@@ -727,206 +727,265 @@ func evalExpr(env ExecEnv, e Expr, row Row) (any, error) {
 	case *Literal:
 		return ex.Val, nil
 	case *VarRef:
-		if v, ok := getVal(row, ex.Name); ok {
-			return v, nil
-		}
-		if strings.Contains(ex.Name, ".") {
-			return nil, fmt.Errorf("unknown column reference %q", ex.Name)
-		}
-		if v, ok := getVal(row, ex.Name); ok {
-			return v, nil
-		}
-		return nil, fmt.Errorf("unknown column %q", ex.Name)
+		return evalVarRef(ex, row)
 	case *IsNull:
-		v, err := evalExpr(env, ex.Expr, row)
-		if err != nil {
-			return nil, err
-		}
-		is := isNull(v)
-		if ex.Negate {
-			return !is, nil
-		}
-		return is, nil
+		return evalIsNull(env, ex, row)
 	case *Unary:
-		v, err := evalExpr(env, ex.Expr, row)
-		if err != nil {
-			return nil, err
-		}
-		switch ex.Op {
-		case "+":
-			if f, ok := numeric(v); ok {
-				return f, nil
-			}
-			if v == nil {
-				return nil, nil
-			}
-			return nil, fmt.Errorf("unary + non-numeric")
-		case "-":
-			if f, ok := numeric(v); ok {
-				return -f, nil
-			}
-			if v == nil {
-				return nil, nil
-			}
-			return nil, fmt.Errorf("unary - non-numeric")
-		case "NOT":
-			return triToValue(triNot(toTri(v))), nil
-		}
+		return evalUnary(env, ex, row)
 	case *Binary:
-		if ex.Op == "AND" || ex.Op == "OR" {
-			lv, err := evalExpr(env, ex.Left, row)
-			if err != nil {
-				return nil, err
-			}
-			if ex.Op == "AND" && toTri(lv) == tvFalse {
-				return false, nil
-			}
-			if ex.Op == "OR" && toTri(lv) == tvTrue {
-				return true, nil
-			}
-			rv, err := evalExpr(env, ex.Right, row)
-			if err != nil {
-				return nil, err
-			}
-			if ex.Op == "AND" {
-				return triToValue(triAnd(toTri(lv), toTri(rv))), nil
-			}
-			return triToValue(triOr(toTri(lv), toTri(rv))), nil
-		}
-		lv, err := evalExpr(env, ex.Left, row)
-		if err != nil {
-			return nil, err
-		}
-		rv, err := evalExpr(env, ex.Right, row)
-		if err != nil {
-			return nil, err
-		}
-		switch ex.Op {
-		case "+", "-", "*", "/":
-			if lv == nil || rv == nil {
-				return nil, nil
-			}
-			lf, lok := numeric(lv)
-			rf, rok := numeric(rv)
-			if !(lok && rok) {
-				return nil, fmt.Errorf("%s expects numeric", ex.Op)
-			}
-			switch ex.Op {
-			case "+":
-				return lf + rf, nil
-			case "-":
-				return lf - rf, nil
-			case "*":
-				return lf * rf, nil
-			case "/":
-				if rf == 0 {
-					return nil, errors.New("division by zero")
-				}
-				return lf / rf, nil
-			}
-		case "=", "!=", "<>", "<", "<=", ">", ">=":
-			if lv == nil || rv == nil {
-				return nil, nil
-			}
-			cmp, err := compare(lv, rv)
-			if err != nil {
-				return nil, err
-			}
-			switch ex.Op {
-			case "=":
-				return cmp == 0, nil
-			case "!=", "<>":
-				return cmp != 0, nil
-			case "<":
-				return cmp < 0, nil
-			case "<=":
-				return cmp <= 0, nil
-			case ">":
-				return cmp > 0, nil
-			case ">=":
-				return cmp >= 0, nil
-			}
-		}
+		return evalBinary(env, ex, row)
 	case *FuncCall:
-		switch ex.Name {
-		case "COALESCE":
-			for _, a := range ex.Args {
-				v, err := evalExpr(env, a, row)
-				if err != nil {
-					return nil, err
-				}
-				if v != nil {
-					return v, nil
-				}
-			}
+		return evalFuncCall(env, ex, row)
+	}
+	return nil, fmt.Errorf("unknown expression")
+}
+
+func evalVarRef(ex *VarRef, row Row) (any, error) {
+	if v, ok := getVal(row, ex.Name); ok {
+		return v, nil
+	}
+	if strings.Contains(ex.Name, ".") {
+		return nil, fmt.Errorf("unknown column reference %q", ex.Name)
+	}
+	if v, ok := getVal(row, ex.Name); ok {
+		return v, nil
+	}
+	return nil, fmt.Errorf("unknown column %q", ex.Name)
+}
+
+func evalIsNull(env ExecEnv, ex *IsNull, row Row) (any, error) {
+	v, err := evalExpr(env, ex.Expr, row)
+	if err != nil {
+		return nil, err
+	}
+	is := isNull(v)
+	if ex.Negate {
+		return !is, nil
+	}
+	return is, nil
+}
+
+func evalUnary(env ExecEnv, ex *Unary, row Row) (any, error) {
+	v, err := evalExpr(env, ex.Expr, row)
+	if err != nil {
+		return nil, err
+	}
+	switch ex.Op {
+	case "+":
+		if f, ok := numeric(v); ok {
+			return f, nil
+		}
+		if v == nil {
 			return nil, nil
-		case "NULLIF":
-			if len(ex.Args) != 2 {
-				return nil, fmt.Errorf("NULLIF expects 2 args")
-			}
-			lv, err := evalExpr(env, ex.Args[0], row)
-			if err != nil {
-				return nil, err
-			}
-			rv, err := evalExpr(env, ex.Args[1], row)
-			if err != nil {
-				return nil, err
-			}
-			if lv == nil {
-				return nil, nil
-			}
-			if rv == nil {
-				return lv, nil
-			}
-			cmp, err := compare(lv, rv)
-			if err != nil {
-				return nil, err
-			}
-			if cmp == 0 {
-				return nil, nil
-			}
-			return lv, nil
-		case "JSON_GET":
-			if len(ex.Args) != 2 {
-				return nil, fmt.Errorf("JSON_GET expects (json, path)")
-			}
-			jv, err := evalExpr(env, ex.Args[0], row)
-			if err != nil {
-				return nil, err
-			}
-			pv, err := evalExpr(env, ex.Args[1], row)
-			if err != nil {
-				return nil, err
-			}
-			ps, _ := pv.(string)
-			return jsonGet(jv, ps), nil
-		case "COUNT":
-			if ex.Star {
-				return 1, nil
-			}
-			if len(ex.Args) != 1 {
-				return nil, fmt.Errorf("COUNT expects 1 arg")
-			}
-			v, err := evalExpr(env, ex.Args[0], row)
-			if err != nil {
-				return nil, err
-			}
-			if v == nil {
-				return 0, nil
-			}
-			return 1, nil
-		case "SUM", "AVG", "MIN", "MAX":
-			if len(ex.Args) != 1 {
-				return nil, fmt.Errorf("%s expects 1 arg", ex.Name)
-			}
-			v, err := evalExpr(env, ex.Args[0], row)
-			if err != nil {
-				return nil, err
-			}
+		}
+		return nil, fmt.Errorf("unary + non-numeric")
+	case "-":
+		if f, ok := numeric(v); ok {
+			return -f, nil
+		}
+		if v == nil {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("unary - non-numeric")
+	case "NOT":
+		return triToValue(triNot(toTri(v))), nil
+	}
+	return nil, fmt.Errorf("unknown unary operator: %s", ex.Op)
+}
+
+func evalBinary(env ExecEnv, ex *Binary, row Row) (any, error) {
+	if ex.Op == "AND" || ex.Op == "OR" {
+		return evalLogicalBinary(env, ex, row)
+	}
+	
+	lv, err := evalExpr(env, ex.Left, row)
+	if err != nil {
+		return nil, err
+	}
+	rv, err := evalExpr(env, ex.Right, row)
+	if err != nil {
+		return nil, err
+	}
+	
+	switch ex.Op {
+	case "+", "-", "*", "/":
+		return evalArithmeticBinary(ex.Op, lv, rv)
+	case "=", "!=", "<>", "<", "<=", ">", ">=":
+		return evalComparisonBinary(ex.Op, lv, rv)
+	}
+	return nil, fmt.Errorf("unknown binary operator: %s", ex.Op)
+}
+
+func evalLogicalBinary(env ExecEnv, ex *Binary, row Row) (any, error) {
+	lv, err := evalExpr(env, ex.Left, row)
+	if err != nil {
+		return nil, err
+	}
+	if ex.Op == "AND" && toTri(lv) == tvFalse {
+		return false, nil
+	}
+	if ex.Op == "OR" && toTri(lv) == tvTrue {
+		return true, nil
+	}
+	rv, err := evalExpr(env, ex.Right, row)
+	if err != nil {
+		return nil, err
+	}
+	if ex.Op == "AND" {
+		return triToValue(triAnd(toTri(lv), toTri(rv))), nil
+	}
+	return triToValue(triOr(toTri(lv), toTri(rv))), nil
+}
+
+func evalArithmeticBinary(op string, lv, rv any) (any, error) {
+	if lv == nil || rv == nil {
+		return nil, nil
+	}
+	lf, lok := numeric(lv)
+	rf, rok := numeric(rv)
+	if !(lok && rok) {
+		return nil, fmt.Errorf("%s expects numeric", op)
+	}
+	switch op {
+	case "+":
+		return lf + rf, nil
+	case "-":
+		return lf - rf, nil
+	case "*":
+		return lf * rf, nil
+	case "/":
+		if rf == 0 {
+			return nil, errors.New("division by zero")
+		}
+		return lf / rf, nil
+	}
+	return nil, fmt.Errorf("unknown arithmetic operator: %s", op)
+}
+
+func evalComparisonBinary(op string, lv, rv any) (any, error) {
+	if lv == nil || rv == nil {
+		return nil, nil
+	}
+	cmp, err := compare(lv, rv)
+	if err != nil {
+		return nil, err
+	}
+	switch op {
+	case "=":
+		return cmp == 0, nil
+	case "!=", "<>":
+		return cmp != 0, nil
+	case "<":
+		return cmp < 0, nil
+	case "<=":
+		return cmp <= 0, nil
+	case ">":
+		return cmp > 0, nil
+	case ">=":
+		return cmp >= 0, nil
+	}
+	return nil, fmt.Errorf("unknown comparison operator: %s", op)
+}
+
+func evalFuncCall(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	switch ex.Name {
+	case "COALESCE":
+		return evalCoalesce(env, ex.Args, row)
+	case "NULLIF":
+		return evalNullif(env, ex.Args, row)
+	case "JSON_GET":
+		return evalJSONGet(env, ex.Args, row)
+	case "COUNT":
+		return evalCountSingle(env, ex, row)
+	case "SUM", "AVG", "MIN", "MAX":
+		return evalAggregateSingle(env, ex, row)
+	}
+	return nil, fmt.Errorf("unknown function: %s", ex.Name)
+}
+
+func evalCoalesce(env ExecEnv, args []Expr, row Row) (any, error) {
+	for _, a := range args {
+		v, err := evalExpr(env, a, row)
+		if err != nil {
+			return nil, err
+		}
+		if v != nil {
 			return v, nil
 		}
 	}
-	return nil, fmt.Errorf("unknown expression")
+	return nil, nil
+}
+
+func evalNullif(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("NULLIF expects 2 args")
+	}
+	lv, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	rv, err := evalExpr(env, args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	if lv == nil {
+		return nil, nil
+	}
+	if rv == nil {
+		return lv, nil
+	}
+	cmp, err := compare(lv, rv)
+	if err != nil {
+		return nil, err
+	}
+	if cmp == 0 {
+		return nil, nil
+	}
+	return lv, nil
+}
+
+func evalJSONGet(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("JSON_GET expects (json, path)")
+	}
+	jv, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	pv, err := evalExpr(env, args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	ps, _ := pv.(string)
+	return jsonGet(jv, ps), nil
+}
+
+func evalCountSingle(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if ex.Star {
+		return 1, nil
+	}
+	if len(ex.Args) != 1 {
+		return nil, fmt.Errorf("COUNT expects 1 arg")
+	}
+	v, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if v == nil {
+		return 0, nil
+	}
+	return 1, nil
+}
+
+func evalAggregateSingle(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) != 1 {
+		return nil, fmt.Errorf("%s expects 1 arg", ex.Name)
+	}
+	v, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
 }
 func triToValue(t int) any {
 	if t == tvTrue {
@@ -958,142 +1017,171 @@ func isAggregate(e Expr) bool {
 func evalAggregate(env ExecEnv, e Expr, rows []Row) (any, error) {
 	switch ex := e.(type) {
 	case *FuncCall:
-		switch ex.Name {
-		case "COUNT":
-			if ex.Star {
-				return len(rows), nil
-			}
-			if len(ex.Args) != 1 {
-				return nil, fmt.Errorf("COUNT expects 1 arg")
-			}
-			cnt := 0
-			for _, r := range rows {
-				if err := checkCtx(env.ctx); err != nil {
-					return nil, err
-				}
-				v, err := evalExpr(env, ex.Args[0], r)
-				if err != nil {
-					return nil, err
-				}
-				if v != nil {
-					cnt++
-				}
-			}
-			return cnt, nil
-		case "SUM", "AVG":
-			if len(ex.Args) != 1 {
-				return nil, fmt.Errorf("%s expects 1 arg", ex.Name)
-			}
-			sum := 0.0
-			n := 0
-			for _, r := range rows {
-				if err := checkCtx(env.ctx); err != nil {
-					return nil, err
-				}
-				v, err := evalExpr(env, ex.Args[0], r)
-				if err != nil {
-					return nil, err
-				}
-				if f, ok := numeric(v); ok {
-					sum += f
-					n++
-				}
-			}
-			if ex.Name == "SUM" {
-				return sum, nil
-			}
-			if n == 0 {
-				return nil, nil
-			}
-			return sum / float64(n), nil
-		case "MIN", "MAX":
-			if len(ex.Args) != 1 {
-				return nil, fmt.Errorf("%s expects 1 arg", ex.Name)
-			}
-			var have bool
-			var best any
-			for _, r := range rows {
-				if err := checkCtx(env.ctx); err != nil {
-					return nil, err
-				}
-				v, err := evalExpr(env, ex.Args[0], r)
-				if err != nil {
-					return nil, err
-				}
-				if v == nil {
-					continue
-				}
-				if !have {
-					best = v
-					have = true
-				} else {
-					cmp, err := compare(v, best)
-					if err == nil {
-						if ex.Name == "MIN" && cmp < 0 {
-							best = v
-						}
-						if ex.Name == "MAX" && cmp > 0 {
-							best = v
-						}
-					}
-				}
-			}
-			if !have {
-				return nil, nil
-			}
-			return best, nil
-		}
+		return evalAggregateFuncCall(env, ex, rows)
 	case *Unary:
-		v, err := evalAggregate(env, ex.Expr, rows)
-		if err != nil {
-			return nil, err
-		}
-		switch ex.Op {
-		case "+":
-			if f, ok := numeric(v); ok {
-				return f, nil
-			}
-			if v == nil {
-				return nil, nil
-			}
-			return nil, fmt.Errorf("unary + non-numeric")
-		case "-":
-			if f, ok := numeric(v); ok {
-				return -f, nil
-			}
-			if v == nil {
-				return nil, nil
-			}
-			return nil, fmt.Errorf("unary - non-numeric")
-		case "NOT":
-			return triToValue(triNot(toTri(v))), nil
-		}
+		return evalAggregateUnary(env, ex, rows)
 	case *Binary:
-		lv, err := evalAggregate(env, ex.Left, rows)
-		if err != nil {
-			return nil, err
-		}
-		rv, err := evalAggregate(env, ex.Right, rows)
-		if err != nil {
-			return nil, err
-		}
-		return evalExpr(env, &Binary{Op: ex.Op, Left: &Literal{Val: lv}, Right: &Literal{Val: rv}}, Row{})
+		return evalAggregateBinary(env, ex, rows)
 	case *IsNull:
-		v, err := evalAggregate(env, ex.Expr, rows)
-		if err != nil {
-			return nil, err
-		}
-		if ex.Negate {
-			return !isNull(v), nil
-		}
-		return isNull(v), nil
+		return evalAggregateIsNull(env, ex, rows)
 	default:
 		if len(rows) == 0 {
 			return nil, nil
 		}
 		return evalExpr(env, e, rows[0])
 	}
-	return nil, fmt.Errorf("unsupported aggregate")
+}
+
+func evalAggregateFuncCall(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
+	switch ex.Name {
+	case "COUNT":
+		return evalAggregateCount(env, ex, rows)
+	case "SUM", "AVG":
+		return evalAggregateSumAvg(env, ex, rows)
+	case "MIN", "MAX":
+		return evalAggregateMinMax(env, ex, rows)
+	}
+	return nil, fmt.Errorf("unsupported aggregate function: %s", ex.Name)
+}
+
+func evalAggregateCount(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
+	if ex.Star {
+		return len(rows), nil
+	}
+	if len(ex.Args) != 1 {
+		return nil, fmt.Errorf("COUNT expects 1 arg")
+	}
+	cnt := 0
+	for _, r := range rows {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, err
+		}
+		v, err := evalExpr(env, ex.Args[0], r)
+		if err != nil {
+			return nil, err
+		}
+		if v != nil {
+			cnt++
+		}
+	}
+	return cnt, nil
+}
+
+func evalAggregateSumAvg(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
+	if len(ex.Args) != 1 {
+		return nil, fmt.Errorf("%s expects 1 arg", ex.Name)
+	}
+	sum := 0.0
+	n := 0
+	for _, r := range rows {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, err
+		}
+		v, err := evalExpr(env, ex.Args[0], r)
+		if err != nil {
+			return nil, err
+		}
+		if f, ok := numeric(v); ok {
+			sum += f
+			n++
+		}
+	}
+	if ex.Name == "SUM" {
+		return sum, nil
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	return sum / float64(n), nil
+}
+
+func evalAggregateMinMax(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
+	if len(ex.Args) != 1 {
+		return nil, fmt.Errorf("%s expects 1 arg", ex.Name)
+	}
+	var have bool
+	var best any
+	for _, r := range rows {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, err
+		}
+		v, err := evalExpr(env, ex.Args[0], r)
+		if err != nil {
+			return nil, err
+		}
+		if v == nil {
+			continue
+		}
+		if !have {
+			best = v
+			have = true
+		} else {
+			cmp, err := compare(v, best)
+			if err == nil {
+				if ex.Name == "MIN" && cmp < 0 {
+					best = v
+				}
+				if ex.Name == "MAX" && cmp > 0 {
+					best = v
+				}
+			}
+		}
+	}
+	if !have {
+		return nil, nil
+	}
+	return best, nil
+}
+
+func evalAggregateUnary(env ExecEnv, ex *Unary, rows []Row) (any, error) {
+	v, err := evalAggregate(env, ex.Expr, rows)
+	if err != nil {
+		return nil, err
+	}
+	switch ex.Op {
+	case "+":
+		if f, ok := numeric(v); ok {
+			return f, nil
+		}
+		if v == nil {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("unary + non-numeric")
+	case "-":
+		if f, ok := numeric(v); ok {
+			return -f, nil
+		}
+		if v == nil {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("unary - non-numeric")
+	case "NOT":
+		return triToValue(triNot(toTri(v))), nil
+	}
+	return nil, fmt.Errorf("unknown unary operator: %s", ex.Op)
+}
+
+func evalAggregateBinary(env ExecEnv, ex *Binary, rows []Row) (any, error) {
+	lv, err := evalAggregate(env, ex.Left, rows)
+	if err != nil {
+		return nil, err
+	}
+	rv, err := evalAggregate(env, ex.Right, rows)
+	if err != nil {
+		return nil, err
+	}
+	return evalExpr(env, &Binary{Op: ex.Op, Left: &Literal{Val: lv}, Right: &Literal{Val: rv}}, Row{})
+}
+
+func evalAggregateIsNull(env ExecEnv, ex *IsNull, rows []Row) (any, error) {
+	v, err := evalAggregate(env, ex.Expr, rows)
+	if err != nil {
+		return nil, err
+	}
+	if ex.Negate {
+		return !isNull(v), nil
+	}
+	return isNull(v), nil
 }
 
 func rowsFromTable(t *storage.Table, alias string) ([]Row, []string) {
