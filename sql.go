@@ -28,8 +28,10 @@
 package tinysql
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -122,6 +124,19 @@ func (db *DB) Drop(name string) error {
 	return nil
 }
 
+func (db *DB) ListTables() []*Table {
+	names := make([]string, 0, len(db.tables))
+	for k := range db.tables {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	out := make([]*Table, 0, len(names))
+	for _, n := range names {
+		out = append(out, db.tables[n])
+	}
+	return out
+}
+
 // TokenType is intentionally small. Keywords come as Keyword with .Val uppercased.
 type TokenType int
 
@@ -152,6 +167,22 @@ func (lx *Lexer) peek() rune {
 		return 0
 	}
 	r, _ := utf8DecodeRuneInString(lx.s[lx.pos:])
+	return r
+}
+
+func (lx *Lexer) peekN(n int) rune {
+	p := lx.pos
+	for i := 0; i < n; i++ {
+		if p >= len(lx.s) {
+			return 0
+		}
+		_, sz := utf8DecodeRuneInString(lx.s[p:])
+		p += sz
+	}
+	if p >= len(lx.s) {
+		return 0
+	}
+	r, _ := utf8DecodeRuneInString(lx.s[p:])
 	return r
 }
 
@@ -207,22 +238,6 @@ func (lx *Lexer) skipWhitespace() {
 		}
 		return
 	}
-}
-
-func (lx *Lexer) peekN(n int) rune {
-	p := lx.pos
-	for i := 0; i < n; i++ {
-		if p >= len(lx.s) {
-			return 0
-		}
-		_, sz := utf8DecodeRuneInString(lx.s[p:])
-		p += sz
-	}
-	if p >= len(lx.s) {
-		return 0
-	}
-	r, _ := utf8DecodeRuneInString(lx.s[p:])
-	return r
 }
 
 func (lx *Lexer) NextToken() Token {
@@ -299,7 +314,6 @@ func (lx *Lexer) NextToken() Token {
 		}
 		return lx.emit(tSymbol, start, string(a))
 	default:
-		// unknown char: consume and return as symbol
 		lx.next()
 		return lx.emit(tSymbol, start, string(r))
 	}
@@ -307,29 +321,24 @@ func (lx *Lexer) NextToken() Token {
 
 func isKeyword(up string) bool {
 	switch up {
-	case "SELECT", "FROM", "WHERE", "GROUP", "BY", "HAVING", "ORDER", "ASC", "DESC", "LIMIT", "OFFSET",
-		"JOIN", "ON", "AS",
+	case "SELECT", "DISTINCT",
+		"FROM", "WHERE", "GROUP", "BY", "HAVING", "ORDER", "ASC", "DESC", "LIMIT", "OFFSET",
+		"JOIN", "LEFT", "RIGHT", "OUTER", "ON", "AS",
 		"CREATE", "TABLE", "TEMP", "DROP",
 		"INSERT", "INTO", "VALUES",
 		"UPDATE", "SET", "DELETE",
 		"INT", "FLOAT", "TEXT", "BOOL",
-		"AND", "OR", "NOT",
+		"AND", "OR", "NOT", "IS", "NULL", "TRUE", "FALSE",
 		"COUNT", "SUM", "AVG", "MIN", "MAX",
-		"TRUE", "FALSE":
+		"COALESCE", "NULLIF":
 		return true
 	default:
 		return false
 	}
 }
 
-// minimal utf8 decoding; avoids importing unicode/utf8 explicitly elsewhere
+// minimal ascii fast-path utf8 decoding
 func utf8DecodeRuneInString(s string) (r rune, size int) {
-	for i := range s {
-		if i > 0 {
-			return rune(s[0]), 1 // ascii fast-path
-		}
-	}
-	// this path runs only for empty or single-rune ascii
 	if len(s) == 0 {
 		return 0, 0
 	}
@@ -349,10 +358,7 @@ func NewParser(sql string) *Parser {
 	return p
 }
 
-func (p *Parser) next() {
-	p.cur = p.peek
-	p.peek = p.lx.NextToken()
-}
+func (p *Parser) next() { p.cur, p.peek = p.peek, p.lx.NextToken() }
 
 func (p *Parser) expectSymbol(sym string) error {
 	if p.cur.Typ == tSymbol && p.cur.Val == sym {
@@ -371,22 +377,15 @@ func (p *Parser) expectKeyword(kw string) error {
 }
 
 func (p *Parser) errf(format string, a ...interface{}) error {
-	// Basic error with pointer location
 	return fmt.Errorf("parse error near %q: %s", p.cur.Val, fmt.Sprintf(format, a...))
 }
 
 type Expr interface{}
 
 type (
-	VarRef struct {
-		// Optional qualifier "table.column" or just "column"
-		// We keep the raw text; resolution happens at eval time against row context
-		Name string
-	}
-	Literal struct {
-		Val interface{}
-	}
-	Unary struct {
+	VarRef struct{ Name string }
+	Literal struct{ Val interface{} }
+	Unary   struct {
 		Op   string // "-" or "NOT"
 		Expr Expr
 	}
@@ -395,9 +394,13 @@ type (
 		Left  Expr
 		Right Expr
 	}
+	IsNull struct {
+		Expr   Expr
+		Negate bool
+	}
 	FuncCall struct {
-		Name string // COUNT, SUM, AVG, MIN, MAX
-		Args []Expr // COUNT(*) => special case with Star = true
+		Name string // COUNT, SUM, AVG, MIN, MAX, COALESCE, NULLIF
+		Args []Expr // COUNT(*) => Star = true
 		Star bool
 	}
 )
@@ -405,16 +408,13 @@ type (
 type Statement interface{}
 
 type CreateTable struct {
-	Name   string
-	Cols   []Column
-	IsTemp bool
-	// optional AS SELECT
+	Name     string
+	Cols     []Column
+	IsTemp   bool
 	AsSelect *Select
 }
 
-type DropTable struct {
-	Name string
-}
+type DropTable struct{ Name string }
 
 type Insert struct {
 	Table string
@@ -433,16 +433,25 @@ type Delete struct {
 	Where Expr
 }
 
+type JoinType int
+
+const (
+	JoinInner JoinType = iota
+	JoinLeft
+	JoinRight
+)
+
 type Select struct {
-	From    FromItem
-	Joins   []JoinClause
-	Projs   []SelectItem
-	Where   Expr
-	GroupBy []VarRef // simple column refs for grouping
-	Having  Expr
-	OrderBy []OrderItem
-	Limit   *int
-	Offset  *int
+	Distinct bool
+	From     FromItem
+	Joins    []JoinClause
+	Projs    []SelectItem
+	Where    Expr
+	GroupBy  []VarRef
+	Having   Expr
+	OrderBy  []OrderItem
+	Limit    *int
+	Offset   *int
 }
 
 type FromItem struct {
@@ -451,6 +460,7 @@ type FromItem struct {
 }
 
 type JoinClause struct {
+	Type  JoinType
 	Right FromItem
 	On    Expr
 }
@@ -500,9 +510,6 @@ func (p *Parser) parseCreate() (Statement, error) {
 		return nil, p.errf("expected table name")
 	}
 
-	// Two forms:
-	//   CREATE [TEMP] TABLE t (col TYPE, ...)
-	//   CREATE [TEMP] TABLE t AS SELECT ...
 	if p.cur.Typ == tSymbol && p.cur.Val == "(" {
 		cols, err := p.parseColumnDefs()
 		if err != nil {
@@ -652,11 +659,18 @@ func (p *Parser) parseSelect() (*Select, error) {
 	if err := p.expectKeyword("SELECT"); err != nil {
 		return nil, err
 	}
+	sel := &Select{}
+
+	// DISTINCT
+	if p.cur.Typ == tKeyword && p.cur.Val == "DISTINCT" {
+		sel.Distinct = true
+		p.next()
+	}
+
 	// projections
-	var projs []SelectItem
 	if p.cur.Typ == tSymbol && p.cur.Val == "*" {
 		p.next()
-		projs = append(projs, SelectItem{Star: true})
+		sel.Projs = append(sel.Projs, SelectItem{Star: true})
 	} else {
 		for {
 			e, err := p.parseExpr()
@@ -671,11 +685,11 @@ func (p *Parser) parseSelect() (*Select, error) {
 					return nil, p.errf("expected alias after AS")
 				}
 			} else if p.cur.Typ == tIdent {
-				// implicit alias (common SQL shortcut)
+				// implicit alias
 				alias = p.cur.Val
 				p.next()
 			}
-			projs = append(projs, SelectItem{Expr: e, Alias: alias})
+			sel.Projs = append(sel.Projs, SelectItem{Expr: e, Alias: alias})
 			if p.cur.Typ == tSymbol && p.cur.Val == "," {
 				p.next()
 				continue
@@ -702,34 +716,39 @@ func (p *Parser) parseSelect() (*Select, error) {
 		alias = p.cur.Val
 		p.next()
 	}
-	from := FromItem{Table: fromTbl, Alias: alias}
+	sel.From = FromItem{Table: fromTbl, Alias: alias}
 
-	var joins []JoinClause
-	for p.cur.Typ == tKeyword && p.cur.Val == "JOIN" {
-		p.next()
-		rtbl := p.parseIdentLike()
-		if rtbl == "" {
-			return nil, p.errf("expected table after JOIN")
-		}
-		ralias := rtbl
-		if p.cur.Typ == tKeyword && p.cur.Val == "AS" {
+	// JOINs: INNER, LEFT OUTER, RIGHT OUTER
+	for {
+		if p.cur.Typ == tKeyword && p.cur.Val == "JOIN" {
 			p.next()
-			ralias = p.parseIdentLike()
-			if ralias == "" {
-				return nil, p.errf("expected alias after AS")
+			rtbl, ralias, on, err := p.parseJoinTail()
+			if err != nil {
+				return nil, err
 			}
-		} else if p.cur.Typ == tIdent {
-			ralias = p.cur.Val
+			sel.Joins = append(sel.Joins, JoinClause{Type: JoinInner, Right: FromItem{Table: rtbl, Alias: ralias}, On: on})
+			continue
+		}
+		if p.cur.Typ == tKeyword && (p.cur.Val == "LEFT" || p.cur.Val == "RIGHT") {
+			jt := JoinLeft
+			if p.cur.Val == "RIGHT" {
+				jt = JoinRight
+			}
 			p.next()
+			if p.cur.Typ == tKeyword && p.cur.Val == "OUTER" {
+				p.next()
+			}
+			if err := p.expectKeyword("JOIN"); err != nil {
+				return nil, err
+			}
+			rtbl, ralias, on, err := p.parseJoinTail()
+			if err != nil {
+				return nil, err
+			}
+			sel.Joins = append(sel.Joins, JoinClause{Type: jt, Right: FromItem{Table: rtbl, Alias: ralias}, On: on})
+			continue
 		}
-		if err := p.expectKeyword("ON"); err != nil {
-			return nil, err
-		}
-		on, err := p.parseExpr()
-		if err != nil {
-			return nil, err
-		}
-		joins = append(joins, JoinClause{Right: FromItem{Table: rtbl, Alias: ralias}, On: on})
+		break
 	}
 
 	var where Expr
@@ -741,6 +760,7 @@ func (p *Parser) parseSelect() (*Select, error) {
 		}
 		where = e
 	}
+	sel.Where = where
 
 	var groupBy []VarRef
 	if p.cur.Typ == tKeyword && p.cur.Val == "GROUP" {
@@ -761,15 +781,15 @@ func (p *Parser) parseSelect() (*Select, error) {
 			break
 		}
 	}
+	sel.GroupBy = groupBy
 
-	var having Expr
 	if p.cur.Typ == tKeyword && p.cur.Val == "HAVING" {
 		p.next()
 		e, err := p.parseExpr()
 		if err != nil {
 			return nil, err
 		}
-		having = e
+		sel.Having = e
 	}
 
 	var orderBy []OrderItem
@@ -796,15 +816,15 @@ func (p *Parser) parseSelect() (*Select, error) {
 			break
 		}
 	}
+	sel.OrderBy = orderBy
 
-	var limit, offset *int
 	if p.cur.Typ == tKeyword && p.cur.Val == "LIMIT" {
 		p.next()
 		n := p.parseIntLiteral()
 		if n == nil {
 			return nil, p.errf("LIMIT expects an integer")
 		}
-		limit = n
+		sel.Limit = n
 	}
 	if p.cur.Typ == tKeyword && p.cur.Val == "OFFSET" {
 		p.next()
@@ -812,20 +832,36 @@ func (p *Parser) parseSelect() (*Select, error) {
 		if n == nil {
 			return nil, p.errf("OFFSET expects an integer")
 		}
-		offset = n
+		sel.Offset = n
 	}
 
-	return &Select{
-		From:    from,
-		Joins:   joins,
-		Projs:   projs,
-		Where:   where,
-		GroupBy: groupBy,
-		Having:  having,
-		OrderBy: orderBy,
-		Limit:   limit,
-		Offset:  offset,
-	}, nil
+	return sel, nil
+}
+
+func (p *Parser) parseJoinTail() (string, string, Expr, error) {
+	rtbl := p.parseIdentLike()
+	if rtbl == "" {
+		return "", "", nil, p.errf("expected table after JOIN")
+	}
+	ralias := rtbl
+	if p.cur.Typ == tKeyword && p.cur.Val == "AS" {
+		p.next()
+		ralias = p.parseIdentLike()
+		if ralias == "" {
+			return "", "", nil, p.errf("expected alias after AS")
+		}
+	} else if p.cur.Typ == tIdent {
+		ralias = p.cur.Val
+		p.next()
+	}
+	if err := p.expectKeyword("ON"); err != nil {
+		return "", "", nil, err
+	}
+	on, err := p.parseExpr()
+	if err != nil {
+		return "", "", nil, err
+	}
+	return rtbl, ralias, on, nil
 }
 
 func (p *Parser) parseColumnDefs() ([]Column, error) {
@@ -881,7 +917,6 @@ func (p *Parser) parseIdentLike() string {
 		p.next()
 		return s
 	}
-	// permit keywords behaving as types/func names used as identifiers? keep strict.
 	return ""
 }
 
@@ -936,13 +971,34 @@ func (p *Parser) parseAnd() (Expr, error) {
 func (p *Parser) parseNot() (Expr, error) {
 	if p.cur.Typ == tKeyword && p.cur.Val == "NOT" {
 		p.next()
-		e, err := p.parseCmp()
+		e, err := p.parseIsNull()
 		if err != nil {
 			return nil, err
 		}
 		return &Unary{Op: "NOT", Expr: e}, nil
 	}
-	return p.parseCmp()
+	return p.parseIsNull()
+}
+
+func (p *Parser) parseIsNull() (Expr, error) {
+	left, err := p.parseCmp()
+	if err != nil {
+		return nil, err
+	}
+	if p.cur.Typ == tKeyword && p.cur.Val == "IS" {
+		p.next()
+		neg := false
+		if p.cur.Typ == tKeyword && p.cur.Val == "NOT" {
+			neg = true
+			p.next()
+		}
+		if p.cur.Typ == tKeyword && p.cur.Val == "NULL" {
+			p.next()
+			return &IsNull{Expr: left, Negate: neg}, nil
+		}
+		return nil, p.errf("expected NULL after IS/IS NOT")
+	}
+	return left, nil
 }
 
 func (p *Parser) parseCmp() (Expr, error) {
@@ -1040,9 +1096,8 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		p.next()
 		return &Literal{Val: s}, nil
 	case tKeyword:
-		// function call?
 		switch p.cur.Val {
-		case "COUNT", "SUM", "AVG", "MIN", "MAX":
+		case "COUNT", "SUM", "AVG", "MIN", "MAX", "COALESCE", "NULLIF":
 			return p.parseFuncCall()
 		case "TRUE":
 			p.next()
@@ -1050,12 +1105,13 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		case "FALSE":
 			p.next()
 			return &Literal{Val: false}, nil
+		case "NULL":
+			p.next()
+			return &Literal{Val: nil}, nil
 		default:
-			// Allow types used as identifiers? Keep strict; treat as error.
 			return nil, p.errf("unexpected keyword %q", p.cur.Val)
 		}
 	case tIdent:
-		// identifier or qualified "t.col"
 		name := p.cur.Val
 		p.next()
 		return &VarRef{Name: name}, nil
@@ -1089,17 +1145,19 @@ func (p *Parser) parseFuncCall() (Expr, error) {
 		return &FuncCall{Name: name, Star: true}, nil
 	}
 	var args []Expr
-	for {
-		e, err := p.parseExpr()
-		if err != nil {
-			return nil, err
+	if !(p.cur.Typ == tSymbol && p.cur.Val == ")") {
+		for {
+			e, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, e)
+			if p.cur.Typ == tSymbol && p.cur.Val == "," {
+				p.next()
+				continue
+			}
+			break
 		}
-		args = append(args, e)
-		if p.cur.Typ == tSymbol && p.cur.Val == "," {
-			p.next()
-			continue
-		}
-		break
 	}
 	if err := p.expectSymbol(")"); err != nil {
 		return nil, err
@@ -1107,7 +1165,7 @@ func (p *Parser) parseFuncCall() (Expr, error) {
 	return &FuncCall{Name: name, Args: args}, nil
 }
 
-type Row map[string]interface{} // keys: "alias.col" always; additionally "col" if unique
+type Row map[string]interface{} // keys: lower-cased; values may be nil (NULL)
 
 type resultSet struct {
 	Cols []string
@@ -1125,6 +1183,8 @@ func putVal(row Row, key string, val interface{}) {
 	row[strings.ToLower(key)] = val
 }
 
+func isNull(v interface{}) bool { return v == nil }
+
 func numeric(v interface{}) (float64, bool) {
 	switch x := v.(type) {
 	case int:
@@ -1139,6 +1199,8 @@ func numeric(v interface{}) (float64, bool) {
 
 func truthy(v interface{}) bool {
 	switch x := v.(type) {
+	case nil:
+		return false
 	case bool:
 		return x
 	case int:
@@ -1147,15 +1209,58 @@ func truthy(v interface{}) bool {
 		return x != 0
 	case string:
 		return x != ""
-	case nil:
-		return false
 	default:
 		return false
 	}
 }
 
+// 3-valued logic helpers: TRUE=1, FALSE=0, UNKNOWN=2
+const (
+	tvFalse   = 0
+	tvTrue    = 1
+	tvUnknown = 2
+)
+
+func toTri(v interface{}) int {
+	if v == nil {
+		return tvUnknown
+	}
+	if truthy(v) {
+		return tvTrue
+	}
+	return tvFalse
+}
+func triNot(t int) int {
+	switch t {
+	case tvTrue:
+		return tvFalse
+	case tvFalse:
+		return tvTrue
+	default:
+		return tvUnknown
+	}
+}
+func triAnd(a, b int) int {
+	if a == tvFalse || b == tvFalse {
+		return tvFalse
+	}
+	if a == tvTrue && b == tvTrue {
+		return tvTrue
+	}
+	return tvUnknown
+}
+func triOr(a, b int) int {
+	if a == tvTrue || b == tvTrue {
+		return tvTrue
+	}
+	if a == tvFalse && b == tvFalse {
+		return tvFalse
+	}
+	return tvUnknown
+}
+
+// compare for non-NULL values; returns -1/0/+1; errors on NULLs or incompatible types
 func compare(a, b interface{}) (int, error) {
-	// returns -1 if a<b, 0 if equal, +1 if a>b
 	if a == nil || b == nil {
 		return 0, errors.New("cannot compare with NULL")
 	}
@@ -1198,11 +1303,39 @@ func compare(a, b interface{}) (int, error) {
 			return 0, nil
 		}
 	}
-	// fallback equality
+	// fallback equality stringification (rare)
 	if fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b) {
 		return 0, nil
 	}
 	return 0, fmt.Errorf("incomparable values %T and %T", a, b)
+}
+
+// compareForOrder allows NULLs with rule:
+//   ASC : NULLS LAST
+//   DESC: NULLS FIRST
+func compareForOrder(a, b interface{}, desc bool) int {
+	// nil handling
+	if a == nil && b == nil {
+		return 0
+	}
+	if a == nil {
+		// a should come last in ASC, first in DESC
+		if desc {
+			return -1
+		}
+		return 1
+	}
+	if b == nil {
+		if desc {
+			return 1
+		}
+		return -1
+	}
+	cmp, err := compare(a, b)
+	if err != nil {
+		return 0
+	}
+	return cmp
 }
 
 // Expression evaluation (row-wise)
@@ -1212,11 +1345,9 @@ func evalExpr(e Expr, row Row) (interface{}, error) {
 	case *Literal:
 		return ex.Val, nil
 	case *VarRef:
-		// try exact key, then allow both "alias.col" already included; if user provided "a.b", treat as exact
 		if v, ok := GetVal(row, ex.Name); ok {
 			return v, nil
 		}
-		// If unqualified, we may have both "col" and "alias.col"
 		if strings.Contains(ex.Name, ".") {
 			return nil, fmt.Errorf("unknown column reference %q", ex.Name)
 		}
@@ -1224,6 +1355,18 @@ func evalExpr(e Expr, row Row) (interface{}, error) {
 			return v, nil
 		}
 		return nil, fmt.Errorf("unknown column %q", ex.Name)
+
+	case *IsNull:
+		v, err := evalExpr(ex.Expr, row)
+		if err != nil {
+			return nil, err
+		}
+		is := isNull(v)
+		if ex.Negate {
+			return !is, nil
+		}
+		return is, nil
+
 	case *Unary:
 		v, err := evalExpr(ex.Expr, row)
 		if err != nil {
@@ -1234,46 +1377,54 @@ func evalExpr(e Expr, row Row) (interface{}, error) {
 			if f, ok := numeric(v); ok {
 				return f, nil
 			}
+			if v == nil {
+				return nil, nil
+			}
 			return nil, fmt.Errorf("unary + on non-numeric")
 		case "-":
 			if f, ok := numeric(v); ok {
 				return -f, nil
 			}
+			if v == nil {
+				return nil, nil
+			}
 			return nil, fmt.Errorf("unary - on non-numeric")
 		case "NOT":
-			return !truthy(v), nil
+			return triToValue(triNot(toTri(v))), nil
 		default:
 			return nil, fmt.Errorf("unknown unary op %q", ex.Op)
 		}
+
 	case *Binary:
-		// short-circuit for AND/OR
-		if ex.Op == "AND" {
+		switch ex.Op {
+		case "AND":
 			lv, err := evalExpr(ex.Left, row)
 			if err != nil {
 				return nil, err
 			}
-			if !truthy(lv) {
+			// short-circuit FALSE
+			if toTri(lv) == tvFalse {
 				return false, nil
 			}
 			rv, err := evalExpr(ex.Right, row)
 			if err != nil {
 				return nil, err
 			}
-			return truthy(rv), nil
-		}
-		if ex.Op == "OR" {
+			return triToValue(triAnd(toTri(lv), toTri(rv))), nil
+		case "OR":
 			lv, err := evalExpr(ex.Left, row)
 			if err != nil {
 				return nil, err
 			}
-			if truthy(lv) {
+			// short-circuit TRUE
+			if toTri(lv) == tvTrue {
 				return true, nil
 			}
 			rv, err := evalExpr(ex.Right, row)
 			if err != nil {
 				return nil, err
 			}
-			return truthy(rv), nil
+			return triToValue(triOr(toTri(lv), toTri(rv))), nil
 		}
 
 		lv, err := evalExpr(ex.Left, row)
@@ -1285,40 +1436,35 @@ func evalExpr(e Expr, row Row) (interface{}, error) {
 			return nil, err
 		}
 		switch ex.Op {
-		case "+":
+		case "+", "-", "*", "/":
+			if lv == nil || rv == nil {
+				return nil, nil
+			}
 			lf, lok := numeric(lv)
 			rf, rok := numeric(rv)
-			if lok && rok {
+			if !(lok && rok) {
+				return nil, fmt.Errorf("%s expects numeric", ex.Op)
+			}
+			switch ex.Op {
+			case "+":
 				return lf + rf, nil
-			}
-			return nil, fmt.Errorf("+ expects numeric")
-		case "-":
-			lf, lok := numeric(lv)
-			rf, rok := numeric(rv)
-			if lok && rok {
+			case "-":
 				return lf - rf, nil
-			}
-			return nil, fmt.Errorf("- expects numeric")
-		case "*":
-			lf, lok := numeric(lv)
-			rf, rok := numeric(rv)
-			if lok && rok {
+			case "*":
 				return lf * rf, nil
-			}
-			return nil, fmt.Errorf("* expects numeric")
-		case "/":
-			lf, lok := numeric(lv)
-			rf, rok := numeric(rv)
-			if lok && rok {
+			case "/":
 				if rf == 0 {
 					return nil, errors.New("division by zero")
 				}
 				return lf / rf, nil
 			}
-			return nil, fmt.Errorf("/ expects numeric")
 		case "=", "!=", "<>", "<", "<=", ">", ">=":
+			// NULL handling -> UNKNOWN (nil)
+			if lv == nil || rv == nil {
+				return nil, nil
+			}
 			cmp, err := compare(lv, rv)
-			if err != nil && (ex.Op != "=" && ex.Op != "!=" && ex.Op != "<>") {
+			if err != nil {
 				return nil, err
 			}
 			switch ex.Op {
@@ -1338,10 +1484,49 @@ func evalExpr(e Expr, row Row) (interface{}, error) {
 		default:
 			return nil, fmt.Errorf("unknown binary op %q", ex.Op)
 		}
+
 	case *FuncCall:
-		// In non-aggregate context, MIN/MAX etc. of a single row is just the argument value; COUNT returns 1 if arg not null
 		switch ex.Name {
+		case "COALESCE":
+			for _, a := range ex.Args {
+				v, err := evalExpr(a, row)
+				if err != nil {
+					return nil, err
+				}
+				if v != nil {
+					return v, nil
+				}
+			}
+			return nil, nil
+		case "NULLIF":
+			if len(ex.Args) != 2 {
+				return nil, fmt.Errorf("NULLIF expects 2 arguments")
+			}
+			lv, err := evalExpr(ex.Args[0], row)
+			if err != nil {
+				return nil, err
+			}
+			rv, err := evalExpr(ex.Args[1], row)
+			if err != nil {
+				return nil, err
+			}
+			if lv == nil {
+				return nil, nil
+			}
+			if rv == nil {
+				return lv, nil
+			}
+			cmp, err := compare(lv, rv)
+			if err != nil {
+				return nil, err
+			}
+			if cmp == 0 {
+				return nil, nil
+			}
+			return lv, nil
+
 		case "COUNT":
+			// non-aggregate context: COUNT(x) -> 1 if x != NULL else 0; COUNT(*) -> 1
 			if ex.Star {
 				return 1, nil
 			}
@@ -1357,6 +1542,7 @@ func evalExpr(e Expr, row Row) (interface{}, error) {
 			}
 			return 1, nil
 		case "SUM", "AVG", "MIN", "MAX":
+			// non-aggregate context: pass-through value (if any)
 			if len(ex.Args) != 1 {
 				return nil, fmt.Errorf("%s expects 1 argument", ex.Name)
 			}
@@ -1371,10 +1557,21 @@ func evalExpr(e Expr, row Row) (interface{}, error) {
 	default:
 		return nil, fmt.Errorf("unknown expression")
 	}
-	return nil, nil
+	return nil, fmt.Errorf("unhandled expression")
 }
 
-// Aggregate evaluation by scanning a group's rows on demand (clarity over speed).
+func triToValue(t int) interface{} {
+	switch t {
+	case tvTrue:
+		return true
+	case tvFalse:
+		return false
+	default:
+		return nil
+	}
+}
+
+// Aggregate evaluation by scanning a group's rows (clarity over speed).
 func isAggregate(e Expr) bool {
 	switch ex := e.(type) {
 	case *FuncCall:
@@ -1386,6 +1583,8 @@ func isAggregate(e Expr) bool {
 		return isAggregate(ex.Expr)
 	case *Binary:
 		return isAggregate(ex.Left) || isAggregate(ex.Right)
+	case *IsNull:
+		return isAggregate(ex.Expr)
 	}
 	return false
 }
@@ -1407,7 +1606,7 @@ func evalAggregate(e Expr, rows []Row) (interface{}, error) {
 				if err != nil {
 					return nil, err
 				}
-				if v != nil && !(fmt.Sprintf("%v", v) == "<nil>") {
+				if v != nil {
 					cnt++
 				}
 			}
@@ -1432,7 +1631,7 @@ func evalAggregate(e Expr, rows []Row) (interface{}, error) {
 				return sum, nil
 			}
 			if n == 0 {
-				return 0.0, nil
+				return nil, nil // AVG over empty/non-numeric -> NULL
 			}
 			return sum / float64(n), nil
 		case "MIN", "MAX":
@@ -1445,6 +1644,9 @@ func evalAggregate(e Expr, rows []Row) (interface{}, error) {
 				v, err := evalExpr(ex.Args[0], r)
 				if err != nil {
 					return nil, err
+				}
+				if v == nil {
+					continue
 				}
 				if !have {
 					best = v
@@ -1465,6 +1667,12 @@ func evalAggregate(e Expr, rows []Row) (interface{}, error) {
 				return nil, nil
 			}
 			return best, nil
+		case "COALESCE", "NULLIF":
+			// not aggregates: evaluate on representative row
+			if len(rows) == 0 {
+				return nil, nil
+			}
+			return evalExpr(ex, rows[0])
 		}
 	case *Unary:
 		v, err := evalAggregate(ex.Expr, rows)
@@ -1476,14 +1684,20 @@ func evalAggregate(e Expr, rows []Row) (interface{}, error) {
 			if f, ok := numeric(v); ok {
 				return f, nil
 			}
+			if v == nil {
+				return nil, nil
+			}
 			return nil, fmt.Errorf("unary + on non-numeric")
 		case "-":
 			if f, ok := numeric(v); ok {
 				return -f, nil
 			}
+			if v == nil {
+				return nil, nil
+			}
 			return nil, fmt.Errorf("unary - on non-numeric")
 		case "NOT":
-			return !truthy(v), nil
+			return triToValue(triNot(toTri(v))), nil
 		}
 	case *Binary:
 		lv, err := evalAggregate(ex.Left, rows)
@@ -1494,10 +1708,17 @@ func evalAggregate(e Expr, rows []Row) (interface{}, error) {
 		if err != nil {
 			return nil, err
 		}
-		// reuse the same ops as non-aggregate
 		return evalExpr(&Binary{Op: ex.Op, Left: &Literal{Val: lv}, Right: &Literal{Val: rv}}, Row{})
+	case *IsNull:
+		v, err := evalAggregate(ex.Expr, rows)
+		if err != nil {
+			return nil, err
+		}
+		if ex.Negate {
+			return !isNull(v), nil
+		}
+		return isNull(v), nil
 	default:
-		// Non-aggregate expression: evaluate it on first row (usual SQL would enforce GROUP BY correctness).
 		if len(rows) == 0 {
 			return nil, nil
 		}
@@ -1512,25 +1733,12 @@ func rowsFromTable(t *Table, alias string) ([]Row, []string) {
 	for i, c := range t.Cols {
 		cols[i] = strings.ToLower(alias + "." + c.Name)
 	}
-	colSet := make(map[string]bool)
-	for _, c := range cols {
-		colSet[c] = true
-	}
-	// also include bare column names if unique across this table
-	for range t.Cols {
-		put := true
-		// (within one table it's unique)
-		_ = put // clarity
-		_ = colSet
-	}
 	var out []Row
 	for _, r := range t.Rows {
 		row := make(Row)
-		// alias.col always present
 		for i, c := range t.Cols {
 			putVal(row, alias+"."+c.Name, r[i])
 		}
-		// also "col" (unqualified) for convenience (later may be shadowed when joining)
 		for i, c := range t.Cols {
 			key := c.Name
 			if _, exists := row[strings.ToLower(key)]; !exists {
@@ -1542,24 +1750,31 @@ func rowsFromTable(t *Table, alias string) ([]Row, []string) {
 	return out, cols
 }
 
+func keysOfRow(r Row) []string {
+	ks := make([]string, 0, len(r))
+	for k := range r {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
+}
+
 func Execute(db *DB, stmt Statement) (*resultSet, error) {
 	switch s := stmt.(type) {
 	case *CreateTable:
 		if s.AsSelect == nil {
-			// CREATE TABLE t (cols)
 			t := NewTable(s.Name, s.Cols, s.IsTemp)
 			return nil, db.Put(t)
 		}
-		// CREATE [TEMP] TABLE t AS SELECT ...
+		// CREATE ... AS SELECT
 		rs, err := Execute(db, s.AsSelect)
 		if err != nil {
 			return nil, err
 		}
-		// infer column names as TEXT (best effort) unless numeric
 		cols := make([]Column, len(rs.Cols))
 		if len(rs.Rows) > 0 {
 			for i, c := range rs.Cols {
-				cols[i] = Column{Name: c, Type: inferType(rs.Rows[0][c])}
+				cols[i] = Column{Name: c, Type: inferType(rs.Rows[0][strings.ToLower(c)])}
 			}
 		} else {
 			for i, c := range rs.Cols {
@@ -1567,7 +1782,6 @@ func Execute(db *DB, stmt Statement) (*resultSet, error) {
 			}
 		}
 		t := NewTable(s.Name, cols, s.IsTemp)
-		// transform result rows into table's [][]interface{}
 		for _, r := range rs.Rows {
 			row := make([]interface{}, len(cols))
 			for i, c := range cols {
@@ -1589,14 +1803,12 @@ func Execute(db *DB, stmt Statement) (*resultSet, error) {
 			return nil, fmt.Errorf("INSERT column count and value count mismatch")
 		}
 		row := make([]interface{}, len(t.Cols))
-		// Defaults: zero values if not provided.
+		// Default to NULLs (SQL default) for unspecified columns.
 		for i := range row {
-			row[i] = zeroValue(t.Cols[i].Type)
+			row[i] = nil
 		}
-		// Evaluate values
 		tmpRow := Row{} // literals only
 		if len(s.Cols) == 0 {
-			// INSERT INTO t VALUES ( … ) maps by position
 			if len(s.Vals) != len(t.Cols) {
 				return nil, fmt.Errorf("INSERT without columns expects %d values", len(t.Cols))
 			}
@@ -1605,7 +1817,7 @@ func Execute(db *DB, stmt Statement) (*resultSet, error) {
 				if err != nil {
 					return nil, err
 				}
-				row[i], err = coerceToType(v, t.Cols[i].Type)
+				row[i], err = coerceToTypeAllowNull(v, t.Cols[i].Type)
 				if err != nil {
 					return nil, fmt.Errorf("column %q: %w", t.Cols[i].Name, err)
 				}
@@ -1620,7 +1832,7 @@ func Execute(db *DB, stmt Statement) (*resultSet, error) {
 				if err != nil {
 					return nil, err
 				}
-				row[idx], err = coerceToType(v, t.Cols[idx].Type)
+				row[idx], err = coerceToTypeAllowNull(v, t.Cols[idx].Type)
 				if err != nil {
 					return nil, fmt.Errorf("column %q: %w", t.Cols[idx].Name, err)
 				}
@@ -1635,7 +1847,6 @@ func Execute(db *DB, stmt Statement) (*resultSet, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Precompute column indices
 		setIdx := make(map[int]Expr)
 		for name, ex := range s.Sets {
 			i, err := t.colIndex(name)
@@ -1657,7 +1868,7 @@ func Execute(db *DB, stmt Statement) (*resultSet, error) {
 				if err != nil {
 					return nil, err
 				}
-				ok = truthy(v)
+				ok = (toTri(v) == tvTrue)
 			}
 			if ok {
 				for i, ex := range setIdx {
@@ -1665,7 +1876,7 @@ func Execute(db *DB, stmt Statement) (*resultSet, error) {
 					if err != nil {
 						return nil, err
 					}
-					cv, err := coerceToType(v, t.Cols[i].Type)
+					cv, err := coerceToTypeAllowNull(v, t.Cols[i].Type)
 					if err != nil {
 						return nil, err
 					}
@@ -1675,7 +1886,7 @@ func Execute(db *DB, stmt Statement) (*resultSet, error) {
 			}
 		}
 		t.Version++
-		return &resultSet{Cols: []string{fmt.Sprintf("updated")}, Rows: []Row{{"updated": count}}}, nil
+		return &resultSet{Cols: []string{"updated"}, Rows: []Row{{"updated": count}}}, nil
 
 	case *Delete:
 		t, err := db.Get(s.Table)
@@ -1690,15 +1901,18 @@ func Execute(db *DB, stmt Statement) (*resultSet, error) {
 				putVal(row, c.Name, r[i])
 				putVal(row, s.Table+"."+c.Name, r[i])
 			}
-			ok := true
+			keep := true
 			if s.Where != nil {
 				v, err := evalExpr(s.Where, row)
 				if err != nil {
 					return nil, err
 				}
-				ok = !truthy(v) // keep if WHERE false
+				// WHERE keeps only TRUE; FALSE/UNKNOWN are filtered
+				if toTri(v) == tvTrue {
+					keep = false
+				}
 			}
-			if ok {
+			if keep {
 				kept = append(kept, r)
 			} else {
 				del++
@@ -1706,7 +1920,7 @@ func Execute(db *DB, stmt Statement) (*resultSet, error) {
 		}
 		t.Rows = kept
 		t.Version++
-		return &resultSet{Cols: []string{fmt.Sprintf("deleted")}, Rows: []Row{{"deleted": del}}}, nil
+		return &resultSet{Cols: []string{"deleted"}, Rows: []Row{{"deleted": del}}}, nil
 
 	case *Select:
 		// FROM
@@ -1715,40 +1929,100 @@ func Execute(db *DB, stmt Statement) (*resultSet, error) {
 			return nil, err
 		}
 		leftRows, _ := rowsFromTable(leftT, s.From.AliasOrTable())
-
-		// JOINs (nested loop join)
 		cur := leftRows
+
+		// JOINs
 		for _, j := range s.Joins {
 			rt, err := db.Get(j.Right.Table)
 			if err != nil {
 				return nil, err
 			}
 			rightRows, _ := rowsFromTable(rt, j.Right.AliasOrTable())
-			var joined []Row
-			for _, l := range cur {
-				for _, r := range rightRows {
-					// merge rows (r overwrites unqualified keys; alias.col never collide)
-					m := make(Row)
-					for k, v := range l {
-						m[k] = v
-					}
-					for k, v := range r {
-						m[k] = v
-					}
-					ok := true
-					if j.On != nil {
-						val, err := evalExpr(j.On, m)
-						if err != nil {
-							return nil, err
+
+			switch j.Type {
+			case JoinInner:
+				var joined []Row
+				for _, l := range cur {
+					for _, r := range rightRows {
+						m := mergeRows(l, r)
+						ok := true
+						if j.On != nil {
+							val, err := evalExpr(j.On, m)
+							if err != nil {
+								return nil, err
+							}
+							ok = (toTri(val) == tvTrue)
 						}
-						ok = truthy(val)
+						if ok {
+							joined = append(joined, m)
+						}
 					}
-					if ok {
+				}
+				cur = joined
+
+			case JoinLeft:
+				var joined []Row
+				for _, l := range cur {
+					matched := false
+					for _, r := range rightRows {
+						m := mergeRows(l, r)
+						ok := true
+						if j.On != nil {
+							val, err := evalExpr(j.On, m)
+							if err != nil {
+								return nil, err
+							}
+							ok = (toTri(val) == tvTrue)
+						}
+						if ok {
+							joined = append(joined, m)
+							matched = true
+						}
+					}
+					if !matched {
+						m := cloneRow(l)
+						// pad right side alias columns with NULLs
+						addRightNulls(m, j.Right.AliasOrTable(), rt)
 						joined = append(joined, m)
 					}
 				}
+				cur = joined
+
+			case JoinRight:
+				var joined []Row
+				// collect left keys prototype
+				leftKeys := []string{}
+				if len(cur) > 0 {
+					leftKeys = keysOfRow(cur[0])
+				}
+				for _, r := range rightRows {
+					matched := false
+					for _, l := range cur {
+						m := mergeRows(l, r)
+						ok := true
+						if j.On != nil {
+							val, err := evalExpr(j.On, m)
+							if err != nil {
+								return nil, err
+							}
+							ok = (toTri(val) == tvTrue)
+						}
+						if ok {
+							joined = append(joined, m)
+							matched = true
+						}
+					}
+					if !matched {
+						m := cloneRow(r)
+						// pad ALL left keys with NULLs (includes any prior joins on the left chain)
+						for _, k := range leftKeys {
+							m[k] = nil
+						}
+						joined = append(joined, m)
+					}
+				}
+				cur = joined
 			}
-			cur = joined
 		}
 
 		// WHERE
@@ -1760,7 +2034,7 @@ func Execute(db *DB, stmt Statement) (*resultSet, error) {
 				if err != nil {
 					return nil, err
 				}
-				if truthy(v) {
+				if toTri(v) == tvTrue {
 					tmp = append(tmp, r)
 				}
 			}
@@ -1774,7 +2048,6 @@ func Execute(db *DB, stmt Statement) (*resultSet, error) {
 
 		if needAgg {
 			// group by keys
-			type key struct{ parts []string }
 			groups := make(map[string][]Row)
 			orderKeys := []string{}
 			for _, r := range filtered {
@@ -1784,7 +2057,7 @@ func Execute(db *DB, stmt Statement) (*resultSet, error) {
 					if err != nil {
 						return nil, err
 					}
-					parts = append(parts, fmt.Sprintf("%v", v))
+					parts = append(parts, fmtKeyPart(v))
 				}
 				ks := strings.Join(parts, "\x1f")
 				if _, ok := groups[ks]; !ok {
@@ -1795,33 +2068,32 @@ func Execute(db *DB, stmt Statement) (*resultSet, error) {
 			// build rows per group
 			for _, k := range orderKeys {
 				rows := groups[k]
-				// HAVING may use aggregates
+				// HAVING
 				if s.Having != nil {
 					hv, err := evalAggregate(s.Having, rows)
 					if err != nil {
 						return nil, err
 					}
-					if !truthy(hv) {
+					if toTri(hv) != tvTrue {
 						continue
 					}
 				}
 				out := Row{}
 				for i, it := range s.Projs {
-					name := projName(it, i)
-					var val interface{}
 					if it.Star {
-						// Expand * from the first row: alias.col names
 						if len(rows) > 0 {
 							for col, v := range rows[0] {
-								// only include qualified names ("a.x")
 								if strings.Contains(col, ".") {
 									putVal(out, col, v)
 									outCols = appendUnique(outCols, col)
 								}
 							}
-							continue
 						}
+						continue
 					}
+					name := projName(it, i)
+					var val interface{}
+					var err error
 					if isAggregate(it.Expr) || len(s.GroupBy) > 0 {
 						val, err = evalAggregate(it.Expr, rows)
 					} else {
@@ -1836,12 +2108,11 @@ func Execute(db *DB, stmt Statement) (*resultSet, error) {
 				outRows = append(outRows, out)
 			}
 		} else {
-			// simple projection, row-wise
+			// simple projection
 			for _, r := range filtered {
 				out := Row{}
 				for i, it := range s.Projs {
 					if it.Star {
-						// expand * => alias.col names from this row
 						for col, v := range r {
 							if strings.Contains(col, ".") {
 								putVal(out, col, v)
@@ -1862,6 +2133,11 @@ func Execute(db *DB, stmt Statement) (*resultSet, error) {
 			}
 		}
 
+		// DISTINCT
+		if s.Distinct {
+			outRows = distinctRows(outRows, outCols)
+		}
+
 		// ORDER BY
 		if len(s.OrderBy) > 0 {
 			sort.SliceStable(outRows, func(i, j int) bool {
@@ -1870,11 +2146,7 @@ func Execute(db *DB, stmt Statement) (*resultSet, error) {
 				for _, oi := range s.OrderBy {
 					av, _ := GetVal(a, oi.Col)
 					bv, _ := GetVal(b, oi.Col)
-					cmp, err := compare(av, bv)
-					if err != nil {
-						// incomparable: keep original order
-						cmp = 0
-					}
+					cmp := compareForOrder(av, bv, oi.Desc)
 					if cmp == 0 {
 						continue
 					}
@@ -1902,7 +2174,6 @@ func Execute(db *DB, stmt Statement) (*resultSet, error) {
 		}
 
 		if len(outCols) == 0 {
-			// if all projections were *, choose deterministic column order from rows
 			outCols = columnsFromRows(outRows)
 		}
 		return &resultSet{Cols: outCols, Rows: outRows}, nil
@@ -1915,6 +2186,34 @@ func (f FromItem) AliasOrTable() string {
 		return f.Alias
 	}
 	return f.Table
+}
+
+func mergeRows(l, r Row) Row {
+	m := make(Row, len(l)+len(r))
+	for k, v := range l {
+		m[k] = v
+	}
+	for k, v := range r {
+		m[k] = v
+	}
+	return m
+}
+
+func cloneRow(r Row) Row {
+	m := make(Row, len(r))
+	for k, v := range r {
+		m[k] = v
+	}
+	return m
+}
+
+func addRightNulls(m Row, rightAlias string, rt *Table) {
+	for _, c := range rt.Cols {
+		putVal(m, rightAlias+"."+c.Name, nil)
+		if _, exists := m[strings.ToLower(c.Name)]; !exists {
+			putVal(m, c.Name, nil)
+		}
+	}
 }
 
 func projName(it SelectItem, idx int) string {
@@ -1933,6 +2232,8 @@ func projName(it SelectItem, idx int) string {
 			}
 		}
 		return up
+	case *IsNull:
+		return fmt.Sprintf("isnull%d", idx+1)
 	default:
 		return fmt.Sprintf("expr%d", idx+1)
 	}
@@ -1947,7 +2248,7 @@ func lastPart(s string) string {
 
 func anyAggInSelect(items []SelectItem) bool {
 	for _, it := range items {
-		if isAggregate(it.Expr) {
+		if it.Expr != nil && isAggregate(it.Expr) {
 			return true
 		}
 	}
@@ -1975,7 +2276,6 @@ func columnsFromRows(rows []Row) []string {
 			}
 		}
 	}
-	// deterministic: sort
 	sort.Strings(cols)
 	return cols
 }
@@ -1995,24 +2295,9 @@ func inferType(v interface{}) ColType {
 	}
 }
 
-func zeroValue(t ColType) interface{} {
-	switch t {
-	case IntType:
-		return 0
-	case FloatType:
-		return 0.0
-	case BoolType:
-		return false
-	case TextType:
-		return ""
-	default:
-		return nil
-	}
-}
-
-func coerceToType(v interface{}, t ColType) (interface{}, error) {
+func coerceToTypeAllowNull(v interface{}, t ColType) (interface{}, error) {
 	if v == nil {
-		return zeroValue(t), nil
+		return nil, nil
 	}
 	switch t {
 	case IntType:
@@ -2076,24 +2361,62 @@ func coerceToType(v interface{}, t ColType) (interface{}, error) {
 	}
 }
 
-func PrintResult(rs *resultSet) {
+func fmtKeyPart(v interface{}) string {
+	switch x := v.(type) {
+	case nil:
+		return "N:"
+	case int:
+		return "I:" + strconv.Itoa(x)
+	case float64:
+		return "F:" + strconv.FormatFloat(x, 'g', -1, 64)
+	case bool:
+		if x {
+			return "B:1"
+		}
+		return "B:0"
+	case string:
+		return "S:" + x
+	default:
+		return fmt.Sprintf("T:%T:%v", v, v)
+	}
+}
+
+func distinctRows(rows []Row, cols []string) []Row {
+	seen := make(map[string]bool)
+	var out []Row
+	for _, r := range rows {
+		var parts []string
+		for _, c := range cols {
+			parts = append(parts, fmtKeyPart(r[strings.ToLower(c)]))
+		}
+		key := strings.Join(parts, "|")
+		if !seen[key] {
+			seen[key] = true
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func printResult(rs *resultSet) {
 	if rs == nil {
 		return
 	}
-	if len(rs.Rows) == 1 && len(rs.Cols) == 1 && (rs.Cols[0] == "updated" || rs.Cols[0] == "deleted") {
+	// single number results (updated/deleted)
+	if len(rs.Rows) == 1 && len(rs.Cols) == 1 && (strings.ToLower(rs.Cols[0]) == "updated" || strings.ToLower(rs.Cols[0]) == "deleted") {
 		for _, r := range rs.Rows {
 			fmt.Printf("%s: %v\n", rs.Cols[0], r[strings.ToLower(rs.Cols[0])])
 		}
 		return
 	}
-	// compute column widths
+	// compute widths
 	width := make([]int, len(rs.Cols))
 	for i, c := range rs.Cols {
 		width[i] = len(c)
 	}
 	for _, r := range rs.Rows {
 		for i, c := range rs.Cols {
-			s := fmt.Sprintf("%v", r[strings.ToLower(c)])
+			s := cellString(r[strings.ToLower(c)])
 			if len(s) > width[i] {
 				width[i] = len(s)
 			}
@@ -2117,7 +2440,7 @@ func PrintResult(rs *resultSet) {
 	// rows
 	for _, r := range rs.Rows {
 		for i, c := range rs.Cols {
-			s := fmt.Sprintf("%v", r[strings.ToLower(c)])
+			s := cellString(r[strings.ToLower(c)])
 			fmt.Print(padRight(s, width[i]))
 			if i < len(rs.Cols)-1 {
 				fmt.Print("  ")
@@ -2127,9 +2450,108 @@ func PrintResult(rs *resultSet) {
 	}
 }
 
+func cellString(v interface{}) string {
+	if v == nil {
+		return "NULL"
+	}
+	return fmt.Sprintf("%v", v)
+}
+
 func padRight(s string, w int) string {
 	if len(s) >= w {
 		return s
 	}
 	return s + strings.Repeat(" ", w-len(s))
+}
+
+func runREPL(db *DB) {
+	fmt.Println("TinySQL+ REPL (stdlib-only).  End a statement with ';'.  Type .help for commands.")
+	sc := bufio.NewScanner(os.Stdin)
+	var buf strings.Builder
+	for {
+		if buf.Len() == 0 {
+			fmt.Print("sql> ")
+		} else {
+			fmt.Print(" ... ")
+		}
+		if !sc.Scan() {
+			fmt.Println()
+			return
+		}
+		line := strings.TrimSpace(sc.Text())
+		if buf.Len() == 0 && strings.HasPrefix(line, ".") {
+			if handleMeta(db, line) {
+				continue
+			}
+			// if not handled, fallthrough to buffer (allows dot lines inside statements if desired)
+		}
+		buf.WriteString(line)
+		// multi-line: keep reading until we see a ';' terminator
+		if strings.HasSuffix(line, ";") {
+			sql := buf.String()
+			sql = strings.TrimSuffix(sql, ";")
+			buf.Reset()
+			if strings.TrimSpace(sql) == "" {
+				continue
+			}
+			p := NewParser(sql)
+			st, err := p.ParseStatement()
+			if err != nil {
+				fmt.Println("ERR:", err)
+				continue
+			}
+			rs, err := Execute(db, st)
+			if err != nil {
+				fmt.Println("ERR:", err)
+				continue
+			}
+			printResult(rs)
+		} else {
+			buf.WriteString(" ")
+		}
+	}
+}
+
+func handleMeta(db *DB, line string) bool {
+	switch {
+	case line == ".help":
+		fmt.Println(`
+.meta commands:
+  .help                 Show this help
+  .tables               List tables
+  .schema <table>       Show schema of a table
+  .quit                 Exit`)
+		return true
+	case line == ".quit":
+		os.Exit(0)
+	case line == ".tables":
+		tables := db.ListTables()
+		if len(tables) == 0 {
+			fmt.Println("(no tables)")
+			return true
+		}
+		for _, t := range tables {
+			fmt.Printf("%s  (cols=%d, rows=%d)\n", t.Name, len(t.Cols), len(t.Rows))
+		}
+		return true
+	case strings.HasPrefix(line, ".schema"):
+		parts := strings.Fields(line)
+		if len(parts) != 2 {
+			fmt.Println("usage: .schema <table>")
+			return true
+		}
+		t, err := db.Get(parts[1])
+		if err != nil {
+			fmt.Println("ERR:", err)
+			return true
+		}
+		for _, c := range t.Cols {
+			fmt.Printf("%s %s\n", c.Name, c.Type.String())
+		}
+		return true
+	default:
+		fmt.Println("unknown meta command; try .help")
+		return true
+	}
+	return true
 }
