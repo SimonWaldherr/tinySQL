@@ -638,51 +638,71 @@ func compare(a, b any) (int, error) {
 	}
 	switch ax := a.(type) {
 	case int:
-		if f, ok := numeric(b); ok {
-			af := float64(ax)
-			if af < f {
-				return -1, nil
-			}
-			if af > f {
-				return 1, nil
-			}
-			return 0, nil
-		}
+		return compareInt(ax, b)
 	case float64:
-		if f, ok := numeric(b); ok {
-			if ax < f {
-				return -1, nil
-			}
-			if ax > f {
-				return 1, nil
-			}
-			return 0, nil
-		}
+		return compareFloat(ax, b)
 	case string:
-		if bs, ok := b.(string); ok {
-			if ax < bs {
-				return -1, nil
-			}
-			if ax > bs {
-				return 1, nil
-			}
-			return 0, nil
-		}
+		return compareString(ax, b)
 	case bool:
-		if bb, ok := b.(bool); ok {
-			if !ax && bb {
-				return -1, nil
-			}
-			if ax && !bb {
-				return 1, nil
-			}
-			return 0, nil
-		}
+		return compareBool(ax, b)
 	}
 	if fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b) {
 		return 0, nil
 	}
 	return 0, fmt.Errorf("incomparable %T and %T", a, b)
+}
+
+func compareInt(ax int, b any) (int, error) {
+	if f, ok := numeric(b); ok {
+		af := float64(ax)
+		if af < f {
+			return -1, nil
+		}
+		if af > f {
+			return 1, nil
+		}
+		return 0, nil
+	}
+	return 0, fmt.Errorf("incomparable int and %T", b)
+}
+
+func compareFloat(ax float64, b any) (int, error) {
+	if f, ok := numeric(b); ok {
+		if ax < f {
+			return -1, nil
+		}
+		if ax > f {
+			return 1, nil
+		}
+		return 0, nil
+	}
+	return 0, fmt.Errorf("incomparable float64 and %T", b)
+}
+
+func compareString(ax string, b any) (int, error) {
+	if bs, ok := b.(string); ok {
+		if ax < bs {
+			return -1, nil
+		}
+		if ax > bs {
+			return 1, nil
+		}
+		return 0, nil
+	}
+	return 0, fmt.Errorf("incomparable string and %T", b)
+}
+
+func compareBool(ax bool, b any) (int, error) {
+	if bb, ok := b.(bool); ok {
+		if !ax && bb {
+			return -1, nil
+		}
+		if ax && !bb {
+			return 1, nil
+		}
+		return 0, nil
+	}
+	return 0, fmt.Errorf("incomparable bool and %T", b)
 }
 func compareForOrder(a, b any, desc bool) int {
 	if a == nil && b == nil {
@@ -1304,78 +1324,94 @@ func coerceToTypeAllowNull(v any, t storage.ColType) (any, error) {
 	}
 	switch t {
 	case storage.IntType:
-		switch x := v.(type) {
-		case int:
-			return x, nil
-		case int64:
-			return int(x), nil
-		case float64:
-			return int(x), nil
-		case string:
-			n, err := strconv.Atoi(strings.TrimSpace(x))
-			if err != nil {
-				return nil, fmt.Errorf("cannot convert %q to INT", x)
-			}
-			return n, nil
-		case bool:
-			if x {
-				return 1, nil
-			}
-			return 0, nil
-		default:
-			return nil, fmt.Errorf("cannot convert %T to INT", v)
-		}
+		return coerceToInt(v)
 	case storage.FloatType:
-		switch x := v.(type) {
-		case int:
-			return float64(x), nil
-		case int64:
-			return float64(x), nil
-		case float64:
-			return x, nil
-		case string:
-			f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
-			if err != nil {
-				return nil, fmt.Errorf("cannot convert %q to FLOAT", x)
-			}
-			return f, nil
-		case bool:
-			if x {
-				return 1.0, nil
-			}
-			return 0.0, nil
-		default:
-			return nil, fmt.Errorf("cannot convert %T to FLOAT", v)
-		}
+		return coerceToFloat(v)
 	case storage.TextType:
 		return fmt.Sprintf("%v", v), nil
 	case storage.BoolType:
-		switch x := v.(type) {
-		case bool:
-			return x, nil
-		case int, int64:
-			return x != 0, nil
-		case float64:
-			return x != 0, nil
-		case string:
-			s := strings.ToLower(strings.TrimSpace(x))
-			return s == "true" || s == "1" || s == "t" || s == "yes", nil
-		default:
-			return nil, fmt.Errorf("cannot convert %T to BOOL", v)
-		}
+		return coerceToBool(v)
 	case storage.JsonType:
-		switch x := v.(type) {
-		case string:
-			var anyv any
-			if json.Unmarshal([]byte(x), &anyv) == nil {
-				return anyv, nil
-			}
-			return x, nil
-		default:
-			return x, nil
-		}
+		return coerceToJson(v)
 	default:
 		return v, nil
+	}
+}
+
+func coerceToInt(v any) (any, error) {
+	switch x := v.(type) {
+	case int:
+		return x, nil
+	case int64:
+		return int(x), nil
+	case float64:
+		return int(x), nil
+	case string:
+		n, err := strconv.Atoi(strings.TrimSpace(x))
+		if err != nil {
+			return nil, fmt.Errorf("cannot convert %q to INT", x)
+		}
+		return n, nil
+	case bool:
+		if x {
+			return 1, nil
+		}
+		return 0, nil
+	default:
+		return nil, fmt.Errorf("cannot convert %T to INT", v)
+	}
+}
+
+func coerceToFloat(v any) (any, error) {
+	switch x := v.(type) {
+	case int:
+		return float64(x), nil
+	case int64:
+		return float64(x), nil
+	case float64:
+		return x, nil
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
+		if err != nil {
+			return nil, fmt.Errorf("cannot convert %q to FLOAT", x)
+		}
+		return f, nil
+	case bool:
+		if x {
+			return 1.0, nil
+		}
+		return 0.0, nil
+	default:
+		return nil, fmt.Errorf("cannot convert %T to FLOAT", v)
+	}
+}
+
+func coerceToBool(v any) (any, error) {
+	switch x := v.(type) {
+	case bool:
+		return x, nil
+	case int, int64:
+		return x != 0, nil
+	case float64:
+		return x != 0, nil
+	case string:
+		s := strings.ToLower(strings.TrimSpace(x))
+		return s == "true" || s == "1" || s == "t" || s == "yes", nil
+	default:
+		return nil, fmt.Errorf("cannot convert %T to BOOL", v)
+	}
+}
+
+func coerceToJson(v any) (any, error) {
+	switch x := v.(type) {
+	case string:
+		var anyv any
+		if json.Unmarshal([]byte(x), &anyv) == nil {
+			return anyv, nil
+		}
+		return x, nil
+	default:
+		return x, nil
 	}
 }
 
