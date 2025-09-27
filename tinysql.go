@@ -48,3 +48,13 @@ func GetVal(row engine.Row, name string) (any, bool) {
 	v, ok := row[strings.ToLower(name)]
 	return v, ok
 }
+
+// SaveToFile saves the database to a GOB file for persistence
+func SaveToFile(db *storage.DB, filename string) error {
+	return storage.SaveToFile(db, filename)
+}
+
+// LoadFromFile loads a database from a GOB file
+func LoadFromFile(filename string) (*storage.DB, error) {
+	return storage.LoadFromFile(filename)
+}
