@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	tsql "tinysql"
-	"tinysql/internal/storage"
+	tsql "github.com/SimonWaldherr/tinySQL"
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 // TestBasicSQL tests basic SQL operations
@@ -1055,7 +1055,7 @@ func TestQueryCompilationPerformance(t *testing.T) {
 func TestGOBPersistenceWithNewDataTypes(t *testing.T) {
 	ctx := context.Background()
 	tempFile := "/tmp/tinysql_test.gob"
-	
+
 	// Clean up temp file after test
 	defer func() {
 		os.Remove(tempFile)
@@ -1206,7 +1206,7 @@ func TestGOBPersistenceWithNewDataTypes(t *testing.T) {
 	}
 
 	// === PHASE 4: Verify loaded data matches original ===
-	
+
 	// Check that tables exist
 	tables := loadedDB.ListTables(tenant)
 	if len(tables) != 2 {
@@ -1270,7 +1270,7 @@ func TestGOBPersistenceWithNewDataTypes(t *testing.T) {
 		if i >= 3 { // We only have 3 rows
 			break
 		}
-		
+
 		// Check first few columns for data integrity
 		if len(row) >= 2 {
 			// ID should be sequential: 1, 2, 3
@@ -1278,7 +1278,7 @@ func TestGOBPersistenceWithNewDataTypes(t *testing.T) {
 			if row[0] != expectedID {
 				t.Errorf("Row %d ID mismatch: expected %v, got %v", i, expectedID, row[0])
 			}
-			
+
 			// Names should be Alice Johnson, Bob Smith, Carol Davis
 			expectedNames := []string{"Alice Johnson", "Bob Smith", "Carol Davis"}
 			if i < len(expectedNames) && row[1] != expectedNames[i] {

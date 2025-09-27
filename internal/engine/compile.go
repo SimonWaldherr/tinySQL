@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"tinysql/internal/storage"
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 // CompiledQuery represents a pre-parsed and cached SQL query
@@ -111,10 +111,10 @@ func (qc *QueryCache) Size() int {
 func (qc *QueryCache) Stats() map[string]interface{} {
 	qc.mu.RLock()
 	defer qc.mu.RUnlock()
-	
+
 	return map[string]interface{}{
-		"size":     len(qc.queries),
-		"maxSize":  qc.maxSize,
-		"queries":  len(qc.queries),
+		"size":    len(qc.queries),
+		"maxSize": qc.maxSize,
+		"queries": len(qc.queries),
 	}
 }

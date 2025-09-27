@@ -15,8 +15,8 @@ import (
 	"sync"
 	"time"
 
-	"tinysql/internal/engine"
-	"tinysql/internal/storage"
+	"github.com/SimonWaldherr/tinySQL/internal/engine"
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 // Treiber registrieren

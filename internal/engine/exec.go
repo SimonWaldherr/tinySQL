@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"tinysql/internal/storage"
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 type Row map[string]any

@@ -14,9 +14,9 @@ import (
 	"strings"
 	"time"
 
-	_ "tinysql/internal/driver"
-	"tinysql/internal/engine"
-	"tinysql/internal/storage"
+	_ "github.com/SimonWaldherr/tinySQL/internal/driver"
+	"github.com/SimonWaldherr/tinySQL/internal/engine"
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 var flagDemo = flag.Bool("demo", false, "run built-in demo instead of REPL")

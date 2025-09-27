@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"strings"
 
-	"tinysql/internal/storage"
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 type Parser struct {
@@ -508,13 +508,13 @@ func (p *Parser) parseColumnDefs() ([]storage.Column, error) {
 		if typ < 0 {
 			return nil, p.errf("unknown type for column %q", name)
 		}
-		
+
 		col := storage.Column{
-			Name: name,
-			Type: typ,
+			Name:       name,
+			Type:       typ,
 			Constraint: storage.NoConstraint,
 		}
-		
+
 		// Parse constraints
 		if p.cur.Typ == tKeyword {
 			switch p.cur.Val {
@@ -557,7 +557,7 @@ func (p *Parser) parseColumnDefs() ([]storage.Column, error) {
 				}
 			}
 		}
-		
+
 		cols = append(cols, col)
 		if p.cur.Typ == tSymbol && p.cur.Val == "," {
 			p.next()

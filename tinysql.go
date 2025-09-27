@@ -4,8 +4,8 @@ import (
 	"context"
 	"strings"
 
-	"tinysql/internal/engine"
-	"tinysql/internal/storage"
+	"github.com/SimonWaldherr/tinySQL/internal/engine"
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 // NewDB creates a new database instance
