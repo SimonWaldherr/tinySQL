@@ -1,11 +1,12 @@
 package tinysql_test
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
 
-	tsql "github.com/simonwaldherr/tinysql"
+	tsql "tinysql"
 )
 
 // TestBasicSQL tests basic SQL operations
@@ -18,7 +19,7 @@ func TestBasicSQL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to parse CREATE TABLE: %v", err)
 	}
-	_, err = tsql.Execute(db, st)
+	_, err = tsql.Execute(context.Background(), db, "default", st)
 	if err != nil {
 		t.Fatalf("Failed to Execute CREATE TABLE: %v", err)
 	}
@@ -29,7 +30,7 @@ func TestBasicSQL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to parse INSERT: %v", err)
 	}
-	_, err = tsql.Execute(db, st)
+	_, err = tsql.Execute(context.Background(), db, "default", st)
 	if err != nil {
 		t.Fatalf("Failed to Execute INSERT: %v", err)
 	}
@@ -40,7 +41,7 @@ func TestBasicSQL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to parse SELECT: %v", err)
 	}
-	rs, err := tsql.Execute(db, st)
+	rs, err := tsql.Execute(context.Background(), db, "default", st)
 	if err != nil {
 		t.Fatalf("Failed to Execute SELECT: %v", err)
 	}
@@ -64,7 +65,7 @@ func TestBooleanValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to parse CREATE TABLE: %v", err)
 	}
-	_, err = tsql.Execute(db, st)
+	_, err = tsql.Execute(context.Background(), db, "default", st)
 	if err != nil {
 		t.Fatalf("Failed to Execute CREATE TABLE: %v", err)
 	}
@@ -75,7 +76,7 @@ func TestBooleanValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to parse INSERT with true: %v", err)
 	}
-	_, err = tsql.Execute(db, st)
+	_, err = tsql.Execute(context.Background(), db, "default", st)
 	if err != nil {
 		t.Fatalf("Failed to Execute INSERT with true: %v", err)
 	}
@@ -86,7 +87,7 @@ func TestBooleanValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to parse INSERT with false: %v", err)
 	}
-	_, err = tsql.Execute(db, st)
+	_, err = tsql.Execute(context.Background(), db, "default", st)
 	if err != nil {
 		t.Fatalf("Failed to Execute INSERT with false: %v", err)
 	}
@@ -97,7 +98,7 @@ func TestBooleanValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to parse SELECT: %v", err)
 	}
-	rs, err := tsql.Execute(db, st)
+	rs, err := tsql.Execute(context.Background(), db, "default", st)
 	if err != nil {
 		t.Fatalf("Failed to Execute SELECT: %v", err)
 	}
@@ -166,7 +167,7 @@ func Example() {
 			fmt.Println()
 			return
 		}
-		rs, err := tsql.Execute(db, st)
+		rs, err := tsql.Execute(context.Background(), db, "default", st)
 		if err != nil {
 			fmt.Println("ERR:", err)
 			fmt.Println()

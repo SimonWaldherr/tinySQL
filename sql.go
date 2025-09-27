@@ -1,40 +1,25 @@
 // TinySQL - a small educational SQL engine using only Go's standard library.
 // Focus: clarity & reliability over performance and SQL coverage.
-// Supported (subset):
-//   - CREATE TABLE name (col TYPE, ...)
-//   - CREATE TEMP TABLE name AS SELECT ...
-//   - DROP TABLE name
-//   - INSERT INTO name (c1, c2, ...) VALUES (v1, v2, ...)
-//   - UPDATE name SET c = expr [, ...] WHERE expr
-//   - DELETE FROM name WHERE expr
-//   - SELECT [*, expr [AS alias], ...]
-//       FROM t [AS a] [JOIN u [AS b] ON expr]...
-//       [WHERE expr]
-//       [GROUP BY col[, ...]]
-//       [HAVING expr]
-//       [ORDER BY col [ASC|DESC][, ...]]
-//       [LIMIT n] [OFFSET n]
-//
-// Aggregates: COUNT, COUNT(*), SUM, AVG, MIN, MAX
-// Types: INT, FLOAT, TEXT, BOOL
-//
-// Notes & limits:
-//   - SQL subset intentionally small. No subqueries; only INNER JOIN.
-//   - GROUP BY expects column refs (no full expression grouping).
-//   - SELECT * expands to alias.col names (or table.col if no alias).
-//   - NULL semantics are minimal; IS NULL not implemented.
-//   - Error messages aim to be helpful and localized.
 
 package tinysql
 
 import (
-	"bufio"
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"encoding/base64"
+	"encoding/gob"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 	"unicode"
 )
 
@@ -45,6 +30,7 @@ const (
 	FloatType
 	TextType
 	BoolType
+	JsonType
 )
 
 func (t ColType) String() string {
@@ -57,6 +43,8 @@ func (t ColType) String() string {
 		return "TEXT"
 	case BoolType:
 		return "BOOL"
+	case JsonType:
+		return "JSON"
 	default:
 		return "UNKNOWN"
 	}
@@ -70,10 +58,10 @@ type Column struct {
 type Table struct {
 	Name    string
 	Cols    []Column
-	Rows    [][]interface{} // each row len == len(Cols)
+	Rows    [][]any
 	IsTemp  bool
-	colPos  map[string]int // lower-cased column name -> index
-	Version int            // bump on write to help debug
+	colPos  map[string]int
+	Version int
 }
 
 func NewTable(name string, cols []Column, isTemp bool) *Table {
@@ -83,7 +71,6 @@ func NewTable(name string, cols []Column, isTemp bool) *Table {
 	}
 	return &Table{Name: name, Cols: cols, colPos: pos, IsTemp: isTemp}
 }
-
 func (t *Table) colIndex(name string) (int, error) {
 	i, ok := t.colPos[strings.ToLower(name)]
 	if !ok {
@@ -92,52 +79,85 @@ func (t *Table) colIndex(name string) (int, error) {
 	return i, nil
 }
 
+type tenantDB struct {
+	tables map[string]*Table
+}
 type DB struct {
-	tables map[string]*Table // lower-cased name -> table
+	tenants map[string]*tenantDB
 }
 
-func NewDB() *DB { return &DB{tables: make(map[string]*Table)} }
+func NewDB() *DB { return &DB{tenants: make(map[string]*tenantDB)} }
 
-func (db *DB) Get(name string) (*Table, error) {
-	t, ok := db.tables[strings.ToLower(name)]
+func (db *DB) getTenant(tn string) *tenantDB {
+	tn = strings.ToLower(tn)
+	td := db.tenants[tn]
+	if td == nil {
+		td = &tenantDB{tables: map[string]*Table{}}
+		db.tenants[tn] = td
+	}
+	return td
+}
+func (db *DB) Get(tn, name string) (*Table, error) {
+	td := db.getTenant(tn)
+	t, ok := td.tables[strings.ToLower(name)]
 	if !ok {
-		return nil, fmt.Errorf("no such table %q", name)
+		return nil, fmt.Errorf("no such table %q (tenant %q)", name, tn)
 	}
 	return t, nil
 }
-
-func (db *DB) Put(t *Table) error {
-	_, exists := db.tables[strings.ToLower(t.Name)]
-	if exists {
-		return fmt.Errorf("table %q already exists", t.Name)
+func (db *DB) Put(tn string, t *Table) error {
+	td := db.getTenant(tn)
+	lc := strings.ToLower(t.Name)
+	if _, exists := td.tables[lc]; exists {
+		return fmt.Errorf("table %q already exists (tenant %q)", t.Name, tn)
 	}
-	db.tables[strings.ToLower(t.Name)] = t
+	td.tables[lc] = t
 	return nil
 }
-
-func (db *DB) Drop(name string) error {
-	_, ok := db.tables[strings.ToLower(name)]
-	if !ok {
-		return fmt.Errorf("no such table %q", name)
+func (db *DB) Drop(tn, name string) error {
+	td := db.getTenant(tn)
+	lc := strings.ToLower(name)
+	if _, ok := td.tables[lc]; !ok {
+		return fmt.Errorf("no such table %q (tenant %q)", name, tn)
 	}
-	delete(db.tables, strings.ToLower(name))
+	delete(td.tables, lc)
 	return nil
 }
-
-func (db *DB) ListTables() []*Table {
-	names := make([]string, 0, len(db.tables))
-	for k := range db.tables {
+func (db *DB) ListTables(tn string) []*Table {
+	td := db.getTenant(tn)
+	names := make([]string, 0, len(td.tables))
+	for k := range td.tables {
 		names = append(names, k)
 	}
 	sort.Strings(names)
 	out := make([]*Table, 0, len(names))
 	for _, n := range names {
-		out = append(out, db.tables[n])
+		out = append(out, td.tables[n])
 	}
 	return out
 }
 
-// TokenType is intentionally small. Keywords come as Keyword with .Val uppercased.
+// DeepClone (für einfache Transaktionen/Checkpoints)
+func (db *DB) DeepClone() *DB {
+	out := NewDB()
+	for tn, tdb := range db.tenants {
+		for _, t := range tdb.tables {
+			cols := make([]Column, len(t.Cols))
+			copy(cols, t.Cols)
+			nt := NewTable(t.Name, cols, t.IsTemp)
+			nt.Version = t.Version
+			nt.Rows = make([][]any, len(t.Rows))
+			for i := range t.Rows {
+				row := make([]any, len(t.Rows[i]))
+				copy(row, t.Rows[i])
+				nt.Rows[i] = row
+			}
+			out.Put(tn, nt)
+		}
+	}
+	return out
+}
+
 type TokenType int
 
 const (
@@ -145,150 +165,129 @@ const (
 	tIdent
 	tNumber
 	tString
-	tSymbol // punctuation/operators (, ) , * + - / = != <> <= >= < > .
+	tSymbol
 	tKeyword
 )
 
 type Token struct {
 	Typ TokenType
 	Val string
-	Pos int // byte offset in input for error context
+	Pos int
 }
-
 type Lexer struct {
 	s   string
 	pos int
 }
 
-func newLexer(s string) *Lexer { return &Lexer{s: s, pos: 0} }
-
+func newLexer(s string) *Lexer { return &Lexer{s: s} }
 func (lx *Lexer) peek() rune {
 	if lx.pos >= len(lx.s) {
 		return 0
 	}
-	r, _ := utf8DecodeRuneInString(lx.s[lx.pos:])
-	return r
+	return rune(lx.s[lx.pos])
 }
-
 func (lx *Lexer) peekN(n int) rune {
-	p := lx.pos
-	for i := 0; i < n; i++ {
-		if p >= len(lx.s) {
-			return 0
-		}
-		_, sz := utf8DecodeRuneInString(lx.s[p:])
-		p += sz
-	}
+	p := lx.pos + n
 	if p >= len(lx.s) {
 		return 0
 	}
-	r, _ := utf8DecodeRuneInString(lx.s[p:])
-	return r
+	return rune(lx.s[p])
 }
-
 func (lx *Lexer) next() rune {
 	if lx.pos >= len(lx.s) {
 		return 0
 	}
-	r, size := utf8DecodeRuneInString(lx.s[lx.pos:])
-	lx.pos += size
+	r := rune(lx.s[lx.pos])
+	lx.pos++
 	return r
 }
-
-func (lx *Lexer) emit(tt TokenType, start int, val string) Token {
-	return Token{Typ: tt, Val: val, Pos: start}
-}
-
-func (lx *Lexer) skipWhitespace() {
+func (lx *Lexer) skipWS() {
 	for {
-		r := lx.peek()
-		if r == 0 {
+		if lx.pos >= len(lx.s) {
 			return
 		}
+		r := rune(lx.s[lx.pos])
 		if unicode.IsSpace(r) {
-			lx.next()
+			lx.pos++
 			continue
 		}
-		// SQL comments: -- line, /* block */
+		// -- line comment
 		if r == '-' && lx.peekN(1) == '-' {
-			lx.next()
-			lx.next()
-			for {
-				r2 := lx.next()
-				if r2 == 0 || r2 == '\n' {
-					break
-				}
+			lx.pos += 2
+			for lx.pos < len(lx.s) && lx.s[lx.pos] != '\n' {
+				lx.pos++
 			}
 			continue
 		}
+		// /* block */
 		if r == '/' && lx.peekN(1) == '*' {
-			lx.next()
-			lx.next()
-			for {
-				r2 := lx.next()
-				if r2 == 0 {
-					return
-				}
-				if r2 == '*' && lx.peek() == '/' {
-					lx.next()
+			lx.pos += 2
+			for lx.pos < len(lx.s) {
+				if lx.s[lx.pos] == '*' && lx.peekN(1) == '/' {
+					lx.pos += 2
 					break
 				}
+				lx.pos++
 			}
 			continue
 		}
 		return
 	}
 }
-
-func (lx *Lexer) NextToken() Token {
-	lx.skipWhitespace()
+func (lx *Lexer) Next() Token {
+	lx.skipWS()
 	start := lx.pos
-	r := lx.peek()
-	if r == 0 {
-		return lx.emit(tEOF, start, "")
+	if start >= len(lx.s) {
+		return Token{Typ: tEOF, Val: "", Pos: start}
 	}
-	// Strings: single quotes '...'
+	r := lx.peek()
+	// string
 	if r == '\'' {
-		lx.next() // consume opening
+		lx.next()
 		var sb strings.Builder
-	loop:
 		for {
-			ch := lx.next()
-			if ch == 0 {
-				return lx.emit(tString, start, sb.String())
+			if lx.pos >= len(lx.s) {
+				break
 			}
+			ch := lx.next()
 			if ch == '\'' {
-				// escape: '' -> '
 				if lx.peek() == '\'' {
 					lx.next()
 					sb.WriteRune('\'')
 					continue
 				}
-				break loop
+				break
 			}
 			sb.WriteRune(ch)
 		}
-		return lx.emit(tString, start, sb.String())
+		return Token{Typ: tString, Val: sb.String(), Pos: start}
 	}
-	// Numbers: simple [0-9]+(.[0-9]+)?
+	// number
 	if unicode.IsDigit(r) {
 		var sb strings.Builder
 		dot := false
-		for unicode.IsDigit(lx.peek()) || (!dot && lx.peek() == '.') {
-			if lx.peek() == '.' {
-				dot = true
+		for lx.pos < len(lx.s) {
+			ch := lx.peek()
+			if unicode.IsDigit(ch) || (!dot && ch == '.') {
+				if ch == '.' {
+					dot = true
+				}
+				sb.WriteByte(byte(ch))
+				lx.pos++
+			} else {
+				break
 			}
-			sb.WriteRune(lx.next())
 		}
-		return lx.emit(tNumber, start, sb.String())
+		return Token{Typ: tNumber, Val: sb.String(), Pos: start}
 	}
-	// Identifiers / keywords: [A-Za-z_][A-Za-z0-9_]*
+	// ident/keyword
 	if unicode.IsLetter(r) || r == '_' {
 		var sb strings.Builder
-		for {
+		for lx.pos < len(lx.s) {
 			ch := lx.peek()
 			if unicode.IsLetter(ch) || unicode.IsDigit(ch) || ch == '_' || ch == '.' {
-				sb.WriteRune(lx.next())
+				sb.WriteByte(byte(ch))
+				lx.pos++
 			} else {
 				break
 			}
@@ -296,53 +295,46 @@ func (lx *Lexer) NextToken() Token {
 		val := sb.String()
 		up := strings.ToUpper(val)
 		if isKeyword(up) {
-			return lx.emit(tKeyword, start, up)
+			return Token{Typ: tKeyword, Val: up, Pos: start}
 		}
-		return lx.emit(tIdent, start, val)
+		return Token{Typ: tIdent, Val: val, Pos: start}
 	}
-	// Symbols and 2-char operators
+	// symbol
 	switch r {
-	case '(', ')', ',', '*', '+', '-', '/', '.', ';':
+	case '(', ')', ',', '*', '+', '-', '/', '.', ';', '?':
 		lx.next()
-		return lx.emit(tSymbol, start, string(r))
+		return Token{Typ: tSymbol, Val: string(r), Pos: start}
 	case '=', '<', '>', '!':
 		a := lx.next()
 		b := lx.peek()
 		if (a == '<' && (b == '=' || b == '>')) || (a == '>' && b == '=') || (a == '!' && b == '=') {
 			lx.next()
-			return lx.emit(tSymbol, start, string(a)+string(b))
+			return Token{Typ: tSymbol, Val: string(a) + string(b), Pos: start}
 		}
-		return lx.emit(tSymbol, start, string(a))
+		return Token{Typ: tSymbol, Val: string(a), Pos: start}
 	default:
 		lx.next()
-		return lx.emit(tSymbol, start, string(r))
+		return Token{Typ: tSymbol, Val: string(r), Pos: start}
 	}
 }
 
 func isKeyword(up string) bool {
 	switch up {
-	case "SELECT", "DISTINCT",
-		"FROM", "WHERE", "GROUP", "BY", "HAVING", "ORDER", "ASC", "DESC", "LIMIT", "OFFSET",
+	case "SELECT", "DISTINCT", "FROM", "WHERE", "GROUP", "BY", "HAVING",
+		"ORDER", "ASC", "DESC", "LIMIT", "OFFSET",
 		"JOIN", "LEFT", "RIGHT", "OUTER", "ON", "AS",
 		"CREATE", "TABLE", "TEMP", "DROP",
 		"INSERT", "INTO", "VALUES",
 		"UPDATE", "SET", "DELETE",
-		"INT", "FLOAT", "TEXT", "BOOL",
+		"INT", "FLOAT", "TEXT", "BOOL", "JSON",
 		"AND", "OR", "NOT", "IS", "NULL", "TRUE", "FALSE",
 		"COUNT", "SUM", "AVG", "MIN", "MAX",
-		"COALESCE", "NULLIF":
+		"COALESCE", "NULLIF",
+		"JSON_GET":
 		return true
 	default:
 		return false
 	}
-}
-
-// minimal ascii fast-path utf8 decoding
-func utf8DecodeRuneInString(s string) (r rune, size int) {
-	if len(s) == 0 {
-		return 0, 0
-	}
-	return rune(s[0]), 1
 }
 
 type Parser struct {
@@ -353,13 +345,11 @@ type Parser struct {
 
 func NewParser(sql string) *Parser {
 	p := &Parser{lx: newLexer(sql)}
-	p.cur = p.lx.NextToken()
-	p.peek = p.lx.NextToken()
+	p.cur = p.lx.Next()
+	p.peek = p.lx.Next()
 	return p
 }
-
-func (p *Parser) next() { p.cur, p.peek = p.peek, p.lx.NextToken() }
-
+func (p *Parser) next() { p.cur, p.peek = p.peek, p.lx.Next() }
 func (p *Parser) expectSymbol(sym string) error {
 	if p.cur.Typ == tSymbol && p.cur.Val == sym {
 		p.next()
@@ -367,7 +357,6 @@ func (p *Parser) expectSymbol(sym string) error {
 	}
 	return p.errf("expected symbol %q", sym)
 }
-
 func (p *Parser) expectKeyword(kw string) error {
 	if p.cur.Typ == tKeyword && p.cur.Val == kw {
 		p.next()
@@ -375,22 +364,21 @@ func (p *Parser) expectKeyword(kw string) error {
 	}
 	return p.errf("expected keyword %q", kw)
 }
-
-func (p *Parser) errf(format string, a ...interface{}) error {
+func (p *Parser) errf(format string, a ...any) error {
 	return fmt.Errorf("parse error near %q: %s", p.cur.Val, fmt.Sprintf(format, a...))
 }
 
 type Expr interface{}
 
 type (
-	VarRef struct{ Name string }
-	Literal struct{ Val interface{} }
+	VarRef  struct{ Name string }
+	Literal struct{ Val any }
 	Unary   struct {
-		Op   string // "-" or "NOT"
+		Op   string
 		Expr Expr
 	}
 	Binary struct {
-		Op    string // + - * / = != <> < <= > >= AND OR
+		Op    string
 		Left  Expr
 		Right Expr
 	}
@@ -399,8 +387,8 @@ type (
 		Negate bool
 	}
 	FuncCall struct {
-		Name string // COUNT, SUM, AVG, MIN, MAX, COALESCE, NULLIF
-		Args []Expr // COUNT(*) => Star = true
+		Name string
+		Args []Expr
 		Star bool
 	}
 )
@@ -413,26 +401,21 @@ type CreateTable struct {
 	IsTemp   bool
 	AsSelect *Select
 }
-
 type DropTable struct{ Name string }
-
 type Insert struct {
 	Table string
 	Cols  []string
 	Vals  []Expr
 }
-
 type Update struct {
 	Table string
 	Sets  map[string]Expr
 	Where Expr
 }
-
 type Delete struct {
 	Table string
 	Where Expr
 }
-
 type JoinType int
 
 const (
@@ -453,24 +436,20 @@ type Select struct {
 	Limit    *int
 	Offset   *int
 }
-
 type FromItem struct {
 	Table string
-	Alias string // if empty, alias = table
+	Alias string
 }
-
 type JoinClause struct {
 	Type  JoinType
 	Right FromItem
 	On    Expr
 }
-
 type SelectItem struct {
-	Expr  Expr // or nil if Star
+	Expr  Expr
 	Alias string
 	Star  bool
 }
-
 type OrderItem struct {
 	Col  string
 	Desc bool
@@ -491,10 +470,9 @@ func (p *Parser) ParseStatement() (Statement, error) {
 	case p.cur.Typ == tKeyword && p.cur.Val == "SELECT":
 		return p.parseSelect()
 	default:
-		return nil, p.errf("expected a statement (CREATE/DROP/INSERT/UPDATE/DELETE/SELECT)")
+		return nil, p.errf("expected a statement")
 	}
 }
-
 func (p *Parser) parseCreate() (Statement, error) {
 	p.next()
 	isTemp := false
@@ -509,7 +487,6 @@ func (p *Parser) parseCreate() (Statement, error) {
 	if name == "" {
 		return nil, p.errf("expected table name")
 	}
-
 	if p.cur.Typ == tSymbol && p.cur.Val == "(" {
 		cols, err := p.parseColumnDefs()
 		if err != nil {
@@ -525,9 +502,8 @@ func (p *Parser) parseCreate() (Statement, error) {
 		}
 		return &CreateTable{Name: name, IsTemp: isTemp, AsSelect: sel}, nil
 	}
-	return nil, p.errf("expected '(' for column defs or AS SELECT")
+	return nil, p.errf("expected '(' or AS SELECT")
 }
-
 func (p *Parser) parseDrop() (Statement, error) {
 	p.next()
 	if err := p.expectKeyword("TABLE"); err != nil {
@@ -539,7 +515,6 @@ func (p *Parser) parseDrop() (Statement, error) {
 	}
 	return &DropTable{Name: name}, nil
 }
-
 func (p *Parser) parseInsert() (Statement, error) {
 	p.next()
 	if err := p.expectKeyword("INTO"); err != nil {
@@ -547,7 +522,7 @@ func (p *Parser) parseInsert() (Statement, error) {
 	}
 	tname := p.parseIdentLike()
 	if tname == "" {
-		return nil, p.errf("expected table name after INSERT INTO")
+		return nil, p.errf("expected table name")
 	}
 	var cols []string
 	if p.cur.Typ == tSymbol && p.cur.Val == "(" {
@@ -555,7 +530,7 @@ func (p *Parser) parseInsert() (Statement, error) {
 		for {
 			id := p.parseIdentLike()
 			if id == "" {
-				return nil, p.errf("expected column name in INSERT column list")
+				return nil, p.errf("expected column name")
 			}
 			cols = append(cols, id)
 			if p.cur.Typ == tSymbol && p.cur.Val == "," {
@@ -592,21 +567,20 @@ func (p *Parser) parseInsert() (Statement, error) {
 	}
 	return &Insert{Table: tname, Cols: cols, Vals: vals}, nil
 }
-
 func (p *Parser) parseUpdate() (Statement, error) {
 	p.next()
 	tname := p.parseIdentLike()
 	if tname == "" {
-		return nil, p.errf("expected table name in UPDATE")
+		return nil, p.errf("expected table name")
 	}
 	if err := p.expectKeyword("SET"); err != nil {
 		return nil, err
 	}
-	sets := make(map[string]Expr)
+	sets := map[string]Expr{}
 	for {
 		col := p.parseIdentLike()
 		if col == "" {
-			return nil, p.errf("expected column name in SET")
+			return nil, p.errf("expected column name")
 		}
 		if err := p.expectSymbol("="); err != nil {
 			return nil, err
@@ -633,7 +607,6 @@ func (p *Parser) parseUpdate() (Statement, error) {
 	}
 	return &Update{Table: tname, Sets: sets, Where: where}, nil
 }
-
 func (p *Parser) parseDelete() (Statement, error) {
 	p.next()
 	if err := p.expectKeyword("FROM"); err != nil {
@@ -641,7 +614,7 @@ func (p *Parser) parseDelete() (Statement, error) {
 	}
 	tname := p.parseIdentLike()
 	if tname == "" {
-		return nil, p.errf("expected table name in DELETE FROM")
+		return nil, p.errf("expected table name")
 	}
 	var where Expr
 	if p.cur.Typ == tKeyword && p.cur.Val == "WHERE" {
@@ -654,20 +627,15 @@ func (p *Parser) parseDelete() (Statement, error) {
 	}
 	return &Delete{Table: tname, Where: where}, nil
 }
-
 func (p *Parser) parseSelect() (*Select, error) {
 	if err := p.expectKeyword("SELECT"); err != nil {
 		return nil, err
 	}
 	sel := &Select{}
-
-	// DISTINCT
 	if p.cur.Typ == tKeyword && p.cur.Val == "DISTINCT" {
 		sel.Distinct = true
 		p.next()
 	}
-
-	// projections
 	if p.cur.Typ == tSymbol && p.cur.Val == "*" {
 		p.next()
 		sel.Projs = append(sel.Projs, SelectItem{Star: true})
@@ -682,10 +650,9 @@ func (p *Parser) parseSelect() (*Select, error) {
 				p.next()
 				alias = p.parseIdentLike()
 				if alias == "" {
-					return nil, p.errf("expected alias after AS")
+					return nil, p.errf("expected alias")
 				}
 			} else if p.cur.Typ == tIdent {
-				// implicit alias
 				alias = p.cur.Val
 				p.next()
 			}
@@ -697,28 +664,26 @@ func (p *Parser) parseSelect() (*Select, error) {
 			break
 		}
 	}
-
 	if err := p.expectKeyword("FROM"); err != nil {
 		return nil, err
 	}
-	fromTbl := p.parseIdentLike()
-	if fromTbl == "" {
+	from := p.parseIdentLike()
+	if from == "" {
 		return nil, p.errf("expected table after FROM")
 	}
-	alias := fromTbl
+	alias := from
 	if p.cur.Typ == tKeyword && p.cur.Val == "AS" {
 		p.next()
 		alias = p.parseIdentLike()
 		if alias == "" {
-			return nil, p.errf("expected alias after AS")
+			return nil, p.errf("expected alias")
 		}
 	} else if p.cur.Typ == tIdent {
 		alias = p.cur.Val
 		p.next()
 	}
-	sel.From = FromItem{Table: fromTbl, Alias: alias}
+	sel.From = FromItem{Table: from, Alias: alias}
 
-	// JOINs: INNER, LEFT OUTER, RIGHT OUTER
 	for {
 		if p.cur.Typ == tKeyword && p.cur.Val == "JOIN" {
 			p.next()
@@ -750,19 +715,14 @@ func (p *Parser) parseSelect() (*Select, error) {
 		}
 		break
 	}
-
-	var where Expr
 	if p.cur.Typ == tKeyword && p.cur.Val == "WHERE" {
 		p.next()
 		e, err := p.parseExpr()
 		if err != nil {
 			return nil, err
 		}
-		where = e
+		sel.Where = e
 	}
-	sel.Where = where
-
-	var groupBy []VarRef
 	if p.cur.Typ == tKeyword && p.cur.Val == "GROUP" {
 		p.next()
 		if err := p.expectKeyword("BY"); err != nil {
@@ -771,9 +731,9 @@ func (p *Parser) parseSelect() (*Select, error) {
 		for {
 			id := p.parseIdentLike()
 			if id == "" {
-				return nil, p.errf("GROUP BY expects column identifiers")
+				return nil, p.errf("GROUP BY expects column")
 			}
-			groupBy = append(groupBy, VarRef{Name: id})
+			sel.GroupBy = append(sel.GroupBy, VarRef{Name: id})
 			if p.cur.Typ == tSymbol && p.cur.Val == "," {
 				p.next()
 				continue
@@ -781,8 +741,6 @@ func (p *Parser) parseSelect() (*Select, error) {
 			break
 		}
 	}
-	sel.GroupBy = groupBy
-
 	if p.cur.Typ == tKeyword && p.cur.Val == "HAVING" {
 		p.next()
 		e, err := p.parseExpr()
@@ -791,8 +749,6 @@ func (p *Parser) parseSelect() (*Select, error) {
 		}
 		sel.Having = e
 	}
-
-	var orderBy []OrderItem
 	if p.cur.Typ == tKeyword && p.cur.Val == "ORDER" {
 		p.next()
 		if err := p.expectKeyword("BY"); err != nil {
@@ -801,14 +757,14 @@ func (p *Parser) parseSelect() (*Select, error) {
 		for {
 			col := p.parseIdentLike()
 			if col == "" {
-				return nil, p.errf("ORDER BY expects column identifiers")
+				return nil, p.errf("ORDER BY expects column")
 			}
 			desc := false
 			if p.cur.Typ == tKeyword && (p.cur.Val == "ASC" || p.cur.Val == "DESC") {
 				desc = (p.cur.Val == "DESC")
 				p.next()
 			}
-			orderBy = append(orderBy, OrderItem{Col: col, Desc: desc})
+			sel.OrderBy = append(sel.OrderBy, OrderItem{Col: col, Desc: desc})
 			if p.cur.Typ == tSymbol && p.cur.Val == "," {
 				p.next()
 				continue
@@ -816,13 +772,11 @@ func (p *Parser) parseSelect() (*Select, error) {
 			break
 		}
 	}
-	sel.OrderBy = orderBy
-
 	if p.cur.Typ == tKeyword && p.cur.Val == "LIMIT" {
 		p.next()
 		n := p.parseIntLiteral()
 		if n == nil {
-			return nil, p.errf("LIMIT expects an integer")
+			return nil, p.errf("LIMIT expects integer")
 		}
 		sel.Limit = n
 	}
@@ -830,28 +784,26 @@ func (p *Parser) parseSelect() (*Select, error) {
 		p.next()
 		n := p.parseIntLiteral()
 		if n == nil {
-			return nil, p.errf("OFFSET expects an integer")
+			return nil, p.errf("OFFSET expects integer")
 		}
 		sel.Offset = n
 	}
-
 	return sel, nil
 }
-
 func (p *Parser) parseJoinTail() (string, string, Expr, error) {
-	rtbl := p.parseIdentLike()
-	if rtbl == "" {
-		return "", "", nil, p.errf("expected table after JOIN")
+	rt := p.parseIdentLike()
+	if rt == "" {
+		return "", "", nil, p.errf("expected table")
 	}
-	ralias := rtbl
+	alias := rt
 	if p.cur.Typ == tKeyword && p.cur.Val == "AS" {
 		p.next()
-		ralias = p.parseIdentLike()
-		if ralias == "" {
-			return "", "", nil, p.errf("expected alias after AS")
+		alias = p.parseIdentLike()
+		if alias == "" {
+			return "", "", nil, p.errf("expected alias")
 		}
 	} else if p.cur.Typ == tIdent {
-		ralias = p.cur.Val
+		alias = p.cur.Val
 		p.next()
 	}
 	if err := p.expectKeyword("ON"); err != nil {
@@ -861,9 +813,8 @@ func (p *Parser) parseJoinTail() (string, string, Expr, error) {
 	if err != nil {
 		return "", "", nil, err
 	}
-	return rtbl, ralias, on, nil
+	return rt, alias, on, nil
 }
-
 func (p *Parser) parseColumnDefs() ([]Column, error) {
 	if err := p.expectSymbol("("); err != nil {
 		return nil, err
@@ -876,7 +827,7 @@ func (p *Parser) parseColumnDefs() ([]Column, error) {
 		}
 		typ := p.parseType()
 		if typ < 0 {
-			return nil, p.errf("unknown or missing type for column %q", name)
+			return nil, p.errf("unknown type for column %q", name)
 		}
 		cols = append(cols, Column{Name: name, Type: typ})
 		if p.cur.Typ == tSymbol && p.cur.Val == "," {
@@ -890,7 +841,6 @@ func (p *Parser) parseColumnDefs() ([]Column, error) {
 	}
 	return cols, nil
 }
-
 func (p *Parser) parseType() ColType {
 	if p.cur.Typ == tKeyword {
 		switch p.cur.Val {
@@ -906,11 +856,13 @@ func (p *Parser) parseType() ColType {
 		case "BOOL":
 			p.next()
 			return BoolType
+		case "JSON":
+			p.next()
+			return JsonType
 		}
 	}
 	return -1
 }
-
 func (p *Parser) parseIdentLike() string {
 	if p.cur.Typ == tIdent {
 		s := p.cur.Val
@@ -919,12 +871,8 @@ func (p *Parser) parseIdentLike() string {
 	}
 	return ""
 }
-
 func (p *Parser) parseIntLiteral() *int {
-	if p.cur.Typ == tNumber {
-		if strings.Contains(p.cur.Val, ".") {
-			return nil
-		}
+	if p.cur.Typ == tNumber && !strings.Contains(p.cur.Val, ".") {
 		n, _ := strconv.Atoi(p.cur.Val)
 		p.next()
 		return &n
@@ -932,42 +880,38 @@ func (p *Parser) parseIntLiteral() *int {
 	return nil
 }
 
+// Expressions
 func (p *Parser) parseExpr() (Expr, error) { return p.parseOr() }
-
 func (p *Parser) parseOr() (Expr, error) {
-	left, err := p.parseAnd()
+	l, err := p.parseAnd()
 	if err != nil {
 		return nil, err
 	}
 	for p.cur.Typ == tKeyword && p.cur.Val == "OR" {
-		op := p.cur.Val
 		p.next()
-		right, err := p.parseAnd()
+		r, err := p.parseAnd()
 		if err != nil {
 			return nil, err
 		}
-		left = &Binary{Op: op, Left: left, Right: right}
+		l = &Binary{Op: "OR", Left: l, Right: r}
 	}
-	return left, nil
+	return l, nil
 }
-
 func (p *Parser) parseAnd() (Expr, error) {
-	left, err := p.parseNot()
+	l, err := p.parseNot()
 	if err != nil {
 		return nil, err
 	}
 	for p.cur.Typ == tKeyword && p.cur.Val == "AND" {
-		op := p.cur.Val
 		p.next()
-		right, err := p.parseNot()
+		r, err := p.parseNot()
 		if err != nil {
 			return nil, err
 		}
-		left = &Binary{Op: op, Left: left, Right: right}
+		l = &Binary{Op: "AND", Left: l, Right: r}
 	}
-	return left, nil
+	return l, nil
 }
-
 func (p *Parser) parseNot() (Expr, error) {
 	if p.cur.Typ == tKeyword && p.cur.Val == "NOT" {
 		p.next()
@@ -979,9 +923,8 @@ func (p *Parser) parseNot() (Expr, error) {
 	}
 	return p.parseIsNull()
 }
-
 func (p *Parser) parseIsNull() (Expr, error) {
-	left, err := p.parseCmp()
+	l, err := p.parseCmp()
 	if err != nil {
 		return nil, err
 	}
@@ -994,15 +937,14 @@ func (p *Parser) parseIsNull() (Expr, error) {
 		}
 		if p.cur.Typ == tKeyword && p.cur.Val == "NULL" {
 			p.next()
-			return &IsNull{Expr: left, Negate: neg}, nil
+			return &IsNull{Expr: l, Negate: neg}, nil
 		}
 		return nil, p.errf("expected NULL after IS/IS NOT")
 	}
-	return left, nil
+	return l, nil
 }
-
 func (p *Parser) parseCmp() (Expr, error) {
-	left, err := p.parseAddSub()
+	l, err := p.parseAddSub()
 	if err != nil {
 		return nil, err
 	}
@@ -1012,53 +954,50 @@ func (p *Parser) parseCmp() (Expr, error) {
 			case "=", "!=", "<>", "<", "<=", ">", ">=":
 				op := p.cur.Val
 				p.next()
-				right, err := p.parseAddSub()
+				r, err := p.parseAddSub()
 				if err != nil {
 					return nil, err
 				}
-				left = &Binary{Op: op, Left: left, Right: right}
+				l = &Binary{Op: op, Left: l, Right: r}
 				continue
 			}
 		}
 		break
 	}
-	return left, nil
+	return l, nil
 }
-
 func (p *Parser) parseAddSub() (Expr, error) {
-	left, err := p.parseMulDiv()
+	l, err := p.parseMulDiv()
 	if err != nil {
 		return nil, err
 	}
 	for p.cur.Typ == tSymbol && (p.cur.Val == "+" || p.cur.Val == "-") {
 		op := p.cur.Val
 		p.next()
-		right, err := p.parseMulDiv()
+		r, err := p.parseMulDiv()
 		if err != nil {
 			return nil, err
 		}
-		left = &Binary{Op: op, Left: left, Right: right}
+		l = &Binary{Op: op, Left: l, Right: r}
 	}
-	return left, nil
+	return l, nil
 }
-
 func (p *Parser) parseMulDiv() (Expr, error) {
-	left, err := p.parseUnary()
+	l, err := p.parseUnary()
 	if err != nil {
 		return nil, err
 	}
 	for p.cur.Typ == tSymbol && (p.cur.Val == "*" || p.cur.Val == "/") {
 		op := p.cur.Val
 		p.next()
-		right, err := p.parseUnary()
+		r, err := p.parseUnary()
 		if err != nil {
 			return nil, err
 		}
-		left = &Binary{Op: op, Left: left, Right: right}
+		l = &Binary{Op: op, Left: l, Right: r}
 	}
-	return left, nil
+	return l, nil
 }
-
 func (p *Parser) parseUnary() (Expr, error) {
 	if p.cur.Typ == tSymbol && (p.cur.Val == "+" || p.cur.Val == "-") {
 		op := p.cur.Val
@@ -1079,7 +1018,6 @@ func (p *Parser) parseUnary() (Expr, error) {
 	}
 	return p.parsePrimary()
 }
-
 func (p *Parser) parsePrimary() (Expr, error) {
 	switch p.cur.Typ {
 	case tNumber:
@@ -1097,7 +1035,7 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		return &Literal{Val: s}, nil
 	case tKeyword:
 		switch p.cur.Val {
-		case "COUNT", "SUM", "AVG", "MIN", "MAX", "COALESCE", "NULLIF":
+		case "COUNT", "SUM", "AVG", "MIN", "MAX", "COALESCE", "NULLIF", "JSON_GET":
 			return p.parseFuncCall()
 		case "TRUE":
 			p.next()
@@ -1130,7 +1068,6 @@ func (p *Parser) parsePrimary() (Expr, error) {
 	}
 	return nil, p.errf("unexpected token %q", p.cur.Val)
 }
-
 func (p *Parser) parseFuncCall() (Expr, error) {
 	name := p.cur.Val
 	p.next()
@@ -1165,27 +1102,22 @@ func (p *Parser) parseFuncCall() (Expr, error) {
 	return &FuncCall{Name: name, Args: args}, nil
 }
 
-type Row map[string]interface{} // keys: lower-cased; values may be nil (NULL)
+type Row map[string]any // keys lower-cased
 
 type resultSet struct {
 	Cols []string
 	Rows []Row
 }
 
-// Eval helpers
-
-func GetVal(row Row, name string) (interface{}, bool) {
-	v, ok := row[strings.ToLower(name)]
-	return v, ok
+type ExecEnv struct {
+	ctx    context.Context
+	tenant string
 }
 
-func putVal(row Row, key string, val interface{}) {
-	row[strings.ToLower(key)] = val
-}
-
-func isNull(v interface{}) bool { return v == nil }
-
-func numeric(v interface{}) (float64, bool) {
+func GetVal(row Row, name string) (any, bool) { v, ok := row[strings.ToLower(name)]; return v, ok }
+func PutVal(row Row, key string, val any)     { row[strings.ToLower(key)] = val }
+func isNull(v any) bool                       { return v == nil }
+func numeric(v any) (float64, bool) {
 	switch x := v.(type) {
 	case int:
 		return float64(x), true
@@ -1196,8 +1128,7 @@ func numeric(v interface{}) (float64, bool) {
 	}
 	return 0, false
 }
-
-func truthy(v interface{}) bool {
+func truthy(v any) bool {
 	switch x := v.(type) {
 	case nil:
 		return false
@@ -1214,14 +1145,14 @@ func truthy(v interface{}) bool {
 	}
 }
 
-// 3-valued logic helpers: TRUE=1, FALSE=0, UNKNOWN=2
+// tri-state boolean
 const (
 	tvFalse   = 0
 	tvTrue    = 1
 	tvUnknown = 2
 )
 
-func toTri(v interface{}) int {
+func toTri(v any) int {
 	if v == nil {
 		return tvUnknown
 	}
@@ -1259,8 +1190,7 @@ func triOr(a, b int) int {
 	return tvUnknown
 }
 
-// compare for non-NULL values; returns -1/0/+1; errors on NULLs or incompatible types
-func compare(a, b interface{}) (int, error) {
+func compare(a, b any) (int, error) {
 	if a == nil || b == nil {
 		return 0, errors.New("cannot compare with NULL")
 	}
@@ -1268,58 +1198,59 @@ func compare(a, b interface{}) (int, error) {
 	case int:
 		if f, ok := numeric(b); ok {
 			af := float64(ax)
-			if af < f {
+			switch {
+			case af < f:
 				return -1, nil
-			} else if af > f {
+			case af > f:
 				return 1, nil
+			default:
+				return 0, nil
 			}
-			return 0, nil
 		}
 	case float64:
 		if f, ok := numeric(b); ok {
-			if ax < f {
+			switch {
+			case ax < f:
 				return -1, nil
-			} else if ax > f {
+			case ax > f:
 				return 1, nil
+			default:
+				return 0, nil
 			}
-			return 0, nil
 		}
 	case string:
 		if bs, ok := b.(string); ok {
-			if ax < bs {
+			switch {
+			case ax < bs:
 				return -1, nil
-			} else if ax > bs {
+			case ax > bs:
 				return 1, nil
+			default:
+				return 0, nil
 			}
-			return 0, nil
 		}
 	case bool:
 		if bb, ok := b.(bool); ok {
-			if !ax && bb {
+			switch {
+			case !ax && bb:
 				return -1, nil
-			} else if ax && !bb {
+			case ax && !bb:
 				return 1, nil
+			default:
+				return 0, nil
 			}
-			return 0, nil
 		}
 	}
-	// fallback equality stringification (rare)
 	if fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b) {
 		return 0, nil
 	}
-	return 0, fmt.Errorf("incomparable values %T and %T", a, b)
+	return 0, fmt.Errorf("incomparable %T and %T", a, b)
 }
-
-// compareForOrder allows NULLs with rule:
-//   ASC : NULLS LAST
-//   DESC: NULLS FIRST
-func compareForOrder(a, b interface{}, desc bool) int {
-	// nil handling
+func compareForOrder(a, b any, desc bool) int {
 	if a == nil && b == nil {
 		return 0
 	}
 	if a == nil {
-		// a should come last in ASC, first in DESC
 		if desc {
 			return -1
 		}
@@ -1331,16 +1262,29 @@ func compareForOrder(a, b interface{}, desc bool) int {
 		}
 		return -1
 	}
-	cmp, err := compare(a, b)
+	c, err := compare(a, b)
 	if err != nil {
 		return 0
 	}
-	return cmp
+	return c
 }
 
-// Expression evaluation (row-wise)
+func checkCtx(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return nil
+	}
+}
 
-func evalExpr(e Expr, row Row) (interface{}, error) {
+func evalExpr(env ExecEnv, e Expr, row Row) (any, error) {
+	if err := checkCtx(env.ctx); err != nil {
+		return nil, err
+	}
 	switch ex := e.(type) {
 	case *Literal:
 		return ex.Val, nil
@@ -1355,9 +1299,8 @@ func evalExpr(e Expr, row Row) (interface{}, error) {
 			return v, nil
 		}
 		return nil, fmt.Errorf("unknown column %q", ex.Name)
-
 	case *IsNull:
-		v, err := evalExpr(ex.Expr, row)
+		v, err := evalExpr(env, ex.Expr, row)
 		if err != nil {
 			return nil, err
 		}
@@ -1366,9 +1309,8 @@ func evalExpr(e Expr, row Row) (interface{}, error) {
 			return !is, nil
 		}
 		return is, nil
-
 	case *Unary:
-		v, err := evalExpr(ex.Expr, row)
+		v, err := evalExpr(env, ex.Expr, row)
 		if err != nil {
 			return nil, err
 		}
@@ -1380,7 +1322,7 @@ func evalExpr(e Expr, row Row) (interface{}, error) {
 			if v == nil {
 				return nil, nil
 			}
-			return nil, fmt.Errorf("unary + on non-numeric")
+			return nil, fmt.Errorf("unary + non-numeric")
 		case "-":
 			if f, ok := numeric(v); ok {
 				return -f, nil
@@ -1388,50 +1330,36 @@ func evalExpr(e Expr, row Row) (interface{}, error) {
 			if v == nil {
 				return nil, nil
 			}
-			return nil, fmt.Errorf("unary - on non-numeric")
+			return nil, fmt.Errorf("unary - non-numeric")
 		case "NOT":
 			return triToValue(triNot(toTri(v))), nil
-		default:
-			return nil, fmt.Errorf("unknown unary op %q", ex.Op)
 		}
-
 	case *Binary:
-		switch ex.Op {
-		case "AND":
-			lv, err := evalExpr(ex.Left, row)
+		if ex.Op == "AND" || ex.Op == "OR" {
+			lv, err := evalExpr(env, ex.Left, row)
 			if err != nil {
 				return nil, err
 			}
-			// short-circuit FALSE
-			if toTri(lv) == tvFalse {
+			if ex.Op == "AND" && toTri(lv) == tvFalse {
 				return false, nil
 			}
-			rv, err := evalExpr(ex.Right, row)
-			if err != nil {
-				return nil, err
-			}
-			return triToValue(triAnd(toTri(lv), toTri(rv))), nil
-		case "OR":
-			lv, err := evalExpr(ex.Left, row)
-			if err != nil {
-				return nil, err
-			}
-			// short-circuit TRUE
-			if toTri(lv) == tvTrue {
+			if ex.Op == "OR" && toTri(lv) == tvTrue {
 				return true, nil
 			}
-			rv, err := evalExpr(ex.Right, row)
+			rv, err := evalExpr(env, ex.Right, row)
 			if err != nil {
 				return nil, err
+			}
+			if ex.Op == "AND" {
+				return triToValue(triAnd(toTri(lv), toTri(rv))), nil
 			}
 			return triToValue(triOr(toTri(lv), toTri(rv))), nil
 		}
-
-		lv, err := evalExpr(ex.Left, row)
+		lv, err := evalExpr(env, ex.Left, row)
 		if err != nil {
 			return nil, err
 		}
-		rv, err := evalExpr(ex.Right, row)
+		rv, err := evalExpr(env, ex.Right, row)
 		if err != nil {
 			return nil, err
 		}
@@ -1459,7 +1387,6 @@ func evalExpr(e Expr, row Row) (interface{}, error) {
 				return lf / rf, nil
 			}
 		case "=", "!=", "<>", "<", "<=", ">", ">=":
-			// NULL handling -> UNKNOWN (nil)
 			if lv == nil || rv == nil {
 				return nil, nil
 			}
@@ -1481,15 +1408,12 @@ func evalExpr(e Expr, row Row) (interface{}, error) {
 			case ">=":
 				return cmp >= 0, nil
 			}
-		default:
-			return nil, fmt.Errorf("unknown binary op %q", ex.Op)
 		}
-
 	case *FuncCall:
 		switch ex.Name {
 		case "COALESCE":
 			for _, a := range ex.Args {
-				v, err := evalExpr(a, row)
+				v, err := evalExpr(env, a, row)
 				if err != nil {
 					return nil, err
 				}
@@ -1500,13 +1424,13 @@ func evalExpr(e Expr, row Row) (interface{}, error) {
 			return nil, nil
 		case "NULLIF":
 			if len(ex.Args) != 2 {
-				return nil, fmt.Errorf("NULLIF expects 2 arguments")
+				return nil, fmt.Errorf("NULLIF expects 2 args")
 			}
-			lv, err := evalExpr(ex.Args[0], row)
+			lv, err := evalExpr(env, ex.Args[0], row)
 			if err != nil {
 				return nil, err
 			}
-			rv, err := evalExpr(ex.Args[1], row)
+			rv, err := evalExpr(env, ex.Args[1], row)
 			if err != nil {
 				return nil, err
 			}
@@ -1524,16 +1448,28 @@ func evalExpr(e Expr, row Row) (interface{}, error) {
 				return nil, nil
 			}
 			return lv, nil
-
+		case "JSON_GET":
+			if len(ex.Args) != 2 {
+				return nil, fmt.Errorf("JSON_GET expects (json, path)")
+			}
+			jv, err := evalExpr(env, ex.Args[0], row)
+			if err != nil {
+				return nil, err
+			}
+			pv, err := evalExpr(env, ex.Args[1], row)
+			if err != nil {
+				return nil, err
+			}
+			ps, _ := pv.(string)
+			return jsonGet(jv, ps), nil
 		case "COUNT":
-			// non-aggregate context: COUNT(x) -> 1 if x != NULL else 0; COUNT(*) -> 1
 			if ex.Star {
 				return 1, nil
 			}
 			if len(ex.Args) != 1 {
-				return nil, fmt.Errorf("COUNT expects 1 argument")
+				return nil, fmt.Errorf("COUNT expects 1 arg")
 			}
-			v, err := evalExpr(ex.Args[0], row)
+			v, err := evalExpr(env, ex.Args[0], row)
 			if err != nil {
 				return nil, err
 			}
@@ -1542,36 +1478,27 @@ func evalExpr(e Expr, row Row) (interface{}, error) {
 			}
 			return 1, nil
 		case "SUM", "AVG", "MIN", "MAX":
-			// non-aggregate context: pass-through value (if any)
 			if len(ex.Args) != 1 {
-				return nil, fmt.Errorf("%s expects 1 argument", ex.Name)
+				return nil, fmt.Errorf("%s expects 1 arg", ex.Name)
 			}
-			v, err := evalExpr(ex.Args[0], row)
+			v, err := evalExpr(env, ex.Args[0], row)
 			if err != nil {
 				return nil, err
 			}
 			return v, nil
-		default:
-			return nil, fmt.Errorf("unknown function %s", ex.Name)
 		}
-	default:
-		return nil, fmt.Errorf("unknown expression")
 	}
-	return nil, fmt.Errorf("unhandled expression")
+	return nil, fmt.Errorf("unknown expression")
 }
-
-func triToValue(t int) interface{} {
-	switch t {
-	case tvTrue:
+func triToValue(t int) any {
+	if t == tvTrue {
 		return true
-	case tvFalse:
-		return false
-	default:
-		return nil
 	}
+	if t == tvFalse {
+		return false
+	}
+	return nil
 }
-
-// Aggregate evaluation by scanning a group's rows (clarity over speed).
 func isAggregate(e Expr) bool {
 	switch ex := e.(type) {
 	case *FuncCall:
@@ -1588,8 +1515,7 @@ func isAggregate(e Expr) bool {
 	}
 	return false
 }
-
-func evalAggregate(e Expr, rows []Row) (interface{}, error) {
+func evalAggregate(env ExecEnv, e Expr, rows []Row) (any, error) {
 	switch ex := e.(type) {
 	case *FuncCall:
 		switch ex.Name {
@@ -1598,27 +1524,33 @@ func evalAggregate(e Expr, rows []Row) (interface{}, error) {
 				return len(rows), nil
 			}
 			if len(ex.Args) != 1 {
-				return nil, fmt.Errorf("COUNT expects 1 argument")
+				return nil, fmt.Errorf("COUNT expects 1 arg")
 			}
-			cnt := 0
+			c := 0
 			for _, r := range rows {
-				v, err := evalExpr(ex.Args[0], r)
+				if err := checkCtx(env.ctx); err != nil {
+					return nil, err
+				}
+				v, err := evalExpr(env, ex.Args[0], r)
 				if err != nil {
 					return nil, err
 				}
 				if v != nil {
-					cnt++
+					c++
 				}
 			}
-			return cnt, nil
+			return c, nil
 		case "SUM", "AVG":
 			if len(ex.Args) != 1 {
-				return nil, fmt.Errorf("%s expects 1 argument", ex.Name)
+				return nil, fmt.Errorf("%s expects 1 arg", ex.Name)
 			}
 			sum := 0.0
 			n := 0
 			for _, r := range rows {
-				v, err := evalExpr(ex.Args[0], r)
+				if err := checkCtx(env.ctx); err != nil {
+					return nil, err
+				}
+				v, err := evalExpr(env, ex.Args[0], r)
 				if err != nil {
 					return nil, err
 				}
@@ -1631,17 +1563,20 @@ func evalAggregate(e Expr, rows []Row) (interface{}, error) {
 				return sum, nil
 			}
 			if n == 0 {
-				return nil, nil // AVG over empty/non-numeric -> NULL
+				return nil, nil
 			}
 			return sum / float64(n), nil
 		case "MIN", "MAX":
 			if len(ex.Args) != 1 {
-				return nil, fmt.Errorf("%s expects 1 argument", ex.Name)
+				return nil, fmt.Errorf("%s expects 1 arg", ex.Name)
 			}
 			var have bool
-			var best interface{}
+			var best any
 			for _, r := range rows {
-				v, err := evalExpr(ex.Args[0], r)
+				if err := checkCtx(env.ctx); err != nil {
+					return nil, err
+				}
+				v, err := evalExpr(env, ex.Args[0], r)
 				if err != nil {
 					return nil, err
 				}
@@ -1667,15 +1602,9 @@ func evalAggregate(e Expr, rows []Row) (interface{}, error) {
 				return nil, nil
 			}
 			return best, nil
-		case "COALESCE", "NULLIF":
-			// not aggregates: evaluate on representative row
-			if len(rows) == 0 {
-				return nil, nil
-			}
-			return evalExpr(ex, rows[0])
 		}
 	case *Unary:
-		v, err := evalAggregate(ex.Expr, rows)
+		v, err := evalAggregate(env, ex.Expr, rows)
 		if err != nil {
 			return nil, err
 		}
@@ -1687,7 +1616,7 @@ func evalAggregate(e Expr, rows []Row) (interface{}, error) {
 			if v == nil {
 				return nil, nil
 			}
-			return nil, fmt.Errorf("unary + on non-numeric")
+			return nil, fmt.Errorf("unary + non-numeric")
 		case "-":
 			if f, ok := numeric(v); ok {
 				return -f, nil
@@ -1695,22 +1624,22 @@ func evalAggregate(e Expr, rows []Row) (interface{}, error) {
 			if v == nil {
 				return nil, nil
 			}
-			return nil, fmt.Errorf("unary - on non-numeric")
+			return nil, fmt.Errorf("unary - non-numeric")
 		case "NOT":
 			return triToValue(triNot(toTri(v))), nil
 		}
 	case *Binary:
-		lv, err := evalAggregate(ex.Left, rows)
+		lv, err := evalAggregate(env, ex.Left, rows)
 		if err != nil {
 			return nil, err
 		}
-		rv, err := evalAggregate(ex.Right, rows)
+		rv, err := evalAggregate(env, ex.Right, rows)
 		if err != nil {
 			return nil, err
 		}
-		return evalExpr(&Binary{Op: ex.Op, Left: &Literal{Val: lv}, Right: &Literal{Val: rv}}, Row{})
+		return evalExpr(env, &Binary{Op: ex.Op, Left: &Literal{Val: lv}, Right: &Literal{Val: rv}}, Row{})
 	case *IsNull:
-		v, err := evalAggregate(ex.Expr, rows)
+		v, err := evalAggregate(env, ex.Expr, rows)
 		if err != nil {
 			return nil, err
 		}
@@ -1722,12 +1651,11 @@ func evalAggregate(e Expr, rows []Row) (interface{}, error) {
 		if len(rows) == 0 {
 			return nil, nil
 		}
-		return evalExpr(e, rows[0])
+		return evalExpr(env, e, rows[0])
 	}
-	return nil, fmt.Errorf("unsupported aggregate expression")
+	return nil, fmt.Errorf("unsupported aggregate")
 }
 
-// Build row contexts from table rows
 func rowsFromTable(t *Table, alias string) ([]Row, []string) {
 	cols := make([]string, len(t.Cols))
 	for i, c := range t.Cols {
@@ -1735,21 +1663,19 @@ func rowsFromTable(t *Table, alias string) ([]Row, []string) {
 	}
 	var out []Row
 	for _, r := range t.Rows {
-		row := make(Row)
+		row := Row{}
 		for i, c := range t.Cols {
-			putVal(row, alias+"."+c.Name, r[i])
+			PutVal(row, alias+"."+c.Name, r[i])
 		}
 		for i, c := range t.Cols {
-			key := c.Name
-			if _, exists := row[strings.ToLower(key)]; !exists {
-				putVal(row, key, r[i])
+			if _, exists := row[strings.ToLower(c.Name)]; !exists {
+				PutVal(row, c.Name, r[i])
 			}
 		}
 		out = append(out, row)
 	}
 	return out, cols
 }
-
 func keysOfRow(r Row) []string {
 	ks := make([]string, 0, len(r))
 	for k := range r {
@@ -1757,463 +1683,6 @@ func keysOfRow(r Row) []string {
 	}
 	sort.Strings(ks)
 	return ks
-}
-
-func Execute(db *DB, stmt Statement) (*resultSet, error) {
-	switch s := stmt.(type) {
-	case *CreateTable:
-		if s.AsSelect == nil {
-			t := NewTable(s.Name, s.Cols, s.IsTemp)
-			return nil, db.Put(t)
-		}
-		// CREATE ... AS SELECT
-		rs, err := Execute(db, s.AsSelect)
-		if err != nil {
-			return nil, err
-		}
-		cols := make([]Column, len(rs.Cols))
-		if len(rs.Rows) > 0 {
-			for i, c := range rs.Cols {
-				cols[i] = Column{Name: c, Type: inferType(rs.Rows[0][strings.ToLower(c)])}
-			}
-		} else {
-			for i, c := range rs.Cols {
-				cols[i] = Column{Name: c, Type: TextType}
-			}
-		}
-		t := NewTable(s.Name, cols, s.IsTemp)
-		for _, r := range rs.Rows {
-			row := make([]interface{}, len(cols))
-			for i, c := range cols {
-				row[i] = r[strings.ToLower(c.Name)]
-			}
-			t.Rows = append(t.Rows, row)
-		}
-		return nil, db.Put(t)
-
-	case *DropTable:
-		return nil, db.Drop(s.Name)
-
-	case *Insert:
-		t, err := db.Get(s.Table)
-		if err != nil {
-			return nil, err
-		}
-		if len(s.Cols) > 0 && len(s.Cols) != len(s.Vals) {
-			return nil, fmt.Errorf("INSERT column count and value count mismatch")
-		}
-		row := make([]interface{}, len(t.Cols))
-		// Default to NULLs (SQL default) for unspecified columns.
-		for i := range row {
-			row[i] = nil
-		}
-		tmpRow := Row{} // literals only
-		if len(s.Cols) == 0 {
-			if len(s.Vals) != len(t.Cols) {
-				return nil, fmt.Errorf("INSERT without columns expects %d values", len(t.Cols))
-			}
-			for i, e := range s.Vals {
-				v, err := evalExpr(e, tmpRow)
-				if err != nil {
-					return nil, err
-				}
-				row[i], err = coerceToTypeAllowNull(v, t.Cols[i].Type)
-				if err != nil {
-					return nil, fmt.Errorf("column %q: %w", t.Cols[i].Name, err)
-				}
-			}
-		} else {
-			for i, name := range s.Cols {
-				idx, err := t.colIndex(name)
-				if err != nil {
-					return nil, err
-				}
-				v, err := evalExpr(s.Vals[i], tmpRow)
-				if err != nil {
-					return nil, err
-				}
-				row[idx], err = coerceToTypeAllowNull(v, t.Cols[idx].Type)
-				if err != nil {
-					return nil, fmt.Errorf("column %q: %w", t.Cols[idx].Name, err)
-				}
-			}
-		}
-		t.Rows = append(t.Rows, row)
-		t.Version++
-		return nil, nil
-
-	case *Update:
-		t, err := db.Get(s.Table)
-		if err != nil {
-			return nil, err
-		}
-		setIdx := make(map[int]Expr)
-		for name, ex := range s.Sets {
-			i, err := t.colIndex(name)
-			if err != nil {
-				return nil, err
-			}
-			setIdx[i] = ex
-		}
-		count := 0
-		for ri, r := range t.Rows {
-			row := Row{}
-			for i, c := range t.Cols {
-				putVal(row, c.Name, r[i])
-				putVal(row, s.Table+"."+c.Name, r[i])
-			}
-			ok := true
-			if s.Where != nil {
-				v, err := evalExpr(s.Where, row)
-				if err != nil {
-					return nil, err
-				}
-				ok = (toTri(v) == tvTrue)
-			}
-			if ok {
-				for i, ex := range setIdx {
-					v, err := evalExpr(ex, row)
-					if err != nil {
-						return nil, err
-					}
-					cv, err := coerceToTypeAllowNull(v, t.Cols[i].Type)
-					if err != nil {
-						return nil, err
-					}
-					t.Rows[ri][i] = cv
-				}
-				count++
-			}
-		}
-		t.Version++
-		return &resultSet{Cols: []string{"updated"}, Rows: []Row{{"updated": count}}}, nil
-
-	case *Delete:
-		t, err := db.Get(s.Table)
-		if err != nil {
-			return nil, err
-		}
-		var kept [][]interface{}
-		del := 0
-		for _, r := range t.Rows {
-			row := Row{}
-			for i, c := range t.Cols {
-				putVal(row, c.Name, r[i])
-				putVal(row, s.Table+"."+c.Name, r[i])
-			}
-			keep := true
-			if s.Where != nil {
-				v, err := evalExpr(s.Where, row)
-				if err != nil {
-					return nil, err
-				}
-				// WHERE keeps only TRUE; FALSE/UNKNOWN are filtered
-				if toTri(v) == tvTrue {
-					keep = false
-				}
-			}
-			if keep {
-				kept = append(kept, r)
-			} else {
-				del++
-			}
-		}
-		t.Rows = kept
-		t.Version++
-		return &resultSet{Cols: []string{"deleted"}, Rows: []Row{{"deleted": del}}}, nil
-
-	case *Select:
-		// FROM
-		leftT, err := db.Get(s.From.Table)
-		if err != nil {
-			return nil, err
-		}
-		leftRows, _ := rowsFromTable(leftT, s.From.AliasOrTable())
-		cur := leftRows
-
-		// JOINs
-		for _, j := range s.Joins {
-			rt, err := db.Get(j.Right.Table)
-			if err != nil {
-				return nil, err
-			}
-			rightRows, _ := rowsFromTable(rt, j.Right.AliasOrTable())
-
-			switch j.Type {
-			case JoinInner:
-				var joined []Row
-				for _, l := range cur {
-					for _, r := range rightRows {
-						m := mergeRows(l, r)
-						ok := true
-						if j.On != nil {
-							val, err := evalExpr(j.On, m)
-							if err != nil {
-								return nil, err
-							}
-							ok = (toTri(val) == tvTrue)
-						}
-						if ok {
-							joined = append(joined, m)
-						}
-					}
-				}
-				cur = joined
-
-			case JoinLeft:
-				var joined []Row
-				for _, l := range cur {
-					matched := false
-					for _, r := range rightRows {
-						m := mergeRows(l, r)
-						ok := true
-						if j.On != nil {
-							val, err := evalExpr(j.On, m)
-							if err != nil {
-								return nil, err
-							}
-							ok = (toTri(val) == tvTrue)
-						}
-						if ok {
-							joined = append(joined, m)
-							matched = true
-						}
-					}
-					if !matched {
-						m := cloneRow(l)
-						// pad right side alias columns with NULLs
-						addRightNulls(m, j.Right.AliasOrTable(), rt)
-						joined = append(joined, m)
-					}
-				}
-				cur = joined
-
-			case JoinRight:
-				var joined []Row
-				// collect left keys prototype
-				leftKeys := []string{}
-				if len(cur) > 0 {
-					leftKeys = keysOfRow(cur[0])
-				}
-				for _, r := range rightRows {
-					matched := false
-					for _, l := range cur {
-						m := mergeRows(l, r)
-						ok := true
-						if j.On != nil {
-							val, err := evalExpr(j.On, m)
-							if err != nil {
-								return nil, err
-							}
-							ok = (toTri(val) == tvTrue)
-						}
-						if ok {
-							joined = append(joined, m)
-							matched = true
-						}
-					}
-					if !matched {
-						m := cloneRow(r)
-						// pad ALL left keys with NULLs (includes any prior joins on the left chain)
-						for _, k := range leftKeys {
-							m[k] = nil
-						}
-						joined = append(joined, m)
-					}
-				}
-				cur = joined
-			}
-		}
-
-		// WHERE
-		filtered := cur
-		if s.Where != nil {
-			var tmp []Row
-			for _, r := range filtered {
-				v, err := evalExpr(s.Where, r)
-				if err != nil {
-					return nil, err
-				}
-				if toTri(v) == tvTrue {
-					tmp = append(tmp, r)
-				}
-			}
-			filtered = tmp
-		}
-
-		// GROUP & HAVING
-		needAgg := len(s.GroupBy) > 0 || anyAggInSelect(s.Projs) || isAggregate(s.Having)
-		var outRows []Row
-		var outCols []string
-
-		if needAgg {
-			// group by keys
-			groups := make(map[string][]Row)
-			orderKeys := []string{}
-			for _, r := range filtered {
-				var parts []string
-				for _, g := range s.GroupBy {
-					v, err := evalExpr(&g, r)
-					if err != nil {
-						return nil, err
-					}
-					parts = append(parts, fmtKeyPart(v))
-				}
-				ks := strings.Join(parts, "\x1f")
-				if _, ok := groups[ks]; !ok {
-					orderKeys = append(orderKeys, ks)
-				}
-				groups[ks] = append(groups[ks], r)
-			}
-			// build rows per group
-			for _, k := range orderKeys {
-				rows := groups[k]
-				// HAVING
-				if s.Having != nil {
-					hv, err := evalAggregate(s.Having, rows)
-					if err != nil {
-						return nil, err
-					}
-					if toTri(hv) != tvTrue {
-						continue
-					}
-				}
-				out := Row{}
-				for i, it := range s.Projs {
-					if it.Star {
-						if len(rows) > 0 {
-							for col, v := range rows[0] {
-								if strings.Contains(col, ".") {
-									putVal(out, col, v)
-									outCols = appendUnique(outCols, col)
-								}
-							}
-						}
-						continue
-					}
-					name := projName(it, i)
-					var val interface{}
-					var err error
-					if isAggregate(it.Expr) || len(s.GroupBy) > 0 {
-						val, err = evalAggregate(it.Expr, rows)
-					} else {
-						val, err = evalExpr(it.Expr, rows[0])
-					}
-					if err != nil {
-						return nil, err
-					}
-					putVal(out, name, val)
-					outCols = appendUnique(outCols, name)
-				}
-				outRows = append(outRows, out)
-			}
-		} else {
-			// simple projection
-			for _, r := range filtered {
-				out := Row{}
-				for i, it := range s.Projs {
-					if it.Star {
-						for col, v := range r {
-							if strings.Contains(col, ".") {
-								putVal(out, col, v)
-								outCols = appendUnique(outCols, col)
-							}
-						}
-						continue
-					}
-					val, err := evalExpr(it.Expr, r)
-					if err != nil {
-						return nil, err
-					}
-					name := projName(it, i)
-					putVal(out, name, val)
-					outCols = appendUnique(outCols, name)
-				}
-				outRows = append(outRows, out)
-			}
-		}
-
-		// DISTINCT
-		if s.Distinct {
-			outRows = distinctRows(outRows, outCols)
-		}
-
-		// ORDER BY
-		if len(s.OrderBy) > 0 {
-			sort.SliceStable(outRows, func(i, j int) bool {
-				a := outRows[i]
-				b := outRows[j]
-				for _, oi := range s.OrderBy {
-					av, _ := GetVal(a, oi.Col)
-					bv, _ := GetVal(b, oi.Col)
-					cmp := compareForOrder(av, bv, oi.Desc)
-					if cmp == 0 {
-						continue
-					}
-					if oi.Desc {
-						return cmp > 0
-					}
-					return cmp < 0
-				}
-				return false
-			})
-		}
-
-		// OFFSET / LIMIT
-		start := 0
-		if s.Offset != nil && *s.Offset > 0 {
-			start = *s.Offset
-		}
-		if start > len(outRows) {
-			outRows = []Row{}
-		} else {
-			outRows = outRows[start:]
-		}
-		if s.Limit != nil && *s.Limit < len(outRows) {
-			outRows = outRows[:*s.Limit]
-		}
-
-		if len(outCols) == 0 {
-			outCols = columnsFromRows(outRows)
-		}
-		return &resultSet{Cols: outCols, Rows: outRows}, nil
-	}
-	return nil, fmt.Errorf("unknown statement")
-}
-
-func (f FromItem) AliasOrTable() string {
-	if f.Alias != "" {
-		return f.Alias
-	}
-	return f.Table
-}
-
-func mergeRows(l, r Row) Row {
-	m := make(Row, len(l)+len(r))
-	for k, v := range l {
-		m[k] = v
-	}
-	for k, v := range r {
-		m[k] = v
-	}
-	return m
-}
-
-func cloneRow(r Row) Row {
-	m := make(Row, len(r))
-	for k, v := range r {
-		m[k] = v
-	}
-	return m
-}
-
-func addRightNulls(m Row, rightAlias string, rt *Table) {
-	for _, c := range rt.Cols {
-		putVal(m, rightAlias+"."+c.Name, nil)
-		if _, exists := m[strings.ToLower(c.Name)]; !exists {
-			putVal(m, c.Name, nil)
-		}
-	}
 }
 
 func projName(it SelectItem, idx int) string {
@@ -2226,8 +1695,7 @@ func projName(it SelectItem, idx int) string {
 	case *FuncCall:
 		up := strings.ToUpper(ex.Name)
 		if len(ex.Args) == 1 {
-			switch a := ex.Args[0].(type) {
-			case *VarRef:
+			if a, ok := ex.Args[0].(*VarRef); ok {
 				return fmt.Sprintf("%s_%s", up, lastPart(a.Name))
 			}
 		}
@@ -2238,14 +1706,12 @@ func projName(it SelectItem, idx int) string {
 		return fmt.Sprintf("expr%d", idx+1)
 	}
 }
-
 func lastPart(s string) string {
 	if i := strings.LastIndex(s, "."); i >= 0 {
 		return s[i+1:]
 	}
 	return s
 }
-
 func anyAggInSelect(items []SelectItem) bool {
 	for _, it := range items {
 		if it.Expr != nil && isAggregate(it.Expr) {
@@ -2254,7 +1720,6 @@ func anyAggInSelect(items []SelectItem) bool {
 	}
 	return false
 }
-
 func appendUnique(cols []string, c string) []string {
 	lc := strings.ToLower(c)
 	for _, x := range cols {
@@ -2264,7 +1729,6 @@ func appendUnique(cols []string, c string) []string {
 	}
 	return append(cols, c)
 }
-
 func columnsFromRows(rows []Row) []string {
 	seen := map[string]bool{}
 	var cols []string
@@ -2279,8 +1743,44 @@ func columnsFromRows(rows []Row) []string {
 	sort.Strings(cols)
 	return cols
 }
+func fmtKeyPart(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return "N:"
+	case int:
+		return "I:" + strconv.Itoa(x)
+	case float64:
+		return "F:" + strconv.FormatFloat(x, 'g', -1, 64)
+	case bool:
+		if x {
+			return "B:1"
+		}
+		return "B:0"
+	case string:
+		return "S:" + x
+	default:
+		b, _ := json.Marshal(x)
+		return "J:" + string(b)
+	}
+}
+func distinctRows(rows []Row, cols []string) []Row {
+	seen := make(map[string]bool)
+	var out []Row
+	for _, r := range rows {
+		var parts []string
+		for _, c := range cols {
+			parts = append(parts, fmtKeyPart(r[strings.ToLower(c)]))
+		}
+		key := strings.Join(parts, "|")
+		if !seen[key] {
+			seen[key] = true
+			out = append(out, r)
+		}
+	}
+	return out
+}
 
-func inferType(v interface{}) ColType {
+func inferType(v any) ColType {
 	switch v.(type) {
 	case int, int64:
 		return IntType
@@ -2291,11 +1791,10 @@ func inferType(v interface{}) ColType {
 	case string:
 		return TextType
 	default:
-		return TextType
+		return JsonType
 	}
 }
-
-func coerceToTypeAllowNull(v interface{}, t ColType) (interface{}, error) {
+func coerceToTypeAllowNull(v any, t ColType) (any, error) {
 	if v == nil {
 		return nil, nil
 	}
@@ -2304,6 +1803,8 @@ func coerceToTypeAllowNull(v interface{}, t ColType) (interface{}, error) {
 		switch x := v.(type) {
 		case int:
 			return x, nil
+		case int64:
+			return int(x), nil
 		case float64:
 			return int(x), nil
 		case string:
@@ -2323,6 +1824,8 @@ func coerceToTypeAllowNull(v interface{}, t ColType) (interface{}, error) {
 	case FloatType:
 		switch x := v.(type) {
 		case int:
+			return float64(x), nil
+		case int64:
 			return float64(x), nil
 		case float64:
 			return x, nil
@@ -2346,7 +1849,7 @@ func coerceToTypeAllowNull(v interface{}, t ColType) (interface{}, error) {
 		switch x := v.(type) {
 		case bool:
 			return x, nil
-		case int:
+		case int, int64:
 			return x != 0, nil
 		case float64:
 			return x != 0, nil
@@ -2356,92 +1859,1135 @@ func coerceToTypeAllowNull(v interface{}, t ColType) (interface{}, error) {
 		default:
 			return nil, fmt.Errorf("cannot convert %T to BOOL", v)
 		}
+	case JsonType:
+		switch x := v.(type) {
+		case string:
+			var anyv any
+			if err := json.Unmarshal([]byte(x), &anyv); err == nil {
+				return anyv, nil
+			}
+			return x, nil
+		default:
+			return x, nil
+		}
 	default:
 		return v, nil
 	}
 }
 
-func fmtKeyPart(v interface{}) string {
-	switch x := v.(type) {
-	case nil:
-		return "N:"
-	case int:
-		return "I:" + strconv.Itoa(x)
-	case float64:
-		return "F:" + strconv.FormatFloat(x, 'g', -1, 64)
-	case bool:
-		if x {
-			return "B:1"
-		}
-		return "B:0"
-	case string:
-		return "S:" + x
+func cellString(v any) string {
+	if v == nil {
+		return "NULL"
+	}
+	switch vv := v.(type) {
+	case map[string]any, []any:
+		b, _ := json.Marshal(vv)
+		return string(b)
 	default:
-		return fmt.Sprintf("T:%T:%v", v, v)
+		return fmt.Sprintf("%v", v)
 	}
 }
 
-func distinctRows(rows []Row, cols []string) []Row {
-	seen := make(map[string]bool)
-	var out []Row
-	for _, r := range rows {
-		var parts []string
-		for _, c := range cols {
-			parts = append(parts, fmtKeyPart(r[strings.ToLower(c)]))
+func Execute(ctx context.Context, db *DB, tenant string, stmt Statement) (*resultSet, error) {
+	env := ExecEnv{ctx: ctx, tenant: tenant}
+	switch s := stmt.(type) {
+	case *CreateTable:
+		if s.AsSelect == nil {
+			t := NewTable(s.Name, s.Cols, s.IsTemp)
+			return nil, db.Put(tenant, t)
 		}
-		key := strings.Join(parts, "|")
-		if !seen[key] {
-			seen[key] = true
-			out = append(out, r)
+		rs, err := Execute(ctx, db, tenant, s.AsSelect)
+		if err != nil {
+			return nil, err
+		}
+		cols := make([]Column, len(rs.Cols))
+		if len(rs.Rows) > 0 {
+			for i, c := range rs.Cols {
+				cols[i] = Column{Name: c, Type: inferType(rs.Rows[0][strings.ToLower(c)])}
+			}
+		} else {
+			for i, c := range rs.Cols {
+				cols[i] = Column{Name: c, Type: TextType}
+			}
+		}
+		t := NewTable(s.Name, cols, s.IsTemp)
+		for _, r := range rs.Rows {
+			row := make([]any, len(cols))
+			for i, c := range cols {
+				row[i] = r[strings.ToLower(c.Name)]
+			}
+			t.Rows = append(t.Rows, row)
+		}
+		return nil, db.Put(tenant, t)
+	case *DropTable:
+		return nil, db.Drop(tenant, s.Name)
+	case *Insert:
+		t, err := db.Get(tenant, s.Table)
+		if err != nil {
+			return nil, err
+		}
+		if len(s.Cols) > 0 && len(s.Cols) != len(s.Vals) {
+			return nil, fmt.Errorf("INSERT column/value count mismatch")
+		}
+		row := make([]any, len(t.Cols))
+		for i := range row {
+			row[i] = nil
+		}
+		tmp := Row{}
+		if len(s.Cols) == 0 {
+			if len(s.Vals) != len(t.Cols) {
+				return nil, fmt.Errorf("INSERT without columns expects %d values", len(t.Cols))
+			}
+			for i, e := range s.Vals {
+				if err := checkCtx(ctx); err != nil {
+					return nil, err
+				}
+				v, err := evalExpr(env, e, tmp)
+				if err != nil {
+					return nil, err
+				}
+				cv, err := coerceToTypeAllowNull(v, t.Cols[i].Type)
+				if err != nil {
+					return nil, fmt.Errorf("column %q: %w", t.Cols[i].Name, err)
+				}
+				row[i] = cv
+			}
+		} else {
+			for i, name := range s.Cols {
+				idx, err := t.colIndex(name)
+				if err != nil {
+					return nil, err
+				}
+				v, err := evalExpr(env, s.Vals[i], tmp)
+				if err != nil {
+					return nil, err
+				}
+				cv, err := coerceToTypeAllowNull(v, t.Cols[idx].Type)
+				if err != nil {
+					return nil, fmt.Errorf("column %q: %w", t.Cols[idx].Name, err)
+				}
+				row[idx] = cv
+			}
+		}
+		t.Rows = append(t.Rows, row)
+		t.Version++
+		return nil, nil
+	case *Update:
+		t, err := db.Get(tenant, s.Table)
+		if err != nil {
+			return nil, err
+		}
+		setIdx := map[int]Expr{}
+		for name, ex := range s.Sets {
+			i, err := t.colIndex(name)
+			if err != nil {
+				return nil, err
+			}
+			setIdx[i] = ex
+		}
+		n := 0
+		for ri, r := range t.Rows {
+			if err := checkCtx(ctx); err != nil {
+				return nil, err
+			}
+			row := Row{}
+			for i, c := range t.Cols {
+				PutVal(row, c.Name, r[i])
+				PutVal(row, s.Table+"."+c.Name, r[i])
+			}
+			ok := true
+			if s.Where != nil {
+				v, err := evalExpr(env, s.Where, row)
+				if err != nil {
+					return nil, err
+				}
+				ok = (toTri(v) == tvTrue)
+			}
+			if ok {
+				for i, ex := range setIdx {
+					v, err := evalExpr(env, ex, row)
+					if err != nil {
+						return nil, err
+					}
+					cv, err := coerceToTypeAllowNull(v, t.Cols[i].Type)
+					if err != nil {
+						return nil, err
+					}
+					t.Rows[ri][i] = cv
+				}
+				n++
+			}
+		}
+		t.Version++
+		return &resultSet{Cols: []string{"updated"}, Rows: []Row{{"updated": n}}}, nil
+	case *Delete:
+		t, err := db.Get(tenant, s.Table)
+		if err != nil {
+			return nil, err
+		}
+		var kept [][]any
+		del := 0
+		for _, r := range t.Rows {
+			if err := checkCtx(ctx); err != nil {
+				return nil, err
+			}
+			row := Row{}
+			for i, c := range t.Cols {
+				PutVal(row, c.Name, r[i])
+				PutVal(row, s.Table+"."+c.Name, r[i])
+			}
+			keep := true
+			if s.Where != nil {
+				v, err := evalExpr(env, s.Where, row)
+				if err != nil {
+					return nil, err
+				}
+				if toTri(v) == tvTrue {
+					keep = false
+				}
+			}
+			if keep {
+				kept = append(kept, r)
+			} else {
+				del++
+			}
+		}
+		t.Rows = kept
+		t.Version++
+		return &resultSet{Cols: []string{"deleted"}, Rows: []Row{{"deleted": del}}}, nil
+	case *Select:
+		// FROM
+		leftT, err := db.Get(tenant, s.From.Table)
+		if err != nil {
+			return nil, err
+		}
+		leftRows, _ := rowsFromTable(leftT, aliasOr(s.From))
+		cur := leftRows
+		// JOINs
+		for _, j := range s.Joins {
+			rt, err := db.Get(tenant, j.Right.Table)
+			if err != nil {
+				return nil, err
+			}
+			rightRows, _ := rowsFromTable(rt, aliasOr(j.Right))
+			switch j.Type {
+			case JoinInner:
+				var joined []Row
+				for _, l := range cur {
+					if err := checkCtx(ctx); err != nil {
+						return nil, err
+					}
+					for _, r := range rightRows {
+						m := mergeRows(l, r)
+						ok := true
+						if j.On != nil {
+							val, err := evalExpr(env, j.On, m)
+							if err != nil {
+								return nil, err
+							}
+							ok = (toTri(val) == tvTrue)
+						}
+						if ok {
+							joined = append(joined, m)
+						}
+					}
+				}
+				cur = joined
+			case JoinLeft:
+				var joined []Row
+				for _, l := range cur {
+					if err := checkCtx(ctx); err != nil {
+						return nil, err
+					}
+					matched := false
+					for _, r := range rightRows {
+						m := mergeRows(l, r)
+						ok := true
+						if j.On != nil {
+							val, err := evalExpr(env, j.On, m)
+							if err != nil {
+								return nil, err
+							}
+							ok = (toTri(val) == tvTrue)
+						}
+						if ok {
+							joined = append(joined, m)
+							matched = true
+						}
+					}
+					if !matched {
+						m := cloneRow(l)
+						addRightNulls(m, aliasOr(j.Right), rt)
+						joined = append(joined, m)
+					}
+				}
+				cur = joined
+			case JoinRight:
+				var joined []Row
+				leftKeys := []string{}
+				if len(cur) > 0 {
+					leftKeys = keysOfRow(cur[0])
+				}
+				for _, r := range rightRows {
+					if err := checkCtx(ctx); err != nil {
+						return nil, err
+					}
+					matched := false
+					for _, l := range cur {
+						m := mergeRows(l, r)
+						ok := true
+						if j.On != nil {
+							val, err := evalExpr(env, j.On, m)
+							if err != nil {
+								return nil, err
+							}
+							ok = (toTri(val) == tvTrue)
+						}
+						if ok {
+							joined = append(joined, m)
+							matched = true
+						}
+					}
+					if !matched {
+						m := cloneRow(r)
+						for _, k := range leftKeys {
+							m[k] = nil
+						}
+						joined = append(joined, m)
+					}
+				}
+				cur = joined
+			}
+		}
+		// WHERE
+		filtered := cur
+		if s.Where != nil {
+			var tmp []Row
+			for _, r := range filtered {
+				if err := checkCtx(ctx); err != nil {
+					return nil, err
+				}
+				v, err := evalExpr(env, s.Where, r)
+				if err != nil {
+					return nil, err
+				}
+				if toTri(v) == tvTrue {
+					tmp = append(tmp, r)
+				}
+			}
+			filtered = tmp
+		}
+		// GROUP/HAVING
+		needAgg := len(s.GroupBy) > 0 || anyAggInSelect(s.Projs) || isAggregate(s.Having)
+		var outRows []Row
+		var outCols []string
+		if needAgg {
+			groups := map[string][]Row{}
+			var orderKeys []string
+			for _, r := range filtered {
+				if err := checkCtx(ctx); err != nil {
+					return nil, err
+				}
+				var parts []string
+				for _, g := range s.GroupBy {
+					v, err := evalExpr(env, &g, r)
+					if err != nil {
+						return nil, err
+					}
+					parts = append(parts, fmtKeyPart(v))
+				}
+				ks := strings.Join(parts, "\x1f")
+				if _, ok := groups[ks]; !ok {
+					orderKeys = append(orderKeys, ks)
+				}
+				groups[ks] = append(groups[ks], r)
+			}
+			for _, k := range orderKeys {
+				rows := groups[k]
+				if s.Having != nil {
+					hv, err := evalAggregate(env, s.Having, rows)
+					if err != nil {
+						return nil, err
+					}
+					if toTri(hv) != tvTrue {
+						continue
+					}
+				}
+				out := Row{}
+				for i, it := range s.Projs {
+					if it.Star {
+						if len(rows) > 0 {
+							for col, v := range rows[0] {
+								if strings.Contains(col, ".") {
+									PutVal(out, col, v)
+									outCols = appendUnique(outCols, col)
+								}
+							}
+						}
+						continue
+					}
+					name := projName(it, i)
+					var val any
+					var err error
+					if isAggregate(it.Expr) || len(s.GroupBy) > 0 {
+						val, err = evalAggregate(env, it.Expr, rows)
+					} else {
+						val, err = evalExpr(env, it.Expr, rows[0])
+					}
+					if err != nil {
+						return nil, err
+					}
+					PutVal(out, name, val)
+					outCols = appendUnique(outCols, name)
+				}
+				outRows = append(outRows, out)
+			}
+		} else {
+			for _, r := range filtered {
+				if err := checkCtx(ctx); err != nil {
+					return nil, err
+				}
+				out := Row{}
+				for i, it := range s.Projs {
+					if it.Star {
+						for col, v := range r {
+							if strings.Contains(col, ".") {
+								PutVal(out, col, v)
+								outCols = appendUnique(outCols, col)
+							}
+						}
+						continue
+					}
+					val, err := evalExpr(env, it.Expr, r)
+					if err != nil {
+						return nil, err
+					}
+					name := projName(it, i)
+					PutVal(out, name, val)
+					outCols = appendUnique(outCols, name)
+				}
+				outRows = append(outRows, out)
+			}
+		}
+		// DISTINCT
+		if s.Distinct {
+			outRows = distinctRows(outRows, outCols)
+		}
+		// ORDER BY
+		if len(s.OrderBy) > 0 {
+			sort.SliceStable(outRows, func(i, j int) bool {
+				a := outRows[i]
+				b := outRows[j]
+				for _, oi := range s.OrderBy {
+					av, _ := GetVal(a, oi.Col)
+					bv, _ := GetVal(b, oi.Col)
+					cmp := compareForOrder(av, bv, oi.Desc)
+					if cmp == 0 {
+						continue
+					}
+					if oi.Desc {
+						return cmp > 0
+					}
+					return cmp < 0
+				}
+				return false
+			})
+		}
+		// OFFSET/LIMIT
+		start := 0
+		if s.Offset != nil && *s.Offset > 0 {
+			start = *s.Offset
+		}
+		if start > len(outRows) {
+			outRows = []Row{}
+		} else {
+			outRows = outRows[start:]
+		}
+		if s.Limit != nil && *s.Limit < len(outRows) {
+			outRows = outRows[:*s.Limit]
+		}
+		if len(outCols) == 0 {
+			outCols = columnsFromRows(outRows)
+		}
+		return &resultSet{Cols: outCols, Rows: outRows}, nil
+	}
+	return nil, fmt.Errorf("unknown statement")
+}
+
+func aliasOr(f FromItem) string {
+	if f.Alias != "" {
+		return f.Alias
+	}
+	return f.Table
+}
+func mergeRows(l, r Row) Row {
+	m := make(Row, len(l)+len(r))
+	for k, v := range l {
+		m[k] = v
+	}
+	for k, v := range r {
+		m[k] = v
+	}
+	return m
+}
+func cloneRow(r Row) Row {
+	m := make(Row, len(r))
+	for k, v := range r {
+		m[k] = v
+	}
+	return m
+}
+func addRightNulls(m Row, alias string, t *Table) {
+	for _, c := range t.Cols {
+		PutVal(m, alias+"."+c.Name, nil)
+		if _, ex := m[strings.ToLower(c.Name)]; !ex {
+			PutVal(m, c.Name, nil)
 		}
 	}
+}
+
+func jsonGet(v any, path string) any {
+	if v == nil || path == "" {
+		return nil
+	}
+	parts := parseJSONPath(path)
+	cur := v
+	for _, p := range parts {
+		switch c := cur.(type) {
+		case map[string]any:
+			cur = c[p.key]
+		case []any:
+			if p.idx >= 0 && p.idx < len(c) {
+				cur = c[p.idx]
+			} else {
+				return nil
+			}
+		default:
+			return nil
+		}
+	}
+	return cur
+}
+
+type pathPart struct {
+	key string
+	idx int
+}
+
+func parseJSONPath(s string) []pathPart {
+	var out []pathPart
+	cur := ""
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '.':
+			if cur != "" {
+				out = append(out, pathPart{key: cur, idx: -1})
+				cur = ""
+			}
+		case '[':
+			if cur != "" {
+				out = append(out, pathPart{key: cur, idx: -1})
+				cur = ""
+			}
+			j := i + 1
+			for j < len(s) && s[j] != ']' {
+				j++
+			}
+			if j <= len(s)-1 {
+				n, _ := strconv.Atoi(s[i+1 : j])
+				out = append(out, pathPart{idx: n})
+				i = j
+			}
+		default:
+			cur += string(s[i])
+		}
+	}
+	if cur != "" {
+		out = append(out, pathPart{key: cur, idx: -1})
+	}
 	return out
+}
+
+type diskColumn struct {
+	Name string
+	Type ColType
+}
+type diskTable struct {
+	Tenant string
+	Name   string
+	Cols   []diskColumn
+	Rows   [][]any
+	IsTemp bool
+}
+
+func saveDBToFile(db *DB, filename string) error {
+	var dump []diskTable
+	for tn, tdb := range db.tenants {
+		for _, t := range tdb.tables {
+			dt := diskTable{Tenant: tn, Name: t.Name, IsTemp: t.IsTemp}
+			for _, c := range t.Cols {
+				dt.Cols = append(dt.Cols, diskColumn{Name: c.Name, Type: c.Type})
+			}
+			for _, r := range t.Rows {
+				row := make([]any, len(r))
+				for i, v := range r {
+					if v == nil {
+						row[i] = nil
+						continue
+					}
+					if t.Cols[i].Type == JsonType {
+						b, _ := json.Marshal(v)
+						row[i] = string(b)
+					} else {
+						row[i] = v
+					}
+				}
+				dt.Rows = append(dt.Rows, row)
+			}
+			dump = append(dump, dt)
+		}
+	}
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	enc := gob.NewEncoder(f)
+	return enc.Encode(dump)
+}
+
+func loadDBFromFile(filename string) (*DB, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return NewDB(), nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+	var dump []diskTable
+	dec := gob.NewDecoder(f)
+	if err := dec.Decode(&dump); err != nil {
+		if errors.Is(err, io.EOF) {
+			return NewDB(), nil
+		}
+		return nil, err
+	}
+	db := NewDB()
+	for _, dt := range dump {
+		var cols []Column
+		for _, c := range dt.Cols {
+			cols = append(cols, Column{Name: c.Name, Type: c.Type})
+		}
+		t := NewTable(dt.Name, cols, dt.IsTemp)
+		for _, r := range dt.Rows {
+			row := make([]any, len(r))
+			for i, v := range r {
+				if v == nil {
+					row[i] = nil
+					continue
+				}
+				if cols[i].Type == JsonType {
+					var anyv any
+					if s, ok := v.(string); ok {
+						if json.Unmarshal([]byte(s), &anyv) == nil {
+							row[i] = anyv
+						} else {
+							row[i] = s
+						}
+					} else {
+						row[i] = v
+					}
+				} else {
+					row[i] = v
+				}
+			}
+			t.Rows = append(t.Rows, row)
+		}
+		_ = db.Put(dt.Tenant, t)
+	}
+	return db, nil
+}
+
+type server struct {
+	mu       sync.RWMutex
+	db       *DB
+	filePath string
+	autosave bool
+}
+
+func newServer(db *DB, path string, autosave bool) *server {
+	return &server{db: db, filePath: path, autosave: autosave}
+}
+func (s *server) saveIfNeeded() {
+	if s.autosave && s.filePath != "" {
+		_ = saveDBToFile(s.db, s.filePath)
+	}
+}
+
+type cfg struct {
+	tenant   string
+	filePath string // "" => mem
+	autosave bool
+}
+
+func parseDSN(dsn string) (cfg, error) {
+	//   "mem://?tenant=acme"
+	//   "file:/tmp/tinysql.db?tenant=acme&autosave=1"
+	var c cfg
+	c.tenant = "default"
+	switch {
+	case strings.HasPrefix(dsn, "mem://"):
+		q := ""
+		if i := strings.Index(dsn, "?"); i >= 0 {
+			q = dsn[i+1:]
+		}
+		for _, kv := range strings.Split(q, "&") {
+			if kv == "" {
+				continue
+			}
+			parts := strings.SplitN(kv, "=", 2)
+			k := parts[0]
+			v := ""
+			if len(parts) == 2 {
+				v = parts[1]
+			}
+			switch k {
+			case "tenant":
+				if v != "" {
+					c.tenant = v
+				}
+			case "autosave":
+				c.autosave = (v == "1" || strings.ToLower(v) == "true")
+			}
+		}
+		return c, nil
+	case strings.HasPrefix(dsn, "file:"):
+		path := strings.TrimPrefix(dsn, "file:")
+		if i := strings.Index(path, "?"); i >= 0 {
+			q := path[i+1:]
+			path = path[:i]
+			for _, kv := range strings.Split(q, "&") {
+				if kv == "" {
+					continue
+				}
+				parts := strings.SplitN(kv, "=", 2)
+				k := parts[0]
+				v := ""
+				if len(parts) == 2 {
+					v = parts[1]
+				}
+				switch k {
+				case "tenant":
+					if v != "" {
+						c.tenant = v
+					}
+				case "autosave":
+					c.autosave = (v == "1" || strings.ToLower(v) == "true")
+				}
+			}
+		}
+		if path == "" {
+			return c, fmt.Errorf("file: path required")
+		}
+		c.filePath = filepath.Clean(path)
+		return c, nil
+	default:
+		// Kompatibilitätsmodus: DSN leer -> mem
+		if dsn == "" {
+			return c, nil
+		}
+		return c, fmt.Errorf("unsupported DSN (use mem:// or file:)")
+	}
+}
+
+type drv struct{ srv *server }
+
+func (d *drv) Open(name string) (driver.Conn, error) {
+	c, err := parseDSN(name)
+	if err != nil {
+		return nil, err
+	}
+	var s *server
+	if d.srv != nil {
+		s = d.srv
+	} else {
+		var db *DB
+		if c.filePath != "" {
+			db, err = loadDBFromFile(c.filePath)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			db = NewDB()
+		}
+		s = newServer(db, c.filePath, c.autosave)
+	}
+	return &conn{srv: s, tenant: c.tenant}, nil
+}
+
+type conn struct {
+	srv    *server
+	tenant string
+	inTx bool
+}
+
+func (c *conn) Prepare(query string) (driver.Stmt, error) {
+	return &stmt{c: c, sql: query}, nil
+}
+func (c *conn) Close() error {
+	c.srv.saveIfNeeded()
+	return nil
+}
+func (c *conn) Begin() (driver.Tx, error) {
+	return c.BeginTx(context.Background(), driver.TxOptions{})
+}
+
+// ConnBeginTx
+func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	c.srv.mu.Lock()
+	c.inTx = true
+	return &tx{c: c}, nil
+}
+
+type tx struct{ c *conn }
+
+func (t *tx) Commit() error {
+	t.c.inTx = false
+	t.c.srv.saveIfNeeded()
+	t.c.srv.mu.Unlock()
+	return nil
+}
+func (t *tx) Rollback() error {
+	t.c.inTx = false
+	t.c.srv.mu.Unlock()
+	return nil
+}
+
+// Query/Exec Context
+
+func (c *conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	sqlStr, err := bindPlaceholders(query, args)
+	if err != nil {
+		return nil, err
+	}
+	return c.execSQL(ctx, sqlStr)
+}
+func (c *conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	sqlStr, err := bindPlaceholders(query, args)
+	if err != nil {
+		return nil, err
+	}
+	return c.querySQL(ctx, sqlStr)
+}
+
+// Fallback (database/sql ruft diese auf, wenn *Context nicht unterstützt)
+func (c *conn) Exec(query string, args []driver.Value) (driver.Result, error) {
+	named := make([]driver.NamedValue, len(args))
+	for i, v := range args {
+		named[i] = driver.NamedValue{Ordinal: i + 1, Value: v}
+	}
+	return c.ExecContext(context.Background(), query, named)
+}
+func (c *conn) Query(query string, args []driver.Value) (driver.Rows, error) {
+	named := make([]driver.NamedValue, len(args))
+	for i, v := range args {
+		named[i] = driver.NamedValue{Ordinal: i + 1, Value: v}
+	}
+	return c.QueryContext(context.Background(), query, named)
+}
+
+func (c *conn) execSQL(ctx context.Context, sqlStr string) (driver.Result, error) {
+	// Parser/Executor
+	p := NewParser(sqlStr)
+	st, err := p.ParseStatement()
+	if err != nil {
+		return nil, err
+	}
+	// write detection
+	isWrite := func(s Statement) bool {
+		switch s.(type) {
+		case *CreateTable, *DropTable, *Insert, *Update, *Delete:
+			return true
+		default:
+			return false
+		}
+	}
+	if isWrite(st) && !c.inTx {
+		c.srv.mu.Lock()
+		defer c.srv.mu.Unlock()
+	}
+	if !isWrite(st) {
+		c.srv.mu.RLock()
+		defer c.srv.mu.RUnlock()
+	}
+	rs, err := Execute(ctx, c.srv.db, c.tenant, st)
+	if err != nil {
+		return nil, err
+	}
+	var rowsAffected int64 = 0
+	if rs != nil && len(rs.Rows) == 1 && len(rs.Cols) == 1 {
+		switch strings.ToLower(rs.Cols[0]) {
+		case "updated", "deleted":
+			if n, ok := rs.Rows[0][rs.Cols[0]].(int); ok {
+				rowsAffected = int64(n)
+			}
+		}
+	}
+	if isWrite(st) && !c.inTx {
+		c.srv.saveIfNeeded()
+	}
+	return driver.RowsAffected(rowsAffected), nil
+}
+
+func (c *conn) querySQL(ctx context.Context, sqlStr string) (driver.Rows, error) {
+	p := NewParser(sqlStr)
+	st, err := p.ParseStatement()
+	if err != nil {
+		return nil, err
+	}
+	// Nur SELECT produziert Rows
+	_, ok := st.(*Select)
+	if !ok {
+		// für DDL/DML als Query: führe aus und gebe "empty rows" zurück
+		if _, err := c.execSQL(ctx, sqlStr); err != nil {
+			return nil, err
+		}
+		return emptyRows{}, nil
+	}
+	c.srv.mu.RLock()
+	defer c.srv.mu.RUnlock()
+	rs, err := Execute(ctx, c.srv.db, c.tenant, st)
+	if err != nil {
+		return nil, err
+	}
+	return &rows{rs: rs}, nil
+}
+
+// NamedValueChecker: normalize Values (time.Time->RFC3339 string, []byte->base64)
+func (c *conn) CheckNamedValue(nv *driver.NamedValue) error {
+	switch v := nv.Value.(type) {
+	case time.Time:
+		nv.Value = v.UTC().Format(time.RFC3339Nano)
+	case []byte:
+		nv.Value = base64.StdEncoding.EncodeToString(v)
+	case int:
+		nv.Value = int64(v)
+	}
+	return nil
+}
+
+type stmt struct {
+	c   *conn
+	sql string
+}
+
+func (s *stmt) Close() error  { return nil }
+func (s *stmt) NumInput() int { return -1 } // variadisch
+
+func (s *stmt) Exec(args []driver.Value) (driver.Result, error) {
+	nv := make([]driver.NamedValue, len(args))
+	for i, v := range args {
+		nv[i] = driver.NamedValue{Ordinal: i + 1, Value: v}
+	}
+	return s.ExecContext(context.Background(), nv)
+}
+func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
+	nv := make([]driver.NamedValue, len(args))
+	for i, v := range args {
+		nv[i] = driver.NamedValue{Ordinal: i + 1, Value: v}
+	}
+	return s.QueryContext(context.Background(), nv)
+}
+
+func (s *stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	sqlStr, err := bindPlaceholders(s.sql, args)
+	if err != nil {
+		return nil, err
+	}
+	return s.c.execSQL(ctx, sqlStr)
+}
+func (s *stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	sqlStr, err := bindPlaceholders(s.sql, args)
+	if err != nil {
+		return nil, err
+	}
+	return s.c.querySQL(ctx, sqlStr)
+}
+
+// Rows
+
+type rows struct {
+	rs   *resultSet
+	i    int
+	once bool
+}
+
+func (r *rows) Columns() []string { return r.rs.Cols }
+func (r *rows) Close() error      { return nil }
+func (r *rows) Next(dest []driver.Value) error {
+	if r.i >= len(r.rs.Rows) {
+		return io.EOF
+	}
+	row := r.rs.Rows[r.i]
+	for i, c := range r.rs.Cols {
+		v := row[strings.ToLower(c)]
+		switch vv := v.(type) {
+		case nil:
+			dest[i] = nil
+		case int:
+			dest[i] = int64(vv)
+		case int64:
+			dest[i] = vv
+		case float64:
+			dest[i] = vv
+		case bool:
+			dest[i] = vv
+		case string:
+			dest[i] = vv
+		default:
+			// JSON/andere -> JSON-String
+			b, _ := json.Marshal(vv)
+			dest[i] = string(b)
+		}
+	}
+	r.i++
+	return nil
+}
+
+// Optional ColumnType* interfaces
+func (r *rows) ColumnTypeDatabaseTypeName(i int) string {
+	// Unbekannt -> TEXT
+	// In dieser einfachen Implementierung kennen wir die Spaltentypen im ResultSet
+	// nicht sicher (Expressions). Wir geben heuristisch TEXT zurück.
+	return "TEXT"
+}
+func (r *rows) ColumnTypeNullable(i int) (nullable, ok bool) { return true, true }
+func (r *rows) ColumnTypeScanType(i int) reflectType {
+	// ohne import reflect/Stringer: einfacher Alias
+	return reflectType("interface{}")
+}
+
+// helper alias to avoid importing reflect; database/sql nutzt das nur informativ
+type reflectType string
+
+// emptyRows: für Exec-as-Query
+type emptyRows struct{}
+
+func (emptyRows) Columns() []string                     { return []string{} }
+func (emptyRows) Close() error                          { return nil }
+func (emptyRows) Next(dest []driver.Value) error        { return io.EOF }
+func (emptyRows) ColumnTypeDatabaseTypeName(int) string { return "TEXT" }
+func (emptyRows) ColumnTypeNullable(int) (bool, bool)   { return true, true }
+func (emptyRows) ColumnTypeScanType(int) reflectType    { return reflectType("interface{}") }
+
+// Placeholder-Bindung: ersetzt '?' in SQL sicher durch Literale
+func bindPlaceholders(sqlStr string, args []driver.NamedValue) (string, error) {
+	var sb strings.Builder
+	argi := 0
+	for i := 0; i < len(sqlStr); i++ {
+		ch := sqlStr[i]
+		if ch == '\'' {
+			// Strings unverändert durchkopieren (mit Escapes)
+			sb.WriteByte(ch)
+			i++
+			for i < len(sqlStr) {
+				sb.WriteByte(sqlStr[i])
+				if sqlStr[i] == '\'' {
+					if i+1 < len(sqlStr) && sqlStr[i+1] == '\'' {
+						i++
+						sb.WriteByte(sqlStr[i])
+						i++
+						continue
+					}
+					break
+				}
+				i++
+			}
+			continue
+		}
+		if ch == '?' {
+			if argi >= len(args) {
+				return "", fmt.Errorf("not enough args for placeholders")
+			}
+			sb.WriteString(sqlLiteral(args[argi].Value))
+			argi++
+			continue
+		}
+		sb.WriteByte(ch)
+	}
+	if argi != len(args) {
+		return "", fmt.Errorf("too many args for placeholders")
+	}
+	return sb.String(), nil
+}
+func sqlLiteral(v any) string {
+	if v == nil {
+		return "NULL"
+	}
+	switch x := v.(type) {
+	case int64:
+		return strconv.FormatInt(x, 10)
+	case float64:
+		return strconv.FormatFloat(x, 'g', -1, 64)
+	case bool:
+		if x {
+			return "TRUE"
+		}
+		return "FALSE"
+	case string:
+		s := strings.ReplaceAll(x, "'", "''")
+		return "'" + s + "'"
+	default:
+		// JSON-fallback
+		b, _ := json.Marshal(x)
+		s := strings.ReplaceAll(string(b), "'", "''")
+		return "'" + s + "'"
+	}
 }
 
 func printResult(rs *resultSet) {
 	if rs == nil {
 		return
 	}
-	// single number results (updated/deleted)
 	if len(rs.Rows) == 1 && len(rs.Cols) == 1 && (strings.ToLower(rs.Cols[0]) == "updated" || strings.ToLower(rs.Cols[0]) == "deleted") {
 		for _, r := range rs.Rows {
 			fmt.Printf("%s: %v\n", rs.Cols[0], r[strings.ToLower(rs.Cols[0])])
 		}
 		return
 	}
-	// compute widths
-	width := make([]int, len(rs.Cols))
+	// Breiten
+	w := make([]int, len(rs.Cols))
 	for i, c := range rs.Cols {
-		width[i] = len(c)
+		w[i] = len(c)
 	}
 	for _, r := range rs.Rows {
 		for i, c := range rs.Cols {
 			s := cellString(r[strings.ToLower(c)])
-			if len(s) > width[i] {
-				width[i] = len(s)
+			if len(s) > w[i] {
+				w[i] = len(s)
 			}
 		}
 	}
-	// header
+	// Header
 	for i, c := range rs.Cols {
-		fmt.Print(padRight(c, width[i]))
+		fmt.Print(padRight(c, w[i]))
 		if i < len(rs.Cols)-1 {
 			fmt.Print("  ")
 		}
 	}
 	fmt.Println()
 	for i := range rs.Cols {
-		fmt.Print(strings.Repeat("-", width[i]))
+		fmt.Print(strings.Repeat("-", w[i]))
 		if i < len(rs.Cols)-1 {
 			fmt.Print("  ")
 		}
 	}
 	fmt.Println()
-	// rows
 	for _, r := range rs.Rows {
 		for i, c := range rs.Cols {
 			s := cellString(r[strings.ToLower(c)])
-			fmt.Print(padRight(s, width[i]))
+			fmt.Print(padRight(s, w[i]))
 			if i < len(rs.Cols)-1 {
 				fmt.Print("  ")
 			}
@@ -2449,14 +2995,6 @@ func printResult(rs *resultSet) {
 		fmt.Println()
 	}
 }
-
-func cellString(v interface{}) string {
-	if v == nil {
-		return "NULL"
-	}
-	return fmt.Sprintf("%v", v)
-}
-
 func padRight(s string, w int) string {
 	if len(s) >= w {
 		return s
@@ -2464,94 +3002,10 @@ func padRight(s string, w int) string {
 	return s + strings.Repeat(" ", w-len(s))
 }
 
-func runREPL(db *DB) {
-	fmt.Println("TinySQL+ REPL (stdlib-only).  End a statement with ';'.  Type .help for commands.")
-	sc := bufio.NewScanner(os.Stdin)
-	var buf strings.Builder
-	for {
-		if buf.Len() == 0 {
-			fmt.Print("sql> ")
-		} else {
-			fmt.Print(" ... ")
-		}
-		if !sc.Scan() {
-			fmt.Println()
-			return
-		}
-		line := strings.TrimSpace(sc.Text())
-		if buf.Len() == 0 && strings.HasPrefix(line, ".") {
-			if handleMeta(db, line) {
-				continue
-			}
-			// if not handled, fallthrough to buffer (allows dot lines inside statements if desired)
-		}
-		buf.WriteString(line)
-		// multi-line: keep reading until we see a ';' terminator
-		if strings.HasSuffix(line, ";") {
-			sql := buf.String()
-			sql = strings.TrimSuffix(sql, ";")
-			buf.Reset()
-			if strings.TrimSpace(sql) == "" {
-				continue
-			}
-			p := NewParser(sql)
-			st, err := p.ParseStatement()
-			if err != nil {
-				fmt.Println("ERR:", err)
-				continue
-			}
-			rs, err := Execute(db, st)
-			if err != nil {
-				fmt.Println("ERR:", err)
-				continue
-			}
-			printResult(rs)
-		} else {
-			buf.WriteString(" ")
-		}
-	}
-}
-
-func handleMeta(db *DB, line string) bool {
-	switch {
-	case line == ".help":
-		fmt.Println(`
-.meta commands:
-  .help                 Show this help
-  .tables               List tables
-  .schema <table>       Show schema of a table
-  .quit                 Exit`)
-		return true
-	case line == ".quit":
-		os.Exit(0)
-	case line == ".tables":
-		tables := db.ListTables()
-		if len(tables) == 0 {
-			fmt.Println("(no tables)")
-			return true
-		}
-		for _, t := range tables {
-			fmt.Printf("%s  (cols=%d, rows=%d)\n", t.Name, len(t.Cols), len(t.Rows))
-		}
-		return true
-	case strings.HasPrefix(line, ".schema"):
-		parts := strings.Fields(line)
-		if len(parts) != 2 {
-			fmt.Println("usage: .schema <table>")
-			return true
-		}
-		t, err := db.Get(parts[1])
-		if err != nil {
-			fmt.Println("ERR:", err)
-			return true
-		}
-		for _, c := range t.Cols {
-			fmt.Printf("%s %s\n", c.Name, c.Type.String())
-		}
-		return true
-	default:
-		fmt.Println("unknown meta command; try .help")
-		return true
-	}
-	return true
+func init() {
+	// database/sql Treiber registrieren
+	sql.Register("tinysql", &drv{})
+	// gob registrations (sicher nicht zwingend, aber gut)
+	gob.Register(map[string]any{})
+	gob.Register([]any{})
 }
