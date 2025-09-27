@@ -508,7 +508,57 @@ func (p *Parser) parseColumnDefs() ([]storage.Column, error) {
 		if typ < 0 {
 			return nil, p.errf("unknown type for column %q", name)
 		}
-		cols = append(cols, storage.Column{Name: name, Type: typ})
+		
+		col := storage.Column{
+			Name: name,
+			Type: typ,
+			Constraint: storage.NoConstraint,
+		}
+		
+		// Parse constraints
+		if p.cur.Typ == tKeyword {
+			switch p.cur.Val {
+			case "PRIMARY":
+				p.next()
+				if p.cur.Typ == tKeyword && p.cur.Val == "KEY" {
+					p.next()
+					col.Constraint = storage.PrimaryKey
+				}
+			case "FOREIGN":
+				p.next()
+				if p.cur.Typ == tKeyword && p.cur.Val == "KEY" {
+					p.next()
+					col.Constraint = storage.ForeignKey
+					// Parse REFERENCES table(column)
+					if p.cur.Typ == tKeyword && p.cur.Val == "REFERENCES" {
+						p.next()
+						table := p.parseIdentLike()
+						if table != "" && p.cur.Typ == tSymbol && p.cur.Val == "(" {
+							p.next()
+							column := p.parseIdentLike()
+							if column != "" {
+								p.expectSymbol(")")
+								col.ForeignKey = &storage.ForeignKeyRef{Table: table, Column: column}
+							}
+						}
+					}
+				}
+			case "UNIQUE":
+				p.next()
+				col.Constraint = storage.Unique
+			case "REFERENCES":
+				// Handle table-level REFERENCES for POINTER type
+				if typ == storage.PointerType {
+					p.next()
+					table := p.parseIdentLike()
+					if table != "" {
+						col.PointerTable = table
+					}
+				}
+			}
+		}
+		
+		cols = append(cols, col)
 		if p.cur.Typ == tSymbol && p.cur.Val == "," {
 			p.next()
 			continue
@@ -538,6 +588,21 @@ func (p *Parser) parseType() storage.ColType {
 		case "JSON":
 			p.next()
 			return storage.JsonType
+		case "DATE":
+			p.next()
+			return storage.DateType
+		case "DATETIME":
+			p.next()
+			return storage.DateTimeType
+		case "DURATION":
+			p.next()
+			return storage.DurationType
+		case "COMPLEX":
+			p.next()
+			return storage.ComplexType
+		case "POINTER":
+			p.next()
+			return storage.PointerType
 		}
 	}
 	return -1

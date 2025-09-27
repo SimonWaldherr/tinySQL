@@ -250,7 +250,8 @@ func (c *conn) Begin() (driver.Tx, error)                 { return c.BeginTx(con
 
 func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
 	switch opts.Isolation {
-	case driver.IsolationLevel(0), driver.LevelSerializable, driver.LevelSnapshot:
+	case driver.IsolationLevel(0): // Default
+		// Allow default isolation
 	default:
 		return nil, fmt.Errorf("unsupported isolation level: %v", opts.Isolation)
 	}

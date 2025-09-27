@@ -23,6 +23,11 @@ const (
 	TextType
 	BoolType
 	JsonType
+	DateType
+	DateTimeType
+	DurationType
+	ComplexType
+	PointerType
 )
 
 func (t ColType) String() string {
@@ -37,14 +42,54 @@ func (t ColType) String() string {
 		return "BOOL"
 	case JsonType:
 		return "JSON"
+	case DateType:
+		return "DATE"
+	case DateTimeType:
+		return "DATETIME"
+	case DurationType:
+		return "DURATION"
+	case ComplexType:
+		return "COMPLEX"
+	case PointerType:
+		return "POINTER"
 	default:
 		return "UNKNOWN"
 	}
 }
 
+type ConstraintType int
+
+const (
+	NoConstraint ConstraintType = iota
+	PrimaryKey
+	ForeignKey
+	Unique
+)
+
+func (c ConstraintType) String() string {
+	switch c {
+	case PrimaryKey:
+		return "PRIMARY KEY"
+	case ForeignKey:
+		return "FOREIGN KEY"
+	case Unique:
+		return "UNIQUE"
+	default:
+		return ""
+	}
+}
+
+type ForeignKeyRef struct {
+	Table  string
+	Column string
+}
+
 type Column struct {
-	Name string
-	Type ColType
+	Name         string
+	Type         ColType
+	Constraint   ConstraintType
+	ForeignKey   *ForeignKeyRef // Only used if Constraint == ForeignKey
+	PointerTable string         // Target table for POINTER type
 }
 
 type Table struct {
@@ -160,8 +205,11 @@ func (db *DB) DeepClone() *DB {
 // ------------------------ GOB Checkpoint (Load/Save) ------------------------
 
 type diskColumn struct {
-	Name string
-	Type ColType
+	Name         string
+	Type         ColType
+	Constraint   ConstraintType
+	ForeignKey   *ForeignKeyRef
+	PointerTable string
 }
 type diskTable struct {
 	Tenant  string
@@ -182,7 +230,13 @@ func tableToDisk(tn string, t *Table) diskTable {
 		Rows:    make([][]any, len(t.Rows)),
 	}
 	for i, c := range t.Cols {
-		dt.Cols[i] = diskColumn{Name: c.Name, Type: c.Type}
+		dt.Cols[i] = diskColumn{
+			Name:         c.Name,
+			Type:         c.Type,
+			Constraint:   c.Constraint,
+			ForeignKey:   c.ForeignKey,
+			PointerTable: c.PointerTable,
+		}
 	}
 	for i, r := range t.Rows {
 		row := make([]any, len(r))
@@ -206,7 +260,13 @@ func tableToDisk(tn string, t *Table) diskTable {
 func diskToTable(dt diskTable) *Table {
 	cols := make([]Column, len(dt.Cols))
 	for i, c := range dt.Cols {
-		cols[i] = Column{Name: c.Name, Type: c.Type}
+		cols[i] = Column{
+			Name:         c.Name,
+			Type:         c.Type,
+			Constraint:   c.Constraint,
+			ForeignKey:   c.ForeignKey,
+			PointerTable: c.PointerTable,
+		}
 	}
 	t := NewTable(dt.Name, cols, dt.IsTemp)
 	t.Version = dt.Version

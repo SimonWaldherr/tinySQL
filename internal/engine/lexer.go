@@ -182,6 +182,8 @@ func isKeyword(up string) bool {
 		"INSERT", "INTO", "VALUES",
 		"UPDATE", "SET", "DELETE",
 		"INT", "FLOAT", "TEXT", "BOOL", "JSON",
+		"DATE", "DATETIME", "DURATION", "COMPLEX", "POINTER",
+		"PRIMARY", "FOREIGN", "KEY", "REFERENCES", "UNIQUE",
 		"AND", "OR", "NOT", "IS", "NULL", "TRUE", "FALSE",
 		"COUNT", "SUM", "AVG", "MIN", "MAX",
 		"COALESCE", "NULLIF",
