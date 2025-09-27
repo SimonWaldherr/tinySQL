@@ -29,428 +29,530 @@ func Execute(ctx context.Context, db *storage.DB, tenant string, stmt Statement)
 	env := ExecEnv{ctx: ctx, tenant: tenant, db: db}
 	switch s := stmt.(type) {
 	case *CreateTable:
-		if s.AsSelect == nil {
-			t := storage.NewTable(s.Name, s.Cols, s.IsTemp)
-			db.Put(tenant, t)
-			return nil, nil
-		}
-		rs, err := Execute(ctx, db, tenant, s.AsSelect)
-		if err != nil {
-			return nil, err
-		}
-		cols := make([]storage.Column, len(rs.Cols))
-		if len(rs.Rows) > 0 {
-			for i, c := range rs.Cols {
-				cols[i] = storage.Column{Name: c, Type: inferType(rs.Rows[0][strings.ToLower(c)])}
-			}
-		} else {
-			for i, c := range rs.Cols {
-				cols[i] = storage.Column{Name: c, Type: storage.TextType}
-			}
-		}
-		t := storage.NewTable(s.Name, cols, s.IsTemp)
-		for _, r := range rs.Rows {
-			row := make([]any, len(cols))
-			for i, c := range cols {
-				row[i] = r[strings.ToLower(c.Name)]
-			}
-			t.Rows = append(t.Rows, row)
-		}
-		db.Put(tenant, t)
-		return nil, nil
+		return executeCreateTable(env, s)
 	case *DropTable:
-		return nil, db.Drop(tenant, s.Name)
+		return executeDropTable(env, s)
 	case *Insert:
-		t, err := db.Get(tenant, s.Table)
+		return executeInsert(env, s)
+	case *Update:
+		return executeUpdate(env, s)
+	case *Delete:
+		return executeDelete(env, s)
+	case *Select:
+		return executeSelect(env, s)
+	}
+	return nil, fmt.Errorf("unknown statement")
+}
+
+// -------------------- Statement Handlers --------------------
+
+func executeCreateTable(env ExecEnv, s *CreateTable) (*ResultSet, error) {
+	if s.AsSelect == nil {
+		t := storage.NewTable(s.Name, s.Cols, s.IsTemp)
+		env.db.Put(env.tenant, t)
+		return nil, nil
+	}
+	rs, err := Execute(env.ctx, env.db, env.tenant, s.AsSelect)
+	if err != nil {
+		return nil, err
+	}
+	cols := make([]storage.Column, len(rs.Cols))
+	if len(rs.Rows) > 0 {
+		for i, c := range rs.Cols {
+			cols[i] = storage.Column{Name: c, Type: inferType(rs.Rows[0][strings.ToLower(c)])}
+		}
+	} else {
+		for i, c := range rs.Cols {
+			cols[i] = storage.Column{Name: c, Type: storage.TextType}
+		}
+	}
+	t := storage.NewTable(s.Name, cols, s.IsTemp)
+	for _, r := range rs.Rows {
+		row := make([]any, len(cols))
+		for i, c := range cols {
+			row[i] = r[strings.ToLower(c.Name)]
+		}
+		t.Rows = append(t.Rows, row)
+	}
+	env.db.Put(env.tenant, t)
+	return nil, nil
+}
+
+func executeDropTable(env ExecEnv, s *DropTable) (*ResultSet, error) {
+	return nil, env.db.Drop(env.tenant, s.Name)
+}
+
+func executeInsert(env ExecEnv, s *Insert) (*ResultSet, error) {
+	t, err := env.db.Get(env.tenant, s.Table)
+	if err != nil {
+		return nil, err
+	}
+	if len(s.Cols) > 0 && len(s.Vals) != len(s.Cols) {
+		return nil, fmt.Errorf("INSERT column/value mismatch")
+	}
+	tmp := Row{}
+	if len(s.Cols) == 0 {
+		return executeInsertAllColumns(env, s, t, tmp)
+	}
+	return executeInsertSpecificColumns(env, s, t, tmp)
+}
+
+func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) (*ResultSet, error) {
+	if len(s.Vals) != len(t.Cols) {
+		return nil, fmt.Errorf("INSERT expects %d values", len(t.Cols))
+	}
+	row := make([]any, len(t.Cols))
+	for i, e := range s.Vals {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, err
+		}
+		v, err := evalExpr(env, e, tmp)
 		if err != nil {
 			return nil, err
 		}
-		if len(s.Cols) > 0 && len(s.Vals) != len(s.Cols) {
-			return nil, fmt.Errorf("INSERT column/value mismatch")
+		cv, err := coerceToTypeAllowNull(v, t.Cols[i].Type)
+		if err != nil {
+			return nil, fmt.Errorf("column %q: %w", t.Cols[i].Name, err)
 		}
-		row := make([]any, len(t.Cols))
-		for i := range row {
-			row[i] = nil
+		row[i] = cv
+	}
+	t.Rows = append(t.Rows, row)
+	t.Version++
+	return nil, nil
+}
+
+func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) (*ResultSet, error) {
+	row := make([]any, len(t.Cols))
+	for i := range row {
+		row[i] = nil
+	}
+	for i, name := range s.Cols {
+		idx, err := t.ColIndex(name)
+		if err != nil {
+			return nil, err
 		}
-		tmp := Row{}
-		if len(s.Cols) == 0 {
-			if len(s.Vals) != len(t.Cols) {
-				return nil, fmt.Errorf("INSERT expects %d values", len(t.Cols))
+		v, err := evalExpr(env, s.Vals[i], tmp)
+		if err != nil {
+			return nil, err
+		}
+		cv, err := coerceToTypeAllowNull(v, t.Cols[idx].Type)
+		if err != nil {
+			return nil, fmt.Errorf("column %q: %w", t.Cols[idx].Name, err)
+		}
+		row[idx] = cv
+	}
+	t.Rows = append(t.Rows, row)
+	t.Version++
+	return nil, nil
+}
+
+func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
+	t, err := env.db.Get(env.tenant, s.Table)
+	if err != nil {
+		return nil, err
+	}
+	setIdx := map[int]Expr{}
+	for name, ex := range s.Sets {
+		i, err := t.ColIndex(name)
+		if err != nil {
+			return nil, err
+		}
+		setIdx[i] = ex
+	}
+	n := 0
+	for ri, r := range t.Rows {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, err
+		}
+		row := Row{}
+		for i, c := range t.Cols {
+			putVal(row, c.Name, r[i])
+			putVal(row, s.Table+"."+c.Name, r[i])
+		}
+		ok := true
+		if s.Where != nil {
+			v, err := evalExpr(env, s.Where, row)
+			if err != nil {
+				return nil, err
 			}
-			for i, e := range s.Vals {
-				if err := checkCtx(env.ctx); err != nil {
-					return nil, err
-				}
-				v, err := evalExpr(env, e, tmp)
+			ok = (toTri(v) == tvTrue)
+		}
+		if ok {
+			for i, ex := range setIdx {
+				v, err := evalExpr(env, ex, row)
 				if err != nil {
 					return nil, err
 				}
 				cv, err := coerceToTypeAllowNull(v, t.Cols[i].Type)
 				if err != nil {
-					return nil, fmt.Errorf("column %q: %w", t.Cols[i].Name, err)
-				}
-				row[i] = cv
-			}
-		} else {
-			for i, name := range s.Cols {
-				idx, err := t.ColIndex(name)
-				if err != nil {
 					return nil, err
 				}
-				v, err := evalExpr(env, s.Vals[i], tmp)
-				if err != nil {
-					return nil, err
-				}
-				cv, err := coerceToTypeAllowNull(v, t.Cols[idx].Type)
-				if err != nil {
-					return nil, fmt.Errorf("column %q: %w", t.Cols[idx].Name, err)
-				}
-				row[idx] = cv
+				t.Rows[ri][i] = cv
 			}
+			n++
 		}
-		t.Rows = append(t.Rows, row)
-		t.Version++
-		return nil, nil
-	case *Update:
-		t, err := db.Get(tenant, s.Table)
-		if err != nil {
+	}
+	t.Version++
+	return &ResultSet{Cols: []string{"updated"}, Rows: []Row{{"updated": n}}}, nil
+}
+
+func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
+	t, err := env.db.Get(env.tenant, s.Table)
+	if err != nil {
+		return nil, err
+	}
+	var kept [][]any
+	del := 0
+	for _, r := range t.Rows {
+		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
 		}
-		setIdx := map[int]Expr{}
-		for name, ex := range s.Sets {
-			i, err := t.ColIndex(name)
+		row := Row{}
+		for i, c := range t.Cols {
+			putVal(row, c.Name, r[i])
+			putVal(row, s.Table+"."+c.Name, r[i])
+		}
+		keep := true
+		if s.Where != nil {
+			v, err := evalExpr(env, s.Where, row)
 			if err != nil {
 				return nil, err
 			}
-			setIdx[i] = ex
+			if toTri(v) == tvTrue {
+				keep = false
+			}
 		}
-		n := 0
-		for ri, r := range t.Rows {
-			if err := checkCtx(env.ctx); err != nil {
-				return nil, err
+		if keep {
+			kept = append(kept, r)
+		} else {
+			del++
+		}
+	}
+	t.Rows = kept
+	t.Version++
+	return &ResultSet{Cols: []string{"deleted"}, Rows: []Row{{"deleted": del}}}, nil
+}
+
+func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
+	// FROM
+	leftT, err := env.db.Get(env.tenant, s.From.Table)
+	if err != nil {
+		return nil, err
+	}
+	leftRows, _ := rowsFromTable(leftT, aliasOr(s.From))
+	cur := leftRows
+
+	// JOINs
+	cur, err = processJoins(env, s.Joins, cur)
+	if err != nil {
+		return nil, err
+	}
+
+	// WHERE
+	filtered, err := applyWhereClause(env, s.Where, cur)
+	if err != nil {
+		return nil, err
+	}
+
+	// GROUP/HAVING
+	outRows, outCols, err := processGroupByHaving(env, s, filtered)
+	if err != nil {
+		return nil, err
+	}
+
+	// DISTINCT
+	if s.Distinct {
+		outRows = distinctRows(outRows, outCols)
+	}
+
+	// ORDER BY
+	if len(s.OrderBy) > 0 {
+		sort.SliceStable(outRows, func(i, j int) bool {
+			a := outRows[i]
+			b := outRows[j]
+			for _, oi := range s.OrderBy {
+				av, _ := getVal(a, oi.Col)
+				bv, _ := getVal(b, oi.Col)
+				cmp := compareForOrder(av, bv, oi.Desc)
+				if cmp == 0 {
+					continue
+				}
+				if oi.Desc {
+					return cmp > 0
+				}
+				return cmp < 0
 			}
-			row := Row{}
-			for i, c := range t.Cols {
-				putVal(row, c.Name, r[i])
-				putVal(row, s.Table+"."+c.Name, r[i])
-			}
+			return false
+		})
+	}
+
+	// OFFSET/LIMIT
+	outRows = applyOffsetLimit(s, outRows)
+
+	if len(outCols) == 0 {
+		outCols = columnsFromRows(outRows)
+	}
+	return &ResultSet{Cols: outCols, Rows: outRows}, nil
+}
+
+func processJoins(env ExecEnv, joins []JoinClause, cur []Row) ([]Row, error) {
+	for _, j := range joins {
+		rt, err := env.db.Get(env.tenant, j.Right.Table)
+		if err != nil {
+			return nil, err
+		}
+		rightRows, _ := rowsFromTable(rt, aliasOr(j.Right))
+		
+		switch j.Type {
+		case JoinInner:
+			cur, err = processInnerJoin(env, cur, rightRows, j.On)
+		case JoinLeft:
+			cur, err = processLeftJoin(env, cur, rightRows, j.On, aliasOr(j.Right), rt)
+		case JoinRight:
+			cur, err = processRightJoin(env, cur, rightRows, j.On)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return cur, nil
+}
+
+func processInnerJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) ([]Row, error) {
+	var joined []Row
+	for _, l := range leftRows {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, err
+		}
+		for _, r := range rightRows {
+			m := mergeRows(l, r)
 			ok := true
-			if s.Where != nil {
-				v, err := evalExpr(env, s.Where, row)
+			if onCondition != nil {
+				val, err := evalExpr(env, onCondition, m)
 				if err != nil {
 					return nil, err
 				}
-				ok = (toTri(v) == tvTrue)
+				ok = (toTri(val) == tvTrue)
 			}
 			if ok {
-				for i, ex := range setIdx {
-					v, err := evalExpr(env, ex, row)
-					if err != nil {
-						return nil, err
-					}
-					cv, err := coerceToTypeAllowNull(v, t.Cols[i].Type)
-					if err != nil {
-						return nil, err
-					}
-					t.Rows[ri][i] = cv
-				}
-				n++
+				joined = append(joined, m)
 			}
 		}
-		t.Version++
-		return &ResultSet{Cols: []string{"updated"}, Rows: []Row{{"updated": n}}}, nil
-	case *Delete:
-		t, err := db.Get(tenant, s.Table)
-		if err != nil {
-			return nil, err
-		}
-		var kept [][]any
-		del := 0
-		for _, r := range t.Rows {
-			if err := checkCtx(env.ctx); err != nil {
-				return nil, err
-			}
-			row := Row{}
-			for i, c := range t.Cols {
-				putVal(row, c.Name, r[i])
-				putVal(row, s.Table+"."+c.Name, r[i])
-			}
-			keep := true
-			if s.Where != nil {
-				v, err := evalExpr(env, s.Where, row)
-				if err != nil {
-					return nil, err
-				}
-				if toTri(v) == tvTrue {
-					keep = false
-				}
-			}
-			if keep {
-				kept = append(kept, r)
-			} else {
-				del++
-			}
-		}
-		t.Rows = kept
-		t.Version++
-		return &ResultSet{Cols: []string{"deleted"}, Rows: []Row{{"deleted": del}}}, nil
-	case *Select:
-		// FROM
-		leftT, err := db.Get(tenant, s.From.Table)
-		if err != nil {
-			return nil, err
-		}
-		leftRows, _ := rowsFromTable(leftT, aliasOr(s.From))
-		cur := leftRows
-		// JOINs
-		for _, j := range s.Joins {
-			rt, err := db.Get(tenant, j.Right.Table)
-			if err != nil {
-				return nil, err
-			}
-			rightRows, _ := rowsFromTable(rt, aliasOr(j.Right))
-			switch j.Type {
-			case JoinInner:
-				var joined []Row
-				for _, l := range cur {
-					if err := checkCtx(env.ctx); err != nil {
-						return nil, err
-					}
-					for _, r := range rightRows {
-						m := mergeRows(l, r)
-						ok := true
-						if j.On != nil {
-							val, err := evalExpr(env, j.On, m)
-							if err != nil {
-								return nil, err
-							}
-							ok = (toTri(val) == tvTrue)
-						}
-						if ok {
-							joined = append(joined, m)
-						}
-					}
-				}
-				cur = joined
-			case JoinLeft:
-				var joined []Row
-				for _, l := range cur {
-					if err := checkCtx(env.ctx); err != nil {
-						return nil, err
-					}
-					matched := false
-					for _, r := range rightRows {
-						m := mergeRows(l, r)
-						ok := true
-						if j.On != nil {
-							val, err := evalExpr(env, j.On, m)
-							if err != nil {
-								return nil, err
-							}
-							ok = (toTri(val) == tvTrue)
-						}
-						if ok {
-							joined = append(joined, m)
-							matched = true
-						}
-					}
-					if !matched {
-						m := cloneRow(l)
-						addRightNulls(m, aliasOr(j.Right), rt)
-						joined = append(joined, m)
-					}
-				}
-				cur = joined
-			case JoinRight:
-				var joined []Row
-				leftKeys := []string{}
-				if len(cur) > 0 {
-					leftKeys = keysOfRow(cur[0])
-				}
-				for _, r := range rightRows {
-					if err := checkCtx(env.ctx); err != nil {
-						return nil, err
-					}
-					matched := false
-					for _, l := range cur {
-						m := mergeRows(l, r)
-						ok := true
-						if j.On != nil {
-							val, err := evalExpr(env, j.On, m)
-							if err != nil {
-								return nil, err
-							}
-							ok = (toTri(val) == tvTrue)
-						}
-						if ok {
-							joined = append(joined, m)
-							matched = true
-						}
-					}
-					if !matched {
-						m := cloneRow(r)
-						for _, k := range leftKeys {
-							m[k] = nil
-						}
-						joined = append(joined, m)
-					}
-				}
-				cur = joined
-			}
-		}
-		// WHERE
-		filtered := cur
-		if s.Where != nil {
-			var tmp []Row
-			for _, r := range filtered {
-				if err := checkCtx(env.ctx); err != nil {
-					return nil, err
-				}
-				v, err := evalExpr(env, s.Where, r)
-				if err != nil {
-					return nil, err
-				}
-				if toTri(v) == tvTrue {
-					tmp = append(tmp, r)
-				}
-			}
-			filtered = tmp
-		}
-		// GROUP/HAVING
-		needAgg := len(s.GroupBy) > 0 || anyAggInSelect(s.Projs) || isAggregate(s.Having)
-		var outRows []Row
-		var outCols []string
-		if needAgg {
-			groups := map[string][]Row{}
-			var orderKeys []string
-			for _, r := range filtered {
-				if err := checkCtx(env.ctx); err != nil {
-					return nil, err
-				}
-				var parts []string
-				for _, g := range s.GroupBy {
-					v, err := evalExpr(env, &g, r)
-					if err != nil {
-						return nil, err
-					}
-					parts = append(parts, fmtKeyPart(v))
-				}
-				ks := strings.Join(parts, "\x1f")
-				if _, ok := groups[ks]; !ok {
-					orderKeys = append(orderKeys, ks)
-				}
-				groups[ks] = append(groups[ks], r)
-			}
-			for _, k := range orderKeys {
-				rows := groups[k]
-				if s.Having != nil {
-					hv, err := evalAggregate(env, s.Having, rows)
-					if err != nil {
-						return nil, err
-					}
-					if toTri(hv) != tvTrue {
-						continue
-					}
-				}
-				out := Row{}
-				for i, it := range s.Projs {
-					if it.Star {
-						if len(rows) > 0 {
-							for col, v := range rows[0] {
-								if strings.Contains(col, ".") {
-									putVal(out, col, v)
-									outCols = appendUnique(outCols, col)
-								}
-							}
-						}
-						continue
-					}
-					name := projName(it, i)
-					var val any
-					var err error
-					if isAggregate(it.Expr) || len(s.GroupBy) > 0 {
-						val, err = evalAggregate(env, it.Expr, rows)
-					} else {
-						val, err = evalExpr(env, it.Expr, rows[0])
-					}
-					if err != nil {
-						return nil, err
-					}
-					putVal(out, name, val)
-					outCols = appendUnique(outCols, name)
-				}
-				outRows = append(outRows, out)
-			}
-		} else {
-			for _, r := range filtered {
-				if err := checkCtx(env.ctx); err != nil {
-					return nil, err
-				}
-				out := Row{}
-				for i, it := range s.Projs {
-					if it.Star {
-						for col, v := range r {
-							if strings.Contains(col, ".") {
-								putVal(out, col, v)
-								outCols = appendUnique(outCols, col)
-							}
-						}
-						continue
-					}
-					val, err := evalExpr(env, it.Expr, r)
-					if err != nil {
-						return nil, err
-					}
-					name := projName(it, i)
-					putVal(out, name, val)
-					outCols = appendUnique(outCols, name)
-				}
-				outRows = append(outRows, out)
-			}
-		}
-		// DISTINCT
-		if s.Distinct {
-			outRows = distinctRows(outRows, outCols)
-		}
-		// ORDER BY
-		if len(s.OrderBy) > 0 {
-			sort.SliceStable(outRows, func(i, j int) bool {
-				a := outRows[i]
-				b := outRows[j]
-				for _, oi := range s.OrderBy {
-					av, _ := getVal(a, oi.Col)
-					bv, _ := getVal(b, oi.Col)
-					cmp := compareForOrder(av, bv, oi.Desc)
-					if cmp == 0 {
-						continue
-					}
-					if oi.Desc {
-						return cmp > 0
-					}
-					return cmp < 0
-				}
-				return false
-			})
-		}
-		// OFFSET/LIMIT
-		start := 0
-		if s.Offset != nil && *s.Offset > 0 {
-			start = *s.Offset
-		}
-		if start > len(outRows) {
-			outRows = []Row{}
-		} else {
-			outRows = outRows[start:]
-		}
-		if s.Limit != nil && *s.Limit < len(outRows) {
-			outRows = outRows[:*s.Limit]
-		}
-		if len(outCols) == 0 {
-			outCols = columnsFromRows(outRows)
-		}
-		return &ResultSet{Cols: outCols, Rows: outRows}, nil
 	}
-	return nil, fmt.Errorf("unknown statement")
+	return joined, nil
+}
+
+func processLeftJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr, rightAlias string, rightTable *storage.Table) ([]Row, error) {
+	var joined []Row
+	for _, l := range leftRows {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, err
+		}
+		matched := false
+		for _, r := range rightRows {
+			m := mergeRows(l, r)
+			ok := true
+			if onCondition != nil {
+				val, err := evalExpr(env, onCondition, m)
+				if err != nil {
+					return nil, err
+				}
+				ok = (toTri(val) == tvTrue)
+			}
+			if ok {
+				joined = append(joined, m)
+				matched = true
+			}
+		}
+		if !matched {
+			m := cloneRow(l)
+			addRightNulls(m, rightAlias, rightTable)
+			joined = append(joined, m)
+		}
+	}
+	return joined, nil
+}
+
+func processRightJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) ([]Row, error) {
+	var joined []Row
+	leftKeys := []string{}
+	if len(leftRows) > 0 {
+		leftKeys = keysOfRow(leftRows[0])
+	}
+	for _, r := range rightRows {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, err
+		}
+		matched := false
+		for _, l := range leftRows {
+			m := mergeRows(l, r)
+			ok := true
+			if onCondition != nil {
+				val, err := evalExpr(env, onCondition, m)
+				if err != nil {
+					return nil, err
+				}
+				ok = (toTri(val) == tvTrue)
+			}
+			if ok {
+				joined = append(joined, m)
+				matched = true
+			}
+		}
+		if !matched {
+			m := cloneRow(r)
+			for _, k := range leftKeys {
+				m[k] = nil
+			}
+			joined = append(joined, m)
+		}
+	}
+	return joined, nil
+}
+
+func applyWhereClause(env ExecEnv, where Expr, rows []Row) ([]Row, error) {
+	if where == nil {
+		return rows, nil
+	}
+	var filtered []Row
+	for _, r := range rows {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, err
+		}
+		v, err := evalExpr(env, where, r)
+		if err != nil {
+			return nil, err
+		}
+		if toTri(v) == tvTrue {
+			filtered = append(filtered, r)
+		}
+	}
+	return filtered, nil
+}
+
+func processGroupByHaving(env ExecEnv, s *Select, filtered []Row) ([]Row, []string, error) {
+	needAgg := len(s.GroupBy) > 0 || anyAggInSelect(s.Projs) || isAggregate(s.Having)
+	
+	if needAgg {
+		return processAggregateQuery(env, s, filtered)
+	}
+	return processNonAggregateQuery(env, s, filtered)
+}
+
+func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []string, error) {
+	groups := map[string][]Row{}
+	var orderKeys []string
+	var outRows []Row
+	var outCols []string
+	
+	for _, r := range filtered {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, nil, err
+		}
+		var parts []string
+		for _, g := range s.GroupBy {
+			v, err := evalExpr(env, &g, r)
+			if err != nil {
+				return nil, nil, err
+			}
+			parts = append(parts, fmtKeyPart(v))
+		}
+		ks := strings.Join(parts, "\x1f")
+		if _, ok := groups[ks]; !ok {
+			orderKeys = append(orderKeys, ks)
+		}
+		groups[ks] = append(groups[ks], r)
+	}
+	
+	for _, k := range orderKeys {
+		rows := groups[k]
+		if s.Having != nil {
+			hv, err := evalAggregate(env, s.Having, rows)
+			if err != nil {
+				return nil, nil, err
+			}
+			if toTri(hv) != tvTrue {
+				continue
+			}
+		}
+		out := Row{}
+		for i, it := range s.Projs {
+			if it.Star {
+				if len(rows) > 0 {
+					for col, v := range rows[0] {
+						if strings.Contains(col, ".") {
+							putVal(out, col, v)
+							outCols = appendUnique(outCols, col)
+						}
+					}
+				}
+				continue
+			}
+			name := projName(it, i)
+			var val any
+			var err error
+			if isAggregate(it.Expr) || len(s.GroupBy) > 0 {
+				val, err = evalAggregate(env, it.Expr, rows)
+			} else {
+				val, err = evalExpr(env, it.Expr, rows[0])
+			}
+			if err != nil {
+				return nil, nil, err
+			}
+			putVal(out, name, val)
+			outCols = appendUnique(outCols, name)
+		}
+		outRows = append(outRows, out)
+	}
+	return outRows, outCols, nil
+}
+
+func processNonAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []string, error) {
+	var outRows []Row
+	var outCols []string
+	
+	for _, r := range filtered {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, nil, err
+		}
+		out := Row{}
+		for i, it := range s.Projs {
+			if it.Star {
+				for col, v := range r {
+					if strings.Contains(col, ".") {
+						putVal(out, col, v)
+						outCols = appendUnique(outCols, col)
+					}
+				}
+				continue
+			}
+			val, err := evalExpr(env, it.Expr, r)
+			if err != nil {
+				return nil, nil, err
+			}
+			name := projName(it, i)
+			putVal(out, name, val)
+			outCols = appendUnique(outCols, name)
+		}
+		outRows = append(outRows, out)
+	}
+	return outRows, outCols, nil
+}
+
+func applyOffsetLimit(s *Select, rows []Row) []Row {
+	start := 0
+	if s.Offset != nil && *s.Offset > 0 {
+		start = *s.Offset
+	}
+	if start > len(rows) {
+		return []Row{}
+	}
+	rows = rows[start:]
+	
+	if s.Limit != nil && *s.Limit < len(rows) {
+		rows = rows[:*s.Limit]
+	}
+	return rows
 }
 
 // -------------------- Eval, Aggregates, Helpers --------------------
