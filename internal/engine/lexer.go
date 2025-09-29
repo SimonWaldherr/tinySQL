@@ -1,11 +1,20 @@
+// Package engine contains the SQL lexer used by the parser.
+//
+// What: A minimal, whitespace- and comment-aware tokenizer that recognizes
+// identifiers, keywords, numeric and string literals, and symbols.
+// How: Single-pass rune-based scanner supporting -- and /* */ comments,
+// uppercasing keywords, and preserving identifier case. Keywords are a fixed
+// allow-list tailored to tinySQL features.
+// Why: A compact lexer reduces parser complexity and keeps error messages
+// local and actionable without external dependencies.
 package engine
 
 import "unicode"
 
-type TokenType int
+type tokenType int
 
 const (
-	tEOF TokenType = iota
+	tEOF tokenType = iota
 	tIdent
 	tNumber
 	tString
@@ -13,33 +22,33 @@ const (
 	tKeyword
 )
 
-type Token struct {
-	Typ TokenType
+type token struct {
+	Typ tokenType
 	Val string
 	Pos int
 }
 
-type Lexer struct {
+type lexer struct {
 	s   string
 	pos int
 }
 
-func newLexer(s string) *Lexer { return &Lexer{s: s} }
+func newLexer(s string) *lexer { return &lexer{s: s} }
 
-func (lx *Lexer) peek() rune {
+func (lx *lexer) peek() rune {
 	if lx.pos >= len(lx.s) {
 		return 0
 	}
 	return rune(lx.s[lx.pos])
 }
-func (lx *Lexer) peekN(n int) rune {
+func (lx *lexer) peekN(n int) rune {
 	p := lx.pos + n
 	if p >= len(lx.s) {
 		return 0
 	}
 	return rune(lx.s[p])
 }
-func (lx *Lexer) next() rune {
+func (lx *lexer) next() rune {
 	if lx.pos >= len(lx.s) {
 		return 0
 	}
@@ -47,7 +56,7 @@ func (lx *Lexer) next() rune {
 	lx.pos++
 	return r
 }
-func (lx *Lexer) skipWS() {
+func (lx *lexer) skipWS() {
 	for {
 		if lx.pos >= len(lx.s) {
 			return
@@ -81,11 +90,11 @@ func (lx *Lexer) skipWS() {
 	}
 }
 
-func (lx *Lexer) Next() Token {
+func (lx *lexer) nextToken() token {
 	lx.skipWS()
 	start := lx.pos
 	if start >= len(lx.s) {
-		return Token{Typ: tEOF, Pos: start}
+		return token{Typ: tEOF, Pos: start}
 	}
 	r := lx.peek()
 	// string
@@ -104,7 +113,7 @@ func (lx *Lexer) Next() Token {
 			}
 			val += string(ch)
 		}
-		return Token{Typ: tString, Val: val, Pos: start}
+		return token{Typ: tString, Val: val, Pos: start}
 	}
 	// number
 	if unicode.IsDigit(r) {
@@ -122,7 +131,7 @@ func (lx *Lexer) Next() Token {
 				break
 			}
 		}
-		return Token{Typ: tNumber, Val: val, Pos: start}
+		return token{Typ: tNumber, Val: val, Pos: start}
 	}
 	// ident/keyword
 	if unicode.IsLetter(r) || r == '_' {
@@ -138,26 +147,26 @@ func (lx *Lexer) Next() Token {
 		}
 		up := upper(val)
 		if isKeyword(up) {
-			return Token{Typ: tKeyword, Val: up, Pos: start}
+			return token{Typ: tKeyword, Val: up, Pos: start}
 		}
-		return Token{Typ: tIdent, Val: val, Pos: start}
+		return token{Typ: tIdent, Val: val, Pos: start}
 	}
 	// symbol
 	switch r {
 	case '(', ')', ',', '*', '+', '-', '/', '.', ';', '?':
 		lx.next()
-		return Token{Typ: tSymbol, Val: string(r), Pos: start}
+		return token{Typ: tSymbol, Val: string(r), Pos: start}
 	case '=', '<', '>', '!':
 		a := lx.next()
 		b := lx.peek()
 		if (a == '<' && (b == '=' || b == '>')) || (a == '>' && b == '=') || (a == '!' && b == '=') {
 			lx.next()
-			return Token{Typ: tSymbol, Val: string(a) + string(b), Pos: start}
+			return token{Typ: tSymbol, Val: string(a) + string(b), Pos: start}
 		}
-		return Token{Typ: tSymbol, Val: string(a), Pos: start}
+		return token{Typ: tSymbol, Val: string(a), Pos: start}
 	default:
 		lx.next()
-		return Token{Typ: tSymbol, Val: string(r), Pos: start}
+		return token{Typ: tSymbol, Val: string(r), Pos: start}
 	}
 }
 
@@ -178,16 +187,24 @@ func isKeyword(up string) bool {
 	case "SELECT", "DISTINCT", "FROM", "WHERE", "GROUP", "BY", "HAVING",
 		"ORDER", "ASC", "DESC", "LIMIT", "OFFSET",
 		"JOIN", "LEFT", "RIGHT", "OUTER", "ON", "AS",
+		"UNION", "ALL", "EXCEPT", "INTERSECT",
 		"CREATE", "TABLE", "TEMP", "DROP",
 		"INSERT", "INTO", "VALUES",
 		"UPDATE", "SET", "DELETE",
-		"INT", "FLOAT", "TEXT", "BOOL", "JSON",
-		"DATE", "DATETIME", "DURATION", "COMPLEX", "POINTER",
+		"INT", "INT8", "INT16", "INT32", "INT64",
+		"UINT", "UINT8", "UINT16", "UINT32", "UINT64",
+		"FLOAT32", "FLOAT64", "FLOAT", "DOUBLE",
+		"STRING", "TEXT", "RUNE", "BYTE",
+		"BOOL", "BOOLEAN",
+		"TIME", "DATE", "DATETIME", "TIMESTAMP", "DURATION",
+		"JSON", "JSONB", "MAP", "SLICE", "ARRAY",
+		"COMPLEX64", "COMPLEX128", "COMPLEX",
+		"POINTER", "PTR", "INTERFACE",
 		"PRIMARY", "FOREIGN", "KEY", "REFERENCES", "UNIQUE",
 		"AND", "OR", "NOT", "IS", "NULL", "TRUE", "FALSE",
 		"COUNT", "SUM", "AVG", "MIN", "MAX",
-		"COALESCE", "NULLIF",
-		"JSON_GET":
+		"COALESCE", "NULLIF", "NOW", "CURRENT_TIME", "CURRENT_DATE",
+		"JSON_GET", "JSON_SET", "JSON_EXTRACT", "DATEDIFF":
 		return true
 	default:
 		return false

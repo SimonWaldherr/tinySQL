@@ -1,3 +1,15 @@
+// Package engine provides SQL parsing, planning, and execution for tinySQL.
+//
+// This file focuses on the query compilation cache:
+//   - What: A lightweight in-memory cache that stores parsed/compiled
+//     representations of SQL statements (CompiledQuery).
+//   - How: Queries are keyed by their exact SQL string. The cache holds a
+//     Statement AST plus metadata (ParsedAt) and returns it to callers to
+//     avoid re-parsing. A simple FIFO eviction based on oldest ParsedAt keeps
+//     the cache within a fixed size.
+//   - Why: Parsing is comparatively expensive and often repeated in loops or
+//     hot paths. Caching reduces parse overhead, improves latency, and keeps
+//     the execution path predictable while remaining simple and thread-safe.
 package engine
 
 import (
@@ -9,21 +21,21 @@ import (
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
-// CompiledQuery represents a pre-parsed and cached SQL query
+// CompiledQuery represents a pre-parsed and cached SQL query.
 type CompiledQuery struct {
 	SQL       string
 	Statement Statement
 	ParsedAt  time.Time
 }
 
-// QueryCache manages compiled queries
+// QueryCache manages compiled queries.
 type QueryCache struct {
 	mu      sync.RWMutex
 	queries map[string]*CompiledQuery
 	maxSize int
 }
 
-// NewQueryCache creates a new query cache with specified maximum size
+// NewQueryCache creates a new query cache with the specified maximum size.
 func NewQueryCache(maxSize int) *QueryCache {
 	if maxSize <= 0 {
 		maxSize = 1000 // default cache size
@@ -34,7 +46,7 @@ func NewQueryCache(maxSize int) *QueryCache {
 	}
 }
 
-// Compile parses and caches a SQL query for reuse
+// Compile parses and caches a SQL query for reuse.
 func (qc *QueryCache) Compile(sql string) (*CompiledQuery, error) {
 	qc.mu.RLock()
 	if cached, exists := qc.queries[sql]; exists {
@@ -79,12 +91,12 @@ func (qc *QueryCache) Compile(sql string) (*CompiledQuery, error) {
 	return compiled, nil
 }
 
-// Execute runs a compiled query against the database
+// Execute runs a compiled query against the database.
 func (cq *CompiledQuery) Execute(ctx context.Context, db *storage.DB, tenant string) (*ResultSet, error) {
 	return Execute(ctx, db, tenant, cq.Statement)
 }
 
-// MustCompile is like Compile but panics on error (similar to regexp.MustCompile)
+// MustCompile is like Compile but panics on error (similar to regexp.MustCompile).
 func (qc *QueryCache) MustCompile(sql string) *CompiledQuery {
 	cq, err := qc.Compile(sql)
 	if err != nil {
@@ -93,21 +105,21 @@ func (qc *QueryCache) MustCompile(sql string) *CompiledQuery {
 	return cq
 }
 
-// Clear removes all cached queries
+// Clear removes all cached queries.
 func (qc *QueryCache) Clear() {
 	qc.mu.Lock()
 	defer qc.mu.Unlock()
 	qc.queries = make(map[string]*CompiledQuery)
 }
 
-// Size returns the number of cached queries
+// Size returns the number of cached queries.
 func (qc *QueryCache) Size() int {
 	qc.mu.RLock()
 	defer qc.mu.RUnlock()
 	return len(qc.queries)
 }
 
-// Stats returns cache statistics
+// Stats returns cache statistics.
 func (qc *QueryCache) Stats() map[string]interface{} {
 	qc.mu.RLock()
 	defer qc.mu.RUnlock()

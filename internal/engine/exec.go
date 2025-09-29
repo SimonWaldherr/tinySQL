@@ -1,3 +1,20 @@
+// Package engine implements the tinySQL execution engine.
+//
+// What: This module evaluates parsed SQL statements (AST) against the storage
+// layer and produces ResultSets. It covers DDL/DML/SELECT, joins, grouping,
+// aggregates, expression evaluation, simple functions (JSON_*, DATEDIFF, etc.),
+// and a minimal tri-state boolean logic (true/false/unknown).
+//
+// How: The executor converts tables to row maps with both qualified and
+// unqualified column keys, applies WHERE/GROUP/HAVING/ORDER/LIMIT/OFFSET, and
+// optionally combines results with UNION/EXCEPT/INTERSECT. Expression
+// evaluation is recursive over a small algebra of literals, variables, unary/
+// binary ops, IS NULL, and function calls. Aggregate evaluation runs per-
+// group with reusable helpers shared with the scalar evaluator.
+//
+// Why: Keeping execution self-contained and data-structure driven (Row maps
+// and simple slices) makes the engine easy to reason about and to extend with
+// new functions, operators, and clauses without introducing heavy planners.
 package engine
 
 import (
@@ -8,12 +25,18 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
+// Row represents a single result row mapped by lower-cased column name.
+// Keys include both qualified (table.column) and unqualified (column) names
+// to simplify expression evaluation and projection.
 type Row map[string]any
 
+// ResultSet holds the column order and the returned rows from a query.
+// Cols preserve the display order; Rows store values in a case-insensitive map.
 type ResultSet struct {
 	Cols []string
 	Rows []Row
@@ -25,6 +48,10 @@ type ExecEnv struct {
 	db     *storage.DB
 }
 
+// Execute runs a parsed SQL statement against the given storage DB and tenant.
+// It dispatches to handlers per statement kind and returns a ResultSet for
+// SELECT (nil for DDL/DML). The context is checked at safe points to support
+// cancellation.
 func Execute(ctx context.Context, db *storage.DB, tenant string, stmt Statement) (*ResultSet, error) {
 	env := ExecEnv{ctx: ctx, tenant: tenant, db: db}
 	switch s := stmt.(type) {
@@ -286,13 +313,118 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 		})
 	}
 
-	// OFFSET/LIMIT
-	outRows = applyOffsetLimit(s, outRows)
+	// OFFSET/LIMIT (applied before UNION to each individual SELECT)
+	baseRows := applyOffsetLimit(s, outRows)
 
-	if len(outCols) == 0 {
-		outCols = columnsFromRows(outRows)
+	// Handle UNION operations
+	resultRows := baseRows
+	resultCols := outCols
+	
+	if s.Union != nil {
+		var err error
+		resultRows, resultCols, err = processUnionClauses(env, s.Union, resultRows, resultCols)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return &ResultSet{Cols: outCols, Rows: outRows}, nil
+
+	if len(resultCols) == 0 {
+		resultCols = columnsFromRows(resultRows)
+	}
+	return &ResultSet{Cols: resultCols, Rows: resultRows}, nil
+}
+
+func processUnionClauses(env ExecEnv, union *UnionClause, leftRows []Row, leftCols []string) ([]Row, []string, error) {
+	resultRows := leftRows
+	resultCols := leftCols
+	
+	current := union
+	for current != nil {
+		// Execute the right-hand SELECT
+		rightResult, err := executeSelect(env, current.Right)
+		if err != nil {
+			return nil, nil, err
+		}
+		
+		// Validate column compatibility
+		if len(rightResult.Cols) != len(resultCols) {
+			return nil, nil, fmt.Errorf("UNION: column count mismatch between queries (%d vs %d)", 
+				len(resultCols), len(rightResult.Cols))
+		}
+		
+		// Process the union based on type
+		switch current.Type {
+		case UnionAll:
+			// UNION ALL: Just append all rows
+			resultRows = append(resultRows, rightResult.Rows...)
+			
+		case UnionDistinct:
+			// UNION: Append and then remove duplicates
+			resultRows = append(resultRows, rightResult.Rows...)
+			resultRows = distinctRows(resultRows, resultCols)
+			
+		case Except:
+			// EXCEPT: Remove rows that exist in the right result
+			resultRows = exceptRows(resultRows, rightResult.Rows, resultCols)
+			
+		case Intersect:
+			// INTERSECT: Keep only rows that exist in both results
+			resultRows = intersectRows(resultRows, rightResult.Rows, resultCols)
+		}
+		
+		current = current.Next
+	}
+	
+	return resultRows, resultCols, nil
+}
+
+func exceptRows(leftRows, rightRows []Row, cols []string) []Row {
+	// Create a set of right rows for fast lookup
+	rightSet := make(map[string]bool)
+	for _, r := range rightRows {
+		key := rowSignature(r, cols)
+		rightSet[key] = true
+	}
+	
+	// Keep only left rows that are not in the right set
+	var result []Row
+	for _, l := range leftRows {
+		key := rowSignature(l, cols)
+		if !rightSet[key] {
+			result = append(result, l)
+		}
+	}
+	return result
+}
+
+func intersectRows(leftRows, rightRows []Row, cols []string) []Row {
+	// Create a set of right rows for fast lookup
+	rightSet := make(map[string]bool)
+	for _, r := range rightRows {
+		key := rowSignature(r, cols)
+		rightSet[key] = true
+	}
+	
+	// Keep only left rows that are also in the right set
+	var result []Row
+	seen := make(map[string]bool)
+	for _, l := range leftRows {
+		key := rowSignature(l, cols)
+		if rightSet[key] && !seen[key] {
+			result = append(result, l)
+			seen[key] = true
+		}
+	}
+	return result
+}
+
+func rowSignature(row Row, cols []string) string {
+	var parts []string
+	for _, col := range cols {
+		val, _ := getVal(row, col)
+		parts = append(parts, fmt.Sprintf("%v", val))
+	}
+	return strings.Join(parts, "|")
 }
 
 func processJoins(env ExecEnv, joins []JoinClause, cur []Row) ([]Row, error) {
@@ -915,10 +1047,18 @@ func evalFuncCall(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return evalNullif(env, ex.Args, row)
 	case "JSON_GET":
 		return evalJSONGet(env, ex.Args, row)
+	case "JSON_SET", "JSON_EXTRACT":
+		return evalJSONExtended(env, ex, row)
 	case "COUNT":
 		return evalCountSingle(env, ex, row)
 	case "SUM", "AVG", "MIN", "MAX":
 		return evalAggregateSingle(env, ex, row)
+	case "NOW", "CURRENT_TIME":
+		return time.Now(), nil
+	case "CURRENT_DATE":
+		return time.Now().Truncate(24 * time.Hour), nil
+	case "DATEDIFF":
+		return evalDateDiff(env, ex, row)
 	}
 	return nil, fmt.Errorf("unknown function: %s", ex.Name)
 }
@@ -980,6 +1120,46 @@ func evalJSONGet(env ExecEnv, args []Expr, row Row) (any, error) {
 	return jsonGet(jv, ps), nil
 }
 
+func evalJSONExtended(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	switch ex.Name {
+	case "JSON_SET":
+		if len(ex.Args) != 3 {
+			return nil, fmt.Errorf("JSON_SET expects (json, path, value)")
+		}
+		jv, err := evalExpr(env, ex.Args[0], row)
+		if err != nil {
+			return nil, err
+		}
+		pv, err := evalExpr(env, ex.Args[1], row)
+		if err != nil {
+			return nil, err
+		}
+		val, err := evalExpr(env, ex.Args[2], row)
+		if err != nil {
+			return nil, err
+		}
+		ps, _ := pv.(string)
+		return jsonSet(jv, ps, val), nil
+		
+	case "JSON_EXTRACT":
+		// Alias for JSON_GET
+		if len(ex.Args) != 2 {
+			return nil, fmt.Errorf("JSON_EXTRACT expects (json, path)")
+		}
+		jv, err := evalExpr(env, ex.Args[0], row)
+		if err != nil {
+			return nil, err
+		}
+		pv, err := evalExpr(env, ex.Args[1], row)
+		if err != nil {
+			return nil, err
+		}
+		ps, _ := pv.(string)
+		return jsonGet(jv, ps), nil
+	}
+	return nil, fmt.Errorf("unknown JSON function: %s", ex.Name)
+}
+
 func evalCountSingle(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if ex.Star {
 		return 1, nil
@@ -1007,6 +1187,102 @@ func evalAggregateSingle(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	}
 	return v, nil
 }
+
+func evalDateDiff(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) != 3 {
+		return nil, fmt.Errorf("DATEDIFF expects 3 arguments: (unit, start_date, end_date)")
+	}
+	
+	// Get the unit (HOURS, DAYS, MINUTES, etc.)
+	unitVal, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	unit, ok := unitVal.(string)
+	if !ok {
+		return nil, fmt.Errorf("DATEDIFF unit must be a string")
+	}
+	
+	// Get start date
+	startVal, err := evalExpr(env, ex.Args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	
+	// Get end date
+	endVal, err := evalExpr(env, ex.Args[2], row)
+	if err != nil {
+		return nil, err
+	}
+	
+	// Convert values to time.Time
+	startTime, err := parseTimeValue(startVal)
+	if err != nil {
+		return nil, fmt.Errorf("DATEDIFF start_date: %v", err)
+	}
+	
+	endTime, err := parseTimeValue(endVal)
+	if err != nil {
+		return nil, fmt.Errorf("DATEDIFF end_date: %v", err)
+	}
+	
+	// Calculate difference
+	diff := endTime.Sub(startTime)
+	
+	// Return based on unit
+	switch strings.ToUpper(unit) {
+	case "HOURS":
+		return int(diff.Hours()), nil
+	case "MINUTES":
+		return int(diff.Minutes()), nil
+	case "SECONDS":
+		return int(diff.Seconds()), nil
+	case "DAYS":
+		return int(diff.Hours() / 24), nil
+	case "WEEKS":
+		return int(diff.Hours() / (24 * 7)), nil
+	case "MONTHS":
+		// Approximate: 30 days per month
+		return int(diff.Hours() / (24 * 30)), nil
+	case "YEARS":
+		// Approximate: 365 days per year
+		return int(diff.Hours() / (24 * 365)), nil
+	default:
+		return nil, fmt.Errorf("unsupported DATEDIFF unit: %s (supported: HOURS, MINUTES, SECONDS, DAYS, WEEKS, MONTHS, YEARS)", unit)
+	}
+}
+
+func parseTimeValue(val any) (time.Time, error) {
+	if val == nil {
+		return time.Time{}, fmt.Errorf("cannot parse nil as time")
+	}
+	
+	switch v := val.(type) {
+	case time.Time:
+		return v, nil
+	case string:
+		// Try various time formats
+		formats := []string{
+			time.RFC3339,
+			"2006-01-02 15:04:05",
+			"2006-01-02T15:04:05",
+			"2006-01-02 15:04",
+			"2006-01-02",
+			"15:04:05",
+			"15:04",
+		}
+		
+		for _, format := range formats {
+			if t, err := time.Parse(format, v); err == nil {
+				return t, nil
+			}
+		}
+		return time.Time{}, fmt.Errorf("cannot parse '%s' as time", v)
+	default:
+		return time.Time{}, fmt.Errorf("cannot convert %T to time", val)
+	}
+}
+
 func triToValue(t int) any {
 	if t == tvTrue {
 		return true
@@ -1476,6 +1752,108 @@ func jsonGet(v any, path string) any {
 		}
 	}
 	return cur
+}
+
+func jsonSet(v any, path string, value any) any {
+	if path == "" {
+		return value
+	}
+	
+	parts := parseJSONPath(path)
+	if len(parts) == 0 {
+		return value
+	}
+	
+	// If v is nil, create a new structure
+	if v == nil {
+		if parts[0].idx >= 0 {
+			v = make([]any, parts[0].idx+1)
+		} else {
+			v = make(map[string]any)
+		}
+	}
+	
+	// Navigate to the parent of the target
+	cur := v
+	for i := 0; i < len(parts)-1; i++ {
+		p := parts[i]
+		switch c := cur.(type) {
+		case map[string]any:
+			if p.idx >= 0 {
+				// This should be an array access, but we have a map
+				return v
+			}
+			if c[p.key] == nil {
+				// Create next level structure
+				if parts[i+1].idx >= 0 {
+					c[p.key] = make([]any, parts[i+1].idx+1)
+				} else {
+					c[p.key] = make(map[string]any)
+				}
+			}
+			cur = c[p.key]
+		case []any:
+			if p.idx < 0 || p.idx >= len(c) {
+				return v
+			}
+			if c[p.idx] == nil {
+				// Create next level structure
+				if parts[i+1].idx >= 0 {
+					c[p.idx] = make([]any, parts[i+1].idx+1)
+				} else {
+					c[p.idx] = make(map[string]any)
+				}
+			}
+			cur = c[p.idx]
+		default:
+			return v
+		}
+	}
+	
+	// Set the final value
+	lastPart := parts[len(parts)-1]
+	switch c := cur.(type) {
+	case map[string]any:
+		if lastPart.idx >= 0 {
+			return v // Invalid: trying to use array index on map
+		}
+		c[lastPart.key] = value
+	case []any:
+		if lastPart.idx < 0 {
+			return v // Invalid: trying to use string key on array
+		}
+		// Extend array if needed
+		for len(c) <= lastPart.idx {
+			c = append(c, nil)
+		}
+		c[lastPart.idx] = value
+		// Update the reference in the parent
+		if len(parts) > 1 {
+			parentParts := parts[:len(parts)-1]
+			parent := v
+			for _, p := range parentParts[:len(parentParts)-1] {
+				switch pc := parent.(type) {
+				case map[string]any:
+					parent = pc[p.key]
+				case []any:
+					parent = pc[p.idx]
+				}
+			}
+			lastParentPart := parentParts[len(parentParts)-1]
+			switch pc := parent.(type) {
+			case map[string]any:
+				pc[lastParentPart.key] = c
+			case []any:
+				pc[lastParentPart.idx] = c
+			}
+		} else {
+			v = c
+		}
+	default:
+		return v
+	}
+	
+	return v
 }
 
 // -------------------- misc helpers --------------------

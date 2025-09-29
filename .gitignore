@@ -1,1 +1,3 @@
 cmd/cmd
+wasm_exec.js
+tinySQL.wasm

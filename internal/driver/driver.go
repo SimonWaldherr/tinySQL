@@ -1,3 +1,14 @@
+// Package driver implements a database/sql driver for tinySQL.
+//
+// What: A minimal driver that exposes tinySQL via the standard database/sql
+// interfaces. It supports in-memory databases (mem://) and file-backed
+// persistence (file:path?options) with optional WAL and autosave.
+// How: A small server wrapper manages a storage.DB and concurrency via reader
+// and writer pools. Connections create snapshots for transactions (MVCC-light)
+// and serialize writes through a WAL when configured. Placeholders (?) are
+// bound by simple string substitution with proper literal escaping.
+// Why: Integrating with database/sql enables familiar APIs, tooling, and
+// portability while keeping the implementation small and self-contained.
 package driver
 
 import (
@@ -19,6 +30,13 @@ import (
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
+// init registers the "tinysql" driver and pre-registers common GOB types.
+// This enables database/sql.Open("tinysql", dsn) to work out of the box.
+// Supported DSNs:
+//   - mem://?tenant=default&pool_readers=4&busy_timeout=250ms
+//   - file:/path/to/db.gob?tenant=default&autosave=1
+//
+// See parseDSN for all available options.
 // Treiber registrieren
 func init() {
 	sql.Register("tinysql", &drv{})
@@ -35,6 +53,7 @@ type cfg struct {
 	busyTimeout time.Duration
 }
 
+// parseDSN parses a tinySQL DSN into a driver configuration.
 func parseDSN(dsn string) (cfg, error) {
 	var c cfg
 	c.tenant = "default"

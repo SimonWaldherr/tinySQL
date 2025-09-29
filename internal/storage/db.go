@@ -1,7 +1,21 @@
+// Package storage provides the durable data structures for tinySQL.
+//
+// What: An in-memory multi-tenant catalog of tables with column metadata,
+// rows, and basic typing. It includes snapshot cloning for MVCC-light,
+// GOB-based checkpoints, and an append-only Write-Ahead Log (WAL) for crash
+// recovery and durability.
+// How: Tables store rows as [][]any for compactness; a lower-cased column
+// index accelerates name lookups. Save/Load serialize the catalog to a file,
+// writing JSON for JSON columns. The WAL logs whole-table changes and drops;
+// recovery replays committed records and truncates partial tails.
+// Why: Favor a simple, explicit model over complex page managers: it keeps the
+// code understandable, testable, and sufficient for embedded/edge use cases.
 package storage
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
 	"encoding/gob"
 	"encoding/json"
 	"errors"
@@ -15,48 +29,128 @@ import (
 	"time"
 )
 
+// ColType enumerates supported column data types.
 type ColType int
 
 const (
+	// Integer types
 	IntType ColType = iota
-	FloatType
-	TextType
+	Int8Type
+	Int16Type
+	Int32Type
+	Int64Type
+	UintType
+	Uint8Type
+	Uint16Type
+	Uint32Type
+	Uint64Type
+	
+	// Floating point types
+	Float32Type
+	Float64Type
+	FloatType // alias for Float64Type
+	
+	// String and character types
+	StringType
+	TextType // alias for StringType
+	RuneType
+	ByteType
+	
+	// Boolean type
 	BoolType
-	JsonType
+	
+	// Time types
+	TimeType
 	DateType
 	DateTimeType
+	TimestampType
 	DurationType
-	ComplexType
+	
+	// Complex types
+	JsonType
+	JsonbType
+	MapType
+	SliceType
+	ArrayType
+	
+	// Advanced types
+	Complex64Type
+	Complex128Type
+	ComplexType // alias for Complex128Type
 	PointerType
+	InterfaceType
 )
 
 func (t ColType) String() string {
 	switch t {
 	case IntType:
 		return "INT"
-	case FloatType:
-		return "FLOAT"
+	case Int8Type:
+		return "INT8"
+	case Int16Type:
+		return "INT16"
+	case Int32Type:
+		return "INT32"
+	case Int64Type:
+		return "INT64"
+	case UintType:
+		return "UINT"
+	case Uint8Type:
+		return "UINT8"
+	case Uint16Type:
+		return "UINT16"
+	case Uint32Type:
+		return "UINT32"
+	case Uint64Type:
+		return "UINT64"
+	case Float32Type:
+		return "FLOAT32"
+	case Float64Type, FloatType:
+		return "FLOAT64"
+	case StringType:
+		return "STRING"
 	case TextType:
 		return "TEXT"
+	case RuneType:
+		return "RUNE"
+	case ByteType:
+		return "BYTE"
 	case BoolType:
 		return "BOOL"
-	case JsonType:
-		return "JSON"
+	case TimeType:
+		return "TIME"
 	case DateType:
 		return "DATE"
 	case DateTimeType:
 		return "DATETIME"
+	case TimestampType:
+		return "TIMESTAMP"
 	case DurationType:
 		return "DURATION"
-	case ComplexType:
+	case JsonType:
+		return "JSON"
+	case JsonbType:
+		return "JSONB"
+	case MapType:
+		return "MAP"
+	case SliceType:
+		return "SLICE"
+	case ArrayType:
+		return "ARRAY"
+	case Complex64Type:
+		return "COMPLEX64"
+	case Complex128Type, ComplexType:
 		return "COMPLEX"
 	case PointerType:
 		return "POINTER"
+	case InterfaceType:
+		return "INTERFACE"
 	default:
 		return "UNKNOWN"
 	}
 }
 
+// ConstraintType enumerates supported column constraints.
 type ConstraintType int
 
 const (
@@ -79,11 +173,13 @@ func (c ConstraintType) String() string {
 	}
 }
 
+// ForeignKeyRef describes a foreign key reference target.
 type ForeignKeyRef struct {
 	Table  string
 	Column string
 }
 
+// Column holds column schema information in a table.
 type Column struct {
 	Name         string
 	Type         ColType
@@ -92,6 +188,7 @@ type Column struct {
 	PointerTable string         // Target table for POINTER type
 }
 
+// Table stores rows along with column metadata and indexes.
 type Table struct {
 	Name    string
 	Cols    []Column
@@ -101,6 +198,7 @@ type Table struct {
 	Version int
 }
 
+// NewTable creates a new Table with case-insensitive column lookup indices.
 func NewTable(name string, cols []Column, isTemp bool) *Table {
 	pos := make(map[string]int)
 	for i, c := range cols {
@@ -108,6 +206,7 @@ func NewTable(name string, cols []Column, isTemp bool) *Table {
 	}
 	return &Table{Name: name, Cols: cols, colPos: pos, IsTemp: isTemp}
 }
+// ColIndex returns the zero-based index of the named column.
 func (t *Table) ColIndex(name string) (int, error) {
 	i, ok := t.colPos[strings.ToLower(name)]
 	if !ok {
@@ -120,12 +219,14 @@ type tenantDB struct {
 	tables map[string]*Table
 }
 
+// DB is an in-memory, multi-tenant database catalog.
 type DB struct {
 	mu      sync.RWMutex
 	tenants map[string]*tenantDB
 	wal     *WALManager
 }
 
+// NewDB creates a new empty database catalog.
 func NewDB() *DB { return &DB{tenants: map[string]*tenantDB{}} }
 
 func (db *DB) getTenant(tn string) *tenantDB {
@@ -138,6 +239,7 @@ func (db *DB) getTenant(tn string) *tenantDB {
 	return td
 }
 
+// Get returns a table by name for the given tenant.
 func (db *DB) Get(tn, name string) (*Table, error) {
 	td := db.getTenant(tn)
 	t, ok := td.tables[strings.ToLower(name)]
@@ -146,6 +248,7 @@ func (db *DB) Get(tn, name string) (*Table, error) {
 	}
 	return t, nil
 }
+// Put adds a new table to the tenant; returns error if it already exists.
 func (db *DB) Put(tn string, t *Table) error {
 	td := db.getTenant(tn)
 	lc := strings.ToLower(t.Name)
@@ -155,6 +258,7 @@ func (db *DB) Put(tn string, t *Table) error {
 	td.tables[lc] = t
 	return nil
 }
+// Drop removes a table from the tenant.
 func (db *DB) Drop(tn, name string) error {
 	td := db.getTenant(tn)
 	lc := strings.ToLower(name)
@@ -165,6 +269,7 @@ func (db *DB) Drop(tn, name string) error {
 	return nil
 }
 
+// ListTables returns the tables in a tenant sorted by name.
 func (db *DB) ListTables(tn string) []*Table {
 	td := db.getTenant(tn)
 	names := make([]string, 0, len(td.tables))
@@ -181,6 +286,7 @@ func (db *DB) ListTables(tn string) []*Table {
 
 // DeepClone: defensive snapshot für "MVCC-light" Transaktionen.
 // Achtung: kein Copy-on-Write, volle Kopie (einfach, aber O(n)).
+// DeepClone creates a full copy of the database (MVCC-light snapshot).
 func (db *DB) DeepClone() *DB {
 	out := NewDB()
 	out.wal = db.wal
@@ -246,8 +352,14 @@ func tableToDisk(tn string, t *Table) diskTable {
 				continue
 			}
 			if t.Cols[j].Type == JsonType {
-				b, _ := json.Marshal(v)
-				row[j] = string(b)
+				switch vv := v.(type) {
+				case string:
+					// Already a JSON/text representation; keep as-is to avoid double encoding.
+					row[j] = vv
+				default:
+					b, _ := json.Marshal(v)
+					row[j] = string(b)
+				}
 			} else {
 				row[j] = v
 			}
@@ -299,6 +411,9 @@ func diskToTable(dt diskTable) *Table {
 	return t
 }
 
+// SaveToFile writes a snapshot of the database to the given file (GOB).
+// SaveToFile writes a snapshot of the database to a file. If the filename
+// ends with .gz, the snapshot is gzip-compressed to reduce size.
 func SaveToFile(db *DB, filename string) error {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -318,10 +433,38 @@ func SaveToFile(db *DB, filename string) error {
 		return err
 	}
 	defer f.Close()
-	enc := gob.NewEncoder(f)
-	return enc.Encode(dump)
+
+	var w io.Writer = bufio.NewWriter(f)
+	// Enable gzip compression based on file extension.
+	var gz *gzip.Writer
+	if strings.HasSuffix(strings.ToLower(filename), ".gz") {
+		gz = gzip.NewWriter(w)
+		w = gz
+	}
+	enc := gob.NewEncoder(w)
+	if err := enc.Encode(dump); err != nil {
+		if gz != nil {
+			_ = gz.Close()
+		}
+		if bw, ok := w.(*bufio.Writer); ok {
+			_ = bw.Flush()
+		}
+		return err
+	}
+	if gz != nil {
+		if err := gz.Close(); err != nil {
+			return err
+		}
+	}
+	if bw, ok := w.(*bufio.Writer); ok {
+		return bw.Flush()
+	}
+	return nil
 }
 
+// LoadFromFile loads a database from a snapshot file and attaches a WAL.
+// LoadFromFile loads a database snapshot from a file. It auto-detects gzip
+// compression based on the .gz suffix and attaches a WAL if a path is given.
 func LoadFromFile(filename string) (*DB, error) {
 	f, err := os.Open(filename)
 	if err != nil {
@@ -332,7 +475,16 @@ func LoadFromFile(filename string) (*DB, error) {
 	}
 	defer f.Close()
 	var dump []diskTable
-	dec := gob.NewDecoder(f)
+	var r io.Reader = bufio.NewReader(f)
+	if strings.HasSuffix(strings.ToLower(filename), ".gz") {
+		gr, gzErr := gzip.NewReader(r)
+		if gzErr != nil {
+			return nil, gzErr
+		}
+		defer gr.Close()
+		r = gr
+	}
+	dec := gob.NewDecoder(r)
 	if err := dec.Decode(&dump); err != nil {
 		if errors.Is(err, io.EOF) {
 			return NewDB(), nil
@@ -352,6 +504,57 @@ func LoadFromFile(filename string) (*DB, error) {
 		db.attachWAL(wal)
 	}
 	return db, nil
+}
+
+// SaveToWriter writes a snapshot of the database to an arbitrary writer.
+// It does not attach or alter WAL configuration.
+func SaveToWriter(db *DB, w io.Writer) error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	var dump []diskTable
+	for tn, tdb := range db.tenants {
+		for _, t := range tdb.tables {
+			dump = append(dump, tableToDisk(tn, t))
+		}
+	}
+	bw := bufio.NewWriter(w)
+	enc := gob.NewEncoder(bw)
+	if err := enc.Encode(dump); err != nil {
+		return err
+	}
+	return bw.Flush()
+}
+
+// LoadFromReader loads a database snapshot from an arbitrary reader.
+// The returned DB has no WAL attached.
+func LoadFromReader(r io.Reader) (*DB, error) {
+	dec := gob.NewDecoder(bufio.NewReader(r))
+	var dump []diskTable
+	if err := dec.Decode(&dump); err != nil {
+		if errors.Is(err, io.EOF) {
+			return NewDB(), nil
+		}
+		return nil, err
+	}
+	db := NewDB()
+	for _, dt := range dump {
+		_ = db.Put(dt.Tenant, diskToTable(dt))
+	}
+	return db, nil
+}
+
+// SaveToBytes serializes the database snapshot to a byte slice.
+func SaveToBytes(db *DB) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := SaveToWriter(db, &buf); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// LoadFromBytes loads a database from a byte slice.
+func LoadFromBytes(b []byte) (*DB, error) {
+	return LoadFromReader(bytes.NewReader(b))
 }
 
 type walRecordType uint8
@@ -380,7 +583,7 @@ type walOperation struct {
 	table  *diskTable
 }
 
-// WALChange beschreibt eine persistente Änderung, die in das WAL geschrieben wird.
+// WALChange describes a persistent change that will be written to the WAL.
 type WALChange struct {
 	Tenant string
 	Name   string
@@ -388,7 +591,7 @@ type WALChange struct {
 	Drop   bool
 }
 
-// CollectWALChanges berechnet die Delta-Menge zwischen zwei MVCC-Snapshots.
+// CollectWALChanges computes the delta between two MVCC snapshots.
 func CollectWALChanges(prev, next *DB) []WALChange {
 	if prev == nil || next == nil {
 		return nil
@@ -426,14 +629,14 @@ func CollectWALChanges(prev, next *DB) []WALChange {
 	return changes
 }
 
-// WALConfig steuert WAL- und Checkpoint-Verhalten.
+// WALConfig configures WAL and checkpoint behavior.
 type WALConfig struct {
 	Path               string
 	CheckpointEvery    uint64
 	CheckpointInterval time.Duration
 }
 
-// WALManager kapselt WAL-Append, Recovery und Checkpoints.
+// WALManager encapsulates WAL append, recovery, and checkpoints.
 type WALManager struct {
 	mu                 sync.Mutex
 	path               string
@@ -455,7 +658,7 @@ func (db *DB) attachWAL(wal *WALManager) {
 	db.mu.Unlock()
 }
 
-// WAL liefert den konfigurierten WAL-Manager (kann nil sein).
+// WAL returns the configured WAL manager (may be nil).
 func (db *DB) WAL() *WALManager {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -467,8 +670,8 @@ func (db *DB) upsertTable(tn string, t *Table) {
 	td.tables[strings.ToLower(t.Name)] = t
 }
 
-// OpenWAL stellt sicher, dass ein WAL existiert, re-appliest vorhandene
-// Committed-Records und liefert einen einsatzbereiten Manager.
+// OpenWAL ensures a WAL exists, replays committed records, and returns a
+// ready-to-use manager. It attaches no WAL when Path is empty.
 func OpenWAL(db *DB, cfg WALConfig) (*WALManager, error) {
 	if cfg.Path == "" {
 		return nil, nil
@@ -479,7 +682,11 @@ func OpenWAL(db *DB, cfg WALConfig) (*WALManager, error) {
 	if cfg.CheckpointInterval <= 0 {
 		cfg.CheckpointInterval = 30 * time.Second
 	}
-	walPath := cfg.Path + ".wal"
+	basePath := cfg.Path
+	if strings.HasSuffix(strings.ToLower(basePath), ".gz") {
+		basePath = strings.TrimSuffix(basePath, ".gz")
+	}
+	walPath := basePath + ".wal"
 	nextSeq, nextTxID, committed, err := replayWAL(db, walPath)
 	if err != nil {
 		return nil, err
@@ -512,8 +719,8 @@ func OpenWAL(db *DB, cfg WALConfig) (*WALManager, error) {
 	return wm, nil
 }
 
-// LogTransaction schreibt alle Änderungen atomar ins WAL; liefert true, wenn
-// anschließend ein Checkpoint empfohlen ist.
+// LogTransaction appends all changes atomically to the WAL.
+// It returns true when a checkpoint is recommended.
 func (w *WALManager) LogTransaction(changes []WALChange) (bool, error) {
 	if w == nil || len(changes) == 0 {
 		return false, nil
@@ -563,7 +770,7 @@ func (w *WALManager) LogTransaction(changes []WALChange) (bool, error) {
 	return need, nil
 }
 
-// Checkpoint schreibt den aktuellen DB-Snapshot und leert das WAL.
+// Checkpoint writes a DB snapshot and resets the WAL file.
 func (w *WALManager) Checkpoint(db *DB) error {
 	if w == nil {
 		return nil
@@ -602,7 +809,7 @@ func (w *WALManager) Checkpoint(db *DB) error {
 	return nil
 }
 
-// Close sorgt für ein sauberes Flushen/Syncen.
+// Close flushes, syncs, and closes the WAL resources.
 func (w *WALManager) Close() error {
 	if w == nil {
 		return nil

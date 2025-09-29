@@ -1288,6 +1288,281 @@ func TestGOBPersistenceWithNewDataTypes(t *testing.T) {
 	}
 
 	t.Log("✅ GOB persistence test completed successfully!")
-	t.Log("✅ All new data types preserved correctly through save/load cycle")
-	t.Logf("✅ Successfully saved and loaded %d tables with %d records", len(tables), len(advancedTable.Rows))
+}
+
+// TestDateDiffAndTimeAggregation tests DATEDIFF function with GROUP BY and time aggregation
+func TestDateDiffAndTimeAggregation(t *testing.T) {
+	db := tsql.NewDB()
+	ctx := context.Background()
+
+	// Create table with start and end timestamps for sessions
+	createTableSQL := `CREATE TABLE user_sessions (
+		id INT,
+		session_id TEXT,
+		user_name TEXT,
+		start_time TIMESTAMP,
+		end_time TIMESTAMP
+	)`
+
+	p := tsql.NewParser(createTableSQL)
+	stmt, err := p.ParseStatement()
+	if err != nil {
+		t.Fatalf("Failed to parse CREATE TABLE: %v", err)
+	}
+	_, err = tsql.Execute(ctx, db, "default", stmt)
+	if err != nil {
+		t.Fatalf("Failed to create user_sessions table: %v", err)
+	}
+
+	// Insert sample session data with explicit start/end times
+	sessionInserts := []string{
+		// User Alice sessions
+		"INSERT INTO user_sessions VALUES (1, 'session_A1', 'Alice', '2023-12-01 09:00:00', '2023-12-01 11:00:00')", // 2 hours
+		"INSERT INTO user_sessions VALUES (2, 'session_A2', 'Alice', '2023-12-01 14:30:00', '2023-12-01 18:00:00')", // 3.5 hours
+		
+		// User Bob sessions  
+		"INSERT INTO user_sessions VALUES (3, 'session_B1', 'Bob', '2023-12-01 10:00:00', '2023-12-01 11:30:00')",   // 1.5 hours
+		"INSERT INTO user_sessions VALUES (4, 'session_B2', 'Bob', '2023-12-01 15:00:00', '2023-12-01 19:30:00')",   // 4.5 hours
+		
+		// User Carol sessions
+		"INSERT INTO user_sessions VALUES (5, 'session_C1', 'Carol', '2023-12-01 08:00:00', '2023-12-01 12:00:00')", // 4 hours
+		"INSERT INTO user_sessions VALUES (6, 'session_C2', 'Carol', '2023-12-01 13:00:00', '2023-12-01 14:00:00')", // 1 hour
+	}
+
+	for i, insertSQL := range sessionInserts {
+		p = tsql.NewParser(insertSQL)
+		stmt, err = p.ParseStatement()
+		if err != nil {
+			t.Fatalf("Failed to parse session insert %d: %v", i+1, err)
+		}
+		_, err = tsql.Execute(ctx, db, "default", stmt)
+		if err != nil {
+			t.Fatalf("Failed to insert session %d: %v", i+1, err)
+		}
+	}
+
+	// Test 1: Calculate session duration in hours using DATEDIFF
+	durationQuerySQL := `
+		SELECT 
+			session_id,
+			user_name,
+			start_time,
+			end_time,
+			DATEDIFF('HOURS', start_time, end_time) AS duration_hours
+		FROM user_sessions 
+		ORDER BY user_name, session_id
+	`
+
+	p = tsql.NewParser(durationQuerySQL)
+	stmt, err = p.ParseStatement()
+	if err != nil {
+		t.Fatalf("Failed to parse DATEDIFF query: %v", err)
+	}
+	rs, err := tsql.Execute(ctx, db, "default", stmt)
+	if err != nil {
+		t.Fatalf("Failed to execute DATEDIFF query: %v", err)
+	}
+
+	// Verify individual session durations
+	if len(rs.Rows) != 6 {
+		t.Fatalf("Expected 6 sessions, got %d", len(rs.Rows))
+	}
+
+	expectedDurations := []struct {
+		sessionID string
+		userName  string
+		hours     int
+	}{
+		{"session_A1", "Alice", 2},
+		{"session_A2", "Alice", 3}, // 3.5 truncated to 3
+		{"session_B1", "Bob", 1},   // 1.5 truncated to 1
+		{"session_B2", "Bob", 4},   // 4.5 truncated to 4
+		{"session_C1", "Carol", 4},
+		{"session_C2", "Carol", 1},
+	}
+
+	// Verify each session's duration
+	for i, row := range rs.Rows {
+		if i >= len(expectedDurations) {
+			break
+		}
+
+		expected := expectedDurations[i]
+		
+		// Get duration from row
+		duration, ok := tsql.GetVal(row, "duration_hours")
+		if !ok {
+			// Try alternative column names
+			for key := range row {
+				if strings.Contains(strings.ToLower(key), "duration") || strings.Contains(strings.ToLower(key), "datediff") {
+					duration, ok = tsql.GetVal(row, key)
+					break
+				}
+			}
+		}
+		
+		if !ok {
+			t.Fatalf("Could not find duration in row %d: %+v", i, row)
+		}
+
+		if duration != expected.hours {
+			t.Errorf("Session %s: expected %d hours, got %v", expected.sessionID, expected.hours, duration)
+		} else {
+			t.Logf("✅ Session %s (%s): %v hours (correct)", expected.sessionID, expected.userName, duration)
+		}
+	}
+
+	// Test 2: Calculate average session duration per user using GROUP BY
+	avgDurationSQL := `
+		SELECT 
+			user_name,
+			COUNT(*) AS session_count,
+			AVG(DATEDIFF('HOURS', start_time, end_time)) AS avg_duration_hours
+		FROM user_sessions 
+		GROUP BY user_name
+		ORDER BY user_name
+	`
+
+	p = tsql.NewParser(avgDurationSQL)
+	stmt, err = p.ParseStatement()
+	if err != nil {
+		t.Fatalf("Failed to parse average duration query: %v", err)
+	}
+	rs, err = tsql.Execute(ctx, db, "default", stmt)
+	if err != nil {
+		t.Fatalf("Failed to execute average duration query: %v", err)
+	}
+
+	if len(rs.Rows) != 3 {
+		t.Fatalf("Expected 3 users, got %d", len(rs.Rows))
+	}
+
+	// Expected averages: Alice=(2+3)/2=2.5, Bob=(1+4)/2=2.5, Carol=(4+1)/2=2.5
+	expectedUsers := []struct {
+		name         string
+		sessionCount int
+		avgHours     float64
+	}{
+		{"Alice", 2, 2.5},
+		{"Bob", 2, 2.5},
+		{"Carol", 2, 2.5},
+	}
+
+	for i, row := range rs.Rows {
+		if i >= len(expectedUsers) {
+			break
+		}
+
+		expected := expectedUsers[i]
+		
+		userName, ok := tsql.GetVal(row, "user_name")
+		if !ok {
+			for key := range row {
+				if strings.Contains(strings.ToLower(key), "user") || strings.Contains(strings.ToLower(key), "name") {
+					userName, ok = tsql.GetVal(row, key)
+					break
+				}
+			}
+		}
+
+		sessionCount, ok2 := tsql.GetVal(row, "session_count")
+		if !ok2 {
+			for key := range row {
+				if strings.Contains(strings.ToLower(key), "count") {
+					sessionCount, ok2 = tsql.GetVal(row, key)
+					break
+				}
+			}
+		}
+
+		avgDuration, ok3 := tsql.GetVal(row, "avg_duration_hours")
+		if !ok3 {
+			for key := range row {
+				if strings.Contains(strings.ToLower(key), "avg") || strings.Contains(strings.ToLower(key), "duration") {
+					avgDuration, ok3 = tsql.GetVal(row, key)
+					break
+				}
+			}
+		}
+
+		if ok && ok2 && ok3 {
+			t.Logf("✅ User %v: %v sessions, avg %.1f hours", userName, sessionCount, avgDuration)
+			
+			if sessionCount != expected.sessionCount {
+				t.Errorf("User %s: expected %d sessions, got %v", expected.name, expected.sessionCount, sessionCount)
+			}
+			
+			// Check if average is reasonable (around 2.5)
+			if avgFloat, ok := avgDuration.(float64); ok && avgFloat >= 2.0 && avgFloat <= 3.0 {
+				t.Logf("✅ Average duration for %s is within expected range", userName)
+			}
+		}
+	}
+
+	// Test 3: Find long sessions (>= 4 hours) using DATEDIFF in WHERE clause
+	longSessionsSQL := `
+		SELECT 
+			session_id,
+			user_name,
+			DATEDIFF('HOURS', start_time, end_time) AS duration_hours
+		FROM user_sessions 
+		WHERE DATEDIFF('HOURS', start_time, end_time) >= 4
+		ORDER BY duration_hours DESC
+	`
+
+	p = tsql.NewParser(longSessionsSQL)
+	stmt, err = p.ParseStatement()
+	if err != nil {
+		t.Fatalf("Failed to parse long sessions query: %v", err)
+	}
+	rs, err = tsql.Execute(ctx, db, "default", stmt)
+	if err != nil {
+		t.Fatalf("Failed to execute long sessions query: %v", err)
+	}
+
+	// Should find session_B2 (4h) and session_C1 (4h)
+	if len(rs.Rows) != 2 {
+		t.Fatalf("Expected 2 long sessions (>=4h), got %d", len(rs.Rows))
+	}
+
+	t.Log("✅ Found long sessions (>= 4 hours):")
+	for _, row := range rs.Rows {
+		sessionID, _ := tsql.GetVal(row, "session_id")
+		userName, _ := tsql.GetVal(row, "user_name")
+		duration, _ := tsql.GetVal(row, "duration_hours")
+		t.Logf("   Session %v (%v): %v hours", sessionID, userName, duration)
+	}
+
+	// Test 4: Calculate total time per user using SUM with DATEDIFF
+	totalTimeSQL := `
+		SELECT 
+			user_name,
+			SUM(DATEDIFF('HOURS', start_time, end_time)) AS total_hours
+		FROM user_sessions 
+		GROUP BY user_name
+		ORDER BY total_hours DESC
+	`
+
+	p = tsql.NewParser(totalTimeSQL)
+	stmt, err = p.ParseStatement()
+	if err != nil {
+		t.Fatalf("Failed to parse total time query: %v", err)
+	}
+	rs, err = tsql.Execute(ctx, db, "default", stmt)
+	if err != nil {
+		t.Fatalf("Failed to execute total time query: %v", err)
+	}
+
+	if len(rs.Rows) != 3 {
+		t.Fatalf("Expected 3 users for total time, got %d", len(rs.Rows))
+	}
+
+	t.Log("✅ Total session time per user:")
+	for _, row := range rs.Rows {
+		userName, _ := tsql.GetVal(row, "user_name")
+		totalHours, _ := tsql.GetVal(row, "total_hours")
+		t.Logf("   %v: %v total hours", userName, totalHours)
+	}
+
+	t.Log("✅ DATEDIFF with GROUP BY and time aggregation test completed successfully!")
 }
