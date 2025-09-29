@@ -1,0 +1,818 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <title>tinySQL – WASM Demo</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      --primary-color: #2563eb;
+      --success-color: #16a34a;
+      --error-color: #dc2626;
+      --warning-color: #ea580c;
+      --border-color: #e5e7eb;
+      --bg-light: #f9fafb;
+      --text-primary: #111827;
+      --text-secondary: #6b7280;
+    }
+
+    * { box-sizing: border-box; }
+    
+    html, body {
+      font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Ubuntu, Cantarell, sans-serif;
+      margin: 0;
+      padding: 0;
+      background: var(--bg-light);
+      color: var(--text-primary);
+      line-height: 1.6;
+    }
+
+    header {
+      background: white;
+      padding: 1rem 1.5rem;
+      border-bottom: 2px solid var(--border-color);
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+
+    .header-content {
+      max-width: 1200px;
+      margin: 0 auto;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 1rem;
+    }
+
+    .logo {
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: var(--primary-color);
+    }
+
+    .status-indicator {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.5rem 1rem;
+      border-radius: 6px;
+      font-size: 0.875rem;
+      font-weight: 500;
+    }
+
+    .status-indicator.disconnected {
+      background: #fef2f2;
+      color: var(--error-color);
+    }
+
+    .status-indicator.connected {
+      background: #f0fdf4;
+      color: var(--success-color);
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+    }
+
+    main {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 2rem;
+      display: grid;
+      gap: 2rem;
+      grid-template-columns: 1fr;
+    }
+
+    .card {
+      background: white;
+      border-radius: 8px;
+      border: 1px solid var(--border-color);
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+      overflow: hidden;
+    }
+
+    .card-header {
+      padding: 1rem 1.5rem;
+      border-bottom: 1px solid var(--border-color);
+      background: var(--bg-light);
+      font-weight: 600;
+    }
+
+    .card-content {
+      padding: 1.5rem;
+    }
+
+    .sql-editor {
+      width: 100%;
+      min-height: 200px;
+      padding: 1rem;
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+      font-size: 14px;
+      line-height: 1.5;
+      resize: vertical;
+      background: #fafafa;
+    }
+
+    .button-row {
+      display: flex;
+      gap: 0.75rem;
+      margin: 1rem 0;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      padding: 0.75rem 1.5rem;
+      border: none;
+      border-radius: 6px;
+      font-size: 0.875rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .btn-primary {
+      background: var(--primary-color);
+      color: white;
+    }
+
+    .btn-primary:hover:not(:disabled) {
+      background: #1d4ed8;
+    }
+
+    .btn-success {
+      background: var(--success-color);
+      color: white;
+    }
+
+    .btn-success:hover:not(:disabled) {
+      background: #15803d;
+    }
+
+    .btn-secondary {
+      background: #6b7280;
+      color: white;
+    }
+
+    .btn-secondary:hover:not(:disabled) {
+      background: #4b5563;
+    }
+
+    .btn-warning {
+      background: var(--warning-color);
+      color: white;
+    }
+
+    .btn-warning:hover:not(:disabled) {
+      background: #c2410c;
+    }
+
+    .result-container {
+      margin-top: 1rem;
+    }
+
+    .result-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 1rem;
+      font-size: 0.875rem;
+    }
+
+    .result-table th,
+    .result-table td {
+      padding: 0.75rem;
+      text-align: left;
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .result-table th {
+      background: var(--bg-light);
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .result-table tbody tr:hover {
+      background: #f8fafc;
+    }
+
+    .error-message {
+      background: #fef2f2;
+      color: var(--error-color);
+      padding: 1rem;
+      border-radius: 6px;
+      border-left: 4px solid var(--error-color);
+      white-space: pre-wrap;
+      font-family: monospace;
+    }
+
+    .success-message {
+      background: #f0fdf4;
+      color: var(--success-color);
+      padding: 1rem;
+      border-radius: 6px;
+      border-left: 4px solid var(--success-color);
+    }
+
+    .info-message {
+      background: #eff6ff;
+      color: var(--primary-color);
+      padding: 1rem;
+      border-radius: 6px;
+      border-left: 4px solid var(--primary-color);
+    }
+
+    .loading {
+      opacity: 0.6;
+      pointer-events: none;
+    }
+
+    .result-meta {
+      display: flex;
+      gap: 1rem;
+      margin-bottom: 1rem;
+      font-size: 0.875rem;
+      color: var(--text-secondary);
+    }
+
+    .demo-row {
+      display: flex;
+      gap: 0.75rem;
+      align-items: center;
+      flex-wrap: wrap;
+      margin: 0.5rem 0 1rem;
+    }
+
+    .demo-select {
+      min-width: 260px;
+      padding: 0.6rem 0.75rem;
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      background: white;
+      font-size: 0.9rem;
+    }
+
+    @media (max-width: 768px) {
+      main {
+        padding: 1rem;
+        gap: 1rem;
+      }
+      
+      .button-row {
+        flex-direction: column;
+      }
+      
+      .btn {
+        justify-content: center;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-content">
+      <div class="logo">tinySQL – WASM Demo</div>
+      <div id="status-indicator" class="status-indicator disconnected">
+        <div class="status-dot" style="background: var(--error-color);"></div>
+        Initialisiere WASM...
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div class="card">
+      <div class="card-header">Database Information</div>
+      <div class="card-content">
+        <p>Diese Demo lädt tinySQL als WebAssembly-Modul und führt es komplett im Browser aus.</p>
+        <div class="info-message">
+          <strong>Hinweis:</strong> Die Datenbank läuft im Arbeitsspeicher (DSN: <code>mem://?tenant=default</code>).
+          Daten gehen beim Neuladen der Seite verloren.
+        </div>
+        
+        <div class="button-row">
+          <button id="btn-connect" class="btn btn-primary">🔌 Verbinden</button>
+          <button id="btn-status" class="btn btn-secondary" disabled>📊 Status</button>
+          <button id="btn-disconnect" class="btn btn-warning" disabled>🔌 Trennen</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">Transaktionen</div>
+      <div class="card-content">
+        <div class="button-row">
+          <button id="btn-begin" class="btn btn-success" disabled>▶️ BEGIN</button>
+          <button id="btn-commit" class="btn btn-success" disabled>✅ COMMIT</button>
+          <button id="btn-rollback" class="btn btn-warning" disabled>↩️ ROLLBACK</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">SQL Editor</div>
+      <div class="card-content">
+        <textarea id="sql-editor" class="sql-editor" placeholder="-- SQL-Befehle hier eingeben...
+CREATE TABLE users (id INT, name TEXT, email TEXT);
+INSERT INTO users VALUES (1, 'Alice', 'alice@example.com');
+SELECT * FROM users;"></textarea>
+        
+        <div class="demo-row">
+          <select id="demo-select" class="demo-select" disabled>
+            <option value="">➕ Demo-Query auswählen…</option>
+            <optgroup label="🕒 Date & Time Functions">
+              <option value="datediff_group">DATEDIFF: Zeitspanne je Nutzer (HOURS)</option>
+              <option value="datediff_days">DATEDIFF: Tage zwischen Events</option>
+              <option value="datediff_minutes">DATEDIFF: Minuten zwischen Login/Logout</option>
+              <option value="events_by_date">Events nach Datum gruppiert</option>
+            </optgroup>
+            <optgroup label="📋 JSON Operations">
+              <option value="json_get">JSON_GET: Gerät aus Orders</option>
+              <option value="json_get_nested">JSON_GET: Verschachtelte Werte</option>
+              <option value="json_extract_items">JSON_EXTRACT: Array-Elemente</option>
+              <option value="json_device_stats">JSON: Geräte-Statistiken</option>
+            </optgroup>
+            <optgroup label="🔗 Joins & Relations">
+              <option value="join_agg">JOIN+AGG: Umsatz pro Nutzer</option>
+              <option value="left_join">LEFT JOIN: Alle Nutzer mit Orders</option>
+              <option value="multi_join">Multi-JOIN: Users + Orders + Events</option>
+              <option value="self_join">Self-JOIN: Event-Sequenzen</option>
+            </optgroup>
+            <optgroup label="📊 Aggregation & Grouping">
+              <option value="count_by_status">COUNT: Orders nach Status</option>
+              <option value="avg_order_value">AVG: Durchschnittlicher Bestellwert</option>
+              <option value="sum_by_user">SUM: Gesamtumsatz je Nutzer</option>
+              <option value="min_max_orders">MIN/MAX: Kleinste/Größte Bestellung</option>
+              <option value="having_clause">HAVING: Nutzer mit >1 Bestellung</option>
+            </optgroup>
+            <optgroup label="🔍 Subqueries & Advanced">
+              <option value="subquery_avg">Subquery: Orders über Durchschnitt</option>
+              <option value="exists_clause">EXISTS: Nutzer mit Events</option>
+              <option value="in_subquery">IN: Aktive Nutzer mit Orders</option>
+              <option value="correlated_subquery">Correlated: Erste Order je Nutzer</option>
+            </optgroup>
+            <optgroup label="🎯 Filtering & Conditions">
+              <option value="null_handling">NULL: Nutzer ohne Email</option>
+              <option value="case_when">CASE WHEN: Kundenklassifizierung</option>
+              <option value="like_pattern">LIKE: Name-Pattern Matching</option>
+              <option value="between_dates">BETWEEN: Events in Zeitraum</option>
+              <option value="complex_where">Complex WHERE: Mehrere Bedingungen</option>
+            </optgroup>
+            <optgroup label="📈 Analytics & Reporting">
+              <option value="timeseries">Timeseries: Events je Nutzer</option>
+              <option value="cohort_analysis">Cohort: Erster vs. Letzter Event</option>
+              <option value="revenue_analysis">Revenue: Monatliche Trends</option>
+              <option value="user_activity">Activity: Events pro Tag</option>
+            </optgroup>
+            <optgroup label="🎲 Utility & Testing">
+              <option value="distinct_values">DISTINCT: Eindeutige Werte</option>
+              <option value="limit_offset">LIMIT/OFFSET: Pagination</option>
+              <option value="order_variations">ORDER BY: Verschiedene Sortierungen</option>
+              <option value="union_example">UNION: Kombinierte Ergebnisse</option>
+            </optgroup>
+          </select>
+          <button id="btn-init-demo" class="btn btn-secondary" disabled>🎯 Demo-Daten laden</button>
+        </div>
+        
+        <div class="button-row">
+          <button id="btn-exec" class="btn btn-primary" disabled>⚡ Execute</button>
+          <button id="btn-query" class="btn btn-primary" disabled>🔍 Query</button>
+          <button id="btn-clear" class="btn btn-secondary">🗑️ Clear</button>
+        </div>
+        
+        <div id="result-container" class="result-container"></div>
+      </div>
+    </div>
+  </main>
+
+  <script src="wasm_exec.js"></script>
+  <script>
+    // Global state
+    let wasmReady = false;
+    let dbConnected = false;
+    let transactionActive = false;
+    let demoLoaded = false;
+
+    // DOM elements
+    const statusIndicator = document.getElementById('status-indicator');
+    const statusDot = statusIndicator.querySelector('.status-dot');
+    const sqlEditor = document.getElementById('sql-editor');
+    const resultContainer = document.getElementById('result-container');
+    
+    const btnConnect = document.getElementById('btn-connect');
+    const btnStatus = document.getElementById('btn-status');
+    const btnDisconnect = document.getElementById('btn-disconnect');
+    const btnBegin = document.getElementById('btn-begin');
+    const btnCommit = document.getElementById('btn-commit');
+    const btnRollback = document.getElementById('btn-rollback');
+    const btnExec = document.getElementById('btn-exec');
+    const btnQuery = document.getElementById('btn-query');
+    const btnInitDemo = document.getElementById('btn-init-demo');
+    const btnClear = document.getElementById('btn-clear');
+    const demoSelect = document.getElementById('demo-select');
+
+    const demoQueries = {
+      // Date & Time Functions
+      datediff_group: `-- Zeitspanne je Nutzer in Stunden (DATEDIFF)\nSELECT user_id, DATEDIFF('HOURS', MIN(ts), MAX(ts)) AS hours_span\nFROM events\nGROUP BY user_id\nORDER BY user_id;`,
+      datediff_days: `-- Tage zwischen ersten und letzten Events\nSELECT user_id, \n       MIN(ts) AS first_event,\n       MAX(ts) AS last_event,\n       DATEDIFF('DAYS', MIN(ts), MAX(ts)) AS days_active\nFROM events\nGROUP BY user_id\nHAVING COUNT(*) > 1;`,
+      datediff_minutes: `-- Minuten zwischen Login und nächstem Event\nSELECT e1.user_id, e1.ts AS login_time, e2.ts AS next_event,\n       DATEDIFF('MINUTES', e1.ts, e2.ts) AS minutes_diff\nFROM events e1 \nJOIN events e2 ON e1.user_id = e2.user_id AND e2.id > e1.id\nWHERE JSON_GET(e1.data, 'type') = 'login'\nORDER BY e1.user_id, e1.ts;`,
+      events_by_date: `-- Events nach Datum gruppiert\nSELECT LEFT(ts, 10) AS event_date,\n       COUNT(*) AS event_count,\n       COUNT(DISTINCT user_id) AS unique_users\nFROM events\nGROUP BY LEFT(ts, 10)\nORDER BY event_date;`,
+
+      // JSON Operations
+      json_get: `-- JSON_GET aus Orders\nSELECT id, JSON_GET(meta, 'device') AS device\nFROM orders\nORDER BY id;`,
+      json_get_nested: `-- JSON_GET: Verschachtelte Werte aus Orders\nSELECT id, \n       JSON_GET(meta, 'device') AS device,\n       JSON_GET(meta, 'items.0.sku') AS first_sku,\n       JSON_GET(meta, 'items.0.qty') AS first_qty\nFROM orders\nWHERE meta IS NOT NULL\nORDER BY id;`,
+      json_extract_items: `-- JSON_EXTRACT: Array-Länge simulieren\nSELECT id, amount,\n       JSON_GET(meta, 'device') AS device,\n       CASE WHEN JSON_GET(meta, 'items.1.sku') IS NOT NULL THEN 'multi' ELSE 'single' END AS item_count\nFROM orders\nWHERE JSON_GET(meta, 'device') IS NOT NULL;`,
+      json_device_stats: `-- JSON: Geräte-Statistiken\nSELECT JSON_GET(meta, 'device') AS device,\n       COUNT(*) AS order_count,\n       SUM(amount) AS total_revenue,\n       AVG(amount) AS avg_order_value\nFROM orders\nWHERE JSON_GET(meta, 'device') IS NOT NULL\nGROUP BY JSON_GET(meta, 'device')\nORDER BY total_revenue DESC;`,
+
+      // Joins & Relations
+      join_agg: `-- JOIN + Aggregation (nur bezahlte Orders)\nSELECT u.name, COUNT(o.id) AS orders, SUM(o.amount) AS revenue\nFROM users u\nJOIN orders o ON u.id = o.user_id\nWHERE o.status = 'PAID'\nGROUP BY u.name\nORDER BY revenue DESC;`,
+      left_join: `-- LEFT JOIN: Alle Nutzer mit ihren Orders\nSELECT u.name, u.email, \n       COALESCE(COUNT(o.id), 0) AS order_count,\n       COALESCE(SUM(o.amount), 0) AS total_spent\nFROM users u\nLEFT JOIN orders o ON u.id = o.user_id AND o.status = 'PAID'\nGROUP BY u.id, u.name, u.email\nORDER BY total_spent DESC;`,
+      multi_join: `-- Multi-JOIN: Users + Orders + Events\nSELECT u.name,\n       COUNT(DISTINCT o.id) AS orders,\n       COUNT(DISTINCT e.id) AS events,\n       MAX(e.ts) AS last_activity\nFROM users u\nLEFT JOIN orders o ON u.id = o.user_id\nLEFT JOIN events e ON u.id = e.user_id\nGROUP BY u.id, u.name\nORDER BY last_activity DESC;`,
+      self_join: `-- Self-JOIN: Event-Sequenzen finden\nSELECT e1.user_id,\n       JSON_GET(e1.data, 'type') AS first_event,\n       JSON_GET(e2.data, 'type') AS second_event,\n       e1.ts AS first_time,\n       e2.ts AS second_time\nFROM events e1\nJOIN events e2 ON e1.user_id = e2.user_id AND e2.id = e1.id + 1\nORDER BY e1.user_id, e1.ts;`,
+
+      // Aggregation & Grouping
+      count_by_status: `-- COUNT: Orders nach Status\nSELECT status, \n       COUNT(*) AS order_count,\n       SUM(amount) AS total_amount,\n       AVG(amount) AS avg_amount\nFROM orders\nGROUP BY status\nORDER BY order_count DESC;`,
+      avg_order_value: `-- AVG: Durchschnittlicher Bestellwert je Nutzer\nSELECT u.name,\n       COUNT(o.id) AS order_count,\n       AVG(o.amount) AS avg_order_value,\n       MIN(o.amount) AS min_order,\n       MAX(o.amount) AS max_order\nFROM users u\nJOIN orders o ON u.id = o.user_id\nWHERE o.status = 'PAID'\nGROUP BY u.id, u.name\nHAVING COUNT(o.id) >= 1\nORDER BY avg_order_value DESC;`,
+      sum_by_user: `-- SUM: Gesamtumsatz je Nutzer mit Ranking\nSELECT u.name, \n       SUM(o.amount) AS total_revenue,\n       COUNT(o.id) AS order_count\nFROM users u\nJOIN orders o ON u.id = o.user_id\nWHERE o.status = 'PAID'\nGROUP BY u.id, u.name\nORDER BY total_revenue DESC;`,
+      min_max_orders: `-- MIN/MAX: Extremwerte analysieren\nSELECT \n  MIN(amount) AS smallest_order,\n  MAX(amount) AS largest_order,\n  AVG(amount) AS average_order,\n  COUNT(*) AS total_orders\nFROM orders\nWHERE status = 'PAID';`,
+      having_clause: `-- HAVING: Nutzer mit mehr als einer Bestellung\nSELECT u.name,\n       COUNT(o.id) AS order_count,\n       SUM(o.amount) AS total_spent\nFROM users u\nJOIN orders o ON u.id = o.user_id\nGROUP BY u.id, u.name\nHAVING COUNT(o.id) > 1\nORDER BY order_count DESC;`,
+
+      // Subqueries & Advanced
+      subquery_avg: `-- Subquery: Orders über dem Durchschnitt\nSELECT id, user_id, amount, status\nFROM orders\nWHERE amount > (SELECT AVG(amount) FROM orders WHERE status = 'PAID')\nORDER BY amount DESC;`,
+      exists_clause: `-- EXISTS: Nutzer die Events haben\nSELECT u.name, u.email\nFROM users u\nWHERE EXISTS (\n  SELECT 1 FROM events e \n  WHERE e.user_id = u.id\n)\nORDER BY u.name;`,
+      in_subquery: `-- IN: Aktive Nutzer mit bezahlten Orders\nSELECT name, email\nFROM users\nWHERE active = TRUE \n  AND id IN (\n    SELECT DISTINCT user_id \n    FROM orders \n    WHERE status = 'PAID'\n  )\nORDER BY name;`,
+      correlated_subquery: `-- Correlated: Erste Order je Nutzer\nSELECT u.name, o.id, o.amount, o.status\nFROM users u\nJOIN orders o ON u.id = o.user_id\nWHERE o.id = (\n  SELECT MIN(id) \n  FROM orders o2 \n  WHERE o2.user_id = u.id\n)\nORDER BY o.amount DESC;`,
+
+      // Filtering & Conditions
+      null_handling: `-- NULL: Nutzer ohne Email-Adresse\nSELECT name, \n       CASE WHEN email IS NULL THEN 'Keine Email' ELSE email END AS email_status,\n       active\nFROM users\nWHERE email IS NULL OR email = ''\nORDER BY name;`,
+      case_when: `-- CASE WHEN: Kundenklassifizierung\nSELECT u.name,\n       SUM(o.amount) AS total_spent,\n       CASE \n         WHEN SUM(o.amount) > 150 THEN 'Premium'\n         WHEN SUM(o.amount) > 75 THEN 'Standard' \n         ELSE 'Basic'\n       END AS customer_tier\nFROM users u\nLEFT JOIN orders o ON u.id = o.user_id AND o.status = 'PAID'\nGROUP BY u.id, u.name\nORDER BY total_spent DESC;`,
+      like_pattern: `-- LIKE: Name-Pattern Matching\nSELECT name, email, active\nFROM users\nWHERE name LIKE '%a%'  -- Namen mit 'a'\n   OR name LIKE 'C%'   -- Namen beginnend mit 'C'\nORDER BY name;`,
+      between_dates: `-- BETWEEN: Events in bestimmtem Zeitraum\nSELECT user_id, ts, JSON_GET(data, 'type') AS event_type\nFROM events\nWHERE ts BETWEEN '2023-01-01' AND '2023-01-02T23:59:59'\nORDER BY ts;`,
+      complex_where: `-- Complex WHERE: Mehrere Bedingungen\nSELECT u.name, o.amount, o.status, JSON_GET(o.meta, 'device') AS device\nFROM users u\nJOIN orders o ON u.id = o.user_id\nWHERE u.active = TRUE\n  AND o.amount >= 75\n  AND (o.status = 'PAID' OR o.status = 'CANCELED')\n  AND JSON_GET(o.meta, 'device') IN ('web', 'app')\nORDER BY o.amount DESC;`,
+
+      // Analytics & Reporting
+      timeseries: `-- Timeseries: Events je Nutzer\nSELECT user_id, ts, JSON_GET(data, 'type') AS event_type\nFROM events\nORDER BY user_id, ts;`,
+      cohort_analysis: `-- Cohort: Erster vs. Letzter Event\nSELECT user_id,\n       MIN(ts) AS first_seen,\n       MAX(ts) AS last_seen,\n       COUNT(*) AS total_events,\n       DATEDIFF('HOURS', MIN(ts), MAX(ts)) AS session_hours\nFROM events\nGROUP BY user_id\nORDER BY session_hours DESC;`,
+      revenue_analysis: `-- Revenue: Analyse nach Datum\nSELECT LEFT(o.id, 1) AS period,  -- Pseudo-Monat\n       COUNT(*) AS orders,\n       SUM(amount) AS revenue,\n       AVG(amount) AS avg_order_value,\n       COUNT(DISTINCT user_id) AS unique_customers\nFROM orders o\nWHERE status = 'PAID'\nGROUP BY LEFT(o.id, 1)\nORDER BY period;`,
+      user_activity: `-- Activity: Event-Häufigkeit\nSELECT JSON_GET(data, 'type') AS event_type,\n       COUNT(*) AS frequency,\n       COUNT(DISTINCT user_id) AS unique_users,\n       MIN(ts) AS first_occurrence,\n       MAX(ts) AS last_occurrence\nFROM events\nGROUP BY JSON_GET(data, 'type')\nORDER BY frequency DESC;`,
+
+      // Utility & Testing
+      distinct_values: `-- DISTINCT: Eindeutige Werte finden\nSELECT 'Order Status' AS category, status AS value, COUNT(*) AS count\nFROM orders\nGROUP BY status\nUNION ALL\nSELECT 'Event Types' AS category, JSON_GET(data, 'type') AS value, COUNT(*) AS count\nFROM events\nGROUP BY JSON_GET(data, 'type')\nORDER BY category, count DESC;`,
+      limit_offset: `-- LIMIT/OFFSET: Pagination Beispiel\nSELECT id, user_id, amount, status\nFROM orders\nORDER BY amount DESC\nLIMIT 3 OFFSET 1;  -- Seite 2, 3 pro Seite`,
+      order_variations: `-- ORDER BY: Verschiedene Sortierungen\nSELECT u.name, u.email, u.active,\n       COALESCE(SUM(o.amount), 0) AS total_spent\nFROM users u\nLEFT JOIN orders o ON u.id = o.user_id AND o.status = 'PAID'\nGROUP BY u.id, u.name, u.email, u.active\nORDER BY u.active DESC, total_spent DESC, u.name ASC;`,
+      union_example: `-- UNION: Kombinierte Ergebnisse\nSELECT 'High Value Customer' AS type, name\nFROM users u\nWHERE id IN (SELECT user_id FROM orders WHERE amount > 100)\nUNION\nSELECT 'Active User' AS type, name  \nFROM users u\nWHERE id IN (SELECT user_id FROM events WHERE ts > '2023-01-02')\nORDER BY type, name;`
+    };
+
+    // Utility functions
+    function updateStatus(text, type = 'info') {
+      statusIndicator.textContent = text;
+      statusIndicator.className = `status-indicator ${type}`;
+      statusDot.style.background = type === 'connected' ? 'var(--success-color)' : 'var(--error-color)';
+    }
+
+    function updateButtons() {
+      const connected = dbConnected;
+      const tx = transactionActive;
+      
+      btnConnect.disabled = connected;
+      btnStatus.disabled = !connected;
+      btnDisconnect.disabled = !connected;
+      
+      btnBegin.disabled = !connected || tx;
+      btnCommit.disabled = !connected || !tx;
+      btnRollback.disabled = !connected || !tx;
+      
+      btnExec.disabled = !connected;
+      btnQuery.disabled = !connected;
+      btnInitDemo.disabled = !connected;
+      demoSelect.disabled = !connected;
+    }
+
+    function showResult(content, type = 'info') {
+      const className = type === 'error' ? 'error-message' : 
+                       type === 'success' ? 'success-message' : 'info-message';
+      resultContainer.innerHTML = `<div class="${className}">${content}</div>`;
+    }
+
+    function showTable(result) {
+      if (!result.columns || result.columns.length === 0) {
+        showResult('Keine Ergebnisse gefunden.', 'info');
+        return;
+      }
+
+      const meta = `
+        <div class="result-meta">
+          <span><strong>Zeilen:</strong> ${result.count || 0}</span>
+          <span><strong>Spalten:</strong> ${result.columns.length}</span>
+          <span><strong>Zeit:</strong> ${result.elapsed_ms ? Math.round(result.elapsed_ms / 1000000) + 'ms' : 'N/A'}</span>
+        </div>
+      `;
+
+      const table = `
+        <table class="result-table">
+          <thead>
+            <tr>${result.columns.map(col => `<th>${escapeHtml(col)}</th>`).join('')}</tr>
+          </thead>
+          <tbody>
+            ${result.rows.map(row => 
+              `<tr>${row.map(cell => `<td>${escapeHtml(formatValue(cell))}</td>`).join('')}</tr>`
+            ).join('')}
+          </tbody>
+        </table>
+      `;
+
+      resultContainer.innerHTML = meta + table;
+    }
+
+    function formatValue(val) {
+      if (val === null || val === undefined) return 'NULL';
+      if (typeof val === 'string') return val;
+      if (typeof val === 'object') return JSON.stringify(val);
+      return String(val);
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    async function handleApiCall(apiCall, successMessage) {
+      try {
+        const result = apiCall();
+        const parsed = typeof result === 'string' ? JSON.parse(result) : result;
+        
+        if (parsed.error) {
+          showResult(parsed.error, 'error');
+          return false;
+        } else if (parsed.success === false) {
+          showResult(parsed.error || 'Unknown error', 'error');
+          return false;
+        } else if (successMessage) {
+          showResult(parsed.message || successMessage, 'success');
+        }
+        
+        return parsed;
+      } catch (error) {
+        showResult(`Error: ${error.message}`, 'error');
+        return false;
+      }
+    }
+
+    // Execute a statement with optional error suppression
+    async function execSQL(sql, { ignoreError = false, successMessage = '' } = {}) {
+      try {
+        let raw, parsed;
+        
+        if (ignoreError) {
+          // For operations we expect to fail, wrap in try/catch to avoid console spam
+          try {
+            raw = window.tinySQL.exec(sql);
+            parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+          } catch (e) {
+            // Expected failure - return success indicator without logging
+            return { success: true, ignored: true };
+          }
+        } else {
+          raw = window.tinySQL.exec(sql);
+          parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        }
+        
+        if (parsed && (parsed.error || parsed.success === false)) {
+          if (!ignoreError) {
+            showResult(parsed.error || 'Unknown error', 'error');
+            return null;
+          }
+          // Error occurred but we're ignoring it - don't show in UI
+          return { success: true, ignored: true };
+        }
+        if (successMessage) {
+          showResult(parsed.message || successMessage, 'success');
+        }
+        return parsed;
+      } catch (e) {
+        if (!ignoreError) {
+          showResult(`Error: ${e && e.message ? e.message : e}`, 'error');
+          return null;
+        }
+        // Error occurred but we're ignoring it - don't show in UI
+        return { success: true, ignored: true };
+      }
+    }
+
+    // Demo data initialization (incl. events for DATEDIFF)
+    async function initDemoData() {
+      const steps = [
+        { sql: 'DROP TABLE users', ignore: true },
+        { sql: 'DROP TABLE orders', ignore: true },
+        { sql: 'DROP TABLE events', ignore: true },
+        { sql: 'CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT, active BOOL)' },
+        { sql: 'CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, amount FLOAT, status TEXT, meta JSON)' },
+        { sql: 'CREATE TABLE events (id INT PRIMARY KEY, user_id INT, ts TEXT, data JSON)' },
+        { sql: 'DELETE FROM users', ignore: true },
+        { sql: 'DELETE FROM orders', ignore: true },
+        { sql: 'DELETE FROM events', ignore: true },
+        { sql: "INSERT INTO users VALUES (1, 'Alice', 'alice@example.com', TRUE)" },
+        { sql: "INSERT INTO users VALUES (2, 'Bob', NULL, TRUE)" },
+        { sql: "INSERT INTO users VALUES (3, 'Carol', 'carol@example.com', FALSE)" },
+        { sql: 'INSERT INTO orders VALUES (101, 1, 100.50, \'PAID\', \'{"device":"web","items":[{"sku":"A","qty":1}]}\')' },
+        { sql: 'INSERT INTO orders VALUES (102, 1, 75.00, \'PAID\', \'{"device":"app","items":[{"sku":"B","qty":2}]}\')' },
+        { sql: 'INSERT INTO orders VALUES (103, 2, 200.00, \'PAID\', \'{"device":"web"}\')' },
+        { sql: "INSERT INTO orders VALUES (104, 2, 20.00, 'CANCELED', NULL)" },
+        // Events for DATEDIFF examples (RFC3339 timestamps)
+        { sql: 'INSERT INTO events VALUES (1, 1, \'2023-01-01T08:00:00Z\', \'{"type":"login"}\')' },
+        { sql: 'INSERT INTO events VALUES (2, 1, \'2023-01-01T12:30:00Z\', \'{"type":"purchase"}\')' },
+        { sql: 'INSERT INTO events VALUES (3, 1, \'2023-01-02T07:45:00Z\', \'{"type":"logout"}\')' },
+        { sql: 'INSERT INTO events VALUES (4, 2, \'2023-01-03T10:00:00Z\', \'{"type":"login"}\')' },
+        { sql: 'INSERT INTO events VALUES (5, 2, \'2023-01-03T18:15:00Z\', \'{"type":"view"}\')' },
+        { sql: 'INSERT INTO events VALUES (6, 3, \'2023-01-05T09:00:00Z\', \'{"type":"login"}\')' },
+      ];
+
+      for (const step of steps) {
+        const ok = await execSQL(step.sql, { ignoreError: !!step.ignore });
+        if (!ok && !step.ignore) {
+          return; // stop on non-ignored errors
+        }
+      }
+      demoLoaded = true;
+      showResult('Demo-Daten erfolgreich geladen! 👍', 'success');
+    }
+
+    // Event listeners
+    btnConnect.addEventListener('click', async () => {
+      const result = await handleApiCall(() => window.tinySQL.open(), 'Erfolgreich verbunden!');
+      if (result && result.success) {
+        dbConnected = true;
+        updateStatus('Verbunden', 'connected');
+        updateButtons();
+      }
+    });
+
+    btnStatus.addEventListener('click', async () => {
+      const result = await handleApiCall(() => window.tinySQL.status());
+      if (result) {
+        resultContainer.innerHTML = `<pre class="info-message">${JSON.stringify(result, null, 2)}</pre>`;
+      }
+    });
+
+    btnDisconnect.addEventListener('click', async () => {
+      const result = await handleApiCall(() => window.tinySQL.close(), 'Verbindung getrennt.');
+      if (result && result.success) {
+        dbConnected = false;
+        transactionActive = false;
+        updateStatus('Getrennt', 'disconnected');
+        updateButtons();
+      }
+    });
+
+    btnBegin.addEventListener('click', async () => {
+      const result = await handleApiCall(() => window.tinySQL.begin(), 'Transaktion gestartet.');
+      if (result && result.success) {
+        transactionActive = true;
+        updateButtons();
+      }
+    });
+
+    btnCommit.addEventListener('click', async () => {
+      const result = await handleApiCall(() => window.tinySQL.commit(), 'Transaktion bestätigt.');
+      if (result && result.success) {
+        transactionActive = false;
+        updateButtons();
+      }
+    });
+
+    btnRollback.addEventListener('click', async () => {
+      const result = await handleApiCall(() => window.tinySQL.rollback(), 'Transaktion zurückgesetzt.');
+      if (result && result.success) {
+        transactionActive = false;
+        updateButtons();
+      }
+    });
+
+    btnExec.addEventListener('click', async () => {
+      const sql = sqlEditor.value.trim();
+      if (!sql) {
+        showResult('Bitte SQL-Befehl eingeben.', 'error');
+        return;
+      }
+      
+      await handleApiCall(() => window.tinySQL.exec(sql), 'SQL erfolgreich ausgeführt!');
+    });
+
+    btnQuery.addEventListener('click', async () => {
+      const sql = sqlEditor.value.trim();
+      if (!sql) {
+        showResult('Bitte SQL-Query eingeben.', 'error');
+        return;
+      }
+      
+      const result = await handleApiCall(() => window.tinySQL.query(sql));
+      if (result && !result.error) {
+        showTable(result);
+      }
+    });
+
+    btnInitDemo.addEventListener('click', initDemoData);
+
+    // Auto-insert demo query on dropdown change
+    demoSelect.addEventListener('change', () => {
+      const key = demoSelect.value;
+      if (!key) {
+        return; // Empty selection
+      }
+      if (!demoLoaded && (key === 'datediff_group' || key === 'timeseries' || key.includes('json') || key.includes('join') || key.includes('subquery') || key.includes('exists') || key.includes('union'))) {
+        showResult('Hinweis: Bitte zuerst "Demo-Daten laden" ausführen, damit die Demo-Queries funktionieren.', 'info');
+      }
+      sqlEditor.value = demoQueries[key] || '';
+    });
+
+    btnClear.addEventListener('click', () => {
+      sqlEditor.value = '';
+      resultContainer.innerHTML = '';
+    });
+
+    // Initialize WASM
+    async function instantiateWasm(go) {
+      // Prefer instantiateStreaming, but fall back to fetch+instantiate for Safari or wrong MIME
+      const wasmURL = 'tinySQL.wasm';
+      if (WebAssembly.instantiateStreaming) {
+        try {
+          return await WebAssembly.instantiateStreaming(fetch(wasmURL), go.importObject);
+        } catch (e) {
+          console.warn('instantiateStreaming failed, falling back to ArrayBuffer:', e);
+        }
+      }
+      const resp = await fetch(wasmURL);
+      const bytes = await resp.arrayBuffer();
+      return await WebAssembly.instantiate(bytes, go.importObject);
+    }
+
+    async function initWasm() {
+      try {
+        updateStatus('Lade WASM...', 'disconnected');
+        const go = new Go();
+        const result = await instantiateWasm(go);
+        
+        updateStatus('Starte Runtime...', 'disconnected');
+  go.run(result.instance || result);
+        
+        // Wait for tinySQL to be available
+        let attempts = 0;
+        while (!window.tinySQL && attempts < 50) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+          attempts++;
+        }
+        
+        if (window.tinySQL) {
+          wasmReady = true;
+          updateButtons();
+          // Auto-connect to reduce confusion
+          updateStatus('WASM bereit – verbinde...', 'disconnected');
+          const res = await handleApiCall(() => window.tinySQL.open());
+          if (res && res.success) {
+            dbConnected = true;
+            updateStatus('Verbunden', 'connected');
+            updateButtons();
+          } else {
+            updateStatus('WASM bereit - nicht verbunden', 'disconnected');
+          }
+        } else {
+          throw new Error('tinySQL API not available after 5 seconds');
+        }
+      } catch (error) {
+        updateStatus(`WASM Fehler: ${error && error.message ? error.message : error}`, 'disconnected');
+        showResult(`WASM loading failed: ${error && error.message ? error.message : error}`, 'error');
+      }
+    }
+
+    // Listen for WASM ready event
+    window.addEventListener('tinySQLReady', async (event) => {
+      console.log('tinySQL WASM ready:', event.detail);
+      wasmReady = true;
+      updateButtons();
+      // Also auto-connect here in case the event fires before the polling loop
+      updateStatus('WASM bereit – verbinde...', 'disconnected');
+      const res = await handleApiCall(() => window.tinySQL.open());
+      if (res && res.success) {
+        dbConnected = true;
+        updateStatus('Verbunden', 'connected');
+        updateButtons();
+      } else {
+        updateStatus('WASM bereit - nicht verbunden', 'disconnected');
+      }
+    });
+
+    // Initialize on page load
+    initWasm();
+  </script>
+</body>
+</html>
