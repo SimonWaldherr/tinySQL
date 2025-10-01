@@ -138,6 +138,13 @@ type Select struct {
 	Limit    *int
 	Offset   *int
 	Union    *UnionClause // For UNION operations
+	CTEs     []CTE        // Common Table Expressions
+}
+
+// CTE represents a Common Table Expression (WITH clause)
+type CTE struct {
+	Name   string
+	Select *Select
 }
 
 type UnionType int
@@ -194,8 +201,8 @@ func (p *Parser) ParseStatement() (Statement, error) {
 		return p.parseUpdate()
 	case p.cur.Typ == tKeyword && p.cur.Val == "DELETE":
 		return p.parseDelete()
-	case p.cur.Typ == tKeyword && p.cur.Val == "SELECT":
-		return p.parseSelect()
+	case p.cur.Typ == tKeyword && (p.cur.Val == "SELECT" || p.cur.Val == "WITH"):
+		return p.parseSelectWithCTE()
 	default:
 		return nil, p.errf("expected a statement")
 	}
@@ -358,6 +365,61 @@ func (p *Parser) parseDelete() (Statement, error) {
 		where = e
 	}
 	return &Delete{Table: tname, Where: where}, nil
+}
+
+func (p *Parser) parseSelectWithCTE() (*Select, error) {
+	var ctes []CTE
+	
+	// Parse WITH clause if present
+	if p.cur.Typ == tKeyword && p.cur.Val == "WITH" {
+		p.next()
+		
+		for {
+			// Parse CTE name
+			cteName := p.parseIdentLike()
+			if cteName == "" {
+				return nil, p.errf("expected CTE name")
+			}
+			
+			if err := p.expectKeyword("AS"); err != nil {
+				return nil, err
+			}
+			
+			if err := p.expectSymbol("("); err != nil {
+				return nil, err
+			}
+			
+			// Parse the SELECT statement for this CTE
+			cteSelect, err := p.parseSelect()
+			if err != nil {
+				return nil, err
+			}
+			
+			if err := p.expectSymbol(")"); err != nil {
+				return nil, err
+			}
+			
+			ctes = append(ctes, CTE{Name: cteName, Select: cteSelect})
+			
+			// Check for more CTEs
+			if p.cur.Typ == tSymbol && p.cur.Val == "," {
+				p.next()
+				continue
+			}
+			break
+		}
+	}
+	
+	// Parse the main SELECT statement
+	sel, err := p.parseSelect()
+	if err != nil {
+		return nil, err
+	}
+	
+	// Attach CTEs to the main SELECT
+	sel.CTEs = ctes
+	
+	return sel, nil
 }
 
 func (p *Parser) parseSelect() (*Select, error) {
@@ -685,7 +747,7 @@ func (p *Parser) parseColumnDefs() ([]storage.Column, error) {
 	if err := p.expectSymbol("("); err != nil {
 		return nil, err
 	}
-	var cols []storage.Column
+	cols := make([]storage.Column, 0, 8) // Pre-allocate for typical table
 	for {
 		col, err := p.parseSingleColumnDef()
 		if err != nil {
@@ -1068,12 +1130,12 @@ func (p *Parser) parsePrimary() (Expr, error) {
 	case tNumber:
 		val := p.cur.Val
 		p.next()
-		if strings.Contains(val, ".") {
-			f, _ := strconv.ParseFloat(val, 64)
-			return &Literal{Val: f}, nil
+		// Try int first (most common), fall back to float
+		if n, err := strconv.Atoi(val); err == nil {
+			return &Literal{Val: n}, nil
 		}
-		n, _ := strconv.Atoi(val)
-		return &Literal{Val: n}, nil
+		f, _ := strconv.ParseFloat(val, 64)
+		return &Literal{Val: f}, nil
 	case tString:
 		s := p.cur.Val
 		p.next()
@@ -1082,7 +1144,8 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		switch p.cur.Val {
 		case "COUNT", "SUM", "AVG", "MIN", "MAX", "COALESCE", "NULLIF", 
 			 "JSON_GET", "JSON_SET", "JSON_EXTRACT",
-			 "NOW", "CURRENT_TIME", "CURRENT_DATE", "DATEDIFF":
+			 "NOW", "CURRENT_TIME", "CURRENT_DATE", "DATEDIFF",
+			 "LTRIM", "RTRIM", "TRIM", "ISNULL":
 			return p.parseFuncCall()
 		case "TRUE":
 			p.next()
@@ -1129,7 +1192,7 @@ func (p *Parser) parseFuncCall() (Expr, error) {
 		return &FuncCall{Name: name, Star: true}, nil
 	}
 	var args []Expr
-	if !(p.cur.Typ == tSymbol && p.cur.Val == ")") {
+	if p.cur.Typ != tSymbol || p.cur.Val != ")" {
 		for {
 			e, err := p.parseExpr()
 			if err != nil {

@@ -1,3 +1,15 @@
 cmd/cmd
 wasm_exec.js
 tinySQL.wasm
+
+# macOS cruft
+.DS_Store
+
+# Coverage artifacts
+coverage*.out
+coverage*.html
+coverage-func.txt
+
+# Local tooling
+.actrc
+.env

@@ -9,7 +9,10 @@
 // local and actionable without external dependencies.
 package engine
 
-import "unicode"
+import (
+	"strings"
+	"unicode"
+)
 
 type tokenType int
 
@@ -100,24 +103,24 @@ func (lx *lexer) nextToken() token {
 	// string
 	if r == '\'' {
 		lx.next()
-		val := ""
+		var val strings.Builder
 		for lx.pos < len(lx.s) {
 			ch := lx.next()
 			if ch == '\'' {
 				if lx.peek() == '\'' {
 					lx.next()
-					val += "'"
+					val.WriteRune('\'')
 					continue
 				}
 				break
 			}
-			val += string(ch)
+			val.WriteRune(ch)
 		}
-		return token{Typ: tString, Val: val, Pos: start}
+		return token{Typ: tString, Val: val.String(), Pos: start}
 	}
 	// number
 	if unicode.IsDigit(r) {
-		val := ""
+		var val strings.Builder
 		dot := false
 		for lx.pos < len(lx.s) {
 			ch := lx.peek()
@@ -125,31 +128,31 @@ func (lx *lexer) nextToken() token {
 				if ch == '.' {
 					dot = true
 				}
-				val += string(ch)
+				val.WriteRune(ch)
 				lx.pos++
 			} else {
 				break
 			}
 		}
-		return token{Typ: tNumber, Val: val, Pos: start}
+		return token{Typ: tNumber, Val: val.String(), Pos: start}
 	}
 	// ident/keyword
 	if unicode.IsLetter(r) || r == '_' {
-		val := ""
+		var val strings.Builder
 		for lx.pos < len(lx.s) {
 			ch := lx.peek()
 			if unicode.IsLetter(ch) || unicode.IsDigit(ch) || ch == '_' || ch == '.' {
-				val += string(ch)
+				val.WriteRune(ch)
 				lx.pos++
 			} else {
 				break
 			}
 		}
-		up := upper(val)
+		up := upper(val.String())
 		if isKeyword(up) {
 			return token{Typ: tKeyword, Val: up, Pos: start}
 		}
-		return token{Typ: tIdent, Val: val, Pos: start}
+		return token{Typ: tIdent, Val: val.String(), Pos: start}
 	}
 	// symbol
 	switch r {
@@ -171,12 +174,12 @@ func (lx *lexer) nextToken() token {
 }
 
 func upper(s string) string {
-	out := make([]rune, len(s))
-	for i, r := range s {
+	out := make([]rune, 0, len(s))
+	for _, r := range s {
 		if 'a' <= r && r <= 'z' {
-			out[i] = r - 32
+			out = append(out, r-32)
 		} else {
-			out[i] = r
+			out = append(out, r)
 		}
 	}
 	return string(out)
@@ -187,7 +190,7 @@ func isKeyword(up string) bool {
 	case "SELECT", "DISTINCT", "FROM", "WHERE", "GROUP", "BY", "HAVING",
 		"ORDER", "ASC", "DESC", "LIMIT", "OFFSET",
 		"JOIN", "LEFT", "RIGHT", "OUTER", "ON", "AS",
-		"UNION", "ALL", "EXCEPT", "INTERSECT",
+		"UNION", "ALL", "EXCEPT", "INTERSECT", "WITH",
 		"CREATE", "TABLE", "TEMP", "DROP",
 		"INSERT", "INTO", "VALUES",
 		"UPDATE", "SET", "DELETE",
@@ -201,10 +204,11 @@ func isKeyword(up string) bool {
 		"COMPLEX64", "COMPLEX128", "COMPLEX",
 		"POINTER", "PTR", "INTERFACE",
 		"PRIMARY", "FOREIGN", "KEY", "REFERENCES", "UNIQUE",
-		"AND", "OR", "NOT", "IS", "NULL", "TRUE", "FALSE",
+		"AND", "OR", "NOT", "IS", "NULL", "TRUE", "FALSE", "IN",
 		"COUNT", "SUM", "AVG", "MIN", "MAX",
 		"COALESCE", "NULLIF", "NOW", "CURRENT_TIME", "CURRENT_DATE",
-		"JSON_GET", "JSON_SET", "JSON_EXTRACT", "DATEDIFF":
+		"JSON_GET", "JSON_SET", "JSON_EXTRACT", "DATEDIFF",
+		"LTRIM", "RTRIM", "TRIM", "REGEXP", "ISNULL":
 		return true
 	default:
 		return false

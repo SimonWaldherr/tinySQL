@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Download deps
+        run: go mod download
+
+      - name: Run unit tests (no cache)
+        run: go test ./... -count=1
+
+      - name: Run coverage
+        run: go test -coverprofile=coverage.out ./...
+
+      - name: Summarize coverage
+        run: |
+          go tool cover -func=coverage.out -o coverage.txt
+          tail -1 coverage.txt >> $GITHUB_STEP_SUMMARY
+
+          ### Artifacts
+          - Binaries for Linux, macOS, Windows (amd64, arm64)
+          - WASM builds for browser and Node.js
+          
+          ### Installation
+          ```bash
+          # Download binary (replace OS/ARCH as needed)
+          wget https://github.com/SimonWaldherr/tinySQL/releases/download/v${{ github.run_number }}/tinysql-demo-linux-amd64
+          chmod +x tinysql-demo-linux-amd64
+          ./tinysql-demo-linux-amd64
+          ```
+          
+          ### Testing
+          ```bash
+          # Test the demo server
+          curl http://localhost:8080/health
+          
+          # Run a query
+          curl -X POST http://localhost:8080/query \
+            -H "Content-Type: application/json" \
+            -d '{"sql": "SELECT 1 as test"}'
+          ```
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

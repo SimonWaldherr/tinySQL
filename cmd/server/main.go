@@ -312,7 +312,7 @@ func grpcQuery(addr string, req *queryRequest) (*queryResponse, error) {
         return nil, err
     }
     if resp.Error != "" {
-        return &resp, fmt.Errorf(resp.Error)
+        return &resp, fmt.Errorf("%s", resp.Error)
     }
     return &resp, nil
 }

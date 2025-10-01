@@ -41,7 +41,7 @@ func NewQueryCache(maxSize int) *QueryCache {
 		maxSize = 1000 // default cache size
 	}
 	return &QueryCache{
-		queries: make(map[string]*CompiledQuery),
+		queries: make(map[string]*CompiledQuery, maxSize),
 		maxSize: maxSize,
 	}
 }

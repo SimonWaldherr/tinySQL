@@ -46,6 +46,7 @@ type ExecEnv struct {
 	ctx    context.Context
 	tenant string
 	db     *storage.DB
+	ctes   map[string]*ResultSet // For CTE support
 }
 
 // Execute runs a parsed SQL statement against the given storage DB and tenant.
@@ -261,22 +262,71 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 }
 
 func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
-	// FROM
-	leftT, err := env.db.Get(env.tenant, s.From.Table)
-	if err != nil {
-		return nil, err
+	// Process CTEs first
+	cteEnv := env
+	if len(s.CTEs) > 0 {
+		// Create a new environment with CTE tables
+		cteEnv = ExecEnv{
+			ctx:    env.ctx,
+			db:     env.db,
+			tenant: env.tenant,
+			ctes:   make(map[string]*ResultSet),
+		}
+		
+		// Execute each CTE and store the result
+		for _, cte := range s.CTEs {
+			cteResult, err := executeSelect(env, cte.Select)
+			if err != nil {
+				return nil, fmt.Errorf("CTE %s: %v", cte.Name, err)
+			}
+			cteEnv.ctes[cte.Name] = cteResult
+		}
 	}
-	leftRows, _ := rowsFromTable(leftT, aliasOr(s.From))
+	
+	// FROM
+	var leftRows []Row
+	
+	// Check if FROM table is a CTE
+	if cteEnv.ctes != nil {
+		if cteResult, exists := cteEnv.ctes[s.From.Table]; exists {
+			// Convert CTE result to rows
+			leftRows = make([]Row, len(cteResult.Rows))
+			for i, row := range cteResult.Rows {
+				leftRows[i] = make(Row)
+				// Copy all values from CTE result row
+				for k, v := range row {
+					leftRows[i][k] = v
+					// Also add qualified names
+					leftRows[i][s.From.Table+"."+k] = v
+				}
+			}
+		} else {
+			// Regular table
+			leftT, err := cteEnv.db.Get(cteEnv.tenant, s.From.Table)
+			if err != nil {
+				return nil, err
+			}
+			leftRows, _ = rowsFromTable(leftT, aliasOr(s.From))
+		}
+	} else {
+		// Regular table
+		leftT, err := env.db.Get(env.tenant, s.From.Table)
+		if err != nil {
+			return nil, err
+		}
+		leftRows, _ = rowsFromTable(leftT, aliasOr(s.From))
+	}
+	
 	cur := leftRows
 
 	// JOINs
-	cur, err = processJoins(env, s.Joins, cur)
+	cur, err := processJoins(cteEnv, s.Joins, cur)
 	if err != nil {
 		return nil, err
 	}
 
 	// WHERE
-	filtered, err := applyWhereClause(env, s.Where, cur)
+	filtered, err := applyWhereClause(cteEnv, s.Where, cur)
 	if err != nil {
 		return nil, err
 	}
@@ -451,7 +501,7 @@ func processJoins(env ExecEnv, joins []JoinClause, cur []Row) ([]Row, error) {
 }
 
 func processInnerJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) ([]Row, error) {
-	var joined []Row
+	joined := make([]Row, 0, len(leftRows)*len(rightRows)/4) // Estimate result size
 	for _, l := range leftRows {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
@@ -475,7 +525,7 @@ func processInnerJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) 
 }
 
 func processLeftJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr, rightAlias string, rightTable *storage.Table) ([]Row, error) {
-	var joined []Row
+	joined := make([]Row, 0, len(leftRows)) // At least one row per left row
 	for _, l := range leftRows {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
@@ -506,8 +556,8 @@ func processLeftJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr, r
 }
 
 func processRightJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) ([]Row, error) {
-	var joined []Row
-	leftKeys := []string{}
+	joined := make([]Row, 0, len(rightRows)) // At least one row per right row
+	var leftKeys []string
 	if len(leftRows) > 0 {
 		leftKeys = keysOfRow(leftRows[0])
 	}
@@ -546,7 +596,7 @@ func applyWhereClause(env ExecEnv, where Expr, rows []Row) ([]Row, error) {
 	if where == nil {
 		return rows, nil
 	}
-	var filtered []Row
+	filtered := make([]Row, 0, len(rows)/2) // Estimate half will match
 	for _, r := range rows {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
@@ -572,10 +622,10 @@ func processGroupByHaving(env ExecEnv, s *Select, filtered []Row) ([]Row, []stri
 }
 
 func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []string, error) {
-	groups := map[string][]Row{}
-	var orderKeys []string
-	var outRows []Row
-	var outCols []string
+	groups := make(map[string][]Row, len(filtered)/2) // Estimate group count
+	orderKeys := make([]string, 0, len(filtered)/2)
+	outRows := make([]Row, 0, len(filtered)/2)
+	outCols := make([]string, 0, len(s.Projs))
 	
 	for _, r := range filtered {
 		if err := checkCtx(env.ctx); err != nil {
@@ -640,8 +690,8 @@ func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []str
 }
 
 func processNonAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []string, error) {
-	var outRows []Row
-	var outCols []string
+	outRows := make([]Row, 0, len(filtered))
+	outCols := make([]string, 0, len(s.Projs))
 	
 	for _, r := range filtered {
 		if err := checkCtx(env.ctx); err != nil {
@@ -1045,6 +1095,8 @@ func evalFuncCall(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return evalCoalesce(env, ex.Args, row)
 	case "NULLIF":
 		return evalNullif(env, ex.Args, row)
+	case "ISNULL":
+		return evalIsNullFunc(env, ex.Args, row)
 	case "JSON_GET":
 		return evalJSONGet(env, ex.Args, row)
 	case "JSON_SET", "JSON_EXTRACT":
@@ -1059,6 +1111,12 @@ func evalFuncCall(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return time.Now().Truncate(24 * time.Hour), nil
 	case "DATEDIFF":
 		return evalDateDiff(env, ex, row)
+	case "LTRIM":
+		return evalLTrim(env, ex.Args, row)
+	case "RTRIM":
+		return evalRTrim(env, ex.Args, row)
+	case "TRIM":
+		return evalTrim(env, ex.Args, row)
 	}
 	return nil, fmt.Errorf("unknown function: %s", ex.Name)
 }
@@ -1291,6 +1349,142 @@ func triToValue(t int) any {
 		return false
 	}
 	return nil
+}
+
+// String manipulation functions
+func evalLTrim(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) < 1 || len(args) > 2 {
+		return nil, fmt.Errorf("LTRIM expects 1 or 2 arguments")
+	}
+	
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	
+	if val == nil {
+		return nil, nil
+	}
+	
+	str, ok := val.(string)
+	if !ok {
+		return nil, fmt.Errorf("LTRIM expects a string argument")
+	}
+	
+	// Default: trim whitespace
+	cutset := " \t\n\r"
+	
+	// If second argument provided, use as cutset
+	if len(args) == 2 {
+		cutsetVal, err := evalExpr(env, args[1], row)
+		if err != nil {
+			return nil, err
+		}
+		if cutsetVal != nil {
+			if cutsetStr, ok := cutsetVal.(string); ok {
+				cutset = cutsetStr
+			} else {
+				return nil, fmt.Errorf("LTRIM cutset must be a string")
+			}
+		}
+	}
+	
+	return strings.TrimLeft(str, cutset), nil
+}
+
+func evalRTrim(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) < 1 || len(args) > 2 {
+		return nil, fmt.Errorf("RTRIM expects 1 or 2 arguments")
+	}
+	
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	
+	if val == nil {
+		return nil, nil
+	}
+	
+	str, ok := val.(string)
+	if !ok {
+		return nil, fmt.Errorf("RTRIM expects a string argument")
+	}
+	
+	// Default: trim whitespace
+	cutset := " \t\n\r"
+	
+	// If second argument provided, use as cutset
+	if len(args) == 2 {
+		cutsetVal, err := evalExpr(env, args[1], row)
+		if err != nil {
+			return nil, err
+		}
+		if cutsetVal != nil {
+			if cutsetStr, ok := cutsetVal.(string); ok {
+				cutset = cutsetStr
+			} else {
+				return nil, fmt.Errorf("RTRIM cutset must be a string")
+			}
+		}
+	}
+	
+	return strings.TrimRight(str, cutset), nil
+}
+
+func evalTrim(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) < 1 || len(args) > 2 {
+		return nil, fmt.Errorf("TRIM expects 1 or 2 arguments")
+	}
+	
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	
+	if val == nil {
+		return nil, nil
+	}
+	
+	str, ok := val.(string)
+	if !ok {
+		return nil, fmt.Errorf("TRIM expects a string argument")
+	}
+	
+	// Default: trim whitespace (use TrimSpace for compatibility)
+	if len(args) == 1 {
+		return strings.TrimSpace(str), nil
+	}
+	
+	// If second argument provided, use as cutset for both sides
+	cutsetVal, err := evalExpr(env, args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	if cutsetVal == nil {
+		return strings.TrimSpace(str), nil
+	}
+	
+	cutsetStr, ok := cutsetVal.(string)
+	if !ok {
+		return nil, fmt.Errorf("TRIM cutset must be a string")
+	}
+	
+	return strings.Trim(str, cutsetStr), nil
+}
+
+// ISNULL function - returns TRUE if argument is NULL, FALSE otherwise
+func evalIsNullFunc(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("ISNULL expects 1 argument")
+	}
+	
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	
+	return val == nil, nil
 }
 
 func isAggregate(e Expr) bool {
@@ -1859,8 +2053,11 @@ func jsonSet(v any, path string, value any) any {
 // -------------------- misc helpers --------------------
 
 func columnsFromRows(rows []Row) []string {
-	seen := map[string]bool{}
-	var cols []string
+	if len(rows) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(rows[0]))
+	cols := make([]string, 0, len(rows[0]))
 	for _, r := range rows {
 		for k := range r {
 			if !seen[k] {

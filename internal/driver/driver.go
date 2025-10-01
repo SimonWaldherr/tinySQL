@@ -37,13 +37,13 @@ import (
 //   - file:/path/to/db.gob?tenant=default&autosave=1
 //
 // See parseDSN for all available options.
-// Treiber registrieren
 func init() {
 	sql.Register("tinysql", &drv{})
 	gob.Register(map[string]any{})
 	gob.Register([]any{})
 }
 
+// cfg stores the connection parameters derived from a parsed DSN.
 type cfg struct {
 	tenant      string
 	filePath    string
@@ -112,6 +112,8 @@ func parseDSN(dsn string) (cfg, error) {
 	}
 }
 
+// server coordinates access to the shared storage.DB and manages
+// concurrency primitives plus optional persistence hooks.
 type server struct {
 	mu          sync.RWMutex
 	db          *storage.DB
@@ -221,6 +223,8 @@ func (s *server) release(pool chan struct{}) {
 	default:
 	}
 }
+
+// saveIfNeeded persists the database to disk when autosave is enabled.
 func (s *server) saveIfNeeded() {
 	if s.autosave && s.filePath != "" {
 		_ = storage.SaveToFile(s.db, s.filePath)
@@ -259,8 +263,8 @@ type conn struct {
 	tenant string
 
 	inTx       bool
-	shadow     *storage.DB // Snapshot-Kopie (MVCC-light)
-	txReadOnly bool        // aktiver Tx wurde als read-only angefordert
+	shadow     *storage.DB // Snapshot copy (MVCC-light)
+	txReadOnly bool        // Active tx requested as read-only
 }
 
 func (c *conn) Prepare(query string) (driver.Stmt, error) { return &stmt{c: c, sql: query}, nil }
@@ -268,13 +272,14 @@ func (c *conn) Close() error                              { c.srv.saveIfNeeded()
 func (c *conn) Begin() (driver.Tx, error)                 { return c.BeginTx(context.Background(), driver.TxOptions{}) }
 
 func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	// Only the default isolation level is supported; other levels are rejected.
 	switch opts.Isolation {
 	case driver.IsolationLevel(0): // Default
 		// Allow default isolation
 	default:
 		return nil, fmt.Errorf("unsupported isolation level: %v", opts.Isolation)
 	}
-	// Snapshot-Kopie unter Read-Lock erzeugen; Writer blockiert Commit kurz.
+	// Create snapshot copy under read lock; writer blocks commit briefly.
 	if err := c.srv.acquireReader(ctx); err != nil {
 		return nil, err
 	}
@@ -296,7 +301,7 @@ func (t *tx) Commit() error {
 		return err
 	}
 	defer t.c.srv.releaseWriter()
-	// Atomarer Swap: Writer-Lock, Daten ersetzen, speichern, Unlock.
+	// Atomic swap: writer lock, replace data, save, unlock.
 	t.c.srv.mu.Lock()
 	defer t.c.srv.mu.Unlock()
 	oldDB := t.c.srv.db
@@ -372,13 +377,15 @@ func (c *conn) currentDB() *storage.DB {
 }
 
 func (c *conn) execSQL(ctx context.Context, sqlStr string) (driver.Result, error) {
+	// Parse the SQL and route to write or read execution paths. Writes run
+	// in a transaction snapshot when inside a tx, otherwise under writer lock.
 	p := engine.NewParser(sqlStr)
 	st, err := p.ParseStatement()
 	if err != nil {
 		return nil, err
 	}
 
-	// DDL/DML (Writes) müssen in Tx-Snapshot oder unter Lock laufen
+	// DDL/DML writes must run in tx snapshot or under lock
 	isWrite := func(s engine.Statement) bool {
 		switch s.(type) {
 		case *engine.CreateTable, *engine.DropTable, *engine.Insert, *engine.Update, *engine.Delete:
@@ -393,7 +400,6 @@ func (c *conn) execSQL(ctx context.Context, sqlStr string) (driver.Result, error
 			return nil, fmt.Errorf("tinysql: write attempted in read-only transaction")
 		}
 		if c.inTx {
-			// im Snapshot arbeiten
 			_, err := engine.Execute(ctx, c.currentDB(), c.tenant, st)
 			if err != nil {
 				return nil, err
@@ -459,13 +465,15 @@ func (c *conn) execSQL(ctx context.Context, sqlStr string) (driver.Result, error
 }
 
 func (c *conn) querySQL(ctx context.Context, sqlStr string) (driver.Rows, error) {
+	// Queries return a driver.Rows. For non-SELECT statements, execute them
+	// and return an empty result set to satisfy the interface.
 	p := engine.NewParser(sqlStr)
 	st, err := p.ParseStatement()
 	if err != nil {
 		return nil, err
 	}
 
-	// Für Nicht-SELECT als Query: ausführen und leere Rows
+	// For non-SELECT statements, execute and return empty rows
 	if _, ok := st.(*engine.Select); !ok {
 		if _, err := c.execSQL(ctx, sqlStr); err != nil {
 			return nil, err
@@ -489,6 +497,7 @@ func (c *conn) querySQL(ctx context.Context, sqlStr string) (driver.Rows, error)
 
 // NamedValueChecker
 func (c *conn) CheckNamedValue(nv *driver.NamedValue) error {
+	// Normalize common Go types into database/sql primitive types.
 	switch v := nv.Value.(type) {
 	case time.Time:
 		nv.Value = v.UTC().Format(time.RFC3339Nano)
@@ -591,6 +600,7 @@ func (emptyRows) ColumnTypeScanType(int) any            { return "interface{}" }
 // Placeholder Binding (einfach/sicher)
 func bindPlaceholders(sqlStr string, args []driver.NamedValue) (string, error) {
 	var sb strings.Builder
+	sb.Grow(len(sqlStr) + len(args)*10)
 	argi := 0
 	for i := 0; i < len(sqlStr); i++ {
 		ch := sqlStr[i]
@@ -627,6 +637,9 @@ func bindPlaceholders(sqlStr string, args []driver.NamedValue) (string, error) {
 	}
 	return sb.String(), nil
 }
+
+// sqlLiteral converts a Go value into a SQL literal string suitable for
+// substitution in a query.
 func sqlLiteral(v any) string {
 	if v == nil {
 		return "NULL"
@@ -651,6 +664,7 @@ func sqlLiteral(v any) string {
 	}
 }
 
+// applyDSNOption mutates the configuration in place for a single DSN option.
 func applyDSNOption(c *cfg, key, value string) error {
 	key = strings.ToLower(key)
 	switch key {

@@ -200,7 +200,7 @@ type Table struct {
 
 // NewTable creates a new Table with case-insensitive column lookup indices.
 func NewTable(name string, cols []Column, isTemp bool) *Table {
-	pos := make(map[string]int)
+	pos := make(map[string]int, len(cols))
 	for i, c := range cols {
 		pos[strings.ToLower(c.Name)] = i
 	}
@@ -219,15 +219,26 @@ type tenantDB struct {
 	tables map[string]*Table
 }
 
-// DB is an in-memory, multi-tenant database catalog.
+// DB is an in-memory, multi-tenant database catalog with full MVCC support.
 type DB struct {
 	mu      sync.RWMutex
 	tenants map[string]*tenantDB
 	wal     *WALManager
+	
+	// MVCC coordinator
+	mvcc *MVCCManager
+	
+	// Advanced WAL (optional - replaces basic WAL when enabled)
+	advancedWAL *AdvancedWAL
 }
 
-// NewDB creates a new empty database catalog.
-func NewDB() *DB { return &DB{tenants: map[string]*tenantDB{}} }
+// NewDB creates a new empty database catalog with MVCC support.
+func NewDB() *DB { 
+	return &DB{
+		tenants: map[string]*tenantDB{},
+		mvcc:    NewMVCCManager(),
+	}
+}
 
 func (db *DB) getTenant(tn string) *tenantDB {
 	tn = strings.ToLower(tn)
@@ -272,22 +283,27 @@ func (db *DB) Drop(tn, name string) error {
 // ListTables returns the tables in a tenant sorted by name.
 func (db *DB) ListTables(tn string) []*Table {
 	td := db.getTenant(tn)
+	if len(td.tables) == 0 {
+		return nil
+	}
 	names := make([]string, 0, len(td.tables))
 	for k := range td.tables {
 		names = append(names, k)
 	}
 	sort.Strings(names)
-	out := make([]*Table, 0, len(names))
-	for _, n := range names {
-		out = append(out, td.tables[n])
+	out := make([]*Table, len(names))
+	for i, n := range names {
+		out[i] = td.tables[n]
 	}
 	return out
 }
 
-// DeepClone: defensive snapshot für "MVCC-light" Transaktionen.
-// Achtung: kein Copy-on-Write, volle Kopie (einfach, aber O(n)).
 // DeepClone creates a full copy of the database (MVCC-light snapshot).
+// Note: This is not copy-on-write; it creates a full copy (simple but O(n)).
 func (db *DB) DeepClone() *DB {
+	if len(db.tenants) == 0 {
+		return NewDB()
+	}
 	out := NewDB()
 	out.wal = db.wal
 	for tn, tdb := range db.tenants {
@@ -321,7 +337,7 @@ type diskTable struct {
 	Tenant  string
 	Name    string
 	Cols    []diskColumn
-	Rows    [][]any // JSON-Spalten als string gespeichert
+	Rows    [][]any // JSON columns stored as strings
 	IsTemp  bool
 	Version int
 }
@@ -386,6 +402,9 @@ func diskToTable(dt diskTable) *Table {
 	for ri, r := range dt.Rows {
 		row := make([]any, len(r))
 		for ci, v := range r {
+			if ci >= len(cols) {
+				break // Skip extra columns beyond schema
+			}
 			if v == nil {
 				row[ci] = nil
 				continue
@@ -411,14 +430,18 @@ func diskToTable(dt diskTable) *Table {
 	return t
 }
 
-// SaveToFile writes a snapshot of the database to the given file (GOB).
 // SaveToFile writes a snapshot of the database to a file. If the filename
 // ends with .gz, the snapshot is gzip-compressed to reduce size.
 func SaveToFile(db *DB, filename string) error {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
-	var dump []diskTable
+	// Pre-allocate dump slice with estimated capacity
+	var totalTables int
+	for _, tdb := range db.tenants {
+		totalTables += len(tdb.tables)
+	}
+	dump := make([]diskTable, 0, totalTables)
 	for tn, tdb := range db.tenants {
 		for _, t := range tdb.tables {
 			dump = append(dump, tableToDisk(tn, t))
@@ -456,13 +479,13 @@ func SaveToFile(db *DB, filename string) error {
 			return err
 		}
 	}
+	// w is bufio.Writer when gz is nil, otherwise gz wraps it
 	if bw, ok := w.(*bufio.Writer); ok {
 		return bw.Flush()
 	}
 	return nil
 }
 
-// LoadFromFile loads a database from a snapshot file and attaches a WAL.
 // LoadFromFile loads a database snapshot from a file. It auto-detects gzip
 // compression based on the .gz suffix and attaches a WAL if a path is given.
 func LoadFromFile(filename string) (*DB, error) {
@@ -511,7 +534,12 @@ func LoadFromFile(filename string) (*DB, error) {
 func SaveToWriter(db *DB, w io.Writer) error {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	var dump []diskTable
+	// Pre-allocate dump slice with estimated capacity
+	var totalTables int
+	for _, tdb := range db.tenants {
+		totalTables += len(tdb.tables)
+	}
+	dump := make([]diskTable, 0, totalTables)
 	for tn, tdb := range db.tenants {
 		for _, t := range tdb.tables {
 			dump = append(dump, tableToDisk(tn, t))
@@ -596,7 +624,12 @@ func CollectWALChanges(prev, next *DB) []WALChange {
 	if prev == nil || next == nil {
 		return nil
 	}
-	changes := make([]WALChange, 0)
+	// Estimate capacity based on number of tables in next
+	var estCapacity int
+	for _, tdb := range next.tenants {
+		estCapacity += len(tdb.tables)
+	}
+	changes := make([]WALChange, 0, estCapacity)
 	for tn, nextTenant := range next.tenants {
 		prevTenant := prev.tenants[tn]
 		for key, nt := range nextTenant.tables {
@@ -656,6 +689,27 @@ func (db *DB) attachWAL(wal *WALManager) {
 	db.mu.Lock()
 	db.wal = wal
 	db.mu.Unlock()
+}
+
+// AttachAdvancedWAL attaches an advanced WAL to the database.
+func (db *DB) AttachAdvancedWAL(wal *AdvancedWAL) {
+	db.mu.Lock()
+	db.advancedWAL = wal
+	db.mu.Unlock()
+}
+
+// AdvancedWAL returns the configured advanced WAL manager (may be nil).
+func (db *DB) AdvancedWAL() *AdvancedWAL {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.advancedWAL
+}
+
+// MVCC returns the MVCC manager.
+func (db *DB) MVCC() *MVCCManager {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.mvcc
 }
 
 // WAL returns the configured WAL manager (may be nil).
@@ -831,10 +885,7 @@ func (w *WALManager) Close() error {
 }
 
 func (w *WALManager) writeRecord(rec *walRecord) error {
-	if err := w.encoder.Encode(rec); err != nil {
-		return err
-	}
-	return nil
+	return w.encoder.Encode(rec)
 }
 
 func (w *WALManager) flushSync() error {
@@ -859,6 +910,7 @@ func replayWAL(db *DB, walPath string) (nextSeq, nextTxID, committed uint64, err
 		}
 		return 0, 0, 0, err
 	}
+	defer f.Close()
 	cr := &countingReader{r: f}
 	dec := gob.NewDecoder(cr)
 	pending := make(map[uint64][]walOperation)
@@ -872,13 +924,11 @@ func replayWAL(db *DB, walPath string) (nextSeq, nextTxID, committed uint64, err
 				break
 			}
 			if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.ErrNoProgress) || strings.Contains(err.Error(), "EOF") {
-				f.Close()
 				if lastGood >= 0 {
 					_ = os.Truncate(walPath, lastGood)
 				}
 				return lastSeq + 1, lastTx + 1, committed, nil
 			}
-			f.Close()
 			return 0, 0, 0, err
 		}
 		lastGood = cr.n
@@ -912,7 +962,6 @@ func replayWAL(db *DB, walPath string) (nextSeq, nextTxID, committed uint64, err
 			committed++
 		}
 	}
-	f.Close()
 	return lastSeq + 1, lastTx + 1, committed, nil
 }
 
