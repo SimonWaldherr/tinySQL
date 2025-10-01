@@ -41,28 +41,3 @@ jobs:
         run: |
           go tool cover -func=coverage.out -o coverage.txt
           tail -1 coverage.txt >> $GITHUB_STEP_SUMMARY
-
-          ### Artifacts
-          - Binaries for Linux, macOS, Windows (amd64, arm64)
-          - WASM builds for browser and Node.js
-          
-          ### Installation
-          ```bash
-          # Download binary (replace OS/ARCH as needed)
-          wget https://github.com/SimonWaldherr/tinySQL/releases/download/v${{ github.run_number }}/tinysql-demo-linux-amd64
-          chmod +x tinysql-demo-linux-amd64
-          ./tinysql-demo-linux-amd64
-          ```
-          
-          ### Testing
-          ```bash
-          # Test the demo server
-          curl http://localhost:8080/health
-          
-          # Run a query
-          curl -X POST http://localhost:8080/query \
-            -H "Content-Type: application/json" \
-            -d '{"sql": "SELECT 1 as test"}'
-          ```
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
