@@ -66,9 +66,11 @@ package tinysql
 
 import (
 	"context"
+	"io"
 	"strings"
 
 	"github.com/SimonWaldherr/tinySQL/internal/engine"
+	"github.com/SimonWaldherr/tinySQL/internal/importer"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
@@ -552,3 +554,121 @@ func OpenAdvancedWAL(config AdvancedWALConfig) (*AdvancedWAL, error) {
 func NewTable(name string, cols []Column, isTemp bool) *Table {
 	return storage.NewTable(name, cols, isTemp)
 }
+
+// ============================================================================
+// File Import - Auto-import structured data files
+// ============================================================================
+
+// ImportOptions re-exports importer.ImportOptions for convenience.
+// Configure import behavior including type inference, batching, and null handling.
+type ImportOptions = importer.ImportOptions
+
+// ImportResult re-exports importer.ImportResult for convenience.
+// Contains metadata about the import operation.
+type ImportResult = importer.ImportResult
+
+// ImportFile imports a structured data file (CSV, TSV, JSON, XML) into a table.
+// The format is auto-detected from the file extension or content.
+//
+// Supported formats:
+//   - CSV (.csv) - Comma-separated values with auto-detected delimiters
+//   - TSV (.tsv, .tab) - Tab-separated values
+//   - JSON (.json) - Array of objects format: [{"id": 1, "name": "Alice"}, ...]
+//   - XML (.xml) - Simple row-based XML (limited support)
+//   - Compressed (.gz) - Transparent gzip decompression
+//
+// Example:
+//
+//	db := tinysql.NewDB()
+//	result, err := tinysql.ImportFile(ctx, db, "default", "users", "data.csv", &tinysql.ImportOptions{
+//	    CreateTable: true,
+//	    TypeInference: true,
+//	    BatchSize: 1000,
+//	})
+//	fmt.Printf("Imported %d rows\n", result.RowsInserted)
+//
+// Parameters:
+//   - ctx: Context for cancellation
+//   - db: Target database instance
+//   - tenant: Tenant/schema name (use "default" for single-tenant mode)
+//   - tableName: Target table name (if empty, derived from filename)
+//   - filePath: Path to the file to import
+//   - opts: Optional configuration (nil uses sensible defaults)
+//
+// Returns ImportResult with metadata and any error encountered.
+func ImportFile(ctx context.Context, db *DB, tenant, tableName, filePath string, opts *ImportOptions) (*ImportResult, error) {
+	return importer.ImportFile(ctx, db, tenant, tableName, filePath, opts)
+}
+
+// ImportCSV imports CSV/TSV data from a reader into a table.
+// Use this for streaming imports or when you already have an io.Reader.
+//
+// Example:
+//
+//	f, _ := os.Open("data.csv")
+//	defer f.Close()
+//	result, err := tinysql.ImportCSV(ctx, db, "default", "users", f, &tinysql.ImportOptions{
+//	    HeaderMode: "auto",
+//	    DelimiterCandidates: []rune{',', ';', '\t'},
+//	})
+//
+// Parameters:
+//   - ctx: Context for cancellation
+//   - db: Target database instance
+//   - tenant: Tenant/schema name
+//   - tableName: Target table name
+//   - src: Input reader (file, network stream, stdin, etc.)
+//   - opts: Optional configuration (nil uses defaults)
+//
+// Returns ImportResult with metadata and any error encountered.
+func ImportCSV(ctx context.Context, db *DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
+	return importer.ImportCSV(ctx, db, tenant, tableName, src, opts)
+}
+
+// ImportJSON imports JSON data from a reader into a table.
+// Supports array of objects format: [{"id": 1, "name": "Alice"}, ...]
+//
+// Example:
+//
+//	jsonData := `[{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]`
+//	result, err := tinysql.ImportJSON(ctx, db, "default", "users", 
+//	    strings.NewReader(jsonData), nil)
+//
+// Parameters:
+//   - ctx: Context for cancellation
+//   - db: Target database instance
+//   - tenant: Tenant/schema name
+//   - tableName: Target table name
+//   - src: Input reader
+//   - opts: Optional configuration
+//
+// Returns ImportResult with metadata and any error encountered.
+func ImportJSON(ctx context.Context, db *DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
+	return importer.ImportJSON(ctx, db, tenant, tableName, src, opts)
+}
+
+// OpenFile opens a data file and returns a DB with the data loaded.
+// This is a convenience function for quick data exploration.
+//
+// Example:
+//
+//	db, tableName, _ := tinysql.OpenFile(context.Background(), "data.csv", nil)
+//	stmt, _ := tinysql.ParseSQL(fmt.Sprintf("SELECT * FROM %s LIMIT 10", tableName))
+//	rs, _ := tinysql.Execute(ctx, db, "default", stmt)
+//	for _, row := range rs.Rows {
+//	    fmt.Println(row)
+//	}
+//
+// Parameters:
+//   - ctx: Context for cancellation
+//   - filePath: Path to the data file
+//   - opts: Optional import configuration
+//
+// Returns:
+//   - db: New database instance with imported data
+//   - tableName: The table name where data was loaded
+//   - error: Any error encountered during import
+func OpenFile(ctx context.Context, filePath string, opts *ImportOptions) (*DB, string, error) {
+	return importer.OpenFile(ctx, filePath, opts)
+}
+

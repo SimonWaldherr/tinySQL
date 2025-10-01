@@ -78,9 +78,38 @@ type (
 	}
 	// FuncCall represents a function call, optionally with a star (COUNT(*)).
 	FuncCall struct {
-		Name string
-		Args []Expr
-		Star bool
+		Name     string
+		Args     []Expr
+		Star     bool
+		Distinct bool // For COUNT(DISTINCT col)
+	}
+	// InExpr represents "expr IN (val1, val2, ...)"
+	InExpr struct {
+		Expr   Expr
+		Values []Expr
+		Negate bool // For NOT IN
+	}
+	// LikeExpr represents "expr LIKE pattern [ESCAPE char]"
+	LikeExpr struct {
+		Expr    Expr
+		Pattern Expr
+		Escape  Expr // Optional ESCAPE character
+		Negate  bool // For NOT LIKE
+	}
+	// CaseExpr represents a CASE ... WHEN ... THEN ... [ELSE ...] END expression.
+	CaseExpr struct {
+		Operand Expr
+		Whens   []CaseWhen
+		Else    Expr
+	}
+	// CaseWhen pairs WHEN condition and THEN result expressions.
+	CaseWhen struct {
+		When Expr
+		Then Expr
+	}
+	// SubqueryExpr wraps a SELECT used as an expression (scalar subquery).
+	SubqueryExpr struct {
+		Select *Select
 	}
 )
 
@@ -89,14 +118,55 @@ type Statement interface{}
 
 // CreateTable represents a CREATE TABLE statement.
 type CreateTable struct {
-	Name     string
-	Cols     []storage.Column
-	IsTemp   bool
-	AsSelect *Select
+	Name        string
+	Cols        []storage.Column
+	IsTemp      bool
+	AsSelect    *Select
+	IfNotExists bool // IF NOT EXISTS clause
 }
 
 // DropTable represents a DROP TABLE statement.
-type DropTable struct{ Name string }
+type DropTable struct {
+	Name     string
+	IfExists bool // IF EXISTS clause
+}
+
+// CreateIndex represents a CREATE INDEX statement.
+type CreateIndex struct {
+	Name        string
+	Table       string
+	Columns     []string
+	Unique      bool
+	IfNotExists bool
+}
+
+// DropIndex represents a DROP INDEX statement.
+type DropIndex struct {
+	Name     string
+	Table    string // Optional: some DBs require table name
+	IfExists bool
+}
+
+// CreateView represents a CREATE VIEW statement.
+type CreateView struct {
+	Name        string
+	Select      *Select
+	IfNotExists bool
+	OrReplace   bool
+}
+
+// DropView represents a DROP VIEW statement.
+type DropView struct {
+	Name     string
+	IfExists bool
+}
+
+// AlterTable represents an ALTER TABLE statement.
+type AlterTable struct {
+	Table     string
+	AddColumn *storage.Column // For ADD COLUMN
+	// Future: DropColumn, RenameColumn, etc.
+}
 
 // Insert represents an INSERT statement.
 type Insert struct {
@@ -136,7 +206,7 @@ type Select struct {
 	Joins    []JoinClause
 	Projs    []SelectItem
 	Where    Expr
-	GroupBy  []VarRef
+	GroupBy  []Expr
 	Having   Expr
 	OrderBy  []OrderItem
 	Limit    *int
@@ -203,6 +273,8 @@ func (p *Parser) ParseStatement() (Statement, error) {
 		return p.parseCreate()
 	case p.cur.Typ == tKeyword && p.cur.Val == "DROP":
 		return p.parseDrop()
+	case p.cur.Typ == tKeyword && p.cur.Val == "ALTER":
+		return p.parseAlter()
 	case p.cur.Typ == tKeyword && p.cur.Val == "INSERT":
 		return p.parseInsert()
 	case p.cur.Typ == tKeyword && p.cur.Val == "UPDATE":
@@ -218,6 +290,18 @@ func (p *Parser) ParseStatement() (Statement, error) {
 
 func (p *Parser) parseCreate() (Statement, error) {
 	p.next()
+	
+	// Check for CREATE INDEX
+	if p.cur.Typ == tKeyword && (p.cur.Val == "INDEX" || p.cur.Val == "UNIQUE") {
+		return p.parseCreateIndex()
+	}
+	
+	// Check for CREATE VIEW
+	if p.cur.Typ == tKeyword && (p.cur.Val == "VIEW" || p.cur.Val == "OR") {
+		return p.parseCreateView()
+	}
+	
+	// CREATE TABLE logic
 	isTemp := false
 	if p.cur.Typ == tKeyword && p.cur.Val == "TEMP" {
 		isTemp = true
@@ -226,6 +310,20 @@ func (p *Parser) parseCreate() (Statement, error) {
 	if err := p.expectKeyword("TABLE"); err != nil {
 		return nil, err
 	}
+	
+	// Check for IF NOT EXISTS
+	ifNotExists := false
+	if p.cur.Typ == tKeyword && p.cur.Val == "IF" {
+		p.next()
+		if err := p.expectKeyword("NOT"); err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		ifNotExists = true
+	}
+	
 	name := p.parseIdentLike()
 	if name == "" {
 		return nil, p.errf("expected table name")
@@ -235,7 +333,7 @@ func (p *Parser) parseCreate() (Statement, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &CreateTable{Name: name, Cols: cols, IsTemp: isTemp}, nil
+		return &CreateTable{Name: name, Cols: cols, IsTemp: isTemp, IfNotExists: ifNotExists}, nil
 	}
 	if p.cur.Typ == tKeyword && p.cur.Val == "AS" {
 		p.next()
@@ -243,21 +341,264 @@ func (p *Parser) parseCreate() (Statement, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &CreateTable{Name: name, IsTemp: isTemp, AsSelect: sel}, nil
+		return &CreateTable{Name: name, IsTemp: isTemp, AsSelect: sel, IfNotExists: ifNotExists}, nil
 	}
 	return nil, p.errf("expected '(' or AS SELECT")
 }
 
 func (p *Parser) parseDrop() (Statement, error) {
 	p.next()
+	
+	// Check for DROP INDEX
+	if p.cur.Typ == tKeyword && p.cur.Val == "INDEX" {
+		return p.parseDropIndex()
+	}
+	
+	// Check for DROP VIEW
+	if p.cur.Typ == tKeyword && p.cur.Val == "VIEW" {
+		return p.parseDropView()
+	}
+	
+	// DROP TABLE
 	if err := p.expectKeyword("TABLE"); err != nil {
 		return nil, err
 	}
+	
+	// Check for IF EXISTS
+	ifExists := false
+	if p.cur.Typ == tKeyword && p.cur.Val == "IF" {
+		p.next()
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		ifExists = true
+	}
+	
 	name := p.parseIdentLike()
 	if name == "" {
 		return nil, p.errf("expected table name")
 	}
-	return &DropTable{Name: name}, nil
+	return &DropTable{Name: name, IfExists: ifExists}, nil
+}
+
+func (p *Parser) parseCreateIndex() (Statement, error) {
+	// Already consumed CREATE, cur should be INDEX or UNIQUE
+	unique := false
+	if p.cur.Typ == tKeyword && p.cur.Val == "UNIQUE" {
+		unique = true
+		p.next()
+		if err := p.expectKeyword("INDEX"); err != nil {
+			return nil, err
+		}
+	}
+	
+	// Check for IF NOT EXISTS
+	ifNotExists := false
+	if p.cur.Typ == tKeyword && p.cur.Val == "IF" {
+		p.next()
+		if err := p.expectKeyword("NOT"); err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		ifNotExists = true
+	}
+	
+	indexName := p.parseIdentLike()
+	if indexName == "" {
+		return nil, p.errf("expected index name")
+	}
+	
+	if err := p.expectKeyword("ON"); err != nil {
+		return nil, err
+	}
+	
+	tableName := p.parseIdentLike()
+	if tableName == "" {
+		return nil, p.errf("expected table name")
+	}
+	
+	if err := p.expectSymbol("("); err != nil {
+		return nil, err
+	}
+	
+	var columns []string
+	for {
+		col := p.parseIdentLike()
+		if col == "" {
+			return nil, p.errf("expected column name")
+		}
+		columns = append(columns, col)
+		
+		if p.cur.Typ == tSymbol && p.cur.Val == "," {
+			p.next()
+			continue
+		}
+		if err := p.expectSymbol(")"); err != nil {
+			return nil, err
+		}
+		break
+	}
+	
+	return &CreateIndex{
+		Name:        indexName,
+		Table:       tableName,
+		Columns:     columns,
+		Unique:      unique,
+		IfNotExists: ifNotExists,
+	}, nil
+}
+
+func (p *Parser) parseDropIndex() (Statement, error) {
+	// Already consumed DROP INDEX
+	p.next()
+	
+	// Check for IF EXISTS
+	ifExists := false
+	if p.cur.Typ == tKeyword && p.cur.Val == "IF" {
+		p.next()
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		ifExists = true
+	}
+	
+	indexName := p.parseIdentLike()
+	if indexName == "" {
+		return nil, p.errf("expected index name")
+	}
+	
+	// Optional: ON table_name
+	var tableName string
+	if p.cur.Typ == tKeyword && p.cur.Val == "ON" {
+		p.next()
+		tableName = p.parseIdentLike()
+	}
+	
+	return &DropIndex{
+		Name:     indexName,
+		Table:    tableName,
+		IfExists: ifExists,
+	}, nil
+}
+
+func (p *Parser) parseCreateView() (Statement, error) {
+	// Already consumed CREATE, check for OR REPLACE
+	orReplace := false
+	if p.cur.Typ == tKeyword && p.cur.Val == "OR" {
+		p.next()
+		if err := p.expectKeyword("REPLACE"); err != nil {
+			return nil, err
+		}
+		orReplace = true
+	}
+	
+	if err := p.expectKeyword("VIEW"); err != nil {
+		return nil, err
+	}
+	
+	// Check for IF NOT EXISTS
+	ifNotExists := false
+	if p.cur.Typ == tKeyword && p.cur.Val == "IF" {
+		p.next()
+		if err := p.expectKeyword("NOT"); err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		ifNotExists = true
+	}
+	
+	viewName := p.parseIdentLike()
+	if viewName == "" {
+		return nil, p.errf("expected view name")
+	}
+	
+	if err := p.expectKeyword("AS"); err != nil {
+		return nil, err
+	}
+	
+	sel, err := p.parseSelect()
+	if err != nil {
+		return nil, err
+	}
+	
+	return &CreateView{
+		Name:        viewName,
+		Select:      sel,
+		IfNotExists: ifNotExists,
+		OrReplace:   orReplace,
+	}, nil
+}
+
+func (p *Parser) parseDropView() (Statement, error) {
+	// Already consumed DROP VIEW
+	p.next()
+	
+	// Check for IF EXISTS
+	ifExists := false
+	if p.cur.Typ == tKeyword && p.cur.Val == "IF" {
+		p.next()
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		ifExists = true
+	}
+	
+	viewName := p.parseIdentLike()
+	if viewName == "" {
+		return nil, p.errf("expected view name")
+	}
+	
+	return &DropView{
+		Name:     viewName,
+		IfExists: ifExists,
+	}, nil
+}
+
+func (p *Parser) parseAlter() (Statement, error) {
+	p.next()
+	
+	if err := p.expectKeyword("TABLE"); err != nil {
+		return nil, err
+	}
+	
+	tableName := p.parseIdentLike()
+	if tableName == "" {
+		return nil, p.errf("expected table name")
+	}
+	
+	if err := p.expectKeyword("ADD"); err != nil {
+		return nil, err
+	}
+	
+	// Optional COLUMN keyword
+	if p.cur.Typ == tKeyword && p.cur.Val == "COLUMN" {
+		p.next()
+	}
+	
+	// Parse column definition
+	colName := p.parseIdentLike()
+	if colName == "" {
+		return nil, p.errf("expected column name")
+	}
+	
+	colType := p.parseType()
+	if colType < 0 {
+		return nil, p.errf("unknown column type")
+	}
+	
+	col := storage.Column{
+		Name: colName,
+		Type: colType,
+	}
+	
+	return &AlterTable{
+		Table:     tableName,
+		AddColumn: &col,
+	}, nil
 }
 
 func (p *Parser) parseInsert() (Statement, error) {
@@ -607,11 +948,11 @@ func (p *Parser) parseGroupByClause(sel *Select) error {
 			return err
 		}
 		for {
-			id := p.parseIdentLike()
-			if id == "" {
-				return p.errf("GROUP BY expects column")
+			expr, err := p.parseExpr()
+			if err != nil {
+				return err
 			}
-			sel.GroupBy = append(sel.GroupBy, VarRef{Name: id})
+			sel.GroupBy = append(sel.GroupBy, expr)
 			if p.cur.Typ == tSymbol && p.cur.Val == "," {
 				p.next()
 				continue
@@ -1064,6 +1405,66 @@ func (p *Parser) parseCmp() (Expr, error) {
 		return nil, err
 	}
 	for {
+		// Check for NOT IN or NOT LIKE
+		negate := false
+		if p.cur.Typ == tKeyword && p.cur.Val == "NOT" {
+			// Peek ahead to see if it's IN or LIKE
+			if p.peek.Typ == tKeyword && (p.peek.Val == "IN" || p.peek.Val == "LIKE") {
+				negate = true
+				p.next() // Consume NOT
+				// Continue with IN/LIKE parsing below
+			} else {
+				// Not IN/LIKE, stop here
+				break
+			}
+		}
+		
+		// Check for IN operator
+		if p.cur.Typ == tKeyword && p.cur.Val == "IN" {
+			p.next()
+			if err := p.expectSymbol("("); err != nil {
+				return nil, err
+			}
+			var values []Expr
+			for {
+				val, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				values = append(values, val)
+				if p.cur.Typ == tSymbol && p.cur.Val == "," {
+					p.next()
+					continue
+				}
+				if err := p.expectSymbol(")"); err != nil {
+					return nil, err
+				}
+				break
+			}
+			l = &InExpr{Expr: l, Values: values, Negate: negate}
+			continue
+		}
+		
+		// Check for LIKE operator
+		if p.cur.Typ == tKeyword && p.cur.Val == "LIKE" {
+			p.next()
+			pattern, err := p.parseAddSub()
+			if err != nil {
+				return nil, err
+			}
+			var escape Expr
+			if p.cur.Typ == tKeyword && p.cur.Val == "ESCAPE" {
+				p.next()
+				escape, err = p.parseAddSub()
+				if err != nil {
+					return nil, err
+				}
+			}
+			l = &LikeExpr{Expr: l, Pattern: pattern, Escape: escape, Negate: negate}
+			continue
+		}
+		
+		// Regular comparison operators
 		if p.cur.Typ == tSymbol {
 			switch p.cur.Val {
 			case "=", "!=", "<>", "<", "<=", ">", ">=":
@@ -1150,10 +1551,23 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		return &Literal{Val: s}, nil
 	case tKeyword:
 		switch p.cur.Val {
-		case "COUNT", "SUM", "AVG", "MIN", "MAX", "COALESCE", "NULLIF",
+		case "CASE":
+			return p.parseCaseExpr()
+		case "SELECT":
+			sel, err := p.parseSelect()
+			if err != nil {
+				return nil, err
+			}
+			return &SubqueryExpr{Select: sel}, nil
+		case "COUNT", "SUM", "AVG", "MIN", "MAX", "MEDIAN", "COALESCE", "NULLIF",
 			"JSON_GET", "JSON_SET", "JSON_EXTRACT",
 			"NOW", "CURRENT_TIME", "CURRENT_DATE", "DATEDIFF",
-			"LTRIM", "RTRIM", "TRIM", "ISNULL":
+			"LTRIM", "RTRIM", "TRIM", "ISNULL",
+			"BASE64", "BASE64_DECODE",
+			"UPPER", "LOWER", "CONCAT", "LENGTH", "SUBSTRING", "SUBSTR",
+			"LEFT", "RIGHT",
+			"MD5", "SHA1", "SHA256", "SHA512",
+			"CAST":
 			return p.parseFuncCall()
 		case "TRUE":
 			p.next()
@@ -1170,6 +1584,12 @@ func (p *Parser) parsePrimary() (Expr, error) {
 	case tIdent:
 		name := p.cur.Val
 		p.next()
+		// Check if it's a function call
+		if p.cur.Typ == tSymbol && p.cur.Val == "(" {
+			// This is a function call with an identifier
+			// Put the current position back and parse as function
+			return p.parseFuncCallWithName(name)
+		}
 		return &VarRef{Name: name}, nil
 	case tSymbol:
 		if p.cur.Val == "(" {
@@ -1184,14 +1604,89 @@ func (p *Parser) parsePrimary() (Expr, error) {
 			return e, nil
 		}
 	}
+
 	return nil, p.errf("unexpected token %q", p.cur.Val)
+}
+
+func (p *Parser) parseCaseExpr() (Expr, error) {
+	p.next() // consume CASE
+	var operand Expr
+	var err error
+	if !(p.cur.Typ == tKeyword && p.cur.Val == "WHEN") {
+		operand, err = p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+	}
+	whens := make([]CaseWhen, 0, 2)
+	for {
+		if err := p.expectKeyword("WHEN"); err != nil {
+			return nil, err
+		}
+		cond, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("THEN"); err != nil {
+			return nil, err
+		}
+		res, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		whens = append(whens, CaseWhen{When: cond, Then: res})
+		if !(p.cur.Typ == tKeyword && p.cur.Val == "WHEN") {
+			break
+		}
+	}
+	var elseExpr Expr
+	if p.cur.Typ == tKeyword && p.cur.Val == "ELSE" {
+		p.next()
+		elseExpr, err = p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+	}
+	if p.cur.Typ != tKeyword || p.cur.Val != "END" {
+		return nil, p.errf("expected END to close CASE expression")
+	}
+	p.next()
+	return &CaseExpr{Operand: operand, Whens: whens, Else: elseExpr}, nil
 }
 func (p *Parser) parseFuncCall() (Expr, error) {
 	name := p.cur.Val
 	p.next()
+	return p.parseFuncCallWithName(name)
+}
+
+func (p *Parser) parseFuncCallWithName(name string) (Expr, error) {
 	if err := p.expectSymbol("("); err != nil {
 		return nil, err
 	}
+	
+	// Handle CAST(expr AS type) specially
+	if name == "CAST" {
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("AS"); err != nil {
+			return nil, err
+		}
+		// Parse the type as an identifier/keyword
+		if p.cur.Typ != tKeyword && p.cur.Typ != tIdent {
+			return nil, p.errf("expected type name after AS")
+		}
+		typeName := p.cur.Val
+		p.next()
+		if err := p.expectSymbol(")"); err != nil {
+			return nil, err
+		}
+		// Return CAST as a function with the type as a literal string
+		return &FuncCall{Name: name, Args: []Expr{expr, &Literal{Val: typeName}}}, nil
+	}
+	
+	// Handle COUNT(*)
 	if name == "COUNT" && p.cur.Typ == tSymbol && p.cur.Val == "*" {
 		p.next()
 		if err := p.expectSymbol(")"); err != nil {
@@ -1199,6 +1694,14 @@ func (p *Parser) parseFuncCall() (Expr, error) {
 		}
 		return &FuncCall{Name: name, Star: true}, nil
 	}
+	
+	// Check for DISTINCT keyword after opening parenthesis
+	distinct := false
+	if p.cur.Typ == tKeyword && p.cur.Val == "DISTINCT" {
+		distinct = true
+		p.next()
+	}
+	
 	var args []Expr
 	if p.cur.Typ != tSymbol || p.cur.Val != ")" {
 		for {
@@ -1217,5 +1720,5 @@ func (p *Parser) parseFuncCall() (Expr, error) {
 	if err := p.expectSymbol(")"); err != nil {
 		return nil, err
 	}
-	return &FuncCall{Name: name, Args: args}, nil
+	return &FuncCall{Name: name, Args: args, Distinct: distinct}, nil
 }

@@ -19,6 +19,11 @@ package engine
 
 import (
 	"context"
+	"crypto/md5"
+	"crypto/sha1"
+	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -60,6 +65,16 @@ func Execute(ctx context.Context, db *storage.DB, tenant string, stmt Statement)
 		return executeCreateTable(env, s)
 	case *DropTable:
 		return executeDropTable(env, s)
+	case *CreateIndex:
+		return executeCreateIndex(env, s)
+	case *DropIndex:
+		return executeDropIndex(env, s)
+	case *CreateView:
+		return executeCreateView(env, s)
+	case *DropView:
+		return executeDropView(env, s)
+	case *AlterTable:
+		return executeAlterTable(env, s)
 	case *Insert:
 		return executeInsert(env, s)
 	case *Update:
@@ -75,10 +90,19 @@ func Execute(ctx context.Context, db *storage.DB, tenant string, stmt Statement)
 // -------------------- Statement Handlers --------------------
 
 func executeCreateTable(env ExecEnv, s *CreateTable) (*ResultSet, error) {
+	// Check IF NOT EXISTS
+	if s.IfNotExists {
+		_, err := env.db.Get(env.tenant, s.Name)
+		if err == nil {
+			// Table already exists, silently succeed
+			return nil, nil
+		}
+	}
+	
 	if s.AsSelect == nil {
 		t := storage.NewTable(s.Name, s.Cols, s.IsTemp)
-		env.db.Put(env.tenant, t)
-		return nil, nil
+		err := env.db.Put(env.tenant, t)
+		return nil, err
 	}
 	rs, err := Execute(env.ctx, env.db, env.tenant, s.AsSelect)
 	if err != nil {
@@ -102,12 +126,88 @@ func executeCreateTable(env ExecEnv, s *CreateTable) (*ResultSet, error) {
 		}
 		t.Rows = append(t.Rows, row)
 	}
-	env.db.Put(env.tenant, t)
-	return nil, nil
+	err = env.db.Put(env.tenant, t)
+	return nil, err
 }
 
 func executeDropTable(env ExecEnv, s *DropTable) (*ResultSet, error) {
+	// Check IF EXISTS
+	if s.IfExists {
+		_, err := env.db.Get(env.tenant, s.Name)
+		if err != nil {
+			// Table doesn't exist, silently succeed
+			return nil, nil
+		}
+	}
 	return nil, env.db.Drop(env.tenant, s.Name)
+}
+
+func executeCreateIndex(env ExecEnv, s *CreateIndex) (*ResultSet, error) {
+	// For now, indexes are a no-op since tinySQL doesn't persist them
+	// In a real implementation, this would store index metadata
+	if s.IfNotExists {
+		// Could check if index already exists
+	}
+	// Log or store index information if needed
+	return nil, nil
+}
+
+func executeDropIndex(env ExecEnv, s *DropIndex) (*ResultSet, error) {
+	// For now, indexes are a no-op since tinySQL doesn't persist them
+	if s.IfExists {
+		// Could check if index exists
+	}
+	return nil, nil
+}
+
+func executeCreateView(env ExecEnv, s *CreateView) (*ResultSet, error) {
+	// Views are not currently stored in tinySQL
+	// In a full implementation, we would store the SELECT statement
+	// and execute it when the view is queried
+	if s.IfNotExists && !s.OrReplace {
+		// Could check if view already exists
+	}
+	// For now, return success
+	return nil, nil
+}
+
+func executeDropView(env ExecEnv, s *DropView) (*ResultSet, error) {
+	// Views are not currently stored in tinySQL
+	if s.IfExists {
+		// Could check if view exists
+	}
+	return nil, nil
+}
+
+func executeAlterTable(env ExecEnv, s *AlterTable) (*ResultSet, error) {
+	// Get the table
+	t, err := env.db.Get(env.tenant, s.Table)
+	if err != nil {
+		return nil, err
+	}
+	
+	// Handle ADD COLUMN
+	if s.AddColumn != nil {
+		// Check if column already exists
+		for _, col := range t.Cols {
+			if col.Name == s.AddColumn.Name {
+				return nil, fmt.Errorf("column %q already exists", s.AddColumn.Name)
+			}
+		}
+		
+		// Add the new column to table schema
+		t.Cols = append(t.Cols, *s.AddColumn)
+		
+		// Add NULL values for existing rows
+		for i := range t.Rows {
+			t.Rows[i] = append(t.Rows[i], nil)
+		}
+		
+		// Update the table
+		env.db.Put(env.tenant, t)
+	}
+	
+	return nil, nil
 }
 
 func executeInsert(env ExecEnv, s *Insert) (*ResultSet, error) {
@@ -633,7 +733,7 @@ func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []str
 		}
 		var parts []string
 		for _, g := range s.GroupBy {
-			v, err := evalExpr(env, &g, r)
+			v, err := evalExpr(env, g, r)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -938,6 +1038,14 @@ func evalExpr(env ExecEnv, e Expr, row Row) (any, error) {
 		return evalBinary(env, ex, row)
 	case *FuncCall:
 		return evalFuncCall(env, ex, row)
+	case *InExpr:
+		return evalIn(env, ex, row)
+	case *LikeExpr:
+		return evalLike(env, ex, row)
+	case *CaseExpr:
+		return evalCaseExpr(env, ex, row)
+	case *SubqueryExpr:
+		return evalSubqueryExpr(env, ex)
 	}
 	return nil, fmt.Errorf("unknown expression")
 }
@@ -965,6 +1073,204 @@ func evalIsNull(env ExecEnv, ex *IsNull, row Row) (any, error) {
 		return !is, nil
 	}
 	return is, nil
+}
+
+func evalIn(env ExecEnv, ex *InExpr, row Row) (any, error) {
+	val, err := evalExpr(env, ex.Expr, row)
+	if err != nil {
+		return nil, err
+	}
+	
+	// Check against each value in the list
+	for _, valExpr := range ex.Values {
+		listVal, err := evalExpr(env, valExpr, row)
+		if err != nil {
+			return nil, err
+		}
+		
+		// Compare values
+		cmp, err := compare(val, listVal)
+		if err == nil && cmp == 0 {
+			// Found a match
+			if ex.Negate {
+				return false, nil
+			}
+			return true, nil
+		}
+	}
+	
+	// No match found
+	if ex.Negate {
+		return true, nil
+	}
+	return false, nil
+}
+
+func evalLike(env ExecEnv, ex *LikeExpr, row Row) (any, error) {
+	val, err := evalExpr(env, ex.Expr, row)
+	if err != nil {
+		return nil, err
+	}
+	
+	patternVal, err := evalExpr(env, ex.Pattern, row)
+	if err != nil {
+		return nil, err
+	}
+	
+	// Convert to strings
+	str, ok := val.(string)
+	if !ok {
+		str = fmt.Sprintf("%v", val)
+	}
+	
+	pattern, ok := patternVal.(string)
+	if !ok {
+		pattern = fmt.Sprintf("%v", patternVal)
+	}
+	
+	// Get escape character if specified
+	escapeChar := '\\'
+	if ex.Escape != nil {
+		escapeVal, err := evalExpr(env, ex.Escape, row)
+		if err != nil {
+			return nil, err
+		}
+		escapeStr, ok := escapeVal.(string)
+		if !ok || len(escapeStr) != 1 {
+			return nil, fmt.Errorf("ESCAPE must be a single character")
+		}
+		escapeChar = rune(escapeStr[0])
+	}
+	
+	// Match pattern
+	matched := matchLikePattern(str, pattern, escapeChar)
+	
+	if ex.Negate {
+		return !matched, nil
+	}
+	return matched, nil
+}
+
+// matchLikePattern matches a string against a SQL LIKE pattern
+// % matches zero or more characters
+// _ matches exactly one character
+func matchLikePattern(str, pattern string, escape rune) bool {
+	sIdx, pIdx := 0, 0
+	sLen, pLen := len(str), len(pattern)
+	star := -1
+	match := 0
+	
+	for sIdx < sLen {
+		if pIdx < pLen {
+			pChar := rune(pattern[pIdx])
+			
+			// Check for escape character
+			if pChar == escape && pIdx+1 < pLen {
+				// Next character is literal
+				pIdx++
+				if sIdx < sLen && str[sIdx] == pattern[pIdx] {
+					sIdx++
+					pIdx++
+					continue
+				}
+				return false
+			}
+			
+			// Handle wildcard characters
+			if pChar == '%' {
+				star = pIdx
+				match = sIdx
+				pIdx++
+				continue
+			}
+			if pChar == '_' || str[sIdx] == pattern[pIdx] {
+				sIdx++
+				pIdx++
+				continue
+			}
+		}
+		
+		// No match, backtrack to last %
+		if star != -1 {
+			pIdx = star + 1
+			match++
+			sIdx = match
+			continue
+		}
+		return false
+	}
+	
+	// Consume remaining % in pattern
+	for pIdx < pLen && pattern[pIdx] == '%' {
+		pIdx++
+	}
+	
+	return pIdx == pLen
+}
+
+func evalCaseExpr(env ExecEnv, ex *CaseExpr, row Row) (any, error) {
+	if ex.Operand != nil {
+		target, err := evalExpr(env, ex.Operand, row)
+		if err != nil {
+			return nil, err
+		}
+		for _, w := range ex.Whens {
+			whenVal, err := evalExpr(env, w.When, row)
+			if err != nil {
+				return nil, err
+			}
+			if cmp, err := compare(target, whenVal); err == nil && cmp == 0 {
+				return evalExpr(env, w.Then, row)
+			}
+		}
+	} else {
+		for _, w := range ex.Whens {
+			cond, err := evalExpr(env, w.When, row)
+			if err != nil {
+				return nil, err
+			}
+			if toTri(cond) == tvTrue {
+				return evalExpr(env, w.Then, row)
+			}
+		}
+	}
+	if ex.Else != nil {
+		return evalExpr(env, ex.Else, row)
+	}
+	return nil, nil
+}
+
+func evalSubqueryExpr(env ExecEnv, ex *SubqueryExpr) (any, error) {
+	rs, err := executeSelect(env, ex.Select)
+	if err != nil {
+		return nil, err
+	}
+	if rs == nil || len(rs.Rows) == 0 {
+		return nil, nil
+	}
+	if len(rs.Rows) > 1 {
+		return nil, fmt.Errorf("scalar subquery returned %d rows", len(rs.Rows))
+	}
+	row := rs.Rows[0]
+	if len(rs.Cols) == 1 {
+		if v, ok := row[strings.ToLower(rs.Cols[0])]; ok {
+			return v, nil
+		}
+	}
+	if len(row) == 1 {
+		for _, v := range row {
+			return v, nil
+		}
+	}
+	for _, col := range rs.Cols {
+		if v, ok := row[strings.ToLower(col)]; ok {
+			return v, nil
+		}
+	}
+	for _, v := range row {
+		return v, nil
+	}
+	return nil, nil
 }
 
 func evalUnary(env ExecEnv, ex *Unary, row Row) (any, error) {
@@ -1117,6 +1423,34 @@ func evalFuncCall(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return evalRTrim(env, ex.Args, row)
 	case "TRIM":
 		return evalTrim(env, ex.Args, row)
+	case "UPPER":
+		return evalUpper(env, ex.Args, row)
+	case "LOWER":
+		return evalLower(env, ex.Args, row)
+	case "CONCAT":
+		return evalConcat(env, ex.Args, row)
+	case "LENGTH", "LEN":
+		return evalLength(env, ex.Args, row)
+	case "SUBSTRING", "SUBSTR":
+		return evalSubstring(env, ex.Args, row)
+	case "MD5":
+		return evalMD5(env, ex.Args, row)
+	case "SHA1":
+		return evalSHA1(env, ex.Args, row)
+	case "SHA256":
+		return evalSHA256(env, ex.Args, row)
+	case "SHA512":
+		return evalSHA512(env, ex.Args, row)
+	case "BASE64":
+		return evalBase64(env, ex.Args, row)
+	case "BASE64_DECODE":
+		return evalBase64Decode(env, ex.Args, row)
+	case "LEFT":
+		return evalLeft(env, ex.Args, row)
+	case "RIGHT":
+		return evalRight(env, ex.Args, row)
+	case "CAST":
+		return evalCast(env, ex.Args, row)
 	}
 	return nil, fmt.Errorf("unknown function: %s", ex.Name)
 }
@@ -1487,11 +1821,461 @@ func evalIsNullFunc(env ExecEnv, args []Expr, row Row) (any, error) {
 	return val == nil, nil
 }
 
+// String manipulation functions - UPPER, LOWER, CONCAT, LENGTH, SUBSTRING
+
+func evalUpper(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("UPPER expects 1 argument")
+	}
+
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+
+	if val == nil {
+		return nil, nil
+	}
+
+	str, ok := val.(string)
+	if !ok {
+		str = fmt.Sprintf("%v", val)
+	}
+
+	return strings.ToUpper(str), nil
+}
+
+func evalLower(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("LOWER expects 1 argument")
+	}
+
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+
+	if val == nil {
+		return nil, nil
+	}
+
+	str, ok := val.(string)
+	if !ok {
+		str = fmt.Sprintf("%v", val)
+	}
+
+	return strings.ToLower(str), nil
+}
+
+func evalConcat(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) == 0 {
+		return "", nil
+	}
+
+	var sb strings.Builder
+	for _, arg := range args {
+		val, err := evalExpr(env, arg, row)
+		if err != nil {
+			return nil, err
+		}
+
+		if val != nil {
+			str, ok := val.(string)
+			if !ok {
+				str = fmt.Sprintf("%v", val)
+			}
+			sb.WriteString(str)
+		}
+	}
+
+	return sb.String(), nil
+}
+
+func evalLength(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("LENGTH expects 1 argument")
+	}
+
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+
+	if val == nil {
+		return nil, nil
+	}
+
+	str, ok := val.(string)
+	if !ok {
+		str = fmt.Sprintf("%v", val)
+	}
+
+	return len(str), nil
+}
+
+func evalSubstring(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) < 2 || len(args) > 3 {
+		return nil, fmt.Errorf("SUBSTRING expects 2 or 3 arguments")
+	}
+
+	// Get string value
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if val == nil {
+		return nil, nil
+	}
+
+	str, ok := val.(string)
+	if !ok {
+		str = fmt.Sprintf("%v", val)
+	}
+
+	// Get start position (1-indexed in SQL)
+	startVal, err := evalExpr(env, args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	startAny, err := coerceToInt(startVal)
+	if err != nil {
+		return nil, fmt.Errorf("SUBSTRING start position must be numeric")
+	}
+	start, ok := startAny.(int)
+	if !ok {
+		return nil, fmt.Errorf("SUBSTRING start position must be an integer")
+	}
+	start = start - 1 // Convert to 0-indexed
+	if start < 0 {
+		start = 0
+	}
+	if start >= len(str) {
+		return "", nil
+	}
+
+	// Get length if provided
+	if len(args) == 3 {
+		lengthVal, err := evalExpr(env, args[2], row)
+		if err != nil {
+			return nil, err
+		}
+		lengthAny, err := coerceToInt(lengthVal)
+		if err != nil {
+			return nil, fmt.Errorf("SUBSTRING length must be numeric")
+		}
+		length, ok := lengthAny.(int)
+		if !ok {
+			return nil, fmt.Errorf("SUBSTRING length must be an integer")
+		}
+
+		end := start + length
+		if end > len(str) {
+			end = len(str)
+		}
+		return str[start:end], nil
+	}
+
+	return str[start:], nil
+}
+
+func evalLeft(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("LEFT expects 2 arguments")
+	}
+
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if val == nil {
+		return nil, nil
+	}
+
+	str, ok := val.(string)
+	if !ok {
+		str = fmt.Sprintf("%v", val)
+	}
+
+	lenVal, err := evalExpr(env, args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	lenAny, err := coerceToInt(lenVal)
+	if err != nil {
+		return nil, fmt.Errorf("LEFT length must be numeric")
+	}
+	length, ok := lenAny.(int)
+	if !ok {
+		return nil, fmt.Errorf("LEFT length must be an integer")
+	}
+
+	if length < 0 {
+		return "", nil
+	}
+	if length > len(str) {
+		return str, nil
+	}
+	return str[:length], nil
+}
+
+func evalRight(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("RIGHT expects 2 arguments")
+	}
+
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if val == nil {
+		return nil, nil
+	}
+
+	str, ok := val.(string)
+	if !ok {
+		str = fmt.Sprintf("%v", val)
+	}
+
+	lenVal, err := evalExpr(env, args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	lenAny, err := coerceToInt(lenVal)
+	if err != nil {
+		return nil, fmt.Errorf("RIGHT length must be numeric")
+	}
+	length, ok := lenAny.(int)
+	if !ok {
+		return nil, fmt.Errorf("RIGHT length must be an integer")
+	}
+
+	if length < 0 {
+		return "", nil
+	}
+	if length > len(str) {
+		return str, nil
+	}
+	return str[len(str)-length:], nil
+}
+
+func evalCast(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("CAST expects 2 arguments")
+	}
+
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+
+	typeExpr, ok := args[1].(*VarRef)
+	if !ok {
+		lit, ok := args[1].(*Literal)
+		if !ok {
+			return nil, fmt.Errorf("CAST type must be a type name")
+		}
+		typeStr, ok := lit.Val.(string)
+		if !ok {
+			return nil, fmt.Errorf("CAST type must be a string")
+		}
+		return castValue(val, strings.ToUpper(typeStr))
+	}
+
+	return castValue(val, strings.ToUpper(typeExpr.Name))
+}
+
+func castValue(val any, targetType string) (any, error) {
+	if val == nil {
+		return nil, nil
+	}
+
+	switch targetType {
+	case "TEXT", "STRING", "VARCHAR", "CHAR":
+		return fmt.Sprintf("%v", val), nil
+	case "INT", "INTEGER":
+		return coerceToInt(val)
+	case "FLOAT", "REAL", "DOUBLE", "NUMERIC":
+		if f, ok := numeric(val); ok {
+			return f, nil
+		}
+		str := fmt.Sprintf("%v", val)
+		return strconv.ParseFloat(str, 64)
+	case "BOOL", "BOOLEAN":
+		switch v := val.(type) {
+		case bool:
+			return v, nil
+		case int:
+			return v != 0, nil
+		case float64:
+			return v != 0, nil
+		case string:
+			return strings.ToLower(v) == "true" || v == "1", nil
+		}
+		return false, nil
+	default:
+		return nil, fmt.Errorf("unsupported cast type: %s", targetType)
+	}
+}
+
+// Hashing functions - MD5, SHA1, SHA256, SHA512
+
+func evalMD5(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("MD5 expects 1 argument")
+	}
+
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+
+	if val == nil {
+		return nil, nil
+	}
+
+	str, ok := val.(string)
+	if !ok {
+		str = fmt.Sprintf("%v", val)
+	}
+
+	// MD5 hash
+	hasher := md5.New()
+	hasher.Write([]byte(str))
+	return fmt.Sprintf("%x", hasher.Sum(nil)), nil
+}
+
+func evalSHA1(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("SHA1 expects 1 argument")
+	}
+
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+
+	if val == nil {
+		return nil, nil
+	}
+
+	str, ok := val.(string)
+	if !ok {
+		str = fmt.Sprintf("%v", val)
+	}
+
+	// SHA1 hash
+	hasher := sha1.New()
+	hasher.Write([]byte(str))
+	return fmt.Sprintf("%x", hasher.Sum(nil)), nil
+}
+
+func evalSHA256(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("SHA256 expects 1 argument")
+	}
+
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+
+	if val == nil {
+		return nil, nil
+	}
+
+	str, ok := val.(string)
+	if !ok {
+		str = fmt.Sprintf("%v", val)
+	}
+
+	// SHA256 hash
+	hasher := sha256.New()
+	hasher.Write([]byte(str))
+	return fmt.Sprintf("%x", hasher.Sum(nil)), nil
+}
+
+func evalSHA512(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("SHA512 expects 1 argument")
+	}
+
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+
+	if val == nil {
+		return nil, nil
+	}
+
+	str, ok := val.(string)
+	if !ok {
+		str = fmt.Sprintf("%v", val)
+	}
+
+	// SHA512 hash
+	hasher := sha512.New()
+	hasher.Write([]byte(str))
+	return fmt.Sprintf("%x", hasher.Sum(nil)), nil
+}
+
+func evalBase64(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("BASE64 expects 1 argument")
+	}
+
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+
+	if val == nil {
+		return nil, nil
+	}
+
+	str, ok := val.(string)
+	if !ok {
+		str = fmt.Sprintf("%v", val)
+	}
+
+	// Base64 encode
+	encoded := base64.StdEncoding.EncodeToString([]byte(str))
+	return encoded, nil
+}
+
+func evalBase64Decode(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("BASE64_DECODE expects 1 argument")
+	}
+
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+
+	if val == nil {
+		return nil, nil
+	}
+
+	str, ok := val.(string)
+	if !ok {
+		str = fmt.Sprintf("%v", val)
+	}
+
+	// Base64 decode
+	decoded, err := base64.StdEncoding.DecodeString(str)
+	if err != nil {
+		return nil, fmt.Errorf("BASE64_DECODE: %v", err)
+	}
+
+	return string(decoded), nil
+}
+
 func isAggregate(e Expr) bool {
 	switch ex := e.(type) {
 	case *FuncCall:
 		switch ex.Name {
-		case "COUNT", "SUM", "AVG", "MIN", "MAX":
+		case "COUNT", "SUM", "AVG", "MIN", "MAX", "MEDIAN":
 			return true
 		}
 	case *Unary:
@@ -1500,6 +2284,18 @@ func isAggregate(e Expr) bool {
 		return isAggregate(ex.Left) || isAggregate(ex.Right)
 	case *IsNull:
 		return isAggregate(ex.Expr)
+	case *CaseExpr:
+		if ex.Operand != nil && isAggregate(ex.Operand) {
+			return true
+		}
+		for _, w := range ex.Whens {
+			if isAggregate(w.When) || isAggregate(w.Then) {
+				return true
+			}
+		}
+		if ex.Else != nil && isAggregate(ex.Else) {
+			return true
+		}
 	}
 	return false
 }
@@ -1514,6 +2310,8 @@ func evalAggregate(env ExecEnv, e Expr, rows []Row) (any, error) {
 		return evalAggregateBinary(env, ex, rows)
 	case *IsNull:
 		return evalAggregateIsNull(env, ex, rows)
+	case *CaseExpr:
+		return evalAggregateCase(env, ex, rows)
 	default:
 		if len(rows) == 0 {
 			return nil, nil
@@ -1530,8 +2328,35 @@ func evalAggregateFuncCall(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 		return evalAggregateSumAvg(env, ex, rows)
 	case "MIN", "MAX":
 		return evalAggregateMinMax(env, ex, rows)
+	case "MEDIAN":
+		return evalAggregateMedian(env, ex, rows)
+	default:
+		// For non-aggregate functions like DATEDIFF, LEFT, etc., evaluate their arguments
+		// in the aggregate context first, then call the function
+		if len(rows) == 0 {
+			return nil, nil
+		}
+		
+		// Create a new FuncCall with evaluated arguments
+		evaledArgs := make([]Expr, len(ex.Args))
+		for i, arg := range ex.Args {
+			val, err := evalAggregate(env, arg, rows)
+			if err != nil {
+				return nil, err
+			}
+			evaledArgs[i] = &Literal{Val: val}
+		}
+		
+		evaledFunc := &FuncCall{
+			Name: ex.Name,
+			Args: evaledArgs,
+			Star: ex.Star,
+			Distinct: ex.Distinct,
+		}
+		
+		// Now evaluate the function normally with a single row
+		return evalFuncCall(env, evaledFunc, rows[0])
 	}
-	return nil, fmt.Errorf("unsupported aggregate function: %s", ex.Name)
 }
 
 func evalAggregateCount(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
@@ -1541,6 +2366,28 @@ func evalAggregateCount(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 	if len(ex.Args) != 1 {
 		return nil, fmt.Errorf("COUNT expects 1 arg")
 	}
+	
+	// Handle COUNT(DISTINCT col)
+	if ex.Distinct {
+		seen := make(map[string]bool)
+		for _, r := range rows {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, err
+			}
+			v, err := evalExpr(env, ex.Args[0], r)
+			if err != nil {
+				return nil, err
+			}
+			if v != nil {
+				// Convert to string for deduplication
+				key := fmt.Sprintf("%v", v)
+				seen[key] = true
+			}
+		}
+		return len(seen), nil
+	}
+	
+	// Regular COUNT(col)
 	cnt := 0
 	for _, r := range rows {
 		if err := checkCtx(env.ctx); err != nil {
@@ -1623,6 +2470,40 @@ func evalAggregateMinMax(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 	return best, nil
 }
 
+func evalAggregateMedian(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
+	if len(ex.Args) != 1 {
+		return nil, fmt.Errorf("MEDIAN expects 1 arg")
+	}
+	var values []float64
+	for _, r := range rows {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, err
+		}
+		v, err := evalExpr(env, ex.Args[0], r)
+		if err != nil {
+			return nil, err
+		}
+		if f, ok := numeric(v); ok {
+			values = append(values, f)
+		}
+	}
+	if len(values) == 0 {
+		return nil, nil
+	}
+	
+	// Sort values
+	sort.Float64s(values)
+	
+	// Calculate median
+	n := len(values)
+	if n%2 == 1 {
+		// Odd number of values - return middle value
+		return values[n/2], nil
+	}
+	// Even number of values - return average of two middle values
+	return (values[n/2-1] + values[n/2]) / 2.0, nil
+}
+
 func evalAggregateUnary(env ExecEnv, ex *Unary, rows []Row) (any, error) {
 	v, err := evalAggregate(env, ex.Expr, rows)
 	if err != nil {
@@ -1672,6 +2553,38 @@ func evalAggregateIsNull(env ExecEnv, ex *IsNull, rows []Row) (any, error) {
 		return !isNull(v), nil
 	}
 	return isNull(v), nil
+}
+
+func evalAggregateCase(env ExecEnv, ex *CaseExpr, rows []Row) (any, error) {
+	if ex.Operand != nil {
+		target, err := evalAggregate(env, ex.Operand, rows)
+		if err != nil {
+			return nil, err
+		}
+		for _, w := range ex.Whens {
+			whenVal, err := evalAggregate(env, w.When, rows)
+			if err != nil {
+				return nil, err
+			}
+			if cmp, err := compare(target, whenVal); err == nil && cmp == 0 {
+				return evalAggregate(env, w.Then, rows)
+			}
+		}
+	} else {
+		for _, w := range ex.Whens {
+			cond, err := evalAggregate(env, w.When, rows)
+			if err != nil {
+				return nil, err
+			}
+			if toTri(cond) == tvTrue {
+				return evalAggregate(env, w.Then, rows)
+			}
+		}
+	}
+	if ex.Else != nil {
+		return evalAggregate(env, ex.Else, rows)
+	}
+	return nil, nil
 }
 
 func rowsFromTable(t *storage.Table, alias string) ([]Row, []string) {

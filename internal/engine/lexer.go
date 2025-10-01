@@ -189,11 +189,13 @@ func isKeyword(up string) bool {
 	switch up {
 	case "SELECT", "DISTINCT", "FROM", "WHERE", "GROUP", "BY", "HAVING",
 		"ORDER", "ASC", "DESC", "LIMIT", "OFFSET",
+		"CASE", "WHEN", "THEN", "ELSE", "END",
 		"JOIN", "LEFT", "RIGHT", "OUTER", "ON", "AS",
 		"UNION", "ALL", "EXCEPT", "INTERSECT", "WITH",
-		"CREATE", "TABLE", "TEMP", "DROP",
+		"CREATE", "TABLE", "TEMP", "DROP", "ALTER", "ADD", "COLUMN",
 		"INSERT", "INTO", "VALUES",
 		"UPDATE", "SET", "DELETE",
+		"INDEX", "VIEW", "REPLACE", "IF", "EXISTS",
 		"INT", "INT8", "INT16", "INT32", "INT64",
 		"UINT", "UINT8", "UINT16", "UINT32", "UINT64",
 		"FLOAT32", "FLOAT64", "FLOAT", "DOUBLE",
@@ -204,11 +206,14 @@ func isKeyword(up string) bool {
 		"COMPLEX64", "COMPLEX128", "COMPLEX",
 		"POINTER", "PTR", "INTERFACE",
 		"PRIMARY", "FOREIGN", "KEY", "REFERENCES", "UNIQUE",
-		"AND", "OR", "NOT", "IS", "NULL", "TRUE", "FALSE", "IN",
-		"COUNT", "SUM", "AVG", "MIN", "MAX",
+		"AND", "OR", "NOT", "IS", "NULL", "TRUE", "FALSE", "IN", "LIKE", "ESCAPE",
+		"COUNT", "SUM", "AVG", "MIN", "MAX", "MEDIAN",
 		"COALESCE", "NULLIF", "NOW", "CURRENT_TIME", "CURRENT_DATE",
 		"JSON_GET", "JSON_SET", "JSON_EXTRACT", "DATEDIFF",
-		"LTRIM", "RTRIM", "TRIM", "REGEXP", "ISNULL":
+		"LTRIM", "RTRIM", "TRIM", "REGEXP", "ISNULL",
+		"BASE64", "BASE64_DECODE",
+		"UPPER", "LOWER", "CONCAT", "LENGTH", "SUBSTRING", "SUBSTR",
+		"MD5", "SHA1", "SHA256", "SHA512":
 		return true
 	default:
 		return false
