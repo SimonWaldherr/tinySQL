@@ -181,7 +181,7 @@ func TestStorageAdvanced(t *testing.T) {
 		table1 := storage.NewTable("TestTable", []storage.Column{
 			{Name: "ID", Type: storage.IntType},
 		}, false)
-		
+
 		err := db.Put("default", table1)
 		if err != nil {
 			t.Fatalf("Failed to put table: %v", err)

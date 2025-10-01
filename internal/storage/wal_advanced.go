@@ -61,32 +61,32 @@ func (t WALOperationType) String() string {
 type WALRecord struct {
 	// Log Sequence Number - globally unique, monotonically increasing
 	LSN LSN
-	
+
 	// Transaction ID
 	TxID TxID
-	
+
 	// Operation type
 	OpType WALOperationType
-	
+
 	// Tenant and table
 	Tenant string
 	Table  string
-	
+
 	// Row ID (for row-level operations)
 	RowID int64
-	
+
 	// UNDO image (before state) - for rollback
 	BeforeImage []any
-	
+
 	// REDO image (after state) - for recovery
 	AfterImage []any
-	
+
 	// Column information (for schema tracking)
 	Columns []Column
-	
+
 	// Timestamp
 	Timestamp time.Time
-	
+
 	// Checksum for corruption detection
 	Checksum uint32
 }
@@ -94,50 +94,50 @@ type WALRecord struct {
 // AdvancedWAL manages row-level write-ahead logging with full ACID guarantees.
 type AdvancedWAL struct {
 	mu sync.Mutex
-	
+
 	// WAL file path
 	path string
-	
+
 	// Checkpoint path
 	checkpointPath string
-	
+
 	// File handle
 	file *os.File
-	
+
 	// Buffered writer
 	writer *bufio.Writer
-	
+
 	// GOB encoder
 	encoder *gob.Encoder
-	
+
 	// Next LSN to assign
 	nextLSN LSN
-	
+
 	// Checkpoint configuration
 	checkpointEvery    uint64
 	checkpointInterval time.Duration
 	lastCheckpoint     time.Time
 	recordsSinceCP     uint64
-	
+
 	// Active transactions (for recovery)
 	activeTxs map[TxID]*WALTxState
-	
+
 	// Committed LSN (for durability guarantees)
 	committedLSN LSN
-	
+
 	// Flushed LSN (written to disk)
 	flushedLSN LSN
-	
+
 	// Compression enabled
 	compress bool
 }
 
 // WALTxState tracks the state of a transaction in the WAL.
 type WALTxState struct {
-	TxID      TxID
-	StartLSN  LSN
+	TxID       TxID
+	StartLSN   LSN
 	Operations []LSN
-	Status    TxStatus
+	Status     TxStatus
 }
 
 // AdvancedWALConfig configures the advanced WAL.
@@ -155,7 +155,7 @@ func OpenAdvancedWAL(config AdvancedWALConfig) (*AdvancedWAL, error) {
 	if config.Path == "" {
 		return nil, fmt.Errorf("WAL path required")
 	}
-	
+
 	if config.CheckpointEvery == 0 {
 		config.CheckpointEvery = 1000
 	}
@@ -165,21 +165,21 @@ func OpenAdvancedWAL(config AdvancedWALConfig) (*AdvancedWAL, error) {
 	if config.BufferSize == 0 {
 		config.BufferSize = 64 * 1024 // 64KB default
 	}
-	
+
 	// Ensure directory exists
 	dir := filepath.Dir(config.Path)
 	if err := os.MkdirAll(dir, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
 		return nil, fmt.Errorf("create WAL directory: %w", err)
 	}
-	
+
 	// Open or create WAL file
 	file, err := os.OpenFile(config.Path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open WAL file: %w", err)
 	}
-	
+
 	writer := bufio.NewWriterSize(file, config.BufferSize)
-	
+
 	wal := &AdvancedWAL{
 		path:               config.Path,
 		checkpointPath:     config.CheckpointPath,
@@ -192,9 +192,9 @@ func OpenAdvancedWAL(config AdvancedWALConfig) (*AdvancedWAL, error) {
 		compress:           config.Compress,
 		nextLSN:            1,
 	}
-	
+
 	wal.encoder = gob.NewEncoder(writer)
-	
+
 	return wal, nil
 }
 
@@ -202,10 +202,10 @@ func OpenAdvancedWAL(config AdvancedWALConfig) (*AdvancedWAL, error) {
 func (w *AdvancedWAL) LogBegin(txID TxID) (LSN, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	lsn := w.nextLSN
 	w.nextLSN++
-	
+
 	record := &WALRecord{
 		LSN:       lsn,
 		TxID:      txID,
@@ -213,18 +213,18 @@ func (w *AdvancedWAL) LogBegin(txID TxID) (LSN, error) {
 		Timestamp: time.Now(),
 	}
 	record.Checksum = w.calculateChecksum(record)
-	
+
 	if err := w.writeRecord(record); err != nil {
 		return 0, err
 	}
-	
+
 	w.activeTxs[txID] = &WALTxState{
 		TxID:       txID,
 		StartLSN:   lsn,
 		Operations: make([]LSN, 0, 16),
 		Status:     TxStatusInProgress,
 	}
-	
+
 	return lsn, nil
 }
 
@@ -232,31 +232,31 @@ func (w *AdvancedWAL) LogBegin(txID TxID) (LSN, error) {
 func (w *AdvancedWAL) LogInsert(txID TxID, tenant, table string, rowID int64, data []any, cols []Column) (LSN, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	lsn := w.nextLSN
 	w.nextLSN++
-	
+
 	record := &WALRecord{
-		LSN:         lsn,
-		TxID:        txID,
-		OpType:      WALOpInsert,
-		Tenant:      tenant,
-		Table:       table,
-		RowID:       rowID,
-		AfterImage:  data,
-		Columns:     cols,
-		Timestamp:   time.Now(),
+		LSN:        lsn,
+		TxID:       txID,
+		OpType:     WALOpInsert,
+		Tenant:     tenant,
+		Table:      table,
+		RowID:      rowID,
+		AfterImage: data,
+		Columns:    cols,
+		Timestamp:  time.Now(),
 	}
 	record.Checksum = w.calculateChecksum(record)
-	
+
 	if err := w.writeRecord(record); err != nil {
 		return 0, err
 	}
-	
+
 	if txState, exists := w.activeTxs[txID]; exists {
 		txState.Operations = append(txState.Operations, lsn)
 	}
-	
+
 	w.recordsSinceCP++
 	return lsn, nil
 }
@@ -265,10 +265,10 @@ func (w *AdvancedWAL) LogInsert(txID TxID, tenant, table string, rowID int64, da
 func (w *AdvancedWAL) LogUpdate(txID TxID, tenant, table string, rowID int64, before, after []any, cols []Column) (LSN, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	lsn := w.nextLSN
 	w.nextLSN++
-	
+
 	record := &WALRecord{
 		LSN:         lsn,
 		TxID:        txID,
@@ -282,15 +282,15 @@ func (w *AdvancedWAL) LogUpdate(txID TxID, tenant, table string, rowID int64, be
 		Timestamp:   time.Now(),
 	}
 	record.Checksum = w.calculateChecksum(record)
-	
+
 	if err := w.writeRecord(record); err != nil {
 		return 0, err
 	}
-	
+
 	if txState, exists := w.activeTxs[txID]; exists {
 		txState.Operations = append(txState.Operations, lsn)
 	}
-	
+
 	w.recordsSinceCP++
 	return lsn, nil
 }
@@ -299,10 +299,10 @@ func (w *AdvancedWAL) LogUpdate(txID TxID, tenant, table string, rowID int64, be
 func (w *AdvancedWAL) LogDelete(txID TxID, tenant, table string, rowID int64, before []any, cols []Column) (LSN, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	lsn := w.nextLSN
 	w.nextLSN++
-	
+
 	record := &WALRecord{
 		LSN:         lsn,
 		TxID:        txID,
@@ -315,15 +315,15 @@ func (w *AdvancedWAL) LogDelete(txID TxID, tenant, table string, rowID int64, be
 		Timestamp:   time.Now(),
 	}
 	record.Checksum = w.calculateChecksum(record)
-	
+
 	if err := w.writeRecord(record); err != nil {
 		return 0, err
 	}
-	
+
 	if txState, exists := w.activeTxs[txID]; exists {
 		txState.Operations = append(txState.Operations, lsn)
 	}
-	
+
 	w.recordsSinceCP++
 	return lsn, nil
 }
@@ -332,10 +332,10 @@ func (w *AdvancedWAL) LogDelete(txID TxID, tenant, table string, rowID int64, be
 func (w *AdvancedWAL) LogCommit(txID TxID) (LSN, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	lsn := w.nextLSN
 	w.nextLSN++
-	
+
 	record := &WALRecord{
 		LSN:       lsn,
 		TxID:      txID,
@@ -343,24 +343,24 @@ func (w *AdvancedWAL) LogCommit(txID TxID) (LSN, error) {
 		Timestamp: time.Now(),
 	}
 	record.Checksum = w.calculateChecksum(record)
-	
+
 	if err := w.writeRecord(record); err != nil {
 		return 0, err
 	}
-	
+
 	// Flush to ensure durability
 	if err := w.flush(); err != nil {
 		return 0, err
 	}
-	
+
 	if txState, exists := w.activeTxs[txID]; exists {
 		txState.Status = TxStatusCommitted
 		delete(w.activeTxs, txID)
 	}
-	
+
 	w.committedLSN = lsn
 	w.flushedLSN = lsn
-	
+
 	return lsn, nil
 }
 
@@ -368,10 +368,10 @@ func (w *AdvancedWAL) LogCommit(txID TxID) (LSN, error) {
 func (w *AdvancedWAL) LogAbort(txID TxID) (LSN, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	lsn := w.nextLSN
 	w.nextLSN++
-	
+
 	record := &WALRecord{
 		LSN:       lsn,
 		TxID:      txID,
@@ -379,16 +379,16 @@ func (w *AdvancedWAL) LogAbort(txID TxID) (LSN, error) {
 		Timestamp: time.Now(),
 	}
 	record.Checksum = w.calculateChecksum(record)
-	
+
 	if err := w.writeRecord(record); err != nil {
 		return 0, err
 	}
-	
+
 	if txState, exists := w.activeTxs[txID]; exists {
 		txState.Status = TxStatusAborted
 		delete(w.activeTxs, txID)
 	}
-	
+
 	return lsn, nil
 }
 
@@ -396,15 +396,15 @@ func (w *AdvancedWAL) LogAbort(txID TxID) (LSN, error) {
 func (w *AdvancedWAL) Checkpoint(db *DB) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	if w.checkpointPath == "" {
 		return nil
 	}
-	
+
 	// Log checkpoint marker
 	lsn := w.nextLSN
 	w.nextLSN++
-	
+
 	record := &WALRecord{
 		LSN:       lsn,
 		TxID:      0,
@@ -412,42 +412,42 @@ func (w *AdvancedWAL) Checkpoint(db *DB) error {
 		Timestamp: time.Now(),
 	}
 	record.Checksum = w.calculateChecksum(record)
-	
+
 	if err := w.writeRecord(record); err != nil {
 		return err
 	}
-	
+
 	// Flush before checkpoint
 	if err := w.flush(); err != nil {
 		return err
 	}
-	
+
 	// Save database snapshot
 	if err := SaveToFile(db, w.checkpointPath); err != nil {
 		return fmt.Errorf("checkpoint save: %w", err)
 	}
-	
+
 	// Truncate WAL
 	if err := w.file.Close(); err != nil {
 		return err
 	}
-	
+
 	if err := os.Truncate(w.path, 0); err != nil {
 		return err
 	}
-	
+
 	file, err := os.OpenFile(w.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
 	}
-	
+
 	w.file = file
 	w.writer = bufio.NewWriter(file)
 	w.encoder = gob.NewEncoder(w.writer)
 	w.recordsSinceCP = 0
 	w.lastCheckpoint = time.Now()
 	w.nextLSN = 1
-	
+
 	return nil
 }
 
@@ -455,15 +455,15 @@ func (w *AdvancedWAL) Checkpoint(db *DB) error {
 func (w *AdvancedWAL) ShouldCheckpoint() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	if w.recordsSinceCP >= w.checkpointEvery {
 		return true
 	}
-	
+
 	if time.Since(w.lastCheckpoint) >= w.checkpointInterval {
 		return true
 	}
-	
+
 	return false
 }
 
@@ -471,7 +471,7 @@ func (w *AdvancedWAL) ShouldCheckpoint() bool {
 func (w *AdvancedWAL) Recover(db *DB) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	file, err := os.Open(w.path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -480,17 +480,17 @@ func (w *AdvancedWAL) Recover(db *DB) (int, error) {
 		return 0, err
 	}
 	defer file.Close()
-	
+
 	dec := gob.NewDecoder(file)
-	
+
 	// Track pending transactions
 	pending := make(map[TxID][]*WALRecord)
 	committed := make(map[TxID]bool)
 	aborted := make(map[TxID]bool)
-	
+
 	recovered := 0
 	var maxLSN LSN
-	
+
 	for {
 		var record WALRecord
 		if err := dec.Decode(&record); err != nil {
@@ -501,27 +501,27 @@ func (w *AdvancedWAL) Recover(db *DB) (int, error) {
 			fmt.Printf("WAL recovery stopped at LSN %d: %v\n", maxLSN, err)
 			break
 		}
-		
+
 		// Verify checksum
 		expectedChecksum := w.calculateChecksum(&record)
 		if record.Checksum != expectedChecksum {
 			fmt.Printf("WAL checksum mismatch at LSN %d, stopping recovery\n", record.LSN)
 			break
 		}
-		
+
 		if record.LSN > maxLSN {
 			maxLSN = record.LSN
 		}
-		
+
 		switch record.OpType {
 		case WALOpBegin:
 			pending[record.TxID] = make([]*WALRecord, 0)
-			
+
 		case WALOpInsert, WALOpUpdate, WALOpDelete:
 			if _, exists := pending[record.TxID]; exists {
 				pending[record.TxID] = append(pending[record.TxID], &record)
 			}
-			
+
 		case WALOpCommit:
 			committed[record.TxID] = true
 			// Apply all operations for this transaction
@@ -534,11 +534,11 @@ func (w *AdvancedWAL) Recover(db *DB) (int, error) {
 				}
 				delete(pending, record.TxID)
 			}
-			
+
 		case WALOpAbort:
 			aborted[record.TxID] = true
 			delete(pending, record.TxID)
-			
+
 		case WALOpCheckpoint:
 			// Checkpoint marker - clear old pending transactions
 			for txID := range pending {
@@ -548,10 +548,10 @@ func (w *AdvancedWAL) Recover(db *DB) (int, error) {
 			}
 		}
 	}
-	
+
 	// Update next LSN
 	w.nextLSN = maxLSN + 1
-	
+
 	return recovered, nil
 }
 
@@ -569,12 +569,12 @@ func (w *AdvancedWAL) applyOperation(db *DB, record *WALRecord) error {
 			return nil // Ignore delete/update for non-existent table
 		}
 	}
-	
+
 	switch record.OpType {
 	case WALOpInsert:
 		table.Rows = append(table.Rows, record.AfterImage)
 		table.Version++
-		
+
 	case WALOpUpdate:
 		// Find and update the row
 		found := false
@@ -591,7 +591,7 @@ func (w *AdvancedWAL) applyOperation(db *DB, record *WALRecord) error {
 			table.Rows = append(table.Rows, record.AfterImage)
 		}
 		table.Version++
-		
+
 	case WALOpDelete:
 		// Find and remove the row
 		for i, row := range table.Rows {
@@ -602,7 +602,7 @@ func (w *AdvancedWAL) applyOperation(db *DB, record *WALRecord) error {
 		}
 		table.Version++
 	}
-	
+
 	return nil
 }
 
@@ -636,7 +636,7 @@ func (w *AdvancedWAL) flush() error {
 func (w *AdvancedWAL) calculateChecksum(record *WALRecord) uint32 {
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
-	
+
 	// Encode everything except the checksum field
 	enc.Encode(record.LSN)
 	enc.Encode(record.TxID)
@@ -644,7 +644,7 @@ func (w *AdvancedWAL) calculateChecksum(record *WALRecord) uint32 {
 	enc.Encode(record.Tenant)
 	enc.Encode(record.Table)
 	enc.Encode(record.RowID)
-	
+
 	data := buf.Bytes()
 	var sum uint32
 	for _, b := range data {
@@ -657,11 +657,11 @@ func (w *AdvancedWAL) calculateChecksum(record *WALRecord) uint32 {
 func (w *AdvancedWAL) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	if err := w.flush(); err != nil {
 		return err
 	}
-	
+
 	return w.file.Close()
 }
 

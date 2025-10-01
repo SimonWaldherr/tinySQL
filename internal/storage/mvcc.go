@@ -34,36 +34,36 @@ const (
 // MVCCManager coordinates transaction IDs, timestamps, and visibility.
 type MVCCManager struct {
 	mu sync.RWMutex
-	
+
 	// Monotonically increasing transaction ID
 	nextTxID atomic.Uint64
-	
+
 	// Monotonically increasing timestamp
 	nextTimestamp atomic.Uint64
-	
+
 	// Active transactions
 	activeTxs map[TxID]*TxContext
-	
+
 	// Transaction commit timestamps
 	commitLog map[TxID]Timestamp
-	
+
 	// Oldest active transaction (for GC)
 	oldestActive TxID
-	
+
 	// GC watermark - versions older than this can be cleaned
 	gcWatermark Timestamp
 }
 
 // TxContext holds the state of an active transaction.
 type TxContext struct {
-	ID            TxID
-	StartTime     Timestamp
-	Status        TxStatus
-	ReadSnapshot  Timestamp // Snapshot timestamp for reads
-	WriteSet      map[string]map[int64]bool // table -> row IDs modified
-	ReadSet       map[string]map[int64]Timestamp // table -> row IDs read with version
+	ID             TxID
+	StartTime      Timestamp
+	Status         TxStatus
+	ReadSnapshot   Timestamp                      // Snapshot timestamp for reads
+	WriteSet       map[string]map[int64]bool      // table -> row IDs modified
+	ReadSet        map[string]map[int64]Timestamp // table -> row IDs read with version
 	IsolationLevel IsolationLevel
-	mu            sync.RWMutex
+	mu             sync.RWMutex
 }
 
 // IsolationLevel defines transaction isolation semantics.
@@ -80,19 +80,19 @@ const (
 type RowVersion struct {
 	// Transaction that created this version
 	XMin TxID
-	
+
 	// Transaction that deleted/updated this version (0 if still valid)
 	XMax TxID
-	
+
 	// Creation timestamp
 	CreatedAt Timestamp
-	
+
 	// Deletion/update timestamp (0 if still valid)
 	DeletedAt Timestamp
-	
+
 	// Actual row data
 	Data []any
-	
+
 	// Pointer to next version (for version chain)
 	NextVersion *RowVersion
 }
@@ -100,13 +100,13 @@ type RowVersion struct {
 // MVCCTable extends Table with version chains.
 type MVCCTable struct {
 	*Table
-	
+
 	// Version chains: row ID -> latest version
 	versions map[int64]*RowVersion
-	
+
 	// Next row ID
 	nextRowID atomic.Int64
-	
+
 	mu sync.RWMutex
 }
 
@@ -125,7 +125,7 @@ func NewMVCCManager() *MVCCManager {
 func (m *MVCCManager) BeginTx(level IsolationLevel) *TxContext {
 	txID := TxID(m.nextTxID.Add(1))
 	now := Timestamp(m.nextTimestamp.Add(1))
-	
+
 	tx := &TxContext{
 		ID:             txID,
 		StartTime:      now,
@@ -135,12 +135,12 @@ func (m *MVCCManager) BeginTx(level IsolationLevel) *TxContext {
 		ReadSet:        make(map[string]map[int64]Timestamp),
 		IsolationLevel: level,
 	}
-	
+
 	m.mu.Lock()
 	m.activeTxs[txID] = tx
 	m.updateOldestActive()
 	m.mu.Unlock()
-	
+
 	return tx
 }
 
@@ -149,26 +149,26 @@ func (m *MVCCManager) CommitTx(tx *TxContext) (Timestamp, error) {
 	if tx.Status != TxStatusInProgress {
 		return 0, ErrTxNotActive
 	}
-	
+
 	// Serializable isolation: check for conflicts
 	if tx.IsolationLevel == Serializable {
 		if err := m.checkSerializableConflicts(tx); err != nil {
 			return 0, err
 		}
 	}
-	
+
 	commitTS := Timestamp(m.nextTimestamp.Add(1))
-	
+
 	tx.mu.Lock()
 	tx.Status = TxStatusCommitted
 	tx.mu.Unlock()
-	
+
 	m.mu.Lock()
 	m.commitLog[tx.ID] = commitTS
 	delete(m.activeTxs, tx.ID)
 	m.updateOldestActive()
 	m.mu.Unlock()
-	
+
 	return commitTS, nil
 }
 
@@ -177,11 +177,11 @@ func (m *MVCCManager) AbortTx(tx *TxContext) {
 	if tx.Status != TxStatusInProgress {
 		return
 	}
-	
+
 	tx.mu.Lock()
 	tx.Status = TxStatusAborted
 	tx.mu.Unlock()
-	
+
 	m.mu.Lock()
 	delete(m.activeTxs, tx.ID)
 	m.updateOldestActive()
@@ -195,37 +195,37 @@ func (m *MVCCManager) IsVisible(tx *TxContext, rv *RowVersion) bool {
 		// Not deleted by this transaction
 		return rv.XMax == 0 || rv.XMax != tx.ID
 	}
-	
+
 	// Check if creator transaction was committed before our snapshot
 	m.mu.RLock()
 	creatorCommitTS, creatorCommitted := m.commitLog[rv.XMin]
 	m.mu.RUnlock()
-	
+
 	// Creator not committed or committed after our snapshot
 	if !creatorCommitted || creatorCommitTS > tx.ReadSnapshot {
 		return false
 	}
-	
+
 	// Row not deleted
 	if rv.XMax == 0 {
 		return true
 	}
-	
+
 	// Row deleted by this transaction
 	if rv.XMax == tx.ID {
 		return false
 	}
-	
+
 	// Check if deleter transaction was committed before our snapshot
 	m.mu.RLock()
 	deleterCommitTS, deleterCommitted := m.commitLog[rv.XMax]
 	m.mu.RUnlock()
-	
+
 	// Deleter not committed or committed after our snapshot - row still visible
 	if !deleterCommitted || deleterCommitTS > tx.ReadSnapshot {
 		return true
 	}
-	
+
 	// Row was deleted before our snapshot
 	return false
 }
@@ -234,7 +234,7 @@ func (m *MVCCManager) IsVisible(tx *TxContext, rv *RowVersion) bool {
 func (tx *TxContext) RecordRead(table string, rowID int64, version Timestamp) {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
-	
+
 	if tx.ReadSet[table] == nil {
 		tx.ReadSet[table] = make(map[int64]Timestamp)
 	}
@@ -245,7 +245,7 @@ func (tx *TxContext) RecordRead(table string, rowID int64, version Timestamp) {
 func (tx *TxContext) RecordWrite(table string, rowID int64) {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
-	
+
 	if tx.WriteSet[table] == nil {
 		tx.WriteSet[table] = make(map[int64]bool)
 	}
@@ -256,22 +256,22 @@ func (tx *TxContext) RecordWrite(table string, rowID int64) {
 func (m *MVCCManager) checkSerializableConflicts(tx *TxContext) error {
 	tx.mu.RLock()
 	defer tx.mu.RUnlock()
-	
+
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
 	// Check if any concurrent transaction wrote to rows we read
 	// Look at commit log for recently committed transactions
 	for otherTxID, commitTS := range m.commitLog {
 		if otherTxID == tx.ID {
 			continue
 		}
-		
+
 		// Only check transactions that committed after we started
 		if commitTS <= tx.StartTime {
 			continue
 		}
-		
+
 		// This is a simplified check - in a real system we'd need
 		// to track write sets of committed transactions
 		// For now, check if there are any overlapping table accesses
@@ -283,7 +283,7 @@ func (m *MVCCManager) checkSerializableConflicts(tx *TxContext) error {
 			}
 		}
 	}
-	
+
 	return nil
 }
 
@@ -291,14 +291,14 @@ func (m *MVCCManager) checkSerializableConflicts(tx *TxContext) error {
 func (m *MVCCManager) updateOldestActive() {
 	var oldest TxID = 0
 	var oldestTS Timestamp = Timestamp(m.nextTimestamp.Load())
-	
+
 	for txID, tx := range m.activeTxs {
 		if oldest == 0 || txID < oldest {
 			oldest = txID
 			oldestTS = tx.StartTime
 		}
 	}
-	
+
 	m.oldestActive = oldest
 	if oldest == 0 {
 		// No active transactions - can GC up to latest commit
@@ -327,9 +327,9 @@ func NewMVCCTable(name string, cols []Column, isTemp bool) *MVCCTable {
 func (t *MVCCTable) InsertVersion(tx *TxContext, data []any) int64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	
+
 	rowID := t.nextRowID.Add(1)
-	
+
 	rv := &RowVersion{
 		XMin:      tx.ID,
 		XMax:      0,
@@ -337,10 +337,10 @@ func (t *MVCCTable) InsertVersion(tx *TxContext, data []any) int64 {
 		DeletedAt: 0,
 		Data:      data,
 	}
-	
+
 	t.versions[rowID] = rv
 	tx.RecordWrite(t.Name, rowID)
-	
+
 	return rowID
 }
 
@@ -348,16 +348,16 @@ func (t *MVCCTable) InsertVersion(tx *TxContext, data []any) int64 {
 func (t *MVCCTable) UpdateVersion(tx *TxContext, rowID int64, newData []any) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	
+
 	oldVersion := t.versions[rowID]
 	if oldVersion == nil {
 		return ErrRowNotFound
 	}
-	
+
 	// Mark old version as deleted by this transaction
 	oldVersion.XMax = tx.ID
 	oldVersion.DeletedAt = Timestamp(time.Now().UnixNano())
-	
+
 	// Create new version
 	newVersion := &RowVersion{
 		XMin:        tx.ID,
@@ -367,10 +367,10 @@ func (t *MVCCTable) UpdateVersion(tx *TxContext, rowID int64, newData []any) err
 		Data:        newData,
 		NextVersion: oldVersion,
 	}
-	
+
 	t.versions[rowID] = newVersion
 	tx.RecordWrite(t.Name, rowID)
-	
+
 	return nil
 }
 
@@ -378,16 +378,16 @@ func (t *MVCCTable) UpdateVersion(tx *TxContext, rowID int64, newData []any) err
 func (t *MVCCTable) DeleteVersion(tx *TxContext, rowID int64) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	
+
 	version := t.versions[rowID]
 	if version == nil {
 		return ErrRowNotFound
 	}
-	
+
 	version.XMax = tx.ID
 	version.DeletedAt = Timestamp(time.Now().UnixNano())
 	tx.RecordWrite(t.Name, rowID)
-	
+
 	return nil
 }
 
@@ -395,9 +395,9 @@ func (t *MVCCTable) DeleteVersion(tx *TxContext, rowID int64) error {
 func (t *MVCCTable) GetVisibleVersion(mvcc *MVCCManager, tx *TxContext, rowID int64) *RowVersion {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	
+
 	version := t.versions[rowID]
-	
+
 	// Walk the version chain to find a visible version
 	for version != nil {
 		if mvcc.IsVisible(tx, version) {
@@ -406,7 +406,7 @@ func (t *MVCCTable) GetVisibleVersion(mvcc *MVCCManager, tx *TxContext, rowID in
 		}
 		version = version.NextVersion
 	}
-	
+
 	return nil
 }
 
@@ -414,16 +414,16 @@ func (t *MVCCTable) GetVisibleVersion(mvcc *MVCCManager, tx *TxContext, rowID in
 func (t *MVCCTable) GarbageCollect(watermark Timestamp) int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	
+
 	collected := 0
 	toDelete := make([]int64, 0)
-	
+
 	for rowID, version := range t.versions {
 		// Check if latest version is deleted and old enough
 		if version.DeletedAt > 0 && version.DeletedAt < watermark {
 			// Can delete entire chain
 			toDelete = append(toDelete, rowID)
-			
+
 			// Count versions in chain
 			curr := version
 			for curr != nil {
@@ -434,7 +434,7 @@ func (t *MVCCTable) GarbageCollect(watermark Timestamp) int {
 			// Keep the latest version, but clean up old versions in the chain
 			prev := version
 			curr := version.NextVersion
-			
+
 			for curr != nil {
 				if curr.DeletedAt > 0 && curr.DeletedAt < watermark {
 					// Remove this version from chain
@@ -453,18 +453,18 @@ func (t *MVCCTable) GarbageCollect(watermark Timestamp) int {
 			}
 		}
 	}
-	
+
 	// Delete entire chains that are obsolete
 	for _, rowID := range toDelete {
 		delete(t.versions, rowID)
 	}
-	
+
 	return collected
 }
 
 // Errors
 var (
-	ErrTxNotActive           = fmt.Errorf("transaction is not active")
-	ErrSerializationFailure  = fmt.Errorf("could not serialize access due to concurrent update")
-	ErrRowNotFound           = fmt.Errorf("row not found")
+	ErrTxNotActive          = fmt.Errorf("transaction is not active")
+	ErrSerializationFailure = fmt.Errorf("could not serialize access due to concurrent update")
+	ErrRowNotFound          = fmt.Errorf("row not found")
 )

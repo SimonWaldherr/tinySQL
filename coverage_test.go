@@ -10,7 +10,7 @@ import (
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
-// TestDropTable tests the DROP TABLE functionality  
+// TestDropTable tests the DROP TABLE functionality
 func TestDropTable(t *testing.T) {
 	db := storage.NewDB()
 	ctx := context.Background()
@@ -223,7 +223,7 @@ func TestStorageOperations(t *testing.T) {
 		}
 
 		// Verify it's gone
-		_, err = db.Get("default", "test_table") 
+		_, err = db.Get("default", "test_table")
 		if err == nil {
 			t.Fatal("Table should not exist after drop")
 		}
@@ -256,13 +256,13 @@ func TestStorageOperations(t *testing.T) {
 
 // TestQueryCache tests the query cache functionality
 func TestQueryCache(t *testing.T) {
-		cache := engine.NewQueryCache(10)
+	cache := engine.NewQueryCache(10)
 
 	// Test cache operations
 	t.Run("CacheOperations", func(t *testing.T) {
 		sql := "SELECT * FROM test"
 
-		// Cache the statement  
+		// Cache the statement
 		cache.Compile(sql)
 
 		// Verify cache size

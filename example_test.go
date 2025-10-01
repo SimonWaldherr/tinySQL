@@ -1319,11 +1319,11 @@ func TestDateDiffAndTimeAggregation(t *testing.T) {
 		// User Alice sessions
 		"INSERT INTO user_sessions VALUES (1, 'session_A1', 'Alice', '2023-12-01 09:00:00', '2023-12-01 11:00:00')", // 2 hours
 		"INSERT INTO user_sessions VALUES (2, 'session_A2', 'Alice', '2023-12-01 14:30:00', '2023-12-01 18:00:00')", // 3.5 hours
-		
-		// User Bob sessions  
-		"INSERT INTO user_sessions VALUES (3, 'session_B1', 'Bob', '2023-12-01 10:00:00', '2023-12-01 11:30:00')",   // 1.5 hours
-		"INSERT INTO user_sessions VALUES (4, 'session_B2', 'Bob', '2023-12-01 15:00:00', '2023-12-01 19:30:00')",   // 4.5 hours
-		
+
+		// User Bob sessions
+		"INSERT INTO user_sessions VALUES (3, 'session_B1', 'Bob', '2023-12-01 10:00:00', '2023-12-01 11:30:00')", // 1.5 hours
+		"INSERT INTO user_sessions VALUES (4, 'session_B2', 'Bob', '2023-12-01 15:00:00', '2023-12-01 19:30:00')", // 4.5 hours
+
 		// User Carol sessions
 		"INSERT INTO user_sessions VALUES (5, 'session_C1', 'Carol', '2023-12-01 08:00:00', '2023-12-01 12:00:00')", // 4 hours
 		"INSERT INTO user_sessions VALUES (6, 'session_C2', 'Carol', '2023-12-01 13:00:00', '2023-12-01 14:00:00')", // 1 hour
@@ -1388,7 +1388,7 @@ func TestDateDiffAndTimeAggregation(t *testing.T) {
 		}
 
 		expected := expectedDurations[i]
-		
+
 		// Get duration from row
 		duration, ok := tsql.GetVal(row, "duration_hours")
 		if !ok {
@@ -1400,7 +1400,7 @@ func TestDateDiffAndTimeAggregation(t *testing.T) {
 				}
 			}
 		}
-		
+
 		if !ok {
 			t.Fatalf("Could not find duration in row %d: %+v", i, row)
 		}
@@ -1454,7 +1454,7 @@ func TestDateDiffAndTimeAggregation(t *testing.T) {
 		}
 
 		expected := expectedUsers[i]
-		
+
 		userName, ok := tsql.GetVal(row, "user_name")
 		if !ok {
 			for key := range row {
@@ -1487,11 +1487,11 @@ func TestDateDiffAndTimeAggregation(t *testing.T) {
 
 		if ok && ok2 && ok3 {
 			t.Logf("✅ User %v: %v sessions, avg %.1f hours", userName, sessionCount, avgDuration)
-			
+
 			if sessionCount != expected.sessionCount {
 				t.Errorf("User %s: expected %d sessions, got %v", expected.name, expected.sessionCount, sessionCount)
 			}
-			
+
 			// Check if average is reasonable (around 2.5)
 			if avgFloat, ok := avgDuration.(float64); ok && avgFloat >= 2.0 && avgFloat <= 3.0 {
 				t.Logf("✅ Average duration for %s is within expected range", userName)

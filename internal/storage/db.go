@@ -44,35 +44,35 @@ const (
 	Uint16Type
 	Uint32Type
 	Uint64Type
-	
+
 	// Floating point types
 	Float32Type
 	Float64Type
 	FloatType // alias for Float64Type
-	
+
 	// String and character types
 	StringType
 	TextType // alias for StringType
 	RuneType
 	ByteType
-	
+
 	// Boolean type
 	BoolType
-	
+
 	// Time types
 	TimeType
 	DateType
 	DateTimeType
 	TimestampType
 	DurationType
-	
+
 	// Complex types
 	JsonType
 	JsonbType
 	MapType
 	SliceType
 	ArrayType
-	
+
 	// Advanced types
 	Complex64Type
 	Complex128Type
@@ -206,6 +206,7 @@ func NewTable(name string, cols []Column, isTemp bool) *Table {
 	}
 	return &Table{Name: name, Cols: cols, colPos: pos, IsTemp: isTemp}
 }
+
 // ColIndex returns the zero-based index of the named column.
 func (t *Table) ColIndex(name string) (int, error) {
 	i, ok := t.colPos[strings.ToLower(name)]
@@ -224,16 +225,16 @@ type DB struct {
 	mu      sync.RWMutex
 	tenants map[string]*tenantDB
 	wal     *WALManager
-	
+
 	// MVCC coordinator
 	mvcc *MVCCManager
-	
+
 	// Advanced WAL (optional - replaces basic WAL when enabled)
 	advancedWAL *AdvancedWAL
 }
 
 // NewDB creates a new empty database catalog with MVCC support.
-func NewDB() *DB { 
+func NewDB() *DB {
 	return &DB{
 		tenants: map[string]*tenantDB{},
 		mvcc:    NewMVCCManager(),
@@ -259,6 +260,7 @@ func (db *DB) Get(tn, name string) (*Table, error) {
 	}
 	return t, nil
 }
+
 // Put adds a new table to the tenant; returns error if it already exists.
 func (db *DB) Put(tn string, t *Table) error {
 	td := db.getTenant(tn)
@@ -269,6 +271,7 @@ func (db *DB) Put(tn string, t *Table) error {
 	td.tables[lc] = t
 	return nil
 }
+
 // Drop removes a table from the tenant.
 func (db *DB) Drop(tn, name string) error {
 	td := db.getTenant(tn)

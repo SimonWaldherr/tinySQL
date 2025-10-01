@@ -18,9 +18,9 @@ type CacheStrategy int
 
 const (
 	StrategyNone CacheStrategy = iota // No eviction (full in-memory)
-	StrategyLRU                        // Least Recently Used
-	StrategyLFU                        // Least Frequently Used (future)
-	StrategyARC                        // Adaptive Replacement Cache (future)
+	StrategyLRU                       // Least Recently Used
+	StrategyLFU                       // Least Frequently Used (future)
+	StrategyARC                       // Adaptive Replacement Cache (future)
 )
 
 func (s CacheStrategy) String() string {
@@ -42,28 +42,28 @@ func (s CacheStrategy) String() string {
 type MemoryPolicy struct {
 	// Maximum memory usage in bytes (0 = unlimited)
 	MaxMemoryBytes int64
-	
+
 	// Cache eviction strategy
 	Strategy CacheStrategy
-	
+
 	// Start evicting when memory usage exceeds this ratio (0.0-1.0)
 	EvictionThreshold float64
-	
+
 	// Tables that should always stay in memory
 	PinnedTables []string
-	
+
 	// Tables that should never be cached
 	IgnoreTables []string
-	
+
 	// Enable eviction (if false, OOM when limit reached)
 	EnableEviction bool
-	
+
 	// Number of tables to evict in one batch
 	EvictionBatchSize int
-	
+
 	// Track access patterns for better eviction decisions
 	TrackAccessPatterns bool
-	
+
 	// Time window for access tracking
 	AccessWindow time.Duration
 }
@@ -97,35 +97,35 @@ func LimitedMemoryPolicy(maxMB int64) *MemoryPolicy {
 // BufferPool manages in-memory tables with configurable eviction.
 type BufferPool struct {
 	policy *MemoryPolicy
-	
+
 	// Current memory usage (atomic for lock-free reads)
 	currentMemory atomic.Int64
-	
+
 	// Table cache: tenant -> table name -> cached table
 	cache map[string]map[string]*CachedTable
-	
+
 	// LRU eviction queue
 	lru *LRUQueue
-	
+
 	// Access statistics
 	stats *CacheStats
-	
+
 	mu sync.RWMutex
 }
 
 // CachedTable wraps a table with caching metadata.
 type CachedTable struct {
-	Table      *Table
-	Size       int64
-	LoadedAt   time.Time
-	LastAccess time.Time
+	Table       *Table
+	Size        int64
+	LoadedAt    time.Time
+	LastAccess  time.Time
 	AccessCount int64
-	Pinned     bool
-	
+	Pinned      bool
+
 	// Disk location (for lazy loading - future)
 	OnDisk     bool
 	DiskOffset int64
-	
+
 	mu sync.RWMutex
 }
 
@@ -150,17 +150,17 @@ type CacheStats struct {
 	MemoryUsed        int64
 	MemoryLimit       int64
 	MemoryUtilization float64
-	
-	CacheHits         int64
-	CacheMisses       int64
-	HitRate           float64
-	
-	EvictionCount     int64
-	EvictionSize      int64
-	
-	TablesInMemory    int
-	TablesOnDisk      int
-	
+
+	CacheHits   int64
+	CacheMisses int64
+	HitRate     float64
+
+	EvictionCount int64
+	EvictionSize  int64
+
+	TablesInMemory int
+	TablesOnDisk   int
+
 	mu sync.RWMutex
 }
 
@@ -169,14 +169,14 @@ func NewBufferPool(policy *MemoryPolicy) *BufferPool {
 	if policy == nil {
 		policy = DefaultMemoryPolicy()
 	}
-	
+
 	bp := &BufferPool{
 		policy: policy,
 		cache:  make(map[string]map[string]*CachedTable),
 		lru:    NewLRUQueue(),
 		stats:  &CacheStats{MemoryLimit: policy.MaxMemoryBytes},
 	}
-	
+
 	bp.currentMemory.Store(0)
 	return bp
 }
@@ -192,40 +192,40 @@ func NewLRUQueue() *LRUQueue {
 func (bp *BufferPool) Put(tenant, name string, table *Table) error {
 	tableSize := EstimateTableSize(table)
 	key := fmt.Sprintf("%s:%s", tenant, name)
-	
+
 	// Check if table is pinned or should be ignored
 	pinned := bp.isPinned(name)
 	ignored := bp.isIgnored(name)
-	
+
 	if ignored {
 		return nil // Don't cache
 	}
-	
+
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
-	
+
 	// Check memory limit
 	if bp.policy.MaxMemoryBytes > 0 && !pinned {
 		currentMem := bp.currentMemory.Load()
 		newTotal := currentMem + tableSize
 		threshold := int64(float64(bp.policy.MaxMemoryBytes) * bp.policy.EvictionThreshold)
-		
+
 		if newTotal > threshold {
 			if bp.policy.EnableEviction {
 				// Evict to make space
 				bp.evictLRU(tableSize)
 			} else {
-				return fmt.Errorf("memory limit exceeded: %d/%d bytes", 
+				return fmt.Errorf("memory limit exceeded: %d/%d bytes",
 					currentMem, bp.policy.MaxMemoryBytes)
 			}
 		}
 	}
-	
+
 	// Get or create tenant cache
 	if bp.cache[tenant] == nil {
 		bp.cache[tenant] = make(map[string]*CachedTable)
 	}
-	
+
 	// Check if table already cached
 	if cached, exists := bp.cache[tenant][name]; exists {
 		// Update existing
@@ -234,10 +234,10 @@ func (bp *BufferPool) Put(tenant, name string, table *Table) error {
 		cached.Size = tableSize
 		cached.LastAccess = time.Now()
 		cached.AccessCount++
-		
+
 		// Update memory usage
 		bp.currentMemory.Add(tableSize - oldSize)
-		
+
 		// Update LRU
 		bp.lru.Access(key, cached)
 	} else {
@@ -250,29 +250,29 @@ func (bp *BufferPool) Put(tenant, name string, table *Table) error {
 			AccessCount: 1,
 			Pinned:      pinned,
 		}
-		
+
 		bp.cache[tenant][name] = cached
 		bp.currentMemory.Add(tableSize)
-		
+
 		// Add to LRU
 		bp.lru.Add(key, cached)
-		
+
 		// Update stats
 		bp.stats.mu.Lock()
 		bp.stats.TablesInMemory++
 		bp.stats.mu.Unlock()
 	}
-	
+
 	// Update stats
 	bp.updateStats()
-	
+
 	return nil
 }
 
 // Get retrieves a table from the buffer pool.
 func (bp *BufferPool) Get(tenant, name string) (*Table, bool) {
 	key := fmt.Sprintf("%s:%s", tenant, name)
-	
+
 	bp.mu.RLock()
 	tenantCache, tenantExists := bp.cache[tenant]
 	if !tenantExists {
@@ -280,50 +280,50 @@ func (bp *BufferPool) Get(tenant, name string) (*Table, bool) {
 		bp.recordMiss()
 		return nil, false
 	}
-	
+
 	cached, tableExists := tenantCache[name]
 	bp.mu.RUnlock()
-	
+
 	if !tableExists {
 		bp.recordMiss()
 		return nil, false
 	}
-	
+
 	// Update access time
 	cached.mu.Lock()
 	cached.LastAccess = time.Now()
 	cached.AccessCount++
 	cached.mu.Unlock()
-	
+
 	// Update LRU
 	bp.lru.Access(key, cached)
-	
+
 	// Record hit
 	bp.recordHit()
-	
+
 	return cached.Table, true
 }
 
 // Remove removes a table from the buffer pool.
 func (bp *BufferPool) Remove(tenant, name string) {
 	key := fmt.Sprintf("%s:%s", tenant, name)
-	
+
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
-	
+
 	if tenantCache, exists := bp.cache[tenant]; exists {
 		if cached, exists := tenantCache[name]; exists {
 			bp.currentMemory.Add(-cached.Size)
 			delete(tenantCache, name)
-			
+
 			bp.lru.Remove(key)
-			
+
 			bp.stats.mu.Lock()
 			bp.stats.TablesInMemory--
 			bp.stats.mu.Unlock()
 		}
 	}
-	
+
 	bp.updateStats()
 }
 
@@ -331,25 +331,25 @@ func (bp *BufferPool) Remove(tenant, name string) {
 func (bp *BufferPool) evictLRU(needed int64) {
 	freed := int64(0)
 	evicted := 0
-	
+
 	for freed < needed && evicted < bp.policy.EvictionBatchSize {
 		key, cached := bp.lru.RemoveLRU()
 		if key == "" {
 			break // No more tables to evict
 		}
-		
+
 		// Don't evict pinned tables
 		if cached.Pinned {
 			continue
 		}
-		
+
 		// Parse key
 		tenant, name := bp.parseKey(key)
 		if tenantCache, exists := bp.cache[tenant]; exists {
 			delete(tenantCache, name)
 			freed += cached.Size
 			evicted++
-			
+
 			bp.stats.mu.Lock()
 			bp.stats.EvictionCount++
 			bp.stats.EvictionSize += cached.Size
@@ -357,7 +357,7 @@ func (bp *BufferPool) evictLRU(needed int64) {
 			bp.stats.mu.Unlock()
 		}
 	}
-	
+
 	bp.currentMemory.Add(-freed)
 }
 
@@ -416,14 +416,14 @@ func (bp *BufferPool) recordMiss() {
 // updateStats updates computed statistics.
 func (bp *BufferPool) updateStats() {
 	memUsed := bp.currentMemory.Load()
-	
+
 	bp.stats.mu.Lock()
 	bp.stats.MemoryUsed = memUsed
-	
+
 	if bp.policy.MaxMemoryBytes > 0 {
 		bp.stats.MemoryUtilization = float64(memUsed) / float64(bp.policy.MaxMemoryBytes)
 	}
-	
+
 	total := bp.stats.CacheHits + bp.stats.CacheMisses
 	if total > 0 {
 		bp.stats.HitRate = float64(bp.stats.CacheHits) / float64(total)
@@ -435,7 +435,7 @@ func (bp *BufferPool) updateStats() {
 func (bp *BufferPool) GetStats() CacheStats {
 	bp.stats.mu.RLock()
 	defer bp.stats.mu.RUnlock()
-	
+
 	// Return copy without mutex
 	return CacheStats{
 		MemoryUsed:        bp.stats.MemoryUsed,
@@ -465,19 +465,19 @@ func (bp *BufferPool) GetMemoryLimit() int64 {
 func (lru *LRUQueue) Add(key string, table *CachedTable) {
 	lru.mu.Lock()
 	defer lru.mu.Unlock()
-	
+
 	// Remove if already exists
 	if node, exists := lru.nodes[key]; exists {
 		lru.remove(node)
 	}
-	
+
 	// Create new node
 	node := &LRUNode{
 		key:        key,
 		table:      table,
 		accessTime: time.Now(),
 	}
-	
+
 	// Add to front
 	lru.addFront(node)
 	lru.nodes[key] = node
@@ -488,7 +488,7 @@ func (lru *LRUQueue) Add(key string, table *CachedTable) {
 func (lru *LRUQueue) Access(key string, table *CachedTable) {
 	lru.mu.Lock()
 	defer lru.mu.Unlock()
-	
+
 	if node, exists := lru.nodes[key]; exists {
 		node.accessTime = time.Now()
 		lru.remove(node)
@@ -500,7 +500,7 @@ func (lru *LRUQueue) Access(key string, table *CachedTable) {
 func (lru *LRUQueue) Remove(key string) {
 	lru.mu.Lock()
 	defer lru.mu.Unlock()
-	
+
 	if node, exists := lru.nodes[key]; exists {
 		lru.remove(node)
 		delete(lru.nodes, key)
@@ -512,16 +512,16 @@ func (lru *LRUQueue) Remove(key string) {
 func (lru *LRUQueue) RemoveLRU() (string, *CachedTable) {
 	lru.mu.Lock()
 	defer lru.mu.Unlock()
-	
+
 	if lru.tail == nil {
 		return "", nil
 	}
-	
+
 	node := lru.tail
 	lru.remove(node)
 	delete(lru.nodes, node.key)
 	lru.size--
-	
+
 	return node.key, node.table
 }
 
@@ -529,12 +529,12 @@ func (lru *LRUQueue) RemoveLRU() (string, *CachedTable) {
 func (lru *LRUQueue) addFront(node *LRUNode) {
 	node.next = lru.head
 	node.prev = nil
-	
+
 	if lru.head != nil {
 		lru.head.prev = node
 	}
 	lru.head = node
-	
+
 	if lru.tail == nil {
 		lru.tail = node
 	}
@@ -547,7 +547,7 @@ func (lru *LRUQueue) remove(node *LRUNode) {
 	} else {
 		lru.head = node.next
 	}
-	
+
 	if node.next != nil {
 		node.next.prev = node.prev
 	} else {
@@ -560,15 +560,15 @@ func EstimateTableSize(t *Table) int64 {
 	if t == nil {
 		return 0
 	}
-	
+
 	// Header: table name, column metadata
 	headerSize := int64(len(t.Name) + 100)
-	
+
 	// Column metadata
 	for _, col := range t.Cols {
 		headerSize += int64(len(col.Name) + 50)
 	}
-	
+
 	// Row data
 	rowSize := int64(0)
 	if len(t.Rows) > 0 {
@@ -582,12 +582,12 @@ func EstimateTableSize(t *Table) int64 {
 			rowSize += EstimateColumnSize(col.Type)
 		}
 	}
-	
+
 	totalSize := headerSize + (rowSize * int64(len(t.Rows)))
-	
+
 	// Add overhead (pointers, maps, slices)
 	overhead := totalSize / 10 // ~10% overhead
-	
+
 	return totalSize + overhead
 }
 
@@ -596,7 +596,7 @@ func EstimateValueSize(val any) int64 {
 	if val == nil {
 		return 8 // Pointer size
 	}
-	
+
 	switch v := val.(type) {
 	case int, int64, uint64, float64:
 		return 8

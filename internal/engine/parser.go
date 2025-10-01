@@ -58,11 +58,11 @@ type Expr interface{}
 
 type (
 	// VarRef refers to a column (qualified or unqualified) in expressions.
-	VarRef  struct{ Name string }
+	VarRef struct{ Name string }
 	// Literal holds a constant value (number, string, bool, NULL).
 	Literal struct{ Val any }
 	// Unary represents unary operators like +, -, NOT.
-	Unary   struct {
+	Unary struct {
 		Op   string
 		Expr Expr
 	}
@@ -94,20 +94,24 @@ type CreateTable struct {
 	IsTemp   bool
 	AsSelect *Select
 }
+
 // DropTable represents a DROP TABLE statement.
 type DropTable struct{ Name string }
+
 // Insert represents an INSERT statement.
 type Insert struct {
 	Table string
 	Cols  []string
 	Vals  []Expr
 }
+
 // Update represents an UPDATE statement.
 type Update struct {
 	Table string
 	Sets  map[string]Expr
 	Where Expr
 }
+
 // Delete represents a DELETE statement.
 type Delete struct {
 	Table string
@@ -166,20 +170,24 @@ type UnionClause struct {
 	Right *Select
 	Next  *UnionClause // For chaining multiple UNIONs
 }
+
 // FromItem binds a source table and its alias in FROM/JOIN.
 type FromItem struct{ Table, Alias string }
+
 // JoinClause holds a JOIN type with the right side and join condition.
 type JoinClause struct {
 	Type  JoinType
 	Right FromItem
 	On    Expr
 }
+
 // SelectItem represents a projection item, optionally with alias or *.
 type SelectItem struct {
 	Expr  Expr
 	Alias string
 	Star  bool
 }
+
 // OrderItem specifies ordering column and direction.
 type OrderItem struct {
 	Col  string
@@ -369,38 +377,38 @@ func (p *Parser) parseDelete() (Statement, error) {
 
 func (p *Parser) parseSelectWithCTE() (*Select, error) {
 	var ctes []CTE
-	
+
 	// Parse WITH clause if present
 	if p.cur.Typ == tKeyword && p.cur.Val == "WITH" {
 		p.next()
-		
+
 		for {
 			// Parse CTE name
 			cteName := p.parseIdentLike()
 			if cteName == "" {
 				return nil, p.errf("expected CTE name")
 			}
-			
+
 			if err := p.expectKeyword("AS"); err != nil {
 				return nil, err
 			}
-			
+
 			if err := p.expectSymbol("("); err != nil {
 				return nil, err
 			}
-			
+
 			// Parse the SELECT statement for this CTE
 			cteSelect, err := p.parseSelect()
 			if err != nil {
 				return nil, err
 			}
-			
+
 			if err := p.expectSymbol(")"); err != nil {
 				return nil, err
 			}
-			
+
 			ctes = append(ctes, CTE{Name: cteName, Select: cteSelect})
-			
+
 			// Check for more CTEs
 			if p.cur.Typ == tSymbol && p.cur.Val == "," {
 				p.next()
@@ -409,16 +417,16 @@ func (p *Parser) parseSelectWithCTE() (*Select, error) {
 			break
 		}
 	}
-	
+
 	// Parse the main SELECT statement
 	sel, err := p.parseSelect()
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Attach CTEs to the main SELECT
 	sel.CTEs = ctes
-	
+
 	return sel, nil
 }
 
@@ -427,57 +435,57 @@ func (p *Parser) parseSelect() (*Select, error) {
 		return nil, err
 	}
 	sel := &Select{}
-	
+
 	// Parse DISTINCT
 	if err := p.parseDistinct(sel); err != nil {
 		return nil, err
 	}
-	
+
 	// Parse projection list
 	if err := p.parseProjections(sel); err != nil {
 		return nil, err
 	}
-	
+
 	// Parse FROM
 	if err := p.parseFromClause(sel); err != nil {
 		return nil, err
 	}
-	
+
 	// Parse JOINs
 	if err := p.parseJoinClauses(sel); err != nil {
 		return nil, err
 	}
-	
+
 	// Parse WHERE
 	if err := p.parseWhereClause(sel); err != nil {
 		return nil, err
 	}
-	
+
 	// Parse GROUP BY
 	if err := p.parseGroupByClause(sel); err != nil {
 		return nil, err
 	}
-	
+
 	// Parse HAVING
 	if err := p.parseHavingClause(sel); err != nil {
 		return nil, err
 	}
-	
+
 	// Parse ORDER BY
 	if err := p.parseOrderByClause(sel); err != nil {
 		return nil, err
 	}
-	
+
 	// Parse LIMIT and OFFSET
 	if err := p.parseLimitOffset(sel); err != nil {
 		return nil, err
 	}
-	
+
 	// Parse UNION clauses
 	if err := p.parseUnionClause(sel); err != nil {
 		return nil, err
 	}
-	
+
 	return sel, nil
 }
 
@@ -495,7 +503,7 @@ func (p *Parser) parseProjections(sel *Select) error {
 		sel.Projs = append(sel.Projs, SelectItem{Star: true})
 		return nil
 	}
-	
+
 	for {
 		e, err := p.parseExpr()
 		if err != nil {
@@ -690,19 +698,19 @@ func (p *Parser) parseUnionClause(sel *Select) error {
 			unionType = Intersect
 			p.next()
 		}
-		
+
 		// Parse the right-hand SELECT
 		rightSelect, err := p.parseSelect()
 		if err != nil {
 			return err
 		}
-		
+
 		// Create the union clause
 		unionClause := &UnionClause{
 			Type:  unionType,
 			Right: rightSelect,
 		}
-		
+
 		// Find the end of the union chain and append
 		if sel.Union == nil {
 			sel.Union = unionClause
@@ -754,7 +762,7 @@ func (p *Parser) parseColumnDefs() ([]storage.Column, error) {
 			return nil, err
 		}
 		cols = append(cols, col)
-		
+
 		if p.cur.Typ == tSymbol && p.cur.Val == "," {
 			p.next()
 			continue
@@ -796,7 +804,7 @@ func (p *Parser) parseColumnConstraints(col *storage.Column) error {
 	if p.cur.Typ != tKeyword {
 		return nil
 	}
-	
+
 	switch p.cur.Val {
 	case "PRIMARY":
 		return p.parsePrimaryKeyConstraint(col)
@@ -892,7 +900,7 @@ func (p *Parser) parseType() storage.ColType {
 		case "UINT64":
 			p.next()
 			return storage.Uint64Type
-		
+
 		// Floating point types
 		case "FLOAT", "FLOAT64", "DOUBLE":
 			p.next()
@@ -900,7 +908,7 @@ func (p *Parser) parseType() storage.ColType {
 		case "FLOAT32":
 			p.next()
 			return storage.Float32Type
-		
+
 		// String and character types
 		case "STRING":
 			p.next()
@@ -914,12 +922,12 @@ func (p *Parser) parseType() storage.ColType {
 		case "BYTE":
 			p.next()
 			return storage.ByteType
-		
+
 		// Boolean type
 		case "BOOL", "BOOLEAN":
 			p.next()
 			return storage.BoolType
-		
+
 		// Time types
 		case "TIME":
 			p.next()
@@ -936,7 +944,7 @@ func (p *Parser) parseType() storage.ColType {
 		case "DURATION":
 			p.next()
 			return storage.DurationType
-		
+
 		// Complex data types
 		case "JSON":
 			p.next()
@@ -950,7 +958,7 @@ func (p *Parser) parseType() storage.ColType {
 		case "SLICE", "ARRAY":
 			p.next()
 			return storage.SliceType
-		
+
 		// Advanced types
 		case "COMPLEX64":
 			p.next()
@@ -1142,10 +1150,10 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		return &Literal{Val: s}, nil
 	case tKeyword:
 		switch p.cur.Val {
-		case "COUNT", "SUM", "AVG", "MIN", "MAX", "COALESCE", "NULLIF", 
-			 "JSON_GET", "JSON_SET", "JSON_EXTRACT",
-			 "NOW", "CURRENT_TIME", "CURRENT_DATE", "DATEDIFF",
-			 "LTRIM", "RTRIM", "TRIM", "ISNULL":
+		case "COUNT", "SUM", "AVG", "MIN", "MAX", "COALESCE", "NULLIF",
+			"JSON_GET", "JSON_SET", "JSON_EXTRACT",
+			"NOW", "CURRENT_TIME", "CURRENT_DATE", "DATEDIFF",
+			"LTRIM", "RTRIM", "TRIM", "ISNULL":
 			return p.parseFuncCall()
 		case "TRUE":
 			p.next()

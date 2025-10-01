@@ -272,7 +272,7 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 			tenant: env.tenant,
 			ctes:   make(map[string]*ResultSet),
 		}
-		
+
 		// Execute each CTE and store the result
 		for _, cte := range s.CTEs {
 			cteResult, err := executeSelect(env, cte.Select)
@@ -282,10 +282,10 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 			cteEnv.ctes[cte.Name] = cteResult
 		}
 	}
-	
+
 	// FROM
 	var leftRows []Row
-	
+
 	// Check if FROM table is a CTE
 	if cteEnv.ctes != nil {
 		if cteResult, exists := cteEnv.ctes[s.From.Table]; exists {
@@ -316,7 +316,7 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 		}
 		leftRows, _ = rowsFromTable(leftT, aliasOr(s.From))
 	}
-	
+
 	cur := leftRows
 
 	// JOINs
@@ -369,7 +369,7 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 	// Handle UNION operations
 	resultRows := baseRows
 	resultCols := outCols
-	
+
 	if s.Union != nil {
 		var err error
 		resultRows, resultCols, err = processUnionClauses(env, s.Union, resultRows, resultCols)
@@ -387,7 +387,7 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 func processUnionClauses(env ExecEnv, union *UnionClause, leftRows []Row, leftCols []string) ([]Row, []string, error) {
 	resultRows := leftRows
 	resultCols := leftCols
-	
+
 	current := union
 	for current != nil {
 		// Execute the right-hand SELECT
@@ -395,36 +395,36 @@ func processUnionClauses(env ExecEnv, union *UnionClause, leftRows []Row, leftCo
 		if err != nil {
 			return nil, nil, err
 		}
-		
+
 		// Validate column compatibility
 		if len(rightResult.Cols) != len(resultCols) {
-			return nil, nil, fmt.Errorf("UNION: column count mismatch between queries (%d vs %d)", 
+			return nil, nil, fmt.Errorf("UNION: column count mismatch between queries (%d vs %d)",
 				len(resultCols), len(rightResult.Cols))
 		}
-		
+
 		// Process the union based on type
 		switch current.Type {
 		case UnionAll:
 			// UNION ALL: Just append all rows
 			resultRows = append(resultRows, rightResult.Rows...)
-			
+
 		case UnionDistinct:
 			// UNION: Append and then remove duplicates
 			resultRows = append(resultRows, rightResult.Rows...)
 			resultRows = distinctRows(resultRows, resultCols)
-			
+
 		case Except:
 			// EXCEPT: Remove rows that exist in the right result
 			resultRows = exceptRows(resultRows, rightResult.Rows, resultCols)
-			
+
 		case Intersect:
 			// INTERSECT: Keep only rows that exist in both results
 			resultRows = intersectRows(resultRows, rightResult.Rows, resultCols)
 		}
-		
+
 		current = current.Next
 	}
-	
+
 	return resultRows, resultCols, nil
 }
 
@@ -435,7 +435,7 @@ func exceptRows(leftRows, rightRows []Row, cols []string) []Row {
 		key := rowSignature(r, cols)
 		rightSet[key] = true
 	}
-	
+
 	// Keep only left rows that are not in the right set
 	var result []Row
 	for _, l := range leftRows {
@@ -454,7 +454,7 @@ func intersectRows(leftRows, rightRows []Row, cols []string) []Row {
 		key := rowSignature(r, cols)
 		rightSet[key] = true
 	}
-	
+
 	// Keep only left rows that are also in the right set
 	var result []Row
 	seen := make(map[string]bool)
@@ -484,7 +484,7 @@ func processJoins(env ExecEnv, joins []JoinClause, cur []Row) ([]Row, error) {
 			return nil, err
 		}
 		rightRows, _ := rowsFromTable(rt, aliasOr(j.Right))
-		
+
 		switch j.Type {
 		case JoinInner:
 			cur, err = processInnerJoin(env, cur, rightRows, j.On)
@@ -614,7 +614,7 @@ func applyWhereClause(env ExecEnv, where Expr, rows []Row) ([]Row, error) {
 
 func processGroupByHaving(env ExecEnv, s *Select, filtered []Row) ([]Row, []string, error) {
 	needAgg := len(s.GroupBy) > 0 || anyAggInSelect(s.Projs) || isAggregate(s.Having)
-	
+
 	if needAgg {
 		return processAggregateQuery(env, s, filtered)
 	}
@@ -626,7 +626,7 @@ func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []str
 	orderKeys := make([]string, 0, len(filtered)/2)
 	outRows := make([]Row, 0, len(filtered)/2)
 	outCols := make([]string, 0, len(s.Projs))
-	
+
 	for _, r := range filtered {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, nil, err
@@ -645,7 +645,7 @@ func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []str
 		}
 		groups[ks] = append(groups[ks], r)
 	}
-	
+
 	for _, k := range orderKeys {
 		rows := groups[k]
 		if s.Having != nil {
@@ -692,7 +692,7 @@ func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []str
 func processNonAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []string, error) {
 	outRows := make([]Row, 0, len(filtered))
 	outCols := make([]string, 0, len(s.Projs))
-	
+
 	for _, r := range filtered {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, nil, err
@@ -730,7 +730,7 @@ func applyOffsetLimit(s *Select, rows []Row) []Row {
 		return []Row{}
 	}
 	rows = rows[start:]
-	
+
 	if s.Limit != nil && *s.Limit < len(rows) {
 		rows = rows[:*s.Limit]
 	}
@@ -999,7 +999,7 @@ func evalBinary(env ExecEnv, ex *Binary, row Row) (any, error) {
 	if ex.Op == "AND" || ex.Op == "OR" {
 		return evalLogicalBinary(env, ex, row)
 	}
-	
+
 	lv, err := evalExpr(env, ex.Left, row)
 	if err != nil {
 		return nil, err
@@ -1008,7 +1008,7 @@ func evalBinary(env ExecEnv, ex *Binary, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	switch ex.Op {
 	case "+", "-", "*", "/":
 		return evalArithmeticBinary(ex.Op, lv, rv)
@@ -1198,7 +1198,7 @@ func evalJSONExtended(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		}
 		ps, _ := pv.(string)
 		return jsonSet(jv, ps, val), nil
-		
+
 	case "JSON_EXTRACT":
 		// Alias for JSON_GET
 		if len(ex.Args) != 2 {
@@ -1250,7 +1250,7 @@ func evalDateDiff(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if len(ex.Args) != 3 {
 		return nil, fmt.Errorf("DATEDIFF expects 3 arguments: (unit, start_date, end_date)")
 	}
-	
+
 	// Get the unit (HOURS, DAYS, MINUTES, etc.)
 	unitVal, err := evalExpr(env, ex.Args[0], row)
 	if err != nil {
@@ -1260,33 +1260,33 @@ func evalDateDiff(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("DATEDIFF unit must be a string")
 	}
-	
+
 	// Get start date
 	startVal, err := evalExpr(env, ex.Args[1], row)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Get end date
 	endVal, err := evalExpr(env, ex.Args[2], row)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Convert values to time.Time
 	startTime, err := parseTimeValue(startVal)
 	if err != nil {
 		return nil, fmt.Errorf("DATEDIFF start_date: %v", err)
 	}
-	
+
 	endTime, err := parseTimeValue(endVal)
 	if err != nil {
 		return nil, fmt.Errorf("DATEDIFF end_date: %v", err)
 	}
-	
+
 	// Calculate difference
 	diff := endTime.Sub(startTime)
-	
+
 	// Return based on unit
 	switch strings.ToUpper(unit) {
 	case "HOURS":
@@ -1314,7 +1314,7 @@ func parseTimeValue(val any) (time.Time, error) {
 	if val == nil {
 		return time.Time{}, fmt.Errorf("cannot parse nil as time")
 	}
-	
+
 	switch v := val.(type) {
 	case time.Time:
 		return v, nil
@@ -1329,7 +1329,7 @@ func parseTimeValue(val any) (time.Time, error) {
 			"15:04:05",
 			"15:04",
 		}
-		
+
 		for _, format := range formats {
 			if t, err := time.Parse(format, v); err == nil {
 				return t, nil
@@ -1356,24 +1356,24 @@ func evalLTrim(env ExecEnv, args []Expr, row Row) (any, error) {
 	if len(args) < 1 || len(args) > 2 {
 		return nil, fmt.Errorf("LTRIM expects 1 or 2 arguments")
 	}
-	
+
 	val, err := evalExpr(env, args[0], row)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	if val == nil {
 		return nil, nil
 	}
-	
+
 	str, ok := val.(string)
 	if !ok {
 		return nil, fmt.Errorf("LTRIM expects a string argument")
 	}
-	
+
 	// Default: trim whitespace
 	cutset := " \t\n\r"
-	
+
 	// If second argument provided, use as cutset
 	if len(args) == 2 {
 		cutsetVal, err := evalExpr(env, args[1], row)
@@ -1388,7 +1388,7 @@ func evalLTrim(env ExecEnv, args []Expr, row Row) (any, error) {
 			}
 		}
 	}
-	
+
 	return strings.TrimLeft(str, cutset), nil
 }
 
@@ -1396,24 +1396,24 @@ func evalRTrim(env ExecEnv, args []Expr, row Row) (any, error) {
 	if len(args) < 1 || len(args) > 2 {
 		return nil, fmt.Errorf("RTRIM expects 1 or 2 arguments")
 	}
-	
+
 	val, err := evalExpr(env, args[0], row)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	if val == nil {
 		return nil, nil
 	}
-	
+
 	str, ok := val.(string)
 	if !ok {
 		return nil, fmt.Errorf("RTRIM expects a string argument")
 	}
-	
+
 	// Default: trim whitespace
 	cutset := " \t\n\r"
-	
+
 	// If second argument provided, use as cutset
 	if len(args) == 2 {
 		cutsetVal, err := evalExpr(env, args[1], row)
@@ -1428,7 +1428,7 @@ func evalRTrim(env ExecEnv, args []Expr, row Row) (any, error) {
 			}
 		}
 	}
-	
+
 	return strings.TrimRight(str, cutset), nil
 }
 
@@ -1436,26 +1436,26 @@ func evalTrim(env ExecEnv, args []Expr, row Row) (any, error) {
 	if len(args) < 1 || len(args) > 2 {
 		return nil, fmt.Errorf("TRIM expects 1 or 2 arguments")
 	}
-	
+
 	val, err := evalExpr(env, args[0], row)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	if val == nil {
 		return nil, nil
 	}
-	
+
 	str, ok := val.(string)
 	if !ok {
 		return nil, fmt.Errorf("TRIM expects a string argument")
 	}
-	
+
 	// Default: trim whitespace (use TrimSpace for compatibility)
 	if len(args) == 1 {
 		return strings.TrimSpace(str), nil
 	}
-	
+
 	// If second argument provided, use as cutset for both sides
 	cutsetVal, err := evalExpr(env, args[1], row)
 	if err != nil {
@@ -1464,12 +1464,12 @@ func evalTrim(env ExecEnv, args []Expr, row Row) (any, error) {
 	if cutsetVal == nil {
 		return strings.TrimSpace(str), nil
 	}
-	
+
 	cutsetStr, ok := cutsetVal.(string)
 	if !ok {
 		return nil, fmt.Errorf("TRIM cutset must be a string")
 	}
-	
+
 	return strings.Trim(str, cutsetStr), nil
 }
 
@@ -1478,12 +1478,12 @@ func evalIsNullFunc(env ExecEnv, args []Expr, row Row) (any, error) {
 	if len(args) != 1 {
 		return nil, fmt.Errorf("ISNULL expects 1 argument")
 	}
-	
+
 	val, err := evalExpr(env, args[0], row)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	return val == nil, nil
 }
 
@@ -1952,12 +1952,12 @@ func jsonSet(v any, path string, value any) any {
 	if path == "" {
 		return value
 	}
-	
+
 	parts := parseJSONPath(path)
 	if len(parts) == 0 {
 		return value
 	}
-	
+
 	// If v is nil, create a new structure
 	if v == nil {
 		if parts[0].idx >= 0 {
@@ -1966,7 +1966,7 @@ func jsonSet(v any, path string, value any) any {
 			v = make(map[string]any)
 		}
 	}
-	
+
 	// Navigate to the parent of the target
 	cur := v
 	for i := 0; i < len(parts)-1; i++ {
@@ -2003,7 +2003,7 @@ func jsonSet(v any, path string, value any) any {
 			return v
 		}
 	}
-	
+
 	// Set the final value
 	lastPart := parts[len(parts)-1]
 	switch c := cur.(type) {
@@ -2046,7 +2046,7 @@ func jsonSet(v any, path string, value any) any {
 	default:
 		return v
 	}
-	
+
 	return v
 }
 

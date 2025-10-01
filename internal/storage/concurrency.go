@@ -23,15 +23,15 @@ type ConcurrencyConfig struct {
 	// Worker pool sizes
 	ReadWorkers  int
 	WriteWorkers int
-	
+
 	// Channel buffer sizes
 	ReadQueueSize  int
 	WriteQueueSize int
-	
+
 	// Timeouts
 	WorkerTimeout time.Duration
 	QueueTimeout  time.Duration
-	
+
 	// Batch settings
 	BatchSize     int
 	BatchInterval time.Duration
@@ -41,10 +41,10 @@ type ConcurrencyConfig struct {
 func DefaultConcurrencyConfig() ConcurrencyConfig {
 	cpus := runtime.NumCPU()
 	return ConcurrencyConfig{
-		ReadWorkers:    cpus * 2,      // More readers than CPUs
-		WriteWorkers:   cpus,          // One writer per CPU
-		ReadQueueSize:  cpus * 100,    // Large buffer for reads
-		WriteQueueSize: cpus * 50,     // Moderate buffer for writes
+		ReadWorkers:    cpus * 2,   // More readers than CPUs
+		WriteWorkers:   cpus,       // One writer per CPU
+		ReadQueueSize:  cpus * 100, // Large buffer for reads
+		WriteQueueSize: cpus * 50,  // Moderate buffer for writes
 		WorkerTimeout:  5 * time.Second,
 		QueueTimeout:   1 * time.Second,
 		BatchSize:      100,
@@ -82,23 +82,23 @@ type WorkResult struct {
 // ConcurrencyManager orchestrates concurrent operations.
 type ConcurrencyManager struct {
 	config ConcurrencyConfig
-	
+
 	// Worker pools
 	readPool  *WorkerPool
 	writePool *WorkerPool
-	
+
 	// Request queues (buffered channels)
 	readQueue  chan WorkRequest
 	writeQueue chan WorkRequest
-	
+
 	// Lifecycle management
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
-	
+
 	// Stats
 	stats ConcurrencyStats
-	
+
 	// Batch processor
 	batcher *BatchProcessor
 }
@@ -132,7 +132,7 @@ type WorkHandler func(ctx context.Context, req WorkRequest) WorkResult
 // NewConcurrencyManager creates a new concurrency manager.
 func NewConcurrencyManager(config ConcurrencyConfig) *ConcurrencyManager {
 	ctx, cancel := context.WithCancel(context.Background())
-	
+
 	cm := &ConcurrencyManager{
 		config:     config,
 		readQueue:  make(chan WorkRequest, config.ReadQueueSize),
@@ -140,22 +140,22 @@ func NewConcurrencyManager(config ConcurrencyConfig) *ConcurrencyManager {
 		ctx:        ctx,
 		cancel:     cancel,
 	}
-	
+
 	// Create worker pools
 	cm.readPool = NewWorkerPool("reader", config.ReadWorkers, cm.readQueue, cm.handleRead, ctx, &cm.wg)
 	cm.writePool = NewWorkerPool("writer", config.WriteWorkers, cm.writeQueue, cm.handleWrite, ctx, &cm.wg)
-	
+
 	// Create batch processor
 	cm.batcher = NewBatchProcessor(config.BatchSize, config.BatchInterval, cm.processBatch)
-	
+
 	// Start worker pools
 	cm.readPool.Start()
 	cm.writePool.Start()
-	
+
 	// Start batch processor
 	cm.wg.Add(1)
 	go cm.batcher.Run(ctx, &cm.wg)
-	
+
 	return cm
 }
 
@@ -183,27 +183,27 @@ func (wp *WorkerPool) Start() {
 // worker is the main worker loop.
 func (wp *WorkerPool) worker(id int) {
 	defer wp.wg.Done()
-	
+
 	for {
 		select {
 		case <-wp.ctx.Done():
 			return
-			
+
 		case req := <-wp.workQueue:
 			// Acquire semaphore
 			wp.semaphore <- struct{}{}
 			wp.processing.Add(1)
-			
+
 			// Process with timeout
 			result := wp.processWithTimeout(req)
-			
+
 			// Send result
 			select {
 			case req.Result <- result:
 			case <-req.Context.Done():
 			case <-wp.ctx.Done():
 			}
-			
+
 			// Release semaphore
 			<-wp.semaphore
 			wp.processing.Add(-1)
@@ -216,14 +216,14 @@ func (wp *WorkerPool) processWithTimeout(req WorkRequest) WorkResult {
 	// Create timeout context
 	ctx, cancel := context.WithTimeout(req.Context, 5*time.Second)
 	defer cancel()
-	
+
 	// Process in goroutine
 	resultChan := make(chan WorkResult, 1)
-	
+
 	go func() {
 		resultChan <- wp.handler(ctx, req)
 	}()
-	
+
 	// Wait for result or timeout
 	select {
 	case result := <-resultChan:
@@ -250,7 +250,7 @@ func (cm *ConcurrencyManager) SubmitWrite(ctx context.Context, data interface{})
 func (cm *ConcurrencyManager) submitRequest(ctx context.Context, workType WorkType, data interface{}, queue chan WorkRequest, queueCounter *atomic.Int64) <-chan WorkResult {
 	reqID := cm.stats.TotalRequests.Add(1)
 	resultChan := make(chan WorkResult, 1)
-	
+
 	req := WorkRequest{
 		ID:      reqID,
 		Context: ctx,
@@ -258,13 +258,13 @@ func (cm *ConcurrencyManager) submitRequest(ctx context.Context, workType WorkTy
 		Data:    data,
 		Result:  resultChan,
 	}
-	
+
 	queueCounter.Add(1)
-	
+
 	// Try to submit with timeout
 	go func() {
 		defer queueCounter.Add(-1)
-		
+
 		select {
 		case queue <- req:
 			// Submitted successfully
@@ -277,14 +277,14 @@ func (cm *ConcurrencyManager) submitRequest(ctx context.Context, workType WorkTy
 			cm.stats.FailedRequests.Add(1)
 		}
 	}()
-	
+
 	return resultChan
 }
 
 // handleRead processes read requests.
 func (cm *ConcurrencyManager) handleRead(ctx context.Context, req WorkRequest) WorkResult {
 	defer cm.stats.CompletedReads.Add(1)
-	
+
 	// Simulate read operation
 	// In real implementation, this would interact with buffer pool, WAL, etc.
 	select {
@@ -299,7 +299,7 @@ func (cm *ConcurrencyManager) handleRead(ctx context.Context, req WorkRequest) W
 // handleWrite processes write requests.
 func (cm *ConcurrencyManager) handleWrite(ctx context.Context, req WorkRequest) WorkResult {
 	defer cm.stats.CompletedWrites.Add(1)
-	
+
 	// Simulate write operation
 	select {
 	case <-ctx.Done():
@@ -319,14 +319,14 @@ func (cm *ConcurrencyManager) Stats() *ConcurrencyStats {
 func (cm *ConcurrencyManager) Shutdown(timeout time.Duration) error {
 	// Cancel context
 	cm.cancel()
-	
+
 	// Wait for workers with timeout
 	done := make(chan struct{})
 	go func() {
 		cm.wg.Wait()
 		close(done)
 	}()
-	
+
 	select {
 	case <-done:
 		return nil
@@ -372,26 +372,26 @@ func (bp *BatchProcessor) Add(item interface{}) error {
 // Run starts the batch processor.
 func (bp *BatchProcessor) Run(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
-	
+
 	ticker := time.NewTicker(bp.interval)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-ctx.Done():
 			// Flush remaining batch
 			bp.flush()
 			return
-			
+
 		case item := <-bp.queue:
 			bp.mu.Lock()
 			bp.batch = append(bp.batch, item)
-			
+
 			if len(bp.batch) >= bp.maxSize {
 				bp.flushLocked()
 			}
 			bp.mu.Unlock()
-			
+
 		case <-ticker.C:
 			bp.flush()
 		}
@@ -410,13 +410,13 @@ func (bp *BatchProcessor) flushLocked() {
 	if len(bp.batch) == 0 {
 		return
 	}
-	
+
 	// Process batch
 	if err := bp.handler(bp.batch); err != nil {
 		// Log error (in real implementation)
 		_ = err
 	}
-	
+
 	// Clear batch
 	bp.batch = bp.batch[:0]
 }
@@ -440,7 +440,7 @@ func NewParallelIterator(items []interface{}, workers int) *ParallelIterator {
 	if workers <= 0 {
 		workers = runtime.NumCPU()
 	}
-	
+
 	return &ParallelIterator{
 		items:   items,
 		workers: workers,
@@ -459,18 +459,18 @@ func (pi *ParallelIterator) ForEach(fn func(item interface{}) error) error {
 	if len(pi.items) == 0 {
 		return nil
 	}
-	
+
 	// Create work channels
 	workChan := make(chan interface{}, len(pi.items))
 	errorChan := make(chan error, pi.workers)
-	
+
 	// Start workers
 	var wg sync.WaitGroup
 	for i := 0; i < pi.workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			
+
 			for item := range workChan {
 				select {
 				case <-pi.ctx.Done():
@@ -485,7 +485,7 @@ func (pi *ParallelIterator) ForEach(fn func(item interface{}) error) error {
 			}
 		}()
 	}
-	
+
 	// Feed work
 	go func() {
 		for _, item := range pi.items {
@@ -498,18 +498,18 @@ func (pi *ParallelIterator) ForEach(fn func(item interface{}) error) error {
 		}
 		close(workChan)
 	}()
-	
+
 	// Wait for completion
 	wg.Wait()
 	close(errorChan)
-	
+
 	// Check for errors
 	for err := range errorChan {
 		if err != nil {
 			return err
 		}
 	}
-	
+
 	return nil
 }
 
@@ -518,27 +518,27 @@ func (pi *ParallelIterator) Map(fn func(item interface{}) (interface{}, error)) 
 	if len(pi.items) == 0 {
 		return nil, nil
 	}
-	
+
 	type result struct {
 		index int
 		value interface{}
 		err   error
 	}
-	
+
 	results := make([]interface{}, len(pi.items))
 	resultChan := make(chan result, len(pi.items))
 	workChan := make(chan struct {
 		index int
 		item  interface{}
 	}, len(pi.items))
-	
+
 	// Start workers
 	var wg sync.WaitGroup
 	for i := 0; i < pi.workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			
+
 			for work := range workChan {
 				select {
 				case <-pi.ctx.Done():
@@ -551,7 +551,7 @@ func (pi *ParallelIterator) Map(fn func(item interface{}) (interface{}, error)) 
 			}
 		}()
 	}
-	
+
 	// Feed work
 	go func() {
 		for i, item := range pi.items {
@@ -567,20 +567,20 @@ func (pi *ParallelIterator) Map(fn func(item interface{}) (interface{}, error)) 
 		}
 		close(workChan)
 	}()
-	
+
 	// Collect results
 	go func() {
 		wg.Wait()
 		close(resultChan)
 	}()
-	
+
 	for res := range resultChan {
 		if res.err != nil {
 			return nil, res.err
 		}
 		results[res.index] = res.value
 	}
-	
+
 	return results, nil
 }
 
@@ -605,7 +605,7 @@ func NewPipeline(ctx context.Context, stages ...PipelineStage) *Pipeline {
 func (p *Pipeline) Execute(input []interface{}) <-chan interface{} {
 	// Create input channel
 	inputChan := make(chan interface{}, len(input))
-	
+
 	// Feed input
 	go func() {
 		defer close(inputChan)
@@ -617,27 +617,27 @@ func (p *Pipeline) Execute(input []interface{}) <-chan interface{} {
 			}
 		}
 	}()
-	
+
 	// Chain stages
 	var current <-chan interface{} = inputChan
 	for _, stage := range p.stages {
 		current = stage(p.ctx, current)
 	}
-	
+
 	return current
 }
 
 // FanOut distributes work from one channel to multiple channels.
 func FanOut(ctx context.Context, input <-chan interface{}, workers int) []<-chan interface{} {
 	outputs := make([]<-chan interface{}, workers)
-	
+
 	for i := 0; i < workers; i++ {
 		ch := make(chan interface{})
 		outputs[i] = ch
-		
+
 		go func(out chan interface{}) {
 			defer close(out)
-			
+
 			for item := range input {
 				select {
 				case <-ctx.Done():
@@ -647,18 +647,18 @@ func FanOut(ctx context.Context, input <-chan interface{}, workers int) []<-chan
 			}
 		}(ch)
 	}
-	
+
 	return outputs
 }
 
 // FanIn combines multiple channels into one.
 func FanIn(ctx context.Context, channels ...<-chan interface{}) <-chan interface{} {
 	output := make(chan interface{})
-	
+
 	var wg sync.WaitGroup
 	multiplex := func(ch <-chan interface{}) {
 		defer wg.Done()
-		
+
 		for item := range ch {
 			select {
 			case <-ctx.Done():
@@ -667,17 +667,17 @@ func FanIn(ctx context.Context, channels ...<-chan interface{}) <-chan interface
 			}
 		}
 	}
-	
+
 	wg.Add(len(channels))
 	for _, ch := range channels {
 		go multiplex(ch)
 	}
-	
+
 	go func() {
 		wg.Wait()
 		close(output)
 	}()
-	
+
 	return output
 }
 
@@ -695,12 +695,12 @@ func NewRateLimiter(opsPerSecond int) *RateLimiter {
 		tokens:   make(chan struct{}, opsPerSecond),
 		capacity: opsPerSecond,
 	}
-	
+
 	// Fill initial tokens
 	for i := 0; i < opsPerSecond; i++ {
 		rl.tokens <- struct{}{}
 	}
-	
+
 	// Refill tokens
 	go func() {
 		for range rl.ticker.C {
@@ -710,7 +710,7 @@ func NewRateLimiter(opsPerSecond int) *RateLimiter {
 			}
 		}
 	}()
-	
+
 	return rl
 }
 
