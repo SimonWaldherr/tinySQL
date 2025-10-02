@@ -21,26 +21,26 @@ func ExampleImportCSV() {
 3,Charlie,35,true`
 
 	// Import CSV data
-	result, err := tinysql.ImportCSV(ctx, db, "default", "users", 
+	result, err := tinysql.ImportCSV(ctx, db, "default", "users",
 		strings.NewReader(csvData), &tinysql.ImportOptions{
-			CreateTable: true,
+			CreateTable:   true,
 			TypeInference: true,
-			HeaderMode: "present",
+			HeaderMode:    "present",
 		})
-	
+
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		return
 	}
 
-	fmt.Printf("Imported %d rows into table with columns: %v\n", 
+	fmt.Printf("Imported %d rows into table with columns: %v\n",
 		result.RowsInserted, result.ColumnNames)
 	fmt.Printf("Detected types: %v\n", result.ColumnTypes)
 
 	// Query the imported data
 	stmt, _ := tinysql.ParseSQL("SELECT name, age FROM users WHERE active = true ORDER BY age")
 	rs, _ := tinysql.Execute(ctx, db, "default", stmt)
-	
+
 	for _, row := range rs.Rows {
 		fmt.Printf("Name: %v, Age: %v\n", row["name"], row["age"])
 	}
@@ -67,7 +67,7 @@ func ExampleImportJSON() {
 	// Import JSON data
 	result, err := tinysql.ImportJSON(ctx, db, "default", "products",
 		strings.NewReader(jsonData), &tinysql.ImportOptions{
-			CreateTable: true,
+			CreateTable:   true,
 			TypeInference: true,
 		})
 
@@ -100,17 +100,17 @@ func ExampleImportFile() {
 	// Create a temporary CSV file
 	tmpFile, _ := os.CreateTemp("", "example-*.csv")
 	defer os.Remove(tmpFile.Name())
-	
+
 	csvContent := `date,temperature,humidity
 2024-01-01,72.5,45
 2024-01-02,73.2,48
 2024-01-03,71.8,52`
-	
+
 	tmpFile.WriteString(csvContent)
 	tmpFile.Close()
 
 	// Import the file (format auto-detected from extension)
-	result, err := tinysql.ImportFile(ctx, db, "default", "weather", 
+	result, err := tinysql.ImportFile(ctx, db, "default", "weather",
 		tmpFile.Name(), nil) // nil uses default options
 
 	if err != nil {
@@ -143,12 +143,12 @@ func ExampleOpenFile() {
 	// Create a temporary TSV file
 	tmpFile, _ := os.CreateTemp("", "data-*.tsv")
 	defer os.Remove(tmpFile.Name())
-	
+
 	tsvContent := "city\tpopulation\tcountry\n"
 	tsvContent += "Tokyo\t37400000\tJapan\n"
 	tsvContent += "Delhi\t31400000\tIndia\n"
 	tsvContent += "Shanghai\t27800000\tChina\n"
-	
+
 	tmpFile.WriteString(tsvContent)
 	tmpFile.Close()
 
@@ -202,7 +202,7 @@ Charlie;92.1;A`
 			NullLiterals:        []string{"", "NULL", "N/A"},
 		})
 
-	fmt.Printf("Imported %d rows using delimiter '%c'\n", 
+	fmt.Printf("Imported %d rows using delimiter '%c'\n",
 		result.RowsInserted, result.Delimiter)
 	fmt.Printf("Columns: %v\n", result.ColumnNames)
 	// Note: Type names may vary (Float64Type vs FloatType)
@@ -221,7 +221,7 @@ func ExampleImportCSV_compressed() {
 
 	// In real usage, you would use a .csv.gz file
 	// This example shows the API for when you have compressed data
-	
+
 	csvData := `id,value
 1,100
 2,200
@@ -231,7 +231,7 @@ func ExampleImportCSV_compressed() {
 	result, _ := tinysql.ImportCSV(ctx, db, "default", "data",
 		strings.NewReader(csvData), nil)
 
-	fmt.Printf("Imported %d rows with encoding: %s\n", 
+	fmt.Printf("Imported %d rows with encoding: %s\n",
 		result.RowsInserted, result.Encoding)
 
 	// Output:

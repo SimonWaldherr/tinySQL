@@ -98,7 +98,7 @@ func executeCreateTable(env ExecEnv, s *CreateTable) (*ResultSet, error) {
 			return nil, nil
 		}
 	}
-	
+
 	if s.AsSelect == nil {
 		t := storage.NewTable(s.Name, s.Cols, s.IsTemp)
 		err := env.db.Put(env.tenant, t)
@@ -185,7 +185,7 @@ func executeAlterTable(env ExecEnv, s *AlterTable) (*ResultSet, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Handle ADD COLUMN
 	if s.AddColumn != nil {
 		// Check if column already exists
@@ -194,19 +194,19 @@ func executeAlterTable(env ExecEnv, s *AlterTable) (*ResultSet, error) {
 				return nil, fmt.Errorf("column %q already exists", s.AddColumn.Name)
 			}
 		}
-		
+
 		// Add the new column to table schema
 		t.Cols = append(t.Cols, *s.AddColumn)
-		
+
 		// Add NULL values for existing rows
 		for i := range t.Rows {
 			t.Rows[i] = append(t.Rows[i], nil)
 		}
-		
+
 		// Update the table
 		env.db.Put(env.tenant, t)
 	}
-	
+
 	return nil, nil
 }
 
@@ -601,6 +601,13 @@ func processJoins(env ExecEnv, joins []JoinClause, cur []Row) ([]Row, error) {
 }
 
 func processInnerJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) ([]Row, error) {
+	// Use hash join optimization for large datasets
+	if len(leftRows) > 50 || len(rightRows) > 50 {
+		optimizer := &HashJoinOptimizer{env: env}
+		return optimizer.ProcessOptimizedJoin(leftRows, rightRows, onCondition, OptimizedJoinTypeInner)
+	}
+
+	// Fall back to original nested loop for small datasets
 	joined := make([]Row, 0, len(leftRows)*len(rightRows)/4) // Estimate result size
 	for _, l := range leftRows {
 		if err := checkCtx(env.ctx); err != nil {
@@ -625,6 +632,22 @@ func processInnerJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) 
 }
 
 func processLeftJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr, rightAlias string, rightTable *storage.Table) ([]Row, error) {
+	// Use hash join optimization for large datasets
+	if len(leftRows) > 50 || len(rightRows) > 50 {
+		optimizer := &HashJoinOptimizer{env: env}
+		result, err := optimizer.ProcessOptimizedJoin(leftRows, rightRows, onCondition, OptimizedJoinTypeLeft)
+		if err != nil {
+			return nil, err
+		}
+
+		// Add right nulls for unmatched rows (hash join might not handle all cases)
+		for _, row := range result {
+			addRightNulls(row, rightAlias, rightTable)
+		}
+		return result, nil
+	}
+
+	// Fall back to original nested loop for small datasets
 	joined := make([]Row, 0, len(leftRows)) // At least one row per left row
 	for _, l := range leftRows {
 		if err := checkCtx(env.ctx); err != nil {
@@ -1080,14 +1103,14 @@ func evalIn(env ExecEnv, ex *InExpr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Check against each value in the list
 	for _, valExpr := range ex.Values {
 		listVal, err := evalExpr(env, valExpr, row)
 		if err != nil {
 			return nil, err
 		}
-		
+
 		// Compare values
 		cmp, err := compare(val, listVal)
 		if err == nil && cmp == 0 {
@@ -1098,7 +1121,7 @@ func evalIn(env ExecEnv, ex *InExpr, row Row) (any, error) {
 			return true, nil
 		}
 	}
-	
+
 	// No match found
 	if ex.Negate {
 		return true, nil
@@ -1111,23 +1134,23 @@ func evalLike(env ExecEnv, ex *LikeExpr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	patternVal, err := evalExpr(env, ex.Pattern, row)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Convert to strings
 	str, ok := val.(string)
 	if !ok {
 		str = fmt.Sprintf("%v", val)
 	}
-	
+
 	pattern, ok := patternVal.(string)
 	if !ok {
 		pattern = fmt.Sprintf("%v", patternVal)
 	}
-	
+
 	// Get escape character if specified
 	escapeChar := '\\'
 	if ex.Escape != nil {
@@ -1141,10 +1164,10 @@ func evalLike(env ExecEnv, ex *LikeExpr, row Row) (any, error) {
 		}
 		escapeChar = rune(escapeStr[0])
 	}
-	
+
 	// Match pattern
 	matched := matchLikePattern(str, pattern, escapeChar)
-	
+
 	if ex.Negate {
 		return !matched, nil
 	}
@@ -1159,11 +1182,11 @@ func matchLikePattern(str, pattern string, escape rune) bool {
 	sLen, pLen := len(str), len(pattern)
 	star := -1
 	match := 0
-	
+
 	for sIdx < sLen {
 		if pIdx < pLen {
 			pChar := rune(pattern[pIdx])
-			
+
 			// Check for escape character
 			if pChar == escape && pIdx+1 < pLen {
 				// Next character is literal
@@ -1175,7 +1198,7 @@ func matchLikePattern(str, pattern string, escape rune) bool {
 				}
 				return false
 			}
-			
+
 			// Handle wildcard characters
 			if pChar == '%' {
 				star = pIdx
@@ -1189,7 +1212,7 @@ func matchLikePattern(str, pattern string, escape rune) bool {
 				continue
 			}
 		}
-		
+
 		// No match, backtrack to last %
 		if star != -1 {
 			pIdx = star + 1
@@ -1199,12 +1222,12 @@ func matchLikePattern(str, pattern string, escape rune) bool {
 		}
 		return false
 	}
-	
+
 	// Consume remaining % in pattern
 	for pIdx < pLen && pattern[pIdx] == '%' {
 		pIdx++
 	}
-	
+
 	return pIdx == pLen
 }
 
@@ -2336,7 +2359,7 @@ func evalAggregateFuncCall(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 		if len(rows) == 0 {
 			return nil, nil
 		}
-		
+
 		// Create a new FuncCall with evaluated arguments
 		evaledArgs := make([]Expr, len(ex.Args))
 		for i, arg := range ex.Args {
@@ -2346,14 +2369,14 @@ func evalAggregateFuncCall(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 			}
 			evaledArgs[i] = &Literal{Val: val}
 		}
-		
+
 		evaledFunc := &FuncCall{
-			Name: ex.Name,
-			Args: evaledArgs,
-			Star: ex.Star,
+			Name:     ex.Name,
+			Args:     evaledArgs,
+			Star:     ex.Star,
 			Distinct: ex.Distinct,
 		}
-		
+
 		// Now evaluate the function normally with a single row
 		return evalFuncCall(env, evaledFunc, rows[0])
 	}
@@ -2366,7 +2389,7 @@ func evalAggregateCount(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 	if len(ex.Args) != 1 {
 		return nil, fmt.Errorf("COUNT expects 1 arg")
 	}
-	
+
 	// Handle COUNT(DISTINCT col)
 	if ex.Distinct {
 		seen := make(map[string]bool)
@@ -2386,7 +2409,7 @@ func evalAggregateCount(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 		}
 		return len(seen), nil
 	}
-	
+
 	// Regular COUNT(col)
 	cnt := 0
 	for _, r := range rows {
@@ -2490,10 +2513,10 @@ func evalAggregateMedian(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 	if len(values) == 0 {
 		return nil, nil
 	}
-	
+
 	// Sort values
 	sort.Float64s(values)
-	
+
 	// Calculate median
 	n := len(values)
 	if n%2 == 1 {

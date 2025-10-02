@@ -23,14 +23,14 @@ func createTable(ctx context.Context, db *storage.DB, tenant, tableName string, 
 			Type: colTypes[i],
 		}
 	}
-	
+
 	// Create new table
 	tbl := &storage.Table{
 		Name: tableName,
 		Cols: cols,
 		Rows: make([][]any, 0),
 	}
-	
+
 	// Add to database (creates if not exists)
 	if err := db.Put(tenant, tbl); err != nil {
 		// If table already exists, that's okay
@@ -39,7 +39,7 @@ func createTable(ctx context.Context, db *storage.DB, tenant, tableName string, 
 		}
 		return fmt.Errorf("create table %s: %w", tableName, err)
 	}
-	
+
 	return nil
 }
 
@@ -50,10 +50,10 @@ func truncateTable(ctx context.Context, db *storage.DB, tenant, tableName string
 	if err != nil {
 		return fmt.Errorf("get table %s: %w", tableName, err)
 	}
-	
+
 	// Clear all rows
 	tbl.Rows = make([][]any, 0)
-	
+
 	return nil
 }
 
@@ -72,30 +72,30 @@ func insertAllRecords(
 	allRecords [][]string,
 	opts *ImportOptions,
 ) (rowsInserted int64, rowsSkipped int64, errors []string) {
-	
+
 	errors = make([]string, 0)
 	batch := make([][]any, 0, opts.BatchSize)
-	
+
 	// Helper to flush batch
 	flushBatch := func() error {
 		if len(batch) == 0 {
 			return nil
 		}
-		
+
 		// Get table and append rows directly
 		tbl, err := db.Get(tenant, tableName)
 		if err != nil {
 			return fmt.Errorf("get table: %w", err)
 		}
-		
+
 		// Append batch to table rows
 		tbl.Rows = append(tbl.Rows, batch...)
-		
+
 		rowsInserted += int64(len(batch))
 		batch = batch[:0] // Clear batch
 		return nil
 	}
-	
+
 	// Process all records
 	for rowNum, rec := range allRecords {
 		// Convert and validate row
@@ -109,9 +109,9 @@ func insertAllRecords(
 			rowsSkipped++
 			continue
 		}
-		
+
 		batch = append(batch, row)
-		
+
 		// Flush batch when full
 		if len(batch) >= opts.BatchSize {
 			if err := flushBatch(); err != nil {
@@ -119,7 +119,7 @@ func insertAllRecords(
 				return rowsInserted, rowsSkipped, errors
 			}
 		}
-		
+
 		// Check context cancellation
 		select {
 		case <-ctx.Done():
@@ -128,12 +128,12 @@ func insertAllRecords(
 		default:
 		}
 	}
-	
+
 	// Flush remaining batch
 	if err := flushBatch(); err != nil {
 		errors = append(errors, err.Error())
 	}
-	
+
 	return rowsInserted, rowsSkipped, errors
 }
 
@@ -150,30 +150,30 @@ func streamInsertCSV(
 	csvr *csv.Reader,
 	opts *ImportOptions,
 ) (rowsInserted int64, rowsSkipped int64, errors []string) {
-	
+
 	errors = make([]string, 0)
 	batch := make([][]any, 0, opts.BatchSize)
-	
+
 	// Helper to flush batch
 	flushBatch := func() error {
 		if len(batch) == 0 {
 			return nil
 		}
-		
+
 		// Get table and append rows directly
 		tbl, err := db.Get(tenant, tableName)
 		if err != nil {
 			return fmt.Errorf("get table: %w", err)
 		}
-		
+
 		// Append batch to table rows
 		tbl.Rows = append(tbl.Rows, batch...)
-		
+
 		rowsInserted += int64(len(batch))
 		batch = batch[:0] // Clear batch
 		return nil
 	}
-	
+
 	// Process first data row if present (no-header case)
 	if firstDataRow != nil {
 		row, err := convertRow(firstDataRow, colNames, colTypes, opts)
@@ -188,13 +188,13 @@ func streamInsertCSV(
 			batch = append(batch, row)
 		}
 	}
-	
+
 	// Process remaining rows
 	rowNum := 1
 	if firstDataRow == nil {
 		rowNum = 0 // Header was present
 	}
-	
+
 	for {
 		rec, err := csvr.Read()
 		if err == io.EOF {
@@ -205,9 +205,9 @@ func streamInsertCSV(
 			rowsSkipped++
 			continue
 		}
-		
+
 		rowNum++
-		
+
 		// Convert and validate row
 		row, err := convertRow(rec, colNames, colTypes, opts)
 		if err != nil {
@@ -219,9 +219,9 @@ func streamInsertCSV(
 			rowsSkipped++
 			continue
 		}
-		
+
 		batch = append(batch, row)
-		
+
 		// Flush batch when full
 		if len(batch) >= opts.BatchSize {
 			if err := flushBatch(); err != nil {
@@ -229,7 +229,7 @@ func streamInsertCSV(
 				return rowsInserted, rowsSkipped, errors
 			}
 		}
-		
+
 		// Check context cancellation
 		select {
 		case <-ctx.Done():
@@ -238,25 +238,25 @@ func streamInsertCSV(
 		default:
 		}
 	}
-	
+
 	// Flush remaining batch
 	if err := flushBatch(); err != nil {
 		errors = append(errors, err.Error())
 	}
-	
+
 	return rowsInserted, rowsSkipped, errors
 }
 
 // convertRow converts a CSV record to a typed row for insertion.
 func convertRow(rec []string, colNames []string, colTypes []storage.ColType, opts *ImportOptions) ([]any, error) {
 	row := make([]any, len(colNames))
-	
+
 	for i := 0; i < len(colNames); i++ {
 		var val string
 		if i < len(rec) {
 			val = rec[i]
 		}
-		
+
 		converted, err := convertValue(val, colTypes[i], opts.DateTimeFormats, opts.NullLiterals)
 		if err != nil {
 			// On error, fall back to string if not strict
@@ -269,6 +269,6 @@ func convertRow(rec []string, colNames []string, colTypes []storage.ColType, opt
 			row[i] = converted
 		}
 	}
-	
+
 	return row, nil
 }

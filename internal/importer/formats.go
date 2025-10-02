@@ -47,7 +47,7 @@ func ImportFile(
 
 	// Detect format from extension
 	ext := strings.ToLower(filepath.Ext(filePath))
-	
+
 	// If table name not provided, derive from filename
 	if tableName == "" {
 		base := filepath.Base(filePath)
@@ -71,20 +71,20 @@ func ImportFile(
 			opts.DelimiterCandidates = []rune{','}
 		}
 		return ImportCSV(ctx, db, tenant, tableName, f, opts)
-		
+
 	case ".tsv", ".tab":
 		if opts == nil {
 			opts = &ImportOptions{}
 		}
 		opts.DelimiterCandidates = []rune{'\t'}
 		return ImportCSV(ctx, db, tenant, tableName, f, opts)
-		
+
 	case ".json":
 		return ImportJSON(ctx, db, tenant, tableName, f, opts)
-		
+
 	case ".xml":
 		return ImportXML(ctx, db, tenant, tableName, f, opts)
-		
+
 	default:
 		// Try auto-detection by content
 		return importByContent(ctx, db, tenant, tableName, f, opts)
@@ -103,7 +103,7 @@ func importByContent(
 	// Peek at first bytes
 	br := bufio.NewReader(f)
 	peek, _ := br.Peek(512)
-	
+
 	// Check for JSON
 	trimmed := strings.TrimSpace(string(peek))
 	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
@@ -111,13 +111,13 @@ func importByContent(
 		f.Seek(0, 0)
 		return ImportJSON(ctx, db, tenant, tableName, f, opts)
 	}
-	
+
 	// Check for XML
 	if strings.HasPrefix(trimmed, "<?xml") || strings.HasPrefix(trimmed, "<") {
 		f.Seek(0, 0)
 		return ImportXML(ctx, db, tenant, tableName, f, opts)
 	}
-	
+
 	// Default to CSV with auto-detection
 	f.Seek(0, 0)
 	return ImportCSV(ctx, db, tenant, tableName, f, opts)
@@ -127,22 +127,22 @@ func importByContent(
 func sanitizeTableName(name string) string {
 	// Replace non-alphanumeric chars with underscore
 	name = strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || 
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
 			(r >= '0' && r <= '9') || r == '_' {
 			return r
 		}
 		return '_'
 	}, name)
-	
+
 	// Remove leading digits
 	name = strings.TrimLeftFunc(name, func(r rune) bool {
 		return r >= '0' && r <= '9'
 	})
-	
+
 	if name == "" {
 		name = "imported_table"
 	}
-	
+
 	return name
 }
 
@@ -175,7 +175,7 @@ func ImportJSON(
 
 	// Try to decode as array of objects first
 	dec := json.NewDecoder(src)
-	
+
 	// Peek at first token
 	token, err := dec.Token()
 	if err != nil {
@@ -183,7 +183,7 @@ func ImportJSON(
 	}
 
 	var records []map[string]any
-	
+
 	if delim, ok := token.(json.Delim); ok && delim == '[' {
 		// Array format
 		for dec.More() {
@@ -261,10 +261,10 @@ func ImportJSON(
 		row := make([]any, len(colNames))
 		for j, col := range colNames {
 			if val, ok := rec[col]; ok {
-				converted, err := convertValue(fmt.Sprintf("%v", val), colTypes[j], 
+				converted, err := convertValue(fmt.Sprintf("%v", val), colTypes[j],
 					opts.DateTimeFormats, opts.NullLiterals)
 				if err != nil && opts.StrictTypes {
-					result.Errors = append(result.Errors, 
+					result.Errors = append(result.Errors,
 						fmt.Sprintf("row %d, col %s: %v", i+1, col, err))
 					result.RowsSkipped++
 					continue
@@ -286,8 +286,8 @@ func ImportJSON(
 // XMLRecord represents a generic XML element for table import.
 type XMLRecord struct {
 	XMLName xml.Name
-	Attrs   []xml.Attr `xml:",any,attr"`
-	Content string     `xml:",chardata"`
+	Attrs   []xml.Attr  `xml:",any,attr"`
+	Content string      `xml:",chardata"`
 	Nodes   []XMLRecord `xml:",any"`
 }
 
@@ -343,7 +343,7 @@ func ImportXML(
 func OpenFile(ctx context.Context, filePath string, opts *ImportOptions) (*storage.DB, string, error) {
 	db := storage.NewDB()
 	tenant := "default"
-	
+
 	// Derive table name from file if not specified
 	tableName := ""
 	if opts != nil && opts.TableName != "" {
@@ -353,11 +353,11 @@ func OpenFile(ctx context.Context, filePath string, opts *ImportOptions) (*stora
 		tableName = strings.TrimSuffix(base, filepath.Ext(base))
 		tableName = sanitizeTableName(tableName)
 	}
-	
+
 	_, err := ImportFile(ctx, db, tenant, tableName, filePath, opts)
 	if err != nil {
 		return nil, "", err
 	}
-	
+
 	return db, tableName, nil
 }

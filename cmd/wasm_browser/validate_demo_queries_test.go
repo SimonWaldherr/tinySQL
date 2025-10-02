@@ -56,51 +56,51 @@ func setupTestDB() *storage.DB {
 // Demo queries from index.html
 var demoQueries = map[string]string{
 	// Date & Time Functions
-	"datediff_group":    "SELECT user_id, DATEDIFF('HOURS', MIN(ts), MAX(ts)) AS hours_span FROM events GROUP BY user_id ORDER BY user_id",
-	"datediff_days":     "SELECT user_id, MIN(ts) AS first_event, MAX(ts) AS last_event, DATEDIFF('DAYS', MIN(ts), MAX(ts)) AS days_active FROM events GROUP BY user_id HAVING COUNT(*) > 1",
-	"datediff_minutes":  "SELECT e1.user_id, e1.ts AS login_time, e2.ts AS next_event, DATEDIFF('MINUTES', e1.ts, e2.ts) AS minutes_diff FROM events e1 JOIN events e2 ON e1.user_id = e2.user_id AND e2.id > e1.id WHERE JSON_GET(e1.data, 'type') = 'login' ORDER BY e1.user_id, e1.ts",
-	"events_by_date":    "SELECT LEFT(ts, 10) AS event_date, COUNT(*) AS event_count, COUNT(DISTINCT user_id) AS unique_users FROM events GROUP BY LEFT(ts, 10) ORDER BY event_date",
+	"datediff_group":   "SELECT user_id, DATEDIFF('HOURS', MIN(ts), MAX(ts)) AS hours_span FROM events GROUP BY user_id ORDER BY user_id",
+	"datediff_days":    "SELECT user_id, MIN(ts) AS first_event, MAX(ts) AS last_event, DATEDIFF('DAYS', MIN(ts), MAX(ts)) AS days_active FROM events GROUP BY user_id HAVING COUNT(*) > 1",
+	"datediff_minutes": "SELECT e1.user_id, e1.ts AS login_time, e2.ts AS next_event, DATEDIFF('MINUTES', e1.ts, e2.ts) AS minutes_diff FROM events e1 JOIN events e2 ON e1.user_id = e2.user_id AND e2.id > e1.id WHERE JSON_GET(e1.data, 'type') = 'login' ORDER BY e1.user_id, e1.ts",
+	"events_by_date":   "SELECT LEFT(ts, 10) AS event_date, COUNT(*) AS event_count, COUNT(DISTINCT user_id) AS unique_users FROM events GROUP BY LEFT(ts, 10) ORDER BY event_date",
 
 	// JSON Operations
-	"json_get":          "SELECT id, JSON_GET(meta, 'device') AS device FROM orders ORDER BY id",
-	"json_get_nested":   "SELECT id, JSON_GET(meta, 'device') AS device, JSON_GET(meta, 'items.0.sku') AS first_sku, JSON_GET(meta, 'items.0.qty') AS first_qty FROM orders WHERE meta IS NOT NULL ORDER BY id",
+	"json_get":           "SELECT id, JSON_GET(meta, 'device') AS device FROM orders ORDER BY id",
+	"json_get_nested":    "SELECT id, JSON_GET(meta, 'device') AS device, JSON_GET(meta, 'items.0.sku') AS first_sku, JSON_GET(meta, 'items.0.qty') AS first_qty FROM orders WHERE meta IS NOT NULL ORDER BY id",
 	"json_extract_items": "SELECT id, amount, JSON_GET(meta, 'device') AS device, CASE WHEN JSON_GET(meta, 'items.1.sku') IS NOT NULL THEN 'multi' ELSE 'single' END AS item_count FROM orders WHERE JSON_GET(meta, 'device') IS NOT NULL",
-	"json_device_stats": "SELECT JSON_GET(meta, 'device') AS device, COUNT(*) AS order_count, SUM(amount) AS total_revenue, AVG(amount) AS avg_order_value FROM orders WHERE JSON_GET(meta, 'device') IS NOT NULL GROUP BY JSON_GET(meta, 'device') ORDER BY total_revenue DESC",
+	"json_device_stats":  "SELECT JSON_GET(meta, 'device') AS device, COUNT(*) AS order_count, SUM(amount) AS total_revenue, AVG(amount) AS avg_order_value FROM orders WHERE JSON_GET(meta, 'device') IS NOT NULL GROUP BY JSON_GET(meta, 'device') ORDER BY total_revenue DESC",
 
 	// Joins & Relations
-	"join_agg":          "SELECT u.name, COUNT(o.id) AS orders, SUM(o.amount) AS revenue FROM users u JOIN orders o ON u.id = o.user_id WHERE o.status = 'PAID' GROUP BY u.name ORDER BY revenue DESC",
-	"left_join":         "SELECT u.name, u.email, COUNT(o.id) AS order_count, SUM(o.amount) AS total_spent FROM users u LEFT JOIN orders o ON u.id = o.user_id AND o.status = 'PAID' GROUP BY u.id, u.name, u.email ORDER BY total_spent DESC",
-	"multi_join":        "SELECT u.name, COUNT(DISTINCT o.id) AS orders, COUNT(DISTINCT e.id) AS events, MAX(e.ts) AS last_activity FROM users u LEFT JOIN orders o ON u.id = o.user_id LEFT JOIN events e ON u.id = e.user_id GROUP BY u.id, u.name ORDER BY last_activity DESC",
-	"self_join":         "SELECT e1.user_id, JSON_GET(e1.data, 'type') AS first_event, JSON_GET(e2.data, 'type') AS second_event, e1.ts AS first_time, e2.ts AS second_time FROM events e1 JOIN events e2 ON e1.user_id = e2.user_id AND e2.id = e1.id + 1 ORDER BY e1.user_id, e1.ts",
+	"join_agg":   "SELECT u.name, COUNT(o.id) AS orders, SUM(o.amount) AS revenue FROM users u JOIN orders o ON u.id = o.user_id WHERE o.status = 'PAID' GROUP BY u.name ORDER BY revenue DESC",
+	"left_join":  "SELECT u.name, u.email, COUNT(o.id) AS order_count, SUM(o.amount) AS total_spent FROM users u LEFT JOIN orders o ON u.id = o.user_id AND o.status = 'PAID' GROUP BY u.id, u.name, u.email ORDER BY total_spent DESC",
+	"multi_join": "SELECT u.name, COUNT(DISTINCT o.id) AS orders, COUNT(DISTINCT e.id) AS events, MAX(e.ts) AS last_activity FROM users u LEFT JOIN orders o ON u.id = o.user_id LEFT JOIN events e ON u.id = e.user_id GROUP BY u.id, u.name ORDER BY last_activity DESC",
+	"self_join":  "SELECT e1.user_id, JSON_GET(e1.data, 'type') AS first_event, JSON_GET(e2.data, 'type') AS second_event, e1.ts AS first_time, e2.ts AS second_time FROM events e1 JOIN events e2 ON e1.user_id = e2.user_id AND e2.id = e1.id + 1 ORDER BY e1.user_id, e1.ts",
 
 	// Aggregation & Grouping
-	"count_by_status":   "SELECT status, COUNT(*) AS order_count, SUM(amount) AS total_amount, AVG(amount) AS avg_amount FROM orders GROUP BY status ORDER BY order_count DESC",
-	"avg_order_value":   "SELECT u.name, COUNT(o.id) AS order_count, AVG(o.amount) AS avg_order_value, MIN(o.amount) AS min_order, MAX(o.amount) AS max_order FROM users u JOIN orders o ON u.id = o.user_id WHERE o.status = 'PAID' GROUP BY u.id, u.name HAVING COUNT(o.id) >= 1 ORDER BY avg_order_value DESC",
-	"sum_by_user":       "SELECT u.name, SUM(o.amount) AS total_revenue, COUNT(o.id) AS order_count FROM users u JOIN orders o ON u.id = o.user_id WHERE o.status = 'PAID' GROUP BY u.id, u.name ORDER BY total_revenue DESC",
-	"min_max_orders":    "SELECT MIN(amount) AS smallest_order, MAX(amount) AS largest_order, AVG(amount) AS average_order, COUNT(*) AS total_orders FROM orders WHERE status = 'PAID'",
-	"having_clause":     "SELECT u.name, COUNT(o.id) AS order_count, SUM(o.amount) AS total_spent FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.name HAVING COUNT(o.id) > 1 ORDER BY order_count DESC",
+	"count_by_status": "SELECT status, COUNT(*) AS order_count, SUM(amount) AS total_amount, AVG(amount) AS avg_amount FROM orders GROUP BY status ORDER BY order_count DESC",
+	"avg_order_value": "SELECT u.name, COUNT(o.id) AS order_count, AVG(o.amount) AS avg_order_value, MIN(o.amount) AS min_order, MAX(o.amount) AS max_order FROM users u JOIN orders o ON u.id = o.user_id WHERE o.status = 'PAID' GROUP BY u.id, u.name HAVING COUNT(o.id) >= 1 ORDER BY avg_order_value DESC",
+	"sum_by_user":     "SELECT u.name, SUM(o.amount) AS total_revenue, COUNT(o.id) AS order_count FROM users u JOIN orders o ON u.id = o.user_id WHERE o.status = 'PAID' GROUP BY u.id, u.name ORDER BY total_revenue DESC",
+	"min_max_orders":  "SELECT MIN(amount) AS smallest_order, MAX(amount) AS largest_order, AVG(amount) AS average_order, COUNT(*) AS total_orders FROM orders WHERE status = 'PAID'",
+	"having_clause":   "SELECT u.name, COUNT(o.id) AS order_count, SUM(o.amount) AS total_spent FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.name HAVING COUNT(o.id) > 1 ORDER BY order_count DESC",
 
 	// Subqueries & Advanced
-	"subquery_avg":      "SELECT id, user_id, amount, status FROM orders WHERE amount > (SELECT AVG(amount) FROM orders WHERE status = 'PAID') ORDER BY amount DESC",
+	"subquery_avg": "SELECT id, user_id, amount, status FROM orders WHERE amount > (SELECT AVG(amount) FROM orders WHERE status = 'PAID') ORDER BY amount DESC",
 	// "exists_clause":     "SELECT u.name, u.email FROM users u WHERE EXISTS (SELECT 1 FROM events e WHERE e.user_id = u.id) ORDER BY u.name", // NOT SUPPORTED YET
 	// "in_subquery":       "SELECT name, email FROM users WHERE active = TRUE AND id IN (SELECT DISTINCT user_id FROM orders WHERE status = 'PAID') ORDER BY name", // SUBQUERY IN IN NOT SUPPORTED
 	// "correlated_subquery": "SELECT u.name, o.id, o.amount, o.status FROM users u JOIN orders o ON u.id = o.user_id WHERE o.id = (SELECT MIN(id) FROM orders o2 WHERE o2.user_id = u.id) ORDER BY o.amount DESC", // SUBQUERY IN WHERE NOT SUPPORTED
 
 	// Filtering & Conditions
-	"null_handling":     "SELECT name, CASE WHEN email IS NULL THEN 'Keine Email' ELSE email END AS email_status, active FROM users WHERE email IS NULL OR email = '' ORDER BY name",
-	"case_when":         "SELECT u.name, SUM(o.amount) AS total_spent, CASE WHEN SUM(o.amount) > 150 THEN 'Premium' WHEN SUM(o.amount) > 75 THEN 'Standard' ELSE 'Basic' END AS customer_tier FROM users u LEFT JOIN orders o ON u.id = o.user_id AND o.status = 'PAID' GROUP BY u.id, u.name ORDER BY total_spent DESC",
-	"like_pattern":      "SELECT name, email, active FROM users WHERE name LIKE '%a%' OR name LIKE 'C%' ORDER BY name",
-	"between_dates":     "SELECT user_id, ts, JSON_GET(data, 'type') AS event_type FROM events WHERE ts BETWEEN '2023-01-01' AND '2023-01-02T23:59:59' ORDER BY ts",
+	"null_handling": "SELECT name, CASE WHEN email IS NULL THEN 'Keine Email' ELSE email END AS email_status, active FROM users WHERE email IS NULL OR email = '' ORDER BY name",
+	"case_when":     "SELECT u.name, SUM(o.amount) AS total_spent, CASE WHEN SUM(o.amount) > 150 THEN 'Premium' WHEN SUM(o.amount) > 75 THEN 'Standard' ELSE 'Basic' END AS customer_tier FROM users u LEFT JOIN orders o ON u.id = o.user_id AND o.status = 'PAID' GROUP BY u.id, u.name ORDER BY total_spent DESC",
+	"like_pattern":  "SELECT name, email, active FROM users WHERE name LIKE '%a%' OR name LIKE 'C%' ORDER BY name",
+	"between_dates": "SELECT user_id, ts, JSON_GET(data, 'type') AS event_type FROM events WHERE ts BETWEEN '2023-01-01' AND '2023-01-02T23:59:59' ORDER BY ts",
 
 	// Analytics & Reporting
-	"timeseries":        "SELECT user_id, ts, JSON_GET(data, 'type') AS event_type FROM events ORDER BY user_id, ts",
-	"cohort_analysis":   "SELECT user_id, MIN(ts) AS first_seen, MAX(ts) AS last_seen, COUNT(*) AS total_events, DATEDIFF('HOURS', MIN(ts), MAX(ts)) AS session_hours FROM events GROUP BY user_id ORDER BY session_hours DESC",
-	"revenue_analysis":  "SELECT LEFT(CAST(o.id AS TEXT), 1) AS period, COUNT(*) AS orders, SUM(amount) AS revenue, AVG(amount) AS avg_order_value, COUNT(DISTINCT user_id) AS unique_customers FROM orders o WHERE status = 'PAID' GROUP BY LEFT(CAST(o.id AS TEXT), 1) ORDER BY period",
-	"user_activity":     "SELECT JSON_GET(data, 'type') AS event_type, COUNT(*) AS frequency, COUNT(DISTINCT user_id) AS unique_users, MIN(ts) AS first_occurrence, MAX(ts) AS last_occurrence FROM events GROUP BY JSON_GET(data, 'type') ORDER BY frequency DESC",
+	"timeseries":       "SELECT user_id, ts, JSON_GET(data, 'type') AS event_type FROM events ORDER BY user_id, ts",
+	"cohort_analysis":  "SELECT user_id, MIN(ts) AS first_seen, MAX(ts) AS last_seen, COUNT(*) AS total_events, DATEDIFF('HOURS', MIN(ts), MAX(ts)) AS session_hours FROM events GROUP BY user_id ORDER BY session_hours DESC",
+	"revenue_analysis": "SELECT LEFT(CAST(o.id AS TEXT), 1) AS period, COUNT(*) AS orders, SUM(amount) AS revenue, AVG(amount) AS avg_order_value, COUNT(DISTINCT user_id) AS unique_customers FROM orders o WHERE status = 'PAID' GROUP BY LEFT(CAST(o.id AS TEXT), 1) ORDER BY period",
+	"user_activity":    "SELECT JSON_GET(data, 'type') AS event_type, COUNT(*) AS frequency, COUNT(DISTINCT user_id) AS unique_users, MIN(ts) AS first_occurrence, MAX(ts) AS last_occurrence FROM events GROUP BY JSON_GET(data, 'type') ORDER BY frequency DESC",
 
 	// Utility & Testing
-	"distinct_values":   "SELECT 'Order Status' AS category, status AS value, COUNT(*) AS count FROM orders GROUP BY status UNION ALL SELECT 'Event Types' AS category, JSON_GET(data, 'type') AS value, COUNT(*) AS count FROM events GROUP BY JSON_GET(data, 'type') ORDER BY category, count DESC",
-	"limit_offset":      "SELECT id, user_id, amount, status FROM orders ORDER BY amount DESC LIMIT 3 OFFSET 1",
+	"distinct_values": "SELECT 'Order Status' AS category, status AS value, COUNT(*) AS count FROM orders GROUP BY status UNION ALL SELECT 'Event Types' AS category, JSON_GET(data, 'type') AS value, COUNT(*) AS count FROM events GROUP BY JSON_GET(data, 'type') ORDER BY category, count DESC",
+	"limit_offset":    "SELECT id, user_id, amount, status FROM orders ORDER BY amount DESC LIMIT 3 OFFSET 1",
 }
 
 func TestAllDemoQueries(t *testing.T) {
@@ -151,34 +151,34 @@ func TestProblematicQueries(t *testing.T) {
 	tenant := "default"
 
 	tests := []struct {
-		name string
-		sql  string
+		name        string
+		sql         string
 		expectError bool
-		reason string
+		reason      string
 	}{
 		{
-			name: "COALESCE in aggregate",
-			sql:  "SELECT u.name, u.email, COALESCE(COUNT(o.id), 0) AS order_count FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.name, u.email",
+			name:        "COALESCE in aggregate",
+			sql:         "SELECT u.name, u.email, COALESCE(COUNT(o.id), 0) AS order_count FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.name, u.email",
 			expectError: false, // COALESCE now works correctly
-			reason: "COALESCE should work in SELECT with aggregates",
+			reason:      "COALESCE should work in SELECT with aggregates",
 		},
 		{
-			name: "Subquery in WHERE",
-			sql:  "SELECT id FROM orders WHERE amount > (SELECT AVG(amount) FROM orders)",
+			name:        "Subquery in WHERE",
+			sql:         "SELECT id FROM orders WHERE amount > (SELECT AVG(amount) FROM orders)",
 			expectError: false,
-			reason: "Scalar subquery in WHERE should work",
+			reason:      "Scalar subquery in WHERE should work",
 		},
 		{
-			name: "EXISTS clause",
-			sql:  "SELECT name FROM users u WHERE EXISTS (SELECT 1 FROM events e WHERE e.user_id = u.id)",
+			name:        "EXISTS clause",
+			sql:         "SELECT name FROM users u WHERE EXISTS (SELECT 1 FROM events e WHERE e.user_id = u.id)",
 			expectError: true, // EXISTS not supported yet
-			reason: "EXISTS clause not implemented",
+			reason:      "EXISTS clause not implemented",
 		},
 		{
-			name: "IN with subquery",
-			sql:  "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders WHERE status = 'PAID')",
+			name:        "IN with subquery",
+			sql:         "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders WHERE status = 'PAID')",
 			expectError: true, // Subquery in IN not supported
-			reason: "Subquery in IN clause not implemented",
+			reason:      "Subquery in IN clause not implemented",
 		},
 	}
 

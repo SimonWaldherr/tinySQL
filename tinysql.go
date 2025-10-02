@@ -631,7 +631,7 @@ func ImportCSV(ctx context.Context, db *DB, tenant, tableName string, src io.Rea
 // Example:
 //
 //	jsonData := `[{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]`
-//	result, err := tinysql.ImportJSON(ctx, db, "default", "users", 
+//	result, err := tinysql.ImportJSON(ctx, db, "default", "users",
 //	    strings.NewReader(jsonData), nil)
 //
 // Parameters:
@@ -671,4 +671,3 @@ func ImportJSON(ctx context.Context, db *DB, tenant, tableName string, src io.Re
 func OpenFile(ctx context.Context, filePath string, opts *ImportOptions) (*DB, string, error) {
 	return importer.OpenFile(ctx, filePath, opts)
 }
-

@@ -17,11 +17,11 @@ func TestImportCSV_Basic(t *testing.T) {
 2,Bob,25
 3,Charlie,35`
 
-	result, err := ImportCSV(ctx, db, "default", "users", 
+	result, err := ImportCSV(ctx, db, "default", "users",
 		strings.NewReader(csvData), &ImportOptions{
-			CreateTable: true,
+			CreateTable:   true,
 			TypeInference: true,
-			HeaderMode: "present",
+			HeaderMode:    "present",
 		})
 
 	if err != nil {
@@ -62,7 +62,7 @@ func TestImportCSV_NoHeader(t *testing.T) {
 	result, err := ImportCSV(ctx, db, "default", "users",
 		strings.NewReader(csvData), &ImportOptions{
 			CreateTable: true,
-			HeaderMode: "absent",
+			HeaderMode:  "absent",
 		})
 
 	if err != nil {
@@ -94,7 +94,7 @@ func TestImportCSV_TSV(t *testing.T) {
 
 	result, err := ImportCSV(ctx, db, "default", "users",
 		strings.NewReader(tsvData), &ImportOptions{
-			CreateTable: true,
+			CreateTable:         true,
 			DelimiterCandidates: []rune{'\t'},
 		})
 
@@ -122,9 +122,9 @@ func TestImportCSV_TypeInference(t *testing.T) {
 
 	result, err := ImportCSV(ctx, db, "default", "products",
 		strings.NewReader(csvData), &ImportOptions{
-			CreateTable: true,
+			CreateTable:   true,
 			TypeInference: true,
-			HeaderMode: "present", // Explicitly state header is present
+			HeaderMode:    "present", // Explicitly state header is present
 		})
 
 	if err != nil {
@@ -141,20 +141,20 @@ func TestImportCSV_TypeInference(t *testing.T) {
 
 	// Check inferred types
 	if result.ColumnTypes[0] != storage.IntType {
-		t.Errorf("Column %s: expected INT type, got %v", 
+		t.Errorf("Column %s: expected INT type, got %v",
 			result.ColumnNames[0], result.ColumnTypes[0])
 	}
-	
+
 	if result.ColumnTypes[1] != storage.TextType {
 		t.Errorf("Column %s: expected TEXT type, got %v",
 			result.ColumnNames[1], result.ColumnTypes[1])
 	}
-	
+
 	if result.ColumnTypes[2] != storage.Float64Type {
 		t.Errorf("Column %s: expected FLOAT type, got %v",
 			result.ColumnNames[2], result.ColumnTypes[2])
 	}
-	
+
 	if result.ColumnTypes[3] != storage.BoolType {
 		t.Errorf("Column %s: expected BOOL type, got %v",
 			result.ColumnNames[3], result.ColumnTypes[3])
@@ -172,9 +172,9 @@ func TestImportCSV_NullHandling(t *testing.T) {
 
 	result, err := ImportCSV(ctx, db, "default", "users",
 		strings.NewReader(csvData), &ImportOptions{
-			CreateTable: true,
+			CreateTable:   true,
 			TypeInference: false, // Use TEXT for simplicity
-			NullLiterals: []string{"", "N/A", "null"},
+			NullLiterals:  []string{"", "N/A", "null"},
 		})
 
 	if err != nil {
@@ -187,12 +187,12 @@ func TestImportCSV_NullHandling(t *testing.T) {
 
 	// Verify nulls were inserted
 	tbl, _ := db.Get("default", "users")
-	
+
 	// Row 2 (index 1) should have NULL name
 	if tbl.Rows[1][1] != nil {
 		t.Errorf("Expected NULL for row 2 name, got %v", tbl.Rows[1][1])
 	}
-	
+
 	// Row 3 (index 2) should have NULL age
 	if tbl.Rows[2][2] != nil {
 		t.Errorf("Expected NULL for row 3 age, got %v", tbl.Rows[2][2])
@@ -211,7 +211,7 @@ func TestImportJSON_ArrayOfObjects(t *testing.T) {
 
 	result, err := ImportJSON(ctx, db, "default", "users",
 		strings.NewReader(jsonData), &ImportOptions{
-			CreateTable: true,
+			CreateTable:   true,
 			TypeInference: true,
 		})
 
@@ -239,7 +239,7 @@ func TestTypeInference_Integer(t *testing.T) {
 
 	types := inferColumnTypes(samples, 3, &ImportOptions{
 		TypeInference: true,
-		NullLiterals: []string{""},
+		NullLiterals:  []string{""},
 	})
 
 	if types[0] != storage.IntType {
@@ -255,7 +255,7 @@ func TestTypeInference_Float(t *testing.T) {
 
 	types := inferColumnTypes(samples, 3, &ImportOptions{
 		TypeInference: true,
-		NullLiterals: []string{""},
+		NullLiterals:  []string{""},
 	})
 
 	if types[0] != storage.Float64Type {
@@ -272,7 +272,7 @@ func TestTypeInference_Boolean(t *testing.T) {
 
 	types := inferColumnTypes(samples, 3, &ImportOptions{
 		TypeInference: true,
-		NullLiterals: []string{""},
+		NullLiterals:  []string{""},
 	})
 
 	for i := 0; i < 3; i++ {
@@ -291,7 +291,7 @@ func TestTypeInference_MixedDefaultsToText(t *testing.T) {
 
 	types := inferColumnTypes(samples, 3, &ImportOptions{
 		TypeInference: true,
-		NullLiterals: []string{""},
+		NullLiterals:  []string{""},
 	})
 
 	// All columns should default to TEXT due to mixed types

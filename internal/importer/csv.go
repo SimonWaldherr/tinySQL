@@ -97,14 +97,14 @@ type ImportOptions struct {
 
 // ImportResult returns metadata about the import operation.
 type ImportResult struct {
-	RowsInserted int64              // Total rows successfully inserted
-	RowsSkipped  int64              // Rows skipped due to errors (if StrictTypes=false)
-	Delimiter    rune               // Detected or configured delimiter
-	HadHeader    bool               // Whether a header row was detected/configured
-	Encoding     string             // Detected encoding: "utf-8", "utf-8-bom", "utf-16le", "utf-16be"
-	ColumnNames  []string           // Final column names used
-	ColumnTypes  []storage.ColType  // Detected column types
-	Errors       []string           // Non-fatal errors encountered during import
+	RowsInserted int64             // Total rows successfully inserted
+	RowsSkipped  int64             // Rows skipped due to errors (if StrictTypes=false)
+	Delimiter    rune              // Detected or configured delimiter
+	HadHeader    bool              // Whether a header row was detected/configured
+	Encoding     string            // Detected encoding: "utf-8", "utf-8-bom", "utf-16le", "utf-16be"
+	ColumnNames  []string          // Final column names used
+	ColumnTypes  []storage.ColType // Detected column types
+	Errors       []string          // Non-fatal errors encountered during import
 }
 
 // ============================================================================
@@ -184,7 +184,7 @@ func ImportCSV(
 	sr := bufio.NewReader(rr)
 	peek := peekN(sr, opts.SampleBytes)
 	lines := splitUniversal(string(peek))
-	
+
 	delim := detectDelimiter(lines, candidateDelims(opts.DelimiterCandidates))
 	result.Delimiter = delim
 
@@ -225,7 +225,7 @@ func ImportCSV(
 	if firstDataRow != nil {
 		allRecords = append(allRecords, firstDataRow)
 	}
-	
+
 	for {
 		rec, err := csvr.Read()
 		if err == io.EOF {
@@ -237,7 +237,7 @@ func ImportCSV(
 		}
 		allRecords = append(allRecords, rec)
 	}
-	
+
 	// Step 7: Analyze sample data for type inference
 	var colTypes []storage.ColType
 	if opts.TypeInference {
@@ -272,7 +272,7 @@ func ImportCSV(
 	}
 
 	// Step 10: Insert all data
-	rows, skipped, errs := insertAllRecords(ctx, db, tenant, tableName, colNames, colTypes, 
+	rows, skipped, errs := insertAllRecords(ctx, db, tenant, tableName, colNames, colTypes,
 		allRecords, opts)
 	result.RowsInserted = rows
 	result.RowsSkipped = skipped
@@ -359,12 +359,12 @@ func decodeUTF16All(b []byte, bigEndian bool) ([]byte, error) {
 	} else if !bigEndian && len(b) >= 2 && b[0] == 0xFF && b[1] == 0xFE {
 		b = b[2:]
 	}
-	
+
 	// Pad odd byte count
 	if len(b)%2 != 0 {
 		b = append(b, 0)
 	}
-	
+
 	u16s := make([]uint16, len(b)/2)
 	for i := 0; i < len(u16s); i++ {
 		if bigEndian {
@@ -373,7 +373,7 @@ func decodeUTF16All(b []byte, bigEndian bool) ([]byte, error) {
 			u16s[i] = uint16(b[i*2+1])<<8 | uint16(b[i*2])
 		}
 	}
-	
+
 	runes := utf16.Decode(u16s)
 	return []byte(string(runes)), nil
 }
@@ -451,7 +451,7 @@ func detectDelimiter(lines []string, cands []rune) rune {
 		fields int
 	}
 	var best *score
-	
+
 	for _, cand := range cands {
 		var counts []int
 		seen := 0
@@ -475,7 +475,7 @@ func detectDelimiter(lines []string, cands []rune) rune {
 			continue
 		}
 		sc := score{cand: cand, stdev: sd, fields: fields}
-		if best == nil || sc.stdev < best.stdev || 
+		if best == nil || sc.stdev < best.stdev ||
 			(math.Abs(sc.stdev-best.stdev) < 1e-9 && sc.fields > best.fields) {
 			cp := sc
 			best = &cp
@@ -513,7 +513,7 @@ func naiveSplitOutsideQuotes(ln string, delim rune) []string {
 	var out []string
 	var sb strings.Builder
 	inQ := false
-	
+
 	for i := 0; i < len(ln); {
 		r, w := utf8.DecodeRuneInString(ln[i:])
 		i += w
@@ -555,16 +555,16 @@ func decideHeader(records [][]string, mode string) bool {
 	case "absent":
 		return false
 	}
-	
+
 	if len(records) < 2 {
 		return false
 	}
-	
+
 	first := records[0]
 	body := records[1:]
 	cols := len(first)
 	headerish := 0
-	
+
 	for c := 0; c < cols; c++ {
 		headNum := looksNumeric(first[c])
 		dataNum := 0
@@ -650,7 +650,7 @@ func sanitizeColumnNames(h []string) []string {
 			if r == ' ' || r == '-' || r == '.' || r == '/' {
 				return '_'
 			}
-			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || 
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
 				(r >= '0' && r <= '9') || r == '_' {
 				return r
 			}
