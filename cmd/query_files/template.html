@@ -1,0 +1,843 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TinySQL Editor - Query Local Files</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            background: #1e1e1e;
+            color: #d4d4d4;
+        }
+
+        /* Top Bar */
+        .topbar {
+            background: #2d2d30;
+            border-bottom: 1px solid #3e3e42;
+            padding: 12px 16px;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .topbar h1 {
+            font-size: 16px;
+            font-weight: 600;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .topbar h1::before {
+            content: "⚡";
+            font-size: 20px;
+        }
+
+        .topbar button {
+            background: #0e639c;
+            border: none;
+            color: #fff;
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-size: 13px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .topbar button:hover {
+            background: #1177bb;
+        }
+
+        .spacer {
+            flex: 1;
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            color: #888;
+        }
+
+        .status-indicator {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #0f0;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        /* Main Layout */
+        .main {
+            flex: 1;
+            display: flex;
+            overflow: hidden;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: 280px;
+            background: #252526;
+            border-right: 1px solid #3e3e42;
+            display: flex;
+            flex-direction: column;
+            overflow-y: auto;
+        }
+
+        .sidebar-header {
+            padding: 12px;
+            background: #2d2d30;
+            border-bottom: 1px solid #3e3e42;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .sidebar-header h2 {
+            font-size: 13px;
+            font-weight: 600;
+            text-transform: uppercase;
+            color: #999;
+        }
+
+        .sidebar-header button {
+            background: transparent;
+            border: none;
+            color: #ccc;
+            cursor: pointer;
+            font-size: 18px;
+            padding: 4px;
+            border-radius: 3px;
+        }
+
+        .sidebar-header button:hover {
+            background: #3e3e42;
+        }
+
+        .table-list {
+            flex: 1;
+            overflow-y: auto;
+        }
+
+        .table-item {
+            padding: 10px 12px;
+            border-bottom: 1px solid #3e3e42;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .table-item:hover {
+            background: #2a2d2e;
+        }
+
+        .table-item.active {
+            background: #37373d;
+        }
+
+        .table-name {
+            font-size: 14px;
+            font-weight: 500;
+            color: #fff;
+            margin-bottom: 4px;
+        }
+
+        .table-meta {
+            font-size: 11px;
+            color: #888;
+            display: flex;
+            gap: 8px;
+        }
+
+        .table-columns {
+            margin-top: 6px;
+            font-size: 11px;
+            color: #999;
+            padding-left: 8px;
+        }
+
+        .table-columns-label {
+            color: #888;
+            font-weight: 600;
+            margin-bottom: 2px;
+        }
+
+        .column-tag {
+            display: inline-block;
+            background: #3e3e42;
+            padding: 2px 6px;
+            border-radius: 3px;
+            margin: 2px;
+            font-size: 10px;
+        }
+
+        /* Main Content */
+        .content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* Editor Area */
+        .editor-area {
+            background: #1e1e1e;
+            border-bottom: 1px solid #3e3e42;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .editor-toolbar {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        .editor-toolbar button {
+            background: #0e639c;
+            border: none;
+            color: #fff;
+            padding: 8px 16px;
+            border-radius: 4px;
+            font-size: 13px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: background 0.2s;
+        }
+
+        .editor-toolbar button:hover {
+            background: #1177bb;
+        }
+
+        .editor-toolbar button:disabled {
+            background: #555;
+            cursor: not-allowed;
+            opacity: 0.5;
+        }
+
+        .editor-toolbar .btn-secondary {
+            background: #3e3e42;
+        }
+
+        .editor-toolbar .btn-secondary:hover {
+            background: #505050;
+        }
+
+        textarea {
+            width: 100%;
+            min-height: 120px;
+            background: #2d2d30;
+            border: 1px solid #3e3e42;
+            color: #d4d4d4;
+            padding: 12px;
+            font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+            font-size: 14px;
+            border-radius: 4px;
+            resize: vertical;
+            line-height: 1.5;
+        }
+
+        textarea:focus {
+            outline: none;
+            border-color: #0e639c;
+        }
+
+        /* Results Area */
+        .results-area {
+            flex: 1;
+            overflow: auto;
+            background: #1e1e1e;
+            padding: 16px;
+        }
+
+        .results-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #3e3e42;
+        }
+
+        .results-info {
+            font-size: 13px;
+            color: #999;
+        }
+
+        .results-actions {
+            display: flex;
+            gap: 8px;
+        }
+
+        .results-actions button {
+            background: #3e3e42;
+            border: none;
+            color: #ccc;
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+
+        .results-actions button:hover {
+            background: #505050;
+        }
+
+        /* Table Styles */
+        .result-table {
+            width: 100%;
+            border-collapse: collapse;
+            background: #252526;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .result-table th {
+            background: #2d2d30;
+            color: #fff;
+            text-align: left;
+            padding: 12px;
+            font-weight: 600;
+            font-size: 13px;
+            border-bottom: 2px solid #3e3e42;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+
+        .result-table td {
+            padding: 10px 12px;
+            border-bottom: 1px solid #3e3e42;
+            font-size: 13px;
+            color: #d4d4d4;
+        }
+
+        .result-table tr:hover {
+            background: #2a2d2e;
+        }
+
+        .result-table td.null-value {
+            color: #888;
+            font-style: italic;
+        }
+
+        .result-table td.number-value {
+            font-family: 'Consolas', monospace;
+            color: #b5cea8;
+        }
+
+        .result-table td.boolean-value {
+            color: #569cd6;
+        }
+
+        /* Error/Empty States */
+        .error-message {
+            background: #5a1d1d;
+            border: 1px solid #f48771;
+            color: #f48771;
+            padding: 12px;
+            border-radius: 4px;
+            font-size: 13px;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #888;
+        }
+
+        .empty-state-icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+        }
+
+        .empty-state-title {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: #ccc;
+        }
+
+        .empty-state-text {
+            font-size: 14px;
+            line-height: 1.5;
+        }
+
+        /* File Upload */
+        .upload-area {
+            padding: 12px;
+            border-bottom: 1px solid #3e3e42;
+        }
+
+        .upload-btn {
+            display: inline-block;
+            background: #3e3e42;
+            color: #ccc;
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+
+        .upload-btn:hover {
+            background: #505050;
+        }
+
+        #fileInput {
+            display: none;
+        }
+
+        /* Query Examples */
+        .examples {
+            padding: 12px;
+            border-top: 1px solid #3e3e42;
+            background: #252526;
+        }
+
+        .examples-title {
+            font-size: 12px;
+            font-weight: 600;
+            color: #999;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+        }
+
+        .example-query {
+            background: #2d2d30;
+            padding: 8px;
+            margin: 6px 0;
+            border-radius: 4px;
+            font-family: 'Consolas', monospace;
+            font-size: 11px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .example-query:hover {
+            background: #3e3e42;
+        }
+
+        /* Loading Spinner */
+        .spinner {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid #555;
+            border-top-color: #fff;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar {
+            width: 10px;
+            height: 10px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #1e1e1e;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #3e3e42;
+            border-radius: 5px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #555;
+        }
+    </style>
+</head>
+<body>
+    <!-- Top Bar -->
+    <div class="topbar">
+        <h1>TinySQL Editor</h1>
+        <button onclick="showUploadDialog()">📁 Upload File</button>
+        <div class="spacer"></div>
+        <div class="status">
+            <div class="status-indicator"></div>
+            <span id="statusText">Ready</span>
+        </div>
+    </div>
+
+    <!-- Main Layout -->
+    <div class="main">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div class="sidebar-header">
+                <h2>Tables</h2>
+                <button onclick="loadTables()" title="Refresh">↻</button>
+            </div>
+            <div class="upload-area">
+                <label class="upload-btn" for="fileInput">
+                    + Upload File
+                </label>
+                <input type="file" id="fileInput" accept=".csv,.json,.xml" onchange="handleFileUpload(event)">
+            </div>
+            <div class="table-list" id="tableList">
+                <div class="empty-state">
+                    <div class="empty-state-icon">📊</div>
+                    <div class="empty-state-title">No Tables Loaded</div>
+                    <div class="empty-state-text">Upload a file or load from disk</div>
+                </div>
+            </div>
+            <div class="examples">
+                <div class="examples-title">Query Examples</div>
+                <div class="example-query" onclick="setQuery('SELECT * FROM users LIMIT 10')">
+                    SELECT * FROM users LIMIT 10
+                </div>
+                <div class="example-query" onclick="setQuery('SELECT name, age FROM users WHERE age > 25')">
+                    SELECT name, age FROM users WHERE age > 25
+                </div>
+                <div class="example-query" onclick="setQuery('SELECT COUNT(*) as total FROM users')">
+                    SELECT COUNT(*) as total FROM users
+                </div>
+                <div class="example-query" onclick="setQuery('SELECT * FROM users ORDER BY age DESC')">
+                    SELECT * FROM users ORDER BY age DESC
+                </div>
+            </div>
+        </div>
+
+        <!-- Main Content -->
+        <div class="content">
+            <!-- Editor Area -->
+            <div class="editor-area">
+                <div class="editor-toolbar">
+                    <button id="executeBtn" onclick="executeQuery()">
+                        ▶ Execute
+                    </button>
+                    <button class="btn-secondary" onclick="clearQuery()">Clear</button>
+                    <button class="btn-secondary" onclick="formatQuery()">Format</button>
+                </div>
+                <textarea id="queryEditor" placeholder="Enter your SQL query here...
+Example: SELECT * FROM users WHERE age > 25
+
+Supported functions:
+- SELECT, WHERE, ORDER BY, GROUP BY, HAVING
+- JOIN (INNER, LEFT, RIGHT, FULL)
+- Aggregations: COUNT, SUM, AVG, MIN, MAX
+- Functions: UPPER, LOWER, SUBSTR, etc."></textarea>
+            </div>
+
+            <!-- Results Area -->
+            <div class="results-area">
+                <div id="resultsContainer">
+                    <div class="empty-state">
+                        <div class="empty-state-icon">⚡</div>
+                        <div class="empty-state-title">Ready to Query</div>
+                        <div class="empty-state-text">
+                            Write your SQL query above and click Execute to see results
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentTables = [];
+
+        // Load tables on startup
+        document.addEventListener('DOMContentLoaded', () => {
+            loadTables();
+        });
+
+        // Load available tables
+        async function loadTables() {
+            try {
+                const response = await fetch('/api/tables');
+                const data = await response.json();
+                currentTables = data.tables || [];
+                renderTables();
+            } catch (error) {
+                console.error('Failed to load tables:', error);
+            }
+        }
+
+        // Render tables in sidebar
+        function renderTables() {
+            const tableList = document.getElementById('tableList');
+            
+            if (currentTables.length === 0) {
+                tableList.innerHTML = ` + "`" + `
+                    <div class="empty-state">
+                        <div class="empty-state-icon">📊</div>
+                        <div class="empty-state-title">No Tables Loaded</div>
+                        <div class="empty-state-text">Upload a file or load from disk</div>
+                    </div>
+                ` + "`" + `;
+                return;
+            }
+
+            tableList.innerHTML = currentTables.map(table => ` + "`" + `
+                <div class="table-item" onclick="selectTable('${table.name}')">
+                    <div class="table-name">${table.name}</div>
+                    <div class="table-meta">
+                        <span>📝 ${table.rowCount} rows</span>
+                        <span>📁 ${table.columns.length} cols</span>
+                    </div>
+                    <div class="table-columns">
+                        <div class="table-columns-label">Columns:</div>
+                        ${table.columns.map(col => ` + "`" + `<span class="column-tag">${col}</span>` + "`" + `).join('')}
+                    </div>
+                </div>
+            ` + "`" + `).join('');
+        }
+
+        // Select a table
+        function selectTable(tableName) {
+            setQuery(` + "`" + `SELECT * FROM ${tableName} LIMIT 10` + "`" + `);
+        }
+
+        // Set query in editor
+        function setQuery(query) {
+            document.getElementById('queryEditor').value = query;
+        }
+
+        // Clear query
+        function clearQuery() {
+            document.getElementById('queryEditor').value = '';
+        }
+
+        // Format query (basic)
+        function formatQuery() {
+            const editor = document.getElementById('queryEditor');
+            let query = editor.value.trim();
+            
+            // Basic SQL formatting
+            query = query
+                .replace(/\s+/g, ' ')
+                .replace(/\b(SELECT|FROM|WHERE|JOIN|ON|ORDER BY|GROUP BY|HAVING|LIMIT)\b/gi, '\n$1')
+                .replace(/,/g, ',\n  ')
+                .trim();
+            
+            editor.value = query;
+        }
+
+        // Execute query
+        async function executeQuery() {
+            const query = document.getElementById('queryEditor').value.trim();
+            
+            if (!query) {
+                alert('Please enter a query');
+                return;
+            }
+
+            const executeBtn = document.getElementById('executeBtn');
+            const resultsContainer = document.getElementById('resultsContainer');
+            
+            executeBtn.disabled = true;
+            executeBtn.innerHTML = '<span class="spinner"></span> Executing...';
+            
+            updateStatus('Executing query...');
+
+            try {
+                const response = await fetch('/api/query', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ query }),
+                });
+
+                const data = await response.json();
+
+                if (data.error) {
+                    resultsContainer.innerHTML = ` + "`" + `
+                        <div class="error-message">
+                            <strong>Error:</strong> ${escapeHtml(data.error)}
+                        </div>
+                    ` + "`" + `;
+                    updateStatus('Query failed');
+                } else {
+                    renderResults(data);
+                    updateStatus(` + "`" + `Query completed: ${data.rowCount} rows in ${data.duration}` + "`" + `);
+                }
+            } catch (error) {
+                resultsContainer.innerHTML = ` + "`" + `
+                    <div class="error-message">
+                        <strong>Error:</strong> ${escapeHtml(error.message)}
+                    </div>
+                ` + "`" + `;
+                updateStatus('Query failed');
+            } finally {
+                executeBtn.disabled = false;
+                executeBtn.innerHTML = '▶ Execute';
+            }
+        }
+
+        // Render query results
+        function renderResults(data) {
+            const resultsContainer = document.getElementById('resultsContainer');
+
+            if (data.rowCount === 0) {
+                resultsContainer.innerHTML = ` + "`" + `
+                    <div class="empty-state">
+                        <div class="empty-state-icon">✓</div>
+                        <div class="empty-state-title">No Results</div>
+                        <div class="empty-state-text">
+                            Query executed successfully but returned no rows
+                            <br>Duration: ${data.duration}
+                        </div>
+                    </div>
+                ` + "`" + `;
+                return;
+            }
+
+            const tableHtml = ` + "`" + `
+                <div class="results-header">
+                    <div class="results-info">
+                        <strong>${data.rowCount}</strong> rows • 
+                        <strong>${data.columns.length}</strong> columns • 
+                        ${data.duration}
+                    </div>
+                    <div class="results-actions">
+                        <button onclick="exportCSV()">Export CSV</button>
+                        <button onclick="exportJSON()">Export JSON</button>
+                    </div>
+                </div>
+                <table class="result-table">
+                    <thead>
+                        <tr>
+                            ${data.columns.map(col => ` + "`" + `<th>${escapeHtml(col)}</th>` + "`" + `).join('')}
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${data.rows.map(row => ` + "`" + `
+                            <tr>
+                                ${data.columns.map(col => {
+                                    const value = row[col];
+                                    return formatCell(value);
+                                }).join('')}
+                            </tr>
+                        ` + "`" + `).join('')}
+                    </tbody>
+                </table>
+            ` + "`" + `;
+
+            resultsContainer.innerHTML = tableHtml;
+        }
+
+        // Format table cell
+        function formatCell(value) {
+            if (value === null || value === undefined) {
+                return '<td class="null-value">NULL</td>';
+            }
+            
+            if (typeof value === 'number') {
+                return ` + "`" + `<td class="number-value">${value}</td>` + "`" + `;
+            }
+            
+            if (typeof value === 'boolean') {
+                return ` + "`" + `<td class="boolean-value">${value}</td>` + "`" + `;
+            }
+            
+            return ` + "`" + `<td>${escapeHtml(String(value))}</td>` + "`" + `;
+        }
+
+        // Handle file upload
+        async function handleFileUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const formData = new FormData();
+            formData.append('file', file);
+
+            updateStatus('Uploading file...');
+
+            try {
+                const response = await fetch('/api/upload', {
+                    method: 'POST',
+                    body: formData,
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    alert(data.message);
+                    await loadTables();
+                    updateStatus('File uploaded successfully');
+                } else {
+                    alert('Upload failed: ' + data.message);
+                    updateStatus('Upload failed');
+                }
+            } catch (error) {
+                alert('Upload failed: ' + error.message);
+                updateStatus('Upload failed');
+            }
+
+            // Reset file input
+            event.target.value = '';
+        }
+
+        // Show upload dialog (placeholder)
+        function showUploadDialog() {
+            document.getElementById('fileInput').click();
+        }
+
+        // Update status
+        function updateStatus(text) {
+            document.getElementById('statusText').textContent = text;
+        }
+
+        // Export to CSV
+        function exportCSV() {
+            alert('CSV export coming soon!');
+        }
+
+        // Export to JSON
+        function exportJSON() {
+            alert('JSON export coming soon!');
+        }
+
+        // Escape HTML
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Keyboard shortcuts
+        document.getElementById('queryEditor').addEventListener('keydown', (e) => {
+            // Ctrl/Cmd + Enter to execute
+            if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+                e.preventDefault();
+                executeQuery();
+            }
+            
+            // Tab for indentation
+            if (e.key === 'Tab') {
+                e.preventDefault();
+                const start = e.target.selectionStart;
+                const end = e.target.selectionEnd;
+                e.target.value = e.target.value.substring(0, start) + '  ' + e.target.value.substring(end);
+                e.target.selectionStart = e.target.selectionEnd = start + 2;
+            }
+        });
+    </script>
+</body>
+</html>

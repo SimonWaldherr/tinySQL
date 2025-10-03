@@ -1,52 +1,192 @@
-# tinySQL File Query Tool
+# tinySQL File Query Tool - SQL Editor
 
-Query CSV, JSON, and XML files using SQL syntax with the power of tinySQL engine.
-
-## Quick Start
-
-Run the demo to see the tool in action:
-```bash
-./demo.sh          # Basic examples
-./advanced_demo.sh  # Comprehensive feature demonstration
-```
+Query CSV, JSON, and XML files using SQL syntax with a modern web interface powered by tinySQL engine.
 
 ## Features
 
+- **Modern Web Interface**: Full-featured SQL editor with VS Code-inspired design
 - **Multiple File Formats**: Support for CSV, JSON, and XML files
-- **SQL Querying**: Full SQL syntax support including WHERE, ORDER BY, GROUP BY, JOIN
-- **Type Inference**: Automatic detection of column types from data
+- **Real-time SQL Execution**: Execute queries instantly and see results
+- **File Upload**: Drag and drop or upload files directly in the browser
+- **Visual Table Browser**: Browse loaded tables with column information
 - **Multiple Output Formats**: Table, JSON, and CSV output
-- **Interactive Mode**: Query multiple files interactively
-- **Flexible Table Naming**: Automatic table names from filenames
+- **CLI Support**: Command-line interface for scripting and automation
+- **Full SQL Support**: WHERE, ORDER BY, GROUP BY, JOIN, aggregations, and more
+- **Fast & Lightweight**: In-memory database with optional persistence
 
-## Usage
+## Quick Start
 
-### Basic Query
+### Build
+
 ```bash
-./query_files -query "SELECT * FROM users WHERE age > 25" users.csv
+go build -o sql-editor
 ```
 
-### Multiple Files with JOIN
+### Start Web Interface
+
 ```bash
-./query_files -query "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id" users.csv orders.json
+# Start web server on default port (8080)
+./sql-editor -web
+
+# Specify custom port and data directory
+./sql-editor -web -port 8090 -datadir ./data
+
+# Pre-load files on startup
+./sql-editor -web -datadir . users.csv orders.json
 ```
 
-### Different Output Formats
+Then open your browser to **http://localhost:8080** (or your specified port)
+
+### Web Interface Features
+
+- **SQL Editor**: Write and execute SQL queries with syntax highlighting
+- **Table Browser**: View all loaded tables with column names and row counts
+- **File Upload**: Upload CSV, JSON, or XML files directly
+- **Query Examples**: Pre-built query examples to get started
+- **Keyboard Shortcuts**: 
+  - `Ctrl/Cmd + Enter`: Execute query
+  - `Tab`: Insert 2 spaces for indentation
+- **Results Display**: Beautiful table view with type-aware formatting
+
+## Usage Examples
+
+### Web Mode (Recommended)
+
+Start the server and use the web interface:
+```bash
+./sql-editor -web -port 8090 -datadir ./mydata
+```
+
+### Command Line Mode
+
+#### Basic Query
+```bash
+./sql-editor -query "SELECT * FROM users WHERE age > 25" users.csv
+```
+
+#### Multiple Files with JOIN
+```bash
+./sql-editor -query "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id" users.csv orders.json
+```
+
+#### Different Output Formats
 ```bash
 # JSON output
-./query_files -query "SELECT name, age FROM users" -output json users.csv
+./sql-editor -query "SELECT name, age FROM users" -output json users.csv
 
 # CSV output  
-./query_files -query "SELECT * FROM users ORDER BY age" -output csv users.json
+./sql-editor -query "SELECT * FROM users ORDER BY age" -output csv users.json
 
 # Table output (default)
-./query_files -query "SELECT name, COUNT(*) as count FROM users GROUP BY name" users.xml
+./sql-editor -query "SELECT name, COUNT(*) as count FROM users GROUP BY name" users.xml
 ```
 
 ### Interactive Mode
 ```bash
-./query_files -interactive data/
+./sql-editor -interactive data/
 ```
+
+## SQL Query Examples
+
+### Basic Queries
+```sql
+-- Select all data
+SELECT * FROM users LIMIT 10
+
+-- Filter with WHERE
+SELECT name, age FROM users WHERE age > 25
+
+-- Order results
+SELECT * FROM users ORDER BY age DESC
+
+-- Count records
+SELECT COUNT(*) as total FROM users
+```
+
+### Aggregations
+```sql
+-- Group by with count
+SELECT city, COUNT(*) as count FROM users GROUP BY city
+
+-- Average calculation
+SELECT AVG(age) as avg_age FROM users
+
+-- Multiple aggregates
+SELECT 
+  city,
+  COUNT(*) as total,
+  AVG(age) as avg_age,
+  MIN(age) as min_age,
+  MAX(age) as max_age
+FROM users 
+GROUP BY city
+```
+
+### Joins (if loading multiple tables)
+```sql
+-- Inner join
+SELECT u.name, o.amount 
+FROM users u 
+JOIN orders o ON u.id = o.user_id
+
+-- Left join with aggregation
+SELECT u.name, COUNT(o.id) as order_count
+FROM users u
+LEFT JOIN orders o ON u.id = o.user_id
+GROUP BY u.name
+```
+
+## Command Line Options
+
+```
+Usage:
+  ./query_files [options] file1 [file2 ...]
+
+Options:
+  -web                Start web server mode (recommended)
+  -port int          Web server port (default: 8080)
+  -datadir string    Data directory for web server (default: ".")
+  -query string      SQL query to execute (CLI mode)
+  -table string      Table name (default: filename without extension)
+  -delimiter string  CSV delimiter (default: ",")
+  -interactive       Run in interactive terminal mode
+  -verbose           Verbose output
+  -output string     Output format: table, json, csv (default: "table")
+```
+
+### Features Demo
+- Load CSV, JSON, and XML files
+- Execute complex SQL queries
+- View results with proper formatting
+- Export results to different formats
+
+## File Format Support
+
+### CSV Files
+- Automatic header detection
+- Type inference (int, float, bool, text)
+- Custom delimiter support
+- Empty value handling
+
+### JSON Files
+- Array of objects
+- Single object
+- Nested structure flattening
+- Flexible schema
+
+### XML Files
+- Automatic record detection
+- Attribute extraction
+- Content parsing
+- Multi-level structures
+
+## Contributing
+
+This tool is built on top of [tinySQL](https://github.com/SimonWaldherr/tinySQL) by Simon Waldherr.
+
+---
+
+**Made with ❤️ using Go and tinySQL**
 
 ### Custom Options
 ```bash

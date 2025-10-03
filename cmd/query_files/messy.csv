@@ -1,0 +1,6 @@
+id,name,amount,status
+1,Alice,1,234.56,active
+2,"Bob",500,pending
+3,Carol,"quotes problem,678.90,active
+4,Dave,999.99
+5,Eve,123.45,completed,extra_column

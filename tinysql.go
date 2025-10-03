@@ -671,3 +671,58 @@ func ImportJSON(ctx context.Context, db *DB, tenant, tableName string, src io.Re
 func OpenFile(ctx context.Context, filePath string, opts *ImportOptions) (*DB, string, error) {
 	return importer.OpenFile(ctx, filePath, opts)
 }
+
+// ============================================================================
+// Fuzzy Import - Tolerant parsing for malformed data
+// ============================================================================
+
+// FuzzyImportOptions extends ImportOptions with fuzzy parsing capabilities.
+// Use this for importing data that may have formatting issues, inconsistent
+// delimiters, malformed quotes, or other common data quality problems.
+type FuzzyImportOptions = importer.FuzzyImportOptions
+
+// FuzzyImportCSV is a more forgiving version of ImportCSV that handles malformed data.
+// It attempts to automatically fix common issues like:
+//   - Inconsistent column counts (pads/truncates rows)
+//   - Unmatched quotes in CSV fields
+//   - Mixed delimiters within the same file
+//   - Invalid UTF-8 characters
+//   - Numbers with thousand separators
+//   - Mixed data types in columns
+//
+// Example:
+//
+//	opts := &tinysql.FuzzyImportOptions{
+//	    ImportOptions: &tinysql.ImportOptions{
+//	        CreateTable: true,
+//	        TypeInference: true,
+//	    },
+//	    SkipInvalidRows: true,
+//	    FixQuotes: true,
+//	    CoerceTypes: true,
+//	}
+//	result, err := tinysql.FuzzyImportCSV(ctx, db, "default", "messy_data", file, opts)
+//
+// Parameters are the same as ImportCSV.
+// Returns ImportResult which includes errors encountered (non-fatal in fuzzy mode).
+func FuzzyImportCSV(ctx context.Context, db *DB, tenant, tableName string, src io.Reader, opts *FuzzyImportOptions) (*ImportResult, error) {
+	return importer.FuzzyImportCSV(ctx, db, tenant, tableName, src, opts)
+}
+
+// FuzzyImportJSON attempts to parse malformed JSON data.
+// It handles common JSON issues like:
+//   - Single quotes instead of double quotes
+//   - Unquoted object keys
+//   - Line-delimited JSON (NDJSON format)
+//   - Trailing commas
+//
+// Example:
+//
+//	// Works even with malformed JSON like {'name': 'Alice', 'age': 30}
+//	result, err := tinysql.FuzzyImportJSON(ctx, db, "default", "users", file, nil)
+//
+// Parameters are the same as ImportJSON.
+func FuzzyImportJSON(ctx context.Context, db *DB, tenant, tableName string, src io.Reader, opts *FuzzyImportOptions) (*ImportResult, error) {
+	return importer.FuzzyImportJSON(ctx, db, tenant, tableName, src, opts)
+}
+
