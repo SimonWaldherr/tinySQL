@@ -18,31 +18,31 @@ import (
 // FuzzyImportOptions extends ImportOptions with fuzzy parsing capabilities
 type FuzzyImportOptions struct {
 	*ImportOptions
-	
+
 	// SkipInvalidRows skips rows that don't match the expected column count (default true)
 	SkipInvalidRows bool
-	
+
 	// TrimWhitespace aggressively trims whitespace from all values (default true)
 	TrimWhitespace bool
-	
+
 	// FixQuotes attempts to fix unmatched quotes in CSV data (default true)
 	FixQuotes bool
-	
+
 	// CoerceTypes attempts to coerce invalid values to the expected type (default true)
 	CoerceTypes bool
-	
+
 	// MaxSkippedRows maximum number of rows to skip before giving up (default 100)
 	MaxSkippedRows int
-	
+
 	// AllowMixedTypes allows columns to have mixed types (converts to TEXT) (default true)
 	AllowMixedTypes bool
-	
+
 	// FuzzyJSON attempts to parse malformed JSON (default true)
 	FuzzyJSON bool
-	
+
 	// RemoveInvalidChars removes invalid UTF-8 characters (default true)
 	RemoveInvalidChars bool
-	
+
 	// AutoFixDelimiters tries to detect and fix inconsistent delimiters (default true)
 	AutoFixDelimiters bool
 }
@@ -61,43 +61,43 @@ func FuzzyImportCSV(
 			ImportOptions: &ImportOptions{},
 		}
 	}
-	
+
 	applyFuzzyDefaults(opts)
-	
+
 	if opts.ImportOptions == nil {
 		opts.ImportOptions = &ImportOptions{}
 	}
 	applyDefaults(opts.ImportOptions)
-	
+
 	if opts.TableName != "" {
 		tableName = opts.TableName
 	}
 	if tableName == "" {
 		return nil, fmt.Errorf("table name is required")
 	}
-	
+
 	result := &ImportResult{
 		Errors: make([]string, 0),
 	}
-	
+
 	// Read and clean the input data
 	cleanedData, err := cleanInputData(src, opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to clean input data: %v", err)
 	}
-	
+
 	// Detect delimiter and structure
 	delimiter, records, err := fuzzyParseCSV(cleanedData, opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse CSV: %v", err)
 	}
-	
+
 	result.Delimiter = delimiter
-	
+
 	if len(records) == 0 {
 		return result, nil
 	}
-	
+
 	// Determine if first row is header
 	headerMode := "auto"
 	if opts.ImportOptions != nil && opts.ImportOptions.HeaderMode != "" {
@@ -105,10 +105,10 @@ func FuzzyImportCSV(
 	}
 	hasHeader := fuzzyDecideHeader(records, headerMode)
 	result.HadHeader = hasHeader
-	
+
 	var headers []string
 	var dataRecords [][]string
-	
+
 	if hasHeader {
 		headers = sanitizeColumnNames(records[0])
 		dataRecords = records[1:]
@@ -117,12 +117,12 @@ func FuzzyImportCSV(
 		headers = generateColumnNames(numCols)
 		dataRecords = records
 	}
-	
+
 	numCols := len(headers)
-	
+
 	// Normalize all records to have the same number of columns
 	dataRecords = normalizeRecords(dataRecords, numCols, opts)
-	
+
 	// Infer column types
 	var columnTypes []storage.ColType
 	typeInference := true
@@ -137,10 +137,10 @@ func FuzzyImportCSV(
 			columnTypes[i] = storage.TextType
 		}
 	}
-	
+
 	result.ColumnNames = headers
 	result.ColumnTypes = columnTypes
-	
+
 	// Create table if needed
 	createTable := true
 	truncate := false
@@ -156,48 +156,48 @@ func FuzzyImportCSV(
 				Type: columnTypes[i],
 			}
 		}
-		
+
 		table := storage.NewTable(tableName, columns, false)
 		if err := db.Put(tenant, table); err != nil {
 			return nil, fmt.Errorf("failed to create table: %v", err)
 		}
-		
+
 		if truncate {
 			table.Rows = nil
 		}
 	}
-	
+
 	// Get the table
 	table, err := db.Get(tenant, tableName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get table: %v", err)
 	}
-	
+
 	// Insert data with fuzzy conversion
 	skippedRows := 0
 	for rowIdx, record := range dataRecords {
 		if len(record) != numCols {
 			skippedRows++
 			result.RowsSkipped++
-			result.Errors = append(result.Errors, 
-				fmt.Sprintf("row %d: column count mismatch (expected %d, got %d)", 
+			result.Errors = append(result.Errors,
+				fmt.Sprintf("row %d: column count mismatch (expected %d, got %d)",
 					rowIdx+1, numCols, len(record)))
-			
+
 			if skippedRows > opts.MaxSkippedRows {
 				return nil, fmt.Errorf("too many skipped rows (%d), aborting import", skippedRows)
 			}
 			continue
 		}
-		
+
 		row := make([]interface{}, numCols)
 		hasError := false
-		
+
 		for colIdx := 0; colIdx < numCols; colIdx++ {
 			value := record[colIdx]
 			if opts.TrimWhitespace {
 				value = strings.TrimSpace(value)
 			}
-			
+
 			converted, err := fuzzyConvertValue(value, columnTypes[colIdx], opts)
 			if err != nil {
 				if !opts.CoerceTypes {
@@ -209,14 +209,14 @@ func FuzzyImportCSV(
 				// Fallback to string
 				converted = value
 			}
-			
+
 			row[colIdx] = converted
 		}
-		
+
 		if hasError && !opts.SkipInvalidRows {
 			return nil, fmt.Errorf("import failed at row %d", rowIdx+1)
 		}
-		
+
 		if !hasError {
 			table.Rows = append(table.Rows, row)
 			result.RowsInserted++
@@ -224,7 +224,7 @@ func FuzzyImportCSV(
 			result.RowsSkipped++
 		}
 	}
-	
+
 	return result, nil
 }
 
@@ -249,21 +249,21 @@ func fuzzyDecideHeader(records [][]string, mode string) bool {
 
 	for c := 0; c < cols; c++ {
 		headVal := strings.TrimSpace(first[c])
-		
+
 		// Check if header looks like a typical column name
 		isTypicalHeader := false
-		
+
 		// Empty or very long is not a good header
 		if len(headVal) == 0 || len(headVal) > 50 {
 			continue
 		}
-		
+
 		// Check if it's a single word or snake_case/camelCase identifier
 		matched, _ := regexp.MatchString(`^[a-zA-Z][a-zA-Z0-9_]*$`, headVal)
 		if matched {
 			isTypicalHeader = true
 		}
-		
+
 		// Check if first row is NOT numeric but data IS
 		headNum := looksNumeric(headVal)
 		dataNum := 0
@@ -277,7 +277,7 @@ func fuzzyDecideHeader(records [][]string, mode string) bool {
 			}
 			rows++
 		}
-		
+
 		// Header-like if: (typical name pattern) OR (non-numeric header with >60% numeric data)
 		if isTypicalHeader {
 			headerish++
@@ -285,7 +285,7 @@ func fuzzyDecideHeader(records [][]string, mode string) bool {
 			headerish++
 		}
 	}
-	
+
 	return float64(headerish)/float64(cols) >= 0.5
 }
 
@@ -294,7 +294,7 @@ func applyFuzzyDefaults(opts *FuzzyImportOptions) {
 	if opts.MaxSkippedRows == 0 {
 		opts.MaxSkippedRows = 100
 	}
-	
+
 	// Set defaults to true if not explicitly set
 	opts.SkipInvalidRows = true
 	opts.TrimWhitespace = true
@@ -312,28 +312,28 @@ func cleanInputData(src io.Reader, opts *FuzzyImportOptions) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	
+
 	str := string(data)
-	
+
 	// Remove BOM if present
 	str = strings.TrimPrefix(str, "\ufeff")
-	
+
 	// Remove invalid UTF-8 characters
 	if opts.RemoveInvalidChars {
 		str = strings.ToValidUTF8(str, "")
 	}
-	
+
 	// Normalize line endings
 	str = strings.ReplaceAll(str, "\r\n", "\n")
 	str = strings.ReplaceAll(str, "\r", "\n")
-	
+
 	// Remove trailing whitespace from lines
 	lines := strings.Split(str, "\n")
 	for i, line := range lines {
 		lines[i] = strings.TrimRight(line, " \t")
 	}
 	str = strings.Join(lines, "\n")
-	
+
 	return str, nil
 }
 
@@ -344,11 +344,11 @@ func fuzzyParseCSV(data string, opts *FuzzyImportOptions) (rune, [][]string, err
 	if len(delimiters) == 0 {
 		delimiters = []rune{',', ';', '\t', '|'}
 	}
-	
+
 	var bestDelimiter rune
 	var bestRecords [][]string
 	var bestScore float64
-	
+
 	for _, delim := range delimiters {
 		records, score := tryParseWithDelimiter(data, delim, opts)
 		if score > bestScore && len(records) > 0 {
@@ -357,11 +357,11 @@ func fuzzyParseCSV(data string, opts *FuzzyImportOptions) (rune, [][]string, err
 			bestRecords = records
 		}
 	}
-	
+
 	if len(bestRecords) == 0 {
 		return ',', nil, fmt.Errorf("failed to parse CSV with any delimiter")
 	}
-	
+
 	return bestDelimiter, bestRecords, nil
 }
 
@@ -372,7 +372,7 @@ func tryParseWithDelimiter(data string, delim rune, opts *FuzzyImportOptions) ([
 	reader.LazyQuotes = true
 	reader.TrimLeadingSpace = true
 	reader.FieldsPerRecord = -1 // Allow variable fields
-	
+
 	var records [][]string
 	for {
 		record, err := reader.Read()
@@ -388,17 +388,17 @@ func tryParseWithDelimiter(data string, delim rune, opts *FuzzyImportOptions) ([
 		}
 		records = append(records, record)
 	}
-	
+
 	if len(records) == 0 {
 		return nil, 0
 	}
-	
+
 	// Score based on consistency of column counts
 	columnCounts := make(map[int]int)
 	for _, record := range records {
 		columnCounts[len(record)]++
 	}
-	
+
 	// Find most common column count
 	maxCount := 0
 	var mostCommonCols int
@@ -408,22 +408,22 @@ func tryParseWithDelimiter(data string, delim rune, opts *FuzzyImportOptions) ([
 			mostCommonCols = cols
 		}
 	}
-	
+
 	// Score is the percentage of rows with the most common column count
 	score := float64(maxCount) / float64(len(records))
-	
+
 	// Bonus if most common column count is > 1
 	if mostCommonCols > 1 {
 		score *= 1.2
 	}
-	
+
 	return records, score
 }
 
 // normalizeRecords ensures all records have the same number of columns
 func normalizeRecords(records [][]string, expectedCols int, opts *FuzzyImportOptions) [][]string {
 	normalized := make([][]string, 0, len(records))
-	
+
 	for _, record := range records {
 		// Pad short records
 		if len(record) < expectedCols {
@@ -446,44 +446,44 @@ func normalizeRecords(records [][]string, expectedCols int, opts *FuzzyImportOpt
 			normalized = append(normalized, record)
 		}
 	}
-	
+
 	return normalized
 }
 
 // fuzzyInferColumnTypes infers types with more lenient rules
 func fuzzyInferColumnTypes(sampleData [][]string, numCols int, opts *FuzzyImportOptions) []storage.ColType {
 	types := make([]storage.ColType, numCols)
-	
+
 	nullLiterals := []string{}
 	if opts.ImportOptions != nil {
 		nullLiterals = opts.ImportOptions.NullLiterals
 	}
-	
+
 	for colIdx := 0; colIdx < numCols; colIdx++ {
 		typeVotes := make(map[storage.ColType]int)
 		totalValues := 0
-		
+
 		for _, row := range sampleData {
 			if colIdx >= len(row) {
 				continue
 			}
-			
+
 			value := strings.TrimSpace(row[colIdx])
 			if value == "" || isNullValue(value, nullLiterals) {
 				continue
 			}
-			
+
 			totalValues++
 			detectedType := fuzzyDetectType(value, opts)
 			typeVotes[detectedType]++
 		}
-		
+
 		// Determine the dominant type
 		if totalValues == 0 {
 			types[colIdx] = storage.TextType
 			continue
 		}
-		
+
 		// Find type with most votes
 		maxVotes := 0
 		var dominantType storage.ColType
@@ -493,7 +493,7 @@ func fuzzyInferColumnTypes(sampleData [][]string, numCols int, opts *FuzzyImport
 				dominantType = typ
 			}
 		}
-		
+
 		// If type consistency is low and mixed types are allowed, use TEXT
 		consistency := float64(maxVotes) / float64(totalValues)
 		if consistency < 0.8 && opts.AllowMixedTypes {
@@ -502,18 +502,18 @@ func fuzzyInferColumnTypes(sampleData [][]string, numCols int, opts *FuzzyImport
 			types[colIdx] = dominantType
 		}
 	}
-	
+
 	return types
 }
 
 // fuzzyDetectType detects type with lenient parsing
 func fuzzyDetectType(value string, opts *FuzzyImportOptions) storage.ColType {
 	value = strings.TrimSpace(value)
-	
+
 	// Remove common thousand separators
 	cleanValue := strings.ReplaceAll(value, ",", "")
 	cleanValue = strings.ReplaceAll(cleanValue, " ", "")
-	
+
 	// Try boolean
 	lower := strings.ToLower(value)
 	if lower == "true" || lower == "false" || lower == "yes" || lower == "no" ||
@@ -521,17 +521,17 @@ func fuzzyDetectType(value string, opts *FuzzyImportOptions) storage.ColType {
 		value == "1" || value == "0" {
 		return storage.BoolType
 	}
-	
+
 	// Try integer
 	if _, err := strconv.ParseInt(cleanValue, 10, 64); err == nil {
 		return storage.IntType
 	}
-	
+
 	// Try float
 	if _, err := strconv.ParseFloat(cleanValue, 64); err == nil {
 		return storage.Float64Type
 	}
-	
+
 	// Try to detect JSON
 	if opts.FuzzyJSON && (strings.HasPrefix(value, "{") || strings.HasPrefix(value, "[")) {
 		var js interface{}
@@ -539,7 +539,7 @@ func fuzzyDetectType(value string, opts *FuzzyImportOptions) storage.ColType {
 			return storage.JsonType
 		}
 	}
-	
+
 	// Default to text
 	return storage.TextType
 }
@@ -547,17 +547,17 @@ func fuzzyDetectType(value string, opts *FuzzyImportOptions) storage.ColType {
 // fuzzyConvertValue converts a string value to the target type with lenient parsing
 func fuzzyConvertValue(value string, targetType storage.ColType, opts *FuzzyImportOptions) (interface{}, error) {
 	value = strings.TrimSpace(value)
-	
+
 	nullLiterals := []string{}
 	if opts.ImportOptions != nil {
 		nullLiterals = opts.ImportOptions.NullLiterals
 	}
-	
+
 	// Check for null
 	if value == "" || isNullValue(value, nullLiterals) {
 		return nil, nil
 	}
-	
+
 	switch targetType {
 	case storage.IntType:
 		// Remove common formatting
@@ -575,7 +575,7 @@ func fuzzyConvertValue(value string, targetType storage.ColType, opts *FuzzyImpo
 		}
 		// Return int instead of int64 for compatibility with SQL literals
 		return int(i), nil
-		
+
 	case storage.Float64Type, storage.FloatType:
 		cleanValue := removeNonNumeric(value, true)
 		if cleanValue == "" {
@@ -586,7 +586,7 @@ func fuzzyConvertValue(value string, targetType storage.ColType, opts *FuzzyImpo
 			return nil, fmt.Errorf("invalid float: %s", value)
 		}
 		return f, nil
-		
+
 	case storage.BoolType:
 		lower := strings.ToLower(value)
 		switch lower {
@@ -597,7 +597,7 @@ func fuzzyConvertValue(value string, targetType storage.ColType, opts *FuzzyImpo
 		default:
 			return nil, fmt.Errorf("invalid boolean: %s", value)
 		}
-		
+
 	case storage.JsonType:
 		var result interface{}
 		if err := json.Unmarshal([]byte(value), &result); err != nil {
@@ -611,7 +611,7 @@ func fuzzyConvertValue(value string, targetType storage.ColType, opts *FuzzyImpo
 			return nil, fmt.Errorf("invalid JSON: %s", value)
 		}
 		return result, nil
-		
+
 	default:
 		return value, nil
 	}
@@ -622,7 +622,7 @@ func removeNonNumeric(s string, allowDecimal bool) string {
 	var result strings.Builder
 	hasDecimal := false
 	hasSign := false
-	
+
 	for _, r := range s {
 		if unicode.IsDigit(r) {
 			result.WriteRune(r)
@@ -634,7 +634,7 @@ func removeNonNumeric(s string, allowDecimal bool) string {
 			hasDecimal = true
 		}
 	}
-	
+
 	return result.String()
 }
 
@@ -642,11 +642,11 @@ func removeNonNumeric(s string, allowDecimal bool) string {
 func fixCommonJSONIssues(s string) string {
 	// Replace single quotes with double quotes
 	s = strings.ReplaceAll(s, "'", "\"")
-	
+
 	// Fix unquoted keys (simple cases)
 	re := regexp.MustCompile(`([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:`)
 	s = re.ReplaceAllString(s, `$1"$2":`)
-	
+
 	return s
 }
 
@@ -665,23 +665,23 @@ func FuzzyImportJSON(
 		}
 	}
 	applyFuzzyDefaults(opts)
-	
+
 	data, err := io.ReadAll(src)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	dataStr := string(data)
-	
+
 	// Try to fix common JSON issues
 	if opts.FuzzyJSON {
 		dataStr = fixCommonJSONIssues(dataStr)
 	}
-	
+
 	// Try parsing as array
 	var records []map[string]interface{}
 	err = json.Unmarshal([]byte(dataStr), &records)
-	
+
 	if err != nil {
 		// Try as single object
 		var record map[string]interface{}
@@ -695,11 +695,11 @@ func FuzzyImportJSON(
 			}
 		}
 	}
-	
+
 	if len(records) == 0 {
 		return &ImportResult{}, nil
 	}
-	
+
 	// Extract all unique keys
 	columnSet := make(map[string]bool)
 	for _, record := range records {
@@ -707,12 +707,12 @@ func FuzzyImportJSON(
 			columnSet[key] = true
 		}
 	}
-	
+
 	var columnNames []string
 	for name := range columnSet {
 		columnNames = append(columnNames, name)
 	}
-	
+
 	// Create columns (all as JSON type initially)
 	columns := make([]storage.Column, len(columnNames))
 	for i, name := range columnNames {
@@ -721,17 +721,17 @@ func FuzzyImportJSON(
 			Type: storage.JsonType,
 		}
 	}
-	
+
 	result := &ImportResult{
 		ColumnNames: columnNames,
 		ColumnTypes: make([]storage.ColType, len(columnNames)),
 		Errors:      make([]string, 0),
 	}
-	
+
 	for i := range result.ColumnTypes {
 		result.ColumnTypes[i] = storage.JsonType
 	}
-	
+
 	// Create table
 	if opts.CreateTable {
 		table := storage.NewTable(tableName, columns, false)
@@ -739,12 +739,12 @@ func FuzzyImportJSON(
 			return nil, err
 		}
 	}
-	
+
 	table, err := db.Get(tenant, tableName)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Insert records
 	for _, record := range records {
 		row := make([]interface{}, len(columnNames))
@@ -756,24 +756,24 @@ func FuzzyImportJSON(
 		table.Rows = append(table.Rows, row)
 		result.RowsInserted++
 	}
-	
+
 	return result, nil
 }
 
 // parseLineDelimitedJSON parses newline-delimited JSON (NDJSON)
 func parseLineDelimitedJSON(data string, opts *FuzzyImportOptions) ([]map[string]interface{}, error) {
 	var records []map[string]interface{}
-	
+
 	scanner := bufio.NewScanner(strings.NewReader(data))
 	lineNum := 0
-	
+
 	for scanner.Scan() {
 		lineNum++
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
-		
+
 		var record map[string]interface{}
 		err := json.Unmarshal([]byte(line), &record)
 		if err != nil {
@@ -792,6 +792,6 @@ func parseLineDelimitedJSON(data string, opts *FuzzyImportOptions) ([]map[string
 		}
 		records = append(records, record)
 	}
-	
+
 	return records, scanner.Err()
 }

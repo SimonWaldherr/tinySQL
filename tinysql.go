@@ -725,4 +725,3 @@ func FuzzyImportCSV(ctx context.Context, db *DB, tenant, tableName string, src i
 func FuzzyImportJSON(ctx context.Context, db *DB, tenant, tableName string, src io.Reader, opts *FuzzyImportOptions) (*ImportResult, error) {
 	return importer.FuzzyImportJSON(ctx, db, tenant, tableName, src, opts)
 }
-

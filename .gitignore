@@ -13,3 +13,4 @@ coverage-func.txt
 # Local tooling
 .actrc
 .env
+*.wasm
