@@ -48,6 +48,7 @@ type FuzzyImportOptions struct {
 }
 
 // FuzzyImportCSV is a more forgiving version of ImportCSV that handles malformed data
+//nolint:gocyclo // Fuzzy CSV import intentionally includes extensive cleanup and fallback paths.
 func FuzzyImportCSV(
 	ctx context.Context,
 	db *storage.DB,
@@ -507,6 +508,7 @@ func fuzzyInferColumnTypes(sampleData [][]string, numCols int, opts *FuzzyImport
 }
 
 // fuzzyDetectType detects type with lenient parsing
+//nolint:gocyclo // Fuzzy type detection tries many relaxed heuristics.
 func fuzzyDetectType(value string, opts *FuzzyImportOptions) storage.ColType {
 	value = strings.TrimSpace(value)
 
@@ -545,6 +547,7 @@ func fuzzyDetectType(value string, opts *FuzzyImportOptions) storage.ColType {
 }
 
 // fuzzyConvertValue converts a string value to the target type with lenient parsing
+//nolint:gocyclo // Conversion supports diverse coercion fallbacks for malformed data.
 func fuzzyConvertValue(value string, targetType storage.ColType, opts *FuzzyImportOptions) (interface{}, error) {
 	value = strings.TrimSpace(value)
 
@@ -651,6 +654,7 @@ func fixCommonJSONIssues(s string) string {
 }
 
 // FuzzyImportJSON attempts to parse malformed JSON data
+//nolint:gocyclo // Fuzzy JSON import applies numerous fallback parsing strategies.
 func FuzzyImportJSON(
 	ctx context.Context,
 	db *storage.DB,

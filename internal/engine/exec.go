@@ -361,6 +361,7 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	return &ResultSet{Cols: []string{"deleted"}, Rows: []Row{{"deleted": del}}}, nil
 }
 
+//nolint:gocyclo // SELECT execution handles joins, CTEs, filtering, projection, and aggregation.
 func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 	// Process CTEs first
 	cteEnv := env
@@ -744,6 +745,7 @@ func processGroupByHaving(env ExecEnv, s *Select, filtered []Row) ([]Row, []stri
 	return processNonAggregateQuery(env, s, filtered)
 }
 
+//nolint:gocyclo // Aggregation flow must cover grouping, HAVING, and projection variants.
 func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []string, error) {
 	groups := make(map[string][]Row, len(filtered)/2) // Estimate group count
 	orderKeys := make([]string, 0, len(filtered)/2)
@@ -1418,6 +1420,7 @@ func evalComparisonBinary(op string, lv, rv any) (any, error) {
 	return nil, fmt.Errorf("unknown comparison operator: %s", op)
 }
 
+//nolint:gocyclo // Function dispatch covers numerous built-in SQL functions.
 func evalFuncCall(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	switch ex.Name {
 	case "COALESCE":
@@ -1936,6 +1939,7 @@ func evalLength(env ExecEnv, args []Expr, row Row) (any, error) {
 	return len(str), nil
 }
 
+//nolint:gocyclo // SUBSTRING handling covers varying arity, coercion, and bounds checks.
 func evalSubstring(env ExecEnv, args []Expr, row Row) (any, error) {
 	if len(args) < 2 || len(args) > 3 {
 		return nil, fmt.Errorf("SUBSTRING expects 2 or 3 arguments")
@@ -2884,6 +2888,7 @@ func jsonGet(v any, path string) any {
 	return cur
 }
 
+//nolint:gocyclo // JSON setter walks paths with mixed map/array handling.
 func jsonSet(v any, path string, value any) any {
 	if path == "" {
 		return value

@@ -4,6 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>TinySQL Editor</title>
+    <link rel="stylesheet" href="https://simonwaldherr.github.io/vanillagrid.js/vanillagrid.css">
+    <link rel="stylesheet" href="https://simonwaldherr.github.io/vanillagrid.js/vg-pivot-d3.css">
     <style>
         * {
             margin: 0;
@@ -18,6 +20,10 @@
             flex-direction: column;
             background: #1e1e1e;
             color: #d4d4d4;
+        }
+
+        .hidden {
+            display: none !important;
         }
 
         /* Top Bar */
@@ -82,6 +88,66 @@
         @keyframes pulse {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.5; }
+        }
+
+        .vanillagrid-section {
+            margin-top: 16px;
+            padding: 16px;
+            background: #252526;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .vanillagrid-section.hidden {
+            display: none !important;
+        }
+
+        .vanillagrid-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+
+        .vanillagrid-header h3 {
+            font-size: 16px;
+            font-weight: 600;
+            color: #fff;
+        }
+
+        .vg-hint {
+            font-size: 12px;
+            color: #999;
+        }
+
+        .vanillagrid-header-info {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .vg-header-actions {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .vg-header-actions button {
+            background: #3e3e42;
+            border: 1px solid #505050;
+            color: #ccc;
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .vg-header-actions button:hover {
+            background: #4b4b4f;
         }
 
         /* Main Layout */
@@ -301,6 +367,14 @@
 
         .results-actions button:hover {
             background: #505050;
+        }
+
+        .results-actions button:disabled {
+            background: #3e3e42;
+            color: #666;
+            border-color: #3e3e42;
+            cursor: not-allowed;
+            opacity: 0.6;
         }
 
         /* Table Styles */
@@ -549,7 +623,7 @@ Supported functions:
             </div>
 
             <!-- Results Area -->
-            <div class="results-area">
+            <div class="results-area vg-theme-dark vg-compact">
                 <div id="resultsContainer">
                     <div class="empty-state">
                         <div class="empty-state-icon">⚡</div>
@@ -559,11 +633,193 @@ Supported functions:
                         </div>
                     </div>
                 </div>
+                <div id="vanillaGridSection" class="vanillagrid-section hidden">
+                    <div class="vanillagrid-header">
+                        <div class="vanillagrid-header-info">
+                            <h3>Pivot Grid</h3>
+                            <span class="vg-hint">Use the pivot toolbar to render d3 charts</span>
+                        </div>
+                        <div class="vg-header-actions">
+                            <button onclick="autoPivot()">Auto Pivot</button>
+                            <button onclick="showTableResults()">Show Table</button>
+                        </div>
+                    </div>
+                    <div id="vanillaGrid"></div>
+                </div>
             </div>
         </div>
     </div>
     <!-- WASM Support -->
     <script src="wasm_exec.js"></script>
+    <script src="https://simonwaldherr.github.io/vanillagrid.js/vanillagrid.js"></script>
+    <script src="https://simonwaldherr.github.io/vanillagrid.js/vg-pivot-d3.js"></script>
+    <script>
+    let vanillaGridInstance = null;
+    let vanillaGridPivotConfig = null;
+        const prefersDarkScheme = window.matchMedia('(prefers-color-scheme: dark)');
+
+        function updateVanillaGridTheme() {
+            const mountNode = document.getElementById('vanillaGrid');
+            if (!mountNode) {
+                return;
+            }
+            mountNode.classList.add('vg-compact');
+            mountNode.classList.remove('vg-theme-dark', 'vg-theme-light');
+            mountNode.classList.add(prefersDarkScheme.matches ? 'vg-theme-dark' : 'vg-theme-light');
+        }
+
+        if (prefersDarkScheme.addEventListener) {
+            prefersDarkScheme.addEventListener('change', updateVanillaGridTheme);
+        } else if (prefersDarkScheme.addListener) {
+            prefersDarkScheme.addListener(updateVanillaGridTheme);
+        }
+
+        updateVanillaGridTheme();
+
+        window.renderVanillaGrid = function (result) {
+            const section = document.getElementById('vanillaGridSection');
+            const mountSelector = '#vanillaGrid';
+            const mountNode = document.querySelector(mountSelector);
+
+            if (!section || !mountNode) {
+                return;
+            }
+
+            const rows = Array.isArray(result?.rows)
+                ? result.rows
+                : Array.isArray(result)
+                    ? result
+                    : [];
+
+            const columns = Array.isArray(result?.columns) && result.columns.length
+                ? result.columns
+                : rows.length
+                    ? Object.keys(rows[0])
+                    : [];
+
+            if (!rows.length || !columns.length) {
+                window.clearVanillaGrid();
+                return;
+            }
+
+            const numericFields = columns.filter((key) => rows.some((row) => typeof row?.[key] === 'number'));
+            const valueField = numericFields[0] || columns[0];
+            const rowField = columns.find((key) => key !== valueField) || valueField;
+            const columnField = columns.find((key) => key !== valueField && key !== rowField);
+
+            const pivotRows = rowField ? [rowField] : [];
+            const pivotColumns = columnField ? [columnField] : [];
+            const pivotValues = numericFields.length ? numericFields.slice() : [valueField];
+            const aggregations = {};
+            pivotValues.forEach((field) => {
+                aggregations[field] = numericFields.includes(field) ? 'sum' : 'count';
+            });
+
+            if (vanillaGridInstance?.destroy instanceof Function) {
+                vanillaGridInstance.destroy();
+            }
+
+            mountNode.innerHTML = '';
+            updateVanillaGridTheme();
+
+            const pivotConfig = {
+                rows: pivotRows,
+                columns: pivotColumns,
+                values: pivotValues,
+                aggregations,
+                chart: {
+                    type: 'grouped',
+                    value: pivotValues[0],
+                    normalize: false,
+                    autorender: false
+                }
+            };
+
+            vanillaGridInstance = new VanillaGrid(mountSelector, {
+                data: rows,
+                columns: columns.map((key) => ({
+                    key,
+                    label: key,
+                    sortable: true,
+                    filterable: true
+                })),
+                pageSize: rows.length > 0 ? Math.min(rows.length, 50) : 25,
+                resizableColumns: true,
+                keyboardNavigation: true,
+                contextMenu: true,
+                pivot: true
+            });
+
+            window.vanillaGridInstance = vanillaGridInstance;
+
+            vanillaGridPivotConfig = pivotConfig;
+
+            if (typeof vanillaGridInstance.enablePivot === 'function') {
+                if (pivotValues.length) {
+                    vanillaGridInstance.enablePivot({
+                        rows: pivotConfig.rows,
+                        columns: pivotConfig.columns,
+                        values: pivotConfig.values,
+                        aggregations: pivotConfig.aggregations
+                    });
+                } else {
+                    vanillaGridInstance.enablePivot();
+                }
+            }
+
+            const resultsContainer = document.getElementById('resultsContainer');
+            if (resultsContainer) {
+                resultsContainer.classList.add('hidden');
+            }
+
+            section.classList.remove('hidden');
+            section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        };
+
+        window.clearVanillaGrid = function () {
+            const section = document.getElementById('vanillaGridSection');
+            const mountNode = document.getElementById('vanillaGrid');
+
+            if (vanillaGridInstance?.destroy instanceof Function) {
+                vanillaGridInstance.destroy();
+            }
+
+            vanillaGridInstance = null;
+            vanillaGridPivotConfig = null;
+
+            if (mountNode) {
+                mountNode.innerHTML = '';
+            }
+
+            if (section) {
+                section.classList.add('hidden');
+            }
+
+            const resultsContainer = document.getElementById('resultsContainer');
+            if (resultsContainer) {
+                resultsContainer.classList.remove('hidden');
+            }
+        };
+
+        window.showTableResults = function () {
+            window.clearVanillaGrid();
+        };
+
+        window.autoPivot = function () {
+            if (vanillaGridInstance?.enablePivot) {
+                if (vanillaGridPivotConfig && vanillaGridPivotConfig.values?.length) {
+                    vanillaGridInstance.enablePivot({
+                        rows: vanillaGridPivotConfig.rows,
+                        columns: vanillaGridPivotConfig.columns,
+                        values: vanillaGridPivotConfig.values,
+                        aggregations: vanillaGridPivotConfig.aggregations
+                    });
+                } else {
+                    vanillaGridInstance.enablePivot();
+                }
+            }
+        };
+    </script>
     <script src="app.js"></script>
 </body>
 </html>

@@ -468,6 +468,7 @@ func (w *AdvancedWAL) ShouldCheckpoint() bool {
 }
 
 // Recover replays the WAL to restore database state after a crash.
+//nolint:gocyclo // Recovery must cover diverse WAL scenarios including corruption handling.
 func (w *AdvancedWAL) Recover(db *DB) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()

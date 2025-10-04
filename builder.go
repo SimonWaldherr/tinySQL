@@ -792,6 +792,7 @@ func ToSQL(stmt engine.Statement) string {
 	}
 }
 
+//nolint:gocyclo // SQL rendering handles many clause permutations in one place.
 func selectToSQL(s *engine.Select) string {
 	var sb strings.Builder
 

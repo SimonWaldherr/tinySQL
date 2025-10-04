@@ -124,6 +124,7 @@ func TestBooleanValues(t *testing.T) {
 }
 
 // Example demonstrates the usage of the TinySQL engine
+//nolint:gocyclo // Example intentionally demonstrates multiple SQL flows in sequence.
 func Example() {
 	db := tsql.NewDB()
 
@@ -396,6 +397,7 @@ func TestAggregateOperations(t *testing.T) {
 }
 
 // TestJSONOperations tests JSON data type and functions
+//nolint:gocyclo // Comprehensive JSON coverage requires multiple branches and assertions.
 func TestJSONOperations(t *testing.T) {
 	db := tsql.NewDB()
 	ctx := context.Background()
@@ -596,6 +598,7 @@ func TestUpdateDeleteOperations(t *testing.T) {
 }
 
 // TestTempTableOperations tests temporary tables
+//nolint:gocyclo // Temporary table scenarios cover numerous operations in one flow.
 func TestTempTableOperations(t *testing.T) {
 	db := tsql.NewDB()
 	ctx := context.Background()
@@ -671,6 +674,7 @@ func TestTempTableOperations(t *testing.T) {
 }
 
 // TestDistinctAndLimitOffset tests DISTINCT, LIMIT, and OFFSET
+//nolint:gocyclo // Coverage spans diverse DISTINCT/LIMIT/OFFSET branches in one flow.
 func TestDistinctAndLimitOffset(t *testing.T) {
 	db := tsql.NewDB()
 	ctx := context.Background()
@@ -685,7 +689,6 @@ func TestDistinctAndLimitOffset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create table: %v", err)
 	}
-
 	// Insert test data
 	queries := []string{
 		`INSERT INTO logs VALUES (1, 'INFO', 'App started')`,
@@ -1052,6 +1055,7 @@ func TestQueryCompilationPerformance(t *testing.T) {
 }
 
 // TestGOBPersistenceWithNewDataTypes tests saving and loading database with new data types using GOB format
+//nolint:gocyclo // Persistence regression test exercises many branches end-to-end.
 func TestGOBPersistenceWithNewDataTypes(t *testing.T) {
 	ctx := context.Background()
 	tempFile := "/tmp/tinysql_test.gob"
@@ -1291,6 +1295,7 @@ func TestGOBPersistenceWithNewDataTypes(t *testing.T) {
 }
 
 // TestDateDiffAndTimeAggregation tests DATEDIFF function with GROUP BY and time aggregation
+//nolint:gocyclo // Extensive temporal scenarios require multiple branches in one test.
 func TestDateDiffAndTimeAggregation(t *testing.T) {
 	db := tsql.NewDB()
 	ctx := context.Background()

@@ -155,6 +155,7 @@ func sanitizeTableName(name string) string {
 //   - Array of objects: [{"id": 1, "name": "Alice"}, ...]
 //   - JSON Lines format: {"id": 1, "name": "Alice"}\n{"id": 2, "name": "Bob"}
 //   - Single object: {"id": 1, "name": "Alice"} (creates single-row table)
+//nolint:gocyclo // JSON import supports arrays, objects, and error recovery in one routine.
 func ImportJSON(
 	ctx context.Context,
 	db *storage.DB,

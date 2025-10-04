@@ -51,6 +51,7 @@ func inferColumnTypes(sampleData [][]string, numCols int, opts *ImportOptions) [
 }
 
 // detectValueType attempts to parse a single value and returns its most specific type.
+//nolint:gocyclo // Value detection intentionally tries multiple parsers in order.
 func detectValueType(val string, dateFormats []string) storage.ColType {
 	if val == "" {
 		return storage.TextType

@@ -126,6 +126,7 @@ type ImportResult struct {
 //   - opts: Optional configuration (nil uses sensible defaults)
 //
 // Returns ImportResult with metadata and any error encountered.
+//nolint:gocyclo // CSV import pipeline handles detection, decoding, and batching in one routine.
 func ImportCSV(
 	ctx context.Context,
 	db *storage.DB,

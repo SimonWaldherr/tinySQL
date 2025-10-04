@@ -287,6 +287,7 @@ async function onExecuteClick() {
     
     executeBtn.disabled = true;
     executeBtn.innerHTML = '<span class="spinner"></span> Executing...';
+    setOpenVanillaGridEnabled(false);
     
     updateStatus('Executing query...');
 
@@ -319,6 +320,8 @@ async function onExecuteClick() {
                     <strong>Error:</strong> ${escapeHtml(errMsg)}
                 </div>
             `;
+            window.clearVanillaGrid?.();
+            setOpenVanillaGridEnabled(false);
             updateStatus('Query failed');
         }
     } catch (error) {
@@ -327,6 +330,8 @@ async function onExecuteClick() {
                 <strong>Error:</strong> ${escapeHtml(error.message)}
             </div>
         `;
+        window.clearVanillaGrid?.();
+        setOpenVanillaGridEnabled(false);
         updateStatus('Query failed');
     } finally {
         executeBtn.disabled = false;
@@ -339,6 +344,8 @@ function renderResults(data) {
     const resultsContainer = document.getElementById('resultsContainer');
 
     if (data.rowCount === 0) {
+        window.clearVanillaGrid?.();
+        setOpenVanillaGridEnabled(false);
         resultsContainer.innerHTML = `
             <div class="empty-state">
                 <div class="empty-state-icon">✓</div>
@@ -352,6 +359,7 @@ function renderResults(data) {
         return;
     }
 
+    window.clearVanillaGrid?.();
     const tableHtml = `
         <div class="results-header">
             <div class="results-info">
@@ -360,6 +368,7 @@ function renderResults(data) {
                 ${data.duration}
             </div>
             <div class="results-actions">
+                <button id="openVanillaGridBtn" onclick="openInVanillaGrid()" disabled>Open in VanillaGrid</button>
                 <button onclick="exportCSV()">Export CSV</button>
                 <button onclick="exportJSON()">Export JSON</button>
             </div>
@@ -384,6 +393,7 @@ function renderResults(data) {
     `;
 
     resultsContainer.innerHTML = tableHtml;
+    setOpenVanillaGridEnabled(true);
 }
 
 // Format table cell
@@ -416,6 +426,21 @@ function loadTables() {
 // Update status
 function updateStatus(text) {
     document.getElementById('statusText').textContent = text;
+}
+
+function setOpenVanillaGridEnabled(enabled) {
+    const btn = document.getElementById('openVanillaGridBtn');
+    if (btn) {
+        btn.disabled = !enabled;
+    }
+}
+
+function openInVanillaGrid() {
+    if (!currentResults || !Array.isArray(currentResults.rows) || currentResults.rows.length === 0) {
+        alert('No results to visualize yet. Execute a query with rows first.');
+        return;
+    }
+    window.renderVanillaGrid?.(currentResults);
 }
 
 // Export to CSV

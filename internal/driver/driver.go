@@ -156,6 +156,7 @@ func (s *server) releaseWriter() {
 	s.release(s.writerPool)
 }
 
+//nolint:gocyclo // Connection throttling must cover timeout, context, and immediate acquisition paths.
 func (s *server) acquire(ctx context.Context, pool chan struct{}) error {
 	if pool == nil {
 		if ctx != nil {
@@ -376,6 +377,7 @@ func (c *conn) currentDB() *storage.DB {
 	return c.srv.db
 }
 
+//nolint:gocyclo // execSQL coordinates parsing, locking, WAL, and transaction paths.
 func (c *conn) execSQL(ctx context.Context, sqlStr string) (driver.Result, error) {
 	// Parse the SQL and route to write or read execution paths. Writes run
 	// in a transaction snapshot when inside a tx, otherwise under writer lock.

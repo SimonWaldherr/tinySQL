@@ -139,6 +139,7 @@ func insertAllRecords(
 
 // streamInsertCSV reads CSV records and inserts them into the table with batching.
 // DEPRECATED: Use insertAllRecords instead for simpler in-memory processing.
+//nolint:gocyclo // Legacy streaming importer must juggle many error and batching branches.
 func streamInsertCSV(
 	ctx context.Context,
 	db *storage.DB,
@@ -149,8 +150,7 @@ func streamInsertCSV(
 	firstDataRow []string,
 	csvr *csv.Reader,
 	opts *ImportOptions,
-) (rowsInserted int64, rowsSkipped int64, errors []string) {
-
+)(rowsInserted int64, rowsSkipped int64, errors []string) {
 	errors = make([]string, 0)
 	batch := make([][]any, 0, opts.BatchSize)
 

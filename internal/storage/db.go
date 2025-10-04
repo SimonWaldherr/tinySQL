@@ -81,6 +81,7 @@ const (
 	InterfaceType
 )
 
+//nolint:gocyclo // String representations cover all supported column types in one switch.
 func (t ColType) String() string {
 	switch t {
 	case IntType:
@@ -905,6 +906,7 @@ func (w *WALManager) flushSync() error {
 	return nil
 }
 
+//nolint:gocyclo // WAL replay walks multiple recovery scenarios and truncation paths.
 func replayWAL(db *DB, walPath string) (nextSeq, nextTxID, committed uint64, err error) {
 	f, err := os.Open(walPath)
 	if err != nil {

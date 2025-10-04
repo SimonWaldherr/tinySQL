@@ -90,6 +90,7 @@ func handleMeta(db *sql.DB, line string) bool {
 	return false
 }
 
+//nolint:gocyclo // REPL printer performs scanning, formatting, and alignment for display.
 func printRows(rows *sql.Rows, cols []string) {
 	type rowMap = map[string]any
 	var out []rowMap

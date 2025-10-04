@@ -93,6 +93,7 @@ func (lx *lexer) skipWS() {
 	}
 }
 
+//nolint:gocyclo // SQL lexer tokenization must cover many literal and comment forms.
 func (lx *lexer) nextToken() token {
 	lx.skipWS()
 	start := lx.pos

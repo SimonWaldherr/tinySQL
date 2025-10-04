@@ -13,6 +13,7 @@ func newTestExecEnv() ExecEnv {
 	return ExecEnv{ctx: context.Background(), tenant: "tenant", db: storage.NewDB()}
 }
 
+//nolint:gocyclo // Exhaustively exercises JSON helper branches.
 func TestEvalJSONExtended(t *testing.T) {
 	env := newTestExecEnv()
 	row := Row{}
@@ -95,6 +96,7 @@ func TestEvalJSONExtended(t *testing.T) {
 	}
 }
 
+//nolint:gocyclo // Aggregation helper coverage requires multiple branch assertions.
 func TestAggregateHelpers(t *testing.T) {
 	env := newTestExecEnv()
 	rows := []Row{
@@ -213,6 +215,7 @@ func TestAggregateHelpers(t *testing.T) {
 	}
 }
 
+//nolint:gocyclo // Coercion helper coverage spans many type branches.
 func TestColumnsAndCoerceHelpers(t *testing.T) {
 	rows := []Row{
 		{"alpha": 1, "beta": 2},

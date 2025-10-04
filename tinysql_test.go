@@ -11,6 +11,7 @@ import (
 )
 
 // TestFeatureSupport tests the requested SQL features
+//nolint:gocyclo // Integration test enumerates many feature scenarios in one suite.
 func TestFeatureSupport(t *testing.T) {
 	db := storage.NewDB()
 	ctx := context.Background()
@@ -561,6 +562,7 @@ func TestEdgeCases(t *testing.T) {
 }
 
 // TestEdgeCasesAdvanced tests more advanced edge cases for maximum coverage
+//nolint:gocyclo // Edge case suite intentionally drives many branches without refactoring core code.
 func TestEdgeCasesAdvanced(t *testing.T) {
 	db := storage.NewDB()
 	ctx := context.Background()

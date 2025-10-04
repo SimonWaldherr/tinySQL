@@ -102,6 +102,7 @@ func runDemo(db *sql.DB) {
 	exec(`SELECT * FROM users ORDER BY id`)
 }
 
+//nolint:gocyclo // Demo printer handles formatting, scanning, and alignment logic together.
 func printRows(rows *sql.Rows, cols []string) {
 	type rowMap = map[string]any
 	var out []rowMap
