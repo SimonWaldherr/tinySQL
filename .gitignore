@@ -14,3 +14,4 @@ coverage-func.txt
 .actrc
 .env
 *.wasm
+persist_test.dat.wal

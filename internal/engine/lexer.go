@@ -93,7 +93,6 @@ func (lx *lexer) skipWS() {
 	}
 }
 
-//nolint:gocyclo // SQL lexer tokenization must cover many literal and comment forms.
 func (lx *lexer) nextToken() token {
 	lx.skipWS()
 	start := lx.pos
@@ -101,61 +100,80 @@ func (lx *lexer) nextToken() token {
 		return token{Typ: tEOF, Pos: start}
 	}
 	r := lx.peek()
-	// string
+
+	// Dispatch to specific tokenizers based on first character
 	if r == '\'' {
-		lx.next()
-		var val strings.Builder
-		for lx.pos < len(lx.s) {
-			ch := lx.next()
-			if ch == '\'' {
-				if lx.peek() == '\'' {
-					lx.next()
-					val.WriteRune('\'')
-					continue
-				}
-				break
+		return lx.tokenizeString(start)
+	}
+	if unicode.IsDigit(r) {
+		return lx.tokenizeNumber(start)
+	}
+	if unicode.IsLetter(r) || r == '_' {
+		return lx.tokenizeIdentOrKeyword(start)
+	}
+	return lx.tokenizeSymbol(start)
+}
+
+// Helper: tokenize string literals
+func (lx *lexer) tokenizeString(start int) token {
+	lx.next() // consume opening quote
+	var val strings.Builder
+	for lx.pos < len(lx.s) {
+		ch := lx.next()
+		if ch == '\'' {
+			if lx.peek() == '\'' {
+				lx.next()
+				val.WriteRune('\'')
+				continue
+			}
+			break
+		}
+		val.WriteRune(ch)
+	}
+	return token{Typ: tString, Val: val.String(), Pos: start}
+}
+
+// Helper: tokenize numeric literals
+func (lx *lexer) tokenizeNumber(start int) token {
+	var val strings.Builder
+	dot := false
+	for lx.pos < len(lx.s) {
+		ch := lx.peek()
+		if unicode.IsDigit(ch) || (!dot && ch == '.') {
+			if ch == '.' {
+				dot = true
 			}
 			val.WriteRune(ch)
+			lx.pos++
+		} else {
+			break
 		}
-		return token{Typ: tString, Val: val.String(), Pos: start}
 	}
-	// number
-	if unicode.IsDigit(r) {
-		var val strings.Builder
-		dot := false
-		for lx.pos < len(lx.s) {
-			ch := lx.peek()
-			if unicode.IsDigit(ch) || (!dot && ch == '.') {
-				if ch == '.' {
-					dot = true
-				}
-				val.WriteRune(ch)
-				lx.pos++
-			} else {
-				break
-			}
+	return token{Typ: tNumber, Val: val.String(), Pos: start}
+}
+
+// Helper: tokenize identifiers and keywords
+func (lx *lexer) tokenizeIdentOrKeyword(start int) token {
+	var val strings.Builder
+	for lx.pos < len(lx.s) {
+		ch := lx.peek()
+		if unicode.IsLetter(ch) || unicode.IsDigit(ch) || ch == '_' || ch == '.' {
+			val.WriteRune(ch)
+			lx.pos++
+		} else {
+			break
 		}
-		return token{Typ: tNumber, Val: val.String(), Pos: start}
 	}
-	// ident/keyword
-	if unicode.IsLetter(r) || r == '_' {
-		var val strings.Builder
-		for lx.pos < len(lx.s) {
-			ch := lx.peek()
-			if unicode.IsLetter(ch) || unicode.IsDigit(ch) || ch == '_' || ch == '.' {
-				val.WriteRune(ch)
-				lx.pos++
-			} else {
-				break
-			}
-		}
-		up := upper(val.String())
-		if isKeyword(up) {
-			return token{Typ: tKeyword, Val: up, Pos: start}
-		}
-		return token{Typ: tIdent, Val: val.String(), Pos: start}
+	up := upper(val.String())
+	if isKeyword(up) {
+		return token{Typ: tKeyword, Val: up, Pos: start}
 	}
-	// symbol
+	return token{Typ: tIdent, Val: val.String(), Pos: start}
+}
+
+// Helper: tokenize symbols and operators
+func (lx *lexer) tokenizeSymbol(start int) token {
+	r := lx.peek()
 	switch r {
 	case '(', ')', ',', '*', '+', '-', '/', '.', ';', '?':
 		lx.next()

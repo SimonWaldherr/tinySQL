@@ -1420,65 +1420,127 @@ func evalComparisonBinary(op string, lv, rv any) (any, error) {
 	return nil, fmt.Errorf("unknown comparison operator: %s", op)
 }
 
-//nolint:gocyclo // Function dispatch covers numerous built-in SQL functions.
+type funcHandler func(env ExecEnv, ex *FuncCall, row Row) (any, error)
+
+func getBuiltinFunctions() map[string]funcHandler {
+	return map[string]funcHandler{
+		"COALESCE":      evalCoalesceFunc,
+		"NULLIF":        evalNullifFunc,
+		"ISNULL":        evalIsNullFuncWrapper,
+		"JSON_GET":      evalJSONGetFunc,
+		"JSON_SET":      evalJSONExtendedFunc,
+		"JSON_EXTRACT":  evalJSONExtendedFunc,
+		"COUNT":         evalCountSingle,
+		"SUM":           evalAggregateSingle,
+		"AVG":           evalAggregateSingle,
+		"MIN":           evalAggregateSingle,
+		"MAX":           evalAggregateSingle,
+		"NOW":           evalNowFunc,
+		"CURRENT_TIME":  evalNowFunc,
+		"CURRENT_DATE":  evalCurrentDateFunc,
+		"DATEDIFF":      evalDateDiff,
+		"LTRIM":         evalLTrimFunc,
+		"RTRIM":         evalRTrimFunc,
+		"TRIM":          evalTrimFunc,
+		"UPPER":         evalUpperFunc,
+		"LOWER":         evalLowerFunc,
+		"CONCAT":        evalConcatFunc,
+		"LENGTH":        evalLengthFunc,
+		"LEN":           evalLengthFunc,
+		"SUBSTRING":     evalSubstringFunc,
+		"SUBSTR":        evalSubstringFunc,
+		"MD5":           evalMD5Func,
+		"SHA1":          evalSHA1Func,
+		"SHA256":        evalSHA256Func,
+		"SHA512":        evalSHA512Func,
+		"BASE64":        evalBase64Func,
+		"BASE64_DECODE": evalBase64DecodeFunc,
+		"LEFT":          evalLeftFunc,
+		"RIGHT":         evalRightFunc,
+		"CAST":          evalCastFunc,
+	}
+}
+
 func evalFuncCall(env ExecEnv, ex *FuncCall, row Row) (any, error) {
-	switch ex.Name {
-	case "COALESCE":
-		return evalCoalesce(env, ex.Args, row)
-	case "NULLIF":
-		return evalNullif(env, ex.Args, row)
-	case "ISNULL":
-		return evalIsNullFunc(env, ex.Args, row)
-	case "JSON_GET":
-		return evalJSONGet(env, ex.Args, row)
-	case "JSON_SET", "JSON_EXTRACT":
-		return evalJSONExtended(env, ex, row)
-	case "COUNT":
-		return evalCountSingle(env, ex, row)
-	case "SUM", "AVG", "MIN", "MAX":
-		return evalAggregateSingle(env, ex, row)
-	case "NOW", "CURRENT_TIME":
-		return time.Now(), nil
-	case "CURRENT_DATE":
-		return time.Now().Truncate(24 * time.Hour), nil
-	case "DATEDIFF":
-		return evalDateDiff(env, ex, row)
-	case "LTRIM":
-		return evalLTrim(env, ex.Args, row)
-	case "RTRIM":
-		return evalRTrim(env, ex.Args, row)
-	case "TRIM":
-		return evalTrim(env, ex.Args, row)
-	case "UPPER":
-		return evalUpper(env, ex.Args, row)
-	case "LOWER":
-		return evalLower(env, ex.Args, row)
-	case "CONCAT":
-		return evalConcat(env, ex.Args, row)
-	case "LENGTH", "LEN":
-		return evalLength(env, ex.Args, row)
-	case "SUBSTRING", "SUBSTR":
-		return evalSubstring(env, ex.Args, row)
-	case "MD5":
-		return evalMD5(env, ex.Args, row)
-	case "SHA1":
-		return evalSHA1(env, ex.Args, row)
-	case "SHA256":
-		return evalSHA256(env, ex.Args, row)
-	case "SHA512":
-		return evalSHA512(env, ex.Args, row)
-	case "BASE64":
-		return evalBase64(env, ex.Args, row)
-	case "BASE64_DECODE":
-		return evalBase64Decode(env, ex.Args, row)
-	case "LEFT":
-		return evalLeft(env, ex.Args, row)
-	case "RIGHT":
-		return evalRight(env, ex.Args, row)
-	case "CAST":
-		return evalCast(env, ex.Args, row)
+	builtinFunctions := getBuiltinFunctions()
+	if handler, ok := builtinFunctions[ex.Name]; ok {
+		return handler(env, ex, row)
 	}
 	return nil, fmt.Errorf("unknown function: %s", ex.Name)
+}
+
+// Wrapper functions to match funcHandler signature
+func evalCoalesceFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalCoalesce(env, ex.Args, row)
+}
+func evalNullifFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalNullif(env, ex.Args, row)
+}
+func evalIsNullFuncWrapper(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalIsNullFunc(env, ex.Args, row)
+}
+func evalJSONGetFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalJSONGet(env, ex.Args, row)
+}
+func evalJSONExtendedFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalJSONExtended(env, ex, row)
+}
+func evalNowFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return time.Now(), nil
+}
+func evalCurrentDateFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return time.Now().Truncate(24 * time.Hour), nil
+}
+func evalLTrimFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalLTrim(env, ex.Args, row)
+}
+func evalRTrimFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalRTrim(env, ex.Args, row)
+}
+func evalTrimFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalTrim(env, ex.Args, row)
+}
+func evalUpperFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalUpper(env, ex.Args, row)
+}
+func evalLowerFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalLower(env, ex.Args, row)
+}
+func evalConcatFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalConcat(env, ex.Args, row)
+}
+func evalLengthFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalLength(env, ex.Args, row)
+}
+func evalSubstringFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalSubstring(env, ex.Args, row)
+}
+func evalMD5Func(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalMD5(env, ex.Args, row)
+}
+func evalSHA1Func(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalSHA1(env, ex.Args, row)
+}
+func evalSHA256Func(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalSHA256(env, ex.Args, row)
+}
+func evalSHA512Func(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalSHA512(env, ex.Args, row)
+}
+func evalBase64Func(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalBase64(env, ex.Args, row)
+}
+func evalBase64DecodeFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalBase64Decode(env, ex.Args, row)
+}
+func evalLeftFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalLeft(env, ex.Args, row)
+}
+func evalRightFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalRight(env, ex.Args, row)
+}
+func evalCastFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalCast(env, ex.Args, row)
 }
 
 func evalCoalesce(env ExecEnv, args []Expr, row Row) (any, error) {

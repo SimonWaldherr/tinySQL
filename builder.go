@@ -792,14 +792,27 @@ func ToSQL(stmt engine.Statement) string {
 	}
 }
 
-//nolint:gocyclo // SQL rendering handles many clause permutations in one place.
 func selectToSQL(s *engine.Select) string {
 	var sb strings.Builder
 
-	// CTEs
-	if len(s.CTEs) > 0 {
+	buildCTEs(&sb, s.CTEs)
+	buildSelectClause(&sb, s)
+	buildFromClause(&sb, s.From)
+	buildJoinClauses(&sb, s.Joins)
+	buildWhereClause(&sb, s.Where)
+	buildGroupByClause(&sb, s.GroupBy)
+	buildHavingClause(&sb, s.Having)
+	buildOrderByClause(&sb, s.OrderBy)
+	buildLimitOffsetClauses(&sb, s.Limit, s.Offset)
+
+	return sb.String()
+}
+
+// Helper: build CTEs clause
+func buildCTEs(sb *strings.Builder, ctes []engine.CTE) {
+	if len(ctes) > 0 {
 		sb.WriteString("WITH ")
-		for i, cte := range s.CTEs {
+		for i, cte := range ctes {
 			if i > 0 {
 				sb.WriteString(", ")
 			}
@@ -810,8 +823,10 @@ func selectToSQL(s *engine.Select) string {
 		}
 		sb.WriteString(" ")
 	}
+}
 
-	// SELECT
+// Helper: build SELECT clause
+func buildSelectClause(sb *strings.Builder, s *engine.Select) {
 	sb.WriteString("SELECT ")
 	if s.Distinct {
 		sb.WriteString("DISTINCT ")
@@ -830,19 +845,23 @@ func selectToSQL(s *engine.Select) string {
 			}
 		}
 	}
+}
 
-	// FROM
-	if s.From.Table != "" {
+// Helper: build FROM clause
+func buildFromClause(sb *strings.Builder, from engine.FromItem) {
+	if from.Table != "" {
 		sb.WriteString(" FROM ")
-		sb.WriteString(s.From.Table)
-		if s.From.Alias != "" {
+		sb.WriteString(from.Table)
+		if from.Alias != "" {
 			sb.WriteString(" AS ")
-			sb.WriteString(s.From.Alias)
+			sb.WriteString(from.Alias)
 		}
 	}
+}
 
-	// JOINs
-	for _, join := range s.Joins {
+// Helper: build JOIN clauses
+func buildJoinClauses(sb *strings.Builder, joins []engine.JoinClause) {
+	for _, join := range joins {
 		switch join.Type {
 		case engine.JoinInner:
 			sb.WriteString(" INNER JOIN ")
@@ -859,34 +878,42 @@ func selectToSQL(s *engine.Select) string {
 		sb.WriteString(" ON ")
 		sb.WriteString(exprToSQL(join.On))
 	}
+}
 
-	// WHERE
-	if s.Where != nil {
+// Helper: build WHERE clause
+func buildWhereClause(sb *strings.Builder, where engine.Expr) {
+	if where != nil {
 		sb.WriteString(" WHERE ")
-		sb.WriteString(exprToSQL(s.Where))
+		sb.WriteString(exprToSQL(where))
 	}
+}
 
-	// GROUP BY
-	if len(s.GroupBy) > 0 {
+// Helper: build GROUP BY clause
+func buildGroupByClause(sb *strings.Builder, groupBy []engine.Expr) {
+	if len(groupBy) > 0 {
 		sb.WriteString(" GROUP BY ")
-		for i, g := range s.GroupBy {
+		for i, g := range groupBy {
 			if i > 0 {
 				sb.WriteString(", ")
 			}
 			sb.WriteString(exprToSQL(g))
 		}
 	}
+}
 
-	// HAVING
-	if s.Having != nil {
+// Helper: build HAVING clause
+func buildHavingClause(sb *strings.Builder, having engine.Expr) {
+	if having != nil {
 		sb.WriteString(" HAVING ")
-		sb.WriteString(exprToSQL(s.Having))
+		sb.WriteString(exprToSQL(having))
 	}
+}
 
-	// ORDER BY
-	if len(s.OrderBy) > 0 {
+// Helper: build ORDER BY clause
+func buildOrderByClause(sb *strings.Builder, orderBy []engine.OrderItem) {
+	if len(orderBy) > 0 {
 		sb.WriteString(" ORDER BY ")
-		for i, o := range s.OrderBy {
+		for i, o := range orderBy {
 			if i > 0 {
 				sb.WriteString(", ")
 			}
@@ -896,16 +923,16 @@ func selectToSQL(s *engine.Select) string {
 			}
 		}
 	}
+}
 
-	// LIMIT/OFFSET
-	if s.Limit != nil {
-		sb.WriteString(fmt.Sprintf(" LIMIT %d", *s.Limit))
+// Helper: build LIMIT/OFFSET clauses
+func buildLimitOffsetClauses(sb *strings.Builder, limit *int, offset *int) {
+	if limit != nil {
+		sb.WriteString(fmt.Sprintf(" LIMIT %d", *limit))
 	}
-	if s.Offset != nil {
-		sb.WriteString(fmt.Sprintf(" OFFSET %d", *s.Offset))
+	if offset != nil {
+		sb.WriteString(fmt.Sprintf(" OFFSET %d", *offset))
 	}
-
-	return sb.String()
 }
 
 func insertToSQL(i *engine.Insert) string {

@@ -51,43 +51,68 @@ func inferColumnTypes(sampleData [][]string, numCols int, opts *ImportOptions) [
 }
 
 // detectValueType attempts to parse a single value and returns its most specific type.
-//nolint:gocyclo // Value detection intentionally tries multiple parsers in order.
 func detectValueType(val string, dateFormats []string) storage.ColType {
 	if val == "" {
 		return storage.TextType
 	}
 
-	// Try boolean
-	lower := strings.ToLower(val)
-	if lower == "true" || lower == "false" || lower == "t" || lower == "f" ||
-		lower == "yes" || lower == "no" || lower == "y" || lower == "n" ||
-		lower == "1" || lower == "0" {
-		// But only if it's clearly boolean, not just any digit
-		if lower == "true" || lower == "false" || lower == "yes" || lower == "no" ||
-			(len(val) == 1 && (lower == "t" || lower == "f" || lower == "y" || lower == "n")) {
-			return storage.BoolType
-		}
+	// Boolean detection
+	if isBoolLike(val) {
+		return storage.BoolType
 	}
 
-	// Try integer (including negative)
-	if _, err := strconv.ParseInt(val, 10, 64); err == nil {
+	// Integer detection (including negative)
+	if isIntLike(val) {
 		return storage.IntType
 	}
 
-	// Try float
-	if _, err := strconv.ParseFloat(val, 64); err == nil {
+	// Float detection
+	if isFloatLike(val) {
 		return storage.Float64Type
 	}
 
-	// Try datetime formats
-	for _, layout := range dateFormats {
-		if _, err := time.Parse(layout, val); err == nil {
-			return storage.TimeType
-		}
+	// Time detection
+	if isTimeLike(val, dateFormats) {
+		return storage.TimeType
 	}
 
 	// Default to text
 	return storage.TextType
+}
+
+// Helper: isBoolLike returns true for common boolean representations.
+func isBoolLike(val string) bool {
+	lower := strings.ToLower(strings.TrimSpace(val))
+	switch lower {
+	case "true", "false", "yes", "no":
+		return true
+	case "t", "f", "y", "n":
+		return len(val) == 1
+	default:
+		return false
+	}
+}
+
+// Helper: isIntLike returns true if the value parses as an integer.
+func isIntLike(val string) bool {
+	_, err := strconv.ParseInt(strings.TrimSpace(val), 10, 64)
+	return err == nil
+}
+
+// Helper: isFloatLike returns true if the value parses as a float.
+func isFloatLike(val string) bool {
+	_, err := strconv.ParseFloat(strings.TrimSpace(val), 64)
+	return err == nil
+}
+
+// Helper: isTimeLike attempts to parse the value against provided layouts.
+func isTimeLike(val string, layouts []string) bool {
+	for _, l := range layouts {
+		if _, err := time.Parse(l, val); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // determineColumnType picks the final type based on vote counts.

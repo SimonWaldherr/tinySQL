@@ -267,26 +267,31 @@ type OrderItem struct {
 // ------------------------------ Parse ------------------------------
 
 // ParseStatement parses a single SQL statement into an AST.
-//nolint:gocyclo // Top-level dispatcher must inspect numerous statement forms.
 func (p *Parser) ParseStatement() (Statement, error) {
-	switch {
-	case p.cur.Typ == tKeyword && p.cur.Val == "CREATE":
-		return p.parseCreate()
-	case p.cur.Typ == tKeyword && p.cur.Val == "DROP":
-		return p.parseDrop()
-	case p.cur.Typ == tKeyword && p.cur.Val == "ALTER":
-		return p.parseAlter()
-	case p.cur.Typ == tKeyword && p.cur.Val == "INSERT":
-		return p.parseInsert()
-	case p.cur.Typ == tKeyword && p.cur.Val == "UPDATE":
-		return p.parseUpdate()
-	case p.cur.Typ == tKeyword && p.cur.Val == "DELETE":
-		return p.parseDelete()
-	case p.cur.Typ == tKeyword && (p.cur.Val == "SELECT" || p.cur.Val == "WITH"):
-		return p.parseSelectWithCTE()
-	default:
+	if p.cur.Typ != tKeyword {
 		return nil, p.errf("expected a statement")
 	}
+
+	// handler map for simple single-keyword dispatch
+	handlers := map[string]func() (Statement, error){
+		"CREATE": p.parseCreate,
+		"DROP":   p.parseDrop,
+		"ALTER":  p.parseAlter,
+		"INSERT": p.parseInsert,
+		"UPDATE": p.parseUpdate,
+		"DELETE": p.parseDelete,
+	}
+
+	if h, ok := handlers[p.cur.Val]; ok {
+		return h()
+	}
+
+	// SELECT and WITH are handled by the same parser
+	if p.cur.Val == "SELECT" || p.cur.Val == "WITH" {
+		return p.parseSelectWithCTE()
+	}
+
+	return nil, p.errf("expected a statement")
 }
 
 //nolint:gocyclo // CREATE statement grammar is broad and handled centrally here.
@@ -1211,113 +1216,58 @@ func (p *Parser) parseReferencesConstraint(col *storage.Column) error {
 	}
 	return nil
 }
-//nolint:gocyclo // parseType centralizes SQL type grammar handling.
+
+var typeKeywordMap = map[string]storage.ColType{
+	// Integer types
+	"INT":    storage.IntType,
+	"INT8":   storage.Int8Type,
+	"INT16":  storage.Int16Type,
+	"INT32":  storage.Int32Type,
+	"INT64":  storage.Int64Type,
+	"UINT":   storage.UintType,
+	"UINT8":  storage.Uint8Type,
+	"UINT16": storage.Uint16Type,
+	"UINT32": storage.Uint32Type,
+	"UINT64": storage.Uint64Type,
+	// Floating point types
+	"FLOAT":   storage.Float64Type,
+	"FLOAT64": storage.Float64Type,
+	"DOUBLE":  storage.Float64Type,
+	"FLOAT32": storage.Float32Type,
+	// String and character types
+	"STRING": storage.StringType,
+	"TEXT":   storage.TextType,
+	"RUNE":   storage.RuneType,
+	"BYTE":   storage.ByteType,
+	// Boolean type
+	"BOOL":    storage.BoolType,
+	"BOOLEAN": storage.BoolType,
+	// Time types
+	"TIME":      storage.TimeType,
+	"DATE":      storage.DateType,
+	"DATETIME":  storage.DateTimeType,
+	"TIMESTAMP": storage.TimestampType,
+	"DURATION":  storage.DurationType,
+	// Complex data types
+	"JSON":  storage.JsonType,
+	"JSONB": storage.JsonbType,
+	"MAP":   storage.MapType,
+	"SLICE": storage.SliceType,
+	"ARRAY": storage.SliceType,
+	// Advanced types
+	"COMPLEX64":  storage.Complex64Type,
+	"COMPLEX128": storage.Complex128Type,
+	"COMPLEX":    storage.Complex128Type,
+	"POINTER":    storage.PointerType,
+	"PTR":        storage.PointerType,
+	"INTERFACE":  storage.InterfaceType,
+}
+
 func (p *Parser) parseType() storage.ColType {
 	if p.cur.Typ == tKeyword {
-		switch p.cur.Val {
-		// Integer types
-		case "INT":
+		if colType, ok := typeKeywordMap[p.cur.Val]; ok {
 			p.next()
-			return storage.IntType
-		case "INT8":
-			p.next()
-			return storage.Int8Type
-		case "INT16":
-			p.next()
-			return storage.Int16Type
-		case "INT32":
-			p.next()
-			return storage.Int32Type
-		case "INT64":
-			p.next()
-			return storage.Int64Type
-		case "UINT":
-			p.next()
-			return storage.UintType
-		case "UINT8":
-			p.next()
-			return storage.Uint8Type
-		case "UINT16":
-			p.next()
-			return storage.Uint16Type
-		case "UINT32":
-			p.next()
-			return storage.Uint32Type
-		case "UINT64":
-			p.next()
-			return storage.Uint64Type
-
-		// Floating point types
-		case "FLOAT", "FLOAT64", "DOUBLE":
-			p.next()
-			return storage.Float64Type
-		case "FLOAT32":
-			p.next()
-			return storage.Float32Type
-
-		// String and character types
-		case "STRING":
-			p.next()
-			return storage.StringType
-		case "TEXT":
-			p.next()
-			return storage.TextType
-		case "RUNE":
-			p.next()
-			return storage.RuneType
-		case "BYTE":
-			p.next()
-			return storage.ByteType
-
-		// Boolean type
-		case "BOOL", "BOOLEAN":
-			p.next()
-			return storage.BoolType
-
-		// Time types
-		case "TIME":
-			p.next()
-			return storage.TimeType
-		case "DATE":
-			p.next()
-			return storage.DateType
-		case "DATETIME":
-			p.next()
-			return storage.DateTimeType
-		case "TIMESTAMP":
-			p.next()
-			return storage.TimestampType
-		case "DURATION":
-			p.next()
-			return storage.DurationType
-
-		// Complex data types
-		case "JSON":
-			p.next()
-			return storage.JsonType
-		case "JSONB":
-			p.next()
-			return storage.JsonbType
-		case "MAP":
-			p.next()
-			return storage.MapType
-		case "SLICE", "ARRAY":
-			p.next()
-			return storage.SliceType
-
-		// Advanced types
-		case "COMPLEX64":
-			p.next()
-			return storage.Complex64Type
-		case "COMPLEX128", "COMPLEX":
-			p.next()
-			return storage.Complex128Type
-		case "POINTER", "PTR":
-			p.next()
-			return storage.PointerType
-		case "INTERFACE":
-			p.next()
-			return storage.InterfaceType
+			return colType
 		}
 	}
 	return -1
@@ -1404,6 +1354,7 @@ func (p *Parser) parseIsNull() (Expr, error) {
 	}
 	return l, nil
 }
+
 //nolint:gocyclo // parseCmp handles many comparison operator permutations.
 func (p *Parser) parseCmp() (Expr, error) {
 	l, err := p.parseAddSub()
@@ -1540,6 +1491,7 @@ func (p *Parser) parseUnary() (Expr, error) {
 	}
 	return p.parsePrimary()
 }
+
 //nolint:gocyclo // Primary expression parsing covers numerous literal and sub-expression forms.
 func (p *Parser) parsePrimary() (Expr, error) {
 	switch p.cur.Typ {

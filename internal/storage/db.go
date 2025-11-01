@@ -81,74 +81,47 @@ const (
 	InterfaceType
 )
 
-//nolint:gocyclo // String representations cover all supported column types in one switch.
+var colTypeToString = map[ColType]string{
+	IntType:        "INT",
+	Int8Type:       "INT8",
+	Int16Type:      "INT16",
+	Int32Type:      "INT32",
+	Int64Type:      "INT64",
+	UintType:       "UINT",
+	Uint8Type:      "UINT8",
+	Uint16Type:     "UINT16",
+	Uint32Type:     "UINT32",
+	Uint64Type:     "UINT64",
+	Float32Type:    "FLOAT32",
+	Float64Type:    "FLOAT64",
+	FloatType:      "FLOAT64",
+	StringType:     "STRING",
+	TextType:       "TEXT",
+	RuneType:       "RUNE",
+	ByteType:       "BYTE",
+	BoolType:       "BOOL",
+	TimeType:       "TIME",
+	DateType:       "DATE",
+	DateTimeType:   "DATETIME",
+	TimestampType:  "TIMESTAMP",
+	DurationType:   "DURATION",
+	JsonType:       "JSON",
+	JsonbType:      "JSONB",
+	MapType:        "MAP",
+	SliceType:      "SLICE",
+	ArrayType:      "ARRAY",
+	Complex64Type:  "COMPLEX64",
+	Complex128Type: "COMPLEX",
+	ComplexType:    "COMPLEX",
+	PointerType:    "POINTER",
+	InterfaceType:  "INTERFACE",
+}
+
 func (t ColType) String() string {
-	switch t {
-	case IntType:
-		return "INT"
-	case Int8Type:
-		return "INT8"
-	case Int16Type:
-		return "INT16"
-	case Int32Type:
-		return "INT32"
-	case Int64Type:
-		return "INT64"
-	case UintType:
-		return "UINT"
-	case Uint8Type:
-		return "UINT8"
-	case Uint16Type:
-		return "UINT16"
-	case Uint32Type:
-		return "UINT32"
-	case Uint64Type:
-		return "UINT64"
-	case Float32Type:
-		return "FLOAT32"
-	case Float64Type, FloatType:
-		return "FLOAT64"
-	case StringType:
-		return "STRING"
-	case TextType:
-		return "TEXT"
-	case RuneType:
-		return "RUNE"
-	case ByteType:
-		return "BYTE"
-	case BoolType:
-		return "BOOL"
-	case TimeType:
-		return "TIME"
-	case DateType:
-		return "DATE"
-	case DateTimeType:
-		return "DATETIME"
-	case TimestampType:
-		return "TIMESTAMP"
-	case DurationType:
-		return "DURATION"
-	case JsonType:
-		return "JSON"
-	case JsonbType:
-		return "JSONB"
-	case MapType:
-		return "MAP"
-	case SliceType:
-		return "SLICE"
-	case ArrayType:
-		return "ARRAY"
-	case Complex64Type:
-		return "COMPLEX64"
-	case Complex128Type, ComplexType:
-		return "COMPLEX"
-	case PointerType:
-		return "POINTER"
-	case InterfaceType:
-		return "INTERFACE"
-	default:
-		return "UNKNOWN"
+	if s, ok := colTypeToString[t]; ok {
+		return s
 	}
+	return "UNKNOWN"
 }
 
 // ConstraintType enumerates supported column constraints.
@@ -906,7 +879,6 @@ func (w *WALManager) flushSync() error {
 	return nil
 }
 
-//nolint:gocyclo // WAL replay walks multiple recovery scenarios and truncation paths.
 func replayWAL(db *DB, walPath string) (nextSeq, nextTxID, committed uint64, err error) {
 	f, err := os.Open(walPath)
 	if err != nil {
@@ -943,31 +915,36 @@ func replayWAL(db *DB, walPath string) (nextSeq, nextTxID, committed uint64, err
 		if rec.TxID > lastTx {
 			lastTx = rec.TxID
 		}
-		switch rec.Type {
-		case walRecordBegin:
-			pending[rec.TxID] = nil
-		case walRecordApplyTable:
-			if rec.Table == nil {
-				continue
-			}
-			dt := *rec.Table
-			pending[rec.TxID] = append(pending[rec.TxID], walOperation{tenant: rec.Tenant, name: dt.Name, table: &dt})
-		case walRecordDropTable:
-			pending[rec.TxID] = append(pending[rec.TxID], walOperation{tenant: rec.Tenant, name: rec.TableName, drop: true})
-		case walRecordCommit:
-			ops := pending[rec.TxID]
-			for _, op := range ops {
-				if op.drop {
-					_ = db.Drop(op.tenant, op.name)
-					continue
-				}
-				db.upsertTable(op.tenant, diskToTable(*op.table))
-			}
-			delete(pending, rec.TxID)
-			committed++
-		}
+		handleWalRecord(db, rec, pending, &committed)
 	}
 	return lastSeq + 1, lastTx + 1, committed, nil
+}
+
+// handleWalRecord processes a single WAL record and updates pending map and committed count.
+func handleWalRecord(db *DB, rec walRecord, pending map[uint64][]walOperation, committed *uint64) {
+	switch rec.Type {
+	case walRecordBegin:
+		pending[rec.TxID] = nil
+	case walRecordApplyTable:
+		if rec.Table == nil {
+			return
+		}
+		dt := *rec.Table
+		pending[rec.TxID] = append(pending[rec.TxID], walOperation{tenant: rec.Tenant, name: dt.Name, table: &dt})
+	case walRecordDropTable:
+		pending[rec.TxID] = append(pending[rec.TxID], walOperation{tenant: rec.Tenant, name: rec.TableName, drop: true})
+	case walRecordCommit:
+		ops := pending[rec.TxID]
+		for _, op := range ops {
+			if op.drop {
+				_ = db.Drop(op.tenant, op.name)
+				continue
+			}
+			db.upsertTable(op.tenant, diskToTable(*op.table))
+		}
+		delete(pending, rec.TxID)
+		*committed++
+	}
 }
 
 type countingReader struct {

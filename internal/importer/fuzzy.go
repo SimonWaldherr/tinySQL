@@ -48,7 +48,6 @@ type FuzzyImportOptions struct {
 }
 
 // FuzzyImportCSV is a more forgiving version of ImportCSV that handles malformed data
-//nolint:gocyclo // Fuzzy CSV import intentionally includes extensive cleanup and fallback paths.
 func FuzzyImportCSV(
 	ctx context.Context,
 	db *storage.DB,
@@ -57,19 +56,15 @@ func FuzzyImportCSV(
 	src io.Reader,
 	opts *FuzzyImportOptions,
 ) (*ImportResult, error) {
+	// Setup and validation
 	if opts == nil {
-		opts = &FuzzyImportOptions{
-			ImportOptions: &ImportOptions{},
-		}
+		opts = &FuzzyImportOptions{ImportOptions: &ImportOptions{}}
 	}
-
 	applyFuzzyDefaults(opts)
-
 	if opts.ImportOptions == nil {
 		opts.ImportOptions = &ImportOptions{}
 	}
 	applyDefaults(opts.ImportOptions)
-
 	if opts.TableName != "" {
 		tableName = opts.TableName
 	}
@@ -77,72 +72,74 @@ func FuzzyImportCSV(
 		return nil, fmt.Errorf("table name is required")
 	}
 
-	result := &ImportResult{
-		Errors: make([]string, 0),
-	}
+	// Core pipeline split into helpers for readability and lower complexity
+	result := &ImportResult{Errors: make([]string, 0)}
 
-	// Read and clean the input data
 	cleanedData, err := cleanInputData(src, opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to clean input data: %v", err)
 	}
 
-	// Detect delimiter and structure
 	delimiter, records, err := fuzzyParseCSV(cleanedData, opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse CSV: %v", err)
 	}
-
 	result.Delimiter = delimiter
-
 	if len(records) == 0 {
 		return result, nil
 	}
 
-	// Determine if first row is header
+	headers, dataRecords := fuzzyPrepareHeaders(records, opts)
+	numCols := len(headers)
+	dataRecords = normalizeRecords(dataRecords, numCols, opts)
+
+	columnTypes := fuzzyPrepareColumnTypes(dataRecords, numCols, opts)
+	result.ColumnNames = headers
+	result.ColumnTypes = columnTypes
+
+	if err := fuzzyEnsureTable(db, tenant, tableName, headers, columnTypes, opts); err != nil {
+		return nil, err
+	}
+
+	if err := fuzzyInsertRows(db, tenant, tableName, headers, columnTypes, dataRecords, result, opts); err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+// Helper: prepare headers and split data records
+func fuzzyPrepareHeaders(records [][]string, opts *FuzzyImportOptions) ([]string, [][]string) {
 	headerMode := "auto"
 	if opts.ImportOptions != nil && opts.ImportOptions.HeaderMode != "" {
 		headerMode = opts.ImportOptions.HeaderMode
 	}
 	hasHeader := fuzzyDecideHeader(records, headerMode)
-	result.HadHeader = hasHeader
-
-	var headers []string
-	var dataRecords [][]string
-
 	if hasHeader {
-		headers = sanitizeColumnNames(records[0])
-		dataRecords = records[1:]
-	} else {
-		numCols := len(records[0])
-		headers = generateColumnNames(numCols)
-		dataRecords = records
+		return sanitizeColumnNames(records[0]), records[1:]
 	}
+	numCols := len(records[0])
+	return generateColumnNames(numCols), records
+}
 
-	numCols := len(headers)
-
-	// Normalize all records to have the same number of columns
-	dataRecords = normalizeRecords(dataRecords, numCols, opts)
-
-	// Infer column types
-	var columnTypes []storage.ColType
+// Helper: infer or default column types
+func fuzzyPrepareColumnTypes(dataRecords [][]string, numCols int, opts *FuzzyImportOptions) []storage.ColType {
 	typeInference := true
 	if opts.ImportOptions != nil {
 		typeInference = opts.ImportOptions.TypeInference
 	}
 	if typeInference {
-		columnTypes = fuzzyInferColumnTypes(dataRecords, numCols, opts)
-	} else {
-		columnTypes = make([]storage.ColType, numCols)
-		for i := range columnTypes {
-			columnTypes[i] = storage.TextType
-		}
+		return fuzzyInferColumnTypes(dataRecords, numCols, opts)
 	}
+	out := make([]storage.ColType, numCols)
+	for i := range out {
+		out[i] = storage.TextType
+	}
+	return out
+}
 
-	result.ColumnNames = headers
-	result.ColumnTypes = columnTypes
-
-	// Create table if needed
+// Helper: create table if requested
+func fuzzyEnsureTable(db *storage.DB, tenant, tableName string, headers []string, columnTypes []storage.ColType, opts *FuzzyImportOptions) error {
 	createTable := true
 	truncate := false
 	if opts.ImportOptions != nil {
@@ -150,74 +147,60 @@ func FuzzyImportCSV(
 		truncate = opts.ImportOptions.Truncate
 	}
 	if createTable {
-		columns := make([]storage.Column, numCols)
-		for i := 0; i < numCols; i++ {
-			columns[i] = storage.Column{
-				Name: headers[i],
-				Type: columnTypes[i],
-			}
+		columns := make([]storage.Column, len(headers))
+		for i := range headers {
+			columns[i] = storage.Column{Name: headers[i], Type: columnTypes[i]}
 		}
-
 		table := storage.NewTable(tableName, columns, false)
 		if err := db.Put(tenant, table); err != nil {
-			return nil, fmt.Errorf("failed to create table: %v", err)
+			return fmt.Errorf("failed to create table: %v", err)
 		}
-
 		if truncate {
 			table.Rows = nil
 		}
 	}
+	return nil
+}
 
-	// Get the table
+// Helper: insert rows with fuzzy conversion and report into result
+func fuzzyInsertRows(db *storage.DB, tenant, tableName string, headers []string, columnTypes []storage.ColType, dataRecords [][]string, result *ImportResult, opts *FuzzyImportOptions) error {
 	table, err := db.Get(tenant, tableName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get table: %v", err)
+		return fmt.Errorf("failed to get table: %v", err)
 	}
-
-	// Insert data with fuzzy conversion
+	numCols := len(headers)
 	skippedRows := 0
 	for rowIdx, record := range dataRecords {
 		if len(record) != numCols {
 			skippedRows++
 			result.RowsSkipped++
-			result.Errors = append(result.Errors,
-				fmt.Sprintf("row %d: column count mismatch (expected %d, got %d)",
-					rowIdx+1, numCols, len(record)))
-
+			result.Errors = append(result.Errors, fmt.Sprintf("row %d: column count mismatch (expected %d, got %d)", rowIdx+1, numCols, len(record)))
 			if skippedRows > opts.MaxSkippedRows {
-				return nil, fmt.Errorf("too many skipped rows (%d), aborting import", skippedRows)
+				return fmt.Errorf("too many skipped rows (%d), aborting import", skippedRows)
 			}
 			continue
 		}
-
 		row := make([]interface{}, numCols)
 		hasError := false
-
 		for colIdx := 0; colIdx < numCols; colIdx++ {
 			value := record[colIdx]
 			if opts.TrimWhitespace {
 				value = strings.TrimSpace(value)
 			}
-
 			converted, err := fuzzyConvertValue(value, columnTypes[colIdx], opts)
 			if err != nil {
 				if !opts.CoerceTypes {
 					hasError = true
-					result.Errors = append(result.Errors,
-						fmt.Sprintf("row %d, col %s: %v", rowIdx+1, headers[colIdx], err))
+					result.Errors = append(result.Errors, fmt.Sprintf("row %d, col %s: %v", rowIdx+1, headers[colIdx], err))
 					break
 				}
-				// Fallback to string
 				converted = value
 			}
-
 			row[colIdx] = converted
 		}
-
 		if hasError && !opts.SkipInvalidRows {
-			return nil, fmt.Errorf("import failed at row %d", rowIdx+1)
+			return fmt.Errorf("import failed at row %d", rowIdx+1)
 		}
-
 		if !hasError {
 			table.Rows = append(table.Rows, row)
 			result.RowsInserted++
@@ -225,8 +208,7 @@ func FuzzyImportCSV(
 			result.RowsSkipped++
 		}
 	}
-
-	return result, nil
+	return nil
 }
 
 // fuzzyDecideHeader is a more lenient header detection that also checks for
@@ -508,6 +490,7 @@ func fuzzyInferColumnTypes(sampleData [][]string, numCols int, opts *FuzzyImport
 }
 
 // fuzzyDetectType detects type with lenient parsing
+//
 //nolint:gocyclo // Fuzzy type detection tries many relaxed heuristics.
 func fuzzyDetectType(value string, opts *FuzzyImportOptions) storage.ColType {
 	value = strings.TrimSpace(value)
@@ -547,6 +530,7 @@ func fuzzyDetectType(value string, opts *FuzzyImportOptions) storage.ColType {
 }
 
 // fuzzyConvertValue converts a string value to the target type with lenient parsing
+//
 //nolint:gocyclo // Conversion supports diverse coercion fallbacks for malformed data.
 func fuzzyConvertValue(value string, targetType storage.ColType, opts *FuzzyImportOptions) (interface{}, error) {
 	value = strings.TrimSpace(value)
@@ -654,6 +638,7 @@ func fixCommonJSONIssues(s string) string {
 }
 
 // FuzzyImportJSON attempts to parse malformed JSON data
+//
 //nolint:gocyclo // Fuzzy JSON import applies numerous fallback parsing strategies.
 func FuzzyImportJSON(
 	ctx context.Context,

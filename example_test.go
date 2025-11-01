@@ -124,6 +124,7 @@ func TestBooleanValues(t *testing.T) {
 }
 
 // Example demonstrates the usage of the TinySQL engine
+//
 //nolint:gocyclo // Example intentionally demonstrates multiple SQL flows in sequence.
 func Example() {
 	db := tsql.NewDB()
@@ -281,6 +282,90 @@ func Example() {
 	// Carol
 }
 
+// TestFilePersistence demonstrates saving and loading a TinySQL database file
+func TestFilePersistence(t *testing.T) {
+	db := tsql.NewDB()
+	// Create and populate table
+	p := tsql.NewParser(`CREATE TABLE persist (id INT, name TEXT)`)
+	st, err := p.ParseStatement()
+	if err != nil {
+		t.Fatalf("Failed to parse CREATE TABLE: %v", err)
+	}
+	_, err = tsql.Execute(context.Background(), db, "default", st)
+	if err != nil {
+		t.Fatalf("Failed to Execute CREATE TABLE: %v", err)
+	}
+	// Insert rows separately (multi-row VALUES may not be supported yet)
+	p = tsql.NewParser(`INSERT INTO persist VALUES (1, 'Alpha')`)
+	st, err = p.ParseStatement()
+	if err != nil {
+		t.Fatalf("Failed to parse first INSERT: %v", err)
+	}
+	if _, err = tsql.Execute(context.Background(), db, "default", st); err != nil {
+		t.Fatalf("Failed to execute first INSERT: %v", err)
+	}
+	p = tsql.NewParser(`INSERT INTO persist VALUES (2, 'Beta')`)
+	st, err = p.ParseStatement()
+	if err != nil {
+		t.Fatalf("Failed to parse second INSERT: %v", err)
+	}
+	if _, err = tsql.Execute(context.Background(), db, "default", st); err != nil {
+		t.Fatalf("Failed to execute second INSERT: %v", err)
+	}
+
+	// Verify two rows exist before persistence
+	p = tsql.NewParser(`SELECT COUNT(*) AS cnt FROM persist`)
+	st, err = p.ParseStatement()
+	if err != nil {
+		t.Fatalf("Failed to parse COUNT SELECT: %v", err)
+	}
+	preRS, err := tsql.Execute(context.Background(), db, "default", st)
+	if err != nil {
+		t.Fatalf("Failed to Execute COUNT SELECT: %v", err)
+	}
+	if len(preRS.Rows) != 1 || len(preRS.Cols) != 1 {
+		t.Fatalf("Unexpected COUNT result shape: rows=%d cols=%d", len(preRS.Rows), len(preRS.Cols))
+	}
+	if cnt, ok := tsql.GetVal(preRS.Rows[0], preRS.Cols[0]); !ok || fmt.Sprint(cnt) != "2" {
+		t.Fatalf("Expected COUNT=2 before save, got %v", cnt)
+	}
+
+	// Save to file
+	tmpfile := "persist_test.dat"
+	if err = tsql.SaveToFile(db, tmpfile); err != nil {
+		t.Fatalf("Failed to save DB: %v", err)
+	}
+
+	// Load from file
+	db2, err := tsql.LoadFromFile(tmpfile)
+	if err != nil {
+		t.Fatalf("Failed to load DB: %v", err)
+	}
+
+	// Query loaded DB
+	p = tsql.NewParser(`SELECT * FROM persist ORDER BY id`)
+	st, err = p.ParseStatement()
+	if err != nil {
+		t.Fatalf("Failed to parse SELECT: %v", err)
+	}
+	rs, err := tsql.Execute(context.Background(), db2, "default", st)
+	if err != nil {
+		t.Fatalf("Failed to Execute SELECT: %v", err)
+	}
+	if len(rs.Rows) != 2 {
+		t.Fatalf("Expected 2 rows after reload, got %d", len(rs.Rows))
+	}
+	if name, ok := tsql.GetVal(rs.Rows[0], "persist.name"); !ok || name != "Alpha" {
+		t.Fatalf("Expected Alpha, got %v", name)
+	}
+	if name, ok := tsql.GetVal(rs.Rows[1], "persist.name"); !ok || name != "Beta" {
+		t.Fatalf("Expected Beta, got %v", name)
+	}
+
+	// Clean up
+	os.Remove(tmpfile)
+}
+
 // TestJoinOperations tests basic multi-table functionality
 func TestJoinOperations(t *testing.T) {
 	db := tsql.NewDB()
@@ -397,6 +482,7 @@ func TestAggregateOperations(t *testing.T) {
 }
 
 // TestJSONOperations tests JSON data type and functions
+//
 //nolint:gocyclo // Comprehensive JSON coverage requires multiple branches and assertions.
 func TestJSONOperations(t *testing.T) {
 	db := tsql.NewDB()
@@ -598,6 +684,7 @@ func TestUpdateDeleteOperations(t *testing.T) {
 }
 
 // TestTempTableOperations tests temporary tables
+//
 //nolint:gocyclo // Temporary table scenarios cover numerous operations in one flow.
 func TestTempTableOperations(t *testing.T) {
 	db := tsql.NewDB()
@@ -674,6 +761,7 @@ func TestTempTableOperations(t *testing.T) {
 }
 
 // TestDistinctAndLimitOffset tests DISTINCT, LIMIT, and OFFSET
+//
 //nolint:gocyclo // Coverage spans diverse DISTINCT/LIMIT/OFFSET branches in one flow.
 func TestDistinctAndLimitOffset(t *testing.T) {
 	db := tsql.NewDB()
@@ -1055,6 +1143,7 @@ func TestQueryCompilationPerformance(t *testing.T) {
 }
 
 // TestGOBPersistenceWithNewDataTypes tests saving and loading database with new data types using GOB format
+//
 //nolint:gocyclo // Persistence regression test exercises many branches end-to-end.
 func TestGOBPersistenceWithNewDataTypes(t *testing.T) {
 	ctx := context.Background()
@@ -1295,6 +1384,7 @@ func TestGOBPersistenceWithNewDataTypes(t *testing.T) {
 }
 
 // TestDateDiffAndTimeAggregation tests DATEDIFF function with GROUP BY and time aggregation
+//
 //nolint:gocyclo // Extensive temporal scenarios require multiple branches in one test.
 func TestDateDiffAndTimeAggregation(t *testing.T) {
 	db := tsql.NewDB()
