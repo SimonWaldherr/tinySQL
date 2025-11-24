@@ -1427,6 +1427,8 @@ type funcHandler func(env ExecEnv, ex *FuncCall, row Row) (any, error)
 func getBuiltinFunctions() map[string]funcHandler {
 	return map[string]funcHandler{
 		"COALESCE":      evalCoalesceFunc,
+		"NVL":           evalCoalesceFunc,
+		"IFNULL":        evalCoalesceFunc,
 		"NULLIF":        evalNullifFunc,
 		"ISNULL":        evalIsNullFuncWrapper,
 		"JSON_GET":      evalJSONGetFunc,
@@ -1447,6 +1449,7 @@ func getBuiltinFunctions() map[string]funcHandler {
 		"UPPER":         evalUpperFunc,
 		"LOWER":         evalLowerFunc,
 		"CONCAT":        evalConcatFunc,
+		"CONCAT_WS":     evalConcatWsFunc,
 		"LENGTH":        evalLengthFunc,
 		"LEN":           evalLengthFunc,
 		"SUBSTRING":     evalSubstringFunc,
@@ -1463,6 +1466,7 @@ func getBuiltinFunctions() map[string]funcHandler {
 		"REPLACE":       evalReplaceFunc,
 		"INSTR":         evalInstrFunc,
 		"LOCATE":        evalInstrFunc,
+		"POSITION":      evalPositionFunc,
 		"ABS":           evalAbsFunc,
 		"ROUND":         evalRoundFunc,
 		"FLOOR":         evalFloorFunc,
@@ -1490,6 +1494,52 @@ func getBuiltinFunctions() map[string]funcHandler {
 		"SECOND":        evalSecondFunc,
 		"RANDOM":        evalRandomFunc,
 		"RAND":          evalRandomFunc,
+		// Math functions
+		"MOD":      evalModFunc,
+		"POWER":    evalPowerFunc,
+		"POW":      evalPowerFunc,
+		"SQRT":     evalSqrtFunc,
+		"LOG":      evalLogFunc,
+		"LN":       evalLnFunc,
+		"LOG10":    evalLog10Func,
+		"LOG2":     evalLog2Func,
+		"EXP":      evalExpFunc,
+		"SIGN":     evalSignFunc,
+		"TRUNCATE": evalTruncateFunc,
+		"TRUNC":    evalTruncateFunc,
+		"PI":       evalPiFunc,
+		"SIN":      evalSinFunc,
+		"COS":      evalCosFunc,
+		"TAN":      evalTanFunc,
+		"ASIN":     evalAsinFunc,
+		"ACOS":     evalAcosFunc,
+		"ATAN":     evalAtanFunc,
+		"ATAN2":    evalAtan2Func,
+		"DEGREES":  evalDegreesFunc,
+		"RADIANS":  evalRadiansFunc,
+		// String functions
+		"SPACE":      evalSpaceFunc,
+		"ASCII":      evalAsciiFunc,
+		"CHAR":       evalCharFunc,
+		"CHR":        evalCharFunc,
+		"INITCAP":    evalInitcapFunc,
+		"SPLIT_PART": evalSplitPartFunc,
+		"SOUNDEX":    evalSoundexFunc,
+		"QUOTE":      evalQuoteFunc,
+		"HEX":        evalHexFunc,
+		"UNHEX":      evalUnhexFunc,
+		// Additional functions
+		"UUID":       evalUuidFunc,
+		"TYPEOF":     evalTypeofFunc,
+		"VERSION":    evalVersionFunc,
+		"DAYOFWEEK":  evalDayOfWeekFunc,
+		"DAYOFYEAR":  evalDayOfYearFunc,
+		"WEEKOFYEAR": evalWeekOfYearFunc,
+		"QUARTER":    evalQuarterFunc,
+		"DATE_ADD":   evalDateAddFunc,
+		"DATE_SUB":   evalDateSubFunc,
+		"DATEADD":    evalDateAddFunc,
+		"DATESUB":    evalDateSubFunc,
 	}
 }
 
@@ -1645,6 +1695,126 @@ func evalSecondFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 }
 func evalRandomFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	return evalRandom(env, ex.Args, row)
+}
+func evalModFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalMod(env, ex.Args, row)
+}
+func evalPowerFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalPower(env, ex.Args, row)
+}
+func evalSqrtFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalSqrt(env, ex.Args, row)
+}
+func evalLogFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalLog(env, ex.Args, row)
+}
+func evalLnFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalLn(env, ex.Args, row)
+}
+func evalLog10Func(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalLog10(env, ex.Args, row)
+}
+func evalLog2Func(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalLog2(env, ex.Args, row)
+}
+func evalExpFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalExp(env, ex.Args, row)
+}
+func evalSignFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalSign(env, ex.Args, row)
+}
+func evalTruncateFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalTruncate(env, ex.Args, row)
+}
+func evalPiFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return math.Pi, nil
+}
+func evalSinFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalSin(env, ex.Args, row)
+}
+func evalCosFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalCos(env, ex.Args, row)
+}
+func evalTanFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalTan(env, ex.Args, row)
+}
+func evalAsinFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalAsin(env, ex.Args, row)
+}
+func evalAcosFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalAcos(env, ex.Args, row)
+}
+func evalAtanFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalAtan(env, ex.Args, row)
+}
+func evalAtan2Func(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalAtan2(env, ex.Args, row)
+}
+func evalDegreesFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalDegrees(env, ex.Args, row)
+}
+func evalRadiansFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalRadians(env, ex.Args, row)
+}
+func evalSpaceFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalSpace(env, ex.Args, row)
+}
+func evalAsciiFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalAscii(env, ex.Args, row)
+}
+func evalCharFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalChar(env, ex.Args, row)
+}
+func evalInitcapFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalInitcap(env, ex.Args, row)
+}
+func evalSplitPartFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalSplitPart(env, ex.Args, row)
+}
+func evalSoundexFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalSoundex(env, ex.Args, row)
+}
+func evalQuoteFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalQuote(env, ex.Args, row)
+}
+func evalHexFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalHex(env, ex.Args, row)
+}
+func evalUnhexFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalUnhex(env, ex.Args, row)
+}
+func evalUuidFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalUuid(env, ex.Args, row)
+}
+func evalTypeofFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalTypeof(env, ex.Args, row)
+}
+func evalVersionFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return "tinySQL 1.0", nil
+}
+func evalConcatWsFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalConcatWs(env, ex.Args, row)
+}
+func evalPositionFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalPosition(env, ex.Args, row)
+}
+func evalDayOfWeekFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalDayOfWeek(env, ex.Args, row)
+}
+func evalDayOfYearFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalDayOfYear(env, ex.Args, row)
+}
+func evalWeekOfYearFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalWeekOfYear(env, ex.Args, row)
+}
+func evalQuarterFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalQuarter(env, ex.Args, row)
+}
+func evalDateAddFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalDateAdd(env, ex.Args, row)
+}
+func evalDateSubFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalDateSub(env, ex.Args, row)
 }
 
 func evalCoalesce(env ExecEnv, args []Expr, row Row) (any, error) {
@@ -2846,6 +3016,816 @@ func strftimeFormat(t time.Time, format string) string {
 		result = strings.ReplaceAll(result, code, goFmt)
 	}
 	return t.Format(result)
+}
+
+// -------------------- Additional Math Functions --------------------
+
+func evalMod(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("MOD expects 2 arguments")
+	}
+	av, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	bv, err := evalExpr(env, args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	a, ok := numeric(av)
+	if !ok {
+		return nil, fmt.Errorf("MOD: first argument must be numeric")
+	}
+	b, ok := numeric(bv)
+	if !ok {
+		return nil, fmt.Errorf("MOD: second argument must be numeric")
+	}
+	if b == 0 {
+		return nil, fmt.Errorf("MOD: division by zero")
+	}
+	return math.Mod(a, b), nil
+}
+
+func evalPower(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("POWER expects 2 arguments")
+	}
+	baseVal, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	expVal, err := evalExpr(env, args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	base, ok := numeric(baseVal)
+	if !ok {
+		return nil, fmt.Errorf("POWER: base must be numeric")
+	}
+	exp, ok := numeric(expVal)
+	if !ok {
+		return nil, fmt.Errorf("POWER: exponent must be numeric")
+	}
+	return math.Pow(base, exp), nil
+}
+
+func evalSqrt(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("SQRT expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	n, ok := numeric(val)
+	if !ok {
+		return nil, fmt.Errorf("SQRT: argument must be numeric")
+	}
+	if n < 0 {
+		return nil, fmt.Errorf("SQRT: argument must be non-negative")
+	}
+	return math.Sqrt(n), nil
+}
+
+func evalLog(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) < 1 || len(args) > 2 {
+		return nil, fmt.Errorf("LOG expects 1 or 2 arguments")
+	}
+	if len(args) == 1 {
+		// LOG(x) = natural log
+		val, err := evalExpr(env, args[0], row)
+		if err != nil {
+			return nil, err
+		}
+		n, ok := numeric(val)
+		if !ok {
+			return nil, fmt.Errorf("LOG: argument must be numeric")
+		}
+		if n <= 0 {
+			return nil, fmt.Errorf("LOG: argument must be positive")
+		}
+		return math.Log(n), nil
+	}
+	// LOG(base, x)
+	baseVal, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	val, err := evalExpr(env, args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	base, ok := numeric(baseVal)
+	if !ok {
+		return nil, fmt.Errorf("LOG: base must be numeric")
+	}
+	n, ok := numeric(val)
+	if !ok {
+		return nil, fmt.Errorf("LOG: argument must be numeric")
+	}
+	if base <= 0 || base == 1 || n <= 0 {
+		return nil, fmt.Errorf("LOG: invalid arguments")
+	}
+	return math.Log(n) / math.Log(base), nil
+}
+
+func evalLn(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("LN expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	n, ok := numeric(val)
+	if !ok {
+		return nil, fmt.Errorf("LN: argument must be numeric")
+	}
+	if n <= 0 {
+		return nil, fmt.Errorf("LN: argument must be positive")
+	}
+	return math.Log(n), nil
+}
+
+func evalLog10(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("LOG10 expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	n, ok := numeric(val)
+	if !ok {
+		return nil, fmt.Errorf("LOG10: argument must be numeric")
+	}
+	if n <= 0 {
+		return nil, fmt.Errorf("LOG10: argument must be positive")
+	}
+	return math.Log10(n), nil
+}
+
+func evalLog2(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("LOG2 expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	n, ok := numeric(val)
+	if !ok {
+		return nil, fmt.Errorf("LOG2: argument must be numeric")
+	}
+	if n <= 0 {
+		return nil, fmt.Errorf("LOG2: argument must be positive")
+	}
+	return math.Log2(n), nil
+}
+
+func evalExp(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("EXP expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	n, ok := numeric(val)
+	if !ok {
+		return nil, fmt.Errorf("EXP: argument must be numeric")
+	}
+	return math.Exp(n), nil
+}
+
+func evalSign(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("SIGN expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	n, ok := numeric(val)
+	if !ok {
+		return nil, fmt.Errorf("SIGN: argument must be numeric")
+	}
+	if n > 0 {
+		return 1, nil
+	} else if n < 0 {
+		return -1, nil
+	}
+	return 0, nil
+}
+
+func evalTruncate(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) < 1 || len(args) > 2 {
+		return nil, fmt.Errorf("TRUNCATE expects 1-2 arguments")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	n, ok := numeric(val)
+	if !ok {
+		return nil, fmt.Errorf("TRUNCATE: argument must be numeric")
+	}
+	decimals := 0
+	if len(args) == 2 {
+		dv, err := evalExpr(env, args[1], row)
+		if err != nil {
+			return nil, err
+		}
+		d, ok := numeric(dv)
+		if !ok {
+			return nil, fmt.Errorf("TRUNCATE: decimals must be numeric")
+		}
+		decimals = int(d)
+	}
+	multiplier := math.Pow(10, float64(decimals))
+	return math.Trunc(n*multiplier) / multiplier, nil
+}
+
+// Trigonometric functions
+func evalSin(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("SIN expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	n, ok := numeric(val)
+	if !ok {
+		return nil, fmt.Errorf("SIN: argument must be numeric")
+	}
+	return math.Sin(n), nil
+}
+
+func evalCos(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("COS expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	n, ok := numeric(val)
+	if !ok {
+		return nil, fmt.Errorf("COS: argument must be numeric")
+	}
+	return math.Cos(n), nil
+}
+
+func evalTan(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("TAN expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	n, ok := numeric(val)
+	if !ok {
+		return nil, fmt.Errorf("TAN: argument must be numeric")
+	}
+	return math.Tan(n), nil
+}
+
+func evalAsin(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("ASIN expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	n, ok := numeric(val)
+	if !ok {
+		return nil, fmt.Errorf("ASIN: argument must be numeric")
+	}
+	if n < -1 || n > 1 {
+		return nil, fmt.Errorf("ASIN: argument must be between -1 and 1")
+	}
+	return math.Asin(n), nil
+}
+
+func evalAcos(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("ACOS expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	n, ok := numeric(val)
+	if !ok {
+		return nil, fmt.Errorf("ACOS: argument must be numeric")
+	}
+	if n < -1 || n > 1 {
+		return nil, fmt.Errorf("ACOS: argument must be between -1 and 1")
+	}
+	return math.Acos(n), nil
+}
+
+func evalAtan(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("ATAN expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	n, ok := numeric(val)
+	if !ok {
+		return nil, fmt.Errorf("ATAN: argument must be numeric")
+	}
+	return math.Atan(n), nil
+}
+
+func evalAtan2(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("ATAN2 expects 2 arguments")
+	}
+	yVal, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	xVal, err := evalExpr(env, args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	y, ok := numeric(yVal)
+	if !ok {
+		return nil, fmt.Errorf("ATAN2: y must be numeric")
+	}
+	x, ok := numeric(xVal)
+	if !ok {
+		return nil, fmt.Errorf("ATAN2: x must be numeric")
+	}
+	return math.Atan2(y, x), nil
+}
+
+func evalDegrees(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("DEGREES expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	n, ok := numeric(val)
+	if !ok {
+		return nil, fmt.Errorf("DEGREES: argument must be numeric")
+	}
+	return n * 180 / math.Pi, nil
+}
+
+func evalRadians(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("RADIANS expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	n, ok := numeric(val)
+	if !ok {
+		return nil, fmt.Errorf("RADIANS: argument must be numeric")
+	}
+	return n * math.Pi / 180, nil
+}
+
+// -------------------- Additional String Functions --------------------
+
+func evalSpace(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("SPACE expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	n, ok := numeric(val)
+	if !ok {
+		return nil, fmt.Errorf("SPACE: argument must be numeric")
+	}
+	if n < 0 {
+		return "", nil
+	}
+	return strings.Repeat(" ", int(n)), nil
+}
+
+func evalAscii(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("ASCII expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	s := fmt.Sprintf("%v", val)
+	if len(s) == 0 {
+		return 0, nil
+	}
+	return int(s[0]), nil
+}
+
+func evalChar(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("CHAR expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	n, ok := numeric(val)
+	if !ok {
+		return nil, fmt.Errorf("CHAR: argument must be numeric")
+	}
+	if n < 0 || n > 127 {
+		return "", nil
+	}
+	return string(rune(int(n))), nil
+}
+
+func evalInitcap(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("INITCAP expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	s := fmt.Sprintf("%v", val)
+	words := strings.Fields(s)
+	for i, word := range words {
+		if len(word) > 0 {
+			words[i] = strings.ToUpper(string(word[0])) + strings.ToLower(word[1:])
+		}
+	}
+	return strings.Join(words, " "), nil
+}
+
+func evalSplitPart(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 3 {
+		return nil, fmt.Errorf("SPLIT_PART expects 3 arguments: (string, delimiter, part)")
+	}
+	strVal, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	delimVal, err := evalExpr(env, args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	partVal, err := evalExpr(env, args[2], row)
+	if err != nil {
+		return nil, err
+	}
+	s := fmt.Sprintf("%v", strVal)
+	delim := fmt.Sprintf("%v", delimVal)
+	part, ok := numeric(partVal)
+	if !ok {
+		return nil, fmt.Errorf("SPLIT_PART: part must be numeric")
+	}
+	parts := strings.Split(s, delim)
+	idx := int(part) - 1 // 1-indexed
+	if idx < 0 || idx >= len(parts) {
+		return "", nil
+	}
+	return parts[idx], nil
+}
+
+func evalSoundex(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("SOUNDEX expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	s := strings.ToUpper(fmt.Sprintf("%v", val))
+	if len(s) == 0 {
+		return "", nil
+	}
+	// Soundex algorithm
+	result := []byte{s[0]}
+	mapping := map[byte]byte{
+		'B': '1', 'F': '1', 'P': '1', 'V': '1',
+		'C': '2', 'G': '2', 'J': '2', 'K': '2', 'Q': '2', 'S': '2', 'X': '2', 'Z': '2',
+		'D': '3', 'T': '3',
+		'L': '4',
+		'M': '5', 'N': '5',
+		'R': '6',
+	}
+	lastCode := mapping[s[0]]
+	for i := 1; i < len(s) && len(result) < 4; i++ {
+		c := s[i]
+		if code, ok := mapping[c]; ok && code != lastCode {
+			result = append(result, code)
+			lastCode = code
+		} else if c == 'A' || c == 'E' || c == 'I' || c == 'O' || c == 'U' || c == 'H' || c == 'W' || c == 'Y' {
+			lastCode = 0
+		}
+	}
+	for len(result) < 4 {
+		result = append(result, '0')
+	}
+	return string(result), nil
+}
+
+func evalQuote(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("QUOTE expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if val == nil {
+		return "NULL", nil
+	}
+	s := fmt.Sprintf("%v", val)
+	escaped := strings.ReplaceAll(s, "'", "''")
+	return "'" + escaped + "'", nil
+}
+
+func evalHex(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("HEX expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	s := fmt.Sprintf("%v", val)
+	return fmt.Sprintf("%X", []byte(s)), nil
+}
+
+func evalUnhex(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("UNHEX expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	s := fmt.Sprintf("%v", val)
+	if len(s)%2 != 0 {
+		s = "0" + s
+	}
+	result := make([]byte, len(s)/2)
+	for i := 0; i < len(s); i += 2 {
+		var b byte
+		_, err := fmt.Sscanf(s[i:i+2], "%02X", &b)
+		if err != nil {
+			return nil, fmt.Errorf("UNHEX: invalid hex string")
+		}
+		result[i/2] = b
+	}
+	return string(result), nil
+}
+
+func evalConcatWs(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("CONCAT_WS expects at least 2 arguments")
+	}
+	sepVal, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	sep := fmt.Sprintf("%v", sepVal)
+	var parts []string
+	for _, arg := range args[1:] {
+		v, err := evalExpr(env, arg, row)
+		if err != nil {
+			return nil, err
+		}
+		if v != nil {
+			parts = append(parts, fmt.Sprintf("%v", v))
+		}
+	}
+	return strings.Join(parts, sep), nil
+}
+
+func evalPosition(env ExecEnv, args []Expr, row Row) (any, error) {
+	// POSITION(substring IN string) - 1-indexed, returns 0 if not found
+	if len(args) != 2 {
+		return nil, fmt.Errorf("POSITION expects 2 arguments: (substring, string)")
+	}
+	subVal, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	strVal, err := evalExpr(env, args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	sub := fmt.Sprintf("%v", subVal)
+	str := fmt.Sprintf("%v", strVal)
+	idx := strings.Index(str, sub)
+	if idx < 0 {
+		return 0, nil
+	}
+	return idx + 1, nil
+}
+
+// -------------------- Additional Functions --------------------
+
+func evalUuid(env ExecEnv, args []Expr, row Row) (any, error) {
+	// Generate a simple UUID v4
+	b := make([]byte, 16)
+	rand.Read(b)
+	b[6] = (b[6] & 0x0f) | 0x40 // Version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // Variant
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:]), nil
+}
+
+func evalTypeof(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("TYPEOF expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if val == nil {
+		return "null", nil
+	}
+	switch val.(type) {
+	case int, int8, int16, int32, int64:
+		return "integer", nil
+	case uint, uint8, uint16, uint32, uint64:
+		return "integer", nil
+	case float32, float64:
+		return "real", nil
+	case bool:
+		return "boolean", nil
+	case string:
+		return "text", nil
+	case time.Time:
+		return "datetime", nil
+	case []any, map[string]any:
+		return "json", nil
+	default:
+		return fmt.Sprintf("%T", val), nil
+	}
+}
+
+func evalDayOfWeek(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("DAYOFWEEK expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	t, err := parseDateTime(val)
+	if err != nil {
+		return nil, err
+	}
+	return int(t.Weekday()) + 1, nil // 1=Sunday, 7=Saturday
+}
+
+func evalDayOfYear(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("DAYOFYEAR expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	t, err := parseDateTime(val)
+	if err != nil {
+		return nil, err
+	}
+	return t.YearDay(), nil
+}
+
+func evalWeekOfYear(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("WEEKOFYEAR expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	t, err := parseDateTime(val)
+	if err != nil {
+		return nil, err
+	}
+	_, week := t.ISOWeek()
+	return week, nil
+}
+
+func evalQuarter(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("QUARTER expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	t, err := parseDateTime(val)
+	if err != nil {
+		return nil, err
+	}
+	return (int(t.Month())-1)/3 + 1, nil
+}
+
+func evalDateAdd(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 3 {
+		return nil, fmt.Errorf("DATE_ADD expects 3 arguments: (date, interval, unit)")
+	}
+	dateVal, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	intervalVal, err := evalExpr(env, args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	unitVal, err := evalExpr(env, args[2], row)
+	if err != nil {
+		return nil, err
+	}
+
+	t, err := parseDateTime(dateVal)
+	if err != nil {
+		return nil, err
+	}
+	interval, ok := numeric(intervalVal)
+	if !ok {
+		return nil, fmt.Errorf("DATE_ADD: interval must be numeric")
+	}
+	unit := strings.ToUpper(fmt.Sprintf("%v", unitVal))
+
+	switch unit {
+	case "YEAR", "YEARS":
+		t = t.AddDate(int(interval), 0, 0)
+	case "MONTH", "MONTHS":
+		t = t.AddDate(0, int(interval), 0)
+	case "DAY", "DAYS":
+		t = t.AddDate(0, 0, int(interval))
+	case "HOUR", "HOURS":
+		t = t.Add(time.Duration(interval) * time.Hour)
+	case "MINUTE", "MINUTES":
+		t = t.Add(time.Duration(interval) * time.Minute)
+	case "SECOND", "SECONDS":
+		t = t.Add(time.Duration(interval) * time.Second)
+	default:
+		return nil, fmt.Errorf("DATE_ADD: unknown unit '%s'", unit)
+	}
+	return t, nil
+}
+
+func evalDateSub(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 3 {
+		return nil, fmt.Errorf("DATE_SUB expects 3 arguments: (date, interval, unit)")
+	}
+	// DATE_SUB is just DATE_ADD with negated interval
+	dateVal, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	intervalVal, err := evalExpr(env, args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	unitVal, err := evalExpr(env, args[2], row)
+	if err != nil {
+		return nil, err
+	}
+
+	t, err := parseDateTime(dateVal)
+	if err != nil {
+		return nil, err
+	}
+	interval, ok := numeric(intervalVal)
+	if !ok {
+		return nil, fmt.Errorf("DATE_SUB: interval must be numeric")
+	}
+	interval = -interval // Negate for subtraction
+	unit := strings.ToUpper(fmt.Sprintf("%v", unitVal))
+
+	switch unit {
+	case "YEAR", "YEARS":
+		t = t.AddDate(int(interval), 0, 0)
+	case "MONTH", "MONTHS":
+		t = t.AddDate(0, int(interval), 0)
+	case "DAY", "DAYS":
+		t = t.AddDate(0, 0, int(interval))
+	case "HOUR", "HOURS":
+		t = t.Add(time.Duration(interval) * time.Hour)
+	case "MINUTE", "MINUTES":
+		t = t.Add(time.Duration(interval) * time.Minute)
+	case "SECOND", "SECONDS":
+		t = t.Add(time.Duration(interval) * time.Second)
+	default:
+		return nil, fmt.Errorf("DATE_SUB: unknown unit '%s'", unit)
+	}
+	return t, nil
 }
 
 func evalCast(env ExecEnv, args []Expr, row Row) (any, error) {

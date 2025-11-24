@@ -1518,21 +1518,30 @@ func (p *Parser) parsePrimary() (Expr, error) {
 				return nil, err
 			}
 			return &SubqueryExpr{Select: sel}, nil
-		case "COUNT", "SUM", "AVG", "MIN", "MAX", "MEDIAN", "COALESCE", "NULLIF",
+		case "COUNT", "SUM", "AVG", "MIN", "MAX", "MEDIAN", "COALESCE", "NVL", "IFNULL", "NULLIF",
 			"JSON_GET", "JSON_SET", "JSON_EXTRACT",
 			"NOW", "CURRENT_TIME", "CURRENT_DATE", "DATEDIFF",
 			"LTRIM", "RTRIM", "TRIM", "ISNULL",
 			"BASE64", "BASE64_DECODE",
-			"UPPER", "LOWER", "CONCAT", "LENGTH", "SUBSTRING", "SUBSTR",
+			"UPPER", "LOWER", "CONCAT", "CONCAT_WS", "LENGTH", "SUBSTRING", "SUBSTR",
 			"LEFT", "RIGHT",
 			"MD5", "SHA1", "SHA256", "SHA512",
 			"CAST",
-			"REPLACE", "INSTR", "LOCATE", "REVERSE", "REPEAT", "PRINTF", "FORMAT",
+			"REPLACE", "INSTR", "LOCATE", "POSITION", "REVERSE", "REPEAT", "PRINTF", "FORMAT",
 			"CHAR_LENGTH", "LPAD", "RPAD",
 			"ABS", "ROUND", "FLOOR", "CEIL", "CEILING",
+			"MOD", "POWER", "POW", "SQRT", "LOG", "LN", "LOG10", "LOG2", "EXP",
+			"SIGN", "TRUNCATE", "TRUNC", "PI",
+			"SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
+			"DEGREES", "RADIANS",
 			"GREATEST", "LEAST", "IF", "IIF",
 			"STRFTIME", "DATE", "TIME", "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND",
-			"RANDOM", "RAND":
+			"DAYOFWEEK", "DAYOFYEAR", "WEEKOFYEAR", "QUARTER",
+			"DATE_ADD", "DATE_SUB", "DATEADD", "DATESUB",
+			"RANDOM", "RAND",
+			"SPACE", "ASCII", "CHAR", "CHR", "INITCAP", "SPLIT_PART", "SOUNDEX",
+			"QUOTE", "HEX", "UNHEX",
+			"UUID", "TYPEOF", "VERSION":
 			return p.parseFuncCall()
 		case "TRUE":
 			p.next()
