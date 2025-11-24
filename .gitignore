@@ -16,3 +16,4 @@ coverage-func.txt
 *.wasm
 persist_test.dat.wal
 tinyrag
+sqltools
