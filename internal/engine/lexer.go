@@ -232,7 +232,13 @@ func isKeyword(up string) bool {
 		"LTRIM", "RTRIM", "TRIM", "REGEXP", "ISNULL",
 		"BASE64", "BASE64_DECODE",
 		"UPPER", "LOWER", "CONCAT", "LENGTH", "SUBSTRING", "SUBSTR",
-		"MD5", "SHA1", "SHA256", "SHA512":
+		"MD5", "SHA1", "SHA256", "SHA512",
+		"INSTR", "LOCATE", "REVERSE", "REPEAT", "PRINTF", "FORMAT",
+		"CHAR_LENGTH", "LPAD", "RPAD",
+		"ABS", "ROUND", "FLOOR", "CEIL", "CEILING",
+		"GREATEST", "LEAST", "IIF",
+		"STRFTIME", "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND",
+		"RANDOM", "RAND", "CAST":
 		return true
 	default:
 		return false

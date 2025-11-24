@@ -1526,7 +1526,13 @@ func (p *Parser) parsePrimary() (Expr, error) {
 			"UPPER", "LOWER", "CONCAT", "LENGTH", "SUBSTRING", "SUBSTR",
 			"LEFT", "RIGHT",
 			"MD5", "SHA1", "SHA256", "SHA512",
-			"CAST":
+			"CAST",
+			"REPLACE", "INSTR", "LOCATE", "REVERSE", "REPEAT", "PRINTF", "FORMAT",
+			"CHAR_LENGTH", "LPAD", "RPAD",
+			"ABS", "ROUND", "FLOOR", "CEIL", "CEILING",
+			"GREATEST", "LEAST", "IF", "IIF",
+			"STRFTIME", "DATE", "TIME", "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND",
+			"RANDOM", "RAND":
 			return p.parseFuncCall()
 		case "TRUE":
 			p.next()

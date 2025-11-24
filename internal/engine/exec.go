@@ -27,6 +27,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"math/rand"
 	"sort"
 	"strconv"
 	"strings"
@@ -1458,6 +1460,36 @@ func getBuiltinFunctions() map[string]funcHandler {
 		"LEFT":          evalLeftFunc,
 		"RIGHT":         evalRightFunc,
 		"CAST":          evalCastFunc,
+		"REPLACE":       evalReplaceFunc,
+		"INSTR":         evalInstrFunc,
+		"LOCATE":        evalInstrFunc,
+		"ABS":           evalAbsFunc,
+		"ROUND":         evalRoundFunc,
+		"FLOOR":         evalFloorFunc,
+		"CEIL":          evalCeilFunc,
+		"CEILING":       evalCeilFunc,
+		"REVERSE":       evalReverseFunc,
+		"REPEAT":        evalRepeatFunc,
+		"PRINTF":        evalPrintfFunc,
+		"FORMAT":        evalPrintfFunc,
+		"CHAR_LENGTH":   evalLengthFunc,
+		"LPAD":          evalLpadFunc,
+		"RPAD":          evalRpadFunc,
+		"GREATEST":      evalGreatestFunc,
+		"LEAST":         evalLeastFunc,
+		"IF":            evalIfFunc,
+		"IIF":           evalIfFunc,
+		"STRFTIME":      evalStrftimeFunc,
+		"DATE":          evalDateFunc,
+		"TIME":          evalTimeFunc,
+		"YEAR":          evalYearFunc,
+		"MONTH":         evalMonthFunc,
+		"DAY":           evalDayFunc,
+		"HOUR":          evalHourFunc,
+		"MINUTE":        evalMinuteFunc,
+		"SECOND":        evalSecondFunc,
+		"RANDOM":        evalRandomFunc,
+		"RAND":          evalRandomFunc,
 	}
 }
 
@@ -1541,6 +1573,78 @@ func evalRightFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 }
 func evalCastFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	return evalCast(env, ex.Args, row)
+}
+func evalReplaceFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalReplace(env, ex.Args, row)
+}
+func evalInstrFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalInstr(env, ex.Args, row)
+}
+func evalAbsFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalAbs(env, ex.Args, row)
+}
+func evalRoundFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalRound(env, ex.Args, row)
+}
+func evalFloorFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalFloor(env, ex.Args, row)
+}
+func evalCeilFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalCeil(env, ex.Args, row)
+}
+func evalReverseFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalReverse(env, ex.Args, row)
+}
+func evalRepeatFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalRepeat(env, ex.Args, row)
+}
+func evalPrintfFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalPrintf(env, ex.Args, row)
+}
+func evalLpadFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalLpad(env, ex.Args, row)
+}
+func evalRpadFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalRpad(env, ex.Args, row)
+}
+func evalGreatestFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalGreatest(env, ex.Args, row)
+}
+func evalLeastFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalLeast(env, ex.Args, row)
+}
+func evalIfFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalIf(env, ex.Args, row)
+}
+func evalStrftimeFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalStrftime(env, ex.Args, row)
+}
+func evalDateFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalDate(env, ex.Args, row)
+}
+func evalTimeFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalTime(env, ex.Args, row)
+}
+func evalYearFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalYear(env, ex.Args, row)
+}
+func evalMonthFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalMonth(env, ex.Args, row)
+}
+func evalDayFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalDay(env, ex.Args, row)
+}
+func evalHourFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalHour(env, ex.Args, row)
+}
+func evalMinuteFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalMinute(env, ex.Args, row)
+}
+func evalSecondFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalSecond(env, ex.Args, row)
+}
+func evalRandomFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalRandom(env, ex.Args, row)
 }
 
 func evalCoalesce(env ExecEnv, args []Expr, row Row) (any, error) {
@@ -2145,6 +2249,603 @@ func evalRight(env ExecEnv, args []Expr, row Row) (any, error) {
 		return str, nil
 	}
 	return str[len(str)-length:], nil
+}
+
+// New string functions
+
+func evalReplace(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 3 {
+		return nil, fmt.Errorf("REPLACE expects 3 arguments: (string, from, to)")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if val == nil {
+		return nil, nil
+	}
+	str := fmt.Sprintf("%v", val)
+
+	fromVal, err := evalExpr(env, args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	from := fmt.Sprintf("%v", fromVal)
+
+	toVal, err := evalExpr(env, args[2], row)
+	if err != nil {
+		return nil, err
+	}
+	to := fmt.Sprintf("%v", toVal)
+
+	return strings.ReplaceAll(str, from, to), nil
+}
+
+func evalInstr(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("INSTR expects 2 arguments: (string, search)")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if val == nil {
+		return 0, nil
+	}
+	str := fmt.Sprintf("%v", val)
+
+	searchVal, err := evalExpr(env, args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	search := fmt.Sprintf("%v", searchVal)
+
+	idx := strings.Index(str, search)
+	if idx == -1 {
+		return 0, nil
+	}
+	return idx + 1, nil // 1-based index
+}
+
+func evalReverse(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("REVERSE expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if val == nil {
+		return nil, nil
+	}
+	str := fmt.Sprintf("%v", val)
+	runes := []rune(str)
+	for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
+		runes[i], runes[j] = runes[j], runes[i]
+	}
+	return string(runes), nil
+}
+
+func evalRepeat(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("REPEAT expects 2 arguments: (string, count)")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if val == nil {
+		return nil, nil
+	}
+	str := fmt.Sprintf("%v", val)
+
+	countVal, err := evalExpr(env, args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	countAny, err := coerceToInt(countVal)
+	if err != nil {
+		return nil, fmt.Errorf("REPEAT count must be numeric")
+	}
+	count, ok := countAny.(int)
+	if !ok || count < 0 {
+		return "", nil
+	}
+	return strings.Repeat(str, count), nil
+}
+
+func evalPrintf(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("PRINTF expects at least 1 argument")
+	}
+	formatVal, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	format := fmt.Sprintf("%v", formatVal)
+
+	fmtArgs := make([]any, len(args)-1)
+	for i := 1; i < len(args); i++ {
+		v, err := evalExpr(env, args[i], row)
+		if err != nil {
+			return nil, err
+		}
+		fmtArgs[i-1] = v
+	}
+	return fmt.Sprintf(format, fmtArgs...), nil
+}
+
+func evalLpad(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) < 2 || len(args) > 3 {
+		return nil, fmt.Errorf("LPAD expects 2-3 arguments: (string, length[, pad])")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if val == nil {
+		return nil, nil
+	}
+	str := fmt.Sprintf("%v", val)
+
+	lenVal, err := evalExpr(env, args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	lenAny, err := coerceToInt(lenVal)
+	if err != nil {
+		return nil, fmt.Errorf("LPAD length must be numeric")
+	}
+	length, ok := lenAny.(int)
+	if !ok || length < 0 {
+		return str, nil
+	}
+
+	pad := " "
+	if len(args) == 3 {
+		padVal, err := evalExpr(env, args[2], row)
+		if err != nil {
+			return nil, err
+		}
+		pad = fmt.Sprintf("%v", padVal)
+		if pad == "" {
+			pad = " "
+		}
+	}
+
+	if len(str) >= length {
+		return str[:length], nil
+	}
+	needed := length - len(str)
+	padding := strings.Repeat(pad, (needed/len(pad))+1)[:needed]
+	return padding + str, nil
+}
+
+func evalRpad(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) < 2 || len(args) > 3 {
+		return nil, fmt.Errorf("RPAD expects 2-3 arguments: (string, length[, pad])")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if val == nil {
+		return nil, nil
+	}
+	str := fmt.Sprintf("%v", val)
+
+	lenVal, err := evalExpr(env, args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	lenAny, err := coerceToInt(lenVal)
+	if err != nil {
+		return nil, fmt.Errorf("RPAD length must be numeric")
+	}
+	length, ok := lenAny.(int)
+	if !ok || length < 0 {
+		return str, nil
+	}
+
+	pad := " "
+	if len(args) == 3 {
+		padVal, err := evalExpr(env, args[2], row)
+		if err != nil {
+			return nil, err
+		}
+		pad = fmt.Sprintf("%v", padVal)
+		if pad == "" {
+			pad = " "
+		}
+	}
+
+	if len(str) >= length {
+		return str[:length], nil
+	}
+	needed := length - len(str)
+	padding := strings.Repeat(pad, (needed/len(pad))+1)[:needed]
+	return str + padding, nil
+}
+
+// Math functions
+
+func evalAbs(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("ABS expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if val == nil {
+		return nil, nil
+	}
+	f, ok := numeric(val)
+	if !ok {
+		return nil, fmt.Errorf("ABS requires numeric argument")
+	}
+	if f < 0 {
+		return -f, nil
+	}
+	return f, nil
+}
+
+func evalRound(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) < 1 || len(args) > 2 {
+		return nil, fmt.Errorf("ROUND expects 1-2 arguments")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if val == nil {
+		return nil, nil
+	}
+	f, ok := numeric(val)
+	if !ok {
+		return nil, fmt.Errorf("ROUND requires numeric argument")
+	}
+
+	decimals := 0
+	if len(args) == 2 {
+		decVal, err := evalExpr(env, args[1], row)
+		if err != nil {
+			return nil, err
+		}
+		decAny, err := coerceToInt(decVal)
+		if err != nil {
+			return nil, fmt.Errorf("ROUND decimals must be numeric")
+		}
+		decimals, _ = decAny.(int)
+	}
+
+	mult := math.Pow(10, float64(decimals))
+	return math.Round(f*mult) / mult, nil
+}
+
+func evalFloor(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("FLOOR expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if val == nil {
+		return nil, nil
+	}
+	f, ok := numeric(val)
+	if !ok {
+		return nil, fmt.Errorf("FLOOR requires numeric argument")
+	}
+	return math.Floor(f), nil
+}
+
+func evalCeil(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("CEIL expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if val == nil {
+		return nil, nil
+	}
+	f, ok := numeric(val)
+	if !ok {
+		return nil, fmt.Errorf("CEIL requires numeric argument")
+	}
+	return math.Ceil(f), nil
+}
+
+func evalGreatest(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("GREATEST expects at least 1 argument")
+	}
+	var result any
+	for _, arg := range args {
+		val, err := evalExpr(env, arg, row)
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			continue
+		}
+		if result == nil {
+			result = val
+			continue
+		}
+		cmp, err := compare(val, result)
+		if err != nil {
+			return nil, err
+		}
+		if cmp > 0 {
+			result = val
+		}
+	}
+	return result, nil
+}
+
+func evalLeast(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("LEAST expects at least 1 argument")
+	}
+	var result any
+	for _, arg := range args {
+		val, err := evalExpr(env, arg, row)
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			continue
+		}
+		if result == nil {
+			result = val
+			continue
+		}
+		cmp, err := compare(val, result)
+		if err != nil {
+			return nil, err
+		}
+		if cmp < 0 {
+			result = val
+		}
+	}
+	return result, nil
+}
+
+func evalIf(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 3 {
+		return nil, fmt.Errorf("IF expects 3 arguments: (condition, true_value, false_value)")
+	}
+	cond, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	// Check if condition is truthy
+	isTrue := false
+	switch v := cond.(type) {
+	case bool:
+		isTrue = v
+	case int:
+		isTrue = v != 0
+	case float64:
+		isTrue = v != 0
+	case string:
+		isTrue = v != "" && v != "0" && strings.ToLower(v) != "false"
+	default:
+		isTrue = cond != nil
+	}
+	if isTrue {
+		return evalExpr(env, args[1], row)
+	}
+	return evalExpr(env, args[2], row)
+}
+
+func evalRandom(env ExecEnv, args []Expr, row Row) (any, error) {
+	return rand.Float64(), nil
+}
+
+// Date/time functions
+
+func evalStrftime(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) < 1 || len(args) > 2 {
+		return nil, fmt.Errorf("STRFTIME expects 1-2 arguments: (format[, datetime])")
+	}
+	formatVal, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	format := fmt.Sprintf("%v", formatVal)
+
+	var t time.Time
+	if len(args) == 2 {
+		dtVal, err := evalExpr(env, args[1], row)
+		if err != nil {
+			return nil, err
+		}
+		t, err = parseDateTime(dtVal)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		t = time.Now()
+	}
+
+	return strftimeFormat(t, format), nil
+}
+
+func evalDate(env ExecEnv, args []Expr, row Row) (any, error) {
+	var t time.Time
+	if len(args) == 0 {
+		t = time.Now()
+	} else {
+		val, err := evalExpr(env, args[0], row)
+		if err != nil {
+			return nil, err
+		}
+		t, err = parseDateTime(val)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return t.Format("2006-01-02"), nil
+}
+
+func evalTime(env ExecEnv, args []Expr, row Row) (any, error) {
+	var t time.Time
+	if len(args) == 0 {
+		t = time.Now()
+	} else {
+		val, err := evalExpr(env, args[0], row)
+		if err != nil {
+			return nil, err
+		}
+		t, err = parseDateTime(val)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return t.Format("15:04:05"), nil
+}
+
+func evalYear(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("YEAR expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	t, err := parseDateTime(val)
+	if err != nil {
+		return nil, err
+	}
+	return t.Year(), nil
+}
+
+func evalMonth(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("MONTH expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	t, err := parseDateTime(val)
+	if err != nil {
+		return nil, err
+	}
+	return int(t.Month()), nil
+}
+
+func evalDay(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("DAY expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	t, err := parseDateTime(val)
+	if err != nil {
+		return nil, err
+	}
+	return t.Day(), nil
+}
+
+func evalHour(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("HOUR expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	t, err := parseDateTime(val)
+	if err != nil {
+		return nil, err
+	}
+	return t.Hour(), nil
+}
+
+func evalMinute(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("MINUTE expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	t, err := parseDateTime(val)
+	if err != nil {
+		return nil, err
+	}
+	return t.Minute(), nil
+}
+
+func evalSecond(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("SECOND expects 1 argument")
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	t, err := parseDateTime(val)
+	if err != nil {
+		return nil, err
+	}
+	return t.Second(), nil
+}
+
+// parseDateTime tries to parse a value as a time.Time
+func parseDateTime(val any) (time.Time, error) {
+	if val == nil {
+		return time.Time{}, fmt.Errorf("cannot parse nil as datetime")
+	}
+	if t, ok := val.(time.Time); ok {
+		return t, nil
+	}
+	str := fmt.Sprintf("%v", val)
+	formats := []string{
+		time.RFC3339,
+		"2006-01-02 15:04:05",
+		"2006-01-02T15:04:05",
+		"2006-01-02",
+		"01/02/2006",
+		"02-Jan-2006",
+	}
+	for _, f := range formats {
+		if t, err := time.Parse(f, str); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("cannot parse '%s' as datetime", str)
+}
+
+// strftimeFormat converts SQLite-style strftime format to Go time
+func strftimeFormat(t time.Time, format string) string {
+	// Map SQLite strftime codes to Go format
+	replacements := map[string]string{
+		"%Y": "2006",
+		"%m": "01",
+		"%d": "02",
+		"%H": "15",
+		"%M": "04",
+		"%S": "05",
+		"%j": fmt.Sprintf("%03d", t.YearDay()),
+		"%W": fmt.Sprintf("%02d", (t.YearDay()-int(t.Weekday())+7)/7),
+		"%w": fmt.Sprintf("%d", t.Weekday()),
+		"%s": fmt.Sprintf("%d", t.Unix()),
+		"%%": "%",
+	}
+	result := format
+	for code, goFmt := range replacements {
+		result = strings.ReplaceAll(result, code, goFmt)
+	}
+	return t.Format(result)
 }
 
 func evalCast(env ExecEnv, args []Expr, row Row) (any, error) {
