@@ -663,9 +663,9 @@ func (tb *TableBuilder) Create(db *DB, tenant string) error {
 
 // InsertBuilder provides a fluent interface for building INSERT statements.
 type InsertBuilder struct {
-	table  string
-	cols   []string
-	values []engine.Expr
+	table string
+	cols  []string
+	rows  [][]engine.Expr
 }
 
 // InsertInto creates a new INSERT builder.
@@ -681,10 +681,11 @@ func (ib *InsertBuilder) Columns(cols ...string) *InsertBuilder {
 
 // Values specifies the values to insert.
 func (ib *InsertBuilder) Values(values ...ExprBuilder) *InsertBuilder {
-	ib.values = make([]engine.Expr, len(values))
+	row := make([]engine.Expr, len(values))
 	for i, v := range values {
-		ib.values[i] = v.Build()
+		row[i] = v.Build()
 	}
+	ib.rows = append(ib.rows, row)
 	return ib
 }
 
@@ -693,7 +694,7 @@ func (ib *InsertBuilder) Build() *engine.Insert {
 	return &engine.Insert{
 		Table: ib.table,
 		Cols:  ib.cols,
-		Vals:  ib.values,
+		Rows:  ib.rows,
 	}
 }
 
@@ -944,14 +945,20 @@ func insertToSQL(i *engine.Insert) string {
 		sb.WriteString(strings.Join(i.Cols, ", "))
 		sb.WriteString(")")
 	}
-	sb.WriteString(" VALUES (")
-	for j, val := range i.Vals {
-		if j > 0 {
+	sb.WriteString(" VALUES ")
+	for ri, row := range i.Rows {
+		if ri > 0 {
 			sb.WriteString(", ")
 		}
-		sb.WriteString(exprToSQL(val))
+		sb.WriteString("(")
+		for ci, val := range row {
+			if ci > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(exprToSQL(val))
+		}
+		sb.WriteString(")")
 	}
-	sb.WriteString(")")
 	return sb.String()
 }
 

@@ -295,22 +295,14 @@ func TestFilePersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to Execute CREATE TABLE: %v", err)
 	}
-	// Insert rows separately (multi-row VALUES may not be supported yet)
-	p = tsql.NewParser(`INSERT INTO persist VALUES (1, 'Alpha')`)
+	// Insert two rows in a single multi-value INSERT statement
+	p = tsql.NewParser(`INSERT INTO persist VALUES (1, 'Alpha'), (2, 'Beta')`)
 	st, err = p.ParseStatement()
 	if err != nil {
-		t.Fatalf("Failed to parse first INSERT: %v", err)
+		t.Fatalf("Failed to parse INSERT: %v", err)
 	}
 	if _, err = tsql.Execute(context.Background(), db, "default", st); err != nil {
-		t.Fatalf("Failed to execute first INSERT: %v", err)
-	}
-	p = tsql.NewParser(`INSERT INTO persist VALUES (2, 'Beta')`)
-	st, err = p.ParseStatement()
-	if err != nil {
-		t.Fatalf("Failed to parse second INSERT: %v", err)
-	}
-	if _, err = tsql.Execute(context.Background(), db, "default", st); err != nil {
-		t.Fatalf("Failed to execute second INSERT: %v", err)
+		t.Fatalf("Failed to execute INSERT: %v", err)
 	}
 
 	// Verify two rows exist before persistence

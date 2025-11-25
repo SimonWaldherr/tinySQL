@@ -213,12 +213,12 @@ func executeAlterTable(env ExecEnv, s *AlterTable) (*ResultSet, error) {
 }
 
 func executeInsert(env ExecEnv, s *Insert) (*ResultSet, error) {
+	if len(s.Rows) == 0 {
+		return nil, fmt.Errorf("INSERT requires at least one VALUES clause")
+	}
 	t, err := env.db.Get(env.tenant, s.Table)
 	if err != nil {
 		return nil, err
-	}
-	if len(s.Cols) > 0 && len(s.Vals) != len(s.Cols) {
-		return nil, fmt.Errorf("INSERT column/value mismatch")
 	}
 	tmp := Row{}
 	if len(s.Cols) == 0 {
@@ -228,50 +228,65 @@ func executeInsert(env ExecEnv, s *Insert) (*ResultSet, error) {
 }
 
 func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) (*ResultSet, error) {
-	if len(s.Vals) != len(t.Cols) {
-		return nil, fmt.Errorf("INSERT expects %d values", len(t.Cols))
+	expected := len(t.Cols)
+	for _, vals := range s.Rows {
+		if len(vals) != expected {
+			return nil, fmt.Errorf("INSERT expects %d values", expected)
+		}
+		row := make([]any, expected)
+		for i, e := range vals {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, err
+			}
+			v, err := evalExpr(env, e, tmp)
+			if err != nil {
+				return nil, err
+			}
+			cv, err := coerceToTypeAllowNull(v, t.Cols[i].Type)
+			if err != nil {
+				return nil, fmt.Errorf("column %q: %w", t.Cols[i].Name, err)
+			}
+			row[i] = cv
+		}
+		t.Rows = append(t.Rows, row)
 	}
-	row := make([]any, len(t.Cols))
-	for i, e := range s.Vals {
-		if err := checkCtx(env.ctx); err != nil {
-			return nil, err
-		}
-		v, err := evalExpr(env, e, tmp)
-		if err != nil {
-			return nil, err
-		}
-		cv, err := coerceToTypeAllowNull(v, t.Cols[i].Type)
-		if err != nil {
-			return nil, fmt.Errorf("column %q: %w", t.Cols[i].Name, err)
-		}
-		row[i] = cv
-	}
-	t.Rows = append(t.Rows, row)
 	t.Version++
 	return nil, nil
 }
 
 func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) (*ResultSet, error) {
-	row := make([]any, len(t.Cols))
-	for i := range row {
-		row[i] = nil
-	}
+	colIdx := make([]int, len(s.Cols))
 	for i, name := range s.Cols {
 		idx, err := t.ColIndex(name)
 		if err != nil {
 			return nil, err
 		}
-		v, err := evalExpr(env, s.Vals[i], tmp)
-		if err != nil {
-			return nil, err
-		}
-		cv, err := coerceToTypeAllowNull(v, t.Cols[idx].Type)
-		if err != nil {
-			return nil, fmt.Errorf("column %q: %w", t.Cols[idx].Name, err)
-		}
-		row[idx] = cv
+		colIdx[i] = idx
 	}
-	t.Rows = append(t.Rows, row)
+	for _, vals := range s.Rows {
+		if len(vals) != len(s.Cols) {
+			return nil, fmt.Errorf("INSERT column/value mismatch")
+		}
+		row := make([]any, len(t.Cols))
+		for i := range row {
+			row[i] = nil
+		}
+		for i, idx := range colIdx {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, err
+			}
+			v, err := evalExpr(env, vals[i], tmp)
+			if err != nil {
+				return nil, err
+			}
+			cv, err := coerceToTypeAllowNull(v, t.Cols[idx].Type)
+			if err != nil {
+				return nil, fmt.Errorf("column %q: %w", t.Cols[idx].Name, err)
+			}
+			row[idx] = cv
+		}
+		t.Rows = append(t.Rows, row)
+	}
 	t.Version++
 	return nil, nil
 }

@@ -545,7 +545,7 @@ func ExplainQuery(sql string) (*QueryPlan, error) {
 			Operation: "INSERT",
 			Object:    s.Table,
 			Cost:      "low",
-			Details:   fmt.Sprintf("Insert %d values", len(s.Vals)),
+			Details:   fmt.Sprintf("Insert %d row(s)", len(s.Rows)),
 		})
 
 	case *engine.Update:

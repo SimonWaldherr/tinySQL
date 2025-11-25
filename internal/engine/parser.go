@@ -172,7 +172,7 @@ type AlterTable struct {
 type Insert struct {
 	Table string
 	Cols  []string
-	Vals  []Expr
+	Rows  [][]Expr
 }
 
 // Update represents an UPDATE statement.
@@ -641,26 +641,43 @@ func (p *Parser) parseInsert() (Statement, error) {
 	if err := p.expectKeyword("VALUES"); err != nil {
 		return nil, err
 	}
-	if err := p.expectSymbol("("); err != nil {
+	rows, err := p.parseInsertValueRows()
+	if err != nil {
 		return nil, err
 	}
-	var vals []Expr
+	return &Insert{Table: tname, Cols: cols, Rows: rows}, nil
+}
+
+func (p *Parser) parseInsertValueRows() ([][]Expr, error) {
+	var rows [][]Expr
 	for {
-		e, err := p.parseExpr()
-		if err != nil {
+		if err := p.expectSymbol("("); err != nil {
 			return nil, err
 		}
-		vals = append(vals, e)
+		var vals []Expr
+		for {
+			e, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			vals = append(vals, e)
+			if p.cur.Typ == tSymbol && p.cur.Val == "," {
+				p.next()
+				continue
+			}
+			if err := p.expectSymbol(")"); err != nil {
+				return nil, err
+			}
+			break
+		}
+		rows = append(rows, vals)
 		if p.cur.Typ == tSymbol && p.cur.Val == "," {
 			p.next()
 			continue
 		}
-		if err := p.expectSymbol(")"); err != nil {
-			return nil, err
-		}
 		break
 	}
-	return &Insert{Table: tname, Cols: cols, Vals: vals}, nil
+	return rows, nil
 }
 
 func (p *Parser) parseUpdate() (Statement, error) {

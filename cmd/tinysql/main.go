@@ -237,7 +237,7 @@ func (r *Repl) Run() error {
 		r.buf.WriteString(line)
 		r.buf.WriteByte('\n')
 
-		if tsql.IsComplete(r.buf.String()) || strings.HasSuffix(trimmed, ";") {
+		if strings.HasSuffix(trimmed, ";") {
 			sqlText := r.buf.String()
 			r.buf.Reset()
 
@@ -503,15 +503,15 @@ func openDatabase(path string) (*tsql.DB, string, error) {
 	if _, err := os.Stat(path); err == nil {
 		db, err := tsql.LoadFromFile(path)
 		return db, path, err
-	}
-	if errors.Is(err, os.ErrNotExist) {
+	} else if errors.Is(err, os.ErrNotExist) {
 		dir := filepath.Dir(path)
 		if dir != "" && dir != "." {
 			_ = os.MkdirAll(dir, 0o755)
 		}
 		return tsql.NewDB(), path, nil
+	} else {
+		return nil, "", err
 	}
-	return nil, "", err
 }
 
 func fmtScalar(v any, nullVal string) string {

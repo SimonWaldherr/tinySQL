@@ -17,3 +17,4 @@ coverage-func.txt
 persist_test.dat.wal
 tinyrag
 sqltools
+libtinysql.so

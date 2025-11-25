@@ -273,3 +273,56 @@ func TestColumnsAndCoerceHelpers(t *testing.T) {
 		t.Fatalf("coerceToTypeAllowNull expected nil, got %#v err=%v", nilVal, err)
 	}
 }
+
+func TestExecuteInsertMultipleRows(t *testing.T) {
+	env := newTestExecEnv()
+	table := storage.NewTable("users", []storage.Column{
+		{Name: "id", Type: storage.IntType},
+		{Name: "name", Type: storage.TextType},
+		{Name: "score", Type: storage.FloatType},
+	}, false)
+	if err := env.db.Put(env.tenant, table); err != nil {
+		t.Fatalf("failed to register test table: %v", err)
+	}
+
+	allCols := &Insert{
+		Table: "users",
+		Rows: [][]Expr{
+			{&Literal{Val: 1}, &Literal{Val: "Alice"}, &Literal{Val: 42.5}},
+			{&Literal{Val: 2}, &Literal{Val: "Bob"}, &Literal{Val: 13.0}},
+		},
+	}
+	if _, err := executeInsert(env, allCols); err != nil {
+		t.Fatalf("executeInsert all-columns failed: %v", err)
+	}
+	if len(table.Rows) != 2 {
+		t.Fatalf("expected 2 rows after first insert, got %d", len(table.Rows))
+	}
+	if table.Rows[0][1] != "Alice" || table.Rows[1][2] != 13.0 {
+		t.Fatalf("unexpected row values: %#v", table.Rows)
+	}
+
+	partialCols := &Insert{
+		Table: "users",
+		Cols:  []string{"id", "name"},
+		Rows: [][]Expr{
+			{&Literal{Val: 3}, &Literal{Val: "Carol"}},
+			{&Literal{Val: 4}, &Literal{Val: "Dave"}},
+		},
+	}
+	if _, err := executeInsert(env, partialCols); err != nil {
+		t.Fatalf("executeInsert column-list failed: %v", err)
+	}
+	if len(table.Rows) != 4 {
+		t.Fatalf("expected 4 rows after second insert, got %d", len(table.Rows))
+	}
+	if table.Rows[2][0] != 3 || table.Rows[2][1] != "Carol" || table.Rows[2][2] != nil {
+		t.Fatalf("unexpected partial insert row: %#v", table.Rows[2])
+	}
+	if table.Rows[3][0] != 4 || table.Rows[3][1] != "Dave" || table.Rows[3][2] != nil {
+		t.Fatalf("unexpected partial insert row: %#v", table.Rows[3])
+	}
+	if table.Version != 2 {
+		t.Fatalf("expected table version 2, got %d", table.Version)
+	}
+}
