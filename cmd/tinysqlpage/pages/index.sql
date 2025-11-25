@@ -20,23 +20,26 @@ FROM ui_context;
 SELECT
     'stat_list' AS component,
     'Active customers' AS label,
-    COUNT(*) AS value,
+    (SELECT COUNT(*) FROM customers WHERE active = true) AS value,
     'Currently enabled accounts' AS info
-FROM customers WHERE active = true
-UNION ALL
+FROM ui_context
+;
+
 SELECT
-    'stat_list',
-    'Open invoices',
-    COUNT(*) AS value,
-    'Awaiting payment'
-FROM invoices WHERE status = 'OPEN'
-UNION ALL
+    'stat_list' AS component,
+    'Open invoices' AS label,
+    (SELECT COUNT(*) FROM invoices WHERE status = 'OPEN') AS value,
+    'Awaiting payment' AS info
+FROM ui_context
+;
+
 SELECT
-    'stat_list',
-    'Paid MRR (k$)',
-    ROUND(SUM(amount)/1000, 2) AS value,
-    'Converted to thousands'
-FROM invoices WHERE status = 'PAID';
+    'stat_list' AS component,
+    'Paid MRR (k$)' AS label,
+    (SELECT SUM(amount)/1000 FROM invoices WHERE status = 'PAID') AS value,
+    'Converted to thousands' AS info
+FROM ui_context
+;
 
 SELECT
     'table' AS component,

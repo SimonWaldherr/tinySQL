@@ -1,10 +1,10 @@
 package main
 
 import (
-    "context"
-    "fmt"
-    "strings"
-    "syscall/js"
+	"context"
+	"fmt"
+	"strings"
+	"syscall/js"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
 )
@@ -144,10 +144,10 @@ func executeQuery(this js.Value, args []js.Value) interface{} {
 			"error":   "Usage: executeQuery(sqlQuery)",
 		}
 	}
-	
+
 	queryStr := args[0].String()
 	ctx := context.Background()
-	
+
 	// Parse query
 	stmt, err := tinysql.ParseSQL(queryStr)
 	if err != nil {
@@ -156,7 +156,7 @@ func executeQuery(this js.Value, args []js.Value) interface{} {
 			"error":   "Parse error: " + err.Error(),
 		}
 	}
-	
+
 	// Execute query
 	result, err := tinysql.Execute(ctx, db, tenant, stmt)
 	if err != nil {
@@ -165,7 +165,7 @@ func executeQuery(this js.Value, args []js.Value) interface{} {
 			"error":   "Execute error: " + err.Error(),
 		}
 	}
-	
+
 	// Convert result to JSON/JS-friendly format
 	if result == nil {
 		return map[string]interface{}{
@@ -174,7 +174,7 @@ func executeQuery(this js.Value, args []js.Value) interface{} {
 			"rows":    []interface{}{},
 		}
 	}
-	
+
 	// Always return []interface{} for rows, and sanitize all cell values
 	safeRows := make([]interface{}, 0, len(result.Rows))
 	for _, row := range result.Rows {

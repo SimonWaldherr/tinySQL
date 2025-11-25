@@ -74,6 +74,12 @@ func main() {
 	}
 }
 
+// pageHandler serves SQL-driven pages. It holds a reference to the tinySQL
+// database, the tenant namespace to execute statements in, and optional
+// template/CSS overrides. Each HTTP request loads an `.sql` file from
+// `pagesDir`, executes the statements and converts rows that contain a
+// `component` column into HTML components which are rendered into the
+// template.
 type pageHandler struct {
 	db       *tsql.DB
 	tenant   string
@@ -430,6 +436,12 @@ func deriveTitle(comps []component) string {
 	return defaultTitle
 }
 
+// renderShell composes a full HTML page from the computed components.
+// It selects the template (custom or default), injects CSS and the
+// generated navigation HTML, and executes the Go `html/template` with
+// a structured `PageData`. It purposely treats `Body` as trusted
+// server-generated HTML (type `template.HTML`) — ensure any user data
+// is escaped before being embedded in component HTML.
 func (h *pageHandler) renderShell(title string, comps []component, currentPage string) string {
 	var body strings.Builder
 	for _, comp := range comps {
@@ -497,7 +509,13 @@ func (h *pageHandler) renderShell(title string, comps []component, currentPage s
 </html>`, html.EscapeString(title), styles, navHTML, body.String())
 }
 
+// buildNavHTML constructs a small HTML fragment with links for every
+// `.sql` page found in `pagesDir`. It reads optional front-matter
+// (top `-- key: value` comments) to obtain friendly labels, order and
+// visibility flags. The returned string contains simple `<a>` links
+// and marks the `currentPage` with a `class="active"` attribute.
 func (h *pageHandler) buildNavHTML(currentPage string) string {
+
 	pattern := filepath.Join(h.pagesDir, "*.sql")
 	files, err := filepath.Glob(pattern)
 	if err != nil || len(files) == 0 {
@@ -576,6 +594,10 @@ func (h *pageHandler) buildNavHTML(currentPage string) string {
 	return sb.String()
 }
 
+// parseFrontMatter reads the top comment lines of a `.sql` file and
+// extracts `key: value` pairs from lines beginning with `--`. This is
+// a lightweight front-matter parser used to customize nav labels,
+// ordering and visibility without changing the SQL execution logic.
 func parseFrontMatter(path string) map[string]string {
 	out := map[string]string{}
 	data, err := os.ReadFile(path)
