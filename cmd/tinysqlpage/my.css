@@ -1,0 +1,125 @@
+:root {
+  font-family: "Inter", "SF Pro Display", system-ui, -apple-system, sans-serif;
+  color-scheme: light dark;
+  --bg: #0f172a;
+  --surface: rgba(15, 23, 42, 0.6);
+  --border: rgba(248, 250, 252, 0.08);
+  --text: #f8fafc;
+  --muted: #cbd5f5;
+  --accent: #38bdf8;
+}
+body {
+  margin: 0;
+  background: linear-gradient(135deg, #020617, #0f172a 60%, #1e293b);
+  color: var(--text);
+  min-height: 100vh;
+}
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 1rem 4vw;
+  border-bottom: 1px solid var(--border);
+  backdrop-filter: blur(12px);
+  position: sticky;
+  top: 0;
+  background: rgba(2, 6, 23, 0.9);
+  z-index: 10;
+}
+.topbar a {
+  color: var(--muted);
+  text-decoration: none;
+  margin-left: 1.5rem;
+  font-weight: 500;
+}
+.topbar a:hover {
+  color: var(--text);
+}
+.logo {
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+.container {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 2rem 4vw 4rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+.component {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  padding: 1.75rem;
+  box-shadow: 0 25px 65px rgba(2, 6, 23, 0.35);
+}
+.hero {
+  text-align: center;
+  padding: 3rem 2rem;
+}
+.hero h1 {
+  margin: 0;
+  font-size: clamp(2.2rem, 5vw, 3.5rem);
+}
+.hero p {
+  color: var(--muted);
+  font-size: 1.1rem;
+}
+.text {
+  font-size: 1.05rem;
+  color: var(--muted);
+}
+.section-title {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin-bottom: 0.75rem;
+}
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 1rem;
+}
+.stat {
+  background: rgba(56, 189, 248, 0.05);
+  border-radius: 14px;
+  padding: 1rem 1.25rem;
+  border: 1px solid rgba(56, 189, 248, 0.25);
+}
+.stat-label {
+  text-transform: uppercase;
+  font-size: 0.75rem;
+  letter-spacing: 0.12em;
+  color: var(--muted);
+}
+.stat-value {
+  font-size: 1.75rem;
+  font-weight: 600;
+  margin-top: 0.2rem;
+}
+.stat-info {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-top: 0.3rem;
+}
+.card .table-wrapper {
+  overflow-x: auto;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+th, td {
+  text-align: left;
+  padding: 0.65rem 0.5rem;
+  border-bottom: 1px solid rgba(248, 250, 252, 0.08);
+}
+th {
+  text-transform: uppercase;
+  font-size: 0.7rem;
+  letter-spacing: 0.12em;
+  color: var(--muted);
+}
+tr:last-child td {
+  border-bottom: none;
+}

@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}}</title>
+
+  <!-- Reveal.js core styles (CDN) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@4/dist/reveal.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@4/dist/theme/black.css" id="theme">
+
+  <style>
+  /* Injected styles ({{.Styles}}) are inserted below by the server as inline CSS */
+  </style>
+  <style>
+  /* Small helper reset for component -> slide conversion */
+  .reveal .component { box-sizing: border-box; }
+  .reveal .component.hero { padding: 3rem; text-align: center; }
+  .reveal .component.card { padding: 1.25rem; }
+  .reveal .component.stats .stat-grid { display:flex; gap:1rem; flex-wrap:wrap; }
+  </style>
+</head>
+<body>
+
+  <div class="reveal">
+    <div class="slides" id="reveal-slides">
+      <!-- Server will place components here inside a container; script below will transform them into slides -->
+      <div class="container">{{.Body}}</div>
+    </div>
+  </div>
+
+  <!-- Reveal.js and dependencies from CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@4/dist/reveal.min.js"></script>
+  <script>
+  // Convert each top-level .component inside the container into a <section> slide
+  (function(){
+    function convertComponentsToSlides() {
+      const container = document.querySelector('.slides > .container');
+      if (!container) return;
+      const comps = Array.from(container.querySelectorAll(':scope > .component'));
+      const slidesParent = container.parentElement; // .slides
+      // Clear any existing children (we'll recreate sections)
+      comps.forEach(c => {
+        const sec = document.createElement('section');
+        // preserve component HTML inside the section
+        sec.innerHTML = c.outerHTML;
+        slidesParent.appendChild(sec);
+      });
+      // remove the original container element
+      container.remove();
+    }
+
+    convertComponentsToSlides();
+
+    // init Reveal
+    Reveal.initialize({
+      hash: true,
+      slideNumber: true,
+      center: true,
+      transition: 'slide',
+      dependencies: [
+        { src: 'https://cdn.jsdelivr.net/npm/reveal.js@4/plugin/markdown/markdown.js' },
+        { src: 'https://cdn.jsdelivr.net/npm/reveal.js@4/plugin/notes/notes.js', async: true }
+      ]
+    });
+  })();
+  </script>
+</body>
+</html>
