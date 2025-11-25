@@ -196,7 +196,7 @@ func NewRepl(db *tsql.DB, cfg *Config, savePath string, out io.Writer) *Repl {
 }
 
 func (r *Repl) Run() error {
-	fmt.Fprintf(r.out, "TinySQL version 0.2 (mimicking sqlite3)\n")
+	fmt.Fprintf(r.out, "TinySQL version v0.4.0 (mimicking sqlite3)\n")
 	fmt.Fprintf(r.out, "Enter \".help\" for usage hints.\n")
 	fmt.Fprintf(r.out, "Connected to: %s\n", r.savePath)
 
