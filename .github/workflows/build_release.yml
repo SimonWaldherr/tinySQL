@@ -1,0 +1,100 @@
+name: Build Release Artifacts
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    name: Build for ${{ matrix.goos }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            goos: linux
+            ext: so
+            arch: amd64
+          - runner: ubuntu-latest
+            goos: linux
+            ext: so
+            arch: arm64
+          - runner: macos-latest
+            goos: darwin
+            ext: dylib
+            arch: amd64
+          - runner: macos-latest
+            goos: darwin
+            ext: dylib
+            arch: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ${{ github.workspace }}/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Build CLI and shared lib
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          echo "Building for ${MATRIX_GOOS:-${{ matrix.goos }}}/${MATRIX_ARCH:-${{ matrix.arch }}} on runner $RUNNER_OS"
+          GOOS=${{ matrix.goos }}
+          GOARCH=${{ matrix.arch }}
+          EXT=${{ matrix.ext }}
+          ART=artifacts
+          PKGDIR=$ART/pkg
+          mkdir -p $PKGDIR
+
+          # Build CLI binary (cmd/tinysql)
+          echo "Building CLI: tinysql for $GOOS-$GOARCH"
+          CGO_ENABLED=1 GOOS=$GOOS GOARCH=$GOARCH go build -o $PKGDIR/tinysql-$GOOS-$GOARCH ./cmd/tinysql
+
+          # Build C shared library (bindings/python provides c-shared target)
+          echo "Building c-shared library"
+          CGO_ENABLED=1 GOOS=$GOOS GOARCH=$GOARCH go build -buildmode=c-shared -o $PKGDIR/libtinysql.$EXT ./bindings/python || true
+
+          # If the header was emitted next to the shared lib, ensure it's inside pkg
+          if [ -f libtinysql.h ]; then mv -f libtinysql.h $PKGDIR/ 2>/dev/null || true; fi
+          if [ -f libtinysql.h ] && [ -f $PKGDIR/libtinysql.$EXT ]; then mv -f libtinysql.h $PKGDIR/ 2>/dev/null || true; fi
+
+          # Package artifacts into tar.gz
+          TARFILE=$ART/tinysql-$GOOS-$GOARCH-${GITHUB_REF_NAME:-untagged}.tar.gz
+          pushd $PKGDIR >/dev/null
+          tar -czf ../$(basename $TARFILE) .
+          popd >/dev/null
+
+          # Compute SHA256 (portable)
+          FILE=$TARFILE
+          if command -v sha256sum >/dev/null 2>&1; then sha256sum "$FILE" > "$FILE.sha256"; else shasum -a 256 "$FILE" > "$FILE.sha256"; fi
+
+          ls -lah artifacts || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tinysql-${{ matrix.goos }}-${{ matrix.arch }}-${{ github.ref_name }}
+          path: artifacts/*.tar.gz
+
+      - name: Upload checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksums-${{ matrix.goos }}-${{ matrix.arch }}-${{ github.ref_name }}
+          path: artifacts/*.sha256
