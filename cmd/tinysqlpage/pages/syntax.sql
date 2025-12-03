@@ -670,7 +670,7 @@ SELECT
     '' AS title,
     'REGEXP_EXTRACT(str, pattern)' AS function,
     'Extracts matching substring' AS description,
-    'SELECT REGEXP_EXTRACT(''Order #123'', ''#\d+'')' AS example
+    'SELECT REGEXP_EXTRACT(''Order #123'', ''#[0-9]+'')' AS example
 FROM ui_context
 UNION ALL
 SELECT
@@ -678,7 +678,7 @@ SELECT
     '' AS title,
     'REGEXP_REPLACE(str, pat, repl)' AS function,
     'Replaces matching patterns' AS description,
-    'SELECT REGEXP_REPLACE(''a1b2'', ''\d'', ''X'')' AS example
+    'SELECT REGEXP_REPLACE(''a1b2'', ''[0-9]'', ''X'')' AS example
 FROM ui_context;
 
 -- ============================================================
@@ -1093,7 +1093,7 @@ SELECT
     'table' AS component,
     '' AS title,
     'BASE64_DECODE(str)' AS function,
-    'Decodes base64 string' AS description,
+    'Decodes base64 string (aGVsbG8= = hello)' AS description,
     'SELECT BASE64_DECODE(''aGVsbG8='')' AS example
 FROM ui_context
 UNION ALL
@@ -1109,7 +1109,7 @@ SELECT
     'table' AS component,
     '' AS title,
     'UNHEX(str)' AS function,
-    'Decodes hexadecimal string' AS description,
+    'Decodes hex string (48656C6C6F = Hello)' AS description,
     'SELECT UNHEX(''48656C6C6F'')' AS example
 FROM ui_context;
 
