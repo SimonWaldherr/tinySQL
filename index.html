@@ -85,6 +85,22 @@
             animation: pulse 2s infinite;
         }
 
+        .status-indicator.ready { background: #0f0; }
+        .status-indicator.failed { background: #d9534f; }
+        .status-indicator.loading { background: #f0ad4e; }
+
+        .table-badge {
+            display: inline-block;
+            margin-left: 8px;
+            padding: 2px 6px;
+            font-size: 11px;
+            border-radius: 12px;
+            color: #fff;
+            vertical-align: middle;
+        }
+        .table-badge.pending { background: #f0ad4e; }
+        .table-badge.imported { background: #28a745; }
+
         @keyframes pulse {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.5; }
@@ -277,6 +293,12 @@
             align-items: center;
         }
 
+        .editor-hint {
+            margin-left: auto;
+            font-size: 12px;
+            color: #999;
+        }
+
         .editor-toolbar button {
             background: #0e639c;
             border: none;
@@ -467,14 +489,20 @@
             display: inline-block;
             background: #3e3e42;
             color: #ccc;
-            padding: 8px 12px;
+            padding: 10px 14px;
             border-radius: 4px;
-            font-size: 12px;
+            font-size: 13px;
             cursor: pointer;
+            transition: all 0.2s;
+            border: 2px dashed transparent;
+            width: 100%;
+            text-align: center;
+            font-weight: 500;
         }
 
         .upload-btn:hover {
             background: #505050;
+            border-color: #0e639c;
         }
 
         #fileInput {
@@ -484,6 +512,24 @@
         .upload-btn.dragover {
             background: #0e639c;
             border-color: #1177bb;
+            color: #fff;
+            transform: scale(1.02);
+        }
+        
+        .table-remove {
+            display: inline-block;
+            margin-left: 8px;
+            padding: 2px 6px;
+            background: #5a1d1d;
+            border-radius: 3px;
+            font-size: 10px;
+            opacity: 0.7;
+            transition: opacity 0.2s;
+        }
+        
+        .table-remove:hover {
+            opacity: 1;
+            background: #8b2e2e;
         }
 
         /* Query Examples */
@@ -556,6 +602,7 @@
     <div class="topbar">
         <h1>TinySQL Editor</h1>
         <button onclick="showUploadDialog()">📁 Upload File</button>
+        <button id="loadAllDemosBtn" style="background: #7d2d7d;">✨ Load Demo Tables</button>
         <div class="spacer"></div>
         <div class="status">
             <div class="status-indicator"></div>
@@ -573,9 +620,12 @@
             </div>
             <div class="upload-area">
                 <label class="upload-btn" for="fileInput">
-                    + Upload File
+                    📤 Upload File
                 </label>
-                <input type="file" id="fileInput" accept=".csv,.json,.xml" onchange="handleFileUpload(event)">
+                <input type="file" id="fileInput" accept=".csv,.json,.xlsx,.xls" multiple onchange="handleFileUpload(event)">
+                <div style="font-size: 11px; color: #888; margin-top: 8px; padding: 0 4px;">
+                    Supports: CSV, JSON, Excel (.xlsx, .xls)
+                </div>
             </div>
             <div class="table-list" id="tableList">
                 <div class="empty-state">
@@ -584,19 +634,25 @@
                     <div class="empty-state-text">Upload a file or load from disk</div>
                 </div>
             </div>
-            <div class="examples">
-                <div class="examples-title">Query Examples</div>
-                <div class="example-query" onclick="setQuery('SELECT * FROM users LIMIT 10')">
-                    SELECT * FROM users LIMIT 10
+            <div id="demoQueries" class="examples hidden">
+                <div class="examples-title">Demo Queries</div>
+                <div class="example-query" onclick="setQuery('-- Sales by region\nSELECT region, SUM(quantity * unit_price) AS revenue\nFROM sales\nGROUP BY region\nORDER BY revenue DESC')">
+                    📊 Sales by Region
                 </div>
-                <div class="example-query" onclick="setQuery('SELECT name, age FROM users WHERE age > 25')">
-                    SELECT name, age FROM users WHERE age > 25
+                <div class="example-query" onclick="setQuery('-- Top products\nSELECT product, COUNT(*) AS orders, SUM(quantity) AS total_qty\nFROM sales\nGROUP BY product\nORDER BY orders DESC')">
+                    🏆 Top Products
                 </div>
-                <div class="example-query" onclick="setQuery('SELECT COUNT(*) as total FROM users')">
-                    SELECT COUNT(*) as total FROM users
+                <div class="example-query" onclick="setQuery('-- Shipment costs by carrier\nSELECT carrier, \n       COUNT(*) AS shipments,\n       AVG(shipping_cost) AS avg_cost,\n       SUM(shipping_cost) AS total_cost\nFROM logistics\nGROUP BY carrier')">
+                    🚚 Carrier Analysis
                 </div>
-                <div class="example-query" onclick="setQuery('SELECT * FROM users ORDER BY age DESC')">
-                    SELECT * FROM users ORDER BY age DESC
+                <div class="example-query" onclick="setQuery('-- Join sales with logistics\nSELECT s.order_id, s.customer_name, s.product, \n       l.carrier, l.status AS shipping_status\nFROM sales s\nLEFT JOIN logistics l ON s.order_id = l.order_id')">
+                    🔗 JOIN Example
+                </div>
+                <div class="example-query" onclick="setQuery('-- Orders with calculated total\nSELECT order_id, customer_name,\n       quantity * unit_price AS total,\n       CASE \n         WHEN quantity * unit_price > 2000 THEN \'Large\'\n         WHEN quantity * unit_price > 1000 THEN \'Medium\'\n         ELSE \'Small\'\n       END AS order_size\nFROM sales\nORDER BY total DESC')">
+                    💰 CASE Statement
+                </div>
+                <div class="example-query" onclick="setQuery('-- Pending shipments\nSELECT shipment_id, origin, destination, \n       status, dispatch_date\nFROM logistics\nWHERE status != \'Delivered\'\nORDER BY dispatch_date DESC')">
+                    ⏳ Pending Shipments
                 </div>
             </div>
         </div>
@@ -611,6 +667,7 @@
                     </button>
                     <button class="btn-secondary" onclick="clearQuery()">Clear</button>
                     <button class="btn-secondary" onclick="formatQuery()">Format</button>
+                    <div class="editor-hint">Tip: Ctrl/Cmd+Enter to run • Tab to indent</div>
                 </div>
                 <textarea id="queryEditor" placeholder="Enter your SQL query here...
 Example: SELECT * FROM users WHERE age > 25
@@ -651,6 +708,7 @@ Supported functions:
     </div>
     <!-- WASM Support -->
     <script src="wasm_exec.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
     <script src="https://simonwaldherr.github.io/vanillagrid.js/vanillagrid.js"></script>
     <script src="https://simonwaldherr.github.io/vanillagrid.js/vg-pivot-d3.js"></script>
     <script>
