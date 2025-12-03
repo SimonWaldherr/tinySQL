@@ -50,10 +50,12 @@ type ResultSet struct {
 }
 
 type ExecEnv struct {
-	ctx    context.Context
-	tenant string
-	db     *storage.DB
-	ctes   map[string]*ResultSet // For CTE support
+	ctx         context.Context
+	tenant      string
+	db          *storage.DB
+	ctes        map[string]*ResultSet // For CTE support
+	windowRows  []Row                 // All rows for window function context
+	windowIndex int                   // Current row index in window context
 }
 
 // Execute runs a parsed SQL statement against the given storage DB and tenant.
@@ -401,20 +403,40 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 		}
 	}
 
-	// FROM
+	// FROM (Tabelle, CTE oder Subselect) - now optional
 	var leftRows []Row
 
-	// Check if FROM table is a CTE
-	if cteEnv.ctes != nil {
+	// Check if FROM clause exists
+	if s.From.Table == "" && s.From.Subquery == nil {
+		// No FROM clause - create a single dummy row for expression evaluation
+		// This allows SELECT NOW(), SELECT 1+1, etc.
+		leftRows = []Row{make(Row)}
+	} else if s.From.Subquery != nil {
+		// FROM (SELECT ...) AS alias
+		subResult, err := executeSelect(env, s.From.Subquery)
+		if err != nil {
+			return nil, err
+		}
+		leftRows = make([]Row, len(subResult.Rows))
+		for i, row := range subResult.Rows {
+			leftRows[i] = make(Row)
+			for k, v := range row {
+				// Immer unqualifiziert (für Outer-Select), lower-case
+				leftRows[i][strings.ToLower(k)] = v
+				// Zusätzlich mit Alias-Präfix, falls Alias gesetzt
+				if s.From.Alias != "" {
+					leftRows[i][strings.ToLower(s.From.Alias+"."+k)] = v
+				}
+			}
+		}
+	} else if cteEnv.ctes != nil {
 		if cteResult, exists := cteEnv.ctes[s.From.Table]; exists {
 			// Convert CTE result to rows
 			leftRows = make([]Row, len(cteResult.Rows))
 			for i, row := range cteResult.Rows {
 				leftRows[i] = make(Row)
-				// Copy all values from CTE result row
 				for k, v := range row {
 					leftRows[i][k] = v
-					// Also add qualified names
 					leftRows[i][s.From.Table+"."+k] = v
 				}
 			}
@@ -804,8 +826,13 @@ func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []str
 			if it.Star {
 				if len(rows) > 0 {
 					for col, v := range rows[0] {
+						putVal(out, col, v)
 						if strings.Contains(col, ".") {
-							putVal(out, col, v)
+							last := strings.LastIndex(col, ".")
+							base := col[last+1:]
+							putVal(out, base, v)
+							outCols = appendUnique(outCols, base)
+						} else {
 							outCols = appendUnique(outCols, col)
 						}
 					}
@@ -835,16 +862,35 @@ func processNonAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []
 	outRows := make([]Row, 0, len(filtered))
 	outCols := make([]string, 0, len(s.Projs))
 
-	for _, r := range filtered {
+	// Check if any window functions are used
+	hasWindowFunctions := anyWindowInSelect(s.Projs)
+
+	// If window functions are present, set up window context
+	if hasWindowFunctions {
+		env.windowRows = filtered
+	}
+
+	for rowIdx, r := range filtered {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, nil, err
 		}
+
+		// Set window index for current row
+		if hasWindowFunctions {
+			env.windowIndex = rowIdx
+		}
+
 		out := Row{}
 		for i, it := range s.Projs {
 			if it.Star {
 				for col, v := range r {
+					putVal(out, col, v)
 					if strings.Contains(col, ".") {
-						putVal(out, col, v)
+						last := strings.LastIndex(col, ".")
+						base := col[last+1:]
+						putVal(out, base, v)
+						outCols = appendUnique(outCols, base)
+					} else {
 						outCols = appendUnique(outCols, col)
 					}
 				}
@@ -1559,7 +1605,23 @@ func getBuiltinFunctions() map[string]funcHandler {
 }
 
 func evalFuncCall(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	// Check if this is a window function call
+	if ex.Over != nil {
+		// Window functions need access to all rows, not just current row
+		// This will be handled specially during SELECT execution
+		// For now, return an error if accessed outside window context
+		if env.windowRows == nil {
+			return nil, fmt.Errorf("window function %s used outside window context", ex.Name)
+		}
+		return evalWindowFunction(env, ex, row)
+	}
+
 	builtinFunctions := getBuiltinFunctions()
+	// Add extended functions
+	extendedFuncs := getExtendedFunctions()
+	for k, v := range extendedFuncs {
+		builtinFunctions[k] = v
+	}
 	if handler, ok := builtinFunctions[ex.Name]; ok {
 		return handler(env, ex, row)
 	}
@@ -4060,7 +4122,8 @@ func isAggregate(e Expr) bool {
 	switch ex := e.(type) {
 	case *FuncCall:
 		switch ex.Name {
-		case "COUNT", "SUM", "AVG", "MIN", "MAX", "MEDIAN":
+		case "COUNT", "SUM", "AVG", "MIN", "MAX", "MEDIAN",
+			"MIN_BY", "MAX_BY", "ARG_MIN", "ARG_MAX":
 			return true
 		}
 	case *Unary:
@@ -4115,6 +4178,10 @@ func evalAggregateFuncCall(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 		return evalAggregateMinMax(env, ex, rows)
 	case "MEDIAN":
 		return evalAggregateMedian(env, ex, rows)
+	case "MIN_BY", "ARG_MIN":
+		return evalAggregateMinBy(env, ex, rows)
+	case "MAX_BY", "ARG_MAX":
+		return evalAggregateMaxBy(env, ex, rows)
 	default:
 		// For non-aggregate functions like DATEDIFF, LEFT, etc., evaluate their arguments
 		// in the aggregate context first, then call the function
@@ -4287,6 +4354,112 @@ func evalAggregateMedian(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 	}
 	// Even number of values - return average of two middle values
 	return (values[n/2-1] + values[n/2]) / 2.0, nil
+}
+
+// evalAggregateMinBy returns the value from first argument where second argument is minimum
+// Usage: MIN_BY(value_column, order_column)
+func evalAggregateMinBy(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
+	if len(ex.Args) != 2 {
+		return nil, fmt.Errorf("MIN_BY expects 2 arguments: (value_column, order_column)")
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+
+	var minOrderVal any
+	var resultVal any
+	first := true
+
+	for _, r := range rows {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, err
+		}
+
+		// Evaluate the ordering column (second argument)
+		orderVal, err := evalExpr(env, ex.Args[1], r)
+		if err != nil {
+			return nil, err
+		}
+
+		// Skip NULL values in comparison
+		if orderVal == nil {
+			continue
+		}
+
+		// First non-NULL value or found a smaller value
+		if first {
+			minOrderVal = orderVal
+			resultVal, err = evalExpr(env, ex.Args[0], r)
+			if err != nil {
+				return nil, err
+			}
+			first = false
+		} else {
+			cmp, err := compare(orderVal, minOrderVal)
+			if err == nil && cmp < 0 {
+				minOrderVal = orderVal
+				resultVal, err = evalExpr(env, ex.Args[0], r)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+
+	return resultVal, nil
+}
+
+// evalAggregateMaxBy returns the value from first argument where second argument is maximum
+// Usage: MAX_BY(value_column, order_column)
+func evalAggregateMaxBy(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
+	if len(ex.Args) != 2 {
+		return nil, fmt.Errorf("MAX_BY expects 2 arguments: (value_column, order_column)")
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+
+	var maxOrderVal any
+	var resultVal any
+	first := true
+
+	for _, r := range rows {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, err
+		}
+
+		// Evaluate the ordering column (second argument)
+		orderVal, err := evalExpr(env, ex.Args[1], r)
+		if err != nil {
+			return nil, err
+		}
+
+		// Skip NULL values in comparison
+		if orderVal == nil {
+			continue
+		}
+
+		// First non-NULL value or found a larger value
+		if first {
+			maxOrderVal = orderVal
+			resultVal, err = evalExpr(env, ex.Args[0], r)
+			if err != nil {
+				return nil, err
+			}
+			first = false
+		} else {
+			cmp, err := compare(orderVal, maxOrderVal)
+			if err == nil && cmp > 0 {
+				maxOrderVal = orderVal
+				resultVal, err = evalExpr(env, ex.Args[0], r)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+
+	return resultVal, nil
 }
 
 func evalAggregateUnary(env ExecEnv, ex *Unary, rows []Row) (any, error) {
@@ -4792,6 +4965,51 @@ func anyAggInSelect(items []SelectItem) bool {
 	return false
 }
 
+// anyWindowInSelect checks if any window functions are used in SELECT projections
+func anyWindowInSelect(items []SelectItem) bool {
+	for _, it := range items {
+		if hasWindowFunction(it.Expr) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasWindowFunction checks if an expression contains a window function
+func hasWindowFunction(e Expr) bool {
+	switch ex := e.(type) {
+	case *FuncCall:
+		if ex.Over != nil {
+			return true
+		}
+		// Check arguments recursively
+		for _, arg := range ex.Args {
+			if hasWindowFunction(arg) {
+				return true
+			}
+		}
+	case *Unary:
+		return hasWindowFunction(ex.Expr)
+	case *Binary:
+		return hasWindowFunction(ex.Left) || hasWindowFunction(ex.Right)
+	case *IsNull:
+		return hasWindowFunction(ex.Expr)
+	case *CaseExpr:
+		if ex.Operand != nil && hasWindowFunction(ex.Operand) {
+			return true
+		}
+		for _, w := range ex.Whens {
+			if hasWindowFunction(w.When) || hasWindowFunction(w.Then) {
+				return true
+			}
+		}
+		if ex.Else != nil && hasWindowFunction(ex.Else) {
+			return true
+		}
+	}
+	return false
+}
+
 // appendUnique appends a column name to the slice if it's not already present
 func appendUnique(cols []string, c string) []string {
 	for _, existing := range cols {
@@ -4800,4 +5018,290 @@ func appendUnique(cols []string, c string) []string {
 		}
 	}
 	return append(cols, c)
+}
+
+// ==================== Window Function Support ====================
+
+// evalWindowFunction evaluates a window function with OVER clause
+func evalWindowFunction(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if ex.Over == nil {
+		return nil, fmt.Errorf("window function %s requires OVER clause", ex.Name)
+	}
+
+	// Get all rows for this window
+	allRows := env.windowRows
+	if allRows == nil {
+		return nil, fmt.Errorf("window function context not available")
+	}
+
+	// Apply PARTITION BY to get relevant partition
+	partitionRows := allRows
+	if len(ex.Over.PartitionBy) > 0 {
+		partitionRows = filterPartition(env, allRows, ex.Over.PartitionBy, row)
+	}
+
+	// Apply ORDER BY to partition
+	if len(ex.Over.OrderBy) > 0 {
+		partitionRows = sortRows(partitionRows, ex.Over.OrderBy)
+	}
+
+	// Find current row position in partition
+	currentIdx := findRowIndex(partitionRows, row, env.windowIndex)
+
+	// Evaluate the specific window function
+	switch ex.Name {
+	case "ROW_NUMBER":
+		return currentIdx + 1, nil
+
+	case "LAG":
+		offset := 1
+		if len(ex.Args) > 1 {
+			offsetVal, err := evalExpr(env, ex.Args[1], row)
+			if err != nil {
+				return nil, err
+			}
+			if offsetInt, ok := offsetVal.(int); ok {
+				offset = offsetInt
+			} else if offsetFloat, ok := offsetVal.(float64); ok {
+				offset = int(offsetFloat)
+			}
+		}
+		lagIdx := currentIdx - offset
+		if lagIdx < 0 {
+			// Return default value if provided
+			if len(ex.Args) > 2 {
+				return evalExpr(env, ex.Args[2], row)
+			}
+			return nil, nil
+		}
+		return evalExpr(env, ex.Args[0], partitionRows[lagIdx])
+
+	case "LEAD":
+		offset := 1
+		if len(ex.Args) > 1 {
+			offsetVal, err := evalExpr(env, ex.Args[1], row)
+			if err != nil {
+				return nil, err
+			}
+			if offsetInt, ok := offsetVal.(int); ok {
+				offset = offsetInt
+			} else if offsetFloat, ok := offsetVal.(float64); ok {
+				offset = int(offsetFloat)
+			}
+		}
+		leadIdx := currentIdx + offset
+		if leadIdx >= len(partitionRows) {
+			// Return default value if provided
+			if len(ex.Args) > 2 {
+				return evalExpr(env, ex.Args[2], row)
+			}
+			return nil, nil
+		}
+		return evalExpr(env, ex.Args[0], partitionRows[leadIdx])
+
+	case "FIRST_VALUE":
+		if len(ex.Args) == 0 {
+			return nil, fmt.Errorf("FIRST_VALUE requires an argument")
+		}
+		if len(partitionRows) == 0 {
+			return nil, nil
+		}
+		return evalExpr(env, ex.Args[0], partitionRows[0])
+
+	case "LAST_VALUE":
+		if len(ex.Args) == 0 {
+			return nil, fmt.Errorf("LAST_VALUE requires an argument")
+		}
+		if len(partitionRows) == 0 {
+			return nil, nil
+		}
+		// Use frame end if specified
+		endIdx := len(partitionRows) - 1
+		if ex.Over.Frame != nil {
+			endIdx = calculateFrameEnd(currentIdx, len(partitionRows), ex.Over.Frame)
+		}
+		return evalExpr(env, ex.Args[0], partitionRows[endIdx])
+
+	case "MOVING_SUM", "MOVING_AVG":
+		// Get window size from first argument
+		if len(ex.Args) == 0 {
+			return nil, fmt.Errorf("%s requires window size argument", ex.Name)
+		}
+		sizeVal, err := evalExpr(env, ex.Args[0], row)
+		if err != nil {
+			return nil, err
+		}
+		var windowSize int
+		if sizeInt, ok := sizeVal.(int); ok {
+			windowSize = sizeInt
+		} else if sizeFloat, ok := sizeVal.(float64); ok {
+			windowSize = int(sizeFloat)
+		}
+
+		// Calculate start of window
+		startIdx := currentIdx - windowSize + 1
+		if startIdx < 0 {
+			startIdx = 0
+		}
+
+		// Get value expression (second argument if provided, otherwise assume column)
+		var valueExpr Expr
+		if len(ex.Args) > 1 {
+			valueExpr = ex.Args[1]
+		} else {
+			// Use ORDER BY column as default
+			if len(ex.Over.OrderBy) > 0 {
+				valueExpr = &VarRef{Name: ex.Over.OrderBy[0].Col}
+			} else {
+				return nil, fmt.Errorf("%s requires value expression", ex.Name)
+			}
+		}
+
+		// Calculate sum over window
+		var sum float64
+		count := 0
+		for i := startIdx; i <= currentIdx && i < len(partitionRows); i++ {
+			val, err := evalExpr(env, valueExpr, partitionRows[i])
+			if err != nil {
+				return nil, err
+			}
+			if val != nil {
+				if valFloat, ok := val.(float64); ok {
+					sum += valFloat
+				} else if valInt, ok := val.(int); ok {
+					sum += float64(valInt)
+				}
+				count++
+			}
+		}
+
+		if ex.Name == "MOVING_SUM" {
+			return sum, nil
+		}
+		// MOVING_AVG
+		if count == 0 {
+			return nil, nil
+		}
+		return sum / float64(count), nil
+
+	default:
+		return nil, fmt.Errorf("unsupported window function: %s", ex.Name)
+	}
+}
+
+// filterPartition returns rows that match the partition of the current row
+func filterPartition(env ExecEnv, allRows []Row, partitionBy []Expr, currentRow Row) []Row {
+	// Evaluate partition expressions for current row
+	currentPartition := make([]any, len(partitionBy))
+	for i, expr := range partitionBy {
+		val, err := evalExpr(env, expr, currentRow)
+		if err != nil {
+			continue
+		}
+		currentPartition[i] = val
+	}
+
+	// Filter rows with same partition values
+	var result []Row
+	for _, row := range allRows {
+		match := true
+		for i, expr := range partitionBy {
+			val, err := evalExpr(env, expr, row)
+			cmp, cmpErr := compare(val, currentPartition[i])
+			if err != nil || cmpErr != nil || cmp != 0 {
+				match = false
+				break
+			}
+		}
+		if match {
+			result = append(result, row)
+		}
+	}
+	return result
+}
+
+// sortRows sorts rows according to ORDER BY items
+func sortRows(rows []Row, orderBy []OrderItem) []Row {
+	sorted := make([]Row, len(rows))
+	copy(sorted, rows)
+
+	sort.SliceStable(sorted, func(i, j int) bool {
+		a := sorted[i]
+		b := sorted[j]
+		for _, oi := range orderBy {
+			av, _ := getVal(a, oi.Col)
+			bv, _ := getVal(b, oi.Col)
+			cmp := compareForOrder(av, bv, oi.Desc)
+			if cmp == 0 {
+				continue
+			}
+			if oi.Desc {
+				return cmp > 0
+			}
+			return cmp < 0
+		}
+		return false
+	})
+
+	return sorted
+}
+
+// findRowIndex finds the index of the current row in the partition
+func findRowIndex(partitionRows []Row, currentRow Row, hint int) int {
+	// Try hint first (optimization)
+	if hint >= 0 && hint < len(partitionRows) {
+		if rowsEqual(partitionRows[hint], currentRow) {
+			return hint
+		}
+	}
+
+	// Linear search
+	for i, row := range partitionRows {
+		if rowsEqual(row, currentRow) {
+			return i
+		}
+	}
+	return 0
+}
+
+// rowsEqual checks if two rows are equal (same values for all columns)
+func rowsEqual(a, b Row) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		cmp, err := compare(v, b[k])
+		if err != nil || cmp != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// calculateFrameEnd calculates the end index for frame-based window functions
+func calculateFrameEnd(currentIdx, totalRows int, frame *WindowFrame) int {
+	if frame == nil {
+		return currentIdx // Default: CURRENT ROW
+	}
+
+	switch frame.EndType {
+	case "CURRENT":
+		return currentIdx
+	case "UNBOUNDED_FOLLOWING":
+		return totalRows - 1
+	case "OFFSET_FOLLOWING":
+		endIdx := currentIdx + frame.EndValue
+		if endIdx >= totalRows {
+			return totalRows - 1
+		}
+		return endIdx
+	case "OFFSET_PRECEDING":
+		endIdx := currentIdx - frame.EndValue
+		if endIdx < 0 {
+			return 0
+		}
+		return endIdx
+	default:
+		return currentIdx
+	}
 }

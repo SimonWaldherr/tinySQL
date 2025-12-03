@@ -1,0 +1,12 @@
+SELECT NOW() as timestamp;
+SELECT EXTRACT('YEAR', NOW()) as year, EXTRACT('MONTH', NOW()) as month;
+SELECT DATE_TRUNC('MONTH', NOW()) as month_start, EOMONTH(CURRENT_DATE()) as month_end;
+SELECT IN_PERIOD('TODAY', CURRENT_DATE()) as today, IN_PERIOD('MTD', CURRENT_DATE()) as mtd;
+SELECT UPPER('hello') as upper, LOWER('WORLD') as lower, LENGTH('test') as len;
+SELECT REGEXP_MATCH('user@test.com', '.*@.*') as valid_email;
+SELECT SPLIT('red,green,blue', ',') as colors;
+SELECT ARRAY_LENGTH(SPLIT('a,b,c,d', ',')) as count;
+SELECT FIRST(SPLIT('1,2,3', ',')) as first, LAST(SPLIT('1,2,3', ',')) as last;
+SELECT ARRAY_JOIN(ARRAY_SORT(SPLIT('c,a,b', ',')), ' -> ') as sorted;
+SELECT ROUND(PI() * POWER(10, 2), 2) as area;
+SELECT COALESCE(NULL, 'default') as value;

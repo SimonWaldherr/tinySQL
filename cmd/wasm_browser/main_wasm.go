@@ -11,7 +11,10 @@ import (
 	"syscall/js"
 	"time"
 
-	_ "github.com/SimonWaldherr/tinySQL/internal/driver"
+	drv "github.com/SimonWaldherr/tinySQL/internal/driver"
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
+	"github.com/SimonWaldherr/tinySQL/internal/engine"
+	tsql "github.com/SimonWaldherr/tinySQL"
 )
 
 // Global state
@@ -21,6 +24,8 @@ var (
 	ctx = context.Background()
 	// keep JS function references alive to avoid GC and subsequent panics
 	retainedFuncs []js.Func
+	// Keep a reference to the underlying storage DB when running in WASM
+	wasmStorageDB *storage.DB
 )
 
 // QueryResult represents the result of a SQL query
@@ -90,6 +95,10 @@ func jsOpen(this js.Value, args []js.Value) any {
 		tx = nil
 	}
 
+	// Create an underlying storage DB and set it as default for the driver
+	wasmStorageDB = storage.NewDB()
+	drv.SetDefaultDB(wasmStorageDB)
+
 	// Open new connection
 	var err error
 	db, err = sql.Open("tinysql", dsn)
@@ -132,6 +141,111 @@ func jsBegin(this js.Value, args []js.Value) any {
 
 	logInfo("Transaction started successfully")
 	return jsonResponse(APIResponse{Success: true, Message: "Transaction started"})
+}
+
+// jsExplain returns a simple query plan for a given SQL string.
+func jsExplain(this js.Value, args []js.Value) any {
+	if len(args) < 1 || args[0].Type() != js.TypeString {
+		return jsonResponse(APIResponse{Success: false, Error: "sql string required"})
+	}
+	sqlStr := args[0].String()
+
+	stmt, err := tsql.ParseSQL(sqlStr)
+	if err != nil {
+		return jsonResponse(map[string]any{"error": err.Error()})
+	}
+
+	// Build a simple plan representation
+	type PlanStep struct {
+		Operation string `json:"operation"`
+		Object    string `json:"object"`
+		Cost      string `json:"cost"`
+		Details   string `json:"details"`
+	}
+	plan := make([]PlanStep, 0)
+
+	switch s := stmt.(type) {
+	case *engine.Select:
+		if s.From.Table != "" {
+			plan = append(plan, PlanStep{Operation: "TABLE SCAN", Object: s.From.Table, Cost: "low", Details: "Sequential scan of table"})
+		}
+		for _, join := range s.Joins {
+			joinTypeStr := "INNER"
+			switch join.Type {
+			case engine.JoinLeft:
+				joinTypeStr = "LEFT"
+			case engine.JoinRight:
+				joinTypeStr = "RIGHT"
+			}
+			plan = append(plan, PlanStep{Operation: "NESTED LOOP JOIN", Object: join.Right.Table, Cost: "medium", Details: fmt.Sprintf("%s join", joinTypeStr)})
+		}
+		if s.Where != nil {
+			plan = append(plan, PlanStep{Operation: "FILTER", Object: "-", Cost: "low", Details: "Apply WHERE conditions"})
+		}
+		if len(s.GroupBy) > 0 {
+			plan = append(plan, PlanStep{Operation: "AGGREGATE", Object: "-", Cost: "medium", Details: "Group and aggregate"})
+		}
+		if len(s.OrderBy) > 0 {
+			plan = append(plan, PlanStep{Operation: "SORT", Object: "-", Cost: "medium-high", Details: "Sort results"})
+		}
+		if s.Limit != nil || s.Offset != nil {
+			plan = append(plan, PlanStep{Operation: "LIMIT/OFFSET", Object: "-", Cost: "low", Details: "Apply row limits"})
+		}
+		plan = append(plan, PlanStep{Operation: "PROJECT", Object: "-", Cost: "low", Details: fmt.Sprintf("Return %d columns", len(s.Projs))})
+	case *engine.Insert:
+		plan = append(plan, PlanStep{Operation: "INSERT", Object: s.Table, Cost: "low", Details: fmt.Sprintf("Insert %d row(s)", len(s.Rows))})
+	case *engine.Update:
+		plan = append(plan, PlanStep{Operation: "TABLE SCAN", Object: s.Table, Cost: "low"})
+		plan = append(plan, PlanStep{Operation: "UPDATE", Object: s.Table, Cost: "low", Details: fmt.Sprintf("Update %d columns", len(s.Sets))})
+	case *engine.Delete:
+		plan = append(plan, PlanStep{Operation: "TABLE SCAN", Object: s.Table, Cost: "low"})
+		plan = append(plan, PlanStep{Operation: "DELETE", Object: s.Table, Cost: "low"})
+	default:
+		plan = append(plan, PlanStep{Operation: "UNKNOWN", Object: "-", Cost: "-", Details: "Cannot build plan for this statement type"})
+	}
+
+	return jsonResponse(map[string]any{"plan": plan})
+}
+
+// jsListTables returns all table names in the current storage DB tenant.
+func jsListTables(this js.Value, args []js.Value) any {
+	if wasmStorageDB == nil {
+		return jsonResponse(map[string]any{"error": "database not initialized"})
+	}
+	tenant := "default"
+	if len(args) > 0 && args[0].Type() == js.TypeString {
+		tenant = args[0].String()
+	}
+	tables := wasmStorageDB.ListTables(tenant)
+	names := make([]string, 0, len(tables))
+	for _, t := range tables {
+		names = append(names, t.Name)
+	}
+	return jsonResponse(map[string]any{"tables": names})
+}
+
+// jsDescribeTable returns column information for a given table.
+func jsDescribeTable(this js.Value, args []js.Value) any {
+	if wasmStorageDB == nil {
+		return jsonResponse(map[string]any{"error": "database not initialized"})
+	}
+	if len(args) < 1 || args[0].Type() != js.TypeString {
+		return jsonResponse(map[string]any{"error": "table name required"})
+	}
+	tenant := "default"
+	tableName := args[0].String()
+	if len(args) > 1 && args[1].Type() == js.TypeString {
+		tenant = args[1].String()
+	}
+	t, err := wasmStorageDB.Get(tenant, tableName)
+	if err != nil || t == nil {
+		return jsonResponse(map[string]any{"error": fmt.Sprintf("table %s not found", tableName)})
+	}
+	cols := make([]map[string]any, 0, len(t.Cols))
+	for _, c := range t.Cols {
+		cols = append(cols, map[string]any{"name": c.Name, "type": c.Type.String(), "primary": c.Constraint == storage.PrimaryKey})
+	}
+	return jsonResponse(map[string]any{"table": tableName, "columns": cols, "rows": len(t.Rows)})
 }
 
 // jsCommit commits the current transaction
@@ -352,6 +466,8 @@ func convertValue(val any) any {
 		return string(v)
 	case *any:
 		return convertValue(*v)
+	case time.Time:
+		return v.Format(time.RFC3339)
 	default:
 		return v
 	}
@@ -394,6 +510,11 @@ func registerAPI() {
 	api.Set("exec", retain(jsExec))
 	api.Set("query", retain(jsQuery))
 
+	// Explain / schema helpers
+	api.Set("explain", retain(jsExplain))
+	api.Set("listTables", retain(jsListTables))
+	api.Set("describeTable", retain(jsDescribeTable))
+
 	// Register the API globally
 	js.Global().Set("tinySQL", api)
 
@@ -405,7 +526,7 @@ func registerAPI() {
 		detail := js.Global().Get("Object").New()
 		detail.Set("version", "1.0.0")
 		apiArr := js.Global().Get("Array").New()
-		for _, m := range []string{"open", "close", "status", "begin", "commit", "rollback", "exec", "query"} {
+		for _, m := range []string{"open", "close", "status", "begin", "commit", "rollback", "exec", "query", "explain", "listTables", "describeTable"} {
 			apiArr.Call("push", m)
 		}
 		detail.Set("api", apiArr)

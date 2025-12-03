@@ -37,10 +37,29 @@ import (
 //   - file:/path/to/db.gob?tenant=default&autosave=1
 //
 // See parseDSN for all available options.
+var defaultDrv = &drv{}
+
 func init() {
-	sql.Register("tinysql", &drv{})
+	sql.Register("tinysql", defaultDrv)
 	gob.Register(map[string]any{})
 	gob.Register([]any{})
+}
+
+// SetDefaultDB allows external code to provide a storage.DB instance that will
+// be used by the driver when opening connections. This is useful for embedding
+// environments (WASM) that want to keep a reference to the underlying DB.
+func SetDefaultDB(db *storage.DB) {
+	if db == nil {
+		return
+	}
+	// Create a default cfg with sane defaults
+	c := cfg{
+		tenant:      "default",
+		maxReaders:  4,
+		maxWriters:  1,
+		busyTimeout: 250 * time.Millisecond,
+	}
+	defaultDrv.srv = newServer(db, c)
 }
 
 // cfg stores the connection parameters derived from a parsed DSN.
@@ -576,6 +595,8 @@ func (r *rows) Next(dest []driver.Value) error {
 			dest[i] = vv
 		case string:
 			dest[i] = vv
+		case time.Time:
+			dest[i] = vv.Format(time.RFC3339)
 		default:
 			b, _ := json.Marshal(vv)
 			dest[i] = string(b)

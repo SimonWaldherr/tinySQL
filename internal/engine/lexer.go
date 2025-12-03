@@ -105,6 +105,10 @@ func (lx *lexer) nextToken() token {
 	if r == '\'' {
 		return lx.tokenizeString(start)
 	}
+	// double-quoted identifiers (SQL-style) -> treat as identifier preserving case
+	if r == '"' {
+		return lx.tokenizeQuotedIdent(start)
+	}
 	if unicode.IsDigit(r) {
 		return lx.tokenizeNumber(start)
 	}
@@ -131,6 +135,27 @@ func (lx *lexer) tokenizeString(start int) token {
 		val.WriteRune(ch)
 	}
 	return token{Typ: tString, Val: val.String(), Pos: start}
+}
+
+// tokenizeQuotedIdent handles SQL-style double-quoted identifiers.
+// It preserves case and allows embedded double-quotes escaped by doubling ("").
+func (lx *lexer) tokenizeQuotedIdent(start int) token {
+	lx.next() // consume opening double-quote
+	var val strings.Builder
+	for lx.pos < len(lx.s) {
+		ch := lx.next()
+		if ch == '"' {
+			if lx.peek() == '"' {
+				lx.next()
+				val.WriteRune('"')
+				continue
+			}
+			break
+		}
+		val.WriteRune(ch)
+	}
+	// Return as identifier token (preserve original casing)
+	return token{Typ: tIdent, Val: val.String(), Pos: start}
 }
 
 // Helper: tokenize numeric literals
@@ -247,7 +272,14 @@ func isKeyword(up string) bool {
 		"RANDOM", "RAND", "CAST",
 		"SPACE", "ASCII", "CHAR", "CHR", "INITCAP", "SPLIT_PART", "SOUNDEX",
 		"QUOTE", "HEX", "UNHEX",
-		"UUID", "TYPEOF", "VERSION":
+		"UUID", "TYPEOF", "VERSION",
+		"IN_PERIOD", "EXTRACT", "DATE_TRUNC", "EOMONTH", "ADD_MONTHS",
+		"REGEXP_MATCH", "REGEXP_EXTRACT", "REGEXP_REPLACE",
+		"SPLIT", "FIRST", "LAST", "ARRAY_LENGTH", "ARRAY_CONTAINS", "IN_ARRAY",
+		"ARRAY_JOIN", "ARRAY_DISTINCT", "ARRAY_SORT",
+		"ROW_NUMBER", "LAG", "LEAD", "MOVING_SUM", "MOVING_AVG",
+		"MIN_BY", "MAX_BY", "ARG_MIN", "ARG_MAX", "FIRST_VALUE", "LAST_VALUE",
+		"OVER", "PARTITION", "ROWS", "RANGE", "BETWEEN", "UNBOUNDED", "PRECEDING", "FOLLOWING", "CURRENT", "ROW":
 		return true
 	default:
 		return false

@@ -19,3 +19,7 @@ tinyrag
 sqltools
 libtinysql.so
 wasm_browser.test
+main
+cmd/desktop/build
+cmd/studio/build/bin/tinySQL Studio.app
+cmd/studio/build

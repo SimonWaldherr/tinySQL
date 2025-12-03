@@ -29,6 +29,37 @@ import (
 	"time"
 )
 
+// safeGobRegister registers a type with encoding/gob but recovers from the
+// known "registering duplicate names" panic which can occur when the same
+// type is registered via different import paths in a multi-package build
+// (for example when using Wails and building bindings). Ignoring that
+// specific panic is safe for our use-case.
+func safeGobRegister(v any) {
+	defer func() {
+		if r := recover(); r != nil {
+			// If the panic is the duplicate registration panic from gob,
+			// ignore it. Otherwise re-panic to avoid hiding real problems.
+			if errStr, ok := r.(string); ok {
+				if strings.Contains(errStr, "registering duplicate names") {
+					return
+				}
+			}
+			panic(r)
+		}
+	}()
+	gob.Register(v)
+}
+
+func init() {
+	// Register common storage types used in serialized snapshots. Use the
+	// safe register helper to avoid build-time panics when types are
+	// registered multiple times under different package paths.
+	safeGobRegister(diskTable{})
+	safeGobRegister(&diskTable{})
+	safeGobRegister(Table{})
+	safeGobRegister(&Table{})
+}
+
 // ColType enumerates supported column data types.
 type ColType int
 

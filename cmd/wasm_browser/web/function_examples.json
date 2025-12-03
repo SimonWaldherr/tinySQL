@@ -1,0 +1,190 @@
+[
+  {
+    "section": "TYPE CONVERSION AND INTROSPECTION",
+    "examples": [
+      "SELECT CAST('123' AS INTEGER) as string_to_int;\nSELECT CAST(3.14 AS INTEGER) as float_to_int;\nSELECT CAST(42 AS TEXT) as int_to_string;",
+      "SELECT TYPEOF(42) as integer_type;\nSELECT TYPEOF('text') as string_type;\nSELECT TYPEOF(3.14) as float_type;"
+    ]
+  },
+  {
+    "section": "UTILITY FUNCTIONS",
+    "examples": [
+      "SELECT UUID() as unique_id;",
+      "SELECT VERSION() as tinysql_version;"
+    ]
+  },
+  {
+    "section": "Create sample table for window function examples",
+    "examples": [
+      "CREATE TABLE window_demo (\n    product TEXT,\n    category TEXT,\n    sale_date TEXT,\n    amount INT\n);",
+      "INSERT INTO window_demo VALUES ('Laptop', 'Electronics', '2025-01-15', 1200);\nINSERT INTO window_demo VALUES ('Mouse', 'Electronics', '2025-01-20', 25);\nINSERT INTO window_demo VALUES ('Desk', 'Furniture', '2025-01-25', 350);\nINSERT INTO window_demo VALUES ('Keyboard', 'Electronics', '2025-02-10', 75);\nINSERT INTO window_demo VALUES ('Chair', 'Furniture', '2025-02-15', 200);",
+      "SELECT \n    product,\n    amount,\n    ROW_NUMBER() OVER (ORDER BY amount) as row_num\nFROM window_demo\nORDER BY amount;",
+      "SELECT \n    product,\n    category,\n    amount,\n    ROW_NUMBER() OVER (PARTITION BY category ORDER BY amount) as row_in_category\nFROM window_demo\nORDER BY category, amount;",
+      "SELECT \n    product,\n    amount,\n    LAG(amount, 1) OVER (ORDER BY sale_date) as previous_amount\nFROM window_demo\nORDER BY sale_date;",
+      "SELECT \n    product,\n    amount,\n    LAG(amount, 1, 0) OVER (ORDER BY sale_date) as previous_or_zero\nFROM window_demo\nORDER BY sale_date;",
+      "SELECT \n    product,\n    amount,\n    LEAD(amount, 1) OVER (ORDER BY sale_date) as next_amount\nFROM window_demo\nORDER BY sale_date;",
+      "SELECT \n    product,\n    amount,\n    FIRST_VALUE(product) OVER (ORDER BY amount) as cheapest_product\nFROM window_demo\nORDER BY amount;",
+      "SELECT \n    product,\n    category,\n    amount,\n    FIRST_VALUE(product) OVER (PARTITION BY category ORDER BY amount) as cheapest_in_category\nFROM window_demo\nORDER BY category, amount;",
+      "SELECT \n    product,\n    amount,\n    LAST_VALUE(product) OVER (ORDER BY amount) as most_expensive_so_far\nFROM window_demo\nORDER BY amount;",
+      "SELECT \n    product,\n    sale_date,\n    amount,\n    MOVING_SUM(3, amount) OVER (ORDER BY sale_date) as rolling_sum_3days\nFROM window_demo\nORDER BY sale_date;",
+      "SELECT \n    product,\n    sale_date,\n    amount,\n    MOVING_AVG(3, amount) OVER (ORDER BY sale_date) as rolling_avg_3days\nFROM window_demo\nORDER BY sale_date;"
+    ]
+  },
+  {
+    "section": "DATE AND TIME FUNCTIONS",
+    "examples": [
+      "SELECT NOW() as current_timestamp;\nSELECT CURRENT_DATE() as today;\nSELECT CURRENT_TIME() as current_time;",
+      "SELECT YEAR(NOW()) as current_year;\nSELECT MONTH(NOW()) as current_month;\nSELECT DAY(NOW()) as current_day;\nSELECT HOUR(NOW()) as current_hour;\nSELECT MINUTE(NOW()) as current_minute;\nSELECT SECOND(NOW()) as current_second;\nSELECT QUARTER(NOW()) as current_quarter;\nSELECT DAYOFWEEK(NOW()) as day_of_week;\nSELECT DAYOFYEAR(NOW()) as day_of_year;\nSELECT WEEKOFYEAR(NOW()) as week_of_year;"
+    ]
+  },
+  {
+    "section": "NUMERIC FUNCTIONS",
+    "examples": [
+      "SELECT ABS(-42) as absolute_value;\nSELECT SIGN(-15) as sign_of_number;\nSELECT ROUND(3.14159, 2) as rounded;\nSELECT FLOOR(3.7) as floor_value;\nSELECT CEIL(3.2) as ceiling_value;\nSELECT CEILING(3.2) as ceiling_value2;\nSELECT TRUNCATE(3.14159, 2) as truncated;\nSELECT TRUNC(3.14159, 2) as trunc_value;",
+      "SELECT POWER(2, 8) as power_of_two;\nSELECT POW(3, 3) as cube;\nSELECT SQRT(16) as square_root;\nSELECT MOD(17, 5) as modulo;",
+      "SELECT LOG(100) as natural_log;\nSELECT LN(2.71828) as ln_value;\nSELECT LOG10(1000) as log_base_10;\nSELECT LOG2(1024) as log_base_2;\nSELECT EXP(1) as euler_number;",
+      "SELECT PI() as pi_value;\nSELECT SIN(PI() / 2) as sine_90_degrees;\nSELECT COS(0) as cosine_0_degrees;\nSELECT TAN(PI() / 4) as tangent_45_degrees;\nSELECT ASIN(1) as arcsine;\nSELECT ACOS(0) as arccosine;\nSELECT ATAN(1) as arctangent;\nSELECT ATAN2(1, 1) as atan2_value;\nSELECT DEGREES(PI()) as radians_to_degrees;\nSELECT RADIANS(180) as degrees_to_radians;",
+      "SELECT RANDOM() as random_value;\nSELECT RAND() as rand_value;"
+    ]
+  },
+  {
+    "section": "NEW: ARRAY FUNCTIONS",
+    "examples": [
+      "SELECT SPLIT('red,green,blue', ',') as colors;",
+      "SELECT FIRST(SPLIT('alpha,beta,gamma', ',')) as first_element;\nSELECT LAST(SPLIT('alpha,beta,gamma', ',')) as last_element;",
+      "SELECT ARRAY_LENGTH(SPLIT('one,two,three,four', ',')) as array_size;",
+      "SELECT ARRAY_CONTAINS(SPLIT('apple,banana,cherry', ','), 'banana') as has_banana;\nSELECT IN_ARRAY(SPLIT('1,2,3,4,5', ','), '3') as has_three;",
+      "SELECT ARRAY_JOIN(SPLIT('hello,world', ','), ' ') as joined_array;\nSELECT ARRAY_JOIN(SPLIT('a,b,c', ','), ' - ') as joined_with_dash;",
+      "SELECT ARRAY_DISTINCT(SPLIT('a,b,a,c,b,d', ',')) as unique_elements;\nSELECT ARRAY_SORT(SPLIT('zebra,apple,mango,banana', ',')) as sorted_array;"
+    ]
+  },
+  {
+    "section": "CONDITIONAL AND NULL HANDLING",
+    "examples": [
+      "SELECT COALESCE(NULL, NULL, 'default') as first_non_null;\nSELECT NVL(NULL, 'replacement') as nvl_result;\nSELECT IFNULL(NULL, 'value') as ifnull_result;\nSELECT NULLIF(5, 5) as nullif_equal;\nSELECT NULLIF(5, 3) as nullif_different;",
+      "SELECT IF(10 \u003e 5, 'yes', 'no') as if_result;\nSELECT IIF(2 + 2 = 4, 'correct', 'wrong') as iif_result;\nSELECT GREATEST(10, 25, 15, 30) as greatest_value;\nSELECT LEAST(10, 25, 15, 30) as least_value;",
+      "SELECT \n    CASE \n        WHEN 10 \u003e 20 THEN 'impossible'\n        WHEN 10 \u003e 5 THEN 'correct'\n        ELSE 'wrong'\n    END as case_result;"
+    ]
+  },
+  {
+    "section": "Example 1: Date range analysis with period check",
+    "examples": [
+      "SELECT \n    CURRENT_DATE() as today,\n    DATE_TRUNC('MONTH', CURRENT_DATE()) as month_start,\n    EOMONTH(CURRENT_DATE()) as month_end,\n    IN_PERIOD('MTD', CURRENT_DATE()) as is_month_to_date,\n    DATEDIFF('DAYS', DATE_TRUNC('MONTH', CURRENT_DATE()), CURRENT_DATE()) as days_into_month;"
+    ]
+  },
+  {
+    "section": "Example 2: String processing with regex",
+    "examples": [
+      "SELECT \n    REGEXP_EXTRACT('Order #12345', '#(\\d+)') as order_id,\n    UPPER(REGEXP_REPLACE('test@EXAMPLE.com', '@.*', '')) as username,\n    ARRAY_LENGTH(SPLIT('item1,item2,item3', ',')) as item_count;"
+    ]
+  },
+  {
+    "section": "Example 3: Numeric calculations",
+    "examples": [
+      "SELECT \n    ROUND(PI() * POWER(5, 2), 2) as circle_area_r5,\n    DEGREES(ATAN2(3, 4)) as angle_degrees,\n    ABS(SIGN(-42) * 100) as absolute_signed;"
+    ]
+  },
+  {
+    "section": "PRACTICAL USE CASES",
+    "examples": [
+      "SELECT \n    REGEXP_MATCH('user@example.com', '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$') as is_valid_email,\n    SPLIT_PART('user@example.com', '@', 1) as username,\n    SPLIT_PART('user@example.com', '@', 2) as domain;",
+      "SELECT \n    IN_PERIOD('LAST_12_MONTHS', ADD_MONTHS(CURRENT_DATE(), -6)) as in_last_year,\n    IN_PERIOD('CURRENT_QUARTER', CURRENT_DATE()) as in_current_quarter,\n    EXTRACT('QUARTER', CURRENT_DATE()) as current_quarter_number;",
+      "SELECT \n    UPPER(TRIM(REGEXP_REPLACE('  Hello   World  ', '\\s+', ' '))) as normalized_string;",
+      "SELECT \n    ARRAY_LENGTH(SPLIT('red,green,blue,yellow', ',')) as color_count,\n    ARRAY_CONTAINS(SPLIT('red,green,blue', ','), 'green') as has_green,\n    ARRAY_JOIN(ARRAY_SORT(ARRAY_DISTINCT(SPLIT('b,a,c,a,b', ','))), ',') as sorted_unique;",
+      "SELECT \n    ADD_MONTHS(DATE_TRUNC('YEAR', CURRENT_DATE()), 6) as mid_year,\n    EOMONTH(ADD_MONTHS(CURRENT_DATE(), 3), 0) as end_of_quarter,\n    DATEDIFF('DAYS', \n        DATE_TRUNC('YEAR', CURRENT_DATE()), \n        EOMONTH(DATE_TRUNC('YEAR', CURRENT_DATE()), 11)\n    ) as days_in_year;"
+    ]
+  },
+  {
+    "section": "NEW: EXTRACT function (alternative to individual functions)",
+    "examples": [
+      "SELECT EXTRACT('YEAR', NOW()) as year;\nSELECT EXTRACT('MONTH', NOW()) as month;\nSELECT EXTRACT('DAY', NOW()) as day;\nSELECT EXTRACT('QUARTER', NOW()) as quarter;\nSELECT EXTRACT('WEEK', NOW()) as week;\nSELECT EXTRACT('DAYOFWEEK', NOW()) as dow;",
+      "SELECT DATE_ADD(CURRENT_DATE(), 7, 'DAY') as next_week;\nSELECT DATE_SUB(CURRENT_DATE(), 30, 'DAY') as last_month;\nSELECT DATEDIFF('DAYS', '2024-01-01', '2024-12-31') as days_in_2024;",
+      "SELECT ADD_MONTHS(CURRENT_DATE(), 3) as three_months_later;\nSELECT ADD_MONTHS(CURRENT_DATE(), -6) as six_months_ago;",
+      "SELECT DATE_TRUNC('YEAR', NOW()) as start_of_year;\nSELECT DATE_TRUNC('QUARTER', NOW()) as start_of_quarter;\nSELECT DATE_TRUNC('MONTH', NOW()) as start_of_month;\nSELECT DATE_TRUNC('WEEK', NOW()) as start_of_week;\nSELECT DATE_TRUNC('DAY', NOW()) as start_of_day;\nSELECT DATE_TRUNC('HOUR', NOW()) as start_of_hour;",
+      "SELECT EOMONTH(CURRENT_DATE()) as end_of_current_month;\nSELECT EOMONTH(CURRENT_DATE(), 1) as end_of_next_month;\nSELECT EOMONTH(CURRENT_DATE(), -1) as end_of_last_month;",
+      "SELECT IN_PERIOD('TODAY', CURRENT_DATE()) as is_today;\nSELECT IN_PERIOD('YTD', '2024-06-15') as is_year_to_date;\nSELECT IN_PERIOD('MTD', CURRENT_DATE()) as is_month_to_date;\nSELECT IN_PERIOD('QTD', CURRENT_DATE()) as is_quarter_to_date;\nSELECT IN_PERIOD('L12M', DATE_SUB(CURRENT_DATE(), 180, 'DAY')) as is_last_12_months;\nSELECT IN_PERIOD('CURRENT_QUARTER', CURRENT_DATE()) as is_current_quarter;\nSELECT IN_PERIOD('PREVIOUS_QUARTER', DATE_SUB(CURRENT_DATE(), 120, 'DAY')) as was_previous_quarter;\nSELECT IN_PERIOD('CURRENT_YEAR_FULL', CURRENT_DATE()) as is_current_year;",
+      "SELECT STRFTIME('%Y-%m-%d', NOW()) as iso_date;\nSELECT STRFTIME('%d.%m.%Y', NOW()) as german_date;\nSELECT STRFTIME('%A, %B %d, %Y', NOW()) as long_date;\nSELECT DATE(NOW()) as date_only;\nSELECT TIME(NOW()) as time_only;"
+    ]
+  },
+  {
+    "section": "Special string functions",
+    "examples": [
+      "SELECT SPACE(10) as ten_spaces;\nSELECT ASCII('A') as ascii_value;\nSELECT CHAR(65) as char_from_ascii;\nSELECT SOUNDEX('Smith') as soundex_code;\nSELECT QUOTE('It''s a test') as quoted_string;"
+    ]
+  },
+  {
+    "section": "Create a sample table for aggregate examples",
+    "examples": [
+      "CREATE TABLE temp_numbers (group_id INT, value INT);\nINSERT INTO temp_numbers VALUES (1, 10), (1, 20), (1, 30);\nINSERT INTO temp_numbers VALUES (2, 5), (2, 15), (2, 25);  \nINSERT INTO temp_numbers VALUES (3, 100), (3, 200);"
+    ]
+  },
+  {
+    "section": "COUNT",
+    "examples": [
+      "SELECT group_id, COUNT(*) as total_count FROM temp_numbers GROUP BY group_id;\nSELECT group_id, COUNT(value) as non_null_count FROM temp_numbers GROUP BY group_id;",
+      "CREATE TABLE temp_sales (product TEXT, sale_date TEXT, amount INT);\nINSERT INTO temp_sales VALUES ('Laptop', '2025-01-15', 1200);\nINSERT INTO temp_sales VALUES ('Mouse', '2025-03-20', 25);\nINSERT INTO temp_sales VALUES ('Keyboard', '2025-02-10', 75);\nINSERT INTO temp_sales VALUES ('Monitor', '2025-01-05', 350);",
+      "SELECT MIN_BY(product, sale_date) as earliest_product FROM temp_sales;",
+      "SELECT MAX_BY(product, sale_date) as latest_product FROM temp_sales;",
+      "SELECT MIN_BY(product, amount) as cheapest FROM temp_sales;",
+      "SELECT MAX_BY(product, amount) as most_expensive FROM temp_sales;",
+      "SELECT MIN_BY(amount, sale_date) as earliest_amount FROM temp_sales;",
+      "SELECT MAX_BY(amount, sale_date) as latest_amount FROM temp_sales;",
+      "SELECT ARG_MIN(product, amount) as cheapest_via_argmin FROM temp_sales;\nSELECT ARG_MAX(product, amount) as most_expensive_via_argmax FROM temp_sales;",
+      "DROP TABLE temp_sales;\nDROP TABLE temp_numbers;-- ============================================================"
+    ]
+  },
+  {
+    "section": "Example 4: Array operations",
+    "examples": [
+      "SELECT \n    FIRST(ARRAY_SORT(ARRAY_DISTINCT(SPLIT('zebra,apple,zebra,mango', ',')))) as first_sorted_unique,\n    ARRAY_JOIN(ARRAY_SORT(SPLIT('3,1,4,1,5,9', ',')), ' -\u003e ') as sorted_numbers;"
+    ]
+  },
+  {
+    "section": "STRING FUNCTIONS",
+    "examples": [
+      "SELECT UPPER('hello world') as uppercase;\nSELECT LOWER('HELLO WORLD') as lowercase;\nSELECT INITCAP('hello world from tinysql') as title_case;",
+      "SELECT CONCAT('Hello', ' ', 'World') as concatenated;\nSELECT CONCAT_WS(', ', 'Apple', 'Banana', 'Cherry') as joined_with_separator;\nSELECT LENGTH('Hello World') as string_length;\nSELECT CHAR_LENGTH('Hello') as char_length;\nSELECT SUBSTRING('Hello World', 7, 5) as substring_result;\nSELECT SUBSTR('Hello World', 1, 5) as substr_result;\nSELECT LEFT('Hello World', 5) as left_chars;\nSELECT RIGHT('Hello World', 5) as right_chars;\nSELECT REVERSE('Hello') as reversed;\nSELECT REPEAT('Ha', 3) as repeated;",
+      "SELECT TRIM('  Hello  ') as trimmed;\nSELECT LTRIM('  Hello') as left_trimmed;\nSELECT RTRIM('Hello  ') as right_trimmed;",
+      "SELECT LPAD('42', 5, '0') as left_padded;\nSELECT RPAD('42', 5, '0') as right_padded;",
+      "SELECT REPLACE('Hello World', 'World', 'Universe') as replaced;",
+      "SELECT INSTR('Hello World', 'World') as position;\nSELECT LOCATE('World', 'Hello World') as locate_position;",
+      "SELECT PRINTF('Value: %d, Name: %s', 42, 'Test') as formatted;\nSELECT FORMAT('Pi is approximately %.2f', 3.14159) as formatted_number;",
+      "SELECT SPLIT('apple,banana,cherry', ',') as fruit_array;",
+      "SELECT SPLIT_PART('apple,banana,cherry', ',', 2) as second_fruit;"
+    ]
+  },
+  {
+    "section": "NEW: REGEX FUNCTIONS",
+    "examples": [
+      "SELECT REGEXP_MATCH('test@example.com', '.*@.*\\.com') as is_email;\nSELECT REGEXP_MATCH('12345', '^\\d+$') as is_numeric;",
+      "SELECT REGEXP_EXTRACT('Order #12345 processed', '#\\d+') as order_number;\nSELECT REGEXP_EXTRACT('Email: test@example.com', '\\w+@\\w+\\.\\w+') as email;",
+      "SELECT REGEXP_REPLACE('2024-11-27', '-', '/') as date_with_slashes;\nSELECT REGEXP_REPLACE('Hello123World456', '\\d+', 'X') as numbers_replaced;"
+    ]
+  },
+  {
+    "section": "CRYPTOGRAPHIC AND ENCODING FUNCTIONS",
+    "examples": [
+      "SELECT MD5('password') as md5_hash;\nSELECT SHA1('password') as sha1_hash;\nSELECT SHA256('password') as sha256_hash;\nSELECT SHA512('password') as sha512_hash;",
+      "SELECT BASE64('Hello World') as base64_encoded;\nSELECT BASE64_DECODE('SGVsbG8gV29ybGQ=') as base64_decoded;\nSELECT HEX('Hello') as hex_encoded;\nSELECT UNHEX('48656C6C6F') as hex_decoded;"
+    ]
+  },
+  {
+    "section": "Complex example: LAG with PARTITION BY",
+    "examples": [
+      "SELECT \n    product,\n    category,\n    amount,\n    LAG(amount, 1) OVER (PARTITION BY category ORDER BY sale_date) as prev_in_category\nFROM window_demo\nORDER BY category, sale_date;",
+      "DROP TABLE window_demo;"
+    ]
+  },
+  {
+    "section": "Example 5: Conditional logic with dates",
+    "examples": [
+      "SELECT \n    CASE \n        WHEN IN_PERIOD('TODAY', CURRENT_DATE()) THEN 'Today'\n        WHEN IN_PERIOD('MTD', CURRENT_DATE()) THEN 'This Month'\n        WHEN IN_PERIOD('QTD', CURRENT_DATE()) THEN 'This Quarter'\n        WHEN IN_PERIOD('YTD', CURRENT_DATE()) THEN 'This Year'\n        ELSE 'Historical'\n    END as period_classification;"
+    ]
+  },
+  {
+    "section": "Example 6: NULL handling with coalesce chain",
+    "examples": [
+      "SELECT \n    COALESCE(\n        NULL,\n        NULLIF('', ''),\n        REGEXP_EXTRACT('No match here', 'PATTERN'),\n        'Final Default'\n    ) as coalesce_result;"
+    ]
+  }
+]

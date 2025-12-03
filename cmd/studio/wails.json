@@ -1,0 +1,12 @@
+{
+  "name": "tinySQL Studio",
+  "outputfilename": "tinySQL-Studio",
+  "frontend:install": "",
+  "frontend:build": "",
+  "frontend:dev:watcher": "",
+  "frontend:dev:serverUrl": "",
+  "author": {
+    "name": "Simon Waldherr",
+    "email": ""
+  }
+}

@@ -81,7 +81,8 @@ type (
 		Name     string
 		Args     []Expr
 		Star     bool
-		Distinct bool // For COUNT(DISTINCT col)
+		Distinct bool        // For COUNT(DISTINCT col)
+		Over     *OverClause // For window functions
 	}
 	// InExpr represents "expr IN (val1, val2, ...)"
 	InExpr struct {
@@ -241,8 +242,12 @@ type UnionClause struct {
 	Next  *UnionClause // For chaining multiple UNIONs
 }
 
-// FromItem binds a source table and its alias in FROM/JOIN.
-type FromItem struct{ Table, Alias string }
+// FromItem kann eine echte Tabelle oder ein Subselect (Derived Table) sein.
+type FromItem struct {
+	Table    string  // Tabellenname (wenn echte Tabelle)
+	Alias    string  // Alias für Tabelle oder Subselect
+	Subquery *Select // Falls abgeleitete Tabelle: das Select-Statement
+}
 
 // JoinClause holds a JOIN type with the right side and join condition.
 type JoinClause struct {
@@ -262,6 +267,22 @@ type SelectItem struct {
 type OrderItem struct {
 	Col  string
 	Desc bool
+}
+
+// OverClause represents the OVER clause for window functions.
+type OverClause struct {
+	PartitionBy []Expr       // PARTITION BY expressions
+	OrderBy     []OrderItem  // ORDER BY items
+	Frame       *WindowFrame // ROWS/RANGE frame specification
+}
+
+// WindowFrame represents ROWS/RANGE BETWEEN frame specification.
+type WindowFrame struct {
+	Mode       string // "ROWS" or "RANGE"
+	StartType  string // "UNBOUNDED", "CURRENT", or "OFFSET"
+	StartValue int    // Offset value for PRECEDING/FOLLOWING
+	EndType    string // "UNBOUNDED", "CURRENT", or "OFFSET"
+	EndValue   int    // Offset value for PRECEDING/FOLLOWING
 }
 
 // ------------------------------ Parse ------------------------------
@@ -898,9 +919,42 @@ func (p *Parser) parseProjections(sel *Select) error {
 }
 
 func (p *Parser) parseFromClause(sel *Select) error {
-	if err := p.expectKeyword("FROM"); err != nil {
-		return err
+	// FROM is now optional (like MSSQL)
+	if p.cur.Typ != tKeyword || p.cur.Val != "FROM" {
+		// No FROM clause - this is allowed for expressions like SELECT NOW(), SELECT 1+1, etc.
+		return nil
 	}
+
+	p.next() // consume FROM keyword
+
+	// Prüfe auf Subselect: (SELECT ...)
+	if p.cur.Typ == tSymbol && p.cur.Val == "(" {
+		p.next()
+		subSel, err := p.parseSelect()
+		if err != nil {
+			return err
+		}
+		if p.cur.Typ != tSymbol || p.cur.Val != ")" {
+			return p.errf("expected ) after subselect in FROM")
+		}
+		p.next()
+		alias := ""
+		if p.cur.Typ == tKeyword && p.cur.Val == "AS" {
+			p.next()
+			alias = p.parseIdentLike()
+			if alias == "" {
+				return p.errf("expected alias after AS for subselect")
+			}
+		} else if p.cur.Typ == tIdent {
+			alias = p.cur.Val
+			p.next()
+		} else {
+			return p.errf("expected alias for subselect in FROM")
+		}
+		sel.From = FromItem{Subquery: subSel, Alias: alias}
+		return nil
+	}
+	// Normale Tabelle
 	from := p.parseIdentLike()
 	if from == "" {
 		return p.errf("expected table")
@@ -1558,7 +1612,13 @@ func (p *Parser) parsePrimary() (Expr, error) {
 			"RANDOM", "RAND",
 			"SPACE", "ASCII", "CHAR", "CHR", "INITCAP", "SPLIT_PART", "SOUNDEX",
 			"QUOTE", "HEX", "UNHEX",
-			"UUID", "TYPEOF", "VERSION":
+			"UUID", "TYPEOF", "VERSION",
+			"IN_PERIOD", "EXTRACT", "DATE_TRUNC", "EOMONTH", "ADD_MONTHS",
+			"REGEXP_MATCH", "REGEXP_EXTRACT", "REGEXP_REPLACE",
+			"SPLIT", "FIRST", "LAST", "ARRAY_LENGTH", "ARRAY_CONTAINS", "IN_ARRAY",
+			"ARRAY_JOIN", "ARRAY_DISTINCT", "ARRAY_SORT",
+			"ROW_NUMBER", "LAG", "LEAD", "MOVING_SUM", "MOVING_AVG",
+			"MIN_BY", "MAX_BY", "ARG_MIN", "ARG_MAX", "FIRST_VALUE", "LAST_VALUE":
 			return p.parseFuncCall()
 		case "TRUE":
 			p.next()
@@ -1713,5 +1773,192 @@ func (p *Parser) parseFuncCallWithName(name string) (Expr, error) {
 	if err := p.expectSymbol(")"); err != nil {
 		return nil, err
 	}
-	return &FuncCall{Name: name, Args: args, Distinct: distinct}, nil
+
+	// Check for OVER clause (window functions)
+	var overClause *OverClause
+	if p.cur.Typ == tKeyword && p.cur.Val == "OVER" {
+		p.next()
+		oc, err := p.parseOverClause()
+		if err != nil {
+			return nil, err
+		}
+		overClause = oc
+	}
+
+	return &FuncCall{Name: name, Args: args, Distinct: distinct, Over: overClause}, nil
+}
+
+// parseOverClause parses the OVER (PARTITION BY ... ORDER BY ... frame) clause
+func (p *Parser) parseOverClause() (*OverClause, error) {
+	if err := p.expectSymbol("("); err != nil {
+		return nil, err
+	}
+
+	oc := &OverClause{}
+
+	// Parse PARTITION BY clause (optional)
+	if p.cur.Typ == tKeyword && p.cur.Val == "PARTITION" {
+		p.next()
+		if err := p.expectKeyword("BY"); err != nil {
+			return nil, err
+		}
+
+		for {
+			expr, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			oc.PartitionBy = append(oc.PartitionBy, expr)
+
+			if p.cur.Typ == tSymbol && p.cur.Val == "," {
+				p.next()
+				continue
+			}
+			break
+		}
+	}
+
+	// Parse ORDER BY clause (optional)
+	if p.cur.Typ == tKeyword && p.cur.Val == "ORDER" {
+		p.next()
+		if err := p.expectKeyword("BY"); err != nil {
+			return nil, err
+		}
+
+		for {
+			if p.cur.Typ != tIdent && p.cur.Typ != tKeyword {
+				return nil, p.errf("expected column name in ORDER BY")
+			}
+			col := p.cur.Val
+			p.next()
+
+			desc := false
+			if p.cur.Typ == tKeyword && (p.cur.Val == "DESC" || p.cur.Val == "ASC") {
+				if p.cur.Val == "DESC" {
+					desc = true
+				}
+				p.next()
+			}
+
+			oc.OrderBy = append(oc.OrderBy, OrderItem{Col: col, Desc: desc})
+
+			if p.cur.Typ == tSymbol && p.cur.Val == "," {
+				p.next()
+				continue
+			}
+			break
+		}
+	}
+
+	// Parse frame clause (ROWS/RANGE BETWEEN ... AND ...) - optional
+	if p.cur.Typ == tKeyword && (p.cur.Val == "ROWS" || p.cur.Val == "RANGE") {
+		frame, err := p.parseWindowFrame()
+		if err != nil {
+			return nil, err
+		}
+		oc.Frame = frame
+	}
+
+	if err := p.expectSymbol(")"); err != nil {
+		return nil, err
+	}
+
+	return oc, nil
+}
+
+// parseWindowFrame parses ROWS/RANGE BETWEEN ... AND ...
+func (p *Parser) parseWindowFrame() (*WindowFrame, error) {
+	frame := &WindowFrame{}
+
+	// ROWS or RANGE
+	frame.Mode = p.cur.Val
+	p.next()
+
+	// BETWEEN keyword
+	if p.cur.Typ == tKeyword && p.cur.Val == "BETWEEN" {
+		p.next()
+
+		// Parse start bound
+		startType, startValue, err := p.parseFrameBound()
+		if err != nil {
+			return nil, err
+		}
+		frame.StartType = startType
+		frame.StartValue = startValue
+
+		// AND keyword
+		if err := p.expectKeyword("AND"); err != nil {
+			return nil, err
+		}
+
+		// Parse end bound
+		endType, endValue, err := p.parseFrameBound()
+		if err != nil {
+			return nil, err
+		}
+		frame.EndType = endType
+		frame.EndValue = endValue
+	} else {
+		// Simple form: ROWS n PRECEDING, etc.
+		startType, startValue, err := p.parseFrameBound()
+		if err != nil {
+			return nil, err
+		}
+		frame.StartType = startType
+		frame.StartValue = startValue
+		frame.EndType = "CURRENT"
+		frame.EndValue = 0
+	}
+
+	return frame, nil
+}
+
+// parseFrameBound parses a single frame bound: UNBOUNDED PRECEDING/FOLLOWING, CURRENT ROW, n PRECEDING/FOLLOWING
+func (p *Parser) parseFrameBound() (string, int, error) {
+	if p.cur.Typ == tKeyword && p.cur.Val == "UNBOUNDED" {
+		p.next()
+		if p.cur.Typ != tKeyword || (p.cur.Val != "PRECEDING" && p.cur.Val != "FOLLOWING") {
+			return "", 0, p.errf("expected PRECEDING or FOLLOWING after UNBOUNDED")
+		}
+		direction := p.cur.Val
+		p.next()
+		if direction == "PRECEDING" {
+			return "UNBOUNDED_PRECEDING", 0, nil
+		}
+		return "UNBOUNDED_FOLLOWING", 0, nil
+	}
+
+	if p.cur.Typ == tKeyword && p.cur.Val == "CURRENT" {
+		p.next()
+		if p.cur.Typ == tKeyword && p.cur.Val == "ROW" {
+			p.next()
+		}
+		return "CURRENT", 0, nil
+	}
+
+	// n PRECEDING/FOLLOWING
+	if p.cur.Typ == tNumber {
+		value := p.cur.Val
+		p.next()
+
+		// Parse the value as integer
+		var n int
+		if _, err := fmt.Sscanf(value, "%d", &n); err != nil {
+			return "", 0, p.errf("invalid frame offset: %s", value)
+		}
+
+		if p.cur.Typ != tKeyword || (p.cur.Val != "PRECEDING" && p.cur.Val != "FOLLOWING") {
+			return "", 0, p.errf("expected PRECEDING or FOLLOWING after offset")
+		}
+
+		direction := p.cur.Val
+		p.next()
+
+		if direction == "PRECEDING" {
+			return "OFFSET_PRECEDING", n, nil
+		}
+		return "OFFSET_FOLLOWING", n, nil
+	}
+
+	return "", 0, p.errf("invalid frame bound")
 }

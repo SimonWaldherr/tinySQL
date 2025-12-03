@@ -282,25 +282,33 @@
   <header>
     <div class="header-content">
       <div class="logo">tinySQL – WASM Demo</div>
-      <div id="status-indicator" class="status-indicator disconnected">
-        <div class="status-dot" style="background: var(--error-color);"></div>
-        Initialisiere WASM...
+      <div style="display: flex; gap: 1rem; align-items: center;">
+        <a href="reference.html" id="refLink" style="text-decoration: none; color: var(--primary-color); font-weight: 500; padding: 0.5rem 1rem; background: white; border-radius: 4px; border: 1px solid var(--primary-color);" data-i18n="refLink">
+          📚 Function Reference
+        </a>
+        <select id="langSelectMain" aria-label="Language" style="padding:0.25rem;border-radius:4px;border:1px solid var(--border-color);background:white;color:var(--text-primary);">
+          <option value="de">DE</option>
+          <option value="en">EN</option>
+        </select>
+        <div id="status-indicator" class="status-indicator disconnected">
+          <div class="status-dot" style="background: var(--error-color);"></div>
+          <span id="statusText">Initialisiere WASM...</span>
+        </div>
       </div>
     </div>
   </header>
 
   <main>
     <div class="card">
-      <div class="card-header">Database Information</div>
+      <div class="card-header" data-i18n="dbInfo">Database Information</div>
       <div class="card-content">
-        <p>Diese Demo lädt tinySQL als WebAssembly-Modul und führt es komplett im Browser aus.</p>
+        <p data-i18n="demoDesc">Diese Demo lädt tinySQL als WebAssembly-Modul und führt es komplett im Browser aus.</p>
         <div class="info-message">
-          <strong>Hinweis:</strong> Die Datenbank läuft im Arbeitsspeicher (DSN: <code>mem://?tenant=default</code>).
-          Daten gehen beim Neuladen der Seite verloren.
+          <strong data-i18n="note">Hinweis:</strong> <span data-i18n="demoNote">Die Datenbank läuft im Arbeitsspeicher (DSN: <code>mem://?tenant=default</code>). Daten gehen beim Neuladen der Seite verloren.</span>
         </div>
         
         <div class="button-row">
-          <button id="btn-connect" class="btn btn-primary">🔌 Verbinden</button>
+          <button id="btn-connect" class="btn btn-primary">🔌 <span data-i18n="connect">Verbinden</span></button>
           <button id="btn-status" class="btn btn-secondary" disabled>📊 Status</button>
           <button id="btn-disconnect" class="btn btn-warning" disabled>🔌 Trennen</button>
         </div>
@@ -380,18 +388,33 @@ SELECT * FROM users;"></textarea>
               <option value="union_example">UNION: Kombinierte Ergebnisse</option>
             </optgroup>
           </select>
-          <button id="btn-init-demo" class="btn btn-secondary" disabled>🎯 Demo-Daten laden</button>
+          <button id="btn-init-demo" class="btn btn-secondary" disabled>🎯 <span data-i18n="loadDemo">Demo-Daten laden</span></button>
         </div>
         
         <div class="button-row">
-          <button id="btn-exec" class="btn btn-primary" disabled>⚡ Execute</button>
-          <button id="btn-query" class="btn btn-primary" disabled>🔍 Query</button>
-          <button id="btn-clear" class="btn btn-secondary">🗑️ Clear</button>
+          <button id="btn-exec" class="btn btn-primary" disabled>⚡ <span data-i18n="exec">Execute</span></button>
+          <button id="btn-query" class="btn btn-primary" disabled>🔍 <span data-i18n="query">Query</span></button>
+          <button id="btn-clear" class="btn btn-secondary">🗑️ <span data-i18n="clear">Clear</span></button>
         </div>
         
         <div id="result-container" class="result-container"></div>
       </div>
     </div>
+
+  <script>
+    // Execute Query on Ctrl/Cmd+Enter in SQL editor
+    (function(){
+      const editor = document.getElementById('sql-editor');
+      const queryBtn = document.getElementById('btn-query');
+      if (!editor || !queryBtn) return;
+      editor.addEventListener('keydown', (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+          e.preventDefault();
+          if (!queryBtn.disabled) queryBtn.click();
+        }
+      });
+    })();
+  </script>
   </main>
 
   <script src="wasm_exec.js"></script>
@@ -478,6 +501,61 @@ SELECT * FROM users;"></textarea>
       statusIndicator.className = `status-indicator ${type}`;
       statusDot.style.background = type === 'connected' ? 'var(--success-color)' : 'var(--error-color)';
     }
+
+    // i18n map
+    const i18nMain = {
+      en: {
+        refLink: 'Function Reference',
+        statusInitializing: 'Loading WASM...',
+        connected: 'Connected',
+        disconnected: 'Disconnected',
+        connect: 'Connect',
+        loadDemo: 'Load Demo Data',
+        exec: 'Execute',
+        query: 'Query',
+        clear: 'Clear',
+        dbInfo: 'Database Information',
+        demoDesc: 'This demo loads tinySQL as a WebAssembly module and runs entirely in the browser.',
+        note: 'Note:',
+        demoNote: 'The database runs in memory (DSN: mem://?tenant=default). Data is lost when the page reloads.'
+      },
+      de: {
+        refLink: '📚 Function Reference',
+        statusInitializing: 'Initialisiere WASM...',
+        connected: 'Verbunden',
+        disconnected: 'Nicht verbunden',
+        connect: 'Verbinden',
+        loadDemo: 'Demo-Daten laden',
+        exec: 'Execute',
+        query: 'Query',
+        clear: 'Clear',
+        dbInfo: 'Database Information',
+        demoDesc: 'Diese Demo lädt tinySQL als WebAssembly-Modul und führt es komplett im Browser aus.',
+        note: 'Hinweis:',
+        demoNote: 'Die Datenbank läuft im Arbeitsspeicher (DSN: mem://?tenant=default). Daten gehen beim Neuladen der Seite verloren.'
+      }
+    };
+
+    function setMainLanguage(lang) {
+      const m = i18nMain[lang] || i18nMain.de;
+      document.getElementById('refLink').textContent = m.refLink;
+      document.getElementById('statusText').textContent = m.statusInitializing;
+      document.querySelector('[data-i18n="dbInfo"]').textContent = m.dbInfo;
+      document.querySelector('[data-i18n="demoDesc"]').textContent = m.demoDesc;
+      document.querySelector('[data-i18n="note"]').textContent = m.note;
+      document.querySelector('[data-i18n="demoNote"]').textContent = m.demoNote;
+      document.querySelector('[data-i18n="connect"]').textContent = m.connect;
+      document.querySelector('[data-i18n="loadDemo"]').textContent = m.loadDemo;
+      document.querySelector('[data-i18n="exec"]').textContent = m.exec;
+      document.querySelector('[data-i18n="query"]').textContent = m.query;
+      document.querySelector('[data-i18n="clear"]').textContent = m.clear;
+    }
+
+    document.getElementById('langSelectMain').addEventListener('change', (e) => setMainLanguage(e.target.value));
+    // initialize
+    const mainLang = (navigator.language || 'de').startsWith('en') ? 'en' : 'de';
+    document.getElementById('langSelectMain').value = mainLang;
+    setMainLanguage(mainLang);
 
     function updateButtons() {
       const connected = dbConnected;

@@ -219,6 +219,88 @@ func TestFeatureSupport(t *testing.T) {
 			}
 		}
 	})
+       t.Run("GROUP_BY_ORDER_BY", func(t *testing.T) {
+	       p := engine.NewParser(`SELECT name, COUNT(*) as rows FROM test_table GROUP BY name ORDER BY COUNT(*) DESC`)
+	       st, err := p.ParseStatement()
+	       if err != nil {
+		       t.Fatalf("Failed to parse GROUP BY/ORDER BY query: %v", err)
+	       }
+	       rs, err := engine.Execute(ctx, db, "default", st)
+	       if err != nil {
+		       t.Fatalf("Failed to execute GROUP BY/ORDER BY query: %v", err)
+	       }
+	       if len(rs.Rows) == 0 {
+		       t.Fatalf("Expected grouped rows, got 0")
+	       }
+		       // Check that result is sorted descending by count (int or int64)
+		       var lastInt, lastInt64 any
+		       lastInt = int(1 << 30)
+		       lastInt64 = int64(1 << 62)
+		       for _, row := range rs.Rows {
+			       v, ok := row["rows"]
+			       if !ok {
+				       t.Fatalf("Missing 'rows' column in result")
+			       }
+			       switch cnt := v.(type) {
+			       case int:
+				       if cnt > lastInt.(int) {
+					       t.Fatalf("Result not sorted descending: %d > %d", cnt, lastInt)
+				       }
+				       lastInt = cnt
+			       case int64:
+				       if cnt > lastInt64.(int64) {
+					       t.Fatalf("Result not sorted descending: %d > %d", cnt, lastInt64)
+				       }
+				       lastInt64 = cnt
+			       default:
+				       t.Fatalf("'rows' column is not int or int64: %T", v)
+			       }
+		       }
+       })
+
+       t.Run("SUBSELECT_GROUP_BY_ORDER_BY", func(t *testing.T) {
+	       p := engine.NewParser(`SELECT * FROM (SELECT name, COUNT(*) as rows FROM test_table GROUP BY name) x ORDER BY rows DESC`)
+	       st, err := p.ParseStatement()
+	       if err != nil {
+		       t.Fatalf("Failed to parse subselect GROUP BY/ORDER BY query: %v", err)
+	       }
+	       rs, err := engine.Execute(ctx, db, "default", st)
+	       if err != nil {
+		       t.Fatalf("Failed to execute subselect GROUP BY/ORDER BY query: %v", err)
+	       }
+	       if len(rs.Rows) == 0 {
+		       t.Fatalf("Expected grouped rows from subselect, got 0")
+	       }
+		       // Debug: log available columns/keys in the subselect result
+		       t.Logf("subselect result cols: %v", rs.Cols)
+		       if len(rs.Rows) > 0 {
+			       t.Logf("subselect first row keys: %v", rs.Rows[0])
+		       }
+		       // Check that result is sorted descending by rows (int or int64)
+		       var lastInt, lastInt64 any
+		       lastInt = int(1 << 30)
+		       lastInt64 = int64(1 << 62)
+		       for _, row := range rs.Rows {
+			       v, ok := row["rows"]
+			       if !ok {
+				       t.Fatalf("Missing 'rows' column in subselect result")
+			       }
+			       switch cnt := v.(type) {
+			       case int:
+				       if cnt > lastInt.(int) {
+					       t.Fatalf("Subselect result not sorted descending: %d > %d", cnt, lastInt)
+				       }
+				       lastInt = cnt
+			       case int64:
+				       if cnt > lastInt64.(int64) {
+					       t.Fatalf("Subselect result not sorted descending: %d > %d", cnt, lastInt64)
+				       }
+				       lastInt64 = cnt
+			       default:
+				       t.Fatalf("'rows' column is not int or int64: %T", v)
+			       }
+		       }
+       })
 }
 
 // TestDropTable tests the DROP TABLE functionality

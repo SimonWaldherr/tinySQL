@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>tinySQL Studio</title>
+    <link rel="stylesheet" href="style.css">
+    <script>
+        // Temporary queued stub for `studio` so inline onclick handlers don't crash
+        // if the ES module hasn't attached the real `studio` object yet.
+        (function(){
+            if (window.studio) return;
+            const q = [];
+            window.__studio_queue = q;
+            window.studio = new Proxy({}, {
+                get(_, name){
+                    if (name === '__isStub') return true;
+                    return function(...args){ q.push([name, args]); };
+                }
+            });
+        })();
+    </script>
+</head>
+<body>
+    <div class="studio-container" id="studioContainer">
+        <!-- Top Menu Bar -->
+        <div class="menu-bar">
+            <div class="menu-group">
+                <button class="menu-btn" onclick="studio.loadDatabase()">📂 Load Database</button>
+                <button class="menu-btn" onclick="studio.saveDatabase()">💾 Save Database</button>
+                <button class="menu-btn" onclick="studio.importFile()">📥 Import File</button>
+                <button class="menu-btn" onclick="studio.newQuery()">➕ New Query</button>
+                <button class="menu-btn" onclick="studio.clearDatabase()">🗑️ Clear All</button>
+            </div>
+            <div class="menu-group">
+                <button class="menu-btn" onclick="studio.executeQuery()">▶ Execute (F5)</button>
+                <button class="menu-btn" onclick="studio.executeSelection()">▶ Execute Selection</button>
+                <button class="menu-btn" onclick="studio.formatQuery()">✨ Format SQL</button>
+            </div>
+            <div class="menu-group">
+                <button class="menu-btn" onclick="studio.toggleTheme()">🎨 Theme</button>
+                <button class="menu-btn" onclick="studio.showHelp()">❓ Help</button>
+            </div>
+        </div>
+
+        <!-- Main Layout -->
+        <div class="main-layout">
+            <!-- Object Explorer (Left Panel) -->
+            <div class="object-explorer">
+                <div class="panel-header">
+                    <h3>Object Explorer</h3>
+                    <button class="refresh-btn" onclick="studio.refreshObjectExplorer()">🔄</button>
+                </div>
+                <div class="tree-view" id="objectExplorer">
+                    <div class="tree-node">
+                        <div class="tree-node-header" onclick="studio.toggleTreeNode(this)">
+                            <span class="tree-icon">▶</span>
+                            <span class="tree-label">📁 Tables</span>
+                        </div>
+                        <div class="tree-node-children" id="tablesTree"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Side: Query Editor + Results -->
+            <div class="editor-results-container">
+                <!-- Query Editor Tabs -->
+                <div class="query-tabs">
+                    <div class="tab-bar" id="tabBar">
+                        <div class="tab active" data-tab-id="0">
+                            <span class="tab-title">Query 1</span>
+                            <span class="tab-close" onclick="studio.closeTab(event, 0)">×</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Query Editor Area -->
+                <div class="query-editor-area"></div>
+
+                <!-- Results Panel (Bottom) -->
+                <div class="results-panel">
+                    <div class="results-tabs">
+                        <button class="results-tab active" onclick="studio.switchResultsTab('results')">Results</button>
+                        <button class="results-tab" onclick="studio.switchResultsTab('messages')">Messages</button>
+                    </div>
+                    <div class="results-content">
+                        <div class="results-view active" id="resultsView">
+                            <div class="no-results">No results. Execute a query to see results here.</div>
+                        </div>
+                        <div class="results-view" id="messagesView">
+                            <div class="messages-content"></div>
+                        </div>
+                    </div>
+                    <div class="status-bar">
+                        <span id="statusText">Ready</span>
+                        <span id="rowCount"></span>
+                        <span id="executionTime"></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Drag & Drop Overlay -->
+    <div class="drop-overlay" id="dropOverlay">
+        <div class="drop-overlay-content">
+            <div class="drop-icon">📥</div>
+            <div class="drop-text">Drop files here to import</div>
+            <div class="drop-hint">Supports CSV, JSON, SQL files</div>
+        </div>
+    </div>
+
+    <!-- Help Modal -->
+    <div class="modal" id="helpModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>tinySQL Studio - Help</h2>
+                <button class="modal-close" onclick="studio.closeModal('helpModal')">×</button>
+            </div>
+            <div class="modal-body">
+                <h3>Keyboard Shortcuts</h3>
+                <ul class="help-list">
+                    <li><kbd>F5</kbd> - Execute query</li>
+                    <li><kbd>Ctrl+N</kbd> - New query tab</li>
+                    <li><kbd>Ctrl+S</kbd> - Save database</li>
+                    <li><kbd>Ctrl+W</kbd> - Close current tab</li>
+                    <li><kbd>Ctrl+Tab</kbd> - Switch to next tab</li>
+                </ul>
+                <h3>Drag & Drop</h3>
+                <p>Drag CSV, JSON, or SQL files anywhere in the window to import them automatically.</p>
+                <h3>Object Explorer</h3>
+                <p>Click on a table to expand and see columns. Right-click for quick actions:</p>
+                <ul class="help-list">
+                    <li>Preview - Shows first 100 rows</li>
+                    <li>SELECT - Inserts SELECT statement into editor</li>
+                </ul>
+                <h3>SQL Functions</h3>
+                <p>tinySQL supports standard SQL plus extended functions like MINMAX_BY, window functions, and more.</p>
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="/wailsjs/go/main/App.js"></script>
+    <!-- Monaco Editor loader (uses CDN). Falls back to textarea if blocked. -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.40.0/min/vs/loader.min.js"></script>
+    <script>
+        // Configure monaco loader to use CDN path
+        if (window.require && !window.monaco) {
+            try {
+                require.config({ paths: { 'vs': 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.40.0/min/vs' } });
+                require(['vs/editor/editor.main'], function() {
+                    console.log('Monaco loaded');
+                });
+            } catch (e) {
+                console.warn('Monaco loader failed, falling back to textarea editors', e);
+            }
+        }
+    </script>
+    <script type="module" src="studio.js"></script>
+</body>
+</html>
