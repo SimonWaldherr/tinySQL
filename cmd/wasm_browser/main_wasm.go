@@ -11,10 +11,10 @@ import (
 	"syscall/js"
 	"time"
 
-	drv "github.com/SimonWaldherr/tinySQL/internal/driver"
-	"github.com/SimonWaldherr/tinySQL/internal/storage"
-	"github.com/SimonWaldherr/tinySQL/internal/engine"
 	tsql "github.com/SimonWaldherr/tinySQL"
+	drv "github.com/SimonWaldherr/tinySQL/internal/driver"
+	"github.com/SimonWaldherr/tinySQL/internal/engine"
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 // Global state

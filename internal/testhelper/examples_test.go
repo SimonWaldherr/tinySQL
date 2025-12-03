@@ -24,9 +24,9 @@ type examplesFile struct {
 	} `yaml:"tables"`
 
 	Queries []struct {
-		ID          string                   `yaml:"id"`
-		Description string                   `yaml:"description"`
-		SQL         string                   `yaml:"sql"`
+		ID          string `yaml:"id"`
+		Description string `yaml:"description"`
+		SQL         string `yaml:"sql"`
 		Expected    struct {
 			Cols []string                 `yaml:"cols"`
 			Rows []map[string]interface{} `yaml:"rows"`

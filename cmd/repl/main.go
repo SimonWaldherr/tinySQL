@@ -48,12 +48,12 @@ func runREPL(db *sql.DB, echo bool, format string) {
 			return
 		}
 		line := strings.TrimSpace(sc.Text())
-		
+
 		// Skip pure comment lines
 		if line == "" || strings.HasPrefix(line, "--") || strings.HasPrefix(line, "/*") {
 			continue
 		}
-		
+
 		if buf.Len() == 0 && strings.HasPrefix(line, ".") {
 			if handleMeta(db, line) {
 				continue
@@ -126,7 +126,7 @@ func printRows(rows *sql.Rows, cols []string, format string) {
 		}
 		out = append(out, m)
 	}
-	
+
 	switch strings.ToLower(format) {
 	case "json":
 		printJSON(out)
@@ -271,7 +271,7 @@ func printCSV(out []map[string]any, cols []string) {
 		}
 	}
 	fmt.Println()
-	
+
 	// Rows
 	for _, r := range out {
 		for i, c := range cols {
@@ -299,7 +299,7 @@ func printTSV(out []map[string]any, cols []string) {
 		fmt.Print(c)
 	}
 	fmt.Println()
-	
+
 	// Rows
 	for _, r := range out {
 		for i, c := range cols {
@@ -325,7 +325,7 @@ func printMarkdown(out []map[string]any, cols []string) {
 			}
 		}
 	}
-	
+
 	// Header
 	fmt.Print("|")
 	for i, c := range cols {
@@ -334,7 +334,7 @@ func printMarkdown(out []map[string]any, cols []string) {
 		fmt.Print(" |")
 	}
 	fmt.Println()
-	
+
 	// Separator
 	fmt.Print("|")
 	for i := range cols {
@@ -342,7 +342,7 @@ func printMarkdown(out []map[string]any, cols []string) {
 		fmt.Print("|")
 	}
 	fmt.Println()
-	
+
 	// Rows
 	for _, r := range out {
 		fmt.Print("|")
@@ -354,4 +354,3 @@ func printMarkdown(out []map[string]any, cols []string) {
 		fmt.Println()
 	}
 }
-

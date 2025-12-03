@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
+	tinysql "github.com/SimonWaldherr/tinySQL"
 	drv "github.com/SimonWaldherr/tinySQL/internal/driver"
 	wailsrt "github.com/wailsapp/wails/v2/pkg/runtime"
-	tinysql "github.com/SimonWaldherr/tinySQL"
 )
 
 // App struct
@@ -31,12 +31,12 @@ func NewApp() *App {
 // startup is called when the app starts
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
-	
+
 	// Initialize tinySQL with in-memory database
 	native := tinysql.NewDB()
 	a.nativeDB = native
 	drv.SetDefaultDB(native)
-	
+
 	var err error
 	a.db, err = sql.Open("tinysql", "mem://?tenant=default")
 	if err != nil {
@@ -52,19 +52,19 @@ func (a *App) shutdown(ctx context.Context) {
 
 // QueryResult represents the result of a SQL query
 type QueryResult struct {
-	Columns []string      `json:"columns"`
-	Rows    [][]any       `json:"rows"`
-	Error   string        `json:"error,omitempty"`
-	Message string        `json:"message,omitempty"`
-	Count   int           `json:"count"`
-	Elapsed int64         `json:"elapsed_ms"`
+	Columns []string `json:"columns"`
+	Rows    [][]any  `json:"rows"`
+	Error   string   `json:"error,omitempty"`
+	Message string   `json:"message,omitempty"`
+	Count   int      `json:"count"`
+	Elapsed int64    `json:"elapsed_ms"`
 }
 
 // TableInfo contains metadata about a table
 type TableInfo struct {
-	Name    string       `json:"name"`
-	Columns []ColumnInfo `json:"columns"`
-	RowCount int         `json:"rowCount"`
+	Name     string       `json:"name"`
+	Columns  []ColumnInfo `json:"columns"`
+	RowCount int          `json:"rowCount"`
 }
 
 // ColumnInfo contains metadata about a column
@@ -76,7 +76,7 @@ type ColumnInfo struct {
 // ExecuteQuery executes a SQL query and returns the result
 func (a *App) ExecuteQuery(sqlStr string) QueryResult {
 	start := time.Now()
-	
+
 	if a.db == nil {
 		return QueryResult{Error: "Database not initialized"}
 	}
@@ -100,21 +100,21 @@ func (a *App) ExecuteQuery(sqlStr string) QueryResult {
 
 	resultRows := make([][]any, 0)
 	colCount := len(columns)
-	
+
 	for rows.Next() {
 		values := make([]interface{}, colCount)
 		valuePtrs := make([]interface{}, colCount)
 		for i := range values {
 			valuePtrs[i] = &values[i]
 		}
-		
+
 		if err := rows.Scan(valuePtrs...); err != nil {
 			return QueryResult{
 				Error:   err.Error(),
 				Elapsed: time.Since(start).Milliseconds(),
 			}
 		}
-		
+
 		resultRows = append(resultRows, values)
 	}
 
@@ -132,7 +132,7 @@ func (a *App) ExecuteStatement(sqlStr string) QueryResult {
 	if a.db == nil {
 		return QueryResult{Error: "Database not initialized"}
 	}
-	
+
 	res, err := a.db.ExecContext(a.ctx, sqlStr)
 	if err != nil {
 		return QueryResult{
@@ -140,9 +140,9 @@ func (a *App) ExecuteStatement(sqlStr string) QueryResult {
 			Elapsed: time.Since(start).Milliseconds(),
 		}
 	}
-	
+
 	rowsAffected, _ := res.RowsAffected()
-	
+
 	return QueryResult{
 		Message: fmt.Sprintf("Success. Rows affected: %d", rowsAffected),
 		Count:   int(rowsAffected),
@@ -306,12 +306,12 @@ func (a *App) GetTableInfo(tableName string) TableInfo {
 	if a.nativeDB == nil {
 		return TableInfo{}
 	}
-	
+
 	table, _ := a.nativeDB.Get(a.tenant, tableName)
 	if table == nil {
 		return TableInfo{}
 	}
-	
+
 	cols := make([]ColumnInfo, len(table.Cols))
 	for i, col := range table.Cols {
 		cols[i] = ColumnInfo{
@@ -319,7 +319,7 @@ func (a *App) GetTableInfo(tableName string) TableInfo {
 			Type: col.Type.String(),
 		}
 	}
-	
+
 	return TableInfo{
 		Name:     table.Name,
 		Columns:  cols,
@@ -335,7 +335,7 @@ func (a *App) SaveDatabaseToFile() (string, error) {
 	if a.nativeDB == nil {
 		return "", fmt.Errorf("no database to save")
 	}
-	
+
 	path, err := wailsrt.SaveFileDialog(a.ctx, wailsrt.SaveDialogOptions{
 		Title:           "Save Database",
 		DefaultFilename: "database.gob",
@@ -346,12 +346,12 @@ func (a *App) SaveDatabaseToFile() (string, error) {
 	if path == "" {
 		return "", nil // User cancelled
 	}
-	
+
 	err = tinysql.SaveToFile(a.nativeDB, path)
 	if err != nil {
 		return "", err
 	}
-	
+
 	return path, nil
 }
 
@@ -360,7 +360,7 @@ func (a *App) LoadDatabaseFromFile() (string, error) {
 	if a.ctx == nil {
 		return "", fmt.Errorf("application context not available")
 	}
-	
+
 	path, err := wailsrt.OpenFileDialog(a.ctx, wailsrt.OpenDialogOptions{
 		Title: "Load Database",
 	})
@@ -370,15 +370,15 @@ func (a *App) LoadDatabaseFromFile() (string, error) {
 	if path == "" {
 		return "", nil // User cancelled
 	}
-	
+
 	db, err := tinysql.LoadFromFile(path)
 	if err != nil {
 		return "", err
 	}
-	
+
 	a.nativeDB = db
 	drv.SetDefaultDB(db)
-	
+
 	// Reconnect SQL driver
 	if a.db != nil {
 		a.db.Close()
@@ -387,65 +387,65 @@ func (a *App) LoadDatabaseFromFile() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	
+
 	return path, nil
 }
 
 // ExportTableToCSV exports a table to CSV format
 func (a *App) ExportTableToCSV(tableName string) (string, error) {
 	path, err := wailsrt.SaveFileDialog(a.ctx, wailsrt.SaveDialogOptions{
-		Title: "Export Table to CSV",
+		Title:           "Export Table to CSV",
 		DefaultFilename: tableName + ".csv",
 		Filters: []wailsrt.FileFilter{
 			{DisplayName: "CSV Files (*.csv)", Pattern: "*.csv"},
 		},
 	})
-	
+
 	if err != nil || path == "" {
 		return "", err
 	}
-	
+
 	// Query all data from table
 	rows, err := a.db.Query(fmt.Sprintf("SELECT * FROM %s", tableName))
 	if err != nil {
 		return "", err
 	}
 	defer rows.Close()
-	
+
 	// Get column names
 	cols, err := rows.Columns()
 	if err != nil {
 		return "", err
 	}
-	
+
 	// Create CSV file
 	file, err := os.Create(path)
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
-	
+
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
-	
+
 	// Write header
 	if err := writer.Write(cols); err != nil {
 		return "", err
 	}
-	
+
 	// Write rows
 	values := make([]interface{}, len(cols))
 	valuePtrs := make([]interface{}, len(cols))
 	for i := range values {
 		valuePtrs[i] = &values[i]
 	}
-	
+
 	rowCount := 0
 	for rows.Next() {
 		if err := rows.Scan(valuePtrs...); err != nil {
 			return "", err
 		}
-		
+
 		record := make([]string, len(cols))
 		for i, v := range values {
 			if v == nil {
@@ -454,12 +454,12 @@ func (a *App) ExportTableToCSV(tableName string) (string, error) {
 				record[i] = fmt.Sprintf("%v", v)
 			}
 		}
-		
+
 		if err := writer.Write(record); err != nil {
 			return "", err
 		}
 		rowCount++
 	}
-	
+
 	return fmt.Sprintf("Exported %d rows to %s", rowCount, path), nil
 }

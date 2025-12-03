@@ -803,11 +803,11 @@ func evalArgMaxFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 func getExtendedFunctions() map[string]funcHandler {
 	return map[string]funcHandler{
 		// New date functions
-		"IN_PERIOD":      evalInPeriodFunc,
-		"EXTRACT":        evalExtractFunc,
-		"DATE_TRUNC":     evalDateTruncFunc,
-		"EOMONTH":        evalEOMonthFunc,
-		"ADD_MONTHS":     evalAddMonthsFunc,
+		"IN_PERIOD":  evalInPeriodFunc,
+		"EXTRACT":    evalExtractFunc,
+		"DATE_TRUNC": evalDateTruncFunc,
+		"EOMONTH":    evalEOMonthFunc,
+		"ADD_MONTHS": evalAddMonthsFunc,
 		// Regex functions
 		"REGEXP_MATCH":   evalRegexpMatchFunc,
 		"REGEXP_EXTRACT": evalRegexpExtractFunc,
@@ -823,11 +823,11 @@ func getExtendedFunctions() map[string]funcHandler {
 		"ARRAY_DISTINCT": evalArrayDistinctFunc,
 		"ARRAY_SORT":     evalArraySortFunc,
 		// Window functions (basic stubs for now)
-		"ROW_NUMBER":  evalRowNumberFunc,
-		"LAG":         evalLagFunc,
-		"LEAD":        evalLeadFunc,
-		"MOVING_SUM":  evalMovingSumFunc,
-		"MOVING_AVG":  evalMovingAvgFunc,
+		"ROW_NUMBER": evalRowNumberFunc,
+		"LAG":        evalLagFunc,
+		"LEAD":       evalLeadFunc,
+		"MOVING_SUM": evalMovingSumFunc,
+		"MOVING_AVG": evalMovingAvgFunc,
 		// Value at MIN/MAX functions
 		"MIN_BY":      evalMinByFunc,
 		"MAX_BY":      evalMaxByFunc,
