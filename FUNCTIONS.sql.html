@@ -1,0 +1,2962 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>tinySQL - Function Examples</title>
+	<style>
+		:root{
+			--bg:#f3f4f6;--card:#ffffff;--text:#0f172a;--muted:#6b7280;--accent:#0b69ff;
+			--border:#e6eef8;--codebg:#f8fafc;
+		}
+		@media (prefers-color-scheme: dark){
+			:root{--bg:#0b0f19;--card:#0f172a;--text:#e5e7eb;--muted:#94a3b8;--accent:#60a5fa;--border:#1f2a44;--codebg:#0b1220;}
+		}
+		body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--text);padding:28px}
+		.container{max-width:1100px;margin:0 auto}
+		.topbar{position:sticky;top:14px;z-index:5;background:color-mix(in srgb, var(--bg) 70%, transparent);backdrop-filter:blur(10px);
+			border:1px solid var(--border);border-radius:12px;padding:12px 14px;display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:16px}
+		h1{font-size:20px;margin:0}
+		p.lead{margin:4px 0 0;color:var(--muted);font-size:13px}
+		.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+		.btn{display:inline-flex;align-items:center;gap:8px;padding:7px 10px;background:var(--card);border:1px solid var(--border);
+			border-radius:10px;font-size:13px;cursor:pointer;color:var(--accent)}
+		.btn:hover{filter:brightness(0.98)}
+		.btn:active{transform:translateY(1px)}
+		hr{border:none;border-top:1px solid var(--border);margin:18px 0}
+
+		.doc-head{margin:18px 2px 8px}
+		.doc-head h2{font-size:16px;margin:18px 0 6px}
+		.doc-head h3{font-size:14px;margin:12px 0 6px}
+		.doc-head .caption{color:var(--muted);font-size:13px;margin:8px 0 4px}
+		.doc-head code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,monospace;font-size:12px;background:var(--codebg);
+			border:1px solid var(--border);padding:2px 6px;border-radius:8px}
+		.doc-head .muted{color:var(--muted);font-weight:500;margin-left:6px}
+
+		.sql-block{background:var(--card);border:1px solid var(--border);padding:12px;margin:12px 0;border-radius:12px;position:relative;
+			box-shadow:0 1px 2px rgba(15,23,42,0.06)}
+		.sql-block .controls{position:absolute;top:10px;right:10px;display:flex;gap:6px;z-index:2}
+		.sql-code{margin-top:8px}
+		.sql-textarea{width:98%;min-height:70px;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,monospace;font-size:13px;line-height:1.45;
+			background:linear-gradient(180deg,var(--codebg),color-mix(in srgb, var(--codebg) 70%, transparent));padding:10px;border-radius:10px;border:1px solid var(--border);resize:vertical}
+		.static-result{margin-top:12px;opacity:0.6;position:relative}
+		.static-result::before{content:'Generated Result';display:block;font-size:11px;color:var(--muted);margin-bottom:6px;font-weight:600}
+		.inline-result{margin-top:12px;border-radius:10px;background:var(--card);position:relative}
+		.inline-result::before{content:'▶ Live Result';display:block;font-size:11px;color:var(--accent);margin-bottom:8px;font-weight:700}
+		.btn[disabled]{opacity:0.5;cursor:not-allowed}
+		.results-wrap{overflow:auto;border-radius:12px;border:1px solid var(--border);margin:12px 0}
+		table.results{border-collapse:separate;border-spacing:0;width:100%;background:transparent}
+		table.results th,table.results td{border-bottom:1px solid var(--border);padding:10px;text-align:left;font-size:13px;background:var(--card)}
+		table.results th{background:var(--codebg);color:var(--muted);font-weight:700}
+		table.results tr:last-child td{border-bottom:none}
+
+		.err{color:#b31d28;font-weight:700;margin:8px 0}
+		.ok{color:#15803d;font-weight:700;margin:8px 0;font-size:13px}
+
+		.toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);padding:10px 12px;border-radius:12px;
+			background:rgba(15,23,42,0.90);color:#fff;font-size:13px;opacity:0;pointer-events:none;transition:opacity .12s ease,transform .12s ease}
+		.toast.show{opacity:1;transform:translateX(-50%) translateY(-6px)}
+	</style>
+</head>
+<body>
+<div class="container">
+	<div class="topbar">
+		<div>
+			<h1>tinySQL - Function Examples</h1>
+			<p class="lead">Auto-generated from input SQL. Results are shown below; SQL is visible above each result.</p>
+		</div>
+		<div class="actions">
+			<button id="init-wasm" class="btn" type="button" onclick="initWasm()">Init WASM</button>
+		</div>
+	</div>
+
+		
+		<script>
+		
+		function copySQL(id){
+			const e=document.getElementById(id);
+			if(!e) return;
+			const pre=e.querySelector('pre');
+			const ta=e.querySelector('textarea');
+			const t = ta ? ta.value : (pre ? pre.innerText : '');
+			if(!t) return;
+			if(navigator.clipboard && navigator.clipboard.writeText){
+				navigator.clipboard.writeText(t).then(()=>toast('Copied SQL'), ()=>fallbackCopy(t));
+			} else {
+				fallbackCopy(t);
+			}
+		}
+		function fallbackCopy(t){
+			const ta=document.createElement('textarea');
+			ta.value=t; document.body.appendChild(ta);
+			ta.select();
+			try{ document.execCommand('copy'); toast('Copied SQL'); }catch(e){}
+			document.body.removeChild(ta);
+		}
+		let toastTimer;
+		function toast(msg){
+			const el=document.getElementById('toast');
+			if(!el) return;
+			el.textContent=msg;
+			el.classList.add('show');
+			clearTimeout(toastTimer);
+			toastTimer=setTimeout(()=>el.classList.remove('show'), 1200);
+		}
+
+		
+		function escapeHtml(s){
+			return String(s).replace(/[&<>\"]/g, function(c){
+				switch(c){case '&': return '&amp;'; case '<': return '&lt;'; case '>': return '&gt;'; case '"': return '&quot;';}
+				return c;
+			});
+		}
+
+		
+		function checkWasm(){
+			return (typeof executeQuery_wasm === 'function') || (window.wasmApi && typeof window.wasmApi.executeQuery === 'function');
+		}
+
+		async function initWasm(){
+			
+			if(window.wasmApi && typeof window.wasmApi.init === 'function'){
+				try{ await window.wasmApi.init(); toast('WASM initialized'); updateRunButtons(); return; }catch(e){ toast('WASM init failed: '+(e && e.message?e.message:String(e))); }
+			}
+
+			
+			
+			function loadScript(url){
+				return new Promise((resolve,reject)=>{
+					try{
+						
+						if(document.querySelector('script[src="'+url+'"]')) return resolve(url);
+					}catch(e){   }
+					const s=document.createElement('script'); s.src=url; s.async=true;
+					s.onload = ()=>resolve(url);
+					s.onerror = ()=>reject(new Error('failed to load '+url));
+					document.head.appendChild(s);
+				});
+			}
+
+			
+			const candidates = ['wasm_exec.js', 'wasm-init.js'];
+			for(const url of candidates){
+				try{
+					await loadScript(url);
+					
+					if(url.includes('wasm-init.js')){
+						
+						for(let i=0; i<50 && typeof window.initWasm !== 'function'; i++){
+							await new Promise(r=>setTimeout(r,100));
+						}
+						if(typeof window.initWasm === 'function'){
+							try{
+								await window.initWasm();
+								toast('WASM initialized');
+								updateRunButtons();
+								return;
+							}catch(e){
+								console.error('initWasm failed:', e);
+								toast('WASM init failed: '+(e && e.message?e.message:String(e)));
+							}
+						} else {
+							console.warn('wasm-init.js loaded but window.initWasm not found');
+						}
+					}
+				} catch(e) {
+					console.warn('Failed to load '+url+':', e);
+				}
+			}
+
+			toast('WASM init not available');
+		}
+
+		function updateRunButtons(){
+			const ok = checkWasm();
+			document.querySelectorAll('.btn-run').forEach(b=>{ b.disabled = !ok; if(!ok) b.title = 'WASM unavailable — click Init WASM to try'; else b.title='Run this query'; });
+			const initBtn = document.getElementById('init-wasm'); if(initBtn) initBtn.disabled = ok;
+		}
+
+		document.addEventListener('DOMContentLoaded', async ()=>{ 
+			updateRunButtons(); 
+			
+			await initWasm();
+		});
+
+		async function runBlockQuery(id){
+				const block = document.getElementById(id);
+				if(!block) return;
+			const ta = block.querySelector('textarea');
+				const sql = ta ? ta.value.trim() : '';
+				if(!sql) { toast('No SQL found'); return; }
+
+			
+			if(!checkWasm()){
+				toast('WASM execute function not available — click Init WASM');
+				const prev = block.querySelector('.inline-result');
+				if(prev) prev.remove();
+				const msg = document.createElement('div'); msg.className='inline-result'; msg.innerHTML = '<div class="err">WASM execute function not available. Click "Init WASM" to attempt initialization or serve the demo assets (app.js + query_files.wasm).</div>';
+				block.appendChild(msg);
+				return;
+			}
+
+			
+				const staticResult = block.querySelector('.static-result');
+				if(staticResult) staticResult.remove();
+				const prev = block.querySelector('.inline-result');
+				if(prev) prev.remove();
+				const resultWrap = document.createElement('div');
+				resultWrap.className = 'inline-result';
+			resultWrap.setAttribute('aria-live','polite');
+				resultWrap.innerHTML = '<div class="ok">Running...</div>';
+				block.appendChild(resultWrap);
+				try{
+					
+					if(typeof executeQuery_wasm !== 'function'){
+						resultWrap.innerHTML = '<div class="err">WASM execute function not available</div>';
+						return;
+					}
+					let res = executeQuery_wasm(sql);
+					
+					if(res && typeof res.then === 'function'){
+						res = await res;
+					}
+					if(!res){
+						resultWrap.innerHTML = '<div class="err">No result returned</div>';
+						return;
+					}
+					if(res.success){
+						const cols = Array.isArray(res.columns) ? res.columns : [];
+						const rows = Array.isArray(res.rows) ? res.rows : [];
+						let html = '<div class="results-wrap"><table class="results"><thead><tr>';
+						for(const c of cols) html += '<th>'+escapeHtml(String(c))+'</th>';
+						html += '</tr></thead><tbody>';
+						for(const r of rows){ html += '<tr>'; for(const c of cols){ const v = r[c]; html += '<td>'+ (v==null? 'NULL' : escapeHtml(String(v))) +'</td>'; } html += '</tr>'; }
+						html += '</tbody></table></div>';
+						resultWrap.innerHTML = html;
+					}else{
+						resultWrap.innerHTML = '<div class="err">'+escapeHtml(String(res.error || 'Query failed'))+'</div>';
+					}
+				} catch(err){
+					resultWrap.innerHTML = '<div class="err">'+escapeHtml(err && err.message ? err.message : String(err))+'</div>';
+				}
+			}
+		</script>
+
+		
+	<div class="sql-block" id="sql-1"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-1')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-1')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT NOW() as current_timestamp</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>current_timestamp</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2025-12-06T21:01:55+01:00</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-4"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-4')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-4')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT CURRENT_DATE() as today</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>today</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2025-12-06T00:00:00+01:00</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-7"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-7')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-7')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT CURRENT_TIME() as current_time</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>CURRENT_TIME</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2025-12-06T21:01:55+01:00</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-10"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-10')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-10')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT YEAR(NOW()) as current_year</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>current_year</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2025</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-13"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-13')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-13')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT MONTH(NOW()) as current_month</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>current_month</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>12</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-16"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-16')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-16')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT DAY(NOW()) as current_day</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>current_day</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>6</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-19"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-19')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-19')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT HOUR(NOW()) as current_hour</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>current_hour</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>21</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-22"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-22')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-22')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT MINUTE(NOW()) as current_minute</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>current_minute</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>1</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-25"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-25')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-25')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT SECOND(NOW()) as current_second</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>current_second</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>55</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-28"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-28')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-28')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT QUARTER(NOW()) as current_quarter</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>current_quarter</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>4</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-31"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-31')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-31')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT DAYOFWEEK(NOW()) as day_of_week</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>day_of_week</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>7</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-34"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-34')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-34')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT DAYOFYEAR(NOW()) as day_of_year</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>day_of_year</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>340</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-37"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-37')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-37')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT WEEKOFYEAR(NOW()) as week_of_year</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>week_of_year</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>49</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-40"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-40')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-40')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT EXTRACT(&#39;YEAR&#39;, NOW()) as year</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>YEAR</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2025</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-43"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-43')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-43')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT EXTRACT(&#39;MONTH&#39;, NOW()) as month</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>MONTH</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>12</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-46"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-46')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-46')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT EXTRACT(&#39;DAY&#39;, NOW()) as day</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>DAY</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>6</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-49"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-49')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-49')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT EXTRACT(&#39;QUARTER&#39;, NOW()) as quarter</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>QUARTER</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>4</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-52"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-52')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-52')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT EXTRACT(&#39;WEEK&#39;, NOW()) as week</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>week</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>49</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-55"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-55')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-55')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT EXTRACT(&#39;DAYOFWEEK&#39;, NOW()) as dow</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>dow</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>6</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-58"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-58')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-58')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT DATE_ADD(CURRENT_DATE(), 7, &#39;DAY&#39;) as next_week</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>next_week</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2025-12-13T00:00:00+01:00</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-61"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-61')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-61')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT DATE_SUB(CURRENT_DATE(), 30, &#39;DAY&#39;) as last_month</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>last_month</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2025-11-06T00:00:00+01:00</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-64"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-64')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-64')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT DATEDIFF(&#39;DAYS&#39;, &#39;2024-01-01&#39;, &#39;2024-12-31&#39;) as days_in_2024</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>days_in_2024</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>365</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-67"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-67')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-67')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT ADD_MONTHS(CURRENT_DATE(), 3) as three_months_later</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>three_months_later</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2026-03-06T00:00:00+01:00</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-70"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-70')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-70')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT ADD_MONTHS(CURRENT_DATE(), -6) as six_months_ago</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>six_months_ago</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2025-06-06T00:00:00+02:00</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-73"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-73')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-73')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT DATE_TRUNC(&#39;YEAR&#39;, NOW()) as start_of_year</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>start_of_year</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2025-01-01T00:00:00+01:00</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-76"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-76')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-76')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT DATE_TRUNC(&#39;QUARTER&#39;, NOW()) as start_of_quarter</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>start_of_quarter</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2025-10-01T00:00:00+02:00</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-79"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-79')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-79')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT DATE_TRUNC(&#39;MONTH&#39;, NOW()) as start_of_month</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>start_of_month</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2025-12-01T00:00:00+01:00</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-82"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-82')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-82')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT DATE_TRUNC(&#39;WEEK&#39;, NOW()) as start_of_week</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>start_of_week</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2025-12-01T01:00:00+01:00</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-85"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-85')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-85')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT DATE_TRUNC(&#39;DAY&#39;, NOW()) as start_of_day</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>start_of_day</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2025-12-06T01:00:00+01:00</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-88"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-88')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-88')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT DATE_TRUNC(&#39;HOUR&#39;, NOW()) as start_of_hour</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>start_of_hour</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2025-12-06T21:00:00+01:00</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-91"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-91')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-91')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT EOMONTH(CURRENT_DATE()) as end_of_current_month</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>end_of_current_month</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2025-12-31T00:00:00+01:00</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-94"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-94')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-94')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT EOMONTH(CURRENT_DATE(), 1) as end_of_next_month</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>end_of_next_month</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2026-01-31T00:00:00+01:00</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-97"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-97')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-97')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT EOMONTH(CURRENT_DATE(), -1) as end_of_last_month</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>end_of_last_month</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2025-11-30T00:00:00+01:00</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-100"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-100')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-100')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT IN_PERIOD(&#39;TODAY&#39;, CURRENT_DATE()) as is_today</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>is_today</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>true</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-103"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-103')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-103')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT IN_PERIOD(&#39;YTD&#39;, &#39;2024-06-15&#39;) as is_year_to_date</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>is_year_to_date</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>false</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-106"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-106')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-106')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT IN_PERIOD(&#39;MTD&#39;, CURRENT_DATE()) as is_month_to_date</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>is_month_to_date</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>true</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-109"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-109')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-109')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT IN_PERIOD(&#39;QTD&#39;, CURRENT_DATE()) as is_quarter_to_date</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>is_quarter_to_date</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>true</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-112"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-112')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-112')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT IN_PERIOD(&#39;L12M&#39;, DATE_SUB(CURRENT_DATE(), 180, &#39;DAY&#39;)) as is_last_12_months</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>is_last_12_months</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>true</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-115"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-115')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-115')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT IN_PERIOD(&#39;CURRENT_QUARTER&#39;, CURRENT_DATE()) as is_current_quarter</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>is_current_quarter</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>true</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-118"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-118')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-118')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT IN_PERIOD(&#39;PREVIOUS_QUARTER&#39;, DATE_SUB(CURRENT_DATE(), 120, &#39;DAY&#39;)) as was_previous_quarter</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>was_previous_quarter</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>true</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-121"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-121')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-121')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT IN_PERIOD(&#39;CURRENT_YEAR_FULL&#39;, CURRENT_DATE()) as is_current_year</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>is_current_year</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>true</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-124"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-124')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-124')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT STRFTIME(&#39;%Y-%m-%d&#39;, NOW()) as iso_date</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>iso_date</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2025-12-06</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-127"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-127')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-127')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT STRFTIME(&#39;%d.%m.%Y&#39;, NOW()) as german_date</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>german_date</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>06.12.2025</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-130"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-130')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-130')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT STRFTIME(&#39;%A, %B %d, %Y&#39;, NOW()) as long_date</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>long_date</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>%A, %B 06, 2025</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-133"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-133')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-133')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT DATE(NOW()) as date_only</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>date_only</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2025-12-06</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-136"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-136')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-136')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT TIME(NOW()) as time_only</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>time_only</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>21:01:55</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-139"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-139')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-139')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT UPPER(&#39;hello world&#39;) as uppercase</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>uppercase</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>HELLO WORLD</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-142"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-142')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-142')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT LOWER(&#39;HELLO WORLD&#39;) as lowercase</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>lowercase</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>hello world</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-145"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-145')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-145')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT INITCAP(&#39;hello world from tinysql&#39;) as title_case</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>title_case</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Hello World From Tinysql</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-148"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-148')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-148')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT CONCAT(&#39;Hello&#39;, &#39; &#39;, &#39;World&#39;) as concatenated</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>concatenated</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Hello World</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-151"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-151')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-151')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT CONCAT_WS(&#39;, &#39;, &#39;Apple&#39;, &#39;Banana&#39;, &#39;Cherry&#39;) as joined_with_separator</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>joined_with_separator</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Apple, Banana, Cherry</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-154"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-154')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-154')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT LENGTH(&#39;Hello World&#39;) as string_length</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>string_length</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>11</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-157"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-157')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-157')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT CHAR_LENGTH(&#39;Hello&#39;) as char_length</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>CHAR_LENGTH</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>5</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-160"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-160')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-160')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT SUBSTRING(&#39;Hello World&#39;, 7, 5) as substring_result</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>substring_result</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>World</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-163"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-163')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-163')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT SUBSTR(&#39;Hello World&#39;, 1, 5) as substr_result</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>substr_result</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Hello</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-166"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-166')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-166')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT LEFT(&#39;Hello World&#39;, 5) as left_chars</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>left_chars</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Hello</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-169"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-169')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-169')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT RIGHT(&#39;Hello World&#39;, 5) as right_chars</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>right_chars</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>World</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-172"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-172')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-172')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT REVERSE(&#39;Hello&#39;) as reversed</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>reversed</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>olleH</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-175"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-175')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-175')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT REPEAT(&#39;Ha&#39;, 3) as repeated</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>repeated</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>HaHaHa</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-178"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-178')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-178')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT TRIM(&#39;  Hello  &#39;) as trimmed</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>trimmed</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Hello</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-181"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-181')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-181')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT LTRIM(&#39;  Hello&#39;) as left_trimmed</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>left_trimmed</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Hello</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-184"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-184')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-184')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT RTRIM(&#39;Hello  &#39;) as right_trimmed</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>right_trimmed</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Hello</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-187"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-187')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-187')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT LPAD(&#39;42&#39;, 5, &#39;0&#39;) as left_padded</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>left_padded</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>00042</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-190"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-190')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-190')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT RPAD(&#39;42&#39;, 5, &#39;0&#39;) as right_padded</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>right_padded</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>42000</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-193"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-193')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-193')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT REPLACE(&#39;Hello World&#39;, &#39;World&#39;, &#39;Universe&#39;) as replaced</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>replaced</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Hello Universe</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-196"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-196')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-196')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT INSTR(&#39;Hello World&#39;, &#39;World&#39;) as position</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>POSITION</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>7</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-199"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-199')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-199')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT LOCATE(&#39;World&#39;, &#39;Hello World&#39;) as locate_position</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>locate_position</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>0</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-202"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-202')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-202')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT PRINTF(&#39;Value: %d, Name: %s&#39;, 42, &#39;Test&#39;) as formatted</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>formatted</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Value: 42, Name: Test</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-205"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-205')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-205')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT FORMAT(&#39;Pi is approximately %.2f&#39;, 3.14159) as formatted_number</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>formatted_number</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Pi is approximately 3.14</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-208"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-208')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-208')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT SPLIT(&#39;apple,banana,cherry&#39;, &#39;,&#39;) as fruit_array</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>fruit_array</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>[&#34;apple&#34;,&#34;banana&#34;,&#34;cherry&#34;]</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-211"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-211')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-211')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT SPLIT_PART(&#39;apple,banana,cherry&#39;, &#39;,&#39;, 2) as second_fruit</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>second_fruit</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>banana</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-214"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-214')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-214')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT SPACE(10) as ten_spaces</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>ten_spaces</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>          </td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-217"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-217')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-217')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT ASCII(&#39;A&#39;) as ascii_value</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>ascii_value</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>65</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-220"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-220')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-220')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT CHAR(65) as char_from_ascii</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>char_from_ascii</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>A</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-223"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-223')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-223')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT SOUNDEX(&#39;Smith&#39;) as soundex_code</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>soundex_code</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>S530</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-226"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-226')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-226')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT QUOTE(&#39;It&#39;&#39;s a test&#39;) as quoted_string</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>quoted_string</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>&#39;It&#39;&#39;s a test&#39;</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-229"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-229')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-229')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT REGEXP_MATCH(&#39;test@example.com&#39;, &#39;.*@.*\.com&#39;) as is_email</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>is_email</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>true</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-232"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-232')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-232')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT REGEXP_MATCH(&#39;12345&#39;, &#39;^\d+$&#39;) as is_numeric</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>is_numeric</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>true</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-235"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-235')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-235')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT REGEXP_EXTRACT(&#39;Order #12345 processed&#39;, &#39;#\d+&#39;) as order_number</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>order_number</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>#12345</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-238"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-238')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-238')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT REGEXP_EXTRACT(&#39;Email: test@example.com&#39;, &#39;\w+@\w+\.\w+&#39;) as email</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>email</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>test@example.com</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-241"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-241')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-241')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT REGEXP_REPLACE(&#39;2024-11-27&#39;, &#39;-&#39;, &#39;/&#39;) as date_with_slashes</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>date_with_slashes</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2024/11/27</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-244"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-244')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-244')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT REGEXP_REPLACE(&#39;Hello123World456&#39;, &#39;\d+&#39;, &#39;X&#39;) as numbers_replaced</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>numbers_replaced</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>HelloXWorldX</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-247"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-247')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-247')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT ABS(-42) as absolute_value</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>absolute_value</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>42</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-250"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-250')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-250')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT SIGN(-15) as sign_of_number</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>sign_of_number</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>-1</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-253"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-253')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-253')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT ROUND(3.14159, 2) as rounded</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>rounded</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>3.14</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-256"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-256')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-256')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT FLOOR(3.7) as floor_value</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>floor_value</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>3</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-259"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-259')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-259')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT CEIL(3.2) as ceiling_value</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>ceiling_value</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>4</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-262"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-262')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-262')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT CEILING(3.2) as ceiling_value2</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>ceiling_value2</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>4</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-265"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-265')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-265')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT TRUNCATE(3.14159, 2) as truncated</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>truncated</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>3.14</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-268"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-268')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-268')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT TRUNC(3.14159, 2) as trunc_value</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>trunc_value</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>3.14</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-271"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-271')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-271')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT POWER(2, 8) as power_of_two</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>power_of_two</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>256</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-274"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-274')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-274')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT POW(3, 3) as cube</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>cube</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>27</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-277"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-277')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-277')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT SQRT(16) as square_root</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>square_root</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>4</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-280"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-280')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-280')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT MOD(17, 5) as modulo</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>modulo</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-283"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-283')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-283')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT LOG(100) as natural_log</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>natural_log</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>4.605170185988092</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-286"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-286')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-286')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT LN(2.71828) as ln_value</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>ln_value</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>0.999999327347282</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-289"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-289')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-289')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT LOG10(1000) as log_base_10</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>log_base_10</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>3</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-292"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-292')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-292')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT LOG2(1024) as log_base_2</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>log_base_2</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>10</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-295"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-295')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-295')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT EXP(1) as euler_number</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>euler_number</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2.718281828459045</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-298"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-298')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-298')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT PI() as pi_value</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>pi_value</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>3.141592653589793</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-301"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-301')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-301')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT SIN(PI() / 2) as sine_90_degrees</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>sine_90_degrees</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>1</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-304"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-304')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-304')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT COS(0) as cosine_0_degrees</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>cosine_0_degrees</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>1</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-307"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-307')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-307')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT TAN(PI() / 4) as tangent_45_degrees</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>tangent_45_degrees</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>0.9999999999999998</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-310"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-310')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-310')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT ASIN(1) as arcsine</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>arcsine</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>1.5707963267948966</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-313"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-313')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-313')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT ACOS(0) as arccosine</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>arccosine</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>1.5707963267948966</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-316"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-316')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-316')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT ATAN(1) as arctangent</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>arctangent</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>0.7853981633974483</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-319"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-319')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-319')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT ATAN2(1, 1) as atan2_value</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>atan2_value</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>0.7853981633974483</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-322"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-322')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-322')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT DEGREES(PI()) as radians_to_degrees</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>radians_to_degrees</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>180</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-325"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-325')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-325')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT RADIANS(180) as degrees_to_radians</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>degrees_to_radians</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>3.141592653589793</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-328"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-328')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-328')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT RANDOM() as random_value</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>random_value</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>0.6461645486625047</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-331"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-331')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-331')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT RAND() as rand_value</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>rand_value</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>0.3421741091338821</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-334"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-334')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-334')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT SPLIT(&#39;red,green,blue&#39;, &#39;,&#39;) as colors</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>colors</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>[&#34;red&#34;,&#34;green&#34;,&#34;blue&#34;]</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-337"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-337')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-337')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT FIRST(SPLIT(&#39;alpha,beta,gamma&#39;, &#39;,&#39;)) as first_element</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>first_element</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>alpha</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-340"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-340')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-340')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT LAST(SPLIT(&#39;alpha,beta,gamma&#39;, &#39;,&#39;)) as last_element</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>last_element</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>gamma</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-343"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-343')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-343')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT ARRAY_LENGTH(SPLIT(&#39;one,two,three,four&#39;, &#39;,&#39;)) as array_size</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>array_size</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>4</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-346"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-346')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-346')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT ARRAY_CONTAINS(SPLIT(&#39;apple,banana,cherry&#39;, &#39;,&#39;), &#39;banana&#39;) as has_banana</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>has_banana</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>true</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-349"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-349')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-349')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT IN_ARRAY(SPLIT(&#39;1,2,3,4,5&#39;, &#39;,&#39;), &#39;3&#39;) as has_three</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>has_three</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>true</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-352"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-352')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-352')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT ARRAY_JOIN(SPLIT(&#39;hello,world&#39;, &#39;,&#39;), &#39; &#39;) as joined_array</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>joined_array</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>hello world</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-355"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-355')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-355')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT ARRAY_JOIN(SPLIT(&#39;a,b,c&#39;, &#39;,&#39;), &#39; - &#39;) as joined_with_dash</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>joined_with_dash</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>a - b - c</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-358"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-358')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-358')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT ARRAY_DISTINCT(SPLIT(&#39;a,b,a,c,b,d&#39;, &#39;,&#39;)) as unique_elements</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>unique_elements</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>[&#34;a&#34;,&#34;b&#34;,&#34;c&#34;,&#34;d&#34;]</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-361"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-361')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-361')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT ARRAY_SORT(SPLIT(&#39;zebra,apple,mango,banana&#39;, &#39;,&#39;)) as sorted_array</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>sorted_array</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>[&#34;apple&#34;,&#34;banana&#34;,&#34;mango&#34;,&#34;zebra&#34;]</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-363"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-363')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-363')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">CREATE TABLE temp_numbers (group_id INT, value INT)</textarea></div></div>
+	
+	<div class='ok'>(ok)</div>
+	
+	<div class="sql-block" id="sql-365"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-365')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-365')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">INSERT INTO temp_numbers VALUES (1, 10), (1, 20), (1, 30)</textarea></div></div>
+	
+	<div class='ok'>(ok)</div>
+	
+	<div class="sql-block" id="sql-367"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-367')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-367')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">INSERT INTO temp_numbers VALUES (2, 5), (2, 15), (2, 25)</textarea></div></div>
+	
+	<div class='ok'>(ok)</div>
+	
+	<div class="sql-block" id="sql-369"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-369')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-369')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">INSERT INTO temp_numbers VALUES (3, 100), (3, 200)</textarea></div></div>
+	
+	<div class='ok'>(ok)</div>
+	
+	<div class="sql-block" id="sql-372"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-372')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-372')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT group_id, COUNT(*) as total_count FROM temp_numbers GROUP BY group_id</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>group_id</th><th>total_count</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>1</td><td>3</td></tr>
+<tr><td>2</td><td>3</td></tr>
+<tr><td>3</td><td>2</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-375"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-375')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-375')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT group_id, COUNT(value) as non_null_count FROM temp_numbers GROUP BY group_id</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>group_id</th><th>non_null_count</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>1</td><td>3</td></tr>
+<tr><td>2</td><td>3</td></tr>
+<tr><td>3</td><td>2</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-377"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-377')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-377')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">CREATE TABLE temp_sales (product TEXT, sale_date TEXT, amount INT)</textarea></div></div>
+	
+	<div class='ok'>(ok)</div>
+	
+	<div class="sql-block" id="sql-379"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-379')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-379')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">INSERT INTO temp_sales VALUES (&#39;Laptop&#39;, &#39;2025-01-15&#39;, 1200)</textarea></div></div>
+	
+	<div class='ok'>(ok)</div>
+	
+	<div class="sql-block" id="sql-381"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-381')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-381')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">INSERT INTO temp_sales VALUES (&#39;Mouse&#39;, &#39;2025-03-20&#39;, 25)</textarea></div></div>
+	
+	<div class='ok'>(ok)</div>
+	
+	<div class="sql-block" id="sql-383"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-383')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-383')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">INSERT INTO temp_sales VALUES (&#39;Keyboard&#39;, &#39;2025-02-10&#39;, 75)</textarea></div></div>
+	
+	<div class='ok'>(ok)</div>
+	
+	<div class="sql-block" id="sql-385"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-385')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-385')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">INSERT INTO temp_sales VALUES (&#39;Monitor&#39;, &#39;2025-01-05&#39;, 350)</textarea></div></div>
+	
+	<div class='ok'>(ok)</div>
+	
+	<div class="sql-block" id="sql-388"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-388')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-388')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT MIN_BY(product, sale_date) as earliest_product FROM temp_sales</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>earliest_product</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Monitor</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-391"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-391')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-391')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT MAX_BY(product, sale_date) as latest_product FROM temp_sales</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>latest_product</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Mouse</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-394"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-394')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-394')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT MIN_BY(product, amount) as cheapest FROM temp_sales</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>cheapest</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Mouse</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-397"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-397')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-397')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT MAX_BY(product, amount) as most_expensive FROM temp_sales</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>most_expensive</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Laptop</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-400"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-400')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-400')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT MIN_BY(amount, sale_date) as earliest_amount FROM temp_sales</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>earliest_amount</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>350</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-403"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-403')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-403')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT MAX_BY(amount, sale_date) as latest_amount FROM temp_sales</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>latest_amount</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>25</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-406"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-406')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-406')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT ARG_MIN(product, amount) as cheapest_via_argmin FROM temp_sales</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>cheapest_via_argmin</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Mouse</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-409"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-409')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-409')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT ARG_MAX(product, amount) as most_expensive_via_argmax FROM temp_sales</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>most_expensive_via_argmax</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Laptop</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-411"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-411')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-411')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">DROP TABLE temp_sales</textarea></div></div>
+	
+	<div class='ok'>(ok)</div>
+	
+	<div class="sql-block" id="sql-413"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-413')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-413')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">DROP TABLE temp_numbers;-- ============================================================ SELECT COALESCE(NULL, NULL, &#39;default&#39;) as first_non_null</textarea></div></div>
+	
+	<div class='ok'>(ok)</div>
+	
+	<div class="sql-block" id="sql-416"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-416')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-416')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT NVL(NULL, &#39;replacement&#39;) as nvl_result</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>nvl_result</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>replacement</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-419"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-419')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-419')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT IFNULL(NULL, &#39;value&#39;) as ifnull_result</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>ifnull_result</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>value</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-422"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-422')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-422')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT NULLIF(5, 5) as nullif_equal</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>nullif_equal</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>NULL</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-425"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-425')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-425')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT NULLIF(5, 3) as nullif_different</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>nullif_different</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>5</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-428"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-428')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-428')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT IF(10 &gt; 5, &#39;yes&#39;, &#39;no&#39;) as if_result</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>if_result</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>yes</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-431"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-431')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-431')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT IIF(2 + 2 = 4, &#39;correct&#39;, &#39;wrong&#39;) as iif_result</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>iif_result</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>correct</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-434"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-434')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-434')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT GREATEST(10, 25, 15, 30) as greatest_value</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>greatest_value</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>30</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-437"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-437')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-437')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT LEAST(10, 25, 15, 30) as least_value</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>least_value</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>10</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-440"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-440')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-440')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT CASE WHEN 10 &gt; 20 THEN &#39;impossible&#39; WHEN 10 &gt; 5 THEN &#39;correct&#39; ELSE &#39;wrong&#39; END as case_result</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>case_result</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>correct</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-443"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-443')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-443')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT MD5(&#39;password&#39;) as md5_hash</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>md5_hash</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>5f4dcc3b5aa765d61d8327deb882cf99</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-446"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-446')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-446')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT SHA1(&#39;password&#39;) as sha1_hash</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>sha1_hash</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>5baa61e4c9b93f3f0682250b6cf8331b7ee68fd8</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-449"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-449')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-449')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT SHA256(&#39;password&#39;) as sha256_hash</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>sha256_hash</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-452"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-452')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-452')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT SHA512(&#39;password&#39;) as sha512_hash</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>sha512_hash</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>b109f3bbbc244eb82441917ed06d618b9008dd09b3befd1b5e07394c706a8bb980b1d7785e5976ec049b46df5f1326af5a2ea6d103fd07c95385ffab0cacbc86</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-455"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-455')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-455')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT BASE64(&#39;Hello World&#39;) as base64_encoded</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>base64_encoded</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>SGVsbG8gV29ybGQ=</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-458"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-458')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-458')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT BASE64_DECODE(&#39;SGVsbG8gV29ybGQ=&#39;) as base64_decoded</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>base64_decoded</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Hello World</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-461"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-461')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-461')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT HEX(&#39;Hello&#39;) as hex_encoded</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>hex_encoded</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>48656C6C6F</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-464"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-464')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-464')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT UNHEX(&#39;48656C6C6F&#39;) as hex_decoded</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>hex_decoded</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Hello</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-467"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-467')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-467')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT CAST(&#39;123&#39; AS INTEGER) as string_to_int</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>string_to_int</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>123</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-470"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-470')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-470')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT CAST(3.14 AS INTEGER) as float_to_int</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>float_to_int</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>3</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-473"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-473')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-473')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT CAST(42 AS TEXT) as int_to_string</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>int_to_string</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>42</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-476"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-476')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-476')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT TYPEOF(42) as integer_type</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>integer_type</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>integer</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-479"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-479')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-479')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT TYPEOF(&#39;text&#39;) as string_type</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>string_type</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>text</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-482"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-482')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-482')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT TYPEOF(3.14) as float_type</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>float_type</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>real</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-485"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-485')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-485')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT UUID() as unique_id</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>unique_id</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>53bdee54-2cdf-4d49-8882-cf9006c73a57</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-488"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-488')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-488')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT VERSION() as tinysql_version</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>tinysql_version</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>tinySQL 1.0</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-490"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-490')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-490')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">CREATE TABLE window_demo ( product TEXT, category TEXT, sale_date TEXT, amount INT )</textarea></div></div>
+	
+	<div class='ok'>(ok)</div>
+	
+	<div class="sql-block" id="sql-492"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-492')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-492')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">INSERT INTO window_demo VALUES (&#39;Laptop&#39;, &#39;Electronics&#39;, &#39;2025-01-15&#39;, 1200)</textarea></div></div>
+	
+	<div class='ok'>(ok)</div>
+	
+	<div class="sql-block" id="sql-494"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-494')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-494')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">INSERT INTO window_demo VALUES (&#39;Mouse&#39;, &#39;Electronics&#39;, &#39;2025-01-20&#39;, 25)</textarea></div></div>
+	
+	<div class='ok'>(ok)</div>
+	
+	<div class="sql-block" id="sql-496"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-496')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-496')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">INSERT INTO window_demo VALUES (&#39;Desk&#39;, &#39;Furniture&#39;, &#39;2025-01-25&#39;, 350)</textarea></div></div>
+	
+	<div class='ok'>(ok)</div>
+	
+	<div class="sql-block" id="sql-498"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-498')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-498')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">INSERT INTO window_demo VALUES (&#39;Keyboard&#39;, &#39;Electronics&#39;, &#39;2025-02-10&#39;, 75)</textarea></div></div>
+	
+	<div class='ok'>(ok)</div>
+	
+	<div class="sql-block" id="sql-500"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-500')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-500')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">INSERT INTO window_demo VALUES (&#39;Chair&#39;, &#39;Furniture&#39;, &#39;2025-02-15&#39;, 200)</textarea></div></div>
+	
+	<div class='ok'>(ok)</div>
+	
+	<div class="sql-block" id="sql-503"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-503')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-503')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT product, amount, ROW_NUMBER() OVER (ORDER BY amount) as row_num FROM window_demo ORDER BY amount</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>product</th><th>amount</th><th>row_num</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Mouse</td><td>25</td><td>1</td></tr>
+<tr><td>Keyboard</td><td>75</td><td>2</td></tr>
+<tr><td>Chair</td><td>200</td><td>3</td></tr>
+<tr><td>Desk</td><td>350</td><td>4</td></tr>
+<tr><td>Laptop</td><td>1200</td><td>5</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-506"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-506')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-506')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT product, category, amount, ROW_NUMBER() OVER (PARTITION BY category ORDER BY amount) as row_in_category FROM window_demo ORDER BY category, amount</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>product</th><th>category</th><th>amount</th><th>row_in_category</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Mouse</td><td>Electronics</td><td>25</td><td>1</td></tr>
+<tr><td>Keyboard</td><td>Electronics</td><td>75</td><td>2</td></tr>
+<tr><td>Laptop</td><td>Electronics</td><td>1200</td><td>3</td></tr>
+<tr><td>Chair</td><td>Furniture</td><td>200</td><td>1</td></tr>
+<tr><td>Desk</td><td>Furniture</td><td>350</td><td>2</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-509"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-509')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-509')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT product, amount, LAG(amount, 1) OVER (ORDER BY sale_date) as previous_amount FROM window_demo ORDER BY sale_date</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>product</th><th>amount</th><th>previous_amount</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Laptop</td><td>1200</td><td>NULL</td></tr>
+<tr><td>Mouse</td><td>25</td><td>1200</td></tr>
+<tr><td>Desk</td><td>350</td><td>25</td></tr>
+<tr><td>Keyboard</td><td>75</td><td>350</td></tr>
+<tr><td>Chair</td><td>200</td><td>75</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-512"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-512')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-512')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT product, amount, LAG(amount, 1, 0) OVER (ORDER BY sale_date) as previous_or_zero FROM window_demo ORDER BY sale_date</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>product</th><th>amount</th><th>previous_or_zero</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Laptop</td><td>1200</td><td>0</td></tr>
+<tr><td>Mouse</td><td>25</td><td>1200</td></tr>
+<tr><td>Desk</td><td>350</td><td>25</td></tr>
+<tr><td>Keyboard</td><td>75</td><td>350</td></tr>
+<tr><td>Chair</td><td>200</td><td>75</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-515"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-515')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-515')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT product, amount, LEAD(amount, 1) OVER (ORDER BY sale_date) as next_amount FROM window_demo ORDER BY sale_date</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>product</th><th>amount</th><th>next_amount</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Laptop</td><td>1200</td><td>25</td></tr>
+<tr><td>Mouse</td><td>25</td><td>350</td></tr>
+<tr><td>Desk</td><td>350</td><td>75</td></tr>
+<tr><td>Keyboard</td><td>75</td><td>200</td></tr>
+<tr><td>Chair</td><td>200</td><td>NULL</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-518"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-518')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-518')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT product, amount, FIRST_VALUE(product) OVER (ORDER BY amount) as cheapest_product FROM window_demo ORDER BY amount</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>product</th><th>amount</th><th>cheapest_product</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Mouse</td><td>25</td><td>Mouse</td></tr>
+<tr><td>Keyboard</td><td>75</td><td>Mouse</td></tr>
+<tr><td>Chair</td><td>200</td><td>Mouse</td></tr>
+<tr><td>Desk</td><td>350</td><td>Mouse</td></tr>
+<tr><td>Laptop</td><td>1200</td><td>Mouse</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-521"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-521')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-521')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT product, category, amount, FIRST_VALUE(product) OVER (PARTITION BY category ORDER BY amount) as cheapest_in_category FROM window_demo ORDER BY category, amount</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>product</th><th>category</th><th>amount</th><th>cheapest_in_category</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Mouse</td><td>Electronics</td><td>25</td><td>Mouse</td></tr>
+<tr><td>Keyboard</td><td>Electronics</td><td>75</td><td>Mouse</td></tr>
+<tr><td>Laptop</td><td>Electronics</td><td>1200</td><td>Mouse</td></tr>
+<tr><td>Chair</td><td>Furniture</td><td>200</td><td>Chair</td></tr>
+<tr><td>Desk</td><td>Furniture</td><td>350</td><td>Chair</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-524"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-524')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-524')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT product, amount, LAST_VALUE(product) OVER (ORDER BY amount) as most_expensive_so_far FROM window_demo ORDER BY amount</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>product</th><th>amount</th><th>most_expensive_so_far</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Mouse</td><td>25</td><td>Laptop</td></tr>
+<tr><td>Keyboard</td><td>75</td><td>Laptop</td></tr>
+<tr><td>Chair</td><td>200</td><td>Laptop</td></tr>
+<tr><td>Desk</td><td>350</td><td>Laptop</td></tr>
+<tr><td>Laptop</td><td>1200</td><td>Laptop</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-527"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-527')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-527')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT product, sale_date, amount, MOVING_SUM(3, amount) OVER (ORDER BY sale_date) as rolling_sum_3days FROM window_demo ORDER BY sale_date</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>product</th><th>sale_date</th><th>amount</th><th>rolling_sum_3days</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Laptop</td><td>2025-01-15</td><td>1200</td><td>1200</td></tr>
+<tr><td>Mouse</td><td>2025-01-20</td><td>25</td><td>1225</td></tr>
+<tr><td>Desk</td><td>2025-01-25</td><td>350</td><td>1575</td></tr>
+<tr><td>Keyboard</td><td>2025-02-10</td><td>75</td><td>450</td></tr>
+<tr><td>Chair</td><td>2025-02-15</td><td>200</td><td>625</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-530"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-530')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-530')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT product, sale_date, amount, MOVING_AVG(3, amount) OVER (ORDER BY sale_date) as rolling_avg_3days FROM window_demo ORDER BY sale_date</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>product</th><th>sale_date</th><th>amount</th><th>rolling_avg_3days</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Laptop</td><td>2025-01-15</td><td>1200</td><td>1200</td></tr>
+<tr><td>Mouse</td><td>2025-01-20</td><td>25</td><td>612.5</td></tr>
+<tr><td>Desk</td><td>2025-01-25</td><td>350</td><td>525</td></tr>
+<tr><td>Keyboard</td><td>2025-02-10</td><td>75</td><td>150</td></tr>
+<tr><td>Chair</td><td>2025-02-15</td><td>200</td><td>208.33333333333334</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-533"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-533')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-533')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT product, category, amount, LAG(amount, 1) OVER (PARTITION BY category ORDER BY sale_date) as prev_in_category FROM window_demo ORDER BY category, sale_date</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>product</th><th>category</th><th>amount</th><th>prev_in_category</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Laptop</td><td>Electronics</td><td>1200</td><td>NULL</td></tr>
+<tr><td>Mouse</td><td>Electronics</td><td>25</td><td>1200</td></tr>
+<tr><td>Keyboard</td><td>Electronics</td><td>75</td><td>25</td></tr>
+<tr><td>Desk</td><td>Furniture</td><td>350</td><td>NULL</td></tr>
+<tr><td>Chair</td><td>Furniture</td><td>200</td><td>350</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-535"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-535')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-535')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">DROP TABLE window_demo</textarea></div></div>
+	
+	<div class='ok'>(ok)</div>
+	
+	<div class="sql-block" id="sql-538"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-538')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-538')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT CURRENT_DATE() as today, DATE_TRUNC(&#39;MONTH&#39;, CURRENT_DATE()) as month_start, EOMONTH(CURRENT_DATE()) as month_end, IN_PERIOD(&#39;MTD&#39;, CURRENT_DATE()) as is_month_to_date, DATEDIFF(&#39;DAYS&#39;, DATE_TRUNC(&#39;MONTH&#39;, CURRENT_DATE()), CURRENT_DATE()) as days_into_month</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>today</th><th>month_start</th><th>month_end</th><th>is_month_to_date</th><th>days_into_month</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2025-12-06T00:00:00+01:00</td><td>2025-12-01T00:00:00+01:00</td><td>2025-12-31T00:00:00+01:00</td><td>true</td><td>5</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-541"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-541')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-541')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT REGEXP_EXTRACT(&#39;Order #12345&#39;, &#39;#(\d+)&#39;) as order_id, UPPER(REGEXP_REPLACE(&#39;test@EXAMPLE.com&#39;, &#39;@.*&#39;, &#39;&#39;)) as username, ARRAY_LENGTH(SPLIT(&#39;item1,item2,item3&#39;, &#39;,&#39;)) as item_count</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>order_id</th><th>username</th><th>item_count</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>#12345</td><td>TEST</td><td>3</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-544"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-544')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-544')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT ROUND(PI() * POWER(5, 2), 2) as circle_area_r5, DEGREES(ATAN2(3, 4)) as angle_degrees, ABS(SIGN(-42) * 100) as absolute_signed</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>circle_area_r5</th><th>angle_degrees</th><th>absolute_signed</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>78.54</td><td>36.86989764584402</td><td>100</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-547"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-547')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-547')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT FIRST(ARRAY_SORT(ARRAY_DISTINCT(SPLIT(&#39;zebra,apple,zebra,mango&#39;, &#39;,&#39;)))) as first_sorted_unique, ARRAY_JOIN(ARRAY_SORT(SPLIT(&#39;3,1,4,1,5,9&#39;, &#39;,&#39;)), &#39; -&gt; &#39;) as sorted_numbers</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>first_sorted_unique</th><th>sorted_numbers</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>apple</td><td>1 -&gt; 1 -&gt; 3 -&gt; 4 -&gt; 5 -&gt; 9</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-550"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-550')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-550')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT CASE WHEN IN_PERIOD(&#39;TODAY&#39;, CURRENT_DATE()) THEN &#39;Today&#39; WHEN IN_PERIOD(&#39;MTD&#39;, CURRENT_DATE()) THEN &#39;This Month&#39; WHEN IN_PERIOD(&#39;QTD&#39;, CURRENT_DATE()) THEN &#39;This Quarter&#39; WHEN IN_PERIOD(&#39;YTD&#39;, CURRENT_DATE()) THEN &#39;This Year&#39; ELSE &#39;Historical&#39; END as period_classification</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>period_classification</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Today</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-553"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-553')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-553')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT COALESCE( NULL, NULLIF(&#39;&#39;, &#39;&#39;), REGEXP_EXTRACT(&#39;No match here&#39;, &#39;PATTERN&#39;), &#39;Final Default&#39; ) as coalesce_result</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>coalesce_result</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Final Default</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-556"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-556')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-556')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT REGEXP_MATCH(&#39;user@example.com&#39;, &#39;^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$&#39;) as is_valid_email, SPLIT_PART(&#39;user@example.com&#39;, &#39;@&#39;, 1) as username, SPLIT_PART(&#39;user@example.com&#39;, &#39;@&#39;, 2) as domain</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>is_valid_email</th><th>username</th><th>domain</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>true</td><td>user</td><td>example.com</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-559"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-559')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-559')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT IN_PERIOD(&#39;LAST_12_MONTHS&#39;, ADD_MONTHS(CURRENT_DATE(), -6)) as in_last_year, IN_PERIOD(&#39;CURRENT_QUARTER&#39;, CURRENT_DATE()) as in_current_quarter, EXTRACT(&#39;QUARTER&#39;, CURRENT_DATE()) as current_quarter_number</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>in_last_year</th><th>in_current_quarter</th><th>current_quarter_number</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>true</td><td>true</td><td>4</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-561"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-561')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-561')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">CREATE TABLE demo_orders ( order_id INT, customer TEXT, order_date TEXT, total INT, &#34;customer name&#34; TEXT )</textarea></div></div>
+	
+	<div class='ok'>(ok)</div>
+	
+	<div class="sql-block" id="sql-563"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-563')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-563')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">INSERT INTO demo_orders VALUES (1, &#39;alice&#39;, &#39;2025-01-10 09:15:00&#39;, 120, &#39;Alice A&#39;), (2, &#39;alice&#39;, &#39;2025-02-05 14:20:00&#39;, 200, &#39;Alice A&#39;), (3, &#39;bob&#39;,   &#39;2025-01-12 11:05:00&#39;, 75,  &#39;Robert B&#39;), (4, &#39;bob&#39;,   &#39;2025-03-01 08:30:00&#39;, 50,  &#39;Robert B&#39;), (5, &#39;carol&#39;, &#39;2025-02-20 16:45:00&#39;, 300, &#39;Carol C&#39;)</textarea></div></div>
+	
+	<div class='ok'>(ok)</div>
+	
+	<div class="sql-block" id="sql-566"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-566')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-566')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT DISTINCT ON (customer) customer, &#34;customer name&#34;, total, order_date, customer + &#39; - &#39; + CAST(total AS TEXT) AS summary, ROW_NUMBER() OVER (PARTITION BY customer ORDER BY order_date DESC) AS rn, GETDATE() AS now_ts, TODAY() AS today_date, FROM_TIMESTAMP(0) AS epoch_zero, TIMESTAMP(&#39;2023-05-01 00:00:00&#39;) AS ts_epoch FROM demo_orders ORDER BY customer, order_date DESC</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>customer</th><th>customer name</th><th>total</th><th>order_date</th><th>summary</th><th>rn</th><th>now_ts</th><th>today_date</th><th>epoch_zero</th><th>ts_epoch</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>alice</td><td>Alice A</td><td>200</td><td>2025-02-05 14:20:00</td><td>alice - 200</td><td>1</td><td>2025-12-06T21:01:55+01:00</td><td>2025-12-06T00:00:00+01:00</td><td>1970-01-01T01:00:00+01:00</td><td>1682899200</td></tr>
+<tr><td>bob</td><td>Robert B</td><td>50</td><td>2025-03-01 08:30:00</td><td>bob - 50</td><td>1</td><td>2025-12-06T21:01:55+01:00</td><td>2025-12-06T00:00:00+01:00</td><td>1970-01-01T01:00:00+01:00</td><td>1682899200</td></tr>
+<tr><td>carol</td><td>Carol C</td><td>300</td><td>2025-02-20 16:45:00</td><td>carol - 300</td><td>1</td><td>2025-12-06T21:01:55+01:00</td><td>2025-12-06T00:00:00+01:00</td><td>1970-01-01T01:00:00+01:00</td><td>1682899200</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-569"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-569')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-569')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT order_id, customer, &#34;customer name&#34;, order_date, total, ROW_NUMBER() OVER (PARTITION BY customer ORDER BY order_date) AS rn_asc, LAG(total, 1) OVER (PARTITION BY customer ORDER BY order_date) AS prev_total FROM demo_orders ORDER BY customer, order_date</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>order_id</th><th>customer</th><th>customer name</th><th>order_date</th><th>total</th><th>rn_asc</th><th>prev_total</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>1</td><td>alice</td><td>Alice A</td><td>2025-01-10 09:15:00</td><td>120</td><td>1</td><td>NULL</td></tr>
+<tr><td>2</td><td>alice</td><td>Alice A</td><td>2025-02-05 14:20:00</td><td>200</td><td>2</td><td>120</td></tr>
+<tr><td>3</td><td>bob</td><td>Robert B</td><td>2025-01-12 11:05:00</td><td>75</td><td>1</td><td>NULL</td></tr>
+<tr><td>4</td><td>bob</td><td>Robert B</td><td>2025-03-01 08:30:00</td><td>50</td><td>2</td><td>75</td></tr>
+<tr><td>5</td><td>carol</td><td>Carol C</td><td>2025-02-20 16:45:00</td><td>300</td><td>1</td><td>NULL</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-571"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-571')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-571')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">DROP TABLE demo_orders</textarea></div></div>
+	
+	<div class='ok'>(ok)</div>
+	
+	<div class="sql-block" id="sql-574"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-574')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-574')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT UPPER(TRIM(REGEXP_REPLACE(&#39;  Hello   World  &#39;, &#39;\s+&#39;, &#39; &#39;))) as normalized_string</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>normalized_string</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>HELLO WORLD</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-577"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-577')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-577')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT ARRAY_LENGTH(SPLIT(&#39;red,green,blue,yellow&#39;, &#39;,&#39;)) as color_count, ARRAY_CONTAINS(SPLIT(&#39;red,green,blue&#39;, &#39;,&#39;), &#39;green&#39;) as has_green, ARRAY_JOIN(ARRAY_SORT(ARRAY_DISTINCT(SPLIT(&#39;b,a,c,a,b&#39;, &#39;,&#39;))), &#39;,&#39;) as sorted_unique</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>color_count</th><th>has_green</th><th>sorted_unique</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>4</td><td>true</td><td>a,b,c</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-580"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-580')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-580')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">SELECT ADD_MONTHS(DATE_TRUNC(&#39;YEAR&#39;, CURRENT_DATE()), 6) as mid_year, EOMONTH(ADD_MONTHS(CURRENT_DATE(), 3), 0) as end_of_quarter, DATEDIFF(&#39;DAYS&#39;, DATE_TRUNC(&#39;YEAR&#39;, CURRENT_DATE()), EOMONTH(DATE_TRUNC(&#39;YEAR&#39;, CURRENT_DATE()), 11) ) as days_in_year</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>mid_year</th><th>end_of_quarter</th><th>days_in_year</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>2025-07-01T00:00:00+02:00</td><td>2026-03-31T00:00:00+02:00</td><td>364</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-583"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-583')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-583')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">WITH recent_sales AS ( SELECT * FROM (SELECT &#39;2025-01-01&#39; AS sale_date, &#39;A&#39; AS product) AS t ) SELECT * FROM recent_sales</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>product</th><th>sale_date</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>A</td><td>2025-01-01</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-586"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-586')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-586')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">WITH RECURSIVE nums AS ( SELECT 1 AS n UNION ALL SELECT n + 1 FROM nums WHERE n &lt; 5 ) SELECT * FROM nums ORDER BY n</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>n</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>1</td></tr>
+<tr><td>2</td></tr>
+<tr><td>3</td></tr>
+<tr><td>4</td></tr>
+<tr><td>5</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+	<div class="sql-block" id="sql-589"><div class="controls"><button type="button" class="btn" onclick="copySQL('sql-589')">Copy</button><button type="button" class="btn btn-run" onclick="runBlockQuery('sql-589')">Run</button></div><div class="sql-code"><textarea class="sql-textarea">WITH RECURSIVE fib AS ( SELECT 0 AS n, 0 AS a, 1 AS b UNION ALL SELECT n + 1, b, a + b FROM fib WHERE n &lt; 9 ) SELECT n, a AS fib_value FROM fib ORDER BY n</textarea></div><div class="static-result"><table class="results">
+<thead>
+<tr>
+<th>n</th><th>fib_value</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>0</td><td>0</td></tr>
+<tr><td>1</td><td>1</td></tr>
+<tr><td>2</td><td>1</td></tr>
+<tr><td>3</td><td>2</td></tr>
+<tr><td>4</td><td>3</td></tr>
+<tr><td>5</td><td>5</td></tr>
+<tr><td>6</td><td>8</td></tr>
+<tr><td>7</td><td>13</td></tr>
+<tr><td>8</td><td>21</td></tr>
+<tr><td>9</td><td>34</td></tr>
+</tbody>
+</table>
+</div></div>
+	
+	<hr/>
+	
+</div>
+<div id="toast" class="toast" aria-live="polite"></div>
+</body>
+</html>

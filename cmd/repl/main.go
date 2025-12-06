@@ -377,6 +377,7 @@ func printJSON(out []map[string]any) {
 		}
 	}
 	fmt.Println("]")
+
 }
 
 // rowsToSlice reads all rows into a slice of maps so callers can render them
@@ -595,10 +596,15 @@ const htmlPageTemplate = `<!doctype html>
 
 		.sql-block{background:var(--card);border:1px solid var(--border);padding:12px;margin:12px 0;border-radius:12px;position:relative;
 			box-shadow:0 1px 2px rgba(15,23,42,0.06)}
-		.sql-block .controls{position:absolute;top:10px;right:10px;display:flex;gap:6px}
-		.sql-block.collapsed pre{display:none}
-		pre{margin:0;white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,monospace;font-size:13px;line-height:1.45;
-			background:linear-gradient(180deg,var(--codebg),color-mix(in srgb, var(--codebg) 70%, transparent));padding:10px;border-radius:10px;border:1px solid var(--border)}
+		.sql-block .controls{position:absolute;top:10px;right:10px;display:flex;gap:6px;z-index:2}
+		.sql-code{margin-top:8px}
+		.sql-textarea{width:98%;min-height:70px;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,monospace;font-size:13px;line-height:1.45;
+			background:linear-gradient(180deg,var(--codebg),color-mix(in srgb, var(--codebg) 70%, transparent));padding:10px;border-radius:10px;border:1px solid var(--border);resize:vertical}
+		.static-result{margin-top:12px;opacity:0.6;position:relative}
+		.static-result::before{content:'Generated Result';display:block;font-size:11px;color:var(--muted);margin-bottom:6px;font-weight:600}
+		.inline-result{margin-top:12px;border-radius:10px;background:var(--card);position:relative}
+		.inline-result::before{content:'▶ Live Result';display:block;font-size:11px;color:var(--accent);margin-bottom:8px;font-weight:700}
+		.btn[disabled]{opacity:0.5;cursor:not-allowed}
 		.results-wrap{overflow:auto;border-radius:12px;border:1px solid var(--border);margin:12px 0}
 		table.results{border-collapse:separate;border-spacing:0;width:100%;background:transparent}
 		table.results th,table.results td{border-bottom:1px solid var(--border);padding:10px;text-align:left;font-size:13px;background:var(--card)}
@@ -621,38 +627,23 @@ const htmlPageTemplate = `<!doctype html>
 			<p class="lead">{{.Lead}}</p>
 		</div>
 		<div class="actions">
-			<button type="button" class="btn" onclick="expandAll()">Expand all</button>
-			<button type="button" class="btn" onclick="collapseAll()">Collapse all</button>
+			<button id="init-wasm" class="btn" type="button" onclick="initWasm()">Init WASM</button>
 		</div>
 	</div>
 
-	<script>
-		function toggle(id){
-			const e=document.getElementById(id);
-			if(!e) return;
-			e.classList.toggle('collapsed');
-			const btn=e.querySelector('[data-role="toggle"]');
-			if(btn) btn.textContent = e.classList.contains('collapsed') ? 'Show SQL' : 'Hide SQL';
-		}
-		function setAll(collapsed){
-			document.querySelectorAll('.sql-block').forEach(e=>{
-				if(collapsed) e.classList.add('collapsed'); else e.classList.remove('collapsed');
-				const btn=e.querySelector('[data-role="toggle"]');
-				if(btn) btn.textContent = collapsed ? 'Show SQL' : 'Hide SQL';
-			});
-		}
-		function collapseAll(){ setAll(true); }
-		function expandAll(){ setAll(false); }
-
+		<!--<script src="tinysql-runner.js" defer></script>-->
+		<script>
+		// Copy SQL helper: works with <pre> or <textarea> inside the sql-block.
 		function copySQL(id){
 			const e=document.getElementById(id);
 			if(!e) return;
 			const pre=e.querySelector('pre');
-			if(!pre) return;
-			const t=pre.innerText;
+			const ta=e.querySelector('textarea');
+			const t = ta ? ta.value : (pre ? pre.innerText : '');
+			if(!t) return;
 			if(navigator.clipboard && navigator.clipboard.writeText){
 				navigator.clipboard.writeText(t).then(()=>toast('Copied SQL'), ()=>fallbackCopy(t));
-			}else{
+			} else {
 				fallbackCopy(t);
 			}
 		}
@@ -660,7 +651,7 @@ const htmlPageTemplate = `<!doctype html>
 			const ta=document.createElement('textarea');
 			ta.value=t; document.body.appendChild(ta);
 			ta.select();
-			try{ document.execCommand('copy'); toast('Copied SQL'); }catch(_){}
+			try{ document.execCommand('copy'); toast('Copied SQL'); }catch(e){}
 			document.body.removeChild(ta);
 		}
 		let toastTimer;
@@ -672,9 +663,147 @@ const htmlPageTemplate = `<!doctype html>
 			clearTimeout(toastTimer);
 			toastTimer=setTimeout(()=>el.classList.remove('show'), 1200);
 		}
-	</script>
 
-	{{range .Parts}}
+		// Simple HTML escape helper used when rendering inline results.
+		function escapeHtml(s){
+			return String(s).replace(/[&<>\"]/g, function(c){
+				switch(c){case '&': return '&amp;'; case '<': return '&lt;'; case '>': return '&gt;'; case '"': return '&quot;';}
+				return c;
+			});
+		}
+
+		// Run SQL from a sql-block using available WASM APIs (if any).
+		function checkWasm(){
+			return (typeof executeQuery_wasm === 'function') || (window.wasmApi && typeof window.wasmApi.executeQuery === 'function');
+		}
+
+		async function initWasm(){
+			// If the page already exposes a wasmApi initializer, call it.
+			if(window.wasmApi && typeof window.wasmApi.init === 'function'){
+				try{ await window.wasmApi.init(); toast('WASM initialized'); updateRunButtons(); return; }catch(e){ toast('WASM init failed: '+(e && e.message?e.message:String(e))); }
+			}
+
+			// Otherwise try to dynamically load the frontend script that usually
+			// registers window.wasmApi (try several common locations).
+			function loadScript(url){
+				return new Promise((resolve,reject)=>{
+					try{
+						// If a script with same src already exists, don't load it again.
+						if(document.querySelector('script[src="'+url+'"]')) return resolve(url);
+					}catch(e){ /* ignore DOM errors */ }
+					const s=document.createElement('script'); s.src=url; s.async=true;
+					s.onload = ()=>resolve(url);
+					s.onerror = ()=>reject(new Error('failed to load '+url));
+					document.head.appendChild(s);
+				});
+			}
+
+			// Load required scripts: wasm_exec.js (Go runtime), then wasm-init.js (minimal loader)
+			const candidates = ['wasm_exec.js', 'cmd/query_files_wasm/wasm-init.js'];
+			for(const url of candidates){
+				try{
+					await loadScript(url);
+					// After loading wasm-init.js, call window.initWasm()
+					if(url.includes('wasm-init.js')){
+						// Wait for window.initWasm to be defined
+						for(let i=0; i<50 && typeof window.initWasm !== 'function'; i++){
+							await new Promise(r=>setTimeout(r,100));
+						}
+						if(typeof window.initWasm === 'function'){
+							try{
+								await window.initWasm();
+								toast('WASM initialized');
+								updateRunButtons();
+								return;
+							}catch(e){
+								console.error('initWasm failed:', e);
+								toast('WASM init failed: '+(e && e.message?e.message:String(e)));
+							}
+						} else {
+							console.warn('wasm-init.js loaded but window.initWasm not found');
+						}
+					}
+				} catch(e) {
+					console.warn('Failed to load '+url+':', e);
+				}
+			}
+
+			toast('WASM init not available');
+		}
+
+		function updateRunButtons(){
+			const ok = checkWasm();
+			document.querySelectorAll('.btn-run').forEach(b=>{ b.disabled = !ok; if(!ok) b.title = 'WASM unavailable — click Init WASM to try'; else b.title='Run this query'; });
+			const initBtn = document.getElementById('init-wasm'); if(initBtn) initBtn.disabled = ok;
+		}
+
+		document.addEventListener('DOMContentLoaded', async ()=>{ 
+			updateRunButtons(); 
+			// Auto-initialize WASM on page load
+			await initWasm();
+		});
+
+		async function runBlockQuery(id){
+				const block = document.getElementById(id);
+				if(!block) return;
+			const ta = block.querySelector('textarea');
+				const sql = ta ? ta.value.trim() : '';
+				if(!sql) { toast('No SQL found'); return; }
+
+			// If WASM not available show helpful guidance
+			if(!checkWasm()){
+				toast('WASM execute function not available — click Init WASM');
+				const prev = block.querySelector('.inline-result');
+				if(prev) prev.remove();
+				const msg = document.createElement('div'); msg.className='inline-result'; msg.innerHTML = '<div class="err">WASM execute function not available. Click "Init WASM" to attempt initialization or serve the demo assets (app.js + query_files.wasm).</div>';
+				block.appendChild(msg);
+				return;
+			}
+
+			// Remove static result and any previous inline result
+				const staticResult = block.querySelector('.static-result');
+				if(staticResult) staticResult.remove();
+				const prev = block.querySelector('.inline-result');
+				if(prev) prev.remove();
+				const resultWrap = document.createElement('div');
+				resultWrap.className = 'inline-result';
+			resultWrap.setAttribute('aria-live','polite');
+				resultWrap.innerHTML = '<div class="ok">Running...</div>';
+				block.appendChild(resultWrap);
+				try{
+					// Call executeQuery_wasm (provided by wasm-init.js)
+					if(typeof executeQuery_wasm !== 'function'){
+						resultWrap.innerHTML = '<div class="err">WASM execute function not available</div>';
+						return;
+					}
+					let res = executeQuery_wasm(sql);
+					// Support Promise-based results (though executeQuery_wasm returns sync)
+					if(res && typeof res.then === 'function'){
+						res = await res;
+					}
+					if(!res){
+						resultWrap.innerHTML = '<div class="err">No result returned</div>';
+						return;
+					}
+					if(res.success){
+						const cols = Array.isArray(res.columns) ? res.columns : [];
+						const rows = Array.isArray(res.rows) ? res.rows : [];
+						let html = '<div class="results-wrap"><table class="results"><thead><tr>';
+						for(const c of cols) html += '<th>'+escapeHtml(String(c))+'</th>';
+						html += '</tr></thead><tbody>';
+						for(const r of rows){ html += '<tr>'; for(const c of cols){ const v = r[c]; html += '<td>'+ (v==null? 'NULL' : escapeHtml(String(v))) +'</td>'; } html += '</tr>'; }
+						html += '</tbody></table></div>';
+						resultWrap.innerHTML = html;
+					}else{
+						resultWrap.innerHTML = '<div class="err">'+escapeHtml(String(res.error || 'Query failed'))+'</div>';
+					}
+				} catch(err){
+					resultWrap.innerHTML = '<div class="err">'+escapeHtml(err && err.message ? err.message : String(err))+'</div>';
+				}
+			}
+		</script>
+
+		{{range .Parts}}
 	{{.}}
 	{{end}}
 </div>
@@ -685,7 +814,7 @@ const htmlPageTemplate = `<!doctype html>
 
 var htmlPageTmpl = template.Must(template.New("page").Parse(htmlPageTemplate))
 
-func decorateHTMLFragment(p string, i int) string {
+func decorateHTMLFragment(p string, i int, next string) string {
 	// Wrap result tables for horizontal scrolling on small screens.
 	if strings.Contains(p, "<table class=\"results\">") {
 		p = strings.Replace(p, "<table class=\"results\">", "<div class=\"results-wrap\"><table class=\"results\">", 1)
@@ -693,17 +822,47 @@ func decorateHTMLFragment(p string, i int) string {
 	}
 
 	if !strings.Contains(p, "class=\"sql-block\"") {
+		// If caller provided a next fragment but this is not a sql-block,
+		// just append next after p so non-sql fragments are preserved.
+		if next != "" {
+			return p + next
+		}
 		return p
 	}
 
 	id := fmt.Sprintf("sql-%d", i)
 
-	// Add id + default collapsed state.
-	p = strings.Replace(p, "class=\"sql-block\"", fmt.Sprintf("class=\"sql-block collapsed\" id=\"%s\"", id), 1)
+	// Add id; do not collapse. Replace <pre> with a readonly textarea to
+	// better preserve formatting and allow easy copying/selection.
+	p = strings.Replace(p, "class=\"sql-block\"", fmt.Sprintf("class=\"sql-block\" id=\"%s\"", id), 1)
 
-	// Add controls just before <pre>.
-	controls := fmt.Sprintf("<div class=\"controls\"><button type=\"button\" class=\"btn\" data-role=\"toggle\" onclick=\"toggle('%s')\">Show SQL</button><button type=\"button\" class=\"btn\" onclick=\"copySQL('%s')\">Copy</button></div>", id, id)
-	p = strings.Replace(p, "<pre>", controls+"<pre>", 1)
+	// Add copy control (no toggle) and replace the pre block with textarea
+	// while preserving the contained HTML-escaped text.
+	controls := fmt.Sprintf("<div class=\"controls\"><button type=\"button\" class=\"btn\" onclick=\"copySQL('%s')\">Copy</button><button type=\"button\" class=\"btn btn-run\" onclick=\"runBlockQuery('%s')\">Run</button></div>", id, id)
+	// Replace only the first <pre> occurrence.
+	if strings.Contains(p, "<pre>") {
+		// Make the textarea editable so users can tweak and re-run example queries.
+		p = strings.Replace(p, "<pre>", controls+"<div class=\"sql-code\"><textarea class=\"sql-textarea\">", 1)
+		p = strings.Replace(p, "</pre>", "</textarea></div>", 1)
+	} else {
+		// Fallback: just inject controls
+		p = strings.Replace(p, "class=\"sql-block\"", fmt.Sprintf("class=\"sql-block\" id=\"%s\"", id), 1)
+		p = strings.Replace(p, "</div>\n", controls+"</div>\n", 1)
+	}
+
+	// If caller provided a next fragment (results/error/ok), wrap it with
+	// static-result class and insert before the final closing `</div>`
+	if next != "" {
+		// Wrap static results to distinguish from dynamic inline results
+		next = "<div class=\"static-result\">" + next + "</div>"
+		// Find the last closing div of this fragment and insert next before it.
+		li := strings.LastIndex(p, "</div>")
+		if li != -1 {
+			p = p[:li] + next + p[li:]
+		} else {
+			p = p + next
+		}
+	}
 
 	return p
 }
@@ -712,13 +871,23 @@ func decorateHTMLFragment(p string, i int) string {
 func emitHTMLPage(parts []string) {
 	data := htmlPageData{
 		Title: "tinySQL - Function Examples",
-		Lead:  "Auto-generated from input SQL. Results are shown below; click “Show SQL” to reveal the statements.",
+		Lead:  "Auto-generated from input SQL. Results are shown below; SQL is visible above each result.",
 		Parts: make([]template.HTML, 0, len(parts)),
 	}
 
-	for i, p := range parts {
-		// Inject show/copy controls into SQL blocks.
-		p = decorateHTMLFragment(p, i)
+	for i := 0; i < len(parts); i++ {
+		p := parts[i]
+		var next string
+		// If the next fragment looks like a result (table, err, or ok), merge it.
+		if i+1 < len(parts) {
+			nxt := parts[i+1]
+			if strings.Contains(nxt, "class=\"results-wrap\"") || strings.Contains(nxt, "<table class=\"results\"") || strings.Contains(nxt, "class=\"err\"") || strings.Contains(nxt, "class=\"ok\"") {
+				next = nxt
+				i++ // skip the merged fragment
+			}
+		}
+		// Inject show/copy controls into SQL blocks and optionally merge next.
+		p = decorateHTMLFragment(p, i, next)
 		data.Parts = append(data.Parts, template.HTML(p))
 	}
 
