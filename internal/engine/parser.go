@@ -202,24 +202,27 @@ const (
 
 // Select represents a SELECT query and its clauses.
 type Select struct {
-	Distinct bool
-	From     FromItem
-	Joins    []JoinClause
-	Projs    []SelectItem
-	Where    Expr
-	GroupBy  []Expr
-	Having   Expr
-	OrderBy  []OrderItem
-	Limit    *int
-	Offset   *int
-	Union    *UnionClause // For UNION operations
-	CTEs     []CTE        // Common Table Expressions
+	Distinct   bool
+	DistinctOn []Expr
+	From       FromItem
+	Joins      []JoinClause
+	Projs      []SelectItem
+	Where      Expr
+	GroupBy    []Expr
+	Having     Expr
+	OrderBy    []OrderItem
+	Limit      *int
+	Offset     *int
+	Union      *UnionClause // For UNION operations
+	CTEs       []CTE        // Common Table Expressions
 }
 
 // CTE represents a Common Table Expression (WITH clause)
 type CTE struct {
 	Name   string
 	Select *Select
+	// Recursive indicates this CTE was declared under WITH RECURSIVE
+	Recursive bool
 }
 
 type UnionType int
@@ -770,11 +773,39 @@ func (p *Parser) parseSelectWithCTE() (*Select, error) {
 	if p.cur.Typ == tKeyword && p.cur.Val == "WITH" {
 		p.next()
 
+		// Optional RECURSIVE keyword applies to all following CTEs
+		recursiveAll := false
+		if p.cur.Typ == tKeyword && p.cur.Val == "RECURSIVE" {
+			recursiveAll = true
+			p.next()
+		}
+
 		for {
 			// Parse CTE name
 			cteName := p.parseIdentLike()
 			if cteName == "" {
 				return nil, p.errf("expected CTE name")
+			}
+
+			// Optional column list: WITH cte(col1, col2) AS (...)
+			if p.cur.Typ == tSymbol && p.cur.Val == "(" {
+				// consume '(' and skip until matching ')'
+				p.next()
+				for {
+					// accept identifier-like column names
+					if p.cur.Typ != tIdent && p.cur.Typ != tKeyword {
+						return nil, p.errf("expected column name in CTE column list")
+					}
+					p.next()
+					if p.cur.Typ == tSymbol && p.cur.Val == "," {
+						p.next()
+						continue
+					}
+					break
+				}
+				if err := p.expectSymbol(")"); err != nil {
+					return nil, err
+				}
 			}
 
 			if err := p.expectKeyword("AS"); err != nil {
@@ -795,7 +826,7 @@ func (p *Parser) parseSelectWithCTE() (*Select, error) {
 				return nil, err
 			}
 
-			ctes = append(ctes, CTE{Name: cteName, Select: cteSelect})
+			ctes = append(ctes, CTE{Name: cteName, Select: cteSelect, Recursive: recursiveAll})
 
 			// Check for more CTEs
 			if p.cur.Typ == tSymbol && p.cur.Val == "," {
@@ -879,8 +910,35 @@ func (p *Parser) parseSelect() (*Select, error) {
 
 func (p *Parser) parseDistinct(sel *Select) error {
 	if p.cur.Typ == tKeyword && p.cur.Val == "DISTINCT" {
-		sel.Distinct = true
 		p.next()
+		// Check for DISTINCT ON (expr, ...)
+		if p.cur.Typ == tKeyword && p.cur.Val == "ON" {
+			p.next()
+			if err := p.expectSymbol("("); err != nil {
+				return err
+			}
+			var exprs []Expr
+			for {
+				e, err := p.parseExpr()
+				if err != nil {
+					return err
+				}
+				exprs = append(exprs, e)
+				if p.cur.Typ == tSymbol && p.cur.Val == "," {
+					p.next()
+					continue
+				}
+				break
+			}
+			if err := p.expectSymbol(")"); err != nil {
+				return err
+			}
+			sel.DistinctOn = exprs
+			// Also mark generic Distinct true for compatibility
+			sel.Distinct = true
+			return nil
+		}
+		sel.Distinct = true
 	}
 	return nil
 }
@@ -1591,7 +1649,8 @@ func (p *Parser) parsePrimary() (Expr, error) {
 			return &SubqueryExpr{Select: sel}, nil
 		case "COUNT", "SUM", "AVG", "MIN", "MAX", "MEDIAN", "COALESCE", "NVL", "IFNULL", "NULLIF",
 			"JSON_GET", "JSON_SET", "JSON_EXTRACT",
-			"NOW", "CURRENT_TIME", "CURRENT_DATE", "DATEDIFF",
+			"NOW", "CURRENT_TIME", "CURRENT_DATE", "CURRENT_TIMESTAMP", "GETDATE", "TODAY",
+			"DATEDIFF", "FROM_TIMESTAMP", "TIMESTAMP",
 			"LTRIM", "RTRIM", "TRIM", "ISNULL",
 			"BASE64", "BASE64_DECODE",
 			"UPPER", "LOWER", "CONCAT", "CONCAT_WS", "LENGTH", "SUBSTRING", "SUBSTR",

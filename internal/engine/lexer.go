@@ -231,6 +231,8 @@ func upper(s string) string {
 
 func isKeyword(up string) bool {
 	switch up {
+	case "RECURSIVE":
+		return true
 	case "SELECT", "DISTINCT", "FROM", "WHERE", "GROUP", "BY", "HAVING",
 		"ORDER", "ASC", "DESC", "LIMIT", "OFFSET",
 		"CASE", "WHEN", "THEN", "ELSE", "END",

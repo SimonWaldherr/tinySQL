@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"flag"
 	"fmt"
+	"html"
+	"html/template"
 	"os"
 	"strings"
 
@@ -14,42 +16,93 @@ import (
 var flagDSN = flag.String("dsn", "mem://?tenant=default", "DSN (mem:// or file:/path.db?tenant=...&autosave=1)")
 var flagEcho = flag.Bool("echo", false, "Echo SQL statements before execution")
 var flagFormat = flag.String("format", "table", "Output format: table, csv, tsv, json, yaml, markdown")
+var flagBeautiful = flag.Bool("beautiful", false, "Pretty-print SQL blocks and results (group statements until next SELECT)")
+var flagHTML = flag.Bool("html", false, "Emit a single HTML page showing the SQL blocks and results (useful when redirecting input)")
 
 func main() {
 	flag.Parse()
 
 	db, err := sql.Open("tinysql", *flagDSN)
 	if err != nil {
-		fmt.Println("open error:", err)
+		fmt.Fprintln(os.Stderr, "open error:", err)
 		return
 	}
 	defer db.Close()
 
-	runREPL(db, *flagEcho, *flagFormat)
+	runREPL(db, *flagEcho, *flagFormat, *flagBeautiful, *flagHTML)
 }
 
-func runREPL(db *sql.DB, echo bool, format string) {
-	fmt.Println("tinysql REPL (database/sql). Statement mit ';' beenden. '.help' für Hilfe.")
+func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool) {
 	sc := bufio.NewScanner(os.Stdin)
+	// Scanner token limit is 64K by default; allow larger statements/files.
+	sc.Buffer(make([]byte, 1024), 4*1024*1024)
+
 	var buf strings.Builder
 	firstPrompt := true
+
+	// If stdin is not a terminal (e.g., redirected from a file) suppress
+	// interactive prompts like `sql>` to keep non-interactive output clean.
+	interactive := false
+	if fi, err := os.Stdin.Stat(); err == nil {
+		interactive = (fi.Mode() & os.ModeCharDevice) != 0
+	}
+
+	// Keep HTML output clean: never print banners/prompts to stdout in htmlMode.
+	if interactive && !htmlMode {
+		fmt.Println("tinysql REPL (database/sql). Statement mit ';' beenden. '.help' für Hilfe.")
+	}
+
+	// srcLines accumulates all input lines since the last printed SELECT (when
+	// running in beautiful mode). We keep comments and DDL/DML lines here and
+	// print them as a block when a SELECT produces output.
+	var srcLines []string
+
+	// When htmlMode is enabled, collect rendered HTML fragments here and
+	// emit a single HTML document at the end of the run.
+	var htmlParts []string
+
 	for {
 		if buf.Len() == 0 {
-			if !firstPrompt {
-				fmt.Println()
+			// Only print spacing/newlines and prompts in interactive mode.
+			if interactive && !htmlMode {
+				if !firstPrompt {
+					fmt.Println()
+				}
+				firstPrompt = false
+				fmt.Print("sql> ")
 			}
-			firstPrompt = false
-			fmt.Print("sql> ")
 		} else {
-			fmt.Print(" ... ")
+			if interactive && !htmlMode {
+				fmt.Print(" ... ")
+			}
 		}
+
 		if !sc.Scan() {
-			fmt.Println()
+			// Input closed (or read error).
+			if err := sc.Err(); err != nil {
+				if htmlMode {
+					htmlParts = append(htmlParts, "<div class='err'>ERR: "+html.EscapeString(err.Error())+"</div>")
+				} else {
+					fmt.Fprintln(os.Stderr, "read error:", err)
+				}
+			}
+
+			if htmlMode {
+				emitHTMLPage(htmlParts)
+			}
 			return
 		}
-		line := strings.TrimSpace(sc.Text())
 
-		// Skip pure comment lines
+		raw := sc.Text()
+		line := strings.TrimSpace(raw)
+
+		// Always collect source lines when beautiful mode is enabled so we can
+		// print the full block (comments, creates, inserts, etc.) later.
+		if beautiful {
+			srcLines = append(srcLines, raw)
+		}
+
+		// Skip pure comment or empty lines for execution-building as before
 		if line == "" || strings.HasPrefix(line, "--") || strings.HasPrefix(line, "/*") {
 			continue
 		}
@@ -59,30 +112,124 @@ func runREPL(db *sql.DB, echo bool, format string) {
 				continue
 			}
 		}
+
 		buf.WriteString(line)
 		if strings.HasSuffix(line, ";") {
-			q := strings.TrimSpace(strings.TrimSuffix(buf.String(), ";"))
+			q := strings.TrimSpace(buf.String())
+			q = strings.TrimSpace(strings.TrimSuffix(q, ";"))
 			buf.Reset()
-			if q == "" {
-				continue
-			}
-			if echo {
+
+			if echo && !beautiful && !htmlMode {
+				// In non-beautiful mode preserve existing echo behaviour. When
+				// beautiful is enabled we print the accumulated block instead.
 				fmt.Println("--", q)
 			}
+
 			up := strings.ToUpper(q)
-			if strings.HasPrefix(up, "SELECT") {
+			var sqlFrag string
+
+			// Treat plain SELECT and WITH (CTE) statements as queries that return rows.
+			if strings.HasPrefix(up, "SELECT") || strings.HasPrefix(up, "WITH") {
 				rows, err := db.Query(q)
+				if beautiful {
+					// Prepare the accumulated SQL block (preserve whitespace)
+					if htmlMode {
+						sqlFrag = renderBeautifulBlockHTML(srcLines)
+					} else {
+						printBeautifulBlock(srcLines)
+					}
+				} else if htmlMode {
+					// When not in beautiful mode but producing HTML, always include the executed SQL text.
+					sqlFrag = renderSQLHTML(q)
+				}
+
 				if err != nil {
-					fmt.Println("ERR:", err)
+					if htmlMode {
+						if sqlFrag != "" {
+							htmlParts = append(htmlParts, sqlFrag)
+						} else {
+							htmlParts = append(htmlParts, renderSQLHTML(q))
+						}
+						htmlParts = append(htmlParts, "<div class='err'>ERR: "+html.EscapeString(err.Error())+"</div>")
+						htmlParts = append(htmlParts, "<hr/>")
+					} else {
+						fmt.Println("ERR:", err)
+					}
+					// Drop the accumulated source so we don't repeatedly print failing statements.
+					if beautiful {
+						srcLines = nil
+					}
 					continue
 				}
-				defer rows.Close()
+
 				cols, _ := rows.Columns()
-				printRows(rows, cols, format)
-			} else {
-				if _, err := db.Exec(q); err != nil {
-					fmt.Println("ERR:", err)
+				if htmlMode {
+					out, err := rowsToSlice(rows, cols)
+					rows.Close()
+
+					// Always include SQL fragment before results/error when producing HTML.
+					if sqlFrag != "" {
+						htmlParts = append(htmlParts, sqlFrag)
+					} else {
+						htmlParts = append(htmlParts, renderSQLHTML(q))
+					}
+
+					if err != nil {
+						htmlParts = append(htmlParts, "<div class='err'>ERR: "+html.EscapeString(err.Error())+"</div>")
+					} else {
+						htmlParts = append(htmlParts, renderRowsHTML(out, cols))
+					}
+					htmlParts = append(htmlParts, "<hr/>")
 				} else {
+					printRows(rows, cols, format)
+					rows.Close()
+					if beautiful {
+						// Ensure at least one blank line separates SELECT outputs for readability
+						fmt.Println()
+					}
+				}
+
+				if beautiful {
+					// After printing results, reset accumulated source lines
+					srcLines = nil
+				}
+				continue
+			}
+
+			// Non-SELECT statements.
+			if _, err := db.Exec(q); err != nil {
+				if htmlMode {
+					// Show the statement to make errors debuggable in the HTML output.
+					if sqlFrag == "" {
+						if beautiful {
+							sqlFrag = renderBeautifulBlockHTML(srcLines)
+						} else {
+							sqlFrag = renderSQLHTML(q)
+						}
+					}
+					htmlParts = append(htmlParts, sqlFrag)
+					htmlParts = append(htmlParts, "<div class='err'>ERR: "+html.EscapeString(err.Error())+"</div>")
+				} else {
+					fmt.Println("ERR:", err)
+				}
+
+				// Drop the accumulated source so we don't repeatedly print failing statements.
+				if beautiful {
+					srcLines = nil
+				}
+				continue
+			}
+
+			if htmlMode {
+				// Show the non-select statement as a small block in the HTML.
+				if sqlFrag == "" {
+					sqlFrag = renderSQLHTML(q)
+				}
+				htmlParts = append(htmlParts, sqlFrag)
+				htmlParts = append(htmlParts, "<div class='ok'>(ok)</div>")
+			} else {
+				// In non-interactive mode (e.g. redirected input) avoid printing a flood of "(ok)" lines.
+				if interactive {
 					fmt.Println("(ok)")
 				}
 			}
@@ -232,6 +379,354 @@ func printJSON(out []map[string]any) {
 	fmt.Println("]")
 }
 
+// rowsToSlice reads all rows into a slice of maps so callers can render them
+// into different output formats (table, html, json, ...).
+func rowsToSlice(rows *sql.Rows, cols []string) ([]map[string]any, error) {
+	type rowMap = map[string]any
+	var out []rowMap
+	for rows.Next() {
+		cells := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range cells {
+			ptrs[i] = &cells[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		m := rowMap{}
+		for i, c := range cols {
+			m[c] = dePtr(ptrs[i])
+		}
+		out = append(out, m)
+	}
+	return out, nil
+}
+
+// renderRowsHTML returns an HTML table for the given rows and columns.
+func renderRowsHTML(out []map[string]any, cols []string) string {
+	var b strings.Builder
+	b.WriteString("<table class=\"results\">\n<thead>\n<tr>\n")
+	for _, c := range cols {
+		b.WriteString("<th>" + html.EscapeString(c) + "</th>")
+	}
+	b.WriteString("\n</tr>\n</thead>\n<tbody>\n")
+	for _, r := range out {
+		b.WriteString("<tr>")
+		for _, c := range cols {
+			v := r[c]
+			s := "NULL"
+			if v != nil {
+				s = fmt.Sprintf("%v", v)
+			}
+			b.WriteString("<td>" + html.EscapeString(s) + "</td>")
+		}
+		b.WriteString("</tr>\n")
+	}
+	b.WriteString("</tbody>\n</table>\n")
+	return b.String()
+}
+
+// renderBeautifulBlockHTML returns an HTML fragment containing the SQL block
+// with preserved whitespace.
+func isSeparatorLine(s string) bool {
+	if len(s) < 3 {
+		return false
+	}
+	for _, r := range s {
+		switch r {
+		case '=', '-', '_', '*':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func isAllCaps(s string) bool {
+	hasLetter := false
+	for _, r := range s {
+		if r >= 'a' && r <= 'z' {
+			return false
+		}
+		if r >= 'A' && r <= 'Z' {
+			hasLetter = true
+		}
+	}
+	return hasLetter
+}
+
+func looksLikeIdentifier(s string) bool {
+	if s == "" || strings.Contains(s, " ") {
+		return false
+	}
+	for i, r := range s {
+		if i == 0 {
+			if !(r == '_' || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z')) {
+				return false
+			}
+		} else {
+			if !(r == '_' || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// splitFuncHeading parses comment headings like:
+//
+//	-- ROW_NUMBER: Assign unique row numbers
+func splitFuncHeading(text string) (name, desc string, ok bool) {
+	parts := strings.SplitN(text, ":", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	name = strings.TrimSpace(parts[0])
+	desc = strings.TrimSpace(parts[1])
+	if name == "" || desc == "" {
+		return "", "", false
+	}
+	if name == "NEW" {
+		return "", "", false
+	}
+	if !looksLikeIdentifier(name) {
+		return "", "", false
+	}
+	// Heuristic: function headings in FUNCTIONS.sql are typically ALL CAPS identifiers.
+	if strings.ToUpper(name) != name {
+		return "", "", false
+	}
+	return name, desc, true
+}
+
+// renderBeautifulBlockHTML returns an HTML fragment containing any human-readable
+// comment headings *outside* the collapsible SQL <pre>, then the SQL block itself.
+func renderBeautifulBlockHTML(lines []string) string {
+	var head strings.Builder
+	var sql strings.Builder
+
+	for _, raw := range lines {
+		rawLine := strings.TrimRight(raw, "\r\n")
+		trim := strings.TrimSpace(rawLine)
+
+		if strings.HasPrefix(trim, "--") {
+			text := strings.TrimSpace(strings.TrimPrefix(trim, "--"))
+			if text == "" || isSeparatorLine(text) {
+				continue
+			}
+
+			if name, desc, ok := splitFuncHeading(text); ok {
+				head.WriteString("<h3 class=\"func\"><code>" + html.EscapeString(name) + "</code><span class=\"muted\"> — " + html.EscapeString(desc) + "</span></h3>\n")
+				continue
+			}
+			if isAllCaps(text) {
+				head.WriteString("<h2>" + html.EscapeString(text) + "</h2>\n")
+				continue
+			}
+			head.WriteString("<div class=\"caption\">" + html.EscapeString(text) + "</div>\n")
+			continue
+		}
+
+		if trim == "" {
+			continue
+		}
+		sql.WriteString(html.EscapeString(rawLine))
+		sql.WriteString("\n")
+	}
+
+	var b strings.Builder
+	if head.Len() > 0 {
+		b.WriteString("<div class=\"doc-head\">\n")
+		b.WriteString(head.String())
+		b.WriteString("</div>\n")
+	}
+	b.WriteString("<div class=\"sql-block\"><pre>")
+	b.WriteString(sql.String())
+	b.WriteString("</pre></div>\n")
+	return b.String()
+}
+
+// renderSQLHTML creates a compact HTML fragment containing the SQL text.
+func renderSQLHTML(q string) string {
+	return "<div class=\"sql-block\"><pre>" + html.EscapeString(q) + "</pre></div>"
+}
+
+type htmlPageData struct {
+	Title string
+	Lead  string
+	Parts []template.HTML
+}
+
+const htmlPageTemplate = `<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>{{.Title}}</title>
+	<style>
+		:root{
+			--bg:#f3f4f6;--card:#ffffff;--text:#0f172a;--muted:#6b7280;--accent:#0b69ff;
+			--border:#e6eef8;--codebg:#f8fafc;
+		}
+		@media (prefers-color-scheme: dark){
+			:root{--bg:#0b0f19;--card:#0f172a;--text:#e5e7eb;--muted:#94a3b8;--accent:#60a5fa;--border:#1f2a44;--codebg:#0b1220;}
+		}
+		body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--text);padding:28px}
+		.container{max-width:1100px;margin:0 auto}
+		.topbar{position:sticky;top:14px;z-index:5;background:color-mix(in srgb, var(--bg) 70%, transparent);backdrop-filter:blur(10px);
+			border:1px solid var(--border);border-radius:12px;padding:12px 14px;display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:16px}
+		h1{font-size:20px;margin:0}
+		p.lead{margin:4px 0 0;color:var(--muted);font-size:13px}
+		.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+		.btn{display:inline-flex;align-items:center;gap:8px;padding:7px 10px;background:var(--card);border:1px solid var(--border);
+			border-radius:10px;font-size:13px;cursor:pointer;color:var(--accent)}
+		.btn:hover{filter:brightness(0.98)}
+		.btn:active{transform:translateY(1px)}
+		hr{border:none;border-top:1px solid var(--border);margin:18px 0}
+
+		.doc-head{margin:18px 2px 8px}
+		.doc-head h2{font-size:16px;margin:18px 0 6px}
+		.doc-head h3{font-size:14px;margin:12px 0 6px}
+		.doc-head .caption{color:var(--muted);font-size:13px;margin:8px 0 4px}
+		.doc-head code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,monospace;font-size:12px;background:var(--codebg);
+			border:1px solid var(--border);padding:2px 6px;border-radius:8px}
+		.doc-head .muted{color:var(--muted);font-weight:500;margin-left:6px}
+
+		.sql-block{background:var(--card);border:1px solid var(--border);padding:12px;margin:12px 0;border-radius:12px;position:relative;
+			box-shadow:0 1px 2px rgba(15,23,42,0.06)}
+		.sql-block .controls{position:absolute;top:10px;right:10px;display:flex;gap:6px}
+		.sql-block.collapsed pre{display:none}
+		pre{margin:0;white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,monospace;font-size:13px;line-height:1.45;
+			background:linear-gradient(180deg,var(--codebg),color-mix(in srgb, var(--codebg) 70%, transparent));padding:10px;border-radius:10px;border:1px solid var(--border)}
+		.results-wrap{overflow:auto;border-radius:12px;border:1px solid var(--border);margin:12px 0}
+		table.results{border-collapse:separate;border-spacing:0;width:100%;background:transparent}
+		table.results th,table.results td{border-bottom:1px solid var(--border);padding:10px;text-align:left;font-size:13px;background:var(--card)}
+		table.results th{background:var(--codebg);color:var(--muted);font-weight:700}
+		table.results tr:last-child td{border-bottom:none}
+
+		.err{color:#b31d28;font-weight:700;margin:8px 0}
+		.ok{color:#15803d;font-weight:700;margin:8px 0;font-size:13px}
+
+		.toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);padding:10px 12px;border-radius:12px;
+			background:rgba(15,23,42,0.90);color:#fff;font-size:13px;opacity:0;pointer-events:none;transition:opacity .12s ease,transform .12s ease}
+		.toast.show{opacity:1;transform:translateX(-50%) translateY(-6px)}
+	</style>
+</head>
+<body>
+<div class="container">
+	<div class="topbar">
+		<div>
+			<h1>{{.Title}}</h1>
+			<p class="lead">{{.Lead}}</p>
+		</div>
+		<div class="actions">
+			<button type="button" class="btn" onclick="expandAll()">Expand all</button>
+			<button type="button" class="btn" onclick="collapseAll()">Collapse all</button>
+		</div>
+	</div>
+
+	<script>
+		function toggle(id){
+			const e=document.getElementById(id);
+			if(!e) return;
+			e.classList.toggle('collapsed');
+			const btn=e.querySelector('[data-role="toggle"]');
+			if(btn) btn.textContent = e.classList.contains('collapsed') ? 'Show SQL' : 'Hide SQL';
+		}
+		function setAll(collapsed){
+			document.querySelectorAll('.sql-block').forEach(e=>{
+				if(collapsed) e.classList.add('collapsed'); else e.classList.remove('collapsed');
+				const btn=e.querySelector('[data-role="toggle"]');
+				if(btn) btn.textContent = collapsed ? 'Show SQL' : 'Hide SQL';
+			});
+		}
+		function collapseAll(){ setAll(true); }
+		function expandAll(){ setAll(false); }
+
+		function copySQL(id){
+			const e=document.getElementById(id);
+			if(!e) return;
+			const pre=e.querySelector('pre');
+			if(!pre) return;
+			const t=pre.innerText;
+			if(navigator.clipboard && navigator.clipboard.writeText){
+				navigator.clipboard.writeText(t).then(()=>toast('Copied SQL'), ()=>fallbackCopy(t));
+			}else{
+				fallbackCopy(t);
+			}
+		}
+		function fallbackCopy(t){
+			const ta=document.createElement('textarea');
+			ta.value=t; document.body.appendChild(ta);
+			ta.select();
+			try{ document.execCommand('copy'); toast('Copied SQL'); }catch(_){}
+			document.body.removeChild(ta);
+		}
+		let toastTimer;
+		function toast(msg){
+			const el=document.getElementById('toast');
+			if(!el) return;
+			el.textContent=msg;
+			el.classList.add('show');
+			clearTimeout(toastTimer);
+			toastTimer=setTimeout(()=>el.classList.remove('show'), 1200);
+		}
+	</script>
+
+	{{range .Parts}}
+	{{.}}
+	{{end}}
+</div>
+<div id="toast" class="toast" aria-live="polite"></div>
+</body>
+</html>
+`
+
+var htmlPageTmpl = template.Must(template.New("page").Parse(htmlPageTemplate))
+
+func decorateHTMLFragment(p string, i int) string {
+	// Wrap result tables for horizontal scrolling on small screens.
+	if strings.Contains(p, "<table class=\"results\">") {
+		p = strings.Replace(p, "<table class=\"results\">", "<div class=\"results-wrap\"><table class=\"results\">", 1)
+		p = strings.Replace(p, "</table>", "</table></div>", 1)
+	}
+
+	if !strings.Contains(p, "class=\"sql-block\"") {
+		return p
+	}
+
+	id := fmt.Sprintf("sql-%d", i)
+
+	// Add id + default collapsed state.
+	p = strings.Replace(p, "class=\"sql-block\"", fmt.Sprintf("class=\"sql-block collapsed\" id=\"%s\"", id), 1)
+
+	// Add controls just before <pre>.
+	controls := fmt.Sprintf("<div class=\"controls\"><button type=\"button\" class=\"btn\" data-role=\"toggle\" onclick=\"toggle('%s')\">Show SQL</button><button type=\"button\" class=\"btn\" onclick=\"copySQL('%s')\">Copy</button></div>", id, id)
+	p = strings.Replace(p, "<pre>", controls+"<pre>", 1)
+
+	return p
+}
+
+// emitHTMLPage writes a single HTML document to stdout using the collected fragments.
+func emitHTMLPage(parts []string) {
+	data := htmlPageData{
+		Title: "tinySQL - Function Examples",
+		Lead:  "Auto-generated from input SQL. Results are shown below; click “Show SQL” to reveal the statements.",
+		Parts: make([]template.HTML, 0, len(parts)),
+	}
+
+	for i, p := range parts {
+		// Inject show/copy controls into SQL blocks.
+		p = decorateHTMLFragment(p, i)
+		data.Parts = append(data.Parts, template.HTML(p))
+	}
+
+	if err := htmlPageTmpl.Execute(os.Stdout, data); err != nil {
+		fmt.Fprintln(os.Stderr, "template error:", err)
+	}
+}
+
 func printYAML(out []map[string]any, cols []string) {
 	for i, r := range out {
 		fmt.Printf("- ")
@@ -353,4 +848,21 @@ func printMarkdown(out []map[string]any, cols []string) {
 		}
 		fmt.Println()
 	}
+}
+
+// printBeautifulBlock prints collected source lines (comments and statements)
+// in a readable multi-line form, suppressing empty lines.
+func printBeautifulBlock(lines []string) {
+	if len(lines) == 0 {
+		return
+	}
+	fmt.Println("---- SQL ----")
+	for _, raw := range lines {
+		// Preserve leading indentation and internal spacing; only trim
+		// trailing newlines so the original formatting from the SQL file
+		// is retained when printing.
+		t := strings.TrimRight(raw, "\r\n")
+		fmt.Println(t)
+	}
+	fmt.Println("--------------")
 }

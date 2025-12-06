@@ -518,6 +518,57 @@ SELECT
     IN_PERIOD('CURRENT_QUARTER', CURRENT_DATE()) as in_current_quarter,
     EXTRACT('QUARTER', CURRENT_DATE()) as current_quarter_number;
 
+-- Complex Example: DISTINCT ON + ROW_NUMBER, string concatenation,
+-- column names with spaces, and timestamp helpers.
+CREATE TABLE demo_orders (
+    order_id INT,
+    customer TEXT,
+    order_date TEXT,
+    total INT,
+    "customer name" TEXT
+);
+
+INSERT INTO demo_orders VALUES
+    (1, 'alice', '2025-01-10 09:15:00', 120, 'Alice A'),
+    (2, 'alice', '2025-02-05 14:20:00', 200, 'Alice A'),
+    (3, 'bob',   '2025-01-12 11:05:00', 75,  'Robert B'),
+    (4, 'bob',   '2025-03-01 08:30:00', 50,  'Robert B'),
+    (5, 'carol', '2025-02-20 16:45:00', 300, 'Carol C');
+
+-- Use DISTINCT ON to pick the most recent order per customer.
+-- Note: DISTINCT ON keeps the first row per key; ORDER BY controls which row is first.
+SELECT DISTINCT ON (customer)
+    customer,
+    "customer name",
+    total,
+    order_date,
+    -- STRING CONCAT via + operator (also works with CONCAT)
+    customer + ' - ' + CAST(total AS TEXT) AS summary,
+    -- ROW_NUMBER demonstrates window function numbering per PARTITION
+    ROW_NUMBER() OVER (PARTITION BY customer ORDER BY order_date DESC) AS rn,
+    -- TIMESTAMP helpers
+    GETDATE() AS now_ts,
+    TODAY() AS today_date,
+    FROM_TIMESTAMP(0) AS epoch_zero,
+    TIMESTAMP('2023-05-01 00:00:00') AS ts_epoch
+FROM demo_orders
+ORDER BY customer, order_date DESC;
+
+-- Show all rows with ROW_NUMBER and LAG for context
+SELECT
+    order_id,
+    customer,
+    "customer name",
+    order_date,
+    total,
+    ROW_NUMBER() OVER (PARTITION BY customer ORDER BY order_date) AS rn_asc,
+    LAG(total, 1) OVER (PARTITION BY customer ORDER BY order_date) AS prev_total
+FROM demo_orders
+ORDER BY customer, order_date;
+
+-- Cleanup demo table
+DROP TABLE demo_orders;
+
 -- Use Case 3: String normalization
 SELECT 
     UPPER(TRIM(REGEXP_REPLACE('  Hello   World  ', '\s+', ' '))) as normalized_string;
@@ -536,6 +587,33 @@ SELECT
         DATE_TRUNC('YEAR', CURRENT_DATE()), 
         EOMONTH(DATE_TRUNC('YEAR', CURRENT_DATE()), 11)
     ) as days_in_year;
+
+-- ============================================================
+-- CTE (Common Table Expression) EXAMPLES
+-- ============================================================
+
+-- Non-recursive CTE: useful for organizing complex subqueries
+WITH recent_sales AS (
+    SELECT * FROM (SELECT '2025-01-01' AS sale_date, 'A' AS product) AS t
+)
+SELECT * FROM recent_sales;
+
+-- Recursive CTE example: generate numbers 1..5
+WITH RECURSIVE nums AS (
+    SELECT 1 AS n
+    UNION ALL
+    SELECT n + 1 FROM nums WHERE n < 5
+)
+SELECT * FROM nums ORDER BY n;
+
+-- Fibonacci via recursive CTE: generate first 10 Fibonacci numbers
+WITH RECURSIVE fib AS (
+    -- n: index, a: current fib value, b: next fib value
+    SELECT 0 AS n, 0 AS a, 1 AS b
+    UNION ALL
+    SELECT n + 1, b, a + b FROM fib WHERE n < 9
+)
+SELECT n, a AS fib_value FROM fib ORDER BY n;
 
 -- ============================================================
 -- END OF EXAMPLES

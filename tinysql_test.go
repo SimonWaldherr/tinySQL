@@ -4,7 +4,9 @@ import (
 	"context"
 	"io/ioutil"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/engine"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -884,4 +886,229 @@ func TestStorageAdvanced(t *testing.T) {
 			t.Fatalf("Failed to put temporary table: %v", err)
 		}
 	})
+}
+
+func TestPlusOperatorStringConcat(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	p := engine.NewParser(`CREATE TABLE strings_demo (txt TEXT, num INT)`)
+	st, err := p.ParseStatement()
+	if err != nil {
+		t.Fatalf("Failed to parse CREATE TABLE: %v", err)
+	}
+	if _, err := engine.Execute(ctx, db, "default", st); err != nil {
+		t.Fatalf("Failed to create table: %v", err)
+	}
+
+	p = engine.NewParser(`INSERT INTO strings_demo VALUES ('hello', 42)`)
+	st, err = p.ParseStatement()
+	if err != nil {
+		t.Fatalf("Failed to parse INSERT: %v", err)
+	}
+	if _, err := engine.Execute(ctx, db, "default", st); err != nil {
+		t.Fatalf("Failed to insert row: %v", err)
+	}
+
+	query := `SELECT txt + ' world' AS greeting, txt + num AS mix, num + 8 AS sum FROM strings_demo`
+	p = engine.NewParser(query)
+	st, err = p.ParseStatement()
+	if err != nil {
+		t.Fatalf("Failed to parse concat query: %v", err)
+	}
+	rs, err := engine.Execute(ctx, db, "default", st)
+	if err != nil {
+		t.Fatalf("Failed to execute concat query: %v", err)
+	}
+	if len(rs.Rows) != 1 {
+		t.Fatalf("Expected 1 row, got %d", len(rs.Rows))
+	}
+	row := rs.Rows[0]
+	get := func(col string) any { return row[strings.ToLower(col)] }
+
+	greeting, _ := get("greeting").(string)
+	if greeting != "hello world" {
+		t.Fatalf("Unexpected greeting result: %v", greeting)
+	}
+	mix, _ := get("mix").(string)
+	if mix != "hello42" {
+		t.Fatalf("Unexpected mix result: %v", mix)
+	}
+	sum, _ := get("sum").(float64)
+	if sum != 50 {
+		t.Fatalf("Unexpected numeric sum: %v", sum)
+	}
+}
+
+func TestTimestampFunctions(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	p := engine.NewParser(`CREATE TABLE dual (id INT)`)
+	st, err := p.ParseStatement()
+	if err != nil {
+		t.Fatalf("Failed to parse CREATE TABLE: %v", err)
+	}
+	if _, err := engine.Execute(ctx, db, "default", st); err != nil {
+		t.Fatalf("Failed to create table: %v", err)
+	}
+
+	p = engine.NewParser(`INSERT INTO dual VALUES (1)`)
+	st, err = p.ParseStatement()
+	if err != nil {
+		t.Fatalf("Failed to parse INSERT: %v", err)
+	}
+	if _, err := engine.Execute(ctx, db, "default", st); err != nil {
+		t.Fatalf("Failed to insert row: %v", err)
+	}
+
+	query := `SELECT GETDATE() AS gd,
+	                 CURRENT_TIMESTAMP() AS ct,
+	                 TODAY() AS today_val,
+	                 FROM_TIMESTAMP(0) AS from_zero,
+	                 FROM_TIMESTAMP('1.5') AS from_frac,
+	                 TIMESTAMP('2023-05-01 00:00:00') AS ts_epoch
+	          FROM dual`
+	p = engine.NewParser(query)
+	st, err = p.ParseStatement()
+	if err != nil {
+		t.Fatalf("Failed to parse timestamp query: %v", err)
+	}
+	rs, err := engine.Execute(ctx, db, "default", st)
+	if err != nil {
+		t.Fatalf("Failed to execute timestamp query: %v", err)
+	}
+	if len(rs.Rows) != 1 {
+		t.Fatalf("Expected 1 row, got %d", len(rs.Rows))
+	}
+	row := rs.Rows[0]
+	get := func(col string) any { return row[strings.ToLower(col)] }
+
+	if _, ok := get("gd").(time.Time); !ok {
+		t.Fatalf("GETDATE result was not time.Time: %T", get("gd"))
+	}
+	if _, ok := get("ct").(time.Time); !ok {
+		t.Fatalf("CURRENT_TIMESTAMP result was not time.Time: %T", get("ct"))
+	}
+	today, ok := get("today_val").(time.Time)
+	if !ok {
+		t.Fatalf("TODAY result was not time.Time: %T", get("today_val"))
+	}
+	if today.Hour() != 0 || today.Minute() != 0 || today.Second() != 0 {
+		t.Fatalf("TODAY result not truncated to day: %v", today)
+	}
+	fromZero, ok := get("from_zero").(time.Time)
+	if !ok {
+		t.Fatalf("FROM_TIMESTAMP(0) result was not time.Time: %T", get("from_zero"))
+	}
+	if !fromZero.Equal(time.Unix(0, 0)) {
+		t.Fatalf("FROM_TIMESTAMP(0) mismatch: %v", fromZero)
+	}
+	fromFrac, ok := get("from_frac").(time.Time)
+	if !ok {
+		t.Fatalf("FROM_TIMESTAMP('1.5') result was not time.Time: %T", get("from_frac"))
+	}
+	if fromFrac.Unix() != 1 || fromFrac.Nanosecond() != 500000000 {
+		t.Fatalf("FROM_TIMESTAMP('1.5') mismatch: %v", fromFrac)
+	}
+	epochVal, ok := get("ts_epoch").(int64)
+	if !ok {
+		t.Fatalf("TIMESTAMP result was not int64: %T", get("ts_epoch"))
+	}
+	expected := time.Date(2023, 5, 1, 0, 0, 0, 0, time.UTC).Unix()
+	if epochVal != expected {
+		t.Fatalf("TIMESTAMP value mismatch, expected %d got %d", expected, epochVal)
+	}
+}
+
+func TestDistinctOnAndWindowFunctions(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	p := engine.NewParser(`CREATE TABLE t (a INT, b INT)`)
+	st, err := p.ParseStatement()
+	if err != nil {
+		t.Fatalf("Failed to parse CREATE TABLE: %v", err)
+	}
+	if _, err := engine.Execute(ctx, db, "default", st); err != nil {
+		t.Fatalf("Failed to create table: %v", err)
+	}
+
+	// Insert rows with duplicates in column a and varying b
+	inserts := []string{
+		`INSERT INTO t VALUES (1, 10)`,
+		`INSERT INTO t VALUES (1, 20)`,
+		`INSERT INTO t VALUES (2, 5)`,
+		`INSERT INTO t VALUES (2, 15)`,
+		`INSERT INTO t VALUES (3, 7)`,
+	}
+	for _, q := range inserts {
+		p = engine.NewParser(q)
+		st, err := p.ParseStatement()
+		if err != nil {
+			t.Fatalf("Failed to parse insert: %v", err)
+		}
+		if _, err := engine.Execute(ctx, db, "default", st); err != nil {
+			t.Fatalf("Failed to execute insert: %v", err)
+		}
+	}
+
+	// DISTINCT ON: pick highest b per a using ORDER BY b DESC
+	q := `SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b DESC`
+	p = engine.NewParser(q)
+	st, err = p.ParseStatement()
+	if err != nil {
+		t.Fatalf("Failed to parse DISTINCT ON query: %v", err)
+	}
+	rs, err := engine.Execute(ctx, db, "default", st)
+	if err != nil {
+		t.Fatalf("Failed to execute DISTINCT ON query: %v", err)
+	}
+	if len(rs.Rows) != 3 {
+		t.Fatalf("DISTINCT ON expected 3 rows, got %d", len(rs.Rows))
+	}
+	// collect b values keyed by a
+	got := map[int]int{}
+	for _, r := range rs.Rows {
+		a := r["a"].(int)
+		b := r["b"].(int)
+		got[a] = b
+	}
+	if got[1] != 20 || got[2] != 15 || got[3] != 7 {
+		t.Fatalf("DISTINCT ON returned unexpected rows: %#v", got)
+	}
+
+	// Window functions: ROW_NUMBER and LAG
+	q = `SELECT a, b, ROW_NUMBER() OVER (ORDER BY a, b) AS rn, LAG(b,1) OVER (ORDER BY a, b) AS prev FROM t ORDER BY a, b`
+	p = engine.NewParser(q)
+	st, err = p.ParseStatement()
+	if err != nil {
+		t.Fatalf("Failed to parse window query: %v", err)
+	}
+	rs, err = engine.Execute(ctx, db, "default", st)
+	if err != nil {
+		t.Fatalf("Failed to execute window query: %v", err)
+	}
+	if len(rs.Rows) != 5 {
+		t.Fatalf("window query expected 5 rows, got %d", len(rs.Rows))
+	}
+	// verify row numbers and previous values
+	// expected ordered rows: (1,10),(1,20),(2,5),(2,15),(3,7)
+	expPrev := []any{nil, 10, 20, 5, 15}
+	for i, r := range rs.Rows {
+		rn := r["rn"].(int)
+		if rn != i+1 {
+			t.Fatalf("unexpected row number at %d: got %d want %d", i, rn, i+1)
+		}
+		prev := r["prev"]
+		if expPrev[i] == nil {
+			if prev != nil {
+				t.Fatalf("expected nil prev at row %d, got %#v", i, prev)
+			}
+		} else {
+			if prev == nil || prev.(int) != expPrev[i].(int) {
+				t.Fatalf("unexpected prev at row %d: got %#v want %#v", i, prev, expPrev[i])
+			}
+		}
+	}
 }

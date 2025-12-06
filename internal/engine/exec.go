@@ -385,7 +385,9 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 	// Process CTEs first
 	cteEnv := env
 	if len(s.CTEs) > 0 {
-		// Create a new environment with CTE tables
+		// Create a new environment for evaluating CTEs. This environment
+		// will carry a map of CTE name -> ResultSet so CTEs can reference
+		// previously defined CTEs.
 		cteEnv = ExecEnv{
 			ctx:    env.ctx,
 			db:     env.db,
@@ -393,13 +395,142 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 			ctes:   make(map[string]*ResultSet),
 		}
 
-		// Execute each CTE and store the result
+		// Execute each CTE in order. If a CTE is recursive (declared via
+		// WITH RECURSIVE) we perform a simple iterative evaluation: evaluate
+		// the anchor part then repeatedly evaluate the recursive part with
+		// the current accumulated rows bound to the CTE name until no new
+		// rows appear (or an iteration cap is reached).
 		for _, cte := range s.CTEs {
-			cteResult, err := executeSelect(env, cte.Select)
-			if err != nil {
-				return nil, fmt.Errorf("CTE %s: %v", cte.Name, err)
+			if !cte.Recursive {
+				// Non-recursive: execute normally with the cteEnv so later CTEs
+				// can reference earlier ones.
+				cteResult, err := executeSelect(cteEnv, cte.Select)
+				if err != nil {
+					return nil, fmt.Errorf("CTE %s: %v", cte.Name, err)
+				}
+				cteEnv.ctes[cte.Name] = cteResult
+				continue
 			}
-			cteEnv.ctes[cte.Name] = cteResult
+
+			// Recursive CTE handling
+			// Require a UNION (typically anchor UNION ALL recursive)
+			if cte.Select == nil || cte.Select.Union == nil {
+				return nil, fmt.Errorf("recursive CTE %s must be a UNION of anchor and recursive part", cte.Name)
+			}
+
+			// Anchor part: clone the select but drop its Union chain
+			anchor := *cte.Select
+			anchor.Union = nil
+
+			// Assume the recursive part is the right side of the first union
+			recursiveSel := cte.Select.Union.Right
+			if recursiveSel == nil {
+				return nil, fmt.Errorf("recursive CTE %s missing recursive part", cte.Name)
+			}
+
+			// Evaluate anchor
+			accRs, err := executeSelect(cteEnv, &anchor)
+			if err != nil {
+				return nil, fmt.Errorf("CTE %s anchor: %v", cte.Name, err)
+			}
+
+			// Use a set to track unique row signatures
+			seen := make(map[string]bool)
+			var accRows []Row
+			if accRs != nil {
+				accRows = append(accRows, accRs.Rows...)
+				if accRs.Cols != nil {
+					// initialize seen from existing rows
+					for _, r := range accRs.Rows {
+						seen[rowSignature(r, accRs.Cols)] = true
+					}
+				}
+			}
+
+			// Iteratively apply recursive part
+			iterLimit := 1024
+			for iter := 0; iter < iterLimit; iter++ {
+				// Bind current accumulated result to CTE name
+				colsForBind := []string{}
+				if accRs != nil && accRs.Cols != nil {
+					colsForBind = accRs.Cols
+				}
+				cteEnv.ctes[cte.Name] = &ResultSet{Cols: colsForBind, Rows: accRows}
+
+				// Execute recursive select against cteEnv
+				nextRs, err := executeSelect(cteEnv, recursiveSel)
+				if err != nil {
+					return nil, fmt.Errorf("CTE %s recursive eval: %v", cte.Name, err)
+				}
+				if nextRs == nil || len(nextRs.Rows) == 0 {
+					break
+				}
+
+				// Append only new rows. We must align column names of the
+				// recursive result with the anchor's column names (by
+				// position) when possible. Otherwise rows from anchor and
+				// recursive part may expose different column keys (e.g.
+				// anchor uses alias `n` while recursive produces `col_0`).
+				newAdded := 0
+
+				// Determine target column names for signature/assignment.
+				targetCols := nextRs.Cols
+				if accRs != nil && accRs.Cols != nil {
+					targetCols = accRs.Cols
+				}
+
+				var alignedRows []Row
+				// If we have explicit anchor columns and the recursive
+				// result has the same column count, remap by position.
+				if accRs != nil && accRs.Cols != nil && nextRs.Cols != nil && len(nextRs.Cols) == len(accRs.Cols) {
+					for _, r := range nextRs.Rows {
+						nr := make(Row)
+						for i := range accRs.Cols {
+							src := nextRs.Cols[i]
+							// row keys are stored lower-cased by the engine
+							var val any
+							if v, ok := r[strings.ToLower(src)]; ok {
+								val = v
+							} else if v, ok := r[src]; ok {
+								val = v
+							}
+							tgt := strings.ToLower(accRs.Cols[i])
+							nr[tgt] = val
+							// also expose qualified name
+							nr[cte.Name+"."+tgt] = val
+						}
+						alignedRows = append(alignedRows, nr)
+					}
+				} else {
+					// Fallback: use rows as-is (they should already have
+					// lower-cased keys from earlier evaluation)
+					alignedRows = nextRs.Rows
+				}
+
+				// Now filter/append only new rows using the chosen column names
+				for _, r := range alignedRows {
+					sig := rowSignature(r, targetCols)
+					if !seen[sig] {
+						seen[sig] = true
+						accRows = append(accRows, r)
+						newAdded++
+					}
+				}
+				// Update accRs.Cols if it was nil
+				if accRs == nil && nextRs != nil {
+					accRs = &ResultSet{Cols: nextRs.Cols}
+				}
+				if newAdded == 0 {
+					break
+				}
+			}
+
+			// Final accumulated result
+			finalCols := []string{}
+			if accRs != nil && accRs.Cols != nil {
+				finalCols = accRs.Cols
+			}
+			cteEnv.ctes[cte.Name] = &ResultSet{Cols: finalCols, Rows: accRows}
 		}
 	}
 
@@ -479,7 +610,51 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 
 	// DISTINCT
 	if s.Distinct {
-		outRows = distinctRows(outRows, outCols)
+		// If DISTINCT ON (...) was used, apply DISTINCT ON semantics: keep first
+		// row per distinct-on key. The ORDER BY clause controls which row is
+		// considered "first"; so apply ORDER BY first if present.
+		if len(s.DistinctOn) > 0 {
+			// If ORDER BY present, sort now so the first row per key is the right one
+			if len(s.OrderBy) > 0 {
+				sort.SliceStable(outRows, func(i, j int) bool {
+					a := outRows[i]
+					b := outRows[j]
+					for _, oi := range s.OrderBy {
+						av, _ := getVal(a, oi.Col)
+						bv, _ := getVal(b, oi.Col)
+						cmp := compareForOrder(av, bv, oi.Desc)
+						if cmp == 0 {
+							continue
+						}
+						if oi.Desc {
+							return cmp > 0
+						}
+						return cmp < 0
+					}
+					return false
+				})
+			}
+			seen := make(map[string]bool)
+			var res []Row
+			for _, r := range outRows {
+				var parts []string
+				for _, e := range s.DistinctOn {
+					v, err := evalExpr(env, e, r)
+					if err != nil {
+						return nil, err
+					}
+					parts = append(parts, fmt.Sprintf("%v", v))
+				}
+				key := strings.Join(parts, "|")
+				if !seen[key] {
+					seen[key] = true
+					res = append(res, r)
+				}
+			}
+			outRows = res
+		} else {
+			outRows = distinctRows(outRows, outCols)
+		}
 	}
 
 	// ORDER BY
@@ -940,6 +1115,45 @@ func numeric(v any) (float64, bool) {
 		return x, true
 	}
 	return 0, false
+}
+func coerceToFloat(v any) (any, error) {
+	switch x := v.(type) {
+	case int:
+		return float64(x), nil
+	case int64:
+		return float64(x), nil
+	case float64:
+		return x, nil
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
+		if err != nil {
+			return nil, fmt.Errorf("cannot convert %q to FLOAT", x)
+		}
+		return f, nil
+	case bool:
+		if x {
+			return 1.0, nil
+		}
+		return 0.0, nil
+	default:
+		return nil, fmt.Errorf("cannot convert %T to FLOAT", v)
+	}
+}
+func isStringValue(v any) bool {
+	_, ok := v.(string)
+	return ok
+}
+func stringifySQLValue(v any) string {
+	switch val := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return val
+	case []byte:
+		return string(val)
+	default:
+		return fmt.Sprint(val)
+	}
 }
 func truthy(v any) bool {
 	switch x := v.(type) {
@@ -1434,7 +1648,14 @@ func evalLogicalBinary(env ExecEnv, ex *Binary, row Row) (any, error) {
 }
 
 func evalArithmeticBinary(op string, lv, rv any) (any, error) {
-	if lv == nil || rv == nil {
+	if op == "+" {
+		if isStringValue(lv) || isStringValue(rv) {
+			return stringifySQLValue(lv) + stringifySQLValue(rv), nil
+		}
+		if lv == nil || rv == nil {
+			return nil, nil
+		}
+	} else if lv == nil || rv == nil {
 		return nil, nil
 	}
 	lf, lok := numeric(lv)
@@ -1487,74 +1708,79 @@ type funcHandler func(env ExecEnv, ex *FuncCall, row Row) (any, error)
 
 func getBuiltinFunctions() map[string]funcHandler {
 	return map[string]funcHandler{
-		"COALESCE":      evalCoalesceFunc,
-		"NVL":           evalCoalesceFunc,
-		"IFNULL":        evalCoalesceFunc,
-		"NULLIF":        evalNullifFunc,
-		"ISNULL":        evalIsNullFuncWrapper,
-		"JSON_GET":      evalJSONGetFunc,
-		"JSON_SET":      evalJSONExtendedFunc,
-		"JSON_EXTRACT":  evalJSONExtendedFunc,
-		"COUNT":         evalCountSingle,
-		"SUM":           evalAggregateSingle,
-		"AVG":           evalAggregateSingle,
-		"MIN":           evalAggregateSingle,
-		"MAX":           evalAggregateSingle,
-		"NOW":           evalNowFunc,
-		"CURRENT_TIME":  evalNowFunc,
-		"CURRENT_DATE":  evalCurrentDateFunc,
-		"DATEDIFF":      evalDateDiff,
-		"LTRIM":         evalLTrimFunc,
-		"RTRIM":         evalRTrimFunc,
-		"TRIM":          evalTrimFunc,
-		"UPPER":         evalUpperFunc,
-		"LOWER":         evalLowerFunc,
-		"CONCAT":        evalConcatFunc,
-		"CONCAT_WS":     evalConcatWsFunc,
-		"LENGTH":        evalLengthFunc,
-		"LEN":           evalLengthFunc,
-		"SUBSTRING":     evalSubstringFunc,
-		"SUBSTR":        evalSubstringFunc,
-		"MD5":           evalMD5Func,
-		"SHA1":          evalSHA1Func,
-		"SHA256":        evalSHA256Func,
-		"SHA512":        evalSHA512Func,
-		"BASE64":        evalBase64Func,
-		"BASE64_DECODE": evalBase64DecodeFunc,
-		"LEFT":          evalLeftFunc,
-		"RIGHT":         evalRightFunc,
-		"CAST":          evalCastFunc,
-		"REPLACE":       evalReplaceFunc,
-		"INSTR":         evalInstrFunc,
-		"LOCATE":        evalInstrFunc,
-		"POSITION":      evalPositionFunc,
-		"ABS":           evalAbsFunc,
-		"ROUND":         evalRoundFunc,
-		"FLOOR":         evalFloorFunc,
-		"CEIL":          evalCeilFunc,
-		"CEILING":       evalCeilFunc,
-		"REVERSE":       evalReverseFunc,
-		"REPEAT":        evalRepeatFunc,
-		"PRINTF":        evalPrintfFunc,
-		"FORMAT":        evalPrintfFunc,
-		"CHAR_LENGTH":   evalLengthFunc,
-		"LPAD":          evalLpadFunc,
-		"RPAD":          evalRpadFunc,
-		"GREATEST":      evalGreatestFunc,
-		"LEAST":         evalLeastFunc,
-		"IF":            evalIfFunc,
-		"IIF":           evalIfFunc,
-		"STRFTIME":      evalStrftimeFunc,
-		"DATE":          evalDateFunc,
-		"TIME":          evalTimeFunc,
-		"YEAR":          evalYearFunc,
-		"MONTH":         evalMonthFunc,
-		"DAY":           evalDayFunc,
-		"HOUR":          evalHourFunc,
-		"MINUTE":        evalMinuteFunc,
-		"SECOND":        evalSecondFunc,
-		"RANDOM":        evalRandomFunc,
-		"RAND":          evalRandomFunc,
+		"COALESCE":          evalCoalesceFunc,
+		"NVL":               evalCoalesceFunc,
+		"IFNULL":            evalCoalesceFunc,
+		"NULLIF":            evalNullifFunc,
+		"ISNULL":            evalIsNullFuncWrapper,
+		"JSON_GET":          evalJSONGetFunc,
+		"JSON_SET":          evalJSONExtendedFunc,
+		"JSON_EXTRACT":      evalJSONExtendedFunc,
+		"COUNT":             evalCountSingle,
+		"SUM":               evalAggregateSingle,
+		"AVG":               evalAggregateSingle,
+		"MIN":               evalAggregateSingle,
+		"MAX":               evalAggregateSingle,
+		"NOW":               evalNowFunc,
+		"GETDATE":           evalNowFunc,
+		"CURRENT_TIME":      evalNowFunc,
+		"CURRENT_TIMESTAMP": evalNowFunc,
+		"CURRENT_DATE":      evalCurrentDateFunc,
+		"TODAY":             evalTodayFunc,
+		"FROM_TIMESTAMP":    evalFromTimestampFunc,
+		"TIMESTAMP":         evalTimestampFunc,
+		"DATEDIFF":          evalDateDiff,
+		"LTRIM":             evalLTrimFunc,
+		"RTRIM":             evalRTrimFunc,
+		"TRIM":              evalTrimFunc,
+		"UPPER":             evalUpperFunc,
+		"LOWER":             evalLowerFunc,
+		"CONCAT":            evalConcatFunc,
+		"CONCAT_WS":         evalConcatWsFunc,
+		"LENGTH":            evalLengthFunc,
+		"LEN":               evalLengthFunc,
+		"SUBSTRING":         evalSubstringFunc,
+		"SUBSTR":            evalSubstringFunc,
+		"MD5":               evalMD5Func,
+		"SHA1":              evalSHA1Func,
+		"SHA256":            evalSHA256Func,
+		"SHA512":            evalSHA512Func,
+		"BASE64":            evalBase64Func,
+		"BASE64_DECODE":     evalBase64DecodeFunc,
+		"LEFT":              evalLeftFunc,
+		"RIGHT":             evalRightFunc,
+		"CAST":              evalCastFunc,
+		"REPLACE":           evalReplaceFunc,
+		"INSTR":             evalInstrFunc,
+		"LOCATE":            evalInstrFunc,
+		"POSITION":          evalPositionFunc,
+		"ABS":               evalAbsFunc,
+		"ROUND":             evalRoundFunc,
+		"FLOOR":             evalFloorFunc,
+		"CEIL":              evalCeilFunc,
+		"CEILING":           evalCeilFunc,
+		"REVERSE":           evalReverseFunc,
+		"REPEAT":            evalRepeatFunc,
+		"PRINTF":            evalPrintfFunc,
+		"FORMAT":            evalPrintfFunc,
+		"CHAR_LENGTH":       evalLengthFunc,
+		"LPAD":              evalLpadFunc,
+		"RPAD":              evalRpadFunc,
+		"GREATEST":          evalGreatestFunc,
+		"LEAST":             evalLeastFunc,
+		"IF":                evalIfFunc,
+		"IIF":               evalIfFunc,
+		"STRFTIME":          evalStrftimeFunc,
+		"DATE":              evalDateFunc,
+		"TIME":              evalTimeFunc,
+		"YEAR":              evalYearFunc,
+		"MONTH":             evalMonthFunc,
+		"DAY":               evalDayFunc,
+		"HOUR":              evalHourFunc,
+		"MINUTE":            evalMinuteFunc,
+		"SECOND":            evalSecondFunc,
+		"RANDOM":            evalRandomFunc,
+		"RAND":              evalRandomFunc,
 		// Math functions
 		"MOD":      evalModFunc,
 		"POWER":    evalPowerFunc,
@@ -1648,7 +1874,59 @@ func evalNowFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	return time.Now(), nil
 }
 func evalCurrentDateFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
-	return time.Now().Truncate(24 * time.Hour), nil
+	now := time.Now()
+	y, m, d := now.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, now.Location()), nil
+}
+func evalTodayFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	now := time.Now()
+	y, m, d := now.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, now.Location()), nil
+}
+func evalFromTimestampFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) != 1 {
+		return nil, fmt.Errorf("FROM_TIMESTAMP expects 1 argument")
+	}
+	val, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if val == nil {
+		return nil, nil
+	}
+	floatAny, err := coerceToFloat(val)
+	if err != nil {
+		return nil, fmt.Errorf("FROM_TIMESTAMP expects numeric or string input: %w", err)
+	}
+	seconds, ok := floatAny.(float64)
+	if !ok {
+		return nil, fmt.Errorf("FROM_TIMESTAMP expected float result, got %T", floatAny)
+	}
+	sec, frac := math.Modf(seconds)
+	nsec := int64(math.Round(frac * 1e9))
+	return time.Unix(int64(sec), nsec), nil
+}
+func evalTimestampFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) != 1 {
+		return nil, fmt.Errorf("TIMESTAMP expects 1 argument")
+	}
+	val, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if val == nil {
+		return nil, nil
+	}
+	if floatAny, err := coerceToFloat(val); err == nil {
+		if seconds, ok := floatAny.(float64); ok {
+			return int64(seconds), nil
+		}
+	}
+	t, err := parseTimeValue(val)
+	if err != nil {
+		return nil, fmt.Errorf("TIMESTAMP: %v", err)
+	}
+	return t.Unix(), nil
 }
 func evalLTrimFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	return evalLTrim(env, ex.Args, row)
@@ -4700,30 +4978,6 @@ func coerceToInt(v any) (any, error) {
 		return 0, nil
 	default:
 		return nil, fmt.Errorf("cannot convert %T to INT", v)
-	}
-}
-
-func coerceToFloat(v any) (any, error) {
-	switch x := v.(type) {
-	case int:
-		return float64(x), nil
-	case int64:
-		return float64(x), nil
-	case float64:
-		return x, nil
-	case string:
-		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
-		if err != nil {
-			return nil, fmt.Errorf("cannot convert %q to FLOAT", x)
-		}
-		return f, nil
-	case bool:
-		if x {
-			return 1.0, nil
-		}
-		return 0.0, nil
-	default:
-		return nil, fmt.Errorf("cannot convert %T to FLOAT", v)
 	}
 }
 

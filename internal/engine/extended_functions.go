@@ -735,20 +735,266 @@ func evalArraySort(env ExecEnv, args []Expr, row Row) (any, error) {
 
 // evalRowNumberFunc returns row number (basic implementation without OVER clause)
 func evalRowNumberFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
-	// TODO: Implement proper window function with OVER clause support
-	return nil, fmt.Errorf("ROW_NUMBER requires OVER clause (not yet implemented)")
+	if ex.Over == nil {
+		return nil, fmt.Errorf("ROW_NUMBER requires OVER clause")
+	}
+	// Build partition key for each row and ordering within partition
+	rows := env.windowRows
+	if rows == nil {
+		return nil, fmt.Errorf("no window rows available")
+	}
+	// Compute partition groups
+	groups := make(map[string][]int)
+	for i, r := range rows {
+		var parts []string
+		for _, p := range ex.Over.PartitionBy {
+			v, err := evalExpr(env, p, r)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, fmt.Sprintf("%v", v))
+		}
+		key := strings.Join(parts, "|")
+		groups[key] = append(groups[key], i)
+	}
+	// For current row, find its group
+	var curKey string
+	{
+		var parts []string
+		for _, p := range ex.Over.PartitionBy {
+			v, err := evalExpr(env, p, row)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, fmt.Sprintf("%v", v))
+		}
+		curKey = strings.Join(parts, "|")
+	}
+	idxs := groups[curKey]
+	// Order idxs according to ORDER BY if present
+	if len(ex.Over.OrderBy) > 0 {
+		sort.SliceStable(idxs, func(i, j int) bool {
+			a := rows[idxs[i]]
+			b := rows[idxs[j]]
+			for _, oi := range ex.Over.OrderBy {
+				av, _ := getVal(a, oi.Col)
+				bv, _ := getVal(b, oi.Col)
+				cmp := compareForOrder(av, bv, oi.Desc)
+				if cmp == 0 {
+					continue
+				}
+				if oi.Desc {
+					return cmp > 0
+				}
+				return cmp < 0
+			}
+			return false
+		})
+	}
+	// find position of env.windowIndex in idxs
+	curPos := -1
+	for pos, ii := range idxs {
+		if ii == env.windowIndex {
+			curPos = pos
+			break
+		}
+	}
+	if curPos == -1 {
+		return nil, fmt.Errorf("current row not found in partition")
+	}
+	return curPos + 1, nil
 }
 
 // evalLagFunc returns the value from a previous row (basic stub)
 func evalLagFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
-	// TODO: Implement proper window function with OVER clause support
-	return nil, fmt.Errorf("LAG requires OVER clause (not yet implemented)")
+	if ex.Over == nil {
+		return nil, fmt.Errorf("LAG requires OVER clause")
+	}
+	rows := env.windowRows
+	if rows == nil {
+		return nil, fmt.Errorf("no window rows available")
+	}
+	// default offset 1
+	offset := 1
+	if len(ex.Args) >= 2 {
+		offVal, err := evalExpr(env, ex.Args[1], row)
+		if err != nil {
+			return nil, err
+		}
+		if offVal == nil {
+			offset = 1
+		} else if n, ok := offVal.(int); ok {
+			offset = n
+		} else if f, ok := numeric(offVal); ok {
+			offset = int(f)
+		} else {
+			return nil, fmt.Errorf("LAG offset must be numeric")
+		}
+	}
+	// Compute partition groups same as ROW_NUMBER
+	groups := make(map[string][]int)
+	for i, r := range rows {
+		var parts []string
+		for _, p := range ex.Over.PartitionBy {
+			v, err := evalExpr(env, p, r)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, fmt.Sprintf("%v", v))
+		}
+		key := strings.Join(parts, "|")
+		groups[key] = append(groups[key], i)
+	}
+	var curKey string
+	{
+		var parts []string
+		for _, p := range ex.Over.PartitionBy {
+			v, err := evalExpr(env, p, row)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, fmt.Sprintf("%v", v))
+		}
+		curKey = strings.Join(parts, "|")
+	}
+	idxs := groups[curKey]
+	if len(ex.Over.OrderBy) > 0 {
+		sort.SliceStable(idxs, func(i, j int) bool {
+			a := rows[idxs[i]]
+			b := rows[idxs[j]]
+			for _, oi := range ex.Over.OrderBy {
+				av, _ := getVal(a, oi.Col)
+				bv, _ := getVal(b, oi.Col)
+				cmp := compareForOrder(av, bv, oi.Desc)
+				if cmp == 0 {
+					continue
+				}
+				if oi.Desc {
+					return cmp > 0
+				}
+				return cmp < 0
+			}
+			return false
+		})
+	}
+	// find current position
+	curPos := -1
+	for pos, ii := range idxs {
+		if ii == env.windowIndex {
+			curPos = pos
+			break
+		}
+	}
+	if curPos == -1 {
+		return nil, fmt.Errorf("current row not found in partition")
+	}
+	target := curPos - offset
+	if target < 0 {
+		return nil, nil
+	}
+	// evaluate value expression (first arg) against target row
+	if len(ex.Args) == 0 {
+		return nil, fmt.Errorf("LAG requires at least 1 argument")
+	}
+	targetRow := rows[idxs[target]]
+	// ensure env.windowIndex reflects evaluated row
+	env.windowIndex = idxs[target]
+	return evalExpr(env, ex.Args[0], targetRow)
 }
 
 // evalLeadFunc returns the value from a following row (basic stub)
 func evalLeadFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
-	// TODO: Implement proper window function with OVER clause support
-	return nil, fmt.Errorf("LEAD requires OVER clause (not yet implemented)")
+	if ex.Over == nil {
+		return nil, fmt.Errorf("LEAD requires OVER clause")
+	}
+	rows := env.windowRows
+	if rows == nil {
+		return nil, fmt.Errorf("no window rows available")
+	}
+	// default offset 1
+	offset := 1
+	if len(ex.Args) >= 2 {
+		offVal, err := evalExpr(env, ex.Args[1], row)
+		if err != nil {
+			return nil, err
+		}
+		if offVal == nil {
+			offset = 1
+		} else if n, ok := offVal.(int); ok {
+			offset = n
+		} else if f, ok := numeric(offVal); ok {
+			offset = int(f)
+		} else {
+			return nil, fmt.Errorf("LEAD offset must be numeric")
+		}
+	}
+	// Compute partition groups
+	groups := make(map[string][]int)
+	for i, r := range rows {
+		var parts []string
+		for _, p := range ex.Over.PartitionBy {
+			v, err := evalExpr(env, p, r)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, fmt.Sprintf("%v", v))
+		}
+		key := strings.Join(parts, "|")
+		groups[key] = append(groups[key], i)
+	}
+	var curKey string
+	{
+		var parts []string
+		for _, p := range ex.Over.PartitionBy {
+			v, err := evalExpr(env, p, row)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, fmt.Sprintf("%v", v))
+		}
+		curKey = strings.Join(parts, "|")
+	}
+	idxs := groups[curKey]
+	if len(ex.Over.OrderBy) > 0 {
+		sort.SliceStable(idxs, func(i, j int) bool {
+			a := rows[idxs[i]]
+			b := rows[idxs[j]]
+			for _, oi := range ex.Over.OrderBy {
+				av, _ := getVal(a, oi.Col)
+				bv, _ := getVal(b, oi.Col)
+				cmp := compareForOrder(av, bv, oi.Desc)
+				if cmp == 0 {
+					continue
+				}
+				if oi.Desc {
+					return cmp > 0
+				}
+				return cmp < 0
+			}
+			return false
+		})
+	}
+	// find current position
+	curPos := -1
+	for pos, ii := range idxs {
+		if ii == env.windowIndex {
+			curPos = pos
+			break
+		}
+	}
+	if curPos == -1 {
+		return nil, fmt.Errorf("current row not found in partition")
+	}
+	target := curPos + offset
+	if target >= len(idxs) {
+		return nil, nil
+	}
+	if len(ex.Args) == 0 {
+		return nil, fmt.Errorf("LEAD requires at least 1 argument")
+	}
+	targetRow := rows[idxs[target]]
+	env.windowIndex = idxs[target]
+	return evalExpr(env, ex.Args[0], targetRow)
 }
 
 // evalMovingSumFunc calculates moving sum (basic stub)
