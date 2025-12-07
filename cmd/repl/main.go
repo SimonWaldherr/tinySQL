@@ -18,6 +18,7 @@ var flagEcho = flag.Bool("echo", false, "Echo SQL statements before execution")
 var flagFormat = flag.String("format", "table", "Output format: table, csv, tsv, json, yaml, markdown")
 var flagBeautiful = flag.Bool("beautiful", false, "Pretty-print SQL blocks and results (group statements until next SELECT)")
 var flagHTML = flag.Bool("html", false, "Emit a single HTML page showing the SQL blocks and results (useful when redirecting input)")
+var flagErrorsOnly = flag.Bool("errors-only", false, "Only print queries/results that produce errors (ERR)")
 
 func main() {
 	flag.Parse()
@@ -29,10 +30,10 @@ func main() {
 	}
 	defer db.Close()
 
-	runREPL(db, *flagEcho, *flagFormat, *flagBeautiful, *flagHTML)
+	runREPL(db, *flagEcho, *flagFormat, *flagBeautiful, *flagHTML, *flagErrorsOnly)
 }
 
-func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool) {
+func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool, errorsOnly bool) {
 	sc := bufio.NewScanner(os.Stdin)
 	// Scanner token limit is 64K by default; allow larger statements/files.
 	sc.Buffer(make([]byte, 1024), 4*1024*1024)
@@ -154,7 +155,14 @@ func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool
 						htmlParts = append(htmlParts, "<div class='err'>ERR: "+html.EscapeString(friendly)+"</div>")
 						htmlParts = append(htmlParts, "<hr/>")
 					} else {
-						fmt.Println("ERR:", err)
+						if errorsOnly {
+							// When running with -errors-only, show the SQL that failed
+							// together with the error to make debugging easier.
+							fmt.Println("--", q)
+							fmt.Println("ERR:", err)
+						} else {
+							fmt.Println("ERR:", err)
+						}
 					}
 					// Drop the accumulated source so we don't repeatedly print failing statements.
 					if beautiful {
@@ -168,31 +176,41 @@ func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool
 					out, err := rowsToSlice(rows, cols)
 					rows.Close()
 
-					// Always include SQL fragment before results/error when producing HTML.
-					if sqlFrag != "" {
-						htmlParts = append(htmlParts, sqlFrag)
-					} else {
-						htmlParts = append(htmlParts, renderSQLHTML(q))
-					}
-
+					// Only include successful results when not in errors-only mode.
 					if err != nil {
+						if sqlFrag != "" {
+							htmlParts = append(htmlParts, sqlFrag)
+						} else {
+							htmlParts = append(htmlParts, renderSQLHTML(q))
+						}
 						friendly := friendlyErrorString(err)
 						htmlParts = append(htmlParts, "<div class='err'>ERR: "+html.EscapeString(friendly)+"</div>")
+						htmlParts = append(htmlParts, "<hr/>")
 					} else {
-						htmlParts = append(htmlParts, renderRowsHTML(out, cols))
+						if !errorsOnly {
+							if sqlFrag != "" {
+								htmlParts = append(htmlParts, sqlFrag)
+							} else {
+								htmlParts = append(htmlParts, renderSQLHTML(q))
+							}
+							htmlParts = append(htmlParts, renderRowsHTML(out, cols))
+							htmlParts = append(htmlParts, "<hr/>")
+						}
 					}
-					htmlParts = append(htmlParts, "<hr/>")
 				} else {
-					printRows(rows, cols, format)
-					rows.Close()
-					if beautiful {
-						// Ensure at least one blank line separates SELECT outputs for readability
-						fmt.Println()
+					// Non-HTML output: only print rows when not in errors-only mode.
+					if !errorsOnly {
+						printRows(rows, cols, format)
+						if beautiful {
+							// Ensure at least one blank line separates SELECT outputs for readability
+							fmt.Println()
+						}
 					}
+					rows.Close()
 				}
 
 				if beautiful {
-					// After printing results, reset accumulated source lines
+					// After handling results, reset accumulated source lines
 					srcLines = nil
 				}
 				continue
@@ -213,7 +231,12 @@ func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool
 					htmlParts = append(htmlParts, sqlFrag)
 					htmlParts = append(htmlParts, "<div class='err'>ERR: "+html.EscapeString(friendly)+"</div>")
 				} else {
-					fmt.Println("ERR:", err)
+					if errorsOnly {
+						fmt.Println("--", q)
+						fmt.Println("ERR:", err)
+					} else {
+						fmt.Println("ERR:", err)
+					}
 				}
 
 				// Drop the accumulated source so we don't repeatedly print failing statements.
@@ -228,11 +251,14 @@ func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool
 				if sqlFrag == "" {
 					sqlFrag = renderSQLHTML(q)
 				}
+				// Only append OK blocks when not in errors-only mode.
 				htmlParts = append(htmlParts, sqlFrag)
-				htmlParts = append(htmlParts, "<div class='ok'>(ok)</div>")
+				if !errorsOnly {
+					htmlParts = append(htmlParts, "<div class='ok'>(ok)</div>")
+				}
 			} else {
 				// In non-interactive mode (e.g. redirected input) avoid printing a flood of "(ok)" lines.
-				if interactive {
+				if interactive && !errorsOnly {
 					fmt.Println("(ok)")
 				}
 			}
@@ -571,8 +597,10 @@ func friendlyErrorString(err error) string {
 		return "table-valued function not available in FROM; parser support pending"
 	case strings.Contains(s, "no such table \"catalog."):
 		return "system catalog SQL queries are not yet supported; catalog is accessible via the Go API"
-	case strings.Contains(s, "parse error near \"JOB\"") || strings.Contains(s, "expected keyword \"TABLE\""):
-		return "CREATE JOB syntax is not yet supported by the SQL parser; use the Go API scheduler"
+	// Previously this repo used to special-case JOB parse errors with a
+	// friendly message. SQL-level JOB support has been implemented, so
+	// remove that special-case and fall through to the default error
+	// message which preserves the original parser text.
 	default:
 		return s
 	}

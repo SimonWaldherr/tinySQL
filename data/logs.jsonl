@@ -1,0 +1,3 @@
+{"timestamp":"2025-12-05T12:00:00Z","level":"INFO","msg":"Service started"}
+{"timestamp":"2025-12-05T12:05:00Z","level":"ERROR","msg":"Failed to open file"}
+{"timestamp":"2025-12-06T08:30:00Z","level":"WARN","msg":"High memory usage"}

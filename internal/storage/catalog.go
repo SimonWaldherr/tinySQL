@@ -246,6 +246,44 @@ func (c *CatalogManager) GetTables() []*CatalogTable {
 	return tables
 }
 
+// GetFunctions returns all registered functions in the catalog
+func (c *CatalogManager) GetFunctions() []*CatalogFunction {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	funcs := make([]*CatalogFunction, 0, len(c.funcs))
+	for _, f := range c.funcs {
+		funcs = append(funcs, f)
+	}
+	return funcs
+}
+
+// GetViews returns all registered views in the catalog
+func (c *CatalogManager) GetViews() []*CatalogView {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	views := make([]*CatalogView, 0, len(c.views))
+	for _, v := range c.views {
+		views = append(views, v)
+	}
+	return views
+}
+
+// GetAllColumns returns all columns across all tables in the catalog
+func (c *CatalogManager) GetAllColumns() []CatalogColumn {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	cols := make([]CatalogColumn, 0)
+	for _, list := range c.columns {
+		for _, col := range list {
+			cols = append(cols, col)
+		}
+	}
+	return cols
+}
+
 // GetColumns returns all columns for a table
 func (c *CatalogManager) GetColumns(schema, tableName string) []CatalogColumn {
 	c.mu.RLock()

@@ -87,6 +87,12 @@ func Execute(ctx context.Context, db *storage.DB, tenant string, stmt Statement)
 		return executeDelete(env, s)
 	case *Select:
 		return executeSelect(env, s)
+	case *CreateJob:
+		return executeCreateJob(env, s)
+	case *AlterJob:
+		return executeAlterJob(env, s)
+	case *DropJob:
+		return executeDropJob(env, s)
 	}
 	return nil, fmt.Errorf("unknown statement")
 }
@@ -172,6 +178,49 @@ func executeCreateView(env ExecEnv, s *CreateView) (*ResultSet, error) {
 		// Could check if view already exists
 	}
 	// For now, return success
+	return nil, nil
+}
+
+func executeCreateJob(env ExecEnv, s *CreateJob) (*ResultSet, error) {
+	job := &storage.CatalogJob{
+		Name:         s.Name,
+		SQLText:      s.SQLText,
+		ScheduleType: s.ScheduleType,
+		CronExpr:     s.CronExpr,
+		IntervalMs:   s.IntervalMs,
+		Timezone:     s.Timezone,
+		Enabled:      s.Enabled,
+		NoOverlap:    s.NoOverlap,
+		MaxRuntimeMs: s.MaxRuntimeMs,
+		CatchUp:      s.CatchUp,
+	}
+	if s.RunAt != nil {
+		job.RunAt = s.RunAt
+	}
+	if err := env.db.Catalog().RegisterJob(job); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+func executeAlterJob(env ExecEnv, s *AlterJob) (*ResultSet, error) {
+	job, err := env.db.Catalog().GetJob(s.Name)
+	if err != nil {
+		return nil, err
+	}
+	if s.Enable != nil {
+		job.Enabled = *s.Enable
+	}
+	if err := env.db.Catalog().RegisterJob(job); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+func executeDropJob(env ExecEnv, s *DropJob) (*ResultSet, error) {
+	if err := env.db.Catalog().DeleteJob(s.Name); err != nil {
+		return nil, err
+	}
 	return nil, nil
 }
 
@@ -538,7 +587,7 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 	var leftRows []Row
 
 	// Check if FROM clause exists
-	if s.From.Table == "" && s.From.Subquery == nil {
+	if s.From.Table == "" && s.From.Subquery == nil && s.From.TableFunc == nil {
 		// No FROM clause - create a single dummy row for expression evaluation
 		// This allows SELECT NOW(), SELECT 1+1, etc.
 		leftRows = []Row{make(Row)}
@@ -560,32 +609,152 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 				}
 			}
 		}
-	} else if cteEnv.ctes != nil {
-		if cteResult, exists := cteEnv.ctes[s.From.Table]; exists {
-			// Convert CTE result to rows
-			leftRows = make([]Row, len(cteResult.Rows))
-			for i, row := range cteResult.Rows {
-				leftRows[i] = make(Row)
-				for k, v := range row {
-					leftRows[i][k] = v
-					leftRows[i][s.From.Table+"."+k] = v
+	} else if s.From.TableFunc != nil {
+		// FROM table-valued function
+		fnName := s.From.TableFunc.Name
+		tf, ok := GetTableFunc(fnName)
+		if !ok {
+			return nil, fmt.Errorf("unknown table function: %s", fnName)
+		}
+		// Validate args optionally
+		if err := tf.ValidateArgs(s.From.TableFunc.Args); err != nil {
+			return nil, fmt.Errorf("%s: %v", fnName, err)
+		}
+		// Execute table function (no correlated row for top-level FROM)
+		rs, err := tf.Execute(env.ctx, s.From.TableFunc.Args, env, nil)
+		if err != nil {
+			return nil, err
+		}
+		// Convert ResultSet to rows with alias handling
+		leftRows = make([]Row, len(rs.Rows))
+		for i, row := range rs.Rows {
+			leftRows[i] = make(Row)
+			for k, v := range row {
+				leftRows[i][strings.ToLower(k)] = v
+				if s.From.Alias != "" {
+					leftRows[i][strings.ToLower(s.From.Alias+"."+k)] = v
 				}
 			}
-		} else {
-			// Regular table
-			leftT, err := cteEnv.db.Get(cteEnv.tenant, s.From.Table)
+		}
+	} else {
+		// No subquery and no table function: this can be a CTE name, a virtual
+		// catalog table (catalog.*), or a regular table. Prefer CTE binding first.
+		if cteEnv.ctes != nil {
+			if cteResult, exists := cteEnv.ctes[s.From.Table]; exists {
+				leftRows = make([]Row, len(cteResult.Rows))
+				for i, row := range cteResult.Rows {
+					leftRows[i] = make(Row)
+					for k, v := range row {
+						leftRows[i][k] = v
+						leftRows[i][s.From.Table+"."+k] = v
+					}
+				}
+			}
+		}
+
+		// Handle virtual catalog.* tables regardless of CTE presence
+		if leftRows == nil && strings.HasPrefix(strings.ToLower(s.From.Table), "catalog.") {
+			parts := strings.SplitN(s.From.Table, ".", 2)
+			if len(parts) != 2 {
+				return nil, fmt.Errorf("invalid catalog reference: %s", s.From.Table)
+			}
+			name := strings.ToLower(parts[1])
+			switch name {
+			case "tables":
+				tabs := env.db.Catalog().GetTables()
+				leftRows = make([]Row, len(tabs))
+				for i, t := range tabs {
+					leftRows[i] = make(Row)
+					putVal(leftRows[i], "schema", t.Schema)
+					putVal(leftRows[i], "name", t.Name)
+					putVal(leftRows[i], "type", t.Type)
+					putVal(leftRows[i], "row_count", t.RowCount)
+					putVal(leftRows[i], "created_at", t.CreatedAt)
+					putVal(leftRows[i], "updated_at", t.UpdatedAt)
+					if s.From.Alias != "" {
+						putVal(leftRows[i], s.From.Alias+".schema", t.Schema)
+						putVal(leftRows[i], s.From.Alias+".name", t.Name)
+					}
+				}
+			case "columns":
+				cols := env.db.Catalog().GetAllColumns()
+				leftRows = make([]Row, len(cols))
+				for i, c := range cols {
+					leftRows[i] = make(Row)
+					putVal(leftRows[i], "schema", c.Schema)
+					putVal(leftRows[i], "table_name", c.TableName)
+					putVal(leftRows[i], "name", c.Name)
+					putVal(leftRows[i], "position", c.Position)
+					putVal(leftRows[i], "data_type", c.DataType)
+					putVal(leftRows[i], "is_nullable", c.IsNullable)
+					if c.DefaultValue != nil {
+						putVal(leftRows[i], "default_value", *c.DefaultValue)
+					} else {
+						putVal(leftRows[i], "default_value", nil)
+					}
+					if s.From.Alias != "" {
+						putVal(leftRows[i], s.From.Alias+".table_name", c.TableName)
+					}
+				}
+			case "functions":
+				fns := env.db.Catalog().GetFunctions()
+				leftRows = make([]Row, len(fns))
+				for i, f := range fns {
+					leftRows[i] = make(Row)
+					putVal(leftRows[i], "schema", f.Schema)
+					putVal(leftRows[i], "name", f.Name)
+					putVal(leftRows[i], "function_type", f.FunctionType)
+					putVal(leftRows[i], "arg_types", f.ArgTypes)
+					putVal(leftRows[i], "return_type", f.ReturnType)
+					putVal(leftRows[i], "language", f.Language)
+					putVal(leftRows[i], "is_deterministic", f.IsDeterministic)
+					putVal(leftRows[i], "description", f.Description)
+				}
+			case "jobs":
+				jobs := env.db.Catalog().ListJobs()
+				leftRows = make([]Row, len(jobs))
+				for i, j := range jobs {
+					leftRows[i] = make(Row)
+					putVal(leftRows[i], "name", j.Name)
+					putVal(leftRows[i], "sql_text", j.SQLText)
+					putVal(leftRows[i], "schedule_type", j.ScheduleType)
+					putVal(leftRows[i], "cron_expr", j.CronExpr)
+					putVal(leftRows[i], "interval_ms", j.IntervalMs)
+					putVal(leftRows[i], "run_at", j.RunAt)
+					putVal(leftRows[i], "timezone", j.Timezone)
+					putVal(leftRows[i], "enabled", j.Enabled)
+					putVal(leftRows[i], "last_run_at", j.LastRunAt)
+					putVal(leftRows[i], "next_run_at", j.NextRunAt)
+				}
+			case "views":
+				views := env.db.Catalog().GetViews()
+				leftRows = make([]Row, len(views))
+				for i, v := range views {
+					leftRows[i] = make(Row)
+					putVal(leftRows[i], "schema", v.Schema)
+					putVal(leftRows[i], "name", v.Name)
+					putVal(leftRows[i], "sql_text", v.SQLText)
+					putVal(leftRows[i], "created_at", v.CreatedAt)
+				}
+			default:
+				return nil, fmt.Errorf("unknown catalog table: %s", name)
+			}
+		}
+
+		// If still not resolved, treat as a regular table (prefer cteEnv.db when available)
+		if leftRows == nil {
+			var leftT *storage.Table
+			var err error
+			if cteEnv.ctes != nil {
+				leftT, err = cteEnv.db.Get(cteEnv.tenant, s.From.Table)
+			} else {
+				leftT, err = env.db.Get(env.tenant, s.From.Table)
+			}
 			if err != nil {
 				return nil, err
 			}
 			leftRows, _ = rowsFromTable(leftT, aliasOr(s.From))
 		}
-	} else {
-		// Regular table
-		leftT, err := env.db.Get(env.tenant, s.From.Table)
-		if err != nil {
-			return nil, err
-		}
-		leftRows, _ = rowsFromTable(leftT, aliasOr(s.From))
 	}
 
 	cur := leftRows
@@ -794,17 +963,76 @@ func rowSignature(row Row, cols []string) string {
 
 func processJoins(env ExecEnv, joins []JoinClause, cur []Row) ([]Row, error) {
 	for _, j := range joins {
-		rt, err := env.db.Get(env.tenant, j.Right.Table)
-		if err != nil {
-			return nil, err
+		var rightRows []Row
+		var rightTable *storage.Table
+		var err error
+
+		if j.Right.Subquery != nil {
+			subRs, err := executeSelect(env, j.Right.Subquery)
+			if err != nil {
+				return nil, err
+			}
+			rightRows = make([]Row, len(subRs.Rows))
+			for i, row := range subRs.Rows {
+				rightRows[i] = make(Row)
+				for k, v := range row {
+					rightRows[i][strings.ToLower(k)] = v
+					if j.Right.Alias != "" {
+						rightRows[i][strings.ToLower(j.Right.Alias+"."+k)] = v
+					}
+				}
+			}
+			// build synthetic table metadata
+			cols := make([]storage.Column, 0, len(subRs.Cols))
+			for _, c := range subRs.Cols {
+				cols = append(cols, storage.Column{Name: c})
+			}
+			rightTable = &storage.Table{Name: j.Right.Alias, Cols: cols}
+
+		} else if j.Right.TableFunc != nil {
+			tf := j.Right.TableFunc
+			fn, ok := GetTableFunc(tf.Name)
+			if !ok {
+				return nil, fmt.Errorf("unknown table function: %s", tf.Name)
+			}
+			if err := fn.ValidateArgs(tf.Args); err != nil {
+				return nil, err
+			}
+			rs, err := fn.Execute(env.ctx, tf.Args, env, nil)
+			if err != nil {
+				return nil, err
+			}
+			rightRows = make([]Row, len(rs.Rows))
+			for i, row := range rs.Rows {
+				rightRows[i] = make(Row)
+				for k, v := range row {
+					rightRows[i][strings.ToLower(k)] = v
+					if j.Right.Alias != "" {
+						rightRows[i][strings.ToLower(j.Right.Alias+"."+k)] = v
+					}
+				}
+			}
+			// synthetic table metadata from ResultSet columns
+			cols := make([]storage.Column, 0, len(rs.Cols))
+			for _, c := range rs.Cols {
+				cols = append(cols, storage.Column{Name: c})
+			}
+			rightTable = &storage.Table{Name: j.Right.Alias, Cols: cols}
+
+		} else {
+			rt, err := env.db.Get(env.tenant, j.Right.Table)
+			if err != nil {
+				return nil, err
+			}
+			rightRows, _ = rowsFromTable(rt, aliasOr(j.Right))
+			rightTable = rt
 		}
-		rightRows, _ := rowsFromTable(rt, aliasOr(j.Right))
 
 		switch j.Type {
 		case JoinInner:
 			cur, err = processInnerJoin(env, cur, rightRows, j.On)
 		case JoinLeft:
-			cur, err = processLeftJoin(env, cur, rightRows, j.On, aliasOr(j.Right), rt)
+			cur, err = processLeftJoin(env, cur, rightRows, j.On, aliasOr(j.Right), rightTable)
 		case JoinRight:
 			cur, err = processRightJoin(env, cur, rightRows, j.On)
 		}

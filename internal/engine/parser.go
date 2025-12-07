@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -162,6 +163,32 @@ type DropView struct {
 	IfExists bool
 }
 
+// CreateJob represents a CREATE JOB statement.
+type CreateJob struct {
+	Name         string
+	ScheduleType string // CRON, INTERVAL, ONCE
+	CronExpr     string
+	IntervalMs   int64
+	RunAt        *time.Time
+	Timezone     string
+	MaxRuntimeMs int64
+	NoOverlap    bool
+	CatchUp      bool
+	Enabled      bool
+	SQLText      string
+}
+
+// AlterJob represents ALTER JOB ... ENABLE/DISABLE
+type AlterJob struct {
+	Name   string
+	Enable *bool // nil means no-op
+}
+
+// DropJob represents DROP JOB <name>
+type DropJob struct {
+	Name string
+}
+
 // AlterTable represents an ALTER TABLE statement.
 type AlterTable struct {
 	Table     string
@@ -250,7 +277,10 @@ type FromItem struct {
 	Table    string  // Tabellenname (wenn echte Tabelle)
 	Alias    string  // Alias für Tabelle oder Subselect
 	Subquery *Select // Falls abgeleitete Tabelle: das Select-Statement
+	TableFunc *TableFuncCall // Wenn FROM eine table-valued function ist
 }
+
+
 
 // JoinClause holds a JOIN type with the right side and join condition.
 type JoinClause struct {
@@ -322,6 +352,11 @@ func (p *Parser) ParseStatement() (Statement, error) {
 func (p *Parser) parseCreate() (Statement, error) {
 	p.next()
 
+	// Support CREATE JOB
+	if (p.cur.Typ == tKeyword || p.cur.Typ == tIdent) && p.cur.Val == "JOB" {
+		return p.parseCreateJob()
+	}
+
 	// Check for CREATE INDEX
 	if p.cur.Typ == tKeyword && (p.cur.Val == "INDEX" || p.cur.Val == "UNIQUE") {
 		return p.parseCreateIndex()
@@ -388,6 +423,16 @@ func (p *Parser) parseDrop() (Statement, error) {
 	// Check for DROP VIEW
 	if p.cur.Typ == tKeyword && p.cur.Val == "VIEW" {
 		return p.parseDropView()
+	}
+
+	// Check for DROP JOB
+	if (p.cur.Typ == tKeyword || p.cur.Typ == tIdent) && p.cur.Val == "JOB" {
+		p.next()
+		name := p.parseIdentLike()
+		if name == "" {
+			return nil, p.errf("expected job name")
+		}
+		return &DropJob{Name: name}, nil
 	}
 
 	// DROP TABLE
@@ -480,6 +525,112 @@ func (p *Parser) parseCreateIndex() (Statement, error) {
 		Unique:      unique,
 		IfNotExists: ifNotExists,
 	}, nil
+}
+
+// parseCreateJob handles CREATE JOB statements.
+func (p *Parser) parseCreateJob() (Statement, error) {
+	// cur is at JOB
+	p.next() // consume JOB
+	name := p.parseIdentLike()
+	if name == "" {
+		return nil, p.errf("expected job name")
+	}
+
+	job := &CreateJob{Name: name, Enabled: true}
+
+	// Parse optional clauses until AS
+	for (p.cur.Typ == tKeyword || p.cur.Typ == tIdent) {
+		switch p.cur.Val {
+		case "SCHEDULE":
+			p.next()
+			if (p.cur.Typ == tKeyword || p.cur.Typ == tIdent) && p.cur.Val == "CRON" {
+				p.next()
+				if p.cur.Typ != tString {
+					return nil, p.errf("expected CRON string")
+				}
+				job.ScheduleType = "CRON"
+				job.CronExpr = p.cur.Val
+				p.next()
+			} else if (p.cur.Typ == tKeyword || p.cur.Typ == tIdent) && p.cur.Val == "INTERVAL" {
+				p.next()
+				if p.cur.Typ != tNumber {
+					return nil, p.errf("expected INTERVAL milliseconds number")
+				}
+				n, _ := strconv.ParseInt(p.cur.Val, 10, 64)
+				job.ScheduleType = "INTERVAL"
+				job.IntervalMs = n
+				p.next()
+			} else if (p.cur.Typ == tKeyword || p.cur.Typ == tIdent) && p.cur.Val == "ONCE" {
+				p.next()
+				if p.cur.Typ != tString {
+					return nil, p.errf("expected ONCE timestamp string")
+				}
+				job.ScheduleType = "ONCE"
+				// parse time in common layout
+				if t, err := time.Parse("2006-01-02 15:04:05", p.cur.Val); err == nil {
+					job.RunAt = &t
+				}
+				p.next()
+			} else {
+				return nil, p.errf("expected CRON|INTERVAL|ONCE after SCHEDULE")
+			}
+		case "TIMEZONE":
+			p.next()
+			if p.cur.Typ != tString {
+				return nil, p.errf("expected timezone string")
+			}
+			job.Timezone = p.cur.Val
+			p.next()
+		case "MAX_RUNTIME":
+			p.next()
+			if p.cur.Typ != tNumber {
+				return nil, p.errf("expected number for MAX_RUNTIME")
+			}
+			n, _ := strconv.ParseInt(p.cur.Val, 10, 64)
+			job.MaxRuntimeMs = n
+			p.next()
+		case "NO_OVERLAP":
+			job.NoOverlap = true
+			p.next()
+		case "CATCH_UP":
+			job.CatchUp = true
+			p.next()
+		case "ENABLED":
+			job.Enabled = true
+			p.next()
+		case "DISABLED":
+			job.Enabled = false
+			p.next()
+		default:
+			// stop when we hit AS or other token
+			goto afterClauses
+		}
+	}
+afterClauses:
+	// If caller provided an explicit AS keyword, consume it; otherwise
+	// be permissive and treat the following tokens as the job body.
+	if (p.cur.Typ == tKeyword || p.cur.Typ == tIdent) && p.cur.Val == "AS" {
+		p.next()
+	}
+
+	// Capture raw SQL text for the job body: start at current token position
+	bodyStart := p.cur.Pos
+	// Advance until semicolon or EOF
+	for !(p.cur.Typ == tSymbol && p.cur.Val == ";") && p.cur.Typ != tEOF {
+		p.next()
+	}
+	endPos := p.cur.Pos
+	// Extract substring from lexer
+	if bodyStart < endPos && endPos <= len(p.lx.s) {
+		job.SQLText = p.lx.s[bodyStart:endPos]
+	} else {
+		job.SQLText = ""
+	}
+	// consume semicolon if present
+	if p.cur.Typ == tSymbol && p.cur.Val == ";" {
+		p.next()
+	}
+	return job, nil
 }
 
 func (p *Parser) parseDropIndex() (Statement, error) {
@@ -592,6 +743,21 @@ func (p *Parser) parseDropView() (Statement, error) {
 
 func (p *Parser) parseAlter() (Statement, error) {
 	p.next()
+
+	// Support ALTER JOB <name> ENABLE|DISABLE
+	if (p.cur.Typ == tKeyword || p.cur.Typ == tIdent) && p.cur.Val == "JOB" {
+		p.next()
+		name := p.parseIdentLike()
+		if name == "" {
+			return nil, p.errf("expected job name")
+		}
+		if (p.cur.Typ == tKeyword || p.cur.Typ == tIdent) && (p.cur.Val == "ENABLE" || p.cur.Val == "DISABLE") {
+			enable := p.cur.Val == "ENABLE"
+			p.next()
+			return &AlterJob{Name: name, Enable: &enable}, nil
+		}
+		return nil, p.errf("expected ENABLE or DISABLE after JOB name")
+	}
 
 	if err := p.expectKeyword("TABLE"); err != nil {
 		return nil, err
@@ -1012,11 +1178,42 @@ func (p *Parser) parseFromClause(sel *Select) error {
 		sel.From = FromItem{Subquery: subSel, Alias: alias}
 		return nil
 	}
-	// Normale Tabelle
+	// Could be a table name OR a table-valued function call
 	from := p.parseIdentLike()
 	if from == "" {
-		return p.errf("expected table")
+		return p.errf("expected table or table-valued function")
 	}
+
+	// Function call in FROM: name(...)
+	if p.cur.Typ == tSymbol && p.cur.Val == "(" {
+		// Reuse func call parsing and convert to TableFuncCall
+		fcExpr, err := p.parseFuncCallWithName(from)
+		if err != nil {
+			return err
+		}
+		fc, ok := fcExpr.(*FuncCall)
+		if !ok {
+			return p.errf("internal: expected FuncCall for table function %q", from)
+		}
+		if fc.Over != nil {
+			return p.errf("OVER clause not allowed for table-valued functions in FROM")
+		}
+		alias := from
+		if p.cur.Typ == tKeyword && p.cur.Val == "AS" {
+			p.next()
+			alias = p.parseIdentLike()
+			if alias == "" {
+				return p.errf("expected alias")
+			}
+		} else if p.cur.Typ == tIdent {
+			alias = p.cur.Val
+			p.next()
+		}
+		sel.From = FromItem{TableFunc: &TableFuncCall{Name: from, Args: fc.Args, Alias: alias}, Alias: alias}
+		return nil
+	}
+
+	// Normale Tabelle
 	alias := from
 	if p.cur.Typ == tKeyword && p.cur.Val == "AS" {
 		p.next()
@@ -1036,11 +1233,11 @@ func (p *Parser) parseJoinClauses(sel *Select) error {
 	for {
 		if p.cur.Typ == tKeyword && p.cur.Val == "JOIN" {
 			p.next()
-			rtbl, ralias, on, err := p.parseJoinTail()
+			right, on, err := p.parseJoinTail()
 			if err != nil {
 				return err
 			}
-			sel.Joins = append(sel.Joins, JoinClause{Type: JoinInner, Right: FromItem{Table: rtbl, Alias: ralias}, On: on})
+			sel.Joins = append(sel.Joins, JoinClause{Type: JoinInner, Right: right, On: on})
 			continue
 		}
 		if p.cur.Typ == tKeyword && (p.cur.Val == "LEFT" || p.cur.Val == "RIGHT") {
@@ -1055,11 +1252,11 @@ func (p *Parser) parseJoinClauses(sel *Select) error {
 			if err := p.expectKeyword("JOIN"); err != nil {
 				return err
 			}
-			rtbl, ralias, on, err := p.parseJoinTail()
+			right, on, err := p.parseJoinTail()
 			if err != nil {
 				return err
 			}
-			sel.Joins = append(sel.Joins, JoinClause{Type: jt, Right: FromItem{Table: rtbl, Alias: ralias}, On: on})
+			sel.Joins = append(sel.Joins, JoinClause{Type: jt, Right: right, On: on})
 			continue
 		}
 		break
@@ -1204,30 +1401,101 @@ func (p *Parser) parseUnionClause(sel *Select) error {
 	return nil
 }
 
-func (p *Parser) parseJoinTail() (string, string, Expr, error) {
+func (p *Parser) parseJoinTail() (FromItem, Expr, error) {
+	// Support subselect as right side of JOIN: (SELECT ...) AS alias
+	if p.cur.Typ == tSymbol && p.cur.Val == "(" {
+		p.next()
+		subSel, err := p.parseSelect()
+		if err != nil {
+			return FromItem{}, nil, err
+		}
+		if p.cur.Typ != tSymbol || p.cur.Val != ")" {
+			return FromItem{}, nil, p.errf("expected ) after subselect in JOIN")
+		}
+		p.next()
+		alias := ""
+		if p.cur.Typ == tKeyword && p.cur.Val == "AS" {
+			p.next()
+			alias = p.parseIdentLike()
+			if alias == "" {
+				return FromItem{}, nil, p.errf("expected alias after AS for subselect")
+			}
+		} else if p.cur.Typ == tIdent {
+			alias = p.cur.Val
+			p.next()
+		} else {
+			return FromItem{}, nil, p.errf("expected alias for subselect in JOIN")
+		}
+		if err := p.expectKeyword("ON"); err != nil {
+			return FromItem{}, nil, err
+		}
+		on, err := p.parseExpr()
+		if err != nil {
+			return FromItem{}, nil, err
+		}
+		return FromItem{Subquery: subSel, Alias: alias}, on, nil
+	}
+
+	// Table name or table-valued function
 	rt := p.parseIdentLike()
 	if rt == "" {
-		return "", "", nil, p.errf("expected table")
+		return FromItem{}, nil, p.errf("expected table or table-valued function")
 	}
+
+	// Function call in JOIN RHS: name(...)
+	if p.cur.Typ == tSymbol && p.cur.Val == "(" {
+		fcExpr, err := p.parseFuncCallWithName(rt)
+		if err != nil {
+			return FromItem{}, nil, err
+		}
+		fc, ok := fcExpr.(*FuncCall)
+		if !ok {
+			return FromItem{}, nil, p.errf("internal: expected FuncCall for table function %q", rt)
+		}
+		if fc.Over != nil {
+			return FromItem{}, nil, p.errf("OVER clause not allowed for table-valued functions in JOIN")
+		}
+		alias := rt
+		if p.cur.Typ == tKeyword && p.cur.Val == "AS" {
+			p.next()
+			alias = p.parseIdentLike()
+			if alias == "" {
+				return FromItem{}, nil, p.errf("expected alias")
+			}
+		} else if p.cur.Typ == tIdent {
+			alias = p.cur.Val
+			p.next()
+		}
+		if err := p.expectKeyword("ON"); err != nil {
+			return FromItem{}, nil, err
+		}
+		on, err := p.parseExpr()
+		if err != nil {
+			return FromItem{}, nil, err
+		}
+		return FromItem{TableFunc: &TableFuncCall{Name: rt, Args: fc.Args, Alias: alias}, Alias: alias}, on, nil
+	}
+
+	// Regular table
 	alias := rt
 	if p.cur.Typ == tKeyword && p.cur.Val == "AS" {
 		p.next()
 		alias = p.parseIdentLike()
 		if alias == "" {
-			return "", "", nil, p.errf("expected alias")
+			return FromItem{}, nil, p.errf("expected alias")
 		}
 	} else if p.cur.Typ == tIdent {
 		alias = p.cur.Val
 		p.next()
 	}
 	if err := p.expectKeyword("ON"); err != nil {
-		return "", "", nil, err
+		return FromItem{}, nil, err
 	}
 	on, err := p.parseExpr()
 	if err != nil {
-		return "", "", nil, err
+		return FromItem{}, nil, err
 	}
-	return rt, alias, on, nil
+	return FromItem{Table: rt, Alias: alias}, on, nil
 }
 
 func (p *Parser) parseColumnDefs() ([]storage.Column, error) {
@@ -1490,22 +1758,16 @@ func (p *Parser) parseCmp() (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	for {
-		// Check for NOT IN or NOT LIKE
+		// Support optional NOT prefix for IN/LIKE
 		negate := false
 		if p.cur.Typ == tKeyword && p.cur.Val == "NOT" {
-			// Peek ahead to see if it's IN or LIKE
-			if p.peek.Typ == tKeyword && (p.peek.Val == "IN" || p.peek.Val == "LIKE") {
-				negate = true
-				p.next() // Consume NOT
-				// Continue with IN/LIKE parsing below
-			} else {
-				// Not IN/LIKE, stop here
-				break
-			}
+			negate = true
+			p.next()
 		}
 
-		// Check for IN operator
+		// IN list
 		if p.cur.Typ == tKeyword && p.cur.Val == "IN" {
 			p.next()
 			if err := p.expectSymbol("("); err != nil {
@@ -1513,25 +1775,25 @@ func (p *Parser) parseCmp() (Expr, error) {
 			}
 			var values []Expr
 			for {
-				val, err := p.parseExpr()
+				e, err := p.parseExpr()
 				if err != nil {
 					return nil, err
 				}
-				values = append(values, val)
+				values = append(values, e)
 				if p.cur.Typ == tSymbol && p.cur.Val == "," {
 					p.next()
 					continue
 				}
-				if err := p.expectSymbol(")"); err != nil {
-					return nil, err
-				}
 				break
+			}
+			if err := p.expectSymbol(")"); err != nil {
+				return nil, err
 			}
 			l = &InExpr{Expr: l, Values: values, Negate: negate}
 			continue
 		}
 
-		// Check for LIKE operator
+		// LIKE operator
 		if p.cur.Typ == tKeyword && p.cur.Val == "LIKE" {
 			p.next()
 			pattern, err := p.parseAddSub()
@@ -1564,8 +1826,10 @@ func (p *Parser) parseCmp() (Expr, error) {
 				continue
 			}
 		}
+
 		break
 	}
+
 	return l, nil
 }
 func (p *Parser) parseAddSub() (Expr, error) {
@@ -1638,6 +1902,7 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		p.next()
 		return &Literal{Val: s}, nil
 	case tKeyword:
+		// Handle explicit keywords that are not identifiers first.
 		switch p.cur.Val {
 		case "CASE":
 			return p.parseCaseExpr()
@@ -1647,38 +1912,6 @@ func (p *Parser) parsePrimary() (Expr, error) {
 				return nil, err
 			}
 			return &SubqueryExpr{Select: sel}, nil
-		case "COUNT", "SUM", "AVG", "MIN", "MAX", "MEDIAN", "COALESCE", "NVL", "IFNULL", "NULLIF",
-			"JSON_GET", "JSON_SET", "JSON_EXTRACT",
-			"NOW", "CURRENT_TIME", "CURRENT_DATE", "CURRENT_TIMESTAMP", "GETDATE", "TODAY",
-			"DATEDIFF", "FROM_TIMESTAMP", "TIMESTAMP",
-			"LTRIM", "RTRIM", "TRIM", "ISNULL",
-			"BASE64", "BASE64_DECODE",
-			"UPPER", "LOWER", "CONCAT", "CONCAT_WS", "LENGTH", "SUBSTRING", "SUBSTR",
-			"LEFT", "RIGHT",
-			"MD5", "SHA1", "SHA256", "SHA512",
-			"CAST",
-			"REPLACE", "INSTR", "LOCATE", "POSITION", "REVERSE", "REPEAT", "PRINTF", "FORMAT",
-			"CHAR_LENGTH", "LPAD", "RPAD",
-			"ABS", "ROUND", "FLOOR", "CEIL", "CEILING",
-			"MOD", "POWER", "POW", "SQRT", "LOG", "LN", "LOG10", "LOG2", "EXP",
-			"SIGN", "TRUNCATE", "TRUNC", "PI",
-			"SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
-			"DEGREES", "RADIANS",
-			"GREATEST", "LEAST", "IF", "IIF",
-			"STRFTIME", "DATE", "TIME", "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND",
-			"DAYOFWEEK", "DAYOFYEAR", "WEEKOFYEAR", "QUARTER",
-			"DATE_ADD", "DATE_SUB", "DATEADD", "DATESUB",
-			"RANDOM", "RAND",
-			"SPACE", "ASCII", "CHAR", "CHR", "INITCAP", "SPLIT_PART", "SOUNDEX",
-			"QUOTE", "HEX", "UNHEX",
-			"UUID", "TYPEOF", "VERSION",
-			"IN_PERIOD", "EXTRACT", "DATE_TRUNC", "EOMONTH", "ADD_MONTHS",
-			"REGEXP_MATCH", "REGEXP_EXTRACT", "REGEXP_REPLACE",
-			"SPLIT", "FIRST", "LAST", "ARRAY_LENGTH", "ARRAY_CONTAINS", "IN_ARRAY",
-			"ARRAY_JOIN", "ARRAY_DISTINCT", "ARRAY_SORT",
-			"ROW_NUMBER", "LAG", "LEAD", "MOVING_SUM", "MOVING_AVG",
-			"MIN_BY", "MAX_BY", "ARG_MIN", "ARG_MAX", "FIRST_VALUE", "LAST_VALUE":
-			return p.parseFuncCall()
 		case "TRUE":
 			p.next()
 			return &Literal{Val: true}, nil
@@ -1688,9 +1921,18 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		case "NULL":
 			p.next()
 			return &Literal{Val: nil}, nil
-		default:
-			return nil, p.errf("unexpected keyword %q", p.cur.Val)
 		}
+
+		// If the keyword is followed by '(' treat it as a function call; otherwise
+		// accept keywords as identifier-like (e.g., a column named TIMESTAMP).
+		if p.peek.Typ == tSymbol && p.peek.Val == "(" {
+			return p.parseFuncCall()
+		}
+
+		// Otherwise treat the keyword as a variable/column reference
+		name := p.cur.Val
+		p.next()
+		return &VarRef{Name: name}, nil
 	case tIdent:
 		name := p.cur.Val
 		p.next()

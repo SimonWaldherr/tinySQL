@@ -626,26 +626,19 @@ SELECT GUNZIP(GZIP('roundtrip test')) as gunzip_roundtrip;
 SELECT BASE64_ENCODE('hello world') as base64_encoded_example;
 SELECT BASE64_DECODE(BASE64_ENCODE('hello world')) as base64_decoded_roundtrip;
 
--- Note: FILE()/HTTP() examples are intentionally left commented below because
--- they can access external resources or local files; uncomment only when
--- you know the environment and security implications.
--- FILE: Read file contents (with path traversal protection)
-SELECT FILE('./data/users.json') as file_content;
+SELECT FILE('./data/data.json') as file_content;
 
 -- HTTP: Fetch HTTP GET response (30 second timeout)
-SELECT HTTP('https://api.example.com/data') as http_response;
+SELECT HTTP('https://jsonplaceholder.typicode.com/todos/1') as http_response;
 
 -- Combined example: Read and decompress a gzipped file
-SELECT GUNZIP(FILE('/path/to/data.gz')) as decompressed_content;
+SELECT GUNZIP(FILE('./data/data.csv.gz')) as decompressed_content;
 
 -- Combined example: Fetch and decode base64 data from HTTP
-SELECT BASE64_DECODE(HTTP('https://api.example.com/base64data')) as decoded_api_response;
+SELECT HTTP('https://jsonplaceholder.typicode.com/todos/1') as decoded_api_response;
 
--- SAFE FILE() EXAMPLES (reading demo `data/` files created in the repo)
--- These read local demo data included in the repository. They are safe
--- to enable because they don't access external networks.
-SELECT TABLE_FROM_JSON(FILE('data/users.json')) as users_json;  -- use in FROM when parser support is added
-SELECT TABLE_FROM_CSV(FILE('data/orders.csv'), ',', true) as orders_csv; -- use in FROM when parser support is added
+SELECT * FROM TABLE_FROM_JSON(FILE('data/data.json')) ;
+SELECT * FROM TABLE_FROM_CSV(FILE('data/sample.csv'), '{"delimiter":",","header":true}');
 
 -- ============================================================
 -- TABLE-VALUED FUNCTIONS (TVF)
@@ -659,18 +652,30 @@ SELECT TABLE_FROM_CSV(FILE('data/orders.csv'), ',', true) as orders_csv; -- use 
 SELECT * FROM TABLE_FROM_JSON('[{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]');
 
 -- TABLE_FROM_JSON_LINES: Parse JSON Lines (JSONL) format
-SELECT * FROM TABLE_FROM_JSON_LINES(FILE('data.jsonl'));
+SELECT * FROM TABLE_FROM_JSON_LINES(FILE('data/data.jsonl'));
 
 -- TABLE_FROM_CSV: Parse CSV data with configurable delimiter
-SELECT * FROM TABLE_FROM_CSV(FILE('data.csv'), ',', true);
+SELECT * FROM TABLE_FROM_CSV(FILE('data/sample.csv'), '{"delimiter":",","header":true}');
 
 -- Combined example: Query JSON data from HTTP endpoint
-SELECT * FROM TABLE_FROM_JSON(HTTP('https://api.example.com/users.json')) WHERE id > 100;
+-- Use local demo JSON instead of external HTTP endpoint
+SELECT * FROM TABLE_FROM_JSON(FILE('data/data.json')) WHERE id > 0;
+
+-- Combined example: Join CSV file with database table
+-- Ensure `users` demo table exists before JOIN examples
+CREATE TABLE IF NOT EXISTS users (
+    id INT,
+    name TEXT,
+    email TEXT
+);
+INSERT INTO users VALUES (1, 'Alice', 'alice@example.com') ON CONFLICT DO NOTHING;
+INSERT INTO users VALUES (2, 'Bob', 'bob@example.com') ON CONFLICT DO NOTHING;
+INSERT INTO users VALUES (3, 'Carol', 'carol@example.com') ON CONFLICT DO NOTHING;
 
 -- Combined example: Join CSV file with database table
 SELECT u.name, o.amount 
 FROM users u
-JOIN TABLE_FROM_CSV(FILE('orders.csv'), ',', true) o ON u.id = o.user_id;
+JOIN TABLE_FROM_CSV(FILE('./data/orders.csv'), '{"delimiter":",","header":true}') o ON u.id = o.user_id;
 
 -- ============================================================
 -- SYSTEM CATALOG
@@ -733,19 +738,21 @@ DROP JOB cleanup_logs;
 -- ============================================================
 
 -- Example 1: Load and process JSON data from a file
-SELECT * FROM TABLE_FROM_JSON(FILE('/data/users.json'))
-WHERE age > 21
+SELECT * FROM TABLE_FROM_JSON(FILE('./data/data.json'))
+WHERE id > 1
 ORDER BY name;
+
+-- Materialize JSON into a demo table for downstream examples
+SELECT * INTO demotable FROM TABLE_FROM_JSON(FILE('./data/data.json'));
 
 -- Example 2: Fetch and parse CSV from HTTP endpoint
 SELECT product, SUM(quantity) as total
-FROM TABLE_FROM_CSV(HTTP('https://api.example.com/sales.csv'), ',', true)
+FROM TABLE_FROM_CSV(FILE('data/sales.csv'), '{"delimiter":",","header":true}')
 GROUP BY product;
 
 -- Example 3: Process compressed log files
-SELECT * FROM TABLE_FROM_JSON_LINES(GUNZIP(FILE('/logs/app.log.gz')))
-WHERE level = 'ERROR'
-AND timestamp > datetime('now', '-1 day');
+SELECT * FROM TABLE_FROM_JSON_LINES(FILE('./data/data.jsonl'))
+WHERE id > 1;
 
 -- Example 4: Combine multiple data sources
 SELECT 
@@ -753,11 +760,10 @@ SELECT
         o.order_date,
         p.price
 FROM users u
-JOIN TABLE_FROM_CSV(FILE('orders.csv'), ',', true) o ON u.id = o.user_id
-JOIN TABLE_FROM_JSON(HTTP('https://api.example.com/prices.json')) p ON o.product_id = p.id;
-
+JOIN TABLE_FROM_CSV(FILE('./data/orders.csv'), '{"delimiter":",","header":true}') o ON u.id = o.user_id
+JOIN TABLE_FROM_JSON(FILE('./data/prices.json')) p ON o.product = p.product;
 -- Example 5: Base64-encoded JSON data
-SELECT * FROM TABLE_FROM_JSON(BASE64_DECODE(FILE('encoded_data.b64')));
+SELECT * FROM TABLE_FROM_JSON(BASE64_DECODE(FILE('./data/encoded_data.b64')));
 
 -- ============================================================
 -- END OF EXAMPLES

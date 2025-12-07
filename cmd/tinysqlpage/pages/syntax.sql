@@ -27,7 +27,7 @@ FROM ui_context;
 
 SELECT
     'table' AS component,
-    '📋 Data Definition Language (DDL)' AS title,
+    'Data Definition Language (DDL)' AS title,
     'CREATE TABLE' AS statement,
     'CREATE [TEMP] TABLE [IF NOT EXISTS] name (col1 TYPE, col2 TYPE, ...)' AS syntax,
     'Creates a new table with specified columns' AS description
@@ -87,7 +87,7 @@ FROM ui_context;
 
 SELECT
     'table' AS component,
-    '🔢 Supported Data Types' AS title,
+    'Supported Data Types' AS title,
     'INT / INTEGER' AS type,
     'Integer numbers' AS description,
     '42, -17, 0' AS examples
@@ -147,7 +147,7 @@ FROM ui_context;
 
 SELECT
     'table' AS component,
-    '✏️ Data Manipulation Language (DML)' AS title,
+    'Data Manipulation Language (DML)' AS title,
     'INSERT' AS statement,
     'INSERT INTO table [(cols)] VALUES (vals), (vals), ...' AS syntax,
     'Inserts one or more rows into a table' AS description
@@ -175,7 +175,7 @@ FROM ui_context;
 
 SELECT
     'table' AS component,
-    '🔍 SELECT Statement Clauses' AS title,
+    'SELECT Statement Clauses' AS title,
     'SELECT' AS clause,
     'SELECT [DISTINCT] cols FROM table' AS syntax,
     'Specifies columns to retrieve, use * for all' AS description
@@ -251,7 +251,7 @@ FROM ui_context;
 
 SELECT
     'table' AS component,
-    '🔄 Set Operations' AS title,
+        'Set Operations' AS title,
     'UNION' AS operation,
     'SELECT ... UNION SELECT ...' AS syntax,
     'Combines results, removes duplicates' AS description
@@ -287,7 +287,7 @@ FROM ui_context;
 
 SELECT
     'table' AS component,
-    '⚡ Operators' AS title,
+        'Operators' AS title,
     'Arithmetic' AS category,
     '+ - * / %' AS operators,
     'Addition, subtraction, multiplication, division, modulo' AS description
@@ -503,7 +503,7 @@ FROM ui_context;
 
 SELECT
     'table' AS component,
-    '📝 String Functions' AS title,
+        'String Functions' AS title,
     'UPPER(str)' AS function,
     'Converts to uppercase' AS description,
     'SELECT UPPER(''hello'')' AS example
@@ -659,7 +659,7 @@ FROM ui_context;
 
 SELECT
     'table' AS component,
-    '🔎 Regex Functions' AS title,
+        'Regex Functions' AS title,
     'REGEXP_MATCH(str, pattern)' AS function,
     'Tests if string matches pattern' AS description,
     'SELECT REGEXP_MATCH(''test@mail.com'', ''.*@.*'')' AS example
@@ -687,7 +687,7 @@ FROM ui_context;
 
 SELECT
     'table' AS component,
-    '🔢 Numeric Functions' AS title,
+        'Numeric Functions' AS title,
     'ABS(n)' AS function,
     'Returns absolute value' AS description,
     'SELECT ABS(-42)' AS example
@@ -827,7 +827,7 @@ FROM ui_context;
 
 SELECT
     'table' AS component,
-    '📊 Aggregate Functions' AS title,
+        'Aggregate Functions' AS title,
     'COUNT(*) / COUNT(col)' AS function,
     'Counts rows or non-null values' AS description,
     'SELECT COUNT(*) FROM table' AS example
@@ -879,7 +879,7 @@ FROM ui_context;
 
 SELECT
     'table' AS component,
-    '📋 Array Functions' AS title,
+        'Array Functions' AS title,
     'FIRST(arr)' AS function,
     'Returns first array element' AS description,
     'SELECT FIRST(SPLIT(''a,b,c'', '',''))' AS example
@@ -939,7 +939,7 @@ FROM ui_context;
 
 SELECT
     'table' AS component,
-    '🪟 Window Functions' AS title,
+        'Window Functions' AS title,
     'ROW_NUMBER() OVER(...)' AS function,
     'Assigns unique row numbers' AS description,
     'ROW_NUMBER() OVER (ORDER BY date)' AS example
@@ -999,7 +999,7 @@ FROM ui_context;
 
 SELECT
     'table' AS component,
-    '🔀 Conditional Functions' AS title,
+        'Conditional Functions' AS title,
     'COALESCE(v1, v2, ...)' AS function,
     'Returns first non-null value' AS description,
     'SELECT COALESCE(NULL, ''default'')' AS example
@@ -1051,7 +1051,7 @@ FROM ui_context;
 
 SELECT
     'table' AS component,
-    '🔐 Cryptographic Functions' AS title,
+        'Cryptographic Functions' AS title,
     'MD5(str)' AS function,
     'Returns MD5 hash' AS description,
     'SELECT MD5(''password'')' AS example
@@ -1119,7 +1119,7 @@ FROM ui_context;
 
 SELECT
     'table' AS component,
-    '🛠️ Type and Utility Functions' AS title,
+        'Type and Utility Functions' AS title,
     'CAST(val AS type)' AS function,
     'Converts value to specified type' AS description,
     'SELECT CAST(''123'' AS INTEGER)' AS example
