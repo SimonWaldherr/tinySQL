@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<products>
+  <product>
+    <id>1</id>
+    <name>Laptop</name>
+    <price>1200</price>
+  </product>
+  <product>
+    <id>2</id>
+    <name>Mouse</name>
+    <price>25</price>
+  </product>
+  <product>
+    <id>3</id>
+    <name>Keyboard</name>
+    <price>75</price>
+  </product>
+</products>
