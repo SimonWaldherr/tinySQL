@@ -236,6 +236,9 @@ type DB struct {
 
 	// Advanced WAL (optional - replaces basic WAL when enabled)
 	advancedWAL *AdvancedWAL
+
+	// System catalog for metadata and job scheduling
+	catalog *CatalogManager
 }
 
 // NewDB creates a new empty database catalog with MVCC support.

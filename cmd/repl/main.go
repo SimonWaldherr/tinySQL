@@ -144,13 +144,14 @@ func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool
 				}
 
 				if err != nil {
+					friendly := friendlyErrorString(err)
 					if htmlMode {
 						if sqlFrag != "" {
 							htmlParts = append(htmlParts, sqlFrag)
 						} else {
 							htmlParts = append(htmlParts, renderSQLHTML(q))
 						}
-						htmlParts = append(htmlParts, "<div class='err'>ERR: "+html.EscapeString(err.Error())+"</div>")
+						htmlParts = append(htmlParts, "<div class='err'>ERR: "+html.EscapeString(friendly)+"</div>")
 						htmlParts = append(htmlParts, "<hr/>")
 					} else {
 						fmt.Println("ERR:", err)
@@ -175,7 +176,8 @@ func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool
 					}
 
 					if err != nil {
-						htmlParts = append(htmlParts, "<div class='err'>ERR: "+html.EscapeString(err.Error())+"</div>")
+						friendly := friendlyErrorString(err)
+						htmlParts = append(htmlParts, "<div class='err'>ERR: "+html.EscapeString(friendly)+"</div>")
 					} else {
 						htmlParts = append(htmlParts, renderRowsHTML(out, cols))
 					}
@@ -198,6 +200,7 @@ func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool
 
 			// Non-SELECT statements.
 			if _, err := db.Exec(q); err != nil {
+				friendly := friendlyErrorString(err)
 				if htmlMode {
 					// Show the statement to make errors debuggable in the HTML output.
 					if sqlFrag == "" {
@@ -208,7 +211,7 @@ func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool
 						}
 					}
 					htmlParts = append(htmlParts, sqlFrag)
-					htmlParts = append(htmlParts, "<div class='err'>ERR: "+html.EscapeString(err.Error())+"</div>")
+					htmlParts = append(htmlParts, "<div class='err'>ERR: "+html.EscapeString(friendly)+"</div>")
 				} else {
 					fmt.Println("ERR:", err)
 				}
@@ -553,6 +556,28 @@ func renderSQLHTML(q string) string {
 	return "<div class=\"sql-block\"><pre>" + html.EscapeString(q) + "</pre></div>"
 }
 
+// friendlyErrorString maps common demo errors to clearer, user-friendly
+// messages so the generated HTML page explains why examples failed.
+func friendlyErrorString(err error) string {
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "file(): open"):
+		return "FILE() failed: missing file or path. This example uses a placeholder path; create the file or adjust the path for your environment."
+	case strings.Contains(s, "http(): Get"):
+		return "HTTP() failed: network or DNS lookup failed. External HTTP examples require network access; disable or replace with a local file."
+	case strings.Contains(s, "table-valued function") && strings.Contains(s, "used as scalar"):
+		return "table-valued function used as scalar; use in FROM clause (parser support pending)"
+	case strings.Contains(s, "no such table \"TABLE_FROM_"):
+		return "table-valued function not available in FROM; parser support pending"
+	case strings.Contains(s, "no such table \"catalog."):
+		return "system catalog SQL queries are not yet supported; catalog is accessible via the Go API"
+	case strings.Contains(s, "parse error near \"JOB\"") || strings.Contains(s, "expected keyword \"TABLE\""):
+		return "CREATE JOB syntax is not yet supported by the SQL parser; use the Go API scheduler"
+	default:
+		return s
+	}
+}
+
 type htmlPageData struct {
 	Title string
 	Lead  string
@@ -699,7 +724,7 @@ const htmlPageTemplate = `<!doctype html>
 			}
 
 			// Load required scripts: wasm_exec.js (Go runtime), then wasm-init.js (minimal loader)
-			const candidates = ['wasm_exec.js', 'cmd/query_files_wasm/wasm-init.js'];
+			const candidates = ['wasm_exec.js', 'wasm-init.js'];
 			for(const url of candidates){
 				try{
 					await loadScript(url);

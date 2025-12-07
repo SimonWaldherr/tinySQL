@@ -1081,5 +1081,17 @@ func getExtendedFunctions() map[string]funcHandler {
 		"ARG_MAX":     evalArgMaxFunc,
 		"FIRST_VALUE": evalFirstValueFunc,
 		"LAST_VALUE":  evalLastValueFunc,
+		// IO functions
+		"FILE":           evalFileFunc,
+		"HTTP":           evalHTTPFunc,
+		// Transform functions
+		"GUNZIP":         evalGunzipFunc,
+		"UNZIP":          evalGunzipFunc,
+		"GZIP":           evalGzipFunc,
+		"BASE64_ENCODE":  evalBase64EncodeFunc,
+        // Table-valued function names (scalar stubs)
+        "TABLE_FROM_JSON":       evalTableFromJSONScalar,
+        "TABLE_FROM_JSON_LINES": evalTableFromJSONLinesScalar,
+        "TABLE_FROM_CSV":        evalTableFromCSVScalar,
 	}
 }

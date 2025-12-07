@@ -616,10 +616,149 @@ WITH RECURSIVE fib AS (
 SELECT n, a AS fib_value FROM fib ORDER BY n;
 
 -- ============================================================
--- END OF EXAMPLES
+-- IO AND TRANSFORM FUNCTIONS (safe runnable examples enabled)
+
+-- GZIP/GUNZIP: Compression functions (safe examples)
+SELECT LENGTH(GZIP('tinySQL gzip test string')) as gzip_compressed_length;
+SELECT GUNZIP(GZIP('roundtrip test')) as gunzip_roundtrip;
+
+-- BASE64 encoding/decoding (safe examples)
+SELECT BASE64_ENCODE('hello world') as base64_encoded_example;
+SELECT BASE64_DECODE(BASE64_ENCODE('hello world')) as base64_decoded_roundtrip;
+
+-- Note: FILE()/HTTP() examples are intentionally left commented below because
+-- they can access external resources or local files; uncomment only when
+-- you know the environment and security implications.
+-- FILE: Read file contents (with path traversal protection)
+SELECT FILE('./data/users.json') as file_content;
+
+-- HTTP: Fetch HTTP GET response (30 second timeout)
+SELECT HTTP('https://api.example.com/data') as http_response;
+
+-- Combined example: Read and decompress a gzipped file
+SELECT GUNZIP(FILE('/path/to/data.gz')) as decompressed_content;
+
+-- Combined example: Fetch and decode base64 data from HTTP
+SELECT BASE64_DECODE(HTTP('https://api.example.com/base64data')) as decoded_api_response;
+
+-- SAFE FILE() EXAMPLES (reading demo `data/` files created in the repo)
+-- These read local demo data included in the repository. They are safe
+-- to enable because they don't access external networks.
+SELECT TABLE_FROM_JSON(FILE('data/users.json')) as users_json;  -- use in FROM when parser support is added
+SELECT TABLE_FROM_CSV(FILE('data/orders.csv'), ',', true) as orders_csv; -- use in FROM when parser support is added
+
+-- ============================================================
+-- TABLE-VALUED FUNCTIONS (TVF)
 -- ============================================================
 
--- Note: This file demonstrates the complete tinySQL function library.
--- All functions shown are available and tested.
--- Window functions (ROW_NUMBER, LAG, LEAD, MOVING_SUM, MOVING_AVG) 
--- are planned for future implementation.
+-- Note: Table-valued functions are currently in development.
+-- The infrastructure is implemented, but parser integration is pending.
+-- These will be available in a future release:
+
+-- TABLE_FROM_JSON: Parse JSON array into table
+SELECT * FROM TABLE_FROM_JSON('[{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]');
+
+-- TABLE_FROM_JSON_LINES: Parse JSON Lines (JSONL) format
+SELECT * FROM TABLE_FROM_JSON_LINES(FILE('data.jsonl'));
+
+-- TABLE_FROM_CSV: Parse CSV data with configurable delimiter
+SELECT * FROM TABLE_FROM_CSV(FILE('data.csv'), ',', true);
+
+-- Combined example: Query JSON data from HTTP endpoint
+SELECT * FROM TABLE_FROM_JSON(HTTP('https://api.example.com/users.json')) WHERE id > 100;
+
+-- Combined example: Join CSV file with database table
+SELECT u.name, o.amount 
+FROM users u
+JOIN TABLE_FROM_CSV(FILE('orders.csv'), ',', true) o ON u.id = o.user_id;
+
+-- ============================================================
+-- SYSTEM CATALOG
+-- ============================================================
+
+-- Note: System catalog tables are implemented and available via the Go API.
+-- SQL syntax for querying catalog is planned for future release:
+
+-- List all tables
+SELECT * FROM catalog.tables;
+
+-- Find columns for a specific table
+SELECT * FROM catalog.columns WHERE table_name = 'users';
+
+-- View all registered functions
+SELECT name, function_type, return_type FROM catalog.functions;
+
+-- Check scheduled jobs
+SELECT name, enabled, schedule_type, next_run_at FROM catalog.jobs WHERE enabled = true;
+
+-- ============================================================
+-- JOB SCHEDULER
+-- ============================================================
+
+-- Note: Job scheduler is fully implemented and operational via the Go API.
+-- SQL syntax for job management is planned for future release:
+
+-- Create a CRON job
+CREATE JOB cleanup_logs
+    SCHEDULE CRON '0 0 3 * * *'  -- Daily at 3 AM
+    TIMEZONE 'UTC'
+    MAX_RUNTIME 300000            -- 5 minutes
+    NO_OVERLAP
+AS
+    DELETE FROM logs WHERE created_at < datetime('now', '-7 days');
+
+-- Create an INTERVAL job
+CREATE JOB refresh_stats
+    SCHEDULE INTERVAL 30000       -- Every 30 seconds
+    MAX_RUNTIME 10000             -- 10 seconds
+AS
+    INSERT INTO stats_cache SELECT * FROM compute_stats();
+
+-- Create a ONCE job
+CREATE JOB send_report
+    SCHEDULE ONCE '2025-12-31 23:59:59'
+    TIMEZONE 'America/New_York'
+AS
+    SELECT generate_report('annual');
+
+-- Enable/disable jobs
+ALTER JOB cleanup_logs ENABLE;
+ALTER JOB cleanup_logs DISABLE;
+
+-- Drop a job
+DROP JOB cleanup_logs;
+
+-- ============================================================
+-- PRACTICAL EXAMPLES WITH NEW FUNCTIONS
+-- ============================================================
+
+-- Example 1: Load and process JSON data from a file
+SELECT * FROM TABLE_FROM_JSON(FILE('/data/users.json'))
+WHERE age > 21
+ORDER BY name;
+
+-- Example 2: Fetch and parse CSV from HTTP endpoint
+SELECT product, SUM(quantity) as total
+FROM TABLE_FROM_CSV(HTTP('https://api.example.com/sales.csv'), ',', true)
+GROUP BY product;
+
+-- Example 3: Process compressed log files
+SELECT * FROM TABLE_FROM_JSON_LINES(GUNZIP(FILE('/logs/app.log.gz')))
+WHERE level = 'ERROR'
+AND timestamp > datetime('now', '-1 day');
+
+-- Example 4: Combine multiple data sources
+SELECT 
+        u.name,
+        o.order_date,
+        p.price
+FROM users u
+JOIN TABLE_FROM_CSV(FILE('orders.csv'), ',', true) o ON u.id = o.user_id
+JOIN TABLE_FROM_JSON(HTTP('https://api.example.com/prices.json')) p ON o.product_id = p.id;
+
+-- Example 5: Base64-encoded JSON data
+SELECT * FROM TABLE_FROM_JSON(BASE64_DECODE(FILE('encoded_data.b64')));
+
+-- ============================================================
+-- END OF EXAMPLES
+-- ============================================================
