@@ -61,33 +61,33 @@ type CatalogView struct {
 
 // CatalogFunction represents metadata for scalar and table-valued functions
 type CatalogFunction struct {
-	Schema       string
-	Name         string
-	FunctionType string // 'SCALAR', 'TABLE', 'AGGREGATE', 'WINDOW'
-	ArgTypes     []string
-	ReturnType   string
-	Language     string // 'BUILTIN', 'SQL', 'GO'
+	Schema          string
+	Name            string
+	FunctionType    string // 'SCALAR', 'TABLE', 'AGGREGATE', 'WINDOW'
+	ArgTypes        []string
+	ReturnType      string
+	Language        string // 'BUILTIN', 'SQL', 'GO'
 	IsDeterministic bool
-	Description  string
+	Description     string
 }
 
 // CatalogJob represents a scheduled job
 type CatalogJob struct {
-	Name          string
-	SQLText       string
-	ScheduleType  string // 'CRON', 'INTERVAL', 'ONCE'
-	CronExpr      string // For CRON schedule
-	IntervalMs    int64  // For INTERVAL schedule (milliseconds)
-	RunAt         *time.Time // For ONCE schedule
-	Timezone      string
-	Enabled       bool
-	CatchUp       bool // Run missed executions
-	NoOverlap     bool // Prevent concurrent runs
-	MaxRuntimeMs  int64
-	LastRunAt     *time.Time
-	NextRunAt     *time.Time
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	Name         string
+	SQLText      string
+	ScheduleType string     // 'CRON', 'INTERVAL', 'ONCE'
+	CronExpr     string     // For CRON schedule
+	IntervalMs   int64      // For INTERVAL schedule (milliseconds)
+	RunAt        *time.Time // For ONCE schedule
+	Timezone     string
+	Enabled      bool
+	CatchUp      bool // Run missed executions
+	NoOverlap    bool // Prevent concurrent runs
+	MaxRuntimeMs int64
+	LastRunAt    *time.Time
+	NextRunAt    *time.Time
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 // ==================== Catalog Operations ====================

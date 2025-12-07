@@ -15,13 +15,13 @@ import (
 
 // Scheduler manages scheduled job execution
 type Scheduler struct {
-	db         *DB
-	catalog    *CatalogManager
-	cron       *cron.Cron
-	mu         sync.RWMutex
-	running    map[string]*jobExecution // Track currently running jobs
-	stopCh     chan struct{}
-	executor   JobExecutor // Interface for executing SQL
+	db       *DB
+	catalog  *CatalogManager
+	cron     *cron.Cron
+	mu       sync.RWMutex
+	running  map[string]*jobExecution // Track currently running jobs
+	stopCh   chan struct{}
+	executor JobExecutor // Interface for executing SQL
 }
 
 // JobExecutor interface allows the scheduler to execute SQL without circular dependencies
@@ -258,7 +258,7 @@ func (s *Scheduler) calculateNextRun(job *CatalogJob) {
 		}
 
 		interval := time.Duration(job.IntervalMs) * time.Millisecond
-		
+
 		if job.LastRunAt == nil {
 			// First run
 			nextRun := now.Add(interval)

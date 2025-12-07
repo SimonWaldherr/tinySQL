@@ -274,13 +274,11 @@ type UnionClause struct {
 
 // FromItem kann eine echte Tabelle oder ein Subselect (Derived Table) sein.
 type FromItem struct {
-	Table    string  // Tabellenname (wenn echte Tabelle)
-	Alias    string  // Alias für Tabelle oder Subselect
-	Subquery *Select // Falls abgeleitete Tabelle: das Select-Statement
+	Table     string         // Tabellenname (wenn echte Tabelle)
+	Alias     string         // Alias für Tabelle oder Subselect
+	Subquery  *Select        // Falls abgeleitete Tabelle: das Select-Statement
 	TableFunc *TableFuncCall // Wenn FROM eine table-valued function ist
 }
-
-
 
 // JoinClause holds a JOIN type with the right side and join condition.
 type JoinClause struct {
@@ -539,7 +537,7 @@ func (p *Parser) parseCreateJob() (Statement, error) {
 	job := &CreateJob{Name: name, Enabled: true}
 
 	// Parse optional clauses until AS
-	for (p.cur.Typ == tKeyword || p.cur.Typ == tIdent) {
+	for p.cur.Typ == tKeyword || p.cur.Typ == tIdent {
 		switch p.cur.Val {
 		case "SCHEDULE":
 			p.next()

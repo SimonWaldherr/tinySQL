@@ -18,10 +18,10 @@ import (
 type TableFunction interface {
 	// Name returns the function name (e.g., "table_from_json")
 	Name() string
-	
+
 	// Execute evaluates the TVF and returns a result set (columns + rows)
 	Execute(ctx context.Context, args []Expr, env ExecEnv, row Row) (*ResultSet, error)
-	
+
 	// ValidateArgs checks if the provided arguments are valid
 	ValidateArgs(args []Expr) error
 }
@@ -488,9 +488,9 @@ func parseXMLToTable(xmlStr string, recordName string) (*ResultSet, error) {
 			if err != nil {
 				break
 			}
-				if se, ok := tok.(xml.StartElement); ok {
-					counts[se.Name.Local]++
-				}
+			if se, ok := tok.(xml.StartElement); ok {
+				counts[se.Name.Local]++
+			}
 		}
 		// pick most frequent element (excluding the document root)
 		best := ""

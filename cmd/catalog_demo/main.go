@@ -31,7 +31,7 @@ func main() {
 
 	// ==================== Register Tables ====================
 	fmt.Println("1. Registering tables in catalog...")
-	
+
 	table1Cols := []storage.Column{
 		{Name: "id", Type: storage.IntType},
 		{Name: "name", Type: storage.StringType},
@@ -52,7 +52,7 @@ func main() {
 	fmt.Println("\n2. Querying catalog.tables:")
 	tables := catalog.GetTables()
 	for _, t := range tables {
-		fmt.Printf("   - %s.%s (type: %s, created: %s)\n", 
+		fmt.Printf("   - %s.%s (type: %s, created: %s)\n",
 			t.Schema, t.Name, t.Type, t.CreatedAt.Format("2006-01-02 15:04:05"))
 	}
 
@@ -70,7 +70,7 @@ func main() {
 
 	// ==================== Register Functions ====================
 	fmt.Println("\n5. Registering functions:")
-	
+
 	catalog.RegisterFunction(&storage.CatalogFunction{
 		Schema:          "main",
 		Name:            "file",
@@ -140,7 +140,7 @@ func main() {
 	fmt.Println("\n7. Starting job scheduler...")
 	executor := &SimpleExecutor{db: db}
 	scheduler := storage.NewScheduler(db, executor)
-	
+
 	if err := scheduler.Start(); err != nil {
 		log.Fatalf("Failed to start scheduler: %v", err)
 	}
@@ -162,18 +162,18 @@ func main() {
 		if job.Enabled {
 			status = "enabled"
 		}
-		
+
 		lastRun := "never"
 		if job.LastRunAt != nil {
 			lastRun = job.LastRunAt.Format("15:04:05")
 		}
-		
+
 		nextRun := "n/a"
 		if job.NextRunAt != nil {
 			nextRun = job.NextRunAt.Format("15:04:05")
 		}
 
-		fmt.Printf("   - %s: %s | last: %s | next: %s\n", 
+		fmt.Printf("   - %s: %s | last: %s | next: %s\n",
 			job.Name, status, lastRun, nextRun)
 	}
 
