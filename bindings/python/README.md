@@ -17,31 +17,30 @@ go build -buildmode=c-archive -o libtinysql.a  ./bindings/python
 Both commands emit a `libtinysql.h` header containing the exported function declarations:
 
 ```c
+const char* TinySQLVersion(void);
 const char* TinySQLExec(const char* sql);
+const char* TinySQLSave(const char* path);
+const char* TinySQLLoad(const char* path);
 void        TinySQLReset(void);
 void        TinySQLFree(char* ptr);
 ```
 
-`TinySQLExec` accepts a UTF‑8 SQL string, executes it against an in-memory database (tenant `default`), and returns a JSON payload describing the outcome. `TinySQLFree` must be called on every pointer returned by `TinySQLExec` to avoid a leak. `TinySQLReset` wipes the in-memory state so you can reuse the same process for multiple tests.
+`TinySQLExec` accepts a UTF‑8 SQL string, executes it against an in-memory database (tenant `default`), and returns a JSON payload describing the outcome. `TinySQLSave` and `TinySQLLoad` allow persisting the database to disk. `TinySQLFree` must be called on every pointer returned by the `TinySQL*` functions (except `TinySQLReset`) to avoid a leak. `TinySQLReset` wipes the in-memory state so you can reuse the same process for multiple tests.
 
 ## Python Usage
 
-A lightweight `ctypes` helper is provided in [example.py](./example.py). You can adapt it to your own application. The gist:
+A lightweight `ctypes` wrapper is provided in [example.py](./example.py). You can adapt it to your own application. The gist:
 
 ```python
-import ctypes, json
+from example import TinySQL
 
-lib = ctypes.CDLL("./libtinysql.so")
-lib.TinySQLExec.argtypes = [ctypes.c_char_p]
-lib.TinySQLExec.restype = ctypes.c_void_p
-lib.TinySQLFree.argtypes = [ctypes.c_void_p]
-
-
-def exec_sql(sql: str):
-    ptr = lib.TinySQLExec(sql.encode("utf-8"))
-    payload = ctypes.string_at(ptr).decode("utf-8")
-    lib.TinySQLFree(ptr)
-    return json.loads(payload)
+db = TinySQL()
+print(db.version())
+db.execute("CREATE TABLE users (id INT, name TEXT);")
+db.execute("INSERT INTO users VALUES (1, 'Alice');")
+result = db.execute("SELECT * FROM users;")
+print(result["rows"])
+db.save("mydata.db")
 ```
 
 The returned JSON looks like this:

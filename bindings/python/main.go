@@ -13,12 +13,45 @@ import (
 	"unsafe"
 
 	tsql "github.com/SimonWaldherr/tinySQL"
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 var (
 	pyDB   = tsql.NewDB()
 	pyLock sync.Mutex
 )
+
+//export TinySQLVersion
+func TinySQLVersion() *C.char {
+	return C.CString("0.1.0")
+}
+
+//export TinySQLSave
+func TinySQLSave(path *C.char) *C.char {
+	pyLock.Lock()
+	defer pyLock.Unlock()
+
+	filePath := C.GoString(path)
+	err := storage.SaveToFile(pyDB, filePath)
+	if err != nil {
+		return cStringError(err)
+	}
+	return cStringJSON(map[string]any{"status": "ok"})
+}
+
+//export TinySQLLoad
+func TinySQLLoad(path *C.char) *C.char {
+	pyLock.Lock()
+	defer pyLock.Unlock()
+
+	filePath := C.GoString(path)
+	db, err := storage.LoadFromFile(filePath)
+	if err != nil {
+		return cStringError(err)
+	}
+	pyDB = db
+	return cStringJSON(map[string]any{"status": "ok"})
+}
 
 //export TinySQLExec
 func TinySQLExec(sql *C.char) *C.char {

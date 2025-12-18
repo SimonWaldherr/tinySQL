@@ -62,6 +62,16 @@ func SetDefaultDB(db *storage.DB) {
 	defaultDrv.srv = newServer(db, c)
 }
 
+// OpenInMemory returns a *sql.DB backed by an in-memory tinySQL server.
+// If tenant is empty the default tenant is used.
+func OpenInMemory(tenant string) (*sql.DB, error) {
+	dsn := "mem://"
+	if tenant != "" {
+		dsn += "?tenant=" + tenant
+	}
+	return sql.Open("tinysql", dsn)
+}
+
 // cfg stores the connection parameters derived from a parsed DSN.
 type cfg struct {
 	tenant      string
@@ -312,6 +322,18 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 	c.shadow = shadow
 	c.txReadOnly = opts.ReadOnly
 	return &tx{c: c}, nil
+}
+
+// Ping implements driver.Pinger so database/sql can health-check the connection.
+func (c *conn) Ping(ctx context.Context) error {
+	if c.srv == nil {
+		return fmt.Errorf("tinysql: no server")
+	}
+	if err := c.srv.acquireReader(ctx); err != nil {
+		return err
+	}
+	c.srv.releaseReader()
+	return nil
 }
 
 type tx struct{ c *conn }
@@ -645,12 +667,28 @@ func bindPlaceholders(sqlStr string, args []driver.NamedValue) (string, error) {
 			}
 			continue
 		}
+		// Support traditional ? placeholders (sequential)
 		if ch == '?' {
 			if argi >= len(args) {
 				return "", fmt.Errorf("not enough args for placeholders")
 			}
 			sb.WriteString(sqlLiteral(args[argi].Value))
 			argi++
+			continue
+		}
+		// Support numbered placeholders: $1, $2 or :1, :2 (1-based)
+		if (ch == '$' || ch == ':') && i+1 < len(sqlStr) && sqlStr[i+1] >= '0' && sqlStr[i+1] <= '9' {
+			j := i + 2
+			for j < len(sqlStr) && sqlStr[j] >= '0' && sqlStr[j] <= '9' {
+				j++
+			}
+			idxStr := sqlStr[i+1 : j]
+			n, err := strconv.Atoi(idxStr)
+			if err != nil || n <= 0 || n > len(args) {
+				return "", fmt.Errorf("tinysql: invalid placeholder %c%s", ch, idxStr)
+			}
+			sb.WriteString(sqlLiteral(args[n-1].Value))
+			i = j - 1
 			continue
 		}
 		sb.WriteByte(ch)

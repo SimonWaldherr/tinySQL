@@ -41,3 +41,42 @@ jobs:
         run: |
           go tool cover -func=coverage.out -o coverage.txt
           tail -1 coverage.txt >> $GITHUB_STEP_SUMMARY
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v4
+        with:
+          version: latest
+
+  build-bindings:
+    name: Build Bindings
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Build Python Bindings
+        run: |
+          cd bindings/python
+          make build
+
+      - name: Build ODBC Bindings
+        run: |
+          cd odbc
+          make linux

@@ -1,0 +1,28 @@
+name: Local CI (act)
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Download deps
+        run: go mod download
+
+      - name: Run unit tests
+        run: go test ./... -count=1
+
+      - name: Run coverage
+        run: go test -coverprofile=coverage.out ./...
+
+      - name: Summarize coverage
+        run: |
+          go tool cover -func=coverage.out

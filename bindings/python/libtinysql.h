@@ -87,6 +87,9 @@ typedef struct { void *data; GoInt len; GoInt cap; } GoSlice;
 extern "C" {
 #endif
 
+extern char* TinySQLVersion(void);
+extern char* TinySQLSave(char* path);
+extern char* TinySQLLoad(char* path);
 extern char* TinySQLExec(char* sql);
 extern void TinySQLReset(void);
 extern void TinySQLFree(char* ptr);
