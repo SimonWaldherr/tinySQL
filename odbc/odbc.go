@@ -5,13 +5,15 @@
 // and query the database.
 //
 // Build as a shared library:
-//   go build -buildmode=c-shared -o libtinysqlodbc.so .
+//
+//	go build -buildmode=c-shared -o libtinysqlodbc.so .
 //
 // Register the driver with your ODBC manager (unixODBC example):
-//   [tinySQL]
-//   Description = TinySQL ODBC Driver
-//   Driver = /path/to/libtinysqlodbc.so
-//   Setup = /path/to/libtinysqlodbc.so
+//
+//	[tinySQL]
+//	Description = TinySQL ODBC Driver
+//	Driver = /path/to/libtinysqlodbc.so
+//	Setup = /path/to/libtinysqlodbc.so
 package main
 
 /*
@@ -111,11 +113,11 @@ import (
 // Global handle registry
 var (
 	envMu    sync.RWMutex
-	envMap   = make(map[uintptr]*environment)
+	envMap           = make(map[uintptr]*environment)
 	envNext  uintptr = 1
-	connMap  = make(map[uintptr]*connection)
+	connMap          = make(map[uintptr]*connection)
 	connNext uintptr = 1
-	stmtMap  = make(map[uintptr]*statement)
+	stmtMap          = make(map[uintptr]*statement)
 	stmtNext uintptr = 1
 )
 
@@ -453,7 +455,7 @@ func SQLGetData(statementHandle C.SQLHSTMT, columnNumber C.SQLUSMALLINT, targetT
 	}
 
 	strVal := fmt.Sprintf("%v", val)
-	
+
 	// Handle wide char (UTF-16) encoding for SQL_C_WCHAR
 	if targetType == C.SQL_C_WCHAR {
 		// Convert UTF-8 string to UTF-16LE
@@ -469,7 +471,7 @@ func SQLGetData(statementHandle C.SQLHSTMT, columnNumber C.SQLUSMALLINT, targetT
 			}
 		}
 		utf16 = append(utf16, 0) // Null terminator
-		
+
 		if targetValuePtr != nil && bufferLength > 0 {
 			bytesToCopy := len(utf16) * 2
 			if bytesToCopy > int(bufferLength) {
@@ -477,7 +479,7 @@ func SQLGetData(statementHandle C.SQLHSTMT, columnNumber C.SQLUSMALLINT, targetT
 			}
 			C.memcpy(unsafe.Pointer(targetValuePtr), unsafe.Pointer(&utf16[0]), C.size_t(bytesToCopy))
 		}
-		
+
 		if strLenOrIndPtr != nil {
 			// Return length in bytes (excluding null terminator)
 			*strLenOrIndPtr = C.SQLLEN((len(utf16) - 1) * 2)
@@ -487,7 +489,7 @@ func SQLGetData(statementHandle C.SQLHSTMT, columnNumber C.SQLUSMALLINT, targetT
 		if targetValuePtr != nil && bufferLength > 0 {
 			cStr := C.CString(strVal)
 			defer C.free(unsafe.Pointer(cStr))
-			
+
 			// Copy string including null terminator
 			lenToCopy := len(strVal)
 			if lenToCopy >= int(bufferLength) {
@@ -498,7 +500,7 @@ func SQLGetData(statementHandle C.SQLHSTMT, columnNumber C.SQLUSMALLINT, targetT
 			targetPtr := unsafe.Pointer(uintptr(unsafe.Pointer(targetValuePtr)) + uintptr(lenToCopy))
 			*(*C.char)(targetPtr) = 0
 		}
-		
+
 		if strLenOrIndPtr != nil {
 			*strLenOrIndPtr = C.SQLLEN(len(strVal))
 		}
@@ -851,18 +853,18 @@ func SQLColumns(statementHandle C.SQLHSTMT, catalogName *C.SQLUCHAR, nameLength1
 	odbcRows := make([]tinysql.Row, 0)
 	for _, colName := range rs.Cols {
 		odbcRows = append(odbcRows, tinysql.Row{
-			"table_cat":       "",
-			"table_schem":     "",
-			"table_name":      table,
-			"column_name":     colName,
-			"data_type":       "12", // SQL_VARCHAR
-			"type_name":       "VARCHAR",
-			"column_size":     "255",
-			"buffer_length":   "255",
-			"decimal_digits":  "",
-			"num_prec_radix":  "10",
-			"nullable":        "1", // SQL_NULLABLE
-			"remarks":         "",
+			"table_cat":      "",
+			"table_schem":    "",
+			"table_name":     table,
+			"column_name":    colName,
+			"data_type":      "12", // SQL_VARCHAR
+			"type_name":      "VARCHAR",
+			"column_size":    "255",
+			"buffer_length":  "255",
+			"decimal_digits": "",
+			"num_prec_radix": "10",
+			"nullable":       "1", // SQL_NULLABLE
+			"remarks":        "",
 		})
 	}
 
