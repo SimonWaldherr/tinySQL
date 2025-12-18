@@ -31,3 +31,4 @@ data/osm_sample2
 niederbayern-251206.osm.pbf
 osm_import
 cover_*
+libtinysqlodbc.so
