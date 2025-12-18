@@ -23,3 +23,11 @@ main
 cmd/desktop/build
 cmd/studio/build/bin/tinySQL Studio.app
 cmd/studio/build
+query_files.wasm.gz
+data/osm_full
+data/osm_full_tags
+data/osm_sample
+data/osm_sample2
+niederbayern-251206.osm.pbf
+osm_import
+cover_*
