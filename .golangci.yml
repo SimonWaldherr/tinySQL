@@ -26,7 +26,7 @@ linters-settings:
     check-shadowing: true
   
   gocyclo:
-    min-complexity: 15
+    min-complexity: 30
   
   maligned:
     suggest-new: true

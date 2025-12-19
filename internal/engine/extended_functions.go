@@ -59,64 +59,63 @@ func evalInPeriod(env ExecEnv, args []Expr, row Row) (any, error) {
 		period = "LAST_12_MONTHS"
 	}
 
+	start, end, err := computePeriodRange(period, now)
+	if err != nil {
+		return nil, err
+	}
+	return (dateTime.After(start) && dateTime.Before(end) || dateTime.Equal(start)), nil
+}
+
+// computePeriodRange returns the start and end time for the given period.
+// The end is exclusive in most cases; callers include start and check before end.
+func computePeriodRange(period string, now time.Time) (time.Time, time.Time, error) {
 	switch period {
 	case "TODAY":
 		start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 		end := start.AddDate(0, 0, 1)
-		return dateTime.After(start) && dateTime.Before(end) || dateTime.Equal(start), nil
-
+		return start, end, nil
 	case "YEAR_TO_DATE":
 		start := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, now.Location())
-		return dateTime.After(start) && dateTime.Before(now) || dateTime.Equal(start), nil
-
+		return start, now, nil
 	case "MONTH_TO_DATE":
 		start := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
-		return dateTime.After(start) && dateTime.Before(now) || dateTime.Equal(start), nil
-
+		return start, now, nil
 	case "QUARTER_TO_DATE":
 		q := ((int(now.Month()) - 1) / 3)
 		start := time.Date(now.Year(), time.Month(q*3+1), 1, 0, 0, 0, 0, now.Location())
-		return dateTime.After(start) && dateTime.Before(now) || dateTime.Equal(start), nil
-
+		return start, now, nil
 	case "LAST_12_MONTHS":
 		start := now.AddDate(0, -12, 0)
-		return dateTime.After(start) && dateTime.Before(now) || dateTime.Equal(start), nil
-
+		return start, now, nil
 	case "PREVIOUS_12_MONTHS":
 		end := now.AddDate(0, -12, 0)
 		start := end.AddDate(0, -12, 0)
-		return dateTime.After(start) && dateTime.Before(end) || dateTime.Equal(start), nil
-
+		return start, end, nil
 	case "CURRENT_QUARTER":
 		q := ((int(now.Month()) - 1) / 3)
 		start := time.Date(now.Year(), time.Month(q*3+1), 1, 0, 0, 0, 0, now.Location())
 		end := start.AddDate(0, 3, 0)
-		return dateTime.After(start) && dateTime.Before(end) || dateTime.Equal(start), nil
-
+		return start, end, nil
 	case "PREVIOUS_QUARTER":
 		q := ((int(now.Month()) - 1) / 3)
 		start := time.Date(now.Year(), time.Month(q*3+1), 1, 0, 0, 0, 0, now.Location()).AddDate(0, -3, 0)
 		end := start.AddDate(0, 3, 0)
-		return dateTime.After(start) && dateTime.Before(end) || dateTime.Equal(start), nil
-
+		return start, end, nil
 	case "NEXT_QUARTER":
 		q := ((int(now.Month()) - 1) / 3)
 		start := time.Date(now.Year(), time.Month(q*3+1), 1, 0, 0, 0, 0, now.Location()).AddDate(0, 3, 0)
 		end := start.AddDate(0, 3, 0)
-		return dateTime.After(start) && dateTime.Before(end) || dateTime.Equal(start), nil
-
+		return start, end, nil
 	case "CURRENT_YEAR_FULL":
 		start := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, now.Location())
 		end := start.AddDate(1, 0, 0)
-		return dateTime.After(start) && dateTime.Before(end) || dateTime.Equal(start), nil
-
+		return start, end, nil
 	case "LAST_YEAR_FULL":
 		start := time.Date(now.Year()-1, 1, 1, 0, 0, 0, 0, now.Location())
 		end := start.AddDate(1, 0, 0)
-		return dateTime.After(start) && dateTime.Before(end) || dateTime.Equal(start), nil
-
+		return start, end, nil
 	default:
-		return nil, fmt.Errorf("IN_PERIOD: unsupported period '%s'", period)
+		return time.Time{}, time.Time{}, fmt.Errorf("IN_PERIOD: unsupported period '%s'", period)
 	}
 }
 

@@ -432,155 +432,9 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 //nolint:gocyclo // SELECT execution handles joins, CTEs, filtering, projection, and aggregation.
 func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 	// Process CTEs first
-	cteEnv := env
-	if len(s.CTEs) > 0 {
-		// Create a new environment for evaluating CTEs. This environment
-		// will carry a map of CTE name -> ResultSet so CTEs can reference
-		// previously defined CTEs.
-		cteEnv = ExecEnv{
-			ctx:    env.ctx,
-			db:     env.db,
-			tenant: env.tenant,
-			ctes:   make(map[string]*ResultSet),
-		}
-
-		// Execute each CTE in order. If a CTE is recursive (declared via
-		// WITH RECURSIVE) we perform a simple iterative evaluation: evaluate
-		// the anchor part then repeatedly evaluate the recursive part with
-		// the current accumulated rows bound to the CTE name until no new
-		// rows appear (or an iteration cap is reached).
-		for _, cte := range s.CTEs {
-			if !cte.Recursive {
-				// Non-recursive: execute normally with the cteEnv so later CTEs
-				// can reference earlier ones.
-				cteResult, err := executeSelect(cteEnv, cte.Select)
-				if err != nil {
-					return nil, fmt.Errorf("CTE %s: %v", cte.Name, err)
-				}
-				cteEnv.ctes[cte.Name] = cteResult
-				continue
-			}
-
-			// Recursive CTE handling
-			// Require a UNION (typically anchor UNION ALL recursive)
-			if cte.Select == nil || cte.Select.Union == nil {
-				return nil, fmt.Errorf("recursive CTE %s must be a UNION of anchor and recursive part", cte.Name)
-			}
-
-			// Anchor part: clone the select but drop its Union chain
-			anchor := *cte.Select
-			anchor.Union = nil
-
-			// Assume the recursive part is the right side of the first union
-			recursiveSel := cte.Select.Union.Right
-			if recursiveSel == nil {
-				return nil, fmt.Errorf("recursive CTE %s missing recursive part", cte.Name)
-			}
-
-			// Evaluate anchor
-			accRs, err := executeSelect(cteEnv, &anchor)
-			if err != nil {
-				return nil, fmt.Errorf("CTE %s anchor: %v", cte.Name, err)
-			}
-
-			// Use a set to track unique row signatures
-			seen := make(map[string]bool)
-			var accRows []Row
-			if accRs != nil {
-				accRows = append(accRows, accRs.Rows...)
-				if accRs.Cols != nil {
-					// initialize seen from existing rows
-					for _, r := range accRs.Rows {
-						seen[rowSignature(r, accRs.Cols)] = true
-					}
-				}
-			}
-
-			// Iteratively apply recursive part
-			iterLimit := 1024
-			for iter := 0; iter < iterLimit; iter++ {
-				// Bind current accumulated result to CTE name
-				colsForBind := []string{}
-				if accRs != nil && accRs.Cols != nil {
-					colsForBind = accRs.Cols
-				}
-				cteEnv.ctes[cte.Name] = &ResultSet{Cols: colsForBind, Rows: accRows}
-
-				// Execute recursive select against cteEnv
-				nextRs, err := executeSelect(cteEnv, recursiveSel)
-				if err != nil {
-					return nil, fmt.Errorf("CTE %s recursive eval: %v", cte.Name, err)
-				}
-				if nextRs == nil || len(nextRs.Rows) == 0 {
-					break
-				}
-
-				// Append only new rows. We must align column names of the
-				// recursive result with the anchor's column names (by
-				// position) when possible. Otherwise rows from anchor and
-				// recursive part may expose different column keys (e.g.
-				// anchor uses alias `n` while recursive produces `col_0`).
-				newAdded := 0
-
-				// Determine target column names for signature/assignment.
-				targetCols := nextRs.Cols
-				if accRs != nil && accRs.Cols != nil {
-					targetCols = accRs.Cols
-				}
-
-				var alignedRows []Row
-				// If we have explicit anchor columns and the recursive
-				// result has the same column count, remap by position.
-				if accRs != nil && accRs.Cols != nil && nextRs.Cols != nil && len(nextRs.Cols) == len(accRs.Cols) {
-					for _, r := range nextRs.Rows {
-						nr := make(Row)
-						for i := range accRs.Cols {
-							src := nextRs.Cols[i]
-							// row keys are stored lower-cased by the engine
-							var val any
-							if v, ok := r[strings.ToLower(src)]; ok {
-								val = v
-							} else if v, ok := r[src]; ok {
-								val = v
-							}
-							tgt := strings.ToLower(accRs.Cols[i])
-							nr[tgt] = val
-							// also expose qualified name
-							nr[cte.Name+"."+tgt] = val
-						}
-						alignedRows = append(alignedRows, nr)
-					}
-				} else {
-					// Fallback: use rows as-is (they should already have
-					// lower-cased keys from earlier evaluation)
-					alignedRows = nextRs.Rows
-				}
-
-				// Now filter/append only new rows using the chosen column names
-				for _, r := range alignedRows {
-					sig := rowSignature(r, targetCols)
-					if !seen[sig] {
-						seen[sig] = true
-						accRows = append(accRows, r)
-						newAdded++
-					}
-				}
-				// Update accRs.Cols if it was nil
-				if accRs == nil && nextRs != nil {
-					accRs = &ResultSet{Cols: nextRs.Cols}
-				}
-				if newAdded == 0 {
-					break
-				}
-			}
-
-			// Final accumulated result
-			finalCols := []string{}
-			if accRs != nil && accRs.Cols != nil {
-				finalCols = accRs.Cols
-			}
-			cteEnv.ctes[cte.Name] = &ResultSet{Cols: finalCols, Rows: accRows}
-		}
+	cteEnv, err := processCTEs(env, s)
+	if err != nil {
+		return nil, err
 	}
 
 	// FROM (Tabelle, CTE oder Subselect) - now optional
@@ -760,7 +614,7 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 	cur := leftRows
 
 	// JOINs
-	cur, err := processJoins(cteEnv, s.Joins, cur)
+	cur, err = processJoins(cteEnv, s.Joins, cur)
 	if err != nil {
 		return nil, err
 	}
@@ -1326,6 +1180,151 @@ func applyOffsetLimit(s *Select, rows []Row) []Row {
 		rows = rows[:*s.Limit]
 	}
 	return rows
+}
+
+// processCTEs extracts and evaluates CTEs (including simple recursive CTEs)
+// and returns an ExecEnv with any CTE results bound.
+func processCTEs(env ExecEnv, s *Select) (ExecEnv, error) {
+	cteEnv := env
+	if len(s.CTEs) == 0 {
+		return cteEnv, nil
+	}
+
+	cteEnv = ExecEnv{
+		ctx:    env.ctx,
+		db:     env.db,
+		tenant: env.tenant,
+		ctes:   make(map[string]*ResultSet),
+	}
+
+	for _, cte := range s.CTEs {
+		if !cte.Recursive {
+			rs, err := evalNonRecursiveCTE(cteEnv, &cte)
+			if err != nil {
+				return env, err
+			}
+			cteEnv.ctes[cte.Name] = rs
+			continue
+		}
+
+		rs, err := evalRecursiveCTE(cteEnv, &cte)
+		if err != nil {
+			return env, err
+		}
+		cteEnv.ctes[cte.Name] = rs
+	}
+
+	return cteEnv, nil
+}
+
+// evalNonRecursiveCTE evaluates a simple (non-recursive) CTE and returns its ResultSet.
+func evalNonRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
+	if cte.Select == nil {
+		return nil, fmt.Errorf("CTE %s: missing select", cte.Name)
+	}
+	rs, err := executeSelect(env, cte.Select)
+	if err != nil {
+		return nil, fmt.Errorf("CTE %s: %v", cte.Name, err)
+	}
+	return rs, nil
+}
+
+// evalRecursiveCTE evaluates a recursive CTE (WITH RECURSIVE) by executing the
+// anchor and iteratively applying the recursive part until stabilization or limit.
+func evalRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
+	if cte.Select == nil || cte.Select.Union == nil {
+		return nil, fmt.Errorf("recursive CTE %s must be a UNION of anchor and recursive part", cte.Name)
+	}
+
+	anchor := *cte.Select
+	anchor.Union = nil
+
+	recursiveSel := cte.Select.Union.Right
+	if recursiveSel == nil {
+		return nil, fmt.Errorf("recursive CTE %s missing recursive part", cte.Name)
+	}
+
+	accRs, err := executeSelect(env, &anchor)
+	if err != nil {
+		return nil, fmt.Errorf("CTE %s anchor: %v", cte.Name, err)
+	}
+
+	seen := make(map[string]bool)
+	var accRows []Row
+	if accRs != nil {
+		accRows = append(accRows, accRs.Rows...)
+		if accRs.Cols != nil {
+			for _, r := range accRs.Rows {
+				seen[rowSignature(r, accRs.Cols)] = true
+			}
+		}
+	}
+
+	iterLimit := 1024
+	for iter := 0; iter < iterLimit; iter++ {
+		colsForBind := []string{}
+		if accRs != nil && accRs.Cols != nil {
+			colsForBind = accRs.Cols
+		}
+		env.ctes[cte.Name] = &ResultSet{Cols: colsForBind, Rows: accRows}
+
+		nextRs, err := executeSelect(env, recursiveSel)
+		if err != nil {
+			return nil, fmt.Errorf("CTE %s recursive eval: %v", cte.Name, err)
+		}
+		if nextRs == nil || len(nextRs.Rows) == 0 {
+			break
+		}
+
+		newAdded := 0
+		targetCols := nextRs.Cols
+		if accRs != nil && accRs.Cols != nil {
+			targetCols = accRs.Cols
+		}
+
+		var alignedRows []Row
+		if accRs != nil && accRs.Cols != nil && nextRs != nil && nextRs.Cols != nil && len(nextRs.Cols) == len(accRs.Cols) {
+			for _, r := range nextRs.Rows {
+				nr := make(Row)
+				for i := range accRs.Cols {
+					src := nextRs.Cols[i]
+					var val any
+					if v, ok := r[strings.ToLower(src)]; ok {
+						val = v
+					} else if v, ok := r[src]; ok {
+						val = v
+					}
+					tgt := strings.ToLower(accRs.Cols[i])
+					nr[tgt] = val
+					nr[cte.Name+"."+tgt] = val
+				}
+				alignedRows = append(alignedRows, nr)
+			}
+		} else {
+			alignedRows = nextRs.Rows
+		}
+
+		for _, r := range alignedRows {
+			sig := rowSignature(r, targetCols)
+			if !seen[sig] {
+				seen[sig] = true
+				accRows = append(accRows, r)
+				newAdded++
+			}
+		}
+		if accRs == nil && nextRs != nil {
+			accRs = &ResultSet{Cols: nextRs.Cols}
+		}
+		if newAdded == 0 {
+			break
+		}
+	}
+
+	finalCols := []string{}
+	if accRs != nil && accRs.Cols != nil {
+		finalCols = accRs.Cols
+	}
+	return &ResultSet{Cols: finalCols, Rows: accRows}, nil
 }
 
 // -------------------- Eval, Aggregates, Helpers --------------------

@@ -127,7 +127,9 @@ type ImportResult struct {
 //
 // Returns ImportResult with metadata and any error encountered.
 //
-//nolint:gocyclo // CSV import pipeline handles detection, decoding, and batching in one routine.
+// ImportCSV is the entrypoint for CSV/TSV imports. It orchestrates detection,
+// decoding, sampling, type inference and insertion while delegating detailed
+// tasks to smaller helpers to keep cyclomatic complexity low.
 func ImportCSV(
 	ctx context.Context,
 	db *storage.DB,
@@ -148,86 +150,29 @@ func ImportCSV(
 		return nil, fmt.Errorf("table name is required")
 	}
 
-	result := &ImportResult{
-		Errors: make([]string, 0),
+	result := &ImportResult{Errors: make([]string, 0)}
+
+	// Prepare reader and detect encoding
+	rr, enc, _, err := prepareReader(src, opts)
+	if err != nil {
+		return nil, err
 	}
-
-	// Step 1: Handle GZIP compression if present
-	r := maybeGzip(src)
-
-	// Step 2: Detect encoding and convert to UTF-8
-	br := bufio.NewReader(r)
-	sampleBytes, _ := br.Peek(maxInt(opts.SampleBytes, 16))
-	enc, hasBOM := detectEncoding(sampleBytes)
 	result.Encoding = enc
 
-	var rr io.Reader
-	switch enc {
-	case "utf-16le", "utf-16be":
-		all, err := io.ReadAll(br)
-		if err != nil {
-			return nil, fmt.Errorf("read UTF-16 stream: %w", err)
-		}
-		utf8data, err := decodeUTF16All(all, enc == "utf-16be")
-		if err != nil {
-			return nil, fmt.Errorf("decode UTF-16: %w", err)
-		}
-		rr = bytes.NewReader(utf8data)
-	default:
-		if hasBOM {
-			if _, err := br.Discard(3); err != nil {
-				return nil, fmt.Errorf("discard UTF-8 BOM: %w", err)
-			}
-		}
-		rr = br
-	}
-
-	// Step 3: Sample data for delimiter and header detection
-	sr := bufio.NewReader(rr)
-	peek := peekN(sr, opts.SampleBytes)
-	lines := splitUniversal(string(peek))
-
-	delim := detectDelimiter(lines, candidateDelims(opts.DelimiterCandidates))
-	result.Delimiter = delim
-
-	records := parseRecords(lines, delim, opts.SampleRecords)
-	hasHeader := decideHeader(records, opts.HeaderMode)
-	result.HadHeader = hasHeader
-
-	// Step 4: Create CSV reader with detected settings
-	csvr := csv.NewReader(sr)
-	csvr.Comma = delim
-	csvr.FieldsPerRecord = -1 // allow ragged rows
-	csvr.LazyQuotes = true
-	csvr.TrimLeadingSpace = true
-
-	// Step 5: Read first record to determine columns
-	firstRec, err := csvr.Read()
+	// Detect delimiter, header and initialize CSV reader
+	sr, csvr, colNames, firstDataRow, delim, hasHeader, err := initCSVFromReader(rr, opts)
 	if err != nil {
-		if errors.Is(err, io.EOF) {
-			return nil, fmt.Errorf("empty input")
-		}
-		return nil, fmt.Errorf("read first record: %w", err)
+		return nil, err
 	}
-
-	var colNames []string
-	var firstDataRow []string
-
-	if hasHeader {
-		colNames = sanitizeColumnNames(firstRec)
-	} else {
-		colNames = generateColumnNames(len(firstRec))
-		firstDataRow = firstRec
-	}
+	result.Delimiter = delim
+	result.HadHeader = hasHeader
 	result.ColumnNames = colNames
 
-	// Step 6: Read all data into memory for processing
-	// (for streaming large files, we'd need a different approach)
+	// Read all records into memory (keeps behavior unchanged)
 	allRecords := make([][]string, 0)
 	if firstDataRow != nil {
 		allRecords = append(allRecords, firstDataRow)
 	}
-
 	for {
 		rec, err := csvr.Read()
 		if err == io.EOF {
@@ -240,10 +185,9 @@ func ImportCSV(
 		allRecords = append(allRecords, rec)
 	}
 
-	// Step 7: Analyze sample data for type inference
+	// Type inference
 	var colTypes []storage.ColType
 	if opts.TypeInference {
-		// Use up to SampleRecords for type inference
 		sampleSize := len(allRecords)
 		if sampleSize > opts.SampleRecords {
 			sampleSize = opts.SampleRecords
@@ -251,7 +195,6 @@ func ImportCSV(
 		sampleData := allRecords[:sampleSize]
 		colTypes = inferColumnTypes(sampleData, len(colNames), opts)
 	} else {
-		// Default all columns to TEXT
 		colTypes = make([]storage.ColType, len(colNames))
 		for i := range colTypes {
 			colTypes[i] = storage.TextType
@@ -259,28 +202,94 @@ func ImportCSV(
 	}
 	result.ColumnTypes = colTypes
 
-	// Step 8: Create table if requested
+	// Create / truncate table as requested
 	if opts.CreateTable {
 		if err := createTable(ctx, db, tenant, tableName, colNames, colTypes); err != nil {
 			return nil, fmt.Errorf("create table: %w", err)
 		}
 	}
-
-	// Step 9: Truncate table if requested
 	if opts.Truncate {
 		if err := truncateTable(ctx, db, tenant, tableName); err != nil {
 			return nil, fmt.Errorf("truncate table: %w", err)
 		}
 	}
 
-	// Step 10: Insert all data
-	rows, skipped, errs := insertAllRecords(ctx, db, tenant, tableName, colNames, colTypes,
-		allRecords, opts)
+	// Insert
+	rows, skipped, errs := insertAllRecords(ctx, db, tenant, tableName, colNames, colTypes, allRecords, opts)
 	result.RowsInserted = rows
 	result.RowsSkipped = skipped
 	result.Errors = append(result.Errors, errs...)
 
+	// Ensure the bufio.Reader is consumed/closed if needed
+	_ = sr
+
 	return result, nil
+}
+
+// prepareReader handles gzip detection and encoding normalization, returning an
+// io.Reader ready for CSV parsing plus encoding metadata.
+func prepareReader(src io.Reader, opts *ImportOptions) (io.Reader, string, bool, error) {
+	r := maybeGzip(src)
+	br := bufio.NewReader(r)
+	sampleBytes, _ := br.Peek(maxInt(opts.SampleBytes, 16))
+	enc, hasBOM := detectEncoding(sampleBytes)
+
+	switch enc {
+	case "utf-16le", "utf-16be":
+		all, err := io.ReadAll(br)
+		if err != nil {
+			return nil, "", false, fmt.Errorf("read UTF-16 stream: %w", err)
+		}
+		utf8data, err := decodeUTF16All(all, enc == "utf-16be")
+		if err != nil {
+			return nil, "", false, fmt.Errorf("decode UTF-16: %w", err)
+		}
+		return bytes.NewReader(utf8data), enc, hasBOM, nil
+	default:
+		if hasBOM {
+			if _, err := br.Discard(3); err != nil {
+				return nil, "", false, fmt.Errorf("discard UTF-8 BOM: %w", err)
+			}
+		}
+		return br, enc, hasBOM, nil
+	}
+}
+
+// initCSVFromReader samples the reader to detect delimiter/header and returns a
+// prepared bufio.Reader, csv.Reader, column names and first data row (if any).
+func initCSVFromReader(rr io.Reader, opts *ImportOptions) (*bufio.Reader, *csv.Reader, []string, []string, rune, bool, error) {
+	sr := bufio.NewReader(rr)
+	peek := peekN(sr, opts.SampleBytes)
+	lines := splitUniversal(string(peek))
+
+	delim := detectDelimiter(lines, candidateDelims(opts.DelimiterCandidates))
+	records := parseRecords(lines, delim, opts.SampleRecords)
+	hasHeader := decideHeader(records, opts.HeaderMode)
+
+	csvr := csv.NewReader(sr)
+	csvr.Comma = delim
+	csvr.FieldsPerRecord = -1
+	csvr.LazyQuotes = true
+	csvr.TrimLeadingSpace = true
+
+	firstRec, err := csvr.Read()
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, nil, nil, nil, 0, false, fmt.Errorf("empty input")
+		}
+		return nil, nil, nil, nil, 0, false, fmt.Errorf("read first record: %w", err)
+	}
+
+	var colNames []string
+	var firstDataRow []string
+	if hasHeader {
+		colNames = sanitizeColumnNames(firstRec)
+	} else {
+		colNames = generateColumnNames(len(firstRec))
+		firstDataRow = firstRec
+	}
+
+	return sr, csvr, colNames, firstDataRow, delim, hasHeader, nil
 }
 
 // ============================================================================

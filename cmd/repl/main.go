@@ -127,140 +127,23 @@ func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool
 			}
 
 			up := strings.ToUpper(q)
-			var sqlFrag string
-
-			// Treat plain SELECT and WITH (CTE) statements as queries that return rows.
 			if strings.HasPrefix(up, "SELECT") || strings.HasPrefix(up, "WITH") {
-				rows, err := db.Query(q)
-				if beautiful {
-					// Prepare the accumulated SQL block (preserve whitespace)
-					if htmlMode {
-						sqlFrag = renderBeautifulBlockHTML(srcLines)
-					} else {
-						printBeautifulBlock(srcLines)
-					}
-				} else if htmlMode {
-					// When not in beautiful mode but producing HTML, always include the executed SQL text.
-					sqlFrag = renderSQLHTML(q)
-				}
-
-				if err != nil {
-					friendly := friendlyErrorString(err)
-					if htmlMode {
-						if sqlFrag != "" {
-							htmlParts = append(htmlParts, sqlFrag)
-						} else {
-							htmlParts = append(htmlParts, renderSQLHTML(q))
-						}
-						htmlParts = append(htmlParts, "<div class='err'>ERR: "+html.EscapeString(friendly)+"</div>")
-						htmlParts = append(htmlParts, "<hr/>")
-					} else {
-						if errorsOnly {
-							// When running with -errors-only, show the SQL that failed
-							// together with the error to make debugging easier.
-							fmt.Println("--", q)
-							fmt.Println("ERR:", err)
-						} else {
-							fmt.Println("ERR:", err)
-						}
-					}
-					// Drop the accumulated source so we don't repeatedly print failing statements.
+				if err := handleSelectStatement(db, q, beautiful, htmlMode, errorsOnly, format, srcLines, &htmlParts, interactive); err != nil {
+					// Errors already reported by helper; drop srcLines when beautiful
 					if beautiful {
 						srcLines = nil
 					}
-					continue
-				}
-
-				cols, _ := rows.Columns()
-				if htmlMode {
-					out, err := rowsToSlice(rows, cols)
-					rows.Close()
-
-					// Only include successful results when not in errors-only mode.
-					if err != nil {
-						if sqlFrag != "" {
-							htmlParts = append(htmlParts, sqlFrag)
-						} else {
-							htmlParts = append(htmlParts, renderSQLHTML(q))
-						}
-						friendly := friendlyErrorString(err)
-						htmlParts = append(htmlParts, "<div class='err'>ERR: "+html.EscapeString(friendly)+"</div>")
-						htmlParts = append(htmlParts, "<hr/>")
-					} else {
-						if !errorsOnly {
-							if sqlFrag != "" {
-								htmlParts = append(htmlParts, sqlFrag)
-							} else {
-								htmlParts = append(htmlParts, renderSQLHTML(q))
-							}
-							htmlParts = append(htmlParts, renderRowsHTML(out, cols))
-							htmlParts = append(htmlParts, "<hr/>")
-						}
-					}
-				} else {
-					// Non-HTML output: only print rows when not in errors-only mode.
-					if !errorsOnly {
-						printRows(rows, cols, format)
-						if beautiful {
-							// Ensure at least one blank line separates SELECT outputs for readability
-							fmt.Println()
-						}
-					}
-					rows.Close()
-				}
-
-				if beautiful {
-					// After handling results, reset accumulated source lines
+				} else if beautiful {
 					srcLines = nil
 				}
 				continue
 			}
 
-			// Non-SELECT statements.
-			if _, err := db.Exec(q); err != nil {
-				friendly := friendlyErrorString(err)
-				if htmlMode {
-					// Show the statement to make errors debuggable in the HTML output.
-					if sqlFrag == "" {
-						if beautiful {
-							sqlFrag = renderBeautifulBlockHTML(srcLines)
-						} else {
-							sqlFrag = renderSQLHTML(q)
-						}
-					}
-					htmlParts = append(htmlParts, sqlFrag)
-					htmlParts = append(htmlParts, "<div class='err'>ERR: "+html.EscapeString(friendly)+"</div>")
-				} else {
-					if errorsOnly {
-						fmt.Println("--", q)
-						fmt.Println("ERR:", err)
-					} else {
-						fmt.Println("ERR:", err)
-					}
-				}
-
-				// Drop the accumulated source so we don't repeatedly print failing statements.
+			if err := handleNonSelectStatement(db, q, beautiful, htmlMode, errorsOnly, &htmlParts, interactive, srcLines); err != nil {
 				if beautiful {
 					srcLines = nil
 				}
 				continue
-			}
-
-			if htmlMode {
-				// Show the non-select statement as a small block in the HTML.
-				if sqlFrag == "" {
-					sqlFrag = renderSQLHTML(q)
-				}
-				// Only append OK blocks when not in errors-only mode.
-				htmlParts = append(htmlParts, sqlFrag)
-				if !errorsOnly {
-					htmlParts = append(htmlParts, "<div class='ok'>(ok)</div>")
-				}
-			} else {
-				// In non-interactive mode (e.g. redirected input) avoid printing a flood of "(ok)" lines.
-				if interactive && !errorsOnly {
-					fmt.Println("(ok)")
-				}
 			}
 		} else {
 			buf.WriteString(" ")
@@ -280,6 +163,119 @@ func handleMeta(db *sql.DB, line string) bool {
 		os.Exit(0)
 	}
 	return false
+}
+
+// handleSelectStatement executes a SELECT/CTE query and appends HTML parts when requested.
+func handleSelectStatement(db *sql.DB, q string, beautiful, htmlMode, errorsOnly bool, format string, srcLines []string, htmlParts *[]string, interactive bool) error {
+	var sqlFrag string
+	if beautiful {
+		if htmlMode {
+			sqlFrag = renderBeautifulBlockHTML(srcLines)
+		} else {
+			printBeautifulBlock(srcLines)
+		}
+	} else if htmlMode {
+		sqlFrag = renderSQLHTML(q)
+	}
+
+	rows, err := db.Query(q)
+	if err != nil {
+		friendly := friendlyErrorString(err)
+		if htmlMode {
+			if sqlFrag != "" {
+				*htmlParts = append(*htmlParts, sqlFrag)
+			} else {
+				*htmlParts = append(*htmlParts, renderSQLHTML(q))
+			}
+			*htmlParts = append(*htmlParts, "<div class='err'>ERR: "+html.EscapeString(friendly)+"</div>")
+			*htmlParts = append(*htmlParts, "<hr/>")
+		} else {
+			if errorsOnly {
+				fmt.Println("--", q)
+				fmt.Println("ERR:", err)
+			} else {
+				fmt.Println("ERR:", err)
+			}
+		}
+		return err
+	}
+
+	cols, _ := rows.Columns()
+	if htmlMode {
+		out, err := rowsToSlice(rows, cols)
+		rows.Close()
+		if err != nil {
+			if sqlFrag != "" {
+				*htmlParts = append(*htmlParts, sqlFrag)
+			} else {
+				*htmlParts = append(*htmlParts, renderSQLHTML(q))
+			}
+			friendly := friendlyErrorString(err)
+			*htmlParts = append(*htmlParts, "<div class='err'>ERR: "+html.EscapeString(friendly)+"</div>")
+			*htmlParts = append(*htmlParts, "<hr/>")
+		} else {
+			if !errorsOnly {
+				if sqlFrag != "" {
+					*htmlParts = append(*htmlParts, sqlFrag)
+				} else {
+					*htmlParts = append(*htmlParts, renderSQLHTML(q))
+				}
+				*htmlParts = append(*htmlParts, renderRowsHTML(out, cols))
+				*htmlParts = append(*htmlParts, "<hr/>")
+			}
+		}
+	} else {
+		if !errorsOnly {
+			printRows(rows, cols, format)
+			if beautiful {
+				fmt.Println()
+			}
+		}
+		rows.Close()
+	}
+	return nil
+}
+
+// handleNonSelectStatement executes non-SELECT statements and updates HTML parts as needed.
+func handleNonSelectStatement(db *sql.DB, q string, beautiful, htmlMode, errorsOnly bool, htmlParts *[]string, interactive bool, srcLines []string) error {
+	var sqlFrag string
+	if _, err := db.Exec(q); err != nil {
+		friendly := friendlyErrorString(err)
+		if htmlMode {
+			if sqlFrag == "" {
+				if beautiful {
+					sqlFrag = renderBeautifulBlockHTML(srcLines)
+				} else {
+					sqlFrag = renderSQLHTML(q)
+				}
+			}
+			*htmlParts = append(*htmlParts, sqlFrag)
+			*htmlParts = append(*htmlParts, "<div class='err'>ERR: "+html.EscapeString(friendly)+"</div>")
+		} else {
+			if errorsOnly {
+				fmt.Println("--", q)
+				fmt.Println("ERR:", err)
+			} else {
+				fmt.Println("ERR:", err)
+			}
+		}
+		return err
+	}
+
+	if htmlMode {
+		if sqlFrag == "" {
+			sqlFrag = renderSQLHTML(q)
+		}
+		*htmlParts = append(*htmlParts, sqlFrag)
+		if !errorsOnly {
+			*htmlParts = append(*htmlParts, "<div class='ok'>(ok)</div>")
+		}
+	} else {
+		if interactive && !errorsOnly {
+			fmt.Println("(ok)")
+		}
+	}
+	return nil
 }
 
 //nolint:gocyclo // REPL printer performs scanning, formatting, and alignment for display.
