@@ -65,11 +65,21 @@ jobs:
 
           # Build CLI binary (cmd/tinysql)
           echo "Building CLI: tinysql for $GOOS-$GOARCH"
-          CGO_ENABLED=1 GOOS=$GOOS GOARCH=$GOARCH go build -o $PKGDIR/tinysql-$GOOS-$GOARCH ./cmd/tinysql
+          # Disable cgo for cross-compiling the pure-Go CLI to avoid needing cross-toolchain.
+          CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -o $PKGDIR/tinysql-$GOOS-$GOARCH ./cmd/tinysql
 
           # Build C shared library (bindings/python provides c-shared target)
-          echo "Building c-shared library"
-          CGO_ENABLED=1 GOOS=$GOOS GOARCH=$GOARCH go build -buildmode=c-shared -o $PKGDIR/libtinysql.$EXT ./bindings/python || true
+          # c-shared requires a native C toolchain; skip when target arch != runner arch.
+          runner_arch=$(uname -m)
+          native_ok=false
+          if [ "$runner_arch" = "x86_64" ] && [ "$GOARCH" = "amd64" ]; then native_ok=true; fi
+          if [ "$runner_arch" = "aarch64" ] && [ "$GOARCH" = "arm64" ]; then native_ok=true; fi
+          if [ "$native_ok" = true ]; then
+            echo "Building c-shared library"
+            CGO_ENABLED=1 GOOS=$GOOS GOARCH=$GOARCH go build -buildmode=c-shared -o $PKGDIR/libtinysql.$EXT ./bindings/python || true
+          else
+            echo "Skipping c-shared build for $GOOS-$GOARCH on runner $runner_arch (no cross C toolchain)"
+          fi
 
           # If the header was emitted next to the shared lib, ensure it's inside pkg
           if [ -f libtinysql.h ]; then mv -f libtinysql.h $PKGDIR/ 2>/dev/null || true; fi
