@@ -1656,6 +1656,9 @@ var typeKeywordMap = map[string]storage.ColType{
 	"POINTER":    storage.PointerType,
 	"PTR":        storage.PointerType,
 	"INTERFACE":  storage.InterfaceType,
+	// Vector types (for RAG / embedding storage)
+	"VECTOR":    storage.VectorType,
+	"EMBEDDING": storage.VectorType,
 }
 
 func (p *Parser) parseType() storage.ColType {

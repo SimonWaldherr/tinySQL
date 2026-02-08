@@ -32,10 +32,34 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
+
+// allFunctions is a lazily-initialised, read-only function registry that
+// merges builtin, extended, and vector functions once and reuses the result
+// for all subsequent evalFuncCall invocations. This avoids allocating three
+// maps and merging them on every function evaluation.
+var (
+	allFunctions     map[string]funcHandler
+	allFunctionsOnce sync.Once
+)
+
+func getAllFunctions() map[string]funcHandler {
+	allFunctionsOnce.Do(func() {
+		m := getBuiltinFunctions()
+		for k, v := range getExtendedFunctions() {
+			m[k] = v
+		}
+		for k, v := range getVectorFunctions() {
+			m[k] = v
+		}
+		allFunctions = m
+	})
+	return allFunctions
+}
 
 // Row represents a single result row mapped by lower-cased column name.
 // Keys include both qualified (table.column) and unqualified (column) names
@@ -302,6 +326,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 		t.Rows = append(t.Rows, row)
 	}
 	t.Version++
+	t.MarkDirtyFrom(len(t.Rows) - len(s.Rows))
 	return nil, nil
 }
 
@@ -339,6 +364,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 		t.Rows = append(t.Rows, row)
 	}
 	t.Version++
+	t.MarkDirtyFrom(len(t.Rows) - len(s.Rows))
 	return nil, nil
 }
 
@@ -389,6 +415,9 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 		}
 	}
 	t.Version++
+	if n > 0 {
+		t.MarkDirtyFrom(-1) // UPDATE is non-append; force full-table WAL
+	}
 	return &ResultSet{Cols: []string{"updated"}, Rows: []Row{{"updated": n}}}, nil
 }
 
@@ -426,6 +455,9 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	}
 	t.Rows = kept
 	t.Version++
+	if del > 0 {
+		t.MarkDirtyFrom(-1) // DELETE is non-append; force full-table WAL
+	}
 	return &ResultSet{Cols: []string{"deleted"}, Rows: []Row{{"deleted": del}}}, nil
 }
 
@@ -639,12 +671,16 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 		if len(s.DistinctOn) > 0 {
 			// If ORDER BY present, sort now so the first row per key is the right one
 			if len(s.OrderBy) > 0 {
+				lcOrdCols := make([]string, len(s.OrderBy))
+				for idx, oi := range s.OrderBy {
+					lcOrdCols[idx] = strings.ToLower(oi.Col)
+				}
 				sort.SliceStable(outRows, func(i, j int) bool {
 					a := outRows[i]
 					b := outRows[j]
-					for _, oi := range s.OrderBy {
-						av, _ := getVal(a, oi.Col)
-						bv, _ := getVal(b, oi.Col)
+					for k, oi := range s.OrderBy {
+						av := a[lcOrdCols[k]]
+						bv := b[lcOrdCols[k]]
 						cmp := compareForOrder(av, bv, oi.Desc)
 						if cmp == 0 {
 							continue
@@ -682,12 +718,16 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 
 	// ORDER BY
 	if len(s.OrderBy) > 0 {
+		lcOrdCols := make([]string, len(s.OrderBy))
+		for idx, oi := range s.OrderBy {
+			lcOrdCols[idx] = strings.ToLower(oi.Col)
+		}
 		sort.SliceStable(outRows, func(i, j int) bool {
 			a := outRows[i]
 			b := outRows[j]
-			for _, oi := range s.OrderBy {
-				av, _ := getVal(a, oi.Col)
-				bv, _ := getVal(b, oi.Col)
+			for k, oi := range s.OrderBy {
+				av := a[lcOrdCols[k]]
+				bv := b[lcOrdCols[k]]
 				cmp := compareForOrder(av, bv, oi.Desc)
 				if cmp == 0 {
 					continue
@@ -807,12 +847,15 @@ func intersectRows(leftRows, rightRows []Row, cols []string) []Row {
 }
 
 func rowSignature(row Row, cols []string) string {
-	var parts []string
-	for _, col := range cols {
+	var buf strings.Builder
+	for i, col := range cols {
+		if i > 0 {
+			buf.WriteByte('|')
+		}
 		val, _ := getVal(row, col)
-		parts = append(parts, fmt.Sprintf("%v", val))
+		writeFmtKeyPart(&buf, val)
 	}
-	return strings.Join(parts, "|")
+	return buf.String()
 }
 
 func processJoins(env ExecEnv, joins []JoinClause, cur []Row) ([]Row, error) {
@@ -1047,6 +1090,7 @@ func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []str
 	orderKeys := make([]string, 0, len(filtered)/2)
 	outRows := make([]Row, 0, len(filtered)/2)
 	outCols := make([]string, 0, len(s.Projs))
+	colSet := make(map[string]struct{}, len(s.Projs))
 
 	for _, r := range filtered {
 		if err := checkCtx(env.ctx); err != nil {
@@ -1088,9 +1132,15 @@ func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []str
 							last := strings.LastIndex(col, ".")
 							base := col[last+1:]
 							putVal(out, base, v)
-							outCols = appendUnique(outCols, base)
+							if _, seen := colSet[base]; !seen {
+								colSet[base] = struct{}{}
+								outCols = append(outCols, base)
+							}
 						} else {
-							outCols = appendUnique(outCols, col)
+							if _, seen := colSet[col]; !seen {
+								colSet[col] = struct{}{}
+								outCols = append(outCols, col)
+							}
 						}
 					}
 				}
@@ -1108,7 +1158,10 @@ func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []str
 				return nil, nil, err
 			}
 			putVal(out, name, val)
-			outCols = appendUnique(outCols, name)
+			if _, seen := colSet[name]; !seen {
+				colSet[name] = struct{}{}
+				outCols = append(outCols, name)
+			}
 		}
 		outRows = append(outRows, out)
 	}
@@ -1118,6 +1171,7 @@ func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []str
 func processNonAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []string, error) {
 	outRows := make([]Row, 0, len(filtered))
 	outCols := make([]string, 0, len(s.Projs))
+	colSet := make(map[string]struct{}, len(s.Projs))
 
 	// Check if any window functions are used
 	hasWindowFunctions := anyWindowInSelect(s.Projs)
@@ -1146,9 +1200,15 @@ func processNonAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []
 						last := strings.LastIndex(col, ".")
 						base := col[last+1:]
 						putVal(out, base, v)
-						outCols = appendUnique(outCols, base)
+						if _, seen := colSet[base]; !seen {
+							colSet[base] = struct{}{}
+							outCols = append(outCols, base)
+						}
 					} else {
-						outCols = appendUnique(outCols, col)
+						if _, seen := colSet[col]; !seen {
+							colSet[col] = struct{}{}
+							outCols = append(outCols, col)
+						}
 					}
 				}
 				continue
@@ -1159,7 +1219,10 @@ func processNonAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []
 			}
 			name := projName(it, i)
 			putVal(out, name, val)
-			outCols = appendUnique(outCols, name)
+			if _, seen := colSet[name]; !seen {
+				colSet[name] = struct{}{}
+				outCols = append(outCols, name)
+			}
 		}
 		outRows = append(outRows, out)
 	}
@@ -1551,9 +1614,9 @@ func checkCtx(ctx context.Context) error {
 }
 
 func evalExpr(env ExecEnv, e Expr, row Row) (any, error) {
-	if err := checkCtx(env.ctx); err != nil {
-		return nil, err
-	}
+	// Context cancellation is checked at row-level loop boundaries
+	// (applyWhereClause, processNonAggregateQuery, UPDATE/DELETE loops, etc.),
+	// not per expression node. This avoids O(nodes_per_row) channel selects.
 	switch ex := e.(type) {
 	case *Literal:
 		return ex.Val, nil
@@ -1585,9 +1648,6 @@ func evalVarRef(ex *VarRef, row Row) (any, error) {
 	}
 	if strings.Contains(ex.Name, ".") {
 		return nil, fmt.Errorf("unknown column reference %q", ex.Name)
-	}
-	if v, ok := getVal(row, ex.Name); ok {
-		return v, nil
 	}
 	return nil, fmt.Errorf("unknown column %q", ex.Name)
 }
@@ -2069,12 +2129,7 @@ func evalFuncCall(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return evalWindowFunction(env, ex, row)
 	}
 
-	builtinFunctions := getBuiltinFunctions()
-	// Add extended functions
-	extendedFuncs := getExtendedFunctions()
-	for k, v := range extendedFuncs {
-		builtinFunctions[k] = v
-	}
+	builtinFunctions := getAllFunctions()
 	if handler, ok := builtinFunctions[ex.Name]; ok {
 		return handler(env, ex, row)
 	}
@@ -5051,22 +5106,40 @@ func evalAggregateCase(env ExecEnv, ex *CaseExpr, rows []Row) (any, error) {
 }
 
 func rowsFromTable(t *storage.Table, alias string) ([]Row, []string) {
-	cols := make([]string, len(t.Cols))
+	numCols := len(t.Cols)
+	// Pre-compute lowercase qualified and unqualified column keys.
+	qualKeys := make([]string, numCols)
+	unqualKeys := make([]string, numCols)
 	for i, c := range t.Cols {
-		cols[i] = strings.ToLower(alias + "." + c.Name)
+		qualKeys[i] = strings.ToLower(alias + "." + c.Name)
+		unqualKeys[i] = strings.ToLower(c.Name)
 	}
-	var out []Row
-	for _, r := range t.Rows {
-		row := Row{}
-		for i, c := range t.Cols {
-			putVal(row, alias+"."+c.Name, r[i])
+
+	cols := make([]string, numCols)
+	copy(cols, qualKeys)
+
+	// Pre-compute which unqualified names are unique (no duplicates).
+	unqualSeen := make(map[string]bool, numCols)
+	for _, k := range unqualKeys {
+		unqualSeen[k] = true
+	}
+	// Total keys per row: qualified + unique unqualified.
+	keysPerRow := numCols + len(unqualSeen)
+
+	out := make([]Row, len(t.Rows))
+	for ri, r := range t.Rows {
+		row := make(Row, keysPerRow)
+		for i := range t.Cols {
+			v := r[i]
+			row[qualKeys[i]] = v
 		}
-		for i, c := range t.Cols {
-			if _, exists := row[strings.ToLower(c.Name)]; !exists {
-				putVal(row, c.Name, r[i])
+		for i := range t.Cols {
+			uq := unqualKeys[i]
+			if _, exists := row[uq]; !exists {
+				row[uq] = r[i]
 			}
 		}
-		out = append(out, row)
+		out[ri] = row
 	}
 	return out, cols
 }
@@ -5114,34 +5187,57 @@ func addRightNulls(m Row, alias string, t *storage.Table) {
 }
 
 func fmtKeyPart(v any) string {
+	var b strings.Builder
+	writeFmtKeyPart(&b, v)
+	return b.String()
+}
+
+// writeFmtKeyPart writes a typed key part directly to a builder, avoiding
+// intermediate string allocations used by the old fmtKeyPart approach.
+func writeFmtKeyPart(b *strings.Builder, v any) {
 	switch x := v.(type) {
 	case nil:
-		return "N:"
+		b.WriteString("N:")
 	case int:
-		return "I:" + strconv.Itoa(x)
+		b.WriteString("I:")
+		b.WriteString(strconv.Itoa(x))
 	case float64:
-		return "F:" + strconv.FormatFloat(x, 'g', -1, 64)
+		b.WriteString("F:")
+		b.WriteString(strconv.FormatFloat(x, 'g', -1, 64))
 	case bool:
 		if x {
-			return "B:1"
+			b.WriteString("B:1")
+		} else {
+			b.WriteString("B:0")
 		}
-		return "B:0"
 	case string:
-		return "S:" + x
+		b.WriteString("S:")
+		b.WriteString(x)
 	default:
-		b, _ := json.Marshal(x)
-		return "J:" + string(b)
+		byt, _ := json.Marshal(x)
+		b.WriteString("J:")
+		b.Write(byt)
 	}
 }
+
 func distinctRows(rows []Row, cols []string) []Row {
-	seen := map[string]bool{}
-	var out []Row
+	seen := make(map[string]bool, len(rows)/2)
+	out := make([]Row, 0, len(rows))
+	// Pre-lowercase column names once.
+	lcCols := make([]string, len(cols))
+	for i, c := range cols {
+		lcCols[i] = strings.ToLower(c)
+	}
+	var buf strings.Builder
 	for _, r := range rows {
-		var parts []string
-		for _, c := range cols {
-			parts = append(parts, fmtKeyPart(r[strings.ToLower(c)]))
+		buf.Reset()
+		for i, c := range lcCols {
+			if i > 0 {
+				buf.WriteByte('|')
+			}
+			writeFmtKeyPart(&buf, r[c])
 		}
-		key := strings.Join(parts, "|")
+		key := buf.String()
 		if !seen[key] {
 			seen[key] = true
 			out = append(out, r)
@@ -5160,6 +5256,8 @@ func inferType(v any) storage.ColType {
 		return storage.BoolType
 	case string:
 		return storage.TextType
+	case []float64:
+		return storage.VectorType
 	default:
 		return storage.JsonType
 	}
@@ -5179,6 +5277,8 @@ func coerceToTypeAllowNull(v any, t storage.ColType) (any, error) {
 		return coerceToBool(v)
 	case storage.JsonType:
 		return coerceToJson(v)
+	case storage.VectorType:
+		return coerceToVector(v)
 	default:
 		return v, nil
 	}
@@ -5235,6 +5335,65 @@ func coerceToJson(v any) (any, error) {
 	default:
 		return x, nil
 	}
+}
+
+// coerceToVector converts a value to []float64 for VECTOR columns.
+// Accepts: []float64 (passthrough), JSON string "[1.0, 2.0, 3.0]",
+// []any (from JSON parse), or []int.
+func coerceToVector(v any) (any, error) {
+	switch x := v.(type) {
+	case []float64:
+		return x, nil
+	case string:
+		s := strings.TrimSpace(x)
+		if s == "" {
+			return nil, fmt.Errorf("cannot convert empty string to VECTOR")
+		}
+		var arr []float64
+		if err := json.Unmarshal([]byte(s), &arr); err == nil {
+			return arr, nil
+		}
+		// Try parsing as []any from JSON
+		var anyArr []any
+		if err := json.Unmarshal([]byte(s), &anyArr); err == nil {
+			return anySliceToFloat64(anyArr)
+		}
+		return nil, fmt.Errorf("cannot convert %q to VECTOR", s)
+	case []any:
+		return anySliceToFloat64(x)
+	case []int:
+		out := make([]float64, len(x))
+		for i, v := range x {
+			out[i] = float64(v)
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("cannot convert %T to VECTOR", v)
+	}
+}
+
+// anySliceToFloat64 converts a []any of numeric values to []float64.
+func anySliceToFloat64(arr []any) ([]float64, error) {
+	out := make([]float64, len(arr))
+	for i, v := range arr {
+		switch n := v.(type) {
+		case float64:
+			out[i] = n
+		case int:
+			out[i] = float64(n)
+		case int64:
+			out[i] = float64(n)
+		case json.Number:
+			f, err := n.Float64()
+			if err != nil {
+				return nil, fmt.Errorf("vector element %d: %w", i, err)
+			}
+			out[i] = f
+		default:
+			return nil, fmt.Errorf("vector element %d: cannot convert %T to float64", i, v)
+		}
+	}
+	return out, nil
 }
 
 // JSON helpers

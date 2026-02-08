@@ -766,5 +766,160 @@ JOIN TABLE_FROM_JSON(FILE('./data/prices.json')) p ON o.product = p.product;
 SELECT * FROM TABLE_FROM_JSON(BASE64_DECODE(FILE('./data/encoded_data.b64')));
 
 -- ============================================================
+-- VECTOR / EMBEDDING FUNCTIONS  (RAG Vector Database Support)
+-- ============================================================
+
+-- tinySQL supports a native VECTOR data type for storing float64 embeddings,
+-- plus a rich set of functions for similarity search, distance computation,
+-- and vector manipulation — enabling RAG (Retrieval-Augmented Generation)
+-- workloads directly in SQL.
+
+-- ---- Vector Creation & Conversion ----
+
+-- Parse a JSON array into a VECTOR
+SELECT VEC_FROM_JSON('[1.0, 2.0, 3.0]') as embedding;
+
+-- Serialize a VECTOR back to JSON
+SELECT VEC_TO_JSON(VEC_FROM_JSON('[1.5, 2.5, 3.5]')) as json_vec;
+
+-- ---- Vector Introspection ----
+
+-- Number of dimensions
+SELECT VEC_DIM(VEC_FROM_JSON('[1,2,3,4,5]')) as dimensions;
+
+-- L2 (Euclidean) norm
+SELECT VEC_NORM(VEC_FROM_JSON('[3.0, 4.0]')) as norm_is_5;
+
+-- ---- Vector Normalization ----
+
+-- Normalize to unit length
+SELECT VEC_NORMALIZE(VEC_FROM_JSON('[3.0, 4.0]')) as unit_vec;
+
+-- ---- Element-wise Arithmetic ----
+
+-- Addition
+SELECT VEC_ADD(VEC_FROM_JSON('[1,2,3]'), VEC_FROM_JSON('[4,5,6]')) as sum_vec;
+
+-- Subtraction
+SELECT VEC_SUB(VEC_FROM_JSON('[5,7,9]'), VEC_FROM_JSON('[1,2,3]')) as diff_vec;
+
+-- Hadamard (element-wise) product
+SELECT VEC_MUL(VEC_FROM_JSON('[2,3,4]'), VEC_FROM_JSON('[5,6,7]')) as prod_vec;
+
+-- Scalar multiplication
+SELECT VEC_SCALE(VEC_FROM_JSON('[1,2,3]'), 2.5) as scaled_vec;
+
+-- ---- Similarity & Distance Functions ----
+
+-- Dot product (inner product)
+SELECT VEC_DOT(VEC_FROM_JSON('[1,2,3]'), VEC_FROM_JSON('[4,5,6]')) as dot_product;
+
+-- Cosine similarity ∈ [-1, 1]  (1 = identical direction)
+SELECT VEC_COSINE_SIMILARITY(VEC_FROM_JSON('[1,0]'), VEC_FROM_JSON('[1,0]')) as same_dir;
+SELECT VEC_COSINE_SIMILARITY(VEC_FROM_JSON('[1,0]'), VEC_FROM_JSON('[0,1]')) as orthogonal;
+
+-- Cosine distance ∈ [0, 2]  (0 = identical)
+SELECT VEC_COSINE_DISTANCE(VEC_FROM_JSON('[1,0]'), VEC_FROM_JSON('[1,0]')) as zero_dist;
+
+-- Euclidean (L2) distance
+SELECT VEC_L2_DISTANCE(VEC_FROM_JSON('[0,0]'), VEC_FROM_JSON('[3,4]')) as dist_5;
+
+-- Manhattan (L1) distance
+SELECT VEC_MANHATTAN_DISTANCE(VEC_FROM_JSON('[1,2,3]'), VEC_FROM_JSON('[4,6,8]')) as dist_12;
+
+-- Generic distance function with selectable metric
+SELECT VEC_DISTANCE(VEC_FROM_JSON('[1,0]'), VEC_FROM_JSON('[0,1]'), 'cosine')    as cosine_dist;
+SELECT VEC_DISTANCE(VEC_FROM_JSON('[0,0]'), VEC_FROM_JSON('[3,4]'), 'l2')        as l2_dist;
+SELECT VEC_DISTANCE(VEC_FROM_JSON('[0,0]'), VEC_FROM_JSON('[3,4]'), 'manhattan') as l1_dist;
+SELECT VEC_DISTANCE(VEC_FROM_JSON('[1,0]'), VEC_FROM_JSON('[0,1]'), 'dot')       as dot_dist;
+
+-- ---- Vector Manipulation ----
+
+-- Extract a sub-vector (0-based start, length)
+SELECT VEC_SLICE(VEC_FROM_JSON('[10,20,30,40,50]'), 1, 3) as sub_vec;
+
+-- Concatenate two vectors
+SELECT VEC_CONCAT(VEC_FROM_JSON('[1,2]'), VEC_FROM_JSON('[3,4,5]')) as concat_vec;
+
+-- Element-wise average of two vectors
+SELECT VEC_AVG(VEC_FROM_JSON('[2,4,6]'), VEC_FROM_JSON('[4,6,8]')) as avg_vec;
+
+-- ---- Quantization ----
+
+-- Simulate 8-bit quantization (reduces precision, saves storage)
+SELECT VEC_QUANTIZE(VEC_FROM_JSON('[0.0, 0.5, 1.0]'), 8) as quantized_8bit;
+
+-- Simulate 16-bit quantization
+SELECT VEC_QUANTIZE(VEC_FROM_JSON('[0.0, 0.33, 0.67, 1.0]'), 16) as quantized_16bit;
+
+-- ---- Random Vector Generation ----
+
+-- Generate a random unit vector of 5 dimensions
+SELECT VEC_RANDOM(5) as random_vec;
+
+-- Deterministic random vector with a seed
+SELECT VEC_RANDOM(5, 42) as seeded_vec;
+
+-- ---- VECTOR Column Type ----
+
+-- Tables can have VECTOR columns for storing embeddings
+CREATE TABLE vec_demo_docs (id INT, title TEXT, embedding VECTOR);
+INSERT INTO vec_demo_docs VALUES (1, 'apple',       '[1.0, 0.0, 0.0]');
+INSERT INTO vec_demo_docs VALUES (2, 'banana',      '[0.9, 0.1, 0.0]');
+INSERT INTO vec_demo_docs VALUES (3, 'cherry',      '[0.0, 1.0, 0.0]');
+INSERT INTO vec_demo_docs VALUES (4, 'date fruit',  '[0.0, 0.0, 1.0]');
+INSERT INTO vec_demo_docs VALUES (5, 'elderberry',  '[0.8, 0.2, 0.0]');
+
+-- Query embeddings with inline similarity scoring
+SELECT title,
+       VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[1.0, 0.0, 0.0]')) as similarity
+FROM vec_demo_docs
+ORDER BY similarity DESC;
+
+-- Filter by similarity threshold
+SELECT title,
+       VEC_DISTANCE(embedding, VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 'cosine') as distance
+FROM vec_demo_docs
+WHERE VEC_DISTANCE(embedding, VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 'cosine') < 0.5
+ORDER BY distance;
+
+-- ---- k-NN Vector Search (Table-Valued Function) ----
+
+-- VEC_SEARCH(table, column, query_vector, k [, metric])
+-- Returns the k nearest neighbours with _vec_distance and _vec_rank columns
+SELECT * FROM VEC_SEARCH('vec_demo_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 3);
+
+-- Search with L2 distance metric
+SELECT * FROM VEC_SEARCH('vec_demo_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 3, 'l2');
+
+-- VEC_TOP_K is an alias for VEC_SEARCH
+SELECT * FROM VEC_TOP_K('vec_demo_docs', 'embedding', VEC_FROM_JSON('[0.0, 1.0, 0.0]'), 2, 'cosine');
+
+-- ---- RAG Workflow Example ----
+
+-- 1. Create a knowledge base with embeddings
+CREATE TABLE vec_demo_kb (id INT, content TEXT, embedding VECTOR);
+INSERT INTO vec_demo_kb VALUES (1, 'Go is a statically typed language',       '[0.9, 0.1, 0.0, 0.0]');
+INSERT INTO vec_demo_kb VALUES (2, 'Python is dynamically typed',             '[0.8, 0.2, 0.1, 0.0]');
+INSERT INTO vec_demo_kb VALUES (3, 'Databases store structured data',         '[0.0, 0.0, 0.9, 0.1]');
+INSERT INTO vec_demo_kb VALUES (4, 'Vector search enables AI applications',   '[0.1, 0.0, 0.1, 0.9]');
+
+-- 2. Semantic search: find docs closest to a query embedding
+SELECT * FROM VEC_SEARCH('vec_demo_kb', 'embedding', VEC_FROM_JSON('[0.85, 0.15, 0.05, 0.0]'), 2);
+
+-- 3. Inline similarity ranking
+SELECT content,
+       VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[0.85, 0.15, 0.05, 0.0]')) as relevance
+FROM vec_demo_kb
+ORDER BY relevance DESC;
+
+-- 4. Vector arithmetic for query expansion (average two embeddings)
+SELECT VEC_AVG(VEC_FROM_JSON('[0.9, 0.1, 0.0, 0.0]'), VEC_FROM_JSON('[0.8, 0.2, 0.1, 0.0]')) as expanded_query;
+
+-- Cleanup demo tables
+DROP TABLE vec_demo_docs;
+DROP TABLE vec_demo_kb;
+
+-- ============================================================
 -- END OF EXAMPLES
 -- ============================================================

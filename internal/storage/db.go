@@ -58,6 +58,9 @@ func init() {
 	safeGobRegister(&diskTable{})
 	safeGobRegister(Table{})
 	safeGobRegister(&Table{})
+	// Register vector slice types for GOB serialization
+	safeGobRegister([]float64{})
+	safeGobRegister([]any{})
 }
 
 // ColType enumerates supported column data types.
@@ -110,6 +113,9 @@ const (
 	ComplexType // alias for Complex128Type
 	PointerType
 	InterfaceType
+
+	// Vector types (for RAG / embedding storage)
+	VectorType
 )
 
 var colTypeToString = map[ColType]string{
@@ -146,6 +152,7 @@ var colTypeToString = map[ColType]string{
 	ComplexType:    "COMPLEX",
 	PointerType:    "POINTER",
 	InterfaceType:  "INTERFACE",
+	VectorType:     "VECTOR",
 }
 
 func (t ColType) String() string {
@@ -201,6 +208,11 @@ type Table struct {
 	IsTemp  bool
 	colPos  map[string]int
 	Version int
+	// dirtyFrom tracks the first row index modified since the last
+	// WAL checkpoint. -1 means no dirty rows (full table must be logged).
+	// For append-only workloads (INSERT without UPDATE/DELETE), this
+	// enables the WAL to log only new rows instead of the entire table.
+	dirtyFrom int
 }
 
 // NewTable creates a new Table with case-insensitive column lookup indices.
@@ -209,8 +221,28 @@ func NewTable(name string, cols []Column, isTemp bool) *Table {
 	for i, c := range cols {
 		pos[strings.ToLower(c.Name)] = i
 	}
-	return &Table{Name: name, Cols: cols, colPos: pos, IsTemp: isTemp}
+	return &Table{Name: name, Cols: cols, colPos: pos, IsTemp: isTemp, dirtyFrom: -1}
 }
+
+// MarkDirtyFrom records the first row index that was modified. If an earlier
+// index is already set, it is kept. Use -1 for non-append mutations (UPDATE,
+// DELETE) to force a full-table WAL entry.
+func (t *Table) MarkDirtyFrom(idx int) {
+	if idx < 0 {
+		t.dirtyFrom = -1
+		return
+	}
+	if t.dirtyFrom >= 0 && t.dirtyFrom <= idx {
+		return // already tracking earlier rows
+	}
+	t.dirtyFrom = idx
+}
+
+// DirtyFrom returns the first dirty row index, or -1 if non-append-only.
+func (t *Table) DirtyFrom() int { return t.dirtyFrom }
+
+// ResetDirty marks the table as clean (called after WAL checkpoint).
+func (t *Table) ResetDirty() { t.dirtyFrom = len(t.Rows) }
 
 // ColIndex returns the zero-based index of the named column.
 func (t *Table) ColIndex(name string) (int, error) {
@@ -249,6 +281,9 @@ func NewDB() *DB {
 	}
 }
 
+// getTenant returns the tenantDB for the given tenant name, creating it
+// if necessary. Callers must hold db.mu (at least read-locked when only
+// reading, write-locked when creating/modifying).
 func (db *DB) getTenant(tn string) *tenantDB {
 	tn = strings.ToLower(tn)
 	td := db.tenants[tn]
@@ -259,9 +294,20 @@ func (db *DB) getTenant(tn string) *tenantDB {
 	return td
 }
 
+// getTenantRO returns the tenantDB for reading. Returns nil if it does not
+// exist (no allocation). Caller must hold db.mu.RLock().
+func (db *DB) getTenantRO(tn string) *tenantDB {
+	return db.tenants[strings.ToLower(tn)]
+}
+
 // Get returns a table by name for the given tenant.
 func (db *DB) Get(tn, name string) (*Table, error) {
-	td := db.getTenant(tn)
+	db.mu.RLock()
+	td := db.getTenantRO(tn)
+	db.mu.RUnlock()
+	if td == nil {
+		return nil, fmt.Errorf("no such table %q (tenant %q)", name, tn)
+	}
 	t, ok := td.tables[strings.ToLower(name)]
 	if !ok {
 		return nil, fmt.Errorf("no such table %q (tenant %q)", name, tn)
@@ -271,30 +317,38 @@ func (db *DB) Get(tn, name string) (*Table, error) {
 
 // Put adds a new table to the tenant; returns error if it already exists.
 func (db *DB) Put(tn string, t *Table) error {
+	db.mu.Lock()
 	td := db.getTenant(tn)
 	lc := strings.ToLower(t.Name)
 	if _, exists := td.tables[lc]; exists {
+		db.mu.Unlock()
 		return fmt.Errorf("table %q already exists (tenant %q)", t.Name, tn)
 	}
 	td.tables[lc] = t
+	db.mu.Unlock()
 	return nil
 }
 
 // Drop removes a table from the tenant.
 func (db *DB) Drop(tn, name string) error {
+	db.mu.Lock()
 	td := db.getTenant(tn)
 	lc := strings.ToLower(name)
 	if _, ok := td.tables[lc]; !ok {
+		db.mu.Unlock()
 		return fmt.Errorf("no such table %q (tenant %q)", name, tn)
 	}
 	delete(td.tables, lc)
+	db.mu.Unlock()
 	return nil
 }
 
 // ListTables returns the tables in a tenant sorted by name.
 func (db *DB) ListTables(tn string) []*Table {
-	td := db.getTenant(tn)
-	if len(td.tables) == 0 {
+	db.mu.RLock()
+	td := db.getTenantRO(tn)
+	if td == nil || len(td.tables) == 0 {
+		db.mu.RUnlock()
 		return nil
 	}
 	names := make([]string, 0, len(td.tables))
@@ -306,6 +360,7 @@ func (db *DB) ListTables(tn string) []*Table {
 	for i, n := range names {
 		out[i] = td.tables[n]
 	}
+	db.mu.RUnlock()
 	return out
 }
 
@@ -335,6 +390,45 @@ func (db *DB) DeepClone() *DB {
 	return out
 }
 
+// ShallowCloneForTable creates a lightweight copy of the database that
+// deep-copies only the specified table and shares all others by reference.
+// This is safe when the caller knows only the target table will be mutated
+// (single-statement DML). For a database with many tables, this is
+// dramatically cheaper than DeepClone — O(rows in target table) instead of
+// O(rows in all tables).
+func (db *DB) ShallowCloneForTable(tenant, tableName string) *DB {
+	if len(db.tenants) == 0 {
+		return NewDB()
+	}
+	out := NewDB()
+	out.wal = db.wal
+	targetTenant := strings.ToLower(tenant)
+	targetKey := strings.ToLower(tableName)
+	for tn, tdb := range db.tenants {
+		for _, t := range tdb.tables {
+			key := strings.ToLower(t.Name)
+			if tn == targetTenant && key == targetKey {
+				// Deep-copy the target table that will be mutated.
+				cols := make([]Column, len(t.Cols))
+				copy(cols, t.Cols)
+				nt := NewTable(t.Name, cols, t.IsTemp)
+				nt.Version = t.Version
+				nt.Rows = make([][]any, len(t.Rows))
+				for i := range t.Rows {
+					row := make([]any, len(t.Rows[i]))
+					copy(row, t.Rows[i])
+					nt.Rows[i] = row
+				}
+				out.upsertTable(tn, nt)
+			} else {
+				// Share by reference — these tables are read-only in this operation.
+				out.upsertTable(tn, t)
+			}
+		}
+	}
+	return out
+}
+
 // ------------------------ GOB Checkpoint (Load/Save) ------------------------
 
 type diskColumn struct {
@@ -354,13 +448,25 @@ type diskTable struct {
 }
 
 func tableToDisk(tn string, t *Table) diskTable {
+	return tableToDiskRange(tn, t, 0, len(t.Rows))
+}
+
+// tableToDiskRange serializes the table schema and rows in [from, to).
+// Used by the WAL to write only newly appended rows.
+func tableToDiskRange(tn string, t *Table, from, to int) diskTable {
+	if from < 0 {
+		from = 0
+	}
+	if to > len(t.Rows) {
+		to = len(t.Rows)
+	}
 	dt := diskTable{
 		Tenant:  tn,
 		Name:    t.Name,
 		IsTemp:  t.IsTemp,
 		Version: t.Version,
 		Cols:    make([]diskColumn, len(t.Cols)),
-		Rows:    make([][]any, len(t.Rows)),
+		Rows:    make([][]any, to-from),
 	}
 	for i, c := range t.Cols {
 		dt.Cols[i] = diskColumn{
@@ -371,7 +477,8 @@ func tableToDisk(tn string, t *Table) diskTable {
 			PointerTable: c.PointerTable,
 		}
 	}
-	for i, r := range t.Rows {
+	for i := from; i < to; i++ {
+		r := t.Rows[i]
 		row := make([]any, len(r))
 		for j, v := range r {
 			if v == nil {
@@ -381,7 +488,6 @@ func tableToDisk(tn string, t *Table) diskTable {
 			if t.Cols[j].Type == JsonType {
 				switch vv := v.(type) {
 				case string:
-					// Already a JSON/text representation; keep as-is to avoid double encoding.
 					row[j] = vv
 				default:
 					b, _ := json.Marshal(v)
@@ -391,7 +497,7 @@ func tableToDisk(tn string, t *Table) diskTable {
 				row[j] = v
 			}
 		}
-		dt.Rows[i] = row
+		dt.Rows[i-from] = row
 	}
 	return dt
 }
@@ -603,6 +709,7 @@ const (
 	walRecordApplyTable
 	walRecordDropTable
 	walRecordCommit
+	walRecordAppendRows // delta: only the new rows appended by INSERT
 )
 
 type walRecord struct {
@@ -616,10 +723,11 @@ type walRecord struct {
 }
 
 type walOperation struct {
-	tenant string
-	name   string
-	drop   bool
-	table  *diskTable
+	tenant     string
+	name       string
+	drop       bool
+	appendOnly bool
+	table      *diskTable
 }
 
 // WALChange describes a persistent change that will be written to the WAL.
@@ -809,9 +917,19 @@ func (w *WALManager) LogTransaction(changes []WALChange) (bool, error) {
 		if ch.Drop {
 			rec.Type = walRecordDropTable
 		} else if ch.Table != nil {
-			dt := tableToDisk(ch.Tenant, ch.Table)
-			rec.Type = walRecordApplyTable
-			rec.Table = &dt
+			dirty := ch.Table.DirtyFrom()
+			if dirty >= 0 && dirty < len(ch.Table.Rows) {
+				// Append-only change: write only the new rows.
+				dt := tableToDiskRange(ch.Tenant, ch.Table, dirty, len(ch.Table.Rows))
+				rec.Type = walRecordAppendRows
+				rec.Table = &dt
+			} else {
+				// Full table change (UPDATE, DELETE, CREATE, or unknown).
+				dt := tableToDisk(ch.Tenant, ch.Table)
+				rec.Type = walRecordApplyTable
+				rec.Table = &dt
+			}
+			ch.Table.ResetDirty()
 		} else {
 			continue
 		}
@@ -965,6 +1083,12 @@ func handleWalRecord(db *DB, rec walRecord, pending map[uint64][]walOperation, c
 		}
 		dt := *rec.Table
 		pending[rec.TxID] = append(pending[rec.TxID], walOperation{tenant: rec.Tenant, name: dt.Name, table: &dt})
+	case walRecordAppendRows:
+		if rec.Table == nil {
+			return
+		}
+		dt := *rec.Table
+		pending[rec.TxID] = append(pending[rec.TxID], walOperation{tenant: rec.Tenant, name: dt.Name, table: &dt, appendOnly: true})
 	case walRecordDropTable:
 		pending[rec.TxID] = append(pending[rec.TxID], walOperation{tenant: rec.Tenant, name: rec.TableName, drop: true})
 	case walRecordCommit:
@@ -973,6 +1097,17 @@ func handleWalRecord(db *DB, rec walRecord, pending map[uint64][]walOperation, c
 			if op.drop {
 				_ = db.Drop(op.tenant, op.name)
 				continue
+			}
+			if op.appendOnly {
+				// Delta replay: append rows to existing table.
+				existing, _ := db.Get(op.tenant, op.name)
+				if existing != nil {
+					delta := diskToTable(*op.table)
+					existing.Rows = append(existing.Rows, delta.Rows...)
+					existing.Version = delta.Version
+					continue
+				}
+				// Fallback: table not found, apply as full table.
 			}
 			db.upsertTable(op.tenant, diskToTable(*op.table))
 		}

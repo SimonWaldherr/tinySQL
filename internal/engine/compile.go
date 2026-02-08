@@ -1,18 +1,19 @@
 // Package engine provides SQL parsing, planning, and execution for tinySQL.
 //
 // This file focuses on the query compilation cache:
-//   - What: A lightweight in-memory cache that stores parsed/compiled
+//   - What: A lightweight in-memory LRU cache that stores parsed/compiled
 //     representations of SQL statements (CompiledQuery).
 //   - How: Queries are keyed by their exact SQL string. The cache holds a
 //     Statement AST plus metadata (ParsedAt) and returns it to callers to
-//     avoid re-parsing. A simple FIFO eviction based on oldest ParsedAt keeps
-//     the cache within a fixed size.
+//     avoid re-parsing. LRU eviction using container/list keeps the cache
+//     within a fixed size with O(1) eviction.
 //   - Why: Parsing is comparatively expensive and often repeated in loops or
 //     hot paths. Caching reduces parse overhead, improves latency, and keeps
 //     the execution path predictable while remaining simple and thread-safe.
 package engine
 
 import (
+	"container/list"
 	"context"
 	"fmt"
 	"sync"
@@ -28,10 +29,17 @@ type CompiledQuery struct {
 	ParsedAt  time.Time
 }
 
-// QueryCache manages compiled queries.
+// cacheEntry pairs a cache key with its compiled query for LRU tracking.
+type cacheEntry struct {
+	key string
+	cq  *CompiledQuery
+}
+
+// QueryCache manages compiled queries with LRU eviction.
 type QueryCache struct {
 	mu      sync.RWMutex
-	queries map[string]*CompiledQuery
+	entries map[string]*list.Element
+	order   *list.List // front = most recently used
 	maxSize int
 }
 
@@ -41,7 +49,8 @@ func NewQueryCache(maxSize int) *QueryCache {
 		maxSize = 1000 // default cache size
 	}
 	return &QueryCache{
-		queries: make(map[string]*CompiledQuery, maxSize),
+		entries: make(map[string]*list.Element, maxSize),
+		order:   list.New(),
 		maxSize: maxSize,
 	}
 }
@@ -49,9 +58,13 @@ func NewQueryCache(maxSize int) *QueryCache {
 // Compile parses and caches a SQL query for reuse.
 func (qc *QueryCache) Compile(sql string) (*CompiledQuery, error) {
 	qc.mu.RLock()
-	if cached, exists := qc.queries[sql]; exists {
+	if elem, exists := qc.entries[sql]; exists {
 		qc.mu.RUnlock()
-		return cached, nil
+		// Promote to front (most recently used) under write lock.
+		qc.mu.Lock()
+		qc.order.MoveToFront(elem)
+		qc.mu.Unlock()
+		return elem.Value.(*cacheEntry).cq, nil
 	}
 	qc.mu.RUnlock()
 
@@ -72,22 +85,24 @@ func (qc *QueryCache) Compile(sql string) (*CompiledQuery, error) {
 	qc.mu.Lock()
 	defer qc.mu.Unlock()
 
-	// If cache is full, remove oldest entry (simple FIFO)
-	if len(qc.queries) >= qc.maxSize {
-		var oldestSQL string
-		var oldestTime time.Time
-		first := true
-		for sql, cq := range qc.queries {
-			if first || cq.ParsedAt.Before(oldestTime) {
-				oldestSQL = sql
-				oldestTime = cq.ParsedAt
-				first = false
-			}
-		}
-		delete(qc.queries, oldestSQL)
+	// Double-check after acquiring write lock (another goroutine may have inserted).
+	if elem, exists := qc.entries[sql]; exists {
+		qc.order.MoveToFront(elem)
+		return elem.Value.(*cacheEntry).cq, nil
 	}
 
-	qc.queries[sql] = compiled
+	// Evict LRU entry if at capacity — O(1).
+	if qc.order.Len() >= qc.maxSize {
+		tail := qc.order.Back()
+		if tail != nil {
+			qc.order.Remove(tail)
+			delete(qc.entries, tail.Value.(*cacheEntry).key)
+		}
+	}
+
+	entry := &cacheEntry{key: sql, cq: compiled}
+	elem := qc.order.PushFront(entry)
+	qc.entries[sql] = elem
 	return compiled, nil
 }
 
@@ -109,14 +124,15 @@ func (qc *QueryCache) MustCompile(sql string) *CompiledQuery {
 func (qc *QueryCache) Clear() {
 	qc.mu.Lock()
 	defer qc.mu.Unlock()
-	qc.queries = make(map[string]*CompiledQuery)
+	qc.entries = make(map[string]*list.Element, qc.maxSize)
+	qc.order.Init()
 }
 
 // Size returns the number of cached queries.
 func (qc *QueryCache) Size() int {
 	qc.mu.RLock()
 	defer qc.mu.RUnlock()
-	return len(qc.queries)
+	return len(qc.entries)
 }
 
 // Stats returns cache statistics.
@@ -125,8 +141,8 @@ func (qc *QueryCache) Stats() map[string]interface{} {
 	defer qc.mu.RUnlock()
 
 	return map[string]interface{}{
-		"size":    len(qc.queries),
+		"size":    len(qc.entries),
 		"maxSize": qc.maxSize,
-		"queries": len(qc.queries),
+		"queries": len(qc.entries),
 	}
 }

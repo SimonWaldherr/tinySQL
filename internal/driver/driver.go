@@ -420,13 +420,33 @@ func (c *conn) currentDB() *storage.DB {
 
 //nolint:gocyclo // execSQL coordinates parsing, locking, WAL, and transaction paths.
 func (c *conn) execSQL(ctx context.Context, sqlStr string) (driver.Result, error) {
-	// Parse the SQL and route to write or read execution paths. Writes run
-	// in a transaction snapshot when inside a tx, otherwise under writer lock.
 	p := engine.NewParser(sqlStr)
 	st, err := p.ParseStatement()
 	if err != nil {
 		return nil, err
 	}
+	return c.execStatement(ctx, st)
+}
+
+// writeTargetTable returns the single table name modified by a DML/DDL statement.
+func writeTargetTable(st engine.Statement) string {
+	switch s := st.(type) {
+	case *engine.Insert:
+		return s.Table
+	case *engine.Update:
+		return s.Table
+	case *engine.Delete:
+		return s.Table
+	case *engine.CreateTable:
+		return s.Name
+	case *engine.DropTable:
+		return s.Name
+	default:
+		return ""
+	}
+}
+
+func (c *conn) execStatement(ctx context.Context, st engine.Statement) (driver.Result, error) {
 
 	// DDL/DML writes must run in tx snapshot or under lock
 	isWrite := func(s engine.Statement) bool {
@@ -457,8 +477,12 @@ func (c *conn) execSQL(ctx context.Context, sqlStr string) (driver.Result, error
 			base := c.srv.db
 			wal := base.WAL()
 			var needCheckpoint bool
+			var err error
 			if wal != nil {
-				shadow := base.DeepClone()
+				// Clone only the single table being modified instead of the
+				// entire database. All other tables are shared by reference.
+				target := writeTargetTable(st)
+				shadow := base.ShallowCloneForTable(c.tenant, target)
 				if _, err := engine.Execute(ctx, shadow, c.tenant, st); err != nil {
 					return nil, err
 				}
@@ -499,7 +523,7 @@ func (c *conn) execSQL(ctx context.Context, sqlStr string) (driver.Result, error
 	defer c.srv.releaseReader()
 	c.srv.mu.RLock()
 	defer c.srv.mu.RUnlock()
-	_, err = engine.Execute(ctx, c.currentDB(), c.tenant, st)
+	_, err := engine.Execute(ctx, c.currentDB(), c.tenant, st)
 	if err != nil {
 		return nil, err
 	}
@@ -516,9 +540,9 @@ func (c *conn) querySQL(ctx context.Context, sqlStr string) (driver.Rows, error)
 		return nil, err
 	}
 
-	// For non-SELECT statements, execute and return empty rows
+	// For non-SELECT statements, execute via pre-parsed statement (no re-parse).
 	if _, ok := st.(*engine.Select); !ok {
-		if _, err := c.execSQL(ctx, sqlStr); err != nil {
+		if _, err := c.execStatement(ctx, st); err != nil {
 			return nil, err
 		}
 		return emptyRows{}, nil
