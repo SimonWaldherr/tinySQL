@@ -187,6 +187,48 @@ const (
 )
 
 // ============================================================================
+// Storage Modes - Pluggable persistence strategies
+// ============================================================================
+
+// StorageMode defines how the database manages data between memory and disk.
+// Different modes trade off speed, memory usage, and durability.
+type StorageMode = storage.StorageMode
+
+// StorageConfig configures database storage behaviour. Pass to OpenDB to
+// create a database with the desired persistence strategy.
+type StorageConfig = storage.StorageConfig
+
+// StorageBackend is the interface implemented by all storage backends.
+type StorageBackend = storage.StorageBackend
+
+// BackendStats provides observability into storage backend behaviour.
+type BackendStats = storage.BackendStats
+
+// Storage mode constants.
+const (
+	// ModeMemory keeps all data in RAM. Persistence only occurs via explicit
+	// SaveToFile calls or when DB.Close is invoked. Fastest mode.
+	ModeMemory StorageMode = storage.ModeMemory
+
+	// ModeWAL keeps all data in RAM and writes a Write-Ahead Log for crash
+	// recovery. Periodic checkpoints create full GOB snapshots.
+	ModeWAL StorageMode = storage.ModeWAL
+
+	// ModeDisk stores each table as a separate GOB file on disk. Tables are
+	// loaded into memory on demand and flushed back on Sync/Close.
+	ModeDisk StorageMode = storage.ModeDisk
+
+	// ModeIndex keeps table schemas in RAM while row data resides on disk.
+	// Rows are loaded on demand with aggressive eviction. Memory usage is
+	// proportional to schema size, not data size.
+	ModeIndex StorageMode = storage.ModeIndex
+
+	// ModeHybrid uses an LRU buffer pool with a configurable memory limit.
+	// Hot tables stay in RAM; cold tables spill to disk.
+	ModeHybrid StorageMode = storage.ModeHybrid
+)
+
+// ============================================================================
 // Column Type Constants - Supported data types
 // ============================================================================
 
@@ -240,6 +282,59 @@ const (
 // The returned DB is safe for concurrent use and includes an integrated MVCC manager.
 func NewDB() *DB {
 	return storage.NewDB()
+}
+
+// OpenDB creates or opens a database with the specified storage mode and
+// configuration. This is the primary entry point for creating databases that
+// persist data to disk using different strategies.
+//
+// Storage Mode Overview:
+//
+//	ModeMemory  – All data in RAM. Fast. Save on Close if Path is set.
+//	ModeWAL     – All data in RAM + Write-Ahead Log for crash recovery.
+//	ModeDisk    – Per-table files on disk, lazy-loaded into RAM.
+//	ModeIndex   – Schemas in RAM, rows on disk with small LRU cache.
+//	ModeHybrid  – Disk-backed with configurable LRU memory limit.
+//
+// Examples:
+//
+//	// In-memory with save-on-close
+//	db, _ := tinysql.OpenDB(tinysql.StorageConfig{
+//	    Mode: tinysql.ModeMemory,
+//	    Path: "mydb.gob",
+//	})
+//	defer db.Close()
+//
+//	// Disk mode for large databases
+//	db, _ := tinysql.OpenDB(tinysql.StorageConfig{
+//	    Mode: tinysql.ModeDisk,
+//	    Path: "/data/mydb",
+//	})
+//	defer db.Close()
+//
+//	// Hybrid mode with 512 MB cache
+//	db, _ := tinysql.OpenDB(tinysql.StorageConfig{
+//	    Mode:           tinysql.ModeHybrid,
+//	    Path:           "/data/mydb",
+//	    MaxMemoryBytes: 512 * 1024 * 1024,
+//	})
+//	defer db.Close()
+//
+// Always call db.Close() to ensure data is flushed to disk.
+func OpenDB(cfg StorageConfig) (*DB, error) {
+	return storage.OpenDB(cfg)
+}
+
+// ParseStorageMode converts a string like "memory", "wal", "disk", "index",
+// or "hybrid" into a StorageMode constant (case-insensitive).
+func ParseStorageMode(s string) (StorageMode, error) {
+	return storage.ParseStorageMode(s)
+}
+
+// DefaultStorageConfig returns a StorageConfig with sensible defaults for
+// the given mode. The caller should set Path before passing to OpenDB.
+func DefaultStorageConfig(mode StorageMode) StorageConfig {
+	return storage.DefaultStorageConfig(mode)
 }
 
 // ============================================================================

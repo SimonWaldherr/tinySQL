@@ -258,6 +258,8 @@ type tenantDB struct {
 }
 
 // DB is an in-memory, multi-tenant database catalog with full MVCC support.
+// It optionally delegates storage to a StorageBackend for disk-based or
+// hybrid persistence strategies.
 type DB struct {
 	mu      sync.RWMutex
 	tenants map[string]*tenantDB
@@ -271,14 +273,154 @@ type DB struct {
 
 	// System catalog for metadata and job scheduling
 	catalog *CatalogManager
+
+	// Pluggable storage backend (nil = pure in-memory, the legacy default).
+	backend StorageBackend
+
+	// Active storage mode. ModeMemory when no backend is attached.
+	storageMode StorageMode
+
+	// Configuration used to open this database (may be nil).
+	config *StorageConfig
 }
 
 // NewDB creates a new empty database catalog with MVCC support.
+// The database operates in ModeMemory (pure in-memory) by default.
+// Use OpenDB for disk-backed or hybrid storage modes.
 func NewDB() *DB {
 	return &DB{
-		tenants: map[string]*tenantDB{},
-		mvcc:    NewMVCCManager(),
+		tenants:     map[string]*tenantDB{},
+		mvcc:        NewMVCCManager(),
+		storageMode: ModeMemory,
 	}
+}
+
+// OpenDB creates or opens a database with the specified storage configuration.
+// For ModeMemory this is equivalent to NewDB (with optional save-on-close).
+// For ModeDisk/ModeHybrid/ModeIndex, tables are stored as individual files
+// in the configured directory. For ModeWAL, the existing WAL mechanism is
+// configured automatically.
+func OpenDB(cfg StorageConfig) (*DB, error) {
+	db := &DB{
+		tenants:     map[string]*tenantDB{},
+		mvcc:        NewMVCCManager(),
+		storageMode: cfg.Mode,
+		config:      &cfg,
+	}
+
+	switch cfg.Mode {
+	case ModeMemory:
+		mb := NewMemoryBackend(cfg.Path)
+		mb.setDB(db)
+		db.backend = mb
+		// If a path is given, try loading an existing GOB file.
+		if cfg.Path != "" {
+			if loaded, err := loadGOBInto(db, cfg.Path); err != nil {
+				return nil, fmt.Errorf("open memory db: %w", err)
+			} else if loaded {
+				// Update the back-pointer after loading
+				mb.setDB(db)
+			}
+		}
+
+	case ModeWAL:
+		if cfg.Path == "" {
+			return nil, fmt.Errorf("ModeWAL requires a Path")
+		}
+		// Load checkpoint if exists
+		if _, err := loadGOBInto(db, cfg.Path); err != nil {
+			return nil, fmt.Errorf("open wal db: %w", err)
+		}
+		// Attach WAL
+		walCfg := WALConfig{
+			Path:               cfg.Path,
+			CheckpointEvery:    cfg.CheckpointEvery,
+			CheckpointInterval: cfg.CheckpointInterval,
+		}
+		wal, err := OpenWAL(db, walCfg)
+		if err != nil {
+			return nil, fmt.Errorf("open wal: %w", err)
+		}
+		db.attachWAL(wal)
+
+	case ModeDisk:
+		if cfg.Path == "" {
+			return nil, fmt.Errorf("ModeDisk requires a Path")
+		}
+		backend, err := NewDiskBackend(cfg.Path, cfg.CompressFiles)
+		if err != nil {
+			return nil, fmt.Errorf("open disk db: %w", err)
+		}
+		db.backend = backend
+
+	case ModeIndex:
+		if cfg.Path == "" {
+			return nil, fmt.Errorf("ModeIndex requires a Path")
+		}
+		mem := cfg.MaxMemoryBytes
+		if mem <= 0 {
+			mem = 64 * 1024 * 1024 // 64 MB
+		}
+		backend, err := NewHybridBackend(cfg.Path, mem, cfg.CompressFiles, ModeIndex)
+		if err != nil {
+			return nil, fmt.Errorf("open index db: %w", err)
+		}
+		db.backend = backend
+
+	case ModeHybrid:
+		if cfg.Path == "" {
+			return nil, fmt.Errorf("ModeHybrid requires a Path")
+		}
+		mem := cfg.MaxMemoryBytes
+		if mem <= 0 {
+			mem = 256 * 1024 * 1024 // 256 MB
+		}
+		backend, err := NewHybridBackend(cfg.Path, mem, cfg.CompressFiles, ModeHybrid)
+		if err != nil {
+			return nil, fmt.Errorf("open hybrid db: %w", err)
+		}
+		db.backend = backend
+
+	default:
+		return nil, fmt.Errorf("unsupported storage mode: %v", cfg.Mode)
+	}
+
+	return db, nil
+}
+
+// loadGOBInto loads a GOB checkpoint file into an existing DB. It returns
+// true if data was actually loaded (file existed and was non-empty).
+func loadGOBInto(db *DB, filename string) (bool, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	defer f.Close()
+
+	var dump []diskTable
+	var r io.Reader = bufio.NewReader(f)
+	if strings.HasSuffix(strings.ToLower(filename), ".gz") {
+		gr, gzErr := gzip.NewReader(r)
+		if gzErr != nil {
+			return false, gzErr
+		}
+		defer gr.Close()
+		r = gr
+	}
+	dec := gob.NewDecoder(r)
+	if err := dec.Decode(&dump); err != nil {
+		if errors.Is(err, io.EOF) {
+			return false, nil
+		}
+		return false, err
+	}
+	for _, dt := range dump {
+		_ = db.Put(dt.Tenant, diskToTable(dt))
+	}
+	return len(dump) > 0, nil
 }
 
 // getTenant returns the tenantDB for the given tenant name, creating it
@@ -301,21 +443,40 @@ func (db *DB) getTenantRO(tn string) *tenantDB {
 }
 
 // Get returns a table by name for the given tenant.
+// When a StorageBackend is attached, tables not found in memory are loaded
+// from the backend on demand (lazy loading).
 func (db *DB) Get(tn, name string) (*Table, error) {
 	db.mu.RLock()
 	td := db.getTenantRO(tn)
 	db.mu.RUnlock()
-	if td == nil {
-		return nil, fmt.Errorf("no such table %q (tenant %q)", name, tn)
+	if td != nil {
+		if t, ok := td.tables[strings.ToLower(name)]; ok {
+			return t, nil
+		}
 	}
-	t, ok := td.tables[strings.ToLower(name)]
-	if !ok {
-		return nil, fmt.Errorf("no such table %q (tenant %q)", name, tn)
+
+	// Not in memory – try the backend.
+	if db.backend != nil {
+		t, err := db.backend.LoadTable(tn, name)
+		if err != nil {
+			return nil, fmt.Errorf("backend load %s/%s: %w", tn, name, err)
+		}
+		if t != nil {
+			// Cache in the in-memory tenants map.
+			db.mu.Lock()
+			db.getTenant(tn).tables[strings.ToLower(t.Name)] = t
+			db.mu.Unlock()
+			return t, nil
+		}
 	}
-	return t, nil
+
+	return nil, fmt.Errorf("no such table %q (tenant %q)", name, tn)
 }
 
 // Put adds a new table to the tenant; returns error if it already exists.
+// When a StorageBackend is attached, the table is also checked against the
+// backend to prevent duplicates, and optionally persisted immediately when
+// SyncOnMutate is configured.
 func (db *DB) Put(tn string, t *Table) error {
 	db.mu.Lock()
 	td := db.getTenant(tn)
@@ -324,27 +485,70 @@ func (db *DB) Put(tn string, t *Table) error {
 		db.mu.Unlock()
 		return fmt.Errorf("table %q already exists (tenant %q)", t.Name, tn)
 	}
+	// Also check the backend for tables that may be on disk but not loaded.
+	if db.backend != nil && db.backend.TableExists(tn, t.Name) {
+		db.mu.Unlock()
+		return fmt.Errorf("table %q already exists (tenant %q)", t.Name, tn)
+	}
 	td.tables[lc] = t
 	db.mu.Unlock()
+
+	// Persist to backend if configured.
+	if db.backend != nil {
+		if err := db.backend.SaveTable(tn, t); err != nil {
+			return fmt.Errorf("backend save %s/%s: %w", tn, t.Name, err)
+		}
+	}
 	return nil
 }
 
-// Drop removes a table from the tenant.
+// Drop removes a table from the tenant (and from the backend if attached).
 func (db *DB) Drop(tn, name string) error {
 	db.mu.Lock()
 	td := db.getTenant(tn)
 	lc := strings.ToLower(name)
-	if _, ok := td.tables[lc]; !ok {
+	_, inMemory := td.tables[lc]
+	onDisk := db.backend != nil && db.backend.TableExists(tn, name)
+	if !inMemory && !onDisk {
 		db.mu.Unlock()
 		return fmt.Errorf("no such table %q (tenant %q)", name, tn)
 	}
 	delete(td.tables, lc)
 	db.mu.Unlock()
+
+	if db.backend != nil && onDisk {
+		if err := db.backend.DeleteTable(tn, name); err != nil {
+			return fmt.Errorf("backend delete %s/%s: %w", tn, name, err)
+		}
+	}
 	return nil
 }
 
 // ListTables returns the tables in a tenant sorted by name.
+// When a StorageBackend is attached, tables that exist on disk but are not
+// currently loaded into memory are loaded on demand.
 func (db *DB) ListTables(tn string) []*Table {
+	// If a backend is attached, ensure we know about all tables on disk.
+	if db.backend != nil {
+		if diskNames, err := db.backend.ListTableNames(tn); err == nil {
+			for _, n := range diskNames {
+				lc := strings.ToLower(n)
+				db.mu.RLock()
+				td := db.getTenantRO(tn)
+				inMem := td != nil && td.tables[lc] != nil
+				db.mu.RUnlock()
+				if !inMem {
+					// Load from backend
+					if t, err := db.backend.LoadTable(tn, n); err == nil && t != nil {
+						db.mu.Lock()
+						db.getTenant(tn).tables[lc] = t
+						db.mu.Unlock()
+					}
+				}
+			}
+		}
+	}
+
 	db.mu.RLock()
 	td := db.getTenantRO(tn)
 	if td == nil || len(td.tables) == 0 {
@@ -843,7 +1047,222 @@ func (db *DB) upsertTable(tn string, t *Table) {
 	td.tables[strings.ToLower(t.Name)] = t
 }
 
-// OpenWAL ensures a WAL exists, replays committed records, and returns a
+// ───────────────────────────────── Backend integration ──────────────────────
+
+// Backend returns the attached StorageBackend (may be nil for pure in-memory
+// databases created with NewDB).
+func (db *DB) Backend() StorageBackend {
+	return db.backend
+}
+
+// SetBackend attaches a StorageBackend and sets the storage mode. This is
+// primarily used internally by OpenDB; calling it on a running database
+// should be done with care.
+func (db *DB) SetBackend(b StorageBackend) {
+	db.mu.Lock()
+	db.backend = b
+	if b != nil {
+		db.storageMode = b.Mode()
+	}
+	db.mu.Unlock()
+}
+
+// StorageMode returns the active storage mode.
+func (db *DB) StorageMode() StorageMode {
+	return db.storageMode
+}
+
+// ListTenants returns the names of all tenants that have at least one table.
+func (db *DB) ListTenants() []string {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	out := make([]string, 0, len(db.tenants))
+	for tn := range db.tenants {
+		out = append(out, tn)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Config returns the StorageConfig used to open this database.
+// Returns nil for databases created with NewDB().
+func (db *DB) Config() *StorageConfig {
+	return db.config
+}
+
+// Sync flushes all dirty in-memory tables to the storage backend. For
+// ModeMemory and ModeWAL this is a no-op (those modes use SaveToFile /
+// WAL checkpoints respectively). For ModeDisk, ModeHybrid, and ModeIndex,
+// tables whose version has changed since the last save are written to disk.
+func (db *DB) Sync() error {
+	if db.backend == nil {
+		return nil
+	}
+
+	// For disk/hybrid backends, save all in-memory tables that are dirty.
+	if db.storageMode == ModeDisk || db.storageMode == ModeHybrid || db.storageMode == ModeIndex {
+		db.mu.RLock()
+		type entry struct {
+			tenant string
+			table  *Table
+		}
+		var toSave []entry
+		for tn, tdb := range db.tenants {
+			for _, t := range tdb.tables {
+				if disk, ok := db.backend.(*DiskBackend); ok {
+					if disk.IsDirty(tn, t.Name, t.Version) {
+						toSave = append(toSave, entry{tn, t})
+					}
+				} else if hybrid, ok := db.backend.(*HybridBackend); ok {
+					if hybrid.Disk().IsDirty(tn, t.Name, t.Version) {
+						toSave = append(toSave, entry{tn, t})
+					}
+				} else {
+					toSave = append(toSave, entry{tn, t})
+				}
+			}
+		}
+		db.mu.RUnlock()
+
+		for _, e := range toSave {
+			if err := db.backend.SaveTable(e.tenant, e.table); err != nil {
+				return err
+			}
+		}
+	}
+
+	return db.backend.Sync()
+}
+
+// Close persists all data and releases resources. For ModeMemory with a
+// configured path, this saves a final GOB snapshot. For ModeDisk/ModeHybrid,
+// dirty tables are flushed. WAL and Advanced WAL resources are closed.
+func (db *DB) Close() error {
+	var firstErr error
+
+	// Sync dirty tables to backend.
+	if err := db.Sync(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+
+	// Close backend (may do its own final save).
+	if db.backend != nil {
+		if err := db.backend.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	// Close WAL resources.
+	if db.wal != nil {
+		if err := db.wal.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if db.advancedWAL != nil {
+		if err := db.advancedWAL.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	return firstErr
+}
+
+// Evict removes a table from the in-memory cache without deleting it from
+// the backend. This is only meaningful for disk-backed modes; in ModeMemory
+// the data would be lost. Returns an error if no backend is attached.
+func (db *DB) Evict(tenant, name string) error {
+	if db.backend == nil || db.storageMode == ModeMemory {
+		return fmt.Errorf("evict requires a disk-backed storage mode")
+	}
+
+	// Ensure the table is saved before evicting.
+	db.mu.RLock()
+	td := db.getTenantRO(tenant)
+	var t *Table
+	if td != nil {
+		t = td.tables[strings.ToLower(name)]
+	}
+	db.mu.RUnlock()
+
+	if t != nil {
+		if err := db.backend.SaveTable(tenant, t); err != nil {
+			return fmt.Errorf("evict save %s/%s: %w", tenant, name, err)
+		}
+		db.mu.Lock()
+		delete(db.getTenant(tenant).tables, strings.ToLower(name))
+		db.mu.Unlock()
+	}
+	return nil
+}
+
+// TableExists reports whether the named table exists, checking both in-memory
+// tables and the storage backend.
+func (db *DB) TableExists(tenant, name string) bool {
+	db.mu.RLock()
+	td := db.getTenantRO(tenant)
+	if td != nil {
+		if _, ok := td.tables[strings.ToLower(name)]; ok {
+			db.mu.RUnlock()
+			return true
+		}
+	}
+	db.mu.RUnlock()
+
+	if db.backend != nil {
+		return db.backend.TableExists(tenant, name)
+	}
+	return false
+}
+
+// SyncTable flushes a single table to the backend. This is called by the
+// engine after mutations when SyncOnMutate is enabled.
+func (db *DB) SyncTable(tenant string, t *Table) error {
+	if db.backend == nil {
+		return nil
+	}
+	return db.backend.SaveTable(tenant, t)
+}
+
+// BackendStats returns statistics from the storage backend. Returns a
+// zero-value BackendStats if no backend is attached.
+func (db *DB) BackendStats() BackendStats {
+	if db.backend == nil {
+		return BackendStats{Mode: ModeMemory}
+	}
+	return db.backend.Stats()
+}
+
+// MigrateToBackend copies all in-memory tables to the given backend and
+// attaches it. This enables migrating a ModeMemory database to ModeDisk
+// or ModeHybrid at runtime.
+func (db *DB) MigrateToBackend(b StorageBackend) error {
+	db.mu.RLock()
+	type entry struct {
+		tenant string
+		table  *Table
+	}
+	var tables []entry
+	for tn, tdb := range db.tenants {
+		for _, t := range tdb.tables {
+			tables = append(tables, entry{tn, t})
+		}
+	}
+	db.mu.RUnlock()
+
+	for _, e := range tables {
+		if err := b.SaveTable(e.tenant, e.table); err != nil {
+			return fmt.Errorf("migrate %s/%s: %w", e.tenant, e.table.Name, err)
+		}
+	}
+
+	db.mu.Lock()
+	db.backend = b
+	db.storageMode = b.Mode()
+	db.mu.Unlock()
+
+	return nil
+}
+
 // ready-to-use manager. It attaches no WAL when Path is empty.
 func OpenWAL(db *DB, cfg WALConfig) (*WALManager, error) {
 	if cfg.Path == "" {

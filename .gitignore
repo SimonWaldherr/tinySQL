@@ -33,3 +33,5 @@ osm_import
 cover_*
 libtinysqlodbc.so
 demo
+/wikirag
+cmd.zip

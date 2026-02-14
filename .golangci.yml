@@ -1,152 +1,100 @@
-# golangci-lint configuration
-configVersion: 2
-# https://golangci-lint.run/usage/configuration/
+# golangci-lint v2 configuration
+version: "2"
 
 run:
   timeout: 5m
-  issues-exit-code: 1
-  tests: true
-  skip-dirs:
-    - vendor
-  skip-files:
-    - ".*\\.pb\\.go$"
-    - ".*_generated\\.go$"
 
 output:
-  format: colored-line-number
+  formats:
+    colored-line-number: {}
   print-issued-lines: true
   print-linter-name: true
 
-linters-settings:
-  errcheck:
-    check-type-assertions: true
-    check-blank: true
-  
-  govet:
-    check-shadowing: true
-  
-  gocyclo:
-    min-complexity: 30
-  
-  maligned:
-    suggest-new: true
-  
-  dupl:
-    threshold: 100
-  
-  goconst:
-    min-len: 3
-    min-occurrences: 3
-  
-  misspell:
-    locale: US
-  
-  lll:
-    line-length: 120
-  
-  goimports:
-    local-prefixes: github.com/SimonWaldherr/tinySQL
-  
-  gocritic:
-    enabled-tags:
-      - performance
-      - style
-      - experimental
-    disabled-checks:
-      - wrapperFunc
-      - commentedOutCode
-  
-  funlen:
-    lines: 100
-    statements: 50
-  
-  godox:
-    keywords:
-      - TODO
-      - BUG
-      - FIXME
-      - NOTE
-      - HACK
-
 linters:
+  default: none
   enable:
     - bodyclose
-    - deadcode
-    - depguard
     - dogsled
     - dupl
     - errcheck
-    - funlen
-    - gocognit
+    - copyloopvar
     - gocognit
     - goconst
     - gocritic
     - gocyclo
     - godox
-    - gofmt
-    - goimports
-    - golint
-    - gomnd
     - goprintffuncname
     - gosec
-    - gosimple
     - govet
     - ineffassign
-    - interfacer
     - lll
-    - maligned
     - misspell
     - nakedret
     - prealloc
-    - scopelint
     - staticcheck
-    - structcheck
-    - stylecheck
-    - typecheck
     - unconvert
     - unparam
     - unused
-    - varcheck
     - whitespace
-  
-  disable:
-    - gochecknoglobals  # Allow globals for configuration
-    - gochecknoinits    # Allow init functions
-    - gomnd             # Allow magic numbers in tests
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+    govet:
+      enable:
+        - shadow
+    gocyclo:
+      min-complexity: 30
+    dupl:
+      threshold: 100
+    goconst:
+      min-len: 3
+      min-occurrences: 3
+    misspell:
+      locale: US
+    lll:
+      line-length: 120
+    gocritic:
+      enabled-tags:
+        - performance
+        - style
+        - experimental
+      disabled-checks:
+        - wrapperFunc
+        - commentedOutCode
+    godox:
+      keywords:
+        - TODO
+        - BUG
+        - FIXME
+        - NOTE
+        - HACK
 
 issues:
-  exclude-use-default: false
+  exclude-dirs:
+    - vendor
   exclude:
-    # Exclude some linters from running on tests files
     - "should have a package comment"
-    - "don't use an underscore in package name"
-  
   exclude-rules:
-    # Exclude some linters from running on tests files
     - path: _test\.go
       linters:
         - gocyclo
         - errcheck
         - dupl
         - gosec
-        - funlen
-    
-    # Exclude example files from certain checks
     - path: example.*\.go
       linters:
         - errcheck
         - gosec
-    
-    # Exclude WASM files from certain checks
-    - path: cmd/wasm.*\.go
-      linters:
-        - gochecknoglobals
-        - deadcode
-    
-    # Allow longer lines in generated files
-    - path: .*\.pb\.go
-      linters:
-        - lll
-
   max-issues-per-linter: 0
   max-same-issues: 0
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/SimonWaldherr/tinySQL

@@ -308,11 +308,11 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 		if len(vals) != expected {
 			return nil, fmt.Errorf("INSERT expects %d values", expected)
 		}
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, err
+		}
 		row := make([]any, expected)
 		for i, e := range vals {
-			if err := checkCtx(env.ctx); err != nil {
-				return nil, err
-			}
 			v, err := evalExpr(env, e, tmp)
 			if err != nil {
 				return nil, err
@@ -343,14 +343,14 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 		if len(vals) != len(s.Cols) {
 			return nil, fmt.Errorf("INSERT column/value mismatch")
 		}
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, err
+		}
 		row := make([]any, len(t.Cols))
 		for i := range row {
 			row[i] = nil
 		}
 		for i, idx := range colIdx {
-			if err := checkCtx(env.ctx); err != nil {
-				return nil, err
-			}
 			v, err := evalExpr(env, vals[i], tmp)
 			if err != nil {
 				return nil, err
@@ -547,20 +547,46 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 			name := strings.ToLower(parts[1])
 			switch name {
 			case "tables":
-				tabs := env.db.Catalog().GetTables()
-				leftRows = make([]Row, len(tabs))
-				for i, t := range tabs {
-					leftRows[i] = make(Row)
-					putVal(leftRows[i], "schema", t.Schema)
-					putVal(leftRows[i], "name", t.Name)
-					putVal(leftRows[i], "type", t.Type)
-					putVal(leftRows[i], "row_count", t.RowCount)
-					putVal(leftRows[i], "created_at", t.CreatedAt)
-					putVal(leftRows[i], "updated_at", t.UpdatedAt)
-					if s.From.Alias != "" {
-						putVal(leftRows[i], s.From.Alias+".schema", t.Schema)
-						putVal(leftRows[i], s.From.Alias+".name", t.Name)
+				// Auto-populate from real tables, then merge catalog-only entries.
+				leftRows = sysTablesRows(env)
+				catTabs := env.db.Catalog().GetTables()
+				catMap := make(map[string]*storage.CatalogTable, len(catTabs))
+				for _, ct := range catTabs {
+					catMap[strings.ToLower(ct.Name)] = ct
+				}
+				// Track which real tables we've seen.
+				seen := make(map[string]bool, len(leftRows))
+				for _, r := range leftRows {
+					tName, _ := r["name"].(string)
+					seen[strings.ToLower(tName)] = true
+					if ct, ok := catMap[strings.ToLower(tName)]; ok {
+						putVal(r, "schema", ct.Schema)
+						putVal(r, "type", ct.Type)
+						putVal(r, "row_count", ct.RowCount)
+						putVal(r, "created_at", ct.CreatedAt)
+						putVal(r, "updated_at", ct.UpdatedAt)
+					} else {
+						putVal(r, "schema", "main")
+						putVal(r, "type", "TABLE")
 					}
+				}
+				// Add catalog-only entries that aren't real tables yet.
+				for _, ct := range catTabs {
+					if seen[strings.ToLower(ct.Name)] {
+						continue
+					}
+					r := make(Row)
+					putVal(r, "schema", ct.Schema)
+					putVal(r, "name", ct.Name)
+					putVal(r, "type", ct.Type)
+					putVal(r, "row_count", ct.RowCount)
+					putVal(r, "created_at", ct.CreatedAt)
+					putVal(r, "updated_at", ct.UpdatedAt)
+					if s.From.Alias != "" {
+						putVal(r, s.From.Alias+".schema", ct.Schema)
+						putVal(r, s.From.Alias+".name", ct.Name)
+					}
+					leftRows = append(leftRows, r)
 				}
 			case "columns":
 				cols := env.db.Catalog().GetAllColumns()
@@ -583,18 +609,45 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 					}
 				}
 			case "functions":
-				fns := env.db.Catalog().GetFunctions()
-				leftRows = make([]Row, len(fns))
-				for i, f := range fns {
-					leftRows[i] = make(Row)
-					putVal(leftRows[i], "schema", f.Schema)
-					putVal(leftRows[i], "name", f.Name)
-					putVal(leftRows[i], "function_type", f.FunctionType)
-					putVal(leftRows[i], "arg_types", f.ArgTypes)
-					putVal(leftRows[i], "return_type", f.ReturnType)
-					putVal(leftRows[i], "language", f.Language)
-					putVal(leftRows[i], "is_deterministic", f.IsDeterministic)
-					putVal(leftRows[i], "description", f.Description)
+				// Auto-populate from real function registry, then overlay catalog entries.
+				leftRows = sysFunctionsRows()
+				catFns := env.db.Catalog().GetFunctions()
+				catMap := make(map[string]*storage.CatalogFunction, len(catFns))
+				for _, cf := range catFns {
+					catMap[strings.ToUpper(cf.Name)] = cf
+				}
+				// Track seen function names.
+				seen := make(map[string]bool, len(leftRows))
+				for _, r := range leftRows {
+					name, _ := r["name"].(string)
+					seen[strings.ToUpper(name)] = true
+					if cf, ok := catMap[strings.ToUpper(name)]; ok {
+						putVal(r, "schema", cf.Schema)
+						if cf.Description != "" {
+							putVal(r, "description", cf.Description)
+						}
+						if cf.ReturnType != "" {
+							putVal(r, "return_type", cf.ReturnType)
+						}
+						if cf.IsDeterministic {
+							putVal(r, "is_deterministic", cf.IsDeterministic)
+						}
+					}
+				}
+				// Add catalog-only functions not in the builtin registry.
+				for _, cf := range catFns {
+					if seen[strings.ToUpper(cf.Name)] {
+						continue
+					}
+					r := make(Row)
+					putVal(r, "schema", cf.Schema)
+					putVal(r, "name", cf.Name)
+					putVal(r, "function_type", cf.FunctionType)
+					putVal(r, "return_type", cf.ReturnType)
+					putVal(r, "language", cf.Language)
+					putVal(r, "is_deterministic", cf.IsDeterministic)
+					putVal(r, "description", cf.Description)
+					leftRows = append(leftRows, r)
 				}
 			case "jobs":
 				jobs := env.db.Catalog().ListJobs()
@@ -624,6 +677,30 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 				}
 			default:
 				return nil, fmt.Errorf("unknown catalog table: %s", name)
+			}
+		}
+
+		// Handle virtual sys.* tables
+		if leftRows == nil && strings.HasPrefix(strings.ToLower(s.From.Table), "sys.") {
+			parts := strings.SplitN(s.From.Table, ".", 2)
+			if len(parts) != 2 {
+				return nil, fmt.Errorf("invalid sys reference: %s", s.From.Table)
+			}
+			name := strings.ToLower(parts[1])
+			sysRows, err := resolveSysTable(env, name)
+			if err != nil {
+				return nil, err
+			}
+			leftRows = sysRows
+			// Apply alias if present.
+			if s.From.Alias != "" {
+				for _, r := range leftRows {
+					for k, v := range r {
+						if !strings.Contains(k, ".") {
+							r[s.From.Alias+"."+k] = v
+						}
+					}
+				}
 			}
 		}
 
