@@ -6,11 +6,19 @@ let currentResults = null;
 let wasmApi = {
     importFile: null,
     executeQuery: null,
+    executeMulti: null,
     clearDatabase: null,
+    listTables: null,
+    exportResults: null,
+    getTableSchema: null,
 };
 
 // Client-side pending tables (used when WASM not ready)
 const pendingClientTables = {};
+
+// Query history (newest first, max 50)
+const MAX_HISTORY = 50;
+let queryHistory = JSON.parse(localStorage.getItem('tsql_history') || '[]');
 
 // Initialize WASM
 async function initWasm() {
@@ -29,17 +37,19 @@ async function initWasm() {
         // Capture WASM API references safely
         wasmApi.importFile = window.importFile;
         wasmApi.executeQuery = window.executeQuery;
+        wasmApi.executeMulti = window.executeMulti;
         wasmApi.clearDatabase = window.clearDatabase;
+        wasmApi.listTables = window.listTables;
+        wasmApi.exportResults = window.exportResults;
+        wasmApi.getTableSchema = window.getTableSchema;
 
-        // Check if functions are available
-        console.log("Available WASM functions:", {
-            importFile: typeof wasmApi.importFile,
-            executeQuery: typeof wasmApi.executeQuery,
-            clearDatabase: typeof wasmApi.clearDatabase
-        });
+        console.log("Available WASM functions:", Object.fromEntries(
+            Object.entries(wasmApi).map(([k,v]) => [k, typeof v])
+        ));
         
         updateStatus("Ready");
         document.querySelector('.status-indicator').classList.add('ready');
+        document.getElementById('executeBtn').disabled = false;
         // If any tables were registered client-side before WASM was ready,
         // import them now into the WASM-backed database so queries will work.
         if (Object.keys(pendingClientTables).length > 0) {
@@ -71,6 +81,7 @@ async function initWasm() {
     } catch (err) {
         console.error("Failed to load WASM:", err);
         updateStatus("Failed to load WASM");
+        document.querySelector('.status-indicator').classList.add('failed');
     }
 }
 
@@ -120,9 +131,7 @@ async function loadDemoTable(tableName) {
     
     updateStatus(`Loading demo table: ${tableName}...`);
 
-        // If WASM is available, import via WASM; otherwise register client-side table
         if (wasmReady && typeof wasmApi.importFile === 'function') {
-            updateStatus(`Loading demo table into WASM: ${tableName}...`);
             try {
                 const result = wasmApi.importFile(`${tableName}.json`, jsonContent, tableName);
                 if (result && result.success) {
@@ -139,11 +148,9 @@ async function loadDemoTable(tableName) {
                     }
                     renderTables();
                     updateStatus(`Demo table "${tableName}" loaded: ${result.rowsImported} rows`);
-                    // Reveal demo queries when demo tables are loaded
                     if (tableName === 'sales' || tableName === 'logistics') {
                         showDemoQueries();
                     }
-                    // Set a relevant query
                     const editor = document.getElementById('queryEditor');
                     if (tableName === 'sales') {
                         editor.value = `SELECT customer_name, product, quantity * unit_price AS total_value\nFROM sales\nORDER BY total_value DESC\nLIMIT 10`;
@@ -160,17 +167,14 @@ async function loadDemoTable(tableName) {
                 updateStatus('Demo load failed');
             }
         } else {
-            // WASM not ready: register client-side so user can see tables in UI
             registerClientTable(tableName, demo.data);
-            // Prefill query editor for demo exploration
             const editor = document.getElementById('queryEditor');
             if (tableName === 'sales') {
                 editor.value = `SELECT customer_name, product, quantity * unit_price AS total_value\nFROM sales\nORDER BY total_value DESC\nLIMIT 10`;
             } else if (tableName === 'logistics') {
                 editor.value = `SELECT carrier, COUNT(*) AS shipment_count, AVG(shipping_cost) AS avg_cost\nFROM logistics\nGROUP BY carrier\nORDER BY shipment_count DESC`;
             }
-            // Inform user that WASM is required for executing queries
-            updateStatus(`Registered demo table "${tableName}" locally. WASM not ready yet; queries will run once WASM is initialized.`);
+            updateStatus(`Registered demo table "${tableName}" locally. Queries will run once WASM is initialized.`);
         }
     
 }
@@ -192,12 +196,12 @@ async function loadAllDemos() {
 document.addEventListener('DOMContentLoaded', () => {
     initWasm();
     setupDragDrop();
+    renderHistory();
     
     // Setup demo buttons
     const loadAllDemosBtn = document.getElementById('loadAllDemosBtn');
     if (loadAllDemosBtn) {
         loadAllDemosBtn.addEventListener('click', async () => {
-            // hide button immediately
             loadAllDemosBtn.style.display = 'none';
             try {
                 await loadAllDemos();
@@ -332,12 +336,7 @@ async function importSingleFile(file) {
                 const executeBtn = document.getElementById('executeBtn');
                 if (executeBtn) executeBtn.disabled = false;
             } else {
-                const errorMsg = result.error || 'Unknown import error';
-                if (/Unsupported file format: \.xml/i.test(errorMsg)) {
-                    alert('XML is not supported yet. Please convert to CSV/JSON for now. We can add XML support next.');
-                } else {
-                    alert(`Import failed: ${errorMsg}`);
-                }
+                alert(`Import failed: ${result.error || 'Unknown error'}`);
                 updateStatus('Import failed');
                 console.error('Import failed:', result);
             }
@@ -470,8 +469,10 @@ function showDemoQueries() {
 // Render tables in sidebar
 function renderTables() {
     const tableList = document.getElementById('tableList');
-    
-    if (currentTables.length === 0) {
+    const virtuals = window._virtualTables || [];
+    const hasAny = currentTables.length > 0 || virtuals.length > 0;
+
+    if (!hasAny) {
         tableList.innerHTML = `
             <div class="empty-state">
                 <div class="empty-state-icon">📊</div>
@@ -482,31 +483,106 @@ function renderTables() {
         return;
     }
 
-    tableList.innerHTML = currentTables.map(table => {
-        const isPending = Object.prototype.hasOwnProperty.call(pendingClientTables, table.name);
-        const badgeHtml = isPending
-            ? `<span class="table-badge pending">pending</span>`
-            : `<span class="table-badge imported">imported</span>`;
+    let html = '';
 
-        return `
-        <div class="table-item" onclick="selectTable('${table.name}')">
-            <div class="table-name">
-                ${table.name} ${badgeHtml}
-                <span class="table-remove" onclick="event.stopPropagation(); removeTable('${table.name}')" title="Remove table">✕</span>
-            </div>
-            <div class="table-meta">
-                <span>📝 ${table.rowCount} rows</span>
-                <span>📁 ${table.columns.length} cols</span>
-            </div>
-            ${table.columns.length > 0 ? `
-                <div class="table-columns">
-                    <div class="table-columns-label">Columns:</div>
-                    ${table.columns.map(col => `<span class="column-tag">${col}</span>`).join('')}
+    // ── User tables ──────────────────────────────────────────────────────
+    if (currentTables.length > 0) {
+        html += `<div class="table-section-label">User Tables (${currentTables.length})</div>`;
+        html += currentTables.map(table => {
+            const isPending = Object.prototype.hasOwnProperty.call(pendingClientTables, table.name);
+            const badgeHtml = isPending
+                ? `<span class="table-badge pending">pending</span>`
+                : `<span class="table-badge imported">imported</span>`;
+
+            return `
+            <div class="table-item" onclick="selectTable('${escapeHtml(table.name)}')">
+                <div class="table-name">
+                    ${escapeHtml(table.name)} ${badgeHtml}
+                    <span class="table-remove" onclick="event.stopPropagation(); removeTable('${escapeHtml(table.name)}')" title="Remove table">✕</span>
+                    <span class="table-info-btn" onclick="event.stopPropagation(); showTableInfo('${escapeHtml(table.name)}')" title="Show schema">ℹ</span>
                 </div>
-            ` : ''}
-        </div>
-    `;
-    }).join('');
+                <div class="table-meta">
+                    <span>📝 ${table.rowCount} rows</span>
+                    <span>📁 ${table.columns.length} cols</span>
+                </div>
+                ${table.columns.length > 0 ? `
+                    <div class="table-columns">
+                        <div class="table-columns-label">Columns:</div>
+                        ${table.columns.map(col => `<span class="column-tag">${escapeHtml(col)}</span>`).join('')}
+                    </div>
+                ` : ''}
+            </div>
+        `;
+        }).join('');
+    }
+
+    // ── Virtual tables ───────────────────────────────────────────────────
+    if (virtuals.length > 0) {
+        const collapsed = window._virtualCollapsed !== false;
+        html += `
+            <div class="table-section-label virtual-toggle" onclick="toggleVirtualTables()">
+                <span>${collapsed ? '▶' : '▼'} Virtual Tables (${virtuals.length})</span>
+            </div>`;
+        if (!collapsed) {
+            html += virtuals.map(vt => `
+                <div class="table-item virtual-table-item" onclick="selectTable('${escapeHtml(vt.name)}')">
+                    <div class="table-name">
+                        ${escapeHtml(vt.name)}
+                        <span class="table-badge virtual">virtual</span>
+                        <span class="table-info-btn" onclick="event.stopPropagation(); showTableInfo('${escapeHtml(vt.name)}')" title="Show schema">ℹ</span>
+                    </div>
+                    <div class="table-meta"><span>computed at query time</span></div>
+                </div>
+            `).join('');
+        }
+    }
+
+    tableList.innerHTML = html;
+}
+
+// Toggle virtual table section collapsed state
+function toggleVirtualTables() {
+    window._virtualCollapsed = !(window._virtualCollapsed !== false);
+    renderTables();
+}
+
+// Show schema / info panel for a table (real or virtual)
+function showTableInfo(tableName) {
+    if (typeof wasmApi.getTableSchema !== 'function') {
+        alert('Schema inspection requires WASM to be ready');
+        return;
+    }
+    const info = wasmApi.getTableSchema(tableName);
+    if (!info || !info.success) {
+        alert(info?.error || 'Could not load schema');
+        return;
+    }
+
+    const cols = Array.isArray(info.columns) ? info.columns : [];
+    const isVirt = info.virtual === true;
+    const rowInfo = isVirt ? 'dynamic' : String(info.rows);
+
+    const panel = document.getElementById('schemaPanel');
+    if (panel) {
+        panel.innerHTML = `
+            <div class="schema-panel-header">
+                <strong>${escapeHtml(tableName)}</strong>
+                ${isVirt ? '<span class="table-badge virtual">virtual</span>' : ''}
+                <button onclick="document.getElementById('schemaPanel').classList.add('hidden')" class="schema-close">✕</button>
+            </div>
+            <div class="schema-meta">${rowInfo} rows · ${cols.length} columns</div>
+            <table class="schema-table">
+                <thead><tr><th>Column</th><th>Type</th></tr></thead>
+                <tbody>
+                    ${cols.map(c => `<tr><td>${escapeHtml(c.name)}</td><td class="schema-type">${escapeHtml(c.type)}</td></tr>`).join('')}
+                </tbody>
+            </table>
+            <div class="schema-actions">
+                <button onclick="setQuery('SELECT * FROM ${escapeHtml(tableName)} LIMIT 100'); document.getElementById('schemaPanel').classList.add('hidden');">SELECT *</button>
+            </div>
+        `;
+        panel.classList.remove('hidden');
+    }
 }
 
 // Remove table
@@ -589,21 +665,24 @@ async function onExecuteClick() {
     const resultsContainer = document.getElementById('resultsContainer');
     
     executeBtn.disabled = true;
-    executeBtn.innerHTML = '<span class="spinner"></span> Executing...';
+    executeBtn.innerHTML = '<span class="spinner"></span> Running…';
     setOpenVanillaGridEnabled(false);
     
-    updateStatus('Executing query...');
+    updateStatus('Executing query…');
 
     try {
         if (typeof wasmApi.executeQuery !== 'function') {
             throw new Error('WASM executeQuery function not available');
         }
 
-        console.log('Executing SQL:', query);
         const startTime = performance.now();
-        const result = executeQuery_wasm(query);
-        console.log('WASM executeQuery result:', result);
-        const duration = ((performance.now() - startTime) / 1000).toFixed(3) + 's';
+        // Use executeMulti if available and query contains semicolons
+        const hasMulti = query.includes(';') && typeof wasmApi.executeMulti === 'function';
+        const result = hasMulti ? wasmApi.executeMulti(query) : wasmApi.executeQuery(query);
+        const wallMs = performance.now() - startTime;
+        const duration = result?.durationMs != null
+            ? result.durationMs.toFixed(2) + ' ms'
+            : wallMs.toFixed(1) + ' ms';
 
         if (result && typeof result === 'object' && result.success) {
             const cols = Array.isArray(result.columns) ? result.columns.map(c => String(c)) : [];
@@ -615,7 +694,8 @@ async function onExecuteClick() {
                 duration: duration
             };
             renderResults(currentResults);
-            updateStatus(`Query completed: ${currentResults.rowCount} rows in ${duration}`);
+            updateStatus(`Query completed: ${currentResults.rowCount} rows in ${duration}${result.statementsRun > 1 ? ` (${result.statementsRun} statements)` : ''}`);
+            pushHistory(query, duration, rows.length);
         } else {
             const errMsg = result && result.error ? result.error : 'Unknown error';
             resultsContainer.innerHTML = `
@@ -626,6 +706,7 @@ async function onExecuteClick() {
             window.clearVanillaGrid?.();
             setOpenVanillaGridEnabled(false);
             updateStatus('Query failed');
+            pushHistory(query, '0 ms', 'err');
         }
     } catch (error) {
         resultsContainer.innerHTML = `
@@ -672,19 +753,23 @@ function renderResults(data) {
             </div>
             <div class="results-actions">
                 <button id="openVanillaGridBtn" onclick="openInVanillaGrid()" disabled>Open in VanillaGrid</button>
-                <button onclick="exportCSV()">Export CSV</button>
-                <button onclick="exportJSON()">Export JSON</button>
+                <button onclick="doExport('csv')">Export CSV</button>
+                <button onclick="doExport('json')">Export JSON</button>
+                <button onclick="doExport('xml')">Export XML</button>
             </div>
         </div>
+        <div class="result-table-wrap">
         <table class="result-table">
             <thead>
                 <tr>
+                    <th class="row-num-col">#</th>
                     ${data.columns.map(col => `<th>${escapeHtml(col)}</th>`).join('')}
                 </tr>
             </thead>
             <tbody>
-                ${data.rows.map(row => `
+                ${data.rows.map((row, idx) => `
                     <tr>
+                        <td class="row-num-col">${idx + 1}</td>
                         ${data.columns.map(col => {
                             const value = row[col];
                             return formatCell(value);
@@ -693,6 +778,7 @@ function renderResults(data) {
                 `).join('')}
             </tbody>
         </table>
+        </div>
     `;
 
     resultsContainer.innerHTML = tableHtml;
@@ -723,6 +809,49 @@ function showUploadDialog() {
 
 // Load tables (for refresh button)
 function loadTables() {
+    if (typeof wasmApi.listTables === 'function') {
+        try {
+            const info = wasmApi.listTables();
+            if (info && Array.isArray(info.tables)) {
+                // Separate user tables from virtual tables
+                const userTbls = info.tables.filter(t => t.kind !== 'virtual');
+                const virtTbls = info.tables.filter(t => t.kind === 'virtual');
+
+                // Merge user tables into currentTables (keep pending status)
+                userTbls.forEach(t => {
+                    const existing = currentTables.find(x => x.name === t.name);
+                    if (!existing) {
+                        currentTables.push({
+                            name: t.name,
+                            rowCount: t.rows,
+                            columns: Array.isArray(t.columns)
+                                ? t.columns.map(c => typeof c === 'object' ? c.name : c)
+                                : [],
+                            columnTypes: Array.isArray(t.columns)
+                                ? t.columns.filter(c => typeof c === 'object')
+                                : [],
+                            kind: 'table',
+                        });
+                    } else {
+                        existing.rowCount = t.rows;
+                        existing.kind = 'table';
+                    }
+                });
+
+                // Store virtual tables separately
+                window._virtualTables = virtTbls.map(t => ({
+                    name: t.name,
+                    kind: 'virtual',
+                    rowCount: -1,
+                    columns: [],
+                }));
+
+                renderTables();
+                updateStatus(`${userTbls.length} table(s), ${virtTbls.length} virtual`);
+                return;
+            }
+        } catch (e) { console.warn('listTables fallback:', e); }
+    }
     renderTables();
 }
 
@@ -744,6 +873,29 @@ function openInVanillaGrid() {
         return;
     }
     window.renderVanillaGrid?.(currentResults);
+}
+
+// Unified export dispatcher – tries WASM-side first, falls back to client-side
+function doExport(format) {
+    if (!currentResults || !currentResults.rows || currentResults.rows.length === 0) {
+        alert('No results to export');
+        return;
+    }
+    // Try WASM-side exporter
+    if (typeof wasmApi.exportResults === 'function') {
+        try {
+            const res = wasmApi.exportResults(format);
+            if (res && res.success && res.data) {
+                downloadFile(res.data, `query_results.${format}`, res.mime || 'application/octet-stream');
+                return;
+            }
+        } catch (_) { /* fall through */ }
+    }
+    // Client-side fallback
+    if (format === 'csv') exportCSV();
+    else if (format === 'json') exportJSON();
+    else if (format === 'xml') exportXML();
+    else alert('Unsupported export format: ' + format);
 }
 
 // Export to CSV
@@ -784,6 +936,25 @@ function exportJSON() {
     downloadFile(json, 'query_results.json', 'application/json');
 }
 
+// Export to XML (client-side fallback)
+function exportXML() {
+    if (!currentResults || !currentResults.rows || currentResults.rows.length === 0) {
+        alert('No results to export');
+        return;
+    }
+    let xml = '<?xml version="1.0" encoding="UTF-8"?>\n<results>\n';
+    currentResults.rows.forEach(row => {
+        xml += '  <row>\n';
+        currentResults.columns.forEach(col => {
+            const val = row[col];
+            xml += `    <${col}>${escapeXml(val == null ? '' : String(val))}</${col}>\n`;
+        });
+        xml += '  </row>\n';
+    });
+    xml += '</results>\n';
+    downloadFile(xml, 'query_results.xml', 'application/xml');
+}
+
 // Download file helper
 function downloadFile(content, filename, mimeType) {
     const blob = new Blob([content], { type: mimeType });
@@ -802,9 +973,58 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-// Wrapper function for WASM executeQuery
-function executeQuery_wasm(query) {
-    return wasmApi.executeQuery(query);
+// Escape XML special chars
+function escapeXml(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;');
+}
+
+// ----- Query History -----
+function pushHistory(sql, duration, rows) {
+    queryHistory.unshift({ sql, duration, rows, ts: Date.now() });
+    if (queryHistory.length > MAX_HISTORY) queryHistory.length = MAX_HISTORY;
+    try { localStorage.setItem('tinySQL_history', JSON.stringify(queryHistory)); } catch (_) {}
+    renderHistory();
+}
+
+function clearHistory() {
+    queryHistory.length = 0;
+    try { localStorage.removeItem('tinySQL_history'); } catch (_) {}
+    renderHistory();
+}
+
+function renderHistory() {
+    const panel = document.getElementById('historyList');
+    if (!panel) return;
+    if (queryHistory.length === 0) {
+        panel.innerHTML = '<div class="empty-state-text">No queries yet</div>';
+        return;
+    }
+    panel.innerHTML = queryHistory.map((h, i) =>
+        `<div class="history-item" onclick="recallHistory(${i})" title="${escapeHtml(h.sql)}">
+            <div class="history-sql">${escapeHtml(h.sql.length > 80 ? h.sql.slice(0,77)+'…' : h.sql)}</div>
+            <div class="history-meta">${h.rows} rows · ${h.duration} · ${timeAgo(h.ts)}</div>
+        </div>`
+    ).join('');
+}
+
+function recallHistory(idx) {
+    const h = queryHistory[idx];
+    if (h) {
+        document.getElementById('queryEditor').value = h.sql;
+    }
+}
+
+function timeAgo(ts) {
+    const sec = Math.floor((Date.now() - ts) / 1000);
+    if (sec < 60) return 'just now';
+    if (sec < 3600) return Math.floor(sec/60) + 'm ago';
+    if (sec < 86400) return Math.floor(sec/3600) + 'h ago';
+    return Math.floor(sec/86400) + 'd ago';
+}
+
+function toggleHistory() {
+    const panel = document.getElementById('historyPanel');
+    if (panel) panel.classList.toggle('hidden');
 }
 
 // Keyboard shortcuts
@@ -825,6 +1045,20 @@ document.addEventListener('DOMContentLoaded', () => {
                 const end = e.target.selectionEnd;
                 e.target.value = e.target.value.substring(0, start) + '  ' + e.target.value.substring(end);
                 e.target.selectionStart = e.target.selectionEnd = start + 2;
+            }
+
+            // ArrowUp in empty editor recalls last query
+            if (e.key === 'ArrowUp' && editor.value.trim() === '' && queryHistory.length > 0) {
+                e.preventDefault();
+                editor.value = queryHistory[0].sql;
+            }
+
+            // Ctrl/Cmd + Shift + F to format SQL
+            if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'F') {
+                e.preventDefault();
+                if (typeof formatSQL === 'function') {
+                    editor.value = formatSQL(editor.value);
+                }
             }
         });
     }

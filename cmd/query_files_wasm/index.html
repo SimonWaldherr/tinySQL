@@ -595,6 +595,228 @@
         ::-webkit-scrollbar-thumb:hover {
             background: #555;
         }
+
+        /* Row number column */
+        .row-num-col {
+            width: 40px;
+            min-width: 40px;
+            max-width: 56px;
+            text-align: right;
+            color: #666 !important;
+            font-size: 11px !important;
+            user-select: none;
+        }
+
+        /* Scrollable table wrapper */
+        .result-table-wrap {
+            overflow: auto;
+            max-height: 60vh;
+            border-radius: 4px;
+        }
+
+        /* History panel */
+        .history-section {
+            padding: 12px;
+            border-top: 1px solid #3e3e42;
+            background: #252526;
+        }
+
+        .history-title {
+            font-size: 12px;
+            font-weight: 600;
+            color: #999;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .history-title button {
+            background: transparent;
+            border: none;
+            color: #888;
+            cursor: pointer;
+            font-size: 11px;
+            padding: 2px 6px;
+            border-radius: 3px;
+        }
+
+        .history-title button:hover {
+            background: #3e3e42;
+            color: #ccc;
+        }
+
+        .history-item {
+            padding: 6px 8px;
+            margin-bottom: 4px;
+            background: #2d2d30;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .history-item:hover {
+            background: #3e3e42;
+        }
+
+        .history-sql {
+            font-family: 'Consolas', monospace;
+            font-size: 11px;
+            color: #d4d4d4;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .history-meta {
+            font-size: 10px;
+            color: #888;
+            margin-top: 2px;
+        }
+
+        /* Table section labels */
+        .table-section-label {
+            padding: 8px 12px 4px;
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            color: #888;
+            letter-spacing: 0.5px;
+        }
+
+        .virtual-toggle {
+            cursor: pointer;
+            user-select: none;
+            transition: color 0.2s;
+        }
+
+        .virtual-toggle:hover {
+            color: #ccc;
+        }
+
+        /* Virtual table styling */
+        .virtual-table-item {
+            opacity: 0.75;
+        }
+
+        .virtual-table-item:hover {
+            opacity: 1;
+        }
+
+        .table-badge.virtual {
+            background: #1a6b8a;
+        }
+
+        /* Info button in table list */
+        .table-info-btn {
+            display: inline-block;
+            margin-left: 4px;
+            padding: 1px 5px;
+            font-size: 11px;
+            border-radius: 3px;
+            cursor: pointer;
+            opacity: 0.5;
+            transition: opacity 0.2s;
+        }
+
+        .table-info-btn:hover {
+            opacity: 1;
+            background: #3e3e42;
+        }
+
+        /* Schema detail panel */
+        .schema-panel {
+            background: #252526;
+            border-top: 1px solid #3e3e42;
+            max-height: 300px;
+            overflow-y: auto;
+            padding: 10px 12px;
+        }
+
+        .schema-panel.hidden {
+            display: none !important;
+        }
+
+        .schema-panel-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+
+        .schema-panel-header strong {
+            font-size: 13px;
+            color: #fff;
+        }
+
+        .schema-close {
+            margin-left: auto;
+            background: transparent;
+            border: none;
+            color: #888;
+            cursor: pointer;
+            font-size: 14px;
+            padding: 2px 6px;
+            border-radius: 3px;
+        }
+
+        .schema-close:hover {
+            background: #3e3e42;
+            color: #fff;
+        }
+
+        .schema-meta {
+            font-size: 11px;
+            color: #888;
+            margin-bottom: 8px;
+        }
+
+        .schema-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+
+        .schema-table th {
+            text-align: left;
+            color: #999;
+            font-weight: 600;
+            padding: 4px 8px;
+            border-bottom: 1px solid #3e3e42;
+        }
+
+        .schema-table td {
+            padding: 3px 8px;
+            color: #d4d4d4;
+            border-bottom: 1px solid #333;
+        }
+
+        .schema-type {
+            font-family: 'Consolas', monospace;
+            color: #b5cea8;
+            font-size: 11px;
+        }
+
+        .schema-actions {
+            margin-top: 8px;
+            display: flex;
+            gap: 6px;
+        }
+
+        .schema-actions button {
+            background: #0e639c;
+            border: none;
+            color: #fff;
+            padding: 4px 10px;
+            border-radius: 3px;
+            font-size: 11px;
+            cursor: pointer;
+        }
+
+        .schema-actions button:hover {
+            background: #1177bb;
+        }
     </style>
 </head>
 <body>
@@ -603,6 +825,7 @@
         <h1>TinySQL Editor</h1>
         <button onclick="showUploadDialog()">📁 Upload File</button>
         <button id="loadAllDemosBtn" style="background: #7d2d7d;">✨ Load Demo Tables</button>
+        <button onclick="toggleHistory()" style="background: #3e3e42;">📜 History</button>
         <div class="spacer"></div>
         <div class="status">
             <div class="status-indicator"></div>
@@ -622,9 +845,9 @@
                 <label class="upload-btn" for="fileInput">
                     📤 Upload File
                 </label>
-                <input type="file" id="fileInput" accept=".csv,.json,.xlsx,.xls" multiple onchange="handleFileUpload(event)">
+                <input type="file" id="fileInput" accept=".csv,.json,.xml,.xlsx,.xls" multiple onchange="handleFileUpload(event)">
                 <div style="font-size: 11px; color: #888; margin-top: 8px; padding: 0 4px;">
-                    Supports: CSV, JSON, Excel (.xlsx, .xls)
+                    Supports: CSV, JSON, XML, Excel (.xlsx, .xls)
                 </div>
             </div>
             <div class="table-list" id="tableList">
@@ -634,6 +857,7 @@
                     <div class="empty-state-text">Upload a file or load from disk</div>
                 </div>
             </div>
+            <div id="schemaPanel" class="schema-panel hidden"></div>
             <div id="demoQueries" class="examples hidden">
                 <div class="examples-title">Demo Queries</div>
                 <div class="example-query" onclick="setQuery('-- Sales by region\nSELECT region, SUM(quantity * unit_price) AS revenue\nFROM sales\nGROUP BY region\nORDER BY revenue DESC')">
@@ -654,6 +878,19 @@
                 <div class="example-query" onclick="setQuery('-- Pending shipments\nSELECT shipment_id, origin, destination, \n       status, dispatch_date\nFROM logistics\nWHERE status != \'Delivered\'\nORDER BY dispatch_date DESC')">
                     ⏳ Pending Shipments
                 </div>
+                <div class="example-query" onclick="setQuery('-- Window function: running total\nSELECT order_id, product, quantity,\n       SUM(quantity) OVER (ORDER BY order_id) AS running_total\nFROM sales')">
+                    📈 Window Function
+                </div>
+                <div class="example-query" onclick="setQuery('-- Multi-statement: create and query\nCREATE TABLE temp (id INTEGER, label TEXT);\nINSERT INTO temp VALUES (1, \'alpha\');\nINSERT INTO temp VALUES (2, \'beta\');\nSELECT * FROM temp')">
+                    🔁 Multi-Statement
+                </div>
+            </div>
+            <div id="historyPanel" class="history-section hidden">
+                <div class="history-title">
+                    Query History
+                    <button onclick="clearHistory()">Clear</button>
+                </div>
+                <div id="historyList"></div>
             </div>
         </div>
 
@@ -667,16 +904,20 @@
                     </button>
                     <button class="btn-secondary" onclick="clearQuery()">Clear</button>
                     <button class="btn-secondary" onclick="formatQuery()">Format</button>
-                    <div class="editor-hint">Tip: Ctrl/Cmd+Enter to run • Tab to indent</div>
+                    <div class="editor-hint">Ctrl/Cmd+Enter to run • Tab to indent • ↑ recall last query</div>
                 </div>
                 <textarea id="queryEditor" placeholder="Enter your SQL query here...
 Example: SELECT * FROM users WHERE age > 25
 
-Supported functions:
+Supported features:
 - SELECT, WHERE, ORDER BY, GROUP BY, HAVING
-- JOIN (INNER, LEFT, RIGHT, FULL)
+- JOIN (INNER, LEFT, RIGHT, FULL), CTE (WITH)
+- Window functions (ROW_NUMBER, SUM OVER, …)
 - Aggregations: COUNT, SUM, AVG, MIN, MAX
-- Functions: UPPER, LOWER, SUBSTR, etc."></textarea>
+- CASE expressions, sub-queries
+- Multi-statement (separated by ;)
+- Import: CSV, JSON, XML, Excel
+- Export: CSV, JSON, XML"></textarea>
             </div>
 
             <!-- Results Area -->

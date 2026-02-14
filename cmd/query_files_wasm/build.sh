@@ -1,94 +1,143 @@
 #!/bin/bash
+# build.sh – compile the TinySQL WASM demo and optionally serve it locally.
+#
+# Usage:
+#   ./build.sh            Build only
+#   ./build.sh --serve    Build, then start a local HTTP server on port 8080
+#   ./build.sh --clean    Remove generated artefacts and exit
+#
+set -euo pipefail
 
-set -e
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
-echo "🔨 Building TinySQL Query Files WASM..."
+PORT="${PORT:-8080}"
+WASM_OUT="query_files.wasm"
 
-# Set WASM build flags
-export GOOS=js
-export GOARCH=wasm
+# ── helpers ──────────────────────────────────────────────────────────────────
+filesize() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null || echo 0; }
+human()    { numfmt --to=iec-i --suffix=B "$1" 2>/dev/null || echo "$1 bytes"; }
+elapsed()  { echo "$(( $(date +%s) - $1 ))s"; }
 
-# Build the WASM binary with size-friendly flags
-echo "📦 Compiling Go to WASM (stripping debug/symbols)..."
-# Use -ldflags to remove symbol table and debug info, and -trimpath to avoid embedding local paths.
-go build -trimpath -ldflags "-s -w" -o query_files.wasm
+# ── flags ────────────────────────────────────────────────────────────────────
+SERVE=false
+CLEAN=false
+for arg in "$@"; do
+    case "$arg" in
+        --serve|-s)  SERVE=true ;;
+        --clean|-c)  CLEAN=true ;;
+        --help|-h)
+            sed -n '2,8s/^# //p' "$0"
+            exit 0 ;;
+    esac
+done
 
-# Copy wasm_exec.js from Go installation
-echo "📋 Copying wasm_exec.js..."
-WASM_EXEC=$(find $(go env GOROOT) -name "wasm_exec.js" 2>/dev/null | head -1)
-if [ -z "$WASM_EXEC" ]; then
-    echo "❌ Could not find wasm_exec.js in Go installation"
+if $CLEAN; then
+    echo "🧹 Cleaning generated files…"
+    rm -f "$WASM_OUT" "${WASM_OUT}.gz" wasm_exec.js
+    echo "   Done."
+    exit 0
+fi
+
+# ── pre-flight checks ───────────────────────────────────────────────────────
+echo "🔨 Building TinySQL Query Files WASM…"
+
+if ! command -v go >/dev/null 2>&1; then
+    echo "❌ Go toolchain not found. Install Go from https://go.dev/dl/"
+    exit 1
+fi
+
+GO_VERSION="$(go version)"
+echo "   Go: $GO_VERSION"
+
+# ── compile ──────────────────────────────────────────────────────────────────
+T0=$(date +%s)
+echo "📦 Compiling Go → WASM (stripping debug info)…"
+GOOS=js GOARCH=wasm go build -trimpath -ldflags "-s -w" -o "$WASM_OUT"
+RAW_SIZE=$(filesize "$WASM_OUT")
+echo "   Compiled in $(elapsed $T0)  –  raw size: $(human "$RAW_SIZE")"
+
+# ── copy wasm_exec.js ────────────────────────────────────────────────────────
+echo "📋 Copying wasm_exec.js…"
+WASM_EXEC="$(go env GOROOT)/misc/wasm/wasm_exec.js"
+if [ ! -f "$WASM_EXEC" ]; then
+    WASM_EXEC=$(find "$(go env GOROOT)" -name "wasm_exec.js" 2>/dev/null | head -1)
+fi
+if [ -z "$WASM_EXEC" ] || [ ! -f "$WASM_EXEC" ]; then
+    echo "❌ Could not find wasm_exec.js in Go installation (GOROOT=$(go env GOROOT))"
     exit 1
 fi
 cp "$WASM_EXEC" .
+echo "   Copied from $WASM_EXEC"
 
-echo "✅ Build complete!"
+# ── optional wasm-opt / wasm-strip ──────────────────────────────────────────
 if command -v wasm-opt >/dev/null 2>&1; then
-    echo "🔧 Found wasm-opt, trying multiple optimization variants (including --converge)..."
+    echo "🔧 Optimising with wasm-opt (trying multiple strategies)…"
 
-    # Candidate flag sets to try. We will pick the smallest resulting file.
     VARIANTS=(
         "--enable-bulk-memory -Oz --strip-debug"
         "--enable-bulk-memory -Oz --strip-debug --converge"
         "--enable-bulk-memory -O3 --strip-debug --converge"
     )
 
-    # Start with the original file as the current best
-    BEST_FILE="query_files.wasm"
-    BEST_SIZE=$(stat -f%z "$BEST_FILE" 2>/dev/null || stat -c%s "$BEST_FILE" 2>/dev/null || echo 0)
+    BEST_SIZE=$(filesize "$WASM_OUT")
 
     for v in "${VARIANTS[@]}"; do
-        # Produce a filename suffix safe string for this variant
-        suffix=$(echo "$v" | tr ' ' '_' | tr -c 'a-zA-Z0-9._-' '_')
-        out="query_files.${suffix}.wasm"
-        echo "🔁 Running: wasm-opt $v -> $out"
+        TMP_OUT="${WASM_OUT}.opt.tmp"
         # shellcheck disable=SC2086
-        wasm-opt $v -o "$out" query_files.wasm || { echo "⚠️ wasm-opt failed for variant: $v"; continue; }
-
-        sz=$(stat -f%z "$out" 2>/dev/null || stat -c%s "$out" 2>/dev/null || echo 0)
-        echo "   -> size: $sz bytes"
-        if [ "$BEST_SIZE" -eq 0 ] || [ "$sz" -lt "$BEST_SIZE" ]; then
-            echo "   ✅ New best wasm: $out ($sz bytes)"
-            mv -f "$out" query_files.wasm
-            BEST_SIZE=$sz
+        if wasm-opt $v -o "$TMP_OUT" "$WASM_OUT" 2>/dev/null; then
+            sz=$(filesize "$TMP_OUT")
+            if [ "$sz" -gt 0 ] && [ "$sz" -lt "$BEST_SIZE" ]; then
+                echo "   ✅ $v → $(human "$sz") (saved $(( BEST_SIZE - sz )) bytes)"
+                mv -f "$TMP_OUT" "$WASM_OUT"
+                BEST_SIZE=$sz
+            else
+                rm -f "$TMP_OUT"
+            fi
         else
-            rm -f "$out"
+            rm -f "$TMP_OUT"
         fi
     done
 
-    echo "🔎 Final chosen wasm size: $(stat -f%z query_files.wasm 2>/dev/null || stat -c%s query_files.wasm 2>/dev/null) bytes"
+    echo "   Final optimised size: $(human "$BEST_SIZE")"
 elif command -v wasm-strip >/dev/null 2>&1; then
-    echo "🔧 Found wasm-strip, stripping debug sections..."
-    wasm-strip query_files.wasm || true
+    echo "🔧 Stripping debug sections with wasm-strip…"
+    wasm-strip "$WASM_OUT" || true
 else
-    echo "ℹ️  wasm-opt/wasm-strip not found; install Binaryen or wabt for further wasm size optimizations"
+    echo "ℹ️  Tip: install Binaryen (wasm-opt) for further size reduction"
 fi
 
-echo "📏 Resulting file sizes:"
-ls -lh query_files.wasm || true
-# Produce a pre-compressed gzip version for efficient HTTP delivery
+# ── gzip pre-compress ───────────────────────────────────────────────────────
 if command -v gzip >/dev/null 2>&1; then
-    echo "🔨 Creating pre-compressed gzip .wasm.gz (best compression)..."
-    gzip -9 -c query_files.wasm > query_files.wasm.gz || true
-    ls -lh query_files.wasm.gz || true
-    echo "(Tip: serve the .wasm.gz with Content-Encoding: gzip for smaller downloads)"
-else
-    echo "(Tip: gzip the .wasm for HTTP delivery; many servers honor pre-compressed .wasm.gz)"
+    gzip -9 -c "$WASM_OUT" > "${WASM_OUT}.gz" 2>/dev/null || true
 fi
+
+# ── summary ──────────────────────────────────────────────────────────────────
 echo ""
 echo "📂 Generated files:"
-echo "   - query_files.wasm (Go compiled to WebAssembly)"
-echo "   - wasm_exec.js (Go WASM runtime)"
+printf "   %-24s %s\n" "$WASM_OUT" "$(human "$(filesize "$WASM_OUT")")"
+if [ -f "${WASM_OUT}.gz" ]; then
+    printf "   %-24s %s  (pre-compressed)\n" "${WASM_OUT}.gz" "$(human "$(filesize "${WASM_OUT}.gz")")"
+fi
+printf "   %-24s %s\n" "wasm_exec.js" "$(human "$(filesize wasm_exec.js)")"
 echo ""
-echo "🚀 To test locally:"
-echo "   python3 -m http.server 8080"
-echo "   # or"
-echo "   php -S localhost:8080"
-echo ""
-echo "   Then open: http://localhost:8080"
-echo ""
-echo "📤 To deploy to GitHub Pages:"
-echo "   1. Commit all files (*.html, *.js, *.wasm)"
-echo "   2. Push to GitHub repository"
-echo "   3. Enable GitHub Pages in repository settings"
-echo "   4. Select branch and /cmd/query_files_wasm folder"
+echo "✅ Build finished in $(elapsed $T0)."
+
+# ── optional local server ───────────────────────────────────────────────────
+if $SERVE; then
+    echo ""
+    echo "🚀 Starting local server on http://localhost:${PORT} …"
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -m http.server "$PORT"
+    elif command -v php >/dev/null 2>&1; then
+        php -S "localhost:${PORT}"
+    else
+        echo "❌ Neither python3 nor php found – please install one to serve locally."
+        exit 1
+    fi
+else
+    echo "🚀 To test locally:"
+    echo "   ./build.sh --serve"
+    echo "   # or: python3 -m http.server $PORT"
+    echo "   Then open: http://localhost:${PORT}"
+fi

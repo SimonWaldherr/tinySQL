@@ -704,23 +704,34 @@ func FuzzyImportJSON(
 		columnNames = append(columnNames, name)
 	}
 
-	// Create columns (all as JSON type initially)
-	columns := make([]storage.Column, len(columnNames))
+	// ── Infer column types from actual values ───────────────────────────
+	// Build a string matrix so we can reuse fuzzyInferColumnTypes.
+	numCols := len(columnNames)
+	sampleData := make([][]string, len(records))
+	for ri, rec := range records {
+		row := make([]string, numCols)
+		for ci, colName := range columnNames {
+			if v, ok := rec[colName]; ok {
+				row[ci] = fmt.Sprint(v)
+			}
+		}
+		sampleData[ri] = row
+	}
+
+	colTypes := fuzzyPrepareColumnTypes(sampleData, numCols, opts)
+
+	columns := make([]storage.Column, numCols)
 	for i, name := range columnNames {
 		columns[i] = storage.Column{
 			Name: name,
-			Type: storage.JsonType,
+			Type: colTypes[i],
 		}
 	}
 
 	result := &ImportResult{
 		ColumnNames: columnNames,
-		ColumnTypes: make([]storage.ColType, len(columnNames)),
+		ColumnTypes: colTypes,
 		Errors:      make([]string, 0),
-	}
-
-	for i := range result.ColumnTypes {
-		result.ColumnTypes[i] = storage.JsonType
 	}
 
 	// Create table
@@ -736,12 +747,47 @@ func FuzzyImportJSON(
 		return nil, err
 	}
 
-	// Insert records
+	// Insert records — convert values to the inferred type when possible.
 	for _, record := range records {
-		row := make([]interface{}, len(columnNames))
+		row := make([]interface{}, numCols)
 		for i, colName := range columnNames {
-			if value, exists := record[colName]; exists {
-				row[i] = value
+			v, exists := record[colName]
+			if !exists {
+				continue
+			}
+			// json.Unmarshal produces float64 for all numbers; convert to
+			// int when the column was inferred as IntType.
+			switch colTypes[i] {
+			case storage.IntType:
+				switch n := v.(type) {
+				case float64:
+					row[i] = int(n)
+				default:
+					row[i] = v
+				}
+			case storage.Float64Type, storage.FloatType:
+				switch n := v.(type) {
+				case float64:
+					row[i] = n
+				default:
+					row[i] = v
+				}
+			case storage.BoolType:
+				row[i] = v
+			default:
+				// For TEXT and anything else keep the original value,
+				// but turn complex sub-objects into a JSON string so
+				// they stay representable as text.
+				switch vv := v.(type) {
+				case map[string]interface{}, []interface{}:
+					if b, err := json.Marshal(vv); err == nil {
+						row[i] = string(b)
+					} else {
+						row[i] = fmt.Sprint(v)
+					}
+				default:
+					row[i] = v
+				}
 			}
 		}
 		table.Rows = append(table.Rows, row)
