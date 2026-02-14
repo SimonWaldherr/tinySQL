@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -413,8 +414,7 @@ func (bp *BatchProcessor) flushLocked() {
 
 	// Process batch
 	if err := bp.handler(bp.batch); err != nil {
-		// Log error (in real implementation)
-		_ = err
+		log.Printf("batch handler error: %v", err)
 	}
 
 	// Clear batch

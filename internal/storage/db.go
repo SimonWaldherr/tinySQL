@@ -67,54 +67,80 @@ func init() {
 type ColType int
 
 const (
-	// Integer types
+	// IntType is a generic integer column type.
 	IntType ColType = iota
+	// Int8Type is an 8-bit signed integer column type.
 	Int8Type
+	// Int16Type is a 16-bit signed integer column type.
 	Int16Type
+	// Int32Type is a 32-bit signed integer column type.
 	Int32Type
+	// Int64Type is a 64-bit signed integer column type.
 	Int64Type
+	// UintType is an unsigned integer column type.
 	UintType
+	// Uint8Type is an 8-bit unsigned integer column type.
 	Uint8Type
+	// Uint16Type is a 16-bit unsigned integer column type.
 	Uint16Type
+	// Uint32Type is a 32-bit unsigned integer column type.
 	Uint32Type
+	// Uint64Type is a 64-bit unsigned integer column type.
 	Uint64Type
 
-	// Floating point types
+	// Float32Type is a 32-bit floating point column type.
 	Float32Type
+	// Float64Type is a 64-bit floating point column type.
 	Float64Type
+	// FloatType is an alias for Float64Type.
 	FloatType // alias for Float64Type
 
-	// String and character types
+	// StringType represents a variable-length UTF-8 string column.
 	StringType
+	// TextType is an alias for StringType intended for long text.
 	TextType // alias for StringType
+	// RuneType stores single Unicode code points.
 	RuneType
+	// ByteType stores raw byte data.
 	ByteType
 
-	// Boolean type
+	// BoolType represents a boolean column (true/false).
 	BoolType
 
-	// Time types
+	// TimeType stores time-of-day values.
 	TimeType
+	// DateType stores date-only values.
 	DateType
+	// DateTimeType stores combined date and time values.
 	DateTimeType
+	// TimestampType stores an absolute point in time.
 	TimestampType
+	// DurationType stores a time duration.
 	DurationType
 
-	// Complex types
+	// JsonType stores JSON text.
 	JsonType
+	// JsonbType stores binary JSON representations.
 	JsonbType
+	// MapType stores map-like complex values.
 	MapType
+	// SliceType stores slice-like complex values.
 	SliceType
+	// ArrayType stores array-like complex values.
 	ArrayType
 
-	// Advanced types
+	// Complex64Type stores complex64 numeric values.
 	Complex64Type
+	// Complex128Type stores complex128 numeric values.
 	Complex128Type
+	// ComplexType is an alias for Complex128Type.
 	ComplexType // alias for Complex128Type
+	// PointerType represents a pointer/reference to another object.
 	PointerType
+	// InterfaceType represents an arbitrary Go interface value.
 	InterfaceType
 
-	// Vector types (for RAG / embedding storage)
+	// VectorType represents a vector/embedding column used by RAG features.
 	VectorType
 )
 
@@ -673,13 +699,7 @@ func tableToDiskRange(tn string, t *Table, from, to int) diskTable {
 		Rows:    make([][]any, to-from),
 	}
 	for i, c := range t.Cols {
-		dt.Cols[i] = diskColumn{
-			Name:         c.Name,
-			Type:         c.Type,
-			Constraint:   c.Constraint,
-			ForeignKey:   c.ForeignKey,
-			PointerTable: c.PointerTable,
-		}
+		dt.Cols[i] = diskColumn(c)
 	}
 	for i := from; i < to; i++ {
 		r := t.Rows[i]
@@ -709,13 +729,7 @@ func tableToDiskRange(tn string, t *Table, from, to int) diskTable {
 func diskToTable(dt diskTable) *Table {
 	cols := make([]Column, len(dt.Cols))
 	for i, c := range dt.Cols {
-		cols[i] = Column{
-			Name:         c.Name,
-			Type:         c.Type,
-			Constraint:   c.Constraint,
-			ForeignKey:   c.ForeignKey,
-			PointerTable: c.PointerTable,
-		}
+		cols[i] = Column(c)
 	}
 	t := NewTable(dt.Name, cols, dt.IsTemp)
 	t.Version = dt.Version
@@ -1471,7 +1485,7 @@ func replayWAL(db *DB, walPath string) (nextSeq, nextTxID, committed uint64, err
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.ErrNoProgress) || strings.Contains(err.Error(), "EOF") {
+			if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.ErrNoProgress) {
 				if lastGood >= 0 {
 					_ = os.Truncate(walPath, lastGood)
 				}

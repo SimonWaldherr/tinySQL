@@ -1,3 +1,8 @@
+// Tests for the importer package. These exercises cover common CSV and
+// JSON import scenarios used by the ImportCSV and ImportJSON helpers.
+// The tests are intentionally simple and focus on behavioral guarantees
+// (delimiter detection, header handling, type inference and null handling)
+// rather than full end-to-end CLI flows.
 package importer
 
 import (
@@ -8,6 +13,8 @@ import (
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
+// TestImportCSV_Basic verifies a simple CSV with header is imported and
+// rows/columns are recorded as expected.
 func TestImportCSV_Basic(t *testing.T) {
 	ctx := context.Background()
 	db := storage.NewDB()
@@ -51,6 +58,8 @@ func TestImportCSV_Basic(t *testing.T) {
 	}
 }
 
+// TestImportCSV_NoHeader verifies behavior when the CSV has no header
+// row: the importer should synthesize column names (col_1, col_2, ...).
 func TestImportCSV_NoHeader(t *testing.T) {
 	ctx := context.Background()
 	db := storage.NewDB()
@@ -86,6 +95,8 @@ func TestImportCSV_NoHeader(t *testing.T) {
 	}
 }
 
+// TestImportCSV_TSV ensures the importer can detect a tab delimiter and
+// import TSV data correctly.
 func TestImportCSV_TSV(t *testing.T) {
 	ctx := context.Background()
 	db := storage.NewDB()
@@ -111,6 +122,8 @@ func TestImportCSV_TSV(t *testing.T) {
 	}
 }
 
+// TestImportCSV_TypeInference checks that basic type inference classifies
+// integer, text, float and boolean sample columns correctly.
 func TestImportCSV_TypeInference(t *testing.T) {
 	ctx := context.Background()
 	db := storage.NewDB()
@@ -161,6 +174,8 @@ func TestImportCSV_TypeInference(t *testing.T) {
 	}
 }
 
+// TestImportCSV_NullHandling verifies that configured null literal
+// strings are interpreted as SQL NULL values on import.
 func TestImportCSV_NullHandling(t *testing.T) {
 	ctx := context.Background()
 	db := storage.NewDB()
@@ -199,6 +214,8 @@ func TestImportCSV_NullHandling(t *testing.T) {
 	}
 }
 
+// TestImportJSON_ArrayOfObjects validates importing a JSON array of
+// objects produces the expected rows in the target table.
 func TestImportJSON_ArrayOfObjects(t *testing.T) {
 	ctx := context.Background()
 	db := storage.NewDB()
@@ -230,6 +247,8 @@ func TestImportJSON_ArrayOfObjects(t *testing.T) {
 	}
 }
 
+// TestTypeInference_Integer asserts that columns with integer-like
+// samples are inferred as INT.
 func TestTypeInference_Integer(t *testing.T) {
 	samples := [][]string{
 		{"1", "2", "3"},
@@ -247,6 +266,8 @@ func TestTypeInference_Integer(t *testing.T) {
 	}
 }
 
+// TestTypeInference_Float asserts that floating-point-like samples
+// are inferred as FLOAT.
 func TestTypeInference_Float(t *testing.T) {
 	samples := [][]string{
 		{"1.5", "2.7", "3.9"},
@@ -263,6 +284,8 @@ func TestTypeInference_Float(t *testing.T) {
 	}
 }
 
+// TestTypeInference_Boolean asserts that boolean-like samples are
+// inferred as BOOL.
 func TestTypeInference_Boolean(t *testing.T) {
 	samples := [][]string{
 		{"true", "false", "true"},
@@ -282,6 +305,8 @@ func TestTypeInference_Boolean(t *testing.T) {
 	}
 }
 
+// TestTypeInference_MixedDefaultsToText ensures mixed-type columns
+// fall back to TEXT to preserve data.
 func TestTypeInference_MixedDefaultsToText(t *testing.T) {
 	samples := [][]string{
 		{"1", "text", "true"},
@@ -302,6 +327,8 @@ func TestTypeInference_MixedDefaultsToText(t *testing.T) {
 	}
 }
 
+// TestDelimiterDetection checks that common delimiters are detected
+// correctly from example lines.
 func TestDelimiterDetection(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -325,6 +352,8 @@ func TestDelimiterDetection(t *testing.T) {
 	}
 }
 
+// TestSanitizeColumnNames ensures invalid characters are replaced and
+// empty names are turned into synthetic column names.
 func TestSanitizeColumnNames(t *testing.T) {
 	input := []string{"Name", "User-ID", "email.address", "", "age/years"}
 	expected := []string{"Name", "User_ID", "email_address", "col_4", "age_years"}
@@ -335,5 +364,71 @@ func TestSanitizeColumnNames(t *testing.T) {
 		if result[i] != exp {
 			t.Errorf("Column %d: expected %s, got %s", i, exp, result[i])
 		}
+	}
+}
+
+// TestImportCSV_QuotedFields verifies CSV parsing with quoted fields containing
+// delimiters and escaped quotes.
+func TestImportCSV_QuotedFields(t *testing.T) {
+	ctx := context.Background()
+	db := storage.NewDB()
+
+	csvData := `id,desc
+1,"Hello, world", 
+2,"He said ""Hi""",`
+
+	result, err := ImportCSV(ctx, db, "default", "quotes",
+		strings.NewReader(csvData), &ImportOptions{CreateTable: true})
+	if err != nil {
+		t.Fatalf("ImportCSV failed: %v", err)
+	}
+	if result.RowsInserted != 2 {
+		t.Fatalf("expected 2 rows inserted, got %d", result.RowsInserted)
+	}
+	tbl, _ := db.Get("default", "quotes")
+	// Check that commas inside quotes and escaped quotes are preserved
+	if tbl.Rows[0][1] != "Hello, world" {
+		t.Fatalf("expected first desc to be Hello, world, got %v", tbl.Rows[0][1])
+	}
+	if tbl.Rows[1][1] != `He said "Hi"` {
+		t.Fatalf("expected second desc to contain escaped quotes, got %v", tbl.Rows[1][1])
+	}
+}
+
+// TestImportCSV_CRLF ensures CRLF line endings are handled correctly.
+func TestImportCSV_CRLF(t *testing.T) {
+	ctx := context.Background()
+	db := storage.NewDB()
+	csvData := "id,name\r\n1,Alice\r\n2,Bob\r\n"
+
+	result, err := ImportCSV(ctx, db, "default", "crlf",
+		strings.NewReader(csvData), &ImportOptions{CreateTable: true})
+	if err != nil {
+		t.Fatalf("ImportCSV failed: %v", err)
+	}
+	if result.RowsInserted != 2 {
+		t.Fatalf("expected 2 rows inserted, got %d", result.RowsInserted)
+	}
+}
+
+// TestImportJSON_NDJSON verifies line-delimited JSON (NDJSON) imports correctly.
+func TestImportJSON_NDJSON(t *testing.T) {
+	ctx := context.Background()
+	db := storage.NewDB()
+	ndjson := `{"id":1, "name":"Alice"}
+{"id":2, "name":"Bob"}
+{"id":3, "name":"Charlie"}`
+
+	result, err := ImportJSON(ctx, db, "default", "ndjson",
+		strings.NewReader(ndjson), &ImportOptions{CreateTable: true, TypeInference: true})
+	if err != nil {
+		t.Fatalf("ImportJSON NDJSON failed: %v", err)
+	}
+	if result.RowsInserted != 3 {
+		t.Fatalf("expected 3 rows inserted, got %d", result.RowsInserted)
+	}
+	tbl, _ := db.Get("default", "ndjson")
+	if len(tbl.Rows) != 3 {
+		t.Fatalf("expected 3 rows in table, got %d", len(tbl.Rows))
 	}
 }

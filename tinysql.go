@@ -233,35 +233,48 @@ const (
 // ============================================================================
 
 const (
-	// Integer types
+	// IntType represents a generic integer column type.
 	IntType   ColType = storage.IntType
+	// Int8Type represents an 8-bit signed integer column type.
 	Int8Type  ColType = storage.Int8Type
+	// Int16Type represents a 16-bit signed integer column type.
 	Int16Type ColType = storage.Int16Type
+	// Int32Type represents a 32-bit signed integer column type.
 	Int32Type ColType = storage.Int32Type
+	// Int64Type represents a 64-bit signed integer column type.
 	Int64Type ColType = storage.Int64Type
+	// UintType represents an unsigned integer column type.
 	UintType  ColType = storage.UintType
+	// Uint8Type represents an 8-bit unsigned integer column type.
 	Uint8Type ColType = storage.Uint8Type
 
-	// Floating point types
+	// Float32Type represents a 32-bit floating point column type.
 	Float32Type ColType = storage.Float32Type
+	// Float64Type represents a 64-bit floating point column type.
 	Float64Type ColType = storage.Float64Type
+	// FloatType is an alias for Float64Type.
 	FloatType   ColType = storage.FloatType
 
-	// String types
+	// StringType represents a short string/text column.
 	StringType ColType = storage.StringType
+	// TextType represents a longer textual column.
 	TextType   ColType = storage.TextType
 
-	// Boolean type
+	// BoolType represents a boolean column (true/false).
 	BoolType ColType = storage.BoolType
 
-	// Time types
+	// TimeType represents a time-only column type.
 	TimeType      ColType = storage.TimeType
+	// DateType represents a date-only column type.
 	DateType      ColType = storage.DateType
+	// DateTimeType represents a combined date and time column.
 	DateTimeType  ColType = storage.DateTimeType
+	// TimestampType represents a timestamp column type.
 	TimestampType ColType = storage.TimestampType
 
-	// Complex types
+	// JsonType represents a JSON textual column.
 	JsonType  ColType = storage.JsonType
+	// JsonbType represents a binary JSON column (if supported by backend).
 	JsonbType ColType = storage.JsonbType
 )
 

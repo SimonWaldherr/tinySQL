@@ -1,3 +1,7 @@
+// Package storage provides persistence primitives and metadata structures
+// used by tinySQL. This file implements a lightweight in-memory system
+// catalog used for introspection (tables, columns, views, functions)
+// and simple job scheduling metadata.
 package storage
 
 import (
@@ -9,7 +13,10 @@ import (
 // ==================== System Catalog ====================
 // Provides metadata tables for introspection and job scheduling
 
-// CatalogManager manages system catalog tables (catalog.tables, catalog.columns, etc.)
+// CatalogManager manages system catalog tables (`catalog.tables`,
+// `catalog.columns`, etc.) and provides thread-safe registration and
+// lookup helpers used by the rest of the system for introspection and
+// scheduling. CatalogManager is safe for concurrent use.
 type CatalogManager struct {
 	mu      sync.RWMutex
 	tables  map[string]*CatalogTable
@@ -19,7 +26,7 @@ type CatalogManager struct {
 	jobs    map[string]*CatalogJob
 }
 
-// NewCatalogManager creates a new catalog manager
+// NewCatalogManager allocates and returns an initialized CatalogManager.
 func NewCatalogManager() *CatalogManager {
 	return &CatalogManager{
 		tables:  make(map[string]*CatalogTable),
@@ -31,6 +38,7 @@ func NewCatalogManager() *CatalogManager {
 }
 
 // CatalogTable represents metadata for a single table
+// CatalogTable holds basic metadata for a registered table or view.
 type CatalogTable struct {
 	Schema    string
 	Name      string
@@ -41,6 +49,9 @@ type CatalogTable struct {
 }
 
 // CatalogColumn represents metadata for a table column
+// CatalogColumn represents a column in a catalog table including its
+// position and declared data type. `DefaultValue` may be nil if none
+// is defined.
 type CatalogColumn struct {
 	Schema       string
 	TableName    string
@@ -52,6 +63,7 @@ type CatalogColumn struct {
 }
 
 // CatalogView represents a saved view definition
+// CatalogView stores the definition of a saved view.
 type CatalogView struct {
 	Schema    string
 	Name      string
@@ -60,6 +72,9 @@ type CatalogView struct {
 }
 
 // CatalogFunction represents metadata for scalar and table-valued functions
+// CatalogFunction describes registered functions (builtin or user
+// defined). `FunctionType` categorizes the function, and `Language`
+// indicates the implementation origin.
 type CatalogFunction struct {
 	Schema          string
 	Name            string
@@ -72,6 +87,9 @@ type CatalogFunction struct {
 }
 
 // CatalogJob represents a scheduled job
+// CatalogJob describes a scheduled job. The fields provide flexible
+// scheduling options (CRON, interval, or single-run) and execution
+// metadata for bookkeeping and scheduling decisions.
 type CatalogJob struct {
 	Name         string
 	SQLText      string
@@ -92,7 +110,9 @@ type CatalogJob struct {
 
 // ==================== Catalog Operations ====================
 
-// RegisterTable adds a table to the catalog
+// RegisterTable registers a table and its columns in the system catalog.
+// The provided `cols` slice is converted to `CatalogColumn` entries and
+// stored under the key `schema.name`.
 func (c *CatalogManager) RegisterTable(schema, name string, cols []Column) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -123,7 +143,7 @@ func (c *CatalogManager) RegisterTable(schema, name string, cols []Column) error
 	return nil
 }
 
-// RegisterView adds a view to the catalog
+// RegisterView registers a view definition under `schema.name`.
 func (c *CatalogManager) RegisterView(schema, name, sqlText string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -139,7 +159,7 @@ func (c *CatalogManager) RegisterView(schema, name, sqlText string) error {
 	return nil
 }
 
-// RegisterFunction adds a function to the catalog
+// RegisterFunction registers or updates a function's metadata.
 func (c *CatalogManager) RegisterFunction(fn *CatalogFunction) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -149,7 +169,8 @@ func (c *CatalogManager) RegisterFunction(fn *CatalogFunction) error {
 	return nil
 }
 
-// RegisterJob adds or updates a job in the catalog
+// RegisterJob adds a new scheduled job or updates an existing entry.
+// Job names must be non-empty.
 func (c *CatalogManager) RegisterJob(job *CatalogJob) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -167,7 +188,7 @@ func (c *CatalogManager) RegisterJob(job *CatalogJob) error {
 	return nil
 }
 
-// GetJob retrieves a job by name
+// GetJob retrieves a job by name, returning an error if not found.
 func (c *CatalogManager) GetJob(name string) (*CatalogJob, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -179,7 +200,7 @@ func (c *CatalogManager) GetJob(name string) (*CatalogJob, error) {
 	return job, nil
 }
 
-// ListJobs returns all registered jobs
+// ListJobs returns a slice containing all registered jobs.
 func (c *CatalogManager) ListJobs() []*CatalogJob {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -191,7 +212,7 @@ func (c *CatalogManager) ListJobs() []*CatalogJob {
 	return jobs
 }
 
-// ListEnabledJobs returns all enabled jobs
+// ListEnabledJobs returns only jobs whose `Enabled` flag is true.
 func (c *CatalogManager) ListEnabledJobs() []*CatalogJob {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -205,7 +226,8 @@ func (c *CatalogManager) ListEnabledJobs() []*CatalogJob {
 	return jobs
 }
 
-// UpdateJobRuntime updates last_run_at and next_run_at for a job
+// UpdateJobRuntime updates runtime bookkeeping fields for a named job.
+// It sets `LastRunAt`, `NextRunAt` and marks the job as recently updated.
 func (c *CatalogManager) UpdateJobRuntime(name string, lastRun, nextRun time.Time) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -221,7 +243,8 @@ func (c *CatalogManager) UpdateJobRuntime(name string, lastRun, nextRun time.Tim
 	return nil
 }
 
-// DeleteJob removes a job from the catalog
+// DeleteJob removes a job from the catalog, returning an error when the
+// job does not exist.
 func (c *CatalogManager) DeleteJob(name string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -234,7 +257,8 @@ func (c *CatalogManager) DeleteJob(name string) error {
 	return nil
 }
 
-// GetTables returns all tables in the catalog
+// GetTables returns a slice with metadata for all registered tables and
+// views.
 func (c *CatalogManager) GetTables() []*CatalogTable {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -246,7 +270,7 @@ func (c *CatalogManager) GetTables() []*CatalogTable {
 	return tables
 }
 
-// GetFunctions returns all registered functions in the catalog
+// GetFunctions returns metadata for all registered functions.
 func (c *CatalogManager) GetFunctions() []*CatalogFunction {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -258,7 +282,7 @@ func (c *CatalogManager) GetFunctions() []*CatalogFunction {
 	return funcs
 }
 
-// GetViews returns all registered views in the catalog
+// GetViews returns metadata for all registered views.
 func (c *CatalogManager) GetViews() []*CatalogView {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -270,21 +294,22 @@ func (c *CatalogManager) GetViews() []*CatalogView {
 	return views
 }
 
-// GetAllColumns returns all columns across all tables in the catalog
+// GetAllColumns aggregates and returns columns registered for every
+// table in the catalog. The returned slice is a concatenation of the
+// internal per-table column lists.
 func (c *CatalogManager) GetAllColumns() []CatalogColumn {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	cols := make([]CatalogColumn, 0)
 	for _, list := range c.columns {
-		for _, col := range list {
-			cols = append(cols, col)
-		}
+		cols = append(cols, list...)
 	}
 	return cols
 }
 
-// GetColumns returns all columns for a table
+// GetColumns returns the column metadata for `schema.tableName`. If the
+// table is unknown an empty slice is returned.
 func (c *CatalogManager) GetColumns(schema, tableName string) []CatalogColumn {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -293,7 +318,8 @@ func (c *CatalogManager) GetColumns(schema, tableName string) []CatalogColumn {
 	return c.columns[key]
 }
 
-// Attach catalog manager to DB
+// Catalog returns the CatalogManager attached to the DB, creating one
+// lazily if necessary.
 func (db *DB) Catalog() *CatalogManager {
 	if db.catalog == nil {
 		db.catalog = NewCatalogManager()

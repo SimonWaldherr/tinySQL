@@ -30,9 +30,8 @@ type PageBackend struct {
 	closed  bool
 
 	// Stats counters.
-	syncCount     atomic.Int64
-	loadCount     atomic.Int64
-	evictionCount atomic.Int64
+	syncCount atomic.Int64
+	loadCount atomic.Int64
 }
 
 // NewPageBackend opens or creates a page-based database.

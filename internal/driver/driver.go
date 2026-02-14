@@ -1,14 +1,15 @@
-// Package driver implements a database/sql driver for tinySQL.
+// Package driver provides a lightweight database/sql driver for tinySQL.
 //
-// What: A minimal driver that exposes tinySQL via the standard database/sql
-// interfaces. It supports in-memory databases (mem://) and file-backed
-// persistence (file:path?options) with optional WAL and autosave.
-// How: A small server wrapper manages a storage.DB and concurrency via reader
-// and writer pools. Connections create snapshots for transactions (MVCC-light)
-// and serialize writes through a WAL when configured. Placeholders (?) are
-// bound by simple string substitution with proper literal escaping.
-// Why: Integrating with database/sql enables familiar APIs, tooling, and
-// portability while keeping the implementation small and self-contained.
+// The driver exposes tinySQL through the standard `database/sql` API and
+// supports both in-memory and file-backed databases. Key features:
+//
+//  - DSN formats: `mem://` and `file:/path/to/db.gob?options` (see `parseDSN`).
+//  - Optional Write-Ahead Log (WAL) and autosave for durability.
+//  - Reader/writer pools and simple MVCC-style snapshots for transactions.
+//  - Simple, safe placeholder binding: sequential `?` and numbered `$1`/`:1`.
+//
+// Use `sql.Open("tinysql", dsn)` to create a connection. See `applyDSNOption`
+// and `applyQueryOptions` for available DSN options and defaults.
 package driver
 
 import (
@@ -20,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -37,6 +39,7 @@ import (
 //   - file:/path/to/db.gob?tenant=default&autosave=1
 //
 // See parseDSN for all available options.
+// defaultDrv is the package-global driver instance registered with database/sql.
 var defaultDrv = &drv{}
 
 func init() {
@@ -59,6 +62,10 @@ func SetDefaultDB(db *storage.DB) {
 		maxWriters:  1,
 		busyTimeout: 250 * time.Millisecond,
 	}
+	// Pre-create server using provided DB so subsequent Open() calls reuse it.
+	// Note: This allows embedding consumers to control the underlying DB
+	// instance (for example tests or WASM hosts) while still using the
+	// database/sql API.
 	defaultDrv.srv = newServer(db, c)
 }
 
@@ -71,6 +78,10 @@ func OpenInMemory(tenant string) (*sql.DB, error) {
 	}
 	return sql.Open("tinysql", dsn)
 }
+
+// OpenInMemory is a convenience wrapper that returns a *sql.DB connected to
+// an in-memory tinySQL server. Use this for tests and short-lived in-memory
+// databases. The returned *sql.DB should be closed by the caller when done.
 
 // cfg stores the connection parameters derived from a parsed DSN.
 type cfg struct {
@@ -90,20 +101,8 @@ func parseDSN(dsn string) (cfg, error) {
 	switch {
 	case strings.HasPrefix(dsn, "mem://"):
 		if i := strings.Index(dsn, "?"); i >= 0 {
-			q := dsn[i+1:]
-			for _, kv := range strings.Split(q, "&") {
-				if kv == "" {
-					continue
-				}
-				parts := strings.SplitN(kv, "=", 2)
-				k := parts[0]
-				v := ""
-				if len(parts) == 2 {
-					v = parts[1]
-				}
-				if err := applyDSNOption(&c, k, v); err != nil {
-					return c, err
-				}
+			if err := applyQueryOptions(dsn[i+1:], &c); err != nil {
+				return c, err
 			}
 		}
 		return c, nil
@@ -118,17 +117,8 @@ func parseDSN(dsn string) (cfg, error) {
 			return c, fmt.Errorf("file: path required")
 		}
 		c.filePath = filepath.Clean(path)
-		for _, kv := range strings.Split(q, "&") {
-			if kv == "" {
-				continue
-			}
-			parts := strings.SplitN(kv, "=", 2)
-			k := parts[0]
-			v := ""
-			if len(parts) == 2 {
-				v = parts[1]
-			}
-			if err := applyDSNOption(&c, k, v); err != nil {
+		if q != "" {
+			if err := applyQueryOptions(q, &c); err != nil {
 				return c, err
 			}
 		}
@@ -139,6 +129,27 @@ func parseDSN(dsn string) (cfg, error) {
 		}
 		return c, fmt.Errorf("unsupported DSN")
 	}
+}
+
+// applyQueryOptions parses a URL-style query string (k=v&k2=v2) and applies
+// options to the provided cfg using applyDSNOption. This consolidates repeated
+// logic used for different DSN prefixes (mem:// and file:).
+func applyQueryOptions(q string, c *cfg) error {
+	for _, kv := range strings.Split(q, "&") {
+		if kv == "" {
+			continue
+		}
+		parts := strings.SplitN(kv, "=", 2)
+		k := parts[0]
+		v := ""
+		if len(parts) == 2 {
+			v = parts[1]
+		}
+		if err := applyDSNOption(c, k, v); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // server coordinates access to the shared storage.DB and manages
@@ -245,6 +256,7 @@ func (s *server) acquire(ctx context.Context, pool chan struct{}) error {
 }
 
 func (s *server) release(pool chan struct{}) {
+	// Non-blocking release: if the pool is empty or nil, simply return.
 	if pool == nil {
 		return
 	}
@@ -255,9 +267,15 @@ func (s *server) release(pool chan struct{}) {
 }
 
 // saveIfNeeded persists the database to disk when autosave is enabled.
+// saveIfNeeded performs a best-effort persistence of the in-memory DB to
+// disk when autosave is enabled. Errors are logged but not returned; callers
+// typically call this from cleanup paths where returning an error would be
+// inconvenient.
 func (s *server) saveIfNeeded() {
 	if s.autosave && s.filePath != "" {
-		_ = storage.SaveToFile(s.db, s.filePath)
+		if err := storage.SaveToFile(s.db, s.filePath); err != nil {
+			log.Printf("autosave failed: %v", err)
+		}
 	}
 }
 
@@ -668,18 +686,29 @@ func (emptyRows) ColumnTypeScanType(int) any            { return "interface{}" }
 
 // Placeholder Binding (einfach/sicher)
 func bindPlaceholders(sqlStr string, args []driver.NamedValue) (string, error) {
+	// Precompute literal strings for all args to avoid repeated formatting.
+	lits := make([]string, len(args))
+	for i := range args {
+		lits[i] = sqlLiteral(args[i].Value)
+	}
+	used := make([]bool, len(lits))
+
 	var sb strings.Builder
-	sb.Grow(len(sqlStr) + len(args)*10)
+	sb.Grow(len(sqlStr) + len(lits)*8)
 	argi := 0
-	for i := 0; i < len(sqlStr); i++ {
+	n := len(sqlStr)
+	for i := 0; i < n; i++ {
 		ch := sqlStr[i]
+		// Copy quoted strings verbatim (single-quoted SQL literals)
 		if ch == '\'' {
 			sb.WriteByte(ch)
 			i++
-			for i < len(sqlStr) {
-				sb.WriteByte(sqlStr[i])
-				if sqlStr[i] == '\'' {
-					if i+1 < len(sqlStr) && sqlStr[i+1] == '\'' {
+			for i < n {
+				b := sqlStr[i]
+				sb.WriteByte(b)
+				if b == '\'' {
+					// handle doubled single-quote escape inside SQL literal
+					if i+1 < n && sqlStr[i+1] == '\'' {
 						i++
 						sb.WriteByte(sqlStr[i])
 						i++
@@ -691,34 +720,50 @@ func bindPlaceholders(sqlStr string, args []driver.NamedValue) (string, error) {
 			}
 			continue
 		}
-		// Support traditional ? placeholders (sequential)
+
+		// Sequential placeholder '?'
 		if ch == '?' {
-			if argi >= len(args) {
+			if argi >= len(lits) {
 				return "", fmt.Errorf("not enough args for placeholders")
 			}
-			sb.WriteString(sqlLiteral(args[argi].Value))
+			sb.WriteString(lits[argi])
+			used[argi] = true
 			argi++
 			continue
 		}
-		// Support numbered placeholders: $1, $2 or :1, :2 (1-based)
-		if (ch == '$' || ch == ':') && i+1 < len(sqlStr) && sqlStr[i+1] >= '0' && sqlStr[i+1] <= '9' {
-			j := i + 2
-			for j < len(sqlStr) && sqlStr[j] >= '0' && sqlStr[j] <= '9' {
+
+		// Numbered placeholders: $1, $2 or :1, :2 (1-based)
+		if (ch == '$' || ch == ':') && i+1 < n {
+			// fast-digit scan
+			j := i + 1
+			for j < n {
+				c := sqlStr[j]
+				if c < '0' || c > '9' {
+					break
+				}
 				j++
 			}
-			idxStr := sqlStr[i+1 : j]
-			n, err := strconv.Atoi(idxStr)
-			if err != nil || n <= 0 || n > len(args) {
-				return "", fmt.Errorf("tinysql: invalid placeholder %c%s", ch, idxStr)
+			if j > i+1 {
+				idxStr := sqlStr[i+1 : j]
+				num, err := strconv.Atoi(idxStr)
+				if err != nil || num <= 0 || num > len(lits) {
+					return "", fmt.Errorf("tinysql: invalid placeholder %c%s", ch, idxStr)
+				}
+				sb.WriteString(lits[num-1])
+				used[num-1] = true
+				i = j - 1
+				continue
 			}
-			sb.WriteString(sqlLiteral(args[n-1].Value))
-			i = j - 1
-			continue
 		}
+
 		sb.WriteByte(ch)
 	}
-	if argi != len(args) {
-		return "", fmt.Errorf("too many args for placeholders")
+
+	// Ensure every provided arg was used by at least one placeholder.
+	for i := range used {
+		if !used[i] {
+			return "", fmt.Errorf("too many args for placeholders: arg %d unused", i+1)
+		}
 	}
 	return sb.String(), nil
 }
@@ -730,20 +775,31 @@ func sqlLiteral(v any) string {
 		return "NULL"
 	}
 	switch x := v.(type) {
+	case int:
+		return strconv.Itoa(x)
 	case int64:
-		return fmt.Sprintf("%d", x)
+		return strconv.FormatInt(x, 10)
+	case float32:
+		return strconv.FormatFloat(float64(x), 'g', -1, 32)
 	case float64:
-		return fmt.Sprintf("%g", x)
+		return strconv.FormatFloat(x, 'g', -1, 64)
 	case bool:
 		if x {
 			return "TRUE"
 		}
 		return "FALSE"
 	case string:
+		// escape single quotes by doubling them
 		s := strings.ReplaceAll(x, "'", "''")
 		return "'" + s + "'"
 	default:
-		b, _ := json.Marshal(x)
+		// Fallback: attempt JSON marshal (handles slices/maps)
+		b, err := json.Marshal(x)
+		if err != nil {
+			// On marshal error, fall back to fmt.Sprintf representation
+			s := strings.ReplaceAll(fmt.Sprintf("%v", x), "'", "''")
+			return "'" + s + "'"
+		}
 		s := strings.ReplaceAll(string(b), "'", "''")
 		return "'" + s + "'"
 	}

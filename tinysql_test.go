@@ -2,7 +2,6 @@ package tinysql
 
 import (
 	"context"
-	"io/ioutil"
 	"os"
 	"strings"
 	"testing"
@@ -526,7 +525,7 @@ func TestStorageOperations(t *testing.T) {
 
 	// Test file persistence
 	t.Run("FilePersistence", func(t *testing.T) {
-		tmpFile, err := ioutil.TempFile("", "test_db_*.json")
+		tmpFile, err := os.CreateTemp("", "test_db_*.json")
 		if err != nil {
 			t.Fatalf("Failed to create temp file: %v", err)
 		}

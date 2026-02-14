@@ -104,11 +104,47 @@ import "C"
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"sync"
+	"unicode/utf8"
 	"unsafe"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
 )
+
+// valueToString converts common tinySQL cell values to string without
+// always using fmt.Sprint to reduce allocations on hot paths.
+func valueToString(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case []byte:
+		return string(t)
+	case int:
+		return strconv.FormatInt(int64(t), 10)
+	case int8:
+		return strconv.FormatInt(int64(t), 10)
+	case int16:
+		return strconv.FormatInt(int64(t), 10)
+	case int32:
+		return strconv.FormatInt(int64(t), 10)
+	case int64:
+		return strconv.FormatInt(t, 10)
+	case uint, uint8, uint16, uint32, uint64:
+		return fmt.Sprint(t)
+	case float32:
+		return strconv.FormatFloat(float64(t), 'f', -1, 32)
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	case bool:
+		if t {
+			return "true"
+		}
+		return "false"
+	default:
+		return fmt.Sprint(t)
+	}
+}
 
 // Global handle registry
 var (
@@ -143,12 +179,17 @@ type statement struct {
 	sql      string
 	rs       *tinysql.ResultSet
 	rowIndex int
+	// Reusable buffers to avoid per-row allocations in hot paths.
+	utf16Buf []uint16
+	// charBuf could be added if we needed to reuse byte buffers for ASCII copies.
 }
 
 // ============================================================================
 // ODBC API Functions - exported to C
 // ============================================================================
 
+// SQLAllocHandle allocates an ODBC handle of the requested type and returns
+// SQL_SUCCESS on success. This matches the ODBC API's SQLAllocHandle.
 //export SQLAllocHandle
 func SQLAllocHandle(handleType C.SQLSMALLINT, inputHandle C.SQLPOINTER, outputHandlePtr *C.SQLPOINTER) C.SQLRETURN {
 	envMu.Lock()
@@ -196,6 +237,8 @@ func SQLAllocHandle(handleType C.SQLSMALLINT, inputHandle C.SQLPOINTER, outputHa
 	}
 }
 
+// SQLFreeHandle releases an ODBC handle previously allocated with
+// SQLAllocHandle. It returns SQL_SUCCESS on success.
 //export SQLFreeHandle
 func SQLFreeHandle(handleType C.SQLSMALLINT, handle C.SQLPOINTER) C.SQLRETURN {
 	envMu.Lock()
@@ -217,6 +260,8 @@ func SQLFreeHandle(handleType C.SQLSMALLINT, handle C.SQLPOINTER) C.SQLRETURN {
 	}
 }
 
+// SQLSetEnvAttr sets attributes on an ODBC environment handle. Only
+// SQL_ATTR_ODBC_VERSION is supported by this shim.
 //export SQLSetEnvAttr
 func SQLSetEnvAttr(environmentHandle C.SQLHENV, attribute C.SQLINTEGER, valuePtr C.SQLPOINTER, stringLength C.SQLINTEGER) C.SQLRETURN {
 	envMu.Lock()
@@ -237,6 +282,8 @@ func SQLSetEnvAttr(environmentHandle C.SQLHENV, attribute C.SQLINTEGER, valuePtr
 	return C.SQL_SUCCESS
 }
 
+// SQLConnect establishes a connection to a tinySQL database. The
+// serverName parameter may be a DSN like "mem://" or "file:/path".
 //export SQLConnect
 func SQLConnect(connectionHandle C.SQLHDBC, serverName *C.SQLUCHAR, nameLength1 C.SQLSMALLINT,
 	userName *C.SQLUCHAR, nameLength2 C.SQLSMALLINT, authentication *C.SQLUCHAR, nameLength3 C.SQLSMALLINT) C.SQLRETURN {
@@ -273,6 +320,8 @@ func SQLConnect(connectionHandle C.SQLHDBC, serverName *C.SQLUCHAR, nameLength1 
 	return C.SQL_SUCCESS
 }
 
+// SQLDriverConnect connects using a full connection string. The function
+// parses common keys (DSN, Database) and opens the corresponding DB.
 //export SQLDriverConnect
 func SQLDriverConnect(connectionHandle C.SQLHDBC, windowHandle C.SQLPOINTER, inConnectionString *C.SQLUCHAR, stringLength1 C.SQLSMALLINT,
 	outConnectionString *C.SQLUCHAR, bufferLength C.SQLSMALLINT, stringLength2Ptr *C.SQLSMALLINT, driverCompletion C.SQLUSMALLINT) C.SQLRETURN {
@@ -347,6 +396,8 @@ func SQLDriverConnect(connectionHandle C.SQLHDBC, windowHandle C.SQLPOINTER, inC
 	return C.SQL_SUCCESS
 }
 
+// SQLDisconnect closes the ODBC connection handle (logical disconnect).
+// It does not persist or destroy the underlying tinySQL DB instance.
 //export SQLDisconnect
 func SQLDisconnect(connectionHandle C.SQLHDBC) C.SQLRETURN {
 	envMu.Lock()
@@ -362,6 +413,8 @@ func SQLDisconnect(connectionHandle C.SQLHDBC) C.SQLRETURN {
 	return C.SQL_SUCCESS
 }
 
+// SQLExecDirect executes the provided SQL statement directly and stores
+// the resulting ResultSet on the statement handle for subsequent fetches.
 //export SQLExecDirect
 func SQLExecDirect(statementHandle C.SQLHSTMT, statementText *C.SQLUCHAR, textLength C.SQLINTEGER) C.SQLRETURN {
 	envMu.RLock()
@@ -403,6 +456,8 @@ func SQLExecDirect(statementHandle C.SQLHSTMT, statementText *C.SQLUCHAR, textLe
 	return C.SQL_SUCCESS
 }
 
+// SQLFetch advances the result cursor to the next row. Returns SQL_NO_DATA
+// when no more rows are available.
 //export SQLFetch
 func SQLFetch(statementHandle C.SQLHSTMT) C.SQLRETURN {
 	envMu.RLock()
@@ -422,6 +477,8 @@ func SQLFetch(statementHandle C.SQLHSTMT) C.SQLRETURN {
 	return C.SQL_SUCCESS
 }
 
+// SQLGetData retrieves column data for the current row into the caller
+// provided buffer. Supports `SQL_C_CHAR` and `SQL_C_WCHAR` target types.
 //export SQLGetData
 func SQLGetData(statementHandle C.SQLHSTMT, columnNumber C.SQLUSMALLINT, targetType C.SQLSMALLINT,
 	targetValuePtr C.SQLPOINTER, bufferLength C.SQLLEN, strLenOrIndPtr *C.SQLLEN) C.SQLRETURN {
@@ -456,47 +513,55 @@ func SQLGetData(statementHandle C.SQLHSTMT, columnNumber C.SQLUSMALLINT, targetT
 
 	strVal := fmt.Sprintf("%v", val)
 
+	// Reuse statement buffer to avoid per-call allocations for UTF-16 conversion.
+	// Obtain the statement pointer (we already have stmt from map above).
+	s := stmt
+
 	// Handle wide char (UTF-16) encoding for SQL_C_WCHAR
 	if targetType == C.SQL_C_WCHAR {
-		// Convert UTF-8 string to UTF-16LE
-		utf16 := make([]uint16, 0, len(strVal)+1)
+		// Count runes (needed for resulting UTF-16 length)
+		runeCount := utf8.RuneCountInString(strVal)
+		needed := runeCount + 1 // null terminator
+		if cap(s.utf16Buf) < needed {
+			s.utf16Buf = make([]uint16, 0, needed)
+		}
+		s.utf16Buf = s.utf16Buf[:0]
+
 		for _, r := range strVal {
 			if r < 0x10000 {
-				utf16 = append(utf16, uint16(r))
+				s.utf16Buf = append(s.utf16Buf, uint16(r))
 			} else {
-				// Encode as surrogate pair for characters > U+FFFF
 				r -= 0x10000
-				utf16 = append(utf16, uint16(0xD800+(r>>10)))
-				utf16 = append(utf16, uint16(0xDC00+(r&0x3FF)))
+				s.utf16Buf = append(s.utf16Buf, uint16(0xD800+(r>>10)))
+				s.utf16Buf = append(s.utf16Buf, uint16(0xDC00+(r&0x3FF)))
 			}
 		}
-		utf16 = append(utf16, 0) // Null terminator
+		s.utf16Buf = append(s.utf16Buf, 0)
 
-		if targetValuePtr != nil && bufferLength > 0 {
-			bytesToCopy := len(utf16) * 2
+		if targetValuePtr != nil && bufferLength > 0 && len(s.utf16Buf) > 0 {
+			bytesToCopy := len(s.utf16Buf) * 2
 			if bytesToCopy > int(bufferLength) {
 				bytesToCopy = int(bufferLength)
 			}
-			C.memcpy(unsafe.Pointer(targetValuePtr), unsafe.Pointer(&utf16[0]), C.size_t(bytesToCopy))
+			C.memcpy(unsafe.Pointer(targetValuePtr), unsafe.Pointer(&s.utf16Buf[0]), C.size_t(bytesToCopy))
 		}
 
 		if strLenOrIndPtr != nil {
-			// Return length in bytes (excluding null terminator)
-			*strLenOrIndPtr = C.SQLLEN((len(utf16) - 1) * 2)
+			*strLenOrIndPtr = C.SQLLEN((len(s.utf16Buf) - 1) * 2)
 		}
 	} else {
-		// Handle regular C string (SQL_C_CHAR)
+		// Handle regular C string (SQL_C_CHAR) without allocating C string.
 		if targetValuePtr != nil && bufferLength > 0 {
-			cStr := C.CString(strVal)
-			defer C.free(unsafe.Pointer(cStr))
-
-			// Copy string including null terminator
+			// Copy up to bufferLength-1 bytes and null-terminate.
 			lenToCopy := len(strVal)
 			if lenToCopy >= int(bufferLength) {
 				lenToCopy = int(bufferLength) - 1
 			}
-			C.memcpy(unsafe.Pointer(targetValuePtr), unsafe.Pointer(cStr), C.size_t(lenToCopy))
-			// Ensure null termination
+			if lenToCopy > 0 {
+				srcPtr := unsafe.Pointer(unsafe.StringData(strVal))
+				C.memcpy(unsafe.Pointer(targetValuePtr), srcPtr, C.size_t(lenToCopy))
+			}
+			// Null terminate
 			targetPtr := unsafe.Pointer(uintptr(unsafe.Pointer(targetValuePtr)) + uintptr(lenToCopy))
 			*(*C.char)(targetPtr) = 0
 		}
@@ -509,6 +574,7 @@ func SQLGetData(statementHandle C.SQLHSTMT, columnNumber C.SQLUSMALLINT, targetT
 	return C.SQL_SUCCESS
 }
 
+// SQLNumResultCols returns the number of columns in the current result set.
 //export SQLNumResultCols
 func SQLNumResultCols(statementHandle C.SQLHSTMT, columnCountPtr *C.SQLSMALLINT) C.SQLRETURN {
 	envMu.RLock()
@@ -529,6 +595,7 @@ func SQLNumResultCols(statementHandle C.SQLHSTMT, columnCountPtr *C.SQLSMALLINT)
 	return C.SQL_SUCCESS
 }
 
+// SQLRowCount returns the number of rows in the current result set (if known).
 //export SQLRowCount
 func SQLRowCount(statementHandle C.SQLHSTMT, rowCountPtr *C.SQLLEN) C.SQLRETURN {
 	envMu.RLock()
@@ -549,6 +616,8 @@ func SQLRowCount(statementHandle C.SQLHSTMT, rowCountPtr *C.SQLLEN) C.SQLRETURN 
 	return C.SQL_SUCCESS
 }
 
+// SQLDescribeCol provides basic metadata about a result column (name, type,
+// size, nullable). It fills the supplied output buffers.
 //export SQLDescribeCol
 func SQLDescribeCol(statementHandle C.SQLHSTMT, columnNumber C.SQLUSMALLINT,
 	columnName *C.SQLUCHAR, bufferLength C.SQLSMALLINT, nameLengthPtr *C.SQLSMALLINT,
@@ -573,10 +642,18 @@ func SQLDescribeCol(statementHandle C.SQLHSTMT, columnNumber C.SQLUSMALLINT,
 	}
 
 	colNameStr := stmt.rs.Cols[colIdx]
-	if columnName != nil {
-		cStr := C.CString(colNameStr)
-		defer C.free(unsafe.Pointer(cStr))
-		C.strncpy((*C.char)(unsafe.Pointer(columnName)), cStr, C.size_t(bufferLength))
+	if columnName != nil && bufferLength > 0 {
+		lenToCopy := len(colNameStr)
+		if lenToCopy >= int(bufferLength) {
+			lenToCopy = int(bufferLength) - 1
+		}
+		if lenToCopy > 0 {
+			srcPtr := unsafe.Pointer(unsafe.StringData(colNameStr))
+			C.memcpy(unsafe.Pointer(columnName), srcPtr, C.size_t(lenToCopy))
+		}
+		// Null terminate
+		termPtr := unsafe.Pointer(uintptr(unsafe.Pointer(columnName)) + uintptr(lenToCopy))
+		*(*C.char)(termPtr) = 0
 	}
 	if nameLengthPtr != nil {
 		*nameLengthPtr = C.SQLSMALLINT(len(colNameStr))
@@ -598,6 +675,8 @@ func SQLDescribeCol(statementHandle C.SQLHSTMT, columnNumber C.SQLUSMALLINT,
 	return C.SQL_SUCCESS
 }
 
+// SQLEndTran commits or rolls back a transaction associated with the handle.
+// This implementation tracks an `inTx` flag on the connection object.
 //export SQLEndTran
 func SQLEndTran(handleType C.SQLSMALLINT, handle C.SQLPOINTER, completionType C.SQLSMALLINT) C.SQLRETURN {
 	envMu.Lock()
@@ -622,6 +701,8 @@ func SQLEndTran(handleType C.SQLSMALLINT, handle C.SQLPOINTER, completionType C.
 	return C.SQL_ERROR
 }
 
+// SQLPrepare stores the provided SQL text on the statement handle for later
+// execution via SQLExecute. It does not perform parsing until execute time.
 //export SQLPrepare
 func SQLPrepare(statementHandle C.SQLHSTMT, statementText *C.SQLUCHAR, textLength C.SQLINTEGER) C.SQLRETURN {
 	envMu.Lock()
@@ -639,6 +720,8 @@ func SQLPrepare(statementHandle C.SQLHSTMT, statementText *C.SQLUCHAR, textLengt
 	return C.SQL_SUCCESS
 }
 
+// SQLExecute runs a previously prepared statement (SQLPrepare) and delegates
+// to SQLExecDirect for execution.
 //export SQLExecute
 func SQLExecute(statementHandle C.SQLHSTMT) C.SQLRETURN {
 	envMu.RLock()
@@ -657,6 +740,8 @@ func SQLExecute(statementHandle C.SQLHSTMT) C.SQLRETURN {
 	return SQLExecDirect(statementHandle, (*C.SQLUCHAR)(unsafe.Pointer(cSQL)), C.SQL_NTS)
 }
 
+// SQLGetInfo returns driver and data source information strings/numbers as
+// defined by the ODBC specification (driver name, version, limits, etc.).
 //export SQLGetInfo
 func SQLGetInfo(connectionHandle C.SQLHDBC, infoType C.SQLUSMALLINT, infoValuePtr C.SQLPOINTER, bufferLength C.SQLSMALLINT, stringLengthPtr *C.SQLSMALLINT) C.SQLRETURN {
 	envMu.RLock()
@@ -710,9 +795,17 @@ func SQLGetInfo(connectionHandle C.SQLHDBC, infoType C.SQLUSMALLINT, infoValuePt
 
 	if infoStr != "" {
 		if infoValuePtr != nil && bufferLength > 0 {
-			cStr := C.CString(infoStr)
-			defer C.free(unsafe.Pointer(cStr))
-			C.strncpy((*C.char)(infoValuePtr), cStr, C.size_t(bufferLength))
+			lenToCopy := len(infoStr)
+			if lenToCopy >= int(bufferLength) {
+				lenToCopy = int(bufferLength) - 1
+			}
+			if lenToCopy > 0 {
+				srcPtr := unsafe.Pointer(unsafe.StringData(infoStr))
+				C.memcpy(unsafe.Pointer(infoValuePtr), srcPtr, C.size_t(lenToCopy))
+			}
+			// Null terminate
+			termPtr := unsafe.Pointer(uintptr(unsafe.Pointer(infoValuePtr)) + uintptr(lenToCopy))
+			*(*C.char)(termPtr) = 0
 		}
 		if stringLengthPtr != nil {
 			*stringLengthPtr = C.SQLSMALLINT(len(infoStr))
@@ -724,6 +817,9 @@ func SQLGetInfo(connectionHandle C.SQLHDBC, infoType C.SQLUSMALLINT, infoValuePt
 	return C.SQL_SUCCESS
 }
 
+// SQLTables returns a result set describing tables accessible in the current
+// connection. It maps tinySQL's SHOW TABLES output to the ODBC standard
+// result layout.
 //export SQLTables
 func SQLTables(statementHandle C.SQLHSTMT, catalogName *C.SQLUCHAR, nameLength1 C.SQLSMALLINT,
 	schemaName *C.SQLUCHAR, nameLength2 C.SQLSMALLINT, tableName *C.SQLUCHAR, nameLength3 C.SQLSMALLINT,
@@ -771,12 +867,12 @@ func SQLTables(statementHandle C.SQLHSTMT, catalogName *C.SQLUCHAR, nameLength1 
 		return C.SQL_SUCCESS
 	}
 
-	// Convert to ODBC standard table format
+	// Convert to ODBC standard table format (avoid fmt for common types)
 	odbcRows := make([]tinysql.Row, 0)
 	for _, row := range rs.Rows {
 		for _, col := range rs.Cols {
 			if val, ok := tinysql.GetVal(row, col); ok {
-				tableName := fmt.Sprintf("%v", val)
+				tableName := valueToString(val)
 				odbcRows = append(odbcRows, tinysql.Row{
 					"table_cat":   "",
 					"table_schem": "",
@@ -797,6 +893,8 @@ func SQLTables(statementHandle C.SQLHSTMT, catalogName *C.SQLUCHAR, nameLength1 
 	return C.SQL_SUCCESS
 }
 
+// SQLColumns returns column metadata for the named table. It produces the
+// standard ODBC columns: table_name, column_name, data_type, etc.
 //export SQLColumns
 func SQLColumns(statementHandle C.SQLHSTMT, catalogName *C.SQLUCHAR, nameLength1 C.SQLSMALLINT,
 	schemaName *C.SQLUCHAR, nameLength2 C.SQLSMALLINT, tableName *C.SQLUCHAR, nameLength3 C.SQLSMALLINT,
@@ -822,6 +920,7 @@ func SQLColumns(statementHandle C.SQLHSTMT, catalogName *C.SQLUCHAR, nameLength1
 
 	table := ""
 	if tableName != nil {
+		// Avoid C string allocation; copy Go string from C pointer
 		table = C.GoString((*C.char)(unsafe.Pointer(tableName)))
 	}
 
@@ -877,6 +976,9 @@ func SQLColumns(statementHandle C.SQLHSTMT, catalogName *C.SQLUCHAR, nameLength1
 	return C.SQL_SUCCESS
 }
 
+// SQLSetConnectAttr sets connection-level attributes such as autocommit.
+// This shim accepts the attribute and returns success without extensive
+// side effects.
 //export SQLSetConnectAttr
 func SQLSetConnectAttr(connectionHandle C.SQLHDBC, attribute C.SQLINTEGER, valuePtr C.SQLPOINTER, stringLength C.SQLINTEGER) C.SQLRETURN {
 	envMu.Lock()
@@ -897,6 +999,8 @@ func SQLSetConnectAttr(connectionHandle C.SQLHDBC, attribute C.SQLINTEGER, value
 	return C.SQL_SUCCESS
 }
 
+// SQLSetStmtAttr sets statement-level attributes. The implementation
+// currently accepts attributes but does not change behavior.
 //export SQLSetStmtAttr
 func SQLSetStmtAttr(statementHandle C.SQLHSTMT, attribute C.SQLINTEGER, valuePtr C.SQLPOINTER, stringLength C.SQLINTEGER) C.SQLRETURN {
 	envMu.Lock()
@@ -912,12 +1016,17 @@ func SQLSetStmtAttr(statementHandle C.SQLHSTMT, attribute C.SQLINTEGER, valuePtr
 	return C.SQL_SUCCESS
 }
 
+// SQLMoreResults reports whether additional result sets are available for a
+// statement. tinySQL does not support multiple result sets, so this returns
+// SQL_NO_DATA.
 //export SQLMoreResults
 func SQLMoreResults(statementHandle C.SQLHSTMT) C.SQLRETURN {
-	// tinySQL doesn't support multiple result sets
 	return C.SQL_NO_DATA
 }
 
+// SQLGetDiagRec returns diagnostic information for the last error.
+// This simplified implementation returns a generic error message when
+// requested; it can be extended to provide richer diagnostics.
 //export SQLGetDiagRec
 func SQLGetDiagRec(handleType C.SQLSMALLINT, handle C.SQLPOINTER, recNumber C.SQLSMALLINT,
 	sqlState *C.SQLUCHAR, nativeErrorPtr *C.SQLINTEGER, messageText *C.SQLUCHAR,

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,14 +25,12 @@ type HybridBackend struct {
 	disk *DiskBackend
 	pool *BufferPool
 	mode StorageMode // ModeHybrid or ModeIndex
-	mu   sync.RWMutex
 
 	// Track which tables have been modified in memory so Sync can flush them.
 	dirty     map[string]map[string]bool // tenant → lower(name) → dirty
 	dirtyLock sync.Mutex
 
-	loadCount     atomic.Int64
-	evictionCount atomic.Int64
+	loadCount atomic.Int64
 }
 
 // NewHybridBackend creates a HybridBackend.
@@ -115,7 +114,9 @@ func (h *HybridBackend) SaveTable(tenant string, t *Table) error {
 	tn := strings.ToLower(tenant)
 
 	// Update cache
-	_ = h.pool.Put(tn, lc, t)
+	if err := h.pool.Put(tn, lc, t); err != nil {
+		log.Printf("warning: cache update failed for %s/%s: %v", tn, lc, err)
+	}
 
 	// Clear dirty flag
 	h.dirtyLock.Lock()

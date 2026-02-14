@@ -380,10 +380,7 @@ func (f *XMLTableFunc) Execute(ctx context.Context, args []Expr, env ExecEnv, ro
 func parseXMLToTable(xmlStr string, recordName string) (*ResultSet, error) {
 	// Support simple XPath-like paths (e.g. "root/records/record")
 	// and include attributes as columns named "attr_<name>".
-	path := strings.TrimSpace(recordName)
-	if strings.HasPrefix(path, "/") {
-		path = strings.TrimPrefix(path, "/")
-	}
+	path := strings.TrimPrefix(strings.TrimSpace(recordName), "/")
 	var pathSegments []string
 	if path != "" {
 		pathSegments = strings.Split(path, "/")

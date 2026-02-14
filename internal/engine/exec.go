@@ -20,6 +20,7 @@ package engine
 import (
 	"context"
 	"crypto/md5"
+	crand "crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -3396,11 +3397,18 @@ func evalRound(env ExecEnv, args []Expr, row Row) (any, error) {
 		if err != nil {
 			return nil, err
 		}
+		if decVal == nil {
+			return nil, nil
+		}
 		decAny, err := coerceToInt(decVal)
 		if err != nil {
 			return nil, fmt.Errorf("ROUND decimals must be numeric")
 		}
-		decimals, _ = decAny.(int)
+		var ok bool
+		decimals, ok = decAny.(int)
+		if !ok {
+			return nil, fmt.Errorf("ROUND decimals internal error: expected int, got %T", decAny)
+		}
 	}
 
 	mult := math.Pow(10, float64(decimals))
@@ -4350,7 +4358,7 @@ func evalPosition(env ExecEnv, args []Expr, row Row) (any, error) {
 func evalUuid(env ExecEnv, args []Expr, row Row) (any, error) {
 	// Generate a simple UUID v4
 	b := make([]byte, 16)
-	rand.Read(b)
+	crand.Read(b)
 	b[6] = (b[6] & 0x0f) | 0x40 // Version 4
 	b[8] = (b[8] & 0x3f) | 0x80 // Variant
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:]), nil
@@ -5659,7 +5667,7 @@ func columnsFromRows(rows []Row) []string {
 	return cols
 }
 
-// Helper functions for projName, anyAggInSelect, and appendUnique
+// Helper functions for projName and anyAggInSelect
 
 // projName generates the column name for a select item
 func projName(it SelectItem, idx int) string {
@@ -5725,16 +5733,6 @@ func hasWindowFunction(e Expr) bool {
 		}
 	}
 	return false
-}
-
-// appendUnique appends a column name to the slice if it's not already present
-func appendUnique(cols []string, c string) []string {
-	for _, existing := range cols {
-		if existing == c {
-			return cols
-		}
-	}
-	return append(cols, c)
 }
 
 // ==================== Window Function Support ====================

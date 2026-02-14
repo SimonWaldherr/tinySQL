@@ -15,6 +15,9 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
+
 	tsql "github.com/SimonWaldherr/tinySQL"
 )
 
@@ -545,7 +548,7 @@ func (h *pageHandler) buildNavHTML(currentPage string) string {
 			if name == "index" {
 				label = "Home"
 			} else {
-				label = strings.Title(strings.ReplaceAll(name, "_", " "))
+				label = cases.Title(language.English).String(strings.ReplaceAll(name, "_", " "))
 			}
 		}
 		order := 0

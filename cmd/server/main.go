@@ -9,7 +9,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +26,7 @@ import (
 var (
 	flagDSN     = flag.String("dsn", "mem://?tenant=default", "DSN for database/sql (mem:// or file:/path.db?tenant=...&autosave=1)")
 	flagHTTP    = flag.String("http", ":8080", "HTTP listen address (empty to disable)")
+	flagAuth    = flag.String("auth", "", "Authorization token (optional, e.g. Bearer <token>)")
 	flagGRPC    = flag.String("grpc", ":9090", "gRPC listen address (empty to disable)")
 	flagPeers   = flag.String("peers", "", "Comma-separated list of gRPC peer addresses for federation (optional)")
 	flagTenant  = flag.String("tenant", "default", "Default tenant if none provided in request")
@@ -117,17 +117,34 @@ func _TinySQL_Query_Handler(srv any, ctx context.Context, dec func(any) error, i
 
 // server state
 type server struct {
-	db       *storage.DB
-	cache    *engine.QueryCache
-	peers    []string
-	defaultT string
+	db        *storage.DB
+	cache     *engine.QueryCache
+	peers     []string
+	defaultT  string
+	authToken string
 }
 
 func newServer() *server {
 	return &server{
-		db:       storage.NewDB(),
-		cache:    engine.NewQueryCache(200),
-		defaultT: *flagTenant,
+		db:        storage.NewDB(),
+		cache:     engine.NewQueryCache(200),
+		defaultT:  *flagTenant,
+		authToken: *flagAuth,
+	}
+}
+
+func (s *server) withAuth(h http.HandlerFunc) http.HandlerFunc {
+	if s.authToken == "" {
+		return h
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		authH := r.Header.Get("Authorization")
+		token := strings.TrimPrefix(authH, "Bearer ")
+		if token != s.authToken {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		h(w, r)
 	}
 }
 
@@ -196,6 +213,7 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req execRequest
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10 MB limit
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
@@ -236,6 +254,7 @@ func (s *server) handleFederatedQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req queryRequest
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10 MB limit
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
@@ -293,12 +312,8 @@ func equalStringSlices(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	mm := make(map[string]struct{}, len(a))
-	for _, s := range a {
-		mm[s] = struct{}{}
-	}
-	for _, s := range b {
-		if _, ok := mm[s]; !ok {
+	for i := range a {
+		if a[i] != b[i] {
 			return false
 		}
 	}
@@ -312,7 +327,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 
 // gRPC JSON client helper
 func grpcQuery(addr string, req *queryRequest) (*queryResponse, error) {
-	conn, err := grpc.Dial(addr,
+	conn, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.ForceCodec(jsonCodec{})),
 	)
@@ -348,42 +363,50 @@ func main() {
 	// Register JSON codec for gRPC
 	encoding.RegisterCodec(jsonCodec{})
 
-	// Start gRPC server
-	var grpcErr error
+	// Start servers
+	errChan := make(chan error, 2)
+	var wg sync.WaitGroup
+
 	if *flagGRPC != "" {
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			lis, err := net.Listen("tcp", *flagGRPC)
 			if err != nil {
-				log.Printf("gRPC listen error: %v", err)
-				grpcErr = err
+				errChan <- fmt.Errorf("gRPC listen error: %v", err)
 				return
 			}
 			gs := grpc.NewServer()
 			registerTinySQLServer(gs, srv)
 			log.Printf("gRPC listening on %s", *flagGRPC)
 			if err := gs.Serve(lis); err != nil {
-				log.Printf("gRPC serve error: %v", err)
-				grpcErr = err
+				errChan <- fmt.Errorf("gRPC serve error: %v", err)
 			}
 		}()
 	}
 
 	// Start HTTP server
 	if *flagHTTP != "" {
-		mux := http.NewServeMux()
-		mux.HandleFunc("/api/exec", srv.handleExec)
-		mux.HandleFunc("/api/query", srv.handleQuery)
-		mux.HandleFunc("/api/status", srv.handleStatus)
-		mux.HandleFunc("/api/federated/query", srv.handleFederatedQuery)
-		log.Printf("HTTP listening on %s", *flagHTTP)
-		if err := http.ListenAndServe(*flagHTTP, mux); err != nil {
-			log.Printf("HTTP serve error: %v", err)
-			if grpcErr != nil {
-				os.Exit(1)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mux := http.NewServeMux()
+			mux.HandleFunc("/api/exec", srv.withAuth(srv.handleExec))
+			mux.HandleFunc("/api/query", srv.withAuth(srv.handleQuery))
+			mux.HandleFunc("/api/status", srv.withAuth(srv.handleStatus))
+			mux.HandleFunc("/api/federated/query", srv.withAuth(srv.handleFederatedQuery))
+			log.Printf("HTTP listening on %s", *flagHTTP)
+			if err := http.ListenAndServe(*flagHTTP, mux); err != nil {
+				errChan <- fmt.Errorf("HTTP serve error: %v", err)
 			}
-		}
-	} else {
-		// If HTTP disabled, block on gRPC only
-		select {}
+		}()
 	}
+
+	if *flagHTTP == "" && *flagGRPC == "" {
+		log.Fatal("No server (HTTP or gRPC) enabled")
+	}
+
+	// Wait for any error
+	err = <-errChan
+	log.Fatal(err)
 }

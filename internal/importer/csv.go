@@ -102,6 +102,7 @@ type ImportResult struct {
 	Delimiter    rune              // Detected or configured delimiter
 	HadHeader    bool              // Whether a header row was detected/configured
 	Encoding     string            // Detected encoding: "utf-8", "utf-8-bom", "utf-16le", "utf-16be"
+	LineEnding   string            // Detected line ending: "\n" or "\r\n"
 	ColumnNames  []string          // Final column names used
 	ColumnTypes  []storage.ColType // Detected column types
 	Errors       []string          // Non-fatal errors encountered during import
@@ -160,13 +161,14 @@ func ImportCSV(
 	result.Encoding = enc
 
 	// Detect delimiter, header and initialize CSV reader
-	sr, csvr, colNames, firstDataRow, delim, hasHeader, err := initCSVFromReader(rr, opts)
+	sr, csvr, colNames, firstDataRow, delim, hasHeader, lineEnding, err := initCSVFromReader(rr, opts)
 	if err != nil {
 		return nil, err
 	}
 	result.Delimiter = delim
 	result.HadHeader = hasHeader
 	result.ColumnNames = colNames
+	result.LineEnding = lineEnding
 
 	// Read all records into memory (keeps behavior unchanged)
 	allRecords := make([][]string, 0)
@@ -257,7 +259,7 @@ func prepareReader(src io.Reader, opts *ImportOptions) (io.Reader, string, bool,
 
 // initCSVFromReader samples the reader to detect delimiter/header and returns a
 // prepared bufio.Reader, csv.Reader, column names and first data row (if any).
-func initCSVFromReader(rr io.Reader, opts *ImportOptions) (*bufio.Reader, *csv.Reader, []string, []string, rune, bool, error) {
+func initCSVFromReader(rr io.Reader, opts *ImportOptions) (*bufio.Reader, *csv.Reader, []string, []string, rune, bool, string, error) {
 	sr := bufio.NewReader(rr)
 	peek := peekN(sr, opts.SampleBytes)
 	lines := splitUniversal(string(peek))
@@ -265,6 +267,7 @@ func initCSVFromReader(rr io.Reader, opts *ImportOptions) (*bufio.Reader, *csv.R
 	delim := detectDelimiter(lines, candidateDelims(opts.DelimiterCandidates))
 	records := parseRecords(lines, delim, opts.SampleRecords)
 	hasHeader := decideHeader(records, opts.HeaderMode)
+	lineEnding := detectLineEnding(string(peek))
 
 	csvr := csv.NewReader(sr)
 	csvr.Comma = delim
@@ -275,9 +278,9 @@ func initCSVFromReader(rr io.Reader, opts *ImportOptions) (*bufio.Reader, *csv.R
 	firstRec, err := csvr.Read()
 	if err != nil {
 		if errors.Is(err, io.EOF) {
-			return nil, nil, nil, nil, 0, false, fmt.Errorf("empty input")
+			return nil, nil, nil, nil, 0, false, "", fmt.Errorf("empty input")
 		}
-		return nil, nil, nil, nil, 0, false, fmt.Errorf("read first record: %w", err)
+		return nil, nil, nil, nil, 0, false, "", fmt.Errorf("read first record: %w", err)
 	}
 
 	var colNames []string
@@ -289,7 +292,16 @@ func initCSVFromReader(rr io.Reader, opts *ImportOptions) (*bufio.Reader, *csv.R
 		firstDataRow = firstRec
 	}
 
-	return sr, csvr, colNames, firstDataRow, delim, hasHeader, nil
+	return sr, csvr, colNames, firstDataRow, delim, hasHeader, lineEnding, nil
+}
+
+// detectLineEnding inspects a sample of the file and returns "\r\n" if
+// CRLF is prevalent, otherwise returns "\n".
+func detectLineEnding(s string) string {
+	if strings.Contains(s, "\r\n") {
+		return "\r\n"
+	}
+	return "\n"
 }
 
 // ============================================================================
@@ -319,6 +331,13 @@ func applyDefaults(o *ImportOptions) {
 		o.DateTimeFormats = []string{
 			time.RFC3339,
 			time.RFC3339Nano,
+			time.RFC1123,
+			time.RFC1123Z,
+			time.RFC822,
+			time.RFC822Z,
+			time.ANSIC,
+			time.UnixDate,
+			time.RubyDate,
 			"2006-01-02",
 			"2006-01-02 15:04:05",
 			"2006-01-02T15:04:05",
@@ -326,13 +345,16 @@ func applyDefaults(o *ImportOptions) {
 			"01/02/2006 15:04:05",
 			"02.01.2006",
 			"02.01.2006 15:04:05",
+			"02-Jan-2006",
+			"2 Jan 2006",
+			"2006/01/02",
 		}
 	}
 	if !o.CreateTable && !o.Truncate {
 		// Enable CreateTable by default if neither option is explicitly set
 		o.CreateTable = true
 	}
-	if o.TypeInference == false && o.CreateTable {
+	if !o.TypeInference && o.CreateTable {
 		// Default TypeInference to true if not explicitly disabled
 		o.TypeInference = true
 	}

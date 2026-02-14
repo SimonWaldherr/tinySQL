@@ -253,7 +253,10 @@ func (bt *BTree) insertWithSplit(txID TxID, path []PageID, entry LeafEntry) erro
 			nextBP := WrapBTreePage(nextBuf)
 			nextBP.SetPrevLeaf(rightID)
 			SetPageCRC(nextBuf)
-			_ = bt.pager.WritePage(txID, oldNext, nextBuf)
+			if err := bt.pager.WritePage(txID, oldNext, nextBuf); err != nil {
+				bt.pager.UnpinPage(oldNext)
+				return err
+			}
 			bt.pager.UnpinPage(oldNext)
 		}
 	}

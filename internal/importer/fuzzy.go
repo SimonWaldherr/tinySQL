@@ -15,6 +15,9 @@ import (
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
+// headerPattern matches typical column-name identifiers.
+var headerPattern = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]*$`)
+
 // FuzzyImportOptions extends ImportOptions with fuzzy parsing capabilities
 type FuzzyImportOptions struct {
 	*ImportOptions
@@ -242,8 +245,7 @@ func fuzzyDecideHeader(records [][]string, mode string) bool {
 		}
 
 		// Check if it's a single word or snake_case/camelCase identifier
-		matched, _ := regexp.MatchString(`^[a-zA-Z][a-zA-Z0-9_]*$`, headVal)
-		if matched {
+		if headerPattern.MatchString(headVal) {
 			isTypicalHeader = true
 		}
 

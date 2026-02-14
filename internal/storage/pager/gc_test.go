@@ -105,6 +105,8 @@ func TestGC_SimulatedOrphans(t *testing.T) {
 	pb.pager.CommitTx(txID)
 	pb.pager.Checkpoint()
 
+	t.Logf("orphan page IDs: %v", orphanIDs)
+
 	// GC should find and reclaim these orphans.
 	result, err := pb.GC()
 	if err != nil {
