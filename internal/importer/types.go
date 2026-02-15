@@ -1,9 +1,12 @@
 package importer
 
 import (
+	"math/big"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -203,6 +206,37 @@ func convertValue(val string, colType storage.ColType, dateFormats []string, nul
 
 	case storage.TimeType, storage.DateType, storage.DateTimeType, storage.TimestampType:
 		return parseDateTime(val, dateFormats)
+
+	case storage.DecimalType, storage.MoneyType:
+		// Use big.Rat for arbitrary precision decimal representation
+		r := new(big.Rat)
+		if _, ok := r.SetString(val); !ok {
+			return nil, strconv.ErrSyntax
+		}
+		return r, nil
+
+	case storage.UUIDType:
+		u, err := uuid.Parse(val)
+		if err != nil {
+			return nil, err
+		}
+		return u, nil
+
+	case storage.BlobType:
+		// For CSV/JSON import, treat as raw bytes of the string value
+		return []byte(val), nil
+
+	case storage.XMLType:
+		// Keep raw XML as string
+		return val, nil
+
+	case storage.IntervalType:
+		// Parse as Go duration where possible
+		if d, err := time.ParseDuration(val); err == nil {
+			return d, nil
+		}
+		// Fallback to string
+		return val, nil
 
 	default:
 		// TEXT and all other types

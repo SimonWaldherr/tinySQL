@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 	"sort"
 	"sync"
 )
@@ -77,7 +78,7 @@ func (c *Catalog) PutEntry(txID TxID, entry CatalogEntry) error {
 	defer c.mu.Unlock()
 
 	key := catalogKey(entry.Tenant, entry.Table)
-	val, err := json.Marshal(entry)
+	val, err := storage.JSONMarshal(entry)
 	if err != nil {
 		return err
 	}

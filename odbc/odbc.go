@@ -190,7 +190,6 @@ type statement struct {
 
 // SQLAllocHandle allocates an ODBC handle of the requested type and returns
 // SQL_SUCCESS on success. This matches the ODBC API's SQLAllocHandle.
-//export SQLAllocHandle
 func SQLAllocHandle(handleType C.SQLSMALLINT, inputHandle C.SQLPOINTER, outputHandlePtr *C.SQLPOINTER) C.SQLRETURN {
 	envMu.Lock()
 	defer envMu.Unlock()
@@ -239,7 +238,6 @@ func SQLAllocHandle(handleType C.SQLSMALLINT, inputHandle C.SQLPOINTER, outputHa
 
 // SQLFreeHandle releases an ODBC handle previously allocated with
 // SQLAllocHandle. It returns SQL_SUCCESS on success.
-//export SQLFreeHandle
 func SQLFreeHandle(handleType C.SQLSMALLINT, handle C.SQLPOINTER) C.SQLRETURN {
 	envMu.Lock()
 	defer envMu.Unlock()
@@ -262,7 +260,6 @@ func SQLFreeHandle(handleType C.SQLSMALLINT, handle C.SQLPOINTER) C.SQLRETURN {
 
 // SQLSetEnvAttr sets attributes on an ODBC environment handle. Only
 // SQL_ATTR_ODBC_VERSION is supported by this shim.
-//export SQLSetEnvAttr
 func SQLSetEnvAttr(environmentHandle C.SQLHENV, attribute C.SQLINTEGER, valuePtr C.SQLPOINTER, stringLength C.SQLINTEGER) C.SQLRETURN {
 	envMu.Lock()
 	defer envMu.Unlock()
@@ -284,7 +281,6 @@ func SQLSetEnvAttr(environmentHandle C.SQLHENV, attribute C.SQLINTEGER, valuePtr
 
 // SQLConnect establishes a connection to a tinySQL database. The
 // serverName parameter may be a DSN like "mem://" or "file:/path".
-//export SQLConnect
 func SQLConnect(connectionHandle C.SQLHDBC, serverName *C.SQLUCHAR, nameLength1 C.SQLSMALLINT,
 	userName *C.SQLUCHAR, nameLength2 C.SQLSMALLINT, authentication *C.SQLUCHAR, nameLength3 C.SQLSMALLINT) C.SQLRETURN {
 
@@ -322,7 +318,6 @@ func SQLConnect(connectionHandle C.SQLHDBC, serverName *C.SQLUCHAR, nameLength1 
 
 // SQLDriverConnect connects using a full connection string. The function
 // parses common keys (DSN, Database) and opens the corresponding DB.
-//export SQLDriverConnect
 func SQLDriverConnect(connectionHandle C.SQLHDBC, windowHandle C.SQLPOINTER, inConnectionString *C.SQLUCHAR, stringLength1 C.SQLSMALLINT,
 	outConnectionString *C.SQLUCHAR, bufferLength C.SQLSMALLINT, stringLength2Ptr *C.SQLSMALLINT, driverCompletion C.SQLUSMALLINT) C.SQLRETURN {
 
@@ -398,7 +393,6 @@ func SQLDriverConnect(connectionHandle C.SQLHDBC, windowHandle C.SQLPOINTER, inC
 
 // SQLDisconnect closes the ODBC connection handle (logical disconnect).
 // It does not persist or destroy the underlying tinySQL DB instance.
-//export SQLDisconnect
 func SQLDisconnect(connectionHandle C.SQLHDBC) C.SQLRETURN {
 	envMu.Lock()
 	defer envMu.Unlock()
@@ -415,7 +409,6 @@ func SQLDisconnect(connectionHandle C.SQLHDBC) C.SQLRETURN {
 
 // SQLExecDirect executes the provided SQL statement directly and stores
 // the resulting ResultSet on the statement handle for subsequent fetches.
-//export SQLExecDirect
 func SQLExecDirect(statementHandle C.SQLHSTMT, statementText *C.SQLUCHAR, textLength C.SQLINTEGER) C.SQLRETURN {
 	envMu.RLock()
 	stmtID := uintptr(statementHandle)
@@ -458,7 +451,6 @@ func SQLExecDirect(statementHandle C.SQLHSTMT, statementText *C.SQLUCHAR, textLe
 
 // SQLFetch advances the result cursor to the next row. Returns SQL_NO_DATA
 // when no more rows are available.
-//export SQLFetch
 func SQLFetch(statementHandle C.SQLHSTMT) C.SQLRETURN {
 	envMu.RLock()
 	defer envMu.RUnlock()
@@ -479,7 +471,6 @@ func SQLFetch(statementHandle C.SQLHSTMT) C.SQLRETURN {
 
 // SQLGetData retrieves column data for the current row into the caller
 // provided buffer. Supports `SQL_C_CHAR` and `SQL_C_WCHAR` target types.
-//export SQLGetData
 func SQLGetData(statementHandle C.SQLHSTMT, columnNumber C.SQLUSMALLINT, targetType C.SQLSMALLINT,
 	targetValuePtr C.SQLPOINTER, bufferLength C.SQLLEN, strLenOrIndPtr *C.SQLLEN) C.SQLRETURN {
 
@@ -575,7 +566,6 @@ func SQLGetData(statementHandle C.SQLHSTMT, columnNumber C.SQLUSMALLINT, targetT
 }
 
 // SQLNumResultCols returns the number of columns in the current result set.
-//export SQLNumResultCols
 func SQLNumResultCols(statementHandle C.SQLHSTMT, columnCountPtr *C.SQLSMALLINT) C.SQLRETURN {
 	envMu.RLock()
 	defer envMu.RUnlock()
@@ -596,7 +586,6 @@ func SQLNumResultCols(statementHandle C.SQLHSTMT, columnCountPtr *C.SQLSMALLINT)
 }
 
 // SQLRowCount returns the number of rows in the current result set (if known).
-//export SQLRowCount
 func SQLRowCount(statementHandle C.SQLHSTMT, rowCountPtr *C.SQLLEN) C.SQLRETURN {
 	envMu.RLock()
 	defer envMu.RUnlock()
@@ -618,7 +607,6 @@ func SQLRowCount(statementHandle C.SQLHSTMT, rowCountPtr *C.SQLLEN) C.SQLRETURN 
 
 // SQLDescribeCol provides basic metadata about a result column (name, type,
 // size, nullable). It fills the supplied output buffers.
-//export SQLDescribeCol
 func SQLDescribeCol(statementHandle C.SQLHSTMT, columnNumber C.SQLUSMALLINT,
 	columnName *C.SQLUCHAR, bufferLength C.SQLSMALLINT, nameLengthPtr *C.SQLSMALLINT,
 	dataTypePtr *C.SQLSMALLINT, columnSizePtr *C.SQLULEN, decimalDigitsPtr *C.SQLSMALLINT, nullablePtr *C.SQLSMALLINT) C.SQLRETURN {
@@ -677,7 +665,6 @@ func SQLDescribeCol(statementHandle C.SQLHSTMT, columnNumber C.SQLUSMALLINT,
 
 // SQLEndTran commits or rolls back a transaction associated with the handle.
 // This implementation tracks an `inTx` flag on the connection object.
-//export SQLEndTran
 func SQLEndTran(handleType C.SQLSMALLINT, handle C.SQLPOINTER, completionType C.SQLSMALLINT) C.SQLRETURN {
 	envMu.Lock()
 	defer envMu.Unlock()
@@ -703,7 +690,6 @@ func SQLEndTran(handleType C.SQLSMALLINT, handle C.SQLPOINTER, completionType C.
 
 // SQLPrepare stores the provided SQL text on the statement handle for later
 // execution via SQLExecute. It does not perform parsing until execute time.
-//export SQLPrepare
 func SQLPrepare(statementHandle C.SQLHSTMT, statementText *C.SQLUCHAR, textLength C.SQLINTEGER) C.SQLRETURN {
 	envMu.Lock()
 	defer envMu.Unlock()
@@ -722,7 +708,6 @@ func SQLPrepare(statementHandle C.SQLHSTMT, statementText *C.SQLUCHAR, textLengt
 
 // SQLExecute runs a previously prepared statement (SQLPrepare) and delegates
 // to SQLExecDirect for execution.
-//export SQLExecute
 func SQLExecute(statementHandle C.SQLHSTMT) C.SQLRETURN {
 	envMu.RLock()
 	stmtID := uintptr(statementHandle)
@@ -742,7 +727,6 @@ func SQLExecute(statementHandle C.SQLHSTMT) C.SQLRETURN {
 
 // SQLGetInfo returns driver and data source information strings/numbers as
 // defined by the ODBC specification (driver name, version, limits, etc.).
-//export SQLGetInfo
 func SQLGetInfo(connectionHandle C.SQLHDBC, infoType C.SQLUSMALLINT, infoValuePtr C.SQLPOINTER, bufferLength C.SQLSMALLINT, stringLengthPtr *C.SQLSMALLINT) C.SQLRETURN {
 	envMu.RLock()
 	defer envMu.RUnlock()
@@ -820,7 +804,6 @@ func SQLGetInfo(connectionHandle C.SQLHDBC, infoType C.SQLUSMALLINT, infoValuePt
 // SQLTables returns a result set describing tables accessible in the current
 // connection. It maps tinySQL's SHOW TABLES output to the ODBC standard
 // result layout.
-//export SQLTables
 func SQLTables(statementHandle C.SQLHSTMT, catalogName *C.SQLUCHAR, nameLength1 C.SQLSMALLINT,
 	schemaName *C.SQLUCHAR, nameLength2 C.SQLSMALLINT, tableName *C.SQLUCHAR, nameLength3 C.SQLSMALLINT,
 	tableType *C.SQLUCHAR, nameLength4 C.SQLSMALLINT) C.SQLRETURN {
@@ -895,7 +878,6 @@ func SQLTables(statementHandle C.SQLHSTMT, catalogName *C.SQLUCHAR, nameLength1 
 
 // SQLColumns returns column metadata for the named table. It produces the
 // standard ODBC columns: table_name, column_name, data_type, etc.
-//export SQLColumns
 func SQLColumns(statementHandle C.SQLHSTMT, catalogName *C.SQLUCHAR, nameLength1 C.SQLSMALLINT,
 	schemaName *C.SQLUCHAR, nameLength2 C.SQLSMALLINT, tableName *C.SQLUCHAR, nameLength3 C.SQLSMALLINT,
 	columnName *C.SQLUCHAR, nameLength4 C.SQLSMALLINT) C.SQLRETURN {
@@ -979,7 +961,6 @@ func SQLColumns(statementHandle C.SQLHSTMT, catalogName *C.SQLUCHAR, nameLength1
 // SQLSetConnectAttr sets connection-level attributes such as autocommit.
 // This shim accepts the attribute and returns success without extensive
 // side effects.
-//export SQLSetConnectAttr
 func SQLSetConnectAttr(connectionHandle C.SQLHDBC, attribute C.SQLINTEGER, valuePtr C.SQLPOINTER, stringLength C.SQLINTEGER) C.SQLRETURN {
 	envMu.Lock()
 	defer envMu.Unlock()
@@ -1001,7 +982,6 @@ func SQLSetConnectAttr(connectionHandle C.SQLHDBC, attribute C.SQLINTEGER, value
 
 // SQLSetStmtAttr sets statement-level attributes. The implementation
 // currently accepts attributes but does not change behavior.
-//export SQLSetStmtAttr
 func SQLSetStmtAttr(statementHandle C.SQLHSTMT, attribute C.SQLINTEGER, valuePtr C.SQLPOINTER, stringLength C.SQLINTEGER) C.SQLRETURN {
 	envMu.Lock()
 	defer envMu.Unlock()
@@ -1019,7 +999,6 @@ func SQLSetStmtAttr(statementHandle C.SQLHSTMT, attribute C.SQLINTEGER, valuePtr
 // SQLMoreResults reports whether additional result sets are available for a
 // statement. tinySQL does not support multiple result sets, so this returns
 // SQL_NO_DATA.
-//export SQLMoreResults
 func SQLMoreResults(statementHandle C.SQLHSTMT) C.SQLRETURN {
 	return C.SQL_NO_DATA
 }
@@ -1027,7 +1006,6 @@ func SQLMoreResults(statementHandle C.SQLHSTMT) C.SQLRETURN {
 // SQLGetDiagRec returns diagnostic information for the last error.
 // This simplified implementation returns a generic error message when
 // requested; it can be extended to provide richer diagnostics.
-//export SQLGetDiagRec
 func SQLGetDiagRec(handleType C.SQLSMALLINT, handle C.SQLPOINTER, recNumber C.SQLSMALLINT,
 	sqlState *C.SQLUCHAR, nativeErrorPtr *C.SQLINTEGER, messageText *C.SQLUCHAR,
 	bufferLength C.SQLSMALLINT, textLengthPtr *C.SQLSMALLINT) C.SQLRETURN {

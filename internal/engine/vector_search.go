@@ -1,5 +1,5 @@
 // Package engine provides a VEC_SEARCH table-valued function for k-nearest
-// neighbour (k-NN) vector search — the core building block for
+// neighbor (k-NN) vector search — the core building block for
 // Retrieval-Augmented Generation (RAG) workloads in tinySQL.
 //
 // Usage:
@@ -11,7 +11,7 @@
 //	table_name     – name of the table containing vectors
 //	vector_column  – column storing VECTOR ([]float64) values
 //	query_vector   – the search vector ([]float64 or JSON string)
-//	k              – number of nearest neighbours to return
+//	k              – number of nearest neighbors to return
 //	metric         – optional distance metric: 'cosine' (default), 'l2', 'manhattan', 'dot'
 //
 // Returns all original columns plus:

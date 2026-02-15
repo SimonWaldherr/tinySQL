@@ -234,9 +234,9 @@ const (
 
 const (
 	// IntType represents a generic integer column type.
-	IntType   ColType = storage.IntType
+	IntType ColType = storage.IntType
 	// Int8Type represents an 8-bit signed integer column type.
-	Int8Type  ColType = storage.Int8Type
+	Int8Type ColType = storage.Int8Type
 	// Int16Type represents a 16-bit signed integer column type.
 	Int16Type ColType = storage.Int16Type
 	// Int32Type represents a 32-bit signed integer column type.
@@ -244,7 +244,7 @@ const (
 	// Int64Type represents a 64-bit signed integer column type.
 	Int64Type ColType = storage.Int64Type
 	// UintType represents an unsigned integer column type.
-	UintType  ColType = storage.UintType
+	UintType ColType = storage.UintType
 	// Uint8Type represents an 8-bit unsigned integer column type.
 	Uint8Type ColType = storage.Uint8Type
 
@@ -253,29 +253,38 @@ const (
 	// Float64Type represents a 64-bit floating point column type.
 	Float64Type ColType = storage.Float64Type
 	// FloatType is an alias for Float64Type.
-	FloatType   ColType = storage.FloatType
+	FloatType ColType = storage.FloatType
 
 	// StringType represents a short string/text column.
 	StringType ColType = storage.StringType
 	// TextType represents a longer textual column.
-	TextType   ColType = storage.TextType
+	TextType ColType = storage.TextType
 
 	// BoolType represents a boolean column (true/false).
 	BoolType ColType = storage.BoolType
 
 	// TimeType represents a time-only column type.
-	TimeType      ColType = storage.TimeType
+	TimeType ColType = storage.TimeType
 	// DateType represents a date-only column type.
-	DateType      ColType = storage.DateType
+	DateType ColType = storage.DateType
 	// DateTimeType represents a combined date and time column.
-	DateTimeType  ColType = storage.DateTimeType
+	DateTimeType ColType = storage.DateTimeType
 	// TimestampType represents a timestamp column type.
 	TimestampType ColType = storage.TimestampType
 
 	// JsonType represents a JSON textual column.
-	JsonType  ColType = storage.JsonType
+	JsonType ColType = storage.JsonType
 	// JsonbType represents a binary JSON column (if supported by backend).
 	JsonbType ColType = storage.JsonbType
+	// GeometryType represents spatial geometry values (GeoJSON/WKB).
+	GeometryType ColType = storage.GeometryType
+	// Decimal and money types
+	DecimalType  ColType = storage.DecimalType
+	MoneyType    ColType = storage.MoneyType
+	UUIDType     ColType = storage.UUIDType
+	BlobType     ColType = storage.BlobType
+	XMLType      ColType = storage.XMLType
+	IntervalType ColType = storage.IntervalType
 )
 
 // ============================================================================

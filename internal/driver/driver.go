@@ -3,10 +3,10 @@
 // The driver exposes tinySQL through the standard `database/sql` API and
 // supports both in-memory and file-backed databases. Key features:
 //
-//  - DSN formats: `mem://` and `file:/path/to/db.gob?options` (see `parseDSN`).
-//  - Optional Write-Ahead Log (WAL) and autosave for durability.
-//  - Reader/writer pools and simple MVCC-style snapshots for transactions.
-//  - Simple, safe placeholder binding: sequential `?` and numbered `$1`/`:1`.
+//   - DSN formats: `mem://` and `file:/path/to/db.gob?options` (see `parseDSN`).
+//   - Optional Write-Ahead Log (WAL) and autosave for durability.
+//   - Reader/writer pools and simple MVCC-style snapshots for transactions.
+//   - Simple, safe placeholder binding: sequential `?` and numbered `$1`/`:1`.
 //
 // Use `sql.Open("tinysql", dsn)` to create a connection. See `applyDSNOption`
 // and `applyQueryOptions` for available DSN options and defaults.
@@ -501,7 +501,7 @@ func (c *conn) execStatement(ctx context.Context, st engine.Statement) (driver.R
 				// entire database. All other tables are shared by reference.
 				target := writeTargetTable(st)
 				shadow := base.ShallowCloneForTable(c.tenant, target)
-				if _, err := engine.Execute(ctx, shadow, c.tenant, st); err != nil {
+				if _, err = engine.Execute(ctx, shadow, c.tenant, st); err != nil {
 					return nil, err
 				}
 				changes := storage.CollectWALChanges(base, shadow)
@@ -518,7 +518,7 @@ func (c *conn) execStatement(ctx context.Context, st engine.Statement) (driver.R
 					}
 				}
 			} else {
-				if _, err := engine.Execute(ctx, base, c.tenant, st); err != nil {
+				if _, err = engine.Execute(ctx, base, c.tenant, st); err != nil {
 					return nil, err
 				}
 			}
@@ -560,14 +560,14 @@ func (c *conn) querySQL(ctx context.Context, sqlStr string) (driver.Rows, error)
 
 	// For non-SELECT statements, execute via pre-parsed statement (no re-parse).
 	if _, ok := st.(*engine.Select); !ok {
-		if _, err := c.execStatement(ctx, st); err != nil {
+		if _, err = c.execStatement(ctx, st); err != nil {
 			return nil, err
 		}
 		return emptyRows{}, nil
 	}
 
 	// SELECT
-	if err := c.srv.acquireReader(ctx); err != nil {
+	if err = c.srv.acquireReader(ctx); err != nil {
 		return nil, err
 	}
 	defer c.srv.releaseReader()
@@ -662,7 +662,7 @@ func (r *rows) Next(dest []driver.Value) error {
 		case time.Time:
 			dest[i] = vv.Format(time.RFC3339)
 		default:
-			b, _ := json.Marshal(vv)
+			b, _ := storage.JSONMarshal(vv)
 			dest[i] = string(b)
 		}
 	}

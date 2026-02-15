@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/SimonWaldherr/tinySQL"
+	tinysql "github.com/SimonWaldherr/tinySQL"
 )
 
 // ExampleImportCSV demonstrates importing a CSV file into tinySQL.

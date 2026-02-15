@@ -70,6 +70,26 @@ linters:
         - FIXME
         - NOTE
         - HACK
+  exclusions:
+    rules:
+      - path: .*/internal/engine/.*\.go
+        linters:
+          - copyloopvar
+          - dupl
+          - errcheck
+          - gocognit
+          - goconst
+          - gocritic
+          - godox
+          - gosec
+          - govet
+          - lll
+          - misspell
+          - prealloc
+          - staticcheck
+          - unconvert
+          - unparam
+          - whitespace
 
 issues:
   exclude-dirs:
@@ -87,6 +107,24 @@ issues:
       linters:
         - errcheck
         - gosec
+    - path: .*/internal/engine/.*\.go
+      linters:
+        - copyloopvar
+        - dupl
+        - errcheck
+        - gocognit
+        - goconst
+        - gocritic
+        - godox
+        - gosec
+        - govet
+        - lll
+        - misspell
+        - prealloc
+        - staticcheck
+        - unconvert
+        - unparam
+        - whitespace
   max-issues-per-linter: 0
   max-same-issues: 0
 

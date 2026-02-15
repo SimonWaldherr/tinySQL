@@ -21,12 +21,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // safeGobRegister registers a type with encoding/gob but recovers from the
@@ -61,6 +64,11 @@ func init() {
 	// Register vector slice types for GOB serialization
 	safeGobRegister([]float64{})
 	safeGobRegister([]any{})
+
+	// Register big.Rat for decimal/money support and uuid.UUID for UUID columns
+	safeGobRegister(big.Rat{})
+	safeGobRegister(&big.Rat{})
+	safeGobRegister(uuid.UUID{})
 }
 
 // ColType enumerates supported column data types.
@@ -118,6 +126,19 @@ const (
 	// DurationType stores a time duration.
 	DurationType
 
+	// DecimalType stores arbitrary-precision decimal numbers.
+	DecimalType
+	// MoneyType is a convenience alias for DecimalType used for monetary values.
+	MoneyType
+	// UUIDType stores RFC-4122 UUID values.
+	UUIDType
+	// BlobType stores binary large objects.
+	BlobType
+	// XMLType stores XML text.
+	XMLType
+	// IntervalType stores SQL-like intervals (parsed to time.Duration when possible).
+	IntervalType
+
 	// JsonType stores JSON text.
 	JsonType
 	// JsonbType stores binary JSON representations.
@@ -142,6 +163,8 @@ const (
 
 	// VectorType represents a vector/embedding column used by RAG features.
 	VectorType
+	// GeometryType stores spatial geometry values (GeoJSON/WKB) as JSONB or binary payload.
+	GeometryType
 )
 
 var colTypeToString = map[ColType]string{
@@ -179,6 +202,14 @@ var colTypeToString = map[ColType]string{
 	PointerType:    "POINTER",
 	InterfaceType:  "INTERFACE",
 	VectorType:     "VECTOR",
+	GeometryType:   "GEOMETRY",
+	// Additional types
+	DecimalType:  "DECIMAL",
+	MoneyType:    "MONEY",
+	UUIDType:     "UUID",
+	BlobType:     "BLOB",
+	XMLType:      "XML",
+	IntervalType: "INTERVAL",
 }
 
 func (t ColType) String() string {
@@ -714,7 +745,7 @@ func tableToDiskRange(tn string, t *Table, from, to int) diskTable {
 				case string:
 					row[j] = vv
 				default:
-					b, _ := json.Marshal(v)
+					b, _ := JSONMarshal(v)
 					row[j] = string(b)
 				}
 			} else {

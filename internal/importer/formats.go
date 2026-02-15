@@ -65,6 +65,15 @@ func ImportFile(
 
 	// Import based on format
 	switch ext {
+	case ".geojson":
+		return ImportGeoJSON(ctx, db, tenant, tableName, f, opts)
+
+	case ".shp":
+		// Shapefiles are multi-file sets; pass the path for the reader to open.
+		return ImportShapefile(ctx, db, tenant, tableName, filePath, opts)
+
+	case ".kml":
+		return ImportKML(ctx, db, tenant, tableName, f, opts)
 	case ".csv":
 		if opts == nil {
 			opts = &ImportOptions{}

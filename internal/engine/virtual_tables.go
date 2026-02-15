@@ -36,7 +36,7 @@ import (
 var startTime = time.Now()
 
 // resolveSysTable returns the rows for a given sys.<name> virtual table.
-// It returns nil, nil when the name is not recognised so the caller can fall
+// It returns nil, nil when the name is not recognized so the caller can fall
 // back to the default "unknown catalog/sys table" error.
 func resolveSysTable(env ExecEnv, name string) ([]Row, error) {
 	switch name {

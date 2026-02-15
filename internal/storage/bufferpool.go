@@ -632,6 +632,18 @@ func EstimateColumnSize(typ ColType) int64 {
 		return 128 // Average JSON
 	case TimeType, DateType, DateTimeType, TimestampType:
 		return 24
+	case DecimalType, MoneyType:
+		return 32 // big.Rat storage estimate
+	case UUIDType:
+		return 16
+	case BlobType:
+		return 128
+	case XMLType:
+		return 128
+	case IntervalType:
+		return 16
+	case GeometryType:
+		return 128
 	default:
 		return 16 // Default
 	}

@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"math/rand"
 	"sort"
 	"strconv"
@@ -39,7 +40,7 @@ import (
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
-// allFunctions is a lazily-initialised, read-only function registry that
+// allFunctions is a lazily-initialized, read-only function registry that
 // merges builtin, extended, and vector functions once and reuses the result
 // for all subsequent evalFuncCall invocations. This avoids allocating three
 // maps and merging them on every function evaluation.
@@ -963,7 +964,6 @@ func processJoins(env ExecEnv, joins []JoinClause, cur []Row) ([]Row, error) {
 				cols = append(cols, storage.Column{Name: c})
 			}
 			rightTable = &storage.Table{Name: j.Right.Alias, Cols: cols}
-
 		} else if j.Right.TableFunc != nil {
 			tf := j.Right.TableFunc
 			fn, ok := GetTableFunc(tf.Name)
@@ -993,7 +993,6 @@ func processJoins(env ExecEnv, joins []JoinClause, cur []Row) ([]Row, error) {
 				cols = append(cols, storage.Column{Name: c})
 			}
 			rightTable = &storage.Table{Name: j.Right.Alias, Cols: cols}
-
 		} else {
 			rt, err := env.db.Get(env.tenant, j.Right.Table)
 			if err != nil {
@@ -1589,6 +1588,10 @@ func compare(a, b any) (int, error) {
 		return 0, errors.New("cannot compare with NULL")
 	}
 	switch ax := a.(type) {
+	case *big.Rat:
+		return compareBigRat(ax, b)
+	case big.Rat:
+		return compareBigRat(&ax, b)
 	case int:
 		return compareInt(ax, b)
 	case float64:
@@ -1602,6 +1605,27 @@ func compare(a, b any) (int, error) {
 		return 0, nil
 	}
 	return 0, fmt.Errorf("incomparable %T and %T", a, b)
+}
+
+func compareBigRat(ax *big.Rat, b any) (int, error) {
+	// Try to convert b to big.Rat
+	if bx, ok := storage.DecimalFromAny(b); ok {
+		rb := new(big.Rat).Set(bx)
+		return ax.Cmp(rb), nil
+	}
+	// If b is numeric (int/float), convert
+	switch bx := b.(type) {
+	case int:
+		rb := new(big.Rat).SetInt64(int64(bx))
+		return ax.Cmp(rb), nil
+	case int64:
+		rb := new(big.Rat).SetInt64(bx)
+		return ax.Cmp(rb), nil
+	case float64:
+		rb := new(big.Rat).SetFloat64(bx)
+		return ax.Cmp(rb), nil
+	}
+	return 0, fmt.Errorf("incomparable decimal and %T", b)
 }
 
 func compareInt(ax int, b any) (int, error) {
@@ -1950,6 +1974,9 @@ func evalUnary(env ExecEnv, ex *Unary, row Row) (any, error) {
 		if f, ok := numeric(v); ok {
 			return f, nil
 		}
+		if r, ok := storage.DecimalFromAny(v); ok {
+			return new(big.Rat).Set(r), nil
+		}
 		if v == nil {
 			return nil, nil
 		}
@@ -1957,6 +1984,11 @@ func evalUnary(env ExecEnv, ex *Unary, row Row) (any, error) {
 	case "-":
 		if f, ok := numeric(v); ok {
 			return -f, nil
+		}
+		if r, ok := storage.DecimalFromAny(v); ok {
+			neg := new(big.Rat).Set(r)
+			neg.Mul(neg, big.NewRat(-1, 1))
+			return neg, nil
 		}
 		if v == nil {
 			return nil, nil
@@ -2023,6 +2055,31 @@ func evalArithmeticBinary(op string, lv, rv any) (any, error) {
 	} else if lv == nil || rv == nil {
 		return nil, nil
 	}
+	// If either operand is a decimal (big.Rat), perform high-precision arithmetic
+	// Only treat values as decimals for high-precision arithmetic when they
+	// are already rational types (i.e. *big.Rat or big.Rat). This preserves
+	// existing numeric semantics for plain ints/floats.
+	if la, lok := storage.AsBigRat(lv); lok {
+		if rb, rok := storage.AsBigRat(rv); rok {
+			a := new(big.Rat).Set(la)
+			b := new(big.Rat).Set(rb)
+			switch op {
+			case "+":
+				return new(big.Rat).Add(a, b), nil
+			case "-":
+				return new(big.Rat).Sub(a, b), nil
+			case "*":
+				return new(big.Rat).Mul(a, b), nil
+			case "/":
+				if b.Sign() == 0 {
+					return nil, errors.New("division by zero")
+				}
+				return new(big.Rat).Quo(a, b), nil
+			}
+		}
+		return nil, fmt.Errorf("%s expects numeric", op)
+	}
+
 	lf, lok := numeric(lv)
 	rf, rok := numeric(rv)
 	if !(lok && rok) {
@@ -4905,8 +4962,12 @@ func evalAggregateSumAvg(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 	if len(ex.Args) != 1 {
 		return nil, fmt.Errorf("%s expects 1 arg", ex.Name)
 	}
-	sum := 0.0
-	n := 0
+	var (
+		sumFloat float64
+		sumRat   = new(big.Rat)
+		useRat   bool
+		n        int
+	)
 	for _, r := range rows {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
@@ -4915,18 +4976,45 @@ func evalAggregateSumAvg(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 		if err != nil {
 			return nil, err
 		}
+		if v == nil {
+			continue
+		}
 		if f, ok := numeric(v); ok {
-			sum += f
+			if useRat {
+				sumRat.Add(sumRat, new(big.Rat).SetFloat64(f))
+			} else {
+				sumFloat += f
+			}
 			n++
+			continue
+		}
+		if rv, ok := storage.DecimalFromAny(v); ok {
+			if !useRat {
+				// migrate any accumulated float sum into rational
+				if n > 0 {
+					sumRat.SetFloat64(sumFloat)
+				}
+				useRat = true
+			}
+			sumRat.Add(sumRat, new(big.Rat).Set(rv))
+			n++
+			continue
 		}
 	}
 	if ex.Name == "SUM" {
-		return sum, nil
+		if useRat {
+			return sumRat, nil
+		}
+		return sumFloat, nil
 	}
 	if n == 0 {
 		return nil, nil
 	}
-	return sum / float64(n), nil
+	if useRat {
+		avg := new(big.Rat).Quo(sumRat, big.NewRat(int64(n), 1))
+		return avg, nil
+	}
+	return sumFloat / float64(n), nil
 }
 
 func evalAggregateMinMax(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
@@ -5117,6 +5205,9 @@ func evalAggregateUnary(env ExecEnv, ex *Unary, rows []Row) (any, error) {
 		if f, ok := numeric(v); ok {
 			return f, nil
 		}
+		if r, ok := storage.DecimalFromAny(v); ok {
+			return new(big.Rat).Set(r), nil
+		}
 		if v == nil {
 			return nil, nil
 		}
@@ -5124,6 +5215,11 @@ func evalAggregateUnary(env ExecEnv, ex *Unary, rows []Row) (any, error) {
 	case "-":
 		if f, ok := numeric(v); ok {
 			return -f, nil
+		}
+		if r, ok := storage.DecimalFromAny(v); ok {
+			neg := new(big.Rat).Set(r)
+			neg.Mul(neg, big.NewRat(-1, 1))
+			return neg, nil
 		}
 		if v == nil {
 			return nil, nil
@@ -5299,7 +5395,7 @@ func writeFmtKeyPart(b *strings.Builder, v any) {
 		b.WriteString("S:")
 		b.WriteString(x)
 	default:
-		byt, _ := json.Marshal(x)
+		byt, _ := storage.JSONMarshal(x)
 		b.WriteString("J:")
 		b.Write(byt)
 	}
