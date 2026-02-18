@@ -1439,6 +1439,47 @@ func evalNonRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
 
 // evalRecursiveCTE evaluates a recursive CTE (WITH RECURSIVE) by executing the
 // anchor and iteratively applying the recursive part until stabilization or limit.
+// alignRecursiveCTERows aligns the rows from recursive part to match anchor columns
+func alignRecursiveCTERows(accRs *ResultSet, nextRs *ResultSet, cteName string) []Row {
+	// If columns don't match or aren't available, return as-is
+	if accRs == nil || accRs.Cols == nil || nextRs == nil || nextRs.Cols == nil || len(nextRs.Cols) != len(accRs.Cols) {
+		return nextRs.Rows
+	}
+
+	alignedRows := make([]Row, 0, len(nextRs.Rows))
+	for _, r := range nextRs.Rows {
+		nr := make(Row)
+		for i := range accRs.Cols {
+			src := nextRs.Cols[i]
+			var val any
+			if v, ok := r[strings.ToLower(src)]; ok {
+				val = v
+			} else if v, ok := r[src]; ok {
+				val = v
+			}
+			tgt := strings.ToLower(accRs.Cols[i])
+			nr[tgt] = val
+			nr[cteName+"."+tgt] = val
+		}
+		alignedRows = append(alignedRows, nr)
+	}
+	return alignedRows
+}
+
+// addNewRowsToRecursiveCTE adds new rows to accumulator, tracking duplicates
+func addNewRowsToRecursiveCTE(accRows []Row, newRows []Row, targetCols []string, seen map[string]bool) ([]Row, int) {
+	newAdded := 0
+	for _, r := range newRows {
+		sig := rowSignature(r, targetCols)
+		if !seen[sig] {
+			seen[sig] = true
+			accRows = append(accRows, r)
+			newAdded++
+		}
+	}
+	return accRows, newAdded
+}
+
 func evalRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
 	if cte.Select == nil || cte.Select.Union == nil {
 		return nil, fmt.Errorf("recursive CTE %s must be a UNION of anchor and recursive part", cte.Name)
@@ -1484,42 +1525,16 @@ func evalRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
 			break
 		}
 
-		newAdded := 0
 		targetCols := nextRs.Cols
 		if accRs != nil && accRs.Cols != nil {
 			targetCols = accRs.Cols
 		}
 
-		var alignedRows []Row
-		if accRs != nil && accRs.Cols != nil && nextRs != nil && nextRs.Cols != nil && len(nextRs.Cols) == len(accRs.Cols) {
-			for _, r := range nextRs.Rows {
-				nr := make(Row)
-				for i := range accRs.Cols {
-					src := nextRs.Cols[i]
-					var val any
-					if v, ok := r[strings.ToLower(src)]; ok {
-						val = v
-					} else if v, ok := r[src]; ok {
-						val = v
-					}
-					tgt := strings.ToLower(accRs.Cols[i])
-					nr[tgt] = val
-					nr[cte.Name+"."+tgt] = val
-				}
-				alignedRows = append(alignedRows, nr)
-			}
-		} else {
-			alignedRows = nextRs.Rows
-		}
-
-		for _, r := range alignedRows {
-			sig := rowSignature(r, targetCols)
-			if !seen[sig] {
-				seen[sig] = true
-				accRows = append(accRows, r)
-				newAdded++
-			}
-		}
+		alignedRows := alignRecursiveCTERows(accRs, nextRs, cte.Name)
+		
+		var newAdded int
+		accRows, newAdded = addNewRowsToRecursiveCTE(accRows, alignedRows, targetCols, seen)
+		
 		if accRs == nil && nextRs != nil {
 			accRs = &ResultSet{Cols: nextRs.Cols}
 		}
