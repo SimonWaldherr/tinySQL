@@ -463,7 +463,377 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	return &ResultSet{Cols: []string{"deleted"}, Rows: []Row{{"deleted": del}}}, nil
 }
 
-//nolint:gocyclo // SELECT execution handles joins, CTEs, filtering, projection, and aggregation.
+// resolveFromClause resolves the FROM clause of a SELECT statement and returns the initial rows.
+// It handles: no FROM (dummy row), subqueries, table functions, CTEs, catalog tables, sys tables, and regular tables.
+func resolveFromClause(env ExecEnv, cteEnv ExecEnv, s *Select) ([]Row, error) {
+	// Check if FROM clause exists
+	if s.From.Table == "" && s.From.Subquery == nil && s.From.TableFunc == nil {
+		// No FROM clause - create a single dummy row for expression evaluation
+		return []Row{make(Row)}, nil
+	}
+
+	if s.From.Subquery != nil {
+		return resolveSubquery(env, s)
+	}
+
+	if s.From.TableFunc != nil {
+		return resolveTableFunc(env, s)
+	}
+
+	// No subquery and no table function: this can be a CTE name, a virtual
+	// catalog table (catalog.*), a sys table (sys.*), or a regular table.
+	return resolveTableSource(cteEnv, env, s)
+}
+
+// resolveSubquery handles FROM (SELECT ...) AS alias
+func resolveSubquery(env ExecEnv, s *Select) ([]Row, error) {
+	subResult, err := executeSelect(env, s.From.Subquery)
+	if err != nil {
+		return nil, err
+	}
+	leftRows := make([]Row, len(subResult.Rows))
+	for i, row := range subResult.Rows {
+		leftRows[i] = make(Row)
+		for k, v := range row {
+			// Immer unqualifiziert (für Outer-Select), lower-case
+			leftRows[i][strings.ToLower(k)] = v
+			// Zusätzlich mit Alias-Präfix, falls Alias gesetzt
+			if s.From.Alias != "" {
+				leftRows[i][strings.ToLower(s.From.Alias+"."+k)] = v
+			}
+		}
+	}
+	return leftRows, nil
+}
+
+// resolveTableFunc handles FROM table-valued function
+func resolveTableFunc(env ExecEnv, s *Select) ([]Row, error) {
+	fnName := s.From.TableFunc.Name
+	tf, ok := GetTableFunc(fnName)
+	if !ok {
+		return nil, fmt.Errorf("unknown table function: %s", fnName)
+	}
+	// Validate args optionally
+	if err := tf.ValidateArgs(s.From.TableFunc.Args); err != nil {
+		return nil, fmt.Errorf("%s: %v", fnName, err)
+	}
+	// Execute table function (no correlated row for top-level FROM)
+	rs, err := tf.Execute(env.ctx, s.From.TableFunc.Args, env, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Convert ResultSet to rows with alias handling
+	leftRows := make([]Row, len(rs.Rows))
+	for i, row := range rs.Rows {
+		leftRows[i] = make(Row)
+		for k, v := range row {
+			leftRows[i][strings.ToLower(k)] = v
+			if s.From.Alias != "" {
+				leftRows[i][strings.ToLower(s.From.Alias+"."+k)] = v
+			}
+		}
+	}
+	return leftRows, nil
+}
+
+// resolveTableSource handles CTE, catalog, sys, or regular table resolution
+func resolveTableSource(cteEnv ExecEnv, env ExecEnv, s *Select) ([]Row, error) {
+	// Prefer CTE binding first
+	if cteEnv.ctes != nil {
+		if cteResult, exists := cteEnv.ctes[s.From.Table]; exists {
+			leftRows := make([]Row, len(cteResult.Rows))
+			for i, row := range cteResult.Rows {
+				leftRows[i] = make(Row)
+				for k, v := range row {
+					leftRows[i][k] = v
+					leftRows[i][s.From.Table+"."+k] = v
+				}
+			}
+			return leftRows, nil
+		}
+	}
+
+	// Handle virtual catalog.* tables
+	if strings.HasPrefix(strings.ToLower(s.From.Table), "catalog.") {
+		return resolveCatalogTable(env, s)
+	}
+
+	// Handle virtual sys.* tables
+	if strings.HasPrefix(strings.ToLower(s.From.Table), "sys.") {
+		return resolveSysVirtualTable(env, s)
+	}
+
+	// Treat as a regular table
+	return resolveRegularTable(cteEnv, env, s)
+}
+
+// resolveCatalogTable handles catalog.* virtual tables
+func resolveCatalogTable(env ExecEnv, s *Select) ([]Row, error) {
+	parts := strings.SplitN(s.From.Table, ".", 2)
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid catalog reference: %s", s.From.Table)
+	}
+	name := strings.ToLower(parts[1])
+	
+	switch name {
+	case "tables":
+		return resolveCatalogTables(env, s)
+	case "columns":
+		return resolveCatalogColumns(env, s)
+	case "functions":
+		return resolveCatalogFunctions(env, s)
+	case "jobs":
+		return resolveCatalogJobs(env, s)
+	case "views":
+		return resolveCatalogViews(env, s)
+	default:
+		return nil, fmt.Errorf("unknown catalog table: %s", name)
+	}
+}
+
+// resolveCatalogTables handles catalog.tables
+func resolveCatalogTables(env ExecEnv, s *Select) ([]Row, error) {
+	// Auto-populate from real tables, then merge catalog-only entries.
+	leftRows := sysTablesRows(env)
+	catTabs := env.db.Catalog().GetTables()
+	catMap := make(map[string]*storage.CatalogTable, len(catTabs))
+	for _, ct := range catTabs {
+		catMap[strings.ToLower(ct.Name)] = ct
+	}
+	// Track which real tables we've seen.
+	seen := make(map[string]bool, len(leftRows))
+	for _, r := range leftRows {
+		tName, _ := r["name"].(string)
+		seen[strings.ToLower(tName)] = true
+		if ct, ok := catMap[strings.ToLower(tName)]; ok {
+			putVal(r, "schema", ct.Schema)
+			putVal(r, "type", ct.Type)
+			putVal(r, "row_count", ct.RowCount)
+			putVal(r, "created_at", ct.CreatedAt)
+			putVal(r, "updated_at", ct.UpdatedAt)
+		} else {
+			putVal(r, "schema", "main")
+			putVal(r, "type", "TABLE")
+		}
+	}
+	// Add catalog-only entries that aren't real tables yet.
+	for _, ct := range catTabs {
+		if seen[strings.ToLower(ct.Name)] {
+			continue
+		}
+		r := make(Row)
+		putVal(r, "schema", ct.Schema)
+		putVal(r, "name", ct.Name)
+		putVal(r, "type", ct.Type)
+		putVal(r, "row_count", ct.RowCount)
+		putVal(r, "created_at", ct.CreatedAt)
+		putVal(r, "updated_at", ct.UpdatedAt)
+		if s.From.Alias != "" {
+			putVal(r, s.From.Alias+".schema", ct.Schema)
+			putVal(r, s.From.Alias+".name", ct.Name)
+		}
+		leftRows = append(leftRows, r)
+	}
+	return leftRows, nil
+}
+
+// resolveCatalogColumns handles catalog.columns
+func resolveCatalogColumns(env ExecEnv, s *Select) ([]Row, error) {
+	cols := env.db.Catalog().GetAllColumns()
+	leftRows := make([]Row, len(cols))
+	for i, c := range cols {
+		leftRows[i] = make(Row)
+		putVal(leftRows[i], "schema", c.Schema)
+		putVal(leftRows[i], "table_name", c.TableName)
+		putVal(leftRows[i], "name", c.Name)
+		putVal(leftRows[i], "position", c.Position)
+		putVal(leftRows[i], "data_type", c.DataType)
+		putVal(leftRows[i], "is_nullable", c.IsNullable)
+		if c.DefaultValue != nil {
+			putVal(leftRows[i], "default_value", *c.DefaultValue)
+		} else {
+			putVal(leftRows[i], "default_value", nil)
+		}
+		if s.From.Alias != "" {
+			putVal(leftRows[i], s.From.Alias+".table_name", c.TableName)
+		}
+	}
+	return leftRows, nil
+}
+
+// resolveCatalogFunctions handles catalog.functions
+func resolveCatalogFunctions(env ExecEnv, s *Select) ([]Row, error) {
+	// Auto-populate from real function registry, then overlay catalog entries.
+	leftRows := sysFunctionsRows()
+	catFns := env.db.Catalog().GetFunctions()
+	catMap := make(map[string]*storage.CatalogFunction, len(catFns))
+	for _, cf := range catFns {
+		catMap[strings.ToUpper(cf.Name)] = cf
+	}
+	// Track seen function names.
+	seen := make(map[string]bool, len(leftRows))
+	for _, r := range leftRows {
+		name, _ := r["name"].(string)
+		seen[strings.ToUpper(name)] = true
+		if cf, ok := catMap[strings.ToUpper(name)]; ok {
+			putVal(r, "schema", cf.Schema)
+			if cf.Description != "" {
+				putVal(r, "description", cf.Description)
+			}
+			if cf.ReturnType != "" {
+				putVal(r, "return_type", cf.ReturnType)
+			}
+			if cf.IsDeterministic {
+				putVal(r, "is_deterministic", cf.IsDeterministic)
+			}
+		}
+	}
+	// Add catalog-only functions not in the builtin registry.
+	for _, cf := range catFns {
+		if seen[strings.ToUpper(cf.Name)] {
+			continue
+		}
+		r := make(Row)
+		putVal(r, "schema", cf.Schema)
+		putVal(r, "name", cf.Name)
+		putVal(r, "function_type", cf.FunctionType)
+		putVal(r, "return_type", cf.ReturnType)
+		putVal(r, "language", cf.Language)
+		putVal(r, "is_deterministic", cf.IsDeterministic)
+		putVal(r, "description", cf.Description)
+		leftRows = append(leftRows, r)
+	}
+	return leftRows, nil
+}
+
+// resolveCatalogJobs handles catalog.jobs
+func resolveCatalogJobs(env ExecEnv, s *Select) ([]Row, error) {
+	jobs := env.db.Catalog().ListJobs()
+	leftRows := make([]Row, len(jobs))
+	for i, j := range jobs {
+		leftRows[i] = make(Row)
+		putVal(leftRows[i], "name", j.Name)
+		putVal(leftRows[i], "sql_text", j.SQLText)
+		putVal(leftRows[i], "schedule_type", j.ScheduleType)
+		putVal(leftRows[i], "cron_expr", j.CronExpr)
+		putVal(leftRows[i], "interval_ms", j.IntervalMs)
+		putVal(leftRows[i], "run_at", j.RunAt)
+		putVal(leftRows[i], "timezone", j.Timezone)
+		putVal(leftRows[i], "enabled", j.Enabled)
+		putVal(leftRows[i], "last_run_at", j.LastRunAt)
+		putVal(leftRows[i], "next_run_at", j.NextRunAt)
+	}
+	return leftRows, nil
+}
+
+// resolveCatalogViews handles catalog.views
+func resolveCatalogViews(env ExecEnv, s *Select) ([]Row, error) {
+	views := env.db.Catalog().GetViews()
+	leftRows := make([]Row, len(views))
+	for i, v := range views {
+		leftRows[i] = make(Row)
+		putVal(leftRows[i], "schema", v.Schema)
+		putVal(leftRows[i], "name", v.Name)
+		putVal(leftRows[i], "sql_text", v.SQLText)
+		putVal(leftRows[i], "created_at", v.CreatedAt)
+	}
+	return leftRows, nil
+}
+
+// resolveSysVirtualTable handles sys.* virtual tables
+func resolveSysVirtualTable(env ExecEnv, s *Select) ([]Row, error) {
+	parts := strings.SplitN(s.From.Table, ".", 2)
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid sys reference: %s", s.From.Table)
+	}
+	name := strings.ToLower(parts[1])
+	sysRows, err := resolveSysTable(env, name)
+	if err != nil {
+		return nil, err
+	}
+	leftRows := sysRows
+	// Apply alias if present.
+	if s.From.Alias != "" {
+		for _, r := range leftRows {
+			for k, v := range r {
+				if !strings.Contains(k, ".") {
+					r[s.From.Alias+"."+k] = v
+				}
+			}
+		}
+	}
+	return leftRows, nil
+}
+
+// resolveRegularTable handles regular table lookup
+func resolveRegularTable(cteEnv ExecEnv, env ExecEnv, s *Select) ([]Row, error) {
+	var leftT *storage.Table
+	var err error
+	if cteEnv.ctes != nil {
+		leftT, err = cteEnv.db.Get(cteEnv.tenant, s.From.Table)
+	} else {
+		leftT, err = env.db.Get(env.tenant, s.From.Table)
+	}
+	if err != nil {
+		return nil, err
+	}
+	leftRows, _ := rowsFromTable(leftT, aliasOr(s.From))
+	return leftRows, nil
+}
+
+// applyDistinctOn applies DISTINCT ON semantics: keep first row per distinct-on key.
+// The ORDER BY clause controls which row is considered "first"; so it applies ORDER BY first if present.
+func applyDistinctOn(env ExecEnv, s *Select, outRows []Row) ([]Row, error) {
+	// If ORDER BY present, sort now so the first row per key is the right one
+	if len(s.OrderBy) > 0 {
+		outRows = applySortOrder(s.OrderBy, outRows)
+	}
+	seen := make(map[string]bool)
+	var res []Row
+	for _, r := range outRows {
+		var parts []string
+		for _, e := range s.DistinctOn {
+			v, err := evalExpr(env, e, r)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, fmt.Sprintf("%v", v))
+		}
+		key := strings.Join(parts, "|")
+		if !seen[key] {
+			seen[key] = true
+			res = append(res, r)
+		}
+	}
+	return res, nil
+}
+
+// applySortOrder applies ORDER BY sorting to rows
+func applySortOrder(orderBy []OrderItem, outRows []Row) []Row {
+	lcOrdCols := make([]string, len(orderBy))
+	for idx, oi := range orderBy {
+		lcOrdCols[idx] = strings.ToLower(oi.Col)
+	}
+	sort.SliceStable(outRows, func(i, j int) bool {
+		a := outRows[i]
+		b := outRows[j]
+		for k, oi := range orderBy {
+			av := a[lcOrdCols[k]]
+			bv := b[lcOrdCols[k]]
+			cmp := compareForOrder(av, bv, oi.Desc)
+			if cmp == 0 {
+				continue
+			}
+			if oi.Desc {
+				return cmp > 0
+			}
+			return cmp < 0
+		}
+		return false
+	})
+	return outRows
+}
+
 func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 	// Process CTEs first
 	cteEnv, err := processCTEs(env, s)
@@ -472,254 +842,9 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 	}
 
 	// FROM (Tabelle, CTE oder Subselect) - now optional
-	var leftRows []Row
-
-	// Check if FROM clause exists
-	if s.From.Table == "" && s.From.Subquery == nil && s.From.TableFunc == nil {
-		// No FROM clause - create a single dummy row for expression evaluation
-		// This allows SELECT NOW(), SELECT 1+1, etc.
-		leftRows = []Row{make(Row)}
-	} else if s.From.Subquery != nil {
-		// FROM (SELECT ...) AS alias
-		subResult, err := executeSelect(env, s.From.Subquery)
-		if err != nil {
-			return nil, err
-		}
-		leftRows = make([]Row, len(subResult.Rows))
-		for i, row := range subResult.Rows {
-			leftRows[i] = make(Row)
-			for k, v := range row {
-				// Immer unqualifiziert (für Outer-Select), lower-case
-				leftRows[i][strings.ToLower(k)] = v
-				// Zusätzlich mit Alias-Präfix, falls Alias gesetzt
-				if s.From.Alias != "" {
-					leftRows[i][strings.ToLower(s.From.Alias+"."+k)] = v
-				}
-			}
-		}
-	} else if s.From.TableFunc != nil {
-		// FROM table-valued function
-		fnName := s.From.TableFunc.Name
-		tf, ok := GetTableFunc(fnName)
-		if !ok {
-			return nil, fmt.Errorf("unknown table function: %s", fnName)
-		}
-		// Validate args optionally
-		if err := tf.ValidateArgs(s.From.TableFunc.Args); err != nil {
-			return nil, fmt.Errorf("%s: %v", fnName, err)
-		}
-		// Execute table function (no correlated row for top-level FROM)
-		rs, err := tf.Execute(env.ctx, s.From.TableFunc.Args, env, nil)
-		if err != nil {
-			return nil, err
-		}
-		// Convert ResultSet to rows with alias handling
-		leftRows = make([]Row, len(rs.Rows))
-		for i, row := range rs.Rows {
-			leftRows[i] = make(Row)
-			for k, v := range row {
-				leftRows[i][strings.ToLower(k)] = v
-				if s.From.Alias != "" {
-					leftRows[i][strings.ToLower(s.From.Alias+"."+k)] = v
-				}
-			}
-		}
-	} else {
-		// No subquery and no table function: this can be a CTE name, a virtual
-		// catalog table (catalog.*), or a regular table. Prefer CTE binding first.
-		if cteEnv.ctes != nil {
-			if cteResult, exists := cteEnv.ctes[s.From.Table]; exists {
-				leftRows = make([]Row, len(cteResult.Rows))
-				for i, row := range cteResult.Rows {
-					leftRows[i] = make(Row)
-					for k, v := range row {
-						leftRows[i][k] = v
-						leftRows[i][s.From.Table+"."+k] = v
-					}
-				}
-			}
-		}
-
-		// Handle virtual catalog.* tables regardless of CTE presence
-		if leftRows == nil && strings.HasPrefix(strings.ToLower(s.From.Table), "catalog.") {
-			parts := strings.SplitN(s.From.Table, ".", 2)
-			if len(parts) != 2 {
-				return nil, fmt.Errorf("invalid catalog reference: %s", s.From.Table)
-			}
-			name := strings.ToLower(parts[1])
-			switch name {
-			case "tables":
-				// Auto-populate from real tables, then merge catalog-only entries.
-				leftRows = sysTablesRows(env)
-				catTabs := env.db.Catalog().GetTables()
-				catMap := make(map[string]*storage.CatalogTable, len(catTabs))
-				for _, ct := range catTabs {
-					catMap[strings.ToLower(ct.Name)] = ct
-				}
-				// Track which real tables we've seen.
-				seen := make(map[string]bool, len(leftRows))
-				for _, r := range leftRows {
-					tName, _ := r["name"].(string)
-					seen[strings.ToLower(tName)] = true
-					if ct, ok := catMap[strings.ToLower(tName)]; ok {
-						putVal(r, "schema", ct.Schema)
-						putVal(r, "type", ct.Type)
-						putVal(r, "row_count", ct.RowCount)
-						putVal(r, "created_at", ct.CreatedAt)
-						putVal(r, "updated_at", ct.UpdatedAt)
-					} else {
-						putVal(r, "schema", "main")
-						putVal(r, "type", "TABLE")
-					}
-				}
-				// Add catalog-only entries that aren't real tables yet.
-				for _, ct := range catTabs {
-					if seen[strings.ToLower(ct.Name)] {
-						continue
-					}
-					r := make(Row)
-					putVal(r, "schema", ct.Schema)
-					putVal(r, "name", ct.Name)
-					putVal(r, "type", ct.Type)
-					putVal(r, "row_count", ct.RowCount)
-					putVal(r, "created_at", ct.CreatedAt)
-					putVal(r, "updated_at", ct.UpdatedAt)
-					if s.From.Alias != "" {
-						putVal(r, s.From.Alias+".schema", ct.Schema)
-						putVal(r, s.From.Alias+".name", ct.Name)
-					}
-					leftRows = append(leftRows, r)
-				}
-			case "columns":
-				cols := env.db.Catalog().GetAllColumns()
-				leftRows = make([]Row, len(cols))
-				for i, c := range cols {
-					leftRows[i] = make(Row)
-					putVal(leftRows[i], "schema", c.Schema)
-					putVal(leftRows[i], "table_name", c.TableName)
-					putVal(leftRows[i], "name", c.Name)
-					putVal(leftRows[i], "position", c.Position)
-					putVal(leftRows[i], "data_type", c.DataType)
-					putVal(leftRows[i], "is_nullable", c.IsNullable)
-					if c.DefaultValue != nil {
-						putVal(leftRows[i], "default_value", *c.DefaultValue)
-					} else {
-						putVal(leftRows[i], "default_value", nil)
-					}
-					if s.From.Alias != "" {
-						putVal(leftRows[i], s.From.Alias+".table_name", c.TableName)
-					}
-				}
-			case "functions":
-				// Auto-populate from real function registry, then overlay catalog entries.
-				leftRows = sysFunctionsRows()
-				catFns := env.db.Catalog().GetFunctions()
-				catMap := make(map[string]*storage.CatalogFunction, len(catFns))
-				for _, cf := range catFns {
-					catMap[strings.ToUpper(cf.Name)] = cf
-				}
-				// Track seen function names.
-				seen := make(map[string]bool, len(leftRows))
-				for _, r := range leftRows {
-					name, _ := r["name"].(string)
-					seen[strings.ToUpper(name)] = true
-					if cf, ok := catMap[strings.ToUpper(name)]; ok {
-						putVal(r, "schema", cf.Schema)
-						if cf.Description != "" {
-							putVal(r, "description", cf.Description)
-						}
-						if cf.ReturnType != "" {
-							putVal(r, "return_type", cf.ReturnType)
-						}
-						if cf.IsDeterministic {
-							putVal(r, "is_deterministic", cf.IsDeterministic)
-						}
-					}
-				}
-				// Add catalog-only functions not in the builtin registry.
-				for _, cf := range catFns {
-					if seen[strings.ToUpper(cf.Name)] {
-						continue
-					}
-					r := make(Row)
-					putVal(r, "schema", cf.Schema)
-					putVal(r, "name", cf.Name)
-					putVal(r, "function_type", cf.FunctionType)
-					putVal(r, "return_type", cf.ReturnType)
-					putVal(r, "language", cf.Language)
-					putVal(r, "is_deterministic", cf.IsDeterministic)
-					putVal(r, "description", cf.Description)
-					leftRows = append(leftRows, r)
-				}
-			case "jobs":
-				jobs := env.db.Catalog().ListJobs()
-				leftRows = make([]Row, len(jobs))
-				for i, j := range jobs {
-					leftRows[i] = make(Row)
-					putVal(leftRows[i], "name", j.Name)
-					putVal(leftRows[i], "sql_text", j.SQLText)
-					putVal(leftRows[i], "schedule_type", j.ScheduleType)
-					putVal(leftRows[i], "cron_expr", j.CronExpr)
-					putVal(leftRows[i], "interval_ms", j.IntervalMs)
-					putVal(leftRows[i], "run_at", j.RunAt)
-					putVal(leftRows[i], "timezone", j.Timezone)
-					putVal(leftRows[i], "enabled", j.Enabled)
-					putVal(leftRows[i], "last_run_at", j.LastRunAt)
-					putVal(leftRows[i], "next_run_at", j.NextRunAt)
-				}
-			case "views":
-				views := env.db.Catalog().GetViews()
-				leftRows = make([]Row, len(views))
-				for i, v := range views {
-					leftRows[i] = make(Row)
-					putVal(leftRows[i], "schema", v.Schema)
-					putVal(leftRows[i], "name", v.Name)
-					putVal(leftRows[i], "sql_text", v.SQLText)
-					putVal(leftRows[i], "created_at", v.CreatedAt)
-				}
-			default:
-				return nil, fmt.Errorf("unknown catalog table: %s", name)
-			}
-		}
-
-		// Handle virtual sys.* tables
-		if leftRows == nil && strings.HasPrefix(strings.ToLower(s.From.Table), "sys.") {
-			parts := strings.SplitN(s.From.Table, ".", 2)
-			if len(parts) != 2 {
-				return nil, fmt.Errorf("invalid sys reference: %s", s.From.Table)
-			}
-			name := strings.ToLower(parts[1])
-			sysRows, err := resolveSysTable(env, name)
-			if err != nil {
-				return nil, err
-			}
-			leftRows = sysRows
-			// Apply alias if present.
-			if s.From.Alias != "" {
-				for _, r := range leftRows {
-					for k, v := range r {
-						if !strings.Contains(k, ".") {
-							r[s.From.Alias+"."+k] = v
-						}
-					}
-				}
-			}
-		}
-
-		// If still not resolved, treat as a regular table (prefer cteEnv.db when available)
-		if leftRows == nil {
-			var leftT *storage.Table
-			var err error
-			if cteEnv.ctes != nil {
-				leftT, err = cteEnv.db.Get(cteEnv.tenant, s.From.Table)
-			} else {
-				leftT, err = env.db.Get(env.tenant, s.From.Table)
-			}
-			if err != nil {
-				return nil, err
-			}
-			leftRows, _ = rowsFromTable(leftT, aliasOr(s.From))
-		}
+	leftRows, err := resolveFromClause(env, cteEnv, s)
+	if err != nil {
+		return nil, err
 	}
 
 	cur := leftRows
@@ -748,48 +873,11 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 		// row per distinct-on key. The ORDER BY clause controls which row is
 		// considered "first"; so apply ORDER BY first if present.
 		if len(s.DistinctOn) > 0 {
-			// If ORDER BY present, sort now so the first row per key is the right one
-			if len(s.OrderBy) > 0 {
-				lcOrdCols := make([]string, len(s.OrderBy))
-				for idx, oi := range s.OrderBy {
-					lcOrdCols[idx] = strings.ToLower(oi.Col)
-				}
-				sort.SliceStable(outRows, func(i, j int) bool {
-					a := outRows[i]
-					b := outRows[j]
-					for k, oi := range s.OrderBy {
-						av := a[lcOrdCols[k]]
-						bv := b[lcOrdCols[k]]
-						cmp := compareForOrder(av, bv, oi.Desc)
-						if cmp == 0 {
-							continue
-						}
-						if oi.Desc {
-							return cmp > 0
-						}
-						return cmp < 0
-					}
-					return false
-				})
+			var err error
+			outRows, err = applyDistinctOn(env, s, outRows)
+			if err != nil {
+				return nil, err
 			}
-			seen := make(map[string]bool)
-			var res []Row
-			for _, r := range outRows {
-				var parts []string
-				for _, e := range s.DistinctOn {
-					v, err := evalExpr(env, e, r)
-					if err != nil {
-						return nil, err
-					}
-					parts = append(parts, fmt.Sprintf("%v", v))
-				}
-				key := strings.Join(parts, "|")
-				if !seen[key] {
-					seen[key] = true
-					res = append(res, r)
-				}
-			}
-			outRows = res
 		} else {
 			outRows = distinctRows(outRows, outCols)
 		}
@@ -797,27 +885,7 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 
 	// ORDER BY
 	if len(s.OrderBy) > 0 {
-		lcOrdCols := make([]string, len(s.OrderBy))
-		for idx, oi := range s.OrderBy {
-			lcOrdCols[idx] = strings.ToLower(oi.Col)
-		}
-		sort.SliceStable(outRows, func(i, j int) bool {
-			a := outRows[i]
-			b := outRows[j]
-			for k, oi := range s.OrderBy {
-				av := a[lcOrdCols[k]]
-				bv := b[lcOrdCols[k]]
-				cmp := compareForOrder(av, bv, oi.Desc)
-				if cmp == 0 {
-					continue
-				}
-				if oi.Desc {
-					return cmp > 0
-				}
-				return cmp < 0
-			}
-			return false
-		})
+		outRows = applySortOrder(s.OrderBy, outRows)
 	}
 
 	// OFFSET/LIMIT (applied before UNION to each individual SELECT)
