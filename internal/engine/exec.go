@@ -5901,6 +5901,149 @@ func hasWindowFunction(e Expr) bool {
 
 // ==================== Window Function Support ====================
 
+// extractWindowOffset extracts and validates offset from window function arguments
+func extractWindowOffset(env ExecEnv, args []Expr, row Row, defaultOffset int) (int, error) {
+	if len(args) <= 1 {
+		return defaultOffset, nil
+	}
+	offsetVal, err := evalExpr(env, args[1], row)
+	if err != nil {
+		return 0, err
+	}
+	if offsetInt, ok := offsetVal.(int); ok {
+		return offsetInt, nil
+	}
+	if offsetFloat, ok := offsetVal.(float64); ok {
+		return int(offsetFloat), nil
+	}
+	return defaultOffset, nil
+}
+
+// evalLagFunction evaluates the LAG window function
+func evalLagFunction(env ExecEnv, ex *FuncCall, partitionRows []Row, currentIdx int, row Row) (any, error) {
+	offset, err := extractWindowOffset(env, ex.Args, row, 1)
+	if err != nil {
+		return nil, err
+	}
+	lagIdx := currentIdx - offset
+	if lagIdx < 0 {
+		// Return default value if provided
+		if len(ex.Args) > 2 {
+			return evalExpr(env, ex.Args[2], row)
+		}
+		return nil, nil
+	}
+	return evalExpr(env, ex.Args[0], partitionRows[lagIdx])
+}
+
+// evalLeadFunction evaluates the LEAD window function
+func evalLeadFunction(env ExecEnv, ex *FuncCall, partitionRows []Row, currentIdx int, row Row) (any, error) {
+	offset, err := extractWindowOffset(env, ex.Args, row, 1)
+	if err != nil {
+		return nil, err
+	}
+	leadIdx := currentIdx + offset
+	if leadIdx >= len(partitionRows) {
+		// Return default value if provided
+		if len(ex.Args) > 2 {
+			return evalExpr(env, ex.Args[2], row)
+		}
+		return nil, nil
+	}
+	return evalExpr(env, ex.Args[0], partitionRows[leadIdx])
+}
+
+// evalFirstValue evaluates the FIRST_VALUE window function
+func evalFirstValue(env ExecEnv, ex *FuncCall, partitionRows []Row) (any, error) {
+	if len(ex.Args) == 0 {
+		return nil, fmt.Errorf("FIRST_VALUE requires an argument")
+	}
+	if len(partitionRows) == 0 {
+		return nil, nil
+	}
+	return evalExpr(env, ex.Args[0], partitionRows[0])
+}
+
+// evalLastValue evaluates the LAST_VALUE window function
+func evalLastValue(env ExecEnv, ex *FuncCall, partitionRows []Row, currentIdx int) (any, error) {
+	if len(ex.Args) == 0 {
+		return nil, fmt.Errorf("LAST_VALUE requires an argument")
+	}
+	if len(partitionRows) == 0 {
+		return nil, nil
+	}
+	// Use frame end if specified
+	endIdx := len(partitionRows) - 1
+	if ex.Over.Frame != nil {
+		endIdx = calculateFrameEnd(currentIdx, len(partitionRows), ex.Over.Frame)
+	}
+	return evalExpr(env, ex.Args[0], partitionRows[endIdx])
+}
+
+// evalMovingAggregate evaluates MOVING_SUM and MOVING_AVG window functions
+func evalMovingAggregate(env ExecEnv, ex *FuncCall, partitionRows []Row, currentIdx int, row Row) (any, error) {
+	// Get window size from first argument
+	if len(ex.Args) == 0 {
+		return nil, fmt.Errorf("%s requires window size argument", ex.Name)
+	}
+	sizeVal, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	var windowSize int
+	if sizeInt, ok := sizeVal.(int); ok {
+		windowSize = sizeInt
+	} else if sizeFloat, ok := sizeVal.(float64); ok {
+		windowSize = int(sizeFloat)
+	}
+
+	// Calculate start of window
+	startIdx := currentIdx - windowSize + 1
+	if startIdx < 0 {
+		startIdx = 0
+	}
+
+	// Get value expression (second argument if provided, otherwise assume column)
+	var valueExpr Expr
+	if len(ex.Args) > 1 {
+		valueExpr = ex.Args[1]
+	} else {
+		// Use ORDER BY column as default
+		if len(ex.Over.OrderBy) > 0 {
+			valueExpr = &VarRef{Name: ex.Over.OrderBy[0].Col}
+		} else {
+			return nil, fmt.Errorf("%s requires value expression", ex.Name)
+		}
+	}
+
+	// Calculate sum over window
+	var sum float64
+	count := 0
+	for i := startIdx; i <= currentIdx && i < len(partitionRows); i++ {
+		val, err := evalExpr(env, valueExpr, partitionRows[i])
+		if err != nil {
+			return nil, err
+		}
+		if val != nil {
+			if valFloat, ok := val.(float64); ok {
+				sum += valFloat
+			} else if valInt, ok := val.(int); ok {
+				sum += float64(valInt)
+			}
+			count++
+		}
+	}
+
+	if ex.Name == "MOVING_SUM" {
+		return sum, nil
+	}
+	// MOVING_AVG
+	if count == 0 {
+		return nil, nil
+	}
+	return sum / float64(count), nil
+}
+
 // evalWindowFunction evaluates a window function with OVER clause
 func evalWindowFunction(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if ex.Over == nil {
@@ -5931,138 +6074,16 @@ func evalWindowFunction(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	switch ex.Name {
 	case "ROW_NUMBER":
 		return currentIdx + 1, nil
-
 	case "LAG":
-		offset := 1
-		if len(ex.Args) > 1 {
-			offsetVal, err := evalExpr(env, ex.Args[1], row)
-			if err != nil {
-				return nil, err
-			}
-			if offsetInt, ok := offsetVal.(int); ok {
-				offset = offsetInt
-			} else if offsetFloat, ok := offsetVal.(float64); ok {
-				offset = int(offsetFloat)
-			}
-		}
-		lagIdx := currentIdx - offset
-		if lagIdx < 0 {
-			// Return default value if provided
-			if len(ex.Args) > 2 {
-				return evalExpr(env, ex.Args[2], row)
-			}
-			return nil, nil
-		}
-		return evalExpr(env, ex.Args[0], partitionRows[lagIdx])
-
+		return evalLagFunction(env, ex, partitionRows, currentIdx, row)
 	case "LEAD":
-		offset := 1
-		if len(ex.Args) > 1 {
-			offsetVal, err := evalExpr(env, ex.Args[1], row)
-			if err != nil {
-				return nil, err
-			}
-			if offsetInt, ok := offsetVal.(int); ok {
-				offset = offsetInt
-			} else if offsetFloat, ok := offsetVal.(float64); ok {
-				offset = int(offsetFloat)
-			}
-		}
-		leadIdx := currentIdx + offset
-		if leadIdx >= len(partitionRows) {
-			// Return default value if provided
-			if len(ex.Args) > 2 {
-				return evalExpr(env, ex.Args[2], row)
-			}
-			return nil, nil
-		}
-		return evalExpr(env, ex.Args[0], partitionRows[leadIdx])
-
+		return evalLeadFunction(env, ex, partitionRows, currentIdx, row)
 	case "FIRST_VALUE":
-		if len(ex.Args) == 0 {
-			return nil, fmt.Errorf("FIRST_VALUE requires an argument")
-		}
-		if len(partitionRows) == 0 {
-			return nil, nil
-		}
-		return evalExpr(env, ex.Args[0], partitionRows[0])
-
+		return evalFirstValue(env, ex, partitionRows)
 	case "LAST_VALUE":
-		if len(ex.Args) == 0 {
-			return nil, fmt.Errorf("LAST_VALUE requires an argument")
-		}
-		if len(partitionRows) == 0 {
-			return nil, nil
-		}
-		// Use frame end if specified
-		endIdx := len(partitionRows) - 1
-		if ex.Over.Frame != nil {
-			endIdx = calculateFrameEnd(currentIdx, len(partitionRows), ex.Over.Frame)
-		}
-		return evalExpr(env, ex.Args[0], partitionRows[endIdx])
-
+		return evalLastValue(env, ex, partitionRows, currentIdx)
 	case "MOVING_SUM", "MOVING_AVG":
-		// Get window size from first argument
-		if len(ex.Args) == 0 {
-			return nil, fmt.Errorf("%s requires window size argument", ex.Name)
-		}
-		sizeVal, err := evalExpr(env, ex.Args[0], row)
-		if err != nil {
-			return nil, err
-		}
-		var windowSize int
-		if sizeInt, ok := sizeVal.(int); ok {
-			windowSize = sizeInt
-		} else if sizeFloat, ok := sizeVal.(float64); ok {
-			windowSize = int(sizeFloat)
-		}
-
-		// Calculate start of window
-		startIdx := currentIdx - windowSize + 1
-		if startIdx < 0 {
-			startIdx = 0
-		}
-
-		// Get value expression (second argument if provided, otherwise assume column)
-		var valueExpr Expr
-		if len(ex.Args) > 1 {
-			valueExpr = ex.Args[1]
-		} else {
-			// Use ORDER BY column as default
-			if len(ex.Over.OrderBy) > 0 {
-				valueExpr = &VarRef{Name: ex.Over.OrderBy[0].Col}
-			} else {
-				return nil, fmt.Errorf("%s requires value expression", ex.Name)
-			}
-		}
-
-		// Calculate sum over window
-		var sum float64
-		count := 0
-		for i := startIdx; i <= currentIdx && i < len(partitionRows); i++ {
-			val, err := evalExpr(env, valueExpr, partitionRows[i])
-			if err != nil {
-				return nil, err
-			}
-			if val != nil {
-				if valFloat, ok := val.(float64); ok {
-					sum += valFloat
-				} else if valInt, ok := val.(int); ok {
-					sum += float64(valInt)
-				}
-				count++
-			}
-		}
-
-		if ex.Name == "MOVING_SUM" {
-			return sum, nil
-		}
-		// MOVING_AVG
-		if count == 0 {
-			return nil, nil
-		}
-		return sum / float64(count), nil
-
+		return evalMovingAggregate(env, ex, partitionRows, currentIdx, row)
 	default:
 		return nil, fmt.Errorf("unsupported window function: %s", ex.Name)
 	}
