@@ -101,79 +101,123 @@ type sqlToken struct {
 	value string
 }
 
+// skipWhitespace skips whitespace characters
+func skipWhitespace(sql string, i int) int {
+	for i < len(sql) && (sql[i] == ' ' || sql[i] == '\t' || sql[i] == '\n') {
+		i++
+	}
+	return i
+}
+
+// tokenizeSingleLineComment tokenizes a single-line comment (-- ...)
+func tokenizeSingleLineComment(sql string, i int) (sqlToken, int) {
+	j := i
+	for j < len(sql) && sql[j] != '\n' {
+		j++
+	}
+	return sqlToken{"comment", sql[i:j]}, j
+}
+
+// tokenizeMultiLineComment tokenizes a multi-line comment (/* ... */)
+func tokenizeMultiLineComment(sql string, i int) (sqlToken, int) {
+	j := i + 2
+	for j+1 < len(sql) && !(sql[j] == '*' && sql[j+1] == '/') {
+		j++
+	}
+	if j+1 < len(sql) {
+		j += 2
+	}
+	return sqlToken{"comment", sql[i:j]}, j
+}
+
+// tokenizeString tokenizes a string literal ('...')
+func tokenizeString(sql string, i int) (sqlToken, int) {
+	j := i + 1
+	for j < len(sql) && sql[j] != '\'' {
+		if sql[j] == '\\' && j+1 < len(sql) {
+			j++
+		}
+		j++
+	}
+	if j < len(sql) {
+		j++
+	}
+	return sqlToken{"string", sql[i:j]}, j
+}
+
+// tokenizeNumber tokenizes a numeric literal
+func tokenizeNumber(sql string, i int) (sqlToken, int) {
+	j := i
+	for j < len(sql) && (sql[j] >= '0' && sql[j] <= '9' || sql[j] == '.') {
+		j++
+	}
+	return sqlToken{"number", sql[i:j]}, j
+}
+
+// tokenizeIdentOrKeyword tokenizes an identifier or keyword
+func tokenizeIdentOrKeyword(sql string, i int) (sqlToken, int) {
+	j := i
+	for j < len(sql) && isIdentChar(sql[j]) {
+		j++
+	}
+	word := sql[i:j]
+	if allKeywords[strings.ToUpper(word)] {
+		return sqlToken{"keyword", word}, j
+	}
+	return sqlToken{"ident", word}, j
+}
+
 func tokenizeSQL(sql string) []sqlToken {
 	var tokens []sqlToken
 	i := 0
 	for i < len(sql) {
+		// Skip whitespace
 		if sql[i] == ' ' || sql[i] == '\t' || sql[i] == '\n' {
-			i++
+			i = skipWhitespace(sql, i)
 			continue
 		}
 
+		// Single-line comment
 		if i+1 < len(sql) && sql[i] == '-' && sql[i+1] == '-' {
-			j := i
-			for j < len(sql) && sql[j] != '\n' {
-				j++
-			}
-			tokens = append(tokens, sqlToken{"comment", sql[i:j]})
-			i = j
+			tok, nextIdx := tokenizeSingleLineComment(sql, i)
+			tokens = append(tokens, tok)
+			i = nextIdx
 			continue
 		}
 
+		// Multi-line comment
 		if i+1 < len(sql) && sql[i] == '/' && sql[i+1] == '*' {
-			j := i + 2
-			for j+1 < len(sql) && !(sql[j] == '*' && sql[j+1] == '/') {
-				j++
-			}
-			if j+1 < len(sql) {
-				j += 2
-			}
-			tokens = append(tokens, sqlToken{"comment", sql[i:j]})
-			i = j
+			tok, nextIdx := tokenizeMultiLineComment(sql, i)
+			tokens = append(tokens, tok)
+			i = nextIdx
 			continue
 		}
 
+		// String literal
 		if sql[i] == '\'' {
-			j := i + 1
-			for j < len(sql) && sql[j] != '\'' {
-				if sql[j] == '\\' && j+1 < len(sql) {
-					j++
-				}
-				j++
-			}
-			if j < len(sql) {
-				j++
-			}
-			tokens = append(tokens, sqlToken{"string", sql[i:j]})
-			i = j
+			tok, nextIdx := tokenizeString(sql, i)
+			tokens = append(tokens, tok)
+			i = nextIdx
 			continue
 		}
 
+		// Number
 		if sql[i] >= '0' && sql[i] <= '9' {
-			j := i
-			for j < len(sql) && (sql[j] >= '0' && sql[j] <= '9' || sql[j] == '.') {
-				j++
-			}
-			tokens = append(tokens, sqlToken{"number", sql[i:j]})
-			i = j
+			tok, nextIdx := tokenizeNumber(sql, i)
+			tokens = append(tokens, tok)
+			i = nextIdx
 			continue
 		}
 
+		// Identifier or keyword
 		if isIdentStart(sql[i]) {
-			j := i
-			for j < len(sql) && isIdentChar(sql[j]) {
-				j++
-			}
-			word := sql[i:j]
-			if allKeywords[strings.ToUpper(word)] {
-				tokens = append(tokens, sqlToken{"keyword", word})
-			} else {
-				tokens = append(tokens, sqlToken{"ident", word})
-			}
-			i = j
+			tok, nextIdx := tokenizeIdentOrKeyword(sql, i)
+			tokens = append(tokens, tok)
+			i = nextIdx
 			continue
 		}
 
+		// Symbol
 		tokens = append(tokens, sqlToken{"symbol", string(sql[i])})
 		i++
 	}

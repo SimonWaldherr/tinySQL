@@ -10,24 +10,8 @@ import (
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
-// ImportGeoJSON imports a GeoJSON file. It supports FeatureCollection and
-// individual Feature objects. Properties become table columns; geometry is
-// stored in a `geometry` column with type GeometryType.
-func ImportGeoJSON(
-	ctx context.Context,
-	db *storage.DB,
-	tenant string,
-	tableName string,
-	src io.Reader,
-	opts *ImportOptions,
-) (*ImportResult, error) {
-	if opts == nil {
-		opts = &ImportOptions{}
-	}
-	applyDefaults(opts)
-
-	// Read into a generic structure so we can support either FeatureCollection
-	// or a sequence of Feature objects (NDJSON style).
+// extractGeoJSONFeatures decodes GeoJSON and extracts features
+func extractGeoJSONFeatures(src io.Reader) ([]map[string]any, error) {
 	br := bufio.NewReader(src)
 	dec := json.NewDecoder(br)
 
@@ -86,7 +70,15 @@ func ImportGeoJSON(
 		return nil, fmt.Errorf("no features found in GeoJSON")
 	}
 
-	// Build column names: properties keys + geometry
+	return features, nil
+}
+
+// buildGeoJSONColumns extracts property keys from features
+func buildGeoJSONColumns(features []map[string]any) []string {
+	if len(features) == 0 {
+		return []string{}
+	}
+
 	first := features[0]
 	propKeys := make([]string, 0)
 	if props, ok := first["properties"].(map[string]any); ok {
@@ -105,12 +97,11 @@ func ImportGeoJSON(
 
 	// Ensure deterministic order
 	sanitizeColumnNames(propKeys)
+	return propKeys
+}
 
-	colNames := append([]string{}, propKeys...)
-	geomCol := "geometry"
-	colNames = append(colNames, geomCol)
-
-	// Build sample data for type inference (stringified properties)
+// buildGeoJSONSampleData creates sample data for type inference
+func buildGeoJSONSampleData(features []map[string]any, propKeys []string) [][]string {
 	sampleData := make([][]string, 0, len(features))
 	for _, f := range features {
 		row := make([]string, len(propKeys))
@@ -133,6 +124,94 @@ func ImportGeoJSON(
 		}
 		sampleData = append(sampleData, row)
 	}
+	return sampleData
+}
+
+// extractFeatureProperties extracts properties from a GeoJSON feature
+func extractFeatureProperties(f map[string]any, propKeys []string) map[string]any {
+	if p, ok := f["properties"].(map[string]any); ok {
+		return p
+	}
+	// If properties absent, try top-level keys
+	props := make(map[string]any)
+	for _, k := range propKeys {
+		if v, ok := f[k]; ok {
+			props[k] = v
+		}
+	}
+	return props
+}
+
+// buildGeoJSONRow builds a row from a feature
+func buildGeoJSONRow(f map[string]any, propKeys []string, colTypes []storage.ColType, opts *ImportOptions, rowIndex int, result *ImportResult) []any {
+	row := make([]any, len(propKeys)+1)
+	props := extractFeatureProperties(f, propKeys)
+
+	for j, k := range propKeys {
+		if v, ok := props[k]; ok && v != nil {
+			s := fmt.Sprintf("%v", v)
+			conv, err := convertValue(s, colTypes[j], opts.DateTimeFormats, opts.NullLiterals)
+			if err != nil && opts.StrictTypes {
+				result.Errors = append(result.Errors, fmt.Sprintf("row %d, col %s: %v", rowIndex+1, k, err))
+				result.RowsSkipped++
+				continue
+			}
+			if err != nil {
+				row[j] = s
+			} else {
+				row[j] = conv
+			}
+		}
+	}
+
+	// Geometry: marshal geometry object to JSON and store as json.RawMessage
+	var geom any
+	if g, ok := f["geometry"]; ok && g != nil {
+		geom = g
+	}
+	if geom != nil {
+		if b, err := json.Marshal(geom); err == nil {
+			row[len(row)-1] = json.RawMessage(b)
+		} else {
+			row[len(row)-1] = nil
+		}
+	} else {
+		row[len(row)-1] = nil
+	}
+
+	return row
+}
+
+// ImportGeoJSON imports a GeoJSON file. It supports FeatureCollection and
+// individual Feature objects. Properties become table columns; geometry is
+// stored in a `geometry` column with type GeometryType.
+func ImportGeoJSON(
+	ctx context.Context,
+	db *storage.DB,
+	tenant string,
+	tableName string,
+	src io.Reader,
+	opts *ImportOptions,
+) (*ImportResult, error) {
+	if opts == nil {
+		opts = &ImportOptions{}
+	}
+	applyDefaults(opts)
+
+	// Extract features from GeoJSON
+	features, err := extractGeoJSONFeatures(src)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build column names
+	propKeys := buildGeoJSONColumns(features)
+	colNames := append([]string{}, propKeys...)
+	geomCol := "geometry"
+	colNames = append(colNames, geomCol)
+
+	// Build sample data for type inference
+	sampleData := buildGeoJSONSampleData(features, propKeys)
 
 	// Infer types for properties; geometry column uses GeometryType
 	var colTypes []storage.ColType
@@ -166,53 +245,7 @@ func ImportGeoJSON(
 	}
 
 	for i, f := range features {
-		row := make([]any, len(colNames))
-
-		var props map[string]any
-		if p, ok := f["properties"].(map[string]any); ok {
-			props = p
-		} else {
-			props = make(map[string]any)
-			for _, k := range propKeys {
-				if v, ok := f[k]; ok {
-					props[k] = v
-				}
-			}
-		}
-
-		for j, k := range propKeys {
-			if v, ok := props[k]; ok && v != nil {
-				s := fmt.Sprintf("%v", v)
-				conv, err := convertValue(s, colTypes[j], opts.DateTimeFormats, opts.NullLiterals)
-				if err != nil && opts.StrictTypes {
-					result.Errors = append(result.Errors, fmt.Sprintf("row %d, col %s: %v", i+1, k, err))
-					result.RowsSkipped++
-					continue
-				}
-				if err != nil {
-					row[j] = s
-				} else {
-					row[j] = conv
-				}
-			}
-		}
-
-		// Geometry: marshal geometry object to JSON and store as json.RawMessage
-		var geom any
-		if g, ok := f["geometry"]; ok && g != nil {
-			geom = g
-		}
-		if geom != nil {
-			if b, err := json.Marshal(geom); err == nil {
-				// store as json.RawMessage so consumers can reparse easily
-				row[len(row)-1] = json.RawMessage(b)
-			} else {
-				row[len(row)-1] = nil
-			}
-		} else {
-			row[len(row)-1] = nil
-		}
-
+		row := buildGeoJSONRow(f, propKeys, colTypes, opts, i, result)
 		tbl.Rows = append(tbl.Rows, row)
 		result.RowsInserted++
 	}

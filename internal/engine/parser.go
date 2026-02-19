@@ -525,6 +525,77 @@ func (p *Parser) parseCreateIndex() (Statement, error) {
 	}, nil
 }
 
+// parseJobSchedule parses the SCHEDULE clause for CREATE JOB
+func (p *Parser) parseJobSchedule(job *CreateJob) error {
+	p.next() // consume SCHEDULE
+	
+	if (p.cur.Typ == tKeyword || p.cur.Typ == tIdent) && p.cur.Val == "CRON" {
+		return p.parseJobScheduleCron(job)
+	}
+	if (p.cur.Typ == tKeyword || p.cur.Typ == tIdent) && p.cur.Val == "INTERVAL" {
+		return p.parseJobScheduleInterval(job)
+	}
+	if (p.cur.Typ == tKeyword || p.cur.Typ == tIdent) && p.cur.Val == "ONCE" {
+		return p.parseJobScheduleOnce(job)
+	}
+	return p.errf("expected CRON|INTERVAL|ONCE after SCHEDULE")
+}
+
+// parseJobScheduleCron parses SCHEDULE CRON clause
+func (p *Parser) parseJobScheduleCron(job *CreateJob) error {
+	p.next() // consume CRON
+	if p.cur.Typ != tString {
+		return p.errf("expected CRON string")
+	}
+	job.ScheduleType = "CRON"
+	job.CronExpr = p.cur.Val
+	p.next()
+	return nil
+}
+
+// parseJobScheduleInterval parses SCHEDULE INTERVAL clause
+func (p *Parser) parseJobScheduleInterval(job *CreateJob) error {
+	p.next() // consume INTERVAL
+	if p.cur.Typ != tNumber {
+		return p.errf("expected INTERVAL milliseconds number")
+	}
+	n, _ := strconv.ParseInt(p.cur.Val, 10, 64)
+	job.ScheduleType = "INTERVAL"
+	job.IntervalMs = n
+	p.next()
+	return nil
+}
+
+// parseJobScheduleOnce parses SCHEDULE ONCE clause
+func (p *Parser) parseJobScheduleOnce(job *CreateJob) error {
+	p.next() // consume ONCE
+	if p.cur.Typ != tString {
+		return p.errf("expected ONCE timestamp string")
+	}
+	job.ScheduleType = "ONCE"
+	// parse time in common layout
+	if t, err := time.Parse("2006-01-02 15:04:05", p.cur.Val); err == nil {
+		job.RunAt = &t
+	}
+	p.next()
+	return nil
+}
+
+// parseJobSQLBody extracts the SQL body of a CREATE JOB statement
+func (p *Parser) parseJobSQLBody() string {
+	bodyStart := p.cur.Pos
+	// Advance until semicolon or EOF
+	for !(p.cur.Typ == tSymbol && p.cur.Val == ";") && p.cur.Typ != tEOF {
+		p.next()
+	}
+	endPos := p.cur.Pos
+	// Extract substring from lexer
+	if bodyStart < endPos && endPos <= len(p.lx.s) {
+		return p.lx.s[bodyStart:endPos]
+	}
+	return ""
+}
+
 // parseCreateJob handles CREATE JOB statements.
 func (p *Parser) parseCreateJob() (Statement, error) {
 	// cur is at JOB
@@ -540,37 +611,8 @@ func (p *Parser) parseCreateJob() (Statement, error) {
 	for p.cur.Typ == tKeyword || p.cur.Typ == tIdent {
 		switch p.cur.Val {
 		case "SCHEDULE":
-			p.next()
-			if (p.cur.Typ == tKeyword || p.cur.Typ == tIdent) && p.cur.Val == "CRON" {
-				p.next()
-				if p.cur.Typ != tString {
-					return nil, p.errf("expected CRON string")
-				}
-				job.ScheduleType = "CRON"
-				job.CronExpr = p.cur.Val
-				p.next()
-			} else if (p.cur.Typ == tKeyword || p.cur.Typ == tIdent) && p.cur.Val == "INTERVAL" {
-				p.next()
-				if p.cur.Typ != tNumber {
-					return nil, p.errf("expected INTERVAL milliseconds number")
-				}
-				n, _ := strconv.ParseInt(p.cur.Val, 10, 64)
-				job.ScheduleType = "INTERVAL"
-				job.IntervalMs = n
-				p.next()
-			} else if (p.cur.Typ == tKeyword || p.cur.Typ == tIdent) && p.cur.Val == "ONCE" {
-				p.next()
-				if p.cur.Typ != tString {
-					return nil, p.errf("expected ONCE timestamp string")
-				}
-				job.ScheduleType = "ONCE"
-				// parse time in common layout
-				if t, err := time.Parse("2006-01-02 15:04:05", p.cur.Val); err == nil {
-					job.RunAt = &t
-				}
-				p.next()
-			} else {
-				return nil, p.errf("expected CRON|INTERVAL|ONCE after SCHEDULE")
+			if err := p.parseJobSchedule(job); err != nil {
+				return nil, err
 			}
 		case "TIMEZONE":
 			p.next()
@@ -611,19 +653,9 @@ afterClauses:
 		p.next()
 	}
 
-	// Capture raw SQL text for the job body: start at current token position
-	bodyStart := p.cur.Pos
-	// Advance until semicolon or EOF
-	for !(p.cur.Typ == tSymbol && p.cur.Val == ";") && p.cur.Typ != tEOF {
-		p.next()
-	}
-	endPos := p.cur.Pos
-	// Extract substring from lexer
-	if bodyStart < endPos && endPos <= len(p.lx.s) {
-		job.SQLText = p.lx.s[bodyStart:endPos]
-	} else {
-		job.SQLText = ""
-	}
+	// Capture raw SQL text for the job body
+	job.SQLText = p.parseJobSQLBody()
+	
 	// consume semicolon if present
 	if p.cur.Typ == tSymbol && p.cur.Val == ";" {
 		p.next()

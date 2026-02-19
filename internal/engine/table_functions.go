@@ -377,6 +377,97 @@ func (f *XMLTableFunc) Execute(ctx context.Context, args []Expr, env ExecEnv, ro
 	return parseXMLToTable(source, recordName)
 }
 
+// matchXMLPath checks if current stack matches the path segments
+func matchXMLPath(stack []string, pathSegments []string) bool {
+	if len(pathSegments) == 0 {
+		return false
+	}
+	if len(stack) < len(pathSegments) {
+		return false
+	}
+	offset := len(stack) - len(pathSegments)
+	for i := range pathSegments {
+		if stack[offset+i] != pathSegments[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// parseXMLElement parses an XML element and returns a Row with its data
+func parseXMLElement(dec *xml.Decoder, startElem xml.StartElement, colsSet map[string]struct{}) (Row, error) {
+	r := make(Row)
+	// Process attributes
+	for _, a := range startElem.Attr {
+		key := strings.ToLower("attr_" + a.Name.Local)
+		r[key] = strings.TrimSpace(a.Value)
+		colsSet[key] = struct{}{}
+	}
+
+	// Read tokens inside the element
+	depth := 1
+	var curElem string
+	var buf strings.Builder
+	for depth > 0 {
+		nt, err := dec.Token()
+		if err != nil {
+			break
+		}
+		switch tt := nt.(type) {
+		case xml.StartElement:
+			// new child; set current element name and reset buffer
+			curElem = tt.Name.Local
+			// capture its attributes too
+			for _, a := range tt.Attr {
+				k := strings.ToLower("attr_" + tt.Name.Local + "_" + a.Name.Local)
+				r[k] = strings.TrimSpace(a.Value)
+				colsSet[k] = struct{}{}
+			}
+			buf.Reset()
+			depth++
+		case xml.CharData:
+			if curElem != "" {
+				buf.WriteString(string(tt))
+			}
+		case xml.EndElement:
+			if curElem != "" && strings.EqualFold(tt.Name.Local, curElem) {
+				key := strings.ToLower(curElem)
+				val := strings.TrimSpace(buf.String())
+				r[key] = val
+				colsSet[key] = struct{}{}
+				curElem = ""
+			}
+			depth--
+		}
+	}
+	return r, nil
+}
+
+// findMostFrequentXMLElement finds the most frequent element in XML
+func findMostFrequentXMLElement(xmlStr string) string {
+	dec := xml.NewDecoder(strings.NewReader(xmlStr))
+	counts := map[string]int{}
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			break
+		}
+		if se, ok := tok.(xml.StartElement); ok {
+			counts[se.Name.Local]++
+		}
+	}
+	// pick most frequent element (excluding the document root)
+	best := ""
+	bestCount := 0
+	for k, v := range counts {
+		if v > bestCount {
+			best = k
+			bestCount = v
+		}
+	}
+	return best
+}
+
 func parseXMLToTable(xmlStr string, recordName string) (*ResultSet, error) {
 	// Support simple XPath-like paths (e.g. "root/records/record")
 	// and include attributes as columns named "attr_<name>".
@@ -399,69 +490,10 @@ func parseXMLToTable(xmlStr string, recordName string) (*ResultSet, error) {
 		switch t := tok.(type) {
 		case xml.StartElement:
 			stack = append(stack, t.Name.Local)
-			// check if current stack ends with pathSegments (if provided)
-			match := false
-			if len(pathSegments) == 0 {
-				// no explicit path: we guess a repeating child under root later
-				match = false
-			} else if len(stack) >= len(pathSegments) {
-				ok := true
-				offset := len(stack) - len(pathSegments)
-				for i := range pathSegments {
-					if stack[offset+i] != pathSegments[i] {
-						ok = false
-						break
-					}
-				}
-				match = ok
-			}
-			if match {
-				// decode this element into tokens until its matching end
-				// collect first-level child elements and attributes
-				r := make(Row)
-				// attributes
-				for _, a := range t.Attr {
-					key := strings.ToLower("attr_" + a.Name.Local)
-					r[key] = strings.TrimSpace(a.Value)
-					colsSet[key] = struct{}{}
-				}
-
-				// read tokens inside the element
-				depth := 1
-				var curElem string
-				var buf strings.Builder
-				for depth > 0 {
-					nt, err := dec.Token()
-					if err != nil {
-						break
-					}
-					switch tt := nt.(type) {
-					case xml.StartElement:
-						// new child; set current element name and reset buffer
-						curElem = tt.Name.Local
-						// capture its attributes too
-						for _, a := range tt.Attr {
-							k := strings.ToLower("attr_" + tt.Name.Local + "_" + a.Name.Local)
-							r[k] = strings.TrimSpace(a.Value)
-							colsSet[k] = struct{}{}
-						}
-						buf.Reset()
-						depth++
-					case xml.CharData:
-						if curElem != "" {
-							buf.WriteString(string(tt))
-						}
-					case xml.EndElement:
-						if curElem != "" && strings.EqualFold(tt.Name.Local, curElem) {
-							key := strings.ToLower(curElem)
-							val := strings.TrimSpace(buf.String())
-							r[key] = val
-							colsSet[key] = struct{}{}
-							curElem = ""
-						}
-						depth--
-					}
-				}
+			// check if current stack matches pathSegments
+			if matchXMLPath(stack, pathSegments) {
+				// Parse this element
+				r, _ := parseXMLElement(dec, t, colsSet)
 				rows = append(rows, r)
 				// pop the element we matched from stack
 				if len(stack) > 0 {
@@ -477,27 +509,7 @@ func parseXMLToTable(xmlStr string, recordName string) (*ResultSet, error) {
 
 	// If no explicit path was given, attempt to guess a repeating child under root
 	if len(pathSegments) == 0 && len(rows) == 0 {
-		// naive approach: find first element name that repeats and use it
-		dec2 := xml.NewDecoder(strings.NewReader(xmlStr))
-		counts := map[string]int{}
-		for {
-			tok, err := dec2.Token()
-			if err != nil {
-				break
-			}
-			if se, ok := tok.(xml.StartElement); ok {
-				counts[se.Name.Local]++
-			}
-		}
-		// pick most frequent element (excluding the document root)
-		best := ""
-		bestCount := 0
-		for k, v := range counts {
-			if v > bestCount {
-				best = k
-				bestCount = v
-			}
-		}
+		best := findMostFrequentXMLElement(xmlStr)
 		if best != "" {
 			// re-run extraction for best
 			return parseXMLToTable(xmlStr, best)
