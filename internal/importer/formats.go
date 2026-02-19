@@ -282,6 +282,81 @@ func sanitizeTableName(name string) string {
 //   - Single object: {"id": 1, "name": "Alice"} (creates single-row table)
 //
 //nolint:gocyclo // JSON import supports arrays, objects, and error recovery in one routine.
+// decodeJSONArray decodes a JSON array from a reader
+func decodeJSONArray(br *bufio.Reader, result *ImportResult) ([]map[string]any, error) {
+	records := []map[string]any{}
+	dec := json.NewDecoder(br)
+	// consume '['
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, fmt.Errorf("read JSON array token: %w", err)
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '[' {
+		return nil, fmt.Errorf("expected JSON array")
+	}
+	for dec.More() {
+		var rec map[string]any
+		if err := dec.Decode(&rec); err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("decode record: %v", err))
+			continue
+		}
+		records = append(records, rec)
+	}
+	return records, nil
+}
+
+// decodeNDJSON decodes newline-delimited JSON from a reader
+func decodeNDJSON(br *bufio.Reader, result *ImportResult) ([]map[string]any, error) {
+	records := []map[string]any{}
+	scanner := bufio.NewScanner(br)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("decode record: %v", err))
+			continue
+		}
+		records = append(records, rec)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan NDJSON: %w", err)
+	}
+	return records, nil
+}
+
+// extractJSONRecords extracts records from JSON input (array or NDJSON)
+func extractJSONRecords(src io.Reader, result *ImportResult) ([]map[string]any, error) {
+	br := bufio.NewReader(src)
+	peek, _ := br.Peek(512)
+	trimmed := strings.TrimSpace(string(peek))
+
+	if strings.HasPrefix(trimmed, "[") {
+		return decodeJSONArray(br, result)
+	}
+	if strings.HasPrefix(trimmed, "{") {
+		return decodeNDJSON(br, result)
+	}
+	return nil, fmt.Errorf("unsupported JSON format")
+}
+
+// buildJSONSampleData converts JSON records to sample data for type inference
+func buildJSONSampleData(records []map[string]any, colNames []string) [][]string {
+	sampleData := make([][]string, 0, len(records))
+	for _, rec := range records {
+		row := make([]string, len(colNames))
+		for i, col := range colNames {
+			if val, ok := rec[col]; ok && val != nil {
+				row[i] = fmt.Sprintf("%v", val)
+			}
+		}
+		sampleData = append(sampleData, row)
+	}
+	return sampleData
+}
+
 func ImportJSON(
 	ctx context.Context,
 	db *storage.DB,
@@ -300,52 +375,10 @@ func ImportJSON(
 		Errors:   make([]string, 0),
 	}
 
-	// Use a buffered reader so we can peek and then stream decode.
-	br := bufio.NewReader(src)
-	peek, _ := br.Peek(512)
-	trimmed := strings.TrimSpace(string(peek))
-
-	var records []map[string]any
-
-	// If input is a JSON array, stream-decode each element using json.Decoder.
-	if strings.HasPrefix(trimmed, "[") {
-		dec := json.NewDecoder(br)
-		// consume '['
-		tok, err := dec.Token()
-		if err != nil {
-			return nil, fmt.Errorf("read JSON array token: %w", err)
-		}
-		if delim, ok := tok.(json.Delim); !ok || delim != '[' {
-			return nil, fmt.Errorf("expected JSON array")
-		}
-		for dec.More() {
-			var rec map[string]any
-			if err := dec.Decode(&rec); err != nil {
-				result.Errors = append(result.Errors, fmt.Sprintf("decode record: %v", err))
-				continue
-			}
-			records = append(records, rec)
-		}
-	} else if strings.HasPrefix(trimmed, "{") {
-		// Treat input as NDJSON (line-delimited JSON). Stream by scanning lines
-		scanner := bufio.NewScanner(br)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" {
-				continue
-			}
-			var rec map[string]any
-			if err := json.Unmarshal([]byte(line), &rec); err != nil {
-				result.Errors = append(result.Errors, fmt.Sprintf("decode record: %v", err))
-				continue
-			}
-			records = append(records, rec)
-		}
-		if err := scanner.Err(); err != nil {
-			return nil, fmt.Errorf("scan NDJSON: %w", err)
-		}
-	} else {
-		return nil, fmt.Errorf("unsupported JSON format")
+	// Extract records from JSON
+	records, err := extractJSONRecords(src, result)
+	if err != nil {
+		return nil, err
 	}
 
 	if len(records) == 0 {
@@ -360,17 +393,8 @@ func ImportJSON(
 	sanitizeColumnNames(colNames)
 	result.ColumnNames = colNames
 
-	// Convert records to rows
-	sampleData := make([][]string, 0, len(records))
-	for _, rec := range records {
-		row := make([]string, len(colNames))
-		for i, col := range colNames {
-			if val, ok := rec[col]; ok && val != nil {
-				row[i] = fmt.Sprintf("%v", val)
-			}
-		}
-		sampleData = append(sampleData, row)
-	}
+	// Build sample data for type inference
+	sampleData := buildJSONSampleData(records, colNames)
 
 	// Infer types
 	var colTypes []storage.ColType
