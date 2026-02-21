@@ -86,6 +86,26 @@ go test ./... -count=1
 go test -coverprofile=coverage.out ./...
 ```
 
+## Available Tools (`cmd/`)
+
+The `cmd/` directory contains ready-to-use binaries for common workflows. See [cmd/README.md](./cmd/README.md) for the full list and build instructions.
+
+| Command | Description |
+|---------|-------------|
+| `demo` | Creates tables, inserts sample data, and runs example queries |
+| `repl` | Interactive SQL REPL with multiple output formats |
+| `server` | HTTP JSON API + gRPC server with optional peer federation |
+| `tinysql` | SQLite-compatible CLI (file or in-memory databases) |
+| `sqltools` | SQL formatter, validator, explain, and REPL |
+| `tinysqlpage` | HTTP server that renders SQL-driven web pages |
+| `studio` | Desktop GUI built with Wails |
+| `wasm_browser` | tinySQL compiled to WebAssembly for browsers |
+| `wasm_node` | tinySQL compiled to WebAssembly for Node.js |
+| `query_files` | Query CSV / JSON / XML files with SQL (web UI + CLI) |
+| `query_files_wasm` | WebAssembly build of query_files for the browser |
+| `catalog_demo` | Demo of the catalog and job-scheduler APIs |
+| `debug` | Development aid for testing BOOL column behavior |
+
 ## Goals (and non-goals)
 
 - Lightweight, educational SQL engine in pure Go
