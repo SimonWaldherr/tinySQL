@@ -42,6 +42,11 @@ func main() {
 	switch os.Args[1] {
 	case "interactive", "repl":
 		runInteractive()
+	case "web":
+		if err := runWeb(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	case "import-file":
 		if err := runImportFile(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -88,6 +93,7 @@ Usage:
 
 Commands:
   interactive          Start interactive REPL for data migration
+  web                  Start web interface for data migration
   import-file          Import a CSV/JSON file into tinySQL
   import-db            Import data from an external database into tinySQL
   export-file          Export a tinySQL table to CSV/JSON file

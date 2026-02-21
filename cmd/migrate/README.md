@@ -4,6 +4,7 @@ A smart CLI tool for data pipelines and processing. Transfer data between CSV/JS
 
 ## Features
 
+- **Web Interface**: Browser-based SQL editor with dark theme, file upload, connection management, and data export — all embedded in a single binary
 - **File Import/Export**: Load CSV and JSON files into tinySQL, export query results to files
 - **External Database Connectivity**: Connect to MySQL/MariaDB, PostgreSQL, SQLite, and MS SQL Server
 - **Cross-Database Transfers**: Move data between any combination of files and databases
@@ -11,6 +12,7 @@ A smart CLI tool for data pipelines and processing. Transfer data between CSV/JS
 - **Interactive REPL**: Named connection management, ad-hoc queries, live data exploration
 - **Pipeline Scripts**: Run multi-step migration workflows from script files
 - **Fuzzy Import**: Intelligent parsing for malformed CSV/JSON with auto-detection of delimiters, type inference, and error recovery
+- **Single Binary Deployment**: All HTML, CSS, and JS are embedded — no external files needed
 
 ## Quick Start
 
@@ -42,10 +44,23 @@ migrate import-file -file users.csv -query "SELECT name, email FROM users" -outp
 migrate interactive
 ```
 
+### Web Interface
+
+```bash
+# Start web server on port 8080
+migrate web
+
+# Custom port and pre-load files
+migrate web -addr :3000 -files users.csv,orders.json
+```
+
+Then open **http://localhost:8080** in your browser.
+
 ## Commands
 
 | Command | Description |
 |---------|-------------|
+| `web` | Start web interface for data migration |
 | `interactive` | Start interactive REPL for data migration |
 | `import-file` | Import a CSV/JSON file into tinySQL |
 | `import-db` | Import data from an external database into tinySQL |
@@ -55,6 +70,47 @@ migrate interactive
 | `help` | Show help message |
 
 ## Command Reference
+
+### web
+
+Start the web interface — a browser-based SQL editor with file upload, database connection management, and data export. All assets are embedded in the binary for single-file deployment.
+
+```bash
+migrate web [options]
+```
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-addr` | Listen address (host:port) | `:8080` |
+| `-files` | Comma-separated files to pre-load | |
+| `-verbose` | Verbose logging | `false` |
+
+**API Endpoints:**
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | Web UI (HTML/CSS/JS) |
+| `/api/query` | POST | Execute SQL query |
+| `/api/tables` | GET | List loaded tables |
+| `/api/connections` | GET | List active connections |
+| `/api/connect` | POST | Register external database |
+| `/api/disconnect` | POST | Close a connection |
+| `/api/import-file` | POST | Upload and import a file |
+| `/api/import-db` | POST | Import from external database |
+| `/api/export` | POST | Export query results (JSON/CSV) |
+
+**Examples:**
+
+```bash
+# Start with pre-loaded data
+migrate web -files data/users.csv,data/orders.json
+
+# Custom port
+migrate web -addr :3000
+
+# Bind to all interfaces (for Docker / remote access)
+migrate web -addr 0.0.0.0:8080
+```
 
 ### import-file
 
