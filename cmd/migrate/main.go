@@ -1073,8 +1073,8 @@ func exportToExternal(extDB *sql.DB, driver string, result *tinysql.ResultSet, t
 	if createTable {
 		createSQL := buildExternalCreateTable(driver, targetTable, result.Cols)
 		if _, err := extDB.Exec(createSQL); err != nil {
-			// Table might already exist, try to continue
-			_ = err
+			// Table might already exist; log but continue with insert
+			fmt.Fprintf(os.Stderr, "Note: CREATE TABLE skipped (%v)\n", err)
 		}
 	}
 

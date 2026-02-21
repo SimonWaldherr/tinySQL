@@ -201,7 +201,7 @@ func TestSplitQuotedFields(t *testing.T) {
 func TestImportFileAndQuery(t *testing.T) {
 	tmpDir := t.TempDir()
 	csvFile := filepath.Join(tmpDir, "test_users.csv")
-	err := os.WriteFile(csvFile, []byte("id,name,email\n1,Alice,alice@example.com\n2,Bob,bob@example.com\n"), 0644)
+	err := os.WriteFile(csvFile, []byte("id,name,email\n1,Alice,alice@example.com\n2,Bob,bob@example.com\n"), 0600)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +233,7 @@ func TestImportFileAndQuery(t *testing.T) {
 func TestImportJSONFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	jsonFile := filepath.Join(tmpDir, "data.json")
-	err := os.WriteFile(jsonFile, []byte(`[{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]`), 0644)
+	err := os.WriteFile(jsonFile, []byte(`[{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]`), 0600)
 	if err != nil {
 		t.Fatal(err)
 	}
