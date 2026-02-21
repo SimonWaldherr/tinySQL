@@ -1,6 +1,6 @@
 .PHONY: help build test clean install lint fmt vet run-repl run-server run-demo
 .PHONY: build-all build-repl build-server build-demo build-cli build-debug build-catalog
-.PHONY: build-wasm-browser build-wasm-node build-studio build-tinysqlpage
+.PHONY: build-wasm-browser build-wasm-node build-studio build-tinysqlpage build-migrate
 .PHONY: test-all test-unit test-integration coverage
 .DEFAULT_GOAL := help
 
@@ -80,6 +80,12 @@ build-tinysqlpage:
 	@echo "$(GREEN)Building tinySQLPage...$(NC)"
 	@mkdir -p $(BINARY_DIR)
 	$(GO) build $(GOFLAGS) $(LDFLAGS) -o $(BINARY_DIR)/tinysqlpage $(CMD_DIR)/tinysqlpage/main.go
+
+## build-migrate: Build data migration tool
+build-migrate:
+	@echo "$(GREEN)Building data migration tool...$(NC)"
+	@mkdir -p $(BINARY_DIR)
+	cd $(CMD_DIR)/migrate && $(GO) build $(GOFLAGS) -o ../../$(BINARY_DIR)/migrate .
 
 ## build-wasm-browser: Build WASM for browser
 build-wasm-browser:
