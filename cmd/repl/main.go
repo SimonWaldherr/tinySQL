@@ -33,6 +33,68 @@ func main() {
 	runREPL(db, *flagEcho, *flagFormat, *flagBeautiful, *flagHTML, *flagErrorsOnly)
 }
 
+// checkInteractiveMode checks if stdin is a terminal
+func checkInteractiveMode() bool {
+	if fi, err := os.Stdin.Stat(); err == nil {
+		return (fi.Mode() & os.ModeCharDevice) != 0
+	}
+	return false
+}
+
+// printREPLBanner prints the REPL startup banner
+func printREPLBanner(interactive, htmlMode bool) {
+	if interactive && !htmlMode {
+		fmt.Println("tinysql REPL (database/sql). Statement mit ';' beenden. '.help' für Hilfe.")
+	}
+}
+
+// printPrompt prints the appropriate prompt based on state
+func printPrompt(hasBuffer, interactive, htmlMode, firstPrompt bool) bool {
+	if !interactive || htmlMode {
+		return firstPrompt
+	}
+	
+	if !hasBuffer {
+		if !firstPrompt {
+			fmt.Println()
+		}
+		fmt.Print("sql> ")
+		return false
+	}
+	fmt.Print(" ... ")
+	return firstPrompt
+}
+
+// handleInputError handles scanner errors
+func handleInputError(err error, htmlMode bool, htmlParts *[]string) {
+	if htmlMode {
+		*htmlParts = append(*htmlParts, "<div class='err'>ERR: "+html.EscapeString(err.Error())+"</div>")
+	} else {
+		fmt.Fprintln(os.Stderr, "read error:", err)
+	}
+}
+
+// shouldSkipLine checks if a line should be skipped for execution
+func shouldSkipLine(line string) bool {
+	return line == "" || strings.HasPrefix(line, "--") || strings.HasPrefix(line, "/*")
+}
+
+// executeStatement executes a complete SQL statement
+func executeStatement(db *sql.DB, q string, beautiful, htmlMode, errorsOnly bool, format string, srcLines []string, htmlParts *[]string, interactive bool) []string {
+	up := strings.ToUpper(q)
+	if strings.HasPrefix(up, "SELECT") || strings.HasPrefix(up, "WITH") {
+		if err := handleSelectStatement(db, q, beautiful, htmlMode, errorsOnly, format, srcLines, htmlParts, interactive); err != nil {
+			return nil
+		}
+		return nil
+	}
+
+	if err := handleNonSelectStatement(db, q, beautiful, htmlMode, errorsOnly, htmlParts, interactive, srcLines); err != nil {
+		return nil
+	}
+	return srcLines
+}
+
 func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool, errorsOnly bool) {
 	sc := bufio.NewScanner(os.Stdin)
 	// Scanner token limit is 64K by default; allow larger statements/files.
@@ -43,15 +105,10 @@ func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool
 
 	// If stdin is not a terminal (e.g., redirected from a file) suppress
 	// interactive prompts like `sql>` to keep non-interactive output clean.
-	interactive := false
-	if fi, err := os.Stdin.Stat(); err == nil {
-		interactive = (fi.Mode() & os.ModeCharDevice) != 0
-	}
+	interactive := checkInteractiveMode()
 
 	// Keep HTML output clean: never print banners/prompts to stdout in htmlMode.
-	if interactive && !htmlMode {
-		fmt.Println("tinysql REPL (database/sql). Statement mit ';' beenden. '.help' für Hilfe.")
-	}
+	printREPLBanner(interactive, htmlMode)
 
 	// srcLines accumulates all input lines since the last printed SELECT (when
 	// running in beautiful mode). We keep comments and DDL/DML lines here and
@@ -63,29 +120,12 @@ func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool
 	var htmlParts []string
 
 	for {
-		if buf.Len() == 0 {
-			// Only print spacing/newlines and prompts in interactive mode.
-			if interactive && !htmlMode {
-				if !firstPrompt {
-					fmt.Println()
-				}
-				firstPrompt = false
-				fmt.Print("sql> ")
-			}
-		} else {
-			if interactive && !htmlMode {
-				fmt.Print(" ... ")
-			}
-		}
+		firstPrompt = printPrompt(buf.Len() > 0, interactive, htmlMode, firstPrompt)
 
 		if !sc.Scan() {
 			// Input closed (or read error).
 			if err := sc.Err(); err != nil {
-				if htmlMode {
-					htmlParts = append(htmlParts, "<div class='err'>ERR: "+html.EscapeString(err.Error())+"</div>")
-				} else {
-					fmt.Fprintln(os.Stderr, "read error:", err)
-				}
+				handleInputError(err, htmlMode, &htmlParts)
 			}
 
 			if htmlMode {
@@ -104,7 +144,7 @@ func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool
 		}
 
 		// Skip pure comment or empty lines for execution-building as before
-		if line == "" || strings.HasPrefix(line, "--") || strings.HasPrefix(line, "/*") {
+		if shouldSkipLine(line) {
 			continue
 		}
 
@@ -126,28 +166,15 @@ func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool
 				fmt.Println("--", q)
 			}
 
-			up := strings.ToUpper(q)
-			if strings.HasPrefix(up, "SELECT") || strings.HasPrefix(up, "WITH") {
-				if err := handleSelectStatement(db, q, beautiful, htmlMode, errorsOnly, format, srcLines, &htmlParts, interactive); err != nil {
-					// Errors already reported by helper; drop srcLines when beautiful
-					if beautiful {
-						srcLines = nil
-					}
-				} else if beautiful {
-					srcLines = nil
-				}
-				continue
+			newSrcLines := executeStatement(db, q, beautiful, htmlMode, errorsOnly, format, srcLines, &htmlParts, interactive)
+			if newSrcLines == nil && beautiful {
+				srcLines = nil
+			} else if newSrcLines != nil {
+				srcLines = newSrcLines
 			}
-
-			if err := handleNonSelectStatement(db, q, beautiful, htmlMode, errorsOnly, &htmlParts, interactive, srcLines); err != nil {
-				if beautiful {
-					srcLines = nil
-				}
-				continue
-			}
-		} else {
-			buf.WriteString(" ")
+			continue
 		}
+		buf.WriteString(" ")
 	}
 }
 
