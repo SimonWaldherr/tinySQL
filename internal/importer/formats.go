@@ -281,8 +281,9 @@ func sanitizeTableName(name string) string {
 //   - JSON Lines format: {"id": 1, "name": "Alice"}\n{"id": 2, "name": "Bob"}
 //   - Single object: {"id": 1, "name": "Alice"} (creates single-row table)
 //
-//nolint:gocyclo // JSON import supports arrays, objects, and error recovery in one routine.
 // decodeJSONArray decodes a JSON array from a reader
+//
+//nolint:gocyclo // JSON import supports arrays, objects, and error recovery in one routine.
 func decodeJSONArray(br *bufio.Reader, result *ImportResult) ([]map[string]any, error) {
 	records := []map[string]any{}
 	dec := json.NewDecoder(br)

@@ -27,15 +27,15 @@ type webState struct {
 
 // apiResponse is the JSON structure returned by API endpoints.
 type apiResponse struct {
-	Success  bool              `json:"success"`
-	Columns  []string          `json:"columns,omitempty"`
-	Rows     []map[string]any  `json:"rows,omitempty"`
-	RowCount int               `json:"rowCount"`
-	Duration string            `json:"duration,omitempty"`
-	Message  string            `json:"message,omitempty"`
-	Error    string            `json:"error,omitempty"`
-	Tables   []tableInfo       `json:"tables,omitempty"`
-	Conns    []connectionInfo  `json:"connections,omitempty"`
+	Success  bool             `json:"success"`
+	Columns  []string         `json:"columns,omitempty"`
+	Rows     []map[string]any `json:"rows,omitempty"`
+	RowCount int              `json:"rowCount"`
+	Duration string           `json:"duration,omitempty"`
+	Message  string           `json:"message,omitempty"`
+	Error    string           `json:"error,omitempty"`
+	Tables   []tableInfo      `json:"tables,omitempty"`
+	Conns    []connectionInfo `json:"connections,omitempty"`
 }
 
 type tableInfo struct {

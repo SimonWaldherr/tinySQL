@@ -574,7 +574,7 @@ func resolveCatalogTable(env ExecEnv, s *Select) ([]Row, error) {
 		return nil, fmt.Errorf("invalid catalog reference: %s", s.From.Table)
 	}
 	name := strings.ToLower(parts[1])
-	
+
 	switch name {
 	case "tables":
 		return resolveCatalogTables(env, s)
@@ -1531,10 +1531,10 @@ func evalRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
 		}
 
 		alignedRows := alignRecursiveCTERows(accRs, nextRs, cte.Name)
-		
+
 		var newAdded int
 		accRows, newAdded = addNewRowsToRecursiveCTE(accRows, alignedRows, targetCols, seen)
-		
+
 		if accRs == nil && nextRs != nil {
 			accRs = &ResultSet{Cols: nextRs.Cols}
 		}

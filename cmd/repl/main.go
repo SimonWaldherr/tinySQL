@@ -53,7 +53,7 @@ func printPrompt(hasBuffer, interactive, htmlMode, firstPrompt bool) bool {
 	if !interactive || htmlMode {
 		return firstPrompt
 	}
-	
+
 	if !hasBuffer {
 		if !firstPrompt {
 			fmt.Println()

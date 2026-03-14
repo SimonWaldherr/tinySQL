@@ -528,7 +528,7 @@ func (p *Parser) parseCreateIndex() (Statement, error) {
 // parseJobSchedule parses the SCHEDULE clause for CREATE JOB
 func (p *Parser) parseJobSchedule(job *CreateJob) error {
 	p.next() // consume SCHEDULE
-	
+
 	if (p.cur.Typ == tKeyword || p.cur.Typ == tIdent) && p.cur.Val == "CRON" {
 		return p.parseJobScheduleCron(job)
 	}
@@ -655,7 +655,7 @@ afterClauses:
 
 	// Capture raw SQL text for the job body
 	job.SQLText = p.parseJobSQLBody()
-	
+
 	// consume semicolon if present
 	if p.cur.Typ == tSymbol && p.cur.Val == ";" {
 		p.next()
