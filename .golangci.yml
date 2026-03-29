@@ -1,17 +1,14 @@
-# golangci-lint v2 configuration
-version: "2"
-
 run:
   timeout: 5m
 
 output:
   formats:
-    colored-line-number: {}
+    - colored-line-number
   print-issued-lines: true
   print-linter-name: true
 
 linters:
-  default: none
+  disable-all: true
   enable:
     - bodyclose
     - dogsled
@@ -37,59 +34,39 @@ linters:
     - unused
     - whitespace
 
-  settings:
-    errcheck:
-      check-type-assertions: true
-      check-blank: true
-    govet:
-      enable:
-        - shadow
-    gocyclo:
-      min-complexity: 30
-    dupl:
-      threshold: 100
-    goconst:
-      min-len: 3
-      min-occurrences: 3
-    misspell:
-      locale: US
-    lll:
-      line-length: 120
-    gocritic:
-      enabled-tags:
-        - performance
-        - style
-        - experimental
-      disabled-checks:
-        - wrapperFunc
-        - commentedOutCode
-    godox:
-      keywords:
-        - TODO
-        - BUG
-        - FIXME
-        - NOTE
-        - HACK
-  exclusions:
-    rules:
-      - path: .*/internal/engine/.*\.go
-        linters:
-          - copyloopvar
-          - dupl
-          - errcheck
-          - gocognit
-          - goconst
-          - gocritic
-          - godox
-          - gosec
-          - govet
-          - lll
-          - misspell
-          - prealloc
-          - staticcheck
-          - unconvert
-          - unparam
-          - whitespace
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+    check-blank: true
+  govet:
+    enable:
+      - shadow
+  gocyclo:
+    min-complexity: 30
+  dupl:
+    threshold: 100
+  goconst:
+    min-len: 3
+    min-occurrences: 3
+  misspell:
+    locale: US
+  lll:
+    line-length: 120
+  gocritic:
+    enabled-tags:
+      - performance
+      - style
+      - experimental
+    disabled-checks:
+      - wrapperFunc
+      - commentedOutCode
+  godox:
+    keywords:
+      - TODO
+      - BUG
+      - FIXME
+      - NOTE
+      - HACK
 
 issues:
   exclude-dirs:
@@ -127,12 +104,3 @@ issues:
         - whitespace
   max-issues-per-linter: 0
   max-same-issues: 0
-
-formatters:
-  enable:
-    - gofmt
-    - goimports
-  settings:
-    goimports:
-      local-prefixes:
-        - github.com/SimonWaldherr/tinySQL
