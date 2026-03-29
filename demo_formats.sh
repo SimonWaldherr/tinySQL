@@ -1,25 +1,38 @@
-#!/bin/bash
-echo "SELECT 'Alice' as name, 30 as age, 'Engineer' as job;" > /tmp/demo.sql
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "==================== TABLE (default) ===================="
-go run cmd/repl/main.go --echo < /tmp/demo.sql 2>&1 | tail -8
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
-echo ""
-echo "==================== JSON ===================="
-go run cmd/repl/main.go --format=json --echo < /tmp/demo.sql 2>&1 | tail -6
+if ! command -v go >/dev/null 2>&1; then
+    echo "go toolchain not found" >&2
+    exit 1
+fi
 
-echo ""
-echo "==================== YAML ===================="
-go run cmd/repl/main.go --format=yaml --echo < /tmp/demo.sql 2>&1 | tail -7
+SQL_FILE="$(mktemp "${TMPDIR:-/tmp}/tinysql-demo-formats.XXXXXX.sql")"
+trap 'rm -f "$SQL_FILE"' EXIT
 
-echo ""
-echo "==================== CSV ===================="
-go run cmd/repl/main.go --format=csv --echo < /tmp/demo.sql 2>&1 | tail -5
+cat >"$SQL_FILE" <<'EOF'
+SELECT 'Alice' as name, 30 as age, 'Engineer' as job;
+EOF
 
-echo ""
-echo "==================== TSV ===================="
-go run cmd/repl/main.go --format=tsv --echo < /tmp/demo.sql 2>&1 | tail -5
+run_format() {
+    local title="$1"
+    local format="$2"
+    local lines="$3"
 
-echo ""
-echo "==================== MARKDOWN ===================="
-go run cmd/repl/main.go --format=markdown --echo < /tmp/demo.sql 2>&1 | tail -7
+    echo "==================== ${title} ===================="
+    if [[ -n "$format" ]]; then
+        go run ./cmd/repl --format="$format" --echo <"$SQL_FILE" 2>&1 | tail -n "$lines"
+    else
+        go run ./cmd/repl --echo <"$SQL_FILE" 2>&1 | tail -n "$lines"
+    fi
+    echo ""
+}
+
+run_format "TABLE (default)" "" 8
+run_format "JSON" "json" 6
+run_format "YAML" "yaml" 7
+run_format "CSV" "csv" 5
+run_format "TSV" "tsv" 5
+run_format "MARKDOWN" "markdown" 7

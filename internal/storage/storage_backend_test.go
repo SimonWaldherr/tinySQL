@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
@@ -60,7 +61,9 @@ func TestParseStorageMode(t *testing.T) {
 		{"ram", ModeMemory, false},
 		{"", ModeMemory, false},
 		{"wal", ModeWAL, false},
+		{"WAL", ModeWAL, false},
 		{"disk", ModeDisk, false},
+		{" DiSk ", ModeDisk, false},
 		{"index", ModeIndex, false},
 		{"hybrid", ModeHybrid, false},
 		{"unknown", ModeMemory, true},
@@ -322,6 +325,151 @@ func TestDiskBackend_Persistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertTableEqual(t, loaded, tbl)
+}
+
+func TestDiskBackend_TenantNormalization(t *testing.T) {
+	dir := t.TempDir()
+
+	b, err := NewDiskBackend(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tbl := makeTestTable("users", 3)
+	if err := b.SaveTable("Tenant_A", tbl); err != nil {
+		t.Fatal(err)
+	}
+
+	if !b.TableExists("tenant_a", "users") {
+		t.Fatal("table should exist with normalized tenant key")
+	}
+	names, err := b.ListTableNames("tenant_a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 1 || names[0] != "users" {
+		t.Fatalf("ListTableNames(tenant_a): got %v, want [users]", names)
+	}
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen should preserve discoverability using normalized tenant keys.
+	b2, err := NewDiskBackend(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !b2.TableExists("tenant_a", "users") {
+		t.Fatal("table should exist after reopen")
+	}
+	loaded, err := b2.LoadTable("tenant_a", "users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertTableEqual(t, loaded, tbl)
+}
+
+func TestDiskBackend_RejectsUnsafeIdentifiers(t *testing.T) {
+	dir := t.TempDir()
+	b, err := NewDiskBackend(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := b.SaveTable("../escape", makeTestTable("users", 1)); err == nil {
+		t.Fatal("expected error for unsafe tenant name")
+	}
+	if err := b.SaveTable("default", makeTestTable("../escape", 1)); err == nil {
+		t.Fatal("expected error for unsafe table name")
+	}
+}
+
+func TestDiskBackend_RejectsUnsafeManifestPaths(t *testing.T) {
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "manifest.json")
+	m := map[string]any{
+		"version":    1,
+		"created_at": "2026-01-01T00:00:00Z",
+		"updated_at": "2026-01-01T00:00:00Z",
+		"tenants": map[string]any{
+			"default": map[string]any{
+				"users": map[string]any{
+					"name":      "users",
+					"cols":      []any{},
+					"row_count": 0,
+					"version":   1,
+					"disk_size": 1,
+					"file_path": "../escape.tbl",
+				},
+			},
+		},
+	}
+	data, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := NewDiskBackend(dir, false); err == nil {
+		t.Fatal("expected NewDiskBackend to fail for unsafe manifest file path")
+	}
+}
+
+func TestDiskBackend_ManifestFlushOnSync(t *testing.T) {
+	dir := t.TempDir()
+	b, err := NewDiskBackend(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tbl := makeTestTable("items", 2)
+	initialVersion := tbl.Version
+	if err := b.SaveTable("default", tbl); err != nil {
+		t.Fatal(err)
+	}
+
+	readManifestVersion := func(t *testing.T) int {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m struct {
+			Tenants map[string]map[string]struct {
+				Version int `json:"version"`
+			} `json:"tenants"`
+		}
+		if err := json.Unmarshal(data, &m); err != nil {
+			t.Fatal(err)
+		}
+		return m.Tenants["default"]["items"].Version
+	}
+
+	if got := readManifestVersion(t); got != initialVersion {
+		t.Fatalf("initial manifest version = %d, want %d", got, initialVersion)
+	}
+
+	// Non-structural update: same table identity/schema, only row data/version changed.
+	tbl.Rows = append(tbl.Rows, []any{99, "new", 9.9})
+	tbl.Version++
+	updatedVersion := tbl.Version
+	if err := b.SaveTable("default", tbl); err != nil {
+		t.Fatal(err)
+	}
+
+	// Manifest should still hold previous version until Sync flushes it.
+	if got := readManifestVersion(t); got != initialVersion {
+		t.Fatalf("manifest version before Sync = %d, want %d", got, initialVersion)
+	}
+
+	if err := b.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if got := readManifestVersion(t); got != updatedVersion {
+		t.Fatalf("manifest version after Sync = %d, want %d", got, updatedVersion)
+	}
 }
 
 func TestDiskBackend_IsDirty(t *testing.T) {

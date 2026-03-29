@@ -10,10 +10,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -39,6 +42,10 @@ type DiskBackend struct {
 
 	// versions tracks the version at last save so we can detect dirty tables.
 	versions map[string]map[string]int // tenant → lower(name) → version
+
+	// Manifest timestamp bookkeeping.
+	manifestCreatedAt time.Time
+	manifestDirty     bool
 
 	// stats
 	syncCount     atomic.Int64
@@ -79,7 +86,10 @@ func (b *DiskBackend) LoadTable(tenant, name string) (*Table, error) {
 		return nil, nil
 	}
 
-	path := filepath.Join(b.dir, meta.FilePath)
+	path, err := b.resolveTablePath(meta.FilePath)
+	if err != nil {
+		return nil, fmt.Errorf("disk backend: invalid file path for %s/%s: %w", tenant, name, err)
+	}
 	t, err := b.readTableFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -91,9 +101,11 @@ func (b *DiskBackend) LoadTable(tenant, name string) (*Table, error) {
 	b.loadCount.Add(1)
 
 	// Track version at load time
+	tn := normalizeTenantKey(tenant)
+	lc := strings.ToLower(name)
 	b.mu.Lock()
-	b.ensureVersionMap(tenant)
-	b.versions[tenant][strings.ToLower(name)] = t.Version
+	b.ensureVersionMap(tn)
+	b.versions[tn][lc] = t.Version
 	b.mu.Unlock()
 
 	return t, nil
@@ -101,27 +113,37 @@ func (b *DiskBackend) LoadTable(tenant, name string) (*Table, error) {
 
 // SaveTable writes a table to its GOB file on disk and updates the manifest.
 func (b *DiskBackend) SaveTable(tenant string, t *Table) error {
+	tn := normalizeTenantKey(tenant)
+	relPath, absPath, err := b.buildTablePaths(tn, t.Name)
+	if err != nil {
+		return fmt.Errorf("disk backend: save %s/%s: %w", tenant, t.Name, err)
+	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	lc := strings.ToLower(t.Name)
-	relPath := filepath.Join(tenant, lc+b.fileExt())
-	absPath := filepath.Join(b.dir, relPath)
 
 	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
 		return fmt.Errorf("disk backend: mkdir: %w", err)
 	}
-	size, err := b.writeTableFile(absPath, tenant, t)
+	size, err := b.writeTableFile(absPath, tn, t)
 	if err != nil {
 		return fmt.Errorf("disk backend: save %s/%s: %w", tenant, t.Name, err)
 	}
 
 	// Update metadata
-	if b.meta[tenant] == nil {
-		b.meta[tenant] = make(map[string]*TableMeta)
+	if b.meta[tn] == nil {
+		b.meta[tn] = make(map[string]*TableMeta)
 	}
-	b.meta[tenant][lc] = &TableMeta{
-		Tenant:   tenant,
+	prevMeta, hadMeta := b.meta[tn][lc]
+	structuralChange := !hadMeta ||
+		prevMeta.FilePath != relPath ||
+		prevMeta.Name != t.Name ||
+		!reflect.DeepEqual(prevMeta.Cols, t.Cols)
+
+	b.meta[tn][lc] = &TableMeta{
+		Tenant:   tn,
 		Name:     t.Name,
 		Cols:     t.Cols,
 		RowCount: len(t.Rows),
@@ -131,28 +153,42 @@ func (b *DiskBackend) SaveTable(tenant string, t *Table) error {
 	}
 
 	// Track version
-	b.ensureVersionMap(tenant)
-	b.versions[tenant][lc] = t.Version
+	b.ensureVersionMap(tn)
+	b.versions[tn][lc] = t.Version
 
-	return b.saveManifestLocked()
+	// Persist manifest immediately only for structural changes (new table,
+	// path/schema/name change). Non-structural row/version updates are
+	// flushed by Sync/Close, which avoids rewriting the full manifest on
+	// every DML write.
+	b.manifestDirty = true
+	if structuralChange {
+		return b.saveManifestLocked()
+	}
+	return nil
 }
 
 // DeleteTable removes a table file from disk and updates the manifest.
 func (b *DiskBackend) DeleteTable(tenant, name string) error {
+	tn := normalizeTenantKey(tenant)
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	lc := strings.ToLower(name)
-	if tm := b.meta[tenant]; tm != nil {
+	if tm := b.meta[tn]; tm != nil {
 		if meta, ok := tm[lc]; ok {
-			absPath := filepath.Join(b.dir, meta.FilePath)
+			absPath, err := b.resolveTablePath(meta.FilePath)
+			if err != nil {
+				return fmt.Errorf("disk backend: delete %s/%s: %w", tenant, name, err)
+			}
 			_ = os.Remove(absPath) // best-effort
 			delete(tm, lc)
 		}
 	}
-	if vm := b.versions[tenant]; vm != nil {
+	if vm := b.versions[tn]; vm != nil {
 		delete(vm, lc)
 	}
+	b.manifestDirty = true
 
 	return b.saveManifestLocked()
 }
@@ -188,6 +224,9 @@ func (b *DiskBackend) Sync() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.syncCount.Add(1)
+	if !b.manifestDirty {
+		return nil
+	}
 	return b.saveManifestLocked()
 }
 
@@ -245,7 +284,7 @@ func (b *DiskBackend) GetMeta(tenant, name string) *TableMeta {
 // ──── internal helpers ───────────────────────────────────────────────────
 
 func (b *DiskBackend) getMeta(tenant, name string) *TableMeta {
-	tm := b.meta[strings.ToLower(tenant)]
+	tm := b.meta[normalizeTenantKey(tenant)]
 	if tm == nil {
 		return nil
 	}
@@ -253,10 +292,110 @@ func (b *DiskBackend) getMeta(tenant, name string) *TableMeta {
 }
 
 func (b *DiskBackend) ensureVersionMap(tenant string) {
-	tn := strings.ToLower(tenant)
+	tn := normalizeTenantKey(tenant)
 	if b.versions[tn] == nil {
 		b.versions[tn] = make(map[string]int)
 	}
+}
+
+func normalizeTenantKey(tenant string) string {
+	return strings.ToLower(tenant)
+}
+
+func validatePathSegment(seg, field string, allowEmpty bool) error {
+	if seg == "" {
+		if allowEmpty {
+			return nil
+		}
+		return fmt.Errorf("%s must not be empty", field)
+	}
+	if seg == "." || seg == ".." {
+		return fmt.Errorf("%s must not be %q", field, seg)
+	}
+	if strings.Contains(seg, "/") || strings.Contains(seg, "\\") {
+		return fmt.Errorf("%s must not contain path separators", field)
+	}
+	if strings.IndexByte(seg, 0) >= 0 {
+		return fmt.Errorf("%s contains invalid NUL byte", field)
+	}
+	return nil
+}
+
+func sanitizeRelativePath(rel string) (string, error) {
+	if rel == "" {
+		return "", fmt.Errorf("path is empty")
+	}
+	if filepath.IsAbs(rel) {
+		return "", fmt.Errorf("absolute paths are not allowed")
+	}
+	clean := filepath.Clean(rel)
+	if clean == "." {
+		return "", fmt.Errorf("path is empty")
+	}
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path escapes database directory")
+	}
+	if vol := filepath.VolumeName(clean); vol != "" {
+		return "", fmt.Errorf("volume-qualified paths are not allowed")
+	}
+	return clean, nil
+}
+
+func (b *DiskBackend) resolveTablePath(rel string) (string, error) {
+	cleanRel, err := sanitizeRelativePath(rel)
+	if err != nil {
+		return "", err
+	}
+	root := filepath.Clean(b.dir)
+	full := filepath.Join(root, cleanRel)
+	relToRoot, err := filepath.Rel(root, full)
+	if err != nil {
+		return "", err
+	}
+	if relToRoot == ".." || strings.HasPrefix(relToRoot, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("resolved path escapes database directory")
+	}
+	return full, nil
+}
+
+func (b *DiskBackend) buildTablePaths(tenant, tableName string) (string, string, error) {
+	if err := validatePathSegment(tenant, "tenant", true); err != nil {
+		return "", "", err
+	}
+	lc := strings.ToLower(tableName)
+	if err := validatePathSegment(lc, "table name", false); err != nil {
+		return "", "", err
+	}
+	rel := filepath.Join(tenant, lc+b.fileExt())
+	abs, err := b.resolveTablePath(rel)
+	if err != nil {
+		return "", "", err
+	}
+	return rel, abs, nil
+}
+
+func syncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		// Directory fsync is not portable on Windows.
+		return nil
+	}
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := f.Sync(); err != nil {
+		// Some filesystems do not support directory fsync.
+		if errors.Is(err, os.ErrInvalid) ||
+			errors.Is(err, os.ErrPermission) ||
+			errors.Is(err, syscall.EINVAL) ||
+			errors.Is(err, syscall.ENOTSUP) ||
+			errors.Is(err, syscall.EPERM) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func (b *DiskBackend) fileExt() string {
@@ -315,10 +454,13 @@ func (b *DiskBackend) writeTableFile(path, tenant string, t *Table) (int64, erro
 		_ = os.Remove(tmp)
 		return 0, err
 	}
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return 0, err
+	}
 
 	info, err := os.Stat(path)
 	if err != nil {
-		return 0, nil
+		return 0, err
 	}
 	return info.Size(), nil
 }
@@ -392,14 +534,34 @@ func (b *DiskBackend) loadManifest() error {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return fmt.Errorf("disk backend: parse manifest: %w", err)
 	}
+	if m.CreatedAt.IsZero() {
+		b.manifestCreatedAt = time.Now()
+	} else {
+		b.manifestCreatedAt = m.CreatedAt
+	}
 	for tn, tables := range m.Tenants {
+		tn = normalizeTenantKey(tn)
+		if err := validatePathSegment(tn, "manifest tenant", true); err != nil {
+			return fmt.Errorf("disk backend: invalid tenant %q: %w", tn, err)
+		}
 		if b.meta[tn] == nil {
 			b.meta[tn] = make(map[string]*TableMeta)
 		}
 		if b.versions[tn] == nil {
 			b.versions[tn] = make(map[string]int)
 		}
-		for lc, tm := range tables {
+		for key, tm := range tables {
+			lc := strings.ToLower(tm.Name)
+			if lc == "" {
+				lc = strings.ToLower(key)
+			}
+			if err := validatePathSegment(lc, "manifest table", false); err != nil {
+				return fmt.Errorf("disk backend: invalid table %q for tenant %q: %w", tm.Name, tn, err)
+			}
+			cleanPath, err := sanitizeRelativePath(tm.FilePath)
+			if err != nil {
+				return fmt.Errorf("disk backend: invalid file path for %s/%s: %w", tn, tm.Name, err)
+			}
 			cols := make([]Column, len(tm.Cols))
 			for i, c := range tm.Cols {
 				cols[i] = Column{
@@ -417,18 +579,22 @@ func (b *DiskBackend) loadManifest() error {
 				RowCount: tm.RowCount,
 				Version:  tm.Version,
 				DiskSize: tm.DiskSize,
-				FilePath: tm.FilePath,
+				FilePath: cleanPath,
 			}
 			b.versions[tn][lc] = tm.Version
 		}
 	}
+	b.manifestDirty = false
 	return nil
 }
 
 func (b *DiskBackend) saveManifestLocked() error {
+	if b.manifestCreatedAt.IsZero() {
+		b.manifestCreatedAt = time.Now()
+	}
 	m := manifest{
 		Version:   1,
-		CreatedAt: time.Now(),
+		CreatedAt: b.manifestCreatedAt,
 		UpdatedAt: time.Now(),
 		Tenants:   make(map[string]map[string]manifestTM),
 	}
@@ -459,11 +625,36 @@ func (b *DiskBackend) saveManifestLocked() error {
 	if err != nil {
 		return err
 	}
-	tmp := b.manifestPath() + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+
+	path := b.manifestPath()
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, b.manifestPath())
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+	b.manifestDirty = false
+	return nil
 }
 
 // ──── Migration: import an existing GOB database into the disk backend ──

@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -31,8 +34,29 @@ jobs:
       - name: Download deps
         run: go mod download
 
+      - name: Check gofmt
+        run: |
+          files=$(git ls-files '*.go')
+          if [ -n "$files" ]; then
+            unformatted=$(gofmt -l $files)
+            if [ -n "$unformatted" ]; then
+              echo "Unformatted Go files:"
+              echo "$unformatted"
+              exit 1
+            fi
+          fi
+
+      - name: Build all packages
+        run: go build ./...
+
+      - name: Run go vet
+        run: go vet ./...
+
       - name: Run unit tests (no cache)
         run: go test ./... -count=1
+
+      - name: Run race tests
+        run: go test ./... -race -count=1
 
       - name: Run coverage
         run: go test -coverprofile=coverage.out ./...
@@ -41,6 +65,39 @@ jobs:
         run: |
           go tool cover -func=coverage.out -o coverage.txt
           tail -1 coverage.txt >> $GITHUB_STEP_SUMMARY
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=10m
+
+  vulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Run govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
 
   build-bindings:
     name: Build Bindings

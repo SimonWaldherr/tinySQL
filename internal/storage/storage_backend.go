@@ -13,6 +13,7 @@ package storage
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -71,7 +72,7 @@ func (m StorageMode) String() string {
 // ParseStorageMode converts a string representation back to a StorageMode.
 // It is case-insensitive and returns an error for unknown values.
 func ParseStorageMode(s string) (StorageMode, error) {
-	switch s {
+	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "memory", "mem", "ram", "":
 		return ModeMemory, nil
 	case "wal":

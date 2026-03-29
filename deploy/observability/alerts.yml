@@ -1,0 +1,29 @@
+groups:
+- name: tinysql-server
+  rules:
+  - alert: TinySQLHighErrorRate
+    expr: |
+      (
+        sum(rate(tinysql_requests_total{protocol="http",status!~"2.."}[5m]))
+        /
+        sum(rate(tinysql_requests_total{protocol="http"}[5m]))
+      ) > 0.01
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: tinySQL HTTP error rate above 1%
+      description: HTTP error-rate SLI exceeded 1% for 10 minutes.
+
+  - alert: TinySQLHighLatencyP95
+    expr: |
+      histogram_quantile(
+        0.95,
+        sum by (le) (rate(tinysql_request_duration_seconds_bucket{protocol="http",route="/api/query"}[5m]))
+      ) > 0.25
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: tinySQL query p95 latency above 250ms
+      description: /api/query p95 latency exceeded 250ms for 10 minutes.

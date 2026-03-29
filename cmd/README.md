@@ -17,12 +17,20 @@ This repo ships multiple binaries under `cmd/` for different use-cases.
   - HTTP JSON API and gRPC (JSON codec) server with optional federation across peers.
   - Build: `go build ./cmd/server`
   - Run: `./server -http :8080 -grpc :9090 -dsn "mem://?tenant=default" -peers "host1:9090,host2:9090"`
-  - Flags: `-dsn`, `-http <addr>`, `-grpc <addr>`, `-auth <token>`, `-peers <addr,...>`, `-tenant <name>`, `-v`
+  - Flags:
+    - Core: `-dsn`, `-http <addr>`, `-grpc <addr>`, `-auth <token>`, `-peers <addr,...>`, `-tenant <name>`, `-v`
+    - TLS: `-tls-min-version`, `-http-tls-cert`, `-http-tls-key`, `-grpc-tls-cert`, `-grpc-tls-key`, `-peer-tls`, `-peer-tls-ca`, `-peer-tls-server-name`, `-peer-tls-skip-verify`
+    - Limits: `-max-body-bytes`, `-max-sql-bytes`, `-grpc-max-recv-bytes`, `-grpc-max-send-bytes`
+    - Timeouts: `-request-timeout`, `-peer-timeout`, `-shutdown-timeout`
+    - HTTP hardening: `-trusted-proxies`, `-http-read-timeout`, `-http-read-header-timeout`, `-http-write-timeout`, `-http-idle-timeout`, `-http-max-header-bytes`
   - HTTP Endpoints:
     - POST /api/exec {tenant, sql}
     - POST /api/query {tenant, sql}
     - GET  /api/status
     - POST /api/federated/query {tenant, sql}
+    - GET  /healthz
+    - GET  /readyz
+    - GET  /metrics
 
 - tinysql
   - SQLite-compatible CLI with file-based and in-memory database support. Accepts a filename as the database path (`:memory:` for in-memory), optional inline SQL as a positional argument, and supports utility subcommands (`tables`, `schema`, `insert`, `query`, `export`).
@@ -57,12 +65,14 @@ This repo ships multiple binaries under `cmd/` for different use-cases.
 
 - wasm_browser
   - Builds tinySQL to WebAssembly for browsers. A modern UI is provided in `web/`.
-  - Build & serve: `cd cmd/wasm_browser && ./build.sh` then open http://localhost:8080
+  - Build only: `cd cmd/wasm_browser && ./build.sh --build-only`
+  - Build & serve: `cd cmd/wasm_browser && ./build.sh --serve` then open http://localhost:8080
   - Manual build: `cd cmd/wasm_browser && GOOS=js GOARCH=wasm go build -o web/tinySQL.wasm . && cp "$(go env GOROOT)/lib/wasm/wasm_exec.js" web/`
 
 - wasm_node
   - Builds tinySQL to WebAssembly for Node.js and provides a Node runner.
-  - Build & run demo: `cd cmd/wasm_node && ./build.sh`
+  - Build only: `cd cmd/wasm_node && ./build.sh --build-only`
+  - Build & run demo: `cd cmd/wasm_node && ./build.sh --run`
   - Manual build: `cd cmd/wasm_node && GOOS=js GOARCH=wasm go build -o tinySQL.wasm . && cp "$(go env GOROOT)/lib/wasm/wasm_exec.js" ./`
   - Run: `node wasm_runner.js` or `node wasm_runner.js query "SELECT 1"`
 
@@ -74,7 +84,8 @@ This repo ships multiple binaries under `cmd/` for different use-cases.
 
 - query_files_wasm
   - WebAssembly build of the query_files tool for use directly in the browser. Exposes `importFile`, `executeQuery`, `listTables`, and `exportResults` JavaScript functions.
-  - Build: `cd cmd/query_files_wasm && ./build.sh`
+  - Build: `cd cmd/query_files_wasm && ./build.sh --build-only`
+  - Build & serve: `cd cmd/query_files_wasm && ./build.sh --serve`
   - Open `index.html` in a browser (requires a local HTTP server due to WASM MIME type).
 
 - catalog_demo
@@ -87,6 +98,12 @@ This repo ships multiple binaries under `cmd/` for different use-cases.
   - Build: `go build ./cmd/debug`
   - Run: `./debug`
 
+- server/loadtest
+  - Lightweight HTTP load generator for `cmd/server`.
+  - Build: `go build -o bin/tinysql-loadtest ./cmd/server/loadtest`
+  - Run: `./bin/tinysql-loadtest -url http://127.0.0.1:8080/api/query -requests 10000 -concurrency 100`
+
 Notes:
 - The in-memory DSN is `mem://?tenant=default`. Files can be persisted using `file:/path/to/db.dat?tenant=<name>&autosave=1`.
-- The server, REPL, and tinysql CLI all rely on the internal driver registration (`_ ".../internal/driver"`).
+- `repl` and `tinysql` rely on the internal `database/sql` driver registration (`_ ".../internal/driver"`).
+- `server` uses `internal/storage` directly with the same DSN conventions.

@@ -17,8 +17,29 @@ jobs:
       - name: Download deps
         run: go mod download
 
+      - name: Check gofmt
+        run: |
+          files=$(git ls-files '*.go')
+          if [ -n "$files" ]; then
+            unformatted=$(gofmt -l $files)
+            if [ -n "$unformatted" ]; then
+              echo "Unformatted Go files:"
+              echo "$unformatted"
+              exit 1
+            fi
+          fi
+
+      - name: Build all packages
+        run: go build ./...
+
+      - name: Run go vet
+        run: go vet ./...
+
       - name: Run unit tests
         run: go test ./... -count=1
+
+      - name: Run race tests
+        run: go test ./... -race -count=1
 
       - name: Run coverage
         run: go test -coverprofile=coverage.out ./...

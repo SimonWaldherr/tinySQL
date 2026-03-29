@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # build.sh – compile the TinySQL WASM demo and optionally serve it locally.
 #
 # Usage:
@@ -25,10 +25,14 @@ CLEAN=false
 for arg in "$@"; do
     case "$arg" in
         --serve|-s)  SERVE=true ;;
+        --build-only|-b) SERVE=false ;;
         --clean|-c)  CLEAN=true ;;
         --help|-h)
             sed -n '2,8s/^# //p' "$0"
             exit 0 ;;
+        *)
+            echo "Unknown flag: $arg"
+            exit 2 ;;
     esac
 done
 
@@ -59,10 +63,16 @@ echo "   Compiled in $(elapsed $T0)  –  raw size: $(human "$RAW_SIZE")"
 
 # ── copy wasm_exec.js ────────────────────────────────────────────────────────
 echo "📋 Copying wasm_exec.js…"
-WASM_EXEC="$(go env GOROOT)/misc/wasm/wasm_exec.js"
-if [ ! -f "$WASM_EXEC" ]; then
-    WASM_EXEC=$(find "$(go env GOROOT)" -name "wasm_exec.js" 2>/dev/null | head -1)
-fi
+GOROOT_PATH="$(go env GOROOT)"
+WASM_EXEC=""
+for candidate in \
+    "${GOROOT_PATH}/lib/wasm/wasm_exec.js" \
+    "${GOROOT_PATH}/misc/wasm/wasm_exec.js"; do
+    if [ -f "$candidate" ]; then
+        WASM_EXEC="$candidate"
+        break
+    fi
+done
 if [ -z "$WASM_EXEC" ] || [ ! -f "$WASM_EXEC" ]; then
     echo "❌ Could not find wasm_exec.js in Go installation (GOROOT=$(go env GOROOT))"
     exit 1

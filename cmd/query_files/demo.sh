@@ -1,44 +1,56 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+if ! command -v go >/dev/null 2>&1; then
+    echo "go toolchain not found" >&2
+    exit 1
+fi
+
+BIN_PATH="$(mktemp "${TMPDIR:-/tmp}/tinysql-query-files-demo.XXXXXX")"
+trap 'rm -f "$BIN_PATH"' EXIT
+
+go build -trimpath -o "$BIN_PATH" .
+
+run_case() {
+    local title="$1"
+    shift
+    echo "$title"
+    "$BIN_PATH" "$@"
+    echo ""
+}
 
 echo "=== TinySQL File Query Demo (Optimized with Fuzzy Import) ==="
 echo ""
 
-echo "1. Simple CSV query (select all):"
-go run main.go -query "SELECT name, age, city FROM sample" sample.csv
-echo ""
+run_case "1. Simple CSV query (select all):" \
+    -query "SELECT name, age, city FROM sample" sample.csv
 
-echo "2. Filter by number (age > 25):"
-go run main.go -query "SELECT name, age FROM sample WHERE age > 25" sample.csv
-echo ""
+run_case "2. Filter by number (age > 25):" \
+    -query "SELECT name, age FROM sample WHERE age > 25" sample.csv
 
-echo "3. Filter by text column (city = 'Paris'):"
-go run main.go -query "SELECT name, age FROM sample WHERE city = 'Paris'" sample.csv
-echo ""
+run_case "3. Filter by text column (city = 'Paris'):" \
+    -query "SELECT name, age FROM sample WHERE city = 'Paris'" sample.csv
 
-echo "4. JSON query with JSON output (ordered by name):"
-go run main.go -query "SELECT name, city FROM sample ORDER BY name" -output json sample.json
-echo ""
+run_case "4. JSON query with JSON output (ordered by name):" \
+    -query "SELECT name, city FROM sample ORDER BY name" -output json sample.json
 
-echo "5. CSV query with pattern matching (city contains 'on'):"
-go run main.go -query "SELECT name, age, city FROM sample WHERE city LIKE '%on%'" sample.csv
-echo ""
+run_case "5. CSV query with pattern matching (city contains 'on'):" \
+    -query "SELECT name, age, city FROM sample WHERE city LIKE '%on%'" sample.csv
 
-echo "6. Range query (age between 22 and 28):"
-go run main.go -query "SELECT name, age FROM sample WHERE age >= 22 AND age <= 28 ORDER BY age" sample.csv
-echo ""
+run_case "6. Range query (age between 22 and 28):" \
+    -query "SELECT name, age FROM sample WHERE age >= 22 AND age <= 28 ORDER BY age" sample.csv
 
-echo "7. Aggregation query (count by city):"
-go run main.go -query "SELECT city, COUNT(*) as count FROM sample GROUP BY city" sample.csv
-echo ""
+run_case "7. Aggregation query (count by city):" \
+    -query "SELECT city, COUNT(*) as count FROM sample GROUP BY city" sample.csv
 
-echo "8. CSV output format:"
-go run main.go -query "SELECT name, city FROM sample ORDER BY name" -output csv sample.csv
-echo ""
+run_case "8. CSV output format:" \
+    -query "SELECT name, city FROM sample ORDER BY name" -output csv sample.csv
 
-echo "9. Semicolon-delimited CSV (auto-detected delimiter):"
-go run main.go -query "SELECT name, amount, status FROM semicolon WHERE status = 'active'" semicolon.csv
-echo ""
+run_case "9. Semicolon-delimited CSV (auto-detected delimiter):" \
+    -query "SELECT name, amount, status FROM semicolon WHERE status = 'active'" semicolon.csv
 
-echo "10. Numeric operations:"
-go run main.go -query "SELECT name, amount FROM semicolon WHERE amount > 600 ORDER BY amount DESC" semicolon.csv
-echo ""
+run_case "10. Numeric operations:" \
+    -query "SELECT name, amount FROM semicolon WHERE amount > 600 ORDER BY amount DESC" semicolon.csv
