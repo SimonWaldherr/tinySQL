@@ -2,12 +2,14 @@
 let wasmReady = false;
 let currentTables = [];
 let currentResults = null;
+const HISTORY_KEY = 'tinysql_query_history_v1';
 // Safe references to WASM-exported functions (set after init)
 let wasmApi = {
     importFile: null,
     executeQuery: null,
     executeMulti: null,
     clearDatabase: null,
+    dropTable: null,
     listTables: null,
     exportResults: null,
     getTableSchema: null,
@@ -18,7 +20,31 @@ const pendingClientTables = {};
 
 // Query history (newest first, max 50)
 const MAX_HISTORY = 50;
-let queryHistory = JSON.parse(localStorage.getItem('tsql_history') || '[]');
+let queryHistory = loadHistory();
+
+function loadHistory() {
+    const legacyKeys = ['tinySQL_history', 'tsql_history'];
+    try {
+        const current = localStorage.getItem(HISTORY_KEY);
+        if (current) {
+            const parsed = JSON.parse(current);
+            return Array.isArray(parsed) ? parsed : [];
+        }
+        for (const key of legacyKeys) {
+            const legacy = localStorage.getItem(key);
+            if (!legacy) continue;
+            const parsed = JSON.parse(legacy);
+            if (Array.isArray(parsed)) {
+                localStorage.setItem(HISTORY_KEY, JSON.stringify(parsed));
+                localStorage.removeItem(key);
+                return parsed;
+            }
+        }
+    } catch (_) {
+        // Keep empty history if storage is corrupted or blocked.
+    }
+    return [];
+}
 
 // Initialize WASM
 async function initWasm() {
@@ -39,6 +65,7 @@ async function initWasm() {
         wasmApi.executeQuery = window.executeQuery;
         wasmApi.executeMulti = window.executeMulti;
         wasmApi.clearDatabase = window.clearDatabase;
+        wasmApi.dropTable = window.dropTable;
         wasmApi.listTables = window.listTables;
         wasmApi.exportResults = window.exportResults;
         wasmApi.getTableSchema = window.getTableSchema;
@@ -78,6 +105,7 @@ async function initWasm() {
             // Clear pending list now that we've attempted to import
             for (const k of Object.keys(pendingClientTables)) delete pendingClientTables[k];
         }
+        loadTables();
     } catch (err) {
         console.error("Failed to load WASM:", err);
         updateStatus("Failed to load WASM");
@@ -587,7 +615,21 @@ function showTableInfo(tableName) {
 
 // Remove table
 function removeTable(tableName) {
+    const isPending = Object.prototype.hasOwnProperty.call(pendingClientTables, tableName);
+
+    if (!isPending && wasmReady && typeof wasmApi.dropTable === 'function') {
+        const result = wasmApi.dropTable(tableName);
+        if (!result || !result.success) {
+            alert(`Failed to drop table "${tableName}": ${result?.error || 'Unknown error'}`);
+            return;
+        }
+    }
+
+    delete pendingClientTables[tableName];
     currentTables = currentTables.filter(t => t.name !== tableName);
+    if (currentResults && currentResults.sourceTable === tableName) {
+        currentResults = null;
+    }
     renderTables();
     updateStatus(`Removed table "${tableName}"`);
 }
@@ -630,6 +672,39 @@ function setQuery(query) {
 // Clear query
 function clearQuery() {
     document.getElementById('queryEditor').value = '';
+}
+
+function clearAllTables() {
+    if (!confirm('This will remove all imported tables. Continue?')) {
+        return;
+    }
+    if (typeof wasmApi.clearDatabase === 'function') {
+        const result = wasmApi.clearDatabase();
+        if (!result || !result.success) {
+            alert(`Failed to clear database: ${result?.error || 'Unknown error'}`);
+            return;
+        }
+    }
+    for (const key of Object.keys(pendingClientTables)) {
+        delete pendingClientTables[key];
+    }
+    currentTables = [];
+    currentResults = null;
+    renderTables();
+    const resultsContainer = document.getElementById('resultsContainer');
+    if (resultsContainer) {
+        resultsContainer.innerHTML = `
+            <div class="empty-state">
+                <div class="empty-state-icon">⚡</div>
+                <div class="empty-state-title">Ready to Query</div>
+                <div class="empty-state-text">
+                    Upload a file and run a SQL query
+                </div>
+            </div>
+        `;
+    }
+    window.clearVanillaGrid?.();
+    updateStatus('Database cleared');
 }
 
 // Format query (basic)
@@ -817,26 +892,31 @@ function loadTables() {
                 const userTbls = info.tables.filter(t => t.kind !== 'virtual');
                 const virtTbls = info.tables.filter(t => t.kind === 'virtual');
 
-                // Merge user tables into currentTables (keep pending status)
-                userTbls.forEach(t => {
-                    const existing = currentTables.find(x => x.name === t.name);
-                    if (!existing) {
+                // Replace current user-table snapshot from backend state.
+                currentTables = userTbls.map(t => ({
+                    name: t.name,
+                    rowCount: t.rows,
+                    columns: Array.isArray(t.columns)
+                        ? t.columns.map(c => typeof c === 'object' ? c.name : c)
+                        : [],
+                    columnTypes: Array.isArray(t.columns)
+                        ? t.columns.filter(c => typeof c === 'object')
+                        : [],
+                    kind: 'table',
+                }));
+
+                // Keep pending local tables visible until they are imported.
+                for (const [name, rows] of Object.entries(pendingClientTables)) {
+                    if (!currentTables.some(t => t.name === name)) {
+                        const cols = Array.isArray(rows) && rows.length > 0 ? Object.keys(rows[0]) : [];
                         currentTables.push({
-                            name: t.name,
-                            rowCount: t.rows,
-                            columns: Array.isArray(t.columns)
-                                ? t.columns.map(c => typeof c === 'object' ? c.name : c)
-                                : [],
-                            columnTypes: Array.isArray(t.columns)
-                                ? t.columns.filter(c => typeof c === 'object')
-                                : [],
+                            name,
+                            rowCount: Array.isArray(rows) ? rows.length : 0,
+                            columns: cols,
                             kind: 'table',
                         });
-                    } else {
-                        existing.rowCount = t.rows;
-                        existing.kind = 'table';
                     }
-                });
+                }
 
                 // Store virtual tables separately
                 window._virtualTables = virtTbls.map(t => ({
@@ -886,7 +966,11 @@ function doExport(format) {
         try {
             const res = wasmApi.exportResults(format);
             if (res && res.success && res.data) {
-                downloadFile(res.data, `query_results.${format}`, res.mime || 'application/octet-stream');
+                const mimeType = (typeof res.mimeType === 'string' && res.mimeType) ||
+                    (typeof res.mime === 'string' && res.mime) ||
+                    'application/octet-stream';
+                const ext = (typeof res.ext === 'string' && res.ext) ? res.ext : format;
+                downloadFile(res.data, `query_results.${ext}`, mimeType);
                 return;
             }
         } catch (_) { /* fall through */ }
@@ -947,7 +1031,8 @@ function exportXML() {
         xml += '  <row>\n';
         currentResults.columns.forEach(col => {
             const val = row[col];
-            xml += `    <${col}>${escapeXml(val == null ? '' : String(val))}</${col}>\n`;
+            const tag = toXmlTag(col);
+            xml += `    <${tag}>${escapeXml(val == null ? '' : String(val))}</${tag}>\n`;
         });
         xml += '  </row>\n';
     });
@@ -978,17 +1063,31 @@ function escapeXml(s) {
     return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;');
 }
 
+function toXmlTag(name) {
+    const raw = String(name || '').trim();
+    if (!raw) return 'col';
+    let tag = raw.replace(/[^A-Za-z0-9_.-]/g, '_');
+    if (!/^[A-Za-z_]/.test(tag)) {
+        tag = `c_${tag}`;
+    }
+    return tag || 'col';
+}
+
 // ----- Query History -----
 function pushHistory(sql, duration, rows) {
     queryHistory.unshift({ sql, duration, rows, ts: Date.now() });
     if (queryHistory.length > MAX_HISTORY) queryHistory.length = MAX_HISTORY;
-    try { localStorage.setItem('tinySQL_history', JSON.stringify(queryHistory)); } catch (_) {}
+    try { localStorage.setItem(HISTORY_KEY, JSON.stringify(queryHistory)); } catch (_) {}
     renderHistory();
 }
 
 function clearHistory() {
     queryHistory.length = 0;
-    try { localStorage.removeItem('tinySQL_history'); } catch (_) {}
+    try {
+        localStorage.removeItem(HISTORY_KEY);
+        localStorage.removeItem('tinySQL_history');
+        localStorage.removeItem('tsql_history');
+    } catch (_) {}
     renderHistory();
 }
 

@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -16,217 +18,410 @@ import (
 	tinysql "github.com/SimonWaldherr/tinySQL"
 )
 
+const (
+	defaultTenant       = "default"
+	defaultWorkers      = 4
+	defaultCacheSize    = 256
+	defaultQueryTimeout = 30 * time.Second
+)
+
 type Config struct {
-	Files        []string
-	Query        string
-	TableName    string
-	Delimiter    string
-	Interactive  bool
-	Verbose      bool
-	Output       string
-	FuzzyImport  bool
-	CacheEnabled bool
-	ParallelLoad bool
-	MaxWorkers   int
+	Files               []string
+	Query               string
+	TableName           string
+	Delimiter           string
+	DelimiterCandidates []rune
+	Interactive         bool
+	Verbose             bool
+	Output              string
+	FuzzyImport         bool
+	CacheEnabled        bool
+	CacheSize           int
+	ParallelLoad        bool
+	MaxWorkers          int
+	QueryTimeout        time.Duration
 }
 
-// Cache for parsed queries
+type loadJob struct {
+	file      string
+	tableName string
+}
+
+type Runner struct {
+	db         *tinysql.DB
+	tenant     string
+	config     Config
+	queryCache *tinysql.QueryCache
+}
+
+// Track loaded table names for interactive status.
 var (
-	queryCache    = make(map[string]tinysql.Statement)
-	queryCacheMux sync.RWMutex
-	tableNames    = make(map[string]string) // file -> tableName mapping
+	tableNames    = make(map[string]string)
 	tableNamesMux sync.RWMutex
 )
 
 func main() {
-	config := parseFlags()
+	config, err := parseFlags()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(2)
+	}
 
 	if config.Interactive {
 		runInteractiveMode(config)
-	} else {
-		if len(config.Files) == 0 || config.Query == "" {
-			fmt.Fprintf(os.Stderr, "Error: Both file and query are required in non-interactive mode\n")
-			flag.Usage()
-			os.Exit(1)
-		}
-		err := executeQuery(config)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
+		return
+	}
+
+	if len(config.Files) == 0 || strings.TrimSpace(config.Query) == "" {
+		fmt.Fprintf(os.Stderr, "Error: both file and query are required in non-interactive mode\n")
+		flag.Usage()
+		os.Exit(2)
+	}
+
+	if err := executeQuery(config); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
 	}
 }
 
-func parseFlags() Config {
-	var config Config
+func parseFlags() (Config, error) {
+	config := Config{}
 
 	flag.StringVar(&config.Query, "query", "", "SQL query to execute")
 	flag.StringVar(&config.TableName, "table", "", "Table name (default: filename without extension)")
-	flag.StringVar(&config.Delimiter, "delimiter", ",", "CSV delimiter (or auto-detect)")
+	flag.StringVar(&config.Delimiter, "delimiter", "auto", "CSV delimiter: auto, comma, semicolon, tab, pipe, or single-char")
 	flag.BoolVar(&config.Interactive, "interactive", false, "Run in interactive mode")
 	flag.BoolVar(&config.Verbose, "verbose", false, "Verbose output with timing and statistics")
 	flag.StringVar(&config.Output, "output", "table", "Output format: table, json, csv")
 	flag.BoolVar(&config.FuzzyImport, "fuzzy", true, "Enable fuzzy import for malformed files")
 	flag.BoolVar(&config.CacheEnabled, "cache", true, "Enable query caching for better performance")
+	flag.IntVar(&config.CacheSize, "cache-size", defaultCacheSize, "Query cache size (ignored when -cache=false)")
 	flag.BoolVar(&config.ParallelLoad, "parallel", false, "Load files in parallel")
-	flag.IntVar(&config.MaxWorkers, "workers", 4, "Number of parallel workers (with -parallel)")
+	flag.IntVar(&config.MaxWorkers, "workers", defaultWorkers, "Number of parallel workers (with -parallel)")
+	flag.DurationVar(&config.QueryTimeout, "query-timeout", defaultQueryTimeout, "Per-query timeout (0 disables timeout)")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "tinySQL File Query Tool (Optimized with Fuzzy Import)\n\n")
-		fmt.Fprintf(os.Stderr, "Query CSV, JSON, and other data files using SQL with intelligent fuzzy parsing.\n\n")
+		fmt.Fprintf(os.Stderr, "tinySQL query_files\n\n")
+		fmt.Fprintf(os.Stderr, "Query CSV/JSON files with SQL from CLI or interactive mode.\n\n")
 		fmt.Fprintf(os.Stderr, "Usage:\n")
-		fmt.Fprintf(os.Stderr, "  %s [options] file1 [file2 ...]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s [options] <file-or-dir> [more files/dirs]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Examples:\n")
-		fmt.Fprintf(os.Stderr, "  # Simple query with automatic fuzzy parsing\n")
-		fmt.Fprintf(os.Stderr, "  %s -query \"SELECT * FROM users WHERE age > 25\" users.csv\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  # Join multiple files with parallel loading\n")
-		fmt.Fprintf(os.Stderr, "  %s -parallel -query \"SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id\" users.csv orders.json\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  # Interactive mode for data exploration\n")
-		fmt.Fprintf(os.Stderr, "  %s -interactive data/\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  # Strict mode (disable fuzzy parsing)\n")
-		fmt.Fprintf(os.Stderr, "  %s -fuzzy=false -query \"SELECT * FROM data\" data.csv\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  # JSON output for piping\n")
-		fmt.Fprintf(os.Stderr, "  %s -output json -query \"SELECT name, email FROM users\" users.csv | jq '.'\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "Fuzzy Import Features (enabled by default):\n")
-		fmt.Fprintf(os.Stderr, "  • Auto-detects delimiters (comma, semicolon, tab, pipe)\n")
-		fmt.Fprintf(os.Stderr, "  • Handles inconsistent column counts (pads/truncates)\n")
-		fmt.Fprintf(os.Stderr, "  • Fixes unmatched quotes automatically\n")
-		fmt.Fprintf(os.Stderr, "  • Parses numbers with thousand separators\n")
-		fmt.Fprintf(os.Stderr, "  • Supports line-delimited JSON (NDJSON)\n")
-		fmt.Fprintf(os.Stderr, "  • Removes invalid UTF-8 characters\n")
-		fmt.Fprintf(os.Stderr, "  • Type coercion for mixed-type columns\n\n")
-		fmt.Fprintf(os.Stderr, "Options:\n")
+		fmt.Fprintf(os.Stderr, "  %s -query \"SELECT * FROM users LIMIT 10\" users.csv\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -parallel -workers 8 -query \"SELECT * FROM users u JOIN orders o ON u.id=o.user_id\" users.csv orders.json\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -interactive ./data\n\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 
 	flag.Parse()
 	config.Files = flag.Args()
-	return config
+
+	if err := normalizeConfig(&config); err != nil {
+		return Config{}, err
+	}
+	return config, nil
 }
 
-func executeQuery(config Config) error {
-	db := tinysql.NewDB()
-	ctx := context.Background()
-	tenant := "default"
+func normalizeConfig(config *Config) error {
+	config.Query = strings.TrimSpace(config.Query)
+	config.TableName = sanitizeTableName(strings.TrimSpace(config.TableName))
+	config.Output = strings.ToLower(strings.TrimSpace(config.Output))
+	config.Delimiter = strings.TrimSpace(config.Delimiter)
 
-	// Load files into database
-	if config.ParallelLoad && len(config.Files) > 1 {
-		err := loadFilesParallel(db, ctx, tenant, config)
-		if err != nil {
-			return err
-		}
-	} else {
-		for _, file := range config.Files {
-			tableName := config.TableName
-			if tableName == "" {
-				tableName = getTableNameFromFile(file)
-			}
-
-			if config.Verbose {
-				fmt.Fprintf(os.Stderr, "Loading %s into table '%s'...\n", file, tableName)
-			}
-
-			start := time.Now()
-			err := loadFile(db, ctx, tenant, file, tableName, config)
-			if err != nil {
-				return fmt.Errorf("failed to load %s: %v", file, err)
-			}
-
-			if config.Verbose {
-				fmt.Fprintf(os.Stderr, "✓ Loaded %s in %v\n", file, time.Since(start))
-			}
-		}
+	switch config.Output {
+	case "table", "json", "csv":
+	default:
+		return fmt.Errorf("invalid output format %q (valid: table, json, csv)", config.Output)
 	}
 
-	// Execute query
-	if config.Verbose {
-		fmt.Fprintf(os.Stderr, "Executing query: %s\n", config.Query)
+	if config.MaxWorkers <= 0 {
+		return fmt.Errorf("workers must be > 0")
+	}
+	if config.QueryTimeout < 0 {
+		return fmt.Errorf("query-timeout must be >= 0")
 	}
 
-	var stmt tinysql.Statement
-	var err error
+	delims, err := parseDelimiterSpec(config.Delimiter)
+	if err != nil {
+		return err
+	}
+	config.DelimiterCandidates = delims
 
 	if config.CacheEnabled {
-		stmt, err = getCachedQuery(config.Query)
-	} else {
-		stmt, err = tinysql.ParseSQL(config.Query)
-	}
-
-	if err != nil {
-		return fmt.Errorf("parse error: %v", err)
-	}
-
-	start := time.Now()
-	result, err := tinysql.Execute(ctx, db, tenant, stmt)
-	duration := time.Since(start)
-
-	if err != nil {
-		return fmt.Errorf("execute error: %v", err)
-	}
-
-	// Output results
-	if result != nil {
-		outputResults(result, config.Output)
-		if config.Verbose {
-			fmt.Fprintf(os.Stderr, "\n(%d rows in %v)\n", len(result.Rows), duration)
+		if config.CacheSize < 0 {
+			return fmt.Errorf("cache-size must be >= 0")
 		}
+		if config.CacheSize == 0 {
+			config.CacheSize = defaultCacheSize
+		}
+	} else {
+		config.CacheSize = 0
 	}
 
 	return nil
 }
 
-func loadFilesParallel(db *tinysql.DB, ctx context.Context, tenant string, config Config) error {
-	type loadJob struct {
-		file      string
-		tableName string
+func parseDelimiterSpec(raw string) ([]rune, error) {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	switch raw {
+	case "", "auto":
+		return nil, nil
+	case `\t`, `\\t`, "tab":
+		return []rune{'\t'}, nil
+	case "comma":
+		return []rune{','}, nil
+	case "semicolon", "semi":
+		return []rune{';'}, nil
+	case "pipe":
+		return []rune{'|'}, nil
 	}
 
-	jobs := make(chan loadJob, len(config.Files))
-	errors := make(chan error, len(config.Files))
-	var wg sync.WaitGroup
+	runes := []rune(raw)
+	if len(runes) != 1 {
+		return nil, fmt.Errorf("invalid delimiter %q (use auto, comma, semicolon, tab, pipe, or a single character)", raw)
+	}
+	return runes, nil
+}
 
-	// Start workers
-	for w := 0; w < config.MaxWorkers; w++ {
+func newRunner(config Config) *Runner {
+	r := &Runner{
+		db:     tinysql.NewDB(),
+		tenant: defaultTenant,
+		config: config,
+	}
+	if config.CacheEnabled {
+		r.queryCache = tinysql.NewQueryCache(config.CacheSize)
+	}
+	return r
+}
+
+func executeQuery(config Config) error {
+	runner := newRunner(config)
+	if err := runner.loadInputs(config.Files, config.TableName); err != nil {
+		return err
+	}
+
+	if config.Verbose {
+		fmt.Fprintf(os.Stderr, "Executing query: %s\n", config.Query)
+	}
+
+	result, duration, err := runner.executeSQL(config.Query)
+	if err != nil {
+		return err
+	}
+
+	if result != nil {
+		if err := outputResults(result, config.Output); err != nil {
+			return err
+		}
+		if config.Verbose {
+			fmt.Fprintf(os.Stderr, "\n(%d rows in %v)\n", len(result.Rows), duration)
+		}
+	}
+	return nil
+}
+
+func (r *Runner) executeSQL(sqlText string) (*tinysql.ResultSet, time.Duration, error) {
+	sqlText = strings.TrimSpace(sqlText)
+	if sqlText == "" {
+		return nil, 0, fmt.Errorf("sql must not be empty")
+	}
+
+	ctx := context.Background()
+	cancel := func() {}
+	if r.config.QueryTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, r.config.QueryTimeout)
+	}
+	defer cancel()
+
+	start := time.Now()
+
+	if r.queryCache != nil {
+		compiled, err := r.queryCache.Compile(sqlText)
+		if err != nil {
+			return nil, time.Since(start), fmt.Errorf("parse error: %w", err)
+		}
+		result, err := tinysql.ExecuteCompiled(ctx, r.db, r.tenant, compiled)
+		if err != nil {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return nil, time.Since(start), fmt.Errorf("query timeout after %s", r.config.QueryTimeout)
+			}
+			return nil, time.Since(start), fmt.Errorf("execute error: %w", err)
+		}
+		return result, time.Since(start), nil
+	}
+
+	stmt, err := tinysql.ParseSQL(sqlText)
+	if err != nil {
+		return nil, time.Since(start), fmt.Errorf("parse error: %w", err)
+	}
+	result, err := tinysql.Execute(ctx, r.db, r.tenant, stmt)
+	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, time.Since(start), fmt.Errorf("query timeout after %s", r.config.QueryTimeout)
+		}
+		return nil, time.Since(start), fmt.Errorf("execute error: %w", err)
+	}
+	return result, time.Since(start), nil
+}
+
+func (r *Runner) loadInputs(inputs []string, explicitTable string) error {
+	jobs, err := collectLoadJobs(inputs, explicitTable)
+	if err != nil {
+		return err
+	}
+	if len(jobs) == 0 {
+		return fmt.Errorf("no supported files found to load")
+	}
+
+	if r.config.ParallelLoad && len(jobs) > 1 {
+		return r.loadJobsParallel(jobs)
+	}
+
+	for _, job := range jobs {
+		if r.config.Verbose {
+			fmt.Fprintf(os.Stderr, "Loading %s into table '%s'...\n", job.file, job.tableName)
+		}
+		start := time.Now()
+		if err := r.loadFile(job.file, job.tableName); err != nil {
+			return fmt.Errorf("failed to load %s: %w", job.file, err)
+		}
+		if r.config.Verbose {
+			fmt.Fprintf(os.Stderr, "✓ Loaded %s in %v\n", job.file, time.Since(start))
+		}
+	}
+	return nil
+}
+
+func (r *Runner) loadJobsParallel(jobs []loadJob) error {
+	workers := r.config.MaxWorkers
+	if workers > len(jobs) {
+		workers = len(jobs)
+	}
+	if workers <= 0 {
+		workers = 1
+	}
+
+	jobCh := make(chan loadJob, len(jobs))
+	errCh := make(chan error, len(jobs))
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for job := range jobs {
-				err := loadFile(db, ctx, tenant, job.file, job.tableName, config)
+			for job := range jobCh {
+				start := time.Now()
+				err := r.loadFile(job.file, job.tableName)
 				if err != nil {
-					errors <- fmt.Errorf("failed to load %s: %v", job.file, err)
-				} else if config.Verbose {
-					fmt.Fprintf(os.Stderr, "✓ Loaded %s\n", job.file)
+					errCh <- fmt.Errorf("failed to load %s: %w", job.file, err)
+					continue
+				}
+				if r.config.Verbose {
+					fmt.Fprintf(os.Stderr, "✓ Loaded %s in %v\n", job.file, time.Since(start))
 				}
 			}
 		}()
 	}
 
-	// Queue jobs
-	for _, file := range config.Files {
-		tableName := config.TableName
-		if tableName == "" {
-			tableName = getTableNameFromFile(file)
-		}
-		jobs <- loadJob{file: file, tableName: tableName}
+	for _, job := range jobs {
+		jobCh <- job
 	}
-	close(jobs)
+	close(jobCh)
 
-	// Wait for completion
 	wg.Wait()
-	close(errors)
+	close(errCh)
 
-	// Check for errors
-	for err := range errors {
+	for err := range errCh {
 		if err != nil {
 			return err
 		}
 	}
-
 	return nil
 }
 
-func loadFile(db *tinysql.DB, ctx context.Context, tenant, filename, tableName string, config Config) error {
-	// Track table name for later reference
+func collectLoadJobs(inputs []string, explicitTable string) ([]loadJob, error) {
+	if len(inputs) == 0 {
+		return nil, nil
+	}
+
+	files := make([]string, 0, len(inputs))
+	for _, input := range inputs {
+		expanded, err := expandInputPath(input)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, expanded...)
+	}
+
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no supported files found")
+	}
+
+	if explicitTable != "" && len(files) > 1 {
+		return nil, fmt.Errorf("-table can only be used with a single input file")
+	}
+
+	sort.Strings(files)
+	jobs := make([]loadJob, 0, len(files))
+	for _, file := range files {
+		tableName := explicitTable
+		if tableName == "" {
+			tableName = getTableNameFromFile(file)
+		}
+		jobs = append(jobs, loadJob{file: file, tableName: tableName})
+	}
+	return jobs, nil
+}
+
+func expandInputPath(path string) ([]string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil, nil
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("stat %s: %w", path, err)
+	}
+
+	if !info.IsDir() {
+		if !isSupportedFile(path) {
+			return nil, fmt.Errorf("unsupported file format: %s", path)
+		}
+		return []string{path}, nil
+	}
+
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil, fmt.Errorf("read dir %s: %w", path, err)
+	}
+
+	files := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		candidate := filepath.Join(path, entry.Name())
+		if isSupportedFile(candidate) {
+			files = append(files, candidate)
+		}
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no supported files found in directory %s", path)
+	}
+	return files, nil
+}
+
+func isSupportedFile(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".csv", ".tsv", ".txt", ".json", ".jsonl", ".ndjson":
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *Runner) loadFile(filename, tableName string) error {
 	tableNamesMux.Lock()
 	tableNames[filename] = tableName
 	tableNamesMux.Unlock()
@@ -237,10 +432,10 @@ func loadFile(db *tinysql.DB, ctx context.Context, tenant, filename, tableName s
 	}
 	defer file.Close()
 
+	ctx := context.Background()
 	ext := strings.ToLower(filepath.Ext(filename))
 
-	if config.FuzzyImport {
-		// Use fuzzy importer
+	if r.config.FuzzyImport {
 		opts := &tinysql.FuzzyImportOptions{
 			ImportOptions: &tinysql.ImportOptions{
 				CreateTable:   true,
@@ -259,110 +454,88 @@ func loadFile(db *tinysql.DB, ctx context.Context, tenant, filename, tableName s
 			RemoveInvalidChars: true,
 			AutoFixDelimiters:  true,
 		}
-
-		if config.Delimiter != "" && config.Delimiter != "," {
-			opts.DelimiterCandidates = []rune{rune(config.Delimiter[0])}
+		if len(r.config.DelimiterCandidates) > 0 {
+			opts.DelimiterCandidates = append([]rune(nil), r.config.DelimiterCandidates...)
 		}
 
 		var result *tinysql.ImportResult
-
 		switch ext {
 		case ".csv", ".tsv", ".txt":
-			result, err = tinysql.FuzzyImportCSV(ctx, db, tenant, tableName, file, opts)
+			result, err = tinysql.FuzzyImportCSV(ctx, r.db, r.tenant, tableName, file, opts)
 		case ".json", ".jsonl", ".ndjson":
-			result, err = tinysql.FuzzyImportJSON(ctx, db, tenant, tableName, file, opts)
+			result, err = tinysql.FuzzyImportJSON(ctx, r.db, r.tenant, tableName, file, opts)
 		default:
-			return fmt.Errorf("unsupported file format: %s (supported: .csv, .tsv, .txt, .json, .jsonl)", ext)
+			return fmt.Errorf("unsupported file format %s (supported: .csv, .tsv, .txt, .json, .jsonl, .ndjson)", ext)
 		}
-
 		if err != nil {
 			return err
 		}
 
-		if config.Verbose && len(result.Errors) > 0 {
-			fmt.Fprintf(os.Stderr, "  Warnings for %s:\n", filename)
-			for i, errMsg := range result.Errors {
-				if i >= 5 {
-					fmt.Fprintf(os.Stderr, "  ... and %d more warnings\n", len(result.Errors)-5)
-					break
+		if r.config.Verbose {
+			if len(result.Errors) > 0 {
+				fmt.Fprintf(os.Stderr, "  Warnings for %s:\n", filename)
+				for i, msg := range result.Errors {
+					if i >= 5 {
+						fmt.Fprintf(os.Stderr, "  ... and %d more warnings\n", len(result.Errors)-5)
+						break
+					}
+					fmt.Fprintf(os.Stderr, "  - %s\n", msg)
 				}
-				fmt.Fprintf(os.Stderr, "  - %s\n", errMsg)
 			}
-		}
-
-		if config.Verbose {
 			fmt.Fprintf(os.Stderr, "  Imported %d rows, skipped %d rows\n", result.RowsInserted, result.RowsSkipped)
 		}
-	} else {
-		// Use standard importer
-		opts := &tinysql.ImportOptions{
-			CreateTable:   true,
-			Truncate:      false,
-			HeaderMode:    "auto",
-			TypeInference: true,
-			TableName:     tableName,
-		}
-
-		if config.Delimiter != "" {
-			opts.DelimiterCandidates = []rune{rune(config.Delimiter[0])}
-		}
-
-		var result *tinysql.ImportResult
-
-		switch ext {
-		case ".csv", ".tsv", ".txt":
-			result, err = tinysql.ImportCSV(ctx, db, tenant, tableName, file, opts)
-		case ".json", ".jsonl", ".ndjson":
-			result, err = tinysql.ImportJSON(ctx, db, tenant, tableName, file, opts)
-		default:
-			return fmt.Errorf("unsupported file format: %s", ext)
-		}
-
-		if err != nil {
-			return err
-		}
-
-		if config.Verbose {
-			fmt.Fprintf(os.Stderr, "  Imported %d rows\n", result.RowsInserted)
-		}
+		return nil
 	}
 
+	opts := &tinysql.ImportOptions{
+		CreateTable:   true,
+		Truncate:      false,
+		HeaderMode:    "auto",
+		TypeInference: true,
+		TableName:     tableName,
+	}
+	if len(r.config.DelimiterCandidates) > 0 {
+		opts.DelimiterCandidates = append([]rune(nil), r.config.DelimiterCandidates...)
+	}
+
+	var result *tinysql.ImportResult
+	switch ext {
+	case ".csv", ".tsv", ".txt":
+		result, err = tinysql.ImportCSV(ctx, r.db, r.tenant, tableName, file, opts)
+	case ".json", ".jsonl", ".ndjson":
+		result, err = tinysql.ImportJSON(ctx, r.db, r.tenant, tableName, file, opts)
+	default:
+		return fmt.Errorf("unsupported file format %s (supported: .csv, .tsv, .txt, .json, .jsonl, .ndjson)", ext)
+	}
+	if err != nil {
+		return err
+	}
+	if r.config.Verbose {
+		fmt.Fprintf(os.Stderr, "  Imported %d rows\n", result.RowsInserted)
+	}
 	return nil
 }
 
 func runInteractiveMode(config Config) {
-	db := tinysql.NewDB()
-	ctx := context.Background()
-	tenant := "default"
+	runner := newRunner(config)
 
 	fmt.Println("╔════════════════════════════════════════════════════════════════╗")
-	fmt.Println("║  tinySQL File Query Tool - Interactive Mode                   ║")
-	fmt.Println("║  Features: Fuzzy parsing, query caching, parallel loading     ║")
+	fmt.Println("║  tinySQL query_files - Interactive Mode                       ║")
 	fmt.Println("╚════════════════════════════════════════════════════════════════╝")
 	fmt.Println()
 	fmt.Println("Type 'help' for commands, 'exit' to quit")
 	fmt.Println()
 
-	// Load files from directory if provided
 	if len(config.Files) > 0 {
-		for _, path := range config.Files {
-			if isDirectory(path) {
-				loadDirectory(db, ctx, tenant, path, config)
-			} else {
-				tableName := getTableNameFromFile(path)
-				err := loadFile(db, ctx, tenant, path, tableName, config)
-				if err != nil {
-					fmt.Printf("⚠ Warning: Failed to load %s: %v\n", path, err)
-				} else {
-					fmt.Printf("✓ Loaded %s as table '%s'\n", path, tableName)
-				}
-			}
+		if err := runner.loadInputs(config.Files, config.TableName); err != nil {
+			fmt.Printf("⚠ Warning: %v\n", err)
 		}
 		fmt.Println()
 	}
 
-	// Interactive loop
 	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+
 	for {
 		fmt.Print("sql> ")
 		if !scanner.Scan() {
@@ -385,105 +558,77 @@ func runInteractiveMode(config Config) {
 			showTables()
 			continue
 		case "stats", ".stats":
-			showStats()
+			showStats(runner)
 			continue
 		case "clear cache", ".clear":
-			clearCache()
+			runner.clearCache()
 			fmt.Println("✓ Cache cleared")
 			continue
 		}
 
-		// Handle load command
 		if strings.HasPrefix(strings.ToLower(input), "load ") {
-			parts := strings.SplitN(input, " ", 2)
-			if len(parts) == 2 {
-				file := strings.TrimSpace(parts[1])
-				tableName := getTableNameFromFile(file)
-				err := loadFile(db, ctx, tenant, file, tableName, config)
-				if err != nil {
-					fmt.Printf("✗ Error: %v\n", err)
-				} else {
-					fmt.Printf("✓ Loaded %s as table '%s'\n", file, tableName)
-				}
+			path := strings.TrimSpace(strings.TrimPrefix(input, "load "))
+			if path == "" {
+				fmt.Println("✗ Usage: load <file-or-directory>")
+				continue
+			}
+			if err := runner.loadInputs([]string{path}, ""); err != nil {
+				fmt.Printf("✗ Error: %v\n", err)
+			} else {
+				fmt.Println("✓ Load complete")
 			}
 			continue
 		}
 
-		// Execute SQL query
-		var stmt tinysql.Statement
-		var err error
-
-		if config.CacheEnabled {
-			stmt, err = getCachedQuery(input)
-		} else {
-			stmt, err = tinysql.ParseSQL(input)
-		}
-
+		result, duration, err := runner.executeSQL(input)
 		if err != nil {
-			fmt.Printf("✗ Parse error: %v\n", err)
-			continue
-		}
-
-		start := time.Now()
-		result, err := tinysql.Execute(ctx, db, tenant, stmt)
-		duration := time.Since(start)
-
-		if err != nil {
-			fmt.Printf("✗ Execute error: %v\n", err)
+			fmt.Printf("✗ %v\n", err)
 			continue
 		}
 
 		if result != nil {
-			outputResults(result, "table")
+			if err := outputResults(result, config.Output); err != nil {
+				fmt.Printf("✗ Output error: %v\n", err)
+				continue
+			}
 			fmt.Printf("\n(%d rows in %v)\n\n", len(result.Rows), duration)
 		} else {
 			fmt.Printf("✓ OK (%v)\n\n", duration)
 		}
 	}
-}
 
-func getCachedQuery(queryStr string) (tinysql.Statement, error) {
-	queryCacheMux.RLock()
-	if stmt, exists := queryCache[queryStr]; exists {
-		queryCacheMux.RUnlock()
-		return stmt, nil
+	if err := scanner.Err(); err != nil {
+		fmt.Printf("✗ Input error: %v\n", err)
 	}
-	queryCacheMux.RUnlock()
+}
 
-	// Parse query
-	stmt, err := tinysql.ParseSQL(queryStr)
-	if err != nil {
-		return nil, err
+func (r *Runner) clearCache() {
+	if r.queryCache != nil {
+		r.queryCache.Clear()
 	}
-
-	// Cache it
-	queryCacheMux.Lock()
-	queryCache[queryStr] = stmt
-	queryCacheMux.Unlock()
-
-	return stmt, nil
 }
 
-func clearCache() {
-	queryCacheMux.Lock()
-	queryCache = make(map[string]tinysql.Statement)
-	queryCacheMux.Unlock()
-}
-
-func showStats() {
-	queryCacheMux.RLock()
-	qCount := len(queryCache)
-	queryCacheMux.RUnlock()
-
+func showStats(r *Runner) {
 	tableNamesMux.RLock()
 	tCount := len(tableNames)
 	tableNamesMux.RUnlock()
 
+	cacheSize := 0
+	cacheMax := 0
+	if r.queryCache != nil {
+		cacheSize = r.queryCache.Size()
+		stats := r.queryCache.Stats()
+		if v, ok := stats["maxSize"].(int); ok {
+			cacheMax = v
+		}
+	}
+
 	fmt.Println("╔════════════════════════════════════════════════════════════════╗")
-	fmt.Println("║  Cache Statistics                                              ║")
+	fmt.Println("║  Runtime Statistics                                            ║")
 	fmt.Println("╠════════════════════════════════════════════════════════════════╣")
-	fmt.Printf("║  Cached queries: %-45d ║\n", qCount)
 	fmt.Printf("║  Loaded tables:  %-45d ║\n", tCount)
+	fmt.Printf("║  Query cache size: %-42d ║\n", cacheSize)
+	fmt.Printf("║  Query cache max:  %-42d ║\n", cacheMax)
 	fmt.Println("╚════════════════════════════════════════════════════════════════╝")
 }
 
@@ -496,50 +641,31 @@ func showTables() {
 		return
 	}
 
+	keys := make([]string, 0, len(tableNames))
+	for filename := range tableNames {
+		keys = append(keys, filename)
+	}
+	sort.Strings(keys)
+
 	fmt.Println("╔════════════════════════════════════════════════════════════════╗")
 	fmt.Println("║  Loaded Tables                                                 ║")
 	fmt.Println("╠════════════════════════════════════════════════════════════════╣")
-	for filename, tableName := range tableNames {
+	for _, filename := range keys {
+		tableName := tableNames[filename]
 		fmt.Printf("║  %-30s → %-30s ║\n", filepath.Base(filename), tableName)
 	}
 	fmt.Println("╚════════════════════════════════════════════════════════════════╝")
 }
 
-func loadDirectory(db *tinysql.DB, ctx context.Context, tenant, dir string, config Config) {
-	files, err := os.ReadDir(dir)
-	if err != nil {
-		fmt.Printf("⚠ Warning: Failed to read directory %s: %v\n", dir, err)
-		return
-	}
-
-	for _, file := range files {
-		if file.IsDir() {
-			continue
-		}
-
-		filename := filepath.Join(dir, file.Name())
-		ext := strings.ToLower(filepath.Ext(file.Name()))
-
-		if ext == ".csv" || ext == ".json" || ext == ".tsv" || ext == ".txt" || ext == ".jsonl" || ext == ".ndjson" {
-			tableName := getTableNameFromFile(file.Name())
-			err := loadFile(db, ctx, tenant, filename, tableName, config)
-			if err != nil {
-				fmt.Printf("⚠ Warning: Failed to load %s: %v\n", filename, err)
-			} else {
-				fmt.Printf("✓ Loaded %s as table '%s'\n", filename, tableName)
-			}
-		}
-	}
-}
-
-func outputResults(result *tinysql.ResultSet, format string) {
+func outputResults(result *tinysql.ResultSet, format string) error {
 	switch format {
 	case "json":
-		outputJSON(result)
+		return outputJSON(result)
 	case "csv":
-		outputCSV(result)
+		return outputCSV(result)
 	default:
 		outputTable(result)
+		return nil
 	}
 }
 
@@ -549,15 +675,16 @@ func outputTable(result *tinysql.ResultSet) {
 		return
 	}
 
-	// Calculate column widths
+	lowerCols := make([]string, len(result.Cols))
 	widths := make([]int, len(result.Cols))
 	for i, col := range result.Cols {
+		lowerCols[i] = strings.ToLower(col)
 		widths[i] = len(col)
 	}
 
 	for _, row := range result.Rows {
-		for i, col := range result.Cols {
-			if value, ok := row[strings.ToLower(col)]; ok {
+		for i, lc := range lowerCols {
+			if value, ok := row[lc]; ok {
 				str := fmt.Sprintf("%v", value)
 				if len(str) > widths[i] {
 					widths[i] = len(str)
@@ -566,35 +693,31 @@ func outputTable(result *tinysql.ResultSet) {
 		}
 	}
 
-	// Limit column width to 50 characters for readability
 	for i := range widths {
 		if widths[i] > 50 {
 			widths[i] = 50
 		}
 	}
 
-	// Print header
 	for i, col := range result.Cols {
-		if len(col) > widths[i] {
+		if len(col) > widths[i] && widths[i] > 3 {
 			col = col[:widths[i]-3] + "..."
 		}
 		fmt.Printf("%-*s  ", widths[i], col)
 	}
 	fmt.Println()
 
-	// Print separator
 	for i := range result.Cols {
 		fmt.Print(strings.Repeat("─", widths[i]) + "  ")
 	}
 	fmt.Println()
 
-	// Print rows
 	for _, row := range result.Rows {
-		for i, col := range result.Cols {
+		for i, lc := range lowerCols {
 			value := ""
-			if v, ok := row[strings.ToLower(col)]; ok && v != nil {
+			if v, ok := row[lc]; ok && v != nil {
 				value = fmt.Sprintf("%v", v)
-				if len(value) > widths[i] {
+				if len(value) > widths[i] && widths[i] > 3 {
 					value = value[:widths[i]-3] + "..."
 				}
 			}
@@ -604,31 +727,27 @@ func outputTable(result *tinysql.ResultSet) {
 	}
 }
 
-func outputJSON(result *tinysql.ResultSet) {
-	var records []map[string]interface{}
+func outputJSON(result *tinysql.ResultSet) error {
+	records := make([]map[string]any, 0, len(result.Rows))
 	for _, row := range result.Rows {
-		record := make(map[string]interface{})
+		record := make(map[string]any, len(result.Cols))
 		for _, col := range result.Cols {
-			if value, ok := row[strings.ToLower(col)]; ok {
-				record[col] = value
-			}
+			record[col] = row[strings.ToLower(col)]
 		}
 		records = append(records, record)
 	}
 
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetIndent("", "  ")
-	encoder.Encode(records)
+	return encoder.Encode(records)
 }
 
-func outputCSV(result *tinysql.ResultSet) {
+func outputCSV(result *tinysql.ResultSet) error {
 	writer := csv.NewWriter(os.Stdout)
-	defer writer.Flush()
+	if err := writer.Write(result.Cols); err != nil {
+		return err
+	}
 
-	// Write header
-	writer.Write(result.Cols)
-
-	// Write rows
 	for _, row := range result.Rows {
 		record := make([]string, len(result.Cols))
 		for i, col := range result.Cols {
@@ -636,41 +755,25 @@ func outputCSV(result *tinysql.ResultSet) {
 				record[i] = fmt.Sprintf("%v", value)
 			}
 		}
-		writer.Write(record)
+		if err := writer.Write(record); err != nil {
+			return err
+		}
 	}
+	writer.Flush()
+	return writer.Error()
 }
 
 func printHelp() {
-	fmt.Println(`
+	fmt.Print(`
 ╔════════════════════════════════════════════════════════════════╗
 ║  Available Commands                                            ║
 ╠════════════════════════════════════════════════════════════════╣
 ║  help, h                   - Show this help                    ║
 ║  exit, quit, q             - Exit the program                  ║
 ║  tables, show tables       - Show loaded tables                ║
-║  stats                     - Show cache statistics             ║
+║  stats                     - Show cache/runtime statistics     ║
 ║  clear cache               - Clear query cache                 ║
-║  load <file>               - Load a file into a table          ║
-╠════════════════════════════════════════════════════════════════╣
-║  SQL Examples                                                  ║
-╠════════════════════════════════════════════════════════════════╣
-║  SELECT * FROM users WHERE age > 25                            ║
-║  SELECT name, email FROM users ORDER BY name                   ║
-║  SELECT u.name, COUNT(o.id) AS orders                          ║
-║    FROM users u LEFT JOIN orders o ON u.id = o.user_id         ║
-║    GROUP BY u.name                                             ║
-║  SELECT * FROM products                                        ║
-║    WHERE JSON_GET(meta, 'category') = 'electronics'            ║
-╠════════════════════════════════════════════════════════════════╣
-║  Fuzzy Import Features (Auto-enabled)                          ║
-╠════════════════════════════════════════════════════════════════╣
-║  ✓ Auto-detects delimiters (comma, semicolon, tab, pipe)      ║
-║  ✓ Handles malformed CSV with inconsistent columns            ║
-║  ✓ Fixes unmatched quotes automatically                        ║
-║  ✓ Parses numbers with thousand separators (1,234.56)         ║
-║  ✓ Supports line-delimited JSON (NDJSON)                       ║
-║  ✓ Removes invalid UTF-8 characters                            ║
-║  ✓ Type coercion for mixed-type columns                        ║
+║  load <file-or-dir>        - Load file(s) into tables          ║
 ╚════════════════════════════════════════════════════════════════╝
 `)
 }
@@ -678,9 +781,18 @@ func printHelp() {
 func getTableNameFromFile(filename string) string {
 	base := filepath.Base(filename)
 	ext := filepath.Ext(base)
-	name := strings.TrimSuffix(base, ext)
+	name := sanitizeTableName(strings.TrimSuffix(base, ext))
+	if name == "" {
+		return "table"
+	}
+	return name
+}
 
-	// Sanitize table name
+func sanitizeTableName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
 	name = strings.Map(func(r rune) rune {
 		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
 			(r >= '0' && r <= '9') || r == '_' {
@@ -688,11 +800,12 @@ func getTableNameFromFile(filename string) string {
 		}
 		return '_'
 	}, name)
-
-	return name
-}
-
-func isDirectory(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && info.IsDir()
+	name = strings.Trim(name, "_")
+	if name == "" {
+		return ""
+	}
+	if name[0] >= '0' && name[0] <= '9' {
+		name = "t_" + name
+	}
+	return strings.ToLower(name)
 }

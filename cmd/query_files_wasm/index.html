@@ -192,6 +192,11 @@
             justify-content: space-between;
         }
 
+        .sidebar-actions {
+            display: flex;
+            gap: 6px;
+        }
+
         .sidebar-header h2 {
             font-size: 13px;
             font-weight: 600;
@@ -839,7 +844,10 @@
         <div class="sidebar">
             <div class="sidebar-header">
                 <h2>Tables</h2>
-                <button onclick="loadTables()" title="Refresh">↻</button>
+                <div class="sidebar-actions">
+                    <button onclick="loadTables()" title="Refresh">↻</button>
+                    <button onclick="clearAllTables()" title="Clear all tables">🗑</button>
+                </div>
             </div>
             <div class="upload-area">
                 <label class="upload-btn" for="fileInput">

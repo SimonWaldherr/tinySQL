@@ -53,11 +53,15 @@ fi
 
 GO_VERSION="$(go version)"
 echo "   Go: $GO_VERSION"
+if [ -n "${GOFLAGS:-}" ]; then
+    echo "   GOFLAGS: ${GOFLAGS}"
+fi
 
 # ── compile ──────────────────────────────────────────────────────────────────
 T0=$(date +%s)
 echo "📦 Compiling Go → WASM (stripping debug info)…"
-GOOS=js GOARCH=wasm go build -trimpath -ldflags "-s -w" -o "$WASM_OUT"
+# shellcheck disable=SC2086
+GOOS=js GOARCH=wasm go build ${GOFLAGS:-} -trimpath -buildvcs=false -ldflags "-s -w" -o "$WASM_OUT" .
 RAW_SIZE=$(filesize "$WASM_OUT")
 echo "   Compiled in $(elapsed $T0)  –  raw size: $(human "$RAW_SIZE")"
 

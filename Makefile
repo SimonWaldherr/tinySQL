@@ -4,7 +4,9 @@ SHELL := /usr/bin/env bash
 .PHONY: help build test clean install lint fmt fmt-check vet run-repl run-server run-demo
 .PHONY: build-all build-repl build-server build-demo build-cli build-debug build-catalog
 .PHONY: build-wasm-browser build-wasm-node build-studio build-tinysqlpage build-migrate
+.PHONY: build-query-files build-query-files-wasm run-query-files-demo
 .PHONY: test-all test-unit test-integration coverage build-check verify verify-ci
+.PHONY: test-query-files test-query-files-wasm
 .PHONY: run-wasm-browser run-wasm-node-demo deps update-deps tidy bench script-lint docker-build info
 .DEFAULT_GOAL := help
 
@@ -20,6 +22,9 @@ GO_TEST_FLAGS ?= -v
 COVERPROFILE ?= coverage.out
 WASM_BROWSER_SCRIPT := ./$(CMD_DIR)/wasm_browser/build.sh
 WASM_NODE_SCRIPT := ./$(CMD_DIR)/wasm_node/build.sh
+QUERY_FILES_DIR := ./$(CMD_DIR)/query_files
+QUERY_FILES_WASM_DIR := ./$(CMD_DIR)/query_files_wasm
+QUERY_FILES_WASM_SCRIPT := $(QUERY_FILES_WASM_DIR)/build.sh
 
 # Color output
 GREEN := \033[0;32m
@@ -39,7 +44,7 @@ help:
 build: build-cli
 
 ## build-all: Build all binaries
-build-all: build-cli build-repl build-server build-demo build-debug build-catalog build-studio build-tinysqlpage build-migrate
+build-all: build-cli build-repl build-server build-demo build-debug build-catalog build-studio build-tinysqlpage build-migrate build-query-files
 	@echo "$(GREEN)✓ All binaries built successfully$(NC)"
 
 ## build-cli: Build tinySQL CLI
@@ -106,6 +111,17 @@ build-wasm-node:
 	@echo "$(GREEN)Building WASM for Node.js...$(NC)"
 	@$(WASM_NODE_SCRIPT) --build-only
 
+## build-query-files: Build standalone query_files CLI
+build-query-files:
+	@echo "$(GREEN)Building query_files CLI...$(NC)"
+	@mkdir -p $(BINARY_DIR)
+	cd $(QUERY_FILES_DIR) && $(GO) build -trimpath -o ../../$(BINARY_DIR)/query_files .
+
+## build-query-files-wasm: Build query_files_wasm artifacts
+build-query-files-wasm:
+	@echo "$(GREEN)Building query_files_wasm...$(NC)"
+	@$(QUERY_FILES_WASM_SCRIPT) --build-only
+
 ## run-wasm-browser: Build and serve browser WASM app on localhost
 run-wasm-browser:
 	@$(WASM_BROWSER_SCRIPT) --serve
@@ -113,6 +129,10 @@ run-wasm-browser:
 ## run-wasm-node-demo: Build and execute Node WASM demo query
 run-wasm-node-demo:
 	@$(WASM_NODE_SCRIPT) --run
+
+## run-query-files-demo: Run query_files demo script
+run-query-files-demo:
+	@$(QUERY_FILES_DIR)/demo.sh
 
 ## install: Install tinySQL CLI to $GOPATH/bin
 install:
@@ -126,6 +146,8 @@ test: test-all
 test-all:
 	@echo "$(GREEN)Running all tests...$(NC)"
 	$(GO) test $(GO_TEST_FLAGS) -race -coverprofile=$(COVERPROFILE) ./...
+	$(MAKE) test-query-files
+	$(MAKE) test-query-files-wasm
 
 ## test-unit: Run unit tests only
 test-unit:
@@ -136,6 +158,16 @@ test-unit:
 test-integration:
 	@echo "$(GREEN)Running integration tests...$(NC)"
 	$(GO) test $(GO_TEST_FLAGS) -run Integration ./...
+
+## test-query-files: Run tests for cmd/query_files module
+test-query-files:
+	@echo "$(GREEN)Running query_files tests...$(NC)"
+	cd $(QUERY_FILES_DIR) && $(GO) test $(GO_TEST_FLAGS) ./...
+
+## test-query-files-wasm: Run tests for cmd/query_files_wasm module
+test-query-files-wasm:
+	@echo "$(GREEN)Running query_files_wasm tests...$(NC)"
+	cd $(QUERY_FILES_WASM_DIR) && $(GO) test $(GO_TEST_FLAGS) ./...
 
 ## coverage: Generate and view test coverage report
 coverage: test-all
@@ -198,6 +230,8 @@ vet:
 build-check:
 	@echo "$(GREEN)Building all Go packages...$(NC)"
 	$(GO) build $(GOFLAGS) ./...
+	$(MAKE) build-query-files
+	$(MAKE) build-query-files-wasm
 
 ## tidy: Tidy dependencies
 tidy:

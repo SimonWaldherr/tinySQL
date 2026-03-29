@@ -8,17 +8,31 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
+	"io"
+	"sort"
 	"strings"
 	"syscall/js"
 	"time"
+	"unicode"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
 )
 
+const (
+	defaultTenant        = "default"
+	defaultQueryTimeout  = 30 * time.Second
+	defaultImportTimeout = 60 * time.Second
+	maxSQLBytes          = 256 * 1024
+	queryCacheSize       = 256
+)
+
 var (
-	db     *tinysql.DB
-	tenant = "default"
+	db         *tinysql.DB
+	tenant     = defaultTenant
+	queryCache *tinysql.QueryCache
+
 	// lastResult caches the most recent query result for client-side export.
 	lastResult     *tinysql.ResultSet
 	lastQueryDurMs float64
@@ -27,14 +41,14 @@ var (
 func main() {
 	c := make(chan struct{})
 
-	// Initialize database
 	db = tinysql.NewDB()
+	queryCache = tinysql.NewQueryCache(queryCacheSize)
 
-	// Register JavaScript functions
 	js.Global().Set("importFile", js.FuncOf(importFile))
 	js.Global().Set("executeQuery", js.FuncOf(executeQuery))
 	js.Global().Set("executeMulti", js.FuncOf(executeMulti))
 	js.Global().Set("clearDatabase", js.FuncOf(clearDatabase))
+	js.Global().Set("dropTable", js.FuncOf(dropTable))
 	js.Global().Set("listTables", js.FuncOf(listTables))
 	js.Global().Set("exportResults", js.FuncOf(exportResults))
 	js.Global().Set("getTableSchema", js.FuncOf(getTableSchema))
@@ -43,30 +57,109 @@ func main() {
 	<-c
 }
 
-// importFile imports a file (CSV, JSON) into the database
-func importFile(this js.Value, args []js.Value) interface{} {
-	if len(args) < 3 {
-		return map[string]interface{}{
-			"success": false,
-			"error":   "Usage: importFile(fileName, fileContent, tableName)",
-		}
+func jsErr(msg string) map[string]interface{} {
+	return map[string]interface{}{"success": false, "error": msg}
+}
+
+func normalizeSQLInput(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("SQL must not be empty")
+	}
+	if len(raw) > maxSQLBytes {
+		return "", fmt.Errorf("SQL exceeds max size (%d bytes)", maxSQLBytes)
+	}
+	return raw, nil
+}
+
+func executeSQLText(sqlText string) (*tinysql.ResultSet, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultQueryTimeout)
+	defer cancel()
+
+	compiled, err := queryCache.Compile(sqlText)
+	if err != nil {
+		return nil, fmt.Errorf("Parse error: %w", err)
 	}
 
-	fileName := args[0].String()
-	fileContent := args[1].String()
-	tableName := args[2].String()
+	result, err := tinysql.ExecuteCompiled(ctx, db, tenant, compiled)
+	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("Query timeout after %s", defaultQueryTimeout)
+		}
+		return nil, fmt.Errorf("Execute error: %w", err)
+	}
+	return result, nil
+}
 
-	// Determine file type
+func resultRowsToJS(result *tinysql.ResultSet) []interface{} {
+	safeRows := make([]interface{}, 0, len(result.Rows))
+	for _, row := range result.Rows {
+		outRow := make(map[string]interface{}, len(result.Cols))
+		for _, col := range result.Cols {
+			val, ok := row[strings.ToLower(col)]
+			if !ok || val == nil {
+				outRow[col] = ""
+				continue
+			}
+			switch v := val.(type) {
+			case string, int, int32, int64, float32, float64, bool:
+				outRow[col] = v
+			default:
+				outRow[col] = fmt.Sprintf("%v", v)
+			}
+		}
+		safeRows = append(safeRows, outRow)
+	}
+	return safeRows
+}
+
+func successResultPayload(result *tinysql.ResultSet, statementsRun int) map[string]interface{} {
+	if result == nil {
+		payload := map[string]interface{}{
+			"success":    true,
+			"columns":    []interface{}{},
+			"rows":       []interface{}{},
+			"durationMs": lastQueryDurMs,
+		}
+		if statementsRun > 0 {
+			payload["statementsRun"] = statementsRun
+		}
+		return payload
+	}
+
+	payload := map[string]interface{}{
+		"success":    true,
+		"columns":    stringsToInterfaces(result.Cols),
+		"rows":       resultRowsToJS(result),
+		"durationMs": lastQueryDurMs,
+	}
+	if statementsRun > 0 {
+		payload["statementsRun"] = statementsRun
+	}
+	return payload
+}
+
+// importFile imports a file (CSV, JSON, XML) into the database.
+func importFile(this js.Value, args []js.Value) interface{} {
+	if len(args) < 3 {
+		return jsErr("Usage: importFile(fileName, fileContent, tableName)")
+	}
+
+	fileName := strings.TrimSpace(args[0].String())
+	fileContent := args[1].String()
+	tableName := strings.TrimSpace(args[2].String())
+	if tableName == "" {
+		tableName = "table"
+	}
+
 	ext := ""
 	if idx := strings.LastIndex(fileName, "."); idx != -1 {
 		ext = strings.ToLower(fileName[idx:])
 	}
 
-	// Create reader from string
-	reader := strings.NewReader(fileContent)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), defaultImportTimeout)
+	defer cancel()
 
-	// Import options with fuzzy parsing
 	opts := &tinysql.FuzzyImportOptions{
 		ImportOptions: &tinysql.ImportOptions{
 			CreateTable:   true,
@@ -86,6 +179,7 @@ func importFile(this js.Value, args []js.Value) interface{} {
 		AutoFixDelimiters:  true,
 	}
 
+	reader := strings.NewReader(fileContent)
 	var impResult *tinysql.ImportResult
 	var err error
 
@@ -95,44 +189,30 @@ func importFile(this js.Value, args []js.Value) interface{} {
 	case ".json", ".jsonl", ".ndjson":
 		impResult, err = tinysql.FuzzyImportJSON(ctx, db, tenant, tableName, reader, opts)
 	case ".xml":
-		// XML import: convert simple row-based XML to JSON objects client-side
-		// then feed through the JSON importer.
 		xmlRows, xmlErr := parseSimpleXML(fileContent)
 		if xmlErr != nil {
-			return map[string]interface{}{
-				"success": false,
-				"error":   "XML parse error: " + xmlErr.Error(),
-			}
+			return jsErr("XML parse error: " + xmlErr.Error())
 		}
 		jsonBytes, _ := json.Marshal(xmlRows)
-		reader = strings.NewReader(string(jsonBytes))
-		impResult, err = tinysql.FuzzyImportJSON(ctx, db, tenant, tableName, reader, opts)
+		impResult, err = tinysql.FuzzyImportJSON(ctx, db, tenant, tableName, strings.NewReader(string(jsonBytes)), opts)
 	default:
-		return map[string]interface{}{
-			"success": false,
-			"error":   "Unsupported file format: " + ext + ". Supported: .csv, .tsv, .txt, .json, .jsonl, .ndjson, .xml",
-		}
+		return jsErr("Unsupported file format: " + ext + ". Supported: .csv, .tsv, .txt, .json, .jsonl, .ndjson, .xml")
 	}
 
 	if err != nil {
-		return map[string]interface{}{
-			"success": false,
-			"error":   "Import failed: " + err.Error(),
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return jsErr("Import timeout after " + defaultImportTimeout.String())
 		}
+		return jsErr("Import failed: " + err.Error())
 	}
-
 	if impResult == nil {
-		return map[string]interface{}{
-			"success": false,
-			"error":   "Import failed: no result returned",
-		}
+		return jsErr("Import failed: no result returned")
 	}
 
 	warnings := []string{}
 	if len(impResult.Errors) > 0 {
-		maxWarnings := 10
 		for i, errMsg := range impResult.Errors {
-			if i >= maxWarnings {
+			if i >= 10 {
 				warnings = append(warnings, "... and more")
 				break
 			}
@@ -140,7 +220,6 @@ func importFile(this js.Value, args []js.Value) interface{} {
 		}
 	}
 
-	// Columns and delimiter safe handling
 	columns := []string{}
 	if impResult.ColumnNames != nil {
 		columns = impResult.ColumnNames
@@ -150,7 +229,9 @@ func importFile(this js.Value, args []js.Value) interface{} {
 		delimiter = string(impResult.Delimiter)
 	}
 
-	// Build JS-friendly response
+	// DDL/DML changed; clear cached last result only.
+	lastResult = nil
+
 	return map[string]interface{}{
 		"success":      true,
 		"tableName":    tableName,
@@ -163,114 +244,55 @@ func importFile(this js.Value, args []js.Value) interface{} {
 	}
 }
 
-// executeQuery executes a SQL query and returns results
+// executeQuery executes a single SQL query and returns results.
 func executeQuery(this js.Value, args []js.Value) interface{} {
 	if len(args) < 1 {
-		return map[string]interface{}{
-			"success": false,
-			"error":   "Usage: executeQuery(sqlQuery)",
-		}
+		return jsErr("Usage: executeQuery(sqlQuery)")
 	}
 
-	queryStr := args[0].String()
-	ctx := context.Background()
+	queryStr, err := normalizeSQLInput(args[0].String())
+	if err != nil {
+		return jsErr(err.Error())
+	}
 
 	start := time.Now()
-
-	// Parse query
-	stmt, err := tinysql.ParseSQL(queryStr)
+	result, err := executeSQLText(queryStr)
 	if err != nil {
-		return map[string]interface{}{
-			"success": false,
-			"error":   "Parse error: " + err.Error(),
-		}
+		return jsErr(err.Error())
 	}
-
-	// Execute query
-	result, err := tinysql.Execute(ctx, db, tenant, stmt)
-	if err != nil {
-		return map[string]interface{}{
-			"success": false,
-			"error":   "Execute error: " + err.Error(),
-		}
-	}
-
 	lastQueryDurMs = float64(time.Since(start).Microseconds()) / 1000.0
-
-	// Convert result to JSON/JS-friendly format
-	if result == nil {
-		lastResult = nil
-		return map[string]interface{}{
-			"success":    true,
-			"columns":    []interface{}{},
-			"rows":       []interface{}{},
-			"durationMs": lastQueryDurMs,
-		}
-	}
-
 	lastResult = result
 
-	// Always return []interface{} for rows, and sanitize all cell values
-	safeRows := make([]interface{}, 0, len(result.Rows))
-	for _, row := range result.Rows {
-		r := make(map[string]interface{})
-		for _, col := range result.Cols {
-			val, ok := row[strings.ToLower(col)]
-			if !ok || val == nil {
-				r[col] = ""
-				continue
-			}
-			switch v := val.(type) {
-			case string:
-				r[col] = v
-			case int, int32, int64, float32, float64:
-				r[col] = v
-			case bool:
-				r[col] = v
-			default:
-				r[col] = fmt.Sprintf("%v", v)
-			}
-		}
-		safeRows = append(safeRows, r)
-	}
-	return map[string]interface{}{
-		"success":    true,
-		"columns":    stringsToInterfaces(result.Cols),
-		"rows":       safeRows,
-		"durationMs": lastQueryDurMs,
-	}
+	return successResultPayload(result, 0)
 }
 
 // executeMulti runs multiple semicolon-separated SQL statements and returns
 // the result of the last SELECT (or an aggregate summary).
 func executeMulti(this js.Value, args []js.Value) interface{} {
 	if len(args) < 1 {
-		return map[string]interface{}{"success": false, "error": "Usage: executeMulti(sql)"}
+		return jsErr("Usage: executeMulti(sql)")
 	}
+
 	raw := args[0].String()
+	if len(raw) > maxSQLBytes {
+		return jsErr(fmt.Sprintf("SQL exceeds max size (%d bytes)", maxSQLBytes))
+	}
+
 	stmts := splitStatements(raw)
 	if len(stmts) == 0 {
-		return map[string]interface{}{"success": false, "error": "No SQL statements found"}
+		return jsErr("No SQL statements found")
 	}
 
-	ctx := context.Background()
 	start := time.Now()
-
 	var lastRS *tinysql.ResultSet
-	for i, s := range stmts {
-		stmt, err := tinysql.ParseSQL(s)
+	for i, stmtRaw := range stmts {
+		stmtSQL, err := normalizeSQLInput(stmtRaw)
 		if err != nil {
-			return map[string]interface{}{
-				"success": false,
-				"error":   fmt.Sprintf("Parse error in statement %d: %v", i+1, err),
-			}
+			return jsErr(fmt.Sprintf("Statement %d: %v", i+1, err))
 		}
-		rs, err := tinysql.Execute(ctx, db, tenant, stmt)
+		rs, err := executeSQLText(stmtSQL)
 		if err != nil {
-			return map[string]interface{}{
-				"success": false,
-				"error":   fmt.Sprintf("Execute error in statement %d: %v", i+1, err),
-			}
+			return jsErr(fmt.Sprintf("Statement %d: %v", i+1, err))
 		}
 		if rs != nil {
 			lastRS = rs
@@ -279,52 +301,13 @@ func executeMulti(this js.Value, args []js.Value) interface{} {
 
 	lastQueryDurMs = float64(time.Since(start).Microseconds()) / 1000.0
 	lastResult = lastRS
-
-	if lastRS == nil {
-		return map[string]interface{}{
-			"success":       true,
-			"columns":       []interface{}{},
-			"rows":          []interface{}{},
-			"durationMs":    lastQueryDurMs,
-			"statementsRun": len(stmts),
-		}
-	}
-
-	safeRows := make([]interface{}, 0, len(lastRS.Rows))
-	for _, row := range lastRS.Rows {
-		r := make(map[string]interface{})
-		for _, col := range lastRS.Cols {
-			val, ok := row[strings.ToLower(col)]
-			if !ok || val == nil {
-				r[col] = ""
-				continue
-			}
-			switch v := val.(type) {
-			case string:
-				r[col] = v
-			case int, int32, int64, float32, float64:
-				r[col] = v
-			case bool:
-				r[col] = v
-			default:
-				r[col] = fmt.Sprintf("%v", v)
-			}
-		}
-		safeRows = append(safeRows, r)
-	}
-
-	return map[string]interface{}{
-		"success":       true,
-		"columns":       stringsToInterfaces(lastRS.Cols),
-		"rows":          safeRows,
-		"durationMs":    lastQueryDurMs,
-		"statementsRun": len(stmts),
-	}
+	return successResultPayload(lastRS, len(stmts))
 }
 
-// clearDatabase clears all tables from the database
+// clearDatabase clears all tables from the database.
 func clearDatabase(this js.Value, args []js.Value) interface{} {
 	db = tinysql.NewDB()
+	queryCache = tinysql.NewQueryCache(queryCacheSize)
 	lastResult = nil
 	return map[string]interface{}{
 		"success": true,
@@ -332,13 +315,39 @@ func clearDatabase(this js.Value, args []js.Value) interface{} {
 	}
 }
 
+// dropTable removes a user table from the database.
+func dropTable(this js.Value, args []js.Value) interface{} {
+	if len(args) < 1 {
+		return jsErr("Usage: dropTable(tableName)")
+	}
+	name := strings.TrimSpace(args[0].String())
+	if name == "" {
+		return jsErr("table name must not be empty")
+	}
+	lower := strings.ToLower(name)
+	if strings.HasPrefix(lower, "sys.") || strings.HasPrefix(lower, "catalog.") {
+		return jsErr("virtual tables cannot be dropped")
+	}
+	if err := db.Drop(tenant, name); err != nil {
+		return jsErr("drop failed: " + err.Error())
+	}
+	lastResult = nil
+	return map[string]interface{}{
+		"success": true,
+		"message": "Table dropped",
+		"table":   name,
+	}
+}
+
 // listTables returns the names and row counts of all loaded tables,
 // plus virtual sys.* and catalog.* tables.
 func listTables(this js.Value, args []js.Value) interface{} {
 	tables := db.ListTables(tenant)
-	out := make([]interface{}, 0, len(tables)+20)
+	sort.Slice(tables, func(i, j int) bool {
+		return strings.ToLower(tables[i].Name) < strings.ToLower(tables[j].Name)
+	})
 
-	// ── Real (user) tables ────────────────────────────────────────────────
+	out := make([]interface{}, 0, len(tables)+20)
 	for _, tbl := range tables {
 		cols := make([]interface{}, len(tbl.Cols))
 		for i, c := range tbl.Cols {
@@ -355,22 +364,16 @@ func listTables(this js.Value, args []js.Value) interface{} {
 		})
 	}
 
-	// ── Virtual sys.* tables ──────────────────────────────────────────────
-	sysNames := []string{
-		"tables", "columns", "constraints", "indexes",
-		"views", "functions", "variables", "status",
-		"memory", "storage", "config", "connections",
-	}
+	sysNames := []string{"tables", "columns", "constraints", "indexes", "views", "functions", "variables", "status", "memory", "storage", "config", "connections"}
 	for _, n := range sysNames {
 		out = append(out, map[string]interface{}{
 			"name":    "sys." + n,
-			"rows":    -1, // dynamic
+			"rows":    -1,
 			"columns": []interface{}{},
 			"kind":    "virtual",
 		})
 	}
 
-	// ── Virtual catalog.* tables ──────────────────────────────────────────
 	catNames := []string{"tables", "columns", "functions", "jobs", "views"}
 	for _, n := range catNames {
 		out = append(out, map[string]interface{}{
@@ -381,33 +384,28 @@ func listTables(this js.Value, args []js.Value) interface{} {
 		})
 	}
 
-	return map[string]interface{}{
-		"success": true,
-		"tables":  out,
-	}
+	return map[string]interface{}{"success": true, "tables": out}
 }
 
 // getTableSchema returns column names, types and row count for a table.
-// For virtual tables (sys.*, catalog.*) it runs SELECT * LIMIT 1 to discover columns.
 func getTableSchema(this js.Value, args []js.Value) interface{} {
 	if len(args) < 1 {
-		return map[string]interface{}{"success": false, "error": "Usage: getTableSchema(tableName)"}
+		return jsErr("Usage: getTableSchema(tableName)")
 	}
-	name := args[0].String()
+	name := strings.TrimSpace(args[0].String())
+	if name == "" {
+		return jsErr("table name must not be empty")
+	}
 
-	// Virtual tables – discover columns by running a LIMIT 1 query.
 	lower := strings.ToLower(name)
 	if strings.HasPrefix(lower, "sys.") || strings.HasPrefix(lower, "catalog.") {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
 		q := fmt.Sprintf("SELECT * FROM %s LIMIT 1", name)
-		stmt, err := tinysql.ParseSQL(q)
+		rs, err := executeSQLText(q)
 		if err != nil {
-			return map[string]interface{}{"success": false, "error": err.Error()}
+			return jsErr(err.Error())
 		}
-		rs, err := tinysql.Execute(ctx, db, tenant, stmt)
-		if err != nil {
-			return map[string]interface{}{"success": false, "error": err.Error()}
+		if rs == nil {
+			rs = &tinysql.ResultSet{}
 		}
 		cols := make([]interface{}, len(rs.Cols))
 		for i, c := range rs.Cols {
@@ -424,14 +422,11 @@ func getTableSchema(this js.Value, args []js.Value) interface{} {
 
 	tbl, err := db.Get(tenant, name)
 	if err != nil {
-		return map[string]interface{}{"success": false, "error": "Table not found: " + name}
+		return jsErr("Table not found: " + name)
 	}
 	cols := make([]interface{}, len(tbl.Cols))
 	for i, c := range tbl.Cols {
-		cols[i] = map[string]interface{}{
-			"name": c.Name,
-			"type": c.Type.String(),
-		}
+		cols[i] = map[string]interface{}{"name": c.Name, "type": c.Type.String()}
 	}
 	return map[string]interface{}{
 		"success": true,
@@ -442,14 +437,14 @@ func getTableSchema(this js.Value, args []js.Value) interface{} {
 }
 
 // exportResults exports the last query result in the requested format.
-// format: "csv", "json", "xml"
+// format: csv, json, xml
 func exportResults(this js.Value, args []js.Value) interface{} {
 	if len(args) < 1 {
-		return map[string]interface{}{"success": false, "error": "Usage: exportResults(format)"}
+		return jsErr("Usage: exportResults(format)")
 	}
-	format := strings.ToLower(args[0].String())
+	format := strings.ToLower(strings.TrimSpace(args[0].String()))
 	if lastResult == nil || len(lastResult.Rows) == 0 {
-		return map[string]interface{}{"success": false, "error": "No results to export"}
+		return jsErr("No results to export")
 	}
 
 	var buf bytes.Buffer
@@ -463,7 +458,10 @@ func exportResults(this js.Value, args []js.Value) interface{} {
 		for _, row := range lastResult.Rows {
 			rec := make([]string, len(lastResult.Cols))
 			for i, c := range lastResult.Cols {
-				rec[i] = fmt.Sprintf("%v", row[strings.ToLower(c)])
+				v := row[strings.ToLower(c)]
+				if v != nil {
+					rec[i] = fmt.Sprintf("%v", v)
+				}
 			}
 			_ = w.Write(rec)
 		}
@@ -487,20 +485,21 @@ func exportResults(this js.Value, args []js.Value) interface{} {
 		for _, row := range lastResult.Rows {
 			buf.WriteString("  <row>\n")
 			for _, c := range lastResult.Cols {
-				v := fmt.Sprintf("%v", row[strings.ToLower(c)])
-				buf.WriteString("    <")
-				xml.Escape(&buf, []byte(c))
-				buf.WriteString(">")
-				xml.Escape(&buf, []byte(v))
-				buf.WriteString("</")
-				xml.Escape(&buf, []byte(c))
-				buf.WriteString(">\n")
+				tag := xmlTagName(c)
+				v := row[strings.ToLower(c)]
+				text := ""
+				if v != nil {
+					text = fmt.Sprintf("%v", v)
+				}
+				buf.WriteString("    <" + tag + ">")
+				xml.EscapeText(&buf, []byte(text))
+				buf.WriteString("</" + tag + ">\n")
 			}
 			buf.WriteString("  </row>\n")
 		}
 		buf.WriteString("</rows>\n")
 	default:
-		return map[string]interface{}{"success": false, "error": "Unknown format: " + format + ". Use csv, json or xml."}
+		return jsErr("Unknown format: " + format + ". Use csv, json or xml.")
 	}
 
 	return map[string]interface{}{
@@ -511,9 +510,7 @@ func exportResults(this js.Value, args []js.Value) interface{} {
 	}
 }
 
-// ─── helpers ────────────────────────────────────────────────────────────────
-
-// stringsToInterfaces converts a []string to []interface{} for JS interop
+// stringsToInterfaces converts a []string to []interface{} for JS interop.
 func stringsToInterfaces(ss []string) []interface{} {
 	out := make([]interface{}, len(ss))
 	for i, s := range ss {
@@ -528,21 +525,32 @@ func splitStatements(raw string) []string {
 	var stmts []string
 	var cur strings.Builder
 	inQuote := false
+
 	for i := 0; i < len(raw); i++ {
 		ch := raw[i]
 		if ch == '\'' {
+			if inQuote && i+1 < len(raw) && raw[i+1] == '\'' {
+				// SQL escaped quote inside literal.
+				cur.WriteByte(ch)
+				cur.WriteByte(raw[i+1])
+				i++
+				continue
+			}
 			inQuote = !inQuote
 			cur.WriteByte(ch)
-		} else if ch == ';' && !inQuote {
+			continue
+		}
+		if ch == ';' && !inQuote {
 			s := strings.TrimSpace(cur.String())
 			if s != "" {
 				stmts = append(stmts, s)
 			}
 			cur.Reset()
-		} else {
-			cur.WriteByte(ch)
+			continue
 		}
+		cur.WriteByte(ch)
 	}
+
 	if s := strings.TrimSpace(cur.String()); s != "" {
 		stmts = append(stmts, s)
 	}
@@ -550,8 +558,7 @@ func splitStatements(raw string) []string {
 }
 
 // parseSimpleXML converts row-based XML into []map[string]string so it can be
-// fed through the JSON importer. Supports both element-content and attribute
-// styles.
+// fed through the JSON importer.
 func parseSimpleXML(data string) ([]map[string]string, error) {
 	decoder := xml.NewDecoder(strings.NewReader(data))
 	var rows []map[string]string
@@ -562,15 +569,17 @@ func parseSimpleXML(data string) ([]map[string]string, error) {
 	for {
 		tok, err := decoder.Token()
 		if err != nil {
-			break
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, err
 		}
+
 		switch t := tok.(type) {
 		case xml.StartElement:
 			depth++
 			if depth == 2 {
-				// row-level element
 				currentRow = make(map[string]string)
-				// attributes become columns
 				for _, a := range t.Attr {
 					currentRow[a.Name.Local] = a.Value
 				}
@@ -579,7 +588,10 @@ func parseSimpleXML(data string) ([]map[string]string, error) {
 			}
 		case xml.CharData:
 			if depth == 3 && currentKey != "" && currentRow != nil {
-				currentRow[currentKey] = strings.TrimSpace(string(t))
+				value := strings.TrimSpace(string(t))
+				if value != "" {
+					currentRow[currentKey] = value
+				}
 			}
 		case xml.EndElement:
 			if depth == 3 {
@@ -599,4 +611,27 @@ func parseSimpleXML(data string) ([]map[string]string, error) {
 		return nil, fmt.Errorf("no row elements found in XML")
 	}
 	return rows, nil
+}
+
+func xmlTagName(col string) string {
+	col = strings.TrimSpace(col)
+	if col == "" {
+		return "col"
+	}
+	var b strings.Builder
+	for i, r := range col {
+		valid := unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '-' || r == '.'
+		if i == 0 && !(unicode.IsLetter(r) || r == '_') {
+			b.WriteString("c_")
+		}
+		if valid {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "col"
+	}
+	return b.String()
 }

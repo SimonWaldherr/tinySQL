@@ -12,7 +12,8 @@ fi
 BIN_PATH="$(mktemp "${TMPDIR:-/tmp}/tinysql-query-files-demo.XXXXXX")"
 trap 'rm -f "$BIN_PATH"' EXIT
 
-go build -trimpath -o "$BIN_PATH" .
+# shellcheck disable=SC2086
+go build ${GOFLAGS:-} -trimpath -buildvcs=false -o "$BIN_PATH" .
 
 run_case() {
     local title="$1"
