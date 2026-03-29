@@ -1,6 +1,6 @@
 module migrate
 
-go 1.25.0
+go 1.25.8
 
 require (
 	github.com/SimonWaldherr/tinySQL v0.4.0
