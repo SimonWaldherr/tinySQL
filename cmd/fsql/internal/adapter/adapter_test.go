@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	tinysql "github.com/SimonWaldherr/tinySQL"
 	"fsql/internal/adapter"
+	tinysql "github.com/SimonWaldherr/tinySQL"
 )
 
 // noopResolver returns the path unchanged (for unit tests that provide absolute paths).

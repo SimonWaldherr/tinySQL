@@ -151,10 +151,10 @@ func (f *linesFunc) Execute(ctx context.Context, args []any) (*tinysql.ResultSet
 		lineNum++
 		text := scanner.Text()
 		r := tinysql.Row{
-			"line_number":        lineNum,
-			"line":               text,
-			"lines.line_number":  lineNum,
-			"lines.line":         text,
+			"line_number":       lineNum,
+			"line":              text,
+			"lines.line_number": lineNum,
+			"lines.line":        text,
 		}
 		rows = append(rows, r)
 	}

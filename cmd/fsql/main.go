@@ -36,9 +36,9 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	tinysql "github.com/SimonWaldherr/tinySQL"
 	"fsql/internal/adapter"
 	"fsql/internal/scope"
+	tinysql "github.com/SimonWaldherr/tinySQL"
 )
 
 const version = "0.1.0"
