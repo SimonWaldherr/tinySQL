@@ -41,6 +41,46 @@ func GetTableFunc(name string) (TableFunction, bool) {
 	return fn, ok
 }
 
+// ExternalTableFunc is the public interface for domain-specific table-valued
+// functions (e.g. FSQL filesystem functions). Its Execute method receives
+// pre-evaluated argument values rather than raw AST nodes.
+type ExternalTableFunc interface {
+	Name() string
+	ValidateArgCount(n int) error
+	Execute(ctx context.Context, args []any) (*ResultSet, error)
+}
+
+// externalTVFAdapter wraps an ExternalTableFunc so it satisfies the internal
+// TableFunction interface. It evaluates all argument expressions before
+// forwarding the call.
+type externalTVFAdapter struct {
+	fn ExternalTableFunc
+}
+
+func (a *externalTVFAdapter) Name() string { return a.fn.Name() }
+
+func (a *externalTVFAdapter) ValidateArgs(args []Expr) error {
+	return a.fn.ValidateArgCount(len(args))
+}
+
+func (a *externalTVFAdapter) Execute(ctx context.Context, args []Expr, env ExecEnv, row Row) (*ResultSet, error) {
+	vals := make([]any, len(args))
+	for i, arg := range args {
+		v, err := evalExpr(env, arg, row)
+		if err != nil {
+			return nil, fmt.Errorf("%s arg %d: %v", a.fn.Name(), i+1, err)
+		}
+		vals[i] = v
+	}
+	return a.fn.Execute(ctx, vals)
+}
+
+// RegisterExternalTableFunc wraps fn in an adapter and registers it so that
+// it can be used in SQL FROM clauses and JOINs.
+func RegisterExternalTableFunc(fn ExternalTableFunc) {
+	RegisterTableFunc(&externalTVFAdapter{fn: fn})
+}
+
 // Scalar-stub handlers for table-valued function names.
 // These are used when a user accidentally calls a TVF in scalar context
 // (e.g. SELECT TABLE_FROM_JSON(...)) — provide a clear error message.

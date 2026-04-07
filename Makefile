@@ -4,9 +4,9 @@ SHELL := /usr/bin/env bash
 .PHONY: help build test clean install lint fmt fmt-check vet run-repl run-server run-demo
 .PHONY: build-all build-repl build-server build-demo build-cli build-debug build-catalog
 .PHONY: build-wasm-browser build-wasm-node build-studio build-tinysqlpage build-migrate
-.PHONY: build-query-files build-query-files-wasm run-query-files-demo
+.PHONY: build-query-files build-query-files-wasm build-fsql run-query-files-demo
 .PHONY: test-all test-unit test-integration coverage build-check verify verify-ci
-.PHONY: test-query-files test-query-files-wasm
+.PHONY: test-query-files test-query-files-wasm test-fsql
 .PHONY: run-wasm-browser run-wasm-node-demo deps update-deps tidy bench script-lint docker-build info
 .DEFAULT_GOAL := help
 
@@ -44,7 +44,7 @@ help:
 build: build-cli
 
 ## build-all: Build all binaries
-build-all: build-cli build-repl build-server build-demo build-debug build-catalog build-studio build-tinysqlpage build-migrate build-query-files
+build-all: build-cli build-repl build-server build-demo build-debug build-catalog build-studio build-tinysqlpage build-migrate build-query-files build-fsql
 	@echo "$(GREEN)✓ All binaries built successfully$(NC)"
 
 ## build-cli: Build tinySQL CLI
@@ -117,6 +117,12 @@ build-query-files:
 	@mkdir -p $(BINARY_DIR)
 	cd $(QUERY_FILES_DIR) && $(GO) build -trimpath -o ../../$(BINARY_DIR)/query_files .
 
+## build-fsql: Build standalone fsql (File System Query Language) CLI
+build-fsql:
+	@echo "$(GREEN)Building fsql CLI...$(NC)"
+	@mkdir -p $(BINARY_DIR)
+	cd ./$(CMD_DIR)/fsql && $(GO) build -trimpath -o ../../$(BINARY_DIR)/fsql .
+
 ## build-query-files-wasm: Build query_files_wasm artifacts
 build-query-files-wasm:
 	@echo "$(GREEN)Building query_files_wasm...$(NC)"
@@ -163,6 +169,11 @@ test-integration:
 test-query-files:
 	@echo "$(GREEN)Running query_files tests...$(NC)"
 	cd $(QUERY_FILES_DIR) && $(GO) test $(GO_TEST_FLAGS) ./...
+
+## test-fsql: Run tests for cmd/fsql module
+test-fsql:
+	@echo "$(GREEN)Running fsql tests...$(NC)"
+	cd ./$(CMD_DIR)/fsql && $(GO) test $(GO_TEST_FLAGS) ./...
 
 ## test-query-files-wasm: Run tests for cmd/query_files_wasm module
 test-query-files-wasm:

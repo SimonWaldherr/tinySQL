@@ -842,3 +842,51 @@ func FuzzyImportCSV(ctx context.Context, db *DB, tenant, tableName string, src i
 func FuzzyImportJSON(ctx context.Context, db *DB, tenant, tableName string, src io.Reader, opts *FuzzyImportOptions) (*ImportResult, error) {
 	return importer.FuzzyImportJSON(ctx, db, tenant, tableName, src, opts)
 }
+
+// ============================================================================
+// External Table-Valued Functions
+// ============================================================================
+
+// ExternalTableFunc is a simplified interface for registering table-valued
+// functions from outside the tinySQL core. Unlike the internal TableFunction
+// interface, it receives pre-evaluated argument values (string, int64,
+// float64, bool, or nil) rather than AST expression nodes.
+//
+// This interface is the intended extension point for domain-specific layers
+// (such as FSQL) that need to expose custom data sources as SQL tables.
+//
+// Example:
+//
+//	type MyFunc struct{}
+//
+//	func (f *MyFunc) Name() string { return "my_func" }
+//	func (f *MyFunc) ValidateArgCount(n int) error {
+//	    if n != 1 { return fmt.Errorf("my_func expects 1 argument") }
+//	    return nil
+//	}
+//	func (f *MyFunc) Execute(ctx context.Context, args []any) (*tinysql.ResultSet, error) {
+//	    // build and return ResultSet...
+//	}
+//
+//	tinysql.RegisterExternalTableFunc(&MyFunc{})
+type ExternalTableFunc interface {
+	// Name returns the SQL function name (case-insensitive).
+	Name() string
+
+	// ValidateArgCount checks whether the number of arguments is acceptable.
+	ValidateArgCount(n int) error
+
+	// Execute evaluates the function with pre-evaluated argument values and
+	// returns a ResultSet. The args slice contains one entry per SQL argument,
+	// with values converted to Go native types (string, int64, float64, bool,
+	// or nil).
+	Execute(ctx context.Context, args []any) (*ResultSet, error)
+}
+
+// RegisterExternalTableFunc registers an ExternalTableFunc so it can be used
+// in SQL FROM clauses and JOIN expressions. The function name is
+// case-insensitive. Re-registering the same name replaces the previous
+// registration.
+func RegisterExternalTableFunc(fn ExternalTableFunc) {
+	engine.RegisterExternalTableFunc(fn)
+}
