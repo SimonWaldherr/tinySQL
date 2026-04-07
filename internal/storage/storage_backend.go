@@ -49,6 +49,10 @@ const (
 	// Hot tables stay in RAM; cold tables spill to disk. Best for mixed
 	// workloads where the working set fits in a bounded amount of memory.
 	ModeHybrid
+
+	// ModeAdvancedWAL keeps all data in RAM and uses a row-level Write-Ahead Log
+	// for full ACID transaction durability, crash recovery, and point-in-time recovery.
+	ModeAdvancedWAL
 )
 
 // String returns a human-readable label for the StorageMode.
@@ -64,6 +68,8 @@ func (m StorageMode) String() string {
 		return "index"
 	case ModeHybrid:
 		return "hybrid"
+	case ModeAdvancedWAL:
+		return "advanced_wal"
 	default:
 		return fmt.Sprintf("StorageMode(%d)", int(m))
 	}
@@ -83,8 +89,10 @@ func ParseStorageMode(s string) (StorageMode, error) {
 		return ModeIndex, nil
 	case "hybrid":
 		return ModeHybrid, nil
+	case "advanced_wal", "advancedwal":
+		return ModeAdvancedWAL, nil
 	default:
-		return ModeMemory, fmt.Errorf("unknown storage mode %q (valid: memory, wal, disk, index, hybrid)", s)
+		return ModeMemory, fmt.Errorf("unknown storage mode %q (valid: memory, wal, disk, index, hybrid, advanced_wal)", s)
 	}
 }
 
@@ -133,6 +141,9 @@ func DefaultStorageConfig(mode StorageMode) StorageConfig {
 	case ModeWAL:
 		cfg.CheckpointEvery = 32
 		cfg.CheckpointInterval = 30 * time.Second
+	case ModeAdvancedWAL:
+		cfg.CheckpointEvery = 1000
+		cfg.CheckpointInterval = 5 * time.Minute
 	}
 	return cfg
 }

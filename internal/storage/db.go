@@ -400,6 +400,32 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 		}
 		db.attachWAL(wal)
 
+	case ModeAdvancedWAL:
+		if cfg.Path == "" {
+			return nil, fmt.Errorf("ModeAdvancedWAL requires a Path")
+		}
+		checkpointPath := cfg.Path + ".checkpoint"
+		if _, err := loadGOBInto(db, checkpointPath); err != nil {
+			return nil, fmt.Errorf("open advanced wal checkpoint: %w", err)
+		}
+		walCfg := AdvancedWALConfig{
+			Path:               cfg.Path,
+			CheckpointPath:     checkpointPath,
+			CheckpointEvery:    cfg.CheckpointEvery,
+			CheckpointInterval: cfg.CheckpointInterval,
+			Compress:           cfg.CompressFiles,
+			BufferSize:         64 * 1024,
+		}
+		wal, err := OpenAdvancedWAL(walCfg)
+		if err != nil {
+			return nil, fmt.Errorf("open advanced wal: %w", err)
+		}
+		// Recover pending WAL operations
+		if _, err := wal.Recover(db); err != nil {
+			return nil, fmt.Errorf("recover advanced wal: %w", err)
+		}
+		db.AttachAdvancedWAL(wal)
+
 	case ModeDisk:
 		if cfg.Path == "" {
 			return nil, fmt.Errorf("ModeDisk requires a Path")
