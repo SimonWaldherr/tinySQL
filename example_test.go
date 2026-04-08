@@ -1107,7 +1107,7 @@ func TestQueryCompilationPerformance(t *testing.T) {
 
 	// Measure traditional parsing time for comparison
 	start = time.Now()
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		p := tsql.NewParser(querySQL)
 		_, err := p.ParseStatement()
 		if err != nil {
@@ -1118,7 +1118,7 @@ func TestQueryCompilationPerformance(t *testing.T) {
 
 	// Measure cached compilation time
 	start = time.Now()
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		_, err := tsql.Compile(cache, querySQL) // Should be cache hits
 		if err != nil {
 			t.Fatal(err)
