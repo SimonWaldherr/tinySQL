@@ -18,11 +18,15 @@ func TestSplitStatements(t *testing.T) {
 		{"SELECT 'a;b'; SELECT 2", 2},
 		{"  ;  ;  ", 0},
 		{"CREATE TABLE t (id INT); INSERT INTO t VALUES (1); SELECT * FROM t", 3},
+		// Doubled single-quote escape: the semicolon is inside the string.
+		{`SELECT 'it''s a;test'`, 1},
+		// Backslash-escaped quote: semicolon after the string ends.
+		{`SELECT 'it\'s'; SELECT 2`, 2},
 	}
 	for _, tc := range cases {
 		got := splitStatements(tc.input)
 		if len(got) != tc.want {
-			t.Errorf("splitStatements(%q): got %d stmts, want %d", tc.input, len(got), tc.want)
+			t.Errorf("splitStatements(%q): got %d stmts, want %d (stmts=%v)", tc.input, len(got), tc.want, got)
 		}
 	}
 }

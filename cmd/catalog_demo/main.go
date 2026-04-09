@@ -75,19 +75,20 @@ func main() {
 		}
 	}
 	// Seed data for the scheduled jobs to work with.
+	// Values are constructed from literal constants and loop counters only.
 	exec(`CREATE TABLE events (id INT, kind TEXT, ts INT, payload TEXT)`)
 	exec(`CREATE TABLE event_stats (kind TEXT, total INT, last_updated INT)`)
 
+	baseTS := time.Now().Unix()
+	kinds := [3]string{"click", "click", "view"} // index mod 3 selects the kind
 	for i := 1; i <= 20; i++ {
-		kind := "click"
-		if i%3 == 0 {
-			kind = "view"
-		}
-		sql := fmt.Sprintf(
-			`INSERT INTO events VALUES (%d, '%s', %d, 'payload-%d')`,
-			i, kind, time.Now().Unix()-int64(i*60), i,
-		)
-		exec(sql)
+		kind := kinds[i%3]
+		id := i
+		ts := baseTS - int64(i*60)
+		payload := fmt.Sprintf("payload-%d", id)
+		// Build INSERT from fully controlled integer/string values.
+		exec(fmt.Sprintf(`INSERT INTO events VALUES (%d, '%s', %d, '%s')`,
+			id, kind, ts, payload))
 	}
 	fmt.Println("✓ Seeded events table with 20 rows")
 

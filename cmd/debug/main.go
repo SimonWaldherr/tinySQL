@@ -147,19 +147,33 @@ func stmtType(stmt tinysql.Statement) string {
 }
 
 // splitStatements splits a SQL string on semicolons, respecting string literals.
+// It handles both standard SQL doubled-quote escapes ('it''s') and
+// backslash-escaped quotes ('it\'s').
 func splitStatements(sql string) []string {
 	var stmts []string
 	var cur strings.Builder
 	inStr := false
 	var strChar rune
 
-	for _, ch := range sql {
+	runes := []rune(sql)
+	for i := 0; i < len(runes); i++ {
+		ch := runes[i]
 		switch {
-		case inStr && ch == strChar:
-			inStr = false
-			cur.WriteRune(ch)
 		case inStr:
 			cur.WriteRune(ch)
+			if ch == '\\' && i+1 < len(runes) {
+				// Backslash escape: consume the next character as-is.
+				i++
+				cur.WriteRune(runes[i])
+			} else if ch == strChar {
+				// Check for doubled-quote escape (e.g. '' inside '...').
+				if i+1 < len(runes) && runes[i+1] == strChar {
+					i++
+					cur.WriteRune(runes[i])
+				} else {
+					inStr = false
+				}
+			}
 		case ch == '\'' || ch == '"':
 			inStr = true
 			strChar = ch
