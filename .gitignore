@@ -16,7 +16,7 @@ coverage-func.txt
 *.wasm
 persist_test.dat.wal
 tinyrag
-sqltools
+/sqltools
 libtinysql.so
 wasm_browser.test
 main
@@ -32,7 +32,7 @@ niederbayern-251206.osm.pbf
 osm_import
 cover_*
 libtinysqlodbc.so
-demo
+/demo
 /wikirag
 cmd.zip
 bin/

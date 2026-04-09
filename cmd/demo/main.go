@@ -323,9 +323,8 @@ func runInteractive(db *sql.DB, timer bool) {
 				prompt()
 				continue
 			case ".tables":
-				rows, err := db.Query(`SELECT name FROM information_schema.tables WHERE table_schema = 'public'`)
+				rows, err := db.Query(`SELECT name FROM sys.tables ORDER BY name`)
 				if err != nil {
-					// Fall back: query tinySQL internal tables list.
 					fmt.Println("(cannot list tables:", err, ")")
 				} else {
 					for rows.Next() {
