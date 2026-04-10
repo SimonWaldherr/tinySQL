@@ -729,7 +729,12 @@ func sanitizeIdent(s string) string {
 	s = strings.TrimSpace(s)
 	var b strings.Builder
 	for i, c := range s {
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || (i > 0 && c >= '0' && c <= '9') {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' {
+			b.WriteRune(c)
+		} else if c >= '0' && c <= '9' {
+			if i == 0 {
+				b.WriteByte('_')
+			}
 			b.WriteRune(c)
 		} else {
 			b.WriteByte('_')
@@ -798,7 +803,7 @@ func printRows(out io.Writer, rows *sql.Rows, cols []string) {
 // printRowsCSV writes rows as CSV.
 func printRowsCSV(out io.Writer, rows *sql.Rows, cols []string) {
 	data := scanRows(rows, cols)
-	w := csv.NewWriter(out.(*os.File))
+	w := csv.NewWriter(out)
 	w.Write(cols)
 	for _, r := range data {
 		var record []string

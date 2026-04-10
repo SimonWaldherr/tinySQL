@@ -297,7 +297,7 @@ func TestSanitizeIdent(t *testing.T) {
 	}{
 		{"Name", "name"},
 		{"First Name", "first_name"},
-		{"123col", "_23col"},
+		{"123col", "_123col"},
 		{"a-b.c", "a_b_c"},
 		{"", "col"},
 	}

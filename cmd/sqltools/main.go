@@ -1040,10 +1040,17 @@ func countNesting(sqlStr string) int {
 	maxDepth, depth := 0, 0
 	inString := false
 	for i := 0; i < len(sqlStr); i++ {
-		if sqlStr[i] == '\'' && !inString {
-			inString = true
-		} else if sqlStr[i] == '\'' && inString {
-			inString = false
+		if sqlStr[i] == '\'' {
+			if inString {
+				// Handle escaped single quotes ('')
+				if i+1 < len(sqlStr) && sqlStr[i+1] == '\'' {
+					i++ // skip the escaped quote
+					continue
+				}
+				inString = false
+			} else {
+				inString = true
+			}
 		}
 		if !inString && sqlStr[i] == '(' {
 			depth++
