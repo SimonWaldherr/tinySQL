@@ -829,7 +829,7 @@
     <div class="topbar">
         <h1>TinySQL Editor</h1>
         <button onclick="showUploadDialog()">📁 Upload File</button>
-        <button id="loadAllDemosBtn" style="background: #7d2d7d;">✨ Load Demo Tables</button>
+        <button id="loadAllDemosBtn" style="background: #7d2d7d;">✨ Load Demo + Large Tables</button>
         <button onclick="toggleHistory()" style="background: #3e3e42;">📜 History</button>
         <div class="spacer"></div>
         <div class="status">
@@ -891,6 +891,15 @@
                 </div>
                 <div class="example-query" onclick="setQuery('-- Multi-statement: create and query\nCREATE TABLE temp (id INTEGER, label TEXT);\nINSERT INTO temp VALUES (1, \'alpha\');\nINSERT INTO temp VALUES (2, \'beta\');\nSELECT * FROM temp')">
                     🔁 Multi-Statement
+                </div>
+                <div class="example-query" onclick="setQuery('-- Large sales cube\nSELECT region, channel, category,\n       COUNT(*) AS orders,\n       SUM(order_total) AS revenue\nFROM sales_large\nGROUP BY region, channel, category\nORDER BY revenue DESC')">
+                    🧮 Large Sales Cube
+                </div>
+                <div class="example-query" onclick="setQuery('-- Large logistics performance\nSELECT carrier, service_level,\n       COUNT(*) AS shipments,\n       AVG(delivery_days) AS avg_delivery_days,\n       SUM(shipping_cost) AS total_shipping_cost\nFROM logistics_large\nGROUP BY carrier, service_level\nORDER BY shipments DESC')">
+                    🚛 Large Logistics
+                </div>
+                <div class="example-query" onclick="setQuery('-- Large web event trends\nSELECT event_date, acquisition_channel,\n       COUNT(*) AS events,\n       SUM(converted) AS conversions,\n       SUM(revenue_impact) AS influenced_revenue\nFROM web_events_large\nGROUP BY event_date, acquisition_channel\nORDER BY event_date DESC')">
+                    🌐 Event Trends
                 </div>
             </div>
             <div id="historyPanel" class="history-section hidden">
