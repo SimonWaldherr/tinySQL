@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,7 +41,7 @@ func openMemDB(t *testing.T) *sql.DB {
 
 func TestSeedSampleData(t *testing.T) {
 	db := openMemDB(t)
-	exec := newExecutor(db, false, true)
+	exec := newExecutor(db, false, true, "table")
 	seedSampleData(exec)
 
 	rows, err := db.Query("SELECT COUNT(*) FROM users")
@@ -60,7 +61,7 @@ func TestSeedSampleData(t *testing.T) {
 
 func TestFeatureTour(t *testing.T) {
 	db := openMemDB(t)
-	exec := newExecutor(db, false, true)
+	exec := newExecutor(db, false, true, "table")
 	seedSampleData(exec)
 	// Running the tour must not panic or return errors.
 	runFeatureTour(exec)
@@ -68,7 +69,7 @@ func TestFeatureTour(t *testing.T) {
 
 func TestRunScript(t *testing.T) {
 	db := openMemDB(t)
-	exec := newExecutor(db, false, true)
+	exec := newExecutor(db, false, true, "table")
 
 	script := `CREATE TABLE t (x INT);
 INSERT INTO t VALUES (42);
@@ -97,7 +98,7 @@ SELECT x FROM t;`
 
 func TestRunScriptFile(t *testing.T) {
 	db := openMemDB(t)
-	exec := newExecutor(db, false, true)
+	exec := newExecutor(db, false, true, "table")
 
 	f, err := os.CreateTemp(t.TempDir(), "*.sql")
 	if err != nil {
@@ -151,7 +152,7 @@ func TestPrintRows(t *testing.T) {
 
 func TestExecutorTimer(t *testing.T) {
 	db := openMemDB(t)
-	exec := newExecutor(db, true, false)
+	exec := newExecutor(db, true, false, "table")
 	if err := exec.run("CREATE TABLE timer_test (x INT)"); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -173,4 +174,152 @@ func TestPadRight(t *testing.T) {
 			t.Errorf("padRight(%q,%d)=%q want %q", tc.s, tc.w, got, tc.want)
 		}
 	}
+}
+
+// ---- Tests for new features ----
+
+func TestOutputCSV(t *testing.T) {
+	db := openMemDB(t)
+	exec := newExecutor(db, false, true, "csv")
+	if _, err := db.Exec("CREATE TABLE csv_test (a TEXT, b INT)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO csv_test VALUES ('hello', 42)"); err != nil {
+		t.Fatal(err)
+	}
+	// CSV output should not panic
+	if err := exec.run("SELECT a, b FROM csv_test"); err != nil {
+		t.Fatalf("run csv: %v", err)
+	}
+}
+
+func TestOutputJSON(t *testing.T) {
+	db := openMemDB(t)
+	exec := newExecutor(db, false, true, "json")
+	if _, err := db.Exec("CREATE TABLE json_test (name TEXT, val INT)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO json_test VALUES ('Alice', 10)"); err != nil {
+		t.Fatal(err)
+	}
+	// JSON output should not panic
+	if err := exec.run("SELECT name, val FROM json_test"); err != nil {
+		t.Fatalf("run json: %v", err)
+	}
+}
+
+func TestPrintRowsJSON(t *testing.T) {
+	db := openMemDB(t)
+	if _, err := db.Exec("CREATE TABLE jtest (x TEXT, y INT)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO jtest VALUES ('foo', 99)"); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.Query("SELECT x, y FROM jtest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	cols, _ := rows.Columns()
+	var buf bytes.Buffer
+	printRowsJSON(&buf, rows, cols)
+	var result []map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON: %v\nOutput: %s", err, buf.String())
+	}
+	if len(result) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(result))
+	}
+}
+
+func TestImportCSV(t *testing.T) {
+	db := openMemDB(t)
+	dir := t.TempDir()
+	csvFile := filepath.Join(dir, "test.csv")
+	os.WriteFile(csvFile, []byte("name,age\nAlice,30\nBob,25\n"), 0644)
+
+	if err := importFile(db, csvFile, "people"); err != nil {
+		t.Fatalf("importFile CSV: %v", err)
+	}
+
+	rows, err := db.Query("SELECT COUNT(*) FROM people")
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	defer rows.Close()
+	var cnt int
+	rows.Next()
+	rows.Scan(&cnt)
+	if cnt != 2 {
+		t.Fatalf("expected 2 rows, got %d", cnt)
+	}
+}
+
+func TestImportJSON(t *testing.T) {
+	db := openMemDB(t)
+	dir := t.TempDir()
+	jsonFile := filepath.Join(dir, "test.json")
+	os.WriteFile(jsonFile, []byte(`[{"x":"hello","y":1},{"x":"world","y":2}]`), 0644)
+
+	if err := importFile(db, jsonFile, "jdata"); err != nil {
+		t.Fatalf("importFile JSON: %v", err)
+	}
+
+	rows, err := db.Query("SELECT COUNT(*) FROM jdata")
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	defer rows.Close()
+	var cnt int
+	rows.Next()
+	rows.Scan(&cnt)
+	if cnt != 2 {
+		t.Fatalf("expected 2 rows, got %d", cnt)
+	}
+}
+
+func TestDumpTable(t *testing.T) {
+	db := openMemDB(t)
+	if _, err := db.Exec("CREATE TABLE dump_test (id INT, name TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO dump_test VALUES (1, 'Alice')"); err != nil {
+		t.Fatal(err)
+	}
+	// dumpTable should not panic
+	dumpTable(db, "dump_test")
+}
+
+func TestSanitizeIdent(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"Name", "name"},
+		{"First Name", "first_name"},
+		{"123col", "_23col"},
+		{"a-b.c", "a_b_c"},
+		{"", "col"},
+	}
+	for _, tc := range tests {
+		got := sanitizeIdent(tc.in)
+		if got != tc.want {
+			t.Errorf("sanitizeIdent(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestPrintTableCount(t *testing.T) {
+	db := openMemDB(t)
+	if _, err := db.Exec("CREATE TABLE cnt_test (x INT)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO cnt_test VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO cnt_test VALUES (2)"); err != nil {
+		t.Fatal(err)
+	}
+	// Must not panic
+	printTableCount(db, "cnt_test")
 }

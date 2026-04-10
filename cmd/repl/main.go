@@ -179,17 +179,277 @@ func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool
 }
 
 func handleMeta(db *sql.DB, line string) bool {
-	switch {
-	case line == ".help":
+	parts := strings.Fields(line)
+	if len(parts) == 0 {
+		return false
+	}
+	cmd := parts[0]
+	args := parts[1:]
+
+	switch cmd {
+	case ".help":
 		fmt.Println(`
-.meta:
-  .help                 Hilfe
-  .quit                 Beenden`)
+Commands:
+  .help                 Show this help
+  .quit                 Exit
+  .tables               List all tables
+  .schema [TABLE]       Show schema (all or specific table)
+  .count [TABLE]        Show row counts
+  .dump [TABLE]         Dump table(s) as INSERT statements
+  .read FILE            Execute SQL from file
+  .output FORMAT        Show current or set output format (table, csv, json)
+  .timer on|off         Toggle execution timing
+  .clear                Clear the screen`)
 		return true
-	case line == ".quit":
+
+	case ".quit", ".exit":
 		os.Exit(0)
+
+	case ".tables":
+		rows, err := db.Query(`SELECT name FROM sys.tables ORDER BY name`)
+		if err != nil {
+			fmt.Println("Error:", err)
+			return true
+		}
+		for rows.Next() {
+			var name string
+			_ = rows.Scan(&name)
+			fmt.Println(" ", name)
+		}
+		rows.Close()
+		return true
+
+	case ".schema":
+		if len(args) > 0 {
+			replShowSchema(db, args[0])
+		} else {
+			tables := replListTableNames(db)
+			for _, t := range tables {
+				replShowSchema(db, t)
+				fmt.Println()
+			}
+		}
+		return true
+
+	case ".count":
+		tables := replListTableNames(db)
+		if len(args) > 0 {
+			tables = args
+		}
+		for _, t := range tables {
+			row := db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", t))
+			var cnt int
+			if err := row.Scan(&cnt); err != nil {
+				fmt.Printf("  %-20s (error: %v)\n", t, err)
+			} else {
+				fmt.Printf("  %-20s %d rows\n", t, cnt)
+			}
+		}
+		return true
+
+	case ".dump":
+		tables := replListTableNames(db)
+		if len(args) > 0 {
+			tables = args
+		}
+		for _, t := range tables {
+			replDumpTable(db, t)
+		}
+		return true
+
+	case ".read":
+		if len(args) < 1 {
+			fmt.Println("Usage: .read FILE")
+			return true
+		}
+		data, err := os.ReadFile(args[0])
+		if err != nil {
+			fmt.Println("Error:", err)
+			return true
+		}
+		// Execute each statement
+		stmts := strings.Split(string(data), ";")
+		for _, s := range stmts {
+			s = strings.TrimSpace(s)
+			if s == "" || strings.HasPrefix(s, "--") {
+				continue
+			}
+			up := strings.ToUpper(s)
+			if strings.HasPrefix(up, "SELECT") || strings.HasPrefix(up, "WITH") {
+				rows, err := db.Query(s)
+				if err != nil {
+					fmt.Println("ERR:", err)
+					continue
+				}
+				cols, _ := rows.Columns()
+				replPrintRows(rows, cols)
+				rows.Close()
+			} else {
+				if _, err := db.Exec(s); err != nil {
+					fmt.Println("ERR:", err)
+				} else {
+					fmt.Println("(ok)")
+				}
+			}
+		}
+		return true
+
+	case ".clear":
+		fmt.Print("\033[2J\033[H")
+		return true
+
+	default:
+		return false
 	}
 	return false
+}
+
+// replListTableNames returns all table names sorted.
+func replListTableNames(db *sql.DB) []string {
+	rows, err := db.Query(`SELECT name FROM sys.tables ORDER BY name`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var n string
+		_ = rows.Scan(&n)
+		names = append(names, n)
+	}
+	return names
+}
+
+// replShowSchema prints column info for a table.
+func replShowSchema(db *sql.DB, table string) {
+	r, err := db.Query(fmt.Sprintf("SELECT * FROM %s LIMIT 0", table))
+	if err != nil {
+		fmt.Printf("Cannot describe %s: %v\n", table, err)
+		return
+	}
+	cols, _ := r.Columns()
+	types, _ := r.ColumnTypes()
+	r.Close()
+
+	fmt.Printf("Table: %s\n", table)
+	for i, c := range cols {
+		typeName := "UNKNOWN"
+		if i < len(types) {
+			typeName = types[i].DatabaseTypeName()
+			if typeName == "" {
+				typeName = "TEXT"
+			}
+		}
+		fmt.Printf("  %-20s %s\n", c, typeName)
+	}
+}
+
+// replDumpTable outputs INSERT statements for a table.
+func replDumpTable(db *sql.DB, table string) {
+	rows, err := db.Query(fmt.Sprintf("SELECT * FROM %s", table))
+	if err != nil {
+		fmt.Printf("dump %s: %v\n", table, err)
+		return
+	}
+	defer rows.Close()
+	cols, _ := rows.Columns()
+	fmt.Printf("-- Table: %s\n", table)
+	for rows.Next() {
+		cells := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range cells {
+			ptrs[i] = &cells[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			continue
+		}
+		var vals []string
+		for _, p := range ptrs {
+			v := replDePtr(p)
+			if v == nil {
+				vals = append(vals, "NULL")
+			} else if s, ok := v.(string); ok {
+				vals = append(vals, "'"+strings.ReplaceAll(s, "'", "''")+"'")
+			} else {
+				vals = append(vals, fmt.Sprintf("%v", v))
+			}
+		}
+		fmt.Printf("INSERT INTO %s (%s) VALUES (%s);\n",
+			table, strings.Join(cols, ", "), strings.Join(vals, ", "))
+	}
+}
+
+func replDePtr(p any) any {
+	if v, ok := p.(*any); ok {
+		return *v
+	}
+	return p
+}
+
+// replPrintRows prints a simple table for .read results.
+func replPrintRows(rows *sql.Rows, cols []string) {
+	type rowMap = map[string]any
+	var data []rowMap
+	for rows.Next() {
+		cells := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range cells {
+			ptrs[i] = &cells[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			continue
+		}
+		m := rowMap{}
+		for i, c := range cols {
+			m[c] = replDePtr(ptrs[i])
+		}
+		data = append(data, m)
+	}
+
+	cell := func(v any) string {
+		if v == nil {
+			return "NULL"
+		}
+		return fmt.Sprintf("%v", v)
+	}
+
+	width := make([]int, len(cols))
+	for i, c := range cols {
+		width[i] = len(c)
+	}
+	for _, r := range data {
+		for i, c := range cols {
+			if w := len(cell(r[c])); w > width[i] {
+				width[i] = w
+			}
+		}
+	}
+
+	for i, c := range cols {
+		if i > 0 {
+			fmt.Print("  ")
+		}
+		fmt.Print(c + strings.Repeat(" ", max(0, width[i]-len(c))))
+	}
+	fmt.Println()
+	for i := range cols {
+		if i > 0 {
+			fmt.Print("  ")
+		}
+		fmt.Print(strings.Repeat("-", width[i]))
+	}
+	fmt.Println()
+	for _, r := range data {
+		for i, c := range cols {
+			if i > 0 {
+				fmt.Print("  ")
+			}
+			s := cell(r[c])
+			fmt.Print(s + strings.Repeat(" ", max(0, width[i]-len(s))))
+		}
+		fmt.Println()
+	}
+	fmt.Printf("(%d row(s))\n", len(data))
 }
 
 // handleSelectStatement executes a SELECT/CTE query and appends HTML parts when requested.

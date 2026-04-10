@@ -284,7 +284,8 @@ func (r *Repl) handleMeta(line string) error {
 		return printSchema(r.out, r.db, r.cfg.Tenant, target)
 	case ".mode":
 		if len(args) < 1 {
-			return errors.New("usage: .mode MODE")
+			fmt.Fprintf(r.out, "current mode: %s\n", r.cfg.Mode)
+			return nil
 		}
 		r.cfg.Mode = OutputMode(args[0])
 	case ".headers":
@@ -294,7 +295,12 @@ func (r *Repl) handleMeta(line string) error {
 		r.cfg.Header = (args[0] == "on")
 	case ".timer":
 		if len(args) < 1 {
-			return errors.New("usage: .timer on|off")
+			if r.cfg.Timer {
+				fmt.Fprintln(r.out, "timer: on")
+			} else {
+				fmt.Fprintln(r.out, "timer: off")
+			}
+			return nil
 		}
 		r.cfg.Timer = (args[0] == "on")
 	case ".nullvalue":
@@ -317,6 +323,17 @@ func (r *Repl) handleMeta(line string) error {
 			return errors.New("usage: .save FILE")
 		}
 		return tsql.SaveToFile(r.db, args[0])
+	case ".dump":
+		return dumpTables(r.out, r.db, r.cfg.Tenant, args)
+	case ".import":
+		if len(args) < 1 {
+			return errors.New("usage: .import FILE [TABLE]")
+		}
+		return importFileCmd(r.db, r.cfg.Tenant, args, r.out)
+	case ".count":
+		return countTables(r.out, r.db, r.cfg.Tenant, args)
+	case ".stats":
+		return showStats(r.out, r.db, r.cfg.Tenant)
 	default:
 		return fmt.Errorf("unknown command: %s", cmd)
 	}
@@ -325,16 +342,235 @@ func (r *Repl) handleMeta(line string) error {
 
 func printHelp(out io.Writer) {
 	fmt.Fprintln(out, `
+.count [TABLE...]      Show row counts for tables
+.dump [TABLE...]       Dump tables as INSERT statements
 .exit                  Exit this program
 .headers on|off        Turn display of headers on or off
 .help                  Show this message
+.import FILE [TABLE]   Import CSV/JSON file into table
 .mode MODE             Set output mode (column, list, csv, json, table)
 .nullvalue STRING      Use STRING in place of NULL values
 .read FILENAME         Execute SQL in FILENAME
 .save FILENAME         Write in-memory database into FILENAME
 .schema ?TABLE?        Show the CREATE statements
+.stats                 Show database statistics
 .tables                List names of tables
 .timer on|off          Turn SQL timer on or off`)
+}
+
+// dumpTables outputs INSERT statements for specified tables (or all).
+func dumpTables(out io.Writer, db *tsql.DB, tenant string, args []string) error {
+	tables := db.ListTables(tenant)
+	names := make([]string, len(tables))
+	for i, t := range tables {
+		names[i] = t.Name
+	}
+	sort.Strings(names)
+
+	// Filter if args given
+	if len(args) > 0 {
+		filter := make(map[string]bool)
+		for _, a := range args {
+			filter[strings.ToLower(a)] = true
+		}
+		var filtered []string
+		for _, n := range names {
+			if filter[strings.ToLower(n)] {
+				filtered = append(filtered, n)
+			}
+		}
+		names = filtered
+	}
+
+	ctx := context.Background()
+	for _, name := range names {
+		tbl, err := db.Get(tenant, name)
+		if err != nil {
+			continue
+		}
+		// Print CREATE TABLE
+		fmt.Fprintf(out, "CREATE TABLE %s (\n", tbl.Name)
+		for i, col := range tbl.Cols {
+			def := fmt.Sprintf("  %s %s", col.Name, col.Type)
+			if col.Constraint == storage.PrimaryKey {
+				def += " PRIMARY KEY"
+			}
+			if i < len(tbl.Cols)-1 {
+				def += ","
+			}
+			fmt.Fprintln(out, def)
+		}
+		fmt.Fprintln(out, ");")
+
+		// Print INSERT statements
+		stmt, err := tsql.ParseSQL(fmt.Sprintf("SELECT * FROM %s", name))
+		if err != nil {
+			continue
+		}
+		rs, err := tsql.Execute(ctx, db, tenant, stmt)
+		if err != nil || rs == nil {
+			continue
+		}
+		for _, row := range rs.Rows {
+			var vals []string
+			for _, col := range rs.Cols {
+				v := row[strings.ToLower(col)]
+				if v == nil {
+					vals = append(vals, "NULL")
+				} else if s, ok := v.(string); ok {
+					vals = append(vals, "'"+strings.ReplaceAll(s, "'", "''")+"'")
+				} else {
+					vals = append(vals, fmt.Sprintf("%v", v))
+				}
+			}
+			fmt.Fprintf(out, "INSERT INTO %s (%s) VALUES (%s);\n",
+				name, strings.Join(rs.Cols, ", "), strings.Join(vals, ", "))
+		}
+		fmt.Fprintln(out)
+	}
+	return nil
+}
+
+// importFileCmd imports a CSV/JSON file into a table.
+func importFileCmd(db *tsql.DB, tenant string, args []string, out io.Writer) error {
+	filePath := args[0]
+	tableName := ""
+	if len(args) > 1 {
+		tableName = args[1]
+	} else {
+		base := filepath.Base(filePath)
+		tableName = strings.TrimSuffix(base, filepath.Ext(base))
+	}
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	ctx := context.Background()
+	ext := strings.ToLower(filepath.Ext(filePath))
+
+	switch ext {
+	case ".csv", ".tsv":
+		opts := &tsql.ImportOptions{}
+		if ext == ".tsv" {
+			opts.DelimiterCandidates = []rune{'\t'}
+		}
+		result, err := tsql.ImportCSV(ctx, db, tenant, tableName, f, opts)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Imported %d rows into %s\n", result.RowsInserted, tableName)
+	case ".json":
+		result, err := tsql.ImportJSON(ctx, db, tenant, tableName, f, nil)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Imported %d rows into %s\n", result.RowsInserted, tableName)
+	default:
+		return fmt.Errorf("unsupported format: %s (use .csv, .tsv, .json)", ext)
+	}
+	return nil
+}
+
+// countTables shows row counts for tables.
+func countTables(out io.Writer, db *tsql.DB, tenant string, args []string) error {
+	tables := db.ListTables(tenant)
+	names := make([]string, 0, len(tables))
+	for _, t := range tables {
+		names = append(names, t.Name)
+	}
+	sort.Strings(names)
+
+	// Filter if args given
+	if len(args) > 0 {
+		filter := make(map[string]bool)
+		for _, a := range args {
+			filter[strings.ToLower(a)] = true
+		}
+		var filtered []string
+		for _, n := range names {
+			if filter[strings.ToLower(n)] {
+				filtered = append(filtered, n)
+			}
+		}
+		names = filtered
+	}
+
+	ctx := context.Background()
+	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(w, "TABLE\tROWS\n")
+	fmt.Fprintf(w, "-----\t----\n")
+	total := 0
+	for _, name := range names {
+		stmt, err := tsql.ParseSQL(fmt.Sprintf("SELECT COUNT(*) AS cnt FROM %s", name))
+		if err != nil {
+			continue
+		}
+		rs, err := tsql.Execute(ctx, db, tenant, stmt)
+		if err != nil || rs == nil || len(rs.Rows) == 0 {
+			fmt.Fprintf(w, "%s\t?\n", name)
+			continue
+		}
+		cnt := 0
+		if v, ok := rs.Rows[0]["cnt"]; ok {
+			switch n := v.(type) {
+			case int:
+				cnt = n
+			case int64:
+				cnt = int(n)
+			case float64:
+				cnt = int(n)
+			}
+		}
+		total += cnt
+		fmt.Fprintf(w, "%s\t%d\n", name, cnt)
+	}
+	fmt.Fprintf(w, "-----\t----\n")
+	fmt.Fprintf(w, "TOTAL\t%d\n", total)
+	return w.Flush()
+}
+
+// showStats displays database-level statistics.
+func showStats(out io.Writer, db *tsql.DB, tenant string) error {
+	tables := db.ListTables(tenant)
+	totalTables := len(tables)
+	totalRows := 0
+	totalCols := 0
+	ctx := context.Background()
+
+	for _, t := range tables {
+		tbl, err := db.Get(tenant, t.Name)
+		if err != nil {
+			continue
+		}
+		totalCols += len(tbl.Cols)
+
+		stmt, _ := tsql.ParseSQL(fmt.Sprintf("SELECT COUNT(*) AS cnt FROM %s", t.Name))
+		if stmt != nil {
+			rs, err := tsql.Execute(ctx, db, tenant, stmt)
+			if err == nil && rs != nil && len(rs.Rows) > 0 {
+				if v, ok := rs.Rows[0]["cnt"]; ok {
+					switch n := v.(type) {
+					case int:
+						totalRows += n
+					case int64:
+						totalRows += int(n)
+					case float64:
+						totalRows += int(n)
+					}
+				}
+			}
+		}
+	}
+
+	fmt.Fprintf(out, "Database Statistics:\n")
+	fmt.Fprintf(out, "  Tenant:       %s\n", tenant)
+	fmt.Fprintf(out, "  Tables:       %d\n", totalTables)
+	fmt.Fprintf(out, "  Columns:      %d\n", totalCols)
+	fmt.Fprintf(out, "  Total rows:   %d\n", totalRows)
+	return nil
 }
 
 // ---- Execution Engine -------------------------------------------------------
