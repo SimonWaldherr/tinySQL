@@ -2,12 +2,14 @@
 let wasmReady = false;
 let currentTables = [];
 let currentResults = null;
+const HISTORY_KEY = 'tinysql_query_history_v1';
 // Safe references to WASM-exported functions (set after init)
 let wasmApi = {
     importFile: null,
     executeQuery: null,
     executeMulti: null,
     clearDatabase: null,
+    dropTable: null,
     listTables: null,
     exportResults: null,
     getTableSchema: null,
@@ -18,7 +20,31 @@ const pendingClientTables = {};
 
 // Query history (newest first, max 50)
 const MAX_HISTORY = 50;
-let queryHistory = JSON.parse(localStorage.getItem('tsql_history') || '[]');
+let queryHistory = loadHistory();
+
+function loadHistory() {
+    const legacyKeys = ['tinySQL_history', 'tsql_history'];
+    try {
+        const current = localStorage.getItem(HISTORY_KEY);
+        if (current) {
+            const parsed = JSON.parse(current);
+            return Array.isArray(parsed) ? parsed : [];
+        }
+        for (const key of legacyKeys) {
+            const legacy = localStorage.getItem(key);
+            if (!legacy) continue;
+            const parsed = JSON.parse(legacy);
+            if (Array.isArray(parsed)) {
+                localStorage.setItem(HISTORY_KEY, JSON.stringify(parsed));
+                localStorage.removeItem(key);
+                return parsed;
+            }
+        }
+    } catch (_) {
+        // Keep empty history if storage is corrupted or blocked.
+    }
+    return [];
+}
 
 // Initialize WASM
 async function initWasm() {
@@ -39,6 +65,7 @@ async function initWasm() {
         wasmApi.executeQuery = window.executeQuery;
         wasmApi.executeMulti = window.executeMulti;
         wasmApi.clearDatabase = window.clearDatabase;
+        wasmApi.dropTable = window.dropTable;
         wasmApi.listTables = window.listTables;
         wasmApi.exportResults = window.exportResults;
         wasmApi.getTableSchema = window.getTableSchema;
@@ -78,6 +105,7 @@ async function initWasm() {
             // Clear pending list now that we've attempted to import
             for (const k of Object.keys(pendingClientTables)) delete pendingClientTables[k];
         }
+        loadTables();
     } catch (err) {
         console.error("Failed to load WASM:", err);
         updateStatus("Failed to load WASM");
@@ -86,6 +114,197 @@ async function initWasm() {
 }
 
 // Demo data
+function createSeededRandom(seed) {
+    let state = seed >>> 0;
+    return function nextRandom() {
+        state = (state * 1664525 + 1013904223) >>> 0;
+        return state / 4294967296;
+    };
+}
+
+function pickValue(values, random) {
+    return values[Math.floor(random() * values.length)];
+}
+
+function randomInt(random, min, max) {
+    return Math.floor(random() * (max - min + 1)) + min;
+}
+
+function randomNumber(random, min, max, decimals = 2) {
+    return Number((min + random() * (max - min)).toFixed(decimals));
+}
+
+function formatIsoDate(date) {
+    return date.toISOString().slice(0, 10);
+}
+
+function formatIsoDateTime(date) {
+    return date.toISOString().slice(0, 19).replace('T', ' ');
+}
+
+function generateLargeSalesData(rowCount) {
+    const random = createSeededRandom(1337);
+    const catalog = [
+        { product: 'Widget A', category: 'Widgets', minPrice: 24, maxPrice: 36 },
+        { product: 'Widget B', category: 'Widgets', minPrice: 39, maxPrice: 58 },
+        { product: 'Widget C', category: 'Widgets', minPrice: 68, maxPrice: 92 },
+        { product: 'Sensor Hub', category: 'Electronics', minPrice: 120, maxPrice: 185 },
+        { product: 'Analytics Suite', category: 'Software', minPrice: 210, maxPrice: 360 },
+        { product: 'Edge Gateway', category: 'Infrastructure', minPrice: 440, maxPrice: 680 }
+    ];
+    const customerPrefixes = ['Acme', 'Northwind', 'BluePeak', 'Signal', 'Vertex', 'Bright', 'Nimbus', 'Evergreen', 'Cobalt', 'Atlas'];
+    const customerSuffixes = ['Retail', 'Logistics', 'Systems', 'Works', 'Labs', 'Partners', 'Industries', 'Solutions', 'Stores', 'Networks'];
+    const segments = ['SMB', 'Mid-Market', 'Enterprise', 'Public Sector'];
+    const regions = ['North', 'South', 'East', 'West', 'Central'];
+    const channels = ['Direct', 'Partner', 'Online', 'Inside Sales'];
+    const statuses = ['Delivered', 'Delivered', 'Delivered', 'Shipped', 'Processing', 'Backorder'];
+    const priorities = ['Low', 'Normal', 'High', 'Urgent'];
+    const salesReps = ['A. Cole', 'B. Rivera', 'C. Shah', 'D. Fischer', 'E. Novak', 'F. Silva'];
+    const baseDate = Date.UTC(2024, 0, 1);
+    const rows = [];
+
+    for (let index = 0; index < rowCount; index += 1) {
+        const item = pickValue(catalog, random);
+        const quantity = randomInt(random, 1, 120);
+        const unitPrice = randomNumber(random, item.minPrice, item.maxPrice);
+        const discountPct = randomInt(random, 0, 18);
+        const grossTotal = Number((quantity * unitPrice).toFixed(2));
+        const orderTotal = Number((grossTotal * (1 - discountPct / 100)).toFixed(2));
+        const customerNumber = 1000 + randomInt(random, 0, 899);
+        const orderDate = new Date(baseDate + randomInt(random, 0, 210) * 86400000);
+
+        rows.push({
+            order_id: 200000 + index,
+            customer_id: `CUST-${customerNumber}`,
+            customer_name: `${pickValue(customerPrefixes, random)} ${pickValue(customerSuffixes, random)}`,
+            segment: pickValue(segments, random),
+            region: pickValue(regions, random),
+            channel: pickValue(channels, random),
+            product: item.product,
+            category: item.category,
+            quantity,
+            unit_price: unitPrice,
+            discount_pct: discountPct,
+            gross_total: grossTotal,
+            order_total: orderTotal,
+            status: pickValue(statuses, random),
+            priority: pickValue(priorities, random),
+            sales_rep: pickValue(salesReps, random),
+            order_date: formatIsoDate(orderDate)
+        });
+    }
+
+    return rows;
+}
+
+function generateLargeLogisticsData(salesRows) {
+    const random = createSeededRandom(2024);
+    const carriers = ['FastShip Express', 'QuickMove Logistics', 'RapidTransit Co', 'Northern Freight', 'CargoStream'];
+    const warehouses = ['New York', 'Chicago', 'Dallas', 'Seattle', 'Rotterdam'];
+    const serviceLevels = ['Standard', 'Priority', 'Two-Day', 'Economy'];
+    const statuses = ['Delivered', 'Delivered', 'Delivered', 'In Transit', 'Processing', 'Delayed'];
+
+    return salesRows.map((sale, index) => {
+        const dispatchDelay = randomInt(random, 0, 3);
+        const deliveryDays = randomInt(random, 1, 8);
+        const dispatchDate = new Date(Date.parse(`${sale.order_date}T08:00:00Z`) + dispatchDelay * 86400000);
+        const status = pickValue(statuses, random);
+        const deliveryDate = status === 'Delivered'
+            ? formatIsoDate(new Date(dispatchDate.getTime() + deliveryDays * 86400000))
+            : null;
+
+        return {
+            shipment_id: `SHP-${sale.order_id}`,
+            order_id: sale.order_id,
+            customer_id: sale.customer_id,
+            warehouse: pickValue(warehouses, random),
+            carrier: pickValue(carriers, random),
+            service_level: pickValue(serviceLevels, random),
+            origin_region: pickValue(['North', 'South', 'East', 'West', 'Central'], random),
+            destination_region: sale.region,
+            weight_kg: randomNumber(random, 5, 380, 1),
+            distance_km: randomInt(random, 120, 5200),
+            shipping_cost: randomNumber(random, 35, 920),
+            delivery_days: status === 'Delivered' ? deliveryDays : null,
+            status,
+            dispatch_date: formatIsoDate(dispatchDate),
+            delivery_date: deliveryDate,
+            batch_id: `BATCH-${100 + (index % 48)}`
+        };
+    });
+}
+
+function generateLargeWebEventsData(salesRows, rowCount) {
+    const random = createSeededRandom(4242);
+    const eventTypes = ['page_view', 'product_view', 'search', 'add_to_cart', 'checkout_start', 'purchase', 'support_chat'];
+    const pages = ['/home', '/pricing', '/catalog', '/products/widget-a', '/products/widget-b', '/checkout', '/support'];
+    const devices = ['desktop', 'mobile', 'tablet'];
+    const countries = ['US', 'DE', 'FR', 'UK', 'NL', 'SE'];
+    const acquisitionChannels = ['organic', 'paid', 'email', 'partner', 'direct'];
+    const baseDate = Date.UTC(2024, 0, 1);
+    const rows = [];
+
+    for (let index = 0; index < rowCount; index += 1) {
+        const sale = salesRows[randomInt(random, 0, salesRows.length - 1)];
+        const eventType = pickValue(eventTypes, random);
+        const eventDate = new Date(
+            baseDate + randomInt(random, 0, 240) * 86400000 + randomInt(random, 0, 1439) * 60000
+        );
+        const revenueImpact = eventType === 'purchase'
+            ? sale.order_total
+            : Number((sale.order_total * random() * 0.08).toFixed(2));
+
+        rows.push({
+            event_id: `EVT-${500000 + index}`,
+            session_id: `SES-${200000 + randomInt(random, 0, 90000)}`,
+            customer_id: sale.customer_id,
+            order_id: eventType === 'purchase' ? sale.order_id : null,
+            event_type: eventType,
+            page: pickValue(pages, random),
+            device: pickValue(devices, random),
+            region: sale.region,
+            country: pickValue(countries, random),
+            acquisition_channel: pickValue(acquisitionChannels, random),
+            event_date: formatIsoDate(eventDate),
+            event_timestamp: formatIsoDateTime(eventDate),
+            duration_seconds: randomInt(random, 5, 1800),
+            revenue_impact: revenueImpact,
+            converted: eventType === 'purchase' ? 1 : (random() < 0.06 ? 1 : 0)
+        });
+    }
+
+    return rows;
+}
+
+let generatedDemoTables = null;
+
+function getGeneratedDemoTables() {
+    if (generatedDemoTables) {
+        return generatedDemoTables;
+    }
+
+    const salesLarge = generateLargeSalesData(5000);
+    generatedDemoTables = {
+        sales_large: salesLarge,
+        logistics_large: generateLargeLogisticsData(salesLarge),
+        web_events_large: generateLargeWebEventsData(salesLarge, 10000)
+    };
+
+    return generatedDemoTables;
+}
+
+function getDemoDefaultQuery(tableName) {
+    const queries = {
+        sales: `SELECT customer_name, product, quantity * unit_price AS total_value\nFROM sales\nORDER BY total_value DESC\nLIMIT 10`,
+        logistics: `SELECT carrier, COUNT(*) AS shipment_count, AVG(shipping_cost) AS avg_cost\nFROM logistics\nGROUP BY carrier\nORDER BY shipment_count DESC`,
+        sales_large: `SELECT region, channel, COUNT(*) AS orders, SUM(order_total) AS revenue\nFROM sales_large\nGROUP BY region, channel\nORDER BY revenue DESC`,
+        logistics_large: `SELECT carrier, service_level, COUNT(*) AS shipments, AVG(delivery_days) AS avg_delivery_days\nFROM logistics_large\nGROUP BY carrier, service_level\nORDER BY shipments DESC`,
+        web_events_large: `SELECT event_date, device, COUNT(*) AS events, SUM(revenue_impact) AS influenced_revenue\nFROM web_events_large\nGROUP BY event_date, device\nORDER BY event_date DESC`
+    };
+
+    return queries[tableName] || '';
+}
+
 const DEMO_TABLES = {
     sales: {
         name: 'sales',
@@ -116,6 +335,18 @@ const DEMO_TABLES = {
             { shipment_id: 'SHP-009', order_id: 1009, origin: 'Los Angeles', destination: 'Seattle', carrier: 'FastShip Express', weight_kg: 175, distance_km: 1800, shipping_cost: 350.00, dispatch_date: '2024-02-03', delivery_date: null, status: 'Processing' },
             { shipment_id: 'SHP-010', order_id: 1010, origin: 'Miami', destination: 'Phoenix', carrier: 'RapidTransit Co', weight_kg: 210, distance_km: 3200, shipping_cost: 480.00, dispatch_date: '2024-02-05', delivery_date: null, status: 'In Transit' }
         ]
+    },
+    sales_large: {
+        name: 'sales_large',
+        getData: () => getGeneratedDemoTables().sales_large
+    },
+    logistics_large: {
+        name: 'logistics_large',
+        getData: () => getGeneratedDemoTables().logistics_large
+    },
+    web_events_large: {
+        name: 'web_events_large',
+        getData: () => getGeneratedDemoTables().web_events_large
     }
 };
 
@@ -127,7 +358,9 @@ async function loadDemoTable(tableName) {
     }
 
     const demo = DEMO_TABLES[tableName];
-    const jsonContent = JSON.stringify(demo.data, null, 2);
+    const rows = typeof demo.getData === 'function' ? demo.getData() : demo.data;
+    const jsonContent = JSON.stringify(rows);
+    const suggestedQuery = getDemoDefaultQuery(tableName);
     
     updateStatus(`Loading demo table: ${tableName}...`);
 
@@ -148,14 +381,12 @@ async function loadDemoTable(tableName) {
                     }
                     renderTables();
                     updateStatus(`Demo table "${tableName}" loaded: ${result.rowsImported} rows`);
-                    if (tableName === 'sales' || tableName === 'logistics') {
+                    if (Object.prototype.hasOwnProperty.call(DEMO_TABLES, tableName)) {
                         showDemoQueries();
                     }
                     const editor = document.getElementById('queryEditor');
-                    if (tableName === 'sales') {
-                        editor.value = `SELECT customer_name, product, quantity * unit_price AS total_value\nFROM sales\nORDER BY total_value DESC\nLIMIT 10`;
-                    } else if (tableName === 'logistics') {
-                        editor.value = `SELECT carrier, COUNT(*) AS shipment_count, AVG(shipping_cost) AS avg_cost\nFROM logistics\nGROUP BY carrier\nORDER BY shipment_count DESC`;
+                    if (suggestedQuery) {
+                        editor.value = suggestedQuery;
                     }
                     document.getElementById('executeBtn').disabled = false;
                 } else {
@@ -167,12 +398,10 @@ async function loadDemoTable(tableName) {
                 updateStatus('Demo load failed');
             }
         } else {
-            registerClientTable(tableName, demo.data);
+            registerClientTable(tableName, rows);
             const editor = document.getElementById('queryEditor');
-            if (tableName === 'sales') {
-                editor.value = `SELECT customer_name, product, quantity * unit_price AS total_value\nFROM sales\nORDER BY total_value DESC\nLIMIT 10`;
-            } else if (tableName === 'logistics') {
-                editor.value = `SELECT carrier, COUNT(*) AS shipment_count, AVG(shipping_cost) AS avg_cost\nFROM logistics\nGROUP BY carrier\nORDER BY shipment_count DESC`;
+            if (suggestedQuery) {
+                editor.value = suggestedQuery;
             }
             updateStatus(`Registered demo table "${tableName}" locally. Queries will run once WASM is initialized.`);
         }
@@ -181,15 +410,21 @@ async function loadDemoTable(tableName) {
 
 // Load all demo tables
 async function loadAllDemos() {
-    await loadDemoTable('sales');
-    await new Promise(resolve => setTimeout(resolve, 100));
-    await loadDemoTable('logistics');
+    const tableNames = ['sales', 'logistics', 'sales_large', 'logistics_large', 'web_events_large'];
+
+    for (const [index, tableName] of tableNames.entries()) {
+        await loadDemoTable(tableName);
+        if (index < tableNames.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 25));
+        }
+    }
     
     // Set a complex demo query
     const editor = document.getElementById('queryEditor');
-    editor.value = `-- Compare sales by region\nSELECT region, \n       COUNT(*) AS order_count,\n       SUM(quantity * unit_price) AS total_revenue\nFROM sales\nGROUP BY region\nORDER BY total_revenue DESC`;
+    editor.value = `-- Large demo: revenue and fulfillment by region and carrier\nSELECT s.region,\n       l.carrier,\n       COUNT(*) AS orders,\n       SUM(s.order_total) AS total_revenue,\n       AVG(l.shipping_cost) AS avg_shipping_cost\nFROM sales_large s\nJOIN logistics_large l ON s.order_id = l.order_id\nGROUP BY s.region, l.carrier\nORDER BY total_revenue DESC`;
     // Ensure demo queries are visible after loading all demos
     showDemoQueries();
+    updateStatus('Loaded curated demos and generated large tables');
 }
 
 // Load tables on startup
@@ -456,7 +691,7 @@ function registerClientTable(tableName, rows) {
     renderTables();
     updateStatus(`Registered local table "${tableName}" (${rows.length} rows). Will import into WASM when ready.`);
     // Reveal demo queries when demo tables are registered
-    if (tableName === 'sales' || tableName === 'logistics') {
+    if (Object.prototype.hasOwnProperty.call(DEMO_TABLES, tableName)) {
         showDemoQueries();
     }
 }
@@ -587,7 +822,21 @@ function showTableInfo(tableName) {
 
 // Remove table
 function removeTable(tableName) {
+    const isPending = Object.prototype.hasOwnProperty.call(pendingClientTables, tableName);
+
+    if (!isPending && wasmReady && typeof wasmApi.dropTable === 'function') {
+        const result = wasmApi.dropTable(tableName);
+        if (!result || !result.success) {
+            alert(`Failed to drop table "${tableName}": ${result?.error || 'Unknown error'}`);
+            return;
+        }
+    }
+
+    delete pendingClientTables[tableName];
     currentTables = currentTables.filter(t => t.name !== tableName);
+    if (currentResults && currentResults.sourceTable === tableName) {
+        currentResults = null;
+    }
     renderTables();
     updateStatus(`Removed table "${tableName}"`);
 }
@@ -630,6 +879,39 @@ function setQuery(query) {
 // Clear query
 function clearQuery() {
     document.getElementById('queryEditor').value = '';
+}
+
+function clearAllTables() {
+    if (!confirm('This will remove all imported tables. Continue?')) {
+        return;
+    }
+    if (typeof wasmApi.clearDatabase === 'function') {
+        const result = wasmApi.clearDatabase();
+        if (!result || !result.success) {
+            alert(`Failed to clear database: ${result?.error || 'Unknown error'}`);
+            return;
+        }
+    }
+    for (const key of Object.keys(pendingClientTables)) {
+        delete pendingClientTables[key];
+    }
+    currentTables = [];
+    currentResults = null;
+    renderTables();
+    const resultsContainer = document.getElementById('resultsContainer');
+    if (resultsContainer) {
+        resultsContainer.innerHTML = `
+            <div class="empty-state">
+                <div class="empty-state-icon">⚡</div>
+                <div class="empty-state-title">Ready to Query</div>
+                <div class="empty-state-text">
+                    Upload a file and run a SQL query
+                </div>
+            </div>
+        `;
+    }
+    window.clearVanillaGrid?.();
+    updateStatus('Database cleared');
 }
 
 // Format query (basic)
@@ -817,26 +1099,31 @@ function loadTables() {
                 const userTbls = info.tables.filter(t => t.kind !== 'virtual');
                 const virtTbls = info.tables.filter(t => t.kind === 'virtual');
 
-                // Merge user tables into currentTables (keep pending status)
-                userTbls.forEach(t => {
-                    const existing = currentTables.find(x => x.name === t.name);
-                    if (!existing) {
+                // Replace current user-table snapshot from backend state.
+                currentTables = userTbls.map(t => ({
+                    name: t.name,
+                    rowCount: t.rows,
+                    columns: Array.isArray(t.columns)
+                        ? t.columns.map(c => typeof c === 'object' ? c.name : c)
+                        : [],
+                    columnTypes: Array.isArray(t.columns)
+                        ? t.columns.filter(c => typeof c === 'object')
+                        : [],
+                    kind: 'table',
+                }));
+
+                // Keep pending local tables visible until they are imported.
+                for (const [name, rows] of Object.entries(pendingClientTables)) {
+                    if (!currentTables.some(t => t.name === name)) {
+                        const cols = Array.isArray(rows) && rows.length > 0 ? Object.keys(rows[0]) : [];
                         currentTables.push({
-                            name: t.name,
-                            rowCount: t.rows,
-                            columns: Array.isArray(t.columns)
-                                ? t.columns.map(c => typeof c === 'object' ? c.name : c)
-                                : [],
-                            columnTypes: Array.isArray(t.columns)
-                                ? t.columns.filter(c => typeof c === 'object')
-                                : [],
+                            name,
+                            rowCount: Array.isArray(rows) ? rows.length : 0,
+                            columns: cols,
                             kind: 'table',
                         });
-                    } else {
-                        existing.rowCount = t.rows;
-                        existing.kind = 'table';
                     }
-                });
+                }
 
                 // Store virtual tables separately
                 window._virtualTables = virtTbls.map(t => ({
@@ -886,7 +1173,11 @@ function doExport(format) {
         try {
             const res = wasmApi.exportResults(format);
             if (res && res.success && res.data) {
-                downloadFile(res.data, `query_results.${format}`, res.mime || 'application/octet-stream');
+                const mimeType = (typeof res.mimeType === 'string' && res.mimeType) ||
+                    (typeof res.mime === 'string' && res.mime) ||
+                    'application/octet-stream';
+                const ext = (typeof res.ext === 'string' && res.ext) ? res.ext : format;
+                downloadFile(res.data, `query_results.${ext}`, mimeType);
                 return;
             }
         } catch (_) { /* fall through */ }
@@ -947,7 +1238,8 @@ function exportXML() {
         xml += '  <row>\n';
         currentResults.columns.forEach(col => {
             const val = row[col];
-            xml += `    <${col}>${escapeXml(val == null ? '' : String(val))}</${col}>\n`;
+            const tag = toXmlTag(col);
+            xml += `    <${tag}>${escapeXml(val == null ? '' : String(val))}</${tag}>\n`;
         });
         xml += '  </row>\n';
     });
@@ -978,17 +1270,31 @@ function escapeXml(s) {
     return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;');
 }
 
+function toXmlTag(name) {
+    const raw = String(name || '').trim();
+    if (!raw) return 'col';
+    let tag = raw.replace(/[^A-Za-z0-9_.-]/g, '_');
+    if (!/^[A-Za-z_]/.test(tag)) {
+        tag = `c_${tag}`;
+    }
+    return tag || 'col';
+}
+
 // ----- Query History -----
 function pushHistory(sql, duration, rows) {
     queryHistory.unshift({ sql, duration, rows, ts: Date.now() });
     if (queryHistory.length > MAX_HISTORY) queryHistory.length = MAX_HISTORY;
-    try { localStorage.setItem('tinySQL_history', JSON.stringify(queryHistory)); } catch (_) {}
+    try { localStorage.setItem(HISTORY_KEY, JSON.stringify(queryHistory)); } catch (_) {}
     renderHistory();
 }
 
 function clearHistory() {
     queryHistory.length = 0;
-    try { localStorage.removeItem('tinySQL_history'); } catch (_) {}
+    try {
+        localStorage.removeItem(HISTORY_KEY);
+        localStorage.removeItem('tinySQL_history');
+        localStorage.removeItem('tsql_history');
+    } catch (_) {}
     renderHistory();
 }
 
