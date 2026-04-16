@@ -26,6 +26,35 @@
             display: none !important;
         }
 
+        .sr-only {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            padding: 0;
+            margin: -1px;
+            overflow: hidden;
+            clip: rect(0, 0, 0, 0);
+            white-space: nowrap;
+            border: 0;
+        }
+
+        .skip-link {
+            position: absolute;
+            left: 12px;
+            top: -40px;
+            z-index: 2000;
+            background: #0e639c;
+            color: #fff;
+            padding: 8px 12px;
+            border-radius: 4px;
+            text-decoration: none;
+            transition: top 0.15s ease;
+        }
+
+        .skip-link:focus {
+            top: 12px;
+        }
+
         /* Top Bar */
         .topbar {
             background: #2d2d30;
@@ -63,6 +92,21 @@
 
         .topbar button:hover {
             background: #1177bb;
+        }
+
+        .topbar button:focus-visible,
+        .sidebar-header button:focus-visible,
+        .editor-toolbar button:focus-visible,
+        .results-actions button:focus-visible,
+        .vg-header-actions button:focus-visible,
+        .history-title button:focus-visible,
+        .schema-actions button:focus-visible,
+        .upload-btn:focus-visible,
+        .example-query:focus-visible,
+        .table-info-btn:focus-visible,
+        .table-remove:focus-visible {
+            outline: 2px solid #9cdcfe;
+            outline-offset: 2px;
         }
 
         .spacer {
@@ -336,6 +380,62 @@
             background: #505050;
         }
 
+        .editor-shell {
+            position: relative;
+        }
+
+        .autocomplete-panel {
+            position: absolute;
+            left: 0;
+            right: 0;
+            top: calc(100% - 6px);
+            z-index: 40;
+            background: #252526;
+            border: 1px solid #3e3e42;
+            border-radius: 0 0 6px 6px;
+            box-shadow: 0 12px 28px rgba(0, 0, 0, 0.35);
+            max-height: 220px;
+            overflow-y: auto;
+        }
+
+        .autocomplete-panel.hidden {
+            display: none !important;
+        }
+
+        .autocomplete-item {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 8px 12px;
+            font-size: 12px;
+            border-bottom: 1px solid #333;
+            cursor: pointer;
+        }
+
+        .autocomplete-item:last-child {
+            border-bottom: none;
+        }
+
+        .autocomplete-item strong {
+            color: #fff;
+            font-weight: 600;
+        }
+
+        .autocomplete-item span {
+            color: #999;
+            white-space: nowrap;
+        }
+
+        .autocomplete-item.active,
+        .autocomplete-item:hover {
+            background: #0e639c;
+        }
+
+        .autocomplete-item.active span,
+        .autocomplete-item:hover span {
+            color: #d9ecff;
+        }
+
         textarea {
             width: 100%;
             min-height: 120px;
@@ -482,6 +582,39 @@
         .empty-state-text {
             font-size: 14px;
             line-height: 1.5;
+        }
+
+        .example-query {
+            display: block;
+            width: 100%;
+            text-align: left;
+            border: 1px solid transparent;
+        }
+
+        .example-query:focus-visible {
+            border-color: #9cdcfe;
+            background: #3e3e42;
+        }
+
+        .schema-panel[aria-hidden="true"] {
+            display: none !important;
+        }
+
+        .schema-panel[aria-hidden="false"] {
+            display: block;
+        }
+
+        .results-area {
+            scroll-behavior: smooth;
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: 0.01ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.01ms !important;
+                scroll-behavior: auto !important;
+            }
         }
 
         /* File Upload */
@@ -825,16 +958,17 @@
     </style>
 </head>
 <body>
+    <a class="skip-link" href="#queryEditor">Skip to query editor</a>
     <!-- Top Bar -->
     <div class="topbar">
         <h1>TinySQL Editor</h1>
-        <button onclick="showUploadDialog()">📁 Upload File</button>
-        <button id="loadAllDemosBtn" style="background: #7d2d7d;">✨ Load Demo + Large Tables</button>
-        <button onclick="toggleHistory()" style="background: #3e3e42;">📜 History</button>
+        <button onclick="showUploadDialog()" aria-label="Upload file">📁 Upload File</button>
+        <button id="loadAllDemosBtn" style="background: #7d2d7d;" aria-label="Load demo data and large tables">✨ Load Demo + Large Tables</button>
+        <button onclick="toggleHistory()" style="background: #3e3e42;" aria-label="Toggle query history">📜 History</button>
         <div class="spacer"></div>
         <div class="status">
             <div class="status-indicator"></div>
-            <span id="statusText">Ready</span>
+            <span id="statusText" role="status" aria-live="polite" aria-atomic="true">Ready</span>
         </div>
     </div>
 
@@ -845,16 +979,16 @@
             <div class="sidebar-header">
                 <h2>Tables</h2>
                 <div class="sidebar-actions">
-                    <button onclick="loadTables()" title="Refresh">↻</button>
-                    <button onclick="clearAllTables()" title="Clear all tables">🗑</button>
+                    <button onclick="loadTables()" title="Refresh" aria-label="Refresh tables">↻</button>
+                    <button onclick="clearAllTables()" title="Clear all tables" aria-label="Clear all tables">🗑</button>
                 </div>
             </div>
             <div class="upload-area">
                 <label class="upload-btn" for="fileInput">
                     📤 Upload File
                 </label>
-                <input type="file" id="fileInput" accept=".csv,.json,.xml,.xlsx,.xls" multiple onchange="handleFileUpload(event)">
-                <div style="font-size: 11px; color: #888; margin-top: 8px; padding: 0 4px;">
+                <input type="file" id="fileInput" accept=".csv,.json,.xml,.xlsx,.xls" multiple onchange="handleFileUpload(event)" aria-describedby="uploadHelp">
+                <div id="uploadHelp" style="font-size: 11px; color: #888; margin-top: 8px; padding: 0 4px;">
                     Supports: CSV, JSON, XML, Excel (.xlsx, .xls)
                 </div>
             </div>
@@ -865,7 +999,7 @@
                     <div class="empty-state-text">Upload a file or load from disk</div>
                 </div>
             </div>
-            <div id="schemaPanel" class="schema-panel hidden"></div>
+            <div id="schemaPanel" class="schema-panel hidden" role="region" aria-hidden="true" aria-labelledby="schemaPanelTitle" tabindex="-1"></div>
             <div id="demoQueries" class="examples hidden">
                 <div class="examples-title">Demo Queries</div>
                 <div class="example-query" onclick="setQuery('-- Sales by region\nSELECT region, SUM(quantity * unit_price) AS revenue\nFROM sales\nGROUP BY region\nORDER BY revenue DESC')">
@@ -916,14 +1050,17 @@
             <!-- Editor Area -->
             <div class="editor-area">
                 <div class="editor-toolbar">
-                    <button id="executeBtn" onclick="onExecuteClick()" disabled>
+                    <button id="executeBtn" onclick="onExecuteClick()" disabled aria-label="Execute SQL query">
                         ▶ Execute
                     </button>
-                    <button class="btn-secondary" onclick="clearQuery()">Clear</button>
-                    <button class="btn-secondary" onclick="formatQuery()">Format</button>
-                    <div class="editor-hint">Ctrl/Cmd+Enter to run • Tab to indent • ↑ recall last query</div>
+                    <button class="btn-secondary" onclick="clearQuery()" aria-label="Clear query editor">Clear</button>
+                    <button class="btn-secondary" onclick="formatQuery()" aria-label="Format SQL query">Format</button>
+                    <button class="btn-secondary" onclick="copyQueryToClipboard()" aria-label="Copy SQL query">Copy SQL</button>
+                    <div class="editor-hint">Ctrl/Cmd+Enter to run • Ctrl/Cmd+Space autocomplete • Tab to indent • ↑ recall last query</div>
                 </div>
-                <textarea id="queryEditor" placeholder="Enter your SQL query here...
+                <div class="editor-shell">
+                    <label for="queryEditor" class="sr-only">SQL query editor</label>
+                    <textarea id="queryEditor" placeholder="Enter your SQL query here...
 Example: SELECT * FROM users WHERE age > 25
 
 Supported features:
@@ -934,12 +1071,15 @@ Supported features:
 - CASE expressions, sub-queries
 - Multi-statement (separated by ;)
 - Import: CSV, JSON, XML, Excel
-- Export: CSV, JSON, XML"></textarea>
+-- Export: CSV, JSON, XML" aria-describedby="editorHelp" aria-expanded="false"></textarea>
+                    <div id="autocompletePanel" class="autocomplete-panel hidden" role="listbox" aria-label="SQL suggestions" aria-hidden="true"></div>
+                </div>
+                <div id="editorHelp" class="sr-only">Write SQL here. Use Ctrl or Command plus Enter to execute. Use Tab to indent and the up arrow to recall the last query when the editor is empty.</div>
             </div>
 
             <!-- Results Area -->
             <div class="results-area vg-theme-dark vg-compact">
-                <div id="resultsContainer">
+                <div id="resultsContainer" aria-live="polite" aria-busy="false">
                     <div class="empty-state">
                         <div class="empty-state-icon">⚡</div>
                         <div class="empty-state-title">Ready to Query</div>

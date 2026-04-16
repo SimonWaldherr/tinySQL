@@ -3,6 +3,13 @@ let wasmReady = false;
 let currentTables = [];
 let currentResults = null;
 const HISTORY_KEY = 'tinysql_query_history_v1';
+const SQL_KEYWORDS = [
+    'SELECT', 'FROM', 'WHERE', 'JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'FULL JOIN', 'INNER JOIN', 'CROSS JOIN',
+    'ON', 'GROUP BY', 'ORDER BY', 'HAVING', 'LIMIT', 'OFFSET', 'DISTINCT', 'AS', 'AND', 'OR', 'NOT',
+    'NULL', 'IN', 'EXISTS', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'LIKE', 'INSERT', 'UPDATE', 'DELETE',
+    'CREATE TABLE', 'ALTER TABLE', 'DROP TABLE', 'UNION', 'UNION ALL', 'INTERSECT', 'EXCEPT', 'WITH',
+    'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'ROW_NUMBER', 'OVER', 'PARTITION BY', 'ASC', 'DESC', 'LIMIT'
+];
 // Safe references to WASM-exported functions (set after init)
 let wasmApi = {
     importFile: null,
@@ -21,6 +28,13 @@ const pendingClientTables = {};
 // Query history (newest first, max 50)
 const MAX_HISTORY = 50;
 let queryHistory = loadHistory();
+let autocompleteState = {
+    visible: false,
+    items: [],
+    activeIndex: 0,
+    rangeStart: 0,
+    rangeEnd: 0,
+};
 
 function loadHistory() {
     const legacyKeys = ['tinySQL_history', 'tsql_history'];
@@ -432,6 +446,9 @@ document.addEventListener('DOMContentLoaded', () => {
     initWasm();
     setupDragDrop();
     renderHistory();
+    enhanceDemoQueries();
+    setupAccessibilityShortcuts();
+    setupSqlAutocomplete();
     
     // Setup demo buttons
     const loadAllDemosBtn = document.getElementById('loadAllDemosBtn');
@@ -465,6 +482,256 @@ function setupDragDrop() {
         uploadBtn.classList.remove('dragover');
         handleFiles(e.dataTransfer.files);
     });
+}
+
+function enhanceDemoQueries() {
+    document.querySelectorAll('.example-query').forEach((item) => {
+        if (item.dataset.a11yEnhanced === 'true') {
+            return;
+        }
+        item.dataset.a11yEnhanced = 'true';
+        item.setAttribute('role', 'button');
+        item.setAttribute('tabindex', '0');
+        item.setAttribute('aria-label', `Load demo query: ${item.textContent.trim()}`);
+        item.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                item.click();
+            }
+        });
+    });
+}
+
+function setupAccessibilityShortcuts() {
+    const schemaPanel = document.getElementById('schemaPanel');
+    if (schemaPanel) {
+        schemaPanel.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape') {
+                closeSchemaPanel();
+            }
+        });
+    }
+}
+
+function setupSqlAutocomplete() {
+    const editor = document.getElementById('queryEditor');
+    const panel = document.getElementById('autocompletePanel');
+    if (!editor || !panel) {
+        return;
+    }
+
+    editor.setAttribute('aria-autocomplete', 'list');
+    editor.setAttribute('aria-controls', 'autocompletePanel');
+    editor.setAttribute('aria-haspopup', 'listbox');
+
+    const refresh = () => updateAutocompleteSuggestions();
+
+    editor.addEventListener('input', refresh);
+    editor.addEventListener('click', refresh);
+    editor.addEventListener('focus', refresh);
+    editor.addEventListener('blur', () => {
+        setTimeout(() => hideAutocompletePanel(), 150);
+    });
+
+    panel.addEventListener('mousedown', (event) => {
+        const option = event.target.closest('[data-autocomplete-index]');
+        if (!option) {
+            return;
+        }
+        event.preventDefault();
+        acceptAutocompleteSuggestion(Number(option.dataset.autocompleteIndex));
+    });
+}
+
+function getKnownTableNames() {
+    const names = new Set();
+    for (const table of currentTables) {
+        if (table && table.name) {
+            names.add(String(table.name));
+        }
+    }
+    for (const table of window._virtualTables || []) {
+        if (table && table.name) {
+            names.add(String(table.name));
+        }
+    }
+    for (const name of Object.keys(pendingClientTables)) {
+        names.add(name);
+    }
+    return [...names];
+}
+
+function getKnownColumnNames() {
+    const names = new Set();
+    for (const table of currentTables) {
+        if (!table) continue;
+        for (const column of table.columns || []) {
+            if (column) {
+                names.add(String(column));
+                names.add(`${table.name}.${column}`);
+            }
+        }
+    }
+    for (const [tableName, rows] of Object.entries(pendingClientTables)) {
+        if (!Array.isArray(rows) || rows.length === 0) continue;
+        for (const column of Object.keys(rows[0])) {
+            names.add(String(column));
+            names.add(`${tableName}.${column}`);
+        }
+    }
+    return [...names];
+}
+
+function getAutocompleteContext(editor) {
+    const cursor = editor.selectionStart ?? 0;
+    const before = editor.value.slice(0, cursor);
+    const match = before.match(/([A-Za-z0-9_.$"]+)$/);
+    const token = match ? match[1] : '';
+    return {
+        token,
+        rangeStart: cursor - token.length,
+        rangeEnd: cursor,
+    };
+}
+
+function buildAutocompleteSuggestions(token, includeAll = false) {
+    const raw = String(token || '').replace(/"/g, '').trim();
+    const items = [];
+    const addItem = (label, detail, insertText = label) => {
+        const key = `${label}||${detail}`.toLowerCase();
+        if (!items.some(item => `${item.label}||${item.detail}`.toLowerCase() === key)) {
+            items.push({ label, detail, insertText });
+        }
+    };
+
+    if (!raw) {
+        if (includeAll) {
+            for (const keyword of SQL_KEYWORDS) {
+                addItem(keyword, 'SQL keyword');
+            }
+            for (const tableName of getKnownTableNames()) {
+                addItem(tableName, 'table');
+            }
+        }
+        return items.slice(0, 20);
+    }
+
+    const upper = raw.toUpperCase();
+    const dotIndex = raw.lastIndexOf('.');
+
+    if (dotIndex > 0 && dotIndex < raw.length) {
+        const tablePrefix = raw.slice(0, dotIndex).replace(/"/g, '').trim();
+        const columnPrefix = raw.slice(dotIndex + 1).replace(/"/g, '').trim().toUpperCase();
+        for (const columnName of getKnownColumnNames()) {
+            const [tableName, column] = columnName.split('.');
+            if (tableName === tablePrefix && column && column.toUpperCase().startsWith(columnPrefix)) {
+                addItem(columnName, 'table.column');
+            }
+        }
+        return items.slice(0, 20);
+    }
+
+    for (const keyword of SQL_KEYWORDS) {
+        if (keyword.startsWith(upper)) {
+            addItem(keyword, 'SQL keyword');
+        }
+    }
+
+    for (const tableName of getKnownTableNames()) {
+        if (tableName.toUpperCase().startsWith(upper)) {
+            addItem(tableName, 'table');
+        }
+    }
+
+    for (const columnName of getKnownColumnNames()) {
+        if (columnName.toUpperCase().startsWith(upper)) {
+            addItem(columnName, columnName.includes('.') ? 'table.column' : 'column');
+        }
+    }
+
+    return items.slice(0, 20);
+}
+
+function updateAutocompleteSuggestions(includeAll = false) {
+    const editor = document.getElementById('queryEditor');
+    const panel = document.getElementById('autocompletePanel');
+    if (!editor || !panel) {
+        return;
+    }
+
+    const context = getAutocompleteContext(editor);
+    const items = buildAutocompleteSuggestions(context.token, includeAll);
+
+    autocompleteState.rangeStart = context.rangeStart;
+    autocompleteState.rangeEnd = context.rangeEnd;
+    autocompleteState.items = items;
+    autocompleteState.activeIndex = Math.min(autocompleteState.activeIndex, Math.max(items.length - 1, 0));
+
+    if (items.length === 0 || (!includeAll && context.token.length < 1)) {
+        hideAutocompletePanel();
+        return;
+    }
+
+    panel.innerHTML = items.map((item, index) => `
+        <div class="autocomplete-item${index === autocompleteState.activeIndex ? ' active' : ''}"
+             role="option"
+             aria-selected="${index === autocompleteState.activeIndex ? 'true' : 'false'}"
+             data-autocomplete-index="${index}">
+            <strong>${escapeHtml(item.label)}</strong>
+            <span>${escapeHtml(item.detail)}</span>
+        </div>
+    `).join('');
+
+    panel.classList.remove('hidden');
+    panel.setAttribute('aria-hidden', 'false');
+    autocompleteState.visible = true;
+    editor.setAttribute('aria-expanded', 'true');
+}
+
+function hideAutocompletePanel() {
+    const panel = document.getElementById('autocompletePanel');
+    const editor = document.getElementById('queryEditor');
+    if (panel) {
+        panel.classList.add('hidden');
+        panel.setAttribute('aria-hidden', 'true');
+        panel.innerHTML = '';
+    }
+    autocompleteState.visible = false;
+    autocompleteState.items = [];
+    autocompleteState.activeIndex = 0;
+    if (editor) {
+        editor.setAttribute('aria-expanded', 'false');
+    }
+}
+
+function acceptAutocompleteSuggestion(index) {
+    const editor = document.getElementById('queryEditor');
+    if (!editor || !autocompleteState.items.length) {
+        return;
+    }
+
+    const item = autocompleteState.items[index];
+    if (!item) {
+        return;
+    }
+
+    const value = editor.value;
+    const before = value.slice(0, autocompleteState.rangeStart);
+    const after = value.slice(autocompleteState.rangeEnd);
+    editor.value = `${before}${item.insertText}${after}`;
+    const nextCursor = before.length + item.insertText.length;
+    editor.selectionStart = editor.selectionEnd = nextCursor;
+    hideAutocompletePanel();
+    editor.focus();
+}
+
+function moveAutocompleteSelection(delta) {
+    if (!autocompleteState.visible || !autocompleteState.items.length) {
+        return;
+    }
+    const nextIndex = (autocompleteState.activeIndex + delta + autocompleteState.items.length) % autocompleteState.items.length;
+    autocompleteState.activeIndex = nextIndex;
+    updateAutocompleteSuggestions();
 }
 
 // Handle file upload
@@ -669,6 +936,17 @@ function sanitizeTableName(filename) {
         .toLowerCase();
 }
 
+function quoteSqlIdentifier(name) {
+    const raw = String(name || '').trim();
+    if (!raw) {
+        return '""';
+    }
+    if (raw.includes('.')) {
+        return raw.split('.').map(part => quoteSqlIdentifier(part)).join('.');
+    }
+    return `"${raw.replace(/"/g, '""')}"`;
+}
+
 // Register a table client-side so it appears in the UI even when WASM is not ready.
 function registerClientTable(tableName, rows) {
     const columns = rows.length ? Object.keys(rows[0]).map(c => String(c)) : [];
@@ -799,11 +1077,12 @@ function showTableInfo(tableName) {
 
     const panel = document.getElementById('schemaPanel');
     if (panel) {
+        panel.setAttribute('aria-hidden', 'false');
         panel.innerHTML = `
             <div class="schema-panel-header">
-                <strong>${escapeHtml(tableName)}</strong>
+                <strong id="schemaPanelTitle">${escapeHtml(tableName)}</strong>
                 ${isVirt ? '<span class="table-badge virtual">virtual</span>' : ''}
-                <button onclick="document.getElementById('schemaPanel').classList.add('hidden')" class="schema-close">✕</button>
+                <button onclick="closeSchemaPanel()" class="schema-close" aria-label="Close schema details">✕</button>
             </div>
             <div class="schema-meta">${rowInfo} rows · ${cols.length} columns</div>
             <table class="schema-table">
@@ -813,11 +1092,21 @@ function showTableInfo(tableName) {
                 </tbody>
             </table>
             <div class="schema-actions">
-                <button onclick="setQuery('SELECT * FROM ${escapeHtml(tableName)} LIMIT 100'); document.getElementById('schemaPanel').classList.add('hidden');">SELECT *</button>
+                <button onclick="setQuery('SELECT * FROM ${quoteSqlIdentifier(tableName)} LIMIT 100'); closeSchemaPanel();">SELECT *</button>
             </div>
         `;
         panel.classList.remove('hidden');
+        panel.focus();
     }
+}
+
+function closeSchemaPanel() {
+    const panel = document.getElementById('schemaPanel');
+    if (!panel) {
+        return;
+    }
+    panel.classList.add('hidden');
+    panel.setAttribute('aria-hidden', 'true');
 }
 
 // Remove table
@@ -864,21 +1153,33 @@ function getTableColumns(tableName) {
 function buildSelectWithColumns(tableName, limit) {
     const cols = getTableColumns(tableName);
     const colsPart = Array.isArray(cols) && cols.length
-        ? cols.map(c => (/[\s\-\(\)\+\/\\]/.test(c) ? `\"${c}\"` : c)).join(', ')
+        ? cols.map(c => quoteSqlIdentifier(c)).join(', ')
         : '*';
 
     const lim = (typeof limit === 'number' && limit > 0) ? ` LIMIT ${limit}` : '';
-    return `SELECT ${colsPart} FROM ${tableName}${lim}`;
+    return `SELECT ${colsPart} FROM ${quoteSqlIdentifier(tableName)}${lim}`;
 }
 
 // Set query in editor
 function setQuery(query) {
-    document.getElementById('queryEditor').value = query;
+    const editor = document.getElementById('queryEditor');
+    if (!editor) {
+        return;
+    }
+    hideAutocompletePanel();
+    editor.value = query;
+    editor.focus();
 }
 
 // Clear query
 function clearQuery() {
-    document.getElementById('queryEditor').value = '';
+    const editor = document.getElementById('queryEditor');
+    if (!editor) {
+        return;
+    }
+    hideAutocompletePanel();
+    editor.value = '';
+    editor.focus();
 }
 
 function clearAllTables() {
@@ -917,6 +1218,9 @@ function clearAllTables() {
 // Format query (basic)
 function formatQuery() {
     const editor = document.getElementById('queryEditor');
+    if (!editor) {
+        return;
+    }
     let query = editor.value.trim();
     
     // Basic SQL formatting
@@ -948,6 +1252,9 @@ async function onExecuteClick() {
     
     executeBtn.disabled = true;
     executeBtn.innerHTML = '<span class="spinner"></span> Running…';
+    if (resultsContainer) {
+        resultsContainer.setAttribute('aria-busy', 'true');
+    }
     setOpenVanillaGridEnabled(false);
     
     updateStatus('Executing query…');
@@ -1002,6 +1309,9 @@ async function onExecuteClick() {
     } finally {
         executeBtn.disabled = false;
         executeBtn.innerHTML = '▶ Execute';
+        if (resultsContainer) {
+            resultsContainer.setAttribute('aria-busy', 'false');
+        }
     }
 }
 
@@ -1034,6 +1344,7 @@ function renderResults(data) {
                 ${data.duration}
             </div>
             <div class="results-actions">
+                <button onclick="copyResultsToClipboard()">Copy Results</button>
                 <button id="openVanillaGridBtn" onclick="openInVanillaGrid()" disabled>Open in VanillaGrid</button>
                 <button onclick="doExport('csv')">Export CSV</button>
                 <button onclick="doExport('json')">Export JSON</button>
@@ -1144,7 +1455,10 @@ function loadTables() {
 
 // Update status
 function updateStatus(text) {
-    document.getElementById('statusText').textContent = text;
+    const statusText = document.getElementById('statusText');
+    if (statusText) {
+        statusText.textContent = text;
+    }
 }
 
 function setOpenVanillaGridEnabled(enabled) {
@@ -1254,8 +1568,64 @@ function downloadFile(content, filename, mimeType) {
     const a = document.createElement('a');
     a.href = url;
     a.download = filename;
+    a.style.display = 'none';
+    document.body.appendChild(a);
     a.click();
-    URL.revokeObjectURL(url);
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+async function copyTextToClipboard(text) {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(text);
+        return true;
+    }
+
+    const fallback = document.createElement('textarea');
+    fallback.value = text;
+    fallback.setAttribute('readonly', 'true');
+    fallback.style.position = 'absolute';
+    fallback.style.left = '-9999px';
+    document.body.appendChild(fallback);
+    fallback.select();
+    const ok = document.execCommand('copy');
+    fallback.remove();
+    return ok;
+}
+
+function copyQueryToClipboard() {
+    const editor = document.getElementById('queryEditor');
+    if (!editor || !editor.value.trim()) {
+        alert('No SQL query to copy');
+        return;
+    }
+
+    copyTextToClipboard(editor.value)
+        .then(() => updateStatus('SQL query copied to clipboard'))
+        .catch((error) => {
+            alert(`Copy failed: ${error.message}`);
+        });
+}
+
+function copyResultsToClipboard() {
+    if (!currentResults || !Array.isArray(currentResults.rows) || currentResults.rows.length === 0) {
+        alert('No query results to copy');
+        return;
+    }
+
+    const header = currentResults.columns.join('\t');
+    const rows = currentResults.rows.map((row) =>
+        currentResults.columns.map((column) => {
+            const value = row[column];
+            return value === null || value === undefined ? '' : String(value).replace(/\t/g, ' ').replace(/\r?\n/g, ' ');
+        }).join('\t')
+    );
+
+    copyTextToClipboard([header, ...rows].join('\n'))
+        .then(() => updateStatus('Results copied to clipboard'))
+        .catch((error) => {
+            alert(`Copy failed: ${error.message}`);
+        });
 }
 
 // Escape HTML
@@ -1336,36 +1706,71 @@ function toggleHistory() {
 // Keyboard shortcuts
 document.addEventListener('DOMContentLoaded', () => {
     const editor = document.getElementById('queryEditor');
-    if (editor) {
-        editor.addEventListener('keydown', (e) => {
-            // Ctrl/Cmd + Enter to execute
-            if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-                e.preventDefault();
-                onExecuteClick();
-            }
-            
-            // Tab for indentation
-            if (e.key === 'Tab') {
-                e.preventDefault();
-                const start = e.target.selectionStart;
-                const end = e.target.selectionEnd;
-                e.target.value = e.target.value.substring(0, start) + '  ' + e.target.value.substring(end);
-                e.target.selectionStart = e.target.selectionEnd = start + 2;
-            }
-
-            // ArrowUp in empty editor recalls last query
-            if (e.key === 'ArrowUp' && editor.value.trim() === '' && queryHistory.length > 0) {
-                e.preventDefault();
-                editor.value = queryHistory[0].sql;
-            }
-
-            // Ctrl/Cmd + Shift + F to format SQL
-            if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'F') {
-                e.preventDefault();
-                if (typeof formatSQL === 'function') {
-                    editor.value = formatSQL(editor.value);
-                }
-            }
-        });
+    if (!editor) {
+        return;
     }
+
+    editor.addEventListener('keydown', (event) => {
+        if (autocompleteState.visible && autocompleteState.items.length > 0) {
+            if (event.key === 'ArrowDown' || event.key === 'Down') {
+                event.preventDefault();
+                moveAutocompleteSelection(1);
+                return;
+            }
+            if (event.key === 'ArrowUp' || event.key === 'Up') {
+                event.preventDefault();
+                moveAutocompleteSelection(-1);
+                return;
+            }
+            if (event.key === 'Tab' || event.key === 'Enter' || event.key === 'Return') {
+                event.preventDefault();
+                acceptAutocompleteSuggestion(autocompleteState.activeIndex);
+                return;
+            }
+            if (event.key === 'Escape' || event.key === 'Esc') {
+                event.preventDefault();
+                hideAutocompletePanel();
+                return;
+            }
+        }
+
+        // Ctrl/Cmd + Enter to execute
+        if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+            event.preventDefault();
+            onExecuteClick();
+            return;
+        }
+
+        // Ctrl/Cmd + Space opens general suggestions
+        if ((event.ctrlKey || event.metaKey) && (event.key === ' ' || event.code === 'Space' || event.key.toLowerCase() === 'space')) {
+            event.preventDefault();
+            updateAutocompleteSuggestions(true);
+            return;
+        }
+
+        // Tab for indentation
+        if (event.key === 'Tab') {
+            event.preventDefault();
+            const start = event.target.selectionStart;
+            const end = event.target.selectionEnd;
+            event.target.value = event.target.value.substring(0, start) + '  ' + event.target.value.substring(end);
+            event.target.selectionStart = event.target.selectionEnd = start + 2;
+            return;
+        }
+
+        // ArrowUp in empty editor recalls last query
+        if (event.key === 'ArrowUp' && editor.value.trim() === '' && queryHistory.length > 0) {
+            event.preventDefault();
+            editor.value = queryHistory[0].sql;
+            return;
+        }
+
+        // Ctrl/Cmd + Shift + F to format SQL
+        if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key === 'F') {
+            event.preventDefault();
+            if (typeof formatQuery === 'function') {
+                formatQuery();
+            }
+        }
+    });
 });
