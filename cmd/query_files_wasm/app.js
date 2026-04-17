@@ -35,6 +35,25 @@ let autocompleteState = {
     rangeStart: 0,
     rangeEnd: 0,
 };
+let resultViewState = {
+    filterText: '',
+    sortColumn: '',
+    sortDirection: 'asc',
+};
+
+function escapeRegex(text) {
+    return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+const SQL_HIGHLIGHT_KEYWORDS = [...new Set(SQL_KEYWORDS)]
+    .sort((left, right) => right.length - left.length)
+    .map((keyword) => escapeRegex(keyword).replace(/\s+/g, '\\s+'))
+    .join('|');
+
+const SQL_HIGHLIGHT_PATTERN = new RegExp(
+    `(--[^\\n]*|\/\\*[\\s\\S]*?\\*\/|'(?:''|[^'])*'|\\b(?:${SQL_HIGHLIGHT_KEYWORDS})\\b|\\b\\d+(?:\\.\\d+)?\\b)`,
+    'gi'
+);
 
 function loadHistory() {
     const legacyKeys = ['tinySQL_history', 'tsql_history'];
@@ -401,6 +420,7 @@ async function loadDemoTable(tableName) {
                     const editor = document.getElementById('queryEditor');
                     if (suggestedQuery) {
                         editor.value = suggestedQuery;
+                        syncEditorHighlight();
                     }
                     document.getElementById('executeBtn').disabled = false;
                 } else {
@@ -416,6 +436,7 @@ async function loadDemoTable(tableName) {
             const editor = document.getElementById('queryEditor');
             if (suggestedQuery) {
                 editor.value = suggestedQuery;
+                syncEditorHighlight();
             }
             updateStatus(`Registered demo table "${tableName}" locally. Queries will run once WASM is initialized.`);
         }
@@ -436,6 +457,7 @@ async function loadAllDemos() {
     // Set a complex demo query
     const editor = document.getElementById('queryEditor');
     editor.value = `-- Large demo: revenue and fulfillment by region and carrier\nSELECT s.region,\n       l.carrier,\n       COUNT(*) AS orders,\n       SUM(s.order_total) AS total_revenue,\n       AVG(l.shipping_cost) AS avg_shipping_cost\nFROM sales_large s\nJOIN logistics_large l ON s.order_id = l.order_id\nGROUP BY s.region, l.carrier\nORDER BY total_revenue DESC`;
+    syncEditorHighlight();
     // Ensure demo queries are visible after loading all demos
     showDemoQueries();
     updateStatus('Loaded curated demos and generated large tables');
@@ -446,6 +468,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initWasm();
     setupDragDrop();
     renderHistory();
+    setupEditorSyntaxHighlighting();
     enhanceDemoQueries();
     setupAccessibilityShortcuts();
     setupSqlAutocomplete();
@@ -511,6 +534,92 @@ function setupAccessibilityShortcuts() {
             }
         });
     }
+}
+
+function setupEditorSyntaxHighlighting() {
+    const editor = document.getElementById('queryEditor');
+    const highlight = document.getElementById('sqlHighlight');
+    if (!editor || !highlight) {
+        return;
+    }
+
+    const refresh = () => syncEditorHighlight();
+    editor.addEventListener('input', refresh);
+    editor.addEventListener('scroll', refresh);
+    editor.addEventListener('keyup', refresh);
+
+    // Sync highlighting when editor is resized (e.g. drag handle)
+    if (typeof ResizeObserver !== 'undefined') {
+        new ResizeObserver(refresh).observe(editor);
+    }
+
+    // Update line/column counter on cursor changes
+    const updateLineCount = () => {
+        const counter = document.getElementById('editorLineCount');
+        if (!counter) return;
+        const pos = editor.selectionStart ?? 0;
+        const textBefore = editor.value.slice(0, pos);
+        const line = textBefore.split('\n').length;
+        const col = pos - textBefore.lastIndexOf('\n');
+        const totalLines = editor.value.split('\n').length;
+        counter.textContent = `Ln ${line}, Col ${col} \u2022 ${totalLines} line${totalLines !== 1 ? 's' : ''}`;
+    };
+    editor.addEventListener('input', updateLineCount);
+    editor.addEventListener('click', updateLineCount);
+    editor.addEventListener('keyup', updateLineCount);
+    editor.addEventListener('focus', updateLineCount);
+    updateLineCount();
+
+    refresh();
+}
+
+function syncEditorHighlight() {
+    const editor = document.getElementById('queryEditor');
+    const highlight = document.getElementById('sqlHighlight');
+    if (!editor || !highlight) {
+        return;
+    }
+
+    highlight.innerHTML = renderSqlHighlight(editor.value);
+    highlight.scrollTop = editor.scrollTop;
+    highlight.scrollLeft = editor.scrollLeft;
+}
+
+function renderSqlHighlight(text) {
+    const raw = String(text || '');
+    if (!raw) {
+        return '<span class="sql-token muted">Type SQL to see highlighting</span>';
+    }
+
+    let html = '';
+    let lastIndex = 0;
+    SQL_HIGHLIGHT_PATTERN.lastIndex = 0;
+
+    let match;
+    while ((match = SQL_HIGHLIGHT_PATTERN.exec(raw)) !== null) {
+        if (match.index > lastIndex) {
+            html += escapeHtml(raw.slice(lastIndex, match.index));
+        }
+
+        const token = match[0];
+        let className = 'keyword';
+        if (token.startsWith('--') || token.startsWith('/*')) {
+            className = 'comment';
+        } else if (token.startsWith("'")) {
+            className = 'string';
+        } else if (/^\d/.test(token)) {
+            className = 'number';
+        }
+
+        html += `<span class="sql-token ${className}">${escapeHtml(token)}</span>`;
+        lastIndex = match.index + token.length;
+    }
+
+    if (lastIndex < raw.length) {
+        html += escapeHtml(raw.slice(lastIndex));
+    }
+
+    return html.replace(/\n$/u, '\n ');
 }
 
 function setupSqlAutocomplete() {
@@ -1168,6 +1277,7 @@ function setQuery(query) {
     }
     hideAutocompletePanel();
     editor.value = query;
+    syncEditorHighlight();
     editor.focus();
 }
 
@@ -1179,6 +1289,7 @@ function clearQuery() {
     }
     hideAutocompletePanel();
     editor.value = '';
+    syncEditorHighlight();
     editor.focus();
 }
 
@@ -1198,6 +1309,11 @@ function clearAllTables() {
     }
     currentTables = [];
     currentResults = null;
+    resultViewState = {
+        filterText: '',
+        sortColumn: '',
+        sortDirection: 'asc',
+    };
     renderTables();
     const resultsContainer = document.getElementById('resultsContainer');
     if (resultsContainer) {
@@ -1226,11 +1342,12 @@ function formatQuery() {
     // Basic SQL formatting
     query = query
         .replace(/\s+/g, ' ')
-        .replace(/\b(SELECT|FROM|WHERE|JOIN|ON|ORDER BY|GROUP BY|HAVING|LIMIT)\b/gi, '\n$1')
+        .replace(/\b(SELECT|FROM|WHERE|JOIN|LEFT JOIN|RIGHT JOIN|INNER JOIN|FULL JOIN|CROSS JOIN|ON|ORDER BY|GROUP BY|HAVING|LIMIT|OFFSET|UNION|UNION ALL|INTERSECT|EXCEPT|WITH)\b/gi, '\n$1')
         .replace(/,/g, ',\n  ')
         .trim();
     
     editor.value = query;
+    syncEditorHighlight();
 }
 
 // Execute query (UI handler)
@@ -1276,6 +1393,11 @@ async function onExecuteClick() {
         if (result && typeof result === 'object' && result.success) {
             const cols = Array.isArray(result.columns) ? result.columns.map(c => String(c)) : [];
             const rows = Array.isArray(result.rows) ? result.rows : [];
+            resultViewState = {
+                filterText: '',
+                sortColumn: '',
+                sortDirection: 'asc',
+            };
             currentResults = {
                 columns: cols,
                 rows: rows,
@@ -1318,17 +1440,42 @@ async function onExecuteClick() {
 // Render query results
 function renderResults(data) {
     const resultsContainer = document.getElementById('resultsContainer');
+    if (!resultsContainer || !data || !Array.isArray(data.rows) || !Array.isArray(data.columns) || data.rowCount === 0) {
+        if (resultsContainer) {
+            window.clearVanillaGrid?.();
+            setOpenVanillaGridEnabled(false);
+            resultsContainer.innerHTML = `
+                <div class="empty-state">
+                    <div class="empty-state-icon">✓</div>
+                    <div class="empty-state-title">No Results</div>
+                    <div class="empty-state-text">
+                        Query executed successfully but returned no rows
+                        <br>Duration: ${data?.duration || '0 ms'}
+                    </div>
+                </div>
+            `;
+        }
+        return;
+    }
 
-    if (data.rowCount === 0) {
+    const visible = getVisibleResults(data);
+    const displayedRows = visible ? visible.rows : [];
+    const displayedColumns = visible ? visible.columns : [];
+    const totalRows = data.rows.length;
+
+    if (!visible || displayedRows.length === 0) {
         window.clearVanillaGrid?.();
         setOpenVanillaGridEnabled(false);
         resultsContainer.innerHTML = `
             <div class="empty-state">
-                <div class="empty-state-icon">✓</div>
-                <div class="empty-state-title">No Results</div>
+                <div class="empty-state-icon">🔎</div>
+                <div class="empty-state-title">No Matching Rows</div>
                 <div class="empty-state-text">
-                    Query executed successfully but returned no rows
-                    <br>Duration: ${data.duration}
+                    Your current filter removed all rows.
+                    <br>Duration: ${data?.duration || '0 ms'}
+                </div>
+                <div style="margin-top: 12px;">
+                    <button onclick="clearResultViewFilters()">Clear Filter</button>
                 </div>
             </div>
         `;
@@ -1339,31 +1486,61 @@ function renderResults(data) {
     const tableHtml = `
         <div class="results-header">
             <div class="results-info">
-                <strong>${data.rowCount}</strong> rows • 
-                <strong>${data.columns.length}</strong> columns • 
+                <strong>${displayedRows.length}</strong> / <strong>${totalRows}</strong> rows • 
+                <strong>${displayedColumns.length}</strong> columns • 
                 ${data.duration}
             </div>
             <div class="results-actions">
                 <button onclick="copyResultsToClipboard()">Copy Results</button>
                 <button id="openVanillaGridBtn" onclick="openInVanillaGrid()" disabled>Open in VanillaGrid</button>
                 <button onclick="doExport('csv')">Export CSV</button>
+                <button onclick="doExport('tsv')">Export TSV</button>
+                <button onclick="doExport('md')">Export Markdown</button>
                 <button onclick="doExport('json')">Export JSON</button>
                 <button onclick="doExport('xml')">Export XML</button>
             </div>
+        </div>
+        <div class="results-toolbar">
+            <label>
+                Filter
+                <input id="resultFilterInput" type="search" value="${escapeHtml(resultViewState.filterText)}" placeholder="Search rows..." oninput="updateResultViewState()">
+            </label>
+            <label>
+                Sort by
+                <select id="resultSortColumn" onchange="updateResultViewState()">
+                    <option value="">None</option>
+                    ${data.columns.map((column) => `<option value="${escapeHtml(column)}" ${resultViewState.sortColumn === column ? 'selected' : ''}>${escapeHtml(column)}</option>`).join('')}
+                </select>
+            </label>
+            <label>
+                Direction
+                <select id="resultSortDirection" onchange="updateResultViewState()">
+                    <option value="asc" ${resultViewState.sortDirection === 'asc' ? 'selected' : ''}>Ascending</option>
+                    <option value="desc" ${resultViewState.sortDirection === 'desc' ? 'selected' : ''}>Descending</option>
+                </select>
+            </label>
+            <button onclick="clearResultViewFilters()">Reset View</button>
         </div>
         <div class="result-table-wrap">
         <table class="result-table">
             <thead>
                 <tr>
                     <th class="row-num-col">#</th>
-                    ${data.columns.map(col => `<th>${escapeHtml(col)}</th>`).join('')}
+                    ${displayedColumns.map(col => `
+                        <th class="sortable-column" aria-sort="${resultViewState.sortColumn === col ? (resultViewState.sortDirection === 'asc' ? 'ascending' : 'descending') : 'none'}">
+                            <button class="column-sort-button" onclick="sortResultsBy(${JSON.stringify(col)})" title="Sort by ${escapeHtml(col)}">
+                                <span>${escapeHtml(col)}</span>
+                                <span class="column-sort-indicator">${getSortIndicator(col)}</span>
+                            </button>
+                        </th>
+                    `).join('')}
                 </tr>
             </thead>
             <tbody>
-                ${data.rows.map((row, idx) => `
-                    <tr>
+                ${displayedRows.map((row, idx) => `
+                    <tr onclick="this.classList.toggle('selected-row')">
                         <td class="row-num-col">${idx + 1}</td>
-                        ${data.columns.map(col => {
+                        ${displayedColumns.map(col => {
                             const value = row[col];
                             return formatCell(value);
                         }).join('')}
@@ -1378,7 +1555,7 @@ function renderResults(data) {
     setOpenVanillaGridEnabled(true);
 }
 
-// Format table cell
+// Format table cell with truncation for long values
 function formatCell(value) {
     if (value === null || value === undefined) {
         return '<td class="null-value">NULL</td>';
@@ -1392,7 +1569,11 @@ function formatCell(value) {
         return `<td class="boolean-value">${value}</td>`;
     }
     
-    return `<td>${escapeHtml(String(value))}</td>`;
+    const str = String(value);
+    if (str.length > 120) {
+        return `<td class="truncated-cell" title="${escapeHtml(str)}">${escapeHtml(str.slice(0, 120))}…</td>`;
+    }
+    return `<td>${escapeHtml(str)}</td>`;
 }
 
 // Show upload dialog
@@ -1453,6 +1634,29 @@ function loadTables() {
     renderTables();
 }
 
+// Toast notification system
+let _toastTimeout = null;
+function showToast(message, type = 'info') {
+    let container = document.getElementById('toastContainer');
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'toastContainer';
+        container.style.cssText = 'position:fixed;bottom:16px;right:16px;z-index:9999;display:flex;flex-direction:column;gap:8px;pointer-events:none;';
+        document.body.appendChild(container);
+    }
+    const toast = document.createElement('div');
+    const bg = type === 'error' ? '#5a1d1d' : type === 'success' ? '#1e4d2b' : '#2d2d30';
+    const border = type === 'error' ? '#f48771' : type === 'success' ? '#28a745' : '#0e639c';
+    toast.style.cssText = `background:${bg};border:1px solid ${border};color:#d4d4d4;padding:10px 16px;border-radius:6px;font-size:13px;box-shadow:0 4px 12px rgba(0,0,0,0.3);pointer-events:auto;opacity:0;transition:opacity 0.3s;max-width:400px;`;
+    toast.textContent = message;
+    container.appendChild(toast);
+    requestAnimationFrame(() => { toast.style.opacity = '1'; });
+    setTimeout(() => {
+        toast.style.opacity = '0';
+        setTimeout(() => toast.remove(), 300);
+    }, 3000);
+}
+
 // Update status
 function updateStatus(text) {
     const statusText = document.getElementById('statusText');
@@ -1469,21 +1673,143 @@ function setOpenVanillaGridEnabled(enabled) {
 }
 
 function openInVanillaGrid() {
-    if (!currentResults || !Array.isArray(currentResults.rows) || currentResults.rows.length === 0) {
+    const visible = getVisibleResults();
+    if (!visible || !Array.isArray(visible.rows) || visible.rows.length === 0) {
         alert('No results to visualize yet. Execute a query with rows first.');
         return;
     }
-    window.renderVanillaGrid?.(currentResults);
+    window.renderVanillaGrid?.(visible);
+}
+
+function getVisibleResults(source = currentResults) {
+    if (!source || !Array.isArray(source.rows) || !Array.isArray(source.columns)) {
+        return null;
+    }
+
+    let rows = source.rows.slice();
+    const filterText = resultViewState.filterText.trim().toLowerCase();
+    if (filterText) {
+        rows = rows.filter((row) => source.columns.some((column) => {
+            const value = row[column];
+            if (value === null || value === undefined) {
+                return false;
+            }
+            return String(value).toLowerCase().includes(filterText);
+        }));
+    }
+
+    if (resultViewState.sortColumn && source.columns.includes(resultViewState.sortColumn)) {
+        const column = resultViewState.sortColumn;
+        const direction = resultViewState.sortDirection === 'desc' ? -1 : 1;
+        rows.sort((leftRow, rightRow) => direction * compareResultValues(leftRow[column], rightRow[column]));
+    }
+
+    return {
+        columns: source.columns.slice(),
+        rows,
+        rowCount: rows.length,
+        duration: source.duration,
+    };
+}
+
+function compareResultValues(leftValue, rightValue) {
+    if (leftValue === rightValue) {
+        return 0;
+    }
+    if (leftValue === null || leftValue === undefined) {
+        return 1;
+    }
+    if (rightValue === null || rightValue === undefined) {
+        return -1;
+    }
+
+    const leftNumber = typeof leftValue === 'number' ? leftValue : Number(leftValue);
+    const rightNumber = typeof rightValue === 'number' ? rightValue : Number(rightValue);
+    const leftIsNumeric = Number.isFinite(leftNumber);
+    const rightIsNumeric = Number.isFinite(rightNumber);
+
+    if (leftIsNumeric && rightIsNumeric) {
+        return leftNumber - rightNumber;
+    }
+
+    const leftText = String(leftValue);
+    const rightText = String(rightValue);
+    return leftText.localeCompare(rightText, undefined, { numeric: true, sensitivity: 'base' });
+}
+
+function updateResultViewState() {
+    const filterInput = document.getElementById('resultFilterInput');
+    const sortSelect = document.getElementById('resultSortColumn');
+    const sortDirection = document.getElementById('resultSortDirection');
+    const keepFilterFocus = document.activeElement && document.activeElement.id === 'resultFilterInput';
+    const selectionStart = keepFilterFocus && typeof filterInput?.selectionStart === 'number' ? filterInput.selectionStart : null;
+    const selectionEnd = keepFilterFocus && typeof filterInput?.selectionEnd === 'number' ? filterInput.selectionEnd : null;
+
+    if (filterInput) {
+        resultViewState.filterText = filterInput.value;
+    }
+    if (sortSelect) {
+        resultViewState.sortColumn = sortSelect.value;
+    }
+    if (sortDirection) {
+        resultViewState.sortDirection = sortDirection.value;
+    }
+
+    if (currentResults) {
+        renderResults(currentResults);
+        if (keepFilterFocus) {
+            const refreshedFilter = document.getElementById('resultFilterInput');
+            if (refreshedFilter) {
+                refreshedFilter.focus();
+                if (selectionStart !== null && selectionEnd !== null && typeof refreshedFilter.setSelectionRange === 'function') {
+                    refreshedFilter.setSelectionRange(selectionStart, selectionEnd);
+                }
+            }
+        }
+    }
+}
+
+function clearResultViewFilters() {
+    resultViewState.filterText = '';
+    resultViewState.sortColumn = '';
+    resultViewState.sortDirection = 'asc';
+    if (currentResults) {
+        renderResults(currentResults);
+    }
+}
+
+function sortResultsBy(column) {
+    if (!currentResults || !Array.isArray(currentResults.columns) || !currentResults.columns.includes(column)) {
+        return;
+    }
+
+    if (resultViewState.sortColumn === column) {
+        resultViewState.sortDirection = resultViewState.sortDirection === 'asc' ? 'desc' : 'asc';
+    } else {
+        resultViewState.sortColumn = column;
+        resultViewState.sortDirection = 'asc';
+    }
+
+    renderResults(currentResults);
+}
+
+function getSortIndicator(column) {
+    if (resultViewState.sortColumn !== column) {
+        return '';
+    }
+    return resultViewState.sortDirection === 'asc' ? '▲' : '▼';
 }
 
 // Unified export dispatcher – tries WASM-side first, falls back to client-side
 function doExport(format) {
-    if (!currentResults || !currentResults.rows || currentResults.rows.length === 0) {
+    const visible = getVisibleResults();
+    if (!visible || !visible.rows || visible.rows.length === 0) {
         alert('No results to export');
         return;
     }
+    const viewIsRaw = !resultViewState.filterText.trim() && !resultViewState.sortColumn;
     // Try WASM-side exporter
-    if (typeof wasmApi.exportResults === 'function') {
+    if (viewIsRaw && typeof wasmApi.exportResults === 'function') {
         try {
             const res = wasmApi.exportResults(format);
             if (res && res.success && res.data) {
@@ -1497,23 +1823,25 @@ function doExport(format) {
         } catch (_) { /* fall through */ }
     }
     // Client-side fallback
-    if (format === 'csv') exportCSV();
-    else if (format === 'json') exportJSON();
-    else if (format === 'xml') exportXML();
+    if (format === 'csv') exportCSV(visible);
+    else if (format === 'tsv') exportTSV(visible);
+    else if (format === 'md') exportMarkdown(visible);
+    else if (format === 'json') exportJSON(visible);
+    else if (format === 'xml') exportXML(visible);
     else alert('Unsupported export format: ' + format);
 }
 
 // Export to CSV
-function exportCSV() {
-    if (!currentResults || !currentResults.rows || currentResults.rows.length === 0) {
+function exportCSV(visible = getVisibleResults()) {
+    if (!visible || !visible.rows || visible.rows.length === 0) {
         alert('No results to export');
         return;
     }
     
-    let csv = currentResults.columns.join(',') + '\n';
+    let csv = visible.columns.join(',') + '\n';
     
-    currentResults.rows.forEach(row => {
-        const values = currentResults.columns.map(col => {
+    visible.rows.forEach(row => {
+        const values = visible.columns.map(col => {
             let value = row[col];
             if (value === null || value === undefined) {
                 return '';
@@ -1530,27 +1858,61 @@ function exportCSV() {
     downloadFile(csv, 'query_results.csv', 'text/csv');
 }
 
+function exportTSV(visible = getVisibleResults()) {
+    if (!visible || !visible.rows || visible.rows.length === 0) {
+        alert('No results to export');
+        return;
+    }
+
+    const escapeTsv = (value) => {
+        if (value === null || value === undefined) {
+            return '';
+        }
+        return String(value).replace(/\t/g, ' ').replace(/\r?\n/g, ' ');
+    };
+
+    const lines = [visible.columns.join('\t')];
+    visible.rows.forEach((row) => {
+        lines.push(visible.columns.map((column) => escapeTsv(row[column])).join('\t'));
+    });
+
+    downloadFile(lines.join('\n'), 'query_results.tsv', 'text/tab-separated-values');
+}
+
+function exportMarkdown(visible = getVisibleResults()) {
+    if (!visible || !visible.rows || visible.rows.length === 0) {
+        alert('No results to export');
+        return;
+    }
+
+    const escapeMd = (value) => String(value ?? '').replace(/\|/g, '\\|').replace(/\n/g, ' ');
+    const header = `| ${visible.columns.map(escapeMd).join(' | ')} |`;
+    const separator = `| ${visible.columns.map(() => '---').join(' | ')} |`;
+    const body = visible.rows.map((row) => `| ${visible.columns.map((column) => escapeMd(row[column])).join(' | ')} |`);
+    downloadFile([header, separator, ...body].join('\n'), 'query_results.md', 'text/markdown');
+}
+
 // Export to JSON
-function exportJSON() {
-    if (!currentResults || !currentResults.rows || currentResults.rows.length === 0) {
+function exportJSON(visible = getVisibleResults()) {
+    if (!visible || !visible.rows || visible.rows.length === 0) {
         alert('No results to export');
         return;
     }
     
-    const json = JSON.stringify(currentResults.rows, null, 2);
+    const json = JSON.stringify(visible.rows, null, 2);
     downloadFile(json, 'query_results.json', 'application/json');
 }
 
 // Export to XML (client-side fallback)
-function exportXML() {
-    if (!currentResults || !currentResults.rows || currentResults.rows.length === 0) {
+function exportXML(visible = getVisibleResults()) {
+    if (!visible || !visible.rows || visible.rows.length === 0) {
         alert('No results to export');
         return;
     }
     let xml = '<?xml version="1.0" encoding="UTF-8"?>\n<results>\n';
-    currentResults.rows.forEach(row => {
+    visible.rows.forEach(row => {
         xml += '  <row>\n';
-        currentResults.columns.forEach(col => {
+        visible.columns.forEach(col => {
             const val = row[col];
             const tag = toXmlTag(col);
             xml += `    <${tag}>${escapeXml(val == null ? '' : String(val))}</${tag}>\n`;
@@ -1601,38 +1963,117 @@ function copyQueryToClipboard() {
     }
 
     copyTextToClipboard(editor.value)
-        .then(() => updateStatus('SQL query copied to clipboard'))
+        .then(() => {
+            updateStatus('SQL query copied to clipboard');
+            showToast('SQL query copied to clipboard', 'success');
+        })
         .catch((error) => {
-            alert(`Copy failed: ${error.message}`);
+            showToast(`Copy failed: ${error.message}`, 'error');
         });
 }
 
 function copyResultsToClipboard() {
-    if (!currentResults || !Array.isArray(currentResults.rows) || currentResults.rows.length === 0) {
+    const visible = getVisibleResults();
+    if (!visible || !Array.isArray(visible.rows) || visible.rows.length === 0) {
         alert('No query results to copy');
         return;
     }
 
-    const header = currentResults.columns.join('\t');
-    const rows = currentResults.rows.map((row) =>
-        currentResults.columns.map((column) => {
+    const header = visible.columns.join('\t');
+    const rows = visible.rows.map((row) =>
+        visible.columns.map((column) => {
             const value = row[column];
             return value === null || value === undefined ? '' : String(value).replace(/\t/g, ' ').replace(/\r?\n/g, ' ');
         }).join('\t')
     );
 
     copyTextToClipboard([header, ...rows].join('\n'))
-        .then(() => updateStatus('Results copied to clipboard'))
+        .then(() => {
+            updateStatus('Results copied to clipboard');
+            showToast('Results copied to clipboard', 'success');
+        })
         .catch((error) => {
-            alert(`Copy failed: ${error.message}`);
+            showToast(`Copy failed: ${error.message}`, 'error');
         });
 }
 
-// Escape HTML
+function detectClipboardImportFormat(text) {
+    const trimmed = String(text || '').trim();
+    if (!trimmed) {
+        return 'csv';
+    }
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        return 'json';
+    }
+
+    const lines = trimmed.split(/\r?\n/).filter(Boolean);
+    if (lines.length > 1 && lines.every((line) => line.trim().startsWith('{') && line.trim().endsWith('}'))) {
+        return 'jsonl';
+    }
+
+    const sample = lines.slice(0, 5).join('\n');
+    const tabCount = (sample.match(/\t/g) || []).length;
+    const commaCount = (sample.match(/,/g) || []).length;
+    return tabCount > commaCount ? 'tsv' : 'csv';
+}
+
+async function importClipboardData() {
+    let text = '';
+    try {
+        if (navigator.clipboard && typeof navigator.clipboard.readText === 'function') {
+            text = await navigator.clipboard.readText();
+        }
+    } catch (_) {
+        // Fall back to prompt below.
+    }
+
+    if (!text || !text.trim()) {
+        text = prompt('Paste CSV, TSV, JSON, or JSONL data to import:');
+        if (text === null) {
+            return;
+        }
+    }
+
+    const format = detectClipboardImportFormat(text);
+    const defaultTableName = `clipboard_${format}`;
+    const tableNameInput = prompt('Table name for imported clipboard data:', defaultTableName);
+    if (tableNameInput === null) {
+        return;
+    }
+
+    const tableName = sanitizeTableName(tableNameInput) || defaultTableName;
+    const ext = format === 'json' ? '.json' : format === 'jsonl' ? '.jsonl' : format === 'tsv' ? '.tsv' : '.csv';
+
+    if (!wasmReady || typeof wasmApi.importFile !== 'function') {
+        alert('WASM import is not ready yet');
+        return;
+    }
+
+    updateStatus(`Importing clipboard data into ${tableName}...`);
+    const result = wasmApi.importFile(`${tableName}${ext}`, text, tableName);
+    if (result && result.success) {
+        loadTables();
+        const editor = document.getElementById('queryEditor');
+        if (editor && !editor.value.trim()) {
+            editor.value = `SELECT * FROM ${quoteSqlIdentifier(tableName)} LIMIT 10`;
+            syncEditorHighlight();
+        }
+        updateStatus(`Imported clipboard data into "${tableName}" (${result.rowsImported} rows)`);
+        return;
+    }
+
+    alert(`Clipboard import failed: ${result?.error || 'Unknown error'}`);
+    updateStatus('Clipboard import failed');
+}
+
+// Escape HTML – static map avoids creating DOM nodes on every call
 function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
 // Escape XML special chars
@@ -1687,6 +2128,7 @@ function recallHistory(idx) {
     const h = queryHistory[idx];
     if (h) {
         document.getElementById('queryEditor').value = h.sql;
+        syncEditorHighlight();
     }
 }
 
@@ -1709,6 +2151,20 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!editor) {
         return;
     }
+
+    // Sidebar toggle for mobile
+    window.toggleSidebar = function () {
+        const sidebar = document.querySelector('.sidebar');
+        if (sidebar) sidebar.classList.toggle('open');
+    };
+    // Close sidebar on click outside (mobile)
+    document.addEventListener('click', (e) => {
+        const sidebar = document.querySelector('.sidebar');
+        const toggle = document.querySelector('.sidebar-toggle');
+        if (sidebar && sidebar.classList.contains('open') && !sidebar.contains(e.target) && e.target !== toggle) {
+            sidebar.classList.remove('open');
+        }
+    });
 
     editor.addEventListener('keydown', (event) => {
         if (autocompleteState.visible && autocompleteState.items.length > 0) {
@@ -1748,20 +2204,54 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        // Tab for indentation
+        // Tab / Shift+Tab for indentation
         if (event.key === 'Tab') {
             event.preventDefault();
             const start = event.target.selectionStart;
             const end = event.target.selectionEnd;
-            event.target.value = event.target.value.substring(0, start) + '  ' + event.target.value.substring(end);
-            event.target.selectionStart = event.target.selectionEnd = start + 2;
+            if (event.shiftKey) {
+                // Unindent: remove up to 2 leading spaces on each selected line
+                const before = event.target.value.substring(0, start);
+                const selected = event.target.value.substring(start, end);
+                const after = event.target.value.substring(end);
+                const lineStart = before.lastIndexOf('\n') + 1;
+                const block = event.target.value.substring(lineStart, end);
+                const unindented = block.replace(/^( {1,2})/gm, '');
+                const diff = block.length - unindented.length;
+                event.target.value = event.target.value.substring(0, lineStart) + unindented + after;
+                event.target.selectionStart = Math.max(lineStart, start - Math.min(2, before.length - lineStart));
+                event.target.selectionEnd = end - diff;
+            } else {
+                event.target.value = event.target.value.substring(0, start) + '  ' + event.target.value.substring(end);
+                event.target.selectionStart = event.target.selectionEnd = start + 2;
+            }
+            syncEditorHighlight();
             return;
+        }
+
+        // Auto-close brackets and quotes
+        const AUTO_PAIRS = { '(': ')', "'": "'", '"': '"' };
+        if (AUTO_PAIRS[event.key] && !event.ctrlKey && !event.metaKey) {
+            const start = event.target.selectionStart;
+            const end = event.target.selectionEnd;
+            const selected = event.target.value.substring(start, end);
+            if (selected.length > 0) {
+                // Wrap selection
+                event.preventDefault();
+                const wrapped = event.key + selected + AUTO_PAIRS[event.key];
+                event.target.value = event.target.value.substring(0, start) + wrapped + event.target.value.substring(end);
+                event.target.selectionStart = start + 1;
+                event.target.selectionEnd = end + 1;
+                syncEditorHighlight();
+                return;
+            }
         }
 
         // ArrowUp in empty editor recalls last query
         if (event.key === 'ArrowUp' && editor.value.trim() === '' && queryHistory.length > 0) {
             event.preventDefault();
             editor.value = queryHistory[0].sql;
+            syncEditorHighlight();
             return;
         }
 

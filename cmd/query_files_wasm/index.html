@@ -220,11 +220,60 @@
         /* Sidebar */
         .sidebar {
             width: 280px;
+            min-width: 200px;
             background: #252526;
             border-right: 1px solid #3e3e42;
             display: flex;
             flex-direction: column;
             overflow-y: auto;
+            transition: width 0.2s;
+        }
+
+        .sidebar-toggle {
+            display: none;
+            position: fixed;
+            left: 8px;
+            bottom: 8px;
+            z-index: 1000;
+            background: #0e639c;
+            border: none;
+            color: #fff;
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            font-size: 18px;
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+        }
+
+        @media (max-width: 768px) {
+            .sidebar {
+                position: fixed;
+                left: 0;
+                top: 0;
+                bottom: 0;
+                z-index: 500;
+                transform: translateX(-100%);
+                transition: transform 0.25s;
+                box-shadow: 4px 0 20px rgba(0,0,0,0.5);
+            }
+            .sidebar.open {
+                transform: translateX(0);
+            }
+            .sidebar-toggle {
+                display: block;
+            }
+            .topbar {
+                flex-wrap: wrap;
+                gap: 8px;
+            }
+            .editor-hint {
+                display: none;
+            }
+            .results-actions {
+                flex-direction: column;
+                align-items: stretch;
+            }
         }
 
         .sidebar-header {
@@ -382,6 +431,56 @@
 
         .editor-shell {
             position: relative;
+            display: block;
+        }
+
+        .editor-line-count {
+            position: absolute;
+            bottom: 4px;
+            right: 10px;
+            z-index: 2;
+            font-size: 11px;
+            color: #666;
+            pointer-events: none;
+            user-select: none;
+        }
+
+        .sql-highlighter {
+            position: absolute;
+            inset: 0;
+            margin: 0;
+            padding: 12px;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            background: #2d2d30;
+            color: #d4d4d4;
+            font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+            font-size: 14px;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            word-break: break-word;
+            overflow: hidden;
+            pointer-events: none;
+            user-select: none;
+        }
+
+        .sql-token.keyword { color: #c586c0; }
+        .sql-token.string { color: #ce9178; }
+        .sql-token.comment { color: #6a9955; }
+        .sql-token.number { color: #b5cea8; }
+        .sql-token.muted { color: #7a7a7a; }
+
+        #queryEditor {
+            position: relative;
+            z-index: 1;
+            background: transparent;
+            color: transparent;
+            caret-color: #d4d4d4;
+            resize: vertical;
+        }
+
+        #queryEditor::placeholder {
+            color: #8a8a8a;
         }
 
         .autocomplete-panel {
@@ -453,6 +552,7 @@
         textarea:focus {
             outline: none;
             border-color: #0e639c;
+            box-shadow: 0 0 0 1px #0e639c;
         }
 
         /* Results Area */
@@ -480,6 +580,55 @@
         .results-actions {
             display: flex;
             gap: 8px;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+        }
+
+        .results-toolbar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 12px;
+            align-items: center;
+        }
+
+        .results-toolbar label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            color: #999;
+        }
+
+        .results-toolbar input,
+        .results-toolbar select {
+            background: #2d2d30;
+            border: 1px solid #3e3e42;
+            color: #d4d4d4;
+            border-radius: 4px;
+            padding: 6px 8px;
+            font-size: 12px;
+            min-width: 150px;
+        }
+
+        .results-toolbar input:focus,
+        .results-toolbar select:focus {
+            border-color: #0e639c;
+            outline: none;
+        }
+
+        .results-toolbar button {
+            background: #3e3e42;
+            border: none;
+            color: #ccc;
+            padding: 6px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+
+        .results-toolbar button:hover {
+            background: #505050;
         }
 
         .results-actions button {
@@ -526,6 +675,40 @@
             z-index: 10;
         }
 
+        .sortable-column {
+            padding: 0;
+        }
+
+        .column-sort-button {
+            width: 100%;
+            background: transparent;
+            border: none;
+            color: inherit;
+            padding: 12px;
+            text-align: left;
+            font: inherit;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+
+        .column-sort-button:hover {
+            background: #37373d;
+        }
+
+        .column-sort-button:focus-visible {
+            outline: 2px solid #9cdcfe;
+            outline-offset: -2px;
+        }
+
+        .column-sort-indicator {
+            color: #9cdcfe;
+            font-size: 11px;
+            flex: 0 0 auto;
+        }
+
         .result-table td {
             padding: 10px 12px;
             border-bottom: 1px solid #3e3e42;
@@ -537,18 +720,50 @@
             background: #2a2d2e;
         }
 
+        .result-table tbody tr:nth-child(even) {
+            background: #262627;
+        }
+
+        .result-table tbody tr:nth-child(even):hover {
+            background: #2a2d2e;
+        }
+
         .result-table td.null-value {
-            color: #888;
+            color: #666;
             font-style: italic;
+            background: repeating-linear-gradient(135deg, transparent, transparent 3px, rgba(255,255,255,0.02) 3px, rgba(255,255,255,0.02) 6px);
         }
 
         .result-table td.number-value {
             font-family: 'Consolas', monospace;
             color: #b5cea8;
+            text-align: right;
         }
 
         .result-table td.boolean-value {
             color: #569cd6;
+        }
+
+        .result-table td.truncated-cell {
+            max-width: 300px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            cursor: help;
+        }
+
+        .result-table td.truncated-cell:hover {
+            white-space: normal;
+            word-break: break-all;
+            max-width: none;
+        }
+
+        .result-table tr.selected-row {
+            background: #264f78 !important;
+        }
+
+        .result-table tr.selected-row td {
+            color: #fff;
         }
 
         /* Error/Empty States */
@@ -750,6 +965,11 @@
             overflow: auto;
             max-height: 60vh;
             border-radius: 4px;
+            border: 1px solid #3e3e42;
+        }
+
+        .result-table-wrap:focus-within {
+            border-color: #0e639c;
         }
 
         /* History panel */
@@ -963,6 +1183,7 @@
     <div class="topbar">
         <h1>TinySQL Editor</h1>
         <button onclick="showUploadDialog()" aria-label="Upload file">📁 Upload File</button>
+        <button onclick="importClipboardData()" aria-label="Import data from clipboard">📋 Import Clipboard</button>
         <button id="loadAllDemosBtn" style="background: #7d2d7d;" aria-label="Load demo data and large tables">✨ Load Demo + Large Tables</button>
         <button onclick="toggleHistory()" style="background: #3e3e42;" aria-label="Toggle query history">📜 History</button>
         <div class="spacer"></div>
@@ -974,6 +1195,8 @@
 
     <!-- Main Layout -->
     <div class="main">
+        <!-- Sidebar toggle for mobile -->
+        <button class="sidebar-toggle" onclick="toggleSidebar()" aria-label="Toggle sidebar">☰</button>
         <!-- Sidebar -->
         <div class="sidebar">
             <div class="sidebar-header">
@@ -987,9 +1210,9 @@
                 <label class="upload-btn" for="fileInput">
                     📤 Upload File
                 </label>
-                <input type="file" id="fileInput" accept=".csv,.json,.xml,.xlsx,.xls" multiple onchange="handleFileUpload(event)" aria-describedby="uploadHelp">
+                <input type="file" id="fileInput" accept=".csv,.tsv,.txt,.json,.jsonl,.ndjson,.xml,.xlsx,.xls" multiple onchange="handleFileUpload(event)" aria-describedby="uploadHelp">
                 <div id="uploadHelp" style="font-size: 11px; color: #888; margin-top: 8px; padding: 0 4px;">
-                    Supports: CSV, JSON, XML, Excel (.xlsx, .xls)
+                    Supports: CSV, TSV, TXT, JSON, JSONL/NDJSON, XML
                 </div>
             </div>
             <div class="table-list" id="tableList">
@@ -1059,6 +1282,7 @@
                     <div class="editor-hint">Ctrl/Cmd+Enter to run • Ctrl/Cmd+Space autocomplete • Tab to indent • ↑ recall last query</div>
                 </div>
                 <div class="editor-shell">
+                    <pre id="sqlHighlight" class="sql-highlighter" aria-hidden="true"></pre>
                     <label for="queryEditor" class="sr-only">SQL query editor</label>
                     <textarea id="queryEditor" placeholder="Enter your SQL query here...
 Example: SELECT * FROM users WHERE age > 25
@@ -1073,6 +1297,7 @@ Supported features:
 - Import: CSV, JSON, XML, Excel
 -- Export: CSV, JSON, XML" aria-describedby="editorHelp" aria-expanded="false"></textarea>
                     <div id="autocompletePanel" class="autocomplete-panel hidden" role="listbox" aria-label="SQL suggestions" aria-hidden="true"></div>
+                    <div id="editorLineCount" class="editor-line-count"></div>
                 </div>
                 <div id="editorHelp" class="sr-only">Write SQL here. Use Ctrl or Command plus Enter to execute. Use Tab to indent and the up arrow to recall the last query when the editor is empty.</div>
             </div>
