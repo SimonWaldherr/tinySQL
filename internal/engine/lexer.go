@@ -218,15 +218,24 @@ func (lx *lexer) tokenizeSymbol(start int) token {
 }
 
 func upper(s string) string {
-	out := make([]rune, 0, len(s))
-	for _, r := range s {
-		if 'a' <= r && r <= 'z' {
-			out = append(out, r-32)
-		} else {
-			out = append(out, r)
+	// fast path: skip allocation if no lowercase ASCII present
+	hasLower := false
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 'a' && s[i] <= 'z' {
+			hasLower = true
+			break
 		}
 	}
-	return string(out)
+	if !hasLower {
+		return s
+	}
+	b := []byte(s)
+	for i, c := range b {
+		if c >= 'a' && c <= 'z' {
+			b[i] = c - 32
+		}
+	}
+	return string(b)
 }
 
 func isKeyword(up string) bool {

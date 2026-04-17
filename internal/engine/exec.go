@@ -283,7 +283,9 @@ func executeAlterTable(env ExecEnv, s *AlterTable) (*ResultSet, error) {
 		}
 
 		// Update the table
-		env.db.Put(env.tenant, t)
+		if err := env.db.Put(env.tenant, t); err != nil {
+			return nil, fmt.Errorf("alter table: %w", err)
+		}
 	}
 
 	return nil, nil
@@ -384,15 +386,12 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 		setIdx[i] = ex
 	}
 	n := 0
+	tablePrefix := strings.ToLower(s.Table) + "."
 	for ri, r := range t.Rows {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
 		}
-		row := Row{}
-		for i, c := range t.Cols {
-			putVal(row, c.Name, r[i])
-			putVal(row, s.Table+"."+c.Name, r[i])
-		}
+		row := buildTableRow(t.Cols, tablePrefix, r)
 		ok := true
 		if s.Where != nil {
 			v, err := evalExpr(env, s.Where, row)
@@ -428,28 +427,29 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	if err != nil {
 		return nil, err
 	}
-	var kept [][]any
+	if s.Where == nil {
+		del := len(t.Rows)
+		if del > 0 {
+			t.Rows = nil
+			t.Version++
+			t.MarkDirtyFrom(-1) // DELETE is non-append; force full-table WAL
+		}
+		return &ResultSet{Cols: []string{"deleted"}, Rows: []Row{{"deleted": del}}}, nil
+	}
+
+	kept := make([][]any, 0, len(t.Rows))
 	del := 0
+	tablePrefix := strings.ToLower(s.Table) + "."
 	for _, r := range t.Rows {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
 		}
-		row := Row{}
-		for i, c := range t.Cols {
-			putVal(row, c.Name, r[i])
-			putVal(row, s.Table+"."+c.Name, r[i])
+		row := buildTableRow(t.Cols, tablePrefix, r)
+		v, err := evalExpr(env, s.Where, row)
+		if err != nil {
+			return nil, err
 		}
-		keep := true
-		if s.Where != nil {
-			v, err := evalExpr(env, s.Where, row)
-			if err != nil {
-				return nil, err
-			}
-			if toTri(v) == tvTrue {
-				keep = false
-			}
-		}
-		if keep {
+		if toTri(v) != tvTrue {
 			kept = append(kept, r)
 		} else {
 			del++
@@ -461,6 +461,17 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 		t.MarkDirtyFrom(-1) // DELETE is non-append; force full-table WAL
 	}
 	return &ResultSet{Cols: []string{"deleted"}, Rows: []Row{{"deleted": del}}}, nil
+}
+
+func buildTableRow(cols []storage.Column, tablePrefix string, values []any) Row {
+	row := make(Row, len(cols)*2)
+	for i, c := range cols {
+		key := strings.ToLower(c.Name)
+		val := values[i]
+		row[key] = val
+		row[tablePrefix+key] = val
+	}
+	return row
 }
 
 // resolveFromClause resolves the FROM clause of a SELECT statement and returns the initial rows.
@@ -1087,7 +1098,7 @@ func processJoins(env ExecEnv, joins []JoinClause, cur []Row) ([]Row, error) {
 
 func processInnerJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) ([]Row, error) {
 	// Use hash join optimization for large datasets
-	if len(leftRows) > 50 || len(rightRows) > 50 {
+	if len(leftRows) > 500 || len(rightRows) > 500 {
 		optimizer := &HashJoinOptimizer{env: env}
 		return optimizer.ProcessOptimizedJoin(leftRows, rightRows, onCondition, OptimizedJoinTypeInner)
 	}
@@ -1118,7 +1129,7 @@ func processInnerJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) 
 
 func processLeftJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr, rightAlias string, rightTable *storage.Table) ([]Row, error) {
 	// Use hash join optimization for large datasets
-	if len(leftRows) > 50 || len(rightRows) > 50 {
+	if len(leftRows) > 500 || len(rightRows) > 500 {
 		optimizer := &HashJoinOptimizer{env: env}
 		result, err := optimizer.ProcessOptimizedJoin(leftRows, rightRows, onCondition, OptimizedJoinTypeLeft)
 		if err != nil {
@@ -2870,15 +2881,21 @@ func parseTimeValue(val any) (time.Time, error) {
 	case time.Time:
 		return v, nil
 	case string:
-		// Try various time formats
-		formats := []string{
-			time.RFC3339,
-			"2006-01-02 15:04:05",
-			"2006-01-02T15:04:05",
-			"2006-01-02 15:04",
-			"2006-01-02",
-			"15:04:05",
-			"15:04",
+		// Select candidate formats by string length to avoid trying all formats on every call.
+		var formats []string
+		switch len(v) {
+		case 5: // "15:04"
+			formats = []string{"15:04"}
+		case 8: // "15:04:05"
+			formats = []string{"15:04:05"}
+		case 10: // "2006-01-02"
+			formats = []string{"2006-01-02"}
+		case 16: // "2006-01-02 15:04"
+			formats = []string{"2006-01-02 15:04"}
+		case 19: // "2006-01-02 15:04:05" or "2006-01-02T15:04:05"
+			formats = []string{"2006-01-02 15:04:05", "2006-01-02T15:04:05"}
+		default: // RFC3339 with timezone and other variants
+			formats = []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02T15:04:05", "2006-01-02 15:04", "2006-01-02", "15:04:05", "15:04"}
 		}
 
 		for _, format := range formats {
@@ -5832,14 +5849,15 @@ func columnsFromRows(rows []Row) []string {
 	if len(rows) == 0 {
 		return nil
 	}
-	seen := make(map[string]bool, len(rows[0]))
+	seen := make(map[string]struct{})
 	cols := make([]string, 0, len(rows[0]))
-	for _, r := range rows {
-		for k := range r {
-			if !seen[k] {
-				seen[k] = true
-				cols = append(cols, k)
+	for _, row := range rows {
+		for k := range row {
+			if _, ok := seen[k]; ok {
+				continue
 			}
+			seen[k] = struct{}{}
+			cols = append(cols, k)
 		}
 	}
 	sort.Strings(cols)
