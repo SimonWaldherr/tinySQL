@@ -133,8 +133,8 @@ Parameters:
 
 ## SQLite Feature Gaps
 
-TinySQL implements a broad SQL dialect but intentionally omits several SQLite
-features. The table below summarises the current status:
+TinySQL implements a broad SQL dialect. The table below summarises the current
+status relative to SQLite.
 
 ### Already supported in tinySQL
 
@@ -143,73 +143,101 @@ features. The table below summarises the current status:
 | SELECT / INSERT / UPDATE / DELETE | Full DML |
 | INNER / LEFT / RIGHT / FULL OUTER / CROSS JOIN | All standard join types |
 | GROUP BY, HAVING, ORDER BY, LIMIT / OFFSET | |
-| Subqueries and CTEs (`WITH`) | Non-recursive |
-| Window functions (`OVER`, `PARTITION BY`, frame specs) | ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, … |
-| Aggregates | COUNT, SUM, AVG, MIN, MAX, MIN_BY, MAX_BY, … |
-| JSON functions | `json_extract`, `json_set`, `json_array`, … |
+| Subqueries and CTEs (`WITH`) | Including `WITH RECURSIVE` |
+| Window functions (`OVER`, `PARTITION BY`, frame specs) | ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE, LAST_VALUE, MOVING_SUM, MOVING_AVG |
+| Aggregates | COUNT, SUM, AVG, MIN, MAX, MIN_BY, MAX_BY, VEC_AVG, … |
+| JSON functions | `json_extract`, `json_set`, `json_array`, `json_object`, … |
+| YAML functions | `YAML_PARSE`, `YAML_GET` |
+| URL functions | `URL_PARSE`, `URL_ENCODE`, `URL_DECODE` |
+| Hash functions | `HASH(algo, text)` — md5/sha1/sha256/sha512/fnv |
+| Bitmap functions | `BITMAP_NEW/SET/GET/COUNT/OR/AND` |
 | String / math / date functions | Extensive built-in library |
-| Views (`CREATE VIEW`) | |
-| Indexes (`CREATE INDEX`) | Parsed; currently a no-op at storage level |
+| Views (`CREATE VIEW`) | Stored and queryable |
+| Indexes (`CREATE INDEX`) | Metadata stored; query planner no-op |
+| **Full-Text Search (FTS)** | `CREATE VIRTUAL TABLE t USING fts(col1, col2)` with `FTS_MATCH`, `FTS_RANK`, `FTS_SNIPPET`, `BM25` |
+| **Triggers** | `CREATE TRIGGER … BEFORE/AFTER INSERT/UPDATE/DELETE ON table FOR EACH ROW BEGIN … END` |
 | MVCC + WAL | Snapshot isolation, crash-safe write-ahead log |
 | Multi-tenancy | Isolated namespaces inside one process |
 | Job scheduler | `CREATE JOB` for periodic or one-shot SQL |
-| Vector search | `VEC_SEARCH(table, col, query_vec, k)` TVF with cosine/L2/dot/manhattan |
+| Vector search | `VEC_SEARCH` / `VEC_TOP_K` TVFs with cosine/L2/dot/manhattan; `VEC_AVG` aggregate |
 | Regex functions | `REGEXP_MATCH`, `REGEXP_EXTRACT`, `REGEXP_REPLACE` |
-| Virtual system tables | `SELECT * FROM sys.tables`, `sys.columns`, … |
+| Virtual system tables | `SELECT * FROM sys.tables`, `sys.columns`, `sys.triggers`, … |
 | Table-valued functions | Extensible via `RegisterExternalTableFunc` |
+| Data types | INT, FLOAT, TEXT, BOOL, DATE, TIMESTAMP, UUID, BLOB, JSON, JSONB, VECTOR, YAML, URL, HASH, BITMAP, GEOMETRY, DECIMAL, MONEY, … |
+
+### Full-Text Search quick start
+
+```sql
+-- Create a virtual FTS table (inverted index maintained automatically)
+CREATE VIRTUAL TABLE docs USING fts(title, body);
+
+-- Insert documents
+INSERT INTO docs VALUES ('Getting Started', 'A guide to tinySQL queries');
+INSERT INTO docs VALUES ('Advanced Joins', 'Window functions and recursive CTEs');
+
+-- Boolean match
+SELECT title FROM docs WHERE FTS_MATCH(body, 'tinySQL') = 1;
+
+-- BM25-ranked search
+SELECT title, FTS_RANK(body, 'guide queries') AS score
+FROM docs
+ORDER BY score DESC;
+
+-- Highlighted snippet
+SELECT FTS_SNIPPET(body, 'tinySQL') AS excerpt FROM docs;
+```
+
+### Trigger quick start
+
+```sql
+CREATE TABLE orders (id INT, total FLOAT, status TEXT);
+CREATE TABLE audit_log (order_id INT, msg TEXT, ts TIMESTAMP);
+
+CREATE TRIGGER orders_after_insert
+AFTER INSERT ON orders
+FOR EACH ROW
+BEGIN
+  INSERT INTO audit_log VALUES (NEW.id, 'created', NOW());
+END;
+
+INSERT INTO orders VALUES (1, 99.99, 'new');
+SELECT * FROM audit_log;
+```
+
+### Vectors
+
+`VEC_SEARCH` and `VEC_TOP_K` perform k-nearest-neighbour search. `VEC_AVG` computes the element-wise average of a set of vectors, useful for building centroid embeddings:
+
+```sql
+-- Store embeddings
+CREATE TABLE embeddings (id INT, label TEXT, vec VECTOR);
+
+-- Find the 5 nearest neighbours to a query vector
+SELECT id, label, _vec_distance
+FROM VEC_SEARCH('embeddings', 'vec', '[0.1, 0.2, 0.3]', 5, 'cosine')
+ORDER BY _vec_rank;
+
+-- Compute centroid of a cluster
+SELECT VEC_AVG(vec) AS centroid FROM embeddings WHERE label = 'science';
+```
 
 ### Not yet implemented
 
 | Feature | SQLite equivalent | Priority |
 |---------|-------------------|----------|
-| **Full-Text Search (FTS5)** | `CREATE VIRTUAL TABLE t USING fts5(…)` + `MATCH` operator, BM25 ranking, tokenizers | High — useful for search use-cases |
-| **Triggers** | `CREATE TRIGGER … BEFORE/AFTER INSERT/UPDATE/DELETE` | Medium |
 | **FOREIGN KEY constraints** | `FOREIGN KEY (col) REFERENCES other(col)` + enforcement | Medium |
 | **CHECK constraints** | `CHECK (expr)` in `CREATE TABLE` | Medium |
 | **RETURNING clause** | `INSERT … RETURNING`, `UPDATE … RETURNING` | Medium |
 | **UPSERT / ON CONFLICT** | `INSERT OR REPLACE`, `INSERT … ON CONFLICT DO UPDATE/NOTHING` | Medium |
-| **Recursive CTEs** | `WITH RECURSIVE cte AS (… UNION ALL …)` | Medium |
 | **Generated / computed columns** | `col AS (expr) STORED/VIRTUAL` | Low |
 | **SAVEPOINT / nested transactions** | `SAVEPOINT sp; ROLLBACK TO sp; RELEASE sp` | Low |
 | **PRAGMA statements** | `PRAGMA journal_mode`, `PRAGMA foreign_keys = ON`, … | Low |
 | **ATTACH / DETACH DATABASE** | Cross-file queries | Low |
 | **Partial indexes** | `CREATE INDEX … WHERE expr` | Low |
+| **Persistent ANN vector index** | HNSW/IVF — current `VEC_SEARCH` is a sequential scan | Low |
 | **WITHOUT ROWID tables** | Storage optimisation | Low |
 | **VACUUM** | Reclaim space, re-pack storage | Low |
 | **`sqlite_master` / `sqlite_schema`** | Metadata table (tinySQL uses `sys.*` instead) | Low |
-
-### Vectors
-
-tinySQL already ships a **`VEC_SEARCH`** table-valued function for k-nearest
-neighbour search — the core primitive for RAG pipelines. It supports four
-distance metrics (`cosine`, `l2`, `manhattan`, `dot`) and returns results
-ranked by distance:
-
-```sql
--- Store embeddings (VECTOR columns hold []float64 values)
-CREATE TABLE embeddings (id INT, text TEXT, vec VECTOR);
-
--- Find the 5 nearest neighbours to a query vector
-SELECT id, text, _vec_distance
-FROM VEC_SEARCH('embeddings', 'vec', '[0.1, 0.2, ...]', 5, 'cosine')
-ORDER BY _vec_rank;
-```
-
-What is **not** yet implemented is a SQLite-`sqlite-vec`-style persistent
-vector index (HNSW / IVF) that scales to millions of rows without a full
-table scan. The current implementation performs a sequential scan, which is
-fast enough for small-to-medium datasets.
-
-### Full-Text Search
-
-No FTS5 equivalent exists yet. Adding it would require:
-
-1. A `CREATE VIRTUAL TABLE … USING fts(…)` parser extension
-2. An inverted index stored alongside the regular table
-3. A `MATCH` operator in the WHERE clause
-4. Optional: BM25 scoring, snippet generation, tokenizer plug-ins
-
-This is the most impactful missing feature for search-oriented workloads.
 
 ## Limitations
 
@@ -243,7 +271,12 @@ TinySQL demonstrates:
 - Database storage concepts
 - Go's database/sql driver interface
 - 3-valued logic (NULL semantics)
-- JSON data handling in SQL
+- JSON / YAML data handling in SQL
+- Full-Text Search with BM25 ranking
+- Trigger execution (BEFORE/AFTER INSERT/UPDATE/DELETE)
+- Recursive CTEs (WITH RECURSIVE)
+- Window functions (OVER, PARTITION BY, frame specs)
+- Vector similarity search (cosine, L2, dot, Manhattan)
 - Multi-tenancy patterns
 
 Perfect for computer science students, developers learning database internals, or anyone who wants to understand how SQL databases work under the hood.
