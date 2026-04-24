@@ -313,8 +313,8 @@ func TestCommonTemplates_NotEmpty(t *testing.T) {
 
 func TestApplyTemplate(t *testing.T) {
 	tmpl := QueryTemplate{
-		Name: "test",
-		SQL:  "SELECT * FROM {table} LIMIT {limit}",
+		Name:       "test",
+		SQL:        "SELECT * FROM {table} LIMIT {limit}",
 		Parameters: []string{"table", "limit"},
 	}
 	params := map[string]string{"table": "users", "limit": "10"}

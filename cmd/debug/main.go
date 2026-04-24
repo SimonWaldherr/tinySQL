@@ -147,7 +147,7 @@ func stmtType(stmt tinysql.Statement) string {
 }
 
 // splitStatements splits a SQL string on semicolons, respecting string literals.
-// It handles both standard SQL doubled-quote escapes ('it''s') and
+// It handles both standard SQL doubled single-quote escapes and
 // backslash-escaped quotes ('it\'s').
 func splitStatements(sql string) []string {
 	var stmts []string
