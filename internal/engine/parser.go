@@ -120,11 +120,14 @@ type Statement interface{}
 
 // CreateTable represents a CREATE TABLE statement.
 type CreateTable struct {
-	Name        string
-	Cols        []storage.Column
-	IsTemp      bool
-	AsSelect    *Select
-	IfNotExists bool // IF NOT EXISTS clause
+	Name         string
+	Cols         []storage.Column
+	IsTemp       bool
+	AsSelect     *Select
+	IfNotExists  bool // IF NOT EXISTS clause
+	VirtualTable bool     // CREATE VIRTUAL TABLE
+	Using        string   // e.g. "fts"
+	FTSColumns   []string // columns passed to fts(...)
 }
 
 // DropTable represents a DROP TABLE statement.
@@ -187,6 +190,24 @@ type AlterJob struct {
 // DropJob represents DROP JOB <name>
 type DropJob struct {
 	Name string
+}
+
+// CreateTrigger represents a CREATE TRIGGER statement.
+type CreateTrigger struct {
+	Name        string
+	Timing      string // "BEFORE", "AFTER", "INSTEAD OF"
+	Event       string // "INSERT", "UPDATE", "DELETE"
+	Table       string
+	ForEachRow  bool
+	WhenExpr    Expr        // optional WHEN condition
+	Body        []Statement // trigger body statements
+	IfNotExists bool
+}
+
+// DropTrigger represents a DROP TRIGGER statement.
+type DropTrigger struct {
+	Name     string
+	IfExists bool
 }
 
 // AlterTable represents an ALTER TABLE statement.
@@ -353,14 +374,46 @@ func (p *Parser) parseCreate() (Statement, error) {
 		return p.parseCreateJob()
 	}
 
+	// Check for CREATE TRIGGER
+	if p.cur.Typ == tKeyword && p.cur.Val == "TRIGGER" {
+		return p.parseCreateTrigger(false)
+	}
+
+	// Check for CREATE OR REPLACE TRIGGER / CREATE OR REPLACE VIEW.
+	// After consuming OR and REPLACE, route to TRIGGER or VIEW parser.
+	// Note: if the next token after REPLACE is neither TRIGGER nor VIEW,
+	// we fall through to parseCreateView which will return a parse error.
+	if p.cur.Typ == tKeyword && p.cur.Val == "OR" {
+		p.next() // consume OR
+		if p.cur.Typ == tKeyword && p.cur.Val == "REPLACE" {
+			p.next() // consume REPLACE
+			if p.cur.Typ == tKeyword && p.cur.Val == "TRIGGER" {
+				return p.parseCreateTrigger(false)
+			}
+			// Fall through to view parsing (OR REPLACE VIEW)
+			return p.parseCreateView()
+		}
+		// Bare OR without REPLACE — unexpected; let view parser report the error.
+		return p.parseCreateView()
+	}
+
 	// Check for CREATE INDEX
 	if p.cur.Typ == tKeyword && (p.cur.Val == "INDEX" || p.cur.Val == "UNIQUE") {
 		return p.parseCreateIndex()
 	}
 
 	// Check for CREATE VIEW
-	if p.cur.Typ == tKeyword && (p.cur.Val == "VIEW" || p.cur.Val == "OR") {
+	if p.cur.Typ == tKeyword && p.cur.Val == "VIEW" {
 		return p.parseCreateView()
+	}
+
+	// Check for CREATE VIRTUAL TABLE
+	if p.cur.Typ == tKeyword && p.cur.Val == "VIRTUAL" {
+		p.next()
+		if err := p.expectKeyword("TABLE"); err != nil {
+			return nil, err
+		}
+		return p.parseVirtualTable()
 	}
 
 	// CREATE TABLE logic
@@ -421,6 +474,11 @@ func (p *Parser) parseDrop() (Statement, error) {
 		return p.parseDropView()
 	}
 
+	// Check for DROP TRIGGER
+	if p.cur.Typ == tKeyword && p.cur.Val == "TRIGGER" {
+		return p.parseDropTrigger()
+	}
+
 	// Check for DROP JOB
 	if (p.cur.Typ == tKeyword || p.cur.Typ == tIdent) && p.cur.Val == "JOB" {
 		p.next()
@@ -451,6 +509,199 @@ func (p *Parser) parseDrop() (Statement, error) {
 		return nil, p.errf("expected table name")
 	}
 	return &DropTable{Name: name, IfExists: ifExists}, nil
+}
+
+// parseCreateTrigger parses CREATE [OR REPLACE] TRIGGER ...
+// Syntax: CREATE TRIGGER [IF NOT EXISTS] name BEFORE|AFTER|INSTEAD OF INSERT|UPDATE|DELETE
+//
+//	ON table [FOR EACH ROW] [WHEN (expr)] BEGIN stmt; ... END
+func (p *Parser) parseCreateTrigger(orReplace bool) (Statement, error) {
+	p.next() // consume TRIGGER
+
+	ifNotExists := false
+	if p.cur.Typ == tKeyword && p.cur.Val == "IF" {
+		p.next()
+		if err := p.expectKeyword("NOT"); err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		ifNotExists = true
+	}
+
+	name := p.parseIdentLike()
+	if name == "" {
+		return nil, p.errf("expected trigger name")
+	}
+
+	// Parse timing: BEFORE | AFTER | INSTEAD OF
+	timing := ""
+	if p.cur.Typ == tKeyword && p.cur.Val == "BEFORE" {
+		timing = "BEFORE"
+		p.next()
+	} else if p.cur.Typ == tKeyword && p.cur.Val == "AFTER" {
+		timing = "AFTER"
+		p.next()
+	} else if p.cur.Typ == tKeyword && p.cur.Val == "INSTEAD" {
+		p.next()
+		if err := p.expectKeyword("OF"); err != nil {
+			return nil, err
+		}
+		timing = "INSTEAD OF"
+	} else {
+		return nil, p.errf("expected BEFORE, AFTER, or INSTEAD OF in trigger")
+	}
+
+	// Parse event: INSERT | UPDATE | DELETE
+	event := ""
+	if p.cur.Typ == tKeyword && (p.cur.Val == "INSERT" || p.cur.Val == "UPDATE" || p.cur.Val == "DELETE") {
+		event = p.cur.Val
+		p.next()
+	} else {
+		return nil, p.errf("expected INSERT, UPDATE, or DELETE in trigger")
+	}
+
+	if err := p.expectKeyword("ON"); err != nil {
+		return nil, err
+	}
+	table := p.parseIdentLike()
+	if table == "" {
+		return nil, p.errf("expected table name in trigger")
+	}
+
+	forEachRow := false
+	if p.cur.Typ == tKeyword && p.cur.Val == "FOR" {
+		p.next()
+		if err := p.expectKeyword("EACH"); err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("ROW"); err != nil {
+			return nil, err
+		}
+		forEachRow = true
+	}
+
+	var whenExpr Expr
+	if p.cur.Typ == tKeyword && p.cur.Val == "WHEN" {
+		p.next()
+		if err := p.expectSymbol("("); err != nil {
+			return nil, err
+		}
+		var err error
+		whenExpr, err = p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectSymbol(")"); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := p.expectKeyword("BEGIN"); err != nil {
+		return nil, err
+	}
+
+	// Parse trigger body statements until END
+	var body []Statement
+	for !(p.cur.Typ == tKeyword && p.cur.Val == "END") && p.cur.Typ != tEOF {
+		stmt, err := p.ParseStatement()
+		if err != nil {
+			return nil, fmt.Errorf("trigger body: %w", err)
+		}
+		body = append(body, stmt)
+		// Consume optional semicolon
+		if p.cur.Typ == tSymbol && p.cur.Val == ";" {
+			p.next()
+		}
+	}
+	if p.cur.Typ == tKeyword && p.cur.Val == "END" {
+		p.next()
+	}
+
+	return &CreateTrigger{
+		Name:        name,
+		Timing:      timing,
+		Event:       event,
+		Table:       table,
+		ForEachRow:  forEachRow,
+		WhenExpr:    whenExpr,
+		Body:        body,
+		IfNotExists: ifNotExists,
+	}, nil
+}
+
+// parseDropTrigger parses DROP TRIGGER [IF EXISTS] name.
+func (p *Parser) parseDropTrigger() (Statement, error) {
+	p.next() // consume TRIGGER
+
+	ifExists := false
+	if p.cur.Typ == tKeyword && p.cur.Val == "IF" {
+		p.next()
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		ifExists = true
+	}
+
+	name := p.parseIdentLike()
+	if name == "" {
+		return nil, p.errf("expected trigger name")
+	}
+	return &DropTrigger{Name: name, IfExists: ifExists}, nil
+}
+
+// parseVirtualTable parses CREATE VIRTUAL TABLE name USING fts(col1, col2, ...).
+func (p *Parser) parseVirtualTable() (Statement, error) {
+	ifNotExists := false
+	if p.cur.Typ == tKeyword && p.cur.Val == "IF" {
+		p.next()
+		if err := p.expectKeyword("NOT"); err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		ifNotExists = true
+	}
+
+	name := p.parseIdentLike()
+	if name == "" {
+		return nil, p.errf("expected table name")
+	}
+
+	if err := p.expectKeyword("USING"); err != nil {
+		return nil, err
+	}
+
+	engine := p.parseIdentLike()
+	if engine == "" {
+		return nil, p.errf("expected virtual table engine name (e.g. fts)")
+	}
+
+	var ftsCols []string
+	if p.cur.Typ == tSymbol && p.cur.Val == "(" {
+		p.next()
+		for p.cur.Typ != tSymbol || p.cur.Val != ")" {
+			col := p.parseIdentLike()
+			if col == "" {
+				return nil, p.errf("expected column name in USING clause")
+			}
+			ftsCols = append(ftsCols, col)
+			if p.cur.Typ == tSymbol && p.cur.Val == "," {
+				p.next()
+			}
+		}
+		p.next() // consume )
+	}
+
+	return &CreateTable{
+		Name:         name,
+		VirtualTable: true,
+		Using:        strings.ToLower(engine),
+		FTSColumns:   ftsCols,
+		IfNotExists:  ifNotExists,
+	}, nil
 }
 
 //nolint:gocyclo // Index creation grammar includes many optional clauses.
@@ -1691,6 +1942,11 @@ var typeKeywordMap = map[string]storage.ColType{
 	// Vector types (for RAG / embedding storage)
 	"VECTOR":    storage.VectorType,
 	"EMBEDDING": storage.VectorType,
+	// Extra data types
+	"YAML":   storage.YAMLType,
+	"URL":    storage.URLType,
+	"HASH":   storage.HASHType,
+	"BITMAP": storage.BitmapType,
 }
 
 func (p *Parser) parseType() storage.ColType {

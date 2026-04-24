@@ -6,6 +6,7 @@ package storage
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -13,27 +14,65 @@ import (
 // ==================== System Catalog ====================
 // Provides metadata tables for introspection and job scheduling
 
+// TriggerTiming indicates when a trigger fires.
+type TriggerTiming string
+
+const (
+	// TriggerBefore fires before the DML operation.
+	TriggerBefore TriggerTiming = "BEFORE"
+	// TriggerAfter fires after the DML operation.
+	TriggerAfter TriggerTiming = "AFTER"
+	// TriggerInsteadOf replaces the DML operation (views).
+	TriggerInsteadOf TriggerTiming = "INSTEAD OF"
+)
+
+// TriggerEvent indicates what event fires the trigger.
+type TriggerEvent string
+
+const (
+	// TriggerInsert fires on INSERT.
+	TriggerInsert TriggerEvent = "INSERT"
+	// TriggerUpdate fires on UPDATE.
+	TriggerUpdate TriggerEvent = "UPDATE"
+	// TriggerDelete fires on DELETE.
+	TriggerDelete TriggerEvent = "DELETE"
+)
+
+// CatalogTrigger holds a stored trigger definition.
+type CatalogTrigger struct {
+	Name       string
+	Table      string
+	Timing     TriggerTiming
+	Event      TriggerEvent
+	ForEachRow bool
+	WhenExpr   string    // optional WHEN clause SQL text
+	Body       string    // SQL text of trigger body (semicolon-separated stmts)
+	CreatedAt  time.Time
+}
+
 // CatalogManager manages system catalog tables (`catalog.tables`,
 // `catalog.columns`, etc.) and provides thread-safe registration and
 // lookup helpers used by the rest of the system for introspection and
 // scheduling. CatalogManager is safe for concurrent use.
 type CatalogManager struct {
-	mu      sync.RWMutex
-	tables  map[string]*CatalogTable
-	columns map[string][]CatalogColumn
-	views   map[string]*CatalogView
-	funcs   map[string]*CatalogFunction
-	jobs    map[string]*CatalogJob
+	mu       sync.RWMutex
+	tables   map[string]*CatalogTable
+	columns  map[string][]CatalogColumn
+	views    map[string]*CatalogView
+	funcs    map[string]*CatalogFunction
+	jobs     map[string]*CatalogJob
+	triggers map[string]*CatalogTrigger // keyed by trigger name
 }
 
 // NewCatalogManager allocates and returns an initialized CatalogManager.
 func NewCatalogManager() *CatalogManager {
 	return &CatalogManager{
-		tables:  make(map[string]*CatalogTable),
-		columns: make(map[string][]CatalogColumn),
-		views:   make(map[string]*CatalogView),
-		funcs:   make(map[string]*CatalogFunction),
-		jobs:    make(map[string]*CatalogJob),
+		tables:   make(map[string]*CatalogTable),
+		columns:  make(map[string][]CatalogColumn),
+		views:    make(map[string]*CatalogView),
+		funcs:    make(map[string]*CatalogFunction),
+		jobs:     make(map[string]*CatalogJob),
+		triggers: make(map[string]*CatalogTrigger),
 	}
 }
 
@@ -316,6 +355,59 @@ func (c *CatalogManager) GetColumns(schema, tableName string) []CatalogColumn {
 
 	key := schema + "." + tableName
 	return c.columns[key]
+}
+
+// RegisterTrigger stores a trigger definition in the catalog. If a trigger with
+// the same name already exists it is replaced.
+func (c *CatalogManager) RegisterTrigger(t *CatalogTrigger) error {
+	if t == nil || t.Name == "" {
+		return fmt.Errorf("trigger name cannot be empty")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if t.CreatedAt.IsZero() {
+		t.CreatedAt = time.Now()
+	}
+	c.triggers[t.Name] = t
+	return nil
+}
+
+// DropTrigger removes a named trigger from the catalog. It returns an error
+// when the trigger does not exist.
+func (c *CatalogManager) DropTrigger(name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.triggers[name]; !ok {
+		return fmt.Errorf("trigger %q not found", name)
+	}
+	delete(c.triggers, name)
+	return nil
+}
+
+// GetTriggers returns all triggers for the given table, timing, and event.
+func (c *CatalogManager) GetTriggers(table string, timing TriggerTiming, event TriggerEvent) []*CatalogTrigger {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var out []*CatalogTrigger
+	for _, t := range c.triggers {
+		if strings.EqualFold(t.Table, table) &&
+			t.Timing == timing &&
+			t.Event == event {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// ListTriggers returns all registered trigger definitions.
+func (c *CatalogManager) ListTriggers() []*CatalogTrigger {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]*CatalogTrigger, 0, len(c.triggers))
+	for _, t := range c.triggers {
+		out = append(out, t)
+	}
+	return out
 }
 
 // Catalog returns the CatalogManager attached to the DB, creating one

@@ -301,7 +301,20 @@ func isKeyword(up string) bool {
 		"VEC_MANHATTAN_DISTANCE", "VEC_L1_DISTANCE",
 		"VEC_DISTANCE",
 		"VEC_SLICE", "VEC_CONCAT", "VEC_QUANTIZE", "VEC_RANDOM", "VEC_AVG",
-		"VEC_SEARCH", "VEC_TOP_K":
+		"VEC_SEARCH", "VEC_TOP_K",
+		// Extra data types
+		"YAML", "URL", "HASH", "BITMAP",
+		// Extra type functions
+		"YAML_PARSE", "YAML_GET",
+		"URL_PARSE", "URL_ENCODE", "URL_DECODE",
+		"BITMAP_NEW", "BITMAP_SET", "BITMAP_GET", "BITMAP_COUNT", "BITMAP_OR", "BITMAP_AND",
+		// Trigger keywords (FOR, AFTER, ROW are already in the main list above)
+		"TRIGGER", "EACH", "BEFORE", "INSTEAD", "OF", "NEW", "OLD",
+		// BEGIN/END for trigger bodies (also used in other contexts)
+		"BEGIN",
+		// FTS keywords
+		"VIRTUAL", "USING", "MATCH",
+		"FTS_MATCH", "FTS_RANK", "FTS_SNIPPET", "BM25":
 		return true
 	default:
 		return false

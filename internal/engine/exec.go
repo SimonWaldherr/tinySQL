@@ -58,6 +58,12 @@ func getAllFunctions() map[string]funcHandler {
 		for k, v := range getVectorFunctions() {
 			m[k] = v
 		}
+		for k, v := range getExtraTypeFunctions() {
+			m[k] = v
+		}
+		for k, v := range getFTSFunctions() {
+			m[k] = v
+		}
 		allFunctions = m
 	})
 	return allFunctions
@@ -119,6 +125,10 @@ func Execute(ctx context.Context, db *storage.DB, tenant string, stmt Statement)
 		return executeAlterJob(env, s)
 	case *DropJob:
 		return executeDropJob(env, s)
+	case *CreateTrigger:
+		return executeCreateTrigger(env, s)
+	case *DropTrigger:
+		return executeDropTrigger(env, s)
 	}
 	return nil, fmt.Errorf("unknown statement")
 }
@@ -133,6 +143,11 @@ func executeCreateTable(env ExecEnv, s *CreateTable) (*ResultSet, error) {
 			// Table already exists, silently succeed
 			return nil, nil
 		}
+	}
+
+	// Handle CREATE VIRTUAL TABLE ... USING fts(...)
+	if s.VirtualTable && s.Using == "fts" {
+		return executeCreateFTSTable(env, s)
 	}
 
 	if s.AsSelect == nil {
@@ -327,7 +342,16 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 			}
 			row[i] = cv
 		}
+		newRow := buildTableRow(t.Cols, strings.ToLower(s.Table)+".", row)
+		if err := fireTriggers(env, s.Table, "BEFORE", "INSERT", newRow, nil); err != nil {
+			return nil, err
+		}
 		t.Rows = append(t.Rows, row)
+		if err := fireTriggers(env, s.Table, "AFTER", "INSERT", newRow, nil); err != nil {
+			return nil, err
+		}
+		// FTS index is updated after all trigger hooks so it reflects final row data.
+		ftsIndexRow(env.tenant+"/"+s.Table, s.Table, len(t.Rows)-1, nil, row, colNames(t.Cols))
 	}
 	t.Version++
 	t.MarkDirtyFrom(len(t.Rows) - len(s.Rows))
@@ -365,7 +389,16 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			}
 			row[idx] = cv
 		}
+		newRow := buildTableRow(t.Cols, strings.ToLower(s.Table)+".", row)
+		if err := fireTriggers(env, s.Table, "BEFORE", "INSERT", newRow, nil); err != nil {
+			return nil, err
+		}
 		t.Rows = append(t.Rows, row)
+		if err := fireTriggers(env, s.Table, "AFTER", "INSERT", newRow, nil); err != nil {
+			return nil, err
+		}
+		// FTS index is updated after all trigger hooks so it reflects final row data.
+		ftsIndexRow(env.tenant+"/"+s.Table, s.Table, len(t.Rows)-1, nil, row, colNames(t.Cols))
 	}
 	t.Version++
 	t.MarkDirtyFrom(len(t.Rows) - len(s.Rows))
@@ -401,6 +434,10 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 			ok = (toTri(v) == tvTrue)
 		}
 		if ok {
+			oldRow := buildTableRow(t.Cols, tablePrefix, t.Rows[ri])
+			if err := fireTriggers(env, s.Table, "BEFORE", "UPDATE", row, oldRow); err != nil {
+				return nil, err
+			}
 			for i, ex := range setIdx {
 				v, err := evalExpr(env, ex, row)
 				if err != nil {
@@ -411,6 +448,11 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 					return nil, err
 				}
 				t.Rows[ri][i] = cv
+			}
+			newRow := buildTableRow(t.Cols, tablePrefix, t.Rows[ri])
+			ftsIndexRow(env.tenant+"/"+s.Table, s.Table, ri, nil, t.Rows[ri], colNames(t.Cols))
+			if err := fireTriggers(env, s.Table, "AFTER", "UPDATE", newRow, oldRow); err != nil {
+				return nil, err
 			}
 			n++
 		}
@@ -452,6 +494,13 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 		if toTri(v) != tvTrue {
 			kept = append(kept, r)
 		} else {
+			if err := fireTriggers(env, s.Table, "BEFORE", "DELETE", nil, row); err != nil {
+				return nil, err
+			}
+			ftsDeleteRow(env.tenant+"/"+s.Table, del+len(kept))
+			if err := fireTriggers(env, s.Table, "AFTER", "DELETE", nil, row); err != nil {
+				return nil, err
+			}
 			del++
 		}
 	}
@@ -4984,6 +5033,8 @@ func evalAggregateFuncCall(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 		return evalAggregateMinBy(env, ex, rows)
 	case "MAX_BY", "ARG_MAX":
 		return evalAggregateMaxBy(env, ex, rows)
+	case "VEC_AVG":
+		return evalAggregateVecAvg(env, ex, rows)
 	default:
 		// For non-aggregate functions like DATEDIFF, LEFT, etc., evaluate their arguments
 		// in the aggregate context first, then call the function
@@ -5293,6 +5344,58 @@ func evalAggregateMaxBy(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 	}
 
 	return resultVal, nil
+}
+
+// evalAggregateVecAvg computes the element-wise average of a set of vectors.
+func evalAggregateVecAvg(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
+	if len(ex.Args) != 1 {
+		return nil, fmt.Errorf("VEC_AVG expects 1 argument")
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+
+	var sum []float64
+	count := 0
+
+	for _, r := range rows {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, err
+		}
+		val, err := evalExpr(env, ex.Args[0], r)
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			continue
+		}
+		var vec []float64
+		switch v := val.(type) {
+		case []float64:
+			vec = v
+		default:
+			continue
+		}
+		if sum == nil {
+			sum = make([]float64, len(vec))
+		}
+		if len(vec) != len(sum) {
+			return nil, fmt.Errorf("VEC_AVG: dimension mismatch (%d vs %d)", len(vec), len(sum))
+		}
+		for i, f := range vec {
+			sum[i] += f
+		}
+		count++
+	}
+
+	if count == 0 {
+		return nil, nil
+	}
+	avg := make([]float64, len(sum))
+	for i := range sum {
+		avg[i] = sum[i] / float64(count)
+	}
+	return avg, nil
 }
 
 func evalAggregateUnary(env ExecEnv, ex *Unary, rows []Row) (any, error) {
