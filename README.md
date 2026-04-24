@@ -59,11 +59,11 @@ package main
 import (
     "database/sql"
     "fmt"
-    _ "github.com/SimonWaldherr/tinySQL/internal/driver"
+    tsqldriver "github.com/SimonWaldherr/tinySQL/driver"
 )
 
 func main() {
-    db, _ := sql.Open("tinysql", "mem://?tenant=default")
+    db, _ := sql.Open(tsqldriver.DriverName, "mem://?tenant=default")
     defer db.Close()
 
     db.Exec(`CREATE TABLE t (id INT, name TEXT)`)
@@ -75,6 +75,8 @@ func main() {
     fmt.Println(name)
 }
 ```
+
+External projects should import `github.com/SimonWaldherr/tinySQL/driver`, not `internal/driver`. Go's `internal/` rule only allows packages inside this module tree to use `internal/*`.
 
 ## Run tests
 

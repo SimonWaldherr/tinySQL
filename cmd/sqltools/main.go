@@ -882,9 +882,9 @@ type LintRule struct {
 
 // LintIssue is a single finding from the linter.
 type LintIssue struct {
-	Rule     LintRule
-	Message  string
-	SQL      string // the offending SQL snippet
+	Rule    LintRule
+	Message string
+	SQL     string // the offending SQL snippet
 }
 
 // LintResult holds all findings from linting a SQL file.
