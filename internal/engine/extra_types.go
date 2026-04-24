@@ -1,5 +1,9 @@
 // Package engine provides helper functions for the YAML, URL, HASH, and
 // BITMAP extra column types added to tinySQL.
+//
+// Note: MD5 and SHA1 are provided for compatibility and checksum use cases only.
+// They are cryptographically broken and must NOT be used for security-sensitive
+// operations (passwords, signatures, etc.). Prefer SHA256 or SHA512 instead.
 package engine
 
 import (

@@ -379,21 +379,21 @@ func (p *Parser) parseCreate() (Statement, error) {
 		return p.parseCreateTrigger(false)
 	}
 
-	// Check for CREATE OR REPLACE TRIGGER
+	// Check for CREATE OR REPLACE TRIGGER / CREATE OR REPLACE VIEW.
+	// After consuming OR and REPLACE, route to TRIGGER or VIEW parser.
+	// Note: if the next token after REPLACE is neither TRIGGER nor VIEW,
+	// we fall through to parseCreateView which will return a parse error.
 	if p.cur.Typ == tKeyword && p.cur.Val == "OR" {
-		saved := p.cur
-		p.next()
+		p.next() // consume OR
 		if p.cur.Typ == tKeyword && p.cur.Val == "REPLACE" {
-			p.next()
+			p.next() // consume REPLACE
 			if p.cur.Typ == tKeyword && p.cur.Val == "TRIGGER" {
 				return p.parseCreateTrigger(false)
 			}
-			// Otherwise fall through to view parsing (OR REPLACE VIEW)
-			_ = saved
+			// Fall through to view parsing (OR REPLACE VIEW)
 			return p.parseCreateView()
 		}
-		// Restore: can't really un-next, so redirect to view parser which
-		// also handles OR REPLACE VIEW. We rely on it being resilient.
+		// Bare OR without REPLACE — unexpected; let view parser report the error.
 		return p.parseCreateView()
 	}
 

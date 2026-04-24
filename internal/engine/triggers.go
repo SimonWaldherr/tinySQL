@@ -92,7 +92,7 @@ func executeTrigger(env ExecEnv, trig *storage.CatalogTrigger, newRow Row, oldRo
 			return err
 		}
 	}
-	_ = trigRow // reserved for WHEN expression evaluation
+	_ = trigRow // TODO: evaluate WHEN condition against trigRow when that feature is added
 	return nil
 }
 
@@ -124,9 +124,10 @@ func triggerBodyToSQL(stmts []Statement) string {
 	return strings.Join(parts, "; ")
 }
 
-// stmtToSQL produces a minimal SQL representation of a statement.
-// It is intentionally simple — it only needs to round-trip INSERT/UPDATE/DELETE
-// that are typically used inside trigger bodies.
+// stmtToSQL produces a minimal SQL representation of a statement for trigger
+// body storage. NOTE: this is a placeholder — the reconstructed SQL is not
+// guaranteed to be fully re-parseable after restart.  A proper AST→SQL printer
+// would be required for reliable round-tripping of trigger bodies.
 func stmtToSQL(stmt Statement) string {
 	switch s := stmt.(type) {
 	case *Insert:

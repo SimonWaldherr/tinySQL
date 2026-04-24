@@ -347,10 +347,11 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 			return nil, err
 		}
 		t.Rows = append(t.Rows, row)
-		ftsIndexRow(env.tenant+"/"+s.Table, s.Table, len(t.Rows)-1, nil, row, colNames(t.Cols))
 		if err := fireTriggers(env, s.Table, "AFTER", "INSERT", newRow, nil); err != nil {
 			return nil, err
 		}
+		// FTS index is updated after all trigger hooks so it reflects final row data.
+		ftsIndexRow(env.tenant+"/"+s.Table, s.Table, len(t.Rows)-1, nil, row, colNames(t.Cols))
 	}
 	t.Version++
 	t.MarkDirtyFrom(len(t.Rows) - len(s.Rows))
@@ -393,10 +394,11 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			return nil, err
 		}
 		t.Rows = append(t.Rows, row)
-		ftsIndexRow(env.tenant+"/"+s.Table, s.Table, len(t.Rows)-1, nil, row, colNames(t.Cols))
 		if err := fireTriggers(env, s.Table, "AFTER", "INSERT", newRow, nil); err != nil {
 			return nil, err
 		}
+		// FTS index is updated after all trigger hooks so it reflects final row data.
+		ftsIndexRow(env.tenant+"/"+s.Table, s.Table, len(t.Rows)-1, nil, row, colNames(t.Cols))
 	}
 	t.Version++
 	t.MarkDirtyFrom(len(t.Rows) - len(s.Rows))

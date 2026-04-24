@@ -359,13 +359,15 @@ func evalFTSRank(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	}
 
 	score := 0.0
-	docLen := float64(len(textTokens))
+	// Standalone BM25 has no corpus avgdl; length normalisation uses 1.0
+	// (equivalent to treating this document as average-length).
+	_ = float64(len(textTokens))
 	for _, q := range queryTerms {
 		tf := float64(freq[q])
 		if tf == 0 {
 			continue
 		}
-		tfNorm := (tf * (bm25K1 + 1)) / (tf + bm25K1*(1-bm25B+bm25B*docLen/docLen))
+		tfNorm := (tf * (bm25K1 + 1)) / (tf + bm25K1*(1-bm25B+bm25B*1.0))
 		score += tfNorm
 	}
 	return score, nil
