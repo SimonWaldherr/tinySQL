@@ -1,6 +1,27 @@
 # tinySQL Command Variants
 
-This repo ships multiple binaries under `cmd/` for different use-cases.
+This repo ships multiple binaries under `cmd/` for different use-cases. Each
+tool has its own README with full documentation — click the links below.
+
+| Tool | README |
+|------|--------|
+| demo | [README](demo/README.md) |
+| repl | [README](repl/README.md) |
+| server | [README](server/README.md) |
+| tinysql | [README](tinysql/README.md) |
+| sqltools | [README](sqltools/README.md) |
+| tinysqlpage | [README](tinysqlpage/README.md) |
+| studio | [README](studio/README.md) |
+| wasm_browser | [README](wasm_browser/README.md) |
+| wasm_node | [README](wasm_node/README.md) |
+| query_files | [README](query_files/README.md) |
+| query_files_wasm | [README](query_files_wasm/README.md) |
+| catalog_demo | [README](catalog_demo/README.md) |
+| debug | [README](debug/README.md) |
+| fsql | [README](fsql/README.md) |
+| migrate | [README](migrate/README.md) |
+
+---
 
 - demo
   - A simple demo that creates tables, inserts sample data, and runs example queries.
@@ -94,9 +115,22 @@ This repo ships multiple binaries under `cmd/` for different use-cases.
   - Run: `./catalog_demo`
 
 - debug
-  - Minimal program that exercises BOOL column handling via the raw tinySQL API. Intended as a development/debugging aid, not an end-user tool.
+  - SQL diagnostic tool: parse and execute SQL statements against an in-memory database, print results and per-statement timing. See [cmd/debug/README.md](./debug/README.md).
   - Build: `go build ./cmd/debug`
-  - Run: `./debug`
+  - Run: `./debug -sql "SELECT 1 + 1 AS result"`
+  - Flags: `-sql`, `-timing`, `-verbose`
+
+- fsql
+  - Treat the filesystem as a relational database. Register named mounts and query file metadata, text lines, CSV rows, and JSON rows using SQL. See [cmd/fsql/README.md](./fsql/README.md).
+  - Build: `cd cmd/fsql && go build -o fsql .`
+  - Register mount: `./fsql mount logs /var/log`
+  - Query: `./fsql --mount /var/log "SELECT path, size FROM files('root', true) WHERE ext = 'log'"`
+
+- migrate
+  - Data pipeline CLI: import CSV/JSON into tinySQL, connect to external databases (PostgreSQL, MySQL, SQLite, MS SQL), and transfer data between any combination of sources and targets. See [cmd/migrate/README.md](./migrate/README.md).
+  - Build: `cd cmd/migrate && go build -o migrate .`
+  - Import and query: `migrate import-file -file users.csv -query "SELECT * FROM users"`
+  - Web UI: `migrate web`
 
 - server/loadtest
   - Lightweight HTTP load generator for `cmd/server`.
