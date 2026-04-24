@@ -870,6 +870,369 @@ func ValidateSQL(sql string) ValidationResult {
 }
 
 // ============================================================================
+// SQL Linter (multi-rule analysis)
+// ============================================================================
+
+// LintRule defines a single lint check.
+type LintRule struct {
+	ID       string // e.g. "L001"
+	Name     string
+	Severity string // "error", "warning", "info"
+}
+
+// LintIssue is a single finding from the linter.
+type LintIssue struct {
+	Rule     LintRule
+	Message  string
+	SQL      string // the offending SQL snippet
+}
+
+// LintResult holds all findings from linting a SQL file.
+type LintResult struct {
+	Issues     []LintIssue
+	Statements int
+}
+
+var lintRules = []LintRule{
+	{ID: "L001", Name: "select-star", Severity: "warning"},
+	{ID: "L002", Name: "missing-where-delete", Severity: "error"},
+	{ID: "L003", Name: "missing-where-update", Severity: "error"},
+	{ID: "L004", Name: "implicit-cross-join", Severity: "warning"},
+	{ID: "L005", Name: "order-by-ordinal", Severity: "info"},
+	{ID: "L006", Name: "nested-subquery-depth", Severity: "warning"},
+	{ID: "L007", Name: "inconsistent-keyword-case", Severity: "info"},
+	{ID: "L009", Name: "syntax-error", Severity: "error"},
+}
+
+// LintSQL analyzes SQL text (possibly multi-statement) and returns lint issues.
+func LintSQL(sqlText string) LintResult {
+	result := LintResult{}
+
+	// Split into statements
+	stmts := splitStatements(sqlText)
+	result.Statements = len(stmts)
+
+	for _, stmt := range stmts {
+		stmt = strings.TrimSpace(stmt)
+		if stmt == "" {
+			continue
+		}
+		upper := strings.ToUpper(stmt)
+
+		// L009: Syntax check
+		vr := ValidateSQL(stmt)
+		if !vr.Valid {
+			result.Issues = append(result.Issues, LintIssue{
+				Rule:    findRule("L009"),
+				Message: "Syntax error: " + vr.Error,
+				SQL:     truncateSQL(stmt, 80),
+			})
+			continue
+		}
+
+		// L001: SELECT *
+		if strings.Contains(upper, "SELECT *") && !strings.Contains(upper, "COUNT(*)") {
+			result.Issues = append(result.Issues, LintIssue{
+				Rule:    findRule("L001"),
+				Message: "Avoid SELECT * — specify columns explicitly for clarity and performance",
+				SQL:     truncateSQL(stmt, 80),
+			})
+		}
+
+		// L002: DELETE without WHERE
+		if strings.HasPrefix(upper, "DELETE") && !strings.Contains(upper, "WHERE") {
+			result.Issues = append(result.Issues, LintIssue{
+				Rule:    findRule("L002"),
+				Message: "DELETE without WHERE clause will remove all rows",
+				SQL:     truncateSQL(stmt, 80),
+			})
+		}
+
+		// L003: UPDATE without WHERE
+		if strings.HasPrefix(upper, "UPDATE") && !strings.Contains(upper, "WHERE") {
+			result.Issues = append(result.Issues, LintIssue{
+				Rule:    findRule("L003"),
+				Message: "UPDATE without WHERE clause will modify all rows",
+				SQL:     truncateSQL(stmt, 80),
+			})
+		}
+
+		// L004: Implicit cross join (FROM a, b)
+		if strings.HasPrefix(upper, "SELECT") && strings.Contains(upper, "FROM") {
+			fromIdx := strings.Index(upper, "FROM")
+			if fromIdx >= 0 {
+				rest := upper[fromIdx+4:]
+				// Find the clause boundary
+				for _, kw := range []string{"WHERE", "GROUP", "ORDER", "LIMIT", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "CROSS"} {
+					if idx := strings.Index(rest, kw); idx >= 0 {
+						rest = rest[:idx]
+					}
+				}
+				if strings.Count(rest, ",") > 0 {
+					result.Issues = append(result.Issues, LintIssue{
+						Rule:    findRule("L004"),
+						Message: "Implicit cross join (comma in FROM) — consider explicit JOIN syntax",
+						SQL:     truncateSQL(stmt, 80),
+					})
+				}
+			}
+		}
+
+		// L005: ORDER BY with numeric ordinal
+		if strings.Contains(upper, "ORDER BY") {
+			orderIdx := strings.Index(upper, "ORDER BY")
+			rest := upper[orderIdx+8:]
+			re := regexp.MustCompile(`\b\d+\b`)
+			if re.MatchString(rest) {
+				result.Issues = append(result.Issues, LintIssue{
+					Rule:    findRule("L005"),
+					Message: "ORDER BY with numeric ordinal — use column names for readability",
+					SQL:     truncateSQL(stmt, 80),
+				})
+			}
+		}
+
+		// L006: Deeply nested subqueries
+		depth := countNesting(stmt)
+		if depth >= 3 {
+			result.Issues = append(result.Issues, LintIssue{
+				Rule:    findRule("L006"),
+				Message: fmt.Sprintf("Deeply nested subqueries (depth %d) — consider using CTEs", depth),
+				SQL:     truncateSQL(stmt, 80),
+			})
+		}
+
+		// L007: Inconsistent keyword case
+		tokens := tokenizeSQL(stmt)
+		hasUpper, hasLower := false, false
+		for _, tok := range tokens {
+			if tok.typ == "keyword" {
+				w := tok.value
+				if w == strings.ToUpper(w) {
+					hasUpper = true
+				} else if w == strings.ToLower(w) {
+					hasLower = true
+				}
+			}
+		}
+		if hasUpper && hasLower {
+			result.Issues = append(result.Issues, LintIssue{
+				Rule:    findRule("L007"),
+				Message: "Inconsistent keyword case — use either all UPPERCASE or all lowercase",
+				SQL:     truncateSQL(stmt, 80),
+			})
+		}
+	}
+
+	return result
+}
+
+func findRule(id string) LintRule {
+	for _, r := range lintRules {
+		if r.ID == id {
+			return r
+		}
+	}
+	return LintRule{ID: id, Name: "unknown", Severity: "info"}
+}
+
+func countNesting(sqlStr string) int {
+	maxDepth, depth := 0, 0
+	inString := false
+	for i := 0; i < len(sqlStr); i++ {
+		if sqlStr[i] == '\'' {
+			if inString {
+				// Handle escaped single quotes ('')
+				if i+1 < len(sqlStr) && sqlStr[i+1] == '\'' {
+					i++ // skip the escaped quote
+					continue
+				}
+				inString = false
+			} else {
+				inString = true
+			}
+		}
+		if !inString && sqlStr[i] == '(' {
+			depth++
+			if depth > maxDepth {
+				maxDepth = depth
+			}
+		}
+		if !inString && sqlStr[i] == ')' {
+			depth--
+		}
+	}
+	return maxDepth
+}
+
+func truncateSQL(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ") // collapse whitespace
+	if len(s) > n {
+		return s[:n-3] + "..."
+	}
+	return s
+}
+
+func splitStatements(sqlStr string) []string {
+	var stmts []string
+	var buf strings.Builder
+	inString := false
+	for i := 0; i < len(sqlStr); i++ {
+		c := sqlStr[i]
+		if c == '\'' {
+			inString = !inString
+		}
+		if c == ';' && !inString {
+			s := strings.TrimSpace(buf.String())
+			if s != "" {
+				stmts = append(stmts, s)
+			}
+			buf.Reset()
+			continue
+		}
+		buf.WriteByte(c)
+	}
+	if s := strings.TrimSpace(buf.String()); s != "" {
+		stmts = append(stmts, s)
+	}
+	return stmts
+}
+
+// PrintLintResult prints lint findings to stdout.
+func PrintLintResult(result LintResult) {
+	if len(result.Issues) == 0 {
+		fmt.Printf("✓ %d statement(s) checked — no issues found\n", result.Statements)
+		return
+	}
+	errors, warnings, infos := 0, 0, 0
+	for _, issue := range result.Issues {
+		icon := "ℹ"
+		switch issue.Rule.Severity {
+		case "error":
+			icon = "✗"
+			errors++
+		case "warning":
+			icon = "⚠"
+			warnings++
+		case "info":
+			infos++
+		}
+		fmt.Printf("%s [%s] %s: %s\n", icon, issue.Rule.ID, issue.Rule.Name, issue.Message)
+		if issue.SQL != "" {
+			fmt.Printf("  → %s\n", issue.SQL)
+		}
+	}
+	fmt.Printf("\n%d statement(s) checked: %d error(s), %d warning(s), %d info(s)\n",
+		result.Statements, errors, warnings, infos)
+}
+
+// ============================================================================
+// SQL Normalizer
+// ============================================================================
+
+// NormalizeSQL converts a SQL statement to a canonical form for comparison/caching.
+// It uppercases keywords, normalizes whitespace, and optionally replaces literals
+// with placeholders.
+func NormalizeSQL(sqlStr string, replaceLiterals bool) string {
+	tokens := tokenizeSQL(sqlStr)
+	tokens = uppercaseKeywords(tokens)
+
+	var parts []string
+	for _, tok := range tokens {
+		if replaceLiterals {
+			if tok.typ == "string" || tok.typ == "number" {
+				parts = append(parts, "?")
+				continue
+			}
+		}
+		parts = append(parts, tok.value)
+	}
+	result := normalizeWhitespace(strings.TrimSpace(strings.Join(parts, " ")))
+	return result
+}
+
+// ============================================================================
+// SQL Diff (compare two SQL files)
+// ============================================================================
+
+// DiffResult holds the comparison of two SQL files.
+type DiffResult struct {
+	OnlyInA []string // statements only in file A
+	OnlyInB []string // statements only in file B
+	Common  int      // identical statements
+}
+
+// DiffSQL compares two SQL texts statement by statement (normalized comparison).
+func DiffSQL(sqlA, sqlB string) DiffResult {
+	stmtsA := splitStatements(sqlA)
+	stmtsB := splitStatements(sqlB)
+
+	normA := make(map[string]string) // normalized → original
+	normB := make(map[string]string)
+
+	for _, s := range stmtsA {
+		normA[NormalizeSQL(s, false)] = s
+	}
+	for _, s := range stmtsB {
+		normB[NormalizeSQL(s, false)] = s
+	}
+
+	result := DiffResult{}
+	for norm, orig := range normA {
+		if _, ok := normB[norm]; ok {
+			result.Common++
+			delete(normB, norm)
+		} else {
+			result.OnlyInA = append(result.OnlyInA, orig)
+		}
+	}
+	for _, orig := range normB {
+		result.OnlyInB = append(result.OnlyInB, orig)
+	}
+
+	sort.Strings(result.OnlyInA)
+	sort.Strings(result.OnlyInB)
+	return result
+}
+
+// PrintDiffResult displays the diff.
+func PrintDiffResult(result DiffResult) {
+	fmt.Printf("Common statements: %d\n", result.Common)
+	if len(result.OnlyInA) > 0 {
+		fmt.Printf("\nOnly in file A (%d):\n", len(result.OnlyInA))
+		for _, s := range result.OnlyInA {
+			fmt.Printf("  - %s\n", truncateSQL(s, 100))
+		}
+	}
+	if len(result.OnlyInB) > 0 {
+		fmt.Printf("\nOnly in file B (%d):\n", len(result.OnlyInB))
+		for _, s := range result.OnlyInB {
+			fmt.Printf("  + %s\n", truncateSQL(s, 100))
+		}
+	}
+	if len(result.OnlyInA) == 0 && len(result.OnlyInB) == 0 {
+		fmt.Println("No differences found.")
+	}
+}
+
+// readSQLInput reads SQL from args or from a file (if arg starts with @).
+func readSQLInput(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	first := args[0]
+	if strings.HasPrefix(first, "@") {
+		data, err := os.ReadFile(first[1:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
+			os.Exit(1)
+		}
+		return strings.TrimSpace(string(data))
+	}
+	return strings.Join(args, " ")
+}
+
+// ============================================================================
 // Interactive SQL Tools REPL
 // ============================================================================
 
@@ -880,6 +1243,13 @@ func main() {
 	validateCmd := flag.NewFlagSet("validate", flag.ExitOnError)
 
 	explainCmd := flag.NewFlagSet("explain", flag.ExitOnError)
+
+	lintCmd := flag.NewFlagSet("lint", flag.ExitOnError)
+
+	normalizeCmd := flag.NewFlagSet("normalize", flag.ExitOnError)
+	normPlaceholders := normalizeCmd.Bool("placeholders", false, "Replace literals with ? placeholders")
+
+	diffCmd := flag.NewFlagSet("diff", flag.ExitOnError)
 
 	replCmd := flag.NewFlagSet("repl", flag.ExitOnError)
 	replTenant := replCmd.String("tenant", "default", "Tenant name")
@@ -892,11 +1262,11 @@ func main() {
 	switch os.Args[1] {
 	case "beautify":
 		beautifyCmd.Parse(os.Args[2:])
-		if beautifyCmd.NArg() < 1 {
-			fmt.Println("Usage: sqltools beautify [-upper=true] <sql>")
+		sql := readSQLInput(beautifyCmd.Args())
+		if sql == "" {
+			fmt.Println("Usage: sqltools beautify [-upper=true] <sql>  or  sqltools beautify @file.sql")
 			os.Exit(1)
 		}
-		sql := strings.Join(beautifyCmd.Args(), " ")
 		opts := DefaultBeautifyOptions()
 		opts.Uppercase = *beautifyUpper
 		b := NewSQLBeautifier(opts)
@@ -904,11 +1274,11 @@ func main() {
 
 	case "validate":
 		validateCmd.Parse(os.Args[2:])
-		if validateCmd.NArg() < 1 {
-			fmt.Println("Usage: sqltools validate <sql>")
+		sql := readSQLInput(validateCmd.Args())
+		if sql == "" {
+			fmt.Println("Usage: sqltools validate <sql>  or  sqltools validate @file.sql")
 			os.Exit(1)
 		}
-		sql := strings.Join(validateCmd.Args(), " ")
 		result := ValidateSQL(sql)
 		if result.Valid {
 			fmt.Printf("✓ Valid %s statement\n", result.SQLType)
@@ -922,11 +1292,11 @@ func main() {
 
 	case "explain":
 		explainCmd.Parse(os.Args[2:])
-		if explainCmd.NArg() < 1 {
-			fmt.Println("Usage: sqltools explain <sql>")
+		sql := readSQLInput(explainCmd.Args())
+		if sql == "" {
+			fmt.Println("Usage: sqltools explain <sql>  or  sqltools explain @file.sql")
 			os.Exit(1)
 		}
-		sql := strings.Join(explainCmd.Args(), " ")
 		plan, err := ExplainQuery(sql)
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
@@ -934,6 +1304,52 @@ func main() {
 		}
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 		PrintPlan(plan, w)
+
+	case "lint":
+		lintCmd.Parse(os.Args[2:])
+		sql := readSQLInput(lintCmd.Args())
+		if sql == "" {
+			fmt.Println("Usage: sqltools lint <sql>  or  sqltools lint @file.sql")
+			os.Exit(1)
+		}
+		result := LintSQL(sql)
+		PrintLintResult(result)
+		if len(result.Issues) > 0 {
+			for _, issue := range result.Issues {
+				if issue.Rule.Severity == "error" {
+					os.Exit(1)
+				}
+			}
+		}
+
+	case "normalize":
+		normalizeCmd.Parse(os.Args[2:])
+		sql := readSQLInput(normalizeCmd.Args())
+		if sql == "" {
+			fmt.Println("Usage: sqltools normalize [-placeholders] <sql>  or  sqltools normalize @file.sql")
+			os.Exit(1)
+		}
+		fmt.Println(NormalizeSQL(sql, *normPlaceholders))
+
+	case "diff":
+		diffCmd.Parse(os.Args[2:])
+		args := diffCmd.Args()
+		if len(args) < 2 {
+			fmt.Println("Usage: sqltools diff <fileA.sql> <fileB.sql>")
+			os.Exit(1)
+		}
+		dataA, err := os.ReadFile(args[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading %s: %v\n", args[0], err)
+			os.Exit(1)
+		}
+		dataB, err := os.ReadFile(args[1])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading %s: %v\n", args[1], err)
+			os.Exit(1)
+		}
+		result := DiffSQL(string(dataA), string(dataB))
+		PrintDiffResult(result)
 
 	case "templates":
 		fmt.Println("Available Query Templates:")
@@ -958,15 +1374,25 @@ func printUsage() {
 	fmt.Println(`SQL Tools - SSMS-like features for tinySQL
 
 Commands:
-  beautify [-upper=true] <sql>   Format SQL statement
-  validate <sql>                 Check SQL syntax
-  explain <sql>                  Show query execution plan
-  templates                      List query templates
-  repl [-tenant=default]         Interactive SQL tools shell
+  beautify [-upper=true] <sql>    Format SQL statement
+  validate <sql>                  Check SQL syntax
+  explain <sql>                   Show query execution plan
+  lint <sql>                      Multi-rule SQL analysis
+  normalize [-placeholders] <sql> Canonicalize SQL for comparison
+  diff <fileA.sql> <fileB.sql>    Compare two SQL files
+  templates                       List query templates
+  repl [-tenant=default]          Interactive SQL tools shell
+
+File input: Use @filename to read SQL from a file, e.g.:
+  sqltools beautify @query.sql
+  sqltools lint @migrations.sql
 
 Examples:
   sqltools beautify "select * from users where id=1"
   sqltools validate "SELECT name FROM users"
+  sqltools lint "DELETE FROM users; SELECT * FROM orders"
+  sqltools normalize -placeholders "SELECT * FROM users WHERE id = 42"
+  sqltools diff old_schema.sql new_schema.sql
   sqltools explain "SELECT * FROM orders JOIN users ON orders.user_id = users.id"
   sqltools repl`)
 }
