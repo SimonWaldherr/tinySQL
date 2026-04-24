@@ -165,6 +165,15 @@ const (
 	VectorType
 	// GeometryType stores spatial geometry values (GeoJSON/WKB) as JSONB or binary payload.
 	GeometryType
+
+	// YAMLType stores YAML-formatted text data.
+	YAMLType
+	// URLType stores URL/URI values with optional validation.
+	URLType
+	// HASHType stores cryptographic hash digests (hex-encoded).
+	HASHType
+	// BitmapType stores roaring-bitmap or bitset values as a byte slice.
+	BitmapType
 )
 
 var colTypeToString = map[ColType]string{
@@ -203,6 +212,10 @@ var colTypeToString = map[ColType]string{
 	InterfaceType:  "INTERFACE",
 	VectorType:     "VECTOR",
 	GeometryType:   "GEOMETRY",
+	YAMLType:       "YAML",
+	URLType:        "URL",
+	HASHType:       "HASH",
+	BitmapType:     "BITMAP",
 	// Additional types
 	DecimalType:  "DECIMAL",
 	MoneyType:    "MONEY",

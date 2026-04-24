@@ -64,6 +64,8 @@ func resolveSysTable(env ExecEnv, name string) ([]Row, error) {
 		return sysConfigRows(env), nil
 	case "connections":
 		return sysConnectionsRows(env), nil
+	case "triggers":
+		return sysTriggersRows(env), nil
 	default:
 		return nil, fmt.Errorf("unknown sys table: %s", name)
 	}
@@ -456,4 +458,24 @@ func Version() string {
 		return bi.Main.Version
 	}
 	return "dev"
+}
+
+// ─────────────────────────── sys.triggers ────────────────────────────────────
+
+func sysTriggersRows(env ExecEnv) []Row {
+	triggers := env.db.Catalog().ListTriggers()
+	rows := make([]Row, 0, len(triggers))
+	for _, t := range triggers {
+		r := make(Row)
+		putVal(r, "name", t.Name)
+		putVal(r, "table", t.Table)
+		putVal(r, "timing", string(t.Timing))
+		putVal(r, "event", string(t.Event))
+		putVal(r, "for_each_row", t.ForEachRow)
+		putVal(r, "when_expr", t.WhenExpr)
+		putVal(r, "body", t.Body)
+		putVal(r, "created_at", t.CreatedAt.Format(time.RFC3339))
+		rows = append(rows, r)
+	}
+	return rows
 }
