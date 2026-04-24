@@ -15,7 +15,7 @@ It is based on the repo examples in `example_test.go`, `import_example_test.go`,
 TinySQL kann auf drei Ebenen integriert werden:
 
 - **Direkt in Go**: Du arbeitest mit dem Paket `github.com/SimonWaldherr/tinySQL` und rufst Parser, Ausfuehrung und Importfunktionen direkt auf.
-- **Ueber `database/sql`**: Wenn du bereits ein SQL-typisches Projekt hast, kannst du den internen Driver verwenden und TinySQL wie eine Datenbank per DSN ansprechen.
+- **Ueber `database/sql`**: Wenn du bereits ein SQL-typisches Projekt hast, importiere das oeffentliche Paket `github.com/SimonWaldherr/tinySQL/driver` und sprich TinySQL wie eine Datenbank per DSN an.
 - **Im Browser via WASM**: Der Build `cmd/query_files_wasm` zeigt, wie TinySQL als WebAssembly-Modul laeuft und aus JavaScript angesprochen wird.
 
 Die Beispiele in diesem Repository sind bewusst unterschiedlich aufgebaut:
@@ -80,7 +80,9 @@ Wichtige Punkte:
 
 #### `database/sql` verwenden
 
-Wenn du schon mit `database/sql` arbeitest, ist der interne Driver oft die sauberste Integration:
+Wenn du schon mit `database/sql` arbeitest, ist das oeffentliche Paket `github.com/SimonWaldherr/tinySQL/driver` die sauberste Integration.
+
+Wichtig fuer Go-Projekte: `internal/` ist ein Sprachfeature. Pakete unter `internal/` duerfen nur aus demselben Modul importiert werden. Deshalb koennen die Beispiele unter `cmd/` zwar `github.com/SimonWaldherr/tinySQL/internal/driver` nutzen, externe Tools und Anwendungen aber nicht. Fuer andere Module ist `github.com/SimonWaldherr/tinySQL/driver` der stabile Einstiegspunkt.
 
 ```go
 package main
@@ -89,11 +91,11 @@ import (
     "database/sql"
     "fmt"
 
-    _ "github.com/SimonWaldherr/tinySQL/internal/driver"
+    tsqldriver "github.com/SimonWaldherr/tinySQL/driver"
 )
 
 func main() {
-    db, err := sql.Open("tinysql", "mem://?tenant=default")
+    db, err := sql.Open(tsqldriver.DriverName, "mem://?tenant=default")
     if err != nil {
         panic(err)
     }
@@ -116,6 +118,21 @@ DSN-Muster aus dem Repo:
 
 - In-Memory: `mem://?tenant=default`
 - Datei-basiert: `file:/pfad/zur/db.dat?tenant=default&autosave=1`
+
+Nuetzliche Helfer aus dem oeffentlichen Driver-Paket:
+
+- `driver.Open(dsn)` fuer den direkten `database/sql`-Einstieg
+- `driver.OpenInMemory("default")` fuer kurzlebige Tests oder Werkzeuge
+- `driver.OpenFile("/pfad/zur/db.dat")` fuer dateibasierte Tools
+
+#### Eigene Werkzeuge und Erweiterungen bauen
+
+Wenn du ein eigenes Tool auf tinySQL aufsetzt, halte deine Imports auf der oeffentlichen API:
+
+- `github.com/SimonWaldherr/tinySQL` fuer Engine, Parser, Importer und stabile Typen
+- `github.com/SimonWaldherr/tinySQL/driver` fuer `database/sql`
+
+Die Root-API re-exportiert bewusst wichtige Typen aus internen Paketen, damit andere Projekte keine `internal/...`-Imports brauchen. Wenn dein Tool eigene tabellenwertige Funktionen bereitstellen soll, nutze `tinysql.RegisterExternalTableFunc(...)` als Erweiterungspunkt statt direkt gegen `internal/engine` zu entwickeln.
 
 #### Dateien importieren
 
@@ -300,7 +317,7 @@ Das ist wichtig fuer Entwickler: TinySQL ist nicht nur eine Lern-Demo, sondern k
 TinySQL can be integrated at three levels:
 
 - **Directly in Go**: use the package `github.com/SimonWaldherr/tinySQL` and call the parser, execution, and import helpers directly.
-- **Through `database/sql`**: if your project already uses SQL-style APIs, you can use the internal driver and access TinySQL through a DSN.
+- **Through `database/sql`**: if your project already uses SQL-style APIs, import the public package `github.com/SimonWaldherr/tinySQL/driver` and access TinySQL through a DSN.
 - **In the browser via WASM**: `cmd/query_files_wasm` shows how TinySQL runs as a WebAssembly module and is controlled from JavaScript.
 
 The repository examples are intentionally complementary:
@@ -364,7 +381,9 @@ Key points:
 
 #### Using `database/sql`
 
-If your code already expects a `database/sql` handle, this is often the cleanest route:
+If your code already expects a `database/sql` handle, the public package `github.com/SimonWaldherr/tinySQL/driver` is usually the cleanest route.
+
+Important Go detail: `internal/` is one of Go's package visibility rules. Anything below `internal/` can only be imported from within the same module tree. That is why the repository's own commands can use `github.com/SimonWaldherr/tinySQL/internal/driver`, while external tools cannot. For other modules, `github.com/SimonWaldherr/tinySQL/driver` is the supported entry point.
 
 ```go
 package main
@@ -373,11 +392,11 @@ import (
     "database/sql"
     "fmt"
 
-    _ "github.com/SimonWaldherr/tinySQL/internal/driver"
+    tsqldriver "github.com/SimonWaldherr/tinySQL/driver"
 )
 
 func main() {
-    db, err := sql.Open("tinysql", "mem://?tenant=default")
+    db, err := sql.Open(tsqldriver.DriverName, "mem://?tenant=default")
     if err != nil {
         panic(err)
     }
@@ -400,6 +419,21 @@ DSN patterns from the repo:
 
 - In-memory: `mem://?tenant=default`
 - File-backed: `file:/path/to/db.dat?tenant=default&autosave=1`
+
+Useful helpers from the public driver package:
+
+- `driver.Open(dsn)` for direct `database/sql` integration
+- `driver.OpenInMemory("default")` for tests and short-lived tools
+- `driver.OpenFile("/path/to/db.dat")` for file-backed tools
+
+#### Building your own tools and extensions
+
+When you build tooling on top of tinySQL, keep your imports on the public surface:
+
+- `github.com/SimonWaldherr/tinySQL` for the engine, parser, importers, and stable re-exported types
+- `github.com/SimonWaldherr/tinySQL/driver` for `database/sql`
+
+The root package deliberately re-exports the important types from internal packages so external projects do not need `internal/...` imports. If your tool needs custom table-valued functions, use `tinysql.RegisterExternalTableFunc(...)` instead of depending on `internal/engine`.
 
 #### Importing files
 
