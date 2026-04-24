@@ -324,26 +324,24 @@ func (p *Parser) ParseStatement() (Statement, error) {
 		return nil, p.errf("expected a statement")
 	}
 
-	// handler map for simple single-keyword dispatch
-	handlers := map[string]func() (Statement, error){
-		"CREATE": p.parseCreate,
-		"DROP":   p.parseDrop,
-		"ALTER":  p.parseAlter,
-		"INSERT": p.parseInsert,
-		"UPDATE": p.parseUpdate,
-		"DELETE": p.parseDelete,
-	}
-
-	if h, ok := handlers[p.cur.Val]; ok {
-		return h()
-	}
-
-	// SELECT and WITH are handled by the same parser
-	if p.cur.Val == "SELECT" || p.cur.Val == "WITH" {
+	switch p.cur.Val {
+	case "CREATE":
+		return p.parseCreate()
+	case "DROP":
+		return p.parseDrop()
+	case "ALTER":
+		return p.parseAlter()
+	case "INSERT":
+		return p.parseInsert()
+	case "UPDATE":
+		return p.parseUpdate()
+	case "DELETE":
+		return p.parseDelete()
+	case "SELECT", "WITH":
 		return p.parseSelectWithCTE()
+	default:
+		return nil, p.errf("expected a statement")
 	}
-
-	return nil, p.errf("expected a statement")
 }
 
 //nolint:gocyclo // CREATE statement grammar is broad and handled centrally here.
@@ -1617,7 +1615,9 @@ func (p *Parser) parseForeignKeyConstraint(col *storage.Column) error {
 				p.next()
 				column := p.parseIdentLike()
 				if column != "" {
-					p.expectSymbol(")")
+					if err := p.expectSymbol(")"); err != nil {
+						return err
+					}
 					col.ForeignKey = &storage.ForeignKeyRef{Table: table, Column: column}
 				}
 			}

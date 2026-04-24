@@ -26,6 +26,35 @@
             display: none !important;
         }
 
+        .sr-only {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            padding: 0;
+            margin: -1px;
+            overflow: hidden;
+            clip: rect(0, 0, 0, 0);
+            white-space: nowrap;
+            border: 0;
+        }
+
+        .skip-link {
+            position: absolute;
+            left: 12px;
+            top: -40px;
+            z-index: 2000;
+            background: #0e639c;
+            color: #fff;
+            padding: 8px 12px;
+            border-radius: 4px;
+            text-decoration: none;
+            transition: top 0.15s ease;
+        }
+
+        .skip-link:focus {
+            top: 12px;
+        }
+
         /* Top Bar */
         .topbar {
             background: #2d2d30;
@@ -63,6 +92,21 @@
 
         .topbar button:hover {
             background: #1177bb;
+        }
+
+        .topbar button:focus-visible,
+        .sidebar-header button:focus-visible,
+        .editor-toolbar button:focus-visible,
+        .results-actions button:focus-visible,
+        .vg-header-actions button:focus-visible,
+        .history-title button:focus-visible,
+        .schema-actions button:focus-visible,
+        .upload-btn:focus-visible,
+        .example-query:focus-visible,
+        .table-info-btn:focus-visible,
+        .table-remove:focus-visible {
+            outline: 2px solid #9cdcfe;
+            outline-offset: 2px;
         }
 
         .spacer {
@@ -176,11 +220,60 @@
         /* Sidebar */
         .sidebar {
             width: 280px;
+            min-width: 200px;
             background: #252526;
             border-right: 1px solid #3e3e42;
             display: flex;
             flex-direction: column;
             overflow-y: auto;
+            transition: width 0.2s;
+        }
+
+        .sidebar-toggle {
+            display: none;
+            position: fixed;
+            left: 8px;
+            bottom: 8px;
+            z-index: 1000;
+            background: #0e639c;
+            border: none;
+            color: #fff;
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            font-size: 18px;
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+        }
+
+        @media (max-width: 768px) {
+            .sidebar {
+                position: fixed;
+                left: 0;
+                top: 0;
+                bottom: 0;
+                z-index: 500;
+                transform: translateX(-100%);
+                transition: transform 0.25s;
+                box-shadow: 4px 0 20px rgba(0,0,0,0.5);
+            }
+            .sidebar.open {
+                transform: translateX(0);
+            }
+            .sidebar-toggle {
+                display: block;
+            }
+            .topbar {
+                flex-wrap: wrap;
+                gap: 8px;
+            }
+            .editor-hint {
+                display: none;
+            }
+            .results-actions {
+                flex-direction: column;
+                align-items: stretch;
+            }
         }
 
         .sidebar-header {
@@ -336,6 +429,112 @@
             background: #505050;
         }
 
+        .editor-shell {
+            position: relative;
+            display: block;
+        }
+
+        .editor-line-count {
+            position: absolute;
+            bottom: 4px;
+            right: 10px;
+            z-index: 2;
+            font-size: 11px;
+            color: #666;
+            pointer-events: none;
+            user-select: none;
+        }
+
+        .sql-highlighter {
+            position: absolute;
+            inset: 0;
+            margin: 0;
+            padding: 12px;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            background: #2d2d30;
+            color: #d4d4d4;
+            font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+            font-size: 14px;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            word-break: break-word;
+            overflow: hidden;
+            pointer-events: none;
+            user-select: none;
+        }
+
+        .sql-token.keyword { color: #c586c0; }
+        .sql-token.string { color: #ce9178; }
+        .sql-token.comment { color: #6a9955; }
+        .sql-token.number { color: #b5cea8; }
+        .sql-token.muted { color: #7a7a7a; }
+
+        #queryEditor {
+            position: relative;
+            z-index: 1;
+            background: transparent;
+            color: transparent;
+            caret-color: #d4d4d4;
+            resize: vertical;
+        }
+
+        #queryEditor::placeholder {
+            color: #8a8a8a;
+        }
+
+        .autocomplete-panel {
+            position: absolute;
+            left: 0;
+            right: 0;
+            top: calc(100% - 6px);
+            z-index: 40;
+            background: #252526;
+            border: 1px solid #3e3e42;
+            border-radius: 0 0 6px 6px;
+            box-shadow: 0 12px 28px rgba(0, 0, 0, 0.35);
+            max-height: 220px;
+            overflow-y: auto;
+        }
+
+        .autocomplete-panel.hidden {
+            display: none !important;
+        }
+
+        .autocomplete-item {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 8px 12px;
+            font-size: 12px;
+            border-bottom: 1px solid #333;
+            cursor: pointer;
+        }
+
+        .autocomplete-item:last-child {
+            border-bottom: none;
+        }
+
+        .autocomplete-item strong {
+            color: #fff;
+            font-weight: 600;
+        }
+
+        .autocomplete-item span {
+            color: #999;
+            white-space: nowrap;
+        }
+
+        .autocomplete-item.active,
+        .autocomplete-item:hover {
+            background: #0e639c;
+        }
+
+        .autocomplete-item.active span,
+        .autocomplete-item:hover span {
+            color: #d9ecff;
+        }
+
         textarea {
             width: 100%;
             min-height: 120px;
@@ -353,6 +552,7 @@
         textarea:focus {
             outline: none;
             border-color: #0e639c;
+            box-shadow: 0 0 0 1px #0e639c;
         }
 
         /* Results Area */
@@ -380,6 +580,55 @@
         .results-actions {
             display: flex;
             gap: 8px;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+        }
+
+        .results-toolbar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 12px;
+            align-items: center;
+        }
+
+        .results-toolbar label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            color: #999;
+        }
+
+        .results-toolbar input,
+        .results-toolbar select {
+            background: #2d2d30;
+            border: 1px solid #3e3e42;
+            color: #d4d4d4;
+            border-radius: 4px;
+            padding: 6px 8px;
+            font-size: 12px;
+            min-width: 150px;
+        }
+
+        .results-toolbar input:focus,
+        .results-toolbar select:focus {
+            border-color: #0e639c;
+            outline: none;
+        }
+
+        .results-toolbar button {
+            background: #3e3e42;
+            border: none;
+            color: #ccc;
+            padding: 6px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+
+        .results-toolbar button:hover {
+            background: #505050;
         }
 
         .results-actions button {
@@ -426,6 +675,40 @@
             z-index: 10;
         }
 
+        .sortable-column {
+            padding: 0;
+        }
+
+        .column-sort-button {
+            width: 100%;
+            background: transparent;
+            border: none;
+            color: inherit;
+            padding: 12px;
+            text-align: left;
+            font: inherit;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+
+        .column-sort-button:hover {
+            background: #37373d;
+        }
+
+        .column-sort-button:focus-visible {
+            outline: 2px solid #9cdcfe;
+            outline-offset: -2px;
+        }
+
+        .column-sort-indicator {
+            color: #9cdcfe;
+            font-size: 11px;
+            flex: 0 0 auto;
+        }
+
         .result-table td {
             padding: 10px 12px;
             border-bottom: 1px solid #3e3e42;
@@ -437,18 +720,50 @@
             background: #2a2d2e;
         }
 
+        .result-table tbody tr:nth-child(even) {
+            background: #262627;
+        }
+
+        .result-table tbody tr:nth-child(even):hover {
+            background: #2a2d2e;
+        }
+
         .result-table td.null-value {
-            color: #888;
+            color: #666;
             font-style: italic;
+            background: repeating-linear-gradient(135deg, transparent, transparent 3px, rgba(255,255,255,0.02) 3px, rgba(255,255,255,0.02) 6px);
         }
 
         .result-table td.number-value {
             font-family: 'Consolas', monospace;
             color: #b5cea8;
+            text-align: right;
         }
 
         .result-table td.boolean-value {
             color: #569cd6;
+        }
+
+        .result-table td.truncated-cell {
+            max-width: 300px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            cursor: help;
+        }
+
+        .result-table td.truncated-cell:hover {
+            white-space: normal;
+            word-break: break-all;
+            max-width: none;
+        }
+
+        .result-table tr.selected-row {
+            background: #264f78 !important;
+        }
+
+        .result-table tr.selected-row td {
+            color: #fff;
         }
 
         /* Error/Empty States */
@@ -482,6 +797,39 @@
         .empty-state-text {
             font-size: 14px;
             line-height: 1.5;
+        }
+
+        .example-query {
+            display: block;
+            width: 100%;
+            text-align: left;
+            border: 1px solid transparent;
+        }
+
+        .example-query:focus-visible {
+            border-color: #9cdcfe;
+            background: #3e3e42;
+        }
+
+        .schema-panel[aria-hidden="true"] {
+            display: none !important;
+        }
+
+        .schema-panel[aria-hidden="false"] {
+            display: block;
+        }
+
+        .results-area {
+            scroll-behavior: smooth;
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: 0.01ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.01ms !important;
+                scroll-behavior: auto !important;
+            }
         }
 
         /* File Upload */
@@ -617,6 +965,11 @@
             overflow: auto;
             max-height: 60vh;
             border-radius: 4px;
+            border: 1px solid #3e3e42;
+        }
+
+        .result-table-wrap:focus-within {
+            border-color: #0e639c;
         }
 
         /* History panel */
@@ -825,37 +1178,41 @@
     </style>
 </head>
 <body>
+    <a class="skip-link" href="#queryEditor">Skip to query editor</a>
     <!-- Top Bar -->
     <div class="topbar">
         <h1>TinySQL Editor</h1>
-        <button onclick="showUploadDialog()">📁 Upload File</button>
-        <button id="loadAllDemosBtn" style="background: #7d2d7d;">✨ Load Demo Tables</button>
-        <button onclick="toggleHistory()" style="background: #3e3e42;">📜 History</button>
+        <button onclick="showUploadDialog()" aria-label="Upload file">📁 Upload File</button>
+        <button onclick="importClipboardData()" aria-label="Import data from clipboard">📋 Import Clipboard</button>
+        <button id="loadAllDemosBtn" style="background: #7d2d7d;" aria-label="Load demo data and large tables">✨ Load Demo + Large Tables</button>
+        <button onclick="toggleHistory()" style="background: #3e3e42;" aria-label="Toggle query history">📜 History</button>
         <div class="spacer"></div>
         <div class="status">
             <div class="status-indicator"></div>
-            <span id="statusText">Ready</span>
+            <span id="statusText" role="status" aria-live="polite" aria-atomic="true">Ready</span>
         </div>
     </div>
 
     <!-- Main Layout -->
     <div class="main">
+        <!-- Sidebar toggle for mobile -->
+        <button class="sidebar-toggle" onclick="toggleSidebar()" aria-label="Toggle sidebar">☰</button>
         <!-- Sidebar -->
         <div class="sidebar">
             <div class="sidebar-header">
                 <h2>Tables</h2>
                 <div class="sidebar-actions">
-                    <button onclick="loadTables()" title="Refresh">↻</button>
-                    <button onclick="clearAllTables()" title="Clear all tables">🗑</button>
+                    <button onclick="loadTables()" title="Refresh" aria-label="Refresh tables">↻</button>
+                    <button onclick="clearAllTables()" title="Clear all tables" aria-label="Clear all tables">🗑</button>
                 </div>
             </div>
             <div class="upload-area">
                 <label class="upload-btn" for="fileInput">
                     📤 Upload File
                 </label>
-                <input type="file" id="fileInput" accept=".csv,.json,.xml,.xlsx,.xls" multiple onchange="handleFileUpload(event)">
-                <div style="font-size: 11px; color: #888; margin-top: 8px; padding: 0 4px;">
-                    Supports: CSV, JSON, XML, Excel (.xlsx, .xls)
+                <input type="file" id="fileInput" accept=".csv,.tsv,.txt,.json,.jsonl,.ndjson,.xml,.xlsx,.xls" multiple onchange="handleFileUpload(event)" aria-describedby="uploadHelp">
+                <div id="uploadHelp" style="font-size: 11px; color: #888; margin-top: 8px; padding: 0 4px;">
+                    Supports: CSV, TSV, TXT, JSON, JSONL/NDJSON, XML
                 </div>
             </div>
             <div class="table-list" id="tableList">
@@ -865,7 +1222,7 @@
                     <div class="empty-state-text">Upload a file or load from disk</div>
                 </div>
             </div>
-            <div id="schemaPanel" class="schema-panel hidden"></div>
+            <div id="schemaPanel" class="schema-panel hidden" role="region" aria-hidden="true" aria-labelledby="schemaPanelTitle" tabindex="-1"></div>
             <div id="demoQueries" class="examples hidden">
                 <div class="examples-title">Demo Queries</div>
                 <div class="example-query" onclick="setQuery('-- Sales by region\nSELECT region, SUM(quantity * unit_price) AS revenue\nFROM sales\nGROUP BY region\nORDER BY revenue DESC')">
@@ -892,6 +1249,15 @@
                 <div class="example-query" onclick="setQuery('-- Multi-statement: create and query\nCREATE TABLE temp (id INTEGER, label TEXT);\nINSERT INTO temp VALUES (1, \'alpha\');\nINSERT INTO temp VALUES (2, \'beta\');\nSELECT * FROM temp')">
                     🔁 Multi-Statement
                 </div>
+                <div class="example-query" onclick="setQuery('-- Large sales cube\nSELECT region, channel, category,\n       COUNT(*) AS orders,\n       SUM(order_total) AS revenue\nFROM sales_large\nGROUP BY region, channel, category\nORDER BY revenue DESC')">
+                    🧮 Large Sales Cube
+                </div>
+                <div class="example-query" onclick="setQuery('-- Large logistics performance\nSELECT carrier, service_level,\n       COUNT(*) AS shipments,\n       AVG(delivery_days) AS avg_delivery_days,\n       SUM(shipping_cost) AS total_shipping_cost\nFROM logistics_large\nGROUP BY carrier, service_level\nORDER BY shipments DESC')">
+                    🚛 Large Logistics
+                </div>
+                <div class="example-query" onclick="setQuery('-- Large web event trends\nSELECT event_date, acquisition_channel,\n       COUNT(*) AS events,\n       SUM(converted) AS conversions,\n       SUM(revenue_impact) AS influenced_revenue\nFROM web_events_large\nGROUP BY event_date, acquisition_channel\nORDER BY event_date DESC')">
+                    🌐 Event Trends
+                </div>
             </div>
             <div id="historyPanel" class="history-section hidden">
                 <div class="history-title">
@@ -907,14 +1273,18 @@
             <!-- Editor Area -->
             <div class="editor-area">
                 <div class="editor-toolbar">
-                    <button id="executeBtn" onclick="onExecuteClick()" disabled>
+                    <button id="executeBtn" onclick="onExecuteClick()" disabled aria-label="Execute SQL query">
                         ▶ Execute
                     </button>
-                    <button class="btn-secondary" onclick="clearQuery()">Clear</button>
-                    <button class="btn-secondary" onclick="formatQuery()">Format</button>
-                    <div class="editor-hint">Ctrl/Cmd+Enter to run • Tab to indent • ↑ recall last query</div>
+                    <button class="btn-secondary" onclick="clearQuery()" aria-label="Clear query editor">Clear</button>
+                    <button class="btn-secondary" onclick="formatQuery()" aria-label="Format SQL query">Format</button>
+                    <button class="btn-secondary" onclick="copyQueryToClipboard()" aria-label="Copy SQL query">Copy SQL</button>
+                    <div class="editor-hint">Ctrl/Cmd+Enter to run • Ctrl/Cmd+Space autocomplete • Tab to indent • ↑ recall last query</div>
                 </div>
-                <textarea id="queryEditor" placeholder="Enter your SQL query here...
+                <div class="editor-shell">
+                    <pre id="sqlHighlight" class="sql-highlighter" aria-hidden="true"></pre>
+                    <label for="queryEditor" class="sr-only">SQL query editor</label>
+                    <textarea id="queryEditor" placeholder="Enter your SQL query here...
 Example: SELECT * FROM users WHERE age > 25
 
 Supported features:
@@ -925,12 +1295,16 @@ Supported features:
 - CASE expressions, sub-queries
 - Multi-statement (separated by ;)
 - Import: CSV, JSON, XML, Excel
-- Export: CSV, JSON, XML"></textarea>
+-- Export: CSV, JSON, XML" aria-describedby="editorHelp" aria-expanded="false"></textarea>
+                    <div id="autocompletePanel" class="autocomplete-panel hidden" role="listbox" aria-label="SQL suggestions" aria-hidden="true"></div>
+                    <div id="editorLineCount" class="editor-line-count"></div>
+                </div>
+                <div id="editorHelp" class="sr-only">Write SQL here. Use Ctrl or Command plus Enter to execute. Use Tab to indent and the up arrow to recall the last query when the editor is empty.</div>
             </div>
 
             <!-- Results Area -->
             <div class="results-area vg-theme-dark vg-compact">
-                <div id="resultsContainer">
+                <div id="resultsContainer" aria-live="polite" aria-busy="false">
                     <div class="empty-state">
                         <div class="empty-state-icon">⚡</div>
                         <div class="empty-state-title">Ready to Query</div>

@@ -137,6 +137,99 @@ func insertAllRecords(
 	return rowsInserted, rowsSkipped, errors
 }
 
+// insertCSVRecords inserts an initial slice of CSV records and then continues
+// reading from the provided reader with batching.
+func insertCSVRecords(
+	ctx context.Context,
+	db *storage.DB,
+	tenant string,
+	tableName string,
+	colNames []string,
+	colTypes []storage.ColType,
+	initialRecords [][]string,
+	csvr *csv.Reader,
+	opts *ImportOptions,
+) (rowsInserted int64, rowsSkipped int64, errors []string) {
+	errors = make([]string, 0)
+	batch := make([][]any, 0, opts.BatchSize)
+	rowNum := 0
+
+	flushBatch := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+
+		tbl, err := db.Get(tenant, tableName)
+		if err != nil {
+			return fmt.Errorf("get table: %w", err)
+		}
+
+		tbl.Rows = append(tbl.Rows, batch...)
+		rowsInserted += int64(len(batch))
+		batch = batch[:0]
+		return nil
+	}
+
+	processRecord := func(rec []string) bool {
+		rowNum++
+		row, err := convertRow(rec, colNames, colTypes, opts)
+		if err != nil {
+			if opts.StrictTypes {
+				errors = append(errors, fmt.Sprintf("row %d: %v", rowNum, err))
+				rowsSkipped++
+				return true
+			}
+			errors = append(errors, fmt.Sprintf("row %d: %v (skipped)", rowNum, err))
+			rowsSkipped++
+			return false
+		}
+
+		batch = append(batch, row)
+		if len(batch) >= opts.BatchSize {
+			if err := flushBatch(); err != nil {
+				errors = append(errors, err.Error())
+				return true
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			errors = append(errors, "import cancelled")
+			return true
+		default:
+		}
+		return false
+	}
+
+	for _, rec := range initialRecords {
+		if stop := processRecord(rec); stop {
+			return rowsInserted, rowsSkipped, errors
+		}
+	}
+
+	for {
+		rec, err := csvr.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			rowNum++
+			errors = append(errors, fmt.Sprintf("row %d: read error: %v", rowNum, err))
+			rowsSkipped++
+			continue
+		}
+		if stop := processRecord(rec); stop {
+			return rowsInserted, rowsSkipped, errors
+		}
+	}
+
+	if err := flushBatch(); err != nil {
+		errors = append(errors, err.Error())
+	}
+
+	return rowsInserted, rowsSkipped, errors
+}
+
 // streamInsertCSV reads CSV records and inserts them into the table with batching.
 // DEPRECATED: Use insertAllRecords instead for simpler in-memory processing.
 //
@@ -152,100 +245,11 @@ func streamInsertCSV(
 	csvr *csv.Reader,
 	opts *ImportOptions,
 ) (rowsInserted int64, rowsSkipped int64, errors []string) {
-	errors = make([]string, 0)
-	batch := make([][]any, 0, opts.BatchSize)
-
-	// Helper to flush batch
-	flushBatch := func() error {
-		if len(batch) == 0 {
-			return nil
-		}
-
-		// Get table and append rows directly
-		tbl, err := db.Get(tenant, tableName)
-		if err != nil {
-			return fmt.Errorf("get table: %w", err)
-		}
-
-		// Append batch to table rows
-		tbl.Rows = append(tbl.Rows, batch...)
-
-		rowsInserted += int64(len(batch))
-		batch = batch[:0] // Clear batch
-		return nil
-	}
-
-	// Process first data row if present (no-header case)
+	initialRecords := make([][]string, 0, 1)
 	if firstDataRow != nil {
-		row, err := convertRow(firstDataRow, colNames, colTypes, opts)
-		if err != nil {
-			if opts.StrictTypes {
-				errors = append(errors, fmt.Sprintf("row 1: %v", err))
-				return rowsInserted, rowsSkipped + 1, errors
-			}
-			errors = append(errors, fmt.Sprintf("row 1: %v (skipped)", err))
-			rowsSkipped++
-		} else {
-			batch = append(batch, row)
-		}
+		initialRecords = append(initialRecords, firstDataRow)
 	}
-
-	// Process remaining rows
-	rowNum := 1
-	if firstDataRow == nil {
-		rowNum = 0 // Header was present
-	}
-
-	for {
-		rec, err := csvr.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			errors = append(errors, fmt.Sprintf("row %d: read error: %v", rowNum+1, err))
-			rowsSkipped++
-			continue
-		}
-
-		rowNum++
-
-		// Convert and validate row
-		row, err := convertRow(rec, colNames, colTypes, opts)
-		if err != nil {
-			if opts.StrictTypes {
-				errors = append(errors, fmt.Sprintf("row %d: %v", rowNum, err))
-				return rowsInserted, rowsSkipped + 1, errors
-			}
-			errors = append(errors, fmt.Sprintf("row %d: %v (skipped)", rowNum, err))
-			rowsSkipped++
-			continue
-		}
-
-		batch = append(batch, row)
-
-		// Flush batch when full
-		if len(batch) >= opts.BatchSize {
-			if err := flushBatch(); err != nil {
-				errors = append(errors, err.Error())
-				return rowsInserted, rowsSkipped, errors
-			}
-		}
-
-		// Check context cancellation
-		select {
-		case <-ctx.Done():
-			errors = append(errors, "import cancelled")
-			return rowsInserted, rowsSkipped, errors
-		default:
-		}
-	}
-
-	// Flush remaining batch
-	if err := flushBatch(); err != nil {
-		errors = append(errors, err.Error())
-	}
-
-	return rowsInserted, rowsSkipped, errors
+	return insertCSVRecords(ctx, db, tenant, tableName, colNames, colTypes, initialRecords, csvr, opts)
 }
 
 // convertRow converts a CSV record to a typed row for insertion.

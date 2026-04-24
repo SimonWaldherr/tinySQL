@@ -1,183 +1,218 @@
+// catalog_demo – tinySQL Catalog & Scheduler demonstration.
+//
+// This tool shows how to use tinySQL's built-in catalog (table/view/function
+// registry) and job scheduler to run periodic SQL maintenance tasks.
+//
+// The scheduler executor is backed by the real tinySQL engine, so every
+// scheduled job actually runs its SQL statement and prints the result.
+//
+// Usage:
+//
+//	catalog_demo
 package main
 
 import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
+	tinysql "github.com/SimonWaldherr/tinySQL"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
-// SimpleExecutor implements the JobExecutor interface for demo purposes
-type SimpleExecutor struct {
-	db *storage.DB
+// TinySQLExecutor implements storage.JobExecutor using the tinySQL engine.
+// It parses and executes SQL statements, printing SELECT results to stdout.
+type TinySQLExecutor struct {
+	db     *tinysql.DB
+	tenant string
 }
 
-func (e *SimpleExecutor) ExecuteSQL(ctx context.Context, sql string) (interface{}, error) {
-	log.Printf("Executing SQL: %s", sql)
-	// In real implementation, this would parse and execute the SQL
-	// For demo, just log it
-	return nil, nil
+func (e *TinySQLExecutor) ExecuteSQL(ctx context.Context, sql string) (interface{}, error) {
+	stmt, err := tinysql.ParseSQL(sql)
+	if err != nil {
+		return nil, fmt.Errorf("parse: %w", err)
+	}
+	rs, err := tinysql.Execute(ctx, e.db, e.tenant, stmt)
+	if err != nil {
+		return nil, fmt.Errorf("execute: %w", err)
+	}
+	if rs != nil && len(rs.Rows) > 0 {
+		log.Printf("job result (%d rows): %v", len(rs.Rows), formatFirstRow(rs))
+	}
+	return rs, nil
+}
+
+func formatFirstRow(rs *tinysql.ResultSet) string {
+	if len(rs.Rows) == 0 {
+		return "(empty)"
+	}
+	row := rs.Rows[0]
+	parts := make([]string, 0, len(rs.Cols))
+	for _, col := range rs.Cols {
+		parts = append(parts, fmt.Sprintf("%s=%v", col, row[col]))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func main() {
-	fmt.Println("=== TinySQL Catalog & Scheduler Demo ===")
+	fmt.Println("=== tinySQL Catalog & Scheduler Demo ===")
 	fmt.Println()
 
-	// Create database
-	db := storage.NewDB()
-	catalog := db.Catalog()
+	// ── Set up tinySQL database ────────────────────────────────────────────
+	tdb := tinysql.NewDB()
+	tenant := "default"
+	ctx := context.Background()
 
-	// ==================== Register Tables ====================
+	exec := func(sql string) {
+		stmt, err := tinysql.ParseSQL(sql)
+		if err != nil {
+			log.Fatalf("parse error: %v (sql: %s)", err, sql)
+		}
+		if _, err := tinysql.Execute(ctx, tdb, tenant, stmt); err != nil {
+			log.Fatalf("execute error: %v (sql: %s)", err, sql)
+		}
+	}
+	// Seed data for the scheduled jobs to work with.
+	// Values are constructed from literal constants and loop counters only.
+	exec(`CREATE TABLE events (id INT, kind TEXT, ts INT, payload TEXT)`)
+	exec(`CREATE TABLE event_stats (kind TEXT, total INT, last_updated INT)`)
+
+	baseTS := time.Now().Unix()
+	kinds := [3]string{"click", "click", "view"} // index mod 3 selects the kind
+	for i := 1; i <= 20; i++ {
+		kind := kinds[i%3]
+		id := i
+		ts := baseTS - int64(i*60)
+		payload := fmt.Sprintf("payload-%d", id)
+		// Build INSERT from fully controlled integer/string values.
+		exec(fmt.Sprintf(`INSERT INTO events VALUES (%d, '%s', %d, '%s')`,
+			id, kind, ts, payload))
+	}
+	fmt.Println("✓ Seeded events table with 20 rows")
+
+	// ── Register tables in catalog ─────────────────────────────────────────
+	fmt.Println()
 	fmt.Println("1. Registering tables in catalog...")
+	catalog := tdb.Catalog()
 
-	table1Cols := []storage.Column{
+	catalog.RegisterTable("main", "events", []storage.Column{
 		{Name: "id", Type: storage.IntType},
-		{Name: "name", Type: storage.StringType},
-		{Name: "email", Type: storage.StringType},
-		{Name: "created_at", Type: storage.TimeType},
-	}
-	catalog.RegisterTable("main", "users", table1Cols)
+		{Name: "kind", Type: storage.StringType},
+		{Name: "ts", Type: storage.IntType},
+		{Name: "payload", Type: storage.StringType},
+	})
+	catalog.RegisterTable("main", "event_stats", []storage.Column{
+		{Name: "kind", Type: storage.StringType},
+		{Name: "total", Type: storage.IntType},
+		{Name: "last_updated", Type: storage.IntType},
+	})
 
-	table2Cols := []storage.Column{
-		{Name: "id", Type: storage.IntType},
-		{Name: "user_id", Type: storage.IntType},
-		{Name: "amount", Type: storage.Float64Type},
-		{Name: "status", Type: storage.StringType},
-	}
-	catalog.RegisterTable("main", "orders", table2Cols)
-
-	// ==================== Query Catalog ====================
-	fmt.Println("\n2. Querying catalog.tables:")
-	tables := catalog.GetTables()
-	for _, t := range tables {
+	// ── Query catalog ──────────────────────────────────────────────────────
+	fmt.Println()
+	fmt.Println("2. Tables registered in catalog:")
+	for _, t := range catalog.GetTables() {
 		fmt.Printf("   - %s.%s (type: %s, created: %s)\n",
-			t.Schema, t.Name, t.Type, t.CreatedAt.Format("2006-01-02 15:04:05"))
+			t.Schema, t.Name, t.Type, t.CreatedAt.Format("15:04:05"))
 	}
 
-	fmt.Println("\n3. Querying catalog.columns for 'users':")
-	columns := catalog.GetColumns("main", "users")
-	for _, c := range columns {
-		fmt.Printf("   - %s.%s.%s: %s (position: %d, nullable: %t)\n",
-			c.Schema, c.TableName, c.Name, c.DataType, c.Position, c.IsNullable)
+	fmt.Println()
+	fmt.Println("3. Columns for 'events':")
+	for _, c := range catalog.GetColumns("main", "events") {
+		fmt.Printf("   - %-15s %s (position %d, nullable: %t)\n",
+			c.Name, c.DataType, c.Position, c.IsNullable)
 	}
 
-	// ==================== Register Views ====================
-	fmt.Println("\n4. Registering views:")
-	catalog.RegisterView("main", "active_users", "SELECT * FROM users WHERE status = 'active'")
-	catalog.RegisterView("main", "order_summary", "SELECT user_id, COUNT(*) as order_count, SUM(amount) as total FROM orders GROUP BY user_id")
+	// ── Register a view ────────────────────────────────────────────────────
+	fmt.Println()
+	fmt.Println("4. Registering views...")
+	catalog.RegisterView("main", "recent_events",
+		"SELECT * FROM events ORDER BY ts DESC LIMIT 10")
+	fmt.Println("   - registered view: recent_events")
 
-	// ==================== Register Functions ====================
-	fmt.Println("\n5. Registering functions:")
-
+	// ── Register functions ─────────────────────────────────────────────────
+	fmt.Println()
+	fmt.Println("5. Registering functions...")
 	catalog.RegisterFunction(&storage.CatalogFunction{
 		Schema:          "main",
-		Name:            "file",
+		Name:            "json_get",
 		FunctionType:    "SCALAR",
-		ArgTypes:        []string{"STRING"},
+		ArgTypes:        []string{"STRING", "STRING"},
 		ReturnType:      "STRING",
 		Language:        "BUILTIN",
-		IsDeterministic: false,
-		Description:     "Read file contents as string",
-	})
-
-	catalog.RegisterFunction(&storage.CatalogFunction{
-		Schema:          "main",
-		Name:            "table_from_json",
-		FunctionType:    "TABLE",
-		ArgTypes:        []string{"STRING"},
-		ReturnType:      "TABLE",
-		Language:        "BUILTIN",
 		IsDeterministic: true,
-		Description:     "Parse JSON array into table",
+		Description:     "Extract a field from a JSON string",
 	})
+	fmt.Println("   - registered function: json_get")
 
-	// ==================== Create Jobs ====================
-	fmt.Println("\n6. Creating scheduled jobs:")
+	// ── Create scheduled jobs ──────────────────────────────────────────────
+	fmt.Println()
+	fmt.Println("6. Creating scheduled jobs...")
 
-	// CRON job: Runs every minute
-	cronJob := &storage.CatalogJob{
-		Name:         "cleanup_old_logs",
-		SQLText:      "DELETE FROM logs WHERE created_at < datetime('now', '-7 days')",
-		ScheduleType: "CRON",
-		CronExpr:     "0 * * * * *", // Every minute at :00 seconds
-		Timezone:     "UTC",
-		Enabled:      true,
-		NoOverlap:    true,
-		MaxRuntimeMs: 60000, // 1 minute max
-	}
-	catalog.RegisterJob(cronJob)
-	fmt.Printf("   - Created CRON job: %s (%s)\n", cronJob.Name, cronJob.CronExpr)
-
-	// INTERVAL job: Runs every 30 seconds
-	intervalJob := &storage.CatalogJob{
-		Name:         "refresh_stats",
-		SQLText:      "INSERT INTO stats_cache SELECT * FROM compute_stats()",
+	// INTERVAL job: refresh event stats every 2 seconds
+	statsJob := &storage.CatalogJob{
+		Name:         "refresh_event_stats",
+		SQLText:      `SELECT kind, COUNT(*) AS total FROM events GROUP BY kind ORDER BY kind`,
 		ScheduleType: "INTERVAL",
-		IntervalMs:   30000, // 30 seconds
+		IntervalMs:   2000,
 		Enabled:      true,
 		CatchUp:      false,
-		MaxRuntimeMs: 10000, // 10 seconds max
+		MaxRuntimeMs: 5000,
 	}
-	catalog.RegisterJob(intervalJob)
-	fmt.Printf("   - Created INTERVAL job: %s (every 30s)\n", intervalJob.Name)
+	catalog.RegisterJob(statsJob)
+	fmt.Printf("   - INTERVAL job %q every 2s: %s\n", statsJob.Name, statsJob.SQLText)
 
-	// ONCE job: Runs at specific time
-	runAt := time.Now().Add(5 * time.Second)
-	onceJob := &storage.CatalogJob{
-		Name:         "send_report",
-		SQLText:      "SELECT generate_report('weekly')",
+	// ONCE job: run an integrity check 1 second from now
+	runAt := time.Now().Add(1 * time.Second)
+	integrityJob := &storage.CatalogJob{
+		Name:         "integrity_check",
+		SQLText:      `SELECT COUNT(*) AS total_events FROM events`,
 		ScheduleType: "ONCE",
 		RunAt:        &runAt,
 		Enabled:      true,
-		MaxRuntimeMs: 30000, // 30 seconds max
+		MaxRuntimeMs: 5000,
 	}
-	catalog.RegisterJob(onceJob)
-	fmt.Printf("   - Created ONCE job: %s (runs at %s)\n", onceJob.Name, runAt.Format("15:04:05"))
+	catalog.RegisterJob(integrityJob)
+	fmt.Printf("   - ONCE job %q at %s: %s\n",
+		integrityJob.Name, runAt.Format("15:04:05"), integrityJob.SQLText)
 
-	// ==================== Start Scheduler ====================
-	fmt.Println("\n7. Starting job scheduler...")
-	executor := &SimpleExecutor{db: db}
-	scheduler := storage.NewScheduler(db, executor)
+	// ── Start scheduler ────────────────────────────────────────────────────
+	fmt.Println()
+	fmt.Println("7. Starting scheduler (jobs will execute real SQL)...")
+	executor := &TinySQLExecutor{db: tdb, tenant: tenant}
+	scheduler := storage.NewScheduler(tdb, executor)
 
 	if err := scheduler.Start(); err != nil {
 		log.Fatalf("Failed to start scheduler: %v", err)
 	}
 
-	// ==================== Monitor Jobs ====================
+	// ── Monitor for a few seconds ──────────────────────────────────────────
 	fmt.Println()
-	fmt.Println("8. Monitoring jobs (15 seconds)...")
-	fmt.Println("   (Watch the log output for job executions)")
-	fmt.Println()
+	fmt.Println("8. Monitoring jobs for 6 seconds (watch log output)...")
+	time.Sleep(6 * time.Second)
 
-	time.Sleep(15 * time.Second)
-
-	// ==================== Query Job Status ====================
+	// ── Job status report ──────────────────────────────────────────────────
 	fmt.Println()
-	fmt.Println("9. Job status after 15 seconds:")
-	jobs := catalog.ListJobs()
-	for _, job := range jobs {
+	fmt.Println("9. Job status:")
+	for _, job := range catalog.ListJobs() {
 		status := "disabled"
 		if job.Enabled {
 			status = "enabled"
 		}
-
 		lastRun := "never"
 		if job.LastRunAt != nil {
 			lastRun = job.LastRunAt.Format("15:04:05")
 		}
-
 		nextRun := "n/a"
 		if job.NextRunAt != nil {
 			nextRun = job.NextRunAt.Format("15:04:05")
 		}
-
-		fmt.Printf("   - %s: %s | last: %s | next: %s\n",
+		fmt.Printf("   %-25s %s | last: %s | next: %s\n",
 			job.Name, status, lastRun, nextRun)
 	}
 
-	// ==================== Cleanup ====================
+	// ── Cleanup ────────────────────────────────────────────────────────────
 	fmt.Println()
 	fmt.Println("10. Stopping scheduler...")
 	scheduler.Stop()

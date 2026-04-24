@@ -7,6 +7,7 @@ package importer
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -211,6 +212,45 @@ func TestImportCSV_NullHandling(t *testing.T) {
 	// Row 3 (index 2) should have NULL age
 	if tbl.Rows[2][2] != nil {
 		t.Errorf("Expected NULL for row 3 age, got %v", tbl.Rows[2][2])
+	}
+}
+
+// TestImportCSV_StreamedSampling verifies that ImportCSV can infer types from
+// a bounded sample and still import the full input without buffering all rows.
+func TestImportCSV_StreamedSampling(t *testing.T) {
+	ctx := context.Background()
+	db := storage.NewDB()
+
+	var builder strings.Builder
+	builder.WriteString("id,name\n")
+	for i := 1; i <= 8; i++ {
+		builder.WriteString(strings.Join([]string{strconv.Itoa(i), "name" + strconv.Itoa(i)}, ","))
+		builder.WriteString("\n")
+	}
+
+	result, err := ImportCSV(ctx, db, "default", "streamed",
+		strings.NewReader(builder.String()), &ImportOptions{
+			CreateTable:   true,
+			TypeInference: true,
+			HeaderMode:    "present",
+			SampleRecords: 2,
+			BatchSize:     3,
+		})
+	if err != nil {
+		t.Fatalf("ImportCSV failed: %v", err)
+	}
+	if result.RowsInserted != 8 {
+		t.Fatalf("expected 8 rows inserted, got %d", result.RowsInserted)
+	}
+	if len(result.ColumnTypes) != 2 || result.ColumnTypes[0] != storage.IntType || result.ColumnTypes[1] != storage.TextType {
+		t.Fatalf("unexpected inferred types: %#v", result.ColumnTypes)
+	}
+	tbl, err := db.Get("default", "streamed")
+	if err != nil {
+		t.Fatalf("Failed to get table: %v", err)
+	}
+	if len(tbl.Rows) != 8 {
+		t.Fatalf("expected 8 rows in table, got %d", len(tbl.Rows))
 	}
 }
 

@@ -170,31 +170,33 @@ func ImportCSV(
 	result.ColumnNames = colNames
 	result.LineEnding = lineEnding
 
-	// Read all records into memory (keeps behavior unchanged)
-	allRecords := make([][]string, 0)
+	// Keep a bounded sample for type inference, then stream the remainder into INSERT batches.
+	sampleData := make([][]string, 0, opts.SampleRecords)
 	if firstDataRow != nil {
-		allRecords = append(allRecords, firstDataRow)
+		sampleData = append(sampleData, firstDataRow)
 	}
-	for {
-		rec, err := csvr.Read()
-		if err == io.EOF {
-			break
+	if opts.TypeInference {
+		for len(sampleData) < opts.SampleRecords {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			default:
+			}
+			rec, err := csvr.Read()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				result.Errors = append(result.Errors, fmt.Sprintf("read error: %v", err))
+				continue
+			}
+			sampleData = append(sampleData, rec)
 		}
-		if err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("read error: %v", err))
-			continue
-		}
-		allRecords = append(allRecords, rec)
 	}
 
 	// Type inference
 	var colTypes []storage.ColType
 	if opts.TypeInference {
-		sampleSize := len(allRecords)
-		if sampleSize > opts.SampleRecords {
-			sampleSize = opts.SampleRecords
-		}
-		sampleData := allRecords[:sampleSize]
 		colTypes = inferColumnTypes(sampleData, len(colNames), opts)
 	} else {
 		colTypes = make([]storage.ColType, len(colNames))
@@ -216,8 +218,8 @@ func ImportCSV(
 		}
 	}
 
-	// Insert
-	rows, skipped, errs := insertAllRecords(ctx, db, tenant, tableName, colNames, colTypes, allRecords, opts)
+	// Insert the sampled rows first, then continue streaming from the reader.
+	rows, skipped, errs := insertCSVRecords(ctx, db, tenant, tableName, colNames, colTypes, sampleData, csvr, opts)
 	result.RowsInserted = rows
 	result.RowsSkipped = skipped
 	result.Errors = append(result.Errors, errs...)

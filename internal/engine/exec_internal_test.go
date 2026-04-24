@@ -326,3 +326,33 @@ func TestExecuteInsertMultipleRows(t *testing.T) {
 		t.Fatalf("expected table version 2, got %d", table.Version)
 	}
 }
+
+func TestExecuteDeleteWithoutWhere(t *testing.T) {
+	env := newTestExecEnv()
+	table := storage.NewTable("users", []storage.Column{
+		{Name: "id", Type: storage.IntType},
+		{Name: "name", Type: storage.TextType},
+	}, false)
+	table.Rows = [][]any{{1, "Alice"}, {2, "Bob"}, {3, "Carol"}}
+	if err := env.db.Put(env.tenant, table); err != nil {
+		t.Fatalf("failed to register test table: %v", err)
+	}
+
+	res, err := executeDelete(env, &Delete{Table: "users"})
+	if err != nil {
+		t.Fatalf("executeDelete failed: %v", err)
+	}
+	if res == nil || len(res.Rows) != 1 || res.Rows[0]["deleted"] != 3 {
+		t.Fatalf("unexpected delete result: %#v", res)
+	}
+	tableAfter, err := env.db.Get(env.tenant, "users")
+	if err != nil {
+		t.Fatalf("failed to reload table: %v", err)
+	}
+	if len(tableAfter.Rows) != 0 {
+		t.Fatalf("expected empty table after delete, got %d rows", len(tableAfter.Rows))
+	}
+	if tableAfter.Version != 1 {
+		t.Fatalf("expected version increment after delete, got %d", tableAfter.Version)
+	}
+}

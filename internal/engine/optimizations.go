@@ -66,20 +66,23 @@ func (h *HashJoinOptimizer) extractJoinCondition(expr Expr) *JoinCondition {
 
 // processHashJoin implements hash join for equi-join conditions
 func (h *HashJoinOptimizer) processHashJoin(leftRows, rightRows []Row, condition *JoinCondition, joinType OptimizedJoinType) ([]Row, error) {
-	// Build hash table from the smaller relation
+	// For LEFT JOIN, always probe with left rows so unmatched left rows can be detected.
+	// For INNER JOIN, build from the smaller relation to minimise hash table size.
 	var buildRows, probeRows []Row
 	var buildColumn, probeColumn string
 
-	if len(leftRows) <= len(rightRows) {
-		buildRows = leftRows
-		probeRows = rightRows
-		buildColumn = condition.LeftColumn
-		probeColumn = condition.RightColumn
-	} else {
+	if joinType == OptimizedJoinTypeLeft || len(leftRows) > len(rightRows) {
+		// probe = left, build = right
 		buildRows = rightRows
 		probeRows = leftRows
 		buildColumn = condition.RightColumn
 		probeColumn = condition.LeftColumn
+	} else {
+		// probe = right, build = left (inner join, left is smaller)
+		buildRows = leftRows
+		probeRows = rightRows
+		buildColumn = condition.LeftColumn
+		probeColumn = condition.RightColumn
 	}
 
 	// Build hash table
@@ -88,7 +91,6 @@ func (h *HashJoinOptimizer) processHashJoin(leftRows, rightRows []Row, condition
 		if err := checkCtx(h.env.ctx); err != nil {
 			return nil, err
 		}
-
 		key := h.getJoinKey(row, buildColumn)
 		if key != nil {
 			hashTable[key] = append(hashTable[key], row)
@@ -96,12 +98,11 @@ func (h *HashJoinOptimizer) processHashJoin(leftRows, rightRows []Row, condition
 	}
 
 	// Probe phase
-	var result []Row
 	estimatedSize := len(probeRows)
 	if joinType == OptimizedJoinTypeInner {
 		estimatedSize = min(len(leftRows), len(rightRows))
 	}
-	result = make([]Row, 0, estimatedSize)
+	result := make([]Row, 0, estimatedSize)
 
 	for _, probeRow := range probeRows {
 		if err := checkCtx(h.env.ctx); err != nil {
@@ -114,11 +115,12 @@ func (h *HashJoinOptimizer) processHashJoin(leftRows, rightRows []Row, condition
 		if key != nil {
 			if matchingRows, exists := hashTable[key]; exists {
 				for _, buildRow := range matchingRows {
+					// probeRow is always left when joinType == Left, or right when Inner+right>left
 					var mergedRow Row
-					if len(leftRows) <= len(rightRows) {
-						mergedRow = mergeRows(buildRow, probeRow)
+					if joinType == OptimizedJoinTypeLeft || len(leftRows) > len(rightRows) {
+						mergedRow = mergeRows(probeRow, buildRow) // left=probe, right=build
 					} else {
-						mergedRow = mergeRows(probeRow, buildRow)
+						mergedRow = mergeRows(buildRow, probeRow) // left=build, right=probe
 					}
 					result = append(result, mergedRow)
 					matched = true
@@ -126,14 +128,12 @@ func (h *HashJoinOptimizer) processHashJoin(leftRows, rightRows []Row, condition
 			}
 		}
 
-		// Handle LEFT JOIN unmatched rows
+		// For LEFT JOIN, emit unmatched left (probe) rows with null right columns.
 		if !matched && joinType == OptimizedJoinTypeLeft {
-			if len(leftRows) <= len(rightRows) {
-				// probeRow is from right table, need to add nulls for left
+			if len(buildRows) > 0 {
 				result = append(result, h.addNullsForUnmatchedJoin(probeRow, buildRows[0]))
 			} else {
-				// probeRow is from left table, need to add nulls for right
-				result = append(result, h.addNullsForUnmatchedJoin(probeRow, buildRows[0]))
+				result = append(result, cloneRow(probeRow))
 			}
 		}
 	}
