@@ -1,0 +1,69 @@
+{{define "profile"}}
+{{template "header" .}}
+<div class="page-header d-flex justify-content-between align-items-center">
+  <div>
+    <h1 class="h3 mb-0"><i class="bi bi-person-gear me-2 text-primary"></i>Mein Profil</h1>
+    <p class="text-muted small mb-0 mt-1">Kontoeinstellungen</p>
+  </div>
+  <a href="/" class="btn btn-outline-secondary btn-sm"><i class="bi bi-arrow-left me-1"></i>Zurück</a>
+</div>
+{{template "alert" .}}
+
+{{if .AdminHintActive}}
+<div class="alert alert-danger d-flex align-items-start gap-3 mb-4">
+  <i class="bi bi-exclamation-triangle-fill fs-4 text-danger mt-1"></i>
+  <div>
+    <div class="fw-semibold">Standard-Passwort ist noch aktiv!</div>
+    <div class="small">Bitte ändern Sie das Passwort sofort, bevor andere Nutzer Zugang zu diesem System erhalten.</div>
+  </div>
+</div>
+{{end}}
+
+<div class="row g-4">
+  <div class="col-lg-4">
+    <div class="card mb-0">
+      <div class="card-body text-center py-4">
+        <div class="rounded-circle d-inline-flex align-items-center justify-content-center mb-3 icon-circle-lg icon-circle-profile">
+          <i class="bi bi-person-fill fs-2"></i>
+        </div>
+        <h5 class="mb-1">{{.CurrentUser.DisplayName}}</h5>
+        <p class="text-muted small mb-1">@{{.CurrentUser.Username}}</p>
+        <span class="badge badge-role-{{.CurrentUser.Role}} rounded-pill">{{.CurrentUser.Role}}</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-8">
+    <div class="card">
+      <div class="card-header fw-semibold">
+        <i class="bi bi-key me-2 text-primary"></i>Passwort ändern
+      </div>
+      <div class="card-body">
+        {{template "alert" .}}
+        <form method="post" action="/profile/password" class="needs-validation" novalidate>
+          <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+          <div class="form-floating mb-3">
+            <input type="password" class="form-control" id="old_password" name="old_password" placeholder="Aktuelles Passwort" autocomplete="current-password" required>
+            <label for="old_password"><i class="bi bi-lock me-1"></i>Aktuelles Passwort</label>
+            <div class="invalid-feedback">Bitte aktuelles Passwort eingeben.</div>
+          </div>
+          <div class="form-floating mb-3">
+            <input type="password" class="form-control" id="new_password" name="new_password" placeholder="Neues Passwort" autocomplete="new-password" minlength="8" required>
+            <label for="new_password"><i class="bi bi-key me-1"></i>Neues Passwort</label>
+            <div class="invalid-feedback">Mindestens 8 Zeichen erforderlich.</div>
+          </div>
+          <div class="form-floating mb-4">
+            <input type="password" class="form-control" id="confirm_password" name="confirm_password" placeholder="Passwort bestätigen" autocomplete="new-password" required>
+            <label for="confirm_password"><i class="bi bi-key-fill me-1"></i>Passwort bestätigen</label>
+            <div class="invalid-feedback">Bitte Passwort bestätigen.</div>
+          </div>
+          <button class="btn btn-primary" type="submit">
+            <i class="bi bi-floppy me-1"></i>Passwort speichern
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+{{template "footer" .}}
+{{end}}

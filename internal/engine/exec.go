@@ -406,6 +406,10 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 }
 
 func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
+	if rs, ok, err := executeSimpleUpdateFastPath(env, s); ok || err != nil {
+		return rs, err
+	}
+
 	t, err := env.db.Get(env.tenant, s.Table)
 	if err != nil {
 		return nil, err
@@ -420,6 +424,7 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 	}
 	n := 0
 	tablePrefix := strings.ToLower(s.Table) + "."
+	columnNames := colNames(t.Cols)
 	for ri, r := range t.Rows {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
@@ -450,7 +455,7 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 				t.Rows[ri][i] = cv
 			}
 			newRow := buildTableRow(t.Cols, tablePrefix, t.Rows[ri])
-			ftsIndexRow(env.tenant+"/"+s.Table, s.Table, ri, nil, t.Rows[ri], colNames(t.Cols))
+			ftsIndexRow(env.tenant+"/"+s.Table, s.Table, ri, nil, t.Rows[ri], columnNames)
 			if err := fireTriggers(env, s.Table, "AFTER", "UPDATE", newRow, oldRow); err != nil {
 				return nil, err
 			}
@@ -462,6 +467,98 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 		t.MarkDirtyFrom(-1) // UPDATE is non-append; force full-table WAL
 	}
 	return &ResultSet{Cols: []string{"updated"}, Rows: []Row{{"updated": n}}}, nil
+}
+
+type simpleUpdatePlan struct {
+	table    *storage.Table
+	colIndex map[string]int
+	where    Expr
+	sets     []simpleUpdateSet
+}
+
+type simpleUpdateSet struct {
+	col  int
+	expr Expr
+}
+
+func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, error) {
+	plan, ok, err := buildSimpleUpdatePlan(env, s)
+	if !ok || err != nil {
+		return nil, ok, err
+	}
+
+	rawPlan := &simpleSelectPlan{colIndex: plan.colIndex, where: plan.where}
+	updated := 0
+	values := make([]any, len(plan.sets))
+	columnNames := colNames(plan.table.Cols)
+	for ri, raw := range plan.table.Rows {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, true, err
+		}
+		match, err := evalRawWhere(rawPlan, raw)
+		if err != nil {
+			return nil, true, err
+		}
+		if !match {
+			continue
+		}
+
+		for i, set := range plan.sets {
+			v, err := evalRawExpr(rawPlan, raw, set.expr)
+			if err != nil {
+				return nil, true, err
+			}
+			cv, err := coerceToTypeAllowNull(v, plan.table.Cols[set.col].Type)
+			if err != nil {
+				return nil, true, err
+			}
+			values[i] = cv
+		}
+		for i, set := range plan.sets {
+			plan.table.Rows[ri][set.col] = values[i]
+		}
+		ftsIndexRow(env.tenant+"/"+s.Table, s.Table, ri, nil, plan.table.Rows[ri], columnNames)
+		updated++
+	}
+
+	plan.table.Version++
+	if updated > 0 {
+		plan.table.MarkDirtyFrom(-1)
+	}
+	return &ResultSet{Cols: []string{"updated"}, Rows: []Row{{"updated": updated}}}, true, nil
+}
+
+func buildSimpleUpdatePlan(env ExecEnv, s *Update) (*simpleUpdatePlan, bool, error) {
+	if len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("BEFORE"), storage.TriggerEvent("UPDATE"))) > 0 ||
+		len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("AFTER"), storage.TriggerEvent("UPDATE"))) > 0 {
+		return nil, false, nil
+	}
+	if !isSimpleRawPredicate(s.Where) {
+		return nil, false, nil
+	}
+
+	table, err := env.db.Get(env.tenant, s.Table)
+	if err != nil {
+		return nil, true, err
+	}
+	colIndex := simpleColumnIndex(table, s.Table)
+	sets := make([]simpleUpdateSet, 0, len(s.Sets))
+	for name, expr := range s.Sets {
+		if !isSimpleRawExpr(expr) {
+			return nil, false, nil
+		}
+		col, err := table.ColIndex(name)
+		if err != nil {
+			return nil, true, err
+		}
+		sets = append(sets, simpleUpdateSet{col: col, expr: expr})
+	}
+	return &simpleUpdatePlan{
+		table:    table,
+		colIndex: colIndex,
+		where:    s.Where,
+		sets:     sets,
+	}, true, nil
 }
 
 func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
@@ -895,6 +992,12 @@ func applySortOrder(orderBy []OrderItem, outRows []Row) []Row {
 }
 
 func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
+	if rs, ok, err := executeSimpleJoinFastPath(env, s); ok || err != nil {
+		return rs, err
+	}
+	if rs, ok, err := executeSimpleAggregateFastPath(env, s); ok || err != nil {
+		return rs, err
+	}
 	if rs, ok, err := executeSimpleSelectFastPath(env, s); ok || err != nil {
 		return rs, err
 	}
@@ -978,6 +1081,7 @@ type simpleSelectPlan struct {
 	colIndex   map[string]int
 	projs      []simpleProjection
 	orderBy    []OrderItem
+	orderExprs []Expr
 	where      Expr
 	limit      *int
 	offset     *int
@@ -989,15 +1093,434 @@ type simpleProjection struct {
 	expr Expr
 }
 
+type simpleJoinPlan struct {
+	left       *storage.Table
+	right      *storage.Table
+	leftIndex  map[string]int
+	rightIndex map[string]int
+	leftKey    int
+	rightKey   int
+	where      Expr
+	projs      []simpleProjection
+	outputCols []string
+}
+
+func executeSimpleJoinFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error) {
+	plan, ok, err := buildSimpleJoinPlan(env, s)
+	if !ok || err != nil {
+		return nil, ok, err
+	}
+
+	rightByKey := make(map[any][][]any, len(plan.right.Rows))
+	for _, right := range plan.right.Rows {
+		key := comparableKeyPart(right[plan.rightKey])
+		rightByKey[key] = append(rightByKey[key], right)
+	}
+
+	outRows := make([]Row, 0, min(len(plan.left.Rows), len(plan.right.Rows)))
+	for _, left := range plan.left.Rows {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, true, err
+		}
+		matches := rightByKey[comparableKeyPart(left[plan.leftKey])]
+		for _, right := range matches {
+			match, err := evalJoinRawWhere(plan, left, right)
+			if err != nil {
+				return nil, true, err
+			}
+			if !match {
+				continue
+			}
+			out, err := projectJoinRawRow(plan, left, right)
+			if err != nil {
+				return nil, true, err
+			}
+			outRows = append(outRows, out)
+		}
+	}
+	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, true, nil
+}
+
+func buildSimpleJoinPlan(env ExecEnv, s *Select) (*simpleJoinPlan, bool, error) {
+	if s.Distinct || len(s.DistinctOn) > 0 || len(s.CTEs) > 0 || len(s.GroupBy) > 0 ||
+		s.Having != nil || s.Union != nil || len(s.OrderBy) > 0 || s.Limit != nil || s.Offset != nil ||
+		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil || len(s.Joins) != 1 ||
+		s.Joins[0].Type != JoinInner || s.Joins[0].Right.Table == "" ||
+		s.Joins[0].Right.Subquery != nil || s.Joins[0].Right.TableFunc != nil {
+		return nil, false, nil
+	}
+	if anyAggInSelect(s.Projs) || anyWindowInSelect(s.Projs) || !isSimpleRawPredicate(s.Where) {
+		return nil, false, nil
+	}
+
+	left, err := env.db.Get(env.tenant, s.From.Table)
+	if err != nil {
+		return nil, true, err
+	}
+	right, err := env.db.Get(env.tenant, s.Joins[0].Right.Table)
+	if err != nil {
+		return nil, true, err
+	}
+
+	leftIndex := simpleColumnIndex(left, aliasOr(s.From))
+	rightIndex := simpleColumnIndex(right, aliasOr(s.Joins[0].Right))
+	leftKey, rightKey, ok := simpleJoinKeys(s.Joins[0].On, leftIndex, rightIndex)
+	if !ok {
+		return nil, false, nil
+	}
+
+	projs := make([]simpleProjection, 0, len(s.Projs))
+	outputCols := make([]string, 0, len(s.Projs))
+	for i, it := range s.Projs {
+		if it.Star || !isSimpleRawExpr(it.Expr) || !simpleJoinExprResolvable(it.Expr, leftIndex, rightIndex) {
+			return nil, false, nil
+		}
+		name := projName(it, i)
+		projs = append(projs, simpleProjection{name: name, expr: it.Expr})
+		outputCols = append(outputCols, name)
+	}
+	if !simpleJoinExprResolvable(s.Where, leftIndex, rightIndex) {
+		return nil, false, nil
+	}
+
+	return &simpleJoinPlan{
+		left:       left,
+		right:      right,
+		leftIndex:  leftIndex,
+		rightIndex: rightIndex,
+		leftKey:    leftKey,
+		rightKey:   rightKey,
+		where:      s.Where,
+		projs:      projs,
+		outputCols: outputCols,
+	}, true, nil
+}
+
+func simpleJoinKeys(on Expr, leftIndex, rightIndex map[string]int) (int, int, bool) {
+	bin, ok := on.(*Binary)
+	if !ok || bin.Op != "=" {
+		return 0, 0, false
+	}
+	leftRef, leftOK := bin.Left.(*VarRef)
+	rightRef, rightOK := bin.Right.(*VarRef)
+	if !leftOK || !rightOK {
+		return 0, 0, false
+	}
+	if li, lok := leftIndex[strings.ToLower(leftRef.Name)]; lok {
+		if ri, rok := rightIndex[strings.ToLower(rightRef.Name)]; rok {
+			return li, ri, true
+		}
+	}
+	if li, lok := leftIndex[strings.ToLower(rightRef.Name)]; lok {
+		if ri, rok := rightIndex[strings.ToLower(leftRef.Name)]; rok {
+			return li, ri, true
+		}
+	}
+	return 0, 0, false
+}
+
+func simpleJoinExprResolvable(e Expr, leftIndex, rightIndex map[string]int) bool {
+	switch ex := e.(type) {
+	case nil, *Literal:
+		return true
+	case *VarRef:
+		_, lok := leftIndex[strings.ToLower(ex.Name)]
+		_, rok := rightIndex[strings.ToLower(ex.Name)]
+		return lok != rok
+	case *IsNull:
+		return simpleJoinExprResolvable(ex.Expr, leftIndex, rightIndex)
+	case *Unary:
+		return simpleJoinExprResolvable(ex.Expr, leftIndex, rightIndex)
+	case *Binary:
+		return simpleJoinExprResolvable(ex.Left, leftIndex, rightIndex) &&
+			simpleJoinExprResolvable(ex.Right, leftIndex, rightIndex)
+	default:
+		return false
+	}
+}
+
+func evalJoinRawWhere(plan *simpleJoinPlan, left, right []any) (bool, error) {
+	if plan.where == nil {
+		return true, nil
+	}
+	v, err := evalJoinRawExpr(plan, left, right, plan.where)
+	if err != nil {
+		return false, err
+	}
+	return toTri(v) == tvTrue, nil
+}
+
+func projectJoinRawRow(plan *simpleJoinPlan, left, right []any) (Row, error) {
+	out := make(Row, len(plan.projs))
+	for _, p := range plan.projs {
+		v, err := evalJoinRawExpr(plan, left, right, p.expr)
+		if err != nil {
+			return nil, err
+		}
+		putVal(out, p.name, v)
+	}
+	return out, nil
+}
+
+func evalJoinRawExpr(plan *simpleJoinPlan, left, right []any, e Expr) (any, error) {
+	switch ex := e.(type) {
+	case *Literal:
+		return ex.Val, nil
+	case *VarRef:
+		name := strings.ToLower(ex.Name)
+		if i, ok := plan.leftIndex[name]; ok {
+			if _, ambiguous := plan.rightIndex[name]; ambiguous {
+				return nil, fmt.Errorf("ambiguous column %q", ex.Name)
+			}
+			return left[i], nil
+		}
+		if i, ok := plan.rightIndex[name]; ok {
+			return right[i], nil
+		}
+		return nil, fmt.Errorf("unknown column %q", ex.Name)
+	case *IsNull:
+		v, err := evalJoinRawExpr(plan, left, right, ex.Expr)
+		if err != nil {
+			return nil, err
+		}
+		is := isNull(v)
+		if ex.Negate {
+			return !is, nil
+		}
+		return is, nil
+	case *Unary:
+		v, err := evalJoinRawExpr(plan, left, right, ex.Expr)
+		if err != nil {
+			return nil, err
+		}
+		return evalRawUnary(&simpleSelectPlan{}, nil, &Unary{Op: ex.Op, Expr: &Literal{Val: v}})
+	case *Binary:
+		return evalJoinRawBinary(plan, left, right, ex)
+	default:
+		return nil, fmt.Errorf("unsupported join fast-path expression %T", e)
+	}
+}
+
+func evalJoinRawBinary(plan *simpleJoinPlan, left, right []any, ex *Binary) (any, error) {
+	if ex.Op == "AND" || ex.Op == "OR" {
+		lv, err := evalJoinRawExpr(plan, left, right, ex.Left)
+		if err != nil {
+			return nil, err
+		}
+		if ex.Op == "AND" && toTri(lv) == tvFalse {
+			return false, nil
+		}
+		if ex.Op == "OR" && toTri(lv) == tvTrue {
+			return true, nil
+		}
+		rv, err := evalJoinRawExpr(plan, left, right, ex.Right)
+		if err != nil {
+			return nil, err
+		}
+		if ex.Op == "AND" {
+			return triToValue(triAnd(toTri(lv), toTri(rv))), nil
+		}
+		return triToValue(triOr(toTri(lv), toTri(rv))), nil
+	}
+	lv, err := evalJoinRawExpr(plan, left, right, ex.Left)
+	if err != nil {
+		return nil, err
+	}
+	rv, err := evalJoinRawExpr(plan, left, right, ex.Right)
+	if err != nil {
+		return nil, err
+	}
+	if isArithmeticOp(ex.Op) {
+		return evalArithmeticBinary(ex.Op, lv, rv)
+	}
+	if isComparisonOp(ex.Op) {
+		return evalComparisonBinary(ex.Op, lv, rv)
+	}
+	return nil, fmt.Errorf("unknown binary operator: %s", ex.Op)
+}
+
+type simpleAggregatePlan struct {
+	table      *storage.Table
+	colIndex   map[string]int
+	groupCol   int
+	groupName  string
+	where      Expr
+	projs      []simpleAggregateProjection
+	outputCols []string
+}
+
+type simpleAggregateProjection struct {
+	name     string
+	groupCol bool
+	countArg Expr
+}
+
+type simpleAggregateState struct {
+	groupValue any
+	counts     []int
+}
+
+func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error) {
+	plan, ok, err := buildSimpleAggregatePlan(env, s)
+	if !ok || err != nil {
+		return nil, ok, err
+	}
+
+	rawPlan := &simpleSelectPlan{colIndex: plan.colIndex, where: plan.where}
+	groups := make(map[any]*simpleAggregateState)
+	order := make([]any, 0)
+	for _, raw := range plan.table.Rows {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, true, err
+		}
+		match, err := evalRawWhere(rawPlan, raw)
+		if err != nil {
+			return nil, true, err
+		}
+		if !match {
+			continue
+		}
+
+		groupValue := raw[plan.groupCol]
+		key := comparableKeyPart(groupValue)
+		state, exists := groups[key]
+		if !exists {
+			state = &simpleAggregateState{
+				groupValue: groupValue,
+				counts:     make([]int, len(plan.projs)),
+			}
+			groups[key] = state
+			order = append(order, key)
+		}
+		for i, proj := range plan.projs {
+			if proj.groupCol {
+				continue
+			}
+			if proj.countArg == nil {
+				state.counts[i]++
+				continue
+			}
+			v, err := evalRawExpr(rawPlan, raw, proj.countArg)
+			if err != nil {
+				return nil, true, err
+			}
+			if v != nil {
+				state.counts[i]++
+			}
+		}
+	}
+
+	outRows := make([]Row, 0, len(order))
+	for _, key := range order {
+		state := groups[key]
+		out := make(Row, len(plan.projs))
+		for i, proj := range plan.projs {
+			if proj.groupCol {
+				putVal(out, proj.name, state.groupValue)
+			} else {
+				putVal(out, proj.name, state.counts[i])
+			}
+		}
+		outRows = append(outRows, out)
+	}
+	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, true, nil
+}
+
+func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, bool, error) {
+	if s.Distinct || len(s.DistinctOn) > 0 || len(s.CTEs) > 0 || len(s.Joins) > 0 ||
+		s.Having != nil || s.Union != nil || len(s.OrderBy) > 0 || s.Limit != nil || s.Offset != nil ||
+		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil || len(s.GroupBy) != 1 {
+		return nil, false, nil
+	}
+	groupRef, ok := s.GroupBy[0].(*VarRef)
+	if !ok {
+		return nil, false, nil
+	}
+	if !isSimpleRawPredicate(s.Where) {
+		return nil, false, nil
+	}
+
+	table, err := env.db.Get(env.tenant, s.From.Table)
+	if err != nil {
+		return nil, true, err
+	}
+	colIndex := simpleColumnIndex(table, aliasOr(s.From))
+	groupCol, ok := colIndex[strings.ToLower(groupRef.Name)]
+	if !ok {
+		return nil, true, fmt.Errorf("unknown column %q", groupRef.Name)
+	}
+
+	projs := make([]simpleAggregateProjection, 0, len(s.Projs))
+	outputCols := make([]string, 0, len(s.Projs))
+	hasCount := false
+	for i, it := range s.Projs {
+		if it.Star {
+			return nil, false, nil
+		}
+		name := projName(it, i)
+		if ref, ok := it.Expr.(*VarRef); ok {
+			refCol, ok := colIndex[strings.ToLower(ref.Name)]
+			if !ok {
+				return nil, true, fmt.Errorf("unknown column %q", ref.Name)
+			}
+			if refCol != groupCol {
+				return nil, false, nil
+			}
+			projs = append(projs, simpleAggregateProjection{name: name, groupCol: true})
+			outputCols = append(outputCols, name)
+			continue
+		}
+		arg, ok := simpleCountArg(it.Expr)
+		if !ok {
+			return nil, false, nil
+		}
+		if arg != nil && !isSimpleRawExpr(arg) {
+			return nil, false, nil
+		}
+		hasCount = true
+		projs = append(projs, simpleAggregateProjection{name: name, countArg: arg})
+		outputCols = append(outputCols, name)
+	}
+	if !hasCount {
+		return nil, false, nil
+	}
+	return &simpleAggregatePlan{
+		table:      table,
+		colIndex:   colIndex,
+		groupCol:   groupCol,
+		groupName:  groupRef.Name,
+		where:      s.Where,
+		projs:      projs,
+		outputCols: outputCols,
+	}, true, nil
+}
+
+func simpleCountArg(e Expr) (Expr, bool) {
+	fc, ok := e.(*FuncCall)
+	if !ok || fc.Name != "COUNT" || fc.Distinct {
+		return nil, false
+	}
+	if fc.Star {
+		return nil, true
+	}
+	if len(fc.Args) != 1 {
+		return nil, false
+	}
+	return fc.Args[0], true
+}
+
 func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error) {
 	plan, ok, err := buildSimpleSelectPlan(env, s)
 	if !ok || err != nil {
 		return nil, ok, err
 	}
+	if len(plan.orderBy) > 0 {
+		return executeSimpleSelectOrderedFastPath(env, plan)
+	}
 
 	outRows := make([]Row, 0, simpleSelectInitialCap(plan))
 	stopAfter := -1
-	if len(plan.orderBy) == 0 && plan.limit != nil {
+	if plan.limit != nil {
 		stopAfter = *plan.limit
 		if plan.offset != nil {
 			stopAfter += *plan.offset
@@ -1025,10 +1548,90 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 		}
 	}
 
-	if len(plan.orderBy) > 0 {
-		outRows = applySortOrder(plan.orderBy, outRows)
-	}
 	outRows = applyOffsetLimit(&Select{Limit: plan.limit, Offset: plan.offset}, outRows)
+	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, true, nil
+}
+
+type orderedRawRow struct {
+	raw  []any
+	key  any
+	keys []any
+}
+
+func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*ResultSet, bool, error) {
+	rows := make([]orderedRawRow, 0, simpleSelectInitialCap(plan))
+	for _, raw := range plan.table.Rows {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, true, err
+		}
+		match, err := evalRawWhere(plan, raw)
+		if err != nil {
+			return nil, true, err
+		}
+		if !match {
+			continue
+		}
+		if len(plan.orderExprs) == 1 {
+			key, err := evalRawExpr(plan, raw, plan.orderExprs[0])
+			if err != nil {
+				return nil, true, err
+			}
+			rows = append(rows, orderedRawRow{raw: raw, key: key})
+			continue
+		}
+		keys := make([]any, len(plan.orderExprs))
+		for i, expr := range plan.orderExprs {
+			v, err := evalRawExpr(plan, raw, expr)
+			if err != nil {
+				return nil, true, err
+			}
+			keys[i] = v
+		}
+		rows = append(rows, orderedRawRow{raw: raw, keys: keys})
+	}
+
+	sort.SliceStable(rows, func(i, j int) bool {
+		if len(plan.orderBy) == 1 {
+			oi := plan.orderBy[0]
+			cmp := compareForOrder(rows[i].key, rows[j].key, oi.Desc)
+			if oi.Desc {
+				return cmp > 0
+			}
+			return cmp < 0
+		}
+		for k, oi := range plan.orderBy {
+			cmp := compareForOrder(rows[i].keys[k], rows[j].keys[k], oi.Desc)
+			if cmp == 0 {
+				continue
+			}
+			if oi.Desc {
+				return cmp > 0
+			}
+			return cmp < 0
+		}
+		return false
+	})
+
+	start := 0
+	if plan.offset != nil && *plan.offset > 0 {
+		start = *plan.offset
+	}
+	if start > len(rows) {
+		return &ResultSet{Cols: plan.outputCols, Rows: []Row{}}, true, nil
+	}
+	rows = rows[start:]
+	if plan.limit != nil && *plan.limit < len(rows) {
+		rows = rows[:*plan.limit]
+	}
+
+	outRows := make([]Row, 0, len(rows))
+	for _, item := range rows {
+		out, err := projectRawRow(plan, item.raw)
+		if err != nil {
+			return nil, true, err
+		}
+		outRows = append(outRows, out)
+	}
 	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, true, nil
 }
 
@@ -1064,11 +1667,13 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 		projs = append(projs, simpleProjection{name: name, expr: it.Expr})
 		outputCols = append(outputCols, name)
 	}
+	orderExprs := make([]Expr, 0, len(s.OrderBy))
 	for _, oi := range s.OrderBy {
 		foundProjection := false
 		for _, p := range projs {
 			if strings.EqualFold(p.name, oi.Col) {
 				foundProjection = true
+				orderExprs = append(orderExprs, p.expr)
 				break
 			}
 		}
@@ -1085,6 +1690,7 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 		colIndex:   colIndex,
 		projs:      projs,
 		orderBy:    s.OrderBy,
+		orderExprs: orderExprs,
 		where:      s.Where,
 		limit:      s.Limit,
 		offset:     s.Offset,
@@ -5899,6 +6505,25 @@ func fmtKeyPart(v any) string {
 	var b strings.Builder
 	writeFmtKeyPart(&b, v)
 	return b.String()
+}
+
+func comparableKeyPart(v any) any {
+	switch x := v.(type) {
+	case nil:
+		return nil
+	case int:
+		return x
+	case int64:
+		return x
+	case float64:
+		return x
+	case bool:
+		return x
+	case string:
+		return x
+	default:
+		return fmtKeyPart(v)
+	}
 }
 
 // writeFmtKeyPart writes a typed key part directly to a builder, avoiding

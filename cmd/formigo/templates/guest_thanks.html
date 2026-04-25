@@ -1,0 +1,20 @@
+{{define "guest_thanks"}}
+{{template "header" .}}
+<div class="row justify-content-center mt-4">
+  <div class="col-sm-10 col-md-7 col-lg-5">
+    <div class="card text-center shadow">
+      <div class="card-body py-5">
+        <div class="rounded-circle d-inline-flex align-items-center justify-content-center mb-4 icon-circle-lg icon-circle-success">
+          <i class="bi bi-check-circle-fill fs-2"></i>
+        </div>
+        <h2 class="h4 fw-bold mb-2">Vielen Dank!</h2>
+        <p class="text-muted mb-4">Ihre Antwort für <strong>{{.Form.Title}}</strong> wurde erfolgreich übermittelt.</p>
+        <a href="/g/{{.Form.ID}}" class="btn btn-outline-primary">
+          <i class="bi bi-arrow-repeat me-1"></i>Nochmal ausfüllen
+        </a>
+      </div>
+    </div>
+  </div>
+</div>
+{{template "footer" .}}
+{{end}}

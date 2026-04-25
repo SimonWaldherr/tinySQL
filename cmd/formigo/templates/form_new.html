@@ -23,9 +23,32 @@
         <label for="title">Titel *</label>
         <div class="invalid-feedback">Bitte Titel eingeben.</div>
       </div>
-      <div class="form-floating">
-        <textarea id="description" name="description" class="form-control" placeholder="Beschreibung" style="height:80px"></textarea>
+      <div class="form-floating mb-3">
+        <textarea id="description" name="description" class="form-control textarea-sm" placeholder="Beschreibung"></textarea>
         <label for="description">Beschreibung <span class="text-muted fw-normal">(optional)</span></label>
+      </div>
+
+      {{/* ── Zeitraum ──────────────────────────────────────────────── */}}
+      <div class="row g-3 mb-3">
+        <div class="col-sm-6">
+          <label for="opens_at" class="form-label small fw-semibold"><i class="bi bi-door-open me-1 text-success"></i>Öffnet am</label>
+          <input type="datetime-local" id="opens_at" name="opens_at" class="form-control form-control-sm">
+          <div class="form-text">Leer = sofort geöffnet</div>
+        </div>
+        <div class="col-sm-6">
+          <label for="closes_at" class="form-label small fw-semibold"><i class="bi bi-door-closed me-1 text-danger"></i>Schließt am</label>
+          <input type="datetime-local" id="closes_at" name="closes_at" class="form-control form-control-sm">
+          <div class="form-text">Leer = kein Ablaufdatum</div>
+        </div>
+      </div>
+
+      {{/* ── Gast-Zugang ──────────────────────────────────────────── */}}
+      <div class="form-check form-switch">
+        <input class="form-check-input" type="checkbox" name="allow_guest" id="allow_guest" value="1" role="switch">
+        <label class="form-check-label" for="allow_guest">
+          <i class="bi bi-globe me-1 text-primary"></i>Öffentlicher Gast-Zugang
+          <span class="text-muted fw-normal small ms-1">— Formular ohne Login ausfüllbar (Link: <code>/g/{id}</code>)</span>
+        </label>
       </div>
     </div>
   </div>
@@ -63,7 +86,7 @@
   <div class="field-card border rounded-3 p-3 mb-3 bg-white position-relative">
     <div class="d-flex align-items-center gap-2 mb-3">
       <span class="field-num badge bg-secondary rounded-pill">1</span>
-      <select name="field_type" class="form-select form-select-sm field-type-select" style="max-width:180px" aria-label="Feldtyp">
+      <select name="field_type" class="form-select form-select-sm field-type-select type-select" aria-label="Feldtyp">
         <option value="text"     data-icon="bi-fonts"         data-has-options="0">Textfeld</option>
         <option value="textarea" data-icon="bi-textarea-t"    data-has-options="0">Textarea</option>
         <option value="select"   data-icon="bi-menu-button"   data-has-options="1">Auswahl (Select)</option>

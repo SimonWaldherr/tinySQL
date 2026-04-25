@@ -119,6 +119,10 @@ func migrate(ctx context.Context, db *sql.DB, d dialect) error {
 	}
 	for _, stmt := range splitMigrationStatements(string(b)) {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			// ALTER TABLE may fail when the column already exists (idempotent re-migration).
+			if strings.Contains(strings.ToUpper(stmt), "ALTER TABLE") {
+				continue
+			}
 			return fmt.Errorf("migration statement failed: %w\n%s", err, stmt)
 		}
 	}

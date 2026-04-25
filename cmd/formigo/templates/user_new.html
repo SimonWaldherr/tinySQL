@@ -10,7 +10,7 @@
 {{template "alert" .}}
 <form method="post" action="/users" class="needs-validation" novalidate>
   <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-  <div class="card mb-4" style="max-width:540px">
+  <div class="card mb-4 card-narrow">
     <div class="card-header fw-semibold"><i class="bi bi-person-badge me-2 text-primary"></i>Benutzerdaten</div>
     <div class="card-body">
       <div class="form-floating mb-3">

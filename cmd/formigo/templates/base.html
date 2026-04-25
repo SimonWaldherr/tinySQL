@@ -12,67 +12,140 @@
       --brand-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
       --card-hover-shadow: 0 8px 25px rgba(0,0,0,.12);
     }
-    body { background: #f0f2f5; }
+    body { background: #f0f2f5; min-height: 100vh; display: flex; flex-direction: column; }
+    main { flex: 1; }
     .navbar-brand-icon { font-size: 1.4rem; }
     .navbar { background: var(--brand-gradient) !important; }
-    .navbar .navbar-brand, .navbar .nav-link, .navbar .navbar-text { color: rgba(255,255,255,.92) !important; }
-    .navbar .nav-link:hover, .navbar .nav-link.active { color: #fff !important; }
+    .navbar .navbar-brand,
+    .navbar .nav-link { color: rgba(255,255,255,.92) !important; }
+    .navbar .nav-link:hover,
+    .navbar .nav-link.active { color: #fff !important; background: rgba(255,255,255,.12); border-radius: .4rem; }
+    /* User dropdown in navbar */
+    .navbar .nav-link.dropdown-toggle::after { border-color: rgba(255,255,255,.8); }
+    .navbar .dropdown-menu { min-width: 200px; border: none; box-shadow: 0 8px 30px rgba(0,0,0,.15); border-radius: .75rem; margin-top: .4rem; }
+    .navbar .dropdown-menu .dropdown-item { padding: .55rem 1rem; font-size: .9rem; border-radius: .4rem; }
+    .navbar .dropdown-menu .dropdown-item:hover { background: rgba(102,126,234,.08); }
+    .navbar .dropdown-menu .dropdown-item.text-danger:hover { background: rgba(220,53,69,.08); }
+    .navbar .user-avatar { width: 32px; height: 32px; border-radius: 50%; background: rgba(255,255,255,.25); display: inline-flex; align-items: center; justify-content: center; font-size: .85rem; font-weight: 700; color: #fff; flex-shrink: 0; }
     .navbar .btn-outline-light { border-color: rgba(255,255,255,.6); }
+    /* Cards */
     .card { border: none; border-radius: .75rem; box-shadow: 0 2px 10px rgba(0,0,0,.07); }
     .card.card-hover:hover { box-shadow: var(--card-hover-shadow); }
+    /* Tables */
     .table thead th { background: #f8f9fa; font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; color: #6c757d; border-bottom: 2px solid #dee2e6; }
     .table tbody tr:hover { background: rgba(102,126,234,.04); }
+    /* Role badges */
     .badge-role-admin    { background: #6f42c1; }
     .badge-role-editor   { background: #0d6efd; }
     .badge-role-viewer   { background: #0dcaf0; color: #000; }
     .badge-role-user     { background: #6c757d; }
-    .page-header { margin-bottom: 1.75rem; }
+    /* Page layout */
+    .page-header { margin-bottom: 1.75rem; padding-top: .25rem; }
     .page-header h1 { font-weight: 600; }
     .empty-state { padding: 3.5rem 1rem; color: #adb5bd; }
     .empty-state .bi { font-size: 3rem; display: block; margin-bottom: .75rem; }
-    main { padding-top: .5rem; }
     /* Form builder */
     .field-card { transition: box-shadow .15s; cursor: default; }
     .field-card[draggable]:hover { box-shadow: 0 4px 16px rgba(0,0,0,.10); cursor: grab; }
     .field-card[draggable]:active { cursor: grabbing; }
     #field-list { min-height: 60px; }
+    /* Footer */
+    .site-footer { background: #fff; border-top: 1px solid #e9ecef; padding: .75rem 0; color: #adb5bd; font-size: .8rem; }
+    /* Alerts */
+    .alert { border-left: 4px solid transparent; }
+    .alert-danger  { border-left-color: #dc3545; }
+    .alert-warning { border-left-color: #ffc107; }
+    .alert-success { border-left-color: #198754; }
+    .alert-info    { border-left-color: #0dcaf0; }
+    /* Icon avatar circles */
+    .icon-circle-primary { width: 56px; height: 56px; background: var(--bs-primary); }
+    .icon-circle-lg      { width: 72px; height: 72px; }
+    .icon-circle-success { background: rgba(25,135,84,.12); color: #198754; }
+    .icon-circle-profile { background: rgba(13,110,253,.12); color: #0d6efd; }
+    /* Misc layout */
+    .col-id    { width: 60px; }
+    .card-narrow { max-width: 540px; }
+    .textarea-sm { height: 80px; }
+    .textarea-md { height: 120px; }
+    .type-select { max-width: 180px; }
+    .dropdown-role-badge { font-size: .7rem; }
+    .admin-hint-banner { background: #fff8e1; }
   </style>
 </head>
 <body>
-<nav class="navbar navbar-expand-lg mb-4 shadow-sm">
+<nav class="navbar navbar-expand-lg shadow-sm">
   <div class="container">
     <a class="navbar-brand fw-bold d-flex align-items-center gap-2" href="/">
       <i class="bi bi-ui-checks-grid navbar-brand-icon"></i>Formigo
     </a>
     {{if .CurrentUser}}
-      <button class="navbar-toggler border-0" type="button" data-bs-toggle="collapse" data-bs-target="#navbar">
-        <span class="navbar-toggler-icon"></span>
+      {{/* Hamburger toggler - visible on mobile */}}
+      <button class="navbar-toggler border-0 text-white" type="button" data-bs-toggle="collapse" data-bs-target="#navbar-collapse">
+        <i class="bi bi-list fs-5"></i>
       </button>
-      <div class="collapse navbar-collapse" id="navbar">
-        <ul class="navbar-nav me-auto mb-2 mb-lg-0">
-          <li class="nav-item"><a class="nav-link" href="/"><i class="bi bi-collection me-1"></i>Formulare</a></li>
-          {{if hasRole .CurrentUser (roleAdmin) (roleEditor)}}<li class="nav-item"><a class="nav-link" href="/forms/new"><i class="bi bi-plus-circle me-1"></i>Neu</a></li>{{end}}
-          {{if hasRole .CurrentUser (roleAdmin)}}<li class="nav-item"><a class="nav-link" href="/users"><i class="bi bi-people me-1"></i>Benutzer</a></li>{{end}}
+      <div class="collapse navbar-collapse" id="navbar-collapse">
+        <ul class="navbar-nav me-auto mb-2 mb-lg-0 gap-1">
+          <li class="nav-item"><a class="nav-link px-3" href="/"><i class="bi bi-collection me-1"></i>Formulare</a></li>
+          {{if hasRole .CurrentUser (roleAdmin) (roleEditor)}}<li class="nav-item"><a class="nav-link px-3" href="/forms/new"><i class="bi bi-plus-circle me-1"></i>Neu</a></li>{{end}}
+          {{if hasRole .CurrentUser (roleAdmin)}}<li class="nav-item"><a class="nav-link px-3" href="/users"><i class="bi bi-people me-1"></i>Benutzer</a></li>{{end}}
         </ul>
-        <div class="d-flex align-items-center gap-3">
-          <span class="navbar-text">
-            <i class="bi bi-person-circle me-1"></i>{{.CurrentUser.DisplayName}}
-            <span class="badge ms-1 badge-role-{{.CurrentUser.Role}} rounded-pill">{{.CurrentUser.Role}}</span>
-          </span>
-          <form method="post" action="/logout" class="d-inline">
-            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-            <button class="btn btn-outline-light btn-sm" type="submit"><i class="bi bi-box-arrow-right me-1"></i>Logout</button>
-          </form>
-        </div>
+
+        {{/* User dropdown - collapsible on mobile, dropdown on desktop */}}
+        <ul class="navbar-nav ms-lg-2">
+          <li class="nav-item dropdown">
+            <a class="nav-link dropdown-toggle d-flex align-items-center gap-2 px-2" href="#" data-bs-toggle="dropdown" aria-expanded="false">
+              <span class="user-avatar">{{initial .CurrentUser.DisplayName}}</span>
+              <span class="d-none d-lg-inline">{{.CurrentUser.DisplayName}}</span>
+              <span class="badge badge-role-{{.CurrentUser.Role}} rounded-pill ms-1 d-none d-lg-inline">{{.CurrentUser.Role}}</span>
+            </a>
+            <ul class="dropdown-menu dropdown-menu-end p-2">
+              <li>
+                <div class="px-3 py-2 border-bottom mb-1">
+                  <div class="fw-semibold text-body">{{.CurrentUser.DisplayName}}</div>
+                  <div class="text-muted small">@{{.CurrentUser.Username}} &middot; <span class="badge badge-role-{{.CurrentUser.Role}} rounded-pill dropdown-role-badge">{{.CurrentUser.Role}}</span></div>
+                </div>
+              </li>
+              <li><a class="dropdown-item" href="/profile"><i class="bi bi-person-gear me-2 text-muted"></i>Profil &amp; Passwort</a></li>
+              {{if .AdminHintActive}}
+              <li><a class="dropdown-item text-warning fw-semibold" href="/profile"><i class="bi bi-shield-exclamation me-2"></i>Passwort ändern!</a></li>
+              {{end}}
+              <li><hr class="dropdown-divider my-1"></li>
+              <li>
+                <form method="post" action="/logout" class="px-1">
+                  <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+                  <button class="dropdown-item text-danger w-100 text-start" type="submit">
+                    <i class="bi bi-box-arrow-right me-2"></i>Abmelden
+                  </button>
+                </form>
+              </li>
+            </ul>
+          </li>
+        </ul>
       </div>
     {{end}}
   </div>
 </nav>
-<main class="container mb-5">
+
+{{if and .CurrentUser .AdminHintActive}}
+<div class="alert alert-warning alert-dismissible rounded-0 border-0 border-bottom mb-0 py-2 text-center admin-hint-banner">
+  <i class="bi bi-shield-exclamation-fill me-2 text-warning"></i>
+  <strong>Sicherheitshinweis:</strong> Das Standard-Passwort ist noch aktiv.
+  <a href="/profile" class="alert-link ms-2 fw-semibold">Jetzt ändern &rarr;</a>
+  <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Schließen"></button>
+</div>
+{{end}}
+
+<main class="container py-4 mb-2">
 {{end}}
 
 {{define "footer"}}
 </main>
+<footer class="site-footer mt-auto">
+  <div class="container d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <span><i class="bi bi-ui-checks-grid me-1"></i><strong class="text-body">Formigo</strong> &mdash; Einfache Formularverwaltung</span>
+    <span class="d-none d-md-inline">Powered by <strong>tinySQL</strong></span>
+  </div>
+</footer>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script src="/static/app.js"></script>
 </body>
@@ -81,9 +154,21 @@
 
 {{define "alert"}}
 {{if .Error}}
-<div class="alert alert-danger d-flex align-items-center gap-2" role="alert">
+<div class="alert alert-danger d-flex align-items-center gap-2 mb-4" role="alert">
   <i class="bi bi-exclamation-triangle-fill flex-shrink-0"></i>
   <span>{{.Error}}</span>
+</div>
+{{end}}
+{{if .Success}}
+<div class="alert alert-success d-flex align-items-center gap-2 mb-4" role="alert">
+  <i class="bi bi-check-circle-fill flex-shrink-0"></i>
+  <span>{{.Success}}</span>
+</div>
+{{end}}
+{{if .Info}}
+<div class="alert alert-info d-flex align-items-center gap-2 mb-4" role="alert">
+  <i class="bi bi-info-circle-fill flex-shrink-0"></i>
+  <span>{{.Info}}</span>
 </div>
 {{end}}
 {{end}}

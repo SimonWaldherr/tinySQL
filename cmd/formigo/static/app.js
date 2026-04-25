@@ -12,6 +12,22 @@
     }, false);
   }
 
+  /* ── Admin quick-login button ───────────────────────────────────── */
+  const adminBtn = document.getElementById('btn-admin-login');
+  if (adminBtn) {
+    adminBtn.addEventListener('click', () => {
+      const u = adminBtn.dataset.adminUser;
+      const p = adminBtn.dataset.adminPass;
+      const userField = document.getElementById('username');
+      const passField = document.getElementById('password');
+      if (userField && passField) {
+        userField.value = u;
+        passField.value = p;
+        userField.closest('form').requestSubmit();
+      }
+    });
+  }
+
   /* ── Form builder ───────────────────────────────────────────────── */
   const list      = document.getElementById('field-list');
   const addBtn    = document.getElementById('btn-add-field');

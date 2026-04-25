@@ -48,7 +48,14 @@ func main() {
 	}
 
 	auth := NewAuthService(store, *cookieSecure)
-	app := NewApp(store, auth, tpl)
+	app := NewApp(store, auth, tpl, *adminUser, *adminPassword)
+
+	// Check if the default admin password is still active.
+	if u, err := store.FindUserByUsername(ctx, *adminUser); err == nil {
+		if CheckPassword(u.PasswordHash, *adminPassword) {
+			app.adminHintActive.Store(true)
+		}
+	}
 
 	mux := http.NewServeMux()
 	app.RegisterRoutes(mux)
@@ -73,6 +80,12 @@ func parseTemplates() (*template.Template, error) {
 		"roleEditor": func() Role { return RoleEditor },
 		"roleViewer": func() Role { return RoleViewer },
 		"roleUser":   func() Role { return RoleUser },
+		"initial": func(s string) string {
+			for _, r := range s {
+				return string(r)
+			}
+			return "?"
+		},
 	}).ParseFS(webFS, "templates/*.html")
 }
 

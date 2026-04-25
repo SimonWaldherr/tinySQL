@@ -5,19 +5,26 @@
     <h1 class="h3 mb-1"><i class="bi bi-pencil-square me-2 text-success"></i>{{.Form.Title}}</h1>
     {{if .Form.Description}}<p class="text-muted mb-0">{{.Form.Description}}</p>{{end}}
   </div>
-  <a href="/" class="btn btn-outline-secondary btn-sm"><i class="bi bi-arrow-left me-1"></i>Zurück</a>
+  {{if not .IsGuest}}<a href="/" class="btn btn-outline-secondary btn-sm"><i class="bi bi-arrow-left me-1"></i>Zurück</a>{{end}}
 </div>
 {{template "alert" .}}
-<form method="post" action="/forms/{{.Form.ID}}/answers" class="needs-validation" novalidate>
-  <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+
+{{if .Closed}}
+<div class="alert alert-warning d-flex align-items-center gap-2">
+  <i class="bi bi-clock-history fs-5"></i>
+  <span>{{.Closed}}</span>
+</div>
+{{else}}
+<form method="post" action="{{.ActionURL}}" class="needs-validation" novalidate>
+  {{if .CSRFToken}}<input type="hidden" name="csrf_token" value="{{.CSRFToken}}">{{end}}
 
   <div class="card mb-4">
     <div class="card-header fw-semibold"><i class="bi bi-person me-2 text-primary"></i>Absender</div>
     <div class="card-body">
       <div class="form-floating">
-        <input type="text" name="submitter" id="submitter" class="form-control" placeholder="Ihr Name" value="{{.CurrentUser.DisplayName}}" required>
-        <label for="submitter">Ihr Name *</label>
-        <div class="invalid-feedback">Bitte Namen eingeben.</div>
+        <input type="text" name="submitter" id="submitter" class="form-control" placeholder="Ihr Name" value="{{if .CurrentUser}}{{.CurrentUser.DisplayName}}{{end}}" {{if not .IsGuest}}required{{end}}>
+        <label for="submitter">{{if .IsGuest}}Ihr Name (optional){{else}}Ihr Name *{{end}}</label>
+        {{if not .IsGuest}}<div class="invalid-feedback">Bitte Namen eingeben.</div>{{end}}
       </div>
     </div>
   </div>
@@ -47,7 +54,7 @@
               id="f{{$field.ID}}"
               class="form-control"
               placeholder="{{$field.Label}}"
-              style="height: 120px"
+              class="form-control textarea-md"
               {{if $field.Required}}required{{end}}>{{$field.DefaultValue}}</textarea>
             <label for="f{{$field.ID}}">{{$field.Label}}{{if $field.Required}} <span class="text-danger">*</span>{{end}}</label>
             {{if $field.Required}}<div class="invalid-feedback">Bitte ausfüllen.</div>{{end}}
@@ -87,9 +94,10 @@
 
   <div class="d-flex gap-2">
     <button class="btn btn-success" type="submit"><i class="bi bi-send me-1"></i>Absenden</button>
-    <a href="/" class="btn btn-outline-secondary"><i class="bi bi-x me-1"></i>Abbrechen</a>
+    {{if not .IsGuest}}<a href="/" class="btn btn-outline-secondary"><i class="bi bi-x me-1"></i>Abbrechen</a>{{end}}
   </div>
 </form>
+{{end}}
 {{template "footer" .}}
 {{end}}
 

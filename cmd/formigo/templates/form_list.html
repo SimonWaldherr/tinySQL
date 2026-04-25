@@ -17,7 +17,7 @@
     <table class="table table-hover align-middle mb-0">
       <thead>
         <tr>
-          <th style="width:60px">#</th>
+          <th class="col-id">#</th>
           <th>Titel</th>
           <th class="d-none d-md-table-cell">Beschreibung</th>
           <th class="d-none d-lg-table-cell">Erstellt</th>
@@ -28,7 +28,12 @@
         {{range .Forms}}
         <tr>
           <td class="text-muted small fw-bold">{{.ID}}</td>
-          <td class="fw-semibold">{{.Title}}</td>
+          <td class="fw-semibold">
+            {{.Title}}
+            {{if .AllowGuest}}<span class="badge bg-success ms-1" title="Öffentlich ausfüllbar"><i class="bi bi-globe"></i></span>{{end}}
+            {{if .OpensAt}}<span class="badge bg-info text-dark ms-1 d-none d-xl-inline" title="Öffnet: {{.OpensAt}}"><i class="bi bi-door-open"></i> {{.OpensAt}}</span>{{end}}
+            {{if .ClosesAt}}<span class="badge bg-secondary ms-1 d-none d-xl-inline" title="Schließt: {{.ClosesAt}}"><i class="bi bi-door-closed"></i> {{.ClosesAt}}</span>{{end}}
+          </td>
           <td class="d-none d-md-table-cell text-muted">{{.Description}}</td>
           <td class="d-none d-lg-table-cell text-muted small">{{.CreatedAt}}</td>
           <td class="text-end">
@@ -36,6 +41,11 @@
               {{if hasRole $.CurrentUser (roleAdmin) (roleEditor) (roleUser)}}
               <a class="btn btn-success" href="/forms/{{.ID}}/fill" title="Ausfüllen">
                 <i class="bi bi-pencil-fill"></i><span class="d-none d-lg-inline ms-1">Ausfüllen</span>
+              </a>
+              {{end}}
+              {{if .AllowGuest}}
+              <a class="btn btn-outline-success" href="/g/{{.ID}}" title="Öffentlicher Link" target="_blank">
+                <i class="bi bi-globe"></i><span class="d-none d-lg-inline ms-1">Gast-Link</span>
               </a>
               {{end}}
               {{if hasRole $.CurrentUser (roleAdmin) (roleEditor) (roleViewer)}}

@@ -91,7 +91,9 @@ func (s *Store) CreateForm(ctx context.Context, input CreateFormInput) (int64, e
 	var formID int64
 	err := withTx(ctx, s.db, func(tx *sql.Tx) error {
 		var err error
-		formID, err = s.d.insertReturningID(ctx, tx, "forms", []string{"title", "description", "created_by", "created_at"}, input.Title, input.Description, input.CreatedBy, now)
+		formID, err = s.d.insertReturningID(ctx, tx, "forms",
+			[]string{"title", "description", "created_by", "created_at", "allow_guest", "opens_at", "closes_at"},
+			input.Title, input.Description, input.CreatedBy, now, boolValue(input.AllowGuest), input.OpensAt, input.ClosesAt)
 		if err != nil {
 			return err
 		}
@@ -121,7 +123,7 @@ func (s *Store) CreateForm(ctx context.Context, input CreateFormInput) (int64, e
 
 // ListForms returns all forms ordered by creation time.
 func (s *Store) ListForms(ctx context.Context) ([]Form, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT id, title, description, created_by, created_at FROM forms ORDER BY created_at DESC, id DESC")
+	rows, err := s.db.QueryContext(ctx, "SELECT id, title, description, created_by, created_at, allow_guest, opens_at, closes_at FROM forms ORDER BY created_at DESC, id DESC")
 	if err != nil {
 		return nil, err
 	}
@@ -130,9 +132,14 @@ func (s *Store) ListForms(ctx context.Context) ([]Form, error) {
 	var forms []Form
 	for rows.Next() {
 		var f Form
-		if err := rows.Scan(&f.ID, &f.Title, &f.Description, &f.CreatedBy, &f.CreatedAt); err != nil {
+		var allowGuest any
+		var opensAt, closesAt sql.NullString
+		if err := rows.Scan(&f.ID, &f.Title, &f.Description, &f.CreatedBy, &f.CreatedAt, &allowGuest, &opensAt, &closesAt); err != nil {
 			return nil, err
 		}
+		f.AllowGuest = scanBool(allowGuest)
+		f.OpensAt = opensAt.String
+		f.ClosesAt = closesAt.String
 		forms = append(forms, f)
 	}
 	return forms, rows.Err()
@@ -141,11 +148,16 @@ func (s *Store) ListForms(ctx context.Context) ([]Form, error) {
 // GetFormDetail returns a form, all fields, and options.
 func (s *Store) GetFormDetail(ctx context.Context, id int64) (FormDetail, error) {
 	var detail FormDetail
-	err := s.db.QueryRowContext(ctx, "SELECT id, title, description, created_by, created_at FROM forms WHERE id = "+s.d.placeholder(1), id).
-		Scan(&detail.Form.ID, &detail.Form.Title, &detail.Form.Description, &detail.Form.CreatedBy, &detail.Form.CreatedAt)
+	var allowGuest any
+	var opensAt, closesAt sql.NullString
+	err := s.db.QueryRowContext(ctx, "SELECT id, title, description, created_by, created_at, allow_guest, opens_at, closes_at FROM forms WHERE id = "+s.d.placeholder(1), id).
+		Scan(&detail.Form.ID, &detail.Form.Title, &detail.Form.Description, &detail.Form.CreatedBy, &detail.Form.CreatedAt, &allowGuest, &opensAt, &closesAt)
 	if err != nil {
 		return detail, err
 	}
+	detail.Form.AllowGuest = scanBool(allowGuest)
+	detail.Form.OpensAt = opensAt.String
+	detail.Form.ClosesAt = closesAt.String
 
 	rows, err := s.db.QueryContext(ctx, "SELECT id, form_id, type, label, required, default_value, sort_order FROM form_fields WHERE form_id = "+s.d.placeholder(1)+" ORDER BY sort_order, id", id)
 	if err != nil {
@@ -382,6 +394,9 @@ func parseCreateForm(values map[string][]string, userID int64) (CreateFormInput,
 		Title:       strings.TrimSpace(first(values, "title")),
 		Description: strings.TrimSpace(first(values, "description")),
 		CreatedBy:   userID,
+		AllowGuest:  first(values, "allow_guest") == "1",
+		OpensAt:     strings.TrimSpace(first(values, "opens_at")),
+		ClosesAt:    strings.TrimSpace(first(values, "closes_at")),
 	}
 	if input.Title == "" {
 		return input, errors.New("title is required")
@@ -447,6 +462,14 @@ func parseOptionsCSV(raw string) []CreateOptionInput {
 // first returns the first form value by key.
 func first(values map[string][]string, key string) string {
 	return at(values[key], 0)
+}
+
+// UpdateUserPassword updates the password hash for a user.
+func (s *Store) UpdateUserPassword(ctx context.Context, userID int64, passwordHash string) error {
+	_, err := s.db.ExecContext(ctx,
+		"UPDATE users SET password_hash = "+s.d.placeholder(1)+" WHERE id = "+s.d.placeholder(2),
+		passwordHash, userID)
+	return err
 }
 
 // at returns values[i] or an empty string.

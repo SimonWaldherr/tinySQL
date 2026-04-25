@@ -46,6 +46,9 @@ type Form struct {
 	Description string `json:"description"`
 	CreatedBy   int64  `json:"created_by"`
 	CreatedAt   string `json:"created_at"`
+	AllowGuest  bool   `json:"allow_guest"`
+	OpensAt     string `json:"opens_at,omitempty"`
+	ClosesAt    string `json:"closes_at,omitempty"`
 }
 
 // Field represents a stable field definition within a form.
@@ -103,6 +106,9 @@ type CreateFormInput struct {
 	Title       string
 	Description string
 	CreatedBy   int64
+	AllowGuest  bool
+	OpensAt     string
+	ClosesAt    string
 	Fields      []CreateFieldInput
 }
 

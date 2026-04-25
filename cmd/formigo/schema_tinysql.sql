@@ -15,7 +15,10 @@ CREATE TABLE IF NOT EXISTS forms (
   title TEXT,
   description TEXT,
   created_by INT,
-  created_at TEXT
+  created_at TEXT,
+  allow_guest INT,
+  opens_at TEXT,
+  closes_at TEXT
 );
 
 -- statement
@@ -61,3 +64,12 @@ CREATE TABLE IF NOT EXISTS sessions (
   csrf_token TEXT,
   expires_at TEXT
 );
+
+-- statement
+ALTER TABLE forms ADD COLUMN allow_guest INT;
+
+-- statement
+ALTER TABLE forms ADD COLUMN opens_at TEXT;
+
+-- statement
+ALTER TABLE forms ADD COLUMN closes_at TEXT;
