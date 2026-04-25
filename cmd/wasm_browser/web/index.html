@@ -497,7 +497,7 @@ SELECT * FROM users;"></textarea>
 
     // Utility functions
     function updateStatus(text, type = 'info') {
-      statusIndicator.textContent = text;
+      document.getElementById('statusText').textContent = text;
       statusIndicator.className = `status-indicator ${type}`;
       statusDot.style.background = type === 'connected' ? 'var(--success-color)' : 'var(--error-color)';
     }

@@ -267,7 +267,7 @@
       <div class="logo">tinySQL – WASM Demo</div>
       <div id="status-indicator" class="status-indicator disconnected">
         <div class="status-dot" style="background: var(--error-color);"></div>
-        Initializing...
+        <span id="statusText">Initializing...</span>
       </div>
     </div>
   </header>
@@ -347,7 +347,7 @@ SELECT * FROM users;"></textarea>
 
     // Utility functions
     function updateStatus(text, type = 'info') {
-      statusIndicator.textContent = text;
+      document.getElementById('statusText').textContent = text;
       statusIndicator.className = `status-indicator ${type}`;
       statusDot.style.background = type === 'connected' ? 'var(--success-color)' : 'var(--error-color)';
     }
