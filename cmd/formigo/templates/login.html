@@ -1,0 +1,36 @@
+{{define "login"}}
+{{template "header" .}}
+<div class="row justify-content-center mt-3">
+  <div class="col-sm-10 col-md-6 col-lg-4">
+    <div class="card shadow">
+      <div class="card-body p-4">
+        <div class="text-center mb-4">
+          <div class="bg-primary bg-gradient text-white rounded-circle d-inline-flex align-items-center justify-content-center mb-3" style="width:56px;height:56px">
+            <i class="bi bi-person-lock fs-4"></i>
+          </div>
+          <h1 class="h4 fw-bold mb-0">Anmelden</h1>
+          <p class="text-muted small mt-1">Bitte melden Sie sich an, um fortzufahren.</p>
+        </div>
+        {{template "alert" .}}
+        <form method="post" action="/login" class="needs-validation" novalidate>
+          <div class="form-floating mb-3">
+            <input type="text" class="form-control" id="username" name="username" placeholder="Benutzername" autocomplete="username" required autofocus>
+            <label for="username"><i class="bi bi-person me-1"></i>Benutzername</label>
+            <div class="invalid-feedback">Bitte Benutzername eingeben.</div>
+          </div>
+          <div class="form-floating mb-4">
+            <input type="password" class="form-control" id="password" name="password" placeholder="Passwort" autocomplete="current-password" required>
+            <label for="password"><i class="bi bi-key me-1"></i>Passwort</label>
+            <div class="invalid-feedback">Bitte Passwort eingeben.</div>
+          </div>
+          <button class="btn btn-primary w-100 py-2" type="submit">
+            <i class="bi bi-box-arrow-in-right me-1"></i>Login
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+{{template "footer" .}}
+{{end}}
+

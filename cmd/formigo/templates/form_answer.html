@@ -1,0 +1,95 @@
+{{define "form_answer"}}
+{{template "header" .}}
+<div class="page-header d-flex justify-content-between align-items-center">
+  <div>
+    <h1 class="h3 mb-1"><i class="bi bi-pencil-square me-2 text-success"></i>{{.Form.Title}}</h1>
+    {{if .Form.Description}}<p class="text-muted mb-0">{{.Form.Description}}</p>{{end}}
+  </div>
+  <a href="/" class="btn btn-outline-secondary btn-sm"><i class="bi bi-arrow-left me-1"></i>Zurück</a>
+</div>
+{{template "alert" .}}
+<form method="post" action="/forms/{{.Form.ID}}/answers" class="needs-validation" novalidate>
+  <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+
+  <div class="card mb-4">
+    <div class="card-header fw-semibold"><i class="bi bi-person me-2 text-primary"></i>Absender</div>
+    <div class="card-body">
+      <div class="form-floating">
+        <input type="text" name="submitter" id="submitter" class="form-control" placeholder="Ihr Name" value="{{.CurrentUser.DisplayName}}" required>
+        <label for="submitter">Ihr Name *</label>
+        <div class="invalid-feedback">Bitte Namen eingeben.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card mb-4">
+    <div class="card-header fw-semibold"><i class="bi bi-list-check me-2 text-primary"></i>Formularfelder</div>
+    <div class="card-body">
+      {{range .Fields}}
+        {{$field := .}}
+        {{if isInputField $field.Type}}
+          <div class="form-floating mb-3">
+            <input
+              type="{{$field.Type}}"
+              name="f_{{$field.ID}}"
+              id="f{{$field.ID}}"
+              class="form-control"
+              placeholder="{{$field.Label}}"
+              value="{{$field.DefaultValue}}"
+              {{if $field.Required}}required{{end}}>
+            <label for="f{{$field.ID}}">{{$field.Label}}{{if $field.Required}} <span class="text-danger">*</span>{{end}}</label>
+            {{if $field.Required}}<div class="invalid-feedback">Bitte ausfüllen.</div>{{end}}
+          </div>
+        {{else if eq $field.Type "textarea"}}
+          <div class="form-floating mb-3">
+            <textarea
+              name="f_{{$field.ID}}"
+              id="f{{$field.ID}}"
+              class="form-control"
+              placeholder="{{$field.Label}}"
+              style="height: 120px"
+              {{if $field.Required}}required{{end}}>{{$field.DefaultValue}}</textarea>
+            <label for="f{{$field.ID}}">{{$field.Label}}{{if $field.Required}} <span class="text-danger">*</span>{{end}}</label>
+            {{if $field.Required}}<div class="invalid-feedback">Bitte ausfüllen.</div>{{end}}
+          </div>
+        {{else if eq $field.Type "select"}}
+          <div class="mb-3">
+            <label for="f{{$field.ID}}" class="form-label fw-semibold">{{$field.Label}}{{if $field.Required}} <span class="text-danger">*</span>{{end}}</label>
+            <select name="f_{{$field.ID}}" id="f{{$field.ID}}" class="form-select" {{if $field.Required}}required{{end}}>
+              {{if not $field.Required}}<option value="">— Bitte wählen —</option>{{end}}
+              {{range $field.Options}}
+                <option value="{{.Value}}" {{if eq .Value $field.DefaultValue}}selected{{end}}>{{.Label}}</option>
+              {{end}}
+            </select>
+            {{if $field.Required}}<div class="invalid-feedback">Bitte auswählen.</div>{{end}}
+          </div>
+        {{else if eq $field.Type "checkboxes"}}
+          <fieldset class="mb-3">
+            <legend class="col-form-label fw-semibold pt-0">{{$field.Label}}{{if $field.Required}} <span class="text-danger">*</span>{{end}}</legend>
+            <div class="d-flex flex-wrap gap-3">
+              {{range $field.Options}}
+                <div class="form-check">
+                  <input class="form-check-input" type="checkbox" name="f_{{$field.ID}}" id="f{{$field.ID}}-{{.ID}}" value="{{.Value}}">
+                  <label class="form-check-label" for="f{{$field.ID}}-{{.ID}}">{{.Label}}</label>
+                </div>
+              {{end}}
+            </div>
+          </fieldset>
+        {{end}}
+      {{else}}
+        <div class="empty-state text-center">
+          <i class="bi bi-clipboard-x"></i>
+          <p class="mb-0">Dieses Formular enthält keine Felder.</p>
+        </div>
+      {{end}}
+    </div>
+  </div>
+
+  <div class="d-flex gap-2">
+    <button class="btn btn-success" type="submit"><i class="bi bi-send me-1"></i>Absenden</button>
+    <a href="/" class="btn btn-outline-secondary"><i class="bi bi-x me-1"></i>Abbrechen</a>
+  </div>
+</form>
+{{template "footer" .}}
+{{end}}
+

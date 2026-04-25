@@ -37,3 +37,6 @@ libtinysqlodbc.so
 cmd.zip
 bin/
 .gocache
+cmd/formigo/formigo
+formigo.db
+formigo.db.wal

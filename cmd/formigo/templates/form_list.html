@@ -1,0 +1,68 @@
+{{define "form_list"}}
+{{template "header" .}}
+<div class="page-header d-flex justify-content-between align-items-center">
+  <div>
+    <h1 class="h3 mb-0"><i class="bi bi-collection me-2 text-primary"></i>Formulare</h1>
+    <p class="text-muted small mb-0 mt-1">Alle verfügbaren Formulare</p>
+  </div>
+  {{if hasRole .CurrentUser (roleAdmin) (roleEditor)}}
+  <a href="/forms/new" class="btn btn-primary">
+    <i class="bi bi-plus-lg me-1"></i>Neues Formular
+  </a>
+  {{end}}
+</div>
+
+<div class="card card-hover">
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th style="width:60px">#</th>
+          <th>Titel</th>
+          <th class="d-none d-md-table-cell">Beschreibung</th>
+          <th class="d-none d-lg-table-cell">Erstellt</th>
+          <th class="text-end">Aktionen</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Forms}}
+        <tr>
+          <td class="text-muted small fw-bold">{{.ID}}</td>
+          <td class="fw-semibold">{{.Title}}</td>
+          <td class="d-none d-md-table-cell text-muted">{{.Description}}</td>
+          <td class="d-none d-lg-table-cell text-muted small">{{.CreatedAt}}</td>
+          <td class="text-end">
+            <div class="btn-group btn-group-sm" role="group">
+              {{if hasRole $.CurrentUser (roleAdmin) (roleEditor) (roleUser)}}
+              <a class="btn btn-success" href="/forms/{{.ID}}/fill" title="Ausfüllen">
+                <i class="bi bi-pencil-fill"></i><span class="d-none d-lg-inline ms-1">Ausfüllen</span>
+              </a>
+              {{end}}
+              {{if hasRole $.CurrentUser (roleAdmin) (roleEditor) (roleViewer)}}
+              <a class="btn btn-outline-secondary" href="/forms/{{.ID}}/answers" title="Antworten">
+                <i class="bi bi-bar-chart-fill"></i><span class="d-none d-lg-inline ms-1">Antworten</span>
+              </a>
+              {{end}}
+            </div>
+          </td>
+        </tr>
+        {{else}}
+        <tr>
+          <td colspan="5">
+            <div class="empty-state text-center">
+              <i class="bi bi-inbox"></i>
+              <p class="mb-0 fw-semibold">Noch keine Formulare vorhanden.</p>
+              {{if hasRole $.CurrentUser (roleAdmin) (roleEditor)}}
+              <a href="/forms/new" class="btn btn-primary btn-sm mt-3">Erstes Formular erstellen</a>
+              {{end}}
+            </div>
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+{{template "footer" .}}
+{{end}}
+

@@ -32,9 +32,9 @@ type ftsPosting struct {
 
 // ftsIndex holds the inverted index and metadata for one virtual FTS table.
 type ftsIndex struct {
-	Columns  []string                    // indexed columns
-	InvIndex map[string][]ftsPosting     // term → postings list
-	DocLens  map[int]int                 // rowID → document length
+	Columns   []string                // indexed columns
+	InvIndex  map[string][]ftsPosting // term → postings list
+	DocLens   map[int]int             // rowID → document length
 	AvgDocLen float64
 }
 

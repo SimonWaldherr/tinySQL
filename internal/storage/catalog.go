@@ -45,8 +45,8 @@ type CatalogTrigger struct {
 	Timing     TriggerTiming
 	Event      TriggerEvent
 	ForEachRow bool
-	WhenExpr   string    // optional WHEN clause SQL text
-	Body       string    // SQL text of trigger body (semicolon-separated stmts)
+	WhenExpr   string // optional WHEN clause SQL text
+	Body       string // SQL text of trigger body (semicolon-separated stmts)
 	CreatedAt  time.Time
 }
 

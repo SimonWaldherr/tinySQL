@@ -895,6 +895,10 @@ func applySortOrder(orderBy []OrderItem, outRows []Row) []Row {
 }
 
 func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
+	if rs, ok, err := executeSimpleSelectFastPath(env, s); ok || err != nil {
+		return rs, err
+	}
+
 	// Process CTEs first
 	cteEnv, err := processCTEs(env, s)
 	if err != nil {
@@ -967,6 +971,327 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 		resultCols = columnsFromRows(resultRows)
 	}
 	return &ResultSet{Cols: resultCols, Rows: resultRows}, nil
+}
+
+type simpleSelectPlan struct {
+	table      *storage.Table
+	colIndex   map[string]int
+	projs      []simpleProjection
+	orderBy    []OrderItem
+	where      Expr
+	limit      *int
+	offset     *int
+	outputCols []string
+}
+
+type simpleProjection struct {
+	name string
+	expr Expr
+}
+
+func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error) {
+	plan, ok, err := buildSimpleSelectPlan(env, s)
+	if !ok || err != nil {
+		return nil, ok, err
+	}
+
+	outRows := make([]Row, 0, simpleSelectInitialCap(plan))
+	stopAfter := -1
+	if len(plan.orderBy) == 0 && plan.limit != nil {
+		stopAfter = *plan.limit
+		if plan.offset != nil {
+			stopAfter += *plan.offset
+		}
+	}
+
+	for _, raw := range plan.table.Rows {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, true, err
+		}
+		match, err := evalRawWhere(plan, raw)
+		if err != nil {
+			return nil, true, err
+		}
+		if !match {
+			continue
+		}
+		out, err := projectRawRow(plan, raw)
+		if err != nil {
+			return nil, true, err
+		}
+		outRows = append(outRows, out)
+		if stopAfter >= 0 && len(outRows) >= stopAfter {
+			break
+		}
+	}
+
+	if len(plan.orderBy) > 0 {
+		outRows = applySortOrder(plan.orderBy, outRows)
+	}
+	outRows = applyOffsetLimit(&Select{Limit: plan.limit, Offset: plan.offset}, outRows)
+	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, true, nil
+}
+
+func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, error) {
+	if s.Distinct || len(s.DistinctOn) > 0 || len(s.CTEs) > 0 || len(s.Joins) > 0 ||
+		len(s.GroupBy) > 0 || s.Having != nil || s.Union != nil ||
+		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil {
+		return nil, false, nil
+	}
+	if strings.Contains(strings.ToLower(s.From.Table), ".") {
+		return nil, false, nil
+	}
+	if anyAggInSelect(s.Projs) || anyWindowInSelect(s.Projs) {
+		return nil, false, nil
+	}
+
+	table, err := env.db.Get(env.tenant, s.From.Table)
+	if err != nil {
+		return nil, true, err
+	}
+	colIndex := simpleColumnIndex(table, aliasOr(s.From))
+
+	projs := make([]simpleProjection, 0, len(s.Projs))
+	outputCols := make([]string, 0, len(s.Projs))
+	for i, it := range s.Projs {
+		if it.Star || !isSimpleRawExpr(it.Expr) {
+			return nil, false, nil
+		}
+		name := projName(it, i)
+		if name == "" {
+			return nil, false, nil
+		}
+		projs = append(projs, simpleProjection{name: name, expr: it.Expr})
+		outputCols = append(outputCols, name)
+	}
+	for _, oi := range s.OrderBy {
+		foundProjection := false
+		for _, p := range projs {
+			if strings.EqualFold(p.name, oi.Col) {
+				foundProjection = true
+				break
+			}
+		}
+		if !foundProjection {
+			return nil, false, nil
+		}
+	}
+	if !isSimpleRawPredicate(s.Where) {
+		return nil, false, nil
+	}
+
+	return &simpleSelectPlan{
+		table:      table,
+		colIndex:   colIndex,
+		projs:      projs,
+		orderBy:    s.OrderBy,
+		where:      s.Where,
+		limit:      s.Limit,
+		offset:     s.Offset,
+		outputCols: outputCols,
+	}, true, nil
+}
+
+func simpleColumnIndex(t *storage.Table, alias string) map[string]int {
+	idx := make(map[string]int, len(t.Cols)*3)
+	tableName := strings.ToLower(t.Name)
+	aliasName := strings.ToLower(alias)
+	for i, c := range t.Cols {
+		col := strings.ToLower(c.Name)
+		idx[col] = i
+		idx[tableName+"."+col] = i
+		if aliasName != "" {
+			idx[aliasName+"."+col] = i
+		}
+	}
+	return idx
+}
+
+func simpleSelectInitialCap(plan *simpleSelectPlan) int {
+	if plan.limit != nil && len(plan.orderBy) == 0 {
+		capHint := *plan.limit
+		if plan.offset != nil {
+			capHint += *plan.offset
+		}
+		if capHint > 0 && capHint < len(plan.table.Rows) {
+			return capHint
+		}
+	}
+	if len(plan.table.Rows) < 64 {
+		return len(plan.table.Rows)
+	}
+	return 64
+}
+
+func isSimpleRawExpr(e Expr) bool {
+	switch ex := e.(type) {
+	case nil:
+		return true
+	case *Literal, *VarRef:
+		return true
+	case *Unary:
+		return (ex.Op == "+" || ex.Op == "-" || ex.Op == "NOT") && isSimpleRawExpr(ex.Expr)
+	case *Binary:
+		if ex.Op == "AND" || ex.Op == "OR" || isComparisonOp(ex.Op) || isArithmeticOp(ex.Op) {
+			return isSimpleRawExpr(ex.Left) && isSimpleRawExpr(ex.Right)
+		}
+		return false
+	case *IsNull:
+		return isSimpleRawExpr(ex.Expr)
+	default:
+		return false
+	}
+}
+
+func isSimpleRawPredicate(e Expr) bool {
+	if e == nil {
+		return true
+	}
+	return isSimpleRawExpr(e)
+}
+
+func isComparisonOp(op string) bool {
+	switch op {
+	case "=", "!=", "<>", "<", "<=", ">", ">=":
+		return true
+	default:
+		return false
+	}
+}
+
+func isArithmeticOp(op string) bool {
+	switch op {
+	case "+", "-", "*", "/":
+		return true
+	default:
+		return false
+	}
+}
+
+func evalRawWhere(plan *simpleSelectPlan, raw []any) (bool, error) {
+	if plan.where == nil {
+		return true, nil
+	}
+	v, err := evalRawExpr(plan, raw, plan.where)
+	if err != nil {
+		return false, err
+	}
+	return toTri(v) == tvTrue, nil
+}
+
+func projectRawRow(plan *simpleSelectPlan, raw []any) (Row, error) {
+	out := make(Row, len(plan.projs))
+	for _, p := range plan.projs {
+		v, err := evalRawExpr(plan, raw, p.expr)
+		if err != nil {
+			return nil, err
+		}
+		putVal(out, p.name, v)
+	}
+	return out, nil
+}
+
+func evalRawExpr(plan *simpleSelectPlan, raw []any, e Expr) (any, error) {
+	switch ex := e.(type) {
+	case *Literal:
+		return ex.Val, nil
+	case *VarRef:
+		i, ok := plan.colIndex[strings.ToLower(ex.Name)]
+		if !ok {
+			if strings.Contains(ex.Name, ".") {
+				return nil, fmt.Errorf("unknown column reference %q", ex.Name)
+			}
+			return nil, fmt.Errorf("unknown column %q", ex.Name)
+		}
+		if i < 0 || i >= len(raw) {
+			return nil, fmt.Errorf("column %q is out of range", ex.Name)
+		}
+		return raw[i], nil
+	case *IsNull:
+		v, err := evalRawExpr(plan, raw, ex.Expr)
+		if err != nil {
+			return nil, err
+		}
+		is := isNull(v)
+		if ex.Negate {
+			return !is, nil
+		}
+		return is, nil
+	case *Unary:
+		return evalRawUnary(plan, raw, ex)
+	case *Binary:
+		return evalRawBinary(plan, raw, ex)
+	default:
+		return nil, fmt.Errorf("unsupported fast-path expression %T", e)
+	}
+}
+
+func evalRawUnary(plan *simpleSelectPlan, raw []any, ex *Unary) (any, error) {
+	v, err := evalRawExpr(plan, raw, ex.Expr)
+	if err != nil {
+		return nil, err
+	}
+	switch ex.Op {
+	case "+":
+		if f, ok := numeric(v); ok {
+			return f, nil
+		}
+		if v == nil {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("unary + non-numeric")
+	case "-":
+		if f, ok := numeric(v); ok {
+			return -f, nil
+		}
+		if v == nil {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("unary - non-numeric")
+	case "NOT":
+		return triToValue(triNot(toTri(v))), nil
+	default:
+		return nil, fmt.Errorf("unknown unary operator: %s", ex.Op)
+	}
+}
+
+func evalRawBinary(plan *simpleSelectPlan, raw []any, ex *Binary) (any, error) {
+	if ex.Op == "AND" || ex.Op == "OR" {
+		lv, err := evalRawExpr(plan, raw, ex.Left)
+		if err != nil {
+			return nil, err
+		}
+		if ex.Op == "AND" && toTri(lv) == tvFalse {
+			return false, nil
+		}
+		if ex.Op == "OR" && toTri(lv) == tvTrue {
+			return true, nil
+		}
+		rv, err := evalRawExpr(plan, raw, ex.Right)
+		if err != nil {
+			return nil, err
+		}
+		if ex.Op == "AND" {
+			return triToValue(triAnd(toTri(lv), toTri(rv))), nil
+		}
+		return triToValue(triOr(toTri(lv), toTri(rv))), nil
+	}
+
+	lv, err := evalRawExpr(plan, raw, ex.Left)
+	if err != nil {
+		return nil, err
+	}
+	rv, err := evalRawExpr(plan, raw, ex.Right)
+	if err != nil {
+		return nil, err
+	}
+	if isArithmeticOp(ex.Op) {
+		return evalArithmeticBinary(ex.Op, lv, rv)
+	}
+	if isComparisonOp(ex.Op) {
+		return evalComparisonBinary(ex.Op, lv, rv)
+	}
+	return nil, fmt.Errorf("unknown binary operator: %s", ex.Op)
 }
 
 func processUnionClauses(env ExecEnv, union *UnionClause, leftRows []Row, leftCols []string) ([]Row, []string, error) {

@@ -1,0 +1,60 @@
+{{define "answer_list"}}
+{{template "header" .}}
+<div class="page-header d-flex justify-content-between align-items-center">
+  <div>
+    <h1 class="h3 mb-1"><i class="bi bi-bar-chart-fill me-2 text-primary"></i>{{.Form.Title}}</h1>
+    {{if .Form.Description}}<p class="text-muted mb-0">{{.Form.Description}}</p>{{end}}
+  </div>
+  <div class="d-flex gap-2">
+    {{if hasRole $.CurrentUser (roleAdmin) (roleEditor) (roleUser)}}
+    <a class="btn btn-success btn-sm" href="/forms/{{.Form.ID}}/fill"><i class="bi bi-pencil-fill me-1"></i>Ausfüllen</a>
+    {{end}}
+    <a class="btn btn-outline-secondary btn-sm" href="/"><i class="bi bi-arrow-left me-1"></i>Zurück</a>
+  </div>
+</div>
+
+<div class="card card-hover">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <span class="fw-semibold">Eingegangene Antworten</span>
+    <span class="badge bg-primary rounded-pill">{{len .Answers}}</span>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th style="width:60px">#</th>
+          <th>Absender</th>
+          <th>Zeitpunkt</th>
+          {{range .Fields}}<th>{{.Label}}</th>{{end}}
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Answers}}
+        <tr>
+          <td class="text-muted small fw-bold">{{.ID}}</td>
+          <td class="fw-semibold">
+            <i class="bi bi-person-circle me-1 text-muted"></i>{{.SubmitterName}}
+          </td>
+          <td class="text-muted small">{{.CreatedAt}}</td>
+          {{range .Cells}}<td>{{.Value}}</td>{{end}}
+        </tr>
+        {{else}}
+        <tr>
+          <td colspan="99">
+            <div class="empty-state text-center">
+              <i class="bi bi-inbox"></i>
+              <p class="mb-0 fw-semibold">Noch keine Antworten vorhanden.</p>
+              {{if hasRole $.CurrentUser (roleAdmin) (roleEditor) (roleUser)}}
+              <a href="/forms/{{$.Form.ID}}/fill" class="btn btn-success btn-sm mt-3">Erste Antwort eintragen</a>
+              {{end}}
+            </div>
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+{{template "footer" .}}
+{{end}}
+

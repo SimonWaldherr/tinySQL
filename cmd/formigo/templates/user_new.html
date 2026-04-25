@@ -1,0 +1,51 @@
+{{define "user_new"}}
+{{template "header" .}}
+<div class="page-header d-flex justify-content-between align-items-center">
+  <div>
+    <h1 class="h3 mb-0"><i class="bi bi-person-plus me-2 text-primary"></i>Neuer Benutzer</h1>
+    <p class="text-muted small mb-0 mt-1">Legen Sie einen neuen Benutzer an.</p>
+  </div>
+  <a href="/users" class="btn btn-outline-secondary btn-sm"><i class="bi bi-arrow-left me-1"></i>Zurück</a>
+</div>
+{{template "alert" .}}
+<form method="post" action="/users" class="needs-validation" novalidate>
+  <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+  <div class="card mb-4" style="max-width:540px">
+    <div class="card-header fw-semibold"><i class="bi bi-person-badge me-2 text-primary"></i>Benutzerdaten</div>
+    <div class="card-body">
+      <div class="form-floating mb-3">
+        <input type="text" class="form-control" name="username" id="username" placeholder="Benutzername" autocomplete="username" required>
+        <label for="username">Benutzername *</label>
+        <div class="invalid-feedback">Bitte Benutzername eingeben.</div>
+      </div>
+      <div class="form-floating mb-3">
+        <input type="text" class="form-control" name="display_name" id="display_name" placeholder="Name" required>
+        <label for="display_name">Anzeigename *</label>
+        <div class="invalid-feedback">Bitte Name eingeben.</div>
+      </div>
+      <div class="form-floating mb-3">
+        <input type="password" class="form-control" name="password" id="password" placeholder="Passwort" autocomplete="new-password" minlength="8" required>
+        <label for="password">Passwort * <span class="text-muted">(min. 8 Zeichen)</span></label>
+        <div class="invalid-feedback">Bitte mindestens 8 Zeichen eingeben.</div>
+      </div>
+      <div class="mb-3">
+        <label for="role" class="form-label fw-semibold">Rolle *</label>
+        <select class="form-select" id="role" name="role" required>
+          {{range .Roles}}
+          <option value="{{.}}">{{.}}</option>
+          {{end}}
+        </select>
+        <div class="form-text text-muted">
+          <strong>admin</strong> – Vollzugriff &middot; <strong>editor</strong> – Formulare &amp; Antworten &middot; <strong>viewer</strong> – nur lesen &middot; <strong>user</strong> – nur ausfüllen
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="d-flex gap-2">
+    <button type="submit" class="btn btn-primary"><i class="bi bi-floppy me-1"></i>Speichern</button>
+    <a href="/users" class="btn btn-outline-secondary"><i class="bi bi-x me-1"></i>Abbrechen</a>
+  </div>
+</form>
+{{template "footer" .}}
+{{end}}
+

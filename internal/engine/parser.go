@@ -53,6 +53,23 @@ func (p *Parser) errf(format string, a ...any) error {
 	return fmt.Errorf("parse error near %q: %s", p.cur.Val, fmt.Sprintf(format, a...))
 }
 
+func (p *Parser) parseBareTableSelect() (*Select, error) {
+	table := p.parseIdentLike()
+	if table == "" {
+		return nil, p.errf("expected table name")
+	}
+	if p.cur.Typ == tSymbol && p.cur.Val == ";" {
+		p.next()
+	}
+	if p.cur.Typ != tEOF {
+		return nil, p.errf("unexpected token after table name")
+	}
+	return &Select{
+		From:  FromItem{Table: table, Alias: table},
+		Projs: []SelectItem{{Star: true}},
+	}, nil
+}
+
 // ------------------------------ AST ------------------------------
 
 type Expr interface{}
@@ -124,7 +141,7 @@ type CreateTable struct {
 	Cols         []storage.Column
 	IsTemp       bool
 	AsSelect     *Select
-	IfNotExists  bool // IF NOT EXISTS clause
+	IfNotExists  bool     // IF NOT EXISTS clause
 	VirtualTable bool     // CREATE VIRTUAL TABLE
 	Using        string   // e.g. "fts"
 	FTSColumns   []string // columns passed to fts(...)
@@ -341,6 +358,9 @@ type WindowFrame struct {
 
 // ParseStatement parses a single SQL statement into an AST.
 func (p *Parser) ParseStatement() (Statement, error) {
+	if p.cur.Typ == tIdent {
+		return p.parseBareTableSelect()
+	}
 	if p.cur.Typ != tKeyword {
 		return nil, p.errf("expected a statement")
 	}
@@ -361,7 +381,7 @@ func (p *Parser) ParseStatement() (Statement, error) {
 	case "SELECT", "WITH":
 		return p.parseSelectWithCTE()
 	default:
-		return nil, p.errf("expected a statement")
+		return p.parseBareTableSelect()
 	}
 }
 

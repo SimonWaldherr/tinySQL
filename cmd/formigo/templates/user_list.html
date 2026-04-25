@@ -1,0 +1,58 @@
+{{define "user_list"}}
+{{template "header" .}}
+<div class="page-header d-flex justify-content-between align-items-center">
+  <div>
+    <h1 class="h3 mb-0"><i class="bi bi-people me-2 text-primary"></i>Benutzer</h1>
+    <p class="text-muted small mb-0 mt-1">Benutzerverwaltung</p>
+  </div>
+  <a href="/users/new" class="btn btn-primary"><i class="bi bi-person-plus me-1"></i>Neuer Benutzer</a>
+</div>
+
+<div class="card card-hover">
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th style="width:60px">#</th>
+          <th>Benutzername</th>
+          <th>Name</th>
+          <th>Rolle</th>
+          <th>Status</th>
+          <th class="d-none d-lg-table-cell">Erstellt</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Users}}
+        <tr>
+          <td class="text-muted small fw-bold">{{.ID}}</td>
+          <td class="fw-semibold"><i class="bi bi-person me-1 text-muted"></i>{{.Username}}</td>
+          <td>{{.DisplayName}}</td>
+          <td>
+            <span class="badge rounded-pill badge-role-{{.Role}}">{{.Role}}</span>
+          </td>
+          <td>
+            {{if .Active}}
+              <span class="badge bg-success-subtle text-success border border-success-subtle rounded-pill"><i class="bi bi-check-circle me-1"></i>Aktiv</span>
+            {{else}}
+              <span class="badge bg-danger-subtle text-danger border border-danger-subtle rounded-pill"><i class="bi bi-x-circle me-1"></i>Inaktiv</span>
+            {{end}}
+          </td>
+          <td class="d-none d-lg-table-cell text-muted small">{{.CreatedAt}}</td>
+        </tr>
+        {{else}}
+        <tr>
+          <td colspan="6">
+            <div class="empty-state text-center">
+              <i class="bi bi-people"></i>
+              <p class="mb-0 fw-semibold">Noch keine Benutzer vorhanden.</p>
+            </div>
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+{{template "footer" .}}
+{{end}}
+
