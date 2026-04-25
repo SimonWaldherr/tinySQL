@@ -78,6 +78,22 @@ func main() {
 
 External projects should import `github.com/SimonWaldherr/tinySQL/driver`, not `internal/driver`. Go's `internal/` rule only allows packages inside this module tree to use `internal/*`.
 
+### Build an agent context
+
+tinySQL can also emit a compact, prompt-ready snapshot of live database metadata for AI agents. The output includes tables, columns, relationships, views, functions, jobs, connections, and a small version/features summary, with hard limits to keep it dense.
+
+```go
+cfg := tinysql.DefaultAgentContextConfig()
+cfg.MaxTables = 8
+cfg.MaxChars = 4000
+
+profile, err := tinysql.BuildAgentContext(context.Background(), db, "default", cfg)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Println(profile)
+```
+
 ## Run tests
 
 ```bash
