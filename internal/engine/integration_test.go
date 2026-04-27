@@ -134,28 +134,44 @@ func TestSelectOrderByLimitOffsetFastPath(t *testing.T) {
 		}
 	}
 
-	stmt, err := NewParser("SELECT id, score FROM scores ORDER BY score DESC LIMIT 2 OFFSET 1").ParseStatement()
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-	rs, err := Execute(ctx, db, "default", stmt)
-	if err != nil {
-		t.Fatalf("execute failed: %v", err)
-	}
-	if rs == nil {
-		t.Fatal("expected result set")
-	}
-
-	got := make([]int, 0, len(rs.Rows))
-	for _, row := range rs.Rows {
-		id, ok := row["id"].(int)
-		if !ok {
-			t.Fatalf("expected int id, got %T", row["id"])
+	for _, tc := range []struct {
+		name string
+		sql  string
+		want []int
+	}{
+		{
+			name: "desc",
+			sql:  "SELECT id, score FROM scores ORDER BY score DESC LIMIT 2 OFFSET 1",
+			want: []int{5, 2},
+		},
+		{
+			name: "asc",
+			sql:  "SELECT id, score FROM scores ORDER BY score ASC LIMIT 2 OFFSET 1",
+			want: []int{3, 2},
+		},
+	} {
+		stmt, err := NewParser(tc.sql).ParseStatement()
+		if err != nil {
+			t.Fatalf("parse failed for %s: %v", tc.name, err)
 		}
-		got = append(got, id)
-	}
-	want := []int{5, 2}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("unexpected row order: got %v want %v", got, want)
+		rs, err := Execute(ctx, db, "default", stmt)
+		if err != nil {
+			t.Fatalf("execute failed for %s: %v", tc.name, err)
+		}
+		if rs == nil {
+			t.Fatalf("expected result set for %s", tc.name)
+		}
+
+		got := make([]int, 0, len(rs.Rows))
+		for _, row := range rs.Rows {
+			id, ok := row["id"].(int)
+			if !ok {
+				t.Fatalf("expected int id, got %T", row["id"])
+			}
+			got = append(got, id)
+		}
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("%s: unexpected row order: got %v want %v", tc.name, got, tc.want)
+		}
 	}
 }

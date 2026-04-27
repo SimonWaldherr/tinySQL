@@ -1581,7 +1581,7 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 	if useTopN {
 		topRows = orderedRawRowHeap{
 			plan:  plan,
-			items: make([]orderedRawRow, 0, keepCount),
+			items: make([]orderedRawRow, 0, simpleSelectInitialCap(plan)),
 		}
 	}
 	for _, raw := range plan.table.Rows {
@@ -1689,7 +1689,7 @@ func (h *orderedRawRowHeap) pushBounded(item orderedRawRow, keepCount int) {
 		heap.Push(h, item)
 		return
 	}
-	if compareOrderedRawRows(h.plan, item, h.items[0]) < 0 {
+	if compareOrderedRawRows(h.plan, h.items[0], item) > 0 {
 		h.items[0] = item
 		heap.Fix(h, 0)
 	}
