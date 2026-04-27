@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -108,5 +109,69 @@ func TestSelectAggregatesAndJoins(t *testing.T) {
 	// join should return at least one matching row
 	if rs3 == nil || len(rs3.Rows) == 0 {
 		t.Fatalf("expected join rows, got %v", rs3)
+	}
+}
+
+func TestSelectOrderByLimitOffsetFastPath(t *testing.T) {
+	ctx := context.Background()
+	db := storage.NewDB()
+
+	stmts := []string{
+		`CREATE TABLE scores (id INT, name TEXT, score FLOAT)`,
+		`INSERT INTO scores VALUES (1, 'alpha', 10.5)`,
+		`INSERT INTO scores VALUES (2, 'beta', 60.0)`,
+		`INSERT INTO scores VALUES (3, 'gamma', 40.0)`,
+		`INSERT INTO scores VALUES (4, 'delta', 90.0)`,
+		`INSERT INTO scores VALUES (5, 'epsilon', 75.0)`,
+	}
+	for _, sql := range stmts {
+		stmt, err := NewParser(sql).ParseStatement()
+		if err != nil {
+			t.Fatalf("parse failed for %q: %v", sql, err)
+		}
+		if _, err := Execute(ctx, db, "default", stmt); err != nil {
+			t.Fatalf("execute failed for %q: %v", sql, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name string
+		sql  string
+		want []int
+	}{
+		{
+			name: "desc",
+			sql:  "SELECT id, score FROM scores ORDER BY score DESC LIMIT 2 OFFSET 1",
+			want: []int{5, 2},
+		},
+		{
+			name: "asc",
+			sql:  "SELECT id, score FROM scores ORDER BY score ASC LIMIT 2 OFFSET 1",
+			want: []int{3, 2},
+		},
+	} {
+		stmt, err := NewParser(tc.sql).ParseStatement()
+		if err != nil {
+			t.Fatalf("parse failed for %s: %v", tc.name, err)
+		}
+		rs, err := Execute(ctx, db, "default", stmt)
+		if err != nil {
+			t.Fatalf("execute failed for %s: %v", tc.name, err)
+		}
+		if rs == nil {
+			t.Fatalf("expected result set for %s", tc.name)
+		}
+
+		got := make([]int, 0, len(rs.Rows))
+		for _, row := range rs.Rows {
+			id, ok := row["id"].(int)
+			if !ok {
+				t.Fatalf("expected int id, got %T", row["id"])
+			}
+			got = append(got, id)
+		}
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("%s: unexpected row order: got %v want %v", tc.name, got, tc.want)
+		}
 	}
 }
