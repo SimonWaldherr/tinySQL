@@ -18,6 +18,7 @@
 package engine
 
 import (
+	"container/heap"
 	"context"
 	"crypto/md5"
 	crand "crypto/rand"
@@ -1559,7 +1560,27 @@ type orderedRawRow struct {
 }
 
 func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*ResultSet, bool, error) {
+	if plan.limit != nil && *plan.limit == 0 {
+		return &ResultSet{Cols: plan.outputCols, Rows: []Row{}}, true, nil
+	}
+
+	keepCount := -1
+	if plan.limit != nil {
+		keepCount = *plan.limit
+		if plan.offset != nil {
+			keepCount += *plan.offset
+		}
+	}
+
 	rows := make([]orderedRawRow, 0, simpleSelectInitialCap(plan))
+	var topRows orderedRawRowHeap
+	useTopN := keepCount > 0 && keepCount < len(plan.table.Rows)
+	if useTopN {
+		topRows = orderedRawRowHeap{
+			plan:  plan,
+			items: make([]orderedRawRow, 0, keepCount),
+		}
+	}
 	for _, raw := range plan.table.Rows {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, true, err
@@ -1576,7 +1597,12 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 			if err != nil {
 				return nil, true, err
 			}
-			rows = append(rows, orderedRawRow{raw: raw, key: key})
+			item := orderedRawRow{raw: raw, key: key}
+			if useTopN {
+				topRows.pushBounded(item, keepCount)
+			} else {
+				rows = append(rows, item)
+			}
 			continue
 		}
 		keys := make([]any, len(plan.orderExprs))
@@ -1587,29 +1613,19 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 			}
 			keys[i] = v
 		}
-		rows = append(rows, orderedRawRow{raw: raw, keys: keys})
+		item := orderedRawRow{raw: raw, keys: keys}
+		if useTopN {
+			topRows.pushBounded(item, keepCount)
+		} else {
+			rows = append(rows, item)
+		}
+	}
+	if useTopN {
+		rows = topRows.items
 	}
 
-	sort.SliceStable(rows, func(i, j int) bool {
-		if len(plan.orderBy) == 1 {
-			oi := plan.orderBy[0]
-			cmp := compareForOrder(rows[i].key, rows[j].key, oi.Desc)
-			if oi.Desc {
-				return cmp > 0
-			}
-			return cmp < 0
-		}
-		for k, oi := range plan.orderBy {
-			cmp := compareForOrder(rows[i].keys[k], rows[j].keys[k], oi.Desc)
-			if cmp == 0 {
-				continue
-			}
-			if oi.Desc {
-				return cmp > 0
-			}
-			return cmp < 0
-		}
-		return false
+	sort.Slice(rows, func(i, j int) bool {
+		return compareOrderedRawRows(plan, rows[i], rows[j]) < 0
 	})
 
 	start := 0
@@ -1633,6 +1649,75 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 		outRows = append(outRows, out)
 	}
 	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, true, nil
+}
+
+type orderedRawRowHeap struct {
+	plan  *simpleSelectPlan
+	items []orderedRawRow
+}
+
+func (h orderedRawRowHeap) Len() int { return len(h.items) }
+
+func (h orderedRawRowHeap) Less(i, j int) bool {
+	return compareOrderedRawRows(h.plan, h.items[i], h.items[j]) > 0
+}
+
+func (h orderedRawRowHeap) Swap(i, j int) {
+	h.items[i], h.items[j] = h.items[j], h.items[i]
+}
+
+func (h *orderedRawRowHeap) Push(x any) {
+	h.items = append(h.items, x.(orderedRawRow))
+}
+
+func (h *orderedRawRowHeap) Pop() any {
+	old := h.items
+	n := len(old)
+	item := old[n-1]
+	h.items = old[:n-1]
+	return item
+}
+
+func (h *orderedRawRowHeap) pushBounded(item orderedRawRow, keepCount int) {
+	if keepCount <= 0 {
+		return
+	}
+	if len(h.items) < keepCount {
+		heap.Push(h, item)
+		return
+	}
+	if compareOrderedRawRows(h.plan, item, h.items[0]) < 0 {
+		h.items[0] = item
+		heap.Fix(h, 0)
+	}
+}
+
+func compareOrderedRawRows(plan *simpleSelectPlan, a, b orderedRawRow) int {
+	if len(plan.orderBy) == 1 {
+		return compareOrderedValue(a.key, b.key, plan.orderBy[0].Desc)
+	}
+	for i, oi := range plan.orderBy {
+		cmp := compareOrderedValue(a.keys[i], b.keys[i], oi.Desc)
+		if cmp != 0 {
+			return cmp
+		}
+	}
+	return 0
+}
+
+func compareOrderedValue(a, b any, desc bool) int {
+	cmp := compareForOrder(a, b, desc)
+	if desc {
+		cmp = -cmp
+	}
+	switch {
+	case cmp < 0:
+		return -1
+	case cmp > 0:
+		return 1
+	default:
+		return 0
+	}
 }
 
 func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, error) {
