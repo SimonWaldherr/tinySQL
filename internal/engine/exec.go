@@ -1570,11 +1570,14 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 		if plan.offset != nil {
 			keepCount += *plan.offset
 		}
+		if keepCount > len(plan.table.Rows) {
+			keepCount = len(plan.table.Rows)
+		}
 	}
 
 	rows := make([]orderedRawRow, 0, simpleSelectInitialCap(plan))
 	var topRows orderedRawRowHeap
-	useTopN := keepCount > 0 && keepCount < len(plan.table.Rows)
+	useTopN := keepCount > 0
 	if useTopN {
 		topRows = orderedRawRowHeap{
 			plan:  plan,
@@ -1624,7 +1627,7 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 		rows = topRows.items
 	}
 
-	sort.Slice(rows, func(i, j int) bool {
+	sort.SliceStable(rows, func(i, j int) bool {
 		return compareOrderedRawRows(plan, rows[i], rows[j]) < 0
 	})
 
@@ -1707,16 +1710,17 @@ func compareOrderedRawRows(plan *simpleSelectPlan, a, b orderedRawRow) int {
 
 func compareOrderedValue(a, b any, desc bool) int {
 	cmp := compareForOrder(a, b, desc)
-	if desc {
-		cmp = -cmp
-	}
 	switch {
+	case cmp == 0:
+		return 0
+	case desc && cmp > 0:
+		return -1
+	case desc:
+		return 1
 	case cmp < 0:
 		return -1
-	case cmp > 0:
-		return 1
 	default:
-		return 0
+		return 1
 	}
 }
 
