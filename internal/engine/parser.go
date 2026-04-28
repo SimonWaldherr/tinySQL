@@ -2069,11 +2069,44 @@ func (p *Parser) parseCmp() (Expr, error) {
 	}
 
 	for {
-		// Support optional NOT prefix for IN/LIKE
+		// Support optional NOT prefix for IN/LIKE/BETWEEN
 		negate := false
 		if p.cur.Typ == tKeyword && p.cur.Val == "NOT" {
 			negate = true
 			p.next()
+		}
+
+		// BETWEEN lo AND hi  /  NOT BETWEEN lo AND hi
+		// Expanded inline as (l >= lo AND l <= hi) or (l < lo OR l > hi).
+		// SQL column expressions have no side effects, so using `l` twice is safe.
+		if p.cur.Typ == tKeyword && p.cur.Val == "BETWEEN" {
+			p.next()
+			lo, err := p.parseAddSub()
+			if err != nil {
+				return nil, err
+			}
+			if p.cur.Typ != tKeyword || p.cur.Val != "AND" {
+				return nil, p.errf("expected AND after BETWEEN lower bound")
+			}
+			p.next()
+			hi, err := p.parseAddSub()
+			if err != nil {
+				return nil, err
+			}
+			if negate {
+				// NOT BETWEEN: l < lo OR l > hi
+				l = &Binary{Op: "OR",
+					Left:  &Binary{Op: "<", Left: l, Right: lo},
+					Right: &Binary{Op: ">", Left: l, Right: hi},
+				}
+			} else {
+				// BETWEEN: l >= lo AND l <= hi
+				l = &Binary{Op: "AND",
+					Left:  &Binary{Op: ">=", Left: l, Right: lo},
+					Right: &Binary{Op: "<=", Left: l, Right: hi},
+				}
+			}
+			continue
 		}
 
 		// IN list
