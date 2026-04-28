@@ -488,13 +488,16 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 		return nil, ok, err
 	}
 
-	rawPlan := &simpleSelectPlan{colIndex: plan.colIndex, where: plan.where}
+	rawPlan := &simpleSelectPlan{colIndex: plan.colIndex, where: plan.where, filter: buildRawFilter(plan.colIndex, plan.where)}
 	updated := 0
 	values := make([]any, len(plan.sets))
 	columnNames := colNames(plan.table.Cols)
 	for ri, raw := range plan.table.Rows {
-		if err := checkCtx(env.ctx); err != nil {
-			return nil, true, err
+		// Check context cancellation every 64 rows to reduce channel-select overhead.
+		if ri&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, true, err
+			}
 		}
 		match, err := evalRawWhere(rawPlan, raw)
 		if err != nil {
@@ -1084,14 +1087,29 @@ type simpleSelectPlan struct {
 	orderBy    []OrderItem
 	orderExprs []Expr
 	where      Expr
+	// filter is a pre-compiled, allocation-free version of where for the most
+	// common patterns (col op literal, boolean column, AND/OR of those). When
+	// non-nil it replaces the recursive evalRawWhere call in the hot scan loop.
+	filter     func([]any) (bool, error)
 	limit      *int
 	offset     *int
 	outputCols []string
 }
 
+// simpleProjection describes a single SELECT item in the raw fast-path.
+// When colIdx >= 0 the projection is a direct column reference: the value is
+// taken from raw[colIdx] without going through evalRawExpr, saving a type
+// switch, a strings.ToLower call, and a map lookup per row per column.
+// key is the pre-lowercased name used as the Row map key (avoids putVal's
+// strings.ToLower on every output row).
+// side is only meaningful for join projections: 0=left table, 1=right table,
+// -1=not resolved (use expr instead).
 type simpleProjection struct {
-	name string
-	expr Expr
+	name   string // output column name (original case for ResultSet.Cols)
+	key    string // strings.ToLower(name) – pre-computed Row map key
+	side   int    // 0=left, 1=right (join), -1=single-table or expression
+	colIdx int    // >= 0: direct array index into raw/left/right; -1: use expr
+	expr   Expr   // used when colIdx < 0
 }
 
 type simpleJoinPlan struct {
@@ -1119,9 +1137,12 @@ func executeSimpleJoinFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error)
 	}
 
 	outRows := make([]Row, 0, min(len(plan.left.Rows), len(plan.right.Rows)))
-	for _, left := range plan.left.Rows {
-		if err := checkCtx(env.ctx); err != nil {
-			return nil, true, err
+	for i, left := range plan.left.Rows {
+		// Check context cancellation every 64 rows to reduce channel-select overhead.
+		if i&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, true, err
+			}
 		}
 		matches := rightByKey[comparableKeyPart(left[plan.leftKey])]
 		for _, right := range matches {
@@ -1177,7 +1198,19 @@ func buildSimpleJoinPlan(env ExecEnv, s *Select) (*simpleJoinPlan, bool, error) 
 			return nil, false, nil
 		}
 		name := projName(it, i)
-		projs = append(projs, simpleProjection{name: name, expr: it.Expr})
+		key := strings.ToLower(name)
+		side, colIdx := -1, -1
+		if ref, ok := it.Expr.(*VarRef); ok {
+			refName := strings.ToLower(ref.Name)
+			if li, lok := leftIndex[refName]; lok {
+				if _, ambig := rightIndex[refName]; !ambig {
+					side, colIdx = 0, li
+				}
+			} else if ri, rok := rightIndex[refName]; rok {
+				side, colIdx = 1, ri
+			}
+		}
+		projs = append(projs, simpleProjection{name: name, key: key, side: side, colIdx: colIdx, expr: it.Expr})
 		outputCols = append(outputCols, name)
 	}
 	if !simpleJoinExprResolvable(s.Where, leftIndex, rightIndex) {
@@ -1235,6 +1268,10 @@ func simpleJoinExprResolvable(e Expr, leftIndex, rightIndex map[string]int) bool
 	case *Binary:
 		return simpleJoinExprResolvable(ex.Left, leftIndex, rightIndex) &&
 			simpleJoinExprResolvable(ex.Right, leftIndex, rightIndex)
+	case *LikeExpr:
+		return simpleJoinExprResolvable(ex.Expr, leftIndex, rightIndex) &&
+			simpleJoinExprResolvable(ex.Pattern, leftIndex, rightIndex) &&
+			(ex.Escape == nil || simpleJoinExprResolvable(ex.Escape, leftIndex, rightIndex))
 	default:
 		return false
 	}
@@ -1254,11 +1291,27 @@ func evalJoinRawWhere(plan *simpleJoinPlan, left, right []any) (bool, error) {
 func projectJoinRawRow(plan *simpleJoinPlan, left, right []any) (Row, error) {
 	out := make(Row, len(plan.projs))
 	for _, p := range plan.projs {
-		v, err := evalJoinRawExpr(plan, left, right, p.expr)
-		if err != nil {
-			return nil, err
+		if p.colIdx >= 0 {
+			// Direct column reference: read from pre-resolved side and index.
+			switch p.side {
+			case 0:
+				out[p.key] = left[p.colIdx]
+			case 1:
+				out[p.key] = right[p.colIdx]
+			default:
+				v, err := evalJoinRawExpr(plan, left, right, p.expr)
+				if err != nil {
+					return nil, err
+				}
+				out[p.key] = v
+			}
+		} else {
+			v, err := evalJoinRawExpr(plan, left, right, p.expr)
+			if err != nil {
+				return nil, err
+			}
+			out[p.key] = v
 		}
-		putVal(out, p.name, v)
 	}
 	return out, nil
 }
@@ -1297,6 +1350,38 @@ func evalJoinRawExpr(plan *simpleJoinPlan, left, right []any, e Expr) (any, erro
 		return evalRawUnary(&simpleSelectPlan{}, nil, &Unary{Op: ex.Op, Expr: &Literal{Val: v}})
 	case *Binary:
 		return evalJoinRawBinary(plan, left, right, ex)
+	case *LikeExpr:
+		val, err := evalJoinRawExpr(plan, left, right, ex.Expr)
+		if err != nil {
+			return nil, err
+		}
+		patVal, err := evalJoinRawExpr(plan, left, right, ex.Pattern)
+		if err != nil {
+			return nil, err
+		}
+		str, ok := val.(string)
+		if !ok {
+			str = fmt.Sprintf("%v", val)
+		}
+		pattern, ok := patVal.(string)
+		if !ok {
+			pattern = fmt.Sprintf("%v", patVal)
+		}
+		escapeChar := '\\'
+		if ex.Escape != nil {
+			escVal, err := evalJoinRawExpr(plan, left, right, ex.Escape)
+			if err != nil {
+				return nil, err
+			}
+			if escStr, ok := escVal.(string); ok && len(escStr) == 1 {
+				escapeChar = rune(escStr[0])
+			}
+		}
+		matched := matchLikePattern(str, pattern, escapeChar)
+		if ex.Negate {
+			return !matched, nil
+		}
+		return matched, nil
 	default:
 		return nil, fmt.Errorf("unsupported join fast-path expression %T", e)
 	}
@@ -1367,12 +1452,15 @@ func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 		return nil, ok, err
 	}
 
-	rawPlan := &simpleSelectPlan{colIndex: plan.colIndex, where: plan.where}
+	rawPlan := &simpleSelectPlan{colIndex: plan.colIndex, where: plan.where, filter: buildRawFilter(plan.colIndex, plan.where)}
 	groups := make(map[any]*simpleAggregateState)
 	order := make([]any, 0)
-	for _, raw := range plan.table.Rows {
-		if err := checkCtx(env.ctx); err != nil {
-			return nil, true, err
+	for i, raw := range plan.table.Rows {
+		// Check context cancellation every 64 rows to reduce channel-select overhead.
+		if i&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, true, err
+			}
 		}
 		match, err := evalRawWhere(rawPlan, raw)
 		if err != nil {
@@ -1528,9 +1616,12 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 		}
 	}
 
-	for _, raw := range plan.table.Rows {
-		if err := checkCtx(env.ctx); err != nil {
-			return nil, true, err
+	for i, raw := range plan.table.Rows {
+		// Check context cancellation every 64 rows to reduce channel-select overhead.
+		if i&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, true, err
+			}
 		}
 		match, err := evalRawWhere(plan, raw)
 		if err != nil {
@@ -1584,9 +1675,12 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 			items: make([]orderedRawRow, 0, simpleSelectInitialCap(plan)),
 		}
 	}
-	for _, raw := range plan.table.Rows {
-		if err := checkCtx(env.ctx); err != nil {
-			return nil, true, err
+	for i, raw := range plan.table.Rows {
+		// Check context cancellation every 64 rows to reduce channel-select overhead.
+		if i&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, true, err
+			}
 		}
 		match, err := evalRawWhere(plan, raw)
 		if err != nil {
@@ -1753,7 +1847,14 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 		if name == "" {
 			return nil, false, nil
 		}
-		projs = append(projs, simpleProjection{name: name, expr: it.Expr})
+		key := strings.ToLower(name)
+		colIdx := -1
+		if ref, ok := it.Expr.(*VarRef); ok {
+			if idx, ok2 := colIndex[strings.ToLower(ref.Name)]; ok2 {
+				colIdx = idx
+			}
+		}
+		projs = append(projs, simpleProjection{name: name, key: key, side: -1, colIdx: colIdx, expr: it.Expr})
 		outputCols = append(outputCols, name)
 	}
 	orderExprs := make([]Expr, 0, len(s.OrderBy))
@@ -1781,6 +1882,7 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 		orderBy:    s.OrderBy,
 		orderExprs: orderExprs,
 		where:      s.Where,
+		filter:     buildRawFilter(colIndex, s.Where),
 		limit:      s.Limit,
 		offset:     s.Offset,
 		outputCols: outputCols,
@@ -1833,6 +1935,10 @@ func isSimpleRawExpr(e Expr) bool {
 		return false
 	case *IsNull:
 		return isSimpleRawExpr(ex.Expr)
+	case *LikeExpr:
+		// LIKE with a literal pattern and no dynamic escape is safe in the fast path.
+		return isSimpleRawExpr(ex.Expr) && isSimpleRawExpr(ex.Pattern) &&
+			(ex.Escape == nil || isSimpleRawExpr(ex.Escape))
 	default:
 		return false
 	}
@@ -1864,6 +1970,9 @@ func isArithmeticOp(op string) bool {
 }
 
 func evalRawWhere(plan *simpleSelectPlan, raw []any) (bool, error) {
+	if plan.filter != nil {
+		return plan.filter(raw)
+	}
 	if plan.where == nil {
 		return true, nil
 	}
@@ -1874,14 +1983,231 @@ func evalRawWhere(plan *simpleSelectPlan, raw []any) (bool, error) {
 	return toTri(v) == tvTrue, nil
 }
 
+// buildRawFilter attempts to compile a WHERE expression into a closure that
+// operates directly on raw row slices ([]any) without going through the
+// general evalRawExpr machinery.  It handles the most common patterns:
+//   - col op literal   (equality, inequality, ordering)
+//   - boolean_col      (truthy column reference)
+//   - NOT boolean_col
+//   - AND / OR of the above
+//
+// Returns nil when the expression is too complex to compile, in which case
+// evalRawExpr is used as the fallback.
+func buildRawFilter(colIndex map[string]int, e Expr) func([]any) (bool, error) {
+	if e == nil {
+		return func([]any) (bool, error) { return true, nil }
+	}
+	switch ex := e.(type) {
+	case *VarRef:
+		colIdx, ok := colIndex[strings.ToLower(ex.Name)]
+		if !ok {
+			return nil
+		}
+		return func(raw []any) (bool, error) { return truthy(raw[colIdx]), nil }
+
+	case *Unary:
+		if ex.Op == "NOT" {
+			inner := buildRawFilter(colIndex, ex.Expr)
+			if inner == nil {
+				return nil
+			}
+			return func(raw []any) (bool, error) {
+				b, err := inner(raw)
+				return !b, err
+			}
+		}
+		return nil
+
+	case *IsNull:
+		innerRef, ok := ex.Expr.(*VarRef)
+		if !ok {
+			return nil
+		}
+		colIdx, ok := colIndex[strings.ToLower(innerRef.Name)]
+		if !ok {
+			return nil
+		}
+		if ex.Negate {
+			return func(raw []any) (bool, error) { return raw[colIdx] != nil, nil }
+		}
+		return func(raw []any) (bool, error) { return raw[colIdx] == nil, nil }
+
+	case *Binary:
+		if ex.Op == "AND" {
+			left := buildRawFilter(colIndex, ex.Left)
+			right := buildRawFilter(colIndex, ex.Right)
+			if left != nil && right != nil {
+				return func(raw []any) (bool, error) {
+					l, err := left(raw)
+					if err != nil || !l {
+						return false, err
+					}
+					return right(raw)
+				}
+			}
+			return nil
+		}
+		if ex.Op == "OR" {
+			left := buildRawFilter(colIndex, ex.Left)
+			right := buildRawFilter(colIndex, ex.Right)
+			if left != nil && right != nil {
+				return func(raw []any) (bool, error) {
+					l, err := left(raw)
+					if err != nil {
+						return false, err
+					}
+					if l {
+						return true, nil
+					}
+					return right(raw)
+				}
+			}
+			return nil
+		}
+		if isComparisonOp(ex.Op) {
+			// col op literal
+			if ref, ok := ex.Left.(*VarRef); ok {
+				if lit, ok := ex.Right.(*Literal); ok {
+					if colIdx, ok := colIndex[strings.ToLower(ref.Name)]; ok {
+						return buildColLiteralFilter(colIdx, ex.Op, lit.Val)
+					}
+				}
+			}
+			// literal op col (reversed)
+			if lit, ok := ex.Left.(*Literal); ok {
+				if ref, ok := ex.Right.(*VarRef); ok {
+					if colIdx, ok := colIndex[strings.ToLower(ref.Name)]; ok {
+						return buildColLiteralFilter(colIdx, reverseComparisonOp(ex.Op), lit.Val)
+					}
+				}
+			}
+		}
+		return nil
+	}
+	return nil
+}
+
+// reverseComparisonOp reverses the direction of a comparison operator,
+// so that "literal op col" can be treated as "col reversed_op literal".
+func reverseComparisonOp(op string) string {
+	switch op {
+	case "<":
+		return ">"
+	case "<=":
+		return ">="
+	case ">":
+		return "<"
+	case ">=":
+		return "<="
+	default:
+		return op // "=" and "!=" / "<>" are symmetric
+	}
+}
+
+// buildColLiteralFilter builds a fast comparison closure for "raw[colIdx] op litVal".
+// The returned function avoids the generic compare() path for the common
+// int/float64/string/bool type combinations.
+func buildColLiteralFilter(colIdx int, op string, litVal any) func([]any) (bool, error) {
+	// Specialise equality and inequality for the most common type pairs.
+	switch op {
+	case "=":
+		return func(raw []any) (bool, error) {
+			a := raw[colIdx]
+			if a == nil || litVal == nil {
+				return false, nil
+			}
+			return rawEqual(a, litVal), nil
+		}
+	case "!=", "<>":
+		return func(raw []any) (bool, error) {
+			a := raw[colIdx]
+			if a == nil || litVal == nil {
+				return false, nil
+			}
+			return !rawEqual(a, litVal), nil
+		}
+	case "<", "<=", ">", ">=":
+		return func(raw []any) (bool, error) {
+			a := raw[colIdx]
+			if a == nil || litVal == nil {
+				return false, nil
+			}
+			cmp, err := compare(a, litVal)
+			if err != nil {
+				return false, err
+			}
+			switch op {
+			case "<":
+				return cmp < 0, nil
+			case "<=":
+				return cmp <= 0, nil
+			case ">":
+				return cmp > 0, nil
+			default: // ">="
+				return cmp >= 0, nil
+			}
+		}
+	}
+	return nil
+}
+
+// rawEqual performs a type-aware equality check between two interface values
+// without going through the generic compare() function.  It covers the value
+// types that tinySQL stores in table rows (int, int64, float64, string, bool).
+func rawEqual(a, b any) bool {
+	switch av := a.(type) {
+	case int:
+		switch bv := b.(type) {
+		case int:
+			return av == bv
+		case int64:
+			return int64(av) == bv
+		case float64:
+			return float64(av) == bv
+		}
+	case int64:
+		switch bv := b.(type) {
+		case int:
+			return av == int64(bv)
+		case int64:
+			return av == bv
+		case float64:
+			return float64(av) == bv
+		}
+	case float64:
+		switch bv := b.(type) {
+		case int:
+			return av == float64(bv)
+		case int64:
+			return av == float64(bv)
+		case float64:
+			return av == bv
+		}
+	case string:
+		if bv, ok := b.(string); ok {
+			return av == bv
+		}
+	case bool:
+		if bv, ok := b.(bool); ok {
+			return av == bv
+		}
+	}
+	return false
+}
+
 func projectRawRow(plan *simpleSelectPlan, raw []any) (Row, error) {
 	out := make(Row, len(plan.projs))
 	for _, p := range plan.projs {
-		v, err := evalRawExpr(plan, raw, p.expr)
-		if err != nil {
-			return nil, err
+		if p.colIdx >= 0 {
+			// Direct column reference: skip type switch, map lookup, and ToLower.
+			out[p.key] = raw[p.colIdx]
+		} else {
+			v, err := evalRawExpr(plan, raw, p.expr)
+			if err != nil {
+				return nil, err
+			}
+			out[p.key] = v
 		}
-		putVal(out, p.name, v)
 	}
 	return out, nil
 }
@@ -1916,6 +2242,8 @@ func evalRawExpr(plan *simpleSelectPlan, raw []any, e Expr) (any, error) {
 		return evalRawUnary(plan, raw, ex)
 	case *Binary:
 		return evalRawBinary(plan, raw, ex)
+	case *LikeExpr:
+		return evalRawLike(plan, raw, ex)
 	default:
 		return nil, fmt.Errorf("unsupported fast-path expression %T", e)
 	}
@@ -1987,6 +2315,42 @@ func evalRawBinary(plan *simpleSelectPlan, raw []any, ex *Binary) (any, error) {
 		return evalComparisonBinary(ex.Op, lv, rv)
 	}
 	return nil, fmt.Errorf("unknown binary operator: %s", ex.Op)
+}
+
+// evalRawLike evaluates a LIKE / NOT LIKE expression in the fast raw path.
+// Both the subject and the pattern must be simple raw-path expressions.
+func evalRawLike(plan *simpleSelectPlan, raw []any, ex *LikeExpr) (any, error) {
+	val, err := evalRawExpr(plan, raw, ex.Expr)
+	if err != nil {
+		return nil, err
+	}
+	patVal, err := evalRawExpr(plan, raw, ex.Pattern)
+	if err != nil {
+		return nil, err
+	}
+	str, ok := val.(string)
+	if !ok {
+		str = fmt.Sprintf("%v", val)
+	}
+	pattern, ok := patVal.(string)
+	if !ok {
+		pattern = fmt.Sprintf("%v", patVal)
+	}
+	escapeChar := '\\'
+	if ex.Escape != nil {
+		escVal, err := evalRawExpr(plan, raw, ex.Escape)
+		if err != nil {
+			return nil, err
+		}
+		if escStr, ok := escVal.(string); ok && len(escStr) == 1 {
+			escapeChar = rune(escStr[0])
+		}
+	}
+	matched := matchLikePattern(str, pattern, escapeChar)
+	if ex.Negate {
+		return !matched, nil
+	}
+	return matched, nil
 }
 
 func processUnionClauses(env ExecEnv, union *UnionClause, leftRows []Row, leftCols []string) ([]Row, []string, error) {
@@ -2792,6 +3156,26 @@ func compareBigRat(ax *big.Rat, b any) (int, error) {
 }
 
 func compareInt(ax int, b any) (int, error) {
+	// Fast path: avoid float64 conversion for same-type comparisons.
+	switch bv := b.(type) {
+	case int:
+		if ax < bv {
+			return -1, nil
+		}
+		if ax > bv {
+			return 1, nil
+		}
+		return 0, nil
+	case int64:
+		ai := int64(ax)
+		if ai < bv {
+			return -1, nil
+		}
+		if ai > bv {
+			return 1, nil
+		}
+		return 0, nil
+	}
 	if f, ok := numeric(b); ok {
 		af := float64(ax)
 		if af < f {
