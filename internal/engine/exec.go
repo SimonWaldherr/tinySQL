@@ -32,6 +32,7 @@ import (
 	"math"
 	"math/big"
 	"math/rand"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -488,13 +489,16 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 		return nil, ok, err
 	}
 
-	rawPlan := &simpleSelectPlan{colIndex: plan.colIndex, where: plan.where}
+	rawPlan := &simpleSelectPlan{colIndex: plan.colIndex, where: plan.where, filter: buildRawFilter(plan.colIndex, plan.where)}
 	updated := 0
 	values := make([]any, len(plan.sets))
 	columnNames := colNames(plan.table.Cols)
 	for ri, raw := range plan.table.Rows {
-		if err := checkCtx(env.ctx); err != nil {
-			return nil, true, err
+		// Check context cancellation every 64 rows to reduce channel-select overhead.
+		if ri&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, true, err
+			}
 		}
 		match, err := evalRawWhere(rawPlan, raw)
 		if err != nil {
@@ -577,6 +581,40 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 		return &ResultSet{Cols: []string{"deleted"}, Rows: []Row{{"deleted": del}}}, nil
 	}
 
+	// Fast path: no triggers and a simple predicate – skip the full Row map allocation.
+	hasTriggers := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("BEFORE"), storage.TriggerEvent("DELETE"))) > 0 ||
+		len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("AFTER"), storage.TriggerEvent("DELETE"))) > 0
+	if !hasTriggers && isSimpleRawPredicate(s.Where) {
+		colIndex := simpleColumnIndex(t, s.Table)
+		rawPlan := &simpleSelectPlan{colIndex: colIndex, where: s.Where, filter: buildRawFilter(colIndex, s.Where)}
+		kept := make([][]any, 0, len(t.Rows))
+		del := 0
+		for i, r := range t.Rows {
+			if i&63 == 0 {
+				if err := checkCtx(env.ctx); err != nil {
+					return nil, err
+				}
+			}
+			match, err := evalRawWhere(rawPlan, r)
+			if err != nil {
+				return nil, err
+			}
+			if match {
+				ftsDeleteRow(env.tenant+"/"+s.Table, del+len(kept))
+				del++
+			} else {
+				kept = append(kept, r)
+			}
+		}
+		t.Rows = kept
+		t.Version++
+		if del > 0 {
+			t.MarkDirtyFrom(-1)
+		}
+		return &ResultSet{Cols: []string{"deleted"}, Rows: []Row{{"deleted": del}}}, nil
+	}
+
+	// Slow path: triggers present or complex predicate – build full Row maps.
 	kept := make([][]any, 0, len(t.Rows))
 	del := 0
 	tablePrefix := strings.ToLower(s.Table) + "."
@@ -1084,14 +1122,30 @@ type simpleSelectPlan struct {
 	orderBy    []OrderItem
 	orderExprs []Expr
 	where      Expr
+	// filter is a pre-compiled, allocation-free version of where for the most
+	// common patterns (col op literal, boolean column, AND/OR of those). When
+	// non-nil it replaces the recursive evalRawWhere call in the hot scan loop.
+	filter     func([]any) (bool, error)
 	limit      *int
 	offset     *int
 	outputCols []string
 }
 
+// simpleProjection describes a single SELECT item in the raw fast-path.
+// When colIdx >= 0 the projection is a direct column reference: the value is
+// taken from raw[colIdx] without going through evalRawExpr, saving a type
+// switch, a strings.ToLower call, and a map lookup per row per column.
+// key is the pre-lowercased name used as the Row map key (avoids putVal's
+// strings.ToLower on every output row).
+// side is only meaningful for join projections: 0=left table, 1=right table,
+// -1=single-table context or expression that could not be resolved to a simple
+// column reference (use expr instead).
 type simpleProjection struct {
-	name string
-	expr Expr
+	name   string // output column name (original case for ResultSet.Cols)
+	key    string // strings.ToLower(name) – pre-computed Row map key
+	side   int    // 0=left, 1=right (join), -1=single-table or expression
+	colIdx int    // >= 0: direct array index into raw/left/right; -1: use expr
+	expr   Expr   // used when colIdx < 0
 }
 
 type simpleJoinPlan struct {
@@ -1119,9 +1173,12 @@ func executeSimpleJoinFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error)
 	}
 
 	outRows := make([]Row, 0, min(len(plan.left.Rows), len(plan.right.Rows)))
-	for _, left := range plan.left.Rows {
-		if err := checkCtx(env.ctx); err != nil {
-			return nil, true, err
+	for i, left := range plan.left.Rows {
+		// Check context cancellation every 64 rows to reduce channel-select overhead.
+		if i&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, true, err
+			}
 		}
 		matches := rightByKey[comparableKeyPart(left[plan.leftKey])]
 		for _, right := range matches {
@@ -1177,7 +1234,19 @@ func buildSimpleJoinPlan(env ExecEnv, s *Select) (*simpleJoinPlan, bool, error) 
 			return nil, false, nil
 		}
 		name := projName(it, i)
-		projs = append(projs, simpleProjection{name: name, expr: it.Expr})
+		key := strings.ToLower(name)
+		side, colIdx := -1, -1
+		if ref, ok := it.Expr.(*VarRef); ok {
+			refName := strings.ToLower(ref.Name)
+			if li, lok := leftIndex[refName]; lok {
+				if _, ambig := rightIndex[refName]; !ambig {
+					side, colIdx = 0, li
+				}
+			} else if ri, rok := rightIndex[refName]; rok {
+				side, colIdx = 1, ri
+			}
+		}
+		projs = append(projs, simpleProjection{name: name, key: key, side: side, colIdx: colIdx, expr: it.Expr})
 		outputCols = append(outputCols, name)
 	}
 	if !simpleJoinExprResolvable(s.Where, leftIndex, rightIndex) {
@@ -1235,6 +1304,23 @@ func simpleJoinExprResolvable(e Expr, leftIndex, rightIndex map[string]int) bool
 	case *Binary:
 		return simpleJoinExprResolvable(ex.Left, leftIndex, rightIndex) &&
 			simpleJoinExprResolvable(ex.Right, leftIndex, rightIndex)
+	case *LikeExpr:
+		return simpleJoinExprResolvable(ex.Expr, leftIndex, rightIndex) &&
+			simpleJoinExprResolvable(ex.Pattern, leftIndex, rightIndex) &&
+			(ex.Escape == nil || simpleJoinExprResolvable(ex.Escape, leftIndex, rightIndex))
+	case *RegexpExpr:
+		return simpleJoinExprResolvable(ex.Expr, leftIndex, rightIndex) &&
+			simpleJoinExprResolvable(ex.Pattern, leftIndex, rightIndex)
+	case *InExpr:
+		if !simpleJoinExprResolvable(ex.Expr, leftIndex, rightIndex) {
+			return false
+		}
+		for _, v := range ex.Values {
+			if !simpleJoinExprResolvable(v, leftIndex, rightIndex) {
+				return false
+			}
+		}
+		return true
 	default:
 		return false
 	}
@@ -1254,11 +1340,27 @@ func evalJoinRawWhere(plan *simpleJoinPlan, left, right []any) (bool, error) {
 func projectJoinRawRow(plan *simpleJoinPlan, left, right []any) (Row, error) {
 	out := make(Row, len(plan.projs))
 	for _, p := range plan.projs {
-		v, err := evalJoinRawExpr(plan, left, right, p.expr)
-		if err != nil {
-			return nil, err
+		if p.colIdx >= 0 {
+			// Direct column reference: read from pre-resolved side and index.
+			switch p.side {
+			case 0:
+				out[p.key] = left[p.colIdx]
+			case 1:
+				out[p.key] = right[p.colIdx]
+			default:
+				v, err := evalJoinRawExpr(plan, left, right, p.expr)
+				if err != nil {
+					return nil, err
+				}
+				out[p.key] = v
+			}
+		} else {
+			v, err := evalJoinRawExpr(plan, left, right, p.expr)
+			if err != nil {
+				return nil, err
+			}
+			out[p.key] = v
 		}
-		putVal(out, p.name, v)
 	}
 	return out, nil
 }
@@ -1297,6 +1399,98 @@ func evalJoinRawExpr(plan *simpleJoinPlan, left, right []any, e Expr) (any, erro
 		return evalRawUnary(&simpleSelectPlan{}, nil, &Unary{Op: ex.Op, Expr: &Literal{Val: v}})
 	case *Binary:
 		return evalJoinRawBinary(plan, left, right, ex)
+	case *LikeExpr:
+		val, err := evalJoinRawExpr(plan, left, right, ex.Expr)
+		if err != nil {
+			return nil, err
+		}
+		patVal, err := evalJoinRawExpr(plan, left, right, ex.Pattern)
+		if err != nil {
+			return nil, err
+		}
+		str, ok := val.(string)
+		if !ok {
+			str = fmt.Sprintf("%v", val)
+		}
+		pattern, ok := patVal.(string)
+		if !ok {
+			pattern = fmt.Sprintf("%v", patVal)
+		}
+		var matched bool
+		if ex.GlobStyle {
+			if ex.CaseInsensitive {
+				matched = matchGlobPattern(strings.ToLower(str), strings.ToLower(pattern))
+			} else {
+				matched = matchGlobPattern(str, pattern)
+			}
+		} else {
+			escapeChar := '\\'
+			if ex.Escape != nil {
+				escVal, err := evalJoinRawExpr(plan, left, right, ex.Escape)
+				if err != nil {
+					return nil, err
+				}
+				if escStr, ok := escVal.(string); ok && len(escStr) == 1 {
+					escapeChar = rune(escStr[0])
+				}
+			}
+			if ex.CaseInsensitive {
+				matched = matchLikePattern(strings.ToLower(str), strings.ToLower(pattern), escapeChar)
+			} else {
+				matched = matchLikePattern(str, pattern, escapeChar)
+			}
+		}
+		if ex.Negate {
+			return !matched, nil
+		}
+		return matched, nil
+	case *RegexpExpr:
+		val, err := evalJoinRawExpr(plan, left, right, ex.Expr)
+		if err != nil {
+			return nil, err
+		}
+		patVal, err := evalJoinRawExpr(plan, left, right, ex.Pattern)
+		if err != nil {
+			return nil, err
+		}
+		if val == nil || patVal == nil {
+			return false, nil
+		}
+		str := fmt.Sprintf("%v", val)
+		pat := fmt.Sprintf("%v", patVal)
+		if ex.SimilarTo {
+			pat = similarToRegexp(pat)
+		}
+		re, err := regexp.Compile(pat)
+		if err != nil {
+			return nil, fmt.Errorf("REGEXP: invalid pattern %q: %v", pat, err)
+		}
+		matched := re.MatchString(str)
+		if ex.Negate {
+			return !matched, nil
+		}
+		return matched, nil
+	case *InExpr:
+		val, err := evalJoinRawExpr(plan, left, right, ex.Expr)
+		if err != nil {
+			return nil, err
+		}
+		for _, valExpr := range ex.Values {
+			listVal, err := evalJoinRawExpr(plan, left, right, valExpr)
+			if err != nil {
+				return nil, err
+			}
+			if rawEqual(val, listVal) {
+				if ex.Negate {
+					return false, nil
+				}
+				return true, nil
+			}
+		}
+		if ex.Negate {
+			return true, nil
+		}
+		return false, nil
 	default:
 		return nil, fmt.Errorf("unsupported join fast-path expression %T", e)
 	}
@@ -1367,12 +1561,15 @@ func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 		return nil, ok, err
 	}
 
-	rawPlan := &simpleSelectPlan{colIndex: plan.colIndex, where: plan.where}
+	rawPlan := &simpleSelectPlan{colIndex: plan.colIndex, where: plan.where, filter: buildRawFilter(plan.colIndex, plan.where)}
 	groups := make(map[any]*simpleAggregateState)
 	order := make([]any, 0)
-	for _, raw := range plan.table.Rows {
-		if err := checkCtx(env.ctx); err != nil {
-			return nil, true, err
+	for i, raw := range plan.table.Rows {
+		// Check context cancellation every 64 rows to reduce channel-select overhead.
+		if i&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, true, err
+			}
 		}
 		match, err := evalRawWhere(rawPlan, raw)
 		if err != nil {
@@ -1528,9 +1725,12 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 		}
 	}
 
-	for _, raw := range plan.table.Rows {
-		if err := checkCtx(env.ctx); err != nil {
-			return nil, true, err
+	for i, raw := range plan.table.Rows {
+		// Check context cancellation every 64 rows to reduce channel-select overhead.
+		if i&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, true, err
+			}
 		}
 		match, err := evalRawWhere(plan, raw)
 		if err != nil {
@@ -1584,9 +1784,12 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 			items: make([]orderedRawRow, 0, simpleSelectInitialCap(plan)),
 		}
 	}
-	for _, raw := range plan.table.Rows {
-		if err := checkCtx(env.ctx); err != nil {
-			return nil, true, err
+	for i, raw := range plan.table.Rows {
+		// Check context cancellation every 64 rows to reduce channel-select overhead.
+		if i&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, true, err
+			}
 		}
 		match, err := evalRawWhere(plan, raw)
 		if err != nil {
@@ -1753,7 +1956,14 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 		if name == "" {
 			return nil, false, nil
 		}
-		projs = append(projs, simpleProjection{name: name, expr: it.Expr})
+		key := strings.ToLower(name)
+		colIdx := -1
+		if ref, ok := it.Expr.(*VarRef); ok {
+			if idx, ok2 := colIndex[strings.ToLower(ref.Name)]; ok2 {
+				colIdx = idx
+			}
+		}
+		projs = append(projs, simpleProjection{name: name, key: key, side: -1, colIdx: colIdx, expr: it.Expr})
 		outputCols = append(outputCols, name)
 	}
 	orderExprs := make([]Expr, 0, len(s.OrderBy))
@@ -1781,6 +1991,7 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 		orderBy:    s.OrderBy,
 		orderExprs: orderExprs,
 		where:      s.Where,
+		filter:     buildRawFilter(colIndex, s.Where),
 		limit:      s.Limit,
 		offset:     s.Offset,
 		outputCols: outputCols,
@@ -1833,6 +2044,23 @@ func isSimpleRawExpr(e Expr) bool {
 		return false
 	case *IsNull:
 		return isSimpleRawExpr(ex.Expr)
+	case *LikeExpr:
+		// LIKE/ILIKE/GLOB with a literal pattern and no dynamic escape is safe in the fast path.
+		return isSimpleRawExpr(ex.Expr) && isSimpleRawExpr(ex.Pattern) &&
+			(ex.Escape == nil || isSimpleRawExpr(ex.Escape))
+	case *RegexpExpr:
+		// REGEXP/RLIKE/SIMILAR TO with literal pattern is safe in the fast path.
+		return isSimpleRawExpr(ex.Expr) && isSimpleRawExpr(ex.Pattern)
+	case *InExpr:
+		if !isSimpleRawExpr(ex.Expr) {
+			return false
+		}
+		for _, v := range ex.Values {
+			if !isSimpleRawExpr(v) {
+				return false
+			}
+		}
+		return true
 	default:
 		return false
 	}
@@ -1864,6 +2092,9 @@ func isArithmeticOp(op string) bool {
 }
 
 func evalRawWhere(plan *simpleSelectPlan, raw []any) (bool, error) {
+	if plan.filter != nil {
+		return plan.filter(raw)
+	}
 	if plan.where == nil {
 		return true, nil
 	}
@@ -1874,14 +2105,820 @@ func evalRawWhere(plan *simpleSelectPlan, raw []any) (bool, error) {
 	return toTri(v) == tvTrue, nil
 }
 
+// buildRawFilter attempts to compile a WHERE expression into a closure that
+// operates directly on raw row slices ([]any) without going through the
+// general evalRawExpr machinery.  It handles the most common patterns:
+//   - col op literal   (equality, inequality, ordering)
+//   - boolean_col      (truthy column reference)
+//   - NOT boolean_col
+//   - AND / OR of the above
+//
+// Returns nil when the expression is too complex to compile, in which case
+// evalRawExpr is used as the fallback.
+func buildRawFilter(colIndex map[string]int, e Expr) func([]any) (bool, error) {
+	if e == nil {
+		return func([]any) (bool, error) { return true, nil }
+	}
+	switch ex := e.(type) {
+	case *VarRef:
+		colIdx, ok := colIndex[strings.ToLower(ex.Name)]
+		if !ok {
+			return nil
+		}
+		return func(raw []any) (bool, error) { return truthy(raw[colIdx]), nil }
+
+	case *Unary:
+		if ex.Op == "NOT" {
+			inner := buildRawFilter(colIndex, ex.Expr)
+			if inner == nil {
+				return nil
+			}
+			return func(raw []any) (bool, error) {
+				b, err := inner(raw)
+				return !b, err
+			}
+		}
+		return nil
+
+	case *IsNull:
+		innerRef, ok := ex.Expr.(*VarRef)
+		if !ok {
+			return nil
+		}
+		colIdx, ok := colIndex[strings.ToLower(innerRef.Name)]
+		if !ok {
+			return nil
+		}
+		if ex.Negate {
+			return func(raw []any) (bool, error) { return raw[colIdx] != nil, nil }
+		}
+		return func(raw []any) (bool, error) { return raw[colIdx] == nil, nil }
+
+	case *Binary:
+		if ex.Op == "AND" {
+			left := buildRawFilter(colIndex, ex.Left)
+			right := buildRawFilter(colIndex, ex.Right)
+			if left != nil && right != nil {
+				return func(raw []any) (bool, error) {
+					l, err := left(raw)
+					if err != nil || !l {
+						return false, err
+					}
+					return right(raw)
+				}
+			}
+			return nil
+		}
+		if ex.Op == "OR" {
+			left := buildRawFilter(colIndex, ex.Left)
+			right := buildRawFilter(colIndex, ex.Right)
+			if left != nil && right != nil {
+				return func(raw []any) (bool, error) {
+					l, err := left(raw)
+					if err != nil {
+						return false, err
+					}
+					if l {
+						return true, nil
+					}
+					return right(raw)
+				}
+			}
+			return nil
+		}
+		if isComparisonOp(ex.Op) {
+			// col op literal
+			if ref, ok := ex.Left.(*VarRef); ok {
+				if lit, ok := ex.Right.(*Literal); ok {
+					if colIdx, ok := colIndex[strings.ToLower(ref.Name)]; ok {
+						return buildColLiteralFilter(colIdx, ex.Op, lit.Val)
+					}
+				}
+			}
+			// literal op col (reversed)
+			if lit, ok := ex.Left.(*Literal); ok {
+				if ref, ok := ex.Right.(*VarRef); ok {
+					if colIdx, ok := colIndex[strings.ToLower(ref.Name)]; ok {
+						return buildColLiteralFilter(colIdx, reverseComparisonOp(ex.Op), lit.Val)
+					}
+				}
+			}
+			// col op col – both sides are column references
+			if lRef, ok := ex.Left.(*VarRef); ok {
+				if rRef, ok := ex.Right.(*VarRef); ok {
+					lIdx, lok := colIndex[strings.ToLower(lRef.Name)]
+					rIdx, rok := colIndex[strings.ToLower(rRef.Name)]
+					if lok && rok {
+						return buildColColFilter(lIdx, ex.Op, rIdx)
+					}
+				}
+			}
+		}
+		return nil
+
+	case *LikeExpr:
+		// Compile LIKE/ILIKE/GLOB/NOT LIKE with a literal pattern into a specialized closure.
+		ref, isRef := ex.Expr.(*VarRef)
+		if !isRef {
+			return nil
+		}
+		colIdx, ok := colIndex[strings.ToLower(ref.Name)]
+		if !ok {
+			return nil
+		}
+		pat, isLit := ex.Pattern.(*Literal)
+		if !isLit {
+			return nil
+		}
+		pattern, isStr := pat.Val.(string)
+		if !isStr {
+			return nil
+		}
+		if ex.GlobStyle {
+			return buildCompiledGlobFilter(colIdx, pattern, ex.CaseInsensitive, ex.Negate)
+		}
+		if ex.Escape != nil {
+			return nil // custom ESCAPE: fall back to evalRawExpr
+		}
+		if ex.CaseInsensitive {
+			// ILIKE: use the dedicated lowercasing filter
+			return buildCompiledILikeFilter(colIdx, pattern, ex.Negate)
+		}
+		return buildCompiledLikeFilter(colIdx, pattern, ex.Negate)
+
+	case *RegexpExpr:
+		// Compile REGEXP/RLIKE/SIMILAR TO with a literal pattern.
+		ref, isRef := ex.Expr.(*VarRef)
+		if !isRef {
+			return nil
+		}
+		colIdx, ok := colIndex[strings.ToLower(ref.Name)]
+		if !ok {
+			return nil
+		}
+		pat, isLit := ex.Pattern.(*Literal)
+		if !isLit {
+			return nil
+		}
+		pattern, isStr := pat.Val.(string)
+		if !isStr {
+			return nil
+		}
+		if ex.SimilarTo {
+			pattern = similarToRegexp(pattern)
+		}
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			return nil // invalid pattern – fall back to evalRawExpr
+		}
+		negate := ex.Negate
+		return func(raw []any) (bool, error) {
+			s, ok := raw[colIdx].(string)
+			if !ok {
+				if raw[colIdx] == nil {
+					return false, nil
+				}
+				s = fmt.Sprintf("%v", raw[colIdx])
+			}
+			matched := re.MatchString(s)
+			if negate {
+				return !matched, nil
+			}
+			return matched, nil
+		}
+
+	case *InExpr:
+		// col IN (lit, ...) / col NOT IN (lit, ...) with all-literal values.
+		ref, isRef := ex.Expr.(*VarRef)
+		if !isRef {
+			return nil
+		}
+		colIdx, ok := colIndex[strings.ToLower(ref.Name)]
+		if !ok {
+			return nil
+		}
+		litVals := make([]any, 0, len(ex.Values))
+		for _, v := range ex.Values {
+			lit, ok := v.(*Literal)
+			if !ok {
+				return nil // non-literal value: can't pre-build a set
+			}
+			litVals = append(litVals, lit.Val)
+		}
+		return buildInFilter(colIdx, litVals, ex.Negate)
+	}
+	return nil
+}
+
+// reverseComparisonOp reverses the direction of a comparison operator,
+// so that "literal op col" can be treated as "col reversed_op literal".
+func reverseComparisonOp(op string) string {
+	switch op {
+	case "<":
+		return ">"
+	case "<=":
+		return ">="
+	case ">":
+		return "<"
+	case ">=":
+		return "<="
+	default:
+		return op // "=" and "!=" / "<>" are symmetric
+	}
+}
+
+// buildColLiteralFilter builds a fast comparison closure for "raw[colIdx] op litVal".
+// The returned function is type-specialized for int, float64, and string to avoid
+// the overhead of the generic compare() path.
+func buildColLiteralFilter(colIdx int, op string, litVal any) func([]any) (bool, error) {
+	switch op {
+	case "=":
+		return func(raw []any) (bool, error) {
+			a := raw[colIdx]
+			if a == nil || litVal == nil {
+				return false, nil
+			}
+			return rawEqual(a, litVal), nil
+		}
+	case "!=", "<>":
+		return func(raw []any) (bool, error) {
+			a := raw[colIdx]
+			if a == nil || litVal == nil {
+				return false, nil
+			}
+			return !rawEqual(a, litVal), nil
+		}
+	case "<", "<=", ">", ">=":
+		// Specialize for the three common literal types to avoid compare().
+		switch lv := litVal.(type) {
+		case int:
+			return buildIntCmpFilter(colIdx, op, lv)
+		case int64:
+			return buildInt64CmpFilter(colIdx, op, lv)
+		case float64:
+			return buildFloat64CmpFilter(colIdx, op, lv)
+		case string:
+			return buildStringCmpFilter(colIdx, op, lv)
+		}
+		// Generic fallback via compare().
+		return func(raw []any) (bool, error) {
+			a := raw[colIdx]
+			if a == nil || litVal == nil {
+				return false, nil
+			}
+			cmp, err := compare(a, litVal)
+			if err != nil {
+				return false, err
+			}
+			switch op {
+			case "<":
+				return cmp < 0, nil
+			case "<=":
+				return cmp <= 0, nil
+			case ">":
+				return cmp > 0, nil
+			default: // ">="
+				return cmp >= 0, nil
+			}
+		}
+	}
+	return nil
+}
+
+// buildIntCmpFilter builds a specialized ordering filter for an int literal.
+func buildIntCmpFilter(colIdx int, op string, lit int) func([]any) (bool, error) {
+	switch op {
+	case "<":
+		return func(raw []any) (bool, error) {
+			a := raw[colIdx]
+			switch av := a.(type) {
+			case int:
+				return av < lit, nil
+			case int64:
+				return av < int64(lit), nil
+			case float64:
+				return av < float64(lit), nil
+			}
+			return false, nil
+		}
+	case "<=":
+		return func(raw []any) (bool, error) {
+			a := raw[colIdx]
+			switch av := a.(type) {
+			case int:
+				return av <= lit, nil
+			case int64:
+				return av <= int64(lit), nil
+			case float64:
+				return av <= float64(lit), nil
+			}
+			return false, nil
+		}
+	case ">":
+		return func(raw []any) (bool, error) {
+			a := raw[colIdx]
+			switch av := a.(type) {
+			case int:
+				return av > lit, nil
+			case int64:
+				return av > int64(lit), nil
+			case float64:
+				return av > float64(lit), nil
+			}
+			return false, nil
+		}
+	case ">=":
+		return func(raw []any) (bool, error) {
+			a := raw[colIdx]
+			switch av := a.(type) {
+			case int:
+				return av >= lit, nil
+			case int64:
+				return av >= int64(lit), nil
+			case float64:
+				return av >= float64(lit), nil
+			}
+			return false, nil
+		}
+	}
+	return nil
+}
+
+// buildInt64CmpFilter builds a specialized ordering filter for an int64 literal.
+func buildInt64CmpFilter(colIdx int, op string, lit int64) func([]any) (bool, error) {
+	switch op {
+	case "<":
+		return func(raw []any) (bool, error) {
+			a := raw[colIdx]
+			switch av := a.(type) {
+			case int:
+				return int64(av) < lit, nil
+			case int64:
+				return av < lit, nil
+			case float64:
+				return av < float64(lit), nil
+			}
+			return false, nil
+		}
+	case "<=":
+		return func(raw []any) (bool, error) {
+			a := raw[colIdx]
+			switch av := a.(type) {
+			case int:
+				return int64(av) <= lit, nil
+			case int64:
+				return av <= lit, nil
+			case float64:
+				return av <= float64(lit), nil
+			}
+			return false, nil
+		}
+	case ">":
+		return func(raw []any) (bool, error) {
+			a := raw[colIdx]
+			switch av := a.(type) {
+			case int:
+				return int64(av) > lit, nil
+			case int64:
+				return av > lit, nil
+			case float64:
+				return av > float64(lit), nil
+			}
+			return false, nil
+		}
+	case ">=":
+		return func(raw []any) (bool, error) {
+			a := raw[colIdx]
+			switch av := a.(type) {
+			case int:
+				return int64(av) >= lit, nil
+			case int64:
+				return av >= lit, nil
+			case float64:
+				return av >= float64(lit), nil
+			}
+			return false, nil
+		}
+	}
+	return nil
+}
+
+// buildFloat64CmpFilter builds a specialized ordering filter for a float64 literal.
+func buildFloat64CmpFilter(colIdx int, op string, lit float64) func([]any) (bool, error) {
+	switch op {
+	case "<":
+		return func(raw []any) (bool, error) {
+			a := raw[colIdx]
+			if f, ok := numericFast(a); ok {
+				return f < lit, nil
+			}
+			return false, nil
+		}
+	case "<=":
+		return func(raw []any) (bool, error) {
+			a := raw[colIdx]
+			if f, ok := numericFast(a); ok {
+				return f <= lit, nil
+			}
+			return false, nil
+		}
+	case ">":
+		return func(raw []any) (bool, error) {
+			a := raw[colIdx]
+			if f, ok := numericFast(a); ok {
+				return f > lit, nil
+			}
+			return false, nil
+		}
+	case ">=":
+		return func(raw []any) (bool, error) {
+			a := raw[colIdx]
+			if f, ok := numericFast(a); ok {
+				return f >= lit, nil
+			}
+			return false, nil
+		}
+	}
+	return nil
+}
+
+// buildStringCmpFilter builds a specialized ordering filter for a string literal.
+func buildStringCmpFilter(colIdx int, op string, lit string) func([]any) (bool, error) {
+	switch op {
+	case "<":
+		return func(raw []any) (bool, error) {
+			if s, ok := raw[colIdx].(string); ok {
+				return s < lit, nil
+			}
+			return false, nil
+		}
+	case "<=":
+		return func(raw []any) (bool, error) {
+			if s, ok := raw[colIdx].(string); ok {
+				return s <= lit, nil
+			}
+			return false, nil
+		}
+	case ">":
+		return func(raw []any) (bool, error) {
+			if s, ok := raw[colIdx].(string); ok {
+				return s > lit, nil
+			}
+			return false, nil
+		}
+	case ">=":
+		return func(raw []any) (bool, error) {
+			if s, ok := raw[colIdx].(string); ok {
+				return s >= lit, nil
+			}
+			return false, nil
+		}
+	}
+	return nil
+}
+
+// buildColColFilter builds a filter for "raw[lIdx] op raw[rIdx]" (col op col).
+func buildColColFilter(lIdx int, op string, rIdx int) func([]any) (bool, error) {
+	return func(raw []any) (bool, error) {
+		a, b := raw[lIdx], raw[rIdx]
+		if a == nil || b == nil {
+			return false, nil
+		}
+		switch op {
+		case "=":
+			return rawEqual(a, b), nil
+		case "!=", "<>":
+			return !rawEqual(a, b), nil
+		}
+		cmp, err := compare(a, b)
+		if err != nil {
+			return false, err
+		}
+		switch op {
+		case "<":
+			return cmp < 0, nil
+		case "<=":
+			return cmp <= 0, nil
+		case ">":
+			return cmp > 0, nil
+		default: // ">="
+			return cmp >= 0, nil
+		}
+	}
+}
+
+// numericFast converts the common numeric types to float64 without the decimal
+// or string-parsing branches of the general numeric() helper.
+func numericFast(v any) (float64, bool) {
+	switch n := v.(type) {
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case float64:
+		return n, true
+	}
+	return 0, false
+}
+
+// buildCompiledLikeFilter compiles a SQL LIKE pattern (with default escape '\\')
+// into a specialized closure. Common patterns are reduced to library calls:
+//   - 'exact'       →  s == "exact"
+//   - 'prefix%'     →  strings.HasPrefix(s, "prefix")
+//   - '%suffix'     →  strings.HasSuffix(s, "suffix")
+//   - '%middle%'    →  strings.Contains(s, "middle")
+//
+// Patterns containing '_' wildcards or multiple '%' anchors fall back to the
+// general matchLikePattern function.
+func buildCompiledLikeFilter(colIdx int, pattern string, negate bool) func([]any) (bool, error) {
+	matchFn := func(match func(string) bool) func([]any) (bool, error) {
+		if negate {
+			return func(raw []any) (bool, error) {
+				s, ok := raw[colIdx].(string)
+				if !ok {
+					return false, nil
+				}
+				return !match(s), nil
+			}
+		}
+		return func(raw []any) (bool, error) {
+			s, ok := raw[colIdx].(string)
+			if !ok {
+				return false, nil
+			}
+			return match(s), nil
+		}
+	}
+
+	// No wildcards → exact match.
+	if !strings.ContainsAny(pattern, "%_") {
+		return matchFn(func(s string) bool { return s == pattern })
+	}
+
+	// prefix% – no other wildcards.
+	if strings.HasSuffix(pattern, "%") && !strings.ContainsAny(pattern[:len(pattern)-1], "%_") {
+		prefix := pattern[:len(pattern)-1]
+		return matchFn(func(s string) bool { return strings.HasPrefix(s, prefix) })
+	}
+
+	// %suffix – no other wildcards.
+	if strings.HasPrefix(pattern, "%") && !strings.ContainsAny(pattern[1:], "%_") {
+		suffix := pattern[1:]
+		return matchFn(func(s string) bool { return strings.HasSuffix(s, suffix) })
+	}
+
+	// %middle% – no other wildcards.
+	if strings.HasPrefix(pattern, "%") && strings.HasSuffix(pattern, "%") &&
+		len(pattern) >= 2 && !strings.ContainsAny(pattern[1:len(pattern)-1], "%_") {
+		middle := pattern[1 : len(pattern)-1]
+		return matchFn(func(s string) bool { return strings.Contains(s, middle) })
+	}
+
+	// Fall back to the general matcher.
+	return matchFn(func(s string) bool { return matchLikePattern(s, pattern, '\\') })
+}
+
+// buildCompiledILikeFilter compiles an ILIKE / NOT ILIKE pattern into a closure.
+// It pre-lowercases the pattern and lowercases each column value at match time,
+// without any per-row heap allocations.
+func buildCompiledILikeFilter(colIdx int, pattern string, negate bool) func([]any) (bool, error) {
+	// Pre-lowercase the pattern once.
+	lowerPat := strings.ToLower(pattern)
+
+	// Pick the cheapest sub-matcher based on the lowercased pattern shape.
+	var match func(string) bool
+	switch {
+	case !strings.ContainsAny(lowerPat, "%_"):
+		match = func(s string) bool { return strings.ToLower(s) == lowerPat }
+	case strings.HasSuffix(lowerPat, "%") && !strings.ContainsAny(lowerPat[:len(lowerPat)-1], "%_"):
+		prefix := lowerPat[:len(lowerPat)-1]
+		match = func(s string) bool { return strings.HasPrefix(strings.ToLower(s), prefix) }
+	case strings.HasPrefix(lowerPat, "%") && !strings.ContainsAny(lowerPat[1:], "%_"):
+		suffix := lowerPat[1:]
+		match = func(s string) bool { return strings.HasSuffix(strings.ToLower(s), suffix) }
+	case strings.HasPrefix(lowerPat, "%") && strings.HasSuffix(lowerPat, "%") &&
+		len(lowerPat) >= 2 && !strings.ContainsAny(lowerPat[1:len(lowerPat)-1], "%_"):
+		mid := lowerPat[1 : len(lowerPat)-1]
+		match = func(s string) bool { return strings.Contains(strings.ToLower(s), mid) }
+	default:
+		match = func(s string) bool { return matchLikePattern(strings.ToLower(s), lowerPat, '\\') }
+	}
+
+	if negate {
+		return func(raw []any) (bool, error) {
+			s, ok := raw[colIdx].(string)
+			if !ok {
+				return false, nil
+			}
+			return !match(s), nil
+		}
+	}
+	return func(raw []any) (bool, error) {
+		s, ok := raw[colIdx].(string)
+		if !ok {
+			return false, nil
+		}
+		return match(s), nil
+	}
+}
+
+// buildCompiledGlobFilter compiles a GLOB / NOT GLOB pattern into a closure.
+// GLOB wildcards: * matches any sequence, ? matches any single character.
+func buildCompiledGlobFilter(colIdx int, pattern string, caseInsensitive, negate bool) func([]any) (bool, error) {
+	if caseInsensitive {
+		pattern = strings.ToLower(pattern)
+	}
+	matchFn := func(s string) bool {
+		if caseInsensitive {
+			s = strings.ToLower(s)
+		}
+		return matchGlobPattern(s, pattern)
+	}
+	if negate {
+		return func(raw []any) (bool, error) {
+			s, ok := raw[colIdx].(string)
+			if !ok {
+				return false, nil
+			}
+			return !matchFn(s), nil
+		}
+	}
+	return func(raw []any) (bool, error) {
+		s, ok := raw[colIdx].(string)
+		if !ok {
+			return false, nil
+		}
+		return matchFn(s), nil
+	}
+}
+
+// buildInFilter builds a fast set-membership closure for col IN (litVals).
+// It pre-builds typed maps for all-int and all-string value sets for O(1) lookup.
+func buildInFilter(colIdx int, litVals []any, negate bool) func([]any) (bool, error) {
+	// Try to build typed sets for O(1) lookup.
+	allInt, allStr := true, true
+	for _, v := range litVals {
+		if _, ok := v.(int); !ok {
+			allInt = false
+		}
+		if _, ok := v.(string); !ok {
+			allStr = false
+		}
+	}
+
+	if allInt {
+		set := make(map[int]struct{}, len(litVals))
+		for _, v := range litVals {
+			set[v.(int)] = struct{}{}
+		}
+		if negate {
+			return func(raw []any) (bool, error) {
+				a := raw[colIdx]
+				if a == nil {
+					return false, nil
+				}
+				if ai, ok := a.(int); ok {
+					_, found := set[ai]
+					return !found, nil
+				}
+				// Fall back for type mismatches (e.g., stored as int64).
+				for _, v := range litVals {
+					if rawEqual(a, v) {
+						return false, nil
+					}
+				}
+				return true, nil
+			}
+		}
+		return func(raw []any) (bool, error) {
+			a := raw[colIdx]
+			if a == nil {
+				return false, nil
+			}
+			if ai, ok := a.(int); ok {
+				_, found := set[ai]
+				return found, nil
+			}
+			for _, v := range litVals {
+				if rawEqual(a, v) {
+					return true, nil
+				}
+			}
+			return false, nil
+		}
+	}
+
+	if allStr {
+		set := make(map[string]struct{}, len(litVals))
+		for _, v := range litVals {
+			set[v.(string)] = struct{}{}
+		}
+		if negate {
+			return func(raw []any) (bool, error) {
+				s, ok := raw[colIdx].(string)
+				if !ok {
+					return false, nil
+				}
+				_, found := set[s]
+				return !found, nil
+			}
+		}
+		return func(raw []any) (bool, error) {
+			s, ok := raw[colIdx].(string)
+			if !ok {
+				return false, nil
+			}
+			_, found := set[s]
+			return found, nil
+		}
+	}
+
+	// Generic fallback using rawEqual.
+	if negate {
+		return func(raw []any) (bool, error) {
+			a := raw[colIdx]
+			for _, v := range litVals {
+				if rawEqual(a, v) {
+					return false, nil
+				}
+			}
+			return true, nil
+		}
+	}
+	return func(raw []any) (bool, error) {
+		a := raw[colIdx]
+		for _, v := range litVals {
+			if rawEqual(a, v) {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+}
+
+// rawEqual performs a type-aware equality check between two interface values
+// without going through the generic compare() function.  It covers the value
+// types that tinySQL stores in table rows (int, int64, float64, string, bool).
+func rawEqual(a, b any) bool {
+	if a == nil {
+		return b == nil
+	}
+	if b == nil {
+		return false
+	}
+	switch av := a.(type) {
+	case int:
+		switch bv := b.(type) {
+		case int:
+			return av == bv
+		case int64:
+			return int64(av) == bv
+		case float64:
+			return float64(av) == bv
+		}
+	case int64:
+		switch bv := b.(type) {
+		case int:
+			return av == int64(bv)
+		case int64:
+			return av == bv
+		case float64:
+			return float64(av) == bv
+		}
+	case float64:
+		switch bv := b.(type) {
+		case int:
+			return av == float64(bv)
+		case int64:
+			return av == float64(bv)
+		case float64:
+			return av == bv
+		}
+	case string:
+		if bv, ok := b.(string); ok {
+			return av == bv
+		}
+	case bool:
+		if bv, ok := b.(bool); ok {
+			return av == bv
+		}
+	}
+	return false
+}
+
 func projectRawRow(plan *simpleSelectPlan, raw []any) (Row, error) {
 	out := make(Row, len(plan.projs))
 	for _, p := range plan.projs {
-		v, err := evalRawExpr(plan, raw, p.expr)
-		if err != nil {
-			return nil, err
+		if p.colIdx >= 0 {
+			// Direct column reference: skip type switch, map lookup, and ToLower.
+			out[p.key] = raw[p.colIdx]
+		} else {
+			v, err := evalRawExpr(plan, raw, p.expr)
+			if err != nil {
+				return nil, err
+			}
+			out[p.key] = v
 		}
-		putVal(out, p.name, v)
 	}
 	return out, nil
 }
@@ -1916,6 +2953,12 @@ func evalRawExpr(plan *simpleSelectPlan, raw []any, e Expr) (any, error) {
 		return evalRawUnary(plan, raw, ex)
 	case *Binary:
 		return evalRawBinary(plan, raw, ex)
+	case *LikeExpr:
+		return evalRawLike(plan, raw, ex)
+	case *InExpr:
+		return evalRawIn(plan, raw, ex)
+	case *RegexpExpr:
+		return evalRawRegexp(plan, raw, ex)
 	default:
 		return nil, fmt.Errorf("unsupported fast-path expression %T", e)
 	}
@@ -1987,6 +3030,108 @@ func evalRawBinary(plan *simpleSelectPlan, raw []any, ex *Binary) (any, error) {
 		return evalComparisonBinary(ex.Op, lv, rv)
 	}
 	return nil, fmt.Errorf("unknown binary operator: %s", ex.Op)
+}
+
+// evalRawLike evaluates a LIKE / NOT LIKE expression in the fast raw path.
+// Both the subject and the pattern must be simple raw-path expressions.
+func evalRawLike(plan *simpleSelectPlan, raw []any, ex *LikeExpr) (any, error) {
+	val, err := evalRawExpr(plan, raw, ex.Expr)
+	if err != nil {
+		return nil, err
+	}
+	patVal, err := evalRawExpr(plan, raw, ex.Pattern)
+	if err != nil {
+		return nil, err
+	}
+	str, ok := val.(string)
+	if !ok {
+		str = fmt.Sprintf("%v", val)
+	}
+	pattern, ok := patVal.(string)
+	if !ok {
+		pattern = fmt.Sprintf("%v", patVal)
+	}
+	var matched bool
+	if ex.GlobStyle {
+		if ex.CaseInsensitive {
+			matched = matchGlobPattern(strings.ToLower(str), strings.ToLower(pattern))
+		} else {
+			matched = matchGlobPattern(str, pattern)
+		}
+	} else {
+		escapeChar := '\\'
+		if ex.Escape != nil {
+			escVal, err := evalRawExpr(plan, raw, ex.Escape)
+			if err != nil {
+				return nil, err
+			}
+			if escStr, ok := escVal.(string); ok && len(escStr) == 1 {
+				escapeChar = rune(escStr[0])
+			}
+		}
+		if ex.CaseInsensitive {
+			matched = matchLikePattern(strings.ToLower(str), strings.ToLower(pattern), escapeChar)
+		} else {
+			matched = matchLikePattern(str, pattern, escapeChar)
+		}
+	}
+	if ex.Negate {
+		return !matched, nil
+	}
+	return matched, nil
+}
+
+// evalRawRegexp evaluates REGEXP / RLIKE / SIMILAR TO in the raw fast path.
+func evalRawRegexp(plan *simpleSelectPlan, raw []any, ex *RegexpExpr) (any, error) {
+	val, err := evalRawExpr(plan, raw, ex.Expr)
+	if err != nil {
+		return nil, err
+	}
+	patVal, err := evalRawExpr(plan, raw, ex.Pattern)
+	if err != nil {
+		return nil, err
+	}
+	if val == nil || patVal == nil {
+		return false, nil
+	}
+	str := fmt.Sprintf("%v", val)
+	pattern := fmt.Sprintf("%v", patVal)
+	if ex.SimilarTo {
+		pattern = similarToRegexp(pattern)
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("REGEXP: invalid pattern %q: %v", pattern, err)
+	}
+	matched := re.MatchString(str)
+	if ex.Negate {
+		return !matched, nil
+	}
+	return matched, nil
+}
+
+// evalRawIn evaluates an IN / NOT IN expression in the raw fast path.
+func evalRawIn(plan *simpleSelectPlan, raw []any, ex *InExpr) (any, error) {
+	val, err := evalRawExpr(plan, raw, ex.Expr)
+	if err != nil {
+		return nil, err
+	}
+	for _, valExpr := range ex.Values {
+		listVal, err := evalRawExpr(plan, raw, valExpr)
+		if err != nil {
+			return nil, err
+		}
+		if rawEqual(val, listVal) {
+			if ex.Negate {
+				return false, nil
+			}
+			return true, nil
+		}
+	}
+	if ex.Negate {
+		return true, nil
+	}
+	return false, nil
 }
 
 func processUnionClauses(env ExecEnv, union *UnionClause, leftRows []Row, leftCols []string) ([]Row, []string, error) {
@@ -2792,6 +3937,26 @@ func compareBigRat(ax *big.Rat, b any) (int, error) {
 }
 
 func compareInt(ax int, b any) (int, error) {
+	// fast path: avoid float64 conversion for same-type comparisons.
+	switch bv := b.(type) {
+	case int:
+		if ax < bv {
+			return -1, nil
+		}
+		if ax > bv {
+			return 1, nil
+		}
+		return 0, nil
+	case int64:
+		ai := int64(ax)
+		if ai < bv {
+			return -1, nil
+		}
+		if ai > bv {
+			return 1, nil
+		}
+		return 0, nil
+	}
 	if f, ok := numeric(b); ok {
 		af := float64(ax)
 		if af < f {
@@ -2899,6 +4064,10 @@ func evalExpr(env ExecEnv, e Expr, row Row) (any, error) {
 		return evalIn(env, ex, row)
 	case *LikeExpr:
 		return evalLike(env, ex, row)
+	case *RegexpExpr:
+		return evalRegexpExpr(env, ex, row)
+	case *ExistsExpr:
+		return evalExistsExpr(env, ex)
 	case *CaseExpr:
 		return evalCaseExpr(env, ex, row)
 	case *SubqueryExpr:
@@ -2982,27 +4151,77 @@ func evalLike(env ExecEnv, ex *LikeExpr, row Row) (any, error) {
 		pattern = fmt.Sprintf("%v", patternVal)
 	}
 
-	// Get escape character if specified
-	escapeChar := '\\'
-	if ex.Escape != nil {
-		escapeVal, err := evalExpr(env, ex.Escape, row)
-		if err != nil {
-			return nil, err
+	var matched bool
+	if ex.GlobStyle {
+		// GLOB: case-sensitive, * matches any sequence, ? matches one char
+		if ex.CaseInsensitive {
+			matched = matchGlobPattern(strings.ToLower(str), strings.ToLower(pattern))
+		} else {
+			matched = matchGlobPattern(str, pattern)
 		}
-		escapeStr, ok := escapeVal.(string)
-		if !ok || len(escapeStr) != 1 {
-			return nil, fmt.Errorf("ESCAPE must be a single character")
+	} else {
+		// LIKE / ILIKE: get optional escape character
+		escapeChar := '\\'
+		if ex.Escape != nil {
+			escapeVal, err := evalExpr(env, ex.Escape, row)
+			if err != nil {
+				return nil, err
+			}
+			escapeStr, ok := escapeVal.(string)
+			if !ok || len(escapeStr) != 1 {
+				return nil, fmt.Errorf("ESCAPE must be a single character")
+			}
+			escapeChar = rune(escapeStr[0])
 		}
-		escapeChar = rune(escapeStr[0])
+		if ex.CaseInsensitive {
+			matched = matchLikePattern(strings.ToLower(str), strings.ToLower(pattern), escapeChar)
+		} else {
+			matched = matchLikePattern(str, pattern, escapeChar)
+		}
 	}
-
-	// Match pattern
-	matched := matchLikePattern(str, pattern, escapeChar)
 
 	if ex.Negate {
 		return !matched, nil
 	}
 	return matched, nil
+}
+
+// evalRegexpExpr evaluates REGEXP / RLIKE / SIMILAR TO predicates.
+func evalRegexpExpr(env ExecEnv, ex *RegexpExpr, row Row) (any, error) {
+	val, err := evalExpr(env, ex.Expr, row)
+	if err != nil {
+		return nil, err
+	}
+	patternVal, err := evalExpr(env, ex.Pattern, row)
+	if err != nil {
+		return nil, err
+	}
+	if val == nil || patternVal == nil {
+		return false, nil
+	}
+	str := fmt.Sprintf("%v", val)
+	pattern := fmt.Sprintf("%v", patternVal)
+	if ex.SimilarTo {
+		pattern = similarToRegexp(pattern)
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("REGEXP: invalid pattern %q: %v", pattern, err)
+	}
+	matched := re.MatchString(str)
+	if ex.Negate {
+		return !matched, nil
+	}
+	return matched, nil
+}
+
+// evalExistsExpr evaluates EXISTS (subquery).
+func evalExistsExpr(env ExecEnv, ex *ExistsExpr) (any, error) {
+	rs, err := executeSelect(env, ex.Select)
+	if err != nil {
+		return nil, err
+	}
+	return rs != nil && len(rs.Rows) > 0, nil
 }
 
 // matchLikePattern matches a string against a SQL LIKE pattern
@@ -3060,6 +4279,76 @@ func matchLikePattern(str, pattern string, escape rune) bool {
 	}
 
 	return pIdx == pLen
+}
+
+// matchGlobPattern matches a string against a GLOB pattern.
+// * matches zero or more characters, ? matches exactly one character.
+// Unlike LIKE, GLOB is case-sensitive by default (callers may lowercase both
+// strings for case-insensitive behaviour).
+func matchGlobPattern(str, pattern string) bool {
+	sIdx, pIdx := 0, 0
+	sLen, pLen := len(str), len(pattern)
+	star := -1
+	match := 0
+
+	for sIdx < sLen {
+		if pIdx < pLen {
+			pChar := pattern[pIdx]
+			if pChar == '*' {
+				star = pIdx
+				match = sIdx
+				pIdx++
+				continue
+			}
+			if pChar == '?' || str[sIdx] == pChar {
+				sIdx++
+				pIdx++
+				continue
+			}
+		}
+		if star != -1 {
+			pIdx = star + 1
+			match++
+			sIdx = match
+			continue
+		}
+		return false
+	}
+	for pIdx < pLen && pattern[pIdx] == '*' {
+		pIdx++
+	}
+	return pIdx == pLen
+}
+
+// similarToRegexp converts a SQL SIMILAR TO pattern to a Go regexp pattern.
+// Rules:
+//   - % matches any sequence of characters (like .* in regex)
+//   - _ matches any single character (like . in regex)
+//   - | * + ? ( ) [ ] { } \ work as standard regex metacharacters
+//   - The match is anchored (whole string must match)
+func similarToRegexp(pattern string) string {
+	var b strings.Builder
+	b.WriteString("^")
+	for i := 0; i < len(pattern); i++ {
+		c := pattern[i]
+		switch c {
+		case '%':
+			b.WriteString(".*")
+		case '_':
+			b.WriteByte('.')
+		case '|', '*', '+', '?', '(', ')', '[', ']', '{', '}', '\\':
+			// Standard regex metacharacters – pass through as-is
+			b.WriteByte(c)
+		case '.', '^', '$':
+			// Anchor/any-char metacharacters in regex that are literal in SIMILAR TO
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	b.WriteString("$")
+	return b.String()
 }
 
 func evalCaseExpr(env ExecEnv, ex *CaseExpr, row Row) (any, error) {

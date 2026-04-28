@@ -1057,6 +1057,13 @@ func getExtendedFunctions() map[string]funcHandler {
 		"REGEXP_MATCH":   evalRegexpMatchFunc,
 		"REGEXP_EXTRACT": evalRegexpExtractFunc,
 		"REGEXP_REPLACE": evalRegexpReplaceFunc,
+		// String predicate functions
+		"CONTAINS":    evalContainsFunc,
+		"STARTS_WITH": evalStartsWithFunc,
+		"ENDS_WITH":   evalEndsWithFunc,
+		// String distance functions
+		"LEVENSHTEIN": evalLevenshteinFunc,
+		"EDIT_DISTANCE": evalLevenshteinFunc,
 		// Array functions
 		"SPLIT":          evalSplitFunc,
 		"FIRST":          evalFirstFunc,
@@ -1093,4 +1100,133 @@ func getExtendedFunctions() map[string]funcHandler {
 		"TABLE_FROM_JSON_LINES": evalTableFromJSONLinesScalar,
 		"TABLE_FROM_CSV":        evalTableFromCSVScalar,
 	}
+}
+
+// ==================== String Predicate Functions ====================
+
+// evalContainsFunc returns true when the first string contains the second string.
+func evalContainsFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) != 2 {
+		return nil, fmt.Errorf("CONTAINS expects 2 arguments: (string, substring)")
+	}
+	strVal, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	subVal, err := evalExpr(env, ex.Args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	if strVal == nil || subVal == nil {
+		return false, nil
+	}
+	return strings.Contains(fmt.Sprintf("%v", strVal), fmt.Sprintf("%v", subVal)), nil
+}
+
+// evalStartsWithFunc returns true when the string starts with the given prefix.
+func evalStartsWithFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) != 2 {
+		return nil, fmt.Errorf("STARTS_WITH expects 2 arguments: (string, prefix)")
+	}
+	strVal, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	prefixVal, err := evalExpr(env, ex.Args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	if strVal == nil || prefixVal == nil {
+		return false, nil
+	}
+	return strings.HasPrefix(fmt.Sprintf("%v", strVal), fmt.Sprintf("%v", prefixVal)), nil
+}
+
+// evalEndsWithFunc returns true when the string ends with the given suffix.
+func evalEndsWithFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) != 2 {
+		return nil, fmt.Errorf("ENDS_WITH expects 2 arguments: (string, suffix)")
+	}
+	strVal, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	suffixVal, err := evalExpr(env, ex.Args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	if strVal == nil || suffixVal == nil {
+		return false, nil
+	}
+	return strings.HasSuffix(fmt.Sprintf("%v", strVal), fmt.Sprintf("%v", suffixVal)), nil
+}
+
+// ==================== String Distance Functions ====================
+
+// evalLevenshteinFunc computes the Levenshtein (edit) distance between two strings.
+// It returns an integer representing the minimum number of single-character edits
+// (insertions, deletions, substitutions) required to transform s into t.
+func evalLevenshteinFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) != 2 {
+		return nil, fmt.Errorf("%s expects 2 arguments: (string, string)", ex.Name)
+	}
+	aVal, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	bVal, err := evalExpr(env, ex.Args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	if aVal == nil || bVal == nil {
+		return nil, nil
+	}
+	s := fmt.Sprintf("%v", aVal)
+	t := fmt.Sprintf("%v", bVal)
+	return levenshtein(s, t), nil
+}
+
+// levenshtein computes the edit distance between two strings using the standard
+// dynamic-programming algorithm with a single rolling row (O(min(|s|,|t|)) space).
+func levenshtein(s, t string) int {
+	rs := []rune(s)
+	rt := []rune(t)
+	m, n := len(rs), len(rt)
+	// Swap so that the longer string is rs (outer loop), reducing dp array size.
+	if m < n {
+		rs, rt = rt, rs
+		m, n = n, m
+	}
+	// dp[j] = edit distance between rs[:i] and rt[:j]
+	dp := make([]int, n+1)
+	for j := range dp {
+		dp[j] = j
+	}
+	for i := 1; i <= m; i++ {
+		prev := i
+		for j := 1; j <= n; j++ {
+			cost := 1
+			if rs[i-1] == rt[j-1] {
+				cost = 0
+			}
+			next := min3(dp[j]+1, prev+1, dp[j-1]+cost)
+			dp[j-1] = prev
+			prev = next
+		}
+		dp[n] = prev
+	}
+	return dp[n]
+}
+
+func min3(a, b, c int) int {
+	if a < b {
+		if a < c {
+			return a
+		}
+		return c
+	}
+	if b < c {
+		return b
+	}
+	return c
 }

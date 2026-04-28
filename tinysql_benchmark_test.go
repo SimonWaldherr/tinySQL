@@ -120,6 +120,9 @@ func BenchmarkExecute_ReadQueries(b *testing.B) {
 		{"FilteredScan", "SELECT id, name FROM users WHERE active = true", 500},
 		{"OrderByLimit", "SELECT id, score FROM users ORDER BY score DESC LIMIT 10", 10},
 		{"Aggregate", "SELECT active, COUNT(*) as count FROM users GROUP BY active", 2},
+		{"Between", "SELECT id, name FROM users WHERE age BETWEEN 20 AND 30", 220},
+		{"InList", "SELECT id, name FROM users WHERE id IN (1, 2, 3, 4, 5)", 5},
+		{"LikeScan", "SELECT id, name FROM users WHERE name LIKE 'user_1%'", 111},
 	}
 
 	for _, tc := range queries {
