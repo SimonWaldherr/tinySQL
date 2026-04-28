@@ -1192,7 +1192,7 @@ func levenshtein(s, t string) int {
 	rs := []rune(s)
 	rt := []rune(t)
 	m, n := len(rs), len(rt)
-	// Swap so that the shorter string is in s (saves memory on wide Unicode).
+	// Swap so that the longer string is rs (outer loop), reducing dp array size.
 	if m < n {
 		rs, rt = rt, rs
 		m, n = n, m

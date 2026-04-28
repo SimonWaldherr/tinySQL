@@ -2631,9 +2631,6 @@ func numericFast(v any) (float64, bool) {
 // Patterns containing '_' wildcards or multiple '%' anchors fall back to the
 // general matchLikePattern function.
 func buildCompiledLikeFilter(colIdx int, pattern string, negate bool) func([]any) (bool, error) {
-	// Helper that wraps the match result with the negate flag.
-	// For ILIKE, the caller pre-lowercases the pattern and the closure lowercases
-	// the column value on each call.
 	matchFn := func(match func(string) bool) func([]any) (bool, error) {
 		if negate {
 			return func(raw []any) (bool, error) {
@@ -2652,16 +2649,6 @@ func buildCompiledLikeFilter(colIdx int, pattern string, negate bool) func([]any
 			return match(s), nil
 		}
 	}
-
-	// Detect whether the caller wants case-insensitive matching by checking if
-	// the pattern is already in lowercase form (ILIKE lowers it before calling).
-	// We detect this by looking at the pattern itself – if it contains any upper
-	// ASCII it's a case-sensitive call; otherwise we produce a lowercasing wrapper.
-	// A simpler approach: always expose a caseInsensitive parameter.
-	// ─── The ILIKE path passes a pre-lowercased pattern; at match time we just
-	// lowercase the column value too via the wrapper created by the caller.
-	// Since the caller already lowercased the pattern we can't distinguish ILIKE
-	// from a literal lowercase LIKE pattern, so we accept this harmless overlap.
 
 	// No wildcards → exact match.
 	if !strings.ContainsAny(pattern, "%_") {
@@ -2691,31 +2678,39 @@ func buildCompiledLikeFilter(colIdx int, pattern string, negate bool) func([]any
 	return matchFn(func(s string) bool { return matchLikePattern(s, pattern, '\\') })
 }
 
-// buildCompiledILikeFilter is like buildCompiledLikeFilter but lowercases the
-// column value at match time so that the comparison is case-insensitive.
+// buildCompiledILikeFilter compiles an ILIKE / NOT ILIKE pattern into a closure.
+// It pre-lowercases the pattern and lowercases each column value at match time,
+// without any per-row heap allocations.
 func buildCompiledILikeFilter(colIdx int, pattern string, negate bool) func([]any) (bool, error) {
 	// Pre-lowercase the pattern once.
 	lowerPat := strings.ToLower(pattern)
 
-	// Build the base LIKE filter on the lowercased pattern.
-	inner := buildCompiledLikeFilter(colIdx, lowerPat, false /* negate handled below */)
-	if inner == nil {
-		return nil
+	// Pick the cheapest sub-matcher based on the lowercased pattern shape.
+	var match func(string) bool
+	switch {
+	case !strings.ContainsAny(lowerPat, "%_"):
+		match = func(s string) bool { return strings.ToLower(s) == lowerPat }
+	case strings.HasSuffix(lowerPat, "%") && !strings.ContainsAny(lowerPat[:len(lowerPat)-1], "%_"):
+		prefix := lowerPat[:len(lowerPat)-1]
+		match = func(s string) bool { return strings.HasPrefix(strings.ToLower(s), prefix) }
+	case strings.HasPrefix(lowerPat, "%") && !strings.ContainsAny(lowerPat[1:], "%_"):
+		suffix := lowerPat[1:]
+		match = func(s string) bool { return strings.HasSuffix(strings.ToLower(s), suffix) }
+	case strings.HasPrefix(lowerPat, "%") && strings.HasSuffix(lowerPat, "%") &&
+		len(lowerPat) >= 2 && !strings.ContainsAny(lowerPat[1:len(lowerPat)-1], "%_"):
+		mid := lowerPat[1 : len(lowerPat)-1]
+		match = func(s string) bool { return strings.Contains(strings.ToLower(s), mid) }
+	default:
+		match = func(s string) bool { return matchLikePattern(strings.ToLower(s), lowerPat, '\\') }
 	}
+
 	if negate {
 		return func(raw []any) (bool, error) {
 			s, ok := raw[colIdx].(string)
 			if !ok {
 				return false, nil
 			}
-			// Swap value then call inner with a synthetic raw slice.
-			tmp := append([]any(nil), raw...)
-			tmp[colIdx] = strings.ToLower(s)
-			result, err := inner(tmp)
-			if err != nil {
-				return false, err
-			}
-			return !result, nil
+			return !match(s), nil
 		}
 	}
 	return func(raw []any) (bool, error) {
@@ -2723,9 +2718,7 @@ func buildCompiledILikeFilter(colIdx int, pattern string, negate bool) func([]an
 		if !ok {
 			return false, nil
 		}
-		tmp := append([]any(nil), raw...)
-		tmp[colIdx] = strings.ToLower(s)
-		return inner(tmp)
+		return match(s), nil
 	}
 }
 
