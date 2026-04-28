@@ -32,6 +32,7 @@ import (
 	"math"
 	"math/big"
 	"math/rand"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1307,6 +1308,9 @@ func simpleJoinExprResolvable(e Expr, leftIndex, rightIndex map[string]int) bool
 		return simpleJoinExprResolvable(ex.Expr, leftIndex, rightIndex) &&
 			simpleJoinExprResolvable(ex.Pattern, leftIndex, rightIndex) &&
 			(ex.Escape == nil || simpleJoinExprResolvable(ex.Escape, leftIndex, rightIndex))
+	case *RegexpExpr:
+		return simpleJoinExprResolvable(ex.Expr, leftIndex, rightIndex) &&
+			simpleJoinExprResolvable(ex.Pattern, leftIndex, rightIndex)
 	case *InExpr:
 		if !simpleJoinExprResolvable(ex.Expr, leftIndex, rightIndex) {
 			return false
@@ -1412,17 +1416,56 @@ func evalJoinRawExpr(plan *simpleJoinPlan, left, right []any, e Expr) (any, erro
 		if !ok {
 			pattern = fmt.Sprintf("%v", patVal)
 		}
-		escapeChar := '\\'
-		if ex.Escape != nil {
-			escVal, err := evalJoinRawExpr(plan, left, right, ex.Escape)
-			if err != nil {
-				return nil, err
+		var matched bool
+		if ex.GlobStyle {
+			if ex.CaseInsensitive {
+				matched = matchGlobPattern(strings.ToLower(str), strings.ToLower(pattern))
+			} else {
+				matched = matchGlobPattern(str, pattern)
 			}
-			if escStr, ok := escVal.(string); ok && len(escStr) == 1 {
-				escapeChar = rune(escStr[0])
+		} else {
+			escapeChar := '\\'
+			if ex.Escape != nil {
+				escVal, err := evalJoinRawExpr(plan, left, right, ex.Escape)
+				if err != nil {
+					return nil, err
+				}
+				if escStr, ok := escVal.(string); ok && len(escStr) == 1 {
+					escapeChar = rune(escStr[0])
+				}
+			}
+			if ex.CaseInsensitive {
+				matched = matchLikePattern(strings.ToLower(str), strings.ToLower(pattern), escapeChar)
+			} else {
+				matched = matchLikePattern(str, pattern, escapeChar)
 			}
 		}
-		matched := matchLikePattern(str, pattern, escapeChar)
+		if ex.Negate {
+			return !matched, nil
+		}
+		return matched, nil
+	case *RegexpExpr:
+		val, err := evalJoinRawExpr(plan, left, right, ex.Expr)
+		if err != nil {
+			return nil, err
+		}
+		patVal, err := evalJoinRawExpr(plan, left, right, ex.Pattern)
+		if err != nil {
+			return nil, err
+		}
+		if val == nil || patVal == nil {
+			return false, nil
+		}
+		str := fmt.Sprintf("%v", val)
+		pat := fmt.Sprintf("%v", patVal)
+		if ex.SimilarTo {
+			pat = similarToRegexp(pat)
+		}
+		re, err := regexp.Compile(pat)
+		if err != nil {
+			return nil, fmt.Errorf("REGEXP: invalid pattern %q: %v", pat, err)
+		}
+		matched := re.MatchString(str)
 		if ex.Negate {
 			return !matched, nil
 		}
@@ -2002,9 +2045,12 @@ func isSimpleRawExpr(e Expr) bool {
 	case *IsNull:
 		return isSimpleRawExpr(ex.Expr)
 	case *LikeExpr:
-		// LIKE with a literal pattern and no dynamic escape is safe in the fast path.
+		// LIKE/ILIKE/GLOB with a literal pattern and no dynamic escape is safe in the fast path.
 		return isSimpleRawExpr(ex.Expr) && isSimpleRawExpr(ex.Pattern) &&
 			(ex.Escape == nil || isSimpleRawExpr(ex.Escape))
+	case *RegexpExpr:
+		// REGEXP/RLIKE/SIMILAR TO with literal pattern is safe in the fast path.
+		return isSimpleRawExpr(ex.Expr) && isSimpleRawExpr(ex.Pattern)
 	case *InExpr:
 		if !isSimpleRawExpr(ex.Expr) {
 			return false
@@ -2171,7 +2217,7 @@ func buildRawFilter(colIndex map[string]int, e Expr) func([]any) (bool, error) {
 		return nil
 
 	case *LikeExpr:
-		// Compile LIKE / NOT LIKE with a literal pattern into a specialized closure.
+		// Compile LIKE/ILIKE/GLOB/NOT LIKE with a literal pattern into a specialized closure.
 		ref, isRef := ex.Expr.(*VarRef)
 		if !isRef {
 			return nil
@@ -2188,10 +2234,58 @@ func buildRawFilter(colIndex map[string]int, e Expr) func([]any) (bool, error) {
 		if !isStr {
 			return nil
 		}
+		if ex.GlobStyle {
+			return buildCompiledGlobFilter(colIdx, pattern, ex.CaseInsensitive, ex.Negate)
+		}
 		if ex.Escape != nil {
 			return nil // custom ESCAPE: fall back to evalRawExpr
 		}
+		if ex.CaseInsensitive {
+			// ILIKE: use the dedicated lowercasing filter
+			return buildCompiledILikeFilter(colIdx, pattern, ex.Negate)
+		}
 		return buildCompiledLikeFilter(colIdx, pattern, ex.Negate)
+
+	case *RegexpExpr:
+		// Compile REGEXP/RLIKE/SIMILAR TO with a literal pattern.
+		ref, isRef := ex.Expr.(*VarRef)
+		if !isRef {
+			return nil
+		}
+		colIdx, ok := colIndex[strings.ToLower(ref.Name)]
+		if !ok {
+			return nil
+		}
+		pat, isLit := ex.Pattern.(*Literal)
+		if !isLit {
+			return nil
+		}
+		pattern, isStr := pat.Val.(string)
+		if !isStr {
+			return nil
+		}
+		if ex.SimilarTo {
+			pattern = similarToRegexp(pattern)
+		}
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			return nil // invalid pattern – fall back to evalRawExpr
+		}
+		negate := ex.Negate
+		return func(raw []any) (bool, error) {
+			s, ok := raw[colIdx].(string)
+			if !ok {
+				if raw[colIdx] == nil {
+					return false, nil
+				}
+				s = fmt.Sprintf("%v", raw[colIdx])
+			}
+			matched := re.MatchString(s)
+			if negate {
+				return !matched, nil
+			}
+			return matched, nil
+		}
 
 	case *InExpr:
 		// col IN (lit, ...) / col NOT IN (lit, ...) with all-literal values.
@@ -2538,6 +2632,8 @@ func numericFast(v any) (float64, bool) {
 // general matchLikePattern function.
 func buildCompiledLikeFilter(colIdx int, pattern string, negate bool) func([]any) (bool, error) {
 	// Helper that wraps the match result with the negate flag.
+	// For ILIKE, the caller pre-lowercases the pattern and the closure lowercases
+	// the column value on each call.
 	matchFn := func(match func(string) bool) func([]any) (bool, error) {
 		if negate {
 			return func(raw []any) (bool, error) {
@@ -2556,6 +2652,16 @@ func buildCompiledLikeFilter(colIdx int, pattern string, negate bool) func([]any
 			return match(s), nil
 		}
 	}
+
+	// Detect whether the caller wants case-insensitive matching by checking if
+	// the pattern is already in lowercase form (ILIKE lowers it before calling).
+	// We detect this by looking at the pattern itself – if it contains any upper
+	// ASCII it's a case-sensitive call; otherwise we produce a lowercasing wrapper.
+	// A simpler approach: always expose a caseInsensitive parameter.
+	// ─── The ILIKE path passes a pre-lowercased pattern; at match time we just
+	// lowercase the column value too via the wrapper created by the caller.
+	// Since the caller already lowercased the pattern we can't distinguish ILIKE
+	// from a literal lowercase LIKE pattern, so we accept this harmless overlap.
 
 	// No wildcards → exact match.
 	if !strings.ContainsAny(pattern, "%_") {
@@ -2583,6 +2689,74 @@ func buildCompiledLikeFilter(colIdx int, pattern string, negate bool) func([]any
 
 	// Fall back to the general matcher.
 	return matchFn(func(s string) bool { return matchLikePattern(s, pattern, '\\') })
+}
+
+// buildCompiledILikeFilter is like buildCompiledLikeFilter but lowercases the
+// column value at match time so that the comparison is case-insensitive.
+func buildCompiledILikeFilter(colIdx int, pattern string, negate bool) func([]any) (bool, error) {
+	// Pre-lowercase the pattern once.
+	lowerPat := strings.ToLower(pattern)
+
+	// Build the base LIKE filter on the lowercased pattern.
+	inner := buildCompiledLikeFilter(colIdx, lowerPat, false /* negate handled below */)
+	if inner == nil {
+		return nil
+	}
+	if negate {
+		return func(raw []any) (bool, error) {
+			s, ok := raw[colIdx].(string)
+			if !ok {
+				return false, nil
+			}
+			// Swap value then call inner with a synthetic raw slice.
+			tmp := append([]any(nil), raw...)
+			tmp[colIdx] = strings.ToLower(s)
+			result, err := inner(tmp)
+			if err != nil {
+				return false, err
+			}
+			return !result, nil
+		}
+	}
+	return func(raw []any) (bool, error) {
+		s, ok := raw[colIdx].(string)
+		if !ok {
+			return false, nil
+		}
+		tmp := append([]any(nil), raw...)
+		tmp[colIdx] = strings.ToLower(s)
+		return inner(tmp)
+	}
+}
+
+// buildCompiledGlobFilter compiles a GLOB / NOT GLOB pattern into a closure.
+// GLOB wildcards: * matches any sequence, ? matches any single character.
+func buildCompiledGlobFilter(colIdx int, pattern string, caseInsensitive, negate bool) func([]any) (bool, error) {
+	if caseInsensitive {
+		pattern = strings.ToLower(pattern)
+	}
+	matchFn := func(s string) bool {
+		if caseInsensitive {
+			s = strings.ToLower(s)
+		}
+		return matchGlobPattern(s, pattern)
+	}
+	if negate {
+		return func(raw []any) (bool, error) {
+			s, ok := raw[colIdx].(string)
+			if !ok {
+				return false, nil
+			}
+			return !matchFn(s), nil
+		}
+	}
+	return func(raw []any) (bool, error) {
+		s, ok := raw[colIdx].(string)
+		if !ok {
+			return false, nil
+		}
+		return matchFn(s), nil
+	}
 }
 
 // buildInFilter builds a fast set-membership closure for col IN (litVals).
@@ -2790,6 +2964,8 @@ func evalRawExpr(plan *simpleSelectPlan, raw []any, e Expr) (any, error) {
 		return evalRawLike(plan, raw, ex)
 	case *InExpr:
 		return evalRawIn(plan, raw, ex)
+	case *RegexpExpr:
+		return evalRawRegexp(plan, raw, ex)
 	default:
 		return nil, fmt.Errorf("unsupported fast-path expression %T", e)
 	}
@@ -2882,17 +3058,59 @@ func evalRawLike(plan *simpleSelectPlan, raw []any, ex *LikeExpr) (any, error) {
 	if !ok {
 		pattern = fmt.Sprintf("%v", patVal)
 	}
-	escapeChar := '\\'
-	if ex.Escape != nil {
-		escVal, err := evalRawExpr(plan, raw, ex.Escape)
-		if err != nil {
-			return nil, err
+	var matched bool
+	if ex.GlobStyle {
+		if ex.CaseInsensitive {
+			matched = matchGlobPattern(strings.ToLower(str), strings.ToLower(pattern))
+		} else {
+			matched = matchGlobPattern(str, pattern)
 		}
-		if escStr, ok := escVal.(string); ok && len(escStr) == 1 {
-			escapeChar = rune(escStr[0])
+	} else {
+		escapeChar := '\\'
+		if ex.Escape != nil {
+			escVal, err := evalRawExpr(plan, raw, ex.Escape)
+			if err != nil {
+				return nil, err
+			}
+			if escStr, ok := escVal.(string); ok && len(escStr) == 1 {
+				escapeChar = rune(escStr[0])
+			}
+		}
+		if ex.CaseInsensitive {
+			matched = matchLikePattern(strings.ToLower(str), strings.ToLower(pattern), escapeChar)
+		} else {
+			matched = matchLikePattern(str, pattern, escapeChar)
 		}
 	}
-	matched := matchLikePattern(str, pattern, escapeChar)
+	if ex.Negate {
+		return !matched, nil
+	}
+	return matched, nil
+}
+
+// evalRawRegexp evaluates REGEXP / RLIKE / SIMILAR TO in the raw fast path.
+func evalRawRegexp(plan *simpleSelectPlan, raw []any, ex *RegexpExpr) (any, error) {
+	val, err := evalRawExpr(plan, raw, ex.Expr)
+	if err != nil {
+		return nil, err
+	}
+	patVal, err := evalRawExpr(plan, raw, ex.Pattern)
+	if err != nil {
+		return nil, err
+	}
+	if val == nil || patVal == nil {
+		return false, nil
+	}
+	str := fmt.Sprintf("%v", val)
+	pattern := fmt.Sprintf("%v", patVal)
+	if ex.SimilarTo {
+		pattern = similarToRegexp(pattern)
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("REGEXP: invalid pattern %q: %v", pattern, err)
+	}
+	matched := re.MatchString(str)
 	if ex.Negate {
 		return !matched, nil
 	}
@@ -3853,6 +4071,10 @@ func evalExpr(env ExecEnv, e Expr, row Row) (any, error) {
 		return evalIn(env, ex, row)
 	case *LikeExpr:
 		return evalLike(env, ex, row)
+	case *RegexpExpr:
+		return evalRegexpExpr(env, ex, row)
+	case *ExistsExpr:
+		return evalExistsExpr(env, ex)
 	case *CaseExpr:
 		return evalCaseExpr(env, ex, row)
 	case *SubqueryExpr:
@@ -3936,27 +4158,77 @@ func evalLike(env ExecEnv, ex *LikeExpr, row Row) (any, error) {
 		pattern = fmt.Sprintf("%v", patternVal)
 	}
 
-	// Get escape character if specified
-	escapeChar := '\\'
-	if ex.Escape != nil {
-		escapeVal, err := evalExpr(env, ex.Escape, row)
-		if err != nil {
-			return nil, err
+	var matched bool
+	if ex.GlobStyle {
+		// GLOB: case-sensitive, * matches any sequence, ? matches one char
+		if ex.CaseInsensitive {
+			matched = matchGlobPattern(strings.ToLower(str), strings.ToLower(pattern))
+		} else {
+			matched = matchGlobPattern(str, pattern)
 		}
-		escapeStr, ok := escapeVal.(string)
-		if !ok || len(escapeStr) != 1 {
-			return nil, fmt.Errorf("ESCAPE must be a single character")
+	} else {
+		// LIKE / ILIKE: get optional escape character
+		escapeChar := '\\'
+		if ex.Escape != nil {
+			escapeVal, err := evalExpr(env, ex.Escape, row)
+			if err != nil {
+				return nil, err
+			}
+			escapeStr, ok := escapeVal.(string)
+			if !ok || len(escapeStr) != 1 {
+				return nil, fmt.Errorf("ESCAPE must be a single character")
+			}
+			escapeChar = rune(escapeStr[0])
 		}
-		escapeChar = rune(escapeStr[0])
+		if ex.CaseInsensitive {
+			matched = matchLikePattern(strings.ToLower(str), strings.ToLower(pattern), escapeChar)
+		} else {
+			matched = matchLikePattern(str, pattern, escapeChar)
+		}
 	}
-
-	// Match pattern
-	matched := matchLikePattern(str, pattern, escapeChar)
 
 	if ex.Negate {
 		return !matched, nil
 	}
 	return matched, nil
+}
+
+// evalRegexpExpr evaluates REGEXP / RLIKE / SIMILAR TO predicates.
+func evalRegexpExpr(env ExecEnv, ex *RegexpExpr, row Row) (any, error) {
+	val, err := evalExpr(env, ex.Expr, row)
+	if err != nil {
+		return nil, err
+	}
+	patternVal, err := evalExpr(env, ex.Pattern, row)
+	if err != nil {
+		return nil, err
+	}
+	if val == nil || patternVal == nil {
+		return false, nil
+	}
+	str := fmt.Sprintf("%v", val)
+	pattern := fmt.Sprintf("%v", patternVal)
+	if ex.SimilarTo {
+		pattern = similarToRegexp(pattern)
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("REGEXP: invalid pattern %q: %v", pattern, err)
+	}
+	matched := re.MatchString(str)
+	if ex.Negate {
+		return !matched, nil
+	}
+	return matched, nil
+}
+
+// evalExistsExpr evaluates EXISTS (subquery).
+func evalExistsExpr(env ExecEnv, ex *ExistsExpr) (any, error) {
+	rs, err := executeSelect(env, ex.Select)
+	if err != nil {
+		return nil, err
+	}
+	return rs != nil && len(rs.Rows) > 0, nil
 }
 
 // matchLikePattern matches a string against a SQL LIKE pattern
@@ -4014,6 +4286,76 @@ func matchLikePattern(str, pattern string, escape rune) bool {
 	}
 
 	return pIdx == pLen
+}
+
+// matchGlobPattern matches a string against a GLOB pattern.
+// * matches zero or more characters, ? matches exactly one character.
+// Unlike LIKE, GLOB is case-sensitive by default (callers may lowercase both
+// strings for case-insensitive behaviour).
+func matchGlobPattern(str, pattern string) bool {
+	sIdx, pIdx := 0, 0
+	sLen, pLen := len(str), len(pattern)
+	star := -1
+	match := 0
+
+	for sIdx < sLen {
+		if pIdx < pLen {
+			pChar := pattern[pIdx]
+			if pChar == '*' {
+				star = pIdx
+				match = sIdx
+				pIdx++
+				continue
+			}
+			if pChar == '?' || str[sIdx] == pChar {
+				sIdx++
+				pIdx++
+				continue
+			}
+		}
+		if star != -1 {
+			pIdx = star + 1
+			match++
+			sIdx = match
+			continue
+		}
+		return false
+	}
+	for pIdx < pLen && pattern[pIdx] == '*' {
+		pIdx++
+	}
+	return pIdx == pLen
+}
+
+// similarToRegexp converts a SQL SIMILAR TO pattern to a Go regexp pattern.
+// Rules:
+//   - % matches any sequence of characters (like .* in regex)
+//   - _ matches any single character (like . in regex)
+//   - | * + ? ( ) [ ] { } \ work as standard regex metacharacters
+//   - The match is anchored (whole string must match)
+func similarToRegexp(pattern string) string {
+	var b strings.Builder
+	b.WriteString("^")
+	for i := 0; i < len(pattern); i++ {
+		c := pattern[i]
+		switch c {
+		case '%':
+			b.WriteString(".*")
+		case '_':
+			b.WriteByte('.')
+		case '|', '*', '+', '?', '(', ')', '[', ']', '{', '}', '\\':
+			// Standard regex metacharacters – pass through as-is
+			b.WriteByte(c)
+		case '.', '^', '$':
+			// Anchor/any-char metacharacters in regex that are literal in SIMILAR TO
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	b.WriteString("$")
+	return b.String()
 }
 
 func evalCaseExpr(env ExecEnv, ex *CaseExpr, row Row) (any, error) {

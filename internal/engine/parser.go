@@ -110,10 +110,23 @@ type (
 	}
 	// LikeExpr represents "expr LIKE pattern [ESCAPE char]"
 	LikeExpr struct {
-		Expr    Expr
-		Pattern Expr
-		Escape  Expr // Optional ESCAPE character
-		Negate  bool // For NOT LIKE
+		Expr            Expr
+		Pattern         Expr
+		Escape          Expr  // Optional ESCAPE character
+		Negate          bool  // For NOT LIKE / NOT ILIKE / NOT GLOB
+		CaseInsensitive bool  // For ILIKE
+		GlobStyle       bool  // For GLOB (* and ? wildcards instead of % and _)
+	}
+	// RegexpExpr represents "expr REGEXP/RLIKE pattern" and "expr SIMILAR TO pattern".
+	RegexpExpr struct {
+		Expr      Expr
+		Pattern   Expr
+		Negate    bool // For NOT REGEXP / NOT RLIKE / NOT SIMILAR TO
+		SimilarTo bool // Pattern uses SQL SIMILAR TO syntax (% and _ wildcards)
+	}
+	// ExistsExpr represents "EXISTS (subquery)".
+	ExistsExpr struct {
+		Select *Select
 	}
 	// CaseExpr represents a CASE ... WHEN ... THEN ... [ELSE ...] END expression.
 	CaseExpr struct {
@@ -2154,6 +2167,61 @@ func (p *Parser) parseCmp() (Expr, error) {
 			continue
 		}
 
+		// ILIKE operator (case-insensitive LIKE)
+		if p.cur.Typ == tKeyword && p.cur.Val == "ILIKE" {
+			p.next()
+			pattern, err := p.parseAddSub()
+			if err != nil {
+				return nil, err
+			}
+			var escape Expr
+			if p.cur.Typ == tKeyword && p.cur.Val == "ESCAPE" {
+				p.next()
+				escape, err = p.parseAddSub()
+				if err != nil {
+					return nil, err
+				}
+			}
+			l = &LikeExpr{Expr: l, Pattern: pattern, Escape: escape, Negate: negate, CaseInsensitive: true}
+			continue
+		}
+
+		// GLOB operator (SQLite-style: * and ? wildcards, case-sensitive)
+		if p.cur.Typ == tKeyword && p.cur.Val == "GLOB" {
+			p.next()
+			pattern, err := p.parseAddSub()
+			if err != nil {
+				return nil, err
+			}
+			l = &LikeExpr{Expr: l, Pattern: pattern, Negate: negate, GlobStyle: true}
+			continue
+		}
+
+		// REGEXP / RLIKE operators
+		if p.cur.Typ == tKeyword && (p.cur.Val == "REGEXP" || p.cur.Val == "RLIKE") {
+			p.next()
+			pattern, err := p.parseAddSub()
+			if err != nil {
+				return nil, err
+			}
+			l = &RegexpExpr{Expr: l, Pattern: pattern, Negate: negate}
+			continue
+		}
+
+		// SIMILAR TO / NOT SIMILAR TO
+		if p.cur.Typ == tKeyword && p.cur.Val == "SIMILAR" {
+			p.next()
+			if err := p.expectKeyword("TO"); err != nil {
+				return nil, err
+			}
+			pattern, err := p.parseAddSub()
+			if err != nil {
+				return nil, err
+			}
+			l = &RegexpExpr{Expr: l, Pattern: pattern, Negate: negate, SimilarTo: true}
+			continue
+		}
+
 		// Regular comparison operators
 		if p.cur.Typ == tSymbol {
 			switch p.cur.Val {
@@ -2254,6 +2322,19 @@ func (p *Parser) parsePrimary() (Expr, error) {
 				return nil, err
 			}
 			return &SubqueryExpr{Select: sel}, nil
+		case "EXISTS":
+			p.next() // consume EXISTS
+			if err := p.expectSymbol("("); err != nil {
+				return nil, err
+			}
+			sel, err := p.parseSelect()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expectSymbol(")"); err != nil {
+				return nil, err
+			}
+			return &ExistsExpr{Select: sel}, nil
 		case "TRUE":
 			p.next()
 			return &Literal{Val: true}, nil
