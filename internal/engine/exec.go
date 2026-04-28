@@ -1103,7 +1103,8 @@ type simpleSelectPlan struct {
 // key is the pre-lowercased name used as the Row map key (avoids putVal's
 // strings.ToLower on every output row).
 // side is only meaningful for join projections: 0=left table, 1=right table,
-// -1=not resolved (use expr instead).
+// -1=single-table context or expression that could not be resolved to a simple
+// column reference (use expr instead).
 type simpleProjection struct {
 	name   string // output column name (original case for ResultSet.Cols)
 	key    string // strings.ToLower(name) – pre-computed Row map key
@@ -2155,6 +2156,12 @@ func buildColLiteralFilter(colIdx int, op string, litVal any) func([]any) (bool,
 // without going through the generic compare() function.  It covers the value
 // types that tinySQL stores in table rows (int, int64, float64, string, bool).
 func rawEqual(a, b any) bool {
+	if a == nil {
+		return b == nil
+	}
+	if b == nil {
+		return false
+	}
 	switch av := a.(type) {
 	case int:
 		switch bv := b.(type) {
@@ -3156,7 +3163,7 @@ func compareBigRat(ax *big.Rat, b any) (int, error) {
 }
 
 func compareInt(ax int, b any) (int, error) {
-	// Fast path: avoid float64 conversion for same-type comparisons.
+	// fast path: avoid float64 conversion for same-type comparisons.
 	switch bv := b.(type) {
 	case int:
 		if ax < bv {
