@@ -112,10 +112,10 @@ type (
 	LikeExpr struct {
 		Expr            Expr
 		Pattern         Expr
-		Escape          Expr  // Optional ESCAPE character
-		Negate          bool  // For NOT LIKE / NOT ILIKE / NOT GLOB
-		CaseInsensitive bool  // For ILIKE
-		GlobStyle       bool  // For GLOB (* and ? wildcards instead of % and _)
+		Escape          Expr // Optional ESCAPE character
+		Negate          bool // For NOT LIKE / NOT ILIKE / NOT GLOB
+		CaseInsensitive bool // For ILIKE
+		GlobStyle       bool // For GLOB (* and ? wildcards instead of % and _)
 	}
 	// RegexpExpr represents "expr REGEXP/RLIKE pattern" and "expr SIMILAR TO pattern".
 	RegexpExpr struct {

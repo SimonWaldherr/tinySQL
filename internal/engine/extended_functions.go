@@ -1062,7 +1062,7 @@ func getExtendedFunctions() map[string]funcHandler {
 		"STARTS_WITH": evalStartsWithFunc,
 		"ENDS_WITH":   evalEndsWithFunc,
 		// String distance functions
-		"LEVENSHTEIN": evalLevenshteinFunc,
+		"LEVENSHTEIN":   evalLevenshteinFunc,
 		"EDIT_DISTANCE": evalLevenshteinFunc,
 		// Array functions
 		"SPLIT":          evalSplitFunc,
