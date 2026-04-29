@@ -634,6 +634,7 @@ func (s *stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driv
 
 type rows struct {
 	rs        *engine.ResultSet
+	cachedRS  *engine.ResultSet
 	lowerCols []string
 	i         int
 }
@@ -644,11 +645,12 @@ func (r *rows) Next(dest []driver.Value) error {
 	if r.i >= len(r.rs.Rows) {
 		return io.EOF
 	}
-	if len(r.lowerCols) != len(r.rs.Cols) {
+	if r.cachedRS != r.rs || len(r.lowerCols) != len(r.rs.Cols) {
 		r.lowerCols = make([]string, len(r.rs.Cols))
 		for i, c := range r.rs.Cols {
 			r.lowerCols[i] = strings.ToLower(c)
 		}
+		r.cachedRS = r.rs
 	}
 	row := r.rs.Rows[r.i]
 	for i := range r.rs.Cols {
@@ -743,12 +745,17 @@ func bindPlaceholders(sqlStr string, args []driver.NamedValue) (string, error) {
 		if (ch == '$' || ch == ':') && i+1 < n {
 			j := i + 1
 			num := 0
+			const maxInt = int(^uint(0) >> 1)
 			for j < n {
 				c := sqlStr[j]
 				if c < '0' || c > '9' {
 					break
 				}
-				num = num*10 + int(c-'0')
+				d := int(c - '0')
+				if num > (maxInt-d)/10 {
+					return "", fmt.Errorf("tinysql: invalid placeholder %c%s", ch, sqlStr[i+1:j+1])
+				}
+				num = num*10 + d
 				j++
 			}
 			if j > i+1 {
