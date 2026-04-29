@@ -1,0 +1,88 @@
+{{define "create_table"}}
+{{template "base_start" (dict "Tables" .Tables "ActiveTable" "")}}
+
+<div class="page-hdr">
+  <h1><i class="bi bi-plus-square text-primary"></i>Create Table</h1>
+  <a href="/" class="btn btn-sm btn-outline-secondary">
+    <i class="bi bi-x me-1"></i>Cancel
+  </a>
+</div>
+
+{{template "alert" .}}
+
+<div class="card form-card">
+  <div class="card-body">
+    <form method="post" action="/create-table" id="createForm">
+      <div class="mb-3">
+        <label class="form-label fw-semibold small">Table Name</label>
+        <input type="text" class="form-control form-control-sm"
+               name="table_name" value="{{.TableName}}"
+               placeholder="e.g. customers" required autofocus>
+        <div class="form-text text-muted">Lowercase letters, digits, and underscores recommended.</div>
+      </div>
+
+      <div class="mb-1">
+        <label class="form-label fw-semibold small d-block">
+          Columns
+          <span class="text-muted fw-normal">(an <strong>id INT</strong> column is added automatically)</span>
+        </label>
+      </div>
+
+      <div id="fieldList">
+        <div class="field-row mb-2">
+          <input type="text" class="form-control form-control-sm" name="col_name"
+                 placeholder="column name" required>
+          <select class="form-select form-select-sm type-sel" name="col_type">
+            <option value="TEXT" selected>TEXT</option>
+            <option value="INT">INT</option>
+            <option value="FLOAT">FLOAT</option>
+            <option value="BOOL">BOOL</option>
+          </select>
+          <button type="button" class="btn btn-outline-danger btn-sm btn-remove"
+                  onclick="removeField(this)" title="Remove column">
+            <i class="bi bi-dash"></i>
+          </button>
+        </div>
+      </div>
+
+      <button type="button" class="btn btn-outline-secondary btn-sm mb-3"
+              onclick="addField()">
+        <i class="bi bi-plus me-1"></i>Add Column
+      </button>
+
+      <div class="d-flex gap-2">
+        <button type="submit" class="btn btn-primary btn-sm">
+          <i class="bi bi-table me-1"></i>Create Table
+        </button>
+        <a href="/" class="btn btn-outline-secondary btn-sm">Cancel</a>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+function addField() {
+  var list = document.getElementById('fieldList');
+  var row = document.createElement('div');
+  row.className = 'field-row mb-2';
+  row.innerHTML =
+    '<input type="text" class="form-control form-control-sm" name="col_name" placeholder="column name" required>' +
+    '<select class="form-select form-select-sm type-sel" name="col_type">' +
+    '<option value="TEXT" selected>TEXT</option><option value="INT">INT</option>' +
+    '<option value="FLOAT">FLOAT</option><option value="BOOL">BOOL</option>' +
+    '</select>' +
+    '<button type="button" class="btn btn-outline-danger btn-sm btn-remove" onclick="removeField(this)" title="Remove column">' +
+    '<i class="bi bi-dash"></i></button>';
+  list.appendChild(row);
+  row.querySelector('input').focus();
+}
+
+function removeField(btn) {
+  var rows = document.querySelectorAll('#fieldList .field-row');
+  if (rows.length <= 1) return; // keep at least one
+  btn.closest('.field-row').remove();
+}
+</script>
+
+{{template "base_end" .}}
+{{end}}

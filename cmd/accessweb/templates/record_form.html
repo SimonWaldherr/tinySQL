@@ -1,0 +1,52 @@
+{{define "record_form"}}
+{{$table  := .Table}}
+{{$meta   := .Meta}}
+{{$values := .Values}}
+{{$isNew  := .IsNew}}
+{{$id     := .ID}}
+{{template "base_start" (dict "Tables" .Tables "ActiveTable" $table)}}
+
+<div class="page-hdr">
+  <h1>
+    <i class="bi bi-{{if $isNew}}plus-circle{{else}}pencil-square{{end}} text-primary"></i>
+    {{if $isNew}}New Record{{else}}Edit Record{{end}}
+    <span class="text-muted fw-normal fs-6 ms-2">in {{$table}}</span>
+  </h1>
+  <a href="/t/{{$table}}" class="btn btn-sm btn-outline-secondary">
+    <i class="bi bi-arrow-left me-1"></i>Back
+  </a>
+</div>
+
+{{template "alert" .}}
+
+<div class="card form-card">
+  <div class="card-body">
+    <form method="post"
+          action="/t/{{$table}}/{{if $isNew}}new{{else}}{{$id}}/edit{{end}}">
+      {{range $col := $meta.Columns}}
+        {{if not (eq $col.Name "id")}}
+        <div class="mb-3">
+          <label class="form-label fw-semibold small mb-1">
+            {{$col.Name}}
+            <span class="text-muted fw-normal">{{$col.TypeName}}</span>
+          </label>
+          <input type="text" class="form-control form-control-sm"
+                 name="{{$col.Name}}"
+                 value="{{index $values $col.Name}}"
+                 placeholder="{{$col.TypeName}}">
+        </div>
+        {{end}}
+      {{end}}
+      <div class="d-flex gap-2 mt-3">
+        <button type="submit" class="btn btn-primary btn-sm">
+          <i class="bi bi-{{if $isNew}}plus-lg{{else}}check-lg{{end}} me-1"></i>
+          {{if $isNew}}Create Record{{else}}Save Changes{{end}}
+        </button>
+        <a href="/t/{{$table}}" class="btn btn-outline-secondary btn-sm">Cancel</a>
+      </div>
+    </form>
+  </div>
+</div>
+
+{{template "base_end" .}}
+{{end}}

@@ -1,0 +1,268 @@
+{{define "base_start"}}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AccessWeb – tinySQL</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+  <style>
+    :root {
+      --brand: #1565c0;
+      --brand-dark: #0d47a1;
+      --sidebar-w: 230px;
+      --nav-h: 52px;
+    }
+    html, body { height: 100%; margin: 0; }
+    body { display: flex; flex-direction: column; background: #f0f2f5; font-size: .9rem; }
+
+    /* ── Top navbar ── */
+    .app-nav {
+      height: var(--nav-h);
+      background: var(--brand);
+      display: flex;
+      align-items: center;
+      padding: 0 1rem;
+      gap: .75rem;
+      flex-shrink: 0;
+      box-shadow: 0 2px 6px rgba(0,0,0,.25);
+      z-index: 100;
+    }
+    .app-nav .brand {
+      color: #fff;
+      font-weight: 700;
+      font-size: 1.05rem;
+      text-decoration: none;
+      display: flex;
+      align-items: center;
+      gap: .4rem;
+    }
+    .app-nav .brand i { font-size: 1.25rem; }
+    .app-nav .nav-sep { flex: 1; }
+    .app-nav a.btn-nav {
+      color: rgba(255,255,255,.85);
+      text-decoration: none;
+      font-size: .82rem;
+      padding: .3rem .65rem;
+      border-radius: .35rem;
+      border: 1px solid rgba(255,255,255,.3);
+      transition: background .15s;
+      display: flex;
+      align-items: center;
+      gap: .3rem;
+    }
+    .app-nav a.btn-nav:hover { background: rgba(255,255,255,.15); color: #fff; }
+    .app-nav a.btn-nav.active { background: rgba(255,255,255,.2); color: #fff; }
+
+    /* ── Layout below navbar ── */
+    .app-body {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* ── Sidebar ── */
+    .sidebar {
+      width: var(--sidebar-w);
+      flex-shrink: 0;
+      background: #1a237e;
+      color: #c5cae9;
+      display: flex;
+      flex-direction: column;
+      overflow-y: auto;
+    }
+    .sidebar .section-title {
+      font-size: .68rem;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: #7986cb;
+      padding: .85rem 1rem .35rem;
+      font-weight: 700;
+    }
+    .sidebar .table-link {
+      display: flex;
+      align-items: center;
+      gap: .5rem;
+      padding: .42rem 1rem;
+      color: #c5cae9;
+      text-decoration: none;
+      font-size: .85rem;
+      border-left: 3px solid transparent;
+      transition: background .12s;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+    .sidebar .table-link i { opacity: .6; flex-shrink: 0; }
+    .sidebar .table-link:hover { background: rgba(255,255,255,.07); color: #fff; }
+    .sidebar .table-link.active {
+      background: rgba(255,255,255,.12);
+      color: #fff;
+      border-left-color: #82b1ff;
+    }
+    .sidebar .sidebar-footer {
+      margin-top: auto;
+      padding: .75rem 1rem;
+      font-size: .75rem;
+      color: #5c6bc0;
+      border-top: 1px solid rgba(255,255,255,.07);
+    }
+
+    /* ── Main content ── */
+    .main-content {
+      flex: 1;
+      overflow-y: auto;
+      padding: 1.25rem 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+
+    /* ── Page header ── */
+    .page-hdr {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: .5rem;
+    }
+    .page-hdr h1 {
+      font-size: 1.15rem;
+      font-weight: 700;
+      margin: 0;
+      display: flex;
+      align-items: center;
+      gap: .45rem;
+    }
+
+    /* ── Cards ── */
+    .card {
+      border: none;
+      border-radius: .5rem;
+      box-shadow: 0 2px 8px rgba(0,0,0,.07);
+    }
+
+    /* ── Datasheet table ── */
+    .datasheet { font-size: .83rem; }
+    .datasheet thead th {
+      background: #e8eaf6;
+      color: #283593;
+      font-size: .75rem;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      border-bottom: 2px solid #c5cae9;
+      white-space: nowrap;
+      padding: .5rem .65rem;
+    }
+    .datasheet thead th a {
+      color: inherit;
+      text-decoration: none;
+    }
+    .datasheet thead th a:hover { text-decoration: underline; }
+    .datasheet tbody tr:hover { background: #e8eaf6; }
+    .datasheet td {
+      padding: .35rem .65rem;
+      max-width: 260px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      border-color: #e9ecef;
+    }
+    .datasheet td.actions-col { white-space: nowrap; width: 80px; }
+    .null-cell { color: #adb5bd; font-style: italic; font-size: .78rem; }
+    .pagination-bar { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+
+    /* ── SQL editor ── */
+    .sql-editor {
+      font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
+      font-size: .85rem;
+      resize: vertical;
+      background: #1e1e1e;
+      color: #d4d4d4;
+      border: 1px solid #444;
+      border-radius: .4rem;
+      padding: .75rem;
+      min-height: 130px;
+      width: 100%;
+    }
+    .sql-editor:focus { outline: 2px solid #82b1ff; border-color: #82b1ff; }
+    .result-table { font-size: .82rem; }
+    .result-table thead th { background: #f8f9fa; }
+
+    /* ── Forms ── */
+    .form-card { max-width: 680px; }
+    .field-row { display: flex; gap: .5rem; align-items: flex-start; }
+    .field-row input, .field-row select { flex: 1; min-width: 0; }
+    .field-row .btn-remove { flex-shrink: 0; }
+
+    /* ── Empty state ── */
+    .empty-state { text-align: center; padding: 3.5rem 1rem; color: #adb5bd; }
+    .empty-state .bi { font-size: 2.8rem; display: block; margin-bottom: .6rem; }
+
+    /* ── Alert ── */
+    .alert { border-left: 4px solid transparent; }
+    .alert-danger { border-left-color: #dc3545; }
+    .alert-success { border-left-color: #198754; }
+    .alert-info { border-left-color: #0dcaf0; }
+
+    /* ── Responsive ── */
+    @media(max-width:768px) {
+      .sidebar { width: 180px; }
+      :root { --sidebar-w: 180px; }
+    }
+  </style>
+</head>
+<body>
+
+<nav class="app-nav">
+  <a class="brand" href="/"><i class="bi bi-grid-3x3-gap-fill"></i>AccessWeb</a>
+  <span class="nav-sep"></span>
+  <a class="btn-nav" href="/query"><i class="bi bi-terminal"></i>SQL Editor</a>
+  <a class="btn-nav" href="/create-table"><i class="bi bi-plus-lg"></i>New Table</a>
+</nav>
+
+<div class="app-body">
+
+  <!-- ── Sidebar ── -->
+  <nav class="sidebar">
+    <div class="section-title">Tables</div>
+    {{$active := .ActiveTable}}
+    {{range .Tables}}
+    <a class="table-link {{if eq $active .}}active{{end}}" href="/t/{{.}}">
+      <i class="bi bi-table"></i>{{.}}
+    </a>
+    {{else}}
+    <div style="padding:.5rem 1rem;font-size:.78rem;color:#5c6bc0;font-style:italic;">No tables yet.</div>
+    {{end}}
+    <div class="sidebar-footer">
+      Powered by <strong>tinySQL</strong>
+    </div>
+  </nav>
+
+  <!-- ── Main content ── -->
+  <main class="main-content">
+{{end}}
+
+{{define "base_end"}}
+  </main>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
+{{end}}
+
+{{define "alert"}}
+{{if .Error}}
+<div class="alert alert-danger d-flex align-items-center gap-2" role="alert">
+  <i class="bi bi-exclamation-triangle-fill flex-shrink-0"></i><span>{{.Error}}</span>
+</div>
+{{end}}
+{{if .Success}}
+<div class="alert alert-success d-flex align-items-center gap-2" role="alert">
+  <i class="bi bi-check-circle-fill flex-shrink-0"></i><span>{{.Success}}</span>
+</div>
+{{end}}
+{{end}}
