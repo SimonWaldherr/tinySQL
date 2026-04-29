@@ -633,8 +633,10 @@ func (s *stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driv
 }
 
 type rows struct {
-	rs *engine.ResultSet
-	i  int
+	rs        *engine.ResultSet
+	cachedRS  *engine.ResultSet
+	lowerCols []string
+	i         int
 }
 
 func (r *rows) Columns() []string { return r.rs.Cols }
@@ -643,9 +645,16 @@ func (r *rows) Next(dest []driver.Value) error {
 	if r.i >= len(r.rs.Rows) {
 		return io.EOF
 	}
+	if r.cachedRS != r.rs || len(r.lowerCols) != len(r.rs.Cols) {
+		r.lowerCols = make([]string, len(r.rs.Cols))
+		for i, c := range r.rs.Cols {
+			r.lowerCols[i] = strings.ToLower(c)
+		}
+		r.cachedRS = r.rs
+	}
 	row := r.rs.Rows[r.i]
-	for i, c := range r.rs.Cols {
-		v := row[strings.ToLower(c)]
+	for i := range r.rs.Cols {
+		v := row[r.lowerCols[i]]
 		switch vv := v.(type) {
 		case nil:
 			dest[i] = nil
@@ -734,20 +743,24 @@ func bindPlaceholders(sqlStr string, args []driver.NamedValue) (string, error) {
 
 		// Numbered placeholders: $1, $2 or :1, :2 (1-based)
 		if (ch == '$' || ch == ':') && i+1 < n {
-			// fast-digit scan
 			j := i + 1
+			num := 0
+			const maxInt = int(^uint(0) >> 1)
 			for j < n {
 				c := sqlStr[j]
 				if c < '0' || c > '9' {
 					break
 				}
+				d := int(c - '0')
+				if num > (maxInt-d)/10 {
+					return "", fmt.Errorf("tinysql: invalid placeholder %c%s", ch, sqlStr[i+1:j+1])
+				}
+				num = num*10 + d
 				j++
 			}
 			if j > i+1 {
-				idxStr := sqlStr[i+1 : j]
-				num, err := strconv.Atoi(idxStr)
-				if err != nil || num <= 0 || num > len(lits) {
-					return "", fmt.Errorf("tinysql: invalid placeholder %c%s", ch, idxStr)
+				if num <= 0 || num > len(lits) {
+					return "", fmt.Errorf("tinysql: invalid placeholder %c%s", ch, sqlStr[i+1:j])
 				}
 				sb.WriteString(lits[num-1])
 				used[num-1] = true
