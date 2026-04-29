@@ -244,8 +244,11 @@ func (a *App) deleteRecord(ctx context.Context, table string, id string) error {
 	return err
 }
 
-// executeSQL runs an arbitrary SQL statement and returns column/row results.
-func (a *App) executeSQL(ctx context.Context, query string) QueryResult {
+// executeSQL runs an arbitrary SQL statement supplied by the user via the SQL
+// editor and returns column/row results. Executing user-supplied SQL is the
+// explicit purpose of this function; callers MUST ensure the request comes from
+// an authenticated session before invoking it.
+func (a *App) executeSQL(ctx context.Context, query string) QueryResult { //nolint:gosec
 	start := time.Now()
 	result := QueryResult{}
 
@@ -310,6 +313,22 @@ func (a *App) executeSQL(ctx context.Context, query string) QueryResult {
 // quoteName wraps a table or column name in double-quotes for safety.
 func quoteName(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+// isValidIdentifier checks that a name contains only alphanumerics and
+// underscores, preventing unexpected characters in SQL identifiers even when
+// combined with quoteName.
+func isValidIdentifier(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 // parseID tries to parse a record id string as an int64. Falls back to the

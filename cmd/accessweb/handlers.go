@@ -108,7 +108,7 @@ func (a *App) tableViewHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build a sorted query if requested.
-	cols, rows, err := a.tableRowsSorted(r, tableName, page, sort, sortDir)
+	cols, rows, err := a.tableRowsSorted(r, tableName, page, sort, sortDir, meta)
 	if err != nil {
 		a.serverError(w, err)
 		return
@@ -131,20 +131,33 @@ func (a *App) tableViewHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// tableRowsSorted fetches a page of rows, optionally sorted.
-func (a *App) tableRowsSorted(r *http.Request, table string, page int, sort, dir string) ([]Column, [][]string, error) {
+// tableRowsSorted fetches a page of rows, optionally sorted by a known column.
+// meta must already be validated (obtained from a.tableMeta); it is used to
+// verify the sort column name before it is interpolated into the SQL query.
+func (a *App) tableRowsSorted(r *http.Request, table string, page int, sortCol, dir string, meta TableMeta) ([]Column, [][]string, error) {
 	if page < 1 {
 		page = 1
 	}
 	offset := (page - 1) * pageSize
 
+	// Validate sort column: it must be a known column name from the verified
+	// meta, preventing unvalidated user input from reaching the SQL query.
 	orderClause := ""
-	if sort != "" {
-		orderClause = " ORDER BY " + quoteName(sort)
-		if dir == "desc" {
-			orderClause += " DESC"
-		} else {
-			orderClause += " ASC"
+	if sortCol != "" {
+		valid := false
+		for _, col := range meta.Columns {
+			if col.Name == sortCol {
+				valid = true
+				break
+			}
+		}
+		if valid {
+			orderClause = " ORDER BY " + quoteName(sortCol)
+			if dir == "desc" {
+				orderClause += " DESC"
+			} else {
+				orderClause += " ASC"
+			}
 		}
 	}
 
@@ -338,6 +351,12 @@ func (a *App) createTableHandler(w http.ResponseWriter, r *http.Request) {
 		a.render(w, "create_table", map[string]interface{}{"Error": "Table name is required."})
 		return
 	}
+	if !isValidIdentifier(tableName) {
+		a.render(w, "create_table", map[string]interface{}{
+			"Error": "Table name may only contain letters, digits, and underscores.",
+		})
+		return
+	}
 
 	colNames := r.Form["col_name"]
 	colTypes := r.Form["col_type"]
@@ -352,6 +371,12 @@ func (a *App) createTableHandler(w http.ResponseWriter, r *http.Request) {
 		name = strings.TrimSpace(name)
 		if name == "" || strings.EqualFold(name, "id") {
 			continue
+		}
+		if !isValidIdentifier(name) {
+			a.render(w, "create_table", map[string]interface{}{
+				"Error": fmt.Sprintf("Column name %q may only contain letters, digits, and underscores.", name),
+			})
+			return
 		}
 		t := "TEXT"
 		if i < len(colTypes) {
