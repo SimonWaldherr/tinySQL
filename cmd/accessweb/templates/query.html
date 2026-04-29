@@ -1,0 +1,158 @@
+{{define "query"}}
+{{template "base_start" (dict "Tables" .Tables "ActiveTable" "")}}
+
+<div class="page-hdr">
+  <h1><i class="bi bi-terminal text-primary"></i>SQL Editor</h1>
+</div>
+
+{{template "alert" .}}
+
+<div class="card">
+  <div class="card-body pb-2">
+    <textarea id="sqlInput" class="sql-editor" rows="6"
+              placeholder="SELECT * FROM your_table LIMIT 100"
+              spellcheck="false">{{.SQL}}</textarea>
+    <div class="d-flex gap-2 align-items-center mt-2 mb-1">
+      <button id="runBtn" class="btn btn-primary btn-sm" onclick="runQuery()">
+        <i class="bi bi-play-fill me-1"></i>Run <kbd class="ms-1 opacity-75" style="font-size:.65rem">Ctrl+Enter</kbd>
+      </button>
+      <button class="btn btn-outline-secondary btn-sm" onclick="clearEditor()">
+        <i class="bi bi-x-lg me-1"></i>Clear
+      </button>
+      <span id="statusMsg" class="small text-muted ms-2"></span>
+    </div>
+  </div>
+</div>
+
+<div id="resultArea"></div>
+
+<!-- No-JS fallback (hidden when JS is active) -->
+<noscript>
+  <div class="card mt-2">
+    <div class="card-body">
+      <form method="post" action="/query">
+        <textarea name="sql" class="sql-editor" rows="6"
+                  placeholder="SELECT * FROM your_table">{{.SQL}}</textarea>
+        <button type="submit" class="btn btn-primary btn-sm mt-2">Run</button>
+      </form>
+      {{with .Result}}
+      {{if .Err}}
+      <div class="alert alert-danger mt-3">{{.Err}}</div>
+      {{else if .Columns}}
+      <div class="table-responsive mt-3">
+        <table class="table table-sm result-table">
+          <thead><tr>{{range .Columns}}<th>{{.}}</th>{{end}}</tr></thead>
+          <tbody>
+            {{range .Rows}}<tr>{{range .}}<td>{{.}}</td>{{end}}</tr>{{end}}
+          </tbody>
+        </table>
+      </div>
+      {{else}}
+      <div class="alert alert-success mt-3">
+        Rows affected: {{.Affected}} ({{.Elapsed}})
+      </div>
+      {{end}}
+      {{end}}
+    </div>
+  </div>
+</noscript>
+
+<script>
+// Hide the noscript form when JS is available.
+document.addEventListener('DOMContentLoaded', function () {
+  var el = document.querySelector('noscript');
+  // noscript is not rendered in DOM so nothing to hide.
+
+  var ta = document.getElementById('sqlInput');
+  ta.addEventListener('keydown', function (e) {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      e.preventDefault();
+      runQuery();
+    }
+  });
+});
+
+function runQuery() {
+  var sql = document.getElementById('sqlInput').value.trim();
+  if (!sql) return;
+  var btn = document.getElementById('runBtn');
+  var status = document.getElementById('statusMsg');
+  btn.disabled = true;
+  status.textContent = 'Running…';
+
+  fetch('/api/query', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({sql: sql})
+  })
+  .then(function(r){ return r.json(); })
+  .then(function(data) {
+    btn.disabled = false;
+    renderResult(data);
+  })
+  .catch(function(err) {
+    btn.disabled = false;
+    status.textContent = '';
+    renderError(err.toString());
+  });
+}
+
+function clearEditor() {
+  document.getElementById('sqlInput').value = '';
+  document.getElementById('resultArea').innerHTML = '';
+  document.getElementById('statusMsg').textContent = '';
+  document.getElementById('sqlInput').focus();
+}
+
+function renderError(msg) {
+  document.getElementById('statusMsg').textContent = '';
+  document.getElementById('resultArea').innerHTML =
+    '<div class="alert alert-danger mt-1 py-2"><i class="bi bi-exclamation-triangle-fill me-2"></i>' +
+    escHtml(msg) + '</div>';
+}
+
+function renderResult(data) {
+  var status = document.getElementById('statusMsg');
+  var area = document.getElementById('resultArea');
+
+  if (data.error) {
+    status.textContent = '';
+    area.innerHTML = '<div class="alert alert-danger mt-1 py-2"><i class="bi bi-exclamation-triangle-fill me-2"></i>' +
+      escHtml(data.error) + '</div>';
+    return;
+  }
+
+  var ms = data.elapsed_ms || 0;
+  if (data.columns && data.columns.length > 0) {
+    var rows = data.rows || [];
+    status.textContent = rows.length + ' row(s) · ' + ms + ' ms';
+    var html = '<div class="card mt-1"><div class="table-responsive">' +
+      '<table class="table table-sm table-hover result-table mb-0"><thead><tr>';
+    data.columns.forEach(function(c){ html += '<th>' + escHtml(c) + '</th>'; });
+    html += '</tr></thead><tbody>';
+    rows.forEach(function(row){
+      html += '<tr>';
+      row.forEach(function(cell){
+        html += '<td>' + (cell === '' ? '<span class="null-cell">null</span>' : escHtml(cell)) + '</td>';
+      });
+      html += '</tr>';
+    });
+    html += '</tbody></table></div></div>';
+    area.innerHTML = html;
+  } else {
+    var affected = data.affected || 0;
+    status.textContent = '';
+    area.innerHTML = '<div class="alert alert-success mt-1 py-2"><i class="bi bi-check-circle-fill me-2"></i>' +
+      'OK — ' + affected + ' row(s) affected · ' + ms + ' ms</div>';
+  }
+}
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+</script>
+
+{{template "base_end" .}}
+{{end}}

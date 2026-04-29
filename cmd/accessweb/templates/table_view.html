@@ -1,0 +1,129 @@
+{{define "table_view"}}
+{{$table := .Table}}
+{{$meta  := .Meta}}
+{{$sort  := .Sort}}
+{{$dir   := .SortDir}}
+{{$page  := .Page}}
+{{$total := .TotalPages}}
+{{template "base_start" (dict "Tables" .Tables "ActiveTable" $table)}}
+
+<div class="page-hdr">
+  <h1><i class="bi bi-table text-primary"></i>{{$table}}
+    <span class="badge bg-secondary fw-normal ms-1" style="font-size:.7rem">{{$meta.RowCount}} rows</span>
+  </h1>
+  <div class="d-flex gap-2 flex-wrap">
+    {{if $meta.HasID}}
+    <a href="/t/{{$table}}/new" class="btn btn-sm btn-primary">
+      <i class="bi bi-plus-lg me-1"></i>Add Record
+    </a>
+    {{end}}
+    <button class="btn btn-sm btn-outline-danger"
+            onclick="confirmDrop('{{$table}}')"
+            title="Drop this table">
+      <i class="bi bi-trash3"></i>
+    </button>
+  </div>
+</div>
+
+{{template "alert" .}}
+
+{{if not $meta.HasID}}
+<div class="alert alert-info d-flex gap-2 align-items-center">
+  <i class="bi bi-info-circle-fill"></i>
+  <span>This table has no <strong>id</strong> column — records are <strong>read-only</strong>. Use the <a href="/query">SQL Editor</a> to modify data.</span>
+</div>
+{{end}}
+
+<div class="card">
+  <div class="table-responsive">
+    <table class="table table-hover datasheet align-middle mb-0">
+      <thead>
+        <tr>
+          {{range $col := .Cols}}
+          <th>
+            {{$newDir := "asc"}}
+            {{if and (eq $sort $col.Name) (eq $dir "asc")}}{{$newDir = "desc"}}{{end}}
+            <a href="/t/{{$table}}?sort={{$col.Name}}&dir={{$newDir}}&page=1">
+              {{$col.Name}}
+              {{if eq $sort $col.Name}}
+                {{if eq $dir "asc"}}<i class="bi bi-sort-up"></i>
+                {{else}}<i class="bi bi-sort-down"></i>{{end}}
+              {{end}}
+            </a>
+            <span class="text-muted fw-normal" style="font-size:.7rem;margin-left:.25rem">{{$col.TypeName}}</span>
+          </th>
+          {{end}}
+          {{if $meta.HasID}}<th class="actions-col text-end">Actions</th>{{end}}
+        </tr>
+      </thead>
+      <tbody>
+        {{range $row := .Rows}}
+        <tr>
+          {{range $cell := $row}}
+          <td title="{{$cell}}">
+            {{if eq $cell ""}}<span class="null-cell">null</span>{{else}}{{$cell}}{{end}}
+          </td>
+          {{end}}
+          {{if $meta.HasID}}
+          <td class="actions-col text-end">
+            {{$id := index $row 0}}
+            <a href="/t/{{$table}}/{{$id}}/edit"
+               class="btn btn-xs btn-outline-secondary py-0 px-1 me-1"
+               title="Edit"><i class="bi bi-pencil"></i></a>
+            <form method="post" action="/t/{{$table}}/{{$id}}/delete" class="d-inline"
+                  onsubmit="return confirm('Delete this record?')">
+              <button class="btn btn-xs btn-outline-danger py-0 px-1" title="Delete">
+                <i class="bi bi-trash3"></i>
+              </button>
+            </form>
+          </td>
+          {{end}}
+        </tr>
+        {{else}}
+        <tr>
+          <td colspan="{{add (len .Cols) 1}}">
+            <div class="empty-state py-4">
+              <i class="bi bi-inbox"></i>
+              <p class="mb-2 small fw-semibold">No records yet.</p>
+              {{if $meta.HasID}}
+              <a href="/t/{{$table}}/new" class="btn btn-primary btn-sm">Add First Record</a>
+              {{end}}
+            </div>
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Pagination -->
+{{if gt $total 1}}
+<nav class="pagination-bar">
+  {{if gt $page 1}}
+  <a href="/t/{{$table}}?page={{sub $page 1}}&sort={{$sort}}&dir={{$dir}}" class="btn btn-sm btn-outline-secondary">
+    <i class="bi bi-chevron-left"></i> Prev
+  </a>
+  {{end}}
+  <span class="text-muted small">Page {{$page}} / {{$total}}</span>
+  {{if lt $page $total}}
+  <a href="/t/{{$table}}?page={{add $page 1}}&sort={{$sort}}&dir={{$dir}}" class="btn btn-sm btn-outline-secondary">
+    Next <i class="bi bi-chevron-right"></i>
+  </a>
+  {{end}}
+</nav>
+{{end}}
+
+<!-- Hidden drop form -->
+<form id="dropForm" method="post" action="/drop-table/{{$table}}" class="d-none"></form>
+
+<script>
+function confirmDrop(name) {
+  if (confirm('Drop table "' + name + '"? This cannot be undone.')) {
+    document.getElementById('dropForm').submit();
+  }
+}
+</script>
+
+{{template "base_end" .}}
+{{end}}
