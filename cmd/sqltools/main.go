@@ -1482,6 +1482,87 @@ func runToolsREPL(tenant string) {
 	}
 }
 
+// toolsHandleSchema prints schema for one or all tables.
+func toolsHandleSchema(parts []string, tenant string, browser *SchemaBrowser) {
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	if len(parts) > 1 {
+		info, err := browser.DescribeTable(tenant, parts[1])
+		if err != nil {
+			fmt.Println("Error:", err)
+			return
+		}
+		fmt.Printf("Table: %s (%d rows)\n", info.Name, info.RowCount)
+		fmt.Fprintf(w, "Column\tType\tFlags\n")
+		fmt.Fprintf(w, "------\t----\t-----\n")
+		for _, col := range info.Columns {
+			flags := ""
+			if col.Primary {
+				flags += "PK "
+			}
+			if !col.Nullable {
+				flags += "NOT NULL"
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\n", col.Name, col.Type, flags)
+		}
+		w.Flush()
+	} else {
+		browser.PrintSchema(tenant, w)
+	}
+}
+
+// toolsHandleValidate validates SQL syntax and prints the result.
+func toolsHandleValidate(parts []string) {
+	if len(parts) < 2 {
+		fmt.Println("Usage: .validate <sql>")
+		return
+	}
+	sql := strings.Join(parts[1:], " ")
+	result := ValidateSQL(sql)
+	if result.Valid {
+		fmt.Printf("✓ Valid %s statement\n", result.SQLType)
+		for _, w := range result.Warnings {
+			fmt.Printf("⚠ %s\n", w)
+		}
+	} else {
+		fmt.Printf("✗ Invalid: %s\n", result.Error)
+	}
+}
+
+// toolsHandleExplain prints the query plan for a SQL statement.
+func toolsHandleExplain(parts []string) {
+	if len(parts) < 2 {
+		fmt.Println("Usage: .explain <sql>")
+		return
+	}
+	sql := strings.Join(parts[1:], " ")
+	plan, err := ExplainQuery(sql)
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	PrintPlan(plan, w)
+}
+
+// toolsHandleTemplate prints details of a named template.
+func toolsHandleTemplate(parts []string) {
+	if len(parts) < 2 {
+		fmt.Println("Usage: .template <name>")
+		return
+	}
+	name := parts[1]
+	for _, t := range CommonTemplates() {
+		if t.Name == name {
+			fmt.Printf("Name: %s\n", t.Name)
+			fmt.Printf("Description: %s\n", t.Description)
+			fmt.Printf("SQL: %s\n", t.SQL)
+			fmt.Printf("Parameters: %s\n", strings.Join(t.Parameters, ", "))
+			return
+		}
+	}
+	fmt.Printf("Template %q not found\n", name)
+}
+
 func handleToolsCommand(cmd string, db *tsql.DB, tenant string, history *QueryHistory, beautifier *SQLBeautifier, browser *SchemaBrowser) {
 	parts := strings.Fields(cmd)
 	if len(parts) == 0 {
@@ -1514,30 +1595,7 @@ Commands:
 		}
 
 	case ".schema":
-		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		if len(parts) > 1 {
-			info, err := browser.DescribeTable(tenant, parts[1])
-			if err != nil {
-				fmt.Println("Error:", err)
-				return
-			}
-			fmt.Printf("Table: %s (%d rows)\n", info.Name, info.RowCount)
-			fmt.Fprintf(w, "Column\tType\tFlags\n")
-			fmt.Fprintf(w, "------\t----\t-----\n")
-			for _, col := range info.Columns {
-				flags := ""
-				if col.Primary {
-					flags += "PK "
-				}
-				if !col.Nullable {
-					flags += "NOT NULL"
-				}
-				fmt.Fprintf(w, "%s\t%s\t%s\n", col.Name, col.Type, flags)
-			}
-			w.Flush()
-		} else {
-			browser.PrintSchema(tenant, w)
-		}
+		toolsHandleSchema(parts, tenant, browser)
 
 	case ".history":
 		n := 10
@@ -1556,34 +1614,10 @@ Commands:
 		fmt.Println(beautifier.Beautify(sql))
 
 	case ".validate":
-		if len(parts) < 2 {
-			fmt.Println("Usage: .validate <sql>")
-			return
-		}
-		sql := strings.Join(parts[1:], " ")
-		result := ValidateSQL(sql)
-		if result.Valid {
-			fmt.Printf("✓ Valid %s statement\n", result.SQLType)
-			for _, w := range result.Warnings {
-				fmt.Printf("⚠ %s\n", w)
-			}
-		} else {
-			fmt.Printf("✗ Invalid: %s\n", result.Error)
-		}
+		toolsHandleValidate(parts)
 
 	case ".explain":
-		if len(parts) < 2 {
-			fmt.Println("Usage: .explain <sql>")
-			return
-		}
-		sql := strings.Join(parts[1:], " ")
-		plan, err := ExplainQuery(sql)
-		if err != nil {
-			fmt.Println("Error:", err)
-			return
-		}
-		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		PrintPlan(plan, w)
+		toolsHandleExplain(parts)
 
 	case ".templates":
 		for _, t := range CommonTemplates() {
@@ -1591,21 +1625,7 @@ Commands:
 		}
 
 	case ".template":
-		if len(parts) < 2 {
-			fmt.Println("Usage: .template <name>")
-			return
-		}
-		name := parts[1]
-		for _, t := range CommonTemplates() {
-			if t.Name == name {
-				fmt.Printf("Name: %s\n", t.Name)
-				fmt.Printf("Description: %s\n", t.Description)
-				fmt.Printf("SQL: %s\n", t.SQL)
-				fmt.Printf("Parameters: %s\n", strings.Join(t.Parameters, ", "))
-				return
-			}
-		}
-		fmt.Printf("Template %q not found\n", name)
+		toolsHandleTemplate(parts)
 
 	default:
 		fmt.Printf("Unknown command: %s (type .help for commands)\n", parts[0])

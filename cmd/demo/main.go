@@ -352,6 +352,107 @@ func runInteractive(db *sql.DB, timer bool, output string) {
 }
 
 // handleDotCommand processes REPL dot-commands.
+// demoListAllTableNames returns all table names from the database.
+func demoListAllTableNames(db *sql.DB) []string {
+	rows, err := db.Query(`SELECT name FROM sys.tables ORDER BY name`)
+	if err != nil {
+		fmt.Println("Error:", err)
+		return nil
+	}
+	defer rows.Close()
+	var tables []string
+	for rows.Next() {
+		var n string
+		_ = rows.Scan(&n)
+		tables = append(tables, n)
+	}
+	return tables
+}
+
+// handleDotSchema handles the .schema dot command.
+func handleDotSchema(db *sql.DB, parts []string) {
+	if len(parts) > 1 {
+		printTableSchema(db, parts[1])
+		return
+	}
+	for _, t := range demoListAllTableNames(db) {
+		printTableSchema(db, t)
+		fmt.Println()
+	}
+}
+
+// handleDotCount handles the .count dot command.
+func handleDotCount(db *sql.DB, parts []string) {
+	tables := demoListAllTableNames(db)
+	if len(parts) > 1 {
+		tables = parts[1:]
+	}
+	for _, t := range tables {
+		printTableCount(db, t)
+	}
+}
+
+// handleDotImport handles the .import dot command.
+func handleDotImport(db *sql.DB, parts []string) {
+	if len(parts) < 2 {
+		fmt.Println("Usage: .import FILE [TABLE]")
+		return
+	}
+	filePath := parts[1]
+	tableName := ""
+	if len(parts) > 2 {
+		tableName = parts[2]
+	} else {
+		base := filepath.Base(filePath)
+		tableName = strings.TrimSuffix(base, filepath.Ext(base))
+	}
+	if err := importFile(db, filePath, tableName); err != nil {
+		fmt.Fprintln(os.Stderr, "Import error:", err)
+	} else {
+		fmt.Printf("Imported into table '%s'\n", tableName)
+	}
+}
+
+// handleDotDump handles the .dump dot command.
+func handleDotDump(db *sql.DB, parts []string) {
+	if len(parts) > 1 {
+		dumpTable(db, parts[1])
+		return
+	}
+	for _, t := range demoListAllTableNames(db) {
+		dumpTable(db, t)
+	}
+}
+
+// handleDotOutput handles the .output dot command.
+func handleDotOutput(exec *executor, parts []string) {
+	if len(parts) < 2 {
+		fmt.Printf("Current output format: %s\n", exec.output)
+		return
+	}
+	switch parts[1] {
+	case "table", "csv", "json":
+		exec.output = parts[1]
+		fmt.Printf("Output format set to: %s\n", exec.output)
+	default:
+		fmt.Println("Unknown format. Use: table, csv, json")
+	}
+}
+
+// handleDotTimer handles the .timer dot command.
+func handleDotTimer(exec *executor, parts []string) {
+	if len(parts) < 2 {
+		if exec.timer {
+			fmt.Println("Timer: on")
+		} else {
+			fmt.Println("Timer: off")
+		}
+		return
+	}
+	exec.timer = (parts[1] == "on")
+	fmt.Printf("Timer: %s\n", parts[1])
+}
+
 func handleDotCommand(db *sql.DB, exec *executor, cmd string) {
 	parts := strings.Fields(cmd)
 	if len(parts) == 0 {
@@ -387,112 +488,22 @@ func handleDotCommand(db *sql.DB, exec *executor, cmd string) {
 		rows.Close()
 
 	case ".schema":
-		if len(parts) > 1 {
-			printTableSchema(db, parts[1])
-		} else {
-			rows, err := db.Query(`SELECT name FROM sys.tables ORDER BY name`)
-			if err != nil {
-				fmt.Println("Error:", err)
-				return
-			}
-			var tables []string
-			for rows.Next() {
-				var n string
-				_ = rows.Scan(&n)
-				tables = append(tables, n)
-			}
-			rows.Close()
-			for _, t := range tables {
-				printTableSchema(db, t)
-				fmt.Println()
-			}
-		}
+		handleDotSchema(db, parts)
 
 	case ".count":
-		if len(parts) > 1 {
-			printTableCount(db, parts[1])
-		} else {
-			rows, err := db.Query(`SELECT name FROM sys.tables ORDER BY name`)
-			if err != nil {
-				fmt.Println("Error:", err)
-				return
-			}
-			var tables []string
-			for rows.Next() {
-				var n string
-				_ = rows.Scan(&n)
-				tables = append(tables, n)
-			}
-			rows.Close()
-			for _, t := range tables {
-				printTableCount(db, t)
-			}
-		}
+		handleDotCount(db, parts)
 
 	case ".import":
-		if len(parts) < 2 {
-			fmt.Println("Usage: .import FILE [TABLE]")
-			return
-		}
-		filePath := parts[1]
-		tableName := ""
-		if len(parts) > 2 {
-			tableName = parts[2]
-		} else {
-			base := filepath.Base(filePath)
-			tableName = strings.TrimSuffix(base, filepath.Ext(base))
-		}
-		if err := importFile(db, filePath, tableName); err != nil {
-			fmt.Fprintln(os.Stderr, "Import error:", err)
-		} else {
-			fmt.Printf("Imported into table '%s'\n", tableName)
-		}
+		handleDotImport(db, parts)
 
 	case ".dump":
-		if len(parts) > 1 {
-			dumpTable(db, parts[1])
-		} else {
-			rows, err := db.Query(`SELECT name FROM sys.tables ORDER BY name`)
-			if err != nil {
-				fmt.Println("Error:", err)
-				return
-			}
-			var tables []string
-			for rows.Next() {
-				var n string
-				_ = rows.Scan(&n)
-				tables = append(tables, n)
-			}
-			rows.Close()
-			for _, t := range tables {
-				dumpTable(db, t)
-			}
-		}
+		handleDotDump(db, parts)
 
 	case ".output":
-		if len(parts) < 2 {
-			fmt.Printf("Current output format: %s\n", exec.output)
-			return
-		}
-		switch parts[1] {
-		case "table", "csv", "json":
-			exec.output = parts[1]
-			fmt.Printf("Output format set to: %s\n", exec.output)
-		default:
-			fmt.Println("Unknown format. Use: table, csv, json")
-		}
+		handleDotOutput(exec, parts)
 
 	case ".timer":
-		if len(parts) < 2 {
-			if exec.timer {
-				fmt.Println("Timer: on")
-			} else {
-				fmt.Println("Timer: off")
-			}
-			return
-		}
-		exec.timer = (parts[1] == "on")
-		fmt.Printf("Timer: %s\n", parts[1])
+		handleDotTimer(exec, parts)
 
 	default:
 		fmt.Printf("Unknown command: %s (type .help)\n", parts[0])

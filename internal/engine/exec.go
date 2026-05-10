@@ -1200,22 +1200,14 @@ func executeSimpleJoinFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error)
 }
 
 func buildSimpleJoinPlan(env ExecEnv, s *Select) (*simpleJoinPlan, bool, error) {
-	if s.Distinct || len(s.DistinctOn) > 0 || len(s.CTEs) > 0 || len(s.GroupBy) > 0 ||
-		s.Having != nil || s.Union != nil || len(s.OrderBy) > 0 || s.Limit != nil || s.Offset != nil ||
-		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil || len(s.Joins) != 1 ||
-		s.Joins[0].Type != JoinInner || s.Joins[0].Right.Table == "" ||
-		s.Joins[0].Right.Subquery != nil || s.Joins[0].Right.TableFunc != nil {
+	if !simpleJoinSelectEligible(s) {
 		return nil, false, nil
 	}
 	if anyAggInSelect(s.Projs) || anyWindowInSelect(s.Projs) || !isSimpleRawPredicate(s.Where) {
 		return nil, false, nil
 	}
 
-	left, err := env.db.Get(env.tenant, s.From.Table)
-	if err != nil {
-		return nil, true, err
-	}
-	right, err := env.db.Get(env.tenant, s.Joins[0].Right.Table)
+	left, right, err := loadSimpleJoinTables(env, s)
 	if err != nil {
 		return nil, true, err
 	}
@@ -1227,27 +1219,9 @@ func buildSimpleJoinPlan(env ExecEnv, s *Select) (*simpleJoinPlan, bool, error) 
 		return nil, false, nil
 	}
 
-	projs := make([]simpleProjection, 0, len(s.Projs))
-	outputCols := make([]string, 0, len(s.Projs))
-	for i, it := range s.Projs {
-		if it.Star || !isSimpleRawExpr(it.Expr) || !simpleJoinExprResolvable(it.Expr, leftIndex, rightIndex) {
-			return nil, false, nil
-		}
-		name := projName(it, i)
-		key := strings.ToLower(name)
-		side, colIdx := -1, -1
-		if ref, ok := it.Expr.(*VarRef); ok {
-			refName := strings.ToLower(ref.Name)
-			if li, lok := leftIndex[refName]; lok {
-				if _, ambig := rightIndex[refName]; !ambig {
-					side, colIdx = 0, li
-				}
-			} else if ri, rok := rightIndex[refName]; rok {
-				side, colIdx = 1, ri
-			}
-		}
-		projs = append(projs, simpleProjection{name: name, key: key, side: side, colIdx: colIdx, expr: it.Expr})
-		outputCols = append(outputCols, name)
+	projs, outputCols, ok := buildSimpleJoinProjections(s.Projs, leftIndex, rightIndex)
+	if !ok {
+		return nil, false, nil
 	}
 	if !simpleJoinExprResolvable(s.Where, leftIndex, rightIndex) {
 		return nil, false, nil
@@ -1264,6 +1238,64 @@ func buildSimpleJoinPlan(env ExecEnv, s *Select) (*simpleJoinPlan, bool, error) 
 		projs:      projs,
 		outputCols: outputCols,
 	}, true, nil
+}
+
+func simpleJoinSelectEligible(s *Select) bool {
+	return !(s.Distinct || len(s.DistinctOn) > 0 || len(s.CTEs) > 0 || len(s.GroupBy) > 0 ||
+		s.Having != nil || s.Union != nil || len(s.OrderBy) > 0 || s.Limit != nil || s.Offset != nil ||
+		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil || len(s.Joins) != 1 ||
+		s.Joins[0].Type != JoinInner || s.Joins[0].Right.Table == "" ||
+		s.Joins[0].Right.Subquery != nil || s.Joins[0].Right.TableFunc != nil)
+}
+
+func loadSimpleJoinTables(env ExecEnv, s *Select) (*storage.Table, *storage.Table, error) {
+	left, err := env.db.Get(env.tenant, s.From.Table)
+	if err != nil {
+		return nil, nil, err
+	}
+	right, err := env.db.Get(env.tenant, s.Joins[0].Right.Table)
+	if err != nil {
+		return nil, nil, err
+	}
+	return left, right, nil
+}
+
+func buildSimpleJoinProjections(items []SelectItem, leftIndex, rightIndex map[string]int) ([]simpleProjection, []string, bool) {
+	projs := make([]simpleProjection, 0, len(items))
+	outputCols := make([]string, 0, len(items))
+	for i, it := range items {
+		if it.Star || !isSimpleRawExpr(it.Expr) || !simpleJoinExprResolvable(it.Expr, leftIndex, rightIndex) {
+			return nil, nil, false
+		}
+		name := projName(it, i)
+		side, colIdx := resolveSimpleJoinProjectionRef(it.Expr, leftIndex, rightIndex)
+		projs = append(projs, simpleProjection{
+			name:   name,
+			key:    strings.ToLower(name),
+			side:   side,
+			colIdx: colIdx,
+			expr:   it.Expr,
+		})
+		outputCols = append(outputCols, name)
+	}
+	return projs, outputCols, true
+}
+
+func resolveSimpleJoinProjectionRef(e Expr, leftIndex, rightIndex map[string]int) (int, int) {
+	ref, ok := e.(*VarRef)
+	if !ok {
+		return -1, -1
+	}
+	refName := strings.ToLower(ref.Name)
+	if li, lok := leftIndex[refName]; lok {
+		if _, ambig := rightIndex[refName]; !ambig {
+			return 0, li
+		}
+	}
+	if ri, rok := rightIndex[refName]; rok {
+		return 1, ri
+	}
+	return -1, -1
 }
 
 func simpleJoinKeys(on Expr, leftIndex, rightIndex map[string]int) (int, int, bool) {
@@ -1370,130 +1402,157 @@ func evalJoinRawExpr(plan *simpleJoinPlan, left, right []any, e Expr) (any, erro
 	case *Literal:
 		return ex.Val, nil
 	case *VarRef:
-		name := strings.ToLower(ex.Name)
-		if i, ok := plan.leftIndex[name]; ok {
-			if _, ambiguous := plan.rightIndex[name]; ambiguous {
-				return nil, fmt.Errorf("ambiguous column %q", ex.Name)
-			}
-			return left[i], nil
-		}
-		if i, ok := plan.rightIndex[name]; ok {
-			return right[i], nil
-		}
-		return nil, fmt.Errorf("unknown column %q", ex.Name)
+		return evalJoinRawVarRef(plan, left, right, ex)
 	case *IsNull:
-		v, err := evalJoinRawExpr(plan, left, right, ex.Expr)
-		if err != nil {
-			return nil, err
-		}
-		is := isNull(v)
-		if ex.Negate {
-			return !is, nil
-		}
-		return is, nil
+		return evalJoinRawIsNull(plan, left, right, ex)
 	case *Unary:
-		v, err := evalJoinRawExpr(plan, left, right, ex.Expr)
-		if err != nil {
-			return nil, err
-		}
-		return evalRawUnary(&simpleSelectPlan{}, nil, &Unary{Op: ex.Op, Expr: &Literal{Val: v}})
+		return evalJoinRawUnary(plan, left, right, ex)
 	case *Binary:
 		return evalJoinRawBinary(plan, left, right, ex)
 	case *LikeExpr:
-		val, err := evalJoinRawExpr(plan, left, right, ex.Expr)
-		if err != nil {
-			return nil, err
-		}
-		patVal, err := evalJoinRawExpr(plan, left, right, ex.Pattern)
-		if err != nil {
-			return nil, err
-		}
-		str, ok := val.(string)
-		if !ok {
-			str = fmt.Sprintf("%v", val)
-		}
-		pattern, ok := patVal.(string)
-		if !ok {
-			pattern = fmt.Sprintf("%v", patVal)
-		}
-		var matched bool
-		if ex.GlobStyle {
-			if ex.CaseInsensitive {
-				matched = matchGlobPattern(strings.ToLower(str), strings.ToLower(pattern))
-			} else {
-				matched = matchGlobPattern(str, pattern)
-			}
-		} else {
-			escapeChar := '\\'
-			if ex.Escape != nil {
-				escVal, err := evalJoinRawExpr(plan, left, right, ex.Escape)
-				if err != nil {
-					return nil, err
-				}
-				if escStr, ok := escVal.(string); ok && len(escStr) == 1 {
-					escapeChar = rune(escStr[0])
-				}
-			}
-			if ex.CaseInsensitive {
-				matched = matchLikePattern(strings.ToLower(str), strings.ToLower(pattern), escapeChar)
-			} else {
-				matched = matchLikePattern(str, pattern, escapeChar)
-			}
-		}
-		if ex.Negate {
-			return !matched, nil
-		}
-		return matched, nil
+		return evalJoinRawLike(plan, left, right, ex)
 	case *RegexpExpr:
-		val, err := evalJoinRawExpr(plan, left, right, ex.Expr)
-		if err != nil {
-			return nil, err
-		}
-		patVal, err := evalJoinRawExpr(plan, left, right, ex.Pattern)
-		if err != nil {
-			return nil, err
-		}
-		if val == nil || patVal == nil {
-			return false, nil
-		}
-		str := fmt.Sprintf("%v", val)
-		pat := fmt.Sprintf("%v", patVal)
-		if ex.SimilarTo {
-			pat = similarToRegexp(pat)
-		}
-		re, err := regexp.Compile(pat)
-		if err != nil {
-			return nil, fmt.Errorf("REGEXP: invalid pattern %q: %v", pat, err)
-		}
-		matched := re.MatchString(str)
-		if ex.Negate {
-			return !matched, nil
-		}
-		return matched, nil
+		return evalJoinRawRegexp(plan, left, right, ex)
 	case *InExpr:
-		val, err := evalJoinRawExpr(plan, left, right, ex.Expr)
-		if err != nil {
-			return nil, err
-		}
-		for _, valExpr := range ex.Values {
-			listVal, err := evalJoinRawExpr(plan, left, right, valExpr)
-			if err != nil {
-				return nil, err
-			}
-			if rawEqual(val, listVal) {
-				if ex.Negate {
-					return false, nil
-				}
-				return true, nil
-			}
-		}
-		if ex.Negate {
-			return true, nil
-		}
-		return false, nil
+		return evalJoinRawIn(plan, left, right, ex)
 	default:
 		return nil, fmt.Errorf("unsupported join fast-path expression %T", e)
 	}
+}
+
+func evalJoinRawVarRef(plan *simpleJoinPlan, left, right []any, ex *VarRef) (any, error) {
+	name := strings.ToLower(ex.Name)
+	if i, ok := plan.leftIndex[name]; ok {
+		if _, ambiguous := plan.rightIndex[name]; ambiguous {
+			return nil, fmt.Errorf("ambiguous column %q", ex.Name)
+		}
+		return left[i], nil
+	}
+	if i, ok := plan.rightIndex[name]; ok {
+		return right[i], nil
+	}
+	return nil, fmt.Errorf("unknown column %q", ex.Name)
+}
+
+func evalJoinRawIsNull(plan *simpleJoinPlan, left, right []any, ex *IsNull) (any, error) {
+	v, err := evalJoinRawExpr(plan, left, right, ex.Expr)
+	if err != nil {
+		return nil, err
+	}
+	is := isNull(v)
+	if ex.Negate {
+		return !is, nil
+	}
+	return is, nil
+}
+
+func evalJoinRawUnary(plan *simpleJoinPlan, left, right []any, ex *Unary) (any, error) {
+	v, err := evalJoinRawExpr(plan, left, right, ex.Expr)
+	if err != nil {
+		return nil, err
+	}
+	return evalRawUnary(&simpleSelectPlan{}, nil, &Unary{Op: ex.Op, Expr: &Literal{Val: v}})
+}
+
+func evalJoinRawLike(plan *simpleJoinPlan, left, right []any, ex *LikeExpr) (any, error) {
+	val, err := evalJoinRawExpr(plan, left, right, ex.Expr)
+	if err != nil {
+		return nil, err
+	}
+	patVal, err := evalJoinRawExpr(plan, left, right, ex.Pattern)
+	if err != nil {
+		return nil, err
+	}
+	str, ok := val.(string)
+	if !ok {
+		str = fmt.Sprintf("%v", val)
+	}
+	pattern, ok := patVal.(string)
+	if !ok {
+		pattern = fmt.Sprintf("%v", patVal)
+	}
+	matched, err := evalJoinRawLikeMatch(plan, left, right, ex, str, pattern)
+	if err != nil {
+		return nil, err
+	}
+	if ex.Negate {
+		return !matched, nil
+	}
+	return matched, nil
+}
+
+func evalJoinRawLikeMatch(plan *simpleJoinPlan, left, right []any, ex *LikeExpr, str, pattern string) (bool, error) {
+	if ex.GlobStyle {
+		if ex.CaseInsensitive {
+			return matchGlobPattern(strings.ToLower(str), strings.ToLower(pattern)), nil
+		}
+		return matchGlobPattern(str, pattern), nil
+	}
+	escapeChar := '\\'
+	if ex.Escape != nil {
+		escVal, err := evalJoinRawExpr(plan, left, right, ex.Escape)
+		if err != nil {
+			return false, err
+		}
+		if escStr, ok := escVal.(string); ok && len(escStr) == 1 {
+			escapeChar = rune(escStr[0])
+		}
+	}
+	if ex.CaseInsensitive {
+		return matchLikePattern(strings.ToLower(str), strings.ToLower(pattern), escapeChar), nil
+	}
+	return matchLikePattern(str, pattern, escapeChar), nil
+}
+
+func evalJoinRawRegexp(plan *simpleJoinPlan, left, right []any, ex *RegexpExpr) (any, error) {
+	val, err := evalJoinRawExpr(plan, left, right, ex.Expr)
+	if err != nil {
+		return nil, err
+	}
+	patVal, err := evalJoinRawExpr(plan, left, right, ex.Pattern)
+	if err != nil {
+		return nil, err
+	}
+	if val == nil || patVal == nil {
+		return false, nil
+	}
+	str := fmt.Sprintf("%v", val)
+	pat := fmt.Sprintf("%v", patVal)
+	if ex.SimilarTo {
+		pat = similarToRegexp(pat)
+	}
+	re, err := regexp.Compile(pat)
+	if err != nil {
+		return nil, fmt.Errorf("REGEXP: invalid pattern %q: %v", pat, err)
+	}
+	matched := re.MatchString(str)
+	if ex.Negate {
+		return !matched, nil
+	}
+	return matched, nil
+}
+
+func evalJoinRawIn(plan *simpleJoinPlan, left, right []any, ex *InExpr) (any, error) {
+	val, err := evalJoinRawExpr(plan, left, right, ex.Expr)
+	if err != nil {
+		return nil, err
+	}
+	for _, valExpr := range ex.Values {
+		listVal, err := evalJoinRawExpr(plan, left, right, valExpr)
+		if err != nil {
+			return nil, err
+		}
+		if rawEqual(val, listVal) {
+			if ex.Negate {
+				return false, nil
+			}
+			return true, nil
+		}
+	}
+	if ex.Negate {
+		return true, nil
+	}
+	return false, nil
 }
 
 func evalJoinRawBinary(plan *simpleJoinPlan, left, right []any, ex *Binary) (any, error) {
@@ -1625,9 +1684,7 @@ func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 }
 
 func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, bool, error) {
-	if s.Distinct || len(s.DistinctOn) > 0 || len(s.CTEs) > 0 || len(s.Joins) > 0 ||
-		s.Having != nil || s.Union != nil || len(s.OrderBy) > 0 || s.Limit != nil || s.Offset != nil ||
-		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil || len(s.GroupBy) != 1 {
+	if !simpleAggregateEligibleSelect(s) {
 		return nil, false, nil
 	}
 	groupRef, ok := s.GroupBy[0].(*VarRef)
@@ -1648,38 +1705,11 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 		return nil, true, fmt.Errorf("unknown column %q", groupRef.Name)
 	}
 
-	projs := make([]simpleAggregateProjection, 0, len(s.Projs))
-	outputCols := make([]string, 0, len(s.Projs))
-	hasCount := false
-	for i, it := range s.Projs {
-		if it.Star {
-			return nil, false, nil
-		}
-		name := projName(it, i)
-		if ref, ok := it.Expr.(*VarRef); ok {
-			refCol, ok := colIndex[strings.ToLower(ref.Name)]
-			if !ok {
-				return nil, true, fmt.Errorf("unknown column %q", ref.Name)
-			}
-			if refCol != groupCol {
-				return nil, false, nil
-			}
-			projs = append(projs, simpleAggregateProjection{name: name, groupCol: true})
-			outputCols = append(outputCols, name)
-			continue
-		}
-		arg, ok := simpleCountArg(it.Expr)
-		if !ok {
-			return nil, false, nil
-		}
-		if arg != nil && !isSimpleRawExpr(arg) {
-			return nil, false, nil
-		}
-		hasCount = true
-		projs = append(projs, simpleAggregateProjection{name: name, countArg: arg})
-		outputCols = append(outputCols, name)
+	projs, outputCols, hasCount, eligible, err := buildSimpleAggregateProjections(s, colIndex, groupCol)
+	if err != nil {
+		return nil, true, err
 	}
-	if !hasCount {
+	if !eligible || !hasCount {
 		return nil, false, nil
 	}
 	return &simpleAggregatePlan{
@@ -1691,6 +1721,57 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 		projs:      projs,
 		outputCols: outputCols,
 	}, true, nil
+}
+
+func simpleAggregateEligibleSelect(s *Select) bool {
+	return !(s.Distinct || len(s.DistinctOn) > 0 || len(s.CTEs) > 0 || len(s.Joins) > 0 ||
+		s.Having != nil || s.Union != nil || len(s.OrderBy) > 0 || s.Limit != nil || s.Offset != nil ||
+		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil || len(s.GroupBy) != 1)
+}
+
+func buildSimpleAggregateProjections(s *Select, colIndex map[string]int, groupCol int) ([]simpleAggregateProjection, []string, bool, bool, error) {
+	projs := make([]simpleAggregateProjection, 0, len(s.Projs))
+	outputCols := make([]string, 0, len(s.Projs))
+	hasCount := false
+
+	for i, it := range s.Projs {
+		proj, name, isCount, eligible, err := buildSimpleAggregateProjection(it, i, colIndex, groupCol)
+		if err != nil {
+			return nil, nil, false, false, err
+		}
+		if !eligible {
+			return nil, nil, false, false, nil
+		}
+		if isCount {
+			hasCount = true
+		}
+		projs = append(projs, proj)
+		outputCols = append(outputCols, name)
+	}
+	return projs, outputCols, hasCount, true, nil
+}
+
+func buildSimpleAggregateProjection(it SelectItem, idx int, colIndex map[string]int, groupCol int) (simpleAggregateProjection, string, bool, bool, error) {
+	if it.Star {
+		return simpleAggregateProjection{}, "", false, false, nil
+	}
+	name := projName(it, idx)
+	if ref, ok := it.Expr.(*VarRef); ok {
+		refCol, ok := colIndex[strings.ToLower(ref.Name)]
+		if !ok {
+			return simpleAggregateProjection{}, "", false, false, fmt.Errorf("unknown column %q", ref.Name)
+		}
+		if refCol != groupCol {
+			return simpleAggregateProjection{}, "", false, false, nil
+		}
+		return simpleAggregateProjection{name: name, groupCol: true}, name, false, true, nil
+	}
+
+	arg, ok := simpleCountArg(it.Expr)
+	if !ok || (arg != nil && !isSimpleRawExpr(arg)) {
+		return simpleAggregateProjection{}, "", false, false, nil
+	}
+	return simpleAggregateProjection{name: name, countArg: arg}, name, true, true, nil
 }
 
 func simpleCountArg(e Expr) (Expr, bool) {
@@ -1928,15 +2009,7 @@ func compareOrderedValue(a, b any, desc bool) int {
 }
 
 func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, error) {
-	if s.Distinct || len(s.DistinctOn) > 0 || len(s.CTEs) > 0 || len(s.Joins) > 0 ||
-		len(s.GroupBy) > 0 || s.Having != nil || s.Union != nil ||
-		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil {
-		return nil, false, nil
-	}
-	if strings.Contains(strings.ToLower(s.From.Table), ".") {
-		return nil, false, nil
-	}
-	if anyAggInSelect(s.Projs) || anyWindowInSelect(s.Projs) {
+	if !simpleSelectEligible(s) {
 		return nil, false, nil
 	}
 
@@ -1946,39 +2019,13 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 	}
 	colIndex := simpleColumnIndex(table, aliasOr(s.From))
 
-	projs := make([]simpleProjection, 0, len(s.Projs))
-	outputCols := make([]string, 0, len(s.Projs))
-	for i, it := range s.Projs {
-		if it.Star || !isSimpleRawExpr(it.Expr) {
-			return nil, false, nil
-		}
-		name := projName(it, i)
-		if name == "" {
-			return nil, false, nil
-		}
-		key := strings.ToLower(name)
-		colIdx := -1
-		if ref, ok := it.Expr.(*VarRef); ok {
-			if idx, ok2 := colIndex[strings.ToLower(ref.Name)]; ok2 {
-				colIdx = idx
-			}
-		}
-		projs = append(projs, simpleProjection{name: name, key: key, side: -1, colIdx: colIdx, expr: it.Expr})
-		outputCols = append(outputCols, name)
+	projs, outputCols, ok := buildSimpleSelectProjections(s.Projs, colIndex)
+	if !ok {
+		return nil, false, nil
 	}
-	orderExprs := make([]Expr, 0, len(s.OrderBy))
-	for _, oi := range s.OrderBy {
-		foundProjection := false
-		for _, p := range projs {
-			if strings.EqualFold(p.name, oi.Col) {
-				foundProjection = true
-				orderExprs = append(orderExprs, p.expr)
-				break
-			}
-		}
-		if !foundProjection {
-			return nil, false, nil
-		}
+	orderExprs, ok := buildSimpleSelectOrderExprs(s.OrderBy, projs)
+	if !ok {
+		return nil, false, nil
 	}
 	if !isSimpleRawPredicate(s.Where) {
 		return nil, false, nil
@@ -1996,6 +2043,76 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 		offset:     s.Offset,
 		outputCols: outputCols,
 	}, true, nil
+}
+
+func simpleSelectEligible(s *Select) bool {
+	if s.Distinct || len(s.DistinctOn) > 0 || len(s.CTEs) > 0 || len(s.Joins) > 0 ||
+		len(s.GroupBy) > 0 || s.Having != nil || s.Union != nil ||
+		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil {
+		return false
+	}
+	if strings.Contains(strings.ToLower(s.From.Table), ".") {
+		return false
+	}
+	return !(anyAggInSelect(s.Projs) || anyWindowInSelect(s.Projs))
+}
+
+func buildSimpleSelectProjections(items []SelectItem, colIndex map[string]int) ([]simpleProjection, []string, bool) {
+	projs := make([]simpleProjection, 0, len(items))
+	outputCols := make([]string, 0, len(items))
+	for i, it := range items {
+		proj, ok := buildSimpleSelectProjection(it, i, colIndex)
+		if !ok {
+			return nil, nil, false
+		}
+		projs = append(projs, proj)
+		outputCols = append(outputCols, proj.name)
+	}
+	return projs, outputCols, true
+}
+
+func buildSimpleSelectProjection(it SelectItem, idx int, colIndex map[string]int) (simpleProjection, bool) {
+	if it.Star || !isSimpleRawExpr(it.Expr) {
+		return simpleProjection{}, false
+	}
+	name := projName(it, idx)
+	if name == "" {
+		return simpleProjection{}, false
+	}
+	colIdx := -1
+	if ref, ok := it.Expr.(*VarRef); ok {
+		if idx, ok2 := colIndex[strings.ToLower(ref.Name)]; ok2 {
+			colIdx = idx
+		}
+	}
+	return simpleProjection{
+		name:   name,
+		key:    strings.ToLower(name),
+		side:   -1,
+		colIdx: colIdx,
+		expr:   it.Expr,
+	}, true
+}
+
+func buildSimpleSelectOrderExprs(orderBy []OrderItem, projs []simpleProjection) ([]Expr, bool) {
+	orderExprs := make([]Expr, 0, len(orderBy))
+	for _, oi := range orderBy {
+		expr, ok := findSimpleSelectOrderExpr(oi.Col, projs)
+		if !ok {
+			return nil, false
+		}
+		orderExprs = append(orderExprs, expr)
+	}
+	return orderExprs, true
+}
+
+func findSimpleSelectOrderExpr(col string, projs []simpleProjection) (Expr, bool) {
+	for _, p := range projs {
+		if strings.EqualFold(p.name, col) {
+			return p.expr, true
+		}
+	}
+	return nil, false
 }
 
 func simpleColumnIndex(t *storage.Table, alias string) map[string]int {
@@ -2121,193 +2238,222 @@ func buildRawFilter(colIndex map[string]int, e Expr) func([]any) (bool, error) {
 	}
 	switch ex := e.(type) {
 	case *VarRef:
-		colIdx, ok := colIndex[strings.ToLower(ex.Name)]
-		if !ok {
-			return nil
-		}
-		return func(raw []any) (bool, error) { return truthy(raw[colIdx]), nil }
-
+		return buildRawFilterVarRef(colIndex, ex)
 	case *Unary:
-		if ex.Op == "NOT" {
-			inner := buildRawFilter(colIndex, ex.Expr)
-			if inner == nil {
-				return nil
-			}
-			return func(raw []any) (bool, error) {
-				b, err := inner(raw)
-				return !b, err
-			}
-		}
-		return nil
-
+		return buildRawFilterUnary(colIndex, ex)
 	case *IsNull:
-		innerRef, ok := ex.Expr.(*VarRef)
-		if !ok {
-			return nil
-		}
-		colIdx, ok := colIndex[strings.ToLower(innerRef.Name)]
-		if !ok {
-			return nil
-		}
-		if ex.Negate {
-			return func(raw []any) (bool, error) { return raw[colIdx] != nil, nil }
-		}
-		return func(raw []any) (bool, error) { return raw[colIdx] == nil, nil }
-
+		return buildRawFilterIsNull(colIndex, ex)
 	case *Binary:
-		if ex.Op == "AND" {
-			left := buildRawFilter(colIndex, ex.Left)
-			right := buildRawFilter(colIndex, ex.Right)
-			if left != nil && right != nil {
-				return func(raw []any) (bool, error) {
-					l, err := left(raw)
-					if err != nil || !l {
-						return false, err
-					}
-					return right(raw)
-				}
-			}
-			return nil
-		}
-		if ex.Op == "OR" {
-			left := buildRawFilter(colIndex, ex.Left)
-			right := buildRawFilter(colIndex, ex.Right)
-			if left != nil && right != nil {
-				return func(raw []any) (bool, error) {
-					l, err := left(raw)
-					if err != nil {
-						return false, err
-					}
-					if l {
-						return true, nil
-					}
-					return right(raw)
-				}
-			}
-			return nil
-		}
-		if isComparisonOp(ex.Op) {
-			// col op literal
-			if ref, ok := ex.Left.(*VarRef); ok {
-				if lit, ok := ex.Right.(*Literal); ok {
-					if colIdx, ok := colIndex[strings.ToLower(ref.Name)]; ok {
-						return buildColLiteralFilter(colIdx, ex.Op, lit.Val)
-					}
-				}
-			}
-			// literal op col (reversed)
-			if lit, ok := ex.Left.(*Literal); ok {
-				if ref, ok := ex.Right.(*VarRef); ok {
-					if colIdx, ok := colIndex[strings.ToLower(ref.Name)]; ok {
-						return buildColLiteralFilter(colIdx, reverseComparisonOp(ex.Op), lit.Val)
-					}
-				}
-			}
-			// col op col – both sides are column references
-			if lRef, ok := ex.Left.(*VarRef); ok {
-				if rRef, ok := ex.Right.(*VarRef); ok {
-					lIdx, lok := colIndex[strings.ToLower(lRef.Name)]
-					rIdx, rok := colIndex[strings.ToLower(rRef.Name)]
-					if lok && rok {
-						return buildColColFilter(lIdx, ex.Op, rIdx)
-					}
-				}
-			}
-		}
-		return nil
-
+		return buildRawFilterBinary(colIndex, ex)
 	case *LikeExpr:
-		// Compile LIKE/ILIKE/GLOB/NOT LIKE with a literal pattern into a specialized closure.
-		ref, isRef := ex.Expr.(*VarRef)
-		if !isRef {
-			return nil
-		}
-		colIdx, ok := colIndex[strings.ToLower(ref.Name)]
-		if !ok {
-			return nil
-		}
-		pat, isLit := ex.Pattern.(*Literal)
-		if !isLit {
-			return nil
-		}
-		pattern, isStr := pat.Val.(string)
-		if !isStr {
-			return nil
-		}
-		if ex.GlobStyle {
-			return buildCompiledGlobFilter(colIdx, pattern, ex.CaseInsensitive, ex.Negate)
-		}
-		if ex.Escape != nil {
-			return nil // custom ESCAPE: fall back to evalRawExpr
-		}
-		if ex.CaseInsensitive {
-			// ILIKE: use the dedicated lowercasing filter
-			return buildCompiledILikeFilter(colIdx, pattern, ex.Negate)
-		}
-		return buildCompiledLikeFilter(colIdx, pattern, ex.Negate)
-
+		return buildRawFilterLike(colIndex, ex)
 	case *RegexpExpr:
-		// Compile REGEXP/RLIKE/SIMILAR TO with a literal pattern.
-		ref, isRef := ex.Expr.(*VarRef)
-		if !isRef {
-			return nil
-		}
-		colIdx, ok := colIndex[strings.ToLower(ref.Name)]
-		if !ok {
-			return nil
-		}
-		pat, isLit := ex.Pattern.(*Literal)
-		if !isLit {
-			return nil
-		}
-		pattern, isStr := pat.Val.(string)
-		if !isStr {
-			return nil
-		}
-		if ex.SimilarTo {
-			pattern = similarToRegexp(pattern)
-		}
-		re, err := regexp.Compile(pattern)
-		if err != nil {
-			return nil // invalid pattern – fall back to evalRawExpr
-		}
-		negate := ex.Negate
-		return func(raw []any) (bool, error) {
-			s, ok := raw[colIdx].(string)
-			if !ok {
-				if raw[colIdx] == nil {
-					return false, nil
-				}
-				s = fmt.Sprintf("%v", raw[colIdx])
-			}
-			matched := re.MatchString(s)
-			if negate {
-				return !matched, nil
-			}
-			return matched, nil
-		}
-
+		return buildRawFilterRegexp(colIndex, ex)
 	case *InExpr:
-		// col IN (lit, ...) / col NOT IN (lit, ...) with all-literal values.
-		ref, isRef := ex.Expr.(*VarRef)
-		if !isRef {
-			return nil
-		}
-		colIdx, ok := colIndex[strings.ToLower(ref.Name)]
-		if !ok {
-			return nil
-		}
-		litVals := make([]any, 0, len(ex.Values))
-		for _, v := range ex.Values {
-			lit, ok := v.(*Literal)
-			if !ok {
-				return nil // non-literal value: can't pre-build a set
-			}
-			litVals = append(litVals, lit.Val)
-		}
-		return buildInFilter(colIdx, litVals, ex.Negate)
+		return buildRawFilterIn(colIndex, ex)
 	}
 	return nil
+}
+
+func buildRawFilterVarRef(colIndex map[string]int, ex *VarRef) func([]any) (bool, error) {
+	colIdx, ok := colIndex[strings.ToLower(ex.Name)]
+	if !ok {
+		return nil
+	}
+	return func(raw []any) (bool, error) { return truthy(raw[colIdx]), nil }
+}
+
+func buildRawFilterUnary(colIndex map[string]int, ex *Unary) func([]any) (bool, error) {
+	if ex.Op != "NOT" {
+		return nil
+	}
+	inner := buildRawFilter(colIndex, ex.Expr)
+	if inner == nil {
+		return nil
+	}
+	return func(raw []any) (bool, error) {
+		b, err := inner(raw)
+		return !b, err
+	}
+}
+
+func buildRawFilterIsNull(colIndex map[string]int, ex *IsNull) func([]any) (bool, error) {
+	innerRef, ok := ex.Expr.(*VarRef)
+	if !ok {
+		return nil
+	}
+	colIdx, ok := colIndex[strings.ToLower(innerRef.Name)]
+	if !ok {
+		return nil
+	}
+	if ex.Negate {
+		return func(raw []any) (bool, error) { return raw[colIdx] != nil, nil }
+	}
+	return func(raw []any) (bool, error) { return raw[colIdx] == nil, nil }
+}
+
+func buildRawFilterBinary(colIndex map[string]int, ex *Binary) func([]any) (bool, error) {
+	switch ex.Op {
+	case "AND":
+		return buildRawAndFilter(colIndex, ex.Left, ex.Right)
+	case "OR":
+		return buildRawOrFilter(colIndex, ex.Left, ex.Right)
+	default:
+		if isComparisonOp(ex.Op) {
+			return buildRawComparisonFilter(colIndex, ex)
+		}
+		return nil
+	}
+}
+
+func buildRawAndFilter(colIndex map[string]int, leftExpr, rightExpr Expr) func([]any) (bool, error) {
+	left := buildRawFilter(colIndex, leftExpr)
+	right := buildRawFilter(colIndex, rightExpr)
+	if left == nil || right == nil {
+		return nil
+	}
+	return func(raw []any) (bool, error) {
+		l, err := left(raw)
+		if err != nil || !l {
+			return false, err
+		}
+		return right(raw)
+	}
+}
+
+func buildRawOrFilter(colIndex map[string]int, leftExpr, rightExpr Expr) func([]any) (bool, error) {
+	left := buildRawFilter(colIndex, leftExpr)
+	right := buildRawFilter(colIndex, rightExpr)
+	if left == nil || right == nil {
+		return nil
+	}
+	return func(raw []any) (bool, error) {
+		l, err := left(raw)
+		if err != nil {
+			return false, err
+		}
+		if l {
+			return true, nil
+		}
+		return right(raw)
+	}
+}
+
+func buildRawComparisonFilter(colIndex map[string]int, ex *Binary) func([]any) (bool, error) {
+	if ref, ok := ex.Left.(*VarRef); ok {
+		if lit, ok := ex.Right.(*Literal); ok {
+			if colIdx, ok := colIndex[strings.ToLower(ref.Name)]; ok {
+				return buildColLiteralFilter(colIdx, ex.Op, lit.Val)
+			}
+		}
+	}
+	if lit, ok := ex.Left.(*Literal); ok {
+		if ref, ok := ex.Right.(*VarRef); ok {
+			if colIdx, ok := colIndex[strings.ToLower(ref.Name)]; ok {
+				return buildColLiteralFilter(colIdx, reverseComparisonOp(ex.Op), lit.Val)
+			}
+		}
+	}
+	if lRef, ok := ex.Left.(*VarRef); ok {
+		if rRef, ok := ex.Right.(*VarRef); ok {
+			lIdx, lok := colIndex[strings.ToLower(lRef.Name)]
+			rIdx, rok := colIndex[strings.ToLower(rRef.Name)]
+			if lok && rok {
+				return buildColColFilter(lIdx, ex.Op, rIdx)
+			}
+		}
+	}
+	return nil
+}
+
+func buildRawFilterLike(colIndex map[string]int, ex *LikeExpr) func([]any) (bool, error) {
+	ref, isRef := ex.Expr.(*VarRef)
+	if !isRef {
+		return nil
+	}
+	colIdx, ok := colIndex[strings.ToLower(ref.Name)]
+	if !ok {
+		return nil
+	}
+	pat, isLit := ex.Pattern.(*Literal)
+	if !isLit {
+		return nil
+	}
+	pattern, isStr := pat.Val.(string)
+	if !isStr {
+		return nil
+	}
+	if ex.GlobStyle {
+		return buildCompiledGlobFilter(colIdx, pattern, ex.CaseInsensitive, ex.Negate)
+	}
+	if ex.Escape != nil {
+		return nil
+	}
+	if ex.CaseInsensitive {
+		return buildCompiledILikeFilter(colIdx, pattern, ex.Negate)
+	}
+	return buildCompiledLikeFilter(colIdx, pattern, ex.Negate)
+}
+
+func buildRawFilterRegexp(colIndex map[string]int, ex *RegexpExpr) func([]any) (bool, error) {
+	ref, isRef := ex.Expr.(*VarRef)
+	if !isRef {
+		return nil
+	}
+	colIdx, ok := colIndex[strings.ToLower(ref.Name)]
+	if !ok {
+		return nil
+	}
+	pat, isLit := ex.Pattern.(*Literal)
+	if !isLit {
+		return nil
+	}
+	pattern, isStr := pat.Val.(string)
+	if !isStr {
+		return nil
+	}
+	if ex.SimilarTo {
+		pattern = similarToRegexp(pattern)
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil
+	}
+	negate := ex.Negate
+	return func(raw []any) (bool, error) {
+		s, ok := raw[colIdx].(string)
+		if !ok {
+			if raw[colIdx] == nil {
+				return false, nil
+			}
+			s = fmt.Sprintf("%v", raw[colIdx])
+		}
+		matched := re.MatchString(s)
+		if negate {
+			return !matched, nil
+		}
+		return matched, nil
+	}
+}
+
+func buildRawFilterIn(colIndex map[string]int, ex *InExpr) func([]any) (bool, error) {
+	ref, isRef := ex.Expr.(*VarRef)
+	if !isRef {
+		return nil
+	}
+	colIdx, ok := colIndex[strings.ToLower(ref.Name)]
+	if !ok {
+		return nil
+	}
+	litVals := make([]any, 0, len(ex.Values))
+	for _, v := range ex.Values {
+		lit, ok := v.(*Literal)
+		if !ok {
+			return nil
+		}
+		litVals = append(litVals, lit.Val)
+	}
+	return buildInFilter(colIdx, litVals, ex.Negate)
 }
 
 // reverseComparisonOp reverses the direction of a comparison operator,

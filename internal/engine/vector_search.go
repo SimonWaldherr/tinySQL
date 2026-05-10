@@ -42,155 +42,172 @@ func (f *VecSearchTableFunc) ValidateArgs(args []Expr) error {
 	return nil
 }
 
+// vecSearchArgs holds parsed arguments for VEC_SEARCH.
+type vecSearchArgs struct {
+	tableName string
+	colName   string
+	queryVec  []float64
+	k         int
+	metric    string
+}
+
+// vecParseArgs evaluates and validates all VEC_SEARCH arguments.
+func vecParseArgs(env ExecEnv, args []Expr, row Row) (vecSearchArgs, error) {
+	var a vecSearchArgs
+
+	tableVal, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return a, fmt.Errorf("VEC_SEARCH table: %w", err)
+	}
+	tableName, ok := tableVal.(string)
+	if !ok {
+		return a, fmt.Errorf("VEC_SEARCH: table name must be a string, got %T", tableVal)
+	}
+	a.tableName = tableName
+
+	colVal, err := evalExpr(env, args[1], row)
+	if err != nil {
+		return a, fmt.Errorf("VEC_SEARCH column: %w", err)
+	}
+	colName, ok := colVal.(string)
+	if !ok {
+		return a, fmt.Errorf("VEC_SEARCH: column name must be a string, got %T", colVal)
+	}
+	a.colName = colName
+
+	queryVec, err := toVec(env, args[2], row)
+	if err != nil {
+		return a, fmt.Errorf("VEC_SEARCH query_vector: %w", err)
+	}
+	a.queryVec = queryVec
+
+	kVal, err := evalExpr(env, args[3], row)
+	if err != nil {
+		return a, fmt.Errorf("VEC_SEARCH k: %w", err)
+	}
+	k, err := toInt(kVal)
+	if err != nil {
+		return a, fmt.Errorf("VEC_SEARCH k: %w", err)
+	}
+	if k <= 0 {
+		return a, fmt.Errorf("VEC_SEARCH: k must be > 0, got %d", k)
+	}
+	a.k = k
+
+	a.metric = "cosine"
+	if len(args) == 5 {
+		mv, err := evalExpr(env, args[4], row)
+		if err != nil {
+			return a, fmt.Errorf("VEC_SEARCH metric: %w", err)
+		}
+		ms, ok := mv.(string)
+		if !ok {
+			return a, fmt.Errorf("VEC_SEARCH: metric must be a string, got %T", mv)
+		}
+		a.metric = strings.ToLower(strings.TrimSpace(ms))
+	}
+
+	return a, nil
+}
+
+// vecScoredRow pairs a table row index with its computed distance.
+type vecScoredRow struct {
+	rowIdx   int
+	distance float64
+}
+
 func (f *VecSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecEnv, row Row) (*ResultSet, error) {
 	if err := f.ValidateArgs(args); err != nil {
 		return nil, err
 	}
 
-	// 1. Evaluate table name
-	tableVal, err := evalExpr(env, args[0], row)
+	a, err := vecParseArgs(env, args, row)
 	if err != nil {
-		return nil, fmt.Errorf("VEC_SEARCH table: %w", err)
-	}
-	tableName, ok := tableVal.(string)
-	if !ok {
-		return nil, fmt.Errorf("VEC_SEARCH: table name must be a string, got %T", tableVal)
+		return nil, err
 	}
 
-	// 2. Evaluate column name
-	colVal, err := evalExpr(env, args[1], row)
-	if err != nil {
-		return nil, fmt.Errorf("VEC_SEARCH column: %w", err)
-	}
-	colName, ok := colVal.(string)
-	if !ok {
-		return nil, fmt.Errorf("VEC_SEARCH: column name must be a string, got %T", colVal)
-	}
-
-	// 3. Evaluate query vector
-	queryVec, err := toVec(env, args[2], row)
-	if err != nil {
-		return nil, fmt.Errorf("VEC_SEARCH query_vector: %w", err)
-	}
-
-	// 4. Evaluate k
-	kVal, err := evalExpr(env, args[3], row)
-	if err != nil {
-		return nil, fmt.Errorf("VEC_SEARCH k: %w", err)
-	}
-	k, err := toInt(kVal)
-	if err != nil {
-		return nil, fmt.Errorf("VEC_SEARCH k: %w", err)
-	}
-	if k <= 0 {
-		return nil, fmt.Errorf("VEC_SEARCH: k must be > 0, got %d", k)
-	}
-
-	// 5. Evaluate optional metric
-	metric := "cosine"
-	if len(args) == 5 {
-		mv, err := evalExpr(env, args[4], row)
-		if err != nil {
-			return nil, fmt.Errorf("VEC_SEARCH metric: %w", err)
-		}
-		ms, ok := mv.(string)
-		if !ok {
-			return nil, fmt.Errorf("VEC_SEARCH: metric must be a string, got %T", mv)
-		}
-		metric = strings.ToLower(strings.TrimSpace(ms))
-	}
-
-	// 6. Get the table from the database
 	tenant := env.tenant
 	if tenant == "" {
 		tenant = "default"
 	}
-	table, err := env.db.Get(tenant, tableName)
+	table, err := env.db.Get(tenant, a.tableName)
 	if err != nil {
-		return nil, fmt.Errorf("VEC_SEARCH: table %q not found: %w", tableName, err)
+		return nil, fmt.Errorf("VEC_SEARCH: table %q not found: %w", a.tableName, err)
 	}
 
-	// 7. Find the vector column index
-	vecColIdx, err := table.ColIndex(colName)
+	vecColIdx, err := table.ColIndex(a.colName)
 	if err != nil {
 		return nil, fmt.Errorf("VEC_SEARCH: %w", err)
 	}
 
-	// 8. Build result column list: all original columns + _vec_distance + _vec_rank
 	resultCols := make([]string, 0, len(table.Cols)+2)
 	for _, c := range table.Cols {
 		resultCols = append(resultCols, c.Name)
 	}
 	resultCols = append(resultCols, "_vec_distance", "_vec_rank")
 
-	// 9. Compute distances
-	type scored struct {
-		rowIdx   int
-		distance float64
-	}
-	var scored_rows []scored
-
+	var scoredRows []vecScoredRow
 	for i, r := range table.Rows {
 		if vecColIdx >= len(r) || r[vecColIdx] == nil {
 			continue
 		}
-
-		var vec []float64
-		switch v := r[vecColIdx].(type) {
-		case []float64:
-			vec = v
-		case string:
-			// Try parsing as JSON
-			coerced, err := coerceToVector(v)
-			if err != nil {
-				continue
-			}
-			vec = coerced.([]float64)
-		default:
+		vec, ok := vecRowValue(r[vecColIdx])
+		if !ok {
 			continue
 		}
-
-		if len(vec) != len(queryVec) {
-			continue // dimension mismatch, skip
+		if len(vec) != len(a.queryVec) {
+			continue
 		}
-
-		dist, err := computeDistance(vec, queryVec, metric)
+		dist, err := computeDistance(vec, a.queryVec, a.metric)
 		if err != nil {
 			continue
 		}
-
-		scored_rows = append(scored_rows, scored{rowIdx: i, distance: dist})
+		scoredRows = append(scoredRows, vecScoredRow{rowIdx: i, distance: dist})
 	}
 
-	// 10. Sort by distance (ascending)
-	sort.Slice(scored_rows, func(i, j int) bool {
-		return scored_rows[i].distance < scored_rows[j].distance
+	sort.Slice(scoredRows, func(i, j int) bool {
+		return scoredRows[i].distance < scoredRows[j].distance
 	})
 
-	// 11. Limit to k results
-	if k > len(scored_rows) {
-		k = len(scored_rows)
+	k := a.k
+	if k > len(scoredRows) {
+		k = len(scoredRows)
 	}
-	scored_rows = scored_rows[:k]
+	scoredRows = scoredRows[:k]
 
-	// 12. Build result rows
 	resultRows := make([]Row, 0, k)
-	for rank, sr := range scored_rows {
-		row := make(Row)
+	for rank, sr := range scoredRows {
+		r := make(Row)
 		for ci, c := range table.Cols {
 			if ci < len(table.Rows[sr.rowIdx]) {
-				row[c.Name] = table.Rows[sr.rowIdx][ci]
+				r[c.Name] = table.Rows[sr.rowIdx][ci]
 			}
 		}
-		row["_vec_distance"] = sr.distance
-		row["_vec_rank"] = rank + 1
-		resultRows = append(resultRows, row)
+		r["_vec_distance"] = sr.distance
+		r["_vec_rank"] = rank + 1
+		resultRows = append(resultRows, r)
 	}
 
 	return &ResultSet{
 		Cols: resultCols,
 		Rows: resultRows,
 	}, nil
+}
+
+// vecRowValue extracts a []float64 from a stored row cell.
+func vecRowValue(v any) ([]float64, bool) {
+	switch val := v.(type) {
+	case []float64:
+		return val, true
+	case string:
+		coerced, err := coerceToVector(val)
+		if err != nil {
+			return nil, false
+		}
+		return coerced.([]float64), true
+	default:
+		return nil, false
+	}
 }
 
 // computeDistance computes distance between two vectors using the specified metric.

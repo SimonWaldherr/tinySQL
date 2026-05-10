@@ -641,7 +641,84 @@ func fixCommonJSONIssues(s string) string {
 
 // FuzzyImportJSON attempts to parse malformed JSON data
 //
+// fuzzyParseJSONInput parses the input string as a JSON array, single object,
+// or newline-delimited JSON, applying fuzzy fixes when enabled.
+//
 //nolint:gocyclo // Fuzzy JSON import applies numerous fallback parsing strategies.
+func fuzzyParseJSONInput(dataStr string, opts *FuzzyImportOptions) ([]map[string]interface{}, error) {
+	var records []map[string]interface{}
+	if err := json.Unmarshal([]byte(dataStr), &records); err == nil {
+		return records, nil
+	}
+	var single map[string]interface{}
+	if err := json.Unmarshal([]byte(dataStr), &single); err == nil {
+		return []map[string]interface{}{single}, nil
+	}
+	recs, err := parseLineDelimitedJSON(dataStr, opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse JSON: %v", err)
+	}
+	return recs, nil
+}
+
+// fuzzyJSONColumnNames extracts all unique keys from a slice of records.
+func fuzzyJSONColumnNames(records []map[string]interface{}) []string {
+	columnSet := make(map[string]bool)
+	for _, record := range records {
+		for key := range record {
+			columnSet[key] = true
+		}
+	}
+	names := make([]string, 0, len(columnSet))
+	for name := range columnSet {
+		names = append(names, name)
+	}
+	return names
+}
+
+// fuzzyBuildJSONSampleData converts JSON records to a string matrix for type inference.
+func fuzzyBuildJSONSampleData(records []map[string]interface{}, columnNames []string) [][]string {
+	sampleData := make([][]string, len(records))
+	for ri, rec := range records {
+		row := make([]string, len(columnNames))
+		for ci, colName := range columnNames {
+			if v, ok := rec[colName]; ok {
+				row[ci] = fmt.Sprint(v)
+			}
+		}
+		sampleData[ri] = row
+	}
+	return sampleData
+}
+
+// fuzzyCoerceJSONValue converts a JSON-unmarshalled value to the target storage type.
+func fuzzyCoerceJSONValue(v interface{}, colType storage.ColType) interface{} {
+	switch colType {
+	case storage.IntType:
+		if n, ok := v.(float64); ok {
+			return int(n)
+		}
+		return v
+	case storage.Float64Type, storage.FloatType:
+		if n, ok := v.(float64); ok {
+			return n
+		}
+		return v
+	case storage.BoolType:
+		return v
+	default:
+		switch vv := v.(type) {
+		case map[string]interface{}, []interface{}:
+			if b, err := json.Marshal(vv); err == nil {
+				return string(b)
+			}
+			return fmt.Sprint(v)
+		default:
+			return v
+		}
+	}
+}
+
 func FuzzyImportJSON(
 	ctx context.Context,
 	db *storage.DB,
@@ -663,69 +740,27 @@ func FuzzyImportJSON(
 	}
 
 	dataStr := string(data)
-
-	// Try to fix common JSON issues
 	if opts.FuzzyJSON {
 		dataStr = fixCommonJSONIssues(dataStr)
 	}
 
-	// Try parsing as array
-	var records []map[string]interface{}
-	err = json.Unmarshal([]byte(dataStr), &records)
-
+	records, err := fuzzyParseJSONInput(dataStr, opts)
 	if err != nil {
-		// Try as single object
-		var record map[string]interface{}
-		if err2 := json.Unmarshal([]byte(dataStr), &record); err2 == nil {
-			records = []map[string]interface{}{record}
-		} else {
-			// Try line-delimited JSON
-			records, err = parseLineDelimitedJSON(dataStr, opts)
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse JSON: %v", err)
-			}
-		}
+		return nil, err
 	}
 
 	if len(records) == 0 {
 		return &ImportResult{}, nil
 	}
 
-	// Extract all unique keys
-	columnSet := make(map[string]bool)
-	for _, record := range records {
-		for key := range record {
-			columnSet[key] = true
-		}
-	}
-
-	var columnNames []string
-	for name := range columnSet {
-		columnNames = append(columnNames, name)
-	}
-
-	// ── Infer column types from actual values ───────────────────────────
-	// Build a string matrix so we can reuse fuzzyInferColumnTypes.
+	columnNames := fuzzyJSONColumnNames(records)
 	numCols := len(columnNames)
-	sampleData := make([][]string, len(records))
-	for ri, rec := range records {
-		row := make([]string, numCols)
-		for ci, colName := range columnNames {
-			if v, ok := rec[colName]; ok {
-				row[ci] = fmt.Sprint(v)
-			}
-		}
-		sampleData[ri] = row
-	}
-
+	sampleData := fuzzyBuildJSONSampleData(records, columnNames)
 	colTypes := fuzzyPrepareColumnTypes(sampleData, numCols, opts)
 
 	columns := make([]storage.Column, numCols)
 	for i, name := range columnNames {
-		columns[i] = storage.Column{
-			Name: name,
-			Type: colTypes[i],
-		}
+		columns[i] = storage.Column{Name: name, Type: colTypes[i]}
 	}
 
 	result := &ImportResult{
@@ -734,7 +769,6 @@ func FuzzyImportJSON(
 		Errors:      make([]string, 0),
 	}
 
-	// Create table
 	if opts.CreateTable {
 		table := storage.NewTable(tableName, columns, false)
 		if err := db.Put(tenant, table); err != nil {
@@ -747,7 +781,6 @@ func FuzzyImportJSON(
 		return nil, err
 	}
 
-	// Insert records — convert values to the inferred type when possible.
 	for _, record := range records {
 		row := make([]interface{}, numCols)
 		for i, colName := range columnNames {
@@ -755,40 +788,7 @@ func FuzzyImportJSON(
 			if !exists {
 				continue
 			}
-			// json.Unmarshal produces float64 for all numbers; convert to
-			// int when the column was inferred as IntType.
-			switch colTypes[i] {
-			case storage.IntType:
-				switch n := v.(type) {
-				case float64:
-					row[i] = int(n)
-				default:
-					row[i] = v
-				}
-			case storage.Float64Type, storage.FloatType:
-				switch n := v.(type) {
-				case float64:
-					row[i] = n
-				default:
-					row[i] = v
-				}
-			case storage.BoolType:
-				row[i] = v
-			default:
-				// For TEXT and anything else keep the original value,
-				// but turn complex sub-objects into a JSON string so
-				// they stay representable as text.
-				switch vv := v.(type) {
-				case map[string]interface{}, []interface{}:
-					if b, err := json.Marshal(vv); err == nil {
-						row[i] = string(b)
-					} else {
-						row[i] = fmt.Sprint(v)
-					}
-				default:
-					row[i] = v
-				}
-			}
+			row[i] = fuzzyCoerceJSONValue(v, colTypes[i])
 		}
 		table.Rows = append(table.Rows, row)
 		result.RowsInserted++
