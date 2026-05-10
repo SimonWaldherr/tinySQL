@@ -1684,9 +1684,7 @@ func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 }
 
 func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, bool, error) {
-	if s.Distinct || len(s.DistinctOn) > 0 || len(s.CTEs) > 0 || len(s.Joins) > 0 ||
-		s.Having != nil || s.Union != nil || len(s.OrderBy) > 0 || s.Limit != nil || s.Offset != nil ||
-		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil || len(s.GroupBy) != 1 {
+	if !simpleAggregateEligibleSelect(s) {
 		return nil, false, nil
 	}
 	groupRef, ok := s.GroupBy[0].(*VarRef)
@@ -1707,38 +1705,11 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 		return nil, true, fmt.Errorf("unknown column %q", groupRef.Name)
 	}
 
-	projs := make([]simpleAggregateProjection, 0, len(s.Projs))
-	outputCols := make([]string, 0, len(s.Projs))
-	hasCount := false
-	for i, it := range s.Projs {
-		if it.Star {
-			return nil, false, nil
-		}
-		name := projName(it, i)
-		if ref, ok := it.Expr.(*VarRef); ok {
-			refCol, ok := colIndex[strings.ToLower(ref.Name)]
-			if !ok {
-				return nil, true, fmt.Errorf("unknown column %q", ref.Name)
-			}
-			if refCol != groupCol {
-				return nil, false, nil
-			}
-			projs = append(projs, simpleAggregateProjection{name: name, groupCol: true})
-			outputCols = append(outputCols, name)
-			continue
-		}
-		arg, ok := simpleCountArg(it.Expr)
-		if !ok {
-			return nil, false, nil
-		}
-		if arg != nil && !isSimpleRawExpr(arg) {
-			return nil, false, nil
-		}
-		hasCount = true
-		projs = append(projs, simpleAggregateProjection{name: name, countArg: arg})
-		outputCols = append(outputCols, name)
+	projs, outputCols, hasCount, eligible, err := buildSimpleAggregateProjections(s, colIndex, groupCol)
+	if err != nil {
+		return nil, true, err
 	}
-	if !hasCount {
+	if !eligible || !hasCount {
 		return nil, false, nil
 	}
 	return &simpleAggregatePlan{
@@ -1750,6 +1721,57 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 		projs:      projs,
 		outputCols: outputCols,
 	}, true, nil
+}
+
+func simpleAggregateEligibleSelect(s *Select) bool {
+	return !(s.Distinct || len(s.DistinctOn) > 0 || len(s.CTEs) > 0 || len(s.Joins) > 0 ||
+		s.Having != nil || s.Union != nil || len(s.OrderBy) > 0 || s.Limit != nil || s.Offset != nil ||
+		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil || len(s.GroupBy) != 1)
+}
+
+func buildSimpleAggregateProjections(s *Select, colIndex map[string]int, groupCol int) ([]simpleAggregateProjection, []string, bool, bool, error) {
+	projs := make([]simpleAggregateProjection, 0, len(s.Projs))
+	outputCols := make([]string, 0, len(s.Projs))
+	hasCount := false
+
+	for i, it := range s.Projs {
+		proj, name, isCount, eligible, err := buildSimpleAggregateProjection(it, i, colIndex, groupCol)
+		if err != nil {
+			return nil, nil, false, false, err
+		}
+		if !eligible {
+			return nil, nil, false, false, nil
+		}
+		if isCount {
+			hasCount = true
+		}
+		projs = append(projs, proj)
+		outputCols = append(outputCols, name)
+	}
+	return projs, outputCols, hasCount, true, nil
+}
+
+func buildSimpleAggregateProjection(it SelectItem, idx int, colIndex map[string]int, groupCol int) (simpleAggregateProjection, string, bool, bool, error) {
+	if it.Star {
+		return simpleAggregateProjection{}, "", false, false, nil
+	}
+	name := projName(it, idx)
+	if ref, ok := it.Expr.(*VarRef); ok {
+		refCol, ok := colIndex[strings.ToLower(ref.Name)]
+		if !ok {
+			return simpleAggregateProjection{}, "", false, false, fmt.Errorf("unknown column %q", ref.Name)
+		}
+		if refCol != groupCol {
+			return simpleAggregateProjection{}, "", false, false, nil
+		}
+		return simpleAggregateProjection{name: name, groupCol: true}, name, false, true, nil
+	}
+
+	arg, ok := simpleCountArg(it.Expr)
+	if !ok || (arg != nil && !isSimpleRawExpr(arg)) {
+		return simpleAggregateProjection{}, "", false, false, nil
+	}
+	return simpleAggregateProjection{name: name, countArg: arg}, name, true, true, nil
 }
 
 func simpleCountArg(e Expr) (Expr, bool) {
@@ -1987,15 +2009,7 @@ func compareOrderedValue(a, b any, desc bool) int {
 }
 
 func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, error) {
-	if s.Distinct || len(s.DistinctOn) > 0 || len(s.CTEs) > 0 || len(s.Joins) > 0 ||
-		len(s.GroupBy) > 0 || s.Having != nil || s.Union != nil ||
-		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil {
-		return nil, false, nil
-	}
-	if strings.Contains(strings.ToLower(s.From.Table), ".") {
-		return nil, false, nil
-	}
-	if anyAggInSelect(s.Projs) || anyWindowInSelect(s.Projs) {
+	if !simpleSelectEligible(s) {
 		return nil, false, nil
 	}
 
@@ -2005,39 +2019,13 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 	}
 	colIndex := simpleColumnIndex(table, aliasOr(s.From))
 
-	projs := make([]simpleProjection, 0, len(s.Projs))
-	outputCols := make([]string, 0, len(s.Projs))
-	for i, it := range s.Projs {
-		if it.Star || !isSimpleRawExpr(it.Expr) {
-			return nil, false, nil
-		}
-		name := projName(it, i)
-		if name == "" {
-			return nil, false, nil
-		}
-		key := strings.ToLower(name)
-		colIdx := -1
-		if ref, ok := it.Expr.(*VarRef); ok {
-			if idx, ok2 := colIndex[strings.ToLower(ref.Name)]; ok2 {
-				colIdx = idx
-			}
-		}
-		projs = append(projs, simpleProjection{name: name, key: key, side: -1, colIdx: colIdx, expr: it.Expr})
-		outputCols = append(outputCols, name)
+	projs, outputCols, ok := buildSimpleSelectProjections(s.Projs, colIndex)
+	if !ok {
+		return nil, false, nil
 	}
-	orderExprs := make([]Expr, 0, len(s.OrderBy))
-	for _, oi := range s.OrderBy {
-		foundProjection := false
-		for _, p := range projs {
-			if strings.EqualFold(p.name, oi.Col) {
-				foundProjection = true
-				orderExprs = append(orderExprs, p.expr)
-				break
-			}
-		}
-		if !foundProjection {
-			return nil, false, nil
-		}
+	orderExprs, ok := buildSimpleSelectOrderExprs(s.OrderBy, projs)
+	if !ok {
+		return nil, false, nil
 	}
 	if !isSimpleRawPredicate(s.Where) {
 		return nil, false, nil
@@ -2055,6 +2043,76 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 		offset:     s.Offset,
 		outputCols: outputCols,
 	}, true, nil
+}
+
+func simpleSelectEligible(s *Select) bool {
+	if s.Distinct || len(s.DistinctOn) > 0 || len(s.CTEs) > 0 || len(s.Joins) > 0 ||
+		len(s.GroupBy) > 0 || s.Having != nil || s.Union != nil ||
+		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil {
+		return false
+	}
+	if strings.Contains(strings.ToLower(s.From.Table), ".") {
+		return false
+	}
+	return !(anyAggInSelect(s.Projs) || anyWindowInSelect(s.Projs))
+}
+
+func buildSimpleSelectProjections(items []SelectItem, colIndex map[string]int) ([]simpleProjection, []string, bool) {
+	projs := make([]simpleProjection, 0, len(items))
+	outputCols := make([]string, 0, len(items))
+	for i, it := range items {
+		proj, ok := buildSimpleSelectProjection(it, i, colIndex)
+		if !ok {
+			return nil, nil, false
+		}
+		projs = append(projs, proj)
+		outputCols = append(outputCols, proj.name)
+	}
+	return projs, outputCols, true
+}
+
+func buildSimpleSelectProjection(it SelectItem, idx int, colIndex map[string]int) (simpleProjection, bool) {
+	if it.Star || !isSimpleRawExpr(it.Expr) {
+		return simpleProjection{}, false
+	}
+	name := projName(it, idx)
+	if name == "" {
+		return simpleProjection{}, false
+	}
+	colIdx := -1
+	if ref, ok := it.Expr.(*VarRef); ok {
+		if idx, ok2 := colIndex[strings.ToLower(ref.Name)]; ok2 {
+			colIdx = idx
+		}
+	}
+	return simpleProjection{
+		name:   name,
+		key:    strings.ToLower(name),
+		side:   -1,
+		colIdx: colIdx,
+		expr:   it.Expr,
+	}, true
+}
+
+func buildSimpleSelectOrderExprs(orderBy []OrderItem, projs []simpleProjection) ([]Expr, bool) {
+	orderExprs := make([]Expr, 0, len(orderBy))
+	for _, oi := range orderBy {
+		expr, ok := findSimpleSelectOrderExpr(oi.Col, projs)
+		if !ok {
+			return nil, false
+		}
+		orderExprs = append(orderExprs, expr)
+	}
+	return orderExprs, true
+}
+
+func findSimpleSelectOrderExpr(col string, projs []simpleProjection) (Expr, bool) {
+	for _, p := range projs {
+		if strings.EqualFold(p.name, col) {
+			return p.expr, true
+		}
+	}
+	return nil, false
 }
 
 func simpleColumnIndex(t *storage.Table, alias string) map[string]int {

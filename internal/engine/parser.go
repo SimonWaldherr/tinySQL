@@ -398,58 +398,66 @@ func (p *Parser) ParseStatement() (Statement, error) {
 	}
 }
 
-//nolint:gocyclo // CREATE statement grammar is broad and handled centrally here.
 func (p *Parser) parseCreate() (Statement, error) {
 	p.next()
 
-	// Support CREATE JOB
+	stmt, handled, err := p.parseCreateNonTable()
+	if err != nil || handled {
+		return stmt, err
+	}
+
+	return p.parseCreateTable()
+}
+
+func (p *Parser) parseCreateNonTable() (Statement, bool, error) {
 	if (p.cur.Typ == tKeyword || p.cur.Typ == tIdent) && p.cur.Val == "JOB" {
-		return p.parseCreateJob()
+		stmt, err := p.parseCreateJob()
+		return stmt, true, err
 	}
-
-	// Check for CREATE TRIGGER
 	if p.cur.Typ == tKeyword && p.cur.Val == "TRIGGER" {
-		return p.parseCreateTrigger(false)
+		stmt, err := p.parseCreateTrigger(false)
+		return stmt, true, err
 	}
-
-	// Check for CREATE OR REPLACE TRIGGER / CREATE OR REPLACE VIEW.
-	// After consuming OR and REPLACE, route to TRIGGER or VIEW parser.
-	// Note: if the next token after REPLACE is neither TRIGGER nor VIEW,
-	// we fall through to parseCreateView which will return a parse error.
 	if p.cur.Typ == tKeyword && p.cur.Val == "OR" {
-		p.next() // consume OR
-		if p.cur.Typ == tKeyword && p.cur.Val == "REPLACE" {
-			p.next() // consume REPLACE
-			if p.cur.Typ == tKeyword && p.cur.Val == "TRIGGER" {
-				return p.parseCreateTrigger(false)
-			}
-			// Fall through to view parsing (OR REPLACE VIEW)
-			return p.parseCreateView()
-		}
-		// Bare OR without REPLACE — unexpected; let view parser report the error.
-		return p.parseCreateView()
+		stmt, err := p.parseCreateOrReplace()
+		return stmt, true, err
 	}
-
-	// Check for CREATE INDEX
 	if p.cur.Typ == tKeyword && (p.cur.Val == "INDEX" || p.cur.Val == "UNIQUE") {
-		return p.parseCreateIndex()
+		stmt, err := p.parseCreateIndex()
+		return stmt, true, err
 	}
-
-	// Check for CREATE VIEW
 	if p.cur.Typ == tKeyword && p.cur.Val == "VIEW" {
+		stmt, err := p.parseCreateView()
+		return stmt, true, err
+	}
+	if p.cur.Typ == tKeyword && p.cur.Val == "VIRTUAL" {
+		stmt, err := p.parseCreateVirtualTable()
+		return stmt, true, err
+	}
+	return nil, false, nil
+}
+
+func (p *Parser) parseCreateOrReplace() (Statement, error) {
+	p.next() // consume OR
+	if p.cur.Typ == tKeyword && p.cur.Val == "REPLACE" {
+		p.next() // consume REPLACE
+		if p.cur.Typ == tKeyword && p.cur.Val == "TRIGGER" {
+			return p.parseCreateTrigger(false)
+		}
 		return p.parseCreateView()
 	}
+	return p.parseCreateView()
+}
 
-	// Check for CREATE VIRTUAL TABLE
-	if p.cur.Typ == tKeyword && p.cur.Val == "VIRTUAL" {
-		p.next()
-		if err := p.expectKeyword("TABLE"); err != nil {
-			return nil, err
-		}
-		return p.parseVirtualTable()
+func (p *Parser) parseCreateVirtualTable() (Statement, error) {
+	p.next()
+	if err := p.expectKeyword("TABLE"); err != nil {
+		return nil, err
 	}
+	return p.parseVirtualTable()
+}
 
-	// CREATE TABLE logic
+func (p *Parser) parseCreateTable() (Statement, error) {
 	isTemp := false
 	if p.cur.Typ == tKeyword && p.cur.Val == "TEMP" {
 		isTemp = true
@@ -1509,42 +1517,37 @@ func (p *Parser) parseFromClause(sel *Select) error {
 
 	p.next() // consume FROM keyword
 
-	// Prüfe auf Subselect: (SELECT ...)
 	if p.cur.Typ == tSymbol && p.cur.Val == "(" {
-		p.next()
-		subSel, err := p.parseSelect()
-		if err != nil {
-			return err
-		}
-		if p.cur.Typ != tSymbol || p.cur.Val != ")" {
-			return p.errf("expected ) after subselect in FROM")
-		}
-		p.next()
-		alias := ""
-		if p.cur.Typ == tKeyword && p.cur.Val == "AS" {
-			p.next()
-			alias = p.parseIdentLike()
-			if alias == "" {
-				return p.errf("expected alias after AS for subselect")
-			}
-		} else if p.cur.Typ == tIdent {
-			alias = p.cur.Val
-			p.next()
-		} else {
-			return p.errf("expected alias for subselect in FROM")
-		}
-		sel.From = FromItem{Subquery: subSel, Alias: alias}
-		return nil
+		return p.parseFromSubselect(sel)
 	}
-	// Could be a table name OR a table-valued function call
+	return p.parseFromTableOrFunction(sel)
+}
+
+func (p *Parser) parseFromSubselect(sel *Select) error {
+	p.next()
+	subSel, err := p.parseSelect()
+	if err != nil {
+		return err
+	}
+	if p.cur.Typ != tSymbol || p.cur.Val != ")" {
+		return p.errf("expected ) after subselect in FROM")
+	}
+	p.next()
+	alias, err := p.parseRequiredAlias("expected alias after AS for subselect", "expected alias for subselect in FROM")
+	if err != nil {
+		return err
+	}
+	sel.From = FromItem{Subquery: subSel, Alias: alias}
+	return nil
+}
+
+func (p *Parser) parseFromTableOrFunction(sel *Select) error {
 	from := p.parseIdentLike()
 	if from == "" {
 		return p.errf("expected table or table-valued function")
 	}
 
-	// Function call in FROM: name(...)
 	if p.cur.Typ == tSymbol && p.cur.Val == "(" {
-		// Reuse func call parsing and convert to TableFuncCall
 		fcExpr, err := p.parseFuncCallWithName(from)
 		if err != nil {
 			return err
@@ -1556,35 +1559,54 @@ func (p *Parser) parseFromClause(sel *Select) error {
 		if fc.Over != nil {
 			return p.errf("OVER clause not allowed for table-valued functions in FROM")
 		}
-		alias := from
-		if p.cur.Typ == tKeyword && p.cur.Val == "AS" {
-			p.next()
-			alias = p.parseIdentLike()
-			if alias == "" {
-				return p.errf("expected alias")
-			}
-		} else if p.cur.Typ == tIdent {
-			alias = p.cur.Val
-			p.next()
+		alias, err := p.parseOptionalAlias(from, "expected alias")
+		if err != nil {
+			return err
 		}
 		sel.From = FromItem{TableFunc: &TableFuncCall{Name: from, Args: fc.Args, Alias: alias}, Alias: alias}
 		return nil
 	}
 
-	// Normale Tabelle
-	alias := from
+	alias, err := p.parseOptionalAlias(from, "expected alias")
+	if err != nil {
+		return err
+	}
+	sel.From = FromItem{Table: from, Alias: alias}
+	return nil
+}
+
+func (p *Parser) parseRequiredAlias(asMsg, missingMsg string) (string, error) {
+	if p.cur.Typ == tKeyword && p.cur.Val == "AS" {
+		p.next()
+		alias := p.parseIdentLike()
+		if alias == "" {
+			return "", p.errf("%s", asMsg)
+		}
+		return alias, nil
+	}
+	if p.cur.Typ == tIdent {
+		alias := p.cur.Val
+		p.next()
+		return alias, nil
+	}
+	return "", p.errf("%s", missingMsg)
+}
+
+func (p *Parser) parseOptionalAlias(defaultAlias, asMsg string) (string, error) {
+	alias := defaultAlias
 	if p.cur.Typ == tKeyword && p.cur.Val == "AS" {
 		p.next()
 		alias = p.parseIdentLike()
 		if alias == "" {
-			return p.errf("expected alias")
+			return "", p.errf("%s", asMsg)
 		}
-	} else if p.cur.Typ == tIdent {
+		return alias, nil
+	}
+	if p.cur.Typ == tIdent {
 		alias = p.cur.Val
 		p.next()
 	}
-	sel.From = FromItem{Table: from, Alias: alias}
-	return nil
+	return alias, nil
 }
 
 func (p *Parser) parseJoinClauses(sel *Select) error {
@@ -1760,47 +1782,39 @@ func (p *Parser) parseUnionClause(sel *Select) error {
 }
 
 func (p *Parser) parseJoinTail() (FromItem, Expr, error) {
-	// Support subselect as right side of JOIN: (SELECT ...) AS alias
 	if p.cur.Typ == tSymbol && p.cur.Val == "(" {
-		p.next()
-		subSel, err := p.parseSelect()
-		if err != nil {
-			return FromItem{}, nil, err
-		}
-		if p.cur.Typ != tSymbol || p.cur.Val != ")" {
-			return FromItem{}, nil, p.errf("expected ) after subselect in JOIN")
-		}
-		p.next()
-		alias := ""
-		if p.cur.Typ == tKeyword && p.cur.Val == "AS" {
-			p.next()
-			alias = p.parseIdentLike()
-			if alias == "" {
-				return FromItem{}, nil, p.errf("expected alias after AS for subselect")
-			}
-		} else if p.cur.Typ == tIdent {
-			alias = p.cur.Val
-			p.next()
-		} else {
-			return FromItem{}, nil, p.errf("expected alias for subselect in JOIN")
-		}
-		if err := p.expectKeyword("ON"); err != nil {
-			return FromItem{}, nil, err
-		}
-		on, err := p.parseExpr()
-		if err != nil {
-			return FromItem{}, nil, err
-		}
-		return FromItem{Subquery: subSel, Alias: alias}, on, nil
+		return p.parseJoinSubselectTail()
 	}
+	return p.parseJoinTableOrFunctionTail()
+}
 
-	// Table name or table-valued function
+func (p *Parser) parseJoinSubselectTail() (FromItem, Expr, error) {
+	p.next()
+	subSel, err := p.parseSelect()
+	if err != nil {
+		return FromItem{}, nil, err
+	}
+	if p.cur.Typ != tSymbol || p.cur.Val != ")" {
+		return FromItem{}, nil, p.errf("expected ) after subselect in JOIN")
+	}
+	p.next()
+	alias, err := p.parseRequiredAlias("expected alias after AS for subselect", "expected alias for subselect in JOIN")
+	if err != nil {
+		return FromItem{}, nil, err
+	}
+	on, err := p.parseJoinOnExpr()
+	if err != nil {
+		return FromItem{}, nil, err
+	}
+	return FromItem{Subquery: subSel, Alias: alias}, on, nil
+}
+
+func (p *Parser) parseJoinTableOrFunctionTail() (FromItem, Expr, error) {
 	rt := p.parseIdentLike()
 	if rt == "" {
 		return FromItem{}, nil, p.errf("expected table or table-valued function")
 	}
 
-	// Function call in JOIN RHS: name(...)
 	if p.cur.Typ == tSymbol && p.cur.Val == "(" {
 		fcExpr, err := p.parseFuncCallWithName(rt)
 		if err != nil {
@@ -1813,47 +1827,37 @@ func (p *Parser) parseJoinTail() (FromItem, Expr, error) {
 		if fc.Over != nil {
 			return FromItem{}, nil, p.errf("OVER clause not allowed for table-valued functions in JOIN")
 		}
-		alias := rt
-		if p.cur.Typ == tKeyword && p.cur.Val == "AS" {
-			p.next()
-			alias = p.parseIdentLike()
-			if alias == "" {
-				return FromItem{}, nil, p.errf("expected alias")
-			}
-		} else if p.cur.Typ == tIdent {
-			alias = p.cur.Val
-			p.next()
-		}
-		if err := p.expectKeyword("ON"); err != nil {
+		alias, err := p.parseOptionalAlias(rt, "expected alias")
+		if err != nil {
 			return FromItem{}, nil, err
 		}
-		on, err := p.parseExpr()
+		on, err := p.parseJoinOnExpr()
 		if err != nil {
 			return FromItem{}, nil, err
 		}
 		return FromItem{TableFunc: &TableFuncCall{Name: rt, Args: fc.Args, Alias: alias}, Alias: alias}, on, nil
 	}
 
-	// Regular table
-	alias := rt
-	if p.cur.Typ == tKeyword && p.cur.Val == "AS" {
-		p.next()
-		alias = p.parseIdentLike()
-		if alias == "" {
-			return FromItem{}, nil, p.errf("expected alias")
-		}
-	} else if p.cur.Typ == tIdent {
-		alias = p.cur.Val
-		p.next()
-	}
-	if err := p.expectKeyword("ON"); err != nil {
+	alias, err := p.parseOptionalAlias(rt, "expected alias")
+	if err != nil {
 		return FromItem{}, nil, err
 	}
-	on, err := p.parseExpr()
+	on, err := p.parseJoinOnExpr()
 	if err != nil {
 		return FromItem{}, nil, err
 	}
 	return FromItem{Table: rt, Alias: alias}, on, nil
+}
+
+func (p *Parser) parseJoinOnExpr() (Expr, error) {
+	if err := p.expectKeyword("ON"); err != nil {
+		return nil, err
+	}
+	on, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	return on, nil
 }
 
 func (p *Parser) parseColumnDefs() ([]storage.Column, error) {
@@ -2593,68 +2597,14 @@ func (p *Parser) parseOverClause() (*OverClause, error) {
 	}
 
 	oc := &OverClause{}
-
-	// Parse PARTITION BY clause (optional)
-	if p.cur.Typ == tKeyword && p.cur.Val == "PARTITION" {
-		p.next()
-		if err := p.expectKeyword("BY"); err != nil {
-			return nil, err
-		}
-
-		for {
-			expr, err := p.parseExpr()
-			if err != nil {
-				return nil, err
-			}
-			oc.PartitionBy = append(oc.PartitionBy, expr)
-
-			if p.cur.Typ == tSymbol && p.cur.Val == "," {
-				p.next()
-				continue
-			}
-			break
-		}
+	if err := p.parseOverPartitionBy(oc); err != nil {
+		return nil, err
 	}
-
-	// Parse ORDER BY clause (optional)
-	if p.cur.Typ == tKeyword && p.cur.Val == "ORDER" {
-		p.next()
-		if err := p.expectKeyword("BY"); err != nil {
-			return nil, err
-		}
-
-		for {
-			if p.cur.Typ != tIdent && p.cur.Typ != tKeyword {
-				return nil, p.errf("expected column name in ORDER BY")
-			}
-			col := p.cur.Val
-			p.next()
-
-			desc := false
-			if p.cur.Typ == tKeyword && (p.cur.Val == "DESC" || p.cur.Val == "ASC") {
-				if p.cur.Val == "DESC" {
-					desc = true
-				}
-				p.next()
-			}
-
-			oc.OrderBy = append(oc.OrderBy, OrderItem{Col: col, Desc: desc})
-
-			if p.cur.Typ == tSymbol && p.cur.Val == "," {
-				p.next()
-				continue
-			}
-			break
-		}
+	if err := p.parseOverOrderBy(oc); err != nil {
+		return nil, err
 	}
-
-	// Parse frame clause (ROWS/RANGE BETWEEN ... AND ...) - optional
-	if p.cur.Typ == tKeyword && (p.cur.Val == "ROWS" || p.cur.Val == "RANGE") {
-		frame, err := p.parseWindowFrame()
-		if err != nil {
-			return nil, err
-		}
-		oc.Frame = frame
+	if err := p.parseOverFrame(oc); err != nil {
+		return nil, err
 	}
 
 	if err := p.expectSymbol(")"); err != nil {
@@ -2662,6 +2612,77 @@ func (p *Parser) parseOverClause() (*OverClause, error) {
 	}
 
 	return oc, nil
+}
+
+func (p *Parser) parseOverPartitionBy(oc *OverClause) error {
+	if p.cur.Typ != tKeyword || p.cur.Val != "PARTITION" {
+		return nil
+	}
+	p.next()
+	if err := p.expectKeyword("BY"); err != nil {
+		return err
+	}
+	for {
+		expr, err := p.parseExpr()
+		if err != nil {
+			return err
+		}
+		oc.PartitionBy = append(oc.PartitionBy, expr)
+		if p.cur.Typ == tSymbol && p.cur.Val == "," {
+			p.next()
+			continue
+		}
+		return nil
+	}
+}
+
+func (p *Parser) parseOverOrderBy(oc *OverClause) error {
+	if p.cur.Typ != tKeyword || p.cur.Val != "ORDER" {
+		return nil
+	}
+	p.next()
+	if err := p.expectKeyword("BY"); err != nil {
+		return err
+	}
+	for {
+		item, err := p.parseOverOrderItem()
+		if err != nil {
+			return err
+		}
+		oc.OrderBy = append(oc.OrderBy, item)
+		if p.cur.Typ == tSymbol && p.cur.Val == "," {
+			p.next()
+			continue
+		}
+		return nil
+	}
+}
+
+func (p *Parser) parseOverOrderItem() (OrderItem, error) {
+	if p.cur.Typ != tIdent && p.cur.Typ != tKeyword {
+		return OrderItem{}, p.errf("expected column name in ORDER BY")
+	}
+	col := p.cur.Val
+	p.next()
+
+	desc := false
+	if p.cur.Typ == tKeyword && (p.cur.Val == "DESC" || p.cur.Val == "ASC") {
+		desc = p.cur.Val == "DESC"
+		p.next()
+	}
+	return OrderItem{Col: col, Desc: desc}, nil
+}
+
+func (p *Parser) parseOverFrame(oc *OverClause) error {
+	if p.cur.Typ != tKeyword || (p.cur.Val != "ROWS" && p.cur.Val != "RANGE") {
+		return nil
+	}
+	frame, err := p.parseWindowFrame()
+	if err != nil {
+		return err
+	}
+	oc.Frame = frame
+	return nil
 }
 
 // parseWindowFrame parses ROWS/RANGE BETWEEN ... AND ...
