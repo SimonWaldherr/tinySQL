@@ -62,4 +62,3 @@ func BenchmarkParsePeerList_Dedup(b *testing.B) {
 		}
 	}
 }
-
