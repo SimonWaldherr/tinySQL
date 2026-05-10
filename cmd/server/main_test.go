@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -211,5 +213,70 @@ func TestMetricsRegistryPrometheusText(t *testing.T) {
 	}
 	if !strings.Contains(text, "tinysql_request_duration_seconds_bucket") {
 		t.Fatal("expected duration bucket metric in prometheus output")
+	}
+}
+
+func TestWithRequestTimeoutOverride(t *testing.T) {
+	s := &server{requestTimeout: 50 * time.Millisecond}
+
+	if _, _, err := s.withRequestTimeoutOverride(context.Background(), -1); err == nil {
+		t.Fatal("expected negative timeout to fail")
+	}
+
+	ctx, cancel, err := s.withRequestTimeoutOverride(context.Background(), 200)
+	if err != nil {
+		t.Fatalf("withRequestTimeoutOverride failed: %v", err)
+	}
+	defer cancel()
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("expected deadline to be set")
+	}
+	if rem := time.Until(deadline); rem <= 0 || rem > 65*time.Millisecond {
+		t.Fatalf("expected capped timeout around 50ms, got %s", rem)
+	}
+}
+
+func TestParsePeerListDedup(t *testing.T) {
+	got := parsePeerList("node1:9090,node2:9090,node1:9090, ,node2:9090,node3:9090")
+	want := []string{"node1:9090", "node2:9090", "node3:9090"}
+	if len(got) != len(want) {
+		t.Fatalf("parsePeerList len = %d, want %d (%v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("parsePeerList[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestHandleClusterStatusNoPeers(t *testing.T) {
+	s := &server{peers: nil}
+	req := httptest.NewRequest(http.MethodGet, "/api/cluster/status", nil)
+	rec := httptest.NewRecorder()
+
+	s.handleClusterStatus(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var body struct {
+		OK           bool `json:"ok"`
+		Cluster      bool `json:"cluster"`
+		PeerCount    int  `json:"peer_count"`
+		HealthyPeers int  `json:"healthy_peers"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !body.OK {
+		t.Fatal("expected ok=true")
+	}
+	if body.Cluster {
+		t.Fatal("expected cluster=false for empty peer list")
+	}
+	if body.PeerCount != 0 || body.HealthyPeers != 0 {
+		t.Fatalf("unexpected peer counters: %+v", body)
 	}
 }

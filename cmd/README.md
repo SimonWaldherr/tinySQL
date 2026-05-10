@@ -45,10 +45,11 @@ tool has its own README with full documentation — click the links below.
     - Timeouts: `-request-timeout`, `-peer-timeout`, `-shutdown-timeout`
     - HTTP hardening: `-trusted-proxies`, `-http-read-timeout`, `-http-read-header-timeout`, `-http-write-timeout`, `-http-idle-timeout`, `-http-max-header-bytes`
   - HTTP Endpoints:
-    - POST /api/exec {tenant, sql}
-    - POST /api/query {tenant, sql}
+    - POST /api/exec {tenant, sql, timeout_ms?}
+    - POST /api/query {tenant, sql, timeout_ms?}
     - GET  /api/status
-    - POST /api/federated/query {tenant, sql}
+    - GET  /api/cluster/status
+    - POST /api/federated/query {tenant, sql, timeout_ms?, peer_timeout_ms?}
     - GET  /healthz
     - GET  /readyz
     - GET  /metrics

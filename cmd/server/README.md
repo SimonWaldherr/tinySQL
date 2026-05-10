@@ -104,6 +104,12 @@ Execute a SELECT and return rows.
 { "tenant": "default", "sql": "SELECT * FROM t" }
 ```
 
+Optional request-level timeout override:
+
+```json
+{ "tenant": "default", "sql": "SELECT * FROM t", "timeout_ms": 5000 }
+```
+
 Response:
 
 ```json
@@ -118,9 +124,16 @@ Response:
 
 Returns server version, uptime, and tenant list.
 
+### `GET /api/cluster/status`
+
+Returns cluster health information for configured federation peers, including
+per-peer reachability and response duration.
+
 ### `POST /api/federated/query`
 
 Fan-out a read query to all configured peers and merge results.
+Supports optional `timeout_ms` and `peer_timeout_ms` overrides in the request
+body.
 
 ### `GET /healthz` / `GET /readyz`
 

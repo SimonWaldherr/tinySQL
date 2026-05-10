@@ -1,8 +1,10 @@
 module query_files
 
-go 1.25.9
+go 1.25.10
 
-require github.com/SimonWaldherr/tinySQL v0.4.0
+replace github.com/SimonWaldherr/tinySQL => ../../../tinySQL
+
+require github.com/SimonWaldherr/tinySQL v0.0.0
 
 require (
 	github.com/google/uuid v1.6.0 // indirect
@@ -10,5 +12,3 @@ require (
 	github.com/robfig/cron/v3 v3.0.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/SimonWaldherr/tinySQL => ../../../tinySQL

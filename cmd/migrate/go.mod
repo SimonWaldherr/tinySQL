@@ -1,9 +1,9 @@
 module migrate
 
-go 1.25.9
+go 1.25.10
 
 require (
-	github.com/SimonWaldherr/tinySQL v0.4.0
+	github.com/SimonWaldherr/tinySQL v0.0.0
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/lib/pq v1.10.9
 	github.com/microsoft/go-mssqldb v1.8.0

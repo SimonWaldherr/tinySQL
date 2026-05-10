@@ -1,6 +1,6 @@
 module github.com/SimonWaldherr/tinySQL/cmd/formigo
 
-go 1.25.9
+go 1.25.10
 
 require (
 	github.com/SimonWaldherr/tinySQL v0.0.0

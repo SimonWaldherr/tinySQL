@@ -88,14 +88,19 @@ Wichtig fuer Go-Projekte: `internal/` ist ein Sprachfeature. Pakete unter `inter
 package main
 
 import (
-    "database/sql"
+    "context"
     "fmt"
+    "time"
 
     tsqldriver "github.com/SimonWaldherr/tinySQL/driver"
 )
 
 func main() {
-    db, err := sql.Open(tsqldriver.DriverName, "mem://?tenant=default")
+    cfg := tsqldriver.DefaultOpenConfig()
+    cfg.Tenant = "default"
+    cfg.BusyTimeout = 500 * time.Millisecond
+
+    db, err := tsqldriver.OpenWithConfig(context.Background(), cfg)
     if err != nil {
         panic(err)
     }
@@ -118,12 +123,20 @@ DSN-Muster aus dem Repo:
 
 - In-Memory: `mem://?tenant=default`
 - Datei-basiert: `file:/pfad/zur/db.dat?tenant=default&autosave=1`
+- Mit Pooling/Busy-Timeout: `mem://?tenant=default&pool_readers=4&pool_writers=1&busy_timeout=250ms`
 
 Nuetzliche Helfer aus dem oeffentlichen Driver-Paket:
 
 - `driver.Open(dsn)` fuer den direkten `database/sql`-Einstieg
+- `driver.DefaultOpenConfig()` + `driver.OpenWithConfig(ctx, cfg)` fuer klar getrennte Settings (DSN, Pooling, Ping-Timeout)
 - `driver.OpenInMemory("default")` fuer kurzlebige Tests oder Werkzeuge
 - `driver.OpenFile("/pfad/zur/db.dat")` fuer dateibasierte Tools
+
+Best Practice fuer Timeouts und Settings:
+
+- DSN fuer tinySQL-spezifische Optionen (`tenant`, `autosave`, `pool_readers`, `pool_writers`, `busy_timeout`)
+- `database/sql` fuer Pool-Parameter (`MaxOpenConns`, `MaxIdleConns`, `ConnMaxLifetime`, `ConnMaxIdleTime`)
+- pro Anfrage/Query immer `context.WithTimeout(...)` + `ExecContext`/`QueryContext`/`PingContext` nutzen
 
 #### Eigene Werkzeuge und Erweiterungen bauen
 

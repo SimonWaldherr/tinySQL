@@ -1,6 +1,8 @@
 module github.com/SimonWaldherr/tinySQL/cmd/accessweb
 
-go 1.25.9
+go 1.25.10
+
+replace github.com/SimonWaldherr/tinySQL => ../..
 
 require github.com/SimonWaldherr/tinySQL v0.0.0
 
@@ -10,5 +12,3 @@ require (
 	github.com/robfig/cron/v3 v3.0.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/SimonWaldherr/tinySQL => ../..
