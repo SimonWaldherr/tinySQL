@@ -350,6 +350,16 @@ func TestTextChunksTVF(t *testing.T) {
 	}
 	// chunk_index of first chunk should be 0.
 	expectInt(t, rs.Rows[0]["chunk_index"], 0, "TEXT_CHUNKS chunk_index")
+	// Overlap of 1: last word of chunk0 should equal first word of chunk1.
+	if len(rs.Rows) >= 2 {
+		words0 := strings.Fields(rs.Rows[0]["chunk_text"].(string))
+		words1 := strings.Fields(rs.Rows[1]["chunk_text"].(string))
+		lastOf0 := words0[len(words0)-1]
+		firstOf1 := words1[0]
+		if lastOf0 != firstOf1 {
+			t.Errorf("expected overlap: last word of chunk0 %q should equal first word of chunk1 %q", lastOf0, firstOf1)
+		}
+	}
 }
 
 func TestTextChunksCharUnit(t *testing.T) {

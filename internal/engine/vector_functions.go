@@ -952,20 +952,28 @@ func evalVecMinDistance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return nil, fmt.Errorf("VEC_MIN_DISTANCE query: %w", err)
 	}
 	minDist := math.MaxFloat64
+	anyValid := false
+	var lastErr error
 	for i, arg := range ex.Args[1:] {
 		v, err := toVec(env, arg, row)
 		if err != nil {
-			return nil, fmt.Errorf("VEC_MIN_DISTANCE arg%d: %w", i+2, err)
+			lastErr = fmt.Errorf("VEC_MIN_DISTANCE arg%d: %w", i+2, err)
+			continue
 		}
 		d, err := computeDistance(query, v, "cosine")
 		if err != nil {
+			lastErr = err
 			continue
 		}
+		anyValid = true
 		if d < minDist {
 			minDist = d
 		}
 	}
-	if minDist == math.MaxFloat64 {
+	if !anyValid {
+		if lastErr != nil {
+			return nil, lastErr
+		}
 		return nil, nil
 	}
 	return minDist, nil

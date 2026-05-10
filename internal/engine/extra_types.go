@@ -401,6 +401,11 @@ func evalBitmapAnd(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 // All BLOB_ functions accept either representation.
 
 // blobDecode decodes a BLOB value (hex string or []byte) to raw bytes.
+// The preferred storage format is a lowercase hex string as produced by
+// blobEncode. As a convenience, plain (non-hex) strings are accepted and
+// treated as raw UTF-8 byte sequences, enabling text blobs. If you need
+// to store arbitrary binary data always use BLOB_FROM_HEX/BLOB_FROM_BASE64
+// to avoid ambiguity with plain text strings.
 func blobDecode(v any) ([]byte, error) {
 	switch x := v.(type) {
 	case []byte:
@@ -650,25 +655,25 @@ func evalBlobEqual(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 // getExtraTypeFunctions returns the function map for YAML/URL/HASH/BITMAP/BLOB helpers.
 func getExtraTypeFunctions() map[string]funcHandler {
 	return map[string]funcHandler{
-		"YAML_PARSE":     evalYAMLParse,
-		"YAML_GET":       evalYAMLGet,
-		"URL_PARSE":      evalURLParse,
-		"URL_ENCODE":     evalURLEncode,
-		"URL_DECODE":     evalURLDecode,
-		"HASH":           evalHashFunc,
-		"BITMAP_NEW":     evalBitmapNew,
-		"BITMAP_SET":     evalBitmapSet,
-		"BITMAP_GET":     evalBitmapGet,
-		"BITMAP_COUNT":   evalBitmapCount,
-		"BITMAP_OR":      evalBitmapOr,
-		"BITMAP_AND":     evalBitmapAnd,
-		"BLOB_LENGTH":    evalBlobLength,
-		"BLOB_HEX":       evalBlobHex,
-		"BLOB_FROM_HEX":  evalBlobFromHex,
-		"BLOB_SUBSTR":    evalBlobSubstr,
-		"BLOB_CONCAT":    evalBlobConcat,
-		"BLOB_TO_BASE64": evalBlobToBase64,
+		"YAML_PARSE":       evalYAMLParse,
+		"YAML_GET":         evalYAMLGet,
+		"URL_PARSE":        evalURLParse,
+		"URL_ENCODE":       evalURLEncode,
+		"URL_DECODE":       evalURLDecode,
+		"HASH":             evalHashFunc,
+		"BITMAP_NEW":       evalBitmapNew,
+		"BITMAP_SET":       evalBitmapSet,
+		"BITMAP_GET":       evalBitmapGet,
+		"BITMAP_COUNT":     evalBitmapCount,
+		"BITMAP_OR":        evalBitmapOr,
+		"BITMAP_AND":       evalBitmapAnd,
+		"BLOB_LENGTH":      evalBlobLength,
+		"BLOB_HEX":         evalBlobHex,
+		"BLOB_FROM_HEX":    evalBlobFromHex,
+		"BLOB_SUBSTR":      evalBlobSubstr,
+		"BLOB_CONCAT":      evalBlobConcat,
+		"BLOB_TO_BASE64":   evalBlobToBase64,
 		"BLOB_FROM_BASE64": evalBlobFromBase64,
-		"BLOB_EQUAL":     evalBlobEqual,
+		"BLOB_EQUAL":       evalBlobEqual,
 	}
 }

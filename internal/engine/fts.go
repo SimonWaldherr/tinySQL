@@ -468,10 +468,10 @@ func getFTSFunctions() map[string]funcHandler {
 
 // ftsQueryNode represents one node in a parsed boolean FTS query tree.
 type ftsQueryNode struct {
-	op      string       // "AND", "OR", "NOT", "TERM", "PHRASE", "PREFIX"
-	term    string       // for TERM / PREFIX
-	phrase  []string     // for PHRASE (stemmed tokens)
-	prefix  string       // for PREFIX (stem prefix without trailing *)
+	op      string   // "AND", "OR", "NOT", "TERM", "PHRASE", "PREFIX"
+	term    string   // for TERM / PREFIX
+	phrase  []string // for PHRASE (stemmed tokens)
+	prefix  string   // for PREFIX (stem prefix without trailing *)
 	left    *ftsQueryNode
 	right   *ftsQueryNode
 	operand *ftsQueryNode // for NOT
@@ -708,7 +708,8 @@ func ftsPhraseMatch(phrase, tokens []string) bool {
 	return false
 }
 
-// ftsScoreNode computes a BM25-ish contribution for a query node.
+const phraseMatchBonus = 1.5
+
 func ftsScoreNode(node *ftsQueryNode, freq map[string]int, docLen float64) float64 {
 	if node == nil {
 		return 0
@@ -741,7 +742,7 @@ func ftsScoreNode(node *ftsQueryNode, freq map[string]int, docLen float64) float
 				s += (tf * (bm25K1 + 1)) / (tf + bm25K1*(1-bm25B+bm25B*docLen))
 			}
 		}
-		return s * 1.5 // phrase match bonus
+		return s * phraseMatchBonus // phrase match bonus
 	case "AND":
 		return ftsScoreNode(node.left, freq, docLen) + ftsScoreNode(node.right, freq, docLen)
 	case "OR":

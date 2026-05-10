@@ -71,6 +71,10 @@ func (f *TextChunksTableFunc) Execute(ctx context.Context, args []Expr, env Exec
 			}
 		}
 	}
+	// Overlap must be strictly less than chunk_size to ensure forward progress.
+	// If overlap >= chunk_size the step would be ≤ 0, producing an infinite loop;
+	// we silently cap it at chunk_size-1 so callers with large overlaps still get
+	// sensible (if dense) output rather than an error.
 	if overlap >= chunkSize {
 		overlap = chunkSize - 1
 	}
