@@ -68,22 +68,29 @@ func TestOpenConfigFileDSN(t *testing.T) {
 }
 
 func TestOpenConfigValidation(t *testing.T) {
-	tests := []OpenConfig{
-		{Mode: "file"},
-		{Mode: "mem", PoolReaders: -1},
-		{Mode: "mem", PoolWriters: -1},
-		{Mode: "mem", BusyTimeout: -1 * time.Millisecond},
-		{Mode: "mem", MaxOpenConns: -1},
-		{Mode: "mem", MaxIdleConns: -1},
-		{Mode: "mem", ConnMaxLifetime: -1 * time.Second},
-		{Mode: "mem", ConnMaxIdleTime: -1 * time.Second},
-		{Mode: "mem", PingTimeout: -1 * time.Second},
-		{Mode: "other"},
+	tests := []struct {
+		cfg OpenConfig
+		msg string
+	}{
+		{cfg: OpenConfig{Mode: "file"}, msg: "requires FilePath"},
+		{cfg: OpenConfig{Mode: "mem", PoolReaders: -1}, msg: "PoolReaders"},
+		{cfg: OpenConfig{Mode: "mem", PoolWriters: -1}, msg: "PoolWriters"},
+		{cfg: OpenConfig{Mode: "mem", BusyTimeout: -1 * time.Millisecond}, msg: "BusyTimeout"},
+		{cfg: OpenConfig{Mode: "mem", MaxOpenConns: -1}, msg: "MaxOpenConns"},
+		{cfg: OpenConfig{Mode: "mem", MaxIdleConns: -1}, msg: "MaxIdleConns"},
+		{cfg: OpenConfig{Mode: "mem", ConnMaxLifetime: -1 * time.Second}, msg: "ConnMaxLifetime"},
+		{cfg: OpenConfig{Mode: "mem", ConnMaxIdleTime: -1 * time.Second}, msg: "ConnMaxIdleTime"},
+		{cfg: OpenConfig{Mode: "mem", PingTimeout: -1 * time.Second}, msg: "PingTimeout"},
+		{cfg: OpenConfig{Mode: "other"}, msg: "unsupported mode"},
 	}
 
 	for _, tc := range tests {
-		if _, err := tc.DSN(); err == nil {
-			t.Fatalf("expected validation error for %+v", tc)
+		_, err := tc.cfg.DSN()
+		if err == nil {
+			t.Fatalf("expected validation error for %+v", tc.cfg)
+		}
+		if !strings.Contains(err.Error(), tc.msg) {
+			t.Fatalf("expected error containing %q, got %q", tc.msg, err.Error())
 		}
 	}
 }
