@@ -66,6 +66,9 @@ func getAllFunctions() map[string]funcHandler {
 		for k, v := range getFTSFunctions() {
 			m[k] = v
 		}
+		for k, v := range getTextFunctions() {
+			m[k] = v
+		}
 		allFunctions = m
 	})
 	return allFunctions

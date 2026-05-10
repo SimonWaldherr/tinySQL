@@ -1,5 +1,5 @@
-// Package engine provides helper functions for the YAML, URL, HASH, and
-// BITMAP extra column types added to tinySQL.
+// Package engine provides helper functions for the YAML, URL, HASH, BITMAP,
+// and BLOB extra column types added to tinySQL.
 //
 // Note: MD5 and SHA1 are provided for compatibility and checksum use cases only.
 // They are cryptographically broken and must NOT be used for security-sensitive
@@ -11,6 +11,7 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -395,22 +396,279 @@ func evalBitmapAnd(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	return bitmapEncode(result), nil
 }
 
+// ─────────────────────────── BLOB helpers ────────────────────────────────────
+// BLOBs are stored as hex-encoded strings (lowercase hex) or raw []byte values.
+// All BLOB_ functions accept either representation.
+
+// blobDecode decodes a BLOB value (hex string or []byte) to raw bytes.
+func blobDecode(v any) ([]byte, error) {
+	switch x := v.(type) {
+	case []byte:
+		return x, nil
+	case string:
+		s := strings.TrimSpace(x)
+		if s == "" {
+			return []byte{}, nil
+		}
+		b, err := hex.DecodeString(s)
+		if err != nil {
+			// Treat as raw UTF-8 bytes (plain text blob).
+			return []byte(s), nil
+		}
+		return b, nil
+	case nil:
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("BLOB: cannot decode %T", v)
+	}
+}
+
+// blobEncode encodes raw bytes to a lowercase hex string for storage.
+func blobEncode(b []byte) string {
+	return hex.EncodeToString(b)
+}
+
+// evalBlobLength returns the byte length of a BLOB.
+func evalBlobLength(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) != 1 {
+		return nil, fmt.Errorf("BLOB_LENGTH expects 1 argument: (blob)")
+	}
+	v, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if v == nil {
+		return nil, nil
+	}
+	b, err := blobDecode(v)
+	if err != nil {
+		return nil, err
+	}
+	return len(b), nil
+}
+
+// evalBlobHex converts a BLOB to its hex string representation.
+func evalBlobHex(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) != 1 {
+		return nil, fmt.Errorf("BLOB_HEX expects 1 argument: (blob)")
+	}
+	v, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if v == nil {
+		return nil, nil
+	}
+	b, err := blobDecode(v)
+	if err != nil {
+		return nil, err
+	}
+	return blobEncode(b), nil
+}
+
+// evalBlobFromHex decodes a hex string into a BLOB (stored as hex string).
+func evalBlobFromHex(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) != 1 {
+		return nil, fmt.Errorf("BLOB_FROM_HEX expects 1 argument: (hex_string)")
+	}
+	v, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if v == nil {
+		return nil, nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return nil, fmt.Errorf("BLOB_FROM_HEX: argument must be a string, got %T", v)
+	}
+	b, err := hex.DecodeString(strings.TrimSpace(s))
+	if err != nil {
+		return nil, fmt.Errorf("BLOB_FROM_HEX: %w", err)
+	}
+	return blobEncode(b), nil
+}
+
+// evalBlobSubstr extracts a byte substring from a BLOB.
+// BLOB_SUBSTR(blob, start, length)  — 0-based start index.
+func evalBlobSubstr(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) != 3 {
+		return nil, fmt.Errorf("BLOB_SUBSTR expects 3 arguments: (blob, start, length)")
+	}
+	blobVal, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	startVal, err := evalExpr(env, ex.Args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	lenVal, err := evalExpr(env, ex.Args[2], row)
+	if err != nil {
+		return nil, err
+	}
+	if blobVal == nil {
+		return nil, nil
+	}
+	b, err := blobDecode(blobVal)
+	if err != nil {
+		return nil, err
+	}
+	start, err := toInt(startVal)
+	if err != nil {
+		return nil, fmt.Errorf("BLOB_SUBSTR start: %w", err)
+	}
+	length, err := toInt(lenVal)
+	if err != nil {
+		return nil, fmt.Errorf("BLOB_SUBSTR length: %w", err)
+	}
+	if start < 0 || start >= len(b) {
+		return blobEncode([]byte{}), nil
+	}
+	end := start + length
+	if end > len(b) {
+		end = len(b)
+	}
+	return blobEncode(b[start:end]), nil
+}
+
+// evalBlobConcat concatenates two BLOBs.
+func evalBlobConcat(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) != 2 {
+		return nil, fmt.Errorf("BLOB_CONCAT expects 2 arguments: (a, b)")
+	}
+	aVal, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	bVal, err := evalExpr(env, ex.Args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	var a, b []byte
+	if aVal != nil {
+		a, err = blobDecode(aVal)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if bVal != nil {
+		b, err = blobDecode(bVal)
+		if err != nil {
+			return nil, err
+		}
+	}
+	result := make([]byte, len(a)+len(b))
+	copy(result, a)
+	copy(result[len(a):], b)
+	return blobEncode(result), nil
+}
+
+// evalBlobToBase64 encodes a BLOB as a base64 string.
+func evalBlobToBase64(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) != 1 {
+		return nil, fmt.Errorf("BLOB_TO_BASE64 expects 1 argument: (blob)")
+	}
+	v, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if v == nil {
+		return nil, nil
+	}
+	b, err := blobDecode(v)
+	if err != nil {
+		return nil, err
+	}
+	return base64.StdEncoding.EncodeToString(b), nil
+}
+
+// evalBlobFromBase64 decodes a base64 string into a BLOB.
+func evalBlobFromBase64(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) != 1 {
+		return nil, fmt.Errorf("BLOB_FROM_BASE64 expects 1 argument: (base64_string)")
+	}
+	v, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if v == nil {
+		return nil, nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return nil, fmt.Errorf("BLOB_FROM_BASE64: argument must be a string, got %T", v)
+	}
+	b, err := base64.StdEncoding.DecodeString(strings.TrimSpace(s))
+	if err != nil {
+		// Try URL-safe base64.
+		b, err = base64.URLEncoding.DecodeString(strings.TrimSpace(s))
+		if err != nil {
+			return nil, fmt.Errorf("BLOB_FROM_BASE64: %w", err)
+		}
+	}
+	return blobEncode(b), nil
+}
+
+// evalBlobEqual returns true if two BLOBs contain identical bytes.
+func evalBlobEqual(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) != 2 {
+		return nil, fmt.Errorf("BLOB_EQUAL expects 2 arguments: (a, b)")
+	}
+	aVal, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	bVal, err := evalExpr(env, ex.Args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	if aVal == nil || bVal == nil {
+		return aVal == nil && bVal == nil, nil
+	}
+	a, err := blobDecode(aVal)
+	if err != nil {
+		return nil, err
+	}
+	b, err := blobDecode(bVal)
+	if err != nil {
+		return nil, err
+	}
+	if len(a) != len(b) {
+		return false, nil
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // ─────────────────────────── Registration ────────────────────────────────────
 
-// getExtraTypeFunctions returns the function map for YAML/URL/HASH/BITMAP helpers.
+// getExtraTypeFunctions returns the function map for YAML/URL/HASH/BITMAP/BLOB helpers.
 func getExtraTypeFunctions() map[string]funcHandler {
 	return map[string]funcHandler{
-		"YAML_PARSE":   evalYAMLParse,
-		"YAML_GET":     evalYAMLGet,
-		"URL_PARSE":    evalURLParse,
-		"URL_ENCODE":   evalURLEncode,
-		"URL_DECODE":   evalURLDecode,
-		"HASH":         evalHashFunc,
-		"BITMAP_NEW":   evalBitmapNew,
-		"BITMAP_SET":   evalBitmapSet,
-		"BITMAP_GET":   evalBitmapGet,
-		"BITMAP_COUNT": evalBitmapCount,
-		"BITMAP_OR":    evalBitmapOr,
-		"BITMAP_AND":   evalBitmapAnd,
+		"YAML_PARSE":     evalYAMLParse,
+		"YAML_GET":       evalYAMLGet,
+		"URL_PARSE":      evalURLParse,
+		"URL_ENCODE":     evalURLEncode,
+		"URL_DECODE":     evalURLDecode,
+		"HASH":           evalHashFunc,
+		"BITMAP_NEW":     evalBitmapNew,
+		"BITMAP_SET":     evalBitmapSet,
+		"BITMAP_GET":     evalBitmapGet,
+		"BITMAP_COUNT":   evalBitmapCount,
+		"BITMAP_OR":      evalBitmapOr,
+		"BITMAP_AND":     evalBitmapAnd,
+		"BLOB_LENGTH":    evalBlobLength,
+		"BLOB_HEX":       evalBlobHex,
+		"BLOB_FROM_HEX":  evalBlobFromHex,
+		"BLOB_SUBSTR":    evalBlobSubstr,
+		"BLOB_CONCAT":    evalBlobConcat,
+		"BLOB_TO_BASE64": evalBlobToBase64,
+		"BLOB_FROM_BASE64": evalBlobFromBase64,
+		"BLOB_EQUAL":     evalBlobEqual,
 	}
 }
