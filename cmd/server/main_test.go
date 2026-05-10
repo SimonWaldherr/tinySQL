@@ -262,10 +262,10 @@ func TestHandleClusterStatusNoPeers(t *testing.T) {
 	}
 
 	var body struct {
-		OK          bool `json:"ok"`
-		Cluster     bool `json:"cluster"`
-		PeerCount   int  `json:"peer_count"`
-		HealthyPeer int  `json:"healthy_peers"`
+		OK           bool `json:"ok"`
+		Cluster      bool `json:"cluster"`
+		PeerCount    int  `json:"peer_count"`
+		HealthyPeers int  `json:"healthy_peers"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode response: %v", err)
@@ -276,7 +276,7 @@ func TestHandleClusterStatusNoPeers(t *testing.T) {
 	if body.Cluster {
 		t.Fatal("expected cluster=false for empty peer list")
 	}
-	if body.PeerCount != 0 || body.HealthyPeer != 0 {
+	if body.PeerCount != 0 || body.HealthyPeers != 0 {
 		t.Fatalf("unexpected peer counters: %+v", body)
 	}
 }
