@@ -98,14 +98,6 @@ func (c OpenConfig) DSN() (string, error) {
 // OpenWithConfig opens a tinySQL database using explicit settings and validates
 // connectivity with PingContext.
 func OpenWithConfig(ctx context.Context, cfg OpenConfig) (*sql.DB, error) {
-	mode := strings.ToLower(strings.TrimSpace(cfg.Mode))
-	if mode == "" {
-		mode = "mem"
-	}
-	if err := validateOpenConfig(cfg, mode); err != nil {
-		return nil, err
-	}
-
 	dsn, err := cfg.DSN()
 	if err != nil {
 		return nil, err
