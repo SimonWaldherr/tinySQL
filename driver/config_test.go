@@ -112,4 +112,3 @@ func TestOpenWithConfig(t *testing.T) {
 		t.Fatalf("expected Alice, got %q", got)
 	}
 }
-
