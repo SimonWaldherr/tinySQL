@@ -57,17 +57,26 @@ func main() {
 package main
 
 import (
-    "database/sql"
+    "context"
     "fmt"
+    "log"
+    "time"
     tsqldriver "github.com/SimonWaldherr/tinySQL/driver"
 )
 
 func main() {
-    db, _ := sql.Open(tsqldriver.DriverName, "mem://?tenant=default")
+    cfg := tsqldriver.DefaultOpenConfig()
+    cfg.Tenant = "default"
+    cfg.BusyTimeout = 500 * time.Millisecond
+
+    db, err := tsqldriver.OpenWithConfig(context.Background(), cfg)
+    if err != nil {
+        log.Fatal(err)
+    }
     defer db.Close()
 
-    db.Exec(`CREATE TABLE t (id INT, name TEXT)`)
-    db.Exec(`INSERT INTO t VALUES (?, ?)`, 1, "Alice")
+    _, _ = db.Exec(`CREATE TABLE t (id INT, name TEXT)`)
+    _, _ = db.Exec(`INSERT INTO t VALUES (?, ?)`, 1, "Alice")
 
     row := db.QueryRow(`SELECT name FROM t WHERE id = ?`, 1)
     var name string
@@ -146,6 +155,13 @@ When using the database/sql driver:
 Parameters:
 - `tenant` - Tenant name for multi-tenancy (required)
 - `autosave` - Auto-save to file (optional, for file-based databases)
+- `pool_readers` / `pool_writers` - tinySQL reader/writer pool sizes (optional)
+- `busy_timeout` - wait timeout for busy pools, e.g. `250ms`, `2s`, or `250` (milliseconds)
+
+Best-practice settings split:
+- DSN (`tenant`, `autosave`, `pool_*`, `busy_timeout`) configures tinySQL driver behavior
+- `database/sql` pool settings (`SetMaxOpenConns`, `SetMaxIdleConns`, lifetimes) configure connection pooling
+- per-request/query timeout should be passed via `context.WithTimeout(...)` to `PingContext` / `ExecContext` / `QueryContext`
 
 ## SQLite Feature Gaps
 
