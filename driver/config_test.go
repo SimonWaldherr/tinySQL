@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -49,10 +50,11 @@ func TestOpenConfigFileDSN(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DSN() returned error: %v", err)
 	}
-	if !strings.HasPrefix(dsn, "file:data/test.db?") {
+	expectedPrefix := "file:" + filepath.Clean(cfg.FilePath) + "?"
+	if !strings.HasPrefix(dsn, expectedPrefix) {
 		t.Fatalf("unexpected file DSN prefix: %q", dsn)
 	}
-	qraw := strings.TrimPrefix(dsn, "file:data/test.db?")
+	qraw := strings.TrimPrefix(dsn, expectedPrefix)
 	q, err := url.ParseQuery(qraw)
 	if err != nil {
 		t.Fatalf("ParseQuery failed: %v", err)
