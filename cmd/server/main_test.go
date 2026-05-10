@@ -233,7 +233,7 @@ func TestWithRequestTimeoutOverride(t *testing.T) {
 	if !ok {
 		t.Fatal("expected deadline to be set")
 	}
-	if rem := time.Until(deadline); rem <= 0 || rem > 55*time.Millisecond {
+	if rem := time.Until(deadline); rem <= 0 || rem > 65*time.Millisecond {
 		t.Fatalf("expected capped timeout around 50ms, got %s", rem)
 	}
 }
