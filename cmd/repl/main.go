@@ -178,6 +178,39 @@ func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool
 	}
 }
 
+// replReadAndExecFile reads SQL statements from filename and executes them.
+func replReadAndExecFile(db *sql.DB, filename string) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	stmts := strings.Split(string(data), ";")
+	for _, s := range stmts {
+		s = strings.TrimSpace(s)
+		if s == "" || strings.HasPrefix(s, "--") {
+			continue
+		}
+		up := strings.ToUpper(s)
+		if strings.HasPrefix(up, "SELECT") || strings.HasPrefix(up, "WITH") {
+			rows, err := db.Query(s)
+			if err != nil {
+				fmt.Println("ERR:", err)
+				continue
+			}
+			cols, _ := rows.Columns()
+			replPrintRows(rows, cols)
+			rows.Close()
+		} else {
+			if _, err := db.Exec(s); err != nil {
+				fmt.Println("ERR:", err)
+			} else {
+				fmt.Println("(ok)")
+			}
+		}
+	}
+}
+
 func handleMeta(db *sql.DB, line string) bool {
 	parts := strings.Fields(line)
 	if len(parts) == 0 {
@@ -262,36 +295,7 @@ Commands:
 			fmt.Println("Usage: .read FILE")
 			return true
 		}
-		data, err := os.ReadFile(args[0])
-		if err != nil {
-			fmt.Println("Error:", err)
-			return true
-		}
-		// Execute each statement
-		stmts := strings.Split(string(data), ";")
-		for _, s := range stmts {
-			s = strings.TrimSpace(s)
-			if s == "" || strings.HasPrefix(s, "--") {
-				continue
-			}
-			up := strings.ToUpper(s)
-			if strings.HasPrefix(up, "SELECT") || strings.HasPrefix(up, "WITH") {
-				rows, err := db.Query(s)
-				if err != nil {
-					fmt.Println("ERR:", err)
-					continue
-				}
-				cols, _ := rows.Columns()
-				replPrintRows(rows, cols)
-				rows.Close()
-			} else {
-				if _, err := db.Exec(s); err != nil {
-					fmt.Println("ERR:", err)
-				} else {
-					fmt.Println("(ok)")
-				}
-			}
-		}
+		replReadAndExecFile(db, args[0])
 		return true
 
 	case ".clear":

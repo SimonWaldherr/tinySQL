@@ -372,6 +372,93 @@ func evalFTSRank(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	return score, nil
 }
 
+// ftsSnippetOpts holds the display options for FTS_SNIPPET.
+type ftsSnippetOpts struct {
+	before    string
+	after     string
+	ellipsis  string
+	maxTokens int
+}
+
+// parseFTSSnippetOpts reads the optional 3rd-6th arguments of FTS_SNIPPET.
+func parseFTSSnippetOpts(env ExecEnv, ex *FuncCall, row Row) (ftsSnippetOpts, error) {
+	opts := ftsSnippetOpts{before: "<b>", after: "</b>", ellipsis: "...", maxTokens: 20}
+	optDefs := []struct {
+		idx   int
+		apply func(string)
+	}{
+		{2, func(v string) { opts.before = v }},
+		{3, func(v string) { opts.after = v }},
+		{4, func(v string) { opts.ellipsis = v }},
+	}
+	for _, d := range optDefs {
+		if len(ex.Args) > d.idx {
+			v, err := evalExpr(env, ex.Args[d.idx], row)
+			if err == nil && v != nil {
+				d.apply(fmt.Sprintf("%v", v))
+			}
+		}
+	}
+	if len(ex.Args) >= 6 {
+		v, err := evalExpr(env, ex.Args[5], row)
+		if err == nil && v != nil {
+			if n, _ := toInt(v); n > 0 {
+				opts.maxTokens = n
+			}
+		}
+	}
+	return opts, nil
+}
+
+// buildFTSSnippet builds a highlighted snippet from the given words and query set.
+func buildFTSSnippet(words []string, querySet map[string]bool, opts ftsSnippetOpts) string {
+	matchIdx := -1
+	for i, w := range words {
+		if querySet[ftsStem(strings.ToLower(w))] {
+			matchIdx = i
+			break
+		}
+	}
+
+	start, end := 0, len(words)
+	prefix, suffix := "", ""
+
+	if matchIdx >= 0 {
+		start = matchIdx - opts.maxTokens/2
+		if start < 0 {
+			start = 0
+		} else {
+			prefix = opts.ellipsis
+		}
+		end = start + opts.maxTokens
+		if end > len(words) {
+			end = len(words)
+		} else {
+			suffix = opts.ellipsis
+		}
+	} else if end > opts.maxTokens {
+		end = opts.maxTokens
+		suffix = opts.ellipsis
+	}
+
+	var sb strings.Builder
+	sb.WriteString(prefix)
+	for i, w := range words[start:end] {
+		if i > 0 {
+			sb.WriteString(" ")
+		}
+		if querySet[ftsStem(strings.ToLower(w))] {
+			sb.WriteString(opts.before)
+			sb.WriteString(w)
+			sb.WriteString(opts.after)
+		} else {
+			sb.WriteString(w)
+		}
+	}
+	sb.WriteString(suffix)
+	return sb.String()
+}
+
 // evalFTSSnippet returns a highlighted snippet of text around matching terms.
 func evalFTSSnippet(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if len(ex.Args) < 2 {
@@ -389,98 +476,19 @@ func evalFTSSnippet(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return nil, nil
 	}
 
-	before := "<b>"
-	after := "</b>"
-	ellipsis := "..."
-	maxTokens := 20
-
-	if len(ex.Args) >= 3 {
-		v, err := evalExpr(env, ex.Args[2], row)
-		if err == nil && v != nil {
-			before = fmt.Sprintf("%v", v)
-		}
-	}
-	if len(ex.Args) >= 4 {
-		v, err := evalExpr(env, ex.Args[3], row)
-		if err == nil && v != nil {
-			after = fmt.Sprintf("%v", v)
-		}
-	}
-	if len(ex.Args) >= 5 {
-		v, err := evalExpr(env, ex.Args[4], row)
-		if err == nil && v != nil {
-			ellipsis = fmt.Sprintf("%v", v)
-		}
-	}
-	if len(ex.Args) >= 6 {
-		v, err := evalExpr(env, ex.Args[5], row)
-		if err == nil && v != nil {
-			n, _ := toInt(v)
-			if n > 0 {
-				maxTokens = n
-			}
-		}
+	opts, err := parseFTSSnippetOpts(env, ex, row)
+	if err != nil {
+		return nil, err
 	}
 
-	text := fmt.Sprintf("%v", textVal)
-	query := fmt.Sprintf("%v", queryVal)
-	queryTerms := ftsTokenize(query)
+	queryTerms := ftsTokenize(fmt.Sprintf("%v", queryVal))
 	querySet := make(map[string]bool, len(queryTerms))
 	for _, q := range queryTerms {
 		querySet[q] = true
 	}
 
-	words := strings.Fields(text)
-	// Find the window of maxTokens around the first match.
-	matchIdx := -1
-	for i, w := range words {
-		stemmed := ftsStem(strings.ToLower(w))
-		if querySet[stemmed] {
-			matchIdx = i
-			break
-		}
-	}
-
-	start := 0
-	end := len(words)
-	prefix := ""
-	suffix := ""
-
-	if matchIdx >= 0 {
-		start = matchIdx - maxTokens/2
-		if start < 0 {
-			start = 0
-		} else {
-			prefix = ellipsis
-		}
-		end = start + maxTokens
-		if end > len(words) {
-			end = len(words)
-		} else {
-			suffix = ellipsis
-		}
-	} else if end > maxTokens {
-		end = maxTokens
-		suffix = ellipsis
-	}
-
-	var sb strings.Builder
-	sb.WriteString(prefix)
-	for i, w := range words[start:end] {
-		if i > 0 {
-			sb.WriteString(" ")
-		}
-		stemmed := ftsStem(strings.ToLower(w))
-		if querySet[stemmed] {
-			sb.WriteString(before)
-			sb.WriteString(w)
-			sb.WriteString(after)
-		} else {
-			sb.WriteString(w)
-		}
-	}
-	sb.WriteString(suffix)
-	return sb.String(), nil
+	words := strings.Fields(fmt.Sprintf("%v", textVal))
+	return buildFTSSnippet(words, querySet, opts), nil
 }
 
 // getFTSFunctions returns scalar FTS function handlers.
