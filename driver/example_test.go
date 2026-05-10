@@ -135,7 +135,11 @@ func ExampleOpen_transaction() {
 		fmt.Println("create error:", err)
 		return
 	}
-	if _, err := db.Exec(`INSERT INTO accounts VALUES (1, 1000.0), (2, 500.0)`); err != nil {
+	if _, err := db.Exec(`INSERT INTO accounts VALUES (1, 1000.0)`); err != nil {
+		fmt.Println("insert error:", err)
+		return
+	}
+	if _, err := db.Exec(`INSERT INTO accounts VALUES (2, 500.0)`); err != nil {
 		fmt.Println("insert error:", err)
 		return
 	}
