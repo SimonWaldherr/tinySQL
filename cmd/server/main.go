@@ -92,8 +92,9 @@ var (
 
 // HTTP types
 type execRequest struct {
-	Tenant string `json:"tenant"`
-	SQL    string `json:"sql"`
+	Tenant    string `json:"tenant"`
+	SQL       string `json:"sql"`
+	TimeoutMS int64  `json:"timeout_ms,omitempty"`
 }
 
 type execResponse struct {
@@ -105,8 +106,10 @@ type execResponse struct {
 }
 
 type queryRequest struct {
-	Tenant string `json:"tenant"`
-	SQL    string `json:"sql"`
+	Tenant        string `json:"tenant"`
+	SQL           string `json:"sql"`
+	TimeoutMS     int64  `json:"timeout_ms,omitempty"`
+	PeerTimeoutMS int64  `json:"peer_timeout_ms,omitempty"`
 }
 
 type queryResponse struct {
@@ -226,6 +229,39 @@ func (s *server) withRequestTimeout(ctx context.Context) (context.Context, conte
 		return ctx, func() {}
 	}
 	return context.WithTimeout(ctx, s.requestTimeout)
+}
+
+func (s *server) withRequestTimeoutOverride(ctx context.Context, timeoutMS int64) (context.Context, context.CancelFunc, error) {
+	if timeoutMS < 0 {
+		return nil, nil, fmt.Errorf("timeout_ms must be >= 0")
+	}
+	if timeoutMS == 0 {
+		reqCtx, cancel := s.withRequestTimeout(ctx)
+		return reqCtx, cancel, nil
+	}
+	d := time.Duration(timeoutMS) * time.Millisecond
+	if d <= 0 {
+		return nil, nil, fmt.Errorf("timeout_ms is out of range")
+	}
+	if s.requestTimeout > 0 && d > s.requestTimeout {
+		d = s.requestTimeout
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, d)
+	return reqCtx, cancel, nil
+}
+
+func (s *server) peerTimeoutOverride(timeoutMS int64) (time.Duration, error) {
+	if timeoutMS < 0 {
+		return 0, fmt.Errorf("peer_timeout_ms must be >= 0")
+	}
+	if timeoutMS == 0 {
+		return s.peerTimeout, nil
+	}
+	d := time.Duration(timeoutMS) * time.Millisecond
+	if d <= 0 {
+		return 0, fmt.Errorf("peer_timeout_ms is out of range")
+	}
+	return d, nil
 }
 
 func (s *server) normalizeSQL(sqlText string) (string, error) {
@@ -416,7 +452,10 @@ func (s *server) Exec(ctx context.Context, req *execRequest) (*execResponse, err
 		return &execResponse{Success: false, Error: err.Error(), Duration: time.Since(start).String()}, nil
 	}
 
-	ctx, cancel := s.withRequestTimeout(ctx)
+	ctx, cancel, err := s.withRequestTimeoutOverride(ctx, req.TimeoutMS)
+	if err != nil {
+		return &execResponse{Success: false, Error: err.Error(), Duration: time.Since(start).String()}, nil
+	}
 	defer cancel()
 
 	parser := engine.NewParser(sqlText)
@@ -439,7 +478,10 @@ func (s *server) Query(ctx context.Context, req *queryRequest) (*queryResponse, 
 		return &queryResponse{SQL: req.SQL, Error: err.Error(), Duration: time.Since(start).String()}, nil
 	}
 
-	ctx, cancel := s.withRequestTimeout(ctx)
+	ctx, cancel, err := s.withRequestTimeoutOverride(ctx, req.TimeoutMS)
+	if err != nil {
+		return &queryResponse{SQL: req.SQL, Error: err.Error(), Duration: time.Since(start).String()}, nil
+	}
 	defer cancel()
 
 	compiled, err := s.cache.Compile(sqlText)
@@ -579,6 +621,72 @@ func (s *server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+func (s *server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErrorJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	type peerStatus struct {
+		Address  string `json:"address"`
+		Healthy  bool   `json:"healthy"`
+		Duration string `json:"duration"`
+		Error    string `json:"error,omitempty"`
+	}
+
+	type peerRes struct {
+		status peerStatus
+	}
+
+	ctx, cancel := s.withRequestTimeout(r.Context())
+	defer cancel()
+
+	ch := make(chan peerRes, len(s.peers))
+	var wg sync.WaitGroup
+	for _, raw := range s.peers {
+		addr := strings.TrimSpace(raw)
+		if addr == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+			start := time.Now()
+			_, err := grpcQuery(ctx, addr, &queryRequest{Tenant: s.defaultT, SQL: "SELECT 1"}, s.authToken, s.peerTimeout, *flagGRPCMaxRecv, s.peerDialCreds)
+			status := peerStatus{
+				Address:  addr,
+				Healthy:  err == nil,
+				Duration: time.Since(start).String(),
+			}
+			if err != nil {
+				status.Error = err.Error()
+			}
+			ch <- peerRes{status: status}
+		}(addr)
+	}
+
+	wg.Wait()
+	close(ch)
+
+	peers := make([]peerStatus, 0, len(s.peers))
+	healthy := 0
+	for res := range ch {
+		peers = append(peers, res.status)
+		if res.status.Healthy {
+			healthy++
+		}
+	}
+	sort.Slice(peers, func(i, j int) bool { return peers[i].Address < peers[j].Address })
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":            true,
+		"cluster":       len(peers) > 0,
+		"peer_count":    len(peers),
+		"healthy_peers": healthy,
+		"peers":         peers,
+	})
+}
+
 func sameColumns(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
@@ -607,19 +715,23 @@ func (s *server) handleFederatedQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	local, _ := s.Query(r.Context(), &req)
-	if local.Error != "" {
-		writeJSON(w, http.StatusBadRequest, local)
+	peerTimeout, err := s.peerTimeoutOverride(req.PeerTimeoutMS)
+	if err != nil {
+		writeErrorJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	cols := append([]string{}, local.Columns...)
-	rows := append([]map[string]any{}, local.Rows...)
 
 	type peerRes struct {
 		rows []map[string]any
 		cols []string
 		err  error
 	}
+
+	localCh := make(chan *queryResponse, 1)
+	go func() {
+		local, _ := s.Query(r.Context(), &req)
+		localCh <- local
+	}()
 
 	ch := make(chan peerRes, len(s.peers))
 	var wg sync.WaitGroup
@@ -631,7 +743,7 @@ func (s *server) handleFederatedQuery(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(addr string) {
 			defer wg.Done()
-			out, err := grpcQuery(r.Context(), addr, &queryRequest{Tenant: req.Tenant, SQL: req.SQL}, s.authToken, s.peerTimeout, *flagGRPCMaxRecv, s.peerDialCreds)
+			out, err := grpcQuery(r.Context(), addr, &queryRequest{Tenant: req.Tenant, SQL: req.SQL, TimeoutMS: req.TimeoutMS}, s.authToken, peerTimeout, *flagGRPCMaxRecv, s.peerDialCreds)
 			if err != nil {
 				ch <- peerRes{err: err}
 				return
@@ -639,6 +751,15 @@ func (s *server) handleFederatedQuery(w http.ResponseWriter, r *http.Request) {
 			ch <- peerRes{rows: out.Rows, cols: out.Columns}
 		}(addr)
 	}
+
+	local := <-localCh
+	if local.Error != "" {
+		writeJSON(w, http.StatusBadRequest, local)
+		return
+	}
+
+	cols := append([]string{}, local.Columns...)
+	rows := append([]map[string]any{}, local.Rows...)
 
 	wg.Wait()
 	close(ch)
@@ -743,9 +864,14 @@ func parsePeerList(raw string) []string {
 	}
 	parts := strings.Split(raw, ",")
 	peers := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
 		if p != "" {
+			if _, ok := seen[p]; ok {
+				continue
+			}
+			seen[p] = struct{}{}
 			peers = append(peers, p)
 		}
 	}
@@ -1125,6 +1251,7 @@ func run() error {
 		mux.HandleFunc("/api/exec", srv.instrumentHTTP("/api/exec", srv.withAuth(srv.handleExec)))
 		mux.HandleFunc("/api/query", srv.instrumentHTTP("/api/query", srv.withAuth(srv.handleQuery)))
 		mux.HandleFunc("/api/status", srv.instrumentHTTP("/api/status", srv.withAuth(srv.handleStatus)))
+		mux.HandleFunc("/api/cluster/status", srv.instrumentHTTP("/api/cluster/status", srv.withAuth(srv.handleClusterStatus)))
 		mux.HandleFunc("/api/federated/query", srv.instrumentHTTP("/api/federated/query", srv.withAuth(srv.handleFederatedQuery)))
 		mux.HandleFunc("/metrics", srv.instrumentHTTP("/metrics", srv.withAuth(srv.handleMetrics)))
 		mux.HandleFunc("/healthz", srv.instrumentHTTP("/healthz", srv.handleHealth))
