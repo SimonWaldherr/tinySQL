@@ -1073,141 +1073,161 @@ func applyStorageOptions(values url.Values, cfg *storage.StorageConfig) error {
 }
 
 func openDBFromDSN(dsn string) (*storage.DB, string, error) {
-	dsn = strings.TrimSpace(dsn)
-	if dsn == "" {
-		dsn = "mem://?tenant=default"
-	}
-
+	dsn = normalizeDSN(dsn)
 	lower := strings.ToLower(dsn)
 	switch {
 	case strings.HasPrefix(lower, "mem://"):
-		rawQuery := ""
-		if i := strings.Index(dsn, "?"); i >= 0 {
-			rawQuery = dsn[i+1:]
-		}
-		values, err := url.ParseQuery(rawQuery)
-		if err != nil {
-			return nil, "", fmt.Errorf("parse mem DSN query: %w", err)
-		}
-
-		tenant := strings.TrimSpace(values.Get("tenant"))
-		if tenant == "" {
-			tenant = "default"
-		}
-
-		mode := storage.ModeMemory
-		if ms := strings.TrimSpace(values.Get("mode")); ms != "" {
-			mode, err = storage.ParseStorageMode(ms)
-			if err != nil {
-				return nil, "", fmt.Errorf("parse mode: %w", err)
-			}
-		}
-
-		cfg := storage.DefaultStorageConfig(mode)
-		cfg.Mode = mode
-		if mode != storage.ModeMemory {
-			path := strings.TrimSpace(values.Get("path"))
-			if path == "" {
-				return nil, "", fmt.Errorf("mem DSN with mode=%s requires path query parameter", mode)
-			}
-			cfg.Path = filepath.Clean(path)
-		}
-		if err := applyStorageOptions(values, &cfg); err != nil {
-			return nil, "", err
-		}
-
-		db, err := storage.OpenDB(cfg)
-		if err != nil {
-			return nil, "", fmt.Errorf("open database: %w", err)
-		}
-		return db, tenant, nil
-
+		return openMemDBFromDSN(dsn)
 	case strings.HasPrefix(lower, "file:"):
-		rest := dsn[len("file:"):]
-		if rest == "" {
-			return nil, "", fmt.Errorf("file DSN path required")
-		}
-
-		path := rest
-		rawQuery := ""
-		if i := strings.Index(rest, "?"); i >= 0 {
-			path = rest[:i]
-			rawQuery = rest[i+1:]
-		}
-		path = strings.TrimSpace(path)
-		if path == "" {
-			return nil, "", fmt.Errorf("file DSN path required")
-		}
-
-		values, err := url.ParseQuery(rawQuery)
-		if err != nil {
-			return nil, "", fmt.Errorf("parse file DSN query: %w", err)
-		}
-
-		tenant := strings.TrimSpace(values.Get("tenant"))
-		if tenant == "" {
-			tenant = "default"
-		}
-
-		mode := storage.ModeMemory
-		if ms := strings.TrimSpace(values.Get("mode")); ms != "" {
-			mode, err = storage.ParseStorageMode(ms)
-			if err != nil {
-				return nil, "", fmt.Errorf("parse mode: %w", err)
-			}
-		} else if raw := strings.TrimSpace(values.Get("autosave")); raw != "" {
-			autosave, err := parseBoolValue(raw)
-			if err != nil {
-				return nil, "", fmt.Errorf("autosave: %w", err)
-			}
-			if autosave {
-				mode = storage.ModeWAL
-			}
-		}
-
-		cfg := storage.DefaultStorageConfig(mode)
-		cfg.Mode = mode
-		cfg.Path = filepath.Clean(path)
-		if err := applyStorageOptions(values, &cfg); err != nil {
-			return nil, "", err
-		}
-
-		db, err := storage.OpenDB(cfg)
-		if err != nil {
-			return nil, "", fmt.Errorf("open database: %w", err)
-		}
-		return db, tenant, nil
-
+		return openFileDBFromDSN(dsn)
 	default:
 		return nil, "", fmt.Errorf("unsupported DSN %q", dsn)
 	}
 }
 
+func normalizeDSN(dsn string) string {
+	dsn = strings.TrimSpace(dsn)
+	if dsn == "" {
+		return "mem://?tenant=default"
+	}
+	return dsn
+}
+
+func dsnTenant(values url.Values) string {
+	tenant := strings.TrimSpace(values.Get("tenant"))
+	if tenant == "" {
+		return "default"
+	}
+	return tenant
+}
+
+func parseDSNQuery(rawQuery, prefix string) (url.Values, error) {
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s DSN query: %w", prefix, err)
+	}
+	return values, nil
+}
+
+func parseStorageModeOrDefault(values url.Values) (storage.StorageMode, error) {
+	mode := storage.ModeMemory
+	if ms := strings.TrimSpace(values.Get("mode")); ms != "" {
+		parsed, err := storage.ParseStorageMode(ms)
+		if err != nil {
+			return 0, fmt.Errorf("parse mode: %w", err)
+		}
+		mode = parsed
+	}
+	return mode, nil
+}
+
+func openMemDBFromDSN(dsn string) (*storage.DB, string, error) {
+	rawQuery := ""
+	if i := strings.Index(dsn, "?"); i >= 0 {
+		rawQuery = dsn[i+1:]
+	}
+	values, err := parseDSNQuery(rawQuery, "mem")
+	if err != nil {
+		return nil, "", err
+	}
+
+	mode, err := parseStorageModeOrDefault(values)
+	if err != nil {
+		return nil, "", err
+	}
+
+	cfg := storage.DefaultStorageConfig(mode)
+	cfg.Mode = mode
+	if mode != storage.ModeMemory {
+		path := strings.TrimSpace(values.Get("path"))
+		if path == "" {
+			return nil, "", fmt.Errorf("mem DSN with mode=%s requires path query parameter", mode)
+		}
+		cfg.Path = filepath.Clean(path)
+	}
+	if err := applyStorageOptions(values, &cfg); err != nil {
+		return nil, "", err
+	}
+
+	db, err := storage.OpenDB(cfg)
+	if err != nil {
+		return nil, "", fmt.Errorf("open database: %w", err)
+	}
+	return db, dsnTenant(values), nil
+}
+
+func parseFileDSNParts(dsn string) (string, string, error) {
+	rest := dsn[len("file:"):]
+	if rest == "" {
+		return "", "", fmt.Errorf("file DSN path required")
+	}
+
+	path := rest
+	rawQuery := ""
+	if i := strings.Index(rest, "?"); i >= 0 {
+		path = rest[:i]
+		rawQuery = rest[i+1:]
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", "", fmt.Errorf("file DSN path required")
+	}
+	return path, rawQuery, nil
+}
+
+func parseFileDSNMode(values url.Values) (storage.StorageMode, error) {
+	mode, err := parseStorageModeOrDefault(values)
+	if err != nil {
+		return 0, err
+	}
+	if strings.TrimSpace(values.Get("mode")) != "" {
+		return mode, nil
+	}
+	if raw := strings.TrimSpace(values.Get("autosave")); raw != "" {
+		autosave, err := parseBoolValue(raw)
+		if err != nil {
+			return 0, fmt.Errorf("autosave: %w", err)
+		}
+		if autosave {
+			return storage.ModeWAL, nil
+		}
+	}
+	return mode, nil
+}
+
+func openFileDBFromDSN(dsn string) (*storage.DB, string, error) {
+	path, rawQuery, err := parseFileDSNParts(dsn)
+	if err != nil {
+		return nil, "", err
+	}
+	values, err := parseDSNQuery(rawQuery, "file")
+	if err != nil {
+		return nil, "", err
+	}
+
+	mode, err := parseFileDSNMode(values)
+	if err != nil {
+		return nil, "", err
+	}
+
+	cfg := storage.DefaultStorageConfig(mode)
+	cfg.Mode = mode
+	cfg.Path = filepath.Clean(path)
+	if err := applyStorageOptions(values, &cfg); err != nil {
+		return nil, "", err
+	}
+
+	db, err := storage.OpenDB(cfg)
+	if err != nil {
+		return nil, "", fmt.Errorf("open database: %w", err)
+	}
+	return db, dsnTenant(values), nil
+}
+
 func run() error {
 	flag.Parse()
 
-	httpAddr := strings.TrimSpace(*flagHTTP)
-	grpcAddr := strings.TrimSpace(*flagGRPC)
-	if httpAddr == "" && grpcAddr == "" {
-		return fmt.Errorf("no server (HTTP or gRPC) enabled")
-	}
-	if err := validateTLSPair(*flagHTTPTLSCert, *flagHTTPTLSKey, "http"); err != nil {
-		return err
-	}
-	if err := validateTLSPair(*flagGRPCTLSCert, *flagGRPCTLSKey, "grpc"); err != nil {
-		return err
-	}
-	if !*flagPeerTLS {
-		if strings.TrimSpace(*flagPeerTLSCA) != "" || strings.TrimSpace(*flagPeerTLSServerName) != "" || *flagPeerTLSSkipVerify {
-			return fmt.Errorf("peer TLS options require -peer-tls=true")
-		}
-	}
-
-	minTLSVersion, err := parseTLSMinVersion(*flagTLSMinVersion)
-	if err != nil {
-		return err
-	}
-	trustedProxies, err := parseTrustedProxyCIDRs(*flagTrustedProxies)
+	httpAddr, grpcAddr, minTLSVersion, trustedProxies, err := parseRunConfig()
 	if err != nil {
 		return err
 	}
@@ -1217,6 +1237,81 @@ func run() error {
 		return err
 	}
 
+	tenant := resolveRunTenant(dsnTenant)
+
+	peerDialCreds, err := buildRunPeerDialCreds(minTLSVersion)
+	if err != nil {
+		_ = db.Close()
+		return err
+	}
+
+	srv := newServer(db, tenant, *flagAuth, parsePeerList(*flagPeers), trustedProxies, peerDialCreds)
+	encoding.RegisterCodec(jsonCodec{})
+
+	errChan := make(chan error, 2)
+
+	httpSrv, err := startHTTPServer(srv, db, httpAddr, minTLSVersion, errChan)
+	if err != nil {
+		return err
+	}
+
+	grpcSrv, err := startGRPCServer(srv, db, grpcAddr, minTLSVersion, errChan)
+	if err != nil {
+		return err
+	}
+
+	runErr := waitForServerStop(errChan)
+
+	srv.ready.Store(false)
+
+	shutdownErr := shutdownRunServers(httpSrv, grpcSrv, db)
+
+	if runErr != nil {
+		return runErr
+	}
+	if shutdownErr != nil {
+		return shutdownErr
+	}
+	return nil
+}
+
+func parseRunConfig() (string, string, uint16, []*net.IPNet, error) {
+	httpAddr := strings.TrimSpace(*flagHTTP)
+	grpcAddr := strings.TrimSpace(*flagGRPC)
+	if httpAddr == "" && grpcAddr == "" {
+		return "", "", 0, nil, fmt.Errorf("no server (HTTP or gRPC) enabled")
+	}
+	if err := validateTLSPair(*flagHTTPTLSCert, *flagHTTPTLSKey, "http"); err != nil {
+		return "", "", 0, nil, err
+	}
+	if err := validateTLSPair(*flagGRPCTLSCert, *flagGRPCTLSKey, "grpc"); err != nil {
+		return "", "", 0, nil, err
+	}
+	if err := validateRunPeerTLSFlags(); err != nil {
+		return "", "", 0, nil, err
+	}
+	minTLSVersion, err := parseTLSMinVersion(*flagTLSMinVersion)
+	if err != nil {
+		return "", "", 0, nil, err
+	}
+	trustedProxies, err := parseTrustedProxyCIDRs(*flagTrustedProxies)
+	if err != nil {
+		return "", "", 0, nil, err
+	}
+	return httpAddr, grpcAddr, minTLSVersion, trustedProxies, nil
+}
+
+func validateRunPeerTLSFlags() error {
+	if *flagPeerTLS {
+		return nil
+	}
+	if strings.TrimSpace(*flagPeerTLSCA) != "" || strings.TrimSpace(*flagPeerTLSServerName) != "" || *flagPeerTLSSkipVerify {
+		return fmt.Errorf("peer TLS options require -peer-tls=true")
+	}
+	return nil
+}
+
+func resolveRunTenant(dsnTenant string) string {
 	tenant := strings.TrimSpace(*flagTenant)
 	tenantFlagSet := false
 	flag.Visit(func(f *flag.Flag) {
@@ -1228,127 +1323,135 @@ func run() error {
 		tenant = dsnTenant
 	}
 	if tenant == "" {
-		tenant = "default"
+		return "default"
+	}
+	return tenant
+}
+
+func buildRunPeerDialCreds(minTLSVersion uint16) (credentials.TransportCredentials, error) {
+	if !*flagPeerTLS {
+		return nil, nil
+	}
+	return loadPeerTLSCredentials(
+		strings.TrimSpace(*flagPeerTLSCA),
+		strings.TrimSpace(*flagPeerTLSServerName),
+		minTLSVersion,
+		*flagPeerTLSSkipVerify,
+	)
+}
+
+func startHTTPServer(srv *server, db *storage.DB, httpAddr string, minTLSVersion uint16, errChan chan<- error) (*http.Server, error) {
+	if httpAddr == "" {
+		return nil, nil
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/exec", srv.instrumentHTTP("/api/exec", srv.withAuth(srv.handleExec)))
+	mux.HandleFunc("/api/query", srv.instrumentHTTP("/api/query", srv.withAuth(srv.handleQuery)))
+	mux.HandleFunc("/api/status", srv.instrumentHTTP("/api/status", srv.withAuth(srv.handleStatus)))
+	mux.HandleFunc("/api/cluster/status", srv.instrumentHTTP("/api/cluster/status", srv.withAuth(srv.handleClusterStatus)))
+	mux.HandleFunc("/api/federated/query", srv.instrumentHTTP("/api/federated/query", srv.withAuth(srv.handleFederatedQuery)))
+	mux.HandleFunc("/metrics", srv.instrumentHTTP("/metrics", srv.withAuth(srv.handleMetrics)))
+	mux.HandleFunc("/healthz", srv.instrumentHTTP("/healthz", srv.handleHealth))
+	mux.HandleFunc("/readyz", srv.instrumentHTTP("/readyz", srv.handleReady))
+
+	httpTLSCfg, err := loadServerTLSConfig(*flagHTTPTLSCert, *flagHTTPTLSKey, minTLSVersion)
+	if err != nil {
+		srv.ready.Store(false)
+		_ = db.Close()
+		return nil, err
 	}
 
-	var peerDialCreds credentials.TransportCredentials
-	if *flagPeerTLS {
-		peerDialCreds, err = loadPeerTLSCredentials(strings.TrimSpace(*flagPeerTLSCA), strings.TrimSpace(*flagPeerTLSServerName), minTLSVersion, *flagPeerTLSSkipVerify)
-		if err != nil {
-			_ = db.Close()
-			return err
-		}
+	httpSrv := &http.Server{
+		Addr:              httpAddr,
+		Handler:           srv.recoverMiddleware(mux),
+		ReadTimeout:       *flagReadTimeout,
+		ReadHeaderTimeout: *flagReadHeaderTimeout,
+		WriteTimeout:      *flagWriteTimeout,
+		IdleTimeout:       *flagIdleTimeout,
+		MaxHeaderBytes:    *flagMaxHeaderBytes,
+		TLSConfig:         httpTLSCfg,
 	}
 
-	srv := newServer(db, tenant, *flagAuth, parsePeerList(*flagPeers), trustedProxies, peerDialCreds)
-	encoding.RegisterCodec(jsonCodec{})
-
-	errChan := make(chan error, 2)
-
-	var httpSrv *http.Server
-	if httpAddr != "" {
-		mux := http.NewServeMux()
-		mux.HandleFunc("/api/exec", srv.instrumentHTTP("/api/exec", srv.withAuth(srv.handleExec)))
-		mux.HandleFunc("/api/query", srv.instrumentHTTP("/api/query", srv.withAuth(srv.handleQuery)))
-		mux.HandleFunc("/api/status", srv.instrumentHTTP("/api/status", srv.withAuth(srv.handleStatus)))
-		mux.HandleFunc("/api/cluster/status", srv.instrumentHTTP("/api/cluster/status", srv.withAuth(srv.handleClusterStatus)))
-		mux.HandleFunc("/api/federated/query", srv.instrumentHTTP("/api/federated/query", srv.withAuth(srv.handleFederatedQuery)))
-		mux.HandleFunc("/metrics", srv.instrumentHTTP("/metrics", srv.withAuth(srv.handleMetrics)))
-		mux.HandleFunc("/healthz", srv.instrumentHTTP("/healthz", srv.handleHealth))
-		mux.HandleFunc("/readyz", srv.instrumentHTTP("/readyz", srv.handleReady))
-
-		httpTLSCfg, tlsErr := loadServerTLSConfig(*flagHTTPTLSCert, *flagHTTPTLSKey, minTLSVersion)
-		if tlsErr != nil {
-			srv.ready.Store(false)
-			_ = db.Close()
-			return tlsErr
+	go func() {
+		proto := "http"
+		var serveErr error
+		if httpTLSCfg != nil {
+			proto = "https"
 		}
-
-		httpSrv = &http.Server{
-			Addr:              httpAddr,
-			Handler:           srv.recoverMiddleware(mux),
-			ReadTimeout:       *flagReadTimeout,
-			ReadHeaderTimeout: *flagReadHeaderTimeout,
-			WriteTimeout:      *flagWriteTimeout,
-			IdleTimeout:       *flagIdleTimeout,
-			MaxHeaderBytes:    *flagMaxHeaderBytes,
-			TLSConfig:         httpTLSCfg,
+		log.Printf("HTTP listening on %s (%s)", httpAddr, proto)
+		if httpTLSCfg != nil {
+			serveErr = httpSrv.ListenAndServeTLS("", "")
+		} else {
+			serveErr = httpSrv.ListenAndServe()
 		}
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			errChan <- fmt.Errorf("http serve: %w", serveErr)
+		}
+	}()
+	return httpSrv, nil
+}
 
-		go func() {
-			proto := "http"
-			var err error
-			if httpTLSCfg != nil {
-				proto = "https"
-			}
-			log.Printf("HTTP listening on %s (%s)", httpAddr, proto)
-			if httpTLSCfg != nil {
-				err = httpSrv.ListenAndServeTLS("", "")
-			} else {
-				err = httpSrv.ListenAndServe()
-			}
-			if err != nil && !errors.Is(err, http.ErrServerClosed) {
-				errChan <- fmt.Errorf("http serve: %w", err)
-			}
-		}()
+func startGRPCServer(srv *server, db *storage.DB, grpcAddr string, minTLSVersion uint16, errChan chan<- error) (*grpc.Server, error) {
+	if grpcAddr == "" {
+		return nil, nil
+	}
+	lis, err := net.Listen("tcp", grpcAddr)
+	if err != nil {
+		srv.ready.Store(false)
+		_ = db.Close()
+		return nil, fmt.Errorf("grpc listen: %w", err)
 	}
 
-	var grpcSrv *grpc.Server
-	if grpcAddr != "" {
-		lis, err := net.Listen("tcp", grpcAddr)
-		if err != nil {
-			srv.ready.Store(false)
-			_ = db.Close()
-			return fmt.Errorf("grpc listen: %w", err)
-		}
-
-		grpcOpts := []grpc.ServerOption{
-			grpc.MaxRecvMsgSize(*flagGRPCMaxRecv),
-			grpc.MaxSendMsgSize(*flagGRPCMaxSend),
-			grpc.UnaryInterceptor(srv.grpcUnaryInterceptor()),
-		}
-		grpcTLSCfg, tlsErr := loadServerTLSConfig(*flagGRPCTLSCert, *flagGRPCTLSKey, minTLSVersion)
-		if tlsErr != nil {
-			srv.ready.Store(false)
-			_ = lis.Close()
-			_ = db.Close()
-			return tlsErr
-		}
-		if grpcTLSCfg != nil {
-			grpcOpts = append(grpcOpts, grpc.Creds(credentials.NewTLS(grpcTLSCfg)))
-		}
-
-		grpcSrv = grpc.NewServer(grpcOpts...)
-		registerTinySQLServer(grpcSrv, srv)
-
-		go func() {
-			proto := "plaintext"
-			if *flagGRPCTLSCert != "" && *flagGRPCTLSKey != "" {
-				proto = "tls"
-			}
-			log.Printf("gRPC listening on %s (%s)", grpcAddr, proto)
-			if err := grpcSrv.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
-				errChan <- fmt.Errorf("grpc serve: %w", err)
-			}
-		}()
+	grpcOpts := []grpc.ServerOption{
+		grpc.MaxRecvMsgSize(*flagGRPCMaxRecv),
+		grpc.MaxSendMsgSize(*flagGRPCMaxSend),
+		grpc.UnaryInterceptor(srv.grpcUnaryInterceptor()),
+	}
+	grpcTLSCfg, err := loadServerTLSConfig(*flagGRPCTLSCert, *flagGRPCTLSKey, minTLSVersion)
+	if err != nil {
+		srv.ready.Store(false)
+		_ = lis.Close()
+		_ = db.Close()
+		return nil, err
+	}
+	if grpcTLSCfg != nil {
+		grpcOpts = append(grpcOpts, grpc.Creds(credentials.NewTLS(grpcTLSCfg)))
 	}
 
+	grpcSrv := grpc.NewServer(grpcOpts...)
+	registerTinySQLServer(grpcSrv, srv)
+
+	go func() {
+		proto := "plaintext"
+		if *flagGRPCTLSCert != "" && *flagGRPCTLSKey != "" {
+			proto = "tls"
+		}
+		log.Printf("gRPC listening on %s (%s)", grpcAddr, proto)
+		if serveErr := grpcSrv.Serve(lis); serveErr != nil && !errors.Is(serveErr, grpc.ErrServerStopped) {
+			errChan <- fmt.Errorf("grpc serve: %w", serveErr)
+		}
+	}()
+	return grpcSrv, nil
+}
+
+func waitForServerStop(errChan <-chan error) error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 
-	var runErr error
 	select {
-	case runErr = <-errChan:
-		if runErr != nil {
-			log.Printf("server error: %v", runErr)
+	case err := <-errChan:
+		if err != nil {
+			log.Printf("server error: %v", err)
 		}
+		return err
 	case sig := <-sigCh:
 		log.Printf("received signal %s, shutting down", sig)
+		return nil
 	}
+}
 
-	srv.ready.Store(false)
-
+func shutdownRunServers(httpSrv *http.Server, grpcSrv *grpc.Server, db *storage.DB) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), *flagShutdownTimeout)
 	defer cancel()
 
@@ -1358,7 +1461,6 @@ func run() error {
 			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("http shutdown: %w", err))
 		}
 	}
-
 	if grpcSrv != nil {
 		done := make(chan struct{})
 		go func() {
@@ -1371,18 +1473,10 @@ func run() error {
 			grpcSrv.Stop()
 		}
 	}
-
 	if err := db.Close(); err != nil {
 		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("close db: %w", err))
 	}
-
-	if runErr != nil {
-		return runErr
-	}
-	if shutdownErr != nil {
-		return shutdownErr
-	}
-	return nil
+	return shutdownErr
 }
 
 func main() {

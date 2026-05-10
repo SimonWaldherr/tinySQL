@@ -551,16 +551,9 @@ func (p *Parser) parseDrop() (Statement, error) {
 func (p *Parser) parseCreateTrigger(orReplace bool) (Statement, error) {
 	p.next() // consume TRIGGER
 
-	ifNotExists := false
-	if p.cur.Typ == tKeyword && p.cur.Val == "IF" {
-		p.next()
-		if err := p.expectKeyword("NOT"); err != nil {
-			return nil, err
-		}
-		if err := p.expectKeyword("EXISTS"); err != nil {
-			return nil, err
-		}
-		ifNotExists = true
+	ifNotExists, err := p.parseTriggerIfNotExists()
+	if err != nil {
+		return nil, err
 	}
 
 	name := p.parseIdentLike()
@@ -568,31 +561,14 @@ func (p *Parser) parseCreateTrigger(orReplace bool) (Statement, error) {
 		return nil, p.errf("expected trigger name")
 	}
 
-	// Parse timing: BEFORE | AFTER | INSTEAD OF
-	timing := ""
-	if p.cur.Typ == tKeyword && p.cur.Val == "BEFORE" {
-		timing = "BEFORE"
-		p.next()
-	} else if p.cur.Typ == tKeyword && p.cur.Val == "AFTER" {
-		timing = "AFTER"
-		p.next()
-	} else if p.cur.Typ == tKeyword && p.cur.Val == "INSTEAD" {
-		p.next()
-		if err := p.expectKeyword("OF"); err != nil {
-			return nil, err
-		}
-		timing = "INSTEAD OF"
-	} else {
-		return nil, p.errf("expected BEFORE, AFTER, or INSTEAD OF in trigger")
+	timing, err := p.parseTriggerTiming()
+	if err != nil {
+		return nil, err
 	}
 
-	// Parse event: INSERT | UPDATE | DELETE
-	event := ""
-	if p.cur.Typ == tKeyword && (p.cur.Val == "INSERT" || p.cur.Val == "UPDATE" || p.cur.Val == "DELETE") {
-		event = p.cur.Val
-		p.next()
-	} else {
-		return nil, p.errf("expected INSERT, UPDATE, or DELETE in trigger")
+	event, err := p.parseTriggerEvent()
+	if err != nil {
+		return nil, err
 	}
 
 	if err := p.expectKeyword("ON"); err != nil {
@@ -603,53 +579,23 @@ func (p *Parser) parseCreateTrigger(orReplace bool) (Statement, error) {
 		return nil, p.errf("expected table name in trigger")
 	}
 
-	forEachRow := false
-	if p.cur.Typ == tKeyword && p.cur.Val == "FOR" {
-		p.next()
-		if err := p.expectKeyword("EACH"); err != nil {
-			return nil, err
-		}
-		if err := p.expectKeyword("ROW"); err != nil {
-			return nil, err
-		}
-		forEachRow = true
+	forEachRow, err := p.parseTriggerForEachRow()
+	if err != nil {
+		return nil, err
 	}
 
-	var whenExpr Expr
-	if p.cur.Typ == tKeyword && p.cur.Val == "WHEN" {
-		p.next()
-		if err := p.expectSymbol("("); err != nil {
-			return nil, err
-		}
-		var err error
-		whenExpr, err = p.parseExpr()
-		if err != nil {
-			return nil, err
-		}
-		if err := p.expectSymbol(")"); err != nil {
-			return nil, err
-		}
+	whenExpr, err := p.parseTriggerWhen()
+	if err != nil {
+		return nil, err
 	}
 
 	if err := p.expectKeyword("BEGIN"); err != nil {
 		return nil, err
 	}
 
-	// Parse trigger body statements until END
-	var body []Statement
-	for !(p.cur.Typ == tKeyword && p.cur.Val == "END") && p.cur.Typ != tEOF {
-		stmt, err := p.ParseStatement()
-		if err != nil {
-			return nil, fmt.Errorf("trigger body: %w", err)
-		}
-		body = append(body, stmt)
-		// Consume optional semicolon
-		if p.cur.Typ == tSymbol && p.cur.Val == ";" {
-			p.next()
-		}
-	}
-	if p.cur.Typ == tKeyword && p.cur.Val == "END" {
-		p.next()
+	body, err := p.parseTriggerBody()
+	if err != nil {
+		return nil, err
 	}
 
 	return &CreateTrigger{
@@ -662,6 +608,106 @@ func (p *Parser) parseCreateTrigger(orReplace bool) (Statement, error) {
 		Body:        body,
 		IfNotExists: ifNotExists,
 	}, nil
+}
+
+func (p *Parser) parseTriggerIfNotExists() (bool, error) {
+	if p.cur.Typ != tKeyword || p.cur.Val != "IF" {
+		return false, nil
+	}
+	p.next()
+	if err := p.expectKeyword("NOT"); err != nil {
+		return false, err
+	}
+	if err := p.expectKeyword("EXISTS"); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (p *Parser) parseTriggerTiming() (string, error) {
+	if p.cur.Typ != tKeyword {
+		return "", p.errf("expected BEFORE, AFTER, or INSTEAD OF in trigger")
+	}
+	switch p.cur.Val {
+	case "BEFORE":
+		p.next()
+		return "BEFORE", nil
+	case "AFTER":
+		p.next()
+		return "AFTER", nil
+	case "INSTEAD":
+		p.next()
+		if err := p.expectKeyword("OF"); err != nil {
+			return "", err
+		}
+		return "INSTEAD OF", nil
+	default:
+		return "", p.errf("expected BEFORE, AFTER, or INSTEAD OF in trigger")
+	}
+}
+
+func (p *Parser) parseTriggerEvent() (string, error) {
+	if p.cur.Typ != tKeyword {
+		return "", p.errf("expected INSERT, UPDATE, or DELETE in trigger")
+	}
+	switch p.cur.Val {
+	case "INSERT", "UPDATE", "DELETE":
+		event := p.cur.Val
+		p.next()
+		return event, nil
+	default:
+		return "", p.errf("expected INSERT, UPDATE, or DELETE in trigger")
+	}
+}
+
+func (p *Parser) parseTriggerForEachRow() (bool, error) {
+	if p.cur.Typ != tKeyword || p.cur.Val != "FOR" {
+		return false, nil
+	}
+	p.next()
+	if err := p.expectKeyword("EACH"); err != nil {
+		return false, err
+	}
+	if err := p.expectKeyword("ROW"); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (p *Parser) parseTriggerWhen() (Expr, error) {
+	if p.cur.Typ != tKeyword || p.cur.Val != "WHEN" {
+		return nil, nil
+	}
+	p.next()
+	if err := p.expectSymbol("("); err != nil {
+		return nil, err
+	}
+	whenExpr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectSymbol(")"); err != nil {
+		return nil, err
+	}
+	return whenExpr, nil
+}
+
+func (p *Parser) parseTriggerBody() ([]Statement, error) {
+	var body []Statement
+	for !(p.cur.Typ == tKeyword && p.cur.Val == "END") && p.cur.Typ != tEOF {
+		stmt, err := p.ParseStatement()
+		if err != nil {
+			return nil, fmt.Errorf("trigger body: %w", err)
+		}
+		body = append(body, stmt)
+		if p.cur.Typ == tSymbol && p.cur.Val == ";" {
+			p.next()
+		}
+	}
+	if p.cur.Typ == tKeyword && p.cur.Val == "END" {
+		p.next()
+	}
+	return body, nil
 }
 
 // parseDropTrigger parses DROP TRIGGER [IF EXISTS] name.
@@ -2082,165 +2128,193 @@ func (p *Parser) parseCmp() (Expr, error) {
 	}
 
 	for {
-		// Support optional NOT prefix for IN/LIKE/BETWEEN
-		negate := false
-		if p.cur.Typ == tKeyword && p.cur.Val == "NOT" {
-			negate = true
-			p.next()
+		negate := p.consumeCmpNot()
+		next, matched, err := p.parseCmpTail(l, negate)
+		if err != nil {
+			return nil, err
 		}
-
-		// BETWEEN lo AND hi  /  NOT BETWEEN lo AND hi
-		// Expanded inline as (l >= lo AND l <= hi) or (l < lo OR l > hi).
-		// SQL column expressions have no side effects, so using `l` twice is safe.
-		if p.cur.Typ == tKeyword && p.cur.Val == "BETWEEN" {
-			p.next()
-			lo, err := p.parseAddSub()
-			if err != nil {
-				return nil, err
-			}
-			if p.cur.Typ != tKeyword || p.cur.Val != "AND" {
-				return nil, p.errf("expected AND after BETWEEN lower bound")
-			}
-			p.next()
-			hi, err := p.parseAddSub()
-			if err != nil {
-				return nil, err
-			}
-			if negate {
-				// NOT BETWEEN: l < lo OR l > hi
-				l = &Binary{Op: "OR",
-					Left:  &Binary{Op: "<", Left: l, Right: lo},
-					Right: &Binary{Op: ">", Left: l, Right: hi},
-				}
-			} else {
-				// BETWEEN: l >= lo AND l <= hi
-				l = &Binary{Op: "AND",
-					Left:  &Binary{Op: ">=", Left: l, Right: lo},
-					Right: &Binary{Op: "<=", Left: l, Right: hi},
-				}
-			}
-			continue
+		if !matched {
+			break
 		}
-
-		// IN list
-		if p.cur.Typ == tKeyword && p.cur.Val == "IN" {
-			p.next()
-			if err := p.expectSymbol("("); err != nil {
-				return nil, err
-			}
-			var values []Expr
-			for {
-				e, err := p.parseExpr()
-				if err != nil {
-					return nil, err
-				}
-				values = append(values, e)
-				if p.cur.Typ == tSymbol && p.cur.Val == "," {
-					p.next()
-					continue
-				}
-				break
-			}
-			if err := p.expectSymbol(")"); err != nil {
-				return nil, err
-			}
-			l = &InExpr{Expr: l, Values: values, Negate: negate}
-			continue
-		}
-
-		// LIKE operator
-		if p.cur.Typ == tKeyword && p.cur.Val == "LIKE" {
-			p.next()
-			pattern, err := p.parseAddSub()
-			if err != nil {
-				return nil, err
-			}
-			var escape Expr
-			if p.cur.Typ == tKeyword && p.cur.Val == "ESCAPE" {
-				p.next()
-				escape, err = p.parseAddSub()
-				if err != nil {
-					return nil, err
-				}
-			}
-			l = &LikeExpr{Expr: l, Pattern: pattern, Escape: escape, Negate: negate}
-			continue
-		}
-
-		// ILIKE operator (case-insensitive LIKE)
-		if p.cur.Typ == tKeyword && p.cur.Val == "ILIKE" {
-			p.next()
-			pattern, err := p.parseAddSub()
-			if err != nil {
-				return nil, err
-			}
-			var escape Expr
-			if p.cur.Typ == tKeyword && p.cur.Val == "ESCAPE" {
-				p.next()
-				escape, err = p.parseAddSub()
-				if err != nil {
-					return nil, err
-				}
-			}
-			l = &LikeExpr{Expr: l, Pattern: pattern, Escape: escape, Negate: negate, CaseInsensitive: true}
-			continue
-		}
-
-		// GLOB operator (SQLite-style: * and ? wildcards, case-sensitive)
-		if p.cur.Typ == tKeyword && p.cur.Val == "GLOB" {
-			p.next()
-			pattern, err := p.parseAddSub()
-			if err != nil {
-				return nil, err
-			}
-			l = &LikeExpr{Expr: l, Pattern: pattern, Negate: negate, GlobStyle: true}
-			continue
-		}
-
-		// REGEXP / RLIKE operators
-		if p.cur.Typ == tKeyword && (p.cur.Val == "REGEXP" || p.cur.Val == "RLIKE") {
-			p.next()
-			pattern, err := p.parseAddSub()
-			if err != nil {
-				return nil, err
-			}
-			l = &RegexpExpr{Expr: l, Pattern: pattern, Negate: negate}
-			continue
-		}
-
-		// SIMILAR TO / NOT SIMILAR TO
-		if p.cur.Typ == tKeyword && p.cur.Val == "SIMILAR" {
-			p.next()
-			if err := p.expectKeyword("TO"); err != nil {
-				return nil, err
-			}
-			pattern, err := p.parseAddSub()
-			if err != nil {
-				return nil, err
-			}
-			l = &RegexpExpr{Expr: l, Pattern: pattern, Negate: negate, SimilarTo: true}
-			continue
-		}
-
-		// Regular comparison operators
-		if p.cur.Typ == tSymbol {
-			switch p.cur.Val {
-			case "=", "!=", "<>", "<", "<=", ">", ">=":
-				op := p.cur.Val
-				p.next()
-				r, err := p.parseAddSub()
-				if err != nil {
-					return nil, err
-				}
-				l = &Binary{Op: op, Left: l, Right: r}
-				continue
-			}
-		}
-
-		break
+		l = next
 	}
 
 	return l, nil
+}
+
+func (p *Parser) consumeCmpNot() bool {
+	if p.cur.Typ == tKeyword && p.cur.Val == "NOT" {
+		p.next()
+		return true
+	}
+	return false
+}
+
+func (p *Parser) parseCmpTail(l Expr, negate bool) (Expr, bool, error) {
+	if expr, ok, err := p.parseCmpBetween(l, negate); ok || err != nil {
+		return expr, ok, err
+	}
+	if expr, ok, err := p.parseCmpIn(l, negate); ok || err != nil {
+		return expr, ok, err
+	}
+	if expr, ok, err := p.parseCmpLike(l, negate); ok || err != nil {
+		return expr, ok, err
+	}
+	if expr, ok, err := p.parseCmpRegexp(l, negate); ok || err != nil {
+		return expr, ok, err
+	}
+	if expr, ok, err := p.parseCmpSimilar(l, negate); ok || err != nil {
+		return expr, ok, err
+	}
+	return p.parseCmpSymbol(l)
+}
+
+func (p *Parser) parseCmpBetween(l Expr, negate bool) (Expr, bool, error) {
+	if p.cur.Typ != tKeyword || p.cur.Val != "BETWEEN" {
+		return nil, false, nil
+	}
+	p.next()
+	lo, err := p.parseAddSub()
+	if err != nil {
+		return nil, true, err
+	}
+	if p.cur.Typ != tKeyword || p.cur.Val != "AND" {
+		return nil, true, p.errf("expected AND after BETWEEN lower bound")
+	}
+	p.next()
+	hi, err := p.parseAddSub()
+	if err != nil {
+		return nil, true, err
+	}
+	if negate {
+		return &Binary{Op: "OR",
+			Left:  &Binary{Op: "<", Left: l, Right: lo},
+			Right: &Binary{Op: ">", Left: l, Right: hi},
+		}, true, nil
+	}
+	return &Binary{Op: "AND",
+		Left:  &Binary{Op: ">=", Left: l, Right: lo},
+		Right: &Binary{Op: "<=", Left: l, Right: hi},
+	}, true, nil
+}
+
+func (p *Parser) parseCmpIn(l Expr, negate bool) (Expr, bool, error) {
+	if p.cur.Typ != tKeyword || p.cur.Val != "IN" {
+		return nil, false, nil
+	}
+	p.next()
+	if err := p.expectSymbol("("); err != nil {
+		return nil, true, err
+	}
+	var values []Expr
+	for {
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, true, err
+		}
+		values = append(values, e)
+		if p.cur.Typ == tSymbol && p.cur.Val == "," {
+			p.next()
+			continue
+		}
+		break
+	}
+	if err := p.expectSymbol(")"); err != nil {
+		return nil, true, err
+	}
+	return &InExpr{Expr: l, Values: values, Negate: negate}, true, nil
+}
+
+func (p *Parser) parseCmpLike(l Expr, negate bool) (Expr, bool, error) {
+	if p.cur.Typ != tKeyword {
+		return nil, false, nil
+	}
+	switch p.cur.Val {
+	case "LIKE":
+		p.next()
+		pattern, escape, err := p.parseCmpPatternAndEscape()
+		if err != nil {
+			return nil, true, err
+		}
+		return &LikeExpr{Expr: l, Pattern: pattern, Escape: escape, Negate: negate}, true, nil
+	case "ILIKE":
+		p.next()
+		pattern, escape, err := p.parseCmpPatternAndEscape()
+		if err != nil {
+			return nil, true, err
+		}
+		return &LikeExpr{Expr: l, Pattern: pattern, Escape: escape, Negate: negate, CaseInsensitive: true}, true, nil
+	case "GLOB":
+		p.next()
+		pattern, err := p.parseAddSub()
+		if err != nil {
+			return nil, true, err
+		}
+		return &LikeExpr{Expr: l, Pattern: pattern, Negate: negate, GlobStyle: true}, true, nil
+	default:
+		return nil, false, nil
+	}
+}
+
+func (p *Parser) parseCmpPatternAndEscape() (Expr, Expr, error) {
+	pattern, err := p.parseAddSub()
+	if err != nil {
+		return nil, nil, err
+	}
+	var escape Expr
+	if p.cur.Typ == tKeyword && p.cur.Val == "ESCAPE" {
+		p.next()
+		escape, err = p.parseAddSub()
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return pattern, escape, nil
+}
+
+func (p *Parser) parseCmpRegexp(l Expr, negate bool) (Expr, bool, error) {
+	if p.cur.Typ != tKeyword || (p.cur.Val != "REGEXP" && p.cur.Val != "RLIKE") {
+		return nil, false, nil
+	}
+	p.next()
+	pattern, err := p.parseAddSub()
+	if err != nil {
+		return nil, true, err
+	}
+	return &RegexpExpr{Expr: l, Pattern: pattern, Negate: negate}, true, nil
+}
+
+func (p *Parser) parseCmpSimilar(l Expr, negate bool) (Expr, bool, error) {
+	if p.cur.Typ != tKeyword || p.cur.Val != "SIMILAR" {
+		return nil, false, nil
+	}
+	p.next()
+	if err := p.expectKeyword("TO"); err != nil {
+		return nil, true, err
+	}
+	pattern, err := p.parseAddSub()
+	if err != nil {
+		return nil, true, err
+	}
+	return &RegexpExpr{Expr: l, Pattern: pattern, Negate: negate, SimilarTo: true}, true, nil
+}
+
+func (p *Parser) parseCmpSymbol(l Expr) (Expr, bool, error) {
+	if p.cur.Typ != tSymbol {
+		return nil, false, nil
+	}
+	switch p.cur.Val {
+	case "=", "!=", "<>", "<", "<=", ">", ">=":
+		op := p.cur.Val
+		p.next()
+		r, err := p.parseAddSub()
+		if err != nil {
+			return nil, true, err
+		}
+		return &Binary{Op: op, Left: l, Right: r}, true, nil
+	default:
+		return nil, false, nil
+	}
 }
 func (p *Parser) parseAddSub() (Expr, error) {
 	l, err := p.parseMulDiv()
