@@ -744,6 +744,242 @@ func evalVecAvg(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 }
 
 // ---------------------------------------------------------------------------
+// VEC_TO_BYTES – encode vector as compact float32 binary (returns hex string)
+// VEC_TO_BYTES(vector)
+// ---------------------------------------------------------------------------
+
+func evalVecToBytes(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if err := requireArgs("VEC_TO_BYTES", ex, 1, 1); err != nil {
+		return nil, err
+	}
+	vec, err := toVec(env, ex.Args[0], row)
+	if err != nil {
+		return nil, fmt.Errorf("VEC_TO_BYTES: %w", err)
+	}
+	// Encode each float64 as float32 (4 bytes, little-endian) for compactness.
+	buf := make([]byte, len(vec)*4)
+	for i, v := range vec {
+		bits32 := math.Float32bits(float32(v))
+		buf[i*4] = byte(bits32)
+		buf[i*4+1] = byte(bits32 >> 8)
+		buf[i*4+2] = byte(bits32 >> 16)
+		buf[i*4+3] = byte(bits32 >> 24)
+	}
+	return fmt.Sprintf("%x", buf), nil
+}
+
+// ---------------------------------------------------------------------------
+// VEC_FROM_BYTES – decode a compact float32 binary blob (hex string) to vector
+// VEC_FROM_BYTES(hex_blob)
+// ---------------------------------------------------------------------------
+
+func evalVecFromBytes(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if err := requireArgs("VEC_FROM_BYTES", ex, 1, 1); err != nil {
+		return nil, err
+	}
+	val, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	var buf []byte
+	switch x := val.(type) {
+	case string:
+		decoded, err := hexDecodeString(strings.TrimSpace(x))
+		if err != nil {
+			return nil, fmt.Errorf("VEC_FROM_BYTES: invalid hex: %w", err)
+		}
+		buf = decoded
+	case []byte:
+		buf = x
+	case nil:
+		return nil, fmt.Errorf("VEC_FROM_BYTES: NULL input")
+	default:
+		return nil, fmt.Errorf("VEC_FROM_BYTES: expected string or bytes, got %T", val)
+	}
+	if len(buf)%4 != 0 {
+		return nil, fmt.Errorf("VEC_FROM_BYTES: byte length %d is not a multiple of 4", len(buf))
+	}
+	vec := make([]float64, len(buf)/4)
+	for i := range vec {
+		bits32 := uint32(buf[i*4]) |
+			uint32(buf[i*4+1])<<8 |
+			uint32(buf[i*4+2])<<16 |
+			uint32(buf[i*4+3])<<24
+		vec[i] = float64(math.Float32frombits(bits32))
+	}
+	return vec, nil
+}
+
+// hexDecodeString is a local helper to avoid importing encoding/hex in this file.
+func hexDecodeString(s string) ([]byte, error) {
+	if len(s)%2 != 0 {
+		return nil, fmt.Errorf("odd hex length")
+	}
+	out := make([]byte, len(s)/2)
+	for i := 0; i < len(s); i += 2 {
+		hi, ok1 := hexNibble(s[i])
+		lo, ok2 := hexNibble(s[i+1])
+		if !ok1 || !ok2 {
+			return nil, fmt.Errorf("invalid hex character at position %d", i)
+		}
+		out[i/2] = (hi << 4) | lo
+	}
+	return out, nil
+}
+
+func hexNibble(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
+}
+
+// ---------------------------------------------------------------------------
+// VEC_BINARY_QUANTIZE – 1-bit binary quantization
+// VEC_BINARY_QUANTIZE(vector)
+//
+// Each element is mapped to 1 if > 0, else 0. The result is a vector of
+// 0.0 / 1.0 values that can be compared using VEC_HAMMING_DISTANCE.
+// ---------------------------------------------------------------------------
+
+func evalVecBinaryQuantize(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if err := requireArgs("VEC_BINARY_QUANTIZE", ex, 1, 1); err != nil {
+		return nil, err
+	}
+	vec, err := toVec(env, ex.Args[0], row)
+	if err != nil {
+		return nil, fmt.Errorf("VEC_BINARY_QUANTIZE: %w", err)
+	}
+	out := make([]float64, len(vec))
+	for i, v := range vec {
+		if v > 0 {
+			out[i] = 1.0
+		}
+	}
+	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// VEC_HAMMING_DISTANCE – bit-level Hamming distance between binary vectors
+// VEC_HAMMING_DISTANCE(v1, v2)
+//
+// Both vectors are expected to contain only 0.0 / 1.0 values (as produced by
+// VEC_BINARY_QUANTIZE). Returns the number of positions that differ.
+// ---------------------------------------------------------------------------
+
+func evalVecHammingDistance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if err := requireArgs("VEC_HAMMING_DISTANCE", ex, 2, 2); err != nil {
+		return nil, err
+	}
+	a, err := toVec(env, ex.Args[0], row)
+	if err != nil {
+		return nil, fmt.Errorf("VEC_HAMMING_DISTANCE arg1: %w", err)
+	}
+	b, err := toVec(env, ex.Args[1], row)
+	if err != nil {
+		return nil, fmt.Errorf("VEC_HAMMING_DISTANCE arg2: %w", err)
+	}
+	if len(a) != len(b) {
+		return nil, fmt.Errorf("VEC_HAMMING_DISTANCE: dimension mismatch %d vs %d", len(a), len(b))
+	}
+	var dist int
+	for i := range a {
+		ai := 0
+		if a[i] > 0 {
+			ai = 1
+		}
+		bi := 0
+		if b[i] > 0 {
+			bi = 1
+		}
+		if ai != bi {
+			dist++
+		}
+	}
+	return dist, nil
+}
+
+// ---------------------------------------------------------------------------
+// VEC_CENTROID – compute the centroid (element-wise mean) of multiple vectors
+// VEC_CENTROID(v1, v2, ..., vN)   – variadic, 2+ vectors required
+// ---------------------------------------------------------------------------
+
+func evalVecCentroid(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if err := requireArgs("VEC_CENTROID", ex, 2, 256); err != nil {
+		return nil, err
+	}
+	vecs := make([][]float64, 0, len(ex.Args))
+	for i, arg := range ex.Args {
+		v, err := toVec(env, arg, row)
+		if err != nil {
+			return nil, fmt.Errorf("VEC_CENTROID arg%d: %w", i+1, err)
+		}
+		if len(vecs) > 0 && len(v) != len(vecs[0]) {
+			return nil, fmt.Errorf("VEC_CENTROID: dimension mismatch at arg%d: %d vs %d", i+1, len(v), len(vecs[0]))
+		}
+		vecs = append(vecs, v)
+	}
+	dim := len(vecs[0])
+	out := make([]float64, dim)
+	for _, v := range vecs {
+		for i, x := range v {
+			out[i] += x
+		}
+	}
+	n := float64(len(vecs))
+	for i := range out {
+		out[i] /= n
+	}
+	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// VEC_MIN_DISTANCE – return the minimum distance from a query to a set of vectors
+// VEC_MIN_DISTANCE(query_vector, v1, v2, ...) – variadic, 2+ args
+// ---------------------------------------------------------------------------
+
+func evalVecMinDistance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if err := requireArgs("VEC_MIN_DISTANCE", ex, 2, 256); err != nil {
+		return nil, err
+	}
+	query, err := toVec(env, ex.Args[0], row)
+	if err != nil {
+		return nil, fmt.Errorf("VEC_MIN_DISTANCE query: %w", err)
+	}
+	minDist := math.MaxFloat64
+	anyValid := false
+	var lastErr error
+	for i, arg := range ex.Args[1:] {
+		v, err := toVec(env, arg, row)
+		if err != nil {
+			lastErr = fmt.Errorf("VEC_MIN_DISTANCE arg%d: %w", i+2, err)
+			continue
+		}
+		d, err := computeDistance(query, v, "cosine")
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		anyValid = true
+		if d < minDist {
+			minDist = d
+		}
+	}
+	if !anyValid {
+		if lastErr != nil {
+			return nil, lastErr
+		}
+		return nil, nil
+	}
+	return minDist, nil
+}
+
+// ---------------------------------------------------------------------------
 // getVectorFunctions returns all vector function handlers
 // ---------------------------------------------------------------------------
 
@@ -752,6 +988,10 @@ func getVectorFunctions() map[string]funcHandler {
 		// Parsing / serialization
 		"VEC_FROM_JSON": evalVecFromJSON,
 		"VEC_TO_JSON":   evalVecToJSON,
+
+		// Binary encoding / decoding (compact float32 BLOB storage)
+		"VEC_TO_BYTES":   evalVecToBytes,
+		"VEC_FROM_BYTES": evalVecFromBytes,
 
 		// Introspection
 		"VEC_DIM":  evalVecDim,
@@ -777,18 +1017,22 @@ func getVectorFunctions() map[string]funcHandler {
 		"VEC_MANHATTAN_DISTANCE": evalVecManhattanDistance,
 		"VEC_L1_DISTANCE":        evalVecManhattanDistance,
 		"VEC_DISTANCE":           evalVecDistance,
+		"VEC_HAMMING_DISTANCE":   evalVecHammingDistance,
+		"VEC_MIN_DISTANCE":       evalVecMinDistance,
 
 		// Manipulation
 		"VEC_SLICE":  evalVecSlice,
 		"VEC_CONCAT": evalVecConcat,
 
 		// Quantization
-		"VEC_QUANTIZE": evalVecQuantize,
+		"VEC_QUANTIZE":        evalVecQuantize,
+		"VEC_BINARY_QUANTIZE": evalVecBinaryQuantize,
 
 		// Generation
 		"VEC_RANDOM": evalVecRandom,
 
-		// Aggregation helper
-		"VEC_AVG": evalVecAvg,
+		// Aggregation helpers
+		"VEC_AVG":      evalVecAvg,
+		"VEC_CENTROID": evalVecCentroid,
 	}
 }

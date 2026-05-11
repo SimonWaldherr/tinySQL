@@ -5,13 +5,26 @@
 //   - CREATE VIRTUAL TABLE t USING fts(col1, col2) creates a regular tinySQL
 //     table with FTS indexing enabled.
 //   - INSERT/UPDATE/DELETE automatically maintain an in-memory inverted index.
-//   - FTS_MATCH(text, query) – boolean match check
+//   - FTS_MATCH(text, query) – boolean match check with phrase/boolean query support
 //   - FTS_RANK(text, query)  – BM25-like relevance score
 //   - FTS_SNIPPET(text, query [, before, after, ellipsis, max_tokens]) – highlighted snippet
+//   - FTS_HIGHLIGHT(text, query [, before, after]) – full-text highlighting alias
 //   - BM25(text, query)      – alias for FTS_RANK
+//   - FTS_SEARCH table-valued function for corpus-level k-nearest search
+//
+// Query syntax supported by FTS_MATCH / FTS_RANK:
+//
+//	word         – single term
+//	"phrase"     – exact phrase (consecutive tokens)
+//	word*        – prefix wildcard
+//	A AND B      – both terms must match
+//	A OR B       – either term must match
+//	NOT A        – term must not match
+//	A B          – implicit AND (same as A AND B)
 package engine
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sort"
@@ -296,82 +309,6 @@ func executeCreateFTSTable(env ExecEnv, s *CreateTable) (*ResultSet, error) {
 
 // ─────────────────────────── Scalar FTS functions ────────────────────────────
 
-// evalFTSMatch returns true if text contains at least one query term.
-func evalFTSMatch(env ExecEnv, ex *FuncCall, row Row) (any, error) {
-	if len(ex.Args) != 2 {
-		return nil, fmt.Errorf("FTS_MATCH expects 2 arguments: (text, query)")
-	}
-	textVal, err := evalExpr(env, ex.Args[0], row)
-	if err != nil {
-		return nil, err
-	}
-	queryVal, err := evalExpr(env, ex.Args[1], row)
-	if err != nil {
-		return nil, err
-	}
-	if textVal == nil || queryVal == nil {
-		return false, nil
-	}
-	text := fmt.Sprintf("%v", textVal)
-	query := fmt.Sprintf("%v", queryVal)
-	textTokens := ftsTokenize(text)
-	queryTerms := ftsTokenize(query)
-	tokenSet := make(map[string]bool, len(textTokens))
-	for _, t := range textTokens {
-		tokenSet[t] = true
-	}
-	for _, q := range queryTerms {
-		if tokenSet[q] {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// evalFTSRank computes a simple BM25-like score for text against query.
-func evalFTSRank(env ExecEnv, ex *FuncCall, row Row) (any, error) {
-	if len(ex.Args) < 2 {
-		return nil, fmt.Errorf("FTS_RANK expects 2 arguments: (text, query)")
-	}
-	textVal, err := evalExpr(env, ex.Args[0], row)
-	if err != nil {
-		return nil, err
-	}
-	queryVal, err := evalExpr(env, ex.Args[1], row)
-	if err != nil {
-		return nil, err
-	}
-	if textVal == nil || queryVal == nil {
-		return 0.0, nil
-	}
-	text := fmt.Sprintf("%v", textVal)
-	query := fmt.Sprintf("%v", queryVal)
-
-	textTokens := ftsTokenize(text)
-	queryTerms := ftsTokenize(query)
-	if len(textTokens) == 0 || len(queryTerms) == 0 {
-		return 0.0, nil
-	}
-
-	freq := make(map[string]int)
-	for _, t := range textTokens {
-		freq[t]++
-	}
-
-	score := 0.0
-	// Standalone BM25 has no corpus avgdl; length normalisation uses 1.0
-	// (treating this document as average-length, i.e. b effectively = 0).
-	for _, q := range queryTerms {
-		tf := float64(freq[q])
-		if tf == 0 {
-			continue
-		}
-		tfNorm := (tf * (bm25K1 + 1)) / (tf + bm25K1*(1-bm25B+bm25B*1.0))
-		score += tfNorm
-	}
-	return score, nil
-}
-
 // ftsSnippetOpts holds the display options for FTS_SNIPPET.
 type ftsSnippetOpts struct {
 	before    string
@@ -410,11 +347,60 @@ func parseFTSSnippetOpts(env ExecEnv, ex *FuncCall, row Row) (ftsSnippetOpts, er
 	return opts, nil
 }
 
-// buildFTSSnippet builds a highlighted snippet from the given words and query set.
-func buildFTSSnippet(words []string, querySet map[string]bool, opts ftsSnippetOpts) string {
+// evalFTSSnippet returns a highlighted snippet of text around matching terms.
+func evalFTSSnippet(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) < 2 {
+		return nil, fmt.Errorf("FTS_SNIPPET expects at least 2 arguments: (text, query[, before, after, ellipsis, max_tokens])")
+	}
+	textVal, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	queryVal, err := evalExpr(env, ex.Args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	if textVal == nil || queryVal == nil {
+		return nil, nil
+	}
+
+	opts, err := parseFTSSnippetOpts(env, ex, row)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build highlight set from the parsed boolean query tree.
+	node := ftsParseQuery(fmt.Sprintf("%v", queryVal))
+	querySet := ftsQueryTerms(node)
+	// Also add simple tokenized terms for backward compatibility.
+	for _, q := range ftsTokenize(fmt.Sprintf("%v", queryVal)) {
+		querySet[q] = true
+	}
+
+	// isHighlighted checks if a word matches any query term or prefix.
+	isHighlighted := func(w string) bool {
+		stemmed := ftsStem(strings.ToLower(w))
+		if querySet[stemmed] {
+			return true
+		}
+		// Check prefix wildcards (stored as "prefix*").
+		for tok := range querySet {
+			if strings.HasSuffix(tok, "*") {
+				pfx := strings.TrimSuffix(tok, "*")
+				if strings.HasPrefix(stemmed, pfx) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	words := strings.Fields(fmt.Sprintf("%v", textVal))
+
+	// Find first match index.
 	matchIdx := -1
 	for i, w := range words {
-		if querySet[ftsStem(strings.ToLower(w))] {
+		if isHighlighted(w) {
 			matchIdx = i
 			break
 		}
@@ -447,7 +433,7 @@ func buildFTSSnippet(words []string, querySet map[string]bool, opts ftsSnippetOp
 		if i > 0 {
 			sb.WriteString(" ")
 		}
-		if querySet[ftsStem(strings.ToLower(w))] {
+		if isHighlighted(w) {
 			sb.WriteString(opts.before)
 			sb.WriteString(w)
 			sb.WriteString(opts.after)
@@ -456,13 +442,329 @@ func buildFTSSnippet(words []string, querySet map[string]bool, opts ftsSnippetOp
 		}
 	}
 	sb.WriteString(suffix)
-	return sb.String()
+	return sb.String(), nil
 }
 
-// evalFTSSnippet returns a highlighted snippet of text around matching terms.
-func evalFTSSnippet(env ExecEnv, ex *FuncCall, row Row) (any, error) {
-	if len(ex.Args) < 2 {
-		return nil, fmt.Errorf("FTS_SNIPPET expects at least 2 arguments: (text, query[, before, after, ellipsis, max_tokens])")
+// evalFTSHighlight is an alias for FTS_SNIPPET with a simpler 2-argument API.
+// FTS_HIGHLIGHT(text, query [, before, after]) highlights all matching tokens.
+func evalFTSHighlight(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalFTSSnippet(env, ex, row)
+}
+
+// getFTSFunctions returns scalar FTS function handlers.
+func getFTSFunctions() map[string]funcHandler {
+	return map[string]funcHandler{
+		"FTS_MATCH":      evalFTSMatch,
+		"FTS_RANK":       evalFTSRank,
+		"FTS_SNIPPET":    evalFTSSnippet,
+		"FTS_HIGHLIGHT":  evalFTSHighlight,
+		"BM25":           evalFTSRank, // alias
+		"MATCH":          evalFTSMatch,
+		"FTS_WORD_COUNT": evalFTSWordCount,
+	}
+}
+
+// ─────────────────────────── FTS boolean query parser ────────────────────────
+
+// ftsQueryNode represents one node in a parsed boolean FTS query tree.
+type ftsQueryNode struct {
+	op      string   // "AND", "OR", "NOT", "TERM", "PHRASE", "PREFIX"
+	term    string   // for TERM / PREFIX
+	phrase  []string // for PHRASE (stemmed tokens)
+	prefix  string   // for PREFIX (stem prefix without trailing *)
+	left    *ftsQueryNode
+	right   *ftsQueryNode
+	operand *ftsQueryNode // for NOT
+}
+
+// ftsParseQuery converts a user query string into a boolean query tree.
+// Supported syntax:
+//
+//	word         single term
+//	"phrase"     exact phrase
+//	word*        prefix wildcard
+//	A AND B      conjunction
+//	A OR B       disjunction
+//	NOT A        negation
+//	A B          implicit AND
+func ftsParseQuery(query string) *ftsQueryNode {
+	tokens := ftsLexQuery(query)
+	if len(tokens) == 0 {
+		return nil
+	}
+	node, _ := ftsParseOr(tokens, 0)
+	return node
+}
+
+// ftsLexQuery tokenises the query string into atoms, preserving operators and phrases.
+func ftsLexQuery(query string) []string {
+	var tokens []string
+	i := 0
+	runes := []rune(query)
+	for i < len(runes) {
+		// Skip whitespace.
+		if runes[i] == ' ' || runes[i] == '\t' {
+			i++
+			continue
+		}
+		// Quoted phrase.
+		if runes[i] == '"' {
+			j := i + 1
+			for j < len(runes) && runes[j] != '"' {
+				j++
+			}
+			tokens = append(tokens, string(runes[i:j+1]))
+			if j < len(runes) {
+				j++
+			}
+			i = j
+			continue
+		}
+		// Word or operator (possibly ending with *).
+		j := i
+		for j < len(runes) && runes[j] != ' ' && runes[j] != '\t' && runes[j] != '"' {
+			j++
+		}
+		tok := string(runes[i:j])
+		if tok != "" {
+			tokens = append(tokens, tok)
+		}
+		i = j
+	}
+	return tokens
+}
+
+// ftsParseOr parses OR-level expressions.
+func ftsParseOr(tokens []string, pos int) (*ftsQueryNode, int) {
+	left, pos := ftsParseAnd(tokens, pos)
+	for pos < len(tokens) && strings.ToUpper(tokens[pos]) == "OR" {
+		pos++
+		right, newPos := ftsParseAnd(tokens, pos)
+		pos = newPos
+		left = &ftsQueryNode{op: "OR", left: left, right: right}
+	}
+	return left, pos
+}
+
+// ftsParseAnd parses AND-level expressions (explicit AND or implicit AND).
+func ftsParseAnd(tokens []string, pos int) (*ftsQueryNode, int) {
+	left, pos := ftsParseUnary(tokens, pos)
+	for pos < len(tokens) {
+		tok := tokens[pos]
+		upper := strings.ToUpper(tok)
+		if upper == "OR" {
+			break
+		}
+		if upper == "AND" {
+			pos++
+		}
+		// Anything else is implicit AND; don't advance pos.
+		right, newPos := ftsParseUnary(tokens, pos)
+		if newPos == pos {
+			break // no progress, avoid infinite loop
+		}
+		pos = newPos
+		left = &ftsQueryNode{op: "AND", left: left, right: right}
+	}
+	return left, pos
+}
+
+// ftsParseUnary parses NOT and atoms.
+func ftsParseUnary(tokens []string, pos int) (*ftsQueryNode, int) {
+	if pos >= len(tokens) {
+		return nil, pos
+	}
+	if strings.ToUpper(tokens[pos]) == "NOT" {
+		pos++
+		operand, newPos := ftsParseAtom(tokens, pos)
+		return &ftsQueryNode{op: "NOT", operand: operand}, newPos
+	}
+	return ftsParseAtom(tokens, pos)
+}
+
+// ftsParseAtom parses a single atom: TERM, PHRASE, or PREFIX.
+func ftsParseAtom(tokens []string, pos int) (*ftsQueryNode, int) {
+	if pos >= len(tokens) {
+		return nil, pos
+	}
+	tok := tokens[pos]
+	// Skip bare operators that ended up here.
+	upper := strings.ToUpper(tok)
+	if upper == "AND" || upper == "OR" || upper == "NOT" {
+		return nil, pos
+	}
+
+	pos++
+
+	// Quoted phrase.
+	if len(tok) >= 2 && tok[0] == '"' {
+		inner := tok[1:]
+		if len(inner) > 0 && inner[len(inner)-1] == '"' {
+			inner = inner[:len(inner)-1]
+		}
+		stemmed := ftsTokenize(inner)
+		return &ftsQueryNode{op: "PHRASE", phrase: stemmed}, pos
+	}
+
+	// Prefix wildcard.
+	if strings.HasSuffix(tok, "*") {
+		pfx := strings.ToLower(strings.TrimSuffix(tok, "*"))
+		pfx = ftsStem(pfx) // stem the prefix
+		return &ftsQueryNode{op: "PREFIX", prefix: pfx}, pos
+	}
+
+	// Plain term.
+	stemmed := ftsTokenize(tok)
+	term := tok
+	if len(stemmed) == 1 {
+		term = stemmed[0]
+	} else if len(stemmed) == 0 {
+		// Stop word or empty – still create node but with empty term.
+		term = strings.ToLower(tok)
+	}
+	return &ftsQueryNode{op: "TERM", term: term}, pos
+}
+
+// ─────────────────────────── Match / Score using query tree ──────────────────
+
+// ftsQueryTerms collects all positive terms from a query tree for snippet highlighting.
+func ftsQueryTerms(node *ftsQueryNode) map[string]bool {
+	if node == nil {
+		return nil
+	}
+	out := make(map[string]bool)
+	ftsCollectTerms(node, out)
+	return out
+}
+
+func ftsCollectTerms(node *ftsQueryNode, out map[string]bool) {
+	if node == nil {
+		return
+	}
+	switch node.op {
+	case "TERM":
+		out[node.term] = true
+	case "PHRASE":
+		for _, t := range node.phrase {
+			out[t] = true
+		}
+	case "PREFIX":
+		out[node.prefix+"*"] = true
+	case "NOT":
+		// Don't highlight negated terms.
+	case "AND", "OR":
+		ftsCollectTerms(node.left, out)
+		ftsCollectTerms(node.right, out)
+	}
+}
+
+// ftsMatchNode evaluates a query tree node against a token frequency map and token list.
+func ftsMatchNode(node *ftsQueryNode, freq map[string]int, tokens []string) bool {
+	if node == nil {
+		return false
+	}
+	switch node.op {
+	case "TERM":
+		return freq[node.term] > 0
+	case "PREFIX":
+		for tok := range freq {
+			if strings.HasPrefix(tok, node.prefix) {
+				return true
+			}
+		}
+		return false
+	case "PHRASE":
+		if len(node.phrase) == 0 {
+			return true
+		}
+		return ftsPhraseMatch(node.phrase, tokens)
+	case "AND":
+		return ftsMatchNode(node.left, freq, tokens) && ftsMatchNode(node.right, freq, tokens)
+	case "OR":
+		return ftsMatchNode(node.left, freq, tokens) || ftsMatchNode(node.right, freq, tokens)
+	case "NOT":
+		return !ftsMatchNode(node.operand, freq, tokens)
+	}
+	return false
+}
+
+// ftsPhraseMatch checks whether tokens contains phrase as a consecutive subsequence.
+func ftsPhraseMatch(phrase, tokens []string) bool {
+	if len(phrase) > len(tokens) {
+		return false
+	}
+	for i := 0; i <= len(tokens)-len(phrase); i++ {
+		match := true
+		for j, p := range phrase {
+			if tokens[i+j] != p {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+const phraseMatchBonus = 1.5
+
+func ftsScoreNode(node *ftsQueryNode, freq map[string]int, docLen float64) float64 {
+	if node == nil {
+		return 0
+	}
+	switch node.op {
+	case "TERM":
+		tf := float64(freq[node.term])
+		if tf == 0 {
+			return 0
+		}
+		return (tf * (bm25K1 + 1)) / (tf + bm25K1*(1-bm25B+bm25B*docLen))
+	case "PREFIX":
+		var s float64
+		for tok, f := range freq {
+			if strings.HasPrefix(tok, node.prefix) {
+				tf := float64(f)
+				s += (tf * (bm25K1 + 1)) / (tf + bm25K1*(1-bm25B+bm25B*docLen))
+			}
+		}
+		return s
+	case "PHRASE":
+		if len(node.phrase) == 0 {
+			return 0
+		}
+		// Score as sum of term scores (phrase match bonus)
+		var s float64
+		for _, t := range node.phrase {
+			tf := float64(freq[t])
+			if tf > 0 {
+				s += (tf * (bm25K1 + 1)) / (tf + bm25K1*(1-bm25B+bm25B*docLen))
+			}
+		}
+		return s * phraseMatchBonus // phrase match bonus
+	case "AND":
+		return ftsScoreNode(node.left, freq, docLen) + ftsScoreNode(node.right, freq, docLen)
+	case "OR":
+		l := ftsScoreNode(node.left, freq, docLen)
+		r := ftsScoreNode(node.right, freq, docLen)
+		if l > r {
+			return l
+		}
+		return r
+	case "NOT":
+		return 0
+	}
+	return 0
+}
+
+// ─────────────────────────── Upgraded FTS_MATCH / FTS_RANK ───────────────────
+
+// evalFTSMatch returns true if text matches the boolean query.
+// Supports: terms, "phrases", prefix*, AND, OR, NOT.
+func evalFTSMatch(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) != 2 {
+		return nil, fmt.Errorf("FTS_MATCH expects 2 arguments: (text, query)")
 	}
 	textVal, err := evalExpr(env, ex.Args[0], row)
 	if err != nil {
@@ -473,33 +775,247 @@ func evalFTSSnippet(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return nil, err
 	}
 	if textVal == nil || queryVal == nil {
-		return nil, nil
+		return false, nil
+	}
+	text := fmt.Sprintf("%v", textVal)
+	query := fmt.Sprintf("%v", queryVal)
+
+	tokens := ftsTokenize(text)
+	freq := make(map[string]int, len(tokens))
+	for _, t := range tokens {
+		freq[t]++
 	}
 
-	opts, err := parseFTSSnippetOpts(env, ex, row)
+	node := ftsParseQuery(query)
+	if node == nil {
+		return false, nil
+	}
+	return ftsMatchNode(node, freq, tokens), nil
+}
+
+// evalFTSRank computes a BM25-like score for text against a boolean query.
+func evalFTSRank(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) < 2 {
+		return nil, fmt.Errorf("FTS_RANK expects 2 arguments: (text, query)")
+	}
+	textVal, err := evalExpr(env, ex.Args[0], row)
 	if err != nil {
 		return nil, err
 	}
+	queryVal, err := evalExpr(env, ex.Args[1], row)
+	if err != nil {
+		return nil, err
+	}
+	if textVal == nil || queryVal == nil {
+		return 0.0, nil
+	}
+	text := fmt.Sprintf("%v", textVal)
+	query := fmt.Sprintf("%v", queryVal)
 
-	queryTerms := ftsTokenize(fmt.Sprintf("%v", queryVal))
-	querySet := make(map[string]bool, len(queryTerms))
-	for _, q := range queryTerms {
-		querySet[q] = true
+	tokens := ftsTokenize(text)
+	if len(tokens) == 0 {
+		return 0.0, nil
 	}
 
-	words := strings.Fields(fmt.Sprintf("%v", textVal))
-	return buildFTSSnippet(words, querySet, opts), nil
+	freq := make(map[string]int, len(tokens))
+	for _, t := range tokens {
+		freq[t]++
+	}
+
+	node := ftsParseQuery(query)
+	if node == nil {
+		return 0.0, nil
+	}
+	// Use doc length of 1.0 (standalone, no corpus avgdl).
+	return ftsScoreNode(node, freq, 1.0), nil
 }
 
-// getFTSFunctions returns scalar FTS function handlers.
-func getFTSFunctions() map[string]funcHandler {
-	return map[string]funcHandler{
-		"FTS_MATCH":   evalFTSMatch,
-		"FTS_RANK":    evalFTSRank,
-		"FTS_SNIPPET": evalFTSSnippet,
-		"BM25":        evalFTSRank, // alias
-		"MATCH":       evalFTSMatch,
+// evalFTSWordCount returns the number of words in a text.
+func evalFTSWordCount(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) != 1 {
+		return nil, fmt.Errorf("FTS_WORD_COUNT expects 1 argument: (text)")
 	}
+	v, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if v == nil {
+		return 0, nil
+	}
+	return len(strings.Fields(fmt.Sprintf("%v", v))), nil
+}
+
+// ─────────────────────────── FTS_SEARCH table-valued function ─────────────────
+
+// FTSSearchTableFunc implements FTS_SEARCH(table, query, k [, columns...]).
+// Usage:
+//
+//	SELECT * FROM FTS_SEARCH('table_name', 'query text', 10)
+//
+// Returns all columns from the source table plus:
+//
+//	_fts_score – BM25 relevance score
+//	_fts_rank  – 1-based rank (1 = most relevant)
+type FTSSearchTableFunc struct{}
+
+func (f *FTSSearchTableFunc) Name() string { return "FTS_SEARCH" }
+
+func (f *FTSSearchTableFunc) ValidateArgs(args []Expr) error {
+	if len(args) < 3 {
+		return fmt.Errorf("FTS_SEARCH requires at least 3 arguments: (table, query, k)")
+	}
+	return nil
+}
+
+func (f *FTSSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecEnv, row Row) (*ResultSet, error) {
+	if err := f.ValidateArgs(args); err != nil {
+		return nil, err
+	}
+
+	tableVal, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, fmt.Errorf("FTS_SEARCH table: %w", err)
+	}
+	tableName, ok := tableVal.(string)
+	if !ok {
+		return nil, fmt.Errorf("FTS_SEARCH: table name must be a string")
+	}
+
+	queryVal, err := evalExpr(env, args[1], row)
+	if err != nil {
+		return nil, fmt.Errorf("FTS_SEARCH query: %w", err)
+	}
+	query, ok := queryVal.(string)
+	if !ok {
+		return nil, fmt.Errorf("FTS_SEARCH: query must be a string")
+	}
+
+	kVal, err := evalExpr(env, args[2], row)
+	if err != nil {
+		return nil, fmt.Errorf("FTS_SEARCH k: %w", err)
+	}
+	k, err := toInt(kVal)
+	if err != nil {
+		return nil, fmt.Errorf("FTS_SEARCH k: %w", err)
+	}
+	if k <= 0 {
+		return nil, fmt.Errorf("FTS_SEARCH: k must be > 0")
+	}
+
+	tenant := env.tenant
+	if tenant == "" {
+		tenant = "default"
+	}
+	table, err := env.db.Get(tenant, tableName)
+	if err != nil {
+		return nil, fmt.Errorf("FTS_SEARCH: table %q not found: %w", tableName, err)
+	}
+
+	// Determine which columns to search: optional 4th+ args list column names.
+	var searchCols []int
+	if len(args) > 3 {
+		for _, colArg := range args[3:] {
+			cv, err := evalExpr(env, colArg, row)
+			if err != nil {
+				continue
+			}
+			cn, ok := cv.(string)
+			if !ok {
+				continue
+			}
+			idx, err := table.ColIndex(cn)
+			if err == nil {
+				searchCols = append(searchCols, idx)
+			}
+		}
+	}
+	if len(searchCols) == 0 {
+		// Default: search all TEXT columns.
+		for i, c := range table.Cols {
+			if c.Type == storage.TextType || c.Type == storage.StringType {
+				searchCols = append(searchCols, i)
+			}
+		}
+		if len(searchCols) == 0 {
+			// Fall back to all columns.
+			for i := range table.Cols {
+				searchCols = append(searchCols, i)
+			}
+		}
+	}
+
+	node := ftsParseQuery(query)
+
+	type scored struct {
+		rowIdx int
+		score  float64
+	}
+	var results []scored
+
+	for ri, r := range table.Rows {
+		// Aggregate text from searched columns.
+		var sb strings.Builder
+		for _, ci := range searchCols {
+			if ci < len(r) && r[ci] != nil {
+				if sb.Len() > 0 {
+					sb.WriteByte(' ')
+				}
+				sb.WriteString(fmt.Sprintf("%v", r[ci]))
+			}
+		}
+		text := sb.String()
+		if text == "" {
+			continue
+		}
+
+		tokens := ftsTokenize(text)
+		if len(tokens) == 0 {
+			continue
+		}
+		freq := make(map[string]int, len(tokens))
+		for _, t := range tokens {
+			freq[t]++
+		}
+
+		if node != nil && !ftsMatchNode(node, freq, tokens) {
+			continue
+		}
+		docLen := float64(len(tokens))
+		score := ftsScoreNode(node, freq, docLen)
+		results = append(results, scored{rowIdx: ri, score: score})
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].score > results[j].score
+	})
+	if k < len(results) {
+		results = results[:k]
+	}
+
+	resultCols := make([]string, 0, len(table.Cols)+2)
+	for _, c := range table.Cols {
+		resultCols = append(resultCols, c.Name)
+	}
+	resultCols = append(resultCols, "_fts_score", "_fts_rank")
+
+	rows := make([]Row, 0, len(results))
+	for rank, sr := range results {
+		r := make(Row)
+		for ci, c := range table.Cols {
+			if ci < len(table.Rows[sr.rowIdx]) {
+				r[c.Name] = table.Rows[sr.rowIdx][ci]
+			}
+		}
+		r["_fts_score"] = sr.score
+		r["_fts_rank"] = rank + 1
+		rows = append(rows, r)
+	}
+
+	return &ResultSet{Cols: resultCols, Rows: rows}, nil
+}
+
+func init() {
+	RegisterTableFunc(&FTSSearchTableFunc{})
 }
 
 // ─────────────────────────── Helper ──────────────────────────────────────────
