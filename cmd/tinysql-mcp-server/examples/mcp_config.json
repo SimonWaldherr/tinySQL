@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "tinysql": {
+      "command": "/absolute/path/to/tinysql-mcp-server",
+      "args": [
+        "--dsn",
+        "file:/absolute/path/to/tinysql.db?tenant=default&autosave=1"
+      ]
+    },
+    "tinysql-memory": {
+      "command": "/absolute/path/to/tinysql-mcp-server",
+      "args": [
+        "--dsn",
+        "mem://?tenant=default"
+      ]
+    }
+  }
+}
