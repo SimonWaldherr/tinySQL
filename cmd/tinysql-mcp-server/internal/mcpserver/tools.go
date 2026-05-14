@@ -404,7 +404,15 @@ func (s *Server) buildAgentContextFallback(ctx context.Context, maxTables, maxCh
 		write(fmt.Sprintf("views(%d): %s", len(names), strings.Join(names, ", ")))
 	}
 
-	write("features: selects; inserts; updates; deletes; joins; group by; having; order by; limit; subqueries; ctes; window functions; views; indexes(metadata); full-text search; triggers; jobs; vector search; json; yaml; url; hash; bitmap; geometry; decimal; money; multi-tenancy; mvcc+wal; sys.* and catalog.* introspection")
+	features := []string{
+		"selects", "inserts", "updates", "deletes", "joins",
+		"group by", "having", "order by", "limit", "subqueries", "ctes",
+		"window functions", "views", "indexes(metadata)", "full-text search",
+		"triggers", "jobs", "vector search", "json", "yaml", "url", "hash",
+		"bitmap", "geometry", "decimal", "money", "multi-tenancy", "mvcc+wal",
+		"sys.* and catalog.* introspection",
+	}
+	write("features: " + strings.Join(features, "; "))
 	write("note: agent context generated via SQL fallback (BuildAgentContext requires direct engine access)")
 
 	return b.String(), nil
