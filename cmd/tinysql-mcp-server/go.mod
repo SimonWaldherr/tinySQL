@@ -1,6 +1,6 @@
 module tinysql-mcp-server
 
-go 1.25.10
+go 1.25.11
 
 replace github.com/SimonWaldherr/tinySQL => ../../
 
