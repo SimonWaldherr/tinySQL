@@ -395,6 +395,35 @@ func TestVectorInWhereClause(t *testing.T) {
 	}
 }
 
+func TestVectorWhereAndSimpleCondition(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	Execute(ctx, db, "default", mustParse("CREATE TABLE docs (id INT, embedding VECTOR)"))
+	Execute(ctx, db, "default", mustParse("INSERT INTO docs VALUES (1, '[1.0, 0.0]')"))
+	Execute(ctx, db, "default", mustParse("INSERT INTO docs VALUES (2, '[0.0, 1.0]')"))
+
+	rs := execSQL(t, db, `
+		SELECT id
+		FROM docs
+		WHERE id = 1
+			AND VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[1.0, 0.0]')) > 0.5
+	`)
+	if len(rs.Rows) != 1 {
+		t.Fatalf("expected 1 matching row, got %d", len(rs.Rows))
+	}
+
+	rs = execSQL(t, db, `
+		SELECT id
+		FROM docs
+		WHERE VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[1.0, 0.0]')) > 0.5
+			AND id = 1
+	`)
+	if len(rs.Rows) != 1 {
+		t.Fatalf("expected 1 matching row for reversed order, got %d", len(rs.Rows))
+	}
+}
+
 // ---------------------------------------------------------------------------
 // VEC_SEARCH table-valued function (k-NN)
 // ---------------------------------------------------------------------------

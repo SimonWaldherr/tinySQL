@@ -676,7 +676,7 @@ func resolveFromClause(env ExecEnv, cteEnv ExecEnv, s *Select) ([]Row, error) {
 	}
 
 	if s.From.TableFunc != nil {
-		return resolveTableFunc(env, s)
+		return resolveTableFunc(cteEnv, s)
 	}
 
 	// No subquery and no table function: this can be a CTE name, a virtual
@@ -1033,6 +1033,133 @@ func applySortOrder(orderBy []OrderItem, outRows []Row) []Row {
 	return outRows
 }
 
+type orderedValueRow struct {
+	row  Row
+	keys []any
+}
+
+type orderedValueRowHeap struct {
+	orderBy []OrderItem
+	items   []orderedValueRow
+}
+
+func (h orderedValueRowHeap) Len() int { return len(h.items) }
+
+func (h orderedValueRowHeap) Less(i, j int) bool {
+	return compareOrderedValueRows(h.orderBy, h.items[i], h.items[j]) > 0
+}
+
+func (h orderedValueRowHeap) Swap(i, j int) {
+	h.items[i], h.items[j] = h.items[j], h.items[i]
+}
+
+func (h *orderedValueRowHeap) Push(x any) {
+	h.items = append(h.items, x.(orderedValueRow))
+}
+
+func (h *orderedValueRowHeap) Pop() any {
+	old := h.items
+	n := len(old)
+	item := old[n-1]
+	h.items = old[:n-1]
+	return item
+}
+
+func (h *orderedValueRowHeap) pushBounded(item orderedValueRow, keepCount int) {
+	if keepCount <= 0 {
+		return
+	}
+	if len(h.items) < keepCount {
+		heap.Push(h, item)
+		return
+	}
+	if compareOrderedValueRows(h.orderBy, h.items[0], item) > 0 {
+		h.items[0] = item
+		heap.Fix(h, 0)
+	}
+}
+
+func compareOrderedValueRows(orderBy []OrderItem, a, b orderedValueRow) int {
+	for i, oi := range orderBy {
+		cmp := compareOrderedValue(a.keys[i], b.keys[i], oi.Desc)
+		if cmp != 0 {
+			return cmp
+		}
+	}
+	return 0
+}
+
+func buildOrderByValues(row Row, lcOrdCols []string) orderedValueRow {
+	keys := make([]any, len(lcOrdCols))
+	for i, col := range lcOrdCols {
+		keys[i] = row[col]
+	}
+	return orderedValueRow{row: row, keys: keys}
+}
+
+func applySortOrderWithLimit(orderBy []OrderItem, outRows []Row, limit, offset *int) []Row {
+	if len(orderBy) == 0 || len(outRows) <= 1 {
+		return outRows
+	}
+	if limit != nil && *limit <= 0 {
+		return []Row{}
+	}
+	if limit == nil && offset == nil {
+		return applySortOrder(orderBy, outRows)
+	}
+
+	lcOrdCols := make([]string, len(orderBy))
+	for idx, oi := range orderBy {
+		lcOrdCols[idx] = strings.ToLower(oi.Col)
+	}
+
+	keepCount := len(outRows)
+	if limit != nil {
+		keepCount = *limit
+		if offset != nil {
+			keepCount += *offset
+		}
+		if keepCount > len(outRows) {
+			keepCount = len(outRows)
+		}
+	}
+	if keepCount <= 0 {
+		return []Row{}
+	}
+
+	items := make([]orderedValueRow, 0, min(cap(outRows), keepCount))
+	var topRows orderedValueRowHeap
+	useTopN := limit != nil && keepCount > 0 && keepCount < len(outRows)
+	if useTopN {
+		topRows = orderedValueRowHeap{
+			orderBy: orderBy,
+			items:   make([]orderedValueRow, 0, min(cap(outRows), keepCount)),
+		}
+	}
+
+	for _, row := range outRows {
+		item := buildOrderByValues(row, lcOrdCols)
+		if useTopN {
+			topRows.pushBounded(item, keepCount)
+		} else {
+			items = append(items, item)
+		}
+	}
+	if useTopN {
+		items = topRows.items
+	}
+
+	sort.SliceStable(items, func(i, j int) bool {
+		return compareOrderedValueRows(orderBy, items[i], items[j]) < 0
+	})
+
+	sorted := make([]Row, len(items))
+	for i, item := range items {
+		sorted[i] = item.row
+	}
+	return sorted
+}
+
 func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 	if rs, ok, err := executeSimpleJoinFastPath(env, s); ok || err != nil {
 		return rs, err
@@ -1094,7 +1221,7 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 
 	// ORDER BY
 	if len(s.OrderBy) > 0 {
-		outRows = applySortOrder(s.OrderBy, outRows)
+		outRows = applySortOrderWithLimit(s.OrderBy, outRows, s.Limit, s.Offset)
 	}
 
 	// OFFSET/LIMIT (applied before UNION to each individual SELECT)
@@ -1311,13 +1438,21 @@ func simpleJoinKeys(on Expr, leftIndex, rightIndex map[string]int) (int, int, bo
 	if !leftOK || !rightOK {
 		return 0, 0, false
 	}
-	if li, lok := leftIndex[strings.ToLower(leftRef.Name)]; lok {
-		if ri, rok := rightIndex[strings.ToLower(rightRef.Name)]; rok {
+	leftKey := leftRef.Lower
+	if leftKey == "" {
+		leftKey = strings.ToLower(leftRef.Name)
+	}
+	rightKey := rightRef.Lower
+	if rightKey == "" {
+		rightKey = strings.ToLower(rightRef.Name)
+	}
+	if li, lok := leftIndex[leftKey]; lok {
+		if ri, rok := rightIndex[rightKey]; rok {
 			return li, ri, true
 		}
 	}
-	if li, lok := leftIndex[strings.ToLower(rightRef.Name)]; lok {
-		if ri, rok := rightIndex[strings.ToLower(leftRef.Name)]; rok {
+	if li, lok := leftIndex[rightKey]; lok {
+		if ri, rok := rightIndex[leftKey]; rok {
 			return li, ri, true
 		}
 	}
@@ -1329,8 +1464,12 @@ func simpleJoinExprResolvable(e Expr, leftIndex, rightIndex map[string]int) bool
 	case nil, *Literal:
 		return true
 	case *VarRef:
-		_, lok := leftIndex[strings.ToLower(ex.Name)]
-		_, rok := rightIndex[strings.ToLower(ex.Name)]
+		key := ex.Lower
+		if key == "" {
+			key = strings.ToLower(ex.Name)
+		}
+		_, lok := leftIndex[key]
+		_, rok := rightIndex[key]
 		return lok != rok
 	case *IsNull:
 		return simpleJoinExprResolvable(ex.Expr, leftIndex, rightIndex)
@@ -1424,7 +1563,10 @@ func evalJoinRawExpr(plan *simpleJoinPlan, left, right []any, e Expr) (any, erro
 }
 
 func evalJoinRawVarRef(plan *simpleJoinPlan, left, right []any, ex *VarRef) (any, error) {
-	name := strings.ToLower(ex.Name)
+	name := ex.Lower
+	if name == "" {
+		name = strings.ToLower(ex.Name)
+	}
 	if i, ok := plan.leftIndex[name]; ok {
 		if _, ambiguous := plan.rightIndex[name]; ambiguous {
 			return nil, fmt.Errorf("ambiguous column %q", ex.Name)
@@ -2030,7 +2172,8 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 	if !ok {
 		return nil, false, nil
 	}
-	if !isSimpleRawPredicate(s.Where) {
+	filter := buildRawFilter(colIndex, s.Where)
+	if filter == nil {
 		return nil, false, nil
 	}
 
@@ -2041,7 +2184,7 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 		orderBy:    s.OrderBy,
 		orderExprs: orderExprs,
 		where:      s.Where,
-		filter:     buildRawFilter(colIndex, s.Where),
+		filter:     filter,
 		limit:      s.Limit,
 		offset:     s.Offset,
 		outputCols: outputCols,
@@ -2181,6 +2324,16 @@ func isSimpleRawExpr(e Expr) bool {
 			}
 		}
 		return true
+	case *FuncCall:
+		if ex.Over != nil {
+			return false
+		}
+		for _, arg := range ex.Args {
+			if !isSimpleRawExpr(arg) {
+				return false
+			}
+		}
+		return true
 	default:
 		return false
 	}
@@ -2259,7 +2412,11 @@ func buildRawFilter(colIndex map[string]int, e Expr) func([]any) (bool, error) {
 }
 
 func buildRawFilterVarRef(colIndex map[string]int, ex *VarRef) func([]any) (bool, error) {
-	colIdx, ok := colIndex[strings.ToLower(ex.Name)]
+	key := ex.Lower
+	if key == "" {
+		key = strings.ToLower(ex.Name)
+	}
+	colIdx, ok := colIndex[key]
 	if !ok {
 		return nil
 	}
@@ -2312,33 +2469,78 @@ func buildRawFilterBinary(colIndex map[string]int, ex *Binary) func([]any) (bool
 func buildRawAndFilter(colIndex map[string]int, leftExpr, rightExpr Expr) func([]any) (bool, error) {
 	left := buildRawFilter(colIndex, leftExpr)
 	right := buildRawFilter(colIndex, rightExpr)
-	if left == nil || right == nil {
+	if left != nil && right != nil {
+		return func(raw []any) (bool, error) {
+			l, err := left(raw)
+			if err != nil || !l {
+				return false, err
+			}
+			return right(raw)
+		}
+	}
+	if left == nil && right == nil {
 		return nil
 	}
+
+	if left == nil {
+		return buildRawAndFilterWithFallback(colIndex, leftExpr, right)
+	}
+	return buildRawAndFilterWithFallback(colIndex, rightExpr, left)
+}
+
+func buildRawAndFilterWithFallback(colIndex map[string]int, expr Expr, fastFilter func([]any) (bool, error)) func([]any) (bool, error) {
+	plan := &simpleSelectPlan{colIndex: colIndex}
 	return func(raw []any) (bool, error) {
-		l, err := left(raw)
-		if err != nil || !l {
+		fast, err := fastFilter(raw)
+		if err != nil || !fast {
 			return false, err
 		}
-		return right(raw)
+		v, err := evalRawExpr(plan, raw, expr)
+		if err != nil {
+			return false, err
+		}
+		return toTri(v) == tvTrue, nil
 	}
 }
 
 func buildRawOrFilter(colIndex map[string]int, leftExpr, rightExpr Expr) func([]any) (bool, error) {
 	left := buildRawFilter(colIndex, leftExpr)
 	right := buildRawFilter(colIndex, rightExpr)
-	if left == nil || right == nil {
+	if left != nil && right != nil {
+		return func(raw []any) (bool, error) {
+			l, err := left(raw)
+			if err != nil {
+				return false, err
+			}
+			if l {
+				return true, nil
+			}
+			return right(raw)
+		}
+	}
+	if left == nil && right == nil {
 		return nil
 	}
+
+	if left == nil {
+		return buildRawOrFilterWithFallback(colIndex, leftExpr, right)
+	}
+	return buildRawOrFilterWithFallback(colIndex, rightExpr, left)
+
+}
+
+func buildRawOrFilterWithFallback(colIndex map[string]int, expr Expr, fastFilter func([]any) (bool, error)) func([]any) (bool, error) {
+	plan := &simpleSelectPlan{colIndex: colIndex}
 	return func(raw []any) (bool, error) {
-		l, err := left(raw)
+		fast, err := fastFilter(raw)
+		if err != nil || fast {
+			return fast, err
+		}
+		v, err := evalRawExpr(plan, raw, expr)
 		if err != nil {
 			return false, err
 		}
-		if l {
-			return true, nil
-		}
-		return right(raw)
+		return toTri(v) == tvTrue, nil
 	}
 }
 
@@ -3077,7 +3279,11 @@ func evalRawExpr(plan *simpleSelectPlan, raw []any, e Expr) (any, error) {
 	case *Literal:
 		return ex.Val, nil
 	case *VarRef:
-		i, ok := plan.colIndex[strings.ToLower(ex.Name)]
+		key := ex.Lower
+		if key == "" {
+			key = strings.ToLower(ex.Name)
+		}
+		i, ok := plan.colIndex[key]
 		if !ok {
 			if strings.Contains(ex.Name, ".") {
 				return nil, fmt.Errorf("unknown column reference %q", ex.Name)
@@ -3108,9 +3314,28 @@ func evalRawExpr(plan *simpleSelectPlan, raw []any, e Expr) (any, error) {
 		return evalRawIn(plan, raw, ex)
 	case *RegexpExpr:
 		return evalRawRegexp(plan, raw, ex)
+	case *FuncCall:
+		return evalRawFuncCall(plan, raw, ex)
 	default:
 		return nil, fmt.Errorf("unsupported fast-path expression %T", e)
 	}
+}
+
+func evalRawFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, error) {
+	if ex.Over != nil {
+		return nil, fmt.Errorf("window function %s is not supported in raw expression evaluation", ex.Name)
+	}
+	evaluatedArgs := make([]Expr, len(ex.Args))
+	for i, arg := range ex.Args {
+		v, err := evalRawExpr(plan, raw, arg)
+		if err != nil {
+			return nil, err
+		}
+		evaluatedArgs[i] = &Literal{Val: v}
+	}
+	call := *ex
+	call.Args = evaluatedArgs
+	return evalFuncCall(ExecEnv{}, &call, Row{})
 }
 
 func evalRawUnary(plan *simpleSelectPlan, raw []any, ex *Unary) (any, error) {
@@ -3927,8 +4152,12 @@ func evalRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
 // -------------------- Eval, Aggregates, Helpers --------------------
 
 func getVal(row Row, name string) (any, bool) { v, ok := row[strings.ToLower(name)]; return v, ok }
-func putVal(row Row, key string, val any)     { row[strings.ToLower(key)] = val }
-func isNull(v any) bool                       { return v == nil }
+func getValLower(row Row, lowerName string) (any, bool) {
+	v, ok := row[lowerName]
+	return v, ok
+}
+func putVal(row Row, key string, val any) { row[strings.ToLower(key)] = val }
+func isNull(v any) bool                   { return v == nil }
 func numeric(v any) (float64, bool) {
 	switch x := v.(type) {
 	case int:
@@ -4226,7 +4455,11 @@ func evalExpr(env ExecEnv, e Expr, row Row) (any, error) {
 }
 
 func evalVarRef(ex *VarRef, row Row) (any, error) {
-	if v, ok := getVal(row, ex.Name); ok {
+	if ex.Lower != "" {
+		if v, ok := getValLower(row, ex.Lower); ok {
+			return v, nil
+		}
+	} else if v, ok := getVal(row, ex.Name); ok {
 		return v, nil
 	}
 	if strings.Contains(ex.Name, ".") {
@@ -4545,7 +4778,7 @@ func evalSubqueryExpr(env ExecEnv, ex *SubqueryExpr) (any, error) {
 	}
 	row := rs.Rows[0]
 	if len(rs.Cols) == 1 {
-		if v, ok := row[strings.ToLower(rs.Cols[0])]; ok {
+		if v, ok := getValLower(row, strings.ToLower(rs.Cols[0])); ok {
 			return v, nil
 		}
 	}
@@ -4555,7 +4788,7 @@ func evalSubqueryExpr(env ExecEnv, ex *SubqueryExpr) (any, error) {
 		}
 	}
 	for _, col := range rs.Cols {
-		if v, ok := row[strings.ToLower(col)]; ok {
+		if v, ok := getValLower(row, strings.ToLower(col)); ok {
 			return v, nil
 		}
 	}
@@ -8623,7 +8856,7 @@ func evalMovingAggregate(env ExecEnv, ex *FuncCall, partitionRows []Row, current
 	} else {
 		// Use ORDER BY column as default
 		if len(ex.Over.OrderBy) > 0 {
-			valueExpr = &VarRef{Name: ex.Over.OrderBy[0].Col}
+			valueExpr = newVarRef(ex.Over.OrderBy[0].Col)
 		} else {
 			return nil, fmt.Errorf("%s requires value expression", ex.Name)
 		}
@@ -8737,13 +8970,17 @@ func filterPartition(env ExecEnv, allRows []Row, partitionBy []Expr, currentRow 
 func sortRows(rows []Row, orderBy []OrderItem) []Row {
 	sorted := make([]Row, len(rows))
 	copy(sorted, rows)
+	orderColsLower := make([]string, len(orderBy))
+	for i, oi := range orderBy {
+		orderColsLower[i] = strings.ToLower(oi.Col)
+	}
 
 	sort.SliceStable(sorted, func(i, j int) bool {
 		a := sorted[i]
 		b := sorted[j]
-		for _, oi := range orderBy {
-			av, _ := getVal(a, oi.Col)
-			bv, _ := getVal(b, oi.Col)
+		for idx, oi := range orderBy {
+			av, _ := getValLower(a, orderColsLower[idx])
+			bv, _ := getValLower(b, orderColsLower[idx])
 			cmp := compareForOrder(av, bv, oi.Desc)
 			if cmp == 0 {
 				continue

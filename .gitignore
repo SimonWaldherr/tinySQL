@@ -40,3 +40,4 @@ bin/
 cmd/formigo/formigo
 formigo.db
 formigo.db.wal
+/.gomodcache

@@ -125,7 +125,7 @@ func (sb *SelectBuilder) LeftJoinAs(table, alias string, on ExprBuilder) *Select
 // GroupBy adds GROUP BY columns.
 func (sb *SelectBuilder) GroupBy(columns ...string) *SelectBuilder {
 	for _, col := range columns {
-		sb.groupBy = append(sb.groupBy, &engine.VarRef{Name: col})
+		sb.groupBy = append(sb.groupBy, &engine.VarRef{Name: col, Lower: strings.ToLower(col)})
 	}
 	return sb
 }
@@ -248,7 +248,7 @@ func (e exprWrapper) Build() engine.Expr { return e.expr }
 //	Col("users.id")
 //	Col("name")
 func Col(name string) ExprBuilder {
-	return exprWrapper{&engine.VarRef{Name: name}}
+	return exprWrapper{&engine.VarRef{Name: name, Lower: strings.ToLower(name)}}
 }
 
 // Val creates a literal value expression.

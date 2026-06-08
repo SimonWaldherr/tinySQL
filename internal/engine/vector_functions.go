@@ -5,6 +5,11 @@
 //
 //	VEC_FROM_JSON(json_string)           – parse "[1.0, 2.0, 3.0]" → []float64
 //	VEC_TO_JSON(vector)                  – serialize vector → JSON string
+//	RECENCY_SCORE(ts, half_life_days [, now]) – exponential decay score in [0, 1]
+//	RAG_HYBRID_SCORE(similarity, ts, half_life_days [, sim_weight, now]) – blend of
+//	                                                                 normalized similarity and recency
+//	RAG_RANK_SCORE(similarity, ts, half_life_days, quality [, sim_w, recency_w, quality_w, now])
+//	                                      – weighted RAG score over similarity, freshness and quality
 //	VEC_DIM(vector)                      – number of dimensions
 //	VEC_NORM(vector)                     – L2 (Euclidean) norm
 //	VEC_NORMALIZE(vector)                – unit-length normalised copy
@@ -30,6 +35,7 @@ import (
 	"math"
 	"math/rand"
 	"strings"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -580,6 +586,235 @@ func toInt(v any) (int, error) {
 	}
 }
 
+// evalRecencyScore calculates an exponential decay score in [0,1].
+//
+// Formula:
+// score = exp(-ln(2) * age_days / half_life_days)
+//
+// Arguments:
+//   - ts: timestamp (string, time.Time, etc., parseable by parseTimeValue)
+//   - half_life_days: positive numeric half-life in days
+//   - optional now: optional override timestamp for deterministic evaluation
+func evalRecencyScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if err := requireArgs("RECENCY_SCORE", ex, 2, 3); err != nil {
+		return nil, err
+	}
+
+	tsVal, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, fmt.Errorf("RECENCY_SCORE ts: %w", err)
+	}
+	ts, err := parseTimeValue(tsVal)
+	if err != nil {
+		return nil, fmt.Errorf("RECENCY_SCORE ts: %w", err)
+	}
+
+	halfLifeVal, err := evalExpr(env, ex.Args[1], row)
+	if err != nil {
+		return nil, fmt.Errorf("RECENCY_SCORE half_life_days: %w", err)
+	}
+	halfLifeDays, err := toFloat64(halfLifeVal)
+	if err != nil {
+		return nil, fmt.Errorf("RECENCY_SCORE half_life_days: %w", err)
+	}
+	if halfLifeDays <= 0 {
+		return nil, fmt.Errorf("RECENCY_SCORE half_life_days must be > 0, got %v", halfLifeDays)
+	}
+
+	now := time.Now()
+	if len(ex.Args) == 3 {
+		nowVal, err := evalExpr(env, ex.Args[2], row)
+		if err != nil {
+			return nil, fmt.Errorf("RECENCY_SCORE now: %w", err)
+		}
+		nowParsed, err := parseTimeValue(nowVal)
+		if err != nil {
+			return nil, fmt.Errorf("RECENCY_SCORE now: %w", err)
+		}
+		now = nowParsed
+	}
+
+	return recencyScore(ts, now, halfLifeDays), nil
+}
+
+// evalRAGHybridScore combines similarity and recency:
+// score = sim_weight * similarity_norm + (1 - sim_weight) * recency_score
+//
+// similarity_norm is computed as (similarity + 1) / 2 and clamped to [0,1],
+// useful for cosine similarity values in [-1, 1].
+func evalRAGHybridScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if err := requireArgs("RAG_HYBRID_SCORE", ex, 3, 5); err != nil {
+		return nil, err
+	}
+
+	simRaw, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, fmt.Errorf("RAG_HYBRID_SCORE similarity: %w", err)
+	}
+	sim, err := toFloat64(simRaw)
+	if err != nil {
+		return nil, fmt.Errorf("RAG_HYBRID_SCORE similarity: %w", err)
+	}
+	simNorm := clamp01((sim + 1.0) / 2.0)
+
+	tsVal, err := evalExpr(env, ex.Args[1], row)
+	if err != nil {
+		return nil, fmt.Errorf("RAG_HYBRID_SCORE ts: %w", err)
+	}
+	ts, err := parseTimeValue(tsVal)
+	if err != nil {
+		return nil, fmt.Errorf("RAG_HYBRID_SCORE ts: %w", err)
+	}
+
+	halfLifeVal, err := evalExpr(env, ex.Args[2], row)
+	if err != nil {
+		return nil, fmt.Errorf("RAG_HYBRID_SCORE half_life_days: %w", err)
+	}
+	halfLifeDays, err := toFloat64(halfLifeVal)
+	if err != nil {
+		return nil, fmt.Errorf("RAG_HYBRID_SCORE half_life_days: %w", err)
+	}
+	if halfLifeDays <= 0 {
+		return nil, fmt.Errorf("RAG_HYBRID_SCORE half_life_days must be > 0, got %v", halfLifeDays)
+	}
+
+	simWeight := 0.7
+	if len(ex.Args) >= 4 {
+		wVal, err := evalExpr(env, ex.Args[3], row)
+		if err != nil {
+			return nil, fmt.Errorf("RAG_HYBRID_SCORE sim_weight: %w", err)
+		}
+		simWeight, err = toFloat64(wVal)
+		if err != nil {
+			return nil, fmt.Errorf("RAG_HYBRID_SCORE sim_weight: %w", err)
+		}
+		if simWeight < 0 || simWeight > 1 {
+			return nil, fmt.Errorf("RAG_HYBRID_SCORE sim_weight must be between 0 and 1, got %v", simWeight)
+		}
+	}
+
+	now := time.Now()
+	if len(ex.Args) >= 5 {
+		nowVal, err := evalExpr(env, ex.Args[4], row)
+		if err != nil {
+			return nil, fmt.Errorf("RAG_HYBRID_SCORE now: %w", err)
+		}
+		nowParsed, err := parseTimeValue(nowVal)
+		if err != nil {
+			return nil, fmt.Errorf("RAG_HYBRID_SCORE now: %w", err)
+		}
+		now = nowParsed
+	}
+
+	return simWeight*simNorm + (1.0-simWeight)*recencyScore(ts, now, halfLifeDays), nil
+}
+
+// evalRAGRankScore combines normalized similarity, recency and a caller-provided
+// quality score. Weights are normalized by their sum, so callers can use either
+// fractions (0.65, 0.25, 0.10) or simple proportions (65, 25, 10).
+func evalRAGRankScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if err := requireArgs("RAG_RANK_SCORE", ex, 4, 8); err != nil {
+		return nil, err
+	}
+
+	simRaw, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, fmt.Errorf("RAG_RANK_SCORE similarity: %w", err)
+	}
+	sim, err := toFloat64(simRaw)
+	if err != nil {
+		return nil, fmt.Errorf("RAG_RANK_SCORE similarity: %w", err)
+	}
+
+	tsVal, err := evalExpr(env, ex.Args[1], row)
+	if err != nil {
+		return nil, fmt.Errorf("RAG_RANK_SCORE ts: %w", err)
+	}
+	ts, err := parseTimeValue(tsVal)
+	if err != nil {
+		return nil, fmt.Errorf("RAG_RANK_SCORE ts: %w", err)
+	}
+
+	halfLifeVal, err := evalExpr(env, ex.Args[2], row)
+	if err != nil {
+		return nil, fmt.Errorf("RAG_RANK_SCORE half_life_days: %w", err)
+	}
+	halfLifeDays, err := toFloat64(halfLifeVal)
+	if err != nil {
+		return nil, fmt.Errorf("RAG_RANK_SCORE half_life_days: %w", err)
+	}
+	if halfLifeDays <= 0 {
+		return nil, fmt.Errorf("RAG_RANK_SCORE half_life_days must be > 0, got %v", halfLifeDays)
+	}
+
+	qualityVal, err := evalExpr(env, ex.Args[3], row)
+	if err != nil {
+		return nil, fmt.Errorf("RAG_RANK_SCORE quality: %w", err)
+	}
+	quality, err := toFloat64(qualityVal)
+	if err != nil {
+		return nil, fmt.Errorf("RAG_RANK_SCORE quality: %w", err)
+	}
+
+	weights := []float64{0.65, 0.25, 0.10}
+	for i := 4; i < len(ex.Args) && i < 7; i++ {
+		weightVal, err := evalExpr(env, ex.Args[i], row)
+		if err != nil {
+			return nil, fmt.Errorf("RAG_RANK_SCORE weight %d: %w", i-3, err)
+		}
+		weights[i-4], err = toFloat64(weightVal)
+		if err != nil {
+			return nil, fmt.Errorf("RAG_RANK_SCORE weight %d: %w", i-3, err)
+		}
+		if weights[i-4] < 0 {
+			return nil, fmt.Errorf("RAG_RANK_SCORE weights must be >= 0")
+		}
+	}
+
+	now := time.Now()
+	if len(ex.Args) == 8 {
+		nowVal, err := evalExpr(env, ex.Args[7], row)
+		if err != nil {
+			return nil, fmt.Errorf("RAG_RANK_SCORE now: %w", err)
+		}
+		nowParsed, err := parseTimeValue(nowVal)
+		if err != nil {
+			return nil, fmt.Errorf("RAG_RANK_SCORE now: %w", err)
+		}
+		now = nowParsed
+	}
+
+	totalWeight := weights[0] + weights[1] + weights[2]
+	if totalWeight <= 0 {
+		return nil, fmt.Errorf("RAG_RANK_SCORE total weight must be > 0")
+	}
+
+	simNorm := clamp01((sim + 1.0) / 2.0)
+	recency := recencyScore(ts, now, halfLifeDays)
+	quality = clamp01(quality)
+
+	return (weights[0]*simNorm + weights[1]*recency + weights[2]*quality) / totalWeight, nil
+}
+
+func recencyScore(ts, now time.Time, halfLifeDays float64) float64 {
+	ageDays := now.Sub(ts).Hours() / 24.0
+	if ageDays <= 0 {
+		return 1.0
+	}
+	lambda := math.Ln2 / halfLifeDays
+	return clamp01(math.Exp(-lambda * ageDays))
+}
+
+func clamp01(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
 // ---------------------------------------------------------------------------
 // VEC_CONCAT – concatenate two vectors
 // ---------------------------------------------------------------------------
@@ -986,8 +1221,11 @@ func evalVecMinDistance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 func getVectorFunctions() map[string]funcHandler {
 	return map[string]funcHandler{
 		// Parsing / serialization
-		"VEC_FROM_JSON": evalVecFromJSON,
-		"VEC_TO_JSON":   evalVecToJSON,
+		"VEC_FROM_JSON":    evalVecFromJSON,
+		"VEC_TO_JSON":      evalVecToJSON,
+		"RECENCY_SCORE":    evalRecencyScore,
+		"RAG_HYBRID_SCORE": evalRAGHybridScore,
+		"RAG_RANK_SCORE":   evalRAGRankScore,
 
 		// Binary encoding / decoding (compact float32 BLOB storage)
 		"VEC_TO_BYTES":   evalVecToBytes,

@@ -427,3 +427,200 @@ func TestRAGHybridWorkflow(t *testing.T) {
 		t.Errorf("BLOB round-trip: expected 0.5, got %v", vec[0])
 	}
 }
+
+func TestRecencyScore(t *testing.T) {
+	db := storage.NewDB()
+	rs := execSQL(t, db, `
+		SELECT RECENCY_SCORE('2026-01-01 00:00:00', 30, '2026-01-31 00:00:00') as score
+	`)
+	score := rs.Rows[0]["score"].(float64)
+	expectFloat(t, score, 0.5, 1e-9, "RECENCY_SCORE 30-day half-life")
+
+	rs = execSQL(t, db, `
+		SELECT RECENCY_SCORE('2026-02-01 00:00:00', 30, '2026-01-31 00:00:00') as score
+	`)
+	// future timestamp yields full freshness
+	expectFloat(t, rs.Rows[0]["score"], 1.0, 1e-12, "RECENCY_SCORE future timestamp")
+}
+
+func TestRAGHybridScore(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	Execute(ctx, db, "default", mustParse(`
+		CREATE TABLE rag_hybrid (
+			id INT,
+			created_at TEXT,
+			embedding VECTOR
+		)
+	`))
+	Execute(ctx, db, "default", mustParse(`
+		INSERT INTO rag_hybrid VALUES
+			(1, '2026-01-01 00:00:00', '[1.0, 0.0]'),
+			(2, '2026-01-31 00:00:00', '[0.2, 1.0]')
+	`))
+
+	// Newer but slightly less similar doc should win due recency weighting.
+	rs := execSQL(t, db, `
+		SELECT id,
+		       RAG_HYBRID_SCORE(
+		           VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[1.0, 0.0]')),
+		           created_at,
+		           7,
+		           0.6,
+		           '2026-01-31 00:00:00'
+		       ) AS rag_score
+		FROM rag_hybrid
+		ORDER BY rag_score DESC
+	`)
+	if len(rs.Rows) != 2 {
+		t.Fatalf("RAG_HYBRID_SCORE: expected 2 results, got %d", len(rs.Rows))
+	}
+	if rs.Rows[0]["id"] != 2 {
+		t.Fatalf("RAG_HYBRID_SCORE expected id=2 on top, got %v", rs.Rows[0]["id"])
+	}
+
+	// Add a recency filter and keep both scoring and filtering in one combined expression.
+	rsFiltered := execSQL(t, db, `
+		SELECT id,
+		       RAG_HYBRID_SCORE(
+		           VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[1.0, 0.0]')),
+		           created_at,
+		           7,
+		           0.6,
+		           '2026-01-31 00:00:00'
+		       ) AS rag_score
+		FROM rag_hybrid
+		WHERE RAG_HYBRID_SCORE(
+		          VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[1.0, 0.0]')),
+		          created_at,
+		          7,
+		          0.6,
+		          '2026-01-31 00:00:00'
+		      ) > 0.7
+		ORDER BY rag_score DESC
+	`)
+	if len(rsFiltered.Rows) != 1 {
+		t.Fatalf("RAG_HYBRID_SCORE with threshold: expected 1 row, got %d", len(rsFiltered.Rows))
+	}
+}
+
+func TestRAGRankScoreWithQuality(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	Execute(ctx, db, "default", mustParse(`
+		CREATE TABLE rag_ranked (
+			id INT,
+			created_at TEXT,
+			quality FLOAT,
+			embedding VECTOR
+		)
+	`))
+	Execute(ctx, db, "default", mustParse(`
+		INSERT INTO rag_ranked VALUES
+			(1, '2026-01-01 00:00:00', 0.2, '[1.0, 0.0]'),
+			(2, '2026-01-31 00:00:00', 0.1, '[0.8, 0.2]'),
+			(3, '2026-01-15 00:00:00', 1.0, '[0.6, 0.8]')
+	`))
+
+	rs := execSQL(t, db, `
+		SELECT id,
+		       RAG_RANK_SCORE(
+		           VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[1.0, 0.0]')),
+		           created_at,
+		           30,
+		           quality,
+		           0.45,
+		           0.15,
+		           0.40,
+		           '2026-01-31 00:00:00'
+		       ) AS rag_score
+		FROM rag_ranked
+		ORDER BY rag_score DESC
+	`)
+	if len(rs.Rows) != 3 {
+		t.Fatalf("RAG_RANK_SCORE: expected 3 rows, got %d", len(rs.Rows))
+	}
+	if rs.Rows[0]["id"] != 3 {
+		t.Fatalf("RAG_RANK_SCORE expected quality-boosted id=3 on top, got %v", rs.Rows[0]["id"])
+	}
+}
+
+func TestRAGContextLoadsPreviousChunks(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	Execute(ctx, db, "default", mustParse(`
+		CREATE TABLE rag_chunks (
+			doc_id TEXT,
+			chunk_index INT,
+			chunk_text TEXT,
+			quality FLOAT,
+			created_at TEXT,
+			embedding VECTOR
+		)
+	`))
+	Execute(ctx, db, "default", mustParse(`
+		INSERT INTO rag_chunks VALUES
+			('doc-a', 0, 'intro', 0.7, '2026-01-01 00:00:00', '[0.0, 1.0]'),
+			('doc-a', 1, 'setup', 0.8, '2026-01-02 00:00:00', '[0.8, 0.2]'),
+			('doc-a', 2, 'answer', 0.9, '2026-01-03 00:00:00', '[1.0, 0.0]'),
+			('doc-b', 0, 'other', 0.9, '2026-01-03 00:00:00', '[0.0, 1.0]')
+	`))
+
+	rs := execSQL(t, db, `
+		SELECT doc_id, chunk_index, chunk_text, _context_offset
+		FROM RAG_CONTEXT('rag_chunks', 'doc_id', 'chunk_index', 'doc-a', 2, 1)
+		ORDER BY chunk_index
+	`)
+	if len(rs.Rows) != 2 {
+		t.Fatalf("RAG_CONTEXT: expected 2 rows, got %d", len(rs.Rows))
+	}
+	if rs.Rows[0]["chunk_index"] != 1 || rs.Rows[1]["chunk_index"] != 2 {
+		t.Fatalf("RAG_CONTEXT expected chunks 1 and 2, got %v / %v", rs.Rows[0]["chunk_index"], rs.Rows[1]["chunk_index"])
+	}
+	if rs.Rows[0]["_context_offset"] != -1 || rs.Rows[1]["_context_offset"] != 0 {
+		t.Fatalf("RAG_CONTEXT unexpected offsets: %v / %v", rs.Rows[0]["_context_offset"], rs.Rows[1]["_context_offset"])
+	}
+}
+
+func TestRAGContextFromCTEHits(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	Execute(ctx, db, "default", mustParse(`
+		CREATE TABLE rag_chunks (
+			doc_id TEXT,
+			chunk_index INT,
+			chunk_text TEXT,
+			embedding VECTOR
+		)
+	`))
+	Execute(ctx, db, "default", mustParse(`
+		INSERT INTO rag_chunks VALUES
+			('doc-a', 0, 'intro', '[0.0, 1.0]'),
+			('doc-a', 1, 'setup', '[0.8, 0.2]'),
+			('doc-a', 2, 'answer', '[1.0, 0.0]'),
+			('doc-b', 0, 'other', '[0.0, 1.0]')
+	`))
+
+	rs := execSQL(t, db, `
+		WITH topk AS (
+			SELECT doc_id, chunk_index, _vec_rank
+			FROM VEC_SEARCH('rag_chunks', 'embedding', VEC_FROM_JSON('[1.0, 0.0]'), 1, 'cosine')
+		)
+		SELECT doc_id, chunk_index, chunk_text, _hit_rank, _context_offset
+		FROM RAG_CONTEXT_FROM('rag_chunks', 'doc_id', 'chunk_index', 'topk', 'doc_id', 'chunk_index', 1)
+		ORDER BY _context_rank
+	`)
+	if len(rs.Rows) != 2 {
+		t.Fatalf("RAG_CONTEXT_FROM: expected 2 rows, got %d", len(rs.Rows))
+	}
+	if rs.Rows[0]["chunk_index"] != 1 || rs.Rows[1]["chunk_index"] != 2 {
+		t.Fatalf("RAG_CONTEXT_FROM expected previous and hit chunks, got %v / %v", rs.Rows[0]["chunk_index"], rs.Rows[1]["chunk_index"])
+	}
+	if rs.Rows[0]["_hit_rank"] != 1 || rs.Rows[1]["_hit_rank"] != 1 {
+		t.Fatalf("RAG_CONTEXT_FROM expected hit rank 1 for context rows")
+	}
+}

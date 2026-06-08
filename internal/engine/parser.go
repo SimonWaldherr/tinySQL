@@ -70,13 +70,20 @@ func (p *Parser) parseBareTableSelect() (*Select, error) {
 	}, nil
 }
 
+func newVarRef(name string) *VarRef {
+	return &VarRef{Name: name, Lower: strings.ToLower(name)}
+}
+
 // ------------------------------ AST ------------------------------
 
 type Expr interface{}
 
 type (
 	// VarRef refers to a column (qualified or unqualified) in expressions.
-	VarRef struct{ Name string }
+	VarRef struct {
+		Name  string
+		Lower string
+	}
 	// Literal holds a constant value (number, string, bool, NULL).
 	Literal struct{ Val any }
 	// Unary represents unary operators like +, -, NOT.
@@ -2433,7 +2440,7 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		// Otherwise treat the keyword as a variable/column reference
 		name := p.cur.Val
 		p.next()
-		return &VarRef{Name: name}, nil
+		return newVarRef(name), nil
 	case tIdent:
 		name := p.cur.Val
 		p.next()
@@ -2443,7 +2450,7 @@ func (p *Parser) parsePrimary() (Expr, error) {
 			// Put the current position back and parse as function
 			return p.parseFuncCallWithName(name)
 		}
-		return &VarRef{Name: name}, nil
+		return newVarRef(name), nil
 	case tSymbol:
 		if p.cur.Val == "(" {
 			p.next()

@@ -135,6 +135,10 @@ The `cmd/` directory contains ready-to-use binaries for common workflows. See [c
 | `fsql` | Query the filesystem with SQL (TVFs: files, lines, csv_rows, json_rows) | [📖](./cmd/fsql/README.md) |
 | `migrate` | Data pipeline CLI: import/export CSV/JSON + cross-database transfers | [📖](./cmd/migrate/README.md) |
 
+## Repository Structure
+
+For a guided overview of the repository layout, see [docs/repository-structure.md](./docs/repository-structure.md).
+
 ## Goals (and non-goals)
 
 - Lightweight, educational SQL engine in pure Go
@@ -192,6 +196,7 @@ status relative to SQLite.
 | Multi-tenancy | Isolated namespaces inside one process |
 | Job scheduler | `CREATE JOB` for periodic or one-shot SQL |
 | Vector search | `VEC_SEARCH` / `VEC_TOP_K` TVFs with cosine/L2/dot/manhattan; `VEC_AVG` aggregate |
+| RAG helpers | `RECENCY_SCORE`, `RAG_HYBRID_SCORE`, `RAG_RANK_SCORE`, `RAG_CONTEXT`, `RAG_CONTEXT_FROM` |
 | Regex functions | `REGEXP_MATCH`, `REGEXP_EXTRACT`, `REGEXP_REPLACE` |
 | Virtual system tables | `SELECT * FROM sys.tables`, `sys.columns`, `sys.triggers`, … |
 | Table-valued functions | Extensible via `RegisterExternalTableFunc` |
@@ -251,6 +256,106 @@ ORDER BY _vec_rank;
 
 -- Compute centroid of a cluster
 SELECT VEC_AVG(vec) AS centroid FROM embeddings WHERE label = 'science';
+```
+
+### RAG retrieval with recency
+
+For RAG-style ranking that balances semantic similarity and freshness, tinySQL adds:
+
+- `RECENCY_SCORE(timestamp, half_life_days [, now])`
+- `RAG_HYBRID_SCORE(similarity, timestamp, half_life_days [, sim_weight, now])`
+- `RAG_RANK_SCORE(similarity, timestamp, half_life_days, quality [, sim_weight, recency_weight, quality_weight, now])`
+- `RAG_CONTEXT(source, doc_id_col, chunk_index_col, doc_id, chunk_index, before [, after])`
+- `RAG_CONTEXT_FROM(source, doc_id_col, chunk_index_col, hits, hit_doc_id_col, hit_chunk_index_col, before [, after])`
+
+```sql
+CREATE TABLE docs (
+  id INT,
+  title TEXT,
+  created_at TEXT, -- ISO-like timestamp string is fine
+  embedding VECTOR
+);
+
+-- Similarity + recency blend (70% similarity, 30% recency by default)
+SELECT id, title,
+       RAG_HYBRID_SCORE(
+         VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[0.1, 0.2, 0.3]')),
+         created_at,
+         30,
+         0.7
+       ) AS rag_score
+FROM docs
+ORDER BY rag_score DESC
+LIMIT 5;
+
+-- Optional strict freshness filter
+SELECT id, title,
+       RAG_HYBRID_SCORE(
+         VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[0.1, 0.2, 0.3]')),
+         created_at,
+         30,
+         0.8,
+         '2026-01-31 00:00:00'
+       ) AS rag_score
+FROM docs
+WHERE
+  VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[0.1, 0.2, 0.3]')) > 0.4
+  AND RECENCY_SCORE(created_at, 30, '2026-01-31 00:00:00') > 0.25
+ORDER BY rag_score DESC;
+```
+
+For pure top-k similarity, first use `VEC_SEARCH` and apply recency scoring after that (this avoids re-scoring all rows during ordering):
+
+```sql
+WITH topk AS (
+  SELECT * FROM VEC_SEARCH('docs', 'embedding', VEC_FROM_JSON('[0.1, 0.2, 0.3]'), 40, 'cosine')
+)
+SELECT id, created_at, title,
+       RAG_HYBRID_SCORE(
+         VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[0.1, 0.2, 0.3]')),
+         created_at,
+         30,
+         0.7
+       ) AS rag_score
+FROM topk
+ORDER BY rag_score DESC
+LIMIT 20;
+```
+
+For chunked documents, expand the winning chunks with local context before the final answer-building step:
+
+```sql
+WITH topk AS (
+  SELECT doc_id, chunk_index, _vec_rank
+  FROM VEC_SEARCH('docs', 'embedding', VEC_FROM_JSON('[0.1, 0.2, 0.3]'), 8, 'cosine')
+)
+SELECT doc_id, chunk_index, chunk_text, _hit_rank, _context_offset
+FROM RAG_CONTEXT_FROM('docs', 'doc_id', 'chunk_index', 'topk', 'doc_id', 'chunk_index', 1, 1)
+ORDER BY _context_rank;
+```
+
+For ranked RAG over similarity, recency and quality:
+
+```sql
+SELECT id, title,
+       RAG_RANK_SCORE(
+         VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[0.1, 0.2, 0.3]')),
+         created_at,
+         30,
+         quality,
+         0.65,
+         0.25,
+         0.10
+       ) AS rag_score
+FROM docs
+ORDER BY rag_score DESC
+LIMIT 20;
+```
+
+Benchmarks for vector/RAG behavior are in `internal/engine/vector_search_benchmark_test.go`. Run:
+
+```bash
+go test ./internal/engine -run '^$' -bench 'Benchmark(WhereVectorAndSimpleCondition|OrderByVectorLimit|CompareTopK_VecSearchVsOrderBy|RAGRankScoreOrderByLimit|RAGContextFromTopK)' -count=1
 ```
 
 ### Not yet implemented
