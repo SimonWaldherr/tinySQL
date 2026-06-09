@@ -344,6 +344,9 @@ type DB struct {
 	// System catalog for metadata and job scheduling
 	catalog *CatalogManager
 
+	// Optional job scheduler/agent.
+	scheduler *Scheduler
+
 	// Pluggable storage backend (nil = pure in-memory, the legacy default).
 	backend StorageBackend
 
@@ -481,6 +484,10 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 		return nil, fmt.Errorf("unsupported storage mode: %v", cfg.Mode)
 	}
 
+	if err := db.loadBackendCatalog(); err != nil {
+		return nil, err
+	}
+
 	return db, nil
 }
 
@@ -516,7 +523,15 @@ func loadGOBInto(db *DB, filename string) (bool, error) {
 	for _, dt := range dump {
 		_ = db.Put(dt.Tenant, diskToTable(dt))
 	}
-	return len(dump) > 0, nil
+	loadedCatalog := false
+	var dc diskCatalog
+	if err := dec.Decode(&dc); err == nil {
+		db.catalog = diskToCatalog(dc)
+		loadedCatalog = true
+	} else if !errors.Is(err, io.EOF) {
+		return false, err
+	}
+	return len(dump) > 0 || loadedCatalog, nil
 }
 
 // getTenant returns the tenantDB for the given tenant name, creating it
@@ -747,6 +762,198 @@ type diskTable struct {
 	Version int
 }
 
+type diskCatalog struct {
+	Tables   []*CatalogTable
+	Columns  map[string][]CatalogColumn
+	Views    []*CatalogView
+	Funcs    []*CatalogFunction
+	Jobs     []*CatalogJob
+	JobRuns  []*CatalogJobHistory
+	NextRun  int64
+	Triggers []*CatalogTrigger
+}
+
+func catalogToDisk(c *CatalogManager) diskCatalog {
+	if c == nil {
+		return diskCatalog{Columns: make(map[string][]CatalogColumn), NextRun: 1}
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	dc := diskCatalog{
+		Tables:   make([]*CatalogTable, 0, len(c.tables)),
+		Columns:  make(map[string][]CatalogColumn, len(c.columns)),
+		Views:    make([]*CatalogView, 0, len(c.views)),
+		Funcs:    make([]*CatalogFunction, 0, len(c.funcs)),
+		Jobs:     make([]*CatalogJob, 0, len(c.jobs)),
+		JobRuns:  make([]*CatalogJobHistory, 0, len(c.jobRuns)),
+		NextRun:  c.nextRun,
+		Triggers: make([]*CatalogTrigger, 0, len(c.triggers)),
+	}
+	if dc.NextRun == 0 {
+		dc.NextRun = 1
+	}
+	for _, t := range c.tables {
+		cp := *t
+		dc.Tables = append(dc.Tables, &cp)
+	}
+	for k, cols := range c.columns {
+		cp := make([]CatalogColumn, len(cols))
+		copy(cp, cols)
+		dc.Columns[k] = cp
+	}
+	for _, v := range c.views {
+		cp := *v
+		dc.Views = append(dc.Views, &cp)
+	}
+	for _, f := range c.funcs {
+		cp := *f
+		if f.ArgTypes != nil {
+			cp.ArgTypes = append([]string(nil), f.ArgTypes...)
+		}
+		dc.Funcs = append(dc.Funcs, &cp)
+	}
+	for _, j := range c.jobs {
+		cp := *j
+		dc.Jobs = append(dc.Jobs, &cp)
+	}
+	for _, run := range c.jobRuns {
+		cp := *run
+		dc.JobRuns = append(dc.JobRuns, &cp)
+	}
+	for _, t := range c.triggers {
+		cp := *t
+		dc.Triggers = append(dc.Triggers, &cp)
+	}
+	return dc
+}
+
+func diskToCatalog(dc diskCatalog) *CatalogManager {
+	c := NewCatalogManager()
+	for _, t := range dc.Tables {
+		if t == nil {
+			continue
+		}
+		cp := *t
+		c.tables[cp.Schema+"."+cp.Name] = &cp
+	}
+	for k, cols := range dc.Columns {
+		cp := make([]CatalogColumn, len(cols))
+		copy(cp, cols)
+		c.columns[k] = cp
+	}
+	for _, v := range dc.Views {
+		if v == nil {
+			continue
+		}
+		cp := *v
+		c.views[cp.Schema+"."+cp.Name] = &cp
+	}
+	for _, f := range dc.Funcs {
+		if f == nil {
+			continue
+		}
+		cp := *f
+		if f.ArgTypes != nil {
+			cp.ArgTypes = append([]string(nil), f.ArgTypes...)
+		}
+		c.funcs[cp.Schema+"."+cp.Name] = &cp
+	}
+	for _, j := range dc.Jobs {
+		if j == nil {
+			continue
+		}
+		cp := *j
+		c.jobs[cp.Name] = &cp
+	}
+	for _, run := range dc.JobRuns {
+		if run == nil {
+			continue
+		}
+		cp := *run
+		c.jobRuns = append(c.jobRuns, &cp)
+		if cp.RunID >= c.nextRun {
+			c.nextRun = cp.RunID + 1
+		}
+	}
+	if dc.NextRun > c.nextRun {
+		c.nextRun = dc.NextRun
+	}
+	if c.nextRun == 0 {
+		c.nextRun = 1
+	}
+	for _, t := range dc.Triggers {
+		if t == nil {
+			continue
+		}
+		cp := *t
+		c.triggers[cp.Name] = &cp
+	}
+	return c
+}
+
+func (db *DB) backendCatalogPath() (string, bool) {
+	if db == nil || db.config == nil || db.config.Path == "" {
+		return "", false
+	}
+	switch db.storageMode {
+	case ModeDisk, ModeHybrid, ModeIndex:
+		return filepath.Join(db.config.Path, ".catalog.gob"), true
+	default:
+		return "", false
+	}
+}
+
+func (db *DB) loadBackendCatalog() error {
+	path, ok := db.backendCatalogPath()
+	if !ok {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+
+	var dc diskCatalog
+	if err := gob.NewDecoder(bufio.NewReader(f)).Decode(&dc); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return err
+	}
+	db.catalog = diskToCatalog(dc)
+	return nil
+}
+
+func (db *DB) saveBackendCatalog() error {
+	path, ok := db.backendCatalogPath()
+	if !ok {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	bw := bufio.NewWriter(f)
+	encErr := gob.NewEncoder(bw).Encode(catalogToDisk(db.catalog))
+	flushErr := bw.Flush()
+	closeErr := f.Close()
+	if encErr != nil {
+		return encErr
+	}
+	if flushErr != nil {
+		return flushErr
+	}
+	return closeErr
+}
+
 func tableToDisk(tn string, t *Table) diskTable {
 	return tableToDiskRange(tn, t, 0, len(t.Rows))
 }
@@ -879,6 +1086,15 @@ func SaveToFile(db *DB, filename string) error {
 		}
 		return err
 	}
+	if err := enc.Encode(catalogToDisk(db.catalog)); err != nil {
+		if gz != nil {
+			_ = gz.Close()
+		}
+		if bw, ok := w.(*bufio.Writer); ok {
+			_ = bw.Flush()
+		}
+		return err
+	}
 	if gz != nil {
 		if err := gz.Close(); err != nil {
 			return err
@@ -923,6 +1139,12 @@ func LoadFromFile(filename string) (*DB, error) {
 	for _, dt := range dump {
 		_ = db.Put(dt.Tenant, diskToTable(dt))
 	}
+	var dc diskCatalog
+	if err := dec.Decode(&dc); err == nil {
+		db.catalog = diskToCatalog(dc)
+	} else if !errors.Is(err, io.EOF) {
+		return nil, err
+	}
 	if filename != "" {
 		cfg := WALConfig{Path: filename}
 		wal, err := OpenWAL(db, cfg)
@@ -955,6 +1177,9 @@ func SaveToWriter(db *DB, w io.Writer) error {
 	if err := enc.Encode(dump); err != nil {
 		return err
 	}
+	if err := enc.Encode(catalogToDisk(db.catalog)); err != nil {
+		return err
+	}
 	return bw.Flush()
 }
 
@@ -972,6 +1197,12 @@ func LoadFromReader(r io.Reader) (*DB, error) {
 	db := NewDB()
 	for _, dt := range dump {
 		_ = db.Put(dt.Tenant, diskToTable(dt))
+	}
+	var dc diskCatalog
+	if err := dec.Decode(&dc); err == nil {
+		db.catalog = diskToCatalog(dc)
+	} else if !errors.Is(err, io.EOF) {
+		return nil, err
 	}
 	return db, nil
 }
@@ -1215,7 +1446,10 @@ func (db *DB) Sync() error {
 		}
 	}
 
-	return db.backend.Sync()
+	if err := db.backend.Sync(); err != nil {
+		return err
+	}
+	return db.saveBackendCatalog()
 }
 
 // Close persists all data and releases resources. For ModeMemory with a
@@ -1223,6 +1457,8 @@ func (db *DB) Sync() error {
 // dirty tables are flushed. WAL and Advanced WAL resources are closed.
 func (db *DB) Close() error {
 	var firstErr error
+
+	db.StopJobScheduler()
 
 	// Sync dirty tables to backend.
 	if err := db.Sync(); err != nil && firstErr == nil {

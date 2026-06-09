@@ -243,7 +243,7 @@ func executeCreateJob(env ExecEnv, s *CreateJob) (*ResultSet, error) {
 	if s.RunAt != nil {
 		job.RunAt = s.RunAt
 	}
-	if err := env.db.Catalog().RegisterJob(job); err != nil {
+	if err := env.db.RegisterJob(job); err != nil {
 		return nil, err
 	}
 	return nil, nil
@@ -257,14 +257,14 @@ func executeAlterJob(env ExecEnv, s *AlterJob) (*ResultSet, error) {
 	if s.Enable != nil {
 		job.Enabled = *s.Enable
 	}
-	if err := env.db.Catalog().RegisterJob(job); err != nil {
+	if err := env.db.RegisterJob(job); err != nil {
 		return nil, err
 	}
 	return nil, nil
 }
 
 func executeDropJob(env ExecEnv, s *DropJob) (*ResultSet, error) {
-	if err := env.db.Catalog().DeleteJob(s.Name); err != nil {
+	if err := env.db.DeleteJob(s.Name); err != nil {
 		return nil, err
 	}
 	return nil, nil
@@ -783,6 +783,8 @@ func resolveCatalogTable(env ExecEnv, s *Select) ([]Row, error) {
 		return resolveCatalogFunctions(env, s)
 	case "jobs":
 		return resolveCatalogJobs(env, s)
+	case "job_history":
+		return resolveCatalogJobHistory(env, s)
 	case "views":
 		return resolveCatalogViews(env, s)
 	default:
@@ -919,8 +921,30 @@ func resolveCatalogJobs(env ExecEnv, s *Select) ([]Row, error) {
 		putVal(leftRows[i], "run_at", j.RunAt)
 		putVal(leftRows[i], "timezone", j.Timezone)
 		putVal(leftRows[i], "enabled", j.Enabled)
+		putVal(leftRows[i], "catch_up", j.CatchUp)
+		putVal(leftRows[i], "no_overlap", j.NoOverlap)
+		putVal(leftRows[i], "max_runtime_ms", j.MaxRuntimeMs)
 		putVal(leftRows[i], "last_run_at", j.LastRunAt)
 		putVal(leftRows[i], "next_run_at", j.NextRunAt)
+		putVal(leftRows[i], "created_at", j.CreatedAt)
+		putVal(leftRows[i], "updated_at", j.UpdatedAt)
+	}
+	return leftRows, nil
+}
+
+// resolveCatalogJobHistory handles catalog.job_history
+func resolveCatalogJobHistory(env ExecEnv, s *Select) ([]Row, error) {
+	runs := env.db.Catalog().ListJobHistory()
+	leftRows := make([]Row, len(runs))
+	for i, run := range runs {
+		leftRows[i] = make(Row)
+		putVal(leftRows[i], "run_id", run.RunID)
+		putVal(leftRows[i], "job_name", run.JobName)
+		putVal(leftRows[i], "started_at", run.StartedAt)
+		putVal(leftRows[i], "finished_at", run.FinishedAt)
+		putVal(leftRows[i], "duration_ms", run.DurationMs)
+		putVal(leftRows[i], "status", run.Status)
+		putVal(leftRows[i], "error_message", run.ErrorMessage)
 	}
 	return leftRows, nil
 }

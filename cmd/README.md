@@ -8,6 +8,7 @@ tool has its own README with full documentation — click the links below.
 | demo | [README](demo/README.md) |
 | repl | [README](repl/README.md) |
 | server | [README](server/README.md) |
+| tinysqld | [README](tinysqld/README.md) |
 | tinysql | [README](tinysql/README.md) |
 | sqltools | [README](sqltools/README.md) |
 | tinysqlpage | [README](tinysqlpage/README.md) |
@@ -53,6 +54,14 @@ tool has its own README with full documentation — click the links below.
     - GET  /healthz
     - GET  /readyz
     - GET  /metrics
+
+- tinysqld
+  - Enterprise DBMS daemon entry point. Opens the enterprise runtime profile with durable storage, starts the job scheduler, and exposes a minimal HTTP API.
+  - Build: `go build ./cmd/tinysqld`
+  - Run: `./tinysqld -data ./tinysqld-data -storage disk -tenant default -http 127.0.0.1:8088`
+  - Check configuration: `./tinysqld -data ./tinysqld-data -storage disk -check`
+  - Endpoints: `GET /healthz`, `GET /readyz`, `GET /api/status`, `POST /api/exec`, `POST /api/query`
+  - Flags: `-data`, `-storage <disk|hybrid|index|wal|advanced_wal>`, `-tenant`, `-http`, `-auth`, `-request-timeout`, `-check`
 
 - tinysql
   - SQLite-compatible CLI with file-based and in-memory database support. Accepts a filename as the database path (`:memory:` for in-memory), optional inline SQL as a positional argument, and supports utility subcommands (`tables`, `schema`, `insert`, `query`, `export`).

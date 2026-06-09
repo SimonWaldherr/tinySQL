@@ -61,6 +61,8 @@ type CatalogManager struct {
 	views    map[string]*CatalogView
 	funcs    map[string]*CatalogFunction
 	jobs     map[string]*CatalogJob
+	jobRuns  []*CatalogJobHistory
+	nextRun  int64
 	triggers map[string]*CatalogTrigger // keyed by trigger name
 }
 
@@ -72,6 +74,8 @@ func NewCatalogManager() *CatalogManager {
 		views:    make(map[string]*CatalogView),
 		funcs:    make(map[string]*CatalogFunction),
 		jobs:     make(map[string]*CatalogJob),
+		jobRuns:  make([]*CatalogJobHistory, 0),
+		nextRun:  1,
 		triggers: make(map[string]*CatalogTrigger),
 	}
 }
@@ -145,6 +149,17 @@ type CatalogJob struct {
 	NextRunAt    *time.Time
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+}
+
+// CatalogJobHistory records one completed, failed, skipped, or canceled job run.
+type CatalogJobHistory struct {
+	RunID        int64
+	JobName      string
+	StartedAt    time.Time
+	FinishedAt   time.Time
+	DurationMs   int64
+	Status       string // 'SUCCEEDED', 'FAILED', 'SKIPPED', 'CANCELED'
+	ErrorMessage string
 }
 
 // ==================== Catalog Operations ====================
@@ -268,6 +283,13 @@ func (c *CatalogManager) ListEnabledJobs() []*CatalogJob {
 // UpdateJobRuntime updates runtime bookkeeping fields for a named job.
 // It sets `LastRunAt`, `NextRunAt` and marks the job as recently updated.
 func (c *CatalogManager) UpdateJobRuntime(name string, lastRun, nextRun time.Time) error {
+	return c.UpdateJobRuntimePtr(name, lastRun, &nextRun)
+}
+
+// UpdateJobRuntimePtr updates runtime bookkeeping fields for a named job.
+// Passing nil for nextRun clears NextRunAt, which is expected for completed
+// one-shot jobs.
+func (c *CatalogManager) UpdateJobRuntimePtr(name string, lastRun time.Time, nextRun *time.Time) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -277,7 +299,7 @@ func (c *CatalogManager) UpdateJobRuntime(name string, lastRun, nextRun time.Tim
 	}
 
 	job.LastRunAt = &lastRun
-	job.NextRunAt = &nextRun
+	job.NextRunAt = nextRun
 	job.UpdatedAt = time.Now()
 	return nil
 }
@@ -294,6 +316,41 @@ func (c *CatalogManager) DeleteJob(name string) error {
 
 	delete(c.jobs, name)
 	return nil
+}
+
+// AddJobHistory appends a job execution history row and assigns a run id.
+func (c *CatalogManager) AddJobHistory(run *CatalogJobHistory) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if run == nil {
+		return fmt.Errorf("job history cannot be nil")
+	}
+	if run.JobName == "" {
+		return fmt.Errorf("job history job name cannot be empty")
+	}
+	cp := *run
+	if cp.RunID == 0 {
+		cp.RunID = c.nextRun
+		c.nextRun++
+	} else if cp.RunID >= c.nextRun {
+		c.nextRun = cp.RunID + 1
+	}
+	c.jobRuns = append(c.jobRuns, &cp)
+	return nil
+}
+
+// ListJobHistory returns all job execution history rows.
+func (c *CatalogManager) ListJobHistory() []*CatalogJobHistory {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	runs := make([]*CatalogJobHistory, 0, len(c.jobRuns))
+	for _, run := range c.jobRuns {
+		cp := *run
+		runs = append(runs, &cp)
+	}
+	return runs
 }
 
 // GetTables returns a slice with metadata for all registered tables and
@@ -417,4 +474,69 @@ func (db *DB) Catalog() *CatalogManager {
 		db.catalog = NewCatalogManager()
 	}
 	return db.catalog
+}
+
+// StartJobScheduler starts the database job scheduler with the given executor.
+func (db *DB) StartJobScheduler(executor JobExecutor) error {
+	db.mu.Lock()
+	if db.scheduler == nil {
+		db.scheduler = NewScheduler(db, executor)
+	} else {
+		db.scheduler.executor = executor
+	}
+	scheduler := db.scheduler
+	db.mu.Unlock()
+	return scheduler.Start()
+}
+
+// StopJobScheduler stops the database job scheduler if it is running.
+func (db *DB) StopJobScheduler() {
+	db.mu.Lock()
+	scheduler := db.scheduler
+	db.scheduler = nil
+	db.mu.Unlock()
+	if scheduler != nil {
+		scheduler.Stop()
+	}
+}
+
+// JobScheduler returns the active database job scheduler, if any.
+func (db *DB) JobScheduler() *Scheduler {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.scheduler
+}
+
+// RegisterJob registers a job and refreshes the live scheduler when present.
+func (db *DB) RegisterJob(job *CatalogJob) error {
+	db.mu.RLock()
+	scheduler := db.scheduler
+	db.mu.RUnlock()
+	if scheduler != nil {
+		if err := scheduler.UpsertJob(job); err != nil {
+			return err
+		}
+		return db.saveBackendCatalog()
+	}
+	if err := db.Catalog().RegisterJob(job); err != nil {
+		return err
+	}
+	return db.saveBackendCatalog()
+}
+
+// DeleteJob deletes a job and unschedules/cancels it when present.
+func (db *DB) DeleteJob(name string) error {
+	db.mu.RLock()
+	scheduler := db.scheduler
+	db.mu.RUnlock()
+	if scheduler != nil {
+		if err := scheduler.RemoveJob(name); err != nil {
+			return err
+		}
+		return db.saveBackendCatalog()
+	}
+	if err := db.Catalog().DeleteJob(name); err != nil {
+		return err
+	}
+	return db.saveBackendCatalog()
 }

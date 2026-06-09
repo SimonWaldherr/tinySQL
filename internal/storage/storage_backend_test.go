@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"testing"
+	"time"
 )
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -242,6 +243,87 @@ func TestDiskBackend_BasicCRUD(t *testing.T) {
 
 	if err := b.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSaveLoadCatalogJobs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "jobs.gob")
+
+	db := NewDB()
+	runAt := time.Now().Add(time.Hour).Truncate(time.Second)
+	if err := db.RegisterJob(&CatalogJob{
+		Name:         "daily_cleanup",
+		SQLText:      "DELETE FROM logs",
+		ScheduleType: "ONCE",
+		RunAt:        &runAt,
+		Enabled:      true,
+		NoOverlap:    true,
+	}); err != nil {
+		t.Fatalf("RegisterJob failed: %v", err)
+	}
+	if err := db.Catalog().AddJobHistory(&CatalogJobHistory{
+		JobName:    "daily_cleanup",
+		StartedAt:  runAt,
+		FinishedAt: runAt,
+		Status:     "SUCCEEDED",
+	}); err != nil {
+		t.Fatalf("AddJobHistory failed: %v", err)
+	}
+	if err := SaveToFile(db, path); err != nil {
+		t.Fatalf("SaveToFile failed: %v", err)
+	}
+
+	loaded, err := LoadFromFile(path)
+	if err != nil {
+		t.Fatalf("LoadFromFile failed: %v", err)
+	}
+
+	job, err := loaded.Catalog().GetJob("daily_cleanup")
+	if err != nil {
+		t.Fatalf("GetJob after load failed: %v", err)
+	}
+	if job.SQLText != "DELETE FROM logs" || !job.Enabled || !job.NoOverlap {
+		t.Fatalf("unexpected loaded job: %#v", job)
+	}
+	runs := loaded.Catalog().ListJobHistory()
+	if len(runs) != 1 || runs[0].JobName != "daily_cleanup" {
+		t.Fatalf("unexpected loaded history: %#v", runs)
+	}
+}
+
+func TestOpenDBDiskCatalogJobsPersist(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := OpenDB(StorageConfig{Mode: ModeDisk, Path: dir})
+	if err != nil {
+		t.Fatalf("OpenDB failed: %v", err)
+	}
+	if err := db.RegisterJob(&CatalogJob{
+		Name:         "disk_job",
+		SQLText:      "SELECT 1",
+		ScheduleType: "INTERVAL",
+		IntervalMs:   1000,
+		Enabled:      true,
+	}); err != nil {
+		t.Fatalf("RegisterJob failed: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	reopened, err := OpenDB(StorageConfig{Mode: ModeDisk, Path: dir})
+	if err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+	defer reopened.Close()
+
+	job, err := reopened.Catalog().GetJob("disk_job")
+	if err != nil {
+		t.Fatalf("GetJob after reopen failed: %v", err)
+	}
+	if job.ScheduleType != "INTERVAL" || job.IntervalMs != 1000 {
+		t.Fatalf("unexpected reopened job: %#v", job)
 	}
 }
 

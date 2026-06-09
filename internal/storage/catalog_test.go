@@ -66,3 +66,30 @@ func TestCatalogJobsLifecycle(t *testing.T) {
 		t.Fatalf("expected GetJob to fail after delete")
 	}
 }
+
+func TestCatalogJobHistory(t *testing.T) {
+	cm := NewCatalogManager()
+	started := time.Now()
+	finished := started.Add(25 * time.Millisecond)
+
+	if err := cm.AddJobHistory(&CatalogJobHistory{
+		JobName:    "job1",
+		StartedAt:  started,
+		FinishedAt: finished,
+		DurationMs: finished.Sub(started).Milliseconds(),
+		Status:     "SUCCEEDED",
+	}); err != nil {
+		t.Fatalf("AddJobHistory failed: %v", err)
+	}
+
+	runs := cm.ListJobHistory()
+	if len(runs) != 1 {
+		t.Fatalf("expected 1 history row, got %d", len(runs))
+	}
+	if runs[0].RunID != 1 {
+		t.Fatalf("expected run id 1, got %d", runs[0].RunID)
+	}
+	if runs[0].JobName != "job1" || runs[0].Status != "SUCCEEDED" {
+		t.Fatalf("unexpected history row: %#v", runs[0])
+	}
+}

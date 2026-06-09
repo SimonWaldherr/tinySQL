@@ -15,13 +15,16 @@ import (
 
 // Scheduler manages scheduled job execution
 type Scheduler struct {
-	db       *DB
-	catalog  *CatalogManager
-	cron     *cron.Cron
-	mu       sync.RWMutex
-	running  map[string]*jobExecution // Track currently running jobs
-	stopCh   chan struct{}
-	executor JobExecutor // Interface for executing SQL
+	db          *DB
+	catalog     *CatalogManager
+	cron        *cron.Cron
+	mu          sync.RWMutex
+	running     map[string]*jobExecution // Track currently running jobs
+	cronEntries map[string]cron.EntryID
+	stopCh      chan struct{}
+	started     bool
+	wg          sync.WaitGroup
+	executor    JobExecutor // Interface for executing SQL
 }
 
 // JobExecutor interface allows the scheduler to execute SQL without circular dependencies
@@ -39,12 +42,13 @@ type jobExecution struct {
 func NewScheduler(db *DB, executor JobExecutor) *Scheduler {
 	loc, _ := time.LoadLocation("UTC")
 	return &Scheduler{
-		db:       db,
-		catalog:  db.Catalog(),
-		cron:     cron.New(cron.WithLocation(loc), cron.WithSeconds()),
-		running:  make(map[string]*jobExecution),
-		stopCh:   make(chan struct{}),
-		executor: executor,
+		db:          db,
+		catalog:     db.Catalog(),
+		cron:        cron.New(cron.WithLocation(loc), cron.WithSeconds()),
+		running:     make(map[string]*jobExecution),
+		cronEntries: make(map[string]cron.EntryID),
+		stopCh:      make(chan struct{}),
+		executor:    executor,
 	}
 }
 
@@ -52,6 +56,13 @@ func NewScheduler(db *DB, executor JobExecutor) *Scheduler {
 func (s *Scheduler) Start() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.started {
+		return nil
+	}
+	if s.stopCh == nil {
+		s.stopCh = make(chan struct{})
+	}
 
 	// Register all enabled jobs
 	jobs := s.catalog.ListEnabledJobs()
@@ -66,6 +77,7 @@ func (s *Scheduler) Start() error {
 
 	// Start interval/once scheduler in goroutine
 	go s.runIntervalScheduler()
+	s.started = true
 
 	log.Printf("Job scheduler started with %d jobs", len(jobs))
 	return nil
@@ -74,26 +86,43 @@ func (s *Scheduler) Start() error {
 // Stop halts the scheduler and cancels all running jobs
 func (s *Scheduler) Stop() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	if !s.started {
+		s.mu.Unlock()
+		return
+	}
+	s.started = false
+	stopCh := s.stopCh
+	s.stopCh = nil
+	if stopCh != nil {
+		close(stopCh)
+	}
+	s.mu.Unlock()
 
 	// Stop cron
 	ctx := s.cron.Stop()
 	<-ctx.Done()
 
-	// Signal interval scheduler to stop
-	close(s.stopCh)
+	s.mu.RLock()
+	running := make(map[string]*jobExecution, len(s.running))
+	for name, exec := range s.running {
+		running[name] = exec
+	}
+	s.mu.RUnlock()
 
 	// Cancel all running jobs
-	for name, exec := range s.running {
+	for name, exec := range running {
 		log.Printf("Canceling running job %q", name)
 		exec.cancelFn()
 	}
+
+	s.wg.Wait()
 
 	log.Println("Job scheduler stopped")
 }
 
 // scheduleJob registers a job with the appropriate scheduler
 func (s *Scheduler) scheduleJob(job *CatalogJob) error {
+	s.unscheduleJobLocked(job.Name)
 	switch job.ScheduleType {
 	case "CRON":
 		return s.scheduleCronJob(job)
@@ -140,11 +169,21 @@ func (s *Scheduler) scheduleCronJob(job *CatalogJob) error {
 	job.NextRunAt = &nextRun
 
 	// Register with cron
-	_, err = s.cron.AddFunc(job.CronExpr, func() {
+	id, err := s.cron.AddFunc(job.CronExpr, func() {
 		s.executeJob(job)
 	})
+	if err == nil {
+		s.cronEntries[job.Name] = id
+	}
 
 	return err
+}
+
+func (s *Scheduler) unscheduleJobLocked(name string) {
+	if id, ok := s.cronEntries[name]; ok {
+		s.cron.Remove(id)
+		delete(s.cronEntries, name)
+	}
 }
 
 // runIntervalScheduler handles INTERVAL and ONCE jobs
@@ -197,6 +236,13 @@ func (s *Scheduler) executeJob(job *CatalogJob) {
 		if _, isRunning := s.running[job.Name]; isRunning {
 			s.mu.Unlock()
 			log.Printf("Job %q already running, skipping (no_overlap=true)", job.Name)
+			now := time.Now()
+			_ = s.catalog.AddJobHistory(&CatalogJobHistory{
+				JobName:    job.Name,
+				StartedAt:  now,
+				FinishedAt: now,
+				Status:     "SKIPPED",
+			})
 			return
 		}
 	}
@@ -213,10 +259,14 @@ func (s *Scheduler) executeJob(job *CatalogJob) {
 		cancelFn:  cancel,
 	}
 	s.running[job.Name] = exec
+	s.wg.Add(1)
 	s.mu.Unlock()
 
 	// Execute job in goroutine
 	go func() {
+		defer s.wg.Done()
+		status := "SUCCEEDED"
+		errMsg := ""
 		defer func() {
 			cancel()
 			s.mu.Lock()
@@ -226,8 +276,23 @@ func (s *Scheduler) executeJob(job *CatalogJob) {
 			// Update last_run_at and calculate next_run_at
 			lastRun := exec.startTime
 			s.calculateNextRun(job)
-			if err := s.catalog.UpdateJobRuntime(job.Name, lastRun, *job.NextRunAt); err != nil {
+			if err := s.catalog.UpdateJobRuntimePtr(job.Name, lastRun, job.NextRunAt); err != nil {
 				log.Printf("Failed to update job runtime for %q: %v", job.Name, err)
+			}
+			finishedAt := time.Now()
+			if ctx.Err() != nil && status == "SUCCEEDED" {
+				status = "CANCELED"
+				errMsg = ctx.Err().Error()
+			}
+			if err := s.catalog.AddJobHistory(&CatalogJobHistory{
+				JobName:      job.Name,
+				StartedAt:    exec.startTime,
+				FinishedAt:   finishedAt,
+				DurationMs:   finishedAt.Sub(exec.startTime).Milliseconds(),
+				Status:       status,
+				ErrorMessage: errMsg,
+			}); err != nil {
+				log.Printf("Failed to add job history for %q: %v", job.Name, err)
 			}
 		}()
 
@@ -236,11 +301,15 @@ func (s *Scheduler) executeJob(job *CatalogJob) {
 		// Execute SQL through executor interface
 		if s.executor != nil {
 			if _, err := s.executor.ExecuteSQL(ctx, job.SQLText); err != nil {
+				status = "FAILED"
+				errMsg = err.Error()
 				log.Printf("Job %q failed: %v", job.Name, err)
 			} else {
 				log.Printf("Job %q completed successfully", job.Name)
 			}
 		} else {
+			status = "SKIPPED"
+			errMsg = "no executor configured"
 			log.Printf("Job %q skipped (no executor configured)", job.Name)
 		}
 	}()
@@ -300,23 +369,30 @@ func (s *Scheduler) calculateNextRun(job *CatalogJob) {
 
 // AddJob registers a new job and schedules it immediately if enabled
 func (s *Scheduler) AddJob(job *CatalogJob) error {
+	return s.UpsertJob(job)
+}
+
+// UpsertJob registers or updates a job and refreshes its live schedule.
+func (s *Scheduler) UpsertJob(job *CatalogJob) error {
 	if err := s.catalog.RegisterJob(job); err != nil {
 		return err
 	}
 
-	if job.Enabled {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		return s.scheduleJob(job)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.unscheduleJobLocked(job.Name)
+	if !job.Enabled {
+		return nil
 	}
-
-	return nil
+	return s.scheduleJob(job)
 }
 
 // RemoveJob unregisters a job and stops its execution
 func (s *Scheduler) RemoveJob(name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.unscheduleJobLocked(name)
 
 	// Cancel if running
 	if exec, ok := s.running[name]; ok {
