@@ -11,6 +11,16 @@
 
 TinySQL is a lightweight, educational SQL database engine written in pure Go. It implements a comprehensive subset of SQL features using only Go's standard library, making it perfect for learning database internals and for applications that need a simple embedded SQL database.
 
+## Product forms
+
+tinySQL is being developed as one compatible engine with three runtime forms:
+
+- **Core package**: in-process Go package for embedding and tests.
+- **Embedded database**: SQLite-like local persistent database shape.
+- **Server / Enterprise DBMS**: networked runtime for jobs, operations, security, and future HA.
+
+The existing `NewDB`, `OpenDB`, `ParseSQL`, and `Execute` APIs remain the stable low-level API. New code can opt into the additive product-form helpers: `OpenPackage`, `OpenEmbedded`, `OpenServer`, and `OpenEnterprise`. See [docs/product-forms.md](./docs/product-forms.md).
+
 ## Quick start
 
 ### Install
@@ -176,7 +186,7 @@ status relative to SQLite.
 
 | Feature | Notes |
 |---------|-------|
-| SELECT / INSERT / UPDATE / DELETE | Full DML |
+| SELECT / INSERT / UPDATE / DELETE | Full DML, including `INSERT` / `UPDATE` / `DELETE … RETURNING` |
 | INNER / LEFT / RIGHT / FULL OUTER / CROSS JOIN | All standard join types |
 | GROUP BY, HAVING, ORDER BY, LIMIT / OFFSET | |
 | Subqueries and CTEs (`WITH`) | Including `WITH RECURSIVE` |
@@ -188,7 +198,8 @@ status relative to SQLite.
 | Hash functions | `HASH(algo, text)` — md5/sha1/sha256/sha512/fnv |
 | Bitmap functions | `BITMAP_NEW/SET/GET/COUNT/OR/AND` |
 | String / math / date functions | Extensive built-in library |
-| Views (`CREATE VIEW`) | Stored and queryable |
+| Views (`CREATE VIEW`) | Stored and queryable, including CTE-backed view definitions |
+| Materialized views | `CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW`, lazy stale refresh, interval refresh, and daily scheduled refresh |
 | Indexes (`CREATE INDEX`) | Metadata stored; query planner no-op |
 | **Full-Text Search (FTS)** | `CREATE VIRTUAL TABLE t USING fts(col1, col2)` with `FTS_MATCH`, `FTS_RANK`, `FTS_SNIPPET`, `BM25` |
 | **Triggers** | `CREATE TRIGGER … BEFORE/AFTER INSERT/UPDATE/DELETE ON table FOR EACH ROW BEGIN … END` |
@@ -201,6 +212,76 @@ status relative to SQLite.
 | Virtual system tables | `SELECT * FROM sys.tables`, `sys.columns`, `sys.triggers`, … |
 | Table-valued functions | Extensible via `RegisterExternalTableFunc` |
 | Data types | INT, FLOAT, TEXT, BOOL, DATE, TIMESTAMP, UUID, BLOB, JSON, JSONB, VECTOR, YAML, URL, HASH, BITMAP, GEOMETRY, DECIMAL, MONEY, … |
+
+### Views and materialized views quick start
+
+Views store and re-run their query definition. The definition can include CTEs:
+
+```sql
+CREATE VIEW paid_customer_totals AS
+WITH paid_orders AS (
+  SELECT customer_id, amount
+  FROM orders
+  WHERE status = 'paid'
+)
+SELECT customer_id, SUM(amount) AS total
+FROM paid_orders
+GROUP BY customer_id;
+
+SELECT customer_id, total
+FROM paid_customer_totals
+ORDER BY customer_id;
+```
+
+Materialized views store the query result in an internal cache table. They can
+be refreshed manually, lazily when stale, or by scheduler policies:
+
+```sql
+CREATE MATERIALIZED VIEW paid_customer_totals_mv AS
+WITH paid_orders AS (
+  SELECT customer_id, amount
+  FROM orders
+  WHERE status = 'paid'
+)
+SELECT customer_id, SUM(amount) AS total
+FROM paid_orders
+GROUP BY customer_id
+REFRESH ON STALE AFTER 6 HOURS
+REFRESH EVERY 30 MINUTES
+REFRESH DAILY AT '02:00' TIMEZONE 'Europe/Berlin'
+WITH DATA;
+
+-- Force a complete rebuild of the materialized cache.
+REFRESH MATERIALIZED VIEW paid_customer_totals_mv;
+
+-- Inspect refresh policy and runtime metadata.
+SELECT name, cache_table_name, last_refresh_at, refresh_every_ms, daily_at, last_error
+FROM catalog.materialized_views;
+```
+
+`WITH NO DATA` stores only the definition. Combined with
+`REFRESH ON STALE AFTER ...`, the first read materializes the cache lazily.
+
+Existing views can be converted in either direction without rewriting the query:
+
+```sql
+ALTER VIEW paid_customer_totals
+MATERIALIZE
+REFRESH EVERY 15 MINUTES
+WITH DATA;
+
+ALTER MATERIALIZED VIEW paid_customer_totals TO VIEW;
+```
+
+For a single operational overview across tables, views, materialized views,
+jobs, triggers, and registered functions, use `sys.objects` or
+`catalog.objects`:
+
+```sql
+SELECT object_type, name, status, rows, is_stale, last_refresh_at, next_run_at, last_error
+FROM sys.objects
+ORDER BY object_type, name;
+```
 
 ### Full-Text Search quick start
 
@@ -364,7 +445,6 @@ go test ./internal/engine -run '^$' -bench 'Benchmark(WhereVectorAndSimpleCondit
 |---------|-------------------|----------|
 | **FOREIGN KEY constraints** | `FOREIGN KEY (col) REFERENCES other(col)` + enforcement | Medium |
 | **CHECK constraints** | `CHECK (expr)` in `CREATE TABLE` | Medium |
-| **RETURNING clause** | `INSERT … RETURNING`, `UPDATE … RETURNING` | Medium |
 | **UPSERT / ON CONFLICT** | `INSERT OR REPLACE`, `INSERT … ON CONFLICT DO UPDATE/NOTHING` | Medium |
 | **Generated / computed columns** | `col AS (expr) STORED/VIRTUAL` | Low |
 | **SAVEPOINT / nested transactions** | `SAVEPOINT sp; ROLLBACK TO sp; RELEASE sp` | Low |

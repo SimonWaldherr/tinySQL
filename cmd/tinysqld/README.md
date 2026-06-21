@@ -58,6 +58,11 @@ Authenticated when `-auth` is set:
 - `GET /api/status`
 - `POST /api/exec`
 - `POST /api/query`
+- `GET /api/catalog/tables`
+- `GET /api/catalog/columns` (real table schemas from `sys.columns`)
+- `GET /api/jobs`
+- `GET /api/job-history`
+- `POST /api/jobs/run`
 
 SQL request body:
 
@@ -74,4 +79,14 @@ Auth accepts either:
 ```text
 Authorization: Bearer <token>
 X-TinySQL-Auth: <token>
+```
+
+Run a registered job immediately:
+
+```json
+{
+  "tenant": "default",
+  "name": "nightly_maintenance",
+  "timeout_ms": 30000
+}
 ```

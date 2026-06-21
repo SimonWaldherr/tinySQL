@@ -59,6 +59,7 @@ type CatalogManager struct {
 	tables   map[string]*CatalogTable
 	columns  map[string][]CatalogColumn
 	views    map[string]*CatalogView
+	mviews   map[string]*CatalogMaterializedView
 	funcs    map[string]*CatalogFunction
 	jobs     map[string]*CatalogJob
 	jobRuns  []*CatalogJobHistory
@@ -72,6 +73,7 @@ func NewCatalogManager() *CatalogManager {
 		tables:   make(map[string]*CatalogTable),
 		columns:  make(map[string][]CatalogColumn),
 		views:    make(map[string]*CatalogView),
+		mviews:   make(map[string]*CatalogMaterializedView),
 		funcs:    make(map[string]*CatalogFunction),
 		jobs:     make(map[string]*CatalogJob),
 		jobRuns:  make([]*CatalogJobHistory, 0),
@@ -112,6 +114,25 @@ type CatalogView struct {
 	Name      string
 	SQLText   string
 	CreatedAt time.Time
+}
+
+// CatalogMaterializedView stores a saved query with physical refresh metadata.
+type CatalogMaterializedView struct {
+	Schema         string
+	Name           string
+	SQLText        string
+	CacheTableName string
+	StaleAfterMs   int64
+	RefreshEveryMs int64
+	DailyAt        string
+	Timezone       string
+	WithData       bool
+	LastRefreshAt  *time.Time
+	LastDurationMs int64
+	LastError      string
+	IsRefreshing   bool
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // CatalogFunction represents metadata for scalar and table-valued functions
@@ -203,13 +224,154 @@ func (c *CatalogManager) RegisterView(schema, name, sqlText string) error {
 	defer c.mu.Unlock()
 
 	key := schema + "." + name
+	now := time.Now()
 	c.views[key] = &CatalogView{
 		Schema:    schema,
 		Name:      name,
 		SQLText:   sqlText,
-		CreatedAt: time.Now(),
+		CreatedAt: now,
+	}
+	c.tables[key] = &CatalogTable{
+		Schema:    schema,
+		Name:      name,
+		Type:      "VIEW",
+		CreatedAt: now,
+		UpdatedAt: now,
 	}
 
+	return nil
+}
+
+// DeleteView removes a view definition and its catalog table entry.
+func (c *CatalogManager) DeleteView(schema, name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := schema + "." + name
+	if _, ok := c.views[key]; !ok {
+		return fmt.Errorf("view %q not found", name)
+	}
+	delete(c.views, key)
+	delete(c.tables, key)
+	delete(c.columns, key)
+	return nil
+}
+
+// GetView retrieves a view definition by schema and name.
+func (c *CatalogManager) GetView(schema, name string) (*CatalogView, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	v, ok := c.views[schema+"."+name]
+	if !ok {
+		return nil, false
+	}
+	cp := *v
+	return &cp, true
+}
+
+// RegisterMaterializedView registers or updates a materialized view definition.
+func (c *CatalogManager) RegisterMaterializedView(mv *CatalogMaterializedView) error {
+	if mv == nil || mv.Name == "" {
+		return fmt.Errorf("materialized view name cannot be empty")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if mv.Schema == "" {
+		mv.Schema = "main"
+	}
+	key := mv.Schema + "." + mv.Name
+	now := time.Now()
+	if existing := c.mviews[key]; existing != nil && !existing.CreatedAt.IsZero() && mv.CreatedAt.IsZero() {
+		mv.CreatedAt = existing.CreatedAt
+	}
+	if mv.CreatedAt.IsZero() {
+		mv.CreatedAt = now
+	}
+	mv.UpdatedAt = now
+	if mv.CacheTableName == "" {
+		mv.CacheTableName = "__mv_" + strings.ToLower(mv.Name)
+	}
+	cp := *mv
+	c.mviews[key] = &cp
+	c.tables[key] = &CatalogTable{
+		Schema:    mv.Schema,
+		Name:      mv.Name,
+		Type:      "MATERIALIZED VIEW",
+		CreatedAt: mv.CreatedAt,
+		UpdatedAt: now,
+	}
+	return nil
+}
+
+// DeleteMaterializedView removes a materialized view definition.
+func (c *CatalogManager) DeleteMaterializedView(schema, name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := schema + "." + name
+	if _, ok := c.mviews[key]; !ok {
+		return fmt.Errorf("materialized view %q not found", name)
+	}
+	delete(c.mviews, key)
+	delete(c.tables, key)
+	delete(c.columns, key)
+	return nil
+}
+
+// GetMaterializedView retrieves a materialized view definition by schema/name.
+func (c *CatalogManager) GetMaterializedView(schema, name string) (*CatalogMaterializedView, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	mv, ok := c.mviews[schema+"."+name]
+	if !ok {
+		return nil, false
+	}
+	cp := *mv
+	return &cp, true
+}
+
+// GetMaterializedViews returns all materialized view definitions.
+func (c *CatalogManager) GetMaterializedViews() []*CatalogMaterializedView {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]*CatalogMaterializedView, 0, len(c.mviews))
+	for _, mv := range c.mviews {
+		cp := *mv
+		out = append(out, &cp)
+	}
+	return out
+}
+
+// TryBeginMaterializedViewRefresh marks a materialized view as refreshing.
+func (c *CatalogManager) TryBeginMaterializedViewRefresh(schema, name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	mv := c.mviews[schema+"."+name]
+	if mv == nil || mv.IsRefreshing {
+		return false
+	}
+	mv.IsRefreshing = true
+	mv.UpdatedAt = time.Now()
+	return true
+}
+
+// FinishMaterializedViewRefresh updates refresh bookkeeping.
+func (c *CatalogManager) FinishMaterializedViewRefresh(schema, name string, refreshedAt time.Time, durationMs int64, rowCount int64, errMsg string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	mv := c.mviews[schema+"."+name]
+	if mv == nil {
+		return fmt.Errorf("materialized view %q not found", name)
+	}
+	mv.IsRefreshing = false
+	mv.LastDurationMs = durationMs
+	mv.LastError = errMsg
+	if errMsg == "" {
+		mv.LastRefreshAt = &refreshedAt
+	}
+	mv.UpdatedAt = time.Now()
+	if t := c.tables[schema+"."+name]; t != nil {
+		t.RowCount = rowCount
+		t.UpdatedAt = mv.UpdatedAt
+	}
 	return nil
 }
 

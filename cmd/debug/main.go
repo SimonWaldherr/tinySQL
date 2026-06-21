@@ -139,6 +139,16 @@ func stmtType(stmt tinysql.Statement) string {
 		return "CREATE VIEW"
 	case *engine.DropView:
 		return "DROP VIEW"
+	case *engine.CreateMaterializedView:
+		return "CREATE MATERIALIZED VIEW"
+	case *engine.DropMaterializedView:
+		return "DROP MATERIALIZED VIEW"
+	case *engine.RefreshMaterializedView:
+		return "REFRESH MATERIALIZED VIEW"
+	case *engine.AlterViewMaterialize:
+		return "ALTER VIEW MATERIALIZE"
+	case *engine.AlterMaterializedViewToView:
+		return "ALTER MATERIALIZED VIEW TO VIEW"
 	case *engine.CreateJob:
 		return "CREATE JOB"
 	default:

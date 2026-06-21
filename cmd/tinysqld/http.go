@@ -39,6 +39,12 @@ type sqlRequest struct {
 	TimeoutMS int64  `json:"timeout_ms,omitempty"`
 }
 
+type runJobRequest struct {
+	Tenant    string `json:"tenant,omitempty"`
+	Name      string `json:"name"`
+	TimeoutMS int64  `json:"timeout_ms,omitempty"`
+}
+
 type sqlResponse struct {
 	Success bool              `json:"success"`
 	Columns []string          `json:"columns,omitempty"`
@@ -80,6 +86,11 @@ func (d *daemon) routes() http.Handler {
 	mux.HandleFunc("/api/status", d.requireAuth(d.handleStatus))
 	mux.HandleFunc("/api/exec", d.requireAuth(d.handleExec))
 	mux.HandleFunc("/api/query", d.requireAuth(d.handleQuery))
+	mux.HandleFunc("/api/catalog/tables", d.requireAuth(d.handleCatalogTables))
+	mux.HandleFunc("/api/catalog/columns", d.requireAuth(d.handleCatalogColumns))
+	mux.HandleFunc("/api/jobs", d.requireAuth(d.handleJobs))
+	mux.HandleFunc("/api/job-history", d.requireAuth(d.handleJobHistory))
+	mux.HandleFunc("/api/jobs/run", d.requireAuth(d.handleRunJob))
 	return mux
 }
 
@@ -141,6 +152,139 @@ func (d *daemon) handleQuery(w http.ResponseWriter, r *http.Request) {
 	d.handleSQL(w, r)
 }
 
+func (d *daemon) handleCatalogTables(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErrorJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	tenant := d.tenantOrDefault(r.URL.Query().Get("tenant"))
+	d.writeCatalogQuery(w, r, tenant, "SELECT schema, name, type, rows FROM catalog.tables")
+}
+
+func (d *daemon) handleCatalogColumns(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErrorJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	tenant := d.tenantOrDefault(r.URL.Query().Get("tenant"))
+	d.writeCatalogQuery(w, r, tenant, "SELECT tenant, table_name, name, position, data_type, constraint, is_nullable, fk_table, fk_column FROM sys.columns")
+}
+
+func (d *daemon) handleJobs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErrorJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	tenant := d.tenantOrDefault(r.URL.Query().Get("tenant"))
+	d.writeCatalogQuery(w, r, tenant, "SELECT name, enabled, schedule_type, cron_expr, interval_ms, run_at, timezone, catch_up, no_overlap, max_runtime_ms, last_run_at, next_run_at, created_at, updated_at FROM catalog.jobs")
+}
+
+func (d *daemon) handleJobHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErrorJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	tenant := d.tenantOrDefault(r.URL.Query().Get("tenant"))
+	d.writeCatalogQuery(w, r, tenant, "SELECT run_id, job_name, started_at, finished_at, duration_ms, status, error_message FROM catalog.job_history")
+}
+
+func (d *daemon) writeCatalogQuery(w http.ResponseWriter, r *http.Request, tenant, sqlText string) {
+	ctx, cancel, err := d.requestContext(r.Context(), 0)
+	if err != nil {
+		writeErrorJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	defer cancel()
+	rs, err := d.executeSQL(ctx, tenant, sqlText)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, sqlResponse{Success: false, Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, sqlResponse{
+		Success: true,
+		Columns: rs.Cols,
+		Rows:    rs.Rows,
+		Meta:    map[string]string{"tenant": tenant},
+	})
+}
+
+func (d *daemon) handleRunJob(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErrorJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req runJobRequest
+	if err := decodeJSONBody(w, r, d.maxBodyBytes, &req); err != nil {
+		writeErrorJSON(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		writeErrorJSON(w, http.StatusBadRequest, "job name must not be empty")
+		return
+	}
+	job, err := d.inst.DB.Catalog().GetJob(name)
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, err.Error())
+		return
+	}
+	ctx, cancel, err := d.requestContext(r.Context(), req.TimeoutMS)
+	if err != nil {
+		writeErrorJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	defer cancel()
+
+	tenant := d.tenantOrDefault(req.Tenant)
+	started := time.Now()
+	status := "SUCCEEDED"
+	errMsg := ""
+	executor := tinysql.NewSQLJobExecutor(d.inst.DB, tenant)
+	if _, err := executor.ExecuteSQL(ctx, job.SQLText); err != nil {
+		status = "FAILED"
+		errMsg = err.Error()
+	}
+	finished := time.Now()
+	if ctx.Err() != nil && status == "SUCCEEDED" {
+		status = "CANCELED"
+		errMsg = ctx.Err().Error()
+	}
+	if err := d.inst.DB.Catalog().UpdateJobRuntimePtr(job.Name, started, job.NextRunAt); err != nil {
+		writeErrorJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := d.inst.DB.Catalog().AddJobHistory(&tinysql.CatalogJobHistory{
+		JobName:      job.Name,
+		StartedAt:    started,
+		FinishedAt:   finished,
+		DurationMs:   finished.Sub(started).Milliseconds(),
+		Status:       status,
+		ErrorMessage: errMsg,
+	}); err != nil {
+		writeErrorJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := d.inst.DB.Sync(); err != nil {
+		writeErrorJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	resp := map[string]any{
+		"success":     status == "SUCCEEDED",
+		"job_name":    job.Name,
+		"tenant":      tenant,
+		"status":      status,
+		"duration_ms": finished.Sub(started).Milliseconds(),
+	}
+	if errMsg != "" {
+		resp["error"] = errMsg
+	}
+	if status == "SUCCEEDED" {
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	writeJSON(w, http.StatusBadRequest, resp)
+}
+
 func (d *daemon) handleSQL(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeErrorJSON(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -164,12 +308,7 @@ func (d *daemon) handleSQL(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	tenant := d.tenantOrDefault(req.Tenant)
-	stmt, err := tinysql.ParseSQL(sqlText)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, sqlResponse{Success: false, Error: err.Error()})
-		return
-	}
-	rs, err := tinysql.Execute(ctx, d.inst.DB, tenant, stmt)
+	rs, err := d.executeSQL(ctx, tenant, sqlText)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, sqlResponse{Success: false, Error: err.Error()})
 		return
@@ -185,6 +324,14 @@ func (d *daemon) handleSQL(w http.ResponseWriter, r *http.Request) {
 		resp.Rows = rs.Rows
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (d *daemon) executeSQL(ctx context.Context, tenant, sqlText string) (*tinysql.ResultSet, error) {
+	stmt, err := tinysql.ParseSQL(sqlText)
+	if err != nil {
+		return nil, err
+	}
+	return tinysql.Execute(ctx, d.inst.DB, tenant, stmt)
 }
 
 func (d *daemon) tenantOrDefault(tenant string) string {

@@ -60,7 +60,7 @@ tool has its own README with full documentation — click the links below.
   - Build: `go build ./cmd/tinysqld`
   - Run: `./tinysqld -data ./tinysqld-data -storage disk -tenant default -http 127.0.0.1:8088`
   - Check configuration: `./tinysqld -data ./tinysqld-data -storage disk -check`
-  - Endpoints: `GET /healthz`, `GET /readyz`, `GET /api/status`, `POST /api/exec`, `POST /api/query`
+  - Endpoints: `GET /healthz`, `GET /readyz`, `GET /api/status`, `POST /api/exec`, `POST /api/query`, `GET /api/catalog/tables`, `GET /api/catalog/columns`, `GET /api/jobs`, `GET /api/job-history`, `POST /api/jobs/run`
   - Flags: `-data`, `-storage <disk|hybrid|index|wal|advanced_wal>`, `-tenant`, `-http`, `-auth`, `-request-timeout`, `-check`
 
 - tinysql

@@ -766,6 +766,7 @@ type diskCatalog struct {
 	Tables   []*CatalogTable
 	Columns  map[string][]CatalogColumn
 	Views    []*CatalogView
+	MViews   []*CatalogMaterializedView
 	Funcs    []*CatalogFunction
 	Jobs     []*CatalogJob
 	JobRuns  []*CatalogJobHistory
@@ -784,6 +785,7 @@ func catalogToDisk(c *CatalogManager) diskCatalog {
 		Tables:   make([]*CatalogTable, 0, len(c.tables)),
 		Columns:  make(map[string][]CatalogColumn, len(c.columns)),
 		Views:    make([]*CatalogView, 0, len(c.views)),
+		MViews:   make([]*CatalogMaterializedView, 0, len(c.mviews)),
 		Funcs:    make([]*CatalogFunction, 0, len(c.funcs)),
 		Jobs:     make([]*CatalogJob, 0, len(c.jobs)),
 		JobRuns:  make([]*CatalogJobHistory, 0, len(c.jobRuns)),
@@ -805,6 +807,10 @@ func catalogToDisk(c *CatalogManager) diskCatalog {
 	for _, v := range c.views {
 		cp := *v
 		dc.Views = append(dc.Views, &cp)
+	}
+	for _, mv := range c.mviews {
+		cp := *mv
+		dc.MViews = append(dc.MViews, &cp)
 	}
 	for _, f := range c.funcs {
 		cp := *f
@@ -848,6 +854,13 @@ func diskToCatalog(dc diskCatalog) *CatalogManager {
 		}
 		cp := *v
 		c.views[cp.Schema+"."+cp.Name] = &cp
+	}
+	for _, mv := range dc.MViews {
+		if mv == nil {
+			continue
+		}
+		cp := *mv
+		c.mviews[cp.Schema+"."+cp.Name] = &cp
 	}
 	for _, f := range dc.Funcs {
 		if f == nil {

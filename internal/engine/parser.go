@@ -193,6 +193,7 @@ type DropIndex struct {
 type CreateView struct {
 	Name        string
 	Select      *Select
+	SQLText     string
 	IfNotExists bool
 	OrReplace   bool
 }
@@ -201,6 +202,47 @@ type CreateView struct {
 type DropView struct {
 	Name     string
 	IfExists bool
+}
+
+// CreateMaterializedView represents a CREATE MATERIALIZED VIEW statement.
+type CreateMaterializedView struct {
+	Name           string
+	Select         *Select
+	SQLText        string
+	IfNotExists    bool
+	OrReplace      bool
+	WithData       bool
+	StaleAfterMs   int64
+	RefreshEveryMs int64
+	DailyAt        string
+	Timezone       string
+}
+
+// DropMaterializedView represents a DROP MATERIALIZED VIEW statement.
+type DropMaterializedView struct {
+	Name     string
+	IfExists bool
+}
+
+// RefreshMaterializedView represents REFRESH MATERIALIZED VIEW.
+type RefreshMaterializedView struct {
+	Name         string
+	Concurrently bool
+}
+
+// AlterViewMaterialize represents ALTER VIEW ... MATERIALIZE.
+type AlterViewMaterialize struct {
+	Name           string
+	WithData       bool
+	StaleAfterMs   int64
+	RefreshEveryMs int64
+	DailyAt        string
+	Timezone       string
+}
+
+// AlterMaterializedViewToView represents ALTER MATERIALIZED VIEW ... TO VIEW.
+type AlterMaterializedViewToView struct {
+	Name string
 }
 
 // CreateJob represents a CREATE JOB statement.
@@ -256,22 +298,25 @@ type AlterTable struct {
 
 // Insert represents an INSERT statement.
 type Insert struct {
-	Table string
-	Cols  []string
-	Rows  [][]Expr
+	Table     string
+	Cols      []string
+	Rows      [][]Expr
+	Returning []SelectItem
 }
 
 // Update represents an UPDATE statement.
 type Update struct {
-	Table string
-	Sets  map[string]Expr
-	Where Expr
+	Table     string
+	Sets      map[string]Expr
+	Where     Expr
+	Returning []SelectItem
 }
 
 // Delete represents a DELETE statement.
 type Delete struct {
-	Table string
-	Where Expr
+	Table     string
+	Where     Expr
+	Returning []SelectItem
 }
 
 type JoinType int
@@ -398,6 +443,8 @@ func (p *Parser) ParseStatement() (Statement, error) {
 		return p.parseUpdate()
 	case "DELETE":
 		return p.parseDelete()
+	case "REFRESH":
+		return p.parseRefresh()
 	case "SELECT", "WITH":
 		return p.parseSelectWithCTE()
 	default:
@@ -429,6 +476,10 @@ func (p *Parser) parseCreateNonTable() (Statement, bool, error) {
 		stmt, err := p.parseCreateOrReplace()
 		return stmt, true, err
 	}
+	if p.cur.Typ == tKeyword && p.cur.Val == "MATERIALIZED" {
+		stmt, err := p.parseCreateMaterializedView(false)
+		return stmt, true, err
+	}
 	if p.cur.Typ == tKeyword && (p.cur.Val == "INDEX" || p.cur.Val == "UNIQUE") {
 		stmt, err := p.parseCreateIndex()
 		return stmt, true, err
@@ -448,6 +499,9 @@ func (p *Parser) parseCreateOrReplace() (Statement, error) {
 	p.next() // consume OR
 	if p.cur.Typ == tKeyword && p.cur.Val == "REPLACE" {
 		p.next() // consume REPLACE
+		if p.cur.Typ == tKeyword && p.cur.Val == "MATERIALIZED" {
+			return p.parseCreateMaterializedView(true)
+		}
 		if p.cur.Typ == tKeyword && p.cur.Val == "TRIGGER" {
 			return p.parseCreateTrigger(false)
 		}
@@ -511,6 +565,11 @@ func (p *Parser) parseCreateTable() (Statement, error) {
 
 func (p *Parser) parseDrop() (Statement, error) {
 	p.next()
+
+	// Check for DROP MATERIALIZED VIEW
+	if p.cur.Typ == tKeyword && p.cur.Val == "MATERIALIZED" {
+		return p.parseDropMaterializedView()
+	}
 
 	// Check for DROP INDEX
 	if p.cur.Typ == tKeyword && p.cur.Val == "INDEX" {
@@ -1076,17 +1135,187 @@ func (p *Parser) parseCreateView() (Statement, error) {
 		return nil, err
 	}
 
-	sel, err := p.parseSelect()
+	queryStart := p.cur.Pos
+	sel, err := p.parseSelectWithCTE()
 	if err != nil {
 		return nil, err
 	}
+	sqlText := p.sqlFragment(queryStart, p.cur.Pos)
 
 	return &CreateView{
 		Name:        viewName,
 		Select:      sel,
+		SQLText:     sqlText,
 		IfNotExists: ifNotExists,
 		OrReplace:   orReplace,
 	}, nil
+}
+
+func (p *Parser) parseCreateMaterializedView(orReplace bool) (Statement, error) {
+	p.next() // consume MATERIALIZED
+	if err := p.expectKeyword("VIEW"); err != nil {
+		return nil, err
+	}
+
+	ifNotExists := false
+	if p.cur.Typ == tKeyword && p.cur.Val == "IF" {
+		p.next()
+		if err := p.expectKeyword("NOT"); err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		ifNotExists = true
+	}
+
+	viewName := p.parseIdentLike()
+	if viewName == "" {
+		return nil, p.errf("expected materialized view name")
+	}
+	if err := p.expectKeyword("AS"); err != nil {
+		return nil, err
+	}
+
+	queryStart := p.cur.Pos
+	sel, err := p.parseSelectWithCTE()
+	if err != nil {
+		return nil, err
+	}
+	mv := &CreateMaterializedView{
+		Name:        viewName,
+		Select:      sel,
+		SQLText:     p.sqlFragment(queryStart, p.cur.Pos),
+		IfNotExists: ifNotExists,
+		OrReplace:   orReplace,
+		WithData:    true,
+	}
+
+	for p.cur.Typ == tKeyword {
+		switch p.cur.Val {
+		case "REFRESH":
+			if err := p.parseMaterializedRefreshClause(mv); err != nil {
+				return nil, err
+			}
+		case "WITH":
+			if err := p.parseMaterializedWithData(mv); err != nil {
+				return nil, err
+			}
+		default:
+			return mv, nil
+		}
+	}
+	return mv, nil
+}
+
+func (p *Parser) parseMaterializedRefreshClause(mv *CreateMaterializedView) error {
+	p.next() // consume REFRESH
+	if p.cur.Typ == tKeyword && p.cur.Val == "ON" {
+		p.next()
+		if p.cur.Typ == tKeyword && p.cur.Val == "STALE" {
+			p.next()
+			if err := p.expectKeyword("AFTER"); err != nil {
+				return err
+			}
+			ms, err := p.parseDurationMillis()
+			if err != nil {
+				return err
+			}
+			mv.StaleAfterMs = ms
+			return nil
+		}
+		if p.cur.Typ == tKeyword && p.cur.Val == "DEMAND" {
+			p.next()
+			return nil
+		}
+		return p.errf("expected STALE or DEMAND after REFRESH ON")
+	}
+	if p.cur.Typ == tKeyword && p.cur.Val == "EVERY" {
+		p.next()
+		ms, err := p.parseDurationMillis()
+		if err != nil {
+			return err
+		}
+		mv.RefreshEveryMs = ms
+		return nil
+	}
+	if p.cur.Typ == tKeyword && p.cur.Val == "DAILY" {
+		p.next()
+		if err := p.expectKeyword("AT"); err != nil {
+			return err
+		}
+		if p.cur.Typ != tString {
+			return p.errf("expected daily refresh time string")
+		}
+		mv.DailyAt = p.cur.Val
+		p.next()
+		if p.cur.Typ == tKeyword && p.cur.Val == "TIMEZONE" {
+			p.next()
+			if p.cur.Typ != tString {
+				return p.errf("expected timezone string")
+			}
+			mv.Timezone = p.cur.Val
+			p.next()
+		}
+		return nil
+	}
+	return p.errf("expected ON, EVERY, or DAILY after REFRESH")
+}
+
+func (p *Parser) parseMaterializedWithData(mv *CreateMaterializedView) error {
+	p.next() // consume WITH
+	if p.cur.Typ == tKeyword && p.cur.Val == "NO" {
+		p.next()
+		if err := p.expectKeyword("DATA"); err != nil {
+			return err
+		}
+		mv.WithData = false
+		return nil
+	}
+	if err := p.expectKeyword("DATA"); err != nil {
+		return err
+	}
+	mv.WithData = true
+	return nil
+}
+
+func (p *Parser) parseDurationMillis() (int64, error) {
+	if p.cur.Typ != tNumber {
+		return 0, p.errf("expected duration number")
+	}
+	n, err := strconv.ParseFloat(p.cur.Val, 64)
+	if err != nil {
+		return 0, p.errf("invalid duration number")
+	}
+	p.next()
+	unit := p.parseIdentLike()
+	if unit == "" {
+		return 0, p.errf("expected duration unit")
+	}
+	switch strings.ToUpper(unit) {
+	case "MILLISECOND", "MILLISECONDS", "MS":
+		return int64(n), nil
+	case "SECOND", "SECONDS":
+		return int64(n * float64(time.Second/time.Millisecond)), nil
+	case "MINUTE", "MINUTES":
+		return int64(n * float64(time.Minute/time.Millisecond)), nil
+	case "HOUR", "HOURS":
+		return int64(n * float64(time.Hour/time.Millisecond)), nil
+	case "DAY", "DAYS":
+		return int64(n * float64((24*time.Hour)/time.Millisecond)), nil
+	default:
+		return 0, p.errf("unknown duration unit %q", unit)
+	}
+}
+
+func (p *Parser) sqlFragment(start, end int) string {
+	if start < 0 {
+		start = 0
+	}
+	if end < start || end > len(p.lx.s) {
+		end = len(p.lx.s)
+	}
+	return strings.TrimSpace(p.lx.s[start:end])
 }
 
 func (p *Parser) parseDropView() (Statement, error) {
@@ -1114,8 +1343,61 @@ func (p *Parser) parseDropView() (Statement, error) {
 	}, nil
 }
 
+func (p *Parser) parseDropMaterializedView() (Statement, error) {
+	p.next() // consume MATERIALIZED
+	if err := p.expectKeyword("VIEW"); err != nil {
+		return nil, err
+	}
+
+	ifExists := false
+	if p.cur.Typ == tKeyword && p.cur.Val == "IF" {
+		p.next()
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		ifExists = true
+	}
+
+	name := p.parseIdentLike()
+	if name == "" {
+		return nil, p.errf("expected materialized view name")
+	}
+	return &DropMaterializedView{Name: name, IfExists: ifExists}, nil
+}
+
+func (p *Parser) parseRefresh() (Statement, error) {
+	p.next() // consume REFRESH
+	if err := p.expectKeyword("MATERIALIZED"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("VIEW"); err != nil {
+		return nil, err
+	}
+	concurrently := false
+	if p.cur.Typ == tKeyword && p.cur.Val == "CONCURRENTLY" {
+		concurrently = true
+		p.next()
+	}
+	name := p.parseIdentLike()
+	if name == "" {
+		return nil, p.errf("expected materialized view name")
+	}
+	if p.cur.Typ == tSymbol && p.cur.Val == ";" {
+		p.next()
+	}
+	return &RefreshMaterializedView{Name: name, Concurrently: concurrently}, nil
+}
+
 func (p *Parser) parseAlter() (Statement, error) {
 	p.next()
+
+	if p.cur.Typ == tKeyword && p.cur.Val == "VIEW" {
+		return p.parseAlterView()
+	}
+
+	if p.cur.Typ == tKeyword && p.cur.Val == "MATERIALIZED" {
+		return p.parseAlterMaterializedView()
+	}
 
 	// Support ALTER JOB <name> ENABLE|DISABLE
 	if (p.cur.Typ == tKeyword || p.cur.Typ == tIdent) && p.cur.Val == "JOB" {
@@ -1172,6 +1454,66 @@ func (p *Parser) parseAlter() (Statement, error) {
 	}, nil
 }
 
+func (p *Parser) parseAlterView() (Statement, error) {
+	p.next() // consume VIEW
+	name := p.parseIdentLike()
+	if name == "" {
+		return nil, p.errf("expected view name")
+	}
+	if (p.cur.Typ != tKeyword && p.cur.Typ != tIdent) || p.cur.Val != "MATERIALIZE" {
+		return nil, p.errf("expected MATERIALIZE")
+	}
+	p.next()
+	mv := &CreateMaterializedView{Name: name, WithData: true}
+	for p.cur.Typ == tKeyword {
+		switch p.cur.Val {
+		case "REFRESH":
+			if err := p.parseMaterializedRefreshClause(mv); err != nil {
+				return nil, err
+			}
+		case "WITH":
+			if err := p.parseMaterializedWithData(mv); err != nil {
+				return nil, err
+			}
+		default:
+			return &AlterViewMaterialize{
+				Name:           name,
+				WithData:       mv.WithData,
+				StaleAfterMs:   mv.StaleAfterMs,
+				RefreshEveryMs: mv.RefreshEveryMs,
+				DailyAt:        mv.DailyAt,
+				Timezone:       mv.Timezone,
+			}, nil
+		}
+	}
+	return &AlterViewMaterialize{
+		Name:           name,
+		WithData:       mv.WithData,
+		StaleAfterMs:   mv.StaleAfterMs,
+		RefreshEveryMs: mv.RefreshEveryMs,
+		DailyAt:        mv.DailyAt,
+		Timezone:       mv.Timezone,
+	}, nil
+}
+
+func (p *Parser) parseAlterMaterializedView() (Statement, error) {
+	p.next() // consume MATERIALIZED
+	if err := p.expectKeyword("VIEW"); err != nil {
+		return nil, err
+	}
+	name := p.parseIdentLike()
+	if name == "" {
+		return nil, p.errf("expected materialized view name")
+	}
+	if err := p.expectKeyword("TO"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("VIEW"); err != nil {
+		return nil, err
+	}
+	return &AlterMaterializedViewToView{Name: name}, nil
+}
+
 //nolint:gocyclo // INSERT parsing covers column lists and multi-row value sets.
 func (p *Parser) parseInsert() (Statement, error) {
 	p.next()
@@ -1208,7 +1550,11 @@ func (p *Parser) parseInsert() (Statement, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Insert{Table: tname, Cols: cols, Rows: rows}, nil
+	returning, err := p.parseReturningClause()
+	if err != nil {
+		return nil, err
+	}
+	return &Insert{Table: tname, Cols: cols, Rows: rows, Returning: returning}, nil
 }
 
 func (p *Parser) parseInsertValueRows() ([][]Expr, error) {
@@ -1281,7 +1627,11 @@ func (p *Parser) parseUpdate() (Statement, error) {
 		}
 		where = e
 	}
-	return &Update{Table: tname, Sets: sets, Where: where}, nil
+	returning, err := p.parseReturningClause()
+	if err != nil {
+		return nil, err
+	}
+	return &Update{Table: tname, Sets: sets, Where: where, Returning: returning}, nil
 }
 
 func (p *Parser) parseDelete() (Statement, error) {
@@ -1302,7 +1652,23 @@ func (p *Parser) parseDelete() (Statement, error) {
 		}
 		where = e
 	}
-	return &Delete{Table: tname, Where: where}, nil
+	returning, err := p.parseReturningClause()
+	if err != nil {
+		return nil, err
+	}
+	return &Delete{Table: tname, Where: where, Returning: returning}, nil
+}
+
+func (p *Parser) parseReturningClause() ([]SelectItem, error) {
+	if p.cur.Typ != tKeyword || p.cur.Val != "RETURNING" {
+		return nil, nil
+	}
+	p.next()
+	sel := &Select{}
+	if err := p.parseProjections(sel); err != nil {
+		return nil, err
+	}
+	return sel.Projs, nil
 }
 
 func (p *Parser) parseSelectWithCTE() (*Select, error) {

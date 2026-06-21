@@ -30,6 +30,7 @@ import (
 //   sys.storage      – storage backend statistics
 //   sys.config       – database configuration
 //   sys.connections  – active tenant / connection info
+//   sys.objects      – unified status for tables, views, jobs, triggers, …
 // ============================================================================
 
 // startTime records when the process started so sys.status can report uptime.
@@ -40,6 +41,8 @@ var startTime = time.Now()
 // back to the default "unknown catalog/sys table" error.
 func resolveSysTable(env ExecEnv, name string) ([]Row, error) {
 	switch name {
+	case "objects":
+		return allObjectStatusRows(env), nil
 	case "tables":
 		return sysTablesRows(env), nil
 	case "columns":
@@ -50,6 +53,8 @@ func resolveSysTable(env ExecEnv, name string) ([]Row, error) {
 		return sysIndexesRows(env), nil
 	case "views":
 		return sysViewsRows(env), nil
+	case "materialized_views":
+		return sysMaterializedViewsRows(env), nil
 	case "functions":
 		return sysFunctionsRows(), nil
 	case "variables":
@@ -86,6 +91,211 @@ func sysTablesRows(env ExecEnv) []Row {
 			putVal(r, "version", t.Version)
 			rows = append(rows, r)
 		}
+	}
+	return rows
+}
+
+// ─────────────────────────── sys.objects / catalog.objects ───────────────
+
+func allObjectStatusRows(env ExecEnv) []Row {
+	rows := make([]Row, 0)
+	rows = append(rows, tableStatusRows(env)...)
+	rows = append(rows, viewStatusRows(env)...)
+	rows = append(rows, materializedViewStatusRows(env)...)
+	rows = append(rows, jobStatusRows(env)...)
+	rows = append(rows, triggerStatusRows(env)...)
+	rows = append(rows, functionStatusRows(env)...)
+	return rows
+}
+
+func tableStatusRows(env ExecEnv) []Row {
+	rows := make([]Row, 0)
+	for _, tn := range env.db.ListTenants() {
+		for _, t := range env.db.ListTables(tn) {
+			if strings.HasPrefix(strings.ToLower(t.Name), "__mv_") {
+				continue
+			}
+			r := make(Row)
+			putVal(r, "schema", "main")
+			putVal(r, "tenant", tn)
+			putVal(r, "name", t.Name)
+			putVal(r, "object_type", "TABLE")
+			putVal(r, "status", "ONLINE")
+			putVal(r, "rows", len(t.Rows))
+			putVal(r, "columns", len(t.Cols))
+			putVal(r, "version", t.Version)
+			putVal(r, "is_stale", nil)
+			putVal(r, "last_refresh_at", nil)
+			putVal(r, "next_run_at", nil)
+			putVal(r, "last_error", nil)
+			rows = append(rows, r)
+		}
+	}
+	return rows
+}
+
+func viewStatusRows(env ExecEnv) []Row {
+	views := env.db.Catalog().GetViews()
+	rows := make([]Row, 0, len(views))
+	for _, v := range views {
+		r := make(Row)
+		putVal(r, "schema", v.Schema)
+		putVal(r, "tenant", env.tenant)
+		putVal(r, "name", v.Name)
+		putVal(r, "object_type", "VIEW")
+		putVal(r, "status", "QUERYABLE")
+		putVal(r, "rows", nil)
+		putVal(r, "columns", nil)
+		putVal(r, "version", nil)
+		putVal(r, "is_stale", nil)
+		putVal(r, "last_refresh_at", nil)
+		putVal(r, "next_run_at", nil)
+		putVal(r, "last_error", nil)
+		putVal(r, "sql_text", v.SQLText)
+		putVal(r, "created_at", v.CreatedAt)
+		rows = append(rows, r)
+	}
+	return rows
+}
+
+func materializedViewStatusRows(env ExecEnv) []Row {
+	views := env.db.Catalog().GetMaterializedViews()
+	rows := make([]Row, 0, len(views))
+	for _, v := range views {
+		rowCount := any(nil)
+		columnCount := any(nil)
+		cacheExists := false
+		if cache, err := env.db.Get(env.tenant, v.CacheTableName); err == nil {
+			cacheExists = true
+			rowCount = len(cache.Rows)
+			columnCount = len(cache.Cols)
+		}
+		stale := materializedViewIsStale(v, cacheExists)
+		status := "FRESH"
+		switch {
+		case v.IsRefreshing:
+			status = "REFRESHING"
+		case v.LastError != "":
+			status = "ERROR"
+		case !cacheExists:
+			status = "UNMATERIALIZED"
+		case stale:
+			status = "STALE"
+		}
+		r := make(Row)
+		putVal(r, "schema", v.Schema)
+		putVal(r, "tenant", env.tenant)
+		putVal(r, "name", v.Name)
+		putVal(r, "object_type", "MATERIALIZED_VIEW")
+		putVal(r, "status", status)
+		putVal(r, "rows", rowCount)
+		putVal(r, "columns", columnCount)
+		putVal(r, "version", nil)
+		putVal(r, "is_stale", stale)
+		putVal(r, "last_refresh_at", v.LastRefreshAt)
+		putVal(r, "next_run_at", nil)
+		putVal(r, "last_error", v.LastError)
+		putVal(r, "cache_table_name", v.CacheTableName)
+		putVal(r, "stale_after_ms", v.StaleAfterMs)
+		putVal(r, "refresh_every_ms", v.RefreshEveryMs)
+		putVal(r, "daily_at", v.DailyAt)
+		putVal(r, "sql_text", v.SQLText)
+		putVal(r, "created_at", v.CreatedAt)
+		putVal(r, "updated_at", v.UpdatedAt)
+		rows = append(rows, r)
+	}
+	return rows
+}
+
+func materializedViewIsStale(v *storage.CatalogMaterializedView, cacheExists bool) bool {
+	if !cacheExists {
+		return true
+	}
+	if v.StaleAfterMs <= 0 {
+		return false
+	}
+	if v.LastRefreshAt == nil {
+		return true
+	}
+	return time.Since(*v.LastRefreshAt) >= time.Duration(v.StaleAfterMs)*time.Millisecond
+}
+
+func jobStatusRows(env ExecEnv) []Row {
+	jobs := env.db.Catalog().ListJobs()
+	rows := make([]Row, 0, len(jobs))
+	for _, j := range jobs {
+		status := "DISABLED"
+		if j.Enabled {
+			status = "ENABLED"
+		}
+		r := make(Row)
+		putVal(r, "schema", "main")
+		putVal(r, "tenant", env.tenant)
+		putVal(r, "name", j.Name)
+		putVal(r, "object_type", "JOB")
+		putVal(r, "status", status)
+		putVal(r, "rows", nil)
+		putVal(r, "columns", nil)
+		putVal(r, "version", nil)
+		putVal(r, "is_stale", nil)
+		putVal(r, "last_refresh_at", nil)
+		putVal(r, "next_run_at", j.NextRunAt)
+		putVal(r, "last_error", nil)
+		putVal(r, "schedule_type", j.ScheduleType)
+		putVal(r, "last_run_at", j.LastRunAt)
+		putVal(r, "sql_text", j.SQLText)
+		putVal(r, "created_at", j.CreatedAt)
+		putVal(r, "updated_at", j.UpdatedAt)
+		rows = append(rows, r)
+	}
+	return rows
+}
+
+func triggerStatusRows(env ExecEnv) []Row {
+	triggers := env.db.Catalog().ListTriggers()
+	rows := make([]Row, 0, len(triggers))
+	for _, tr := range triggers {
+		r := make(Row)
+		putVal(r, "schema", "main")
+		putVal(r, "tenant", env.tenant)
+		putVal(r, "name", tr.Name)
+		putVal(r, "object_type", "TRIGGER")
+		putVal(r, "status", "ENABLED")
+		putVal(r, "table_name", tr.Table)
+		putVal(r, "event", tr.Event)
+		putVal(r, "timing", tr.Timing)
+		putVal(r, "rows", nil)
+		putVal(r, "columns", nil)
+		putVal(r, "version", nil)
+		putVal(r, "is_stale", nil)
+		putVal(r, "last_refresh_at", nil)
+		putVal(r, "next_run_at", nil)
+		putVal(r, "last_error", nil)
+		putVal(r, "created_at", tr.CreatedAt)
+		rows = append(rows, r)
+	}
+	return rows
+}
+
+func functionStatusRows(env ExecEnv) []Row {
+	funcs := env.db.Catalog().GetFunctions()
+	rows := make([]Row, 0, len(funcs))
+	for _, fn := range funcs {
+		r := make(Row)
+		putVal(r, "schema", fn.Schema)
+		putVal(r, "tenant", env.tenant)
+		putVal(r, "name", fn.Name)
+		putVal(r, "object_type", "FUNCTION")
+		putVal(r, "status", "AVAILABLE")
+		putVal(r, "function_type", fn.FunctionType)
+		putVal(r, "rows", nil)
+		putVal(r, "columns", nil)
+		putVal(r, "version", nil)
+		putVal(r, "is_stale", nil)
+		putVal(r, "last_refresh_at", nil)
+		putVal(r, "next_run_at", nil)
+		putVal(r, "last_error", nil)
+		rows = append(rows, r)
 	}
 	return rows
 }
@@ -166,6 +376,29 @@ func sysViewsRows(env ExecEnv) []Row {
 		putVal(r, "name", v.Name)
 		putVal(r, "sql_text", v.SQLText)
 		putVal(r, "created_at", v.CreatedAt)
+		rows[i] = r
+	}
+	return rows
+}
+
+func sysMaterializedViewsRows(env ExecEnv) []Row {
+	views := env.db.Catalog().GetMaterializedViews()
+	rows := make([]Row, len(views))
+	for i, v := range views {
+		r := make(Row)
+		putVal(r, "schema", v.Schema)
+		putVal(r, "name", v.Name)
+		putVal(r, "sql_text", v.SQLText)
+		putVal(r, "cache_table_name", v.CacheTableName)
+		putVal(r, "stale_after_ms", v.StaleAfterMs)
+		putVal(r, "refresh_every_ms", v.RefreshEveryMs)
+		putVal(r, "daily_at", v.DailyAt)
+		putVal(r, "timezone", v.Timezone)
+		putVal(r, "last_refresh_at", v.LastRefreshAt)
+		putVal(r, "last_error", v.LastError)
+		putVal(r, "is_refreshing", v.IsRefreshing)
+		putVal(r, "created_at", v.CreatedAt)
+		putVal(r, "updated_at", v.UpdatedAt)
 		rows[i] = r
 	}
 	return rows

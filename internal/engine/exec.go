@@ -93,6 +93,7 @@ type ExecEnv struct {
 	ctes        map[string]*ResultSet // For CTE support
 	windowRows  []Row                 // All rows for window function context
 	windowIndex int                   // Current row index in window context
+	viewDepth   int
 }
 
 // Execute runs a parsed SQL statement against the given storage DB and tenant.
@@ -114,6 +115,16 @@ func Execute(ctx context.Context, db *storage.DB, tenant string, stmt Statement)
 		return executeCreateView(env, s)
 	case *DropView:
 		return executeDropView(env, s)
+	case *CreateMaterializedView:
+		return executeCreateMaterializedView(env, s)
+	case *DropMaterializedView:
+		return executeDropMaterializedView(env, s)
+	case *RefreshMaterializedView:
+		return executeRefreshMaterializedView(env, s)
+	case *AlterViewMaterialize:
+		return executeAlterViewMaterialize(env, s)
+	case *AlterMaterializedViewToView:
+		return executeAlterMaterializedViewToView(env, s)
 	case *AlterTable:
 		return executeAlterTable(env, s)
 	case *Insert:
@@ -217,13 +228,55 @@ func executeDropIndex(env ExecEnv, s *DropIndex) (*ResultSet, error) {
 }
 
 func executeCreateView(env ExecEnv, s *CreateView) (*ResultSet, error) {
-	// Views are not currently stored in tinySQL
-	// In a full implementation, we would store the SELECT statement
-	// and execute it when the view is queried
-	if s.IfNotExists && !s.OrReplace {
-		// Could check if view already exists
+	if _, exists := env.db.Catalog().GetView("main", s.Name); exists {
+		if s.IfNotExists && !s.OrReplace {
+			return nil, nil
+		}
+		if !s.OrReplace {
+			return nil, fmt.Errorf("view %q already exists", s.Name)
+		}
 	}
-	// For now, return success
+	sqlText := s.SQLText
+	if strings.TrimSpace(sqlText) == "" {
+		return nil, fmt.Errorf("CREATE VIEW %s missing stored SQL text", s.Name)
+	}
+	return nil, env.db.Catalog().RegisterView("main", s.Name, sqlText)
+}
+
+func executeCreateMaterializedView(env ExecEnv, s *CreateMaterializedView) (*ResultSet, error) {
+	if _, exists := env.db.Catalog().GetMaterializedView("main", s.Name); exists {
+		if s.IfNotExists && !s.OrReplace {
+			return nil, nil
+		}
+		if !s.OrReplace {
+			return nil, fmt.Errorf("materialized view %q already exists", s.Name)
+		}
+	}
+	if strings.TrimSpace(s.SQLText) == "" {
+		return nil, fmt.Errorf("CREATE MATERIALIZED VIEW %s missing stored SQL text", s.Name)
+	}
+	mv := &storage.CatalogMaterializedView{
+		Schema:         "main",
+		Name:           s.Name,
+		SQLText:        s.SQLText,
+		CacheTableName: materializedViewCacheTableName(s.Name),
+		StaleAfterMs:   s.StaleAfterMs,
+		RefreshEveryMs: s.RefreshEveryMs,
+		DailyAt:        s.DailyAt,
+		Timezone:       s.Timezone,
+		WithData:       s.WithData,
+	}
+	if err := env.db.Catalog().RegisterMaterializedView(mv); err != nil {
+		return nil, err
+	}
+	if err := registerMaterializedViewRefreshJobs(env, mv); err != nil {
+		return nil, err
+	}
+	if s.WithData {
+		if err := refreshMaterializedView(env, s.Name); err != nil {
+			return nil, err
+		}
+	}
 	return nil, nil
 }
 
@@ -271,11 +324,217 @@ func executeDropJob(env ExecEnv, s *DropJob) (*ResultSet, error) {
 }
 
 func executeDropView(env ExecEnv, s *DropView) (*ResultSet, error) {
-	// Views are not currently stored in tinySQL
 	if s.IfExists {
-		// Could check if view exists
+		if _, ok := env.db.Catalog().GetView("main", s.Name); !ok {
+			return nil, nil
+		}
 	}
-	return nil, nil
+	return nil, env.db.Catalog().DeleteView("main", s.Name)
+}
+
+func executeDropMaterializedView(env ExecEnv, s *DropMaterializedView) (*ResultSet, error) {
+	mv, ok := env.db.Catalog().GetMaterializedView("main", s.Name)
+	if !ok {
+		if s.IfExists {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("materialized view %q not found", s.Name)
+	}
+	_ = env.db.DeleteJob(materializedViewIntervalJobName(s.Name))
+	_ = env.db.DeleteJob(materializedViewDailyJobName(s.Name))
+	if _, err := env.db.Get(env.tenant, mv.CacheTableName); err == nil {
+		_ = env.db.Drop(env.tenant, mv.CacheTableName)
+	}
+	return nil, env.db.Catalog().DeleteMaterializedView("main", s.Name)
+}
+
+func executeRefreshMaterializedView(env ExecEnv, s *RefreshMaterializedView) (*ResultSet, error) {
+	_ = s.Concurrently
+	if err := refreshMaterializedView(env, s.Name); err != nil {
+		return nil, err
+	}
+	return &ResultSet{Cols: []string{"refreshed"}, Rows: []Row{{"refreshed": s.Name}}}, nil
+}
+
+func executeAlterViewMaterialize(env ExecEnv, s *AlterViewMaterialize) (*ResultSet, error) {
+	view, ok := env.db.Catalog().GetView("main", s.Name)
+	if !ok {
+		return nil, fmt.Errorf("view %q not found", s.Name)
+	}
+	if _, exists := env.db.Catalog().GetMaterializedView("main", s.Name); exists {
+		return nil, fmt.Errorf("materialized view %q already exists", s.Name)
+	}
+	mv := &storage.CatalogMaterializedView{
+		Schema:         "main",
+		Name:           s.Name,
+		SQLText:        view.SQLText,
+		CacheTableName: materializedViewCacheTableName(s.Name),
+		StaleAfterMs:   s.StaleAfterMs,
+		RefreshEveryMs: s.RefreshEveryMs,
+		DailyAt:        s.DailyAt,
+		Timezone:       s.Timezone,
+		WithData:       s.WithData,
+		CreatedAt:      view.CreatedAt,
+	}
+	if err := env.db.Catalog().DeleteView("main", s.Name); err != nil {
+		return nil, err
+	}
+	if err := env.db.Catalog().RegisterMaterializedView(mv); err != nil {
+		_ = env.db.Catalog().RegisterView("main", s.Name, view.SQLText)
+		return nil, err
+	}
+	if err := registerMaterializedViewRefreshJobs(env, mv); err != nil {
+		return nil, err
+	}
+	if s.WithData {
+		if err := refreshMaterializedView(env, s.Name); err != nil {
+			return nil, err
+		}
+	}
+	return &ResultSet{Cols: []string{"materialized"}, Rows: []Row{{"materialized": s.Name}}}, nil
+}
+
+func executeAlterMaterializedViewToView(env ExecEnv, s *AlterMaterializedViewToView) (*ResultSet, error) {
+	mv, ok := env.db.Catalog().GetMaterializedView("main", s.Name)
+	if !ok {
+		return nil, fmt.Errorf("materialized view %q not found", s.Name)
+	}
+	if _, exists := env.db.Catalog().GetView("main", s.Name); exists {
+		return nil, fmt.Errorf("view %q already exists", s.Name)
+	}
+	_ = env.db.DeleteJob(materializedViewIntervalJobName(s.Name))
+	_ = env.db.DeleteJob(materializedViewDailyJobName(s.Name))
+	if _, err := env.db.Get(env.tenant, mv.CacheTableName); err == nil {
+		_ = env.db.Drop(env.tenant, mv.CacheTableName)
+	}
+	if err := env.db.Catalog().DeleteMaterializedView("main", s.Name); err != nil {
+		return nil, err
+	}
+	if err := env.db.Catalog().RegisterView("main", s.Name, mv.SQLText); err != nil {
+		return nil, err
+	}
+	return &ResultSet{Cols: []string{"view"}, Rows: []Row{{"view": s.Name}}}, nil
+}
+
+func materializedViewCacheTableName(name string) string {
+	return "__mv_" + strings.ToLower(name)
+}
+
+func materializedViewIntervalJobName(name string) string {
+	return "__mv_refresh_" + strings.ToLower(name) + "_interval"
+}
+
+func materializedViewDailyJobName(name string) string {
+	return "__mv_refresh_" + strings.ToLower(name) + "_daily"
+}
+
+func registerMaterializedViewRefreshJobs(env ExecEnv, mv *storage.CatalogMaterializedView) error {
+	if mv.RefreshEveryMs > 0 {
+		if err := env.db.RegisterJob(&storage.CatalogJob{
+			Name:         materializedViewIntervalJobName(mv.Name),
+			SQLText:      "REFRESH MATERIALIZED VIEW " + mv.Name,
+			ScheduleType: "INTERVAL",
+			IntervalMs:   mv.RefreshEveryMs,
+			Enabled:      true,
+			NoOverlap:    true,
+		}); err != nil {
+			return err
+		}
+	}
+	if mv.DailyAt != "" {
+		cronExpr, err := dailyAtToCron(mv.DailyAt)
+		if err != nil {
+			return err
+		}
+		if err := env.db.RegisterJob(&storage.CatalogJob{
+			Name:         materializedViewDailyJobName(mv.Name),
+			SQLText:      "REFRESH MATERIALIZED VIEW " + mv.Name,
+			ScheduleType: "CRON",
+			CronExpr:     cronExpr,
+			Timezone:     mv.Timezone,
+			Enabled:      true,
+			NoOverlap:    true,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func dailyAtToCron(dailyAt string) (string, error) {
+	parts := strings.Split(dailyAt, ":")
+	if len(parts) != 2 {
+		return "", fmt.Errorf("daily refresh time must be HH:MM")
+	}
+	hour, err := strconv.Atoi(parts[0])
+	if err != nil || hour < 0 || hour > 23 {
+		return "", fmt.Errorf("daily refresh hour must be 0..23")
+	}
+	minute, err := strconv.Atoi(parts[1])
+	if err != nil || minute < 0 || minute > 59 {
+		return "", fmt.Errorf("daily refresh minute must be 0..59")
+	}
+	return fmt.Sprintf("0 %d %d * * *", minute, hour), nil
+}
+
+func refreshMaterializedView(env ExecEnv, name string) (err error) {
+	mv, ok := env.db.Catalog().GetMaterializedView("main", name)
+	if !ok {
+		return fmt.Errorf("materialized view %q not found", name)
+	}
+	if !env.db.Catalog().TryBeginMaterializedViewRefresh("main", name) {
+		return fmt.Errorf("materialized view %q is already refreshing", name)
+	}
+
+	start := time.Now()
+	rowCount := int64(0)
+	defer func() {
+		errMsg := ""
+		if err != nil {
+			errMsg = err.Error()
+		}
+		_ = env.db.Catalog().FinishMaterializedViewRefresh("main", name, time.Now(), time.Since(start).Milliseconds(), rowCount, errMsg)
+	}()
+
+	stmt, parseErr := NewParser(mv.SQLText).ParseStatement()
+	if parseErr != nil {
+		return parseErr
+	}
+	sel, ok := stmt.(*Select)
+	if !ok {
+		return fmt.Errorf("materialized view %q query is not a SELECT", name)
+	}
+	rs, execErr := Execute(env.ctx, env.db, env.tenant, sel)
+	if execErr != nil {
+		return execErr
+	}
+	if rs == nil {
+		return fmt.Errorf("materialized view %q query produced no result set", name)
+	}
+
+	cols := make([]storage.Column, len(rs.Cols))
+	for i, c := range rs.Cols {
+		colType := storage.TextType
+		if len(rs.Rows) > 0 {
+			colType = inferType(rs.Rows[0][strings.ToLower(c)])
+		}
+		cols[i] = storage.Column{Name: c, Type: colType}
+	}
+	cache := storage.NewTable(mv.CacheTableName, cols, false)
+	for _, r := range rs.Rows {
+		row := make([]any, len(cols))
+		for i, c := range cols {
+			row[i] = r[strings.ToLower(c.Name)]
+		}
+		cache.Rows = append(cache.Rows, row)
+	}
+	rowCount = int64(len(cache.Rows))
+	if _, err := env.db.Get(env.tenant, mv.CacheTableName); err == nil {
+		if err := env.db.Drop(env.tenant, mv.CacheTableName); err != nil {
+			return err
+		}
+	}
+	return env.db.Put(env.tenant, cache)
 }
 
 func executeAlterTable(env ExecEnv, s *AlterTable) (*ResultSet, error) {
@@ -328,6 +587,7 @@ func executeInsert(env ExecEnv, s *Insert) (*ResultSet, error) {
 
 func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) (*ResultSet, error) {
 	expected := len(t.Cols)
+	returningRows := make([]Row, 0, len(s.Rows))
 	for _, vals := range s.Rows {
 		if len(vals) != expected {
 			return nil, fmt.Errorf("INSERT expects %d values", expected)
@@ -357,9 +617,15 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 		}
 		// FTS index is updated after all trigger hooks so it reflects final row data.
 		ftsIndexRow(env.tenant+"/"+s.Table, s.Table, len(t.Rows)-1, nil, row, colNames(t.Cols))
+		if len(s.Returning) > 0 {
+			returningRows = append(returningRows, newRow)
+		}
 	}
 	t.Version++
 	t.MarkDirtyFrom(len(t.Rows) - len(s.Rows))
+	if len(s.Returning) > 0 {
+		return projectReturningRows(env, t.Cols, s.Returning, returningRows)
+	}
 	return nil, nil
 }
 
@@ -372,6 +638,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 		}
 		colIdx[i] = idx
 	}
+	returningRows := make([]Row, 0, len(s.Rows))
 	for _, vals := range s.Rows {
 		if len(vals) != len(s.Cols) {
 			return nil, fmt.Errorf("INSERT column/value mismatch")
@@ -404,9 +671,15 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 		}
 		// FTS index is updated after all trigger hooks so it reflects final row data.
 		ftsIndexRow(env.tenant+"/"+s.Table, s.Table, len(t.Rows)-1, nil, row, colNames(t.Cols))
+		if len(s.Returning) > 0 {
+			returningRows = append(returningRows, newRow)
+		}
 	}
 	t.Version++
 	t.MarkDirtyFrom(len(t.Rows) - len(s.Rows))
+	if len(s.Returning) > 0 {
+		return projectReturningRows(env, t.Cols, s.Returning, returningRows)
+	}
 	return nil, nil
 }
 
@@ -428,6 +701,7 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 		setIdx[i] = ex
 	}
 	n := 0
+	returningRows := make([]Row, 0)
 	tablePrefix := strings.ToLower(s.Table) + "."
 	columnNames := colNames(t.Cols)
 	for ri, r := range t.Rows {
@@ -464,12 +738,18 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 			if err := fireTriggers(env, s.Table, "AFTER", "UPDATE", newRow, oldRow); err != nil {
 				return nil, err
 			}
+			if len(s.Returning) > 0 {
+				returningRows = append(returningRows, newRow)
+			}
 			n++
 		}
 	}
 	t.Version++
 	if n > 0 {
 		t.MarkDirtyFrom(-1) // UPDATE is non-append; force full-table WAL
+	}
+	if len(s.Returning) > 0 {
+		return projectReturningRows(env, t.Cols, s.Returning, returningRows)
 	}
 	return &ResultSet{Cols: []string{"updated"}, Rows: []Row{{"updated": n}}}, nil
 }
@@ -487,6 +767,9 @@ type simpleUpdateSet struct {
 }
 
 func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, error) {
+	if len(s.Returning) > 0 {
+		return nil, false, nil
+	}
 	plan, ok, err := buildSimpleUpdatePlan(env, s)
 	if !ok || err != nil {
 		return nil, ok, err
@@ -576,6 +859,19 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	}
 	if s.Where == nil {
 		del := len(t.Rows)
+		if len(s.Returning) > 0 {
+			tablePrefix := strings.ToLower(s.Table) + "."
+			returningRows := make([]Row, 0, len(t.Rows))
+			for _, r := range t.Rows {
+				returningRows = append(returningRows, buildTableRow(t.Cols, tablePrefix, r))
+			}
+			if del > 0 {
+				t.Rows = nil
+				t.Version++
+				t.MarkDirtyFrom(-1) // DELETE is non-append; force full-table WAL
+			}
+			return projectReturningRows(env, t.Cols, s.Returning, returningRows)
+		}
 		if del > 0 {
 			t.Rows = nil
 			t.Version++
@@ -587,7 +883,7 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	// Fast path: no triggers and a simple predicate – skip the full Row map allocation.
 	hasTriggers := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("BEFORE"), storage.TriggerEvent("DELETE"))) > 0 ||
 		len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("AFTER"), storage.TriggerEvent("DELETE"))) > 0
-	if !hasTriggers && isSimpleRawPredicate(s.Where) {
+	if !hasTriggers && len(s.Returning) == 0 && isSimpleRawPredicate(s.Where) {
 		colIndex := simpleColumnIndex(t, s.Table)
 		rawPlan := &simpleSelectPlan{colIndex: colIndex, where: s.Where, filter: buildRawFilter(colIndex, s.Where)}
 		kept := make([][]any, 0, len(t.Rows))
@@ -620,6 +916,7 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	// Slow path: triggers present or complex predicate – build full Row maps.
 	kept := make([][]any, 0, len(t.Rows))
 	del := 0
+	returningRows := make([]Row, 0)
 	tablePrefix := strings.ToLower(s.Table) + "."
 	for _, r := range t.Rows {
 		if err := checkCtx(env.ctx); err != nil {
@@ -640,6 +937,9 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 			if err := fireTriggers(env, s.Table, "AFTER", "DELETE", nil, row); err != nil {
 				return nil, err
 			}
+			if len(s.Returning) > 0 {
+				returningRows = append(returningRows, row)
+			}
 			del++
 		}
 	}
@@ -647,6 +947,9 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	t.Version++
 	if del > 0 {
 		t.MarkDirtyFrom(-1) // DELETE is non-append; force full-table WAL
+	}
+	if len(s.Returning) > 0 {
+		return projectReturningRows(env, t.Cols, s.Returning, returningRows)
 	}
 	return &ResultSet{Cols: []string{"deleted"}, Rows: []Row{{"deleted": del}}}, nil
 }
@@ -660,6 +963,63 @@ func buildTableRow(cols []storage.Column, tablePrefix string, values []any) Row 
 		row[tablePrefix+key] = val
 	}
 	return row
+}
+
+func projectReturningRows(env ExecEnv, cols []storage.Column, projs []SelectItem, rows []Row) (*ResultSet, error) {
+	outRows := make([]Row, 0, len(rows))
+	outCols := returningOutputCols(cols, projs)
+
+	for _, r := range rows {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, err
+		}
+		out := Row{}
+		for i, it := range projs {
+			if it.Star {
+				for _, c := range cols {
+					name := c.Name
+					lowerName := strings.ToLower(name)
+					val, _ := getValLower(r, lowerName)
+					putVal(out, name, val)
+				}
+				continue
+			}
+			val, err := evalExpr(env, it.Expr, r)
+			if err != nil {
+				return nil, err
+			}
+			putVal(out, projName(it, i), val)
+		}
+		outRows = append(outRows, out)
+	}
+
+	return &ResultSet{Cols: outCols, Rows: outRows}, nil
+}
+
+func returningOutputCols(cols []storage.Column, projs []SelectItem) []string {
+	outCols := make([]string, 0, len(projs))
+	seen := make(map[string]struct{}, len(projs))
+	for i, it := range projs {
+		if it.Star {
+			for _, c := range cols {
+				key := strings.ToLower(c.Name)
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+				outCols = append(outCols, c.Name)
+			}
+			continue
+		}
+		name := projName(it, i)
+		key := strings.ToLower(name)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		outCols = append(outCols, name)
+	}
+	return outCols
 }
 
 // resolveFromClause resolves the FROM clause of a SELECT statement and returns the initial rows.
@@ -775,6 +1135,8 @@ func resolveCatalogTable(env ExecEnv, s *Select) ([]Row, error) {
 	name := strings.ToLower(parts[1])
 
 	switch name {
+	case "objects":
+		return allObjectStatusRows(env), nil
 	case "tables":
 		return resolveCatalogTables(env, s)
 	case "columns":
@@ -787,6 +1149,8 @@ func resolveCatalogTable(env ExecEnv, s *Select) ([]Row, error) {
 		return resolveCatalogJobHistory(env, s)
 	case "views":
 		return resolveCatalogViews(env, s)
+	case "materialized_views":
+		return resolveCatalogMaterializedViews(env, s)
 	default:
 		return nil, fmt.Errorf("unknown catalog table: %s", name)
 	}
@@ -810,6 +1174,7 @@ func resolveCatalogTables(env ExecEnv, s *Select) ([]Row, error) {
 			putVal(r, "schema", ct.Schema)
 			putVal(r, "type", ct.Type)
 			putVal(r, "row_count", ct.RowCount)
+			putVal(r, "rows", ct.RowCount)
 			putVal(r, "created_at", ct.CreatedAt)
 			putVal(r, "updated_at", ct.UpdatedAt)
 		} else {
@@ -827,6 +1192,7 @@ func resolveCatalogTables(env ExecEnv, s *Select) ([]Row, error) {
 		putVal(r, "name", ct.Name)
 		putVal(r, "type", ct.Type)
 		putVal(r, "row_count", ct.RowCount)
+		putVal(r, "rows", ct.RowCount)
 		putVal(r, "created_at", ct.CreatedAt)
 		putVal(r, "updated_at", ct.UpdatedAt)
 		if s.From.Alias != "" {
@@ -963,6 +1329,31 @@ func resolveCatalogViews(env ExecEnv, s *Select) ([]Row, error) {
 	return leftRows, nil
 }
 
+// resolveCatalogMaterializedViews handles catalog.materialized_views
+func resolveCatalogMaterializedViews(env ExecEnv, s *Select) ([]Row, error) {
+	views := env.db.Catalog().GetMaterializedViews()
+	leftRows := make([]Row, len(views))
+	for i, v := range views {
+		leftRows[i] = make(Row)
+		putVal(leftRows[i], "schema", v.Schema)
+		putVal(leftRows[i], "name", v.Name)
+		putVal(leftRows[i], "sql_text", v.SQLText)
+		putVal(leftRows[i], "cache_table_name", v.CacheTableName)
+		putVal(leftRows[i], "stale_after_ms", v.StaleAfterMs)
+		putVal(leftRows[i], "refresh_every_ms", v.RefreshEveryMs)
+		putVal(leftRows[i], "daily_at", v.DailyAt)
+		putVal(leftRows[i], "timezone", v.Timezone)
+		putVal(leftRows[i], "with_data", v.WithData)
+		putVal(leftRows[i], "last_refresh_at", v.LastRefreshAt)
+		putVal(leftRows[i], "last_duration_ms", v.LastDurationMs)
+		putVal(leftRows[i], "last_error", v.LastError)
+		putVal(leftRows[i], "is_refreshing", v.IsRefreshing)
+		putVal(leftRows[i], "created_at", v.CreatedAt)
+		putVal(leftRows[i], "updated_at", v.UpdatedAt)
+	}
+	return leftRows, nil
+}
+
 // resolveSysVirtualTable handles sys.* virtual tables
 func resolveSysVirtualTable(env ExecEnv, s *Select) ([]Row, error) {
 	parts := strings.SplitN(s.From.Table, ".", 2)
@@ -997,11 +1388,114 @@ func resolveRegularTable(cteEnv ExecEnv, env ExecEnv, s *Select) ([]Row, error) 
 	} else {
 		leftT, err = env.db.Get(env.tenant, s.From.Table)
 	}
-	if err != nil {
-		return nil, err
+	if err == nil {
+		leftRows, _ := rowsFromTable(leftT, aliasOr(s.From))
+		return leftRows, nil
 	}
-	leftRows, _ := rowsFromTable(leftT, aliasOr(s.From))
-	return leftRows, nil
+
+	if rows, found, viewErr := resolveMaterializedViewSource(env, s); found || viewErr != nil {
+		return rows, viewErr
+	}
+	if rows, found, viewErr := resolveViewSource(env, s); found || viewErr != nil {
+		return rows, viewErr
+	}
+	return nil, err
+}
+
+func resolveMaterializedViewSource(env ExecEnv, s *Select) ([]Row, bool, error) {
+	mv, ok := env.db.Catalog().GetMaterializedView("main", s.From.Table)
+	if !ok {
+		return nil, false, nil
+	}
+	cache, err := ensureMaterializedViewCache(env, s.From.Table, mv)
+	if err != nil {
+		return nil, true, err
+	}
+	leftRows, _ := rowsFromTable(cache, aliasOr(s.From))
+	return leftRows, true, nil
+}
+
+func ensureMaterializedViewCache(env ExecEnv, sourceName string, mv *storage.CatalogMaterializedView) (*storage.Table, error) {
+	cache, cacheErr := env.db.Get(env.tenant, mv.CacheTableName)
+	cacheExists := cacheErr == nil
+
+	needsRefresh := false
+	if !cacheExists {
+		needsRefresh = mv.WithData || mv.StaleAfterMs > 0
+		if !needsRefresh {
+			return nil, fmt.Errorf("materialized view %q has no data", sourceName)
+		}
+	} else if mv.StaleAfterMs > 0 {
+		if mv.LastRefreshAt == nil {
+			needsRefresh = true
+		} else {
+			needsRefresh = time.Since(*mv.LastRefreshAt) >= time.Duration(mv.StaleAfterMs)*time.Millisecond
+		}
+	}
+
+	if needsRefresh {
+		if err := refreshMaterializedView(env, sourceName); err != nil && !cacheExists {
+			return nil, err
+		}
+		refreshed, err := env.db.Get(env.tenant, mv.CacheTableName)
+		if err == nil {
+			cache = refreshed
+			cacheExists = true
+		}
+	}
+	if !cacheExists {
+		return nil, cacheErr
+	}
+	return cache, nil
+}
+
+func resolveViewSource(env ExecEnv, s *Select) ([]Row, bool, error) {
+	view, ok := env.db.Catalog().GetView("main", s.From.Table)
+	if !ok {
+		return nil, false, nil
+	}
+	if env.viewDepth >= 16 {
+		return nil, true, fmt.Errorf("view expansion exceeded depth limit")
+	}
+	stmt, err := NewParser(view.SQLText).ParseStatement()
+	if err != nil {
+		return nil, true, fmt.Errorf("view %q parse failed: %w", view.Name, err)
+	}
+	sel, ok := stmt.(*Select)
+	if !ok {
+		return nil, true, fmt.Errorf("view %q query is not a SELECT", view.Name)
+	}
+	viewEnv := env
+	viewEnv.ctes = nil
+	viewEnv.viewDepth++
+	rs, err := executeSelect(viewEnv, sel)
+	if err != nil {
+		return nil, true, err
+	}
+	return rowsFromResultSet(rs, aliasOr(s.From)), true, nil
+}
+
+func rowsFromResultSet(rs *ResultSet, alias string) []Row {
+	if rs == nil {
+		return nil
+	}
+	rows := make([]Row, len(rs.Rows))
+	for i, r := range rs.Rows {
+		out := make(Row, len(rs.Cols)*2)
+		for _, c := range rs.Cols {
+			key := strings.ToLower(c)
+			val, ok := getValLower(r, key)
+			if !ok {
+				continue
+			}
+			putVal(out, c, val)
+			if alias != "" {
+				putVal(out, alias+"."+c, val)
+			}
+		}
+		rows[i] = out
+	}
+	return rows
 }
 
 // applyDistinctOn applies DISTINCT ON semantics: keep first row per distinct-on key.
@@ -1355,6 +1849,9 @@ func executeSimpleJoinFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error)
 
 func buildSimpleJoinPlan(env ExecEnv, s *Select) (*simpleJoinPlan, bool, error) {
 	if !simpleJoinSelectEligible(s) {
+		return nil, false, nil
+	}
+	if isCatalogViewSource(env, s.From.Table) || isCatalogViewSource(env, s.Joins[0].Right.Table) {
 		return nil, false, nil
 	}
 	if anyAggInSelect(s.Projs) || anyWindowInSelect(s.Projs) || !isSimpleRawPredicate(s.Where) {
@@ -1866,7 +2363,16 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 
 	table, err := env.db.Get(env.tenant, s.From.Table)
 	if err != nil {
-		return nil, true, err
+		if mv, ok := env.db.Catalog().GetMaterializedView("main", s.From.Table); ok {
+			table, err = ensureMaterializedViewCache(env, s.From.Table, mv)
+			if err != nil {
+				return nil, true, err
+			}
+		} else if isCatalogViewSource(env, s.From.Table) {
+			return nil, false, nil
+		} else {
+			return nil, true, err
+		}
 	}
 	colIndex := simpleColumnIndex(table, aliasOr(s.From))
 	groupCol, ok := colIndex[strings.ToLower(groupRef.Name)]
@@ -2184,7 +2690,16 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 
 	table, err := env.db.Get(env.tenant, s.From.Table)
 	if err != nil {
-		return nil, true, err
+		if mv, ok := env.db.Catalog().GetMaterializedView("main", s.From.Table); ok {
+			table, err = ensureMaterializedViewCache(env, s.From.Table, mv)
+			if err != nil {
+				return nil, true, err
+			}
+		} else if isCatalogViewSource(env, s.From.Table) {
+			return nil, false, nil
+		} else {
+			return nil, true, err
+		}
 	}
 	colIndex := simpleColumnIndex(table, aliasOr(s.From))
 
@@ -2213,6 +2728,19 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 		offset:     s.Offset,
 		outputCols: outputCols,
 	}, true, nil
+}
+
+func isCatalogViewSource(env ExecEnv, name string) bool {
+	if name == "" {
+		return false
+	}
+	if _, ok := env.db.Catalog().GetView("main", name); ok {
+		return true
+	}
+	if _, ok := env.db.Catalog().GetMaterializedView("main", name); ok {
+		return true
+	}
+	return false
 }
 
 func simpleSelectEligible(s *Select) bool {
