@@ -75,8 +75,14 @@ func (s *Scheduler) Start() error {
 	// Start cron scheduler
 	s.cron.Start()
 
-	// Start interval/once scheduler in goroutine
-	go s.runIntervalScheduler()
+	// Capture the stop channel under the lock so the goroutine never reads
+	// s.stopCh directly; Stop() may write s.stopCh = nil concurrently.
+	stopCh := s.stopCh
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.runIntervalScheduler(stopCh)
+	}()
 	s.started = true
 
 	log.Printf("Job scheduler started with %d jobs", len(jobs))
@@ -186,14 +192,17 @@ func (s *Scheduler) unscheduleJobLocked(name string) {
 	}
 }
 
-// runIntervalScheduler handles INTERVAL and ONCE jobs
-func (s *Scheduler) runIntervalScheduler() {
+// runIntervalScheduler handles INTERVAL and ONCE jobs.
+// stopCh is passed by value (captured under the scheduler lock in Start) so
+// this goroutine never reads the s.stopCh field, avoiding a data race with
+// Stop() which writes s.stopCh = nil while holding s.mu.
+func (s *Scheduler) runIntervalScheduler(stopCh <-chan struct{}) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-s.stopCh:
+		case <-stopCh:
 			return
 		case now := <-ticker.C:
 			s.checkIntervalJobs(now)
