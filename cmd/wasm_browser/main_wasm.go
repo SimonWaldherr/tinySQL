@@ -5,9 +5,11 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"syscall/js"
 	"time"
 
@@ -70,6 +72,51 @@ func validateArgs(args []js.Value, minCount int, expectedType js.Type) error {
 	return nil
 }
 
+func currentStorageDB() *storage.DB {
+	if current := drv.CurrentDefaultDB(); current != nil {
+		wasmStorageDB = current
+		return current
+	}
+	return wasmStorageDB
+}
+
+func bindStorageDB(next *storage.DB, dsn string) error {
+	if next == nil {
+		next = storage.NewDB()
+	}
+	if dsn == "" {
+		dsn = "mem://?tenant=default"
+	}
+
+	if tx != nil {
+		if err := tx.Rollback(); err != nil {
+			logError("Failed to rollback active transaction during storage switch", err)
+		}
+		tx = nil
+	}
+	if db != nil {
+		if err := db.Close(); err != nil {
+			logError("Failed to close existing connection", err)
+		}
+		db = nil
+	}
+
+	wasmStorageDB = next
+	drv.SetDefaultDB(wasmStorageDB)
+
+	var err error
+	db, err = sql.Open("tinysql", dsn)
+	if err != nil {
+		return err
+	}
+	if err = db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		db = nil
+		return fmt.Errorf("connection test failed: %w", err)
+	}
+	return nil
+}
+
 // jsOpen opens a database connection
 func jsOpen(this js.Value, args []js.Value) any {
 	logInfo("Opening database connection...")
@@ -85,36 +132,65 @@ func jsOpen(this js.Value, args []js.Value) any {
 		logInfo(fmt.Sprintf("Using default DSN: %s", dsn))
 	}
 
-	// Close existing connection if any
-	if db != nil {
-		logInfo("Closing existing database connection...")
-		if err := db.Close(); err != nil {
-			logError("Failed to close existing connection", err)
-		}
-		db = nil
-		tx = nil
-	}
-
-	// Create an underlying storage DB and set it as default for the driver
-	wasmStorageDB = storage.NewDB()
-	drv.SetDefaultDB(wasmStorageDB)
-
-	// Open new connection
-	var err error
-	db, err = sql.Open("tinysql", dsn)
-	if err != nil {
+	if err := bindStorageDB(storage.NewDB(), dsn); err != nil {
 		logError("Failed to open database", err)
 		return jsonResponse(APIResponse{Success: false, Error: err.Error()})
 	}
 
-	// Test the connection
-	if err = db.PingContext(ctx); err != nil {
-		logError("Database ping failed", err)
-		return jsonResponse(APIResponse{Success: false, Error: fmt.Sprintf("connection test failed: %v", err)})
-	}
-
 	logInfo("Database connection established successfully")
 	return jsonResponse(APIResponse{Success: true, Message: "Database opened successfully"})
+}
+
+// jsExportDB serializes the current in-memory database as a base64 GOB snapshot.
+func jsExportDB(this js.Value, args []js.Value) any {
+	source := currentStorageDB()
+	if source == nil {
+		return jsonResponse(APIResponse{Success: false, Error: "database not opened"})
+	}
+	data, err := storage.SaveToBytes(source)
+	if err != nil {
+		logError("Failed to export database", err)
+		return jsonResponse(APIResponse{Success: false, Error: err.Error()})
+	}
+	return jsonResponse(map[string]any{
+		"success":    true,
+		"message":    "Database exported successfully",
+		"data":       base64.StdEncoding.EncodeToString(data),
+		"size_bytes": len(data),
+	})
+}
+
+// jsImportDB replaces the current in-memory database with a base64 GOB snapshot.
+func jsImportDB(this js.Value, args []js.Value) any {
+	if err := validateArgs(args, 1, js.TypeString); err != nil {
+		return jsonResponse(APIResponse{Success: false, Error: err.Error()})
+	}
+
+	encoded := strings.TrimSpace(args[0].String())
+	if encoded == "" {
+		return jsonResponse(APIResponse{Success: false, Error: "snapshot must not be empty"})
+	}
+
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return jsonResponse(APIResponse{Success: false, Error: fmt.Sprintf("invalid base64 snapshot: %v", err)})
+	}
+	loaded, err := storage.LoadFromBytes(data)
+	if err != nil {
+		logError("Failed to import database", err)
+		return jsonResponse(APIResponse{Success: false, Error: err.Error()})
+	}
+	if err = bindStorageDB(loaded, "mem://?tenant=default"); err != nil {
+		logError("Failed to bind imported database", err)
+		return jsonResponse(APIResponse{Success: false, Error: err.Error()})
+	}
+
+	logInfo("Database snapshot imported successfully")
+	return jsonResponse(map[string]any{
+		"success":    true,
+		"message":    "Database imported successfully",
+		"size_bytes": len(data),
+	})
 }
 
 // jsBegin starts a new transaction
@@ -509,6 +585,8 @@ func registerAPI() {
 	// SQL operations
 	api.Set("exec", retain(jsExec))
 	api.Set("query", retain(jsQuery))
+	api.Set("exportDB", retain(jsExportDB))
+	api.Set("importDB", retain(jsImportDB))
 
 	// Explain / schema helpers
 	api.Set("explain", retain(jsExplain))
@@ -526,7 +604,7 @@ func registerAPI() {
 		detail := js.Global().Get("Object").New()
 		detail.Set("version", "1.0.0")
 		apiArr := js.Global().Get("Array").New()
-		for _, m := range []string{"open", "close", "status", "begin", "commit", "rollback", "exec", "query", "explain", "listTables", "describeTable"} {
+		for _, m := range []string{"open", "close", "status", "begin", "commit", "rollback", "exec", "query", "exportDB", "importDB", "explain", "listTables", "describeTable"} {
 			apiArr.Call("push", m)
 		}
 		detail.Set("api", apiArr)

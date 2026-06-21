@@ -155,6 +155,19 @@ type (
 // Statement is the root interface for all parsed SQL statements.
 type Statement interface{}
 
+// Explain represents an EXPLAIN statement around another statement.
+type Explain struct {
+	Statement Statement
+}
+
+// Pragma represents a SQLite-compatible PRAGMA statement.
+type Pragma struct {
+	Name   string
+	Schema string
+	Args   []string
+	Value  *string
+}
+
 // CreateTable represents a CREATE TABLE statement.
 type CreateTable struct {
 	Name         string
@@ -206,16 +219,17 @@ type DropView struct {
 
 // CreateMaterializedView represents a CREATE MATERIALIZED VIEW statement.
 type CreateMaterializedView struct {
-	Name           string
-	Select         *Select
-	SQLText        string
-	IfNotExists    bool
-	OrReplace      bool
-	WithData       bool
-	StaleAfterMs   int64
-	RefreshEveryMs int64
-	DailyAt        string
-	Timezone       string
+	Name               string
+	Select             *Select
+	SQLText            string
+	IfNotExists        bool
+	OrReplace          bool
+	WithData           bool
+	StaleAfterMs       int64
+	RefreshEveryMs     int64
+	DailyAt            string
+	Timezone           string
+	InvalidateOnChange bool
 }
 
 // DropMaterializedView represents a DROP MATERIALIZED VIEW statement.
@@ -232,12 +246,13 @@ type RefreshMaterializedView struct {
 
 // AlterViewMaterialize represents ALTER VIEW ... MATERIALIZE.
 type AlterViewMaterialize struct {
-	Name           string
-	WithData       bool
-	StaleAfterMs   int64
-	RefreshEveryMs int64
-	DailyAt        string
-	Timezone       string
+	Name               string
+	WithData           bool
+	StaleAfterMs       int64
+	RefreshEveryMs     int64
+	DailyAt            string
+	Timezone           string
+	InvalidateOnChange bool
 }
 
 // AlterMaterializedViewToView represents ALTER MATERIALIZED VIEW ... TO VIEW.
@@ -431,6 +446,10 @@ func (p *Parser) ParseStatement() (Statement, error) {
 	}
 
 	switch p.cur.Val {
+	case "EXPLAIN":
+		return p.parseExplain()
+	case "PRAGMA":
+		return p.parsePragma()
 	case "CREATE":
 		return p.parseCreate()
 	case "DROP":
@@ -450,6 +469,96 @@ func (p *Parser) ParseStatement() (Statement, error) {
 	default:
 		return p.parseBareTableSelect()
 	}
+}
+
+func (p *Parser) parseExplain() (Statement, error) {
+	p.next()
+	stmt, err := p.ParseStatement()
+	if err != nil {
+		return nil, err
+	}
+	return &Explain{Statement: stmt}, nil
+}
+
+func (p *Parser) parsePragma() (Statement, error) {
+	p.next()
+	name := p.parseIdentLike()
+	if name == "" {
+		return nil, p.errf("expected PRAGMA name")
+	}
+	schema := ""
+	if p.cur.Typ == tSymbol && p.cur.Val == "." {
+		schema = name
+		p.next()
+		name = p.parseIdentLike()
+		if name == "" {
+			return nil, p.errf("expected PRAGMA name after schema")
+		}
+	}
+
+	stmt := &Pragma{Name: name, Schema: schema}
+	if p.cur.Typ == tSymbol && p.cur.Val == "(" {
+		p.next()
+		args, err := p.parsePragmaArgs()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Args = args
+	}
+	if p.cur.Typ == tSymbol && p.cur.Val == "=" {
+		p.next()
+		value, err := p.parsePragmaValue()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Value = &value
+	}
+	if p.cur.Typ == tSymbol && p.cur.Val == ";" {
+		p.next()
+	}
+	if p.cur.Typ != tEOF {
+		return nil, p.errf("unexpected token after PRAGMA")
+	}
+	return stmt, nil
+}
+
+func (p *Parser) parsePragmaArgs() ([]string, error) {
+	args := make([]string, 0, 1)
+	var b strings.Builder
+	for p.cur.Typ != tEOF {
+		if p.cur.Typ == tSymbol && p.cur.Val == ")" {
+			if strings.TrimSpace(b.String()) != "" {
+				args = append(args, strings.TrimSpace(b.String()))
+			}
+			p.next()
+			return args, nil
+		}
+		if p.cur.Typ == tSymbol && p.cur.Val == "," {
+			args = append(args, strings.TrimSpace(b.String()))
+			b.Reset()
+			p.next()
+			continue
+		}
+		b.WriteString(p.cur.Val)
+		p.next()
+	}
+	return nil, p.errf("expected ')' after PRAGMA arguments")
+}
+
+func (p *Parser) parsePragmaValue() (string, error) {
+	var b strings.Builder
+	for p.cur.Typ != tEOF {
+		if p.cur.Typ == tSymbol && p.cur.Val == ";" {
+			break
+		}
+		b.WriteString(p.cur.Val)
+		p.next()
+	}
+	value := strings.TrimSpace(b.String())
+	if value == "" {
+		return "", p.errf("expected PRAGMA value")
+	}
+	return value, nil
 }
 
 func (p *Parser) parseCreate() (Statement, error) {
@@ -1201,6 +1310,10 @@ func (p *Parser) parseCreateMaterializedView(orReplace bool) (Statement, error) 
 			if err := p.parseMaterializedWithData(mv); err != nil {
 				return nil, err
 			}
+		case "INVALIDATE":
+			if err := p.parseMaterializedInvalidateClause(mv); err != nil {
+				return nil, err
+			}
 		default:
 			return mv, nil
 		}
@@ -1276,6 +1389,18 @@ func (p *Parser) parseMaterializedWithData(mv *CreateMaterializedView) error {
 		return err
 	}
 	mv.WithData = true
+	return nil
+}
+
+func (p *Parser) parseMaterializedInvalidateClause(mv *CreateMaterializedView) error {
+	p.next() // consume INVALIDATE
+	if err := p.expectKeyword("ON"); err != nil {
+		return err
+	}
+	if err := p.expectKeyword("CHANGE"); err != nil {
+		return err
+	}
+	mv.InvalidateOnChange = true
 	return nil
 }
 
@@ -1475,24 +1600,30 @@ func (p *Parser) parseAlterView() (Statement, error) {
 			if err := p.parseMaterializedWithData(mv); err != nil {
 				return nil, err
 			}
+		case "INVALIDATE":
+			if err := p.parseMaterializedInvalidateClause(mv); err != nil {
+				return nil, err
+			}
 		default:
 			return &AlterViewMaterialize{
-				Name:           name,
-				WithData:       mv.WithData,
-				StaleAfterMs:   mv.StaleAfterMs,
-				RefreshEveryMs: mv.RefreshEveryMs,
-				DailyAt:        mv.DailyAt,
-				Timezone:       mv.Timezone,
+				Name:               name,
+				WithData:           mv.WithData,
+				StaleAfterMs:       mv.StaleAfterMs,
+				RefreshEveryMs:     mv.RefreshEveryMs,
+				DailyAt:            mv.DailyAt,
+				Timezone:           mv.Timezone,
+				InvalidateOnChange: mv.InvalidateOnChange,
 			}, nil
 		}
 	}
 	return &AlterViewMaterialize{
-		Name:           name,
-		WithData:       mv.WithData,
-		StaleAfterMs:   mv.StaleAfterMs,
-		RefreshEveryMs: mv.RefreshEveryMs,
-		DailyAt:        mv.DailyAt,
-		Timezone:       mv.Timezone,
+		Name:               name,
+		WithData:           mv.WithData,
+		StaleAfterMs:       mv.StaleAfterMs,
+		RefreshEveryMs:     mv.RefreshEveryMs,
+		DailyAt:            mv.DailyAt,
+		Timezone:           mv.Timezone,
+		InvalidateOnChange: mv.InvalidateOnChange,
 	}, nil
 }
 

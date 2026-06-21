@@ -7,6 +7,8 @@ import (
 	"sort"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -96,6 +98,59 @@ func TestStorageModeString(t *testing.T) {
 		if got := tc.m.String(); got != tc.want {
 			t.Errorf("StorageMode(%d).String() = %q, want %q", tc.m, got, tc.want)
 		}
+	}
+}
+
+func TestDefaultStorageConfig(t *testing.T) {
+	tests := []struct {
+		mode               StorageMode
+		wantMemoryBytes    int64
+		wantCheckpointEach uint64
+		wantInterval       time.Duration
+	}{
+		{ModeMemory, 0, 0, 0},
+		{ModeHybrid, 256 * 1024 * 1024, 0, 0},
+		{ModeIndex, 64 * 1024 * 1024, 0, 0},
+		{ModeWAL, 0, 32, 30 * time.Second},
+		{ModeAdvancedWAL, 0, 1000, 5 * time.Minute},
+	}
+
+	for _, tc := range tests {
+		got := DefaultStorageConfig(tc.mode)
+		if got.Mode != tc.mode {
+			t.Fatalf("mode = %v, want %v", got.Mode, tc.mode)
+		}
+		if got.MaxMemoryBytes != tc.wantMemoryBytes {
+			t.Fatalf("MaxMemoryBytes for %v = %d, want %d", tc.mode, got.MaxMemoryBytes, tc.wantMemoryBytes)
+		}
+		if got.CheckpointEvery != tc.wantCheckpointEach {
+			t.Fatalf("CheckpointEvery for %v = %d, want %d", tc.mode, got.CheckpointEvery, tc.wantCheckpointEach)
+		}
+		if got.CheckpointInterval != tc.wantInterval {
+			t.Fatalf("CheckpointInterval for %v = %s, want %s", tc.mode, got.CheckpointInterval, tc.wantInterval)
+		}
+	}
+}
+
+func TestUUIDHelpers(t *testing.T) {
+	want := uuid.MustParse("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+	got, err := ParseUUID(want.String())
+	if err != nil {
+		t.Fatalf("ParseUUID failed: %v", err)
+	}
+	if got != want {
+		t.Fatalf("ParseUUID = %s, want %s", got, want)
+	}
+	if _, err := ParseUUID("not-a-uuid"); err == nil {
+		t.Fatal("expected invalid UUID to fail")
+	}
+	b := UUIDToBytes(want)
+	gotFromBytes, err := uuid.FromBytes(b)
+	if err != nil {
+		t.Fatalf("uuid.FromBytes failed: %v", err)
+	}
+	if len(b) != 16 || gotFromBytes != want {
+		t.Fatalf("UUIDToBytes = %v", b)
 	}
 }
 

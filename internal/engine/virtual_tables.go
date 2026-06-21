@@ -31,6 +31,7 @@ import (
 //   sys.config       – database configuration
 //   sys.connections  – active tenant / connection info
 //   sys.objects      – unified status for tables, views, jobs, triggers, …
+//   sys.dependencies – dependency graph for views and materialized views
 // ============================================================================
 
 // startTime records when the process started so sys.status can report uptime.
@@ -43,6 +44,8 @@ func resolveSysTable(env ExecEnv, name string) ([]Row, error) {
 	switch name {
 	case "objects":
 		return allObjectStatusRows(env), nil
+	case "dependencies":
+		return dependencyRows(env), nil
 	case "tables":
 		return sysTablesRows(env), nil
 	case "columns":
@@ -76,15 +79,38 @@ func resolveSysTable(env ExecEnv, name string) ([]Row, error) {
 	}
 }
 
+// ─────────────────────────── sys.dependencies / catalog.dependencies ─────
+
+func dependencyRows(env ExecEnv) []Row {
+	deps := env.db.Catalog().GetDependencies()
+	rows := make([]Row, len(deps))
+	for i, dep := range deps {
+		r := make(Row)
+		putVal(r, "schema", dep.Schema)
+		putVal(r, "object_name", dep.ObjectName)
+		putVal(r, "object_type", dep.ObjectType)
+		putVal(r, "depends_on_schema", dep.DependsOnSchema)
+		putVal(r, "depends_on_name", dep.DependsOnName)
+		putVal(r, "depends_on_type", dep.DependsOnType)
+		putVal(r, "dependency_type", dep.DependencyType)
+		putVal(r, "created_at", dep.CreatedAt)
+		rows[i] = r
+	}
+	return rows
+}
+
 // ─────────────────────────── sys.tables ──────────────────────────────────
 
 func sysTablesRows(env ExecEnv) []Row {
 	var rows []Row
 	for _, tn := range env.db.ListTenants() {
 		for _, t := range env.db.ListTables(tn) {
+			schema, name := splitObjectName(t.Name)
 			r := make(Row)
 			putVal(r, "tenant", tn)
-			putVal(r, "name", t.Name)
+			putVal(r, "schema", schema)
+			putVal(r, "name", name)
+			putVal(r, "full_name", catalogDisplayName(schema, name))
 			putVal(r, "columns", len(t.Cols))
 			putVal(r, "rows", len(t.Rows))
 			putVal(r, "is_temp", t.IsTemp)
@@ -115,10 +141,12 @@ func tableStatusRows(env ExecEnv) []Row {
 			if strings.HasPrefix(strings.ToLower(t.Name), "__mv_") {
 				continue
 			}
+			schema, name := splitObjectName(t.Name)
 			r := make(Row)
-			putVal(r, "schema", "main")
+			putVal(r, "schema", schema)
 			putVal(r, "tenant", tn)
-			putVal(r, "name", t.Name)
+			putVal(r, "name", name)
+			putVal(r, "full_name", catalogDisplayName(schema, name))
 			putVal(r, "object_type", "TABLE")
 			putVal(r, "status", "ONLINE")
 			putVal(r, "rows", len(t.Rows))
@@ -199,6 +227,7 @@ func materializedViewStatusRows(env ExecEnv) []Row {
 		putVal(r, "stale_after_ms", v.StaleAfterMs)
 		putVal(r, "refresh_every_ms", v.RefreshEveryMs)
 		putVal(r, "daily_at", v.DailyAt)
+		putVal(r, "invalidate_on_change", v.InvalidateOnChange)
 		putVal(r, "sql_text", v.SQLText)
 		putVal(r, "created_at", v.CreatedAt)
 		putVal(r, "updated_at", v.UpdatedAt)
@@ -209,6 +238,9 @@ func materializedViewStatusRows(env ExecEnv) []Row {
 
 func materializedViewIsStale(v *storage.CatalogMaterializedView, cacheExists bool) bool {
 	if !cacheExists {
+		return true
+	}
+	if v.IsStale {
 		return true
 	}
 	if v.StaleAfterMs <= 0 {
@@ -306,10 +338,13 @@ func sysColumnsRows(env ExecEnv) []Row {
 	var rows []Row
 	for _, tn := range env.db.ListTenants() {
 		for _, t := range env.db.ListTables(tn) {
+			schema, tableName := splitObjectName(t.Name)
 			for i, c := range t.Cols {
 				r := make(Row)
 				putVal(r, "tenant", tn)
-				putVal(r, "table_name", t.Name)
+				putVal(r, "schema", schema)
+				putVal(r, "table_name", tableName)
+				putVal(r, "full_table_name", catalogDisplayName(schema, tableName))
 				putVal(r, "name", c.Name)
 				putVal(r, "position", i+1)
 				putVal(r, "data_type", c.Type.String())
@@ -335,13 +370,16 @@ func sysConstraintsRows(env ExecEnv) []Row {
 	var rows []Row
 	for _, tn := range env.db.ListTenants() {
 		for _, t := range env.db.ListTables(tn) {
+			schema, tableName := splitObjectName(t.Name)
 			for _, c := range t.Cols {
 				if c.Constraint == storage.NoConstraint {
 					continue
 				}
 				r := make(Row)
 				putVal(r, "tenant", tn)
-				putVal(r, "table_name", t.Name)
+				putVal(r, "schema", schema)
+				putVal(r, "table_name", tableName)
+				putVal(r, "full_table_name", catalogDisplayName(schema, tableName))
 				putVal(r, "column_name", c.Name)
 				putVal(r, "constraint_type", constraintStr(c.Constraint))
 				if c.ForeignKey != nil {
@@ -396,6 +434,8 @@ func sysMaterializedViewsRows(env ExecEnv) []Row {
 		putVal(r, "timezone", v.Timezone)
 		putVal(r, "last_refresh_at", v.LastRefreshAt)
 		putVal(r, "last_error", v.LastError)
+		putVal(r, "is_stale", v.IsStale)
+		putVal(r, "invalidate_on_change", v.InvalidateOnChange)
 		putVal(r, "is_refreshing", v.IsRefreshing)
 		putVal(r, "created_at", v.CreatedAt)
 		putVal(r, "updated_at", v.UpdatedAt)

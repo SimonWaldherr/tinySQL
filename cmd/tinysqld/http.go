@@ -99,7 +99,12 @@ func (d *daemon) handleHealth(w http.ResponseWriter, r *http.Request) {
 		writeErrorJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	health := d.inst.Health()
+	status := http.StatusOK
+	if !health.OK {
+		status = http.StatusServiceUnavailable
+	}
+	writeJSON(w, status, healthResponse(health))
 }
 
 func (d *daemon) handleReady(w http.ResponseWriter, r *http.Request) {
@@ -107,11 +112,12 @@ func (d *daemon) handleReady(w http.ResponseWriter, r *http.Request) {
 		writeErrorJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	if !d.ready.Load() {
+	health := d.inst.Health()
+	if !d.ready.Load() || !health.OK {
 		writeErrorJSON(w, http.StatusServiceUnavailable, "server not ready")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ready": true})
+	writeJSON(w, http.StatusOK, map[string]any{"ready": true, "health": healthResponse(health)})
 }
 
 func (d *daemon) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -120,6 +126,7 @@ func (d *daemon) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	stats := d.inst.DB.BackendStats()
+	health := d.inst.Health()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":            true,
 		"ready":         d.ready.Load(),
@@ -130,6 +137,7 @@ func (d *daemon) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"storage_mode":  d.inst.DB.StorageMode().String(),
 		"tables":        len(d.inst.DB.ListTables(d.defaultTenant)),
 		"job_scheduler": d.inst.DB.JobScheduler() != nil,
+		"health":        healthResponse(health),
 		"backend_stats": map[string]any{
 			"tables_in_memory":   stats.TablesInMemory,
 			"tables_on_disk":     stats.TablesOnDisk,
@@ -142,6 +150,43 @@ func (d *daemon) handleStatus(w http.ResponseWriter, r *http.Request) {
 			"eviction_count":     stats.EvictionCount,
 		},
 	})
+}
+
+func healthResponse(health tinysql.DBHealth) map[string]any {
+	recovery := map[string]any{
+		"mode":                   health.Recovery.Mode.String(),
+		"path":                   health.Recovery.Path,
+		"checkpoint_loaded":      health.Recovery.CheckpointLoaded,
+		"recovered_transactions": health.Recovery.RecoveredTransactions,
+		"recovered_operations":   health.Recovery.RecoveredOperations,
+		"truncated":              health.Recovery.Truncated,
+	}
+	if !health.Recovery.RecoveredAt.IsZero() {
+		recovery["recovered_at"] = health.Recovery.RecoveredAt.Format(time.RFC3339)
+	}
+	out := map[string]any{
+		"ok":                  health.OK,
+		"storage_mode":        health.ModeName,
+		"path":                health.Path,
+		"closed":              health.Closed,
+		"closing":             health.Closing,
+		"scheduler_running":   health.SchedulerRunning,
+		"wal_active":          health.WALActive,
+		"advanced_wal_active": health.AdvancedWALActive,
+		"tenants":             health.Tenants,
+		"tables":              health.Tables,
+		"recovery":            recovery,
+	}
+	if !health.LastSyncAt.IsZero() {
+		out["last_sync_at"] = health.LastSyncAt.Format(time.RFC3339)
+	}
+	if !health.LastCloseAt.IsZero() {
+		out["last_close_at"] = health.LastCloseAt.Format(time.RFC3339)
+	}
+	if health.Error != "" {
+		out["error"] = health.Error
+	}
+	return out
 }
 
 func (d *daemon) handleExec(w http.ResponseWriter, r *http.Request) {

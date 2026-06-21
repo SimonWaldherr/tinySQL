@@ -160,6 +160,7 @@ func (s *Scheduler) scheduleCronJob(job *CatalogJob) error {
 		loc, err = time.LoadLocation(job.Timezone)
 		if err != nil {
 			log.Printf("Invalid timezone %q for job %q, using UTC", job.Timezone, job.Name)
+			loc = time.UTC
 		}
 	}
 
@@ -277,6 +278,7 @@ func (s *Scheduler) executeJob(job *CatalogJob) {
 		status := "SUCCEEDED"
 		errMsg := ""
 		defer func() {
+			ctxErr := ctx.Err()
 			cancel()
 			s.mu.Lock()
 			delete(s.running, job.Name)
@@ -289,9 +291,9 @@ func (s *Scheduler) executeJob(job *CatalogJob) {
 				log.Printf("Failed to update job runtime for %q: %v", job.Name, err)
 			}
 			finishedAt := time.Now()
-			if ctx.Err() != nil && status == "SUCCEEDED" {
+			if ctxErr != nil && status == "SUCCEEDED" {
 				status = "CANCELED"
-				errMsg = ctx.Err().Error()
+				errMsg = ctxErr.Error()
 			}
 			if err := s.catalog.AddJobHistory(&CatalogJobHistory{
 				JobName:      job.Name,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 )
 
 // DeploymentMode describes the intended runtime shape for a tinySQL instance.
@@ -58,9 +59,11 @@ type DeploymentConfig struct {
 
 // Instance is a thin runtime wrapper around DB with deployment metadata.
 type Instance struct {
+	mu     sync.Mutex
 	DB     *DB
 	Mode   DeploymentMode
 	Tenant string
+	config DeploymentConfig
 }
 
 // OpenDeployment opens a tinySQL instance using the supplied deployment config.
@@ -74,7 +77,16 @@ func OpenDeployment(cfg DeploymentConfig) (*Instance, error) {
 		tenant = "default"
 	}
 
-	db, err := OpenDB(cfg.Storage)
+	cfg.Mode = mode
+	cfg.Tenant = tenant
+
+	var db *DB
+	var err error
+	if mode == DeploymentPackage && cfg.Storage == (StorageConfig{}) {
+		db = NewDB()
+	} else {
+		db, err = OpenDB(cfg.Storage)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +102,7 @@ func OpenDeployment(cfg DeploymentConfig) (*Instance, error) {
 		}
 	}
 
-	return &Instance{DB: db, Mode: mode, Tenant: tenant}, nil
+	return &Instance{DB: db, Mode: mode, Tenant: tenant, config: cfg}, nil
 }
 
 // OpenPackage creates an in-memory package-mode instance.
@@ -98,7 +110,12 @@ func OpenPackage(tenant string) *Instance {
 	if tenant == "" {
 		tenant = "default"
 	}
-	return &Instance{DB: NewDB(), Mode: DeploymentPackage, Tenant: tenant}
+	return &Instance{
+		DB:     NewDB(),
+		Mode:   DeploymentPackage,
+		Tenant: tenant,
+		config: DeploymentConfig{Mode: DeploymentPackage, Tenant: tenant},
+	}
 }
 
 // OpenEmbedded opens a SQLite-like embedded instance at path using WAL storage.
@@ -154,10 +171,94 @@ func (i *Instance) ExecuteSQL(ctx context.Context, sql string) (*ResultSet, erro
 	return Execute(ctx, i.DB, i.Tenant, stmt)
 }
 
-// Close releases instance resources.
-func (i *Instance) Close() error {
-	if i == nil || i.DB == nil {
+// Start opens the configured DB if the instance is stopped.
+func (i *Instance) Start() error {
+	if i == nil {
+		return fmt.Errorf("nil tinySQL instance")
+	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	if i.DB != nil && i.DB.HealthCheck().OK {
 		return nil
 	}
-	return i.DB.Close()
+
+	cfg := i.config
+	if cfg.Mode == "" {
+		cfg.Mode = i.Mode
+	}
+	if cfg.Mode == "" {
+		cfg.Mode = DeploymentPackage
+	}
+	if cfg.Tenant == "" {
+		cfg.Tenant = i.Tenant
+	}
+	if cfg.Tenant == "" {
+		cfg.Tenant = "default"
+	}
+
+	var db *DB
+	var err error
+	if cfg.Mode == DeploymentPackage && cfg.Storage == (StorageConfig{}) {
+		db = NewDB()
+	} else {
+		db, err = OpenDB(cfg.Storage)
+	}
+	if err != nil {
+		return err
+	}
+	if cfg.StartJobScheduler {
+		executor := cfg.JobExecutor
+		if executor == nil {
+			executor = NewSQLJobExecutor(db, cfg.Tenant)
+		}
+		if err := db.StartJobScheduler(executor); err != nil {
+			_ = db.Close()
+			return err
+		}
+	}
+
+	i.DB = db
+	i.Mode = cfg.Mode
+	i.Tenant = cfg.Tenant
+	i.config = cfg
+	return nil
+}
+
+// Stop gracefully stops schedulers, syncs storage, and closes DB resources.
+func (i *Instance) Stop() error {
+	if i == nil {
+		return nil
+	}
+	i.mu.Lock()
+	db := i.DB
+	i.mu.Unlock()
+	if db == nil {
+		return nil
+	}
+	return db.Close()
+}
+
+// Restart gracefully stops and reopens the configured instance.
+func (i *Instance) Restart() error {
+	if i == nil {
+		return fmt.Errorf("nil tinySQL instance")
+	}
+	if err := i.Stop(); err != nil {
+		return err
+	}
+	return i.Start()
+}
+
+// Health returns a production-oriented status snapshot for the instance.
+func (i *Instance) Health() DBHealth {
+	if i == nil || i.DB == nil {
+		return DBHealth{OK: false, Error: "nil tinySQL instance"}
+	}
+	return i.DB.HealthCheck()
+}
+
+// Close releases instance resources.
+func (i *Instance) Close() error {
+	return i.Stop()
 }

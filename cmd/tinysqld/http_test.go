@@ -40,6 +40,15 @@ func TestDaemonHealthReadyStatus(t *testing.T) {
 			t.Fatalf("%s status = %d, body=%s", path, rec.Code, rec.Body.String())
 		}
 	}
+
+	status := getJSON(t, handler, "/api/status")
+	health, ok := status["health"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing health object: %#v", status)
+	}
+	if health["ok"] != true || health["storage_mode"] != "disk" || health["scheduler_running"] != true {
+		t.Fatalf("unexpected health object: %#v", health)
+	}
 }
 
 func TestDaemonExecAndQuery(t *testing.T) {

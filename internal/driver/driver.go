@@ -69,6 +69,17 @@ func SetDefaultDB(db *storage.DB) {
 	defaultDrv.srv = newServer(db, c)
 }
 
+// CurrentDefaultDB returns the storage database currently backing the default
+// driver server, if one exists.
+func CurrentDefaultDB() *storage.DB {
+	if defaultDrv.srv == nil {
+		return nil
+	}
+	defaultDrv.srv.mu.RLock()
+	defer defaultDrv.srv.mu.RUnlock()
+	return defaultDrv.srv.db
+}
+
 // OpenInMemory returns a *sql.DB backed by an in-memory tinySQL server.
 // If tenant is empty the default tenant is used.
 func OpenInMemory(tenant string) (*sql.DB, error) {
@@ -357,15 +368,25 @@ func (c *conn) Ping(ctx context.Context) error {
 type tx struct{ c *conn }
 
 func (t *tx) Commit() error {
-	if err := t.c.srv.acquireWriter(context.Background()); err != nil {
+	return t.c.commitTx()
+}
+func (t *tx) Rollback() error {
+	return t.c.rollbackTx()
+}
+
+func (c *conn) commitTx() error {
+	if !c.inTx || c.shadow == nil {
+		return fmt.Errorf("tinysql: no active transaction")
+	}
+	if err := c.srv.acquireWriter(context.Background()); err != nil {
 		return err
 	}
-	defer t.c.srv.releaseWriter()
+	defer c.srv.releaseWriter()
 	// Atomic swap: writer lock, replace data, save, unlock.
-	t.c.srv.mu.Lock()
-	defer t.c.srv.mu.Unlock()
-	oldDB := t.c.srv.db
-	newDB := t.c.shadow
+	c.srv.mu.Lock()
+	defer c.srv.mu.Unlock()
+	oldDB := c.srv.db
+	newDB := c.shadow
 	changes := storage.CollectWALChanges(oldDB, newDB)
 	wal := oldDB.WAL()
 	needCheckpoint := false
@@ -376,23 +397,27 @@ func (t *tx) Commit() error {
 			return err
 		}
 	}
-	t.c.srv.db = newDB
+	c.srv.db = newDB
 	if wal != nil && needCheckpoint {
 		if err := wal.Checkpoint(newDB); err != nil {
 			return err
 		}
 	}
-	t.c.srv.saveIfNeeded()
+	c.srv.saveIfNeeded()
 
-	t.c.inTx = false
-	t.c.shadow = nil
-	t.c.txReadOnly = false
+	c.inTx = false
+	c.shadow = nil
+	c.txReadOnly = false
 	return nil
 }
-func (t *tx) Rollback() error {
-	t.c.inTx = false
-	t.c.shadow = nil
-	t.c.txReadOnly = false
+
+func (c *conn) rollbackTx() error {
+	if !c.inTx {
+		return fmt.Errorf("tinysql: no active transaction")
+	}
+	c.inTx = false
+	c.shadow = nil
+	c.txReadOnly = false
 	return nil
 }
 
@@ -438,12 +463,48 @@ func (c *conn) currentDB() *storage.DB {
 
 //nolint:gocyclo // execSQL coordinates parsing, locking, WAL, and transaction paths.
 func (c *conn) execSQL(ctx context.Context, sqlStr string) (driver.Result, error) {
+	if res, handled, err := c.execTransactionControl(ctx, sqlStr); handled {
+		return res, err
+	}
 	p := engine.NewParser(sqlStr)
 	st, err := p.ParseStatement()
 	if err != nil {
 		return nil, err
 	}
 	return c.execStatement(ctx, st)
+}
+
+func (c *conn) execTransactionControl(ctx context.Context, sqlStr string) (driver.Result, bool, error) {
+	switch normalizeTransactionSQL(sqlStr) {
+	case "BEGIN", "BEGIN TRANSACTION", "START TRANSACTION":
+		if c.inTx {
+			return nil, true, fmt.Errorf("tinysql: transaction already active")
+		}
+		if _, err := c.BeginTx(ctx, driver.TxOptions{}); err != nil {
+			return nil, true, err
+		}
+		return driver.RowsAffected(0), true, nil
+	case "COMMIT", "COMMIT TRANSACTION":
+		if err := c.commitTx(); err != nil {
+			return nil, true, err
+		}
+		return driver.RowsAffected(0), true, nil
+	case "ROLLBACK", "ROLLBACK TRANSACTION":
+		if err := c.rollbackTx(); err != nil {
+			return nil, true, err
+		}
+		return driver.RowsAffected(0), true, nil
+	default:
+		return nil, false, nil
+	}
+}
+
+func normalizeTransactionSQL(sqlStr string) string {
+	s := strings.TrimSpace(sqlStr)
+	for strings.HasSuffix(s, ";") {
+		s = strings.TrimSpace(strings.TrimSuffix(s, ";"))
+	}
+	return strings.Join(strings.Fields(strings.ToUpper(s)), " ")
 }
 
 // writeTargetTable returns the single table name modified by a DML/DDL statement.
@@ -550,6 +611,12 @@ func (c *conn) execStatement(ctx context.Context, st engine.Statement) (driver.R
 }
 
 func (c *conn) querySQL(ctx context.Context, sqlStr string) (driver.Rows, error) {
+	if _, handled, err := c.execTransactionControl(ctx, sqlStr); handled {
+		if err != nil {
+			return nil, err
+		}
+		return emptyRows{}, nil
+	}
 	// Queries return a driver.Rows. For non-SELECT statements, execute them
 	// and return an empty result set to satisfy the interface.
 	p := engine.NewParser(sqlStr)
@@ -558,8 +625,10 @@ func (c *conn) querySQL(ctx context.Context, sqlStr string) (driver.Rows, error)
 		return nil, err
 	}
 
-	// For non-SELECT statements, execute via pre-parsed statement (no re-parse).
-	if _, ok := st.(*engine.Select); !ok {
+	// For non-result statements, execute via pre-parsed statement (no re-parse).
+	_, isSelect := st.(*engine.Select)
+	_, isExplain := st.(*engine.Explain)
+	if !isSelect && !isExplain {
 		if _, err = c.execStatement(ctx, st); err != nil {
 			return nil, err
 		}

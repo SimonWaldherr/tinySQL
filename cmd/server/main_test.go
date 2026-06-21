@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -165,14 +167,116 @@ func TestParseTrustedProxyCIDRs(t *testing.T) {
 }
 
 func TestParseTLSMinVersion(t *testing.T) {
-	if _, err := parseTLSMinVersion("1.2"); err != nil {
+	if got, err := parseTLSMinVersion("1.2"); err != nil || got != tls.VersionTLS12 {
 		t.Fatalf("expected tls 1.2 to pass: %v", err)
 	}
-	if _, err := parseTLSMinVersion("1.3"); err != nil {
+	if got, err := parseTLSMinVersion("1.3"); err != nil || got != tls.VersionTLS13 {
 		t.Fatalf("expected tls 1.3 to pass: %v", err)
+	}
+	if got, err := parseTLSMinVersion(""); err != nil || got != tls.VersionTLS12 {
+		t.Fatalf("expected default tls 1.2, got %x, %v", got, err)
 	}
 	if _, err := parseTLSMinVersion("1.1"); err == nil {
 		t.Fatal("expected tls 1.1 to fail")
+	}
+}
+
+func TestServerDSNHelpers(t *testing.T) {
+	if got := normalizeDSN("  "); got != "mem://?tenant=default" {
+		t.Fatalf("empty DSN normalized to %q", got)
+	}
+	if got := normalizeDSN(" file:/tmp/db "); got != "file:/tmp/db" {
+		t.Fatalf("trimmed DSN = %q", got)
+	}
+	if got := dsnTenant(url.Values{}); got != "default" {
+		t.Fatalf("empty tenant = %q", got)
+	}
+	if got := dsnTenant(url.Values{"tenant": []string{" acme "}}); got != "acme" {
+		t.Fatalf("tenant = %q", got)
+	}
+	if _, err := parseDSNQuery("%zz", "mem"); err == nil {
+		t.Fatal("expected invalid query to fail")
+	}
+
+	mode, err := parseStorageModeOrDefault(url.Values{})
+	if err != nil || mode != storage.ModeMemory {
+		t.Fatalf("default mode = %v, %v", mode, err)
+	}
+	mode, err = parseStorageModeOrDefault(url.Values{"mode": []string{"wal"}})
+	if err != nil || mode != storage.ModeWAL {
+		t.Fatalf("wal mode = %v, %v", mode, err)
+	}
+	if _, err := parseStorageModeOrDefault(url.Values{"mode": []string{"bad"}}); err == nil {
+		t.Fatal("expected bad mode to fail")
+	}
+
+	path, raw, err := parseFileDSNParts("file:/tmp/example.db?tenant=t1")
+	if err != nil || path != "/tmp/example.db" || raw != "tenant=t1" {
+		t.Fatalf("parseFileDSNParts = %q, %q, %v", path, raw, err)
+	}
+	if _, _, err := parseFileDSNParts("file:   ?tenant=t1"); err == nil {
+		t.Fatal("expected blank file path to fail")
+	}
+
+	mode, err = parseFileDSNMode(url.Values{"autosave": []string{"1"}})
+	if err != nil || mode != storage.ModeWAL {
+		t.Fatalf("autosave mode = %v, %v", mode, err)
+	}
+	mode, err = parseFileDSNMode(url.Values{"autosave": []string{"0"}})
+	if err != nil || mode != storage.ModeMemory {
+		t.Fatalf("autosave false mode = %v, %v", mode, err)
+	}
+	if _, err := parseFileDSNMode(url.Values{"autosave": []string{"maybe"}}); err == nil {
+		t.Fatal("expected bad autosave to fail")
+	}
+}
+
+func TestServerStorageOptionHelpers(t *testing.T) {
+	values := url.Values{
+		"compress":            []string{"true"},
+		"sync_on_mutate":      []string{"1"},
+		"max_memory_mb":       []string{"2"},
+		"checkpoint_every":    []string{"7"},
+		"checkpoint_interval": []string{"2s"},
+	}
+	cfg := storage.StorageConfig{}
+	if err := applyStorageOptions(values, &cfg); err != nil {
+		t.Fatalf("applyStorageOptions failed: %v", err)
+	}
+	if !cfg.CompressFiles || !cfg.SyncOnMutate || cfg.MaxMemoryBytes != 2*1024*1024 || cfg.CheckpointEvery != 7 || cfg.CheckpointInterval != 2*time.Second {
+		t.Fatalf("unexpected storage config: %#v", cfg)
+	}
+
+	var b bool
+	if err := parseOptionalBool(url.Values{}, "missing", &b); err != nil {
+		t.Fatalf("missing bool failed: %v", err)
+	}
+	if err := parseOptionalBool(url.Values{"x": []string{"maybe"}}, "x", &b); err == nil {
+		t.Fatal("expected bad bool to fail")
+	}
+
+	var i int64
+	if err := parseOptionalInt64(url.Values{"n": []string{"-1"}}, "n", &i); err == nil {
+		t.Fatal("expected negative int64 to fail")
+	}
+	if err := parseOptionalInt64(url.Values{"n": []string{"abc"}}, "n", &i); err == nil {
+		t.Fatal("expected invalid int64 to fail")
+	}
+
+	var u uint64
+	if err := parseOptionalUint64(url.Values{"n": []string{"abc"}}, "n", &u); err == nil {
+		t.Fatal("expected invalid uint64 to fail")
+	}
+
+	var d time.Duration
+	if err := parseOptionalDuration(url.Values{"d": []string{"-1s"}}, "d", &d); err == nil {
+		t.Fatal("expected negative duration to fail")
+	}
+	if err := parseOptionalDuration(url.Values{"d": []string{"bad"}}, "d", &d); err == nil {
+		t.Fatal("expected invalid duration to fail")
+	}
+	if err := applyStorageOptions(url.Values{"max_memory_mb": []string{"-1"}}, &storage.StorageConfig{}); err == nil {
+		t.Fatal("expected negative max_memory_mb to fail")
 	}
 }
 

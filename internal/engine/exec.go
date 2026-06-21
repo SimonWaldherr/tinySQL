@@ -103,6 +103,10 @@ type ExecEnv struct {
 func Execute(ctx context.Context, db *storage.DB, tenant string, stmt Statement) (*ResultSet, error) {
 	env := ExecEnv{ctx: ctx, tenant: tenant, db: db}
 	switch s := stmt.(type) {
+	case *Explain:
+		return executeExplain(env, s)
+	case *Pragma:
+		return executePragma(env, s)
 	case *CreateTable:
 		return executeCreateTable(env, s)
 	case *DropTable:
@@ -228,7 +232,8 @@ func executeDropIndex(env ExecEnv, s *DropIndex) (*ResultSet, error) {
 }
 
 func executeCreateView(env ExecEnv, s *CreateView) (*ResultSet, error) {
-	if _, exists := env.db.Catalog().GetView("main", s.Name); exists {
+	schema, name := splitObjectName(s.Name)
+	if _, exists := env.db.Catalog().GetView(schema, name); exists {
 		if s.IfNotExists && !s.OrReplace {
 			return nil, nil
 		}
@@ -240,11 +245,16 @@ func executeCreateView(env ExecEnv, s *CreateView) (*ResultSet, error) {
 	if strings.TrimSpace(sqlText) == "" {
 		return nil, fmt.Errorf("CREATE VIEW %s missing stored SQL text", s.Name)
 	}
-	return nil, env.db.Catalog().RegisterView("main", s.Name, sqlText)
+	if err := env.db.Catalog().RegisterView(schema, name, sqlText); err != nil {
+		return nil, err
+	}
+	env.db.Catalog().SetDependencies(schema, name, "VIEW", selectDependencies(env.db.Catalog(), schema, name, "VIEW", s.Select))
+	return nil, nil
 }
 
 func executeCreateMaterializedView(env ExecEnv, s *CreateMaterializedView) (*ResultSet, error) {
-	if _, exists := env.db.Catalog().GetMaterializedView("main", s.Name); exists {
+	schema, name := splitObjectName(s.Name)
+	if _, exists := env.db.Catalog().GetMaterializedView(schema, name); exists {
 		if s.IfNotExists && !s.OrReplace {
 			return nil, nil
 		}
@@ -256,19 +266,21 @@ func executeCreateMaterializedView(env ExecEnv, s *CreateMaterializedView) (*Res
 		return nil, fmt.Errorf("CREATE MATERIALIZED VIEW %s missing stored SQL text", s.Name)
 	}
 	mv := &storage.CatalogMaterializedView{
-		Schema:         "main",
-		Name:           s.Name,
-		SQLText:        s.SQLText,
-		CacheTableName: materializedViewCacheTableName(s.Name),
-		StaleAfterMs:   s.StaleAfterMs,
-		RefreshEveryMs: s.RefreshEveryMs,
-		DailyAt:        s.DailyAt,
-		Timezone:       s.Timezone,
-		WithData:       s.WithData,
+		Schema:             schema,
+		Name:               name,
+		SQLText:            s.SQLText,
+		CacheTableName:     materializedViewCacheTableNameFor(schema, name),
+		StaleAfterMs:       s.StaleAfterMs,
+		RefreshEveryMs:     s.RefreshEveryMs,
+		DailyAt:            s.DailyAt,
+		Timezone:           s.Timezone,
+		WithData:           s.WithData,
+		InvalidateOnChange: s.InvalidateOnChange,
 	}
 	if err := env.db.Catalog().RegisterMaterializedView(mv); err != nil {
 		return nil, err
 	}
+	env.db.Catalog().SetDependencies(schema, name, "MATERIALIZED_VIEW", selectDependencies(env.db.Catalog(), schema, name, "MATERIALIZED_VIEW", s.Select))
 	if err := registerMaterializedViewRefreshJobs(env, mv); err != nil {
 		return nil, err
 	}
@@ -324,28 +336,31 @@ func executeDropJob(env ExecEnv, s *DropJob) (*ResultSet, error) {
 }
 
 func executeDropView(env ExecEnv, s *DropView) (*ResultSet, error) {
+	schema, name := splitObjectName(s.Name)
 	if s.IfExists {
-		if _, ok := env.db.Catalog().GetView("main", s.Name); !ok {
+		if _, ok := env.db.Catalog().GetView(schema, name); !ok {
 			return nil, nil
 		}
 	}
-	return nil, env.db.Catalog().DeleteView("main", s.Name)
+	return nil, env.db.Catalog().DeleteView(schema, name)
 }
 
 func executeDropMaterializedView(env ExecEnv, s *DropMaterializedView) (*ResultSet, error) {
-	mv, ok := env.db.Catalog().GetMaterializedView("main", s.Name)
+	schema, name := splitObjectName(s.Name)
+	displayName := catalogDisplayName(schema, name)
+	mv, ok := env.db.Catalog().GetMaterializedView(schema, name)
 	if !ok {
 		if s.IfExists {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("materialized view %q not found", s.Name)
 	}
-	_ = env.db.DeleteJob(materializedViewIntervalJobName(s.Name))
-	_ = env.db.DeleteJob(materializedViewDailyJobName(s.Name))
+	_ = env.db.DeleteJob(materializedViewIntervalJobName(displayName))
+	_ = env.db.DeleteJob(materializedViewDailyJobName(displayName))
 	if _, err := env.db.Get(env.tenant, mv.CacheTableName); err == nil {
 		_ = env.db.Drop(env.tenant, mv.CacheTableName)
 	}
-	return nil, env.db.Catalog().DeleteMaterializedView("main", s.Name)
+	return nil, env.db.Catalog().DeleteMaterializedView(schema, name)
 }
 
 func executeRefreshMaterializedView(env ExecEnv, s *RefreshMaterializedView) (*ResultSet, error) {
@@ -357,31 +372,39 @@ func executeRefreshMaterializedView(env ExecEnv, s *RefreshMaterializedView) (*R
 }
 
 func executeAlterViewMaterialize(env ExecEnv, s *AlterViewMaterialize) (*ResultSet, error) {
-	view, ok := env.db.Catalog().GetView("main", s.Name)
+	schema, name := splitObjectName(s.Name)
+	view, ok := env.db.Catalog().GetView(schema, name)
 	if !ok {
 		return nil, fmt.Errorf("view %q not found", s.Name)
 	}
-	if _, exists := env.db.Catalog().GetMaterializedView("main", s.Name); exists {
+	if _, exists := env.db.Catalog().GetMaterializedView(schema, name); exists {
 		return nil, fmt.Errorf("materialized view %q already exists", s.Name)
 	}
 	mv := &storage.CatalogMaterializedView{
-		Schema:         "main",
-		Name:           s.Name,
-		SQLText:        view.SQLText,
-		CacheTableName: materializedViewCacheTableName(s.Name),
-		StaleAfterMs:   s.StaleAfterMs,
-		RefreshEveryMs: s.RefreshEveryMs,
-		DailyAt:        s.DailyAt,
-		Timezone:       s.Timezone,
-		WithData:       s.WithData,
-		CreatedAt:      view.CreatedAt,
+		Schema:             schema,
+		Name:               name,
+		SQLText:            view.SQLText,
+		CacheTableName:     materializedViewCacheTableNameFor(schema, name),
+		StaleAfterMs:       s.StaleAfterMs,
+		RefreshEveryMs:     s.RefreshEveryMs,
+		DailyAt:            s.DailyAt,
+		Timezone:           s.Timezone,
+		WithData:           s.WithData,
+		InvalidateOnChange: s.InvalidateOnChange,
+		CreatedAt:          view.CreatedAt,
 	}
-	if err := env.db.Catalog().DeleteView("main", s.Name); err != nil {
+	if err := env.db.Catalog().DeleteView(schema, name); err != nil {
 		return nil, err
 	}
 	if err := env.db.Catalog().RegisterMaterializedView(mv); err != nil {
-		_ = env.db.Catalog().RegisterView("main", s.Name, view.SQLText)
+		_ = env.db.Catalog().RegisterView(schema, name, view.SQLText)
 		return nil, err
+	}
+	stmt, parseErr := NewParser(view.SQLText).ParseStatement()
+	if parseErr == nil {
+		if sel, ok := stmt.(*Select); ok {
+			env.db.Catalog().SetDependencies(schema, name, "MATERIALIZED_VIEW", selectDependencies(env.db.Catalog(), schema, name, "MATERIALIZED_VIEW", sel))
+		}
 	}
 	if err := registerMaterializedViewRefreshJobs(env, mv); err != nil {
 		return nil, err
@@ -395,23 +418,31 @@ func executeAlterViewMaterialize(env ExecEnv, s *AlterViewMaterialize) (*ResultS
 }
 
 func executeAlterMaterializedViewToView(env ExecEnv, s *AlterMaterializedViewToView) (*ResultSet, error) {
-	mv, ok := env.db.Catalog().GetMaterializedView("main", s.Name)
+	schema, name := splitObjectName(s.Name)
+	displayName := catalogDisplayName(schema, name)
+	mv, ok := env.db.Catalog().GetMaterializedView(schema, name)
 	if !ok {
 		return nil, fmt.Errorf("materialized view %q not found", s.Name)
 	}
-	if _, exists := env.db.Catalog().GetView("main", s.Name); exists {
+	if _, exists := env.db.Catalog().GetView(schema, name); exists {
 		return nil, fmt.Errorf("view %q already exists", s.Name)
 	}
-	_ = env.db.DeleteJob(materializedViewIntervalJobName(s.Name))
-	_ = env.db.DeleteJob(materializedViewDailyJobName(s.Name))
+	_ = env.db.DeleteJob(materializedViewIntervalJobName(displayName))
+	_ = env.db.DeleteJob(materializedViewDailyJobName(displayName))
 	if _, err := env.db.Get(env.tenant, mv.CacheTableName); err == nil {
 		_ = env.db.Drop(env.tenant, mv.CacheTableName)
 	}
-	if err := env.db.Catalog().DeleteMaterializedView("main", s.Name); err != nil {
+	if err := env.db.Catalog().DeleteMaterializedView(schema, name); err != nil {
 		return nil, err
 	}
-	if err := env.db.Catalog().RegisterView("main", s.Name, mv.SQLText); err != nil {
+	if err := env.db.Catalog().RegisterView(schema, name, mv.SQLText); err != nil {
 		return nil, err
+	}
+	stmt, parseErr := NewParser(mv.SQLText).ParseStatement()
+	if parseErr == nil {
+		if sel, ok := stmt.(*Select); ok {
+			env.db.Catalog().SetDependencies(schema, name, "VIEW", selectDependencies(env.db.Catalog(), schema, name, "VIEW", sel))
+		}
 	}
 	return &ResultSet{Cols: []string{"view"}, Rows: []Row{{"view": s.Name}}}, nil
 }
@@ -420,19 +451,39 @@ func materializedViewCacheTableName(name string) string {
 	return "__mv_" + strings.ToLower(name)
 }
 
+func materializedViewCacheTableNameFor(schema, name string) string {
+	if schema == "" || schema == "main" {
+		return materializedViewCacheTableName(name)
+	}
+	return "__mv_" + sanitizeObjectID(schema+"_"+name)
+}
+
 func materializedViewIntervalJobName(name string) string {
-	return "__mv_refresh_" + strings.ToLower(name) + "_interval"
+	return "__mv_refresh_" + sanitizeObjectID(name) + "_interval"
 }
 
 func materializedViewDailyJobName(name string) string {
-	return "__mv_refresh_" + strings.ToLower(name) + "_daily"
+	return "__mv_refresh_" + sanitizeObjectID(name) + "_daily"
+}
+
+func catalogDisplayName(schema, name string) string {
+	if schema == "" || schema == "main" {
+		return name
+	}
+	return schema + "." + name
+}
+
+func sanitizeObjectID(name string) string {
+	replacer := strings.NewReplacer(".", "_", " ", "_")
+	return strings.ToLower(replacer.Replace(name))
 }
 
 func registerMaterializedViewRefreshJobs(env ExecEnv, mv *storage.CatalogMaterializedView) error {
+	viewName := catalogDisplayName(mv.Schema, mv.Name)
 	if mv.RefreshEveryMs > 0 {
 		if err := env.db.RegisterJob(&storage.CatalogJob{
-			Name:         materializedViewIntervalJobName(mv.Name),
-			SQLText:      "REFRESH MATERIALIZED VIEW " + mv.Name,
+			Name:         materializedViewIntervalJobName(viewName),
+			SQLText:      "REFRESH MATERIALIZED VIEW " + viewName,
 			ScheduleType: "INTERVAL",
 			IntervalMs:   mv.RefreshEveryMs,
 			Enabled:      true,
@@ -447,8 +498,8 @@ func registerMaterializedViewRefreshJobs(env ExecEnv, mv *storage.CatalogMateria
 			return err
 		}
 		if err := env.db.RegisterJob(&storage.CatalogJob{
-			Name:         materializedViewDailyJobName(mv.Name),
-			SQLText:      "REFRESH MATERIALIZED VIEW " + mv.Name,
+			Name:         materializedViewDailyJobName(viewName),
+			SQLText:      "REFRESH MATERIALIZED VIEW " + viewName,
 			ScheduleType: "CRON",
 			CronExpr:     cronExpr,
 			Timezone:     mv.Timezone,
@@ -478,11 +529,12 @@ func dailyAtToCron(dailyAt string) (string, error) {
 }
 
 func refreshMaterializedView(env ExecEnv, name string) (err error) {
-	mv, ok := env.db.Catalog().GetMaterializedView("main", name)
+	schema, objectName := splitObjectName(name)
+	mv, ok := env.db.Catalog().GetMaterializedView(schema, objectName)
 	if !ok {
 		return fmt.Errorf("materialized view %q not found", name)
 	}
-	if !env.db.Catalog().TryBeginMaterializedViewRefresh("main", name) {
+	if !env.db.Catalog().TryBeginMaterializedViewRefresh(schema, objectName) {
 		return fmt.Errorf("materialized view %q is already refreshing", name)
 	}
 
@@ -493,7 +545,7 @@ func refreshMaterializedView(env ExecEnv, name string) (err error) {
 		if err != nil {
 			errMsg = err.Error()
 		}
-		_ = env.db.Catalog().FinishMaterializedViewRefresh("main", name, time.Now(), time.Since(start).Milliseconds(), rowCount, errMsg)
+		_ = env.db.Catalog().FinishMaterializedViewRefresh(schema, objectName, time.Now(), time.Since(start).Milliseconds(), rowCount, errMsg)
 	}()
 
 	stmt, parseErr := NewParser(mv.SQLText).ParseStatement()
@@ -607,6 +659,9 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 			}
 			row[i] = cv
 		}
+		if err := validateRowConstraints(env, t, row, -1); err != nil {
+			return nil, err
+		}
 		newRow := buildTableRow(t.Cols, strings.ToLower(s.Table)+".", row)
 		if err := fireTriggers(env, s.Table, "BEFORE", "INSERT", newRow, nil); err != nil {
 			return nil, err
@@ -623,6 +678,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 	}
 	t.Version++
 	t.MarkDirtyFrom(len(t.Rows) - len(s.Rows))
+	markDependentMaterializedViewsStale(env, s.Table)
 	if len(s.Returning) > 0 {
 		return projectReturningRows(env, t.Cols, s.Returning, returningRows)
 	}
@@ -661,6 +717,9 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			}
 			row[idx] = cv
 		}
+		if err := validateRowConstraints(env, t, row, -1); err != nil {
+			return nil, err
+		}
 		newRow := buildTableRow(t.Cols, strings.ToLower(s.Table)+".", row)
 		if err := fireTriggers(env, s.Table, "BEFORE", "INSERT", newRow, nil); err != nil {
 			return nil, err
@@ -677,10 +736,70 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	}
 	t.Version++
 	t.MarkDirtyFrom(len(t.Rows) - len(s.Rows))
+	markDependentMaterializedViewsStale(env, s.Table)
 	if len(s.Returning) > 0 {
 		return projectReturningRows(env, t.Cols, s.Returning, returningRows)
 	}
 	return nil, nil
+}
+
+func validateRowConstraints(env ExecEnv, t *storage.Table, row []any, excludeRow int) error {
+	for colIdx, col := range t.Cols {
+		if col.Constraint == storage.NoConstraint {
+			continue
+		}
+		if colIdx >= len(row) {
+			return fmt.Errorf("row missing constrained column %q", col.Name)
+		}
+		val := row[colIdx]
+		switch col.Constraint {
+		case storage.PrimaryKey:
+			if isNull(val) {
+				return fmt.Errorf("PRIMARY KEY column %q cannot be NULL", col.Name)
+			}
+			if constraintValueExists(t, colIdx, val, excludeRow) {
+				return fmt.Errorf("duplicate PRIMARY KEY value for column %q", col.Name)
+			}
+		case storage.Unique:
+			if isNull(val) {
+				continue
+			}
+			if constraintValueExists(t, colIdx, val, excludeRow) {
+				return fmt.Errorf("duplicate UNIQUE value for column %q", col.Name)
+			}
+		case storage.ForeignKey:
+			if isNull(val) {
+				continue
+			}
+			if col.ForeignKey == nil {
+				return fmt.Errorf("FOREIGN KEY column %q has no reference target", col.Name)
+			}
+			refTable, err := env.db.Get(env.tenant, col.ForeignKey.Table)
+			if err != nil {
+				return fmt.Errorf("FOREIGN KEY column %q references missing table %q", col.Name, col.ForeignKey.Table)
+			}
+			refIdx, err := refTable.ColIndex(col.ForeignKey.Column)
+			if err != nil {
+				return fmt.Errorf("FOREIGN KEY column %q references missing column %q.%q", col.Name, col.ForeignKey.Table, col.ForeignKey.Column)
+			}
+			if !constraintValueExists(refTable, refIdx, val, -1) {
+				return fmt.Errorf("FOREIGN KEY violation on column %q: value %v not found in %s.%s", col.Name, val, col.ForeignKey.Table, col.ForeignKey.Column)
+			}
+		}
+	}
+	return nil
+}
+
+func constraintValueExists(t *storage.Table, colIdx int, val any, excludeRow int) bool {
+	for rowIdx, existing := range t.Rows {
+		if rowIdx == excludeRow || colIdx >= len(existing) {
+			continue
+		}
+		if rawEqual(existing[colIdx], val) {
+			return true
+		}
+	}
+	return false
 }
 
 func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
@@ -722,6 +841,7 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 			if err := fireTriggers(env, s.Table, "BEFORE", "UPDATE", row, oldRow); err != nil {
 				return nil, err
 			}
+			nextRow := append([]any(nil), t.Rows[ri]...)
 			for i, ex := range setIdx {
 				v, err := evalExpr(env, ex, row)
 				if err != nil {
@@ -731,8 +851,12 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 				if err != nil {
 					return nil, err
 				}
-				t.Rows[ri][i] = cv
+				nextRow[i] = cv
 			}
+			if err := validateRowConstraints(env, t, nextRow, ri); err != nil {
+				return nil, err
+			}
+			t.Rows[ri] = nextRow
 			newRow := buildTableRow(t.Cols, tablePrefix, t.Rows[ri])
 			ftsIndexRow(env.tenant+"/"+s.Table, s.Table, ri, nil, t.Rows[ri], columnNames)
 			if err := fireTriggers(env, s.Table, "AFTER", "UPDATE", newRow, oldRow); err != nil {
@@ -747,6 +871,7 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 	t.Version++
 	if n > 0 {
 		t.MarkDirtyFrom(-1) // UPDATE is non-append; force full-table WAL
+		markDependentMaterializedViewsStale(env, s.Table)
 	}
 	if len(s.Returning) > 0 {
 		return projectReturningRows(env, t.Cols, s.Returning, returningRows)
@@ -805,9 +930,14 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 			}
 			values[i] = cv
 		}
+		nextRow := append([]any(nil), raw...)
 		for i, set := range plan.sets {
-			plan.table.Rows[ri][set.col] = values[i]
+			nextRow[set.col] = values[i]
 		}
+		if err := validateRowConstraints(env, plan.table, nextRow, ri); err != nil {
+			return nil, true, err
+		}
+		plan.table.Rows[ri] = nextRow
 		ftsIndexRow(env.tenant+"/"+s.Table, s.Table, ri, nil, plan.table.Rows[ri], columnNames)
 		updated++
 	}
@@ -815,6 +945,7 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 	plan.table.Version++
 	if updated > 0 {
 		plan.table.MarkDirtyFrom(-1)
+		markDependentMaterializedViewsStale(env, s.Table)
 	}
 	return &ResultSet{Cols: []string{"updated"}, Rows: []Row{{"updated": updated}}}, true, nil
 }
@@ -869,6 +1000,7 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 				t.Rows = nil
 				t.Version++
 				t.MarkDirtyFrom(-1) // DELETE is non-append; force full-table WAL
+				markDependentMaterializedViewsStale(env, s.Table)
 			}
 			return projectReturningRows(env, t.Cols, s.Returning, returningRows)
 		}
@@ -876,6 +1008,7 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 			t.Rows = nil
 			t.Version++
 			t.MarkDirtyFrom(-1) // DELETE is non-append; force full-table WAL
+			markDependentMaterializedViewsStale(env, s.Table)
 		}
 		return &ResultSet{Cols: []string{"deleted"}, Rows: []Row{{"deleted": del}}}, nil
 	}
@@ -909,6 +1042,7 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 		t.Version++
 		if del > 0 {
 			t.MarkDirtyFrom(-1)
+			markDependentMaterializedViewsStale(env, s.Table)
 		}
 		return &ResultSet{Cols: []string{"deleted"}, Rows: []Row{{"deleted": del}}}, nil
 	}
@@ -947,6 +1081,7 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	t.Version++
 	if del > 0 {
 		t.MarkDirtyFrom(-1) // DELETE is non-append; force full-table WAL
+		markDependentMaterializedViewsStale(env, s.Table)
 	}
 	if len(s.Returning) > 0 {
 		return projectReturningRows(env, t.Cols, s.Returning, returningRows)
@@ -963,6 +1098,17 @@ func buildTableRow(cols []storage.Column, tablePrefix string, values []any) Row 
 		row[tablePrefix+key] = val
 	}
 	return row
+}
+
+func markDependentMaterializedViewsStale(env ExecEnv, tableName string) {
+	if strings.HasPrefix(strings.ToLower(tableName), "__mv_") {
+		return
+	}
+	schema, name := splitObjectName(tableName)
+	if schema == "" {
+		schema = "main"
+	}
+	_ = env.db.Catalog().MarkMaterializedViewsStaleByDependency(schema, name)
 }
 
 func projectReturningRows(env ExecEnv, cols []storage.Column, projs []SelectItem, rows []Row) (*ResultSet, error) {
@@ -1122,6 +1268,10 @@ func resolveTableSource(cteEnv ExecEnv, env ExecEnv, s *Select) ([]Row, error) {
 		return resolveSysVirtualTable(env, s)
 	}
 
+	if isSQLiteSchemaTable(s.From.Table) {
+		return resolveSQLiteSchemaTable(env, s), nil
+	}
+
 	// Treat as a regular table
 	return resolveRegularTable(cteEnv, env, s)
 }
@@ -1137,6 +1287,8 @@ func resolveCatalogTable(env ExecEnv, s *Select) ([]Row, error) {
 	switch name {
 	case "objects":
 		return allObjectStatusRows(env), nil
+	case "dependencies":
+		return dependencyRows(env), nil
 	case "tables":
 		return resolveCatalogTables(env, s)
 	case "columns":
@@ -1163,14 +1315,19 @@ func resolveCatalogTables(env ExecEnv, s *Select) ([]Row, error) {
 	catTabs := env.db.Catalog().GetTables()
 	catMap := make(map[string]*storage.CatalogTable, len(catTabs))
 	for _, ct := range catTabs {
-		catMap[strings.ToLower(ct.Name)] = ct
+		catMap[strings.ToLower(ct.Schema+"."+ct.Name)] = ct
 	}
 	// Track which real tables we've seen.
 	seen := make(map[string]bool, len(leftRows))
 	for _, r := range leftRows {
 		tName, _ := r["name"].(string)
-		seen[strings.ToLower(tName)] = true
-		if ct, ok := catMap[strings.ToLower(tName)]; ok {
+		tSchema, _ := r["schema"].(string)
+		if tSchema == "" {
+			tSchema = "main"
+		}
+		key := strings.ToLower(tSchema + "." + tName)
+		seen[key] = true
+		if ct, ok := catMap[key]; ok {
 			putVal(r, "schema", ct.Schema)
 			putVal(r, "type", ct.Type)
 			putVal(r, "row_count", ct.RowCount)
@@ -1178,18 +1335,19 @@ func resolveCatalogTables(env ExecEnv, s *Select) ([]Row, error) {
 			putVal(r, "created_at", ct.CreatedAt)
 			putVal(r, "updated_at", ct.UpdatedAt)
 		} else {
-			putVal(r, "schema", "main")
+			putVal(r, "schema", tSchema)
 			putVal(r, "type", "TABLE")
 		}
 	}
 	// Add catalog-only entries that aren't real tables yet.
 	for _, ct := range catTabs {
-		if seen[strings.ToLower(ct.Name)] {
+		if seen[strings.ToLower(ct.Schema+"."+ct.Name)] {
 			continue
 		}
 		r := make(Row)
 		putVal(r, "schema", ct.Schema)
 		putVal(r, "name", ct.Name)
+		putVal(r, "full_name", catalogDisplayName(ct.Schema, ct.Name))
 		putVal(r, "type", ct.Type)
 		putVal(r, "row_count", ct.RowCount)
 		putVal(r, "rows", ct.RowCount)
@@ -1347,6 +1505,8 @@ func resolveCatalogMaterializedViews(env ExecEnv, s *Select) ([]Row, error) {
 		putVal(leftRows[i], "last_refresh_at", v.LastRefreshAt)
 		putVal(leftRows[i], "last_duration_ms", v.LastDurationMs)
 		putVal(leftRows[i], "last_error", v.LastError)
+		putVal(leftRows[i], "is_stale", v.IsStale)
+		putVal(leftRows[i], "invalidate_on_change", v.InvalidateOnChange)
 		putVal(leftRows[i], "is_refreshing", v.IsRefreshing)
 		putVal(leftRows[i], "created_at", v.CreatedAt)
 		putVal(leftRows[i], "updated_at", v.UpdatedAt)
@@ -1381,6 +1541,10 @@ func resolveSysVirtualTable(env ExecEnv, s *Select) ([]Row, error) {
 
 // resolveRegularTable handles regular table lookup
 func resolveRegularTable(cteEnv ExecEnv, env ExecEnv, s *Select) ([]Row, error) {
+	if isSQLiteSchemaTable(s.From.Table) {
+		return resolveSQLiteSchemaTable(env, s), nil
+	}
+
 	var leftT *storage.Table
 	var err error
 	if cteEnv.ctes != nil {
@@ -1403,7 +1567,8 @@ func resolveRegularTable(cteEnv ExecEnv, env ExecEnv, s *Select) ([]Row, error) 
 }
 
 func resolveMaterializedViewSource(env ExecEnv, s *Select) ([]Row, bool, error) {
-	mv, ok := env.db.Catalog().GetMaterializedView("main", s.From.Table)
+	schema, name := splitObjectName(s.From.Table)
+	mv, ok := env.db.Catalog().GetMaterializedView(schema, name)
 	if !ok {
 		return nil, false, nil
 	}
@@ -1425,6 +1590,8 @@ func ensureMaterializedViewCache(env ExecEnv, sourceName string, mv *storage.Cat
 		if !needsRefresh {
 			return nil, fmt.Errorf("materialized view %q has no data", sourceName)
 		}
+	} else if mv.IsStale {
+		needsRefresh = true
 	} else if mv.StaleAfterMs > 0 {
 		if mv.LastRefreshAt == nil {
 			needsRefresh = true
@@ -1450,7 +1617,8 @@ func ensureMaterializedViewCache(env ExecEnv, sourceName string, mv *storage.Cat
 }
 
 func resolveViewSource(env ExecEnv, s *Select) ([]Row, bool, error) {
-	view, ok := env.db.Catalog().GetView("main", s.From.Table)
+	schema, name := splitObjectName(s.From.Table)
+	view, ok := env.db.Catalog().GetView(schema, name)
 	if !ok {
 		return nil, false, nil
 	}
@@ -1896,7 +2064,8 @@ func simpleJoinSelectEligible(s *Select) bool {
 		s.Having != nil || s.Union != nil || len(s.OrderBy) > 0 || s.Limit != nil || s.Offset != nil ||
 		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil || len(s.Joins) != 1 ||
 		s.Joins[0].Type != JoinInner || s.Joins[0].Right.Table == "" ||
-		s.Joins[0].Right.Subquery != nil || s.Joins[0].Right.TableFunc != nil)
+		s.Joins[0].Right.Subquery != nil || s.Joins[0].Right.TableFunc != nil ||
+		isSQLiteSchemaTable(s.From.Table) || isSQLiteSchemaTable(s.Joins[0].Right.Table))
 }
 
 func loadSimpleJoinTables(env ExecEnv, s *Select) (*storage.Table, *storage.Table, error) {
@@ -2363,7 +2532,8 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 
 	table, err := env.db.Get(env.tenant, s.From.Table)
 	if err != nil {
-		if mv, ok := env.db.Catalog().GetMaterializedView("main", s.From.Table); ok {
+		schema, name := splitObjectName(s.From.Table)
+		if mv, ok := env.db.Catalog().GetMaterializedView(schema, name); ok {
 			table, err = ensureMaterializedViewCache(env, s.From.Table, mv)
 			if err != nil {
 				return nil, true, err
@@ -2401,7 +2571,8 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 func simpleAggregateEligibleSelect(s *Select) bool {
 	return !(s.Distinct || len(s.DistinctOn) > 0 || len(s.CTEs) > 0 || len(s.Joins) > 0 ||
 		s.Having != nil || s.Union != nil || len(s.OrderBy) > 0 || s.Limit != nil || s.Offset != nil ||
-		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil || len(s.GroupBy) != 1)
+		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil || len(s.GroupBy) != 1 ||
+		isSQLiteSchemaTable(s.From.Table))
 }
 
 func buildSimpleAggregateProjections(s *Select, colIndex map[string]int, groupCol int) ([]simpleAggregateProjection, []string, bool, bool, error) {
@@ -2690,7 +2861,8 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 
 	table, err := env.db.Get(env.tenant, s.From.Table)
 	if err != nil {
-		if mv, ok := env.db.Catalog().GetMaterializedView("main", s.From.Table); ok {
+		schema, name := splitObjectName(s.From.Table)
+		if mv, ok := env.db.Catalog().GetMaterializedView(schema, name); ok {
 			table, err = ensureMaterializedViewCache(env, s.From.Table, mv)
 			if err != nil {
 				return nil, true, err
@@ -2734,10 +2906,11 @@ func isCatalogViewSource(env ExecEnv, name string) bool {
 	if name == "" {
 		return false
 	}
-	if _, ok := env.db.Catalog().GetView("main", name); ok {
+	schema, objectName := splitObjectName(name)
+	if _, ok := env.db.Catalog().GetView(schema, objectName); ok {
 		return true
 	}
-	if _, ok := env.db.Catalog().GetMaterializedView("main", name); ok {
+	if _, ok := env.db.Catalog().GetMaterializedView(schema, objectName); ok {
 		return true
 	}
 	return false
@@ -2750,6 +2923,9 @@ func simpleSelectEligible(s *Select) bool {
 		return false
 	}
 	if strings.Contains(strings.ToLower(s.From.Table), ".") {
+		return false
+	}
+	if isSQLiteSchemaTable(s.From.Table) {
 		return false
 	}
 	return !(anyAggInSelect(s.Projs) || anyWindowInSelect(s.Projs))

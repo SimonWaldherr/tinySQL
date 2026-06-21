@@ -130,6 +130,8 @@ type AdvancedWAL struct {
 
 	// Compression enabled
 	compress bool
+
+	closed bool
 }
 
 // WALTxState tracks the state of a transaction in the WAL.
@@ -396,6 +398,9 @@ func (w *AdvancedWAL) LogAbort(txID TxID) (LSN, error) {
 func (w *AdvancedWAL) Checkpoint(db *DB) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.closed {
+		return fmt.Errorf("advanced WAL is closed")
+	}
 
 	if w.checkpointPath == "" {
 		return nil
@@ -623,15 +628,29 @@ func (w *AdvancedWAL) rowsEqual(a, b []any) bool {
 
 // writeRecord writes a single WAL record.
 func (w *AdvancedWAL) writeRecord(record *WALRecord) error {
+	if w.closed || w.encoder == nil {
+		return fmt.Errorf("advanced WAL is closed")
+	}
 	return w.encoder.Encode(record)
 }
 
 // flush flushes the write buffer and syncs to disk.
 func (w *AdvancedWAL) flush() error {
-	if err := w.writer.Flush(); err != nil {
+	if w.closed {
+		return nil
+	}
+	if w.writer != nil {
+		if err := w.writer.Flush(); err != nil {
+			return err
+		}
+	}
+	if w.file == nil {
+		return nil
+	}
+	if err := w.file.Sync(); err != nil {
 		return err
 	}
-	return w.file.Sync()
+	return nil
 }
 
 // calculateChecksum computes a simple checksum for corruption detection.
@@ -659,12 +678,24 @@ func (w *AdvancedWAL) calculateChecksum(record *WALRecord) uint32 {
 func (w *AdvancedWAL) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.closed {
+		return nil
+	}
 
 	if err := w.flush(); err != nil {
 		return err
 	}
 
-	return w.file.Close()
+	if w.file != nil {
+		if err := w.file.Close(); err != nil {
+			return err
+		}
+	}
+	w.closed = true
+	w.file = nil
+	w.writer = nil
+	w.encoder = nil
+	return nil
 }
 
 // GetNextLSN returns the next LSN to be assigned.

@@ -10,6 +10,7 @@ behavior remains compatible while the DBMS runtime grows.
 - Requires durable storage.
 - Starts the job scheduler through the enterprise profile.
 - Exposes a minimal HTTP DBMS API.
+- Reports DB health, storage, scheduler, WAL, and recovery state.
 - Waits for a shutdown signal and shuts down gracefully.
 
 Use `cmd/server` for the older HTTP/gRPC API server while `tinysqld` grows into
@@ -50,12 +51,12 @@ go build ./cmd/tinysqld
 
 Unauthenticated:
 
-- `GET /healthz`
-- `GET /readyz`
+- `GET /healthz`: DB health snapshot; returns `503` if storage is closed or closing.
+- `GET /readyz`: readiness plus health; returns `503` while not ready or unhealthy.
 
 Authenticated when `-auth` is set:
 
-- `GET /api/status`
+- `GET /api/status`: runtime status, backend stats, and DB health.
 - `POST /api/exec`
 - `POST /api/query`
 - `GET /api/catalog/tables`
@@ -88,5 +89,23 @@ Run a registered job immediately:
   "tenant": "default",
   "name": "nightly_maintenance",
   "timeout_ms": 30000
+}
+```
+
+Status responses include a `health` object:
+
+```json
+{
+  "ok": true,
+  "storage_mode": "disk",
+  "scheduler_running": true,
+  "wal_active": false,
+  "advanced_wal_active": false,
+  "recovery": {
+    "mode": "memory",
+    "recovered_transactions": 0,
+    "recovered_operations": 0,
+    "truncated": false
+  }
 }
 ```

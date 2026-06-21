@@ -55,30 +55,32 @@ type CatalogTrigger struct {
 // lookup helpers used by the rest of the system for introspection and
 // scheduling. CatalogManager is safe for concurrent use.
 type CatalogManager struct {
-	mu       sync.RWMutex
-	tables   map[string]*CatalogTable
-	columns  map[string][]CatalogColumn
-	views    map[string]*CatalogView
-	mviews   map[string]*CatalogMaterializedView
-	funcs    map[string]*CatalogFunction
-	jobs     map[string]*CatalogJob
-	jobRuns  []*CatalogJobHistory
-	nextRun  int64
-	triggers map[string]*CatalogTrigger // keyed by trigger name
+	mu           sync.RWMutex
+	tables       map[string]*CatalogTable
+	columns      map[string][]CatalogColumn
+	views        map[string]*CatalogView
+	mviews       map[string]*CatalogMaterializedView
+	dependencies map[string][]CatalogDependency
+	funcs        map[string]*CatalogFunction
+	jobs         map[string]*CatalogJob
+	jobRuns      []*CatalogJobHistory
+	nextRun      int64
+	triggers     map[string]*CatalogTrigger // keyed by trigger name
 }
 
 // NewCatalogManager allocates and returns an initialized CatalogManager.
 func NewCatalogManager() *CatalogManager {
 	return &CatalogManager{
-		tables:   make(map[string]*CatalogTable),
-		columns:  make(map[string][]CatalogColumn),
-		views:    make(map[string]*CatalogView),
-		mviews:   make(map[string]*CatalogMaterializedView),
-		funcs:    make(map[string]*CatalogFunction),
-		jobs:     make(map[string]*CatalogJob),
-		jobRuns:  make([]*CatalogJobHistory, 0),
-		nextRun:  1,
-		triggers: make(map[string]*CatalogTrigger),
+		tables:       make(map[string]*CatalogTable),
+		columns:      make(map[string][]CatalogColumn),
+		views:        make(map[string]*CatalogView),
+		mviews:       make(map[string]*CatalogMaterializedView),
+		dependencies: make(map[string][]CatalogDependency),
+		funcs:        make(map[string]*CatalogFunction),
+		jobs:         make(map[string]*CatalogJob),
+		jobRuns:      make([]*CatalogJobHistory, 0),
+		nextRun:      1,
+		triggers:     make(map[string]*CatalogTrigger),
 	}
 }
 
@@ -118,21 +120,35 @@ type CatalogView struct {
 
 // CatalogMaterializedView stores a saved query with physical refresh metadata.
 type CatalogMaterializedView struct {
-	Schema         string
-	Name           string
-	SQLText        string
-	CacheTableName string
-	StaleAfterMs   int64
-	RefreshEveryMs int64
-	DailyAt        string
-	Timezone       string
-	WithData       bool
-	LastRefreshAt  *time.Time
-	LastDurationMs int64
-	LastError      string
-	IsRefreshing   bool
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	Schema             string
+	Name               string
+	SQLText            string
+	CacheTableName     string
+	StaleAfterMs       int64
+	RefreshEveryMs     int64
+	DailyAt            string
+	Timezone           string
+	WithData           bool
+	InvalidateOnChange bool
+	IsStale            bool
+	LastRefreshAt      *time.Time
+	LastDurationMs     int64
+	LastError          string
+	IsRefreshing       bool
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+}
+
+// CatalogDependency records that one catalog object depends on another object.
+type CatalogDependency struct {
+	Schema          string
+	ObjectName      string
+	ObjectType      string
+	DependsOnSchema string
+	DependsOnName   string
+	DependsOnType   string
+	DependencyType  string
+	CreatedAt       time.Time
 }
 
 // CatalogFunction represents metadata for scalar and table-valued functions
@@ -253,6 +269,7 @@ func (c *CatalogManager) DeleteView(schema, name string) error {
 	delete(c.views, key)
 	delete(c.tables, key)
 	delete(c.columns, key)
+	delete(c.dependencies, key)
 	return nil
 }
 
@@ -313,6 +330,7 @@ func (c *CatalogManager) DeleteMaterializedView(schema, name string) error {
 	delete(c.mviews, key)
 	delete(c.tables, key)
 	delete(c.columns, key)
+	delete(c.dependencies, key)
 	return nil
 }
 
@@ -366,6 +384,7 @@ func (c *CatalogManager) FinishMaterializedViewRefresh(schema, name string, refr
 	mv.LastError = errMsg
 	if errMsg == "" {
 		mv.LastRefreshAt = &refreshedAt
+		mv.IsStale = false
 	}
 	mv.UpdatedAt = time.Now()
 	if t := c.tables[schema+"."+name]; t != nil {
@@ -373,6 +392,81 @@ func (c *CatalogManager) FinishMaterializedViewRefresh(schema, name string, refr
 		t.UpdatedAt = mv.UpdatedAt
 	}
 	return nil
+}
+
+// SetDependencies replaces the dependency list for a catalog object.
+func (c *CatalogManager) SetDependencies(schema, objectName, objectType string, deps []CatalogDependency) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := schema + "." + objectName
+	if len(deps) == 0 {
+		delete(c.dependencies, key)
+		return
+	}
+	now := time.Now()
+	out := make([]CatalogDependency, 0, len(deps))
+	for _, dep := range deps {
+		if dep.Schema == "" {
+			dep.Schema = schema
+		}
+		if dep.ObjectName == "" {
+			dep.ObjectName = objectName
+		}
+		if dep.ObjectType == "" {
+			dep.ObjectType = objectType
+		}
+		if dep.DependsOnSchema == "" {
+			dep.DependsOnSchema = "main"
+		}
+		if dep.DependsOnType == "" {
+			dep.DependsOnType = "UNKNOWN"
+		}
+		if dep.DependencyType == "" {
+			dep.DependencyType = "NORMAL"
+		}
+		if dep.CreatedAt.IsZero() {
+			dep.CreatedAt = now
+		}
+		out = append(out, dep)
+	}
+	c.dependencies[key] = out
+}
+
+// GetDependencies returns all recorded catalog dependencies.
+func (c *CatalogManager) GetDependencies() []CatalogDependency {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]CatalogDependency, 0)
+	for _, deps := range c.dependencies {
+		out = append(out, deps...)
+	}
+	return out
+}
+
+// MarkMaterializedViewsStaleByDependency marks opt-in materialized views stale
+// when they depend on the changed object. It returns the affected view names.
+func (c *CatalogManager) MarkMaterializedViewsStaleByDependency(schema, changedName string) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	changedKey := strings.ToLower(schema + "." + changedName)
+	affected := make([]string, 0)
+	for key, deps := range c.dependencies {
+		mv := c.mviews[key]
+		if mv == nil || !mv.InvalidateOnChange {
+			continue
+		}
+		for _, dep := range deps {
+			depKey := strings.ToLower(dep.DependsOnSchema + "." + dep.DependsOnName)
+			if depKey != changedKey {
+				continue
+			}
+			mv.IsStale = true
+			mv.UpdatedAt = time.Now()
+			affected = append(affected, mv.Name)
+			break
+		}
+	}
+	return affected
 }
 
 // RegisterFunction registers or updates a function's metadata.
@@ -660,6 +754,12 @@ func (db *DB) StopJobScheduler() {
 	if scheduler != nil {
 		scheduler.Stop()
 	}
+}
+
+// RestartJobScheduler restarts the database job scheduler with the executor.
+func (db *DB) RestartJobScheduler(executor JobExecutor) error {
+	db.StopJobScheduler()
+	return db.StartJobScheduler(executor)
 }
 
 // JobScheduler returns the active database job scheduler, if any.

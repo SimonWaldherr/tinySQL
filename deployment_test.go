@@ -97,3 +97,51 @@ func TestOpenEnterpriseStartsScheduler(t *testing.T) {
 		t.Fatal("expected enterprise profile to start job scheduler")
 	}
 }
+
+func TestInstanceStopStartRestartHealth(t *testing.T) {
+	dir := t.TempDir()
+	inst, err := OpenEnterprise(StorageConfig{Mode: ModeDisk, Path: dir}, "main")
+	if err != nil {
+		t.Fatalf("OpenEnterprise failed: %v", err)
+	}
+	defer inst.Close()
+
+	if !inst.Health().OK {
+		t.Fatalf("initial health = %#v", inst.Health())
+	}
+	if _, err := inst.ExecuteSQL(context.Background(), "CREATE TABLE users (id INT, name TEXT)"); err != nil {
+		t.Fatalf("CREATE TABLE failed: %v", err)
+	}
+	if _, err := inst.ExecuteSQL(context.Background(), "INSERT INTO users VALUES (1, 'Ada')"); err != nil {
+		t.Fatalf("INSERT failed: %v", err)
+	}
+
+	if err := inst.Stop(); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+	stopped := inst.Health()
+	if stopped.OK || !stopped.Closed || stopped.LastCloseAt.IsZero() {
+		t.Fatalf("stopped health mismatch: %#v", stopped)
+	}
+
+	if err := inst.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	if !inst.Health().OK || inst.DB.JobScheduler() == nil {
+		t.Fatalf("started health mismatch: %#v", inst.Health())
+	}
+	rs, err := inst.ExecuteSQL(context.Background(), "SELECT name FROM users")
+	if err != nil {
+		t.Fatalf("SELECT after start failed: %v", err)
+	}
+	if len(rs.Rows) != 1 || rs.Rows[0]["name"] != "Ada" {
+		t.Fatalf("unexpected rows after start: %#v", rs.Rows)
+	}
+
+	if err := inst.Restart(); err != nil {
+		t.Fatalf("Restart failed: %v", err)
+	}
+	if !inst.Health().OK || inst.DB.JobScheduler() == nil {
+		t.Fatalf("restarted health mismatch: %#v", inst.Health())
+	}
+}

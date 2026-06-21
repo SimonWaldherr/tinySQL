@@ -254,6 +254,80 @@ func TestObjectStatusViews(t *testing.T) {
 	}
 }
 
+func TestMaterializedViewDependenciesAndInvalidateOnChange(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	mvExecSQL(t, ctx, db, "CREATE TABLE dep_orders (customer_id INT, amount INT, status TEXT)")
+	mvExecSQL(t, ctx, db, "INSERT INTO dep_orders VALUES (1, 10, 'paid'), (1, 5, 'open')")
+	mvExecSQL(t, ctx, db, `
+		CREATE MATERIALIZED VIEW dep_paid_totals AS
+		WITH paid AS (
+			SELECT customer_id, amount FROM dep_orders WHERE status = 'paid'
+		)
+		SELECT customer_id, SUM(amount) AS total
+		FROM paid
+		GROUP BY customer_id
+		INVALIDATE ON CHANGE
+		WITH DATA
+	`)
+
+	rs := mvQuerySQL(t, ctx, db, "SELECT object_name, depends_on_name, depends_on_type FROM sys.dependencies WHERE object_name = 'dep_paid_totals'")
+	if len(rs.Rows) != 1 {
+		t.Fatalf("sys.dependencies rows = %#v", rs.Rows)
+	}
+	if rs.Rows[0]["depends_on_name"] != "dep_orders" || rs.Rows[0]["depends_on_type"] != "TABLE" {
+		t.Fatalf("unexpected dependency row: %#v", rs.Rows[0])
+	}
+	rs = mvQuerySQL(t, ctx, db, "SELECT object_name, depends_on_name FROM catalog.dependencies WHERE object_name = 'dep_paid_totals'")
+	if len(rs.Rows) != 1 || rs.Rows[0]["depends_on_name"] != "dep_orders" {
+		t.Fatalf("catalog.dependencies rows = %#v", rs.Rows)
+	}
+
+	rs = mvQuerySQL(t, ctx, db, "SELECT total FROM dep_paid_totals WHERE customer_id = 1")
+	if len(rs.Rows) != 1 || rs.Rows[0]["total"] != float64(10) {
+		t.Fatalf("initial materialized rows = %#v", rs.Rows)
+	}
+
+	mvExecSQL(t, ctx, db, "INSERT INTO dep_orders VALUES (1, 7, 'paid')")
+	rs = mvQuerySQL(t, ctx, db, "SELECT name, status, is_stale FROM sys.objects WHERE name = 'dep_paid_totals'")
+	if len(rs.Rows) != 1 || rs.Rows[0]["status"] != "STALE" || rs.Rows[0]["is_stale"] != true {
+		t.Fatalf("expected stale status after dependency change: %#v", rs.Rows)
+	}
+
+	rs = mvQuerySQL(t, ctx, db, "SELECT total FROM dep_paid_totals WHERE customer_id = 1")
+	if len(rs.Rows) != 1 || rs.Rows[0]["total"] != float64(17) {
+		t.Fatalf("stale read should refresh materialized rows: %#v", rs.Rows)
+	}
+	rs = mvQuerySQL(t, ctx, db, "SELECT name, is_stale FROM catalog.materialized_views WHERE name = 'dep_paid_totals'")
+	if len(rs.Rows) != 1 || rs.Rows[0]["is_stale"] != false {
+		t.Fatalf("expected refresh to clear stale flag: %#v", rs.Rows)
+	}
+}
+
+func TestMaterializedViewInvalidateOnChangeIsOptIn(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	mvExecSQL(t, ctx, db, "CREATE TABLE noinv_orders (amount INT)")
+	mvExecSQL(t, ctx, db, "INSERT INTO noinv_orders VALUES (10)")
+	mvExecSQL(t, ctx, db, `
+		CREATE MATERIALIZED VIEW noinv_total AS
+		SELECT SUM(amount) AS total FROM noinv_orders
+		WITH DATA
+	`)
+
+	mvExecSQL(t, ctx, db, "INSERT INTO noinv_orders VALUES (5)")
+	rs := mvQuerySQL(t, ctx, db, "SELECT name, status, is_stale FROM sys.objects WHERE name = 'noinv_total'")
+	if len(rs.Rows) != 1 || rs.Rows[0]["status"] != "FRESH" || rs.Rows[0]["is_stale"] != false {
+		t.Fatalf("non opt-in materialized view should stay fresh: %#v", rs.Rows)
+	}
+	rs = mvQuerySQL(t, ctx, db, "SELECT total FROM noinv_total")
+	if len(rs.Rows) != 1 || rs.Rows[0]["total"] != float64(10) {
+		t.Fatalf("non opt-in materialized view should keep cache: %#v", rs.Rows)
+	}
+}
+
 func BenchmarkMaterializedViewCachedRead(b *testing.B) {
 	db := storage.NewDB()
 	ctx := context.Background()

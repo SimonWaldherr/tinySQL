@@ -129,6 +129,12 @@ type CatalogJob = storage.CatalogJob
 // CatalogJobHistory records a scheduled job run.
 type CatalogJobHistory = storage.CatalogJobHistory
 
+// DBHealth describes database lifecycle, storage, scheduler, and recovery state.
+type DBHealth = storage.DBHealth
+
+// RecoveryStatus describes the last recovery pass performed while opening a DB.
+type RecoveryStatus = storage.RecoveryStatus
+
 // ============================================================================
 // MVCC Types - Transaction management and isolation
 // ============================================================================
@@ -570,12 +576,28 @@ func StartJobScheduler(db *DB, tenant string) error {
 	return db.StartJobScheduler(NewSQLJobExecutor(db, tenant))
 }
 
+// RestartJobScheduler restarts the database job scheduler for a tenant.
+func RestartJobScheduler(db *DB, tenant string) error {
+	if db == nil {
+		return fmt.Errorf("nil DB")
+	}
+	return db.RestartJobScheduler(NewSQLJobExecutor(db, tenant))
+}
+
 // StopJobScheduler stops the database job scheduler.
 func StopJobScheduler(db *DB) {
 	if db == nil {
 		return
 	}
 	db.StopJobScheduler()
+}
+
+// HealthCheck returns a production-oriented database health snapshot.
+func HealthCheck(db *DB) DBHealth {
+	if db == nil {
+		return DBHealth{OK: false, Error: "nil DB"}
+	}
+	return db.HealthCheck()
 }
 
 // ============================================================================

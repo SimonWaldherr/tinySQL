@@ -304,7 +304,7 @@
       <div class="card-content">
         <p data-i18n="demoDesc">Diese Demo lädt tinySQL als WebAssembly-Modul und führt es komplett im Browser aus.</p>
         <div class="info-message">
-          <strong data-i18n="note">Hinweis:</strong> <span data-i18n="demoNote">Die Datenbank läuft im Arbeitsspeicher (DSN: <code>mem://?tenant=default</code>). Daten gehen beim Neuladen der Seite verloren.</span>
+          <strong data-i18n="note">Hinweis:</strong> <span data-i18n="demoNote">Die Datenbank läuft im Browser und wird lokal per localStorage wiederhergestellt. Der Snapshot verlässt deinen Browser nicht.</span>
         </div>
         
         <div class="button-row">
@@ -443,6 +443,16 @@ SELECT * FROM users;"></textarea>
     const btnClear = document.getElementById('btn-clear');
     const demoSelect = document.getElementById('demo-select');
 
+    const persistenceKeys = {
+      snapshot: 'tinysql-wasm-demo-snapshot-v1',
+      editor: 'tinysql-wasm-demo-editor-v1',
+      selectedDemo: 'tinysql-wasm-demo-selected-demo-v1',
+      demoLoaded: 'tinysql-wasm-demo-demo-loaded-v1'
+    };
+    let connectionRestored = false;
+    let connecting = false;
+    let editorSaveTimer = null;
+
     const demoQueries = {
       // Date & Time Functions
       datediff_group: `-- Zeitspanne je Nutzer in Stunden (DATEDIFF)\nSELECT user_id, DATEDIFF('HOURS', MIN(ts), MAX(ts)) AS hours_span\nFROM events\nGROUP BY user_id\nORDER BY user_id;`,
@@ -517,7 +527,7 @@ SELECT * FROM users;"></textarea>
         dbInfo: 'Database Information',
         demoDesc: 'This demo loads tinySQL as a WebAssembly module and runs entirely in the browser.',
         note: 'Note:',
-        demoNote: 'The database runs in memory (DSN: mem://?tenant=default). Data is lost when the page reloads.'
+        demoNote: 'The database runs in the browser and is restored locally via localStorage. The snapshot never leaves your browser.'
       },
       de: {
         refLink: '📚 Function Reference',
@@ -532,7 +542,7 @@ SELECT * FROM users;"></textarea>
         dbInfo: 'Database Information',
         demoDesc: 'Diese Demo lädt tinySQL als WebAssembly-Modul und führt es komplett im Browser aus.',
         note: 'Hinweis:',
-        demoNote: 'Die Datenbank läuft im Arbeitsspeicher (DSN: mem://?tenant=default). Daten gehen beim Neuladen der Seite verloren.'
+        demoNote: 'Die Datenbank läuft im Browser und wird lokal per localStorage wiederhergestellt. Der Snapshot verlässt deinen Browser nicht.'
       }
     };
 
@@ -556,6 +566,154 @@ SELECT * FROM users;"></textarea>
     const mainLang = (navigator.language || 'de').startsWith('en') ? 'en' : 'de';
     document.getElementById('langSelectMain').value = mainLang;
     setMainLanguage(mainLang);
+
+    function storageGet(key) {
+      try {
+        return window.localStorage ? window.localStorage.getItem(key) : null;
+      } catch (error) {
+        console.warn('localStorage read failed:', error);
+        return null;
+      }
+    }
+
+    function storageSet(key, value) {
+      try {
+        if (!window.localStorage) return false;
+        window.localStorage.setItem(key, value);
+        return true;
+      } catch (error) {
+        console.warn('localStorage write failed:', error);
+        showResult('Lokales Speichern fehlgeschlagen. Browser-Quota oder private session prüfen.', 'error');
+        return false;
+      }
+    }
+
+    function storageRemove(key) {
+      try {
+        if (window.localStorage) window.localStorage.removeItem(key);
+      } catch (error) {
+        console.warn('localStorage remove failed:', error);
+      }
+    }
+
+    function parseApiResult(result) {
+      return typeof result === 'string' ? JSON.parse(result) : (result || {});
+    }
+
+    function readPersistedSnapshot() {
+      const raw = storageGet(persistenceKeys.snapshot);
+      if (!raw) return null;
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed.data === 'string') return parsed;
+      } catch (_) {
+        // Backward-compatible path for snapshots stored as raw base64 strings.
+      }
+      return { data: raw };
+    }
+
+    function saveEditorState() {
+      storageSet(persistenceKeys.editor, sqlEditor.value);
+      storageSet(persistenceKeys.selectedDemo, demoSelect.value || '');
+      storageSet(persistenceKeys.demoLoaded, demoLoaded ? '1' : '0');
+    }
+
+    function scheduleEditorStateSave() {
+      window.clearTimeout(editorSaveTimer);
+      editorSaveTimer = window.setTimeout(saveEditorState, 150);
+    }
+
+    function restoreEditorState() {
+      const savedSQL = storageGet(persistenceKeys.editor);
+      if (savedSQL !== null) {
+        sqlEditor.value = savedSQL;
+      }
+      const savedDemo = storageGet(persistenceKeys.selectedDemo);
+      if (savedDemo && demoQueries[savedDemo]) {
+        demoSelect.value = savedDemo;
+      }
+      demoLoaded = storageGet(persistenceKeys.demoLoaded) === '1';
+    }
+
+    async function saveDatabaseSnapshot() {
+      if (!dbConnected || !window.tinySQL || typeof window.tinySQL.exportDB !== 'function') {
+        return false;
+      }
+      try {
+        const parsed = parseApiResult(window.tinySQL.exportDB());
+        if (!parsed || parsed.success === false || parsed.error || typeof parsed.data !== 'string') {
+          console.warn('Database snapshot export failed:', parsed && (parsed.error || parsed.message));
+          return false;
+        }
+        const payload = {
+          version: 1,
+          savedAt: new Date().toISOString(),
+          sizeBytes: parsed.size_bytes || 0,
+          data: parsed.data
+        };
+        return storageSet(persistenceKeys.snapshot, JSON.stringify(payload));
+      } catch (error) {
+        console.warn('Database snapshot export failed:', error);
+        return false;
+      }
+    }
+
+    async function restoreDatabaseSnapshot() {
+      if (!window.tinySQL || typeof window.tinySQL.importDB !== 'function') {
+        return false;
+      }
+      const snapshot = readPersistedSnapshot();
+      if (!snapshot || !snapshot.data) {
+        return false;
+      }
+      try {
+        updateStatus('Stelle lokalen Zustand wieder her...', 'connected');
+        const parsed = parseApiResult(window.tinySQL.importDB(snapshot.data));
+        if (!parsed || parsed.success === false || parsed.error) {
+          storageRemove(persistenceKeys.snapshot);
+          updateStatus('Verbunden', 'connected');
+          showResult(`Lokaler Snapshot konnte nicht geladen werden: ${parsed.error || 'unbekannter Fehler'}`, 'error');
+          return false;
+        }
+        dbConnected = true;
+        transactionActive = false;
+        connectionRestored = true;
+        updateStatus('Verbunden - lokaler Zustand wiederhergestellt', 'connected');
+        showResult('Lokaler Datenbankzustand wurde wiederhergestellt.', 'success');
+        return true;
+      } catch (error) {
+        storageRemove(persistenceKeys.snapshot);
+        updateStatus('Verbunden', 'connected');
+        showResult(`Lokaler Snapshot konnte nicht geladen werden: ${error.message}`, 'error');
+        return false;
+      }
+    }
+
+    async function connectDb({ restore = true, successMessage = '' } = {}) {
+      if (dbConnected) return true;
+      if (connecting) return false;
+      connecting = true;
+      try {
+        const result = await handleApiCall(() => window.tinySQL.open(), successMessage);
+        if (result && result.success) {
+          dbConnected = true;
+          transactionActive = false;
+          connectionRestored = false;
+          updateStatus('Verbunden', 'connected');
+          updateButtons();
+          if (restore && !connectionRestored) {
+            await restoreDatabaseSnapshot();
+            updateButtons();
+          }
+          return true;
+        }
+        return false;
+      } finally {
+        connecting = false;
+      }
+    }
+
+    restoreEditorState();
 
     function updateButtons() {
       const connected = dbConnected;
@@ -627,7 +785,7 @@ SELECT * FROM users;"></textarea>
     async function handleApiCall(apiCall, successMessage) {
       try {
         const result = apiCall();
-        const parsed = typeof result === 'string' ? JSON.parse(result) : result;
+        const parsed = parseApiResult(result);
         
         if (parsed.error) {
           showResult(parsed.error, 'error');
@@ -655,14 +813,14 @@ SELECT * FROM users;"></textarea>
           // For operations we expect to fail, wrap in try/catch to avoid console spam
           try {
             raw = window.tinySQL.exec(sql);
-            parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            parsed = parseApiResult(raw);
           } catch (e) {
             // Expected failure - return success indicator without logging
             return { success: true, ignored: true };
           }
         } else {
           raw = window.tinySQL.exec(sql);
-          parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+          parsed = parseApiResult(raw);
         }
         
         if (parsed && (parsed.error || parsed.success === false)) {
@@ -722,17 +880,18 @@ SELECT * FROM users;"></textarea>
         }
       }
       demoLoaded = true;
-      showResult('Demo-Daten erfolgreich geladen! 👍', 'success');
+      saveEditorState();
+      const persisted = await saveDatabaseSnapshot();
+      if (persisted) {
+        showResult('Demo-Daten erfolgreich geladen! 👍', 'success');
+      } else {
+        showResult('Demo-Daten geladen, aber lokales Speichern ist fehlgeschlagen.', 'error');
+      }
     }
 
     // Event listeners
     btnConnect.addEventListener('click', async () => {
-      const result = await handleApiCall(() => window.tinySQL.open(), 'Erfolgreich verbunden!');
-      if (result && result.success) {
-        dbConnected = true;
-        updateStatus('Verbunden', 'connected');
-        updateButtons();
-      }
+      await connectDb({ successMessage: 'Erfolgreich verbunden!' });
     });
 
     btnStatus.addEventListener('click', async () => {
@@ -747,6 +906,7 @@ SELECT * FROM users;"></textarea>
       if (result && result.success) {
         dbConnected = false;
         transactionActive = false;
+        connectionRestored = false;
         updateStatus('Getrennt', 'disconnected');
         updateButtons();
       }
@@ -764,6 +924,7 @@ SELECT * FROM users;"></textarea>
       const result = await handleApiCall(() => window.tinySQL.commit(), 'Transaktion bestätigt.');
       if (result && result.success) {
         transactionActive = false;
+        await saveDatabaseSnapshot();
         updateButtons();
       }
     });
@@ -783,7 +944,11 @@ SELECT * FROM users;"></textarea>
         return;
       }
       
-      await handleApiCall(() => window.tinySQL.exec(sql), 'SQL erfolgreich ausgeführt!');
+      const result = await handleApiCall(() => window.tinySQL.exec(sql), 'SQL erfolgreich ausgeführt!');
+      if (result && result.success !== false && !result.error) {
+        saveEditorState();
+        await saveDatabaseSnapshot();
+      }
     });
 
     btnQuery.addEventListener('click', async () => {
@@ -796,6 +961,8 @@ SELECT * FROM users;"></textarea>
       const result = await handleApiCall(() => window.tinySQL.query(sql));
       if (result && !result.error) {
         showTable(result);
+        saveEditorState();
+        await saveDatabaseSnapshot();
       }
     });
 
@@ -811,12 +978,17 @@ SELECT * FROM users;"></textarea>
         showResult('Hinweis: Bitte zuerst "Demo-Daten laden" ausführen, damit die Demo-Queries funktionieren.', 'info');
       }
       sqlEditor.value = demoQueries[key] || '';
+      saveEditorState();
     });
 
     btnClear.addEventListener('click', () => {
       sqlEditor.value = '';
+      demoSelect.value = '';
       resultContainer.innerHTML = '';
+      saveEditorState();
     });
+
+    sqlEditor.addEventListener('input', scheduleEditorStateSave);
 
     // Initialize WASM
     async function instantiateWasm(go) {
@@ -855,12 +1027,7 @@ SELECT * FROM users;"></textarea>
           updateButtons();
           // Auto-connect to reduce confusion
           updateStatus('WASM bereit – verbinde...', 'disconnected');
-          const res = await handleApiCall(() => window.tinySQL.open());
-          if (res && res.success) {
-            dbConnected = true;
-            updateStatus('Verbunden', 'connected');
-            updateButtons();
-          } else {
+          if (!(await connectDb())) {
             updateStatus('WASM bereit - nicht verbunden', 'disconnected');
           }
         } else {
@@ -879,12 +1046,7 @@ SELECT * FROM users;"></textarea>
       updateButtons();
       // Also auto-connect here in case the event fires before the polling loop
       updateStatus('WASM bereit – verbinde...', 'disconnected');
-      const res = await handleApiCall(() => window.tinySQL.open());
-      if (res && res.success) {
-        dbConnected = true;
-        updateStatus('Verbunden', 'connected');
-        updateButtons();
-      } else {
+      if (!(await connectDb())) {
         updateStatus('WASM bereit - nicht verbunden', 'disconnected');
       }
     });

@@ -327,6 +327,37 @@ type tenantDB struct {
 	tables map[string]*Table
 }
 
+// RecoveryStatus describes the last recovery pass performed while opening a DB.
+type RecoveryStatus struct {
+	Mode                  StorageMode
+	Path                  string
+	CheckpointLoaded      bool
+	RecoveredTransactions uint64
+	RecoveredOperations   int
+	Truncated             bool
+	RecoveredAt           time.Time
+}
+
+// DBHealth is a point-in-time operational snapshot for production probes.
+type DBHealth struct {
+	OK                bool
+	Mode              StorageMode
+	ModeName          string
+	Path              string
+	Closed            bool
+	Closing           bool
+	SchedulerRunning  bool
+	WALActive         bool
+	AdvancedWALActive bool
+	Tenants           int
+	Tables            int
+	BackendStats      BackendStats
+	LastSyncAt        time.Time
+	LastCloseAt       time.Time
+	Recovery          RecoveryStatus
+	Error             string
+}
+
 // DB is an in-memory, multi-tenant database catalog with full MVCC support.
 // It optionally delegates storage to a StorageBackend for disk-based or
 // hybrid persistence strategies.
@@ -355,6 +386,13 @@ type DB struct {
 
 	// Configuration used to open this database (may be nil).
 	config *StorageConfig
+
+	closing      bool
+	closed       bool
+	lastSyncAt   time.Time
+	lastCloseAt  time.Time
+	lastRecovery RecoveryStatus
+	lastError    string
 }
 
 // NewDB creates a new empty database catalog with MVCC support.
@@ -401,7 +439,8 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 			return nil, fmt.Errorf("ModeWAL requires a Path")
 		}
 		// Load checkpoint if exists
-		if _, err := loadGOBInto(db, cfg.Path); err != nil {
+		checkpointLoaded, err := loadGOBInto(db, cfg.Path)
+		if err != nil {
 			return nil, fmt.Errorf("open wal db: %w", err)
 		}
 		// Attach WAL
@@ -414,14 +453,17 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 		if err != nil {
 			return nil, fmt.Errorf("open wal: %w", err)
 		}
+		wal.recovery.CheckpointLoaded = checkpointLoaded
 		db.attachWAL(wal)
+		db.recordRecovery(wal.recovery)
 
 	case ModeAdvancedWAL:
 		if cfg.Path == "" {
 			return nil, fmt.Errorf("ModeAdvancedWAL requires a Path")
 		}
 		checkpointPath := cfg.Path + ".checkpoint"
-		if _, err := loadGOBInto(db, checkpointPath); err != nil {
+		checkpointLoaded, err := loadGOBInto(db, checkpointPath)
+		if err != nil {
 			return nil, fmt.Errorf("open advanced wal checkpoint: %w", err)
 		}
 		walCfg := AdvancedWALConfig{
@@ -437,10 +479,18 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 			return nil, fmt.Errorf("open advanced wal: %w", err)
 		}
 		// Recover pending WAL operations
-		if _, err := wal.Recover(db); err != nil {
+		recovered, err := wal.Recover(db)
+		if err != nil {
 			return nil, fmt.Errorf("recover advanced wal: %w", err)
 		}
 		db.AttachAdvancedWAL(wal)
+		db.recordRecovery(RecoveryStatus{
+			Mode:                ModeAdvancedWAL,
+			Path:                cfg.Path,
+			CheckpointLoaded:    checkpointLoaded,
+			RecoveredOperations: recovered,
+			RecoveredAt:         time.Now(),
+		})
 
 	case ModeDisk:
 		if cfg.Path == "" {
@@ -763,15 +813,16 @@ type diskTable struct {
 }
 
 type diskCatalog struct {
-	Tables   []*CatalogTable
-	Columns  map[string][]CatalogColumn
-	Views    []*CatalogView
-	MViews   []*CatalogMaterializedView
-	Funcs    []*CatalogFunction
-	Jobs     []*CatalogJob
-	JobRuns  []*CatalogJobHistory
-	NextRun  int64
-	Triggers []*CatalogTrigger
+	Tables       []*CatalogTable
+	Columns      map[string][]CatalogColumn
+	Views        []*CatalogView
+	MViews       []*CatalogMaterializedView
+	Dependencies []CatalogDependency
+	Funcs        []*CatalogFunction
+	Jobs         []*CatalogJob
+	JobRuns      []*CatalogJobHistory
+	NextRun      int64
+	Triggers     []*CatalogTrigger
 }
 
 func catalogToDisk(c *CatalogManager) diskCatalog {
@@ -782,15 +833,16 @@ func catalogToDisk(c *CatalogManager) diskCatalog {
 	defer c.mu.RUnlock()
 
 	dc := diskCatalog{
-		Tables:   make([]*CatalogTable, 0, len(c.tables)),
-		Columns:  make(map[string][]CatalogColumn, len(c.columns)),
-		Views:    make([]*CatalogView, 0, len(c.views)),
-		MViews:   make([]*CatalogMaterializedView, 0, len(c.mviews)),
-		Funcs:    make([]*CatalogFunction, 0, len(c.funcs)),
-		Jobs:     make([]*CatalogJob, 0, len(c.jobs)),
-		JobRuns:  make([]*CatalogJobHistory, 0, len(c.jobRuns)),
-		NextRun:  c.nextRun,
-		Triggers: make([]*CatalogTrigger, 0, len(c.triggers)),
+		Tables:       make([]*CatalogTable, 0, len(c.tables)),
+		Columns:      make(map[string][]CatalogColumn, len(c.columns)),
+		Views:        make([]*CatalogView, 0, len(c.views)),
+		MViews:       make([]*CatalogMaterializedView, 0, len(c.mviews)),
+		Dependencies: make([]CatalogDependency, 0),
+		Funcs:        make([]*CatalogFunction, 0, len(c.funcs)),
+		Jobs:         make([]*CatalogJob, 0, len(c.jobs)),
+		JobRuns:      make([]*CatalogJobHistory, 0, len(c.jobRuns)),
+		NextRun:      c.nextRun,
+		Triggers:     make([]*CatalogTrigger, 0, len(c.triggers)),
 	}
 	if dc.NextRun == 0 {
 		dc.NextRun = 1
@@ -811,6 +863,9 @@ func catalogToDisk(c *CatalogManager) diskCatalog {
 	for _, mv := range c.mviews {
 		cp := *mv
 		dc.MViews = append(dc.MViews, &cp)
+	}
+	for _, deps := range c.dependencies {
+		dc.Dependencies = append(dc.Dependencies, deps...)
 	}
 	for _, f := range c.funcs {
 		cp := *f
@@ -861,6 +916,10 @@ func diskToCatalog(dc diskCatalog) *CatalogManager {
 		}
 		cp := *mv
 		c.mviews[cp.Schema+"."+cp.Name] = &cp
+	}
+	for _, dep := range dc.Dependencies {
+		key := dep.Schema + "." + dep.ObjectName
+		c.dependencies[key] = append(c.dependencies[key], dep)
 	}
 	for _, f := range dc.Funcs {
 		if f == nil {
@@ -1334,6 +1393,8 @@ type WALManager struct {
 	nextTxID           uint64
 	txSinceCheckpoint  uint64
 	lastCheckpoint     time.Time
+	closed             bool
+	recovery           RecoveryStatus
 }
 
 func (db *DB) attachWAL(wal *WALManager) {
@@ -1418,12 +1479,85 @@ func (db *DB) Config() *StorageConfig {
 	return db.config
 }
 
+func (db *DB) recordRecovery(status RecoveryStatus) {
+	if status.RecoveredAt.IsZero() {
+		status.RecoveredAt = time.Now()
+	}
+	db.mu.Lock()
+	db.lastRecovery = status
+	db.mu.Unlock()
+}
+
+func (db *DB) markSynced() {
+	db.mu.Lock()
+	db.lastSyncAt = time.Now()
+	db.lastError = ""
+	db.mu.Unlock()
+}
+
+func (db *DB) markError(err error) error {
+	if err == nil {
+		return nil
+	}
+	db.mu.Lock()
+	db.lastError = err.Error()
+	db.mu.Unlock()
+	return err
+}
+
+// HealthCheck returns a production-oriented lifecycle and storage snapshot.
+func (db *DB) HealthCheck() DBHealth {
+	if db == nil {
+		return DBHealth{OK: false, Error: "nil DB"}
+	}
+
+	db.mu.RLock()
+	path := ""
+	if db.config != nil {
+		path = db.config.Path
+	}
+	tableCount := 0
+	for _, tdb := range db.tenants {
+		tableCount += len(tdb.tables)
+	}
+	health := DBHealth{
+		OK:                !db.closed && !db.closing,
+		Mode:              db.storageMode,
+		ModeName:          db.storageMode.String(),
+		Path:              path,
+		Closed:            db.closed,
+		Closing:           db.closing,
+		SchedulerRunning:  db.scheduler != nil,
+		WALActive:         db.wal != nil,
+		AdvancedWALActive: db.advancedWAL != nil,
+		Tenants:           len(db.tenants),
+		Tables:            tableCount,
+		LastSyncAt:        db.lastSyncAt,
+		LastCloseAt:       db.lastCloseAt,
+		Recovery:          db.lastRecovery,
+		Error:             db.lastError,
+	}
+	db.mu.RUnlock()
+
+	health.BackendStats = db.BackendStats()
+	if health.Error == "" {
+		switch {
+		case health.Closed:
+			health.Error = "database closed"
+		case health.Closing:
+			health.Error = "database closing"
+		}
+	}
+	return health
+}
+
 // Sync flushes all dirty in-memory tables to the storage backend. For
 // ModeMemory and ModeWAL this is a no-op (those modes use SaveToFile /
 // WAL checkpoints respectively). For ModeDisk, ModeHybrid, and ModeIndex,
 // tables whose version has changed since the last save are written to disk.
 func (db *DB) Sync() error {
 	if db.backend == nil {
+		db.markSynced()
 		return nil
 	}
 
@@ -1454,21 +1588,40 @@ func (db *DB) Sync() error {
 
 		for _, e := range toSave {
 			if err := db.backend.SaveTable(e.tenant, e.table); err != nil {
-				return err
+				return db.markError(err)
 			}
 		}
 	}
 
 	if err := db.backend.Sync(); err != nil {
-		return err
+		return db.markError(err)
 	}
-	return db.saveBackendCatalog()
+	if err := db.saveBackendCatalog(); err != nil {
+		return db.markError(err)
+	}
+	db.markSynced()
+	return nil
 }
 
 // Close persists all data and releases resources. For ModeMemory with a
 // configured path, this saves a final GOB snapshot. For ModeDisk/ModeHybrid,
 // dirty tables are flushed. WAL and Advanced WAL resources are closed.
 func (db *DB) Close() error {
+	if db == nil {
+		return nil
+	}
+	db.mu.Lock()
+	if db.closed {
+		db.mu.Unlock()
+		return nil
+	}
+	if db.closing {
+		db.mu.Unlock()
+		return nil
+	}
+	db.closing = true
+	db.mu.Unlock()
+
 	var firstErr error
 
 	db.StopJobScheduler()
@@ -1496,6 +1649,17 @@ func (db *DB) Close() error {
 			firstErr = err
 		}
 	}
+
+	db.mu.Lock()
+	db.closing = false
+	db.lastCloseAt = time.Now()
+	if firstErr == nil {
+		db.closed = true
+		db.lastError = ""
+	} else {
+		db.lastError = firstErr.Error()
+	}
+	db.mu.Unlock()
 
 	return firstErr
 }
@@ -1612,7 +1776,7 @@ func OpenWAL(db *DB, cfg WALConfig) (*WALManager, error) {
 		basePath = strings.TrimSuffix(basePath, ".gz")
 	}
 	walPath := basePath + ".wal"
-	nextSeq, nextTxID, committed, err := replayWAL(db, walPath)
+	nextSeq, nextTxID, committed, truncated, err := replayWAL(db, walPath)
 	if err != nil {
 		return nil, err
 	}
@@ -1639,6 +1803,13 @@ func OpenWAL(db *DB, cfg WALConfig) (*WALManager, error) {
 		nextTxID:           nextTxID,
 		txSinceCheckpoint:  committed,
 		lastCheckpoint:     time.Now(),
+		recovery: RecoveryStatus{
+			Mode:                  ModeWAL,
+			Path:                  walPath,
+			RecoveredTransactions: committed,
+			Truncated:             truncated,
+			RecoveredAt:           time.Now(),
+		},
 	}
 	wm.encoder = gob.NewEncoder(writer)
 	return wm, nil
@@ -1652,6 +1823,9 @@ func (w *WALManager) LogTransaction(changes []WALChange) (bool, error) {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.closed {
+		return false, fmt.Errorf("wal is closed")
+	}
 	txID := w.nextTxID
 	w.nextTxID++
 	if err := w.writeRecord(&walRecord{Seq: w.nextSeq, TxID: txID, Type: walRecordBegin, WrittenAt: time.Now().UnixNano()}); err != nil {
@@ -1712,6 +1886,9 @@ func (w *WALManager) Checkpoint(db *DB) error {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.closed {
+		return fmt.Errorf("wal is closed")
+	}
 	if w.checkpointPath == "" {
 		return nil
 	}
@@ -1751,6 +1928,9 @@ func (w *WALManager) Close() error {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.closed {
+		return nil
+	}
 	if w.writer != nil {
 		if err := w.writer.Flush(); err != nil {
 			return err
@@ -1760,12 +1940,21 @@ func (w *WALManager) Close() error {
 		if err := w.file.Sync(); err != nil {
 			return err
 		}
-		return w.file.Close()
+		if err := w.file.Close(); err != nil {
+			return err
+		}
 	}
+	w.closed = true
+	w.file = nil
+	w.writer = nil
+	w.encoder = nil
 	return nil
 }
 
 func (w *WALManager) writeRecord(rec *walRecord) error {
+	if w.closed || w.encoder == nil {
+		return fmt.Errorf("wal is closed")
+	}
 	return w.encoder.Encode(rec)
 }
 
@@ -1783,13 +1972,13 @@ func (w *WALManager) flushSync() error {
 	return nil
 }
 
-func replayWAL(db *DB, walPath string) (nextSeq, nextTxID, committed uint64, err error) {
+func replayWAL(db *DB, walPath string) (nextSeq, nextTxID, committed uint64, truncated bool, err error) {
 	f, err := os.Open(walPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return 1, 1, 0, nil
+			return 1, 1, 0, false, nil
 		}
-		return 0, 0, 0, err
+		return 0, 0, 0, false, err
 	}
 	defer f.Close()
 	cr := &countingReader{r: f}
@@ -1808,9 +1997,9 @@ func replayWAL(db *DB, walPath string) (nextSeq, nextTxID, committed uint64, err
 				if lastGood >= 0 {
 					_ = os.Truncate(walPath, lastGood)
 				}
-				return lastSeq + 1, lastTx + 1, committed, nil
+				return lastSeq + 1, lastTx + 1, committed, true, nil
 			}
-			return 0, 0, 0, err
+			return 0, 0, 0, false, err
 		}
 		lastGood = cr.n
 		if rec.Seq > lastSeq {
@@ -1821,7 +2010,7 @@ func replayWAL(db *DB, walPath string) (nextSeq, nextTxID, committed uint64, err
 		}
 		handleWalRecord(db, rec, pending, &committed)
 	}
-	return lastSeq + 1, lastTx + 1, committed, nil
+	return lastSeq + 1, lastTx + 1, committed, false, nil
 }
 
 // handleWalRecord processes a single WAL record and updates pending map and committed count.

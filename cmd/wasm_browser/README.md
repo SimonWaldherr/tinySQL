@@ -34,24 +34,33 @@ cd web && python3 -m http.server 8080
 - SQL editor with multi-statement support
 - Result table with column headers
 - Schema inspector (list tables, show columns)
-- Query history stored in `localStorage`
+- SQL editor state, selected demo query, and the database snapshot are restored
+  from `localStorage`
 - Export results as CSV or JSON
 
 ## JavaScript API
 
-The WASM module exposes global functions callable from the browser console or
-your own JavaScript:
+The WASM module exposes `window.tinySQL` functions callable from the browser
+console or your own JavaScript:
 
 | Function | Description |
 |----------|-------------|
-| `executeSQL(sql)` | Execute one or more SQL statements |
-| `listTables()` | Return a JSON array of table names |
-| `getSchema(table)` | Return column definitions for a table |
-| `clearDatabase()` | Reset the in-memory database |
+| `tinySQL.open([dsn])` | Open an in-memory database connection |
+| `tinySQL.close()` | Close the current connection |
+| `tinySQL.exec(sql)` | Execute a SQL statement |
+| `tinySQL.query(sql)` | Execute a query and return rows |
+| `tinySQL.exportDB()` | Return a base64-encoded GOB snapshot |
+| `tinySQL.importDB(snapshot)` | Replace the current database from a snapshot |
+| `tinySQL.listTables()` | Return table metadata |
+| `tinySQL.describeTable(table)` | Return column definitions for a table |
 
 ## Notes
 
-- The database is **in-memory** and resets on page reload.
+- The SQL engine still runs in memory. The browser demo persists a compact
+  database snapshot to `localStorage` after successful mutations and restores
+  it on reload.
+- Clear the browser's site data for the demo origin to reset the persisted
+  snapshot.
 - WASM files must be served over HTTP (not `file://`) due to browser security
   restrictions — use the built-in server or any static file host.
 - For a Node.js variant see [`../wasm_node/`](../wasm_node/).

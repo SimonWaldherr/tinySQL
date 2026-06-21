@@ -251,7 +251,7 @@ func isKeyword(up string) bool {
 		"INSERT", "INTO", "VALUES",
 		"UPDATE", "SET", "DELETE", "RETURNING",
 		"MATERIALIZED", "REFRESH", "STALE", "AFTER", "EVERY", "DAILY", "AT",
-		"TIMEZONE", "DATA", "NO", "DEMAND", "HOURS", "MINUTES",
+		"TIMEZONE", "DATA", "NO", "DEMAND", "INVALIDATE", "CHANGE", "HOURS", "MINUTES",
 		"SECONDS", "DAYS", "MILLISECOND", "MILLISECONDS", "MS",
 		"CONCURRENTLY",
 		"INDEX", "VIEW", "REPLACE", "IF", "EXISTS",
@@ -317,11 +317,13 @@ func isKeyword(up string) bool {
 		"BITMAP_NEW", "BITMAP_SET", "BITMAP_GET", "BITMAP_COUNT", "BITMAP_OR", "BITMAP_AND",
 		// Trigger keywords (FOR, AFTER, ROW are already in the main list above)
 		"TRIGGER", "EACH", "BEFORE", "INSTEAD", "OF", "NEW", "OLD",
-		// BEGIN/END for trigger bodies (also used in other contexts)
-		"BEGIN",
+		// Statement wrappers and block delimiters
+		"EXPLAIN", "BEGIN",
 		// FTS keywords
 		"VIRTUAL", "USING", "MATCH",
 		"FTS_MATCH", "FTS_RANK", "FTS_SNIPPET", "BM25":
+		return true
+	case "PRAGMA":
 		return true
 	default:
 		return false

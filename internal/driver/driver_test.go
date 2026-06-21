@@ -382,6 +382,76 @@ func TestTransactionsSnapshotAndReadonly(t *testing.T) {
 	}
 }
 
+func TestSQLTransactionControlCommands(t *testing.T) {
+	d := &drv{}
+	rawConn, err := d.Open("mem://")
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	c := rawConn.(*conn)
+	if _, err := c.ExecContext(context.Background(), "CREATE TABLE tx_sql (id INT)", nil); err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+
+	if _, err := c.ExecContext(context.Background(), "begin transaction;", nil); err != nil {
+		t.Fatalf("BEGIN failed: %v", err)
+	}
+	if _, err := c.ExecContext(context.Background(), "INSERT INTO tx_sql VALUES (1)", nil); err != nil {
+		t.Fatalf("insert in tx failed: %v", err)
+	}
+	if _, err := c.ExecContext(context.Background(), "ROLLBACK", nil); err != nil {
+		t.Fatalf("ROLLBACK failed: %v", err)
+	}
+	rows, err := c.QueryContext(context.Background(), "SELECT id FROM tx_sql", nil)
+	if err != nil {
+		t.Fatalf("select after rollback failed: %v", err)
+	}
+	if err := rows.Next(make([]driver.Value, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("expected no rows after rollback, got err=%v", err)
+	}
+
+	if _, err := c.ExecContext(context.Background(), "START TRANSACTION", nil); err != nil {
+		t.Fatalf("START TRANSACTION failed: %v", err)
+	}
+	if _, err := c.ExecContext(context.Background(), "INSERT INTO tx_sql VALUES (2)", nil); err != nil {
+		t.Fatalf("insert in second tx failed: %v", err)
+	}
+	if _, err := c.ExecContext(context.Background(), "COMMIT TRANSACTION", nil); err != nil {
+		t.Fatalf("COMMIT failed: %v", err)
+	}
+	rows, err = c.QueryContext(context.Background(), "SELECT id FROM tx_sql", nil)
+	if err != nil {
+		t.Fatalf("select after commit failed: %v", err)
+	}
+	dest := make([]driver.Value, 1)
+	if err := rows.Next(dest); err != nil {
+		t.Fatalf("expected committed row: %v", err)
+	}
+	if dest[0] != int64(2) && dest[0] != 2 {
+		t.Fatalf("committed row = %#v, want 2", dest[0])
+	}
+}
+
+func TestQueryExplainReturnsRows(t *testing.T) {
+	d := &drv{}
+	rawConn, err := d.Open("mem://")
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	c := rawConn.(*conn)
+	rows, err := c.QueryContext(context.Background(), "EXPLAIN SELECT * FROM explain_table WHERE id = 1", nil)
+	if err != nil {
+		t.Fatalf("EXPLAIN query failed: %v", err)
+	}
+	if cols := rows.Columns(); len(cols) != 3 || cols[0] != "step" || cols[1] != "operation" || cols[2] != "detail" {
+		t.Fatalf("unexpected EXPLAIN columns: %#v", cols)
+	}
+	dest := make([]driver.Value, 3)
+	if err := rows.Next(dest); err != nil {
+		t.Fatalf("expected EXPLAIN row: %v", err)
+	}
+}
+
 func TestCheckNamedValue(t *testing.T) {
 	c := &conn{}
 	// time.Time
