@@ -600,6 +600,19 @@ SELECT * FROM users;"></textarea>
       return typeof result === 'string' ? JSON.parse(result) : (result || {});
     }
 
+    function sqlMayMutate(sql) {
+      const stripped = String(sql || '')
+        .replace(/--[^\n]*/g, ' ')
+        .replace(/\/\*[\s\S]*?\*\//g, ' ')
+        .replace(/'(?:''|[^'])*'/g, "''")
+        .trim();
+      if (!stripped) return false;
+      return stripped.split(';').some((statement) => {
+        const first = statement.trim().split(/\s+/)[0]?.toUpperCase();
+        return first && !['SELECT', 'WITH', 'EXPLAIN', 'SHOW', 'DESCRIBE', 'PRAGMA'].includes(first);
+      });
+    }
+
     function readPersistedSnapshot() {
       const raw = storageGet(persistenceKeys.snapshot);
       if (!raw) return null;
@@ -962,7 +975,9 @@ SELECT * FROM users;"></textarea>
       if (result && !result.error) {
         showTable(result);
         saveEditorState();
-        await saveDatabaseSnapshot();
+        if (sqlMayMutate(sql)) {
+          await saveDatabaseSnapshot();
+        }
       }
     });
 

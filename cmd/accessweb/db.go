@@ -255,49 +255,15 @@ func (a *App) executeSQL(ctx context.Context, query string) QueryResult { //noli
 	start := time.Now()
 	result := QueryResult{}
 
-	// Detect query type to decide whether to use Query or Exec.
-	upper := strings.TrimSpace(strings.ToUpper(query))
-	isSelect := strings.HasPrefix(upper, "SELECT") ||
-		strings.HasPrefix(upper, "WITH") ||
-		strings.HasPrefix(upper, "SHOW") ||
-		strings.HasPrefix(upper, "EXPLAIN")
-
-	if isSelect {
-		rows, err := a.sqlDB.QueryContext(ctx, query)
-		if err != nil {
-			result.Err = err.Error()
-			result.Elapsed = time.Since(start)
-			return result
-		}
-		defer rows.Close()
-
-		cols, err := rows.Columns()
+	if isResultQuerySQL(query) {
+		cols, rows, err := a.queryRows(ctx, query)
 		if err != nil {
 			result.Err = err.Error()
 			result.Elapsed = time.Since(start)
 			return result
 		}
 		result.Columns = cols
-
-		for rows.Next() {
-			vals := make([]interface{}, len(cols))
-			ptrs := make([]interface{}, len(cols))
-			for i := range vals {
-				ptrs[i] = &vals[i]
-			}
-			if err := rows.Scan(ptrs...); err != nil {
-				result.Err = err.Error()
-				break
-			}
-			row := make([]string, len(cols))
-			for i, v := range vals {
-				row[i] = anyToString(v)
-			}
-			result.Rows = append(result.Rows, row)
-		}
-		if err := rows.Err(); err != nil {
-			result.Err = err.Error()
-		}
+		result.Rows = rows
 	} else {
 		res, err := a.sqlDB.ExecContext(ctx, query)
 		if err != nil {
@@ -311,6 +277,48 @@ func (a *App) executeSQL(ctx context.Context, query string) QueryResult { //noli
 
 	result.Elapsed = time.Since(start)
 	return result
+}
+
+func (a *App) queryRows(ctx context.Context, query string) ([]string, [][]string, error) { //nolint:gosec
+	rows, err := a.sqlDB.QueryContext(ctx, query)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	return scanRows(rows)
+}
+
+func scanRows(rows *sql.Rows) ([]string, [][]string, error) {
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	result := make([][]string, 0)
+	for rows.Next() {
+		vals := make([]interface{}, len(cols))
+		ptrs := make([]interface{}, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, nil, err
+		}
+		row := make([]string, len(cols))
+		for i, v := range vals {
+			row[i] = anyToString(v)
+		}
+		result = append(result, row)
+	}
+	return cols, result, rows.Err()
+}
+
+func isResultQuerySQL(query string) bool {
+	upper := strings.TrimSpace(strings.ToUpper(query))
+	return strings.HasPrefix(upper, "SELECT") ||
+		strings.HasPrefix(upper, "WITH") ||
+		strings.HasPrefix(upper, "SHOW") ||
+		strings.HasPrefix(upper, "EXPLAIN")
 }
 
 // quoteName wraps a table or column name in double-quotes for safety.

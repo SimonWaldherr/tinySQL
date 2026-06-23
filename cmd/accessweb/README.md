@@ -10,6 +10,7 @@ A minimalist, modern browser-based database manager for [tinySQL](https://github
 | **Datasheet View** | View, sort, and page through table rows |
 | **Record CRUD** | Add, edit, and delete records from any table with an `id INT` column |
 | **Table Design** | Create new tables with a visual column designer (INT, FLOAT, TEXT, BOOL) |
+| **Export** | Download whole tables or SQL query results as CSV or JSON |
 | **Drop Table** | Delete any table with a one-click confirmation |
 | **SQL Editor** | Run arbitrary SQL with an async JSON API; results are rendered inline |
 | **File Persistence** | Optionally read/write a `.gob` file on disk |
@@ -17,10 +18,13 @@ A minimalist, modern browser-based database manager for [tinySQL](https://github
 ## Quick Start
 
 ```bash
-# In-memory (data lost on exit)
+# File-backed by default (accessweb.db)
 go run .
 
-# Persist to a file
+# Explicit in-memory mode (data lost on exit)
+go run . -db :memory:
+
+# Persist to a custom file
 go run . -db mydata.db
 
 # Custom port
@@ -34,7 +38,7 @@ Open your browser at **http://localhost:8080**.
 | Flag | Default | Description |
 |---|---|---|
 | `-addr` | `:8080` | HTTP listen address |
-| `-db` | _(empty)_ | Path to a `.gob` database file. Created if it doesn't exist. |
+| `-db` | `accessweb.db` | Path to a `.gob` database file. Use `:memory:` or an empty value for in-memory mode. |
 | `-tenant` | `default` | Tenant namespace within the database |
 
 ## Architecture
@@ -62,6 +66,7 @@ cmd/accessweb/
 |---|---|---|
 | `GET` | `/` | Redirect to first table, or empty-state |
 | `GET` | `/t/{table}` | Datasheet view (query params: `page`, `sort`, `dir`) |
+| `GET` | `/t/{table}/export?format=csv\|json` | Download a full table export |
 | `GET` | `/t/{table}/new` | New record form |
 | `POST` | `/t/{table}/new` | Create record |
 | `GET` | `/t/{table}/{id}/edit` | Edit record form |
@@ -70,6 +75,7 @@ cmd/accessweb/
 | `POST` | `/drop-table/{table}` | Drop table |
 | `GET` | `/query` | SQL editor page |
 | `POST` | `/api/query` | Execute SQL (JSON API) |
+| `POST` | `/api/export` | Download SQL query results as CSV or JSON |
 | `GET` | `/create-table` | Table designer |
 | `POST` | `/create-table` | Create table |
 | `GET/POST` | `/static/*` | Static assets |
@@ -101,6 +107,15 @@ Response (error):
 ```json
 { "error": "table not found" }
 ```
+
+**POST /api/export**
+
+Request:
+```json
+{ "sql": "SELECT * FROM my_table", "format": "csv" }
+```
+
+The endpoint accepts result-producing SQL (`SELECT`, `WITH`, `SHOW`, `EXPLAIN`) and returns an attachment in `csv` or `json` format.
 
 ## Running Tests
 

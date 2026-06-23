@@ -4,11 +4,13 @@
 # Usage:
 #   ./build.sh            Build only
 #   ./build.sh --serve    Build, then start a local HTTP server on port 8080
+#   ./build.sh --skip-build --serve
+#                         Serve existing artefacts without rebuilding
 #   ./build.sh --clean    Remove generated artefacts and exit
 #
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null && pwd -P)"
 cd "$SCRIPT_DIR"
 
 PORT="${PORT:-8080}"
@@ -22,13 +24,15 @@ elapsed()  { echo "$(( $(date +%s) - $1 ))s"; }
 # ── flags ────────────────────────────────────────────────────────────────────
 SERVE=false
 CLEAN=false
+SKIP_BUILD=false
 for arg in "$@"; do
     case "$arg" in
         --serve|-s)  SERVE=true ;;
         --build-only|-b) SERVE=false ;;
+        --skip-build) SKIP_BUILD=true ;;
         --clean|-c)  CLEAN=true ;;
         --help|-h)
-            sed -n '2,8s/^# //p' "$0"
+            sed -n '2,10s/^# //p' "$SCRIPT_DIR/build.sh"
             exit 0 ;;
         *)
             echo "Unknown flag: $arg"
@@ -44,86 +48,94 @@ if $CLEAN; then
 fi
 
 # ── pre-flight checks ───────────────────────────────────────────────────────
-echo "🔨 Building TinySQL Query Files WASM…"
+if ! $SKIP_BUILD; then
+    echo "🔨 Building TinySQL Query Files WASM…"
+else
+    echo "⏭️  Skipping build; using existing WASM artefacts…"
+fi
 
-if ! command -v go >/dev/null 2>&1; then
+if ! $SKIP_BUILD && ! command -v go >/dev/null 2>&1; then
     echo "❌ Go toolchain not found. Install Go from https://go.dev/dl/"
     exit 1
 fi
 
-GO_VERSION="$(go version)"
-echo "   Go: $GO_VERSION"
-if [ -n "${GOFLAGS:-}" ]; then
-    echo "   GOFLAGS: ${GOFLAGS}"
-fi
-
-# ── compile ──────────────────────────────────────────────────────────────────
-T0=$(date +%s)
-echo "📦 Compiling Go → WASM (stripping debug info)…"
-# shellcheck disable=SC2086
-GOOS=js GOARCH=wasm go build ${GOFLAGS:-} -trimpath -buildvcs=false -ldflags "-s -w" -o "$WASM_OUT" .
-RAW_SIZE=$(filesize "$WASM_OUT")
-echo "   Compiled in $(elapsed $T0)  –  raw size: $(human "$RAW_SIZE")"
-
-# ── copy wasm_exec.js ────────────────────────────────────────────────────────
-echo "📋 Copying wasm_exec.js…"
-GOROOT_PATH="$(go env GOROOT)"
-WASM_EXEC=""
-for candidate in \
-    "${GOROOT_PATH}/lib/wasm/wasm_exec.js" \
-    "${GOROOT_PATH}/misc/wasm/wasm_exec.js"; do
-    if [ -f "$candidate" ]; then
-        WASM_EXEC="$candidate"
-        break
+if ! $SKIP_BUILD; then
+    GO_VERSION="$(go version)"
+    echo "   Go: $GO_VERSION"
+    if [ -n "${GOFLAGS:-}" ]; then
+        echo "   GOFLAGS: ${GOFLAGS}"
     fi
-done
-if [ -z "$WASM_EXEC" ] || [ ! -f "$WASM_EXEC" ]; then
-    echo "❌ Could not find wasm_exec.js in Go installation (GOROOT=$(go env GOROOT))"
-    exit 1
 fi
-cp "$WASM_EXEC" .
-echo "   Copied from $WASM_EXEC"
 
-# ── optional wasm-opt / wasm-strip ──────────────────────────────────────────
-if command -v wasm-opt >/dev/null 2>&1; then
-    echo "🔧 Optimising with wasm-opt (trying multiple strategies)…"
+T0=$(date +%s)
+if ! $SKIP_BUILD; then
+    # ── compile ──────────────────────────────────────────────────────────────
+    echo "📦 Compiling Go → WASM (stripping debug info)…"
+    # shellcheck disable=SC2086
+    GOOS=js GOARCH=wasm go build ${GOFLAGS:-} -trimpath -buildvcs=false -ldflags "-s -w" -o "$WASM_OUT" .
+    RAW_SIZE=$(filesize "$WASM_OUT")
+    echo "   Compiled in $(elapsed $T0)  –  raw size: $(human "$RAW_SIZE")"
 
-    VARIANTS=(
-        "--enable-bulk-memory -Oz --strip-debug"
-        "--enable-bulk-memory -Oz --strip-debug --converge"
-        "--enable-bulk-memory -O3 --strip-debug --converge"
-    )
+    # ── copy wasm_exec.js ────────────────────────────────────────────────────
+    echo "📋 Copying wasm_exec.js…"
+    GOROOT_PATH="$(go env GOROOT)"
+    WASM_EXEC=""
+    for candidate in \
+        "${GOROOT_PATH}/lib/wasm/wasm_exec.js" \
+        "${GOROOT_PATH}/misc/wasm/wasm_exec.js"; do
+        if [ -f "$candidate" ]; then
+            WASM_EXEC="$candidate"
+            break
+        fi
+    done
+    if [ -z "$WASM_EXEC" ] || [ ! -f "$WASM_EXEC" ]; then
+        echo "❌ Could not find wasm_exec.js in Go installation (GOROOT=$(go env GOROOT))"
+        exit 1
+    fi
+    cp "$WASM_EXEC" .
+    echo "   Copied from $WASM_EXEC"
 
-    BEST_SIZE=$(filesize "$WASM_OUT")
+    # ── optional wasm-opt / wasm-strip ──────────────────────────────────────
+    if command -v wasm-opt >/dev/null 2>&1; then
+        echo "🔧 Optimising with wasm-opt (trying multiple strategies)…"
 
-    for v in "${VARIANTS[@]}"; do
-        TMP_OUT="${WASM_OUT}.opt.tmp"
-        # shellcheck disable=SC2086
-        if wasm-opt $v -o "$TMP_OUT" "$WASM_OUT" 2>/dev/null; then
-            sz=$(filesize "$TMP_OUT")
-            if [ "$sz" -gt 0 ] && [ "$sz" -lt "$BEST_SIZE" ]; then
-                echo "   ✅ $v → $(human "$sz") (saved $(( BEST_SIZE - sz )) bytes)"
-                mv -f "$TMP_OUT" "$WASM_OUT"
-                BEST_SIZE=$sz
+        VARIANTS=(
+            "--enable-bulk-memory -Oz --strip-debug"
+            "--enable-bulk-memory -Oz --strip-debug --converge"
+            "--enable-bulk-memory -O3 --strip-debug --converge"
+        )
+
+        BEST_SIZE=$(filesize "$WASM_OUT")
+
+        for v in "${VARIANTS[@]}"; do
+            TMP_OUT="${WASM_OUT}.opt.tmp"
+            # shellcheck disable=SC2086
+            if wasm-opt $v -o "$TMP_OUT" "$WASM_OUT" 2>/dev/null; then
+                sz=$(filesize "$TMP_OUT")
+                if [ "$sz" -gt 0 ] && [ "$sz" -lt "$BEST_SIZE" ]; then
+                    echo "   ✅ $v → $(human "$sz") (saved $(( BEST_SIZE - sz )) bytes)"
+                    mv -f "$TMP_OUT" "$WASM_OUT"
+                    BEST_SIZE=$sz
+                else
+                    rm -f "$TMP_OUT"
+                fi
             else
                 rm -f "$TMP_OUT"
             fi
-        else
-            rm -f "$TMP_OUT"
-        fi
-    done
+        done
 
-    echo "   Final optimised size: $(human "$BEST_SIZE")"
-elif command -v wasm-strip >/dev/null 2>&1; then
-    echo "🔧 Stripping debug sections with wasm-strip…"
-    wasm-strip "$WASM_OUT" || true
-else
-    echo "ℹ️  Tip: install Binaryen (wasm-opt) for further size reduction"
-fi
+        echo "   Final optimised size: $(human "$BEST_SIZE")"
+    elif command -v wasm-strip >/dev/null 2>&1; then
+        echo "🔧 Stripping debug sections with wasm-strip…"
+        wasm-strip "$WASM_OUT" || true
+    else
+        echo "ℹ️  Tip: install Binaryen (wasm-opt) for further size reduction"
+    fi
 
-# ── gzip pre-compress ───────────────────────────────────────────────────────
-if command -v gzip >/dev/null 2>&1; then
-    gzip -9 -c "$WASM_OUT" > "${WASM_OUT}.gz" 2>/dev/null || true
+    # ── gzip pre-compress ───────────────────────────────────────────────────
+    if command -v gzip >/dev/null 2>&1; then
+        gzip -9 -c "$WASM_OUT" > "${WASM_OUT}.gz" 2>/dev/null || true
+    fi
 fi
 
 # ── summary ──────────────────────────────────────────────────────────────────

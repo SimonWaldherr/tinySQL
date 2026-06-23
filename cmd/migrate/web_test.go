@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -211,6 +213,71 @@ func TestWebExportCSV(t *testing.T) {
 	}
 	if ct := w.Header().Get("Content-Type"); ct != "text/csv" {
 		t.Errorf("expected text/csv, got %s", ct)
+	}
+}
+
+func TestWebExportRejectsDDL(t *testing.T) {
+	state := newTestWebState(t)
+
+	body := `{"sql":"CREATE TABLE exported (id INT)","format":"csv"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/export", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	state.handleAPIExport(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "export requires") {
+		t.Errorf("expected export requires error, got %s", w.Body.String())
+	}
+}
+
+func TestWebImportFileYAML(t *testing.T) {
+	state := &webState{db: tinysql.NewDB(), ctx: context.Background(), tenant: "default"}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	filePart, err := writer.CreateFormFile("file", "users.yaml")
+	if err != nil {
+		t.Fatalf("CreateFormFile: %v", err)
+	}
+	if _, err := filePart.Write([]byte("- id: 1\n  name: Alice\n- id: 2\n  name: Bob\n")); err != nil {
+		t.Fatalf("write file part: %v", err)
+	}
+	if err := writer.WriteField("table", "yaml_users"); err != nil {
+		t.Fatalf("WriteField: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close multipart writer: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/import-file", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	w := httptest.NewRecorder()
+	state.handleImportFile(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp apiResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if !resp.Success {
+		t.Fatalf("expected success, got error: %s", resp.Error)
+	}
+
+	stmt, err := tinysql.ParseSQL("SELECT * FROM yaml_users")
+	if err != nil {
+		t.Fatalf("ParseSQL failed: %v", err)
+	}
+	result, err := tinysql.Execute(state.ctx, state.db, state.tenant, stmt)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("expected 2 imported rows, got %d", len(result.Rows))
 	}
 }
 

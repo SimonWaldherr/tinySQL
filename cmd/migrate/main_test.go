@@ -260,3 +260,62 @@ func TestImportJSONFile(t *testing.T) {
 		t.Errorf("expected 2 rows, got %d", len(result.Rows))
 	}
 }
+
+func TestImportYAMLFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	yamlFile := filepath.Join(tmpDir, "data.yaml")
+	err := os.WriteFile(yamlFile, []byte("- id: 1\n  name: Alice\n- id: 2\n  name: Bob\n"), 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	db := tinysql.NewDB()
+
+	if err := importFileToTinySQL(db, ctx, "default", yamlFile, "yaml_data", true, false); err != nil {
+		t.Fatalf("importFileToTinySQL (YAML) failed: %v", err)
+	}
+
+	stmt, err := tinysql.ParseSQL("SELECT * FROM yaml_data")
+	if err != nil {
+		t.Fatalf("ParseSQL failed: %v", err)
+	}
+	result, err := tinysql.Execute(ctx, db, "default", stmt)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if len(result.Rows) != 2 {
+		t.Errorf("expected 2 rows, got %d", len(result.Rows))
+	}
+}
+
+func TestImportXMLFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	xmlFile := filepath.Join(tmpDir, "data.xml")
+	err := os.WriteFile(xmlFile, []byte(`<root>
+  <record id="1" name="Alice" />
+  <record id="2" name="Bob" />
+</root>`), 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	db := tinysql.NewDB()
+
+	if err := importFileToTinySQL(db, ctx, "default", xmlFile, "xml_data", true, false); err != nil {
+		t.Fatalf("importFileToTinySQL (XML) failed: %v", err)
+	}
+
+	stmt, err := tinysql.ParseSQL("SELECT * FROM xml_data")
+	if err != nil {
+		t.Fatalf("ParseSQL failed: %v", err)
+	}
+	result, err := tinysql.Execute(ctx, db, "default", stmt)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if len(result.Rows) != 2 {
+		t.Errorf("expected 2 rows, got %d", len(result.Rows))
+	}
+}

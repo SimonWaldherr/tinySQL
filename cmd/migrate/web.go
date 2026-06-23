@@ -356,14 +356,14 @@ func (s *webState) handleImportFile(w http.ResponseWriter, r *http.Request) {
 		tableName = tableNameFromFile(header.Filename)
 	}
 
-	// Write uploaded file to temp location
-	tmpDir := os.TempDir()
-	tmpFile := filepath.Join(tmpDir, "migrate_upload_"+header.Filename)
-	out, err := os.Create(tmpFile)
+	// Write uploaded file to a temp location while preserving the extension for format detection.
+	safeName := filepath.Base(header.Filename)
+	out, err := os.CreateTemp("", "migrate_upload_*"+filepath.Ext(safeName))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, apiResponse{Error: "failed to create temp file"})
 		return
 	}
+	tmpFile := out.Name()
 	if _, err := io.Copy(out, file); err != nil {
 		out.Close()
 		os.Remove(tmpFile)
@@ -452,8 +452,13 @@ func (s *webState) handleAPIExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	req.SQL = strings.TrimSpace(req.SQL)
 	if req.SQL == "" {
 		writeJSON(w, http.StatusBadRequest, apiResponse{Error: "sql is required"})
+		return
+	}
+	if !isResultQuerySQL(req.SQL) {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Error: "export requires SELECT, WITH, SHOW, or EXPLAIN"})
 		return
 	}
 	if req.Format == "" {
@@ -506,6 +511,14 @@ func writeJSON(w http.ResponseWriter, status int, data apiResponse) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(data)
+}
+
+func isResultQuerySQL(query string) bool {
+	upper := strings.TrimSpace(strings.ToUpper(query))
+	return strings.HasPrefix(upper, "SELECT") ||
+		strings.HasPrefix(upper, "WITH") ||
+		strings.HasPrefix(upper, "SHOW") ||
+		strings.HasPrefix(upper, "EXPLAIN")
 }
 
 // ============================================================================
@@ -847,8 +860,8 @@ header nav button.active { background: var(--accent); color: var(--bg); border-c
     <label for="importTable">Table Name (optional)</label>
     <input type="text" id="importTable" placeholder="Auto-detected from filename">
     <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
-      Drop CSV or JSON file here, or click to browse
-      <input type="file" id="fileInput" accept=".csv,.json,.jsonl,.tsv,.txt,.ndjson">
+      Drop CSV, JSON, YAML, or XML file here, or click to browse
+      <input type="file" id="fileInput" accept=".csv,.json,.jsonl,.tsv,.txt,.ndjson,.yaml,.yml,.xml">
     </div>
     <div class="actions">
       <button class="btn-cancel" onclick="hideModal('importFileModal')">Cancel</button>
@@ -1064,7 +1077,7 @@ async function uploadFile() {
       statusEl.className = 'status ok';
       // Reset
       fileInput.value = '';
-      uploadZone.textContent = 'Drop CSV or JSON file here, or click to browse';
+      uploadZone.textContent = 'Drop CSV, JSON, YAML, or XML file here, or click to browse';
       document.getElementById('importTable').value = '';
     }
   } catch (err) {

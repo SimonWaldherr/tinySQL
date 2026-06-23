@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
 	"encoding/xml"
@@ -52,6 +53,8 @@ func main() {
 	js.Global().Set("listTables", js.FuncOf(listTables))
 	js.Global().Set("exportResults", js.FuncOf(exportResults))
 	js.Global().Set("getTableSchema", js.FuncOf(getTableSchema))
+	js.Global().Set("exportDatabase", js.FuncOf(exportDatabase))
+	js.Global().Set("importDatabase", js.FuncOf(importDatabase))
 
 	println("TinySQL Query Files WASM initialized!")
 	<-c
@@ -312,6 +315,47 @@ func clearDatabase(this js.Value, args []js.Value) interface{} {
 	return map[string]interface{}{
 		"success": true,
 		"message": "Database cleared",
+	}
+}
+
+// exportDatabase serializes the current database as a base64 GOB snapshot.
+func exportDatabase(this js.Value, args []js.Value) interface{} {
+	data, err := tinysql.SaveToBytes(db)
+	if err != nil {
+		return jsErr("export failed: " + err.Error())
+	}
+	return map[string]interface{}{
+		"success":    true,
+		"data":       base64.StdEncoding.EncodeToString(data),
+		"sizeBytes":  len(data),
+		"exportedAt": time.Now().UTC().Format(time.RFC3339),
+	}
+}
+
+// importDatabase replaces the current database from a base64 GOB snapshot.
+func importDatabase(this js.Value, args []js.Value) interface{} {
+	if len(args) < 1 {
+		return jsErr("Usage: importDatabase(snapshot)")
+	}
+	encoded := strings.TrimSpace(args[0].String())
+	if encoded == "" {
+		return jsErr("snapshot must not be empty")
+	}
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return jsErr("invalid base64 snapshot: " + err.Error())
+	}
+	loaded, err := tinysql.LoadFromBytes(data)
+	if err != nil {
+		return jsErr("import failed: " + err.Error())
+	}
+	db = loaded
+	queryCache = tinysql.NewQueryCache(queryCacheSize)
+	lastResult = nil
+	return map[string]interface{}{
+		"success":   true,
+		"message":   "Database imported",
+		"sizeBytes": len(data),
 	}
 }
 

@@ -28,12 +28,18 @@ You can override the port:
 PORT=8090 ./build.sh --serve
 ```
 
+To serve already built artifacts without rebuilding:
+
+```bash
+./build.sh --skip-build --serve
+```
+
 ## UI capabilities
 
 - import CSV/TSV/TXT, JSON/JSONL/NDJSON, XML, and Excel (`.xlsx`, `.xls`)
 - execute single- and multi-statement SQL
 - schema inspection and table removal
-- query history in local storage
+- query history, editor state, and database snapshot in local storage
 - export results as CSV, JSON, XML
 
 ## JS/WASM API
@@ -46,4 +52,6 @@ The WASM module exposes:
 - `getTableSchema(tableName)`
 - `dropTable(tableName)`
 - `clearDatabase()`
+- `exportDatabase()`
+- `importDatabase(snapshot)`
 - `exportResults(format)`

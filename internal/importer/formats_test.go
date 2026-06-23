@@ -75,16 +75,43 @@ func TestImportByContent_CSVDetection(t *testing.T) {
 	}
 }
 
-func TestImportFile_XMLError(t *testing.T) {
+func TestImportFile_XML(t *testing.T) {
 	ctx := context.Background()
 	db := storage.NewDB()
 
 	dir := t.TempDir()
 	fn := filepath.Join(dir, "data.xml")
-	_ = os.WriteFile(fn, []byte("<root></root>"), 0644)
+	_ = os.WriteFile(fn, []byte(`<root>
+  <record id="1" name="Alice" />
+  <record id="2" name="Bob" />
+</root>`), 0644)
 
-	if _, err := ImportFile(ctx, db, "default", "", fn, &ImportOptions{}); err == nil {
-		t.Fatalf("expected ImportFile to return error for XML import (not implemented)")
+	res, err := ImportFile(ctx, db, "default", "people_xml", fn, &ImportOptions{CreateTable: true, TypeInference: true})
+	if err != nil {
+		t.Fatalf("ImportFile XML failed: %v", err)
+	}
+	if res.RowsInserted != 2 {
+		t.Fatalf("expected 2 rows inserted, got %d", res.RowsInserted)
+	}
+}
+
+func TestImportFile_XMLNestedRecords(t *testing.T) {
+	ctx := context.Background()
+	db := storage.NewDB()
+
+	dir := t.TempDir()
+	fn := filepath.Join(dir, "nested.xml")
+	_ = os.WriteFile(fn, []byte(`<root>
+  <record><id>1</id><name>Alice</name></record>
+  <record><id>2</id><name>Bob</name></record>
+</root>`), 0644)
+
+	res, err := ImportFile(ctx, db, "default", "people_nested", fn, &ImportOptions{CreateTable: true, TypeInference: true})
+	if err != nil {
+		t.Fatalf("ImportFile nested XML failed: %v", err)
+	}
+	if res.RowsInserted != 2 {
+		t.Fatalf("expected 2 rows inserted, got %d", res.RowsInserted)
 	}
 }
 

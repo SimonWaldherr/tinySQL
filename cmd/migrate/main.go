@@ -85,7 +85,7 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, `tinySQL Data Migration Tool
 
 A smart tool for data pipelines and processing. Import and export data
-between CSV/JSON files, tinySQL, and external databases (MySQL/MariaDB,
+between CSV/TSV/JSON/YAML/XML files, tinySQL, and external databases (MySQL/MariaDB,
 PostgreSQL, SQLite, MS SQL Server).
 
 Usage:
@@ -94,7 +94,7 @@ Usage:
 Commands:
   interactive          Start interactive REPL for data migration
   web                  Start web interface for data migration
-  import-file          Import a CSV/JSON file into tinySQL
+  import-file          Import a CSV/TSV/JSON/YAML/XML file into tinySQL
   import-db            Import data from an external database into tinySQL
   export-file          Export a tinySQL table to CSV/JSON file
   export-db            Export a tinySQL table to an external database
@@ -129,12 +129,12 @@ Inter-database Queries (interactive mode):
 }
 
 // ============================================================================
-// import-file: Import CSV/JSON files into tinySQL
+// import-file: Import structured files into tinySQL
 // ============================================================================
 
 func runImportFile(args []string) error {
 	fs := flag.NewFlagSet("import-file", flag.ExitOnError)
-	file := fs.String("file", "", "Path to CSV/JSON file to import")
+	file := fs.String("file", "", "Path to CSV/TSV/JSON/YAML/XML file to import")
 	table := fs.String("table", "", "Target table name (default: filename without extension)")
 	query := fs.String("query", "", "SQL query to execute after import")
 	output := fs.String("output", "", "Output file for query results (default: stdout)")
@@ -524,7 +524,7 @@ func printInteractiveHelp() {
 ║                                                                ║
 ║  Data Import                                                   ║
 ║  ───────────                                                   ║
-║  load <file>                    Load CSV/JSON into tinySQL     ║
+║  load <file>                    Load file into tinySQL         ║
 ║  load <file> AS <table>         Load with explicit table name  ║
 ║  import <conn> <table>          Import table from ext DB       ║
 ║  import <conn> "<query>" AS <t> Import query result as table   ║
@@ -934,23 +934,18 @@ func showTinyTables(db *tinysql.DB, tenant string) {
 // ============================================================================
 
 func importFileToTinySQL(db *tinysql.DB, ctx context.Context, tenant, filename, tableName string, fuzzy, verbose bool) error {
-	file, err := os.Open(filename)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
 	ext := strings.ToLower(filepath.Ext(filename))
+	opts := &tinysql.ImportOptions{
+		CreateTable:   true,
+		Truncate:      false,
+		HeaderMode:    "auto",
+		TypeInference: true,
+		TableName:     tableName,
+	}
 
 	if fuzzy {
-		opts := &tinysql.FuzzyImportOptions{
-			ImportOptions: &tinysql.ImportOptions{
-				CreateTable:   true,
-				Truncate:      false,
-				HeaderMode:    "auto",
-				TypeInference: true,
-				TableName:     tableName,
-			},
+		fuzzyOpts := &tinysql.FuzzyImportOptions{
+			ImportOptions:      opts,
 			SkipInvalidRows:    true,
 			TrimWhitespace:     true,
 			FixQuotes:          true,
@@ -964,7 +959,13 @@ func importFileToTinySQL(db *tinysql.DB, ctx context.Context, tenant, filename, 
 
 		switch ext {
 		case ".csv", ".tsv", ".txt":
-			result, err := tinysql.FuzzyImportCSV(ctx, db, tenant, tableName, file, opts)
+			file, err := os.Open(filename)
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+
+			result, err := tinysql.FuzzyImportCSV(ctx, db, tenant, tableName, file, fuzzyOpts)
 			if err != nil {
 				return err
 			}
@@ -978,30 +979,24 @@ func importFileToTinySQL(db *tinysql.DB, ctx context.Context, tenant, filename, 
 				}
 			}
 		case ".json", ".jsonl", ".ndjson":
-			_, err = tinysql.FuzzyImportJSON(ctx, db, tenant, tableName, file, opts)
+			file, err := os.Open(filename)
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+
+			_, err = tinysql.FuzzyImportJSON(ctx, db, tenant, tableName, file, fuzzyOpts)
 			if err != nil {
 				return err
 			}
 		default:
-			return fmt.Errorf("unsupported file format: %s (supported: .csv, .tsv, .txt, .json, .jsonl)", ext)
+			_, err := tinysql.ImportFile(ctx, db, tenant, tableName, filename, opts)
+			if err != nil {
+				return err
+			}
 		}
 	} else {
-		opts := &tinysql.ImportOptions{
-			CreateTable:   true,
-			Truncate:      false,
-			HeaderMode:    "auto",
-			TypeInference: true,
-			TableName:     tableName,
-		}
-
-		switch ext {
-		case ".csv", ".tsv", ".txt":
-			_, err = tinysql.ImportCSV(ctx, db, tenant, tableName, file, opts)
-		case ".json", ".jsonl", ".ndjson":
-			_, err = tinysql.ImportJSON(ctx, db, tenant, tableName, file, opts)
-		default:
-			return fmt.Errorf("unsupported file format: %s", ext)
-		}
+		_, err := tinysql.ImportFile(ctx, db, tenant, tableName, filename, opts)
 		if err != nil {
 			return err
 		}

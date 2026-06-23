@@ -667,6 +667,21 @@ func LoadFromFile(filename string) (*DB, error) {
 	return storage.LoadFromFile(filename)
 }
 
+// SaveToBytes serializes the entire database to an in-memory GOB snapshot.
+//
+// This is useful for embedding targets such as WebAssembly where writing to a
+// filesystem is unavailable or expensive. The returned bytes can be restored
+// with LoadFromBytes.
+func SaveToBytes(db *DB) ([]byte, error) {
+	return storage.SaveToBytes(db)
+}
+
+// LoadFromBytes deserializes a database from a GOB snapshot created by
+// SaveToBytes.
+func LoadFromBytes(snapshot []byte) (*DB, error) {
+	return storage.LoadFromBytes(snapshot)
+}
+
 // ============================================================================
 // Advanced WAL - Write-Ahead Logging
 // ============================================================================
@@ -761,13 +776,14 @@ type ImportOptions = importer.ImportOptions
 // Contains metadata about the import operation.
 type ImportResult = importer.ImportResult
 
-// ImportFile imports a structured data file (CSV, TSV, JSON, XML) into a table.
+// ImportFile imports a structured data file (CSV, TSV, JSON, YAML, XML) into a table.
 // The format is auto-detected from the file extension or content.
 //
 // Supported formats:
 //   - CSV (.csv) - Comma-separated values with auto-detected delimiters
 //   - TSV (.tsv, .tab) - Tab-separated values
 //   - JSON (.json) - Array of objects format: [{"id": 1, "name": "Alice"}, ...]
+//   - YAML (.yaml, .yml) - Sequence of mappings or a single mapping
 //   - XML (.xml) - Simple row-based XML (limited support)
 //   - Compressed (.gz) - Transparent gzip decompression
 //

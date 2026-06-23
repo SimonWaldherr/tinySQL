@@ -19,6 +19,12 @@
       <button class="btn btn-outline-secondary btn-sm" onclick="clearEditor()">
         <i class="bi bi-x-lg me-1"></i>Clear
       </button>
+      <button class="btn btn-outline-secondary btn-sm" onclick="exportQuery('csv')">
+        <i class="bi bi-filetype-csv me-1"></i>CSV
+      </button>
+      <button class="btn btn-outline-secondary btn-sm" onclick="exportQuery('json')">
+        <i class="bi bi-filetype-json me-1"></i>JSON
+      </button>
       <span id="statusMsg" class="small text-muted ms-2"></span>
     </div>
   </div>
@@ -102,6 +108,40 @@ function clearEditor() {
   document.getElementById('resultArea').innerHTML = '';
   document.getElementById('statusMsg').textContent = '';
   document.getElementById('sqlInput').focus();
+}
+
+function exportQuery(format) {
+  var sql = document.getElementById('sqlInput').value.trim();
+  if (!sql) return;
+  var status = document.getElementById('statusMsg');
+  status.textContent = 'Exporting…';
+
+  fetch('/api/export', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({sql: sql, format: format})
+  })
+  .then(function(r) {
+    if (!r.ok) {
+      return r.text().then(function(text) { throw new Error(text || r.statusText); });
+    }
+    return r.blob();
+  })
+  .then(function(blob) {
+    status.textContent = '';
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'query.' + format;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  })
+  .catch(function(err) {
+    status.textContent = '';
+    renderError(err.message || err.toString());
+  });
 }
 
 function renderError(msg) {

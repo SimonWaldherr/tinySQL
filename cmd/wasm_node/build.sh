@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null && pwd -P)"
 cd "$SCRIPT_DIR"
 
 RUN_DEMO=false
 SKIP_BUILD=false
 QUERY="SELECT 1"
+WASM_OUT="tinySQL.wasm"
 
 usage() {
     cat <<'EOF'
@@ -18,6 +19,9 @@ Usage:
   ./build.sh --skip-build --run        Run demo without rebuilding
 EOF
 }
+
+filesize() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null || echo 0; }
+human() { numfmt --to=iec-i --suffix=B "$1" 2>/dev/null || echo "$1 bytes"; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -83,10 +87,14 @@ if [[ "$SKIP_BUILD" == false ]]; then
         exit 1
     fi
     cp "$WASM_EXEC_PATH" wasm_exec.js
-    GOOS=js GOARCH=wasm go build -trimpath -ldflags "-s -w" -o tinySQL.wasm .
+    # shellcheck disable=SC2086
+    GOOS=js GOARCH=wasm go build ${GOFLAGS:-} -trimpath -buildvcs=false -ldflags "-s -w" -o "$WASM_OUT" .
 fi
 
 echo "Done."
+if [[ -f "$WASM_OUT" ]]; then
+    printf "  %-20s %s\n" "$WASM_OUT" "$(human "$(filesize "$WASM_OUT")")"
+fi
 if [[ "$RUN_DEMO" == true ]]; then
     if ! command -v node >/dev/null 2>&1; then
         echo "node not found (required for --run)" >&2

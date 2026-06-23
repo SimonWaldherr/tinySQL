@@ -12,6 +12,12 @@
     <span class="badge bg-secondary fw-normal ms-1" style="font-size:.7rem">{{$meta.RowCount}} rows</span>
   </h1>
   <div class="d-flex gap-2 flex-wrap">
+    <a href="/t/{{$table}}/export?format=csv" class="btn btn-sm btn-outline-secondary">
+      <i class="bi bi-filetype-csv me-1"></i>CSV
+    </a>
+    <a href="/t/{{$table}}/export?format=json" class="btn btn-sm btn-outline-secondary">
+      <i class="bi bi-filetype-json me-1"></i>JSON
+    </a>
     {{if $meta.HasID}}
     <a href="/t/{{$table}}/new" class="btn btn-sm btn-primary">
       <i class="bi bi-plus-lg me-1"></i>Add Record

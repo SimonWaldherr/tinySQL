@@ -20,6 +20,38 @@ tinySQL is being developed as one compatible engine with three runtime forms:
 - **Server / Enterprise DBMS**: networked runtime for jobs, operations, security, and future HA.
 
 The existing `NewDB`, `OpenDB`, `ParseSQL`, and `Execute` APIs remain the stable low-level API. New code can opt into the additive product-form helpers: `OpenPackage`, `OpenEmbedded`, `OpenServer`, and `OpenEnterprise`. See [docs/product-forms.md](./docs/product-forms.md).
+The long-term embedded database direction is tracked in [docs/sqlite-2030-roadmap.md](./docs/sqlite-2030-roadmap.md).
+
+## Production readiness
+
+Durable product forms now expose explicit lifecycle and observability hooks:
+
+- `Instance.Start`, `Instance.Stop`, `Instance.Restart`, and `Instance.Health`.
+- `DB.HealthCheck` / `tinysql.HealthCheck` for storage, scheduler, WAL, sync, close, and recovery status.
+- Idempotent close behavior for DB, WAL, and Advanced WAL resources.
+- `RestartJobScheduler` for controlled scheduler restarts.
+- `tinysqld` health/readiness/status endpoints backed by the same DB health snapshot.
+
+Example:
+
+```go
+inst, err := tinysql.OpenEnterprise(tinysql.StorageConfig{
+    Mode: tinysql.ModeDisk,
+    Path: "./data/tinysql",
+}, "default")
+if err != nil {
+    log.Fatal(err)
+}
+defer inst.Close()
+
+if !inst.Health().OK {
+    log.Fatalf("database unhealthy: %s", inst.Health().Error)
+}
+
+if err := inst.Restart(); err != nil {
+    log.Fatal(err)
+}
+```
 
 ## Quick start
 
@@ -199,19 +231,52 @@ status relative to SQLite.
 | Bitmap functions | `BITMAP_NEW/SET/GET/COUNT/OR/AND` |
 | String / math / date functions | Extensive built-in library |
 | Views (`CREATE VIEW`) | Stored and queryable, including CTE-backed view definitions |
-| Materialized views | `CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW`, lazy stale refresh, interval refresh, and daily scheduled refresh |
+| Materialized views | `CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW`, lazy stale refresh, interval refresh, daily scheduled refresh, and optional `INVALIDATE ON CHANGE` |
+| View dependencies | `sys.dependencies` / `catalog.dependencies` expose base-object dependencies for views and materialized views |
+| Schema-qualified names | Objects can use names such as `sales.orders`; system views expose `schema`, `name`, and `full_name` where applicable |
+| EXPLAIN | `EXPLAIN SELECT …` and `EXPLAIN CREATE MATERIALIZED VIEW …` return a compact logical plan |
+| Column constraints | Column-level `PRIMARY KEY`, `UNIQUE`, and `FOREIGN KEY REFERENCES` are enforced on INSERT/UPDATE |
 | Indexes (`CREATE INDEX`) | Metadata stored; query planner no-op |
 | **Full-Text Search (FTS)** | `CREATE VIRTUAL TABLE t USING fts(col1, col2)` with `FTS_MATCH`, `FTS_RANK`, `FTS_SNIPPET`, `BM25` |
 | **Triggers** | `CREATE TRIGGER … BEFORE/AFTER INSERT/UPDATE/DELETE ON table FOR EACH ROW BEGIN … END` |
-| MVCC + WAL | Snapshot isolation, crash-safe write-ahead log |
+| MVCC + WAL | Snapshot isolation, crash-safe write-ahead log; the database/sql driver supports `BEGIN`, `COMMIT`, and `ROLLBACK` on a single connection |
 | Multi-tenancy | Isolated namespaces inside one process |
 | Job scheduler | `CREATE JOB` for periodic or one-shot SQL |
 | Vector search | `VEC_SEARCH` / `VEC_TOP_K` TVFs with cosine/L2/dot/manhattan; `VEC_AVG` aggregate |
 | RAG helpers | `RECENCY_SCORE`, `RAG_HYBRID_SCORE`, `RAG_RANK_SCORE`, `RAG_CONTEXT`, `RAG_CONTEXT_FROM` |
 | Regex functions | `REGEXP_MATCH`, `REGEXP_EXTRACT`, `REGEXP_REPLACE` |
 | Virtual system tables | `SELECT * FROM sys.tables`, `sys.columns`, `sys.triggers`, … |
+| SQLite compatibility | `sqlite_schema`, `sqlite_master`, and common introspection PRAGMAs |
 | Table-valued functions | Extensible via `RegisterExternalTableFunc` |
 | Data types | INT, FLOAT, TEXT, BOOL, DATE, TIMESTAMP, UUID, BLOB, JSON, JSONB, VECTOR, YAML, URL, HASH, BITMAP, GEOMETRY, DECIMAL, MONEY, … |
+
+### SQLite compatibility quick start
+
+tinySQL exposes SQLite-style metadata for tools and ORMs that probe embedded
+databases before running application queries:
+
+```sql
+SELECT type, name, tbl_name, sql
+FROM sqlite_schema
+WHERE type IN ('table', 'view');
+
+SELECT name, sql
+FROM sqlite_master
+WHERE name = 'users';
+
+PRAGMA table_info(users);
+PRAGMA table_xinfo('users');
+PRAGMA table_list;
+PRAGMA database_list;
+PRAGMA journal_mode;
+PRAGMA foreign_keys = ON;
+PRAGMA integrity_check;
+PRAGMA compile_options;
+```
+
+The current PRAGMA layer is intentionally introspection-first. Settings such as
+`foreign_keys = ON` are accepted for compatibility, while constraint enforcement
+continues to be governed by tinySQL's engine semantics.
 
 ### Views and materialized views quick start
 
@@ -249,6 +314,7 @@ GROUP BY customer_id
 REFRESH ON STALE AFTER 6 HOURS
 REFRESH EVERY 30 MINUTES
 REFRESH DAILY AT '02:00' TIMEZONE 'Europe/Berlin'
+INVALIDATE ON CHANGE
 WITH DATA;
 
 -- Force a complete rebuild of the materialized cache.
@@ -257,10 +323,17 @@ REFRESH MATERIALIZED VIEW paid_customer_totals_mv;
 -- Inspect refresh policy and runtime metadata.
 SELECT name, cache_table_name, last_refresh_at, refresh_every_ms, daily_at, last_error
 FROM catalog.materialized_views;
+
+-- Inspect base-object dependencies.
+SELECT object_type, object_name, depends_on_schema, depends_on_name, depends_on_type
+FROM sys.dependencies
+WHERE object_name = 'paid_customer_totals_mv';
 ```
 
 `WITH NO DATA` stores only the definition. Combined with
 `REFRESH ON STALE AFTER ...`, the first read materializes the cache lazily.
+`INVALIDATE ON CHANGE` is opt-in: writes to dependent base tables mark the
+materialized view stale, and the next read refreshes the cache.
 
 Existing views can be converted in either direction without rewriting the query:
 
@@ -282,6 +355,45 @@ SELECT object_type, name, status, rows, is_stale, last_refresh_at, next_run_at, 
 FROM sys.objects
 ORDER BY object_type, name;
 ```
+
+Schema-qualified objects are stored and reported with separate schema metadata:
+
+```sql
+CREATE TABLE sales.orders (id INT PRIMARY KEY, amount INT);
+CREATE VIEW sales.large_orders AS
+SELECT id, amount FROM sales.orders WHERE amount >= 100;
+
+SELECT schema, name, full_name
+FROM sys.tables
+WHERE schema = 'sales';
+```
+
+Use `EXPLAIN` to inspect a compact logical plan without executing the query:
+
+```sql
+EXPLAIN
+WITH recent AS (
+  SELECT id, amount FROM sales.orders WHERE amount > 10
+)
+SELECT id
+FROM recent
+WHERE amount < 100
+ORDER BY amount
+LIMIT 5;
+```
+
+The `database/sql` driver also accepts transaction control commands on the
+same connection:
+
+```sql
+BEGIN;
+INSERT INTO sales.orders VALUES (3, 42);
+COMMIT;
+```
+
+More copy-pasteable examples are available in `example_showcase.sql`; the
+Go example in `view_examples_test.go` demonstrates the same lifecycle through
+the public API.
 
 ### Full-Text Search quick start
 
@@ -443,18 +555,17 @@ go test ./internal/engine -run '^$' -bench 'Benchmark(WhereVectorAndSimpleCondit
 
 | Feature | SQLite equivalent | Priority |
 |---------|-------------------|----------|
-| **FOREIGN KEY constraints** | `FOREIGN KEY (col) REFERENCES other(col)` + enforcement | Medium |
+| **Table-level constraint declarations** | `PRIMARY KEY (a, b)`, `FOREIGN KEY (col) REFERENCES other(col)` | Medium |
 | **CHECK constraints** | `CHECK (expr)` in `CREATE TABLE` | Medium |
 | **UPSERT / ON CONFLICT** | `INSERT OR REPLACE`, `INSERT … ON CONFLICT DO UPDATE/NOTHING` | Medium |
 | **Generated / computed columns** | `col AS (expr) STORED/VIRTUAL` | Low |
 | **SAVEPOINT / nested transactions** | `SAVEPOINT sp; ROLLBACK TO sp; RELEASE sp` | Low |
-| **PRAGMA statements** | `PRAGMA journal_mode`, `PRAGMA foreign_keys = ON`, … | Low |
+| **Broader PRAGMA coverage** | `PRAGMA cache_size`, `PRAGMA page_size`, `PRAGMA optimize`, … | Low |
 | **ATTACH / DETACH DATABASE** | Cross-file queries | Low |
 | **Partial indexes** | `CREATE INDEX … WHERE expr` | Low |
 | **Persistent ANN vector index** | HNSW/IVF — current `VEC_SEARCH` is a sequential scan | Low |
 | **WITHOUT ROWID tables** | Storage optimisation | Low |
 | **VACUUM** | Reclaim space, re-pack storage | Low |
-| **`sqlite_master` / `sqlite_schema`** | Metadata table (tinySQL uses `sys.*` instead) | Low |
 
 ## Limitations
 

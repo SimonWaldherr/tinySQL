@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,6 +31,7 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 
 	// Table datasheet view.
 	mux.HandleFunc("GET /t/{table}", a.tableViewHandler)
+	mux.HandleFunc("GET /t/{table}/export", a.exportTableHandler)
 
 	// Record CRUD.
 	mux.HandleFunc("GET /t/{table}/new", a.newRecordFormHandler)
@@ -49,6 +51,7 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 
 	// JSON API used by the query editor for async execution.
 	mux.HandleFunc("POST /api/query", a.apiQueryHandler)
+	mux.HandleFunc("POST /api/export", a.apiExportHandler)
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -70,6 +73,62 @@ func (a *App) writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func (a *App) writeExport(w http.ResponseWriter, columns []string, rows [][]string, format, filenameBase string) bool {
+	filenameBase = safeExportFilenameBase(filenameBase)
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "", "csv":
+		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.csv"`, filenameBase))
+		cw := csv.NewWriter(w)
+		_ = cw.Write(columns)
+		for _, row := range rows {
+			_ = cw.Write(row)
+		}
+		cw.Flush()
+		return true
+	case "json":
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.json"`, filenameBase))
+		records := make([]map[string]string, 0, len(rows))
+		for _, row := range rows {
+			record := make(map[string]string, len(columns))
+			for i, col := range columns {
+				if i < len(row) {
+					record[col] = row[i]
+				} else {
+					record[col] = ""
+				}
+			}
+			records = append(records, record)
+		}
+		_ = json.NewEncoder(w).Encode(records)
+		return true
+	default:
+		return false
+	}
+}
+
+func safeExportFilenameBase(name string) string {
+	name = strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r
+		case r >= '0' && r <= '9':
+			return r
+		case r == '_', r == '-', r == '.':
+			return r
+		default:
+			return '_'
+		}
+	}, strings.TrimSpace(name))
+	if name == "" {
+		return "export"
+	}
+	return name
 }
 
 // ─── route handlers ───────────────────────────────────────────────────────────
@@ -130,6 +189,25 @@ func (a *App) tableViewHandler(w http.ResponseWriter, r *http.Request) {
 		"Sort":       sort,
 		"SortDir":    sortDir,
 	})
+}
+
+// exportTableHandler streams a full table export as CSV or JSON.
+func (a *App) exportTableHandler(w http.ResponseWriter, r *http.Request) {
+	tableName := r.PathValue("table")
+	meta, err := a.tableMeta(r.Context(), tableName)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	cols, rows, err := a.queryRows(r.Context(), "SELECT * FROM "+quoteName(meta.Name))
+	if err != nil {
+		a.serverError(w, err)
+		return
+	}
+	if ok := a.writeExport(w, cols, rows, r.URL.Query().Get("format"), meta.Name); !ok {
+		http.Error(w, "unsupported export format", http.StatusBadRequest)
+	}
 }
 
 // tableRowsSorted fetches a page of rows, optionally sorted by a known column.
@@ -480,4 +558,35 @@ func (a *App) apiQueryHandler(w http.ResponseWriter, r *http.Request) {
 		Error:     result.Err,
 	}
 	a.writeJSON(w, http.StatusOK, out)
+}
+
+// apiExportHandler streams the result of a read-only SQL query as CSV or JSON.
+func (a *App) apiExportHandler(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SQL    string `json:"sql"`
+		Format string `json:"format"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+
+	query := strings.TrimSpace(body.SQL)
+	if query == "" {
+		a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "empty sql"})
+		return
+	}
+	if !isResultQuerySQL(query) {
+		a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "export requires SELECT, WITH, SHOW, or EXPLAIN"})
+		return
+	}
+
+	cols, rows, err := a.queryRows(r.Context(), query)
+	if err != nil {
+		a.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if ok := a.writeExport(w, cols, rows, body.Format, "query"); !ok {
+		a.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported export format"})
+	}
 }

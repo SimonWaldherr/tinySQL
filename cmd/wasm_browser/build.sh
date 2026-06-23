@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null && pwd -P)"
 cd "$SCRIPT_DIR"
 
 PORT="${PORT:-8080}"
 SERVE=false
 SKIP_BUILD=false
+WASM_OUT="web/tinySQL.wasm"
 
 usage() {
     cat <<'EOF'
@@ -18,6 +19,9 @@ Usage:
                              Serve existing assets without rebuilding
 EOF
 }
+
+filesize() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null || echo 0; }
+human() { numfmt --to=iec-i --suffix=B "$1" 2>/dev/null || echo "$1 bytes"; }
 
 for arg in "$@"; do
     case "$arg" in
@@ -73,10 +77,20 @@ if [[ "$SKIP_BUILD" == false ]]; then
         exit 1
     fi
     cp "$WASM_EXEC_PATH" web/wasm_exec.js
-    GOOS=js GOARCH=wasm go build -trimpath -ldflags "-s -w" -o web/tinySQL.wasm .
+    # shellcheck disable=SC2086
+    GOOS=js GOARCH=wasm go build ${GOFLAGS:-} -trimpath -buildvcs=false -ldflags "-s -w" -o "$WASM_OUT" .
+    if command -v gzip >/dev/null 2>&1; then
+        gzip -9 -c "$WASM_OUT" > "${WASM_OUT}.gz" 2>/dev/null || true
+    fi
 fi
 
 echo "Done."
+if [[ -f "$WASM_OUT" ]]; then
+    printf "  %-20s %s\n" "$(basename "$WASM_OUT")" "$(human "$(filesize "$WASM_OUT")")"
+fi
+if [[ -f "${WASM_OUT}.gz" ]]; then
+    printf "  %-20s %s\n" "$(basename "${WASM_OUT}.gz")" "$(human "$(filesize "${WASM_OUT}.gz")")"
+fi
 if [[ "$SERVE" == true ]]; then
     if ! command -v python3 >/dev/null 2>&1; then
         echo "python3 not found (required for --serve)" >&2

@@ -1,17 +1,17 @@
 # tinySQL Data Migration Tool
 
-A smart CLI tool for data pipelines and processing. Transfer data between CSV/JSON files, tinySQL, and external databases (MySQL/MariaDB, PostgreSQL, SQLite, MS SQL Server). Uses tinySQL as a central query hub with cross-database transfer support.
+A smart CLI tool for data pipelines and processing. Transfer data between CSV/TSV/JSON/YAML/XML files, tinySQL, and external databases (MySQL/MariaDB, PostgreSQL, SQLite, MS SQL Server). Uses tinySQL as a central query hub with cross-database transfer support.
 
 ## Features
 
 - **Web Interface**: Browser-based SQL editor with dark theme, file upload, connection management, and data export — all embedded in a single binary
-- **File Import/Export**: Load CSV and JSON files into tinySQL, export query results to files
+- **File Import/Export**: Load CSV, TSV, JSON, YAML, and simple row-based XML files into tinySQL; export query results to CSV/JSON files
 - **External Database Connectivity**: Connect to MySQL/MariaDB, PostgreSQL, SQLite, and MS SQL Server
 - **Cross-Database Transfers**: Move data between any combination of files and databases
 - **Inter-Database Queries**: `COPY SELECT ... INTO <connection>.<table>` syntax for routing query results to external databases
 - **Interactive REPL**: Named connection management, ad-hoc queries, live data exploration
 - **Pipeline Scripts**: Run multi-step migration workflows from script files
-- **Fuzzy Import**: Intelligent parsing for malformed CSV/JSON with auto-detection of delimiters, type inference, and error recovery
+- **Fuzzy Import**: Intelligent parsing for malformed CSV/JSON with auto-detection of delimiters, type inference, and error recovery; other formats use the structured auto-importer
 - **Single Binary Deployment**: All HTML, CSS, and JS are embedded — no external files needed
 
 ## Quick Start
@@ -62,7 +62,7 @@ Then open **http://localhost:8080** in your browser.
 |---------|-------------|
 | `web` | Start web interface for data migration |
 | `interactive` | Start interactive REPL for data migration |
-| `import-file` | Import a CSV/JSON file into tinySQL |
+| `import-file` | Import a CSV/TSV/JSON/YAML/XML file into tinySQL |
 | `import-db` | Import data from an external database into tinySQL |
 | `export-file` | Export tinySQL data to a CSV/JSON file |
 | `export-db` | Export tinySQL data to an external database |
@@ -114,7 +114,7 @@ migrate web -addr 0.0.0.0:8080
 
 ### import-file
 
-Import a CSV or JSON file into tinySQL, optionally query and output results.
+Import a CSV, TSV, JSON, YAML, or simple row-based XML file into tinySQL, optionally query and output results.
 
 ```bash
 migrate import-file [options]
@@ -122,7 +122,7 @@ migrate import-file [options]
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-file` | Path to CSV/JSON file (or positional arg) | Required |
+| `-file` | Path to CSV/TSV/JSON/YAML/XML file (or positional arg) | Required |
 | `-table` | Target table name | Filename without extension |
 | `-query` | SQL query to execute after import | |
 | `-output` | Output file for query results | stdout |
@@ -141,6 +141,10 @@ migrate import-file -file data.csv -table customers -query "SELECT * FROM custom
 
 # Positional file argument
 migrate import-file users.csv
+
+# Import YAML or XML through the structured importer
+migrate import-file -file users.yaml -table users
+migrate import-file -file users.xml -table users
 ```
 
 ### import-db
@@ -289,7 +293,7 @@ migrate interactive
 | `connect <name> <dsn>` | Register an external database connection |
 | `disconnect <name>` | Close a connection |
 | `connections` | List active connections |
-| `load <file> [AS <table>]` | Load a CSV/JSON file into tinySQL |
+| `load <file> [AS <table>]` | Load a CSV/TSV/JSON/YAML/XML file into tinySQL |
 | `import <conn> <table>` | Import a table from an external database |
 | `import <conn> "<query>" AS <table>` | Import query results as a table |
 | `export file <query> TO <file>` | Export query results to a file |
@@ -345,6 +349,8 @@ Auto-detection also works for common patterns without explicit scheme prefixes:
 |--------|-----------|----------|
 | CSV | `.csv`, `.tsv`, `.txt` | Auto-delimiter detection, header inference, type coercion |
 | JSON | `.json`, `.jsonl`, `.ndjson` | Array of objects, line-delimited JSON, nested structures |
+| YAML | `.yaml`, `.yml` | Sequence of mappings or a single mapping |
+| XML | `.xml` | Simple row-based XML with attributes or child elements as columns |
 
 Fuzzy import (enabled by default) handles:
 - Inconsistent column counts
@@ -372,7 +378,7 @@ The tool uses tinySQL as a central in-memory SQL engine:
 
 ```
 ┌─────────────┐     ┌──────────────┐     ┌──────────────┐
-│  CSV/JSON   │────▶│              │────▶│  CSV/JSON    │
+│ CSV/JSON/...│────▶│              │────▶│  CSV/JSON    │
 │  Files      │     │              │     │  Files       │
 └─────────────┘     │              │     └──────────────┘
                     │   tinySQL    │

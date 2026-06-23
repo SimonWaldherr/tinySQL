@@ -16,6 +16,9 @@ cd cmd/wasm_node
 
 # Build and run the built-in demo
 ./build.sh --run
+
+# Run existing assets without rebuilding
+./build.sh --skip-build --run
 ```
 
 ### Manual build

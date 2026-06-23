@@ -11,11 +11,14 @@ file download.
 ```bash
 cd cmd/wasm_browser
 
-# Build only (produces web/tinySQL.wasm + web/wasm_exec.js)
+# Build only (produces web/tinySQL.wasm, optional .gz, and web/wasm_exec.js)
 ./build.sh --build-only
 
 # Build and start a local HTTP server on port 8080
 ./build.sh --serve
+
+# Serve existing assets without rebuilding
+./build.sh --skip-build --serve
 ```
 
 Then open **http://localhost:8080** in your browser.

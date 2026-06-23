@@ -107,3 +107,34 @@ func TestPublicAPICompiledExecutionAndJobScheduler(t *testing.T) {
 		t.Fatal("expected nil DB health to be unhealthy")
 	}
 }
+
+func TestPublicAPIByteSnapshots(t *testing.T) {
+	db := tsql.NewDB()
+	ctx := context.Background()
+	if _, err := tsql.Execute(ctx, db, "default", tsql.MustParseSQL("CREATE TABLE snap_items (id INT, name TEXT)")); err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+	if _, err := tsql.Execute(ctx, db, "default", tsql.MustParseSQL("INSERT INTO snap_items VALUES (1, 'persisted')")); err != nil {
+		t.Fatalf("insert failed: %v", err)
+	}
+
+	data, err := tsql.SaveToBytes(db)
+	if err != nil {
+		t.Fatalf("SaveToBytes failed: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("SaveToBytes returned empty snapshot")
+	}
+
+	restored, err := tsql.LoadFromBytes(data)
+	if err != nil {
+		t.Fatalf("LoadFromBytes failed: %v", err)
+	}
+	rs, err := tsql.Execute(ctx, restored, "default", tsql.MustParseSQL("SELECT name FROM snap_items WHERE id = 1"))
+	if err != nil {
+		t.Fatalf("query restored snapshot failed: %v", err)
+	}
+	if len(rs.Rows) != 1 || rs.Rows[0]["name"] != "persisted" {
+		t.Fatalf("unexpected restored rows: %#v", rs.Rows)
+	}
+}

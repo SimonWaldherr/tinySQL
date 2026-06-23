@@ -495,10 +495,145 @@ func ImportXML(
 		Errors:   make([]string, 0),
 	}
 
-	// For now, return a helpful error - XML parsing is complex
-	// and would require knowing the schema
-	_ = result // Keep for future implementation
-	return nil, fmt.Errorf("XML import not yet implemented - please convert to CSV or JSON first")
+	var root XMLRecord
+	if err := xml.NewDecoder(src).Decode(&root); err != nil {
+		return nil, fmt.Errorf("decode XML: %w", err)
+	}
+
+	records := xmlRecords(root)
+	if len(records) == 0 {
+		return nil, fmt.Errorf("no records found in XML")
+	}
+
+	colNames := make([]string, 0, len(records[0]))
+	for key := range records[0] {
+		colNames = append(colNames, key)
+	}
+	sanitizeColumnNames(colNames)
+	result.ColumnNames = colNames
+
+	sampleData := buildJSONSampleData(records, colNames)
+	var colTypes []storage.ColType
+	if opts.TypeInference {
+		colTypes = inferColumnTypes(sampleData, len(colNames), opts)
+	} else {
+		colTypes = make([]storage.ColType, len(colNames))
+		for i := range colTypes {
+			colTypes[i] = storage.TextType
+		}
+	}
+	result.ColumnTypes = colTypes
+
+	if opts.CreateTable {
+		if err := createTable(ctx, db, tenant, tableName, colNames, colTypes); err != nil {
+			return nil, err
+		}
+	}
+	if opts.Truncate {
+		if err := truncateTable(ctx, db, tenant, tableName); err != nil {
+			return nil, err
+		}
+	}
+
+	tbl, err := db.Get(tenant, tableName)
+	if err != nil {
+		return nil, fmt.Errorf("get table: %w", err)
+	}
+
+	for i, rec := range records {
+		select {
+		case <-ctx.Done():
+			return result, ctx.Err()
+		default:
+		}
+
+		row := make([]any, len(colNames))
+		for j, col := range colNames {
+			if val, ok := rec[col]; ok {
+				converted, err := convertValue(fmt.Sprintf("%v", val), colTypes[j],
+					opts.DateTimeFormats, opts.NullLiterals)
+				if err != nil && opts.StrictTypes {
+					result.Errors = append(result.Errors,
+						fmt.Sprintf("row %d, col %s: %v", i+1, col, err))
+					result.RowsSkipped++
+					continue
+				}
+				row[j] = converted
+			}
+		}
+		tbl.Rows = append(tbl.Rows, row)
+		result.RowsInserted++
+	}
+
+	return result, nil
+}
+
+func xmlRecords(root XMLRecord) []map[string]any {
+	records := make([]map[string]any, 0, len(root.Nodes))
+	for _, node := range root.Nodes {
+		record := xmlElementMap(node)
+		if len(record) > 0 {
+			records = append(records, record)
+		}
+	}
+	if len(records) > 0 {
+		return records
+	}
+
+	record := xmlElementMap(root)
+	if len(record) == 0 {
+		return nil
+	}
+	return []map[string]any{record}
+}
+
+func xmlElementMap(node XMLRecord) map[string]any {
+	record := make(map[string]any)
+	for _, attr := range node.Attrs {
+		record[attr.Name.Local] = attr.Value
+	}
+	for _, child := range node.Nodes {
+		name := child.XMLName.Local
+		if name == "" {
+			continue
+		}
+		record[uniqueXMLFieldName(record, name)] = xmlElementValue(child)
+	}
+	if content := strings.TrimSpace(node.Content); content != "" && len(record) == 0 {
+		record["value"] = content
+	}
+	return record
+}
+
+func xmlElementValue(node XMLRecord) any {
+	if len(node.Attrs) == 0 && len(node.Nodes) == 0 {
+		return strings.TrimSpace(node.Content)
+	}
+
+	record := xmlElementMap(node)
+	if len(record) == 1 {
+		if value, ok := record["value"]; ok {
+			return value
+		}
+	}
+
+	data, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Sprintf("%v", record)
+	}
+	return string(data)
+}
+
+func uniqueXMLFieldName(record map[string]any, base string) string {
+	if _, ok := record[base]; !ok {
+		return base
+	}
+	for i := 2; ; i++ {
+		name := fmt.Sprintf("%s_%d", base, i)
+		if _, ok := record[name]; !ok {
+			return name
+		}
+	}
 }
 
 // ============================================================================
