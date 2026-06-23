@@ -3,6 +3,8 @@ let wasmReady = false;
 let currentTables = [];
 let currentResults = null;
 const HISTORY_KEY = 'tinysql_query_history_v1';
+const DB_SNAPSHOT_KEY = 'tinysql_query_files_db_snapshot_v1';
+const EDITOR_STATE_KEY = 'tinysql_query_files_editor_v1';
 const SQL_KEYWORDS = [
     'SELECT', 'FROM', 'WHERE', 'JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'FULL JOIN', 'INNER JOIN', 'CROSS JOIN',
     'ON', 'GROUP BY', 'ORDER BY', 'HAVING', 'LIMIT', 'OFFSET', 'DISTINCT', 'AS', 'AND', 'OR', 'NOT',
@@ -20,6 +22,8 @@ let wasmApi = {
     listTables: null,
     exportResults: null,
     getTableSchema: null,
+    exportDatabase: null,
+    importDatabase: null,
 };
 
 // Client-side pending tables (used when WASM not ready)
@@ -40,6 +44,8 @@ let resultViewState = {
     sortColumn: '',
     sortDirection: 'asc',
 };
+let editorSaveTimer = null;
+let snapshotSaveTimer = null;
 
 function escapeRegex(text) {
     return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -79,17 +85,151 @@ function loadHistory() {
     return [];
 }
 
+function storageGet(key) {
+    try {
+        return window.localStorage ? window.localStorage.getItem(key) : null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function storageSet(key, value) {
+    try {
+        if (!window.localStorage) return false;
+        window.localStorage.setItem(key, value);
+        return true;
+    } catch (error) {
+        console.warn('localStorage write failed:', error);
+        updateStatus('Local persistence failed');
+        return false;
+    }
+}
+
+function storageRemove(key) {
+    try {
+        if (window.localStorage) window.localStorage.removeItem(key);
+    } catch (_) {
+        // Ignore blocked storage cleanup.
+    }
+}
+
+async function instantiateWasm(go) {
+    const wasmURL = 'query_files.wasm';
+    if (WebAssembly.instantiateStreaming) {
+        try {
+            return await WebAssembly.instantiateStreaming(fetch(wasmURL), go.importObject);
+        } catch (error) {
+            console.warn('instantiateStreaming failed, falling back to ArrayBuffer:', error);
+        }
+    }
+    const response = await fetch(wasmURL);
+    const bytes = await response.arrayBuffer();
+    return WebAssembly.instantiate(bytes, go.importObject);
+}
+
+function saveEditorState() {
+    const editor = document.getElementById('queryEditor');
+    if (editor) {
+        storageSet(EDITOR_STATE_KEY, editor.value);
+    }
+}
+
+function scheduleEditorStateSave() {
+    window.clearTimeout(editorSaveTimer);
+    editorSaveTimer = window.setTimeout(saveEditorState, 150);
+}
+
+function restoreEditorState() {
+    const editor = document.getElementById('queryEditor');
+    const value = storageGet(EDITOR_STATE_KEY);
+    if (editor && value !== null && editor.value.trim() === '') {
+        editor.value = value;
+        syncEditorHighlight();
+    }
+}
+
+function saveDatabaseSnapshotNow() {
+    if (!wasmReady || typeof wasmApi.exportDatabase !== 'function') {
+        return false;
+    }
+    try {
+        const result = wasmApi.exportDatabase();
+        if (!result || !result.success || typeof result.data !== 'string') {
+            console.warn('Database snapshot export failed:', result?.error || result);
+            return false;
+        }
+        const payload = {
+            version: 1,
+            savedAt: new Date().toISOString(),
+            sizeBytes: result.sizeBytes || 0,
+            data: result.data,
+        };
+        return storageSet(DB_SNAPSHOT_KEY, JSON.stringify(payload));
+    } catch (error) {
+        console.warn('Database snapshot export failed:', error);
+        return false;
+    }
+}
+
+function scheduleDatabaseSnapshotSave(delay = 250) {
+    window.clearTimeout(snapshotSaveTimer);
+    snapshotSaveTimer = window.setTimeout(saveDatabaseSnapshotNow, delay);
+}
+
+function restoreDatabaseSnapshot() {
+    if (typeof wasmApi.importDatabase !== 'function') {
+        return false;
+    }
+    const raw = storageGet(DB_SNAPSHOT_KEY);
+    if (!raw) {
+        return false;
+    }
+    try {
+        let snapshot = raw;
+        try {
+            const payload = JSON.parse(raw);
+            if (payload && typeof payload.data === 'string') {
+                snapshot = payload.data;
+            }
+        } catch (_) {
+            // Backward-compatible path for raw base64 snapshots.
+        }
+        const result = wasmApi.importDatabase(snapshot);
+        if (!result || !result.success) {
+            storageRemove(DB_SNAPSHOT_KEY);
+            updateStatus(`Saved database could not be restored: ${result?.error || 'unknown error'}`);
+            return false;
+        }
+        updateStatus('Restored local database snapshot');
+        return true;
+    } catch (error) {
+        storageRemove(DB_SNAPSHOT_KEY);
+        updateStatus(`Saved database could not be restored: ${error.message}`);
+        return false;
+    }
+}
+
+function sqlMayMutate(sql) {
+    const stripped = String(sql || '')
+        .replace(/--[^\n]*/g, ' ')
+        .replace(/\/\*[\s\S]*?\*\//g, ' ')
+        .replace(/'(?:''|[^'])*'/g, "''")
+        .trim();
+    if (!stripped) return false;
+    return stripped.split(';').some((statement) => {
+        const first = statement.trim().split(/\s+/)[0]?.toUpperCase();
+        return first && !['SELECT', 'WITH', 'EXPLAIN', 'SHOW', 'DESCRIBE', 'PRAGMA'].includes(first);
+    });
+}
+
 // Initialize WASM
 async function initWasm() {
     const go = new Go();
     
     try {
-        const result = await WebAssembly.instantiateStreaming(
-            fetch("query_files.wasm"),
-            go.importObject
-        );
+        const result = await instantiateWasm(go);
         
-        go.run(result.instance);
+        go.run(result.instance || result);
         wasmReady = true;
         console.log("WASM initialized successfully");
         
@@ -102,6 +242,8 @@ async function initWasm() {
         wasmApi.listTables = window.listTables;
         wasmApi.exportResults = window.exportResults;
         wasmApi.getTableSchema = window.getTableSchema;
+        wasmApi.exportDatabase = window.exportDatabase;
+        wasmApi.importDatabase = window.importDatabase;
 
         console.log("Available WASM functions:", Object.fromEntries(
             Object.entries(wasmApi).map(([k,v]) => [k, typeof v])
@@ -110,6 +252,7 @@ async function initWasm() {
         updateStatus("Ready");
         document.querySelector('.status-indicator').classList.add('ready');
         document.getElementById('executeBtn').disabled = false;
+        restoreDatabaseSnapshot();
         // If any tables were registered client-side before WASM was ready,
         // import them now into the WASM-backed database so queries will work.
         if (Object.keys(pendingClientTables).length > 0) {
@@ -137,6 +280,7 @@ async function initWasm() {
             renderTables();
             // Clear pending list now that we've attempted to import
             for (const k of Object.keys(pendingClientTables)) delete pendingClientTables[k];
+            scheduleDatabaseSnapshotSave();
         }
         loadTables();
     } catch (err) {
@@ -421,8 +565,10 @@ async function loadDemoTable(tableName) {
                     if (suggestedQuery) {
                         editor.value = suggestedQuery;
                         syncEditorHighlight();
+                        saveEditorState();
                     }
                     document.getElementById('executeBtn').disabled = false;
+                    scheduleDatabaseSnapshotSave();
                 } else {
                     alert(`Failed to load demo table: ${result?.error || 'Unknown error'}`);
                     updateStatus('Demo load failed');
@@ -437,6 +583,7 @@ async function loadDemoTable(tableName) {
             if (suggestedQuery) {
                 editor.value = suggestedQuery;
                 syncEditorHighlight();
+                saveEditorState();
             }
             updateStatus(`Registered demo table "${tableName}" locally. Queries will run once WASM is initialized.`);
         }
@@ -458,20 +605,23 @@ async function loadAllDemos() {
     const editor = document.getElementById('queryEditor');
     editor.value = `-- Large demo: revenue and fulfillment by region and carrier\nSELECT s.region,\n       l.carrier,\n       COUNT(*) AS orders,\n       SUM(s.order_total) AS total_revenue,\n       AVG(l.shipping_cost) AS avg_shipping_cost\nFROM sales_large s\nJOIN logistics_large l ON s.order_id = l.order_id\nGROUP BY s.region, l.carrier\nORDER BY total_revenue DESC`;
     syncEditorHighlight();
+    saveEditorState();
     // Ensure demo queries are visible after loading all demos
     showDemoQueries();
+    scheduleDatabaseSnapshotSave();
     updateStatus('Loaded curated demos and generated large tables');
 }
 
 // Load tables on startup
 document.addEventListener('DOMContentLoaded', () => {
-    initWasm();
     setupDragDrop();
     renderHistory();
     setupEditorSyntaxHighlighting();
+    restoreEditorState();
     enhanceDemoQueries();
     setupAccessibilityShortcuts();
     setupSqlAutocomplete();
+    initWasm();
     
     // Setup demo buttons
     const loadAllDemosBtn = document.getElementById('loadAllDemosBtn');
@@ -545,6 +695,7 @@ function setupEditorSyntaxHighlighting() {
 
     const refresh = () => syncEditorHighlight();
     editor.addEventListener('input', refresh);
+    editor.addEventListener('input', scheduleEditorStateSave);
     editor.addEventListener('scroll', refresh);
     editor.addEventListener('keyup', refresh);
 
@@ -941,11 +1092,14 @@ async function importSingleFile(file) {
                 const defaultQuery = `SELECT * FROM ${tableName} LIMIT 10`;
                 if (!editor.value || /SELECT \* FROM (mytable|table1|table2)/i.test(editor.value)) {
                     editor.value = defaultQuery;
+                    syncEditorHighlight();
+                    saveEditorState();
                 }
 
                 // Ensure Execute is enabled
                 const executeBtn = document.getElementById('executeBtn');
                 if (executeBtn) executeBtn.disabled = false;
+                scheduleDatabaseSnapshotSave();
             } else {
                 alert(`Import failed: ${result.error || 'Unknown error'}`);
                 updateStatus('Import failed');
@@ -1023,7 +1177,10 @@ async function importExcelFile(file) {
             if (currentTables.length > 0) {
                 const firstTable = currentTables[0].name;
                 document.getElementById('queryEditor').value = `SELECT * FROM ${firstTable} LIMIT 10`;
+                syncEditorHighlight();
+                saveEditorState();
             }
+            scheduleDatabaseSnapshotSave();
         } catch (err) {
             alert(`Failed to parse Excel file: ${err.message}`);
             updateStatus('Excel import failed');
@@ -1236,6 +1393,7 @@ function removeTable(tableName) {
         currentResults = null;
     }
     renderTables();
+    scheduleDatabaseSnapshotSave();
     updateStatus(`Removed table "${tableName}"`);
 }
 
@@ -1278,6 +1436,7 @@ function setQuery(query) {
     hideAutocompletePanel();
     editor.value = query;
     syncEditorHighlight();
+    saveEditorState();
     editor.focus();
 }
 
@@ -1290,6 +1449,7 @@ function clearQuery() {
     hideAutocompletePanel();
     editor.value = '';
     syncEditorHighlight();
+    saveEditorState();
     editor.focus();
 }
 
@@ -1328,6 +1488,7 @@ function clearAllTables() {
         `;
     }
     window.clearVanillaGrid?.();
+    storageRemove(DB_SNAPSHOT_KEY);
     updateStatus('Database cleared');
 }
 
@@ -1348,6 +1509,7 @@ function formatQuery() {
     
     editor.value = query;
     syncEditorHighlight();
+    saveEditorState();
 }
 
 // Execute query (UI handler)
@@ -1407,6 +1569,11 @@ async function onExecuteClick() {
             renderResults(currentResults);
             updateStatus(`Query completed: ${currentResults.rowCount} rows in ${duration}${result.statementsRun > 1 ? ` (${result.statementsRun} statements)` : ''}`);
             pushHistory(query, duration, rows.length);
+            saveEditorState();
+            if (sqlMayMutate(query)) {
+                loadTables();
+                scheduleDatabaseSnapshotSave();
+            }
         } else {
             const errMsg = result && result.error ? result.error : 'Unknown error';
             resultsContainer.innerHTML = `
@@ -2057,7 +2224,9 @@ async function importClipboardData() {
         if (editor && !editor.value.trim()) {
             editor.value = `SELECT * FROM ${quoteSqlIdentifier(tableName)} LIMIT 10`;
             syncEditorHighlight();
+            saveEditorState();
         }
+        scheduleDatabaseSnapshotSave();
         updateStatus(`Imported clipboard data into "${tableName}" (${result.rowsImported} rows)`);
         return;
     }
