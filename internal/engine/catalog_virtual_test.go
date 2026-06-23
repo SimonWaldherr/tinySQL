@@ -61,6 +61,15 @@ func TestCatalogVirtualTables(t *testing.T) {
 		t.Fatalf("expected columns for users in catalog.columns")
 	}
 
+	// Quoted schema-qualified form should behave like catalog.columns.
+	rscQuoted, err := Execute(ctx, db, "main", mustParse(`SELECT * FROM "catalog"."columns" LIMIT 10`))
+	if err != nil {
+		t.Fatalf(`SELECT "catalog"."columns" failed: %v`, err)
+	}
+	if len(rscQuoted.Rows) == 0 {
+		t.Fatalf("expected rows from quoted catalog.columns")
+	}
+
 	// Query catalog.jobs
 	rsj, err := Execute(ctx, db, "main", mustParse("SELECT name, enabled FROM catalog.jobs WHERE enabled = true"))
 	if err != nil {

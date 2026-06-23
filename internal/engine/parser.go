@@ -54,7 +54,7 @@ func (p *Parser) errf(format string, a ...any) error {
 }
 
 func (p *Parser) parseBareTableSelect() (*Select, error) {
-	table := p.parseIdentLike()
+	table := p.parseQualifiedIdentLike()
 	if table == "" {
 		return nil, p.errf("expected table name")
 	}
@@ -2046,7 +2046,7 @@ func (p *Parser) parseFromSubselect(sel *Select) error {
 }
 
 func (p *Parser) parseFromTableOrFunction(sel *Select) error {
-	from := p.parseIdentLike()
+	from := p.parseQualifiedIdentLike()
 	if from == "" {
 		return p.errf("expected table or table-valued function")
 	}
@@ -2314,7 +2314,7 @@ func (p *Parser) parseJoinSubselectTail() (FromItem, Expr, error) {
 }
 
 func (p *Parser) parseJoinTableOrFunctionTail() (FromItem, Expr, error) {
-	rt := p.parseIdentLike()
+	rt := p.parseQualifiedIdentLike()
 	if rt == "" {
 		return FromItem{}, nil, p.errf("expected table or table-valued function")
 	}
@@ -2554,6 +2554,23 @@ func (p *Parser) parseIdentLike() string {
 		return s
 	}
 	return ""
+}
+
+func (p *Parser) parseQualifiedIdentLike() string {
+	name := p.parseIdentLike()
+	if name == "" {
+		return ""
+	}
+	parts := []string{name}
+	for p.cur.Typ == tSymbol && p.cur.Val == "." {
+		p.next()
+		part := p.parseIdentLike()
+		if part == "" {
+			return strings.Join(parts, ".")
+		}
+		parts = append(parts, part)
+	}
+	return strings.Join(parts, ".")
 }
 func (p *Parser) parseIntLiteral() *int {
 	if p.cur.Typ == tNumber && !strings.Contains(p.cur.Val, ".") {

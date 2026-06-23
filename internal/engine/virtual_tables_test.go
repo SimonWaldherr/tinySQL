@@ -160,6 +160,19 @@ func TestSysConstraints(t *testing.T) {
 	}
 }
 
+func TestSysConstraintsQuotedQualifiedName(t *testing.T) {
+	db := setupTestDB()
+	ctx := context.Background()
+
+	rs, err := Execute(ctx, db, "main", mustParseSys(`SELECT * FROM "sys"."constraints" LIMIT 10`))
+	if err != nil {
+		t.Fatalf(`SELECT "sys"."constraints" failed: %v`, err)
+	}
+	if len(rs.Rows) == 0 {
+		t.Fatal("expected constraints from quoted sys.constraints")
+	}
+}
+
 // TestSysIndexes verifies sys.indexes returns empty (CREATE INDEX is a no-op).
 func TestSysIndexes(t *testing.T) {
 	db := setupTestDB()
