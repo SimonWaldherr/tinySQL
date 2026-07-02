@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches: [ main ]
   pull_request:
@@ -65,6 +66,68 @@ jobs:
         run: |
           go tool cover -func=coverage.out -o coverage.txt
           tail -1 coverage.txt >> $GITHUB_STEP_SUMMARY
+
+  vector-simd-amd64:
+    name: Vector SIMD (linux/amd64)
+    runs-on: ubuntu-latest
+    env:
+      GOARCH: amd64
+      GOAMD64: v1
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-amd64-v1-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-amd64-v1-
+            ${{ runner.os }}-go-
+
+      - name: Download deps
+        run: go mod download
+
+      - name: Verify amd64 runner settings
+        run: |
+          test "$(go env GOOS)" = "linux"
+          test "$(go env GOARCH)" = "amd64"
+          test "$(go env GOAMD64)" = "v1"
+          uname -m
+
+      - name: Run engine tests with amd64 SIMD
+        run: go test ./internal/engine -count=1 -v
+
+      - name: Run vector SIMD benchmarks
+        run: |
+          set -o pipefail
+          go test ./internal/engine \
+            -run '^$' \
+            -bench 'BenchmarkVector(Dot768|DotUnrolled768|L2Squared768|L2SquaredUnrolled768)|BenchmarkVecSearchIndexModesSameTable' \
+            -benchmem \
+            -benchtime=500ms \
+            -count=3 | tee vector-amd64-bench.txt
+          {
+            echo "### Vector SIMD amd64 benchmark"
+            echo
+            echo '```'
+            cat vector-amd64-bench.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload vector benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector-amd64-bench
+          path: vector-amd64-bench.txt
 
   vulncheck:
     runs-on: ubuntu-latest

@@ -1,25 +1,25 @@
-//go:build arm64
+//go:build amd64
 
 package engine
 
-const vectorMathBackend = "arm64-neon"
+const vectorMathBackend = "amd64-sse2"
 
 //go:noescape
-func vectorDotNEON(a, b []float64) float64
+func vectorDotSSE2(a, b []float64) float64
 
 //go:noescape
-func vectorL2SquaredNEON(a, b []float64) float64
+func vectorL2SquaredSSE2(a, b []float64) float64
 
 func vectorDotKernel(a, b []float64) float64 {
 	if len(a) < 128 {
 		return vectorDotUnrolled(a, b)
 	}
-	return vectorDotNEON(a, b)
+	return vectorDotSSE2(a, b)
 }
 
 func vectorL2SquaredKernel(a, b []float64) float64 {
 	if len(a) < 128 {
 		return vectorL2SquaredUnrolled(a, b)
 	}
-	return vectorL2SquaredNEON(a, b)
+	return vectorL2SquaredSSE2(a, b)
 }

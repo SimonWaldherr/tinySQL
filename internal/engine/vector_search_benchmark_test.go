@@ -11,6 +11,54 @@ import (
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
+var vectorMathBenchmarkSink float64
+
+func makeVectorMathBenchmarkInputs(dims int) ([]float64, []float64) {
+	a := make([]float64, dims)
+	b := make([]float64, dims)
+	for i := range a {
+		a[i] = math.Sin(float64(i)*0.11) * 0.75
+		b[i] = math.Cos(float64(i)*0.07) * 0.5
+	}
+	return a, b
+}
+
+func BenchmarkVectorDot768(b *testing.B) {
+	a, vecB := makeVectorMathBenchmarkInputs(768)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		vectorMathBenchmarkSink = vectorDot(a, vecB)
+	}
+}
+
+func BenchmarkVectorDotUnrolled768(b *testing.B) {
+	a, vecB := makeVectorMathBenchmarkInputs(768)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		vectorMathBenchmarkSink = vectorDotUnrolled(a, vecB)
+	}
+}
+
+func BenchmarkVectorL2Squared768(b *testing.B) {
+	a, vecB := makeVectorMathBenchmarkInputs(768)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		vectorMathBenchmarkSink = vectorL2Squared(a, vecB)
+	}
+}
+
+func BenchmarkVectorL2SquaredUnrolled768(b *testing.B) {
+	a, vecB := makeVectorMathBenchmarkInputs(768)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		vectorMathBenchmarkSink = vectorL2SquaredUnrolled(a, vecB)
+	}
+}
+
 func makeVecSearchBenchmarkTable(rows, dims int) *storage.DB {
 	db := storage.NewDB()
 	table := storage.NewTable("vec_docs", []storage.Column{
@@ -237,6 +285,45 @@ func BenchmarkVecSearchCosineTopK_IVFCached(b *testing.B) {
 
 func BenchmarkVecSearchCosineTopK_HNSWCached(b *testing.B) {
 	benchmarkVecSearchIndexed(b, "hnsw")
+}
+
+func BenchmarkVecSearchIndexModesSameTable(b *testing.B) {
+	db := makeRAGHybridBenchmarkTable(12000, 64)
+	fn := &VecSearchTableFunc{}
+	env := ExecEnv{ctx: context.Background(), tenant: "default", db: db}
+	query := make([]float64, 64)
+	for i := range query {
+		query[i] = math.Cos(0.08*float64(i) + 0.5)
+	}
+
+	for _, indexMode := range []string{"flat", "ivf", "hnsw"} {
+		indexMode := indexMode
+		b.Run(indexMode, func(b *testing.B) {
+			args := []Expr{
+				&Literal{Val: "rag_hybrid"},
+				&Literal{Val: "embedding"},
+				&Literal{Val: query},
+				&Literal{Val: 20},
+				&Literal{Val: "cosine"},
+				&Literal{Val: indexMode},
+			}
+			if _, err := fn.Execute(context.Background(), args, env, Row{}); err != nil {
+				b.Fatal(err)
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				rs, err := fn.Execute(context.Background(), args, env, Row{})
+				if err != nil {
+					b.Fatal(err)
+				}
+				if len(rs.Rows) == 0 || len(rs.Rows) > 20 {
+					b.Fatalf("expected up to 20 results, got %d", len(rs.Rows))
+				}
+			}
+		})
+	}
 }
 
 func BenchmarkWhereVectorAndSimpleCondition_VectorThenScalar(b *testing.B) {

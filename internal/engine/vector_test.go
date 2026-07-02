@@ -182,6 +182,34 @@ func TestVecDot(t *testing.T) {
 	expectFloat(t, rs.Rows[0]["d"], 32.0, 1e-9, "VEC_DOT")
 }
 
+func TestVecDotLargeVectorKernel(t *testing.T) {
+	a := make([]float64, 257)
+	b := make([]float64, 257)
+	var want float64
+	for i := range a {
+		a[i] = math.Sin(float64(i) * 0.11)
+		b[i] = math.Cos(float64(i) * 0.07)
+		want += a[i] * b[i]
+	}
+	expectFloat(t, vectorDot(a, b), want, 1e-9, "large vector dot kernel")
+	if vectorMathBackend == "" {
+		t.Fatal("vector math backend must be named")
+	}
+}
+
+func TestVecL2SquaredLargeVectorKernel(t *testing.T) {
+	a := make([]float64, 257)
+	b := make([]float64, 257)
+	var want float64
+	for i := range a {
+		a[i] = math.Sin(float64(i)*0.13) * 0.75
+		b[i] = math.Cos(float64(i)*0.09) * 0.5
+		d := a[i] - b[i]
+		want += d * d
+	}
+	expectFloat(t, vectorL2Squared(a, b), want, 1e-9, "large vector l2 kernel")
+}
+
 // ---------------------------------------------------------------------------
 // VEC_COSINE_SIMILARITY / VEC_COSINE_DISTANCE
 // ---------------------------------------------------------------------------

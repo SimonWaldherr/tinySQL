@@ -332,6 +332,10 @@ func (idx *vecHNSWIndex) search(ctx context.Context, query []float64, queryNorm 
 	for _, sr := range candidates {
 		pushTopK(resultHeap, sr.rowIdx, sr.distance, k)
 	}
+	if resultHeap.Len() < k {
+		distFn := buildVecDistanceFunc(idx.metric, query, queryNorm, cache)
+		return vecSearchTopK(ctx, idx.table.Rows, idx.dims, k, cache, distFn)
+	}
 	return topKFromHeap(resultHeap, k), nil
 }
 
@@ -532,12 +536,12 @@ func hnswLevel(rowIdx int) int {
 }
 
 func chooseHNSWEfSearch(k int) int {
-	ef := k * 3
-	if ef < 24 {
-		ef = 24
+	ef := k
+	if ef < 16 {
+		ef = 16
 	}
-	if ef > 96 {
-		ef = 96
+	if ef > 64 {
+		ef = 64
 	}
 	return ef
 }

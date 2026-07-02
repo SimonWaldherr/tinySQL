@@ -560,6 +560,14 @@ Benchmarks for vector/RAG behavior are in `internal/engine/vector_search_benchma
 go test ./internal/engine -run '^$' -bench 'Benchmark(WhereVectorAndSimpleCondition|OrderByVectorLimit|CompareTopK_VecSearchVsOrderBy|VecSearchCosineTopK|RAGRankScoreOrderByLimit|RAGContextFromTopK)' -count=1
 ```
 
+For SIMD vector math and ANN index-mode comparisons:
+
+```bash
+go test ./internal/engine -run '^$' -bench 'BenchmarkVector(Dot768|DotUnrolled768|L2Squared768|L2SquaredUnrolled768)|BenchmarkVecSearchIndexModesSameTable' -benchmem -count=3
+```
+
+GitHub Actions also runs `Vector SIMD (linux/amd64)` on an Ubuntu x86_64 runner with `GOARCH=amd64` and `GOAMD64=v1`, and uploads the benchmark output as the `vector-amd64-bench` artifact.
+
 ### Not yet implemented
 
 | Feature | SQLite equivalent | Priority |

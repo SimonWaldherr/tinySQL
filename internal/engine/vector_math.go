@@ -7,7 +7,7 @@ func vectorDot(a, b []float64) float64 {
 	if len(b) < n {
 		n = len(b)
 	}
-	return vectorDotUnrolled(a[:n], b[:n])
+	return vectorDotKernel(a[:n], b[:n])
 }
 
 func vectorDotUnrolled(a, b []float64) float64 {
@@ -31,9 +31,13 @@ func vectorL2Squared(a, b []float64) float64 {
 	if len(b) < n {
 		n = len(b)
 	}
+	return vectorL2SquaredKernel(a[:n], b[:n])
+}
+
+func vectorL2SquaredUnrolled(a, b []float64) float64 {
 	var s0, s1, s2, s3 float64
 	i := 0
-	for ; i+3 < n; i += 4 {
+	for ; i+3 < len(a); i += 4 {
 		d0 := a[i] - b[i]
 		d1 := a[i+1] - b[i+1]
 		d2 := a[i+2] - b[i+2]
@@ -44,7 +48,7 @@ func vectorL2Squared(a, b []float64) float64 {
 		s3 += d3 * d3
 	}
 	sum := (s0 + s1) + (s2 + s3)
-	for ; i < n; i++ {
+	for ; i < len(a); i++ {
 		d := a[i] - b[i]
 		sum += d * d
 	}
