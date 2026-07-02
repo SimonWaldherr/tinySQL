@@ -4,7 +4,7 @@
 //
 // Usage:
 //
-//	SELECT * FROM VEC_SEARCH('table_name', 'vector_column', query_vector, k [, 'metric'])
+//	SELECT * FROM VEC_SEARCH('table_name', 'vector_column', query_vector, k [, 'metric' [, 'index']])
 //
 // Parameters:
 //
@@ -13,6 +13,7 @@
 //	query_vector   – the search vector ([]float64 or JSON string)
 //	k              – number of nearest neighbors to return
 //	metric         – optional distance metric: 'cosine' (default), 'l2', 'manhattan', 'dot'
+//	index          – optional index mode: 'flat' (default exact), 'ivf', 'hnsw'
 //
 // Returns all original columns plus:
 //
@@ -45,8 +46,8 @@ type VecSearchTableFunc struct{}
 func (f *VecSearchTableFunc) Name() string { return "VEC_SEARCH" }
 
 func (f *VecSearchTableFunc) ValidateArgs(args []Expr) error {
-	if len(args) < 4 || len(args) > 5 {
-		return fmt.Errorf("VEC_SEARCH requires 4-5 arguments: (table, column, query_vector, k [, metric])")
+	if len(args) < 4 || len(args) > 6 {
+		return fmt.Errorf("VEC_SEARCH requires 4-6 arguments: (table, column, query_vector, k [, metric [, index]])")
 	}
 	return nil
 }
@@ -58,6 +59,7 @@ type vecSearchArgs struct {
 	queryVec  []float64
 	k         int
 	metric    string
+	indexMode string
 }
 
 // vecParseArgs evaluates and validates all VEC_SEARCH arguments.
@@ -119,6 +121,21 @@ func vecParseArgs(env ExecEnv, args []Expr, row Row) (vecSearchArgs, error) {
 		}
 	} else {
 		a.metric = "cosine"
+	}
+	a.indexMode = "flat"
+	if len(args) == 6 {
+		iv, err := evalExpr(env, args[5], row)
+		if err != nil {
+			return a, fmt.Errorf("VEC_SEARCH index: %w", err)
+		}
+		is, ok := iv.(string)
+		if !ok {
+			return a, fmt.Errorf("VEC_SEARCH: index must be a string, got %T", iv)
+		}
+		a.indexMode = normalizeVecIndexMode(is)
+		if a.indexMode == "" {
+			return a, fmt.Errorf("VEC_SEARCH: unknown index %q (supported: flat, exact, ivf, hnsw)", is)
+		}
 	}
 
 	return a, nil
@@ -213,11 +230,7 @@ func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeN
 }
 
 func vectorL2Norm(v []float64) float64 {
-	var sum float64
-	for _, x := range v {
-		sum += x * x
-	}
-	return math.Sqrt(sum)
+	return math.Sqrt(vectorDot(v, v))
 }
 
 func pushTopK(heapRows *vecScoredHeap, rowIdx int, distance float64, k int) {
@@ -267,40 +280,19 @@ func buildVecDistanceFunc(metric string, query []float64, queryNorm float64, cac
 			if rowIdx >= len(cache.valid) || !cache.valid[rowIdx] {
 				return 0, false
 			}
-			norm := cache.norms[rowIdx]
-			if norm == 0 {
-				return 0, false
-			}
-			var dot float64
-			for i := range query {
-				dot += vec[i] * query[i]
-			}
-			return 1.0 - dot/(norm*queryNorm), true
+			return vectorDistance(metric, vec, query, cache.norms[rowIdx], queryNorm)
 		}
 	case "l2":
 		return func(vec []float64, _ int) (float64, bool) {
-			var sum float64
-			for i := range query {
-				d := vec[i] - query[i]
-				sum += d * d
-			}
-			return math.Sqrt(sum), true
+			return vectorDistance(metric, vec, query, 0, 0)
 		}
 	case "manhattan":
 		return func(vec []float64, _ int) (float64, bool) {
-			var sum float64
-			for i := range query {
-				sum += math.Abs(vec[i] - query[i])
-			}
-			return sum, true
+			return vectorDistance(metric, vec, query, 0, 0)
 		}
 	case "dot":
 		return func(vec []float64, _ int) (float64, bool) {
-			var dot float64
-			for i := range query {
-				dot += vec[i] * query[i]
-			}
-			return -dot, true
+			return vectorDistance(metric, vec, query, 0, 0)
 		}
 	default:
 		return func([]float64, int) (float64, bool) { return 0, false }
@@ -459,7 +451,7 @@ func (f *VecSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 	}
 	cache := getVecColumnCache(tenant, table, vecColIdx, a.metric == "cosine")
 	distFn := buildVecDistanceFunc(a.metric, a.queryVec, queryNorm, cache)
-	scoredRowsOrdered, err := vecSearchTopK(searchCtx, table.Rows, queryLen, a.k, cache, distFn)
+	scoredRowsOrdered, err := vecSearchTopKWithIndex(searchCtx, tenant, table, vecColIdx, a, queryLen, queryNorm, cache, distFn)
 	if err != nil {
 		return nil, err
 	}
@@ -501,35 +493,23 @@ func vecRowValue(v any) ([]float64, bool) {
 
 // computeDistance computes distance between two vectors using the specified metric.
 func computeDistance(a, b []float64, metric string) (float64, error) {
-	switch metric {
-	case "cosine":
-		sim, err := cosineSimilarity(a, b)
-		if err != nil {
-			return 0, err
-		}
-		return 1.0 - sim, nil
-	case "l2", "euclidean":
-		var sum float64
-		for i := range a {
-			d := a[i] - b[i]
-			sum += d * d
-		}
-		return math.Sqrt(sum), nil
-	case "manhattan", "l1":
-		var sum float64
-		for i := range a {
-			sum += math.Abs(a[i] - b[i])
-		}
-		return sum, nil
-	case "dot", "inner_product":
-		var dot float64
-		for i := range a {
-			dot += a[i] * b[i]
-		}
-		return -dot, nil // negate so smaller = more similar
-	default:
+	normalized := normalizeVecMetric(metric)
+	if normalized == "" {
 		return 0, fmt.Errorf("unknown metric %q (supported: cosine, l2, manhattan, dot)", metric)
 	}
+	var normA, normB float64
+	if normalized == "cosine" {
+		normA = vectorL2Norm(a)
+		normB = vectorL2Norm(b)
+	}
+	dist, ok := vectorDistance(normalized, a, b, normA, normB)
+	if !ok {
+		if normalized == "cosine" && len(a) == len(b) && (normA == 0 || normB == 0) {
+			return 0, fmt.Errorf("zero-length vector")
+		}
+		return 0, fmt.Errorf("dimension mismatch %d vs %d", len(a), len(b))
+	}
+	return dist, nil
 }
 
 // VecTopKTableFunc implements VEC_TOP_K — alias/alternative API for k-NN search.

@@ -482,6 +482,105 @@ func TestVecSearchWithL2Metric(t *testing.T) {
 	expectFloat(t, rs.Rows[1]["_vec_distance"], math.Sqrt(2), 1e-9, "L2 second")
 }
 
+func TestVecSearchWithANNIndexModes(t *testing.T) {
+	db := storage.NewDB()
+	table := storage.NewTable("ann_docs", []storage.Column{
+		{Name: "id", Type: storage.IntType},
+		{Name: "label", Type: storage.TextType},
+		{Name: "embedding", Type: storage.VectorType},
+	}, false)
+
+	for i := 0; i < 512; i++ {
+		vec := []float64{
+			math.Sin(float64(i) * 0.17),
+			math.Cos(float64(i) * 0.11),
+			math.Sin(float64(i)*0.07 + 1.0),
+			math.Cos(float64(i)*0.13 + 2.0),
+			float64(i%17) / 17.0,
+		}
+		table.Rows = append(table.Rows, []any{i, fmt.Sprintf("doc-%03d", i), vec})
+	}
+	if err := db.Put("default", table); err != nil {
+		t.Fatal(err)
+	}
+
+	targetID := 137
+	query := table.Rows[targetID][2].([]float64)
+	for _, mode := range []string{"ivf", "hnsw"} {
+		t.Run(mode, func(t *testing.T) {
+			rs := execSQL(t, db, fmt.Sprintf(`
+				SELECT id, _vec_distance, _vec_rank
+				FROM VEC_SEARCH('ann_docs', 'embedding', VEC_FROM_JSON('%s'), 10, 'cosine', '%s')
+			`, mustVecJSON(t, query), mode))
+			if len(rs.Rows) == 0 {
+				t.Fatalf("%s returned no rows", mode)
+			}
+			found := false
+			for _, row := range rs.Rows {
+				if row["id"] == targetID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("%s did not return exact query row %d in top-10: %#v", mode, targetID, rs.Rows)
+			}
+		})
+	}
+}
+
+func TestVecSearchANNIndexInvalidatesOnTableVersion(t *testing.T) {
+	db := storage.NewDB()
+	table := storage.NewTable("ann_mutable", []storage.Column{
+		{Name: "id", Type: storage.IntType},
+		{Name: "embedding", Type: storage.VectorType},
+	}, false)
+	for i := 0; i < 384; i++ {
+		table.Rows = append(table.Rows, []any{i, []float64{
+			math.Sin(float64(i) * 0.09),
+			math.Cos(float64(i) * 0.05),
+			math.Sin(float64(i) * 0.03),
+			math.Cos(float64(i) * 0.02),
+		}})
+	}
+	if err := db.Put("default", table); err != nil {
+		t.Fatal(err)
+	}
+
+	base := table.Rows[151][1].([]float64)
+	query := []float64{base[0] + 0.001, base[1] - 0.001, base[2] + 0.001, base[3] - 0.001}
+	for _, mode := range []string{"ivf", "hnsw"} {
+		_ = execSQL(t, db, fmt.Sprintf(`
+			SELECT id
+			FROM VEC_SEARCH('ann_mutable', 'embedding', VEC_FROM_JSON('%s'), 5, 'l2', '%s')
+		`, mustVecJSON(t, query), mode))
+	}
+
+	table.Rows = append(table.Rows, []any{999, query})
+	table.Version++
+
+	for _, mode := range []string{"ivf", "hnsw"} {
+		t.Run(mode, func(t *testing.T) {
+			rs := execSQL(t, db, fmt.Sprintf(`
+				SELECT id
+				FROM VEC_SEARCH('ann_mutable', 'embedding', VEC_FROM_JSON('%s'), 5, 'l2', '%s')
+			`, mustVecJSON(t, query), mode))
+			if len(rs.Rows) == 0 || rs.Rows[0]["id"] != 999 {
+				t.Fatalf("%s did not rebuild after table version change: %#v", mode, rs.Rows)
+			}
+		})
+	}
+}
+
+func mustVecJSON(t *testing.T, vec []float64) string {
+	t.Helper()
+	b, err := json.Marshal(vec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
 // ---------------------------------------------------------------------------
 // Error handling
 // ---------------------------------------------------------------------------

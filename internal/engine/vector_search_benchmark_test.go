@@ -64,6 +64,40 @@ func benchmarkVecSearch(b *testing.B, metric string) {
 	}
 }
 
+func benchmarkVecSearchIndexed(b *testing.B, indexMode string) {
+	db := makeRAGHybridBenchmarkTable(12000, 64)
+	fn := &VecSearchTableFunc{}
+	env := ExecEnv{ctx: context.Background(), tenant: "default", db: db}
+	query := make([]float64, 64)
+	for i := range query {
+		query[i] = math.Cos(0.08*float64(i) + 0.5)
+	}
+	args := []Expr{
+		&Literal{Val: "rag_hybrid"},
+		&Literal{Val: "embedding"},
+		&Literal{Val: query},
+		&Literal{Val: 20},
+		&Literal{Val: "cosine"},
+		&Literal{Val: indexMode},
+	}
+
+	if _, err := fn.Execute(context.Background(), args, env, Row{}); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rs, err := fn.Execute(context.Background(), args, env, Row{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(rs.Rows) == 0 || len(rs.Rows) > 20 {
+			b.Fatalf("expected up to 20 results, got %d", len(rs.Rows))
+		}
+	}
+}
+
 func makeWhereAndBenchmarkTable(rows, dims int) *storage.DB {
 	db := storage.NewDB()
 	table := storage.NewTable("rag_docs", []storage.Column{
@@ -195,6 +229,14 @@ func BenchmarkVecSearchCosineTopK(b *testing.B) {
 
 func BenchmarkVecSearchL2TopK(b *testing.B) {
 	benchmarkVecSearch(b, "l2")
+}
+
+func BenchmarkVecSearchCosineTopK_IVFCached(b *testing.B) {
+	benchmarkVecSearchIndexed(b, "ivf")
+}
+
+func BenchmarkVecSearchCosineTopK_HNSWCached(b *testing.B) {
+	benchmarkVecSearchIndexed(b, "hnsw")
 }
 
 func BenchmarkWhereVectorAndSimpleCondition_VectorThenScalar(b *testing.B) {

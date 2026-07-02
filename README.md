@@ -436,7 +436,7 @@ SELECT * FROM audit_log;
 
 ### Vectors
 
-`VEC_SEARCH` and `VEC_TOP_K` perform k-nearest-neighbour search. `VEC_AVG` computes the element-wise average of a set of vectors, useful for building centroid embeddings:
+`VEC_SEARCH` and `VEC_TOP_K` perform k-nearest-neighbour search. By default they use exact top-k search; pass a sixth argument (`'ivf'` or `'hnsw'`) to use cached approximate vector indexes for larger RAG corpora. `VEC_AVG` computes the element-wise average of a set of vectors, useful for building centroid embeddings:
 
 ```sql
 -- Store embeddings
@@ -445,6 +445,15 @@ CREATE TABLE embeddings (id INT, label TEXT, vec VECTOR);
 -- Find the 5 nearest neighbours to a query vector
 SELECT id, label, _vec_distance
 FROM VEC_SEARCH('embeddings', 'vec', '[0.1, 0.2, 0.3]', 5, 'cosine')
+ORDER BY _vec_rank;
+
+-- Approximate indexed retrieval for larger RAG tables
+SELECT id, label, _vec_distance
+FROM VEC_SEARCH('embeddings', 'vec', '[0.1, 0.2, 0.3]', 20, 'cosine', 'hnsw')
+ORDER BY _vec_rank;
+
+SELECT id, label, _vec_distance
+FROM VEC_SEARCH('embeddings', 'vec', '[0.1, 0.2, 0.3]', 20, 'cosine', 'ivf')
 ORDER BY _vec_rank;
 
 -- Compute centroid of a cluster
@@ -501,7 +510,7 @@ For pure top-k similarity, first use `VEC_SEARCH` and apply recency scoring afte
 
 ```sql
 WITH topk AS (
-  SELECT * FROM VEC_SEARCH('docs', 'embedding', VEC_FROM_JSON('[0.1, 0.2, 0.3]'), 40, 'cosine')
+  SELECT * FROM VEC_SEARCH('docs', 'embedding', VEC_FROM_JSON('[0.1, 0.2, 0.3]'), 40, 'cosine', 'hnsw')
 )
 SELECT id, created_at, title,
        RAG_HYBRID_SCORE(
@@ -548,7 +557,7 @@ LIMIT 20;
 Benchmarks for vector/RAG behavior are in `internal/engine/vector_search_benchmark_test.go`. Run:
 
 ```bash
-go test ./internal/engine -run '^$' -bench 'Benchmark(WhereVectorAndSimpleCondition|OrderByVectorLimit|CompareTopK_VecSearchVsOrderBy|RAGRankScoreOrderByLimit|RAGContextFromTopK)' -count=1
+go test ./internal/engine -run '^$' -bench 'Benchmark(WhereVectorAndSimpleCondition|OrderByVectorLimit|CompareTopK_VecSearchVsOrderBy|VecSearchCosineTopK|RAGRankScoreOrderByLimit|RAGContextFromTopK)' -count=1
 ```
 
 ### Not yet implemented
@@ -563,7 +572,7 @@ go test ./internal/engine -run '^$' -bench 'Benchmark(WhereVectorAndSimpleCondit
 | **Broader PRAGMA coverage** | `PRAGMA cache_size`, `PRAGMA page_size`, `PRAGMA optimize`, … | Low |
 | **ATTACH / DETACH DATABASE** | Cross-file queries | Low |
 | **Partial indexes** | `CREATE INDEX … WHERE expr` | Low |
-| **Persistent ANN vector index** | HNSW/IVF — current `VEC_SEARCH` is a sequential scan | Low |
+| **Persistent ANN vector index files** | HNSW/IVF indexes currently rebuild in memory per table version | Low |
 | **WITHOUT ROWID tables** | Storage optimisation | Low |
 | **VACUUM** | Reclaim space, re-pack storage | Low |
 

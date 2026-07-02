@@ -885,12 +885,16 @@ ORDER BY distance;
 
 -- ---- k-NN Vector Search (Table-Valued Function) ----
 
--- VEC_SEARCH(table, column, query_vector, k [, metric])
+-- VEC_SEARCH(table, column, query_vector, k [, metric [, index]])
 -- Returns the k nearest neighbours with _vec_distance and _vec_rank columns
 SELECT * FROM VEC_SEARCH('vec_demo_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 3);
 
 -- Search with L2 distance metric
 SELECT * FROM VEC_SEARCH('vec_demo_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 3, 'l2');
+
+-- Search with cached approximate ANN indexes for larger RAG tables
+SELECT * FROM VEC_SEARCH('vec_demo_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 3, 'cosine', 'hnsw');
+SELECT * FROM VEC_SEARCH('vec_demo_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 3, 'cosine', 'ivf');
 
 -- VEC_TOP_K is an alias for VEC_SEARCH
 SELECT * FROM VEC_TOP_K('vec_demo_docs', 'embedding', VEC_FROM_JSON('[0.0, 1.0, 0.0]'), 2, 'cosine');
