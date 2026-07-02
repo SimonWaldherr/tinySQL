@@ -27,8 +27,16 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"runtime"
 	"strings"
 	"sync"
+
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
+)
+
+const (
+	vecSearchParallelMinRows   = 4096
+	vecSearchParallelChunkRows = 2048
 )
 
 // VecSearchTableFunc implements the VEC_SEARCH table-valued function.
@@ -124,9 +132,14 @@ type vecScoredRow struct {
 
 type vecScoredHeap []vecScoredRow
 
-func (h vecScoredHeap) Len() int           { return len(h) }
-func (h vecScoredHeap) Less(i, j int) bool { return h[i].distance > h[j].distance }
-func (h vecScoredHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h vecScoredHeap) Len() int { return len(h) }
+func (h vecScoredHeap) Less(i, j int) bool {
+	if h[i].distance == h[j].distance {
+		return h[i].rowIdx > h[j].rowIdx
+	}
+	return h[i].distance > h[j].distance
+}
+func (h vecScoredHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 
 func (h *vecScoredHeap) Push(x any) {
 	*h = append(*h, x.(vecScoredRow))
@@ -140,39 +153,44 @@ func (h *vecScoredHeap) Pop() any {
 	return v
 }
 
-type vecSearchNormCacheKey struct {
+type vecSearchColumnCacheKey struct {
 	tenant string
 	table  string
 	colIdx int
 }
 
-type vecSearchNormCacheEntry struct {
-	version int
-	norms   []float64
-	valid   []bool
+type vecSearchColumnCacheEntry struct {
+	table      *storage.Table
+	version    int
+	vectors    [][]float64
+	norms      []float64
+	normsReady bool
+	valid      []bool
 }
 
 var (
-	vecSearchNormCacheMu sync.RWMutex
-	vecSearchNormCache   = make(map[vecSearchNormCacheKey]vecSearchNormCacheEntry)
+	vecSearchColumnCacheMu sync.RWMutex
+	vecSearchColumnCache   = make(map[vecSearchColumnCacheKey]vecSearchColumnCacheEntry)
 )
 
-func getVecColumnNorms(tenant, tableName string, tableVersion int, tableRows [][]any, colIdx int) ([]float64, []bool) {
-	key := vecSearchNormCacheKey{tenant: tenant, table: tableName, colIdx: colIdx}
+func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeNorms bool) vecSearchColumnCacheEntry {
+	key := vecSearchColumnCacheKey{tenant: tenant, table: table.Name, colIdx: colIdx}
 
-	vecSearchNormCacheMu.RLock()
-	if cached, ok := vecSearchNormCache[key]; ok && cached.version == tableVersion {
-		norms := cached.norms
-		valid := cached.valid
-		vecSearchNormCacheMu.RUnlock()
-		return norms, valid
+	vecSearchColumnCacheMu.RLock()
+	if cached, ok := vecSearchColumnCache[key]; ok && cached.table == table && cached.version == table.Version && (!includeNorms || cached.normsReady) {
+		vecSearchColumnCacheMu.RUnlock()
+		return cached
 	}
-	vecSearchNormCacheMu.RUnlock()
+	vecSearchColumnCacheMu.RUnlock()
 
-	norms := make([]float64, len(tableRows))
-	valid := make([]bool, len(tableRows))
+	vectors := make([][]float64, len(table.Rows))
+	var norms []float64
+	if includeNorms {
+		norms = make([]float64, len(table.Rows))
+	}
+	valid := make([]bool, len(table.Rows))
 
-	for i, r := range tableRows {
+	for i, r := range table.Rows {
 		if colIdx >= len(r) || r[colIdx] == nil {
 			continue
 		}
@@ -180,15 +198,18 @@ func getVecColumnNorms(tenant, tableName string, tableVersion int, tableRows [][
 		if !ok {
 			continue
 		}
-		norms[i] = vectorL2Norm(vec)
+		if includeNorms {
+			norms[i] = vectorL2Norm(vec)
+		}
 		valid[i] = true
+		vectors[i] = vec
 	}
 
-	entry := vecSearchNormCacheEntry{version: tableVersion, norms: norms, valid: valid}
-	vecSearchNormCacheMu.Lock()
-	vecSearchNormCache[key] = entry
-	vecSearchNormCacheMu.Unlock()
-	return norms, valid
+	entry := vecSearchColumnCacheEntry{table: table, version: table.Version, vectors: vectors, norms: norms, normsReady: includeNorms, valid: valid}
+	vecSearchColumnCacheMu.Lock()
+	vecSearchColumnCache[key] = entry
+	vecSearchColumnCacheMu.Unlock()
+	return entry
 }
 
 func vectorL2Norm(v []float64) float64 {
@@ -199,20 +220,6 @@ func vectorL2Norm(v []float64) float64 {
 	return math.Sqrt(sum)
 }
 
-func cosineDistanceFromNorm(vecA, vecB []float64, normA, normB float64) (float64, error) {
-	if normA == 0 || normB == 0 {
-		return 0, fmt.Errorf("zero-length vector")
-	}
-	if len(vecA) != len(vecB) {
-		return 0, fmt.Errorf("dimension mismatch %d vs %d", len(vecA), len(vecB))
-	}
-	var dot float64
-	for i := range vecA {
-		dot += vecA[i] * vecB[i]
-	}
-	return 1.0 - dot/(normA*normB), nil
-}
-
 func pushTopK(heapRows *vecScoredHeap, rowIdx int, distance float64, k int) {
 	if k <= 0 {
 		return
@@ -221,10 +228,17 @@ func pushTopK(heapRows *vecScoredHeap, rowIdx int, distance float64, k int) {
 		heap.Push(heapRows, vecScoredRow{rowIdx: rowIdx, distance: distance})
 		return
 	}
-	if heapRows.Len() > 0 && (*heapRows)[0].distance > distance {
+	if heapRows.Len() > 0 && vecScoredRowLess(vecScoredRow{rowIdx: rowIdx, distance: distance}, (*heapRows)[0]) {
 		(*heapRows)[0] = vecScoredRow{rowIdx: rowIdx, distance: distance}
 		heap.Fix(heapRows, 0)
 	}
+}
+
+func vecScoredRowLess(a, b vecScoredRow) bool {
+	if a.distance == b.distance {
+		return a.rowIdx < b.rowIdx
+	}
+	return a.distance < b.distance
 }
 
 func topKFromHeap(heapRows *vecScoredHeap, k int) []vecScoredRow {
@@ -239,6 +253,153 @@ func topKFromHeap(heapRows *vecScoredHeap, k int) []vecScoredRow {
 		rows[i] = heap.Pop(heapRows).(vecScoredRow)
 	}
 	return rows
+}
+
+type vecDistanceFunc func(vec []float64, rowIdx int) (float64, bool)
+
+func buildVecDistanceFunc(metric string, query []float64, queryNorm float64, cache vecSearchColumnCacheEntry) vecDistanceFunc {
+	switch metric {
+	case "cosine":
+		if queryNorm == 0 {
+			return func([]float64, int) (float64, bool) { return 0, false }
+		}
+		return func(vec []float64, rowIdx int) (float64, bool) {
+			if rowIdx >= len(cache.valid) || !cache.valid[rowIdx] {
+				return 0, false
+			}
+			norm := cache.norms[rowIdx]
+			if norm == 0 {
+				return 0, false
+			}
+			var dot float64
+			for i := range query {
+				dot += vec[i] * query[i]
+			}
+			return 1.0 - dot/(norm*queryNorm), true
+		}
+	case "l2":
+		return func(vec []float64, _ int) (float64, bool) {
+			var sum float64
+			for i := range query {
+				d := vec[i] - query[i]
+				sum += d * d
+			}
+			return math.Sqrt(sum), true
+		}
+	case "manhattan":
+		return func(vec []float64, _ int) (float64, bool) {
+			var sum float64
+			for i := range query {
+				sum += math.Abs(vec[i] - query[i])
+			}
+			return sum, true
+		}
+	case "dot":
+		return func(vec []float64, _ int) (float64, bool) {
+			var dot float64
+			for i := range query {
+				dot += vec[i] * query[i]
+			}
+			return -dot, true
+		}
+	default:
+		return func([]float64, int) (float64, bool) { return 0, false }
+	}
+}
+
+func vecSearchWorkerCount(rows, dims int) int {
+	if rows < vecSearchParallelMinRows || dims == 0 {
+		return 1
+	}
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 2 {
+		return 1
+	}
+	maxByRows := (rows + vecSearchParallelChunkRows - 1) / vecSearchParallelChunkRows
+	if workers > maxByRows {
+		workers = maxByRows
+	}
+	if workers < 2 {
+		return 1
+	}
+	return workers
+}
+
+func vecSearchTopK(ctx context.Context, rows [][]any, queryLen int, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc) ([]vecScoredRow, error) {
+	workers := vecSearchWorkerCount(len(rows), queryLen)
+	if workers == 1 {
+		h, err := vecSearchTopKRange(ctx, rows, 0, len(rows), queryLen, k, cache, distFn)
+		if err != nil {
+			return nil, err
+		}
+		return topKFromHeap(&h, k), nil
+	}
+
+	type workerResult struct {
+		heapRows vecScoredHeap
+		err      error
+	}
+	results := make([]workerResult, workers)
+	var wg sync.WaitGroup
+	chunk := (len(rows) + workers - 1) / workers
+
+	for worker := 0; worker < workers; worker++ {
+		start := worker * chunk
+		end := start + chunk
+		if end > len(rows) {
+			end = len(rows)
+		}
+		if start >= end {
+			continue
+		}
+		wg.Add(1)
+		go func(worker, start, end int) {
+			defer wg.Done()
+			h, err := vecSearchTopKRange(ctx, rows, start, end, queryLen, k, cache, distFn)
+			results[worker] = workerResult{heapRows: h, err: err}
+		}(worker, start, end)
+	}
+	wg.Wait()
+
+	merged := &vecScoredHeap{}
+	heap.Init(merged)
+	for i := range results {
+		if results[i].err != nil {
+			return nil, results[i].err
+		}
+		localRows := topKFromHeap(&results[i].heapRows, k)
+		for _, sr := range localRows {
+			pushTopK(merged, sr.rowIdx, sr.distance, k)
+		}
+	}
+	return topKFromHeap(merged, k), nil
+}
+
+func vecSearchTopKRange(ctx context.Context, rows [][]any, start, end, queryLen, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc) (vecScoredHeap, error) {
+	scoredRows := &vecScoredHeap{}
+	heap.Init(scoredRows)
+
+	for i := start; i < end; i++ {
+		if i&1023 == 0 {
+			if err := checkCtx(ctx); err != nil {
+				return nil, err
+			}
+		}
+		if i >= len(cache.valid) || !cache.valid[i] {
+			continue
+		}
+		vec := cache.vectors[i]
+		if len(vec) != queryLen {
+			continue
+		}
+		dist, ok := distFn(vec, i)
+		if !ok {
+			continue
+		}
+		pushTopK(scoredRows, i, dist, k)
+	}
+
+	return *scoredRows, nil
 }
 
 func normalizeVecMetric(metric string) string {
@@ -286,45 +447,22 @@ func (f *VecSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 	}
 	resultCols = append(resultCols, "_vec_distance", "_vec_rank")
 
-	scoredRows := &vecScoredHeap{}
-	heap.Init(scoredRows)
 	queryLen := len(a.queryVec)
-	var norms []float64
-	var normValid []bool
 	var queryNorm float64
 	if a.metric == "cosine" {
 		queryNorm = vectorL2Norm(a.queryVec)
-		norms, normValid = getVecColumnNorms(tenant, table.Name, table.Version, table.Rows, vecColIdx)
-	}
-	for i, r := range table.Rows {
-		if vecColIdx >= len(r) || r[vecColIdx] == nil {
-			continue
-		}
-		vec, ok := vecRowValue(r[vecColIdx])
-		if !ok {
-			continue
-		}
-		if len(vec) != queryLen {
-			continue
-		}
-
-		var dist float64
-		var err error
-		if a.metric == "cosine" {
-			if i >= len(normValid) || !normValid[i] {
-				continue
-			}
-			dist, err = cosineDistanceFromNorm(vec, a.queryVec, norms[i], queryNorm)
-		} else {
-			dist, err = computeDistance(vec, a.queryVec, a.metric)
-		}
-		if err != nil {
-			continue
-		}
-		pushTopK(scoredRows, i, dist, a.k)
 	}
 
-	scoredRowsOrdered := topKFromHeap(scoredRows, a.k)
+	searchCtx := ctx
+	if searchCtx == nil {
+		searchCtx = env.ctx
+	}
+	cache := getVecColumnCache(tenant, table, vecColIdx, a.metric == "cosine")
+	distFn := buildVecDistanceFunc(a.metric, a.queryVec, queryNorm, cache)
+	scoredRowsOrdered, err := vecSearchTopK(searchCtx, table.Rows, queryLen, a.k, cache, distFn)
+	if err != nil {
+		return nil, err
+	}
 
 	resultRows := make([]Row, 0, len(scoredRowsOrdered))
 	for rank, sr := range scoredRowsOrdered {
