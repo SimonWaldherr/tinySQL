@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -346,6 +347,7 @@ type DBHealth struct {
 	Path              string
 	Closed            bool
 	Closing           bool
+	ReadOnly          bool
 	SchedulerRunning  bool
 	WALActive         bool
 	AdvancedWALActive bool
@@ -393,6 +395,30 @@ type DB struct {
 	lastCloseAt  time.Time
 	lastRecovery RecoveryStatus
 	lastError    string
+
+	// readOnly rejects all mutating statements at the engine level when set.
+	// Serving-only deployments (e.g. nightly bulk load, read-only during the
+	// day) use this to guarantee cache/index stability: no write can invalidate
+	// vector index or column caches, and the WAL is never appended to.
+	readOnly atomic.Bool
+}
+
+// SetReadOnly toggles read-only mode. While enabled, the SQL engine rejects
+// INSERT/UPDATE/DELETE/DDL with an error; SELECT, EXPLAIN, and PRAGMA still
+// work. Safe to call concurrently with running queries.
+func (db *DB) SetReadOnly(ro bool) {
+	if db == nil {
+		return
+	}
+	db.readOnly.Store(ro)
+}
+
+// IsReadOnly reports whether the database is in read-only mode.
+func (db *DB) IsReadOnly() bool {
+	if db == nil {
+		return false
+	}
+	return db.readOnly.Load()
 }
 
 // NewDB creates a new empty database catalog with MVCC support.
@@ -448,6 +474,7 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 			Path:               cfg.Path,
 			CheckpointEvery:    cfg.CheckpointEvery,
 			CheckpointInterval: cfg.CheckpointInterval,
+			CheckpointMaxBytes: cfg.CheckpointMaxBytes,
 		}
 		wal, err := OpenWAL(db, walCfg)
 		if err != nil {
@@ -471,6 +498,7 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 			CheckpointPath:     checkpointPath,
 			CheckpointEvery:    cfg.CheckpointEvery,
 			CheckpointInterval: cfg.CheckpointInterval,
+			CheckpointMaxBytes: cfg.CheckpointMaxBytes,
 			Compress:           cfg.CompressFiles,
 			BufferSize:         64 * 1024,
 		}
@@ -536,6 +564,10 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 
 	if err := db.loadBackendCatalog(); err != nil {
 		return nil, err
+	}
+
+	if cfg.ReadOnly {
+		db.SetReadOnly(true)
 	}
 
 	return db, nil
@@ -1116,6 +1148,10 @@ func diskToTable(dt diskTable) *Table {
 
 // SaveToFile writes a snapshot of the database to a file. If the filename
 // ends with .gz, the snapshot is gzip-compressed to reduce size.
+//
+// The snapshot is written atomically: data goes to a temporary file in the
+// same directory, is fsynced, and is then renamed over the target. A crash
+// mid-checkpoint therefore never corrupts or truncates the previous snapshot.
 func SaveToFile(db *DB, filename string) error {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -1135,13 +1171,19 @@ func SaveToFile(db *DB, filename string) error {
 	if err := os.MkdirAll(filepath.Dir(filename), 0o755); err != nil && !errors.Is(err, os.ErrExist) {
 		return err
 	}
-	f, err := os.Create(filename)
+	tmp := filename + ".tmp"
+	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	fail := func(err error) error {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
 
-	var w io.Writer = bufio.NewWriter(f)
+	bw := bufio.NewWriter(f)
+	var w io.Writer = bw
 	// Enable gzip compression based on file extension.
 	var gz *gzip.Writer
 	if strings.HasSuffix(strings.ToLower(filename), ".gz") {
@@ -1150,33 +1192,32 @@ func SaveToFile(db *DB, filename string) error {
 	}
 	enc := gob.NewEncoder(w)
 	if err := enc.Encode(dump); err != nil {
-		if gz != nil {
-			_ = gz.Close()
-		}
-		if bw, ok := w.(*bufio.Writer); ok {
-			_ = bw.Flush()
-		}
-		return err
+		return fail(err)
 	}
 	if err := enc.Encode(catalogToDisk(db.catalog)); err != nil {
-		if gz != nil {
-			_ = gz.Close()
-		}
-		if bw, ok := w.(*bufio.Writer); ok {
-			_ = bw.Flush()
-		}
-		return err
+		return fail(err)
 	}
 	if gz != nil {
 		if err := gz.Close(); err != nil {
-			return err
+			return fail(err)
 		}
 	}
-	// w is bufio.Writer when gz is nil, otherwise gz wraps it
-	if bw, ok := w.(*bufio.Writer); ok {
-		return bw.Flush()
+	if err := bw.Flush(); err != nil {
+		return fail(err)
 	}
-	return nil
+	if err := f.Sync(); err != nil {
+		return fail(err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, filename); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	// Make the rename durable across power loss (no-op on Windows).
+	return syncDir(filepath.Dir(filename))
 }
 
 // LoadFromFile loads a database snapshot from a file. It auto-detects gzip
@@ -1377,6 +1418,25 @@ type WALConfig struct {
 	Path               string
 	CheckpointEvery    uint64
 	CheckpointInterval time.Duration
+	// CheckpointMaxBytes forces a checkpoint once the WAL file exceeds this
+	// size, bounding WAL growth independently of transaction count and time.
+	// Zero means default (64 MB); negative disables the size trigger.
+	CheckpointMaxBytes int64
+}
+
+// defaultCheckpointMaxBytes bounds WAL growth when no explicit limit is set.
+const defaultCheckpointMaxBytes = 64 << 20 // 64 MB
+
+// normalizeCheckpointMaxBytes maps the config convention (0 = default,
+// negative = disabled) onto the internal one (0 = disabled).
+func normalizeCheckpointMaxBytes(v int64) int64 {
+	if v == 0 {
+		return defaultCheckpointMaxBytes
+	}
+	if v < 0 {
+		return 0
+	}
+	return v
 }
 
 // WALManager encapsulates WAL append, recovery, and checkpoints.
@@ -1386,7 +1446,9 @@ type WALManager struct {
 	checkpointPath     string
 	checkpointEvery    uint64
 	checkpointInterval time.Duration
+	checkpointMaxBytes int64
 	file               *os.File
+	bytes              *countingWriter
 	writer             *bufio.Writer
 	encoder            *gob.Encoder
 	nextSeq            uint64
@@ -1522,6 +1584,7 @@ func (db *DB) HealthCheck() DBHealth {
 	}
 	health := DBHealth{
 		OK:                !db.closed && !db.closing,
+		ReadOnly:          db.IsReadOnly(),
 		Mode:              db.storageMode,
 		ModeName:          db.storageMode.String(),
 		Path:              path,
@@ -1787,17 +1850,21 @@ func OpenWAL(db *DB, cfg WALConfig) (*WALManager, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+	size, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
 		f.Close()
 		return nil, err
 	}
-	writer := bufio.NewWriter(f)
+	cw := &countingWriter{w: f, n: size}
+	writer := bufio.NewWriter(cw)
 	wm := &WALManager{
 		path:               walPath,
 		checkpointPath:     cfg.Path,
 		checkpointEvery:    cfg.CheckpointEvery,
 		checkpointInterval: cfg.CheckpointInterval,
+		checkpointMaxBytes: normalizeCheckpointMaxBytes(cfg.CheckpointMaxBytes),
 		file:               f,
+		bytes:              cw,
 		writer:             writer,
 		nextSeq:            nextSeq,
 		nextTxID:           nextTxID,
@@ -1876,6 +1943,9 @@ func (w *WALManager) LogTransaction(changes []WALChange) (bool, error) {
 	if !need && w.checkpointInterval > 0 && time.Since(w.lastCheckpoint) >= w.checkpointInterval {
 		need = true
 	}
+	if !need && w.checkpointMaxBytes > 0 && w.bytes.n >= w.checkpointMaxBytes {
+		need = true
+	}
 	return need, nil
 }
 
@@ -1913,7 +1983,8 @@ func (w *WALManager) Checkpoint(db *DB) error {
 		return err
 	}
 	w.file = f
-	w.writer = bufio.NewWriter(f)
+	w.bytes = &countingWriter{w: f}
+	w.writer = bufio.NewWriter(w.bytes)
 	w.encoder = gob.NewEncoder(w.writer)
 	w.nextSeq = 1
 	w.txSinceCheckpoint = 0
@@ -2064,6 +2135,19 @@ type countingReader struct {
 
 func (c *countingReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// countingWriter tracks the number of bytes written through it. Used to
+// bound WAL file growth without stat() calls on the hot path.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
 	c.n += int64(n)
 	return n, err
 }

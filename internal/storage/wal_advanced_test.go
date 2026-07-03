@@ -117,6 +117,92 @@ func TestAdvancedWALAbort(t *testing.T) {
 	}
 }
 
+// TestAdvancedWALChecksumDeterminism verifies that the CRC32C record checksum
+// is identical before writing and after a gob round-trip, including the tricky
+// image value types: time.Time (loses its monotonic clock in gob), maps
+// (random iteration order), and []float64 vectors.
+func TestAdvancedWALChecksumDeterminism(t *testing.T) {
+	safeGobRegister(map[string]any{})
+	safeGobRegister(time.Time{})
+
+	tmpDir := t.TempDir()
+	walPath := filepath.Join(tmpDir, "determinism.wal")
+
+	cols := []Column{
+		{Name: "id", Type: IntType},
+		{Name: "payload", Type: JsonType},
+	}
+	image := []any{
+		int64(42),
+		"hello",
+		3.14159,
+		time.Now(), // carries a monotonic clock reading before the round-trip
+		map[string]any{"beta": 2.0, "alpha": 1.0, "nested": []any{"x", 1.5}},
+		[]float64{0.25, -1.5, 3.75},
+		nil,
+	}
+
+	{
+		wal, err := OpenAdvancedWAL(AdvancedWALConfig{Path: walPath})
+		if err != nil {
+			t.Fatalf("open WAL: %v", err)
+		}
+		wal.LogBegin(1)
+		if _, err := wal.LogInsert(1, "default", "docs", 1, image, cols); err != nil {
+			t.Fatalf("log insert: %v", err)
+		}
+		if _, err := wal.LogCommit(1); err != nil {
+			t.Fatalf("log commit: %v", err)
+		}
+		wal.Close()
+	}
+
+	db := NewDB()
+	wal, err := OpenAdvancedWAL(AdvancedWALConfig{Path: walPath})
+	if err != nil {
+		t.Fatalf("reopen WAL: %v", err)
+	}
+	defer wal.Close()
+	recovered, err := wal.Recover(db)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	// A checksum mismatch stops recovery silently, so recovered==1 proves the
+	// checksum was deterministic across the round-trip.
+	if recovered != 1 {
+		t.Fatalf("expected 1 recovered operation, got %d (checksum not deterministic?)", recovered)
+	}
+	table, err := db.Get("default", "docs")
+	if err != nil || len(table.Rows) != 1 {
+		t.Fatalf("recovered table missing row: err=%v", err)
+	}
+}
+
+// TestAdvancedWALChecksumCoversImages verifies that corrupting a row image
+// invalidates the checksum (the legacy additive checksum ignored images).
+func TestAdvancedWALChecksumCoversImages(t *testing.T) {
+	w := &AdvancedWAL{}
+	rec := &WALRecord{
+		LSN:        7,
+		TxID:       3,
+		OpType:     WALOpInsert,
+		Tenant:     "default",
+		Table:      "docs",
+		RowID:      1,
+		AfterImage: []any{[]float64{1, 2, 3}, "text"},
+		Timestamp:  time.Now(),
+	}
+	orig := w.calculateChecksum(rec)
+	rec.AfterImage = []any{[]float64{1, 2, 4}, "text"}
+	if w.calculateChecksum(rec) == orig {
+		t.Fatal("checksum did not change when AfterImage changed")
+	}
+	rec.AfterImage = []any{[]float64{1, 2, 3}, "text"}
+	if w.calculateChecksum(rec) != orig {
+		t.Fatal("checksum not stable for identical record")
+	}
+}
+
 func TestAdvancedWALRecovery(t *testing.T) {
 	tmpDir := t.TempDir()
 	walPath := filepath.Join(tmpDir, "recovery.wal")

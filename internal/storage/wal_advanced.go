@@ -10,12 +10,16 @@ package storage
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -104,6 +108,9 @@ type AdvancedWAL struct {
 	// File handle
 	file *os.File
 
+	// Byte counter between file and writer (bounds WAL growth)
+	bytes *countingWriter
+
 	// Buffered writer
 	writer *bufio.Writer
 
@@ -116,6 +123,7 @@ type AdvancedWAL struct {
 	// Checkpoint configuration
 	checkpointEvery    uint64
 	checkpointInterval time.Duration
+	checkpointMaxBytes int64
 	lastCheckpoint     time.Time
 	recordsSinceCP     uint64
 
@@ -148,6 +156,7 @@ type AdvancedWALConfig struct {
 	CheckpointPath     string
 	CheckpointEvery    uint64        // Checkpoint after N records
 	CheckpointInterval time.Duration // Checkpoint after duration
+	CheckpointMaxBytes int64         // Checkpoint once WAL exceeds this size (0 = 64 MB default, <0 disables)
 	Compress           bool
 	BufferSize         int // Buffer size for writing
 }
@@ -180,15 +189,22 @@ func OpenAdvancedWAL(config AdvancedWALConfig) (*AdvancedWAL, error) {
 		return nil, fmt.Errorf("open WAL file: %w", err)
 	}
 
-	writer := bufio.NewWriterSize(file, config.BufferSize)
+	var walSize int64
+	if fi, statErr := file.Stat(); statErr == nil {
+		walSize = fi.Size()
+	}
+	cw := &countingWriter{w: file, n: walSize}
+	writer := bufio.NewWriterSize(cw, config.BufferSize)
 
 	wal := &AdvancedWAL{
 		path:               config.Path,
 		checkpointPath:     config.CheckpointPath,
 		file:               file,
+		bytes:              cw,
 		writer:             writer,
 		checkpointEvery:    config.CheckpointEvery,
 		checkpointInterval: config.CheckpointInterval,
+		checkpointMaxBytes: normalizeCheckpointMaxBytes(config.CheckpointMaxBytes),
 		lastCheckpoint:     time.Now(),
 		activeTxs:          make(map[TxID]*WALTxState),
 		compress:           config.Compress,
@@ -447,7 +463,8 @@ func (w *AdvancedWAL) Checkpoint(db *DB) error {
 	}
 
 	w.file = file
-	w.writer = bufio.NewWriter(file)
+	w.bytes = &countingWriter{w: file}
+	w.writer = bufio.NewWriter(w.bytes)
 	w.encoder = gob.NewEncoder(w.writer)
 	w.recordsSinceCP = 0
 	w.lastCheckpoint = time.Now()
@@ -466,6 +483,10 @@ func (w *AdvancedWAL) ShouldCheckpoint() bool {
 	}
 
 	if time.Since(w.lastCheckpoint) >= w.checkpointInterval {
+		return true
+	}
+
+	if w.checkpointMaxBytes > 0 && w.bytes != nil && w.bytes.n >= w.checkpointMaxBytes {
 		return true
 	}
 
@@ -509,9 +530,9 @@ func (w *AdvancedWAL) Recover(db *DB) (int, error) {
 			break
 		}
 
-		// Verify checksum
-		expectedChecksum := w.calculateChecksum(&record)
-		if record.Checksum != expectedChecksum {
+		// Verify checksum (CRC32C; fall back to the legacy additive checksum
+		// so WAL files written by older versions still recover).
+		if record.Checksum != w.calculateChecksum(&record) && record.Checksum != w.legacyChecksum(&record) {
 			fmt.Printf("WAL checksum mismatch at LSN %d, stopping recovery\n", record.LSN)
 			break
 		}
@@ -653,8 +674,93 @@ func (w *AdvancedWAL) flush() error {
 	return nil
 }
 
-// calculateChecksum computes a simple checksum for corruption detection.
+// walCRCTable is the CRC32-Castagnoli table used for WAL record checksums.
+// Castagnoli has hardware support (SSE4.2 / ARMv8 CRC) and far better error
+// detection than the legacy additive checksum.
+var walCRCTable = crc32.MakeTable(crc32.Castagnoli)
+
+// calculateChecksum computes a CRC32-Castagnoli checksum over every record
+// field — including the before/after row images, which the legacy checksum
+// did not cover, so image corruption previously went undetected.
 func (w *AdvancedWAL) calculateChecksum(record *WALRecord) uint32 {
+	h := crc32.New(walCRCTable)
+	var b [8]byte
+	writeU64 := func(v uint64) {
+		binary.LittleEndian.PutUint64(b[:], v)
+		h.Write(b[:])
+	}
+	writeU64(uint64(record.LSN))
+	writeU64(uint64(record.TxID))
+	h.Write([]byte{byte(record.OpType)})
+	io.WriteString(h, record.Tenant)
+	h.Write([]byte{0})
+	io.WriteString(h, record.Table)
+	h.Write([]byte{0})
+	writeU64(uint64(record.RowID))
+	writeU64(uint64(record.Timestamp.UnixNano()))
+	hashWALImage(h, record.BeforeImage)
+	hashWALImage(h, record.AfterImage)
+	for _, c := range record.Columns {
+		fmt.Fprintf(h, "c%s;%d;", c.Name, int(c.Type))
+	}
+	return h.Sum32()
+}
+
+// hashWALImage writes a canonical byte representation of a row image.
+// The encoding must be identical before writing and after a gob round-trip:
+// time.Time loses its monotonic clock reading in gob, so it is hashed via
+// UnixNano, and maps are hashed in sorted key order.
+func hashWALImage(h io.Writer, image []any) {
+	if image == nil {
+		io.WriteString(h, "~")
+		return
+	}
+	io.WriteString(h, "[")
+	for _, v := range image {
+		hashWALValue(h, v)
+	}
+	io.WriteString(h, "]")
+}
+
+func hashWALValue(h io.Writer, v any) {
+	switch t := v.(type) {
+	case nil:
+		io.WriteString(h, "n;")
+	case time.Time:
+		fmt.Fprintf(h, "t%d;", t.UnixNano())
+	case []float64:
+		io.WriteString(h, "V")
+		var b [8]byte
+		for _, f := range t {
+			binary.LittleEndian.PutUint64(b[:], math.Float64bits(f))
+			h.Write(b[:])
+		}
+	case []any:
+		io.WriteString(h, "[")
+		for _, e := range t {
+			hashWALValue(h, e)
+		}
+		io.WriteString(h, "]")
+	case map[string]any:
+		keys := make([]string, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		io.WriteString(h, "{")
+		for _, k := range keys {
+			fmt.Fprintf(h, "%q:", k)
+			hashWALValue(h, t[k])
+		}
+		io.WriteString(h, "}")
+	default:
+		fmt.Fprintf(h, "%T%v;", v, v)
+	}
+}
+
+// legacyChecksum is the pre-CRC additive checksum. It is kept only so WAL
+// files written by older versions still pass verification during recovery.
+func (w *AdvancedWAL) legacyChecksum(record *WALRecord) uint32 {
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
 

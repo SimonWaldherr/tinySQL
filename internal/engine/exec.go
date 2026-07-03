@@ -102,6 +102,11 @@ type ExecEnv struct {
 // cancellation.
 func Execute(ctx context.Context, db *storage.DB, tenant string, stmt Statement) (*ResultSet, error) {
 	env := ExecEnv{ctx: ctx, tenant: tenant, db: db}
+	if db.IsReadOnly() {
+		if err := rejectIfMutating(stmt); err != nil {
+			return nil, err
+		}
+	}
 	switch s := stmt.(type) {
 	case *Explain:
 		return executeExplain(env, s)
@@ -151,6 +156,17 @@ func Execute(ctx context.Context, db *storage.DB, tenant string, stmt Statement)
 		return executeDropTrigger(env, s)
 	}
 	return nil, fmt.Errorf("unknown statement")
+}
+
+// rejectIfMutating returns an error for any statement that would modify data
+// or schema. Only SELECT, EXPLAIN, and PRAGMA are permitted in read-only mode.
+func rejectIfMutating(stmt Statement) error {
+	switch stmt.(type) {
+	case *Select, *Explain, *Pragma:
+		return nil
+	default:
+		return fmt.Errorf("database is in read-only mode: %T statements are not allowed", stmt)
+	}
 }
 
 // -------------------- Statement Handlers --------------------

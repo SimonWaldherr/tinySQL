@@ -127,6 +127,18 @@ type StorageConfig struct {
 	// CheckpointInterval controls the maximum time between checkpoints
 	// (ModeWAL only). Zero means default (30 s).
 	CheckpointInterval time.Duration
+
+	// CheckpointMaxBytes forces a checkpoint once the WAL file exceeds this
+	// size, bounding WAL growth independently of transaction count and time
+	// (ModeWAL / ModeAdvancedWAL). Zero means default (64 MB); negative
+	// disables the size trigger.
+	CheckpointMaxBytes int64
+
+	// ReadOnly opens the database in read-only mode: the SQL engine rejects
+	// all mutating statements. Ideal for serve-only phases (e.g. load at
+	// night, query during the day) — vector index and column caches can never
+	// be invalidated and the WAL is never appended to.
+	ReadOnly bool
 }
 
 // DefaultStorageConfig returns a StorageConfig with sensible defaults for

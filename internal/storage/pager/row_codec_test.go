@@ -62,6 +62,65 @@ func TestRowCodec_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestRowCodec_VectorRoundTrip(t *testing.T) {
+	vec := make([]float64, 384)
+	for i := range vec {
+		vec[i] = math.Sin(float64(i)) * 1e3
+	}
+	row := []any{float64(7), "doc-1", vec, []float64{}, nil}
+	decoded, err := UnmarshalRow(MarshalRow(row, nil))
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	got, ok := decoded[2].([]float64)
+	if !ok {
+		t.Fatalf("expected []float64, got %T", decoded[2])
+	}
+	if len(got) != len(vec) {
+		t.Fatalf("length mismatch: got %d, want %d", len(got), len(vec))
+	}
+	for i := range vec {
+		if got[i] != vec[i] {
+			t.Fatalf("[%d] got %v, want %v (must be bit-exact)", i, got[i], vec[i])
+		}
+	}
+	if empty, ok := decoded[3].([]float64); !ok || len(empty) != 0 {
+		t.Fatalf("empty vector round-trip failed: %#v", decoded[3])
+	}
+}
+
+func TestRowCodec_LongStringAndBytes(t *testing.T) {
+	long := string(make([]byte, 70000))
+	longBytes := make([]byte, 70000)
+	longBytes[69999] = 0xAB
+	row := []any{long, longBytes}
+	decoded, err := UnmarshalRow(MarshalRow(row, nil))
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if s, ok := decoded[0].(string); !ok || len(s) != 70000 {
+		t.Fatalf("long string round-trip failed: %T len=%d", decoded[0], len(decoded[0].(string)))
+	}
+	b, ok := decoded[1].([]byte)
+	if !ok || len(b) != 70000 || b[69999] != 0xAB {
+		t.Fatalf("long bytes round-trip failed")
+	}
+}
+
+func BenchmarkMarshalRowVector(b *testing.B) {
+	vec := make([]float64, 768)
+	for i := range vec {
+		vec[i] = float64(i) * 0.001
+	}
+	row := []any{float64(1), "doc", vec}
+	var buf []byte
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		buf = MarshalRow(row, buf)
+	}
+}
+
 func TestRowCodec_BufferReuse(t *testing.T) {
 	row := []any{float64(1), "test", 2.5}
 	buf := MarshalRow(row, nil)

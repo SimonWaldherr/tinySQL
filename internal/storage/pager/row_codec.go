@@ -27,17 +27,27 @@ import (
 //   0x03 — float64 (8 bytes LE)
 //   0x04 — string (uint16 LE length prefix + UTF-8)
 //   0x05 — []byte (uint16 LE length prefix + raw)
+//   0x06 — vector []float64 (uint32 LE element count + count*8 bytes LE)
+//   0x07 — long string (uint32 LE length prefix + UTF-8), for len > 65535
+//   0x08 — long []byte (uint32 LE length prefix + raw), for len > 65535
 //
 // Total overhead per row: 2 + N*(1 + payload).  For a typical 3-column row
 // (int, string, float64) this is ~30 bytes vs ~60+ for JSON.
+//
+// Vectors get a dedicated tag so embedding columns round-trip losslessly as
+// raw IEEE-754 binary (8 bytes/dim + 5 bytes overhead) instead of degrading
+// to a printed string representation.
 
 const (
-	tagNil     byte = 0x00
-	tagBool    byte = 0x01
-	tagInt64   byte = 0x02
-	tagFloat64 byte = 0x03
-	tagString  byte = 0x04
-	tagBytes   byte = 0x05
+	tagNil        byte = 0x00
+	tagBool       byte = 0x01
+	tagInt64      byte = 0x02
+	tagFloat64    byte = 0x03
+	tagString     byte = 0x04
+	tagBytes      byte = 0x05
+	tagVecF64     byte = 0x06
+	tagLongString byte = 0x07
+	tagLongBytes  byte = 0x08
 )
 
 // MarshalRow encodes a row into the compact binary format.
@@ -83,28 +93,54 @@ func MarshalRow(row []any, buf []byte) []byte {
 			binary.LittleEndian.PutUint64(b[:], math.Float64bits(val))
 			buf = append(buf, b[:]...)
 		case string:
-			buf = append(buf, tagString)
-			var b [2]byte
-			binary.LittleEndian.PutUint16(b[:], uint16(len(val)))
-			buf = append(buf, b[:]...)
-			buf = append(buf, val...)
+			buf = appendTaggedString(buf, val)
 		case []byte:
-			buf = append(buf, tagBytes)
-			var b [2]byte
-			binary.LittleEndian.PutUint16(b[:], uint16(len(val)))
-			buf = append(buf, b[:]...)
+			if len(val) > 0xFFFF {
+				buf = append(buf, tagLongBytes)
+				var b [4]byte
+				binary.LittleEndian.PutUint32(b[:], uint32(len(val)))
+				buf = append(buf, b[:]...)
+			} else {
+				buf = append(buf, tagBytes)
+				var b [2]byte
+				binary.LittleEndian.PutUint16(b[:], uint16(len(val)))
+				buf = append(buf, b[:]...)
+			}
 			buf = append(buf, val...)
+		case []float64:
+			buf = append(buf, tagVecF64)
+			var b [4]byte
+			binary.LittleEndian.PutUint32(b[:], uint32(len(val)))
+			buf = append(buf, b[:]...)
+			for _, f := range val {
+				var e [8]byte
+				binary.LittleEndian.PutUint64(e[:], math.Float64bits(f))
+				buf = append(buf, e[:]...)
+			}
 		default:
 			// Fallback: store as string representation.
-			s := fmt.Sprint(val)
-			buf = append(buf, tagString)
-			var b [2]byte
-			binary.LittleEndian.PutUint16(b[:], uint16(len(s)))
-			buf = append(buf, b[:]...)
-			buf = append(buf, s...)
+			buf = appendTaggedString(buf, fmt.Sprint(val))
 		}
 	}
 	return buf
+}
+
+// appendTaggedString appends a string column, switching to the uint32-length
+// tag when the value exceeds the uint16 range (which would otherwise be
+// silently truncated).
+func appendTaggedString(buf []byte, s string) []byte {
+	if len(s) > 0xFFFF {
+		buf = append(buf, tagLongString)
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], uint32(len(s)))
+		buf = append(buf, b[:]...)
+	} else {
+		buf = append(buf, tagString)
+		var b [2]byte
+		binary.LittleEndian.PutUint16(b[:], uint16(len(s)))
+		buf = append(buf, b[:]...)
+	}
+	return append(buf, s...)
 }
 
 // UnmarshalRow decodes a row from the compact binary format.
@@ -163,6 +199,45 @@ func UnmarshalRow(data []byte) ([]any, error) {
 			off += 2
 			if off+blen > len(data) {
 				return nil, fmt.Errorf("truncated bytes data at column %d", i)
+			}
+			dst := make([]byte, blen)
+			copy(dst, data[off:off+blen])
+			row[i] = dst
+			off += blen
+		case tagVecF64:
+			if off+4 > len(data) {
+				return nil, fmt.Errorf("truncated vector len at column %d", i)
+			}
+			n := int(binary.LittleEndian.Uint32(data[off : off+4]))
+			off += 4
+			if n < 0 || off+n*8 > len(data) {
+				return nil, fmt.Errorf("truncated vector data at column %d", i)
+			}
+			vec := make([]float64, n)
+			for j := 0; j < n; j++ {
+				vec[j] = math.Float64frombits(binary.LittleEndian.Uint64(data[off : off+8]))
+				off += 8
+			}
+			row[i] = vec
+		case tagLongString:
+			if off+4 > len(data) {
+				return nil, fmt.Errorf("truncated long string len at column %d", i)
+			}
+			slen := int(binary.LittleEndian.Uint32(data[off : off+4]))
+			off += 4
+			if slen < 0 || off+slen > len(data) {
+				return nil, fmt.Errorf("truncated long string data at column %d", i)
+			}
+			row[i] = string(data[off : off+slen])
+			off += slen
+		case tagLongBytes:
+			if off+4 > len(data) {
+				return nil, fmt.Errorf("truncated long bytes len at column %d", i)
+			}
+			blen := int(binary.LittleEndian.Uint32(data[off : off+4]))
+			off += 4
+			if blen < 0 || off+blen > len(data) {
+				return nil, fmt.Errorf("truncated long bytes data at column %d", i)
 			}
 			dst := make([]byte, blen)
 			copy(dst, data[off:off+blen])

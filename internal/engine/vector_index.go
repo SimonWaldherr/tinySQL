@@ -72,7 +72,26 @@ var (
 	vecIVFCache    = make(map[vecIndexCacheKey]*vecIVFIndex)
 	vecHNSWCacheMu sync.RWMutex
 	vecHNSWCache   = make(map[vecIndexCacheKey]*vecHNSWIndex)
+
+	// vecVisitedPool recycles the per-search visited bitmaps so HNSW queries
+	// on large tables do not allocate len(rows) bytes per call.
+	vecVisitedPool sync.Pool
 )
+
+func acquireVisited(n int) []bool {
+	if v, ok := vecVisitedPool.Get().([]bool); ok && cap(v) >= n {
+		v = v[:n]
+		clear(v)
+		return v
+	}
+	return make([]bool, n)
+}
+
+func releaseVisited(v []bool) {
+	if cap(v) > 0 {
+		vecVisitedPool.Put(v[:0]) //nolint:staticcheck // slice header, not pointer
+	}
+}
 
 func normalizeVecIndexMode(mode string) string {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
@@ -151,20 +170,24 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 		idx.centroids[i] = append([]float64(nil), src...)
 	}
 	assignments := make([]int, len(rows))
+	// Reuse the accumulation buffers across k-means iterations instead of
+	// reallocating nlist*dims floats per pass.
+	sums := make([]float64, nlist*dims)
+	counts := make([]int, nlist)
 	for iter := 0; iter < vecIVFKMeansIters; iter++ {
 		if err := checkCtx(ctx); err != nil {
 			return nil, err
 		}
 		idx.centroidNorms = centroidNorms(idx.centroids)
-		sums := make([]float64, nlist*dims)
-		counts := make([]int, nlist)
+		clear(sums)
+		clear(counts)
 		for i, rowIdx := range rows {
 			if i&1023 == 0 {
 				if err := checkCtx(ctx); err != nil {
 					return nil, err
 				}
 			}
-			c := nearestCentroid(metric, cache.vectors[rowIdx], rowNorm(cache, rowIdx), idx.centroids, idx.centroidNorms)
+			c := nearestCentroid(metric, cache.vectors[rowIdx], rowNormFor(metric, cache, rowIdx), idx.centroids, idx.centroidNorms)
 			assignments[i] = c
 			counts[c]++
 			base := c * dims
@@ -281,7 +304,7 @@ func buildVecHNSWIndex(ctx context.Context, table *storage.Table, metric string,
 
 		current := idx.entry
 		query := cache.vectors[rowIdx]
-		queryNorm := rowNorm(cache, rowIdx)
+		queryNorm := rowNormFor(metric, cache, rowIdx)
 		for layer := idx.maxLevel; layer > level; layer-- {
 			best := idx.searchLayer(query, queryNorm, current, 1, layer, cache, visited)
 			if len(best) > 0 {
@@ -315,7 +338,8 @@ func (idx *vecHNSWIndex) search(ctx context.Context, query []float64, queryNorm 
 		return nil, nil
 	}
 	current := idx.entry
-	visited := make([]bool, len(cache.vectors))
+	visited := acquireVisited(len(cache.vectors))
+	defer releaseVisited(visited)
 	for layer := idx.maxLevel; layer > 0; layer-- {
 		if err := checkCtx(ctx); err != nil {
 			return nil, err
@@ -414,7 +438,7 @@ func (idx *vecHNSWIndex) pruneHNSWNeighbors(rowIdx, layer int, cache vecSearchCo
 		return
 	}
 	query := cache.vectors[rowIdx]
-	queryNorm := rowNorm(cache, rowIdx)
+	queryNorm := rowNormFor(idx.metric, cache, rowIdx)
 	sort.Slice(nbs, func(i, j int) bool {
 		di, okI := rowDistance(idx.metric, query, queryNorm, cache, nbs[i])
 		dj, okJ := rowDistance(idx.metric, query, queryNorm, cache, nbs[j])
@@ -464,11 +488,26 @@ func rowNorm(cache vecSearchColumnCacheEntry, rowIdx int) float64 {
 	return vectorL2Norm(cache.vectors[rowIdx])
 }
 
+// metricNeedsNorms reports whether the metric consumes vector norms.
+// Only cosine does; computing norms for l2/manhattan/dot would double the
+// per-row work in index build and search paths.
+func metricNeedsNorms(metric string) bool {
+	return metric == "cosine"
+}
+
+// rowNormFor returns the cached/computed norm only when the metric needs it.
+func rowNormFor(metric string, cache vecSearchColumnCacheEntry, rowIdx int) float64 {
+	if !metricNeedsNorms(metric) {
+		return 0
+	}
+	return rowNorm(cache, rowIdx)
+}
+
 func rowDistance(metric string, query []float64, queryNorm float64, cache vecSearchColumnCacheEntry, rowIdx int) (float64, bool) {
 	if rowIdx < 0 || rowIdx >= len(cache.vectors) || !cache.valid[rowIdx] {
 		return 0, false
 	}
-	return vectorDistance(metric, cache.vectors[rowIdx], query, rowNorm(cache, rowIdx), queryNorm)
+	return vectorDistance(metric, cache.vectors[rowIdx], query, rowNormFor(metric, cache, rowIdx), queryNorm)
 }
 
 func centroidNorms(centroids [][]float64) []float64 {
