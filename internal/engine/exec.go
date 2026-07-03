@@ -38,6 +38,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -1709,29 +1711,29 @@ func applyDistinctOn(env ExecEnv, s *Select, outRows []Row) ([]Row, error) {
 	return res, nil
 }
 
-// applySortOrder applies ORDER BY sorting to rows
+// applySortOrder applies ORDER BY sorting to rows. Sort keys are extracted
+// once per row up front (same helper as applySortOrderWithLimit's TopN path)
+// instead of re-looking them up from the row map on every comparator call —
+// a map lookup per column per comparison adds up fast under sort.SliceStable's
+// O(n log n) comparisons.
 func applySortOrder(orderBy []OrderItem, outRows []Row) []Row {
+	if len(orderBy) == 0 || len(outRows) <= 1 {
+		return outRows
+	}
 	lcOrdCols := make([]string, len(orderBy))
 	for idx, oi := range orderBy {
 		lcOrdCols[idx] = strings.ToLower(oi.Col)
 	}
-	sort.SliceStable(outRows, func(i, j int) bool {
-		a := outRows[i]
-		b := outRows[j]
-		for k, oi := range orderBy {
-			av := a[lcOrdCols[k]]
-			bv := b[lcOrdCols[k]]
-			cmp := compareForOrder(av, bv, oi.Desc)
-			if cmp == 0 {
-				continue
-			}
-			if oi.Desc {
-				return cmp > 0
-			}
-			return cmp < 0
-		}
-		return false
+	items := make([]orderedValueRow, len(outRows))
+	for i, row := range outRows {
+		items[i] = buildOrderByValues(row, lcOrdCols)
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		return compareOrderedValueRows(orderBy, items[i], items[j]) < 0
 	})
+	for i, item := range items {
+		outRows[i] = item.row
+	}
 	return outRows
 }
 
@@ -1975,9 +1977,11 @@ type simpleSelectPlan struct {
 type simpleProjection struct {
 	name   string // output column name (original case for ResultSet.Cols)
 	key    string // strings.ToLower(name) – pre-computed Row map key
-	side   int    // 0=left, 1=right (join), -1=single-table or expression
-	colIdx int    // >= 0: direct array index into raw/left/right; -1: use expr
-	expr   Expr   // used when colIdx < 0
+	altKey string // optional second Row map key (e.g. "alias.col" for SELECT *,
+	// matching rowsFromTable's qualified+unqualified dual keys); empty if unused
+	side   int  // 0=left, 1=right (join), -1=single-table or expression
+	colIdx int  // >= 0: direct array index into raw/left/right; -1: use expr
+	expr   Expr // used when colIdx < 0
 }
 
 type simpleJoinPlan struct {
@@ -2191,6 +2195,10 @@ func simpleJoinExprResolvable(e Expr, leftIndex, rightIndex map[string]int) bool
 	case *RegexpExpr:
 		return simpleJoinExprResolvable(ex.Expr, leftIndex, rightIndex) &&
 			simpleJoinExprResolvable(ex.Pattern, leftIndex, rightIndex)
+	case *BetweenExpr:
+		return simpleJoinExprResolvable(ex.Expr, leftIndex, rightIndex) &&
+			simpleJoinExprResolvable(ex.Lo, leftIndex, rightIndex) &&
+			simpleJoinExprResolvable(ex.Hi, leftIndex, rightIndex)
 	case *InExpr:
 		if !simpleJoinExprResolvable(ex.Expr, leftIndex, rightIndex) {
 			return false
@@ -2261,11 +2269,31 @@ func evalJoinRawExpr(plan *simpleJoinPlan, left, right []any, e Expr) (any, erro
 		return evalJoinRawLike(plan, left, right, ex)
 	case *RegexpExpr:
 		return evalJoinRawRegexp(plan, left, right, ex)
+	case *BetweenExpr:
+		return evalJoinRawBetween(plan, left, right, ex)
 	case *InExpr:
 		return evalJoinRawIn(plan, left, right, ex)
 	default:
 		return nil, fmt.Errorf("unsupported join fast-path expression %T", e)
 	}
+}
+
+// evalJoinRawBetween evaluates BETWEEN in the join fast path with a single
+// evaluation of the comparand.
+func evalJoinRawBetween(plan *simpleJoinPlan, left, right []any, ex *BetweenExpr) (any, error) {
+	v, err := evalJoinRawExpr(plan, left, right, ex.Expr)
+	if err != nil {
+		return nil, err
+	}
+	lo, err := evalJoinRawExpr(plan, left, right, ex.Lo)
+	if err != nil {
+		return nil, err
+	}
+	hi, err := evalJoinRawExpr(plan, left, right, ex.Hi)
+	if err != nil {
+		return nil, err
+	}
+	return betweenResult(v, lo, hi, ex.Negate)
 }
 
 func evalJoinRawVarRef(plan *simpleJoinPlan, left, right []any, ex *VarRef) (any, error) {
@@ -2313,6 +2341,9 @@ func evalJoinRawLike(plan *simpleJoinPlan, left, right []any, ex *LikeExpr) (any
 	patVal, err := evalJoinRawExpr(plan, left, right, ex.Pattern)
 	if err != nil {
 		return nil, err
+	}
+	if val == nil || patVal == nil {
+		return false, nil
 	}
 	str, ok := val.(string)
 	if !ok {
@@ -2372,7 +2403,7 @@ func evalJoinRawRegexp(plan *simpleJoinPlan, left, right []any, ex *RegexpExpr) 
 	if ex.SimilarTo {
 		pat = similarToRegexp(pat)
 	}
-	re, err := regexp.Compile(pat)
+	re, err := compileCachedRegexp(pat)
 	if err != nil {
 		return nil, fmt.Errorf("REGEXP: invalid pattern %q: %v", pat, err)
 	}
@@ -2891,9 +2922,22 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 	}
 	colIndex := simpleColumnIndex(table, aliasOr(s.From))
 
-	projs, outputCols, ok := buildSimpleSelectProjections(s.Projs, colIndex)
-	if !ok {
-		return nil, false, nil
+	var projs []simpleProjection
+	var outputCols []string
+	if len(s.Projs) == 1 && s.Projs[0].Star && s.Projs[0].Alias == "" {
+		// SELECT * FROM t (single table, no join — guaranteed by
+		// simpleSelectEligible): expand directly into one raw-column
+		// projection per table column instead of falling back to the
+		// general Row-map path. Star previously disqualified the fast path
+		// entirely, making "SELECT *" tens of times slower than an
+		// equivalent narrow SELECT on the same table.
+		projs, outputCols = buildSimpleSelectStarProjections(table, aliasOr(s.From))
+	} else {
+		var projOk bool
+		projs, outputCols, projOk = buildSimpleSelectProjections(s.Projs, colIndex)
+		if !projOk {
+			return nil, false, nil
+		}
 	}
 	orderExprs, ok := buildSimpleSelectOrderExprs(s.OrderBy, projs)
 	if !ok {
@@ -2959,6 +3003,39 @@ func buildSimpleSelectProjections(items []SelectItem, colIndex map[string]int) (
 		outputCols = append(outputCols, proj.name)
 	}
 	return projs, outputCols, true
+}
+
+// buildSimpleSelectStarProjections builds one direct-column-reference
+// projection per table column, in schema order — the raw fast-path
+// equivalent of "expand * to all columns". Each projection has colIdx >= 0,
+// so projectRawRow copies straight from raw[] with no evalRawExpr call.
+//
+// Both the unqualified ("col") and qualified ("alias.col") Row map keys are
+// populated via altKey, matching rowsFromTable's dual-key output — callers
+// may look up either form (e.g. tsql.GetVal(row, "orders.id")), and several
+// tests/public-API examples rely on the qualified form being present even
+// for SELECT *.
+//
+// expr is also populated (as a plain VarRef) purely so ORDER BY on a star
+// query can resolve a column name via findSimpleSelectOrderExpr, which
+// returns .expr regardless of whether the fast colIdx path was used for
+// projection itself.
+func buildSimpleSelectStarProjections(table *storage.Table, alias string) ([]simpleProjection, []string) {
+	projs := make([]simpleProjection, len(table.Cols))
+	outputCols := make([]string, len(table.Cols))
+	for i, c := range table.Cols {
+		lower := strings.ToLower(c.Name)
+		projs[i] = simpleProjection{
+			name:   c.Name,
+			key:    lower,
+			altKey: strings.ToLower(alias) + "." + lower,
+			side:   -1,
+			colIdx: i,
+			expr:   &VarRef{Name: c.Name, Lower: lower},
+		}
+		outputCols[i] = c.Name
+	}
+	return projs, outputCols
 }
 
 func buildSimpleSelectProjection(it SelectItem, idx int, colIndex map[string]int) (simpleProjection, bool) {
@@ -3058,6 +3135,8 @@ func isSimpleRawExpr(e Expr) bool {
 	case *RegexpExpr:
 		// REGEXP/RLIKE/SIMILAR TO with literal pattern is safe in the fast path.
 		return isSimpleRawExpr(ex.Expr) && isSimpleRawExpr(ex.Pattern)
+	case *BetweenExpr:
+		return isSimpleRawExpr(ex.Expr) && isSimpleRawExpr(ex.Lo) && isSimpleRawExpr(ex.Hi)
 	case *InExpr:
 		if !isSimpleRawExpr(ex.Expr) {
 			return false
@@ -3072,12 +3151,74 @@ func isSimpleRawExpr(e Expr) bool {
 		if ex.Over != nil {
 			return false
 		}
+		if rowAwareFuncNames[ex.Name] {
+			// Reads the ambient Row directly; the raw path pre-evaluates
+			// args and substitutes an empty Row, which would silently
+			// always return "". Must go through the general evaluator.
+			return false
+		}
 		for _, arg := range ex.Args {
 			if !isSimpleRawExpr(arg) {
 				return false
 			}
 		}
 		return true
+	default:
+		return false
+	}
+}
+
+// rowAwareFuncNames lists scalar functions that read the ambient Row map
+// directly rather than only their own evaluated arguments (e.g. ROW_TO_TEXT).
+// Such calls must never execute through a raw ([]any + evalRawExpr) fast
+// path, which resolves each arg into a Literal and then substitutes an
+// empty Row — see evalRawFuncCall. Checked both by isSimpleRawExpr (gates
+// whole-plan eligibility) and exprHasRowAwareFuncCall (gates the AND/OR
+// raw-filter fallback in buildRawFilter, a separate mechanism that can
+// invoke evalRawExpr on a sub-expression even when the overall plan looked
+// eligible).
+var rowAwareFuncNames = map[string]bool{
+	"ROW_TO_TEXT": true,
+}
+
+// exprHasRowAwareFuncCall reports whether e, or any sub-expression reachable
+// through the node kinds evalRawExpr supports, calls a row-aware function.
+func exprHasRowAwareFuncCall(e Expr) bool {
+	switch ex := e.(type) {
+	case nil, *VarRef, *Literal:
+		return false
+	case *Unary:
+		return exprHasRowAwareFuncCall(ex.Expr)
+	case *Binary:
+		return exprHasRowAwareFuncCall(ex.Left) || exprHasRowAwareFuncCall(ex.Right)
+	case *IsNull:
+		return exprHasRowAwareFuncCall(ex.Expr)
+	case *LikeExpr:
+		return exprHasRowAwareFuncCall(ex.Expr) || exprHasRowAwareFuncCall(ex.Pattern) || exprHasRowAwareFuncCall(ex.Escape)
+	case *RegexpExpr:
+		return exprHasRowAwareFuncCall(ex.Expr) || exprHasRowAwareFuncCall(ex.Pattern)
+	case *BetweenExpr:
+		return exprHasRowAwareFuncCall(ex.Expr) || exprHasRowAwareFuncCall(ex.Lo) || exprHasRowAwareFuncCall(ex.Hi)
+	case *InExpr:
+		if exprHasRowAwareFuncCall(ex.Expr) {
+			return true
+		}
+		for _, v := range ex.Values {
+			if exprHasRowAwareFuncCall(v) {
+				return true
+			}
+		}
+		return false
+	case *FuncCall:
+		if rowAwareFuncNames[ex.Name] {
+			return true
+		}
+		for _, arg := range ex.Args {
+			if exprHasRowAwareFuncCall(arg) {
+				return true
+			}
+		}
+		return false
 	default:
 		return false
 	}
@@ -3226,8 +3367,19 @@ func buildRawAndFilter(colIndex map[string]int, leftExpr, rightExpr Expr) func([
 		return nil
 	}
 
+	// The fallback path below evaluates the unbuildable side via
+	// evalRawExpr(plan, raw, expr), which substitutes an empty Row for any
+	// FuncCall — wrong for a row-aware function like ROW_TO_TEXT. Refuse to
+	// build a raw filter at all in that case so the caller falls back to the
+	// general (correct) Row-based evaluator instead.
 	if left == nil {
+		if exprHasRowAwareFuncCall(leftExpr) {
+			return nil
+		}
 		return buildRawAndFilterWithFallback(colIndex, leftExpr, right)
+	}
+	if exprHasRowAwareFuncCall(rightExpr) {
+		return nil
 	}
 	return buildRawAndFilterWithFallback(colIndex, rightExpr, left)
 }
@@ -3266,8 +3418,17 @@ func buildRawOrFilter(colIndex map[string]int, leftExpr, rightExpr Expr) func([]
 		return nil
 	}
 
+	// See the matching comment in buildRawAndFilter: the fallback evaluates
+	// the unbuildable side via evalRawExpr with an empty Row, which is wrong
+	// for row-aware functions.
 	if left == nil {
+		if exprHasRowAwareFuncCall(leftExpr) {
+			return nil
+		}
 		return buildRawOrFilterWithFallback(colIndex, leftExpr, right)
+	}
+	if exprHasRowAwareFuncCall(rightExpr) {
+		return nil
 	}
 	return buildRawOrFilterWithFallback(colIndex, rightExpr, left)
 
@@ -4004,15 +4165,20 @@ func rawEqual(a, b any) bool {
 func projectRawRow(plan *simpleSelectPlan, raw []any) (Row, error) {
 	out := make(Row, len(plan.projs))
 	for _, p := range plan.projs {
+		var v any
 		if p.colIdx >= 0 {
 			// Direct column reference: skip type switch, map lookup, and ToLower.
-			out[p.key] = raw[p.colIdx]
+			v = raw[p.colIdx]
 		} else {
-			v, err := evalRawExpr(plan, raw, p.expr)
+			var err error
+			v, err = evalRawExpr(plan, raw, p.expr)
 			if err != nil {
 				return nil, err
 			}
-			out[p.key] = v
+		}
+		out[p.key] = v
+		if p.altKey != "" {
+			out[p.altKey] = v
 		}
 	}
 	return out, nil
@@ -4058,11 +4224,31 @@ func evalRawExpr(plan *simpleSelectPlan, raw []any, e Expr) (any, error) {
 		return evalRawIn(plan, raw, ex)
 	case *RegexpExpr:
 		return evalRawRegexp(plan, raw, ex)
+	case *BetweenExpr:
+		return evalRawBetween(plan, raw, ex)
 	case *FuncCall:
 		return evalRawFuncCall(plan, raw, ex)
 	default:
 		return nil, fmt.Errorf("unsupported fast-path expression %T", e)
 	}
+}
+
+// evalRawBetween evaluates BETWEEN in the raw fast path with a single
+// evaluation of the comparand.
+func evalRawBetween(plan *simpleSelectPlan, raw []any, ex *BetweenExpr) (any, error) {
+	v, err := evalRawExpr(plan, raw, ex.Expr)
+	if err != nil {
+		return nil, err
+	}
+	lo, err := evalRawExpr(plan, raw, ex.Lo)
+	if err != nil {
+		return nil, err
+	}
+	hi, err := evalRawExpr(plan, raw, ex.Hi)
+	if err != nil {
+		return nil, err
+	}
+	return betweenResult(v, lo, hi, ex.Negate)
 }
 
 func evalRawFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, error) {
@@ -4161,6 +4347,9 @@ func evalRawLike(plan *simpleSelectPlan, raw []any, ex *LikeExpr) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if val == nil || patVal == nil {
+		return false, nil
+	}
 	str, ok := val.(string)
 	if !ok {
 		str = fmt.Sprintf("%v", val)
@@ -4217,7 +4406,7 @@ func evalRawRegexp(plan *simpleSelectPlan, raw []any, ex *RegexpExpr) (any, erro
 	if ex.SimilarTo {
 		pattern = similarToRegexp(pattern)
 	}
-	re, err := regexp.Compile(pattern)
+	re, err := compileCachedRegexp(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("REGEXP: invalid pattern %q: %v", pattern, err)
 	}
@@ -4580,19 +4769,26 @@ func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []str
 	outCols := make([]string, 0, len(s.Projs))
 	colSet := make(map[string]struct{}, len(s.Projs))
 
+	// Build the composite group key directly into a reused builder instead of
+	// collecting per-column strings into a slice and strings.Join-ing them —
+	// avoids one slice + one string allocation per group-by expression, per row.
+	var keyBuf strings.Builder
 	for _, r := range filtered {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, nil, err
 		}
-		var parts []string
-		for _, g := range s.GroupBy {
+		keyBuf.Reset()
+		for i, g := range s.GroupBy {
 			v, err := evalExpr(env, g, r)
 			if err != nil {
 				return nil, nil, err
 			}
-			parts = append(parts, fmtKeyPart(v))
+			if i > 0 {
+				keyBuf.WriteByte('\x1f')
+			}
+			writeFmtKeyPart(&keyBuf, v)
 		}
-		ks := strings.Join(parts, "\x1f")
+		ks := keyBuf.String()
 		if _, ok := groups[ks]; !ok {
 			orderKeys = append(orderKeys, ks)
 		}
@@ -5188,6 +5384,8 @@ func evalExpr(env ExecEnv, e Expr, row Row) (any, error) {
 		return evalLike(env, ex, row)
 	case *RegexpExpr:
 		return evalRegexpExpr(env, ex, row)
+	case *BetweenExpr:
+		return evalBetween(env, ex, row)
 	case *ExistsExpr:
 		return evalExistsExpr(env, ex)
 	case *CaseExpr:
@@ -5196,6 +5394,50 @@ func evalExpr(env ExecEnv, e Expr, row Row) (any, error) {
 		return evalSubqueryExpr(env, ex)
 	}
 	return nil, fmt.Errorf("unknown expression")
+}
+
+// evalBetween evaluates "expr [NOT] BETWEEN lo AND hi" with a single
+// evaluation of expr, using the same three-valued comparison semantics as
+// the desugared AND/OR form.
+func evalBetween(env ExecEnv, ex *BetweenExpr, row Row) (any, error) {
+	v, err := evalExpr(env, ex.Expr, row)
+	if err != nil {
+		return nil, err
+	}
+	lo, err := evalExpr(env, ex.Lo, row)
+	if err != nil {
+		return nil, err
+	}
+	hi, err := evalExpr(env, ex.Hi, row)
+	if err != nil {
+		return nil, err
+	}
+	return betweenResult(v, lo, hi, ex.Negate)
+}
+
+// betweenResult combines the boundary comparisons exactly like the desugared
+// forms: BETWEEN → (v >= lo AND v <= hi), NOT BETWEEN → (v < lo OR v > hi).
+func betweenResult(v, lo, hi any, negate bool) (any, error) {
+	if negate {
+		lt, err := evalComparisonBinary("<", v, lo)
+		if err != nil {
+			return nil, err
+		}
+		gt, err := evalComparisonBinary(">", v, hi)
+		if err != nil {
+			return nil, err
+		}
+		return triToValue(triOr(toTri(lt), toTri(gt))), nil
+	}
+	ge, err := evalComparisonBinary(">=", v, lo)
+	if err != nil {
+		return nil, err
+	}
+	le, err := evalComparisonBinary("<=", v, hi)
+	if err != nil {
+		return nil, err
+	}
+	return triToValue(triAnd(toTri(ge), toTri(le))), nil
 }
 
 func evalVarRef(ex *VarRef, row Row) (any, error) {
@@ -5266,6 +5508,12 @@ func evalLike(env ExecEnv, ex *LikeExpr, row Row) (any, error) {
 		return nil, err
 	}
 
+	// SQL semantics: NULL LIKE ... and ... LIKE NULL are not matches
+	// (previously nil was stringified to "<nil>" and could match '%').
+	if val == nil || patternVal == nil {
+		return false, nil
+	}
+
 	// Convert to strings
 	str, ok := val.(string)
 	if !ok {
@@ -5330,7 +5578,7 @@ func evalRegexpExpr(env ExecEnv, ex *RegexpExpr, row Row) (any, error) {
 	if ex.SimilarTo {
 		pattern = similarToRegexp(pattern)
 	}
-	re, err := regexp.Compile(pattern)
+	re, err := compileCachedRegexp(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("REGEXP: invalid pattern %q: %v", pattern, err)
 	}
@@ -5350,49 +5598,55 @@ func evalExistsExpr(env ExecEnv, ex *ExistsExpr) (any, error) {
 	return rs != nil && len(rs.Rows) > 0, nil
 }
 
-// matchLikePattern matches a string against a SQL LIKE pattern
-// % matches zero or more characters
-// _ matches exactly one character
+// matchLikePattern matches a string against a SQL LIKE pattern.
+// % matches zero or more characters, _ matches exactly one character.
+//
+// The matcher is rune-aware: _ consumes one Unicode code point, not one byte,
+// so multi-byte characters (é, 日, …) match _ correctly. Wildcard backtracking
+// uses the classic two-pointer greedy algorithm (O(len(str)*len(pattern))
+// worst case, linear for typical patterns, zero allocations).
 func matchLikePattern(str, pattern string, escape rune) bool {
 	sIdx, pIdx := 0, 0
 	sLen, pLen := len(str), len(pattern)
-	star := -1
-	match := 0
+	star, match := -1, 0
 
 	for sIdx < sLen {
 		if pIdx < pLen {
-			pChar := rune(pattern[pIdx])
+			pChar, pw := utf8.DecodeRuneInString(pattern[pIdx:])
 
-			// Check for escape character
-			if pChar == escape && pIdx+1 < pLen {
-				// Next character is literal
-				pIdx++
-				if sIdx < sLen && str[sIdx] == pattern[pIdx] {
-					sIdx++
-					pIdx++
+			switch {
+			case pChar == escape && pIdx+pw < pLen:
+				// Escaped character matches literally.
+				lChar, lw := utf8.DecodeRuneInString(pattern[pIdx+pw:])
+				sChar, sw := utf8.DecodeRuneInString(str[sIdx:])
+				if sChar == lChar {
+					sIdx += sw
+					pIdx += pw + lw
 					continue
 				}
-				return false
-			}
-
-			// Handle wildcard characters
-			if pChar == '%' {
+				// Mismatch: fall through to % backtracking (a bare
+				// "return false" here would wrongly reject e.g.
+				// 'a_b' LIKE '%\_%' at the first position).
+			case pChar == '%':
 				star = pIdx
 				match = sIdx
-				pIdx++
+				pIdx += pw
 				continue
-			}
-			if pChar == '_' || str[sIdx] == pattern[pIdx] {
-				sIdx++
-				pIdx++
-				continue
+			default:
+				sChar, sw := utf8.DecodeRuneInString(str[sIdx:])
+				if pChar == '_' || sChar == pChar {
+					sIdx += sw
+					pIdx += pw
+					continue
+				}
 			}
 		}
 
-		// No match, backtrack to last %
+		// No match, backtrack to last % and consume one more source rune.
 		if star != -1 {
-			pIdx = star + 1
-			match++
+			pIdx = star + 1 // '%' is a single byte
+			_, mw := utf8.DecodeRuneInString(str[match:])
+			match += mw
 			sIdx = match
 			continue
 		}
@@ -5408,33 +5662,34 @@ func matchLikePattern(str, pattern string, escape rune) bool {
 }
 
 // matchGlobPattern matches a string against a GLOB pattern.
-// * matches zero or more characters, ? matches exactly one character.
-// Unlike LIKE, GLOB is case-sensitive by default (callers may lowercase both
-// strings for case-insensitive behaviour).
+// * matches zero or more characters, ? matches exactly one character (one
+// Unicode code point). Unlike LIKE, GLOB is case-sensitive by default
+// (callers may lowercase both strings for case-insensitive behaviour).
 func matchGlobPattern(str, pattern string) bool {
 	sIdx, pIdx := 0, 0
 	sLen, pLen := len(str), len(pattern)
-	star := -1
-	match := 0
+	star, match := -1, 0
 
 	for sIdx < sLen {
 		if pIdx < pLen {
-			pChar := pattern[pIdx]
+			pChar, pw := utf8.DecodeRuneInString(pattern[pIdx:])
 			if pChar == '*' {
 				star = pIdx
 				match = sIdx
-				pIdx++
+				pIdx += pw
 				continue
 			}
-			if pChar == '?' || str[sIdx] == pChar {
-				sIdx++
-				pIdx++
+			sChar, sw := utf8.DecodeRuneInString(str[sIdx:])
+			if pChar == '?' || sChar == pChar {
+				sIdx += sw
+				pIdx += pw
 				continue
 			}
 		}
 		if star != -1 {
-			pIdx = star + 1
-			match++
+			pIdx = star + 1 // '*' is a single byte
+			_, mw := utf8.DecodeRuneInString(str[match:])
+			match += mw
 			sIdx = match
 			continue
 		}
@@ -5708,6 +5963,7 @@ type funcHandler func(env ExecEnv, ex *FuncCall, row Row) (any, error)
 
 func getBuiltinFunctions() map[string]funcHandler {
 	return map[string]funcHandler{
+		"ROW_TO_TEXT":       evalRowToTextFunc,
 		"COALESCE":          evalCoalesceFunc,
 		"NVL":               evalCoalesceFunc,
 		"IFNULL":            evalCoalesceFunc,
@@ -5867,6 +6123,43 @@ func evalJSONExtendedFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 }
 func evalNowFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	return time.Now(), nil
+}
+
+// evalRowToTextFunc implements ROW_TO_TEXT() — concatenates every column
+// value of the current row into one space-separated string, for ad-hoc
+// whole-row substring search without setting up FTS, e.g.:
+//
+//	SELECT * FROM orders WHERE ROW_TO_TEXT() LIKE '%acme corp%' AND status = 'open'
+//
+// This reads the ambient Row directly rather than evaluating ex.Args, so it
+// must never run through the raw fast path (which pre-evaluates args and
+// substitutes an empty Row) — see the *FuncCall case in isSimpleRawExpr.
+func evalRowToTextFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) > 0 {
+		return nil, fmt.Errorf("ROW_TO_TEXT expects no arguments")
+	}
+	// Row maps store each column under both its qualified ("t.col") and
+	// unqualified ("col") key pointing at the same value; skip qualified
+	// keys so each value is included exactly once.
+	keys := make([]string, 0, len(row))
+	for k := range row {
+		if !strings.Contains(k, ".") {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	var sb strings.Builder
+	for _, k := range keys {
+		v := row[k]
+		if v == nil {
+			continue
+		}
+		if sb.Len() > 0 {
+			sb.WriteByte(' ')
+		}
+		fmt.Fprintf(&sb, "%v", v)
+	}
+	return sb.String(), nil
 }
 func evalCurrentDateFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	now := time.Now()
@@ -6404,29 +6697,37 @@ func triToValue(t int) any {
 }
 
 // String manipulation functions
-func evalLTrim(env ExecEnv, args []Expr, row Row) (any, error) {
+// trimSide selects which side(s) a trim function removes characters from.
+type trimSide uint8
+
+const (
+	trimLeft trimSide = 1 << iota
+	trimRight
+	trimBoth = trimLeft | trimRight
+)
+
+// evalTrimCommon implements TRIM/LTRIM/RTRIM(str [, cutset]).
+// NULL input yields NULL; non-string inputs are coerced to their text form
+// (SQLite/MySQL behaviour, e.g. LTRIM(123) = '123'); the default cutset is
+// Unicode whitespace (unicode.IsSpace), consistent across all three functions.
+func evalTrimCommon(env ExecEnv, name string, side trimSide, args []Expr, row Row) (any, error) {
 	if len(args) < 1 || len(args) > 2 {
-		return nil, fmt.Errorf("LTRIM expects 1 or 2 arguments")
+		return nil, fmt.Errorf("%s expects 1 or 2 arguments", name)
 	}
 
 	val, err := evalExpr(env, args[0], row)
 	if err != nil {
 		return nil, err
 	}
-
 	if val == nil {
 		return nil, nil
 	}
-
 	str, ok := val.(string)
 	if !ok {
-		return nil, fmt.Errorf("LTRIM expects a string argument")
+		str = fmt.Sprintf("%v", val)
 	}
 
-	// Default: trim whitespace
-	cutset := " \t\n\r"
-
-	// If second argument provided, use as cutset
+	cutset := ""
 	if len(args) == 2 {
 		cutsetVal, err := evalExpr(env, args[1], row)
 		if err != nil {
@@ -6436,93 +6737,42 @@ func evalLTrim(env ExecEnv, args []Expr, row Row) (any, error) {
 			if cutsetStr, ok := cutsetVal.(string); ok {
 				cutset = cutsetStr
 			} else {
-				return nil, fmt.Errorf("LTRIM cutset must be a string")
+				return nil, fmt.Errorf("%s cutset must be a string", name)
 			}
 		}
 	}
 
-	return strings.TrimLeft(str, cutset), nil
+	if cutset == "" {
+		// Default: Unicode-aware whitespace trimming.
+		switch side {
+		case trimLeft:
+			return strings.TrimLeftFunc(str, unicode.IsSpace), nil
+		case trimRight:
+			return strings.TrimRightFunc(str, unicode.IsSpace), nil
+		default:
+			return strings.TrimSpace(str), nil
+		}
+	}
+	switch side {
+	case trimLeft:
+		return strings.TrimLeft(str, cutset), nil
+	case trimRight:
+		return strings.TrimRight(str, cutset), nil
+	default:
+		return strings.Trim(str, cutset), nil
+	}
+}
+
+func evalLTrim(env ExecEnv, args []Expr, row Row) (any, error) {
+	return evalTrimCommon(env, "LTRIM", trimLeft, args, row)
 }
 
 func evalRTrim(env ExecEnv, args []Expr, row Row) (any, error) {
-	if len(args) < 1 || len(args) > 2 {
-		return nil, fmt.Errorf("RTRIM expects 1 or 2 arguments")
-	}
-
-	val, err := evalExpr(env, args[0], row)
-	if err != nil {
-		return nil, err
-	}
-
-	if val == nil {
-		return nil, nil
-	}
-
-	str, ok := val.(string)
-	if !ok {
-		return nil, fmt.Errorf("RTRIM expects a string argument")
-	}
-
-	// Default: trim whitespace
-	cutset := " \t\n\r"
-
-	// If second argument provided, use as cutset
-	if len(args) == 2 {
-		cutsetVal, err := evalExpr(env, args[1], row)
-		if err != nil {
-			return nil, err
-		}
-		if cutsetVal != nil {
-			if cutsetStr, ok := cutsetVal.(string); ok {
-				cutset = cutsetStr
-			} else {
-				return nil, fmt.Errorf("RTRIM cutset must be a string")
-			}
-		}
-	}
-
-	return strings.TrimRight(str, cutset), nil
+	return evalTrimCommon(env, "RTRIM", trimRight, args, row)
 }
 
 func evalTrim(env ExecEnv, args []Expr, row Row) (any, error) {
-	if len(args) < 1 || len(args) > 2 {
-		return nil, fmt.Errorf("TRIM expects 1 or 2 arguments")
-	}
-
-	val, err := evalExpr(env, args[0], row)
-	if err != nil {
-		return nil, err
-	}
-
-	if val == nil {
-		return nil, nil
-	}
-
-	str, ok := val.(string)
-	if !ok {
-		return nil, fmt.Errorf("TRIM expects a string argument")
-	}
-
-	// Default: trim whitespace (use TrimSpace for compatibility)
-	if len(args) == 1 {
-		return strings.TrimSpace(str), nil
-	}
-
-	// If second argument provided, use as cutset for both sides
-	cutsetVal, err := evalExpr(env, args[1], row)
-	if err != nil {
-		return nil, err
-	}
-	if cutsetVal == nil {
-		return strings.TrimSpace(str), nil
-	}
-
-	cutsetStr, ok := cutsetVal.(string)
-	if !ok {
-		return nil, fmt.Errorf("TRIM cutset must be a string")
-	}
-
-	return strings.Trim(str, cutsetStr), nil
+	return evalTrimCommon(env, "TRIM", trimBoth, args, row)
 }
 
 // ISNULL function - returns TRUE if argument is NULL, FALSE otherwise
@@ -9711,32 +9961,30 @@ func filterPartition(env ExecEnv, allRows []Row, partitionBy []Expr, currentRow 
 }
 
 // sortRows sorts rows according to ORDER BY items
+// sortRows returns a sorted copy of rows (used for window-function partition
+// ordering, which must not mutate the caller's slice). Like applySortOrder,
+// sort keys are extracted once per row instead of re-looked-up from the row
+// map on every comparator call.
 func sortRows(rows []Row, orderBy []OrderItem) []Row {
 	sorted := make([]Row, len(rows))
 	copy(sorted, rows)
-	orderColsLower := make([]string, len(orderBy))
-	for i, oi := range orderBy {
-		orderColsLower[i] = strings.ToLower(oi.Col)
+	if len(orderBy) == 0 || len(sorted) <= 1 {
+		return sorted
 	}
-
-	sort.SliceStable(sorted, func(i, j int) bool {
-		a := sorted[i]
-		b := sorted[j]
-		for idx, oi := range orderBy {
-			av, _ := getValLower(a, orderColsLower[idx])
-			bv, _ := getValLower(b, orderColsLower[idx])
-			cmp := compareForOrder(av, bv, oi.Desc)
-			if cmp == 0 {
-				continue
-			}
-			if oi.Desc {
-				return cmp > 0
-			}
-			return cmp < 0
-		}
-		return false
+	lcOrdCols := make([]string, len(orderBy))
+	for i, oi := range orderBy {
+		lcOrdCols[i] = strings.ToLower(oi.Col)
+	}
+	items := make([]orderedValueRow, len(sorted))
+	for i, row := range sorted {
+		items[i] = buildOrderByValues(row, lcOrdCols)
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		return compareOrderedValueRows(orderBy, items[i], items[j]) < 0
 	})
-
+	for i, item := range items {
+		sorted[i] = item.row
+	}
 	return sorted
 }
 

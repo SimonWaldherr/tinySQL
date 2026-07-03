@@ -12,6 +12,7 @@ package engine
 import (
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 type tokenType int
@@ -38,12 +39,19 @@ type lexer struct {
 
 func newLexer(s string) *lexer { return &lexer{s: s} }
 
+// peek returns the rune at the current position, decoding UTF-8 so that
+// multi-byte characters in string literals and identifiers survive lexing
+// (a byte-wise cast turned 'héllo' into 'hÃ©llo').
 func (lx *lexer) peek() rune {
 	if lx.pos >= len(lx.s) {
 		return 0
 	}
-	return rune(lx.s[lx.pos])
+	r, _ := utf8.DecodeRuneInString(lx.s[lx.pos:])
+	return r
 }
+
+// peekN looks ahead n BYTES. It is only used for ASCII lookahead
+// (comment markers, operators), where byte offsets equal rune offsets.
 func (lx *lexer) peekN(n int) rune {
 	p := lx.pos + n
 	if p >= len(lx.s) {
@@ -55,8 +63,8 @@ func (lx *lexer) next() rune {
 	if lx.pos >= len(lx.s) {
 		return 0
 	}
-	r := rune(lx.s[lx.pos])
-	lx.pos++
+	r, w := utf8.DecodeRuneInString(lx.s[lx.pos:])
+	lx.pos += w
 	return r
 }
 func (lx *lexer) skipWS() {
@@ -64,9 +72,9 @@ func (lx *lexer) skipWS() {
 		if lx.pos >= len(lx.s) {
 			return
 		}
-		r := rune(lx.s[lx.pos])
+		r, w := utf8.DecodeRuneInString(lx.s[lx.pos:])
 		if unicode.IsSpace(r) {
-			lx.pos++
+			lx.pos += w
 			continue
 		}
 		// -- Kommentar
@@ -181,10 +189,10 @@ func (lx *lexer) tokenizeNumber(start int) token {
 func (lx *lexer) tokenizeIdentOrKeyword(start int) token {
 	var val strings.Builder
 	for lx.pos < len(lx.s) {
-		ch := lx.peek()
+		ch, w := utf8.DecodeRuneInString(lx.s[lx.pos:])
 		if unicode.IsLetter(ch) || unicode.IsDigit(ch) || ch == '_' || ch == '.' {
 			val.WriteRune(ch)
-			lx.pos++
+			lx.pos += w
 		} else {
 			break
 		}
@@ -269,7 +277,7 @@ func isKeyword(up string) bool {
 		"COUNT", "SUM", "AVG", "MIN", "MAX", "MEDIAN",
 		"COALESCE", "NULLIF", "NVL", "IFNULL", "NOW", "CURRENT_TIME", "CURRENT_DATE",
 		"JSON_GET", "JSON_SET", "JSON_EXTRACT", "DATEDIFF",
-		"LTRIM", "RTRIM", "TRIM", "REGEXP", "ISNULL",
+		"LTRIM", "RTRIM", "TRIM", "REGEXP", "ISNULL", "ROW_TO_TEXT",
 		"ILIKE", "RLIKE", "GLOB", "SIMILAR", "TO",
 		"LEVENSHTEIN", "EDIT_DISTANCE",
 		"CONTAINS", "STARTS_WITH", "ENDS_WITH",

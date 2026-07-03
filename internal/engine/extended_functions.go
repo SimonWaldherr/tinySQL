@@ -2,7 +2,6 @@ package engine
 
 import (
 	"fmt"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -356,12 +355,12 @@ func evalRegexpMatch(env ExecEnv, args []Expr, row Row) (any, error) {
 	str := fmt.Sprintf("%v", strVal)
 	pattern := fmt.Sprintf("%v", patternVal)
 
-	matched, err := regexp.MatchString(pattern, str)
+	re, err := compileCachedRegexp(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("REGEXP_MATCH: %v", err)
 	}
 
-	return matched, nil
+	return re.MatchString(str), nil
 }
 
 // evalRegexpExtractFunc extracts the first match of a regex pattern
@@ -391,7 +390,7 @@ func evalRegexpExtract(env ExecEnv, args []Expr, row Row) (any, error) {
 	str := fmt.Sprintf("%v", strVal)
 	pattern := fmt.Sprintf("%v", patternVal)
 
-	re, err := regexp.Compile(pattern)
+	re, err := compileCachedRegexp(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("REGEXP_EXTRACT: %v", err)
 	}
@@ -437,7 +436,7 @@ func evalRegexpReplace(env ExecEnv, args []Expr, row Row) (any, error) {
 	pattern := fmt.Sprintf("%v", patternVal)
 	replacement := fmt.Sprintf("%v", replVal)
 
-	re, err := regexp.Compile(pattern)
+	re, err := compileCachedRegexp(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("REGEXP_REPLACE: %v", err)
 	}

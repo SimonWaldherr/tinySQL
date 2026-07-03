@@ -240,6 +240,11 @@ func exprKind(e Expr) string {
 			return "SIMILAR TO"
 		}
 		return "REGEXP"
+	case *BetweenExpr:
+		if ex.Negate {
+			return "NOT BETWEEN"
+		}
+		return "BETWEEN"
 	default:
 		return fmt.Sprintf("%T", e)
 	}

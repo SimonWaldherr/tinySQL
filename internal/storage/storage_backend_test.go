@@ -217,6 +217,9 @@ func TestMemoryBackend_SaveOnClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Close releases the WAL handle LoadFromFile attaches; without this the
+	// TempDir cleanup fails on Windows (file in use).
+	defer db2.Close()
 	got, err := db2.Get("default", "users")
 	if err != nil {
 		t.Fatal(err)
@@ -333,6 +336,7 @@ func TestSaveLoadCatalogJobs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadFromFile failed: %v", err)
 	}
+	defer loaded.Close()
 
 	job, err := loaded.Catalog().GetJob("daily_cleanup")
 	if err != nil {

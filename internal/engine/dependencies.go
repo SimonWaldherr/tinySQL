@@ -94,6 +94,10 @@ func collectExprDependencies(cat *storage.CatalogManager, expr Expr, ctes map[st
 	case *RegexpExpr:
 		collectExprDependencies(cat, ex.Expr, ctes, seen)
 		collectExprDependencies(cat, ex.Pattern, ctes, seen)
+	case *BetweenExpr:
+		collectExprDependencies(cat, ex.Expr, ctes, seen)
+		collectExprDependencies(cat, ex.Lo, ctes, seen)
+		collectExprDependencies(cat, ex.Hi, ctes, seen)
 	case *ExistsExpr:
 		collectSelectDependencies(cat, ex.Select, ctes, seen)
 	case *SubqueryExpr:

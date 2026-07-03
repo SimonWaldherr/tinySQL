@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -845,6 +846,95 @@ func evalFTSWordCount(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	return len(strings.Fields(fmt.Sprintf("%v", v))), nil
 }
 
+// ─────────────────────────── FTS_SEARCH document cache ────────────────────────
+//
+// Unlike CREATE VIRTUAL TABLE ... USING fts, FTS_SEARCH is index-free: it
+// scores directly against whatever table it's pointed at. Its scoring
+// (ftsScoreNode) only needs per-document stats (term frequency + doc length),
+// never corpus-wide IDF, so per-row tokenization can be cached and reused
+// across repeated searches (e.g. a live search box re-querying per keystroke,
+// or a dashboard) until the table is mutated. Mirrors the vecSearchColumnCache
+// pattern in vector_search.go: keyed by (tenant, table, column set), and
+// invalidated by table.Version.
+type ftsCachedDoc struct {
+	freq   map[string]int
+	tokens []string
+	docLen float64
+	valid  bool
+}
+
+type ftsDocCacheKey struct {
+	tenant string
+	table  string
+	cols   string // sorted, comma-joined column indices
+}
+
+type ftsDocCacheEntry struct {
+	table   *storage.Table
+	version int
+	docs    []ftsCachedDoc
+}
+
+var (
+	ftsDocCacheMu sync.RWMutex
+	ftsDocCache   = make(map[ftsDocCacheKey]ftsDocCacheEntry)
+)
+
+func ftsColsCacheKey(cols []int) string {
+	var b strings.Builder
+	for i, c := range cols {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(strconv.Itoa(c))
+	}
+	return b.String()
+}
+
+// getFTSDocCache returns the tokenized documents for the given column set,
+// (re)building them if the table has changed since the last call.
+func getFTSDocCache(tenant string, table *storage.Table, cols []int) []ftsCachedDoc {
+	key := ftsDocCacheKey{tenant: tenant, table: table.Name, cols: ftsColsCacheKey(cols)}
+
+	ftsDocCacheMu.RLock()
+	if e, ok := ftsDocCache[key]; ok && e.table == table && e.version == table.Version {
+		ftsDocCacheMu.RUnlock()
+		return e.docs
+	}
+	ftsDocCacheMu.RUnlock()
+
+	docs := make([]ftsCachedDoc, len(table.Rows))
+	var sb strings.Builder
+	for ri, r := range table.Rows {
+		sb.Reset()
+		for _, ci := range cols {
+			if ci < len(r) && r[ci] != nil {
+				if sb.Len() > 0 {
+					sb.WriteByte(' ')
+				}
+				fmt.Fprintf(&sb, "%v", r[ci])
+			}
+		}
+		if sb.Len() == 0 {
+			continue
+		}
+		tokens := ftsTokenize(sb.String())
+		if len(tokens) == 0 {
+			continue
+		}
+		freq := make(map[string]int, len(tokens))
+		for _, t := range tokens {
+			freq[t]++
+		}
+		docs[ri] = ftsCachedDoc{freq: freq, tokens: tokens, docLen: float64(len(tokens)), valid: true}
+	}
+
+	ftsDocCacheMu.Lock()
+	ftsDocCache[key] = ftsDocCacheEntry{table: table, version: table.Version, docs: docs}
+	ftsDocCacheMu.Unlock()
+	return docs
+}
+
 // ─────────────────────────── FTS_SEARCH table-valued function ─────────────────
 
 // FTSSearchTableFunc implements FTS_SEARCH(table, query, k [, columns...]).
@@ -930,21 +1020,17 @@ func (f *FTSSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 		}
 	}
 	if len(searchCols) == 0 {
-		// Default: search all TEXT columns.
-		for i, c := range table.Cols {
-			if c.Type == storage.TextType || c.Type == storage.StringType {
-				searchCols = append(searchCols, i)
-			}
-		}
-		if len(searchCols) == 0 {
-			// Fall back to all columns.
-			for i := range table.Cols {
-				searchCols = append(searchCols, i)
-			}
+		// Default: search every column — the whole row, not just TEXT/STRING
+		// ones. Numeric IDs, dates, booleans, etc. are stringified the same
+		// way an explicit column list would be, so e.g. an order number or
+		// a status enum is findable without special-casing its type.
+		for i := range table.Cols {
+			searchCols = append(searchCols, i)
 		}
 	}
 
 	node := ftsParseQuery(query)
+	docs := getFTSDocCache(tenant, table, searchCols)
 
 	type scored struct {
 		rowIdx int
@@ -952,36 +1038,14 @@ func (f *FTSSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 	}
 	var results []scored
 
-	for ri, r := range table.Rows {
-		// Aggregate text from searched columns.
-		var sb strings.Builder
-		for _, ci := range searchCols {
-			if ci < len(r) && r[ci] != nil {
-				if sb.Len() > 0 {
-					sb.WriteByte(' ')
-				}
-				sb.WriteString(fmt.Sprintf("%v", r[ci]))
-			}
-		}
-		text := sb.String()
-		if text == "" {
+	for ri, doc := range docs {
+		if !doc.valid {
 			continue
 		}
-
-		tokens := ftsTokenize(text)
-		if len(tokens) == 0 {
+		if node != nil && !ftsMatchNode(node, doc.freq, doc.tokens) {
 			continue
 		}
-		freq := make(map[string]int, len(tokens))
-		for _, t := range tokens {
-			freq[t]++
-		}
-
-		if node != nil && !ftsMatchNode(node, freq, tokens) {
-			continue
-		}
-		docLen := float64(len(tokens))
-		score := ftsScoreNode(node, freq, docLen)
+		score := ftsScoreNode(node, doc.freq, doc.docLen)
 		results = append(results, scored{rowIdx: ri, score: score})
 	}
 

@@ -333,6 +333,9 @@ func TestFilePersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to load DB: %v", err)
 	}
+	// Close releases the WAL handle attached by LoadFromFile so the files
+	// can be removed on Windows.
+	defer db2.Close()
 
 	// Query loaded DB
 	p = tsql.NewParser(`SELECT * FROM persist ORDER BY id`)
@@ -354,8 +357,12 @@ func TestFilePersistence(t *testing.T) {
 		t.Fatalf("Expected Beta, got %v", name)
 	}
 
-	// Clean up
-	os.Remove(tmpfile)
+	// Clean up. t.Cleanup runs after the deferred db2.Close(), which must
+	// release the WAL handle first for the removal to succeed on Windows.
+	t.Cleanup(func() {
+		os.Remove(tmpfile)
+		os.Remove(tmpfile + ".wal")
+	})
 }
 
 // TestJoinOperations tests basic multi-table functionality
@@ -1141,10 +1148,12 @@ func TestGOBPersistenceWithNewDataTypes(t *testing.T) {
 	ctx := context.Background()
 	tempFile := "/tmp/tinysql_test.gob"
 
-	// Clean up temp file after test
-	defer func() {
+	// Clean up temp files after test (t.Cleanup runs after deferred Closes,
+	// so the WAL handle is released before removal — required on Windows).
+	t.Cleanup(func() {
 		os.Remove(tempFile)
-	}()
+		os.Remove(tempFile + ".wal")
+	})
 
 	// === PHASE 1: Create database with new data types and populate it ===
 	db := tsql.NewDB()
@@ -1289,6 +1298,7 @@ func TestGOBPersistenceWithNewDataTypes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to load database from GOB file: %v", err)
 	}
+	defer loadedDB.Close()
 
 	// === PHASE 4: Verify loaded data matches original ===
 

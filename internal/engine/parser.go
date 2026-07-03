@@ -131,6 +131,17 @@ type (
 		Negate    bool // For NOT REGEXP / NOT RLIKE / NOT SIMILAR TO
 		SimilarTo bool // Pattern uses SQL SIMILAR TO syntax (% and _ wildcards)
 	}
+	// BetweenExpr represents "expr [NOT] BETWEEN lo AND hi" when expr is not a
+	// plain column or literal. Unlike the desugared form
+	// (expr >= lo AND expr <= hi) it evaluates expr exactly once, which is
+	// faster for expensive expressions and correct for non-deterministic ones
+	// (e.g. RANDOM() BETWEEN 1 AND 10).
+	BetweenExpr struct {
+		Expr   Expr
+		Lo     Expr
+		Hi     Expr
+		Negate bool
+	}
 	// ExistsExpr represents "EXISTS (subquery)".
 	ExistsExpr struct {
 		Select *Select
@@ -2711,16 +2722,25 @@ func (p *Parser) parseCmpBetween(l Expr, negate bool) (Expr, bool, error) {
 	if err != nil {
 		return nil, true, err
 	}
-	if negate {
-		return &Binary{Op: "OR",
-			Left:  &Binary{Op: "<", Left: l, Right: lo},
-			Right: &Binary{Op: ">", Left: l, Right: hi},
+	switch l.(type) {
+	case *VarRef, *Literal:
+		// Desugar plain column/literal comparands: re-evaluating them is
+		// free and the raw fast paths compile these Binary trees into
+		// tight filters.
+		if negate {
+			return &Binary{Op: "OR",
+				Left:  &Binary{Op: "<", Left: l, Right: lo},
+				Right: &Binary{Op: ">", Left: l, Right: hi},
+			}, true, nil
+		}
+		return &Binary{Op: "AND",
+			Left:  &Binary{Op: ">=", Left: l, Right: lo},
+			Right: &Binary{Op: "<=", Left: l, Right: hi},
 		}, true, nil
 	}
-	return &Binary{Op: "AND",
-		Left:  &Binary{Op: ">=", Left: l, Right: lo},
-		Right: &Binary{Op: "<=", Left: l, Right: hi},
-	}, true, nil
+	// Complex comparand (function call, subquery, arithmetic, ...):
+	// evaluate it once via a dedicated node.
+	return &BetweenExpr{Expr: l, Lo: lo, Hi: hi, Negate: negate}, true, nil
 }
 
 func (p *Parser) parseCmpIn(l Expr, negate bool) (Expr, bool, error) {
