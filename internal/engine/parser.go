@@ -567,6 +567,10 @@ func (p *Parser) ParseStatement() (Statement, error) {
 		return p.parseDelete()
 	case "REFRESH":
 		return p.parseRefresh()
+	case "GRANT":
+		return p.parseGrantOrRevoke(true)
+	case "REVOKE":
+		return p.parseGrantOrRevoke(false)
 	case "SELECT", "WITH":
 		return p.parseSelectWithCTE()
 	default:
@@ -678,6 +682,10 @@ func (p *Parser) parseCreate() (Statement, error) {
 func (p *Parser) parseCreateNonTable() (Statement, bool, error) {
 	if (p.cur.Typ == tKeyword || p.cur.Typ == tIdent) && p.cur.Val == "JOB" {
 		stmt, err := p.parseCreateJob()
+		return stmt, true, err
+	}
+	if p.cur.Typ == tKeyword && (p.cur.Val == "USER" || p.cur.Val == "ROLE") {
+		stmt, err := p.parseCreateUserOrRole()
 		return stmt, true, err
 	}
 	if p.cur.Typ == tKeyword && p.cur.Val == "TRIGGER" {
@@ -806,6 +814,11 @@ func (p *Parser) parseDrop() (Statement, error) {
 			return nil, p.errf("expected job name")
 		}
 		return &DropJob{Name: name}, nil
+	}
+
+	// Check for DROP USER / DROP ROLE
+	if p.cur.Typ == tKeyword && (p.cur.Val == "USER" || p.cur.Val == "ROLE") {
+		return p.parseDropUserOrRole()
 	}
 
 	// DROP TABLE
@@ -1638,6 +1651,10 @@ func (p *Parser) parseAlter() (Statement, error) {
 
 	if p.cur.Typ == tKeyword && p.cur.Val == "MATERIALIZED" {
 		return p.parseAlterMaterializedView()
+	}
+
+	if p.cur.Typ == tKeyword && p.cur.Val == "USER" {
+		return p.parseAlterUser()
 	}
 
 	// Support ALTER JOB <name> ENABLE|DISABLE

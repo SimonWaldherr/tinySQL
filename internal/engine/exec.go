@@ -205,6 +205,24 @@ func execStmt(env ExecEnv, stmt Statement) (*ResultSet, error) {
 		return executeCreateTrigger(env, s)
 	case *DropTrigger:
 		return executeDropTrigger(env, s)
+	case *CreateUser:
+		return executeCreateUser(env, s)
+	case *DropUser:
+		return executeDropUser(env, s)
+	case *AlterUser:
+		return executeAlterUser(env, s)
+	case *CreateRole:
+		return executeCreateRole(env, s)
+	case *DropRole:
+		return executeDropRole(env, s)
+	case *GrantPrivilege:
+		return executeGrantPrivilege(env, s)
+	case *RevokePrivilege:
+		return executeRevokePrivilege(env, s)
+	case *GrantRoleStmt:
+		return executeGrantRoleStmt(env, s)
+	case *RevokeRoleStmt:
+		return executeRevokeRoleStmt(env, s)
 	}
 	return nil, fmt.Errorf("unknown statement")
 }

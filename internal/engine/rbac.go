@@ -130,6 +130,107 @@ func requiredPermission(stmt Statement) (perm storage.Permission, schema, table 
 		return storage.PermDDL, "*", "*", true
 	case *CreateJob, *AlterJob, *DropJob:
 		return storage.PermDDL, "*", "*", true
+	case *CreateUser, *DropUser, *AlterUser, *CreateRole, *DropRole,
+		*GrantPrivilege, *RevokePrivilege, *GrantRoleStmt, *RevokeRoleStmt:
+		// User/role/grant management requires a wildcard (schema="*",
+		// table="*") DDL grant specifically — i.e. only an
+		// administrator-scoped role, not merely "DDL on some table" — so a
+		// role that can create tables in one schema can't also mint new
+		// users. There's no separate "ADMIN" permission distinct from a
+		// wildcard PermDDL grant; that's a deliberate simplification.
+		return storage.PermDDL, "*", "*", true
 	}
 	return "", "", "", false
+}
+
+// executeCreateUser handles CREATE USER. See storage.CatalogManager.CreateUser.
+func executeCreateUser(env ExecEnv, s *CreateUser) (*ResultSet, error) {
+	if err := env.db.Catalog().CreateUser(s.Name, s.Password, s.Roles); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+func executeDropUser(env ExecEnv, s *DropUser) (*ResultSet, error) {
+	if err := env.db.Catalog().DropUser(s.Name); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+func executeAlterUser(env ExecEnv, s *AlterUser) (*ResultSet, error) {
+	if s.SetEnabled != nil {
+		if err := env.db.Catalog().SetUserDisabled(s.Name, *s.SetEnabled); err != nil {
+			return nil, err
+		}
+	}
+	if s.NewPassword != nil {
+		// There's no separate "change password" catalog method — reuse
+		// CreateUser's bcrypt hashing by dropping and recreating the
+		// account, preserving its current role memberships and enabled
+		// state exactly as they were.
+		cat := env.db.Catalog()
+		existing, ok := cat.GetUser(s.Name)
+		if !ok {
+			return nil, fmt.Errorf("user %q does not exist", s.Name)
+		}
+		if err := cat.DropUser(s.Name); err != nil {
+			return nil, err
+		}
+		if err := cat.CreateUser(s.Name, *s.NewPassword, existing.Roles); err != nil {
+			return nil, err
+		}
+		if existing.Disabled {
+			if err := cat.SetUserDisabled(s.Name, true); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return nil, nil
+}
+
+func executeCreateRole(env ExecEnv, s *CreateRole) (*ResultSet, error) {
+	if err := env.db.Catalog().CreateRole(s.Name); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+func executeDropRole(env ExecEnv, s *DropRole) (*ResultSet, error) {
+	if err := env.db.Catalog().DropRole(s.Name); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+func executeGrantPrivilege(env ExecEnv, s *GrantPrivilege) (*ResultSet, error) {
+	for _, perm := range s.Permissions {
+		if err := env.db.Catalog().GrantPermission(s.RoleName, perm, s.Schema, s.Table); err != nil {
+			return nil, err
+		}
+	}
+	return nil, nil
+}
+
+func executeRevokePrivilege(env ExecEnv, s *RevokePrivilege) (*ResultSet, error) {
+	for _, perm := range s.Permissions {
+		if err := env.db.Catalog().RevokePermission(s.RoleName, perm, s.Schema, s.Table); err != nil {
+			return nil, err
+		}
+	}
+	return nil, nil
+}
+
+func executeGrantRoleStmt(env ExecEnv, s *GrantRoleStmt) (*ResultSet, error) {
+	if err := env.db.Catalog().GrantRoleToUser(s.UserName, s.RoleName); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+func executeRevokeRoleStmt(env ExecEnv, s *RevokeRoleStmt) (*ResultSet, error) {
+	if err := env.db.Catalog().RevokeRoleFromUser(s.UserName, s.RoleName); err != nil {
+		return nil, err
+	}
+	return nil, nil
 }

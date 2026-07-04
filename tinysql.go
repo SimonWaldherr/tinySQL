@@ -533,6 +533,33 @@ func Execute(ctx context.Context, db *DB, tenant string, stmt Statement) (*Resul
 	return engine.Execute(ctx, db, tenant, stmt)
 }
 
+// WithUser returns a context carrying the acting username for RBAC
+// permission checks (see CREATE USER/CREATE ROLE/GRANT below). Pass the
+// result to Execute/ExecuteCompiled in place of a plain context.
+//
+// RBAC is opt-in: until the first CREATE USER statement runs against a
+// database, every Execute call is permitted regardless of context — so
+// existing code that never touches users/roles sees no behavior change.
+// Once a user exists, every subsequent Execute call requires one via
+// WithUser, or it's rejected with an "access denied" error.
+//
+// Example:
+//
+//	tinysql.Execute(ctx, db, "default", mustParse(`CREATE ROLE admin_role`))
+//	tinysql.Execute(ctx, db, "default", mustParse(`GRANT ALL ON * TO ROLE admin_role`))
+//	tinysql.Execute(ctx, db, "default", mustParse(`CREATE USER admin WITH PASSWORD 'x' ROLE admin_role`))
+//	// RBAC is now active; every further call needs an authenticated context:
+//	adminCtx := tinysql.WithUser(ctx, "admin")
+//	tinysql.Execute(adminCtx, db, "default", stmt)
+func WithUser(ctx context.Context, username string) context.Context {
+	return engine.WithUser(ctx, username)
+}
+
+// UserFromContext returns the username set by WithUser, if any.
+func UserFromContext(ctx context.Context) (string, bool) {
+	return engine.UserFromContext(ctx)
+}
+
 // ExecuteCompiled executes a pre-compiled query against the database.
 //
 // This is more efficient than Execute for queries executed repeatedly,
