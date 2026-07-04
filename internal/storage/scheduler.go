@@ -91,18 +91,23 @@ func (s *Scheduler) Start() error {
 
 // Stop halts the scheduler and cancels all running jobs
 func (s *Scheduler) Stop() {
-	s.mu.Lock()
-	if !s.started {
-		s.mu.Unlock()
+	wasStarted, stopCh := func() (bool, chan struct{}) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if !s.started {
+			return false, nil
+		}
+		s.started = false
+		ch := s.stopCh
+		s.stopCh = nil
+		return true, ch
+	}()
+	if !wasStarted {
 		return
 	}
-	s.started = false
-	stopCh := s.stopCh
-	s.stopCh = nil
 	if stopCh != nil {
 		close(stopCh)
 	}
-	s.mu.Unlock()
 
 	// Stop cron
 	ctx := s.cron.Stop()
@@ -239,38 +244,43 @@ func (s *Scheduler) checkIntervalJobs(now time.Time) {
 
 // executeJob runs a job's SQL with proper concurrency control
 func (s *Scheduler) executeJob(job *CatalogJob) {
-	s.mu.Lock()
-
-	// Check no_overlap flag
-	if job.NoOverlap {
-		if _, isRunning := s.running[job.Name]; isRunning {
-			s.mu.Unlock()
-			log.Printf("Job %q already running, skipping (no_overlap=true)", job.Name)
-			now := time.Now()
-			_ = s.catalog.AddJobHistory(&CatalogJobHistory{
-				JobName:    job.Name,
-				StartedAt:  now,
-				FinishedAt: now,
-				Status:     "SKIPPED",
-			})
-			return
-		}
-	}
-
 	// Create execution context with timeout
 	timeout := time.Duration(job.MaxRuntimeMs) * time.Millisecond
 	if timeout == 0 {
 		timeout = 5 * time.Minute // Default 5 minutes
 	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	exec := &jobExecution{
 		startTime: time.Now(),
 		cancelFn:  cancel,
 	}
-	s.running[job.Name] = exec
-	s.wg.Add(1)
-	s.mu.Unlock()
+
+	// Check no_overlap flag and register as running atomically under one lock.
+	skip := func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if job.NoOverlap {
+			if _, isRunning := s.running[job.Name]; isRunning {
+				return true
+			}
+		}
+		s.running[job.Name] = exec
+		s.wg.Add(1)
+		return false
+	}()
+
+	if skip {
+		cancel()
+		log.Printf("Job %q already running, skipping (no_overlap=true)", job.Name)
+		now := time.Now()
+		_ = s.catalog.AddJobHistory(&CatalogJobHistory{
+			JobName:    job.Name,
+			StartedAt:  now,
+			FinishedAt: now,
+			Status:     "SKIPPED",
+		})
+		return
+	}
 
 	// Execute job in goroutine
 	go func() {

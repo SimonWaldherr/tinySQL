@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"fmt"
@@ -65,6 +66,83 @@ func TestParseDSNErrors(t *testing.T) {
 	}
 	if _, err := parseDSN("custom://path"); err == nil {
 		t.Fatalf("expected error for unsupported scheme")
+	}
+}
+
+func TestParseDSNMode(t *testing.T) {
+	c, err := parseDSN("file:./test.db?tenant=t&mode=json")
+	if err != nil {
+		t.Fatalf("parseDSN returned error: %v", err)
+	}
+	if !c.modeSet || c.mode != storage.ModeJSON {
+		t.Fatalf("expected mode=json, got modeSet=%v mode=%v", c.modeSet, c.mode)
+	}
+
+	if _, err := parseDSN("file:./test.db?mode=bogus"); err == nil {
+		t.Fatal("expected error for unknown mode")
+	}
+}
+
+// TestDriverModeJSONPersistsAndReopens exercises mode=json end-to-end
+// through database/sql: data written through one connection must survive a
+// full close/reopen cycle as human-readable per-table JSON files on disk —
+// previously the driver could only produce ModeMemory-style GOB snapshots
+// via LoadFromFile/SaveToFile, with no way to reach ModeDisk/ModeJSON/
+// ModeHybrid/ModeWAL from a database/sql DSN at all.
+func TestDriverModeJSONPersistsAndReopens(t *testing.T) {
+	dir := t.TempDir()
+	dsn := "file:" + filepath.Join(dir, "db") + "?tenant=default&mode=json"
+
+	db, err := sql.Open("tinysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE notes (id INT, body TEXT)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO notes VALUES (1, 'hello json mode')`); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	tablePath := filepath.Join(dir, "db", "default", "notes.json")
+	data, err := os.ReadFile(tablePath)
+	if err != nil {
+		t.Fatalf("expected %s on disk: %v", tablePath, err)
+	}
+	if !strings.Contains(string(data), "hello json mode") {
+		t.Fatalf("expected readable row content in JSON file, got: %s", data)
+	}
+
+	reopened, err := sql.Open("tinysql", dsn)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	row := reopened.QueryRow(`SELECT body FROM notes WHERE id = 1`)
+	var body string
+	if err := row.Scan(&body); err != nil {
+		t.Fatalf("query after reopen: %v", err)
+	}
+	if body != "hello json mode" {
+		t.Fatalf("got %q, want %q", body, "hello json mode")
+	}
+}
+
+// TestDriverModeRequiresFilePath guards the mode= validation added
+// alongside JSON-mode DSN support: a non-memory mode with no file path is a
+// clear configuration error, not a silent fallback to in-memory.
+func TestDriverModeRequiresFilePath(t *testing.T) {
+	if _, err := sql.Open("tinysql", "mem://?mode=disk"); err != nil {
+		// sql.Open itself is lazy and may not error until first use.
+		return
+	}
+	db, _ := sql.Open("tinysql", "mem://?mode=disk")
+	defer db.Close()
+	if _, err := db.Exec(`SELECT 1`); err == nil {
+		t.Fatal("expected error opening mode=disk without a file path")
 	}
 }
 

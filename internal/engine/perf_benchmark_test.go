@@ -210,6 +210,44 @@ func BenchmarkFTSSearchRepeated(b *testing.B) {
 	runBench(b, db, `SELECT * FROM FTS_SEARCH('docs', 'database programming', 10)`)
 }
 
+// ─────────────────────────── Constraint checking ───────────────────────────
+
+// BenchmarkInsertIntoLargePKTable measures single-row INSERT throughput into
+// a table with an existing large PRIMARY KEY-constrained dataset — the
+// scenario getConstraintIndex targets. Before it, every INSERT paid an O(n)
+// scan of the whole table per constraint check; each iteration here should
+// now be ~O(1) instead of O(existing row count).
+func BenchmarkInsertIntoLargePKTable(b *testing.B) {
+	db := storage.NewDB()
+	ctx := context.Background()
+	if _, err := Execute(ctx, db, "default", mustParse(`CREATE TABLE t (id INT PRIMARY KEY, val TEXT)`)); err != nil {
+		b.Fatal(err)
+	}
+	const seedRows = 50000
+	table, err := db.Get("default", "t")
+	if err != nil {
+		b.Fatal(err)
+	}
+	table.Rows = make([][]any, seedRows)
+	for i := 0; i < seedRows; i++ {
+		table.Rows[i] = []any{float64(i), fmt.Sprintf("val-%d", i)}
+	}
+	table.Version++
+
+	stmts := make([]Statement, b.N)
+	for i := 0; i < b.N; i++ {
+		stmts[i] = mustParse(fmt.Sprintf(`INSERT INTO t VALUES (%d, 'new-%d')`, seedRows+i, i))
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := Execute(ctx, db, "default", stmts[i]); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkFTSSearchColdEachTime forces a cache rebuild every iteration by
 // bumping the table version, isolating the tokenization cost the cache
 // otherwise amortizes.

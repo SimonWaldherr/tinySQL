@@ -13,6 +13,7 @@ package engine
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -354,7 +355,29 @@ const (
 	JoinLeft
 	// JoinRight represents RIGHT (OUTER) JOIN.
 	JoinRight
+	// JoinFull represents FULL (OUTER) JOIN.
+	JoinFull
+	// JoinCross represents CROSS JOIN (unconditional Cartesian product; no ON clause).
+	JoinCross
 )
+
+// String returns the SQL keyword form of the join type, e.g. "LEFT JOIN".
+func (t JoinType) String() string {
+	switch t {
+	case JoinLeft:
+		return "LEFT JOIN"
+	case JoinRight:
+		return "RIGHT JOIN"
+	case JoinFull:
+		return "FULL OUTER JOIN"
+	case JoinCross:
+		return "CROSS JOIN"
+	case JoinInner:
+		return "JOIN"
+	default:
+		return "JOIN"
+	}
+}
 
 // Select represents a SELECT query and its clauses.
 type Select struct {
@@ -364,6 +387,7 @@ type Select struct {
 	Joins      []JoinClause
 	Projs      []SelectItem
 	Where      Expr
+	Pivot      *PivotClause
 	GroupBy    []Expr
 	Having     Expr
 	OrderBy    []OrderItem
@@ -371,6 +395,30 @@ type Select struct {
 	Offset     *int
 	Union      *UnionClause // For UNION operations
 	CTEs       []CTE        // Common Table Expressions
+}
+
+// PivotClause represents "PIVOT (agg(value_expr) FOR pivot_col IN (v1 [AS a1], v2 [AS a2], ...))".
+// It reshapes the WHERE-filtered row set: each distinct value listed in the
+// IN-list becomes its own output column (named by its alias, or by the
+// value's literal text if no alias is given), holding agg(value_expr) over
+// the rows where pivot_col equals that value. Every other selected column
+// acts as an implicit GROUP BY key, matching standard SQL PIVOT semantics.
+//
+// Scope: a single aggregate function and a static (literal) value list —
+// no dynamic pivot driven by a subquery. This covers the overwhelmingly
+// common case (a known, fixed set of categories to spread into columns)
+// without the complexity of a fully dynamic PIVOT.
+type PivotClause struct {
+	AggFunc   string // e.g. SUM, COUNT, AVG, MIN, MAX
+	ValueExpr Expr
+	PivotCol  string
+	Values    []PivotValue
+}
+
+// PivotValue is one entry in a PIVOT's IN (...) list.
+type PivotValue struct {
+	Expr  Expr
+	Alias string // output column name; defaults to the value's text form
 }
 
 // CTE represents a Common Table Expression (WITH clause)
@@ -393,6 +441,22 @@ const (
 	// Intersect corresponds to INTERSECT.
 	Intersect
 )
+
+// String returns the SQL keyword form of the union type, e.g. "UNION ALL".
+func (t UnionType) String() string {
+	switch t {
+	case UnionAll:
+		return "UNION ALL"
+	case Except:
+		return "EXCEPT"
+	case Intersect:
+		return "INTERSECT"
+	case UnionDistinct:
+		return "UNION"
+	default:
+		return "UNION"
+	}
+}
 
 // UnionClause represents a set operation chaining RIGHT select with current one.
 type UnionClause struct {
@@ -1927,6 +1991,11 @@ func (p *Parser) parseSelect() (*Select, error) {
 		return nil, err
 	}
 
+	// Parse PIVOT
+	if err := p.parsePivotClause(sel); err != nil {
+		return nil, err
+	}
+
 	// Parse GROUP BY
 	if err := p.parseGroupByClause(sel); err != nil {
 		return nil, err
@@ -1953,6 +2022,89 @@ func (p *Parser) parseSelect() (*Select, error) {
 	}
 
 	return sel, nil
+}
+
+// parsePivotClause parses an optional
+// "PIVOT (agg(expr) FOR col IN (v1 [AS a1], v2 [AS a2], ...))" clause.
+func (p *Parser) parsePivotClause(sel *Select) error {
+	if p.cur.Typ != tKeyword || p.cur.Val != "PIVOT" {
+		return nil
+	}
+	p.next()
+	if err := p.expectSymbol("("); err != nil {
+		return err
+	}
+
+	if p.cur.Typ != tIdent && p.cur.Typ != tKeyword {
+		return p.errf("expected aggregate function name in PIVOT")
+	}
+	aggFunc := strings.ToUpper(p.cur.Val)
+	p.next()
+
+	if err := p.expectSymbol("("); err != nil {
+		return err
+	}
+	valueExpr, err := p.parseExpr()
+	if err != nil {
+		return err
+	}
+	if err := p.expectSymbol(")"); err != nil {
+		return err
+	}
+
+	if err := p.expectKeyword("FOR"); err != nil {
+		return err
+	}
+	pivotCol := p.parseIdentLike()
+	if pivotCol == "" {
+		return p.errf("expected column name after FOR in PIVOT")
+	}
+
+	if err := p.expectKeyword("IN"); err != nil {
+		return err
+	}
+	if err := p.expectSymbol("("); err != nil {
+		return err
+	}
+	var values []PivotValue
+	for {
+		ve, err := p.parseExpr()
+		if err != nil {
+			return err
+		}
+		alias := ""
+		if p.cur.Typ == tKeyword && p.cur.Val == "AS" {
+			p.next()
+			alias = p.parseIdentLike()
+			if alias == "" {
+				return p.errf("expected alias after AS in PIVOT value list")
+			}
+		}
+		values = append(values, PivotValue{Expr: ve, Alias: alias})
+		if p.cur.Typ == tSymbol && p.cur.Val == "," {
+			p.next()
+			continue
+		}
+		break
+	}
+	if err := p.expectSymbol(")"); err != nil {
+		return err
+	}
+	if len(values) == 0 {
+		return p.errf("PIVOT IN (...) requires at least one value")
+	}
+
+	if err := p.expectSymbol(")"); err != nil {
+		return err
+	}
+
+	sel.Pivot = &PivotClause{
+		AggFunc:   aggFunc,
+		ValueExpr: valueExpr,
+		PivotCol:  pivotCol,
+		Values:    values,
+	}
+	return nil
 }
 
 func (p *Parser) parseDistinct(sel *Select) error {
@@ -2135,10 +2287,15 @@ func (p *Parser) parseJoinClauses(sel *Select) error {
 			sel.Joins = append(sel.Joins, JoinClause{Type: JoinInner, Right: right, On: on})
 			continue
 		}
-		if p.cur.Typ == tKeyword && (p.cur.Val == "LEFT" || p.cur.Val == "RIGHT") {
-			jt := JoinLeft
-			if p.cur.Val == "RIGHT" {
+		if p.cur.Typ == tKeyword && (p.cur.Val == "LEFT" || p.cur.Val == "RIGHT" || p.cur.Val == "FULL") {
+			var jt JoinType
+			switch p.cur.Val {
+			case "LEFT":
+				jt = JoinLeft
+			case "RIGHT":
 				jt = JoinRight
+			case "FULL":
+				jt = JoinFull
 			}
 			p.next()
 			if p.cur.Typ == tKeyword && p.cur.Val == "OUTER" {
@@ -2152,6 +2309,24 @@ func (p *Parser) parseJoinClauses(sel *Select) error {
 				return err
 			}
 			sel.Joins = append(sel.Joins, JoinClause{Type: jt, Right: right, On: on})
+			continue
+		}
+		if p.cur.Typ == tKeyword && p.cur.Val == "CROSS" {
+			p.next()
+			if err := p.expectKeyword("JOIN"); err != nil {
+				return err
+			}
+			// CROSS JOIN is an unconditional Cartesian product: no ON clause,
+			// so it can't reuse parseJoinTail (which always requires one).
+			rt := p.parseQualifiedIdentLike()
+			if rt == "" {
+				return p.errf("expected table name after CROSS JOIN")
+			}
+			alias, err := p.parseOptionalAlias(rt, "expected alias")
+			if err != nil {
+				return err
+			}
+			sel.Joins = append(sel.Joins, JoinClause{Type: JoinCross, Right: FromItem{Table: rt, Alias: alias}, On: nil})
 			continue
 		}
 		break
@@ -2235,21 +2410,78 @@ func (p *Parser) parseOrderByClause(sel *Select) error {
 func (p *Parser) parseLimitOffset(sel *Select) error {
 	if p.cur.Typ == tKeyword && p.cur.Val == "LIMIT" {
 		p.next()
-		if n := p.parseIntLiteral(); n != nil {
-			sel.Limit = n
-		} else {
-			return p.errf("LIMIT expects integer")
+		n, err := p.parseLimitOffsetValue("LIMIT")
+		if err != nil {
+			return err
 		}
+		sel.Limit = n
 	}
 	if p.cur.Typ == tKeyword && p.cur.Val == "OFFSET" {
 		p.next()
-		if n := p.parseIntLiteral(); n != nil {
-			sel.Offset = n
-		} else {
-			return p.errf("OFFSET expects integer")
+		n, err := p.parseLimitOffsetValue("OFFSET")
+		if err != nil {
+			return err
+		}
+		sel.Offset = n
+	}
+	// SQL:2008 alternate syntax: OFFSET n ROWS [FETCH {FIRST|NEXT} m {ROW|ROWS} ONLY].
+	// The bare "ROWS" after a numeric OFFSET is optional noise words.
+	if p.cur.Typ == tKeyword && p.cur.Val == "ROWS" && sel.Offset != nil {
+		p.next()
+	}
+	if p.cur.Typ == tKeyword && p.cur.Val == "FETCH" {
+		p.next()
+		if p.cur.Typ != tKeyword || (p.cur.Val != "FIRST" && p.cur.Val != "NEXT") {
+			return p.errf("expected FIRST or NEXT after FETCH")
+		}
+		p.next()
+		n, err := p.parseLimitOffsetValue("FETCH")
+		if err != nil {
+			return err
+		}
+		sel.Limit = n
+		if p.cur.Typ != tKeyword || (p.cur.Val != "ROW" && p.cur.Val != "ROWS") {
+			return p.errf("expected ROW or ROWS after FETCH count")
+		}
+		p.next()
+		if err := p.expectKeyword("ONLY"); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// parseLimitOffsetValue parses a LIMIT/OFFSET/FETCH value: either the
+// SQL-standard "ALL" (no limit — returns nil, nil), or a constant integer
+// expression evaluated immediately (LIMIT/OFFSET are resolved before
+// execution, not per-row), e.g. a bare literal or arithmetic like "2 + 3".
+// Non-constant expressions (column references, subqueries) are rejected
+// with a clear error.
+func (p *Parser) parseLimitOffsetValue(clause string) (*int, error) {
+	if p.cur.Typ == tKeyword && p.cur.Val == "ALL" {
+		p.next()
+		return nil, nil
+	}
+	expr, err := p.parseAddSub()
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", clause, err)
+	}
+	val, err := evalExpr(ExecEnv{}, expr, Row{})
+	if err != nil {
+		return nil, fmt.Errorf("%s must be a constant expression: %w", clause, err)
+	}
+	f, ok := numeric(val)
+	if !ok {
+		return nil, fmt.Errorf("%s expects an integer, got %T", clause, val)
+	}
+	if f != math.Trunc(f) {
+		return nil, fmt.Errorf("%s expects an integer, got %v", clause, f)
+	}
+	n := int(f)
+	if n < 0 {
+		return nil, fmt.Errorf("%s must be non-negative, got %d", clause, n)
+	}
+	return &n, nil
 }
 
 func (p *Parser) parseUnionClause(sel *Select) error {
@@ -2582,14 +2814,6 @@ func (p *Parser) parseQualifiedIdentLike() string {
 		parts = append(parts, part)
 	}
 	return strings.Join(parts, ".")
-}
-func (p *Parser) parseIntLiteral() *int {
-	if p.cur.Typ == tNumber && !strings.Contains(p.cur.Val, ".") {
-		n, _ := strconv.Atoi(p.cur.Val)
-		p.next()
-		return &n
-	}
-	return nil
 }
 
 // Expressions

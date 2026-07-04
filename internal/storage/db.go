@@ -434,8 +434,8 @@ func NewDB() *DB {
 
 // OpenDB creates or opens a database with the specified storage configuration.
 // For ModeMemory this is equivalent to NewDB (with optional save-on-close).
-// For ModeDisk/ModeHybrid/ModeIndex, tables are stored as individual files
-// in the configured directory. For ModeWAL, the existing WAL mechanism is
+// For ModeDisk/ModeJSON/ModeHybrid/ModeIndex, tables are stored as individual
+// files in the configured directory. For ModeWAL, the existing WAL mechanism is
 // configured automatically.
 func OpenDB(cfg StorageConfig) (*DB, error) {
 	db := &DB{
@@ -527,6 +527,16 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 		backend, err := NewDiskBackend(cfg.Path, cfg.CompressFiles)
 		if err != nil {
 			return nil, fmt.Errorf("open disk db: %w", err)
+		}
+		db.backend = backend
+
+	case ModeJSON:
+		if cfg.Path == "" {
+			return nil, fmt.Errorf("ModeJSON requires a Path")
+		}
+		backend, err := NewJSONBackend(cfg.Path, cfg.CompressFiles)
+		if err != nil {
+			return nil, fmt.Errorf("open json db: %w", err)
 		}
 		db.backend = backend
 
@@ -671,20 +681,24 @@ func (db *DB) Get(tn, name string) (*Table, error) {
 // backend to prevent duplicates, and optionally persisted immediately when
 // SyncOnMutate is configured.
 func (db *DB) Put(tn string, t *Table) error {
-	db.mu.Lock()
-	td := db.getTenant(tn)
-	lc := strings.ToLower(t.Name)
-	if _, exists := td.tables[lc]; exists {
-		db.mu.Unlock()
+	exists := func() bool {
+		db.mu.Lock()
+		defer db.mu.Unlock()
+		td := db.getTenant(tn)
+		lc := strings.ToLower(t.Name)
+		if _, exists := td.tables[lc]; exists {
+			return true
+		}
+		// Also check the backend for tables that may be on disk but not loaded.
+		if db.backend != nil && db.backend.TableExists(tn, t.Name) {
+			return true
+		}
+		td.tables[lc] = t
+		return false
+	}()
+	if exists {
 		return fmt.Errorf("table %q already exists (tenant %q)", t.Name, tn)
 	}
-	// Also check the backend for tables that may be on disk but not loaded.
-	if db.backend != nil && db.backend.TableExists(tn, t.Name) {
-		db.mu.Unlock()
-		return fmt.Errorf("table %q already exists (tenant %q)", t.Name, tn)
-	}
-	td.tables[lc] = t
-	db.mu.Unlock()
 
 	// Persist to backend if configured.
 	if db.backend != nil {
@@ -697,17 +711,22 @@ func (db *DB) Put(tn string, t *Table) error {
 
 // Drop removes a table from the tenant (and from the backend if attached).
 func (db *DB) Drop(tn, name string) error {
-	db.mu.Lock()
-	td := db.getTenant(tn)
-	lc := strings.ToLower(name)
-	_, inMemory := td.tables[lc]
-	onDisk := db.backend != nil && db.backend.TableExists(tn, name)
-	if !inMemory && !onDisk {
-		db.mu.Unlock()
+	onDisk, found := func() (bool, bool) {
+		db.mu.Lock()
+		defer db.mu.Unlock()
+		td := db.getTenant(tn)
+		lc := strings.ToLower(name)
+		_, inMemory := td.tables[lc]
+		onDisk := db.backend != nil && db.backend.TableExists(tn, name)
+		if !inMemory && !onDisk {
+			return false, false
+		}
+		delete(td.tables, lc)
+		return onDisk, true
+	}()
+	if !found {
 		return fmt.Errorf("no such table %q (tenant %q)", name, tn)
 	}
-	delete(td.tables, lc)
-	db.mu.Unlock()
 
 	if db.backend != nil && onDisk {
 		if err := db.backend.DeleteTable(tn, name); err != nil {
@@ -1001,7 +1020,7 @@ func (db *DB) backendCatalogPath() (string, bool) {
 		return "", false
 	}
 	switch db.storageMode {
-	case ModeDisk, ModeHybrid, ModeIndex:
+	case ModeDisk, ModeHybrid, ModeIndex, ModeJSON:
 		return filepath.Join(db.config.Path, ".catalog.gob"), true
 	default:
 		return "", false
@@ -1107,6 +1126,34 @@ func tableToDiskRange(tn string, t *Table, from, to int) diskTable {
 	return dt
 }
 
+// normalizeVectorValue coerces a decoded vector cell back into []float64.
+// GOB round-trips []float64 exactly; JSON round-trips it as []any (each
+// element a float64, or a json.Number if a decoder used UseNumber()).
+func normalizeVectorValue(v any) any {
+	switch vv := v.(type) {
+	case []float64:
+		return vv
+	case []any:
+		out := make([]float64, len(vv))
+		for i, e := range vv {
+			switch n := e.(type) {
+			case float64:
+				out[i] = n
+			case json.Number:
+				f, _ := n.Float64()
+				out[i] = f
+			case int:
+				out[i] = float64(n)
+			case int64:
+				out[i] = float64(n)
+			}
+		}
+		return out
+	default:
+		return v
+	}
+}
+
 func diskToTable(dt diskTable) *Table {
 	cols := make([]Column, len(dt.Cols))
 	for i, c := range dt.Cols {
@@ -1125,7 +1172,8 @@ func diskToTable(dt diskTable) *Table {
 				row[ci] = nil
 				continue
 			}
-			if cols[ci].Type == JsonType {
+			switch {
+			case cols[ci].Type == JsonType:
 				var anyv any
 				switch val := v.(type) {
 				case string:
@@ -1137,7 +1185,14 @@ func diskToTable(dt diskTable) *Table {
 				default:
 					row[ci] = val
 				}
-			} else {
+			case cols[ci].Type == VectorType:
+				// GOB preserves []float64 exactly; JSON-based backends decode
+				// a JSON number array into []any (each element boxed as
+				// float64). Normalize both to []float64 so vector functions
+				// (which type-switch on []float64) work regardless of the
+				// backend that produced this row.
+				row[ci] = normalizeVectorValue(v)
+			default:
 				row[ci] = v
 			}
 		}
@@ -1616,8 +1671,9 @@ func (db *DB) HealthCheck() DBHealth {
 
 // Sync flushes all dirty in-memory tables to the storage backend. For
 // ModeMemory and ModeWAL this is a no-op (those modes use SaveToFile /
-// WAL checkpoints respectively). For ModeDisk, ModeHybrid, and ModeIndex,
-// tables whose version has changed since the last save are written to disk.
+// WAL checkpoints respectively). For ModeDisk, ModeJSON, ModeHybrid, and
+// ModeIndex, tables whose version has changed since the last save are
+// written to disk.
 func (db *DB) Sync() error {
 	if db.backend == nil {
 		db.markSynced()
@@ -1625,7 +1681,7 @@ func (db *DB) Sync() error {
 	}
 
 	// For disk/hybrid backends, save all in-memory tables that are dirty.
-	if db.storageMode == ModeDisk || db.storageMode == ModeHybrid || db.storageMode == ModeIndex {
+	if db.storageMode == ModeDisk || db.storageMode == ModeJSON || db.storageMode == ModeHybrid || db.storageMode == ModeIndex {
 		db.mu.RLock()
 		type entry struct {
 			tenant string
@@ -1667,23 +1723,24 @@ func (db *DB) Sync() error {
 }
 
 // Close persists all data and releases resources. For ModeMemory with a
-// configured path, this saves a final GOB snapshot. For ModeDisk/ModeHybrid,
-// dirty tables are flushed. WAL and Advanced WAL resources are closed.
+// configured path, this saves a final GOB snapshot. For ModeDisk/ModeJSON/
+// ModeHybrid, dirty tables are flushed. WAL and Advanced WAL resources are closed.
 func (db *DB) Close() error {
 	if db == nil {
 		return nil
 	}
-	db.mu.Lock()
-	if db.closed {
-		db.mu.Unlock()
+	shouldClose := func() bool {
+		db.mu.Lock()
+		defer db.mu.Unlock()
+		if db.closed || db.closing {
+			return false
+		}
+		db.closing = true
+		return true
+	}()
+	if !shouldClose {
 		return nil
 	}
-	if db.closing {
-		db.mu.Unlock()
-		return nil
-	}
-	db.closing = true
-	db.mu.Unlock()
 
 	var firstErr error
 

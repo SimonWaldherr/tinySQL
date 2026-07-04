@@ -5,6 +5,8 @@
 //
 //   - DSN formats: `mem://` and `file:/path/to/db.gob?options` (see `parseDSN`).
 //   - Optional Write-Ahead Log (WAL) and autosave for durability.
+//   - `mode=` selects any storage.StorageMode (disk, json, hybrid, wal, ...)
+//     via storage.OpenDB instead of the default GOB-snapshot behavior.
 //   - Reader/writer pools and simple MVCC-style snapshots for transactions.
 //   - Simple, safe placeholder binding: sequential `?` and numbered `$1`/`:1`.
 //
@@ -37,6 +39,7 @@ import (
 // Supported DSNs:
 //   - mem://?tenant=default&pool_readers=4&busy_timeout=250ms
 //   - file:/path/to/db.gob?tenant=default&autosave=1
+//   - file:/path/to/dbdir?tenant=default&mode=json (or disk, hybrid, wal, ...)
 //
 // See parseDSN for all available options.
 // defaultDrv is the package-global driver instance registered with database/sql.
@@ -102,6 +105,13 @@ type cfg struct {
 	maxReaders  int
 	maxWriters  int
 	busyTimeout time.Duration
+	// mode selects a storage.StorageMode other than the driver's original
+	// in-memory-plus-GOB-snapshot behavior (e.g. "disk", "json", "wal").
+	// modeSet distinguishes "not specified" (keep the original LoadFromFile/
+	// NewDB + autosave path, unchanged) from an explicit "memory" (which
+	// behaves the same but goes through storage.OpenDB).
+	mode    storage.StorageMode
+	modeSet bool
 }
 
 // parseDSN parses a tinySQL DSN into a driver configuration.
@@ -173,14 +183,21 @@ type server struct {
 	readerPool  chan struct{}
 	writerPool  chan struct{}
 	busyTimeout time.Duration
+	// usesStorageBackend is true when db was opened via storage.OpenDB with
+	// an explicit mode= DSN option, rather than the driver's original
+	// LoadFromFile/NewDB + SaveToFile-on-close scheme. Such backends persist
+	// via DB.Sync() (which flushes dirty tables to whatever backend is
+	// attached — GOB, JSON, ...), not via a whole-database GOB snapshot.
+	usesStorageBackend bool
 }
 
 func newServer(db *storage.DB, c cfg) *server {
 	s := &server{
-		db:          db,
-		filePath:    c.filePath,
-		autosave:    c.autosave,
-		busyTimeout: c.busyTimeout,
+		db:                 db,
+		filePath:           c.filePath,
+		autosave:           c.autosave,
+		busyTimeout:        c.busyTimeout,
+		usesStorageBackend: c.modeSet && c.mode != storage.ModeMemory,
 	}
 	if c.maxReaders > 0 {
 		s.readerPool = make(chan struct{}, c.maxReaders)
@@ -283,6 +300,18 @@ func (s *server) release(pool chan struct{}) {
 // typically call this from cleanup paths where returning an error would be
 // inconvenient.
 func (s *server) saveIfNeeded() {
+	if s.usesStorageBackend {
+		// Disk-backed modes (ModeDisk, ModeJSON, ModeHybrid, ModeIndex)
+		// persist via their attached backend's Sync, not a whole-database
+		// GOB snapshot; ModeWAL/ModeAdvancedWAL rely on their own
+		// checkpoint machinery and treat Sync as a no-op (see DB.Sync's
+		// doc comment). Always sync here regardless of the autosave flag —
+		// choosing a durable mode is itself the opt-in.
+		if err := s.db.Sync(); err != nil {
+			log.Printf("sync failed: %v", err)
+		}
+		return
+	}
 	if s.autosave && s.filePath != "" {
 		if err := storage.SaveToFile(s.db, s.filePath); err != nil {
 			log.Printf("autosave failed: %v", err)
@@ -302,12 +331,21 @@ func (d *drv) Open(name string) (driver.Conn, error) {
 		s = d.srv
 	} else {
 		var db *storage.DB
-		if c.filePath != "" {
+		switch {
+		case c.modeSet && c.mode != storage.ModeMemory:
+			if c.filePath == "" {
+				return nil, fmt.Errorf("tinysql: mode=%s requires a file: DSN with a path", c.mode)
+			}
+			db, err = storage.OpenDB(storage.StorageConfig{Mode: c.mode, Path: c.filePath})
+			if err != nil {
+				return nil, err
+			}
+		case c.filePath != "":
 			db, err = storage.LoadFromFile(c.filePath)
 			if err != nil {
 				return nil, err
 			}
-		} else {
+		default:
 			db = storage.NewDB()
 		}
 		s = newServer(db, c)
@@ -924,6 +962,13 @@ func applyDSNOption(c *cfg, key, value string) error {
 			return err
 		}
 		c.busyTimeout = dur
+	case "mode":
+		m, err := storage.ParseStorageMode(value)
+		if err != nil {
+			return err
+		}
+		c.mode = m
+		c.modeSet = true
 	default:
 		return nil
 	}

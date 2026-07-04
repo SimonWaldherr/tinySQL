@@ -221,12 +221,18 @@ func executeCreateTable(env ExecEnv, s *CreateTable) (*ResultSet, error) {
 
 func executeDropTable(env ExecEnv, s *DropTable) (*ResultSet, error) {
 	// Check IF EXISTS
-	if s.IfExists {
-		_, err := env.db.Get(env.tenant, s.Name)
-		if err != nil {
+	t, err := env.db.Get(env.tenant, s.Name)
+	if err != nil {
+		if s.IfExists {
 			// Table doesn't exist, silently succeed
 			return nil, nil
 		}
+	} else {
+		// Release cached constraint indexes; otherwise a create/drop/create
+		// cycle under the same table name leaks one stale entry per
+		// constrained column per drop (the old *storage.Table pointer is
+		// never looked up again, but its map entries live until process exit).
+		invalidateConstraintIndexes(t)
 	}
 	return nil, env.db.Drop(env.tenant, s.Name)
 }
@@ -658,6 +664,17 @@ func executeInsert(env ExecEnv, s *Insert) (*ResultSet, error) {
 func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) (*ResultSet, error) {
 	expected := len(t.Cols)
 	returningRows := make([]Row, 0, len(s.Rows))
+	// buildTableRow allocates a map(2*len(cols)) per call; GetTriggers takes
+	// a catalog RLock per call. Both were previously paid unconditionally on
+	// every inserted row even when there were no triggers and no RETURNING
+	// to consume the built row — hoist the trigger-existence check and
+	// column-name slice out of the loop, and skip the row-map build entirely
+	// when nothing will use it.
+	tablePrefix := strings.ToLower(s.Table) + "."
+	tableColNames := colNames(t.Cols)
+	hasBefore := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("BEFORE"), storage.TriggerEvent("INSERT"))) > 0
+	hasAfter := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("AFTER"), storage.TriggerEvent("INSERT"))) > 0
+	needsRow := hasBefore || hasAfter || len(s.Returning) > 0
 	for _, vals := range s.Rows {
 		if len(vals) != expected {
 			return nil, fmt.Errorf("INSERT expects %d values", expected)
@@ -680,16 +697,23 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 		if err := validateRowConstraints(env, t, row, -1); err != nil {
 			return nil, err
 		}
-		newRow := buildTableRow(t.Cols, strings.ToLower(s.Table)+".", row)
-		if err := fireTriggers(env, s.Table, "BEFORE", "INSERT", newRow, nil); err != nil {
-			return nil, err
+		var newRow Row
+		if needsRow {
+			newRow = buildTableRow(t.Cols, tablePrefix, row)
+		}
+		if hasBefore {
+			if err := fireTriggers(env, s.Table, "BEFORE", "INSERT", newRow, nil); err != nil {
+				return nil, err
+			}
 		}
 		t.Rows = append(t.Rows, row)
-		if err := fireTriggers(env, s.Table, "AFTER", "INSERT", newRow, nil); err != nil {
-			return nil, err
+		if hasAfter {
+			if err := fireTriggers(env, s.Table, "AFTER", "INSERT", newRow, nil); err != nil {
+				return nil, err
+			}
 		}
 		// FTS index is updated after all trigger hooks so it reflects final row data.
-		ftsIndexRow(env.tenant+"/"+s.Table, s.Table, len(t.Rows)-1, nil, row, colNames(t.Cols))
+		ftsIndexRow(env.tenant+"/"+s.Table, s.Table, len(t.Rows)-1, nil, row, tableColNames)
 		if len(s.Returning) > 0 {
 			returningRows = append(returningRows, newRow)
 		}
@@ -713,6 +737,11 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 		colIdx[i] = idx
 	}
 	returningRows := make([]Row, 0, len(s.Rows))
+	tablePrefix := strings.ToLower(s.Table) + "."
+	tableColNames := colNames(t.Cols)
+	hasBefore := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("BEFORE"), storage.TriggerEvent("INSERT"))) > 0
+	hasAfter := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("AFTER"), storage.TriggerEvent("INSERT"))) > 0
+	needsRow := hasBefore || hasAfter || len(s.Returning) > 0
 	for _, vals := range s.Rows {
 		if len(vals) != len(s.Cols) {
 			return nil, fmt.Errorf("INSERT column/value mismatch")
@@ -738,16 +767,23 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 		if err := validateRowConstraints(env, t, row, -1); err != nil {
 			return nil, err
 		}
-		newRow := buildTableRow(t.Cols, strings.ToLower(s.Table)+".", row)
-		if err := fireTriggers(env, s.Table, "BEFORE", "INSERT", newRow, nil); err != nil {
-			return nil, err
+		var newRow Row
+		if needsRow {
+			newRow = buildTableRow(t.Cols, tablePrefix, row)
+		}
+		if hasBefore {
+			if err := fireTriggers(env, s.Table, "BEFORE", "INSERT", newRow, nil); err != nil {
+				return nil, err
+			}
 		}
 		t.Rows = append(t.Rows, row)
-		if err := fireTriggers(env, s.Table, "AFTER", "INSERT", newRow, nil); err != nil {
-			return nil, err
+		if hasAfter {
+			if err := fireTriggers(env, s.Table, "AFTER", "INSERT", newRow, nil); err != nil {
+				return nil, err
+			}
 		}
 		// FTS index is updated after all trigger hooks so it reflects final row data.
-		ftsIndexRow(env.tenant+"/"+s.Table, s.Table, len(t.Rows)-1, nil, row, colNames(t.Cols))
+		ftsIndexRow(env.tenant+"/"+s.Table, s.Table, len(t.Rows)-1, nil, row, tableColNames)
 		if len(s.Returning) > 0 {
 			returningRows = append(returningRows, newRow)
 		}
@@ -808,12 +844,115 @@ func validateRowConstraints(env ExecEnv, t *storage.Table, row []any, excludeRow
 	return nil
 }
 
-func constraintValueExists(t *storage.Table, colIdx int, val any, excludeRow int) bool {
-	for rowIdx, existing := range t.Rows {
-		if rowIdx == excludeRow || colIdx >= len(existing) {
+// constraintIndexes caches, per (table, column), a hash map from an
+// already-used column value to the row indices holding it. This turns
+// PRIMARY KEY / UNIQUE / FOREIGN KEY existence checks from an O(n) scan of
+// the whole table (paid on every INSERT/UPDATE) into an O(1) lookup — the
+// difference between ~10s and ~10ms when bulk-inserting 10k rows into a
+// table that already has 100k.
+//
+// Maintenance is incremental rather than invalidate-and-rebuild-on-any-
+// change, because a naive "rebuild when table.Version changes" cache would
+// pay the full O(n) rebuild on literally every row of a multi-row INSERT
+// (each row bumps Version), erasing the benefit entirely:
+//   - INSERT only appends, so getConstraintIndex just indexes whatever rows
+//     have been added since rowCount was last recorded — including rows
+//     added earlier in the very same multi-row INSERT statement.
+//   - UPDATE overwrites a row in place without changing the row count, so
+//     it can't be detected by growth; patchConstraintIndexRow moves that
+//     one row from its old value's bucket to its new one directly.
+//   - DELETE removes rows and shifts every subsequent row's index, which
+//     the incremental scheme can't reconcile cheaply, so
+//     invalidateConstraintIndexes drops the cache outright and the next
+//     check rebuilds it from scratch.
+type constraintIndexKey struct {
+	table  *storage.Table
+	colIdx int
+}
+type constraintIndexEntry struct {
+	rowCount int // rows already reflected in `rows`, i.e. t.Rows[:rowCount]
+	rows     map[any][]int
+}
+
+var (
+	constraintIndexMu sync.Mutex
+	constraintIndexes = make(map[constraintIndexKey]*constraintIndexEntry)
+)
+
+func getConstraintIndex(t *storage.Table, colIdx int) *constraintIndexEntry {
+	key := constraintIndexKey{table: t, colIdx: colIdx}
+	constraintIndexMu.Lock()
+	defer constraintIndexMu.Unlock()
+
+	e, ok := constraintIndexes[key]
+	if !ok || e.rowCount > len(t.Rows) {
+		// First use for this column, or the table shrank (DELETE already
+		// invalidates explicitly; this is a defensive fallback in case some
+		// row-removing path doesn't).
+		e = &constraintIndexEntry{rows: make(map[any][]int, len(t.Rows))}
+		constraintIndexes[key] = e
+	}
+	for i := e.rowCount; i < len(t.Rows); i++ {
+		r := t.Rows[i]
+		if colIdx >= len(r) || r[colIdx] == nil {
 			continue
 		}
-		if rawEqual(existing[colIdx], val) {
+		k := comparableKeyPart(r[colIdx])
+		e.rows[k] = append(e.rows[k], i)
+	}
+	e.rowCount = len(t.Rows)
+	return e
+}
+
+// invalidateConstraintIndexes drops every cached constraint index for a
+// table. Call before any operation that can remove or reorder existing rows
+// (DELETE) or replace the table wholesale (DROP TABLE) — the incremental
+// index only knows how to grow by appending or patch a single row in place.
+func invalidateConstraintIndexes(t *storage.Table) {
+	constraintIndexMu.Lock()
+	for k := range constraintIndexes {
+		if k.table == t {
+			delete(constraintIndexes, k)
+		}
+	}
+	constraintIndexMu.Unlock()
+}
+
+// patchConstraintIndexRow updates every cached constraint index for a table
+// after row rowIdx is overwritten in place (UPDATE), moving it from its old
+// value's bucket to its new one instead of invalidating the whole cache.
+func patchConstraintIndexRow(t *storage.Table, rowIdx int, oldRow, newRow []any) {
+	constraintIndexMu.Lock()
+	defer constraintIndexMu.Unlock()
+	for k, e := range constraintIndexes {
+		if k.table != t || k.colIdx >= len(oldRow) || k.colIdx >= len(newRow) {
+			continue
+		}
+		oldVal, newVal := oldRow[k.colIdx], newRow[k.colIdx]
+		if rawEqual(oldVal, newVal) {
+			continue
+		}
+		if oldVal != nil {
+			ok := comparableKeyPart(oldVal)
+			bucket := e.rows[ok]
+			for i, ri := range bucket {
+				if ri == rowIdx {
+					e.rows[ok] = append(bucket[:i], bucket[i+1:]...)
+					break
+				}
+			}
+		}
+		if newVal != nil {
+			nk := comparableKeyPart(newVal)
+			e.rows[nk] = append(e.rows[nk], rowIdx)
+		}
+	}
+}
+
+func constraintValueExists(t *storage.Table, colIdx int, val any, excludeRow int) bool {
+	idx := getConstraintIndex(t, colIdx)
+	for _, rowIdx := range idx.rows[comparableKeyPart(val)] {
+		if rowIdx != excludeRow {
 			return true
 		}
 	}
@@ -841,6 +980,9 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 	returningRows := make([]Row, 0)
 	tablePrefix := strings.ToLower(s.Table) + "."
 	columnNames := colNames(t.Cols)
+	hasBefore := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("BEFORE"), storage.TriggerEvent("UPDATE"))) > 0
+	hasAfter := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("AFTER"), storage.TriggerEvent("UPDATE"))) > 0
+	needsNewRow := hasAfter || len(s.Returning) > 0
 	for ri, r := range t.Rows {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
@@ -855,9 +997,14 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 			ok = (toTri(v) == tvTrue)
 		}
 		if ok {
-			oldRow := buildTableRow(t.Cols, tablePrefix, t.Rows[ri])
-			if err := fireTriggers(env, s.Table, "BEFORE", "UPDATE", row, oldRow); err != nil {
-				return nil, err
+			// r == t.Rows[ri] before any mutation below, so oldRow is
+			// identical to row — reuse it instead of rebuilding the same
+			// map from the same data.
+			oldRow := row
+			if hasBefore {
+				if err := fireTriggers(env, s.Table, "BEFORE", "UPDATE", row, oldRow); err != nil {
+					return nil, err
+				}
 			}
 			nextRow := append([]any(nil), t.Rows[ri]...)
 			for i, ex := range setIdx {
@@ -874,11 +1021,17 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 			if err := validateRowConstraints(env, t, nextRow, ri); err != nil {
 				return nil, err
 			}
+			patchConstraintIndexRow(t, ri, t.Rows[ri], nextRow)
 			t.Rows[ri] = nextRow
-			newRow := buildTableRow(t.Cols, tablePrefix, t.Rows[ri])
+			var newRow Row
+			if needsNewRow {
+				newRow = buildTableRow(t.Cols, tablePrefix, t.Rows[ri])
+			}
 			ftsIndexRow(env.tenant+"/"+s.Table, s.Table, ri, nil, t.Rows[ri], columnNames)
-			if err := fireTriggers(env, s.Table, "AFTER", "UPDATE", newRow, oldRow); err != nil {
-				return nil, err
+			if hasAfter {
+				if err := fireTriggers(env, s.Table, "AFTER", "UPDATE", newRow, oldRow); err != nil {
+					return nil, err
+				}
 			}
 			if len(s.Returning) > 0 {
 				returningRows = append(returningRows, newRow)
@@ -955,6 +1108,7 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 		if err := validateRowConstraints(env, plan.table, nextRow, ri); err != nil {
 			return nil, true, err
 		}
+		patchConstraintIndexRow(plan.table, ri, plan.table.Rows[ri], nextRow)
 		plan.table.Rows[ri] = nextRow
 		ftsIndexRow(env.tenant+"/"+s.Table, s.Table, ri, nil, plan.table.Rows[ri], columnNames)
 		updated++
@@ -1006,6 +1160,10 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Removing rows shifts every subsequent row's index, which the
+	// incremental constraint index can't reconcile cheaply — drop it and
+	// let the next INSERT/UPDATE rebuild it from scratch.
+	invalidateConstraintIndexes(t)
 	if s.Where == nil {
 		del := len(t.Rows)
 		if len(s.Returning) > 0 {
@@ -1070,6 +1228,8 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	del := 0
 	returningRows := make([]Row, 0)
 	tablePrefix := strings.ToLower(s.Table) + "."
+	hasBeforeDel := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("BEFORE"), storage.TriggerEvent("DELETE"))) > 0
+	hasAfterDel := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("AFTER"), storage.TriggerEvent("DELETE"))) > 0
 	for _, r := range t.Rows {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
@@ -1082,12 +1242,16 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 		if toTri(v) != tvTrue {
 			kept = append(kept, r)
 		} else {
-			if err := fireTriggers(env, s.Table, "BEFORE", "DELETE", nil, row); err != nil {
-				return nil, err
+			if hasBeforeDel {
+				if err := fireTriggers(env, s.Table, "BEFORE", "DELETE", nil, row); err != nil {
+					return nil, err
+				}
 			}
 			ftsDeleteRow(env.tenant+"/"+s.Table, del+len(kept))
-			if err := fireTriggers(env, s.Table, "AFTER", "DELETE", nil, row); err != nil {
-				return nil, err
+			if hasAfterDel {
+				if err := fireTriggers(env, s.Table, "AFTER", "DELETE", nil, row); err != nil {
+					return nil, err
+				}
 			}
 			if len(s.Returning) > 0 {
 				returningRows = append(returningRows, row)
@@ -2083,7 +2247,7 @@ func simpleJoinSelectEligible(s *Select) bool {
 	return !(s.Distinct || len(s.DistinctOn) > 0 || len(s.CTEs) > 0 || len(s.GroupBy) > 0 ||
 		s.Having != nil || s.Union != nil || len(s.OrderBy) > 0 || s.Limit != nil || s.Offset != nil ||
 		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil || len(s.Joins) != 1 ||
-		s.Joins[0].Type != JoinInner || s.Joins[0].Right.Table == "" ||
+		s.Joins[0].Type != JoinInner || s.Joins[0].Right.Table == "" || s.Pivot != nil ||
 		s.Joins[0].Right.Subquery != nil || s.Joins[0].Right.TableFunc != nil ||
 		isSQLiteSchemaTable(s.From.Table) || isSQLiteSchemaTable(s.Joins[0].Right.Table))
 }
@@ -2619,7 +2783,7 @@ func simpleAggregateEligibleSelect(s *Select) bool {
 	return !(s.Distinct || len(s.DistinctOn) > 0 || len(s.CTEs) > 0 || len(s.Joins) > 0 ||
 		s.Having != nil || s.Union != nil || len(s.OrderBy) > 0 || s.Limit != nil || s.Offset != nil ||
 		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil || len(s.GroupBy) != 1 ||
-		isSQLiteSchemaTable(s.From.Table))
+		s.Pivot != nil || isSQLiteSchemaTable(s.From.Table))
 }
 
 func buildSimpleAggregateProjections(s *Select, colIndex map[string]int, groupCol int) ([]simpleAggregateProjection, []string, bool, bool, error) {
@@ -2978,7 +3142,7 @@ func isCatalogViewSource(env ExecEnv, name string) bool {
 
 func simpleSelectEligible(s *Select) bool {
 	if s.Distinct || len(s.DistinctOn) > 0 || len(s.CTEs) > 0 || len(s.Joins) > 0 ||
-		len(s.GroupBy) > 0 || s.Having != nil || s.Union != nil ||
+		len(s.GroupBy) > 0 || s.Having != nil || s.Union != nil || s.Pivot != nil ||
 		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil {
 		return false
 	}
@@ -4609,6 +4773,11 @@ func processJoins(env ExecEnv, joins []JoinClause, cur []Row) ([]Row, error) {
 			cur, err = processLeftJoin(env, cur, rightRows, j.On, aliasOr(j.Right), rightTable)
 		case JoinRight:
 			cur, err = processRightJoin(env, cur, rightRows, j.On)
+		case JoinFull:
+			cur, err = processFullOuterJoin(env, cur, rightRows, j.On, aliasOr(j.Right), rightTable)
+		case JoinCross:
+			optimizer := &HashJoinOptimizer{env: env}
+			cur, err = optimizer.processCrossJoin(cur, rightRows, OptimizedJoinTypeInner)
 		}
 		if err != nil {
 			return nil, err
@@ -4732,6 +4901,64 @@ func processRightJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) 
 	return joined, nil
 }
 
+// processFullOuterJoin combines every left row (matched or, like LEFT JOIN,
+// paired with right-side NULLs when unmatched) with every right row that
+// never matched any left row (paired with left-side NULLs, like RIGHT
+// JOIN's unmatched case). This was previously entirely unimplemented: FULL
+// and CROSS were not lexer keywords, so "FULL OUTER JOIN" silently
+// mis-parsed as a table aliased "FULL" with the rest of the clause dropped
+// — a query that looked like a two-table join silently ran as a one-table
+// scan with no error.
+func processFullOuterJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr, rightAlias string, rightTable *storage.Table) ([]Row, error) {
+	matchedRight := make([]bool, len(rightRows))
+	joined := make([]Row, 0, len(leftRows)+len(rightRows))
+
+	var leftKeys []string
+	if len(leftRows) > 0 {
+		leftKeys = keysOfRow(leftRows[0])
+	}
+
+	for _, l := range leftRows {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, err
+		}
+		matchedAny := false
+		for ri, r := range rightRows {
+			m := mergeRows(l, r)
+			ok := true
+			if onCondition != nil {
+				val, err := evalExpr(env, onCondition, m)
+				if err != nil {
+					return nil, err
+				}
+				ok = (toTri(val) == tvTrue)
+			}
+			if ok {
+				joined = append(joined, m)
+				matchedAny = true
+				matchedRight[ri] = true
+			}
+		}
+		if !matchedAny {
+			m := cloneRow(l)
+			addRightNulls(m, rightAlias, rightTable)
+			joined = append(joined, m)
+		}
+	}
+
+	for ri, r := range rightRows {
+		if matchedRight[ri] {
+			continue
+		}
+		m := cloneRow(r)
+		for _, k := range leftKeys {
+			m[k] = nil
+		}
+		joined = append(joined, m)
+	}
+	return joined, nil
+}
+
 func applyWhereClause(env ExecEnv, where Expr, rows []Row) ([]Row, error) {
 	if where == nil {
 		return rows, nil
@@ -4753,12 +4980,167 @@ func applyWhereClause(env ExecEnv, where Expr, rows []Row) ([]Row, error) {
 }
 
 func processGroupByHaving(env ExecEnv, s *Select, filtered []Row) ([]Row, []string, error) {
+	if s.Pivot != nil {
+		pivotRows, err := processPivot(env, s.Pivot, filtered)
+		if err != nil {
+			return nil, nil, err
+		}
+		// Pivoted rows are a plain row set keyed by group columns + one key
+		// per pivot value; run them through the normal (non-aggregate)
+		// projection path so SELECT * / explicit column lists / window
+		// functions work exactly as they would on any other row set.
+		return processNonAggregateQuery(env, s, pivotRows)
+	}
+
 	needAgg := len(s.GroupBy) > 0 || anyAggInSelect(s.Projs) || isAggregate(s.Having)
 
 	if needAgg {
 		return processAggregateQuery(env, s, filtered)
 	}
 	return processNonAggregateQuery(env, s, filtered)
+}
+
+// processPivot reshapes filtered rows per a PIVOT clause: every column not
+// used as the pivot column or the aggregated value column becomes an
+// implicit GROUP BY key, and each literal in the PIVOT's IN (...) list
+// becomes its own output column holding agg(value_expr) over the rows in
+// that group matching that pivot value.
+func processPivot(env ExecEnv, pv *PivotClause, filtered []Row) ([]Row, error) {
+	pivotColLower := strings.ToLower(pv.PivotCol)
+	exclude := map[string]bool{pivotColLower: true}
+	for name := range collectVarRefNames(pv.ValueExpr) {
+		exclude[name] = true
+	}
+
+	// Group-by columns: every unqualified column present in the source rows
+	// except the pivot column and the value expression's own column(s).
+	var groupCols []string
+	if len(filtered) > 0 {
+		seen := map[string]bool{}
+		for k := range filtered[0] {
+			if strings.Contains(k, ".") || exclude[k] || seen[k] {
+				continue
+			}
+			seen[k] = true
+			groupCols = append(groupCols, k)
+		}
+		sort.Strings(groupCols)
+	}
+
+	// Evaluate each IN (...) entry once (they must be constant expressions)
+	// and determine its output column name.
+	type pivotOut struct {
+		key  any
+		name string
+	}
+	outs := make([]pivotOut, len(pv.Values))
+	for i, v := range pv.Values {
+		val, err := evalExpr(env, v.Expr, Row{})
+		if err != nil {
+			return nil, fmt.Errorf("PIVOT: evaluating IN-list value: %w", err)
+		}
+		name := v.Alias
+		if name == "" {
+			name = fmt.Sprint(val)
+		}
+		outs[i] = pivotOut{key: val, name: name}
+	}
+
+	// Group source rows by their group-by column values, preserving first-
+	// seen order (matches GROUP BY's existing behavior elsewhere).
+	type group struct {
+		values []any
+		rows   []Row
+	}
+	groups := make(map[string]*group)
+	var order []string
+	var keyBuf strings.Builder
+	for _, r := range filtered {
+		keyBuf.Reset()
+		values := make([]any, len(groupCols))
+		for i, c := range groupCols {
+			v := r[c]
+			values[i] = v
+			if i > 0 {
+				keyBuf.WriteByte('\x1f')
+			}
+			writeFmtKeyPart(&keyBuf, v)
+		}
+		gk := keyBuf.String()
+		g, ok := groups[gk]
+		if !ok {
+			g = &group{values: values}
+			groups[gk] = g
+			order = append(order, gk)
+		}
+		g.rows = append(g.rows, r)
+	}
+
+	outRows := make([]Row, 0, len(order))
+	for _, gk := range order {
+		g := groups[gk]
+		out := Row{}
+		for i, c := range groupCols {
+			putVal(out, c, g.values[i])
+		}
+		for _, o := range outs {
+			var matching []Row
+			for _, r := range g.rows {
+				pcv, _ := getValLower(r, pivotColLower)
+				cmp, err := compare(pcv, o.key)
+				if err == nil && cmp == 0 {
+					matching = append(matching, r)
+				}
+			}
+			aggCall := &FuncCall{Name: pv.AggFunc, Args: []Expr{pv.ValueExpr}}
+			val, err := evalAggregateFuncCall(env, aggCall, matching)
+			if err != nil {
+				return nil, fmt.Errorf("PIVOT: %s: %w", pv.AggFunc, err)
+			}
+			putVal(out, o.name, val)
+		}
+		outRows = append(outRows, out)
+	}
+	return outRows, nil
+}
+
+// collectVarRefNames returns the lowercased names of every column reference
+// reachable within e — used by PIVOT to exclude the value expression's own
+// column(s) from the implicit GROUP BY key set.
+func collectVarRefNames(e Expr) map[string]bool {
+	names := make(map[string]bool)
+	var walk func(Expr)
+	walk = func(e Expr) {
+		switch ex := e.(type) {
+		case nil:
+		case *VarRef:
+			key := ex.Lower
+			if key == "" {
+				key = strings.ToLower(ex.Name)
+			}
+			names[key] = true
+		case *Unary:
+			walk(ex.Expr)
+		case *Binary:
+			walk(ex.Left)
+			walk(ex.Right)
+		case *IsNull:
+			walk(ex.Expr)
+		case *FuncCall:
+			for _, a := range ex.Args {
+				walk(a)
+			}
+		case *CaseExpr:
+			walk(ex.Operand)
+			for _, w := range ex.Whens {
+				walk(w.When)
+				walk(w.Then)
+			}
+			walk(ex.Else)
+		}
+	}
+	walk(e)
+	return names
 }
 
 //nolint:gocyclo // Aggregation flow must cover grouping, HAVING, and projection variants.
@@ -9914,6 +10296,16 @@ func evalWindowFunction(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	switch ex.Name {
 	case "ROW_NUMBER":
 		return currentIdx + 1, nil
+	case "RANK":
+		return evalRankFunction(partitionRows, currentIdx, ex.Over.OrderBy), nil
+	case "DENSE_RANK":
+		return evalDenseRankFunction(partitionRows, currentIdx, ex.Over.OrderBy), nil
+	case "PERCENT_RANK":
+		return evalPercentRank(partitionRows, currentIdx, ex.Over.OrderBy), nil
+	case "CUME_DIST":
+		return evalCumeDist(partitionRows, currentIdx, ex.Over.OrderBy), nil
+	case "NTILE":
+		return evalNtile(env, ex, partitionRows, currentIdx, row)
 	case "LAG":
 		return evalLagFunction(env, ex, partitionRows, currentIdx, row)
 	case "LEAD":
@@ -9927,6 +10319,112 @@ func evalWindowFunction(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	default:
 		return nil, fmt.Errorf("unsupported window function: %s", ex.Name)
 	}
+}
+
+// rowsOrderTie reports whether a and b have identical values for every
+// ORDER BY column — the sort direction is irrelevant for tie detection,
+// only equality matters.
+func rowsOrderTie(a, b Row, orderBy []OrderItem) bool {
+	for _, oi := range orderBy {
+		col := strings.ToLower(oi.Col)
+		av, _ := getValLower(a, col)
+		bv, _ := getValLower(b, col)
+		if compareForOrder(av, bv, false) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// evalRankFunction computes SQL RANK(): tied rows (identical ORDER BY key)
+// share the same rank, and the rank after a tie group skips ahead by the
+// group's size (e.g. 1, 1, 3, 4, 4, 6). partitionRows must already be
+// sorted by orderBy (evalWindowFunction guarantees this).
+func evalRankFunction(partitionRows []Row, currentIdx int, orderBy []OrderItem) int {
+	if len(orderBy) == 0 {
+		return currentIdx + 1
+	}
+	i := currentIdx
+	for i > 0 && rowsOrderTie(partitionRows[i-1], partitionRows[currentIdx], orderBy) {
+		i--
+	}
+	return i + 1
+}
+
+// evalDenseRankFunction computes SQL DENSE_RANK(): like RANK but without
+// gaps after ties (e.g. 1, 1, 2, 3, 3, 4).
+func evalDenseRankFunction(partitionRows []Row, currentIdx int, orderBy []OrderItem) int {
+	if len(orderBy) == 0 {
+		return currentIdx + 1
+	}
+	rank := 1
+	for i := 1; i <= currentIdx; i++ {
+		if !rowsOrderTie(partitionRows[i-1], partitionRows[i], orderBy) {
+			rank++
+		}
+	}
+	return rank
+}
+
+// evalPercentRank computes SQL PERCENT_RANK(): (RANK - 1) / (partition size - 1),
+// or 0 when the partition has only one row.
+func evalPercentRank(partitionRows []Row, currentIdx int, orderBy []OrderItem) float64 {
+	total := len(partitionRows)
+	if total <= 1 {
+		return 0
+	}
+	rank := evalRankFunction(partitionRows, currentIdx, orderBy)
+	return float64(rank-1) / float64(total-1)
+}
+
+// evalCumeDist computes SQL CUME_DIST(): the fraction of partition rows
+// whose ORDER BY key is less than or equal to the current row's key. All
+// rows in the same tie group get the same value (the group's last position).
+func evalCumeDist(partitionRows []Row, currentIdx int, orderBy []OrderItem) float64 {
+	total := len(partitionRows)
+	if total == 0 {
+		return 0
+	}
+	i := currentIdx
+	for i+1 < total && rowsOrderTie(partitionRows[i+1], partitionRows[currentIdx], orderBy) {
+		i++
+	}
+	return float64(i+1) / float64(total)
+}
+
+// evalNtile computes SQL NTILE(n): divides the partition into n
+// (approximately) equal-sized buckets and returns the 1-based bucket number
+// for the current row. When the partition size doesn't divide evenly, the
+// first (size % n) buckets get one extra row each — matching PostgreSQL's
+// NTILE bucketing.
+func evalNtile(env ExecEnv, ex *FuncCall, partitionRows []Row, currentIdx int, row Row) (any, error) {
+	if len(ex.Args) != 1 {
+		return nil, fmt.Errorf("NTILE expects 1 argument")
+	}
+	nVal, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	n, err := toInt(nVal)
+	if err != nil {
+		return nil, fmt.Errorf("NTILE: %w", err)
+	}
+	if n <= 0 {
+		return nil, fmt.Errorf("NTILE argument must be positive, got %d", n)
+	}
+	total := len(partitionRows)
+	base := total / n
+	remainder := total % n
+	boundary := remainder * (base + 1)
+	if currentIdx < boundary {
+		return currentIdx/(base+1) + 1, nil
+	}
+	if base == 0 {
+		// n exceeds the partition size; every remaining row is its own
+		// bucket, continuing on from the (remainder) buckets already used.
+		return remainder + (currentIdx - boundary) + 1, nil
+	}
+	return remainder + (currentIdx-boundary)/base + 1, nil
 }
 
 // filterPartition returns rows that match the partition of the current row

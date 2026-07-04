@@ -253,7 +253,7 @@ func isKeyword(up string) bool {
 	case "SELECT", "DISTINCT", "FROM", "WHERE", "GROUP", "BY", "HAVING",
 		"ORDER", "ASC", "DESC", "LIMIT", "OFFSET",
 		"CASE", "WHEN", "THEN", "ELSE", "END",
-		"JOIN", "LEFT", "RIGHT", "OUTER", "ON", "AS",
+		"JOIN", "LEFT", "RIGHT", "FULL", "CROSS", "OUTER", "ON", "AS",
 		"UNION", "ALL", "EXCEPT", "INTERSECT", "WITH",
 		"CREATE", "TABLE", "TEMP", "DROP", "ALTER", "ADD", "COLUMN",
 		"INSERT", "INTO", "VALUES",
@@ -303,7 +303,7 @@ func isKeyword(up string) bool {
 		"REGEXP_MATCH", "REGEXP_EXTRACT", "REGEXP_REPLACE",
 		"SPLIT", "FIRST", "LAST", "ARRAY_LENGTH", "ARRAY_CONTAINS", "IN_ARRAY",
 		"ARRAY_JOIN", "ARRAY_DISTINCT", "ARRAY_SORT",
-		"ROW_NUMBER", "LAG", "LEAD", "MOVING_SUM", "MOVING_AVG",
+		"ROW_NUMBER", "RANK", "DENSE_RANK", "LAG", "LEAD", "MOVING_SUM", "MOVING_AVG",
 		"MIN_BY", "MAX_BY", "ARG_MIN", "ARG_MAX", "FIRST_VALUE", "LAST_VALUE",
 		"OVER", "PARTITION", "ROWS", "RANGE", "BETWEEN", "UNBOUNDED", "PRECEDING", "FOLLOWING", "CURRENT", "ROW",
 		// Vector / embedding types and functions
@@ -323,13 +323,19 @@ func isKeyword(up string) bool {
 		"YAML_PARSE", "YAML_GET",
 		"URL_PARSE", "URL_ENCODE", "URL_DECODE",
 		"BITMAP_NEW", "BITMAP_SET", "BITMAP_GET", "BITMAP_COUNT", "BITMAP_OR", "BITMAP_AND",
-		// Trigger keywords (FOR, AFTER, ROW are already in the main list above)
-		"TRIGGER", "EACH", "BEFORE", "INSTEAD", "OF", "NEW", "OLD",
+		// Trigger keywords ("FOR" was previously missing here, meaning
+		// "FOR EACH ROW" only matched when the user typed "FOR" in that
+		// exact uppercase form — tIdent tokens preserve original case.)
+		"TRIGGER", "EACH", "BEFORE", "INSTEAD", "OF", "NEW", "OLD", "FOR",
 		// Statement wrappers and block delimiters
 		"EXPLAIN", "BEGIN",
 		// FTS keywords
 		"VIRTUAL", "USING", "MATCH",
-		"FTS_MATCH", "FTS_RANK", "FTS_SNIPPET", "BM25":
+		"FTS_MATCH", "FTS_RANK", "FTS_SNIPPET", "BM25",
+		// PIVOT keyword
+		"PIVOT",
+		// SQL:2008 OFFSET ... FETCH {FIRST|NEXT} ... {ROW|ROWS} ONLY
+		"FETCH", "NEXT", "ONLY":
 		return true
 	case "PRAGMA":
 		return true

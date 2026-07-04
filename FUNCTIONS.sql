@@ -141,6 +141,57 @@ SELECT REGEXP_REPLACE('2024-11-27', '-', '/') as date_with_slashes;
 SELECT REGEXP_REPLACE('Hello123World456', '\d+', 'X') as numbers_replaced;
 
 -- ============================================================
+-- FULL-TEXT SEARCH FUNCTIONS
+-- ============================================================
+
+-- FTS_MATCH: boolean match against a query (single term, phrase, boolean, prefix)
+SELECT FTS_MATCH('the quick brown fox', 'fox') as has_fox;
+SELECT FTS_MATCH('the quick brown fox', 'quick AND fox') as has_both;
+SELECT FTS_MATCH('the quick brown fox', 'cat OR fox') as has_either;
+SELECT FTS_MATCH('the quick brown fox', 'NOT cat') as lacks_cat;
+SELECT FTS_MATCH('the quick brown fox jumps', '"quick brown"') as has_phrase;
+SELECT FTS_MATCH('the database stores information', 'inform*') as has_prefix;
+
+-- FTS_RANK / BM25: relevance score for the same query syntax (higher = more relevant)
+SELECT FTS_RANK('the quick brown fox', 'fox AND quick') as relevance;
+SELECT BM25('the quick brown fox', 'fox AND quick') as relevance_alias;
+
+-- FTS_SNIPPET / FTS_HIGHLIGHT: return the text with matches wrapped in markers
+SELECT FTS_SNIPPET('the quick brown fox', 'fox', '<em>', '</em>', '', 10) as excerpt;
+
+-- FTS_WORD_COUNT: number of (stop-word-filtered, stemmed) tokens
+SELECT FTS_WORD_COUNT('hello world foo') as token_count;
+
+-- FTS_SEARCH table-valued function: ranked search across a real table.
+-- With no column arguments it searches the WHOLE ROW (every column, not
+-- just TEXT ones); pass explicit column names to restrict the search.
+-- Repeated calls against an unchanged table reuse a cached tokenization,
+-- so it's cheap for interactive/repeated queries.
+CREATE TABLE fts_demo_articles (id INT, title TEXT, body TEXT);
+INSERT INTO fts_demo_articles VALUES (1, 'Go Programming', 'Go is a fast compiled language for systems programming');
+INSERT INTO fts_demo_articles VALUES (2, 'Python Tutorial', 'Python is a dynamic scripting language popular for data science');
+INSERT INTO fts_demo_articles VALUES (3, 'Database Design', 'Relational databases store data in tables with relationships');
+
+SELECT id, title, _fts_score, _fts_rank
+FROM FTS_SEARCH('fts_demo_articles', 'programming language', 2)
+ORDER BY _fts_rank;
+
+-- Restrict the search to a single column
+SELECT id, title FROM FTS_SEARCH('fts_demo_articles', 'relational', 5, 'body');
+
+DROP TABLE fts_demo_articles;
+
+-- ROW_TO_TEXT: ad-hoc whole-row substring search inside an ordinary WHERE
+-- clause, combinable with other conditions. Cheaper to set up than
+-- FTS_SEARCH (no ranking, no table function) but also less precise; good
+-- for a quick "search everywhere" filter.
+CREATE TABLE row_to_text_demo (id INT, customer TEXT, status TEXT);
+INSERT INTO row_to_text_demo VALUES (1, 'Acme Corp', 'open');
+INSERT INTO row_to_text_demo VALUES (2, 'Globex', 'closed');
+SELECT id FROM row_to_text_demo WHERE ROW_TO_TEXT() LIKE '%Acme%' AND status = 'open';
+DROP TABLE row_to_text_demo;
+
+-- ============================================================
 -- NUMERIC FUNCTIONS
 -- ============================================================
 
@@ -264,7 +315,49 @@ SELECT ARG_MAX(product, amount) as most_expensive_via_argmax FROM temp_sales;
 
 -- Clean up
 DROP TABLE temp_sales;
-DROP TABLE temp_numbers;-- ============================================================
+DROP TABLE temp_numbers;
+
+-- ============================================================
+-- COMPARISON AND RANGE PREDICATES
+-- ============================================================
+
+-- BETWEEN: inclusive range check, equivalent to (x >= lo AND x <= hi)
+SELECT 5 BETWEEN 1 AND 10 as in_range;
+SELECT 15 BETWEEN 1 AND 10 as out_of_range;
+SELECT 5 NOT BETWEEN 1 AND 10 as not_in_range;
+
+-- BETWEEN also works on dates and strings (lexicographic range for strings)
+SELECT '2024-06-15' BETWEEN '2024-01-01' AND '2024-12-31' as in_2024;
+SELECT 'mango' BETWEEN 'apple' AND 'peach' as alphabetically_between;
+
+-- The comparand is evaluated exactly once even for expensive/non-deterministic
+-- expressions, e.g. RANDOM() BETWEEN 0.0 AND 1.0 is always true, never
+-- comparing two different random draws against each other.
+SELECT RANDOM() BETWEEN 0.0 AND 1.0 as random_is_always_in_unit_range;
+
+-- ============================================================
+-- LIMIT / OFFSET
+-- ============================================================
+
+CREATE TABLE limit_demo (id INT);
+INSERT INTO limit_demo VALUES (1);
+INSERT INTO limit_demo VALUES (2);
+INSERT INTO limit_demo VALUES (3);
+INSERT INTO limit_demo VALUES (4);
+INSERT INTO limit_demo VALUES (5);
+
+-- LIMIT ALL means "no limit" (same as omitting LIMIT entirely)
+SELECT * FROM limit_demo ORDER BY id LIMIT ALL;
+
+-- LIMIT/OFFSET accept any constant expression, not just a bare literal
+SELECT * FROM limit_demo ORDER BY id LIMIT 2 + 1 OFFSET 1 * 2;
+
+-- SQL:2008 standard syntax: OFFSET n ROWS FETCH {FIRST|NEXT} m ROWS ONLY
+SELECT * FROM limit_demo ORDER BY id OFFSET 1 ROWS FETCH FIRST 2 ROWS ONLY;
+
+DROP TABLE limit_demo;
+
+-- ============================================================
 -- CONDITIONAL AND NULL HANDLING
 -- ============================================================
 
@@ -375,8 +468,43 @@ SELECT
 FROM window_demo
 ORDER BY category, amount;
 
+-- RANK: like ROW_NUMBER, but tied rows share a rank and the next rank
+-- skips ahead by the tie-group size (e.g. 1, 1, 3)
+SELECT
+    product,
+    amount,
+    RANK() OVER (ORDER BY amount DESC) as rank_by_amount
+FROM window_demo
+ORDER BY amount DESC;
+
+-- DENSE_RANK: like RANK, but no gaps after ties (e.g. 1, 1, 2)
+SELECT
+    product,
+    amount,
+    DENSE_RANK() OVER (ORDER BY amount DESC) as dense_rank_by_amount
+FROM window_demo
+ORDER BY amount DESC;
+
+-- PERCENT_RANK and CUME_DIST: relative standing within the partition, as a
+-- fraction in [0, 1]
+SELECT
+    product,
+    amount,
+    PERCENT_RANK() OVER (ORDER BY amount) as percent_rank,
+    CUME_DIST() OVER (ORDER BY amount) as cume_dist
+FROM window_demo
+ORDER BY amount;
+
+-- NTILE: split the partition into N (approximately) equal-sized buckets
+SELECT
+    product,
+    amount,
+    NTILE(3) OVER (ORDER BY amount) as tercile
+FROM window_demo
+ORDER BY amount;
+
 -- LAG: Access previous row value
-SELECT 
+SELECT
     product,
     amount,
     LAG(amount, 1) OVER (ORDER BY sale_date) as previous_amount
@@ -501,6 +629,38 @@ SELECT
         REGEXP_EXTRACT('No match here', 'PATTERN'),
         'Final Default'
     ) as coalesce_result;
+
+-- ============================================================
+-- PIVOT
+-- ============================================================
+
+-- PIVOT spreads the distinct values of one column into new output columns,
+-- aggregating another column into each. Every other selected column becomes
+-- an implicit GROUP BY key. Scope: one aggregate function and a static
+-- (literal) value list.
+CREATE TABLE pivot_demo (region TEXT, category TEXT, amount INT);
+INSERT INTO pivot_demo VALUES ('East', 'Electronics', 100);
+INSERT INTO pivot_demo VALUES ('East', 'Furniture', 50);
+INSERT INTO pivot_demo VALUES ('West', 'Electronics', 200);
+INSERT INTO pivot_demo VALUES ('West', 'Furniture', 75);
+
+-- One row per region, one column per category, aliased for clean output names
+SELECT *
+FROM pivot_demo
+PIVOT (SUM(amount) FOR category IN ('Electronics' AS electronics, 'Furniture' AS furniture));
+
+-- WHERE filters the source rows before pivoting
+SELECT *
+FROM pivot_demo
+WHERE amount >= 100
+PIVOT (SUM(amount) FOR category IN ('Electronics' AS electronics));
+
+-- COUNT works too, not just SUM
+SELECT *
+FROM pivot_demo
+PIVOT (COUNT(amount) FOR category IN ('Electronics' AS electronics_count, 'Furniture' AS furniture_count));
+
+DROP TABLE pivot_demo;
 
 -- ============================================================
 -- PRACTICAL USE CASES

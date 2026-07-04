@@ -237,6 +237,13 @@ const (
 	// loaded into memory on demand and flushed back on Sync/Close.
 	ModeDisk StorageMode = storage.ModeDisk
 
+	// ModeJSON stores each table as a separate human-readable JSON file on
+	// disk — same lazy-load/dirty-tracking behavior as ModeDisk, which uses
+	// GOB instead. Larger on disk and big.Rat/uuid.UUID values round-trip as
+	// plain strings, but files can be read, diffed, or hand-edited with any
+	// text tool.
+	ModeJSON StorageMode = storage.ModeJSON
+
 	// ModeIndex keeps table schemas in RAM while row data resides on disk.
 	// Rows are loaded on demand with aggressive eviction. Memory usage is
 	// proportional to schema size, not data size.

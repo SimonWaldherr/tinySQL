@@ -53,6 +53,13 @@ const (
 	// ModeAdvancedWAL keeps all data in RAM and uses a row-level Write-Ahead Log
 	// for full ACID transaction durability, crash recovery, and point-in-time recovery.
 	ModeAdvancedWAL
+
+	// ModeJSON stores each table as a separate human-readable JSON file on
+	// disk (same lazy-load/dirty-tracking behaviour as ModeDisk, which uses
+	// GOB instead). Larger on disk than GOB and big.Rat/uuid.UUID values
+	// round-trip as plain strings, but files can be read, diffed, or
+	// hand-edited with any text tool.
+	ModeJSON
 )
 
 // String returns a human-readable label for the StorageMode.
@@ -70,6 +77,8 @@ func (m StorageMode) String() string {
 		return "hybrid"
 	case ModeAdvancedWAL:
 		return "advanced_wal"
+	case ModeJSON:
+		return "json"
 	default:
 		return fmt.Sprintf("StorageMode(%d)", int(m))
 	}
@@ -91,8 +100,10 @@ func ParseStorageMode(s string) (StorageMode, error) {
 		return ModeHybrid, nil
 	case "advanced_wal", "advancedwal":
 		return ModeAdvancedWAL, nil
+	case "json":
+		return ModeJSON, nil
 	default:
-		return ModeMemory, fmt.Errorf("unknown storage mode %q (valid: memory, wal, disk, index, hybrid, advanced_wal)", s)
+		return ModeMemory, fmt.Errorf("unknown storage mode %q (valid: memory, wal, disk, index, hybrid, advanced_wal, json)", s)
 	}
 }
 

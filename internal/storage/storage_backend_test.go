@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -69,6 +70,8 @@ func TestParseStorageMode(t *testing.T) {
 		{" DiSk ", ModeDisk, false},
 		{"index", ModeIndex, false},
 		{"hybrid", ModeHybrid, false},
+		{"json", ModeJSON, false},
+		{" JSON ", ModeJSON, false},
 		{"unknown", ModeMemory, true},
 	}
 	for _, tc := range tests {
@@ -93,6 +96,7 @@ func TestStorageModeString(t *testing.T) {
 		{ModeDisk, "disk"},
 		{ModeIndex, "index"},
 		{ModeHybrid, "hybrid"},
+		{ModeJSON, "json"},
 	}
 	for _, tc := range modes {
 		if got := tc.m.String(); got != tc.want {
@@ -113,6 +117,7 @@ func TestDefaultStorageConfig(t *testing.T) {
 		{ModeIndex, 64 * 1024 * 1024, 0, 0},
 		{ModeWAL, 0, 32, 30 * time.Second},
 		{ModeAdvancedWAL, 0, 1000, 5 * time.Minute},
+		{ModeJSON, 0, 0, 0},
 	}
 
 	for _, tc := range tests {
@@ -301,6 +306,147 @@ func TestDiskBackend_BasicCRUD(t *testing.T) {
 
 	if err := b.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestJSONBackend_BasicCRUD(t *testing.T) {
+	dir := t.TempDir()
+	b, err := NewJSONBackend(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Mode() != ModeJSON {
+		t.Fatalf("mode: got %v, want %v", b.Mode(), ModeJSON)
+	}
+
+	tbl := makeTestTable("products", 50)
+	if err := b.SaveTable("default", tbl); err != nil {
+		t.Fatal(err)
+	}
+
+	// File should exist with a .json extension, not .tbl (GOB).
+	fp := filepath.Join(dir, "default", "products.json")
+	data, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatalf("table file not created: %v", err)
+	}
+	// The whole point of ModeJSON is human-readability: the file must be
+	// valid, parseable JSON, not a GOB binary blob.
+	var probe map[string]any
+	if err := json.Unmarshal(data, &probe); err != nil {
+		t.Fatalf("table file is not valid JSON: %v", err)
+	}
+	if _, ok := probe["Rows"]; !ok {
+		t.Fatalf("expected a top-level Rows field in JSON output, got keys: %v", mapKeys(probe))
+	}
+
+	if !b.TableExists("default", "products") {
+		t.Fatal("TableExists should be true")
+	}
+
+	names, err := b.ListTableNames("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 1 || names[0] != "products" {
+		t.Fatalf("ListTableNames: got %v, want [products]", names)
+	}
+
+	loaded, err := b.LoadTable("default", "products")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertTableEqualJSON(t, loaded, tbl)
+
+	if err := b.DeleteTable("default", "products"); err != nil {
+		t.Fatal(err)
+	}
+	if b.TableExists("default", "products") {
+		t.Fatal("TableExists should be false after delete")
+	}
+	if _, err := os.Stat(fp); !os.IsNotExist(err) {
+		t.Fatal("file should be deleted")
+	}
+
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// assertTableEqualJSON is assertTableEqual's counterpart for JSON-backed
+// round-trips: unlike GOB, encoding/json has no int type, so a Go `int` cell
+// decodes back as `float64` (same numeric value, different Go type). Compare
+// by formatted value instead of Go type identity.
+func assertTableEqualJSON(t *testing.T, got, want *Table) {
+	t.Helper()
+	if got.Name != want.Name {
+		t.Errorf("table name: got %q, want %q", got.Name, want.Name)
+	}
+	if len(got.Rows) != len(want.Rows) {
+		t.Fatalf("row count: got %d, want %d", len(got.Rows), len(want.Rows))
+	}
+	for i := range got.Rows {
+		if len(got.Rows[i]) != len(want.Rows[i]) {
+			t.Fatalf("row[%d] length: got %d, want %d", i, len(got.Rows[i]), len(want.Rows[i]))
+		}
+		for j := range got.Rows[i] {
+			g, w := fmt.Sprint(got.Rows[i][j]), fmt.Sprint(want.Rows[i][j])
+			if g != w {
+				t.Errorf("row[%d][%d]: got %v, want %v", i, j, got.Rows[i][j], want.Rows[i][j])
+			}
+		}
+	}
+}
+
+func mapKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// TestJSONBackend_VectorRoundTrip guards a specific correctness bug: JSON
+// decodes a numeric array into []any (each element boxed as float64), not
+// []float64. Vector functions (VEC_SEARCH etc.) type-switch on []float64, so
+// without normalization in diskToTable, every vector column would silently
+// stop matching after a save/load cycle through a JSON-backed table.
+func TestJSONBackend_VectorRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	b, err := NewJSONBackend(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cols := []Column{
+		{Name: "id", Type: IntType},
+		{Name: "embedding", Type: VectorType},
+	}
+	tbl := NewTable("vectors", cols, false)
+	tbl.Rows = append(tbl.Rows, []any{1, []float64{0.1, 0.2, 0.3}})
+	tbl.Version = 1
+
+	if err := b.SaveTable("default", tbl); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := b.LoadTable("default", "vectors")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(loaded.Rows))
+	}
+	vec, ok := loaded.Rows[0][1].([]float64)
+	if !ok {
+		t.Fatalf("expected []float64 after JSON round-trip, got %T (%v)", loaded.Rows[0][1], loaded.Rows[0][1])
+	}
+	want := []float64{0.1, 0.2, 0.3}
+	if len(vec) != len(want) {
+		t.Fatalf("vector length: got %d, want %d", len(vec), len(want))
+	}
+	for i := range want {
+		if vec[i] != want[i] {
+			t.Errorf("vec[%d] = %v, want %v", i, vec[i], want[i])
+		}
 	}
 }
 
@@ -986,9 +1132,50 @@ func TestOpenDB_WAL(t *testing.T) {
 	_ = db.Close()
 }
 
+// TestOpenDB_JSON verifies the full OpenDB -> Put -> Close -> reopen cycle
+// for ModeJSON, exercising the Sync() dirty-table path (which must include
+// ModeJSON alongside ModeDisk/ModeHybrid/ModeIndex or table content would
+// never actually reach disk).
+func TestOpenDB_JSON(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := OpenDB(StorageConfig{Mode: ModeJSON, Path: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.StorageMode() != ModeJSON {
+		t.Fatalf("mode: got %v, want %v", db.StorageMode(), ModeJSON)
+	}
+
+	tbl := makeTestTable("json_data", 10)
+	if err := db.Put("default", tbl); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The table file must actually be on disk as JSON after Close.
+	fp := filepath.Join(dir, "default", "json_data.json")
+	if _, err := os.Stat(fp); err != nil {
+		t.Fatalf("expected table file at %s after Close: %v", fp, err)
+	}
+
+	reopened, err := OpenDB(StorageConfig{Mode: ModeJSON, Path: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	got, err := reopened.Get("default", "json_data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertTableEqualJSON(t, got, tbl)
+}
+
 func TestOpenDB_ErrorCases(t *testing.T) {
 	// Missing path for disk modes
-	for _, mode := range []StorageMode{ModeWAL, ModeDisk, ModeIndex, ModeHybrid} {
+	for _, mode := range []StorageMode{ModeWAL, ModeDisk, ModeIndex, ModeHybrid, ModeJSON} {
 		_, err := OpenDB(StorageConfig{Mode: mode})
 		if err == nil {
 			t.Errorf("OpenDB with %v and no path should fail", mode)

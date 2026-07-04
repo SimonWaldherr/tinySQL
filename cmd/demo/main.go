@@ -1,11 +1,19 @@
 // Package main provides a practical SQL playground for tinySQL.
 //
-// It seeds sample tables (users, orders) and then lets you:
+// It seeds sample tables (users, orders, sales, articles, docs) and then
+// lets you:
 //   - run any SQL script file via -script
 //   - drop into an interactive REPL via -interactive
 //   - time every statement via -timer
 //   - export query results in multiple formats via -output
 //   - import CSV/JSON files via .import command in REPL
+//
+// The built-in feature tour (run with no -script/-interactive flag) covers
+// PIVOT, window functions (RANK/DENSE_RANK/PERCENT_RANK/CUME_DIST/NTILE),
+// FULL OUTER / CROSS JOIN, whole-row full-text search (FTS_SEARCH and
+// ROW_TO_TEXT), vector search with VEC_WARM index warm-up, and the
+// SQL:2008 OFFSET ... FETCH syntax, alongside traditional JOIN/GROUP
+// BY/aggregate queries.
 //
 // Usage:
 //
@@ -70,6 +78,9 @@ Examples:
 
   # Use a persistent file database
   demo -dsn "file:/tmp/mydb.db?tenant=main" -interactive
+
+  # Use human-readable JSON-per-table storage instead of the GOB default
+  demo -dsn "file:/tmp/mydb?tenant=main&mode=json" -interactive
 `)
 	}
 	flag.Parse()
@@ -183,6 +194,28 @@ func seedSampleData(exec *executor) {
 		`INSERT INTO orders VALUES (102, 1, 75.0,  'PAID', '{"device":"app","items":[{"sku":"B","qty":2}]}')`,
 		`INSERT INTO orders VALUES (103, 2, 200.0, 'PAID', '{"device":"web"}')`,
 		`INSERT INTO orders VALUES (104, 2, 20.0,  'CANCELED', NULL)`,
+
+		// sales: region/category/amount for PIVOT and window-function examples.
+		`CREATE TABLE sales (id INT, region TEXT, category TEXT, amount FLOAT)`,
+		`INSERT INTO sales VALUES (1, 'East', 'Electronics', 1200)`,
+		`INSERT INTO sales VALUES (2, 'East', 'Furniture', 350)`,
+		`INSERT INTO sales VALUES (3, 'East', 'Electronics', 800)`,
+		`INSERT INTO sales VALUES (4, 'West', 'Electronics', 950)`,
+		`INSERT INTO sales VALUES (5, 'West', 'Furniture', 500)`,
+		`INSERT INTO sales VALUES (6, 'West', 'Furniture', 275)`,
+
+		// articles: for FTS_SEARCH (whole-row search) and ROW_TO_TEXT examples.
+		`CREATE TABLE articles (id INT, title TEXT, body TEXT)`,
+		`INSERT INTO articles VALUES (1, 'Go Programming', 'Go is a fast compiled language for systems programming')`,
+		`INSERT INTO articles VALUES (2, 'Python Tutorial', 'Python is a dynamic scripting language popular for data science')`,
+		`INSERT INTO articles VALUES (3, 'Database Design', 'Relational databases store data in tables with relationships')`,
+
+		// docs: for vector search (VEC_SEARCH / VEC_WARM). Tiny 3-dim toy
+		// embeddings so the example runs with no external embedding model.
+		`CREATE TABLE docs (id INT, title TEXT, embedding VECTOR)`,
+		`INSERT INTO docs VALUES (1, 'Cat facts', '[0.9, 0.1, 0.0]')`,
+		`INSERT INTO docs VALUES (2, 'Dog facts', '[0.8, 0.2, 0.0]')`,
+		`INSERT INTO docs VALUES (3, 'Rocket science', '[0.0, 0.1, 0.9]')`,
 	}
 	for _, s := range stmts {
 		if err := exec.run(s); err != nil {
@@ -212,6 +245,44 @@ SELECT o.id AS order_id, u.name AS user
 FROM users u
 RIGHT OUTER JOIN orders o ON u.id = o.user_id
 ORDER BY order_id`},
+		{"FULL OUTER JOIN (every user, every order, matched or not)", `
+SELECT u.name AS user, o.id AS order_id
+FROM users u
+FULL OUTER JOIN orders o ON u.id = o.user_id
+ORDER BY user, order_id`},
+		{"CROSS JOIN (Cartesian product: every user paired with every order)", `
+SELECT u.name AS user, o.id AS order_id
+FROM users u
+CROSS JOIN orders o
+ORDER BY user, order_id`},
+		{"PIVOT: category totals as columns, one row per region", `
+SELECT *
+FROM (SELECT region, category, amount FROM sales) AS s
+PIVOT (SUM(amount) FOR category IN ('Electronics' AS electronics, 'Furniture' AS furniture))
+ORDER BY region`},
+		{"Window functions: RANK/DENSE_RANK/PERCENT_RANK/NTILE", `
+SELECT region, category, amount,
+       RANK() OVER (ORDER BY amount DESC) AS rank,
+       DENSE_RANK() OVER (ORDER BY amount DESC) AS dense_rank,
+       PERCENT_RANK() OVER (ORDER BY amount) AS percent_rank,
+       NTILE(2) OVER (ORDER BY amount) AS half
+FROM sales
+ORDER BY amount DESC`},
+		{"FTS_SEARCH: whole-row ranked search (no column list needed)", `
+SELECT id, title, _fts_score, _fts_rank
+FROM FTS_SEARCH('articles', 'programming language', 2)
+ORDER BY _fts_rank`},
+		{"ROW_TO_TEXT(): ad-hoc whole-row substring search in WHERE", `
+SELECT id, title FROM articles WHERE ROW_TO_TEXT() LIKE '%Python%'`},
+		{"VEC_WARM + VEC_SEARCH: prebuild the index, then query it", `
+SELECT * FROM VEC_WARM('docs', 'embedding', 'cosine', 'hnsw')`},
+		{"  (now served from the warmed index)", `
+SELECT id, title, _vec_distance
+FROM VEC_SEARCH('docs', 'embedding', '[0.85, 0.15, 0.0]', 2, 'cosine', 'hnsw')
+ORDER BY _vec_rank`},
+		{"LIMIT ALL (explicit 'no limit')", `SELECT id FROM articles ORDER BY id LIMIT ALL`},
+		{"SQL:2008 OFFSET ... FETCH syntax", `
+SELECT id, title FROM articles ORDER BY id OFFSET 1 ROWS FETCH FIRST 1 ROW ONLY`},
 		{"CREATE TEMP TABLE AS SELECT + HAVING", `
 CREATE TEMP TABLE big_spenders AS
 SELECT u.id AS user_id, u.name, SUM(o.amount) AS total

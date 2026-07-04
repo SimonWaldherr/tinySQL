@@ -70,7 +70,7 @@ func explainSelect(env ExecEnv, rows *[]Row, sel *Select, prefix string) {
 		explainFrom(env, rows, "SCAN", sel.From, prefix)
 	}
 	for _, join := range sel.Joins {
-		explainFrom(env, rows, joinOperation(join.Type), join.Right, prefix)
+		explainFrom(env, rows, join.Type.String(), join.Right, prefix)
 		if join.On != nil {
 			addExplainStep(rows, "JOIN FILTER", exprKind(join.On))
 		}
@@ -140,7 +140,7 @@ func explainFrom(env ExecEnv, rows *[]Row, op string, from FromItem, prefix stri
 
 func explainUnion(env ExecEnv, rows *[]Row, union *UnionClause) {
 	for u := union; u != nil; u = u.Next {
-		addExplainStep(rows, unionOperation(u.Type), "right input")
+		addExplainStep(rows, u.Type.String(), "right input")
 		explainSelect(env, rows, u.Right, "set ")
 	}
 }
@@ -170,30 +170,6 @@ func statementName(stmt Statement) string {
 		return "CREATE MATERIALIZED VIEW"
 	default:
 		return fmt.Sprintf("%T", stmt)
-	}
-}
-
-func joinOperation(t JoinType) string {
-	switch t {
-	case JoinLeft:
-		return "LEFT JOIN"
-	case JoinRight:
-		return "RIGHT JOIN"
-	default:
-		return "JOIN"
-	}
-}
-
-func unionOperation(t UnionType) string {
-	switch t {
-	case UnionAll:
-		return "UNION ALL"
-	case Except:
-		return "EXCEPT"
-	case Intersect:
-		return "INTERSECT"
-	default:
-		return "UNION"
 	}
 }
 

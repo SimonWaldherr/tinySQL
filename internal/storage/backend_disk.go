@@ -24,18 +24,36 @@ import (
 // DiskBackend – every table is a separate GOB file on disk
 // ───────────────────────────────────────────────────────────────────────────
 
+// diskFileFormat selects the per-table file encoding DiskBackend uses.
+type diskFileFormat int
+
+const (
+	// diskFormatGob encodes each table with encoding/gob — compact, exact
+	// round-trip of every Go type tinySQL stores (big.Rat, uuid.UUID, ...).
+	diskFormatGob diskFileFormat = iota
+	// diskFormatJSON encodes each table with encoding/json — larger and
+	// slightly lossy for exotic types (big.Rat/uuid.UUID round-trip as
+	// plain strings, see normalizeForJSON), but human-readable and easy to
+	// inspect, diff, or edit with any text tool.
+	diskFormatJSON
+)
+
 // DiskBackend stores each table as an individual file under a directory tree:
 //
-//	<dir>/<tenant>/<tablename>.tbl      (GOB-encoded diskTable)
-//	<dir>/manifest.json                 (lightweight metadata index)
+//	<dir>/<tenant>/<tablename>.tbl        (GOB-encoded diskTable, default)
+//	<dir>/<tenant>/<tablename>.json       (JSON-encoded diskTable, ModeJSON)
+//	<dir>/manifest.json                   (lightweight metadata index)
 //
 // Tables are loaded into memory on demand (via LoadTable) and written back
 // on SaveTable / Sync. This minimises RAM usage while keeping the file
-// format compatible with the existing GOB serialisation.
+// format compatible with the existing GOB serialisation (or, for ModeJSON,
+// a JSON encoding of the same diskTable structure).
 type DiskBackend struct {
-	mu   sync.RWMutex
-	dir  string
-	gzip bool
+	mu     sync.RWMutex
+	dir    string
+	gzip   bool
+	format diskFileFormat
+	mode   StorageMode
 
 	// meta tracks every known table (on disk or in memory).
 	meta map[string]map[string]*TableMeta // tenant → lower(name) → meta
@@ -53,15 +71,32 @@ type DiskBackend struct {
 	evictionCount atomic.Int64
 }
 
-// NewDiskBackend opens (or creates) a disk-backed storage directory.
-// It reads the manifest to learn which tables exist without loading them.
+// NewDiskBackend opens (or creates) a disk-backed storage directory using
+// GOB-encoded per-table files (ModeDisk).
 func NewDiskBackend(dir string, compress bool) (*DiskBackend, error) {
+	return newDiskBackend(dir, compress, diskFormatGob, ModeDisk)
+}
+
+// NewJSONBackend opens (or creates) a disk-backed storage directory using
+// JSON-encoded per-table files (ModeJSON). Functionally identical to
+// NewDiskBackend — same manifest, same lazy loading, same dirty tracking —
+// only the per-table file encoding differs. JSON files are larger than GOB
+// and big.Rat/uuid.UUID values round-trip as plain strings (see
+// normalizeForJSON), but the files can be read, diffed, or hand-edited with
+// any text tool, which GOB files cannot.
+func NewJSONBackend(dir string, compress bool) (*DiskBackend, error) {
+	return newDiskBackend(dir, compress, diskFormatJSON, ModeJSON)
+}
+
+func newDiskBackend(dir string, compress bool, format diskFileFormat, mode StorageMode) (*DiskBackend, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("disk backend: create dir: %w", err)
 	}
 	b := &DiskBackend{
 		dir:      dir,
 		gzip:     compress,
+		format:   format,
+		mode:     mode,
 		meta:     make(map[string]map[string]*TableMeta),
 		versions: make(map[string]map[string]int),
 	}
@@ -235,7 +270,7 @@ func (b *DiskBackend) Close() error {
 	return b.Sync()
 }
 
-func (b *DiskBackend) Mode() StorageMode { return ModeDisk }
+func (b *DiskBackend) Mode() StorageMode { return b.mode }
 
 func (b *DiskBackend) Stats() BackendStats {
 	b.mu.RLock()
@@ -250,7 +285,7 @@ func (b *DiskBackend) Stats() BackendStats {
 		}
 	}
 	return BackendStats{
-		Mode:          ModeDisk,
+		Mode:          b.mode,
 		TablesOnDisk:  diskTables,
 		DiskUsedBytes: diskBytes,
 		SyncCount:     b.syncCount.Load(),
@@ -399,13 +434,34 @@ func syncDir(dir string) error {
 }
 
 func (b *DiskBackend) fileExt() string {
-	if b.gzip {
-		return ".tbl.gz"
+	switch b.format {
+	case diskFormatJSON:
+		if b.gzip {
+			return ".json.gz"
+		}
+		return ".json"
+	default:
+		if b.gzip {
+			return ".tbl.gz"
+		}
+		return ".tbl"
 	}
-	return ".tbl"
 }
 
 // ──── File I/O ──────────────────────────────────────────────────────────
+
+// tableEncoder is the common interface between gob.Encoder and json.Encoder
+// that writeTableFile needs.
+type tableEncoder interface {
+	Encode(v any) error
+}
+
+func (b *DiskBackend) newEncoder(w io.Writer) tableEncoder {
+	if b.format == diskFormatJSON {
+		return json.NewEncoder(w)
+	}
+	return gob.NewEncoder(w)
+}
 
 func (b *DiskBackend) writeTableFile(path, tenant string, t *Table) (int64, error) {
 	dt := tableToDisk(tenant, t)
@@ -424,8 +480,21 @@ func (b *DiskBackend) writeTableFile(path, tenant string, t *Table) (int64, erro
 		w = gz
 	}
 
-	enc := gob.NewEncoder(w)
-	encErr := enc.Encode(dt)
+	enc := b.newEncoder(w)
+	var encErr error
+	if b.format == diskFormatJSON {
+		// JSONMarshal-equivalent normalization (big.Rat/uuid.UUID -> string)
+		// applied to Rows before encoding; Cols/Name/etc. are already
+		// JSON-safe types.
+		normalized := dt
+		normalized.Rows = make([][]any, len(dt.Rows))
+		for i, row := range dt.Rows {
+			normalized.Rows[i] = normalizeForJSON(row).([]any)
+		}
+		encErr = enc.Encode(normalized)
+	} else {
+		encErr = enc.Encode(dt)
+	}
 
 	// Close gzip layer first (flushes compressed data to bw)
 	if gz != nil {
@@ -488,10 +557,17 @@ func (b *DiskBackend) readTableFile(path string) (*Table, error) {
 	}
 
 	var dt diskTable
-	dec := gob.NewDecoder(r)
-	if err := dec.Decode(&dt); err != nil {
-		return nil, err
+	if b.format == diskFormatJSON {
+		if err := json.NewDecoder(r).Decode(&dt); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := gob.NewDecoder(r).Decode(&dt); err != nil {
+			return nil, err
+		}
 	}
+	// diskToTable normalizes vector cells regardless of source format: GOB
+	// preserves []float64 exactly, JSON decodes numeric arrays as []any.
 	return diskToTable(dt), nil
 }
 

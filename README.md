@@ -20,7 +20,6 @@ tinySQL is being developed as one compatible engine with three runtime forms:
 - **Server / Enterprise DBMS**: networked runtime for jobs, operations, security, and future HA.
 
 The existing `NewDB`, `OpenDB`, `ParseSQL`, and `Execute` APIs remain the stable low-level API. New code can opt into the additive product-form helpers: `OpenPackage`, `OpenEmbedded`, `OpenServer`, and `OpenEnterprise`. See [docs/product-forms.md](./docs/product-forms.md).
-The long-term embedded database direction is tracked in [docs/sqlite-2030-roadmap.md](./docs/sqlite-2030-roadmap.md).
 
 ## Production readiness
 
@@ -31,6 +30,9 @@ Durable product forms now expose explicit lifecycle and observability hooks:
 - Idempotent close behavior for DB, WAL, and Advanced WAL resources.
 - `RestartJobScheduler` for controlled scheduler restarts.
 - `tinysqld` health/readiness/status endpoints backed by the same DB health snapshot.
+- Atomic checkpoints: snapshots are written to a temp file, fsynced, and renamed into place, so a crash mid-checkpoint never corrupts the previous snapshot.
+- `WALConfig.CheckpointMaxBytes` / `AdvancedWALConfig.CheckpointMaxBytes` force a checkpoint once the WAL file exceeds a size (default 64 MB), bounding WAL growth independently of the existing transaction-count and time-based triggers.
+- PRIMARY KEY / UNIQUE / FOREIGN KEY constraint checks use a per-table hash index maintained incrementally on INSERT/UPDATE/DELETE, instead of scanning the whole table on every write — bulk-loading into a large constrained table is an order of magnitude faster.
 
 Example:
 
@@ -51,6 +53,73 @@ if !inst.Health().OK {
 if err := inst.Restart(); err != nil {
     log.Fatal(err)
 }
+```
+
+### Read-only mode for bulk-load / serve-only workloads
+
+If you load data on a schedule (e.g. nightly) and only serve reads in
+between, opening the database read-only avoids the WAL entirely and
+guarantees vector/FTS caches can never be invalidated by a stray write:
+
+```go
+// Load phase: in-memory, with a path so Close() writes a full GOB snapshot.
+db, _ := tsql.OpenDB(tsql.StorageConfig{Mode: tsql.ModeMemory, Path: "./data/db.gob"})
+// ... bulk INSERT/UPDATE via tsql.Execute ...
+db.Close() // writes the snapshot
+
+// Serve phase: read-only, loaded from the same snapshot.
+serveDB, _ := tsql.OpenDB(tsql.StorageConfig{Mode: tsql.ModeMemory, Path: "./data/db.gob", ReadOnly: true})
+defer serveDB.Close()
+
+// Warm vector/FTS structures once, right after opening, so the first
+// real query never pays the index-build cost:
+warmStmt, _ := tsql.ParseSQL(`SELECT * FROM VEC_WARM('docs', 'embedding', 'cosine', 'hnsw')`)
+tsql.Execute(context.Background(), serveDB, "default", warmStmt)
+```
+
+While `ReadOnly` is set, `INSERT`/`UPDATE`/`DELETE` and DDL statements are
+rejected with an error; `SELECT`, `EXPLAIN`, and `PRAGMA` are unaffected.
+Toggle it at runtime with `db.SetReadOnly(true/false)`.
+
+> **Note on `ModeWAL`/`ModeAdvancedWAL` durability:** statements run through
+> `tsql.Execute` update the in-memory catalog directly; neither WAL mode is
+> currently wired to log those mutations automatically. Durability via the
+> WAL today is a lower-level, opt-in mechanism: snapshot the DB before and
+> after a change, diff it with `storage.CollectWALChanges`, and call
+> `db.WAL().LogTransaction(changes)` yourself (see
+> `internal/storage/lifecycle_test.go` for the exact pattern) — or use
+> `ModeMemory`/`ModeDisk` with a `Path`, which do persist automatically on
+> `Sync()`/`Close()`, as in the example above.
+
+## Storage modes
+
+`StorageConfig.Mode` (or `ParseStorageMode("...")`) selects how table data is
+kept between memory and disk. All modes share the same SQL engine and
+`*DB` API — only persistence behavior differs.
+
+| Mode | String | Persistence | Notes |
+|---|---|---|---|
+| `ModeMemory` | `"memory"` | None, unless `Path` is set (GOB snapshot on `Close`) | Default; fastest |
+| `ModeWAL` | `"wal"` | RAM + write-ahead log, periodic GOB checkpoints | See the WAL durability caveat above |
+| `ModeDisk` | `"disk"` | One GOB file per table, loaded on demand | Minimizes RAM at the cost of disk I/O |
+| `ModeJSON` | `"json"` | One **JSON** file per table, loaded on demand | Same behavior as `ModeDisk`; files are human-readable/diffable/hand-editable. Larger on disk; `big.Rat`/`uuid.UUID` values round-trip as plain strings |
+| `ModeIndex` | `"index"` | Schemas in RAM, rows on disk | RAM usage scales with schema, not data size |
+| `ModeHybrid` | `"hybrid"` | LRU buffer pool, cold tables spill to disk | Bounded-memory mixed workloads |
+| `ModeAdvancedWAL` | `"advanced_wal"` | Row-level WAL with LSNs | See the WAL durability caveat above |
+
+```go
+// Human-readable per-table JSON files instead of GOB — handy for
+// debugging, version control, or interop with non-Go tooling.
+db, err := tsql.OpenDB(tsql.StorageConfig{
+    Mode: tsql.ModeJSON,
+    Path: "./data/tinysql",
+})
+```
+
+```sql
+-- Equivalent via a driver DSN
+-- file:./data/tinysql?mode=json
+-- mem://?mode=json&path=./data/tinysql
 ```
 
 ## Quick start
@@ -196,16 +265,18 @@ For a guided overview of the repository layout, see [docs/repository-structure.m
 When using the database/sql driver:
 
 - **In-memory database**: `mem://?tenant=<tenant_name>`
-- **File-based database**: `file:/path/to/db.dat?tenant=<tenant_name>&autosave=1`
+- **File-based database (GOB snapshot)**: `file:/path/to/db.dat?tenant=<tenant_name>&autosave=1`
+- **File-based database (any storage mode)**: `file:/path/to/dbdir?tenant=<tenant_name>&mode=json` (or `disk`, `hybrid`, `wal`, `advanced_wal`)
 
 Parameters:
 - `tenant` - Tenant name for multi-tenancy (required)
-- `autosave` - Auto-save to file (optional, for file-based databases)
+- `autosave` - Auto-save to file (optional, for file-based databases; ignored when `mode` selects a non-memory storage mode, which always persists via its own backend)
+- `mode` - Any `storage.StorageMode` string (see "Storage modes" above); opens via `storage.OpenDB` instead of the default GOB-snapshot behavior. Requires a `file:` DSN with a path.
 - `pool_readers` / `pool_writers` - tinySQL reader/writer pool sizes (optional)
 - `busy_timeout` - wait timeout for busy pools, e.g. `250ms`, `2s`, or `250` (milliseconds)
 
 Best-practice settings split:
-- DSN (`tenant`, `autosave`, `pool_*`, `busy_timeout`) configures tinySQL driver behavior
+- DSN (`tenant`, `autosave`, `mode`, `pool_*`, `busy_timeout`) configures tinySQL driver behavior
 - `database/sql` pool settings (`SetMaxOpenConns`, `SetMaxIdleConns`, lifetimes) configure connection pooling
 - per-request/query timeout should be passed via `context.WithTimeout(...)` to `PingContext` / `ExecContext` / `QueryContext`
 
@@ -220,9 +291,10 @@ status relative to SQLite.
 |---------|-------|
 | SELECT / INSERT / UPDATE / DELETE | Full DML, including `INSERT` / `UPDATE` / `DELETE … RETURNING` |
 | INNER / LEFT / RIGHT / FULL OUTER / CROSS JOIN | All standard join types |
-| GROUP BY, HAVING, ORDER BY, LIMIT / OFFSET | |
+| GROUP BY, HAVING, ORDER BY, LIMIT / OFFSET | `LIMIT`/`OFFSET` accept `ALL` or any constant expression (e.g. `LIMIT 2 + 3`); the SQL:2008 `OFFSET n ROWS FETCH {FIRST\|NEXT} m ROWS ONLY` form is also supported |
+| `PIVOT` | `FROM t [WHERE ...] PIVOT (agg(expr) FOR col IN (v1 [AS a1], v2 [AS a2], ...))`; single aggregate, static value list |
 | Subqueries and CTEs (`WITH`) | Including `WITH RECURSIVE` |
-| Window functions (`OVER`, `PARTITION BY`, frame specs) | ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE, LAST_VALUE, MOVING_SUM, MOVING_AVG |
+| Window functions (`OVER`, `PARTITION BY`, frame specs) | ROW_NUMBER, RANK, DENSE_RANK, PERCENT_RANK, CUME_DIST, NTILE, LAG, LEAD, FIRST_VALUE, LAST_VALUE, MOVING_SUM, MOVING_AVG |
 | Aggregates | COUNT, SUM, AVG, MIN, MAX, MIN_BY, MAX_BY, VEC_AVG, … |
 | JSON functions | `json_extract`, `json_set`, `json_array`, `json_object`, … |
 | YAML functions | `YAML_PARSE`, `YAML_GET` |
@@ -237,12 +309,12 @@ status relative to SQLite.
 | EXPLAIN | `EXPLAIN SELECT …` and `EXPLAIN CREATE MATERIALIZED VIEW …` return a compact logical plan |
 | Column constraints | Column-level `PRIMARY KEY`, `UNIQUE`, and `FOREIGN KEY REFERENCES` are enforced on INSERT/UPDATE |
 | Indexes (`CREATE INDEX`) | Metadata stored; query planner no-op |
-| **Full-Text Search (FTS)** | `CREATE VIRTUAL TABLE t USING fts(col1, col2)` with `FTS_MATCH`, `FTS_RANK`, `FTS_SNIPPET`, `BM25` |
+| **Full-Text Search (FTS)** | `CREATE VIRTUAL TABLE t USING fts(col1, col2)` with `FTS_MATCH`, `FTS_RANK`, `FTS_SNIPPET`, `BM25`; `FTS_SEARCH` TVF for cached, whole-row ranked search on any table; `ROW_TO_TEXT()` for ad-hoc whole-row substring search in `WHERE` |
 | **Triggers** | `CREATE TRIGGER … BEFORE/AFTER INSERT/UPDATE/DELETE ON table FOR EACH ROW BEGIN … END` |
 | MVCC + WAL | Snapshot isolation, crash-safe write-ahead log; the database/sql driver supports `BEGIN`, `COMMIT`, and `ROLLBACK` on a single connection |
 | Multi-tenancy | Isolated namespaces inside one process |
 | Job scheduler | `CREATE JOB` for periodic or one-shot SQL |
-| Vector search | `VEC_SEARCH` / `VEC_TOP_K` TVFs with cosine/L2/dot/manhattan; `VEC_AVG` aggregate |
+| Vector search | `VEC_SEARCH` / `VEC_TOP_K` TVFs with cosine/L2/dot/manhattan and cached `ivf`/`hnsw` indexes; `VEC_WARM` prebuilds those indexes; `VEC_AVG` aggregate |
 | RAG helpers | `RECENCY_SCORE`, `RAG_HYBRID_SCORE`, `RAG_RANK_SCORE`, `RAG_CONTEXT`, `RAG_CONTEXT_FROM` |
 | Regex functions | `REGEXP_MATCH`, `REGEXP_EXTRACT`, `REGEXP_REPLACE` |
 | Virtual system tables | `SELECT * FROM sys.tables`, `sys.columns`, `sys.triggers`, … |
@@ -417,6 +489,38 @@ ORDER BY score DESC;
 SELECT FTS_SNIPPET(body, 'tinySQL') AS excerpt FROM docs;
 ```
 
+`FTS_SEARCH(table, query, k [, column, ...])` runs a ranked search directly
+against any regular table — no `CREATE VIRTUAL TABLE` required. With no
+column arguments it searches **every column of the row**, not just text
+ones (a numeric order ID or status code is searchable too); pass explicit
+column names to restrict the search. Repeated calls against an unchanged
+table reuse a per-table tokenization cache (invalidated automatically on
+INSERT/UPDATE/DELETE), so it's cheap to call from something like a live
+search box that re-queries per keystroke:
+
+```sql
+CREATE TABLE articles (id INT, title TEXT, body TEXT);
+INSERT INTO articles VALUES (1, 'Go Programming', 'Go is a fast compiled language');
+INSERT INTO articles VALUES (2, 'Python Tutorial', 'Python is dynamic and popular');
+
+-- Whole-row search, BM25-ranked, top 2
+SELECT id, title, _fts_score, _fts_rank
+FROM FTS_SEARCH('articles', 'programming language', 2)
+ORDER BY _fts_rank;
+
+-- Restrict to specific columns
+SELECT id FROM FTS_SEARCH('articles', 'dynamic', 5, 'body');
+```
+
+For ad-hoc substring search across a whole row inside an ordinary `WHERE`
+clause — no ranking, no setup, combinable with other conditions —
+`ROW_TO_TEXT()` concatenates every column of the current row:
+
+```sql
+SELECT * FROM orders
+WHERE ROW_TO_TEXT() LIKE '%acme corp%' AND status = 'open';
+```
+
 ### Trigger quick start
 
 ```sql
@@ -432,6 +536,47 @@ END;
 
 INSERT INTO orders VALUES (1, 99.99, 'new');
 SELECT * FROM audit_log;
+```
+
+### PIVOT quick start
+
+`PIVOT` spreads the distinct values of one column into new output columns,
+aggregating another column into each. Every other selected column becomes
+an implicit `GROUP BY` key — you don't write `GROUP BY` yourself.
+
+```sql
+CREATE TABLE sales (region TEXT, category TEXT, amount INT);
+INSERT INTO sales VALUES ('East', 'Electronics', 100);
+INSERT INTO sales VALUES ('East', 'Furniture', 50);
+INSERT INTO sales VALUES ('West', 'Electronics', 200);
+INSERT INTO sales VALUES ('West', 'Furniture', 75);
+
+-- One row per region, one column per category
+SELECT *
+FROM sales
+PIVOT (SUM(amount) FOR category IN ('Electronics' AS electronics, 'Furniture' AS furniture));
+
+-- WHERE filters the source rows before pivoting
+SELECT *
+FROM sales
+WHERE amount >= 100
+PIVOT (SUM(amount) FOR category IN ('Electronics' AS electronics));
+```
+
+Scope: one aggregate function and a static (literal) `IN (...)` list — no
+dynamic pivot driven by a subquery, and no combining with an explicit
+`GROUP BY` on the same query.
+
+**Gotcha:** *every* source column other than the pivot column and the
+aggregated value column becomes an implicit `GROUP BY` key — including a
+primary key or other per-row-unique column, if the source table has one.
+`SELECT *` won't hide it: grouping happens on the underlying row set before
+the outer `SELECT` list is applied. If your table has an `id` column,
+project it out via a subquery before pivoting:
+
+```sql
+SELECT * FROM (SELECT region, category, amount FROM sales) AS s
+PIVOT (SUM(amount) FOR category IN ('Electronics' AS electronics));
 ```
 
 ### Vectors
@@ -458,6 +603,17 @@ ORDER BY _vec_rank;
 
 -- Compute centroid of a cluster
 SELECT VEC_AVG(vec) AS centroid FROM embeddings WHERE label = 'science';
+```
+
+`ivf`/`hnsw` indexes are built lazily on first use per (table, column,
+metric) and cached until the table's version changes. For a bulk-load-then-serve
+workload, call `VEC_WARM` right after loading to pay that build cost once,
+up front, instead of on whichever query happens to run first:
+
+```sql
+-- Prebuild the HNSW index and column cache for cosine search; returns one
+-- row with row_count, vector_count, dims for confirmation.
+SELECT * FROM VEC_WARM('embeddings', 'vec', 'cosine', 'hnsw');
 ```
 
 ### RAG retrieval with recency
