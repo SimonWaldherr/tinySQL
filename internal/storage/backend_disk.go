@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"encoding/gob"
 	"encoding/json"
@@ -55,6 +56,11 @@ type DiskBackend struct {
 	format diskFileFormat
 	mode   StorageMode
 
+	// encryptor, if non-nil, wraps every table file's encoded (and
+	// optionally gzipped) bytes in AES-256-GCM before it's written to
+	// disk, and unwraps on read. See SetEncryptor.
+	encryptor *Encryptor
+
 	// meta tracks every known table (on disk or in memory).
 	meta map[string]map[string]*TableMeta // tenant → lower(name) → meta
 
@@ -107,6 +113,20 @@ func newDiskBackend(dir string, compress bool, format diskFileFormat, mode Stora
 		}
 	}
 	return b, nil
+}
+
+// SetEncryptor enables (or, passing nil, disables) AES-256-GCM encryption
+// at rest for every table file this backend writes from this point on.
+// Existing files already on disk are re-encrypted (or decrypted) lazily,
+// the next time each is saved — SetEncryptor doesn't rewrite files that
+// aren't touched again, so a backend directory can end up with a mix of
+// encrypted and unencrypted files if the encryptor is changed mid-lifetime.
+// For a clean transition, set the encryptor once at open time (see
+// StorageConfig.EncryptionKey) rather than toggling it on a live backend.
+func (b *DiskBackend) SetEncryptor(enc *Encryptor) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.encryptor = enc
 }
 
 // ──── StorageBackend interface ────────────────────────────────────────────
@@ -472,6 +492,44 @@ func (b *DiskBackend) writeTableFile(path, tenant string, t *Table) (int64, erro
 		return 0, err
 	}
 
+	// Encryption needs the complete ciphertext (GCM authenticates the
+	// whole message at once, it isn't a true streaming cipher the way
+	// gzip/GOB are), so when an encryptor is configured, encode+gzip into
+	// an in-memory buffer first, encrypt that buffer's bytes as one blob,
+	// and write the result in a single Write call — instead of the
+	// unencrypted path's direct stream to the file below. Table files are
+	// bounded in size for this engine's use case, so buffering one file's
+	// contents in memory is an acceptable trade for correct AEAD usage.
+	if b.encryptor != nil {
+		var buf bytes.Buffer
+		if err := b.encodeTableInto(&buf, dt); err != nil {
+			f.Close()
+			_ = os.Remove(tmp)
+			return 0, err
+		}
+		ciphertext, err := b.encryptor.Encrypt(buf.Bytes())
+		if err != nil {
+			f.Close()
+			_ = os.Remove(tmp)
+			return 0, fmt.Errorf("encrypt table file: %w", err)
+		}
+		if _, err := f.Write(ciphertext); err != nil {
+			f.Close()
+			_ = os.Remove(tmp)
+			return 0, err
+		}
+		if err := f.Sync(); err != nil {
+			f.Close()
+			_ = os.Remove(tmp)
+			return 0, err
+		}
+		if err := f.Close(); err != nil {
+			_ = os.Remove(tmp)
+			return 0, err
+		}
+		return b.finishTableFileWrite(tmp, path)
+	}
+
 	bw := bufio.NewWriterSize(f, 64*1024)
 	var w io.Writer = bw
 	var gz *gzip.Writer
@@ -518,7 +576,46 @@ func (b *DiskBackend) writeTableFile(path, tenant string, t *Table) (int64, erro
 		return 0, encErr
 	}
 
-	// Atomic rename for crash safety
+	return b.finishTableFileWrite(tmp, path)
+}
+
+// encodeTableInto GOB- or JSON-encodes dt (gzip-compressed if b.gzip) into
+// w, applying the same JSON normalization writeTableFile's unencrypted
+// path does. Shared by the encrypted write path above, which needs the
+// fully encoded bytes in memory before encryption rather than streamed
+// straight to a file.
+func (b *DiskBackend) encodeTableInto(w io.Writer, dt diskTable) error {
+	var gz *gzip.Writer
+	target := w
+	if b.gzip {
+		gz = gzip.NewWriter(w)
+		target = gz
+	}
+	enc := b.newEncoder(target)
+	var err error
+	if b.format == diskFormatJSON {
+		normalized := dt
+		normalized.Rows = make([][]any, len(dt.Rows))
+		for i, row := range dt.Rows {
+			normalized.Rows[i] = normalizeForJSON(row).([]any)
+		}
+		err = enc.Encode(normalized)
+	} else {
+		err = enc.Encode(dt)
+	}
+	if gz != nil {
+		if closeErr := gz.Close(); err == nil {
+			err = closeErr
+		}
+	}
+	return err
+}
+
+// finishTableFileWrite atomically installs tmp as path (rename + directory
+// fsync for crash safety) and returns the final file's size. Shared by both
+// the encrypted and unencrypted write paths above once their bytes are
+// already durably on disk under the temp name.
+func (b *DiskBackend) finishTableFileWrite(tmp, path string) (int64, error) {
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return 0, err
@@ -526,7 +623,6 @@ func (b *DiskBackend) writeTableFile(path, tenant string, t *Table) (int64, erro
 	if err := syncDir(filepath.Dir(path)); err != nil {
 		return 0, err
 	}
-
 	info, err := os.Stat(path)
 	if err != nil {
 		return 0, err
@@ -540,19 +636,43 @@ func init() {
 }
 
 func (b *DiskBackend) readTableFile(path string) (*Table, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
+	var r io.Reader
+	var closers []io.Closer
+	defer func() {
+		for i := len(closers) - 1; i >= 0; i-- {
+			closers[i].Close()
+		}
+	}()
 
-	var r io.Reader = bufio.NewReaderSize(f, 64*1024)
+	if b.encryptor != nil {
+		// GCM authenticates the whole ciphertext as one unit, so the file
+		// must be read in full before any of it can be decrypted — no
+		// streaming decrypt-as-you-go the way the unencrypted path streams
+		// decompression.
+		ciphertext, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		plaintext, err := b.encryptor.Decrypt(ciphertext)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt table file %s: %w", path, err)
+		}
+		r = bytes.NewReader(plaintext)
+	} else {
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		closers = append(closers, f)
+		r = bufio.NewReaderSize(f, 64*1024)
+	}
+
 	if strings.HasSuffix(strings.ToLower(path), ".gz") {
 		gr, err := gzip.NewReader(r)
 		if err != nil {
 			return nil, err
 		}
-		defer gr.Close()
+		closers = append(closers, gr)
 		r = gr
 	}
 

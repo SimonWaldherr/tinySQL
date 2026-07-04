@@ -206,6 +206,50 @@ const (
 )
 
 // ============================================================================
+// Audit Log - tamper-evident, hash-chained record of every executed statement
+// ============================================================================
+
+// AuditLog is an append-only, hash-chained log of statement executions. See
+// OpenAuditLog/NewAuditLog and DB.AttachAuditLog.
+type AuditLog = storage.AuditLog
+
+// AuditEntry is one recorded statement execution, including the hash chain
+// fields (PrevHash/Hash) that make tampering detectable via AuditLog.Verify.
+type AuditEntry = storage.AuditEntry
+
+// NewAuditLog creates an in-memory-only audit log (not persisted to disk).
+func NewAuditLog() *AuditLog {
+	return storage.NewAuditLog()
+}
+
+// OpenAuditLog opens (creating if needed) a file-backed, append-only audit
+// log at path. If the file already contains entries, they're replayed and
+// the hash chain is verified as part of opening — a tampered or corrupted
+// existing log is rejected immediately rather than silently trusted.
+//
+// Example:
+//
+//	auditLog, err := tinysql.OpenAuditLog("data/audit.jsonl")
+//	if err != nil {
+//	    log.Fatal(err) // includes "tampered with" detail if verification failed
+//	}
+//	defer auditLog.Close()
+//	db.AttachAuditLog(auditLog)
+//	...
+//	ctx = tinysql.WithAuditText(tinysql.WithUser(ctx, "alice"), sqlText)
+//	tinysql.Execute(ctx, db, "default", stmt)
+func OpenAuditLog(path string) (*AuditLog, error) {
+	return storage.OpenAuditLog(path)
+}
+
+// WithAuditText attaches the original SQL text of the statement about to
+// run to ctx, so an attached audit log records the real query instead of a
+// best-effort statement-type fallback. See OpenAuditLog's example.
+func WithAuditText(ctx context.Context, sqlText string) context.Context {
+	return engine.WithAuditText(ctx, sqlText)
+}
+
+// ============================================================================
 // Storage Modes - Pluggable persistence strategies
 // ============================================================================
 
@@ -222,6 +266,53 @@ type StorageBackend = storage.StorageBackend
 
 // BackendStats provides observability into storage backend behaviour.
 type BackendStats = storage.BackendStats
+
+// ============================================================================
+// Encryption at rest - AES-256-GCM for ModeDisk/ModeJSON table files
+// ============================================================================
+
+// EncryptionKeySize is the required key length, in bytes, for
+// StorageConfig.EncryptionKey and NewEncryptor (AES-256).
+const EncryptionKeySize = storage.EncryptionKeySize
+
+// EncryptionSaltSize is the recommended salt length, in bytes, for
+// DeriveKeyFromPassphrase.
+const EncryptionSaltSize = storage.EncryptionSaltSize
+
+// Encryptor performs authenticated AES-256-GCM encryption/decryption.
+// StorageConfig.EncryptionKey is the usual way to enable it for ModeDisk/
+// ModeJSON; construct one directly only if you need to encrypt/decrypt
+// something outside the storage backend's own file I/O.
+type Encryptor = storage.Encryptor
+
+// NewEncryptor creates an Encryptor from an EncryptionKeySize-byte key.
+func NewEncryptor(key []byte) (*Encryptor, error) {
+	return storage.NewEncryptor(key)
+}
+
+// DeriveKeyFromPassphrase derives an AES-256 key from a human-chosen
+// passphrase using Argon2id (memory-hard, resists large-scale offline
+// guessing better than a plain PBKDF2/SHA hash). salt must be a fixed,
+// persisted value (see NewEncryptionSalt) — the same passphrase and salt
+// always derive the same key, but a different salt derives a different
+// key from the same passphrase.
+//
+// Example:
+//
+//	salt, _ := tinysql.NewEncryptionSalt()   // generate once, persist it yourself
+//	key := tinysql.DeriveKeyFromPassphrase("correct horse battery staple", salt)
+//	db, err := tinysql.OpenDB(tinysql.StorageConfig{
+//	    Mode: tinysql.ModeDisk, Path: "./data", EncryptionKey: key,
+//	})
+func DeriveKeyFromPassphrase(passphrase string, salt []byte) []byte {
+	return storage.DeriveKeyFromPassphrase(passphrase, salt)
+}
+
+// NewEncryptionSalt returns a fresh, cryptographically random salt for
+// DeriveKeyFromPassphrase.
+func NewEncryptionSalt() ([]byte, error) {
+	return storage.NewEncryptionSalt()
+}
 
 // Storage mode constants.
 const (
