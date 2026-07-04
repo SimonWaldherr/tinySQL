@@ -33,7 +33,7 @@ func TestRankWithTies(t *testing.T) {
 	rs := execSQL(t, db, `SELECT name, score, RANK() OVER (ORDER BY score DESC) AS r FROM scores ORDER BY score DESC, name`)
 	want := map[string]int{
 		"Alice": 1, "Ben": 1, // tied for 1st
-		"Cara": 3, // skips to 3rd (rank isn't dense)
+		"Cara": 3,           // skips to 3rd (rank isn't dense)
 		"Dan":  4, "Eve": 4, // tied for 4th
 		"Fay": 6, // skips to 6th
 	}
