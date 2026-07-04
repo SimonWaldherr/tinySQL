@@ -122,6 +122,9 @@ type ExecEnv struct {
 // unrelated table B — but it is correct and simple to audit, which matters
 // more for a safety fix than maximum parallelism.
 func Execute(ctx context.Context, db *storage.DB, tenant string, stmt Statement) (rs *ResultSet, err error) {
+	if err := checkPermission(ctx, db, stmt); err != nil {
+		return nil, err
+	}
 	if isReadOnlyStatement(stmt) {
 		db.LockContentForRead()
 		defer db.UnlockContentForRead()
