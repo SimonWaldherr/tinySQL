@@ -204,7 +204,14 @@ func (bp *BufferPool) Put(tenant, name string, table *Table) error {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 
-	// Check memory limit
+	// Check memory limit. EvictionThreshold (a fraction like 0.9, not 1.0)
+	// triggers eviction before the pool is completely full, leaving
+	// headroom rather than evicting reactively only once MaxMemoryBytes is
+	// already exceeded. evictLRU is asked to free exactly tableSize —
+	// enough room for this one Put, not to drive memory back down below
+	// threshold as a whole — so a Put right at the edge may trigger
+	// eviction again on the very next call; that's an intentional
+	// trade-off favoring simplicity over minimizing eviction churn.
 	if bp.policy.MaxMemoryBytes > 0 && !pinned {
 		currentMem := bp.currentMemory.Load()
 		newTotal := currentMem + tableSize
@@ -327,7 +334,10 @@ func (bp *BufferPool) Remove(tenant, name string) {
 	bp.updateStats()
 }
 
-// evictLRU evicts least recently used tables to free up space.
+// evictLRU evicts least recently used tables to free up space. Bounded by
+// two independent limits — freed >= needed (enough memory reclaimed) or
+// evicted == EvictionBatchSize (don't stall a single Put call evicting
+// unboundedly) — whichever comes first.
 func (bp *BufferPool) evictLRU(needed int64) {
 	freed := int64(0)
 	evicted := 0
@@ -338,7 +348,16 @@ func (bp *BufferPool) evictLRU(needed int64) {
 			break // No more tables to evict
 		}
 
-		// Don't evict pinned tables
+		// RemoveLRU already popped this node out of LRU tracking entirely
+		// (it's not re-inserted below). For a pinned table that's the
+		// desired end state — pinned tables are permanently exempt from
+		// eviction, so dropping them from LRU bookkeeping for good is
+		// correct, not a leak: they simply stop being eviction candidates
+		// from this point on while remaining in bp.cache untouched. This
+		// does mean a run of many pinned tables reaching the LRU tail can
+		// burn through EvictionBatchSize without freeing any memory, but
+		// the loop still terminates (lru.size strictly decreases each
+		// iteration via RemoveLRU, so key == "" is reached eventually).
 		if cached.Pinned {
 			continue
 		}

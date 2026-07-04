@@ -284,63 +284,21 @@ func (bt *BTree) insertIntoParent(txID TxID, path []PageID, leftID PageID, key [
 		bt.pager.UnpinPage(parentID)
 		return bt.splitInternal(txID, path, leftID, key, rightID)
 	}
-	// The right child becomes the new child for the next separator (or RightChild).
-	// We need to update pointers: after inserting, the right child pointer
-	// for the newly inserted key should point to rightID.
-	// Internal page layout: entry[i].childID points left of entry[i].key.
-	// We set RightChild or the next entry's child based on position.
-	// Actually, the entry's ChildID is the left pointer. The right pointer
-	// is the ChildID of the next entry, or RightChild if it's the last.
-	// Since our key goes between leftID and rightID, and we store leftID
-	// in the entry, rightID needs to be stored either as the next entry's
-	// child or as RightChild. Let's update RightChild if this new entry is last.
+	// Internal page invariant: for sorted entries e[0..n-1] plus RightChild,
+	// e[i].ChildID is the subtree strictly left of e[i].Key, and the subtree
+	// strictly right of e[i].Key is e[i+1].ChildID (or RightChild if e[i] is
+	// last). leftID/rightID are the two halves of a child page that just
+	// split, so together they replace one old child pointer at this level:
+	// leftID takes over the "left of key" role (already set by
+	// InsertInternalEntry above), and the position immediately right of the
+	// new key — e[i+1].ChildID, or RightChild if key ended up last — must
+	// become rightID, overwriting whatever pointer used to sit there.
 	sc := bp.slotCount()
-	// Find where our key ended up.
 	for i := 0; i < sc; i++ {
 		e := bp.GetInternalEntry(i)
 		if bytes.Equal(e.Key, key) {
-			// entry[i].childID = leftID ✓
-			// The pointer after key is:
 			if i+1 < sc {
-				// entry[i+1].childID should already be correct
-				// unless it was the old "rightChild" that got pushed.
-				// We need to ensure rightID is reachable.
-				// For internal pages, between key[i] and key[i+1], the child
-				// is entry[i+1].childID. So we need entry[i+1].childID = rightID?
-				// No: entry[i+1].childID = pointer left of key[i+1].
-				// If the old layout was: ... | leftID | oldKey | ... | RightChild
-				// And we inserted key between leftID and the next, rightID should be
-				// the next entry's child. But the old next entry still points to old child.
-				// Actually, for a simple B+Tree internal split propagation:
-				// We just need to make sure that after key, the traversal goes to rightID.
-				// The simplest correct approach: set entry at position i to have child=leftID,
-				// and update the next entry's child or RightChild to rightID.
 				next := bp.GetInternalEntry(i + 1)
-				// Save old child of next entry — it's still needed.
-				oldChild := next.ChildID
-				_ = oldChild
-				// Actually — in a standard B+Tree, when we push up a separator:
-				// old internal page: ... child0 | sep0 | child1 | sep1 | ... | RightChild
-				// After split of child_x into leftID/rightID:
-				// ... | leftID | key | rightID | ...
-				// So we just replace: the child pointer that used to point to child_x
-				// is now leftID, and rightID goes right of key.
-				//
-				// Since InsertInternalEntry put leftID as the key's left child and the
-				// existing entries' children remain unchanged, we need to find the old
-				// reference to the unsplit child and ensure rightID replaces it properly.
-				//
-				// Simplification: we put the entry with childID=leftID at pos i.
-				// The right pointer of key is the childID of entry[i+1] or RightChild.
-				// Before the insert, entry[i+1].childID was some other child — it should
-				// now become rightID, and the old child should shift forward.
-				// This is getting complex. Let's use a cleaner approach: rebuild entries.
-
-				// For correctness in V1: just set the child pointer after key to rightID.
-				// We do this by setting entry[i+1]'s child to rightID if i+1 < sc.
-				// But we need to preserve the old entry[i+1].key. The old child at [i+1]
-				// was correct for between key[i+1-1] and key[i+1] — but now key[i] is our
-				// new separator. So entry[i+1].childID = rightID is correct.
 				next.ChildID = rightID
 				rec := marshalInternalRecord(next)
 				bp.setSlotEntry(i+1, SlotEntry{})
@@ -362,6 +320,13 @@ func (bt *BTree) insertIntoParent(txID TxID, path []PageID, leftID PageID, key [
 	return bt.pager.WritePage(txID, parentID, buf)
 }
 
+// splitInternal handles inserting a new separator into an internal page
+// that has no room for it (insertIntoParent's InsertInternalEntry call
+// already failed once by the time this runs). It merges the existing
+// entries with the new one in sorted order, splits the merged list at its
+// midpoint into a reused left page (parentID) and a freshly allocated right
+// page, and pushes the middle key one level up via a recursive
+// insertIntoParent call — the standard B+tree internal-split algorithm.
 func (bt *BTree) splitInternal(txID TxID, path []PageID, leftChildID PageID, key []byte, rightChildID PageID) error {
 	parentID := path[len(path)-1]
 	buf, err := bt.pager.ReadPage(parentID)
@@ -404,12 +369,20 @@ func (bt *BTree) splitInternal(txID TxID, path []PageID, leftChildID PageID, key
 			return fmt.Errorf("split internal left: %w", err)
 		}
 	}
-	// The left internal's right child is the midChild's child.
-	// Depending on where the insert happened, we need to handle rightChildID.
-	// When the new entry's position was before mid:
-	//   merged[mid].ChildID might be rightChildID or some old child.
-	// For correctness: after inserting the new separator, the pointer right of key
-	// should be rightChildID. Let's find where key landed:
+	// Exactly one of three cases determines where rightChildID (the new
+	// right half from the child split) ends up, based on where the new
+	// separator key landed relative to the split point mid:
+	//   1. key == pushUpKey: key itself became the separator pushed up to
+	//      the grandparent, so leftChildID becomes the left page's
+	//      RightChild, and rightChildID becomes the right page's first
+	//      entry's ChildID (both "sides" of the pushed-up key).
+	//   2. key landed in leftEntries: the left page's RightChild — which
+	//      would otherwise be midChildRight, the old pointer at the split
+	//      boundary — is redirected to rightChildID, since rightChildID is
+	//      now the correct pointer immediately right of key.
+	//   3. key landed in rightEntries: same "right of key" fixup as
+	//      insertIntoParent above, just applied to the newly-allocated
+	//      right internal page instead of an existing one.
 	foundInLeft := false
 	for _, e := range leftEntries {
 		if bytes.Equal(e.Key, key) {
@@ -585,6 +558,15 @@ func (bt *BTree) ScanRange(startKey, endKey []byte, fn func(key, value []byte) b
 
 // ── Overflow chain I/O ───────────────────────────────────────────────────
 
+// writeOverflow splits data into page-sized chunks and chains them into a
+// singly-linked list of overflow pages (for values too large to fit inline
+// in a leaf record), returning the head page ID. Each page's NextOverflow
+// pointer must reference the *next* page's ID, which isn't known until that
+// next page is allocated — so the loop lags one page behind: it allocates
+// page N, then (on the following iteration, once page N+1 exists) sets page
+// N's NextOverflow to N+1's ID and writes page N to disk. prevBuf/prevID
+// hold that one-page-behind state. The final page has no successor, so it's
+// written once after the loop exits instead of inside it.
 func (bt *BTree) writeOverflow(txID TxID, data []byte) (PageID, error) {
 	cap := OverflowCapacity(bt.pager.pageSize)
 	var headID PageID
@@ -620,7 +602,8 @@ func (bt *BTree) writeOverflow(txID TxID, data []byte) (PageID, error) {
 		prevID = pid
 	}
 
-	// Write last page.
+	// The last page in the chain was never written above (its NextOverflow
+	// is left at the zero value, InvalidPageID, correctly marking chain end).
 	if prevBuf != nil {
 		SetPageCRC(prevBuf)
 		if err := bt.pager.WritePage(txID, prevID, prevBuf); err != nil {

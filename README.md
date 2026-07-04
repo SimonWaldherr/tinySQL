@@ -272,7 +272,15 @@ For a guided overview of the repository layout, see [docs/repository-structure.m
 
 - Lightweight, educational SQL engine in pure Go
 - Useful for embeddings, demos, and learning database internals
-- Not intended as a production-grade relational database
+- Hardened enough for real embedded/single-process use (see "Production
+  readiness" above: a content lock closing a real concurrency data race,
+  automatic WAL durability under `ModeAdvancedWAL`, foreign key referential
+  actions, panic recovery, parser depth limits) — but **not** a drop-in
+  replacement for a multi-node, horizontally-scaled RDBMS like PostgreSQL or
+  MySQL: there's no replication, no distributed transactions, and
+  correctness-critical gaps remain (see "Limitations" and "Not yet
+  implemented" below) that a team should evaluate before betting a business
+  on it
 
 ## Requirements
 
@@ -777,10 +785,20 @@ go test ./internal/engine -run '^$' -bench 'Benchmark(WhereVectorAndSimpleCondit
 For SIMD vector math and ANN index-mode comparisons:
 
 ```bash
-go test ./internal/engine -run '^$' -bench 'BenchmarkVector(Dot768|DotUnrolled768|L2Squared768|L2SquaredUnrolled768)|BenchmarkVecSearchIndexModesSameTable' -benchmem -count=3
+go test ./internal/engine -run '^$' -bench 'BenchmarkVector(Dot768|DotUnrolled768|L2Squared768|L2SquaredUnrolled768|L1Distance768|L1DistanceUnrolled768)|BenchmarkVecSearchIndexModesSameTable' -benchmem -count=3
 ```
 
 GitHub Actions also runs `Vector SIMD (linux/amd64)` on an Ubuntu x86_64 runner with `GOARCH=amd64` and `GOAMD64=v1`, and uploads the benchmark output as the `vector-amd64-bench` artifact.
+
+**SIMD kernel coverage** (`internal/engine/vector_math_*.{go,s}`), used automatically by `VEC_DOT`/`VEC_COSINE_*`, `VEC_L2_DISTANCE`/`VEC_SEARCH`, and `VEC_MANHATTAN_DISTANCE`/`VEC_DISTANCE(...,'manhattan')` above a 128-element threshold (smaller vectors use the portable 4-way-unrolled Go path, where SIMD call/setup overhead isn't worth it):
+
+| Metric | amd64 (SSE2) | arm64 (NEON) | Fallback |
+|---|---|---|---|
+| Dot product | ✅ `vectorDotSSE2` | ✅ `vectorDotNEON` | 4-way unrolled Go |
+| L2 squared distance | ✅ `vectorL2SquaredSSE2` | ✅ `vectorL2SquaredNEON` | 4-way unrolled Go |
+| Manhattan (L1) distance | ✅ `vectorL1SSE2` (~4.5x over the unrolled fallback at 768 dims) | Not yet — see note below | 4-way unrolled Go |
+
+The arm64 L1 kernel is intentionally left unimplemented rather than shipped unverified: a hand-derived NEON float-abs encoding can't be validated for correctness without running it on real ARM64 hardware, and a wrong bit pattern would silently corrupt distance results rather than fail to build. Contributions with ARM64 hardware to test on are welcome — see `vectorL1Kernel` in `vector_math_arm64.go`.
 
 ### Not yet implemented
 
@@ -800,7 +818,43 @@ GitHub Actions also runs `Vector SIMD (linux/amd64)` on an Ubuntu x86_64 runner 
 
 ## Limitations
 
-TinySQL is designed for educational purposes
+TinySQL is designed primarily for education, embedding, and single-process
+workloads. Known, current limitations (as opposed to planned features — see
+"Not yet implemented" above):
+
+- **No true statement-level rollback in `Execute`.** If a multi-row
+  INSERT/UPDATE/DELETE fails partway through (e.g. a later row violates a
+  constraint), rows already applied earlier in that same statement stay
+  applied — there's no automatic all-or-nothing undo. Real atomicity across
+  multiple statements is only available via `internal/driver`'s
+  `BeginTx`/`Commit`/`Rollback`, which clones an MVCC snapshot rather than
+  mutating live state until commit.
+- **No composite (multi-column) `PRIMARY KEY`/`FOREIGN KEY`.** Only a single
+  local column can participate in either constraint; see "Foreign key quick
+  start" above and "Not yet implemented".
+- **No `CHECK` constraints or `UPSERT`/`ON CONFLICT`.**
+- **`CREATE INDEX` is metadata-only.** It's parsed and stored but the query
+  planner never uses it — every `WHERE`/`JOIN` lookup is a full table scan
+  regardless of declared indexes.
+- **WAL durability differs by mode.** `ModeAdvancedWAL` logs every
+  INSERT/UPDATE/DELETE automatically; the older `ModeWAL` still requires the
+  caller to snapshot-diff and log manually. See the WAL durability note
+  under "Production readiness".
+- **Single-process only.** No built-in replication, clustering, or sharding;
+  concurrent access is one `*storage.DB` shared across goroutines in the
+  same process, not across machines.
+- **The engine's concurrency lock is coarse, not per-table.** A write to one
+  table blocks concurrent reads/writes on every other table in the same
+  `DB`, trading some parallelism for a simple, easy-to-audit correctness
+  guarantee (see "Production readiness").
+- **No SAVEPOINT / nested transactions.**
+- **`cmd/server` ships with authentication off by default.** See the
+  "Security checklist" above — this is a deliberate opt-in design, not a
+  bug, but it means an unconfigured server run beyond localhost is an open
+  SQL endpoint.
+- **No NEON kernel for Manhattan/L1 vector distance on arm64** (Dot and L2
+  have one); it uses the portable unrolled Go path there. See "SIMD kernel
+  coverage" under Vectors.
 
 ## Testing
 

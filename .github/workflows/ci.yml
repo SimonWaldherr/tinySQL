@@ -111,7 +111,7 @@ jobs:
           set -o pipefail
           go test ./internal/engine \
             -run '^$' \
-            -bench 'BenchmarkVector(Dot768|DotUnrolled768|L2Squared768|L2SquaredUnrolled768)|BenchmarkVecSearchIndexModesSameTable' \
+            -bench 'BenchmarkVector(Dot768|DotUnrolled768|L2Squared768|L2SquaredUnrolled768|L1Distance768|L1DistanceUnrolled768)|BenchmarkVecSearchIndexModesSameTable' \
             -benchmem \
             -benchtime=500ms \
             -count=3 | tee vector-amd64-bench.txt

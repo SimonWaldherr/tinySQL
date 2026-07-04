@@ -164,6 +164,10 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 		return idx, nil
 	}
 
+	// Seed centroids by taking nlist rows spread evenly across the (already
+	// arbitrary-ordered) row set, rather than the first nlist rows — cheap
+	// and avoids every centroid starting near-identical if the table happens
+	// to be sorted or clustered by insertion order.
 	idx.centroids = make([][]float64, nlist)
 	for i := range idx.centroids {
 		src := cache.vectors[rows[(i*len(rows))/nlist]]
@@ -197,6 +201,13 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 			}
 		}
 		for c := range idx.centroids {
+			// A centroid can end up with zero assigned rows this iteration
+			// (every row happened to be closer to some other centroid) —
+			// a normal k-means edge case, more likely with unlucky seeding
+			// or nlist close to the number of distinct clusters actually
+			// present. Leave it at its previous position rather than
+			// dividing by zero; it may pick up members in a later
+			// iteration as other centroids move, or simply stay unused.
 			if counts[c] == 0 {
 				continue
 			}

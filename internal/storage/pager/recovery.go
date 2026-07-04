@@ -91,6 +91,12 @@ func (p *Pager) recoverFlushSuperblock(txMap map[TxID]*recoverTxEntry, maxLSN LS
 		return err
 	}
 
+	// NextTxID/NextPageID store the next ID to hand out, not the last one
+	// used — hence the +1 below. maxTxID/rec.PageID are the highest IDs
+	// actually observed in the replayed WAL, so the superblock's allocator
+	// state must be bumped past them or a fresh transaction/page allocation
+	// after recovery could collide with (and silently overwrite) one that
+	// was just replayed.
 	p.sb.CheckpointLSN = maxLSN
 	if TxID(maxTxID+1) > p.sb.NextTxID {
 		p.sb.NextTxID = TxID(maxTxID + 1)
