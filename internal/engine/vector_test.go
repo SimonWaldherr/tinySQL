@@ -210,6 +210,42 @@ func TestVecL2SquaredLargeVectorKernel(t *testing.T) {
 	expectFloat(t, vectorL2Squared(a, b), want, 1e-9, "large vector l2 kernel")
 }
 
+// TestVecL1LargeVectorKernel exercises vectorL1Distance above the SIMD
+// threshold (128 elements) so it actually dispatches to vectorL1Kernel
+// (SSE2 on amd64) rather than the portable unrolled fallback, checked
+// against a plain, unoptimized reference sum computed independently here.
+func TestVecL1LargeVectorKernel(t *testing.T) {
+	a := make([]float64, 257)
+	b := make([]float64, 257)
+	var want float64
+	for i := range a {
+		a[i] = math.Sin(float64(i)*0.17) * 0.75
+		b[i] = math.Cos(float64(i)*0.05) * 0.5
+		want += math.Abs(a[i] - b[i])
+	}
+	expectFloat(t, vectorL1Distance(a, b), want, 1e-9, "large vector l1 kernel")
+}
+
+// TestVecL1KernelMatchesUnrolledAcrossSizes checks the SIMD kernel and the
+// portable unrolled fallback agree across sizes that straddle the SIMD
+// threshold (128) and the assembly's own inner-loop width (8) and tail
+// handling, including sizes with no full 8-wide iteration at all.
+func TestVecL1KernelMatchesUnrolledAcrossSizes(t *testing.T) {
+	for _, n := range []int{0, 1, 3, 7, 8, 9, 15, 16, 17, 127, 128, 129, 255, 256, 300} {
+		a := make([]float64, n)
+		b := make([]float64, n)
+		for i := range a {
+			a[i] = math.Sin(float64(i)*0.31) * 2.0
+			b[i] = math.Cos(float64(i)*0.19) * 1.5
+		}
+		got := vectorL1Distance(a, b)
+		want := vectorL1Unrolled(a, b)
+		if math.Abs(got-want) > 1e-9 {
+			t.Errorf("n=%d: kernel=%v unrolled=%v (diff %v)", n, got, want, got-want)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // VEC_COSINE_SIMILARITY / VEC_COSINE_DISTANCE
 // ---------------------------------------------------------------------------

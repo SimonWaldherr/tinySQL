@@ -59,6 +59,24 @@ func BenchmarkVectorL2SquaredUnrolled768(b *testing.B) {
 	}
 }
 
+func BenchmarkVectorL1Distance768(b *testing.B) {
+	a, vecB := makeVectorMathBenchmarkInputs(768)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		vectorMathBenchmarkSink = vectorL1Distance(a, vecB)
+	}
+}
+
+func BenchmarkVectorL1DistanceUnrolled768(b *testing.B) {
+	a, vecB := makeVectorMathBenchmarkInputs(768)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		vectorMathBenchmarkSink = vectorL1Unrolled(a, vecB)
+	}
+}
+
 func makeVecSearchBenchmarkTable(rows, dims int) *storage.DB {
 	db := storage.NewDB()
 	table := storage.NewTable("vec_docs", []storage.Column{

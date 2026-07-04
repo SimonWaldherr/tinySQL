@@ -10,6 +10,9 @@ func vectorDotSSE2(a, b []float64) float64
 //go:noescape
 func vectorL2SquaredSSE2(a, b []float64) float64
 
+//go:noescape
+func vectorL1SSE2(a, b []float64) float64
+
 func vectorDotKernel(a, b []float64) float64 {
 	if len(a) < 128 {
 		return vectorDotUnrolled(a, b)
@@ -22,4 +25,11 @@ func vectorL2SquaredKernel(a, b []float64) float64 {
 		return vectorL2SquaredUnrolled(a, b)
 	}
 	return vectorL2SquaredSSE2(a, b)
+}
+
+func vectorL1Kernel(a, b []float64) float64 {
+	if len(a) < 128 {
+		return vectorL1Unrolled(a, b)
+	}
+	return vectorL1SSE2(a, b)
 }

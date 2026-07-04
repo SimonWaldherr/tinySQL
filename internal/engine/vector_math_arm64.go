@@ -23,3 +23,15 @@ func vectorL2SquaredKernel(a, b []float64) float64 {
 	}
 	return vectorL2SquaredNEON(a, b)
 }
+
+// vectorL1Kernel has no NEON assembly kernel (unlike Dot/L2Squared above):
+// writing one would mean hand-deriving a raw FABS.2D vector encoding without
+// being able to run it on real ARM64 hardware to confirm correctness, and a
+// wrong bit pattern here would silently corrupt distance results rather
+// than fail to build. The portable unrolled path is still 4-way unrolled
+// (see vectorL1Unrolled) and auto-vectorizes reasonably well under the Go
+// compiler; a real NEON kernel is a good follow-up for whoever can validate
+// it on actual ARM64 hardware.
+func vectorL1Kernel(a, b []float64) float64 {
+	return vectorL1Unrolled(a, b)
+}

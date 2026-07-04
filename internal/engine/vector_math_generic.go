@@ -11,3 +11,7 @@ func vectorDotKernel(a, b []float64) float64 {
 func vectorL2SquaredKernel(a, b []float64) float64 {
 	return vectorL2SquaredUnrolled(a, b)
 }
+
+func vectorL1Kernel(a, b []float64) float64 {
+	return vectorL1Unrolled(a, b)
+}
