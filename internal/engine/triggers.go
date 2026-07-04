@@ -22,16 +22,13 @@ func executeCreateTrigger(env ExecEnv, s *CreateTrigger) (*ResultSet, error) {
 		}
 	}
 
-	// Serialise the body back to SQL text for storage.
-	body := triggerBodyToSQL(s.Body)
-
 	t := &storage.CatalogTrigger{
 		Name:       s.Name,
 		Table:      s.Table,
 		Timing:     storage.TriggerTiming(s.Timing),
 		Event:      storage.TriggerEvent(s.Event),
 		ForEachRow: s.ForEachRow,
-		Body:       body,
+		Body:       s.BodyText,
 	}
 
 	if err := cat.RegisterTrigger(t); err != nil {
@@ -87,12 +84,21 @@ func executeTrigger(env ExecEnv, trig *storage.CatalogTrigger, newRow Row, oldRo
 		return err
 	}
 
+	// Make NEW.col/OLD.col resolvable inside the body statements themselves
+	// (e.g. "INSERT INTO audit_log VALUES (NEW.id, ...)") via evalVarRef's
+	// env.triggerRow fallback.
+	env.triggerRow = trigRow
+
 	for _, stmt := range stmts {
-		if _, err := Execute(env.ctx, env.db, env.tenant, stmt); err != nil {
+		// execStmt, not Execute: trigger bodies run inside the INSERT/UPDATE/
+		// DELETE that fired them, already inside Execute's write lock on the
+		// same goroutine — re-acquiring it here would deadlock (sync.RWMutex
+		// is not reentrant).
+		if _, err := execStmt(env, stmt); err != nil {
 			return err
 		}
 	}
-	_ = trigRow // TODO: evaluate WHEN condition against trigRow when that feature is added
+	// TODO: evaluate WHEN condition against trigRow when that feature is added.
 	return nil
 }
 
@@ -114,29 +120,3 @@ func parseTriggerBody(body string) ([]Statement, error) {
 	return stmts, nil
 }
 
-// triggerBodyToSQL serialises a slice of statements back to semicolon-separated
-// SQL text for catalog storage. It uses a simple AST-to-SQL strategy.
-func triggerBodyToSQL(stmts []Statement) string {
-	parts := make([]string, 0, len(stmts))
-	for _, stmt := range stmts {
-		parts = append(parts, stmtToSQL(stmt))
-	}
-	return strings.Join(parts, "; ")
-}
-
-// stmtToSQL produces a minimal SQL representation of a statement for trigger
-// body storage. NOTE: this is a placeholder — the reconstructed SQL is not
-// guaranteed to be fully re-parseable after restart.  A proper AST→SQL printer
-// would be required for reliable round-tripping of trigger bodies.
-func stmtToSQL(stmt Statement) string {
-	switch s := stmt.(type) {
-	case *Insert:
-		return fmt.Sprintf("INSERT INTO %s ... (trigger body)", s.Table)
-	case *Update:
-		return fmt.Sprintf("UPDATE %s ... (trigger body)", s.Table)
-	case *Delete:
-		return fmt.Sprintf("DELETE FROM %s ... (trigger body)", s.Table)
-	default:
-		return fmt.Sprintf("/* unknown trigger body stmt %T */", s)
-	}
-}

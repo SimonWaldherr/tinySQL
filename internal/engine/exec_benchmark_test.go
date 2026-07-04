@@ -16,7 +16,7 @@ func BenchmarkEvalVarRefLookup(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		v, err := evalVarRef(ex, row)
+		v, err := evalVarRef(ExecEnv{}, ex, row)
 		if err != nil {
 			b.Fatal(err)
 		}

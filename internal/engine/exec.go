@@ -96,15 +96,61 @@ type ExecEnv struct {
 	windowRows  []Row                 // All rows for window function context
 	windowIndex int                   // Current row index in window context
 	viewDepth   int
+	// triggerRow carries new.<col>/old.<col> pseudo-columns while executing a
+	// trigger body statement (see executeTrigger in triggers.go), so
+	// NEW.col/OLD.col resolve even though the body statement's own row
+	// context (e.g. an INSERT's VALUES row) has no such columns.
+	triggerRow Row
 }
 
 // Execute runs a parsed SQL statement against the given storage DB and tenant.
 // It dispatches to handlers per statement kind and returns a ResultSet for
 // SELECT (nil for DDL/DML). The context is checked at safe points to support
 // cancellation.
-func Execute(ctx context.Context, db *storage.DB, tenant string, stmt Statement) (*ResultSet, error) {
-	env := ExecEnv{ctx: ctx, tenant: tenant, db: db}
-	if db.IsReadOnly() {
+//
+// Concurrency: storage.DB's own mutex only protects the tenant->table map
+// structure, not the contents of a *storage.Table (Rows/Cols/Version) once a
+// caller holds one — INSERT/UPDATE/DELETE mutate Table.Rows with no lock of
+// their own, so two goroutines calling Execute concurrently on the same DB
+// would otherwise race on that slice (a real data race, not just stale
+// reads: concurrent unsynchronized slice append + range is undefined
+// behavior in Go). Execute closes that gap with a single coarse
+// read/write lock around the whole statement: SELECT/EXPLAIN/PRAGMA take a
+// shared read lock (so concurrent reads still run in parallel with each
+// other), everything else takes an exclusive write lock. This is coarser
+// than per-table locking — a write to table A blocks a concurrent read of
+// unrelated table B — but it is correct and simple to audit, which matters
+// more for a safety fix than maximum parallelism.
+func Execute(ctx context.Context, db *storage.DB, tenant string, stmt Statement) (rs *ResultSet, err error) {
+	if isReadOnlyStatement(stmt) {
+		db.LockContentForRead()
+		defer db.UnlockContentForRead()
+	} else {
+		db.LockContentForWrite()
+		defer db.UnlockContentForWrite()
+	}
+	// cmd/server and cmd/tinysqld already recover from panics at their own
+	// request boundary, but an application embedding tinySQL directly (via
+	// this function or the database/sql driver) has no such guard — a bug
+	// anywhere in the evaluator would otherwise crash the whole host
+	// process over a single bad query. Recovering here turns that into an
+	// ordinary error instead.
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("internal error executing statement: %v", r)
+		}
+	}()
+	return execStmt(ExecEnv{ctx: ctx, tenant: tenant, db: db}, stmt)
+}
+
+// execStmt is Execute's dispatch logic without the content lock. It exists
+// so that statements which recursively execute a nested statement on the
+// same goroutine (CREATE TABLE AS SELECT, materialized view refresh) can
+// call back into the dispatcher without re-acquiring db's content lock —
+// sync.RWMutex is not reentrant, so a second Lock/RLock call from the same
+// goroutine that already holds the write lock would deadlock.
+func execStmt(env ExecEnv, stmt Statement) (*ResultSet, error) {
+	if env.db.IsReadOnly() {
 		if err := rejectIfMutating(stmt); err != nil {
 			return nil, err
 		}
@@ -160,6 +206,19 @@ func Execute(ctx context.Context, db *storage.DB, tenant string, stmt Statement)
 	return nil, fmt.Errorf("unknown statement")
 }
 
+// isReadOnlyStatement reports whether stmt can never mutate table rows or
+// schema. Kept in sync with rejectIfMutating's classification (used for
+// read-only-mode enforcement) since both need the same answer: only
+// SELECT/EXPLAIN/PRAGMA are safe to run under a shared read lock.
+func isReadOnlyStatement(stmt Statement) bool {
+	switch stmt.(type) {
+	case *Select, *Explain, *Pragma:
+		return true
+	default:
+		return false
+	}
+}
+
 // rejectIfMutating returns an error for any statement that would modify data
 // or schema. Only SELECT, EXPLAIN, and PRAGMA are permitted in read-only mode.
 func rejectIfMutating(stmt Statement) error {
@@ -193,7 +252,9 @@ func executeCreateTable(env ExecEnv, s *CreateTable) (*ResultSet, error) {
 		err := env.db.Put(env.tenant, t)
 		return nil, err
 	}
-	rs, err := Execute(env.ctx, env.db, env.tenant, s.AsSelect)
+	// Recurses via execStmt, not Execute: this runs inside executeCreateTable,
+	// already inside Execute's write lock on the same goroutine.
+	rs, err := execStmt(env, s.AsSelect)
 	if err != nil {
 		return nil, err
 	}
@@ -580,7 +641,9 @@ func refreshMaterializedView(env ExecEnv, name string) (err error) {
 	if !ok {
 		return fmt.Errorf("materialized view %q query is not a SELECT", name)
 	}
-	rs, execErr := Execute(env.ctx, env.db, env.tenant, sel)
+	// Recurses via execStmt, not Execute: this runs inside materialized-view
+	// refresh, already inside Execute's write lock on the same goroutine.
+	rs, execErr := execStmt(env, sel)
 	if execErr != nil {
 		return execErr
 	}
@@ -675,6 +738,10 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 	hasBefore := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("BEFORE"), storage.TriggerEvent("INSERT"))) > 0
 	hasAfter := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("AFTER"), storage.TriggerEvent("INSERT"))) > 0
 	needsRow := hasBefore || hasAfter || len(s.Returning) > 0
+	wal, err := beginWALAuto(env, s.Table)
+	if err != nil {
+		return nil, err
+	}
 	for _, vals := range s.Rows {
 		if len(vals) != expected {
 			return nil, fmt.Errorf("INSERT expects %d values", expected)
@@ -707,6 +774,9 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 			}
 		}
 		t.Rows = append(t.Rows, row)
+		if err := wal.logInsert(env, len(t.Rows)-1, row, t.Cols); err != nil {
+			return nil, err
+		}
 		if hasAfter {
 			if err := fireTriggers(env, s.Table, "AFTER", "INSERT", newRow, nil); err != nil {
 				return nil, err
@@ -717,6 +787,9 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 		if len(s.Returning) > 0 {
 			returningRows = append(returningRows, newRow)
 		}
+	}
+	if err := wal.commit(); err != nil {
+		return nil, err
 	}
 	t.Version++
 	t.MarkDirtyFrom(len(t.Rows) - len(s.Rows))
@@ -742,6 +815,10 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	hasBefore := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("BEFORE"), storage.TriggerEvent("INSERT"))) > 0
 	hasAfter := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("AFTER"), storage.TriggerEvent("INSERT"))) > 0
 	needsRow := hasBefore || hasAfter || len(s.Returning) > 0
+	wal, err := beginWALAuto(env, s.Table)
+	if err != nil {
+		return nil, err
+	}
 	for _, vals := range s.Rows {
 		if len(vals) != len(s.Cols) {
 			return nil, fmt.Errorf("INSERT column/value mismatch")
@@ -777,6 +854,9 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			}
 		}
 		t.Rows = append(t.Rows, row)
+		if err := wal.logInsert(env, len(t.Rows)-1, row, t.Cols); err != nil {
+			return nil, err
+		}
 		if hasAfter {
 			if err := fireTriggers(env, s.Table, "AFTER", "INSERT", newRow, nil); err != nil {
 				return nil, err
@@ -787,6 +867,9 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 		if len(s.Returning) > 0 {
 			returningRows = append(returningRows, newRow)
 		}
+	}
+	if err := wal.commit(); err != nil {
+		return nil, err
 	}
 	t.Version++
 	t.MarkDirtyFrom(len(t.Rows) - len(s.Rows))
@@ -960,12 +1043,17 @@ func constraintValueExists(t *storage.Table, colIdx int, val any, excludeRow int
 }
 
 func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
-	if rs, ok, err := executeSimpleUpdateFastPath(env, s); ok || err != nil {
-		return rs, err
+	if !tenantHasAnyForeignKeys(env) {
+		if rs, ok, err := executeSimpleUpdateFastPath(env, s); ok || err != nil {
+			return rs, err
+		}
 	}
 
 	t, err := env.db.Get(env.tenant, s.Table)
 	if err != nil {
+		return nil, err
+	}
+	if err := checkForeignKeysBeforeUpdate(env, t, s); err != nil {
 		return nil, err
 	}
 	setIdx := map[int]Expr{}
@@ -983,6 +1071,10 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 	hasBefore := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("BEFORE"), storage.TriggerEvent("UPDATE"))) > 0
 	hasAfter := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("AFTER"), storage.TriggerEvent("UPDATE"))) > 0
 	needsNewRow := hasAfter || len(s.Returning) > 0
+	wal, err := beginWALAuto(env, s.Table)
+	if err != nil {
+		return nil, err
+	}
 	for ri, r := range t.Rows {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
@@ -1022,7 +1114,11 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 				return nil, err
 			}
 			patchConstraintIndexRow(t, ri, t.Rows[ri], nextRow)
+			before := r
 			t.Rows[ri] = nextRow
+			if err := wal.logUpdate(env, ri, before, nextRow, t.Cols); err != nil {
+				return nil, err
+			}
 			var newRow Row
 			if needsNewRow {
 				newRow = buildTableRow(t.Cols, tablePrefix, t.Rows[ri])
@@ -1038,6 +1134,9 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 			}
 			n++
 		}
+	}
+	if err := wal.commit(); err != nil {
+		return nil, err
 	}
 	t.Version++
 	if n > 0 {
@@ -1075,6 +1174,10 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 	updated := 0
 	values := make([]any, len(plan.sets))
 	columnNames := colNames(plan.table.Cols)
+	wal, err := beginWALAuto(env, s.Table)
+	if err != nil {
+		return nil, true, err
+	}
 	for ri, raw := range plan.table.Rows {
 		// Check context cancellation every 64 rows to reduce channel-select overhead.
 		if ri&63 == 0 {
@@ -1109,9 +1212,16 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 			return nil, true, err
 		}
 		patchConstraintIndexRow(plan.table, ri, plan.table.Rows[ri], nextRow)
+		before := raw
 		plan.table.Rows[ri] = nextRow
+		if err := wal.logUpdate(env, ri, before, nextRow, plan.table.Cols); err != nil {
+			return nil, true, err
+		}
 		ftsIndexRow(env.tenant+"/"+s.Table, s.Table, ri, nil, plan.table.Rows[ri], columnNames)
 		updated++
+	}
+	if err := wal.commit(); err != nil {
+		return nil, true, err
 	}
 
 	plan.table.Version++
@@ -1164,6 +1274,13 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	// incremental constraint index can't reconcile cheaply — drop it and
 	// let the next INSERT/UPDATE rebuild it from scratch.
 	invalidateConstraintIndexes(t)
+	if err := checkForeignKeysBeforeDelete(env, t, s.Where); err != nil {
+		return nil, err
+	}
+	wal, err := beginWALAuto(env, s.Table)
+	if err != nil {
+		return nil, err
+	}
 	if s.Where == nil {
 		del := len(t.Rows)
 		if len(s.Returning) > 0 {
@@ -1173,6 +1290,14 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 				returningRows = append(returningRows, buildTableRow(t.Cols, tablePrefix, r))
 			}
 			if del > 0 {
+				for i, r := range t.Rows {
+					if err := wal.logDelete(env, i, r, t.Cols); err != nil {
+						return nil, err
+					}
+				}
+				if err := wal.commit(); err != nil {
+					return nil, err
+				}
 				t.Rows = nil
 				t.Version++
 				t.MarkDirtyFrom(-1) // DELETE is non-append; force full-table WAL
@@ -1181,6 +1306,14 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 			return projectReturningRows(env, t.Cols, s.Returning, returningRows)
 		}
 		if del > 0 {
+			for i, r := range t.Rows {
+				if err := wal.logDelete(env, i, r, t.Cols); err != nil {
+					return nil, err
+				}
+			}
+			if err := wal.commit(); err != nil {
+				return nil, err
+			}
 			t.Rows = nil
 			t.Version++
 			t.MarkDirtyFrom(-1) // DELETE is non-append; force full-table WAL
@@ -1208,11 +1341,17 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 				return nil, err
 			}
 			if match {
+				if err := wal.logDelete(env, i, r, t.Cols); err != nil {
+					return nil, err
+				}
 				ftsDeleteRow(env.tenant+"/"+s.Table, del+len(kept))
 				del++
 			} else {
 				kept = append(kept, r)
 			}
+		}
+		if err := wal.commit(); err != nil {
+			return nil, err
 		}
 		t.Rows = kept
 		t.Version++
@@ -1230,7 +1369,7 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	tablePrefix := strings.ToLower(s.Table) + "."
 	hasBeforeDel := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("BEFORE"), storage.TriggerEvent("DELETE"))) > 0
 	hasAfterDel := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("AFTER"), storage.TriggerEvent("DELETE"))) > 0
-	for _, r := range t.Rows {
+	for i, r := range t.Rows {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
 		}
@@ -1247,6 +1386,9 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 					return nil, err
 				}
 			}
+			if err := wal.logDelete(env, i, r, t.Cols); err != nil {
+				return nil, err
+			}
 			ftsDeleteRow(env.tenant+"/"+s.Table, del+len(kept))
 			if hasAfterDel {
 				if err := fireTriggers(env, s.Table, "AFTER", "DELETE", nil, row); err != nil {
@@ -1258,6 +1400,9 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 			}
 			del++
 		}
+	}
+	if err := wal.commit(); err != nil {
+		return nil, err
 	}
 	t.Rows = kept
 	t.Version++
@@ -5297,6 +5442,17 @@ func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []str
 		groups[ks] = append(groups[ks], r)
 	}
 
+	// A whole-table aggregate (no GROUP BY) always produces exactly one row,
+	// even over zero matching input rows — "SELECT COUNT(*) FROM t" on an
+	// empty (or fully filtered-out) table must return one row with count 0,
+	// not zero rows. Only synthesize that implicit empty group when there's
+	// no GROUP BY at all; a real "GROUP BY x" correctly produces zero rows
+	// when there's no data to group.
+	if len(s.GroupBy) == 0 && len(orderKeys) == 0 {
+		orderKeys = append(orderKeys, "")
+		groups[""] = nil
+	}
+
 	for _, k := range orderKeys {
 		rows := groups[k]
 		if s.Having != nil {
@@ -5337,8 +5493,17 @@ func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []str
 			var err error
 			if isAggregate(it.Expr) || len(s.GroupBy) > 0 {
 				val, err = evalAggregate(env, it.Expr, rows)
-			} else {
+			} else if len(rows) > 0 {
 				val, err = evalExpr(env, it.Expr, rows[0])
+			} else {
+				// The implicit empty group for a whole-table aggregate over
+				// zero rows (see above): a non-aggregate projection has no
+				// row to evaluate against. A literal still evaluates fine;
+				// a real column reference will error instead of panicking
+				// on rows[0], which is the right failure mode here since
+				// such a reference is not meaningfully defined without a
+				// GROUP BY or a row to pull it from.
+				val, err = evalExpr(env, it.Expr, Row{})
 			}
 			if err != nil {
 				return nil, nil, err
@@ -5871,7 +6036,7 @@ func evalExpr(env ExecEnv, e Expr, row Row) (any, error) {
 	case *Literal:
 		return ex.Val, nil
 	case *VarRef:
-		return evalVarRef(ex, row)
+		return evalVarRef(env, ex, row)
 	case *IsNull:
 		return evalIsNull(env, ex, row)
 	case *Unary:
@@ -5942,13 +6107,26 @@ func betweenResult(v, lo, hi any, negate bool) (any, error) {
 	return triToValue(triAnd(toTri(ge), toTri(le))), nil
 }
 
-func evalVarRef(ex *VarRef, row Row) (any, error) {
+func evalVarRef(env ExecEnv, ex *VarRef, row Row) (any, error) {
 	if ex.Lower != "" {
 		if v, ok := getValLower(row, ex.Lower); ok {
 			return v, nil
 		}
 	} else if v, ok := getVal(row, ex.Name); ok {
 		return v, nil
+	}
+	// Trigger bodies reference NEW.col/OLD.col, which aren't part of the row
+	// being built by the statement the trigger body itself is executing (an
+	// INSERT into a different table, say) — env.triggerRow carries them
+	// separately. See executeTrigger in triggers.go.
+	if env.triggerRow != nil {
+		lower := ex.Lower
+		if lower == "" {
+			lower = strings.ToLower(ex.Name)
+		}
+		if v, ok := getValLower(env.triggerRow, lower); ok {
+			return v, nil
+		}
 	}
 	if strings.Contains(ex.Name, ".") {
 		return nil, fmt.Errorf("unknown column reference %q", ex.Name)

@@ -33,6 +33,19 @@ Durable product forms now expose explicit lifecycle and observability hooks:
 - Atomic checkpoints: snapshots are written to a temp file, fsynced, and renamed into place, so a crash mid-checkpoint never corrupts the previous snapshot.
 - `WALConfig.CheckpointMaxBytes` / `AdvancedWALConfig.CheckpointMaxBytes` force a checkpoint once the WAL file exceeds a size (default 64 MB), bounding WAL growth independently of the existing transaction-count and time-based triggers.
 - PRIMARY KEY / UNIQUE / FOREIGN KEY constraint checks use a per-table hash index maintained incrementally on INSERT/UPDATE/DELETE, instead of scanning the whole table on every write — bulk-loading into a large constrained table is an order of magnitude faster.
+- Single-table `GROUP BY` queries using `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` take a raw-row fast path that accumulates aggregates directly during the table scan, instead of buffering every matching row into a `Row` map and re-scanning it once per aggregate expression. See [BENCHMARKS.md](BENCHMARKS.md) for measured numbers against SQLite.
+- Concurrent queries: `Execute` takes a shared read lock for SELECT/EXPLAIN/PRAGMA and an exclusive write lock for everything else, for the duration of the whole statement. Before this, `Table.Rows` had no lock at all — two goroutines calling `Execute` concurrently on the same table could race on the underlying slice. The lock is coarse (a write to one table blocks a concurrent read of an unrelated table) rather than per-table, trading some parallelism for a single, easy-to-audit correctness guarantee.
+- `Execute` recovers from panics and returns them as an error instead of crashing the host process — important for applications that call it directly rather than through `cmd/server`/`cmd/tinysqld` (which already had their own recovery middleware at the request boundary).
+- The parser rejects pathologically deep expression/subquery nesting (`maxParseDepth`, currently 200) with an ordinary parse error. Unbounded recursive-descent parsing on attacker-controlled input can otherwise exhaust the goroutine stack, which in Go is a fatal error that `recover()` cannot catch — this closes that gap before it becomes one.
+- Trigger bodies are stored and re-parsed from their **original source text**, not a lossy reprint of the parsed AST. The previous AST-to-SQL serializer was an unfinished placeholder that produced non-executable text (`"INSERT INTO x ... (trigger body)"`), so **every trigger with an INSERT/UPDATE/DELETE body silently failed on every fire** — this is now fixed, including `NEW.col`/`OLD.col` references inside the body.
+
+### Security checklist for `cmd/server` (gRPC + HTTP query server)
+
+`cmd/server` ships with authentication **off** by default (`-auth ""`) and listens on all interfaces by default (`-http :8080`, `-grpc :9090`). Anyone who can reach those ports can run arbitrary SQL, including DDL, with no credentials. The server logs a startup warning if it detects this combination, but does not refuse to start — treat these as required steps before exposing the server beyond your own machine:
+
+- Set `-auth <token>` (checked as a bearer token on both HTTP and gRPC) or bind to `127.0.0.1`/`localhost` if the server is only ever accessed from the same host.
+- Configure TLS via `-http-tls-cert`/`-http-tls-key` and `-grpc-tls-cert`/`-grpc-tls-key`; without it, an auth token is sent in the clear.
+- `cmd/tinysqld` (the lighter admin/health HTTP daemon) defaults to `127.0.0.1:8088`, so it's loopback-only out of the box; it still supports the same `-auth`-style token if you need to expose it further.
 
 Example:
 
@@ -81,15 +94,20 @@ While `ReadOnly` is set, `INSERT`/`UPDATE`/`DELETE` and DDL statements are
 rejected with an error; `SELECT`, `EXPLAIN`, and `PRAGMA` are unaffected.
 Toggle it at runtime with `db.SetReadOnly(true/false)`.
 
-> **Note on `ModeWAL`/`ModeAdvancedWAL` durability:** statements run through
-> `tsql.Execute` update the in-memory catalog directly; neither WAL mode is
-> currently wired to log those mutations automatically. Durability via the
-> WAL today is a lower-level, opt-in mechanism: snapshot the DB before and
-> after a change, diff it with `storage.CollectWALChanges`, and call
-> `db.WAL().LogTransaction(changes)` yourself (see
-> `internal/storage/lifecycle_test.go` for the exact pattern) — or use
-> `ModeMemory`/`ModeDisk` with a `Path`, which do persist automatically on
-> `Sync()`/`Close()`, as in the example above.
+> **Note on WAL durability:** `ModeAdvancedWAL` now logs every
+> INSERT/UPDATE/DELETE automatically — `Execute` wraps each statement in its
+> own implicit WAL transaction and logs each row change as it happens, so a
+> process killed mid-write and restarted can recover via
+> `wal.Recover(db)` with no extra code (see
+> `internal/engine/wal_logging_test.go` for a simulated-crash test proving
+> this end to end). `ModeWAL` (the older, table-snapshot-diff WAL) is
+> **not** auto-wired the same way: it still requires the caller to snapshot
+> the DB before and after a change, diff it with
+> `storage.CollectWALChanges`, and call `db.WAL().LogTransaction(changes)`
+> manually (see `internal/storage/lifecycle_test.go`). For automatic
+> durability, prefer `ModeAdvancedWAL` — or `ModeMemory`/`ModeDisk` with a
+> `Path`, which persist automatically on `Sync()`/`Close()` (whole-snapshot,
+> not per-statement).
 
 ## Storage modes
 
@@ -100,12 +118,12 @@ kept between memory and disk. All modes share the same SQL engine and
 | Mode | String | Persistence | Notes |
 |---|---|---|---|
 | `ModeMemory` | `"memory"` | None, unless `Path` is set (GOB snapshot on `Close`) | Default; fastest |
-| `ModeWAL` | `"wal"` | RAM + write-ahead log, periodic GOB checkpoints | See the WAL durability caveat above |
+| `ModeWAL` | `"wal"` | RAM + write-ahead log, periodic GOB checkpoints | Manual logging only — see the WAL durability note above |
 | `ModeDisk` | `"disk"` | One GOB file per table, loaded on demand | Minimizes RAM at the cost of disk I/O |
 | `ModeJSON` | `"json"` | One **JSON** file per table, loaded on demand | Same behavior as `ModeDisk`; files are human-readable/diffable/hand-editable. Larger on disk; `big.Rat`/`uuid.UUID` values round-trip as plain strings |
 | `ModeIndex` | `"index"` | Schemas in RAM, rows on disk | RAM usage scales with schema, not data size |
 | `ModeHybrid` | `"hybrid"` | LRU buffer pool, cold tables spill to disk | Bounded-memory mixed workloads |
-| `ModeAdvancedWAL` | `"advanced_wal"` | Row-level WAL with LSNs | See the WAL durability caveat above |
+| `ModeAdvancedWAL` | `"advanced_wal"` | Row-level WAL with LSNs | Logged automatically on every write — see the WAL durability note above |
 
 ```go
 // Human-readable per-table JSON files instead of GOB — handy for
@@ -307,7 +325,7 @@ status relative to SQLite.
 | View dependencies | `sys.dependencies` / `catalog.dependencies` expose base-object dependencies for views and materialized views |
 | Schema-qualified names | Objects can use names such as `sales.orders`; system views expose `schema`, `name`, and `full_name` where applicable |
 | EXPLAIN | `EXPLAIN SELECT …` and `EXPLAIN CREATE MATERIALIZED VIEW …` return a compact logical plan |
-| Column constraints | Column-level `PRIMARY KEY`, `UNIQUE`, and `FOREIGN KEY REFERENCES` are enforced on INSERT/UPDATE |
+| Column constraints | `PRIMARY KEY`, `UNIQUE` (column-level), and `FOREIGN KEY`/`REFERENCES` (column-level `col TYPE REFERENCES tbl(col)`/`col TYPE FOREIGN KEY REFERENCES tbl(col)`, or table-level `FOREIGN KEY (col) REFERENCES tbl(col)`, single-column only) are enforced on INSERT/UPDATE. `ON DELETE`/`ON UPDATE` support `CASCADE`, `SET NULL`, `RESTRICT`, and `NO ACTION`; the default (no clause) is `RESTRICT` — deleting or changing a referenced value with existing child rows is rejected unless a clause says otherwise |
 | Indexes (`CREATE INDEX`) | Metadata stored; query planner no-op |
 | **Full-Text Search (FTS)** | `CREATE VIRTUAL TABLE t USING fts(col1, col2)` with `FTS_MATCH`, `FTS_RANK`, `FTS_SNIPPET`, `BM25`; `FTS_SEARCH` TVF for cached, whole-row ranked search on any table; `ROW_TO_TEXT()` for ad-hoc whole-row substring search in `WHERE` |
 | **Triggers** | `CREATE TRIGGER … BEFORE/AFTER INSERT/UPDATE/DELETE ON table FOR EACH ROW BEGIN … END` |
@@ -538,6 +556,46 @@ INSERT INTO orders VALUES (1, 99.99, 'new');
 SELECT * FROM audit_log;
 ```
 
+### Foreign key quick start
+
+```sql
+CREATE TABLE customers (id INT PRIMARY KEY, name TEXT);
+
+-- Column-level, standard SQL shorthand:
+CREATE TABLE orders (
+  id INT PRIMARY KEY,
+  customer_id INT REFERENCES customers(id) ON DELETE CASCADE
+);
+
+-- Equivalent table-level form (also supported):
+CREATE TABLE shipments (
+  id INT,
+  order_id INT,
+  FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE SET NULL
+);
+
+INSERT INTO customers VALUES (1, 'Acme');
+INSERT INTO orders VALUES (100, 1);
+INSERT INTO shipments VALUES (1000, 100);
+
+DELETE FROM customers WHERE id = 1;
+-- ON DELETE CASCADE removes the order too, which transitively triggers
+-- shipments' ON DELETE SET NULL — order_id becomes NULL, the row survives.
+SELECT * FROM orders;    -- empty
+SELECT * FROM shipments; -- order_id is NULL
+```
+
+**Gotcha:** the default, when a `FOREIGN KEY`/`REFERENCES` has no `ON DELETE`/`ON UPDATE`
+clause at all, is `RESTRICT` — deleting a customer that still has orders (or
+changing a referenced column's value) is rejected with an error, not
+silently allowed. This matches the SQL standard's default but is worth
+calling out since earlier tinySQL versions had no referential-action
+enforcement at all and would have orphaned the child rows silently. Add
+`ON DELETE CASCADE`/`SET NULL` (and `ON UPDATE CASCADE`/`SET NULL`) explicitly
+wherever orphaning or cascading is the desired behavior. Composite
+(multi-column) foreign keys are not supported — only a single local column
+referencing a single column in another table.
+
 ### PIVOT quick start
 
 `PIVOT` spreads the distinct values of one column into new output columns,
@@ -728,7 +786,7 @@ GitHub Actions also runs `Vector SIMD (linux/amd64)` on an Ubuntu x86_64 runner 
 
 | Feature | SQLite equivalent | Priority |
 |---------|-------------------|----------|
-| **Table-level constraint declarations** | `PRIMARY KEY (a, b)`, `FOREIGN KEY (col) REFERENCES other(col)` | Medium |
+| **Composite (multi-column) constraints** | `PRIMARY KEY (a, b)`, `FOREIGN KEY (a, b) REFERENCES other(a, b)` | Medium |
 | **CHECK constraints** | `CHECK (expr)` in `CREATE TABLE` | Medium |
 | **UPSERT / ON CONFLICT** | `INSERT OR REPLACE`, `INSERT … ON CONFLICT DO UPDATE/NOTHING` | Medium |
 | **Generated / computed columns** | `col AS (expr) STORED/VIRTUAL` | Low |

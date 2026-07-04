@@ -1245,6 +1245,8 @@ func run() error {
 		return err
 	}
 
+	warnIfUnauthenticatedAndExposed(*flagAuth, httpAddr, grpcAddr)
+
 	srv := newServer(db, tenant, *flagAuth, parsePeerList(*flagPeers), trustedProxies, peerDialCreds)
 	encoding.RegisterCodec(jsonCodec{})
 
@@ -1273,6 +1275,52 @@ func run() error {
 		return shutdownErr
 	}
 	return nil
+}
+
+// warnIfUnauthenticatedAndExposed logs a loud, hard-to-miss warning when the
+// server is about to listen on a non-loopback address with no auth token
+// configured — the -auth flag defaults to empty and -http/-grpc default to
+// ":8080"/":9090" (all interfaces), so running this binary with zero flags
+// exposes an endpoint that runs arbitrary SQL with no authentication at all.
+// This does not change default behavior (still opt-in auth, matching how
+// the flags have always worked) — it only makes the risk impossible to miss
+// in the startup logs.
+func warnIfUnauthenticatedAndExposed(authToken, httpAddr, grpcAddr string) {
+	if strings.TrimSpace(authToken) != "" {
+		return
+	}
+	exposed := []string{}
+	if httpAddr != "" && !isLoopbackListenAddr(httpAddr) {
+		exposed = append(exposed, fmt.Sprintf("HTTP %s", httpAddr))
+	}
+	if grpcAddr != "" && !isLoopbackListenAddr(grpcAddr) {
+		exposed = append(exposed, fmt.Sprintf("gRPC %s", grpcAddr))
+	}
+	if len(exposed) == 0 {
+		return
+	}
+	log.Printf("WARNING: no -auth token configured, and %s is bound to a non-loopback address — "+
+		"anyone who can reach this host can run arbitrary SQL against the database with no authentication. "+
+		"Set -auth to a token, or bind to 127.0.0.1 if this is not intentional.",
+		strings.Join(exposed, " and "))
+}
+
+// isLoopbackListenAddr reports whether a "host:port" listen address (as
+// accepted by net.Listen) resolves to a loopback-only host. An empty host
+// (":8080") means "all interfaces", which is not loopback-only.
+func isLoopbackListenAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	if host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func parseRunConfig() (string, string, uint16, []*net.IPNet, error) {

@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -98,6 +99,13 @@ type WALRecord struct {
 // AdvancedWAL manages row-level write-ahead logging with full ACID guarantees.
 type AdvancedWAL struct {
 	mu sync.Mutex
+
+	// autoTxID hands out transaction IDs for the engine's implicit
+	// single-statement transactions (see NewAutoTxID) — separate from any
+	// explicit transaction machinery (internal/driver's BeginTx uses the
+	// unrelated basic WALManager, not this one), so there's no ID space to
+	// collide with.
+	autoTxID atomic.Uint64
 
 	// WAL file path
 	path string
@@ -214,6 +222,13 @@ func OpenAdvancedWAL(config AdvancedWALConfig) (*AdvancedWAL, error) {
 	wal.encoder = gob.NewEncoder(writer)
 
 	return wal, nil
+}
+
+// NewAutoTxID returns a fresh transaction ID for the engine to use as an
+// implicit single-statement transaction (one INSERT/UPDATE/DELETE statement
+// = one WAL transaction, autocommitted). Safe for concurrent use.
+func (w *AdvancedWAL) NewAutoTxID() TxID {
+	return TxID(w.autoTxID.Add(1))
 }
 
 // LogBegin logs the start of a transaction.

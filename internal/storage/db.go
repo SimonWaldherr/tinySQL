@@ -256,10 +256,44 @@ func (c ConstraintType) String() string {
 	}
 }
 
+// ReferentialAction enumerates what happens to a child row when the parent
+// row it references is deleted (ON DELETE) or its referenced column value
+// changes (ON UPDATE).
+type ReferentialAction int
+
+const (
+	// NoAction means no ON DELETE/ON UPDATE clause was given. tinySQL checks
+	// foreign key constraints immediately (it has no deferred-constraint
+	// mode), so NoAction and Restrict behave identically here — the SQL
+	// standard only distinguishes them for deferred checking.
+	NoAction ReferentialAction = iota
+	// Restrict blocks the parent-side mutation while a referencing child row exists.
+	Restrict
+	// Cascade propagates the parent-side delete/update to matching child rows.
+	Cascade
+	// SetNull nulls the child row's foreign key column instead of deleting/blocking.
+	SetNull
+)
+
+func (a ReferentialAction) String() string {
+	switch a {
+	case Restrict:
+		return "RESTRICT"
+	case Cascade:
+		return "CASCADE"
+	case SetNull:
+		return "SET NULL"
+	default:
+		return "NO ACTION"
+	}
+}
+
 // ForeignKeyRef describes a foreign key reference target.
 type ForeignKeyRef struct {
-	Table  string
-	Column string
+	Table    string
+	Column   string
+	OnDelete ReferentialAction
+	OnUpdate ReferentialAction
 }
 
 // Column holds column schema information in a table.
@@ -368,6 +402,17 @@ type DB struct {
 	tenants map[string]*tenantDB
 	wal     *WALManager
 
+	// contentMu guards the contents of Table values (Rows, Cols, Version,
+	// dirtyFrom) reached through a *Table pointer returned by Get/Put/etc.
+	// mu only protects the tenant->table map structure itself; once a
+	// caller holds a *Table, nothing previously serialized reads of
+	// t.Rows against concurrent INSERT/UPDATE/DELETE appends/mutations of
+	// the same slice. The engine's Execute() takes contentMu for read
+	// (SELECT/EXPLAIN/PRAGMA) or write (everything else) for the duration
+	// of a whole statement, which is coarser than per-table locking but
+	// closes the race with a single, easy-to-audit choke point.
+	contentMu sync.RWMutex
+
 	// MVCC coordinator
 	mvcc *MVCCManager
 
@@ -419,6 +464,34 @@ func (db *DB) IsReadOnly() bool {
 		return false
 	}
 	return db.readOnly.Load()
+}
+
+// LockContentForRead acquires the database's content lock for a read-only
+// statement (SELECT/EXPLAIN/PRAGMA). Multiple readers may hold this
+// concurrently; it excludes concurrent LockContentForWrite callers. Callers
+// must call UnlockContentForRead exactly once, typically via defer, and must
+// not call it again re-entrantly on the same goroutine (sync.RWMutex is not
+// reentrant) — nested statement execution within the engine must bypass
+// this lock rather than re-acquire it.
+func (db *DB) LockContentForRead() {
+	db.contentMu.RLock()
+}
+
+// UnlockContentForRead releases a lock taken by LockContentForRead.
+func (db *DB) UnlockContentForRead() {
+	db.contentMu.RUnlock()
+}
+
+// LockContentForWrite acquires the database's content lock exclusively, for
+// any statement that may mutate table rows/columns (INSERT/UPDATE/DELETE and
+// all DDL). See LockContentForRead for the re-entrancy caveat.
+func (db *DB) LockContentForWrite() {
+	db.contentMu.Lock()
+}
+
+// UnlockContentForWrite releases a lock taken by LockContentForWrite.
+func (db *DB) UnlockContentForWrite() {
+	db.contentMu.Unlock()
 }
 
 // NewDB creates a new empty database catalog with MVCC support.
@@ -649,13 +722,18 @@ func (db *DB) getTenantRO(tn string) *tenantDB {
 // When a StorageBackend is attached, tables not found in memory are loaded
 // from the backend on demand (lazy loading).
 func (db *DB) Get(tn, name string) (*Table, error) {
-	db.mu.RLock()
-	td := db.getTenantRO(tn)
-	db.mu.RUnlock()
-	if td != nil {
-		if t, ok := td.tables[strings.ToLower(name)]; ok {
-			return t, nil
+	t, found := func() (*Table, bool) {
+		db.mu.RLock()
+		defer db.mu.RUnlock()
+		td := db.getTenantRO(tn)
+		if td == nil {
+			return nil, false
 		}
+		t, ok := td.tables[strings.ToLower(name)]
+		return t, ok
+	}()
+	if found {
+		return t, nil
 	}
 
 	// Not in memory – try the backend.

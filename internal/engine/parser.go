@@ -26,6 +26,33 @@ type Parser struct {
 	lx   *lexer
 	cur  token
 	peek token
+	// depth tracks combined expression/subquery recursion nesting. Without
+	// a limit, a maliciously deep input like "((((((...1...))))))" or
+	// nested "(SELECT * FROM (SELECT * FROM (SELECT ...)))" recurses once
+	// per nesting level through the whole precedence chain — enough levels
+	// exhausts the goroutine stack. That failure mode is a Go runtime fatal
+	// error ("stack overflow"), not a normal panic: it cannot be caught by
+	// recover(), so unlike other engine bugs it would kill the whole
+	// process outright, not just fail the one query. maxParseDepth keeps
+	// it a plain, recoverable parse error instead.
+	depth int
+}
+
+// maxParseDepth bounds parseExpr/parseSelect recursion. 200 comfortably
+// covers any realistic hand-written or generated query while stopping
+// pathological nesting well before it threatens the goroutine stack.
+const maxParseDepth = 200
+
+func (p *Parser) enterRecursion() error {
+	p.depth++
+	if p.depth > maxParseDepth {
+		return p.errf("expression or subquery nested too deeply (limit %d)", maxParseDepth)
+	}
+	return nil
+}
+
+func (p *Parser) exitRecursion() {
+	p.depth--
 }
 
 // NewParser creates a new SQL parser for the provided input string.
@@ -306,7 +333,8 @@ type CreateTrigger struct {
 	Table       string
 	ForEachRow  bool
 	WhenExpr    Expr        // optional WHEN condition
-	Body        []Statement // trigger body statements
+	Body        []Statement // trigger body statements, parsed once to validate syntax at CREATE TRIGGER time
+	BodyText    string      // verbatim source text of the body (between BEGIN and END), stored for re-parsing on each fire
 	IfNotExists bool
 }
 
@@ -851,7 +879,7 @@ func (p *Parser) parseCreateTrigger(orReplace bool) (Statement, error) {
 		return nil, err
 	}
 
-	body, err := p.parseTriggerBody()
+	body, bodyText, err := p.parseTriggerBody()
 	if err != nil {
 		return nil, err
 	}
@@ -864,6 +892,7 @@ func (p *Parser) parseCreateTrigger(orReplace bool) (Statement, error) {
 		ForEachRow:  forEachRow,
 		WhenExpr:    whenExpr,
 		Body:        body,
+		BodyText:    bodyText,
 		IfNotExists: ifNotExists,
 	}, nil
 }
@@ -950,22 +979,34 @@ func (p *Parser) parseTriggerWhen() (Expr, error) {
 	return whenExpr, nil
 }
 
-func (p *Parser) parseTriggerBody() ([]Statement, error) {
+// parseTriggerBody parses the statements between BEGIN and END, validating
+// their syntax immediately (so a malformed trigger body fails at CREATE
+// TRIGGER time rather than silently on every future fire). It also returns
+// the verbatim source text of the body, sliced out of the original SQL by
+// byte offset — this, not a reprint of the parsed AST, is what gets stored
+// for re-parsing each time the trigger fires. An AST-to-SQL printer would
+// need to precisely reconstruct every expression (including qualified names
+// like NEW.col); capturing the original text sidesteps that entirely and
+// can't drift from what the user actually wrote.
+func (p *Parser) parseTriggerBody() ([]Statement, string, error) {
+	startPos := p.cur.Pos
 	var body []Statement
 	for !(p.cur.Typ == tKeyword && p.cur.Val == "END") && p.cur.Typ != tEOF {
 		stmt, err := p.ParseStatement()
 		if err != nil {
-			return nil, fmt.Errorf("trigger body: %w", err)
+			return nil, "", fmt.Errorf("trigger body: %w", err)
 		}
 		body = append(body, stmt)
 		if p.cur.Typ == tSymbol && p.cur.Val == ";" {
 			p.next()
 		}
 	}
+	endPos := p.cur.Pos
+	bodyText := strings.TrimSpace(p.lx.s[startPos:endPos])
 	if p.cur.Typ == tKeyword && p.cur.Val == "END" {
 		p.next()
 	}
-	return body, nil
+	return body, bodyText, nil
 }
 
 // parseDropTrigger parses DROP TRIGGER [IF EXISTS] name.
@@ -1961,6 +2002,10 @@ func (p *Parser) parseSelectWithCTE() (*Select, error) {
 }
 
 func (p *Parser) parseSelect() (*Select, error) {
+	if err := p.enterRecursion(); err != nil {
+		return nil, err
+	}
+	defer p.exitRecursion()
 	if err := p.expectKeyword("SELECT"); err != nil {
 		return nil, err
 	}
@@ -2613,11 +2658,21 @@ func (p *Parser) parseColumnDefs() ([]storage.Column, error) {
 	}
 	cols := make([]storage.Column, 0, 8) // Pre-allocate for typical table
 	for {
-		col, err := p.parseSingleColumnDef()
-		if err != nil {
-			return nil, err
+		// A comma-separated item starting with FOREIGN is a table-level
+		// constraint ("FOREIGN KEY (col) REFERENCES tbl(col) ..."), not a
+		// column definition — apply it to the already-parsed column it
+		// names instead of appending a new column.
+		if p.cur.Typ == tKeyword && p.cur.Val == "FOREIGN" {
+			if err := p.parseTableLevelForeignKey(cols); err != nil {
+				return nil, err
+			}
+		} else {
+			col, err := p.parseSingleColumnDef()
+			if err != nil {
+				return nil, err
+			}
+			cols = append(cols, col)
 		}
-		cols = append(cols, col)
 
 		if p.cur.Typ == tSymbol && p.cur.Val == "," {
 			p.next()
@@ -2629,6 +2684,58 @@ func (p *Parser) parseColumnDefs() ([]storage.Column, error) {
 		break
 	}
 	return cols, nil
+}
+
+// parseTableLevelForeignKey parses "FOREIGN KEY (col) REFERENCES tbl(col)
+// [ON DELETE action] [ON UPDATE action]" and attaches the result to the
+// named column within cols (which must already have been parsed — table
+// constraints are written after the columns they reference in every
+// realistic schema). Only a single local column is supported per
+// constraint; composite (multi-column) foreign keys are not.
+func (p *Parser) parseTableLevelForeignKey(cols []storage.Column) error {
+	p.next() // consume FOREIGN
+	if err := p.expectKeyword("KEY"); err != nil {
+		return err
+	}
+	if err := p.expectSymbol("("); err != nil {
+		return err
+	}
+	localCol := p.parseIdentLike()
+	if localCol == "" {
+		return p.errf("expected column name in FOREIGN KEY (...)")
+	}
+	if err := p.expectSymbol(")"); err != nil {
+		return err
+	}
+	if err := p.expectKeyword("REFERENCES"); err != nil {
+		return err
+	}
+	table := p.parseIdentLike()
+	if table == "" {
+		return p.errf("expected table name after REFERENCES")
+	}
+	if err := p.expectSymbol("("); err != nil {
+		return err
+	}
+	refCol := p.parseIdentLike()
+	if refCol == "" {
+		return p.errf("expected column name in REFERENCES")
+	}
+	if err := p.expectSymbol(")"); err != nil {
+		return err
+	}
+	onDelete, onUpdate, err := p.parseOnDeleteOnUpdateClauses()
+	if err != nil {
+		return err
+	}
+	for i := range cols {
+		if strings.EqualFold(cols[i].Name, localCol) {
+			cols[i].Constraint = storage.ForeignKey
+			cols[i].ForeignKey = &storage.ForeignKeyRef{Table: table, Column: refCol, OnDelete: onDelete, OnUpdate: onUpdate}
+			return nil
+		}
+	}
+	return p.errf("FOREIGN KEY (%s): no such column in this table", localCol)
 }
 
 func (p *Parser) parseSingleColumnDef() (storage.Column, error) {
@@ -2687,22 +2794,7 @@ func (p *Parser) parseForeignKeyConstraint(col *storage.Column) error {
 	p.next()
 	if p.cur.Typ == tKeyword && p.cur.Val == "KEY" {
 		p.next()
-		col.Constraint = storage.ForeignKey
-		// Parse REFERENCES table(column)
-		if p.cur.Typ == tKeyword && p.cur.Val == "REFERENCES" {
-			p.next()
-			table := p.parseIdentLike()
-			if table != "" && p.cur.Typ == tSymbol && p.cur.Val == "(" {
-				p.next()
-				column := p.parseIdentLike()
-				if column != "" {
-					if err := p.expectSymbol(")"); err != nil {
-						return err
-					}
-					col.ForeignKey = &storage.ForeignKeyRef{Table: table, Column: column}
-				}
-			}
-		}
+		return p.parseReferencesClauseInto(col)
 	}
 	return nil
 }
@@ -2713,16 +2805,106 @@ func (p *Parser) parseUniqueConstraint(col *storage.Column) error {
 	return nil
 }
 
+// parseReferencesConstraint handles a column constraint that starts directly
+// with REFERENCES (i.e. "col TYPE REFERENCES table(col)", the common SQL
+// shorthand that omits "FOREIGN KEY"). For POINTER-typed columns this instead
+// records a graph-traversal target table (an unrelated, pre-existing
+// tinySQL-specific feature, not a real foreign key constraint).
 func (p *Parser) parseReferencesConstraint(col *storage.Column) error {
-	// Handle table-level REFERENCES for POINTER type
 	if col.Type == storage.PointerType {
 		p.next()
 		table := p.parseIdentLike()
 		if table != "" {
 			col.PointerTable = table
 		}
+		return nil
 	}
+	return p.parseReferencesClauseInto(col)
+}
+
+// parseReferencesClauseInto parses "REFERENCES table(column) [ON DELETE
+// action] [ON UPDATE action]" (in either order) starting at the REFERENCES
+// keyword, and records the result as col's foreign key. Shared by both
+// column-level spellings: "col TYPE REFERENCES ..." and
+// "col TYPE FOREIGN KEY REFERENCES ...".
+func (p *Parser) parseReferencesClauseInto(col *storage.Column) error {
+	if !(p.cur.Typ == tKeyword && p.cur.Val == "REFERENCES") {
+		return nil
+	}
+	p.next()
+	table := p.parseIdentLike()
+	if table == "" {
+		return p.errf("expected table name after REFERENCES")
+	}
+	if err := p.expectSymbol("("); err != nil {
+		return err
+	}
+	column := p.parseIdentLike()
+	if column == "" {
+		return p.errf("expected column name in REFERENCES")
+	}
+	if err := p.expectSymbol(")"); err != nil {
+		return err
+	}
+	onDelete, onUpdate, err := p.parseOnDeleteOnUpdateClauses()
+	if err != nil {
+		return err
+	}
+	col.Constraint = storage.ForeignKey
+	col.ForeignKey = &storage.ForeignKeyRef{Table: table, Column: column, OnDelete: onDelete, OnUpdate: onUpdate}
 	return nil
+}
+
+// parseOnDeleteOnUpdateClauses parses zero or more "ON DELETE <action>" /
+// "ON UPDATE <action>" clauses, in either order (standard SQL allows both
+// orderings), stopping at the first token that isn't a leading ON.
+func (p *Parser) parseOnDeleteOnUpdateClauses() (onDelete, onUpdate storage.ReferentialAction, err error) {
+	for p.cur.Typ == tKeyword && p.cur.Val == "ON" {
+		p.next()
+		switch {
+		case p.cur.Typ == tKeyword && p.cur.Val == "DELETE":
+			p.next()
+			onDelete, err = p.parseReferentialAction()
+		case p.cur.Typ == tKeyword && p.cur.Val == "UPDATE":
+			p.next()
+			onUpdate, err = p.parseReferentialAction()
+		default:
+			return onDelete, onUpdate, p.errf("expected DELETE or UPDATE after ON")
+		}
+		if err != nil {
+			return onDelete, onUpdate, err
+		}
+	}
+	return onDelete, onUpdate, nil
+}
+
+// parseReferentialAction parses CASCADE | SET NULL | RESTRICT | NO ACTION,
+// the token(s) following ON DELETE/ON UPDATE.
+func (p *Parser) parseReferentialAction() (storage.ReferentialAction, error) {
+	if p.cur.Typ != tKeyword {
+		return storage.NoAction, p.errf("expected a referential action (CASCADE, SET NULL, RESTRICT, or NO ACTION)")
+	}
+	switch p.cur.Val {
+	case "CASCADE":
+		p.next()
+		return storage.Cascade, nil
+	case "RESTRICT":
+		p.next()
+		return storage.Restrict, nil
+	case "SET":
+		p.next()
+		if err := p.expectKeyword("NULL"); err != nil {
+			return storage.NoAction, err
+		}
+		return storage.SetNull, nil
+	case "NO":
+		p.next()
+		if err := p.expectKeyword("ACTION"); err != nil {
+			return storage.NoAction, err
+		}
+		return storage.NoAction, nil
+	}
+	return storage.NoAction, p.errf("expected a referential action (CASCADE, SET NULL, RESTRICT, or NO ACTION)")
 }
 
 var typeKeywordMap = map[string]storage.ColType{
@@ -2817,7 +2999,13 @@ func (p *Parser) parseQualifiedIdentLike() string {
 }
 
 // Expressions
-func (p *Parser) parseExpr() (Expr, error) { return p.parseOr() }
+func (p *Parser) parseExpr() (Expr, error) {
+	if err := p.enterRecursion(); err != nil {
+		return nil, err
+	}
+	defer p.exitRecursion()
+	return p.parseOr()
+}
 func (p *Parser) parseOr() (Expr, error) {
 	l, err := p.parseAnd()
 	if err != nil {

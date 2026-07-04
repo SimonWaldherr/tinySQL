@@ -126,10 +126,29 @@ func (s *Scheduler) Stop() {
 		exec.cancelFn()
 	}
 
-	s.wg.Wait()
+	// s.wg.Wait() has no timeout of its own: a job that ignores context
+	// cancellation (e.g. blocked on I/O the job's SQL doesn't check ctx
+	// inside) would hang here forever, and since Stop is called from
+	// DB.Close, that means a stuck job could hang the whole shutdown path
+	// indefinitely. Bound the wait so shutdown always completes.
+	waitDone := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+	case <-time.After(schedulerShutdownTimeout):
+		log.Printf("job scheduler: %d job(s) did not finish within %s of Stop being called; continuing shutdown anyway", len(running), schedulerShutdownTimeout)
+	}
 
 	log.Println("Job scheduler stopped")
 }
+
+// schedulerShutdownTimeout bounds how long Stop waits for already-running
+// jobs to exit after their context is canceled, so a misbehaving job (one
+// that doesn't check ctx.Done()) can't hang the whole DB.Close() path.
+const schedulerShutdownTimeout = 30 * time.Second
 
 // scheduleJob registers a job with the appropriate scheduler
 func (s *Scheduler) scheduleJob(job *CatalogJob) error {
