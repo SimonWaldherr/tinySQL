@@ -2649,15 +2649,42 @@ type simpleAggregatePlan struct {
 	outputCols []string
 }
 
+// aggKind identifies which aggregate a simpleAggregateProjection computes in
+// the raw fast path. Kept as a small enum (rather than a string) so the hot
+// per-row switch in executeSimpleAggregateFastPath stays branch-cheap.
+type aggKind byte
+
+const (
+	aggGroupCol aggKind = iota
+	aggCount
+	aggSum
+	aggAvg
+	aggMin
+	aggMax
+)
+
 type simpleAggregateProjection struct {
-	name     string
-	groupCol bool
-	countArg Expr
+	name string
+	kind aggKind
+	arg  Expr // nil for the group-by column and for COUNT(*)
 }
 
+// simpleAggregateState accumulates one group's aggregates directly (SUM as a
+// running float/rational, MIN/MAX as a running best value) instead of
+// buffering every matching row and re-scanning it once per aggregate
+// expression, which is what the general (non-fast-path) GROUP BY evaluator
+// does. sumRat/useRat mirror evalAggregateSumAvg's float->big.Rat promotion
+// so SUM/AVG over DECIMAL/MONEY columns stays exact; they're left nil for
+// groups that never see a decimal value, avoiding the allocation entirely
+// for the common all-numeric case.
 type simpleAggregateState struct {
 	groupValue any
-	counts     []int
+	counts     []int // COUNT result, or non-null sample count for SUM/AVG
+	sumFloat   []float64
+	sumRat     []*big.Rat
+	useRat     []bool
+	minmax     []any
+	haveMinMax []bool
 }
 
 func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error) {
@@ -2691,24 +2718,81 @@ func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 			state = &simpleAggregateState{
 				groupValue: groupValue,
 				counts:     make([]int, len(plan.projs)),
+				sumFloat:   make([]float64, len(plan.projs)),
+				minmax:     make([]any, len(plan.projs)),
+				haveMinMax: make([]bool, len(plan.projs)),
 			}
 			groups[key] = state
 			order = append(order, key)
 		}
 		for i, proj := range plan.projs {
-			if proj.groupCol {
+			switch proj.kind {
+			case aggGroupCol:
 				continue
-			}
-			if proj.countArg == nil {
-				state.counts[i]++
-				continue
-			}
-			v, err := evalRawExpr(rawPlan, raw, proj.countArg)
-			if err != nil {
-				return nil, true, err
-			}
-			if v != nil {
-				state.counts[i]++
+			case aggCount:
+				if proj.arg == nil {
+					state.counts[i]++
+					continue
+				}
+				v, err := evalRawExpr(rawPlan, raw, proj.arg)
+				if err != nil {
+					return nil, true, err
+				}
+				if v != nil {
+					state.counts[i]++
+				}
+			case aggSum, aggAvg:
+				v, err := evalRawExpr(rawPlan, raw, proj.arg)
+				if err != nil {
+					return nil, true, err
+				}
+				if v == nil {
+					continue
+				}
+				if f, ok := numeric(v); ok {
+					if state.useRat != nil && state.useRat[i] {
+						state.sumRat[i].Add(state.sumRat[i], new(big.Rat).SetFloat64(f))
+					} else {
+						state.sumFloat[i] += f
+					}
+					state.counts[i]++
+					continue
+				}
+				if rv, ok := storage.DecimalFromAny(v); ok {
+					if state.useRat == nil {
+						state.useRat = make([]bool, len(plan.projs))
+						state.sumRat = make([]*big.Rat, len(plan.projs))
+					}
+					if !state.useRat[i] {
+						state.sumRat[i] = new(big.Rat)
+						if state.counts[i] > 0 {
+							state.sumRat[i].SetFloat64(state.sumFloat[i])
+						}
+						state.useRat[i] = true
+					}
+					state.sumRat[i].Add(state.sumRat[i], new(big.Rat).Set(rv))
+					state.counts[i]++
+				}
+			case aggMin, aggMax:
+				v, err := evalRawExpr(rawPlan, raw, proj.arg)
+				if err != nil {
+					return nil, true, err
+				}
+				if v == nil {
+					continue
+				}
+				if !state.haveMinMax[i] {
+					state.minmax[i] = v
+					state.haveMinMax[i] = true
+					continue
+				}
+				cmp, err := compare(v, state.minmax[i])
+				if err != nil {
+					continue
+				}
+				if (proj.kind == aggMin && cmp < 0) || (proj.kind == aggMax && cmp > 0) {
+					state.minmax[i] = v
+				}
 			}
 		}
 	}
@@ -2718,10 +2802,31 @@ func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 		state := groups[key]
 		out := make(Row, len(plan.projs))
 		for i, proj := range plan.projs {
-			if proj.groupCol {
+			switch proj.kind {
+			case aggGroupCol:
 				putVal(out, proj.name, state.groupValue)
-			} else {
+			case aggCount:
 				putVal(out, proj.name, state.counts[i])
+			case aggSum:
+				if state.useRat != nil && state.useRat[i] {
+					putVal(out, proj.name, state.sumRat[i])
+				} else {
+					putVal(out, proj.name, state.sumFloat[i])
+				}
+			case aggAvg:
+				if state.counts[i] == 0 {
+					putVal(out, proj.name, nil)
+				} else if state.useRat != nil && state.useRat[i] {
+					putVal(out, proj.name, new(big.Rat).Quo(state.sumRat[i], big.NewRat(int64(state.counts[i]), 1)))
+				} else {
+					putVal(out, proj.name, state.sumFloat[i]/float64(state.counts[i]))
+				}
+			case aggMin, aggMax:
+				if state.haveMinMax[i] {
+					putVal(out, proj.name, state.minmax[i])
+				} else {
+					putVal(out, proj.name, nil)
+				}
 			}
 		}
 		outRows = append(outRows, out)
@@ -2761,11 +2866,11 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 		return nil, true, fmt.Errorf("unknown column %q", groupRef.Name)
 	}
 
-	projs, outputCols, hasCount, eligible, err := buildSimpleAggregateProjections(s, colIndex, groupCol)
+	projs, outputCols, hasAgg, eligible, err := buildSimpleAggregateProjections(s, colIndex, groupCol)
 	if err != nil {
 		return nil, true, err
 	}
-	if !eligible || !hasCount {
+	if !eligible || !hasAgg {
 		return nil, false, nil
 	}
 	return &simpleAggregatePlan{
@@ -2789,23 +2894,34 @@ func simpleAggregateEligibleSelect(s *Select) bool {
 func buildSimpleAggregateProjections(s *Select, colIndex map[string]int, groupCol int) ([]simpleAggregateProjection, []string, bool, bool, error) {
 	projs := make([]simpleAggregateProjection, 0, len(s.Projs))
 	outputCols := make([]string, 0, len(s.Projs))
-	hasCount := false
+	hasAgg := false
 
 	for i, it := range s.Projs {
-		proj, name, isCount, eligible, err := buildSimpleAggregateProjection(it, i, colIndex, groupCol)
+		proj, name, isAgg, eligible, err := buildSimpleAggregateProjection(it, i, colIndex, groupCol)
 		if err != nil {
 			return nil, nil, false, false, err
 		}
 		if !eligible {
 			return nil, nil, false, false, nil
 		}
-		if isCount {
-			hasCount = true
+		if isAgg {
+			hasAgg = true
 		}
 		projs = append(projs, proj)
 		outputCols = append(outputCols, name)
 	}
-	return projs, outputCols, hasCount, true, nil
+	return projs, outputCols, hasAgg, true, nil
+}
+
+// simpleAggFuncKinds maps the aggregate function names supported by the raw
+// GROUP BY fast path (executeSimpleAggregateFastPath) to their aggKind.
+// SUM/AVG/MIN/MAX join COUNT here so simple single-table GROUP BY queries
+// using any of these no longer fall back to the general row-map evaluator.
+var simpleAggFuncKinds = map[string]aggKind{
+	"SUM": aggSum,
+	"AVG": aggAvg,
+	"MIN": aggMin,
+	"MAX": aggMax,
 }
 
 func buildSimpleAggregateProjection(it SelectItem, idx int, colIndex map[string]int, groupCol int) (simpleAggregateProjection, string, bool, bool, error) {
@@ -2821,28 +2937,32 @@ func buildSimpleAggregateProjection(it SelectItem, idx int, colIndex map[string]
 		if refCol != groupCol {
 			return simpleAggregateProjection{}, "", false, false, nil
 		}
-		return simpleAggregateProjection{name: name, groupCol: true}, name, false, true, nil
+		return simpleAggregateProjection{name: name, kind: aggGroupCol}, name, false, true, nil
 	}
 
-	arg, ok := simpleCountArg(it.Expr)
-	if !ok || (arg != nil && !isSimpleRawExpr(arg)) {
+	fc, ok := it.Expr.(*FuncCall)
+	if !ok || fc.Distinct || fc.Over != nil {
 		return simpleAggregateProjection{}, "", false, false, nil
 	}
-	return simpleAggregateProjection{name: name, countArg: arg}, name, true, true, nil
-}
 
-func simpleCountArg(e Expr) (Expr, bool) {
-	fc, ok := e.(*FuncCall)
-	if !ok || fc.Name != "COUNT" || fc.Distinct {
-		return nil, false
+	if fc.Name == "COUNT" {
+		if fc.Star {
+			return simpleAggregateProjection{name: name, kind: aggCount}, name, true, true, nil
+		}
+		if len(fc.Args) != 1 || !isSimpleRawExpr(fc.Args[0]) {
+			return simpleAggregateProjection{}, "", false, false, nil
+		}
+		return simpleAggregateProjection{name: name, kind: aggCount, arg: fc.Args[0]}, name, true, true, nil
 	}
-	if fc.Star {
-		return nil, true
+
+	if kind, ok := simpleAggFuncKinds[fc.Name]; ok {
+		if fc.Star || len(fc.Args) != 1 || !isSimpleRawExpr(fc.Args[0]) {
+			return simpleAggregateProjection{}, "", false, false, nil
+		}
+		return simpleAggregateProjection{name: name, kind: kind, arg: fc.Args[0]}, name, true, true, nil
 	}
-	if len(fc.Args) != 1 {
-		return nil, false
-	}
-	return fc.Args[0], true
+
+	return simpleAggregateProjection{}, "", false, false, nil
 }
 
 func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error) {

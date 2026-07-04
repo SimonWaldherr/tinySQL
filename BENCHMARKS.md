@@ -166,32 +166,42 @@ rather than a hash join.
 
 | Backend | 10 cust / 50 orders | 50 cust / 500 orders | 100 cust / 2000 orders |
 |---|---|---|---|
-| tinySQL-Memory | 285 µs | 804 µs | 1.86 ms |
-| tinySQL-Disk | 534 µs | 1.06 ms | 2.37 ms |
-| **SQLite-modernc** | 368 µs | 623 µs | 1.73 ms |
+| tinySQL-Memory | 123 µs | 218 µs | 430 µs |
+| tinySQL-Disk | 224 µs | 310 µs | 660 µs |
+| **SQLite-modernc** | 200 µs | 522 µs | 1.60 ms |
 
-Closer race than the join benchmark: tinySQL-Memory is faster at the
-smallest size, roughly ties SQLite at 100 customers, and SQLite edges ahead as
-group count and row count both grow. SQLite's allocs/op stay flat and tiny
-(27→126 across the sweep) while tinySQL's grow with row count (321→7377) —
-tinySQL's `GROUP BY` currently builds a Go map keyed by group value plus a
-`Row` per aggregation bucket, so its allocation profile scales with input
-size rather than group count the way SQLite's does. This is a reasonable
-target for a future allocation-reduction pass, similar to the constraint-index
-work already done for INSERT/UPDATE/DELETE.
+**Update:** this originally showed tinySQL losing ground as size grew
+(SQLite ~1.73ms vs. tinySQL-Memory ~1.86ms at the largest size), because
+`SUM`/`AVG`/`MIN`/`MAX` fell off the raw-row GROUP BY fast path and went
+through the general row-map evaluator, which re-scans each group's buffered
+`Row` slice once per aggregate expression and pays full map-based row
+evaluation on top. Only `COUNT` had a fast path before this round.
+
+Extending `executeSimpleAggregateFastPath` (`internal/engine/exec.go`) to
+also accumulate `SUM`/`AVG`/`MIN`/`MAX` directly off the raw `[]any` row
+during the single group-by scan — the same way `COUNT` already did — cut
+this benchmark's cost dramatically: at 2000 orders, tinySQL-Memory went from
+1.86ms/950KB/7377 allocs to 430µs/85KB/912 allocs (~4.3x faster, ~11x less
+memory, ~8x fewer allocations). tinySQL now wins this benchmark at every
+size tested, including a ~3.7x win over SQLite at the largest size, instead
+of losing to it. `SUM`/`AVG` still fall back to `big.Rat` accumulation
+(mirroring the general evaluator) when they encounter a `DECIMAL`/`MONEY`
+value, so correctness for exact-decimal columns is unchanged — only the
+common all-numeric case got faster.
 
 ## Takeaways
 
 - **tinySQL wins decisively on read-heavy and low-latency-write workloads**
   when running in-memory or with its lightweight disk backends — full scans,
-  single inserts, joins, and mixed workloads are all 1.3-4.6x faster than
+  single inserts, joins, aggregates, and mixed workloads are all faster than
   SQLite at the row counts tested (10-2000 rows). This matches tinySQL's
   design as an embedded, allocation-light, single-process engine without
   SQLite's transactional-durability machinery in the hot path.
-- **SQLite pulls ahead on large bulk inserts** (1000+ rows in one loop),
-  indexed point lookups, and larger `GROUP BY` aggregations — all areas
-  where its mature B-tree engine, per-column binary encoding, and
-  low-allocation aggregate path pay off at scale.
+- **SQLite pulls ahead on large bulk inserts** (1000+ rows in one loop) and
+  indexed point lookups — areas where its mature B-tree engine and
+  per-column binary encoding pay off at scale. It no longer wins the
+  `GROUP BY` aggregate benchmark after the fast-path extension described
+  above.
 - **`tinySQL-Page`, the direct B+Tree backend, is currently the slowest
   option** for bulk writes — it doesn't yet do incremental/append writes at
   the page level, so every `SaveTable` call serializes the whole table. This
@@ -215,9 +225,11 @@ work already done for INSERT/UPDATE/DELETE.
    see `BenchmarkJoin`/`BenchmarkAggregate` in
    `benchmarks/query_benchmark_test.go`.
 3. Extend the row-count sweep beyond current sizes (e.g. 10k/100k rows) to
-   see where the bulk-insert and aggregate crossovers with SQLite happen and
-   how far they grow.
-4. Investigate tinySQL's `GROUP BY` allocation growth (see Aggregate results
-   above — allocs/op scales with input row count, not group count) as a
-   candidate for the same kind of allocation-reduction work already applied
-   to constraint checking and trigger dispatch.
+   see where the bulk-insert crossover with SQLite happens and how far it
+   grows.
+4. ~~Investigate tinySQL's `GROUP BY` allocation growth~~ — done; see the
+   Aggregate section above. `SUM`/`AVG`/`MIN`/`MAX` now join `COUNT` on the
+   raw-row fast path instead of falling back to the general row-map
+   evaluator. Remaining candidate: extend the same fast path to multi-column
+   `GROUP BY` (currently limited to a single group-by column) and to
+   `HAVING` clauses that only reference already-computed aggregates.

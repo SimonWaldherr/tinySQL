@@ -41,3 +41,5 @@ cmd/formigo/formigo
 formigo.db
 formigo.db.wal
 /.gomodcache
+benchmarks/cpu.out
+benchmarks/mem.out
