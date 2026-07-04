@@ -66,6 +66,7 @@ type CatalogManager struct {
 	jobRuns      []*CatalogJobHistory
 	nextRun      int64
 	triggers     map[string]*CatalogTrigger // keyed by trigger name
+	rbac         *rbacState                 // users/roles/grants; see rbac.go
 }
 
 // NewCatalogManager allocates and returns an initialized CatalogManager.
@@ -81,6 +82,7 @@ func NewCatalogManager() *CatalogManager {
 		jobRuns:      make([]*CatalogJobHistory, 0),
 		nextRun:      1,
 		triggers:     make(map[string]*CatalogTrigger),
+		rbac:         newRBACState(),
 	}
 }
 
