@@ -2293,6 +2293,7 @@ type simpleSelectPlan struct {
 	limit      *int
 	offset     *int
 	outputCols []string
+	rowMapCap  int
 }
 
 // simpleProjection describes a single SELECT item in the raw fast-path.
@@ -3409,6 +3410,7 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 		limit:      s.Limit,
 		offset:     s.Offset,
 		outputCols: outputCols,
+		rowMapCap:  simpleProjectionMapCap(projs),
 	}, true, nil
 }
 
@@ -3453,6 +3455,16 @@ func buildSimpleSelectProjections(items []SelectItem, colIndex map[string]int) (
 		outputCols = append(outputCols, proj.name)
 	}
 	return projs, outputCols, true
+}
+
+func simpleProjectionMapCap(projs []simpleProjection) int {
+	capHint := len(projs)
+	for _, p := range projs {
+		if p.altKey != "" {
+			capHint++
+		}
+	}
+	return capHint
 }
 
 // buildSimpleSelectStarProjections builds one direct-column-reference
@@ -3548,7 +3560,7 @@ func simpleColumnIndex(t *storage.Table, alias string) map[string]int {
 }
 
 func simpleSelectInitialCap(plan *simpleSelectPlan) int {
-	if plan.limit != nil && len(plan.orderBy) == 0 {
+	if plan.limit != nil {
 		capHint := *plan.limit
 		if plan.offset != nil {
 			capHint += *plan.offset
@@ -3556,6 +3568,9 @@ func simpleSelectInitialCap(plan *simpleSelectPlan) int {
 		if capHint > 0 && capHint < len(plan.table.Rows) {
 			return capHint
 		}
+	}
+	if plan.where == nil && len(plan.table.Rows) > 0 {
+		return len(plan.table.Rows)
 	}
 	if len(plan.table.Rows) < 64 {
 		return len(plan.table.Rows)
@@ -4613,7 +4628,7 @@ func rawEqual(a, b any) bool {
 }
 
 func projectRawRow(plan *simpleSelectPlan, raw []any) (Row, error) {
-	out := make(Row, len(plan.projs))
+	out := make(Row, plan.rowMapCap)
 	for _, p := range plan.projs {
 		var v any
 		if p.colIdx >= 0 {

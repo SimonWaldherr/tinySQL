@@ -119,4 +119,3 @@ func parseTriggerBody(body string) ([]Statement, error) {
 	}
 	return stmts, nil
 }
-
