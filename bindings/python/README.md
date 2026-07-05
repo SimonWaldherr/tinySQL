@@ -27,6 +27,11 @@ void        TinySQLFree(char* ptr);
 
 `TinySQLExec` accepts a UTF‑8 SQL string, executes it against an in-memory database (tenant `default`), and returns a JSON payload describing the outcome. `TinySQLSave` and `TinySQLLoad` allow persisting the database to disk. `TinySQLFree` must be called on every pointer returned by the `TinySQL*` functions (except `TinySQLReset`) to avoid a leak. `TinySQLReset` wipes the in-memory state so you can reuse the same process for multiple tests.
 
+Returned payloads are UTF-8 JSON and should be treated as RFC 8259 JSON.
+Future error objects can use SQLSTATE classification from the public tinySQL
+API. See [`../../docs/STANDARDS.md`](../../docs/STANDARDS.md) for the shared
+standards map.
+
 ## Python Usage
 
 A lightweight `ctypes` wrapper is provided in [example.py](./example.py). You can adapt it to your own application. The gist:

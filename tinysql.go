@@ -73,6 +73,7 @@ import (
 	"github.com/SimonWaldherr/tinySQL/internal/engine"
 	"github.com/SimonWaldherr/tinySQL/internal/importer"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
+	"github.com/SimonWaldherr/tinySQL/standards"
 )
 
 // ============================================================================
@@ -101,6 +102,9 @@ type Row = engine.Row
 // Returned by SELECT queries and available for inspection.
 type ResultSet = engine.ResultSet
 
+// SQLStateError attaches an ISO/IEC 9075 SQLSTATE code to an error.
+type SQLStateError = standards.SQLStateError
+
 // Statement is the base interface for all parsed SQL statements.
 // Use Parser.ParseStatement() to obtain a Statement from SQL text.
 type Statement = engine.Statement
@@ -116,6 +120,21 @@ type QueryCache = engine.QueryCache
 // CompiledQuery represents a pre-parsed SQL statement that can be executed
 // multiple times efficiently.
 type CompiledQuery = engine.CompiledQuery
+
+const (
+	SQLStateSuccessfulCompletion = standards.SQLStateSuccessfulCompletion
+	SQLStateWarning              = standards.SQLStateWarning
+	SQLStateNoData               = standards.SQLStateNoData
+	SQLStateDataException        = standards.SQLStateDataException
+	SQLStateInvalidDatetime      = standards.SQLStateInvalidDatetime
+	SQLStateInvalidParameter     = standards.SQLStateInvalidParameter
+	SQLStateSyntaxError          = standards.SQLStateSyntaxError
+	SQLStateUndefinedTable       = standards.SQLStateUndefinedTable
+	SQLStateIntegrityViolation   = standards.SQLStateIntegrityViolation
+	SQLStateInvalidAuthorization = standards.SQLStateInvalidAuthorization
+	SQLStateTransactionRollback  = standards.SQLStateTransactionRollback
+	SQLStateInternalError        = standards.SQLStateInternalError
+)
 
 // JobExecutor executes SQL text for scheduled jobs.
 type JobExecutor = storage.JobExecutor
@@ -530,6 +549,18 @@ func MustParseSQL(sql string) Statement {
 		panic(err)
 	}
 	return stmt
+}
+
+// WithSQLState wraps err with a SQLSTATE code. It is useful for integrations
+// that expose tinySQL errors over SQL drivers, HTTP APIs, or observability
+// pipelines where stable machine-readable error classes matter.
+func WithSQLState(state string, err error) error {
+	return standards.WithSQLState(state, err)
+}
+
+// SQLState returns the SQLSTATE attached to err, if present.
+func SQLState(err error) string {
+	return standards.SQLState(err)
 }
 
 // ============================================================================

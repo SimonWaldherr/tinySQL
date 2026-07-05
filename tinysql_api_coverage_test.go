@@ -2,6 +2,8 @@ package tinysql_test
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 
 	tsql "github.com/SimonWaldherr/tinySQL"
@@ -32,6 +34,17 @@ func TestPublicAPIWrappers(t *testing.T) {
 		}()
 		_ = tsql.MustParseSQL("CREATE TABLE")
 	}()
+}
+
+func TestPublicSQLStateHelpers(t *testing.T) {
+	base := fmt.Errorf("bad sql")
+	err := tsql.WithSQLState(tsql.SQLStateSyntaxError, base)
+	if got := tsql.SQLState(err); got != tsql.SQLStateSyntaxError {
+		t.Fatalf("SQLState = %q, want %q", got, tsql.SQLStateSyntaxError)
+	}
+	if !strings.Contains(err.Error(), tsql.SQLStateSyntaxError) {
+		t.Fatalf("expected SQLSTATE in error text, got %q", err.Error())
+	}
 }
 
 func TestPublicAPICompiledExecutionAndJobScheduler(t *testing.T) {
