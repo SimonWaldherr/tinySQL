@@ -111,6 +111,13 @@ type rbacState struct {
 	mu    sync.RWMutex
 	users map[string]*CatalogUser // key: lowercased name
 	roles map[string]*CatalogRole // key: lowercased name
+	// disabled forces RBAC off (IsRBACEnabled always returns false)
+	// regardless of whether users exist. See SetRBACEnabled — this is a
+	// separate override from HasUsers, not a replacement for it, so a
+	// setup that provisioned users/roles for later but isn't ready to
+	// enforce yet can flip enforcement back on later without recreating
+	// any of that state.
+	disabled bool
 }
 
 func newRBACState() *rbacState {
@@ -120,12 +127,44 @@ func newRBACState() *rbacState {
 	}
 }
 
-// HasUsers reports whether any user has been created — the switch that
-// turns RBAC enforcement on. See the package doc comment for why this is
-// opt-in.
+// HasUsers reports whether any user has been created. Note this ignores
+// SetRBACEnabled's override — use IsRBACEnabled to answer "is enforcement
+// actually active right now", which is what Execute checks.
 func (c *CatalogManager) HasUsers() bool {
 	c.rbac.mu.RLock()
 	defer c.rbac.mu.RUnlock()
+	return len(c.rbac.users) > 0
+}
+
+// SetRBACEnabled overrides the default opt-in-via-CreateUser behavior.
+// Pass false to force RBAC off — every Execute call is permitted
+// regardless of context, even if users/roles already exist — useful for a
+// setup that provisions accounts ahead of time but isn't ready to enforce
+// yet, or a dev/test environment that wants audit-log attribution (see
+// WithUser) without access checks getting in the way. Pass true to restore
+// the default: enforcement follows HasUsers() exactly as if
+// SetRBACEnabled had never been called.
+//
+// This is a deliberate escape hatch matching SetReadOnly's toggle pattern
+// elsewhere in this package — RBAC being opt-in-by-default already covers
+// "not needed in every setup" for anyone who simply never calls
+// CreateUser; this method is for the narrower case of a database that
+// *has* users defined but shouldn't enforce against them right now.
+func (c *CatalogManager) SetRBACEnabled(enabled bool) {
+	c.rbac.mu.Lock()
+	defer c.rbac.mu.Unlock()
+	c.rbac.disabled = !enabled
+}
+
+// IsRBACEnabled reports whether Execute currently enforces permissions:
+// true if SetRBACEnabled(false) was never called (or was reverted via
+// SetRBACEnabled(true)) and at least one user exists.
+func (c *CatalogManager) IsRBACEnabled() bool {
+	c.rbac.mu.RLock()
+	defer c.rbac.mu.RUnlock()
+	if c.rbac.disabled {
+		return false
+	}
 	return len(c.rbac.users) > 0
 }
 

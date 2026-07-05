@@ -123,6 +123,10 @@ type ExecEnv struct {
 // more for a safety fix than maximum parallelism.
 func Execute(ctx context.Context, db *storage.DB, tenant string, stmt Statement) (rs *ResultSet, err error) {
 	if err := checkPermission(ctx, db, stmt); err != nil {
+		// A denied attempt is itself a security-relevant event — arguably
+		// more worth auditing than a routine success — so it's logged even
+		// though nothing ran and no lock was ever taken.
+		recordAudit(ctx, db, tenant, stmt, err)
 		return nil, err
 	}
 	if isReadOnlyStatement(stmt) {
@@ -132,6 +136,13 @@ func Execute(ctx context.Context, db *storage.DB, tenant string, stmt Statement)
 		db.LockContentForWrite()
 		defer db.UnlockContentForWrite()
 	}
+	// Registered before the recover defer below so it runs *after* it
+	// during unwind (defers run LIFO): recover finalizes err first, then
+	// this reads the now-final value — including errors turned from a
+	// panic — rather than an err that's still mid-update.
+	defer func() {
+		recordAudit(ctx, db, tenant, stmt, err)
+	}()
 	// cmd/server and cmd/tinysqld already recover from panics at their own
 	// request boundary, but an application embedding tinySQL directly (via
 	// this function or the database/sql driver) has no such guard — a bug
@@ -144,6 +155,27 @@ func Execute(ctx context.Context, db *storage.DB, tenant string, stmt Statement)
 		}
 	}()
 	return execStmt(ExecEnv{ctx: ctx, tenant: tenant, db: db}, stmt)
+}
+
+// recordAudit appends one entry to db's audit log, if one is attached
+// (see storage.DB.AttachAuditLog). A no-op — including skipping the
+// auditTextFromContext/UserFromContext lookups — when none is configured,
+// so callers that never enable auditing pay no cost per statement.
+func recordAudit(ctx context.Context, db *storage.DB, tenant string, stmt Statement, err error) {
+	log := db.AuditLog()
+	if log == nil {
+		return
+	}
+	text, ok := auditTextFromContext(ctx)
+	if !ok {
+		text = fmt.Sprintf("<%T>", stmt)
+	}
+	user, _ := UserFromContext(ctx)
+	errMsg := ""
+	if err != nil {
+		errMsg = err.Error()
+	}
+	log.Append(tenant, user, text, err == nil, errMsg)
 }
 
 // execStmt is Execute's dispatch logic without the content lock. It exists

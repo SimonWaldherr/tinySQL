@@ -203,3 +203,68 @@ func TestGenerateRandomPassword(t *testing.T) {
 		t.Errorf("expected 32-char hex string, got %d chars: %q", len(p1), p1)
 	}
 }
+
+func TestRBACExplicitDisableOverridesHasUsers(t *testing.T) {
+	db := storage.NewDB()
+	cat := db.Catalog()
+	if err := cat.CreateRole("admin_role"); err != nil {
+		t.Fatalf("CreateRole: %v", err)
+	}
+	if err := cat.GrantPermission("admin_role", storage.PermAll, "*", "*"); err != nil {
+		t.Fatalf("GrantPermission: %v", err)
+	}
+	if err := cat.CreateUser("admin", "pw", []string{"admin_role"}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	if !db.IsRBACEnabled() {
+		t.Fatal("expected RBAC to be enabled once a user exists")
+	}
+	if _, err := Execute(context.Background(), db, "default", mustParse(`CREATE TABLE t (id INT)`)); err == nil {
+		t.Fatal("expected an unauthenticated request to be denied while RBAC is active")
+	}
+
+	db.SetRBACEnabled(false)
+	if db.IsRBACEnabled() {
+		t.Fatal("expected IsRBACEnabled to report false after SetRBACEnabled(false)")
+	}
+	// Same unauthenticated context that was denied a moment ago must now
+	// succeed — users/roles still exist, but enforcement is off.
+	if _, err := Execute(context.Background(), db, "default", mustParse(`CREATE TABLE t (id INT)`)); err != nil {
+		t.Fatalf("expected the request to succeed once RBAC is explicitly disabled: %v", err)
+	}
+	if _, err := Execute(context.Background(), db, "default", mustParse(`INSERT INTO t VALUES (1)`)); err != nil {
+		t.Fatalf("expected INSERT to succeed while RBAC is disabled: %v", err)
+	}
+
+	db.SetRBACEnabled(true)
+	if !db.IsRBACEnabled() {
+		t.Fatal("expected IsRBACEnabled to report true again after SetRBACEnabled(true)")
+	}
+	if _, err := Execute(context.Background(), db, "default", mustParse(`INSERT INTO t VALUES (2)`)); err == nil {
+		t.Fatal("expected enforcement to resume after SetRBACEnabled(true), denying an unauthenticated request again")
+	}
+	// The existing admin account and its grants must still work — disabling
+	// and re-enabling must not have lost any RBAC state.
+	adminCtx := WithUser(context.Background(), "admin")
+	if _, err := Execute(adminCtx, db, "default", mustParse(`INSERT INTO t VALUES (2)`)); err != nil {
+		t.Fatalf("expected admin's grants to still work after the disable/re-enable cycle: %v", err)
+	}
+}
+
+func TestRBACDisableBeforeAnyUserIsANoOp(t *testing.T) {
+	// Calling SetRBACEnabled on a database with no users at all shouldn't
+	// break anything either way — IsRBACEnabled must stay false regardless.
+	db := storage.NewDB()
+	db.SetRBACEnabled(false)
+	if db.IsRBACEnabled() {
+		t.Fatal("expected IsRBACEnabled to be false with no users, disabled")
+	}
+	db.SetRBACEnabled(true)
+	if db.IsRBACEnabled() {
+		t.Fatal("expected IsRBACEnabled to still be false with no users, even after SetRBACEnabled(true) (no users exist to enforce against)")
+	}
+	if _, err := Execute(context.Background(), db, "default", mustParse(`CREATE TABLE t (id INT)`)); err != nil {
+		t.Fatalf("expected CREATE TABLE to succeed with no users regardless of the toggle: %v", err)
+	}
+}

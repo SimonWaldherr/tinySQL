@@ -9,8 +9,13 @@
 // composes with context.WithTimeout/WithCancel that callers already use.
 //
 // Enforcement itself is opt-in at the database level: checkPermission is a
-// no-op unless db.Catalog().HasUsers() is true, so every existing embedder
-// and test that never creates a user sees zero behavior change.
+// no-op unless db.IsRBACEnabled() is true (which itself is false until the
+// first CreateUser call), so every existing embedder and test that never
+// creates a user sees zero behavior change. Call db.SetRBACEnabled(false)
+// to force enforcement off even after users/roles have been created — for
+// a setup that provisions accounts ahead of time but isn't ready to
+// enforce yet, or a dev/test environment that wants audit-log attribution
+// via WithUser without access checks getting in the way.
 package engine
 
 import (
@@ -39,10 +44,10 @@ func UserFromContext(ctx context.Context) (string, bool) {
 }
 
 // checkPermission enforces RBAC for stmt, if enabled. Returns nil
-// immediately if db has no users defined (RBAC off) — see the package doc
-// comment above and storage.CatalogManager.HasUsers.
+// immediately if RBAC isn't active — see the package doc comment above and
+// storage.DB.IsRBACEnabled/SetRBACEnabled.
 func checkPermission(ctx context.Context, db *storage.DB, stmt Statement) error {
-	if !db.Catalog().HasUsers() {
+	if !db.IsRBACEnabled() {
 		return nil
 	}
 	user, ok := UserFromContext(ctx)

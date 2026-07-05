@@ -150,6 +150,16 @@ type StorageConfig struct {
 	// night, query during the day) — vector index and column caches can never
 	// be invalidated and the WAL is never appended to.
 	ReadOnly bool
+
+	// EncryptionKey, if set, must be exactly EncryptionKeySize (32) bytes
+	// and enables AES-256-GCM encryption at rest for table files (ModeDisk,
+	// ModeJSON). Derive it from a passphrase with DeriveKeyFromPassphrase
+	// (persist the salt yourself — this package doesn't manage key
+	// storage) or supply 32 cryptographically random bytes directly for a
+	// key-file-based setup. Leave nil for the default, unencrypted
+	// behavior. Not yet supported for ModeWAL/ModeAdvancedWAL/ModeHybrid/
+	// ModeIndex — see README's Limitations section.
+	EncryptionKey []byte
 }
 
 // DefaultStorageConfig returns a StorageConfig with sensible defaults for

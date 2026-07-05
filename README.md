@@ -38,6 +38,9 @@ Durable product forms now expose explicit lifecycle and observability hooks:
 - `Execute` recovers from panics and returns them as an error instead of crashing the host process — important for applications that call it directly rather than through `cmd/server`/`cmd/tinysqld` (which already had their own recovery middleware at the request boundary).
 - The parser rejects pathologically deep expression/subquery nesting (`maxParseDepth`, currently 200) with an ordinary parse error. Unbounded recursive-descent parsing on attacker-controlled input can otherwise exhaust the goroutine stack, which in Go is a fatal error that `recover()` cannot catch — this closes that gap before it becomes one.
 - Trigger bodies are stored and re-parsed from their **original source text**, not a lossy reprint of the parsed AST. The previous AST-to-SQL serializer was an unfinished placeholder that produced non-executable text (`"INSERT INTO x ... (trigger body)"`), so **every trigger with an INSERT/UPDATE/DELETE body silently failed on every fire** — this is now fixed, including `NEW.col`/`OLD.col` references inside the body.
+- **Role-based access control (RBAC)**: users authenticate with a bcrypt-hashed password and hold one or more roles; roles carry grants (`SELECT`/`INSERT`/`UPDATE`/`DELETE`/`DDL`/`ALL` on a schema/table, with `*` wildcards). Opt-in — enforcement only activates once the first `CREATE USER` runs, so every existing embedder/test that never touches users sees zero behavior change. See "Role-based access control" below.
+- **Tamper-evident audit log**: every statement `Execute` runs can be recorded to an append-only, hash-chained log (`tinysql.OpenAuditLog`) — altering, reordering, or deleting a logged entry breaks the chain in a way `Verify` detects. See "Audit logging" below.
+- **Encryption at rest**: `StorageConfig.EncryptionKey` enables AES-256-GCM encryption of table files for `ModeDisk`/`ModeJSON`. GCM is authenticated, so decrypting with the wrong key or tampered data fails closed with an error instead of returning garbage. See "Encryption at rest" below.
 
 ### Security checklist for `cmd/server` (gRPC + HTTP query server)
 
@@ -67,6 +70,106 @@ if err := inst.Restart(); err != nil {
     log.Fatal(err)
 }
 ```
+
+### Role-based access control
+
+```sql
+-- Bootstrap: RBAC is off until the first CREATE USER runs, so this
+-- sequence needs no authenticated context yet.
+CREATE ROLE admin_role;
+GRANT ALL ON * TO ROLE admin_role;
+CREATE USER admin WITH PASSWORD 'change-me' ROLE admin_role;
+-- RBAC is now ON. Every further statement needs an authenticated context.
+```
+
+```go
+ctx := context.Background()
+db := tinysql.NewDB()
+
+run := func(c context.Context, sql string) (*tinysql.ResultSet, error) {
+    stmt, err := tinysql.ParseSQL(sql)
+    if err != nil {
+        return nil, err
+    }
+    return tinysql.Execute(c, db, "default", stmt)
+}
+
+run(ctx, `CREATE ROLE admin_role`)
+run(ctx, `GRANT ALL ON * TO ROLE admin_role`)
+run(ctx, `CREATE USER admin WITH PASSWORD 'change-me' ROLE admin_role`)
+
+// RBAC is active now — attach the acting user via context.
+adminCtx := tinysql.WithUser(ctx, "admin")
+run(adminCtx, `CREATE ROLE readonly`)
+run(adminCtx, `GRANT SELECT ON * TO ROLE readonly`)
+run(adminCtx, `CREATE USER viewer WITH PASSWORD 'viewpass' ROLE readonly`)
+
+viewerCtx := tinysql.WithUser(ctx, "viewer")
+run(viewerCtx, `SELECT * FROM orders`)          // allowed
+run(viewerCtx, `DELETE FROM orders WHERE id=1`) // err: "access denied: user \"viewer\" lacks DELETE permission..."
+```
+
+Grant/permission model:
+
+| SQL | Effect |
+|---|---|
+| `CREATE USER name WITH PASSWORD 'pw' [ROLE r1[, r2...]]` | Creates a user; password is bcrypt-hashed, never stored in plaintext |
+| `ALTER USER name ENABLE\|DISABLE` | Disables a user without deleting their account (audit history stays attributable) |
+| `ALTER USER name WITH PASSWORD 'newpw'` | Changes password, preserving role memberships |
+| `DROP USER name` / `CREATE ROLE r` / `DROP ROLE r` | — |
+| `GRANT perm[, perm...] ON [schema.]table\|* TO ROLE r` | `perm` is `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `DDL`, or `ALL`; `*` for table/schema means "every table"/"every schema" |
+| `REVOKE perm[, perm...] ON target FROM ROLE r` | Exact-match revoke of a previously granted permission |
+| `GRANT ROLE r TO USER u` / `REVOKE ROLE r FROM USER u` | Role membership |
+
+RBAC isn't needed in every setup — the default already handles that: never call `CREATE USER` and enforcement never activates, no extra step required. For the narrower case of a database that *has* users/roles defined (maybe provisioned ahead of time, or from a previous run) but shouldn't enforce against them right now, there's an explicit override:
+
+```go
+db.SetRBACEnabled(false) // force enforcement off, even though users exist
+db.IsRBACEnabled()       // false
+// ... run statements with no user in context, as if RBAC were never configured ...
+db.SetRBACEnabled(true)  // resume enforcement; all existing users/roles/grants still work
+```
+
+**Gotchas**: RBAC enforcement is all-or-nothing per database — once any user exists (and `SetRBACEnabled(false)` hasn't been called), *every* statement (from any caller) needs `tinysql.WithUser(ctx, name)` in its context, or it's rejected, including statements from code that predates RBAC being enabled. User/role management itself (`CREATE USER`, `GRANT`, ...) requires a wildcard (`schema="*"`, `table="*"`) `DDL` grant specifically, not merely DDL on some table — a role scoped to one schema can create tables there but can't mint new users. Composite/multi-table permission checks aren't attempted: a `SELECT` with a subquery or joined tables only checks the outer `FROM` table (see `requiredPermission` in `internal/engine/rbac.go` for the exact, documented scope).
+
+### Audit logging
+
+```go
+auditLog, err := tinysql.OpenAuditLog("data/audit.jsonl")
+if err != nil {
+    log.Fatal(err) // includes "tampered with" detail if an existing log fails verification on open
+}
+defer auditLog.Close()
+db.AttachAuditLog(auditLog)
+
+ctx := tinysql.WithAuditText(tinysql.WithUser(context.Background(), "alice"), sqlText)
+tinysql.Execute(ctx, db, "default", stmt)
+// auditLog now has one entry: {Seq, Timestamp, Tenant, User: "alice",
+// Statement: sqlText, Success, Error, PrevHash, Hash}
+
+if err := auditLog.Verify(); err != nil {
+    log.Fatalf("audit log integrity check failed: %v", err)
+}
+```
+
+Each entry's `Hash` covers its own fields *and* the previous entry's hash — the same chaining primitive git commit history and blockchains use. Editing, reordering, or deleting a logged entry breaks the chain from that point forward, which `Verify` detects and reports (identifying the first entry, by `Seq`, where the recorded hash no longer matches). `OpenAuditLog` replays and verifies an existing file automatically, so a tampered log is rejected at startup rather than silently trusted.
+
+**What this does and doesn't guarantee**: a hash chain makes tampering with recorded entries *detectable*, not *impossible* — anyone with write access to the log file can still edit it, they just can't do so without `Verify` noticing (with one exception: truncating a *valid suffix* off the end, i.e. deleting the most recent N entries wholesale, produces a shorter chain that still verifies cleanly on its own terms, since there's nothing left to contradict). True tamper-*prevention* needs an append-only filesystem, remote log shipping, or signing with a key the log's own host doesn't hold — all outside an embedded database's scope. `Execute` records the original SQL text only if the caller attaches it via `WithAuditText` (there's no reliable way to reconstruct exact SQL from a parsed AST — the same reason the trigger-body bug existed); without it, entries fall back to a `<*engine.Insert>`-style statement-kind description.
+
+### Encryption at rest
+
+```go
+salt, _ := tinysql.NewEncryptionSalt() // generate once, persist it yourself (e.g. next to the data directory)
+key := tinysql.DeriveKeyFromPassphrase("correct horse battery staple", salt)
+
+db, err := tinysql.OpenDB(tinysql.StorageConfig{
+    Mode:          tinysql.ModeDisk, // or ModeJSON
+    Path:          "./data",
+    EncryptionKey: key,
+})
+```
+
+Table files are encrypted with AES-256-GCM — authenticated encryption, so decrypting with the wrong key or reading a file that was altered after being written fails with an explicit error instead of returning corrupted or stale-looking data. Passphrase-based keys use Argon2id (memory-hard, resists large-scale offline guessing far better than a plain PBKDF2/SHA-based hash); you can also supply 32 raw random bytes directly (`tinysql.EncryptionKeySize`) for a key-file-based setup instead of a passphrase. Only `ModeDisk`/`ModeJSON` are covered today — `ModeWAL`/`ModeAdvancedWAL`/`ModeHybrid`/`ModeIndex` and the backend manifest file are not yet encrypted; see "Limitations" below.
 
 ### Read-only mode for bulk-load / serve-only workloads
 
@@ -855,6 +958,26 @@ workloads. Known, current limitations (as opposed to planned features — see
 - **No NEON kernel for Manhattan/L1 vector distance on arm64** (Dot and L2
   have one); it uses the portable unrolled Go path there. See "SIMD kernel
   coverage" under Vectors.
+- **RBAC permission checks are single-table, not per-referenced-table.** A
+  `SELECT` with a subquery, join, or CTE only checks the outer `FROM`
+  table's permission, not every table it actually reads — see "Role-based
+  access control" above for the exact, documented scope.
+- **Encryption at rest covers `ModeDisk`/`ModeJSON` table files only.**
+  `ModeWAL`/`ModeAdvancedWAL`/`ModeHybrid`/`ModeIndex` and the backend
+  manifest file (table/column names, not row data) are not encrypted.
+- **The audit log's hash chain detects tampering with recorded entries, not
+  wholesale truncation of the most recent ones.** Deleting the last N
+  entries from an audit log file produces a shorter chain that still
+  verifies cleanly — there's nothing left to contradict it against. True
+  tamper-*prevention* (vs. detection) needs an append-only filesystem,
+  remote log shipping, or external signing, all outside this package's
+  scope.
+- **No cluster/replication story.** Combined with the single-process
+  limitation above: there is currently no leader/follower setup, no
+  automatic failover, and no distributed consensus. For availability
+  beyond a single machine, replicate at the infrastructure level (e.g.
+  periodic `SaveToFile`/`AdvancedWAL` shipping to a standby) rather than
+  expecting tinySQL to coordinate this itself.
 
 ## Testing
 

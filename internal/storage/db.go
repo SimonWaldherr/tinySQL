@@ -419,6 +419,9 @@ type DB struct {
 	// Advanced WAL (optional - replaces basic WAL when enabled)
 	advancedWAL *AdvancedWAL
 
+	// Optional tamper-evident audit log; see AttachAuditLog.
+	auditLog *AuditLog
+
 	// System catalog for metadata and job scheduling
 	catalog *CatalogManager
 
@@ -466,6 +469,26 @@ func (db *DB) IsReadOnly() bool {
 	return db.readOnly.Load()
 }
 
+// SetRBACEnabled overrides RBAC's default opt-in-via-CreateUser behavior;
+// see CatalogManager.SetRBACEnabled for the full explanation. A convenience
+// delegate to db.Catalog().SetRBACEnabled, provided directly on DB to
+// mirror SetReadOnly above (the same "toggle a behavior" shape).
+func (db *DB) SetRBACEnabled(enabled bool) {
+	if db == nil {
+		return
+	}
+	db.Catalog().SetRBACEnabled(enabled)
+}
+
+// IsRBACEnabled reports whether Execute currently enforces RBAC
+// permissions. A convenience delegate to db.Catalog().IsRBACEnabled.
+func (db *DB) IsRBACEnabled() bool {
+	if db == nil {
+		return false
+	}
+	return db.Catalog().IsRBACEnabled()
+}
+
 // LockContentForRead acquires the database's content lock for a read-only
 // statement (SELECT/EXPLAIN/PRAGMA). Multiple readers may hold this
 // concurrently; it excludes concurrent LockContentForWrite callers. Callers
@@ -503,6 +526,22 @@ func NewDB() *DB {
 		mvcc:        NewMVCCManager(),
 		storageMode: ModeMemory,
 	}
+}
+
+// applyEncryptionKey enables AES-256-GCM encryption at rest on backend when
+// key is non-empty, validating its length immediately with a clear error —
+// rather than letting a wrong-size key surface later as an opaque failure
+// the first time SaveTable/LoadTable actually tries to use it.
+func applyEncryptionKey(backend *DiskBackend, key []byte) error {
+	if len(key) == 0 {
+		return nil
+	}
+	enc, err := NewEncryptor(key)
+	if err != nil {
+		return fmt.Errorf("storage encryption: %w", err)
+	}
+	backend.SetEncryptor(enc)
+	return nil
 }
 
 // OpenDB creates or opens a database with the specified storage configuration.
@@ -601,6 +640,9 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 		if err != nil {
 			return nil, fmt.Errorf("open disk db: %w", err)
 		}
+		if err := applyEncryptionKey(backend, cfg.EncryptionKey); err != nil {
+			return nil, err
+		}
 		db.backend = backend
 
 	case ModeJSON:
@@ -610,6 +652,9 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 		backend, err := NewJSONBackend(cfg.Path, cfg.CompressFiles)
 		if err != nil {
 			return nil, fmt.Errorf("open json db: %w", err)
+		}
+		if err := applyEncryptionKey(backend, cfg.EncryptionKey); err != nil {
+			return nil, err
 		}
 		db.backend = backend
 
@@ -1610,6 +1655,25 @@ func (db *DB) AdvancedWAL() *AdvancedWAL {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	return db.advancedWAL
+}
+
+// AttachAuditLog attaches a tamper-evident audit log to the database. Once
+// attached, internal/engine.Execute records every statement to it (see
+// internal/engine/audit.go). Pass nil to detach (stop logging); Execute
+// treats a nil audit log as "logging disabled", matching the opt-in
+// pattern used throughout this session's hardening work (RBAC, read-only
+// mode, the security warning in cmd/server).
+func (db *DB) AttachAuditLog(log *AuditLog) {
+	db.mu.Lock()
+	db.auditLog = log
+	db.mu.Unlock()
+}
+
+// AuditLog returns the attached audit log, or nil if none is configured.
+func (db *DB) AuditLog() *AuditLog {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.auditLog
 }
 
 // MVCC returns the MVCC manager.

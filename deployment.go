@@ -3,6 +3,7 @@ package tinysql
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 )
@@ -82,7 +83,7 @@ func OpenDeployment(cfg DeploymentConfig) (*Instance, error) {
 
 	var db *DB
 	var err error
-	if mode == DeploymentPackage && cfg.Storage == (StorageConfig{}) {
+	if mode == DeploymentPackage && reflect.DeepEqual(cfg.Storage, StorageConfig{}) {
 		db = NewDB()
 	} else {
 		db, err = OpenDB(cfg.Storage)
@@ -199,7 +200,7 @@ func (i *Instance) Start() error {
 
 	var db *DB
 	var err error
-	if cfg.Mode == DeploymentPackage && cfg.Storage == (StorageConfig{}) {
+	if cfg.Mode == DeploymentPackage && reflect.DeepEqual(cfg.Storage, StorageConfig{}) {
 		db = NewDB()
 	} else {
 		db, err = OpenDB(cfg.Storage)
