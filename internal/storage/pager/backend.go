@@ -208,10 +208,7 @@ func (pb *PageBackend) SaveTable(tenant string, td *TableData) error {
 	for i, row := range td.Rows {
 		key := RowKey(int64(i))
 		encBuf = MarshalRow(row, encBuf)
-		// Copy because BTree may retain the buffer.
-		val := make([]byte, len(encBuf))
-		copy(val, encBuf)
-		if err := bt.Insert(txID, key, val); err != nil {
+		if err := bt.Insert(txID, key, encBuf); err != nil {
 			pb.pager.AbortTx(txID)
 			return fmt.Errorf("insert row %d: %w", i, err)
 		}

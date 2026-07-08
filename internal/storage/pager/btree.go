@@ -184,7 +184,7 @@ func (bt *BTree) insertWithSplit(txID TxID, path []PageID, entry LeafEntry) erro
 	// Collect all entries + new entry, sorted.
 	entries := bp.GetAllLeafEntries()
 	inserted := false
-	var merged []LeafEntry
+	merged := make([]LeafEntry, 0, len(entries)+1)
 	for _, e := range entries {
 		if !inserted && bytes.Compare(entry.Key, e.Key) <= 0 {
 			merged = append(merged, entry)
@@ -341,7 +341,7 @@ func (bt *BTree) splitInternal(txID TxID, path []PageID, leftChildID PageID, key
 
 	// Insert new entry in sorted order.
 	newEntry := InternalEntry{ChildID: leftChildID, Key: key}
-	var merged []InternalEntry
+	merged := make([]InternalEntry, 0, len(entries)+1)
 	inserted := false
 	for _, e := range entries {
 		if !inserted && bytes.Compare(key, e.Key) < 0 {
