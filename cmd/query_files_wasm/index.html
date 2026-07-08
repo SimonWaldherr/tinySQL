@@ -1572,6 +1572,10 @@
                     <button type="button" data-demo-filter="geo" onclick="setDemoQueryGroup('geo')">Geo</button>
                     <button type="button" data-demo-filter="search" onclick="setDemoQueryGroup('search')">Search/RAG</button>
                     <button type="button" data-demo-filter="analytics" onclick="setDemoQueryGroup('analytics')">Analytics</button>
+                    <button type="button" data-demo-filter="recent" onclick="setDemoQueryGroup('recent')">Recent</button>
+                </div>
+                <div class="example-query" onclick="setQuery('-- Last two months: what changed\nSELECT area, feature, browser_demo\nFROM release_features\nORDER BY area, feature')">
+                    🚀 Recent Features
                 </div>
                 <div class="example-query" onclick="setQuery('-- Sales by region\nSELECT region, SUM(quantity * unit_price) AS revenue\nFROM sales\nGROUP BY region\nORDER BY revenue DESC')">
                     📊 Sales by Region
@@ -1593,6 +1597,18 @@
                 </div>
                 <div class="example-query" onclick="setQuery('-- Window function: running total\nSELECT order_id, product, quantity,\n       SUM(quantity) OVER (ORDER BY order_id) AS running_total\nFROM sales')">
                     📈 Window Function
+                </div>
+                <div class="example-query" onclick="setQuery('-- PIVOT: product revenue by region\nSELECT region, widget_a, widget_b, widget_c\nFROM sales\nPIVOT (SUM(quantity * unit_price) FOR product IN (\'Widget A\' AS widget_a, \'Widget B\' AS widget_b, \'Widget C\' AS widget_c))\nORDER BY region')">
+                    🧮 SQL PIVOT
+                </div>
+                <div class="example-query" onclick="setQuery('-- Views, materialized views, RETURNING\nDROP MATERIALIZED VIEW IF EXISTS demo_revenue_mv;\nDROP VIEW IF EXISTS demo_paid_orders;\nCREATE VIEW demo_paid_orders AS\nSELECT customer_name, region, product, quantity * unit_price AS revenue\nFROM sales\nWHERE status = \'Delivered\';\nCREATE MATERIALIZED VIEW demo_revenue_mv AS\nSELECT region, SUM(revenue) AS revenue\nFROM demo_paid_orders\nGROUP BY region\nWITH DATA;\nINSERT INTO sales VALUES (1011, \'Acme Corp\', \'Widget D\', 10, 120.00, \'2024-03-01\', \'North\', \'Delivered\') RETURNING order_id, customer_name, quantity * unit_price AS returned_total;\nREFRESH MATERIALIZED VIEW demo_revenue_mv;\nSELECT region, revenue\nFROM demo_revenue_mv\nORDER BY revenue DESC')">
+                    🧱 Views + RETURNING
+                </div>
+                <div class="example-query" onclick="setQuery('-- EXPLAIN query plan\nEXPLAIN SELECT s.region, SUM(s.quantity * s.unit_price) AS revenue\nFROM sales s\nJOIN logistics l ON s.order_id = l.order_id\nGROUP BY s.region\nORDER BY revenue DESC')">
+                    🔍 EXPLAIN
+                </div>
+                <div class="example-query" onclick="setQuery('-- SQLite-compatible PRAGMA metadata\nPRAGMA table_info(sales)')">
+                    🧾 PRAGMA table_info
                 </div>
                 <div class="example-query" onclick="setQuery('-- Multi-statement: create and query\nCREATE TABLE temp (id INTEGER, label TEXT);\nINSERT INTO temp VALUES (1, \'alpha\');\nINSERT INTO temp VALUES (2, \'beta\');\nSELECT * FROM temp')">
                     🔁 Multi-Statement
@@ -1642,6 +1658,18 @@
                 <div class="example-query" onclick="setQuery('-- Hybrid text + vector ranking\nSELECT title, category,\n       FTS_RANK(content, \'vector OR search\') AS text_rank,\n       VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON(\'[1.0, 0.0, 0.0]\')) AS vector_similarity\nFROM ai_docs\nWHERE FTS_MATCH(content, \'vector OR search\')\nORDER BY vector_similarity DESC')">
                     🧩 Hybrid Retrieval
                 </div>
+                <div class="example-query" onclick="setQuery('-- RAG context expansion from vector top-k\nWITH topk AS (\n    SELECT doc_id, chunk_index, _vec_rank\n    FROM VEC_SEARCH(\'rag_chunks\', \'embedding\', VEC_FROM_JSON(\'[0.8, 0.6, 0.1]\'), 1, \'cosine\')\n)\nSELECT doc_id, chunk_index, chunk_text, _hit_rank, _context_offset\nFROM RAG_CONTEXT_FROM(\'rag_chunks\', \'doc_id\', \'chunk_index\', \'topk\', \'doc_id\', \'chunk_index\', 1)\nORDER BY _context_rank')">
+                    🔗 RAG Context
+                </div>
+                <div class="example-query" onclick="setQuery('-- FTS snippet and BM25-style score\nSELECT title,\n       FTS_SNIPPET(content, \'vector search\', \'<mark>\', \'</mark>\', \' ... \', 12) AS snippet,\n       BM25(content, \'vector search\') AS score\nFROM ai_docs\nWHERE FTS_MATCH(content, \'vector OR search\')\nORDER BY score DESC')">
+                    ✂️ FTS Snippet
+                </div>
+                <div class="example-query" onclick="setQuery('-- sys catalog: functions and procedures\nSELECT name, function_type, language\nFROM sys.functions\nWHERE name LIKE \'ST_%\' OR name LIKE \'RAG_%\' OR name IN (\'FTS_SEARCH\', \'VEC_SEARCH\')\nUNION ALL\nSELECT name, storage AS function_type, language\nFROM sys.procedures\nORDER BY name')">
+                    🧭 sys Catalog
+                </div>
+                <div class="example-query" onclick="setQuery('-- In-memory stored procedure: release matrix\nCALL demo_release_features()')">
+                    🚀 Release Procedure
+                </div>
                 <div class="example-query" onclick="setQuery('-- In-memory stored procedure\nCALL demo_table_summary()')">
                     🧾 Stored Procedure
                 </div>
@@ -1679,9 +1707,10 @@ Supported features:
 - JOIN (INNER, LEFT, RIGHT, FULL), CTE (WITH)
 - Window functions (ROW_NUMBER, SUM OVER, …)
 - Aggregations: COUNT, SUM, AVG, MIN, MAX
-- CASE expressions, sub-queries
+- CASE expressions, sub-queries, PIVOT, RETURNING
+- Views, materialized views, EXPLAIN, PRAGMA
 - Geo: ST_DISTANCE, ST_DWITHIN, ST_WITHIN_BBOX
-- Search: FTS_SEARCH, VEC_SEARCH, hybrid retrieval
+- Search: FTS_SEARCH, FTS_SNIPPET, VEC_SEARCH, RAG_CONTEXT, hybrid retrieval
 - Multi-statement (separated by ;)
 - Import: CSV, JSON, YAML, XML, GeoJSON, KML, OSM, routing graph, Excel
 -- Export: CSV, JSON, XML" aria-describedby="editorHelp" aria-expanded="false"></textarea>

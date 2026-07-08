@@ -11,12 +11,15 @@ const SQL_KEYWORDS = [
     'SELECT', 'FROM', 'WHERE', 'JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'FULL JOIN', 'INNER JOIN', 'CROSS JOIN',
     'ON', 'GROUP BY', 'ORDER BY', 'HAVING', 'LIMIT', 'OFFSET', 'DISTINCT', 'AS', 'AND', 'OR', 'NOT',
     'NULL', 'IN', 'EXISTS', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'LIKE', 'INSERT', 'UPDATE', 'DELETE',
-    'CREATE TABLE', 'ALTER TABLE', 'DROP TABLE', 'UNION', 'UNION ALL', 'INTERSECT', 'EXCEPT', 'WITH',
+    'CREATE TABLE', 'CREATE VIEW', 'CREATE MATERIALIZED VIEW', 'ALTER MATERIALIZED VIEW', 'REFRESH MATERIALIZED VIEW',
+    'DROP VIEW', 'DROP MATERIALIZED VIEW', 'ALTER TABLE', 'DROP TABLE', 'UNION', 'UNION ALL', 'INTERSECT', 'EXCEPT', 'WITH',
     'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'ROW_NUMBER', 'OVER', 'PARTITION BY', 'ASC', 'DESC', 'LIMIT',
+    'PIVOT', 'RETURNING', 'EXPLAIN', 'PRAGMA',
     'ST_MAKEPOINT', 'ST_POINT', 'ST_X', 'ST_Y', 'ST_DISTANCE', 'ST_DWITHIN', 'ST_WITHIN_BBOX',
     'GEO_POINT', 'GEO_DISTANCE', 'GEO_WITHIN_BBOX', 'FTS_MATCH', 'FTS_RANK', 'FTS_SEARCH',
     'FTS_SNIPPET', 'BM25', 'VEC_FROM_JSON', 'VEC_SEARCH', 'VEC_COSINE_SIMILARITY',
-    'VEC_DISTANCE', 'HASH', 'URL_PARSE', 'YAML_GET', 'CALL', 'ROUND'
+    'VEC_DISTANCE', 'RAG_CONTEXT', 'RAG_CONTEXT_FROM', 'RAG_HYBRID_SCORE', 'RAG_RANK_SCORE',
+    'RECENCY_SCORE', 'HASH', 'URL_PARSE', 'YAML_GET', 'CALL', 'ROUND'
 ];
 // Safe references to WASM-exported functions (set after init)
 let wasmApi = {
@@ -657,7 +660,36 @@ const DEMO_AI_DOCS = [
     }
 ];
 
+const DEMO_RAG_CHUNKS = [
+    { doc_id: 'tinySQL', chunk_index: 0, chunk_text: 'tinySQL added browser-ready file analytics, query history, snapshots, and shareable URL hash demos.', quality: 0.78, created_at: '2026-07-08 10:00:00', embedding: '[0.9, 0.2, 0.0]' },
+    { doc_id: 'tinySQL', chunk_index: 1, chunk_text: 'Geodata imports now cover GeoJSON, KML ExtendedData and MultiGeometry, OSM XML, routing graph NDJSON, Shapefile ZIP, and MBTiles metadata.', quality: 0.94, created_at: '2026-07-08 11:00:00', embedding: '[1.0, 0.1, 0.1]' },
+    { doc_id: 'tinySQL', chunk_index: 2, chunk_text: 'RAG helpers combine FTS snippets, vector search, context expansion, recency scoring, and quality-weighted hybrid ranking.', quality: 0.96, created_at: '2026-07-08 12:00:00', embedding: '[0.8, 0.6, 0.1]' },
+    { doc_id: 'tinySQL', chunk_index: 3, chunk_text: 'SQL analytics gained CTE views, materialized views, PIVOT, RETURNING, EXPLAIN, SQLite-compatible PRAGMA metadata, and richer sys catalog tables.', quality: 0.91, created_at: '2026-07-08 13:00:00', embedding: '[0.4, 0.9, 0.2]' },
+    { doc_id: 'ops', chunk_index: 0, chunk_text: 'Operational work added RBAC, audit logging, storage and WAL improvements, tinysqld HTTP APIs, MCP server tools, and tinyORM examples.', quality: 0.86, created_at: '2026-07-08 14:00:00', embedding: '[0.2, 0.4, 1.0]' }
+];
+
+const DEMO_RELEASE_FEATURES = [
+    { area: 'Geodata', feature: 'GeoJSON importer', added: '2026-07-08', browser_demo: 'Direct upload/import and ST_* SQL examples' },
+    { area: 'Geodata', feature: 'KML ExtendedData, SchemaData, MultiGeometry, altitude', added: '2026-07-08', browser_demo: 'Direct .kml import' },
+    { area: 'Geodata', feature: 'OSM XML nodes, ways, relations, refs, geometry', added: '2026-07-08', browser_demo: 'Direct .osm/.osm.xml import' },
+    { area: 'Geodata', feature: 'Routing graph JSON/CSV/NDJSON with node and edge tables', added: '2026-07-08', browser_demo: 'Direct .rg and .graph.json import' },
+    { area: 'Geodata', feature: 'Shapefile ZIP and MBTiles metadata imports', added: '2026-07-08', browser_demo: 'Go/CLI/server-side; documented in browser feature matrix' },
+    { area: 'Search/RAG', feature: 'FTS snippets, BM25 ranking, vector indexes, RAG context, hybrid scoring', added: '2026-05-10 to 2026-07-08', browser_demo: 'Direct SQL over ai_docs and rag_chunks' },
+    { area: 'Analytics SQL', feature: 'CTE views, materialized views, PIVOT, RETURNING, EXPLAIN', added: '2026-06-21 to 2026-07-08', browser_demo: 'Direct multi-statement SQL recipes' },
+    { area: 'Catalog', feature: 'sys.* metadata, dependencies, functions, procedures, SQLite-compatible PRAGMAs', added: '2026-06-21 to 2026-07-08', browser_demo: 'Direct catalog queries' },
+    { area: 'Security/Ops', feature: 'RBAC, audit logs, encryption, WAL/storage, tinysqld, MCP server', added: '2026-05-14 to 2026-07-05', browser_demo: 'Feature matrix and metadata queries; server-side examples in Go tools' },
+    { area: 'Developer UX', feature: 'tinyORM, public importer/resultutil/sqlutil/jobs/standards packages, gh-pages workflow', added: '2026-07-05 to 2026-07-08', browser_demo: 'Documented and linked from demo README' }
+];
+
 const SHAREABLE_DEMOS = {
+    release: {
+        title: 'What changed recently',
+        description: 'A compact two-month feature matrix with direct browser coverage and server-side-only notes.',
+        icon: '🚀',
+        tables: ['release_features'],
+        autoRun: true,
+        query: `-- Last two months: feature areas and what this WASM demo can show\nSELECT area, feature, browser_demo\nFROM release_features\nORDER BY area, feature`
+    },
     geo: {
         title: 'Geodata lab',
         description: 'GeoJSON points, routing graph nodes/edges, bounding boxes, radius filters, and distance calculations.',
@@ -673,6 +705,30 @@ const SHAREABLE_DEMOS = {
         tables: ['ai_docs'],
         autoRun: true,
         query: `-- Shareable RAG demo: full-text + vector score\nSELECT title, category,\n       FTS_RANK(content, 'vector OR search') AS text_rank,\n       VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[1.0, 0.0, 0.0]')) AS vector_similarity\nFROM ai_docs\nWHERE FTS_MATCH(content, 'vector OR search')\nORDER BY vector_similarity DESC`
+    },
+    ragcontext: {
+        title: 'RAG context expansion',
+        description: 'Vector top-k retrieval expanded into neighboring chunks with quality and recency-aware ranking.',
+        icon: '🔗',
+        tables: ['rag_chunks'],
+        autoRun: true,
+        query: `-- Shareable RAG context demo: vector hit + surrounding chunks\nWITH topk AS (\n    SELECT doc_id, chunk_index, _vec_rank\n    FROM VEC_SEARCH('rag_chunks', 'embedding', VEC_FROM_JSON('[0.8, 0.6, 0.1]'), 1, 'cosine')\n)\nSELECT doc_id, chunk_index, chunk_text, _hit_rank, _context_offset\nFROM RAG_CONTEXT_FROM('rag_chunks', 'doc_id', 'chunk_index', 'topk', 'doc_id', 'chunk_index', 1)\nORDER BY _context_rank`
+    },
+    sqlfeatures: {
+        title: 'Views, PIVOT, RETURNING',
+        description: 'Recent analytics SQL features in one repeatable multi-statement browser recipe.',
+        icon: '🧮',
+        tables: ['sales'],
+        autoRun: true,
+        query: `-- Shareable SQL feature demo: views, materialized views, RETURNING\nDROP MATERIALIZED VIEW IF EXISTS demo_revenue_mv;\nDROP VIEW IF EXISTS demo_paid_orders;\nCREATE VIEW demo_paid_orders AS\nSELECT customer_name, region, product, quantity * unit_price AS revenue\nFROM sales\nWHERE status = 'Delivered';\nCREATE MATERIALIZED VIEW demo_revenue_mv AS\nSELECT region, SUM(revenue) AS revenue\nFROM demo_paid_orders\nGROUP BY region\nWITH DATA;\nINSERT INTO sales VALUES (1011, 'Acme Corp', 'Widget D', 10, 120.00, '2024-03-01', 'North', 'Delivered') RETURNING order_id, customer_name, quantity * unit_price AS returned_total;\nREFRESH MATERIALIZED VIEW demo_revenue_mv;\nSELECT region, revenue\nFROM demo_revenue_mv\nORDER BY revenue DESC`
+    },
+    catalog: {
+        title: 'sys catalog introspection',
+        description: 'Inspect loaded tables, registered SQL functions, stored procedures, and runtime status from SQL.',
+        icon: '🧭',
+        tables: ['release_features', 'ai_docs'],
+        autoRun: true,
+        query: `-- Shareable catalog demo: tinySQL can query its own metadata\nSELECT 'tables' AS kind, name AS item, rows AS detail\nFROM sys.tables\nUNION ALL\nSELECT 'procedures' AS kind, name AS item, storage AS detail\nFROM sys.procedures\nUNION ALL\nSELECT 'status' AS kind, key AS item, value AS detail\nFROM sys.status\nWHERE key IN ('go_version', 'goroutines')\nORDER BY kind, item`
     },
     files: {
         title: 'Multi-format file analytics',
@@ -703,7 +759,9 @@ function getDemoDefaultQuery(tableName) {
         routes_rg: `SELECT edge_id, source, target, distance, duration, mode\nFROM routes_rg\nORDER BY distance`,
         geo_zones: `SELECT z.zone_name, p.city, p.role\nFROM places_geo p\nJOIN geo_zones z ON ST_WITHIN_BBOX(p.geometry, z.min_lon, z.min_lat, z.max_lon, z.max_lat)\nORDER BY z.zone_name, p.city`,
         settings_yaml: `SELECT service, region, active, replicas\nFROM settings_yaml\nORDER BY service`,
-        ai_docs: `SELECT title, category,\n       FTS_RANK(content, 'vector OR search') AS text_rank,\n       VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[1.0, 0.0, 0.0]')) AS vector_similarity\nFROM ai_docs\nWHERE FTS_MATCH(content, 'vector OR search')\nORDER BY vector_similarity DESC`
+        ai_docs: `SELECT title, category,\n       FTS_RANK(content, 'vector OR search') AS text_rank,\n       VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[1.0, 0.0, 0.0]')) AS vector_similarity\nFROM ai_docs\nWHERE FTS_MATCH(content, 'vector OR search')\nORDER BY vector_similarity DESC`,
+        rag_chunks: `WITH topk AS (\n    SELECT doc_id, chunk_index, _vec_rank\n    FROM VEC_SEARCH('rag_chunks', 'embedding', VEC_FROM_JSON('[0.8, 0.6, 0.1]'), 1, 'cosine')\n)\nSELECT doc_id, chunk_index, chunk_text, _hit_rank, _context_offset\nFROM RAG_CONTEXT_FROM('rag_chunks', 'doc_id', 'chunk_index', 'topk', 'doc_id', 'chunk_index', 1)\nORDER BY _context_rank`,
+        release_features: `SELECT area, feature, browser_demo\nFROM release_features\nORDER BY area, feature`
     };
 
     return queries[tableName] || '';
@@ -812,6 +870,7 @@ function renderIntroPage() {
                         the SQL, sample tables, and selected workflow are encoded in the URL hash.
                     </p>
                     <div class="intro-actions">
+                        <button onclick="loadShareableDemo('release')">See what changed</button>
                         <button onclick="loadShareableDemo('geo')">Start with geodata</button>
                         <button onclick="loadShareableDemo('rag')">Try FTS + vectors</button>
                         <button class="secondary" onclick="showUploadDialog()">Upload a file</button>
@@ -820,12 +879,13 @@ function renderIntroPage() {
                 <div class="intro-metrics">
                     <div class="intro-metric"><strong>Local-first</strong><span>No backend, no account, snapshot stays in the browser.</span></div>
                     <div class="intro-metric"><strong>Typed imports</strong><span>CSV, JSON, YAML, XML, Excel, GeoJSON, KML, OSM, routing graph.</span></div>
-                    <div class="intro-metric"><strong>SQL-rich</strong><span>Joins, CTEs, windows, geospatial functions, FTS, vector search.</span></div>
+                    <div class="intro-metric"><strong>SQL-rich</strong><span>CTEs, views, PIVOT, windows, geospatial functions, FTS, vector search.</span></div>
                 </div>
             </section>
             <section class="feature-strip">
                 <div class="feature-pill"><strong>Geodata-ready</strong>Distance, radius, bbox and routing-graph examples.</div>
                 <div class="feature-pill"><strong>RAG-ready</strong>Combine BM25-style FTS with vector similarity.</div>
+                <div class="feature-pill"><strong>Release-aware</strong>Recent tinySQL features are grouped into runnable recipes.</div>
                 <div class="feature-pill"><strong>Shareable</strong>Demo data and SQL travel in the URL hash.</div>
                 <div class="feature-pill"><strong>Exportable</strong>Copy or export query results as CSV, TSV, Markdown, JSON, XML.</div>
             </section>
@@ -901,6 +961,16 @@ const DEMO_TABLES = {
         name: 'ai_docs',
         fileName: 'ai_docs.json',
         getData: () => DEMO_AI_DOCS
+    },
+    rag_chunks: {
+        name: 'rag_chunks',
+        fileName: 'rag_chunks.json',
+        getData: () => DEMO_RAG_CHUNKS
+    },
+    release_features: {
+        name: 'release_features',
+        fileName: 'release_features.json',
+        getData: () => DEMO_RELEASE_FEATURES
     }
 };
 
@@ -1073,7 +1143,7 @@ async function loadGeoDemos() {
 
 // Load all demo tables
 async function loadAllDemos() {
-    const tableNames = ['sales', 'logistics', 'places_geo', 'geo_zones', 'routes_rg', 'settings_yaml', 'ai_docs', 'sales_large', 'logistics_large', 'web_events_large'];
+    const tableNames = ['sales', 'logistics', 'places_geo', 'geo_zones', 'routes_rg', 'settings_yaml', 'ai_docs', 'rag_chunks', 'release_features', 'sales_large', 'logistics_large', 'web_events_large'];
     await loadDemoTables(
         tableNames,
         `-- Large demo: revenue and fulfillment by region and carrier\nSELECT s.region,\n       l.carrier,\n       COUNT(*) AS orders,\n       SUM(s.order_total) AS total_revenue,\n       AVG(l.shipping_cost) AS avg_shipping_cost\nFROM sales_large s\nJOIN logistics_large l ON s.order_id = l.order_id\nGROUP BY s.region, l.carrier\nORDER BY total_revenue DESC`,
@@ -1170,13 +1240,18 @@ function enhanceDemoQueries() {
 
 function inferDemoQueryGroup(text) {
     const label = String(text || '').toLowerCase();
+    if (label.includes('recent') || label.includes('release') || label.includes('catalog') ||
+        label.includes('pragma') || label.includes('explain') || label.includes('pivot') ||
+        label.includes('returning') || label.includes('view')) {
+        return 'recent';
+    }
     if (label.includes('geo') || label.includes('bbox') || label.includes('node') ||
         label.includes('route') || label.includes('distance') || label.includes('radius') ||
         label.includes('zone') || label.includes('munich')) {
         return 'geo';
     }
     if (label.includes('fts') || label.includes('vector') || label.includes('hybrid') ||
-        label.includes('procedure') || label.includes('yaml')) {
+        label.includes('rag') || label.includes('procedure') || label.includes('yaml')) {
         return 'search';
     }
     return 'analytics';

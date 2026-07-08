@@ -11,17 +11,21 @@ local storage snapshots unless the user exports it.
 
 ## Showcase features
 
-- intro page with guided recipes for file analytics, geodata, FTS/vector search,
-  and joins/reporting
+- intro page with guided recipes for recent release features, file analytics,
+  geodata, FTS/vector search, RAG context expansion, and joins/reporting
 - shareable demo links using `#demo=<base64url-json>`; each link can carry SQL
   plus small sample tables
 - imports for CSV/TSV/TXT, JSON/JSONL/NDJSON, YAML, XML, Excel, GeoJSON, KML,
   OSM XML, and routing graph data (`.rg`, `.routinggraph`, `.graph.json`, ...)
 - geodata examples: point extraction, distance matrices, radius filters,
   bounding boxes, zone membership, routing graph nodes, and route edges
-- search examples: `FTS_SEARCH`, `FTS_RANK`, `VEC_SEARCH`,
-  `VEC_COSINE_SIMILARITY`, and hybrid retrieval queries
-- in-memory stored procedure demo via `CALL demo_table_summary()`
+- search examples: `FTS_SEARCH`, `FTS_RANK`, `FTS_SNIPPET`, `BM25`,
+  `VEC_SEARCH`, `VEC_COSINE_SIMILARITY`, `RAG_CONTEXT_FROM`, and hybrid
+  retrieval queries
+- analytics examples for recent SQL features: `PIVOT`, `RETURNING`, `EXPLAIN`,
+  SQLite-compatible `PRAGMA`, views, and materialized views
+- in-memory stored procedure demos via `CALL demo_table_summary()` and
+  `CALL demo_release_features()`
 - query history, schema inspection, local database snapshot, result filtering,
   sorting, exports, and mobile-optimized layout
 
@@ -77,6 +81,8 @@ branch when anything changed. `make push-gh-pages` also pushes the branch.
   GeoJSON, KML, OSM XML, and routing graph files
 - execute single- and multi-statement SQL
 - schema inspection and table removal
+- recent-feature recipes for RAG helpers, spatial SQL, materialized views,
+  `PIVOT`, `RETURNING`, `EXPLAIN`, `PRAGMA`, and `sys.*` metadata
 - query history, editor state, and database snapshot in local storage
 - result filtering, sorting, table copy, VanillaGrid pivot view, and exports as
   CSV, TSV, Markdown, JSON, and XML
