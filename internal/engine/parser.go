@@ -194,6 +194,12 @@ type (
 // Statement is the root interface for all parsed SQL statements.
 type Statement interface{}
 
+// CallProcedure represents CALL proc_name(arg1, arg2, ...).
+type CallProcedure struct {
+	Name string
+	Args []Expr
+}
+
 // Explain represents an EXPLAIN statement around another statement.
 type Explain struct {
 	Statement Statement
@@ -565,6 +571,8 @@ func (p *Parser) ParseStatement() (Statement, error) {
 		return p.parseUpdate()
 	case "DELETE":
 		return p.parseDelete()
+	case "CALL":
+		return p.parseCallProcedure()
 	case "REFRESH":
 		return p.parseRefresh()
 	case "GRANT":
@@ -576,6 +584,42 @@ func (p *Parser) ParseStatement() (Statement, error) {
 	default:
 		return p.parseBareTableSelect()
 	}
+}
+
+func (p *Parser) parseCallProcedure() (Statement, error) {
+	p.next()
+	name := p.parseQualifiedIdentLike()
+	if name == "" {
+		return nil, p.errf("expected stored procedure name")
+	}
+	stmt := &CallProcedure{Name: name}
+	if p.cur.Typ == tSymbol && p.cur.Val == "(" {
+		p.next()
+		if p.cur.Typ != tSymbol || p.cur.Val != ")" {
+			for {
+				arg, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				stmt.Args = append(stmt.Args, arg)
+				if p.cur.Typ == tSymbol && p.cur.Val == "," {
+					p.next()
+					continue
+				}
+				break
+			}
+		}
+		if err := p.expectSymbol(")"); err != nil {
+			return nil, err
+		}
+	}
+	if p.cur.Typ == tSymbol && p.cur.Val == ";" {
+		p.next()
+	}
+	if p.cur.Typ != tEOF {
+		return nil, p.errf("unexpected token after CALL")
+	}
+	return stmt, nil
 }
 
 func (p *Parser) parseExplain() (Statement, error) {

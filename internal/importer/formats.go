@@ -21,7 +21,8 @@ import (
 // ============================================================================
 
 // ImportFile detects the file format and imports it into a tinySQL table.
-// Supports: CSV, TSV, JSON, XML (with automatic detection based on extension/content).
+// Supports: CSV, TSV, JSON, XML and common map data formats
+// (GeoJSON, KML, Shapefile, OSM XML, MBTiles, routing graph JSON/CSV/NDJSON).
 //
 // Parameters:
 //   - ctx: Context for cancellation
@@ -40,15 +41,8 @@ func ImportFile(
 	filePath string,
 	opts *ImportOptions,
 ) (*ImportResult, error) {
-	// Open file
-	f, err := os.Open(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("open file: %w", err)
-	}
-	defer f.Close()
-
-	// Detect format from extension
-	ext := strings.ToLower(filepath.Ext(filePath))
+	lowerPath := strings.ToLower(filePath)
+	ext := strings.ToLower(filepath.Ext(lowerPath))
 
 	// If table name not provided, derive from filename
 	if tableName == "" {
@@ -61,19 +55,49 @@ func ImportFile(
 	if ext == ".gz" {
 		base := strings.TrimSuffix(filePath, ".gz")
 		ext = strings.ToLower(filepath.Ext(base))
+		lowerPath = strings.ToLower(base)
 	}
+	isRoutingGraphJSON := strings.HasSuffix(lowerPath, ".graph.json") ||
+		strings.HasSuffix(lowerPath, ".routinggraph.json") ||
+		strings.HasSuffix(lowerPath, ".routing-graph.json") ||
+		strings.HasSuffix(lowerPath, ".routing_graph.json")
+
+	switch ext {
+	case ".shp":
+		// Shapefiles are multi-file sets; pass the path for the reader to open.
+		return ImportShapefile(ctx, db, tenant, tableName, filePath, opts)
+	case ".mbtiles":
+		// MBTiles is a SQLite database; the importer needs random access to the
+		// file path rather than a stream.
+		return ImportMBTiles(ctx, db, tenant, tableName, filePath, opts)
+	case ".pbf":
+		return nil, fmt.Errorf("OSM PBF import is not supported yet; convert %s to .osm XML first", filepath.Base(filePath))
+	}
+
+	// Open stream-based formats after path-only formats have been handled.
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("open file: %w", err)
+	}
+	defer f.Close()
 
 	// Import based on format
 	switch ext {
 	case ".geojson":
 		return ImportGeoJSON(ctx, db, tenant, tableName, f, opts)
 
-	case ".shp":
-		// Shapefiles are multi-file sets; pass the path for the reader to open.
-		return ImportShapefile(ctx, db, tenant, tableName, filePath, opts)
-
 	case ".kml":
 		return ImportKML(ctx, db, tenant, tableName, f, opts)
+
+	case ".osm":
+		return ImportOSM(ctx, db, tenant, tableName, f, opts)
+
+	case ".rg", ".routinggraph", ".routing-graph", ".routing_graph":
+		return ImportRoutingGraph(ctx, db, tenant, tableName, f, opts)
+
+	case ".zip":
+		return ImportShapefileZip(ctx, db, tenant, tableName, f, opts)
+
 	case ".csv":
 		if opts == nil {
 			opts = &ImportOptions{}
@@ -90,7 +114,13 @@ func ImportFile(
 		opts.DelimiterCandidates = []rune{'\t'}
 		return ImportCSV(ctx, db, tenant, tableName, f, opts)
 
-	case ".json", ".ndjson", ".jsonl":
+	case ".json":
+		if isRoutingGraphJSON {
+			return ImportRoutingGraph(ctx, db, tenant, tableName, f, opts)
+		}
+		return ImportJSON(ctx, db, tenant, tableName, f, opts)
+
+	case ".ndjson", ".jsonl":
 		return ImportJSON(ctx, db, tenant, tableName, f, opts)
 
 	case ".yaml", ".yml":
@@ -101,6 +131,9 @@ func ImportFile(
 		return ImportYAML(ctx, db, tenant, tableName, f, opts)
 
 	case ".xml":
+		if strings.HasSuffix(lowerPath, ".osm.xml") {
+			return ImportOSM(ctx, db, tenant, tableName, f, opts)
+		}
 		return ImportXML(ctx, db, tenant, tableName, f, opts)
 
 	default:

@@ -30,6 +30,7 @@ import (
 //   sys.storage      – storage backend statistics
 //   sys.config       – database configuration
 //   sys.connections  – active tenant / connection info
+//   sys.procedures   – process-local in-memory stored procedures
 //   sys.objects      – unified status for tables, views, jobs, triggers, …
 //   sys.dependencies – dependency graph for views and materialized views
 // ============================================================================
@@ -60,6 +61,8 @@ func resolveSysTable(env ExecEnv, name string) ([]Row, error) {
 		return sysMaterializedViewsRows(env), nil
 	case "functions":
 		return sysFunctionsRows(), nil
+	case "procedures":
+		return sysProceduresRows(), nil
 	case "variables":
 		return sysVariablesRows(env), nil
 	case "status":
@@ -131,6 +134,7 @@ func allObjectStatusRows(env ExecEnv) []Row {
 	rows = append(rows, jobStatusRows(env)...)
 	rows = append(rows, triggerStatusRows(env)...)
 	rows = append(rows, functionStatusRows(env)...)
+	rows = append(rows, procedureStatusRows(env)...)
 	return rows
 }
 
@@ -332,6 +336,29 @@ func functionStatusRows(env ExecEnv) []Row {
 	return rows
 }
 
+func procedureStatusRows(env ExecEnv) []Row {
+	procs := ListStoredProcedures()
+	rows := make([]Row, 0, len(procs))
+	for _, proc := range procs {
+		r := make(Row)
+		putVal(r, "schema", "sys")
+		putVal(r, "tenant", env.tenant)
+		putVal(r, "name", proc.Name)
+		putVal(r, "object_type", "PROCEDURE")
+		putVal(r, "status", "AVAILABLE")
+		putVal(r, "rows", nil)
+		putVal(r, "columns", nil)
+		putVal(r, "version", nil)
+		putVal(r, "is_stale", nil)
+		putVal(r, "last_refresh_at", nil)
+		putVal(r, "next_run_at", nil)
+		putVal(r, "last_error", nil)
+		putVal(r, "registered_at", proc.RegisteredAt)
+		rows = append(rows, r)
+	}
+	return rows
+}
+
 // ─────────────────────────── sys.columns ─────────────────────────────────
 
 func sysColumnsRows(env ExecEnv) []Row {
@@ -491,6 +518,22 @@ func sysFunctionsRows() []Row {
 		}
 	}
 
+	return rows
+}
+
+// ─────────────────────────── sys.procedures ──────────────────────────────
+
+func sysProceduresRows() []Row {
+	procs := ListStoredProcedures()
+	rows := make([]Row, 0, len(procs))
+	for _, proc := range procs {
+		r := make(Row)
+		putVal(r, "name", proc.Name)
+		putVal(r, "language", "GO")
+		putVal(r, "storage", "MEMORY")
+		putVal(r, "registered_at", proc.RegisteredAt)
+		rows = append(rows, r)
+	}
 	return rows
 }
 

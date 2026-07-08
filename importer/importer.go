@@ -59,6 +59,31 @@ func ImportShapefile(ctx context.Context, db *tinysql.DB, tenant, tableName, fil
 	return ii.ImportShapefile(ctx, db, tenant, tableName, filePath, opts)
 }
 
+// ImportShapefileZip imports a ZIP archive containing Shapefile sidecar files from src.
+func ImportShapefileZip(ctx context.Context, db *tinysql.DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
+	return ii.ImportShapefileZip(ctx, db, tenant, tableName, src, opts)
+}
+
+// ImportOSM imports OSM XML (.osm or .osm.xml) from src.
+func ImportOSM(ctx context.Context, db *tinysql.DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
+	return ii.ImportOSM(ctx, db, tenant, tableName, src, opts)
+}
+
+// ImportMBTiles imports tiles from an MBTiles SQLite database path.
+func ImportMBTiles(ctx context.Context, db *tinysql.DB, tenant, tableName, filePath string, opts *ImportOptions) (*ImportResult, error) {
+	return ii.ImportMBTiles(ctx, db, tenant, tableName, filePath, opts)
+}
+
+// ImportMBTilesReader imports MBTiles from src by spooling to a temporary SQLite file.
+func ImportMBTilesReader(ctx context.Context, db *tinysql.DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
+	return ii.ImportMBTilesReader(ctx, db, tenant, tableName, src, opts)
+}
+
+// ImportRoutingGraph imports routing graph JSON or CSV edge-list data from src.
+func ImportRoutingGraph(ctx context.Context, db *tinysql.DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
+	return ii.ImportRoutingGraph(ctx, db, tenant, tableName, src, opts)
+}
+
 // OpenFile creates a new DB and imports filePath into it.
 func OpenFile(ctx context.Context, filePath string, opts *ImportOptions) (*tinysql.DB, string, error) {
 	return ii.OpenFile(ctx, filePath, opts)

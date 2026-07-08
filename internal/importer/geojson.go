@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -79,24 +80,31 @@ func buildGeoJSONColumns(features []map[string]any) []string {
 		return []string{}
 	}
 
-	first := features[0]
+	seen := make(map[string]bool)
 	propKeys := make([]string, 0)
-	if props, ok := first["properties"].(map[string]any); ok {
-		for k := range props {
-			propKeys = append(propKeys, k)
+	for _, feature := range features {
+		if props, ok := feature["properties"].(map[string]any); ok {
+			for k := range props {
+				if !seen[k] {
+					seen[k] = true
+					propKeys = append(propKeys, k)
+				}
+			}
+			continue
 		}
-	} else {
-		// Fallback: use top-level keys except geometry
-		for k := range first {
-			if k == "geometry" || k == "type" {
+		// Fallback: use top-level keys except GeoJSON structural fields.
+		for k := range feature {
+			if k == "geometry" || k == "type" || k == "properties" {
 				continue
 			}
-			propKeys = append(propKeys, k)
+			if !seen[k] {
+				seen[k] = true
+				propKeys = append(propKeys, k)
+			}
 		}
 	}
 
-	// Ensure deterministic order
-	sanitizeColumnNames(propKeys)
+	sort.Strings(propKeys)
 	return propKeys
 }
 
@@ -144,7 +152,7 @@ func extractFeatureProperties(f map[string]any, propKeys []string) map[string]an
 
 // buildGeoJSONRow builds a row from a feature
 func buildGeoJSONRow(f map[string]any, propKeys []string, colTypes []storage.ColType, opts *ImportOptions, rowIndex int, result *ImportResult) []any {
-	row := make([]any, len(propKeys)+1)
+	row := make([]any, len(propKeys)+2)
 	props := extractFeatureProperties(f, propKeys)
 
 	for j, k := range propKeys {
@@ -168,6 +176,11 @@ func buildGeoJSONRow(f map[string]any, propKeys []string, colTypes []storage.Col
 	var geom any
 	if g, ok := f["geometry"]; ok && g != nil {
 		geom = g
+	}
+	if geomMap, ok := geom.(map[string]any); ok {
+		if typ, ok := geomMap["type"].(string); ok {
+			row[len(row)-2] = typ
+		}
 	}
 	if geom != nil {
 		if b, err := json.Marshal(geom); err == nil {
@@ -206,9 +219,8 @@ func ImportGeoJSON(
 
 	// Build column names
 	propKeys := buildGeoJSONColumns(features)
-	colNames := append([]string{}, propKeys...)
-	geomCol := "geometry"
-	colNames = append(colNames, geomCol)
+	colNames := sanitizeColumnNames(append([]string{}, propKeys...))
+	colNames = append(colNames, "geometry_type", "geometry")
 
 	// Build sample data for type inference
 	sampleData := buildGeoJSONSampleData(features, propKeys)
@@ -223,7 +235,7 @@ func ImportGeoJSON(
 			colTypes[i] = storage.TextType
 		}
 	}
-	colTypes = append(colTypes, storage.GeometryType)
+	colTypes = append(colTypes, storage.TextType, storage.GeometryType)
 
 	result := &ImportResult{Encoding: "utf-8", Errors: make([]string, 0), ColumnNames: colNames, ColumnTypes: colTypes}
 

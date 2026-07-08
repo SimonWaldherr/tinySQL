@@ -90,6 +90,8 @@ func requiredPermission(stmt Statement) (perm storage.Permission, schema, table 
 	case *Delete:
 		schema, table = splitObjectName(s.Table)
 		return storage.PermDelete, schema, table, true
+	case *CallProcedure:
+		return "", "", "", false
 	case *CreateTable:
 		schema, table = splitObjectName(s.Name)
 		return storage.PermDDL, schema, table, true

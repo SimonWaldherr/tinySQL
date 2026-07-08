@@ -105,6 +105,17 @@ type Row = engine.Row
 // Returned by SELECT queries and available for inspection.
 type ResultSet = engine.ResultSet
 
+// ProcedureContext is passed to in-memory stored procedures registered with
+// RegisterStoredProcedure. It can execute nested SQL within the same CALL.
+type ProcedureContext = engine.ProcedureContext
+
+// StoredProcedureFunc is the Go handler signature for in-memory stored
+// procedures invoked with CALL name(...).
+type StoredProcedureFunc = engine.StoredProcedureFunc
+
+// StoredProcedureInfo describes one registered in-memory stored procedure.
+type StoredProcedureInfo = engine.StoredProcedureInfo
+
 // SQLStateError attaches an ISO/IEC 9075 SQLSTATE code to an error.
 type SQLStateError = standards.SQLStateError
 
@@ -991,7 +1002,7 @@ type ImportOptions = importer.ImportOptions
 // Contains metadata about the import operation.
 type ImportResult = importer.ImportResult
 
-// ImportFile imports a structured data file (CSV, TSV, JSON, YAML, XML) into a table.
+// ImportFile imports a structured data file into a table.
 // The format is auto-detected from the file extension or content.
 //
 // Supported formats:
@@ -1000,6 +1011,11 @@ type ImportResult = importer.ImportResult
 //   - JSON (.json) - Array of objects format: [{"id": 1, "name": "Alice"}, ...]
 //   - YAML (.yaml, .yml) - Sequence of mappings or a single mapping
 //   - XML (.xml) - Simple row-based XML (limited support)
+//   - GeoJSON (.geojson), KML (.kml), Shapefile (.shp)
+//   - Shapefile ZIP archives (.zip)
+//   - OSM XML (.osm, .osm.xml)
+//   - MBTiles (.mbtiles)
+//   - Routing graph (.rg, .routinggraph)
 //   - Compressed (.gz) - Transparent gzip decompression
 //
 // Example:
@@ -1070,6 +1086,56 @@ func ImportCSV(ctx context.Context, db *DB, tenant, tableName string, src io.Rea
 // Returns ImportResult with metadata and any error encountered.
 func ImportJSON(ctx context.Context, db *DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
 	return importer.ImportJSON(ctx, db, tenant, tableName, src, opts)
+}
+
+// ImportYAML imports YAML data from a reader into a table.
+func ImportYAML(ctx context.Context, db *DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
+	return importer.ImportYAML(ctx, db, tenant, tableName, src, opts)
+}
+
+// ImportXML imports row-oriented XML data from a reader into a table.
+func ImportXML(ctx context.Context, db *DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
+	return importer.ImportXML(ctx, db, tenant, tableName, src, opts)
+}
+
+// ImportGeoJSON imports GeoJSON FeatureCollection or Feature data from a reader.
+func ImportGeoJSON(ctx context.Context, db *DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
+	return importer.ImportGeoJSON(ctx, db, tenant, tableName, src, opts)
+}
+
+// ImportKML imports KML Placemark data from a reader.
+func ImportKML(ctx context.Context, db *DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
+	return importer.ImportKML(ctx, db, tenant, tableName, src, opts)
+}
+
+// ImportShapefile imports an ESRI Shapefile path and its sidecar DBF attributes.
+func ImportShapefile(ctx context.Context, db *DB, tenant, tableName, filePath string, opts *ImportOptions) (*ImportResult, error) {
+	return importer.ImportShapefile(ctx, db, tenant, tableName, filePath, opts)
+}
+
+// ImportShapefileZip imports a ZIP archive containing Shapefile sidecar files from a reader.
+func ImportShapefileZip(ctx context.Context, db *DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
+	return importer.ImportShapefileZip(ctx, db, tenant, tableName, src, opts)
+}
+
+// ImportOSM imports OSM XML (.osm or .osm.xml) from a reader.
+func ImportOSM(ctx context.Context, db *DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
+	return importer.ImportOSM(ctx, db, tenant, tableName, src, opts)
+}
+
+// ImportMBTiles imports tiles from an MBTiles SQLite database path.
+func ImportMBTiles(ctx context.Context, db *DB, tenant, tableName, filePath string, opts *ImportOptions) (*ImportResult, error) {
+	return importer.ImportMBTiles(ctx, db, tenant, tableName, filePath, opts)
+}
+
+// ImportMBTilesReader imports MBTiles from a reader by spooling to a temporary SQLite file.
+func ImportMBTilesReader(ctx context.Context, db *DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
+	return importer.ImportMBTilesReader(ctx, db, tenant, tableName, src, opts)
+}
+
+// ImportRoutingGraph imports routing graph JSON or CSV edge-list data from a reader.
+func ImportRoutingGraph(ctx context.Context, db *DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
+	return importer.ImportRoutingGraph(ctx, db, tenant, tableName, src, opts)
 }
 
 // OpenFile opens a data file and returns a DB with the data loaded.
@@ -1197,4 +1263,21 @@ type ExternalTableFunc interface {
 // registration.
 func RegisterExternalTableFunc(fn ExternalTableFunc) {
 	engine.RegisterExternalTableFunc(fn)
+}
+
+// RegisterStoredProcedure registers a process-local in-memory stored procedure.
+// The procedure can be invoked from SQL with CALL name(arg1, arg2, ...).
+// Registrations are not persisted in database snapshots.
+func RegisterStoredProcedure(name string, fn StoredProcedureFunc) error {
+	return engine.RegisterStoredProcedure(name, fn)
+}
+
+// UnregisterStoredProcedure removes a process-local stored procedure.
+func UnregisterStoredProcedure(name string) bool {
+	return engine.UnregisterStoredProcedure(name)
+}
+
+// ListStoredProcedures returns registered in-memory stored procedures sorted by name.
+func ListStoredProcedures() []StoredProcedureInfo {
+	return engine.ListStoredProcedures()
 }

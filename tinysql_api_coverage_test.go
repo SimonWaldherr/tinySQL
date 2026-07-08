@@ -47,6 +47,54 @@ func TestPublicSQLStateHelpers(t *testing.T) {
 	}
 }
 
+func TestPublicStoredProcedureHelpers(t *testing.T) {
+	const procName = "public_proc_echo_test"
+	tsql.UnregisterStoredProcedure(procName)
+	t.Cleanup(func() { tsql.UnregisterStoredProcedure(procName) })
+
+	err := tsql.RegisterStoredProcedure(procName, func(ctx tsql.ProcedureContext, args []any) (*tsql.ResultSet, error) {
+		return &tsql.ResultSet{
+			Cols: []string{"value", "tenant"},
+			Rows: []tsql.Row{{"value": args[0], "tenant": ctx.Tenant()}},
+		}, nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterStoredProcedure failed: %v", err)
+	}
+	if len(tsql.ListStoredProcedures()) == 0 {
+		t.Fatal("expected registered procedure to be listed")
+	}
+
+	rs, err := tsql.Execute(context.Background(), tsql.NewDB(), "default", tsql.MustParseSQL(`CALL public_proc_echo_test('x')`))
+	if err != nil {
+		t.Fatalf("CALL failed: %v", err)
+	}
+	if len(rs.Rows) != 1 || rs.Rows[0]["value"] != "x" || rs.Rows[0]["tenant"] != "default" {
+		t.Fatalf("unexpected procedure result: %#v", rs.Rows)
+	}
+}
+
+func TestPublicMapImportWrappers(t *testing.T) {
+	ctx := context.Background()
+	db := tsql.NewDB()
+
+	if _, err := tsql.ImportYAML(ctx, db, "default", "yaml_public", strings.NewReader("- id: 1\n"), &tsql.ImportOptions{CreateTable: true}); err != nil {
+		t.Fatalf("ImportYAML failed: %v", err)
+	}
+	if _, err := tsql.ImportXML(ctx, db, "default", "xml_public", strings.NewReader("<root><row id=\"1\"/></root>"), &tsql.ImportOptions{CreateTable: true}); err != nil {
+		t.Fatalf("ImportXML failed: %v", err)
+	}
+	if _, err := tsql.ImportGeoJSON(ctx, db, "default", "geo_public", strings.NewReader(`{"type":"Feature","properties":{"name":"x"},"geometry":{"type":"Point","coordinates":[1,2]}}`), &tsql.ImportOptions{CreateTable: true}); err != nil {
+		t.Fatalf("ImportGeoJSON failed: %v", err)
+	}
+	if _, err := tsql.ImportOSM(ctx, db, "default", "osm_public", strings.NewReader(`<osm><node id="1" lat="1" lon="2"/></osm>`), &tsql.ImportOptions{CreateTable: true}); err != nil {
+		t.Fatalf("ImportOSM failed: %v", err)
+	}
+	if _, err := tsql.ImportRoutingGraph(ctx, db, "default", "rg_public", strings.NewReader(`[{"source":"a","target":"b","cost":1}]`), &tsql.ImportOptions{CreateTable: true}); err != nil {
+		t.Fatalf("ImportRoutingGraph failed: %v", err)
+	}
+}
+
 func TestPublicRBACHelpers(t *testing.T) {
 	perm, err := tsql.ParsePermission("select")
 	if err != nil {

@@ -225,6 +225,8 @@ func execStmt(env ExecEnv, stmt Statement) (*ResultSet, error) {
 		return executeUpdate(env, s)
 	case *Delete:
 		return executeDelete(env, s)
+	case *CallProcedure:
+		return executeCallProcedure(env, s)
 	case *Select:
 		return executeSelect(env, s)
 	case *CreateJob:
