@@ -9,7 +9,10 @@ TinySQL is a lightweight SQL database engine written in pure Go. It is built for
 learning database internals, embedding in Go programs, demos, tests, and
 single-process workloads that need a small SQL layer without external services.
 
-Demo: [youtu.be/W28-aBk3BL0](https://youtu.be/W28-aBk3BL0)
+Demos:
+
+- Video: [youtu.be/W28-aBk3BL0](https://youtu.be/W28-aBk3BL0)
+- Browser playground: [simonwaldherr.github.io/tinySQL](https://simonwaldherr.github.io/tinySQL/)
 
 ## Install
 
@@ -140,6 +143,8 @@ and `PRAGMA` still run.
   referential actions.
 - Built-in functions for JSON, YAML, URLs, hashes, bitmaps, regex, text, math,
   dates, full-text search, vector search, and RAG scoring.
+- Geodata imports and SQL helpers for GeoJSON, KML, OSM XML, Shapefiles,
+  MBTiles, routing graphs, points, distance, radius, and bounding-box queries.
 - Operational hooks for health checks, lifecycle management, read-only mode,
   RBAC, audit logging, and encryption at rest for `ModeDisk`/`ModeJSON`.
 
@@ -161,6 +166,7 @@ Common entries:
 | `cmd/tinysqld` | Lightweight admin/health daemon |
 | `cmd/sqltools` | Format, validate, explain, and REPL helpers |
 | `cmd/query_files` | Query CSV, JSON, and XML files with SQL |
+| `cmd/query_files_wasm` | Static browser playground used by gh-pages |
 | `cmd/fsql` | Query filesystem metadata and file contents with SQL |
 | `cmd/studio` | Desktop GUI |
 | `cmd/wasm_browser` | Browser WebAssembly build |
@@ -168,6 +174,30 @@ Common entries:
 Security note: `cmd/server` defaults to authentication off and listens on all
 interfaces. Use `-auth`, bind to localhost, and configure TLS before exposing it
 outside a trusted environment.
+
+## Browser Playground
+
+The [gh-pages playground](https://simonwaldherr.github.io/tinySQL/) is built
+from `cmd/query_files_wasm`. It runs tinySQL as WebAssembly in the browser and
+demonstrates the current feature set without a backend:
+
+- local-first file analytics for CSV, JSON, JSONL/NDJSON, YAML, XML, Excel,
+  GeoJSON, KML, OSM XML, and routing graph files;
+- SQL joins, CTEs, window functions, exports, schema inspection, and persisted
+  browser snapshots;
+- geodata recipes for distance matrices, radius filters, bounding boxes, zones,
+  routing graph edges, and node lookups;
+- full-text search, vector search, hybrid retrieval, and in-memory stored
+  procedure examples;
+- shareable demo URLs where the SQL and sample data are encoded in the URL hash.
+
+Build and publish helpers:
+
+```bash
+make build-gh-pages-demo
+make update-gh-pages
+make push-gh-pages
+```
 
 ## Limitations
 

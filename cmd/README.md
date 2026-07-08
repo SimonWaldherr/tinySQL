@@ -114,9 +114,12 @@ tool has its own README with full documentation — click the links below.
   - CLI mode: `./query_files -query "SELECT * FROM users" users.csv`
 
 - query_files_wasm
-  - WebAssembly build of the query_files tool for use directly in the browser. Exposes `importFile`, `executeQuery`, `listTables`, and `exportResults` JavaScript functions.
+  - WebAssembly build of the query_files tool for use directly in the browser. This is the source for the gh-pages playground at https://simonwaldherr.github.io/tinySQL/.
+  - Includes an intro page, shareable URL-hash demos, mobile-optimized SQL editor, file imports, geodata recipes, FTS/vector search examples, and result export.
   - Build: `cd cmd/query_files_wasm && ./build.sh --build-only`
   - Build & serve: `cd cmd/query_files_wasm && ./build.sh --serve`
+  - Build gh-pages artifacts: `make build-gh-pages-demo`
+  - Update gh-pages branch in a worktree and commit: `make update-gh-pages`
   - Open `index.html` in a browser (requires a local HTTP server due to WASM MIME type).
 
 - catalog_demo

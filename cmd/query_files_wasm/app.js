@@ -5,6 +5,8 @@ let currentResults = null;
 const HISTORY_KEY = 'tinysql_query_history_v1';
 const DB_SNAPSHOT_KEY = 'tinysql_query_files_db_snapshot_v1';
 const EDITOR_STATE_KEY = 'tinysql_query_files_editor_v1';
+const RESULT_RENDER_LIMIT = 500;
+const DEMO_HASH_PREFIX = 'demo=';
 const SQL_KEYWORDS = [
     'SELECT', 'FROM', 'WHERE', 'JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'FULL JOIN', 'INNER JOIN', 'CROSS JOIN',
     'ON', 'GROUP BY', 'ORDER BY', 'HAVING', 'LIMIT', 'OFFSET', 'DISTINCT', 'AS', 'AND', 'OR', 'NOT',
@@ -14,7 +16,7 @@ const SQL_KEYWORDS = [
     'ST_MAKEPOINT', 'ST_POINT', 'ST_X', 'ST_Y', 'ST_DISTANCE', 'ST_DWITHIN', 'ST_WITHIN_BBOX',
     'GEO_POINT', 'GEO_DISTANCE', 'GEO_WITHIN_BBOX', 'FTS_MATCH', 'FTS_RANK', 'FTS_SEARCH',
     'FTS_SNIPPET', 'BM25', 'VEC_FROM_JSON', 'VEC_SEARCH', 'VEC_COSINE_SIMILARITY',
-    'VEC_DISTANCE', 'HASH', 'URL_PARSE', 'YAML_GET', 'CALL'
+    'VEC_DISTANCE', 'HASH', 'URL_PARSE', 'YAML_GET', 'CALL', 'ROUND'
 ];
 // Safe references to WASM-exported functions (set after init)
 let wasmApi = {
@@ -50,6 +52,8 @@ let resultViewState = {
 };
 let editorSaveTimer = null;
 let snapshotSaveTimer = null;
+let applyingHashDemo = false;
+let lastAppliedHash = '';
 
 function escapeRegex(text) {
     return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -114,6 +118,42 @@ function storageRemove(key) {
         if (window.localStorage) window.localStorage.removeItem(key);
     } catch (_) {
         // Ignore blocked storage cleanup.
+    }
+}
+
+function base64UrlEncode(text) {
+    const bytes = new TextEncoder().encode(String(text || ''));
+    let binary = '';
+    bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function base64UrlDecode(encoded) {
+    const normalized = String(encoded || '').replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized + '='.repeat((4 - normalized.length % 4) % 4);
+    const binary = atob(padded);
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+}
+
+function encodeDemoHash(payload) {
+    return `${DEMO_HASH_PREFIX}${base64UrlEncode(JSON.stringify(payload))}`;
+}
+
+function decodeDemoHash(hash = window.location.hash) {
+    const raw = String(hash || '').replace(/^#/, '');
+    if (!raw.startsWith(DEMO_HASH_PREFIX)) {
+        return null;
+    }
+    try {
+        const payload = JSON.parse(base64UrlDecode(raw.slice(DEMO_HASH_PREFIX.length)));
+        if (!payload || payload.kind !== 'tinysql-demo' || !Array.isArray(payload.tables)) {
+            return null;
+        }
+        return payload;
+    } catch (error) {
+        console.warn('Invalid tinySQL demo hash:', error);
+        return null;
     }
 }
 
@@ -256,7 +296,10 @@ async function initWasm() {
         updateStatus("Ready");
         document.querySelector('.status-indicator').classList.add('ready');
         document.getElementById('executeBtn').disabled = false;
-        restoreDatabaseSnapshot();
+        const hashDemoPayload = decodeDemoHash();
+        if (!hashDemoPayload) {
+            restoreDatabaseSnapshot();
+        }
         // If any tables were registered client-side before WASM was ready,
         // import them now into the WASM-backed database so queries will work.
         if (Object.keys(pendingClientTables).length > 0) {
@@ -287,6 +330,10 @@ async function initWasm() {
             scheduleDatabaseSnapshotSave();
         }
         loadTables();
+        if (hashDemoPayload) {
+            await applyHashDemoPayload(hashDemoPayload);
+            lastAppliedHash = window.location.hash || '';
+        }
     } catch (err) {
         console.error("Failed to load WASM:", err);
         updateStatus("Failed to load WASM");
@@ -496,6 +543,16 @@ const DEMO_GEOJSON = {
             type: 'Feature',
             properties: { name: 'Hamburg Port', city: 'Hamburg', role: 'port' },
             geometry: { type: 'Point', coordinates: [9.9937, 53.5511] }
+        },
+        {
+            type: 'Feature',
+            properties: { name: 'Vienna Terminal', city: 'Vienna', role: 'terminal' },
+            geometry: { type: 'Point', coordinates: [16.3738, 48.2082] }
+        },
+        {
+            type: 'Feature',
+            properties: { name: 'Amsterdam Gateway', city: 'Amsterdam', role: 'gateway' },
+            geometry: { type: 'Point', coordinates: [4.9041, 52.3676] }
         }
     ]
 };
@@ -504,6 +561,8 @@ const DEMO_ROUTING_GRAPH = [
     JSON.stringify({ type: 'node', id: 'berlin', lat: 52.5200, lon: 13.4050, properties: { city: 'Berlin' } }),
     JSON.stringify({ type: 'node', id: 'munich', lat: 48.1372, lon: 11.5755, properties: { city: 'Munich' } }),
     JSON.stringify({ type: 'node', id: 'zurich', lat: 47.3769, lon: 8.5417, properties: { city: 'Zurich' } }),
+    JSON.stringify({ type: 'node', id: 'hamburg', lat: 53.5511, lon: 9.9937, properties: { city: 'Hamburg' } }),
+    JSON.stringify({ type: 'node', id: 'vienna', lat: 48.2082, lon: 16.3738, properties: { city: 'Vienna' } }),
     JSON.stringify({
         type: 'edge',
         id: 'berlin-munich',
@@ -523,8 +582,35 @@ const DEMO_ROUTING_GRAPH = [
         duration: 12600,
         mode: 'road',
         geometry: { type: 'LineString', coordinates: [[11.5755, 48.1372], [8.5417, 47.3769]] }
+    }),
+    JSON.stringify({
+        type: 'edge',
+        id: 'hamburg-berlin',
+        source: 'hamburg',
+        target: 'berlin',
+        distance: 289000,
+        duration: 10800,
+        mode: 'rail',
+        geometry: { type: 'LineString', coordinates: [[9.9937, 53.5511], [13.4050, 52.5200]] }
+    }),
+    JSON.stringify({
+        type: 'edge',
+        id: 'munich-vienna',
+        source: 'munich',
+        target: 'vienna',
+        distance: 435000,
+        duration: 16200,
+        mode: 'road',
+        geometry: { type: 'LineString', coordinates: [[11.5755, 48.1372], [16.3738, 48.2082]] }
     })
 ].join('\n');
+
+const DEMO_GEO_ZONES = [
+    { zone_name: 'DACH Core', min_lon: 5.5, min_lat: 45.5, max_lon: 17.5, max_lat: 55.2 },
+    { zone_name: 'Northern Corridor', min_lon: 4.0, min_lat: 52.0, max_lon: 14.5, max_lat: 54.5 },
+    { zone_name: 'Alpine Reach', min_lon: 6.5, min_lat: 46.0, max_lon: 17.5, max_lat: 49.5 },
+    { zone_name: 'Benelux Access', min_lon: 3.0, min_lat: 50.5, max_lon: 7.5, max_lat: 53.8 }
+];
 
 const DEMO_YAML = `- service: api
   region: eu-central
@@ -571,6 +657,41 @@ const DEMO_AI_DOCS = [
     }
 ];
 
+const SHAREABLE_DEMOS = {
+    geo: {
+        title: 'Geodata lab',
+        description: 'GeoJSON points, routing graph nodes/edges, bounding boxes, radius filters, and distance calculations.',
+        icon: '🗺️',
+        tables: ['places_geo', 'geo_zones', 'routes_rg'],
+        autoRun: true,
+        query: `-- Shareable Geo demo: zones + hubs\nSELECT z.zone_name, p.city, p.role,\n       ROUND(ST_DISTANCE(p.geometry, ST_MakePoint(13.4050, 52.5200)) / 1000, 1) AS km_from_berlin\nFROM places_geo p\nJOIN geo_zones z ON ST_WITHIN_BBOX(p.geometry, z.min_lon, z.min_lat, z.max_lon, z.max_lat)\nORDER BY z.zone_name, km_from_berlin`
+    },
+    rag: {
+        title: 'FTS + vector retrieval',
+        description: 'A compact RAG-style corpus with full-text ranking and vector similarity running in the browser.',
+        icon: '🧠',
+        tables: ['ai_docs'],
+        autoRun: true,
+        query: `-- Shareable RAG demo: full-text + vector score\nSELECT title, category,\n       FTS_RANK(content, 'vector OR search') AS text_rank,\n       VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[1.0, 0.0, 0.0]')) AS vector_similarity\nFROM ai_docs\nWHERE FTS_MATCH(content, 'vector OR search')\nORDER BY vector_similarity DESC`
+    },
+    files: {
+        title: 'Multi-format file analytics',
+        description: 'JSON and YAML demo data imported as typed tables, then queried with ordinary SQL.',
+        icon: '📁',
+        tables: ['sales', 'settings_yaml'],
+        autoRun: true,
+        query: `-- Shareable file analytics demo\nSELECT service AS item, region AS segment, replicas AS metric\nFROM settings_yaml\nUNION ALL\nSELECT product AS item, region AS segment, quantity AS metric\nFROM sales\nORDER BY segment, item`
+    },
+    analytics: {
+        title: 'Joins and reporting',
+        description: 'A small sales/logistics model demonstrating joins, aggregation, calculated metrics, and export-ready results.',
+        icon: '📊',
+        tables: ['sales', 'logistics'],
+        autoRun: true,
+        query: `-- Shareable analytics demo: sales + logistics\nSELECT s.region,\n       l.carrier,\n       COUNT(*) AS orders,\n       SUM(s.quantity * s.unit_price) AS revenue,\n       AVG(l.shipping_cost) AS avg_shipping_cost\nFROM sales s\nJOIN logistics l ON s.order_id = l.order_id\nGROUP BY s.region, l.carrier\nORDER BY revenue DESC`
+    }
+};
+
 function getDemoDefaultQuery(tableName) {
     const queries = {
         sales: `SELECT customer_name, product, quantity * unit_price AS total_value\nFROM sales\nORDER BY total_value DESC\nLIMIT 10`,
@@ -580,6 +701,7 @@ function getDemoDefaultQuery(tableName) {
         web_events_large: `SELECT event_date, device, COUNT(*) AS events, SUM(revenue_impact) AS influenced_revenue\nFROM web_events_large\nGROUP BY event_date, device\nORDER BY event_date DESC`,
         places_geo: `SELECT name, city, role,\n       ST_X(geometry) AS lon,\n       ST_Y(geometry) AS lat,\n       ST_DISTANCE(geometry, ST_MakePoint(13.4050, 52.5200)) AS meters_from_berlin\nFROM places_geo\nORDER BY meters_from_berlin`,
         routes_rg: `SELECT edge_id, source, target, distance, duration, mode\nFROM routes_rg\nORDER BY distance`,
+        geo_zones: `SELECT z.zone_name, p.city, p.role\nFROM places_geo p\nJOIN geo_zones z ON ST_WITHIN_BBOX(p.geometry, z.min_lon, z.min_lat, z.max_lon, z.max_lat)\nORDER BY z.zone_name, p.city`,
         settings_yaml: `SELECT service, region, active, replicas\nFROM settings_yaml\nORDER BY service`,
         ai_docs: `SELECT title, category,\n       FTS_RANK(content, 'vector OR search') AS text_rank,\n       VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[1.0, 0.0, 0.0]')) AS vector_similarity\nFROM ai_docs\nWHERE FTS_MATCH(content, 'vector OR search')\nORDER BY vector_similarity DESC`
     };
@@ -597,6 +719,119 @@ function isRoutingGraphFile(fileName) {
         lower.endsWith('.routinggraph.json') ||
         lower.endsWith('.routing-graph.json') ||
         lower.endsWith('.routing_graph.json');
+}
+
+function demoTablePayload(tableName) {
+    const demo = DEMO_TABLES[tableName];
+    if (!demo) {
+        throw new Error(`Unknown demo table: ${tableName}`);
+    }
+    const data = typeof demo.getData === 'function' ? demo.getData() : demo.data;
+    const fileName = demo.fileName || `${tableName}.json`;
+    return {
+        name: tableName,
+        fileName,
+        content: typeof data === 'string' ? data : JSON.stringify(data),
+    };
+}
+
+function buildShareableDemoPayload(demoId) {
+    const recipe = SHAREABLE_DEMOS[demoId];
+    if (!recipe) {
+        throw new Error(`Unknown shareable demo: ${demoId}`);
+    }
+    return {
+        kind: 'tinysql-demo',
+        version: 1,
+        id: demoId,
+        title: recipe.title,
+        description: recipe.description,
+        query: recipe.query,
+        autoRun: recipe.autoRun === true,
+        tables: recipe.tables.map(demoTablePayload),
+    };
+}
+
+function getShareableDemoHash(demoId) {
+    return encodeDemoHash(buildShareableDemoPayload(demoId));
+}
+
+function getShareableDemoURL(demoId) {
+    const base = `${window.location.origin}${window.location.pathname}`;
+    return `${base}#${getShareableDemoHash(demoId)}`;
+}
+
+function loadShareableDemo(demoId) {
+    const hash = getShareableDemoHash(demoId);
+    if (window.location.hash === `#${hash}`) {
+        const payload = decodeDemoHash(`#${hash}`);
+        if (payload) {
+            applyHashDemoPayload(payload);
+            lastAppliedHash = `#${hash}`;
+        }
+    } else {
+        window.location.hash = hash;
+    }
+}
+
+async function copyDemoLink(demoId) {
+    const url = getShareableDemoURL(demoId);
+    try {
+        await navigator.clipboard.writeText(url);
+        showToast('Demo link copied', 'success');
+    } catch (_) {
+        window.prompt('Copy demo link', url);
+    }
+}
+
+function renderIntroPage() {
+    const resultsContainer = document.getElementById('resultsContainer');
+    if (!resultsContainer || decodeDemoHash()) {
+        return;
+    }
+    const cards = Object.entries(SHAREABLE_DEMOS).map(([id, demo]) => `
+        <div class="intro-card">
+            <h3>${demo.icon} ${escapeHtml(demo.title)}</h3>
+            <p>${escapeHtml(demo.description)}</p>
+            <code>${escapeHtml(demo.query.split('\n').find(line => !line.startsWith('--')) || demo.query)}</code>
+            <div class="intro-card-actions">
+                <button onclick="loadShareableDemo('${id}')">Run demo</button>
+                <button class="secondary" onclick="copyDemoLink('${id}')">Copy link</button>
+            </div>
+        </div>
+    `).join('');
+
+    resultsContainer.innerHTML = `
+        <div class="intro-page">
+            <section class="intro-hero">
+                <div>
+                    <div class="intro-kicker">tinySQL WebAssembly demo</div>
+                    <h2>Query files, geodata, full-text indexes, and vectors directly in your browser.</h2>
+                    <p class="intro-copy">
+                        tinySQL runs locally as a static WASM app. Upload data or open a shareable demo link:
+                        the SQL, sample tables, and selected workflow are encoded in the URL hash.
+                    </p>
+                    <div class="intro-actions">
+                        <button onclick="loadShareableDemo('geo')">Start with geodata</button>
+                        <button onclick="loadShareableDemo('rag')">Try FTS + vectors</button>
+                        <button class="secondary" onclick="showUploadDialog()">Upload a file</button>
+                    </div>
+                </div>
+                <div class="intro-metrics">
+                    <div class="intro-metric"><strong>Local-first</strong><span>No backend, no account, snapshot stays in the browser.</span></div>
+                    <div class="intro-metric"><strong>Typed imports</strong><span>CSV, JSON, YAML, XML, Excel, GeoJSON, KML, OSM, routing graph.</span></div>
+                    <div class="intro-metric"><strong>SQL-rich</strong><span>Joins, CTEs, windows, geospatial functions, FTS, vector search.</span></div>
+                </div>
+            </section>
+            <section class="feature-strip">
+                <div class="feature-pill"><strong>Geodata-ready</strong>Distance, radius, bbox and routing-graph examples.</div>
+                <div class="feature-pill"><strong>RAG-ready</strong>Combine BM25-style FTS with vector similarity.</div>
+                <div class="feature-pill"><strong>Shareable</strong>Demo data and SQL travel in the URL hash.</div>
+                <div class="feature-pill"><strong>Exportable</strong>Copy or export query results as CSV, TSV, Markdown, JSON, XML.</div>
+            </section>
+            <section class="intro-grid">${cards}</section>
+        </div>
+    `;
 }
 
 const DEMO_TABLES = {
@@ -651,6 +886,11 @@ const DEMO_TABLES = {
         name: 'routes_rg',
         fileName: 'routes.rg',
         getData: () => DEMO_ROUTING_GRAPH
+    },
+    geo_zones: {
+        name: 'geo_zones',
+        fileName: 'geo_zones.json',
+        getData: () => DEMO_GEO_ZONES
     },
     settings_yaml: {
         name: 'settings_yaml',
@@ -731,29 +971,114 @@ async function loadDemoTable(tableName) {
             }
             updateStatus(`Registered demo table "${tableName}" locally. Queries will run once WASM is initialized.`);
         }
-    
+
+}
+
+async function importDemoPayloadTable(table) {
+    if (!table || !table.name || typeof table.content !== 'string') {
+        throw new Error('Invalid demo table payload');
+    }
+    const fileName = table.fileName || `${table.name}.json`;
+    const result = wasmApi.importFile(fileName, table.content, table.name);
+    if (!result || !result.success) {
+        throw new Error(result?.error || `Import failed for ${table.name}`);
+    }
+    return {
+        name: table.name,
+        rowCount: result.rowsImported,
+        columns: Array.isArray(result.columns) ? result.columns.map(c => String(c)) : [],
+    };
+}
+
+async function applyHashDemoPayload(payload) {
+    if (!payload || applyingHashDemo || !wasmReady || typeof wasmApi.importFile !== 'function') {
+        return false;
+    }
+    applyingHashDemo = true;
+    try {
+        updateStatus(`Loading shared demo: ${payload.title || payload.id || 'tinySQL'}...`);
+        if (typeof wasmApi.clearDatabase === 'function') {
+            wasmApi.clearDatabase();
+        }
+        currentTables = [];
+        currentResults = null;
+        for (const key of Object.keys(pendingClientTables)) {
+            delete pendingClientTables[key];
+        }
+
+        for (const table of payload.tables) {
+            const tableInfo = await importDemoPayloadTable(table);
+            currentTables.push(tableInfo);
+            if (isRoutingGraphFile(table.fileName)) {
+                loadTables();
+            }
+        }
+
+        renderTables();
+        showDemoQueries();
+        if (payload.query) {
+            setQuery(payload.query);
+        }
+        scheduleDatabaseSnapshotSave();
+        updateStatus(`Loaded shared demo: ${payload.title || payload.id || 'tinySQL'}`);
+
+        if (payload.autoRun && payload.query) {
+            await onExecuteClick();
+        }
+        return true;
+    } catch (error) {
+        updateStatus('Shared demo failed');
+        showToast(`Shared demo failed: ${error.message}`, 'error');
+        console.error('applyHashDemoPayload failed:', error);
+        return false;
+    } finally {
+        applyingHashDemo = false;
+    }
+}
+
+async function applyHashDemoFromLocation() {
+    const hash = window.location.hash || '';
+    if (!hash || hash === lastAppliedHash) {
+        return false;
+    }
+    const payload = decodeDemoHash(hash);
+    if (!payload) {
+        return false;
+    }
+    lastAppliedHash = hash;
+    return applyHashDemoPayload(payload);
+}
+
+async function loadDemoTables(tableNames, finalQuery, statusText) {
+    const total = tableNames.length;
+    for (const [index, tableName] of tableNames.entries()) {
+        updateStatus(`Loading demo ${index + 1}/${total}: ${tableName}...`);
+        await loadDemoTable(tableName);
+        if (index < tableNames.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 20));
+        }
+    }
+
+    if (finalQuery) {
+        setQuery(finalQuery);
+    }
+    showDemoQueries();
+    scheduleDatabaseSnapshotSave();
+    updateStatus(statusText || `Loaded ${total} demo table(s)`);
+}
+
+async function loadGeoDemos() {
+    loadShareableDemo('geo');
 }
 
 // Load all demo tables
 async function loadAllDemos() {
-    const tableNames = ['sales', 'logistics', 'places_geo', 'routes_rg', 'settings_yaml', 'ai_docs', 'sales_large', 'logistics_large', 'web_events_large'];
-
-    for (const [index, tableName] of tableNames.entries()) {
-        await loadDemoTable(tableName);
-        if (index < tableNames.length - 1) {
-            await new Promise(resolve => setTimeout(resolve, 25));
-        }
-    }
-    
-    // Set a complex demo query
-    const editor = document.getElementById('queryEditor');
-    editor.value = `-- Large demo: revenue and fulfillment by region and carrier\nSELECT s.region,\n       l.carrier,\n       COUNT(*) AS orders,\n       SUM(s.order_total) AS total_revenue,\n       AVG(l.shipping_cost) AS avg_shipping_cost\nFROM sales_large s\nJOIN logistics_large l ON s.order_id = l.order_id\nGROUP BY s.region, l.carrier\nORDER BY total_revenue DESC`;
-    syncEditorHighlight();
-    saveEditorState();
-    // Ensure demo queries are visible after loading all demos
-    showDemoQueries();
-    scheduleDatabaseSnapshotSave();
-    updateStatus('Loaded curated demos and generated large tables');
+    const tableNames = ['sales', 'logistics', 'places_geo', 'geo_zones', 'routes_rg', 'settings_yaml', 'ai_docs', 'sales_large', 'logistics_large', 'web_events_large'];
+    await loadDemoTables(
+        tableNames,
+        `-- Large demo: revenue and fulfillment by region and carrier\nSELECT s.region,\n       l.carrier,\n       COUNT(*) AS orders,\n       SUM(s.order_total) AS total_revenue,\n       AVG(l.shipping_cost) AS avg_shipping_cost\nFROM sales_large s\nJOIN logistics_large l ON s.order_id = l.order_id\nGROUP BY s.region, l.carrier\nORDER BY total_revenue DESC`,
+        'Loaded curated demos and generated large tables'
+    );
 }
 
 // Load tables on startup
@@ -765,6 +1090,7 @@ document.addEventListener('DOMContentLoaded', () => {
     enhanceDemoQueries();
     setupAccessibilityShortcuts();
     setupSqlAutocomplete();
+    renderIntroPage();
     initWasm();
     
     // Setup demo buttons
@@ -778,6 +1104,27 @@ document.addEventListener('DOMContentLoaded', () => {
                 console.error('Error loading demos:', e);
             }
         });
+    }
+
+    const loadGeoDemosBtn = document.getElementById('loadGeoDemosBtn');
+    if (loadGeoDemosBtn) {
+        loadGeoDemosBtn.addEventListener('click', () => {
+            loadGeoDemosBtn.disabled = true;
+            try {
+                loadGeoDemos();
+            } catch (e) {
+                console.error('Error loading geo demos:', e);
+                updateStatus('Geo demo load failed');
+            } finally {
+                window.setTimeout(() => { loadGeoDemosBtn.disabled = false; }, 300);
+            }
+        });
+    }
+});
+
+window.addEventListener('hashchange', () => {
+    if (wasmReady) {
+        applyHashDemoFromLocation();
     }
 });
 
@@ -807,6 +1154,7 @@ function enhanceDemoQueries() {
             return;
         }
         item.dataset.a11yEnhanced = 'true';
+        item.dataset.demoGroup = inferDemoQueryGroup(item.textContent);
         item.setAttribute('role', 'button');
         item.setAttribute('tabindex', '0');
         item.setAttribute('aria-label', `Load demo query: ${item.textContent.trim()}`);
@@ -816,6 +1164,32 @@ function enhanceDemoQueries() {
                 item.click();
             }
         });
+    });
+    setDemoQueryGroup('all');
+}
+
+function inferDemoQueryGroup(text) {
+    const label = String(text || '').toLowerCase();
+    if (label.includes('geo') || label.includes('bbox') || label.includes('node') ||
+        label.includes('route') || label.includes('distance') || label.includes('radius') ||
+        label.includes('zone') || label.includes('munich')) {
+        return 'geo';
+    }
+    if (label.includes('fts') || label.includes('vector') || label.includes('hybrid') ||
+        label.includes('procedure') || label.includes('yaml')) {
+        return 'search';
+    }
+    return 'analytics';
+}
+
+function setDemoQueryGroup(group) {
+    const selectedGroup = group || 'all';
+    document.querySelectorAll('.demo-filter button').forEach((button) => {
+        button.classList.toggle('active', button.dataset.demoFilter === selectedGroup);
+    });
+    document.querySelectorAll('.example-query').forEach((item) => {
+        const matches = selectedGroup === 'all' || item.dataset.demoGroup === selectedGroup;
+        item.classList.toggle('hidden', !matches);
     });
 }
 
@@ -1390,6 +1764,7 @@ function registerClientTable(tableName, rows) {
 function showDemoQueries() {
     const dq = document.getElementById('demoQueries');
     if (dq) dq.classList.remove('hidden');
+    enhanceDemoQueries();
 }
 
 // Render tables in sidebar
@@ -1584,7 +1959,18 @@ function setQuery(query) {
     editor.value = query;
     syncEditorHighlight();
     saveEditorState();
+    closeSidebarOnMobile();
     editor.focus();
+}
+
+function closeSidebarOnMobile() {
+    if (!window.matchMedia || !window.matchMedia('(max-width: 900px)').matches) {
+        return;
+    }
+    const sidebar = document.querySelector('.sidebar');
+    if (sidebar) {
+        sidebar.classList.remove('open');
+    }
 }
 
 // Clear query
@@ -1636,6 +2022,7 @@ function clearAllTables() {
     }
     window.clearVanillaGrid?.();
     storageRemove(DB_SNAPSHOT_KEY);
+    renderIntroPage();
     updateStatus('Database cleared');
 }
 
@@ -1776,6 +2163,8 @@ function renderResults(data) {
     const displayedRows = visible ? visible.rows : [];
     const displayedColumns = visible ? visible.columns : [];
     const totalRows = data.rows.length;
+    const renderedRows = displayedRows.slice(0, RESULT_RENDER_LIMIT);
+    const renderIsLimited = displayedRows.length > renderedRows.length;
 
     if (!visible || displayedRows.length === 0) {
         window.clearVanillaGrid?.();
@@ -1803,6 +2192,7 @@ function renderResults(data) {
                 <strong>${displayedRows.length}</strong> / <strong>${totalRows}</strong> rows • 
                 <strong>${displayedColumns.length}</strong> columns • 
                 ${data.duration}
+                ${renderIsLimited ? `<br><span>Showing first ${renderedRows.length} rows for browser performance. Export uses the full filtered result.</span>` : ''}
             </div>
             <div class="results-actions">
                 <button onclick="copyResultsToClipboard()">Copy Results</button>
@@ -1851,7 +2241,7 @@ function renderResults(data) {
                 </tr>
             </thead>
             <tbody>
-                ${displayedRows.map((row, idx) => `
+                ${renderedRows.map((row, idx) => `
                     <tr onclick="this.classList.toggle('selected-row')">
                         <td class="row-num-col">${idx + 1}</td>
                         ${displayedColumns.map(col => {
@@ -1884,10 +2274,37 @@ function formatCell(value) {
     }
     
     const str = String(value);
+    const geo = formatGeoJSONCell(str);
+    if (geo) {
+        return `<td class="truncated-cell" title="${escapeHtml(str)}">${escapeHtml(geo)}</td>`;
+    }
     if (str.length > 120) {
         return `<td class="truncated-cell" title="${escapeHtml(str)}">${escapeHtml(str.slice(0, 120))}…</td>`;
     }
     return `<td>${escapeHtml(str)}</td>`;
+}
+
+function formatGeoJSONCell(value) {
+    const text = String(value || '').trim();
+    if (!text.startsWith('{') || !text.includes('"coordinates"')) {
+        return '';
+    }
+    try {
+        const obj = JSON.parse(text);
+        if (obj && obj.type === 'Point' && Array.isArray(obj.coordinates)) {
+            const lon = Number(obj.coordinates[0]);
+            const lat = Number(obj.coordinates[1]);
+            if (Number.isFinite(lon) && Number.isFinite(lat)) {
+                return `Point(${lon.toFixed(4)}, ${lat.toFixed(4)})`;
+            }
+        }
+        if (obj && typeof obj.type === 'string') {
+            return `${obj.type} geometry`;
+        }
+    } catch (_) {
+        return '';
+    }
+    return '';
 }
 
 // Show upload dialog
@@ -2443,8 +2860,7 @@ function renderHistory() {
 function recallHistory(idx) {
     const h = queryHistory[idx];
     if (h) {
-        document.getElementById('queryEditor').value = h.sql;
-        syncEditorHighlight();
+        setQuery(h.sql);
     }
 }
 

@@ -16,10 +16,12 @@
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
             height: 100vh;
+            height: 100dvh;
             display: flex;
             flex-direction: column;
             background: #1e1e1e;
             color: #d4d4d4;
+            overflow: hidden;
         }
 
         .hidden {
@@ -63,6 +65,7 @@
             display: flex;
             align-items: center;
             gap: 16px;
+            flex: 0 0 auto;
         }
 
         .topbar h1 {
@@ -88,6 +91,8 @@
             font-size: 13px;
             cursor: pointer;
             transition: background 0.2s;
+            white-space: nowrap;
+            min-height: 34px;
         }
 
         .topbar button:hover {
@@ -189,6 +194,179 @@
             gap: 4px;
         }
 
+        .intro-page {
+            display: flex;
+            flex-direction: column;
+            gap: 18px;
+            max-width: 1180px;
+            margin: 0 auto;
+        }
+
+        .intro-hero {
+            border: 1px solid #3e3e42;
+            background: #252526;
+            border-radius: 6px;
+            padding: 20px;
+            display: grid;
+            grid-template-columns: minmax(0, 1.4fr) minmax(240px, 0.8fr);
+            gap: 18px;
+            align-items: start;
+        }
+
+        .intro-kicker {
+            color: #9cdcfe;
+            font-size: 12px;
+            font-weight: 700;
+            text-transform: uppercase;
+            margin-bottom: 8px;
+        }
+
+        .intro-hero h2 {
+            color: #fff;
+            font-size: 28px;
+            line-height: 1.15;
+            margin-bottom: 10px;
+        }
+
+        .intro-copy {
+            color: #c8c8c8;
+            font-size: 14px;
+            line-height: 1.55;
+            max-width: 760px;
+        }
+
+        .intro-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 16px;
+        }
+
+        .intro-actions button,
+        .intro-card-actions button {
+            background: #0e639c;
+            border: none;
+            color: #fff;
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-size: 13px;
+            cursor: pointer;
+            min-height: 34px;
+        }
+
+        .intro-actions .secondary,
+        .intro-card-actions .secondary {
+            background: #3e3e42;
+            color: #d4d4d4;
+        }
+
+        .intro-actions button:hover,
+        .intro-card-actions button:hover {
+            background: #1177bb;
+        }
+
+        .intro-actions .secondary:hover,
+        .intro-card-actions .secondary:hover {
+            background: #505050;
+        }
+
+        .intro-metrics {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 8px;
+        }
+
+        .intro-metric {
+            background: #1e1e1e;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            padding: 10px;
+        }
+
+        .intro-metric strong {
+            display: block;
+            color: #fff;
+            font-size: 17px;
+            margin-bottom: 2px;
+        }
+
+        .intro-metric span {
+            color: #999;
+            font-size: 12px;
+        }
+
+        .feature-strip {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 10px;
+        }
+
+        .feature-pill {
+            background: #252526;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            padding: 10px;
+            color: #d4d4d4;
+            font-size: 12px;
+            line-height: 1.35;
+        }
+
+        .feature-pill strong {
+            display: block;
+            color: #fff;
+            font-size: 13px;
+            margin-bottom: 3px;
+        }
+
+        .intro-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 12px;
+        }
+
+        .intro-card {
+            background: #252526;
+            border: 1px solid #3e3e42;
+            border-radius: 6px;
+            padding: 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .intro-card h3 {
+            color: #fff;
+            font-size: 16px;
+            margin: 0;
+        }
+
+        .intro-card p {
+            color: #a9a9a9;
+            font-size: 13px;
+            line-height: 1.45;
+        }
+
+        .intro-card code {
+            background: #1e1e1e;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            color: #ce9178;
+            display: block;
+            font-size: 11px;
+            line-height: 1.45;
+            overflow: hidden;
+            padding: 8px;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .intro-card-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: auto;
+        }
+
         .vg-header-actions {
             display: flex;
             align-items: center;
@@ -215,6 +393,7 @@
             flex: 1;
             display: flex;
             overflow: hidden;
+            min-height: 0;
         }
 
         /* Sidebar */
@@ -227,6 +406,7 @@
             flex-direction: column;
             overflow-y: auto;
             transition: width 0.2s;
+            overscroll-behavior: contain;
         }
 
         .sidebar-toggle {
@@ -244,36 +424,6 @@
             font-size: 18px;
             cursor: pointer;
             box-shadow: 0 2px 8px rgba(0,0,0,0.3);
-        }
-
-        @media (max-width: 768px) {
-            .sidebar {
-                position: fixed;
-                left: 0;
-                top: 0;
-                bottom: 0;
-                z-index: 500;
-                transform: translateX(-100%);
-                transition: transform 0.25s;
-                box-shadow: 4px 0 20px rgba(0,0,0,0.5);
-            }
-            .sidebar.open {
-                transform: translateX(0);
-            }
-            .sidebar-toggle {
-                display: block;
-            }
-            .topbar {
-                flex-wrap: wrap;
-                gap: 8px;
-            }
-            .editor-hint {
-                display: none;
-            }
-            .results-actions {
-                flex-direction: column;
-                align-items: stretch;
-            }
         }
 
         .sidebar-header {
@@ -373,6 +523,7 @@
             display: flex;
             flex-direction: column;
             overflow: hidden;
+            min-width: 0;
         }
 
         /* Editor Area */
@@ -383,12 +534,14 @@
             display: flex;
             flex-direction: column;
             gap: 12px;
+            flex: 0 0 auto;
         }
 
         .editor-toolbar {
             display: flex;
             gap: 8px;
             align-items: center;
+            min-width: 0;
         }
 
         .editor-hint {
@@ -409,6 +562,8 @@
             align-items: center;
             gap: 6px;
             transition: background 0.2s;
+            white-space: nowrap;
+            min-height: 36px;
         }
 
         .editor-toolbar button:hover {
@@ -561,6 +716,7 @@
             overflow: auto;
             background: #1e1e1e;
             padding: 16px;
+            min-height: 0;
         }
 
         .results-header {
@@ -570,6 +726,7 @@
             margin-bottom: 16px;
             padding-bottom: 8px;
             border-bottom: 1px solid #3e3e42;
+            gap: 12px;
         }
 
         .results-info {
@@ -639,6 +796,7 @@
             border-radius: 4px;
             font-size: 12px;
             cursor: pointer;
+            min-height: 30px;
         }
 
         .results-actions button:hover {
@@ -900,6 +1058,30 @@
             text-transform: uppercase;
         }
 
+        .demo-filter {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 6px;
+            margin-bottom: 10px;
+        }
+
+        .demo-filter button {
+            background: #2d2d30;
+            border: 1px solid #3e3e42;
+            color: #ccc;
+            padding: 6px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            cursor: pointer;
+        }
+
+        .demo-filter button.active,
+        .demo-filter button:hover {
+            background: #0e639c;
+            border-color: #1177bb;
+            color: #fff;
+        }
+
         .example-query {
             background: #2d2d30;
             padding: 8px;
@@ -966,6 +1148,7 @@
             max-height: 60vh;
             border-radius: 4px;
             border: 1px solid #3e3e42;
+            -webkit-overflow-scrolling: touch;
         }
 
         .result-table-wrap:focus-within {
@@ -1175,6 +1358,164 @@
         .schema-actions button:hover {
             background: #1177bb;
         }
+
+        @media (max-width: 900px) {
+            .topbar {
+                gap: 8px;
+                overflow-x: auto;
+                scrollbar-width: thin;
+                padding: 10px 12px;
+            }
+
+            .topbar h1 {
+                flex: 0 0 auto;
+            }
+
+            .sidebar {
+                position: fixed;
+                left: 0;
+                top: 0;
+                bottom: 0;
+                z-index: 500;
+                width: min(88vw, 360px);
+                max-width: 360px;
+                transform: translateX(-100%);
+                transition: transform 0.25s;
+                box-shadow: 4px 0 20px rgba(0,0,0,0.5);
+            }
+
+            .sidebar.open {
+                transform: translateX(0);
+            }
+
+            .sidebar-toggle {
+                display: block;
+            }
+
+            .editor-area {
+                padding: 10px;
+                gap: 8px;
+            }
+
+            .editor-toolbar {
+                overflow-x: auto;
+                padding-bottom: 2px;
+            }
+
+            .editor-toolbar button {
+                flex: 0 0 auto;
+                padding: 8px 12px;
+            }
+
+            .editor-hint {
+                display: none;
+            }
+
+            textarea,
+            .sql-highlighter {
+                font-size: 13px;
+                line-height: 1.45;
+            }
+
+            textarea {
+                min-height: 150px;
+            }
+
+            .results-area {
+                padding: 10px;
+            }
+
+            .results-header {
+                align-items: flex-start;
+                flex-direction: column;
+            }
+
+            .results-actions {
+                width: 100%;
+                justify-content: flex-start;
+            }
+
+            .results-actions button {
+                flex: 1 1 calc(50% - 8px);
+            }
+
+            .results-toolbar {
+                display: grid;
+                grid-template-columns: 1fr;
+            }
+
+            .results-toolbar label,
+            .results-toolbar input,
+            .results-toolbar select,
+            .results-toolbar button {
+                width: 100%;
+            }
+
+            .result-table-wrap {
+                max-height: 48vh;
+            }
+        }
+
+        @media (max-width: 520px) {
+            .topbar button {
+                padding: 6px 10px;
+                font-size: 12px;
+            }
+
+            .spacer {
+                display: none;
+            }
+
+            .status {
+                flex: 0 0 auto;
+                padding-right: 4px;
+            }
+
+            .empty-state {
+                padding: 36px 14px;
+            }
+
+            .empty-state-icon {
+                font-size: 34px;
+            }
+
+            .result-table th,
+            .result-table td {
+                padding: 8px;
+                font-size: 12px;
+            }
+
+            .result-table td.truncated-cell {
+                max-width: 180px;
+            }
+
+            .column-sort-button {
+                padding: 8px;
+            }
+
+            .vanillagrid-section {
+                padding: 10px;
+            }
+
+            .intro-hero,
+            .intro-grid,
+            .feature-strip {
+                grid-template-columns: 1fr;
+            }
+
+            .intro-hero {
+                padding: 16px;
+            }
+
+            .intro-hero h2 {
+                font-size: 23px;
+            }
+
+            .intro-card code {
+                white-space: normal;
+                word-break: break-word;
+            }
+        }
     </style>
 </head>
 <body>
@@ -1185,6 +1526,7 @@
         <button onclick="showUploadDialog()" aria-label="Upload file">📁 Upload File</button>
         <button onclick="importClipboardData()" aria-label="Import data from clipboard">📋 Import Clipboard</button>
         <button id="loadAllDemosBtn" style="background: #7d2d7d;" aria-label="Load demo data and large tables">✨ Load Demo + Large Tables</button>
+        <button id="loadGeoDemosBtn" style="background: #236f52;" aria-label="Load geodata demo tables">🗺️ Load Geo Demo</button>
         <button onclick="toggleHistory()" style="background: #3e3e42;" aria-label="Toggle query history">📜 History</button>
         <div class="spacer"></div>
         <div class="status">
@@ -1225,6 +1567,12 @@
             <div id="schemaPanel" class="schema-panel hidden" role="region" aria-hidden="true" aria-labelledby="schemaPanelTitle" tabindex="-1"></div>
             <div id="demoQueries" class="examples hidden">
                 <div class="examples-title">Demo Queries</div>
+                <div class="demo-filter" role="group" aria-label="Filter demo queries">
+                    <button type="button" class="active" data-demo-filter="all" onclick="setDemoQueryGroup('all')">All</button>
+                    <button type="button" data-demo-filter="geo" onclick="setDemoQueryGroup('geo')">Geo</button>
+                    <button type="button" data-demo-filter="search" onclick="setDemoQueryGroup('search')">Search/RAG</button>
+                    <button type="button" data-demo-filter="analytics" onclick="setDemoQueryGroup('analytics')">Analytics</button>
+                </div>
                 <div class="example-query" onclick="setQuery('-- Sales by region\nSELECT region, SUM(quantity * unit_price) AS revenue\nFROM sales\nGROUP BY region\nORDER BY revenue DESC')">
                     📊 Sales by Region
                 </div>
@@ -1269,6 +1617,18 @@
                 </div>
                 <div class="example-query" onclick="setQuery('-- Routing graph nodes near Berlin\nSELECT node_id,\n       ST_DISTANCE(geometry, ST_MakePoint(13.4050, 52.5200)) AS meters_from_berlin\nFROM routes_rg_nodes\nWHERE ST_DWITHIN(geometry, ST_MakePoint(13.4050, 52.5200), 700000)\nORDER BY meters_from_berlin')">
                     📌 Nearby Nodes
+                </div>
+                <div class="example-query" onclick="setQuery('-- Geo zone membership\nSELECT z.zone_name, p.city, p.role\nFROM places_geo p\nJOIN geo_zones z ON ST_WITHIN_BBOX(p.geometry, z.min_lon, z.min_lat, z.max_lon, z.max_lat)\nORDER BY z.zone_name, p.city')">
+                    🧱 Geo Zones
+                </div>
+                <div class="example-query" onclick="setQuery('-- Distance matrix between hubs\nSELECT a.city AS origin, b.city AS destination,\n       ROUND(ST_DISTANCE(a.geometry, b.geometry) / 1000, 1) AS km\nFROM places_geo a\nJOIN places_geo b ON a.city < b.city\nORDER BY km')">
+                    📏 Distance Matrix
+                </div>
+                <div class="example-query" onclick="setQuery('-- Route edges with source and target coordinates\nSELECT e.edge_id,\n       s.node_id AS source_node,\n       t.node_id AS target_node,\n       ROUND(e.distance / 1000, 1) AS route_km,\n       ROUND(ST_DISTANCE(s.geometry, t.geometry) / 1000, 1) AS air_km\nFROM routes_rg e\nJOIN routes_rg_nodes s ON e.source = s.node_id\nJOIN routes_rg_nodes t ON e.target = t.node_id\nORDER BY route_km DESC')">
+                    🛣️ Route Geometry
+                </div>
+                <div class="example-query" onclick="setQuery('-- Hubs within 450 km of Munich\nSELECT name, city,\n       ROUND(ST_DISTANCE(geometry, ST_MakePoint(11.5755, 48.1372)) / 1000, 1) AS km_from_munich\nFROM places_geo\nWHERE ST_DWITHIN(geometry, ST_MakePoint(11.5755, 48.1372), 450000)\nORDER BY km_from_munich')">
+                    🎯 Munich Radius
                 </div>
                 <div class="example-query" onclick="setQuery('-- YAML import demo\nSELECT service, region, active, replicas\nFROM settings_yaml\nORDER BY service')">
                     ⚙️ YAML Import
@@ -1320,8 +1680,10 @@ Supported features:
 - Window functions (ROW_NUMBER, SUM OVER, …)
 - Aggregations: COUNT, SUM, AVG, MIN, MAX
 - CASE expressions, sub-queries
+- Geo: ST_DISTANCE, ST_DWITHIN, ST_WITHIN_BBOX
+- Search: FTS_SEARCH, VEC_SEARCH, hybrid retrieval
 - Multi-statement (separated by ;)
-- Import: CSV, JSON, XML, Excel
+- Import: CSV, JSON, YAML, XML, GeoJSON, KML, OSM, routing graph, Excel
 -- Export: CSV, JSON, XML" aria-describedby="editorHelp" aria-expanded="false"></textarea>
                     <div id="autocompletePanel" class="autocomplete-panel hidden" role="listbox" aria-label="SQL suggestions" aria-hidden="true"></div>
                     <div id="editorLineCount" class="editor-line-count"></div>
