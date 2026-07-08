@@ -9,16 +9,14 @@ import (
 	"testing"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
-	idrv "github.com/SimonWaldherr/tinySQL/internal/driver"
-
-	_ "github.com/SimonWaldherr/tinySQL/driver"
+	tsqldriver "github.com/SimonWaldherr/tinySQL/driver"
 )
 
 func newBenchmarkApp(b *testing.B, rows int) *App {
 	b.Helper()
 
 	nativeDB := tinysql.NewDB()
-	idrv.SetDefaultDB(nativeDB)
+	tsqldriver.SetDefaultDB(nativeDB)
 	tenant := fmt.Sprintf("bench_%s_%d", strings.ReplaceAll(b.Name(), "/", "_"), rows)
 
 	sqlDB, err := sql.Open("tinysql", "mem://?tenant="+tenant)

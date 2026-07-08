@@ -11,7 +11,7 @@ import (
 	"syscall/js"
 	"time"
 
-	_ "github.com/SimonWaldherr/tinySQL/internal/driver"
+	_ "github.com/SimonWaldherr/tinySQL/driver"
 )
 
 // Global state

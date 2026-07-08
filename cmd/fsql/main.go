@@ -27,8 +27,6 @@ package main
 
 import (
 	"context"
-	"encoding/csv"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -39,6 +37,8 @@ import (
 	"fsql/internal/adapter"
 	"fsql/internal/scope"
 	tinysql "github.com/SimonWaldherr/tinySQL"
+	"github.com/SimonWaldherr/tinySQL/exporter"
+	"github.com/SimonWaldherr/tinySQL/resultutil"
 )
 
 const version = "0.1.0"
@@ -218,53 +218,26 @@ func printResultSet(rs *tinysql.ResultSet, format string) error {
 }
 
 func printTable(rs *tinysql.ResultSet) error {
+	cols, rows := resultutil.ResultSetToStringMatrix(rs)
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, strings.Join(rs.Cols, "\t"))
-	sep := make([]string, len(rs.Cols))
-	for i, c := range rs.Cols {
+	fmt.Fprintln(w, strings.Join(cols, "\t"))
+	sep := make([]string, len(cols))
+	for i, c := range cols {
 		sep[i] = strings.Repeat("-", len(c))
 	}
 	fmt.Fprintln(w, strings.Join(sep, "\t"))
-	for _, row := range rs.Rows {
-		vals := make([]string, len(rs.Cols))
-		for i, col := range rs.Cols {
-			vals[i] = fmt.Sprintf("%v", row[col])
-		}
-		fmt.Fprintln(w, strings.Join(vals, "\t"))
+	for _, row := range rows {
+		fmt.Fprintln(w, strings.Join(row, "\t"))
 	}
 	return w.Flush()
 }
 
 func printCSV(rs *tinysql.ResultSet) error {
-	w := csv.NewWriter(os.Stdout)
-	if err := w.Write(rs.Cols); err != nil {
-		return err
-	}
-	for _, row := range rs.Rows {
-		rec := make([]string, len(rs.Cols))
-		for i, col := range rs.Cols {
-			rec[i] = fmt.Sprintf("%v", row[col])
-		}
-		if err := w.Write(rec); err != nil {
-			return err
-		}
-	}
-	w.Flush()
-	return w.Error()
+	return exporter.ExportCSV(os.Stdout, rs, exporter.Options{})
 }
 
 func printJSON(rs *tinysql.ResultSet) error {
-	out := make([]map[string]any, len(rs.Rows))
-	for i, row := range rs.Rows {
-		m := make(map[string]any, len(rs.Cols))
-		for _, col := range rs.Cols {
-			m[col] = row[col]
-		}
-		out[i] = m
-	}
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(out)
+	return exporter.ExportJSON(os.Stdout, rs, exporter.Options{PrettyJSON: true})
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

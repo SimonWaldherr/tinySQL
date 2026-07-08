@@ -4,8 +4,6 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
-	"encoding/csv"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -17,6 +15,8 @@ import (
 	"time"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
+	"github.com/SimonWaldherr/tinySQL/exporter"
+	"github.com/SimonWaldherr/tinySQL/resultutil"
 
 	// External database drivers
 	_ "github.com/go-sql-driver/mysql"
@@ -1301,20 +1301,18 @@ func outputTableWriter(out io.Writer, result *tinysql.ResultSet) {
 		fmt.Fprintln(out, "No results")
 		return
 	}
+	cols, rows := resultutil.ResultSetToStringMatrix(result)
 
 	// Calculate column widths
-	widths := make([]int, len(result.Cols))
-	for i, col := range result.Cols {
+	widths := make([]int, len(cols))
+	for i, col := range cols {
 		widths[i] = len(col)
 	}
 
-	for _, row := range result.Rows {
-		for i, col := range result.Cols {
-			if value, ok := row[strings.ToLower(col)]; ok {
-				str := fmt.Sprintf("%v", value)
-				if len(str) > widths[i] {
-					widths[i] = len(str)
-				}
+	for _, row := range rows {
+		for i, value := range row {
+			if len(value) > widths[i] {
+				widths[i] = len(value)
 			}
 		}
 	}
@@ -1326,7 +1324,7 @@ func outputTableWriter(out io.Writer, result *tinysql.ResultSet) {
 	}
 
 	// Print header
-	for i, col := range result.Cols {
+	for i, col := range cols {
 		if len(col) > widths[i] {
 			col = col[:widths[i]-3] + "..."
 		}
@@ -1334,19 +1332,15 @@ func outputTableWriter(out io.Writer, result *tinysql.ResultSet) {
 	}
 	fmt.Fprintln(out)
 
-	for i := range result.Cols {
+	for i := range cols {
 		fmt.Fprint(out, strings.Repeat("─", widths[i])+"  ")
 	}
 	fmt.Fprintln(out)
 
-	for _, row := range result.Rows {
-		for i, col := range result.Cols {
-			value := ""
-			if v, ok := row[strings.ToLower(col)]; ok && v != nil {
-				value = fmt.Sprintf("%v", v)
-				if len(value) > widths[i] {
-					value = value[:widths[i]-3] + "..."
-				}
+	for _, row := range rows {
+		for i, value := range row {
+			if len(value) > widths[i] {
+				value = value[:widths[i]-3] + "..."
 			}
 			fmt.Fprintf(out, "%-*s  ", widths[i], value)
 		}
@@ -1355,37 +1349,11 @@ func outputTableWriter(out io.Writer, result *tinysql.ResultSet) {
 }
 
 func outputJSON(out io.Writer, result *tinysql.ResultSet) {
-	var records []map[string]any
-	for _, row := range result.Rows {
-		record := make(map[string]any)
-		for _, col := range result.Cols {
-			if value, ok := row[strings.ToLower(col)]; ok {
-				record[col] = value
-			}
-		}
-		records = append(records, record)
-	}
-
-	encoder := json.NewEncoder(out)
-	encoder.SetIndent("", "  ")
-	encoder.Encode(records)
+	_ = exporter.ExportJSON(out, result, exporter.Options{PrettyJSON: true})
 }
 
 func outputCSV(out io.Writer, result *tinysql.ResultSet) {
-	writer := csv.NewWriter(out)
-	defer writer.Flush()
-
-	writer.Write(result.Cols)
-
-	for _, row := range result.Rows {
-		record := make([]string, len(result.Cols))
-		for i, col := range result.Cols {
-			if value, ok := row[strings.ToLower(col)]; ok && value != nil {
-				record[i] = fmt.Sprintf("%v", value)
-			}
-		}
-		writer.Write(record)
-	}
+	_ = exporter.ExportCSV(out, result, exporter.Options{})
 }
 
 // ============================================================================

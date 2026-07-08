@@ -28,6 +28,11 @@ func ExportJSON(w io.Writer, rs *tinysql.ResultSet, opts Options) error {
 	return ie.ExportJSON(w, rs, opts)
 }
 
+// ExportSQL writes ResultSet rows as INSERT statements for tableName.
+func ExportSQL(w io.Writer, rs *tinysql.ResultSet, tableName string) error {
+	return ie.ExportSQL(w, rs, tableName)
+}
+
 // ExportXML writes ResultSet rows as simple XML.
 func ExportXML(w io.Writer, rs *tinysql.ResultSet) error {
 	return ie.ExportXML(w, rs)

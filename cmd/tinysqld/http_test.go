@@ -69,6 +69,22 @@ func TestDaemonExecAndQuery(t *testing.T) {
 	}
 }
 
+func TestDaemonSQLStateOnSyntaxError(t *testing.T) {
+	d := newTestDaemon(t)
+	handler := d.routes()
+
+	resp := postJSONStatus(t, handler, "/api/query", map[string]any{"sql": "SLECT * FROM missing"}, http.StatusBadRequest)
+	if resp["success"] != false {
+		t.Fatalf("expected failed response, got %#v", resp)
+	}
+	if resp["sql_state"] != tinysql.SQLStateSyntaxError {
+		t.Fatalf("expected syntax SQLSTATE, got %#v", resp)
+	}
+	if resp["error"] == "" {
+		t.Fatalf("expected original error message, got %#v", resp)
+	}
+}
+
 func TestDaemonCatalogEndpoints(t *testing.T) {
 	d := newTestDaemon(t)
 	handler := d.routes()
@@ -99,9 +115,27 @@ func TestDaemonJobsEndpointsAndManualRun(t *testing.T) {
 	handler := d.routes()
 
 	postJSON(t, handler, "/api/exec", map[string]any{"sql": "CREATE TABLE audit_log (id INT, message TEXT)"})
-	postJSON(t, handler, "/api/exec", map[string]any{
-		"sql": "CREATE JOB audit_job SCHEDULE ONCE '2099-01-01 00:00:00' DISABLED AS INSERT INTO audit_log VALUES (1, 'manual')",
-	})
+	created := postJSONStatus(t, handler, "/api/jobs", map[string]any{
+		"name":          "audit_job",
+		"sql":           "INSERT INTO audit_log VALUES (1, 'manual')",
+		"schedule_type": "ONCE",
+		"run_at":        "2099-01-01T00:00:00Z",
+		"enabled":       false,
+	}, http.StatusCreated)
+	job, ok := created["job"].(map[string]any)
+	if !ok || job["name"] != "audit_job" || job["schedule_type"] != "ONCE" {
+		t.Fatalf("unexpected create job response: %#v", created)
+	}
+
+	bad := postJSONStatus(t, handler, "/api/jobs", map[string]any{
+		"name":          "bad_job",
+		"sql":           "SELECT 1",
+		"schedule_type": "ONCE",
+		"run_at":        "not-a-time",
+	}, http.StatusBadRequest)
+	if bad["success"] != false || bad["error"] == "" {
+		t.Fatalf("unexpected invalid job response: %#v", bad)
+	}
 
 	jobs := getJSON(t, handler, "/api/jobs")
 	rows := responseRows(t, jobs)
@@ -171,6 +205,10 @@ func getJSON(t *testing.T, handler http.Handler, path string) map[string]any {
 }
 
 func postJSON(t *testing.T, handler http.Handler, path string, body map[string]any) map[string]any {
+	return postJSONStatus(t, handler, path, body, http.StatusOK)
+}
+
+func postJSONStatus(t *testing.T, handler http.Handler, path string, body map[string]any, wantStatus int) map[string]any {
 	t.Helper()
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -180,8 +218,8 @@ func postJSON(t *testing.T, handler http.Handler, path string, body map[string]a
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("POST %s status = %d, body=%s", path, rec.Code, rec.Body.String())
+	if rec.Code != wantStatus {
+		t.Fatalf("POST %s status = %d, want %d, body=%s", path, rec.Code, wantStatus, rec.Body.String())
 	}
 	var resp map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {

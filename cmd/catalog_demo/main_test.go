@@ -5,14 +5,13 @@ import (
 	"testing"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
-	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 func TestCatalogOperations(t *testing.T) {
 	db := tinysql.NewDB()
 	catalog := db.Catalog()
 
-	tableCols := []storage.Column{{Name: "id"}, {Name: "name"}}
+	tableCols := []tinysql.Column{{Name: "id"}, {Name: "name"}}
 	catalog.RegisterTable("main", "users", tableCols)
 
 	tables := catalog.GetTables()
@@ -29,10 +28,10 @@ func TestCatalogOperations(t *testing.T) {
 
 	// Register a view and a function and verify no panic
 	catalog.RegisterView("main", "v_users", "SELECT * FROM users")
-	catalog.RegisterFunction(&storage.CatalogFunction{Name: "dummy", Schema: "main", FunctionType: "SCALAR"})
+	catalog.RegisterFunction(&tinysql.CatalogFunction{Name: "dummy", Schema: "main", FunctionType: "SCALAR"})
 
 	// Register a job and verify it appears in list
-	job := &storage.CatalogJob{Name: "job1", SQLText: "SELECT 1", Enabled: true}
+	job := &tinysql.CatalogJob{Name: "job1", SQLText: "SELECT 1", Enabled: true}
 	catalog.RegisterJob(job)
 	jobs := catalog.ListJobs()
 	if len(jobs) == 0 {

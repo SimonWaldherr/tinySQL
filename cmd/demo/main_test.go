@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/SimonWaldherr/tinySQL/internal/driver"
+	_ "github.com/SimonWaldherr/tinySQL/driver"
 )
 
 func TestBuildDemo(t *testing.T) {

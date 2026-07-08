@@ -94,6 +94,9 @@ type Column = storage.Column
 // ColType enumerates supported column data types (INT, TEXT, BOOL, JSON, etc.).
 type ColType = storage.ColType
 
+// ConstraintType enumerates supported column constraints.
+type ConstraintType = storage.ConstraintType
+
 // Row represents a single result row mapped by column name (case-insensitive).
 // Keys include both qualified (table.column) and unqualified (column) names.
 type Row = engine.Row
@@ -104,6 +107,42 @@ type ResultSet = engine.ResultSet
 
 // SQLStateError attaches an ISO/IEC 9075 SQLSTATE code to an error.
 type SQLStateError = standards.SQLStateError
+
+// Permission enumerates RBAC operations that can be granted to roles.
+type Permission = storage.Permission
+
+// Grant authorizes a Permission on a schema/table pair, with "*" as wildcard.
+type Grant = storage.Grant
+
+// CatalogRole is a named RBAC role and its grants.
+type CatalogRole = storage.CatalogRole
+
+// CatalogUser is an RBAC user principal. PasswordHash is opaque.
+type CatalogUser = storage.CatalogUser
+
+// CatalogManager stores schema, RBAC, function, trigger, view, and job metadata.
+type CatalogManager = storage.CatalogManager
+
+// CatalogTable describes a table registered in the catalog.
+type CatalogTable = storage.CatalogTable
+
+// CatalogColumn describes a table column registered in the catalog.
+type CatalogColumn = storage.CatalogColumn
+
+// CatalogView describes a logical SQL view.
+type CatalogView = storage.CatalogView
+
+// CatalogMaterializedView describes a cached materialized view.
+type CatalogMaterializedView = storage.CatalogMaterializedView
+
+// CatalogDependency records a dependency between catalog objects.
+type CatalogDependency = storage.CatalogDependency
+
+// CatalogFunction describes a scalar, aggregate, or table function.
+type CatalogFunction = storage.CatalogFunction
+
+// CatalogTrigger describes a trigger registered in the catalog.
+type CatalogTrigger = storage.CatalogTrigger
 
 // Statement is the base interface for all parsed SQL statements.
 // Use Parser.ParseStatement() to obtain a Statement from SQL text.
@@ -134,6 +173,21 @@ const (
 	SQLStateInvalidAuthorization = standards.SQLStateInvalidAuthorization
 	SQLStateTransactionRollback  = standards.SQLStateTransactionRollback
 	SQLStateInternalError        = standards.SQLStateInternalError
+)
+
+const (
+	NoConstraint ConstraintType = storage.NoConstraint
+	PrimaryKey   ConstraintType = storage.PrimaryKey
+	Unique       ConstraintType = storage.Unique
+)
+
+const (
+	PermSelect Permission = storage.PermSelect
+	PermInsert Permission = storage.PermInsert
+	PermUpdate Permission = storage.PermUpdate
+	PermDelete Permission = storage.PermDelete
+	PermDDL    Permission = storage.PermDDL
+	PermAll    Permission = storage.PermAll
 )
 
 // JobExecutor executes SQL text for scheduled jobs.
@@ -680,6 +734,11 @@ func WithUser(ctx context.Context, username string) context.Context {
 // UserFromContext returns the username set by WithUser, if any.
 func UserFromContext(ctx context.Context) (string, bool) {
 	return engine.UserFromContext(ctx)
+}
+
+// ParsePermission validates and normalizes an RBAC permission keyword.
+func ParsePermission(s string) (Permission, error) {
+	return storage.ParsePermission(s)
 }
 
 // ExecuteCompiled executes a pre-compiled query against the database.

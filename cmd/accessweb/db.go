@@ -11,7 +11,6 @@ import (
 	"time"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
-	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 // App holds the shared application state.
@@ -62,7 +61,7 @@ func (a *App) tableNames() []string {
 // table. It uses the native DB for schema info (immune to LIMIT-0 issue).
 func (a *App) tableMeta(ctx context.Context, name string) (TableMeta, error) {
 	tables := a.nativeDB.ListTables(a.tenant)
-	var found *storage.Table
+	var found *tinysql.Table
 	for _, t := range tables {
 		if t != nil && strings.EqualFold(t.Name, name) {
 			found = t

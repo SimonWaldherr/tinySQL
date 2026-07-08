@@ -47,6 +47,45 @@ func TestPublicSQLStateHelpers(t *testing.T) {
 	}
 }
 
+func TestPublicRBACHelpers(t *testing.T) {
+	perm, err := tsql.ParsePermission("select")
+	if err != nil {
+		t.Fatalf("ParsePermission failed: %v", err)
+	}
+	if perm != tsql.PermSelect {
+		t.Fatalf("ParsePermission = %q, want %q", perm, tsql.PermSelect)
+	}
+
+	db := tsql.NewDB()
+	ctx := context.Background()
+	if _, err := tsql.Execute(ctx, db, "default", tsql.MustParseSQL("CREATE TABLE public_rbac (id INT)")); err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+	if err := db.Catalog().CreateRole("reader"); err != nil {
+		t.Fatalf("CreateRole failed: %v", err)
+	}
+	if err := db.Catalog().GrantPermission("reader", tsql.PermSelect, "default", "public_rbac"); err != nil {
+		t.Fatalf("GrantPermission failed: %v", err)
+	}
+	if err := db.Catalog().CreateUser("alice", "secret", []string{"reader"}); err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+	if !db.Catalog().HasPermission("alice", tsql.PermSelect, "default", "public_rbac") {
+		t.Fatal("expected public Permission alias to work with CatalogManager")
+	}
+	table := tsql.NewTable("api_constraints", []tsql.Column{
+		{Name: "id", Type: tsql.IntType, Constraint: tsql.PrimaryKey},
+	}, false)
+	if table.Cols[0].Constraint != tsql.PrimaryKey {
+		t.Fatal("expected public ConstraintType alias to work with Column")
+	}
+	var _ tsql.Grant = tsql.Grant{Permission: tsql.PermSelect, Schema: "default", Table: "public_rbac"}
+	var _ *tsql.CatalogManager = db.Catalog()
+	var _ []*tsql.CatalogTable = db.Catalog().GetTables()
+	var _ []tsql.CatalogRole = db.Catalog().ListRoles()
+	var _ []tsql.CatalogUser = db.Catalog().ListUsers()
+}
+
 func TestPublicAPICompiledExecutionAndJobScheduler(t *testing.T) {
 	db := tsql.NewDB()
 	ctx := context.Background()

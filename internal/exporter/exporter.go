@@ -110,6 +110,37 @@ func ExportJSON(w io.Writer, rs *engine.ResultSet, opts Options) error {
 	return enc.Encode(out)
 }
 
+// ExportSQL writes ResultSet rows as INSERT statements for tableName.
+func ExportSQL(w io.Writer, rs *engine.ResultSet, tableName string) error {
+	for _, r := range rs.Rows {
+		values := make([]string, len(rs.Cols))
+		for i, c := range rs.Cols {
+			values[i] = valueToSQLLiteral(r[strings.ToLower(c)])
+		}
+		if _, err := fmt.Fprintf(w, "INSERT INTO %s (%s) VALUES (%s);\n",
+			tableName, strings.Join(rs.Cols, ", "), strings.Join(values, ", ")); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func valueToSQLLiteral(v any) string {
+	if v == nil {
+		return "NULL"
+	}
+	switch t := v.(type) {
+	case string:
+		return "'" + strings.ReplaceAll(t, "'", "''") + "'"
+	case time.Time:
+		return "'" + t.Format(time.RFC3339) + "'"
+	case []byte:
+		return "'" + strings.ReplaceAll(string(t), "'", "''") + "'"
+	default:
+		return valueToString(v)
+	}
+}
+
 type xmlField struct {
 	XMLName xml.Name
 	Value   string `xml:",chardata"`

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
+	"github.com/SimonWaldherr/tinySQL/sqlutil"
 )
 
 // webState holds the shared state for the web server.
@@ -165,7 +166,8 @@ func (s *webState) handleQuery(w http.ResponseWriter, r *http.Request) {
 		for _, row := range result.Rows {
 			cleanRow := make(map[string]any)
 			for _, col := range result.Cols {
-				cleanRow[col] = row[strings.ToLower(col)]
+				value, _ := tinysql.GetVal(row, col)
+				cleanRow[col] = value
 			}
 			rows = append(rows, cleanRow)
 		}
@@ -514,11 +516,7 @@ func writeJSON(w http.ResponseWriter, status int, data apiResponse) {
 }
 
 func isResultQuerySQL(query string) bool {
-	upper := strings.TrimSpace(strings.ToUpper(query))
-	return strings.HasPrefix(upper, "SELECT") ||
-		strings.HasPrefix(upper, "WITH") ||
-		strings.HasPrefix(upper, "SHOW") ||
-		strings.HasPrefix(upper, "EXPLAIN")
+	return sqlutil.IsResultProducing(query)
 }
 
 // ============================================================================

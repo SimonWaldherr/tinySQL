@@ -8,14 +8,12 @@ import (
 	"strings"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
-	idrv "github.com/SimonWaldherr/tinySQL/internal/driver"
-
-	_ "github.com/SimonWaldherr/tinySQL/driver"
+	tsqldriver "github.com/SimonWaldherr/tinySQL/driver"
 )
 
 func ExampleApp_apiExportHandler() {
 	nativeDB := tinysql.NewDB()
-	idrv.SetDefaultDB(nativeDB)
+	tsqldriver.SetDefaultDB(nativeDB)
 	sqlDB, err := sql.Open("tinysql", "mem://?tenant=example_export")
 	if err != nil {
 		panic(err)

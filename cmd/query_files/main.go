@@ -3,8 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/csv"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -16,6 +14,8 @@ import (
 	"time"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
+	"github.com/SimonWaldherr/tinySQL/exporter"
+	"github.com/SimonWaldherr/tinySQL/resultutil"
 )
 
 const (
@@ -674,21 +674,17 @@ func outputTable(result *tinysql.ResultSet) {
 		fmt.Println("No results")
 		return
 	}
+	cols, rows := resultutil.ResultSetToStringMatrix(result)
 
-	lowerCols := make([]string, len(result.Cols))
-	widths := make([]int, len(result.Cols))
-	for i, col := range result.Cols {
-		lowerCols[i] = strings.ToLower(col)
+	widths := make([]int, len(cols))
+	for i, col := range cols {
 		widths[i] = len(col)
 	}
 
-	for _, row := range result.Rows {
-		for i, lc := range lowerCols {
-			if value, ok := row[lc]; ok {
-				str := fmt.Sprintf("%v", value)
-				if len(str) > widths[i] {
-					widths[i] = len(str)
-				}
+	for _, row := range rows {
+		for i, value := range row {
+			if len(value) > widths[i] {
+				widths[i] = len(value)
 			}
 		}
 	}
@@ -699,7 +695,7 @@ func outputTable(result *tinysql.ResultSet) {
 		}
 	}
 
-	for i, col := range result.Cols {
+	for i, col := range cols {
 		if len(col) > widths[i] && widths[i] > 3 {
 			col = col[:widths[i]-3] + "..."
 		}
@@ -707,19 +703,15 @@ func outputTable(result *tinysql.ResultSet) {
 	}
 	fmt.Println()
 
-	for i := range result.Cols {
+	for i := range cols {
 		fmt.Print(strings.Repeat("─", widths[i]) + "  ")
 	}
 	fmt.Println()
 
-	for _, row := range result.Rows {
-		for i, lc := range lowerCols {
-			value := ""
-			if v, ok := row[lc]; ok && v != nil {
-				value = fmt.Sprintf("%v", v)
-				if len(value) > widths[i] && widths[i] > 3 {
-					value = value[:widths[i]-3] + "..."
-				}
+	for _, row := range rows {
+		for i, value := range row {
+			if len(value) > widths[i] && widths[i] > 3 {
+				value = value[:widths[i]-3] + "..."
 			}
 			fmt.Printf("%-*s  ", widths[i], value)
 		}
@@ -728,39 +720,11 @@ func outputTable(result *tinysql.ResultSet) {
 }
 
 func outputJSON(result *tinysql.ResultSet) error {
-	records := make([]map[string]any, 0, len(result.Rows))
-	for _, row := range result.Rows {
-		record := make(map[string]any, len(result.Cols))
-		for _, col := range result.Cols {
-			record[col] = row[strings.ToLower(col)]
-		}
-		records = append(records, record)
-	}
-
-	encoder := json.NewEncoder(os.Stdout)
-	encoder.SetIndent("", "  ")
-	return encoder.Encode(records)
+	return exporter.ExportJSON(os.Stdout, result, exporter.Options{PrettyJSON: true})
 }
 
 func outputCSV(result *tinysql.ResultSet) error {
-	writer := csv.NewWriter(os.Stdout)
-	if err := writer.Write(result.Cols); err != nil {
-		return err
-	}
-
-	for _, row := range result.Rows {
-		record := make([]string, len(result.Cols))
-		for i, col := range result.Cols {
-			if value, ok := row[strings.ToLower(col)]; ok && value != nil {
-				record[i] = fmt.Sprintf("%v", value)
-			}
-		}
-		if err := writer.Write(record); err != nil {
-			return err
-		}
-	}
-	writer.Flush()
-	return writer.Error()
+	return exporter.ExportCSV(os.Stdout, result, exporter.Options{})
 }
 
 func printHelp() {

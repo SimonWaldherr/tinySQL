@@ -3,8 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/csv"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -15,8 +13,8 @@ import (
 	"time"
 
 	tsql "github.com/SimonWaldherr/tinySQL"
+	"github.com/SimonWaldherr/tinySQL/exporter"
 	"github.com/SimonWaldherr/tinySQL/internal/engine"
-	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 // ============================================================================
@@ -358,8 +356,8 @@ func (sb *SchemaBrowser) DescribeTable(tenant, table string) (*TableInfo, error)
 		info.Columns = append(info.Columns, ColumnInfo{
 			Name:     col.Name,
 			Type:     col.Type.String(),
-			Nullable: col.Constraint != storage.PrimaryKey,
-			Primary:  col.Constraint == storage.PrimaryKey,
+			Nullable: col.Constraint != tsql.PrimaryKey,
+			Primary:  col.Constraint == tsql.PrimaryKey,
 		})
 	}
 
@@ -663,66 +661,18 @@ func (e *Exporter) Export(rs *tsql.ResultSet, tableName string, w *os.File) erro
 	case FormatJSON:
 		return e.exportJSON(rs, w)
 	case FormatSQL:
-		return e.exportSQL(rs, tableName, w)
+		return exporter.ExportSQL(w, rs, tableName)
 	default:
 		return fmt.Errorf("unknown format: %s", e.format)
 	}
 }
 
 func (e *Exporter) exportCSV(rs *tsql.ResultSet, w *os.File) error {
-	writer := csv.NewWriter(w)
-	defer writer.Flush()
-
-	if err := writer.Write(rs.Cols); err != nil {
-		return err
-	}
-
-	for _, row := range rs.Rows {
-		record := make([]string, len(rs.Cols))
-		for i, col := range rs.Cols {
-			if v, ok := row[strings.ToLower(col)]; ok && v != nil {
-				record[i] = fmt.Sprintf("%v", v)
-			}
-		}
-		if err := writer.Write(record); err != nil {
-			return err
-		}
-	}
-	return nil
+	return exporter.ExportCSV(w, rs, exporter.Options{})
 }
 
 func (e *Exporter) exportJSON(rs *tsql.ResultSet, w *os.File) error {
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-
-	var data []map[string]any
-	for _, row := range rs.Rows {
-		item := make(map[string]any)
-		for _, col := range rs.Cols {
-			item[col] = row[strings.ToLower(col)]
-		}
-		data = append(data, item)
-	}
-	return enc.Encode(data)
-}
-
-func (e *Exporter) exportSQL(rs *tsql.ResultSet, tableName string, w *os.File) error {
-	for _, row := range rs.Rows {
-		var values []string
-		for _, col := range rs.Cols {
-			v := row[strings.ToLower(col)]
-			if v == nil {
-				values = append(values, "NULL")
-			} else if s, ok := v.(string); ok {
-				values = append(values, fmt.Sprintf("'%s'", strings.ReplaceAll(s, "'", "''")))
-			} else {
-				values = append(values, fmt.Sprintf("%v", v))
-			}
-		}
-		fmt.Fprintf(w, "INSERT INTO %s (%s) VALUES (%s);\n",
-			tableName, strings.Join(rs.Cols, ", "), strings.Join(values, ", "))
-	}
-	return nil
+	return exporter.ExportJSON(w, rs, exporter.Options{PrettyJSON: true})
 }
 
 // ============================================================================
@@ -1464,7 +1414,7 @@ func runToolsREPL(tenant string) {
 				for _, row := range rs.Rows {
 					var vals []string
 					for _, col := range rs.Cols {
-						v := row[strings.ToLower(col)]
+						v, _ := tsql.GetVal(row, col)
 						if v == nil {
 							vals = append(vals, "NULL")
 						} else {

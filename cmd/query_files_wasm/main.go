@@ -99,7 +99,7 @@ func resultRowsToJS(result *tinysql.ResultSet) []interface{} {
 	for _, row := range result.Rows {
 		outRow := make(map[string]interface{}, len(result.Cols))
 		for _, col := range result.Cols {
-			val, ok := row[strings.ToLower(col)]
+			val, ok := tinysql.GetVal(row, col)
 			if !ok || val == nil {
 				outRow[col] = ""
 				continue

@@ -19,10 +19,9 @@ import (
 	"time"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
-	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
-// TinySQLExecutor implements storage.JobExecutor using the tinySQL engine.
+// TinySQLExecutor implements tinysql.JobExecutor using the tinySQL engine.
 // It parses and executes SQL statements, printing SELECT results to stdout.
 type TinySQLExecutor struct {
 	db     *tinysql.DB
@@ -51,7 +50,8 @@ func formatFirstRow(rs *tinysql.ResultSet) string {
 	row := rs.Rows[0]
 	parts := make([]string, 0, len(rs.Cols))
 	for _, col := range rs.Cols {
-		parts = append(parts, fmt.Sprintf("%s=%v", col, row[col]))
+		value, _ := tinysql.GetVal(row, col)
+		parts = append(parts, fmt.Sprintf("%s=%v", col, value))
 	}
 	return strings.Join(parts, ", ")
 }
@@ -97,16 +97,16 @@ func main() {
 	fmt.Println("1. Registering tables in catalog...")
 	catalog := tdb.Catalog()
 
-	catalog.RegisterTable("main", "events", []storage.Column{
-		{Name: "id", Type: storage.IntType},
-		{Name: "kind", Type: storage.StringType},
-		{Name: "ts", Type: storage.IntType},
-		{Name: "payload", Type: storage.StringType},
+	catalog.RegisterTable("main", "events", []tinysql.Column{
+		{Name: "id", Type: tinysql.IntType},
+		{Name: "kind", Type: tinysql.StringType},
+		{Name: "ts", Type: tinysql.IntType},
+		{Name: "payload", Type: tinysql.StringType},
 	})
-	catalog.RegisterTable("main", "event_stats", []storage.Column{
-		{Name: "kind", Type: storage.StringType},
-		{Name: "total", Type: storage.IntType},
-		{Name: "last_updated", Type: storage.IntType},
+	catalog.RegisterTable("main", "event_stats", []tinysql.Column{
+		{Name: "kind", Type: tinysql.StringType},
+		{Name: "total", Type: tinysql.IntType},
+		{Name: "last_updated", Type: tinysql.IntType},
 	})
 
 	// ── Query catalog ──────────────────────────────────────────────────────
@@ -134,7 +134,7 @@ func main() {
 	// ── Register functions ─────────────────────────────────────────────────
 	fmt.Println()
 	fmt.Println("5. Registering functions...")
-	catalog.RegisterFunction(&storage.CatalogFunction{
+	catalog.RegisterFunction(&tinysql.CatalogFunction{
 		Schema:          "main",
 		Name:            "json_get",
 		FunctionType:    "SCALAR",
@@ -151,7 +151,7 @@ func main() {
 	fmt.Println("6. Creating scheduled jobs...")
 
 	// INTERVAL job: refresh event stats every 2 seconds
-	statsJob := &storage.CatalogJob{
+	statsJob := &tinysql.CatalogJob{
 		Name:         "refresh_event_stats",
 		SQLText:      `SELECT kind, COUNT(*) AS total FROM events GROUP BY kind ORDER BY kind`,
 		ScheduleType: "INTERVAL",
@@ -165,7 +165,7 @@ func main() {
 
 	// ONCE job: run an integrity check 1 second from now
 	runAt := time.Now().Add(1 * time.Second)
-	integrityJob := &storage.CatalogJob{
+	integrityJob := &tinysql.CatalogJob{
 		Name:         "integrity_check",
 		SQLText:      `SELECT COUNT(*) AS total_events FROM events`,
 		ScheduleType: "ONCE",
@@ -181,9 +181,8 @@ func main() {
 	fmt.Println()
 	fmt.Println("7. Starting scheduler (jobs will execute real SQL)...")
 	executor := &TinySQLExecutor{db: tdb, tenant: tenant}
-	scheduler := storage.NewScheduler(tdb, executor)
 
-	if err := scheduler.Start(); err != nil {
+	if err := tdb.StartJobScheduler(executor); err != nil {
 		log.Fatalf("Failed to start scheduler: %v", err)
 	}
 
@@ -215,7 +214,7 @@ func main() {
 	// ── Cleanup ────────────────────────────────────────────────────────────
 	fmt.Println()
 	fmt.Println("10. Stopping scheduler...")
-	scheduler.Stop()
+	tdb.StopJobScheduler()
 
 	fmt.Println()
 	fmt.Println("=== Demo Complete ===")

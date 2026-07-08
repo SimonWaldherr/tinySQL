@@ -12,9 +12,7 @@ import (
 	"os"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
-	idrv "github.com/SimonWaldherr/tinySQL/internal/driver"
-
-	_ "github.com/SimonWaldherr/tinySQL/driver"
+	tsqldriver "github.com/SimonWaldherr/tinySQL/driver"
 )
 
 //go:embed templates static
@@ -43,7 +41,7 @@ func main() {
 
 	// Register the native DB instance with the database/sql driver so that
 	// sql.Open("tinysql", ...) shares the same underlying storage.
-	idrv.SetDefaultDB(nativeDB)
+	tsqldriver.SetDefaultDB(nativeDB)
 
 	sqlDB, err := sql.Open("tinysql", "mem://?tenant="+*tenant)
 	if err != nil {

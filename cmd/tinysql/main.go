@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -20,7 +19,7 @@ import (
 	"time"
 
 	tsql "github.com/SimonWaldherr/tinySQL"
-	"github.com/SimonWaldherr/tinySQL/internal/storage"
+	"github.com/SimonWaldherr/tinySQL/exporter"
 )
 
 // Config holds the runtime configuration.
@@ -392,7 +391,7 @@ func dumpTables(out io.Writer, db *tsql.DB, tenant string, args []string) error 
 		fmt.Fprintf(out, "CREATE TABLE %s (\n", tbl.Name)
 		for i, col := range tbl.Cols {
 			def := fmt.Sprintf("  %s %s", col.Name, col.Type)
-			if col.Constraint == storage.PrimaryKey {
+			if col.Constraint == tsql.PrimaryKey {
 				def += " PRIMARY KEY"
 			}
 			if i < len(tbl.Cols)-1 {
@@ -411,20 +410,8 @@ func dumpTables(out io.Writer, db *tsql.DB, tenant string, args []string) error 
 		if err != nil || rs == nil {
 			continue
 		}
-		for _, row := range rs.Rows {
-			var vals []string
-			for _, col := range rs.Cols {
-				v := row[strings.ToLower(col)]
-				if v == nil {
-					vals = append(vals, "NULL")
-				} else if s, ok := v.(string); ok {
-					vals = append(vals, "'"+strings.ReplaceAll(s, "'", "''")+"'")
-				} else {
-					vals = append(vals, fmt.Sprintf("%v", v))
-				}
-			}
-			fmt.Fprintf(out, "INSERT INTO %s (%s) VALUES (%s);\n",
-				name, strings.Join(rs.Cols, ", "), strings.Join(vals, ", "))
+		if err := exporter.ExportSQL(out, rs, name); err != nil {
+			return err
 		}
 		fmt.Fprintln(out)
 	}
@@ -664,7 +651,7 @@ func (cp *ColumnPrinter) Print(out io.Writer, rs *tsql.ResultSet, cfg *Config) e
 	// Data
 	for _, row := range rs.Rows {
 		for i, col := range rs.Cols {
-			val := row[strings.ToLower(col)]
+			val, _ := tsql.GetVal(row, col)
 			fmt.Fprint(w, fmtScalar(val, cfg.NullValue))
 			if i < len(rs.Cols)-1 {
 				fmt.Fprint(w, "\t")
@@ -683,7 +670,7 @@ func (lp *ListPrinter) Print(out io.Writer, rs *tsql.ResultSet, cfg *Config) err
 			if i > 0 {
 				fmt.Fprint(out, "|")
 			}
-			val := row[strings.ToLower(col)]
+			val, _ := tsql.GetVal(row, col)
 			fmt.Fprint(out, fmtScalar(val, cfg.NullValue))
 		}
 		fmt.Fprintln(out)
@@ -694,40 +681,13 @@ func (lp *ListPrinter) Print(out io.Writer, rs *tsql.ResultSet, cfg *Config) err
 type CSVPrinter struct{}
 
 func (cp *CSVPrinter) Print(out io.Writer, rs *tsql.ResultSet, cfg *Config) error {
-	w := csv.NewWriter(out)
-	if cfg.Header {
-		if err := w.Write(rs.Cols); err != nil {
-			return err
-		}
-	}
-	for _, row := range rs.Rows {
-		record := make([]string, len(rs.Cols))
-		for i, col := range rs.Cols {
-			val := row[strings.ToLower(col)]
-			record[i] = fmtScalar(val, "")
-		}
-		if err := w.Write(record); err != nil {
-			return err
-		}
-	}
-	w.Flush()
-	return w.Error()
+	return exporter.ExportCSV(out, rs, exporter.Options{CSVNoHeader: !cfg.Header})
 }
 
 type JSONPrinter struct{}
 
 func (jp *JSONPrinter) Print(out io.Writer, rs *tsql.ResultSet, cfg *Config) error {
-	enc := json.NewEncoder(out)
-	enc.SetIndent("", "  ")
-	output := make([]map[string]any, 0, len(rs.Rows))
-	for _, row := range rs.Rows {
-		item := make(map[string]any)
-		for _, col := range rs.Cols {
-			item[col] = row[strings.ToLower(col)]
-		}
-		output = append(output, item)
-	}
-	return enc.Encode(output)
+	return exporter.ExportJSON(out, rs, exporter.Options{PrettyJSON: true})
 }
 
 // ---- Helpers ----------------------------------------------------------------
@@ -808,7 +768,7 @@ func printSchema(out io.Writer, db *tsql.DB, tenant, tableFilter string) error {
 		fmt.Fprintf(out, "CREATE TABLE %s (\n", fullTable.Name)
 		for i, col := range fullTable.Cols {
 			def := fmt.Sprintf("  %s %s", col.Name, col.Type)
-			if col.Constraint == storage.PrimaryKey {
+			if col.Constraint == tsql.PrimaryKey {
 				def += " PRIMARY KEY"
 			}
 			if i < len(fullTable.Cols)-1 {

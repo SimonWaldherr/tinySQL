@@ -12,6 +12,7 @@ import (
 	"time"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
+	"github.com/SimonWaldherr/tinySQL/jobs"
 )
 
 type daemonConfig struct {
@@ -45,12 +46,27 @@ type runJobRequest struct {
 	TimeoutMS int64  `json:"timeout_ms,omitempty"`
 }
 
+type createJobRequest struct {
+	Name         string `json:"name"`
+	SQL          string `json:"sql"`
+	ScheduleType string `json:"schedule_type,omitempty"`
+	CronExpr     string `json:"cron_expr,omitempty"`
+	IntervalMS   int64  `json:"interval_ms,omitempty"`
+	RunAt        string `json:"run_at,omitempty"`
+	Timezone     string `json:"timezone,omitempty"`
+	Enabled      *bool  `json:"enabled,omitempty"`
+	CatchUp      bool   `json:"catch_up,omitempty"`
+	NoOverlap    bool   `json:"no_overlap,omitempty"`
+	MaxRuntimeMS int64  `json:"max_runtime_ms,omitempty"`
+}
+
 type sqlResponse struct {
-	Success bool              `json:"success"`
-	Columns []string          `json:"columns,omitempty"`
-	Rows    []tinysql.Row     `json:"rows,omitempty"`
-	Error   string            `json:"error,omitempty"`
-	Meta    map[string]string `json:"meta,omitempty"`
+	Success  bool              `json:"success"`
+	Columns  []string          `json:"columns,omitempty"`
+	Rows     []tinysql.Row     `json:"rows,omitempty"`
+	Error    string            `json:"error,omitempty"`
+	SQLState string            `json:"sql_state,omitempty"`
+	Meta     map[string]string `json:"meta,omitempty"`
 }
 
 func newDaemon(inst *tinysql.Instance, cfg daemonConfig) *daemon {
@@ -216,12 +232,40 @@ func (d *daemon) handleCatalogColumns(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *daemon) handleJobs(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+	switch r.Method {
+	case http.MethodGet:
+		tenant := d.tenantOrDefault(r.URL.Query().Get("tenant"))
+		d.writeCatalogQuery(w, r, tenant, "SELECT name, enabled, schedule_type, cron_expr, interval_ms, run_at, timezone, catch_up, no_overlap, max_runtime_ms, last_run_at, next_run_at, created_at, updated_at FROM catalog.jobs")
+	case http.MethodPost:
+		d.handleCreateJob(w, r)
+	default:
 		writeErrorJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (d *daemon) handleCreateJob(w http.ResponseWriter, r *http.Request) {
+	var req createJobRequest
+	if err := decodeJSONBody(w, r, d.maxBodyBytes, &req); err != nil {
+		writeErrorJSON(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
-	tenant := d.tenantOrDefault(r.URL.Query().Get("tenant"))
-	d.writeCatalogQuery(w, r, tenant, "SELECT name, enabled, schedule_type, cron_expr, interval_ms, run_at, timezone, catch_up, no_overlap, max_runtime_ms, last_run_at, next_run_at, created_at, updated_at FROM catalog.jobs")
+	job, err := buildCatalogJob(req)
+	if err != nil {
+		writeErrorJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := d.inst.DB.RegisterJob(job); err != nil {
+		writeErrorJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := d.inst.DB.Sync(); err != nil {
+		writeErrorJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"success": true,
+		"job":     jobResponse(job),
+	})
 }
 
 func (d *daemon) handleJobHistory(w http.ResponseWriter, r *http.Request) {
@@ -242,7 +286,7 @@ func (d *daemon) writeCatalogQuery(w http.ResponseWriter, r *http.Request, tenan
 	defer cancel()
 	rs, err := d.executeSQL(ctx, tenant, sqlText)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, sqlResponse{Success: false, Error: err.Error()})
+		writeJSON(w, http.StatusBadRequest, sqlErrorResponse(err))
 		return
 	}
 	writeJSON(w, http.StatusOK, sqlResponse{
@@ -355,7 +399,7 @@ func (d *daemon) handleSQL(w http.ResponseWriter, r *http.Request) {
 	tenant := d.tenantOrDefault(req.Tenant)
 	rs, err := d.executeSQL(ctx, tenant, sqlText)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, sqlResponse{Success: false, Error: err.Error()})
+		writeJSON(w, http.StatusBadRequest, sqlErrorResponse(err))
 		return
 	}
 	resp := sqlResponse{
@@ -374,9 +418,75 @@ func (d *daemon) handleSQL(w http.ResponseWriter, r *http.Request) {
 func (d *daemon) executeSQL(ctx context.Context, tenant, sqlText string) (*tinysql.ResultSet, error) {
 	stmt, err := tinysql.ParseSQL(sqlText)
 	if err != nil {
-		return nil, err
+		return nil, tinysql.WithSQLState(tinysql.SQLStateSyntaxError, err)
 	}
 	return tinysql.Execute(ctx, d.inst.DB, tenant, stmt)
+}
+
+func buildCatalogJob(req createJobRequest) (*tinysql.CatalogJob, error) {
+	cfg := jobs.Config{
+		Name:         req.Name,
+		SQL:          req.SQL,
+		ScheduleType: req.ScheduleType,
+		CronExpr:     req.CronExpr,
+		IntervalMs:   req.IntervalMS,
+		Timezone:     req.Timezone,
+		Enabled:      req.Enabled,
+		CatchUp:      req.CatchUp,
+		NoOverlap:    req.NoOverlap,
+		MaxRuntimeMs: req.MaxRuntimeMS,
+	}
+	if strings.TrimSpace(req.RunAt) != "" {
+		runAt, err := time.Parse(time.RFC3339, strings.TrimSpace(req.RunAt))
+		if err != nil {
+			return nil, fmt.Errorf("run_at must be RFC3339: %w", err)
+		}
+		cfg.RunAt = &runAt
+	}
+	return jobs.Build(cfg)
+}
+
+func jobResponse(job *tinysql.CatalogJob) map[string]any {
+	out := map[string]any{
+		"name":           job.Name,
+		"sql":            job.SQLText,
+		"enabled":        job.Enabled,
+		"schedule_type":  job.ScheduleType,
+		"cron_expr":      job.CronExpr,
+		"interval_ms":    job.IntervalMs,
+		"timezone":       job.Timezone,
+		"catch_up":       job.CatchUp,
+		"no_overlap":     job.NoOverlap,
+		"max_runtime_ms": job.MaxRuntimeMs,
+	}
+	if job.RunAt != nil {
+		out["run_at"] = job.RunAt.Format(time.RFC3339)
+	}
+	if job.LastRunAt != nil {
+		out["last_run_at"] = job.LastRunAt.Format(time.RFC3339)
+	}
+	if job.NextRunAt != nil {
+		out["next_run_at"] = job.NextRunAt.Format(time.RFC3339)
+	}
+	if !job.CreatedAt.IsZero() {
+		out["created_at"] = job.CreatedAt.Format(time.RFC3339)
+	}
+	if !job.UpdatedAt.IsZero() {
+		out["updated_at"] = job.UpdatedAt.Format(time.RFC3339)
+	}
+	return out
+}
+
+func sqlErrorResponse(err error) sqlResponse {
+	resp := sqlResponse{Success: false, Error: err.Error()}
+	var stateErr *tinysql.SQLStateError
+	if errors.As(err, &stateErr) && stateErr.Unwrap() != nil {
+		resp.Error = stateErr.Unwrap().Error()
+	}
+	if state := tinysql.SQLState(err); state != "" {
+		resp.SQLState = state
+	}
+	return resp
 }
 
 func (d *daemon) tenantOrDefault(tenant string) string {

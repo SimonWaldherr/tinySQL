@@ -11,7 +11,7 @@ import (
 	"time"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
-	drv "github.com/SimonWaldherr/tinySQL/internal/driver"
+	tsqldriver "github.com/SimonWaldherr/tinySQL/driver"
 	wailsrt "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
@@ -35,7 +35,7 @@ func (a *App) startup(ctx context.Context) {
 	// Initialize tinySQL with in-memory database
 	native := tinysql.NewDB()
 	a.nativeDB = native
-	drv.SetDefaultDB(native)
+	tsqldriver.SetDefaultDB(native)
 
 	var err error
 	a.db, err = sql.Open("tinysql", "mem://?tenant=default")
@@ -377,7 +377,7 @@ func (a *App) LoadDatabaseFromFile() (string, error) {
 	}
 
 	a.nativeDB = db
-	drv.SetDefaultDB(db)
+	tsqldriver.SetDefaultDB(db)
 
 	// Reconnect SQL driver
 	if a.db != nil {

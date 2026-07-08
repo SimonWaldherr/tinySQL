@@ -32,3 +32,19 @@ func TestExportCSVAndTSV(t *testing.T) {
 		t.Fatalf("unexpected TSV: %q", tsv.String())
 	}
 }
+
+func TestExportSQL(t *testing.T) {
+	rs := &tinysql.ResultSet{
+		Cols: []string{"id", "name"},
+		Rows: []tinysql.Row{
+			{"id": 1, "name": "O'Hara"},
+		},
+	}
+	var sql bytes.Buffer
+	if err := ExportSQL(&sql, rs, "people"); err != nil {
+		t.Fatalf("ExportSQL: %v", err)
+	}
+	if got := sql.String(); !strings.Contains(got, "INSERT INTO people (id, name) VALUES (1, 'O''Hara');") {
+		t.Fatalf("unexpected SQL: %q", got)
+	}
+}

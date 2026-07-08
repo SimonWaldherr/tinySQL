@@ -12,9 +12,7 @@ import (
 	"testing"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
-	idrv "github.com/SimonWaldherr/tinySQL/internal/driver"
-
-	_ "github.com/SimonWaldherr/tinySQL/driver"
+	tsqldriver "github.com/SimonWaldherr/tinySQL/driver"
 )
 
 var testCounter atomic.Int64
@@ -25,7 +23,7 @@ func newTestApp(t *testing.T) *App {
 	t.Helper()
 
 	nativeDB := tinysql.NewDB()
-	idrv.SetDefaultDB(nativeDB)
+	tsqldriver.SetDefaultDB(nativeDB)
 	tenant := fmt.Sprintf("test_%d", testCounter.Add(1))
 
 	sqlDB, err := sql.Open("tinysql", "mem://?tenant="+tenant)

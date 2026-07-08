@@ -10,7 +10,8 @@ import (
 	"os"
 	"strings"
 
-	_ "github.com/SimonWaldherr/tinySQL/internal/driver"
+	_ "github.com/SimonWaldherr/tinySQL/driver"
+	"github.com/SimonWaldherr/tinySQL/sqlutil"
 )
 
 var flagDSN = flag.String("dsn", "mem://?tenant=default", "DSN (mem:// or file:/path.db?tenant=...&autosave=1)")
@@ -81,8 +82,7 @@ func shouldSkipLine(line string) bool {
 
 // executeStatement executes a complete SQL statement
 func executeStatement(db *sql.DB, q string, beautiful, htmlMode, errorsOnly bool, format string, srcLines []string, htmlParts *[]string, interactive bool) []string {
-	up := strings.ToUpper(q)
-	if strings.HasPrefix(up, "SELECT") || strings.HasPrefix(up, "WITH") {
+	if sqlutil.IsResultProducing(q) {
 		if err := handleSelectStatement(db, q, beautiful, htmlMode, errorsOnly, format, srcLines, htmlParts, interactive); err != nil {
 			return nil
 		}
@@ -191,8 +191,7 @@ func replReadAndExecFile(db *sql.DB, filename string) {
 		if s == "" || strings.HasPrefix(s, "--") {
 			continue
 		}
-		up := strings.ToUpper(s)
-		if strings.HasPrefix(up, "SELECT") || strings.HasPrefix(up, "WITH") {
+		if sqlutil.IsResultProducing(s) {
 			rows, err := db.Query(s)
 			if err != nil {
 				fmt.Println("ERR:", err)
@@ -230,7 +229,7 @@ Commands:
   .count [TABLE]        Show row counts
   .dump [TABLE]         Dump table(s) as INSERT statements
   .read FILE            Execute SQL from file
-  .output FORMAT        Show current or set output format (table, csv, json)
+  .output FORMAT        Show current or set output format (table, csv, tsv, json, yaml, markdown)
   .timer on|off         Toggle execution timing
   .clear                Clear the screen`)
 		return true

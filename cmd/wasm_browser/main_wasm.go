@@ -14,7 +14,7 @@ import (
 	"time"
 
 	tsql "github.com/SimonWaldherr/tinySQL"
-	drv "github.com/SimonWaldherr/tinySQL/internal/driver"
+	tsqldriver "github.com/SimonWaldherr/tinySQL/driver"
 	"github.com/SimonWaldherr/tinySQL/internal/engine"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -73,7 +73,7 @@ func validateArgs(args []js.Value, minCount int, expectedType js.Type) error {
 }
 
 func currentStorageDB() *storage.DB {
-	if current := drv.CurrentDefaultDB(); current != nil {
+	if current := tsqldriver.CurrentDefaultDB(); current != nil {
 		wasmStorageDB = current
 		return current
 	}
@@ -102,7 +102,7 @@ func bindStorageDB(next *storage.DB, dsn string) error {
 	}
 
 	wasmStorageDB = next
-	drv.SetDefaultDB(wasmStorageDB)
+	tsqldriver.SetDefaultDB(wasmStorageDB)
 
 	var err error
 	db, err = sql.Open("tinysql", dsn)

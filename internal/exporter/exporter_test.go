@@ -52,6 +52,32 @@ func TestExportJSON(t *testing.T) {
 	}
 }
 
+func TestExportSQL(t *testing.T) {
+	rs := &engine.ResultSet{
+		Cols: []string{"id", "name", "created_at", "payload"},
+		Rows: []engine.Row{
+			{
+				"id":         1,
+				"name":       "O'Hara",
+				"created_at": time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC),
+				"payload":    []byte("a'b"),
+			},
+			{"id": 2, "name": nil},
+		},
+	}
+	var buf bytes.Buffer
+	if err := ExportSQL(&buf, rs, "people"); err != nil {
+		t.Fatalf("ExportSQL failed: %v", err)
+	}
+	out := buf.String()
+	if !bytes.Contains(buf.Bytes(), []byte("INSERT INTO people (id, name, created_at, payload) VALUES (1, 'O''Hara', '2020-01-02T03:04:05Z', 'a''b');")) {
+		t.Fatalf("SQL missing escaped row: %s", out)
+	}
+	if !bytes.Contains(buf.Bytes(), []byte("VALUES (2, NULL")) {
+		t.Fatalf("SQL missing NULL row: %s", out)
+	}
+}
+
 func TestExportXML(t *testing.T) {
 	rs := makeSample()
 	var buf bytes.Buffer

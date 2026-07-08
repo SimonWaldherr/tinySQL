@@ -29,6 +29,7 @@ func OpenWithDB(db *storage.DB) (*sql.DB, error) {
 // consumers can use a stable public API while the implementation remains
 // hidden under `internal/driver`.
 var (
-	OpenInMemory = id.OpenInMemory
-	SetDefaultDB = id.SetDefaultDB
+	OpenInMemory     = id.OpenInMemory
+	SetDefaultDB     = id.SetDefaultDB
+	CurrentDefaultDB = id.CurrentDefaultDB
 )

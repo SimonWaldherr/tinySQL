@@ -40,7 +40,8 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/SimonWaldherr/tinySQL/internal/driver"
+	_ "github.com/SimonWaldherr/tinySQL/driver"
+	"github.com/SimonWaldherr/tinySQL/sqlutil"
 )
 
 var (
@@ -142,10 +143,8 @@ func (e *executor) run(q string) error {
 	}
 
 	start := time.Now()
-	up := strings.ToUpper(q)
-	isQuery := strings.HasPrefix(up, "SELECT") || strings.HasPrefix(up, "WITH")
 
-	if isQuery {
+	if sqlutil.IsResultProducing(q) {
 		rows, err := e.db.Query(q)
 		if err != nil {
 			return err
