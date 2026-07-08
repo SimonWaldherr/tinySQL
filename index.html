@@ -1210,9 +1210,9 @@
                 <label class="upload-btn" for="fileInput">
                     📤 Upload File
                 </label>
-                <input type="file" id="fileInput" accept=".csv,.tsv,.txt,.json,.jsonl,.ndjson,.xml,.geojson,.kml,.osm,.rg,.routinggraph,.routing-graph,.routing_graph,.xlsx,.xls" multiple onchange="handleFileUpload(event)" aria-describedby="uploadHelp">
+                <input type="file" id="fileInput" accept=".csv,.tsv,.txt,.json,.jsonl,.ndjson,.yaml,.yml,.xml,.geojson,.kml,.osm,.rg,.routinggraph,.routing-graph,.routing_graph,.xlsx,.xls" multiple onchange="handleFileUpload(event)" aria-describedby="uploadHelp">
                 <div id="uploadHelp" style="font-size: 11px; color: #888; margin-top: 8px; padding: 0 4px;">
-                    Supports: CSV, TSV, TXT, JSON, JSONL/NDJSON, XML, GeoJSON, KML, OSM XML, routing graph
+                    Supports: CSV, TSV, TXT, JSON, JSONL/NDJSON, YAML, XML, GeoJSON, KML, OSM XML, routing graph
                 </div>
             </div>
             <div class="table-list" id="tableList">
@@ -1269,6 +1269,21 @@
                 </div>
                 <div class="example-query" onclick="setQuery('-- Routing graph nodes near Berlin\nSELECT node_id,\n       ST_DISTANCE(geometry, ST_MakePoint(13.4050, 52.5200)) AS meters_from_berlin\nFROM routes_rg_nodes\nWHERE ST_DWITHIN(geometry, ST_MakePoint(13.4050, 52.5200), 700000)\nORDER BY meters_from_berlin')">
                     📌 Nearby Nodes
+                </div>
+                <div class="example-query" onclick="setQuery('-- YAML import demo\nSELECT service, region, active, replicas\nFROM settings_yaml\nORDER BY service')">
+                    ⚙️ YAML Import
+                </div>
+                <div class="example-query" onclick="setQuery('-- Full-text search\nSELECT title, category, _fts_score, _fts_rank\nFROM FTS_SEARCH(\'ai_docs\', \'vector search\', 3)')">
+                    🔎 FTS Search
+                </div>
+                <div class="example-query" onclick="setQuery('-- Vector nearest-neighbor search\nSELECT title, category, _vec_distance, _vec_rank\nFROM VEC_SEARCH(\'ai_docs\', \'embedding\', VEC_FROM_JSON(\'[1.0, 0.0, 0.0]\'), 3, \'cosine\')')">
+                    🧠 Vector Search
+                </div>
+                <div class="example-query" onclick="setQuery('-- Hybrid text + vector ranking\nSELECT title, category,\n       FTS_RANK(content, \'vector OR search\') AS text_rank,\n       VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON(\'[1.0, 0.0, 0.0]\')) AS vector_similarity\nFROM ai_docs\nWHERE FTS_MATCH(content, \'vector OR search\')\nORDER BY vector_similarity DESC')">
+                    🧩 Hybrid Retrieval
+                </div>
+                <div class="example-query" onclick="setQuery('-- In-memory stored procedure\nCALL demo_table_summary()')">
+                    🧾 Stored Procedure
                 </div>
             </div>
             <div id="historyPanel" class="history-section hidden">
