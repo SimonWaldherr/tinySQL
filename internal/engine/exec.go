@@ -71,6 +71,9 @@ func getAllFunctions() map[string]funcHandler {
 		for k, v := range getTextFunctions() {
 			m[k] = v
 		}
+		for k, v := range getGeoFunctions() {
+			m[k] = v
+		}
 		allFunctions = m
 	})
 	return allFunctions
@@ -6850,6 +6853,9 @@ func evalFuncCall(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 
 	builtinFunctions := getAllFunctions()
 	if handler, ok := builtinFunctions[ex.Name]; ok {
+		return handler(env, ex, row)
+	}
+	if handler, ok := builtinFunctions[strings.ToUpper(ex.Name)]; ok {
 		return handler(env, ex, row)
 	}
 	return nil, fmt.Errorf("unknown function: %s", ex.Name)
