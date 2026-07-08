@@ -1,6 +1,6 @@
 module github.com/SimonWaldherr/tinySQL/cmd/accessweb
 
-go 1.25.11
+go 1.25.12
 
 replace github.com/SimonWaldherr/tinySQL => ../..
 
