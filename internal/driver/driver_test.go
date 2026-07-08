@@ -510,6 +510,107 @@ func TestSQLTransactionControlCommands(t *testing.T) {
 	}
 }
 
+func TestTransactionCommitMergesUnrelatedConcurrentChanges(t *testing.T) {
+	s := newServer(storage.NewDB(), cfg{})
+	d := &drv{srv: s}
+	raw1, err := d.Open("mem://")
+	if err != nil {
+		t.Fatalf("open conn1: %v", err)
+	}
+	raw2, err := d.Open("mem://")
+	if err != nil {
+		t.Fatalf("open conn2: %v", err)
+	}
+	c1 := raw1.(*conn)
+	c2 := raw2.(*conn)
+	ctx := context.Background()
+
+	for _, sql := range []string{
+		"CREATE TABLE tx_a (id INT)",
+		"CREATE TABLE tx_b (id INT)",
+	} {
+		if _, err := c1.ExecContext(ctx, sql, nil); err != nil {
+			t.Fatalf("setup %q: %v", sql, err)
+		}
+	}
+	if _, err := c1.ExecContext(ctx, "BEGIN", nil); err != nil {
+		t.Fatalf("begin c1: %v", err)
+	}
+	if _, err := c2.ExecContext(ctx, "INSERT INTO tx_b VALUES (20)", nil); err != nil {
+		t.Fatalf("concurrent insert c2: %v", err)
+	}
+	if _, err := c1.ExecContext(ctx, "INSERT INTO tx_a VALUES (10)", nil); err != nil {
+		t.Fatalf("insert c1: %v", err)
+	}
+	if _, err := c1.ExecContext(ctx, "COMMIT", nil); err != nil {
+		t.Fatalf("commit c1: %v", err)
+	}
+
+	for table, want := range map[string]int{"tx_a": 10, "tx_b": 20} {
+		rows, err := c1.QueryContext(ctx, "SELECT id FROM "+table, nil)
+		if err != nil {
+			t.Fatalf("select %s: %v", table, err)
+		}
+		dest := make([]driver.Value, 1)
+		if err := rows.Next(dest); err != nil {
+			t.Fatalf("expected row in %s: %v", table, err)
+		}
+		if dest[0] != int64(want) && dest[0] != want {
+			t.Fatalf("%s row = %#v, want %d", table, dest[0], want)
+		}
+	}
+}
+
+func TestTransactionCommitRejectsSameTableConflict(t *testing.T) {
+	s := newServer(storage.NewDB(), cfg{})
+	d := &drv{srv: s}
+	raw1, err := d.Open("mem://")
+	if err != nil {
+		t.Fatalf("open conn1: %v", err)
+	}
+	raw2, err := d.Open("mem://")
+	if err != nil {
+		t.Fatalf("open conn2: %v", err)
+	}
+	c1 := raw1.(*conn)
+	c2 := raw2.(*conn)
+	ctx := context.Background()
+
+	if _, err := c1.ExecContext(ctx, "CREATE TABLE tx_conflict (id INT)", nil); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := c1.ExecContext(ctx, "BEGIN", nil); err != nil {
+		t.Fatalf("begin c1: %v", err)
+	}
+	if _, err := c2.ExecContext(ctx, "INSERT INTO tx_conflict VALUES (2)", nil); err != nil {
+		t.Fatalf("insert c2: %v", err)
+	}
+	if _, err := c1.ExecContext(ctx, "INSERT INTO tx_conflict VALUES (1)", nil); err != nil {
+		t.Fatalf("insert c1: %v", err)
+	}
+	if _, err := c1.ExecContext(ctx, "COMMIT", nil); err == nil {
+		t.Fatal("expected same-table transaction conflict")
+	}
+	if c1.inTx {
+		t.Fatal("connection stayed in transaction after commit conflict")
+	}
+
+	rows, err := c2.QueryContext(ctx, "SELECT id FROM tx_conflict", nil)
+	if err != nil {
+		t.Fatalf("select after conflict: %v", err)
+	}
+	dest := make([]driver.Value, 1)
+	if err := rows.Next(dest); err != nil {
+		t.Fatalf("expected concurrent row to remain: %v", err)
+	}
+	if dest[0] != int64(2) && dest[0] != 2 {
+		t.Fatalf("remaining row = %#v, want 2", dest[0])
+	}
+	if err := rows.Next(dest); !errors.Is(err, io.EOF) {
+		t.Fatalf("expected only the concurrent row, got next err=%v row=%#v", err, dest)
+	}
+}
+
 func TestQueryExplainReturnsRows(t *testing.T) {
 	d := &drv{}
 	rawConn, err := d.Open("mem://")

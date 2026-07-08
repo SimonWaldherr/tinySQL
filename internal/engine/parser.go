@@ -339,6 +339,7 @@ type CreateTrigger struct {
 	Table       string
 	ForEachRow  bool
 	WhenExpr    Expr        // optional WHEN condition
+	WhenText    string      // original WHEN expression text, for persisted triggers
 	Body        []Statement // trigger body statements, parsed once to validate syntax at CREATE TRIGGER time
 	BodyText    string      // verbatim source text of the body (between BEGIN and END), stored for re-parsing on each fire
 	IfNotExists bool
@@ -927,7 +928,7 @@ func (p *Parser) parseCreateTrigger(orReplace bool) (Statement, error) {
 		return nil, err
 	}
 
-	whenExpr, err := p.parseTriggerWhen()
+	whenExpr, whenText, err := p.parseTriggerWhen()
 	if err != nil {
 		return nil, err
 	}
@@ -948,6 +949,7 @@ func (p *Parser) parseCreateTrigger(orReplace bool) (Statement, error) {
 		Table:       table,
 		ForEachRow:  forEachRow,
 		WhenExpr:    whenExpr,
+		WhenText:    whenText,
 		Body:        body,
 		BodyText:    bodyText,
 		IfNotExists: ifNotExists,
@@ -1018,22 +1020,24 @@ func (p *Parser) parseTriggerForEachRow() (bool, error) {
 	return true, nil
 }
 
-func (p *Parser) parseTriggerWhen() (Expr, error) {
+func (p *Parser) parseTriggerWhen() (Expr, string, error) {
 	if p.cur.Typ != tKeyword || p.cur.Val != "WHEN" {
-		return nil, nil
+		return nil, "", nil
 	}
 	p.next()
 	if err := p.expectSymbol("("); err != nil {
-		return nil, err
+		return nil, "", err
 	}
+	startPos := p.cur.Pos
 	whenExpr, err := p.parseExpr()
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
+	endPos := p.cur.Pos
 	if err := p.expectSymbol(")"); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return whenExpr, nil
+	return whenExpr, strings.TrimSpace(p.lx.s[startPos:endPos]), nil
 }
 
 // parseTriggerBody parses the statements between BEGIN and END, validating

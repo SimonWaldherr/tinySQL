@@ -360,6 +360,7 @@ type conn struct {
 	tenant string
 
 	inTx       bool
+	txBase     *storage.DB // Snapshot base used for conflict detection
 	shadow     *storage.DB // Snapshot copy (MVCC-light)
 	txReadOnly bool        // Active tx requested as read-only
 }
@@ -382,10 +383,11 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 	}
 	defer c.srv.releaseReader()
 	c.srv.mu.RLock()
-	shadow := c.srv.db.DeepClone()
+	base, shadow := c.srv.db.DeepClonePair()
 	c.srv.mu.RUnlock()
 
 	c.inTx = true
+	c.txBase = base
 	c.shadow = shadow
 	c.txReadOnly = opts.ReadOnly
 	return &tx{c: c}, nil
@@ -425,7 +427,14 @@ func (c *conn) commitTx() error {
 	defer c.srv.mu.Unlock()
 	oldDB := c.srv.db
 	newDB := c.shadow
-	changes := storage.CollectWALChanges(oldDB, newDB)
+	changes := storage.CollectWALChanges(c.txBase, newDB)
+	if err := c.detectTxConflicts(oldDB, changes); err != nil {
+		c.inTx = false
+		c.txBase = nil
+		c.shadow = nil
+		c.txReadOnly = false
+		return err
+	}
 	wal := oldDB.WAL()
 	needCheckpoint := false
 	var err error
@@ -435,17 +444,41 @@ func (c *conn) commitTx() error {
 			return err
 		}
 	}
-	c.srv.db = newDB
+	if err := oldDB.ApplyWALChanges(changes); err != nil {
+		return err
+	}
 	if wal != nil && needCheckpoint {
-		if err := wal.Checkpoint(newDB); err != nil {
+		if err := wal.Checkpoint(oldDB); err != nil {
 			return err
 		}
 	}
 	c.srv.saveIfNeeded()
 
 	c.inTx = false
+	c.txBase = nil
 	c.shadow = nil
 	c.txReadOnly = false
+	return nil
+}
+
+func (c *conn) detectTxConflicts(current *storage.DB, changes []storage.WALChange) error {
+	if c.txBase == nil {
+		return nil
+	}
+	for _, ch := range changes {
+		baseTable, baseErr := c.txBase.Get(ch.Tenant, ch.Name)
+		currentTable, currentErr := current.Get(ch.Tenant, ch.Name)
+		baseExists := baseErr == nil
+		currentExists := currentErr == nil
+		switch {
+		case !baseExists && currentExists:
+			return fmt.Errorf("tinysql: transaction conflict on table %q", ch.Name)
+		case baseExists && !currentExists:
+			return fmt.Errorf("tinysql: transaction conflict on table %q", ch.Name)
+		case baseExists && currentExists && baseTable.Version != currentTable.Version:
+			return fmt.Errorf("tinysql: transaction conflict on table %q", ch.Name)
+		}
+	}
 	return nil
 }
 
@@ -454,6 +487,7 @@ func (c *conn) rollbackTx() error {
 		return fmt.Errorf("tinysql: no active transaction")
 	}
 	c.inTx = false
+	c.txBase = nil
 	c.shadow = nil
 	c.txReadOnly = false
 	return nil
