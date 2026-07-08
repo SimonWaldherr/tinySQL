@@ -44,6 +44,7 @@ func main() {
 
 	db = tinysql.NewDB()
 	queryCache = tinysql.NewQueryCache(queryCacheSize)
+	registerDemoStoredProcedures()
 
 	js.Global().Set("importFile", js.FuncOf(importFile))
 	js.Global().Set("executeQuery", js.FuncOf(executeQuery))
@@ -58,6 +59,14 @@ func main() {
 
 	println("TinySQL Query Files WASM initialized!")
 	<-c
+}
+
+func registerDemoStoredProcedures() {
+	if err := tinysql.RegisterStoredProcedure("demo_table_summary", func(ctx tinysql.ProcedureContext, args []any) (*tinysql.ResultSet, error) {
+		return ctx.ExecuteSQL("SELECT name, columns, rows FROM sys.tables ORDER BY name")
+	}); err != nil {
+		println("Failed to register demo_table_summary:", err.Error())
+	}
 }
 
 func jsErr(msg string) map[string]interface{} {
@@ -155,9 +164,10 @@ func importFile(this js.Value, args []js.Value) interface{} {
 		tableName = "table"
 	}
 
+	lowerName := strings.ToLower(fileName)
 	ext := ""
-	if idx := strings.LastIndex(fileName, "."); idx != -1 {
-		ext = strings.ToLower(fileName[idx:])
+	if idx := strings.LastIndex(lowerName, "."); idx != -1 {
+		ext = lowerName[idx:]
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultImportTimeout)
@@ -186,12 +196,29 @@ func importFile(this js.Value, args []js.Value) interface{} {
 	var impResult *tinysql.ImportResult
 	var err error
 
-	switch ext {
-	case ".csv", ".tsv", ".txt":
+	switch {
+	case ext == ".csv" || ext == ".tsv" || ext == ".txt":
 		impResult, err = tinysql.FuzzyImportCSV(ctx, db, tenant, tableName, reader, opts)
-	case ".json", ".jsonl", ".ndjson":
-		impResult, err = tinysql.FuzzyImportJSON(ctx, db, tenant, tableName, reader, opts)
-	case ".xml":
+	case ext == ".json" || ext == ".jsonl" || ext == ".ndjson":
+		if strings.HasSuffix(lowerName, ".graph.json") ||
+			strings.HasSuffix(lowerName, ".routinggraph.json") ||
+			strings.HasSuffix(lowerName, ".routing-graph.json") ||
+			strings.HasSuffix(lowerName, ".routing_graph.json") {
+			impResult, err = tinysql.ImportRoutingGraph(ctx, db, tenant, tableName, reader, opts.ImportOptions)
+		} else {
+			impResult, err = tinysql.FuzzyImportJSON(ctx, db, tenant, tableName, reader, opts)
+		}
+	case ext == ".yaml" || ext == ".yml":
+		impResult, err = tinysql.ImportYAML(ctx, db, tenant, tableName, reader, opts.ImportOptions)
+	case ext == ".geojson":
+		impResult, err = tinysql.ImportGeoJSON(ctx, db, tenant, tableName, reader, opts.ImportOptions)
+	case ext == ".kml":
+		impResult, err = tinysql.ImportKML(ctx, db, tenant, tableName, reader, opts.ImportOptions)
+	case ext == ".osm" || strings.HasSuffix(lowerName, ".osm.xml"):
+		impResult, err = tinysql.ImportOSM(ctx, db, tenant, tableName, reader, opts.ImportOptions)
+	case ext == ".rg" || ext == ".routinggraph" || ext == ".routing-graph" || ext == ".routing_graph":
+		impResult, err = tinysql.ImportRoutingGraph(ctx, db, tenant, tableName, reader, opts.ImportOptions)
+	case ext == ".xml":
 		xmlRows, xmlErr := parseSimpleXML(fileContent)
 		if xmlErr != nil {
 			return jsErr("XML parse error: " + xmlErr.Error())
@@ -199,7 +226,7 @@ func importFile(this js.Value, args []js.Value) interface{} {
 		jsonBytes, _ := json.Marshal(xmlRows)
 		impResult, err = tinysql.FuzzyImportJSON(ctx, db, tenant, tableName, strings.NewReader(string(jsonBytes)), opts)
 	default:
-		return jsErr("Unsupported file format: " + ext + ". Supported: .csv, .tsv, .txt, .json, .jsonl, .ndjson, .xml")
+		return jsErr("Unsupported file format: " + ext + ". Supported: .csv, .tsv, .txt, .json, .jsonl, .ndjson, .yaml, .xml, .geojson, .kml, .osm, .rg")
 	}
 
 	if err != nil {

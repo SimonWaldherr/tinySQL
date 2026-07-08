@@ -5,6 +5,7 @@ SHELL := /usr/bin/env bash
 .PHONY: build-all build-repl build-server build-demo build-cli build-debug build-catalog
 .PHONY: build-wasm-browser build-wasm-node build-studio build-tinysqlpage build-migrate
 .PHONY: build-query-files build-query-files-wasm build-fsql run-query-files-demo
+.PHONY: build-gh-pages-demo update-gh-pages push-gh-pages
 .PHONY: test-all test-unit test-integration coverage build-check verify verify-ci
 .PHONY: test-query-files test-query-files-wasm test-fsql
 .PHONY: run-wasm-browser run-wasm-node-demo deps update-deps tidy bench script-lint docker-build info
@@ -25,6 +26,10 @@ WASM_NODE_SCRIPT := ./$(CMD_DIR)/wasm_node/build.sh
 QUERY_FILES_DIR := ./$(CMD_DIR)/query_files
 QUERY_FILES_WASM_DIR := ./$(CMD_DIR)/query_files_wasm
 QUERY_FILES_WASM_SCRIPT := $(QUERY_FILES_WASM_DIR)/build.sh
+GH_PAGES_BRANCH ?= gh-pages
+GH_PAGES_WORKTREE ?= .gh-pages-worktree
+GH_PAGES_COMMIT_MESSAGE ?= Update gh-pages demo
+GH_PAGES_DEMO_FILES := index.html app.js query_files.wasm query_files.wasm.gz wasm_exec.js
 
 # Color output
 GREEN := \033[0;32m
@@ -127,6 +132,40 @@ build-fsql:
 build-query-files-wasm:
 	@echo "$(GREEN)Building query_files_wasm...$(NC)"
 	@$(QUERY_FILES_WASM_SCRIPT) --build-only
+
+## build-gh-pages-demo: Build the static WASM demo used by gh-pages
+build-gh-pages-demo: build-query-files-wasm
+	@echo "$(GREEN)✓ gh-pages demo artifacts built$(NC)"
+
+## update-gh-pages: Build demo, check out gh-pages in a worktree, update and commit it
+update-gh-pages: build-gh-pages-demo
+	@echo "$(GREEN)Updating $(GH_PAGES_BRANCH) from $(QUERY_FILES_WASM_DIR)...$(NC)"
+	@if [ -e "$(GH_PAGES_WORKTREE)" ] && [ ! -f "$(GH_PAGES_WORKTREE)/.git" ] && [ ! -d "$(GH_PAGES_WORKTREE)/.git" ]; then \
+		echo "$(RED)$(GH_PAGES_WORKTREE) exists but is not a git worktree$(NC)"; \
+		exit 1; \
+	fi
+	@if [ -e "$(GH_PAGES_WORKTREE)" ]; then \
+		git worktree remove --force "$(GH_PAGES_WORKTREE)"; \
+	fi
+	@git worktree add "$(GH_PAGES_WORKTREE)" "$(GH_PAGES_BRANCH)"
+	@for file in $(GH_PAGES_DEMO_FILES); do \
+		if [ -f "$(QUERY_FILES_WASM_DIR)/$$file" ]; then \
+			cp "$(QUERY_FILES_WASM_DIR)/$$file" "$(GH_PAGES_WORKTREE)/$$file"; \
+		else \
+			rm -f "$(GH_PAGES_WORKTREE)/$$file"; \
+		fi; \
+	done
+	@touch "$(GH_PAGES_WORKTREE)/.nojekyll"
+	@cd "$(GH_PAGES_WORKTREE)" && git add -A .nojekyll $(GH_PAGES_DEMO_FILES) && \
+		if git diff --cached --quiet; then \
+			echo "$(YELLOW)$(GH_PAGES_BRANCH) already up to date$(NC)"; \
+		else \
+			git commit -m "$(GH_PAGES_COMMIT_MESSAGE)"; \
+		fi
+
+## push-gh-pages: Update and push the gh-pages demo branch
+push-gh-pages: update-gh-pages
+	@git push origin "$(GH_PAGES_BRANCH)"
 
 ## run-wasm-browser: Build and serve browser WASM app on localhost
 run-wasm-browser:
