@@ -10,7 +10,9 @@ const SQL_KEYWORDS = [
     'ON', 'GROUP BY', 'ORDER BY', 'HAVING', 'LIMIT', 'OFFSET', 'DISTINCT', 'AS', 'AND', 'OR', 'NOT',
     'NULL', 'IN', 'EXISTS', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'LIKE', 'INSERT', 'UPDATE', 'DELETE',
     'CREATE TABLE', 'ALTER TABLE', 'DROP TABLE', 'UNION', 'UNION ALL', 'INTERSECT', 'EXCEPT', 'WITH',
-    'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'ROW_NUMBER', 'OVER', 'PARTITION BY', 'ASC', 'DESC', 'LIMIT'
+    'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'ROW_NUMBER', 'OVER', 'PARTITION BY', 'ASC', 'DESC', 'LIMIT',
+    'ST_MAKEPOINT', 'ST_POINT', 'ST_X', 'ST_Y', 'ST_DISTANCE', 'ST_DWITHIN', 'ST_WITHIN_BBOX',
+    'GEO_POINT', 'GEO_DISTANCE', 'GEO_WITHIN_BBOX'
 ];
 // Safe references to WASM-exported functions (set after init)
 let wasmApi = {
@@ -470,16 +472,82 @@ function getGeneratedDemoTables() {
     return generatedDemoTables;
 }
 
+const DEMO_GEOJSON = {
+    type: 'FeatureCollection',
+    features: [
+        {
+            type: 'Feature',
+            properties: { name: 'Berlin Hub', city: 'Berlin', role: 'warehouse' },
+            geometry: { type: 'Point', coordinates: [13.4050, 52.5200] }
+        },
+        {
+            type: 'Feature',
+            properties: { name: 'Munich Depot', city: 'Munich', role: 'warehouse' },
+            geometry: { type: 'Point', coordinates: [11.5755, 48.1372] }
+        },
+        {
+            type: 'Feature',
+            properties: { name: 'Zurich Crossdock', city: 'Zurich', role: 'crossdock' },
+            geometry: { type: 'Point', coordinates: [8.5417, 47.3769] }
+        },
+        {
+            type: 'Feature',
+            properties: { name: 'Hamburg Port', city: 'Hamburg', role: 'port' },
+            geometry: { type: 'Point', coordinates: [9.9937, 53.5511] }
+        }
+    ]
+};
+
+const DEMO_ROUTING_GRAPH = [
+    JSON.stringify({ type: 'node', id: 'berlin', lat: 52.5200, lon: 13.4050, properties: { city: 'Berlin' } }),
+    JSON.stringify({ type: 'node', id: 'munich', lat: 48.1372, lon: 11.5755, properties: { city: 'Munich' } }),
+    JSON.stringify({ type: 'node', id: 'zurich', lat: 47.3769, lon: 8.5417, properties: { city: 'Zurich' } }),
+    JSON.stringify({
+        type: 'edge',
+        id: 'berlin-munich',
+        source: 'berlin',
+        target: 'munich',
+        distance: 585000,
+        duration: 21600,
+        mode: 'road',
+        geometry: { type: 'LineString', coordinates: [[13.4050, 52.5200], [11.5755, 48.1372]] }
+    }),
+    JSON.stringify({
+        type: 'edge',
+        id: 'munich-zurich',
+        source: 'munich',
+        target: 'zurich',
+        distance: 315000,
+        duration: 12600,
+        mode: 'road',
+        geometry: { type: 'LineString', coordinates: [[11.5755, 48.1372], [8.5417, 47.3769]] }
+    })
+].join('\n');
+
 function getDemoDefaultQuery(tableName) {
     const queries = {
         sales: `SELECT customer_name, product, quantity * unit_price AS total_value\nFROM sales\nORDER BY total_value DESC\nLIMIT 10`,
         logistics: `SELECT carrier, COUNT(*) AS shipment_count, AVG(shipping_cost) AS avg_cost\nFROM logistics\nGROUP BY carrier\nORDER BY shipment_count DESC`,
         sales_large: `SELECT region, channel, COUNT(*) AS orders, SUM(order_total) AS revenue\nFROM sales_large\nGROUP BY region, channel\nORDER BY revenue DESC`,
         logistics_large: `SELECT carrier, service_level, COUNT(*) AS shipments, AVG(delivery_days) AS avg_delivery_days\nFROM logistics_large\nGROUP BY carrier, service_level\nORDER BY shipments DESC`,
-        web_events_large: `SELECT event_date, device, COUNT(*) AS events, SUM(revenue_impact) AS influenced_revenue\nFROM web_events_large\nGROUP BY event_date, device\nORDER BY event_date DESC`
+        web_events_large: `SELECT event_date, device, COUNT(*) AS events, SUM(revenue_impact) AS influenced_revenue\nFROM web_events_large\nGROUP BY event_date, device\nORDER BY event_date DESC`,
+        places_geo: `SELECT name, city, role,\n       ST_X(geometry) AS lon,\n       ST_Y(geometry) AS lat,\n       ST_DISTANCE(geometry, ST_MakePoint(13.4050, 52.5200)) AS meters_from_berlin\nFROM places_geo\nORDER BY meters_from_berlin`,
+        routes_rg: `SELECT edge_id, source, target, distance, duration, mode\nFROM routes_rg\nORDER BY distance`
     };
 
     return queries[tableName] || '';
+}
+
+function isRoutingGraphFile(fileName) {
+    const lower = String(fileName || '').toLowerCase();
+    return lower.endsWith('.rg') ||
+        lower.endsWith('.routinggraph') ||
+        lower.endsWith('.routing-graph') ||
+        lower.endsWith('.routing_graph') ||
+        lower.endsWith('.graph.json') ||
+        lower.endsWith('.routinggraph.json') ||
+        lower.endsWith('.routing-graph.json') ||
+        lower.endsWith('.routing_graph.json');
 }
 
 const DEMO_TABLES = {
@@ -524,6 +592,16 @@ const DEMO_TABLES = {
     web_events_large: {
         name: 'web_events_large',
         getData: () => getGeneratedDemoTables().web_events_large
+    },
+    places_geo: {
+        name: 'places_geo',
+        fileName: 'places.geojson',
+        getData: () => DEMO_GEOJSON
+    },
+    routes_rg: {
+        name: 'routes_rg',
+        fileName: 'routes.rg',
+        getData: () => DEMO_ROUTING_GRAPH
     }
 };
 
@@ -537,13 +615,15 @@ async function loadDemoTable(tableName) {
     const demo = DEMO_TABLES[tableName];
     const rows = typeof demo.getData === 'function' ? demo.getData() : demo.data;
     const jsonContent = JSON.stringify(rows);
+    const fileContent = typeof rows === 'string' ? rows : jsonContent;
+    const fileName = demo.fileName || `${tableName}.json`;
     const suggestedQuery = getDemoDefaultQuery(tableName);
     
     updateStatus(`Loading demo table: ${tableName}...`);
 
         if (wasmReady && typeof wasmApi.importFile === 'function') {
             try {
-                const result = wasmApi.importFile(`${tableName}.json`, jsonContent, tableName);
+                const result = wasmApi.importFile(fileName, fileContent, tableName);
                 if (result && result.success) {
                     const tableInfo = {
                         name: tableName,
@@ -557,6 +637,9 @@ async function loadDemoTable(tableName) {
                         currentTables.push(tableInfo);
                     }
                     renderTables();
+                    if (isRoutingGraphFile(fileName)) {
+                        loadTables();
+                    }
                     updateStatus(`Demo table "${tableName}" loaded: ${result.rowsImported} rows`);
                     if (Object.prototype.hasOwnProperty.call(DEMO_TABLES, tableName)) {
                         showDemoQueries();
@@ -578,7 +661,9 @@ async function loadDemoTable(tableName) {
                 updateStatus('Demo load failed');
             }
         } else {
-            registerClientTable(tableName, rows);
+            if (Array.isArray(rows)) {
+                registerClientTable(tableName, rows);
+            }
             const editor = document.getElementById('queryEditor');
             if (suggestedQuery) {
                 editor.value = suggestedQuery;
@@ -592,7 +677,7 @@ async function loadDemoTable(tableName) {
 
 // Load all demo tables
 async function loadAllDemos() {
-    const tableNames = ['sales', 'logistics', 'sales_large', 'logistics_large', 'web_events_large'];
+    const tableNames = ['sales', 'logistics', 'places_geo', 'routes_rg', 'sales_large', 'logistics_large', 'web_events_large'];
 
     for (const [index, tableName] of tableNames.entries()) {
         await loadDemoTable(tableName);
@@ -1080,6 +1165,9 @@ async function importSingleFile(file) {
                 }
                 
                 renderTables();
+                if (isRoutingGraphFile(file.name)) {
+                    loadTables();
+                }
                 
                 let message = `Imported ${result.rowsImported} rows into "${tableName}"`;
                 if (result.rowsSkipped > 0) {

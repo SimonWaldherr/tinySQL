@@ -1210,9 +1210,9 @@
                 <label class="upload-btn" for="fileInput">
                     📤 Upload File
                 </label>
-                <input type="file" id="fileInput" accept=".csv,.tsv,.txt,.json,.jsonl,.ndjson,.xml,.xlsx,.xls" multiple onchange="handleFileUpload(event)" aria-describedby="uploadHelp">
+                <input type="file" id="fileInput" accept=".csv,.tsv,.txt,.json,.jsonl,.ndjson,.xml,.geojson,.kml,.osm,.rg,.routinggraph,.routing-graph,.routing_graph,.xlsx,.xls" multiple onchange="handleFileUpload(event)" aria-describedby="uploadHelp">
                 <div id="uploadHelp" style="font-size: 11px; color: #888; margin-top: 8px; padding: 0 4px;">
-                    Supports: CSV, TSV, TXT, JSON, JSONL/NDJSON, XML
+                    Supports: CSV, TSV, TXT, JSON, JSONL/NDJSON, XML, GeoJSON, KML, OSM XML, routing graph
                 </div>
             </div>
             <div class="table-list" id="tableList">
@@ -1257,6 +1257,18 @@
                 </div>
                 <div class="example-query" onclick="setQuery('-- Large web event trends\nSELECT event_date, acquisition_channel,\n       COUNT(*) AS events,\n       SUM(converted) AS conversions,\n       SUM(revenue_impact) AS influenced_revenue\nFROM web_events_large\nGROUP BY event_date, acquisition_channel\nORDER BY event_date DESC')">
                     🌐 Event Trends
+                </div>
+                <div class="example-query" onclick="setQuery('-- GeoJSON point functions\nSELECT name, city, role,\n       ST_X(geometry) AS lon,\n       ST_Y(geometry) AS lat,\n       ST_DISTANCE(geometry, ST_MakePoint(13.4050, 52.5200)) AS meters_from_berlin\nFROM places_geo\nORDER BY meters_from_berlin')">
+                    🗺️ GeoJSON Distance
+                </div>
+                <div class="example-query" onclick="setQuery('-- Bounding box filter\nSELECT name, city, role\nFROM places_geo\nWHERE ST_WITHIN_BBOX(geometry, 8.0, 47.0, 14.5, 54.0)\nORDER BY city')">
+                    📍 Bounding Box
+                </div>
+                <div class="example-query" onclick="setQuery('-- Routing graph edges\nSELECT edge_id, source, target, distance, duration, mode\nFROM routes_rg\nORDER BY distance')">
+                    🧭 Routing Graph
+                </div>
+                <div class="example-query" onclick="setQuery('-- Routing graph nodes near Berlin\nSELECT node_id,\n       ST_DISTANCE(geometry, ST_MakePoint(13.4050, 52.5200)) AS meters_from_berlin\nFROM routes_rg_nodes\nWHERE ST_DWITHIN(geometry, ST_MakePoint(13.4050, 52.5200), 700000)\nORDER BY meters_from_berlin')">
+                    📌 Nearby Nodes
                 </div>
             </div>
             <div id="historyPanel" class="history-section hidden">
