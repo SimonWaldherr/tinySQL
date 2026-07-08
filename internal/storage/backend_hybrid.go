@@ -215,6 +215,11 @@ func (h *HybridBackend) Close() error {
 
 func (h *HybridBackend) Mode() StorageMode { return h.mode }
 
+// SetEncryptor forwards table-file encryption to the underlying DiskBackend.
+func (h *HybridBackend) SetEncryptor(enc *Encryptor) {
+	h.disk.SetEncryptor(enc)
+}
+
 func (h *HybridBackend) Stats() BackendStats {
 	ds := h.disk.Stats()
 	ps := h.pool.GetStats()

@@ -21,7 +21,7 @@ import (
 //   sys.tables       – real tables across all tenants (auto-populated)
 //   sys.columns      – real columns from actual table schemas
 //   sys.constraints  – PK / FK / UNIQUE constraints
-//   sys.indexes      – index metadata (stub — CREATE INDEX is a no-op)
+//   sys.indexes      – CREATE INDEX metadata (not planner-backed yet)
 //   sys.views        – same as catalog.views but auto-populated
 //   sys.functions    – all registered functions (builtin + extended + vector)
 //   sys.variables    – server variables (version, pid, mode, …)
@@ -425,9 +425,20 @@ func sysConstraintsRows(env ExecEnv) []Row {
 
 // ─────────────────────────── sys.indexes ─────────────────────────────────
 
-func sysIndexesRows(_ ExecEnv) []Row {
-	// CREATE INDEX is currently a no-op in tinySQL – return empty.
-	return []Row{}
+func sysIndexesRows(env ExecEnv) []Row {
+	indexes := env.db.Catalog().GetIndexes()
+	rows := make([]Row, len(indexes))
+	for i, idx := range indexes {
+		r := make(Row)
+		putVal(r, "schema", idx.Schema)
+		putVal(r, "name", idx.Name)
+		putVal(r, "table_name", idx.Table)
+		putVal(r, "columns", strings.Join(idx.Columns, ","))
+		putVal(r, "is_unique", idx.Unique)
+		putVal(r, "created_at", idx.CreatedAt)
+		rows[i] = r
+	}
+	return rows
 }
 
 // ─────────────────────────── sys.views ───────────────────────────────────

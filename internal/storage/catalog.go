@@ -61,6 +61,7 @@ type CatalogManager struct {
 	views        map[string]*CatalogView
 	mviews       map[string]*CatalogMaterializedView
 	dependencies map[string][]CatalogDependency
+	indexes      map[string]*CatalogIndex
 	funcs        map[string]*CatalogFunction
 	jobs         map[string]*CatalogJob
 	jobRuns      []*CatalogJobHistory
@@ -77,6 +78,7 @@ func NewCatalogManager() *CatalogManager {
 		views:        make(map[string]*CatalogView),
 		mviews:       make(map[string]*CatalogMaterializedView),
 		dependencies: make(map[string][]CatalogDependency),
+		indexes:      make(map[string]*CatalogIndex),
 		funcs:        make(map[string]*CatalogFunction),
 		jobs:         make(map[string]*CatalogJob),
 		jobRuns:      make([]*CatalogJobHistory, 0),
@@ -151,6 +153,18 @@ type CatalogDependency struct {
 	DependsOnType   string
 	DependencyType  string
 	CreatedAt       time.Time
+}
+
+// CatalogIndex stores metadata for a CREATE INDEX statement. tinySQL records
+// index definitions for introspection, but the query planner does not consume
+// them yet.
+type CatalogIndex struct {
+	Schema    string
+	Name      string
+	Table     string
+	Columns   []string
+	Unique    bool
+	CreatedAt time.Time
 }
 
 // CatalogFunction represents metadata for scalar and table-valued functions
@@ -441,6 +455,84 @@ func (c *CatalogManager) GetDependencies() []CatalogDependency {
 	out := make([]CatalogDependency, 0)
 	for _, deps := range c.dependencies {
 		out = append(out, deps...)
+	}
+	return out
+}
+
+// RegisterIndex stores index metadata for introspection. If an index with the
+// same schema/name exists, it is replaced.
+func (c *CatalogManager) RegisterIndex(idx *CatalogIndex) error {
+	if idx == nil || idx.Name == "" {
+		return fmt.Errorf("index name cannot be empty")
+	}
+	if idx.Table == "" {
+		return fmt.Errorf("index table cannot be empty")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if idx.Schema == "" {
+		idx.Schema = "main"
+	}
+	if idx.CreatedAt.IsZero() {
+		idx.CreatedAt = time.Now()
+	}
+	cp := *idx
+	cp.Columns = append([]string(nil), idx.Columns...)
+	c.indexes[cp.Schema+"."+cp.Name] = &cp
+	return nil
+}
+
+// DeleteIndex removes a stored index definition.
+func (c *CatalogManager) DeleteIndex(schema, name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if schema == "" {
+		schema = "main"
+	}
+	key := schema + "." + name
+	if _, ok := c.indexes[key]; !ok {
+		return fmt.Errorf("index %q not found", name)
+	}
+	delete(c.indexes, key)
+	return nil
+}
+
+// DeleteIndexesForTable removes all indexes registered for a table.
+func (c *CatalogManager) DeleteIndexesForTable(table string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key, idx := range c.indexes {
+		if strings.EqualFold(idx.Table, table) {
+			delete(c.indexes, key)
+		}
+	}
+}
+
+// GetIndex retrieves an index definition by schema and name.
+func (c *CatalogManager) GetIndex(schema, name string) (*CatalogIndex, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if schema == "" {
+		schema = "main"
+	}
+	idx, ok := c.indexes[schema+"."+name]
+	if !ok {
+		return nil, false
+	}
+	cp := *idx
+	cp.Columns = append([]string(nil), idx.Columns...)
+	return &cp, true
+}
+
+// GetIndexes returns all registered index definitions.
+func (c *CatalogManager) GetIndexes() []*CatalogIndex {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]*CatalogIndex, 0, len(c.indexes))
+	for _, idx := range c.indexes {
+		cp := *idx
+		cp.Columns = append([]string(nil), idx.Columns...)
+		out = append(out, &cp)
 	}
 	return out
 }

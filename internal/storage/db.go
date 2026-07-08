@@ -670,6 +670,9 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 		if err != nil {
 			return nil, fmt.Errorf("open index db: %w", err)
 		}
+		if err := applyEncryptionKey(backend.Disk(), cfg.EncryptionKey); err != nil {
+			return nil, err
+		}
 		db.backend = backend
 
 	case ModeHybrid:
@@ -683,6 +686,9 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 		backend, err := NewHybridBackend(cfg.Path, mem, cfg.CompressFiles, ModeHybrid)
 		if err != nil {
 			return nil, fmt.Errorf("open hybrid db: %w", err)
+		}
+		if err := applyEncryptionKey(backend.Disk(), cfg.EncryptionKey); err != nil {
+			return nil, err
 		}
 		db.backend = backend
 
@@ -992,6 +998,7 @@ type diskCatalog struct {
 	Views        []*CatalogView
 	MViews       []*CatalogMaterializedView
 	Dependencies []CatalogDependency
+	Indexes      []*CatalogIndex
 	Funcs        []*CatalogFunction
 	Jobs         []*CatalogJob
 	JobRuns      []*CatalogJobHistory
@@ -1012,6 +1019,7 @@ func catalogToDisk(c *CatalogManager) diskCatalog {
 		Views:        make([]*CatalogView, 0, len(c.views)),
 		MViews:       make([]*CatalogMaterializedView, 0, len(c.mviews)),
 		Dependencies: make([]CatalogDependency, 0),
+		Indexes:      make([]*CatalogIndex, 0, len(c.indexes)),
 		Funcs:        make([]*CatalogFunction, 0, len(c.funcs)),
 		Jobs:         make([]*CatalogJob, 0, len(c.jobs)),
 		JobRuns:      make([]*CatalogJobHistory, 0, len(c.jobRuns)),
@@ -1040,6 +1048,11 @@ func catalogToDisk(c *CatalogManager) diskCatalog {
 	}
 	for _, deps := range c.dependencies {
 		dc.Dependencies = append(dc.Dependencies, deps...)
+	}
+	for _, idx := range c.indexes {
+		cp := *idx
+		cp.Columns = append([]string(nil), idx.Columns...)
+		dc.Indexes = append(dc.Indexes, &cp)
 	}
 	for _, f := range c.funcs {
 		cp := *f
@@ -1094,6 +1107,14 @@ func diskToCatalog(dc diskCatalog) *CatalogManager {
 	for _, dep := range dc.Dependencies {
 		key := dep.Schema + "." + dep.ObjectName
 		c.dependencies[key] = append(c.dependencies[key], dep)
+	}
+	for _, idx := range dc.Indexes {
+		if idx == nil {
+			continue
+		}
+		cp := *idx
+		cp.Columns = append([]string(nil), idx.Columns...)
+		c.indexes[cp.Schema+"."+cp.Name] = &cp
 	}
 	for _, f := range dc.Funcs {
 		if f == nil {

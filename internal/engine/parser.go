@@ -1149,6 +1149,8 @@ func (p *Parser) parseCreateIndex() (Statement, error) {
 		if err := p.expectKeyword("INDEX"); err != nil {
 			return nil, err
 		}
+	} else if err := p.expectKeyword("INDEX"); err != nil {
+		return nil, err
 	}
 
 	// Check for IF NOT EXISTS

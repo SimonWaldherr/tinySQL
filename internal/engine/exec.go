@@ -352,26 +352,54 @@ func executeDropTable(env ExecEnv, s *DropTable) (*ResultSet, error) {
 		// constrained column per drop (the old *storage.Table pointer is
 		// never looked up again, but its map entries live until process exit).
 		invalidateConstraintIndexes(t)
+		env.db.Catalog().DeleteIndexesForTable(s.Name)
 	}
 	return nil, env.db.Drop(env.tenant, s.Name)
 }
 
 func executeCreateIndex(env ExecEnv, s *CreateIndex) (*ResultSet, error) {
-	// For now, indexes are a no-op since tinySQL doesn't persist them
-	// In a real implementation, this would store index metadata
-	if s.IfNotExists {
-		// Could check if index already exists
+	schema, name := splitObjectName(s.Name)
+	if _, exists := env.db.Catalog().GetIndex(schema, name); exists {
+		if s.IfNotExists {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("index %q already exists", s.Name)
 	}
-	// Log or store index information if needed
+	t, err := env.db.Get(env.tenant, s.Table)
+	if err != nil {
+		return nil, err
+	}
+	for _, col := range s.Columns {
+		if _, err := t.ColIndex(col); err != nil {
+			return nil, err
+		}
+	}
+	if err := env.db.Catalog().RegisterIndex(&storage.CatalogIndex{
+		Schema:    schema,
+		Name:      name,
+		Table:     s.Table,
+		Columns:   append([]string(nil), s.Columns...),
+		Unique:    s.Unique,
+		CreatedAt: time.Now(),
+	}); err != nil {
+		return nil, err
+	}
 	return nil, nil
 }
 
 func executeDropIndex(env ExecEnv, s *DropIndex) (*ResultSet, error) {
-	// For now, indexes are a no-op since tinySQL doesn't persist them
-	if s.IfExists {
-		// Could check if index exists
+	schema, name := splitObjectName(s.Name)
+	idx, exists := env.db.Catalog().GetIndex(schema, name)
+	if !exists {
+		if s.IfExists {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("index %q not found", s.Name)
 	}
-	return nil, nil
+	if s.Table != "" && !strings.EqualFold(idx.Table, s.Table) {
+		return nil, fmt.Errorf("index %q is on table %q, not %q", s.Name, idx.Table, s.Table)
+	}
+	return nil, env.db.Catalog().DeleteIndex(schema, name)
 }
 
 func executeCreateView(env ExecEnv, s *CreateView) (*ResultSet, error) {
