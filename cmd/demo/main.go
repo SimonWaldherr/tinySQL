@@ -274,6 +274,11 @@ FROM FTS_SEARCH('articles', 'programming language', 2)
 ORDER BY _fts_rank`},
 		{"ROW_TO_TEXT(): ad-hoc whole-row substring search in WHERE", `
 SELECT id, title FROM articles WHERE ROW_TO_TEXT() LIKE '%Python%'`},
+		// This table has 3 toy rows, so warm-up is instant here — the pattern
+		// matters on real RAG-sized tables (thousands+ rows), where building
+		// the HNSW graph is real work best done once via VEC_WARM (e.g. right
+		// after a bulk load) rather than on whichever query runs first. See
+		// BENCHMARKS.md for index build/query numbers at that scale.
 		{"VEC_WARM + VEC_SEARCH: prebuild the index, then query it", `
 SELECT * FROM VEC_WARM('docs', 'embedding', 'cosine', 'hnsw')`},
 		{"  (now served from the warmed index)", `

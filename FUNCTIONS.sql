@@ -1056,6 +1056,16 @@ SELECT * FROM VEC_SEARCH('vec_demo_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0,
 SELECT * FROM VEC_SEARCH('vec_demo_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 3, 'cosine', 'hnsw');
 SELECT * FROM VEC_SEARCH('vec_demo_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 3, 'cosine', 'ivf');
 
+-- VEC_WARM(table, column [, metric [, index]]) prebuilds the vector column
+-- cache and the requested ANN index (ivf/hnsw) ahead of time, instead of
+-- paying that one-time O(n log n) build cost on whichever query happens to
+-- run first. Building an HNSW index is real, non-trivial work (each row
+-- insertion does its own approximate-nearest-neighbor search against the
+-- graph built so far) — worth doing explicitly right after a bulk load
+-- (e.g. a nightly re-embed) rather than surprising the first live query with
+-- it. Returns one row describing what was warmed.
+SELECT * FROM VEC_WARM('vec_demo_docs', 'embedding', 'cosine', 'hnsw');
+
 -- VEC_TOP_K is an alias for VEC_SEARCH
 SELECT * FROM VEC_TOP_K('vec_demo_docs', 'embedding', VEC_FROM_JSON('[0.0, 1.0, 0.0]'), 2, 'cosine');
 

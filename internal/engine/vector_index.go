@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"container/heap"
 	"context"
 	"math"
 	"sort"
@@ -58,13 +57,57 @@ func (h vecMinScoredHeap) Less(i, j int) bool {
 	return vecScoredRowLess(h[i], h[j])
 }
 func (h vecMinScoredHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
-func (h *vecMinScoredHeap) Push(x any)   { *h = append(*h, x.(vecScoredRow)) }
-func (h *vecMinScoredHeap) Pop() any {
+
+// vecMinHeapPush/Pop mirror vecScoredHeapPush/Pop (see vector_search.go) for
+// the candidates frontier — direct concrete-type push/pop instead of
+// heap.Push/heap.Pop, which box every vecScoredRow into an `any` and
+// allocate. searchLayer calls this once per neighbor considered during graph
+// traversal, so this was the largest remaining allocation source in HNSW
+// build/search.
+func vecMinHeapPush(h *vecMinScoredHeap, v vecScoredRow) {
+	*h = append(*h, v)
+	vecMinHeapUp(*h, len(*h)-1)
+}
+
+func vecMinHeapPop(h *vecMinScoredHeap) vecScoredRow {
 	old := *h
-	n := len(old)
-	v := old[n-1]
-	*h = old[:n-1]
+	n := len(old) - 1
+	old.Swap(0, n)
+	vecMinHeapDown(old[:n], 0)
+	v := old[n]
+	*h = old[:n]
 	return v
+}
+
+func vecMinHeapUp(h vecMinScoredHeap, j int) {
+	for {
+		i := (j - 1) / 2
+		if i == j || !h.Less(j, i) {
+			break
+		}
+		h.Swap(i, j)
+		j = i
+	}
+}
+
+func vecMinHeapDown(h vecMinScoredHeap, i0 int) {
+	n := len(h)
+	i := i0
+	for {
+		j1 := 2*i + 1
+		if j1 >= n || j1 < 0 {
+			break
+		}
+		j := j1
+		if j2 := j1 + 1; j2 < n && h.Less(j2, j1) {
+			j = j2
+		}
+		if !h.Less(j, i) {
+			break
+		}
+		h.Swap(i, j)
+		i = j
+	}
 }
 
 var (
@@ -77,6 +120,34 @@ var (
 	// on large tables do not allocate len(rows) bytes per call.
 	vecVisitedPool sync.Pool
 )
+
+// vecHNSWScratch holds the reusable candidate/result heaps and visited-touch
+// list for one HNSW traversal (one search() call, or the whole sequential
+// build loop). searchLayer runs once per graph layer visited during a
+// traversal, and previously allocated a fresh pair of heaps plus a touched-
+// node slice on every one of those calls — for a 12k-row build that added up
+// to tens of thousands of small allocations and made container/heap's
+// interface-dispatched Push/Pop the dominant CPU cost. Reusing the backing
+// arrays (reset to length 0, capacity retained) across calls, and across
+// pooled instances between queries, converges to zero steady-state
+// allocations for the traversal's own bookkeeping.
+type vecHNSWScratch struct {
+	candidates vecMinScoredHeap
+	results    vecScoredHeap
+	touched    []int
+}
+
+var vecHNSWScratchPool = sync.Pool{
+	New: func() any { return new(vecHNSWScratch) },
+}
+
+func acquireHNSWScratch() *vecHNSWScratch {
+	return vecHNSWScratchPool.Get().(*vecHNSWScratch)
+}
+
+func releaseHNSWScratch(s *vecHNSWScratch) {
+	vecHNSWScratchPool.Put(s)
+}
 
 func acquireVisited(n int) []bool {
 	if v, ok := vecVisitedPool.Get().([]bool); ok && cap(v) >= n {
@@ -234,7 +305,6 @@ func (idx *vecIVFIndex) search(ctx context.Context, query []float64, queryNorm f
 	}
 	probes := chooseIVFNProbe(len(idx.centroids), k)
 	centroidHeap := &vecScoredHeap{}
-	heap.Init(centroidHeap)
 	for i, c := range idx.centroids {
 		dist, ok := vectorDistance(idx.metric, c, query, idx.centroidNorms[i], queryNorm)
 		if !ok {
@@ -245,7 +315,6 @@ func (idx *vecIVFIndex) search(ctx context.Context, query []float64, queryNorm f
 	bestCentroids := topKFromHeap(centroidHeap, probes)
 
 	resultHeap := &vecScoredHeap{}
-	heap.Init(resultHeap)
 	for _, c := range bestCentroids {
 		list := idx.lists[c.rowIdx]
 		for i, rowIdx := range list {
@@ -295,6 +364,11 @@ func buildVecHNSWIndex(ctx context.Context, table *storage.Table, metric string,
 	}
 
 	visited := make([]bool, len(cache.vectors))
+	// The build loop is strictly sequential (single goroutine inserting one
+	// row at a time), so a single scratch instance can be reused across all
+	// insertions instead of round-tripping through the pool per row.
+	scratch := acquireHNSWScratch()
+	defer releaseHNSWScratch(scratch)
 	for rowIdx := range cache.vectors {
 		if rowIdx&1023 == 0 {
 			if err := checkCtx(ctx); err != nil {
@@ -317,7 +391,7 @@ func buildVecHNSWIndex(ctx context.Context, table *storage.Table, metric string,
 		query := cache.vectors[rowIdx]
 		queryNorm := rowNormFor(metric, cache, rowIdx)
 		for layer := idx.maxLevel; layer > level; layer-- {
-			best := idx.searchLayer(query, queryNorm, current, 1, layer, cache, visited)
+			best := idx.searchLayer(query, queryNorm, current, 1, layer, cache, visited, scratch)
 			if len(best) > 0 {
 				current = best[0].rowIdx
 			}
@@ -327,7 +401,7 @@ func buildVecHNSWIndex(ctx context.Context, table *storage.Table, metric string,
 			upper = idx.maxLevel
 		}
 		for layer := upper; layer >= 0; layer-- {
-			candidates := idx.searchLayer(query, queryNorm, current, vecHNSWEfConstruction, layer, cache, visited)
+			candidates := idx.searchLayer(query, queryNorm, current, vecHNSWEfConstruction, layer, cache, visited, scratch)
 			selected := selectHNSWNeighbors(candidates, vecHNSWM)
 			for _, nb := range selected {
 				idx.addHNSWLink(rowIdx, nb.rowIdx, layer, cache)
@@ -351,19 +425,20 @@ func (idx *vecHNSWIndex) search(ctx context.Context, query []float64, queryNorm 
 	current := idx.entry
 	visited := acquireVisited(len(cache.vectors))
 	defer releaseVisited(visited)
+	scratch := acquireHNSWScratch()
+	defer releaseHNSWScratch(scratch)
 	for layer := idx.maxLevel; layer > 0; layer-- {
 		if err := checkCtx(ctx); err != nil {
 			return nil, err
 		}
-		best := idx.searchLayer(query, queryNorm, current, 1, layer, cache, visited)
+		best := idx.searchLayer(query, queryNorm, current, 1, layer, cache, visited, scratch)
 		if len(best) > 0 {
 			current = best[0].rowIdx
 		}
 	}
 	efSearch := chooseHNSWEfSearch(k)
-	candidates := idx.searchLayer(query, queryNorm, current, efSearch, 0, cache, visited)
+	candidates := idx.searchLayer(query, queryNorm, current, efSearch, 0, cache, visited, scratch)
 	resultHeap := &vecScoredHeap{}
-	heap.Init(resultHeap)
 	for _, sr := range candidates {
 		pushTopK(resultHeap, sr.rowIdx, sr.distance, k)
 	}
@@ -374,7 +449,7 @@ func (idx *vecHNSWIndex) search(ctx context.Context, query []float64, queryNorm 
 	return topKFromHeap(resultHeap, k), nil
 }
 
-func (idx *vecHNSWIndex) searchLayer(query []float64, queryNorm float64, entry int, ef int, layer int, cache vecSearchColumnCacheEntry, visited []bool) []vecScoredRow {
+func (idx *vecHNSWIndex) searchLayer(query []float64, queryNorm float64, entry int, ef int, layer int, cache vecSearchColumnCacheEntry, visited []bool, scratch *vecHNSWScratch) []vecScoredRow {
 	if entry < 0 || ef <= 0 || !idx.hasLayer(entry, layer) {
 		return nil
 	}
@@ -385,7 +460,7 @@ func (idx *vecHNSWIndex) searchLayer(query []float64, queryNorm float64, entry i
 	if len(visited) < len(cache.vectors) {
 		visited = make([]bool, len(cache.vectors))
 	}
-	touched := make([]int, 0, ef*vecHNSWM)
+	touched := scratch.touched[:0]
 	markVisited := func(rowIdx int) bool {
 		if rowIdx < 0 || rowIdx >= len(visited) || visited[rowIdx] {
 			return false
@@ -399,16 +474,17 @@ func (idx *vecHNSWIndex) searchLayer(query []float64, queryNorm float64, entry i
 		for _, rowIdx := range touched {
 			visited[rowIdx] = false
 		}
+		scratch.touched = touched[:0]
 	}()
-	candidates := &vecMinScoredHeap{}
-	results := &vecScoredHeap{}
-	heap.Init(candidates)
-	heap.Init(results)
-	heap.Push(candidates, vecScoredRow{rowIdx: entry, distance: dist})
+	scratch.candidates = scratch.candidates[:0]
+	scratch.results = scratch.results[:0]
+	candidates := &scratch.candidates
+	results := &scratch.results
+	vecMinHeapPush(candidates, vecScoredRow{rowIdx: entry, distance: dist})
 	pushTopK(results, entry, dist, ef)
 
 	for candidates.Len() > 0 {
-		nearest := heap.Pop(candidates).(vecScoredRow)
+		nearest := vecMinHeapPop(candidates)
 		if results.Len() >= ef && !vecScoredRowLess(nearest, (*results)[0]) {
 			break
 		}
@@ -421,7 +497,7 @@ func (idx *vecHNSWIndex) searchLayer(query []float64, queryNorm float64, entry i
 				continue
 			}
 			if results.Len() < ef || vecScoredRowLess(vecScoredRow{rowIdx: nb, distance: dist}, (*results)[0]) {
-				heap.Push(candidates, vecScoredRow{rowIdx: nb, distance: dist})
+				vecMinHeapPush(candidates, vecScoredRow{rowIdx: nb, distance: dist})
 				pushTopK(results, nb, dist, ef)
 			}
 		}

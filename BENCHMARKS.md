@@ -233,3 +233,79 @@ common all-numeric case got faster.
    evaluator. Remaining candidate: extend the same fast path to multi-column
    `GROUP BY` (currently limited to a single group-by column) and to
    `HAVING` clauses that only reference already-computed aggregates.
+
+## Internal engine optimizations (not SQLite comparisons)
+
+The sections above compare tinySQL against SQLite. This section instead
+tracks before/after numbers for engine-internal work with no SQLite side to
+compare against — measured with `go test -bench=. -benchmem ./internal/engine/...`
+on the same machine as above.
+
+### Vector search (`VEC_SEARCH`/`VEC_WARM`): HNSW allocation and build-time fix
+
+Profiling `VEC_SEARCH(..., 'hnsw')` and `VEC_WARM(..., 'hnsw')` on a
+12,000-row / 64-dim table (`BenchmarkVecSearchIndexModesSameTable` in
+`internal/engine/vector_search_benchmark_test.go`) found two compounding
+issues in the HNSW graph traversal (`internal/engine/vector_index.go`):
+
+1. `searchLayer` allocated a fresh pair of heaps plus a "touched nodes" slice
+   on every one of the many calls per traversal (one per graph layer) — for a
+   12k-row index build, that's tens of thousands of short-lived allocations.
+2. Both heaps went through `container/heap`'s `Push(h Interface, x any)` /
+   `Pop() any` API, which boxes every `vecScoredRow` value into an
+   interface — one heap allocation per graph edge considered during
+   traversal, dwarfing the cost of (1).
+
+Fixed by pooling the candidate/result heaps and the visited-touch buffer
+across `searchLayer` calls within one traversal (`vecHNSWScratch` +
+`sync.Pool`), and replacing the `container/heap`-based push/pop with direct,
+non-interface sift-up/sift-down functions on the concrete slice types.
+
+Separately, `vectorDotKernel`/`vectorL2SquaredKernel`/`vectorL1Kernel`
+(`internal/engine/vector_math_amd64.go`) fell back to a portable scalar loop
+for vectors under 128 dimensions, on the assumption SIMD setup cost wasn't
+worth it below that size. Benchmarking across realistic embedding sizes
+(`BenchmarkVectorDotKernelBySize`) showed the SSE2 kernel winning at every
+size tested, including 16 dimensions, so the threshold was removed.
+
+| Benchmark (12k rows, 64 dims, k=20, cosine) | before | after |
+|---|---|---|
+| HNSW index build (`VEC_WARM`) | 19.5 s | 7.5 s (2.6x) |
+| HNSW query (`BenchmarkVecSearchCosineTopK_HNSWCached`) | 2.26 ms, 4336 allocs/op | ~1.0-1.2 ms, 78 allocs/op |
+| IVF query | 382 µs, 133 allocs/op | ~220 µs, 77 allocs/op |
+| Flat (exact) query | 970 µs, 415 allocs/op | ~580 µs, 128 allocs/op |
+
+Correctness is unaffected: `TestVecSearchWithANNIndexModes` and
+`TestVecSearchANNIndexInvalidatesOnTableVersion`
+(`internal/engine/vector_test.go`) already cover HNSW/IVF result correctness
+against exact search and pass unchanged.
+
+### Row materialization (`rowsFromTable`): removed a redundant per-row map check
+
+`rowsFromTable` (`internal/engine/exec.go`) builds the `Row`
+(`map[string]any`) for every row of every table referenced in a `FROM`
+clause — the shared entry point behind scans, joins, `GROUP BY`, and
+`ORDER BY` alike. Each column is stored under both a qualified key
+(`alias.col`) and an unqualified key (`col`); the unqualified insert used to
+be guarded by a map existence check on *every row*, to protect against a
+duplicate column name clobbering an earlier one. Real schemas essentially
+never have duplicate column names, so that check was pure overhead in the
+common case.
+
+Fixed by computing "does this table have any duplicate column names" once
+per query instead of once per row. When there are none (the fast path), both
+keys are set unconditionally in a single loop; the slow path preserves the
+exact original "first occurrence wins" behavior for the rare duplicate-name
+case (regression test: `TestRowsFromTableDuplicateColumnNames` in
+`internal/engine/rows_from_table_test.go`).
+
+| Benchmark (20,000 rows) | before | after |
+|---|---|---|
+| `SELECT grp, sub, COUNT(*), AVG(val) ... GROUP BY grp, sub` | ~50 ms | ~40 ms (≈20%) |
+| `SELECT * FROM t` | ~29 ms | ~27 ms |
+
+Reproduce with:
+
+```sh
+go test -bench='BenchmarkGroupByTwoColumns|BenchmarkSelectStarFullScan' -benchmem ./internal/engine/...
+```

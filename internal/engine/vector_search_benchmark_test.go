@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math"
 	"strconv"
 	"testing"
@@ -74,6 +75,38 @@ func BenchmarkVectorL1DistanceUnrolled768(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		vectorMathBenchmarkSink = vectorL1Unrolled(a, vecB)
+	}
+}
+
+// BenchmarkVectorDotKernelBySize guards the amd64 kernel dispatch decision in
+// vectorDotKernel (vector_math_amd64.go): that function used to fall back to
+// the portable vectorDotUnrolled loop for vectors shorter than 128 elements,
+// on the assumption that SSE2 setup overhead wasn't worth it below that size.
+// Measuring across the dimension sizes real embedding models actually use
+// (16 up to 768) showed the SSE2 kernel winning at every single size,
+// including 16 — the assembly kernel's own tail loop already handles
+// short/odd-length inputs, so there was no setup cost being amortized and
+// the threshold only ever left performance on the table. Run both variants
+// side by side here so a future change to that threshold (or a new
+// portable-loop "improvement") shows up as a regression instead of silently
+// reintroducing the bad cutover.
+func BenchmarkVectorDotKernelBySize(b *testing.B) {
+	for _, dims := range []int{16, 32, 64, 128, 256, 768} {
+		a, vecB := makeVectorMathBenchmarkInputs(dims)
+		b.Run(fmt.Sprintf("unrolled/%d", dims), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				vectorMathBenchmarkSink = vectorDotUnrolled(a, vecB)
+			}
+		})
+		b.Run(fmt.Sprintf("kernel/%d", dims), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				vectorMathBenchmarkSink = vectorDotKernel(a, vecB)
+			}
+		})
 	}
 }
 

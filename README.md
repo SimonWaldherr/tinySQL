@@ -187,6 +187,18 @@ TinySQL is not a PostgreSQL/MySQL replacement. Important current limits:
 
 Evaluate these limits before using TinySQL for production-critical data.
 
+## Performance
+
+TinySQL wins most read-heavy and low-latency-write workloads against
+`modernc.org/sqlite` at the row counts tested (full scans, joins, aggregates,
+single inserts) by operating on native Go values with no `database/sql`
+`Scan()` marshaling. Vector search (`VEC_SEARCH`) supports `flat` (exact),
+`ivf`, and `hnsw` index modes, with `VEC_WARM` for prebuilding an index ahead
+of the first query. See [BENCHMARKS.md](./BENCHMARKS.md) for detailed
+tinySQL-vs-SQLite numbers and a log of internal engine optimizations
+(allocation and SIMD-kernel fixes to vector search and row scanning) with
+before/after measurements.
+
 ## Development
 
 ```bash

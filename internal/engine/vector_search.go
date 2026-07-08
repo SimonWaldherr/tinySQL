@@ -24,7 +24,6 @@
 package engine
 
 import (
-	"container/heap"
 	"context"
 	"fmt"
 	"math"
@@ -158,16 +157,58 @@ func (h vecScoredHeap) Less(i, j int) bool {
 }
 func (h vecScoredHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 
-func (h *vecScoredHeap) Push(x any) {
-	*h = append(*h, x.(vecScoredRow))
+// vecScoredHeapPush/Pop/fixDown replicate container/heap's up/down algorithm
+// directly on the concrete vecScoredHeap type instead of going through
+// heap.Interface. heap.Push/Pop take/return `any`, which forces every
+// vecScoredRow (an 8-byte int + 8-byte float64) to be heap-allocated just to
+// box it into the interface — on the hot paths here (flat scan, IVF list
+// scan, HNSW candidate expansion) that is one allocation per row considered.
+// Calling Less/Swap directly on the concrete type keeps the exact same
+// ordering with zero boxing and lets the compiler inline the comparisons.
+func vecScoredHeapPush(h *vecScoredHeap, v vecScoredRow) {
+	*h = append(*h, v)
+	vecScoredHeapUp(*h, len(*h)-1)
 }
 
-func (h *vecScoredHeap) Pop() any {
+func vecScoredHeapPop(h *vecScoredHeap) vecScoredRow {
 	old := *h
-	n := len(old)
-	v := old[n-1]
-	*h = old[:n-1]
+	n := len(old) - 1
+	old.Swap(0, n)
+	vecScoredHeapDown(old[:n], 0)
+	v := old[n]
+	*h = old[:n]
 	return v
+}
+
+func vecScoredHeapUp(h vecScoredHeap, j int) {
+	for {
+		i := (j - 1) / 2
+		if i == j || !h.Less(j, i) {
+			break
+		}
+		h.Swap(i, j)
+		j = i
+	}
+}
+
+func vecScoredHeapDown(h vecScoredHeap, i0 int) {
+	n := len(h)
+	i := i0
+	for {
+		j1 := 2*i + 1
+		if j1 >= n || j1 < 0 {
+			break
+		}
+		j := j1
+		if j2 := j1 + 1; j2 < n && h.Less(j2, j1) {
+			j = j2
+		}
+		if !h.Less(j, i) {
+			break
+		}
+		h.Swap(i, j)
+		i = j
+	}
 }
 
 type vecSearchColumnCacheKey struct {
@@ -238,12 +279,12 @@ func pushTopK(heapRows *vecScoredHeap, rowIdx int, distance float64, k int) {
 		return
 	}
 	if heapRows.Len() < k {
-		heap.Push(heapRows, vecScoredRow{rowIdx: rowIdx, distance: distance})
+		vecScoredHeapPush(heapRows, vecScoredRow{rowIdx: rowIdx, distance: distance})
 		return
 	}
 	if heapRows.Len() > 0 && vecScoredRowLess(vecScoredRow{rowIdx: rowIdx, distance: distance}, (*heapRows)[0]) {
 		(*heapRows)[0] = vecScoredRow{rowIdx: rowIdx, distance: distance}
-		heap.Fix(heapRows, 0)
+		vecScoredHeapDown(*heapRows, 0)
 	}
 }
 
@@ -263,7 +304,7 @@ func topKFromHeap(heapRows *vecScoredHeap, k int) []vecScoredRow {
 	}
 	rows := make([]vecScoredRow, k)
 	for i := k - 1; i >= 0; i-- {
-		rows[i] = heap.Pop(heapRows).(vecScoredRow)
+		rows[i] = vecScoredHeapPop(heapRows)
 	}
 	return rows
 }
@@ -354,7 +395,6 @@ func vecSearchTopK(ctx context.Context, rows [][]any, queryLen int, k int, cache
 	wg.Wait()
 
 	merged := &vecScoredHeap{}
-	heap.Init(merged)
 	for i := range results {
 		if results[i].err != nil {
 			return nil, results[i].err
@@ -369,7 +409,6 @@ func vecSearchTopK(ctx context.Context, rows [][]any, queryLen int, k int, cache
 
 func vecSearchTopKRange(ctx context.Context, rows [][]any, start, end, queryLen, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc) (vecScoredHeap, error) {
 	scoredRows := &vecScoredHeap{}
-	heap.Init(scoredRows)
 
 	for i := start; i < end; i++ {
 		if i&1023 == 0 {

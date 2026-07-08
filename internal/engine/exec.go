@@ -9935,25 +9935,54 @@ func rowsFromTable(t *storage.Table, alias string) ([]Row, []string) {
 	cols := make([]string, numCols)
 	copy(cols, qualKeys)
 
-	// Pre-compute which unqualified names are unique (no duplicates).
+	// Pre-compute which unqualified names are unique (no duplicates), and
+	// whether any duplicate exists at all. This is the only thing that can
+	// make inserting a column's unqualified key unsafe to do unconditionally
+	// (a qualified key like "t.name" can't collide with an unqualified key
+	// for a different, uniquely-named column). Real schemas never have
+	// duplicate column names, so computing this once per query — instead of
+	// re-checking "does this key already exist" on every single row below —
+	// turns the common case into one map assignment per column instead of a
+	// map lookup plus a conditional assignment.
 	unqualSeen := make(map[string]bool, numCols)
-	for _, k := range unqualKeys {
+	firstOccurrence := make([]bool, numCols)
+	hasDup := false
+	for i, k := range unqualKeys {
+		if unqualSeen[k] {
+			hasDup = true
+			continue
+		}
 		unqualSeen[k] = true
+		firstOccurrence[i] = true
 	}
 	// Total keys per row: qualified + unique unqualified.
 	keysPerRow := numCols + len(unqualSeen)
 
 	out := make([]Row, len(t.Rows))
+	if !hasDup {
+		for ri, r := range t.Rows {
+			row := make(Row, keysPerRow)
+			for i := range t.Cols {
+				v := r[i]
+				row[qualKeys[i]] = v
+				row[unqualKeys[i]] = v
+			}
+			out[ri] = row
+		}
+		return out, cols
+	}
+
+	// Slow path: at least one duplicate unqualified column name exists, so
+	// the first occurrence (in column order) must win — mirrors the
+	// pre-optimization behavior exactly.
 	for ri, r := range t.Rows {
 		row := make(Row, keysPerRow)
 		for i := range t.Cols {
-			v := r[i]
-			row[qualKeys[i]] = v
+			row[qualKeys[i]] = r[i]
 		}
 		for i := range t.Cols {
-			uq := unqualKeys[i]
-			if _, exists := row[uq]; !exists {
-				row[uq] = r[i]
+			if firstOccurrence[i] {
+				row[unqualKeys[i]] = r[i]
 			}
 		}
 		out[ri] = row
