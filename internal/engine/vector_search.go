@@ -226,10 +226,63 @@ type vecSearchColumnCacheEntry struct {
 	valid      []bool
 }
 
+// vecColumnCacheMaxEntries bounds the column cache. Entries are keyed by
+// (tenant, table, column) and each one pins its *storage.Table — including
+// every row — via the entry's table pointer. Same-name replacement reuses
+// the key, and DROP TABLE purges eagerly (purgeVectorCachesFor), but paths
+// with no purge hook (table renames, tenant removal) would otherwise leak
+// one pinned table per orphaned key for the life of the process. When the
+// cap is hit, arbitrary entries are evicted; the cost of a bad eviction is
+// one lazy rebuild scan on next query.
+const vecColumnCacheMaxEntries = 256
+
 var (
 	vecSearchColumnCacheMu sync.RWMutex
 	vecSearchColumnCache   = make(map[vecSearchColumnCacheKey]vecSearchColumnCacheEntry)
 )
+
+// purgeVectorCachesFor eagerly drops all cached vector-search structures
+// (column cache, IVF and HNSW indexes) for one table, called from
+// DROP TABLE. Without this, the last cache entry keeps the dropped table's
+// entire row data reachable until the same (tenant, table, column) key is
+// written again — which for a dropped name may be never.
+func purgeVectorCachesFor(tenant, table string) {
+	vecSearchColumnCacheMu.Lock()
+	for k := range vecSearchColumnCache {
+		if k.tenant == tenant && k.table == table {
+			delete(vecSearchColumnCache, k)
+		}
+	}
+	vecSearchColumnCacheMu.Unlock()
+
+	vecIVFCacheMu.Lock()
+	for k := range vecIVFCache {
+		if k.tenant == tenant && k.table == table {
+			delete(vecIVFCache, k)
+		}
+	}
+	vecIVFCacheMu.Unlock()
+
+	vecHNSWCacheMu.Lock()
+	for k := range vecHNSWCache {
+		if k.tenant == tenant && k.table == table {
+			delete(vecHNSWCache, k)
+		}
+	}
+	vecHNSWCacheMu.Unlock()
+}
+
+// evictOverCap removes arbitrary entries until the map is below the cap,
+// making room for one more. Go's random map iteration order makes this a
+// cheap pseudo-random eviction policy.
+func evictOverCap[K comparable, V any](m map[K]V, maxEntries int) {
+	for k := range m {
+		if len(m) < maxEntries {
+			return
+		}
+		delete(m, k)
+	}
+}
 
 func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeNorms bool) vecSearchColumnCacheEntry {
 	key := vecSearchColumnCacheKey{tenant: tenant, table: table.Name, colIdx: colIdx}
@@ -265,6 +318,9 @@ func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeN
 
 	entry := vecSearchColumnCacheEntry{table: table, version: table.Version, vectors: vectors, norms: norms, normsReady: includeNorms, valid: valid}
 	vecSearchColumnCacheMu.Lock()
+	if _, exists := vecSearchColumnCache[key]; !exists {
+		evictOverCap(vecSearchColumnCache, vecColumnCacheMaxEntries)
+	}
 	vecSearchColumnCache[key] = entry
 	vecSearchColumnCacheMu.Unlock()
 	return entry

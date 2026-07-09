@@ -352,6 +352,16 @@ func executeDropTable(env ExecEnv, s *DropTable) (*ResultSet, error) {
 		// constrained column per drop (the old *storage.Table pointer is
 		// never looked up again, but its map entries live until process exit).
 		invalidateConstraintIndexes(t)
+		// Same for the vector-search caches: a stale column-cache/ANN-index
+		// entry pins the dropped table's entire row data until the same
+		// (tenant, table, column) key is rebuilt — which, for a dropped
+		// name, may be never. The vector caches normalize an empty tenant
+		// to "default", so match that here.
+		tenant := env.tenant
+		if tenant == "" {
+			tenant = "default"
+		}
+		purgeVectorCachesFor(tenant, t.Name)
 	}
 	return nil, env.db.Drop(env.tenant, s.Name)
 }
@@ -3895,8 +3905,8 @@ func buildRawFilterBinary(colIndex map[string]int, ex *Binary) func([]any) (bool
 }
 
 func buildRawAndFilter(colIndex map[string]int, leftExpr, rightExpr Expr) func([]any) (bool, error) {
-	left := buildRawFilter(colIndex, leftExpr)
-	right := buildRawFilter(colIndex, rightExpr)
+	left := buildRawFilterSpecialized(colIndex, leftExpr)
+	right := buildRawFilterSpecialized(colIndex, rightExpr)
 	if left != nil && right != nil {
 		return func(raw []any) (bool, error) {
 			l, err := left(raw)
@@ -3907,14 +3917,31 @@ func buildRawAndFilter(colIndex map[string]int, leftExpr, rightExpr Expr) func([
 		}
 	}
 	if left == nil && right == nil {
-		return nil
+		// Neither side compiles to a specialized filter (e.g. two
+		// function-call predicates). Run both through the expression
+		// fallback, left first, so the plan still avoids the Row-map
+		// evaluator.
+		lf := buildRawExprFilter(colIndex, leftExpr)
+		rf := buildRawExprFilter(colIndex, rightExpr)
+		if lf == nil || rf == nil {
+			return nil
+		}
+		return func(raw []any) (bool, error) {
+			l, err := lf(raw)
+			if err != nil || !l {
+				return false, err
+			}
+			return rf(raw)
+		}
 	}
 
-	// The fallback path below evaluates the unbuildable side via
-	// evalRawExpr(plan, raw, expr), which substitutes an empty Row for any
-	// FuncCall — wrong for a row-aware function like ROW_TO_TEXT. Refuse to
-	// build a raw filter at all in that case so the caller falls back to the
-	// general (correct) Row-based evaluator instead.
+	// Exactly one side compiled. The specialized side is cheap (raw slice
+	// access + comparison), so it runs first regardless of written order;
+	// the expression side runs only on surviving rows. The fallback
+	// evaluates via evalRawExpr(plan, raw, expr), which substitutes an
+	// empty Row for any FuncCall — wrong for a row-aware function like
+	// ROW_TO_TEXT. Refuse to build a raw filter at all in that case so the
+	// caller falls back to the general (correct) Row-based evaluator.
 	if left == nil {
 		if exprHasRowAwareFuncCall(leftExpr) {
 			return nil
@@ -3943,8 +3970,8 @@ func buildRawAndFilterWithFallback(colIndex map[string]int, expr Expr, fastFilte
 }
 
 func buildRawOrFilter(colIndex map[string]int, leftExpr, rightExpr Expr) func([]any) (bool, error) {
-	left := buildRawFilter(colIndex, leftExpr)
-	right := buildRawFilter(colIndex, rightExpr)
+	left := buildRawFilterSpecialized(colIndex, leftExpr)
+	right := buildRawFilterSpecialized(colIndex, rightExpr)
 	if left != nil && right != nil {
 		return func(raw []any) (bool, error) {
 			l, err := left(raw)
@@ -3958,12 +3985,28 @@ func buildRawOrFilter(colIndex map[string]int, leftExpr, rightExpr Expr) func([]
 		}
 	}
 	if left == nil && right == nil {
-		return nil
+		// See the matching comment in buildRawAndFilter.
+		lf := buildRawExprFilter(colIndex, leftExpr)
+		rf := buildRawExprFilter(colIndex, rightExpr)
+		if lf == nil || rf == nil {
+			return nil
+		}
+		return func(raw []any) (bool, error) {
+			l, err := lf(raw)
+			if err != nil {
+				return false, err
+			}
+			if l {
+				return true, nil
+			}
+			return rf(raw)
+		}
 	}
 
-	// See the matching comment in buildRawAndFilter: the fallback evaluates
-	// the unbuildable side via evalRawExpr with an empty Row, which is wrong
-	// for row-aware functions.
+	// See the matching comment in buildRawAndFilter: the specialized (cheap)
+	// side short-circuits first; the fallback evaluates the unbuildable side
+	// via evalRawExpr with an empty Row, which is wrong for row-aware
+	// functions.
 	if left == nil {
 		if exprHasRowAwareFuncCall(leftExpr) {
 			return nil

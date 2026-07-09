@@ -291,6 +291,57 @@ func TestVecCosineKernelMatchesUnrolledAcrossSizes(t *testing.T) {
 	}
 }
 
+// TestDropTablePurgesVectorCaches guards against the vector caches pinning a
+// dropped table's row data for the life of the process: the column cache and
+// the IVF/HNSW index caches each hold a *storage.Table, and their keys
+// (tenant, table, column) are never written again after a DROP, so without
+// an eager purge the entries — and through them every row of the dropped
+// table — stayed reachable forever.
+func TestDropTablePurgesVectorCaches(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE purge_me (id INT, embedding VECTOR)`)
+	for i := 0; i < 8; i++ {
+		execSQL(t, db, fmt.Sprintf(
+			`INSERT INTO purge_me VALUES (%d, VEC_FROM_JSON('[%d.0, 1.0, 0.5]'))`, i, i%3))
+	}
+	// Warm all three cache kinds.
+	execSQL(t, db, `SELECT * FROM VEC_WARM('purge_me', 'embedding', 'cosine', 'ivf')`)
+	execSQL(t, db, `SELECT * FROM VEC_WARM('purge_me', 'embedding', 'cosine', 'hnsw')`)
+
+	countEntries := func() (n int) {
+		vecSearchColumnCacheMu.RLock()
+		for k := range vecSearchColumnCache {
+			if k.table == "purge_me" {
+				n++
+			}
+		}
+		vecSearchColumnCacheMu.RUnlock()
+		vecIVFCacheMu.RLock()
+		for k := range vecIVFCache {
+			if k.table == "purge_me" {
+				n++
+			}
+		}
+		vecIVFCacheMu.RUnlock()
+		vecHNSWCacheMu.RLock()
+		for k := range vecHNSWCache {
+			if k.table == "purge_me" {
+				n++
+			}
+		}
+		vecHNSWCacheMu.RUnlock()
+		return n
+	}
+
+	if n := countEntries(); n == 0 {
+		t.Fatal("expected warm caches to hold entries before DROP")
+	}
+	execSQL(t, db, `DROP TABLE purge_me`)
+	if n := countEntries(); n != 0 {
+		t.Fatalf("expected all vector cache entries purged after DROP, %d remain", n)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Parse-time constant folding of pure vector functions
 // ---------------------------------------------------------------------------

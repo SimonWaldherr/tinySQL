@@ -20,6 +20,12 @@ const (
 	vecHNSWM              = 12
 	vecHNSWEfConstruction = 48
 	vecHNSWMaxLevel       = 8
+
+	// vecIndexCacheMaxEntries bounds the IVF and HNSW caches — see the
+	// vecColumnCacheMaxEntries comment in vector_search.go for rationale.
+	// Lower than the column-cache cap because index entries are larger
+	// (centroids/graph) and each also pins its *storage.Table.
+	vecIndexCacheMaxEntries = 64
 )
 
 type vecIndexCacheKey struct {
@@ -222,6 +228,9 @@ func getVecIVFIndex(ctx context.Context, tenant string, table *storage.Table, co
 		return nil, err
 	}
 	vecIVFCacheMu.Lock()
+	if _, exists := vecIVFCache[key]; !exists {
+		evictOverCap(vecIVFCache, vecIndexCacheMaxEntries)
+	}
 	vecIVFCache[key] = idx
 	vecIVFCacheMu.Unlock()
 	return idx, nil
@@ -346,6 +355,9 @@ func getVecHNSWIndex(ctx context.Context, tenant string, table *storage.Table, c
 		return nil, err
 	}
 	vecHNSWCacheMu.Lock()
+	if _, exists := vecHNSWCache[key]; !exists {
+		evictOverCap(vecHNSWCache, vecIndexCacheMaxEntries)
+	}
 	vecHNSWCache[key] = idx
 	vecHNSWCacheMu.Unlock()
 	return idx, nil

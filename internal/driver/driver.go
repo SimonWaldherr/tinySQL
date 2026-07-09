@@ -499,13 +499,69 @@ func (c *conn) currentDB() *storage.DB {
 	return c.srv.db
 }
 
+// parsedStmtCache is a bounded, process-wide cache of parsed statements
+// keyed by the final (post-placeholder-binding) SQL text. Applications going
+// through database/sql re-issue the same statement text on every call —
+// dashboards, health checks, catalog queries, RAG query templates — and
+// previously paid a full lex+parse each time. Only SELECT/EXPLAIN results
+// are cached: they are the shapes that repeat, and read statements are
+// naturally re-executed from a shared AST elsewhere (the public
+// ParseSQL-once/Execute-many pattern), so cross-connection reuse is safe.
+// Oversized statements (bulk INSERTs, inlined vector literals — unique per
+// call) are parsed directly and never stored, so they cannot churn the
+// cache.
+var (
+	parsedStmtMu    sync.RWMutex
+	parsedStmtCache = make(map[string]engine.Statement)
+)
+
+const (
+	parsedStmtCacheMaxEntries = 256
+	parsedStmtCacheMaxSQLLen  = 8 << 10
+)
+
+func parseSQLCached(sqlStr string) (engine.Statement, error) {
+	cacheable := len(sqlStr) <= parsedStmtCacheMaxSQLLen
+	if cacheable {
+		parsedStmtMu.RLock()
+		st, ok := parsedStmtCache[sqlStr]
+		parsedStmtMu.RUnlock()
+		if ok {
+			return st, nil
+		}
+	}
+	p := engine.NewParser(sqlStr)
+	st, err := p.ParseStatement()
+	if err != nil || !cacheable {
+		return st, err
+	}
+	switch st.(type) {
+	case *engine.Select, *engine.Explain:
+	default:
+		return st, nil
+	}
+	parsedStmtMu.Lock()
+	if len(parsedStmtCache) >= parsedStmtCacheMaxEntries {
+		// Random eviction via map iteration order; a bad eviction just
+		// costs one re-parse.
+		for k := range parsedStmtCache {
+			if len(parsedStmtCache) < parsedStmtCacheMaxEntries {
+				break
+			}
+			delete(parsedStmtCache, k)
+		}
+	}
+	parsedStmtCache[sqlStr] = st
+	parsedStmtMu.Unlock()
+	return st, nil
+}
+
 //nolint:gocyclo // execSQL coordinates parsing, locking, WAL, and transaction paths.
 func (c *conn) execSQL(ctx context.Context, sqlStr string) (driver.Result, error) {
 	if res, handled, err := c.execTransactionControl(ctx, sqlStr); handled {
 		return res, err
 	}
-	p := engine.NewParser(sqlStr)
-	st, err := p.ParseStatement()
+	st, err := parseSQLCached(sqlStr)
 	if err != nil {
 		return nil, err
 	}
@@ -657,8 +713,7 @@ func (c *conn) querySQL(ctx context.Context, sqlStr string) (driver.Rows, error)
 	}
 	// Queries return a driver.Rows. For non-SELECT statements, execute them
 	// and return an empty result set to satisfy the interface.
-	p := engine.NewParser(sqlStr)
-	st, err := p.ParseStatement()
+	st, err := parseSQLCached(sqlStr)
 	if err != nil {
 		return nil, err
 	}

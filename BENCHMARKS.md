@@ -362,3 +362,60 @@ Reproduce with:
 ```sh
 go test -bench='BenchmarkOrderByVectorLimit|BenchmarkRAGRankScore|BenchmarkHybridOrderBy|BenchmarkVectorDot768' -benchmem ./internal/engine/...
 ```
+
+### Production-hardening round: raw-filter fallback, cache eviction, statement cache
+
+Follow-up round to the RAG scalar-function work above, targeting long-running
+production processes (measured on the same machine; wall-clock numbers below
+carry some thermal variance — the allocation numbers are the stable signal).
+
+1. **Function predicates no longer force the Row-map evaluator**
+   (`internal/engine/exec.go`). WHERE clauses built from function-call
+   comparisons — `VEC_COSINE_SIMILARITY(embedding, ...) > 0.5 AND
+   RECENCY_SCORE(created_at, 30) > 0.2` — previously compiled to no raw
+   filter at all, disqualifying the whole plan from the raw fast path. The
+   general evaluator then built a `map[string]any` with two entries per
+   column for every row, and that map traffic dominated the query. Now any
+   predicate the specialized builders can't compile falls back to a raw
+   `evalRawExpr` filter (`buildRawExprFilter`), keeping the scan on `[]any`
+   rows. AND/OR ordering keeps its cost model: a specialized side (column
+   comparison) still short-circuits before an expression side (vector
+   distance), regardless of written order.
+2. **Function names normalize to uppercase at parse time**
+   (`internal/engine/parser.go`). Handler resolution tries an exact map hit
+   first and retried with `strings.ToUpper` — for lowercase-written SQL that
+   was an extra lookup plus a string allocation per call per row.
+3. **Vector caches are bounded and purged on DROP TABLE**
+   (`internal/engine/vector_search.go`, `vector_index.go`, `exec.go`). The
+   column cache and the IVF/HNSW index caches each pin their
+   `*storage.Table` — including all row data. Entries for dropped tables
+   were never evicted, so a create/query/drop cycle leaked the entire table
+   per iteration for the life of the process. DROP TABLE now purges all
+   three caches eagerly (`purgeVectorCachesFor`), and hard caps (256 column
+   caches, 64 per index kind) bound paths with no purge hook (renames,
+   tenant removal). Regression test: `TestDropTablePurgesVectorCaches`.
+4. **The `database/sql` driver caches parsed SELECT/EXPLAIN statements**
+   (`internal/driver/driver.go`). Applications re-issue the same statement
+   text on every call; each call previously paid a full lex+parse. A
+   bounded, process-wide cache (256 entries, statements ≤ 8 KB) returns the
+   shared AST for repeated text — parsed statements are already safely
+   re-executable (the public ParseSQL-once/Execute-many pattern). Oversized
+   or unique statements (bulk INSERTs, inlined vector literals) are parsed
+   directly and never stored.
+
+| Benchmark (12k rows, 64 dims) | before | after |
+|---|---|---|
+| Hybrid score + recency (`RAG_HYBRID_SCORE`) | ~23 ms, 13.2 MB, 144k allocs | ~19 ms, **494 KB, 60k allocs** |
+| `WHERE vector-cond AND scalar-cond` (vector written first) | 4.2 ms* | 2.2 ms (order-independent) |
+| Repeated SELECT via `database/sql` | 137 allocs/query | 87 allocs/query (parse skipped) |
+
+*The 4.2 ms "before" is what the naive fallback (evaluate both predicate
+sides in written order) would cost; the shipped version restores
+cheap-side-first ordering, so predicate order in SQL text no longer matters.
+
+Reproduce with:
+
+```sh
+go test -bench='BenchmarkHybridOrderBy|BenchmarkWhereVectorAndSimpleCondition' -benchmem ./internal/engine/...
+go test -bench='BenchmarkRepeatedSelectViaDriver' -benchmem ./internal/driver/...
+```

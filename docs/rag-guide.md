@@ -155,6 +155,11 @@ For a lighter variant, retrieve by vector and rerank with the scalar
 - **SIMD is automatic.** Distance kernels use AVX2+FMA on amd64 (detected at
   startup, SSE2 fallback) and NEON on arm64, with a portable fallback
   everywhere else; no build tags or cgo required.
+- **Repeated statements skip the parser.** Through the `database/sql`
+  driver, SELECT/EXPLAIN statements up to 8 KB are cached by their final
+  SQL text, so re-issued query templates don't re-parse. Vector caches and
+  ANN indexes are dropped eagerly on `DROP TABLE` and bounded overall, so
+  long-running services don't accumulate memory from schema churn.
 - **Exposing the schema to an LLM agent:** `tsql.BuildAgentContext(...)`
   renders a compact, token-budgeted schema summary for system prompts, and
   `cmd/tinysql-mcp-server` serves the database over MCP.

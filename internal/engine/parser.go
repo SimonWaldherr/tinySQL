@@ -3529,6 +3529,13 @@ func (p *Parser) parseFuncCall() (Expr, error) {
 
 //nolint:gocyclo // Function-call grammar involves numerous special cases.
 func (p *Parser) parseFuncCallWithName(name string) (Expr, error) {
+	// Normalize the function name once at parse time. SQL function names are
+	// case-insensitive; evalFuncCall resolves handlers with an exact-match
+	// lookup first and only then retries with strings.ToUpper — which, for a
+	// lowercase-written call, costs an extra map lookup plus a string
+	// allocation on every evaluation, i.e. once per row in scans. Uppercasing
+	// here makes the first lookup hit for every spelling.
+	name = strings.ToUpper(name)
 	if err := p.expectSymbol("("); err != nil {
 		return nil, err
 	}
