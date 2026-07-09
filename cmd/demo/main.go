@@ -13,7 +13,8 @@
 // FULL OUTER / CROSS JOIN, whole-row full-text search (FTS_SEARCH and
 // ROW_TO_TEXT), vector search with VEC_WARM index warm-up, and the
 // SQL:2008 OFFSET ... FETCH syntax, alongside traditional JOIN/GROUP
-// BY/aggregate queries.
+// BY/aggregate queries. It also shows a row trigger that writes an audit log
+// whenever a new order is inserted.
 //
 // Usage:
 //
@@ -186,6 +187,8 @@ func seedSampleData(exec *executor) {
 	stmts := []string{
 		`CREATE TABLE users (id INT, name TEXT, email TEXT, active BOOL)`,
 		`CREATE TABLE orders (id INT, user_id INT, amount FLOAT, status TEXT, meta JSON)`,
+		`CREATE TABLE order_audit (order_id INT, event TEXT)`,
+		`CREATE TRIGGER orders_after_insert AFTER INSERT ON orders FOR EACH ROW BEGIN INSERT INTO order_audit VALUES (new.id, 'created'); END`,
 		`INSERT INTO users (id, name, email, active) VALUES (1, 'Alice', 'alice@example.com', TRUE)`,
 		`INSERT INTO users (id, name, email, active) VALUES (2, 'Bob', NULL, TRUE)`,
 		`INSERT INTO users (id, name, email, active) VALUES (3, 'Carol', 'carol@example.com', NULL)`,
@@ -233,6 +236,8 @@ func runFeatureTour(exec *executor) {
 	steps := []step{
 		{"DISTINCT values", `SELECT DISTINCT active FROM users ORDER BY active ASC`},
 		{"JSON extraction", `SELECT id, JSON_GET(meta, 'device') AS device FROM orders ORDER BY id`},
+		{"Trigger: insert an order and inspect its audit row", `INSERT INTO orders VALUES (105, 3, 49.0, 'PAID', '{"device":"web"}')`},
+		{"  (the AFTER INSERT trigger wrote this audit row)", `SELECT order_id, event FROM order_audit ORDER BY order_id`},
 		{"LEFT JOIN + GROUP BY + aggregates", `
 SELECT u.name AS user, SUM(o.amount) AS total, COUNT(*) AS cnt
 FROM users u

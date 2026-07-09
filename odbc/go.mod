@@ -4,7 +4,7 @@ go 1.25.12
 
 replace github.com/SimonWaldherr/tinySQL => ../
 
-require github.com/SimonWaldherr/tinySQL v0.0.0
+require github.com/SimonWaldherr/tinySQL v0.16.0
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
@@ -14,7 +14,7 @@ require (
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/robfig/cron/v3 v3.0.1 // indirect
-	golang.org/x/crypto v0.53.0 // indirect
+	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	modernc.org/libc v1.74.1 // indirect

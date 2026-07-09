@@ -89,6 +89,7 @@ package main
 
 import (
     "context"
+	"errors"
     "fmt"
     "time"
 
@@ -137,6 +138,21 @@ Best Practice fuer Timeouts und Settings:
 - DSN fuer tinySQL-spezifische Optionen (`tenant`, `autosave`, `pool_readers`, `pool_writers`, `busy_timeout`)
 - `database/sql` fuer Pool-Parameter (`MaxOpenConns`, `MaxIdleConns`, `ConnMaxLifetime`, `ConnMaxIdleTime`)
 - pro Anfrage/Query immer `context.WithTimeout(...)` + `ExecContext`/`QueryContext`/`PingContext` nutzen
+
+#### Transaktionen und konkurrierende Schreibvorgaenge
+
+Der Driver verwendet bei `BeginTx` einen Snapshot. Aenderungen an verschiedenen
+Tabellen koennen parallel committed werden; aendert eine andere Verbindung
+dieselbe Tabelle zwischen `BEGIN` und `COMMIT`, wird der Commit abgelehnt statt
+die fremde Aenderung zu ueberschreiben. Solche Konflikte sind mit
+`errors.Is(err, driver.ErrTransactionConflict)` erkennbar und sollten von der
+Anwendung bei Bedarf mit einem erneuten Lesen und Retry behandelt werden.
+
+```go
+if err := tx.Commit(); errors.Is(err, tsqldriver.ErrTransactionConflict) {
+    // Daten erneut lesen und die fachliche Operation bei Bedarf wiederholen.
+}
+```
 
 #### Eigene Werkzeuge und Erweiterungen bauen
 

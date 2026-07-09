@@ -10,6 +10,10 @@ import (
 // DriverName is the registered database/sql driver name for tinySQL.
 const DriverName = "tinysql"
 
+// ErrTransactionConflict indicates a retryable optimistic-concurrency
+// conflict while committing a transaction. Use errors.Is to check it.
+var ErrTransactionConflict = id.ErrTransactionConflict
+
 // Open is a convenience wrapper around `sql.Open(DriverName, dsn)`.
 func Open(dsn string) (*sql.DB, error) { return sql.Open(DriverName, dsn) }
 

@@ -670,6 +670,9 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 		if err != nil {
 			return nil, fmt.Errorf("open index db: %w", err)
 		}
+		if err := applyEncryptionKey(backend.Disk(), cfg.EncryptionKey); err != nil {
+			return nil, err
+		}
 		db.backend = backend
 
 	case ModeHybrid:
@@ -683,6 +686,9 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 		backend, err := NewHybridBackend(cfg.Path, mem, cfg.CompressFiles, ModeHybrid)
 		if err != nil {
 			return nil, fmt.Errorf("open hybrid db: %w", err)
+		}
+		if err := applyEncryptionKey(backend.Disk(), cfg.EncryptionKey); err != nil {
+			return nil, err
 		}
 		db.backend = backend
 
@@ -913,20 +919,41 @@ func (db *DB) DeepClone() *DB {
 	out.wal = db.wal
 	for tn, tdb := range db.tenants {
 		for _, t := range tdb.tables {
-			cols := make([]Column, len(t.Cols))
-			copy(cols, t.Cols)
-			nt := NewTable(t.Name, cols, t.IsTemp)
-			nt.Version = t.Version
-			nt.Rows = make([][]any, len(t.Rows))
-			for i := range t.Rows {
-				row := make([]any, len(t.Rows[i]))
-				copy(row, t.Rows[i])
-				nt.Rows[i] = row
-			}
-			out.Put(tn, nt)
+			out.Put(tn, cloneTable(t))
 		}
 	}
 	return out
+}
+
+// DeepClonePair creates two independent full copies in one traversal. The SQL
+// driver uses this for transaction begin: one immutable base snapshot for
+// conflict detection and one mutable shadow that receives transaction writes.
+func (db *DB) DeepClonePair() (*DB, *DB) {
+	base := NewDB()
+	shadow := NewDB()
+	base.wal = db.wal
+	shadow.wal = db.wal
+	for tn, tdb := range db.tenants {
+		for _, t := range tdb.tables {
+			base.upsertTable(tn, cloneTable(t))
+			shadow.upsertTable(tn, cloneTable(t))
+		}
+	}
+	return base, shadow
+}
+
+func cloneTable(t *Table) *Table {
+	cols := make([]Column, len(t.Cols))
+	copy(cols, t.Cols)
+	nt := NewTable(t.Name, cols, t.IsTemp)
+	nt.Version = t.Version
+	nt.Rows = make([][]any, len(t.Rows))
+	for i := range t.Rows {
+		row := make([]any, len(t.Rows[i]))
+		copy(row, t.Rows[i])
+		nt.Rows[i] = row
+	}
+	return nt
 }
 
 // ShallowCloneForTable creates a lightweight copy of the database that
@@ -948,17 +975,7 @@ func (db *DB) ShallowCloneForTable(tenant, tableName string) *DB {
 			key := strings.ToLower(t.Name)
 			if tn == targetTenant && key == targetKey {
 				// Deep-copy the target table that will be mutated.
-				cols := make([]Column, len(t.Cols))
-				copy(cols, t.Cols)
-				nt := NewTable(t.Name, cols, t.IsTemp)
-				nt.Version = t.Version
-				nt.Rows = make([][]any, len(t.Rows))
-				for i := range t.Rows {
-					row := make([]any, len(t.Rows[i]))
-					copy(row, t.Rows[i])
-					nt.Rows[i] = row
-				}
-				out.upsertTable(tn, nt)
+				out.upsertTable(tn, cloneTable(t))
 			} else {
 				// Share by reference — these tables are read-only in this operation.
 				out.upsertTable(tn, t)
@@ -992,6 +1009,7 @@ type diskCatalog struct {
 	Views        []*CatalogView
 	MViews       []*CatalogMaterializedView
 	Dependencies []CatalogDependency
+	Indexes      []*CatalogIndex
 	Funcs        []*CatalogFunction
 	Jobs         []*CatalogJob
 	JobRuns      []*CatalogJobHistory
@@ -1012,6 +1030,7 @@ func catalogToDisk(c *CatalogManager) diskCatalog {
 		Views:        make([]*CatalogView, 0, len(c.views)),
 		MViews:       make([]*CatalogMaterializedView, 0, len(c.mviews)),
 		Dependencies: make([]CatalogDependency, 0),
+		Indexes:      make([]*CatalogIndex, 0, len(c.indexes)),
 		Funcs:        make([]*CatalogFunction, 0, len(c.funcs)),
 		Jobs:         make([]*CatalogJob, 0, len(c.jobs)),
 		JobRuns:      make([]*CatalogJobHistory, 0, len(c.jobRuns)),
@@ -1040,6 +1059,11 @@ func catalogToDisk(c *CatalogManager) diskCatalog {
 	}
 	for _, deps := range c.dependencies {
 		dc.Dependencies = append(dc.Dependencies, deps...)
+	}
+	for _, idx := range c.indexes {
+		cp := *idx
+		cp.Columns = append([]string(nil), idx.Columns...)
+		dc.Indexes = append(dc.Indexes, &cp)
 	}
 	for _, f := range c.funcs {
 		cp := *f
@@ -1094,6 +1118,14 @@ func diskToCatalog(dc diskCatalog) *CatalogManager {
 	for _, dep := range dc.Dependencies {
 		key := dep.Schema + "." + dep.ObjectName
 		c.dependencies[key] = append(c.dependencies[key], dep)
+	}
+	for _, idx := range dc.Indexes {
+		if idx == nil {
+			continue
+		}
+		cp := *idx
+		cp.Columns = append([]string(nil), idx.Columns...)
+		c.indexes[cp.Schema+"."+cp.Name] = &cp
 	}
 	for _, f := range dc.Funcs {
 		if f == nil {
@@ -1589,6 +1621,34 @@ func CollectWALChanges(prev, next *DB) []WALChange {
 		return strings.ToLower(changes[i].Tenant) < strings.ToLower(changes[j].Tenant)
 	})
 	return changes
+}
+
+// ApplyWALChanges applies a set of table-level changes to the database. It is
+// used by the SQL driver to commit a transaction by merging the transaction's
+// delta into the latest shared database instead of replacing the whole DB with
+// an older snapshot.
+func (db *DB) ApplyWALChanges(changes []WALChange) error {
+	for _, ch := range changes {
+		if ch.Drop {
+			db.mu.Lock()
+			td := db.getTenant(ch.Tenant)
+			delete(td.tables, strings.ToLower(ch.Name))
+			db.mu.Unlock()
+			if db.backend != nil && db.backend.TableExists(ch.Tenant, ch.Name) {
+				if err := db.backend.DeleteTable(ch.Tenant, ch.Name); err != nil {
+					return fmt.Errorf("backend delete %s/%s: %w", ch.Tenant, ch.Name, err)
+				}
+			}
+			continue
+		}
+		if ch.Table == nil {
+			continue
+		}
+		db.mu.Lock()
+		db.getTenant(ch.Tenant).tables[strings.ToLower(ch.Name)] = ch.Table
+		db.mu.Unlock()
+	}
+	return nil
 }
 
 // WALConfig configures WAL and checkpoint behavior.

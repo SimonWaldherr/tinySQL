@@ -352,7 +352,7 @@ type StorageBackend = storage.StorageBackend
 type BackendStats = storage.BackendStats
 
 // ============================================================================
-// Encryption at rest - AES-256-GCM for ModeDisk/ModeJSON table files
+// Encryption at rest - AES-256-GCM for disk-backed table files
 // ============================================================================
 
 // EncryptionKeySize is the required key length, in bytes, for
@@ -364,8 +364,8 @@ const EncryptionKeySize = storage.EncryptionKeySize
 const EncryptionSaltSize = storage.EncryptionSaltSize
 
 // Encryptor performs authenticated AES-256-GCM encryption/decryption.
-// StorageConfig.EncryptionKey is the usual way to enable it for ModeDisk/
-// ModeJSON; construct one directly only if you need to encrypt/decrypt
+// StorageConfig.EncryptionKey is the usual way to enable it for disk-backed
+// table files; construct one directly only if you need to encrypt/decrypt
 // something outside the storage backend's own file I/O.
 type Encryptor = storage.Encryptor
 

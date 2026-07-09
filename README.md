@@ -67,7 +67,8 @@ func main() {
 - Geodata imports and SQL helpers for GeoJSON, KML, OSM XML, Shapefiles,
   MBTiles, routing graphs, points, distance, radius, and bounding-box queries.
 - Operational hooks for health checks, lifecycle management, read-only mode,
-  RBAC, audit logging, and encryption at rest for `ModeDisk`/`ModeJSON`.
+  RBAC, audit logging, and encryption at rest for `ModeDisk`, `ModeJSON`,
+  `ModeHybrid`, and `ModeIndex` table files.
 
 For a broader feature reference, see [FUNCTIONS.sql](./FUNCTIONS.sql),
 [example_showcase.sql](./example_showcase.sql), and the Go tests.
@@ -99,8 +100,8 @@ TinySQL is not a PostgreSQL/MySQL replacement. Important current limits:
   partial indexes, generated columns, or persistent ANN vector index files.
 - `CREATE INDEX` stores metadata, but the planner does not use indexes yet.
 - RBAC checks are coarse and single-table oriented.
-- Encryption at rest currently covers `ModeDisk`/`ModeJSON` table files, not
-  every backend mode or metadata file.
+- Encryption at rest currently covers table files for `ModeDisk`, `ModeJSON`,
+  `ModeHybrid`, and `ModeIndex`, not WAL-backed modes or metadata files.
 
 Evaluate these limits before using TinySQL for production-critical data.
 

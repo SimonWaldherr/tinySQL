@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -173,17 +174,85 @@ func TestSysConstraintsQuotedQualifiedName(t *testing.T) {
 	}
 }
 
-// TestSysIndexes verifies sys.indexes returns empty (CREATE INDEX is a no-op).
+// TestSysIndexes verifies sys.indexes exposes CREATE INDEX metadata.
 func TestSysIndexes(t *testing.T) {
 	db := setupTestDB()
 	ctx := context.Background()
 
-	rs, err := Execute(ctx, db, "main", mustParseSys("SELECT * FROM sys.indexes"))
+	if _, err := Execute(ctx, db, "main", mustParseSys("CREATE TABLE idx_users (id INT, email TEXT)")); err != nil {
+		t.Fatalf("CREATE TABLE failed: %v", err)
+	}
+	if _, err := Execute(ctx, db, "main", mustParseSys("CREATE UNIQUE INDEX idx_users_email ON idx_users(email)")); err != nil {
+		t.Fatalf("CREATE INDEX failed: %v", err)
+	}
+
+	rs, err := Execute(ctx, db, "main", mustParseSys("SELECT name, table_name, columns, is_unique FROM sys.indexes"))
+	if err != nil {
+		t.Fatalf("SELECT sys.indexes failed: %v", err)
+	}
+	if len(rs.Rows) != 1 {
+		t.Fatalf("expected 1 index, got %d", len(rs.Rows))
+	}
+	row := rs.Rows[0]
+	if row["name"] != "idx_users_email" || row["table_name"] != "idx_users" || row["columns"] != "email" || row["is_unique"] != true {
+		t.Fatalf("unexpected index metadata: %#v", row)
+	}
+}
+
+func TestSysIndexesDropTableCleanup(t *testing.T) {
+	db := setupTestDB()
+	ctx := context.Background()
+
+	if _, err := Execute(ctx, db, "main", mustParseSys("CREATE TABLE idx_cleanup (id INT)")); err != nil {
+		t.Fatalf("CREATE TABLE failed: %v", err)
+	}
+	if _, err := Execute(ctx, db, "main", mustParseSys("CREATE INDEX idx_cleanup_id ON idx_cleanup(id)")); err != nil {
+		t.Fatalf("CREATE INDEX failed: %v", err)
+	}
+	if _, err := Execute(ctx, db, "main", mustParseSys("DROP TABLE idx_cleanup")); err != nil {
+		t.Fatalf("DROP TABLE failed: %v", err)
+	}
+	rs, err := Execute(ctx, db, "main", mustParseSys("SELECT name FROM sys.indexes WHERE name = 'idx_cleanup_id'"))
 	if err != nil {
 		t.Fatalf("SELECT sys.indexes failed: %v", err)
 	}
 	if len(rs.Rows) != 0 {
-		t.Fatalf("expected 0 indexes, got %d", len(rs.Rows))
+		t.Fatalf("expected index metadata to be removed, got %#v", rs.Rows)
+	}
+}
+
+func TestSysIndexesPersistAcrossDiskReopen(t *testing.T) {
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "db")
+	db, err := storage.OpenDB(storage.StorageConfig{Mode: storage.ModeDisk, Path: dir})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	if _, err := Execute(ctx, db, "main", mustParseSys("CREATE TABLE idx_persist (id INT, email TEXT)")); err != nil {
+		t.Fatalf("CREATE TABLE failed: %v", err)
+	}
+	if _, err := Execute(ctx, db, "main", mustParseSys("CREATE INDEX idx_persist_email ON idx_persist(email)")); err != nil {
+		t.Fatalf("CREATE INDEX failed: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := storage.OpenDB(storage.StorageConfig{Mode: storage.ModeDisk, Path: dir})
+	if err != nil {
+		t.Fatalf("reopen OpenDB: %v", err)
+	}
+	defer reopened.Close()
+	rs, err := Execute(ctx, reopened, "main", mustParseSys("SELECT name, table_name, columns FROM sys.indexes WHERE name = 'idx_persist_email'"))
+	if err != nil {
+		t.Fatalf("SELECT sys.indexes failed: %v", err)
+	}
+	if len(rs.Rows) != 1 {
+		t.Fatalf("expected persisted index metadata, got %#v", rs.Rows)
+	}
+	row := rs.Rows[0]
+	if row["table_name"] != "idx_persist" || row["columns"] != "email" {
+		t.Fatalf("unexpected persisted index metadata: %#v", row)
 	}
 }
 

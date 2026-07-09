@@ -241,6 +241,63 @@ func TestOpenDBWithEncryptionKeyEndToEnd(t *testing.T) {
 	}
 }
 
+func TestOpenDBWithEncryptionKeyHybridAndIndex(t *testing.T) {
+	for _, mode := range []StorageMode{ModeHybrid, ModeIndex} {
+		t.Run(mode.String(), func(t *testing.T) {
+			dir := t.TempDir()
+			key := bytes.Repeat([]byte{0x66}, EncryptionKeySize)
+			secretMarker := "HYBRID-INDEX-SECRET-MARKER"
+
+			db, err := OpenDB(StorageConfig{Mode: mode, Path: dir, EncryptionKey: key})
+			if err != nil {
+				t.Fatalf("OpenDB: %v", err)
+			}
+			table := NewTable("secrets", []Column{
+				{Name: "id", Type: IntType},
+				{Name: "val", Type: StringType},
+			}, false)
+			table.Rows = [][]any{{1, secretMarker}}
+			if err := db.Put("default", table); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+			if err := db.Sync(); err != nil {
+				t.Fatalf("Sync: %v", err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+
+			foundPlaintext := false
+			filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+				if err != nil || d.IsDir() {
+					return nil
+				}
+				data, rerr := os.ReadFile(path)
+				if rerr == nil && bytes.Contains(data, []byte(secretMarker)) {
+					foundPlaintext = true
+				}
+				return nil
+			})
+			if foundPlaintext {
+				t.Fatal("found the secret marker string in plaintext on disk")
+			}
+
+			db2, err := OpenDB(StorageConfig{Mode: mode, Path: dir, EncryptionKey: key})
+			if err != nil {
+				t.Fatalf("reopen OpenDB: %v", err)
+			}
+			defer db2.Close()
+			loaded, err := db2.Get("default", "secrets")
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			if len(loaded.Rows) != 1 || loaded.Rows[0][1] != secretMarker {
+				t.Errorf("unexpected data after reopen: %+v", loaded.Rows)
+			}
+		})
+	}
+}
+
 func TestOpenDBRejectsWrongSizeEncryptionKey(t *testing.T) {
 	dir := t.TempDir()
 	_, err := OpenDB(StorageConfig{Mode: ModeDisk, Path: dir, EncryptionKey: []byte("too-short")})

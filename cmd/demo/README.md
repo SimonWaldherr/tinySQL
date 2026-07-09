@@ -4,8 +4,8 @@ A practical SQL playground that seeds sample data into an in-memory (or file-bac
 
 ## Features
 
-- **Seed mode** – Creates `users` and `orders` tables with realistic sample data.
-- **Feature tour** – Runs a guided tour of tinySQL capabilities (JOINs, GROUP BY, JSON extraction, CTEs, temp tables, UPDATE/DELETE).
+- **Seed mode** – Creates `users`, `orders`, `order_audit`, `sales`, `articles`, and `docs` sample tables.
+- **Feature tour** – Runs a guided tour of joins, PIVOT/window functions, JSON, triggers, full-text search, vector search, CTEs, temp tables, UPDATE/DELETE.
 - **Script mode** – Executes any SQL script file (`.sql`) statement by statement.
 - **Interactive REPL** – Drops into a live SQL shell after setup.
 - **Timer** – Optionally prints per-statement execution time.
@@ -49,7 +49,7 @@ Runs the full feature tour against freshly seeded sample data.
 ./demo -script my_queries.sql
 ```
 
-Executes every statement in `my_queries.sql` against the seeded `users`/`orders` tables.
+Executes every statement in `my_queries.sql` against the seeded tables.
 
 ### Interactive playground
 
@@ -100,7 +100,7 @@ The database is saved to `/tmp/mydb.db`; run again without `-seed` to keep exist
 
 ## Sample data
 
-After seeding, two tables are available:
+After seeding, six tables are available. The most commonly used are:
 
 **`users`** (id INT, name TEXT, email TEXT, active BOOL)
 
@@ -118,3 +118,7 @@ After seeding, two tables are available:
 | 102 | 1       | 75.0   | PAID     |
 | 103 | 2       | 200.0  | PAID     |
 | 104 | 2       | 20.0   | CANCELED |
+
+`order_audit` records inserted order IDs through an `AFTER INSERT` trigger;
+`sales`, `articles`, and `docs` power the PIVOT/window, full-text, and vector
+search steps in the feature tour.

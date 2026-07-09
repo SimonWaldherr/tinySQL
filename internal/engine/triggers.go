@@ -6,8 +6,20 @@ package engine
 import (
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
+)
+
+type triggerCacheEntry struct {
+	body  string
+	stmts []Statement
+}
+
+var (
+	triggerCacheMu   sync.RWMutex
+	triggerBodyCache = make(map[string]triggerCacheEntry)
+	triggerWhenCache = make(map[string]Expr)
 )
 
 // executeCreateTrigger stores a trigger definition in the catalog.
@@ -28,11 +40,16 @@ func executeCreateTrigger(env ExecEnv, s *CreateTrigger) (*ResultSet, error) {
 		Timing:     storage.TriggerTiming(s.Timing),
 		Event:      storage.TriggerEvent(s.Event),
 		ForEachRow: s.ForEachRow,
+		WhenExpr:   s.WhenText,
 		Body:       s.BodyText,
 	}
 
 	if err := cat.RegisterTrigger(t); err != nil {
 		return nil, err
+	}
+	cacheTriggerBody(t.Name, t.Body, s.Body)
+	if s.WhenExpr != nil && s.WhenText != "" {
+		cacheTriggerWhen(t.WhenExpr, s.WhenExpr)
 	}
 	return nil, nil
 }
@@ -78,8 +95,21 @@ func executeTrigger(env ExecEnv, trig *storage.CatalogTrigger, newRow Row, oldRo
 		trigRow["old."+k] = v
 	}
 
-	// Parse the trigger body SQL statements.
-	stmts, err := parseTriggerBody(trig.Body)
+	if strings.TrimSpace(trig.WhenExpr) != "" {
+		whenExpr, err := triggerWhenExpr(trig.WhenExpr)
+		if err != nil {
+			return err
+		}
+		ok, err := evalExpr(env, whenExpr, trigRow)
+		if err != nil {
+			return err
+		}
+		if toTri(ok) != tvTrue {
+			return nil
+		}
+	}
+
+	stmts, err := triggerBodyStatements(trig)
 	if err != nil {
 		return err
 	}
@@ -98,8 +128,54 @@ func executeTrigger(env ExecEnv, trig *storage.CatalogTrigger, newRow Row, oldRo
 			return err
 		}
 	}
-	// TODO: evaluate WHEN condition against trigRow when that feature is added.
 	return nil
+}
+
+func cacheTriggerBody(name, body string, stmts []Statement) {
+	triggerCacheMu.Lock()
+	defer triggerCacheMu.Unlock()
+	triggerBodyCache[name] = triggerCacheEntry{body: body, stmts: append([]Statement(nil), stmts...)}
+}
+
+func triggerBodyStatements(trig *storage.CatalogTrigger) ([]Statement, error) {
+	triggerCacheMu.RLock()
+	if cached, ok := triggerBodyCache[trig.Name]; ok && cached.body == trig.Body {
+		stmts := append([]Statement(nil), cached.stmts...)
+		triggerCacheMu.RUnlock()
+		return stmts, nil
+	}
+	triggerCacheMu.RUnlock()
+
+	stmts, err := parseTriggerBody(trig.Body)
+	if err != nil {
+		return nil, err
+	}
+	cacheTriggerBody(trig.Name, trig.Body, stmts)
+	return append([]Statement(nil), stmts...), nil
+}
+
+func cacheTriggerWhen(text string, expr Expr) {
+	triggerCacheMu.Lock()
+	defer triggerCacheMu.Unlock()
+	triggerWhenCache[text] = expr
+}
+
+func triggerWhenExpr(text string) (Expr, error) {
+	text = strings.TrimSpace(text)
+	triggerCacheMu.RLock()
+	if expr, ok := triggerWhenCache[text]; ok {
+		triggerCacheMu.RUnlock()
+		return expr, nil
+	}
+	triggerCacheMu.RUnlock()
+
+	p := NewParser(text)
+	expr, err := p.parseExpr()
+	if err != nil {
+		return nil, fmt.Errorf("trigger WHEN parse: %w", err)
+	}
+	cacheTriggerWhen(text, expr)
+	return expr, nil
 }
 
 // parseTriggerBody splits and parses semicolon-separated SQL statements.
