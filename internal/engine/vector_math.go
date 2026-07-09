@@ -83,6 +83,42 @@ func vectorL1Unrolled(a, b []float64) float64 {
 	return sum
 }
 
+// vectorCosineParts computes dot(a,b), dot(a,a) and dot(b,b) in a single
+// pass over both vectors, dispatching to a fused SIMD kernel where one
+// exists. Cosine similarity needs all three quantities; when no cached norm
+// is available (the scalar VEC_COSINE_SIMILARITY path), one fused pass costs
+// the same memory traffic as a plain dot product instead of three separate
+// loops.
+func vectorCosineParts(a, b []float64) (dot, normA2, normB2 float64) {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	return vectorCosineKernel(a[:n], b[:n])
+}
+
+func vectorCosineUnrolled(a, b []float64) (dot, normA2, normB2 float64) {
+	var d0, d1, n0, n1, m0, m1 float64
+	i := 0
+	for ; i+1 < len(a); i += 2 {
+		a0, a1 := a[i], a[i+1]
+		b0, b1 := b[i], b[i+1]
+		d0 += a0 * b0
+		d1 += a1 * b1
+		n0 += a0 * a0
+		n1 += a1 * a1
+		m0 += b0 * b0
+		m1 += b1 * b1
+	}
+	if i < len(a) {
+		a0, b0 := a[i], b[i]
+		d0 += a0 * b0
+		n0 += a0 * a0
+		m0 += b0 * b0
+	}
+	return d0 + d1, n0 + n1, m0 + m1
+}
+
 func vectorDistance(metric string, a, b []float64, normA, normB float64) (float64, bool) {
 	if len(a) != len(b) {
 		return 0, false

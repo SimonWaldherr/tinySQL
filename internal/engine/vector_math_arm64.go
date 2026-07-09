@@ -24,6 +24,18 @@ func vectorL2SquaredKernel(a, b []float64) float64 {
 	return vectorL2SquaredNEON(a, b)
 }
 
+// vectorCosineKernel fuses dot(a,b), dot(a,a), dot(b,b). There is no fused
+// NEON kernel (same rationale as vectorL1Kernel below: hand-writing NEON
+// without hardware to validate on risks silent corruption), so large inputs
+// reuse the proven NEON dot kernel three times — each pass SIMD — and small
+// inputs use the portable fused loop.
+func vectorCosineKernel(a, b []float64) (dot, normA2, normB2 float64) {
+	if len(a) < 128 {
+		return vectorCosineUnrolled(a, b)
+	}
+	return vectorDotNEON(a, b), vectorDotNEON(a, a), vectorDotNEON(b, b)
+}
+
 // vectorL1Kernel has no NEON assembly kernel (unlike Dot/L2Squared above):
 // writing one would mean hand-deriving a raw FABS.2D vector encoding without
 // being able to run it on real ARM64 hardware to confirm correctness, and a

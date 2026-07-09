@@ -164,11 +164,7 @@ func evalVecNorm(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("VEC_NORM: %w", err)
 	}
-	var sum float64
-	for _, v := range vec {
-		sum += v * v
-	}
-	return math.Sqrt(sum), nil
+	return vectorL2Norm(vec), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -183,11 +179,7 @@ func evalVecNormalize(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("VEC_NORMALIZE: %w", err)
 	}
-	var sum float64
-	for _, v := range vec {
-		sum += v * v
-	}
-	norm := math.Sqrt(sum)
+	norm := vectorL2Norm(vec)
 	if norm == 0 {
 		return nil, fmt.Errorf("VEC_NORMALIZE: zero-length vector cannot be normalized")
 	}
@@ -336,11 +328,7 @@ func evalVecDot(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if len(a) != len(b) {
 		return nil, fmt.Errorf("VEC_DOT: dimension mismatch %d vs %d", len(a), len(b))
 	}
-	var dot float64
-	for i := range a {
-		dot += a[i] * b[i]
-	}
-	return dot, nil
+	return vectorDot(a, b), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -370,13 +358,8 @@ func cosineSimilarity(a, b []float64) (float64, error) {
 	if len(a) != len(b) {
 		return 0, fmt.Errorf("dimension mismatch %d vs %d", len(a), len(b))
 	}
-	var dot, normA, normB float64
-	for i := range a {
-		dot += a[i] * b[i]
-		normA += a[i] * a[i]
-		normB += b[i] * b[i]
-	}
-	denom := math.Sqrt(normA) * math.Sqrt(normB)
+	dot, normA2, normB2 := vectorCosineParts(a, b)
+	denom := math.Sqrt(normA2) * math.Sqrt(normB2)
 	if denom == 0 {
 		return 0, fmt.Errorf("zero-length vector")
 	}
@@ -425,12 +408,7 @@ func evalVecL2Distance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if len(a) != len(b) {
 		return nil, fmt.Errorf("VEC_L2_DISTANCE: dimension mismatch %d vs %d", len(a), len(b))
 	}
-	var sum float64
-	for i := range a {
-		d := a[i] - b[i]
-		sum += d * d
-	}
-	return math.Sqrt(sum), nil
+	return math.Sqrt(vectorL2Squared(a, b)), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -452,11 +430,7 @@ func evalVecManhattanDistance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if len(a) != len(b) {
 		return nil, fmt.Errorf("VEC_MANHATTAN_DISTANCE: dimension mismatch %d vs %d", len(a), len(b))
 	}
-	var sum float64
-	for i := range a {
-		sum += math.Abs(a[i] - b[i])
-	}
-	return sum, nil
+	return vectorL1Distance(a, b), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -506,25 +480,12 @@ func evalVecDistance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		}
 		return 1.0 - sim, nil
 	case "l2", "euclidean":
-		var sum float64
-		for i := range a {
-			d := a[i] - b[i]
-			sum += d * d
-		}
-		return math.Sqrt(sum), nil
+		return math.Sqrt(vectorL2Squared(a, b)), nil
 	case "manhattan", "l1":
-		var sum float64
-		for i := range a {
-			sum += math.Abs(a[i] - b[i])
-		}
-		return sum, nil
+		return vectorL1Distance(a, b), nil
 	case "dot", "inner_product":
-		var dot float64
-		for i := range a {
-			dot += a[i] * b[i]
-		}
 		// For distance: lower = more similar, so negate dot product
-		return -dot, nil
+		return -vectorDot(a, b), nil
 	default:
 		return nil, fmt.Errorf("VEC_DISTANCE: unknown metric %q (supported: cosine, l2, manhattan, dot)", metric)
 	}

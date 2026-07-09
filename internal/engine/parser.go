@@ -3601,7 +3601,7 @@ func (p *Parser) parseFuncCallWithName(name string) (Expr, error) {
 		overClause = oc
 	}
 
-	return &FuncCall{Name: name, Args: args, Distinct: distinct, Over: overClause}, nil
+	return foldConstFuncCall(&FuncCall{Name: name, Args: args, Distinct: distinct, Over: overClause}), nil
 }
 
 // parseOverClause parses the OVER (PARTITION BY ... ORDER BY ... frame) clause

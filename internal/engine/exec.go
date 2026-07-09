@@ -4753,21 +4753,58 @@ func evalRawBetween(plan *simpleSelectPlan, raw []any, ex *BetweenExpr) (any, er
 	return betweenResult(v, lo, hi, ex.Negate)
 }
 
+// rawCallScratch holds the reusable argument wrappers for one
+// evalRawFuncCall invocation. The raw fast path evaluates function calls
+// once per row; allocating the args slice, one Literal per argument, the
+// FuncCall copy (which escapes through the map-dispatched handler) and an
+// empty Row map on every row made the allocator — not the function body —
+// the dominant cost of expression-heavy scans (e.g. per-row
+// VEC_COSINE_SIMILARITY in RAG queries). Handlers only read the wrappers to
+// extract argument values and never retain them, so recycling the backing
+// structs through a pool is safe; nested calls simply draw their own
+// scratch instance.
+type rawCallScratch struct {
+	call FuncCall
+	args []Expr
+	lits []Literal
+}
+
+var rawCallScratchPool = sync.Pool{
+	New: func() any { return new(rawCallScratch) },
+}
+
+// rawEmptyRow is the shared no-columns row passed to handlers on the raw
+// fast path. All arguments arrive pre-evaluated as literals, so handlers
+// never look anything up in it (ROW_TO_TEXT, which reads the ambient row,
+// is excluded from this path by isSimpleRawExpr).
+var rawEmptyRow = Row{}
+
 func evalRawFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, error) {
 	if ex.Over != nil {
 		return nil, fmt.Errorf("window function %s is not supported in raw expression evaluation", ex.Name)
 	}
-	evaluatedArgs := make([]Expr, len(ex.Args))
+	sc := rawCallScratchPool.Get().(*rawCallScratch)
+	defer rawCallScratchPool.Put(sc)
+	if cap(sc.args) < len(ex.Args) {
+		sc.args = make([]Expr, len(ex.Args))
+		sc.lits = make([]Literal, len(ex.Args))
+	}
+	args := sc.args[:len(ex.Args)]
+	lits := sc.lits[:len(ex.Args)]
 	for i, arg := range ex.Args {
+		if lit, ok := arg.(*Literal); ok {
+			args[i] = lit
+			continue
+		}
 		v, err := evalRawExpr(plan, raw, arg)
 		if err != nil {
 			return nil, err
 		}
-		evaluatedArgs[i] = &Literal{Val: v}
+		lits[i].Val = v
+		args[i] = &lits[i]
 	}
-	call := *ex
-	call.Args = evaluatedArgs
-	return evalFuncCall(ExecEnv{}, &call, Row{})
+	sc.call = FuncCall{Name: ex.Name, Args: args, Star: ex.Star, Distinct: ex.Distinct}
+	return evalFuncCall(ExecEnv{}, &sc.call, rawEmptyRow)
 }
 
 func evalRawUnary(plan *simpleSelectPlan, raw []any, ex *Unary) (any, error) {
@@ -7405,6 +7442,63 @@ func evalDateDiff(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	}
 }
 
+// parseTimeFixedDigits parses the fixed-width layouts "2006-01-02 15:04:05",
+// "2006-01-02T15:04:05" and "2006-01-02" directly, without going through
+// time.Parse's layout interpreter. Timestamp columns in analytical/RAG
+// queries (RECENCY_SCORE, RAG_HYBRID_SCORE, date functions) are parsed once
+// per row, and time.Parse's generality made it a top-3 CPU cost in such
+// scans; direct digit slicing is ~15x cheaper. Returns ok=false for
+// anything that does not match exactly — including out-of-range components,
+// which time.Date would silently normalize (e.g. month 13 → January) where
+// time.Parse reports an error — so callers fall back to the general path
+// and error behavior is unchanged.
+func parseTimeFixedDigits(s string) (time.Time, bool) {
+	digit2 := func(i int) (int, bool) {
+		c0, c1 := s[i]-'0', s[i+1]-'0'
+		if c0 > 9 || c1 > 9 {
+			return 0, false
+		}
+		return int(c0)*10 + int(c1), true
+	}
+	if len(s) != 10 && len(s) != 19 {
+		return time.Time{}, false
+	}
+	if s[4] != '-' || s[7] != '-' {
+		return time.Time{}, false
+	}
+	yHi, ok1 := digit2(0)
+	yLo, ok2 := digit2(2)
+	m, ok3 := digit2(5)
+	d, ok4 := digit2(8)
+	if !ok1 || !ok2 || !ok3 || !ok4 {
+		return time.Time{}, false
+	}
+	y := yHi*100 + yLo
+	var hh, mm, ss int
+	if len(s) == 19 {
+		if (s[10] != ' ' && s[10] != 'T') || s[13] != ':' || s[16] != ':' {
+			return time.Time{}, false
+		}
+		var ok5, ok6, ok7 bool
+		hh, ok5 = digit2(11)
+		mm, ok6 = digit2(14)
+		ss, ok7 = digit2(17)
+		if !ok5 || !ok6 || !ok7 || hh > 23 || mm > 59 || ss > 59 {
+			return time.Time{}, false
+		}
+	}
+	if m < 1 || m > 12 || d < 1 || d > 31 {
+		return time.Time{}, false
+	}
+	t := time.Date(y, time.Month(m), d, hh, mm, ss, 0, time.UTC)
+	// Reject dates time.Date normalized (e.g. Feb 31 → Mar 3) to keep
+	// time.Parse's out-of-range error semantics via the fallback path.
+	if t.Day() != d {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
 func parseTimeValue(val any) (time.Time, error) {
 	if val == nil {
 		return time.Time{}, fmt.Errorf("cannot parse nil as time")
@@ -7414,6 +7508,9 @@ func parseTimeValue(val any) (time.Time, error) {
 	case time.Time:
 		return v, nil
 	case string:
+		if t, ok := parseTimeFixedDigits(v); ok {
+			return t, nil
+		}
 		// Select candidate formats by string length to avoid trying all formats on every call.
 		var formats []string
 		switch len(v) {

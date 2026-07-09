@@ -309,3 +309,56 @@ Reproduce with:
 ```sh
 go test -bench='BenchmarkGroupByTwoColumns|BenchmarkSelectStarFullScan' -benchmem ./internal/engine/...
 ```
+
+### RAG scalar-function path: constant folding, fused SIMD cosine, AVX2+FMA kernels
+
+The `VEC_SEARCH` table function was already fast, but the *scalar* RAG query
+shape — per-row `VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[...]'))`
+in `WHERE`/`ORDER BY`, optionally blended via `RAG_HYBRID_SCORE` /
+`RAG_RANK_SCORE` — was orders of magnitude slower than the equivalent
+`VEC_SEARCH` call. Profiling a 12,000-row / 64-dim `ORDER BY sim DESC
+LIMIT 20` query showed ~85% of CPU time inside `encoding/json`: the
+`VEC_FROM_JSON` literal was re-parsed for every row. Five compounding fixes
+(`internal/engine/const_fold.go`, `vector_functions.go`, `vector_math*.go/.s`,
+`exec.go`):
+
+1. **Parse-time constant folding** — `VEC_FROM_JSON`/`VEC_FROM_BYTES`/
+   `VEC_NORMALIZE` calls whose arguments are all literals are evaluated once
+   at parse time and replaced with a vector literal (`foldConstFuncCall`).
+   Invalid input stays unfolded so errors still surface at execution.
+2. **Scalar vector functions now use the SIMD kernels** — `VEC_DOT`,
+   `VEC_L2_DISTANCE`, `VEC_MANHATTAN_DISTANCE`, `VEC_DISTANCE`, `VEC_NORM`,
+   `VEC_NORMALIZE` and `cosineSimilarity` previously used naive Go loops.
+3. **Fused cosine kernel** — cosine similarity without cached norms needs
+   dot(a,b), dot(a,a) and dot(b,b); a fused one-pass kernel
+   (`vectorCosineKernel`) computes all three with the memory traffic of a
+   single dot product.
+4. **AVX2+FMA kernels with runtime dispatch** — 4-wide `VFMADD231PD`
+   variants of the dot/L2/L1/cosine kernels, selected at startup via an
+   in-repo CPUID check (no new dependency); baseline SSE2 remains the
+   fallback and the floor for short vectors.
+5. **Raw fast path allocation removal** — `evalRawFuncCall` allocated an
+   args slice, per-arg `Literal` wrappers, an escaping `FuncCall` copy and
+   an empty `Row` map per row; these are now pooled/shared. Timestamp
+   parsing (`RECENCY_SCORE`, `RAG_HYBRID_SCORE`) also gained a fixed-layout
+   fast path (`parseTimeFixedDigits`), ~15x cheaper than `time.Parse`.
+
+| Benchmark (12k rows, 64 dims) | before | after |
+|---|---|---|
+| `ORDER BY VEC_COSINE_SIMILARITY(...) LIMIT 20` | 271 ms, 34 MB, 264k allocs | 2.7 ms, 109 KB, 12k allocs (**~100x**) |
+| `RAG_RANK_SCORE(...) ORDER BY ... LIMIT 20` | 282 ms | 7.6 ms (**37x**) |
+| Hybrid score + recency (`RAG_HYBRID_SCORE`) | 535 ms | 22.6 ms (**24x**) |
+| `WHERE vector-cond AND scalar-cond` | ~29 ms | ~1.5 ms (**19x**) |
+| `vectorDot`, 768 dims (AVX2+FMA vs SSE2) | 184 ns | 73 ns (2.5x) |
+| `vectorL2Squared`, 768 dims | 227 ns | 83 ns (2.7x) |
+
+Kernel parity across sizes (including AVX2 dispatch thresholds and odd
+tails) is covered by `TestVecDotKernelMatchesUnrolledAcrossSizes` and
+`TestVecCosineKernelMatchesUnrolledAcrossSizes`; folding semantics by
+`TestVecFromJSONConstantFolding` / `TestVecFromJSONInvalidStillErrors`.
+
+Reproduce with:
+
+```sh
+go test -bench='BenchmarkOrderByVectorLimit|BenchmarkRAGRankScore|BenchmarkHybridOrderBy|BenchmarkVectorDot768' -benchmem ./internal/engine/...
+```

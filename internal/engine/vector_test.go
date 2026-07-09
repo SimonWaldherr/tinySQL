@@ -246,6 +246,102 @@ func TestVecL1KernelMatchesUnrolledAcrossSizes(t *testing.T) {
 	}
 }
 
+// TestVecDotKernelMatchesUnrolledAcrossSizes checks kernel dispatch (which on
+// amd64 may route to SSE2 or AVX2+FMA depending on the CPU and length
+// threshold) against the portable unrolled loop, across sizes straddling the
+// AVX2 dispatch threshold (16), the main-loop widths (16 for dot/l2), and
+// odd tails.
+func TestVecDotKernelMatchesUnrolledAcrossSizes(t *testing.T) {
+	for _, n := range []int{0, 1, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 127, 128, 129, 300, 768} {
+		a := make([]float64, n)
+		b := make([]float64, n)
+		for i := range a {
+			a[i] = math.Sin(float64(i)*0.23) * 1.5
+			b[i] = math.Cos(float64(i)*0.29) * 0.8
+		}
+		got := vectorDot(a, b)
+		want := vectorDotUnrolled(a, b)
+		if math.Abs(got-want) > 1e-9 {
+			t.Errorf("dot n=%d: kernel=%v unrolled=%v (diff %v)", n, got, want, got-want)
+		}
+		got = vectorL2Squared(a, b)
+		want = vectorL2SquaredUnrolled(a, b)
+		if math.Abs(got-want) > 1e-9 {
+			t.Errorf("l2 n=%d: kernel=%v unrolled=%v (diff %v)", n, got, want, got-want)
+		}
+	}
+}
+
+// TestVecCosineKernelMatchesUnrolledAcrossSizes checks the fused
+// dot/normA²/normB² kernel against the portable fused loop across sizes
+// straddling the AVX2 dispatch threshold (8) and tail handling.
+func TestVecCosineKernelMatchesUnrolledAcrossSizes(t *testing.T) {
+	for _, n := range []int{0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 63, 64, 127, 128, 129, 300, 768} {
+		a := make([]float64, n)
+		b := make([]float64, n)
+		for i := range a {
+			a[i] = math.Sin(float64(i)*0.37) * 1.2
+			b[i] = math.Cos(float64(i)*0.41) * 0.9
+		}
+		gd, gna, gnb := vectorCosineParts(a, b)
+		wd, wna, wnb := vectorCosineUnrolled(a, b)
+		if math.Abs(gd-wd) > 1e-9 || math.Abs(gna-wna) > 1e-9 || math.Abs(gnb-wnb) > 1e-9 {
+			t.Errorf("cosine n=%d: kernel=(%v,%v,%v) unrolled=(%v,%v,%v)", n, gd, gna, gnb, wd, wna, wnb)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Parse-time constant folding of pure vector functions
+// ---------------------------------------------------------------------------
+
+// TestVecFromJSONConstantFolding verifies that VEC_FROM_JSON over a string
+// literal is folded to a vector literal at parse time — the optimization that
+// keeps RAG queries from re-parsing the query-vector JSON once per row.
+func TestVecFromJSONConstantFolding(t *testing.T) {
+	folded := foldConstFuncCall(&FuncCall{
+		Name: "VEC_FROM_JSON",
+		Args: []Expr{&Literal{Val: "[1.5, 2.5]"}},
+	})
+	lit, ok := folded.(*Literal)
+	if !ok {
+		t.Fatalf("expected fold to *Literal, got %T", folded)
+	}
+	vec, ok := lit.Val.([]float64)
+	if !ok || len(vec) != 2 || vec[0] != 1.5 || vec[1] != 2.5 {
+		t.Fatalf("expected [1.5 2.5], got %v", lit.Val)
+	}
+
+	// Non-literal args must not fold.
+	unfolded := foldConstFuncCall(&FuncCall{
+		Name: "VEC_FROM_JSON",
+		Args: []Expr{&VarRef{Name: "col"}},
+	})
+	if _, ok := unfolded.(*FuncCall); !ok {
+		t.Fatalf("expected non-literal args to stay a *FuncCall, got %T", unfolded)
+	}
+
+	// Invalid input must stay unfolded so the error surfaces at execution.
+	bad := foldConstFuncCall(&FuncCall{
+		Name: "VEC_FROM_JSON",
+		Args: []Expr{&Literal{Val: "not json"}},
+	})
+	if _, ok := bad.(*FuncCall); !ok {
+		t.Fatalf("expected invalid JSON to stay a *FuncCall, got %T", bad)
+	}
+}
+
+// TestVecFromJSONInvalidStillErrors guards the error semantics after
+// constant folding: a query evaluating VEC_FROM_JSON on malformed JSON must
+// still fail at execution time.
+func TestVecFromJSONInvalidStillErrors(t *testing.T) {
+	db := storage.NewDB()
+	_, err := Execute(context.Background(), db, "default", mustParse(`SELECT VEC_FROM_JSON('nope') as v`))
+	if err == nil {
+		t.Fatal("expected error for invalid JSON, got nil")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // VEC_COSINE_SIMILARITY / VEC_COSINE_DISTANCE
 // ---------------------------------------------------------------------------
