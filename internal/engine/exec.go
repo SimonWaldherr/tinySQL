@@ -3776,6 +3776,29 @@ func evalRawWhere(plan *simpleSelectPlan, raw []any) (bool, error) {
 // Returns nil when the expression is too complex to compile, in which case
 // evalRawExpr is used as the fallback.
 func buildRawFilter(colIndex map[string]int, e Expr) func([]any) (bool, error) {
+	if f := buildRawFilterSpecialized(colIndex, e); f != nil {
+		return f
+	}
+	// General fallback: predicates the specialized builders don't compile —
+	// e.g. function-call comparisons like
+	// VEC_COSINE_SIMILARITY(embedding, ...) > 0.5 — can still run on raw
+	// rows through evalRawExpr, provided the expression only uses node
+	// kinds the raw evaluator supports and no row-aware functions.
+	// Previously such WHERE clauses disqualified the entire plan and forced
+	// the general Row-map evaluator, which allocates two map entries per
+	// column per row; on scoring-heavy RAG scans that map traffic — not the
+	// predicate itself — dominated the query cost.
+	return buildRawExprFilter(colIndex, e)
+}
+
+// buildRawFilterSpecialized compiles the predicate forms with dedicated,
+// type-specialized closures (column/literal comparisons, LIKE with literal
+// pattern, IN lists, ...). Returns nil for anything else. AND/OR use this
+// distinction as a cost signal: a specialized side is cheap (a raw slice
+// access plus a comparison) and runs first, while an expression that only
+// evaluates through the evalRawExpr fallback (typically a function call
+// such as a vector distance) runs second, only on rows that survive.
+func buildRawFilterSpecialized(colIndex map[string]int, e Expr) func([]any) (bool, error) {
 	if e == nil {
 		return func([]any) (bool, error) { return true, nil }
 	}
@@ -3796,6 +3819,24 @@ func buildRawFilter(colIndex map[string]int, e Expr) func([]any) (bool, error) {
 		return buildRawFilterIn(colIndex, ex)
 	}
 	return nil
+}
+
+// buildRawExprFilter wraps an arbitrary raw-evaluable expression as a filter,
+// using the same truthiness conversion (toTri == tvTrue) as the AND/OR
+// fallback paths so three-valued logic matches the general evaluator.
+// Returns nil when the expression cannot run on raw rows.
+func buildRawExprFilter(colIndex map[string]int, e Expr) func([]any) (bool, error) {
+	if !isSimpleRawExpr(e) || exprHasRowAwareFuncCall(e) {
+		return nil
+	}
+	plan := &simpleSelectPlan{colIndex: colIndex}
+	return func(raw []any) (bool, error) {
+		v, err := evalRawExpr(plan, raw, e)
+		if err != nil {
+			return false, err
+		}
+		return toTri(v) == tvTrue, nil
+	}
 }
 
 func buildRawFilterVarRef(colIndex map[string]int, ex *VarRef) func([]any) (bool, error) {
