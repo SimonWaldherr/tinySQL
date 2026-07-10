@@ -37,7 +37,7 @@ tool has its own README with full documentation — click the links below.
 
 - server
   - HTTP JSON API and gRPC (JSON codec) server with optional federation across peers.
-  - Build: `go build ./cmd/server`
+  - Build: `cd cmd/server && go build .`
   - Run: `./server -http :8080 -grpc :9090 -dsn "mem://?tenant=default" -peers "host1:9090,host2:9090"`
   - Flags:
     - Core: `-dsn`, `-http <addr>`, `-grpc <addr>`, `-auth <token>`, `-peers <addr,...>`, `-tenant <name>`, `-v`
@@ -147,7 +147,7 @@ tool has its own README with full documentation — click the links below.
 
 - server/loadtest
   - Lightweight HTTP load generator for `cmd/server`.
-  - Build: `go build -o bin/tinysql-loadtest ./cmd/server/loadtest`
+  - Build: `cd cmd/server && go build -o ../../bin/tinysql-loadtest ./loadtest`
   - Run: `./bin/tinysql-loadtest -url http://127.0.0.1:8080/api/query -requests 10000 -concurrency 100`
 
 Notes:

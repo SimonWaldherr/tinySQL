@@ -5,7 +5,7 @@ Small built-in load generator for the `cmd/server` HTTP query endpoint.
 ## Build
 
 ```bash
-go build -o bin/tinysql-loadtest ./cmd/server/loadtest
+go build -o tinysql-loadtest .
 ```
 
 ## Run

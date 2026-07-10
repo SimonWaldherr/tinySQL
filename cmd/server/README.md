@@ -9,7 +9,8 @@ instances.
 ## Build
 
 ```bash
-go build -o server ./cmd/server
+cd cmd/server
+go build -o server .
 ```
 
 ## Quick start
@@ -148,7 +149,8 @@ Prometheus-compatible metrics endpoint.
 A built-in load generator lives in [`loadtest/`](loadtest/):
 
 ```bash
-go build -o bin/tinysql-loadtest ./cmd/server/loadtest
+cd cmd/server
+go build -o ../../bin/tinysql-loadtest ./loadtest
 
 ./bin/tinysql-loadtest \
   -url http://127.0.0.1:8080/api/query \
