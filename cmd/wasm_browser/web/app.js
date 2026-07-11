@@ -1,6 +1,7 @@
     // WASM Integration
     let wasmReady = false;
     let dbConnected = false;
+    let liveCatalogData = null;
 
     async function instantiateWasm(go) {
       // Prefer instantiateStreaming, but fall back to fetch+instantiate for Safari or wrong MIME
@@ -41,6 +42,7 @@
           if (result && result.success) {
             dbConnected = true;
             console.log('[Reference] dbConnected set to true');
+            await loadLiveCatalog();
           } else {
             console.error('[Reference] Database connection failed:', result);
           }
@@ -71,6 +73,19 @@
         tablePlaceholder: 'table name',
         explainPlaceholder: 'SELECT ...',
         tryButton: 'Try It Yourself',
+        generatedOverview: 'Automatically generated function overview',
+        example: 'example',
+        examples: 'examples',
+        liveCatalog: 'Live catalog',
+        catalogSource: 'Complete runtime inventory from catalog.functions and sys.procedures.',
+        functions: 'functions',
+        proceduresCount: 'stored procedures',
+        scalar: 'Scalar functions',
+        aggregate: 'Aggregate functions',
+        window: 'Window functions',
+        table: 'Table-valued functions',
+        procedures: 'Stored procedures',
+        procedureDescription: 'Process-local procedures registered in the active tinySQL runtime.',
         wasmNotReady: 'WASM not ready. Please reload the page.'
       },
       de: {
@@ -89,9 +104,27 @@
         tablePlaceholder: 'table name',
         explainPlaceholder: 'SELECT ...',
         tryButton: '▶ Try It Yourself',
+        generatedOverview: 'Automatisch erzeugte Funktionsübersicht',
+        example: 'Beispiel',
+        examples: 'Beispiele',
+        liveCatalog: 'Laufzeitkatalog',
+        catalogSource: 'Vollständige Laufzeit-Inventur aus catalog.functions und sys.procedures.',
+        functions: 'Funktionen',
+        proceduresCount: 'gespeicherte Prozeduren',
+        scalar: 'Skalare Funktionen',
+        aggregate: 'Aggregatfunktionen',
+        window: 'Window-Funktionen',
+        table: 'Tabellenfunktionen',
+        procedures: 'Gespeicherte Prozeduren',
+        procedureDescription: 'Prozesslokale Prozeduren, die in der aktiven tinySQL-Laufzeit registriert sind.',
         wasmNotReady: 'WASM nicht bereit. Bitte Seite neu laden.'
       }
     };
+
+    function generatedExampleLabel(section, count, lang) {
+      const map = i18n[lang] || i18n.de;
+      return `${section} (${count} ${count === 1 ? map.example : map.examples})`;
+    }
 
     function setLanguage(lang) {
       const map = i18n[lang] || i18n.de;
@@ -111,6 +144,15 @@
       document.getElementById('explainSql').placeholder = map.explainPlaceholder;
       // update try buttons
       document.querySelectorAll('.try-button').forEach(b => b.textContent = map.tryButton);
+      document.querySelectorAll('[data-generated-overview]').forEach(h => h.textContent = map.generatedOverview);
+      document.querySelectorAll('[data-example-count]').forEach(summary => {
+        summary.textContent = generatedExampleLabel(
+          summary.dataset.section,
+          Number(summary.dataset.exampleCount),
+          lang
+        );
+      });
+      if (liveCatalogData) renderLiveCatalog();
     }
 
     document.getElementById('langSelect').addEventListener('change', (e) => {
@@ -490,10 +532,12 @@
       const cards = document.querySelectorAll('.function-card');
 
       cards.forEach(card => {
-        const name = card.querySelector('.function-name').textContent.toLowerCase();
-        const desc = card.querySelector('.function-description').textContent.toLowerCase();
+        const name = card.querySelector('.function-name')?.textContent.toLowerCase() || '';
+        const desc = card.querySelector('.function-description')?.textContent.toLowerCase() || '';
+        const catalogNames = Array.from(card.querySelectorAll('.catalog-function-name'))
+          .some(item => item.textContent.toLowerCase().includes(query));
 
-        if (name.includes(query) || desc.includes(query)) {
+        if (name.includes(query) || desc.includes(query) || catalogNames) {
           card.style.display = 'block';
         } else {
           card.style.display = 'none';
@@ -535,6 +579,121 @@
     // Load generated examples (if the generator has produced `function_examples.json`)
     let generatedExamples = null;
 
+    function queryRowsAsObjects(result) {
+      const columns = Array.isArray(result.columns) ? result.columns : [];
+      const rows = Array.isArray(result.rows) ? result.rows : [];
+      return rows.map(row => Object.fromEntries(columns.map((column, index) => [
+        String(column).toLowerCase(), row[index]
+      ])));
+    }
+
+    function liveCatalogTitle(functionCount, procedureCount, lang) {
+      const map = i18n[lang] || i18n.de;
+      return `${map.liveCatalog}: ${functionCount} ${map.functions} · ${procedureCount} ${map.proceduresCount}`;
+    }
+
+    function catalogTypeLabel(type, lang) {
+      const map = i18n[lang] || i18n.de;
+      return map[String(type).toLowerCase()] || type;
+    }
+
+    function appendCatalogGroup(container, title, description, names) {
+      const details = document.createElement('details');
+      details.className = 'function-card catalog-group';
+      const summary = document.createElement('summary');
+      summary.className = 'function-name';
+      summary.textContent = `${title} (${names.length})`;
+      details.appendChild(summary);
+
+      const desc = document.createElement('p');
+      desc.className = 'function-description';
+      desc.textContent = description;
+      details.appendChild(desc);
+
+      if (names.length > 0) {
+        const list = document.createElement('ul');
+        list.className = 'catalog-function-list';
+        names.forEach(name => {
+          const item = document.createElement('li');
+          item.className = 'catalog-function-name';
+          item.textContent = name;
+          list.appendChild(item);
+        });
+        details.appendChild(list);
+      }
+      container.appendChild(details);
+    }
+
+    function renderLiveCatalog() {
+      if (!liveCatalogData) return;
+      const content = document.getElementById('content');
+      const lang = document.getElementById('langSelect').value;
+      const map = i18n[lang] || i18n.de;
+      const previous = document.getElementById('live-catalog');
+      if (previous) previous.remove();
+
+      const container = document.createElement('section');
+      container.id = 'live-catalog';
+      container.className = 'category';
+      const heading = document.createElement('h2');
+      heading.className = 'category-title';
+      heading.textContent = liveCatalogTitle(liveCatalogData.functions.length, liveCatalogData.procedures.length, lang);
+      container.appendChild(heading);
+      const source = document.createElement('p');
+      source.className = 'catalog-source';
+      source.textContent = map.catalogSource;
+      container.appendChild(source);
+
+      const byType = new Map();
+      liveCatalogData.functions.forEach(fn => {
+        const type = String(fn.function_type || 'SCALAR').toUpperCase();
+        if (!byType.has(type)) byType.set(type, []);
+        byType.get(type).push(String(fn.name));
+      });
+      const typeOrder = ['SCALAR', 'AGGREGATE', 'WINDOW', 'TABLE'];
+      const typeRank = type => {
+        const index = typeOrder.indexOf(type);
+        return index >= 0 ? index : typeOrder.length;
+      };
+      [...byType.keys()]
+        .sort((a, b) => typeRank(a) - typeRank(b) || a.localeCompare(b))
+        .forEach(type => {
+          const names = byType.get(type).sort((a, b) => a.localeCompare(b));
+          appendCatalogGroup(container, catalogTypeLabel(type, lang), `${type} · ${names.length}`, names);
+        });
+
+      appendCatalogGroup(
+        container,
+        map.procedures,
+        map.procedureDescription,
+        liveCatalogData.procedures.map(proc => String(proc.name)).sort((a, b) => a.localeCompare(b))
+      );
+
+      content.insertBefore(container, document.getElementById('generated-examples') || content.firstChild);
+      observer.observe(container);
+    }
+
+    async function loadLiveCatalog() {
+      try {
+        const [functionResponse, procedureResponse] = await Promise.all([
+          window.tinySQL.query('SELECT name, function_type FROM catalog.functions ORDER BY function_type, name'),
+          window.tinySQL.query('SELECT name FROM sys.procedures ORDER BY name')
+        ]);
+        const functionResult = typeof functionResponse === 'string' ? JSON.parse(functionResponse) : functionResponse;
+        const procedureResult = typeof procedureResponse === 'string' ? JSON.parse(procedureResponse) : procedureResponse;
+        if (functionResult.error) throw new Error(functionResult.error);
+        if (procedureResult.error) throw new Error(procedureResult.error);
+
+        liveCatalogData = {
+          functions: queryRowsAsObjects(functionResult),
+          procedures: queryRowsAsObjects(procedureResult)
+        };
+        renderLiveCatalog();
+      } catch (err) {
+        console.warn('[Reference] Live catalog unavailable', err);
+      }
+    }
+
     async function loadGeneratedExamples() {
       try {
         const res = await fetch('function_examples.json');
@@ -547,7 +706,8 @@
         container.className = 'category';
         const h = document.createElement('h2');
         h.className = 'category-title';
-        h.textContent = 'Generated Examples';
+        h.dataset.generatedOverview = 'true';
+        h.textContent = i18n[document.getElementById('langSelect').value].generatedOverview;
         container.appendChild(h);
 
         data.forEach(sec => {
@@ -556,7 +716,10 @@
           details.open = false;
           const summary = document.createElement('summary');
           summary.className = 'function-name';
-          summary.textContent = sec.section;
+          const count = Array.isArray(sec.examples) ? sec.examples.length : 0;
+          summary.dataset.section = sec.section;
+          summary.dataset.exampleCount = String(count);
+          summary.textContent = generatedExampleLabel(sec.section, count, document.getElementById('langSelect').value);
           details.appendChild(summary);
 
           if (Array.isArray(sec.examples)) {
@@ -590,8 +753,13 @@
         });
 
         const content = document.getElementById('content');
-        // Insert generated examples into the main content area to avoid layout overlap
-        content.prepend(container);
+        // Keep the live catalog first; the generated SQL examples follow it.
+        const liveCatalog = document.getElementById('live-catalog');
+        if (liveCatalog) {
+          content.insertBefore(container, liveCatalog.nextSibling);
+        } else {
+          content.prepend(container);
+        }
       } catch (err) {
         console.warn('[Reference] No generated examples available', err);
       }

@@ -8,23 +8,26 @@ package main
 // emit a JSON file consumed by the web reference.
 
 import (
-	"bufio"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
+
+	"github.com/SimonWaldherr/tinySQL/cmd/wasm_browser/internal/referencegen"
 )
 
-type SectionExamples struct {
-	Section  string   `json:"section"`
-	Examples []string `json:"examples"`
-}
-
 func main() {
-	root := filepath.Join("..", "..", "..") // repo root relative to cmd/wasm_browser
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to get working dir: %v\n", err)
+		os.Exit(2)
+	}
+	root, err := referencegen.FindRepoRoot(cwd)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to find repository root: %v\n", err)
+		os.Exit(2)
+	}
 	src := filepath.Join(root, "FUNCTIONS.sql")
-	outDir := filepath.Join("web")
+	outDir := filepath.Join(root, "cmd", "wasm_browser", "web")
 	outFile := filepath.Join(outDir, "function_examples.json")
 
 	f, err := os.Open(src)
@@ -34,83 +37,8 @@ func main() {
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	currentSection := "General"
-	var buffer []string
-	sections := make(map[string][]string)
-
-	isSectionHeader := func(line string) (string, bool) {
-		// Detect lines like: -- ============================================================
-		// or: -- WINDOW FUNCTIONS - FULLY IMPLEMENTED
-		s := strings.TrimSpace(line)
-		if !strings.HasPrefix(s, "--") {
-			return "", false
-		}
-		// remove leading '--'
-		s = strings.TrimSpace(strings.TrimPrefix(s, "--"))
-		if s == "" {
-			return "", false
-		}
-		// treat uppercase headings or lines containing 'EXAMPLE' as section headers
-		upper := strings.ToUpper(s)
-		if strings.Contains(upper, "EXAMPLE") || strings.Contains(upper, "FUNCTIONS") || upper == s {
-			// collapse repeated '=' lines into no-op
-			if strings.Count(s, "=") > 10 {
-				return "", false
-			}
-			return s, true
-		}
-		return "", false
-	}
-
-	pushBuffer := func() {
-		if len(buffer) == 0 {
-			return
-		}
-		// trim trailing blank lines
-		// join and trim
-		text := strings.TrimSpace(strings.Join(buffer, "\n"))
-		if text != "" {
-			sections[currentSection] = append(sections[currentSection], text)
-		}
-		buffer = buffer[:0]
-	}
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if sec, ok := isSectionHeader(line); ok {
-			// push any pending buffer to previous section
-			pushBuffer()
-			// set current section
-			currentSection = sec
-			continue
-		}
-
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "--") {
-			// skip comment-only lines
-			continue
-		}
-
-		if trimmed == "" {
-			// blank line -> end of block
-			pushBuffer()
-			continue
-		}
-
-		// add to buffer
-		buffer = append(buffer, line)
-	}
-	// push leftover
-	pushBuffer()
-
-	// convert to ordered slice
-	var out []SectionExamples
-	for name, ex := range sections {
-		out = append(out, SectionExamples{Section: name, Examples: ex})
-	}
-
-	if err := scanner.Err(); err != nil {
+	sections, err := referencegen.Generate(f)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "error reading file: %v\n", err)
 		os.Exit(2)
 	}
@@ -128,12 +56,10 @@ func main() {
 	}
 	defer of.Close()
 
-	enc := json.NewEncoder(of)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(out); err != nil {
+	if err := referencegen.Encode(of, sections); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to write json: %v\n", err)
 		os.Exit(2)
 	}
 
-	fmt.Printf("wrote %s with %d sections\n", outFile, len(out))
+	fmt.Printf("wrote %s with %d sections\n", outFile, len(sections))
 }

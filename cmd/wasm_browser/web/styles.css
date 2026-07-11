@@ -147,6 +147,32 @@ main {
   margin-bottom: 1rem;
 }
 
+.catalog-source {
+  color: var(--text-secondary);
+  margin: -0.75rem 0 1.5rem;
+}
+
+.catalog-group summary {
+  cursor: pointer;
+}
+
+.catalog-function-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: 0.5rem 1rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.catalog-function-name {
+  background: var(--code-bg);
+  border-radius: 4px;
+  font-family: 'Courier New', monospace;
+  font-size: 0.85rem;
+  padding: 0.35rem 0.5rem;
+}
+
 .examples-section {
   margin-top: 1.5rem;
 }
