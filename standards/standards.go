@@ -3,9 +3,7 @@
 package standards
 
 import (
-	"encoding/json"
 	"errors"
-	"net/http"
 	"strings"
 	"time"
 )
@@ -51,40 +49,6 @@ func FormatTime(t time.Time) string {
 // ParseTime parses API timestamps using RFC 3339.
 func ParseTime(value string) (time.Time, error) {
 	return time.Parse(time.RFC3339, strings.TrimSpace(value))
-}
-
-// Problem is an RFC 9457 Problem Details response. Error is a compatibility
-// extension for older tinySQL/dbweb clients that read JSON responses via
-// data.error.
-type Problem struct {
-	Type     string `json:"type"`
-	Title    string `json:"title"`
-	Status   int    `json:"status"`
-	Detail   string `json:"detail,omitempty"`
-	Instance string `json:"instance,omitempty"`
-	Error    string `json:"error,omitempty"`
-}
-
-// NewProblem creates a Problem with a stable default type URI.
-func NewProblem(status int, title, detail, instance string) Problem {
-	if title == "" {
-		title = http.StatusText(status)
-	}
-	return Problem{
-		Type:     "about:blank",
-		Title:    title,
-		Status:   status,
-		Detail:   detail,
-		Instance: instance,
-		Error:    detail,
-	}
-}
-
-// WriteProblem writes an RFC 9457 problem+json response.
-func WriteProblem(w http.ResponseWriter, problem Problem) {
-	w.Header().Set("Content-Type", MediaTypeProblemJSON)
-	w.WriteHeader(problem.Status)
-	_ = json.NewEncoder(w).Encode(problem)
 }
 
 // SQLStateError attaches a SQLSTATE code to an underlying error.

@@ -630,10 +630,10 @@ func sysStatusRows() []Row {
 		{"num_cpu", fmt.Sprintf("%d", runtime.NumCPU())},
 		{"max_procs", fmt.Sprintf("%d", runtime.GOMAXPROCS(0))},
 		{"pid", fmt.Sprintf("%d", os.Getpid())},
-		{"gc_runs", fmt.Sprintf("%d", mem.NumGC)},
 		{"heap_alloc_mb", fmt.Sprintf("%.2f", float64(mem.HeapAlloc)/1024/1024)},
 		{"sys_mb", fmt.Sprintf("%.2f", float64(mem.Sys)/1024/1024)},
 	}
+	kv = append(kv, runtimeStatusMemoryRows(mem)...)
 
 	rows := make([]Row, len(kv))
 	for i, pair := range kv {
@@ -665,14 +665,9 @@ func sysMemoryRows() []Row {
 		{"heap_inuse_bytes", fmt.Sprintf("%d", mem.HeapInuse)},
 		{"heap_released_bytes", fmt.Sprintf("%d", mem.HeapReleased)},
 		{"heap_objects", fmt.Sprintf("%d", mem.HeapObjects)},
-		{"stack_inuse_bytes", fmt.Sprintf("%d", mem.StackInuse)},
-		{"stack_sys_bytes", fmt.Sprintf("%d", mem.StackSys)},
-		{"gc_runs", fmt.Sprintf("%d", mem.NumGC)},
-		{"gc_pause_total_ns", fmt.Sprintf("%d", mem.PauseTotalNs)},
-		{"gc_pause_total_ms", fmt.Sprintf("%.2f", float64(mem.PauseTotalNs)/1e6)},
-		{"gc_cpu_fraction", fmt.Sprintf("%.6f", mem.GCCPUFraction)},
 		{"num_goroutine", fmt.Sprintf("%d", runtime.NumGoroutine())},
 	}
+	kv = append(kv, runtimeDetailedMemoryRows(mem)...)
 
 	rows := make([]Row, len(kv))
 	for i, pair := range kv {

@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
 	"os"
 	"path/filepath"
 	"sort"
@@ -29,8 +28,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 // safeGobRegister registers a type with encoding/gob but recovers from the
@@ -43,33 +40,13 @@ func safeGobRegister(v any) {
 		if r := recover(); r != nil {
 			// If the panic is the duplicate registration panic from gob,
 			// ignore it. Otherwise re-panic to avoid hiding real problems.
-			if errStr, ok := r.(string); ok {
-				if strings.Contains(errStr, "registering duplicate names") {
-					return
-				}
+			if strings.Contains(fmt.Sprint(r), "registering duplicate names") {
+				return
 			}
 			panic(r)
 		}
 	}()
 	gob.Register(v)
-}
-
-func init() {
-	// Register common storage types used in serialized snapshots. Use the
-	// safe register helper to avoid build-time panics when types are
-	// registered multiple times under different package paths.
-	safeGobRegister(diskTable{})
-	safeGobRegister(&diskTable{})
-	safeGobRegister(Table{})
-	safeGobRegister(&Table{})
-	// Register vector slice types for GOB serialization
-	safeGobRegister([]float64{})
-	safeGobRegister([]any{})
-
-	// Register big.Rat for decimal/money support and uuid.UUID for UUID columns
-	safeGobRegister(big.Rat{})
-	safeGobRegister(&big.Rat{})
-	safeGobRegister(uuid.UUID{})
 }
 
 // ColType enumerates supported column data types.

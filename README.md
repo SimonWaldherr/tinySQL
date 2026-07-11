@@ -81,6 +81,7 @@ Pick the guide that matches what you're building:
 |---|---|
 | [RAG / AI usage](./docs/rag-guide.md) | Retrieval-augmented generation: vector search, hybrid retrieval, reranking, context expansion, LLM agent integration |
 | [Developer integration](./docs/developer-integration.md) | Embedding TinySQL in Go, using the `database/sql` driver, running it as WASM in the browser or a custom frontend |
+| [TinyGo / embedded](./docs/tinygo-guide.md) | Running tinySQL in TinyGo WebAssembly and memory-rich embedded targets |
 | [Storage & persistence](./docs/storage-guide.md) | Storage modes, DSNs, connection strings, read-only serving |
 | [Command line tools](./docs/cli-guide.md) | Using the `cmd/tinysql` CLI, REPL, servers, file-query tools, and the browser playground |
 | [Development guide](./docs/development-guide.md) | Running tests, the Makefile, building the WASM demo |
