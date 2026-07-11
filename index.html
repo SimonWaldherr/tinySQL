@@ -2027,7 +2027,7 @@
         <nav class="topbar-nav" aria-label="Product navigation">
             <a href="#surfaces">Use cases</a>
             <a href="#rag">RAG</a>
-            <a href="#embedded">Embedded Go</a>
+            <a href="#embedded">Embedded &amp; TinyGo</a>
         </nav>
         <div class="spacer"></div>
         <a class="topbar-link" href="https://github.com/SimonWaldherr/tinySQL" target="_blank" rel="noreferrer">GitHub ↗</a>
@@ -2058,7 +2058,7 @@
                     </div>
                     <div class="hero-proof" aria-label="tinySQL highlights">
                         <span>Static WASM playground</span>
-                        <span>Embed directly in Go</span>
+                        <span>Go &amp; TinyGo targets</span>
                         <span>FTS, vectors &amp; RAG helpers</span>
                     </div>
                 </div>
@@ -2067,7 +2067,7 @@
                     <div class="core-node">tinySQL<small>parser · execution · storage · functions</small></div>
                     <div class="surface-map">
                         <div class="surface-node"><strong>Browser</strong><span>Static WASM, local files, shareable recipes.</span></div>
-                        <div class="surface-node"><strong>Embedded Go</strong><span>In-process SQL without a separate database service.</span></div>
+                        <div class="surface-node"><strong>Go &amp; TinyGo</strong><span>In-process SQL for services, WASM and embedded targets.</span></div>
                         <div class="surface-node"><strong>RAG retrieval</strong><span>Text, vectors, hybrid ranking and context expansion.</span></div>
                         <div class="surface-node"><strong>Tools &amp; services</strong><span>database/sql, ODBC, MCP and tinySQL server workflows.</span></div>
                     </div>
@@ -2087,9 +2087,9 @@
                     </article>
                     <article id="embedded" class="use-case">
                         <div class="use-case-icon">⌘</div>
-                        <h3>Embedded Go</h3>
-                        <p>Put an in-process SQL layer directly in a Go program for tests, tools, single-process apps and controlled deployments.</p>
-                        <a href="https://github.com/SimonWaldherr/tinySQL/blob/main/docs/developer-integration.md" target="_blank" rel="noreferrer">See the Go guide ↗</a>
+                        <h3>Embedded Go &amp; TinyGo</h3>
+                        <p>Run the same in-process SQL core in Go services, TinyGo WASM and memory-rich embedded targets—without a separate database service.</p>
+                        <a href="https://github.com/SimonWaldherr/tinySQL/blob/main/docs/tinygo-guide.md" target="_blank" rel="noreferrer">See the TinyGo guide ↗</a>
                     </article>
                     <article id="rag" class="use-case">
                         <div class="use-case-icon">✦</div>
@@ -2138,7 +2138,7 @@ SELECT * FROM RAG_CONTEXT_FROM(...);</pre>
                 </div>
                 <div class="hero-actions">
                     <button class="hero-button primary" onclick="launchRagDemo()">Try RAG in the studio</button>
-                    <a class="hero-button secondary" href="https://github.com/SimonWaldherr/tinySQL#quick-start" target="_blank" rel="noreferrer">Embed in Go ↗</a>
+                    <a class="hero-button secondary" href="https://github.com/SimonWaldherr/tinySQL/blob/main/docs/tinygo-guide.md" target="_blank" rel="noreferrer">Embed with TinyGo ↗</a>
                 </div>
             </section>
         </div>
