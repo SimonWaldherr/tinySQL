@@ -3,8 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>tinySQL — One local SQL core for browser, Go, and RAG</title>
-    <meta name="description" content="tinySQL is a pure-Go, local-first SQL engine for embedded applications, browser-delivered tools, file analytics, vector search, and RAG retrieval.">
+    <title>tinySQL — One local SQL core for browser, Go, embedded and AI-compatible apps</title>
+    <meta name="description" content="tinySQL is a pure-Go, local-first SQL engine for browser tools, Go applications, embedded devices, local file analytics, geodata, integrations and AI-compatible retrieval.">
     <link rel="stylesheet" href="https://simonwaldherr.github.io/vanillagrid.js/vanillagrid.css">
     <link rel="stylesheet" href="https://simonwaldherr.github.io/vanillagrid.js/vg-pivot-d3.css">
     <style>
@@ -2129,7 +2129,7 @@
         </a>
         <nav class="topbar-nav" aria-label="Product navigation">
             <a href="#surfaces">Use cases</a>
-            <a href="#rag">RAG</a>
+            <a href="#ai">AI compatible</a>
             <a href="#embedded">Embedded &amp; TinyGo</a>
             <a href="#compare">Compare</a>
         </nav>
@@ -2154,16 +2154,16 @@
                 <div>
                     <p class="eyebrow">Pure Go · Local-first · SQL without the ceremony</p>
                     <h1 id="landing-title">One SQL core.<br><em>Everywhere your data needs to run.</em></h1>
-                    <p class="hero-lede">tinySQL is a compact database engine for the places heavyweight infrastructure does not fit: inside Go services, in browser-delivered tools, and beside RAG pipelines that need retrieval they can actually inspect.</p>
+                    <p class="hero-lede">tinySQL is a compact database engine for the places heavyweight infrastructure does not fit: inside Go applications, browser-delivered tools, embedded devices and local data workflows. AI retrieval is one useful capability—not the whole product.</p>
                     <div class="hero-actions">
-                        <button id="launch-studio" class="hero-button primary" onclick="launchRagDemo()">Run a RAG workflow →</button>
-                        <button class="hero-button secondary" onclick="openStudio()">Open browser studio</button>
+                        <button id="launch-studio" class="hero-button primary" onclick="openStudio()">Try SQL in the browser →</button>
+                        <a class="hero-button secondary" href="#surfaces">Explore use cases</a>
                         <a class="hero-button secondary" href="https://github.com/SimonWaldherr/tinySQL" target="_blank" rel="noreferrer">Read the source ↗</a>
                     </div>
                     <div class="hero-proof" aria-label="tinySQL highlights">
-                        <span>Static WASM playground</span>
-                        <span>Go &amp; TinyGo targets</span>
-                        <span>FTS, vectors &amp; RAG helpers</span>
+                        <span>Browser, Go &amp; TinyGo</span>
+                        <span>Files, geodata &amp; SQL tools</span>
+                        <span>Optional FTS, vectors &amp; AI retrieval</span>
                     </div>
                     <p class="hero-origin"><strong>Built in Bavaria, Germany, Europe.</strong> tinySQL is open source and free software under the <a href="https://github.com/SimonWaldherr/tinySQL/blob/main/LICENSE" target="_blank" rel="noreferrer">AGPL-3.0 license</a>, so the engine stays inspectable, shareable and modifiable.</p>
                 </div>
@@ -2171,35 +2171,55 @@
                     <div class="engine-terminal-head">tinySQL / one core, many surfaces</div>
                     <div class="core-node">tinySQL<small>parser · execution · storage · functions</small></div>
                     <div class="surface-map">
-                        <div class="surface-node"><strong>Browser</strong><span>Static WASM, local files, shareable recipes.</span></div>
-                        <div class="surface-node"><strong>Go &amp; TinyGo</strong><span>In-process SQL for services, WASM and embedded targets.</span></div>
-                        <div class="surface-node"><strong>RAG retrieval</strong><span>Text, vectors, hybrid ranking and context expansion.</span></div>
-                        <div class="surface-node"><strong>Tools &amp; services</strong><span>database/sql, ODBC, MCP and tinySQL server workflows.</span></div>
+                        <div class="surface-node"><strong>Browser tools</strong><span>Static WASM, local files and shareable recipes.</span></div>
+                        <div class="surface-node"><strong>Go apps</strong><span>In-process SQL for services and utilities.</span></div>
+                        <div class="surface-node"><strong>Embedded &amp; edge</strong><span>TinyGo WASM and memory-rich devices.</span></div>
+                        <div class="surface-node"><strong>Local data work</strong><span>Files, JSON, CSV and geodata close to the app.</span></div>
+                        <div class="surface-node"><strong>AI compatible</strong><span>Optional text, vectors and transparent retrieval.</span></div>
+                        <div class="surface-node"><strong>Integrations</strong><span>database/sql, ODBC, MCP and server workflows.</span></div>
                     </div>
                 </aside>
             </section>
 
             <section id="surfaces" class="landing-section" aria-labelledby="surfaces-title">
-                <p class="section-label">Choose your surface</p>
-                <h2 id="surfaces-title" class="section-heading">Keep the same SQL engine when the product changes shape.</h2>
-                <p class="section-copy">Start with a browser demo, embed it in the service that owns the data, or use the retrieval primitives in an agent workflow. The core stays understandable and close to your application.</p>
+                <p class="section-label">Eight practical use cases</p>
+                <h2 id="surfaces-title" class="section-heading">One engine for the many ways local data shows up in a product.</h2>
+                <p class="section-copy">Start with a browser tool, embed SQL in a Go program, ship it to an edge device, or query files locally. The core stays understandable and close to the application that owns the data.</p>
                 <div class="use-case-grid">
                     <article class="use-case">
                         <div class="use-case-icon">⚡</div>
-                        <h3>Browser tools</h3>
+                        <h3>Browser &amp; local files</h3>
                         <p>Upload local files, query them in a static WASM app and share a reproducible demo without standing up a backend.</p>
                         <button onclick="openStudio()">Explore the studio →</button>
                     </article>
+                    <article class="use-case">
+                        <div class="use-case-icon">⌁</div>
+                        <h3>Go applications</h3>
+                        <p>Put SQL directly in a Go service, desktop utility or command-line application without introducing a separate database tier.</p>
+                        <a href="https://github.com/SimonWaldherr/tinySQL/blob/main/docs/developer-integration.md" target="_blank" rel="noreferrer">See Go integration ↗</a>
+                    </article>
                     <article id="embedded" class="use-case">
                         <div class="use-case-icon">⌘</div>
-                        <h3>Embedded Go &amp; TinyGo</h3>
+                        <h3>Embedded &amp; edge</h3>
                         <p>Run the same in-process SQL core in Go services, TinyGo WASM and memory-rich embedded targets—without a separate database service.</p>
                         <a href="https://github.com/SimonWaldherr/tinySQL/blob/main/docs/tinygo-guide.md" target="_blank" rel="noreferrer">See the TinyGo guide ↗</a>
                     </article>
-                    <article id="rag" class="use-case">
+                    <article class="use-case">
+                        <div class="use-case-icon">▤</div>
+                        <h3>Data utilities</h3>
+                        <p>Import, query and export common data formats for one-off analysis, repeatable data checks and lightweight internal tools.</p>
+                        <button onclick="openStudio()">Query your data →</button>
+                    </article>
+                    <article class="use-case">
+                        <div class="use-case-icon">◉</div>
+                        <h3>Geodata &amp; logistics</h3>
+                        <p>Bring local GeoJSON, KML, OSM and routing data into SQL when a product needs spatial filters and distance helpers.</p>
+                        <button onclick="openStudio()">Explore geodata tools →</button>
+                    </article>
+                    <article id="ai" class="use-case">
                         <div class="use-case-icon">✦</div>
-                        <h3>AI ready</h3>
-                        <p>Combine full-text search, vector similarity, hybrid scores and neighboring-context retrieval in ordinary SQL. Vector search and embeddings for use with RAG systems.</p>
+                        <h3>AI compatible</h3>
+                        <p>Optionally combine full-text search, vector similarity and hybrid scores in ordinary SQL. This also supports retrieval-augmented generation (RAG) workflows.</p>
                         <button onclick="launchRagDemo()">Run the retrieval recipe →</button>
                     </article>
                     <article class="use-case">
@@ -2208,21 +2228,26 @@
                         <p>Expose familiar interfaces where they help: database/sql, ODBC, MCP for agents and lightweight server tooling.</p>
                         <a href="https://github.com/SimonWaldherr/tinySQL/blob/main/docs/cli-guide.md" target="_blank" rel="noreferrer">See integration options ↗</a>
                     </article>
+                    <article class="use-case">
+                        <div class="use-case-icon">▸</div>
+                        <h3>CLI &amp; automation</h3>
+                        <p>Use the SQLite-like CLI, REPL and file-query tools when a script or an operator needs a local SQL workspace.</p>
+                        <a href="https://github.com/SimonWaldherr/tinySQL/blob/main/docs/cli-guide.md" target="_blank" rel="noreferrer">See command-line tools ↗</a>
+                    </article>
                 </div>
             </section>
 
             <section class="landing-section" aria-labelledby="proof-title">
                 <p class="section-label">A practical engine, not a black box</p>
-                <h2 id="proof-title" class="section-heading">From app data to agent context — without switching mental models.</h2>
+                <h2 id="proof-title" class="section-heading">SQL capabilities that stay useful as the product changes shape.</h2>
                 <div class="proof-grid">
                     <article class="proof-card">
-                        <h3>RAG primitives you can query and tune</h3>
-                        <p>Use SQL to make retrieval behavior visible: inspect full-text scores, vector similarity, ranks and the chunks that become context.</p>
-                        <pre>WITH topk AS (
-  SELECT doc_id, chunk_index
-  FROM VEC_SEARCH('chunks', 'embedding', ?, 5)
-)
-SELECT * FROM RAG_CONTEXT_FROM(...);</pre>
+                        <h3>Start with ordinary SQL</h3>
+                        <p>Use tables, joins, aggregates, JSON and window functions for application data, imported files and local analysis—then add search or vectors only when they help.</p>
+                        <pre>SELECT region, SUM(quantity * unit_price) AS revenue
+FROM sales
+GROUP BY region
+ORDER BY revenue DESC;</pre>
                     </article>
                     <article class="proof-card">
                         <h3>Small enough to live with your app</h3>
@@ -2230,6 +2255,7 @@ SELECT * FROM RAG_CONTEXT_FROM(...);</pre>
                             <li>Pure Go core for direct embedding and deterministic tests.</li>
                             <li>Local-first browser workflow for file analysis and demos.</li>
                             <li>SQL features from joins and windows to geodata, JSON, FTS and vectors.</li>
+                            <li>AI retrieval and RAG helpers are available when the application needs them.</li>
                             <li>System catalog views make the running database inspectable.</li>
                         </ul>
                     </article>
@@ -2328,10 +2354,10 @@ SELECT * FROM RAG_CONTEXT_FROM(...);</pre>
             <section class="landing-cta" aria-label="Start using tinySQL">
                 <div>
                     <h2>Start where the problem is.</h2>
-                    <p>Try a runnable retrieval workflow now, or take the same core into a Go service, a local tool or an agent-facing interface.</p>
+                    <p>Start in the browser, take the same core into a Go service, ship it to an embedded target, or use it in a local data tool.</p>
                 </div>
                 <div class="hero-actions">
-                    <button class="hero-button primary" onclick="launchRagDemo()">Try RAG in the studio</button>
+                    <button class="hero-button primary" onclick="openStudio()">Try SQL in the studio</button>
                     <a class="hero-button secondary" href="https://github.com/SimonWaldherr/tinySQL/blob/main/docs/tinygo-guide.md" target="_blank" rel="noreferrer">Embed with TinyGo ↗</a>
                 </div>
             </section>
