@@ -789,6 +789,87 @@
             position: absolute;
         }
 
+        .comparison-intro {
+            align-items: end;
+            display: flex;
+            gap: 32px;
+            justify-content: space-between;
+        }
+
+        .comparison-intro .section-copy {
+            margin-bottom: 4px;
+        }
+
+        .comparison-wrap {
+            border: 1px solid #35435a;
+            border-radius: 10px;
+            margin-top: 34px;
+            overflow-x: auto;
+        }
+
+        .comparison-table {
+            border-collapse: collapse;
+            min-width: 1380px;
+            width: 100%;
+        }
+
+        .comparison-table th,
+        .comparison-table td {
+            border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+            padding: 18px;
+            text-align: left;
+            vertical-align: top;
+        }
+
+        .comparison-table thead th {
+            background: #1b2739;
+            color: #f8fafc;
+            font-size: 14px;
+        }
+
+        .comparison-table thead th:first-child {
+            color: #9ca9ba;
+            font-size: 12px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            width: 12%;
+        }
+
+        .comparison-table tbody th {
+            background: rgba(24, 34, 50, 0.72);
+            color: #cbd5e1;
+            font-size: 13px;
+            font-weight: 700;
+        }
+
+        .comparison-table td {
+            color: #aebbd0;
+            font-size: 13px;
+            line-height: 1.55;
+            width: 12.57%;
+        }
+
+        .comparison-table .tiny-column {
+            background: rgba(30, 99, 142, 0.15);
+            color: #d8efff;
+        }
+
+        .comparison-table tbody tr:last-child th,
+        .comparison-table tbody tr:last-child td {
+            border-bottom: 0;
+        }
+
+        .comparison-note {
+            color: #8493a8;
+            font-size: 12px;
+            line-height: 1.55;
+            margin-top: 14px;
+        }
+
+        .comparison-note a {
+            color: #9cdcfe;
+        }
+
         .landing-cta {
             background: linear-gradient(120deg, #152b46, #22204b);
             border: 1px solid #46648b;
@@ -826,6 +907,12 @@
 
             .use-case-grid {
                 grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+
+            .comparison-intro {
+                align-items: start;
+                flex-direction: column;
+                gap: 0;
             }
         }
 
@@ -2028,6 +2115,7 @@
             <a href="#surfaces">Use cases</a>
             <a href="#rag">RAG</a>
             <a href="#embedded">Embedded &amp; TinyGo</a>
+            <a href="#compare">Compare</a>
         </nav>
         <div class="spacer"></div>
         <a class="topbar-link" href="https://github.com/SimonWaldherr/tinySQL" target="_blank" rel="noreferrer">GitHub ↗</a>
@@ -2129,6 +2217,95 @@ SELECT * FROM RAG_CONTEXT_FROM(...);</pre>
                         </ul>
                     </article>
                 </div>
+            </section>
+
+            <section id="compare" class="landing-section" aria-labelledby="compare-title">
+                <div class="comparison-intro">
+                    <div>
+                        <p class="section-label">Choose by shape, not hype</p>
+                        <h2 id="compare-title" class="section-heading">tinySQL fits best where the database should stay inside the product.</h2>
+                    </div>
+                    <p class="section-copy">This is a deployment-fit guide, not a benchmark. Pick tinySQL when an in-process Go or WASM engine is useful. Pick something else when the main job is operating a shared database service.</p>
+                </div>
+                <div class="comparison-wrap" role="region" aria-label="Database deployment fit comparison" tabindex="0">
+                    <table class="comparison-table">
+                        <thead>
+                            <tr>
+                                <th scope="col">Question</th>
+                                <th scope="col" class="tiny-column">tinySQL</th>
+                                <th scope="col">SQLite</th>
+                                <th scope="col">DuckDB</th>
+                                <th scope="col">PostgreSQL</th>
+                                <th scope="col">MariaDB</th>
+                                <th scope="col">MongoDB</th>
+                                <th scope="col">SQL Server / Oracle</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <th scope="row">Best fit</th>
+                                <td class="tiny-column">Go binaries, TinyGo targets and browser-local tools that need SQL, local indexing and inspectable retrieval close to the application.</td>
+                                <td>Mature embedded relational storage for local application data.</td>
+                                <td>Analytical and columnar workloads close to files and data pipelines.</td>
+                                <td>Shared, networked applications with a dedicated database service.</td>
+                                <td>MySQL-compatible server deployments, web stacks and operational SQL services.</td>
+                                <td>Document-oriented applications where flexible JSON-like records are the center of the model.</td>
+                                <td>Enterprise server deployments with large operational footprints, vendor tooling and organization-wide database operations.</td>
+                            </tr>
+                            <tr>
+                                <th scope="row">Operating shape</th>
+                                <td class="tiny-column">Single-process engine embedded into a Go program, an edge binary or a static WASM application.</td>
+                                <td>Embedded library inside the application.</td>
+                                <td>In-process analytical engine; browser WASM is also available.</td>
+                                <td>Client/server database operated as a separate service.</td>
+                                <td>Client/server relational database, often self-hosted or managed.</td>
+                                <td>Client/server document database with its own query model and operational layer.</td>
+                                <td>Commercial client/server platforms, commonly run as centralized services with administration and licensing overhead.</td>
+                            </tr>
+                            <tr>
+                                <th scope="row">Why pick it</th>
+                                <td class="tiny-column">One compact core for embedding, browser demos, FTS/vector-assisted retrieval and debuggable RAG context inspection without introducing a separate DB tier.</td>
+                                <td>Choose it when its ecosystem and proven embedded-storage model are the priority.</td>
+                                <td>Choose it when analytical throughput and columnar execution are the priority.</td>
+                                <td>Choose it when multi-user server operations and its ecosystem are the priority.</td>
+                                <td>Choose it when you want a familiar MySQL-family server with broad hosting and tooling support.</td>
+                                <td>Choose it when document flexibility and document-centric access patterns matter more than relational SQL shape.</td>
+                                <td>Choose them when centralized governance, vendor integrations, procurement requirements or enterprise operational standards are decisive.</td>
+                            </tr>
+                            <tr>
+                                <th scope="row">Do not force it</th>
+                                <td class="tiny-column">Not the right pitch for high-concurrency shared database infrastructure, large remote teams writing into one central service, or deployments that depend on established DBA workflows, clustering or vendor-specific ecosystems.</td>
+                                <td>Prefer a server engine when the application needs a shared database service.</td>
+                                <td>Prefer an OLTP-focused engine when transactional application storage is the main job.</td>
+                                <td>Prefer an embedded/local-first engine when a separate service is unnecessary.</td>
+                                <td>Prefer an embedded engine when shipping the database inside the app is the actual requirement.</td>
+                                <td>Prefer a relational engine when joins, SQL tooling and tabular consistency are the natural fit.</td>
+                                <td>Prefer a lighter embedded or open operational model when the product does not need heavyweight centralized database administration.</td>
+                            </tr>
+                            <tr>
+                                <th scope="row">RAG / local AI</th>
+                                <td class="tiny-column">Strong fit when you want retrieval to stay inside the app: local chunks, metadata, vectors, FTS and transparent SQL inspection in one place.</td>
+                                <td>Useful when local persistence matters, but retrieval features usually come from surrounding application code.</td>
+                                <td>Useful for offline analysis and experimentation over prepared datasets.</td>
+                                <td>Useful when retrieval runs as a shared backend service for many clients.</td>
+                                <td>Useful when the application already depends on a MySQL-style service layer.</td>
+                                <td>Useful when document-style storage dominates, but inspectable relational retrieval is not the primary goal.</td>
+                                <td>Useful when AI retrieval is only one workload inside a larger centralized enterprise platform.</td>
+                            </tr>
+                            <tr>
+                                <th scope="row">Embedded / edge</th>
+                                <td class="tiny-column">Primary strength: pure Go embedding, TinyGo portability work and browser-local execution without a separate database install.</td>
+                                <td>Primary strength for embedded relational storage with a long operational track record.</td>
+                                <td>Possible, but usually chosen for analytics rather than device- or app-level embedded storage.</td>
+                                <td>Usually excessive when the deployment target is a single device, binary or static app.</td>
+                                <td>Usually excessive when the goal is a self-contained local binary or firmware-adjacent deployment.</td>
+                                <td>Usually excessive when the goal is small-footprint local execution.</td>
+                                <td>Usually the wrong cost and operational shape for edge or embedded products.</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                <p class="comparison-note">Scope: product and deployment fit, not benchmarks. The cells deliberately describe typical operating shapes, not every feature of every edition. Verify details in the official documentation for <a href="https://www.sqlite.org/whentouse.html" target="_blank" rel="noreferrer">SQLite</a>, <a href="https://duckdb.org/docs/stable/why_duckdb.html" target="_blank" rel="noreferrer">DuckDB</a>, <a href="https://www.postgresql.org/about/" target="_blank" rel="noreferrer">PostgreSQL</a>, <a href="https://mariadb.com/kb/en/mariadb-overview/" target="_blank" rel="noreferrer">MariaDB</a>, <a href="https://www.mongodb.com/docs/" target="_blank" rel="noreferrer">MongoDB</a>, <a href="https://learn.microsoft.com/sql/sql-server/what-is-sql-server" target="_blank" rel="noreferrer">SQL Server</a> and <a href="https://www.oracle.com/database/" target="_blank" rel="noreferrer">Oracle Database</a>. Product names belong to their respective owners.</p>
             </section>
 
             <section class="landing-cta" aria-label="Start using tinySQL">
