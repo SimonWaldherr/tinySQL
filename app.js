@@ -819,6 +819,31 @@ function getShareableDemoURL(demoId) {
     return `${base}#${getShareableDemoHash(demoId)}`;
 }
 
+function openStudio({ focusEditor = true } = {}) {
+    document.body.classList.remove('landing-mode');
+    document.body.classList.add('studio-mode');
+    if (focusEditor) {
+        window.setTimeout(() => document.getElementById('queryEditor')?.focus(), 0);
+    }
+}
+
+function showLanding() {
+    document.body.classList.remove('studio-mode');
+    document.body.classList.add('landing-mode');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function launchRagDemo() {
+    openStudio({ focusEditor: false });
+    loadShareableDemo('ragcontext');
+}
+
+// Keep landing-page controls available to inline HTML actions as well as
+// shareable demo links.
+window.openStudio = openStudio;
+window.showLanding = showLanding;
+window.launchRagDemo = launchRagDemo;
+
 function loadShareableDemo(demoId) {
     const hash = getShareableDemoHash(demoId);
     if (window.location.hash === `#${hash}`) {
@@ -1064,6 +1089,7 @@ async function applyHashDemoPayload(payload) {
     if (!payload || applyingHashDemo || !wasmReady || typeof wasmApi.importFile !== 'function') {
         return false;
     }
+    openStudio({ focusEditor: false });
     applyingHashDemo = true;
     try {
         updateStatus(`Loading shared demo: ${payload.title || payload.id || 'tinySQL'}...`);
@@ -1153,6 +1179,9 @@ async function loadAllDemos() {
 
 // Load tables on startup
 document.addEventListener('DOMContentLoaded', () => {
+    if (decodeDemoHash()) {
+        openStudio({ focusEditor: false });
+    }
     setupDragDrop();
     renderHistory();
     setupEditorSyntaxHighlighting();
@@ -1161,6 +1190,11 @@ document.addEventListener('DOMContentLoaded', () => {
     setupAccessibilityShortcuts();
     setupSqlAutocomplete();
     renderIntroPage();
+    if (window.__tinySQLPendingDemo) {
+        const pendingDemo = window.__tinySQLPendingDemo;
+        delete window.__tinySQLPendingDemo;
+        loadShareableDemo(pendingDemo);
+    }
     initWasm();
     
     // Setup demo buttons
