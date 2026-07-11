@@ -1235,7 +1235,7 @@ function enhanceDemoQueries() {
             }
         });
     });
-    setDemoQueryGroup('all');
+    updateDemoQueryVisibility();
 }
 
 function inferDemoQueryGroup(text) {
@@ -1257,15 +1257,85 @@ function inferDemoQueryGroup(text) {
     return 'analytics';
 }
 
+const DEMO_QUERY_REQUIREMENTS = {
+    '🚀 Recent Features': 'release_features',
+    '📊 Sales by Region': 'sales',
+    '🏆 Top Products': 'sales',
+    '🚚 Carrier Analysis': 'logistics',
+    '🔗 JOIN Example': 'sales logistics',
+    '💰 CASE Statement': 'sales',
+    '⏳ Pending Shipments': 'logistics',
+    '📈 Window Function': 'sales',
+    '🧮 SQL PIVOT': 'sales',
+    '🧱 Views + RETURNING': 'sales',
+    '🔍 EXPLAIN': 'sales logistics',
+    '🧾 PRAGMA table_info': 'sales',
+    '🧮 Large Sales Cube': 'sales_large',
+    '🚛 Large Logistics': 'logistics_large',
+    '🌐 Event Trends': 'web_events_large',
+    '🗺️ GeoJSON Distance': 'places_geo',
+    '📍 Bounding Box': 'places_geo',
+    '🧭 Routing Graph': 'routes_rg',
+    '📌 Nearby Nodes': 'routes_rg_nodes',
+    '🧱 Geo Zones': 'places_geo geo_zones',
+    '📏 Distance Matrix': 'places_geo',
+    '🛣️ Route Geometry': 'routes_rg routes_rg_nodes',
+    '🎯 Munich Radius': 'places_geo',
+    '⚙️ YAML Import': 'settings_yaml',
+    '🔎 FTS Search': 'ai_docs',
+    '🧠 Vector Search': 'ai_docs',
+    '🧩 Hybrid Retrieval': 'ai_docs',
+    '🔗 RAG Context': 'rag_chunks',
+    '✂️ FTS Snippet': 'ai_docs',
+};
+
+function demoQueryRequirements(item) {
+    if (item.dataset.requires) {
+        return item.dataset.requires;
+    }
+    return DEMO_QUERY_REQUIREMENTS[String(item.textContent || '').trim()] || '';
+}
+
 function setDemoQueryGroup(group) {
-    const selectedGroup = group || 'all';
+    let selectedGroup = group || 'all';
+    const availableItems = [...document.querySelectorAll('.example-query:not(.demo-query-unavailable)')];
+    if (selectedGroup !== 'all' && !availableItems.some((item) => item.dataset.demoGroup === selectedGroup)) {
+        selectedGroup = 'all';
+    }
     document.querySelectorAll('.demo-filter button').forEach((button) => {
         button.classList.toggle('active', button.dataset.demoFilter === selectedGroup);
+        const hasMatchingQuery = selectedGroup === 'all' || availableItems.some((item) => item.dataset.demoGroup === button.dataset.demoFilter);
+        button.classList.toggle('hidden', button.dataset.demoFilter !== 'all' && !hasMatchingQuery);
     });
     document.querySelectorAll('.example-query').forEach((item) => {
-        const matches = selectedGroup === 'all' || item.dataset.demoGroup === selectedGroup;
+        const matches = !item.classList.contains('demo-query-unavailable') &&
+            (selectedGroup === 'all' || item.dataset.demoGroup === selectedGroup);
         item.classList.toggle('hidden', !matches);
     });
+}
+
+function updateDemoQueryVisibility() {
+    const loadedTables = new Set(currentTables.map((table) => String(table.name).toLowerCase()));
+    let availableCount = 0;
+
+    document.querySelectorAll('.example-query').forEach((item) => {
+        const requiredTables = demoQueryRequirements(item)
+            .split(/\s+/)
+            .map((name) => name.trim().toLowerCase())
+            .filter(Boolean);
+        const canRun = requiredTables.every((name) => loadedTables.has(name));
+        item.classList.toggle('demo-query-unavailable', !canRun);
+        if (canRun) {
+            availableCount++;
+        }
+    });
+
+    const demos = document.getElementById('demoQueries');
+    if (demos) {
+        demos.classList.toggle('hidden', availableCount === 0);
+    }
+    const activeFilter = document.querySelector('.demo-filter button.active')?.dataset.demoFilter || 'all';
+    setDemoQueryGroup(activeFilter);
 }
 
 function setupAccessibilityShortcuts() {
@@ -1837,9 +1907,8 @@ function registerClientTable(tableName, rows) {
 }
 
 function showDemoQueries() {
-    const dq = document.getElementById('demoQueries');
-    if (dq) dq.classList.remove('hidden');
     enhanceDemoQueries();
+    updateDemoQueryVisibility();
 }
 
 // Render tables in sidebar
@@ -1848,6 +1917,7 @@ function renderTables() {
     const virtuals = window._virtualTables || [];
     const hasAny = currentTables.length > 0 || virtuals.length > 0;
 
+    updateDemoQueryVisibility();
     if (!hasAny) {
         tableList.innerHTML = `
             <div class="empty-state">
