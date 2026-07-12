@@ -53,6 +53,25 @@ func TestExportJSON(t *testing.T) {
 	}
 }
 
+func TestExportNDJSON(t *testing.T) {
+	var buf bytes.Buffer
+	if err := ExportNDJSON(&buf, makeSample(), Options{}); err != nil {
+		t.Fatalf("ExportNDJSON failed: %v", err)
+	}
+	dec := json.NewDecoder(&buf)
+	count := 0
+	for dec.More() {
+		var row map[string]any
+		if err := dec.Decode(&row); err != nil {
+			t.Fatalf("decode NDJSON row: %v", err)
+		}
+		count++
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 NDJSON rows, got %d", count)
+	}
+}
+
 func TestExportSQL(t *testing.T) {
 	rs := &engine.ResultSet{
 		Cols: []string{"id", "name", "created_at", "payload"},

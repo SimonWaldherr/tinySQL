@@ -30,6 +30,11 @@ func ExportJSON(w io.Writer, rs *tinysql.ResultSet, opts Options) error {
 	return ie.ExportJSON(w, rs, opts)
 }
 
+// ExportNDJSON streams one JSON object per ResultSet row to w.
+func ExportNDJSON(w io.Writer, rs *tinysql.ResultSet, opts Options) error {
+	return ie.ExportNDJSON(w, rs, opts)
+}
+
 // ExportSQL writes ResultSet rows as INSERT statements for tableName.
 func ExportSQL(w io.Writer, rs *tinysql.ResultSet, tableName string) error {
 	return ie.ExportSQL(w, rs, tableName)

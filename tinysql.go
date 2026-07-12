@@ -108,7 +108,13 @@ type ResultSet = engine.ResultSet
 // VectorCacheConfig configures the optional process-wide VEC_SEARCH result
 // cache and its opt-in analytics ring buffer.
 type VectorCacheConfig = engine.VectorCacheConfig
+
+// VectorCacheStats reports bounded result-cache state and, when enabled, the
+// recent query window. It is a snapshot and safe to serialize for monitoring.
 type VectorCacheStats = engine.VectorCacheStats
+
+// VectorQueryEvent describes one recent VEC_SEARCH shape without exposing its
+// raw vector contents.
 type VectorQueryEvent = engine.VectorQueryEvent
 
 // ConfigureVectorCache replaces the process-wide VEC_SEARCH result-cache and
@@ -738,6 +744,20 @@ func Execute(ctx context.Context, db *DB, tenant string, stmt Statement) (*Resul
 	return engine.Execute(ctx, db, tenant, stmt)
 }
 
+// ExecSQL parses and executes exactly one SQL statement. It is the concise
+// public entry point for dynamic SQL, scripts with one statement per call, and
+// small embedded applications. For repeated SQL, prefer Compile or database/sql
+// prepared statements so parsing and planning can be reused.
+//
+// The tenant is required; use "default" for single-tenant applications.
+func ExecSQL(ctx context.Context, db *DB, tenant, sql string) (*ResultSet, error) {
+	stmt, err := ParseSQL(sql)
+	if err != nil {
+		return nil, err
+	}
+	return Execute(ctx, db, tenant, stmt)
+}
+
 // WithUser returns a context carrying the acting username for RBAC
 // permission checks (see CREATE USER/CREATE ROLE/GRANT below). Pass the
 // result to Execute/ExecuteCompiled in place of a plain context.
@@ -893,6 +913,12 @@ func SaveToFile(db *DB, filename string) error {
 	return storage.SaveToFile(db, filename)
 }
 
+// SaveToWriter serializes a consistent database snapshot to w. It is useful
+// for embedded targets, HTTP responses, and callers that own their storage.
+func SaveToWriter(db *DB, w io.Writer) error {
+	return storage.SaveToWriter(db, w)
+}
+
 // LoadFromFile deserializes a database from a GOB file created by SaveToFile.
 //
 // This restores all tables, rows, and metadata from the file. The returned
@@ -909,6 +935,12 @@ func SaveToFile(db *DB, filename string) error {
 // Returns a new DB instance or an error if the file cannot be read.
 func LoadFromFile(filename string) (*DB, error) {
 	return storage.LoadFromFile(filename)
+}
+
+// LoadFromReader restores a database snapshot from r without requiring a
+// temporary file. Callers should bound untrusted input before passing it here.
+func LoadFromReader(r io.Reader) (*DB, error) {
+	return storage.LoadFromReader(r)
 }
 
 // SaveToBytes serializes the entire database to an in-memory GOB snapshot.
@@ -1127,11 +1159,13 @@ func ImportKML(ctx context.Context, db *DB, tenant, tableName string, src io.Rea
 }
 
 // ImportShapefile imports an ESRI Shapefile path and its sidecar DBF attributes.
+// It requires a build with -tags=shapefile.
 func ImportShapefile(ctx context.Context, db *DB, tenant, tableName, filePath string, opts *ImportOptions) (*ImportResult, error) {
 	return importer.ImportShapefile(ctx, db, tenant, tableName, filePath, opts)
 }
 
 // ImportShapefileZip imports a ZIP archive containing Shapefile sidecar files from a reader.
+// It requires a build with -tags=shapefile.
 func ImportShapefileZip(ctx context.Context, db *DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
 	return importer.ImportShapefileZip(ctx, db, tenant, tableName, src, opts)
 }
@@ -1141,12 +1175,15 @@ func ImportOSM(ctx context.Context, db *DB, tenant, tableName string, src io.Rea
 	return importer.ImportOSM(ctx, db, tenant, tableName, src, opts)
 }
 
-// ImportMBTiles imports tiles from an MBTiles SQLite database path.
+// ImportMBTiles imports tiles from an MBTiles SQLite database path. It requires
+// a build with -tags=sqliteimport; SQLite remains the recommended production
+// backend for standard MBTiles serving.
 func ImportMBTiles(ctx context.Context, db *DB, tenant, tableName, filePath string, opts *ImportOptions) (*ImportResult, error) {
 	return importer.ImportMBTiles(ctx, db, tenant, tableName, filePath, opts)
 }
 
-// ImportMBTilesReader imports MBTiles from a reader by spooling to a temporary SQLite file.
+// ImportMBTilesReader imports MBTiles from a reader by spooling to a temporary
+// SQLite file. It requires a build with -tags=sqliteimport.
 func ImportMBTilesReader(ctx context.Context, db *DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
 	return importer.ImportMBTilesReader(ctx, db, tenant, tableName, src, opts)
 }

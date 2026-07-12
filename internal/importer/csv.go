@@ -51,6 +51,16 @@ import (
 
 // ImportOptions configures the importer behavior. All fields are optional.
 type ImportOptions struct {
+	// MaxInputBytes rejects input that exceeds this size. Zero leaves the source
+	// unbounded, which preserves the historic library behavior. Set this for
+	// network and user-supplied input. For gzip CSV, the limit applies after
+	// decompression.
+	MaxInputBytes int64
+
+	// MaxRecordBytes caps an individual NDJSON record. Zero uses the scanner's
+	// standard limit. CSV records remain governed by encoding/csv.
+	MaxRecordBytes int
+
 	// Encoding selects the source text encoding. Empty or "auto" accepts a
 	// UTF BOM when present and otherwise requires UTF-8. Legacy single-byte
 	// encodings are opt-in: iso-8859-1, iso-8859-2, iso-8859-15, and
@@ -163,7 +173,7 @@ func ImportCSV(
 	result := &ImportResult{Errors: make([]string, 0)}
 
 	// Prepare reader and detect encoding
-	rr, enc, _, err := prepareReader(src, opts)
+	rr, enc, _, err := prepareReader(ctx, src, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -241,8 +251,8 @@ func ImportCSV(
 
 // prepareReader handles gzip detection and encoding normalization, returning an
 // io.Reader ready for CSV parsing plus encoding metadata.
-func prepareReader(src io.Reader, opts *ImportOptions) (io.Reader, string, bool, error) {
-	r := maybeGzip(src)
+func prepareReader(ctx context.Context, src io.Reader, opts *ImportOptions) (io.Reader, string, bool, error) {
+	r := limitInput(ctx, maybeGzip(contextReader{ctx: ctx, r: src}), opts)
 	br := bufio.NewReader(r)
 	sampleBytes, _ := br.Peek(maxInt(opts.SampleBytes, 16))
 	enc, hasBOM := detectEncoding(sampleBytes)

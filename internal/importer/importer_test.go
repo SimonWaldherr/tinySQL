@@ -7,6 +7,7 @@ package importer
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"testing"
@@ -470,5 +471,24 @@ func TestImportJSON_NDJSON(t *testing.T) {
 	tbl, _ := db.Get("default", "ndjson")
 	if len(tbl.Rows) != 3 {
 		t.Fatalf("expected 3 rows in table, got %d", len(tbl.Rows))
+	}
+}
+
+func TestImportJSONRejectsOversizedInput(t *testing.T) {
+	db := storage.NewDB()
+	_, err := ImportJSON(context.Background(), db, "default", "limited",
+		strings.NewReader(`[{"name":"Ada"}]`), &ImportOptions{MaxInputBytes: 8})
+	if !errors.Is(err, ErrInputTooLarge) {
+		t.Fatalf("ImportJSON error = %v, want ErrInputTooLarge", err)
+	}
+}
+
+func TestImportJSONHonorsCancelledContext(t *testing.T) {
+	db := storage.NewDB()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := ImportJSON(ctx, db, "default", "cancelled", strings.NewReader(`[{"name":"Ada"}]`), nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ImportJSON error = %v, want context.Canceled", err)
 	}
 }

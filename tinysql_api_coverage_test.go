@@ -1,6 +1,7 @@
 package tinysql_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -44,6 +45,39 @@ func TestPublicSQLStateHelpers(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), tsql.SQLStateSyntaxError) {
 		t.Fatalf("expected SQLSTATE in error text, got %q", err.Error())
+	}
+}
+
+func TestPublicExecSQL(t *testing.T) {
+	db := tsql.NewDB()
+	ctx := context.Background()
+	if _, err := tsql.ExecSQL(ctx, db, "default", `CREATE TABLE exec_sql_users (id INTEGER, name TEXT)`); err != nil {
+		t.Fatalf("CREATE via ExecSQL: %v", err)
+	}
+	if _, err := tsql.ExecSQL(ctx, db, "default", `INSERT INTO exec_sql_users VALUES (1, 'Ada')`); err != nil {
+		t.Fatalf("INSERT via ExecSQL: %v", err)
+	}
+	rs, err := tsql.ExecSQL(ctx, db, "default", `SELECT name FROM exec_sql_users`)
+	if err != nil || len(rs.Rows) != 1 || rs.Rows[0]["name"] != "Ada" {
+		t.Fatalf("SELECT via ExecSQL: rows=%#v err=%v", rs, err)
+	}
+}
+
+func TestPublicReaderWriterPersistence(t *testing.T) {
+	db := tsql.NewDB()
+	if _, err := tsql.ExecSQL(context.Background(), db, "default", `CREATE TABLE snapshots (id INTEGER)`); err != nil {
+		t.Fatalf("create snapshot table: %v", err)
+	}
+	var snapshot bytes.Buffer
+	if err := tsql.SaveToWriter(db, &snapshot); err != nil {
+		t.Fatalf("SaveToWriter: %v", err)
+	}
+	restored, err := tsql.LoadFromReader(&snapshot)
+	if err != nil {
+		t.Fatalf("LoadFromReader: %v", err)
+	}
+	if _, err := tsql.ExecSQL(context.Background(), restored, "default", `SELECT * FROM snapshots`); err != nil {
+		t.Fatalf("query restored snapshot: %v", err)
 	}
 }
 

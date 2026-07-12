@@ -190,6 +190,7 @@ func ImportYAML(
 		opts = &ImportOptions{}
 	}
 	applyDefaults(opts)
+	src = limitInput(ctx, src, opts)
 
 	all, err := io.ReadAll(src)
 	if err != nil {
@@ -340,9 +341,16 @@ func decodeJSONArray(br *bufio.Reader, result *ImportResult) ([]map[string]any, 
 }
 
 // decodeNDJSON decodes newline-delimited JSON from a reader
-func decodeNDJSON(br *bufio.Reader, result *ImportResult) ([]map[string]any, error) {
+func decodeNDJSON(br *bufio.Reader, result *ImportResult, maxRecordBytes int) ([]map[string]any, error) {
 	records := []map[string]any{}
 	scanner := bufio.NewScanner(br)
+	if maxRecordBytes > 0 {
+		initialBuffer := maxRecordBytes
+		if initialBuffer > 64*1024 {
+			initialBuffer = 64 * 1024
+		}
+		scanner.Buffer(make([]byte, initialBuffer), maxRecordBytes)
+	}
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -362,7 +370,7 @@ func decodeNDJSON(br *bufio.Reader, result *ImportResult) ([]map[string]any, err
 }
 
 // extractJSONRecords extracts records from JSON input (array or NDJSON)
-func extractJSONRecords(src io.Reader, result *ImportResult) ([]map[string]any, error) {
+func extractJSONRecords(src io.Reader, result *ImportResult, maxRecordBytes int) ([]map[string]any, error) {
 	br := bufio.NewReader(src)
 	peek, _ := br.Peek(512)
 	trimmed := strings.TrimSpace(string(peek))
@@ -371,7 +379,7 @@ func extractJSONRecords(src io.Reader, result *ImportResult) ([]map[string]any, 
 		return decodeJSONArray(br, result)
 	}
 	if strings.HasPrefix(trimmed, "{") {
-		return decodeNDJSON(br, result)
+		return decodeNDJSON(br, result, maxRecordBytes)
 	}
 	return nil, fmt.Errorf("unsupported JSON format")
 }
@@ -403,6 +411,7 @@ func ImportJSON(
 		opts = &ImportOptions{}
 	}
 	applyDefaults(opts)
+	src = limitInput(ctx, src, opts)
 
 	result := &ImportResult{
 		Encoding: "utf-8",
@@ -410,7 +419,7 @@ func ImportJSON(
 	}
 
 	// Extract records from JSON
-	records, err := extractJSONRecords(src, result)
+	records, err := extractJSONRecords(src, result, opts.MaxRecordBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -463,6 +472,9 @@ func ImportJSON(
 	}
 
 	for i, rec := range records {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		row := make([]any, len(colNames))
 		for j, col := range colNames {
 			if val, ok := rec[col]; ok {
@@ -522,6 +534,7 @@ func ImportXML(
 		opts = &ImportOptions{}
 	}
 	applyDefaults(opts)
+	src = limitInput(ctx, src, opts)
 
 	result := &ImportResult{
 		Encoding: "utf-8",

@@ -219,6 +219,23 @@ func ExportJSON(w io.Writer, rs *engine.ResultSet, opts Options) error {
 	return enc.Encode(out)
 }
 
+// ExportNDJSON writes one JSON object per ResultSet row. Unlike ExportJSON it
+// does not materialize a result-sized array, so it is suitable for pipes and
+// large exports. Each line is independently valid JSON.
+func ExportNDJSON(w io.Writer, rs *engine.ResultSet, opts Options) error {
+	enc := json.NewEncoder(w)
+	for _, r := range rs.Rows {
+		m := make(map[string]any, len(rs.Cols))
+		for _, c := range rs.Cols {
+			m[c] = jsonValue(r[strings.ToLower(c)], opts)
+		}
+		if err := enc.Encode(m); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func jsonValue(v any, opts Options) any {
 	b, ok := v.([]byte)
 	if !ok || strings.EqualFold(opts.JSONBinaryMode, "legacy-string") {
