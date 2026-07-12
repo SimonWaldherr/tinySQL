@@ -21,6 +21,7 @@ type daemonConfig struct {
 	RequestTimeout time.Duration
 	MaxBodyBytes   int64
 	MaxSQLBytes    int
+	Analytics      bool
 }
 
 type daemon struct {
@@ -30,6 +31,7 @@ type daemon struct {
 	requestTimeout time.Duration
 	maxBodyBytes   int64
 	maxSQLBytes    int
+	analytics      bool
 	startedAt      time.Time
 	ready          atomic.Bool
 }
@@ -89,6 +91,7 @@ func newDaemon(inst *tinysql.Instance, cfg daemonConfig) *daemon {
 		requestTimeout: cfg.RequestTimeout,
 		maxBodyBytes:   maxBodyBytes,
 		maxSQLBytes:    maxSQLBytes,
+		analytics:      cfg.Analytics,
 		startedAt:      time.Now(),
 	}
 	d.ready.Store(true)
@@ -100,6 +103,7 @@ func (d *daemon) routes() http.Handler {
 	mux.HandleFunc("/healthz", d.handleHealth)
 	mux.HandleFunc("/readyz", d.handleReady)
 	mux.HandleFunc("/api/status", d.requireAuth(d.handleStatus))
+	mux.HandleFunc("/api/analytics/vector", d.requireAuth(d.handleVectorAnalytics))
 	mux.HandleFunc("/api/exec", d.requireAuth(d.handleExec))
 	mux.HandleFunc("/api/query", d.requireAuth(d.handleQuery))
 	mux.HandleFunc("/api/catalog/tables", d.requireAuth(d.handleCatalogTables))
@@ -108,6 +112,18 @@ func (d *daemon) routes() http.Handler {
 	mux.HandleFunc("/api/job-history", d.requireAuth(d.handleJobHistory))
 	mux.HandleFunc("/api/jobs/run", d.requireAuth(d.handleRunJob))
 	return mux
+}
+
+func (d *daemon) handleVectorAnalytics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErrorJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !d.analytics {
+		writeErrorJSON(w, http.StatusNotFound, "analytics disabled")
+		return
+	}
+	writeJSON(w, http.StatusOK, tinysql.VectorCacheAnalytics())
 }
 
 func (d *daemon) handleHealth(w http.ResponseWriter, r *http.Request) {

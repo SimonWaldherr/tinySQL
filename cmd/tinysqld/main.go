@@ -17,18 +17,22 @@ import (
 
 func main() {
 	var (
-		dataPath    = flag.String("data", "", "Durable database path or directory")
-		storageMode = flag.String("storage", "disk", "Storage mode: disk, hybrid, index, wal, advanced_wal")
-		tenant      = flag.String("tenant", "default", "Default tenant")
-		httpAddr    = flag.String("http", "127.0.0.1:8088", "HTTP listen address; empty disables HTTP")
-		authToken   = flag.String("auth", "", "Optional bearer token for API endpoints")
-		reqTimeout  = flag.Duration("request-timeout", 30*time.Second, "Maximum SQL request duration")
-		readTimeout = flag.Duration("http-read-timeout", 10*time.Second, "HTTP read timeout")
-		writeTO     = flag.Duration("http-write-timeout", 30*time.Second, "HTTP write timeout")
-		shutdownTO  = flag.Duration("shutdown-timeout", 10*time.Second, "Graceful shutdown timeout")
-		check       = flag.Bool("check", false, "Open the DBMS runtime, print status, then exit")
+		dataPath     = flag.String("data", "", "Durable database path or directory")
+		storageMode  = flag.String("storage", "disk", "Storage mode: disk, hybrid, index, wal, advanced_wal")
+		tenant       = flag.String("tenant", "default", "Default tenant")
+		httpAddr     = flag.String("http", "127.0.0.1:8088", "HTTP listen address; empty disables HTTP")
+		authToken    = flag.String("auth", "", "Optional bearer token for API endpoints")
+		reqTimeout   = flag.Duration("request-timeout", 30*time.Second, "Maximum SQL request duration")
+		readTimeout  = flag.Duration("http-read-timeout", 10*time.Second, "HTTP read timeout")
+		writeTO      = flag.Duration("http-write-timeout", 30*time.Second, "HTTP write timeout")
+		shutdownTO   = flag.Duration("shutdown-timeout", 10*time.Second, "Graceful shutdown timeout")
+		analytics    = flag.Bool("analytics", false, "Enable vector-cache analytics endpoint and event window")
+		cacheEntries = flag.Int("vector-cache-entries", 0, "VEC_SEARCH result-cache entries (0 disables)")
+		cacheTTL     = flag.Duration("vector-cache-ttl", 0, "VEC_SEARCH result-cache TTL (0 disables)")
+		check        = flag.Bool("check", false, "Open the DBMS runtime, print status, then exit")
 	)
 	flag.Parse()
+	tinysql.ConfigureVectorCache(tinysql.VectorCacheConfig{ResultCacheEntries: *cacheEntries, ResultCacheTTL: *cacheTTL, Analytics: *analytics})
 
 	mode, err := tinysql.ParseStorageMode(*storageMode)
 	if err != nil {
@@ -59,6 +63,7 @@ func main() {
 		DefaultTenant:  *tenant,
 		AuthToken:      *authToken,
 		RequestTimeout: *reqTimeout,
+		Analytics:      *analytics,
 	})
 	var httpSrv *http.Server
 	if *httpAddr != "" {

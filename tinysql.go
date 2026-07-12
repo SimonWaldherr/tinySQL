@@ -105,6 +105,15 @@ type Row = engine.Row
 // Returned by SELECT queries and available for inspection.
 type ResultSet = engine.ResultSet
 
+// VectorCacheConfig configures the optional process-wide VEC_SEARCH result
+// cache and its opt-in analytics ring buffer.
+type VectorCacheConfig = engine.VectorCacheConfig
+type VectorCacheStats = engine.VectorCacheStats
+type VectorQueryEvent = engine.VectorQueryEvent
+
+func ConfigureVectorCache(cfg VectorCacheConfig) { engine.ConfigureVectorCache(cfg) }
+func VectorCacheAnalytics() VectorCacheStats     { return engine.VectorCacheAnalytics() }
+
 // ProcedureContext is passed to in-memory stored procedures registered with
 // RegisterStoredProcedure. It can execute nested SQL within the same CALL.
 type ProcedureContext = engine.ProcedureContext

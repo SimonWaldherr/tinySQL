@@ -51,6 +51,23 @@ func TestDaemonHealthReadyStatus(t *testing.T) {
 	}
 }
 
+func TestVectorAnalyticsEndpointIsOptIn(t *testing.T) {
+	d := newTestDaemon(t)
+	h := d.routes()
+	req := httptest.NewRequest(http.MethodGet, "/api/analytics/vector", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("disabled analytics status = %d", rec.Code)
+	}
+	d.analytics = true
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("enabled analytics status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestDaemonExecAndQuery(t *testing.T) {
 	d := newTestDaemon(t)
 	handler := d.routes()

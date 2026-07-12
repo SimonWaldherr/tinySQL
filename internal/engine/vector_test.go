@@ -8,6 +8,7 @@ import (
 	"math"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -822,6 +823,27 @@ func TestVecSearchConcurrentColdIndexBuild(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestVecSearchResultCacheAndAnalytics(t *testing.T) {
+	ConfigureVectorCache(VectorCacheConfig{ResultCacheEntries: 8, ResultCacheTTL: time.Minute, Analytics: true, AnalyticsWindow: time.Minute, AnalyticsMaxEvents: 8})
+	t.Cleanup(func() { ConfigureVectorCache(VectorCacheConfig{}) })
+	db := setupTestDB()
+	execSQL(t, db, `CREATE TABLE cached_vectors (id INT, embedding VECTOR)`)
+	execSQL(t, db, `INSERT INTO cached_vectors VALUES (1, '[1.0, 0.0]'), (2, '[0.0, 1.0]')`)
+	q := `SELECT id FROM VEC_SEARCH('cached_vectors', 'embedding', '[1.0, 0.0]', 1, 'cosine', 'flat')`
+	execSQL(t, db, q)
+	execSQL(t, db, q)
+	stats := VectorCacheAnalytics()
+	if stats.Hits != 1 || stats.Misses != 1 || stats.Entries != 1 || len(stats.RecentQueries) != 2 || !stats.RecentQueries[1].CacheHit {
+		t.Fatalf("cache analytics = %#v", stats)
+	}
+	execSQL(t, db, `INSERT INTO cached_vectors VALUES (3, '[1.0, 0.0]')`)
+	execSQL(t, db, q)
+	stats = VectorCacheAnalytics()
+	if stats.Misses != 2 {
+		t.Fatalf("table-version mutation must invalidate result key: %#v", stats)
 	}
 }
 

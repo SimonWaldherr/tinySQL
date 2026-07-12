@@ -30,6 +30,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -571,12 +572,19 @@ func (f *VecSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 	if searchCtx == nil {
 		searchCtx = env.ctx
 	}
-	cache := getVecColumnCache(tenant, table, vecColIdx, a.metric == "cosine")
-	distFn := buildVecDistanceFunc(a.metric, a.queryVec, queryNorm, cache)
-	scoredRowsOrdered, err := vecSearchTopKWithIndex(searchCtx, tenant, table, vecColIdx, a, queryLen, queryNorm, cache, distFn)
-	if err != nil {
-		return nil, err
+	started := time.Now()
+	key := vecQueryKey(tenant, table.Name, a.colName, table.Version, a)
+	scoredRowsOrdered, cacheHit := getVecQueryCache(key)
+	if !cacheHit {
+		cache := getVecColumnCache(tenant, table, vecColIdx, a.metric == "cosine")
+		distFn := buildVecDistanceFunc(a.metric, a.queryVec, queryNorm, cache)
+		scoredRowsOrdered, err = vecSearchTopKWithIndex(searchCtx, tenant, table, vecColIdx, a, queryLen, queryNorm, cache, distFn)
+		if err != nil {
+			return nil, err
+		}
+		putVecQueryCache(key, scoredRowsOrdered)
 	}
+	recordVecQuery(VectorQueryEvent{At: time.Now(), Table: table.Name, Column: a.colName, Metric: a.metric, Index: a.indexMode, K: a.k, CacheHit: cacheHit, Duration: time.Since(started)})
 
 	resultRows := make([]Row, 0, len(scoredRowsOrdered))
 	for rank, sr := range scoredRowsOrdered {
