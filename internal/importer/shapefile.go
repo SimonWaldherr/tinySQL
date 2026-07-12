@@ -1,3 +1,5 @@
+//go:build shapefile
+
 package importer
 
 import (
