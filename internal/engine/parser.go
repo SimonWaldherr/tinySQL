@@ -113,7 +113,10 @@ type (
 		Lower string
 	}
 	// Literal holds a constant value (number, string, bool, NULL).
-	Literal struct{ Val any }
+	Literal struct {
+		Val       any
+		Parameter bool // bound positional parameter; value may change between executions
+	}
 	// Unary represents unary operators like +, -, NOT.
 	Unary struct {
 		Op   string
@@ -431,6 +434,9 @@ type Select struct {
 	Offset     *int
 	Union      *UnionClause // For UNION operations
 	CTEs       []CTE        // Common Table Expressions
+	// simplePlanCache is initialized by the parser and stores only immutable
+	// plan shape. Parameter values and index RowIDs are rebound for every run.
+	simplePlanCache *simpleSelectPlanCache
 }
 
 // PivotClause represents "PIVOT (agg(value_expr) FOR pivot_col IN (v1 [AS a1], v2 [AS a2], ...))".
@@ -1984,7 +1990,7 @@ func (p *Parser) parseReturningClause() ([]SelectItem, error) {
 		return nil, nil
 	}
 	p.next()
-	sel := &Select{}
+	sel := &Select{simplePlanCache: &simpleSelectPlanCache{}}
 	if err := p.parseProjections(sel); err != nil {
 		return nil, err
 	}
@@ -2082,7 +2088,7 @@ func (p *Parser) parseSelect() (*Select, error) {
 	if err := p.expectKeyword("SELECT"); err != nil {
 		return nil, err
 	}
-	sel := &Select{}
+	sel := &Select{simplePlanCache: &simpleSelectPlanCache{}}
 
 	// Parse DISTINCT
 	if err := p.parseDistinct(sel); err != nil {

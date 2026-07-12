@@ -2427,6 +2427,18 @@ type simpleSelectPlan struct {
 	estimatedRows   int
 }
 
+// simpleSelectPlanCache stores the parameter-independent shape of a parsed
+// simple SELECT. It deliberately excludes RowIDs and access-path estimates:
+// those depend on the current bound values and current index contents. The
+// cache lives on the AST, so its lifetime is bounded by the existing parsed
+// statement cache or database/sql prepared statement.
+type simpleSelectPlanCache struct {
+	mu       sync.Mutex
+	table    *storage.Table
+	colCount int
+	plan     *simpleSelectPlan
+}
+
 // simpleProjection describes a single SELECT item in the raw fast-path.
 // When colIdx >= 0 the projection is a direct column reference: the value is
 // taken from raw[colIdx] without going through evalRawExpr, saving a type
@@ -3514,6 +3526,54 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 			return nil, true, err
 		}
 	}
+	template, ok, err := loadSimpleSelectPlanTemplate(table, s)
+	if !ok || err != nil {
+		return nil, ok, err
+	}
+	plan := *template
+	// Access paths are value- and data-dependent. Never retain them in the
+	// cached shape: a subsequent prepared execution may bind another key and
+	// DML may have rebuilt the index entry arrays in the meantime.
+	plan.rowIDs = nil
+	plan.scanType = "TABLE SCAN"
+	plan.indexName = ""
+	plan.indexPredicates = nil
+	plan.residualFilter = false
+	plan.coveringIndex = false
+	plan.estimatedRows = len(table.Rows)
+	if idx, values, predicates, residual := selectSecondaryIndex(table, plan.colIndex, s.Where); idx != nil {
+		var rowIDs []int
+		var seekErr error
+		if len(values) == len(idx.Columns) {
+			rowIDs, seekErr = table.LookupSecondaryIndexPoint(idx, values)
+		} else {
+			rowIDs, seekErr = table.LookupSecondaryIndexPrefix(idx, values)
+		}
+		if seekErr != nil {
+			return nil, true, seekErr
+		}
+		plan.rowIDs = rowIDs
+		plan.scanType = "INDEX " + seekKind(len(values), len(idx.Columns))
+		plan.indexName = idx.Name
+		plan.indexPredicates = predicates
+		plan.residualFilter = residual
+		plan.coveringIndex = projectionsCoveredByIndex(plan.projs, idx, table)
+		plan.estimatedRows = len(rowIDs)
+	}
+	return &plan, true, nil
+}
+
+func loadSimpleSelectPlanTemplate(table *storage.Table, s *Select) (*simpleSelectPlan, bool, error) {
+	cache := s.simplePlanCache
+	cacheable := cache != nil && simplePlanCacheSafe(s.Where)
+	if cacheable {
+		cache.mu.Lock()
+		defer cache.mu.Unlock()
+		if cache.plan != nil && cache.table == table && cache.colCount == len(table.Cols) {
+			return cache.plan, true, nil
+		}
+	}
+
 	colIndex := simpleColumnIndex(table, aliasOr(s.From))
 
 	var projs []simpleProjection
@@ -3557,26 +3617,81 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 		scanType:      "TABLE SCAN",
 		estimatedRows: len(table.Rows),
 	}
-	if idx, values, predicates, residual := selectSecondaryIndex(table, colIndex, s.Where); idx != nil {
-		var rowIDs []int
-		var seekErr error
-		if len(values) == len(idx.Columns) {
-			rowIDs, seekErr = table.LookupSecondaryIndexPoint(idx, values)
-		} else {
-			rowIDs, seekErr = table.LookupSecondaryIndexPrefix(idx, values)
-		}
-		if seekErr != nil {
-			return nil, true, seekErr
-		}
-		plan.rowIDs = rowIDs
-		plan.scanType = "INDEX " + seekKind(len(values), len(idx.Columns))
-		plan.indexName = idx.Name
-		plan.indexPredicates = predicates
-		plan.residualFilter = residual
-		plan.coveringIndex = projectionsCoveredByIndex(projs, idx, table)
-		plan.estimatedRows = len(rowIDs)
+	if cacheable {
+		cache.table = table
+		cache.colCount = len(table.Cols)
+		cache.plan = plan
 	}
 	return plan, true, nil
+}
+
+// simplePlanCacheSafe rejects bound forms whose compiled filter captures the
+// current parameter value (LIKE/IN/regexp). Plain comparisons use a dynamic
+// bound-literal filter and are safe to reuse.
+func simplePlanCacheSafe(expr Expr) bool {
+	switch ex := expr.(type) {
+	case nil, *VarRef:
+		return true
+	case *Literal:
+		return !ex.Parameter
+	case *Unary:
+		return simplePlanCacheSafe(ex.Expr)
+	case *IsNull:
+		return simplePlanCacheSafe(ex.Expr)
+	case *Binary:
+		if ex.Op == "AND" || ex.Op == "OR" || isComparisonOp(ex.Op) {
+			return simplePlanCacheSafeComparisonSide(ex.Left) && simplePlanCacheSafeComparisonSide(ex.Right)
+		}
+		return !exprContainsBoundParameter(expr)
+	default:
+		return !exprContainsBoundParameter(expr)
+	}
+}
+
+func simplePlanCacheSafeComparisonSide(expr Expr) bool {
+	switch ex := expr.(type) {
+	case *Literal:
+		return true // dynamic comparison filters dereference Parameter literals
+	case *Binary:
+		return simplePlanCacheSafe(ex)
+	default:
+		return !exprContainsBoundParameter(expr)
+	}
+}
+
+func exprContainsBoundParameter(expr Expr) bool {
+	switch ex := expr.(type) {
+	case nil:
+		return false
+	case *Literal:
+		return ex.Parameter
+	case *Unary:
+		return exprContainsBoundParameter(ex.Expr)
+	case *Binary:
+		return exprContainsBoundParameter(ex.Left) || exprContainsBoundParameter(ex.Right)
+	case *IsNull:
+		return exprContainsBoundParameter(ex.Expr)
+	case *LikeExpr:
+		return exprContainsBoundParameter(ex.Expr) || exprContainsBoundParameter(ex.Pattern) || exprContainsBoundParameter(ex.Escape)
+	case *RegexpExpr:
+		return exprContainsBoundParameter(ex.Expr) || exprContainsBoundParameter(ex.Pattern)
+	case *InExpr:
+		if exprContainsBoundParameter(ex.Expr) {
+			return true
+		}
+		for _, value := range ex.Values {
+			if exprContainsBoundParameter(value) {
+				return true
+			}
+		}
+	case *FuncCall:
+		for _, arg := range ex.Args {
+			if exprContainsBoundParameter(arg) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func seekKind(prefixCols, allCols int) string {
@@ -4250,6 +4365,9 @@ func buildRawComparisonFilter(colIndex map[string]int, ex *Binary) func([]any) (
 	if ref, ok := ex.Left.(*VarRef); ok {
 		if lit, ok := ex.Right.(*Literal); ok {
 			if colIdx, ok := colIndex[strings.ToLower(ref.Name)]; ok {
+				if lit.Parameter {
+					return buildBoundLiteralFilter(colIdx, ex.Op, lit)
+				}
 				return buildColLiteralFilter(colIdx, ex.Op, lit.Val)
 			}
 		}
@@ -4257,6 +4375,9 @@ func buildRawComparisonFilter(colIndex map[string]int, ex *Binary) func([]any) (
 	if lit, ok := ex.Left.(*Literal); ok {
 		if ref, ok := ex.Right.(*VarRef); ok {
 			if colIdx, ok := colIndex[strings.ToLower(ref.Name)]; ok {
+				if lit.Parameter {
+					return buildBoundLiteralFilter(colIdx, reverseComparisonOp(ex.Op), lit)
+				}
 				return buildColLiteralFilter(colIdx, reverseComparisonOp(ex.Op), lit.Val)
 			}
 		}
@@ -4271,6 +4392,40 @@ func buildRawComparisonFilter(colIndex map[string]int, ex *Binary) func([]any) (
 		}
 	}
 	return nil
+}
+
+// buildBoundLiteralFilter reads the current parameter value on every call.
+// Prepared statements mutate Literal.Val under their statement mutex, while
+// the cached plan shape and closure stay immutable.
+func buildBoundLiteralFilter(colIdx int, op string, literal *Literal) func([]any) (bool, error) {
+	return func(raw []any) (bool, error) {
+		a, b := raw[colIdx], literal.Val
+		if a == nil || b == nil {
+			return false, nil
+		}
+		switch op {
+		case "=":
+			return rawEqual(a, b), nil
+		case "!=", "<>":
+			return !rawEqual(a, b), nil
+		}
+		comparison, err := compare(a, b)
+		if err != nil {
+			return false, err
+		}
+		switch op {
+		case "<":
+			return comparison < 0, nil
+		case "<=":
+			return comparison <= 0, nil
+		case ">":
+			return comparison > 0, nil
+		case ">=":
+			return comparison >= 0, nil
+		default:
+			return false, fmt.Errorf("unsupported comparison operator %q", op)
+		}
+	}
 }
 
 func buildRawFilterLike(colIndex map[string]int, ex *LikeExpr) func([]any) (bool, error) {

@@ -461,6 +461,75 @@ func TestPreparedSelectBindsNewValuesWithoutReparse(t *testing.T) {
 		}
 		_ = rows.Close()
 	}
+
+	// Range predicates also use a cached plan shape, but must read the current
+	// bound value rather than the value from the first execution.
+	rangeStmt, err := c.Prepare("SELECT name FROM prepared WHERE id > ?")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rangeFast := rangeStmt.(*stmt)
+	rows, err := rangeFast.QueryContext(ctx, []driver.NamedValue{{Ordinal: 1, Value: int64(1)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := make([]driver.Value, 1)
+	if err := rows.Next(values); err != nil || values[0] != "two" {
+		t.Fatalf("range id > 1: values=%v err=%v", values, err)
+	}
+	_ = rows.Close()
+	rows, err = rangeFast.QueryContext(ctx, []driver.NamedValue{{Ordinal: 1, Value: int64(2)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rows.Next(values); err != io.EOF {
+		t.Fatalf("range id > 2 returned row or error: %v (%v)", values, err)
+	}
+	_ = rows.Close()
+
+	// Access-path state is not cached: adding an index after the first reads
+	// must remain correct, as must a schema change that changes column count.
+	if _, err := c.ExecContext(ctx, "CREATE INDEX prepared_id ON prepared(id)", nil); err != nil {
+		t.Fatal(err)
+	}
+	table, err := c.srv.db.Get("default", "prepared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	table.Cols = append(table.Cols, storage.Column{Name: "extra", Type: storage.TextType})
+	for i := range table.Rows {
+		table.Rows[i] = append(table.Rows[i], nil)
+	}
+	rows, err = fast.QueryContext(ctx, []driver.NamedValue{{Ordinal: 1, Value: int64(2)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	values = make([]driver.Value, 1)
+	if err := rows.Next(values); err != nil || values[0] != "two" {
+		t.Fatalf("prepared query after index/schema change: values=%v err=%v", values, err)
+	}
+	_ = rows.Close()
+
+	// DROP/CREATE replaces the table pointer. A cached template must not retain
+	// the old table or its rows.
+	if _, err := c.ExecContext(ctx, "DROP TABLE prepared", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ExecContext(ctx, "CREATE TABLE prepared (id INT, name TEXT)", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ExecContext(ctx, "INSERT INTO prepared VALUES (3, 'three')", nil); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = fast.QueryContext(ctx, []driver.NamedValue{{Ordinal: 1, Value: int64(3)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	values = make([]driver.Value, 1)
+	if err := rows.Next(values); err != nil || values[0] != "three" {
+		t.Fatalf("prepared query after table replacement: values=%v err=%v", values, err)
+	}
+	_ = rows.Close()
 }
 
 func TestTransactionsSnapshotAndReadonly(t *testing.T) {

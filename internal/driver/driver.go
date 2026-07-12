@@ -921,6 +921,7 @@ func buildPreparedQuery(sqlText string) (*preparedQuery, error) {
 		if literal == nil {
 			return nil, fmt.Errorf("tinysql: positional parameter %d was not parsed as a literal", i+1)
 		}
+		literal.Parameter = true
 	}
 	return &preparedQuery{statement: statement, params: params}, nil
 }
