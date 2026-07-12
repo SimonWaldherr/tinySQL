@@ -151,7 +151,8 @@ func (t *Table) LookupSecondaryIndexPrefix(idx *SecondaryIndex, values []any) ([
 	if idx == nil || len(values) == 0 || len(values) > len(idx.Columns) {
 		return nil, nil
 	}
-	key := canonicalIndexKey(values)
+	var scratch [128]byte
+	key := canonicalIndexKeyInto(scratch[:0], values)
 	start := sort.Search(len(idx.Entries), func(i int) bool {
 		return bytes.Compare(idx.Entries[i].Key, key) >= 0
 	})
@@ -161,6 +162,26 @@ func (t *Table) LookupSecondaryIndexPrefix(idx *SecondaryIndex, values []any) ([
 	}
 	sort.Ints(out)
 	return out, nil
+}
+
+// LookupSecondaryIndexPoint returns the immutable RowID run for a complete
+// composite key. Unlike a prefix seek it neither merges nor sorts entries:
+// RebuildSecondaryIndexes appends RowIDs in table order, so the entry is
+// already in the observable order of a table scan. The returned slice aliases
+// the index and is read-only; it remains valid until the table is mutated.
+//
+// This is intentionally a separate API from LookupSecondaryIndexPrefix. A
+// general caller may need an owned prefix result, while the engine's locked
+// read path can safely avoid an allocation on every point lookup.
+func (t *Table) LookupSecondaryIndexPoint(idx *SecondaryIndex, values []any) ([]int, error) {
+	if idx == nil || len(values) != len(idx.Columns) {
+		return nil, nil
+	}
+	// Numeric/geocell/category point keys comfortably fit in this stack buffer.
+	// append grows to a private heap slice only for genuinely large text/BLOB
+	// components, preserving correctness without charging normal seeks an alloc.
+	var scratch [128]byte
+	return idx.lookup(canonicalIndexKeyInto(scratch[:0], values)), nil
 }
 
 func (idx *SecondaryIndex) lookup(key []byte) []int {
@@ -193,6 +214,10 @@ func (t *Table) indexKey(columns []string, row []any) ([]byte, error) {
 
 func canonicalIndexKey(values []any) []byte {
 	key := make([]byte, 0, len(values)*12)
+	return canonicalIndexKeyInto(key, values)
+}
+
+func canonicalIndexKeyInto(key []byte, values []any) []byte {
 	for _, value := range values {
 		key = appendCanonicalIndexValue(key, value)
 	}

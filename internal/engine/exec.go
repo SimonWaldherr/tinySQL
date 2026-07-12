@@ -3558,7 +3558,13 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 		estimatedRows: len(table.Rows),
 	}
 	if idx, values, predicates, residual := selectSecondaryIndex(table, colIndex, s.Where); idx != nil {
-		rowIDs, seekErr := table.LookupSecondaryIndexPrefix(idx, values)
+		var rowIDs []int
+		var seekErr error
+		if len(values) == len(idx.Columns) {
+			rowIDs, seekErr = table.LookupSecondaryIndexPoint(idx, values)
+		} else {
+			rowIDs, seekErr = table.LookupSecondaryIndexPrefix(idx, values)
+		}
 		if seekErr != nil {
 			return nil, true, seekErr
 		}
