@@ -111,8 +111,16 @@ type VectorCacheConfig = engine.VectorCacheConfig
 type VectorCacheStats = engine.VectorCacheStats
 type VectorQueryEvent = engine.VectorQueryEvent
 
-func ConfigureVectorCache(cfg VectorCacheConfig)  { engine.ConfigureVectorCache(cfg) }
-func VectorCacheAnalytics() VectorCacheStats      { return engine.VectorCacheAnalytics() }
+// ConfigureVectorCache replaces the process-wide VEC_SEARCH result-cache and
+// analytics configuration. A zero ResultCacheEntries disables result caching.
+func ConfigureVectorCache(cfg VectorCacheConfig) { engine.ConfigureVectorCache(cfg) }
+
+// VectorCacheAnalytics returns a point-in-time cache and optional query-window
+// snapshot. It does not expose raw query-vector contents.
+func VectorCacheAnalytics() VectorCacheStats { return engine.VectorCacheAnalytics() }
+
+// DefaultVectorCacheConfig returns bounded cache/analytics defaults with both
+// optional features disabled until explicitly enabled by the caller.
 func DefaultVectorCacheConfig() VectorCacheConfig { return engine.DefaultVectorCacheConfig() }
 
 // ProcedureContext is passed to in-memory stored procedures registered with

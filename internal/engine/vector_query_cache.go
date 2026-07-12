@@ -12,10 +12,16 @@ import (
 // VectorCacheConfig controls the optional process-wide VEC_SEARCH result
 // cache. The existing column/ANN caches remain active independently.
 type VectorCacheConfig struct {
+	// ResultCacheEntries bounds cached result sets. Zero disables the cache.
 	ResultCacheEntries int
-	ResultCacheTTL     time.Duration
-	Analytics          bool
-	AnalyticsWindow    time.Duration
+	// ResultCacheTTL expires cached result sets. A positive entry limit with a
+	// non-positive TTL uses the conservative default of 30 seconds.
+	ResultCacheTTL time.Duration
+	// Analytics enables the bounded in-memory recent-query window.
+	Analytics bool
+	// AnalyticsWindow limits how long query events remain visible.
+	AnalyticsWindow time.Duration
+	// AnalyticsMaxEvents bounds retained query events independently of time.
 	AnalyticsMaxEvents int
 }
 
@@ -45,13 +51,14 @@ type VectorCacheStats struct {
 }
 
 type VectorQueryEvent struct {
-	At       time.Time     `json:"at"`
-	Table    string        `json:"table"`
-	Column   string        `json:"column"`
-	Metric   string        `json:"metric"`
-	Index    string        `json:"index"`
-	K        int           `json:"k"`
-	CacheHit bool          `json:"cache_hit"`
+	At       time.Time `json:"at"`
+	Table    string    `json:"table"`
+	Column   string    `json:"column"`
+	Metric   string    `json:"metric"`
+	Index    string    `json:"index"`
+	K        int       `json:"k"`
+	CacheHit bool      `json:"cache_hit"`
+	// Duration covers the vector-search stage, including a cache lookup.
 	Duration time.Duration `json:"duration"`
 }
 

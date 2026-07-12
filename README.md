@@ -61,7 +61,9 @@ func main() {
 - Views, materialized views, triggers, table-valued functions, system catalog
   views, job scheduling, and multi-tenancy.
 - Constraints: single-column PRIMARY KEY, UNIQUE, and FOREIGN KEY with
-  referential actions.
+  referential actions, plus `NOT NULL` and literal `DEFAULT` values.
+- SQLite-style type declarations and affinities, including `INTEGER`, `REAL`,
+  `TEXT`, `NUMERIC`, `VARCHAR(n)`, `CLOB`, typeless columns, and `ANY`.
 - Built-in functions for JSON, YAML, URLs, hashes, bitmaps, regex, text, math,
   dates, full-text search, vector search, and RAG scoring.
 - Geodata imports and SQL helpers for GeoJSON, KML, OSM XML, Shapefiles,
@@ -72,6 +74,73 @@ func main() {
 
 For a broader feature reference, see [FUNCTIONS.sql](./FUNCTIONS.sql),
 [example_showcase.sql](./example_showcase.sql), and the Go tests.
+
+## Optional import profiles
+
+The core has no SQLite or Shapefile runtime dependency. Enable specialized
+importers only in builds that need them:
+
+```bash
+# SQLite files and MBTiles (pure-Go modernc SQLite)
+go build -tags=sqliteimport ./...
+
+# ESRI Shapefile and Shapefile ZIP imports
+go build -tags=shapefile ./...
+
+# Both optional importers
+go build -tags=sqliteimport,shapefile ./...
+```
+
+Without the respective tag, the import API remains available but returns a
+clear feature-disabled error. SQLite remains the recommended production
+backend for standard MBTiles serving.
+
+## Portable import and export
+
+CSV/TSV imports normalize text to UTF-8. UTF-8, UTF-16 LE/BE, ISO-8859-1,
+ISO-8859-2, ISO-8859-15, and Windows-1252 can be selected explicitly. Invalid
+UTF-8 is rejected instead of silently replaced. BLOB values stay binary:
+CSV/XML use self-identifying Base64 or hex, JSON uses a BLOB envelope, and SQL
+exports use SQLite-compatible `X'...'` literals.
+
+`exporter.ExportTableManifest` writes a versioned JSON schema manifest with
+declared types, affinity, constraints, row count, and an ordered typed-row
+SHA-256 fingerprint. It can be paired with CSV, JSON, or SQL data exports for
+verifiable transfers.
+
+## Vector search cache and analytics
+
+VEC_SEARCH already maintains bounded internal column and ANN-index caches.
+The optional result cache stores only deterministic top-K row IDs, never RAG
+answers or raw query vectors. Its key includes tenant, table version, column,
+metric, index mode, `k`, and a vector hash, so table mutations invalidate
+results naturally.
+
+The default is deliberately lean: no result cache and no analytics. Enable a
+small bounded cache only for repeated queries:
+
+```go
+cfg := tsql.DefaultVectorCacheConfig()
+cfg.ResultCacheEntries = 128 // 0 keeps it disabled
+cfg.Analytics = true
+tsql.ConfigureVectorCache(cfg)
+
+stats := tsql.VectorCacheAnalytics()
+```
+
+Enabled caches default to a 30-second TTL. Analytics defaults to a 60-second,
+128-event in-memory window and records query shape and timing, not vector
+contents. The configuration is process-wide because vector indexes and caches
+are process-wide.
+
+For `tinysqld`:
+
+```bash
+tinysqld -analytics -vector-cache-entries 128 -vector-cache-ttl 30s
+```
+
+The authenticated `GET /api/analytics/vector` endpoint is available only with
+`-analytics`; otherwise it returns `404`.
 
 ## Guides
 
@@ -99,10 +168,15 @@ TinySQL is not a PostgreSQL/MySQL replacement. Important current limits:
 - No composite primary keys or composite foreign keys.
 - No CHECK constraints, UPSERT/ON CONFLICT, SAVEPOINT, ATTACH/DETACH, VACUUM,
   partial indexes, generated columns, or persistent ANN vector index files.
-- `CREATE INDEX` stores metadata, but the planner does not use indexes yet.
+- Materialized secondary indexes currently support equality point/prefix seeks
+  on their leading columns. They are rebuilt after DML and persisted with
+  snapshots/backends; pager-native incremental index pages and range planning
+  are not implemented yet.
 - RBAC checks are coarse and single-table oriented.
 - Encryption at rest currently covers table files for `ModeDisk`, `ModeJSON`,
   `ModeHybrid`, and `ModeIndex`, not WAL-backed modes or metadata files.
+- The optional VEC_SEARCH result cache is process-local and in-memory; it is
+  not a distributed cache and does not persist across process restarts.
 
 Evaluate these limits before using TinySQL for production-critical data.
 
