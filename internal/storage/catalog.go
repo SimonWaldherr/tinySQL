@@ -236,18 +236,44 @@ func (c *CatalogManager) RegisterTable(schema, name string, cols []Column) error
 	// Register columns
 	catalogCols := make([]CatalogColumn, len(cols))
 	for i, col := range cols {
+		var defaultValue *string
+		if col.HasDefault {
+			v := catalogDefaultValue(col.DefaultValue)
+			defaultValue = &v
+		}
 		catalogCols[i] = CatalogColumn{
-			Schema:     schema,
-			TableName:  name,
-			Name:       col.Name,
-			Position:   i + 1,
-			DataType:   col.Type.String(),
-			IsNullable: true, // tinySQL doesn't enforce NOT NULL yet
+			Schema:       schema,
+			TableName:    name,
+			Name:         col.Name,
+			Position:     i + 1,
+			DataType:     columnDeclaredType(col),
+			IsNullable:   !col.NotNull && col.Constraint != PrimaryKey,
+			DefaultValue: defaultValue,
 		}
 	}
 	c.columns[key] = catalogCols
 
 	return nil
+}
+
+func columnDeclaredType(col Column) string {
+	if col.DeclaredType != "" {
+		return col.DeclaredType
+	}
+	return col.Type.String()
+}
+
+func catalogDefaultValue(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return "NULL"
+	case string:
+		return "'" + strings.ReplaceAll(x, "'", "''") + "'"
+	case []byte:
+		return "X'" + fmt.Sprintf("%X", x) + "'"
+	default:
+		return fmt.Sprint(x)
+	}
 }
 
 // RegisterView registers a view definition under `schema.name`.

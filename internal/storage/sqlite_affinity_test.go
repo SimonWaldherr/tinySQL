@@ -9,7 +9,7 @@ func TestSQLiteAffinitySchemaPersists(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "affinity.gob")
 	db := NewDB()
 	table := NewTable("places", []Column{
-		{Name: "name", Type: TextType, DeclaredType: "VARCHAR(255)", Affinity: AffinityText},
+		{Name: "name", Type: TextType, DeclaredType: "VARCHAR(255)", Affinity: AffinityText, NotNull: true, HasDefault: true, DefaultValue: "unknown"},
 		{Name: "rank", Type: DecimalType, DeclaredType: "NUMERIC(12,2)", Affinity: AffinityNumeric},
 		{Name: "metadata", Type: InterfaceType, DeclaredType: "ANY", Affinity: AffinityBlob},
 	}, false)
@@ -28,7 +28,7 @@ func TestSQLiteAffinitySchemaPersists(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get table: %v", err)
 	}
-	if got.Cols[0].DeclaredType != "VARCHAR(255)" || got.Cols[0].Affinity != AffinityText {
+	if got.Cols[0].DeclaredType != "VARCHAR(255)" || got.Cols[0].Affinity != AffinityText || !got.Cols[0].NotNull || !got.Cols[0].HasDefault || got.Cols[0].DefaultValue != "unknown" {
 		t.Fatalf("text schema metadata = %#v", got.Cols[0])
 	}
 	if got.Cols[1].DeclaredType != "NUMERIC(12,2)" || got.Cols[1].Affinity != AffinityNumeric {

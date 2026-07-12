@@ -317,7 +317,12 @@ type Column struct {
 	DeclaredType string
 	// Affinity is populated for SQLite-style declarations. AffinityDefault
 	// means this column was declared using a native tinySQL type.
-	Affinity     SQLiteAffinity
+	Affinity SQLiteAffinity
+	// NotNull and default metadata are independent of Constraint because SQL
+	// permits combinations such as "PRIMARY KEY NOT NULL DEFAULT 0".
+	NotNull      bool
+	HasDefault   bool
+	DefaultValue any
 	Constraint   ConstraintType
 	ForeignKey   *ForeignKeyRef // Only used if Constraint == ForeignKey
 	PointerTable string         // Target table for POINTER type
@@ -1026,6 +1031,9 @@ type diskColumn struct {
 	Type         ColType
 	DeclaredType string
 	Affinity     SQLiteAffinity
+	NotNull      bool
+	HasDefault   bool
+	DefaultValue any
 	Constraint   ConstraintType
 	ForeignKey   *ForeignKeyRef
 	PointerTable string

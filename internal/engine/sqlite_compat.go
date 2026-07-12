@@ -51,12 +51,20 @@ func pragmaTableInfo(env ExecEnv, tableName string, includeHidden bool) *ResultS
 	}
 	rows := make([]Row, 0, len(t.Cols))
 	for i, c := range t.Cols {
+		declaredType := c.DeclaredType
+		if declaredType == "" {
+			declaredType = c.Type.String()
+		}
+		var defaultValue any
+		if c.HasDefault {
+			defaultValue = sqliteDefaultSQL(c.DefaultValue)
+		}
 		row := Row{
 			"cid":        i,
 			"name":       c.Name,
-			"type":       c.Type.String(),
-			"notnull":    sqliteBoolInt(c.Constraint == storage.PrimaryKey),
-			"dflt_value": nil,
+			"type":       declaredType,
+			"notnull":    sqliteBoolInt(c.NotNull || c.Constraint == storage.PrimaryKey),
+			"dflt_value": defaultValue,
 			"pk":         sqliteBoolInt(c.Constraint == storage.PrimaryKey),
 		}
 		if includeHidden {
@@ -219,7 +227,11 @@ func sqliteSchemaRow(typ, schema, name, tableName, sql string) Row {
 func sqliteCreateTableSQL(schema, name string, t *storage.Table) string {
 	parts := make([]string, 0, len(t.Cols))
 	for _, c := range t.Cols {
-		part := sqliteIdent(c.Name) + " " + c.Type.String()
+		declaredType := c.DeclaredType
+		if declaredType == "" {
+			declaredType = c.Type.String()
+		}
+		part := sqliteIdent(c.Name) + " " + declaredType
 		switch c.Constraint {
 		case storage.PrimaryKey:
 			part += " PRIMARY KEY"
@@ -230,9 +242,28 @@ func sqliteCreateTableSQL(schema, name string, t *storage.Table) string {
 				part += " REFERENCES " + sqliteIdent(c.ForeignKey.Table) + "(" + sqliteIdent(c.ForeignKey.Column) + ")"
 			}
 		}
+		if c.NotNull && c.Constraint != storage.PrimaryKey {
+			part += " NOT NULL"
+		}
+		if c.HasDefault {
+			part += " DEFAULT " + sqliteDefaultSQL(c.DefaultValue)
+		}
 		parts = append(parts, part)
 	}
 	return "CREATE TABLE " + sqliteIdent(catalogDisplayName(schema, name)) + " (" + strings.Join(parts, ", ") + ")"
+}
+
+func sqliteDefaultSQL(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return "NULL"
+	case string:
+		return "'" + strings.ReplaceAll(x, "'", "''") + "'"
+	case []byte:
+		return "X'" + fmt.Sprintf("%X", x) + "'"
+	default:
+		return fmt.Sprint(x)
+	}
 }
 
 func sqliteIdent(name string) string {

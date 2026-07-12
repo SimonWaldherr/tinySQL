@@ -946,8 +946,8 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			return nil, err
 		}
 		row := make([]any, len(t.Cols))
-		for i := range row {
-			row[i] = nil
+		if err := applyColumnDefaults(row, t.Cols); err != nil {
+			return nil, err
 		}
 		for i, idx := range colIdx {
 			v, err := evalExpr(env, vals[i], tmp)
@@ -1005,15 +1005,39 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	return nil, nil
 }
 
-func validateRowConstraints(env ExecEnv, t *storage.Table, row []any, excludeRow int) error {
-	for colIdx, col := range t.Cols {
-		if col.Constraint == storage.NoConstraint {
+// applyColumnDefaults initializes an INSERT row before explicitly named
+// columns overwrite their positions. Defaults are copied before coercion so a
+// BLOB default can never be shared and mutated through a stored row.
+func applyColumnDefaults(row []any, cols []storage.Column) error {
+	for i, col := range cols {
+		if !col.HasDefault {
 			continue
 		}
+		v := col.DefaultValue
+		if b, ok := v.([]byte); ok {
+			v = append([]byte(nil), b...)
+		}
+		cv, err := coerceColumnValue(v, col)
+		if err != nil {
+			return fmt.Errorf("default for column %q: %w", col.Name, err)
+		}
+		row[i] = cv
+	}
+	return nil
+}
+
+func validateRowConstraints(env ExecEnv, t *storage.Table, row []any, excludeRow int) error {
+	for colIdx, col := range t.Cols {
 		if colIdx >= len(row) {
 			return fmt.Errorf("row missing constrained column %q", col.Name)
 		}
 		val := row[colIdx]
+		if col.NotNull && isNull(val) {
+			return fmt.Errorf("NOT NULL column %q cannot be NULL", col.Name)
+		}
+		if col.Constraint == storage.NoConstraint {
+			continue
+		}
 		switch col.Constraint {
 		case storage.PrimaryKey:
 			if isNull(val) {

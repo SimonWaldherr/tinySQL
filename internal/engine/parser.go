@@ -2847,21 +2847,93 @@ func (p *Parser) parseSingleColumnDef() (storage.Column, error) {
 }
 
 func (p *Parser) parseColumnConstraints(col *storage.Column) error {
-	if p.cur.Typ != tKeyword {
-		return nil
-	}
-
-	switch p.cur.Val {
-	case "PRIMARY":
-		return p.parsePrimaryKeyConstraint(col)
-	case "FOREIGN":
-		return p.parseForeignKeyConstraint(col)
-	case "UNIQUE":
-		return p.parseUniqueConstraint(col)
-	case "REFERENCES":
-		return p.parseReferencesConstraint(col)
+	for p.cur.Typ == tKeyword {
+		switch p.cur.Val {
+		case "NOT":
+			p.next()
+			if err := p.expectKeyword("NULL"); err != nil {
+				return err
+			}
+			col.NotNull = true
+		case "NULL":
+			// Explicit NULL is the default in ordinary SQLite tables.
+			p.next()
+			col.NotNull = false
+		case "DEFAULT":
+			if err := p.parseColumnDefault(col); err != nil {
+				return err
+			}
+		case "PRIMARY":
+			if err := p.parsePrimaryKeyConstraint(col); err != nil {
+				return err
+			}
+		case "FOREIGN":
+			if err := p.parseForeignKeyConstraint(col); err != nil {
+				return err
+			}
+		case "UNIQUE":
+			if err := p.parseUniqueConstraint(col); err != nil {
+				return err
+			}
+		case "REFERENCES":
+			if err := p.parseReferencesConstraint(col); err != nil {
+				return err
+			}
+		default:
+			return nil
+		}
 	}
 	return nil
+}
+
+// parseColumnDefault accepts deterministic literal defaults. Dynamic defaults
+// (for example CURRENT_TIMESTAMP) intentionally remain unsupported until they
+// can be represented consistently in snapshots and read-only replicas.
+func (p *Parser) parseColumnDefault(col *storage.Column) error {
+	p.next() // DEFAULT
+	expr, err := p.parseExpr()
+	if err != nil {
+		return err
+	}
+	v, ok := defaultLiteralValue(expr)
+	if !ok {
+		return p.errf("DEFAULT for column %q must be a literal", col.Name)
+	}
+	col.HasDefault = true
+	col.DefaultValue = v
+	return nil
+}
+
+func defaultLiteralValue(expr Expr) (any, bool) {
+	switch e := expr.(type) {
+	case *Literal:
+		if b, ok := e.Val.([]byte); ok {
+			return append([]byte(nil), b...), true
+		}
+		return e.Val, true
+	case *Unary:
+		lit, ok := e.Expr.(*Literal)
+		if !ok {
+			return nil, false
+		}
+		switch n := lit.Val.(type) {
+		case int:
+			if e.Op == "-" {
+				return -n, true
+			}
+			if e.Op == "+" {
+				return n, true
+			}
+		case float64:
+			if e.Op == "-" {
+				return -n, true
+			}
+			if e.Op == "+" {
+				return n, true
+			}
+		}
+	}
+	return nil, false
 }
 
 func (p *Parser) parsePrimaryKeyConstraint(col *storage.Column) error {
@@ -3153,7 +3225,7 @@ func (p *Parser) isColumnTypeTerminator() bool {
 		return false
 	}
 	switch p.cur.Val {
-	case "PRIMARY", "FOREIGN", "UNIQUE", "REFERENCES", "NOT", "NULL":
+	case "PRIMARY", "FOREIGN", "UNIQUE", "REFERENCES", "NOT", "NULL", "DEFAULT":
 		return true
 	default:
 		return false
