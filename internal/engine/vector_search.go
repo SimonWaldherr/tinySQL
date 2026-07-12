@@ -226,6 +226,8 @@ type vecSearchColumnCacheEntry struct {
 	valid      []bool
 }
 
+type vecColumnBuildCall struct{ done chan struct{} }
+
 // vecColumnCacheMaxEntries bounds the column cache. Entries are keyed by
 // (tenant, table, column) and each one pins its *storage.Table — including
 // every row — via the entry's table pointer. Same-name replacement reuses
@@ -239,6 +241,10 @@ const vecColumnCacheMaxEntries = 256
 var (
 	vecSearchColumnCacheMu sync.RWMutex
 	vecSearchColumnCache   = make(map[vecSearchColumnCacheKey]vecSearchColumnCacheEntry)
+	// vecSearchColumnBuilds coalesces concurrent cold reads for the same
+	// vector column. Without it, a RAG request burst can make every caller
+	// scan and normalize the whole column before any one cache entry wins.
+	vecSearchColumnBuilds = make(map[vecSearchColumnCacheKey]*vecColumnBuildCall)
 )
 
 // purgeVectorCachesFor eagerly drops all cached vector-search structures
@@ -287,13 +293,42 @@ func evictOverCap[K comparable, V any](m map[K]V, maxEntries int) {
 func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeNorms bool) vecSearchColumnCacheEntry {
 	key := vecSearchColumnCacheKey{tenant: tenant, table: table.Name, colIdx: colIdx}
 
-	vecSearchColumnCacheMu.RLock()
-	if cached, ok := vecSearchColumnCache[key]; ok && cached.table == table && cached.version == table.Version && (!includeNorms || cached.normsReady) {
+	for {
+		vecSearchColumnCacheMu.RLock()
+		if cached, ok := vecSearchColumnCache[key]; ok && cached.table == table && cached.version == table.Version && (!includeNorms || cached.normsReady) {
+			vecSearchColumnCacheMu.RUnlock()
+			return cached
+		}
 		vecSearchColumnCacheMu.RUnlock()
-		return cached
-	}
-	vecSearchColumnCacheMu.RUnlock()
 
+		vecSearchColumnCacheMu.Lock()
+		if cached, ok := vecSearchColumnCache[key]; ok && cached.table == table && cached.version == table.Version && (!includeNorms || cached.normsReady) {
+			vecSearchColumnCacheMu.Unlock()
+			return cached
+		}
+		if call := vecSearchColumnBuilds[key]; call != nil {
+			vecSearchColumnCacheMu.Unlock()
+			<-call.done
+			continue
+		}
+		call := &vecColumnBuildCall{done: make(chan struct{})}
+		vecSearchColumnBuilds[key] = call
+		vecSearchColumnCacheMu.Unlock()
+
+		entry := buildVecColumnCache(table, colIdx, includeNorms)
+		vecSearchColumnCacheMu.Lock()
+		if _, exists := vecSearchColumnCache[key]; !exists {
+			evictOverCap(vecSearchColumnCache, vecColumnCacheMaxEntries)
+		}
+		vecSearchColumnCache[key] = entry
+		delete(vecSearchColumnBuilds, key)
+		close(call.done)
+		vecSearchColumnCacheMu.Unlock()
+		return entry
+	}
+}
+
+func buildVecColumnCache(table *storage.Table, colIdx int, includeNorms bool) vecSearchColumnCacheEntry {
 	vectors := make([][]float64, len(table.Rows))
 	var norms []float64
 	if includeNorms {
@@ -315,15 +350,7 @@ func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeN
 		valid[i] = true
 		vectors[i] = vec
 	}
-
-	entry := vecSearchColumnCacheEntry{table: table, version: table.Version, vectors: vectors, norms: norms, normsReady: includeNorms, valid: valid}
-	vecSearchColumnCacheMu.Lock()
-	if _, exists := vecSearchColumnCache[key]; !exists {
-		evictOverCap(vecSearchColumnCache, vecColumnCacheMaxEntries)
-	}
-	vecSearchColumnCache[key] = entry
-	vecSearchColumnCacheMu.Unlock()
-	return entry
+	return vecSearchColumnCacheEntry{table: table, version: table.Version, vectors: vectors, norms: norms, normsReady: includeNorms, valid: valid}
 }
 
 func vectorL2Norm(v []float64) float64 {

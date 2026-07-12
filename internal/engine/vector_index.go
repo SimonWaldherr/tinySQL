@@ -121,6 +121,11 @@ var (
 	vecIVFCache    = make(map[vecIndexCacheKey]*vecIVFIndex)
 	vecHNSWCacheMu sync.RWMutex
 	vecHNSWCache   = make(map[vecIndexCacheKey]*vecHNSWIndex)
+	// Cold ANN construction is intentionally serialized. It is rare (first
+	// query, VEC_WARM, or a table-version change), expensive, and concurrent
+	// duplicate builds can multiply CPU and heap use during a RAG traffic
+	// burst. Hot searches never take this mutex.
+	vecIndexBuildMu sync.Mutex
 
 	// vecVisitedPool recycles the per-search visited bitmaps so HNSW queries
 	// on large tables do not allocate len(rows) bytes per call.
@@ -216,6 +221,14 @@ func vecSearchTopKWithIndex(
 
 func getVecIVFIndex(ctx context.Context, tenant string, table *storage.Table, colIdx int, metric string, dims int, cache vecSearchColumnCacheEntry) (*vecIVFIndex, error) {
 	key := vecIndexCacheKey{tenant: tenant, table: table.Name, colIdx: colIdx, metric: metric}
+	vecIVFCacheMu.RLock()
+	if idx := vecIVFCache[key]; idx != nil && idx.table == table && idx.version == table.Version && idx.dims == dims {
+		vecIVFCacheMu.RUnlock()
+		return idx, nil
+	}
+	vecIVFCacheMu.RUnlock()
+	vecIndexBuildMu.Lock()
+	defer vecIndexBuildMu.Unlock()
 	vecIVFCacheMu.RLock()
 	if idx := vecIVFCache[key]; idx != nil && idx.table == table && idx.version == table.Version && idx.dims == dims {
 		vecIVFCacheMu.RUnlock()
@@ -343,6 +356,14 @@ func (idx *vecIVFIndex) search(ctx context.Context, query []float64, queryNorm f
 
 func getVecHNSWIndex(ctx context.Context, tenant string, table *storage.Table, colIdx int, metric string, dims int, cache vecSearchColumnCacheEntry) (*vecHNSWIndex, error) {
 	key := vecIndexCacheKey{tenant: tenant, table: table.Name, colIdx: colIdx, metric: metric}
+	vecHNSWCacheMu.RLock()
+	if idx := vecHNSWCache[key]; idx != nil && idx.table == table && idx.version == table.Version && idx.dims == dims {
+		vecHNSWCacheMu.RUnlock()
+		return idx, nil
+	}
+	vecHNSWCacheMu.RUnlock()
+	vecIndexBuildMu.Lock()
+	defer vecIndexBuildMu.Unlock()
 	vecHNSWCacheMu.RLock()
 	if idx := vecHNSWCache[key]; idx != nil && idx.table == table && idx.version == table.Version && idx.dims == dims {
 		vecHNSWCacheMu.RUnlock()

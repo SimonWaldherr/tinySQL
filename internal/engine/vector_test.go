@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sync"
 	"testing"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -780,6 +781,47 @@ func TestVecSearchANNIndexInvalidatesOnTableVersion(t *testing.T) {
 				t.Fatalf("%s did not rebuild after table version change: %#v", mode, rs.Rows)
 			}
 		})
+	}
+}
+
+func TestVecSearchConcurrentColdIndexBuild(t *testing.T) {
+	db := setupTestDB()
+	execSQL(t, db, `CREATE TABLE ann_docs (id INT, embedding VECTOR)`)
+	for i := 0; i < 128; i++ {
+		execSQL(t, db, fmt.Sprintf(`INSERT INTO ann_docs VALUES (%d, '[1.0, 0.0, 0.0]')`, i))
+	}
+	// Remove any state created by other tests for this table name before a
+	// concurrent first HNSW request. The test exercises the cache singleflight
+	// path and, under -race, guards its synchronization contract.
+	purgeVectorCachesFor("default", "ann_docs")
+	const readers = 16
+	errs := make(chan error, readers)
+	var wg sync.WaitGroup
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			stmt, err := NewParser(`SELECT id FROM VEC_SEARCH('ann_docs', 'embedding', '[1.0, 0.0, 0.0]', 5, 'cosine', 'hnsw')`).ParseStatement()
+			if err != nil {
+				errs <- err
+				return
+			}
+			rs, err := Execute(context.Background(), db, "default", stmt)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if len(rs.Rows) != 5 {
+				errs <- fmt.Errorf("rows = %d, want 5", len(rs.Rows))
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
