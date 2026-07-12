@@ -11,6 +11,8 @@ import (
 
 // Options controls exporter behavior.
 type Options = ie.Options
+type TableManifest = ie.TableManifest
+type ManifestColumn = ie.ManifestColumn
 
 // ExportCSV writes ResultSet rows as CSV to w.
 func ExportCSV(w io.Writer, rs *tinysql.ResultSet, opts Options) error {
@@ -41,4 +43,9 @@ func ExportXML(w io.Writer, rs *tinysql.ResultSet) error {
 // ExportGOB writes ResultSet rows and column order as a GOB payload.
 func ExportGOB(w io.Writer, rs *tinysql.ResultSet) error {
 	return ie.ExportGOB(w, rs)
+}
+
+// ExportTableManifest writes a versioned table schema and data fingerprint.
+func ExportTableManifest(w io.Writer, db *tinysql.DB, tenant, tableName string) error {
+	return ie.ExportTableManifest(w, db, tenant, tableName)
 }

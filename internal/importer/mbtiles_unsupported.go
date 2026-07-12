@@ -1,4 +1,4 @@
-//go:build js || wasm || baremetal
+//go:build !sqliteimport || js || wasm || baremetal
 
 package importer
 
@@ -18,7 +18,7 @@ func ImportMBTiles(
 	filePath string,
 	opts *ImportOptions,
 ) (*ImportResult, error) {
-	return nil, fmt.Errorf("MBTiles import is not supported on this TinyGo target")
+	return nil, fmt.Errorf("MBTiles/SQLite import requires the sqliteimport build tag")
 }
 
 func ImportMBTilesReader(
@@ -29,5 +29,5 @@ func ImportMBTilesReader(
 	src io.Reader,
 	opts *ImportOptions,
 ) (*ImportResult, error) {
-	return nil, fmt.Errorf("MBTiles import is not supported on this TinyGo target")
+	return nil, fmt.Errorf("MBTiles/SQLite import requires the sqliteimport build tag")
 }

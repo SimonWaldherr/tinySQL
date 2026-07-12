@@ -1,6 +1,8 @@
 package exporter
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/csv"
 	"encoding/gob"
 	"encoding/json"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/engine"
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 func init() {
@@ -24,9 +27,112 @@ type Options struct {
 	PrettyJSON   bool
 	CSVNoHeader  bool
 	CSVDelimiter rune
+	// BinaryEncoding controls CSV rendering of BLOB values. "base64" is the
+	// default and writes a self-identifying base64: payload; "hex" writes a
+	// self-identifying hex: payload. SQL always uses SQLite-compatible X'..'.
+	BinaryEncoding string
+	// JSONBinaryEnvelope preserves the BLOB/text distinction in JSON by
+	// encoding BLOBs as {"$tinysql":"blob","base64":"..."}. It is enabled
+	// by default; set JSONBinaryMode to "legacy-string" for a plain base64
+	// string compatible with encoding/json's historical []byte behaviour.
+	JSONBinaryMode string
 }
 
-func valueToString(v any) string {
+// TableManifest is a portable, versioned description of an exported table.
+// DataSHA256 fingerprints the ordered rows and typed cells without exposing
+// their contents. It allows an import/export workflow to verify parity before
+// publishing an artifact.
+type TableManifest struct {
+	FormatVersion int              `json:"format_version"`
+	Tenant        string           `json:"tenant"`
+	Table         string           `json:"table"`
+	TextEncoding  string           `json:"text_encoding"`
+	RowCount      int              `json:"row_count"`
+	DataSHA256    string           `json:"data_sha256"`
+	Columns       []ManifestColumn `json:"columns"`
+}
+
+// ManifestColumn preserves portable schema information without exposing
+// tinySQL internal implementation fields.
+type ManifestColumn struct {
+	Name         string `json:"name"`
+	DeclaredType string `json:"declared_type"`
+	Affinity     string `json:"affinity,omitempty"`
+	NotNull      bool   `json:"not_null"`
+	HasDefault   bool   `json:"has_default"`
+	DefaultSQL   string `json:"default_sql,omitempty"`
+	Constraint   string `json:"constraint,omitempty"`
+}
+
+// ExportTableManifest writes a deterministic JSON schema and data fingerprint
+// for one table. The corresponding data can be exported as CSV, JSON or SQL.
+func ExportTableManifest(w io.Writer, db *storage.DB, tenant, tableName string) error {
+	table, err := db.Get(tenant, tableName)
+	if err != nil {
+		return err
+	}
+	manifest := TableManifest{
+		FormatVersion: 1,
+		Tenant:        tenant,
+		Table:         table.Name,
+		TextEncoding:  "utf-8",
+		RowCount:      len(table.Rows),
+		DataSHA256:    tableDataSHA256(table.Rows),
+		Columns:       make([]ManifestColumn, len(table.Cols)),
+	}
+	for i, col := range table.Cols {
+		declared := col.DeclaredType
+		if declared == "" {
+			declared = col.Type.String()
+		}
+		manifest.Columns[i] = ManifestColumn{
+			Name:         col.Name,
+			DeclaredType: declared,
+			Affinity:     col.Affinity.String(),
+			NotNull:      col.NotNull || col.Constraint == storage.PrimaryKey,
+			HasDefault:   col.HasDefault,
+			DefaultSQL:   manifestDefaultSQL(col),
+			Constraint:   col.Constraint.String(),
+		}
+	}
+	return json.NewEncoder(w).Encode(manifest)
+}
+
+func manifestDefaultSQL(col storage.Column) string {
+	if !col.HasDefault {
+		return ""
+	}
+	return valueToSQLLiteral(col.DefaultValue)
+}
+
+func tableDataSHA256(rows [][]any) string {
+	h := sha256.New()
+	for _, row := range rows {
+		for _, cell := range row {
+			writeManifestCell(h, cell)
+		}
+		h.Write([]byte{0xff}) // row boundary distinct from all cell encodings
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+func writeManifestCell(w io.Writer, v any) {
+	var kind, value string
+	switch x := v.(type) {
+	case nil:
+		kind = "null"
+	case []byte:
+		kind, value = "blob", base64.StdEncoding.EncodeToString(x)
+	case time.Time:
+		kind, value = "time", x.UTC().Format(time.RFC3339Nano)
+	default:
+		kind, value = fmt.Sprintf("%T", v), fmt.Sprint(v)
+	}
+	fmt.Fprintf(w, "%s:%d:%s", kind, len(value), value)
+	w.Write([]byte{0})
+}
+
+func valueToString(v any, binaryEncoding string) string {
 	if v == nil {
 		return ""
 	}
@@ -62,7 +168,10 @@ func valueToString(v any) string {
 	case time.Time:
 		return t.Format(time.RFC3339)
 	case []byte:
-		return string(t)
+		if strings.EqualFold(binaryEncoding, "hex") {
+			return "hex:" + fmt.Sprintf("%x", t)
+		}
+		return "base64:" + base64.StdEncoding.EncodeToString(t)
 	default:
 		return fmt.Sprint(t)
 	}
@@ -82,7 +191,7 @@ func ExportCSV(w io.Writer, rs *engine.ResultSet, opts Options) error {
 	for _, r := range rs.Rows {
 		row := make([]string, len(rs.Cols))
 		for i, c := range rs.Cols {
-			row[i] = valueToString(r[strings.ToLower(c)])
+			row[i] = valueToString(r[strings.ToLower(c)], opts.BinaryEncoding)
 		}
 		if err := csvw.Write(row); err != nil {
 			return err
@@ -103,11 +212,22 @@ func ExportJSON(w io.Writer, rs *engine.ResultSet, opts Options) error {
 	for i, r := range rs.Rows {
 		m := make(map[string]any, len(rs.Cols))
 		for _, c := range rs.Cols {
-			m[c] = r[strings.ToLower(c)]
+			m[c] = jsonValue(r[strings.ToLower(c)], opts)
 		}
 		out[i] = m
 	}
 	return enc.Encode(out)
+}
+
+func jsonValue(v any, opts Options) any {
+	b, ok := v.([]byte)
+	if !ok || strings.EqualFold(opts.JSONBinaryMode, "legacy-string") {
+		return v
+	}
+	return map[string]string{
+		"$tinysql": "blob",
+		"base64":   base64.StdEncoding.EncodeToString(b),
+	}
 }
 
 // ExportSQL writes ResultSet rows as INSERT statements for tableName.
@@ -135,9 +255,9 @@ func valueToSQLLiteral(v any) string {
 	case time.Time:
 		return "'" + t.Format(time.RFC3339) + "'"
 	case []byte:
-		return "'" + strings.ReplaceAll(string(t), "'", "''") + "'"
+		return "X'" + fmt.Sprintf("%X", t) + "'"
 	default:
-		return valueToString(v)
+		return valueToString(v, "base64")
 	}
 }
 
@@ -161,7 +281,7 @@ func ExportXML(w io.Writer, rs *engine.ResultSet) error {
 	for _, r := range rs.Rows {
 		xrRow := xmlRow{Fields: make([]xmlField, 0, len(rs.Cols))}
 		for _, c := range rs.Cols {
-			xrRow.Fields = append(xrRow.Fields, xmlField{XMLName: xml.Name{Local: c}, Value: valueToString(r[strings.ToLower(c)])})
+			xrRow.Fields = append(xrRow.Fields, xmlField{XMLName: xml.Name{Local: c}, Value: valueToString(r[strings.ToLower(c)], "base64")})
 		}
 		xr.Rows = append(xr.Rows, xrRow)
 	}

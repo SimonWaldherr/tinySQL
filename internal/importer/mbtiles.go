@@ -1,4 +1,4 @@
-//go:build !js && !wasm && !baremetal
+//go:build sqliteimport && !js && !wasm && !baremetal
 
 package importer
 

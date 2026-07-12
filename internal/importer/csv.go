@@ -39,6 +39,9 @@ import (
 	"unicode/utf16"
 	"unicode/utf8"
 
+	"golang.org/x/text/encoding/charmap"
+	"golang.org/x/text/transform"
+
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
@@ -48,6 +51,12 @@ import (
 
 // ImportOptions configures the importer behavior. All fields are optional.
 type ImportOptions struct {
+	// Encoding selects the source text encoding. Empty or "auto" accepts a
+	// UTF BOM when present and otherwise requires UTF-8. Legacy single-byte
+	// encodings are opt-in: iso-8859-1, iso-8859-2, iso-8859-15, and
+	// windows-1252. tinySQL always stores resulting TEXT as UTF-8.
+	Encoding string
+
 	// BatchSize controls how many rows are buffered before executing INSERT (default 1000).
 	BatchSize int
 
@@ -237,6 +246,13 @@ func prepareReader(src io.Reader, opts *ImportOptions) (io.Reader, string, bool,
 	br := bufio.NewReader(r)
 	sampleBytes, _ := br.Peek(maxInt(opts.SampleBytes, 16))
 	enc, hasBOM := detectEncoding(sampleBytes)
+	if requested := strings.ToLower(strings.TrimSpace(opts.Encoding)); requested != "" && requested != "auto" {
+		var err error
+		enc, err = normalizeTextEncoding(requested)
+		if err != nil {
+			return nil, "", false, err
+		}
+	}
 
 	switch enc {
 	case "utf-16le", "utf-16be":
@@ -249,14 +265,112 @@ func prepareReader(src io.Reader, opts *ImportOptions) (io.Reader, string, bool,
 			return nil, "", false, fmt.Errorf("decode UTF-16: %w", err)
 		}
 		return bytes.NewReader(utf8data), enc, hasBOM, nil
+	case "iso-8859-1", "iso-8859-2", "iso-8859-15", "windows-1252":
+		decoder, err := textDecoder(enc)
+		if err != nil {
+			return nil, "", false, err
+		}
+		return newStrictUTF8Reader(transform.NewReader(br, decoder)), enc, false, nil
 	default:
 		if hasBOM {
 			if _, err := br.Discard(3); err != nil {
 				return nil, "", false, fmt.Errorf("discard UTF-8 BOM: %w", err)
 			}
 		}
-		return br, enc, hasBOM, nil
+		return newStrictUTF8Reader(br), enc, hasBOM, nil
 	}
+}
+
+func normalizeTextEncoding(enc string) (string, error) {
+	switch enc {
+	case "utf-8", "utf8":
+		return "utf-8", nil
+	case "utf-16le", "utf16le":
+		return "utf-16le", nil
+	case "utf-16be", "utf16be":
+		return "utf-16be", nil
+	case "iso-8859-1", "iso8859-1", "latin1":
+		return "iso-8859-1", nil
+	case "iso-8859-2", "iso8859-2":
+		return "iso-8859-2", nil
+	case "iso-8859-15", "iso8859-15", "latin9":
+		return "iso-8859-15", nil
+	case "windows-1252", "cp1252":
+		return "windows-1252", nil
+	default:
+		return "", fmt.Errorf("unsupported text encoding %q", enc)
+	}
+}
+
+func textDecoder(enc string) (transform.Transformer, error) {
+	switch enc {
+	case "iso-8859-1":
+		return charmap.ISO8859_1.NewDecoder(), nil
+	case "iso-8859-2":
+		return charmap.ISO8859_2.NewDecoder(), nil
+	case "iso-8859-15":
+		return charmap.ISO8859_15.NewDecoder(), nil
+	case "windows-1252":
+		return charmap.Windows1252.NewDecoder(), nil
+	default:
+		return nil, fmt.Errorf("unsupported text encoding %q", enc)
+	}
+}
+
+// strictUTF8Reader validates the entire decoded stream without buffering it
+// in memory. A malformed sequence is an import error rather than a silent
+// U+FFFD replacement, preserving the TEXT/BLOB boundary.
+type strictUTF8Reader struct {
+	r       io.Reader
+	out     []byte
+	tail    []byte
+	readErr error
+}
+
+func newStrictUTF8Reader(r io.Reader) *strictUTF8Reader { return &strictUTF8Reader{r: r} }
+
+func (r *strictUTF8Reader) Read(p []byte) (int, error) {
+	for len(r.out) == 0 && r.readErr == nil {
+		buf := make([]byte, 32*1024)
+		n, err := r.r.Read(buf)
+		if n > 0 {
+			r.process(append(r.tail, buf[:n]...))
+		}
+		if err != nil {
+			if err == io.EOF && len(r.tail) > 0 {
+				r.readErr = fmt.Errorf("invalid UTF-8 at end of input")
+			} else {
+				r.readErr = err
+			}
+		}
+	}
+	if len(r.out) > 0 {
+		n := copy(p, r.out)
+		r.out = r.out[n:]
+		return n, nil
+	}
+	if r.readErr == io.EOF {
+		return 0, io.EOF
+	}
+	return 0, r.readErr
+}
+
+func (r *strictUTF8Reader) process(data []byte) {
+	r.tail = r.tail[:0]
+	i := 0
+	for i < len(data) {
+		if !utf8.FullRune(data[i:]) {
+			r.tail = append(r.tail, data[i:]...)
+			break
+		}
+		_, size := utf8.DecodeRune(data[i:])
+		if size == 1 && data[i] >= 0x80 {
+			r.readErr = fmt.Errorf("invalid UTF-8 sequence")
+			return
+		}
+		i += size
+	}
+	r.out = append(r.out, data[:i]...)
 }
 
 // initCSVFromReader samples the reader to detect delimiter/header and returns a
@@ -395,9 +509,10 @@ func decodeUTF16All(b []byte, bigEndian bool) ([]byte, error) {
 		b = b[2:]
 	}
 
-	// Pad odd byte count
+	// An incomplete code unit is malformed input. Padding would silently
+	// fabricate a character and violates the strict text import contract.
 	if len(b)%2 != 0 {
-		b = append(b, 0)
+		return nil, fmt.Errorf("odd UTF-16 byte length")
 	}
 
 	u16s := make([]uint16, len(b)/2)

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/engine"
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 func makeSample() *engine.ResultSet {
@@ -70,11 +71,57 @@ func TestExportSQL(t *testing.T) {
 		t.Fatalf("ExportSQL failed: %v", err)
 	}
 	out := buf.String()
-	if !bytes.Contains(buf.Bytes(), []byte("INSERT INTO people (id, name, created_at, payload) VALUES (1, 'O''Hara', '2020-01-02T03:04:05Z', 'a''b');")) {
+	if !bytes.Contains(buf.Bytes(), []byte("INSERT INTO people (id, name, created_at, payload) VALUES (1, 'O''Hara', '2020-01-02T03:04:05Z', X'612762');")) {
 		t.Fatalf("SQL missing escaped row: %s", out)
 	}
 	if !bytes.Contains(buf.Bytes(), []byte("VALUES (2, NULL")) {
 		t.Fatalf("SQL missing NULL row: %s", out)
+	}
+}
+
+func TestExportBinaryValuesAreUnambiguous(t *testing.T) {
+	rs := &engine.ResultSet{Cols: []string{"payload"}, Rows: []engine.Row{{"payload": []byte{0x00, 0xff}}}}
+
+	var csvBuf bytes.Buffer
+	if err := ExportCSV(&csvBuf, rs, Options{}); err != nil {
+		t.Fatalf("ExportCSV: %v", err)
+	}
+	if !bytes.Contains(csvBuf.Bytes(), []byte("base64:AP8=")) {
+		t.Fatalf("CSV BLOB = %q", csvBuf.String())
+	}
+
+	var jsonBuf bytes.Buffer
+	if err := ExportJSON(&jsonBuf, rs, Options{}); err != nil {
+		t.Fatalf("ExportJSON: %v", err)
+	}
+	if !bytes.Contains(jsonBuf.Bytes(), []byte(`"$tinysql":"blob"`)) || !bytes.Contains(jsonBuf.Bytes(), []byte(`"base64":"AP8="`)) {
+		t.Fatalf("JSON BLOB envelope = %q", jsonBuf.String())
+	}
+}
+
+func TestExportTableManifest(t *testing.T) {
+	db := storage.NewDB()
+	table := storage.NewTable("places", []storage.Column{
+		{Name: "name", Type: storage.TextType, DeclaredType: "VARCHAR(80)", Affinity: storage.AffinityText, NotNull: true},
+		{Name: "payload", Type: storage.BlobType},
+	}, false)
+	table.Rows = append(table.Rows, []any{"Bayern", []byte{0x01, 0x02}})
+	if err := db.Put("default", table); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := ExportTableManifest(&buf, db, "default", "places"); err != nil {
+		t.Fatalf("ExportTableManifest: %v", err)
+	}
+	var manifest TableManifest
+	if err := json.Unmarshal(buf.Bytes(), &manifest); err != nil {
+		t.Fatalf("manifest JSON: %v", err)
+	}
+	if manifest.FormatVersion != 1 || manifest.TextEncoding != "utf-8" || manifest.RowCount != 1 || manifest.DataSHA256 == "" {
+		t.Fatalf("manifest = %#v", manifest)
+	}
+	if manifest.Columns[0].DeclaredType != "VARCHAR(80)" || !manifest.Columns[0].NotNull {
+		t.Fatalf("schema manifest = %#v", manifest.Columns)
 	}
 }
 

@@ -1,7 +1,11 @@
 package importer
 
 import (
+	"bytes"
+	"context"
 	"testing"
+
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 func TestDetectEncodingAndDecodeUTF16(t *testing.T) {
@@ -27,6 +31,37 @@ func TestDetectEncodingAndDecodeUTF16(t *testing.T) {
 	}
 	if string(out) != "ab" {
 		t.Fatalf("decodeUTF16All result unexpected: %q", string(out))
+	}
+}
+
+func TestImportCSVExplicitLegacyEncoding(t *testing.T) {
+	db := storage.NewDB()
+	data := []byte("name\nM\xfcnchen\n")
+	result, err := ImportCSV(context.Background(), db, "default", "cities", bytes.NewReader(data), &ImportOptions{
+		CreateTable: true,
+		HeaderMode:  "present",
+		Encoding:    "iso-8859-1",
+	})
+	if err != nil {
+		t.Fatalf("ImportCSV ISO-8859-1: %v", err)
+	}
+	if result.Encoding != "iso-8859-1" {
+		t.Fatalf("encoding = %q", result.Encoding)
+	}
+	table, err := db.Get("default", "cities")
+	if err != nil || table.Rows[0][0] != "München" {
+		t.Fatalf("decoded row = %#v, err=%v", table.Rows, err)
+	}
+}
+
+func TestImportCSVRejectsInvalidUTF8(t *testing.T) {
+	db := storage.NewDB()
+	_, err := ImportCSV(context.Background(), db, "default", "bad", bytes.NewReader([]byte("name\n\xff\n")), &ImportOptions{
+		CreateTable: true,
+		HeaderMode:  "present",
+	})
+	if err == nil {
+		t.Fatal("invalid UTF-8 import unexpectedly succeeded")
 	}
 }
 
