@@ -929,10 +929,10 @@ func buildOrderByClause(sb *strings.Builder, orderBy []engine.OrderItem) {
 // Helper: build LIMIT/OFFSET clauses
 func buildLimitOffsetClauses(sb *strings.Builder, limit *int, offset *int) {
 	if limit != nil {
-		sb.WriteString(fmt.Sprintf(" LIMIT %d", *limit))
+		fmt.Fprintf(sb, " LIMIT %d", *limit)
 	}
 	if offset != nil {
-		sb.WriteString(fmt.Sprintf(" OFFSET %d", *offset))
+		fmt.Fprintf(sb, " OFFSET %d", *offset)
 	}
 }
 

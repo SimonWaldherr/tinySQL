@@ -180,21 +180,6 @@ func (bp *BTreePage) getRecord(i int) []byte {
 	return bp.buf[e.Offset : e.Offset+e.Length]
 }
 
-// appendRecord adds a record to the page and returns its slot index.
-func (bp *BTreePage) appendRecord(data []byte) (int, error) {
-	needed := len(data)
-	if bp.freeSpace() < needed {
-		return -1, fmt.Errorf("btree page full: need %d, have %d free", needed, bp.freeSpace())
-	}
-	newEnd := bp.freeSpaceEnd() - needed
-	copy(bp.buf[newEnd:], data)
-	bp.setFreeSpaceEnd(newEnd)
-	idx := bp.slotCount()
-	bp.setSlotEntry(idx, SlotEntry{Offset: uint16(newEnd), Length: uint16(needed)})
-	bp.setSlotCount(idx + 1)
-	return idx, nil
-}
-
 // insertRecordAt inserts a record at position pos, shifting later slots.
 func (bp *BTreePage) insertRecordAt(pos int, data []byte) error {
 	needed := len(data)

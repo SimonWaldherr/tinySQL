@@ -26,7 +26,6 @@ package engine
 import (
 	"context"
 	"fmt"
-	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -50,12 +49,6 @@ type ftsIndex struct {
 	InvIndex  map[string][]ftsPosting // term → postings list
 	DocLens   map[int]int             // rowID → document length
 	AvgDocLen float64
-}
-
-// ftsSearchResult holds the result of an FTS search.
-type ftsSearchResult struct {
-	RowID int
-	Score float64
 }
 
 // Global FTS registry (tenant/table → index).
@@ -230,61 +223,6 @@ const (
 	bm25K1 = 1.2
 	bm25B  = 0.75
 )
-
-// ftsSearch performs a BM25-ranked search and returns the top-k results.
-// k <= 0 means return all results.
-func ftsSearch(key string, query string, k int) []ftsSearchResult {
-	ftsRegistryMu.RLock()
-	idx, ok := ftsRegistry[key]
-	ftsRegistryMu.RUnlock()
-	if !ok {
-		return nil
-	}
-
-	queryTerms := ftsTokenize(query)
-	if len(queryTerms) == 0 {
-		return nil
-	}
-
-	ftsRegistryMu.RLock()
-	defer ftsRegistryMu.RUnlock()
-
-	N := float64(len(idx.DocLens))
-	if N == 0 {
-		return nil
-	}
-
-	scores := make(map[int]float64)
-	for _, term := range queryTerms {
-		posts, ok := idx.InvIndex[term]
-		if !ok {
-			continue
-		}
-		df := float64(len(posts))
-		idf := math.Log((N-df+0.5)/(df+0.5) + 1)
-		for _, p := range posts {
-			tf := float64(p.Freq)
-			dl := float64(p.DocLen)
-			avgdl := idx.AvgDocLen
-			if avgdl == 0 {
-				avgdl = 1
-			}
-			tfNorm := (tf * (bm25K1 + 1)) / (tf + bm25K1*(1-bm25B+bm25B*dl/avgdl))
-			scores[p.RowID] += idf * tfNorm
-		}
-	}
-
-	results := make([]ftsSearchResult, 0, len(scores))
-	for rowID, score := range scores {
-		results = append(results, ftsSearchResult{RowID: rowID, Score: score})
-	}
-	sort.Slice(results, func(i, j int) bool { return results[i].Score > results[j].Score })
-
-	if k > 0 && len(results) > k {
-		results = results[:k]
-	}
-	return results
-}
 
 // ─────────────────────────── FTS virtual table creation ──────────────────────
 

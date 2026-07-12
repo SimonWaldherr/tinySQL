@@ -137,9 +137,8 @@ func VerifyDB(dbPath string) ([]string, error) {
 			fi.Size(), pageSize))
 	}
 
-	if uint64(totalPages) != sb.PageCount && uint64(totalPages) > sb.PageCount {
-		// Allow file to be larger (pages may have been allocated).
-	}
+	// A file may be larger than the superblock page count because pages can be
+	// allocated before the superblock is updated.
 
 	// Check each page's CRC.
 	buf := make([]byte, pageSize)

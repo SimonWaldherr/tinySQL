@@ -140,8 +140,8 @@ func TestRowCodec_BufferReuse(t *testing.T) {
 	buf := MarshalRow(row, nil)
 	// Reuse the buffer.
 	buf2 := MarshalRow(row, buf)
-	if &buf[0] == &buf2[0] && len(buf) == len(buf2) {
-		// Good — buffer was reused (same underlying array).
+	if &buf[0] != &buf2[0] || len(buf) != len(buf2) {
+		t.Fatalf("expected MarshalRow to reuse the supplied buffer")
 	}
 	decoded, err := UnmarshalRow(buf2)
 	if err != nil {

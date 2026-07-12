@@ -161,11 +161,11 @@ func TestPublicRBACHelpers(t *testing.T) {
 	if table.Cols[0].Constraint != tsql.PrimaryKey {
 		t.Fatal("expected public ConstraintType alias to work with Column")
 	}
-	var _ tsql.Grant = tsql.Grant{Permission: tsql.PermSelect, Schema: "default", Table: "public_rbac"}
-	var _ *tsql.CatalogManager = db.Catalog()
-	var _ []*tsql.CatalogTable = db.Catalog().GetTables()
-	var _ []tsql.CatalogRole = db.Catalog().ListRoles()
-	var _ []tsql.CatalogUser = db.Catalog().ListUsers()
+	var _ = tsql.Grant{Permission: tsql.PermSelect, Schema: "default", Table: "public_rbac"}
+	var _ = db.Catalog()
+	var _ = db.Catalog().GetTables()
+	var _ = db.Catalog().ListRoles()
+	var _ = db.Catalog().ListUsers()
 }
 
 func TestPublicAPICompiledExecutionAndJobScheduler(t *testing.T) {

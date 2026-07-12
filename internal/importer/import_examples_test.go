@@ -40,8 +40,8 @@ func TestImportDecimalUUIDMoney_InsertAllRecords(t *testing.T) {
 	}
 
 	// Basic type assertions
-	if _, ok := tbl.Rows[0][0].([]byte); ok {
-		// uuid.UUID may marshal to []byte in storage; accept either
+	if _, ok := tbl.Rows[0][0].([]byte); !ok {
+		t.Fatalf("expected UUID storage representation as []byte, got %T", tbl.Rows[0][0])
 	}
 }
 

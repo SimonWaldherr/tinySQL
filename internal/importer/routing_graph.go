@@ -54,7 +54,7 @@ func importRoutingGraphJSON(ctx context.Context, db *storage.DB, tenant, tableNa
 	}
 
 	nodes := make([]map[string]any, 0)
-	edges := make([]map[string]any, 0)
+	var edges []map[string]any
 	switch v := payload.(type) {
 	case map[string]any:
 		nodes = mapSlice(v["nodes"])

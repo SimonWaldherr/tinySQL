@@ -1374,8 +1374,8 @@ func diskToTable(dt diskTable) *Table {
 				row[ci] = nil
 				continue
 			}
-			switch {
-			case cols[ci].Type == JsonType:
+			switch cols[ci].Type {
+			case JsonType:
 				var anyv any
 				switch val := v.(type) {
 				case string:
@@ -1387,7 +1387,7 @@ func diskToTable(dt diskTable) *Table {
 				default:
 					row[ci] = val
 				}
-			case cols[ci].Type == VectorType:
+			case VectorType:
 				// GOB preserves []float64 exactly; JSON-based backends decode
 				// a JSON number array into []any (each element boxed as
 				// float64). Normalize both to []float64 so vector functions

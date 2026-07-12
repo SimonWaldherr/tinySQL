@@ -1064,7 +1064,7 @@ func (p *Parser) parseTriggerWhen() (Expr, string, error) {
 func (p *Parser) parseTriggerBody() ([]Statement, string, error) {
 	startPos := p.cur.Pos
 	var body []Statement
-	for !(p.cur.Typ == tKeyword && p.cur.Val == "END") && p.cur.Typ != tEOF {
+	for (p.cur.Typ != tKeyword || p.cur.Val != "END") && p.cur.Typ != tEOF {
 		stmt, err := p.ParseStatement()
 		if err != nil {
 			return nil, "", fmt.Errorf("trigger body: %w", err)
@@ -1287,7 +1287,7 @@ func (p *Parser) parseJobScheduleOnce(job *CreateJob) error {
 func (p *Parser) parseJobSQLBody() string {
 	bodyStart := p.cur.Pos
 	// Advance until semicolon or EOF
-	for !(p.cur.Typ == tSymbol && p.cur.Val == ";") && p.cur.Typ != tEOF {
+	for (p.cur.Typ != tSymbol || p.cur.Val != ";") && p.cur.Typ != tEOF {
 		p.next()
 	}
 	endPos := p.cur.Pos
@@ -2983,7 +2983,7 @@ func (p *Parser) parseReferencesConstraint(col *storage.Column) error {
 // column-level spellings: "col TYPE REFERENCES ..." and
 // "col TYPE FOREIGN KEY REFERENCES ...".
 func (p *Parser) parseReferencesClauseInto(col *storage.Column) error {
-	if !(p.cur.Typ == tKeyword && p.cur.Val == "REFERENCES") {
+	if p.cur.Typ != tKeyword || p.cur.Val != "REFERENCES" {
 		return nil
 	}
 	p.next()
@@ -3737,7 +3737,7 @@ func (p *Parser) parseCaseExpr() (Expr, error) {
 	p.next() // consume CASE
 	var operand Expr
 	var err error
-	if !(p.cur.Typ == tKeyword && p.cur.Val == "WHEN") {
+	if p.cur.Typ != tKeyword || p.cur.Val != "WHEN" {
 		operand, err = p.parseExpr()
 		if err != nil {
 			return nil, err
@@ -3760,7 +3760,7 @@ func (p *Parser) parseCaseExpr() (Expr, error) {
 			return nil, err
 		}
 		whens = append(whens, CaseWhen{When: cond, Then: res})
-		if !(p.cur.Typ == tKeyword && p.cur.Val == "WHEN") {
+		if p.cur.Typ != tKeyword || p.cur.Val != "WHEN" {
 			break
 		}
 	}

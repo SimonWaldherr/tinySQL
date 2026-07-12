@@ -212,11 +212,6 @@ func (t *Table) indexKey(columns []string, row []any) ([]byte, error) {
 	return key, nil
 }
 
-func canonicalIndexKey(values []any) []byte {
-	key := make([]byte, 0, len(values)*12)
-	return canonicalIndexKeyInto(key, values)
-}
-
 func canonicalIndexKeyInto(key []byte, values []any) []byte {
 	for _, value := range values {
 		key = appendCanonicalIndexValue(key, value)

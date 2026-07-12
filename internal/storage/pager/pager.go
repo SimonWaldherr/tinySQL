@@ -424,14 +424,6 @@ func (p *Pager) FreePage(pid PageID) {
 	p.pool.mu.Unlock()
 }
 
-// freePageLocked is like FreePage but assumes p.mu is already held.
-func (p *Pager) freePageLocked(pid PageID) {
-	p.freeMgr.Free(pid)
-	p.pool.mu.Lock()
-	p.pool.remove(pid)
-	p.pool.mu.Unlock()
-}
-
 // freeOldFreeListChain walks the old free-list chain and adds those pages
 // to the FreeManager so they can be reused. Must be called with p.mu held.
 func (p *Pager) freeOldFreeListChain(head PageID) {

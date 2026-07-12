@@ -228,10 +228,10 @@ func geoPointFromMap(obj map[string]any) (geoPoint, error) {
 	}
 	coords, ok := obj["coordinates"].([]any)
 	if !ok {
-		return geoPoint{}, fmt.Errorf("Point coordinates must be an array")
+		return geoPoint{}, fmt.Errorf("point coordinates must be an array")
 	}
 	if len(coords) < 2 {
-		return geoPoint{}, fmt.Errorf("Point coordinates need lon and lat")
+		return geoPoint{}, fmt.Errorf("point coordinates need lon and lat")
 	}
 	lon, err := geoFloat(coords[0])
 	if err != nil {

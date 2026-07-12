@@ -119,7 +119,7 @@ func tokenizeSingleLineComment(sql string, i int) (sqlToken, int) {
 // tokenizeMultiLineComment tokenizes a multi-line comment (/* ... */)
 func tokenizeMultiLineComment(sql string, i int) (sqlToken, int) {
 	j := i + 2
-	for j+1 < len(sql) && !(sql[j] == '*' && sql[j+1] == '/') {
+	for j+1 < len(sql) && (sql[j] != '*' || sql[j+1] != '/') {
 		j++
 	}
 	if j+1 < len(sql) {
@@ -271,9 +271,10 @@ func (b *SQLBeautifier) formatTokens(tokens []sqlToken) string {
 			}
 		}
 
-		if tok.value == "(" {
+		switch tok.value {
+		case "(":
 			indent++
-		} else if tok.value == ")" {
+		case ")":
 			indent--
 			if indent < 0 {
 				indent = 0

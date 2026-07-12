@@ -399,14 +399,14 @@ func TestStmtExecQueryPaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare failed: %v", err)
 	}
-	if _, err := st.Exec([]driver.Value{int64(7)}); err != nil {
+	if _, err := st.(*stmt).ExecContext(context.Background(), []driver.NamedValue{{Ordinal: 1, Value: int64(7)}}); err != nil {
 		t.Fatalf("stmt exec failed: %v", err)
 	}
 	q, err := c.Prepare("SELECT id FROM s")
 	if err != nil {
 		t.Fatalf("prepare query failed: %v", err)
 	}
-	rs, err := q.Query(nil)
+	rs, err := q.(*stmt).QueryContext(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("stmt query failed: %v", err)
 	}

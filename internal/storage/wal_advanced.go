@@ -522,7 +522,7 @@ func (w *AdvancedWAL) Recover(db *DB) (int, error) {
 		}
 		return 0, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	dec := gob.NewDecoder(file)
 
@@ -702,21 +702,21 @@ func (w *AdvancedWAL) calculateChecksum(record *WALRecord) uint32 {
 	var b [8]byte
 	writeU64 := func(v uint64) {
 		binary.LittleEndian.PutUint64(b[:], v)
-		h.Write(b[:])
+		_, _ = h.Write(b[:])
 	}
 	writeU64(uint64(record.LSN))
 	writeU64(uint64(record.TxID))
-	h.Write([]byte{byte(record.OpType)})
-	io.WriteString(h, record.Tenant)
-	h.Write([]byte{0})
-	io.WriteString(h, record.Table)
-	h.Write([]byte{0})
+	_, _ = h.Write([]byte{byte(record.OpType)})
+	_, _ = io.WriteString(h, record.Tenant)
+	_, _ = h.Write([]byte{0})
+	_, _ = io.WriteString(h, record.Table)
+	_, _ = h.Write([]byte{0})
 	writeU64(uint64(record.RowID))
 	writeU64(uint64(record.Timestamp.UnixNano()))
 	hashWALImage(h, record.BeforeImage)
 	hashWALImage(h, record.AfterImage)
 	for _, c := range record.Columns {
-		fmt.Fprintf(h, "c%s;%d;", c.Name, int(c.Type))
+		_, _ = fmt.Fprintf(h, "c%s;%d;", c.Name, int(c.Type))
 	}
 	return h.Sum32()
 }
@@ -727,28 +727,28 @@ func (w *AdvancedWAL) calculateChecksum(record *WALRecord) uint32 {
 // UnixNano, and maps are hashed in sorted key order.
 func hashWALImage(h io.Writer, image []any) {
 	if image == nil {
-		io.WriteString(h, "~")
+		_, _ = io.WriteString(h, "~")
 		return
 	}
-	io.WriteString(h, "[")
+	_, _ = io.WriteString(h, "[")
 	for _, v := range image {
 		hashWALValue(h, v)
 	}
-	io.WriteString(h, "]")
+	_, _ = io.WriteString(h, "]")
 }
 
 func hashWALValue(h io.Writer, v any) {
 	switch t := v.(type) {
 	case nil:
-		io.WriteString(h, "n;")
+		_, _ = io.WriteString(h, "n;")
 	case time.Time:
-		fmt.Fprintf(h, "t%d;", t.UnixNano())
+		_, _ = fmt.Fprintf(h, "t%d;", t.UnixNano())
 	case []float64:
-		io.WriteString(h, "V")
+		_, _ = io.WriteString(h, "V")
 		var b [8]byte
 		for _, f := range t {
 			binary.LittleEndian.PutUint64(b[:], math.Float64bits(f))
-			h.Write(b[:])
+			_, _ = h.Write(b[:])
 		}
 	case []any:
 		io.WriteString(h, "[")

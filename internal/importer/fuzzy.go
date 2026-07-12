@@ -114,8 +114,8 @@ func FuzzyImportCSV(
 // Helper: prepare headers and split data records
 func fuzzyPrepareHeaders(records [][]string, opts *FuzzyImportOptions) ([]string, [][]string) {
 	headerMode := "auto"
-	if opts.ImportOptions != nil && opts.ImportOptions.HeaderMode != "" {
-		headerMode = opts.ImportOptions.HeaderMode
+	if opts.ImportOptions != nil && opts.HeaderMode != "" {
+		headerMode = opts.HeaderMode
 	}
 	hasHeader := fuzzyDecideHeader(records, headerMode)
 	if hasHeader {
@@ -129,7 +129,7 @@ func fuzzyPrepareHeaders(records [][]string, opts *FuzzyImportOptions) ([]string
 func fuzzyPrepareColumnTypes(dataRecords [][]string, numCols int, opts *FuzzyImportOptions) []storage.ColType {
 	typeInference := true
 	if opts.ImportOptions != nil {
-		typeInference = opts.ImportOptions.TypeInference
+		typeInference = opts.TypeInference
 	}
 	if typeInference {
 		return fuzzyInferColumnTypes(dataRecords, numCols, opts)
@@ -146,8 +146,8 @@ func fuzzyEnsureTable(db *storage.DB, tenant, tableName string, headers []string
 	createTable := true
 	truncate := false
 	if opts.ImportOptions != nil {
-		createTable = opts.ImportOptions.CreateTable
-		truncate = opts.ImportOptions.Truncate
+		createTable = opts.CreateTable
+		truncate = opts.Truncate
 	}
 	if createTable {
 		columns := make([]storage.Column, len(headers))
@@ -441,7 +441,7 @@ func fuzzyInferColumnTypes(sampleData [][]string, numCols int, opts *FuzzyImport
 
 	nullLiterals := []string{}
 	if opts.ImportOptions != nil {
-		nullLiterals = opts.ImportOptions.NullLiterals
+		nullLiterals = opts.NullLiterals
 	}
 
 	for colIdx := 0; colIdx < numCols; colIdx++ {
@@ -539,7 +539,7 @@ func fuzzyConvertValue(value string, targetType storage.ColType, opts *FuzzyImpo
 
 	nullLiterals := []string{}
 	if opts.ImportOptions != nil {
-		nullLiterals = opts.ImportOptions.NullLiterals
+		nullLiterals = opts.NullLiterals
 	}
 
 	// Check for null

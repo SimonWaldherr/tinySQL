@@ -1272,8 +1272,8 @@ func parseBusyTimeout(value string) (time.Duration, error) {
 		}
 	}
 	if isNumeric {
-		switch {
-		case value == "":
+		switch value {
+		case "":
 			return 0, nil
 		default:
 			sz, err := strconv.ParseInt(value, 10, 64)

@@ -290,7 +290,7 @@ func (m *MVCCManager) checkSerializableConflicts(tx *TxContext) error {
 // updateOldestActive updates the watermark for the oldest active transaction.
 func (m *MVCCManager) updateOldestActive() {
 	var oldest TxID = 0
-	var oldestTS Timestamp = Timestamp(m.nextTimestamp.Load())
+	var oldestTS = Timestamp(m.nextTimestamp.Load())
 
 	for txID, tx := range m.activeTxs {
 		if oldest == 0 || txID < oldest {

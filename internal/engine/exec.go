@@ -2578,12 +2578,11 @@ func buildSimpleJoinPlan(env ExecEnv, s *Select) (*simpleJoinPlan, bool, error) 
 }
 
 func simpleJoinSelectEligible(s *Select) bool {
-	return !(s.Distinct || len(s.DistinctOn) > 0 || len(s.CTEs) > 0 || len(s.GroupBy) > 0 ||
-		s.Having != nil || s.Union != nil || len(s.OrderBy) > 0 || s.Limit != nil || s.Offset != nil ||
-		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil || len(s.Joins) != 1 ||
-		s.Joins[0].Type != JoinInner || s.Joins[0].Right.Table == "" || s.Pivot != nil ||
-		s.Joins[0].Right.Subquery != nil || s.Joins[0].Right.TableFunc != nil ||
-		isSQLiteSchemaTable(s.From.Table) || isSQLiteSchemaTable(s.Joins[0].Right.Table))
+	return !s.Distinct && len(s.DistinctOn) <= 0 && len(s.CTEs) <= 0 && len(s.GroupBy) <= 0 &&
+		s.Having == nil && s.Union == nil && len(s.OrderBy) <= 0 && s.Limit == nil && s.Offset == nil &&
+		s.From.Table != "" && s.From.Subquery == nil && s.From.TableFunc == nil && len(s.Joins) == 1 &&
+		s.Joins[0].Type == JoinInner && s.Joins[0].Right.Table != "" && s.Pivot == nil &&
+		s.Joins[0].Right.Subquery == nil && s.Joins[0].Right.TableFunc == nil && !isSQLiteSchemaTable(s.From.Table) && !isSQLiteSchemaTable(s.Joins[0].Right.Table)
 }
 
 func loadSimpleJoinTables(env ExecEnv, s *Select) (*storage.Table, *storage.Table, error) {
@@ -3219,10 +3218,10 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 }
 
 func simpleAggregateEligibleSelect(s *Select) bool {
-	return !(s.Distinct || len(s.DistinctOn) > 0 || len(s.CTEs) > 0 || len(s.Joins) > 0 ||
-		s.Having != nil || s.Union != nil || len(s.OrderBy) > 0 || s.Limit != nil || s.Offset != nil ||
-		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil || len(s.GroupBy) != 1 ||
-		s.Pivot != nil || isSQLiteSchemaTable(s.From.Table))
+	return !s.Distinct && len(s.DistinctOn) <= 0 && len(s.CTEs) <= 0 && len(s.Joins) <= 0 &&
+		s.Having == nil && s.Union == nil && len(s.OrderBy) <= 0 && s.Limit == nil && s.Offset == nil &&
+		s.From.Table != "" && s.From.Subquery == nil && s.From.TableFunc == nil && len(s.GroupBy) == 1 &&
+		s.Pivot == nil && !isSQLiteSchemaTable(s.From.Table)
 }
 
 func buildSimpleAggregateProjections(s *Select, colIndex map[string]int, groupCol int) ([]simpleAggregateProjection, []string, bool, bool, error) {
@@ -3837,7 +3836,7 @@ func simpleSelectEligible(s *Select) bool {
 	if isSQLiteSchemaTable(s.From.Table) {
 		return false
 	}
-	return !(anyAggInSelect(s.Projs) || anyWindowInSelect(s.Projs))
+	return !anyAggInSelect(s.Projs) && !anyWindowInSelect(s.Projs)
 }
 
 func buildSimpleSelectProjections(items []SelectItem, colIndex map[string]int) ([]simpleProjection, []string, bool) {
@@ -7179,7 +7178,7 @@ func evalArithmeticBinary(op string, lv, rv any) (any, error) {
 
 	lf, lok := numeric(lv)
 	rf, rok := numeric(rv)
-	if !(lok && rok) {
+	if !lok || !rok {
 		return nil, fmt.Errorf("%s expects numeric", op)
 	}
 	switch op {
