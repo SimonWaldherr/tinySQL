@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"path/filepath"
 	"testing"
 )
@@ -75,6 +76,70 @@ func TestWALRecoveryStatusAfterOpen(t *testing.T) {
 	}
 	if health.Recovery.Path == "" || health.Recovery.RecoveredAt.IsZero() {
 		t.Fatalf("missing recovery metadata: %#v", health.Recovery)
+	}
+}
+
+func TestWALRecoveryPreservesBlobBytes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blob.gob")
+	db, err := OpenDB(StorageConfig{Mode: ModeWAL, Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := NewDB()
+	payload := []byte{0x1f, 0x8b, 0x08, 0x00, 0x00, 0xff, 0x42}
+	table := NewTable("tiles", []Column{{Name: "tile_data", Type: BlobType}}, false)
+	table.Rows = [][]any{{payload}, {[]byte{}}, {nil}}
+	if err := db.Put("default", table); err != nil {
+		t.Fatal(err)
+	}
+	changes := CollectWALChanges(before, db)
+	if _, err := db.WAL().LogTransaction(changes); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenDB(StorageConfig{Mode: ModeWAL, Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	got, err := reopened.Get("default", "tiles")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, ok := got.Rows[0][0].([]byte)
+	if !ok || !bytes.Equal(b, payload) {
+		t.Fatalf("recovered BLOB = %#v, want %x", got.Rows[0][0], payload)
+	}
+	if b, ok := got.Rows[1][0].([]byte); !ok || len(b) != 0 {
+		t.Fatalf("empty BLOB changed: %#v", got.Rows[1][0])
+	}
+	if got.Rows[2][0] != nil {
+		t.Fatalf("NULL BLOB changed: %#v", got.Rows[2][0])
+	}
+}
+
+func TestDeepCloneDoesNotAliasBlobBytes(t *testing.T) {
+	db := NewDB()
+	table := NewTable("tiles", []Column{{Name: "tile_data", Type: BlobType}}, false)
+	table.Rows = [][]any{{[]byte{1, 2, 3}}}
+	if err := db.Put("default", table); err != nil {
+		t.Fatal(err)
+	}
+	clone := db.DeepClone()
+	cloned, err := clone.Get("default", "tiles")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cloned.Rows[0][0].([]byte)[0] = 9
+	original, err := db.Get("default", "tiles")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if original.Rows[0][0].([]byte)[0] != 1 {
+		t.Fatal("snapshot clone aliases BLOB bytes")
 	}
 }
 

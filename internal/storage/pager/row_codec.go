@@ -50,6 +50,11 @@ const (
 	tagLongBytes  byte = 0x08
 )
 
+// MaxValueBytes is the defensive decoder bound for one variable-length row
+// field. SQL writes are capped earlier by engine.MaxBlobBytes; this second
+// boundary keeps damaged on-disk lengths from allocating excessive memory.
+const MaxValueBytes = 64 << 20
+
 // MarshalRow encodes a row into the compact binary format.
 // It reuses the provided buf if large enough.
 func MarshalRow(row []any, buf []byte) []byte {
@@ -225,7 +230,7 @@ func UnmarshalRow(data []byte) ([]any, error) {
 			}
 			slen := int(binary.LittleEndian.Uint32(data[off : off+4]))
 			off += 4
-			if slen < 0 || off+slen > len(data) {
+			if slen < 0 || slen > MaxValueBytes || off+slen > len(data) {
 				return nil, fmt.Errorf("truncated long string data at column %d", i)
 			}
 			row[i] = string(data[off : off+slen])
@@ -236,7 +241,7 @@ func UnmarshalRow(data []byte) ([]any, error) {
 			}
 			blen := int(binary.LittleEndian.Uint32(data[off : off+4]))
 			off += 4
-			if blen < 0 || off+blen > len(data) {
+			if blen < 0 || blen > MaxValueBytes || off+blen > len(data) {
 				return nil, fmt.Errorf("truncated long bytes data at column %d", i)
 			}
 			dst := make([]byte, blen)
@@ -246,6 +251,9 @@ func UnmarshalRow(data []byte) ([]any, error) {
 		default:
 			return nil, fmt.Errorf("unknown tag 0x%02x at column %d", tag, i)
 		}
+	}
+	if off != len(data) {
+		return nil, fmt.Errorf("trailing data after row: %d bytes", len(data)-off)
 	}
 	return row, nil
 }

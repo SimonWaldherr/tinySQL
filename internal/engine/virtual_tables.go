@@ -21,7 +21,7 @@ import (
 //   sys.tables       – real tables across all tenants (auto-populated)
 //   sys.columns      – real columns from actual table schemas
 //   sys.constraints  – PK / FK / UNIQUE constraints
-//   sys.indexes      – CREATE INDEX metadata (not planner-backed yet)
+//   sys.indexes      – CREATE INDEX metadata for materialized planner-backed indexes
 //   sys.views        – same as catalog.views but auto-populated
 //   sys.functions    – all registered functions (builtin + extended + vector)
 //   sys.variables    – server variables (version, pid, mode, …)

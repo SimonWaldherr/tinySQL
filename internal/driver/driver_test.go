@@ -416,6 +416,53 @@ func TestStmtExecQueryPaths(t *testing.T) {
 	}
 }
 
+func TestPreparedSelectBindsNewValuesWithoutReparse(t *testing.T) {
+	d := &drv{}
+	rawConn, err := d.Open("mem://")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := rawConn.(*conn)
+	ctx := context.Background()
+	if _, err := c.ExecContext(ctx, "CREATE TABLE prepared (id INT, name TEXT)", nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []struct {
+		id   int64
+		name string
+	}{{1, "one"}, {2, "two"}} {
+		if _, err := c.ExecContext(ctx, "INSERT INTO prepared VALUES (?, ?)", []driver.NamedValue{{Ordinal: 1, Value: row.id}, {Ordinal: 2, Value: row.name}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	preparedStmt, err := c.Prepare("SELECT name FROM prepared WHERE id = ?")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fast, ok := preparedStmt.(*stmt)
+	if !ok || fast.prepared == nil {
+		t.Fatal("SELECT with positional parameter did not build prepared AST")
+	}
+	for _, want := range []string{"one", "two"} {
+		id := int64(1)
+		if want == "two" {
+			id = 2
+		}
+		rows, err := fast.QueryContext(ctx, []driver.NamedValue{{Ordinal: 1, Value: id}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		values := make([]driver.Value, 1)
+		if err := rows.Next(values); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := values[0].(string); got != want {
+			t.Fatalf("id %d: got %q, want %q", id, got, want)
+		}
+		_ = rows.Close()
+	}
+}
+
 func TestTransactionsSnapshotAndReadonly(t *testing.T) {
 	d := &drv{}
 	rawConn, err := d.Open("mem://")
@@ -643,10 +690,16 @@ func TestCheckNamedValue(t *testing.T) {
 		t.Fatalf("expected time to be converted to RFC3339 string")
 	}
 	// []byte
-	nv = &driver.NamedValue{Ordinal: 1, Value: []byte{1, 2, 3}}
+	input := []byte{1, 2, 3}
+	nv = &driver.NamedValue{Ordinal: 1, Value: input}
 	_ = c.CheckNamedValue(nv)
-	if _, ok := nv.Value.(string); !ok {
-		t.Fatalf("expected []byte to base64 string")
+	b, ok := nv.Value.([]byte)
+	if !ok || string(b) != string(input) {
+		t.Fatalf("expected []byte to remain binary, got %#v", nv.Value)
+	}
+	input[0] = 9
+	if b[0] != 1 {
+		t.Fatalf("expected CheckNamedValue to take ownership of BLOB bytes")
 	}
 	// int
 	nv = &driver.NamedValue{Ordinal: 1, Value: int(5)}

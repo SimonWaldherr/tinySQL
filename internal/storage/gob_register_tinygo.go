@@ -15,6 +15,7 @@ func init() {
 	safeGobRegister(diskTable{})
 	safeGobRegister(Table{})
 	safeGobRegister([]float64{})
+	safeGobRegister([]byte{})
 	safeGobRegister([]any{})
 	safeGobRegister(big.Rat{})
 	safeGobRegister(uuid.UUID{})

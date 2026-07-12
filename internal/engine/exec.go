@@ -387,6 +387,9 @@ func executeCreateIndex(env ExecEnv, s *CreateIndex) (*ResultSet, error) {
 			return nil, err
 		}
 	}
+	if err := t.CreateSecondaryIndex(name, s.Columns, s.Unique); err != nil {
+		return nil, err
+	}
 	if err := env.db.Catalog().RegisterIndex(&storage.CatalogIndex{
 		Schema:    schema,
 		Name:      name,
@@ -395,8 +398,14 @@ func executeCreateIndex(env ExecEnv, s *CreateIndex) (*ResultSet, error) {
 		Unique:    s.Unique,
 		CreatedAt: time.Now(),
 	}); err != nil {
+		t.DropSecondaryIndex(name)
 		return nil, err
 	}
+	// A CREATE INDEX changes the executable shape of the table. Bumping the
+	// table version invalidates any prepared plan that captured the old shape
+	// and makes disk/hybrid backends persist the materialized entries.
+	t.Version++
+	t.MarkDirtyFrom(-1)
 	return nil, nil
 }
 
@@ -411,6 +420,11 @@ func executeDropIndex(env ExecEnv, s *DropIndex) (*ResultSet, error) {
 	}
 	if s.Table != "" && !strings.EqualFold(idx.Table, s.Table) {
 		return nil, fmt.Errorf("index %q is on table %q, not %q", s.Name, idx.Table, s.Table)
+	}
+	if t, err := env.db.Get(env.tenant, idx.Table); err == nil {
+		t.DropSecondaryIndex(name)
+		t.Version++
+		t.MarkDirtyFrom(-1)
 	}
 	return nil, env.db.Catalog().DeleteIndex(schema, name)
 }
@@ -863,6 +877,9 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 		if err := validateRowConstraints(env, t, row, -1); err != nil {
 			return nil, err
 		}
+		if err := t.CheckSecondaryIndexConstraints(row, -1); err != nil {
+			return nil, err
+		}
 		var newRow Row
 		if needsRow {
 			newRow = buildTableRow(t.Cols, tablePrefix, row)
@@ -891,6 +908,9 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 		return nil, err
 	}
 	t.Version++
+	if err := t.RebuildSecondaryIndexes(); err != nil {
+		return nil, err
+	}
 	t.MarkDirtyFrom(len(t.Rows) - len(s.Rows))
 	markDependentMaterializedViewsStale(env, s.Table)
 	if len(s.Returning) > 0 {
@@ -943,6 +963,9 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 		if err := validateRowConstraints(env, t, row, -1); err != nil {
 			return nil, err
 		}
+		if err := t.CheckSecondaryIndexConstraints(row, -1); err != nil {
+			return nil, err
+		}
 		var newRow Row
 		if needsRow {
 			newRow = buildTableRow(t.Cols, tablePrefix, row)
@@ -971,6 +994,9 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 		return nil, err
 	}
 	t.Version++
+	if err := t.RebuildSecondaryIndexes(); err != nil {
+		return nil, err
+	}
 	t.MarkDirtyFrom(len(t.Rows) - len(s.Rows))
 	markDependentMaterializedViewsStale(env, s.Table)
 	if len(s.Returning) > 0 {
@@ -1212,6 +1238,9 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 			if err := validateRowConstraints(env, t, nextRow, ri); err != nil {
 				return nil, err
 			}
+			if err := t.CheckSecondaryIndexConstraints(nextRow, ri); err != nil {
+				return nil, err
+			}
 			patchConstraintIndexRow(t, ri, t.Rows[ri], nextRow)
 			before := r
 			t.Rows[ri] = nextRow
@@ -1238,6 +1267,9 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 		return nil, err
 	}
 	t.Version++
+	if err := t.RebuildSecondaryIndexes(); err != nil {
+		return nil, err
+	}
 	if n > 0 {
 		t.MarkDirtyFrom(-1) // UPDATE is non-append; force full-table WAL
 		markDependentMaterializedViewsStale(env, s.Table)
@@ -1399,6 +1431,9 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 				}
 				t.Rows = nil
 				t.Version++
+				if err := t.RebuildSecondaryIndexes(); err != nil {
+					return nil, err
+				}
 				t.MarkDirtyFrom(-1) // DELETE is non-append; force full-table WAL
 				markDependentMaterializedViewsStale(env, s.Table)
 			}
@@ -1415,6 +1450,9 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 			}
 			t.Rows = nil
 			t.Version++
+			if err := t.RebuildSecondaryIndexes(); err != nil {
+				return nil, err
+			}
 			t.MarkDirtyFrom(-1) // DELETE is non-append; force full-table WAL
 			markDependentMaterializedViewsStale(env, s.Table)
 		}
@@ -1454,6 +1492,9 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 		}
 		t.Rows = kept
 		t.Version++
+		if err := t.RebuildSecondaryIndexes(); err != nil {
+			return nil, err
+		}
 		if del > 0 {
 			t.MarkDirtyFrom(-1)
 			markDependentMaterializedViewsStale(env, s.Table)
@@ -1505,6 +1546,9 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	}
 	t.Rows = kept
 	t.Version++
+	if err := t.RebuildSecondaryIndexes(); err != nil {
+		return nil, err
+	}
 	if del > 0 {
 		t.MarkDirtyFrom(-1) // DELETE is non-append; force full-table WAL
 		markDependentMaterializedViewsStale(env, s.Table)
@@ -2372,6 +2416,15 @@ type simpleSelectPlan struct {
 	offset     *int
 	outputCols []string
 	rowMapCap  int
+	// rowIDs is nil for a table scan. A non-nil slice is a materialized
+	// secondary-index point/prefix seek and contains table row positions.
+	rowIDs          []int
+	scanType        string
+	indexName       string
+	indexPredicates []string
+	residualFilter  bool
+	coveringIndex   bool
+	estimatedRows   int
 }
 
 // simpleProjection describes a single SELECT item in the raw fast-path.
@@ -3228,7 +3281,19 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 		}
 	}
 
-	for i, raw := range plan.table.Rows {
+	rowCount := len(plan.table.Rows)
+	if plan.rowIDs != nil {
+		rowCount = len(plan.rowIDs)
+	}
+	for i := 0; i < rowCount; i++ {
+		rowID := i
+		if plan.rowIDs != nil {
+			rowID = plan.rowIDs[i]
+		}
+		if rowID < 0 || rowID >= len(plan.table.Rows) {
+			return nil, true, fmt.Errorf("index %q returned invalid row id %d", plan.indexName, rowID)
+		}
+		raw := plan.table.Rows[rowID]
 		// Check context cancellation every 64 rows to reduce channel-select overhead.
 		if i&63 == 0 {
 			if err := checkCtx(env.ctx); err != nil {
@@ -3477,19 +3542,128 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 		return nil, false, nil
 	}
 
-	return &simpleSelectPlan{
-		table:      table,
-		colIndex:   colIndex,
-		projs:      projs,
-		orderBy:    s.OrderBy,
-		orderExprs: orderExprs,
-		where:      s.Where,
-		filter:     filter,
-		limit:      s.Limit,
-		offset:     s.Offset,
-		outputCols: outputCols,
-		rowMapCap:  simpleProjectionMapCap(projs),
-	}, true, nil
+	plan := &simpleSelectPlan{
+		table:         table,
+		colIndex:      colIndex,
+		projs:         projs,
+		orderBy:       s.OrderBy,
+		orderExprs:    orderExprs,
+		where:         s.Where,
+		filter:        filter,
+		limit:         s.Limit,
+		offset:        s.Offset,
+		outputCols:    outputCols,
+		rowMapCap:     simpleProjectionMapCap(projs),
+		scanType:      "TABLE SCAN",
+		estimatedRows: len(table.Rows),
+	}
+	if idx, values, predicates, residual := selectSecondaryIndex(table, colIndex, s.Where); idx != nil {
+		rowIDs, seekErr := table.LookupSecondaryIndexPrefix(idx, values)
+		if seekErr != nil {
+			return nil, true, seekErr
+		}
+		plan.rowIDs = rowIDs
+		plan.scanType = "INDEX " + seekKind(len(values), len(idx.Columns))
+		plan.indexName = idx.Name
+		plan.indexPredicates = predicates
+		plan.residualFilter = residual
+		plan.coveringIndex = projectionsCoveredByIndex(projs, idx, table)
+		plan.estimatedRows = len(rowIDs)
+	}
+	return plan, true, nil
+}
+
+func seekKind(prefixCols, allCols int) string {
+	if prefixCols == allCols {
+		return "POINT SEEK"
+	}
+	return "PREFIX SEEK"
+}
+
+// selectSecondaryIndex extracts equality terms from a simple WHERE tree and
+// chooses the longest matching composite-index prefix. Other predicates stay
+// as residual filters and are still evaluated by the normal raw evaluator.
+func selectSecondaryIndex(table *storage.Table, colIndex map[string]int, where Expr) (*storage.SecondaryIndex, []any, []string, bool) {
+	if where == nil || len(table.Indexes) == 0 {
+		return nil, nil, nil, false
+	}
+	equalities := make(map[int]any)
+	totalTerms := collectEqualityTerms(where, colIndex, equalities)
+	var chosen *storage.SecondaryIndex
+	var values []any
+	var predicates []string
+	for _, idx := range table.Indexes {
+		candidate := make([]any, 0, len(idx.Columns))
+		candidatePredicates := make([]string, 0, len(idx.Columns))
+		for _, column := range idx.Columns {
+			pos, err := table.ColIndex(column)
+			if err != nil {
+				break
+			}
+			value, ok := equalities[pos]
+			if !ok {
+				break
+			}
+			candidate = append(candidate, value)
+			candidatePredicates = append(candidatePredicates, column+" = ?")
+		}
+		if len(candidate) == 0 || (chosen != nil && len(candidate) <= len(values)) {
+			continue
+		}
+		chosen, values, predicates = idx, candidate, candidatePredicates
+	}
+	if chosen == nil {
+		return nil, nil, nil, false
+	}
+	return chosen, values, predicates, totalTerms != len(values)
+}
+
+func collectEqualityTerms(expr Expr, colIndex map[string]int, out map[int]any) int {
+	b, ok := expr.(*Binary)
+	if !ok {
+		return 0
+	}
+	if b.Op == "AND" {
+		return collectEqualityTerms(b.Left, colIndex, out) + collectEqualityTerms(b.Right, colIndex, out)
+	}
+	if b.Op != "=" {
+		return 0
+	}
+	if ref, ok := b.Left.(*VarRef); ok {
+		if lit, ok := b.Right.(*Literal); ok {
+			if pos, found := colIndex[ref.Lower]; found {
+				out[pos] = lit.Val
+				return 1
+			}
+		}
+	}
+	if ref, ok := b.Right.(*VarRef); ok {
+		if lit, ok := b.Left.(*Literal); ok {
+			if pos, found := colIndex[ref.Lower]; found {
+				out[pos] = lit.Val
+				return 1
+			}
+		}
+	}
+	return 0
+}
+
+func projectionsCoveredByIndex(projs []simpleProjection, idx *storage.SecondaryIndex, table *storage.Table) bool {
+	covered := make(map[int]struct{}, len(idx.Columns))
+	for _, column := range idx.Columns {
+		if pos, err := table.ColIndex(column); err == nil {
+			covered[pos] = struct{}{}
+		}
+	}
+	for _, proj := range projs {
+		if proj.colIdx < 0 {
+			return false
+		}
+		if _, ok := covered[proj.colIdx]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func isCatalogViewSource(env ExecEnv, name string) bool {
@@ -10343,6 +10517,8 @@ func inferType(v any) storage.ColType {
 		return storage.TextType
 	case []float64:
 		return storage.VectorType
+	case []byte:
+		return storage.BlobType
 	default:
 		return storage.JsonType
 	}
@@ -10364,9 +10540,29 @@ func coerceToTypeAllowNull(v any, t storage.ColType) (any, error) {
 		return coerceToJson(v)
 	case storage.VectorType:
 		return coerceToVector(v)
+	case storage.BlobType:
+		return coerceToBlob(v)
 	default:
 		return v, nil
 	}
+}
+
+// MaxBlobBytes bounds a single BLOB accepted by the SQL executor. It avoids
+// integer/codec overflows and accidental unbounded allocations while staying
+// comfortably above normal compressed MVT payloads.
+const MaxBlobBytes = 64 << 20
+
+func coerceToBlob(v any) (any, error) {
+	b, ok := v.([]byte)
+	if !ok {
+		return nil, fmt.Errorf("cannot convert %T to BLOB", v)
+	}
+	if len(b) > MaxBlobBytes {
+		return nil, fmt.Errorf("BLOB is %d bytes; maximum is %d", len(b), MaxBlobBytes)
+	}
+	// Driver callers commonly reuse their parameter buffer. The database owns
+	// its row bytes, so retain neither the input nor a caller-visible alias.
+	return append([]byte(nil), b...), nil
 }
 
 func coerceToInt(v any) (any, error) {

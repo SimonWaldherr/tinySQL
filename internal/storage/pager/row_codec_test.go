@@ -1,6 +1,7 @@
 package pager
 
 import (
+	"bytes"
 	"math"
 	"testing"
 )
@@ -15,6 +16,7 @@ func TestRowCodec_RoundTrip(t *testing.T) {
 		{"bool-values", []any{true, false}},
 		{"empty-string", []any{""}},
 		{"bytes", []any{[]byte{0xDE, 0xAD}}},
+		{"empty-bytes", []any{[]byte{}}},
 		{"large-int", []any{float64(math.MaxInt32)}},
 		{"negative-float", []any{float64(-1.5)}},
 		{"mixed", []any{float64(1), "two", 3.0, nil, true, []byte("bin")}},
@@ -53,12 +55,24 @@ func TestRowCodec_RoundTrip(t *testing.T) {
 					}
 				case []byte:
 					g, ok := got.([]byte)
-					if !ok || len(g) != len(w) {
+					if !ok || !bytes.Equal(g, w) {
 						t.Errorf("[%d] got %v, want %v", i, got, want)
 					}
 				}
 			}
 		})
+	}
+}
+
+func TestRowCodecRejectsTrailingAndOversizeValues(t *testing.T) {
+	valid := MarshalRow([]any{[]byte("tile")}, nil)
+	if _, err := UnmarshalRow(append(valid, 0xff)); err == nil {
+		t.Fatal("trailing row data unexpectedly accepted")
+	}
+	// One BLOB column with the long-byte tag and a corrupt 64 MiB+1 length.
+	corrupt := []byte{1, 0, tagLongBytes, 1, 0, 0, 4}
+	if _, err := UnmarshalRow(corrupt); err == nil {
+		t.Fatal("oversize BLOB length unexpectedly accepted")
 	}
 }
 

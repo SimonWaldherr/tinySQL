@@ -203,6 +203,7 @@ type CallProcedure struct {
 // Explain represents an EXPLAIN statement around another statement.
 type Explain struct {
 	Statement Statement
+	Analyze   bool
 }
 
 // Pragma represents a SQLite-compatible PRAGMA statement.
@@ -625,11 +626,16 @@ func (p *Parser) parseCallProcedure() (Statement, error) {
 
 func (p *Parser) parseExplain() (Statement, error) {
 	p.next()
+	analyze := false
+	if (p.cur.Typ == tKeyword || p.cur.Typ == tIdent) && upper(p.cur.Val) == "ANALYZE" {
+		analyze = true
+		p.next()
+	}
 	stmt, err := p.ParseStatement()
 	if err != nil {
 		return nil, err
 	}
-	return &Explain{Statement: stmt}, nil
+	return &Explain{Statement: stmt, Analyze: analyze}, nil
 }
 
 func (p *Parser) parsePragma() (Statement, error) {
@@ -3026,11 +3032,18 @@ var typeKeywordMap = map[string]storage.ColType{
 	"URL":    storage.URLType,
 	"HASH":   storage.HASHType,
 	"BITMAP": storage.BitmapType,
+	// Binary data. BLOB is the canonical SQL spelling; the aliases make it
+	// practical to import SQLite/PostgreSQL-ish schemas without weakening the
+	// runtime invariant that BlobType values are always []byte.
+	"BLOB":      storage.BlobType,
+	"BYTEA":     storage.BlobType,
+	"BINARY":    storage.BlobType,
+	"VARBINARY": storage.BlobType,
 }
 
 func (p *Parser) parseType() storage.ColType {
-	if p.cur.Typ == tKeyword {
-		if colType, ok := typeKeywordMap[p.cur.Val]; ok {
+	if p.cur.Typ == tKeyword || p.cur.Typ == tIdent {
+		if colType, ok := typeKeywordMap[upper(p.cur.Val)]; ok {
 			p.next()
 			return colType
 		}
@@ -3409,6 +3422,18 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		s := p.cur.Val
 		p.next()
 		return &Literal{Val: s}, nil
+	case tBlob:
+		encoded := p.cur.Val
+		decodeErr := p.cur.Err
+		p.next()
+		if decodeErr != "" {
+			return nil, p.errf("invalid BLOB hex literal: %s", decodeErr)
+		}
+		// token.Val uses a string only because token values are textual. Copy
+		// it into a byte slice so the AST owns binary data and cannot alias the
+		// SQL input buffer.
+		blob := append([]byte(nil), []byte(encoded)...)
+		return &Literal{Val: blob}, nil
 	case tKeyword:
 		// Handle explicit keywords that are not identifiers first.
 		switch p.cur.Val {

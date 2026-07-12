@@ -16,6 +16,7 @@ func init() {
 	safeGobRegister(Table{})
 	safeGobRegister(&Table{})
 	safeGobRegister([]float64{})
+	safeGobRegister([]byte{})
 	safeGobRegister([]any{})
 	safeGobRegister(big.Rat{})
 	safeGobRegister(&big.Rat{})

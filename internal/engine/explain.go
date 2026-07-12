@@ -2,13 +2,31 @@ package engine
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
+	"time"
 )
 
 func executeExplain(env ExecEnv, s *Explain) (*ResultSet, error) {
 	rows := make([]Row, 0, 8)
 	addExplainStep(&rows, "PLAN", statementName(s.Statement))
 	explainStatement(env, &rows, s.Statement)
+	if s.Analyze {
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		started := time.Now()
+		rs, err := Execute(env.ctx, env.db, env.tenant, s.Statement)
+		elapsed := time.Since(started)
+		runtime.ReadMemStats(&after)
+		if err != nil {
+			return nil, err
+		}
+		actualRows := 0
+		if rs != nil {
+			actualRows = len(rs.Rows)
+		}
+		addExplainStep(&rows, "ANALYZE", fmt.Sprintf("actual rows=%d time=%s allocations=%d allocated_bytes=%d page_reads=0 cache_hits=0 cache_misses=0", actualRows, elapsed, after.Mallocs-before.Mallocs, after.TotalAlloc-before.TotalAlloc))
+	}
 	for i, row := range rows {
 		row["step"] = i + 1
 	}
@@ -67,7 +85,15 @@ func explainSelect(env ExecEnv, rows *[]Row, sel *Select, prefix string) {
 		explainSelect(env, rows, cte.Select, "cte ")
 	}
 	if sel.From.Table != "" || sel.From.Subquery != nil || sel.From.TableFunc != nil {
-		explainFrom(env, rows, "SCAN", sel.From, prefix)
+		if plan, ok, err := buildSimpleSelectPlan(env, sel); err == nil && ok {
+			detail := fmt.Sprintf("table=%s scan=%s estimated_rows=%d", sel.From.Table, plan.scanType, plan.estimatedRows)
+			if plan.indexName != "" {
+				detail += fmt.Sprintf(" index=%s predicates=%s residual_filter=%t covering_index=%t", plan.indexName, strings.Join(plan.indexPredicates, ", "), plan.residualFilter, plan.coveringIndex)
+			}
+			addExplainStep(rows, plan.scanType, detail)
+		} else {
+			explainFrom(env, rows, "SCAN", sel.From, prefix)
+		}
 	}
 	for _, join := range sel.Joins {
 		explainFrom(env, rows, join.Type.String(), join.Right, prefix)

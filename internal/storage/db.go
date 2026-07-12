@@ -284,9 +284,13 @@ type Column struct {
 
 // Table stores rows along with column metadata and indexes.
 type Table struct {
-	Name    string
-	Cols    []Column
-	Rows    [][]any
+	Name string
+	Cols []Column
+	Rows [][]any
+	// Indexes contains materialized secondary and composite indexes keyed by
+	// lower-case SQL index name. Unlike catalog metadata these entries are
+	// used by the executor and persisted with table snapshots.
+	Indexes map[string]*SecondaryIndex
 	IsTemp  bool
 	colPos  map[string]int
 	Version int
@@ -303,7 +307,7 @@ func NewTable(name string, cols []Column, isTemp bool) *Table {
 	for i, c := range cols {
 		pos[strings.ToLower(c.Name)] = i
 	}
-	return &Table{Name: name, Cols: cols, colPos: pos, IsTemp: isTemp, dirtyFrom: -1}
+	return &Table{Name: name, Cols: cols, colPos: pos, IsTemp: isTemp, dirtyFrom: -1, Indexes: make(map[string]*SecondaryIndex)}
 }
 
 // MarkDirtyFrom records the first row index that was modified. If an earlier
@@ -924,13 +928,25 @@ func cloneTable(t *Table) *Table {
 	copy(cols, t.Cols)
 	nt := NewTable(t.Name, cols, t.IsTemp)
 	nt.Version = t.Version
+	nt.Indexes = cloneSecondaryIndexes(t.Indexes)
 	nt.Rows = make([][]any, len(t.Rows))
 	for i := range t.Rows {
 		row := make([]any, len(t.Rows[i]))
-		copy(row, t.Rows[i])
+		for j, value := range t.Rows[i] {
+			row[j] = cloneCell(value)
+		}
 		nt.Rows[i] = row
 	}
 	return nt
+}
+
+// cloneCell preserves snapshot isolation for mutable binary values. Other
+// scalar values are immutable/value types at the storage boundary.
+func cloneCell(v any) any {
+	if b, ok := v.([]byte); ok {
+		return append([]byte(nil), b...)
+	}
+	return v
 }
 
 // ShallowCloneForTable creates a lightweight copy of the database that
@@ -978,6 +994,7 @@ type diskTable struct {
 	Rows    [][]any // JSON columns stored as strings
 	IsTemp  bool
 	Version int
+	Indexes map[string]*SecondaryIndex
 }
 
 type diskCatalog struct {
@@ -1229,6 +1246,7 @@ func tableToDiskRange(tn string, t *Table, from, to int) diskTable {
 		Version: t.Version,
 		Cols:    make([]diskColumn, len(t.Cols)),
 		Rows:    make([][]any, to-from),
+		Indexes: cloneSecondaryIndexes(t.Indexes),
 	}
 	for i, c := range t.Cols {
 		dt.Cols[i] = diskColumn(c)
@@ -1293,6 +1311,7 @@ func diskToTable(dt diskTable) *Table {
 	}
 	t := NewTable(dt.Name, cols, dt.IsTemp)
 	t.Version = dt.Version
+	t.Indexes = cloneSecondaryIndexes(dt.Indexes)
 	t.Rows = make([][]any, len(dt.Rows))
 	for ri, r := range dt.Rows {
 		row := make([]any, len(r))
@@ -2353,6 +2372,10 @@ func handleWalRecord(db *DB, rec walRecord, pending map[uint64][]walOperation, c
 					delta := diskToTable(*op.table)
 					existing.Rows = append(existing.Rows, delta.Rows...)
 					existing.Version = delta.Version
+					// WAL deltas carry rows, while the existing table owns the
+					// durable index definitions. Rebuild so recovered index row IDs
+					// and table rows are atomically consistent.
+					_ = existing.RebuildSecondaryIndexes()
 					continue
 				}
 				// Fallback: table not found, apply as full table.

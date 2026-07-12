@@ -18,14 +18,15 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
-	"encoding/base64"
 	"encoding/gob"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -371,9 +372,15 @@ type conn struct {
 	txReadOnly bool        // Active tx requested as read-only
 }
 
-func (c *conn) Prepare(query string) (driver.Stmt, error) { return &stmt{c: c, sql: query}, nil }
-func (c *conn) Close() error                              { c.srv.saveIfNeeded(); return nil }
-func (c *conn) Begin() (driver.Tx, error)                 { return c.BeginTx(context.Background(), driver.TxOptions{}) }
+func (c *conn) Prepare(query string) (driver.Stmt, error) {
+	// database/sql may call Prepare for arbitrary SQL. Failing to build the
+	// optional prepared-AST fast path must not change its historical behavior:
+	// QueryContext will use the text-binding fallback below.
+	prepared, _ := buildPreparedQuery(query)
+	return &stmt{c: c, sql: query, prepared: prepared}, nil
+}
+func (c *conn) Close() error              { c.srv.saveIfNeeded(); return nil }
+func (c *conn) Begin() (driver.Tx, error) { return c.BeginTx(context.Background(), driver.TxOptions{}) }
 
 func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
 	// Only the default isolation level is supported; other levels are rejected.
@@ -768,8 +775,14 @@ func (c *conn) querySQL(ctx context.Context, sqlStr string) (driver.Rows, error)
 		return emptyRows{}, nil
 	}
 
-	// SELECT
-	if err = c.srv.acquireReader(ctx); err != nil {
+	return c.queryStatement(ctx, st)
+}
+
+// queryStatement executes an already parsed SELECT/EXPLAIN statement. It is
+// deliberately shared by normal and prepared queries so locking, snapshots,
+// and database/sql row ownership remain identical.
+func (c *conn) queryStatement(ctx context.Context, st engine.Statement) (driver.Rows, error) {
+	if err := c.srv.acquireReader(ctx); err != nil {
 		return nil, err
 	}
 	defer c.srv.releaseReader()
@@ -789,7 +802,10 @@ func (c *conn) CheckNamedValue(nv *driver.NamedValue) error {
 	case time.Time:
 		nv.Value = v.UTC().Format(time.RFC3339Nano)
 	case []byte:
-		nv.Value = base64.StdEncoding.EncodeToString(v)
+		// Keep BLOB parameters as bytes. bindPlaceholders emits a SQL X'...'
+		// literal and the parser recreates []byte without a text/base64 round
+		// trip.
+		nv.Value = append([]byte(nil), v...)
 	case int:
 		nv.Value = int64(v)
 	}
@@ -799,8 +815,19 @@ func (c *conn) CheckNamedValue(nv *driver.NamedValue) error {
 // ------------------- stmt / rows -------------------
 
 type stmt struct {
-	c   *conn
-	sql string
+	c        *conn
+	sql      string
+	prepared *preparedQuery
+	mu       sync.Mutex
+}
+
+// preparedQuery holds the parsed AST and the Literal nodes that correspond to
+// positional ? placeholders. The stmt mutex makes binding safe when a
+// database/sql statement is used concurrently. Execute materializes rows
+// before the mutex is released, so no returned result aliases the next bind.
+type preparedQuery struct {
+	statement engine.Statement
+	params    []*engine.Literal
 }
 
 func (s *stmt) Close() error  { return nil }
@@ -827,11 +854,156 @@ func (s *stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (drive
 	return s.c.execSQL(ctx, sqlStr)
 }
 func (s *stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	if s.prepared != nil {
+		return s.queryPrepared(ctx, args)
+	}
 	sqlStr, err := bindPlaceholders(s.sql, args)
 	if err != nil {
 		return nil, err
 	}
 	return s.c.querySQL(ctx, sqlStr)
+}
+
+func (s *stmt) queryPrepared(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	if len(args) != len(s.prepared.params) {
+		return nil, fmt.Errorf("tinysql: expected %d placeholder arguments, got %d", len(s.prepared.params), len(args))
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, arg := range args {
+		s.prepared.params[i].Val = driverValueLiteral(arg.Value)
+	}
+	return s.c.queryStatement(ctx, s.prepared.statement)
+}
+
+func driverValueLiteral(v any) any {
+	// bindPlaceholders previously converted integer arguments into a decimal
+	// SQL literal, which the parser represented as int where possible. Keep
+	// that type behaviour so prepared index seeks use the same canonical keys.
+	switch value := v.(type) {
+	case int64:
+		if int64(int(value)) == value {
+			return int(value)
+		}
+		return value
+	case []byte:
+		return append([]byte(nil), value...)
+	default:
+		return value
+	}
+}
+
+const preparedMarkerPrefix = "__tinysql_prepared_param_"
+
+// buildPreparedQuery recognizes positional placeholders outside SQL strings,
+// parses their marker form once, and retains pointers to the corresponding
+// Literal nodes. Numbered placeholders deliberately keep the text fallback:
+// their repeated/reordered binding needs a separate ordinal map.
+func buildPreparedQuery(sqlText string) (*preparedQuery, error) {
+	markerSQL, count, ok := markerSQLForPositionalParams(sqlText)
+	if !ok || count == 0 {
+		return nil, nil
+	}
+	statement, err := engine.NewParser(markerSQL).ParseStatement()
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := statement.(*engine.Select); !ok {
+		return nil, nil
+	}
+	markers := make(map[string]int, count)
+	for i := range count {
+		markers[preparedMarkerPrefix+strconv.Itoa(i)+"__"] = i
+	}
+	params := make([]*engine.Literal, count)
+	collectPreparedLiterals(reflect.ValueOf(statement), markers, params)
+	for i, literal := range params {
+		if literal == nil {
+			return nil, fmt.Errorf("tinysql: positional parameter %d was not parsed as a literal", i+1)
+		}
+	}
+	return &preparedQuery{statement: statement, params: params}, nil
+}
+
+func markerSQLForPositionalParams(sqlText string) (string, int, bool) {
+	var out strings.Builder
+	out.Grow(len(sqlText) + 32)
+	count := 0
+	for i := 0; i < len(sqlText); i++ {
+		ch := sqlText[i]
+		if ch == '\'' {
+			out.WriteByte(ch)
+			i++
+			for i < len(sqlText) {
+				b := sqlText[i]
+				out.WriteByte(b)
+				if b == '\'' {
+					if i+1 < len(sqlText) && sqlText[i+1] == '\'' {
+						i++
+						out.WriteByte(sqlText[i])
+						i++
+						continue
+					}
+					break
+				}
+				i++
+			}
+			continue
+		}
+		if ch == '?' {
+			out.WriteByte('\'')
+			out.WriteString(preparedMarkerPrefix)
+			out.WriteString(strconv.Itoa(count))
+			out.WriteString("__'")
+			count++
+			continue
+		}
+		// Keep $1/:1 on the established text-binding path. This also avoids
+		// interpreting PostgreSQL casts or identifiers containing a colon.
+		if ch == '$' || ch == ':' {
+			if i+1 < len(sqlText) && sqlText[i+1] >= '0' && sqlText[i+1] <= '9' {
+				return "", 0, false
+			}
+		}
+		out.WriteByte(ch)
+	}
+	return out.String(), count, true
+}
+
+var literalPtrType = reflect.TypeOf((*engine.Literal)(nil))
+
+func collectPreparedLiterals(v reflect.Value, markers map[string]int, params []*engine.Literal) {
+	if !v.IsValid() {
+		return
+	}
+	if v.Type() == literalPtrType {
+		if v.IsNil() {
+			return
+		}
+		literal := v.Interface().(*engine.Literal)
+		if marker, ok := literal.Val.(string); ok {
+			if i, ok := markers[marker]; ok {
+				params[i] = literal
+			}
+		}
+		return
+	}
+	switch v.Kind() {
+	case reflect.Interface, reflect.Pointer:
+		if !v.IsNil() {
+			collectPreparedLiterals(v.Elem(), markers, params)
+		}
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i++ {
+			if v.Field(i).CanInterface() {
+				collectPreparedLiterals(v.Field(i), markers, params)
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < v.Len(); i++ {
+			collectPreparedLiterals(v.Index(i), markers, params)
+		}
+	}
 }
 
 type rows struct {
@@ -872,6 +1044,10 @@ func (r *rows) Next(dest []driver.Value) error {
 			dest[i] = vv
 		case time.Time:
 			dest[i] = vv.Format(time.RFC3339)
+		case []byte:
+			// database/sql callers may retain Scan destinations; return an owned
+			// slice just as the standard drivers do for binary columns.
+			dest[i] = append([]byte(nil), vv...)
 		default:
 			b, _ := storage.JSONMarshal(vv)
 			dest[i] = string(b)
@@ -1007,6 +1183,8 @@ func sqlLiteral(v any) string {
 		// escape single quotes by doubling them
 		s := strings.ReplaceAll(x, "'", "''")
 		return "'" + s + "'"
+	case []byte:
+		return "X'" + hex.EncodeToString(x) + "'"
 	default:
 		// Fallback: attempt JSON marshal (handles slices/maps)
 		b, err := json.Marshal(x)

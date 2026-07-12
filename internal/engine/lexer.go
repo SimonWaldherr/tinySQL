@@ -10,6 +10,7 @@
 package engine
 
 import (
+	"encoding/hex"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -22,6 +23,7 @@ const (
 	tIdent
 	tNumber
 	tString
+	tBlob
 	tSymbol
 	tKeyword
 )
@@ -30,6 +32,7 @@ type token struct {
 	Typ tokenType
 	Val string
 	Pos int
+	Err string
 }
 
 type lexer struct {
@@ -110,6 +113,12 @@ func (lx *lexer) nextToken() token {
 	r := lx.peek()
 
 	// Dispatch to specific tokenizers based on first character
+	// SQL binary literals use X'0123abcd' (case-insensitive). Keep this
+	// distinct from text literals so a BLOB can never silently become UTF-8
+	// text while crossing the parser or database/sql boundary.
+	if (r == 'x' || r == 'X') && lx.pos+1 < len(lx.s) && lx.s[lx.pos+1] == '\'' {
+		return lx.tokenizeBlob(start)
+	}
 	if r == '\'' {
 		return lx.tokenizeString(start)
 	}
@@ -124,6 +133,26 @@ func (lx *lexer) nextToken() token {
 		return lx.tokenizeIdentOrKeyword(start)
 	}
 	return lx.tokenizeSymbol(start)
+}
+
+// tokenizeBlob reads a SQL X'hex' literal and validates it eagerly. The
+// parser receives decoded raw bytes in token.Val. Decode failures travel in
+// token.Err, never as a sentinel in the payload itself.
+func (lx *lexer) tokenizeBlob(start int) token {
+	lx.pos += 2 // X and opening quote
+	begin := lx.pos
+	for lx.pos < len(lx.s) && lx.s[lx.pos] != '\'' {
+		lx.pos++
+	}
+	hexText := lx.s[begin:lx.pos]
+	if lx.pos < len(lx.s) {
+		lx.pos++
+	}
+	decoded, err := hex.DecodeString(hexText)
+	if err != nil {
+		return token{Typ: tBlob, Pos: start, Err: err.Error()}
+	}
+	return token{Typ: tBlob, Val: string(decoded), Pos: start}
 }
 
 // Helper: tokenize string literals
