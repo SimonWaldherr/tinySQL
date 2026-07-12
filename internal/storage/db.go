@@ -203,6 +203,40 @@ var colTypeToString = map[ColType]string{
 	IntervalType: "INTERVAL",
 }
 
+// SQLiteAffinity is the five-class type system used by SQLite declarations.
+// It is schema metadata, not another runtime value type: tinySQL continues to
+// store NULL, integer, real, text and binary values directly. Keeping the
+// declared affinity separate lets imported SQLite schemas retain their
+// lossless-coercion behaviour without multiplying ColType values.
+type SQLiteAffinity uint8
+
+const (
+	// AffinityDefault retains tinySQL's native, strongly typed coercion rules.
+	AffinityDefault SQLiteAffinity = iota
+	AffinityInteger
+	AffinityText
+	AffinityNumeric
+	AffinityReal
+	AffinityBlob
+)
+
+func (a SQLiteAffinity) String() string {
+	switch a {
+	case AffinityInteger:
+		return "INTEGER"
+	case AffinityText:
+		return "TEXT"
+	case AffinityNumeric:
+		return "NUMERIC"
+	case AffinityReal:
+		return "REAL"
+	case AffinityBlob:
+		return "BLOB"
+	default:
+		return ""
+	}
+}
+
 func (t ColType) String() string {
 	if s, ok := colTypeToString[t]; ok {
 		return s
@@ -275,8 +309,15 @@ type ForeignKeyRef struct {
 
 // Column holds column schema information in a table.
 type Column struct {
-	Name         string
-	Type         ColType
+	Name string
+	Type ColType
+	// DeclaredType retains the source SQL spelling (for example VARCHAR(80)
+	// or DOUBLE PRECISION). It is intentionally metadata; the physical value
+	// representation remains ColType plus SQLiteAffinity.
+	DeclaredType string
+	// Affinity is populated for SQLite-style declarations. AffinityDefault
+	// means this column was declared using a native tinySQL type.
+	Affinity     SQLiteAffinity
 	Constraint   ConstraintType
 	ForeignKey   *ForeignKeyRef // Only used if Constraint == ForeignKey
 	PointerTable string         // Target table for POINTER type
@@ -983,6 +1024,8 @@ func (db *DB) ShallowCloneForTable(tenant, tableName string) *DB {
 type diskColumn struct {
 	Name         string
 	Type         ColType
+	DeclaredType string
+	Affinity     SQLiteAffinity
 	Constraint   ConstraintType
 	ForeignKey   *ForeignKeyRef
 	PointerTable string

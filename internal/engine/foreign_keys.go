@@ -318,7 +318,7 @@ func checkForeignKeysBeforeUpdate(env ExecEnv, t *storage.Table, s *Update) erro
 			if err != nil {
 				return err
 			}
-			cv, err := coerceToTypeAllowNull(newVal, t.Cols[colIdx].Type)
+			cv, err := coerceColumnValue(newVal, t.Cols[colIdx])
 			if err != nil {
 				return err
 			}

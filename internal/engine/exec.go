@@ -868,7 +868,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 			if err != nil {
 				return nil, err
 			}
-			cv, err := coerceToTypeAllowNull(v, t.Cols[i].Type)
+			cv, err := coerceColumnValue(v, t.Cols[i])
 			if err != nil {
 				return nil, fmt.Errorf("column %q: %w", t.Cols[i].Name, err)
 			}
@@ -954,7 +954,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			if err != nil {
 				return nil, err
 			}
-			cv, err := coerceToTypeAllowNull(v, t.Cols[idx].Type)
+			cv, err := coerceColumnValue(v, t.Cols[idx])
 			if err != nil {
 				return nil, fmt.Errorf("column %q: %w", t.Cols[idx].Name, err)
 			}
@@ -1229,7 +1229,7 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 				if err != nil {
 					return nil, err
 				}
-				cv, err := coerceToTypeAllowNull(v, t.Cols[i].Type)
+				cv, err := coerceColumnValue(v, t.Cols[i])
 				if err != nil {
 					return nil, err
 				}
@@ -1329,7 +1329,7 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 			if err != nil {
 				return nil, true, err
 			}
-			cv, err := coerceToTypeAllowNull(v, plan.table.Cols[set.col].Type)
+			cv, err := coerceColumnValue(v, plan.table.Cols[set.col])
 			if err != nil {
 				return nil, true, err
 			}
@@ -10706,6 +10706,89 @@ func coerceToTypeAllowNull(v any, t storage.ColType) (any, error) {
 	default:
 		return v, nil
 	}
+}
+
+// coerceColumnValue applies SQLite's documented affinity rules only to
+// SQLite-style declarations. Native tinySQL columns retain their existing
+// strict conversion behaviour. SQLite affinity conversion is deliberately
+// lossless: a value which cannot be represented without changing meaning is
+// retained with its original storage class rather than rejected or truncated.
+func coerceColumnValue(v any, col storage.Column) (any, error) {
+	if v == nil {
+		return nil, nil
+	}
+	switch col.Affinity {
+	case storage.AffinityInteger:
+		return coerceSQLiteInteger(v)
+	case storage.AffinityReal:
+		return coerceSQLiteReal(v)
+	case storage.AffinityText:
+		// SQLite does not coerce BLOB values when applying TEXT affinity.
+		if _, ok := v.([]byte); ok {
+			return v, nil
+		}
+		return fmt.Sprintf("%v", v), nil
+	case storage.AffinityNumeric:
+		return coerceSQLiteNumeric(v)
+	case storage.AffinityBlob:
+		return v, nil
+	default:
+		return coerceToTypeAllowNull(v, col.Type)
+	}
+}
+
+func coerceSQLiteInteger(v any) (any, error) {
+	switch x := v.(type) {
+	case string:
+		s := strings.TrimSpace(x)
+		i, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			f, floatErr := strconv.ParseFloat(s, 64)
+			if floatErr != nil || math.Trunc(f) != f || f < math.MinInt64 || f > math.MaxInt64 {
+				return v, nil
+			}
+			return int(f), nil
+		}
+		return int(i), nil
+	case float64:
+		if math.Trunc(x) == x && x >= math.MinInt64 && x <= math.MaxInt64 {
+			return int(x), nil
+		}
+	}
+	return v, nil
+}
+
+func coerceSQLiteReal(v any) (any, error) {
+	switch x := v.(type) {
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
+		if err != nil {
+			return v, nil
+		}
+		return f, nil
+	case int:
+		return float64(x), nil
+	case int64:
+		return float64(x), nil
+	}
+	return v, nil
+}
+
+func coerceSQLiteNumeric(v any) (any, error) {
+	switch x := v.(type) {
+	case string:
+		s := strings.TrimSpace(x)
+		if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return int(i), nil
+		}
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			if math.Trunc(f) == f && f >= math.MinInt64 && f <= math.MaxInt64 {
+				return int(f), nil
+			}
+			return f, nil
+		}
+	}
+	return v, nil
 }
 
 // MaxBlobBytes bounds a single BLOB accepted by the SQL executor. It avoids

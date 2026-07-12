@@ -1758,14 +1758,16 @@ func (p *Parser) parseAlter() (Statement, error) {
 		return nil, p.errf("expected column name")
 	}
 
-	colType := p.parseType()
-	if colType < 0 {
+	colType, err := p.parseColumnType()
+	if err != nil {
 		return nil, p.errf("unknown column type")
 	}
 
 	col := storage.Column{
-		Name: colName,
-		Type: colType,
+		Name:         colName,
+		Type:         colType.typ,
+		DeclaredType: colType.declared,
+		Affinity:     colType.affinity,
 	}
 
 	return &AlterTable{
@@ -2822,19 +2824,21 @@ func (p *Parser) parseSingleColumnDef() (storage.Column, error) {
 	if name == "" {
 		return storage.Column{}, p.errf("expected column name")
 	}
-	typ := p.parseType()
-	if typ < 0 {
+	typ, err := p.parseColumnType()
+	if err != nil {
 		return storage.Column{}, p.errf("unknown type for column %q", name)
 	}
 
 	col := storage.Column{
-		Name:       name,
-		Type:       typ,
-		Constraint: storage.NoConstraint,
+		Name:         name,
+		Type:         typ.typ,
+		DeclaredType: typ.declared,
+		Affinity:     typ.affinity,
+		Constraint:   storage.NoConstraint,
 	}
 
 	// Parse constraints
-	err := p.parseColumnConstraints(&col)
+	err = p.parseColumnConstraints(&col)
 	if err != nil {
 		return storage.Column{}, err
 	}
@@ -3038,6 +3042,14 @@ var typeKeywordMap = map[string]storage.ColType{
 	"URL":    storage.URLType,
 	"HASH":   storage.HASHType,
 	"BITMAP": storage.BitmapType,
+	// Existing native types which were previously only usable through the
+	// storage API. They also make ordinary SQLite schemas more portable.
+	"DECIMAL":  storage.DecimalType,
+	"NUMERIC":  storage.DecimalType,
+	"MONEY":    storage.MoneyType,
+	"UUID":     storage.UUIDType,
+	"XML":      storage.XMLType,
+	"INTERVAL": storage.IntervalType,
 	// Binary data. BLOB is the canonical SQL spelling; the aliases make it
 	// practical to import SQLite/PostgreSQL-ish schemas without weakening the
 	// runtime invariant that BlobType values are always []byte.
@@ -3047,14 +3059,150 @@ var typeKeywordMap = map[string]storage.ColType{
 	"VARBINARY": storage.BlobType,
 }
 
-func (p *Parser) parseType() storage.ColType {
-	if p.cur.Typ == tKeyword || p.cur.Typ == tIdent {
-		if colType, ok := typeKeywordMap[upper(p.cur.Val)]; ok {
-			p.next()
-			return colType
+type parsedColumnType struct {
+	typ      storage.ColType
+	declared string
+	affinity storage.SQLiteAffinity
+}
+
+// parseColumnType accepts both tinySQL's native names and SQLite's permissive
+// type declarations. SQLite's type system is affinity-based, so declarations
+// such as VARCHAR(255), DOUBLE PRECISION and UNSIGNED BIG INT must not force
+// the engine to invent a separate physical value type.
+func (p *Parser) parseColumnType() (parsedColumnType, error) {
+	// SQLite allows a column without a declared type. It has BLOB affinity and
+	// accepts every storage class, represented here by InterfaceType.
+	if p.isColumnTypeTerminator() {
+		return parsedColumnType{typ: storage.InterfaceType, affinity: storage.AffinityBlob}, nil
+	}
+	if p.cur.Typ != tKeyword && p.cur.Typ != tIdent {
+		return parsedColumnType{}, p.errf("expected column type")
+	}
+
+	words := make([]string, 0, 3)
+	var arguments string
+	for (p.cur.Typ == tKeyword || p.cur.Typ == tIdent) && !p.isColumnTypeTerminator() {
+		words = append(words, upper(p.cur.Val))
+		p.next()
+		// A SQLite type name may be followed by one parenthesized length or
+		// precision list. Its values are schema decoration, not runtime limits.
+		if p.cur.Typ == tSymbol && p.cur.Val == "(" {
+			var err error
+			arguments, err = p.skipTypeArguments()
+			if err != nil {
+				return parsedColumnType{}, err
+			}
+			break
 		}
 	}
-	return -1
+	if len(words) == 0 {
+		return parsedColumnType{}, p.errf("expected column type")
+	}
+
+	declared := strings.Join(words, " ") + arguments
+	// ANY is the SQLite STRICT-table escape hatch. It has no coercion and
+	// preserves the value's original storage class, so InterfaceType is the
+	// existing tinySQL representation rather than a new value type.
+	if declared == "ANY" {
+		return parsedColumnType{typ: storage.InterfaceType, declared: declared, affinity: storage.AffinityBlob}, nil
+	}
+	if typ, ok := typeKeywordMap[declared]; ok {
+		// These names have SQLite-defined affinity semantics. Keep native
+		// tinySQL spellings such as INT8, JSON and TIMESTAMP strict.
+		switch declared {
+		case "INT", "FLOAT", "DOUBLE", "TEXT", "NUMERIC", "DECIMAL", "BOOL", "BOOLEAN":
+			return parsedColumnType{typ: typ, declared: declared, affinity: sqliteAffinity(declared)}, nil
+		default:
+			return parsedColumnType{typ: typ, declared: declared}, nil
+		}
+	}
+	// A one-token native type retains existing tinySQL coercion semantics.
+	if len(words) == 1 && arguments == "" {
+		if typ, ok := typeKeywordMap[words[0]]; ok {
+			return parsedColumnType{typ: typ, declared: declared}, nil
+		}
+	}
+
+	affinity := sqliteAffinity(declared)
+	typ := storage.InterfaceType
+	switch affinity {
+	case storage.AffinityInteger:
+		typ = storage.IntType
+	case storage.AffinityReal:
+		typ = storage.FloatType
+	case storage.AffinityText:
+		typ = storage.TextType
+	case storage.AffinityNumeric:
+		typ = storage.DecimalType
+	case storage.AffinityBlob:
+		// A declared BLOB is a binary tinySQL column. A type-less column is
+		// represented above as InterfaceType so it remains fully dynamic.
+		if declared == "BLOB" {
+			typ = storage.BlobType
+			affinity = storage.AffinityDefault
+		}
+	}
+	return parsedColumnType{typ: typ, declared: declared, affinity: affinity}, nil
+}
+
+func (p *Parser) isColumnTypeTerminator() bool {
+	if p.cur.Typ == tSymbol && (p.cur.Val == "," || p.cur.Val == ")") {
+		return true
+	}
+	if p.cur.Typ != tKeyword {
+		return false
+	}
+	switch p.cur.Val {
+	case "PRIMARY", "FOREIGN", "UNIQUE", "REFERENCES", "NOT", "NULL":
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *Parser) skipTypeArguments() (string, error) {
+	depth := 0
+	var b strings.Builder
+	for p.cur.Typ == tSymbol && p.cur.Val == "(" || depth > 0 {
+		if p.cur.Typ == tEOF {
+			return "", p.errf("unterminated type arguments")
+		}
+		b.WriteString(p.cur.Val)
+		if p.cur.Typ == tSymbol {
+			switch p.cur.Val {
+			case "(":
+				depth++
+			case ")":
+				depth--
+			}
+		}
+		p.next()
+		if depth == 0 {
+			return b.String(), nil
+		}
+	}
+	return "", nil
+}
+
+func sqliteAffinity(declared string) storage.SQLiteAffinity {
+	// This is SQLite's documented affinity algorithm, applied to the upper
+	// case declaration. Order matters: "FLOATING POINT" contains "INT".
+	base := declared
+	if i := strings.IndexByte(base, '('); i >= 0 {
+		base = base[:i]
+	}
+	switch {
+	case strings.Contains(base, "INT"):
+		return storage.AffinityInteger
+	case strings.Contains(base, "CHAR"), strings.Contains(base, "CLOB"), strings.Contains(base, "TEXT"):
+		return storage.AffinityText
+	case base == "", strings.Contains(base, "BLOB"):
+		return storage.AffinityBlob
+	case strings.Contains(base, "REAL"), strings.Contains(base, "FLOA"), strings.Contains(base, "DOUB"):
+		return storage.AffinityReal
+	default:
+		return storage.AffinityNumeric
+	}
 }
 func (p *Parser) parseIdentLike() string {
 	// Accept both identifiers and keywords as identifier-like names.
