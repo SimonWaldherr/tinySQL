@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
@@ -40,8 +42,12 @@ func TestImportDecimalUUIDMoney_InsertAllRecords(t *testing.T) {
 	}
 
 	// Basic type assertions
-	if _, ok := tbl.Rows[0][0].([]byte); !ok {
-		t.Fatalf("expected UUID storage representation as []byte, got %T", tbl.Rows[0][0])
+	gotUUID, ok := tbl.Rows[0][0].(uuid.UUID)
+	if !ok {
+		t.Fatalf("expected UUID storage representation as uuid.UUID, got %T", tbl.Rows[0][0])
+	}
+	if gotUUID.String() != "550e8400-e29b-41d4-a716-446655440000" {
+		t.Fatalf("UUID = %q, want input UUID", gotUUID)
 	}
 }
 

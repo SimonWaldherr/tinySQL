@@ -372,7 +372,10 @@ func decodeNDJSON(br *bufio.Reader, result *ImportResult, maxRecordBytes int) ([
 // extractJSONRecords extracts records from JSON input (array or NDJSON)
 func extractJSONRecords(src io.Reader, result *ImportResult, maxRecordBytes int) ([]map[string]any, error) {
 	br := bufio.NewReader(src)
-	peek, _ := br.Peek(512)
+	peek, err := br.Peek(512)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
 	trimmed := strings.TrimSpace(string(peek))
 
 	if strings.HasPrefix(trimmed, "[") {

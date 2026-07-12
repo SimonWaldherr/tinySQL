@@ -37,12 +37,17 @@ func (r contextReader) Read(p []byte) (int, error) {
 }
 
 type maxBytesReader struct {
-	r         io.Reader
-	remaining int64
+	r            io.Reader
+	remaining    int64
+	limitChecked bool
 }
 
 func (r *maxBytesReader) Read(p []byte) (int, error) {
 	if r.remaining <= 0 {
+		if r.limitChecked {
+			return 0, io.EOF
+		}
+		r.limitChecked = true
 		var probe [1]byte
 		n, err := r.r.Read(probe[:])
 		if n > 0 {
