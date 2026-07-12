@@ -28,7 +28,7 @@ func main() {
 		shutdownTO   = flag.Duration("shutdown-timeout", 10*time.Second, "Graceful shutdown timeout")
 		analytics    = flag.Bool("analytics", false, "Enable vector-cache analytics endpoint and event window")
 		cacheEntries = flag.Int("vector-cache-entries", 0, "VEC_SEARCH result-cache entries (0 disables)")
-		cacheTTL     = flag.Duration("vector-cache-ttl", 0, "VEC_SEARCH result-cache TTL (0 disables)")
+		cacheTTL     = flag.Duration("vector-cache-ttl", 30*time.Second, "VEC_SEARCH result-cache TTL once entries are enabled")
 		check        = flag.Bool("check", false, "Open the DBMS runtime, print status, then exit")
 	)
 	flag.Parse()

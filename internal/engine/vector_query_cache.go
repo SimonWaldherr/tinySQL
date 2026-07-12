@@ -19,6 +19,18 @@ type VectorCacheConfig struct {
 	AnalyticsMaxEvents int
 }
 
+const (
+	defaultVectorCacheTTL        = 30 * time.Second
+	defaultVectorAnalyticsWindow = time.Minute
+	defaultVectorAnalyticsEvents = 128
+)
+
+// DefaultVectorCacheConfig returns the conservative profile: caching and
+// analytics are opt-in, while bounded values are ready for enabled features.
+func DefaultVectorCacheConfig() VectorCacheConfig {
+	return VectorCacheConfig{ResultCacheTTL: defaultVectorCacheTTL, AnalyticsWindow: defaultVectorAnalyticsWindow, AnalyticsMaxEvents: defaultVectorAnalyticsEvents}
+}
+
 // VectorCacheStats is a snapshot suitable for embedding applications and the
 // server analytics endpoint. Query names exclude vector contents.
 type VectorCacheStats struct {
@@ -72,8 +84,14 @@ func ConfigureVectorCache(cfg VectorCacheConfig) {
 	if cfg.AnalyticsMaxEvents < 0 {
 		cfg.AnalyticsMaxEvents = 0
 	}
+	if cfg.ResultCacheEntries > 0 && cfg.ResultCacheTTL <= 0 {
+		cfg.ResultCacheTTL = defaultVectorCacheTTL
+	}
 	if cfg.AnalyticsWindow <= 0 {
-		cfg.AnalyticsWindow = time.Minute
+		cfg.AnalyticsWindow = defaultVectorAnalyticsWindow
+	}
+	if cfg.Analytics && cfg.AnalyticsMaxEvents == 0 {
+		cfg.AnalyticsMaxEvents = defaultVectorAnalyticsEvents
 	}
 	vecQueryCacheState.cfg = cfg
 	vecQueryCacheState.hits = 0

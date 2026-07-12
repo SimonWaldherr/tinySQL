@@ -111,8 +111,9 @@ type VectorCacheConfig = engine.VectorCacheConfig
 type VectorCacheStats = engine.VectorCacheStats
 type VectorQueryEvent = engine.VectorQueryEvent
 
-func ConfigureVectorCache(cfg VectorCacheConfig) { engine.ConfigureVectorCache(cfg) }
-func VectorCacheAnalytics() VectorCacheStats     { return engine.VectorCacheAnalytics() }
+func ConfigureVectorCache(cfg VectorCacheConfig)  { engine.ConfigureVectorCache(cfg) }
+func VectorCacheAnalytics() VectorCacheStats      { return engine.VectorCacheAnalytics() }
+func DefaultVectorCacheConfig() VectorCacheConfig { return engine.DefaultVectorCacheConfig() }
 
 // ProcedureContext is passed to in-memory stored procedures registered with
 // RegisterStoredProcedure. It can execute nested SQL within the same CALL.
