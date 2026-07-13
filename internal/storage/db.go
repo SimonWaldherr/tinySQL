@@ -577,6 +577,25 @@ func applyEncryptionKey(backend *DiskBackend, key []byte) error {
 // files in the configured directory. For ModeWAL, the existing WAL mechanism is
 // configured automatically.
 func OpenDB(cfg StorageConfig) (*DB, error) {
+	// WAL open/recovery currently opens its log read-write and can truncate a
+	// torn tail during recovery. Reject it rather than claiming that a
+	// read-only open is safe while creating or modifying a WAL sidecar.
+	if cfg.ReadOnly && (cfg.Mode == ModeWAL || cfg.Mode == ModeAdvancedWAL) {
+		return nil, fmt.Errorf("read-only open is not supported for %s; use a checkpointed disk, index, hybrid, or json artifact", cfg.Mode)
+	}
+	// Persistent read-only modes must never turn a typo or missing artifact
+	// into a newly created directory. NewDiskBackend normally creates its root
+	// for import workflows, so validate before it is constructed.
+	if cfg.ReadOnly && (cfg.Mode == ModeDisk || cfg.Mode == ModeJSON || cfg.Mode == ModeIndex || cfg.Mode == ModeHybrid) {
+		info, err := os.Stat(cfg.Path)
+		if err != nil {
+			return nil, fmt.Errorf("read-only open requires an existing storage directory %q: %w", cfg.Path, err)
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("read-only open requires a storage directory, got %q", cfg.Path)
+		}
+	}
+
 	db := &DB{
 		tenants:     map[string]*tenantDB{},
 		mvcc:        NewMVCCManager(),
@@ -670,6 +689,7 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 		if err := applyEncryptionKey(backend, cfg.EncryptionKey); err != nil {
 			return nil, err
 		}
+		backend.SetReadOnly(cfg.ReadOnly)
 		db.backend = backend
 
 	case ModeJSON:
@@ -683,6 +703,7 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 		if err := applyEncryptionKey(backend, cfg.EncryptionKey); err != nil {
 			return nil, err
 		}
+		backend.SetReadOnly(cfg.ReadOnly)
 		db.backend = backend
 
 	case ModeIndex:
@@ -700,6 +721,7 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 		if err := applyEncryptionKey(backend.Disk(), cfg.EncryptionKey); err != nil {
 			return nil, err
 		}
+		backend.SetReadOnly(cfg.ReadOnly)
 		db.backend = backend
 
 	case ModeHybrid:
@@ -717,6 +739,7 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 		if err := applyEncryptionKey(backend.Disk(), cfg.EncryptionKey); err != nil {
 			return nil, err
 		}
+		backend.SetReadOnly(cfg.ReadOnly)
 		db.backend = backend
 
 	default:
@@ -821,10 +844,17 @@ func (db *DB) Get(tn, name string) (*Table, error) {
 			return nil, fmt.Errorf("backend load %s/%s: %w", tn, name, err)
 		}
 		if t != nil {
-			// Cache in the in-memory tenants map.
-			db.mu.Lock()
-			db.getTenant(tn).tables[strings.ToLower(t.Name)] = t
-			db.mu.Unlock()
+			// ModeIndex and ModeHybrid own loaded tables through their bounded
+			// buffer pool. Retaining another pointer in DB.tenants would turn a
+			// cache eviction into a no-op and make memory grow with every table
+			// ever queried. The caller's reference is a query-scoped lease: it
+			// remains valid while that statement holds DB.contentMu, and becomes
+			// collectible once both caller and pool release it.
+			if !db.backendTablesEvictable() {
+				db.mu.Lock()
+				db.getTenant(tn).tables[strings.ToLower(t.Name)] = t
+				db.mu.Unlock()
+			}
 			return t, nil
 		}
 	}
@@ -832,11 +862,23 @@ func (db *DB) Get(tn, name string) (*Table, error) {
 	return nil, fmt.Errorf("no such table %q (tenant %q)", name, tn)
 }
 
+// backendTablesEvictable reports modes whose backend, rather than DB.tenants,
+// is the owner of lazily loaded tables. Keeping this policy explicit is
+// important: schemas and manifest metadata stay resident, row payloads do
+// not. Mutable tables created in the current process remain in the catalog
+// until they are explicitly Evict'ed or the DB is reopened.
+func (db *DB) backendTablesEvictable() bool {
+	return db.backend != nil && (db.storageMode == ModeIndex || db.storageMode == ModeHybrid)
+}
+
 // Put adds a new table to the tenant; returns error if it already exists.
 // When a StorageBackend is attached, the table is also checked against the
 // backend to prevent duplicates, and optionally persisted immediately when
 // SyncOnMutate is configured.
 func (db *DB) Put(tn string, t *Table) error {
+	if db.IsReadOnly() {
+		return ErrReadOnlyStorage
+	}
 	exists := func() bool {
 		db.mu.Lock()
 		defer db.mu.Unlock()
@@ -867,6 +909,9 @@ func (db *DB) Put(tn string, t *Table) error {
 
 // Drop removes a table from the tenant (and from the backend if attached).
 func (db *DB) Drop(tn, name string) error {
+	if db.IsReadOnly() {
+		return ErrReadOnlyStorage
+	}
 	onDisk, found := func() (bool, bool) {
 		db.mu.Lock()
 		defer db.mu.Unlock()
@@ -896,6 +941,23 @@ func (db *DB) Drop(tn, name string) error {
 // When a StorageBackend is attached, tables that exist on disk but are not
 // currently loaded into memory are loaded on demand.
 func (db *DB) ListTables(tn string) []*Table {
+	// In the evictable modes the tenant catalog deliberately does not own
+	// backend-loaded row data. ListTables is an explicit all-table operation,
+	// so return transient table leases rather than repopulating that catalog.
+	if db.backendTablesEvictable() {
+		names, err := db.backend.ListTableNames(tn)
+		if err != nil {
+			return nil
+		}
+		out := make([]*Table, 0, len(names))
+		for _, name := range names {
+			if t, err := db.Get(tn, name); err == nil && t != nil {
+				out = append(out, t)
+			}
+		}
+		return out
+	}
+
 	// If a backend is attached, ensure we know about all tables on disk.
 	if db.backend != nil {
 		if diskNames, err := db.backend.ListTableNames(tn); err == nil {
@@ -908,9 +970,11 @@ func (db *DB) ListTables(tn string) []*Table {
 				if !inMem {
 					// Load from backend
 					if t, err := db.backend.LoadTable(tn, n); err == nil && t != nil {
-						db.mu.Lock()
-						db.getTenant(tn).tables[lc] = t
-						db.mu.Unlock()
+						if !db.backendTablesEvictable() {
+							db.mu.Lock()
+							db.getTenant(tn).tables[lc] = t
+							db.mu.Unlock()
+						}
 					}
 				}
 			}
@@ -1253,6 +1317,9 @@ func (db *DB) loadBackendCatalog() error {
 }
 
 func (db *DB) saveBackendCatalog() error {
+	if db.IsReadOnly() {
+		return nil
+	}
 	path, ok := db.backendCatalogPath()
 	if !ok {
 		return nil
@@ -1924,6 +1991,10 @@ func (db *DB) HealthCheck() DBHealth {
 // ModeIndex, tables whose version has changed since the last save are
 // written to disk.
 func (db *DB) Sync() error {
+	if db.IsReadOnly() {
+		db.markSynced()
+		return nil
+	}
 	if db.backend == nil {
 		db.markSynced()
 		return nil
@@ -2037,6 +2108,12 @@ func (db *DB) Close() error {
 // the backend. This is only meaningful for disk-backed modes; in ModeMemory
 // the data would be lost. Returns an error if no backend is attached.
 func (db *DB) Evict(tenant, name string) error {
+	if db.IsReadOnly() {
+		// Eviction must not try to "save before evicting" an immutable artifact.
+		// It is already durable; no catalog table is retained on lazy reads in
+		// ModeIndex/ModeHybrid, so there is nothing to flush.
+		return nil
+	}
 	if db.backend == nil || db.storageMode == ModeMemory {
 		return fmt.Errorf("evict requires a disk-backed storage mode")
 	}
@@ -2083,6 +2160,9 @@ func (db *DB) TableExists(tenant, name string) bool {
 // SyncTable flushes a single table to the backend. This is called by the
 // engine after mutations when SyncOnMutate is enabled.
 func (db *DB) SyncTable(tenant string, t *Table) error {
+	if db.IsReadOnly() {
+		return ErrReadOnlyStorage
+	}
 	if db.backend == nil {
 		return nil
 	}
@@ -2102,6 +2182,9 @@ func (db *DB) BackendStats() BackendStats {
 // attaches it. This enables migrating a ModeMemory database to ModeDisk
 // or ModeHybrid at runtime.
 func (db *DB) MigrateToBackend(b StorageBackend) error {
+	if db.IsReadOnly() {
+		return ErrReadOnlyStorage
+	}
 	db.mu.RLock()
 	type entry struct {
 		tenant string

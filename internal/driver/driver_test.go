@@ -10,7 +10,9 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -193,6 +195,260 @@ func TestDSNAliases(t *testing.T) {
 	}
 	if c.maxReaders != 2 || c.maxWriters != 1 || c.busyTimeout != 100*time.Millisecond {
 		t.Fatalf("alias parsing failed: %#v", c)
+	}
+}
+
+func TestParseDSNStorageOptionsAreStrictAndComplete(t *testing.T) {
+	c, err := parseDSN("file:/tmp/tiny?tenant=tiles&mode=index&autosave=1&pool_readers=4&pool_writers=2&busy_timeout=125ms&max_memory_bytes=64MiB&read_only=0&sync_on_mutate=true&compress_files=false&checkpoint_every=9&checkpoint_interval=2s&checkpoint_max_bytes=512MiB")
+	if err != nil {
+		t.Fatalf("parse DSN: %v", err)
+	}
+	if c.maxMemoryBytes != 64<<20 || c.checkpointMaxBytes != 512<<20 {
+		t.Fatalf("byte options = memory %d checkpoint %d", c.maxMemoryBytes, c.checkpointMaxBytes)
+	}
+	if c.checkpointEvery != 9 || c.checkpointInterval != 2*time.Second || !c.syncOnMutate || c.compressFiles || c.readOnly {
+		t.Fatalf("storage options not preserved: %#v", c)
+	}
+	for _, dsn := range []string{
+		"mem://?max_memory_bytes=not-a-size",
+		"mem://?read_only=maybe",
+		"mem://?checkpoint_interval=-1s",
+		"mem://?unknown_option=1",
+		"mem://?tenant=a&tenant=b",
+	} {
+		if _, err := parseDSN(dsn); err == nil {
+			t.Fatalf("expected strict parse error for %q", dsn)
+		}
+	}
+}
+
+func TestConnectorSharesOneStorageDBPerSQLDB(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		opened = make(map[*storage.DB]int)
+	)
+	serverOpenHook.Lock()
+	if serverOpenHook.fn != nil {
+		serverOpenHook.Unlock()
+		t.Fatal("test hook already installed")
+	}
+	serverOpenHook.fn = func(db *storage.DB, _ cfg) {
+		mu.Lock()
+		opened[db]++
+		mu.Unlock()
+	}
+	serverOpenHook.Unlock()
+	t.Cleanup(func() {
+		serverOpenHook.Lock()
+		serverOpenHook.fn = nil
+		serverOpenHook.Unlock()
+	})
+
+	// A named mem DSN is deliberately used here: it must not inherit a
+	// SetDefaultDB installed by another embedding test.
+	db, err := sql.Open("tinysql", "mem://?tenant=connector_shared&pool_readers=8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(8)
+	if _, err := db.Exec(`CREATE TABLE probe (id INT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO probe VALUES (1)`); err != nil {
+		t.Fatal(err)
+	}
+
+	ready := make(chan error, 8)
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tx, err := db.Begin()
+			if err == nil {
+				var n int
+				err = tx.QueryRow(`SELECT id FROM probe WHERE id = 1`).Scan(&n)
+				if err == nil && n != 1 {
+					err = fmt.Errorf("query returned %d, want 1", n)
+				}
+			}
+			ready <- err
+			<-release // Keep the physical connection checked out.
+			if tx != nil {
+				_ = tx.Rollback()
+			}
+		}()
+	}
+	for range 8 {
+		if err := <-ready; err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(release)
+	wg.Wait()
+
+	mu.Lock()
+	if len(opened) != 1 {
+		mu.Unlock()
+		t.Fatalf("physical connections opened %d storage DBs, want one", len(opened))
+	}
+	mu.Unlock()
+
+	// A second sql.Open gets a second Connector and therefore an isolated
+	// in-memory database even when its DSN text is identical.
+	separate, err := sql.Open("tinysql", "mem://?tenant=connector_shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer separate.Close()
+	if err := separate.QueryRow(`SELECT id FROM probe`).Scan(new(int)); err == nil {
+		t.Fatal("separate sql.Open unexpectedly observed the first mem:// database")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(opened) != 2 {
+		t.Fatalf("separate sql.Open constructed %d storage DBs, want two", len(opened))
+	}
+}
+
+func TestConnectorForwardsStorageConfig(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "artifact")
+	dsn := "file:" + dir + "?mode=index&max_memory_bytes=64MiB&sync_on_mutate=1&compress_files=1&checkpoint_every=7&checkpoint_interval=3s&checkpoint_max_bytes=512MiB"
+	co, err := (&drv{}).OpenConnector(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := co.Connect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := raw.(*conn)
+	defer c.srv.db.Close()
+	got := c.srv.db.Config()
+	if got == nil || got.Mode != storage.ModeIndex || got.MaxMemoryBytes != 64<<20 || !got.SyncOnMutate || !got.CompressFiles || got.CheckpointEvery != 7 || got.CheckpointInterval != 3*time.Second || got.CheckpointMaxBytes != 512<<20 {
+		t.Fatalf("storage config was not forwarded: %#v", got)
+	}
+	if stats := c.srv.db.BackendStats(); stats.MemoryLimitBytes != 64<<20 {
+		t.Fatalf("buffer-pool limit = %d, want %d", stats.MemoryLimitBytes, 64<<20)
+	}
+}
+
+func TestReadOnlyIndexDSNPreventsWritesAndArtifacts(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "artifact")
+	writeDSN := "file:" + dir + "?mode=index"
+	writer, err := sql.Open("tinysql", writeDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Exec(`CREATE TABLE images (tile_id TEXT, tile_data BLOB)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Exec(`CREATE TABLE map (zoom_level INT, tile_column INT, tile_row INT, tile_id TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{0x1f, 0x8b, 0x08, 0x00, 0xff}
+	if _, err := writer.Exec(`INSERT INTO images VALUES (?, ?)`, "z/x/y", want); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Exec(`INSERT INTO map VALUES (12, 2174, 1423, 'z/x/y')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Exec(`CREATE UNIQUE INDEX idx_map_zxy ON map(zoom_level, tile_column, tile_row)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Exec(`CREATE UNIQUE INDEX idx_images_tile_id ON images(tile_id)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	manifestBefore, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tablePath := filepath.Join(dir, "default", "images.tbl")
+	tableBefore, err := os.ReadFile(tablePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := sql.Open("tinysql", writeDSN+"&read_only=1&max_memory_bytes=1MiB")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tileID string
+	if err := reader.QueryRow(`SELECT tile_id FROM map WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?`, 12, 2174, 1423).Scan(&tileID); err != nil {
+		t.Fatal(err)
+	}
+	if tileID != "z/x/y" {
+		t.Fatalf("map point lookup = %q", tileID)
+	}
+	var got []byte
+	if err := reader.QueryRow(`SELECT tile_data FROM images WHERE tile_id = ?`, tileID).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("BLOB mismatch: got %x want %x", got, want)
+	}
+	got[0] ^= 0xff // A caller must not mutate a cache/driver-owned BLOB.
+	var again []byte
+	if err := reader.QueryRow(`SELECT tile_data FROM images WHERE tile_id = ?`, "z/x/y").Scan(&again); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(again, want) {
+		t.Fatalf("BLOB scan aliased storage: got %x want %x", again, want)
+	}
+	if err := reader.QueryRow(`SELECT tile_data FROM images WHERE tile_id = ?`, "missing").Scan(new([]byte)); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("missing tile error = %v, want sql.ErrNoRows", err)
+	}
+	explain, err := reader.Query(`EXPLAIN SELECT tile_id FROM map WHERE zoom_level = 12 AND tile_column = 2174 AND tile_row = 1423`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundSeek := false
+	for explain.Next() {
+		var step int
+		var operation, detail string
+		if err := explain.Scan(&step, &operation, &detail); err != nil {
+			explain.Close()
+			t.Fatal(err)
+		}
+		if operation == "INDEX POINT SEEK" && strings.Contains(detail, "index=idx_map_zxy") {
+			foundSeek = true
+		}
+	}
+	if err := explain.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !foundSeek {
+		t.Fatal("EXPLAIN did not expose the composite index point seek")
+	}
+	if _, err := reader.Exec(`INSERT INTO images VALUES ('new', X'00')`); err == nil {
+		t.Fatal("read-only INSERT unexpectedly succeeded")
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	manifestAfter, _ := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	tableAfter, _ := os.ReadFile(tablePath)
+	if !reflect.DeepEqual(manifestBefore, manifestAfter) || !reflect.DeepEqual(tableBefore, tableAfter) {
+		t.Fatal("read-only open changed persistent artifact")
+	}
+
+	missing := filepath.Join(t.TempDir(), "missing")
+	missingDB, err := sql.Open("tinysql", "file:"+missing+"?mode=index&read_only=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer missingDB.Close()
+	if err := missingDB.Ping(); err == nil {
+		t.Fatal("read-only open of missing artifact unexpectedly succeeded")
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatalf("read-only open created %q: %v", missing, err)
 	}
 }
 

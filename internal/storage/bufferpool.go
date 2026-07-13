@@ -221,6 +221,13 @@ func (bp *BufferPool) Put(tenant, name string, table *Table) error {
 			if bp.policy.EnableEviction {
 				// Evict to make space
 				bp.evictLRU(tableSize)
+				// The pool must remain an actual bound, not merely an eviction
+				// hint. A table larger than the budget (or a set of pinned tables)
+				// cannot be admitted; callers still receive their query-scoped
+				// table lease but it is deliberately not cached.
+				if bp.currentMemory.Load()+tableSize > bp.policy.MaxMemoryBytes {
+					return fmt.Errorf("memory limit exceeded: table requires %d bytes with %d/%d resident", tableSize, bp.currentMemory.Load(), bp.policy.MaxMemoryBytes)
+				}
 			} else {
 				return fmt.Errorf("memory limit exceeded: %d/%d bytes",
 					currentMem, bp.policy.MaxMemoryBytes)

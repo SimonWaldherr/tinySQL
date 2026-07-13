@@ -171,7 +171,11 @@ TinySQL is not a PostgreSQL/MySQL replacement. Important current limits:
 - Materialized secondary indexes currently support equality point/prefix seeks
   on their leading columns. They are rebuilt after DML and persisted with
   snapshots/backends; pager-native incremental index pages and range planning
-  are not implemented yet.
+  are not implemented yet. `ModeIndex`/`ModeHybrid` now keep backend-loaded
+  tables out of the permanent DB catalog and enforce their buffer-pool budget,
+  but the legacy GOB table codec still decodes a full table on a cache miss.
+  They are therefore not yet suitable as a strict per-record, multi-gigabyte
+  MBTiles serving engine; SQLite remains the production MBTiles default.
 - RBAC checks are coarse and single-table oriented.
 - Encryption at rest currently covers table files for `ModeDisk`, `ModeJSON`,
   `ModeHybrid`, and `ModeIndex`, not WAL-backed modes or metadata files.

@@ -169,6 +169,9 @@ func (h *HybridBackend) MarkDirty(tenant, name string) {
 
 // Sync writes all dirty in-memory tables to disk.
 func (h *HybridBackend) Sync() error {
+	if h.disk.IsReadOnly() {
+		return nil
+	}
 	h.dirtyLock.Lock()
 	snapshot := make(map[string]map[string]bool)
 	for tn, dm := range h.dirty {
@@ -218,6 +221,11 @@ func (h *HybridBackend) Mode() StorageMode { return h.mode }
 // SetEncryptor forwards table-file encryption to the underlying DiskBackend.
 func (h *HybridBackend) SetEncryptor(enc *Encryptor) {
 	h.disk.SetEncryptor(enc)
+}
+
+// SetReadOnly forwards the serving-only contract to the durable backend.
+func (h *HybridBackend) SetReadOnly(readOnly bool) {
+	h.disk.SetReadOnly(readOnly)
 }
 
 func (h *HybridBackend) Stats() BackendStats {

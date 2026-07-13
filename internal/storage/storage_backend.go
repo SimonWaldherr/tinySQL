@@ -12,10 +12,17 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 )
+
+// ErrReadOnlyStorage is returned by a persistence backend when a caller tries
+// to modify an artifact opened for serving. It is deliberately distinct from
+// an OS permission error so callers can surface an actionable configuration
+// error before any file is touched.
+var ErrReadOnlyStorage = errors.New("storage is read-only")
 
 // ───────────────────────────────────────────────────────────────────────────
 // Storage mode enumeration

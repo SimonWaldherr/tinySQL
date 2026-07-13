@@ -71,6 +71,11 @@ type DiskBackend struct {
 	manifestCreatedAt time.Time
 	manifestDirty     bool
 
+	// readOnly prevents every persistence operation, including Close/Sync.
+	// DB.SetReadOnly protects SQL execution; this backend flag additionally
+	// protects direct embedding callers and background cleanup paths.
+	readOnly atomic.Bool
+
 	// stats
 	syncCount     atomic.Int64
 	loadCount     atomic.Int64
@@ -129,6 +134,19 @@ func (b *DiskBackend) SetEncryptor(enc *Encryptor) {
 	b.encryptor = enc
 }
 
+// SetReadOnly makes the backend observational. It is normally set by OpenDB
+// before the backend is exposed to callers.
+func (b *DiskBackend) SetReadOnly(readOnly bool) {
+	if b != nil {
+		b.readOnly.Store(readOnly)
+	}
+}
+
+// IsReadOnly reports whether persistence has been disabled for this backend.
+func (b *DiskBackend) IsReadOnly() bool {
+	return b != nil && b.readOnly.Load()
+}
+
 // ──── StorageBackend interface ────────────────────────────────────────────
 
 // LoadTable reads a table from its GOB file on disk.
@@ -168,6 +186,9 @@ func (b *DiskBackend) LoadTable(tenant, name string) (*Table, error) {
 
 // SaveTable writes a table to its GOB file on disk and updates the manifest.
 func (b *DiskBackend) SaveTable(tenant string, t *Table) error {
+	if b.IsReadOnly() {
+		return ErrReadOnlyStorage
+	}
 	tn := normalizeTenantKey(tenant)
 	relPath, absPath, err := b.buildTablePaths(tn, t.Name)
 	if err != nil {
@@ -224,6 +245,9 @@ func (b *DiskBackend) SaveTable(tenant string, t *Table) error {
 
 // DeleteTable removes a table file from disk and updates the manifest.
 func (b *DiskBackend) DeleteTable(tenant, name string) error {
+	if b.IsReadOnly() {
+		return ErrReadOnlyStorage
+	}
 	tn := normalizeTenantKey(tenant)
 
 	b.mu.Lock()
@@ -276,6 +300,9 @@ func (b *DiskBackend) TableExists(tenant, name string) bool {
 // by SaveTable). The caller should call SaveTable for each dirty table before
 // calling Sync, or use DB.Sync which does this automatically.
 func (b *DiskBackend) Sync() error {
+	if b.IsReadOnly() {
+		return nil
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.syncCount.Add(1)

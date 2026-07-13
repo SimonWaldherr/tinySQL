@@ -10,8 +10,14 @@
 //   - Reader/writer pools and simple MVCC-style snapshots for transactions.
 //   - Simple, safe placeholder binding: sequential `?` and numbered `$1`/`:1`.
 //
-// Use `sql.Open("tinysql", dsn)` to create a connection. See `applyDSNOption`
-// and `applyQueryOptions` for available DSN options and defaults.
+// Use `sql.Open("tinysql", dsn)` to create a connection. Each sql.Open call
+// creates one Connector which owns one lazily opened server/storage.DB. The
+// physical connections subsequently created by database/sql share that server,
+// while transactions and prepared statements remain connection-local. Separate
+// sql.Open calls never share a DSN-backed database instance implicitly.
+//
+// See applyDSNOption and applyQueryOptions for available DSN options and
+// defaults.
 package driver
 
 import (
@@ -25,6 +31,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -76,18 +83,23 @@ func SetDefaultDB(db *storage.DB) {
 	// Note: This allows embedding consumers to control the underlying DB
 	// instance (for example tests or WASM hosts) while still using the
 	// database/sql API.
+	defaultDrv.mu.Lock()
 	defaultDrv.srv = newServer(db, c)
+	defaultDrv.mu.Unlock()
 }
 
 // CurrentDefaultDB returns the storage database currently backing the default
 // driver server, if one exists.
 func CurrentDefaultDB() *storage.DB {
-	if defaultDrv.srv == nil {
+	defaultDrv.mu.RLock()
+	srv := defaultDrv.srv
+	defaultDrv.mu.RUnlock()
+	if srv == nil {
 		return nil
 	}
-	defaultDrv.srv.mu.RLock()
-	defer defaultDrv.srv.mu.RUnlock()
-	return defaultDrv.srv.db
+	srv.mu.RLock()
+	defer srv.mu.RUnlock()
+	return srv.db
 }
 
 // OpenInMemory returns a *sql.DB backed by an in-memory tinySQL server.
@@ -106,6 +118,9 @@ func OpenInMemory(tenant string) (*sql.DB, error) {
 
 // cfg stores the connection parameters derived from a parsed DSN.
 type cfg struct {
+	// defaultDSN is true only for the empty DSN used by the legacy embedding
+	// helpers. Named mem:// and file: DSNs must never inherit SetDefaultDB.
+	defaultDSN  bool
 	tenant      string
 	filePath    string
 	autosave    bool
@@ -119,6 +134,14 @@ type cfg struct {
 	// behaves the same but goes through storage.OpenDB).
 	mode    storage.StorageMode
 	modeSet bool
+
+	maxMemoryBytes     int64
+	readOnly           bool
+	syncOnMutate       bool
+	compressFiles      bool
+	checkpointEvery    uint64
+	checkpointInterval time.Duration
+	checkpointMaxBytes int64
 }
 
 // parseDSN parses a tinySQL DSN into a driver configuration.
@@ -126,6 +149,10 @@ func parseDSN(dsn string) (cfg, error) {
 	var c cfg
 	c.tenant = "default"
 	c.maxWriters = 1
+	if dsn == "" {
+		c.defaultDSN = true
+		return c, nil
+	}
 	switch {
 	case strings.HasPrefix(dsn, "mem://"):
 		if i := strings.Index(dsn, "?"); i >= 0 {
@@ -152,9 +179,6 @@ func parseDSN(dsn string) (cfg, error) {
 		}
 		return c, nil
 	default:
-		if dsn == "" {
-			return c, nil
-		}
 		return c, fmt.Errorf("unsupported DSN")
 	}
 }
@@ -163,17 +187,15 @@ func parseDSN(dsn string) (cfg, error) {
 // options to the provided cfg using applyDSNOption. This consolidates repeated
 // logic used for different DSN prefixes (mem:// and file:).
 func applyQueryOptions(q string, c *cfg) error {
-	for _, kv := range strings.Split(q, "&") {
-		if kv == "" {
-			continue
+	values, err := url.ParseQuery(q)
+	if err != nil {
+		return fmt.Errorf("tinysql: invalid DSN query: %w", err)
+	}
+	for key, values := range values {
+		if len(values) != 1 {
+			return fmt.Errorf("tinysql: DSN option %q must occur once", key)
 		}
-		parts := strings.SplitN(kv, "=", 2)
-		k := parts[0]
-		v := ""
-		if len(parts) == 2 {
-			v = parts[1]
-		}
-		if err := applyDSNOption(c, k, v); err != nil {
+		if err := applyDSNOption(c, key, values[0]); err != nil {
 			return err
 		}
 	}
@@ -307,6 +329,12 @@ func (s *server) release(pool chan struct{}) {
 // typically call this from cleanup paths where returning an error would be
 // inconvenient.
 func (s *server) saveIfNeeded() {
+	// A read-only open must be observational: physical connection closes and
+	// database/sql pool churn must never create manifests, checkpoints, WAL
+	// files, or rewritten snapshots.
+	if s.db == nil || s.db.IsReadOnly() {
+		return
+	}
 	if s.usesStorageBackend {
 		// Disk-backed modes (ModeDisk, ModeJSON, ModeHybrid, ModeIndex)
 		// persist via their attached backend's Sync, not a whole-database
@@ -326,38 +354,148 @@ func (s *server) saveIfNeeded() {
 	}
 }
 
-type drv struct{ srv *server }
+// drv is the globally registered database/sql Driver. srv is intentionally
+// reserved for the legacy empty-DSN embedding API (SetDefaultDB). It is not a
+// cache for arbitrary DSNs: sharing it for mem:// or file: caused independent
+// sql.Open calls to see the wrong database and, before Connector support,
+// opening a physical connection could construct another full storage.DB.
+type drv struct {
+	mu  sync.RWMutex
+	srv *server
+}
 
-func (d *drv) Open(name string) (driver.Conn, error) {
+var _ driver.DriverContext = (*drv)(nil)
+
+// connector belongs to exactly one sql.Open call. sync.Once makes server
+// creation lazy and guarantees that all physical connections allocated by that
+// *sql.DB share one server and one storage.DB.
+type connector struct {
+	driver *drv
+	cfg    cfg
+
+	once sync.Once
+	srv  *server
+	err  error
+}
+
+var _ driver.Connector = (*connector)(nil)
+
+// serverOpenHook is intentionally package-private test instrumentation. It
+// observes actual storage.DB construction without becoming a production API.
+var serverOpenHook struct {
+	sync.RWMutex
+	fn func(*storage.DB, cfg)
+}
+
+func notifyServerOpen(db *storage.DB, c cfg) {
+	serverOpenHook.RLock()
+	fn := serverOpenHook.fn
+	serverOpenHook.RUnlock()
+	if fn != nil {
+		fn(db, c)
+	}
+}
+
+// OpenConnector is the database/sql DriverContext entry point. database/sql
+// calls it once per sql.Open, rather than calling Open once per physical
+// connection, which is the ownership boundary required for bounded storage.
+func (d *drv) OpenConnector(name string) (driver.Connector, error) {
 	c, err := parseDSN(name)
 	if err != nil {
 		return nil, err
 	}
-	var s *server
-	if d.srv != nil {
-		s = d.srv
+	return &connector{driver: d, cfg: c}, nil
+}
+
+// Open remains for callers using driver.Driver directly. Normal database/sql
+// use takes OpenConnector above.
+func (d *drv) Open(name string) (driver.Conn, error) {
+	// Keep the historical direct-driver embedding behavior: a caller that
+	// constructs drv{srv: ...} owns that server explicitly. database/sql does
+	// not use this branch because drv implements DriverContext.
+	if c, err := parseDSN(name); err != nil {
+		return nil, err
 	} else {
-		var db *storage.DB
-		switch {
-		case c.modeSet && c.mode != storage.ModeMemory:
-			if c.filePath == "" {
-				return nil, fmt.Errorf("tinysql: mode=%s requires a file: DSN with a path", c.mode)
-			}
-			db, err = storage.OpenDB(storage.StorageConfig{Mode: c.mode, Path: c.filePath})
-			if err != nil {
-				return nil, err
-			}
-		case c.filePath != "":
-			db, err = storage.LoadFromFile(c.filePath)
-			if err != nil {
-				return nil, err
-			}
-		default:
-			db = storage.NewDB()
+		d.mu.RLock()
+		s := d.srv
+		d.mu.RUnlock()
+		if s != nil {
+			return &conn{srv: s, tenant: c.tenant}, nil
 		}
-		s = newServer(db, c)
 	}
-	return &conn{srv: s, tenant: c.tenant}, nil
+	c, err := d.OpenConnector(name)
+	if err != nil {
+		return nil, err
+	}
+	return c.Connect(context.Background())
+}
+
+func (c *connector) Driver() driver.Driver { return c.driver }
+
+func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+	}
+	c.once.Do(func() {
+		c.srv, c.err = c.openServer()
+	})
+	if c.err != nil {
+		return nil, c.err
+	}
+	return &conn{srv: c.srv, tenant: c.cfg.tenant}, nil
+}
+
+func (c *connector) openServer() (*server, error) {
+	// Preserve SetDefaultDB/OpenWithDB for the one historical empty-DSN path,
+	// but never let it leak into named in-memory or file DSNs.
+	if c.cfg.defaultDSN {
+		c.driver.mu.RLock()
+		s := c.driver.srv
+		c.driver.mu.RUnlock()
+		if s != nil {
+			return s, nil
+		}
+	}
+
+	var (
+		db  *storage.DB
+		err error
+	)
+	switch {
+	case c.cfg.modeSet:
+		if c.cfg.mode != storage.ModeMemory && c.cfg.filePath == "" {
+			return nil, fmt.Errorf("tinysql: mode=%s requires a file: DSN with a path", c.cfg.mode)
+		}
+		sc := storage.DefaultStorageConfig(c.cfg.mode)
+		sc.Path = c.cfg.filePath
+		sc.MaxMemoryBytes = c.cfg.maxMemoryBytes
+		sc.ReadOnly = c.cfg.readOnly
+		sc.SyncOnMutate = c.cfg.syncOnMutate
+		sc.CompressFiles = c.cfg.compressFiles
+		sc.CheckpointEvery = c.cfg.checkpointEvery
+		sc.CheckpointInterval = c.cfg.checkpointInterval
+		sc.CheckpointMaxBytes = c.cfg.checkpointMaxBytes
+		db, err = storage.OpenDB(sc)
+	case c.cfg.filePath != "":
+		if c.cfg.readOnly {
+			return nil, fmt.Errorf("tinysql: read_only requires an explicit persistent mode (disk, index, hybrid, wal, advanced_wal, or json)")
+		}
+		db, err = storage.LoadFromFile(c.cfg.filePath)
+	default:
+		db = storage.NewDB()
+		if c.cfg.readOnly {
+			db.SetReadOnly(true)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	notifyServerOpen(db, c.cfg)
+	return newServer(db, c.cfg), nil
 }
 
 // ------------------- connection / transactions -------------------
@@ -390,6 +528,18 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 	default:
 		return nil, fmt.Errorf("unsupported isolation level: %v", opts.Isolation)
 	}
+	// An immutable/read-only database never has a writer to conflict with.
+	// Avoid DeepClone here: cloning a disk-backed ModeIndex catalog would both
+	// defeat its memory bound and lose its backend reference. The shared,
+	// immutable DB itself is the transaction snapshot.
+	if c.srv.db.IsReadOnly() {
+		c.inTx = true
+		c.txBase = nil
+		c.shadow = nil
+		c.txReadOnly = true
+		return &tx{c: c}, nil
+	}
+
 	// Create snapshot copy under read lock; writer blocks commit briefly.
 	if err := c.srv.acquireReader(ctx); err != nil {
 		return nil, err
@@ -428,8 +578,19 @@ func (t *tx) Rollback() error {
 }
 
 func (c *conn) commitTx() error {
-	if !c.inTx || c.shadow == nil {
+	if !c.inTx {
 		return fmt.Errorf("tinysql: no active transaction")
+	}
+	// Read-only transactions use the immutable shared database as their
+	// snapshot and intentionally have no private shadow to merge.
+	if c.shadow == nil && c.txReadOnly {
+		c.inTx = false
+		c.txBase = nil
+		c.txReadOnly = false
+		return nil
+	}
+	if c.shadow == nil {
+		return fmt.Errorf("tinysql: no active transaction snapshot")
 	}
 	if err := c.srv.acquireWriter(context.Background()); err != nil {
 		return err
@@ -667,19 +828,17 @@ func writeTargetTable(st engine.Statement) string {
 }
 
 func (c *conn) execStatement(ctx context.Context, st engine.Statement) (driver.Result, error) {
-
-	// DDL/DML writes must run in tx snapshot or under lock
-	isWrite := func(s engine.Statement) bool {
-		switch s.(type) {
-		case *engine.CreateTable, *engine.DropTable, *engine.Insert, *engine.Update, *engine.Delete:
-			return true
-		default:
-			return false
-		}
+	// Only SELECT/EXPLAIN/PRAGMA are guaranteed read-only. Treat every other
+	// parsed statement as a write for connection scheduling so DDL, indexes,
+	// views, jobs and RBAC cannot bypass the writer gate.
+	isWrite := true
+	switch st.(type) {
+	case *engine.Select, *engine.Explain, *engine.Pragma:
+		isWrite = false
 	}
 
-	if isWrite(st) {
-		if c.inTx && c.txReadOnly {
+	if isWrite {
+		if c.srv.db.IsReadOnly() || (c.inTx && c.txReadOnly) {
 			return nil, fmt.Errorf("tinysql: write attempted in read-only transaction")
 		}
 		if c.inTx {
@@ -1199,21 +1358,25 @@ func sqlLiteral(v any) string {
 	}
 }
 
-// applyDSNOption mutates the configuration in place for a single DSN option.
+// applyDSNOption mutates the configuration in place for one URL-query option.
+// Unknown or malformed options are errors: silently accepting a memory or
+// durability setting is dangerous because callers believe a bound exists when
+// it does not.
 func applyDSNOption(c *cfg, key, value string) error {
-	key = strings.ToLower(key)
+	key = strings.ToLower(strings.TrimSpace(key))
 	switch key {
 	case "tenant":
-		if value != "" {
-			c.tenant = value
-		}
-	case "autosave":
+		value = strings.TrimSpace(value)
 		if value == "" {
-			c.autosave = false
-			return nil
+			return fmt.Errorf("tinysql: tenant must not be empty")
 		}
-		v := strings.ToLower(value)
-		c.autosave = v == "1" || v == "true" || v == "yes" || v == "on"
+		c.tenant = value
+	case "autosave":
+		v, err := parseDSNBool(value, key)
+		if err != nil {
+			return err
+		}
+		c.autosave = v
 	case "pool_readers", "read_pool", "reader_pool":
 		n, err := parsePoolSize(value, "pool_readers")
 		if err != nil {
@@ -1227,10 +1390,6 @@ func applyDSNOption(c *cfg, key, value string) error {
 		}
 		c.maxWriters = n
 	case "busy_timeout", "busytimeout":
-		if value == "" {
-			c.busyTimeout = 0
-			return nil
-		}
 		dur, err := parseBusyTimeout(value)
 		if err != nil {
 			return err
@@ -1243,15 +1402,130 @@ func applyDSNOption(c *cfg, key, value string) error {
 		}
 		c.mode = m
 		c.modeSet = true
+	case "max_memory_bytes":
+		sz, err := parseByteSize(value, key, false)
+		if err != nil {
+			return err
+		}
+		c.maxMemoryBytes = sz
+	case "read_only":
+		v, err := parseDSNBool(value, key)
+		if err != nil {
+			return err
+		}
+		c.readOnly = v
+	case "sync_on_mutate":
+		v, err := parseDSNBool(value, key)
+		if err != nil {
+			return err
+		}
+		c.syncOnMutate = v
+	case "compress_files":
+		v, err := parseDSNBool(value, key)
+		if err != nil {
+			return err
+		}
+		c.compressFiles = v
+	case "checkpoint_every":
+		v, err := parseNonNegativeUint(value, key)
+		if err != nil {
+			return err
+		}
+		c.checkpointEvery = v
+	case "checkpoint_interval":
+		d, err := parseNonNegativeDuration(value, key)
+		if err != nil {
+			return err
+		}
+		c.checkpointInterval = d
+	case "checkpoint_max_bytes":
+		sz, err := parseByteSize(value, key, true)
+		if err != nil {
+			return err
+		}
+		c.checkpointMaxBytes = sz
 	default:
-		return nil
+		return fmt.Errorf("tinysql: unsupported DSN option %q", key)
 	}
 	return nil
 }
 
+func parseDSNBool(value, key string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true, nil
+	case "0", "false", "no", "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("tinysql: invalid %s boolean %q (use 0/1 or true/false)", key, value)
+	}
+}
+
+func parseNonNegativeUint(value, key string) (uint64, error) {
+	if strings.TrimSpace(value) == "" {
+		return 0, fmt.Errorf("tinysql: %s must not be empty", key)
+	}
+	v, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("tinysql: invalid %s value %q", key, value)
+	}
+	return v, nil
+}
+
+func parseNonNegativeDuration(value, key string) (time.Duration, error) {
+	if strings.TrimSpace(value) == "" {
+		return 0, fmt.Errorf("tinysql: %s must not be empty", key)
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil || d < 0 {
+		return 0, fmt.Errorf("tinysql: invalid %s duration %q", key, value)
+	}
+	return d, nil
+}
+
+// parseByteSize accepts a non-negative integer byte count or a binary/decimal
+// suffix (KiB/MiB/GiB and KB/MB/GB). -1 is accepted only for options where it
+// has an explicit documented meaning (checkpoint_max_bytes disables its size
+// trigger). Values must fit an int64 so they can be handed directly to the
+// storage layer without silent overflow.
+func parseByteSize(value, key string, allowNegativeOne bool) (int64, error) {
+	v := strings.TrimSpace(value)
+	if allowNegativeOne && v == "-1" {
+		return -1, nil
+	}
+	if v == "" || strings.HasPrefix(v, "-") {
+		return 0, fmt.Errorf("tinysql: invalid %s size %q", key, value)
+	}
+	lower := strings.ToLower(v)
+	multipliers := []struct {
+		suffix string
+		factor uint64
+	}{
+		{"kib", 1 << 10}, {"mib", 1 << 20}, {"gib", 1 << 30}, {"tib", 1 << 40},
+		{"kb", 1000}, {"mb", 1000 * 1000}, {"gb", 1000 * 1000 * 1000}, {"tb", 1000 * 1000 * 1000 * 1000},
+		{"b", 1},
+	}
+	factor := uint64(1)
+	for _, unit := range multipliers {
+		if strings.HasSuffix(lower, unit.suffix) {
+			lower = strings.TrimSpace(strings.TrimSuffix(lower, unit.suffix))
+			factor = unit.factor
+			break
+		}
+	}
+	if lower == "" {
+		return 0, fmt.Errorf("tinysql: invalid %s size %q", key, value)
+	}
+	n, err := strconv.ParseUint(lower, 10, 64)
+	if err != nil || n > uint64(^uint64(0))/factor || n*factor > uint64(^uint64(0)>>1) {
+		return 0, fmt.Errorf("tinysql: invalid %s size %q", key, value)
+	}
+	return int64(n * factor), nil
+}
+
 func parsePoolSize(value, key string) (int, error) {
-	if value == "" {
-		return 0, nil
+	if strings.TrimSpace(value) == "" {
+		return 0, fmt.Errorf("tinysql: %s must not be empty", key)
 	}
 	n, err := strconv.Atoi(value)
 	if err != nil {
@@ -1264,6 +1538,9 @@ func parsePoolSize(value, key string) (int, error) {
 }
 
 func parseBusyTimeout(value string) (time.Duration, error) {
+	if strings.TrimSpace(value) == "" {
+		return 0, fmt.Errorf("tinysql: busy_timeout must not be empty")
+	}
 	isNumeric := true
 	for _, r := range value {
 		if r < '0' || r > '9' {
