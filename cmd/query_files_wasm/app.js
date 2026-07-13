@@ -847,7 +847,8 @@ function renderIntroPage() {
     if (!resultsContainer || decodeDemoHash()) {
         return;
     }
-    const cards = Object.entries(SHAREABLE_DEMOS).map(([id, demo]) => `
+    const starterDemoIDs = ['files', 'analytics', 'geo', 'rag', 'sqlfeatures', 'catalog', 'release', 'ragcontext'];
+    const cards = starterDemoIDs.map((id) => [id, SHAREABLE_DEMOS[id]]).map(([id, demo]) => `
         <div class="intro-card">
             <h3>${demo.icon} ${escapeHtml(demo.title)}</h3>
             <p>${escapeHtml(demo.description)}</p>
@@ -863,17 +864,17 @@ function renderIntroPage() {
         <div class="intro-page">
             <section class="intro-hero">
                 <div>
-                    <div class="intro-kicker">tinySQL WebAssembly demo</div>
-                    <h2>Query files, geodata, full-text indexes, and vectors directly in your browser.</h2>
+                    <div class="intro-kicker">tinySQL WebAssembly playground</div>
+                    <h2>Explore your data locally — files, analytics, maps, and AI-ready search.</h2>
                     <p class="intro-copy">
-                        tinySQL runs locally as a static WASM app. Upload data or open a shareable demo link:
-                        the SQL, sample tables, and selected workflow are encoded in the URL hash.
+                        Start with a file, a reporting workflow, or geodata. tinySQL runs as a static WASM app:
+                        no account, no backend, and your local snapshot stays in this browser.
                     </p>
                     <div class="intro-actions">
-                        <button onclick="loadShareableDemo('release')">See what changed</button>
-                        <button onclick="loadShareableDemo('geo')">Start with geodata</button>
-                        <button onclick="loadShareableDemo('rag')">Try FTS + vectors</button>
-                        <button class="secondary" onclick="showUploadDialog()">Upload a file</button>
+                        <button onclick="showUploadDialog()">Upload a file</button>
+                        <button onclick="loadShareableDemo('analytics')">Explore analytics</button>
+                        <button onclick="loadShareableDemo('geo')">Open geodata lab</button>
+                        <button class="secondary" onclick="loadShareableDemo('rag')">Try AI search</button>
                     </div>
                 </div>
                 <div class="intro-metrics">
@@ -884,7 +885,7 @@ function renderIntroPage() {
             </section>
             <section class="feature-strip">
                 <div class="feature-pill"><strong>Geodata-ready</strong>Distance, radius, bbox and routing-graph examples.</div>
-                <div class="feature-pill"><strong>RAG-ready</strong>Combine BM25-style FTS with vector similarity.</div>
+                <div class="feature-pill"><strong>AI-compatible</strong>Full-text, vector similarity, and optional RAG-style retrieval recipes.</div>
                 <div class="feature-pill"><strong>Release-aware</strong>Recent tinySQL features are grouped into runnable recipes.</div>
                 <div class="feature-pill"><strong>Shareable</strong>Demo data and SQL travel in the URL hash.</div>
                 <div class="feature-pill"><strong>Exportable</strong>Copy or export query results as CSV, TSV, Markdown, JSON, XML.</div>

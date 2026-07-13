@@ -9,6 +9,7 @@ A practical SQL playground that seeds sample data into an in-memory (or file-bac
 - **Script mode** – Executes any SQL script file (`.sql`) statement by statement.
 - **Interactive REPL** – Drops into a live SQL shell after setup.
 - **Timer** – Optionally prints per-statement execution time.
+- **Pipeline output** – Use `-output ndjson` for one JSON record per result row.
 - **Persistent storage** – Point at a file-based DSN to persist data across runs.
 
 ## Build
@@ -96,6 +97,12 @@ The database is saved to `/tmp/mydb.db`; run again without `-seed` to keep exist
 
 ```bash
 ./demo -timer -script heavy_queries.sql
+```
+
+### Stream results to another tool
+
+```bash
+./demo -output ndjson -script report.sql | jq -c .
 ```
 
 ## Sample data

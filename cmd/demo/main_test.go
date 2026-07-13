@@ -233,6 +233,31 @@ func TestPrintRowsJSON(t *testing.T) {
 	}
 }
 
+func TestPrintRowsNDJSON(t *testing.T) {
+	db := openMemDB(t)
+	if _, err := db.Exec("CREATE TABLE ndjson_test (x TEXT, y INT)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO ndjson_test VALUES ('foo', 99)"); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.Query("SELECT x, y FROM ndjson_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	cols, _ := rows.Columns()
+	var buf bytes.Buffer
+	printRowsNDJSON(&buf, rows, cols)
+	var result map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("invalid NDJSON: %v\nOutput: %s", err, buf.String())
+	}
+	if result["x"] != "foo" {
+		t.Fatalf("NDJSON x = %#v, want foo", result["x"])
+	}
+}
+
 func TestImportCSV(t *testing.T) {
 	db := openMemDB(t)
 	dir := t.TempDir()

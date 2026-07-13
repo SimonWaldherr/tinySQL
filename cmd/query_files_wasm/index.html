@@ -78,8 +78,19 @@
         }
 
         .topbar h1::before {
-            content: "🌐";
+            content: "▦";
             font-size: 20px;
+        }
+
+        .topbar-tag {
+            color: #9cdcfe;
+            border: 1px solid #3e3e42;
+            border-radius: 999px;
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            padding: 3px 7px;
+            text-transform: uppercase;
         }
 
         .topbar button {
@@ -1522,11 +1533,12 @@
     <a class="skip-link" href="#queryEditor">Skip to query editor</a>
     <!-- Top Bar -->
     <div class="topbar">
-        <h1>TinySQL Editor</h1>
-        <button onclick="showUploadDialog()" aria-label="Upload file">📁 Upload File</button>
-        <button onclick="importClipboardData()" aria-label="Import data from clipboard">📋 Import Clipboard</button>
-        <button id="loadAllDemosBtn" style="background: #7d2d7d;" aria-label="Load demo data and large tables">✨ Load Demo + Large Tables</button>
-        <button id="loadGeoDemosBtn" style="background: #236f52;" aria-label="Load geodata demo tables">🗺️ Load Geo Demo</button>
+        <h1>tinySQL <span class="topbar-tag">browser lab</span></h1>
+        <button onclick="showUploadDialog()" aria-label="Upload a data file">📁 Your data</button>
+        <button onclick="loadShareableDemo('analytics')" aria-label="Run analytics demo">📊 Analytics</button>
+        <button onclick="loadShareableDemo('geo')" style="background: #236f52;" aria-label="Run geodata demo">🗺️ Geodata</button>
+        <button onclick="loadShareableDemo('rag')" style="background: #7d2d7d;" aria-label="Run AI search demo">✦ AI search</button>
+        <button onclick="importClipboardData()" aria-label="Import data from clipboard">📋 Clipboard</button>
         <button onclick="toggleHistory()" style="background: #3e3e42;" aria-label="Toggle query history">📜 History</button>
         <div class="spacer"></div>
         <div class="status">

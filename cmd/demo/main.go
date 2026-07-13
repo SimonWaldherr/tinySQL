@@ -25,7 +25,7 @@
 //	  -interactive       Start interactive SQL shell after setup
 //	  -timer             Print execution time for every statement
 //	  -quiet             Suppress DDL/DML output; show only query results
-//	  -output FORMAT     Output format: table, csv, json (default: table)
+//	  -output FORMAT     Output format: table, csv, json, ndjson (default: table)
 package main
 
 import (
@@ -52,7 +52,7 @@ var (
 	flagInteractive = flag.Bool("interactive", false, "Start an interactive SQL shell after setup")
 	flagTimer       = flag.Bool("timer", false, "Print execution time for every statement")
 	flagQuiet       = flag.Bool("quiet", false, "Suppress DDL/DML confirmation output; show only SELECT results")
-	flagOutput      = flag.String("output", "table", "Output format: table, csv, json")
+	flagOutput      = flag.String("output", "table", "Output format: table, csv, json, ndjson")
 )
 
 func main() {
@@ -129,7 +129,7 @@ type executor struct {
 	db     *sql.DB
 	timer  bool
 	quiet  bool
-	output string // "table", "csv", "json"
+	output string // "table", "csv", "json", "ndjson"
 }
 
 func newExecutor(db *sql.DB, timer, quiet bool, output string) *executor {
@@ -157,6 +157,8 @@ func (e *executor) run(q string) error {
 			printRowsCSV(os.Stdout, rows, cols)
 		case "json":
 			printRowsJSON(os.Stdout, rows, cols)
+		case "ndjson":
+			printRowsNDJSON(os.Stdout, rows, cols)
 		default:
 			printRows(os.Stdout, rows, cols)
 		}
@@ -511,11 +513,11 @@ func handleDotOutput(exec *executor, parts []string) {
 		return
 	}
 	switch parts[1] {
-	case "table", "csv", "json":
+	case "table", "csv", "json", "ndjson":
 		exec.output = parts[1]
 		fmt.Printf("Output format set to: %s\n", exec.output)
 	default:
-		fmt.Println("Unknown format. Use: table, csv, json")
+		fmt.Println("Unknown format. Use: table, csv, json, ndjson")
 	}
 }
 
@@ -550,7 +552,7 @@ func handleDotCommand(db *sql.DB, exec *executor, cmd string) {
   .count [TABLE]        Show row counts
   .import FILE [TABLE]  Import CSV/JSON file into TABLE
   .dump [TABLE]         Dump table(s) as INSERT statements
-  .output FORMAT        Set output format (table, csv, json)
+  .output FORMAT        Set output format (table, csv, json, ndjson)
   .timer on|off         Toggle query timing
   .quit                 Exit`)
 
@@ -925,6 +927,27 @@ func printRowsJSON(out io.Writer, rows *sql.Rows, cols []string) {
 	enc := json.NewEncoder(out)
 	enc.SetIndent("", "  ")
 	enc.Encode(jsonData)
+}
+
+// printRowsNDJSON writes one JSON object per row. It avoids a result-sized
+// JSON array and is the suitable format for pipes and incremental consumers.
+func printRowsNDJSON(out io.Writer, rows *sql.Rows, cols []string) {
+	enc := json.NewEncoder(out)
+	for rows.Next() {
+		cells := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range cells {
+			ptrs[i] = &cells[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			continue
+		}
+		row := make(map[string]any, len(cols))
+		for i, col := range cols {
+			row[col] = dePtr(ptrs[i])
+		}
+		_ = enc.Encode(row)
+	}
 }
 
 // scanRows reads all rows into a slice of maps.
