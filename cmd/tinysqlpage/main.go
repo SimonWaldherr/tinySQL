@@ -35,6 +35,7 @@ func main() {
 	seedFile := flag.String("seed", defaultSeed, "SQL file executed at startup to seed demo data")
 	cssFile := flag.String("css", "", "Path to custom CSS file")
 	tplFile := flag.String("template", "", "Path to custom HTML template file (use {{TITLE}}, {{STYLES}}, {{BODY}})")
+	requestTimeout := flag.Duration("request-timeout", 5*time.Second, "Maximum SQL rendering time per HTTP request (0 disables the timeout)")
 	flag.Parse()
 
 	db := tsql.NewDB()
@@ -50,7 +51,7 @@ func main() {
 		pagesDir: *pagesDir,
 		css:      "",
 		tpl:      "",
-		ctx:      ctx,
+		timeout:  *requestTimeout,
 	}
 
 	if *cssFile != "" {
@@ -72,7 +73,14 @@ func main() {
 	mux.Handle("/", handler)
 
 	log.Printf("tinysqlpage listening on %s (pages=%s)", *addr, *pagesDir)
-	if err := http.ListenAndServe(*addr, mux); err != nil {
+	server := &http.Server{
+		Addr:              *addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -87,7 +95,7 @@ type pageHandler struct {
 	db       *tsql.DB
 	tenant   string
 	pagesDir string
-	ctx      context.Context
+	timeout  time.Duration
 	css      string
 	tpl      string
 }
@@ -124,7 +132,13 @@ func (h *pageHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	comps, err := h.renderComponents(string(data))
+	ctx := r.Context()
+	if h.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, h.timeout)
+		defer cancel()
+	}
+	comps, err := h.renderComponents(ctx, string(data))
 	if err != nil {
 		log.Printf("render %s: %v", sqlPath, err)
 		http.Error(w, "failed to render page", http.StatusInternalServerError)
@@ -142,7 +156,7 @@ func (h *pageHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(htmlBody))
 }
 
-func (h *pageHandler) renderComponents(script string) ([]component, error) {
+func (h *pageHandler) renderComponents(ctx context.Context, script string) ([]component, error) {
 	statements := splitSQLStatements(script)
 	var comps []component
 	for _, stmtSQL := range statements {
@@ -150,7 +164,7 @@ func (h *pageHandler) renderComponents(script string) ([]component, error) {
 		if err != nil {
 			return nil, fmt.Errorf("parse statement: %w", err)
 		}
-		rs, err := tsql.Execute(h.ctx, h.db, h.tenant, parsed)
+		rs, err := tsql.Execute(ctx, h.db, h.tenant, parsed)
 		if err != nil {
 			short := stmtSQL
 			if len(short) > 80 {

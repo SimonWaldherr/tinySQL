@@ -49,6 +49,9 @@ Options:
 
 ./sqltools validate "SELECT id FROM users"
 # exit code 0 + "OK"
+
+# Read one statement from standard input
+printf 'SELECT id FROM users' | ./sqltools validate -
 ```
 
 ### `explain` — Show a query execution plan
@@ -97,6 +100,8 @@ Inside the REPL:
 | `.schema <table>` | Show table schema |
 | `.help` | Show help |
 | `.quit` | Exit |
+
+Use `.export ndjson output.ndjson SELECT ...` for a streaming JSON Lines export.
 
 ## Examples
 

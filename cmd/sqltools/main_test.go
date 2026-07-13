@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"os/exec"
@@ -580,5 +581,26 @@ func TestReadSQLInput_Empty(t *testing.T) {
 	got := readSQLInput(nil)
 	if got != "" {
 		t.Errorf("expected empty, got: %s", got)
+	}
+}
+
+func TestReadSQLInput_Stdin(t *testing.T) {
+	got, err := readSQLInputFrom([]string{"-"}, strings.NewReader(" SELECT 42 \n"))
+	if err != nil {
+		t.Fatalf("readSQLInputFrom: %v", err)
+	}
+	if got != "SELECT 42" {
+		t.Fatalf("stdin SQL = %q, want SELECT 42", got)
+	}
+}
+
+func TestExporterNDJSON(t *testing.T) {
+	rs := &tsql.ResultSet{Cols: []string{"id"}, Rows: []tsql.Row{{"id": 1}, {"id": 2}}}
+	var buf bytes.Buffer
+	if err := NewExporter(FormatNDJSON).Export(rs, "ignored", &buf); err != nil {
+		t.Fatalf("Export NDJSON: %v", err)
+	}
+	if lines := strings.Count(strings.TrimSpace(buf.String()), "\n") + 1; lines != 2 {
+		t.Fatalf("expected two NDJSON records, got %q", buf.String())
 	}
 }

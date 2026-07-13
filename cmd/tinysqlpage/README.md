@@ -33,6 +33,7 @@ go build -o tinysqlpage ./cmd/tinysqlpage
 | `-seed` | SQL file executed at startup to populate demo data | `cmd/tinysqlpage/sample_data.sql` |
 | `-css` | Path to a custom CSS file (replaces the built-in dark theme) | — |
 | `-template` | Path to a custom HTML template file | — |
+| `-request-timeout` | Maximum time for one page's SQL rendering; `0` disables it | `5s` |
 
 ## How it works
 
@@ -90,6 +91,9 @@ LIMIT 10;
 | `/` | Renders `index.sql` |
 | `/<page>` | Renders `<page>.sql` |
 | `/healthz` | Liveness probe (returns `200 OK`) |
+
+Each request uses the caller's context and the configured timeout. A cancelled
+client connection or a slow query therefore does not keep rendering work alive.
 
 ## Custom template
 

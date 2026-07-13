@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"sort"
@@ -639,9 +640,10 @@ func PrintPlan(plan *QueryPlan, w *tabwriter.Writer) {
 type ExportFormat string
 
 const (
-	FormatCSV  ExportFormat = "csv"
-	FormatJSON ExportFormat = "json"
-	FormatSQL  ExportFormat = "sql"
+	FormatCSV    ExportFormat = "csv"
+	FormatJSON   ExportFormat = "json"
+	FormatNDJSON ExportFormat = "ndjson"
+	FormatSQL    ExportFormat = "sql"
 )
 
 // Exporter exports query results to various formats.
@@ -655,12 +657,14 @@ func NewExporter(format ExportFormat) *Exporter {
 }
 
 // Export writes result set to writer.
-func (e *Exporter) Export(rs *tsql.ResultSet, tableName string, w *os.File) error {
+func (e *Exporter) Export(rs *tsql.ResultSet, tableName string, w io.Writer) error {
 	switch e.format {
 	case FormatCSV:
 		return e.exportCSV(rs, w)
 	case FormatJSON:
 		return e.exportJSON(rs, w)
+	case FormatNDJSON:
+		return exporter.ExportNDJSON(w, rs, exporter.Options{})
 	case FormatSQL:
 		return exporter.ExportSQL(w, rs, tableName)
 	default:
@@ -668,11 +672,11 @@ func (e *Exporter) Export(rs *tsql.ResultSet, tableName string, w *os.File) erro
 	}
 }
 
-func (e *Exporter) exportCSV(rs *tsql.ResultSet, w *os.File) error {
+func (e *Exporter) exportCSV(rs *tsql.ResultSet, w io.Writer) error {
 	return exporter.ExportCSV(w, rs, exporter.Options{})
 }
 
-func (e *Exporter) exportJSON(rs *tsql.ResultSet, w *os.File) error {
+func (e *Exporter) exportJSON(rs *tsql.ResultSet, w io.Writer) error {
 	return exporter.ExportJSON(w, rs, exporter.Options{PrettyJSON: true})
 }
 
@@ -1166,21 +1170,36 @@ func PrintDiffResult(result DiffResult) {
 	}
 }
 
-// readSQLInput reads SQL from args or from a file (if arg starts with @).
+// readSQLInput reads SQL from args, @filename, or stdin when the sole input is "-".
 func readSQLInput(args []string) string {
-	if len(args) == 0 {
+	sql, err := readSQLInputFrom(args, os.Stdin)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading SQL: %v\n", err)
 		return ""
 	}
+	return sql
+}
+
+func readSQLInputFrom(args []string, stdin io.Reader) (string, error) {
+	if len(args) == 0 {
+		return "", nil
+	}
 	first := args[0]
+	if first == "-" && len(args) == 1 {
+		data, err := io.ReadAll(stdin)
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(data)), nil
+	}
 	if strings.HasPrefix(first, "@") {
 		data, err := os.ReadFile(first[1:])
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
-			os.Exit(1)
+			return "", err
 		}
-		return strings.TrimSpace(string(data))
+		return strings.TrimSpace(string(data)), nil
 	}
-	return strings.Join(args, " ")
+	return strings.Join(args, " "), nil
 }
 
 // ============================================================================
@@ -1337,6 +1356,8 @@ Commands:
 File input: Use @filename to read SQL from a file, e.g.:
   sqltools beautify @query.sql
   sqltools lint @migrations.sql
+Standard input: Use - to read SQL from a pipe, e.g.:
+  printf 'SELECT 1' | sqltools validate -
 
 Examples:
   sqltools beautify "select * from users where id=1"
@@ -1532,7 +1553,7 @@ Commands:
   .beautify <sql>       Format SQL
   .validate <sql>       Check SQL syntax
   .explain <sql>        Show query plan
-  .export <format> <file> <sql>   Export results (csv, json, sql)
+  .export <format> <file> <sql>   Export results (csv, json, ndjson, sql)
   .template <name>      Show template
   .templates            List all templates`)
 
@@ -1578,7 +1599,38 @@ Commands:
 	case ".template":
 		toolsHandleTemplate(parts)
 
+	case ".export":
+		toolsHandleExport(parts, db, tenant)
+
 	default:
 		fmt.Printf("Unknown command: %s (type .help for commands)\n", parts[0])
 	}
+}
+
+func toolsHandleExport(parts []string, db *tsql.DB, tenant string) {
+	if len(parts) < 4 {
+		fmt.Println("Usage: .export <csv|json|ndjson|sql> <file> <sql>")
+		return
+	}
+	stmt, err := tsql.ParseSQL(strings.Join(parts[3:], " "))
+	if err != nil {
+		fmt.Println("Parse error:", err)
+		return
+	}
+	rs, err := tsql.Execute(context.Background(), db, tenant, stmt)
+	if err != nil {
+		fmt.Println("Query error:", err)
+		return
+	}
+	f, err := os.Create(parts[2])
+	if err != nil {
+		fmt.Println("Create export:", err)
+		return
+	}
+	defer f.Close()
+	if err := NewExporter(ExportFormat(strings.ToLower(parts[1]))).Export(rs, "result", f); err != nil {
+		fmt.Println("Export error:", err)
+		return
+	}
+	fmt.Printf("Exported %d row(s) to %s\n", len(rs.Rows), parts[2])
 }
