@@ -452,6 +452,118 @@ func TestReadOnlyIndexDSNPreventsWritesAndArtifacts(t *testing.T) {
 	}
 }
 
+// TestPagedIndexReadOnlyConnectionsUseOnlyLocatedPages is the database/sql
+// regression test for the page-oriented MBTiles path. Eight checked-out
+// connections share one storage.DB, while each z/x/y -> BLOB read uses its
+// persistent B+Tree index and never invokes the compatibility LoadTable path.
+func TestPagedIndexReadOnlyConnectionsUseOnlyLocatedPages(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "paged-mbtiles")
+	buildMBTilesLikeIndexArtifact(t, dir, 256, 4096, storage.ModePagedIndex)
+
+	var (
+		mu     sync.Mutex
+		opened []*storage.DB
+	)
+	serverOpenHook.Lock()
+	if serverOpenHook.fn != nil {
+		serverOpenHook.Unlock()
+		t.Fatal("test hook already installed")
+	}
+	serverOpenHook.fn = func(db *storage.DB, _ cfg) {
+		mu.Lock()
+		opened = append(opened, db)
+		mu.Unlock()
+	}
+	serverOpenHook.Unlock()
+	t.Cleanup(func() {
+		serverOpenHook.Lock()
+		serverOpenHook.fn = nil
+		serverOpenHook.Unlock()
+	})
+
+	db, err := sql.Open("tinysql", "file:"+dir+"?mode=paged_index&read_only=1&max_memory_bytes=16KiB&pool_readers=8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(8)
+
+	ctx := context.Background()
+	ready := make(chan error, 8)
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	for worker := range 8 {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			conn, err := db.Conn(ctx)
+			if err == nil {
+				defer conn.Close()
+				for n := worker; n < 256 && err == nil; n += 8 {
+					var id string
+					err = conn.QueryRowContext(ctx, `SELECT tile_id FROM map WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?`, 12, n, 0).Scan(&id)
+					if err != nil {
+						break
+					}
+					var payload []byte
+					err = conn.QueryRowContext(ctx, `SELECT tile_data FROM images WHERE tile_id = ?`, id).Scan(&payload)
+					if err == nil && len(payload) != 4096 {
+						err = fmt.Errorf("payload length %d, want 4096", len(payload))
+					}
+				}
+			}
+			ready <- err
+			<-release // keep all physical driver connections checked out
+		}(worker)
+	}
+	for range 8 {
+		if err := <-ready; err != nil {
+			close(release)
+			wg.Wait()
+			t.Fatal(err)
+		}
+	}
+	close(release)
+	wg.Wait()
+
+	mu.Lock()
+	if len(opened) != 1 {
+		mu.Unlock()
+		t.Fatalf("opened %d storage DBs, want exactly one", len(opened))
+	}
+	shared := opened[0]
+	mu.Unlock()
+	stats := shared.BackendStats()
+	if stats.LoadCount != 0 {
+		t.Fatalf("point lookups called LoadTable %d times", stats.LoadCount)
+	}
+	if stats.PageReads == 0 || stats.CacheMisses == 0 {
+		t.Fatalf("paged reads not observed: %#v", stats)
+	}
+	if stats.CachedPages > stats.MaxCachePages {
+		t.Fatalf("read-only cache exceeded limit: %#v", stats)
+	}
+	if stats.TransientFrames != 0 {
+		t.Fatalf("query-local pages leaked after concurrent reads: %#v", stats)
+	}
+	if stats.MemoryLimitBytes != 16<<10 {
+		t.Fatalf("memory limit = %d, want 16384", stats.MemoryLimitBytes)
+	}
+
+	var blob []byte
+	if err := db.QueryRowContext(ctx, `SELECT tile_data FROM images WHERE tile_id = ?`, "12/5/0").Scan(&blob); err != nil {
+		t.Fatal(err)
+	}
+	blob[0] ^= 0xff
+	var fresh []byte
+	if err := db.QueryRowContext(ctx, `SELECT tile_data FROM images WHERE tile_id = ?`, "12/5/0").Scan(&fresh); err != nil {
+		t.Fatal(err)
+	}
+	if fresh[0] == blob[0] {
+		t.Fatal("database/sql BLOB scan aliases page-cache or driver memory")
+	}
+}
+
 func TestBindPlaceholders(t *testing.T) {
 	args := []driver.NamedValue{
 		{Ordinal: 1, Value: int64(42)},

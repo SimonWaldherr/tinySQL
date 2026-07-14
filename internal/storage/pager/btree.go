@@ -61,44 +61,67 @@ func (bt *BTree) Root() PageID { return bt.root }
 // Get looks up a key. Returns (value, true) or (nil, false).
 // Handles overflow pages transparently.
 func (bt *BTree) Get(key []byte) ([]byte, bool, error) {
-	leafID, err := bt.findLeaf(key)
+	var result []byte
+	found, err := bt.GetValue(key, func(value []byte) error {
+		result = append(result, value...)
+		return nil
+	})
+	return result, found, err
+}
+
+// GetValue resolves key and invokes visit while the containing page remains
+// pinned. Inline values are views into that page and must not be retained by
+// visit. Overflow values are assembled into a temporary slice. This allows
+// index locators and row codecs to decode directly from page memory without
+// allocating a throw-away copy for every B+Tree comparison.
+func (bt *BTree) GetValue(key []byte, visit func(value []byte) error) (bool, error) {
+	leafID, buf, err := bt.findLeafPinned(key)
 	if err != nil {
-		return nil, false, err
-	}
-	buf, err := bt.pager.ReadPage(leafID)
-	if err != nil {
-		return nil, false, err
+		return false, err
 	}
 	defer bt.pager.UnpinPage(leafID)
 
 	bp := WrapBTreePage(buf)
 	pos, found := bp.FindLeafEntry(key)
 	if !found {
-		return nil, false, nil
+		return false, nil
 	}
-	entry := bp.GetLeafEntry(pos)
-	if entry.Overflow {
-		val, err := bt.readOverflow(entry.OverflowPageID, entry.TotalSize)
+	value, overflow, overflowPageID, totalSize := bp.leafValueAt(pos)
+	if overflow {
+		value, err = bt.readOverflow(overflowPageID, totalSize)
 		if err != nil {
-			return nil, false, err
+			return false, err
 		}
-		return val, true, nil
 	}
-	return entry.Value, true, nil
+	if err := visit(value); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // findLeaf traverses from root to the leaf page containing key.
 func (bt *BTree) findLeaf(key []byte) (PageID, error) {
+	pageID, _, err := bt.findLeafPinned(key)
+	if err != nil {
+		return InvalidPageID, err
+	}
+	bt.pager.UnpinPage(pageID)
+	return pageID, nil
+}
+
+// findLeafPinned traverses to the leaf containing key and leaves that leaf
+// pinned for the caller. Point lookups use it to avoid re-reading the leaf
+// merely to inspect the record after the traversal has already reached it.
+func (bt *BTree) findLeafPinned(key []byte) (PageID, []byte, error) {
 	pageID := bt.root
 	for {
 		buf, err := bt.pager.ReadPage(pageID)
 		if err != nil {
-			return 0, err
+			return InvalidPageID, nil, err
 		}
 		bp := WrapBTreePage(buf)
 		if bp.IsLeaf() {
-			bt.pager.UnpinPage(pageID)
-			return pageID, nil
+			return pageID, buf, nil
 		}
 		child := bp.SearchInternal(key)
 		bt.pager.UnpinPage(pageID)

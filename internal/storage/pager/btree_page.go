@@ -405,8 +405,7 @@ func (bp *BTreePage) searchLeaf(key []byte) int {
 	lo, hi := 0, sc
 	for lo < hi {
 		mid := (lo + hi) / 2
-		e := bp.GetLeafEntry(mid)
-		if bytes.Compare(e.Key, key) < 0 {
+		if bytes.Compare(bp.leafKeyAt(mid), key) < 0 {
 			lo = mid + 1
 		} else {
 			hi = mid
@@ -419,12 +418,34 @@ func (bp *BTreePage) searchLeaf(key []byte) int {
 func (bp *BTreePage) FindLeafEntry(key []byte) (int, bool) {
 	pos := bp.searchLeaf(key)
 	if pos < bp.slotCount() {
-		e := bp.GetLeafEntry(pos)
-		if bytes.Equal(e.Key, key) {
+		if bytes.Equal(bp.leafKeyAt(pos), key) {
 			return pos, true
 		}
 	}
 	return -1, false
+}
+
+// leafKeyAt returns a view into the pinned page. It is used only by lookup
+// code that does not let the slice escape the pager lifetime; the allocating
+// GetLeafEntry remains available to mutation and inspection callers.
+func (bp *BTreePage) leafKeyAt(i int) []byte {
+	rec := bp.getRecord(i)
+	kl := int(binary.LittleEndian.Uint16(rec[:2]))
+	return rec[2 : 2+kl]
+}
+
+// leafValueAt returns a view into an inline leaf value, or overflow metadata.
+// The returned view becomes invalid when the caller unpins the page.
+func (bp *BTreePage) leafValueAt(i int) (value []byte, overflow bool, overflowPageID PageID, totalSize uint32) {
+	rec := bp.getRecord(i)
+	kl := int(binary.LittleEndian.Uint16(rec[:2]))
+	off := 2 + kl
+	flags := binary.LittleEndian.Uint16(rec[off : off+2])
+	if flags&leafFlagOverflow != 0 {
+		return nil, true, PageID(binary.LittleEndian.Uint32(rec[off+2 : off+6])), binary.LittleEndian.Uint32(rec[off+6 : off+10])
+	}
+	vl := int(binary.LittleEndian.Uint16(rec[off+2 : off+4]))
+	return rec[off+4 : off+4+vl], false, InvalidPageID, 0
 }
 
 // GetAllLeafEntries returns all leaf entries in order.
@@ -449,9 +470,11 @@ func (bp *BTreePage) GetAllLeafEntries() []LeafEntry {
 func (bp *BTreePage) SearchInternal(key []byte) PageID {
 	sc := bp.slotCount()
 	for i := 0; i < sc; i++ {
-		e := bp.GetInternalEntry(i)
-		if bytes.Compare(key, e.Key) < 0 {
-			return e.ChildID
+		rec := bp.getRecord(i)
+		childID := PageID(binary.LittleEndian.Uint32(rec[:4]))
+		kl := int(binary.LittleEndian.Uint16(rec[4:6]))
+		if bytes.Compare(key, rec[6:6+kl]) < 0 {
+			return childID
 		}
 	}
 	return bp.RightChild()

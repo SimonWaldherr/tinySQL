@@ -20,14 +20,33 @@ import (
 //
 //	go test ./internal/driver -run '^$' -bench ReadOnlyMBTilesLike -benchmem -count 3
 func BenchmarkReadOnlyMBTilesLikeTwoPointReads(b *testing.B) {
+	benchmarkReadOnlyMBTilesLikeTwoPointReads(b, storage.ModeIndex, false)
+}
+
+// BenchmarkReadOnlyPagedIndexMBTilesLikeTwoPointReads measures the immutable
+// page-store counterpart. Unlike ModeIndex, its warm and cold point reads do
+// not need to deserialize the complete map or images table.
+func BenchmarkReadOnlyPagedIndexMBTilesLikeTwoPointReads(b *testing.B) {
+	benchmarkReadOnlyMBTilesLikeTwoPointReads(b, storage.ModePagedIndex, false)
+}
+
+// BenchmarkReadOnlyPagedIndexMBTilesLikeTwoPointReadsWarm separates serving
+// latency from the first traversal that fills the bounded page cache. It is
+// comparable to the legacy ModeIndex benchmark, which materializes its table
+// during the one-time warm-up before the timer starts.
+func BenchmarkReadOnlyPagedIndexMBTilesLikeTwoPointReadsWarm(b *testing.B) {
+	benchmarkReadOnlyMBTilesLikeTwoPointReads(b, storage.ModePagedIndex, true)
+}
+
+func benchmarkReadOnlyMBTilesLikeTwoPointReads(b *testing.B, mode storage.StorageMode, prewarmAll bool) {
 	const (
 		rows      = 10_000
 		blobBytes = 1024
 	)
 	dir := filepath.Join(b.TempDir(), "mbtiles-like")
-	buildMBTilesLikeIndexArtifact(b, dir, rows, blobBytes)
+	buildMBTilesLikeIndexArtifact(b, dir, rows, blobBytes, mode)
 
-	dsn := "file:" + dir + "?mode=index&read_only=1&max_memory_bytes=32MiB&pool_readers=8"
+	dsn := "file:" + dir + "?mode=" + mode.String() + "&read_only=1&max_memory_bytes=32MiB&pool_readers=8"
 	db, err := sql.Open("tinysql", dsn)
 	if err != nil {
 		b.Fatal(err)
@@ -60,6 +79,18 @@ func BenchmarkReadOnlyMBTilesLikeTwoPointReads(b *testing.B) {
 	if err := imageStmt.QueryRowContext(ctx, warmID).Scan(&warmBlob); err != nil {
 		b.Fatal(err)
 	}
+	if prewarmAll {
+		for n := 0; n < rows; n++ {
+			var tileID string
+			if err := mapStmt.QueryRowContext(ctx, 12, n, 0).Scan(&tileID); err != nil {
+				b.Fatal(err)
+			}
+			var tile []byte
+			if err := imageStmt.QueryRowContext(ctx, tileID).Scan(&tile); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
 
 	b.SetBytes(blobBytes)
 	b.ReportAllocs()
@@ -80,15 +111,15 @@ func BenchmarkReadOnlyMBTilesLikeTwoPointReads(b *testing.B) {
 	}
 }
 
-func buildMBTilesLikeIndexArtifact(b *testing.B, dir string, rows, blobBytes int) {
-	b.Helper()
+func buildMBTilesLikeIndexArtifact(tb testing.TB, dir string, rows, blobBytes int, mode storage.StorageMode) {
+	tb.Helper()
 	db, err := storage.OpenDB(storage.StorageConfig{
-		Mode:           storage.ModeIndex,
+		Mode:           mode,
 		Path:           dir,
 		MaxMemoryBytes: 64 << 20,
 	})
 	if err != nil {
-		b.Fatal(err)
+		tb.Fatal(err)
 	}
 	mapTable := storage.NewTable("map", []storage.Column{
 		{Name: "zoom_level", Type: storage.IntType},
@@ -109,18 +140,18 @@ func buildMBTilesLikeIndexArtifact(b *testing.B, dir string, rows, blobBytes int
 		images.Rows = append(images.Rows, []any{id, payload})
 	}
 	if err := mapTable.CreateSecondaryIndex("idx_map_zxy", []string{"zoom_level", "tile_column", "tile_row"}, true); err != nil {
-		b.Fatal(err)
+		tb.Fatal(err)
 	}
 	if err := images.CreateSecondaryIndex("idx_images_tile_id", []string{"tile_id"}, true); err != nil {
-		b.Fatal(err)
+		tb.Fatal(err)
 	}
 	if err := db.Put("default", mapTable); err != nil {
-		b.Fatal(err)
+		tb.Fatal(err)
 	}
 	if err := db.Put("default", images); err != nil {
-		b.Fatal(err)
+		tb.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
-		b.Fatal(err)
+		tb.Fatal(err)
 	}
 }

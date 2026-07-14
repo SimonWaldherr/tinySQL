@@ -2442,7 +2442,11 @@ type simpleSelectPlan struct {
 	rowMapCap  int
 	// rowIDs is nil for a table scan. A non-nil slice is a materialized
 	// secondary-index point/prefix seek and contains table row positions.
-	rowIDs          []int
+	rowIDs []int
+	// rows is a query-private source supplied by page-oriented index seeks.
+	// It is never retained in a cached plan, so decoded BLOBs remain bounded
+	// to the request that loaded them.
+	rows            [][]any
 	scanType        string
 	indexName       string
 	indexPredicates []string
@@ -3316,7 +3320,8 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 		}
 	}
 
-	rowCount := len(plan.table.Rows)
+	rows := simplePlanRows(plan)
+	rowCount := len(rows)
 	if plan.rowIDs != nil {
 		rowCount = len(plan.rowIDs)
 	}
@@ -3325,10 +3330,10 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 		if plan.rowIDs != nil {
 			rowID = plan.rowIDs[i]
 		}
-		if rowID < 0 || rowID >= len(plan.table.Rows) {
+		if rowID < 0 || rowID >= len(rows) {
 			return nil, true, fmt.Errorf("index %q returned invalid row id %d", plan.indexName, rowID)
 		}
-		raw := plan.table.Rows[rowID]
+		raw := rows[rowID]
 		// Check context cancellation every 64 rows to reduce channel-select overhead.
 		if i&63 == 0 {
 			if err := checkCtx(env.ctx); err != nil {
@@ -3373,8 +3378,8 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 		if plan.offset != nil {
 			keepCount += *plan.offset
 		}
-		if keepCount > len(plan.table.Rows) {
-			keepCount = len(plan.table.Rows)
+		if keepCount > len(simplePlanRows(plan)) {
+			keepCount = len(simplePlanRows(plan))
 		}
 	}
 
@@ -3387,7 +3392,7 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 			items: make([]orderedRawRow, 0, simpleSelectInitialCap(plan)),
 		}
 	}
-	for i, raw := range plan.table.Rows {
+	for i, raw := range simplePlanRows(plan) {
 		// Check context cancellation every 64 rows to reduce channel-select overhead.
 		if i&63 == 0 {
 			if err := checkCtx(env.ctx); err != nil {
@@ -3535,6 +3540,42 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 		return nil, false, nil
 	}
 
+	// ModePagedIndex exposes table schema and index roots without loading row
+	// pages. For a complete composite equality predicate, resolve the B+Tree
+	// key first and materialize only the located rows. All other query shapes
+	// deliberately fall through to the established full-table compatibility
+	// path rather than pretending a scan is a page seek.
+	if metadata, paged, metaErr := env.db.PagedIndexMetadata(env.tenant, s.From.Table); metaErr != nil {
+		return nil, true, metaErr
+	} else if paged {
+		colIndex := simpleColumnIndex(metadata, aliasOr(s.From))
+		if idx, values, predicates, residual := selectSecondaryIndex(metadata, colIndex, s.Where); idx != nil && len(values) == len(idx.Columns) {
+			rows, exists, seekErr := env.db.PagedIndexRows(env.tenant, s.From.Table, idx.Name, values)
+			if seekErr != nil {
+				return nil, true, seekErr
+			}
+			if exists {
+				// Compile/cache from immutable schema metadata. Candidate rows live
+				// only on this plan copy, so a template never retains a decoded BLOB.
+				template, ok, err := loadSimpleSelectPlanTemplate(metadata, s, true)
+				if !ok || err != nil {
+					return nil, ok, err
+				}
+				plan := *template
+				plan.table = metadata
+				resetSimplePlanAccess(&plan, len(rows))
+				plan.rows = rows
+				plan.scanType = "PAGED INDEX POINT SEEK"
+				plan.indexName = idx.Name
+				plan.indexPredicates = predicates
+				plan.residualFilter = residual
+				plan.coveringIndex = projectionsCoveredByIndex(plan.projs, idx, metadata)
+				plan.estimatedRows = len(rows)
+				return &plan, true, nil
+			}
+		}
+	}
+
 	table, err := env.db.Get(env.tenant, s.From.Table)
 	if err != nil {
 		schema, name := splitObjectName(s.From.Table)
@@ -3549,21 +3590,12 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 			return nil, true, err
 		}
 	}
-	template, ok, err := loadSimpleSelectPlanTemplate(table, s)
+	template, ok, err := loadSimpleSelectPlanTemplate(table, s, false)
 	if !ok || err != nil {
 		return nil, ok, err
 	}
 	plan := *template
-	// Access paths are value- and data-dependent. Never retain them in the
-	// cached shape: a subsequent prepared execution may bind another key and
-	// DML may have rebuilt the index entry arrays in the meantime.
-	plan.rowIDs = nil
-	plan.scanType = "TABLE SCAN"
-	plan.indexName = ""
-	plan.indexPredicates = nil
-	plan.residualFilter = false
-	plan.coveringIndex = false
-	plan.estimatedRows = len(table.Rows)
+	resetSimplePlanAccess(&plan, len(table.Rows))
 	if idx, values, predicates, residual := selectSecondaryIndex(table, plan.colIndex, s.Where); idx != nil {
 		var rowIDs []int
 		var seekErr error
@@ -3586,13 +3618,27 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 	return &plan, true, nil
 }
 
-func loadSimpleSelectPlanTemplate(table *storage.Table, s *Select) (*simpleSelectPlan, bool, error) {
+// resetSimplePlanAccess clears value-dependent state retained by a cached
+// query shape. Prepared parameters and table mutations can change the access
+// path on every execution.
+func resetSimplePlanAccess(plan *simpleSelectPlan, rows int) {
+	plan.rowIDs = nil
+	plan.rows = nil
+	plan.scanType = "TABLE SCAN"
+	plan.indexName = ""
+	plan.indexPredicates = nil
+	plan.residualFilter = false
+	plan.coveringIndex = false
+	plan.estimatedRows = rows
+}
+
+func loadSimpleSelectPlanTemplate(table *storage.Table, s *Select, reusableSchema bool) (*simpleSelectPlan, bool, error) {
 	cache := s.simplePlanCache
 	cacheable := cache != nil && simplePlanCacheSafe(s.Where)
 	if cacheable {
 		cache.mu.Lock()
 		defer cache.mu.Unlock()
-		if cache.plan != nil && cache.table == table && cache.colCount == len(table.Cols) {
+		if cache.plan != nil && cache.colCount == len(table.Cols) && (cache.table == table || (reusableSchema && sameSimplePlanSchema(cache.table, table))) {
 			return cache.plan, true, nil
 		}
 	}
@@ -3646,6 +3692,23 @@ func loadSimpleSelectPlanTemplate(table *storage.Table, s *Select) (*simpleSelec
 		cache.plan = plan
 	}
 	return plan, true, nil
+}
+
+// sameSimplePlanSchema is intentionally narrower than a general table
+// equality check. It permits page-store queries to reuse a compiled plan
+// across independent schema-only Table instances while rejecting anything
+// that could change column resolution or raw-value interpretation.
+func sameSimplePlanSchema(a, b *storage.Table) bool {
+	if a == nil || b == nil || len(a.Cols) != len(b.Cols) {
+		return false
+	}
+	for i := range a.Cols {
+		left, right := a.Cols[i], b.Cols[i]
+		if !strings.EqualFold(left.Name, right.Name) || left.Type != right.Type || left.DeclaredType != right.DeclaredType || left.Affinity != right.Affinity || left.Constraint != right.Constraint || left.NotNull != right.NotNull {
+			return false
+		}
+	}
+	return true
 }
 
 // simplePlanCacheSafe rejects bound forms whose compiled filter captures the
@@ -3956,22 +4019,30 @@ func simpleColumnIndex(t *storage.Table, alias string) map[string]int {
 }
 
 func simpleSelectInitialCap(plan *simpleSelectPlan) int {
+	rows := simplePlanRows(plan)
 	if plan.limit != nil {
 		capHint := *plan.limit
 		if plan.offset != nil {
 			capHint += *plan.offset
 		}
-		if capHint > 0 && capHint < len(plan.table.Rows) {
+		if capHint > 0 && capHint < len(rows) {
 			return capHint
 		}
 	}
-	if plan.where == nil && len(plan.table.Rows) > 0 {
-		return len(plan.table.Rows)
+	if plan.where == nil && len(rows) > 0 {
+		return len(rows)
 	}
-	if len(plan.table.Rows) < 64 {
-		return len(plan.table.Rows)
+	if len(rows) < 64 {
+		return len(rows)
 	}
 	return 64
+}
+
+func simplePlanRows(plan *simpleSelectPlan) [][]any {
+	if plan.rows != nil {
+		return plan.rows
+	}
+	return plan.table.Rows
 }
 
 func isSimpleRawExpr(e Expr) bool {

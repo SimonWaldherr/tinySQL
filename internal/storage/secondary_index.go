@@ -219,6 +219,13 @@ func canonicalIndexKeyInto(key []byte, values []any) []byte {
 	return key
 }
 
+// CanonicalIndexKey returns the durable, type-tagged composite encoding used
+// by materialized secondary indexes. Paged storage uses exactly the same
+// encoding so a SQL-bound key and an on-disk B+Tree key compare identically.
+func CanonicalIndexKey(values []any) []byte {
+	return canonicalIndexKeyInto(nil, values)
+}
+
 // appendCanonicalIndexValue produces a type-tagged, length-framed encoding.
 // It distinguishes NULL, empty BLOB, non-empty BLOB and text, while keeping a
 // complete leading component usable as a byte prefix for composite seeks.

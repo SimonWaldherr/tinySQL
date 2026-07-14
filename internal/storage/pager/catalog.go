@@ -4,8 +4,8 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"github.com/SimonWaldherr/tinySQL/internal/storage"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -25,8 +25,26 @@ type CatalogEntry struct {
 	Table      string          `json:"table"`
 	RootPageID PageID          `json:"root_page_id"`
 	Columns    []CatalogColumn `json:"columns"`
+	Indexes    []IndexInfo     `json:"indexes,omitempty"`
 	RowCount   int64           `json:"row_count"`
 	Version    int             `json:"version"`
+}
+
+// IndexInfo identifies one persistent secondary-index B+Tree. Entries are
+// supplied only while building a table; root and schema are persisted in the
+// catalog and are sufficient for immutable seeks after reopening the file.
+type IndexInfo struct {
+	Name       string       `json:"name"`
+	Columns    []string     `json:"columns"`
+	Unique     bool         `json:"unique"`
+	RootPageID PageID       `json:"root_page_id"`
+	Entries    []IndexEntry `json:"-"`
+}
+
+// IndexEntry maps one canonical key to row IDs in table order.
+type IndexEntry struct {
+	Key    []byte
+	RowIDs []int
 }
 
 // CatalogColumn describes a column in the system catalog.
@@ -41,7 +59,7 @@ type CatalogColumn struct {
 
 // catalogKey constructs the catalog lookup key.
 func catalogKey(tenant, table string) []byte {
-	return []byte(tenant + "\x00" + table)
+	return []byte(strings.ToLower(tenant) + "\x00" + strings.ToLower(table))
 }
 
 // Catalog manages the system catalog B+Tree.
@@ -78,7 +96,7 @@ func (c *Catalog) PutEntry(txID TxID, entry CatalogEntry) error {
 	defer c.mu.Unlock()
 
 	key := catalogKey(entry.Tenant, entry.Table)
-	val, err := storage.JSONMarshal(entry)
+	val, err := json.Marshal(entry)
 	if err != nil {
 		return err
 	}
@@ -115,7 +133,7 @@ func (c *Catalog) ListTables(tenant string) ([]string, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	prefix := []byte(tenant + "\x00")
+	prefix := []byte(strings.ToLower(tenant) + "\x00")
 	var names []string
 	err := c.tree.ScanRange(prefix, nil, func(key, val []byte) bool {
 		// Check prefix match.

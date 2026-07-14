@@ -844,12 +844,31 @@ func (c *CatalogManager) ListTriggers() []*CatalogTrigger {
 }
 
 // Catalog returns the CatalogManager attached to the DB, creating one
-// lazily if necessary.
+// lazily if necessary. The catalog is reached by every SQL statement for
+// RBAC checks, so its one-time construction must be synchronized when a
+// database/sql connector opens several physical reader connections at once.
 func (db *DB) Catalog() *CatalogManager {
+	db.catalogMu.RLock()
+	catalog := db.catalog
+	db.catalogMu.RUnlock()
+	if catalog != nil {
+		return catalog
+	}
+	db.catalogMu.Lock()
+	defer db.catalogMu.Unlock()
 	if db.catalog == nil {
 		db.catalog = NewCatalogManager()
 	}
 	return db.catalog
+}
+
+// setCatalog installs a fully decoded catalog while loading a database. It is
+// deliberately private: callers that need the active catalog use Catalog(),
+// which gives them a stable, concurrency-safe instance.
+func (db *DB) setCatalog(catalog *CatalogManager) {
+	db.catalogMu.Lock()
+	db.catalog = catalog
+	db.catalogMu.Unlock()
 }
 
 // StartJobScheduler starts the database job scheduler with the given executor.

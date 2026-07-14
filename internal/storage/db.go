@@ -450,7 +450,8 @@ type DB struct {
 	auditLog *AuditLog
 
 	// System catalog for metadata and job scheduling
-	catalog *CatalogManager
+	catalogMu sync.RWMutex
+	catalog   *CatalogManager
 
 	// Optional job scheduler/agent.
 	scheduler *Scheduler
@@ -586,7 +587,7 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 	// Persistent read-only modes must never turn a typo or missing artifact
 	// into a newly created directory. NewDiskBackend normally creates its root
 	// for import workflows, so validate before it is constructed.
-	if cfg.ReadOnly && (cfg.Mode == ModeDisk || cfg.Mode == ModeJSON || cfg.Mode == ModeIndex || cfg.Mode == ModeHybrid) {
+	if cfg.ReadOnly && (cfg.Mode == ModeDisk || cfg.Mode == ModeJSON || cfg.Mode == ModeIndex || cfg.Mode == ModeHybrid || cfg.Mode == ModePagedIndex) {
 		info, err := os.Stat(cfg.Path)
 		if err != nil {
 			return nil, fmt.Errorf("read-only open requires an existing storage directory %q: %w", cfg.Path, err)
@@ -742,6 +743,20 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 		backend.SetReadOnly(cfg.ReadOnly)
 		db.backend = backend
 
+	case ModePagedIndex:
+		if cfg.Path == "" {
+			return nil, fmt.Errorf("ModePagedIndex requires a Path")
+		}
+		mem := cfg.MaxMemoryBytes
+		if mem <= 0 {
+			mem = 64 * 1024 * 1024
+		}
+		backend, err := NewPagedIndexBackend(cfg.Path, mem, cfg.ReadOnly)
+		if err != nil {
+			return nil, fmt.Errorf("open paged index db: %w", err)
+		}
+		db.backend = backend
+
 	default:
 		return nil, fmt.Errorf("unsupported storage mode: %v", cfg.Mode)
 	}
@@ -792,7 +807,7 @@ func loadGOBInto(db *DB, filename string) (bool, error) {
 	loadedCatalog := false
 	var dc diskCatalog
 	if err := dec.Decode(&dc); err == nil {
-		db.catalog = diskToCatalog(dc)
+		db.setCatalog(diskToCatalog(dc))
 		loadedCatalog = true
 	} else if !errors.Is(err, io.EOF) {
 		return false, err
@@ -868,7 +883,7 @@ func (db *DB) Get(tn, name string) (*Table, error) {
 // not. Mutable tables created in the current process remain in the catalog
 // until they are explicitly Evict'ed or the DB is reopened.
 func (db *DB) backendTablesEvictable() bool {
-	return db.backend != nil && (db.storageMode == ModeIndex || db.storageMode == ModeHybrid)
+	return db.backend != nil && (db.storageMode == ModeIndex || db.storageMode == ModeHybrid || db.storageMode == ModePagedIndex)
 }
 
 // Put adds a new table to the tenant; returns error if it already exists.
@@ -1312,7 +1327,7 @@ func (db *DB) loadBackendCatalog() error {
 		}
 		return err
 	}
-	db.catalog = diskToCatalog(dc)
+	db.setCatalog(diskToCatalog(dc))
 	return nil
 }
 
@@ -1332,7 +1347,7 @@ func (db *DB) saveBackendCatalog() error {
 		return err
 	}
 	bw := bufio.NewWriter(f)
-	encErr := gob.NewEncoder(bw).Encode(catalogToDisk(db.catalog))
+	encErr := gob.NewEncoder(bw).Encode(catalogToDisk(db.Catalog()))
 	flushErr := bw.Flush()
 	closeErr := f.Close()
 	if encErr != nil {
@@ -1518,7 +1533,7 @@ func SaveToFile(db *DB, filename string) error {
 	if err := enc.Encode(dump); err != nil {
 		return fail(err)
 	}
-	if err := enc.Encode(catalogToDisk(db.catalog)); err != nil {
+	if err := enc.Encode(catalogToDisk(db.Catalog())); err != nil {
 		return fail(err)
 	}
 	if gz != nil {
@@ -1578,7 +1593,7 @@ func LoadFromFile(filename string) (*DB, error) {
 	}
 	var dc diskCatalog
 	if err := dec.Decode(&dc); err == nil {
-		db.catalog = diskToCatalog(dc)
+		db.setCatalog(diskToCatalog(dc))
 	} else if !errors.Is(err, io.EOF) {
 		return nil, err
 	}
@@ -1614,7 +1629,7 @@ func SaveToWriter(db *DB, w io.Writer) error {
 	if err := enc.Encode(dump); err != nil {
 		return err
 	}
-	if err := enc.Encode(catalogToDisk(db.catalog)); err != nil {
+	if err := enc.Encode(catalogToDisk(db.Catalog())); err != nil {
 		return err
 	}
 	return bw.Flush()
@@ -1637,7 +1652,7 @@ func LoadFromReader(r io.Reader) (*DB, error) {
 	}
 	var dc diskCatalog
 	if err := dec.Decode(&dc); err == nil {
-		db.catalog = diskToCatalog(dc)
+		db.setCatalog(diskToCatalog(dc))
 	} else if !errors.Is(err, io.EOF) {
 		return nil, err
 	}
@@ -1877,6 +1892,36 @@ func (db *DB) Backend() StorageBackend {
 	return db.backend
 }
 
+// PagedIndexMetadata returns a schema-only table for the immutable
+// ModePagedIndex backend. The returned table has column and secondary-index
+// metadata but no rows; it lets a planner select an on-disk index before a
+// full-table compatibility load is considered.
+func (db *DB) PagedIndexMetadata(tenant, table string) (*Table, bool, error) {
+	backend, ok := db.backend.(*PagedIndexBackend)
+	if !ok {
+		return nil, false, nil
+	}
+	t, err := backend.IndexMetadata(tenant, table)
+	if err != nil {
+		return nil, false, err
+	}
+	if t == nil {
+		return nil, false, nil
+	}
+	return t, true, nil
+}
+
+// PagedIndexRows performs an exact composite seek in a ModePagedIndex
+// artifact. The boolean is false when no physical index with that name exists;
+// a true result with an empty row slice is a valid negative lookup.
+func (db *DB) PagedIndexRows(tenant, table, indexName string, values []any) ([][]any, bool, error) {
+	backend, ok := db.backend.(*PagedIndexBackend)
+	if !ok {
+		return nil, false, nil
+	}
+	return backend.LookupIndexRows(tenant, table, indexName, values)
+}
+
 // SetBackend attaches a StorageBackend and sets the storage mode. This is
 // primarily used internally by OpenDB; calling it on a running database
 // should be done with care.
@@ -2001,7 +2046,7 @@ func (db *DB) Sync() error {
 	}
 
 	// For disk/hybrid backends, save all in-memory tables that are dirty.
-	if db.storageMode == ModeDisk || db.storageMode == ModeJSON || db.storageMode == ModeHybrid || db.storageMode == ModeIndex {
+	if db.storageMode == ModeDisk || db.storageMode == ModeJSON || db.storageMode == ModeHybrid || db.storageMode == ModeIndex || db.storageMode == ModePagedIndex {
 		db.mu.RLock()
 		type entry struct {
 			tenant string

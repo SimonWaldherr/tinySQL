@@ -67,6 +67,12 @@ const (
 	// round-trip as plain strings, but files can be read, diffed, or
 	// hand-edited with any text tool.
 	ModeJSON
+
+	// ModePagedIndex is an immutable-page-oriented artifact for read-mostly
+	// lookups. It stores rows and materialized secondary indexes in separate
+	// B+Trees, so an exact index seek can load only index and referenced row
+	// pages instead of decoding a complete table file.
+	ModePagedIndex
 )
 
 // String returns a human-readable label for the StorageMode.
@@ -86,6 +92,8 @@ func (m StorageMode) String() string {
 		return "advanced_wal"
 	case ModeJSON:
 		return "json"
+	case ModePagedIndex:
+		return "paged_index"
 	default:
 		return fmt.Sprintf("StorageMode(%d)", int(m))
 	}
@@ -109,8 +117,10 @@ func ParseStorageMode(s string) (StorageMode, error) {
 		return ModeAdvancedWAL, nil
 	case "json":
 		return ModeJSON, nil
+	case "paged_index", "pagedindex", "page_index":
+		return ModePagedIndex, nil
 	default:
-		return ModeMemory, fmt.Errorf("unknown storage mode %q (valid: memory, wal, disk, index, hybrid, advanced_wal, json)", s)
+		return ModeMemory, fmt.Errorf("unknown storage mode %q (valid: memory, wal, disk, index, hybrid, advanced_wal, json, paged_index)", s)
 	}
 }
 
@@ -178,6 +188,8 @@ func DefaultStorageConfig(mode StorageMode) StorageConfig {
 		cfg.MaxMemoryBytes = 256 * 1024 * 1024 // 256 MB
 	case ModeIndex:
 		cfg.MaxMemoryBytes = 64 * 1024 * 1024 // 64 MB (schemas are small)
+	case ModePagedIndex:
+		cfg.MaxMemoryBytes = 64 * 1024 * 1024
 	case ModeWAL:
 		cfg.CheckpointEvery = 32
 		cfg.CheckpointInterval = 30 * time.Second
@@ -243,6 +255,18 @@ type BackendStats struct {
 	SyncCount        int64
 	LoadCount        int64
 	EvictionCount    int64
+	// PageReads and cache counters are populated by page-oriented backends.
+	// They are zero for legacy table-file backends which do not expose pages.
+	PageReads   int64
+	CacheHits   int64
+	CacheMisses int64
+	CachedPages int
+	PinnedPages int
+	// Transient pages are read-only query scratch that could not be admitted
+	// while all cache frames were pinned. They are never retained by the LRU.
+	TransientPages  int
+	TransientFrames int
+	MaxCachePages   int
 }
 
 // ───────────────────────────────────────────────────────────────────────────

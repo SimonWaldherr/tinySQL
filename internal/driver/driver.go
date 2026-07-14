@@ -719,9 +719,22 @@ func (c *conn) currentDB() *storage.DB {
 // call) are parsed directly and never stored, so they cannot churn the
 // cache.
 var (
-	parsedStmtMu    sync.RWMutex
-	parsedStmtCache = make(map[string]engine.Statement)
+	parsedStmtMu       sync.RWMutex
+	parsedStmtCache    = make(map[string]engine.Statement)
+	parsedStmtInFlight = make(map[string]*parsedStmtCall)
 )
+
+// parsedStmtCall is a small, channel-based singleflight for cold parse-cache
+// misses. It deliberately lives beside the cache instead of adding another
+// dependency: the leader parses once, concurrent readers wait without holding
+// a mutex, and every waiter receives the same immutable SELECT/EXPLAIN AST.
+// DML is never shared this way because it can carry connection-local state.
+type parsedStmtCall struct {
+	done   chan struct{}
+	stmt   engine.Statement
+	err    error
+	shared bool
+}
 
 const (
 	parsedStmtCacheMaxEntries = 256
@@ -729,39 +742,98 @@ const (
 )
 
 func parseSQLCached(sqlStr string) (engine.Statement, error) {
-	cacheable := len(sqlStr) <= parsedStmtCacheMaxSQLLen
-	if cacheable {
-		parsedStmtMu.RLock()
-		st, ok := parsedStmtCache[sqlStr]
-		parsedStmtMu.RUnlock()
-		if ok {
-			return st, nil
-		}
+	cacheable := len(sqlStr) <= parsedStmtCacheMaxSQLLen && parseCacheCandidate(sqlStr)
+	if !cacheable {
+		return engine.NewParser(sqlStr).ParseStatement()
 	}
-	p := engine.NewParser(sqlStr)
-	st, err := p.ParseStatement()
-	if err != nil || !cacheable {
-		return st, err
-	}
-	switch st.(type) {
-	case *engine.Select, *engine.Explain:
-	default:
+
+	parsedStmtMu.RLock()
+	st, ok := parsedStmtCache[sqlStr]
+	parsedStmtMu.RUnlock()
+	if ok {
 		return st, nil
 	}
+
+	// Register a leader while holding the short cache mutex. Waiters release
+	// it before blocking, so a cold burst neither serializes readers nor causes
+	// N identical lex/parse passes.
 	parsedStmtMu.Lock()
-	if len(parsedStmtCache) >= parsedStmtCacheMaxEntries {
-		// Random eviction via map iteration order; a bad eviction just
-		// costs one re-parse.
-		for k := range parsedStmtCache {
-			if len(parsedStmtCache) < parsedStmtCacheMaxEntries {
-				break
-			}
-			delete(parsedStmtCache, k)
+	if st, ok := parsedStmtCache[sqlStr]; ok {
+		parsedStmtMu.Unlock()
+		return st, nil
+	}
+	if call := parsedStmtInFlight[sqlStr]; call != nil {
+		parsedStmtMu.Unlock()
+		<-call.done
+		if call.err != nil {
+			return nil, call.err
+		}
+		if call.shared {
+			return call.stmt, nil
+		}
+		// A malformed read-shaped statement is not shared. This branch is
+		// defensive: cache candidates are SELECT/EXPLAIN only.
+		return engine.NewParser(sqlStr).ParseStatement()
+	}
+	call := &parsedStmtCall{done: make(chan struct{})}
+	parsedStmtInFlight[sqlStr] = call
+	parsedStmtMu.Unlock()
+
+	p := engine.NewParser(sqlStr)
+	var err error
+	st, err = p.ParseStatement()
+	if err == nil {
+		switch st.(type) {
+		case *engine.Select, *engine.Explain:
+			call.shared = true
 		}
 	}
-	parsedStmtCache[sqlStr] = st
+
+	parsedStmtMu.Lock()
+	if err == nil && call.shared {
+		if len(parsedStmtCache) >= parsedStmtCacheMaxEntries {
+			// Random eviction via map iteration order; a bad eviction just
+			// costs one re-parse.
+			for k := range parsedStmtCache {
+				if len(parsedStmtCache) < parsedStmtCacheMaxEntries {
+					break
+				}
+				delete(parsedStmtCache, k)
+			}
+		}
+		parsedStmtCache[sqlStr] = st
+	}
+	call.stmt = st
+	call.err = err
+	delete(parsedStmtInFlight, sqlStr)
+	close(call.done)
 	parsedStmtMu.Unlock()
-	return st, nil
+	return st, err
+}
+
+// parseCacheCandidate keeps DML out of the cold-miss coordinator. A write
+// cannot be shared safely between connections, and coordinating it would only
+// serialize a burst of independent mutations. The parser remains the final
+// authority; this inexpensive check merely limits the immutable read cache.
+func parseCacheCandidate(sqlStr string) bool {
+	sqlStr = strings.TrimLeft(sqlStr, " \t\r\n")
+	end := 0
+	for end < len(sqlStr) {
+		ch := sqlStr[end]
+		if (ch < 'A' || ch > 'Z') && (ch < 'a' || ch > 'z') {
+			break
+		}
+		end++
+	}
+	if end == 0 {
+		return false
+	}
+	switch strings.ToUpper(sqlStr[:end]) {
+	case "SELECT", "EXPLAIN":
+		return true
+	default:
+		return false
+	}
 }
 
 //nolint:gocyclo // execSQL coordinates parsing, locking, WAL, and transaction paths.
@@ -977,14 +1049,25 @@ type stmt struct {
 	c        *conn
 	sql      string
 	prepared *preparedQuery
-	mu       sync.Mutex
 }
 
-// preparedQuery holds the parsed AST and the Literal nodes that correspond to
-// positional ? placeholders. The stmt mutex makes binding safe when a
-// database/sql statement is used concurrently. Execute materializes rows
-// before the mutex is released, so no returned result aliases the next bind.
+// preparedQuery is an immutable prepared-statement template. Each execution
+// borrows an exclusive AST plus literal slots from pool, which avoids both
+// reparsing on warm workers and the former statement-wide mutex. A pooled AST
+// never escapes queryStatement: engine.Execute has materialized its ResultSet
+// before the execution state is returned to the pool.
 type preparedQuery struct {
+	markerSQL string
+	markers   []string
+	pool      sync.Pool
+}
+
+// preparedExecution is intentionally owned by exactly one goroutine between
+// acquire and release. Keeping the bindable literals together with their AST
+// makes concurrent prepared statements race-free without cloning the AST for
+// every query. release restores markers so a pooled execution cannot retain
+// caller BLOBs or other large parameter values.
+type preparedExecution struct {
 	statement engine.Statement
 	params    []*engine.Literal
 }
@@ -1024,15 +1107,18 @@ func (s *stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driv
 }
 
 func (s *stmt) queryPrepared(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
-	if len(args) != len(s.prepared.params) {
-		return nil, fmt.Errorf("tinysql: expected %d placeholder arguments, got %d", len(s.prepared.params), len(args))
+	if len(args) != len(s.prepared.markers) {
+		return nil, fmt.Errorf("tinysql: expected %d placeholder arguments, got %d", len(s.prepared.markers), len(args))
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	exec, err := s.prepared.acquire()
+	if err != nil {
+		return nil, err
+	}
+	defer s.prepared.release(exec)
 	for i, arg := range args {
-		s.prepared.params[i].Val = driverValueLiteral(arg.Value)
+		exec.params[i].Val = driverValueLiteral(arg.Value)
 	}
-	return s.c.queryStatement(ctx, s.prepared.statement)
+	return s.c.queryStatement(ctx, exec.statement)
 }
 
 func driverValueLiteral(v any) any {
@@ -1054,35 +1140,66 @@ func driverValueLiteral(v any) any {
 
 const preparedMarkerPrefix = "__tinysql_prepared_param_"
 
-// buildPreparedQuery recognizes positional placeholders outside SQL strings,
-// parses their marker form once, and retains pointers to the corresponding
-// Literal nodes. Numbered placeholders deliberately keep the text fallback:
-// their repeated/reordered binding needs a separate ordinal map.
+// buildPreparedQuery recognizes positional placeholders outside SQL strings
+// and validates the marker form once. Numbered placeholders deliberately keep
+// the text fallback: their repeated/reordered binding needs a separate ordinal
+// map.
 func buildPreparedQuery(sqlText string) (*preparedQuery, error) {
 	markerSQL, count, ok := markerSQLForPositionalParams(sqlText)
 	if !ok || count == 0 {
 		return nil, nil
 	}
-	statement, err := engine.NewParser(markerSQL).ParseStatement()
+	markers := make([]string, count)
+	for i := range markers {
+		markers[i] = preparedMarkerPrefix + strconv.Itoa(i) + "__"
+	}
+	prepared := &preparedQuery{markerSQL: markerSQL, markers: markers}
+	// Parse and validate once at Prepare time. Seeding the pool gives the
+	// common single-goroutine path the original no-reparse behavior; additional
+	// workers create isolated executions only when needed.
+	exec, err := prepared.newExecution()
+	if err != nil {
+		return nil, err
+	}
+	prepared.pool.Put(exec)
+	return prepared, nil
+}
+
+func (p *preparedQuery) acquire() (*preparedExecution, error) {
+	if value := p.pool.Get(); value != nil {
+		return value.(*preparedExecution), nil
+	}
+	return p.newExecution()
+}
+
+func (p *preparedQuery) release(exec *preparedExecution) {
+	for i, literal := range exec.params {
+		literal.Val = p.markers[i]
+	}
+	p.pool.Put(exec)
+}
+
+func (p *preparedQuery) newExecution() (*preparedExecution, error) {
+	statement, err := engine.NewParser(p.markerSQL).ParseStatement()
 	if err != nil {
 		return nil, err
 	}
 	if _, ok := statement.(*engine.Select); !ok {
-		return nil, nil
+		return nil, fmt.Errorf("tinysql: prepared fast path supports SELECT only")
 	}
-	markers := make(map[string]int, count)
-	for i := range count {
-		markers[preparedMarkerPrefix+strconv.Itoa(i)+"__"] = i
+	markerPositions := make(map[string]int, len(p.markers))
+	for i, marker := range p.markers {
+		markerPositions[marker] = i
 	}
-	params := make([]*engine.Literal, count)
-	collectPreparedLiterals(reflect.ValueOf(statement), markers, params)
+	params := make([]*engine.Literal, len(p.markers))
+	collectPreparedLiterals(reflect.ValueOf(statement), markerPositions, params)
 	for i, literal := range params {
 		if literal == nil {
 			return nil, fmt.Errorf("tinysql: positional parameter %d was not parsed as a literal", i+1)
 		}
 		literal.Parameter = true
 	}
-	return &preparedQuery{statement: statement, params: params}, nil
+	return &preparedExecution{statement: statement, params: params}, nil
 }
 
 func markerSQLForPositionalParams(sqlText string) (string, int, bool) {

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"testing"
 )
 
@@ -324,6 +325,82 @@ func TestPager_BasicTransactions(t *testing.T) {
 	bp := WrapBTreePage(buf2)
 	if !bp.IsLeaf() {
 		t.Fatal("expected leaf page")
+	}
+}
+
+func TestPager_ReadOnlyConcurrentColdReadSingleflight(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "concurrent.db")
+	writer, err := OpenPager(PagerConfig{DBPath: path, PageSize: DefaultPageSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	txID, err := writer.BeginTx()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, page := writer.AllocPage()
+	InitBTreePage(page, pid, true)
+	SetPageCRC(page)
+	if err := writer.WritePage(txID, pid, page); err != nil {
+		t.Fatal(err)
+	}
+	writer.UnpinPage(pid)
+	if err := writer.CommitTx(txID); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := OpenPager(PagerConfig{
+		DBPath:        path,
+		PageSize:      DefaultPageSize,
+		MaxCachePages: 8,
+		ReadOnly:      true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	const workers = 64
+	start := make(chan struct{})
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			buf, err := reader.ReadPage(pid)
+			if err == nil {
+				if got := UnmarshalHeader(buf).ID; got != pid {
+					err = fmt.Errorf("page ID %d, want %d", got, pid)
+				}
+				reader.UnpinPage(pid)
+			}
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	stats := reader.CacheStats()
+	if stats.PageReads != 1 || stats.CacheMisses != 1 {
+		t.Fatalf("cold read stampede: page_reads=%d cache_misses=%d, want 1/1", stats.PageReads, stats.CacheMisses)
+	}
+	if stats.PinnedPages != 0 || stats.TransientFrames != 0 {
+		t.Fatalf("page pins leaked after concurrent read: %#v", stats)
 	}
 }
 

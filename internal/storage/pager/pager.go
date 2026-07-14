@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 )
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -37,19 +38,41 @@ type PageBufferPool struct {
 	mu       sync.Mutex
 	maxPages int
 	pages    map[PageID]*PageFrame
+	// loads coordinates a cold read of one page. It is intentionally scoped to
+	// a PageID, so unrelated cold pages still issue I/O in parallel while a
+	// stampede for one tile/index page performs exactly one physical read.
+	loads map[PageID]*pageLoad
+	// transient tracks uncached read-only page buffers. A page in this map
+	// must not be admitted until every caller that received its raw buffer has
+	// unpinned it; UnpinPage identifies frames only by PageID.
+	transient map[PageID]int
 	// LRU doubly-linked list: head = most recent, tail = least recent.
 	head *PageFrame
 	tail *PageFrame
+}
+
+// pageLoad is published under PageBufferPool.mu and completed by closing done.
+// Waiters never hold a mutex while waiting for disk I/O. transient means the
+// result could not enter the bounded cache because all frames were pinned; the
+// shared raw buffer remains valid until every waiter calls UnpinPage.
+type pageLoad struct {
+	done      chan struct{}
+	buf       []byte
+	err       error
+	transient bool
 }
 
 func newPageBufferPool(maxPages int) *PageBufferPool {
 	if maxPages <= 0 {
 		maxPages = 1024
 	}
-	return &PageBufferPool{
-		maxPages: maxPages,
-		pages:    make(map[PageID]*PageFrame, maxPages),
+	pool := &PageBufferPool{
+		maxPages:  maxPages,
+		pages:     make(map[PageID]*PageFrame, maxPages),
+		loads:     make(map[PageID]*pageLoad),
+		transient: make(map[PageID]int),
 	}
+	return pool
 }
 
 func (bp *PageBufferPool) get(id PageID) (*PageFrame, bool) {
@@ -61,8 +84,8 @@ func (bp *PageBufferPool) get(id PageID) (*PageFrame, bool) {
 }
 
 func (bp *PageBufferPool) put(f *PageFrame) {
-	if _, exists := bp.pages[f.id]; exists {
-		bp.moveToFront(f)
+	if existing, exists := bp.pages[f.id]; exists {
+		bp.moveToFront(existing)
 		return
 	}
 	// Evict if at capacity.
@@ -75,6 +98,44 @@ func (bp *PageBufferPool) put(f *PageFrame) {
 	bp.pushFront(f)
 }
 
+// putReadOnly admits one frame without ever exceeding maxPages. Callers
+// must hold bp.mu. If all resident frames are pinned, it returns false:
+// the caller may use its just-read buffer as query-local scratch but must
+// not retain it in the cache. Waiting here can deadlock when a BLOB leaf is
+// pinned while the same query needs an overflow page.
+func (bp *PageBufferPool) putReadOnly(f *PageFrame) (*PageFrame, bool) {
+	if bp.transient[f.id] > 0 {
+		bp.transient[f.id]++
+		return nil, false
+	}
+	if existing, exists := bp.pages[f.id]; exists {
+		existing.pinned++
+		bp.moveToFront(existing)
+		return existing, true
+	}
+	if len(bp.pages) >= bp.maxPages && !bp.evictOne() {
+		bp.transient[f.id]++
+		return nil, false
+	}
+	bp.pages[f.id] = f
+	bp.pushFront(f)
+	return f, true
+}
+
+func (bp *PageBufferPool) unpin(id PageID) {
+	if count := bp.transient[id]; count > 0 {
+		if count == 1 {
+			delete(bp.transient, id)
+		} else {
+			bp.transient[id] = count - 1
+		}
+		return
+	}
+	if f, ok := bp.get(id); ok && f.pinned > 0 {
+		f.pinned--
+	}
+}
+
 func (bp *PageBufferPool) remove(id PageID) {
 	f, ok := bp.pages[id]
 	if !ok {
@@ -84,11 +145,17 @@ func (bp *PageBufferPool) remove(id PageID) {
 	delete(bp.pages, id)
 }
 
-// evictOne removes the least-recently-used unpinned page.
+// evictOne removes the least-recently-used clean, unpinned page.
 // Returns false if no page can be evicted.
+//
+// A dirty page is the only in-memory copy of a committed WAL page until the
+// next checkpoint. Dropping it would make a later B-Tree read fall back to an
+// older/truncated main file. Read-only serving has no dirty pages, so its
+// cache remains strictly bounded; mutable imports may temporarily exceed the
+// target while a transaction is being built, but never lose durability.
 func (bp *PageBufferPool) evictOne() bool {
 	for f := bp.tail; f != nil; f = f.prev {
-		if f.pinned == 0 {
+		if f.pinned == 0 && !f.dirty {
 			bp.unlink(f)
 			delete(bp.pages, f.id)
 			return true
@@ -150,6 +217,7 @@ type PagerConfig struct {
 	WALPath       string
 	PageSize      int
 	MaxCachePages int // buffer pool capacity (0 = default 1024)
+	ReadOnly      bool
 }
 
 // Pager manages page-level I/O, WAL, buffer pool, and free-list.
@@ -163,7 +231,12 @@ type Pager struct {
 	pageSize int
 	path     string
 	walPath  string
+	readOnly bool
 	closed   bool
+
+	pageReads   atomic.Int64
+	cacheHits   atomic.Int64
+	cacheMisses atomic.Int64
 }
 
 // OpenPager opens or creates a page-based database.
@@ -178,10 +251,17 @@ func OpenPager(cfg PagerConfig) (*Pager, error) {
 
 	isNew := false
 	if _, err := os.Stat(cfg.DBPath); os.IsNotExist(err) {
+		if cfg.ReadOnly {
+			return nil, fmt.Errorf("read-only pager requires existing database %q", cfg.DBPath)
+		}
 		isNew = true
 	}
 
-	f, err := os.OpenFile(cfg.DBPath, os.O_RDWR|os.O_CREATE, 0644)
+	flags := os.O_RDWR | os.O_CREATE
+	if cfg.ReadOnly {
+		flags = os.O_RDONLY
+	}
+	f, err := os.OpenFile(cfg.DBPath, flags, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("open db file: %w", err)
 	}
@@ -191,6 +271,7 @@ func OpenPager(cfg PagerConfig) (*Pager, error) {
 		pageSize: ps,
 		path:     cfg.DBPath,
 		walPath:  cfg.WALPath,
+		readOnly: cfg.ReadOnly,
 		pool:     newPageBufferPool(cfg.MaxCachePages),
 		freeMgr:  NewFreeManager(),
 	}
@@ -225,12 +306,24 @@ func OpenPager(cfg PagerConfig) (*Pager, error) {
 		}
 	}
 
-	// Open or create WAL.
+	// A published immutable artifact has no active WAL. Refuse a non-empty
+	// sidecar instead of opening recovery in writable mode or silently serving
+	// data whose committed state is ambiguous.
 	walPath := cfg.WALPath
 	if walPath == "" {
 		walPath = cfg.DBPath + ".wal"
 	}
 	p.walPath = walPath
+	if cfg.ReadOnly {
+		if info, err := os.Stat(walPath); err == nil && info.Size() > WALFileHdrSize {
+			f.Close()
+			return nil, fmt.Errorf("read-only pager refuses active WAL %q", walPath)
+		} else if err != nil && !os.IsNotExist(err) {
+			f.Close()
+			return nil, err
+		}
+		return p, nil
+	}
 	wf, err := OpenWALFile(walPath, p.pageSize)
 	if err != nil {
 		f.Close()
@@ -296,35 +389,109 @@ func (p *Pager) readPageCached(id PageID) ([]byte, error) {
 	if f, ok := p.pool.get(id); ok {
 		f.pinned++
 		p.pool.mu.Unlock()
+		p.cacheHits.Add(1)
 		return f.buf, nil
 	}
+	if loading := p.pool.loads[id]; loading != nil {
+		p.pool.mu.Unlock()
+		<-loading.done
+		if loading.err != nil {
+			return nil, loading.err
+		}
+		p.pool.mu.Lock()
+		if loading.transient {
+			// The leader already counted itself. Each waiter shares the same
+			// query-local bytes and owns one matching transient pin.
+			p.pool.transient[id]++
+			buf := loading.buf
+			p.pool.mu.Unlock()
+			p.cacheHits.Add(1)
+			return buf, nil
+		}
+		if f, ok := p.pool.get(id); ok {
+			f.pinned++
+			p.pool.mu.Unlock()
+			p.cacheHits.Add(1)
+			return f.buf, nil
+		}
+		// A completed loader normally leaves either a cache frame or a
+		// transient result. Retrying is safer than returning bytes whose
+		// ownership cannot be proven if a future cache policy changes.
+		p.pool.mu.Unlock()
+		return p.readPageCached(id)
+	}
+	loading := &pageLoad{done: make(chan struct{})}
+	p.pool.loads[id] = loading
 	p.pool.mu.Unlock()
 
 	// Cache miss — read from file.
+	p.cacheMisses.Add(1)
+	p.pageReads.Add(1)
 	buf, err := p.readPageRaw(id)
 	if err != nil {
+		p.finishPageLoad(id, loading, nil, err, false)
 		return nil, err
 	}
 	f := &PageFrame{id: id, buf: buf, pinned: 1}
 	p.pool.mu.Lock()
+	if p.readOnly {
+		canonical, admitted := p.pool.putReadOnly(f)
+		if !admitted {
+			p.finishPageLoadLocked(id, loading, buf, nil, true)
+			p.pool.mu.Unlock()
+			return buf, nil
+		}
+		p.finishPageLoadLocked(id, loading, canonical.buf, nil, false)
+		p.pool.mu.Unlock()
+		return canonical.buf, nil
+	}
+	// Another reader may have fetched this page while we were in ReadAt.
+	// Use that canonical frame; otherwise its pin count and the LRU links
+	// would diverge from the bytes returned to the caller.
+	if existing, ok := p.pool.get(id); ok {
+		existing.pinned++
+		p.finishPageLoadLocked(id, loading, existing.buf, nil, false)
+		p.pool.mu.Unlock()
+		return existing.buf, nil
+	}
 	p.pool.put(f)
+	p.finishPageLoadLocked(id, loading, buf, nil, false)
 	p.pool.mu.Unlock()
 	return buf, nil
+}
+
+// finishPageLoad publishes the result of a cold read. It is split from the
+// locked helper for the error path, where no buffer-pool mutation is pending.
+func (p *Pager) finishPageLoad(id PageID, loading *pageLoad, buf []byte, err error, transient bool) {
+	p.pool.mu.Lock()
+	p.finishPageLoadLocked(id, loading, buf, err, transient)
+	p.pool.mu.Unlock()
+}
+
+// finishPageLoadLocked must be called with p.pool.mu held. Channel close is
+// the happens-before edge for all pageLoad fields observed by waiters.
+func (p *Pager) finishPageLoadLocked(id PageID, loading *pageLoad, buf []byte, err error, transient bool) {
+	loading.buf = buf
+	loading.err = err
+	loading.transient = transient
+	delete(p.pool.loads, id)
+	close(loading.done)
 }
 
 // UnpinPage decrements the pin count.
 func (p *Pager) UnpinPage(id PageID) {
 	p.pool.mu.Lock()
 	defer p.pool.mu.Unlock()
-	if f, ok := p.pool.get(id); ok && f.pinned > 0 {
-		f.pinned--
-	}
+	p.pool.unpin(id)
 }
 
 // WritePage writes (updates) a page through the WAL. The page image is
 // logged to the WAL and cached as dirty. The caller should have called
 // BeginTx beforehand.
 func (p *Pager) WritePage(txID TxID, id PageID, buf []byte) error {
+	if p.readOnly {
+		return fmt.Errorf("pager is read-only")
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -362,6 +529,9 @@ func (p *Pager) WritePage(txID TxID, id PageID, buf []byte) error {
 
 // BeginTx starts a new transaction and writes a BEGIN record to the WAL.
 func (p *Pager) BeginTx() (TxID, error) {
+	if p.readOnly {
+		return 0, fmt.Errorf("pager is read-only")
+	}
 	p.mu.Lock()
 	txID := p.sb.NextTxID
 	p.sb.NextTxID++
@@ -396,6 +566,9 @@ func (p *Pager) AbortTx(txID TxID) error {
 // AllocPage allocates a new page (from the free-list or by extending the file).
 // Returns the page ID and a zeroed buffer. The page is pinned in the cache.
 func (p *Pager) AllocPage() (PageID, []byte) {
+	if p.readOnly {
+		return InvalidPageID, nil
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -416,6 +589,9 @@ func (p *Pager) AllocPage() (PageID, []byte) {
 
 // FreePage marks a page as free for reuse.
 func (p *Pager) FreePage(pid PageID) {
+	if p.readOnly {
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.freeMgr.Free(pid)
@@ -445,6 +621,9 @@ func (p *Pager) freeOldFreeListChain(head PageID) {
 // Checkpoint flushes all dirty pages to the database file, writes an updated
 // superblock, fsyncs the file, then truncates the WAL.
 func (p *Pager) Checkpoint() error {
+	if p.readOnly {
+		return nil
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -520,6 +699,9 @@ func (p *Pager) Superblock() Superblock {
 // UpdateSuperblock updates the in-memory superblock fields. It does NOT
 // write to disk. Use Checkpoint for that.
 func (p *Pager) UpdateSuperblock(fn func(sb *Superblock)) {
+	if p.readOnly {
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	fn(p.sb)
@@ -527,6 +709,47 @@ func (p *Pager) UpdateSuperblock(fn func(sb *Superblock)) {
 
 // PageSize returns the configured page size.
 func (p *Pager) PageSize() int { return p.pageSize }
+
+// PagerCacheStats reports the physical-read and bounded-cache state. The
+// counters are deliberately process-local: they describe this open snapshot,
+// not a persisted database property.
+type PagerCacheStats struct {
+	PageReads       int64
+	CacheHits       int64
+	CacheMisses     int64
+	CachedPages     int
+	PinnedPages     int
+	TransientPages  int
+	TransientFrames int
+	MaxPages        int
+}
+
+func (p *Pager) CacheStats() PagerCacheStats {
+	p.pool.mu.Lock()
+	cached := len(p.pool.pages)
+	pinned := 0
+	for _, frame := range p.pool.pages {
+		if frame.pinned > 0 {
+			pinned++
+		}
+	}
+	transientFrames := 0
+	for _, count := range p.pool.transient {
+		transientFrames += count
+	}
+	maxPages := p.pool.maxPages
+	p.pool.mu.Unlock()
+	return PagerCacheStats{
+		PageReads:       p.pageReads.Load(),
+		CacheHits:       p.cacheHits.Load(),
+		CacheMisses:     p.cacheMisses.Load(),
+		CachedPages:     cached,
+		PinnedPages:     pinned,
+		TransientPages:  len(p.pool.transient),
+		TransientFrames: transientFrames,
+		MaxPages:        maxPages,
+	}
+}
 
 // ── Close ─────────────────────────────────────────────────────────────────
 
@@ -543,13 +766,17 @@ func (p *Pager) Close() error {
 	// Final checkpoint to ensure all data is on disk.
 	if err := p.Checkpoint(); err != nil {
 		// Best effort — still close files.
-		_ = p.wal.Close()
+		if p.wal != nil {
+			_ = p.wal.Close()
+		}
 		_ = p.file.Close()
 		return err
 	}
-	if err := p.wal.Close(); err != nil {
-		_ = p.file.Close()
-		return err
+	if p.wal != nil {
+		if err := p.wal.Close(); err != nil {
+			_ = p.file.Close()
+			return err
+		}
 	}
 	return p.file.Close()
 }
