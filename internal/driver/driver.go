@@ -546,7 +546,16 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 	}
 	defer c.srv.releaseReader()
 	c.srv.mu.RLock()
-	base, shadow := c.srv.db.DeepClonePair()
+	// A read-only transaction produces no changes to merge, so it needs only a
+	// single stable read snapshot and no conflict-detection base. A read-write
+	// transaction needs a mutable shadow plus a lightweight version-only base
+	// (SnapshotForTx copies rows once, not twice).
+	var base, shadow *storage.DB
+	if opts.ReadOnly {
+		shadow = c.srv.db.DeepClone()
+	} else {
+		base, shadow = c.srv.db.SnapshotForTx()
+	}
 	c.srv.mu.RUnlock()
 
 	c.inTx = true
@@ -581,11 +590,14 @@ func (c *conn) commitTx() error {
 	if !c.inTx {
 		return fmt.Errorf("tinysql: no active transaction")
 	}
-	// Read-only transactions use the immutable shared database as their
-	// snapshot and intentionally have no private shadow to merge.
-	if c.shadow == nil && c.txReadOnly {
+	// Read-only transactions produce no changes to merge: their snapshot is
+	// either the immutable shared database (shadow == nil) or a private read
+	// clone (shadow != nil, txBase == nil). Either way there is nothing to
+	// commit, so skip the writer lock and change-collection entirely.
+	if c.txReadOnly {
 		c.inTx = false
 		c.txBase = nil
+		c.shadow = nil
 		c.txReadOnly = false
 		return nil
 	}

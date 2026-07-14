@@ -1048,6 +1048,40 @@ func (db *DB) DeepClonePair() (*DB, *DB) {
 	return base, shadow
 }
 
+// SnapshotForTx creates the pair of snapshots a SQL transaction needs while
+// copying row data only once instead of twice.
+//
+// shadow is a full deep clone that receives the transaction's writes. base is
+// a lightweight snapshot that records each table's identity and Version but no
+// rows: the only consumers of the base — CollectWALChanges and the driver's
+// conflict detection — read Table.Version and table existence exclusively and
+// never inspect rows. Copying rows into the base (as DeepClonePair does) would
+// therefore waste memory proportional to the entire database on every Begin.
+func (db *DB) SnapshotForTx() (base *DB, shadow *DB) {
+	base = NewDB()
+	shadow = NewDB()
+	base.wal = db.wal
+	shadow.wal = db.wal
+	for tn, tdb := range db.tenants {
+		for _, t := range tdb.tables {
+			base.upsertTable(tn, cloneTableMeta(t))
+			shadow.upsertTable(tn, cloneTable(t))
+		}
+	}
+	return base, shadow
+}
+
+// cloneTableMeta copies a table's identity, schema and Version but not its
+// rows. It backs the transaction base snapshot from SnapshotForTx, where only
+// Version and existence are ever read. Cols are shared by reference: the base
+// is never mutated, and any schema change bumps Version, so a stale shared
+// header cannot cause a missed conflict.
+func cloneTableMeta(t *Table) *Table {
+	nt := NewTable(t.Name, t.Cols, t.IsTemp)
+	nt.Version = t.Version
+	return nt
+}
+
 func cloneTable(t *Table) *Table {
 	cols := make([]Column, len(t.Cols))
 	copy(cols, t.Cols)

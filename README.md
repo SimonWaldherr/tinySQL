@@ -154,6 +154,7 @@ Pick the guide that matches what you're building:
 | [Storage & persistence](./docs/storage-guide.md) | Storage modes, DSNs, connection strings, read-only serving |
 | [Command line tools](./docs/cli-guide.md) | Using the `cmd/tinysql` CLI, REPL, servers, file-query tools, and the browser playground |
 | [Development guide](./docs/development-guide.md) | Running tests, the Makefile, building the WASM demo |
+| [Memory optimization](./docs/memory-optimization.md) | Where tinySQL spends memory, landed wins, and proposals for further reductions |
 | [Repository structure](./docs/repository-structure.md) | Codebase layout for contributors |
 | [Benchmarks](./BENCHMARKS.md) | TinySQL-vs-SQLite numbers and internal optimization history |
 
