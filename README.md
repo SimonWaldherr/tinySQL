@@ -65,7 +65,8 @@ func main() {
 - SQLite-style type declarations and affinities, including `INTEGER`, `REAL`,
   `TEXT`, `NUMERIC`, `VARCHAR(n)`, `CLOB`, typeless columns, and `ANY`.
 - Built-in functions for JSON, YAML, URLs, hashes, bitmaps, regex, text, math,
-  dates, full-text search, vector search, and RAG scoring.
+  dates, full-text search, vector search, RAG scoring, and provenance-aware
+  context expansion.
 - Geodata imports and SQL helpers for GeoJSON, KML, OSM XML, Shapefiles,
   MBTiles, routing graphs, points, distance, radius, and bounding-box queries.
 - Operational hooks for health checks, lifecycle management, read-only mode,

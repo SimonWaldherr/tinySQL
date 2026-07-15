@@ -624,3 +624,63 @@ func TestRAGContextFromCTEHits(t *testing.T) {
 		t.Fatalf("RAG_CONTEXT_FROM expected hit rank 1 for context rows")
 	}
 }
+
+func TestRAGContextFromMergesOverlappingHitProvenance(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	Execute(ctx, db, "default", mustParse(`
+		CREATE TABLE rag_chunks (
+			doc_id TEXT,
+			chunk_index INT,
+			chunk_text TEXT
+		)
+	`))
+	Execute(ctx, db, "default", mustParse(`
+		INSERT INTO rag_chunks VALUES
+			('doc-a', 0, 'zero'),
+			('doc-a', 1, 'one'),
+			('doc-a', 2, 'two'),
+			('doc-a', 3, 'three')
+	`))
+	Execute(ctx, db, "default", mustParse(`
+		CREATE TABLE rag_hits (
+			doc_id TEXT,
+			chunk_index INT,
+			rank INT
+		)
+	`))
+	Execute(ctx, db, "default", mustParse(`
+		INSERT INTO rag_hits VALUES
+			('doc-a', 1, 2),
+			('doc-a', 2, 1)
+	`))
+
+	rs := execSQL(t, db, `
+		SELECT chunk_index, _hit_rank, _context_offset, _context_rank, _context_hits
+		FROM RAG_CONTEXT_FROM('rag_chunks', 'doc_id', 'chunk_index', 'rag_hits', 'doc_id', 'chunk_index', 1, 1)
+		ORDER BY _context_rank
+	`)
+	if len(rs.Rows) != 4 {
+		t.Fatalf("RAG_CONTEXT_FROM: expected 4 unique context rows, got %d", len(rs.Rows))
+	}
+
+	want := []struct {
+		chunk, hitRank, offset, contextRank, hitCount int
+	}{
+		{1, 1, -1, 1, 2},
+		{2, 1, 0, 2, 2},
+		{3, 1, 1, 3, 1},
+		{0, 2, -1, 4, 1},
+	}
+	for i, expected := range want {
+		got := rs.Rows[i]
+		if got["chunk_index"] != expected.chunk ||
+			got["_hit_rank"] != expected.hitRank ||
+			got["_context_offset"] != expected.offset ||
+			got["_context_rank"] != expected.contextRank ||
+			got["_context_hits"] != expected.hitCount {
+			t.Fatalf("row %d: got %#v, want chunk=%d rank=%d offset=%d context_rank=%d hits=%d", i, got, expected.chunk, expected.hitRank, expected.offset, expected.contextRank, expected.hitCount)
+		}
+	}
+}

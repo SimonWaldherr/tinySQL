@@ -102,20 +102,25 @@ cheap compared to a second retrieval round.
 LLM answers improve when retrieved chunks arrive with their surrounding text.
 `RAG_CONTEXT_FROM` takes a hit set (a CTE or table) and returns each hit plus
 its neighbors within the same document, annotated with `_hit_rank`,
-`_context_offset` (position relative to the hit), and `_context_rank`:
+`_context_offset` (position relative to the best supporting hit), and
+`_context_rank`:
 
 ```sql
 WITH topk AS (
     SELECT doc_id, chunk_index
     FROM VEC_SEARCH('chunks', 'embedding', VEC_FROM_JSON('[0.1, 0.0, 0.9]'), 5, 'cosine')
 )
-SELECT doc_id, chunk_index, chunk_text, _hit_rank, _context_offset
+SELECT doc_id, chunk_index, chunk_text, _hit_rank, _context_offset, _context_hits
 FROM RAG_CONTEXT_FROM('chunks', 'doc_id', 'chunk_index', 'topk', 'doc_id', 'chunk_index', 1, 1)
 ORDER BY _context_rank;
 ```
 
 The trailing `1, 1` fetches one chunk before and one after each hit.
-`RAG_CONTEXT` does the same for a single known chunk.
+`RAG_CONTEXT` does the same for a single known chunk. Overlapping windows are
+deduplicated: `_context_hits` is the number of retrieved hits that contributed
+that chunk, while `_hit_rank` and `_context_offset` come from its best-ranked
+supporting hit. This gives prompt builders a cheap, explainable confidence
+signal without repeating text.
 
 ## 5. Hybrid retrieval: vectors + keywords
 
@@ -160,6 +165,10 @@ For a lighter variant, retrieve by vector and rerank with the scalar
   SQL text, so re-issued query templates don't re-parse. Vector caches and
   ANN indexes are dropped eagerly on `DROP TABLE` and bounded overall, so
   long-running services don't accumulate memory from schema churn.
+- **Context expansion scales with the window, not the source × hit count.**
+  `RAG_CONTEXT` and `RAG_CONTEXT_FROM` build a document/chunk index once per
+  query and binary-search each requested window. Keep `chunk_index` monotonic
+  within a document for predictable prompt ordering.
 - **Exposing the schema to an LLM agent:** `tsql.BuildAgentContext(...)`
   renders a compact, token-budgeted schema summary for system prompts, and
   `cmd/tinysql-mcp-server` serves the database over MCP.

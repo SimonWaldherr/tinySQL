@@ -497,6 +497,27 @@ func BenchmarkRAGContextFromTopK(b *testing.B) {
 	}
 }
 
+func BenchmarkRAGContextSingle(b *testing.B) {
+	db := makeRAGChunkBenchmarkTable(12000, 64)
+	stmt := mustParse(`
+		SELECT doc_id, chunk_index, chunk_text, _context_offset
+		FROM RAG_CONTEXT('rag_chunks', 'doc_id', 'chunk_index', 'doc-500', 6, 2, 2)
+		ORDER BY _context_rank
+	`)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rs, err := Execute(context.Background(), db, "default", stmt)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(rs.Rows) != 5 {
+			b.Fatalf("expected 5 context rows, got %d", len(rs.Rows))
+		}
+	}
+}
+
 func BenchmarkOrderByVectorLimit_NoWhere(b *testing.B) {
 	db := makeRAGHybridBenchmarkTable(12000, 64)
 	query := make([]float64, 64)
