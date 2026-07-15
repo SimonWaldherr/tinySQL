@@ -876,10 +876,44 @@ type ftsDocCacheEntry struct {
 	docs    []ftsCachedDoc
 }
 
+// ftsDocCacheMaxEntries bounds the tokenized-document cache the same way the
+// vector column cache is bounded: each entry pins a *storage.Table, so without
+// a cap a long-running process that creates/drops many FTS-backed tables (or
+// searches many distinct column sets) leaks one pinned table per orphaned key.
+const ftsDocCacheMaxEntries = 256
+
 var (
 	ftsDocCacheMu sync.RWMutex
 	ftsDocCache   = make(map[ftsDocCacheKey]ftsDocCacheEntry)
 )
+
+// purgeFTSCachesFor drops the tokenized-document cache and inverted index for
+// one table, called from DROP TABLE. Purging is always safe: both structures
+// rebuild lazily on the next FTS_SEARCH. ftsDocCache keys carry no DB pointer,
+// and the registry key embeds one, so the registry is matched by its
+// tenant/table suffix (over-purging identically named tables across embedded
+// DBs at worst forces a lazy rebuild).
+func purgeFTSCachesFor(tenant, table string) {
+	if tenant == "" {
+		tenant = "default"
+	}
+	ftsDocCacheMu.Lock()
+	for k := range ftsDocCache {
+		if k.tenant == tenant && k.table == table {
+			delete(ftsDocCache, k)
+		}
+	}
+	ftsDocCacheMu.Unlock()
+
+	suffix := "/" + strings.ToLower(tenant) + "/" + strings.ToLower(table)
+	ftsRegistryMu.Lock()
+	for k := range ftsRegistry {
+		if strings.HasSuffix(k, suffix) {
+			delete(ftsRegistry, k)
+		}
+	}
+	ftsRegistryMu.Unlock()
+}
 
 func ftsColsCacheKey(cols []int) string {
 	var b strings.Builder
@@ -931,6 +965,9 @@ func getFTSDocCache(tenant string, table *storage.Table, cols []int) []ftsCached
 	}
 
 	ftsDocCacheMu.Lock()
+	if _, exists := ftsDocCache[key]; !exists {
+		evictOverCap(ftsDocCache, ftsDocCacheMaxEntries)
+	}
 	ftsDocCache[key] = ftsDocCacheEntry{table: table, version: table.Version, docs: docs}
 	ftsDocCacheMu.Unlock()
 	return docs
@@ -1031,6 +1068,13 @@ func (f *FTSSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 	}
 
 	node := ftsParseQuery(query)
+	if node == nil {
+		// Empty or all-stopword query matches nothing. Without this guard every
+		// valid document scores 0 (ftsScoreNode(nil,...) == 0) and k arbitrary
+		// rows would be injected into the caller's RAG context window.
+		resultCols := append(colNames(table.Cols), "_fts_score", "_fts_rank")
+		return &ResultSet{Cols: resultCols, Rows: []Row{}}, nil
+	}
 	docs := getFTSDocCache(tenant, table, searchCols)
 
 	type scored struct {

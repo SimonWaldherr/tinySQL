@@ -6,8 +6,11 @@
 package tinysql
 
 import (
+	"encoding/hex"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/engine"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -1016,13 +1019,46 @@ func createTableToSQL(c *engine.CreateTable) string {
 	return sb.String()
 }
 
+// literalToSQL renders a literal value as valid, re-parseable SQL, mirroring
+// the driver's parameter encoding: single-quoted and escaped strings, X'..'
+// blobs, quoted RFC3339 timestamps, bare numerics/bools, and NULL. Without
+// this, string/blob/time literals in ToSQL output were unquoted and unescaped
+// (e.g. WHERE name = O'Brien), i.e. syntactically invalid SQL.
+func literalToSQL(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return "NULL"
+	case string:
+		return "'" + strings.ReplaceAll(x, "'", "''") + "'"
+	case []byte:
+		return "X'" + hex.EncodeToString(x) + "'"
+	case time.Time:
+		return "'" + x.Format(time.RFC3339Nano) + "'"
+	case bool:
+		if x {
+			return "TRUE"
+		}
+		return "FALSE"
+	case float32:
+		return strconv.FormatFloat(float64(x), 'f', -1, 32)
+	case float64:
+		return strconv.FormatFloat(x, 'f', -1, 64)
+	case int:
+		return strconv.Itoa(x)
+	case int64:
+		return strconv.FormatInt(x, 10)
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
 func exprToSQL(e engine.Expr) string {
 	if e == nil {
 		return "NULL"
 	}
 	switch ex := e.(type) {
 	case *engine.Literal:
-		return fmt.Sprintf("%v", ex.Val)
+		return literalToSQL(ex.Val)
 	case *engine.VarRef:
 		return ex.Name
 	case *engine.Binary:
@@ -1041,6 +1077,12 @@ func exprToSQL(e engine.Expr) string {
 		for i, arg := range ex.Args {
 			if i > 0 {
 				sb.WriteString(", ")
+			}
+			// The star in COUNT(*) is carried as a "*" string literal; render it
+			// bare rather than quoting it as a string value.
+			if lit, ok := arg.(*engine.Literal); ok && lit.Val == "*" {
+				sb.WriteString("*")
+				continue
 			}
 			sb.WriteString(exprToSQL(arg))
 		}

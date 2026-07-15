@@ -573,8 +573,19 @@ func (f *VecSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 		searchCtx = env.ctx
 	}
 	started := time.Now()
-	key := vecQueryKey(tenant, table.Name, a.colName, table.Version, a)
-	scoredRowsOrdered, cacheHit := getVecQueryCache(key)
+	// Only hash the query vector (SHA-256 over every element) when the opt-in
+	// result cache is actually enabled; it is off by default, so the common
+	// path skips the hash entirely.
+	cacheEnabled := vecQueryCacheEnabled()
+	var (
+		key               vecQueryCacheKey
+		scoredRowsOrdered []vecScoredRow
+		cacheHit          bool
+	)
+	if cacheEnabled {
+		key = vecQueryKey(tenant, table.Name, a.colName, table.Version, a)
+		scoredRowsOrdered, cacheHit = getVecQueryCache(key)
+	}
 	if !cacheHit {
 		cache := getVecColumnCache(tenant, table, vecColIdx, a.metric == "cosine")
 		distFn := buildVecDistanceFunc(a.metric, a.queryVec, queryNorm, cache)
@@ -582,7 +593,9 @@ func (f *VecSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 		if err != nil {
 			return nil, err
 		}
-		putVecQueryCache(key, scoredRowsOrdered)
+		if cacheEnabled {
+			putVecQueryCache(key, scoredRowsOrdered)
+		}
 	}
 	recordVecQuery(VectorQueryEvent{At: time.Now(), Table: table.Name, Column: a.colName, Metric: a.metric, Index: a.indexMode, K: a.k, CacheHit: cacheHit, Duration: time.Since(started)})
 

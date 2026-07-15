@@ -191,7 +191,7 @@ func NewLRUQueue() *LRUQueue {
 // Put adds or updates a table in the buffer pool.
 func (bp *BufferPool) Put(tenant, name string, table *Table) error {
 	tableSize := EstimateTableSize(table)
-	key := fmt.Sprintf("%s:%s", tenant, name)
+	key := tenant + ":" + name
 
 	// Check if table is pinned or should be ignored
 	pinned := bp.isPinned(name)
@@ -285,7 +285,7 @@ func (bp *BufferPool) Put(tenant, name string, table *Table) error {
 
 // Get retrieves a table from the buffer pool.
 func (bp *BufferPool) Get(tenant, name string) (*Table, bool) {
-	key := fmt.Sprintf("%s:%s", tenant, name)
+	key := tenant + ":" + name
 
 	bp.mu.RLock()
 	tenantCache, tenantExists := bp.cache[tenant]
@@ -320,7 +320,7 @@ func (bp *BufferPool) Get(tenant, name string) (*Table, bool) {
 
 // Remove removes a table from the buffer pool.
 func (bp *BufferPool) Remove(tenant, name string) {
-	key := fmt.Sprintf("%s:%s", tenant, name)
+	key := tenant + ":" + name
 
 	bp.mu.Lock()
 	defer bp.mu.Unlock()

@@ -37,6 +37,24 @@ func TestFTSSearchDefaultSearchesWholeRow(t *testing.T) {
 	expectInt(t, rs.Rows[0]["id"], 42, "id")
 }
 
+func TestFTSSearchEmptyQueryMatchesNothing(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+	Execute(ctx, db, "default", mustParse(`CREATE TABLE docs (id INT, body TEXT)`))
+	Execute(ctx, db, "default", mustParse(`INSERT INTO docs VALUES (1, 'hello world')`))
+	Execute(ctx, db, "default", mustParse(`INSERT INTO docs VALUES (2, 'the quick brown fox')`))
+
+	// An empty or whitespace-only query carries no searchable terms. It must
+	// return zero rows, not k arbitrary rows scored 0 (which would silently
+	// poison a RAG context window).
+	for _, q := range []string{``, `   `} {
+		rs := execSQL(t, db, `SELECT * FROM FTS_SEARCH('docs', '`+q+`', 5)`)
+		if len(rs.Rows) != 0 {
+			t.Fatalf("query %q: expected 0 rows, got %d", q, len(rs.Rows))
+		}
+	}
+}
+
 func TestFTSSearchExplicitColumnsStillWork(t *testing.T) {
 	db := storage.NewDB()
 	ctx := context.Background()

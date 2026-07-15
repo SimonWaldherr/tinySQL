@@ -500,12 +500,19 @@ func statsNumber(value any) (float64, bool) {
 // MarkDirtyFrom records the first row index that was modified. If an earlier
 // index is already set, it is kept. Use -1 for non-append mutations (UPDATE,
 // DELETE) to force a full-table WAL entry.
+//
+// The -1 (full-table) sentinel is sticky: once a mutation within a transaction
+// forces a full-table entry, a later append-only INSERT must not downgrade it
+// to a delta, or the earlier UPDATE/DELETE would be lost on WAL recovery.
 func (t *Table) MarkDirtyFrom(idx int) {
 	if idx < 0 {
 		t.dirtyFrom = -1
 		return
 	}
-	if t.dirtyFrom >= 0 && t.dirtyFrom <= idx {
+	if t.dirtyFrom < 0 {
+		return // full-table WAL entry already forced; keep the sentinel
+	}
+	if t.dirtyFrom <= idx {
 		return // already tracking earlier rows
 	}
 	t.dirtyFrom = idx

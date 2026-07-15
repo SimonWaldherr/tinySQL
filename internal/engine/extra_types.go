@@ -172,7 +172,18 @@ func evalHashFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return nil, nil
 	}
 	alg := strings.ToLower(fmt.Sprintf("%v", algVal))
-	data := []byte(fmt.Sprintf("%v", textVal))
+	// Hash the actual bytes. fmt.Sprintf("%v", []byte{...}) renders a decimal
+	// list ("[104 105]"), so a BLOB would otherwise be hashed as that text
+	// rather than its bytes, yielding a digest of the wrong data.
+	var data []byte
+	switch v := textVal.(type) {
+	case []byte:
+		data = v
+	case string:
+		data = []byte(v)
+	default:
+		data = []byte(fmt.Sprintf("%v", textVal))
+	}
 
 	switch alg {
 	case "md5":

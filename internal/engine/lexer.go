@@ -195,9 +195,10 @@ func (lx *lexer) tokenizeQuotedIdent(start int) token {
 	return token{Typ: tIdent, Val: val.String(), Pos: start}
 }
 
-// Helper: tokenize numeric literals
+// Helper: tokenize numeric literals. The token is a contiguous run in the
+// source, so it is returned as a zero-copy substring rather than accumulated
+// into a strings.Builder (digits and '.' are single-byte, so lx.pos++ is safe).
 func (lx *lexer) tokenizeNumber(start int) token {
-	var val strings.Builder
 	dot := false
 	for lx.pos < len(lx.s) {
 		ch := lx.peek()
@@ -205,32 +206,31 @@ func (lx *lexer) tokenizeNumber(start int) token {
 			if ch == '.' {
 				dot = true
 			}
-			val.WriteRune(ch)
 			lx.pos++
 		} else {
 			break
 		}
 	}
-	return token{Typ: tNumber, Val: val.String(), Pos: start}
+	return token{Typ: tNumber, Val: lx.s[start:lx.pos], Pos: start}
 }
 
-// Helper: tokenize identifiers and keywords
+// Helper: tokenize identifiers and keywords. Like tokenizeNumber, the token is
+// a contiguous source run returned as a zero-copy substring; the rune width w
+// keeps multi-byte Unicode identifiers correct.
 func (lx *lexer) tokenizeIdentOrKeyword(start int) token {
-	var val strings.Builder
 	for lx.pos < len(lx.s) {
 		ch, w := utf8.DecodeRuneInString(lx.s[lx.pos:])
 		if unicode.IsLetter(ch) || unicode.IsDigit(ch) || ch == '_' || ch == '.' {
-			val.WriteRune(ch)
 			lx.pos += w
 		} else {
 			break
 		}
 	}
-	up := upper(val.String())
-	if isKeyword(up) {
+	val := lx.s[start:lx.pos]
+	if up := upper(val); isKeyword(up) {
 		return token{Typ: tKeyword, Val: up, Pos: start}
 	}
-	return token{Typ: tIdent, Val: val.String(), Pos: start}
+	return token{Typ: tIdent, Val: val, Pos: start}
 }
 
 // Helper: tokenize symbols and operators

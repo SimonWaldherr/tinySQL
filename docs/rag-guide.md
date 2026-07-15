@@ -40,8 +40,12 @@ db.ExecContext(ctx, `INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?)`,
     docID, idx, chunkText, createdAt, quality, vec)
 ```
 
-For memory-constrained setups, `VEC_TO_BYTES`/`VEC_FROM_BYTES` round-trip
-vectors through a compact float32 encoding at half the storage cost.
+`VEC_TO_BYTES`/`VEC_FROM_BYTES` round-trip vectors through a compact float32
+encoding — half the size of `float64` *on the wire*, which is useful as a
+portable serialization/interchange format for export or transport. Note the
+current `VEC_TO_BYTES` output is a hex string, so storing it in a `TEXT` column
+is **not** smaller than a native `VECTOR`; treat it as an interchange format,
+not an in-table memory optimization.
 
 ## 2. Retrieve: VEC_SEARCH
 
@@ -137,12 +141,20 @@ LEFT JOIN (SELECT doc_id, chunk_index, _vec_rank
            FROM VEC_SEARCH('chunks', 'embedding', VEC_FROM_JSON('[0.1, 0.0, 0.9]'), 20, 'cosine')) v
     ON v.doc_id = c.doc_id AND v.chunk_index = c.chunk_index
 LEFT JOIN (SELECT doc_id, chunk_index, _fts_rank
-           FROM FTS_SEARCH('chunks', 'hnsw index build', 20)) f
+           FROM FTS_SEARCH('chunks', 'hnsw index build', 20, 'chunk_text')) f
     ON f.doc_id = c.doc_id AND f.chunk_index = c.chunk_index
 WHERE v.doc_id IS NOT NULL OR f.doc_id IS NOT NULL
 ORDER BY rrf_score DESC
 LIMIT 5;
 ```
+
+Always pass the text column(s) to `FTS_SEARCH` explicitly (the trailing
+`'chunk_text'` above). With no column list it searches *every* column,
+including the `embedding` VECTOR — tokenizing thousands of float values into
+the index, wasting memory and polluting ranking. Also note that `FTS_SEARCH`
+treats adjacent terms as an implicit **AND**, so a verbose natural-language
+question can match nothing; for question-style input, OR-expand the terms
+(e.g. `'error OR timeout OR retry'`) or keep queries to the key terms.
 
 For a lighter variant, retrieve by vector and rerank with the scalar
 `FTS_RANK` (BM25) inside one CTE:

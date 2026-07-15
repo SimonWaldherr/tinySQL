@@ -58,6 +58,11 @@ func executeDropTable(env ExecEnv, s *DropTable) (*ResultSet, error) {
 			tenant = "default"
 		}
 		purgeVectorCachesFor(tenant, t.Name)
+		// Also drop the query-result cache and FTS caches for this table.
+		// Otherwise a DROP + recreate can serve stale top-K row IDs (wrong
+		// rows, or a panic on an out-of-range index) and leak FTS memory.
+		purgeVecQueryCacheFor(tenant, t.Name)
+		purgeFTSCachesFor(tenant, t.Name)
 		env.db.Catalog().DeleteIndexesForTable(s.Name)
 	}
 	return nil, env.db.Drop(env.tenant, s.Name)

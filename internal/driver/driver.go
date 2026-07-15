@@ -373,12 +373,16 @@ type connector struct {
 	driver *drv
 	cfg    cfg
 
-	once sync.Once
-	srv  *server
-	err  error
+	once       sync.Once
+	srv        *server
+	ownsServer bool // true when this connector opened srv.db and must close it
+	err        error
 }
 
-var _ driver.Connector = (*connector)(nil)
+var (
+	_ driver.Connector = (*connector)(nil)
+	_ io.Closer        = (*connector)(nil)
+)
 
 // serverOpenHook is intentionally package-private test instrumentation. It
 // observes actual storage.DB construction without becoming a production API.
@@ -495,7 +499,20 @@ func (c *connector) openServer() (*server, error) {
 		return nil, err
 	}
 	notifyServerOpen(db, c.cfg)
+	c.ownsServer = true
 	return newServer(db, c.cfg), nil
+}
+
+// Close releases the storage.DB this connector opened. database/sql invokes it
+// from sql.DB.Close() because *connector implements io.Closer; without it the
+// underlying DB (and any paged-index/WAL file handles or job scheduler) would
+// leak until process exit. The default-DSN path returns a driver-owned server,
+// which this connector does not own and must not close.
+func (c *connector) Close() error {
+	if !c.ownsServer || c.srv == nil || c.srv.db == nil {
+		return nil
+	}
+	return c.srv.db.Close()
 }
 
 // ------------------- connection / transactions -------------------
@@ -911,6 +928,26 @@ func writeTargetTable(st engine.Statement) string {
 	}
 }
 
+// affectedRows extracts the affected-row count from an UPDATE/DELETE result.
+// The engine returns a single {countCell: n} row for the plain form; a
+// RETURNING clause instead projects one row per affected row.
+func affectedRows(rs *engine.ResultSet, countCell string) int64 {
+	if rs == nil {
+		return 0
+	}
+	if len(rs.Rows) == 1 && len(rs.Cols) == 1 && rs.Cols[0] == countCell {
+		switch n := rs.Rows[0][countCell].(type) {
+		case int:
+			return int64(n)
+		case int64:
+			return n
+		case float64:
+			return int64(n)
+		}
+	}
+	return int64(len(rs.Rows))
+}
+
 func (c *conn) execStatement(ctx context.Context, st engine.Statement) (driver.Result, error) {
 	// Only SELECT/EXPLAIN/PRAGMA are guaranteed read-only. Treat every other
 	// parsed statement as a write for connection scheduling so DDL, indexes,
@@ -925,11 +962,13 @@ func (c *conn) execStatement(ctx context.Context, st engine.Statement) (driver.R
 		if c.srv.db.IsReadOnly() || (c.inTx && c.txReadOnly) {
 			return nil, fmt.Errorf("tinysql: write attempted in read-only transaction")
 		}
+		var rs *engine.ResultSet
 		if c.inTx {
-			_, err := engine.Execute(ctx, c.currentDB(), c.tenant, st)
+			r, err := engine.Execute(ctx, c.currentDB(), c.tenant, st)
 			if err != nil {
 				return nil, err
 			}
+			rs = r
 		} else {
 			if err := c.srv.acquireWriter(ctx); err != nil {
 				return nil, err
@@ -946,7 +985,7 @@ func (c *conn) execStatement(ctx context.Context, st engine.Statement) (driver.R
 				// entire database. All other tables are shared by reference.
 				target := writeTargetTable(st)
 				shadow := base.ShallowCloneForTable(c.tenant, target)
-				if _, err = engine.Execute(ctx, shadow, c.tenant, st); err != nil {
+				if rs, err = engine.Execute(ctx, shadow, c.tenant, st); err != nil {
 					return nil, err
 				}
 				changes := storage.CollectWALChanges(base, shadow)
@@ -963,18 +1002,20 @@ func (c *conn) execStatement(ctx context.Context, st engine.Statement) (driver.R
 					}
 				}
 			} else {
-				if _, err = engine.Execute(ctx, base, c.tenant, st); err != nil {
+				if rs, err = engine.Execute(ctx, base, c.tenant, st); err != nil {
 					return nil, err
 				}
 			}
 			c.srv.saveIfNeeded()
 		}
-		// Result-Affected Rows: nur für UPDATE/DELETE (Engine liefert es)
-		if ud, ok := st.(*engine.Update); ok && ud != nil {
-			return driver.RowsAffected(0), nil
-		}
-		if dl, ok := st.(*engine.Delete); ok && dl != nil {
-			return driver.RowsAffected(0), nil
+		// Report affected rows for UPDATE/DELETE. The engine returns a single
+		// {updated|deleted: n} cell for the plain form; a RETURNING clause
+		// projects one row per affected row. INSERT has no engine-side count.
+		switch st.(type) {
+		case *engine.Update:
+			return driver.RowsAffected(affectedRows(rs, "updated")), nil
+		case *engine.Delete:
+			return driver.RowsAffected(affectedRows(rs, "deleted")), nil
 		}
 		return driver.RowsAffected(0), nil
 	}
@@ -1332,7 +1373,9 @@ func (r *rows) Next(dest []driver.Value) error {
 		case string:
 			dest[i] = vv
 		case time.Time:
-			dest[i] = vv.Format(time.RFC3339)
+			// RFC3339Nano to match the bind path (CheckNamedValue), so sub-second
+			// precision survives a bind -> store -> scan round trip.
+			dest[i] = vv.Format(time.RFC3339Nano)
 		case []byte:
 			// database/sql callers may retain Scan destinations; return an owned
 			// slice just as the standard drivers do for binary columns.
@@ -1460,9 +1503,11 @@ func sqlLiteral(v any) string {
 	case int64:
 		return strconv.FormatInt(x, 10)
 	case float32:
-		return strconv.FormatFloat(float64(x), 'g', -1, 32)
+		// 'f' (not 'g') so small/large magnitudes never render in scientific
+		// notation (e.g. 1e-05), which the SQL lexer cannot tokenize.
+		return strconv.FormatFloat(float64(x), 'f', -1, 32)
 	case float64:
-		return strconv.FormatFloat(x, 'g', -1, 64)
+		return strconv.FormatFloat(x, 'f', -1, 64)
 	case bool:
 		if x {
 			return "TRUE"

@@ -6,7 +6,12 @@ This guide explains how to embed TinySQL in three common setups:
 2. Browser/WASM applications
 3. Custom web frontends that talk to a WASM-backed TinySQL runtime
 
-It is based on the repo examples in `example_test.go`, `import_example_test.go`, `cmd/demo`, `cmd/query_files_wasm`, and `cmd/wasm_browser`.
+It is based on the repo examples in `example_test.go`, `import_example_test.go`, `cmd/demo`, `cmd/ragdemo`, `cmd/query_files_wasm`, and `cmd/wasm_browser`.
+
+> **Vector search & RAG:** TinySQL is also a first-class retrieval backend
+> (vector k-NN, BM25 full-text, hybrid retrieval, RAG context expansion). If
+> you are embedding it for AI/RAG, start with the
+> [RAG / AI usage guide](./rag-guide.md) and the runnable `cmd/ragdemo`.
 
 ## Deutsch
 

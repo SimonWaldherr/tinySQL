@@ -60,7 +60,7 @@ func TestBuilderCTEAndStatementRendering(t *testing.T) {
 		Values(Val(1), Val("Ada"), Val(true)).
 		Values(Val(2), Null(), Val(false)).
 		Build()
-	if got, want := ToSQL(insert), "INSERT INTO users (id, name, active) VALUES (1, Ada, true), (2, <nil>, false)"; got != want {
+	if got, want := ToSQL(insert), "INSERT INTO users (id, name, active) VALUES (1, 'Ada', TRUE), (2, NULL, FALSE)"; got != want {
 		t.Fatalf("insert SQL = %q, want %q", got, want)
 	}
 
@@ -101,18 +101,18 @@ func TestBuilderExpressionsToSQL(t *testing.T) {
 		expr ExprBuilder
 		want string
 	}{
-		{"and empty", And(), "true"},
+		{"and empty", And(), "TRUE"},
 		{"and single", And(Eq(Col("a"), Val(1))), "(a = 1)"},
-		{"or empty", Or(), "false"},
+		{"or empty", Or(), "FALSE"},
 		{"or single", Or(Eq(Col("a"), Val(1))), "(a = 1)"},
 		{"or multi", Or(Eq(Col("a"), Val(1)), Lt(Col("b"), Val(2)), Eq(Col("c"), Val(3))), "(((a = 1) OR (b < 2)) OR (c = 3))"},
 		{"not", Not(Eq(Col("a"), Val(1))), "NOT ((a = 1))"},
 		{"is null", IsNull(Col("a")), "(a IS NULL)"},
 		{"arithmetic", Div(Mul(Sub(Add(Col("a"), Val(2)), Val(3)), Val(4)), Val(5)), "((((a + 2) - 3) * 4) / 5)"},
 		{"aggregates", Coalesce(Count(Col("id")), Sum(Col("score")), Avg(Col("score")), Min(Col("score")), Max(Col("score"))), "COALESCE(COUNT(id), SUM(score), AVG(score), MIN(score), MAX(score))"},
-		{"strings", Concat(Lower(Col("first")), Val(" "), Upper(Col("last"))), "CONCAT(LOWER(first),  , UPPER(last))"},
+		{"strings", Concat(Lower(Col("first")), Val(" "), Upper(Col("last"))), "CONCAT(LOWER(first), ' ', UPPER(last))"},
 		{"hashes", Coalesce(MD5(Col("a")), SHA1(Col("b")), SHA256(Col("c")), SHA512(Col("d"))), "COALESCE(MD5(a), SHA1(b), SHA256(c), SHA512(d))"},
-		{"literal nil", Null(), "<nil>"},
+		{"literal nil", Null(), "NULL"},
 	}
 
 	for _, tc := range tests {

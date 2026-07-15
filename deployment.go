@@ -162,14 +162,23 @@ func OpenEnterprise(cfg StorageConfig, tenant string) (*Instance, error) {
 
 // ExecuteSQL parses and executes one SQL statement against the instance tenant.
 func (i *Instance) ExecuteSQL(ctx context.Context, sql string) (*ResultSet, error) {
-	if i == nil || i.DB == nil {
+	if i == nil {
+		return nil, fmt.Errorf("nil tinySQL instance")
+	}
+	// Snapshot the DB pointer under the same lock Start/Stop use to mutate it,
+	// then release before executing so concurrent queries are not serialized
+	// and a concurrent Restart cannot swap the DB out from under us.
+	i.mu.Lock()
+	db, tenant := i.DB, i.Tenant
+	i.mu.Unlock()
+	if db == nil {
 		return nil, fmt.Errorf("nil tinySQL instance")
 	}
 	stmt, err := ParseSQL(sql)
 	if err != nil {
 		return nil, err
 	}
-	return Execute(ctx, i.DB, i.Tenant, stmt)
+	return Execute(ctx, db, tenant, stmt)
 }
 
 // Start opens the configured DB if the instance is stopped.
@@ -234,6 +243,8 @@ func (i *Instance) Stop() error {
 	i.mu.Lock()
 	db := i.DB
 	i.mu.Unlock()
+	// Keep i.DB pointing at the closed DB (do not nil it) so Health() can still
+	// report the closed snapshot (Closed, LastCloseAt); Start() replaces it.
 	if db == nil {
 		return nil
 	}
@@ -253,10 +264,16 @@ func (i *Instance) Restart() error {
 
 // Health returns a production-oriented status snapshot for the instance.
 func (i *Instance) Health() DBHealth {
-	if i == nil || i.DB == nil {
+	if i == nil {
 		return DBHealth{OK: false, Error: "nil tinySQL instance"}
 	}
-	return i.DB.HealthCheck()
+	i.mu.Lock()
+	db := i.DB
+	i.mu.Unlock()
+	if db == nil {
+		return DBHealth{OK: false, Error: "nil tinySQL instance"}
+	}
+	return db.HealthCheck()
 }
 
 // Close releases instance resources.

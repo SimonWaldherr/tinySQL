@@ -172,6 +172,28 @@ func TestWriteQuery_PermitsInsert(t *testing.T) {
 	}
 }
 
+// TestWriteQuery_RejectsDDL guards the least-privilege contract: write_query is
+// for row-level mutation only, so DDL (DROP/CREATE/ALTER) must be rejected and
+// routed through the dedicated create_table tool instead.
+func TestWriteQuery_RejectsDDL(t *testing.T) {
+	s := New(openTestStore(t))
+	mustExec(t, s, "CREATE TABLE ddl_guard (id INT)")
+	for _, q := range []string{
+		"DROP TABLE ddl_guard",
+		"CREATE TABLE via_write (id INT)",
+		"ALTER TABLE ddl_guard ADD COLUMN name TEXT",
+		"CREATE VIEW v AS SELECT * FROM ddl_guard",
+	} {
+		res, err := s.HandleWriteQuery(context.Background(), WriteQueryArgs{Query: q})
+		if err != nil {
+			t.Fatalf("%q: unexpected Go error: %v", q, err)
+		}
+		if !res.IsError {
+			t.Errorf("write_query should reject DDL %q", q)
+		}
+	}
+}
+
 // ─── create_table tests ───────────────────────────────────────────────────────
 
 func TestCreateTable_PermitsCreateTable(t *testing.T) {

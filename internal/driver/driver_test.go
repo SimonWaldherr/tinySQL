@@ -1228,5 +1228,42 @@ func TestSqlLiteralEscaping(t *testing.T) {
 	}
 }
 
+// TestDriverRowsAffectedForUpdateDelete verifies the database/sql contract:
+// Result.RowsAffected() must report the number of rows changed by UPDATE and
+// DELETE (previously the driver always returned 0, silently misleading ORMs
+// and migration tools).
+func TestDriverRowsAffectedForUpdateDelete(t *testing.T) {
+	db, err := sql.Open("tinysql", "mem://?tenant=rows_affected")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`CREATE TABLE t (id INT, v INT)`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 5; i++ {
+		if _, err := db.Exec(`INSERT INTO t VALUES (?, ?)`, i, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	res, err := db.Exec(`UPDATE t SET v = 1 WHERE id <= 3`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 3 {
+		t.Fatalf("UPDATE RowsAffected()=%d (err %v), want 3", n, err)
+	}
+
+	res, err = db.Exec(`DELETE FROM t WHERE id <= 2`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 2 {
+		t.Fatalf("DELETE RowsAffected()=%d (err %v), want 2", n, err)
+	}
+}
+
 // tiny helper to quiet unused imports during incremental edits
 var _ = fmt.Sprintf

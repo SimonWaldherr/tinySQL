@@ -131,6 +131,14 @@ func VectorCacheAnalytics() VectorCacheStats {
 	return stats
 }
 
+// vecQueryCacheEnabled reports whether the opt-in result cache is active. When
+// it is off (the default), the search path skips hashing the query vector.
+func vecQueryCacheEnabled() bool {
+	vecQueryCacheState.Lock()
+	defer vecQueryCacheState.Unlock()
+	return vecQueryCacheState.cfg.ResultCacheEntries > 0 && vecQueryCacheState.cfg.ResultCacheTTL > 0
+}
+
 func vecQueryKey(tenant string, tableName, colName string, version int, a vecSearchArgs) vecQueryCacheKey {
 	h := sha256.New()
 	var bits [8]byte

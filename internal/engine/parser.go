@@ -3641,7 +3641,10 @@ func (p *Parser) parseUnary() (Expr, error) {
 	if p.cur.Typ == tSymbol && (p.cur.Val == "+" || p.cur.Val == "-") {
 		op := p.cur.Val
 		p.next()
-		e, err := p.parsePrimary()
+		// Recurse into parseUnary so stacked prefix operators chain, e.g.
+		// `- -1` or `- +x`. Precedence relative to * / + is unaffected because
+		// parseMulDiv still enters operands through parseUnary.
+		e, err := p.parseUnary()
 		if err != nil {
 			return nil, err
 		}
@@ -3664,9 +3667,14 @@ func (p *Parser) parsePrimary() (Expr, error) {
 	case tNumber:
 		val := p.cur.Val
 		p.next()
-		// Try int first (most common), fall back to float
+		// Try platform int first (most common). Fall back to int64 before float
+		// so integers that exceed a 32-bit int (on wasm32/TinyGo) keep exact
+		// integer semantics instead of silently becoming float64.
 		if n, err := strconv.Atoi(val); err == nil {
 			return &Literal{Val: n}, nil
+		}
+		if n64, err := strconv.ParseInt(val, 10, 64); err == nil {
+			return &Literal{Val: n64}, nil
 		}
 		f, _ := strconv.ParseFloat(val, 64)
 		return &Literal{Val: f}, nil
@@ -4064,9 +4072,11 @@ func (p *Parser) parseFrameBound() (string, int, error) {
 		value := p.cur.Val
 		p.next()
 
-		// Parse the value as integer
-		var n int
-		if _, err := fmt.Sscanf(value, "%d", &n); err != nil {
+		// Parse the value as an integer. strconv.Atoi is allocation-free and,
+		// unlike fmt.Sscanf("%d"), rejects a fractional token like "1.5" rather
+		// than silently truncating it to 1.
+		n, err := strconv.Atoi(value)
+		if err != nil {
 			return "", 0, p.errf("invalid frame offset: %s", value)
 		}
 

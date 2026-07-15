@@ -94,6 +94,9 @@ func TestSecondaryIndexUniqueInvalidationAndSnapshotPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Close releases the WAL handle LoadFromFile attaches; without this the
+	// TempDir cleanup fails on Windows (file in use).
+	defer reopened.Close()
 	table, err := reopened.Get("default", "map")
 	if err != nil {
 		t.Fatal(err)

@@ -104,8 +104,12 @@ func (s *Server) HandleWriteQuery(ctx context.Context, args WriteQueryArgs) (*mc
 		return toolErrorf("server is in read-only mode")
 	}
 
+	// Only row-level mutations. isMutating() also returns true for DDL
+	// (CREATE/DROP/ALTER), which must go through the dedicated, separately
+	// gated create_table tool — otherwise write_query could destroy schema
+	// despite advertising row-level mutation only.
 	kind := classifySQL(args.Query)
-	if !kind.isMutating() {
+	if kind != kindInsert && kind != kindUpdate && kind != kindDelete {
 		return toolErrorf("write_query only accepts INSERT, UPDATE, or DELETE statements; got %s", describeKind(kind))
 	}
 
@@ -143,8 +147,10 @@ func (s *Server) HandleCreateTable(ctx context.Context, args CreateTableArgs) (*
 
 // HandleListTables returns all tables visible to the current tenant.
 func (s *Server) HandleListTables(ctx context.Context) (*mcp.CallToolResult, error) {
-	q := `SELECT tenant, name, columns, rows, is_temp FROM sys.tables ORDER BY tenant, name`
-	rows, cols, _, err := s.queryRows(ctx, q)
+	// sys.tables spans every tenant; scope to this connection's tenant so the
+	// agent only sees tables it can actually query.
+	q := `SELECT tenant, name, columns, rows, is_temp FROM sys.tables WHERE tenant = ? ORDER BY tenant, name`
+	rows, cols, _, err := s.queryRowsArgs(ctx, q, s.store.Tenant)
 	if err != nil {
 		// sys.tables unavailable; fall back to a best-effort approach.
 		return toolErrorf("list_tables failed: %v", err)
@@ -162,8 +168,11 @@ func (s *Server) HandleDescribeTable(ctx context.Context, args DescribeTableArgs
 		return toolErrorf("invalid table name: %q", name)
 	}
 
-	q := `SELECT name, position, data_type, constraint, fk_table, fk_column FROM sys.columns WHERE table_name = ? ORDER BY position`
-	rows, cols, _, err := s.queryRowsArgs(ctx, q, name)
+	// Scope to this connection's tenant: sys.columns spans all tenants, so a
+	// same-named table under another tenant would otherwise interleave its
+	// columns (duplicate positions) into the result.
+	q := `SELECT name, position, data_type, constraint, fk_table, fk_column FROM sys.columns WHERE table_name = ? AND tenant = ? ORDER BY position`
+	rows, cols, _, err := s.queryRowsArgs(ctx, q, name, s.store.Tenant)
 	if err != nil {
 		return toolErrorf("describe_table failed: %v", err)
 	}
@@ -350,8 +359,9 @@ func (s *Server) buildAgentContextFallback(ctx context.Context, maxTables, maxCh
 		if len(tables) == 0 {
 			write("tables: none")
 		} else {
-			colRows, _, _, _ := s.queryRows(ctx, `SELECT tenant, table_name, name, position, data_type, constraint FROM sys.columns ORDER BY tenant, table_name, position`)
+			colRows, _, _, _ := s.queryRows(ctx, `SELECT tenant, table_name, name, position, data_type, constraint, fk_table, fk_column FROM sys.columns ORDER BY tenant, table_name, position`)
 			colMap := map[string][]string{}
+			var relations []string
 			for _, r := range colRows {
 				tname := fmt.Sprintf("%v", nullStr(r["table_name"]))
 				cname := fmt.Sprintf("%v", nullStr(r["name"]))
@@ -362,6 +372,12 @@ func (s *Server) buildAgentContextFallback(ctx context.Context, maxTables, maxCh
 					desc += " pk"
 				}
 				colMap[tname] = append(colMap[tname], desc)
+				// Emit foreign-key relations so the agent can author JOINs; the
+				// canonical BuildAgentContext includes these and this fallback
+				// previously dropped them.
+				if fkTable := fmt.Sprintf("%v", nullStr(r["fk_table"])); fkTable != "" {
+					relations = append(relations, fmt.Sprintf("%s.%s -> %s.%s", tname, cname, fkTable, fmt.Sprintf("%v", nullStr(r["fk_column"]))))
+				}
 			}
 
 			parts := make([]string, 0, len(tables))
@@ -381,6 +397,9 @@ func (s *Server) buildAgentContextFallback(ctx context.Context, maxTables, maxCh
 				parts = append(parts, fmt.Sprintf("%s rows=%s cols=%s%s [%s]", label, t.rows, t.columns, temp, colList))
 			}
 			write(fmt.Sprintf("tables(%d): %s", len(parts), strings.Join(parts, " | ")))
+			if len(relations) > 0 {
+				write(fmt.Sprintf("relations(%d): %s", len(relations), strings.Join(relations, ", ")))
+			}
 		}
 	} else {
 		write(fmt.Sprintf("tables: unavailable (%v)", err))

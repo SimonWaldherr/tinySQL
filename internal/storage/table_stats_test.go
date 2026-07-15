@@ -22,6 +22,9 @@ func TestTableStatsPersistAcrossSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Close releases the WAL handle LoadFromFile attaches; without this the
+	// TempDir cleanup fails on Windows (file in use).
+	defer reopened.Close()
 	restored, err := reopened.Get("default", "events")
 	if err != nil {
 		t.Fatal(err)
