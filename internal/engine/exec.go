@@ -108,6 +108,10 @@ type ExecEnv struct {
 	// AdvancedWAL emits a single commit only after the outer statement has
 	// completed successfully.
 	statementWAL *statementWAL
+	// foreignKeyActions tracks the active referential-action path. Nested
+	// ON UPDATE/ON DELETE cascades share it so a cyclic reference fails
+	// cleanly instead of recursing until stack exhaustion.
+	foreignKeyActions *foreignKeyActionState
 	// now is the evaluation timestamp for this statement, set once when the
 	// statement begins executing. RECENCY_SCORE/RAG_HYBRID_SCORE/RAG_RANK_SCORE
 	// default to it (via envNow) instead of calling time.Now() per row, so
@@ -1391,7 +1395,7 @@ func resolveFromClause(env ExecEnv, cteEnv ExecEnv, s *Select) ([]Row, error) {
 	}
 
 	if s.From.Subquery != nil {
-		return resolveSubquery(env, s)
+		return resolveSubquery(cteEnv, s)
 	}
 
 	if s.From.TableFunc != nil {
@@ -1458,16 +1462,9 @@ func resolveTableFunc(env ExecEnv, s *Select) ([]Row, error) {
 func resolveTableSource(cteEnv ExecEnv, env ExecEnv, s *Select) ([]Row, error) {
 	// Prefer CTE binding first
 	if cteEnv.ctes != nil {
-		if cteResult, exists := cteEnv.ctes[s.From.Table]; exists {
-			leftRows := make([]Row, len(cteResult.Rows))
-			for i, row := range cteResult.Rows {
-				leftRows[i] = make(Row)
-				for k, v := range row {
-					leftRows[i][k] = v
-					leftRows[i][s.From.Table+"."+k] = v
-				}
-			}
-			return leftRows, nil
+		cteName := strings.ToLower(s.From.Table)
+		if cteResult, exists := cteEnv.ctes[cteName]; exists {
+			return rowsFromCTEResult(cteResult, s.From), nil
 		}
 	}
 
@@ -1487,6 +1484,42 @@ func resolveTableSource(cteEnv ExecEnv, env ExecEnv, s *Select) ([]Row, error) {
 
 	// Treat as a regular table
 	return resolveRegularTable(cteEnv, env, s)
+}
+
+// rowsFromCTEResult materializes a CTE ResultSet as a FROM/JOIN source. It
+// retains unqualified names plus both the CTE name and alias qualifiers, so a
+// CTE behaves identically whether it appears on the left of FROM or right of
+// a JOIN.
+func rowsFromCTEResult(cteResult *ResultSet, source FromItem) []Row {
+	cteName := strings.ToLower(source.Table)
+	qualifier := cteName
+	if source.Alias != "" {
+		qualifier = strings.ToLower(source.Alias)
+	}
+	rows := make([]Row, len(cteResult.Rows))
+	for i, row := range cteResult.Rows {
+		out := make(Row)
+		for _, col := range cteResult.Cols {
+			v, ok := getVal(row, col)
+			if !ok {
+				continue
+			}
+			key := strings.ToLower(col)
+			out[key] = v
+			out[cteName+"."+key] = v
+			out[qualifier+"."+key] = v
+		}
+		rows[i] = out
+	}
+	return rows
+}
+
+func resultSetTable(name string, cols []string) *storage.Table {
+	tableCols := make([]storage.Column, 0, len(cols))
+	for _, col := range cols {
+		tableCols = append(tableCols, storage.Column{Name: col})
+	}
+	return &storage.Table{Name: name, Cols: tableCols}
 }
 
 // resolveCatalogTable handles catalog.* virtual tables
@@ -2060,24 +2093,28 @@ func applySortOrderWithLimit(orderBy []OrderItem, outRows []Row, limit, offset *
 }
 
 func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
-	if rs, ok, err := executeSimpleJoinFastPath(env, s); ok || err != nil {
-		return rs, err
-	}
-	if rs, ok, err := executeSimpleAggregateFastPath(env, s); ok || err != nil {
-		return rs, err
-	}
-	if rs, ok, err := executeSimpleSelectFastPath(env, s); ok || err != nil {
-		return rs, err
-	}
-
-	// Process CTEs first
 	cteEnv, err := processCTEs(env, s)
 	if err != nil {
 		return nil, err
 	}
+	// Fast paths access physical storage directly. A CTE source exists only in
+	// the execution environment, so bypass them whenever FROM/JOIN references
+	// an active CTE; otherwise recursive and chained CTEs are treated as
+	// missing physical tables.
+	if !selectReferencesCTE(cteEnv, s) {
+		if rs, ok, err := executeSimpleJoinFastPath(cteEnv, s); ok || err != nil {
+			return rs, err
+		}
+		if rs, ok, err := executeSimpleAggregateFastPath(cteEnv, s); ok || err != nil {
+			return rs, err
+		}
+		if rs, ok, err := executeSimpleSelectFastPath(cteEnv, s); ok || err != nil {
+			return rs, err
+		}
+	}
 
 	// FROM (Tabelle, CTE oder Subselect) - now optional
-	leftRows, err := resolveFromClause(env, cteEnv, s)
+	leftRows, err := resolveFromClause(cteEnv, cteEnv, s)
 	if err != nil {
 		return nil, err
 	}
@@ -2097,7 +2134,7 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 	}
 
 	// GROUP/HAVING
-	outRows, outCols, err := processGroupByHaving(env, s, filtered)
+	outRows, outCols, err := processGroupByHaving(cteEnv, s, filtered)
 	if err != nil {
 		return nil, err
 	}
@@ -2109,7 +2146,7 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 		// considered "first"; so apply ORDER BY first if present.
 		if len(s.DistinctOn) > 0 {
 			var err error
-			outRows, err = applyDistinctOn(env, s, outRows)
+			outRows, err = applyDistinctOn(cteEnv, s, outRows)
 			if err != nil {
 				return nil, err
 			}
@@ -2132,7 +2169,7 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 
 	if s.Union != nil {
 		var err error
-		resultRows, resultCols, err = processUnionClauses(env, s.Union, resultRows, resultCols)
+		resultRows, resultCols, err = processUnionClauses(cteEnv, s.Union, resultRows, resultCols)
 		if err != nil {
 			return nil, err
 		}
@@ -2142,6 +2179,30 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 		resultCols = columnsFromRows(resultRows)
 	}
 	return &ResultSet{Cols: resultCols, Rows: resultRows}, nil
+}
+
+// selectReferencesCTE reports whether a SELECT needs rows bound in the active
+// CTE environment instead of a physical table lookup.
+func selectReferencesCTE(env ExecEnv, s *Select) bool {
+	if len(env.ctes) == 0 || s == nil {
+		return false
+	}
+	fromReferencesCTE := func(from FromItem) bool {
+		if from.Table == "" {
+			return false
+		}
+		_, ok := env.ctes[strings.ToLower(from.Table)]
+		return ok
+	}
+	if fromReferencesCTE(s.From) {
+		return true
+	}
+	for _, join := range s.Joins {
+		if fromReferencesCTE(join.Right) {
+			return true
+		}
+	}
+	return false
 }
 
 type simpleSelectPlan struct {
@@ -2698,8 +2759,7 @@ func evalJoinRawBinary(plan *simpleJoinPlan, left, right []any, ex *Binary) (any
 type simpleAggregatePlan struct {
 	table      *storage.Table
 	colIndex   map[string]int
-	groupCol   int
-	groupName  string
+	groupCols  []int
 	where      Expr
 	projs      []simpleAggregateProjection
 	outputCols []string
@@ -2720,9 +2780,10 @@ const (
 )
 
 type simpleAggregateProjection struct {
-	name string
-	kind aggKind
-	arg  Expr // nil for the group-by column and for COUNT(*)
+	name       string
+	kind       aggKind
+	arg        Expr // nil for the group-by column and for COUNT(*)
+	groupIndex int  // only used by aggGroupCol
 }
 
 // simpleAggregateState accumulates one group's aggregates directly (SUM as a
@@ -2734,13 +2795,13 @@ type simpleAggregateProjection struct {
 // groups that never see a decimal value, avoiding the allocation entirely
 // for the common all-numeric case.
 type simpleAggregateState struct {
-	groupValue any
-	counts     []int // COUNT result, or non-null sample count for SUM/AVG
-	sumFloat   []float64
-	sumRat     []*big.Rat
-	useRat     []bool
-	minmax     []any
-	haveMinMax []bool
+	groupValues []any
+	counts      []int // COUNT result, or non-null sample count for SUM/AVG
+	sumFloat    []float64
+	sumRat      []*big.Rat
+	useRat      []bool
+	minmax      []any
+	haveMinMax  []bool
 }
 
 func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error) {
@@ -2750,8 +2811,16 @@ func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 	}
 
 	rawPlan := &simpleSelectPlan{colIndex: plan.colIndex, where: plan.where, filter: buildRawFilter(plan.colIndex, plan.where)}
+	if len(plan.groupCols) == 1 {
+		return executeSimpleSingleGroupAggregate(env, plan, rawPlan)
+	}
+	return executeSimpleMultiGroupAggregate(env, plan, rawPlan)
+}
+
+func executeSimpleSingleGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, rawPlan *simpleSelectPlan) (*ResultSet, bool, error) {
 	groups := make(map[any]*simpleAggregateState)
-	order := make([]any, 0)
+	order := make([]*simpleAggregateState, 0)
+	groupCol := plan.groupCols[0]
 	for i, raw := range plan.table.Rows {
 		// Check context cancellation every 64 rows to reduce channel-select overhead.
 		if i&63 == 0 {
@@ -2767,100 +2836,156 @@ func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 			continue
 		}
 
-		groupValue := raw[plan.groupCol]
+		groupValue := raw[groupCol]
 		key := comparableKeyPart(groupValue)
 		state, exists := groups[key]
 		if !exists {
-			state = &simpleAggregateState{
-				groupValue: groupValue,
-				counts:     make([]int, len(plan.projs)),
-				sumFloat:   make([]float64, len(plan.projs)),
-				minmax:     make([]any, len(plan.projs)),
-				haveMinMax: make([]bool, len(plan.projs)),
-			}
+			state = newSimpleAggregateState([]any{groupValue}, len(plan.projs))
 			groups[key] = state
-			order = append(order, key)
+			order = append(order, state)
 		}
-		for i, proj := range plan.projs {
-			switch proj.kind {
-			case aggGroupCol:
+		if err := accumulateSimpleAggregateState(env, rawPlan, raw, state, plan.projs); err != nil {
+			return nil, true, err
+		}
+	}
+	return simpleAggregateResultSet(plan, order), true, nil
+}
+
+func executeSimpleMultiGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, rawPlan *simpleSelectPlan) (*ResultSet, bool, error) {
+	groups := make(map[string]*simpleAggregateState)
+	order := make([]*simpleAggregateState, 0)
+	var keyBuf strings.Builder
+	for rowIdx, raw := range plan.table.Rows {
+		if rowIdx&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, true, err
+			}
+		}
+		match, err := evalRawWhere(rawPlan, raw)
+		if err != nil {
+			return nil, true, err
+		}
+		if !match {
+			continue
+		}
+
+		keyBuf.Reset()
+		for i, groupCol := range plan.groupCols {
+			if i > 0 {
+				keyBuf.WriteByte('\x1f')
+			}
+			writeFmtKeyPart(&keyBuf, raw[groupCol])
+		}
+		key := keyBuf.String()
+		state, exists := groups[key]
+		if !exists {
+			values := make([]any, len(plan.groupCols))
+			for i, groupCol := range plan.groupCols {
+				values[i] = raw[groupCol]
+			}
+			state = newSimpleAggregateState(values, len(plan.projs))
+			groups[key] = state
+			order = append(order, state)
+		}
+		if err := accumulateSimpleAggregateState(env, rawPlan, raw, state, plan.projs); err != nil {
+			return nil, true, err
+		}
+	}
+	return simpleAggregateResultSet(plan, order), true, nil
+}
+
+func newSimpleAggregateState(groupValues []any, projections int) *simpleAggregateState {
+	return &simpleAggregateState{
+		groupValues: groupValues,
+		counts:      make([]int, projections),
+		sumFloat:    make([]float64, projections),
+		minmax:      make([]any, projections),
+		haveMinMax:  make([]bool, projections),
+	}
+}
+
+func accumulateSimpleAggregateState(env ExecEnv, rawPlan *simpleSelectPlan, raw []any, state *simpleAggregateState, projs []simpleAggregateProjection) error {
+	for i, proj := range projs {
+		switch proj.kind {
+		case aggGroupCol:
+			continue
+		case aggCount:
+			if proj.arg == nil {
+				state.counts[i]++
 				continue
-			case aggCount:
-				if proj.arg == nil {
-					state.counts[i]++
-					continue
+			}
+			v, err := evalRawExpr(rawPlan, raw, proj.arg)
+			if err != nil {
+				return err
+			}
+			if v != nil {
+				state.counts[i]++
+			}
+		case aggSum, aggAvg:
+			v, err := evalRawExpr(rawPlan, raw, proj.arg)
+			if err != nil {
+				return err
+			}
+			if v == nil {
+				continue
+			}
+			if f, ok := numeric(v); ok {
+				if state.useRat != nil && state.useRat[i] {
+					state.sumRat[i].Add(state.sumRat[i], new(big.Rat).SetFloat64(f))
+				} else {
+					state.sumFloat[i] += f
 				}
-				v, err := evalRawExpr(rawPlan, raw, proj.arg)
-				if err != nil {
-					return nil, true, err
+				state.counts[i]++
+				continue
+			}
+			if rv, ok := storage.DecimalFromAny(v); ok {
+				if state.useRat == nil {
+					state.useRat = make([]bool, len(projs))
+					state.sumRat = make([]*big.Rat, len(projs))
 				}
-				if v != nil {
-					state.counts[i]++
-				}
-			case aggSum, aggAvg:
-				v, err := evalRawExpr(rawPlan, raw, proj.arg)
-				if err != nil {
-					return nil, true, err
-				}
-				if v == nil {
-					continue
-				}
-				if f, ok := numeric(v); ok {
-					if state.useRat != nil && state.useRat[i] {
-						state.sumRat[i].Add(state.sumRat[i], new(big.Rat).SetFloat64(f))
-					} else {
-						state.sumFloat[i] += f
+				if !state.useRat[i] {
+					state.sumRat[i] = new(big.Rat)
+					if state.counts[i] > 0 {
+						state.sumRat[i].SetFloat64(state.sumFloat[i])
 					}
-					state.counts[i]++
-					continue
+					state.useRat[i] = true
 				}
-				if rv, ok := storage.DecimalFromAny(v); ok {
-					if state.useRat == nil {
-						state.useRat = make([]bool, len(plan.projs))
-						state.sumRat = make([]*big.Rat, len(plan.projs))
-					}
-					if !state.useRat[i] {
-						state.sumRat[i] = new(big.Rat)
-						if state.counts[i] > 0 {
-							state.sumRat[i].SetFloat64(state.sumFloat[i])
-						}
-						state.useRat[i] = true
-					}
-					state.sumRat[i].Add(state.sumRat[i], new(big.Rat).Set(rv))
-					state.counts[i]++
-				}
-			case aggMin, aggMax:
-				v, err := evalRawExpr(rawPlan, raw, proj.arg)
-				if err != nil {
-					return nil, true, err
-				}
-				if v == nil {
-					continue
-				}
-				if !state.haveMinMax[i] {
-					state.minmax[i] = v
-					state.haveMinMax[i] = true
-					continue
-				}
-				cmp, err := compare(v, state.minmax[i])
-				if err != nil {
-					continue
-				}
-				if (proj.kind == aggMin && cmp < 0) || (proj.kind == aggMax && cmp > 0) {
-					state.minmax[i] = v
-				}
+				state.sumRat[i].Add(state.sumRat[i], new(big.Rat).Set(rv))
+				state.counts[i]++
+			}
+		case aggMin, aggMax:
+			v, err := evalRawExpr(rawPlan, raw, proj.arg)
+			if err != nil {
+				return err
+			}
+			if v == nil {
+				continue
+			}
+			if !state.haveMinMax[i] {
+				state.minmax[i] = v
+				state.haveMinMax[i] = true
+				continue
+			}
+			cmp, err := compare(v, state.minmax[i])
+			if err != nil {
+				continue
+			}
+			if (proj.kind == aggMin && cmp < 0) || (proj.kind == aggMax && cmp > 0) {
+				state.minmax[i] = v
 			}
 		}
 	}
+	return nil
+}
 
+func simpleAggregateResultSet(plan *simpleAggregatePlan, order []*simpleAggregateState) *ResultSet {
 	outRows := make([]Row, 0, len(order))
-	for _, key := range order {
-		state := groups[key]
+	for _, state := range order {
 		out := make(Row, len(plan.projs))
 		for i, proj := range plan.projs {
 			switch proj.kind {
 			case aggGroupCol:
-				putVal(out, proj.name, state.groupValue)
+				putVal(out, proj.name, state.groupValues[proj.groupIndex])
 			case aggCount:
 				putVal(out, proj.name, state.counts[i])
 			case aggSum:
@@ -2887,15 +3012,11 @@ func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 		}
 		outRows = append(outRows, out)
 	}
-	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, true, nil
+	return &ResultSet{Cols: plan.outputCols, Rows: outRows}
 }
 
 func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, bool, error) {
 	if !simpleAggregateEligibleSelect(s) {
-		return nil, false, nil
-	}
-	groupRef, ok := s.GroupBy[0].(*VarRef)
-	if !ok {
 		return nil, false, nil
 	}
 	if !isSimpleRawPredicate(s.Where) {
@@ -2917,12 +3038,24 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 		}
 	}
 	colIndex := simpleColumnIndex(table, aliasOr(s.From))
-	groupCol, ok := colIndex[strings.ToLower(groupRef.Name)]
-	if !ok {
-		return nil, true, fmt.Errorf("unknown column %q", groupRef.Name)
+	groupCols := make([]int, len(s.GroupBy))
+	groupPositions := make(map[int]int, len(s.GroupBy))
+	for i, groupExpr := range s.GroupBy {
+		groupRef, ok := groupExpr.(*VarRef)
+		if !ok {
+			return nil, false, nil
+		}
+		groupCol, ok := colIndex[strings.ToLower(groupRef.Name)]
+		if !ok {
+			return nil, true, fmt.Errorf("unknown column %q", groupRef.Name)
+		}
+		groupCols[i] = groupCol
+		if _, exists := groupPositions[groupCol]; !exists {
+			groupPositions[groupCol] = i
+		}
 	}
 
-	projs, outputCols, hasAgg, eligible, err := buildSimpleAggregateProjections(s, colIndex, groupCol)
+	projs, outputCols, hasAgg, eligible, err := buildSimpleAggregateProjections(s, colIndex, groupPositions)
 	if err != nil {
 		return nil, true, err
 	}
@@ -2932,8 +3065,7 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 	return &simpleAggregatePlan{
 		table:      table,
 		colIndex:   colIndex,
-		groupCol:   groupCol,
-		groupName:  groupRef.Name,
+		groupCols:  groupCols,
 		where:      s.Where,
 		projs:      projs,
 		outputCols: outputCols,
@@ -2943,17 +3075,17 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 func simpleAggregateEligibleSelect(s *Select) bool {
 	return !s.Distinct && len(s.DistinctOn) <= 0 && len(s.CTEs) <= 0 && len(s.Joins) <= 0 &&
 		s.Having == nil && s.Union == nil && len(s.OrderBy) <= 0 && s.Limit == nil && s.Offset == nil &&
-		s.From.Table != "" && s.From.Subquery == nil && s.From.TableFunc == nil && len(s.GroupBy) == 1 &&
+		s.From.Table != "" && s.From.Subquery == nil && s.From.TableFunc == nil && len(s.GroupBy) > 0 &&
 		s.Pivot == nil && !isSQLiteSchemaTable(s.From.Table)
 }
 
-func buildSimpleAggregateProjections(s *Select, colIndex map[string]int, groupCol int) ([]simpleAggregateProjection, []string, bool, bool, error) {
+func buildSimpleAggregateProjections(s *Select, colIndex map[string]int, groupPositions map[int]int) ([]simpleAggregateProjection, []string, bool, bool, error) {
 	projs := make([]simpleAggregateProjection, 0, len(s.Projs))
 	outputCols := make([]string, 0, len(s.Projs))
 	hasAgg := false
 
 	for i, it := range s.Projs {
-		proj, name, isAgg, eligible, err := buildSimpleAggregateProjection(it, i, colIndex, groupCol)
+		proj, name, isAgg, eligible, err := buildSimpleAggregateProjection(it, i, colIndex, groupPositions)
 		if err != nil {
 			return nil, nil, false, false, err
 		}
@@ -2980,7 +3112,7 @@ var simpleAggFuncKinds = map[string]aggKind{
 	"MAX": aggMax,
 }
 
-func buildSimpleAggregateProjection(it SelectItem, idx int, colIndex map[string]int, groupCol int) (simpleAggregateProjection, string, bool, bool, error) {
+func buildSimpleAggregateProjection(it SelectItem, idx int, colIndex map[string]int, groupPositions map[int]int) (simpleAggregateProjection, string, bool, bool, error) {
 	if it.Star {
 		return simpleAggregateProjection{}, "", false, false, nil
 	}
@@ -2990,10 +3122,11 @@ func buildSimpleAggregateProjection(it SelectItem, idx int, colIndex map[string]
 		if !ok {
 			return simpleAggregateProjection{}, "", false, false, fmt.Errorf("unknown column %q", ref.Name)
 		}
-		if refCol != groupCol {
+		groupIndex, grouped := groupPositions[refCol]
+		if !grouped {
 			return simpleAggregateProjection{}, "", false, false, nil
 		}
-		return simpleAggregateProjection{name: name, kind: aggGroupCol}, name, false, true, nil
+		return simpleAggregateProjection{name: name, kind: aggGroupCol, groupIndex: groupIndex}, name, false, true, nil
 	}
 
 	fc, ok := it.Expr.(*FuncCall)
@@ -3028,6 +3161,9 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 	}
 	if len(plan.orderBy) > 0 {
 		return executeSimpleSelectOrderedFastPath(env, plan)
+	}
+	if plan.where == nil && plan.rowIDs == nil {
+		return executeSimpleSelectUnfilteredFastPath(env, plan)
 	}
 
 	outRows := make([]Row, 0, simpleSelectInitialCap(plan))
@@ -3080,6 +3216,55 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, true, nil
 }
 
+// executeSimpleSelectUnfilteredFastPath applies LIMIT/OFFSET before row
+// projection for an unfiltered table scan. SQL applies OFFSET after filtering,
+// so this shortcut is deliberately restricted to a scan with no WHERE clause
+// and no index RowID set. In the common pagination shape this avoids building
+// and then discarding one Row map for every skipped row.
+func executeSimpleSelectUnfilteredFastPath(env ExecEnv, plan *simpleSelectPlan) (*ResultSet, bool, error) {
+	rows := simplePlanRows(plan)
+	// The generic scan checks the context on its first source row, even when
+	// LIMIT/OFFSET would ultimately discard all rows. Preserve that
+	// cancellation behavior before returning an empty page.
+	if len(rows) > 0 {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, true, err
+		}
+	}
+	if plan.limit != nil && *plan.limit == 0 {
+		return &ResultSet{Cols: plan.outputCols, Rows: []Row{}}, true, nil
+	}
+
+	start := 0
+	if plan.offset != nil && *plan.offset > 0 {
+		start = *plan.offset
+	}
+	if start >= len(rows) {
+		return &ResultSet{Cols: plan.outputCols, Rows: []Row{}}, true, nil
+	}
+	end := len(rows)
+	if plan.limit != nil && *plan.limit < end-start {
+		end = start + *plan.limit
+	}
+
+	outRows := make([]Row, 0, end-start)
+	for i, raw := range rows[start:end] {
+		// The first source row was checked above. Continue at the same 64-row
+		// cadence as the generic scan without checking it twice.
+		if i > 0 && i&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, true, err
+			}
+		}
+		out, err := projectRawRow(plan, raw)
+		if err != nil {
+			return nil, true, err
+		}
+		outRows = append(outRows, out)
+	}
+	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, true, nil
+}
+
 type orderedRawRow struct {
 	raw  []any
 	key  any
@@ -3090,6 +3275,11 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 	if plan.limit != nil && *plan.limit == 0 {
 		return &ResultSet{Cols: plan.outputCols, Rows: []Row{}}, true, nil
 	}
+	sourceRows := simplePlanRows(plan)
+	rowCount := len(sourceRows)
+	if plan.rowIDs != nil {
+		rowCount = len(plan.rowIDs)
+	}
 
 	keepCount := -1
 	if plan.limit != nil {
@@ -3097,8 +3287,8 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 		if plan.offset != nil {
 			keepCount += *plan.offset
 		}
-		if keepCount > len(simplePlanRows(plan)) {
-			keepCount = len(simplePlanRows(plan))
+		if keepCount > rowCount {
+			keepCount = rowCount
 		}
 	}
 
@@ -3111,7 +3301,15 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 			items: make([]orderedRawRow, 0, simpleSelectInitialCap(plan)),
 		}
 	}
-	for i, raw := range simplePlanRows(plan) {
+	for i := 0; i < rowCount; i++ {
+		rowID := i
+		if plan.rowIDs != nil {
+			rowID = plan.rowIDs[i]
+		}
+		if rowID < 0 || rowID >= len(sourceRows) {
+			return nil, true, fmt.Errorf("index %q returned invalid row id %d", plan.indexName, rowID)
+		}
+		raw := sourceRows[rowID]
 		// Check context cancellation every 64 rows to reduce channel-select overhead.
 		if i&63 == 0 {
 			if err := checkCtx(env.ctx); err != nil {
@@ -3540,6 +3738,15 @@ func selectSecondaryIndex(table *storage.Table, colIndex map[string]int, where E
 			if !ok {
 				break
 			}
+			// SQL's current int/float comparison semantics intentionally allow
+			// values such as 1 and 1.0 to compare equal, while the durable
+			// secondary-index encoding keeps their types distinct. A numeric seek
+			// is therefore valid only when no differently encoded row can match
+			// this literal. Stop before an unsafe numeric component and retain
+			// it as a residual filter; a preceding text/bool prefix remains safe.
+			if isNumericSQLValue(value) && !numericSecondaryIndexSeekSafe(table, pos, value) {
+				break
+			}
 			candidate = append(candidate, value)
 			candidatePredicates = append(candidatePredicates, column+" = ?")
 		}
@@ -3561,6 +3768,86 @@ func selectSecondaryIndex(table *storage.Table, colIndex map[string]int, where E
 		return nil, nil, nil, false
 	}
 	return chosen, values, predicates, totalTerms != len(values)
+}
+
+func isNumericSQLValue(value any) bool {
+	switch value.(type) {
+	case int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64,
+		float32, float64:
+		return true
+	default:
+		return false
+	}
+}
+
+func numericSecondaryIndexSeekSafe(table *storage.Table, colPos int, value any) bool {
+	if table == nil || colPos < 0 || colPos >= len(table.Cols) {
+		return false
+	}
+	// ModePagedIndex supplies schema-only metadata. SQL comparison treats an
+	// int and a float such as 1 and 1.0 as equal, while durable index keys keep
+	// their storage representations distinct. Permit only literal forms whose
+	// declared write coercion gives one canonical representation; all other
+	// forms fall through to the compatible loaded-table path.
+	if len(table.Rows) == 0 {
+		return numericPagedIndexSeekSafe(table.Cols[colPos], value)
+	}
+
+	for _, row := range table.Rows {
+		if colPos >= len(row) || !isNumericSQLValue(row[colPos]) {
+			continue
+		}
+		cmp, err := compare(row[colPos], value)
+		if err != nil || cmp != 0 {
+			continue
+		}
+		if !storage.CanonicalIndexValueEqual(row[colPos], value) {
+			return false
+		}
+	}
+	return true
+}
+
+func numericPagedIndexSeekSafe(col storage.Column, value any) bool {
+	switch col.Affinity {
+	case storage.AffinityInteger:
+		return numericIntegerStorageSeekSafe(value)
+	case storage.AffinityReal:
+		return numericRealStorageSeekSafe(value)
+	}
+	switch col.Type {
+	case storage.IntType:
+		return numericIntegerStorageSeekSafe(value)
+	case storage.FloatType:
+		return numericRealStorageSeekSafe(value)
+	default:
+		// Types such as FLOAT64 intentionally retain their caller-provided
+		// representation today, so metadata cannot safely choose one key.
+		return false
+	}
+}
+
+// numericIntegerStorageSeekSafe accepts forms that cannot be numerically
+// equal to a differently encoded integer key. Integral floats are excluded:
+// 1.0 compares equal to an integer 1 but has a distinct durable key.
+func numericIntegerStorageSeekSafe(value any) bool {
+	switch v := value.(type) {
+	case int, int64:
+		return true
+	case float64:
+		return !math.IsNaN(v) && math.Trunc(v) != v
+	default:
+		return false
+	}
+}
+
+// numericRealStorageSeekSafe accepts normal finite, non-zero float literals.
+// Integer literals and signed zero can compare equal to a distinct integer or
+// opposite-sign floating representation, respectively.
+func numericRealStorageSeekSafe(value any) bool {
+	v, ok := value.(float64)
+	return ok && !math.IsNaN(v) && v != 0
 }
 
 func preferSecondaryIndex(candidate *storage.SecondaryIndex, candidatePrefix int, candidateEstimate float64, current *storage.SecondaryIndex, currentPrefix int, currentEstimate float64) bool {
@@ -5422,6 +5709,9 @@ func processJoins(env ExecEnv, joins []JoinClause, cur []Row) ([]Row, error) {
 				cols = append(cols, storage.Column{Name: c})
 			}
 			rightTable = &storage.Table{Name: j.Right.Alias, Cols: cols}
+		} else if cteResult, exists := env.ctes[strings.ToLower(j.Right.Table)]; exists {
+			rightRows = rowsFromCTEResult(cteResult, j.Right)
+			rightTable = resultSetTable(aliasOr(j.Right), cteResult.Cols)
 		} else if j.Right.TableFunc != nil {
 			tf := j.Right.TableFunc
 			fn, ok := GetTableFunc(tf.Name)
@@ -6028,17 +6318,16 @@ func applyOffsetLimit(s *Select, rows []Row) []Row {
 // processCTEs extracts and evaluates CTEs (including simple recursive CTEs)
 // and returns an ExecEnv with any CTE results bound.
 func processCTEs(env ExecEnv, s *Select) (ExecEnv, error) {
-	cteEnv := env
 	if len(s.CTEs) == 0 {
-		return cteEnv, nil
+		return env, nil
 	}
 
-	cteEnv = ExecEnv{
-		ctx:    env.ctx,
-		db:     env.db,
-		tenant: env.tenant,
-		ctes:   make(map[string]*ResultSet),
-		now:    env.now,
+	// Preserve all execution state (including statement WAL and trigger row)
+	// and copy outer bindings so nested WITH queries retain their scope.
+	cteEnv := env
+	cteEnv.ctes = make(map[string]*ResultSet, len(env.ctes)+len(s.CTEs))
+	for name, rs := range env.ctes {
+		cteEnv.ctes[strings.ToLower(name)] = rs
 	}
 
 	for _, cte := range s.CTEs {
@@ -6047,7 +6336,11 @@ func processCTEs(env ExecEnv, s *Select) (ExecEnv, error) {
 			if err != nil {
 				return env, err
 			}
-			cteEnv.ctes[cte.Name] = rs
+			rs, err = applyCTEColumnAliases(&cte, rs)
+			if err != nil {
+				return env, err
+			}
+			cteEnv.ctes[strings.ToLower(cte.Name)] = rs
 			continue
 		}
 
@@ -6055,7 +6348,7 @@ func processCTEs(env ExecEnv, s *Select) (ExecEnv, error) {
 		if err != nil {
 			return env, err
 		}
-		cteEnv.ctes[cte.Name] = rs
+		cteEnv.ctes[strings.ToLower(cte.Name)] = rs
 	}
 
 	return cteEnv, nil
@@ -6071,6 +6364,31 @@ func evalNonRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
 		return nil, fmt.Errorf("CTE %s: %v", cte.Name, err)
 	}
 	return rs, nil
+}
+
+// applyCTEColumnAliases implements WITH c(alias1, ...) AS (...) by remapping
+// the result columns by position. The returned rows contain both unqualified
+// and CTE-qualified keys so subsequent CTEs, aliases, and recursive steps use
+// the same lookup rules as regular tables.
+func applyCTEColumnAliases(cte *CTE, rs *ResultSet) (*ResultSet, error) {
+	if rs == nil || len(cte.Columns) == 0 {
+		return rs, nil
+	}
+	if len(cte.Columns) != len(rs.Cols) {
+		return nil, fmt.Errorf("CTE %s declares %d column aliases for %d result columns", cte.Name, len(cte.Columns), len(rs.Cols))
+	}
+	cols := append([]string(nil), cte.Columns...)
+	rows := make([]Row, len(rs.Rows))
+	for rowIdx, row := range rs.Rows {
+		out := make(Row, len(cols)*2)
+		for i, source := range rs.Cols {
+			value, _ := getVal(row, source)
+			putVal(out, cols[i], value)
+			putVal(out, cte.Name+"."+cols[i], value)
+		}
+		rows[rowIdx] = out
+	}
+	return &ResultSet{Cols: cols, Rows: rows}, nil
 }
 
 // evalRecursiveCTE evaluates a recursive CTE (WITH RECURSIVE) by executing the
@@ -6094,8 +6412,8 @@ func alignRecursiveCTERows(accRs *ResultSet, nextRs *ResultSet, cteName string) 
 				val = v
 			}
 			tgt := strings.ToLower(accRs.Cols[i])
-			nr[tgt] = val
-			nr[cteName+"."+tgt] = val
+			putVal(nr, tgt, val)
+			putVal(nr, cteName+"."+tgt, val)
 		}
 		alignedRows = append(alignedRows, nr)
 	}
@@ -6120,11 +6438,18 @@ func evalRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
 	if cte.Select == nil || cte.Select.Union == nil {
 		return nil, fmt.Errorf("recursive CTE %s must be a UNION of anchor and recursive part", cte.Name)
 	}
+	union := cte.Select.Union
+	if union.Type != UnionDistinct && union.Type != UnionAll {
+		return nil, fmt.Errorf("recursive CTE %s must use UNION or UNION ALL", cte.Name)
+	}
+	if union.Next != nil {
+		return nil, fmt.Errorf("recursive CTE %s supports one recursive UNION term", cte.Name)
+	}
 
 	anchor := *cte.Select
 	anchor.Union = nil
 
-	recursiveSel := cte.Select.Union.Right
+	recursiveSel := union.Right
 	if recursiveSel == nil {
 		return nil, fmt.Errorf("recursive CTE %s missing recursive part", cte.Name)
 	}
@@ -6133,57 +6458,69 @@ func evalRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
 	if err != nil {
 		return nil, fmt.Errorf("CTE %s anchor: %v", cte.Name, err)
 	}
+	accRs, err = applyCTEColumnAliases(cte, accRs)
+	if err != nil {
+		return nil, err
+	}
+	if accRs == nil {
+		return &ResultSet{}, nil
+	}
 
 	seen := make(map[string]bool)
-	var accRows []Row
-	if accRs != nil {
-		accRows = append(accRows, accRs.Rows...)
-		if accRs.Cols != nil {
-			for _, r := range accRs.Rows {
-				seen[rowSignature(r, accRs.Cols)] = true
+	accRows := make([]Row, 0, len(accRs.Rows))
+	frontier := make([]Row, 0, len(accRs.Rows))
+	for _, row := range accRs.Rows {
+		if union.Type == UnionDistinct {
+			sig := rowSignature(row, accRs.Cols)
+			if seen[sig] {
+				continue
 			}
+			seen[sig] = true
 		}
+		accRows = append(accRows, row)
+		frontier = append(frontier, row)
 	}
 
 	iterLimit := 1024
-	for iter := 0; iter < iterLimit; iter++ {
-		colsForBind := []string{}
-		if accRs != nil && accRs.Cols != nil {
-			colsForBind = accRs.Cols
-		}
-		env.ctes[cte.Name] = &ResultSet{Cols: colsForBind, Rows: accRows}
+	for iter := 0; iter < iterLimit && len(frontier) > 0; iter++ {
+		// SQL recursive evaluation feeds each iteration only the rows produced
+		// by the previous iteration (the working table), not all accumulated
+		// rows. This is essential for UNION ALL semantics and termination.
+		env.ctes[strings.ToLower(cte.Name)] = &ResultSet{Cols: accRs.Cols, Rows: frontier}
 
 		nextRs, err := executeSelect(env, recursiveSel)
 		if err != nil {
 			return nil, fmt.Errorf("CTE %s recursive eval: %v", cte.Name, err)
 		}
 		if nextRs == nil || len(nextRs.Rows) == 0 {
+			frontier = nil
 			break
 		}
-
-		targetCols := nextRs.Cols
-		if accRs != nil && accRs.Cols != nil {
-			targetCols = accRs.Cols
+		if len(nextRs.Cols) != len(accRs.Cols) {
+			return nil, fmt.Errorf("recursive CTE %s has %d columns in anchor and %d in recursive term", cte.Name, len(accRs.Cols), len(nextRs.Cols))
 		}
-
 		alignedRows := alignRecursiveCTERows(accRs, nextRs, cte.Name)
-
-		var newAdded int
-		accRows, newAdded = addNewRowsToRecursiveCTE(accRows, alignedRows, targetCols, seen)
-
-		if accRs == nil && nextRs != nil {
-			accRs = &ResultSet{Cols: nextRs.Cols}
+		if union.Type == UnionAll {
+			accRows = append(accRows, alignedRows...)
+			frontier = alignedRows
+			continue
 		}
-		if newAdded == 0 {
-			break
+
+		frontier = frontier[:0]
+		for _, row := range alignedRows {
+			sig := rowSignature(row, accRs.Cols)
+			if seen[sig] {
+				continue
+			}
+			seen[sig] = true
+			accRows = append(accRows, row)
+			frontier = append(frontier, row)
 		}
 	}
-
-	finalCols := []string{}
-	if accRs != nil && accRs.Cols != nil {
-		finalCols = accRs.Cols
+	if len(frontier) > 0 {
+		return nil, fmt.Errorf("recursive CTE %s exceeded iteration limit %d", cte.Name, iterLimit)
 	}
-	return &ResultSet{Cols: finalCols, Rows: accRows}, nil
+	return &ResultSet{Cols: accRs.Cols, Rows: accRows}, nil
 }
 
 // -------------------- Eval, Aggregates, Helpers --------------------
@@ -10482,30 +10819,38 @@ func comparableKeyPart(v any) any {
 	}
 }
 
-// writeFmtKeyPart writes a typed key part directly to a builder, avoiding
-// intermediate string allocations used by the old fmtKeyPart approach.
+// writeFmtKeyPart writes a typed, self-delimiting key part directly to a
+// builder. Self-delimiting text and JSON payloads are essential for composite
+// keys: a user string may contain the separator used by GROUP BY, DISTINCT,
+// or set-operation callers.
 func writeFmtKeyPart(b *strings.Builder, v any) {
 	switch x := v.(type) {
 	case nil:
-		b.WriteString("N:")
+		b.WriteString("N;")
 	case int:
-		b.WriteString("I:")
+		b.WriteString("I")
 		b.WriteString(strconv.Itoa(x))
+		b.WriteByte(';')
 	case float64:
-		b.WriteString("F:")
+		b.WriteString("F")
 		b.WriteString(strconv.FormatFloat(x, 'g', -1, 64))
+		b.WriteByte(';')
 	case bool:
 		if x {
-			b.WriteString("B:1")
+			b.WriteString("B1;")
 		} else {
-			b.WriteString("B:0")
+			b.WriteString("B0;")
 		}
 	case string:
-		b.WriteString("S:")
+		b.WriteByte('S')
+		b.WriteString(strconv.Itoa(len(x)))
+		b.WriteByte(':')
 		b.WriteString(x)
 	default:
 		byt, _ := storage.JSONMarshal(x)
-		b.WriteString("J:")
+		b.WriteByte('J')
+		b.WriteString(strconv.Itoa(len(byt)))
+		b.WriteByte(':')
 		b.Write(byt)
 	}
 }

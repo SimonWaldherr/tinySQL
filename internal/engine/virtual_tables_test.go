@@ -256,6 +256,88 @@ func TestSysIndexesPersistAcrossDiskReopen(t *testing.T) {
 	}
 }
 
+func TestSysIndexesAreTenantScoped(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+	execTenant := func(tenant, sql string) *ResultSet {
+		t.Helper()
+		rs, err := Execute(ctx, db, tenant, mustParseSys(sql))
+		if err != nil {
+			t.Fatalf("%s as tenant %q: %v", sql, tenant, err)
+		}
+		return rs
+	}
+
+	for _, tenant := range []string{"alpha", "beta"} {
+		execTenant(tenant, `CREATE TABLE users (id INT, email TEXT)`)
+		execTenant(tenant, `CREATE UNIQUE INDEX idx_users_email ON users(email)`)
+	}
+	execTenant("alpha", `CREATE INDEX idx_alpha_private ON users(id)`)
+
+	// A tenant that does not own the definition must neither see nor delete it.
+	if _, err := Execute(ctx, db, "beta", mustParseSys(`DROP INDEX idx_alpha_private`)); err == nil {
+		t.Fatal("beta unexpectedly dropped alpha's private index metadata")
+	}
+	alphaIndexes := execTenant("alpha", `SELECT name FROM sys.indexes`)
+	if len(alphaIndexes.Rows) != 2 {
+		t.Fatalf("alpha indexes = %#v, want its two definitions", alphaIndexes.Rows)
+	}
+	betaIndexes := execTenant("beta", `SELECT name FROM sys.indexes`)
+	if len(betaIndexes.Rows) != 1 || betaIndexes.Rows[0]["name"] != "idx_users_email" {
+		t.Fatalf("beta index visibility = %#v", betaIndexes.Rows)
+	}
+
+	// Dropping alpha's table must not erase beta's same-named index metadata
+	// or its materialized unique index.
+	execTenant("alpha", `DROP TABLE users`)
+	if rows := execTenant("alpha", `SELECT name FROM sys.indexes`).Rows; len(rows) != 0 {
+		t.Fatalf("alpha metadata survived DROP TABLE: %#v", rows)
+	}
+	betaIndexes = execTenant("beta", `SELECT name FROM sys.indexes`)
+	if len(betaIndexes.Rows) != 1 || betaIndexes.Rows[0]["name"] != "idx_users_email" {
+		t.Fatalf("beta metadata was removed by alpha DROP TABLE: %#v", betaIndexes.Rows)
+	}
+	execTenant("beta", `INSERT INTO users VALUES (1, 'duplicate@example.test')`)
+	if _, err := Execute(ctx, db, "beta", mustParseSys(`INSERT INTO users VALUES (2, 'duplicate@example.test')`)); err == nil {
+		t.Fatal("beta's unique index was lost after alpha DROP TABLE")
+	}
+}
+
+func TestTenantScopedIndexesPersistAcrossDiskReopen(t *testing.T) {
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "db")
+	db, err := storage.OpenDB(storage.StorageConfig{Mode: storage.ModeDisk, Path: dir})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	for _, tenant := range []string{"alpha", "beta"} {
+		if _, err := Execute(ctx, db, tenant, mustParseSys(`CREATE TABLE users (id INT, email TEXT)`)); err != nil {
+			t.Fatalf("CREATE TABLE for %q: %v", tenant, err)
+		}
+		if _, err := Execute(ctx, db, tenant, mustParseSys(`CREATE UNIQUE INDEX idx_users_email ON users(email)`)); err != nil {
+			t.Fatalf("CREATE INDEX for %q: %v", tenant, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := storage.OpenDB(storage.StorageConfig{Mode: storage.ModeDisk, Path: dir})
+	if err != nil {
+		t.Fatalf("reopen OpenDB: %v", err)
+	}
+	defer reopened.Close()
+	for _, tenant := range []string{"alpha", "beta"} {
+		rs, err := Execute(ctx, reopened, tenant, mustParseSys(`SELECT name FROM sys.indexes WHERE name = 'idx_users_email'`))
+		if err != nil {
+			t.Fatalf("SELECT sys.indexes for %q: %v", tenant, err)
+		}
+		if len(rs.Rows) != 1 || rs.Rows[0]["name"] != "idx_users_email" {
+			t.Fatalf("persisted indexes for %q = %#v", tenant, rs.Rows)
+		}
+	}
+}
+
 // TestSysViews verifies sys.views returns registered views.
 func TestSysViews(t *testing.T) {
 	db := setupTestDB()

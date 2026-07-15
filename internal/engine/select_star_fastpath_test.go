@@ -8,6 +8,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"testing"
 
@@ -87,6 +88,45 @@ func TestSelectStarFastPathOrderByAndLimit(t *testing.T) {
 		t.Fatalf("expected 3 rows, got %d", len(rs.Rows))
 	}
 	expectInt(t, rs.Rows[0]["id"], 6, "offset rank0.id")
+}
+
+func TestSelectStarFastPathUnfilteredLimitOffset(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE t (id INT)`)
+	for i := 1; i <= 10; i++ {
+		execSQL(t, db, `INSERT INTO t VALUES (`+strconv.Itoa(i)+`)`)
+	}
+
+	stmt := mustParse(`SELECT * FROM t LIMIT 3 OFFSET 5`).(*Select)
+	plan, ok, err := buildSimpleSelectPlan(ExecEnv{ctx: context.Background(), tenant: "default", db: db}, stmt)
+	if err != nil || !ok {
+		t.Fatalf("unfiltered select plan = %#v, ok=%v, err=%v", plan, ok, err)
+	}
+	if plan.where != nil || plan.rowIDs != nil {
+		t.Fatalf("unexpected plan shape: where=%#v rowIDs=%#v", plan.where, plan.rowIDs)
+	}
+	rs, ok, err := executeSimpleSelectUnfilteredFastPath(ExecEnv{ctx: context.Background(), tenant: "default", db: db}, plan)
+	if err != nil || !ok {
+		t.Fatalf("unfiltered pagination fast path = %#v, ok=%v, err=%v", rs, ok, err)
+	}
+	if len(rs.Rows) != 3 {
+		t.Fatalf("rows = %#v, want three", rs.Rows)
+	}
+	expectInt(t, rs.Rows[0]["id"], 6, "first unfiltered page row")
+	expectInt(t, rs.Rows[2]["id"], 8, "last unfiltered page row")
+}
+
+func TestSelectStarFastPathUnfilteredLimitZeroHonorsCanceledContext(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE t (id INT)`)
+	execSQL(t, db, `INSERT INTO t VALUES (1)`)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := Execute(ctx, db, "default", mustParse(`SELECT * FROM t LIMIT 0`))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled LIMIT 0 query error = %v, want context.Canceled", err)
+	}
 }
 
 // TestSelectStarFastPathQualifiedKeys guards a specific regression: the

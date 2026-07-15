@@ -1,6 +1,37 @@
 package storage
 
-import "testing"
+import (
+	"bytes"
+	"math"
+	"testing"
+)
+
+func TestCanonicalIndexValueEqualMatchesEncoding(t *testing.T) {
+	tests := []struct {
+		name  string
+		left  any
+		right any
+	}{
+		{name: "nil", left: nil, right: nil},
+		{name: "bool", left: true, right: true},
+		{name: "int and int64", left: int(7), right: int64(7)},
+		{name: "int and float differ", left: int(7), right: float64(7)},
+		{name: "signed zero differs", left: float64(0), right: math.Copysign(0, -1)},
+		{name: "text", left: "hello", right: "hello"},
+		{name: "blob", left: []byte{1, 2}, right: []byte{1, 2}},
+		{name: "empty and nil blob", left: []byte(nil), right: []byte{}},
+		{name: "fallback native type", left: int8(7), right: int8(7)},
+		{name: "fallback type boundary", left: int8(7), right: int(7)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			want := bytes.Equal(CanonicalIndexKey([]any{test.left}), CanonicalIndexKey([]any{test.right}))
+			if got := CanonicalIndexValueEqual(test.left, test.right); got != want {
+				t.Fatalf("CanonicalIndexValueEqual(%#v, %#v) = %v, want %v", test.left, test.right, got, want)
+			}
+		})
+	}
+}
 
 func TestSecondaryIndexDeltasMaintainLookupAndDeleteRowMapping(t *testing.T) {
 	table := NewTable("events", []Column{{Name: "id", Type: IntType}, {Name: "kind", Type: TextType}}, false)

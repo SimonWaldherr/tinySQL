@@ -218,3 +218,131 @@ func TestForeignKeyNoForeignKeysAnywhereUnaffected(t *testing.T) {
 		t.Errorf("expected val=99 after UPDATE, got %v", got)
 	}
 }
+
+func TestForeignKeySetNullMaintainsSecondaryIndexes(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE parent (id INT PRIMARY KEY)`)
+	execSQL(t, db, `CREATE TABLE child (id INT, parent_id INT REFERENCES parent(id) ON DELETE SET NULL)`)
+	execSQL(t, db, `CREATE UNIQUE INDEX idx_child_parent_id ON child(parent_id)`)
+	execSQL(t, db, `INSERT INTO parent VALUES (1)`)
+	execSQL(t, db, `INSERT INTO child VALUES (10, 1)`)
+
+	execSQL(t, db, `DELETE FROM parent WHERE id = 1`)
+	execSQL(t, db, `INSERT INTO parent VALUES (1)`)
+	// The referential SET NULL must release the old index key. Before this
+	// regression, the materialized index still held key 1 and rejected this
+	// otherwise valid row as a duplicate.
+	execSQL(t, db, `INSERT INTO child VALUES (11, 1)`)
+
+	rs := execSQL(t, db, `SELECT id FROM child WHERE parent_id = 1`)
+	if len(rs.Rows) != 1 || expectAsInt(t, rs.Rows[0]["id"]) != 11 {
+		t.Fatalf("indexed lookup after ON DELETE SET NULL = %#v", rs.Rows)
+	}
+}
+
+func TestForeignKeyCascadeMaintainsSecondaryIndexRowIDs(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE parent (id INT PRIMARY KEY)`)
+	execSQL(t, db, `CREATE TABLE child (id INT, parent_id INT REFERENCES parent(id) ON DELETE CASCADE)`)
+	execSQL(t, db, `CREATE INDEX idx_child_id ON child(id)`)
+	execSQL(t, db, `INSERT INTO parent VALUES (1), (2)`)
+	execSQL(t, db, `INSERT INTO child VALUES (10, 1), (20, 2)`)
+
+	execSQL(t, db, `DELETE FROM parent WHERE id = 1`)
+	// Child id=20 is compacted from row position 1 to 0. Its index entry must
+	// be remapped too, otherwise an indexed lookup points beyond child.Rows.
+	rs := execSQL(t, db, `SELECT parent_id FROM child WHERE id = 20`)
+	if len(rs.Rows) != 1 || expectAsInt(t, rs.Rows[0]["parent_id"]) != 2 {
+		t.Fatalf("indexed lookup after ON DELETE CASCADE = %#v", rs.Rows)
+	}
+}
+
+func TestForeignKeyUpdateCascadeMaintainsSecondaryIndexes(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE parent (id INT PRIMARY KEY)`)
+	execSQL(t, db, `CREATE TABLE child (id INT, parent_id INT REFERENCES parent(id) ON UPDATE CASCADE)`)
+	execSQL(t, db, `CREATE INDEX idx_child_parent_id ON child(parent_id)`)
+	execSQL(t, db, `INSERT INTO parent VALUES (1)`)
+	execSQL(t, db, `INSERT INTO child VALUES (10, 1)`)
+
+	execSQL(t, db, `UPDATE parent SET id = 2 WHERE id = 1`)
+	rs := execSQL(t, db, `SELECT id FROM child WHERE parent_id = 2`)
+	if len(rs.Rows) != 1 || expectAsInt(t, rs.Rows[0]["id"]) != 10 {
+		t.Fatalf("indexed lookup after ON UPDATE CASCADE = %#v", rs.Rows)
+	}
+}
+
+func TestForeignKeySetNullRejectsNotNullChildColumn(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE parent (id INT PRIMARY KEY)`)
+	execSQL(t, db, `CREATE TABLE child (id INT, parent_id INT NOT NULL REFERENCES parent(id) ON DELETE SET NULL)`)
+	execSQL(t, db, `INSERT INTO parent VALUES (1)`)
+	execSQL(t, db, `INSERT INTO child VALUES (10, 1)`)
+
+	stmt := mustParse(`DELETE FROM parent WHERE id = 1`)
+	if _, err := Execute(context.Background(), db, "default", stmt); err == nil {
+		t.Fatal("expected ON DELETE SET NULL to reject a NOT NULL child column")
+	}
+	parent := execSQL(t, db, `SELECT id FROM parent`)
+	child := execSQL(t, db, `SELECT parent_id FROM child`)
+	if len(parent.Rows) != 1 || len(child.Rows) != 1 || expectAsInt(t, child.Rows[0]["parent_id"]) != 1 {
+		t.Fatalf("failed SET NULL action mutated rows: parent=%#v child=%#v", parent.Rows, child.Rows)
+	}
+}
+
+func TestForeignKeyUpdateCascadePropagatesTransitively(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE parent (id INT PRIMARY KEY)`)
+	execSQL(t, db, `CREATE TABLE child (id INT PRIMARY KEY, parent_id INT REFERENCES parent(id) ON UPDATE CASCADE)`)
+	execSQL(t, db, `CREATE TABLE grandchild (id INT, child_parent_id INT REFERENCES child(parent_id) ON UPDATE CASCADE)`)
+	execSQL(t, db, `INSERT INTO parent VALUES (1)`)
+	execSQL(t, db, `INSERT INTO child VALUES (10, 1)`)
+	execSQL(t, db, `INSERT INTO grandchild VALUES (100, 1)`)
+
+	execSQL(t, db, `UPDATE parent SET id = 2 WHERE id = 1`)
+	child := execSQL(t, db, `SELECT parent_id FROM child WHERE id = 10`)
+	grandchild := execSQL(t, db, `SELECT child_parent_id FROM grandchild WHERE id = 100`)
+	if len(child.Rows) != 1 || expectAsInt(t, child.Rows[0]["parent_id"]) != 2 {
+		t.Fatalf("child update cascade = %#v", child.Rows)
+	}
+	if len(grandchild.Rows) != 1 || expectAsInt(t, grandchild.Rows[0]["child_parent_id"]) != 2 {
+		t.Fatalf("grandchild update cascade = %#v", grandchild.Rows)
+	}
+}
+
+func TestForeignKeySetNullPropagatesDownstreamUpdateAction(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE parent (id INT PRIMARY KEY)`)
+	execSQL(t, db, `CREATE TABLE child (id INT PRIMARY KEY, parent_id INT REFERENCES parent(id) ON DELETE SET NULL)`)
+	execSQL(t, db, `CREATE TABLE grandchild (id INT, child_parent_id INT REFERENCES child(parent_id) ON UPDATE CASCADE)`)
+	execSQL(t, db, `INSERT INTO parent VALUES (1)`)
+	execSQL(t, db, `INSERT INTO child VALUES (10, 1)`)
+	execSQL(t, db, `INSERT INTO grandchild VALUES (100, 1)`)
+
+	execSQL(t, db, `DELETE FROM parent WHERE id = 1`)
+	child := execSQL(t, db, `SELECT parent_id FROM child WHERE id = 10`)
+	grandchild := execSQL(t, db, `SELECT child_parent_id FROM grandchild WHERE id = 100`)
+	if len(child.Rows) != 1 || child.Rows[0]["parent_id"] != nil {
+		t.Fatalf("child SET NULL action = %#v", child.Rows)
+	}
+	if len(grandchild.Rows) != 1 || grandchild.Rows[0]["child_parent_id"] != nil {
+		t.Fatalf("downstream UPDATE CASCADE after SET NULL = %#v", grandchild.Rows)
+	}
+}
+
+func TestForeignKeyCascadeCycleFailsWithoutPartialMutation(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE node (id INT PRIMARY KEY, parent_id INT REFERENCES node(id) ON DELETE CASCADE)`)
+	execSQL(t, db, `INSERT INTO node VALUES (1, NULL)`)
+	execSQL(t, db, `INSERT INTO node VALUES (2, 1)`)
+	execSQL(t, db, `UPDATE node SET parent_id = 2 WHERE id = 1`)
+
+	stmt := mustParse(`DELETE FROM node WHERE id = 1`)
+	if _, err := Execute(context.Background(), db, "default", stmt); err == nil {
+		t.Fatal("expected cyclic cascade to return an error")
+	}
+	rs := execSQL(t, db, `SELECT id FROM node`)
+	if len(rs.Rows) != 2 {
+		t.Fatalf("cyclic cascade partially mutated table: %#v", rs.Rows)
+	}
+}

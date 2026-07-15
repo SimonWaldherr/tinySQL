@@ -58,9 +58,13 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 }
 
 func isAtomicDML(stmt Statement) bool {
-	switch stmt.(type) {
+	switch s := stmt.(type) {
 	case *Insert, *Update, *Delete:
 		return true
+	case *Explain:
+		// EXPLAIN ANALYZE executes its inner statement in the outer statement
+		// lifecycle, so it needs the same rollback guarantee as direct DML.
+		return s.Analyze && isAtomicDML(s.Statement)
 	default:
 		return false
 	}

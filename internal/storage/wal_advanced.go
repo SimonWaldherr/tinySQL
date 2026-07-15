@@ -645,6 +645,16 @@ func (w *AdvancedWAL) applyOperation(db *DB, record *WALRecord) error {
 		}
 		table.Version++
 	}
+	// A recovered table can already own materialized secondary-index metadata
+	// from its last checkpoint. Replay changes rows directly, so rebuild those
+	// indexes before exposing the recovered table to the executor; otherwise a
+	// subsequent indexed lookup can silently miss recovered rows or retain old
+	// row positions after a delete.
+	if err := table.RebuildSecondaryIndexes(); err != nil {
+		return err
+	}
+	table.InvalidateStats()
+	table.MarkDirtyFrom(-1)
 
 	return nil
 }

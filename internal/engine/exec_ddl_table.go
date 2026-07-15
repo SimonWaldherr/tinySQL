@@ -63,14 +63,14 @@ func executeDropTable(env ExecEnv, s *DropTable) (*ResultSet, error) {
 		// rows, or a panic on an out-of-range index) and leak FTS memory.
 		purgeVecQueryCacheFor(tenant, t.Name)
 		purgeFTSCachesFor(tenant, t.Name)
-		env.db.Catalog().DeleteIndexesForTable(s.Name)
+		env.db.Catalog().DeleteIndexesForTenantTable(env.tenant, s.Name)
 	}
 	return nil, env.db.Drop(env.tenant, s.Name)
 }
 
 func executeCreateIndex(env ExecEnv, s *CreateIndex) (*ResultSet, error) {
 	schema, name := splitObjectName(s.Name)
-	if _, exists := env.db.Catalog().GetIndex(schema, name); exists {
+	if _, exists := env.db.Catalog().GetIndexForTenant(env.tenant, schema, name); exists {
 		if s.IfNotExists {
 			return nil, nil
 		}
@@ -88,7 +88,7 @@ func executeCreateIndex(env ExecEnv, s *CreateIndex) (*ResultSet, error) {
 	if err := t.CreateSecondaryIndex(name, s.Columns, s.Unique); err != nil {
 		return nil, err
 	}
-	if err := env.db.Catalog().RegisterIndex(&storage.CatalogIndex{Schema: schema, Name: name, Table: s.Table, Columns: append([]string(nil), s.Columns...), Unique: s.Unique, CreatedAt: time.Now()}); err != nil {
+	if err := env.db.Catalog().RegisterIndexForTenant(env.tenant, &storage.CatalogIndex{Tenant: env.tenant, Schema: schema, Name: name, Table: s.Table, Columns: append([]string(nil), s.Columns...), Unique: s.Unique, CreatedAt: time.Now()}); err != nil {
 		t.DropSecondaryIndex(name)
 		return nil, err
 	}
@@ -99,7 +99,7 @@ func executeCreateIndex(env ExecEnv, s *CreateIndex) (*ResultSet, error) {
 
 func executeDropIndex(env ExecEnv, s *DropIndex) (*ResultSet, error) {
 	schema, name := splitObjectName(s.Name)
-	idx, exists := env.db.Catalog().GetIndex(schema, name)
+	idx, exists := env.db.Catalog().GetIndexForTenant(env.tenant, schema, name)
 	if !exists {
 		if s.IfExists {
 			return nil, nil
@@ -114,5 +114,5 @@ func executeDropIndex(env ExecEnv, s *DropIndex) (*ResultSet, error) {
 		t.Version++
 		t.MarkDirtyFrom(-1)
 	}
-	return nil, env.db.Catalog().DeleteIndex(schema, name)
+	return nil, env.db.Catalog().DeleteIndexForTenant(env.tenant, schema, name)
 }

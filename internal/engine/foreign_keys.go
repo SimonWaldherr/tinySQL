@@ -34,6 +34,21 @@ type fkChange struct {
 	deleted bool
 }
 
+// foreignKeyActionState follows the referential-action path within one
+// statement. A key is kept active until the action returns; revisiting the
+// same child column/value means a cascade cycle rather than a new action.
+// It is intentionally statement-local (via ExecEnv), not global, so tenants
+// and concurrent databases never share mutable state.
+type foreignKeyActionState struct {
+	active map[fkActionKey]struct{}
+}
+
+type fkActionKey struct {
+	table  *storage.Table
+	column int
+	value  string
+}
+
 // tenantHasAnyForeignKeys reports whether any table in the tenant declares a
 // FOREIGN KEY column at all. DELETE/UPDATE call this first so the common
 // case (no foreign keys anywhere) pays no cost beyond one cheap metadata
@@ -126,14 +141,45 @@ func fkOnUpdateCheckColumn(env ExecEnv, t *storage.Table, parentColIdx int, chan
 // CASCADE, or SET NULL) for the given set of parent-value changes against
 // ref's child table/column.
 func applyOneForeignKeyReference(env ExecEnv, ref fkReference, changes map[any]fkChange) error {
+	var leave func()
+	if ref.action == storage.Cascade || ref.action == storage.SetNull {
+		var err error
+		env, leave, err = enterForeignKeyAction(env, ref, changes)
+		if err != nil {
+			return err
+		}
+		defer leave()
+	}
 	switch ref.action {
 	case storage.Cascade:
 		return cascadeForeignKeyReference(env, ref, changes)
 	case storage.SetNull:
-		return setNullForeignKeyReference(ref, changes)
+		return setNullForeignKeyReference(env, ref, changes)
 	default: // Restrict, NoAction
 		return restrictForeignKeyReference(ref, changes)
 	}
+}
+
+func enterForeignKeyAction(env ExecEnv, ref fkReference, changes map[any]fkChange) (ExecEnv, func(), error) {
+	if env.foreignKeyActions == nil {
+		env.foreignKeyActions = &foreignKeyActionState{active: make(map[fkActionKey]struct{})}
+	}
+	keys := make([]fkActionKey, 0, len(changes))
+	for value := range changes {
+		key := fkActionKey{table: ref.childTable, column: ref.childColIdx, value: fmtKeyPart(value)}
+		if _, active := env.foreignKeyActions.active[key]; active {
+			return env, nil, fmt.Errorf("FOREIGN KEY cascade cycle detected at table %q column %q", ref.childTable.Name, ref.childTable.Cols[ref.childColIdx].Name)
+		}
+		keys = append(keys, key)
+	}
+	for _, key := range keys {
+		env.foreignKeyActions.active[key] = struct{}{}
+	}
+	return env, func() {
+		for _, key := range keys {
+			delete(env.foreignKeyActions.active, key)
+		}
+	}, nil
 }
 
 // restrictForeignKeyReference blocks the parent-side change if any child row
@@ -155,23 +201,67 @@ func restrictForeignKeyReference(ref fkReference, changes map[any]fkChange) erro
 }
 
 // setNullForeignKeyReference nulls out the referencing column in every
-// matching child row, for both deletions and updates.
-func setNullForeignKeyReference(ref fkReference, changes map[any]fkChange) error {
+// matching child row, for both deletions and updates. It deliberately uses
+// the same row/index/WAL maintenance as executeUpdate: referential actions
+// are still real table updates, even though they do not run SQL triggers.
+func setNullForeignKeyReference(env ExecEnv, ref fkReference, changes map[any]fkChange) error {
 	child := ref.childTable
-	touched := false
+	matchingRows := make([]int, 0)
 	for i, r := range child.Rows {
 		if ref.childColIdx >= len(r) || r[ref.childColIdx] == nil {
 			continue
 		}
 		if _, ok := changes[comparableKeyPart(r[ref.childColIdx])]; ok {
-			child.Rows[i][ref.childColIdx] = nil
-			touched = true
+			matchingRows = append(matchingRows, i)
 		}
 	}
-	if touched {
-		child.Version++
-		invalidateConstraintIndexes(child)
+	if len(matchingRows) == 0 {
+		return nil
 	}
+
+	col := child.Cols[ref.childColIdx]
+	if col.NotNull || col.Constraint == storage.PrimaryKey {
+		return fmt.Errorf("FOREIGN KEY constraint violation: SET NULL cannot null NOT NULL column %q on table %q",
+			col.Name, child.Name)
+	}
+	childChanges := make(map[any]fkChange, len(matchingRows))
+	for _, rowID := range matchingRows {
+		childChanges[comparableKeyPart(child.Rows[rowID][ref.childColIdx])] = fkChange{newVal: nil}
+	}
+	if err := fkOnUpdateCheckColumn(env, child, ref.childColIdx, childChanges); err != nil {
+		return err
+	}
+
+	wal, err := beginWALAuto(env, child.Name)
+	if err != nil {
+		return err
+	}
+	for _, rowID := range matchingRows {
+		before := append([]any(nil), child.Rows[rowID]...)
+		after := append([]any(nil), before...)
+		after[ref.childColIdx] = nil
+		if err := validateRowConstraints(env, child, after, rowID); err != nil {
+			return err
+		}
+		if err := child.CheckSecondaryIndexConstraints(after, rowID); err != nil {
+			return err
+		}
+		patchConstraintIndexRow(child, rowID, before, after)
+		child.Rows[rowID] = after
+		if err := child.UpdateSecondaryIndexRow(rowID, before, after); err != nil {
+			return err
+		}
+		if err := wal.logUpdate(env, rowID, before, after, child.Cols); err != nil {
+			return err
+		}
+	}
+	if err := wal.commit(); err != nil {
+		return err
+	}
+	child.Version++
+	child.InvalidateStats()
+	child.MarkDirtyFrom(-1)
+	markDependentMaterializedViewsStale(env, child.Name)
 	return nil
 }
 
@@ -181,13 +271,18 @@ func setNullForeignKeyReference(ref fkReference, changes map[any]fkChange) error
 // foreign keys (grandchild referencing child referencing parent) cascades
 // correctly instead of only one level deep.
 //
-// This mutates child.Rows directly rather than re-entering
-// executeDelete/executeUpdate, so triggers and FTS index updates do not fire
-// for cascaded rows — a deliberate scope limit; see README's foreign key
-// section.
+// This does not re-enter executeDelete/executeUpdate, so SQL triggers and FTS
+// index updates do not fire for cascaded rows — a deliberate scope limit; see
+// README's foreign key section. The underlying row/index/WAL bookkeeping is
+// nevertheless kept identical to normal DML.
 func cascadeForeignKeyReference(env ExecEnv, ref fkReference, changes map[any]fkChange) error {
 	child := ref.childTable
 	var toRemove []int
+	type rowUpdate struct {
+		rowID  int
+		newVal any
+	}
+	updates := make([]rowUpdate, 0)
 	for i, r := range child.Rows {
 		if ref.childColIdx >= len(r) || r[ref.childColIdx] == nil {
 			continue
@@ -199,13 +294,26 @@ func cascadeForeignKeyReference(env ExecEnv, ref fkReference, changes map[any]fk
 		if ch.deleted {
 			toRemove = append(toRemove, i)
 		} else {
-			child.Rows[i][ref.childColIdx] = ch.newVal
+			updates = append(updates, rowUpdate{rowID: i, newVal: ch.newVal})
 		}
 	}
-	if len(toRemove) == 0 {
-		child.Version++
-		invalidateConstraintIndexes(child)
+	if len(toRemove) == 0 && len(updates) == 0 {
 		return nil
+	}
+	for _, update := range updates {
+		if isNull(update.newVal) && (child.Cols[ref.childColIdx].NotNull || child.Cols[ref.childColIdx].Constraint == storage.PrimaryKey) {
+			return fmt.Errorf("FOREIGN KEY constraint violation: CASCADE cannot assign NULL to NOT NULL column %q on table %q",
+				child.Cols[ref.childColIdx].Name, child.Name)
+		}
+	}
+	if len(updates) > 0 {
+		childChanges := make(map[any]fkChange, len(updates))
+		for _, update := range updates {
+			childChanges[comparableKeyPart(child.Rows[update.rowID][ref.childColIdx])] = fkChange{newVal: update.newVal}
+		}
+		if err := fkOnUpdateCheckColumn(env, child, ref.childColIdx, childChanges); err != nil {
+			return err
+		}
 	}
 
 	deletedRaw := make([][]any, len(toRemove))
@@ -216,19 +324,60 @@ func cascadeForeignKeyReference(env ExecEnv, ref fkReference, changes map[any]fk
 		return err
 	}
 
-	removeSet := make(map[int]bool, len(toRemove))
-	for _, idx := range toRemove {
-		removeSet[idx] = true
+	wal, err := beginWALAuto(env, child.Name)
+	if err != nil {
+		return err
 	}
-	kept := make([][]any, 0, len(child.Rows)-len(toRemove))
-	for i, r := range child.Rows {
-		if !removeSet[i] {
-			kept = append(kept, r)
+	for _, update := range updates {
+		before := append([]any(nil), child.Rows[update.rowID]...)
+		after := append([]any(nil), before...)
+		after[ref.childColIdx] = update.newVal
+		// The parent row is deliberately updated after this referential action,
+		// so validating this one foreign-key column against the current parent
+		// state would incorrectly reject a valid ON UPDATE CASCADE. All other
+		// constraints are unchanged; materialized unique indexes still need the
+		// usual duplicate check.
+		if err := child.CheckSecondaryIndexConstraints(after, update.rowID); err != nil {
+			return err
+		}
+		patchConstraintIndexRow(child, update.rowID, before, after)
+		child.Rows[update.rowID] = after
+		if err := child.UpdateSecondaryIndexRow(update.rowID, before, after); err != nil {
+			return err
+		}
+		if err := wal.logUpdate(env, update.rowID, before, after, child.Cols); err != nil {
+			return err
 		}
 	}
-	child.Rows = kept
+
+	if len(toRemove) > 0 {
+		removeSet := make(map[int]bool, len(toRemove))
+		for _, idx := range toRemove {
+			removeSet[idx] = true
+		}
+		kept := make([][]any, 0, len(child.Rows)-len(toRemove))
+		oldToNew := make(map[int]int, len(child.Rows)-len(toRemove))
+		for i, r := range child.Rows {
+			if removeSet[i] {
+				if err := wal.logDelete(env, i, r, child.Cols); err != nil {
+					return err
+				}
+				continue
+			}
+			oldToNew[i] = len(kept)
+			kept = append(kept, r)
+		}
+		child.Rows = kept
+		child.ReindexSecondaryIndexRows(oldToNew)
+		invalidateConstraintIndexes(child)
+	}
+	if err := wal.commit(); err != nil {
+		return err
+	}
 	child.Version++
-	invalidateConstraintIndexes(child)
+	child.InvalidateStats()
+	child.MarkDirtyFrom(-1)
+	markDependentMaterializedViewsStale(env, child.Name)
 	return nil
 }
 

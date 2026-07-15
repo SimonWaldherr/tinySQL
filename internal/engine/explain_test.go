@@ -2,7 +2,9 @@ package engine
 
 import (
 	"context"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -52,6 +54,48 @@ func TestExplainMaterializedViewPlanIncludesInvalidation(t *testing.T) {
 		if !ops[want] {
 			t.Fatalf("missing EXPLAIN operation %q in rows %#v", want, rs.Rows)
 		}
+	}
+}
+
+func TestExplainAnalyzeMutatingStatementSharesStatementLifecycle(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+	if _, err := Execute(ctx, db, "default", mustParse(`CREATE TABLE t (id INT PRIMARY KEY)`)); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	// A re-entrant Execute call used to deadlock here: outer EXPLAIN held a
+	// read lock while inner INSERT needed a write lock. Keep a timeout around
+	// the regression so a future reintroduction fails as a clear deadlock.
+	runWithTimeout(t, time.Second, func() error {
+		_, err := Execute(ctx, db, "default", mustParse(`EXPLAIN ANALYZE INSERT INTO t VALUES (1)`))
+		return err
+	})
+	rows := execSQL(t, db, `SELECT id FROM t`)
+	if len(rows.Rows) != 1 || rows.Rows[0]["id"] != 1 {
+		t.Fatalf("EXPLAIN ANALYZE INSERT rows = %#v", rows.Rows)
+	}
+
+	// The outer EXPLAIN ANALYZE lifecycle must also roll back a failed inner
+	// DML statement rather than leaving its first row behind.
+	_, err := Execute(ctx, db, "default", mustParse(`EXPLAIN ANALYZE INSERT INTO t VALUES (2), (2)`))
+	if err == nil || !strings.Contains(err.Error(), "PRIMARY KEY") {
+		t.Fatalf("duplicate EXPLAIN ANALYZE INSERT error = %v, want PRIMARY KEY", err)
+	}
+	rows = execSQL(t, db, `SELECT id FROM t ORDER BY id`)
+	if len(rows.Rows) != 1 || rows.Rows[0]["id"] != 1 {
+		t.Fatalf("failed EXPLAIN ANALYZE INSERT was not rolled back: %#v", rows.Rows)
+	}
+}
+
+func TestExplainAnalyzeMutationRespectsReadOnlyMode(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+	execSQL(t, db, `CREATE TABLE t (id INT)`)
+	db.SetReadOnly(true)
+	_, err := Execute(ctx, db, "default", mustParse(`EXPLAIN ANALYZE INSERT INTO t VALUES (1)`))
+	if err == nil || !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("read-only EXPLAIN ANALYZE INSERT error = %v, want read-only error", err)
 	}
 }
 

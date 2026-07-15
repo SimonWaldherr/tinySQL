@@ -1248,15 +1248,56 @@ func cloneTable(t *Table) *Table {
 	nt.Indexes = cloneSecondaryIndexes(t.Indexes)
 	nt.Stats = cloneTableStats(t.Stats)
 	nt.dirtyFrom = t.dirtyFrom
-	nt.Rows = make([][]any, len(t.Rows))
-	for i := range t.Rows {
-		row := make([]any, len(t.Rows[i]))
-		for j, value := range t.Rows[i] {
-			row[j] = cloneCell(value)
-		}
-		nt.Rows[i] = row
-	}
+	nt.Rows = cloneRows(t.Rows)
 	return nt
+}
+
+// cloneRows copies all row headers into a single backing array. A statement
+// snapshot commonly clones tens of thousands of rows; keeping the cells
+// contiguous avoids one allocation per row while preserving the original
+// per-row append semantics through a full slice expression.
+func cloneRows(rows [][]any) [][]any {
+	cloned := make([][]any, len(rows))
+	maxInt := int(^uint(0) >> 1)
+	totalCells := 0
+	for _, row := range rows {
+		if len(row) > maxInt-totalCells {
+			// The contiguous allocation cannot be represented. This is only
+			// reachable for an impossibly large in-memory table on supported
+			// platforms, but retain the safe per-row behavior rather than
+			// overflowing the allocation size.
+			return cloneRowsIndividually(rows)
+		}
+		totalCells += len(row)
+	}
+
+	cells := make([]any, totalCells)
+	offset := 0
+	for i, row := range rows {
+		end := offset + len(row)
+		// Restrict capacity to the row length. Before this optimization each
+		// row was independently allocated with cap == len, so append must not
+		// be able to overwrite the next row in the shared backing array.
+		copyRow := cells[offset:end:end]
+		for j, value := range row {
+			copyRow[j] = cloneCell(value)
+		}
+		cloned[i] = copyRow
+		offset = end
+	}
+	return cloned
+}
+
+func cloneRowsIndividually(rows [][]any) [][]any {
+	cloned := make([][]any, len(rows))
+	for i, row := range rows {
+		copyRow := make([]any, len(row))
+		for j, value := range row {
+			copyRow[j] = cloneCell(value)
+		}
+		cloned[i] = copyRow
+	}
+	return cloned
 }
 
 // cloneCell preserves snapshot isolation for mutable binary values. Other
@@ -1444,7 +1485,15 @@ func diskToCatalog(dc diskCatalog) *CatalogManager {
 		}
 		cp := *idx
 		cp.Columns = append([]string(nil), idx.Columns...)
-		c.indexes[cp.Schema+"."+cp.Name] = &cp
+		if cp.Tenant == "" {
+			// Snapshots created before tenant-scoped index metadata cannot
+			// identify the owning tenant. Preserve them for administrative
+			// inspection, but do not expose them to a tenant by guessing.
+			c.indexes[legacyCatalogIndexKey(cp.Schema, cp.Name)] = &cp
+			continue
+		}
+		cp.Tenant = normalizeCatalogTenant(cp.Tenant)
+		c.indexes[catalogIndexKey(cp.Tenant, cp.Schema, cp.Name)] = &cp
 	}
 	for _, f := range dc.Funcs {
 		if f == nil {

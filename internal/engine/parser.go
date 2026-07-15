@@ -14,6 +14,7 @@ package engine
 import (
 	"fmt"
 	"math"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -85,12 +86,6 @@ func (p *Parser) parseBareTableSelect() (*Select, error) {
 	table := p.parseQualifiedIdentLike()
 	if table == "" {
 		return nil, p.errf("expected table name")
-	}
-	if p.cur.Typ == tSymbol && p.cur.Val == ";" {
-		p.next()
-	}
-	if p.cur.Typ != tEOF {
-		return nil, p.errf("unexpected token after table name")
 	}
 	return &Select{
 		From:  FromItem{Table: table, Alias: table},
@@ -471,9 +466,11 @@ type PivotValue struct {
 
 // CTE represents a Common Table Expression (WITH clause)
 type CTE struct {
-	Name   string
-	Select *Select
-	// Recursive indicates this CTE was declared under WITH RECURSIVE
+	Name    string
+	Columns []string
+	Select  *Select
+	// Recursive is true only when this CTE actually references itself. WITH
+	// RECURSIVE permits recursion; it does not make every CTE recursive.
 	Recursive bool
 }
 
@@ -559,8 +556,27 @@ type WindowFrame struct {
 
 // ------------------------------ Parse ------------------------------
 
-// ParseStatement parses a single SQL statement into an AST.
+// ParseStatement parses exactly one complete SQL statement into an AST. A
+// single trailing semicolon is accepted; any remaining token is an error so a
+// valid DML prefix can never silently ignore and execute before junk input.
 func (p *Parser) ParseStatement() (Statement, error) {
+	stmt, err := p.parseStatement()
+	if err != nil {
+		return nil, err
+	}
+	if p.cur.Typ == tSymbol && p.cur.Val == ";" {
+		p.next()
+	}
+	if p.cur.Typ != tEOF {
+		return nil, p.errf("unexpected token after statement")
+	}
+	return stmt, nil
+}
+
+// parseStatement parses one statement prefix without requiring EOF. It is
+// used for individual statements inside CREATE TRIGGER ... BEGIN ... END;
+// public callers must use ParseStatement above.
+func (p *Parser) parseStatement() (Statement, error) {
 	if p.cur.Typ == tIdent {
 		return p.parseBareTableSelect()
 	}
@@ -629,12 +645,6 @@ func (p *Parser) parseCallProcedure() (Statement, error) {
 			return nil, err
 		}
 	}
-	if p.cur.Typ == tSymbol && p.cur.Val == ";" {
-		p.next()
-	}
-	if p.cur.Typ != tEOF {
-		return nil, p.errf("unexpected token after CALL")
-	}
 	return stmt, nil
 }
 
@@ -645,7 +655,7 @@ func (p *Parser) parseExplain() (Statement, error) {
 		analyze = true
 		p.next()
 	}
-	stmt, err := p.ParseStatement()
+	stmt, err := p.parseStatement()
 	if err != nil {
 		return nil, err
 	}
@@ -660,12 +670,6 @@ func (p *Parser) parseAnalyze() (Statement, error) {
 		if stmt.Table == "" {
 			return nil, p.errf("expected table name after ANALYZE")
 		}
-	}
-	if p.cur.Typ == tSymbol && p.cur.Val == ";" {
-		p.next()
-	}
-	if p.cur.Typ != tEOF {
-		return nil, p.errf("unexpected token after ANALYZE")
 	}
 	return stmt, nil
 }
@@ -702,12 +706,6 @@ func (p *Parser) parsePragma() (Statement, error) {
 			return nil, err
 		}
 		stmt.Value = &value
-	}
-	if p.cur.Typ == tSymbol && p.cur.Val == ";" {
-		p.next()
-	}
-	if p.cur.Typ != tEOF {
-		return nil, p.errf("unexpected token after PRAGMA")
 	}
 	return stmt, nil
 }
@@ -1091,7 +1089,7 @@ func (p *Parser) parseTriggerBody() ([]Statement, string, error) {
 	startPos := p.cur.Pos
 	var body []Statement
 	for (p.cur.Typ != tKeyword || p.cur.Val != "END") && p.cur.Typ != tEOF {
-		stmt, err := p.ParseStatement()
+		stmt, err := p.parseStatement()
 		if err != nil {
 			return nil, "", fmt.Errorf("trigger body: %w", err)
 		}
@@ -1101,10 +1099,11 @@ func (p *Parser) parseTriggerBody() ([]Statement, string, error) {
 		}
 	}
 	endPos := p.cur.Pos
-	bodyText := strings.TrimSpace(p.lx.s[startPos:endPos])
-	if p.cur.Typ == tKeyword && p.cur.Val == "END" {
-		p.next()
+	if p.cur.Typ == tEOF {
+		return nil, "", p.errf("expected END to close trigger body")
 	}
+	bodyText := strings.TrimSpace(p.lx.s[startPos:endPos])
+	p.next() // consume END
 	return body, bodyText, nil
 }
 
@@ -1384,10 +1383,6 @@ afterClauses:
 	// Capture raw SQL text for the job body
 	job.SQLText = p.parseJobSQLBody()
 
-	// consume semicolon if present
-	if p.cur.Typ == tSymbol && p.cur.Val == ";" {
-		p.next()
-	}
 	return job, nil
 }
 
@@ -1724,9 +1719,6 @@ func (p *Parser) parseRefresh() (Statement, error) {
 	if name == "" {
 		return nil, p.errf("expected materialized view name")
 	}
-	if p.cur.Typ == tSymbol && p.cur.Val == ";" {
-		p.next()
-	}
 	return &RefreshMaterializedView{Name: name, Concurrently: concurrently}, nil
 }
 
@@ -2032,7 +2024,8 @@ func (p *Parser) parseSelectWithCTE() (*Select, error) {
 	if p.cur.Typ == tKeyword && p.cur.Val == "WITH" {
 		p.next()
 
-		// Optional RECURSIVE keyword applies to all following CTEs
+		// WITH RECURSIVE permits self references in following CTEs. Whether a
+		// particular CTE is recursive is determined after parsing its SELECT.
 		recursiveAll := false
 		if p.cur.Typ == tKeyword && p.cur.Val == "RECURSIVE" {
 			recursiveAll = true
@@ -2047,14 +2040,16 @@ func (p *Parser) parseSelectWithCTE() (*Select, error) {
 			}
 
 			// Optional column list: WITH cte(col1, col2) AS (...)
+			var cteColumns []string
 			if p.cur.Typ == tSymbol && p.cur.Val == "(" {
-				// consume '(' and skip until matching ')'
+				// Consume and retain the aliases; they rename the CTE output.
 				p.next()
 				for {
 					// accept identifier-like column names
 					if p.cur.Typ != tIdent && p.cur.Typ != tKeyword {
 						return nil, p.errf("expected column name in CTE column list")
 					}
+					cteColumns = append(cteColumns, p.cur.Val)
 					p.next()
 					if p.cur.Typ == tSymbol && p.cur.Val == "," {
 						p.next()
@@ -2085,7 +2080,12 @@ func (p *Parser) parseSelectWithCTE() (*Select, error) {
 				return nil, err
 			}
 
-			ctes = append(ctes, CTE{Name: cteName, Select: cteSelect, Recursive: recursiveAll})
+			ctes = append(ctes, CTE{
+				Name:      cteName,
+				Columns:   cteColumns,
+				Select:    cteSelect,
+				Recursive: recursiveAll && selectReferencesCTEName(cteSelect, cteName),
+			})
 
 			// Check for more CTEs
 			if p.cur.Typ == tSymbol && p.cur.Val == "," {
@@ -2106,6 +2106,36 @@ func (p *Parser) parseSelectWithCTE() (*Select, error) {
 	sel.CTEs = ctes
 
 	return sel, nil
+}
+
+// selectReferencesCTEName reports whether sel's FROM tree references name.
+// It is intentionally structural: the parser needs only distinguish an
+// actual self-reference from an ordinary CTE written under WITH RECURSIVE.
+func selectReferencesCTEName(sel *Select, name string) bool {
+	if sel == nil {
+		return false
+	}
+	name = strings.ToLower(name)
+	fromReferences := func(from FromItem) bool {
+		if strings.EqualFold(from.Table, name) {
+			return true
+		}
+		return from.Subquery != nil && selectReferencesCTEName(from.Subquery, name)
+	}
+	if fromReferences(sel.From) {
+		return true
+	}
+	for _, join := range sel.Joins {
+		if fromReferences(join.Right) {
+			return true
+		}
+	}
+	for union := sel.Union; union != nil; union = union.Next {
+		if selectReferencesCTEName(union.Right, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Parser) parseSelect() (*Select, error) {
@@ -2539,9 +2569,22 @@ func (p *Parser) parseOrderByClause(sel *Select) error {
 			return err
 		}
 		for {
-			col := p.parseIdentLike()
-			if col == "" {
-				return p.errf("ORDER BY expects column")
+			var col string
+			if (p.cur.Typ == tIdent || p.cur.Typ == tKeyword) && p.peek.Typ == tSymbol && p.peek.Val == "(" {
+				expr, err := p.parseExpr()
+				if err != nil {
+					return err
+				}
+				var ok bool
+				col, ok = orderByProjectionName(sel, expr)
+				if !ok {
+					return p.errf("ORDER BY expression must appear in the SELECT list or have an alias")
+				}
+			} else {
+				col = p.parseIdentLike()
+				if col == "" {
+					return p.errf("ORDER BY expects column")
+				}
 			}
 			desc := false
 			if p.cur.Typ == tKeyword && (p.cur.Val == "ASC" || p.cur.Val == "DESC") {
@@ -2557,6 +2600,26 @@ func (p *Parser) parseOrderByClause(sel *Select) error {
 		}
 	}
 	return nil
+}
+
+// orderByProjectionName resolves a function/expression used in ORDER BY to
+// the output column produced by the matching SELECT item. Sorting happens
+// after projection in this executor, so an expression must be present in the
+// projection list (typically with an alias such as COUNT(*) AS total).
+func orderByProjectionName(sel *Select, expr Expr) (string, bool) {
+	for i, item := range sel.Projs {
+		if item.Star || !reflect.DeepEqual(item.Expr, expr) {
+			continue
+		}
+		if item.Alias != "" {
+			return item.Alias, true
+		}
+		if ref, ok := item.Expr.(*VarRef); ok {
+			return ref.Name, true
+		}
+		return fmt.Sprintf("col_%d", i), true
+	}
+	return "", false
 }
 
 func (p *Parser) parseLimitOffset(sel *Select) error {

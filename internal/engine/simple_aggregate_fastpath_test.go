@@ -6,6 +6,7 @@
 package engine
 
 import (
+	"context"
 	"math/big"
 	"testing"
 
@@ -84,6 +85,88 @@ func TestAggregateFastPathSumOnlyNoCount(t *testing.T) {
 	expectFloat(t, byCustomer[1]["total"], 30, 1e-9, "sum cust 1")
 	expectFloat(t, byCustomer[2]["total"], 45, 1e-9, "sum cust 2")
 	expectFloat(t, byCustomer[3]["total"], 100, 1e-9, "sum cust 3")
+}
+
+func TestAggregateFastPathMultipleGroupColumns(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE sales (region TEXT, category TEXT, amount FLOAT64)`)
+	for _, sql := range []string{
+		`INSERT INTO sales VALUES ('east', 'books', 10.0)`,
+		`INSERT INTO sales VALUES ('east', 'books', 20.0)`,
+		`INSERT INTO sales VALUES ('east', 'games', 5.0)`,
+		`INSERT INTO sales VALUES ('west', 'books', 7.0)`,
+	} {
+		execSQL(t, db, sql)
+	}
+
+	stmt := mustParse(`
+		SELECT region, category, COUNT(*) AS count, SUM(amount) AS total
+		FROM sales
+		GROUP BY region, category
+	`).(*Select)
+	plan, ok, err := buildSimpleAggregatePlan(ExecEnv{ctx: context.Background(), tenant: "default", db: db}, stmt)
+	if err != nil || !ok {
+		t.Fatalf("multi-column aggregate plan = %#v, ok=%v, err=%v", plan, ok, err)
+	}
+	if len(plan.groupCols) != 2 {
+		t.Fatalf("group columns = %#v, want two", plan.groupCols)
+	}
+
+	rs := execSQL(t, db, `
+		SELECT region, category, COUNT(*) AS count, SUM(amount) AS total
+		FROM sales
+		GROUP BY region, category
+	`)
+	byGroup := make(map[string]Row, len(rs.Rows))
+	for _, row := range rs.Rows {
+		byGroup[row["region"].(string)+"/"+row["category"].(string)] = row
+	}
+	if len(byGroup) != 3 {
+		t.Fatalf("groups = %#v, want three", rs.Rows)
+	}
+	for group, want := range map[string]struct {
+		count int
+		total float64
+	}{
+		"east/books": {count: 2, total: 30},
+		"east/games": {count: 1, total: 5},
+		"west/books": {count: 1, total: 7},
+	} {
+		row, ok := byGroup[group]
+		if !ok {
+			t.Errorf("missing group %q in %#v", group, rs.Rows)
+			continue
+		}
+		expectInt(t, row["count"], want.count, group+" count")
+		expectFloat(t, row["total"], want.total, 1e-9, group+" total")
+	}
+}
+
+func TestAggregateFastPathMultipleGroupColumnsWithSeparatorValues(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE pair_groups (a TEXT, b TEXT)`)
+	// These pairs produced the same old delimiter-based composite key. SQL
+	// text can contain the unit separator, so group keys must length-frame
+	// each typed value rather than trusting a delimiter to be absent.
+	execSQL(t, db, "INSERT INTO pair_groups VALUES ('x', 'y\x1fS:z')")
+	execSQL(t, db, "INSERT INTO pair_groups VALUES ('x\x1fS:y', 'z')")
+
+	rs := execSQL(t, db, `SELECT a, b, COUNT(*) AS count FROM pair_groups GROUP BY a, b`)
+	if len(rs.Rows) != 2 {
+		t.Fatalf("groups = %#v, want two distinct groups", rs.Rows)
+	}
+	groups := make(map[[2]string]Row, len(rs.Rows))
+	for _, row := range rs.Rows {
+		groups[[2]string{row["a"].(string), row["b"].(string)}] = row
+	}
+	for _, pair := range [][2]string{{"x", "y\x1fS:z"}, {"x\x1fS:y", "z"}} {
+		row, ok := groups[pair]
+		if !ok {
+			t.Errorf("missing group %#v in %#v", pair, rs.Rows)
+			continue
+		}
+		expectInt(t, row["count"], 1, "separator group count")
+	}
 }
 
 func TestAggregateFastPathWithWhere(t *testing.T) {

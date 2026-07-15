@@ -89,9 +89,13 @@ func execStmt(env ExecEnv, stmt Statement) (*ResultSet, error) {
 }
 
 func isReadOnlyStatement(stmt Statement) bool {
-	switch stmt.(type) {
-	case *Select, *Explain, *Pragma:
+	switch s := stmt.(type) {
+	case *Select, *Pragma:
 		return true
+	case *Explain:
+		// Plain EXPLAIN only inspects the statement. EXPLAIN ANALYZE executes
+		// it, so it must use the inner statement's lock classification.
+		return !s.Analyze || isReadOnlyStatement(s.Statement)
 	default:
 		return false
 	}

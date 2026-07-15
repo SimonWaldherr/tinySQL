@@ -159,6 +159,11 @@ type CatalogDependency struct {
 // index definitions for introspection, but the query planner does not consume
 // them yet.
 type CatalogIndex struct {
+	// Tenant scopes the index definition to one logical database tenant.
+	// Unlike views and functions, materialized secondary indexes belong to a
+	// physical tenant table, so catalog metadata must never be shared across
+	// tenants with the same schema/name.
+	Tenant    string
 	Schema    string
 	Name      string
 	Table     string
@@ -485,9 +490,19 @@ func (c *CatalogManager) GetDependencies() []CatalogDependency {
 	return out
 }
 
-// RegisterIndex stores index metadata for introspection. If an index with the
-// same schema/name exists, it is replaced.
+// RegisterIndex stores index metadata in the default tenant. New engine code
+// should use RegisterIndexForTenant so tenant ownership is explicit.
 func (c *CatalogManager) RegisterIndex(idx *CatalogIndex) error {
+	tenant := "default"
+	if idx != nil && idx.Tenant != "" {
+		tenant = idx.Tenant
+	}
+	return c.RegisterIndexForTenant(tenant, idx)
+}
+
+// RegisterIndexForTenant stores index metadata for one tenant. If an index
+// with the same tenant/schema/name exists, it is replaced.
+func (c *CatalogManager) RegisterIndexForTenant(tenant string, idx *CatalogIndex) error {
 	if idx == nil || idx.Name == "" {
 		return fmt.Errorf("index name cannot be empty")
 	}
@@ -503,19 +518,23 @@ func (c *CatalogManager) RegisterIndex(idx *CatalogIndex) error {
 		idx.CreatedAt = time.Now()
 	}
 	cp := *idx
+	cp.Tenant = normalizeCatalogTenant(tenant)
 	cp.Columns = append([]string(nil), idx.Columns...)
-	c.indexes[cp.Schema+"."+cp.Name] = &cp
+	c.indexes[catalogIndexKey(cp.Tenant, cp.Schema, cp.Name)] = &cp
 	return nil
 }
 
-// DeleteIndex removes a stored index definition.
+// DeleteIndex removes an index definition from the default tenant. New engine
+// code should use DeleteIndexForTenant so tenant ownership is explicit.
 func (c *CatalogManager) DeleteIndex(schema, name string) error {
+	return c.DeleteIndexForTenant("default", schema, name)
+}
+
+// DeleteIndexForTenant removes a stored index definition from one tenant.
+func (c *CatalogManager) DeleteIndexForTenant(tenant, schema, name string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if schema == "" {
-		schema = "main"
-	}
-	key := schema + "." + name
+	key := catalogIndexKey(tenant, schema, name)
 	if _, ok := c.indexes[key]; !ok {
 		return fmt.Errorf("index %q not found", name)
 	}
@@ -523,25 +542,37 @@ func (c *CatalogManager) DeleteIndex(schema, name string) error {
 	return nil
 }
 
-// DeleteIndexesForTable removes all indexes registered for a table.
+// DeleteIndexesForTable removes default-tenant indexes registered for a
+// table. New engine code should use DeleteIndexesForTenantTable.
 func (c *CatalogManager) DeleteIndexesForTable(table string) {
+	c.DeleteIndexesForTenantTable("default", table)
+}
+
+// DeleteIndexesForTenantTable removes all indexes registered for a table in
+// one tenant only.
+func (c *CatalogManager) DeleteIndexesForTenantTable(tenant, table string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for key, idx := range c.indexes {
-		if strings.EqualFold(idx.Table, table) {
+		if idx.Tenant != "" && normalizeCatalogTenant(idx.Tenant) == normalizeCatalogTenant(tenant) && strings.EqualFold(idx.Table, table) {
 			delete(c.indexes, key)
 		}
 	}
 }
 
-// GetIndex retrieves an index definition by schema and name.
+// GetIndex retrieves a default-tenant index definition by schema and name.
+// New engine code should use GetIndexForTenant.
 func (c *CatalogManager) GetIndex(schema, name string) (*CatalogIndex, bool) {
+	return c.GetIndexForTenant("default", schema, name)
+}
+
+// GetIndexForTenant retrieves one tenant's index definition by schema and
+// name. Legacy unscoped catalog records intentionally do not match: guessing
+// their owner would let one tenant read or delete another tenant's metadata.
+func (c *CatalogManager) GetIndexForTenant(tenant, schema, name string) (*CatalogIndex, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if schema == "" {
-		schema = "main"
-	}
-	idx, ok := c.indexes[schema+"."+name]
+	idx, ok := c.indexes[catalogIndexKey(tenant, schema, name)]
 	if !ok {
 		return nil, false
 	}
@@ -550,7 +581,9 @@ func (c *CatalogManager) GetIndex(schema, name string) (*CatalogIndex, bool) {
 	return &cp, true
 }
 
-// GetIndexes returns all registered index definitions.
+// GetIndexes returns all registered index definitions, including legacy
+// unscoped records. It exists for administrative callers; query execution
+// and virtual tables must use GetIndexesForTenant.
 func (c *CatalogManager) GetIndexes() []*CatalogIndex {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -561,6 +594,47 @@ func (c *CatalogManager) GetIndexes() []*CatalogIndex {
 		out = append(out, &cp)
 	}
 	return out
+}
+
+// GetIndexesForTenant returns only index definitions owned by tenant. Legacy
+// records with an empty tenant are deliberately excluded rather than being
+// guessed as a particular tenant.
+func (c *CatalogManager) GetIndexesForTenant(tenant string) []*CatalogIndex {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	normalizedTenant := normalizeCatalogTenant(tenant)
+	out := make([]*CatalogIndex, 0)
+	for _, idx := range c.indexes {
+		if idx.Tenant == "" || normalizeCatalogTenant(idx.Tenant) != normalizedTenant {
+			continue
+		}
+		cp := *idx
+		cp.Columns = append([]string(nil), idx.Columns...)
+		out = append(out, &cp)
+	}
+	return out
+}
+
+func normalizeCatalogTenant(tenant string) string {
+	tenant = strings.TrimSpace(tenant)
+	if tenant == "" {
+		return "default"
+	}
+	return strings.ToLower(tenant)
+}
+
+func catalogIndexKey(tenant, schema, name string) string {
+	if schema == "" {
+		schema = "main"
+	}
+	return normalizeCatalogTenant(tenant) + "\x00" + strings.ToLower(schema) + "\x00" + strings.ToLower(name)
+}
+
+func legacyCatalogIndexKey(schema, name string) string {
+	if schema == "" {
+		schema = "main"
+	}
+	return "\x00legacy\x00" + strings.ToLower(schema) + "\x00" + strings.ToLower(name)
 }
 
 // MarkMaterializedViewsStaleByDependency marks opt-in materialized views stale

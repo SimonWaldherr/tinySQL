@@ -433,7 +433,7 @@ func sysConstraintsRows(env ExecEnv) []Row {
 // ─────────────────────────── sys.indexes ─────────────────────────────────
 
 func sysIndexesRows(env ExecEnv) []Row {
-	indexes := env.db.Catalog().GetIndexes()
+	indexes := env.db.Catalog().GetIndexesForTenant(env.tenant)
 	rows := make([]Row, len(indexes))
 	for i, idx := range indexes {
 		r := make(Row)

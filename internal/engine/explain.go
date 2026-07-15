@@ -12,10 +12,21 @@ func executeExplain(env ExecEnv, s *Explain) (*ResultSet, error) {
 	addExplainStep(&rows, "PLAN", statementName(s.Statement))
 	explainStatement(env, &rows, s.Statement)
 	if s.Analyze {
+		// EXPLAIN itself intentionally needs no object permission because it
+		// only describes a plan. ANALYZE executes the wrapped statement, so
+		// enforce that statement's permission explicitly before dispatching it.
+		if err := checkPermission(env.ctx, env.db, s.Statement); err != nil {
+			return nil, err
+		}
 		var before, after runtime.MemStats
 		runtime.ReadMemStats(&before)
 		started := time.Now()
-		rs, err := Execute(env.ctx, env.db, env.tenant, s.Statement)
+		// Execute already holds this statement's content lock. Re-entering it
+		// for a mutating inner statement would try to take a write lock while
+		// this goroutine still holds the outer lock and deadlock. execStmt
+		// intentionally shares the outer lock, rollback snapshot, audit entry,
+		// and statement WAL transaction instead.
+		rs, err := execStmt(env, s.Statement)
 		elapsed := time.Since(started)
 		runtime.ReadMemStats(&after)
 		if err != nil {

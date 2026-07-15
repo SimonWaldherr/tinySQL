@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"reflect"
 	"testing"
@@ -11,6 +12,33 @@ import (
 
 func newTestExecEnv() ExecEnv {
 	return ExecEnv{ctx: context.Background(), tenant: "tenant", db: storage.NewDB()}
+}
+
+func TestOrderedFastPathUsesSecondaryIndexRowIDs(t *testing.T) {
+	table := storage.NewTable("items", []storage.Column{{Name: "id", Type: storage.IntType}}, false)
+	table.Rows = [][]any{{0}, {1}}
+	plan := &simpleSelectPlan{
+		table:      table,
+		projs:      []simpleProjection{{name: "id", key: "id", colIdx: 0, expr: newVarRef("id")}},
+		orderBy:    []OrderItem{{Col: "id"}},
+		orderExprs: []Expr{&Literal{Val: 1}},
+		rowIDs:     []int{1},
+		outputCols: []string{"id"},
+		filter: func(raw []any) (bool, error) {
+			if raw[0] == 0 {
+				return false, fmt.Errorf("ordered index path examined a row outside rowIDs")
+			}
+			return true, nil
+		},
+	}
+
+	rs, ok, err := executeSimpleSelectOrderedFastPath(newTestExecEnv(), plan)
+	if err != nil || !ok {
+		t.Fatalf("ordered fast path = result:%#v ok:%v err:%v", rs, ok, err)
+	}
+	if len(rs.Rows) != 1 || rs.Rows[0]["id"] != 1 {
+		t.Fatalf("ordered index result = %#v", rs.Rows)
+	}
 }
 
 //nolint:gocyclo // Exhaustively exercises JSON helper branches.

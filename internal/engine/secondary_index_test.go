@@ -109,3 +109,20 @@ func TestSecondaryIndexUniqueInvalidationAndSnapshotPersistence(t *testing.T) {
 		t.Fatalf("reopened lookup = %#v", got.Rows)
 	}
 }
+
+func TestSecondaryIndexMixedNumericEqualityFallsBackToCorrectScan(t *testing.T) {
+	db := storage.NewDB()
+	executeIndexSQL(t, db, `CREATE TABLE values_by_id (id ANY, value TEXT)`)
+	executeIndexSQL(t, db, `INSERT INTO values_by_id VALUES (1, 'int'), (1.0, 'float'), ('1', 'text')`)
+	executeIndexSQL(t, db, `CREATE INDEX idx_values_by_id ON values_by_id(id)`)
+
+	for _, sql := range []string{
+		`SELECT value FROM values_by_id WHERE id = 1`,
+		`SELECT value FROM values_by_id WHERE id = 1.0`,
+	} {
+		rs := executeIndexSQL(t, db, sql)
+		if len(rs.Rows) != 2 || rs.Rows[0]["value"] != "int" || rs.Rows[1]["value"] != "float" {
+			t.Fatalf("%s = %#v; want int and float rows", sql, rs.Rows)
+		}
+	}
+}

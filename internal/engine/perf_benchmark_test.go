@@ -1,9 +1,8 @@
-// Benchmarks covering execution-engine hotspots that previously had no
-// dedicated coverage: multi-column GROUP BY (the processAggregateQuery path,
-// distinct from the single-column aggregate fast path), ORDER BY at scale,
-// JOIN at both the nested-loop and hash-join thresholds, plain table scans
-// (Row map allocation cost), row-wide LIKE/REGEXP scans, and FTS_SEARCH
-// repeated-query behavior (which exercises the document cache).
+// Benchmarks covering execution-engine hotspots: single- and multi-column
+// GROUP BY raw paths, ORDER BY at scale, JOIN at both the nested-loop and
+// hash-join thresholds, plain table scans (Row map allocation cost), row-wide
+// LIKE/REGEXP scans, and FTS_SEARCH repeated-query behavior (which exercises
+// the document cache).
 package engine
 
 import (
@@ -59,16 +58,15 @@ func runBench(b *testing.B, db *storage.DB, sql string) {
 
 // ─────────────────────────── GROUP BY ──────────────────────────────────────
 
-// BenchmarkGroupByTwoColumns exercises processAggregateQuery directly: the
-// single-column aggregate fast path (buildSimpleAggregatePlan) requires
-// exactly one GROUP BY column, so two columns forces the general path.
+// BenchmarkGroupByTwoColumns measures the raw aggregate fast path's composite
+// group key handling.
 func BenchmarkGroupByTwoColumns(b *testing.B) {
 	db := setupPerfTable(b, 20000)
 	runBench(b, db, `SELECT grp, sub, COUNT(*) as n, AVG(val) as a FROM t GROUP BY grp, sub`)
 }
 
-// BenchmarkGroupBySingleColumnFastPath is the sibling fast-path benchmark,
-// kept alongside the general-path one above for direct comparison.
+// BenchmarkGroupBySingleColumnFastPath measures the specialized one-column
+// variant that can use the grouped value itself as a map key.
 func BenchmarkGroupBySingleColumnFastPath(b *testing.B) {
 	db := setupPerfTable(b, 20000)
 	runBench(b, db, `SELECT grp, COUNT(*) as n, AVG(val) as a FROM t GROUP BY grp`)
@@ -153,6 +151,14 @@ func BenchmarkSelectStarFullScan(b *testing.B) {
 func BenchmarkSelectProjectedFullScan(b *testing.B) {
 	db := setupPerfTable(b, 20000)
 	runBench(b, db, `SELECT id, val FROM t`)
+}
+
+// BenchmarkSelectProjectedLimitOffset measures unfiltered pagination far into
+// a table. The raw scan can slice source rows before materializing maps, so
+// only the visible page should be projected.
+func BenchmarkSelectProjectedLimitOffset(b *testing.B) {
+	db := setupPerfTable(b, 20000)
+	runBench(b, db, `SELECT id, val FROM t LIMIT 20 OFFSET 10000`)
 }
 
 // ─────────────────────────── LIKE / REGEXP scans ───────────────────────────

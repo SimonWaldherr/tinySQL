@@ -143,6 +143,44 @@ func TestPagedIndexCompositeSeekReadsOnlyLocatedRows(t *testing.T) {
 	}
 }
 
+func TestPagedIndexMixedNumericEqualityFallsBackToLoadedTable(t *testing.T) {
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "numeric")
+	builder, err := storage.OpenDB(storage.StorageConfig{Mode: storage.ModePagedIndex, Path: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sql := range []string{
+		`CREATE TABLE nums (v FLOAT64)`,
+		`INSERT INTO nums VALUES (1)`,
+		`CREATE INDEX idx_nums_v ON nums(v)`,
+	} {
+		if _, err := Execute(ctx, builder, "default", mustParsePagedSQL(t, sql)); err != nil {
+			t.Fatalf("build %q: %v", sql, err)
+		}
+	}
+	if err := builder.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := builder.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := storage.OpenDB(storage.StorageConfig{Mode: storage.ModePagedIndex, Path: dir, ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	rs, err := Execute(ctx, reader, "default", mustParsePagedSQL(t, `SELECT v FROM nums WHERE v = 1.0`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rs.Rows) != 1 || expectAsInt(t, rs.Rows[0]["v"]) != 1 {
+		t.Fatalf("numeric equality after paged reopen = %#v", rs.Rows)
+	}
+}
+
 func mustParsePagedSQL(t *testing.T, sql string) Statement {
 	t.Helper()
 	stmt, err := NewParser(sql).ParseStatement()

@@ -360,6 +360,49 @@ func CanonicalIndexKey(values []any) []byte {
 	return canonicalIndexKeyInto(nil, values)
 }
 
+// CanonicalIndexValueEqual reports whether two individual values have the
+// same durable index encoding. The hot primitive forms avoid constructing
+// temporary []any and []byte values, while the fallback deliberately uses the
+// canonical encoder so newly supported value types retain identical behavior.
+func CanonicalIndexValueEqual(left, right any) bool {
+	switch value := left.(type) {
+	case nil:
+		return right == nil
+	case bool:
+		other, ok := right.(bool)
+		return ok && value == other
+	case int:
+		switch other := right.(type) {
+		case int:
+			return value == other
+		case int64:
+			return int64(value) == other
+		default:
+			return false
+		}
+	case int64:
+		switch other := right.(type) {
+		case int:
+			return value == int64(other)
+		case int64:
+			return value == other
+		default:
+			return false
+		}
+	case float64:
+		other, ok := right.(float64)
+		return ok && math.Float64bits(value) == math.Float64bits(other)
+	case string:
+		other, ok := right.(string)
+		return ok && value == other
+	case []byte:
+		other, ok := right.([]byte)
+		return ok && bytes.Equal(value, other)
+	default:
+		return bytes.Equal(CanonicalIndexKey([]any{left}), CanonicalIndexKey([]any{right}))
+	}
+}
+
 // appendCanonicalIndexValue produces a type-tagged, length-framed encoding.
 // It distinguishes NULL, empty BLOB, non-empty BLOB and text, while keeping a
 // complete leading component usable as a byte prefix for composite seeks.

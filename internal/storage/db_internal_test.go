@@ -131,3 +131,23 @@ func TestDeepCloneIndependence(t *testing.T) {
 		t.Fatalf("expected clone version to match original: %d vs %d", cloneTable.Version, original.Version)
 	}
 }
+
+func TestDeepCloneRowsRetainIndependentAppendCapacity(t *testing.T) {
+	db := NewDB()
+	table := NewTable("items", []Column{{Name: "id", Type: IntType}}, false)
+	table.Rows = append(table.Rows, []any{1}, []any{2})
+	if err := db.Put("tenant", table); err != nil {
+		t.Fatalf("failed to put table: %v", err)
+	}
+
+	clone := db.DeepClone()
+	clonedTable, err := clone.Get("tenant", "items")
+	if err != nil {
+		t.Fatalf("clone table missing: %v", err)
+	}
+	clonedTable.Rows[0] = append(clonedTable.Rows[0], 99)
+
+	if got := clonedTable.Rows[1][0]; got != 2 {
+		t.Fatalf("appending cloned row overwrote its sibling: got %#v", got)
+	}
+}

@@ -89,3 +89,76 @@ func TestAdvancedWALAutoLoggingNoOpWithoutWAL(t *testing.T) {
 		t.Errorf("expected 0 rows, got %d", got)
 	}
 }
+
+func TestAdvancedWALRecoveryRebuildsExistingSecondaryIndexes(t *testing.T) {
+	walPath := filepath.Join(t.TempDir(), "index-recovery.wal")
+
+	func() {
+		wal, err := storage.OpenAdvancedWAL(storage.AdvancedWALConfig{Path: walPath})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer wal.Close()
+		live := storage.NewDB()
+		live.AttachAdvancedWAL(wal)
+		execSQL(t, live, `CREATE TABLE users (email TEXT, name TEXT)`)
+		execSQL(t, live, `CREATE INDEX idx_users_email ON users(email)`)
+		execSQL(t, live, `INSERT INTO users VALUES ('alice@example.test', 'Alice')`)
+		execSQL(t, live, `INSERT INTO users VALUES ('bob@example.test', 'Bob')`)
+	}()
+
+	// In a normal restart the table/index definition comes from the last
+	// checkpoint while row changes after it come from AdvancedWAL recovery.
+	recovered := storage.NewDB()
+	execSQL(t, recovered, `CREATE TABLE users (email TEXT, name TEXT)`)
+	execSQL(t, recovered, `CREATE INDEX idx_users_email ON users(email)`)
+	wal, err := storage.OpenAdvancedWAL(storage.AdvancedWALConfig{Path: walPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	if _, err := wal.Recover(recovered); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+
+	rs := execSQL(t, recovered, `SELECT name FROM users WHERE email = 'bob@example.test'`)
+	if len(rs.Rows) != 1 || rs.Rows[0]["name"] != "Bob" {
+		t.Fatalf("indexed lookup after recovery = %#v", rs.Rows)
+	}
+}
+
+func TestAdvancedWALRecoveryIncludesForeignKeyReferentialActions(t *testing.T) {
+	walPath := filepath.Join(t.TempDir(), "foreign-key-recovery.wal")
+
+	func() {
+		wal, err := storage.OpenAdvancedWAL(storage.AdvancedWALConfig{Path: walPath})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer wal.Close()
+		live := storage.NewDB()
+		live.AttachAdvancedWAL(wal)
+		execSQL(t, live, `CREATE TABLE parent (id INT PRIMARY KEY)`)
+		execSQL(t, live, `CREATE TABLE child (id INT, parent_id INT REFERENCES parent(id) ON DELETE SET NULL)`)
+		execSQL(t, live, `INSERT INTO parent VALUES (1)`)
+		execSQL(t, live, `INSERT INTO child VALUES (10, 1)`)
+		execSQL(t, live, `DELETE FROM parent WHERE id = 1`)
+	}()
+
+	recovered := storage.NewDB()
+	execSQL(t, recovered, `CREATE TABLE parent (id INT PRIMARY KEY)`)
+	execSQL(t, recovered, `CREATE TABLE child (id INT, parent_id INT REFERENCES parent(id) ON DELETE SET NULL)`)
+	wal, err := storage.OpenAdvancedWAL(storage.AdvancedWALConfig{Path: walPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	if _, err := wal.Recover(recovered); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+
+	rs := execSQL(t, recovered, `SELECT parent_id FROM child WHERE id = 10`)
+	if len(rs.Rows) != 1 || rs.Rows[0]["parent_id"] != nil {
+		t.Fatalf("recovered ON DELETE SET NULL action = %#v", rs.Rows)
+	}
+}
