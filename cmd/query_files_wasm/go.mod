@@ -1,6 +1,6 @@
 module query_files_wasm
 
-go 1.26.0
+go 1.26.5
 
 replace github.com/SimonWaldherr/tinySQL => ../../
 

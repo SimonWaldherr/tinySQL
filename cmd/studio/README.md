@@ -7,7 +7,7 @@ embedded in-memory tinySQL database.
 
 ## Prerequisites
 
-- Go 1.25+
+- Go 1.26.5+
 - [Wails v2 CLI](https://wails.io/docs/gettingstarted/installation):
   ```bash
   go install github.com/wailsapp/wails/v2/cmd/wails@latest

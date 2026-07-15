@@ -1,6 +1,6 @@
 module github.com/SimonWaldherr/tinySQL/odbc
 
-go 1.26.0
+go 1.26.5
 
 replace github.com/SimonWaldherr/tinySQL => ../
 

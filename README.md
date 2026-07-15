@@ -19,7 +19,8 @@ Demos:
 go get github.com/SimonWaldherr/tinySQL@latest
 ```
 
-Requirements: Go 1.26+.
+Requirements: Go 1.26.5+ (the minimum patched release for the Go 1.26
+standard-library security fixes).
 
 ## Quick Start
 

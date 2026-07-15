@@ -1,6 +1,6 @@
 module github.com/SimonWaldherr/tinySQL/cmd/server
 
-go 1.26.0
+go 1.26.5
 
 require (
 	github.com/SimonWaldherr/tinySQL v0.16.0
