@@ -6,7 +6,7 @@ SHELL := /usr/bin/env bash
 .PHONY: build-wasm-browser build-wasm-node build-studio build-tinysqlpage build-migrate
 .PHONY: build-query-files build-query-files-wasm build-fsql run-query-files-demo
 .PHONY: build-gh-pages-demo update-gh-pages push-gh-pages
-.PHONY: test-all test-unit test-integration coverage build-check verify verify-ci
+.PHONY: test-all test-unit test-integration test-jsonv2 coverage build-check verify verify-ci
 .PHONY: test-query-files test-query-files-wasm test-fsql
 .PHONY: run-wasm-browser run-wasm-node-demo deps update-deps tidy bench script-lint docker-build info
 .DEFAULT_GOAL := help
@@ -203,6 +203,11 @@ test-unit:
 test-integration:
 	@echo "$(GREEN)Running integration tests...$(NC)"
 	$(GO) test $(GO_TEST_FLAGS) -run Integration ./...
+
+## test-jsonv2: Verify persistence compatibility with Go's experimental JSON v2 implementation
+test-jsonv2:
+	@echo "$(GREEN)Testing JSON v2 compatibility...$(NC)"
+	GOEXPERIMENT=jsonv2 $(GO) test $(GO_TEST_FLAGS) ./internal/storage ./internal/engine
 
 ## test-query-files: Run tests for cmd/query_files module
 test-query-files:

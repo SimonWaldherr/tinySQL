@@ -28,9 +28,11 @@ import (
 //   sys.status       – runtime status (goroutines, uptime, Go version, …)
 //   sys.memory       – Go runtime memory statistics
 //   sys.storage      – storage backend statistics
+//   sys.statistics   – persisted ANALYZE statistics and freshness
 //   sys.config       – database configuration
 //   sys.connections  – active tenant / connection info
 //   sys.procedures   – process-local in-memory stored procedures
+//   sys.extensions   – statically linked Go extensions active for this DB
 //   sys.objects      – unified status for tables, views, jobs, triggers, …
 //   sys.dependencies – dependency graph for views and materialized views
 // ============================================================================
@@ -63,6 +65,8 @@ func resolveSysTable(env ExecEnv, name string) ([]Row, error) {
 		return sysFunctionsRows(), nil
 	case "procedures":
 		return sysProceduresRows(), nil
+	case "extensions":
+		return sysExtensionsRows(env), nil
 	case "variables":
 		return sysVariablesRows(env), nil
 	case "status":
@@ -71,6 +75,8 @@ func resolveSysTable(env ExecEnv, name string) ([]Row, error) {
 		return sysMemoryRows(), nil
 	case "storage":
 		return sysStorageRows(env), nil
+	case "statistics":
+		return sysStatisticsRows(env), nil
 	case "config":
 		return sysConfigRows(env), nil
 	case "connections":
@@ -135,6 +141,7 @@ func allObjectStatusRows(env ExecEnv) []Row {
 	rows = append(rows, triggerStatusRows(env)...)
 	rows = append(rows, functionStatusRows(env)...)
 	rows = append(rows, procedureStatusRows(env)...)
+	rows = append(rows, extensionStatusRows(env)...)
 	return rows
 }
 
@@ -543,6 +550,86 @@ func sysProceduresRows() []Row {
 		putVal(r, "language", "GO")
 		putVal(r, "storage", "MEMORY")
 		putVal(r, "registered_at", proc.RegisteredAt)
+		rows = append(rows, r)
+	}
+	return rows
+}
+
+// ─────────────────────────── sys.statistics ─────────────────────────────
+
+func sysStatisticsRows(env ExecEnv) []Row {
+	rows := make([]Row, 0)
+	for _, tenant := range env.db.ListTenants() {
+		for _, table := range env.db.ListTables(tenant) {
+			stats := table.Statistics()
+			if stats == nil {
+				continue
+			}
+			schema, name := splitObjectName(table.Name)
+			for columnName, columnStats := range stats.Columns {
+				row := Row{}
+				putVal(row, "tenant", tenant)
+				putVal(row, "schema", schema)
+				putVal(row, "table_name", name)
+				putVal(row, "column_name", columnName)
+				putVal(row, "row_count", stats.RowCount)
+				putVal(row, "null_count", columnStats.NullCount)
+				putVal(row, "distinct_count", columnStats.DistinctCount)
+				putVal(row, "min", columnStats.Min)
+				putVal(row, "max", columnStats.Max)
+				putVal(row, "has_min_max", columnStats.HasMinMax)
+				putVal(row, "analyzed_at", stats.AnalyzedAt)
+				putVal(row, "is_stale", stats.Stale)
+				rows = append(rows, row)
+			}
+		}
+	}
+	return rows
+}
+
+// ─────────────────────────── sys.extensions ─────────────────────────────
+
+func sysExtensionsRows(env ExecEnv) []Row {
+	extensions := env.db.Extensions()
+	rows := make([]Row, len(extensions))
+	for i, extension := range extensions {
+		r := make(Row)
+		putVal(r, "name", extension.Name)
+		putVal(r, "version", extension.Version)
+		putVal(r, "description", extension.Description)
+		putVal(r, "language", "GO")
+		putVal(r, "linkage", "STATIC")
+		putVal(r, "capabilities", extensionCapabilitiesText(extension.Capabilities))
+		putVal(r, "loaded_at", extension.LoadedAt)
+		rows[i] = r
+	}
+	return rows
+}
+
+func extensionCapabilitiesText(capabilities []storage.ExtensionCapability) string {
+	parts := make([]string, len(capabilities))
+	for i, capability := range capabilities {
+		parts[i] = string(capability)
+	}
+	return strings.Join(parts, ",")
+}
+
+func extensionStatusRows(env ExecEnv) []Row {
+	extensions := env.db.Extensions()
+	rows := make([]Row, 0, len(extensions))
+	for _, extension := range extensions {
+		r := make(Row)
+		putVal(r, "schema", "sys")
+		putVal(r, "tenant", env.tenant)
+		putVal(r, "name", extension.Name)
+		putVal(r, "object_type", "EXTENSION")
+		putVal(r, "status", "ACTIVE")
+		putVal(r, "version", extension.Version)
+		putVal(r, "description", extension.Description)
+		putVal(r, "language", "GO")
+		putVal(r, "linkage", "STATIC")
+		putVal(r, "capabilities", extensionCapabilitiesText(extension.Capabilities))
+		putVal(r, "loaded_at", extension.LoadedAt)
 		rows = append(rows, r)
 	}
 	return rows

@@ -181,6 +181,19 @@ func putVecQueryCache(key vecQueryCacheKey, rows []vecScoredRow) {
 	vecQueryCacheState.entries[key] = vecQueryCacheEntry{rows: append([]vecScoredRow(nil), rows...), expires: time.Now().Add(cfg.ResultCacheTTL)}
 }
 
+// purgeVecQueryCacheFor removes query-result cache entries made obsolete by a
+// rolled-back DML statement. Normally table versions invalidate these entries;
+// rollback restores the old version, so the explicit purge is required.
+func purgeVecQueryCacheFor(tenant, table string) {
+	vecQueryCacheState.Lock()
+	for key := range vecQueryCacheState.entries {
+		if key.tenant == tenant && key.table == table {
+			delete(vecQueryCacheState.entries, key)
+		}
+	}
+	vecQueryCacheState.Unlock()
+}
+
 func recordVecQuery(event VectorQueryEvent) {
 	vecQueryCacheState.Lock()
 	defer vecQueryCacheState.Unlock()

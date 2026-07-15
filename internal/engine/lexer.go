@@ -359,7 +359,7 @@ func isKeyword(up string) bool {
 		// exact uppercase form — tIdent tokens preserve original case.)
 		"TRIGGER", "EACH", "BEFORE", "INSTEAD", "OF", "NEW", "OLD", "FOR",
 		// Statement wrappers and block delimiters
-		"EXPLAIN", "BEGIN",
+		"EXPLAIN", "ANALYZE", "BEGIN",
 		// FTS keywords
 		"VIRTUAL", "USING", "MATCH",
 		"FTS_MATCH", "FTS_RANK", "FTS_SNIPPET", "BM25",

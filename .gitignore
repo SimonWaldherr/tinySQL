@@ -25,6 +25,7 @@ cmd/desktop/build
 cmd/studio/build/bin/tinySQL Studio.app
 cmd/studio/build
 query_files.wasm.gz
+cmd/wasm_browser/web/tinySQL.wasm.gz
 data/osm_full
 data/osm_full_tags
 data/osm_sample

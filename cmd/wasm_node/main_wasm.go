@@ -7,7 +7,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
 	"syscall/js"
 	"time"
 
@@ -39,8 +38,12 @@ type APIResponse struct {
 
 // Logger for WASM environment
 func logInfo(msg string) {
-	log.Printf("[tinySQL-WASM] %s", msg)
-	js.Global().Get("console").Call("log", fmt.Sprintf("[tinySQL-WASM] %s", msg))
+	if !js.Global().Get("tinySQLWasmDebug").Truthy() {
+		return
+	}
+	if console := js.Global().Get("console"); console.Truthy() {
+		console.Call("log", fmt.Sprintf("[tinySQL-WASM] %s", msg))
+	}
 }
 
 func logError(msg string, err error) {
@@ -48,8 +51,9 @@ func logError(msg string, err error) {
 	if err != nil {
 		errMsg += fmt.Sprintf(" - %v", err)
 	}
-	log.Print(errMsg)
-	js.Global().Get("console").Call("error", errMsg)
+	if console := js.Global().Get("console"); console.Truthy() {
+		console.Call("error", errMsg)
+	}
 }
 
 // validateArgs checks if the required arguments are provided

@@ -15,6 +15,7 @@ const (
 	KindUnknown                StatementKind = "unknown"
 	KindSelect                 StatementKind = "select"
 	KindExplain                StatementKind = "explain"
+	KindAnalyze                StatementKind = "analyze"
 	KindPragma                 StatementKind = "pragma"
 	KindInsert                 StatementKind = "insert"
 	KindUpdate                 StatementKind = "update"
@@ -64,6 +65,8 @@ func AnalyzeStatement(stmt engine.Statement) Analysis {
 		return Analysis{Kind: KindSelect, ReadOnly: true, ResultProducing: true}
 	case *engine.Explain:
 		return Analysis{Kind: KindExplain, ReadOnly: true, ResultProducing: true}
+	case *engine.Analyze:
+		return Analysis{Kind: KindAnalyze, ObjectName: s.Table, Mutation: true, ResultProducing: true}
 	case *engine.Pragma:
 		return Analysis{Kind: KindPragma, ReadOnly: true, ResultProducing: true}
 	case *engine.Insert:

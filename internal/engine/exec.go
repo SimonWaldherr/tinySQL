@@ -104,6 +104,10 @@ type ExecEnv struct {
 	// NEW.col/OLD.col resolve even though the body statement's own row
 	// context (e.g. an INSERT's VALUES row) has no such columns.
 	triggerRow Row
+	// statementWAL is shared by nested DML (for example trigger bodies) so
+	// AdvancedWAL emits a single commit only after the outer statement has
+	// completed successfully.
+	statementWAL *statementWAL
 }
 
 // Execute runs a parsed SQL statement against the given storage DB and tenant.
@@ -139,12 +143,35 @@ func Execute(ctx context.Context, db *storage.DB, tenant string, stmt Statement)
 		db.LockContentForWrite()
 		defer db.UnlockContentForWrite()
 	}
+	var snapshot *storage.StatementSnapshot
+	var ftsState ftsSnapshot
+	if isAtomicDML(stmt) {
+		snapshot = db.SnapshotForStatement()
+		ftsState = takeFTSSnapshot(db)
+	}
 	// Registered before the recover defer below so it runs *after* it
 	// during unwind (defers run LIFO): recover finalizes err first, then
 	// this reads the now-final value — including errors turned from a
 	// panic — rather than an err that's still mid-update.
 	defer func() {
 		recordAudit(ctx, db, tenant, stmt, err)
+	}()
+	// This defer is registered before the recovery handler below so panic
+	// recovery turns into err first; only then do we roll the full DML state
+	// back. Audit logging above consequently observes the final outcome.
+	defer func() {
+		if err == nil || snapshot == nil {
+			return
+		}
+		db.RestoreStatementSnapshot(snapshot)
+		restoreFTSSnapshot(db, ftsState)
+		for _, rollbackTenant := range db.ListTenants() {
+			for _, table := range db.ListTables(rollbackTenant) {
+				invalidateConstraintIndexes(table)
+				purgeVectorCachesFor(rollbackTenant, table.Name)
+				purgeVecQueryCacheFor(rollbackTenant, table.Name)
+			}
+		}
 	}()
 	// cmd/server and cmd/tinysqld already recover from panics at their own
 	// request boundary, but an application embedding tinySQL directly (via
@@ -157,7 +184,21 @@ func Execute(ctx context.Context, db *storage.DB, tenant string, stmt Statement)
 			err = fmt.Errorf("internal error executing statement: %v", r)
 		}
 	}()
-	return execStmt(ExecEnv{ctx: ctx, tenant: tenant, db: db}, stmt)
+	statementWAL := newStatementWAL(db.AdvancedWAL())
+	rs, err = execStmt(ExecEnv{ctx: ctx, tenant: tenant, db: db, statementWAL: statementWAL}, stmt)
+	if err == nil {
+		err = statementWAL.commit()
+	}
+	return rs, err
+}
+
+func isAtomicDML(stmt Statement) bool {
+	switch stmt.(type) {
+	case *Insert, *Update, *Delete:
+		return true
+	default:
+		return false
+	}
 }
 
 // recordAudit appends one entry to db's audit log, if one is attached
@@ -196,6 +237,8 @@ func execStmt(env ExecEnv, stmt Statement) (*ResultSet, error) {
 	switch s := stmt.(type) {
 	case *Explain:
 		return executeExplain(env, s)
+	case *Analyze:
+		return executeAnalyze(env, s)
 	case *Pragma:
 		return executePragma(env, s)
 	case *CreateTable:
@@ -275,6 +318,33 @@ func isReadOnlyStatement(stmt Statement) bool {
 	default:
 		return false
 	}
+}
+
+func executeAnalyze(env ExecEnv, s *Analyze) (*ResultSet, error) {
+	tables := make([]*storage.Table, 0)
+	if s.Table != "" {
+		table, err := env.db.Get(env.tenant, s.Table)
+		if err != nil {
+			return nil, err
+		}
+		tables = append(tables, table)
+	} else {
+		tables = env.db.ListTables(env.tenant)
+	}
+	rows := make([]Row, 0, len(tables))
+	for _, table := range tables {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, err
+		}
+		stats := table.Analyze()
+		row := Row{}
+		putVal(row, "table_name", table.Name)
+		putVal(row, "row_count", stats.RowCount)
+		putVal(row, "column_count", len(stats.Columns))
+		putVal(row, "analyzed_at", stats.AnalyzedAt)
+		rows = append(rows, row)
+	}
+	return &ResultSet{Cols: []string{"table_name", "row_count", "column_count", "analyzed_at"}, Rows: rows}, nil
 }
 
 // rejectIfMutating returns an error for any statement that would modify data
@@ -812,6 +882,7 @@ func executeAlterTable(env ExecEnv, s *AlterTable) (*ResultSet, error) {
 		for i := range t.Rows {
 			t.Rows[i] = append(t.Rows[i], nil)
 		}
+		t.InvalidateStats()
 
 		// Update the table
 		if err := env.db.Put(env.tenant, t); err != nil {
@@ -890,6 +961,9 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 			}
 		}
 		t.Rows = append(t.Rows, row)
+		if err := t.InsertSecondaryIndexRow(len(t.Rows)-1, row); err != nil {
+			return nil, err
+		}
 		if err := wal.logInsert(env, len(t.Rows)-1, row, t.Cols); err != nil {
 			return nil, err
 		}
@@ -899,7 +973,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 			}
 		}
 		// FTS index is updated after all trigger hooks so it reflects final row data.
-		ftsIndexRow(env.tenant+"/"+s.Table, s.Table, len(t.Rows)-1, nil, row, tableColNames)
+		ftsIndexRow(ftsKey(env.db, env.tenant, s.Table), s.Table, len(t.Rows)-1, nil, row, tableColNames)
 		if len(s.Returning) > 0 {
 			returningRows = append(returningRows, newRow)
 		}
@@ -908,9 +982,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 		return nil, err
 	}
 	t.Version++
-	if err := t.RebuildSecondaryIndexes(); err != nil {
-		return nil, err
-	}
+	t.InvalidateStats()
 	t.MarkDirtyFrom(len(t.Rows) - len(s.Rows))
 	markDependentMaterializedViewsStale(env, s.Table)
 	if len(s.Returning) > 0 {
@@ -976,6 +1048,9 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			}
 		}
 		t.Rows = append(t.Rows, row)
+		if err := t.InsertSecondaryIndexRow(len(t.Rows)-1, row); err != nil {
+			return nil, err
+		}
 		if err := wal.logInsert(env, len(t.Rows)-1, row, t.Cols); err != nil {
 			return nil, err
 		}
@@ -985,7 +1060,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			}
 		}
 		// FTS index is updated after all trigger hooks so it reflects final row data.
-		ftsIndexRow(env.tenant+"/"+s.Table, s.Table, len(t.Rows)-1, nil, row, tableColNames)
+		ftsIndexRow(ftsKey(env.db, env.tenant, s.Table), s.Table, len(t.Rows)-1, nil, row, tableColNames)
 		if len(s.Returning) > 0 {
 			returningRows = append(returningRows, newRow)
 		}
@@ -994,9 +1069,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 		return nil, err
 	}
 	t.Version++
-	if err := t.RebuildSecondaryIndexes(); err != nil {
-		return nil, err
-	}
+	t.InvalidateStats()
 	t.MarkDirtyFrom(len(t.Rows) - len(s.Rows))
 	markDependentMaterializedViewsStale(env, s.Table)
 	if len(s.Returning) > 0 {
@@ -1268,6 +1341,9 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 			patchConstraintIndexRow(t, ri, t.Rows[ri], nextRow)
 			before := r
 			t.Rows[ri] = nextRow
+			if err := t.UpdateSecondaryIndexRow(ri, before, nextRow); err != nil {
+				return nil, err
+			}
 			if err := wal.logUpdate(env, ri, before, nextRow, t.Cols); err != nil {
 				return nil, err
 			}
@@ -1275,7 +1351,7 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 			if needsNewRow {
 				newRow = buildTableRow(t.Cols, tablePrefix, t.Rows[ri])
 			}
-			ftsIndexRow(env.tenant+"/"+s.Table, s.Table, ri, nil, t.Rows[ri], columnNames)
+			ftsIndexRow(ftsKey(env.db, env.tenant, s.Table), s.Table, ri, nil, t.Rows[ri], columnNames)
 			if hasAfter {
 				if err := fireTriggers(env, s.Table, "AFTER", "UPDATE", newRow, oldRow); err != nil {
 					return nil, err
@@ -1291,10 +1367,8 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 		return nil, err
 	}
 	t.Version++
-	if err := t.RebuildSecondaryIndexes(); err != nil {
-		return nil, err
-	}
 	if n > 0 {
+		t.InvalidateStats()
 		t.MarkDirtyFrom(-1) // UPDATE is non-append; force full-table WAL
 		markDependentMaterializedViewsStale(env, s.Table)
 	}
@@ -1366,13 +1440,19 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 		if err := validateRowConstraints(env, plan.table, nextRow, ri); err != nil {
 			return nil, true, err
 		}
+		if err := plan.table.CheckSecondaryIndexConstraints(nextRow, ri); err != nil {
+			return nil, true, err
+		}
 		patchConstraintIndexRow(plan.table, ri, plan.table.Rows[ri], nextRow)
 		before := raw
 		plan.table.Rows[ri] = nextRow
+		if err := plan.table.UpdateSecondaryIndexRow(ri, before, nextRow); err != nil {
+			return nil, true, err
+		}
 		if err := wal.logUpdate(env, ri, before, nextRow, plan.table.Cols); err != nil {
 			return nil, true, err
 		}
-		ftsIndexRow(env.tenant+"/"+s.Table, s.Table, ri, nil, plan.table.Rows[ri], columnNames)
+		ftsIndexRow(ftsKey(env.db, env.tenant, s.Table), s.Table, ri, nil, plan.table.Rows[ri], columnNames)
 		updated++
 	}
 	if err := wal.commit(); err != nil {
@@ -1381,6 +1461,7 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 
 	plan.table.Version++
 	if updated > 0 {
+		plan.table.InvalidateStats()
 		plan.table.MarkDirtyFrom(-1)
 		markDependentMaterializedViewsStale(env, s.Table)
 	}
@@ -1455,9 +1536,8 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 				}
 				t.Rows = nil
 				t.Version++
-				if err := t.RebuildSecondaryIndexes(); err != nil {
-					return nil, err
-				}
+				t.ClearSecondaryIndexes()
+				t.InvalidateStats()
 				t.MarkDirtyFrom(-1) // DELETE is non-append; force full-table WAL
 				markDependentMaterializedViewsStale(env, s.Table)
 			}
@@ -1474,9 +1554,8 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 			}
 			t.Rows = nil
 			t.Version++
-			if err := t.RebuildSecondaryIndexes(); err != nil {
-				return nil, err
-			}
+			t.ClearSecondaryIndexes()
+			t.InvalidateStats()
 			t.MarkDirtyFrom(-1) // DELETE is non-append; force full-table WAL
 			markDependentMaterializedViewsStale(env, s.Table)
 		}
@@ -1490,6 +1569,7 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 		colIndex := simpleColumnIndex(t, s.Table)
 		rawPlan := &simpleSelectPlan{colIndex: colIndex, where: s.Where, filter: buildRawFilter(colIndex, s.Where)}
 		kept := make([][]any, 0, len(t.Rows))
+		oldToNew := make(map[int]int, len(t.Rows))
 		del := 0
 		for i, r := range t.Rows {
 			if i&63 == 0 {
@@ -1505,9 +1585,10 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 				if err := wal.logDelete(env, i, r, t.Cols); err != nil {
 					return nil, err
 				}
-				ftsDeleteRow(env.tenant+"/"+s.Table, del+len(kept))
+				ftsDeleteRow(ftsKey(env.db, env.tenant, s.Table), del+len(kept))
 				del++
 			} else {
+				oldToNew[i] = len(kept)
 				kept = append(kept, r)
 			}
 		}
@@ -1516,10 +1597,9 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 		}
 		t.Rows = kept
 		t.Version++
-		if err := t.RebuildSecondaryIndexes(); err != nil {
-			return nil, err
-		}
+		t.ReindexSecondaryIndexRows(oldToNew)
 		if del > 0 {
+			t.InvalidateStats()
 			t.MarkDirtyFrom(-1)
 			markDependentMaterializedViewsStale(env, s.Table)
 		}
@@ -1528,6 +1608,7 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 
 	// Slow path: triggers present or complex predicate – build full Row maps.
 	kept := make([][]any, 0, len(t.Rows))
+	oldToNew := make(map[int]int, len(t.Rows))
 	del := 0
 	returningRows := make([]Row, 0)
 	tablePrefix := strings.ToLower(s.Table) + "."
@@ -1543,6 +1624,7 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 			return nil, err
 		}
 		if toTri(v) != tvTrue {
+			oldToNew[i] = len(kept)
 			kept = append(kept, r)
 		} else {
 			if hasBeforeDel {
@@ -1553,7 +1635,7 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 			if err := wal.logDelete(env, i, r, t.Cols); err != nil {
 				return nil, err
 			}
-			ftsDeleteRow(env.tenant+"/"+s.Table, del+len(kept))
+			ftsDeleteRow(ftsKey(env.db, env.tenant, s.Table), del+len(kept))
 			if hasAfterDel {
 				if err := fireTriggers(env, s.Table, "AFTER", "DELETE", nil, row); err != nil {
 					return nil, err
@@ -1570,10 +1652,9 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	}
 	t.Rows = kept
 	t.Version++
-	if err := t.RebuildSecondaryIndexes(); err != nil {
-		return nil, err
-	}
+	t.ReindexSecondaryIndexRows(oldToNew)
 	if del > 0 {
+		t.InvalidateStats()
 		t.MarkDirtyFrom(-1) // DELETE is non-append; force full-table WAL
 		markDependentMaterializedViewsStale(env, s.Table)
 	}
@@ -3788,8 +3869,11 @@ func seekKind(prefixCols, allCols int) string {
 }
 
 // selectSecondaryIndex extracts equality terms from a simple WHERE tree and
-// chooses the longest matching composite-index prefix. Other predicates stay
-// as residual filters and are still evaluated by the normal raw evaluator.
+// chooses the cheapest matching index prefix. Fresh ANALYZE statistics estimate
+// cardinality from column distinct counts; before ANALYZE (or after DML marked
+// statistics stale) it deterministically falls back to the longest prefix.
+// Other predicates stay as residual filters and are still evaluated by the
+// normal raw evaluator.
 func selectSecondaryIndex(table *storage.Table, colIndex map[string]int, where Expr) (*storage.SecondaryIndex, []any, []string, bool) {
 	if where == nil || len(table.Indexes) == 0 {
 		return nil, nil, nil, false
@@ -3799,7 +3883,14 @@ func selectSecondaryIndex(table *storage.Table, colIndex map[string]int, where E
 	var chosen *storage.SecondaryIndex
 	var values []any
 	var predicates []string
-	for _, idx := range table.Indexes {
+	bestEstimate := 0.0
+	indexNames := make([]string, 0, len(table.Indexes))
+	for name := range table.Indexes {
+		indexNames = append(indexNames, name)
+	}
+	sort.Strings(indexNames)
+	for _, indexName := range indexNames {
+		idx := table.Indexes[indexName]
 		candidate := make([]any, 0, len(idx.Columns))
 		candidatePredicates := make([]string, 0, len(idx.Columns))
 		for _, column := range idx.Columns {
@@ -3814,15 +3905,61 @@ func selectSecondaryIndex(table *storage.Table, colIndex map[string]int, where E
 			candidate = append(candidate, value)
 			candidatePredicates = append(candidatePredicates, column+" = ?")
 		}
-		if len(candidate) == 0 || (chosen != nil && len(candidate) <= len(values)) {
+		if len(candidate) == 0 {
 			continue
 		}
-		chosen, values, predicates = idx, candidate, candidatePredicates
+		estimate := estimateSecondaryIndexRows(table, idx, len(candidate))
+		if chosen != nil && !preferSecondaryIndex(idx, len(candidate), estimate, chosen, len(values), bestEstimate) {
+			continue
+		}
+		chosen, values, predicates, bestEstimate = idx, candidate, candidatePredicates, estimate
 	}
 	if chosen == nil {
 		return nil, nil, nil, false
 	}
+	// An index expected to return the full table costs more than a sequential
+	// scan because it still has to visit rows through RowIDs.
+	if table.Stats != nil && !table.Stats.Stale && len(table.Rows) > 0 && bestEstimate >= float64(len(table.Rows)) {
+		return nil, nil, nil, false
+	}
 	return chosen, values, predicates, totalTerms != len(values)
+}
+
+func preferSecondaryIndex(candidate *storage.SecondaryIndex, candidatePrefix int, candidateEstimate float64, current *storage.SecondaryIndex, currentPrefix int, currentEstimate float64) bool {
+	if candidateEstimate != currentEstimate {
+		return candidateEstimate < currentEstimate
+	}
+	if candidatePrefix != currentPrefix {
+		return candidatePrefix > currentPrefix
+	}
+	if candidate.Unique != current.Unique {
+		return candidate.Unique
+	}
+	return strings.ToLower(candidate.Name) < strings.ToLower(current.Name)
+}
+
+func estimateSecondaryIndexRows(table *storage.Table, index *storage.SecondaryIndex, prefixLen int) float64 {
+	if stats := table.Stats; stats != nil && !stats.Stale && stats.RowCount > 0 {
+		estimate := float64(stats.RowCount)
+		for _, column := range index.Columns[:prefixLen] {
+			columnStats, ok := stats.Columns[strings.ToLower(column)]
+			if !ok || columnStats.DistinctCount == 0 {
+				// A conservative default is preferable to claiming a selective
+				// lookup when a plugin type has no meaningful cardinality data.
+				estimate *= 0.1
+				continue
+			}
+			estimate /= float64(columnStats.DistinctCount)
+		}
+		if estimate < 1 {
+			return 1
+		}
+		return estimate
+	}
+	// Without fresh stats, preserve the historical behavior (longest prefix)
+	// but keep it deterministic by assigning each same-prefix index the same
+	// estimate. The name tie-breaker above then makes EXPLAIN reproducible.
+	return float64(len(table.Rows) + len(index.Columns) - prefixLen)
 }
 
 func collectEqualityTerms(expr Expr, colIndex map[string]int, out map[int]any) int {

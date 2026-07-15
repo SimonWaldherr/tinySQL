@@ -4,30 +4,30 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 	"syscall/js"
 	"time"
 
 	tsql "github.com/SimonWaldherr/tinySQL"
-	tsqldriver "github.com/SimonWaldherr/tinySQL/driver"
 	"github.com/SimonWaldherr/tinySQL/internal/engine"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 // Global state
 var (
-	db  *sql.DB
-	tx  *sql.Tx
 	ctx = context.Background()
 	// keep JS function references alive to avoid GC and subsequent panics
 	retainedFuncs []js.Func
-	// Keep a reference to the underlying storage DB when running in WASM
+	// wasmStorageDB is the committed browser-local database. transactionDB is a
+	// full snapshot copy used only while a JS transaction is active, avoiding
+	// database/sql and the driver/server stack in the browser bundle.
 	wasmStorageDB *storage.DB
+	transactionDB *storage.DB
+	wasmTenant    = "default"
+	wasmConnected bool
 )
 
 // QueryResult represents the result of a SQL query
@@ -48,8 +48,12 @@ type APIResponse struct {
 
 // Logger for WASM environment
 func logInfo(msg string) {
-	log.Printf("[tinySQL-WASM] %s", msg)
-	js.Global().Get("console").Call("log", fmt.Sprintf("[tinySQL-WASM] %s", msg))
+	if !js.Global().Get("tinySQLWasmDebug").Truthy() {
+		return
+	}
+	if console := js.Global().Get("console"); console.Truthy() {
+		console.Call("log", fmt.Sprintf("[tinySQL-WASM] %s", msg))
+	}
 }
 
 func logError(msg string, err error) {
@@ -57,8 +61,9 @@ func logError(msg string, err error) {
 	if err != nil {
 		errMsg += fmt.Sprintf(" - %v", err)
 	}
-	log.Print(errMsg)
-	js.Global().Get("console").Call("error", errMsg)
+	if console := js.Global().Get("console"); console.Truthy() {
+		console.Call("error", errMsg)
+	}
 }
 
 // validateArgs checks if the required arguments are provided
@@ -73,9 +78,11 @@ func validateArgs(args []js.Value, minCount int, expectedType js.Type) error {
 }
 
 func currentStorageDB() *storage.DB {
-	if current := tsqldriver.CurrentDefaultDB(); current != nil {
-		wasmStorageDB = current
-		return current
+	if !wasmConnected {
+		return nil
+	}
+	if transactionDB != nil {
+		return transactionDB
 	}
 	return wasmStorageDB
 }
@@ -84,37 +91,54 @@ func bindStorageDB(next *storage.DB, dsn string) error {
 	if next == nil {
 		next = storage.NewDB()
 	}
-	if dsn == "" {
-		dsn = "mem://?tenant=default"
-	}
-
-	if tx != nil {
-		if err := tx.Rollback(); err != nil {
-			logError("Failed to rollback active transaction during storage switch", err)
-		}
-		tx = nil
-	}
-	if db != nil {
-		if err := db.Close(); err != nil {
-			logError("Failed to close existing connection", err)
-		}
-		db = nil
-	}
-
-	wasmStorageDB = next
-	tsqldriver.SetDefaultDB(wasmStorageDB)
-
-	var err error
-	db, err = sql.Open("tinysql", dsn)
+	tenant, err := wasmTenantFromDSN(dsn)
 	if err != nil {
 		return err
 	}
-	if err = db.PingContext(ctx); err != nil {
-		_ = db.Close()
-		db = nil
-		return fmt.Errorf("connection test failed: %w", err)
-	}
+
+	wasmStorageDB = next
+	transactionDB = nil
+	wasmTenant = tenant
+	wasmConnected = true
 	return nil
+}
+
+// wasmTenantFromDSN preserves the small browser API's mem:// syntax without
+// linking the database/sql driver. Persistent DSNs are intentionally rejected:
+// browser persistence is handled by exportDB/importDB and local storage.
+func wasmTenantFromDSN(dsn string) (string, error) {
+	dsn = strings.TrimSpace(dsn)
+	if dsn == "" {
+		return "default", nil
+	}
+	if !strings.HasPrefix(strings.ToLower(dsn), "mem://") {
+		return "", fmt.Errorf("WASM supports only mem:// DSNs; use exportDB/importDB for persistence")
+	}
+	tenant := "default"
+	if queryAt := strings.IndexByte(dsn, '?'); queryAt >= 0 {
+		for _, field := range strings.Split(dsn[queryAt+1:], "&") {
+			key, value, ok := strings.Cut(field, "=")
+			if ok && strings.EqualFold(strings.TrimSpace(key), "tenant") {
+				tenant = strings.TrimSpace(value)
+			}
+		}
+	}
+	if tenant == "" {
+		return "", fmt.Errorf("tenant must not be empty")
+	}
+	return tenant, nil
+}
+
+func executeWASMStatement(sqlText string) (*tsql.ResultSet, error) {
+	source := currentStorageDB()
+	if source == nil {
+		return nil, fmt.Errorf("database not opened")
+	}
+	stmt, err := tsql.ParseSQL(sqlText)
+	if err != nil {
+		return nil, err
+	}
+	return tsql.Execute(ctx, source, wasmTenant, stmt)
 }
 
 // jsOpen opens a database connection
@@ -197,21 +221,24 @@ func jsImportDB(this js.Value, args []js.Value) any {
 func jsBegin(this js.Value, args []js.Value) any {
 	logInfo("Starting transaction...")
 
-	if db == nil {
+	if currentStorageDB() == nil {
 		return jsonResponse(APIResponse{Success: false, Error: "database not opened"})
 	}
 
-	if tx != nil {
+	if transactionDB != nil {
 		return jsonResponse(APIResponse{Success: false, Error: "transaction already active"})
 	}
 
-	var err error
-	tx, err = db.BeginTx(ctx, &sql.TxOptions{
-		Isolation: sql.LevelDefault,
-		ReadOnly:  false,
-	})
+	// A snapshot copy keeps the browser API transactional without linking the
+	// database/sql driver. Save/Load preserves rows, indexes and catalog state.
+	snapshot, err := storage.SaveToBytes(wasmStorageDB)
 	if err != nil {
-		logError("Failed to begin transaction", err)
+		logError("Failed to snapshot transaction", err)
+		return jsonResponse(APIResponse{Success: false, Error: err.Error()})
+	}
+	transactionDB, err = storage.LoadFromBytes(snapshot)
+	if err != nil {
+		logError("Failed to open transaction snapshot", err)
 		return jsonResponse(APIResponse{Success: false, Error: err.Error()})
 	}
 
@@ -285,14 +312,15 @@ func jsExplain(this js.Value, args []js.Value) any {
 
 // jsListTables returns all table names in the current storage DB tenant.
 func jsListTables(this js.Value, args []js.Value) any {
-	if wasmStorageDB == nil {
+	source := currentStorageDB()
+	if source == nil {
 		return jsonResponse(map[string]any{"error": "database not initialized"})
 	}
-	tenant := "default"
+	tenant := wasmTenant
 	if len(args) > 0 && args[0].Type() == js.TypeString {
 		tenant = args[0].String()
 	}
-	tables := wasmStorageDB.ListTables(tenant)
+	tables := source.ListTables(tenant)
 	names := make([]string, 0, len(tables))
 	for _, t := range tables {
 		names = append(names, t.Name)
@@ -302,18 +330,19 @@ func jsListTables(this js.Value, args []js.Value) any {
 
 // jsDescribeTable returns column information for a given table.
 func jsDescribeTable(this js.Value, args []js.Value) any {
-	if wasmStorageDB == nil {
+	source := currentStorageDB()
+	if source == nil {
 		return jsonResponse(map[string]any{"error": "database not initialized"})
 	}
 	if len(args) < 1 || args[0].Type() != js.TypeString {
 		return jsonResponse(map[string]any{"error": "table name required"})
 	}
-	tenant := "default"
+	tenant := wasmTenant
 	tableName := args[0].String()
 	if len(args) > 1 && args[1].Type() == js.TypeString {
 		tenant = args[1].String()
 	}
-	t, err := wasmStorageDB.Get(tenant, tableName)
+	t, err := source.Get(tenant, tableName)
 	if err != nil || t == nil {
 		return jsonResponse(map[string]any{"error": fmt.Sprintf("table %s not found", tableName)})
 	}
@@ -328,16 +357,12 @@ func jsDescribeTable(this js.Value, args []js.Value) any {
 func jsCommit(this js.Value, args []js.Value) any {
 	logInfo("Committing transaction...")
 
-	if tx == nil {
+	if transactionDB == nil {
 		return jsonResponse(APIResponse{Success: false, Error: "no active transaction"})
 	}
 
-	if err := tx.Commit(); err != nil {
-		logError("Failed to commit transaction", err)
-		return jsonResponse(APIResponse{Success: false, Error: err.Error()})
-	}
-
-	tx = nil
+	wasmStorageDB = transactionDB
+	transactionDB = nil
 	logInfo("Transaction committed successfully")
 	return jsonResponse(APIResponse{Success: true, Message: "Transaction committed"})
 }
@@ -346,16 +371,11 @@ func jsCommit(this js.Value, args []js.Value) any {
 func jsRollback(this js.Value, args []js.Value) any {
 	logInfo("Rolling back transaction...")
 
-	if tx == nil {
+	if transactionDB == nil {
 		return jsonResponse(APIResponse{Success: false, Error: "no active transaction"})
 	}
 
-	if err := tx.Rollback(); err != nil {
-		logError("Failed to rollback transaction", err)
-		return jsonResponse(APIResponse{Success: false, Error: err.Error()})
-	}
-
-	tx = nil
+	transactionDB = nil
 	logInfo("Transaction rolled back successfully")
 	return jsonResponse(APIResponse{Success: true, Message: "Transaction rolled back"})
 }
@@ -366,22 +386,25 @@ func jsExec(this js.Value, args []js.Value) any {
 		return jsonResponse(APIResponse{Success: false, Error: err.Error()})
 	}
 
-	if db == nil {
+	if currentStorageDB() == nil {
 		return jsonResponse(APIResponse{Success: false, Error: "database not opened"})
 	}
 
 	sqlStr := args[0].String()
+	// Preserve database/sql-style transaction commands used by the reference
+	// UI while the browser bundle executes all regular SQL directly.
+	switch strings.ToUpper(strings.TrimSpace(strings.TrimSuffix(sqlStr, ";"))) {
+	case "BEGIN", "BEGIN TRANSACTION":
+		return jsBegin(this, nil)
+	case "COMMIT", "END":
+		return jsCommit(this, nil)
+	case "ROLLBACK":
+		return jsRollback(this, nil)
+	}
 	logInfo(fmt.Sprintf("Executing SQL: %s", sqlStr))
 
 	start := time.Now()
-	var result sql.Result
-	var err error
-
-	if tx != nil {
-		result, err = tx.ExecContext(ctx, sqlStr)
-	} else {
-		result, err = db.ExecContext(ctx, sqlStr)
-	}
+	result, err := executeWASMStatement(sqlStr)
 
 	elapsed := time.Since(start)
 
@@ -390,15 +413,13 @@ func jsExec(this js.Value, args []js.Value) any {
 		return jsonResponse(APIResponse{Success: false, Error: err.Error()})
 	}
 
-	rowsAffected, _ := result.RowsAffected()
-	lastInsertId, _ := result.LastInsertId()
+	rowsAffected := resultRowsAffected(result)
 
 	logInfo(fmt.Sprintf("SQL executed successfully in %v, rows affected: %d", elapsed, rowsAffected))
 
 	return jsonResponse(APIResponse{
 		Success: true,
-		Message: fmt.Sprintf("Executed successfully. Rows affected: %d, Last insert ID: %d, Elapsed: %v",
-			rowsAffected, lastInsertId, elapsed),
+		Message: fmt.Sprintf("Executed successfully. Rows affected: %d, Elapsed: %v", rowsAffected, elapsed),
 	})
 }
 
@@ -408,7 +429,7 @@ func jsQuery(this js.Value, args []js.Value) any {
 		return jsonResponse(QueryResult{Error: err.Error()})
 	}
 
-	if db == nil {
+	if currentStorageDB() == nil {
 		return jsonResponse(QueryResult{Error: "database not opened"})
 	}
 
@@ -416,59 +437,28 @@ func jsQuery(this js.Value, args []js.Value) any {
 	logInfo(fmt.Sprintf("Executing query: %s", sqlStr))
 
 	start := time.Now()
-	var rows *sql.Rows
-	var err error
-
-	if tx != nil {
-		rows, err = tx.QueryContext(ctx, sqlStr)
-	} else {
-		rows, err = db.QueryContext(ctx, sqlStr)
-	}
-
+	resultSet, err := executeWASMStatement(sqlStr)
 	if err != nil {
 		logError("Query execution failed", err)
 		return jsonResponse(QueryResult{Error: err.Error()})
 	}
-	defer rows.Close()
-
-	// Get column information
-	columns, err := rows.Columns()
-	if err != nil {
-		logError("Failed to get columns", err)
-		return jsonResponse(QueryResult{Error: err.Error()})
+	if resultSet == nil {
+		resultSet = &tsql.ResultSet{}
 	}
 
 	// Prepare result structure
 	result := QueryResult{
-		Columns: columns,
-		Rows:    make([][]any, 0),
+		Columns: resultSet.Cols,
+		Rows:    make([][]any, 0, len(resultSet.Rows)),
 	}
 
-	// Scan all rows
-	for rows.Next() {
-		values := make([]any, len(columns))
-		valuePtrs := make([]any, len(columns))
-		for i := range values {
-			valuePtrs[i] = &values[i]
+	for _, sourceRow := range resultSet.Rows {
+		row := make([]any, len(resultSet.Cols))
+		for i, column := range resultSet.Cols {
+			value, _ := tsql.GetVal(sourceRow, column)
+			row[i] = convertValue(value)
 		}
-
-		if err := rows.Scan(valuePtrs...); err != nil {
-			logError("Failed to scan row", err)
-			return jsonResponse(QueryResult{Error: err.Error()})
-		}
-
-		// Convert values to proper types
-		row := make([]any, len(columns))
-		for i, val := range values {
-			row[i] = convertValue(val)
-		}
-
 		result.Rows = append(result.Rows, row)
-	}
-
-	if err = rows.Err(); err != nil {
-		logError("Row iteration error", err)
-		return jsonResponse(QueryResult{Error: err.Error()})
 	}
 
 	result.Count = len(result.Rows)
@@ -483,21 +473,9 @@ func jsQuery(this js.Value, args []js.Value) any {
 func jsClose(this js.Value, args []js.Value) any {
 	logInfo("Closing database connection...")
 
-	if tx != nil {
-		logInfo("Rolling back active transaction...")
-		if err := tx.Rollback(); err != nil {
-			logError("Failed to rollback transaction during close", err)
-		}
-		tx = nil
-	}
-
-	if db != nil {
-		if err := db.Close(); err != nil {
-			logError("Failed to close database", err)
-			return jsonResponse(APIResponse{Success: false, Error: err.Error()})
-		}
-		db = nil
-	}
+	transactionDB = nil
+	wasmStorageDB = nil
+	wasmConnected = false
 
 	logInfo("Database connection closed successfully")
 	return jsonResponse(APIResponse{Success: true, Message: "Database closed"})
@@ -506,23 +484,17 @@ func jsClose(this js.Value, args []js.Value) any {
 // jsStatus returns the current status of the database
 func jsStatus(this js.Value, args []js.Value) any {
 	status := map[string]any{
-		"connected":          db != nil,
-		"transaction_active": tx != nil,
-		"driver":             "tinysql",
+		"connected":          currentStorageDB() != nil,
+		"transaction_active": transactionDB != nil,
+		"driver":             "tinysql-wasm-direct",
 		"version":            "1.0.0",
 		"build_time":         time.Now().Format(time.RFC3339),
 	}
 
-	if db != nil {
-		stats := db.Stats()
+	if source := currentStorageDB(); source != nil {
 		status["connection_stats"] = map[string]any{
-			"open_connections":    stats.OpenConnections,
-			"in_use":              stats.InUse,
-			"idle":                stats.Idle,
-			"wait_count":          stats.WaitCount,
-			"wait_duration":       stats.WaitDuration.String(),
-			"max_idle_closed":     stats.MaxIdleClosed,
-			"max_lifetime_closed": stats.MaxLifetimeClosed,
+			"open_connections": 1,
+			"tables":           len(source.ListTables(wasmTenant)),
 		}
 	}
 
@@ -547,6 +519,23 @@ func convertValue(val any) any {
 	default:
 		return v
 	}
+}
+
+func resultRowsAffected(result *tsql.ResultSet) int {
+	if result == nil || len(result.Rows) == 0 {
+		return 0
+	}
+	for _, key := range []string{"updated", "deleted"} {
+		if value, ok := tsql.GetVal(result.Rows[0], key); ok {
+			switch n := value.(type) {
+			case int:
+				return n
+			case int64:
+				return int(n)
+			}
+		}
+	}
+	return len(result.Rows)
 }
 
 // jsonResponse marshals any value to JSON string

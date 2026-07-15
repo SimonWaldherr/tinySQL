@@ -28,11 +28,13 @@ Useful targets:
 | `make build` | Build the main `cmd/tinysql` CLI into `bin/tinysql`. |
 | `make build-all` | Build the main CLI and the common command demos into `bin/`. |
 | `make build-query-files-wasm` | Build the browser playground WASM artifacts. |
+| `make build-wasm-browser` / `make build-wasm-node` | Build the browser or Node WASM API bundles. |
 | `make build-gh-pages-demo` | Build the static files used by the GitHub Pages demo. |
 | `make update-gh-pages` | Build the demo, update the `gh-pages` worktree, and commit changes there. |
 | `make push-gh-pages` | Run `update-gh-pages` and push the `gh-pages` branch. |
 | `make test` / `make test-all` | Run root tests plus standalone module tests for query file demos. |
 | `make test-unit` | Run short unit tests. |
+| `make test-jsonv2` | Exercise storage and engine persistence tests with Go's experimental JSON v2 implementation; it is a compatibility gate, not a production default. |
 | `make test-query-files-wasm` | Run tests inside `cmd/query_files_wasm`. |
 | `make coverage` | Run tests and open an HTML coverage report. |
 | `make bench` | Run Go benchmarks with allocation output. |
@@ -59,6 +61,9 @@ Notes:
 - `make verify-ci` is the safest pre-push check because it does not rewrite Go
   files.
 - `make verify` runs `make fmt`, so it may modify tracked Go files.
+- Go 1.26's `testing/synctest` is used for virtual-time concurrency tests;
+  keep new timing-sensitive tests deterministic rather than adding real sleeps.
+- CI compiles all browser and Node WASM targets in addition to the host build.
 - `make update-gh-pages` creates or refreshes a local worktree for the
   `gh-pages` branch and commits only when the generated static demo changed.
 - `make push-gh-pages` pushes only `gh-pages`; push `main` separately after

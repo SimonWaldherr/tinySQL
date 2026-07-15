@@ -3,30 +3,27 @@ package main
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
-	"sync/atomic"
 	"testing"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
 	tsqldriver "github.com/SimonWaldherr/tinySQL/driver"
 )
 
-var testCounter atomic.Int64
-
 // newTestApp creates a fully isolated App for testing. Each call uses a unique
-// tenant name so tests don't interfere through the global driver server.
+// storage DB. The driver's empty DSN is the intentional embedding path that
+// reuses the DB installed by SetDefaultDB; named mem:// DSNs own a separate DB.
 func newTestApp(t *testing.T) *App {
 	t.Helper()
 
 	nativeDB := tinysql.NewDB()
 	tsqldriver.SetDefaultDB(nativeDB)
-	tenant := fmt.Sprintf("test_%d", testCounter.Add(1))
+	tenant := "default"
 
-	sqlDB, err := sql.Open("tinysql", "mem://?tenant="+tenant)
+	sqlDB, err := sql.Open("tinysql", "")
 	if err != nil {
 		t.Fatalf("open sql db: %v", err)
 	}

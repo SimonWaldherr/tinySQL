@@ -209,6 +209,12 @@ type Explain struct {
 	Analyze   bool
 }
 
+// Analyze refreshes persisted planner statistics for one table, or every
+// table in the current tenant when Table is empty.
+type Analyze struct {
+	Table string
+}
+
 // Pragma represents a SQLite-compatible PRAGMA statement.
 type Pragma struct {
 	Name   string
@@ -565,6 +571,8 @@ func (p *Parser) ParseStatement() (Statement, error) {
 	switch p.cur.Val {
 	case "EXPLAIN":
 		return p.parseExplain()
+	case "ANALYZE":
+		return p.parseAnalyze()
 	case "PRAGMA":
 		return p.parsePragma()
 	case "CREATE":
@@ -642,6 +650,24 @@ func (p *Parser) parseExplain() (Statement, error) {
 		return nil, err
 	}
 	return &Explain{Statement: stmt, Analyze: analyze}, nil
+}
+
+func (p *Parser) parseAnalyze() (Statement, error) {
+	p.next()
+	stmt := &Analyze{}
+	if p.cur.Typ != tEOF && !(p.cur.Typ == tSymbol && p.cur.Val == ";") {
+		stmt.Table = p.parseQualifiedIdentLike()
+		if stmt.Table == "" {
+			return nil, p.errf("expected table name after ANALYZE")
+		}
+	}
+	if p.cur.Typ == tSymbol && p.cur.Val == ";" {
+		p.next()
+	}
+	if p.cur.Typ != tEOF {
+		return nil, p.errf("unexpected token after ANALYZE")
+	}
+	return stmt, nil
 }
 
 func (p *Parser) parsePragma() (Statement, error) {

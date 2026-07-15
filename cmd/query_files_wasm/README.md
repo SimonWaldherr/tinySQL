@@ -41,6 +41,10 @@ Generated artifacts:
 - `query_files.wasm.gz` (if `gzip` is available)
 - `wasm_exec.js`
 
+Modern browsers load `query_files.wasm.gz` with streaming decompression when
+available. The loader falls back to the uncompressed `.wasm` asset on older
+browsers or servers that already apply HTTP compression.
+
 ## Run locally
 
 ```bash

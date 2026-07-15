@@ -12,7 +12,17 @@ async function main() {
   const go = new Go();
   const wasmBuffer = fs.readFileSync(wasmPath);
   const { instance } = await WebAssembly.instantiate(wasmBuffer, go.importObject);
-  await go.run(instance);
+
+  // The module deliberately remains alive to serve its JS API, so do not
+  // await go.run(): it resolves only after the runtime exits. Wait for the
+  // exported API instead.
+  go.run(instance).catch(err => {
+    console.error('tinySQL WASM runtime failed:', err);
+    process.exit(1);
+  });
+  for (let attempt = 0; attempt < 100 && !global.tinySQL; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
 
   if (!global.tinySQL) {
     console.error('tinySQL API not available');

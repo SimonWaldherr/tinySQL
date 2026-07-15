@@ -97,6 +97,10 @@ type ColType = storage.ColType
 // ConstraintType enumerates supported column constraints.
 type ConstraintType = storage.ConstraintType
 
+// ColumnStats and TableStats are the persisted results of an ANALYZE command.
+type ColumnStats = storage.ColumnStats
+type TableStats = storage.TableStats
+
 // Row represents a single result row mapped by column name (case-insensitive).
 // Keys include both qualified (table.column) and unqualified (column) names.
 type Row = engine.Row
@@ -374,6 +378,28 @@ type StorageBackend = storage.StorageBackend
 
 // BackendStats provides observability into storage backend behaviour.
 type BackendStats = storage.BackendStats
+
+// ExtensionCapability describes a resource category a statically linked Go
+// extension declares it may need. Declarations are visible through
+// sys.extensions; capability enforcement is not implemented yet.
+type ExtensionCapability = storage.ExtensionCapability
+
+const (
+	CapabilityFilesystem = storage.CapabilityFilesystem
+	CapabilityNetwork    = storage.CapabilityNetwork
+	CapabilityWrite      = storage.CapabilityWrite
+	CapabilitySecrets    = storage.CapabilitySecrets
+)
+
+// ExtensionInfo describes a Go extension active for one DB instance.
+type ExtensionInfo = storage.ExtensionInfo
+
+// Extension is implemented by statically linked Go extension packages. Import
+// an extension package in the embedding application and activate it with
+// db.Use(extension). Dynamic Go shared-object plugins are intentionally not
+// supported because they are not portable across tinySQL's Go, TinyGo, and
+// WebAssembly targets.
+type Extension = storage.Extension
 
 // ============================================================================
 // Encryption at rest - AES-256-GCM for disk-backed table files

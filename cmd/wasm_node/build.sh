@@ -23,6 +23,34 @@ EOF
 filesize() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null || echo 0; }
 human() { numfmt --to=iec-i --suffix=B "$1" 2>/dev/null || echo "$1 bytes"; }
 
+optimise_wasm() {
+    local best_size variant temp size
+    if ! command -v wasm-opt >/dev/null 2>&1; then
+        echo "Tip: install Binaryen (wasm-opt) for additional WASM size optimisation"
+        return
+    fi
+    best_size="$(filesize "$WASM_OUT")"
+    for variant in \
+        "--enable-bulk-memory -Oz --strip-debug" \
+        "--enable-bulk-memory -Oz --strip-debug --converge" \
+        "--enable-bulk-memory -O3 --strip-debug --converge"; do
+        temp="${WASM_OUT}.opt.tmp"
+        # shellcheck disable=SC2086
+        if wasm-opt $variant -o "$temp" "$WASM_OUT" 2>/dev/null; then
+            size="$(filesize "$temp")"
+            if [[ "$size" -gt 0 && "$size" -lt "$best_size" ]]; then
+                echo "  wasm-opt $variant: saved $((best_size - size)) bytes"
+                mv -f "$temp" "$WASM_OUT"
+                best_size="$size"
+            else
+                rm -f "$temp"
+            fi
+        else
+            rm -f "$temp"
+        fi
+    done
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --run|-r)
@@ -89,6 +117,7 @@ if [[ "$SKIP_BUILD" == false ]]; then
     cp "$WASM_EXEC_PATH" wasm_exec.js
     # shellcheck disable=SC2086
     GOOS=js GOARCH=wasm go build ${GOFLAGS:-} -trimpath -buildvcs=false -ldflags "-s -w" -o "$WASM_OUT" .
+    optimise_wasm
 fi
 
 echo "Done."

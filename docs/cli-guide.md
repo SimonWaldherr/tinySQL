@@ -42,6 +42,8 @@ demonstrates the current feature set without a backend:
 - full-text search, vector search, hybrid retrieval, and in-memory stored
   procedure examples;
 - shareable demo URLs where the SQL and sample data are encoded in the URL hash.
+- a pre-compressed WASM companion with a streaming-decompression loader for
+  lower static-host download cost, with an uncompressed fallback.
 
 Build and publish helpers (see the [Development Guide](./development-guide.md)
 for details):

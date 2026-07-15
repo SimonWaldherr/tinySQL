@@ -23,9 +23,44 @@ import "github.com/SimonWaldherr/tinySQL/internal/storage"
 // no-op when wal is nil, so callers can construct one unconditionally and
 // only pay for the nil check.
 type walAuto struct {
-	wal   *storage.AdvancedWAL
-	txID  storage.TxID
-	table string
+	wal            *storage.AdvancedWAL
+	txID           storage.TxID
+	table          string
+	deferredCommit bool
+}
+
+// statementWAL groups the row records emitted by one outer Execute call into
+// a single AdvancedWAL transaction. Nested DML from triggers shares this
+// object, so its records cannot be committed if a later trigger fails and the
+// statement is rolled back.
+type statementWAL struct {
+	wal     *storage.AdvancedWAL
+	txID    storage.TxID
+	started bool
+}
+
+func newStatementWAL(wal *storage.AdvancedWAL) *statementWAL {
+	return &statementWAL{wal: wal}
+}
+
+func (s *statementWAL) begin() error {
+	if s == nil || s.wal == nil || s.started {
+		return nil
+	}
+	s.txID = s.wal.NewAutoTxID()
+	if _, err := s.wal.LogBegin(s.txID); err != nil {
+		return err
+	}
+	s.started = true
+	return nil
+}
+
+func (s *statementWAL) commit() error {
+	if s == nil || s.wal == nil || !s.started {
+		return nil
+	}
+	_, err := s.wal.LogCommit(s.txID)
+	return err
 }
 
 // beginWALAuto starts an implicit WAL transaction for a statement against
@@ -35,6 +70,20 @@ type walAuto struct {
 // failure should abort the statement — see executeInsertAllColumns for the
 // pattern).
 func beginWALAuto(env ExecEnv, table string) (*walAuto, error) {
+	if env.statementWAL != nil {
+		if err := env.statementWAL.begin(); err != nil {
+			return nil, err
+		}
+		if env.statementWAL.wal == nil {
+			return &walAuto{}, nil
+		}
+		return &walAuto{
+			wal:            env.statementWAL.wal,
+			txID:           env.statementWAL.txID,
+			table:          table,
+			deferredCommit: true,
+		}, nil
+	}
 	wal := env.db.AdvancedWAL()
 	if wal == nil {
 		return &walAuto{}, nil
@@ -75,6 +124,9 @@ func (a *walAuto) logDelete(env ExecEnv, rowIdx int, before []any, cols []storag
 // is attached or beginWALAuto never started a transaction.
 func (a *walAuto) commit() error {
 	if a == nil || a.wal == nil {
+		return nil
+	}
+	if a.deferredCommit {
 		return nil
 	}
 	_, err := a.wal.LogCommit(a.txID)

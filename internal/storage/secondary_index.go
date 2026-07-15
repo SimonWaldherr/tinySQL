@@ -119,6 +119,140 @@ func (t *Table) RebuildSecondaryIndexes() error {
 	return nil
 }
 
+// InsertSecondaryIndexRow adds one appended table row to every materialized
+// secondary index. It avoids rebuilding unaffected keys after every INSERT.
+// Call it only after the row has been appended to t.Rows and constraints have
+// been checked.
+func (t *Table) InsertSecondaryIndexRow(rowID int, row []any) error {
+	updates, err := t.indexRowKeys(row)
+	if err != nil {
+		return err
+	}
+	for _, update := range updates {
+		insertSecondaryIndexRowID(update.index, update.key, rowID)
+	}
+	return nil
+}
+
+// UpdateSecondaryIndexRow moves one stable row position between composite
+// keys. Row positions do not change during UPDATE, so this is O(indexes ·
+// log(keys)) instead of rescanning the table.
+func (t *Table) UpdateSecondaryIndexRow(rowID int, before, after []any) error {
+	beforeKeys, err := t.indexRowKeys(before)
+	if err != nil {
+		return err
+	}
+	afterKeys, err := t.indexRowKeys(after)
+	if err != nil {
+		return err
+	}
+	for i, before := range beforeKeys {
+		after := afterKeys[i]
+		if bytes.Equal(before.key, after.key) {
+			continue
+		}
+		removeSecondaryIndexRowID(before.index, before.key, rowID)
+		insertSecondaryIndexRowID(after.index, after.key, rowID)
+	}
+	return nil
+}
+
+// ReindexSecondaryIndexRows applies the old-to-new row-position mapping made
+// by DELETE. Keys stay sorted and are not recomputed; only RowIDs belonging
+// to removed rows disappear. This is deliberately named "reindex" rather
+// than "rebuild": it preserves the materialized key structures.
+func (t *Table) ReindexSecondaryIndexRows(oldToNew map[int]int) {
+	for _, index := range t.Indexes {
+		entries := make([]IndexEntry, 0, len(index.Entries))
+		for _, entry := range index.Entries {
+			rowIDs := entry.RowIDs[:0]
+			for _, oldID := range entry.RowIDs {
+				if newID, ok := oldToNew[oldID]; ok {
+					rowIDs = append(rowIDs, newID)
+				}
+			}
+			if len(rowIDs) == 0 {
+				continue
+			}
+			entry.RowIDs = rowIDs
+			entries = append(entries, entry)
+		}
+		index.Entries = entries
+	}
+}
+
+// ClearSecondaryIndexes removes all RowIDs while retaining CREATE INDEX
+// metadata, as required after DELETE without a WHERE clause.
+func (t *Table) ClearSecondaryIndexes() {
+	for _, index := range t.Indexes {
+		index.Entries = nil
+	}
+}
+
+type secondaryIndexRowKey struct {
+	index *SecondaryIndex
+	key   []byte
+}
+
+func (t *Table) indexRowKeys(row []any) ([]secondaryIndexRowKey, error) {
+	updates := make([]secondaryIndexRowKey, 0, len(t.Indexes))
+	names := make([]string, 0, len(t.Indexes))
+	for name := range t.Indexes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		index := t.Indexes[name]
+		key, err := t.indexKey(index.Columns, row)
+		if err != nil {
+			return nil, fmt.Errorf("index %q: %w", index.Name, err)
+		}
+		updates = append(updates, secondaryIndexRowKey{index: index, key: key})
+	}
+	return updates, nil
+}
+
+func insertSecondaryIndexRowID(index *SecondaryIndex, key []byte, rowID int) {
+	pos := sort.Search(len(index.Entries), func(i int) bool {
+		return bytes.Compare(index.Entries[i].Key, key) >= 0
+	})
+	if pos == len(index.Entries) || !bytes.Equal(index.Entries[pos].Key, key) {
+		index.Entries = append(index.Entries, IndexEntry{})
+		copy(index.Entries[pos+1:], index.Entries[pos:])
+		index.Entries[pos] = IndexEntry{Key: append([]byte(nil), key...)}
+	}
+	rowIDs := index.Entries[pos].RowIDs
+	rowPos := sort.SearchInts(rowIDs, rowID)
+	if rowPos < len(rowIDs) && rowIDs[rowPos] == rowID {
+		return
+	}
+	rowIDs = append(rowIDs, 0)
+	copy(rowIDs[rowPos+1:], rowIDs[rowPos:])
+	rowIDs[rowPos] = rowID
+	index.Entries[pos].RowIDs = rowIDs
+}
+
+func removeSecondaryIndexRowID(index *SecondaryIndex, key []byte, rowID int) {
+	pos := sort.Search(len(index.Entries), func(i int) bool {
+		return bytes.Compare(index.Entries[i].Key, key) >= 0
+	})
+	if pos == len(index.Entries) || !bytes.Equal(index.Entries[pos].Key, key) {
+		return
+	}
+	rowIDs := index.Entries[pos].RowIDs
+	rowPos := sort.SearchInts(rowIDs, rowID)
+	if rowPos == len(rowIDs) || rowIDs[rowPos] != rowID {
+		return
+	}
+	rowIDs = append(rowIDs[:rowPos], rowIDs[rowPos+1:]...)
+	if len(rowIDs) > 0 {
+		index.Entries[pos].RowIDs = rowIDs
+		return
+	}
+	copy(index.Entries[pos:], index.Entries[pos+1:])
+	index.Entries = index.Entries[:len(index.Entries)-1]
+}
+
 // FindSecondaryIndex returns an index whose leading columns exactly match the
 // requested equality predicates. The caller may provide a prefix shorter than
 // the full composite index, enabling prefix seeks.

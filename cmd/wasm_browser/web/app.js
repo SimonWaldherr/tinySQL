@@ -6,6 +6,21 @@
     async function instantiateWasm(go) {
       // Prefer instantiateStreaming, but fall back to fetch+instantiate for Safari or wrong MIME
       const wasmURL = 'tinySQL.wasm';
+      if (typeof DecompressionStream !== 'undefined') {
+        try {
+          const compressed = await fetch(`${wasmURL}.gz`);
+          if (!compressed.ok || !compressed.body) {
+            throw new Error(`compressed WASM unavailable (${compressed.status})`);
+          }
+          const stream = compressed.body.pipeThrough(new DecompressionStream('gzip'));
+          return await WebAssembly.instantiateStreaming(
+            new Response(stream, { headers: { 'Content-Type': 'application/wasm' } }),
+            go.importObject
+          );
+        } catch (error) {
+          console.info('Compressed WASM unavailable, using standard loader:', error);
+        }
+      }
       if (WebAssembly.instantiateStreaming) {
         try {
           return await WebAssembly.instantiateStreaming(fetch(wasmURL), go.importObject);
@@ -14,6 +29,9 @@
         }
       }
       const resp = await fetch(wasmURL);
+      if (!resp.ok) {
+        throw new Error(`WASM request failed (${resp.status})`);
+      }
       const bytes = await resp.arrayBuffer();
       return await WebAssembly.instantiate(bytes, go.importObject);
     }

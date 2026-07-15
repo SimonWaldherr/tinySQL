@@ -1,6 +1,6 @@
 module github.com/SimonWaldherr/tinySQL
 
-go 1.25.12
+go 1.26.0
 
 require (
 	github.com/google/uuid v1.6.0

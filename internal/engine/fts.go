@@ -51,11 +51,74 @@ type ftsIndex struct {
 	AvgDocLen float64
 }
 
-// Global FTS registry (tenant/table → index).
+// FTS indexes are process-local, but their keys include the owning DB so two
+// embedded databases may safely use the same tenant/table names.
 var (
 	ftsRegistry   = make(map[string]*ftsIndex)
 	ftsRegistryMu sync.RWMutex
 )
+
+func ftsDBPrefix(db *storage.DB) string {
+	return fmt.Sprintf("%p/", db)
+}
+
+func ftsKey(db *storage.DB, tenant, table string) string {
+	if tenant == "" {
+		tenant = "default"
+	}
+	return ftsDBPrefix(db) + strings.ToLower(tenant) + "/" + strings.ToLower(table)
+}
+
+// ftsSnapshot captures every FTS index owned by db. It is paired with the
+// storage statement snapshot so a failed DML statement cannot leave stale
+// postings behind after its table rows are restored.
+type ftsSnapshot map[string]*ftsIndex
+
+func takeFTSSnapshot(db *storage.DB) ftsSnapshot {
+	prefix := ftsDBPrefix(db)
+	ftsRegistryMu.RLock()
+	snapshot := make(ftsSnapshot)
+	for key, index := range ftsRegistry {
+		if strings.HasPrefix(key, prefix) {
+			snapshot[key] = cloneFTSIndex(index)
+		}
+	}
+	ftsRegistryMu.RUnlock()
+	return snapshot
+}
+
+func restoreFTSSnapshot(db *storage.DB, snapshot ftsSnapshot) {
+	prefix := ftsDBPrefix(db)
+	ftsRegistryMu.Lock()
+	for key := range ftsRegistry {
+		if strings.HasPrefix(key, prefix) {
+			delete(ftsRegistry, key)
+		}
+	}
+	for key, index := range snapshot {
+		ftsRegistry[key] = cloneFTSIndex(index)
+	}
+	ftsRegistryMu.Unlock()
+}
+
+func cloneFTSIndex(index *ftsIndex) *ftsIndex {
+	if index == nil {
+		return nil
+	}
+	copy := &ftsIndex{
+		Columns:   append([]string(nil), index.Columns...),
+		InvIndex:  make(map[string][]ftsPosting, len(index.InvIndex)),
+		DocLens:   make(map[int]int, len(index.DocLens)),
+		AvgDocLen: index.AvgDocLen,
+	}
+	for term, postings := range index.InvIndex {
+		copy.InvIndex[term] = append([]ftsPosting(nil), postings...)
+	}
+	for rowID, docLen := range index.DocLens {
+		copy.DocLens[rowID] = docLen
+	}
+	return copy
+}
 
 // ─────────────────────────── Stop words ──────────────────────────────────────
 
@@ -240,7 +303,7 @@ func executeCreateFTSTable(env ExecEnv, s *CreateTable) (*ResultSet, error) {
 	}
 
 	// Register the FTS index.
-	key := env.tenant + "/" + s.Name
+	key := ftsKey(env.db, env.tenant, s.Name)
 	ftsGetOrCreate(key, s.FTSColumns)
 
 	return nil, nil

@@ -81,6 +81,12 @@ func requiredPermission(stmt Statement) (perm storage.Permission, schema, table 
 		}
 		schema, table = splitObjectName(s.From.Table)
 		return storage.PermSelect, schema, table, true
+	case *Analyze:
+		if s.Table == "" {
+			return storage.PermDDL, "", "*", true
+		}
+		schema, table = splitObjectName(s.Table)
+		return storage.PermDDL, schema, table, true
 	case *Insert:
 		schema, table = splitObjectName(s.Table)
 		return storage.PermInsert, schema, table, true

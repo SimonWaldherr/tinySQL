@@ -162,6 +162,24 @@ function decodeDemoHash(hash = window.location.hash) {
 
 async function instantiateWasm(go) {
     const wasmURL = 'query_files.wasm';
+    // GitHub Pages serves the pre-compressed companion as a normal .gz file.
+    // Modern browsers can stream-decompress it into the compiler, avoiding a
+    // large network transfer while retaining streaming compilation.
+    if (typeof DecompressionStream !== 'undefined') {
+        try {
+            const compressed = await fetch(`${wasmURL}.gz`);
+            if (!compressed.ok || !compressed.body) {
+                throw new Error(`compressed WASM unavailable (${compressed.status})`);
+            }
+            const stream = compressed.body.pipeThrough(new DecompressionStream('gzip'));
+            return await WebAssembly.instantiateStreaming(
+                new Response(stream, { headers: { 'Content-Type': 'application/wasm' } }),
+                go.importObject
+            );
+        } catch (error) {
+            console.info('Compressed WASM unavailable, using standard loader:', error);
+        }
+    }
     if (WebAssembly.instantiateStreaming) {
         try {
             return await WebAssembly.instantiateStreaming(fetch(wasmURL), go.importObject);
@@ -170,6 +188,9 @@ async function instantiateWasm(go) {
         }
     }
     const response = await fetch(wasmURL);
+    if (!response.ok) {
+        throw new Error(`WASM request failed (${response.status})`);
+    }
     const bytes = await response.arrayBuffer();
     return WebAssembly.instantiate(bytes, go.importObject);
 }

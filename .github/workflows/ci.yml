@@ -28,7 +28,7 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.mod', '**/go.sum') }}
           restore-keys: |
             ${{ runner.os }}-go-
 
@@ -50,11 +50,23 @@ jobs:
       - name: Build all packages
         run: go build ./...
 
+      - name: Build WebAssembly targets
+        run: |
+          GOOS=js GOARCH=wasm go build -trimpath -o /tmp/tinysql-browser.wasm ./cmd/wasm_browser
+          GOOS=js GOARCH=wasm go build -trimpath -o /tmp/tinysql-node.wasm ./cmd/wasm_node
+          (
+            cd cmd/query_files_wasm
+            GOOS=js GOARCH=wasm go build -trimpath -o /tmp/query-files.wasm .
+          )
+
       - name: Run go vet
         run: go vet ./...
 
       - name: Run unit tests (no cache)
         run: go test ./... -count=1
+
+      - name: Run JSON v2 compatibility tests
+        run: GOEXPERIMENT=jsonv2 go test ./internal/storage ./internal/engine -count=1
 
       - name: Run race tests
         run: go test ./... -race -count=1
@@ -88,7 +100,7 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: ${{ runner.os }}-go-amd64-v1-${{ hashFiles('**/go.sum') }}
+          key: ${{ runner.os }}-go-amd64-v1-${{ hashFiles('**/go.mod', '**/go.sum') }}
           restore-keys: |
             ${{ runner.os }}-go-amd64-v1-
             ${{ runner.os }}-go-

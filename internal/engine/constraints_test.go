@@ -53,27 +53,20 @@ func TestForeignKeyConstraintValidatesInsertAndUpdate(t *testing.T) {
 	}
 }
 
-// TestConstraintIndexCatchesIntraBatchDuplicate guards the incremental
-// constraint index (getConstraintIndex): within a single multi-row INSERT,
-// a duplicate PRIMARY KEY appearing later in the SAME statement must still
-// be caught, even though the whole batch commits under one table.Version
-// bump — the index has to grow as rows are appended mid-batch, not just
-// when Version changes.
+// TestConstraintIndexCatchesIntraBatchDuplicate guards both the incremental
+// constraint index and statement-level atomicity: a duplicate appearing later
+// in one multi-row INSERT must be caught, and none of the earlier rows may be
+// visible after the statement fails.
 func TestConstraintIndexCatchesIntraBatchDuplicate(t *testing.T) {
 	db := storage.NewDB()
 	ctx := context.Background()
 	execConstraintSQL(t, ctx, db, "CREATE TABLE t (id INT PRIMARY KEY)")
 	expectConstraintErr(t, ctx, db, "INSERT INTO t VALUES (1), (2), (1)", "PRIMARY KEY")
 
-	// Multi-row INSERT validates and appends one row at a time and stops
-	// at the first failure (pre-existing behavior, not introduced by the
-	// constraint index — rows 1 and 2 are already committed by the time row
-	// 3 is rejected). What this test actually guards: the duplicate is
-	// caught at all, proving the index sees row 1 (appended earlier in this
-	// same statement, before table.Version incremented) rather than only
-	// rows visible as of the last Version bump.
+	// The index sees earlier rows in the same statement, while Execute's DML
+	// snapshot makes the complete batch disappear on the resulting error.
 	rs := queryConstraintSQL(t, ctx, db, "SELECT COUNT(*) as n FROM t")
-	expectInt(t, rs.Rows[0]["n"], 2, "row count after rejected batch (partial insert, pre-existing behavior)")
+	expectInt(t, rs.Rows[0]["n"], 0, "row count after rejected batch")
 }
 
 // TestConstraintIndexUpdateThenReinsert guards patchConstraintIndexRow:

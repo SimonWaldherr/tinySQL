@@ -340,11 +340,33 @@ type Table struct {
 	IsTemp  bool
 	colPos  map[string]int
 	Version int
+	// Stats is populated by ANALYZE and persisted with the table. DML marks it
+	// stale rather than trying to estimate distinct values incrementally.
+	Stats *TableStats
 	// dirtyFrom tracks the first row index modified since the last
 	// WAL checkpoint. -1 means no dirty rows (full table must be logged).
 	// For append-only workloads (INSERT without UPDATE/DELETE), this
 	// enables the WAL to log only new rows instead of the entire table.
 	dirtyFrom int
+}
+
+// ColumnStats summarizes one column as of TableStats.AnalyzedAt. Min and Max
+// are display values for introspection; the planner currently uses row and
+// distinct counts, which remain meaningful across all supported column types.
+type ColumnStats struct {
+	NullCount     int
+	DistinctCount int
+	Min           string
+	Max           string
+	HasMinMax     bool
+}
+
+// TableStats is the persisted result of ANALYZE for one table.
+type TableStats struct {
+	RowCount   int
+	Columns    map[string]ColumnStats // lower-cased column name → statistics
+	AnalyzedAt time.Time
+	Stale      bool
 }
 
 // NewTable creates a new Table with case-insensitive column lookup indices.
@@ -354,6 +376,125 @@ func NewTable(name string, cols []Column, isTemp bool) *Table {
 		pos[strings.ToLower(c.Name)] = i
 	}
 	return &Table{Name: name, Cols: cols, colPos: pos, IsTemp: isTemp, dirtyFrom: -1, Indexes: make(map[string]*SecondaryIndex)}
+}
+
+// Analyze computes exact cardinality, null and simple range summaries for the
+// current table contents. The first statistics implementation scans all rows
+// deliberately: transparent and correct inputs are more useful than a sampled
+// model whose accuracy would need separate policy and tuning.
+func (t *Table) Analyze() *TableStats {
+	stats := &TableStats{
+		RowCount:   len(t.Rows),
+		Columns:    make(map[string]ColumnStats, len(t.Cols)),
+		AnalyzedAt: time.Now().UTC(),
+	}
+	for colIdx, column := range t.Cols {
+		columnStats := ColumnStats{}
+		distinct := make(map[string]struct{})
+		var minValue, maxValue any
+		for _, row := range t.Rows {
+			if colIdx >= len(row) || row[colIdx] == nil {
+				columnStats.NullCount++
+				continue
+			}
+			value := row[colIdx]
+			distinct[string(CanonicalIndexKey([]any{value}))] = struct{}{}
+			if !columnStats.HasMinMax || statsLess(value, minValue) {
+				minValue = value
+			}
+			if !columnStats.HasMinMax || statsLess(maxValue, value) {
+				maxValue = value
+			}
+			columnStats.HasMinMax = true
+		}
+		columnStats.DistinctCount = len(distinct)
+		if columnStats.HasMinMax {
+			columnStats.Min = fmt.Sprint(minValue)
+			columnStats.Max = fmt.Sprint(maxValue)
+		}
+		stats.Columns[strings.ToLower(column.Name)] = columnStats
+	}
+	t.Stats = stats
+	return cloneTableStats(stats)
+}
+
+// InvalidateStats marks the previous ANALYZE result stale after a mutation.
+// RowCount remains useful for observability while distinct/range values are
+// excluded from planner decisions until ANALYZE is run again.
+func (t *Table) InvalidateStats() {
+	if t.Stats == nil {
+		return
+	}
+	t.Stats.RowCount = len(t.Rows)
+	t.Stats.Stale = true
+}
+
+// Statistics returns a defensive copy of the latest ANALYZE result.
+func (t *Table) Statistics() *TableStats { return cloneTableStats(t.Stats) }
+
+func cloneTableStats(stats *TableStats) *TableStats {
+	if stats == nil {
+		return nil
+	}
+	copy := *stats
+	copy.Columns = make(map[string]ColumnStats, len(stats.Columns))
+	for name, column := range stats.Columns {
+		copy.Columns[name] = column
+	}
+	return &copy
+}
+
+func statsLess(left, right any) bool {
+	if right == nil {
+		return true
+	}
+	leftNumber, leftIsNumber := statsNumber(left)
+	rightNumber, rightIsNumber := statsNumber(right)
+	if leftIsNumber && rightIsNumber {
+		return leftNumber < rightNumber
+	}
+	if leftTime, ok := left.(time.Time); ok {
+		if rightTime, ok := right.(time.Time); ok {
+			return leftTime.Before(rightTime)
+		}
+	}
+	if leftDuration, ok := left.(time.Duration); ok {
+		if rightDuration, ok := right.(time.Duration); ok {
+			return leftDuration < rightDuration
+		}
+	}
+	return fmt.Sprint(left) < fmt.Sprint(right)
+}
+
+func statsNumber(value any) (float64, bool) {
+	switch value := value.(type) {
+	case int:
+		return float64(value), true
+	case int8:
+		return float64(value), true
+	case int16:
+		return float64(value), true
+	case int32:
+		return float64(value), true
+	case int64:
+		return float64(value), true
+	case uint:
+		return float64(value), true
+	case uint8:
+		return float64(value), true
+	case uint16:
+		return float64(value), true
+	case uint32:
+		return float64(value), true
+	case uint64:
+		return float64(value), true
+	case float32:
+		return float64(value), true
+	case float64:
+		return value, true
+	default:
+		return 0, false
+	}
 }
 
 // MarkDirtyFrom records the first row index that was modified. If an earlier
@@ -428,6 +569,14 @@ type DB struct {
 	mu      sync.RWMutex
 	tenants map[string]*tenantDB
 	wal     *WALManager
+
+	// extensions contains the statically linked Go extensions activated for
+	// this database instance. It deliberately lives outside the persisted
+	// catalog: an extension's executable code must be linked into the current
+	// process and explicitly activated again after a restart.
+	extensionsMu      sync.RWMutex
+	extensions        map[string]ExtensionInfo
+	loadingExtensions map[string]struct{}
 
 	// contentMu guards the contents of Table values (Rows, Cols, Version,
 	// dirtyFrom) reached through a *Table pointer returned by Get/Put/etc.
@@ -550,9 +699,11 @@ func (db *DB) UnlockContentForWrite() {
 // Use OpenDB for disk-backed or hybrid storage modes.
 func NewDB() *DB {
 	return &DB{
-		tenants:     map[string]*tenantDB{},
-		mvcc:        NewMVCCManager(),
-		storageMode: ModeMemory,
+		tenants:           map[string]*tenantDB{},
+		mvcc:              NewMVCCManager(),
+		storageMode:       ModeMemory,
+		extensions:        map[string]ExtensionInfo{},
+		loadingExtensions: map[string]struct{}{},
 	}
 }
 
@@ -1088,6 +1239,8 @@ func cloneTable(t *Table) *Table {
 	nt := NewTable(t.Name, cols, t.IsTemp)
 	nt.Version = t.Version
 	nt.Indexes = cloneSecondaryIndexes(t.Indexes)
+	nt.Stats = cloneTableStats(t.Stats)
+	nt.dirtyFrom = t.dirtyFrom
 	nt.Rows = make([][]any, len(t.Rows))
 	for i := range t.Rows {
 		row := make([]any, len(t.Rows[i]))
@@ -1159,6 +1312,7 @@ type diskTable struct {
 	IsTemp  bool
 	Version int
 	Indexes map[string]*SecondaryIndex
+	Stats   *TableStats
 }
 
 type diskCatalog struct {
@@ -1414,6 +1568,7 @@ func tableToDiskRange(tn string, t *Table, from, to int) diskTable {
 		Cols:    make([]diskColumn, len(t.Cols)),
 		Rows:    make([][]any, to-from),
 		Indexes: cloneSecondaryIndexes(t.Indexes),
+		Stats:   cloneTableStats(t.Stats),
 	}
 	for i, c := range t.Cols {
 		dt.Cols[i] = diskColumn(c)
@@ -1479,6 +1634,7 @@ func diskToTable(dt diskTable) *Table {
 	t := NewTable(dt.Name, cols, dt.IsTemp)
 	t.Version = dt.Version
 	t.Indexes = cloneSecondaryIndexes(dt.Indexes)
+	t.Stats = cloneTableStats(dt.Stats)
 	t.Rows = make([][]any, len(dt.Rows))
 	for ri, r := range dt.Rows {
 		row := make([]any, len(r))

@@ -48,7 +48,7 @@ console or your own JavaScript:
 
 | Function | Description |
 |----------|-------------|
-| `tinySQL.open([dsn])` | Open an in-memory database connection |
+| `tinySQL.open([dsn])` | Open an in-memory database (`mem://?tenant=name`) |
 | `tinySQL.close()` | Close the current connection |
 | `tinySQL.exec(sql)` | Execute a SQL statement |
 | `tinySQL.query(sql)` | Execute a query and return rows |
@@ -66,4 +66,11 @@ console or your own JavaScript:
   snapshot.
 - WASM files must be served over HTTP (not `file://`) due to browser security
   restrictions — use the built-in server or any static file host.
+- Modern browsers load the generated `tinySQL.wasm.gz` companion and stream it
+  through `DecompressionStream`; older browsers and hosts that already apply
+  compression fall back to `tinySQL.wasm` automatically.
+- The browser API executes directly against TinySQL's engine instead of through
+  `database/sql`; this reduces bundle size and avoids connection-pool overhead.
+- Set `window.tinySQLWasmDebug = true` before loading the module to enable
+  diagnostic console logs; normal query paths stay quiet.
 - For a Node.js variant see [`../wasm_node/`](../wasm_node/).

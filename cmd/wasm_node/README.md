@@ -32,34 +32,31 @@ cp "$(go env GOROOT)/lib/wasm/wasm_exec.js" ./
 ## Run
 
 ```bash
-# Interactive mode — reads SQL from stdin
+# Default status command
 node wasm_runner.js
 
 # One-shot query
 node wasm_runner.js query "SELECT 1 AS n, 'hello' AS greeting"
 
-# Multiple statements
-node wasm_runner.js query "CREATE TABLE t (id INT); INSERT INTO t VALUES (1); SELECT * FROM t"
+# Execute one statement
+node wasm_runner.js exec "CREATE TABLE t (id INT)"
 ```
 
-## Use in Node scripts
+The runner starts the Go runtime asynchronously and waits until the global
+`tinySQL` API is ready; it then opens an in-memory database, runs the selected
+command, and closes it again. `status` is the default command.
 
-```js
-const { loadTinySQL } = require('./wasm_runner');
+## Embed in your own Node script
 
-async function main() {
-    const db = await loadTinySQL();
-    db.exec("CREATE TABLE users (id INT, name TEXT)");
-    db.exec("INSERT INTO users VALUES (1, 'Alice')");
-    const result = db.query("SELECT * FROM users");
-    console.log(result);
-}
-main();
-```
+Use `wasm_runner.js` as the bootstrap reference: instantiate `tinySQL.wasm`,
+call `go.run(instance)` without awaiting its never-ending runtime promise, and
+wait for `global.tinySQL`. The runner is a CLI helper, not a CommonJS module.
 
 ## Notes
 
 - Requires Node.js 18+ (WebAssembly support).
 - The database is **in-memory** and does not persist between Node.js process
   runs.
+- Builds use stripped symbols and optionally `wasm-opt` when Binaryen is
+  installed.
 - For the browser variant see [`../wasm_browser/`](../wasm_browser/).

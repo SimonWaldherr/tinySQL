@@ -215,6 +215,13 @@ cd cmd/query_files_wasm
 
 Wichtig: Das Modul muss ueber HTTP oder HTTPS laufen. `file://` funktioniert fuer Browser-WASM in der Regel nicht sauber, weil `fetch()` und MIME-Typen benoetigt werden.
 
+Der mitgelieferte Loader versucht auf statischen Hosts zuerst
+`query_files.wasm.gz` und streamt ihn mit `DecompressionStream` in den
+WebAssembly-Compiler. Fehlt diese Browser-API oder liefert der Host bereits
+HTTP-Kompression, faellt er automatisch auf `query_files.wasm` zurueck. Fuer
+ein eigenes Frontend kannst du den Loader aus `cmd/query_files_wasm/app.js`
+uebernehmen.
+
 #### Exportierte JS-Funktionen
 
 `cmd/query_files_wasm/main.go` bindet diese Funktionen an `window`:
@@ -514,6 +521,12 @@ cd cmd/query_files_wasm
 ```
 
 The module should be served over HTTP or HTTPS. Browsers generally do not handle WASM initialization reliably from `file://` URLs because `fetch()` and MIME types matter.
+
+On static hosts, the bundled loader first tries `query_files.wasm.gz` and
+streams it through `DecompressionStream` into the WebAssembly compiler. It
+falls back to `query_files.wasm` when that API is unavailable or the host
+already applies HTTP compression. Reuse the loader in
+`cmd/query_files_wasm/app.js` for a custom frontend.
 
 #### Exported JS functions
 

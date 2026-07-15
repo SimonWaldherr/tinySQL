@@ -19,7 +19,7 @@ Demos:
 go get github.com/SimonWaldherr/tinySQL@latest
 ```
 
-Requirements: Go 1.25+.
+Requirements: Go 1.26+.
 
 ## Quick Start
 
@@ -71,6 +71,15 @@ func main() {
 - Operational hooks for health checks, lifecycle management, read-only mode,
   RBAC, audit logging, and encryption at rest for `ModeDisk`, `ModeJSON`,
   `ModeHybrid`, and `ModeIndex` table files.
+- `ANALYZE` persists exact table and column statistics; `sys.statistics`
+  exposes them and the planner uses fresh distinct-count estimates to prefer
+  more selective equality indexes.
+- Direct multi-row `INSERT`, `UPDATE`, and `DELETE` are statement-atomic,
+  including trigger side effects; materialized secondary indexes are updated
+  incrementally instead of rebuilt after each mutation.
+- Browser WASM demos run the engine directly in the browser. Their loaders use
+  a pre-compressed `.wasm.gz` artifact when the browser supports streaming
+  decompression and fall back to the regular `.wasm` file.
 
 For a broader feature reference, see [FUNCTIONS.sql](./FUNCTIONS.sql),
 [example_showcase.sql](./example_showcase.sql), and the Go tests.
@@ -94,6 +103,43 @@ go build -tags=sqliteimport,shapefile ./...
 Without the respective tag, the import API remains available but returns a
 clear feature-disabled error. SQLite remains the recommended production
 backend for standard MBTiles serving.
+
+## Statically linked Go extensions
+
+Applications can add an extension by importing its Go package and activating
+it for one database instance. This is intentionally static rather than a Go
+shared-object plugin, so it remains portable across Go, TinyGo, and WebAssembly
+builds.
+
+```go
+type ExampleExtension struct{}
+
+func (ExampleExtension) ExtensionInfo() tinysql.ExtensionInfo {
+    return tinysql.ExtensionInfo{
+        Name: "example",
+        Version: "1.0.0",
+        Capabilities: []tinysql.ExtensionCapability{
+            tinysql.CapabilityFilesystem,
+        },
+    }
+}
+
+func (ExampleExtension) Register(db *tinysql.DB) error {
+    // Register supported extension points for this DB.
+    return nil
+}
+
+db := tinysql.NewDB()
+if err := db.Use(ExampleExtension{}); err != nil {
+    panic(err)
+}
+```
+
+`SELECT * FROM sys.extensions` lists the extensions active for the current DB;
+`sys.objects` includes them as `EXTENSION` objects. Extensions are deliberately
+not persisted or unloadable: their code must be linked into each process and
+explicitly activated after opening a database. Capability declarations are
+visible metadata today; enforcement is a future server-policy feature.
 
 ## Portable import and export
 
@@ -164,13 +210,15 @@ TinySQL is not a PostgreSQL/MySQL replacement. Important current limits:
 
 - Single-process database engine; no built-in replication, clustering,
   failover, sharding, or distributed transactions.
-- No true statement-level rollback for partially applied multi-row statements
-  through direct `Execute`.
+- Direct multi-row `INSERT`, `UPDATE`, and `DELETE` statements are atomic,
+  including their trigger side effects. Cross-statement transactions and
+  `SAVEPOINT` are not implemented.
 - No composite primary keys or composite foreign keys.
 - No CHECK constraints, UPSERT/ON CONFLICT, SAVEPOINT, ATTACH/DETACH, VACUUM,
   partial indexes, generated columns, or persistent ANN vector index files.
 - Materialized secondary indexes currently support equality point/prefix seeks
-  on their leading columns. They are rebuilt after DML and persisted with
+  on their leading columns. They are maintained incrementally for
+  `INSERT`/`UPDATE` and remapped on `DELETE`, then persisted with
   snapshots/backends; pager-native incremental index pages and range planning
   are not implemented yet. `ModeIndex`/`ModeHybrid` now keep backend-loaded
   tables out of the permanent DB catalog and enforce their buffer-pool budget,

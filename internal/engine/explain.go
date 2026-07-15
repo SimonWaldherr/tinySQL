@@ -188,6 +188,8 @@ func statementName(stmt Statement) string {
 		return "UPDATE"
 	case *Delete:
 		return "DELETE"
+	case *Analyze:
+		return "ANALYZE"
 	case *CreateTable:
 		return "CREATE TABLE"
 	case *CreateView:
