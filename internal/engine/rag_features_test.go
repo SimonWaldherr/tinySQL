@@ -7,6 +7,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -441,6 +442,62 @@ func TestRecencyScore(t *testing.T) {
 	`)
 	// future timestamp yields full freshness
 	expectFloat(t, rs.Rows[0]["score"], 1.0, 1e-12, "RECENCY_SCORE future timestamp")
+}
+
+// TestRAGScorersDefaultToStatementClock guards the per-statement evaluation
+// clock: RECENCY_SCORE/RAG_HYBRID_SCORE/RAG_RANK_SCORE must default the
+// implicit `now` to env.now (set once per statement) rather than a fresh
+// time.Now() call. env.now is pinned to 2020 here; if any of the three
+// regressed to time.Now(), the computed age would jump from exactly one
+// half-life to several years, collapsing the score toward 0 instead of ~0.5.
+func TestRAGScorersDefaultToStatementClock(t *testing.T) {
+	fixedNow := time.Date(2020, 6, 15, 12, 0, 0, 0, time.UTC)
+	tsOneHalfLifeAgo := fixedNow.Add(-30 * 24 * time.Hour).Format("2006-01-02 15:04:05")
+	env := ExecEnv{now: fixedNow}
+	row := Row{}
+
+	t.Run("RECENCY_SCORE", func(t *testing.T) {
+		ex := &FuncCall{Name: "RECENCY_SCORE", Args: []Expr{
+			&Literal{Val: tsOneHalfLifeAgo},
+			&Literal{Val: 30.0},
+		}}
+		got, err := evalRecencyScore(env, ex, row)
+		if err != nil {
+			t.Fatalf("RECENCY_SCORE: %v", err)
+		}
+		expectFloat(t, got, 0.5, 1e-9, "RECENCY_SCORE against statement clock")
+	})
+
+	t.Run("RAG_HYBRID_SCORE", func(t *testing.T) {
+		ex := &FuncCall{Name: "RAG_HYBRID_SCORE", Args: []Expr{
+			&Literal{Val: 1.0}, // similarity=1.0 -> simNorm=1.0
+			&Literal{Val: tsOneHalfLifeAgo},
+			&Literal{Val: 30.0},
+			&Literal{Val: 0.0}, // sim_weight=0 isolates the recency term
+		}}
+		got, err := evalRAGHybridScore(env, ex, row)
+		if err != nil {
+			t.Fatalf("RAG_HYBRID_SCORE: %v", err)
+		}
+		expectFloat(t, got, 0.5, 1e-9, "RAG_HYBRID_SCORE recency against statement clock")
+	})
+
+	t.Run("RAG_RANK_SCORE", func(t *testing.T) {
+		ex := &FuncCall{Name: "RAG_RANK_SCORE", Args: []Expr{
+			&Literal{Val: 1.0},              // similarity
+			&Literal{Val: tsOneHalfLifeAgo}, // ts
+			&Literal{Val: 30.0},             // half_life_days
+			&Literal{Val: 0.0},              // quality
+			&Literal{Val: 0.0},              // sim_weight
+			&Literal{Val: 1.0},              // recency_weight isolates the recency term
+			&Literal{Val: 0.0},              // quality_weight
+		}}
+		got, err := evalRAGRankScore(env, ex, row)
+		if err != nil {
+			t.Fatalf("RAG_RANK_SCORE: %v", err)
+		}
+		expectFloat(t, got, 0.5, 1e-9, "RAG_RANK_SCORE recency against statement clock")
+	})
 }
 
 func TestRAGHybridScore(t *testing.T) {

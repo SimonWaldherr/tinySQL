@@ -55,6 +55,29 @@ func TestFTSSearchEmptyQueryMatchesNothing(t *testing.T) {
 	}
 }
 
+// TestFTSSearchIDFWeightsRareTermsHigher guards BM25 IDF weighting in
+// FTS_SEARCH. "product" appears in every doc (common, low IDF); "widget"
+// appears in only one (rare, high IDF). Without IDF, doc 1's extra token
+// makes it longer than average, and the BM25 length penalty alone would
+// rank it *below* the shorter product-only docs — so this only passes if
+// the rare term's IDF is actually outweighing the length penalty.
+func TestFTSSearchIDFWeightsRareTermsHigher(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+	Execute(ctx, db, "default", mustParse(`CREATE TABLE docs (id INT, body TEXT)`))
+	Execute(ctx, db, "default", mustParse(`INSERT INTO docs VALUES (1, 'widget product alpha')`))
+	Execute(ctx, db, "default", mustParse(`INSERT INTO docs VALUES (2, 'product beta')`))
+	Execute(ctx, db, "default", mustParse(`INSERT INTO docs VALUES (3, 'product gamma')`))
+	Execute(ctx, db, "default", mustParse(`INSERT INTO docs VALUES (4, 'product delta')`))
+	Execute(ctx, db, "default", mustParse(`INSERT INTO docs VALUES (5, 'product epsilon')`))
+
+	rs := execSQL(t, db, `SELECT id FROM FTS_SEARCH('docs', 'widget OR product', 5, 'body')`)
+	if len(rs.Rows) != 5 {
+		t.Fatalf("expected all 5 docs to match, got %d", len(rs.Rows))
+	}
+	expectInt(t, rs.Rows[0]["id"], 1, "doc containing the rare term 'widget' should rank first")
+}
+
 func TestFTSSearchExplicitColumnsStillWork(t *testing.T) {
 	db := storage.NewDB()
 	ctx := context.Background()

@@ -108,6 +108,23 @@ type ExecEnv struct {
 	// AdvancedWAL emits a single commit only after the outer statement has
 	// completed successfully.
 	statementWAL *statementWAL
+	// now is the evaluation timestamp for this statement, set once when the
+	// statement begins executing. RECENCY_SCORE/RAG_HYBRID_SCORE/RAG_RANK_SCORE
+	// default to it (via envNow) instead of calling time.Now() per row, so
+	// every row of one query — and every RAG scorer call within it — sees the
+	// same "now" and ranks consistently. The zero value falls back to
+	// time.Now() (see envNow), which is what ExecEnv{} in tests gets.
+	now time.Time
+}
+
+// envNow returns the statement's evaluation timestamp, falling back to
+// time.Now() when env.now is unset (e.g. ExecEnv{} in unit tests, or any
+// evaluation path outside executeStatement's per-statement clock).
+func envNow(env ExecEnv) time.Time {
+	if env.now.IsZero() {
+		return time.Now()
+	}
+	return env.now
 }
 
 // Execute runs a parsed SQL statement against the given storage DB and tenant.
@@ -551,7 +568,6 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 	// column-name slice out of the loop, and skip the row-map build entirely
 	// when nothing will use it.
 	tablePrefix := strings.ToLower(s.Table) + "."
-	tableColNames := colNames(t.Cols)
 	hasBefore := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("BEFORE"), storage.TriggerEvent("INSERT"))) > 0
 	hasAfter := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("AFTER"), storage.TriggerEvent("INSERT"))) > 0
 	needsRow := hasBefore || hasAfter || len(s.Returning) > 0
@@ -605,8 +621,6 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 				return nil, err
 			}
 		}
-		// FTS index is updated after all trigger hooks so it reflects final row data.
-		ftsIndexRow(ftsKey(env.db, env.tenant, s.Table), s.Table, len(t.Rows)-1, nil, row, tableColNames)
 		if len(s.Returning) > 0 {
 			returningRows = append(returningRows, newRow)
 		}
@@ -635,7 +649,6 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	}
 	returningRows := make([]Row, 0, len(s.Rows))
 	tablePrefix := strings.ToLower(s.Table) + "."
-	tableColNames := colNames(t.Cols)
 	hasBefore := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("BEFORE"), storage.TriggerEvent("INSERT"))) > 0
 	hasAfter := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("AFTER"), storage.TriggerEvent("INSERT"))) > 0
 	needsRow := hasBefore || hasAfter || len(s.Returning) > 0
@@ -692,8 +705,6 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 				return nil, err
 			}
 		}
-		// FTS index is updated after all trigger hooks so it reflects final row data.
-		ftsIndexRow(ftsKey(env.db, env.tenant, s.Table), s.Table, len(t.Rows)-1, nil, row, tableColNames)
 		if len(s.Returning) > 0 {
 			returningRows = append(returningRows, newRow)
 		}
@@ -922,7 +933,6 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 	n := 0
 	returningRows := make([]Row, 0)
 	tablePrefix := strings.ToLower(s.Table) + "."
-	columnNames := colNames(t.Cols)
 	hasBefore := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("BEFORE"), storage.TriggerEvent("UPDATE"))) > 0
 	hasAfter := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("AFTER"), storage.TriggerEvent("UPDATE"))) > 0
 	needsNewRow := hasAfter || len(s.Returning) > 0
@@ -984,7 +994,6 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 			if needsNewRow {
 				newRow = buildTableRow(t.Cols, tablePrefix, t.Rows[ri])
 			}
-			ftsIndexRow(ftsKey(env.db, env.tenant, s.Table), s.Table, ri, nil, t.Rows[ri], columnNames)
 			if hasAfter {
 				if err := fireTriggers(env, s.Table, "AFTER", "UPDATE", newRow, oldRow); err != nil {
 					return nil, err
@@ -1035,7 +1044,6 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 	rawPlan := &simpleSelectPlan{colIndex: plan.colIndex, where: plan.where, filter: buildRawFilter(plan.colIndex, plan.where)}
 	updated := 0
 	values := make([]any, len(plan.sets))
-	columnNames := colNames(plan.table.Cols)
 	wal, err := beginWALAuto(env, s.Table)
 	if err != nil {
 		return nil, true, err
@@ -1085,7 +1093,6 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 		if err := wal.logUpdate(env, ri, before, nextRow, plan.table.Cols); err != nil {
 			return nil, true, err
 		}
-		ftsIndexRow(ftsKey(env.db, env.tenant, s.Table), s.Table, ri, nil, plan.table.Rows[ri], columnNames)
 		updated++
 	}
 	if err := wal.commit(); err != nil {
@@ -1218,7 +1225,6 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 				if err := wal.logDelete(env, i, r, t.Cols); err != nil {
 					return nil, err
 				}
-				ftsDeleteRow(ftsKey(env.db, env.tenant, s.Table), del+len(kept))
 				del++
 			} else {
 				oldToNew[i] = len(kept)
@@ -1268,7 +1274,6 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 			if err := wal.logDelete(env, i, r, t.Cols); err != nil {
 				return nil, err
 			}
-			ftsDeleteRow(ftsKey(env.db, env.tenant, s.Table), del+len(kept))
 			if hasAfterDel {
 				if err := fireTriggers(env, s.Table, "AFTER", "DELETE", nil, row); err != nil {
 					return nil, err
@@ -6033,6 +6038,7 @@ func processCTEs(env ExecEnv, s *Select) (ExecEnv, error) {
 		db:     env.db,
 		tenant: env.tenant,
 		ctes:   make(map[string]*ResultSet),
+		now:    env.now,
 	}
 
 	for _, cte := range s.CTEs {

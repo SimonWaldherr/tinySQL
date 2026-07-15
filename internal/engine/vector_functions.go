@@ -582,7 +582,7 @@ func evalRecencyScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return nil, fmt.Errorf("RECENCY_SCORE half_life_days must be > 0, got %v", halfLifeDays)
 	}
 
-	now := time.Now()
+	now := envNow(env)
 	if len(ex.Args) == 3 {
 		nowVal, err := evalExpr(env, ex.Args[2], row)
 		if err != nil {
@@ -654,7 +654,7 @@ func evalRAGHybridScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		}
 	}
 
-	now := time.Now()
+	now := envNow(env)
 	if len(ex.Args) >= 5 {
 		nowVal, err := evalExpr(env, ex.Args[4], row)
 		if err != nil {
@@ -732,7 +732,7 @@ func evalRAGRankScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		}
 	}
 
-	now := time.Now()
+	now := envNow(env)
 	if len(ex.Args) == 8 {
 		nowVal, err := evalExpr(env, ex.Args[7], row)
 		if err != nil {

@@ -17,8 +17,11 @@
 //
 // Returns all original columns plus:
 //
-//	_vec_distance  – computed distance from query_vector
-//	_vec_rank      – 1-based rank (1 = closest)
+//	_vec_distance    – computed distance from query_vector (lower = closer)
+//	_vec_similarity  – similarity derived from the distance (higher = closer);
+//	                   feed this, not _vec_distance, into RAG_HYBRID_SCORE /
+//	                   RAG_RANK_SCORE, which expect a similarity input
+//	_vec_rank        – 1-based rank (1 = closest)
 //
 // The results are returned in ascending order of distance (closest first).
 package engine
@@ -560,7 +563,7 @@ func (f *VecSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 	for _, c := range table.Cols {
 		resultCols = append(resultCols, c.Name)
 	}
-	resultCols = append(resultCols, "_vec_distance", "_vec_rank")
+	resultCols = append(resultCols, "_vec_distance", "_vec_similarity", "_vec_rank")
 
 	queryLen := len(a.queryVec)
 	var queryNorm float64
@@ -600,7 +603,15 @@ func (f *VecSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 	recordVecQuery(VectorQueryEvent{At: time.Now(), Table: table.Name, Column: a.colName, Metric: a.metric, Index: a.indexMode, K: a.k, CacheHit: cacheHit, Duration: time.Since(started)})
 
 	resultRows := make([]Row, 0, len(scoredRowsOrdered))
-	for rank, sr := range scoredRowsOrdered {
+	rank := 0
+	for _, sr := range scoredRowsOrdered {
+		// Defensive: a stale opt-in result-cache entry (e.g. from a DROP+CREATE
+		// that reproduced table.Version 0 before the cache was purged) could
+		// otherwise index past the current table.Rows and panic.
+		if sr.rowIdx < 0 || sr.rowIdx >= len(table.Rows) {
+			continue
+		}
+		rank++
 		r := make(Row)
 		for ci, c := range table.Cols {
 			if ci < len(table.Rows[sr.rowIdx]) {
@@ -608,7 +619,8 @@ func (f *VecSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 			}
 		}
 		r["_vec_distance"] = sr.distance
-		r["_vec_rank"] = rank + 1
+		r["_vec_similarity"] = vecSimilarityFromDistance(a.metric, sr.distance)
+		r["_vec_rank"] = rank
 		resultRows = append(resultRows, r)
 	}
 
@@ -616,6 +628,24 @@ func (f *VecSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 		Cols: resultCols,
 		Rows: resultRows,
 	}, nil
+}
+
+// vecSimilarityFromDistance converts a VEC_SEARCH distance (lower = closer)
+// into a similarity score (higher = closer) for RAG_HYBRID_SCORE/
+// RAG_RANK_SCORE, which normalize their similarity input as cosine
+// similarity in [-1, 1]. Feeding _vec_distance directly into those scorers
+// silently inverts ranking: for cosine, an exact match (distance 0) would
+// score 0.5 while an opposite match (distance 2) would score 1.0.
+//
+// cosine distance is 1-similarity, so similarity = 1-distance, matching
+// VEC_COSINE_SIMILARITY's [-1, 1] range. For l2/manhattan/dot, distance has
+// no fixed upper bound, so similarity is just the negated distance — for
+// "dot", that recovers the raw (unnegated) inner product.
+func vecSimilarityFromDistance(metric string, distance float64) float64 {
+	if metric == "cosine" {
+		return 1.0 - distance
+	}
+	return -distance
 }
 
 // vecRowValue extracts a []float64 from a stored row cell.

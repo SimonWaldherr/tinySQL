@@ -50,10 +50,15 @@ not an in-table memory optimization.
 ## 2. Retrieve: VEC_SEARCH
 
 `VEC_SEARCH(table, column, query_vector, k [, metric [, index]])` returns the
-k nearest rows plus `_vec_distance` and `_vec_rank`:
+k nearest rows plus `_vec_distance`, `_vec_similarity`, and `_vec_rank`.
+`_vec_distance` is lower = closer; `_vec_similarity` is higher = closer (for
+cosine: `1.0 - _vec_distance`, matching `VEC_COSINE_SIMILARITY`'s [-1, 1]
+range). **Feed `_vec_similarity`, not `_vec_distance`, into `RAG_HYBRID_SCORE`
+/ `RAG_RANK_SCORE`** — those functions expect a similarity, and passing a
+distance silently inverts the ranking (no error is raised):
 
 ```sql
-SELECT doc_id, chunk_index, chunk_text, _vec_distance, _vec_rank
+SELECT doc_id, chunk_index, chunk_text, _vec_distance, _vec_similarity, _vec_rank
 FROM VEC_SEARCH('chunks', 'embedding', VEC_FROM_JSON('[0.1, 0.0, 0.9]'), 5, 'cosine');
 ```
 
@@ -81,22 +86,29 @@ tool when the ranking expression blends more than similarity.
 
 ## 3. Rerank: blend similarity with freshness and quality
 
-Cosine *distance* converts to similarity as `1.0 - _vec_distance`.
 `RAG_RANK_SCORE(similarity, ts, half_life_days, quality [, w_sim, w_rec, w_q])`
 combines normalized similarity, exponential recency decay, and a quality
 signal; `RAG_HYBRID_SCORE` (similarity + recency) and `RECENCY_SCORE` are the
-simpler variants:
+simpler variants. Use `_vec_similarity` from `VEC_SEARCH` directly:
 
 ```sql
 WITH hits AS (
     SELECT * FROM VEC_SEARCH('chunks', 'embedding', VEC_FROM_JSON('[0.1, 0.0, 0.9]'), 20, 'cosine')
 )
 SELECT doc_id, chunk_index, chunk_text,
-       RAG_RANK_SCORE(1.0 - _vec_distance, created_at, 30, quality, 0.65, 0.25, 0.10) AS score
+       RAG_RANK_SCORE(_vec_similarity, created_at, 30, quality, 0.65, 0.25, 0.10) AS score
 FROM hits
 ORDER BY score DESC
 LIMIT 5;
 ```
+
+`RECENCY_SCORE`/`RAG_HYBRID_SCORE`/`RAG_RANK_SCORE` all take an optional
+trailing `now` argument. When omitted, they default to the timestamp the
+current SQL statement started executing (stable across every row of one
+query, so ranking within a single result set is self-consistent) — not a
+fresh `time.Now()` per row. Pass `now` explicitly for scores that must stay
+identical across separate statement executions (e.g. golden-file tests, or
+pipelines run at different times over the same data).
 
 Retrieve generously (k=20), rerank, then keep the top few — reranking is
 cheap compared to a second retrieval round.
@@ -158,7 +170,7 @@ question can match nothing; for question-style input, OR-expand the terms
 
 For a lighter variant, retrieve by vector and rerank with the scalar
 `FTS_RANK` (BM25) inside one CTE:
-`0.7 * (1.0 - _vec_distance) + 0.3 * FTS_RANK(chunk_text, 'query terms')`.
+`0.7 * _vec_similarity + 0.3 * FTS_RANK(chunk_text, 'query terms')`.
 `FTS_SNIPPET` and `FTS_HIGHLIGHT` format the matched passages for prompts.
 
 ## 6. Serving and performance notes

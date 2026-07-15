@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -25,10 +26,8 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 	}
 
 	var snapshot *storage.StatementSnapshot
-	var ftsState ftsSnapshot
 	if isAtomicDML(stmt) {
 		snapshot = db.SnapshotForStatement()
-		ftsState = takeFTSSnapshot(db)
 	}
 	defer func() { recordAudit(ctx, db, tenant, stmt, err) }()
 	defer func() {
@@ -36,7 +35,6 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 			return
 		}
 		db.RestoreStatementSnapshot(snapshot)
-		restoreFTSSnapshot(db, ftsState)
 		for _, rollbackTenant := range db.ListTenants() {
 			for _, table := range db.ListTables(rollbackTenant) {
 				invalidateConstraintIndexes(table)
@@ -52,7 +50,7 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 	}()
 
 	statementWAL := newStatementWAL(db.AdvancedWAL())
-	rs, err = execStmt(ExecEnv{ctx: ctx, tenant: tenant, db: db, statementWAL: statementWAL}, stmt)
+	rs, err = execStmt(ExecEnv{ctx: ctx, tenant: tenant, db: db, statementWAL: statementWAL, now: time.Now()}, stmt)
 	if err == nil {
 		err = statementWAL.commit()
 	}

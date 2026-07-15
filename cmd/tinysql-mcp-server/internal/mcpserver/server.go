@@ -33,7 +33,7 @@ func (s *Server) buildMCPServer() *mcp.Server {
 func registerTools(srv *mcp.Server, s *Server) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "read_query",
-		Description: "Execute a read-only SQL SELECT statement against the tinySQL database. CTEs (WITH … SELECT) are also accepted. Mutating statements are rejected.",
+		Description: "Execute a read-only SQL SELECT statement against the tinySQL database. CTEs (WITH … SELECT) are also accepted. Mutating statements are rejected. tinySQL also supports vector k-NN search (VEC_SEARCH), BM25 full-text search (FTS_SEARCH), and RAG helpers (RAG_CONTEXT, RAG_CONTEXT_FROM, RAG_HYBRID_SCORE, RAG_RANK_SCORE) usable in this SELECT — see the tinysql://functions resource for their signatures.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args ReadQueryArgs) (*mcp.CallToolResult, any, error) {
 		res, err := s.HandleReadQuery(ctx, args)
 		return res, nil, err
@@ -156,6 +156,28 @@ func (s *Server) registerResources() {
 					URI:      "tinysql://agent-context",
 					MIMEType: "text/plain",
 					Text:     text,
+				},
+			},
+		}, nil
+	})
+
+	// tinysql://functions – RAG/vector/full-text function reference. Nothing
+	// else exposed over MCP tells an agent that VEC_SEARCH, FTS_SEARCH, or the
+	// RAG_* helpers exist, so without this resource the only discoverable SQL
+	// surface is generic read_query/write_query — tinySQL's headline RAG
+	// feature is otherwise unreachable by an agent that hasn't read the docs.
+	s.mcpSrv.AddResource(&mcp.Resource{
+		URI:         "tinysql://functions",
+		Name:        "RAG / Vector / Full-Text Functions",
+		Description: "Signatures and usage notes for tinySQL's vector search, full-text search, and RAG helper functions (VEC_SEARCH, FTS_SEARCH, RAG_CONTEXT, RAG_HYBRID_SCORE, ...), usable from read_query.",
+		MIMEType:    "text/plain",
+	}, func(_ context.Context, _ *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+		return &mcp.ReadResourceResult{
+			Contents: []*mcp.ResourceContents{
+				{
+					URI:      "tinysql://functions",
+					MIMEType: "text/plain",
+					Text:     functionsCatalog,
 				},
 			},
 		}, nil

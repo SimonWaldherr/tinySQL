@@ -675,6 +675,39 @@ func TestVecSearchTVF(t *testing.T) {
 	expectInt(t, rs.Rows[0]["_vec_rank"], 1, "rank of closest")
 }
 
+// TestVecSearchEmitsSimilarityColumn guards against feeding _vec_distance
+// directly into RAG_HYBRID_SCORE/RAG_RANK_SCORE, which expect a similarity
+// (higher = closer) and would silently invert ranking on a distance input.
+func TestVecSearchEmitsSimilarityColumn(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	Execute(ctx, db, "default", mustParse("CREATE TABLE documents (id INT, embedding VECTOR)"))
+	Execute(ctx, db, "default", mustParse("INSERT INTO documents VALUES (1, '[1.0, 0.0, 0.0]')"))
+	Execute(ctx, db, "default", mustParse("INSERT INTO documents VALUES (2, '[0.0, 1.0, 0.0]')"))
+
+	// cosine: exact match (distance 0) must report similarity 1.0, matching
+	// VEC_COSINE_SIMILARITY's [-1, 1] range, not _vec_distance's [0, 2].
+	rs := execSQL(t, db, `SELECT * FROM VEC_SEARCH('documents', 'embedding', VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 2, 'cosine')`)
+	expectFloat(t, rs.Rows[0]["_vec_similarity"], 1.0, 1e-9, "cosine similarity for exact match")
+	dist, _ := rs.Rows[0]["_vec_distance"].(float64)
+	sim, _ := rs.Rows[0]["_vec_similarity"].(float64)
+	expectFloat(t, sim, 1.0-dist, 1e-9, "cosine similarity = 1 - distance")
+
+	// l2: similarity is the negated distance (higher = closer), so ordering by
+	// similarity DESC must match ordering by distance ASC.
+	rs = execSQL(t, db, `SELECT * FROM VEC_SEARCH('documents', 'embedding', VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 2, 'l2')`)
+	dist0, _ := rs.Rows[0]["_vec_distance"].(float64)
+	sim0, _ := rs.Rows[0]["_vec_similarity"].(float64)
+	dist1, _ := rs.Rows[1]["_vec_distance"].(float64)
+	sim1, _ := rs.Rows[1]["_vec_similarity"].(float64)
+	expectFloat(t, sim0, -dist0, 1e-9, "l2 similarity = -distance (row 0)")
+	expectFloat(t, sim1, -dist1, 1e-9, "l2 similarity = -distance (row 1)")
+	if sim0 <= sim1 {
+		t.Errorf("expected closer row (smaller distance) to have larger similarity: sim0=%v sim1=%v", sim0, sim1)
+	}
+}
+
 func TestVecSearchWithL2Metric(t *testing.T) {
 	db := storage.NewDB()
 	ctx := context.Background()

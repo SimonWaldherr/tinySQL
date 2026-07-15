@@ -225,21 +225,38 @@ func embeddingText(c chunk) string {
 	return "Document: " + c.DocID + "\nSection: " + c.Heading + "\n" + c.Text
 }
 
+// buildDB creates the corpus table and loads it through ordinary INSERT
+// statements — the supported path taught by docs/rag-guide.md. (An earlier
+// version of this demo appended directly to table.Rows, which skips
+// coerceToVector and the table-version bump vector/FTS caches key on; that
+// only happens to work because every row lands before the first query, and
+// is not a pattern to copy against a table that queries run against.)
 func buildDB(chunks []chunk) (*tsql.DB, error) {
+	ctx := context.Background()
 	db := tsql.NewDB()
 	stmt, err := tsql.ParseSQL(`CREATE TABLE rag_chunks (doc_id TEXT, chunk_index INT, heading TEXT, chunk_text TEXT, embedding VECTOR)`)
 	if err != nil {
 		return nil, err
 	}
-	if _, err = tsql.Execute(context.Background(), db, "default", stmt); err != nil {
-		return nil, err
-	}
-	table, err := db.Get("default", "rag_chunks")
-	if err != nil {
+	if _, err = tsql.Execute(ctx, db, "default", stmt); err != nil {
 		return nil, err
 	}
 	for _, c := range chunks {
-		table.Rows = append(table.Rows, []any{c.DocID, c.Index, c.Heading, c.Text, c.Embedding})
+		embJSON, err := json.Marshal(c.Embedding)
+		if err != nil {
+			return nil, fmt.Errorf("marshal embedding for %s#%d: %w", c.DocID, c.Index, err)
+		}
+		insertSQL := fmt.Sprintf(
+			`INSERT INTO rag_chunks VALUES ('%s', %d, '%s', '%s', VEC_FROM_JSON('%s'))`,
+			sqlQuote(c.DocID), c.Index, sqlQuote(c.Heading), sqlQuote(c.Text), embJSON,
+		)
+		insertStmt, err := tsql.ParseSQL(insertSQL)
+		if err != nil {
+			return nil, fmt.Errorf("parse insert for %s#%d: %w", c.DocID, c.Index, err)
+		}
+		if _, err := tsql.Execute(ctx, db, "default", insertStmt); err != nil {
+			return nil, fmt.Errorf("insert %s#%d: %w", c.DocID, c.Index, err)
+		}
 	}
 	return db, nil
 }
@@ -250,7 +267,7 @@ func retrieve(ctx context.Context, client *lmClient, db *tsql.DB, chunks []chunk
 		return nil, fmt.Errorf("embed query: %w", err)
 	}
 	qJSON, _ := json.Marshal(vectors[0])
-	sql := fmt.Sprintf(`SELECT doc_id, chunk_index, heading, chunk_text, _vec_distance, _vec_rank FROM VEC_SEARCH('rag_chunks', 'embedding', VEC_FROM_JSON('%s'), %d, 'cosine', 'flat')`, qJSON, cfg.candidateK)
+	sql := fmt.Sprintf(`SELECT doc_id, chunk_index, heading, chunk_text, _vec_similarity, _vec_rank FROM VEC_SEARCH('rag_chunks', 'embedding', VEC_FROM_JSON('%s'), %d, 'cosine', 'flat')`, qJSON, cfg.candidateK)
 	stmt, err := tsql.ParseSQL(sql)
 	if err != nil {
 		return nil, err
@@ -264,9 +281,9 @@ func retrieve(ctx context.Context, client *lmClient, db *tsql.DB, chunks []chunk
 		doc, _ := value[string](row, "doc_id")
 		idx, _ := intValue(row, "chunk_index")
 		rank, _ := intValue(row, "_vec_rank")
-		distance, _ := value[float64](row, "_vec_distance")
+		similarity, _ := value[float64](row, "_vec_similarity")
 		c := findChunk(chunks, doc, idx)
-		byKey[key(doc, idx)] = &hit{Chunk: c, VectorRank: rank, Similarity: 1 - distance}
+		byKey[key(doc, idx)] = &hit{Chunk: c, VectorRank: rank, Similarity: similarity}
 	}
 
 	if cfg.hybrid {

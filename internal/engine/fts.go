@@ -26,6 +26,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,92 +34,6 @@ import (
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
-
-// ─────────────────────────── FTS Index types ─────────────────────────────────
-
-// ftsPosting holds the per-document occurrence data for a term.
-type ftsPosting struct {
-	RowID  int
-	Freq   int // term frequency in document
-	DocLen int // total tokens in document
-}
-
-// ftsIndex holds the inverted index and metadata for one virtual FTS table.
-type ftsIndex struct {
-	Columns   []string                // indexed columns
-	InvIndex  map[string][]ftsPosting // term → postings list
-	DocLens   map[int]int             // rowID → document length
-	AvgDocLen float64
-}
-
-// FTS indexes are process-local, but their keys include the owning DB so two
-// embedded databases may safely use the same tenant/table names.
-var (
-	ftsRegistry   = make(map[string]*ftsIndex)
-	ftsRegistryMu sync.RWMutex
-)
-
-func ftsDBPrefix(db *storage.DB) string {
-	return fmt.Sprintf("%p/", db)
-}
-
-func ftsKey(db *storage.DB, tenant, table string) string {
-	if tenant == "" {
-		tenant = "default"
-	}
-	return ftsDBPrefix(db) + strings.ToLower(tenant) + "/" + strings.ToLower(table)
-}
-
-// ftsSnapshot captures every FTS index owned by db. It is paired with the
-// storage statement snapshot so a failed DML statement cannot leave stale
-// postings behind after its table rows are restored.
-type ftsSnapshot map[string]*ftsIndex
-
-func takeFTSSnapshot(db *storage.DB) ftsSnapshot {
-	prefix := ftsDBPrefix(db)
-	ftsRegistryMu.RLock()
-	snapshot := make(ftsSnapshot)
-	for key, index := range ftsRegistry {
-		if strings.HasPrefix(key, prefix) {
-			snapshot[key] = cloneFTSIndex(index)
-		}
-	}
-	ftsRegistryMu.RUnlock()
-	return snapshot
-}
-
-func restoreFTSSnapshot(db *storage.DB, snapshot ftsSnapshot) {
-	prefix := ftsDBPrefix(db)
-	ftsRegistryMu.Lock()
-	for key := range ftsRegistry {
-		if strings.HasPrefix(key, prefix) {
-			delete(ftsRegistry, key)
-		}
-	}
-	for key, index := range snapshot {
-		ftsRegistry[key] = cloneFTSIndex(index)
-	}
-	ftsRegistryMu.Unlock()
-}
-
-func cloneFTSIndex(index *ftsIndex) *ftsIndex {
-	if index == nil {
-		return nil
-	}
-	copy := &ftsIndex{
-		Columns:   append([]string(nil), index.Columns...),
-		InvIndex:  make(map[string][]ftsPosting, len(index.InvIndex)),
-		DocLens:   make(map[int]int, len(index.DocLens)),
-		AvgDocLen: index.AvgDocLen,
-	}
-	for term, postings := range index.InvIndex {
-		copy.InvIndex[term] = append([]ftsPosting(nil), postings...)
-	}
-	for rowID, docLen := range index.DocLens {
-		copy.DocLens[rowID] = docLen
-	}
-	return copy
-}
 
 // ─────────────────────────── Stop words ──────────────────────────────────────
 
@@ -162,124 +77,6 @@ func ftsStem(w string) string {
 	return w
 }
 
-// ─────────────────────────── Index maintenance ───────────────────────────────
-
-// ftsGetOrCreate returns the ftsIndex for the given key, creating it if needed.
-func ftsGetOrCreate(key string, cols []string) *ftsIndex {
-	ftsRegistryMu.Lock()
-	defer ftsRegistryMu.Unlock()
-	idx, ok := ftsRegistry[key]
-	if !ok {
-		idx = &ftsIndex{
-			Columns:  cols,
-			InvIndex: make(map[string][]ftsPosting),
-			DocLens:  make(map[int]int),
-		}
-		ftsRegistry[key] = idx
-	}
-	return idx
-}
-
-// ftsIndexRow adds or updates a row's tokens in the inverted index.
-// cols is the list of FTS-indexed column names (nil means "use all").
-func ftsIndexRow(key, table string, rowID int, cols []string, row []any, colNames []string) {
-	ftsRegistryMu.RLock()
-	idx, ok := ftsRegistry[key]
-	ftsRegistryMu.RUnlock()
-	if !ok {
-		return // not an FTS table
-	}
-
-	// Remove old postings for this rowID.
-	ftsRegistryMu.Lock()
-	defer ftsRegistryMu.Unlock()
-
-	for term, posts := range idx.InvIndex {
-		filtered := posts[:0]
-		for _, p := range posts {
-			if p.RowID != rowID {
-				filtered = append(filtered, p)
-			}
-		}
-		if len(filtered) == 0 {
-			delete(idx.InvIndex, term)
-		} else {
-			idx.InvIndex[term] = filtered
-		}
-	}
-	delete(idx.DocLens, rowID)
-
-	// Collect text from indexed columns.
-	var allTokens []string
-	activeCols := cols
-	if len(activeCols) == 0 {
-		activeCols = idx.Columns
-	}
-	for _, cn := range activeCols {
-		for i, name := range colNames {
-			if strings.EqualFold(name, cn) && i < len(row) {
-				if row[i] != nil {
-					allTokens = append(allTokens, ftsTokenize(fmt.Sprintf("%v", row[i]))...)
-				}
-			}
-		}
-	}
-
-	if len(allTokens) == 0 {
-		return
-	}
-
-	// Count term frequencies.
-	freq := make(map[string]int)
-	for _, t := range allTokens {
-		freq[t]++
-	}
-
-	docLen := len(allTokens)
-	idx.DocLens[rowID] = docLen
-
-	for term, f := range freq {
-		idx.InvIndex[term] = append(idx.InvIndex[term], ftsPosting{
-			RowID:  rowID,
-			Freq:   f,
-			DocLen: docLen,
-		})
-	}
-
-	// Recompute average document length.
-	total := 0
-	for _, dl := range idx.DocLens {
-		total += dl
-	}
-	if len(idx.DocLens) > 0 {
-		idx.AvgDocLen = float64(total) / float64(len(idx.DocLens))
-	}
-}
-
-// ftsDeleteRow removes all postings for rowID from the index.
-func ftsDeleteRow(key string, rowID int) {
-	ftsRegistryMu.Lock()
-	defer ftsRegistryMu.Unlock()
-	idx, ok := ftsRegistry[key]
-	if !ok {
-		return
-	}
-	for term, posts := range idx.InvIndex {
-		filtered := posts[:0]
-		for _, p := range posts {
-			if p.RowID != rowID {
-				filtered = append(filtered, p)
-			}
-		}
-		if len(filtered) == 0 {
-			delete(idx.InvIndex, term)
-		} else {
-			idx.InvIndex[term] = filtered
-		}
-	}
-	delete(idx.DocLens, rowID)
-}
-
 // ─────────────────────────── BM25 Search ─────────────────────────────────────
 
 const (
@@ -289,7 +86,10 @@ const (
 
 // ─────────────────────────── FTS virtual table creation ──────────────────────
 
-// executeCreateFTSTable creates the underlying physical table and registers an FTS index.
+// executeCreateFTSTable creates the underlying physical table backing a
+// CREATE VIRTUAL TABLE ... USING fts(...) declaration. FTS_SEARCH is
+// index-free (see the document cache below), so nothing further needs
+// registering here.
 func executeCreateFTSTable(env ExecEnv, s *CreateTable) (*ResultSet, error) {
 	// Build column definitions (all TEXT)
 	cols := make([]storage.Column, len(s.FTSColumns))
@@ -298,15 +98,7 @@ func executeCreateFTSTable(env ExecEnv, s *CreateTable) (*ResultSet, error) {
 	}
 
 	t := storage.NewTable(s.Name, cols, false)
-	if err := env.db.Put(env.tenant, t); err != nil {
-		return nil, err
-	}
-
-	// Register the FTS index.
-	key := ftsKey(env.db, env.tenant, s.Name)
-	ftsGetOrCreate(key, s.FTSColumns)
-
-	return nil, nil
+	return nil, env.db.Put(env.tenant, t)
 }
 
 // ─────────────────────────── Scalar FTS functions ────────────────────────────
@@ -712,23 +504,39 @@ func ftsPhraseMatch(phrase, tokens []string) bool {
 
 const phraseMatchBonus = 1.5
 
-func ftsScoreNode(node *ftsQueryNode, freq map[string]int, docLen float64) float64 {
+// ftsIDFFunc looks up a term's inverse document frequency. nil means "no
+// corpus stats available" (e.g. the standalone FTS_RANK/FTS_MATCH path),
+// in which case term scores are left unweighted (IDF factor of 1).
+type ftsIDFFunc func(term string) float64
+
+// ftsScoreNode computes a BM25-style score for a parsed query tree.
+// normDocLen is the document length already normalized by the corpus
+// average (docLen/avgdl); callers with no corpus (evalFTSRank) pass 1.0,
+// meaning "assume average length", which reduces to no length penalty at
+// all — unchanged from this function's pre-normalization behavior.
+func ftsScoreNode(node *ftsQueryNode, freq map[string]int, normDocLen float64, idf ftsIDFFunc) float64 {
 	if node == nil {
 		return 0
 	}
-	switch node.op {
-	case "TERM":
-		tf := float64(freq[node.term])
+	termScore := func(term string, f int) float64 {
+		tf := float64(f)
 		if tf == 0 {
 			return 0
 		}
-		return (tf * (bm25K1 + 1)) / (tf + bm25K1*(1-bm25B+bm25B*docLen))
+		s := (tf * (bm25K1 + 1)) / (tf + bm25K1*(1-bm25B+bm25B*normDocLen))
+		if idf != nil {
+			s *= idf(term)
+		}
+		return s
+	}
+	switch node.op {
+	case "TERM":
+		return termScore(node.term, freq[node.term])
 	case "PREFIX":
 		var s float64
 		for tok, f := range freq {
 			if strings.HasPrefix(tok, node.prefix) {
-				tf := float64(f)
-				s += (tf * (bm25K1 + 1)) / (tf + bm25K1*(1-bm25B+bm25B*docLen))
+				s += termScore(tok, f)
 			}
 		}
 		return s
@@ -739,17 +547,14 @@ func ftsScoreNode(node *ftsQueryNode, freq map[string]int, docLen float64) float
 		// Score as sum of term scores (phrase match bonus)
 		var s float64
 		for _, t := range node.phrase {
-			tf := float64(freq[t])
-			if tf > 0 {
-				s += (tf * (bm25K1 + 1)) / (tf + bm25K1*(1-bm25B+bm25B*docLen))
-			}
+			s += termScore(t, freq[t])
 		}
 		return s * phraseMatchBonus // phrase match bonus
 	case "AND":
-		return ftsScoreNode(node.left, freq, docLen) + ftsScoreNode(node.right, freq, docLen)
+		return ftsScoreNode(node.left, freq, normDocLen, idf) + ftsScoreNode(node.right, freq, normDocLen, idf)
 	case "OR":
-		l := ftsScoreNode(node.left, freq, docLen)
-		r := ftsScoreNode(node.right, freq, docLen)
+		l := ftsScoreNode(node.left, freq, normDocLen, idf)
+		r := ftsScoreNode(node.right, freq, normDocLen, idf)
 		if l > r {
 			return l
 		}
@@ -828,8 +633,9 @@ func evalFTSRank(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if node == nil {
 		return 0.0, nil
 	}
-	// Use doc length of 1.0 (standalone, no corpus avgdl).
-	return ftsScoreNode(node, freq, 1.0), nil
+	// Use normalized doc length of 1.0 (standalone, no corpus avgdl to
+	// normalize against) and no IDF weighting (no corpus to compute it from).
+	return ftsScoreNode(node, freq, 1.0, nil), nil
 }
 
 // evalFTSWordCount returns the number of words in a text.
@@ -874,6 +680,14 @@ type ftsDocCacheEntry struct {
 	table   *storage.Table
 	version int
 	docs    []ftsCachedDoc
+	// avgDocLen and docFreq are corpus-wide BM25 statistics gathered for
+	// free while building docs below (one pass, already touching every
+	// token). avgDocLen normalizes each document's length so long documents
+	// aren't penalized by their absolute token count; docFreq (document
+	// frequency per term) feeds IDF so rare terms outweigh common ones.
+	avgDocLen float64
+	docFreq   map[string]int
+	numDocs   int
 }
 
 // ftsDocCacheMaxEntries bounds the tokenized-document cache the same way the
@@ -887,12 +701,9 @@ var (
 	ftsDocCache   = make(map[ftsDocCacheKey]ftsDocCacheEntry)
 )
 
-// purgeFTSCachesFor drops the tokenized-document cache and inverted index for
-// one table, called from DROP TABLE. Purging is always safe: both structures
-// rebuild lazily on the next FTS_SEARCH. ftsDocCache keys carry no DB pointer,
-// and the registry key embeds one, so the registry is matched by its
-// tenant/table suffix (over-purging identically named tables across embedded
-// DBs at worst forces a lazy rebuild).
+// purgeFTSCachesFor drops the tokenized-document cache for one table, called
+// from DROP TABLE. Purging is always safe: the cache rebuilds lazily on the
+// next FTS_SEARCH.
 func purgeFTSCachesFor(tenant, table string) {
 	if tenant == "" {
 		tenant = "default"
@@ -904,15 +715,6 @@ func purgeFTSCachesFor(tenant, table string) {
 		}
 	}
 	ftsDocCacheMu.Unlock()
-
-	suffix := "/" + strings.ToLower(tenant) + "/" + strings.ToLower(table)
-	ftsRegistryMu.Lock()
-	for k := range ftsRegistry {
-		if strings.HasSuffix(k, suffix) {
-			delete(ftsRegistry, k)
-		}
-	}
-	ftsRegistryMu.Unlock()
 }
 
 func ftsColsCacheKey(cols []int) string {
@@ -926,19 +728,23 @@ func ftsColsCacheKey(cols []int) string {
 	return b.String()
 }
 
-// getFTSDocCache returns the tokenized documents for the given column set,
-// (re)building them if the table has changed since the last call.
-func getFTSDocCache(tenant string, table *storage.Table, cols []int) []ftsCachedDoc {
+// getFTSDocCache returns the tokenized documents (plus corpus-wide BM25
+// stats) for the given column set, (re)building them if the table has
+// changed since the last call.
+func getFTSDocCache(tenant string, table *storage.Table, cols []int) ftsDocCacheEntry {
 	key := ftsDocCacheKey{tenant: tenant, table: table.Name, cols: ftsColsCacheKey(cols)}
 
 	ftsDocCacheMu.RLock()
 	if e, ok := ftsDocCache[key]; ok && e.table == table && e.version == table.Version {
 		ftsDocCacheMu.RUnlock()
-		return e.docs
+		return e
 	}
 	ftsDocCacheMu.RUnlock()
 
 	docs := make([]ftsCachedDoc, len(table.Rows))
+	docFreq := make(map[string]int)
+	var totalLen float64
+	var numDocs int
 	var sb strings.Builder
 	for ri, r := range table.Rows {
 		sb.Reset()
@@ -962,15 +768,43 @@ func getFTSDocCache(tenant string, table *storage.Table, cols []int) []ftsCached
 			freq[t]++
 		}
 		docs[ri] = ftsCachedDoc{freq: freq, tokens: tokens, docLen: float64(len(tokens)), valid: true}
+		totalLen += float64(len(tokens))
+		numDocs++
+		for term := range freq {
+			docFreq[term]++
+		}
 	}
 
+	var avgDocLen float64
+	if numDocs > 0 {
+		avgDocLen = totalLen / float64(numDocs)
+	}
+
+	entry := ftsDocCacheEntry{table: table, version: table.Version, docs: docs, avgDocLen: avgDocLen, docFreq: docFreq, numDocs: numDocs}
 	ftsDocCacheMu.Lock()
 	if _, exists := ftsDocCache[key]; !exists {
 		evictOverCap(ftsDocCache, ftsDocCacheMaxEntries)
 	}
-	ftsDocCache[key] = ftsDocCacheEntry{table: table, version: table.Version, docs: docs}
+	ftsDocCache[key] = entry
 	ftsDocCacheMu.Unlock()
-	return docs
+	return entry
+}
+
+// ftsIDFLookup returns a BM25 IDF function (Robertson-Sparck Jones with the
+// standard +1 smoothing, always positive) over one doc-cache snapshot's
+// document frequencies.
+func ftsIDFLookup(entry ftsDocCacheEntry) ftsIDFFunc {
+	if entry.numDocs == 0 {
+		return nil
+	}
+	n := float64(entry.numDocs)
+	return func(term string) float64 {
+		df := entry.docFreq[term]
+		if df == 0 {
+			return 0
+		}
+		return math.Log(1 + (n-float64(df)+0.5)/(float64(df)+0.5))
+	}
 }
 
 // ─────────────────────────── FTS_SEARCH table-valued function ─────────────────
@@ -1075,7 +909,8 @@ func (f *FTSSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 		resultCols := append(colNames(table.Cols), "_fts_score", "_fts_rank")
 		return &ResultSet{Cols: resultCols, Rows: []Row{}}, nil
 	}
-	docs := getFTSDocCache(tenant, table, searchCols)
+	cache := getFTSDocCache(tenant, table, searchCols)
+	idf := ftsIDFLookup(cache)
 
 	type scored struct {
 		rowIdx int
@@ -1083,14 +918,18 @@ func (f *FTSSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 	}
 	var results []scored
 
-	for ri, doc := range docs {
+	for ri, doc := range cache.docs {
 		if !doc.valid {
 			continue
 		}
 		if node != nil && !ftsMatchNode(node, doc.freq, doc.tokens) {
 			continue
 		}
-		score := ftsScoreNode(node, doc.freq, doc.docLen)
+		normDocLen := doc.docLen
+		if cache.avgDocLen > 0 {
+			normDocLen = doc.docLen / cache.avgDocLen
+		}
+		score := ftsScoreNode(node, doc.freq, normDocLen, idf)
 		results = append(results, scored{rowIdx: ri, score: score})
 	}
 
