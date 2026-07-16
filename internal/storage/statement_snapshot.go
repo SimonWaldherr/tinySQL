@@ -1,5 +1,7 @@
 package storage
 
+import "strings"
+
 // StatementSnapshot is an in-memory rollback point for one SQL statement.
 // It is deliberately internal storage machinery: the engine holds DB's
 // content lock for the whole statement, so a snapshot does not need to solve
@@ -11,11 +13,26 @@ package storage
 type StatementSnapshot struct {
 	tables  map[string]map[string]tableState
 	catalog diskCatalog
+	// full is false for a table-scoped snapshot. Such snapshots restore only
+	// the table that the statement can mutate, leaving unrelated tables in
+	// place. This avoids cloning an entire database for ordinary DML.
+	full bool
 }
 
 type tableState struct {
-	table *Table
-	state *Table
+	table      *Table
+	state      *Table
+	appendOnly *appendOnlyTableState
+}
+
+// appendOnlyTableState is the minimal rollback point for an INSERT that can
+// only append rows. It deliberately avoids copying existing rows; callers
+// must ensure that no secondary index or other side effect is mutated.
+type appendOnlyTableState struct {
+	rowCount  int
+	version   int
+	stats     *TableStats
+	dirtyFrom int
 }
 
 // SnapshotForStatement captures all table and catalog state needed to undo a
@@ -28,6 +45,7 @@ func (db *DB) SnapshotForStatement() *StatementSnapshot {
 	snapshot := &StatementSnapshot{
 		tables:  make(map[string]map[string]tableState),
 		catalog: catalogToDisk(db.Catalog()),
+		full:    true,
 	}
 	db.mu.RLock()
 	for tenant, tenantDB := range db.tenants {
@@ -41,6 +59,56 @@ func (db *DB) SnapshotForStatement() *StatementSnapshot {
 	return snapshot
 }
 
+// SnapshotForTableStatement captures one table and the catalog state needed
+// to roll back a statement known to mutate only that table. Callers must use
+// SnapshotForStatement instead when triggers or foreign-key actions could
+// affect other tables. The caller must already hold DB's content write lock.
+func (db *DB) SnapshotForTableStatement(tenant, name string) (*StatementSnapshot, error) {
+	if db == nil {
+		return nil, nil
+	}
+	table, err := db.Get(tenant, name)
+	if err != nil {
+		return nil, err
+	}
+	key := strings.ToLower(table.Name)
+	return &StatementSnapshot{
+		tables: map[string]map[string]tableState{
+			tenant: {key: {table: table, state: cloneTable(table)}},
+		},
+		catalog: catalogToDisk(db.Catalog()),
+	}, nil
+}
+
+// SnapshotForAppendOnlyTableStatement captures the lightweight rollback state
+// for a statement that can only append rows to one table. It is intended for
+// the executor's triggerless, index-free INSERT fast path; other callers must
+// use SnapshotForTableStatement or SnapshotForStatement.
+func (db *DB) SnapshotForAppendOnlyTableStatement(tenant, name string) (*StatementSnapshot, error) {
+	if db == nil {
+		return nil, nil
+	}
+	table, err := db.Get(tenant, name)
+	if err != nil {
+		return nil, err
+	}
+	key := strings.ToLower(table.Name)
+	return &StatementSnapshot{
+		tables: map[string]map[string]tableState{
+			tenant: {key: {
+				table: table,
+				appendOnly: &appendOnlyTableState{
+					rowCount:  len(table.Rows),
+					version:   table.Version,
+					stats:     cloneTableStats(table.Stats),
+					dirtyFrom: table.dirtyFrom,
+				},
+			}},
+		},
+		catalog: catalogToDisk(db.Catalog()),
+	}, nil
+}
+
 // RestoreStatementSnapshot rolls a database back to snapshot. It restores
 // pre-existing tables in place and removes tables created by the failed
 // statement. The caller must hold DB's content write lock.
@@ -50,22 +118,48 @@ func (db *DB) RestoreStatementSnapshot(snapshot *StatementSnapshot) {
 	}
 
 	db.mu.Lock()
-	restored := make(map[string]*tenantDB, len(snapshot.tables))
-	for tenant, tables := range snapshot.tables {
-		tenantDB := &tenantDB{tables: make(map[string]*Table, len(tables))}
-		for name, saved := range tables {
-			restoreTable(saved.table, saved.state)
-			tenantDB.tables[name] = saved.table
+	if snapshot.full {
+		restored := make(map[string]*tenantDB, len(snapshot.tables))
+		for tenant, tables := range snapshot.tables {
+			tenantDB := &tenantDB{tables: make(map[string]*Table, len(tables))}
+			for name, saved := range tables {
+				restoreStatementTable(saved)
+				tenantDB.tables[name] = saved.table
+			}
+			restored[tenant] = tenantDB
 		}
-		restored[tenant] = tenantDB
+		db.tenants = restored
+	} else {
+		for tenant, tables := range snapshot.tables {
+			tenantDB := db.getTenant(tenant)
+			for name, saved := range tables {
+				restoreStatementTable(saved)
+				tenantDB.tables[name] = saved.table
+			}
+		}
 	}
-	db.tenants = restored
 	db.mu.Unlock()
 
 	// CatalogManager has its own lock and includes materialized-view stale
 	// state changed by DML. Reconstructing it from the deep-copy disk form is
 	// less error-prone than selectively undoing each catalog side effect.
 	db.setCatalog(diskToCatalog(snapshot.catalog))
+}
+
+func restoreStatementTable(saved tableState) {
+	if saved.appendOnly != nil {
+		table := saved.table
+		state := saved.appendOnly
+		if table == nil {
+			return
+		}
+		table.Rows = table.Rows[:state.rowCount:state.rowCount]
+		table.Version = state.version
+		table.Stats = cloneTableStats(state.stats)
+		table.dirtyFrom = state.dirtyFrom
+		return
+	}
+	restoreTable(saved.table, saved.state)
 }
 
 // CollectWALChangesFromSnapshot computes the same per-table change set as
