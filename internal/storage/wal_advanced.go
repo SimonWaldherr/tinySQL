@@ -144,6 +144,16 @@ type AdvancedWAL struct {
 	// Flushed LSN (written to disk)
 	flushedLSN LSN
 
+	// LSN up to which the last checkpoint's saved snapshot already reflects
+	// every operation (loaded from the checkpoint file at open time, and
+	// updated after each successful Checkpoint). Recover uses this to skip
+	// re-applying records at or below it: without this, a crash between
+	// Checkpoint's snapshot save and its WAL truncation leaves an intact
+	// WAL whose already-checkpointed operations would otherwise be replayed
+	// a second time on top of a snapshot that already contains them,
+	// silently duplicating every row written since the previous checkpoint.
+	checkpointWatermark LSN
+
 	// Compression enabled
 	compress bool
 
@@ -204,19 +214,30 @@ func OpenAdvancedWAL(config AdvancedWALConfig) (*AdvancedWAL, error) {
 	cw := &countingWriter{w: file, n: walSize}
 	writer := bufio.NewWriterSize(cw, config.BufferSize)
 
+	var checkpointWatermark LSN
+	if config.CheckpointPath != "" {
+		w, err := ReadCheckpointWatermark(config.CheckpointPath)
+		if err != nil {
+			file.Close()
+			return nil, fmt.Errorf("read checkpoint watermark: %w", err)
+		}
+		checkpointWatermark = LSN(w)
+	}
+
 	wal := &AdvancedWAL{
-		path:               config.Path,
-		checkpointPath:     config.CheckpointPath,
-		file:               file,
-		bytes:              cw,
-		writer:             writer,
-		checkpointEvery:    config.CheckpointEvery,
-		checkpointInterval: config.CheckpointInterval,
-		checkpointMaxBytes: normalizeCheckpointMaxBytes(config.CheckpointMaxBytes),
-		lastCheckpoint:     time.Now(),
-		activeTxs:          make(map[TxID]*WALTxState),
-		compress:           config.Compress,
-		nextLSN:            1,
+		path:                config.Path,
+		checkpointPath:      config.CheckpointPath,
+		file:                file,
+		bytes:               cw,
+		writer:              writer,
+		checkpointEvery:     config.CheckpointEvery,
+		checkpointInterval:  config.CheckpointInterval,
+		checkpointMaxBytes:  normalizeCheckpointMaxBytes(config.CheckpointMaxBytes),
+		lastCheckpoint:      time.Now(),
+		activeTxs:           make(map[TxID]*WALTxState),
+		compress:            config.Compress,
+		nextLSN:             checkpointWatermark + 1,
+		checkpointWatermark: checkpointWatermark,
 	}
 
 	wal.encoder = gob.NewEncoder(writer)
@@ -458,8 +479,14 @@ func (w *AdvancedWAL) Checkpoint(db *DB) error {
 		return err
 	}
 
-	// Save database snapshot
-	if err := SaveToFile(db, w.checkpointPath); err != nil {
+	// Save database snapshot together with the LSN watermark up to which it
+	// already reflects every operation (this checkpoint marker's own LSN —
+	// everything before it was already applied to db directly by the live
+	// engine, not via replay, since AdvancedWAL only logs alongside that
+	// mutation). If a crash lands between this save and the WAL truncation
+	// below, Recover uses the watermark to skip re-applying records this
+	// snapshot already contains, instead of silently duplicating them.
+	if err := SaveToFile(db, w.checkpointPath, uint64(lsn)); err != nil {
 		return fmt.Errorf("checkpoint save: %w", err)
 	}
 
@@ -483,7 +510,16 @@ func (w *AdvancedWAL) Checkpoint(db *DB) error {
 	w.encoder = gob.NewEncoder(w.writer)
 	w.recordsSinceCP = 0
 	w.lastCheckpoint = time.Now()
-	w.nextLSN = 1
+	w.checkpointWatermark = lsn
+	// nextLSN is deliberately NOT reset here: LSN is documented as globally
+	// unique and monotonically increasing for the database's lifetime (see
+	// the LSN doc comment and GetNextLSN/GetCommittedLSN/GetFlushedLSN,
+	// which external callers — e.g. a backup/replication feed — may rely
+	// on). Continuing the sequence also keeps it consistent with
+	// checkpointWatermark across repeated checkpoint cycles: if LSNs reset
+	// to 1 here, a later crash-recovery pass could not tell a fresh
+	// post-checkpoint LSN 1 apart from the LSN 1 of checkpoints ago, and
+	// the watermark check above would wrongly skip real new records.
 
 	return nil
 }
@@ -532,7 +568,14 @@ func (w *AdvancedWAL) Recover(db *DB) (int, error) {
 	aborted := make(map[TxID]bool)
 
 	recovered := 0
-	var maxLSN LSN
+	// Seed from the checkpoint's own watermark (loaded in OpenAdvancedWAL),
+	// not zero, so nextLSN below continues monotonically even when the WAL
+	// file has nothing left to scan (e.g. a cleanly truncated WAL after a
+	// prior successful checkpoint) — otherwise the next checkpoint's LSN
+	// numbering would restart from a value already used before, and this
+	// same watermark check would wrongly treat genuinely new records as
+	// already-checkpointed.
+	maxLSN := w.checkpointWatermark
 
 	for {
 		var record WALRecord
@@ -554,6 +597,16 @@ func (w *AdvancedWAL) Recover(db *DB) (int, error) {
 
 		if record.LSN > maxLSN {
 			maxLSN = record.LSN
+		}
+
+		if record.LSN <= w.checkpointWatermark {
+			// Already reflected in the checkpoint snapshot loaded before
+			// Recover ran (see OpenDB's ModeAdvancedWAL case) — this record
+			// only still exists because a crash landed between the
+			// snapshot save and the WAL truncation that would normally
+			// have removed it. Re-applying it would duplicate a row this
+			// state already contains.
+			continue
 		}
 
 		switch record.OpType {

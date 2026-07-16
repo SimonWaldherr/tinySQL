@@ -4347,14 +4347,15 @@ func buildRawFilterUnary(colIndex map[string]int, ex *Unary) func([]any) (bool, 
 	if ex.Op != "NOT" {
 		return nil
 	}
-	inner := buildRawFilter(colIndex, ex.Expr)
-	if inner == nil {
-		return nil
-	}
-	return func(raw []any) (bool, error) {
-		b, err := inner(raw)
-		return !b, err
-	}
+	// NOT must implement three-valued logic: NOT(unknown) stays unknown
+	// (row excluded), not "not false" = true. The specialized
+	// comparison/LIKE/IN filters compile to a plain bool that intentionally
+	// collapses a NULL-involving predicate to false — safe when applied
+	// directly (both false and unknown exclude the row the same way), but
+	// wrong once negated, since !false == true loses the distinction.
+	// evalRawExpr's own NOT case already implements this correctly via
+	// toTri/triNot, so delegate to it instead of negating a collapsed bool.
+	return buildRawExprFilter(colIndex, ex)
 }
 
 func buildRawFilterIsNull(colIndex map[string]int, ex *IsNull) func([]any) (bool, error) {
@@ -5493,7 +5494,11 @@ func evalRawLike(plan *simpleSelectPlan, raw []any, ex *LikeExpr) (any, error) {
 		return nil, err
 	}
 	if val == nil || patVal == nil {
-		return false, nil
+		// SQL three-valued logic: a NULL operand makes the predicate
+		// unknown, not false — returning false here would be silently
+		// wrong once this result is negated by an enclosing NOT (see
+		// evalRawUnary's NOT case, which relies on toTri/triNot).
+		return nil, nil
 	}
 	str, ok := val.(string)
 	if !ok {
@@ -5544,7 +5549,9 @@ func evalRawRegexp(plan *simpleSelectPlan, raw []any, ex *RegexpExpr) (any, erro
 		return nil, err
 	}
 	if val == nil || patVal == nil {
-		return false, nil
+		// See the matching comment in evalRawLike: NULL makes this unknown,
+		// not false, so an enclosing NOT stays excluded rather than flipping.
+		return nil, nil
 	}
 	str := fmt.Sprintf("%v", val)
 	pattern := fmt.Sprintf("%v", patVal)
@@ -5567,6 +5574,14 @@ func evalRawIn(plan *simpleSelectPlan, raw []any, ex *InExpr) (any, error) {
 	val, err := evalRawExpr(plan, raw, ex.Expr)
 	if err != nil {
 		return nil, err
+	}
+	if val == nil {
+		// SQL three-valued logic: NULL IN (...) and NULL NOT IN (...) are
+		// both unknown, not a definite true/false — critically, this must
+		// be decided before rawEqual, whose nil-vs-nil branch returns true
+		// (a Go-equality convention used elsewhere for grouping/dedup, not
+		// SQL equality, where NULL never equals NULL).
+		return nil, nil
 	}
 	for _, valExpr := range ex.Values {
 		listVal, err := evalRawExpr(plan, raw, valExpr)
@@ -6918,6 +6933,11 @@ func evalIn(env ExecEnv, ex *InExpr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if val == nil {
+		// SQL three-valued logic: NULL IN (...) and NULL NOT IN (...) are
+		// both unknown, not a definite true/false.
+		return nil, nil
+	}
 
 	// Check against each value in the list
 	for _, valExpr := range ex.Values {
@@ -6955,10 +6975,12 @@ func evalLike(env ExecEnv, ex *LikeExpr, row Row) (any, error) {
 		return nil, err
 	}
 
-	// SQL semantics: NULL LIKE ... and ... LIKE NULL are not matches
-	// (previously nil was stringified to "<nil>" and could match '%').
+	// SQL three-valued logic: NULL LIKE ... and ... LIKE NULL are unknown,
+	// not false (previously nil was stringified to "<nil>" and could match
+	// '%'; returning a definite false here is also wrong once this result
+	// is negated by an enclosing NOT — see evalUnary's NOT case).
 	if val == nil || patternVal == nil {
-		return false, nil
+		return nil, nil
 	}
 
 	// Convert to strings
@@ -7018,7 +7040,9 @@ func evalRegexpExpr(env ExecEnv, ex *RegexpExpr, row Row) (any, error) {
 		return nil, err
 	}
 	if val == nil || patternVal == nil {
-		return false, nil
+		// See the matching comment in evalLike: NULL makes this unknown,
+		// not false, so an enclosing NOT stays excluded rather than flipping.
+		return nil, nil
 	}
 	str := fmt.Sprintf("%v", val)
 	pattern := fmt.Sprintf("%v", patternVal)

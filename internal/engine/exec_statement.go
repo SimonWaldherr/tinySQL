@@ -54,6 +54,9 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 	if err == nil {
 		err = statementWAL.commit()
 	}
+	if err == nil {
+		err = maybeLogToWALManager(db, snapshot)
+	}
 	return rs, err
 }
 

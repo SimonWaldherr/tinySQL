@@ -1,19 +1,26 @@
-// Automatic AdvancedWAL logging for INSERT/UPDATE/DELETE.
+// Automatic WAL logging for INSERT/UPDATE/DELETE, for both WAL
+// implementations tinySQL supports.
 //
-// Before this, tinySQL had two WAL implementations — the basic WALManager
-// (whole-table snapshot diffing, used by internal/driver's explicit
-// BeginTx/Commit) and AdvancedWAL (row-level, LSN-based, with real
-// REDO/recovery) — but nothing in the engine's own INSERT/UPDATE/DELETE path
-// ever called AdvancedWAL's LogInsert/LogUpdate/LogDelete. A caller using
-// ModeAdvancedWAL and writing through the ordinary tinysql.Execute API (not
-// through internal/driver's transaction machinery) got no durability
-// logging at all — a silent gap, since nothing errored or warned about it.
+// tinySQL has two WAL implementations — the basic WALManager (whole-table
+// snapshot diffing, used by ModeWAL) and AdvancedWAL (row-level, LSN-based,
+// with real REDO/recovery, used by ModeAdvancedWAL) — but historically
+// nothing in the engine's own INSERT/UPDATE/DELETE path called either one.
+// Both were only driven by internal/driver's explicit BeginTx/Commit and
+// autocommit paths. A caller using ModeWAL or ModeAdvancedWAL and writing
+// through the ordinary tinysql.Execute API (not through internal/driver's
+// connection machinery — e.g. cmd/server, or any direct embedder) got no
+// durability logging at all: a silent gap, since nothing errored or warned
+// about it, and DB.HealthCheck() still reported WALActive/AdvancedWALActive
+// as true.
 //
 // walAuto wraps each mutating statement in its own implicit, autocommitted
-// WAL transaction (LogBegin before the row loop, LogCommit after) and logs
-// every row change as it happens. It is a complete no-op — zero calls, zero
-// overhead beyond one nil check — when no AdvancedWAL is attached, which
-// remains the default for ModeMemory/ModeDisk/ModeJSON/ModeHybrid/ModeWAL.
+// AdvancedWAL transaction (LogBegin before the row loop, LogCommit after)
+// and logs every row change as it happens. maybeLogToWALManager instead
+// diffs the statement's pre-execution snapshot against the now-mutated DB
+// and logs the resulting table-level changes to WALManager, mirroring what
+// internal/driver's commitTx/execStatement already do for driver-mediated
+// access. Both are complete no-ops — zero calls, zero overhead beyond a nil
+// check — when the corresponding WAL isn't attached.
 package engine
 
 import "github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -131,4 +138,32 @@ func (a *walAuto) commit() error {
 	}
 	_, err := a.wal.LogCommit(a.txID)
 	return err
+}
+
+// maybeLogToWALManager drives the basic WALManager (ModeWAL) for one
+// successfully completed INSERT/UPDATE/DELETE statement executed directly
+// through engine.Execute, mirroring internal/driver's own
+// commitTx/execStatement handling of the same WAL. snapshot is the
+// statement's pre-execution StatementSnapshot (already captured
+// unconditionally for atomic-DML rollback, see executeStatement); db is the
+// now-mutated, live database. A no-op when no WALManager is attached, when
+// there's no snapshot to diff against, or when the statement touched no
+// table.
+func maybeLogToWALManager(db *storage.DB, snapshot *storage.StatementSnapshot) error {
+	wal := db.WAL()
+	if wal == nil || snapshot == nil {
+		return nil
+	}
+	changes := storage.CollectWALChangesFromSnapshot(snapshot, db)
+	if len(changes) == 0 {
+		return nil
+	}
+	needCheckpoint, err := wal.LogTransaction(changes)
+	if err != nil {
+		return err
+	}
+	if needCheckpoint {
+		return wal.Checkpoint(db)
+	}
+	return nil
 }

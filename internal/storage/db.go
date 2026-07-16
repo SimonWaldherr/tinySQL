@@ -973,6 +973,49 @@ func loadGOBInto(db *DB, filename string) (bool, error) {
 	return len(dump) > 0 || loadedCatalog, nil
 }
 
+// ReadCheckpointWatermark reads the trailing uint64 a checkpoint file may
+// carry after its table dump and catalog (see SaveToFile's extra
+// parameter) — the LSN/Seq up to which that checkpoint already reflects
+// every operation, used by AdvancedWAL/WALManager to skip re-applying
+// already-checkpointed WAL records on recovery (see each Checkpoint/Recover
+// pair). Returns 0 with no error if the file doesn't exist, is empty, or
+// simply predates this watermark (an older checkpoint format) — all of
+// which mean "nothing to skip," the safe default.
+func ReadCheckpointWatermark(filename string) (uint64, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	defer f.Close()
+
+	var r io.Reader = bufio.NewReader(f)
+	if strings.HasSuffix(strings.ToLower(filename), ".gz") {
+		gr, gzErr := gzip.NewReader(r)
+		if gzErr != nil {
+			return 0, gzErr
+		}
+		defer gr.Close()
+		r = gr
+	}
+	dec := gob.NewDecoder(r)
+	var dump []diskTable
+	if err := dec.Decode(&dump); err != nil {
+		return 0, nil // empty or unreadable as a snapshot: nothing to skip
+	}
+	var dc diskCatalog
+	if err := dec.Decode(&dc); err != nil {
+		return 0, nil // no catalog section: predates any watermark too
+	}
+	var watermark uint64
+	if err := dec.Decode(&watermark); err != nil {
+		return 0, nil // predates the watermark being written: nothing to skip
+	}
+	return watermark, nil
+}
+
 // getTenant returns the tenantDB for the given tenant name, creating it
 // if necessary. Callers must hold db.mu (at least read-locked when only
 // reading, write-locked when creating/modifying).
@@ -1737,7 +1780,16 @@ func diskToTable(dt diskTable) *Table {
 // The snapshot is written atomically: data goes to a temporary file in the
 // same directory, is fsynced, and is then renamed over the target. A crash
 // mid-checkpoint therefore never corrupts or truncates the previous snapshot.
-func SaveToFile(db *DB, filename string) error {
+// SaveToFile writes an atomic snapshot of db (every table plus the catalog)
+// to filename, then gob-encodes each value in extra, in order, immediately
+// after — letting a caller persist small auxiliary state (e.g. a WAL
+// checkpoint's last-applied LSN/Seq watermark, see
+// AdvancedWAL.Checkpoint/WALManager.Checkpoint) atomically with the
+// snapshot itself, via the same temp-file-then-rename step, rather than a
+// separate file whose write could complete independently of this one and
+// leave the two inconsistent after a crash. Existing callers that pass no
+// extra values are unaffected; the file format is unchanged for them.
+func SaveToFile(db *DB, filename string, extra ...any) error {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
@@ -1781,6 +1833,11 @@ func SaveToFile(db *DB, filename string) error {
 	}
 	if err := enc.Encode(catalogToDisk(db.Catalog())); err != nil {
 		return fail(err)
+	}
+	for _, v := range extra {
+		if err := enc.Encode(v); err != nil {
+			return fail(err)
+		}
 	}
 	if gz != nil {
 		if err := gz.Close(); err != nil {

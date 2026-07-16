@@ -68,6 +68,28 @@ func (db *DB) RestoreStatementSnapshot(snapshot *StatementSnapshot) {
 	db.setCatalog(diskToCatalog(snapshot.catalog))
 }
 
+// CollectWALChangesFromSnapshot computes the same per-table change set as
+// CollectWALChanges, using a StatementSnapshot's pre-statement table clones
+// as the "before" side instead of a second live *DB. This lets a single
+// statement executed directly through engine.Execute drive WALManager
+// logging (see internal/engine/wal_logging.go) without cloning the whole
+// database purely to diff it — SnapshotForStatement already captured
+// exactly the "before" state this needs, for rollback purposes.
+func CollectWALChangesFromSnapshot(snapshot *StatementSnapshot, next *DB) []WALChange {
+	if snapshot == nil || next == nil {
+		return nil
+	}
+	tenants := make(map[string]*tenantDB, len(snapshot.tables))
+	for tenant, tables := range snapshot.tables {
+		td := &tenantDB{tables: make(map[string]*Table, len(tables))}
+		for name, saved := range tables {
+			td.tables[name] = saved.state
+		}
+		tenants[tenant] = td
+	}
+	return CollectWALChanges(&DB{tenants: tenants}, next)
+}
+
 func restoreTable(dst, saved *Table) {
 	if dst == nil || saved == nil {
 		return
