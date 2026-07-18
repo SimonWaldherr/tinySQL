@@ -1,6 +1,7 @@
 package tinysql
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -128,6 +129,42 @@ func TestBuilderExpressionsToSQL(t *testing.T) {
 	}
 	if got := exprToSQL(struct{ engine.Expr }{}); got != "?" {
 		t.Fatalf("unknown expr = %q", got)
+	}
+}
+
+func TestBuilderExistsPredicates(t *testing.T) {
+	existsQuery := SelectStar().From("tags")
+	stmt := Select(Col("name")).From("items").Where(Exists(existsQuery)).Build()
+	if got, want := ToSQL(stmt), "SELECT name FROM items WHERE EXISTS (SELECT * FROM tags)"; got != want {
+		t.Fatalf("EXISTS SQL = %q, want %q", got, want)
+	}
+	notExistsStmt := SelectStar().From("items").Where(NotExists(existsQuery)).Build()
+	if got, want := ToSQL(notExistsStmt), "SELECT * FROM items WHERE NOT (EXISTS (SELECT * FROM tags))"; got != want {
+		t.Fatalf("NOT EXISTS SQL = %q, want %q", got, want)
+	}
+
+	db := NewDB()
+	ctx := context.Background()
+	for _, sql := range []string{
+		"CREATE TABLE items (id INT, name TEXT)",
+		"CREATE TABLE tags (item_id INT)",
+		"INSERT INTO items VALUES (1, 'Ada'), (2, 'Linus')",
+		"INSERT INTO tags VALUES (1)",
+	} {
+		parsed, err := ParseSQL(sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Execute(ctx, db, "default", parsed); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := Execute(ctx, db, "default", stmt)
+	if err != nil {
+		t.Fatalf("execute builder EXISTS query: %v", err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("EXISTS result rows = %d, want 2", len(result.Rows))
 	}
 }
 

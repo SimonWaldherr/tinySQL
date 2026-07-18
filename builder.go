@@ -582,7 +582,15 @@ func Coalesce(exprs ...ExprBuilder) ExprBuilder {
 	}}
 }
 
-// TODO: Exists and NotExists - implement EXISTS subquery support in the engine first
+// Exists creates an EXISTS predicate for a subquery.
+func Exists(query *SelectBuilder) ExprBuilder {
+	return exprWrapper{&engine.ExistsExpr{Select: query.Build()}}
+}
+
+// NotExists creates a NOT EXISTS predicate for a subquery.
+func NotExists(query *SelectBuilder) ExprBuilder {
+	return Not(Exists(query))
+}
 
 // ============================================================================
 // Table Builder - For programmatic schema definition
@@ -1088,6 +1096,8 @@ func exprToSQL(e engine.Expr) string {
 		}
 		sb.WriteString(")")
 		return sb.String()
+	case *engine.ExistsExpr:
+		return fmt.Sprintf("EXISTS (%s)", selectToSQL(ex.Select))
 	default:
 		return "?"
 	}
