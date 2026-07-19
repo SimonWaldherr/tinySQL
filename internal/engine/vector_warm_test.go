@@ -72,6 +72,34 @@ func TestVecWarmIVFAndDefaults(t *testing.T) {
 	}
 }
 
+func TestVecWarmMixedDimensionalityReported(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE docs (id INT, body TEXT, emb VECTOR)`)
+	// 5 rows with the "old" 3-dim embedding, then 2 rows with a "new" 4-dim
+	// embedding — simulating an embedding-model migration mid-flight.
+	for i := 0; i < 5; i++ {
+		execSQL(t, db, fmt.Sprintf(
+			`INSERT INTO docs (id, body, emb) VALUES (%d, 'doc %d', '[%d.0, %d.0, %d.0]')`,
+			i, i, i, i+1, i+2))
+	}
+	for i := 5; i < 7; i++ {
+		execSQL(t, db, fmt.Sprintf(
+			`INSERT INTO docs (id, body, emb) VALUES (%d, 'doc %d', '[%d.0, %d.0, %d.0, %d.0]')`,
+			i, i, i, i+1, i+2, i+3))
+	}
+
+	rs := execSQL(t, db, `SELECT * FROM VEC_WARM('docs', 'emb', 'cosine', 'hnsw')`)
+	if len(rs.Rows) != 1 {
+		t.Fatalf("expected 1 stats row, got %d", len(rs.Rows))
+	}
+	row := rs.Rows[0]
+	expectInt(t, row["row_count"], 7, "row_count")
+	expectInt(t, row["vector_count"], 7, "vector_count")
+	expectInt(t, row["dims"], 3, "dims")
+	expectInt(t, row["distinct_dims"], 2, "distinct_dims")
+	expectInt(t, row["excluded_rows"], 2, "excluded_rows")
+}
+
 func TestVecWarmErrors(t *testing.T) {
 	db := storage.NewDB()
 	setupWarmTable(t, db, 3)

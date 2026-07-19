@@ -124,6 +124,27 @@ func TestNtileMoreBucketsThanRows(t *testing.T) {
 	expectInt(t, rs.Rows[1]["bucket"], 2, "row1 bucket")
 }
 
+func TestLagLeadNegativeOffsetReturnsDefaultInsteadOfPanicking(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE t (id INT)`)
+	execSQL(t, db, `INSERT INTO t VALUES (1)`)
+	execSQL(t, db, `INSERT INTO t VALUES (2)`)
+	execSQL(t, db, `INSERT INTO t VALUES (3)`)
+
+	// A negative offset drives lagIdx/leadIdx out of [0, len(partitionRows))
+	// on the side the pre-fix bounds check didn't cover (lagIdx's upper bound,
+	// leadIdx's lower bound), indexing partitionRows out of range instead of
+	// returning the supplied default.
+	rs := execSQL(t, db, `SELECT id, LAG(id, -5, -1) OVER (ORDER BY id) AS lg, LEAD(id, -5, -1) OVER (ORDER BY id) AS ld FROM t ORDER BY id`)
+	if len(rs.Rows) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(rs.Rows))
+	}
+	for _, row := range rs.Rows {
+		expectInt(t, row["lg"], -1, "LAG with out-of-range negative offset")
+		expectInt(t, row["ld"], -1, "LEAD with out-of-range negative offset")
+	}
+}
+
 func TestNtileRejectsNonPositive(t *testing.T) {
 	db := storage.NewDB()
 	execSQL(t, db, `CREATE TABLE t (id INT)`)

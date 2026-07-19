@@ -5,6 +5,7 @@ import (
 	"encoding/gob"
 	"encoding/json"
 	"encoding/xml"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,6 +51,58 @@ func TestExportJSON(t *testing.T) {
 	}
 	if len(arr) != 2 {
 		t.Fatalf("expected 2 rows, got %d", len(arr))
+	}
+}
+
+// TestExportJSONStreamingMatchesBuffered pins ExportJSON's row-at-a-time
+// implementation to byte-identical output with the naive "build a
+// []map[string]any, then json.Encoder.Encode it once" approach it replaced.
+// It covers zero rows, one row, multiple rows and BLOB envelopes, in both
+// compact and PrettyJSON modes.
+func TestExportJSONStreamingMatchesBuffered(t *testing.T) {
+	bufferedJSON := func(t *testing.T, rs *engine.ResultSet, opts Options) string {
+		t.Helper()
+		var buf bytes.Buffer
+		enc := json.NewEncoder(&buf)
+		if opts.PrettyJSON {
+			enc.SetIndent("", "  ")
+		}
+		out := make([]map[string]any, len(rs.Rows))
+		for i, r := range rs.Rows {
+			m := make(map[string]any, len(rs.Cols))
+			for _, c := range rs.Cols {
+				m[c] = jsonValue(r[strings.ToLower(c)], opts)
+			}
+			out[i] = m
+		}
+		if err := enc.Encode(out); err != nil {
+			t.Fatalf("buffered encode: %v", err)
+		}
+		return buf.String()
+	}
+
+	cases := []struct {
+		name string
+		rs   *engine.ResultSet
+	}{
+		{"empty", &engine.ResultSet{Cols: []string{"id"}, Rows: nil}},
+		{"single", &engine.ResultSet{Cols: []string{"id", "name"}, Rows: []engine.Row{{"id": 1, "name": "alice"}}}},
+		{"multi", makeSample()},
+		{"blob", &engine.ResultSet{Cols: []string{"payload"}, Rows: []engine.Row{{"payload": []byte{0x00, 0xff}}}}},
+	}
+	for _, tc := range cases {
+		for _, pretty := range []bool{false, true} {
+			opts := Options{PrettyJSON: pretty}
+			want := bufferedJSON(t, tc.rs, opts)
+
+			var got bytes.Buffer
+			if err := ExportJSON(&got, tc.rs, opts); err != nil {
+				t.Fatalf("%s pretty=%v: ExportJSON: %v", tc.name, pretty, err)
+			}
+			if got.String() != want {
+				t.Fatalf("%s pretty=%v:\n got=%q\nwant=%q", tc.name, pretty, got.String(), want)
+			}
+		}
 	}
 }
 

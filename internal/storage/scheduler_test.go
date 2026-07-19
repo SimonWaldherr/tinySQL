@@ -9,15 +9,19 @@ import (
 )
 
 type schedulerTestExecutor struct {
-	mu    sync.Mutex
-	calls []string
-	err   error
+	mu       sync.Mutex
+	calls    []string
+	err      error
+	panicMsg string
 }
 
 func (e *schedulerTestExecutor) ExecuteSQL(_ context.Context, sql string) (interface{}, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.calls = append(e.calls, sql)
+	if e.panicMsg != "" {
+		panic(e.panicMsg)
+	}
 	if e.err != nil {
 		return nil, e.err
 	}
@@ -123,6 +127,53 @@ func TestSchedulerExecuteJobSuccessFailureAndSkipped(t *testing.T) {
 	}
 	if statuses["noexec"] != "SKIPPED" {
 		t.Fatalf("noexec status = %q", statuses["noexec"])
+	}
+}
+
+func TestSchedulerExecuteJobRecoversFromPanic(t *testing.T) {
+	db := NewDB()
+	exec := &schedulerTestExecutor{panicMsg: "simulated parser panic on job SQL"}
+	s := NewScheduler(db, exec)
+
+	job := &CatalogJob{Name: "panicky", SQLText: "SELECT this triggers a panic", ScheduleType: "ONCE", Enabled: true}
+	if err := db.Catalog().RegisterJob(job); err != nil {
+		t.Fatalf("RegisterJob panicky failed: %v", err)
+	}
+
+	// This must not crash the test process: a panic inside ExecuteSQL should
+	// be recovered and recorded as a FAILED job run, not propagate out of the
+	// scheduler's goroutine.
+	s.executeJob(job)
+	s.wg.Wait()
+
+	var found bool
+	for _, run := range db.Catalog().ListJobHistory() {
+		if run.JobName != "panicky" {
+			continue
+		}
+		found = true
+		if run.Status != "FAILED" {
+			t.Fatalf("panicky status = %q, want FAILED", run.Status)
+		}
+		if run.ErrorMessage == "" {
+			t.Fatal("expected non-empty error message for panicked job")
+		}
+	}
+	if !found {
+		t.Fatal("expected job history entry for panicky job")
+	}
+
+	// The scheduler must remain usable after a recovered panic.
+	successExec := &schedulerTestExecutor{}
+	s2 := NewScheduler(db, successExec)
+	follow := &CatalogJob{Name: "after-panic", SQLText: "SELECT 1", ScheduleType: "ONCE", Enabled: true}
+	if err := db.Catalog().RegisterJob(follow); err != nil {
+		t.Fatalf("RegisterJob after-panic failed: %v", err)
+	}
+	s2.executeJob(follow)
+	s2.wg.Wait()
+	if successExec.callCount() != 1 {
+		t.Fatalf("executor calls after recovered panic = %d, want 1", successExec.callCount())
 	}
 }
 

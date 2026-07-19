@@ -336,6 +336,20 @@ func (s *Scheduler) executeJob(job *CatalogJob) {
 			}
 		}()
 
+		// Recover from a panic inside job execution (e.g. a parser bug
+		// triggered by the job's own stored SQL text) so one bad job can't
+		// take down the whole process; mirrors executeStatement's
+		// panic-to-error conversion in internal/engine/exec_statement.go,
+		// but records the panic as a FAILED job run instead of returning it
+		// as an error to a caller.
+		defer func() {
+			if r := recover(); r != nil {
+				status = "FAILED"
+				errMsg = fmt.Sprintf("panic executing job: %v", r)
+				log.Printf("Job %q panicked: %v", job.Name, r)
+			}
+		}()
+
 		log.Printf("Executing job %q", job.Name)
 
 		// Execute SQL through executor interface

@@ -400,3 +400,50 @@ func TestBufferPoolConcurrency(t *testing.T) {
 	// Should not panic or deadlock
 	t.Log("Concurrency test passed")
 }
+
+// TestBufferPoolConcurrentSameKey exercises Put and Get racing on the exact
+// same CachedTable (same tenant+name) from multiple goroutines. Put's
+// "update existing" branch must lock cached.mu the same way Get does,
+// otherwise the shared CachedTable fields (Table/Size/LastAccess/AccessCount)
+// are mutated without mutual exclusion between the two call paths.
+func TestBufferPoolConcurrentSameKey(t *testing.T) {
+	bp := NewBufferPool(DefaultMemoryPolicy())
+
+	cols := []Column{{Name: "id", Type: IntType}}
+	base := NewTable("shared", cols, false)
+	base.Rows = [][]any{{1}}
+
+	if err := bp.Put("default", "shared", base); err != nil {
+		t.Fatalf("initial put failed: %v", err)
+	}
+
+	const iterations = 200
+	done := make(chan bool, 2)
+
+	// Repeatedly overwrite the same cached table entry.
+	go func() {
+		for i := 0; i < iterations; i++ {
+			table := NewTable("shared", cols, false)
+			table.Rows = [][]any{{i}}
+			if err := bp.Put("default", "shared", table); err != nil {
+				t.Errorf("put failed: %v", err)
+			}
+		}
+		done <- true
+	}()
+
+	// Concurrently read it back.
+	go func() {
+		for i := 0; i < iterations; i++ {
+			bp.Get("default", "shared")
+		}
+		done <- true
+	}()
+
+	<-done
+	<-done
+
+	if _, found := bp.Get("default", "shared"); !found {
+		t.Error("shared table should still be present after concurrent Put/Get")
+	}
+}

@@ -7,6 +7,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/SimonWaldherr/tinySQL/internal/engine"
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 type requestKey struct {
@@ -34,6 +37,17 @@ type metricsRegistry struct {
 	requests     map[requestKey]uint64
 	durations    map[durationKey]*durationHistogram
 	totalByProto map[string]uint64
+
+	// backendStatsSource, when set, supplies storage.BackendStats for the
+	// tinysql_memory_used_bytes/etc. gauges emitted by PrometheusText. Nil
+	// (the zero value) disables that section, e.g. before a DB is attached.
+	backendStatsSource func() storage.BackendStats
+
+	// vectorCacheMetricsEnabled gates the tinysql_vector_cache_* section of
+	// PrometheusText. This mirrors cmd/tinysqld's -analytics opt-in: a scrape
+	// should not pay for engine.VectorCacheAnalytics() (which reads
+	// runtime.MemStats) unless the operator explicitly enabled analytics.
+	vectorCacheMetricsEnabled bool
 }
 
 func newMetricsRegistry() *metricsRegistry {
@@ -42,6 +56,23 @@ func newMetricsRegistry() *metricsRegistry {
 		durations:    make(map[durationKey]*durationHistogram),
 		totalByProto: make(map[string]uint64),
 	}
+}
+
+// SetBackendStatsSource wires a storage backend stats provider into the
+// registry so PrometheusText can emit tinysql_memory_used_bytes and related
+// gauges/counters. Pass nil to disable that section.
+func (m *metricsRegistry) SetBackendStatsSource(fn func() storage.BackendStats) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.backendStatsSource = fn
+}
+
+// SetVectorCacheMetricsEnabled gates whether PrometheusText emits
+// tinysql_vector_cache_* metrics (see vectorCacheMetricsEnabled).
+func (m *metricsRegistry) SetVectorCacheMetricsEnabled(enabled bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.vectorCacheMetricsEnabled = enabled
 }
 
 func defaultDurationBounds() []float64 {
@@ -209,6 +240,54 @@ func (m *metricsRegistry) PrometheusText() string {
 			prometheusEscapeLabel(k.Method),
 			h.count,
 		)
+	}
+
+	if m.backendStatsSource != nil {
+		stats := m.backendStatsSource()
+
+		b.WriteString("# HELP tinysql_memory_used_bytes Storage backend memory usage in bytes.\n")
+		b.WriteString("# TYPE tinysql_memory_used_bytes gauge\n")
+		fmt.Fprintf(&b, "tinysql_memory_used_bytes %d\n", stats.MemoryUsedBytes)
+
+		b.WriteString("# HELP tinysql_memory_limit_bytes Storage backend memory limit in bytes (0 = unlimited).\n")
+		b.WriteString("# TYPE tinysql_memory_limit_bytes gauge\n")
+		fmt.Fprintf(&b, "tinysql_memory_limit_bytes %d\n", stats.MemoryLimitBytes)
+
+		b.WriteString("# HELP tinysql_disk_used_bytes Storage backend disk usage in bytes.\n")
+		b.WriteString("# TYPE tinysql_disk_used_bytes gauge\n")
+		fmt.Fprintf(&b, "tinysql_disk_used_bytes %d\n", stats.DiskUsedBytes)
+
+		b.WriteString("# HELP tinysql_cache_hit_rate Storage backend cache hit rate (0..1).\n")
+		b.WriteString("# TYPE tinysql_cache_hit_rate gauge\n")
+		fmt.Fprintf(&b, "tinysql_cache_hit_rate %s\n", strconv.FormatFloat(stats.CacheHitRate, 'f', -1, 64))
+
+		b.WriteString("# HELP tinysql_sync_count_total Storage backend sync operations.\n")
+		b.WriteString("# TYPE tinysql_sync_count_total counter\n")
+		fmt.Fprintf(&b, "tinysql_sync_count_total %d\n", stats.SyncCount)
+
+		b.WriteString("# HELP tinysql_load_count_total Storage backend load operations.\n")
+		b.WriteString("# TYPE tinysql_load_count_total counter\n")
+		fmt.Fprintf(&b, "tinysql_load_count_total %d\n", stats.LoadCount)
+
+		b.WriteString("# HELP tinysql_cache_evictions_total Storage backend cache evictions.\n")
+		b.WriteString("# TYPE tinysql_cache_evictions_total counter\n")
+		fmt.Fprintf(&b, "tinysql_cache_evictions_total %d\n", stats.EvictionCount)
+	}
+
+	if m.vectorCacheMetricsEnabled {
+		vc := engine.VectorCacheAnalytics()
+
+		b.WriteString("# HELP tinysql_vector_cache_hits_total VEC_SEARCH result-cache hits.\n")
+		b.WriteString("# TYPE tinysql_vector_cache_hits_total counter\n")
+		fmt.Fprintf(&b, "tinysql_vector_cache_hits_total %d\n", vc.Hits)
+
+		b.WriteString("# HELP tinysql_vector_cache_misses_total VEC_SEARCH result-cache misses.\n")
+		b.WriteString("# TYPE tinysql_vector_cache_misses_total counter\n")
+		fmt.Fprintf(&b, "tinysql_vector_cache_misses_total %d\n", vc.Misses)
+
+		b.WriteString("# HELP tinysql_vector_cache_evictions_total VEC_SEARCH result-cache evictions.\n")
+		b.WriteString("# TYPE tinysql_vector_cache_evictions_total counter\n")
+		fmt.Fprintf(&b, "tinysql_vector_cache_evictions_total %d\n", vc.Evictions)
 	}
 
 	return b.String()

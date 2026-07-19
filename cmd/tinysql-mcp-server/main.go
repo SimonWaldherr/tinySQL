@@ -16,8 +16,10 @@
 //	--tenant        Tenant namespace (default: "default", or derived from --dsn).
 //	--autosave      Enable auto-save for file-backed databases.
 //	--readonly      Block all mutating tools (write_query, create_table).
-//	--max-rows      Maximum rows returned by read_query (0 = unlimited).
-//	--query-timeout Per-query timeout, e.g. "5s" (0 = no timeout).
+//	--max-rows      Maximum rows returned by read_query (default: 1000; 0 = unlimited).
+//	                This only truncates client-visible output, not engine-side
+//	                computation — use --query-timeout to bound query execution itself.
+//	--query-timeout Per-query timeout, e.g. "5s" (default: 30s; 0 = no timeout).
 //	--log-level     Log verbosity: debug, info, warn, error (default: info).
 package main
 
@@ -27,9 +29,20 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	"tinysql-mcp-server/internal/mcpserver"
 	"tinysql-mcp-server/internal/tinysqldb"
+)
+
+// Defaults for the row/time limits that bound an LLM-agent-issued query. An
+// agent (or a prompt-injected instruction reaching one) can issue arbitrary
+// SQL, so an unmodified deployment must have a sane ceiling on both response
+// size and execution time out of the box. Operators who genuinely want no
+// limit can still pass an explicit 0 to opt back in.
+const (
+	defaultMaxRows      = 1000
+	defaultQueryTimeout = 30 * time.Second
 )
 
 func main() {
@@ -41,14 +54,17 @@ func main() {
 
 func run() error {
 	var (
-		flagDSN          = flag.String("dsn", "", "Full tinySQL DSN (mem://?tenant=default or file:path?...)")
-		flagDBPath       = flag.String("db-path", "", "Shorthand for a file-backed database path")
-		flagTenant       = flag.String("tenant", "", `Tenant namespace (default "default")`)
-		flagAutosave     = flag.Bool("autosave", false, "Enable auto-save for file-backed databases")
-		flagReadOnly     = flag.Bool("readonly", false, "Block all mutating tools")
-		flagMaxRows      = flag.Int("max-rows", 0, "Maximum rows returned by read_query (0 = unlimited)")
-		flagQueryTimeout = flag.Duration("query-timeout", 0, `Per-query timeout, e.g. "5s" (0 = no timeout)`)
-		flagLogLevel     = flag.String("log-level", "info", "Log verbosity: debug, info, warn, error")
+		flagDSN      = flag.String("dsn", "", "Full tinySQL DSN (mem://?tenant=default or file:path?...)")
+		flagDBPath   = flag.String("db-path", "", "Shorthand for a file-backed database path")
+		flagTenant   = flag.String("tenant", "", `Tenant namespace (default "default")`)
+		flagAutosave = flag.Bool("autosave", false, "Enable auto-save for file-backed databases")
+		flagReadOnly = flag.Bool("readonly", false, "Block all mutating tools")
+		flagMaxRows  = flag.Int("max-rows", defaultMaxRows, "Maximum rows returned by read_query (0 = unlimited). "+
+			"Only truncates client-visible output, not engine-side computation; --query-timeout is the real "+
+			"backstop against an expensive query.")
+		flagQueryTimeout = flag.Duration("query-timeout", defaultQueryTimeout, `Per-query timeout, e.g. "5s" (0 = no timeout). `+
+			"Bounds engine-side execution time; set to 0 only if you explicitly want unbounded queries.")
+		flagLogLevel = flag.String("log-level", "info", "Log verbosity: debug, info, warn, error")
 	)
 	flag.Parse()
 

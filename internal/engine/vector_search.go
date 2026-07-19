@@ -362,7 +362,15 @@ func vectorL2Norm(v []float64) float64 {
 }
 
 func pushTopK(heapRows *vecScoredHeap, rowIdx int, distance float64, k int) {
-	if k <= 0 {
+	// A NaN distance (e.g. from a NaN/Inf-poisoned vector component that
+	// slipped past storage-layer validation) must never enter the heap:
+	// every comparison against NaN in vecScoredRowLess/vecScoredHeap.Less is
+	// false per IEEE 754, so a NaN row that lands at the heap root blocks
+	// every later, genuinely-closer real candidate from ever being judged
+	// "better" and corrupts the top-k result silently. Flat scan, IVF, and
+	// HNSW all fill their result heaps through this one function, so
+	// guarding here excludes such rows from top-k consideration everywhere.
+	if k <= 0 || math.IsNaN(distance) {
 		return
 	}
 	if heapRows.Len() < k {
@@ -408,23 +416,38 @@ func buildVecDistanceFunc(metric string, query []float64, queryNorm float64, cac
 			if rowIdx >= len(cache.valid) || !cache.valid[rowIdx] {
 				return 0, false
 			}
-			return vectorDistance(metric, vec, query, cache.norms[rowIdx], queryNorm)
+			return vecCheckedDistance(metric, vec, query, cache.norms[rowIdx], queryNorm)
 		}
 	case "l2":
 		return func(vec []float64, _ int) (float64, bool) {
-			return vectorDistance(metric, vec, query, 0, 0)
+			return vecCheckedDistance(metric, vec, query, 0, 0)
 		}
 	case "manhattan":
 		return func(vec []float64, _ int) (float64, bool) {
-			return vectorDistance(metric, vec, query, 0, 0)
+			return vecCheckedDistance(metric, vec, query, 0, 0)
 		}
 	case "dot":
 		return func(vec []float64, _ int) (float64, bool) {
-			return vectorDistance(metric, vec, query, 0, 0)
+			return vecCheckedDistance(metric, vec, query, 0, 0)
 		}
 	default:
 		return func([]float64, int) (float64, bool) { return 0, false }
 	}
+}
+
+// vecCheckedDistance wraps vectorDistance with a NaN guard. A NaN or
+// Inf-derived-NaN vector component (e.g. dividing by a zero-ish norm that
+// underflowed, or a NaN stored via a non-SQL insertion path) can produce a
+// NaN distance even though vectorDistance's own "ok" contract only rejects
+// dimension mismatches and zero-norm vectors. Treat a NaN result the same as
+// any other invalid-row case (ok=false) so it is excluded from top-k
+// consideration instead of poisoning the heap (see pushTopK).
+func vecCheckedDistance(metric string, a, b []float64, normA, normB float64) (float64, bool) {
+	dist, ok := vectorDistance(metric, a, b, normA, normB)
+	if !ok || math.IsNaN(dist) {
+		return 0, false
+	}
+	return dist, true
 }
 
 func vecSearchWorkerCount(rows, dims int) int {
@@ -475,6 +498,16 @@ func vecSearchTopK(ctx context.Context, rows [][]any, queryLen int, k int, cache
 		wg.Add(1)
 		go func(worker, start, end int) {
 			defer wg.Done()
+			// A panic in one worker (e.g. a future edge case in a distance
+			// function) must not take down the whole process: recover here and
+			// surface it as an ordinary worker error, following the same
+			// results[worker].err propagation path used below for non-panic
+			// errors, instead of letting the goroutine crash uncaught.
+			defer func() {
+				if r := recover(); r != nil {
+					results[worker].err = fmt.Errorf("VEC_SEARCH: worker panic: %v", r)
+				}
+			}()
 			h, err := vecSearchTopKRange(ctx, rows, start, end, queryLen, k, cache, distFn)
 			results[worker] = workerResult{heapRows: h, err: err}
 		}(worker, start, end)

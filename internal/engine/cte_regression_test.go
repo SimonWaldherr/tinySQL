@@ -81,6 +81,38 @@ func TestRecursiveCTEBypassesPhysicalTableFastPath(t *testing.T) {
 	}
 }
 
+func TestRecursiveCTEFanOutJoinExceedsRowLimitInsteadOfExhaustingMemory(t *testing.T) {
+	// Lower the row cap for the duration of this test so it can prove the
+	// limit trips without actually allocating millions of rows.
+	orig := recursiveCTEMaxRows
+	recursiveCTEMaxRows = 50
+	defer func() { recursiveCTEMaxRows = orig }()
+
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE two (x INT)`)
+	execSQL(t, db, `INSERT INTO two VALUES (1), (2)`)
+
+	// Each iteration self-joins the frontier against a 2-row table with a
+	// trivially-true ON condition, doubling the frontier every round. With
+	// iterLimit at 1024 this would keep doubling well past any reasonable
+	// memory budget (2^30+ rows) long before the iteration cap ever kicks in.
+	stmt, err := NewParser(`
+		WITH RECURSIVE cnt AS (
+			SELECT 1 AS n
+			UNION ALL
+			SELECT cnt.n + 1 AS n FROM cnt LEFT JOIN two ON 1 = 1 WHERE cnt.n < 1000000
+		)
+		SELECT n FROM cnt
+	`).ParseStatement()
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	_, err = Execute(context.Background(), db, "default", stmt)
+	if err == nil {
+		t.Fatal("expected exponential-fan-out recursive CTE to error out once it exceeds the row limit")
+	}
+}
+
 func TestRecursiveCTEUnionAllPreservesDuplicateFrontierRows(t *testing.T) {
 	db := storage.NewDB()
 	execSQL(t, db, `CREATE TABLE two (x INT)`)

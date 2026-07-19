@@ -4,7 +4,10 @@ package engine
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -170,5 +173,47 @@ func TestRowToTextBypassesRawFastPathCorrectly(t *testing.T) {
 	rs := execSQL(t, db, `SELECT id FROM t WHERE ROW_TO_TEXT() LIKE '%note-7%'`)
 	if len(rs.Rows) == 0 {
 		t.Fatal("ROW_TO_TEXT() returned no matches — likely evaluated against an empty row in the raw fast path")
+	}
+}
+
+// TestFTSSearchTopKOrderWithManyMatches guards the bounded top-k heap
+// selection in FTSSearchTableFunc.Execute (replacing collect-all-then-sort):
+// with far more matching docs than k requested, the returned rows must still
+// be exactly the k highest-scoring ones, in strictly descending score order.
+//
+// Every doc has the same total token count (n), so BM25's length
+// normalization (normDocLen) is identical across all of them and the
+// term-frequency component alone determines the ranking: doc i repeats
+// "common" i times, padded with a filler word to keep doc length constant,
+// so its score strictly increases with i and every doc's score is distinct.
+func TestFTSSearchTopKOrderWithManyMatches(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+	Execute(ctx, db, "default", mustParse(`CREATE TABLE docs (id INT, body TEXT)`))
+
+	const n = 30
+	for i := 1; i <= n; i++ {
+		body := strings.TrimSpace(strings.Repeat("common ", i) + strings.Repeat("filler ", n-i))
+		Execute(ctx, db, "default", mustParse(fmt.Sprintf(`INSERT INTO docs VALUES (%d, '%s')`, i, body)))
+	}
+
+	const k = 5
+	rs := execSQL(t, db, fmt.Sprintf(`SELECT id, _fts_score FROM FTS_SEARCH('docs', 'common', %d, 'body')`, k))
+	if len(rs.Rows) != k {
+		t.Fatalf("expected %d rows, got %d: %+v", k, len(rs.Rows), rs.Rows)
+	}
+
+	wantIDs := []int{n, n - 1, n - 2, n - 3, n - 4}
+	lastScore := math.MaxFloat64
+	for i, row := range rs.Rows {
+		expectInt(t, row["id"], wantIDs[i], fmt.Sprintf("rank %d id", i+1))
+		score, ok := row["_fts_score"].(float64)
+		if !ok {
+			t.Fatalf("rank %d: _fts_score not a float64: %T", i+1, row["_fts_score"])
+		}
+		if score > lastScore {
+			t.Fatalf("rank %d score %v exceeds previous rank's score %v; results not sorted descending", i+1, score, lastScore)
+		}
+		lastScore = score
 	}
 }

@@ -201,22 +201,59 @@ func ExportCSV(w io.Writer, rs *engine.ResultSet, opts Options) error {
 	return csvw.Error()
 }
 
-// ExportJSON writes ResultSet rows as a JSON array of objects.
+// jsonRowMap converts one ResultSet row into a map keyed by display column
+// name, applying jsonValue's BLOB envelope handling per Options.
+func jsonRowMap(r engine.Row, cols []string, opts Options) map[string]any {
+	m := make(map[string]any, len(cols))
+	for _, c := range cols {
+		m[c] = jsonValue(r[strings.ToLower(c)], opts)
+	}
+	return m
+}
+
+// ExportJSON writes ResultSet rows as a JSON array of objects. Like
+// ExportNDJSON, it encodes one row at a time instead of materializing a
+// result-sized []map[string]any, so memory use stays proportional to a
+// single row rather than the whole result set. The bytes written are
+// identical to json.Encoder (with the same PrettyJSON setting) encoding that
+// materialized slice in one call.
 func ExportJSON(w io.Writer, rs *engine.ResultSet, opts Options) error {
-	enc := json.NewEncoder(w)
-	if opts.PrettyJSON {
-		enc.SetIndent("", "  ")
+	if _, err := io.WriteString(w, "["); err != nil {
+		return err
 	}
-	// Convert rows to []map[string]any with display column names
-	out := make([]map[string]any, len(rs.Rows))
 	for i, r := range rs.Rows {
-		m := make(map[string]any, len(rs.Cols))
-		for _, c := range rs.Cols {
-			m[c] = jsonValue(r[strings.ToLower(c)], opts)
+		m := jsonRowMap(r, rs.Cols, opts)
+		var b []byte
+		var err error
+		if opts.PrettyJSON {
+			b, err = json.MarshalIndent(m, "  ", "  ")
+		} else {
+			b, err = json.Marshal(m)
 		}
-		out[i] = m
+		if err != nil {
+			return err
+		}
+		sep := ""
+		if i > 0 {
+			sep = ","
+		}
+		if opts.PrettyJSON {
+			sep += "\n  "
+		}
+		if _, err := io.WriteString(w, sep); err != nil {
+			return err
+		}
+		if _, err := w.Write(b); err != nil {
+			return err
+		}
 	}
-	return enc.Encode(out)
+	if opts.PrettyJSON && len(rs.Rows) > 0 {
+		if _, err := io.WriteString(w, "\n"); err != nil {
+			return err
+		}
+	}
+	_, err := io.WriteString(w, "]\n")
+	return err
 }
 
 // ExportNDJSON writes one JSON object per ResultSet row. Unlike ExportJSON it
@@ -225,10 +262,7 @@ func ExportJSON(w io.Writer, rs *engine.ResultSet, opts Options) error {
 func ExportNDJSON(w io.Writer, rs *engine.ResultSet, opts Options) error {
 	enc := json.NewEncoder(w)
 	for _, r := range rs.Rows {
-		m := make(map[string]any, len(rs.Cols))
-		for _, c := range rs.Cols {
-			m[c] = jsonValue(r[strings.ToLower(c)], opts)
-		}
+		m := jsonRowMap(r, rs.Cols, opts)
 		if err := enc.Encode(m); err != nil {
 			return err
 		}

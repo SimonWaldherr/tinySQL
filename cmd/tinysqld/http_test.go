@@ -204,6 +204,30 @@ func TestDaemonAuth(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status with auth = %d, body=%s", rec.Code, rec.Body.String())
 	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	req.Header.Set("Authorization", "Bearer wrong")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status with wrong bearer token = %d", rec.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	req.Header.Set("X-TinySQL-Auth", "secret")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status with X-TinySQL-Auth = %d, body=%s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	req.Header.Set("X-TinySQL-Auth", "wrong")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status with wrong X-TinySQL-Auth = %d", rec.Code)
+	}
 }
 
 func getJSON(t *testing.T, handler http.Handler, path string) map[string]any {

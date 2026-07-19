@@ -27,7 +27,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -809,6 +808,124 @@ func ftsIDFLookup(entry ftsDocCacheEntry) ftsIDFFunc {
 
 // ─────────────────────────── FTS_SEARCH table-valued function ─────────────────
 
+// ftsScored pairs a table row index with its computed relevance score.
+type ftsScored struct {
+	rowIdx int
+	score  float64
+}
+
+// ftsScoredHeap is a bounded top-k selector mirroring vecScoredHeap in
+// vector_search.go: rather than collecting every match and sorting the whole
+// set (O(m log m) for m matches, most of which get discarded), it keeps only
+// the k best candidates seen so far in a size-k heap, giving O(m log k). The
+// heap root is the *worst* of the currently-kept k (lowest score, ties broken
+// toward the higher rowIdx), so a new candidate only needs comparing against
+// the root to decide whether it displaces the current worst entry.
+type ftsScoredHeap []ftsScored
+
+func (h ftsScoredHeap) Len() int { return len(h) }
+func (h ftsScoredHeap) Less(i, j int) bool {
+	if h[i].score == h[j].score {
+		return h[i].rowIdx > h[j].rowIdx
+	}
+	return h[i].score < h[j].score
+}
+func (h ftsScoredHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+// ftsScoredHeapPush/Pop/Up/Down replicate container/heap's up/down algorithm
+// directly on the concrete ftsScoredHeap type (see vecScoredHeapPush/Pop for
+// the rationale: this avoids boxing every candidate through heap.Interface's
+// `any` push/pop).
+func ftsScoredHeapPush(h *ftsScoredHeap, v ftsScored) {
+	*h = append(*h, v)
+	ftsScoredHeapUp(*h, len(*h)-1)
+}
+
+func ftsScoredHeapPop(h *ftsScoredHeap) ftsScored {
+	old := *h
+	n := len(old) - 1
+	old.Swap(0, n)
+	ftsScoredHeapDown(old[:n], 0)
+	v := old[n]
+	*h = old[:n]
+	return v
+}
+
+func ftsScoredHeapUp(h ftsScoredHeap, j int) {
+	for {
+		i := (j - 1) / 2
+		if i == j || !h.Less(j, i) {
+			break
+		}
+		h.Swap(i, j)
+		j = i
+	}
+}
+
+func ftsScoredHeapDown(h ftsScoredHeap, i0 int) {
+	n := len(h)
+	i := i0
+	for {
+		j1 := 2*i + 1
+		if j1 >= n || j1 < 0 {
+			break
+		}
+		j := j1
+		if j2 := j1 + 1; j2 < n && h.Less(j2, j1) {
+			j = j2
+		}
+		if !h.Less(j, i) {
+			break
+		}
+		h.Swap(i, j)
+		i = j
+	}
+}
+
+// ftsScoredLess reports whether a outranks b: a strictly higher score wins,
+// and on a tie the lower rowIdx wins (i.e. the earlier-seen row is kept),
+// matching the order documents are scanned in cache.docs.
+func ftsScoredLess(a, b ftsScored) bool {
+	if a.score == b.score {
+		return a.rowIdx < b.rowIdx
+	}
+	return a.score > b.score
+}
+
+// ftsPushTopK offers rowIdx/score into a size-k top-k heap, mirroring
+// pushTopK in vector_search.go.
+func ftsPushTopK(h *ftsScoredHeap, rowIdx int, score float64, k int) {
+	if k <= 0 {
+		return
+	}
+	if h.Len() < k {
+		ftsScoredHeapPush(h, ftsScored{rowIdx: rowIdx, score: score})
+		return
+	}
+	if h.Len() > 0 && ftsScoredLess(ftsScored{rowIdx: rowIdx, score: score}, (*h)[0]) {
+		(*h)[0] = ftsScored{rowIdx: rowIdx, score: score}
+		ftsScoredHeapDown(*h, 0)
+	}
+}
+
+// ftsTopKFromHeap drains the heap into a slice ordered best-first (highest
+// score first), mirroring topKFromHeap in vector_search.go: each pop removes
+// the current worst remaining entry, so filling the output backwards leaves
+// the best entry at index 0.
+func ftsTopKFromHeap(h *ftsScoredHeap, k int) []ftsScored {
+	if k > h.Len() {
+		k = h.Len()
+	}
+	if k <= 0 {
+		return nil
+	}
+	rows := make([]ftsScored, k)
+	for i := k - 1; i >= 0; i-- {
+		rows[i] = ftsScoredHeapPop(h)
+	}
+	return rows
+}
+
 // FTSSearchTableFunc implements FTS_SEARCH(table, query, k [, columns...]).
 // Usage:
 //
@@ -912,12 +1029,12 @@ func (f *FTSSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 	cache := getFTSDocCache(tenant, table, searchCols)
 	idf := ftsIDFLookup(cache)
 
-	type scored struct {
-		rowIdx int
-		score  float64
-	}
-	var results []scored
-
+	// Bounded top-k selection (O(m log k) for m candidate docs) instead of
+	// collecting every match into a slice and sorting the whole thing
+	// (O(m log m)) — the same fix VEC_SEARCH already applies via
+	// vecScoredHeap/topKFromHeap in vector_search.go. Only the k best-scoring
+	// docs are ever retained.
+	heapRows := make(ftsScoredHeap, 0, k)
 	for ri, doc := range cache.docs {
 		if !doc.valid {
 			continue
@@ -930,15 +1047,9 @@ func (f *FTSSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 			normDocLen = doc.docLen / cache.avgDocLen
 		}
 		score := ftsScoreNode(node, doc.freq, normDocLen, idf)
-		results = append(results, scored{rowIdx: ri, score: score})
+		ftsPushTopK(&heapRows, ri, score, k)
 	}
-
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].score > results[j].score
-	})
-	if k < len(results) {
-		results = results[:k]
-	}
+	results := ftsTopKFromHeap(&heapRows, k)
 
 	resultCols := make([]string, 0, len(table.Cols)+2)
 	for _, c := range table.Cols {

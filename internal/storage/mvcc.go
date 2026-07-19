@@ -47,6 +47,17 @@ type MVCCManager struct {
 	// Transaction commit timestamps
 	commitLog map[TxID]Timestamp
 
+	// Commit timestamps of committed transactions that never wrote a row
+	// version (empty WriteSet). Such a TxID can never be the XMin/XMax of a
+	// RowVersion (only InsertVersion/UpdateVersion/DeleteVersion assign
+	// those, and each of them calls RecordWrite), so IsVisible will never
+	// need to look it up again -- only checkSerializableConflicts consults
+	// it, and that scan already ignores commits at or before an active
+	// transaction's StartTime. That makes entries in this set (and only
+	// these entries) safe to evict from commitLog once they fall below the
+	// GC watermark; see the pruning step in updateOldestActive.
+	prunableCommits map[TxID]Timestamp
+
 	// Oldest active transaction (for GC)
 	oldestActive TxID
 
@@ -113,8 +124,9 @@ type MVCCTable struct {
 // NewMVCCManager creates a new MVCC coordinator.
 func NewMVCCManager() *MVCCManager {
 	m := &MVCCManager{
-		activeTxs: make(map[TxID]*TxContext),
-		commitLog: make(map[TxID]Timestamp),
+		activeTxs:       make(map[TxID]*TxContext),
+		commitLog:       make(map[TxID]Timestamp),
+		prunableCommits: make(map[TxID]Timestamp),
 	}
 	m.nextTxID.Store(1)
 	m.nextTimestamp.Store(1)
@@ -161,10 +173,15 @@ func (m *MVCCManager) CommitTx(tx *TxContext) (Timestamp, error) {
 
 	tx.mu.Lock()
 	tx.Status = TxStatusCommitted
+	writeCount := len(tx.WriteSet)
 	tx.mu.Unlock()
 
 	m.mu.Lock()
 	m.commitLog[tx.ID] = commitTS
+	if writeCount == 0 {
+		// Read-only commit: safe to prune later, see prunableCommits doc.
+		m.prunableCommits[tx.ID] = commitTS
+	}
 	delete(m.activeTxs, tx.ID)
 	m.updateOldestActive()
 	m.mu.Unlock()
@@ -305,6 +322,23 @@ func (m *MVCCManager) updateOldestActive() {
 		m.gcWatermark = Timestamp(m.nextTimestamp.Load())
 	} else {
 		m.gcWatermark = oldestTS
+	}
+
+	// Evict read-only commits that have fallen below the watermark. This is
+	// deliberately restricted to prunableCommits (see its doc comment) and
+	// must NOT be widened to all of commitLog: a transaction that wrote a
+	// row keeps that row's XMin/XMax referring to its TxID for as long as
+	// the row stays live (GarbageCollect never removes a live/undeleted
+	// version chain, no matter its age), so IsVisible may need that
+	// transaction's commit timestamp indefinitely -- long after the
+	// watermark has advanced past it. Pruning those entries too would make
+	// old, never-updated rows silently invisible to every future
+	// transaction.
+	for txID, commitTS := range m.prunableCommits {
+		if commitTS < m.gcWatermark {
+			delete(m.commitLog, txID)
+			delete(m.prunableCommits, txID)
+		}
 	}
 }
 

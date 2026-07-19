@@ -206,6 +206,10 @@ Pick the guide that matches what you're building:
 | [Repository structure](./docs/repository-structure.md) | Codebase layout for contributors |
 | [Benchmarks](./BENCHMARKS.md) | TinySQL-vs-SQLite numbers and internal optimization history |
 
+`RAG_HYBRID_SCORE`/`RAG_RANK_SCORE` assume cosine `[-1, 1]` similarity input —
+see the [reranking caveat](./docs/rag-guide.md#3-rerank-blend-similarity-with-freshness-and-quality)
+before pairing them with a non-cosine `VEC_SEARCH` metric.
+
 ## Limitations
 
 TinySQL is not a PostgreSQL/MySQL replacement. Important current limits:

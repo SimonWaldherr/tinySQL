@@ -16,10 +16,26 @@ type triggerCacheEntry struct {
 	stmts []Statement
 }
 
+// triggerWhenCacheEntry pairs a compiled WHEN expression with the raw text it
+// was parsed from, so a cache hit keyed by trigger name can detect a
+// redefinition (same name, new WHEN clause) the way triggerCacheEntry.body
+// already does for trigger bodies.
+type triggerWhenCacheEntry struct {
+	text string
+	expr Expr
+}
+
+// triggerCacheMaxEntries bounds both caches below, mirroring regexCache: keyed
+// by trigger name, they are purged precisely on DROP TRIGGER (see
+// executeDropTrigger), but this cap is a backstop against unbounded growth
+// from deployments that keep churning through distinct trigger names without
+// ever dropping the old ones.
+const triggerCacheMaxEntries = 256
+
 var (
 	triggerCacheMu   sync.RWMutex
 	triggerBodyCache = make(map[string]triggerCacheEntry)
-	triggerWhenCache = make(map[string]Expr)
+	triggerWhenCache = make(map[string]triggerWhenCacheEntry)
 )
 
 // executeCreateTrigger stores a trigger definition in the catalog.
@@ -49,7 +65,7 @@ func executeCreateTrigger(env ExecEnv, s *CreateTrigger) (*ResultSet, error) {
 	}
 	cacheTriggerBody(t.Name, t.Body, s.Body)
 	if s.WhenExpr != nil && s.WhenText != "" {
-		cacheTriggerWhen(t.WhenExpr, s.WhenExpr)
+		cacheTriggerWhen(t.Name, t.WhenExpr, s.WhenExpr)
 	}
 	return nil, nil
 }
@@ -60,6 +76,16 @@ func executeDropTrigger(env ExecEnv, s *DropTrigger) (*ResultSet, error) {
 	if err != nil && !s.IfExists {
 		return nil, err
 	}
+	// Purge the per-trigger cache entries regardless of outcome: on success
+	// they are now stale, and on an IfExists no-op there is nothing to purge
+	// so the delete is a harmless no-op. Without this, triggerBodyCache and
+	// triggerWhenCache grow by one entry per distinct trigger name ever
+	// created in a long-running deployment that creates/drops triggers
+	// dynamically.
+	triggerCacheMu.Lock()
+	delete(triggerBodyCache, s.Name)
+	delete(triggerWhenCache, s.Name)
+	triggerCacheMu.Unlock()
 	return nil, nil
 }
 
@@ -96,7 +122,7 @@ func executeTrigger(env ExecEnv, trig *storage.CatalogTrigger, newRow Row, oldRo
 	}
 
 	if strings.TrimSpace(trig.WhenExpr) != "" {
-		whenExpr, err := triggerWhenExpr(trig.WhenExpr)
+		whenExpr, err := triggerWhenExpr(trig.Name, trig.WhenExpr)
 		if err != nil {
 			return err
 		}
@@ -134,6 +160,14 @@ func executeTrigger(env ExecEnv, trig *storage.CatalogTrigger, newRow Row, oldRo
 func cacheTriggerBody(name, body string, stmts []Statement) {
 	triggerCacheMu.Lock()
 	defer triggerCacheMu.Unlock()
+	if _, exists := triggerBodyCache[name]; !exists && len(triggerBodyCache) >= triggerCacheMaxEntries {
+		// Simple full reset: bounded memory without LRU bookkeeping, same
+		// tradeoff regexCache makes. DROP TRIGGER already purges the common
+		// case (a trigger actually being retired); this only guards against
+		// deployments that keep defining new trigger names without ever
+		// dropping the old ones.
+		triggerBodyCache = make(map[string]triggerCacheEntry)
+	}
 	triggerBodyCache[name] = triggerCacheEntry{body: body, stmts: append([]Statement(nil), stmts...)}
 }
 
@@ -154,18 +188,25 @@ func triggerBodyStatements(trig *storage.CatalogTrigger) ([]Statement, error) {
 	return append([]Statement(nil), stmts...), nil
 }
 
-func cacheTriggerWhen(text string, expr Expr) {
+// cacheTriggerWhen caches a compiled WHEN expression under the owning
+// trigger's name (rather than the raw WHEN text) so executeDropTrigger can
+// purge it directly, the same way it purges triggerBodyCache.
+func cacheTriggerWhen(name, text string, expr Expr) {
 	triggerCacheMu.Lock()
 	defer triggerCacheMu.Unlock()
-	triggerWhenCache[text] = expr
+	if _, exists := triggerWhenCache[name]; !exists && len(triggerWhenCache) >= triggerCacheMaxEntries {
+		// See cacheTriggerBody: same bounded-reset backstop as regexCache.
+		triggerWhenCache = make(map[string]triggerWhenCacheEntry)
+	}
+	triggerWhenCache[name] = triggerWhenCacheEntry{text: text, expr: expr}
 }
 
-func triggerWhenExpr(text string) (Expr, error) {
+func triggerWhenExpr(name, text string) (Expr, error) {
 	text = strings.TrimSpace(text)
 	triggerCacheMu.RLock()
-	if expr, ok := triggerWhenCache[text]; ok {
+	if cached, ok := triggerWhenCache[name]; ok && cached.text == text {
 		triggerCacheMu.RUnlock()
-		return expr, nil
+		return cached.expr, nil
 	}
 	triggerCacheMu.RUnlock()
 
@@ -174,7 +215,7 @@ func triggerWhenExpr(text string) (Expr, error) {
 	if err != nil {
 		return nil, fmt.Errorf("trigger WHEN parse: %w", err)
 	}
-	cacheTriggerWhen(text, expr)
+	cacheTriggerWhen(name, text, expr)
 	return expr, nil
 }
 

@@ -5775,6 +5775,12 @@ func processJoins(env ExecEnv, joins []JoinClause, cur []Row) ([]Row, error) {
 		case JoinFull:
 			cur, err = processFullOuterJoin(env, cur, rightRows, j.On, aliasOr(j.Right), rightTable)
 		case JoinCross:
+			// CROSS JOIN has no ON condition by construction, so (like the
+			// onCondition == nil case in processInnerJoin) its output size is
+			// the full Cartesian product; guard against materializing it here.
+			if int64(len(cur))*int64(len(rightRows)) > maxJoinRows {
+				return nil, fmt.Errorf("cross join would produce more than %d rows; add a filtering condition or LIMIT the inputs", maxJoinRows)
+			}
 			optimizer := &HashJoinOptimizer{env: env}
 			cur, err = optimizer.processCrossJoin(cur, rightRows, OptimizedJoinTypeInner)
 		}
@@ -5785,7 +5791,24 @@ func processJoins(env ExecEnv, joins []JoinClause, cur []Row) ([]Row, error) {
 	return cur, nil
 }
 
+// maxJoinRows bounds the number of rows a single join step may materialize.
+// LIMIT/OFFSET is applied only after all joins (and WHERE, GROUP BY, DISTINCT,
+// ORDER BY) run, so an unconditional cross join -- no ON clause, or one with a
+// trivially-true condition -- would otherwise fully materialize the Cartesian
+// product of its inputs before a later LIMIT ever gets a chance to trim it.
+// A var (not const) so tests can lower it temporarily instead of allocating
+// millions of rows to exercise the cap.
+var maxJoinRows int64 = 5_000_000
+
 func processInnerJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) ([]Row, error) {
+	// A missing ON condition means every row pair is kept unconditionally, so
+	// the worst-case output size is known up front: guard against it before
+	// materializing anything, including before delegating to the hash-join
+	// optimizer below.
+	if onCondition == nil && int64(len(leftRows))*int64(len(rightRows)) > maxJoinRows {
+		return nil, fmt.Errorf("join would produce more than %d rows without a filtering ON condition; add a condition or LIMIT the inputs", maxJoinRows)
+	}
+
 	// Use hash join optimization for large datasets
 	if len(leftRows) > 500 || len(rightRows) > 500 {
 		optimizer := &HashJoinOptimizer{env: env}
@@ -5810,6 +5833,9 @@ func processInnerJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) 
 			}
 			if ok {
 				joined = append(joined, m)
+				if int64(len(joined)) > maxJoinRows {
+					return nil, fmt.Errorf("join exceeded row limit %d", maxJoinRows)
+				}
 			}
 		}
 	}
@@ -6449,6 +6475,13 @@ func addNewRowsToRecursiveCTE(accRows []Row, newRows []Row, targetCols []string,
 	return accRows, newAdded
 }
 
+// recursiveCTEMaxRows caps the total accumulated rows a recursive CTE may
+// produce, guarding against fan-out recursive terms (e.g. a self-join) that
+// grow exponentially and would otherwise exhaust memory well before iterLimit
+// is reached. A var (not const) so tests can lower it temporarily instead of
+// allocating millions of rows to exercise the cap.
+var recursiveCTEMaxRows = 4_000_000
+
 func evalRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
 	if cte.Select == nil || cte.Select.Union == nil {
 		return nil, fmt.Errorf("recursive CTE %s must be a UNION of anchor and recursive part", cte.Name)
@@ -6518,6 +6551,9 @@ func evalRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
 		if union.Type == UnionAll {
 			accRows = append(accRows, alignedRows...)
 			frontier = alignedRows
+			if len(accRows) > recursiveCTEMaxRows {
+				return nil, fmt.Errorf("recursive CTE %s exceeded row limit %d", cte.Name, recursiveCTEMaxRows)
+			}
 			continue
 		}
 
@@ -6530,6 +6566,9 @@ func evalRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
 			seen[sig] = true
 			accRows = append(accRows, row)
 			frontier = append(frontier, row)
+		}
+		if len(accRows) > recursiveCTEMaxRows {
+			return nil, fmt.Errorf("recursive CTE %s exceeded row limit %d", cte.Name, recursiveCTEMaxRows)
 		}
 	}
 	if len(frontier) > 0 {
@@ -11442,7 +11481,7 @@ func evalLagFunction(env ExecEnv, ex *FuncCall, partitionRows []Row, currentIdx 
 		return nil, err
 	}
 	lagIdx := currentIdx - offset
-	if lagIdx < 0 {
+	if lagIdx < 0 || lagIdx >= len(partitionRows) {
 		// Return default value if provided
 		if len(ex.Args) > 2 {
 			return evalExpr(env, ex.Args[2], row)
@@ -11459,7 +11498,7 @@ func evalLeadFunction(env ExecEnv, ex *FuncCall, partitionRows []Row, currentIdx
 		return nil, err
 	}
 	leadIdx := currentIdx + offset
-	if leadIdx >= len(partitionRows) {
+	if leadIdx < 0 || leadIdx >= len(partitionRows) {
 		// Return default value if provided
 		if len(ex.Args) > 2 {
 			return evalExpr(env, ex.Args[2], row)

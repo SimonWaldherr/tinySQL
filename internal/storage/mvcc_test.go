@@ -144,8 +144,12 @@ func TestMVCCConcurrentTransactions(t *testing.T) {
 	if activeCount != 0 {
 		t.Errorf("expected 0 active transactions, got %d", activeCount)
 	}
-	if commitCount != txCount {
-		t.Errorf("expected %d committed transactions, got %d", txCount, commitCount)
+	// These transactions are all read-only (no RecordWrite calls), so once
+	// each one's commit timestamp falls below the GC watermark its
+	// commitLog entry is pruned (see prunableCommits in mvcc.go) -- the log
+	// is no longer expected to retain one entry per transaction forever.
+	if commitCount >= txCount {
+		t.Errorf("expected read-only commitLog entries to be pruned well below %d, got %d entries", txCount, commitCount)
 	}
 }
 
@@ -299,6 +303,108 @@ func TestMVCCGarbageCollection(t *testing.T) {
 	collected := table.GarbageCollect(watermark)
 	if collected <= 0 {
 		t.Error("expected to collect some old versions")
+	}
+}
+
+// TestMVCCCommitLogPruning proves two properties of the commitLog GC:
+//
+// (a) commitLog entries for read-only (write-free) transactions are
+//     eventually evicted once the GC watermark advances past their commit
+//     timestamp, so a long-running process doing many short-lived
+//     transactions does not accumulate commitLog entries forever.
+//
+// (b) an entry still needed for visibility -- i.e. a transaction that wrote
+//     a still-live row -- is NOT pruned no matter how far the watermark
+//     advances afterwards, and that row remains visible to later
+//     transactions.
+func TestMVCCCommitLogPruning(t *testing.T) {
+	mvcc := NewMVCCManager()
+	cols := []Column{{Name: "id", Type: IntType}}
+	table := NewMVCCTable("docs", cols, false)
+
+	// tx1 writes a row and commits. Its commitLog entry must survive
+	// forever: the row it created stays live (nothing updates or deletes
+	// it), so future transactions need tx1's commit timestamp to resolve
+	// visibility via IsVisible.
+	tx1 := mvcc.BeginTx(SnapshotIsolation)
+	rowID := table.InsertVersion(tx1, []any{1})
+	if _, err := mvcc.CommitTx(tx1); err != nil {
+		t.Fatalf("tx1 commit failed: %v", err)
+	}
+
+	// Drive many read-only (no RecordWrite) transactions through
+	// begin/commit so the GC watermark advances well past tx1's commit
+	// timestamp.
+	const readOnlyTxCount = 20
+	for i := 0; i < readOnlyTxCount; i++ {
+		tx := mvcc.BeginTx(SnapshotIsolation)
+		if _, err := mvcc.CommitTx(tx); err != nil {
+			t.Fatalf("read-only tx commit failed: %v", err)
+		}
+	}
+
+	mvcc.mu.RLock()
+	commitCount := len(mvcc.commitLog)
+	_, tx1Present := mvcc.commitLog[tx1.ID]
+	mvcc.mu.RUnlock()
+
+	// (a) The read-only transactions' commitLog entries must not
+	// accumulate without bound -- only a small residue (tx1's permanent
+	// entry, plus at most the most recently committed read-only tx that
+	// hasn't yet been superseded by a later watermark update) should
+	// remain, not all readOnlyTxCount+1 of them.
+	if commitCount >= readOnlyTxCount {
+		t.Errorf("expected read-only commitLog entries to be pruned, got %d entries remaining (started with %d)", commitCount, readOnlyTxCount+1)
+	}
+
+	// (b) tx1's entry must never be pruned: it is still needed for
+	// visibility.
+	if !tx1Present {
+		t.Fatal("tx1's commitLog entry was pruned even though it wrote a still-live row -- this breaks visibility for future readers")
+	}
+
+	txN := mvcc.BeginTx(SnapshotIsolation)
+	version := table.GetVisibleVersion(mvcc, txN, rowID)
+	if version == nil {
+		t.Fatal("row created by tx1 should still be visible after the watermark advanced past its commit")
+	}
+	if version.Data[0] != 1 {
+		t.Errorf("unexpected row data: %v", version.Data)
+	}
+}
+
+// TestMVCCCommitLogPruningKeepsActiveSnapshot proves that a commitLog entry
+// still needed by a currently active transaction's snapshot is never pruned
+// prematurely, even while many other unrelated read-only transactions
+// advance the GC watermark around it.
+func TestMVCCCommitLogPruningKeepsActiveSnapshot(t *testing.T) {
+	mvcc := NewMVCCManager()
+	cols := []Column{{Name: "id", Type: IntType}}
+	table := NewMVCCTable("docs2", cols, false)
+
+	writer := mvcc.BeginTx(SnapshotIsolation)
+	rowID := table.InsertVersion(writer, []any{42})
+	if _, err := mvcc.CommitTx(writer); err != nil {
+		t.Fatalf("writer commit failed: %v", err)
+	}
+
+	// Begin a long-lived reader before further churn; it must keep seeing
+	// the row exactly as it existed at its snapshot.
+	reader := mvcc.BeginTx(SnapshotIsolation)
+
+	for i := 0; i < 20; i++ {
+		tx := mvcc.BeginTx(SnapshotIsolation)
+		if _, err := mvcc.CommitTx(tx); err != nil {
+			t.Fatalf("churn tx commit failed: %v", err)
+		}
+	}
+
+	version := table.GetVisibleVersion(mvcc, reader, rowID)
+	if version == nil {
+		t.Fatal("row should still be visible to the long-lived reader despite later commitLog pruning")
+	}
+	if version.Data[0] != 42 {
+		t.Errorf("unexpected row data: %v", version.Data)
 	}
 }
 

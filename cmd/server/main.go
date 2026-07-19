@@ -49,6 +49,29 @@ const (
 	defaultMaxSQLBytes       int   = 256 << 10 // 256 KiB
 	defaultMaxHeaderBytes          = 1 << 20   // 1 MiB
 	defaultMaxGRPCMsgBytes         = 4 << 20   // 4 MiB
+
+	// defaultMaxResponseRows/Bytes bound a single query response (handleQuery)
+	// and the combined response of a federated query (handleFederatedQuery),
+	// which otherwise JSON-encode an already fully-materialized ResultSet with
+	// no ceiling. 0 disables the corresponding cap.
+	defaultMaxResponseRows  int   = 100_000
+	defaultMaxResponseBytes int64 = 64 << 20 // 64 MiB
+
+	// defaultMaxConcurrentQueries bounds how many Exec/Query calls run against
+	// the engine at once. internal/driver uses a maxReaders semaphore with a
+	// default of 4 for a single embedded connection; a server multiplexes many
+	// client connections onto the same engine/storage, so its default is set
+	// higher to avoid needlessly serializing unrelated clients.
+	defaultMaxConcurrentQueries int = 32
+
+	// defaultVectorCacheTTL matches cmd/tinysqld's default so the two binaries
+	// behave the same way when an operator opts into vector-cache analytics.
+	defaultVectorCacheTTL = 30 * time.Second
+
+	// maxLogErrorLen bounds error text written to the always-on failure log
+	// (see grpcUnaryInterceptor) so a large/adversarial error string can't
+	// blow up log output.
+	maxLogErrorLen = 200
 )
 
 // Flags
@@ -74,8 +97,17 @@ var (
 	flagMaxBodyBytes = flag.Int64("max-body-bytes", defaultMaxBodyBytes, "Maximum HTTP request body size in bytes")
 	flagMaxSQLBytes  = flag.Int("max-sql-bytes", defaultMaxSQLBytes, "Maximum SQL query length in bytes")
 
+	flagMaxResponseRows  = flag.Int("max-response-rows", defaultMaxResponseRows, "Maximum rows returned in a query response before truncation (0 = unlimited); a federated query caps the combined total across all peers, not each source independently")
+	flagMaxResponseBytes = flag.Int64("max-response-bytes", defaultMaxResponseBytes, "Maximum approximate JSON-encoded size in bytes of a query response's rows before truncation (0 = unlimited)")
+
 	flagGRPCMaxRecv = flag.Int("grpc-max-recv-bytes", defaultMaxGRPCMsgBytes, "Maximum gRPC request size in bytes")
 	flagGRPCMaxSend = flag.Int("grpc-max-send-bytes", defaultMaxGRPCMsgBytes, "Maximum gRPC response size in bytes")
+
+	flagMaxConcurrentQueries = flag.Int("max-concurrent-queries", defaultMaxConcurrentQueries, "Maximum concurrent SQL executions (Exec/Query) across HTTP and gRPC (0 = unlimited); bounds engine load independently of internal/driver's reader pool (default 4), scaled up since a server multiplexes many client connections")
+
+	flagAnalytics          = flag.Bool("analytics", false, "Enable vector-cache analytics collection and expose vector cache metrics via /metrics and /api/status (matches cmd/tinysqld's -analytics flag)")
+	flagVectorCacheEntries = flag.Int("vector-cache-entries", 0, "VEC_SEARCH result-cache entries (0 disables the cache; matches cmd/tinysqld)")
+	flagVectorCacheTTL     = flag.Duration("vector-cache-ttl", defaultVectorCacheTTL, "VEC_SEARCH result-cache TTL once entries are enabled (matches cmd/tinysqld)")
 
 	flagTLSMinVersion     = flag.String("tls-min-version", "1.2", "TLS minimum version: 1.2 or 1.3")
 	flagHTTPTLSCert       = flag.String("http-tls-cert", "", "Path to HTTP TLS certificate (enables HTTPS when set with key)")
@@ -113,12 +145,13 @@ type queryRequest struct {
 }
 
 type queryResponse struct {
-	SQL      string           `json:"sql"`
-	Columns  []string         `json:"columns"`
-	Rows     []map[string]any `json:"rows"`
-	Error    string           `json:"error,omitempty"`
-	Duration string           `json:"duration"`
-	Count    int              `json:"count"`
+	SQL       string           `json:"sql"`
+	Columns   []string         `json:"columns"`
+	Rows      []map[string]any `json:"rows"`
+	Error     string           `json:"error,omitempty"`
+	Duration  string           `json:"duration"`
+	Count     int              `json:"count"`
+	Truncated bool             `json:"truncated,omitempty"`
 }
 
 // gRPC JSON codec
@@ -179,42 +212,80 @@ func _TinySQL_Query_Handler(srv any, ctx context.Context, dec func(any) error, i
 
 // server state
 type server struct {
-	db             *storage.DB
-	cache          *engine.QueryCache
-	peers          []string
-	defaultT       string
-	authToken      string
-	trustedProxies []*net.IPNet
-	peerDialCreds  credentials.TransportCredentials
-	requestTimeout time.Duration
-	peerTimeout    time.Duration
-	maxBodyBytes   int64
-	maxSQLBytes    int
-	verbose        bool
-	startedAt      time.Time
-	ready          atomic.Bool
-	metrics        *metricsRegistry
+	db               *storage.DB
+	cache            *engine.QueryCache
+	peers            []string
+	defaultT         string
+	authToken        string
+	trustedProxies   []*net.IPNet
+	peerDialCreds    credentials.TransportCredentials
+	requestTimeout   time.Duration
+	peerTimeout      time.Duration
+	maxBodyBytes     int64
+	maxSQLBytes      int
+	maxResponseRows  int
+	maxResponseBytes int64
+	verbose          bool
+	analytics        bool
+	startedAt        time.Time
+	ready            atomic.Bool
+	metrics          *metricsRegistry
+	execSem          chan struct{} // bounded concurrency for Exec/Query; nil = unlimited
 }
 
 func newServer(db *storage.DB, defaultTenant, authToken string, peers []string, trustedProxies []*net.IPNet, peerDialCreds credentials.TransportCredentials) *server {
 	s := &server{
-		db:             db,
-		cache:          engine.NewQueryCache(200),
-		peers:          peers,
-		defaultT:       defaultTenant,
-		authToken:      strings.TrimSpace(authToken),
-		trustedProxies: trustedProxies,
-		peerDialCreds:  peerDialCreds,
-		requestTimeout: *flagRequestTimeout,
-		peerTimeout:    *flagPeerTimeout,
-		maxBodyBytes:   *flagMaxBodyBytes,
-		maxSQLBytes:    *flagMaxSQLBytes,
-		verbose:        *flagVerbose,
-		startedAt:      time.Now(),
-		metrics:        newMetricsRegistry(),
+		db:               db,
+		cache:            engine.NewQueryCache(200),
+		peers:            peers,
+		defaultT:         defaultTenant,
+		authToken:        strings.TrimSpace(authToken),
+		trustedProxies:   trustedProxies,
+		peerDialCreds:    peerDialCreds,
+		requestTimeout:   *flagRequestTimeout,
+		peerTimeout:      *flagPeerTimeout,
+		maxBodyBytes:     *flagMaxBodyBytes,
+		maxSQLBytes:      *flagMaxSQLBytes,
+		maxResponseRows:  *flagMaxResponseRows,
+		maxResponseBytes: *flagMaxResponseBytes,
+		verbose:          *flagVerbose,
+		analytics:        *flagAnalytics,
+		startedAt:        time.Now(),
+		metrics:          newMetricsRegistry(),
+		execSem:          newExecSemaphore(*flagMaxConcurrentQueries),
 	}
 	s.ready.Store(true)
+	s.metrics.SetBackendStatsSource(db.BackendStats)
+	s.metrics.SetVectorCacheMetricsEnabled(s.analytics)
 	return s
+}
+
+// newExecSemaphore returns a bounded channel used to cap concurrent query
+// execution, mirroring internal/driver's maxReaders pattern (see
+// internal/driver/driver.go, default 4) but sized higher by default since a
+// server multiplexes many client connections onto one shared engine/storage.
+// A non-positive size disables the cap.
+func newExecSemaphore(n int) chan struct{} {
+	if n <= 0 {
+		return nil
+	}
+	return make(chan struct{}, n)
+}
+
+// acquireExecSlot blocks until an execution slot is available or ctx is done.
+// The returned release func must be called (typically via defer) once the
+// slot is no longer needed. A nil semaphore (unbounded concurrency) always
+// returns immediately with a no-op release.
+func (s *server) acquireExecSlot(ctx context.Context) (release func(), err error) {
+	if s.execSem == nil {
+		return func() {}, nil
+	}
+	select {
+	case s.execSem <- struct{}{}:
+		return func() { <-s.execSem }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (s *server) tenantOrDefault(t string) string {
@@ -321,6 +392,16 @@ func (s *server) grpcUnaryInterceptor() grpc.UnaryServerInterceptor {
 			s.metrics.Observe("grpc", info.FullMethod, "UNARY", int(statusCode), time.Since(start))
 			if s.verbose {
 				log.Printf("grpc method=%s status=%s duration=%s", info.FullMethod, statusCode.String(), time.Since(start))
+			}
+			// Always log failures, regardless of -v, so operators aren't blind
+			// to errors by default. Only the status/error class and a bounded
+			// error string are logged here -- never SQL text or parameters.
+			if statusCode != codes.OK {
+				errMsg := ""
+				if err != nil {
+					errMsg = truncateForLog(err.Error(), maxLogErrorLen)
+				}
+				log.Printf("grpc FAILED method=%s status=%s error=%q", info.FullMethod, statusCode.String(), errMsg)
 			}
 		}()
 
@@ -440,7 +521,38 @@ func (s *server) instrumentHTTP(route string, h http.HandlerFunc) http.HandlerFu
 		if s.verbose {
 			log.Printf("http route=%s method=%s status=%d duration=%s client_ip=%s", route, r.Method, rec.status, dur, s.clientIPFromRequest(r))
 		}
+		// Always log non-2xx responses, regardless of -v, so failures aren't
+		// silent by default. Only route/method/status/error-class are logged
+		// here -- never request bodies, SQL text, or parameter values.
+		if rec.status < 200 || rec.status >= 300 {
+			log.Printf("http FAILED route=%s method=%s status=%d class=%s", route, r.Method, rec.status, httpErrorClass(rec.status))
+		}
 	}
+}
+
+// httpErrorClass buckets an HTTP status code into a coarse class suitable for
+// the always-on failure log, without echoing any request/response content.
+func httpErrorClass(statusCode int) string {
+	switch {
+	case statusCode >= 500:
+		return "server_error"
+	case statusCode >= 400:
+		return "client_error"
+	case statusCode >= 300:
+		return "redirect"
+	default:
+		return "unexpected_status"
+	}
+}
+
+// truncateForLog bounds a message before it is written to the always-on
+// failure log so a large or adversarial error string can't blow up log
+// output.
+func truncateForLog(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	return s[:max] + "...(truncated)"
 }
 
 // TinySQLServer implementation
@@ -463,6 +575,13 @@ func (s *server) Exec(ctx context.Context, req *execRequest) (*execResponse, err
 	if err != nil {
 		return &execResponse{Success: false, Error: err.Error(), Duration: time.Since(start).String()}, nil
 	}
+
+	release, err := s.acquireExecSlot(ctx)
+	if err != nil {
+		return &execResponse{Success: false, Error: err.Error(), Duration: time.Since(start).String()}, nil
+	}
+	defer release()
+
 	_, err = engine.Execute(ctx, s.db, tenant, stmt)
 	if err != nil {
 		return &execResponse{Success: false, Error: err.Error(), Duration: time.Since(start).String()}, nil
@@ -488,6 +607,13 @@ func (s *server) Query(ctx context.Context, req *queryRequest) (*queryResponse, 
 	if err != nil {
 		return &queryResponse{SQL: sqlText, Error: err.Error(), Duration: time.Since(start).String()}, nil
 	}
+
+	release, err := s.acquireExecSlot(ctx)
+	if err != nil {
+		return &queryResponse{SQL: sqlText, Error: err.Error(), Duration: time.Since(start).String()}, nil
+	}
+	defer release()
+
 	rs, err := compiled.Execute(ctx, s.db, tenant)
 	if err != nil {
 		return &queryResponse{SQL: sqlText, Error: err.Error(), Duration: time.Since(start).String()}, nil
@@ -510,13 +636,52 @@ func (s *server) Query(ctx context.Context, req *queryRequest) (*queryResponse, 
 			rows = append(rows, m)
 		}
 	}
+
+	rows, truncated := truncateRows(rows, s.maxResponseRows, s.maxResponseBytes)
 	return &queryResponse{
-		SQL:      sqlText,
-		Columns:  cols,
-		Rows:     rows,
-		Duration: time.Since(start).String(),
-		Count:    len(rows),
+		SQL:       sqlText,
+		Columns:   cols,
+		Rows:      rows,
+		Duration:  time.Since(start).String(),
+		Count:     len(rows),
+		Truncated: truncated,
 	}, nil
+}
+
+// truncateRows caps rows to at most maxRows entries and/or an approximate
+// JSON-encoded size of maxBytes, whichever is hit first. A non-positive limit
+// disables the corresponding cap. It reports whether truncation occurred so
+// callers can surface a "truncated" flag to clients instead of silently
+// dropping rows. Both handleQuery (via Query) and handleFederatedQuery apply
+// this to the already fully-materialized result set to bound response size.
+func truncateRows(rows []map[string]any, maxRows int, maxBytes int64) ([]map[string]any, bool) {
+	if len(rows) == 0 {
+		return rows, false
+	}
+
+	truncated := false
+	if maxRows > 0 && len(rows) > maxRows {
+		rows = rows[:maxRows]
+		truncated = true
+	}
+
+	if maxBytes > 0 {
+		var total int64
+		for i, r := range rows {
+			enc, err := json.Marshal(r)
+			if err != nil {
+				continue
+			}
+			total += int64(len(enc)) + 1 // +1 approximates the array separator
+			if total > maxBytes {
+				rows = rows[:i]
+				truncated = true
+				break
+			}
+		}
+	}
+
+	return rows, truncated
 }
 
 func decodeJSONBody(w http.ResponseWriter, r *http.Request, limit int64, dst any) error {
@@ -593,7 +758,7 @@ func (s *server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 func (s *server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	stats := s.db.BackendStats()
 	reqTotals := s.metrics.TotalRequestsByProtocol()
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"ok":              true,
 		"ready":           s.ready.Load(),
 		"time":            time.Now().Format(time.RFC3339),
@@ -618,7 +783,14 @@ func (s *server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 			"load_count":         stats.LoadCount,
 			"eviction_count":     stats.EvictionCount,
 		},
-	})
+	}
+	// Vector-cache analytics are opt-in (matches cmd/tinysqld's -analytics
+	// flag): VectorCacheAnalytics() walks runtime.ReadMemStats, so it's only
+	// worth the cost when an operator explicitly asked for it.
+	if s.analytics {
+		resp["vector_cache"] = engine.VectorCacheAnalytics()
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
@@ -722,9 +894,10 @@ func (s *server) handleFederatedQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type peerRes struct {
-		rows []map[string]any
-		cols []string
-		err  error
+		rows      []map[string]any
+		cols      []string
+		truncated bool
+		err       error
 	}
 
 	localCh := make(chan *queryResponse, 1)
@@ -748,7 +921,7 @@ func (s *server) handleFederatedQuery(w http.ResponseWriter, r *http.Request) {
 				ch <- peerRes{err: err}
 				return
 			}
-			ch <- peerRes{rows: out.Rows, cols: out.Columns}
+			ch <- peerRes{rows: out.Rows, cols: out.Columns, truncated: out.Truncated}
 		}(addr)
 	}
 
@@ -760,6 +933,7 @@ func (s *server) handleFederatedQuery(w http.ResponseWriter, r *http.Request) {
 
 	cols := append([]string{}, local.Columns...)
 	rows := append([]map[string]any{}, local.Rows...)
+	truncated := local.Truncated
 
 	wg.Wait()
 	close(ch)
@@ -781,14 +955,27 @@ func (s *server) handleFederatedQuery(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		rows = append(rows, res.rows...)
+		if res.truncated {
+			truncated = true
+		}
+	}
+
+	// Cap the combined total across local + all peers here, not each source
+	// independently, so the merged response has the same ceiling as a plain
+	// (non-federated) query response.
+	var capTruncated bool
+	rows, capTruncated = truncateRows(rows, s.maxResponseRows, s.maxResponseBytes)
+	if capTruncated {
+		truncated = true
 	}
 
 	writeJSON(w, http.StatusOK, &queryResponse{
-		SQL:      req.SQL,
-		Columns:  cols,
-		Rows:     rows,
-		Duration: "n/a",
-		Count:    len(rows),
+		SQL:       req.SQL,
+		Columns:   cols,
+		Rows:      rows,
+		Duration:  "n/a",
+		Count:     len(rows),
+		Truncated: truncated,
 	})
 }
 
@@ -1231,6 +1418,15 @@ func run() error {
 	if err != nil {
 		return err
 	}
+
+	// Vector-cache result caching/analytics are opt-in, matching
+	// cmd/tinysqld's -analytics/-vector-cache-* flags. With zero values this
+	// is a no-op (cache stays disabled, no analytics window is kept).
+	engine.ConfigureVectorCache(engine.VectorCacheConfig{
+		ResultCacheEntries: *flagVectorCacheEntries,
+		ResultCacheTTL:     *flagVectorCacheTTL,
+		Analytics:          *flagAnalytics,
+	})
 
 	db, dsnTenant, err := openDBFromDSN(*flagDSN)
 	if err != nil {

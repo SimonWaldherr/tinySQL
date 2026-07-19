@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"math"
-	"sort"
 	"strings"
 	"sync"
 
@@ -34,6 +33,11 @@ type vecIndexCacheKey struct {
 	colIdx int
 	metric string
 }
+
+// vecIndexBuildCall coalesces concurrent cold ANN index builds for one cache
+// key — see vecIVFBuilds/vecHNSWBuilds and vecColumnBuildCall (vector_search.go)
+// for the shared pattern.
+type vecIndexBuildCall struct{ done chan struct{} }
 
 type vecIVFIndex struct {
 	table         *storage.Table
@@ -117,15 +121,21 @@ func vecMinHeapDown(h vecMinScoredHeap, i0 int) {
 }
 
 var (
-	vecIVFCacheMu  sync.RWMutex
-	vecIVFCache    = make(map[vecIndexCacheKey]*vecIVFIndex)
+	vecIVFCacheMu sync.RWMutex
+	vecIVFCache   = make(map[vecIndexCacheKey]*vecIVFIndex)
+	// vecIVFBuilds coalesces concurrent cold IVF builds for the same
+	// (tenant, table, colIdx, metric) key, mirroring vecSearchColumnBuilds in
+	// vector_search.go. Keying the in-flight-build map by the same cache key
+	// (rather than one global mutex) lets concurrent builds for DIFFERENT
+	// keys proceed in parallel — e.g. VEC_WARM warming several tables at
+	// startup takes max(build_i) instead of sum(build_i) — while concurrent
+	// requests for the SAME key still coalesce onto a single build.
+	vecIVFBuilds = make(map[vecIndexCacheKey]*vecIndexBuildCall)
+
 	vecHNSWCacheMu sync.RWMutex
 	vecHNSWCache   = make(map[vecIndexCacheKey]*vecHNSWIndex)
-	// Cold ANN construction is intentionally serialized. It is rare (first
-	// query, VEC_WARM, or a table-version change), expensive, and concurrent
-	// duplicate builds can multiply CPU and heap use during a RAG traffic
-	// burst. Hot searches never take this mutex.
-	vecIndexBuildMu sync.Mutex
+	// vecHNSWBuilds is vecIVFBuilds' counterpart for the HNSW cache.
+	vecHNSWBuilds = make(map[vecIndexCacheKey]*vecIndexBuildCall)
 
 	// vecVisitedPool recycles the per-search visited bitmaps so HNSW queries
 	// on large tables do not allocate len(rows) bytes per call.
@@ -221,32 +231,43 @@ func vecSearchTopKWithIndex(
 
 func getVecIVFIndex(ctx context.Context, tenant string, table *storage.Table, colIdx int, metric string, dims int, cache vecSearchColumnCacheEntry) (*vecIVFIndex, error) {
 	key := vecIndexCacheKey{tenant: tenant, table: table.Name, colIdx: colIdx, metric: metric}
-	vecIVFCacheMu.RLock()
-	if idx := vecIVFCache[key]; idx != nil && idx.table == table && idx.version == table.Version && idx.dims == dims {
-		vecIVFCacheMu.RUnlock()
-		return idx, nil
-	}
-	vecIVFCacheMu.RUnlock()
-	vecIndexBuildMu.Lock()
-	defer vecIndexBuildMu.Unlock()
-	vecIVFCacheMu.RLock()
-	if idx := vecIVFCache[key]; idx != nil && idx.table == table && idx.version == table.Version && idx.dims == dims {
-		vecIVFCacheMu.RUnlock()
-		return idx, nil
-	}
-	vecIVFCacheMu.RUnlock()
 
-	idx, err := buildVecIVFIndex(ctx, table, metric, dims, cache)
-	if err != nil {
-		return nil, err
+	for {
+		vecIVFCacheMu.RLock()
+		if idx := vecIVFCache[key]; idx != nil && idx.table == table && idx.version == table.Version && idx.dims == dims {
+			vecIVFCacheMu.RUnlock()
+			return idx, nil
+		}
+		vecIVFCacheMu.RUnlock()
+
+		vecIVFCacheMu.Lock()
+		if idx := vecIVFCache[key]; idx != nil && idx.table == table && idx.version == table.Version && idx.dims == dims {
+			vecIVFCacheMu.Unlock()
+			return idx, nil
+		}
+		if call := vecIVFBuilds[key]; call != nil {
+			vecIVFCacheMu.Unlock()
+			<-call.done
+			continue
+		}
+		call := &vecIndexBuildCall{done: make(chan struct{})}
+		vecIVFBuilds[key] = call
+		vecIVFCacheMu.Unlock()
+
+		idx, err := buildVecIVFIndex(ctx, table, metric, dims, cache)
+
+		vecIVFCacheMu.Lock()
+		delete(vecIVFBuilds, key)
+		if err == nil {
+			if _, exists := vecIVFCache[key]; !exists {
+				evictOverCap(vecIVFCache, vecIndexCacheMaxEntries)
+			}
+			vecIVFCache[key] = idx
+		}
+		close(call.done)
+		vecIVFCacheMu.Unlock()
+		return idx, err
 	}
-	vecIVFCacheMu.Lock()
-	if _, exists := vecIVFCache[key]; !exists {
-		evictOverCap(vecIVFCache, vecIndexCacheMaxEntries)
-	}
-	vecIVFCache[key] = idx
-	vecIVFCacheMu.Unlock()
-	return idx, nil
 }
 
 func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, dims int, cache vecSearchColumnCacheEntry) (*vecIVFIndex, error) {
@@ -356,32 +377,43 @@ func (idx *vecIVFIndex) search(ctx context.Context, query []float64, queryNorm f
 
 func getVecHNSWIndex(ctx context.Context, tenant string, table *storage.Table, colIdx int, metric string, dims int, cache vecSearchColumnCacheEntry) (*vecHNSWIndex, error) {
 	key := vecIndexCacheKey{tenant: tenant, table: table.Name, colIdx: colIdx, metric: metric}
-	vecHNSWCacheMu.RLock()
-	if idx := vecHNSWCache[key]; idx != nil && idx.table == table && idx.version == table.Version && idx.dims == dims {
-		vecHNSWCacheMu.RUnlock()
-		return idx, nil
-	}
-	vecHNSWCacheMu.RUnlock()
-	vecIndexBuildMu.Lock()
-	defer vecIndexBuildMu.Unlock()
-	vecHNSWCacheMu.RLock()
-	if idx := vecHNSWCache[key]; idx != nil && idx.table == table && idx.version == table.Version && idx.dims == dims {
-		vecHNSWCacheMu.RUnlock()
-		return idx, nil
-	}
-	vecHNSWCacheMu.RUnlock()
 
-	idx, err := buildVecHNSWIndex(ctx, table, metric, dims, cache)
-	if err != nil {
-		return nil, err
+	for {
+		vecHNSWCacheMu.RLock()
+		if idx := vecHNSWCache[key]; idx != nil && idx.table == table && idx.version == table.Version && idx.dims == dims {
+			vecHNSWCacheMu.RUnlock()
+			return idx, nil
+		}
+		vecHNSWCacheMu.RUnlock()
+
+		vecHNSWCacheMu.Lock()
+		if idx := vecHNSWCache[key]; idx != nil && idx.table == table && idx.version == table.Version && idx.dims == dims {
+			vecHNSWCacheMu.Unlock()
+			return idx, nil
+		}
+		if call := vecHNSWBuilds[key]; call != nil {
+			vecHNSWCacheMu.Unlock()
+			<-call.done
+			continue
+		}
+		call := &vecIndexBuildCall{done: make(chan struct{})}
+		vecHNSWBuilds[key] = call
+		vecHNSWCacheMu.Unlock()
+
+		idx, err := buildVecHNSWIndex(ctx, table, metric, dims, cache)
+
+		vecHNSWCacheMu.Lock()
+		delete(vecHNSWBuilds, key)
+		if err == nil {
+			if _, exists := vecHNSWCache[key]; !exists {
+				evictOverCap(vecHNSWCache, vecIndexCacheMaxEntries)
+			}
+			vecHNSWCache[key] = idx
+		}
+		close(call.done)
+		vecHNSWCacheMu.Unlock()
+		return idx, err
 	}
-	vecHNSWCacheMu.Lock()
-	if _, exists := vecHNSWCache[key]; !exists {
-		evictOverCap(vecHNSWCache, vecIndexCacheMaxEntries)
-	}
-	vecHNSWCache[key] = idx
-	vecHNSWCacheMu.Unlock()
-	return idx, nil
 }
 
 func buildVecHNSWIndex(ctx context.Context, table *storage.Table, metric string, dims int, cache vecSearchColumnCacheEntry) (*vecHNSWIndex, error) {
@@ -559,20 +591,39 @@ func (idx *vecHNSWIndex) pruneHNSWNeighbors(rowIdx, layer int, cache vecSearchCo
 	}
 	query := cache.vectors[rowIdx]
 	queryNorm := rowNormFor(idx.metric, cache, rowIdx)
-	sort.Slice(nbs, func(i, j int) bool {
-		di, okI := rowDistance(idx.metric, query, queryNorm, cache, nbs[i])
-		dj, okJ := rowDistance(idx.metric, query, queryNorm, cache, nbs[j])
-		if !okI {
-			return false
+
+	// addHNSWLink calls this on essentially every link insertion during the
+	// sequential build loop, so this was the dominant cost of HNSW index
+	// construction: a sort.Slice comparator recomputed rowDistance twice per
+	// comparison (once for each side), on top of sort.Slice's own
+	// reflection-based Swapper overhead. Precompute each neighbor's distance
+	// once into a concrete vecScoredRow slice, then insertion-sort it in
+	// place — nbs is bounded to vecHNSWM+1 elements here, so insertion sort
+	// is both fast and avoids sort.Slice's overhead entirely.
+	// vecScoredRowLess (distance ascending, ties broken by rowIdx ascending)
+	// reproduces the exact ordering the old comparator computed, so which
+	// neighbors survive pruning — and therefore search results — is
+	// unchanged.
+	scored := make([]vecScoredRow, len(nbs))
+	for i, nb := range nbs {
+		dist, ok := rowDistance(idx.metric, query, queryNorm, cache, nb)
+		if !ok {
+			dist = math.Inf(1)
 		}
-		if !okJ {
-			return true
+		scored[i] = vecScoredRow{rowIdx: nb, distance: dist}
+	}
+	for i := 1; i < len(scored); i++ {
+		v := scored[i]
+		j := i - 1
+		for j >= 0 && vecScoredRowLess(v, scored[j]) {
+			scored[j+1] = scored[j]
+			j--
 		}
-		if di == dj {
-			return nbs[i] < nbs[j]
-		}
-		return di < dj
-	})
+		scored[j+1] = v
+	}
+	for i, sr := range scored {
+		nbs[i] = sr.rowIdx
+	}
 	idx.neighbors[rowIdx][layer] = nbs[:vecHNSWM]
 }
 

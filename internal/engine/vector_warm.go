@@ -11,7 +11,16 @@
 //
 // Returns a single row describing what was warmed:
 //
-//	table_name, column_name, metric, index_mode, row_count, vector_count, dims
+//	table_name, column_name, metric, index_mode, row_count, vector_count, dims,
+//	distinct_dims, excluded_rows
+//
+// distinct_dims counts how many different vector lengths were seen among the
+// valid rows (e.g. during an embedding-model migration where old and new
+// dimensionalities briefly coexist in the same column). The ANN index is
+// only ever built for the first-seen dims; excluded_rows reports how many
+// otherwise-valid rows were left out of that index because their vector's
+// length did not match dims, so callers can detect a mixed-dimensionality
+// column instead of silently getting a partial index.
 package engine
 
 import (
@@ -99,41 +108,55 @@ func (f *VecWarmTableFunc) Execute(ctx context.Context, args []Expr, env ExecEnv
 		warmCtx = env.ctx
 	}
 
-	rowCount, vectorCount, dims, err := warmVectorStructures(warmCtx, tenant, table, vecColIdx, metric, indexMode)
+	rowCount, vectorCount, dims, distinctDims, excludedRows, err := warmVectorStructures(warmCtx, tenant, table, vecColIdx, metric, indexMode)
 	if err != nil {
 		return nil, err
 	}
 
 	out := Row{
-		"table_name":   tableName,
-		"column_name":  colName,
-		"metric":       metric,
-		"index_mode":   indexMode,
-		"row_count":    rowCount,
-		"vector_count": vectorCount,
-		"dims":         dims,
+		"table_name":    tableName,
+		"column_name":   colName,
+		"metric":        metric,
+		"index_mode":    indexMode,
+		"row_count":     rowCount,
+		"vector_count":  vectorCount,
+		"dims":          dims,
+		"distinct_dims": distinctDims,
+		"excluded_rows": excludedRows,
 	}
 	return &ResultSet{
-		Cols: []string{"table_name", "column_name", "metric", "index_mode", "row_count", "vector_count", "dims"},
+		Cols: []string{"table_name", "column_name", "metric", "index_mode", "row_count", "vector_count", "dims", "distinct_dims", "excluded_rows"},
 		Rows: []Row{out},
 	}, nil
 }
 
 // warmVectorStructures builds the column cache, norms (cosine), and the
-// requested ANN index for the given column. It returns basic statistics.
-func warmVectorStructures(ctx context.Context, tenant string, table *storage.Table, colIdx int, metric, indexMode string) (rowCount, vectorCount, dims int, err error) {
+// requested ANN index for the given column. It returns basic statistics,
+// including how many distinct vector lengths were seen among valid rows
+// (distinctDims) and how many otherwise-valid rows were excluded from the
+// built index because their length didn't match the chosen dims
+// (excludedRows) — e.g. when old and new embedding dimensionalities briefly
+// coexist in the same column during a migration.
+func warmVectorStructures(ctx context.Context, tenant string, table *storage.Table, colIdx int, metric, indexMode string) (rowCount, vectorCount, dims, distinctDims, excludedRows int, err error) {
 	cache := getVecColumnCache(tenant, table, colIdx, metricNeedsNorms(metric))
 	rowCount = len(cache.vectors)
+	lenCounts := make(map[int]int)
 	for i := range cache.vectors {
 		if cache.valid[i] {
 			vectorCount++
+			l := len(cache.vectors[i])
+			lenCounts[l]++
 			if dims == 0 {
-				dims = len(cache.vectors[i])
+				dims = l
 			}
 		}
 	}
+	distinctDims = len(lenCounts)
+	if dims != 0 {
+		excludedRows = vectorCount - lenCounts[dims]
+	}
 	if dims == 0 {
-		return rowCount, vectorCount, dims, nil
+		return rowCount, vectorCount, dims, distinctDims, excludedRows, nil
 	}
 	switch indexMode {
 	case vecIndexIVF:
@@ -141,7 +164,7 @@ func warmVectorStructures(ctx context.Context, tenant string, table *storage.Tab
 	case vecIndexHNSW:
 		_, err = getVecHNSWIndex(ctx, tenant, table, colIdx, metric, dims, cache)
 	}
-	return rowCount, vectorCount, dims, err
+	return rowCount, vectorCount, dims, distinctDims, excludedRows, err
 }
 
 func init() {

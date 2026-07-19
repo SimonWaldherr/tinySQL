@@ -104,7 +104,9 @@ import "C"
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"unicode/utf8"
 	"unsafe"
@@ -876,6 +878,31 @@ func SQLTables(statementHandle C.SQLHSTMT, catalogName *C.SQLUCHAR, nameLength1 
 	return C.SQL_SUCCESS
 }
 
+// validTableIdent matches a safe SQL identifier for catalog-browsing calls
+// such as SQLColumns: a bare name, or one schema-qualified with a single dot.
+// This mirrors the validation cmd/tinysql-mcp-server's sample_table tool
+// applies to a caller-supplied table name before quoting it into SQL text,
+// so that ODBC clients (Excel, pyodbc, etc.) cannot inject arbitrary SQL via
+// the table name argument.
+var validTableIdent = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)?$`)
+
+// isValidTableName reports whether name is safe to interpolate into a SQL
+// statement without risk of SQL injection.
+func isValidTableName(name string) bool {
+	return validTableIdent.MatchString(name)
+}
+
+// quoteTableName double-quotes each dot-separated part of name (escaping
+// embedded quotes by doubling them) so it can be safely embedded in a SQL
+// statement. Callers must validate name with isValidTableName first.
+func quoteTableName(name string) string {
+	parts := strings.Split(name, ".")
+	for i, p := range parts {
+		parts[i] = `"` + strings.ReplaceAll(p, `"`, `""`) + `"`
+	}
+	return strings.Join(parts, ".")
+}
+
 // SQLColumns returns column metadata for the named table. It produces the
 // standard ODBC columns: table_name, column_name, data_type, etc.
 func SQLColumns(statementHandle C.SQLHSTMT, catalogName *C.SQLUCHAR, nameLength1 C.SQLSMALLINT,
@@ -906,9 +933,17 @@ func SQLColumns(statementHandle C.SQLHSTMT, catalogName *C.SQLUCHAR, nameLength1
 		table = C.GoString((*C.char)(unsafe.Pointer(tableName)))
 	}
 
+	// Reject anything that isn't a safe identifier before it ever reaches a
+	// SQL string; an unvalidated table name here would let any caller of
+	// this ODBC catalog function (e.g. Excel/pyodbc table pickers) inject
+	// arbitrary SQL.
+	if !isValidTableName(table) {
+		return C.SQL_ERROR
+	}
+
 	// Query the table to get column information
 	ctx := context.Background()
-	query := fmt.Sprintf("SELECT * FROM %s LIMIT 0", table)
+	query := fmt.Sprintf("SELECT * FROM %s LIMIT 0", quoteTableName(table))
 	parser := tinysql.NewParser(query)
 	st, err := parser.ParseStatement()
 	if err != nil {

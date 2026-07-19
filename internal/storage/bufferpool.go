@@ -242,12 +242,16 @@ func (bp *BufferPool) Put(tenant, name string, table *Table) error {
 
 	// Check if table already cached
 	if cached, exists := bp.cache[tenant][name]; exists {
-		// Update existing
+		// Update existing. Guarded by cached.mu (the same lock Get takes)
+		// so this write path can't race with Get's reads/writes of these
+		// same CachedTable fields after Get has released bp.mu.
+		cached.mu.Lock()
 		oldSize := cached.Size
 		cached.Table = table
 		cached.Size = tableSize
 		cached.LastAccess = time.Now()
 		cached.AccessCount++
+		cached.mu.Unlock()
 
 		// Update memory usage
 		bp.currentMemory.Add(tableSize - oldSize)

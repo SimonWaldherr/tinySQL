@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -552,7 +553,11 @@ func (d *daemon) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			next(w, r)
 			return
 		}
-		if bearerToken(r.Header.Get("Authorization")) == d.authToken || r.Header.Get("X-TinySQL-Auth") == d.authToken {
+		bearer := bearerToken(r.Header.Get("Authorization"))
+		bearerOK := len(bearer) == len(d.authToken) && subtle.ConstantTimeCompare([]byte(bearer), []byte(d.authToken)) == 1
+		headerToken := r.Header.Get("X-TinySQL-Auth")
+		headerOK := len(headerToken) == len(d.authToken) && subtle.ConstantTimeCompare([]byte(headerToken), []byte(d.authToken)) == 1
+		if bearerOK || headerOK {
 			next(w, r)
 			return
 		}

@@ -8,6 +8,7 @@
 package engine
 
 import (
+	"context"
 	"testing"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -100,5 +101,33 @@ func TestCrossJoinProducesCartesianProduct(t *testing.T) {
 	rs := execSQL(t, db, `SELECT colors.name as color, sizes.name as size FROM colors CROSS JOIN sizes`)
 	if len(rs.Rows) != 6 {
 		t.Fatalf("CROSS JOIN: expected 2*3=6 rows, got %d: %+v", len(rs.Rows), rs.Rows)
+	}
+}
+
+func TestCrossJoinExceedingRowCapErrorsInsteadOfMaterializing(t *testing.T) {
+	// Lower the cap for the duration of this test so it can prove the guard
+	// trips without actually allocating millions of rows. LIMIT/OFFSET is
+	// applied only after all joins run, so without this cap a huge cross
+	// join fully materializes its Cartesian product before "LIMIT 1" ever
+	// gets a chance to trim it.
+	orig := maxJoinRows
+	maxJoinRows = 10
+	defer func() { maxJoinRows = orig }()
+
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE colors (name TEXT)`)
+	execSQL(t, db, `INSERT INTO colors VALUES ('red')`)
+	execSQL(t, db, `INSERT INTO colors VALUES ('blue')`)
+	execSQL(t, db, `INSERT INTO colors VALUES ('green')`)
+	execSQL(t, db, `INSERT INTO colors VALUES ('yellow')`)
+	execSQL(t, db, `CREATE TABLE sizes (name TEXT)`)
+	execSQL(t, db, `INSERT INTO sizes VALUES ('S')`)
+	execSQL(t, db, `INSERT INTO sizes VALUES ('M')`)
+	execSQL(t, db, `INSERT INTO sizes VALUES ('L')`)
+
+	// 4*3=12 rows exceeds the lowered cap of 10.
+	_, err := Execute(context.Background(), db, "default", mustParse(`SELECT colors.name, sizes.name FROM colors CROSS JOIN sizes LIMIT 1`))
+	if err == nil {
+		t.Fatal("expected cross join exceeding the row cap to error out instead of materializing everything")
 	}
 }

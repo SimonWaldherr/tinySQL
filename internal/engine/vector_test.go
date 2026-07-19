@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -728,6 +730,90 @@ func TestVecSearchWithL2Metric(t *testing.T) {
 	expectFloat(t, rs.Rows[1]["_vec_distance"], math.Sqrt(2), 1e-9, "L2 second")
 }
 
+// TestVecSearchNaNRowExcluded is a regression test: a row whose vector
+// contains a NaN component (e.g. inserted via a non-SQL path, bypassing
+// VEC_FROM_JSON validation) used to compute a NaN distance that, once it
+// landed at the top-k heap root, made every later "is this closer?"
+// comparison against it false (NaN comparisons are always false per IEEE
+// 754) — silently rejecting genuinely closer real rows and returning the
+// poisoned NaN row in the results. The NaN row is inserted first and a
+// mid-distance row second so both fill the k=2 heap before the true exact
+// match is scanned, reproducing the original failure mode if the NaN guard
+// regresses.
+func TestVecSearchNaNRowExcluded(t *testing.T) {
+	db := storage.NewDB()
+	table := storage.NewTable("nan_docs", []storage.Column{
+		{Name: "id", Type: storage.IntType},
+		{Name: "embedding", Type: storage.VectorType},
+	}, false)
+	table.Rows = append(table.Rows,
+		[]any{1, []float64{math.NaN(), 0, 0}}, // poisoned row: must never appear in results
+		[]any{2, []float64{0, 1, 0}},          // orthogonal: cosine distance 1
+		[]any{3, []float64{1, 0, 0}},          // exact match: cosine distance 0
+	)
+	if err := db.Put("default", table); err != nil {
+		t.Fatal(err)
+	}
+
+	rs := execSQL(t, db, `SELECT id, _vec_distance FROM VEC_SEARCH('nan_docs', 'embedding', VEC_FROM_JSON('[1,0,0]'), 2)`)
+	if len(rs.Rows) != 2 {
+		t.Fatalf("expected 2 results (NaN row excluded), got %d: %#v", len(rs.Rows), rs.Rows)
+	}
+	for _, r := range rs.Rows {
+		if r["id"] == 1 {
+			t.Fatalf("NaN-poisoned row leaked into results: %#v", rs.Rows)
+		}
+		if d, ok := r["_vec_distance"].(float64); ok && math.IsNaN(d) {
+			t.Fatalf("result row has NaN distance: %#v", r)
+		}
+	}
+	expectInt(t, rs.Rows[0]["id"], 3, "closest match should be the exact-match row")
+	expectFloat(t, rs.Rows[0]["_vec_distance"], 0.0, 1e-9, "exact match distance")
+	expectInt(t, rs.Rows[1]["id"], 2, "second closest should be the orthogonal row")
+	expectFloat(t, rs.Rows[1]["_vec_distance"], 1.0, 1e-9, "orthogonal row distance")
+}
+
+// TestVecSearchTopKWorkerPanicRecovered is a regression test for crash
+// safety: vecSearchTopK fans out to parallel workers once a table has
+// vecSearchParallelMinRows+ rows, and none of those goroutines had a
+// recover(), so a panic in a distance function (e.g. a future edge case)
+// crashed the whole process even though the caller's own HTTP/gRPC handler
+// recover() only protects its own goroutine, not ones it spawns. This
+// exercises the parallel path directly with a distFn that panics on one row
+// and asserts the panic surfaces as an ordinary error instead of escaping.
+func TestVecSearchTopKWorkerPanicRecovered(t *testing.T) {
+	if runtime.GOMAXPROCS(0) < 2 {
+		t.Skip("requires GOMAXPROCS >= 2 to exercise the parallel worker path")
+	}
+	const numRows = vecSearchParallelMinRows
+	const dims = 4
+
+	cache := vecSearchColumnCacheEntry{
+		vectors: make([][]float64, numRows),
+		valid:   make([]bool, numRows),
+	}
+	for i := range cache.vectors {
+		cache.vectors[i] = []float64{1, 0, 0, 0}
+		cache.valid[i] = true
+	}
+	panicRow := numRows - 1 // falls in the last worker's chunk
+	distFn := func(_ []float64, rowIdx int) (float64, bool) {
+		if rowIdx == panicRow {
+			panic("synthetic distance panic for test")
+		}
+		return float64(rowIdx), true
+	}
+
+	fakeRows := make([][]any, numRows)
+	_, err := vecSearchTopK(context.Background(), fakeRows, dims, 5, cache, distFn)
+	if err == nil {
+		t.Fatal("expected the worker panic to surface as an error; a nil error here means it either crashed the process or was silently swallowed")
+	}
+	if !strings.Contains(err.Error(), "panic") {
+		t.Errorf("expected error to reference the panic, got: %v", err)
+	}
+}
+
 func TestVecSearchWithANNIndexModes(t *testing.T) {
 	db := storage.NewDB()
 	table := storage.NewTable("ann_docs", []storage.Column{
@@ -772,6 +858,67 @@ func TestVecSearchWithANNIndexModes(t *testing.T) {
 				t.Fatalf("%s did not return exact query row %d in top-10: %#v", mode, targetID, rs.Rows)
 			}
 		})
+	}
+}
+
+// TestVecSearchHNSWNeighborPruningStable pins the exact ordered top-10 row
+// IDs an HNSW search returns for a fixed dataset/query. pruneHNSWNeighbors
+// was rewritten to precompute each neighbor's distance once into a
+// vecScoredRow slice and insertion-sort it, instead of sort.Slice with a
+// comparator that recomputed rowDistance on every comparison — a
+// performance-only change. The dataset here (2000 rows x 16 dims) is large
+// enough, relative to vecHNSWM, that pruneHNSWNeighbors runs on essentially
+// every insertion, so an unchanged result set here confirms the rewritten
+// sort preserves the exact nearest-M-by-distance, tie-broken-by-rowIdx
+// ordering the original comparator produced.
+func TestVecSearchHNSWNeighborPruningStable(t *testing.T) {
+	db := storage.NewDB()
+	table := storage.NewTable("hnsw_prune_docs", []storage.Column{
+		{Name: "id", Type: storage.IntType},
+		{Name: "embedding", Type: storage.VectorType},
+	}, false)
+
+	const numRows, dims = 2000, 16
+	vecAt := func(i int) []float64 {
+		vec := make([]float64, dims)
+		for d := 0; d < dims; d++ {
+			vec[d] = math.Sin(float64(i)*0.013+float64(d)*0.7) + math.Cos(float64(i)*0.021*float64(d+1))
+		}
+		return vec
+	}
+	for i := 0; i < numRows; i++ {
+		table.Rows = append(table.Rows, []any{i, vecAt(i)})
+	}
+	if err := db.Put("default", table); err != nil {
+		t.Fatal(err)
+	}
+
+	query := vecAt(777)
+	rs := execSQL(t, db, fmt.Sprintf(`
+		SELECT id
+		FROM VEC_SEARCH('hnsw_prune_docs', 'embedding', VEC_FROM_JSON('%s'), 10, 'cosine', 'hnsw')
+	`, mustVecJSON(t, query)))
+
+	if len(rs.Rows) != 10 {
+		t.Fatalf("expected 10 rows, got %d: %#v", len(rs.Rows), rs.Rows)
+	}
+	got := make([]int, len(rs.Rows))
+	for i, row := range rs.Rows {
+		id, ok := row["id"].(int)
+		if !ok {
+			t.Fatalf("row %d id has unexpected type %T", i, row["id"])
+		}
+		got[i] = id
+	}
+
+	// Captured from the pre-optimization pruneHNSWNeighbors implementation
+	// (sort.Slice with a recomputing comparator) and re-verified unchanged
+	// after the insertion-sort rewrite.
+	want := []int{777, 778, 776, 779, 775, 780, 774, 1317, 1316, 1318}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("HNSW top-10 changed at position %d: got %v, want %v", i, got, want)
+		}
 	}
 }
 

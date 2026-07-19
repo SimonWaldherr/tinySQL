@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SimonWaldherr/tinySQL/internal/engine"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
@@ -382,5 +386,123 @@ func TestHandleClusterStatusNoPeers(t *testing.T) {
 	}
 	if body.PeerCount != 0 || body.HealthyPeers != 0 {
 		t.Fatalf("unexpected peer counters: %+v", body)
+	}
+}
+
+func TestTruncateRows(t *testing.T) {
+	rows := []map[string]any{{"a": 1}, {"a": 2}, {"a": 3}, {"a": 4}}
+
+	if out, truncated := truncateRows(rows, 0, 0); truncated || len(out) != 4 {
+		t.Fatalf("no caps: got len=%d truncated=%v, want len=4 truncated=false", len(out), truncated)
+	}
+
+	out, truncated := truncateRows(rows, 2, 0)
+	if !truncated || len(out) != 2 {
+		t.Fatalf("max-rows cap: got len=%d truncated=%v, want len=2 truncated=true", len(out), truncated)
+	}
+
+	// Each encoded row ({"a":N}) is 7 bytes; a tiny byte cap must truncate
+	// before exhausting the row count.
+	out, truncated = truncateRows(rows, 0, 5)
+	if !truncated || len(out) >= len(rows) {
+		t.Fatalf("max-bytes cap: got len=%d truncated=%v, want len<%d truncated=true", len(out), truncated, len(rows))
+	}
+}
+
+func TestQueryTruncatesRows(t *testing.T) {
+	db := storage.NewDB()
+	defer db.Close()
+
+	s := &server{
+		db:              db,
+		cache:           engine.NewQueryCache(10),
+		defaultT:        "default",
+		maxResponseRows: 2,
+	}
+
+	ctx := context.Background()
+	if _, err := s.Exec(ctx, &execRequest{Tenant: "default", SQL: "CREATE TABLE t (id INT)"}); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		sql := fmt.Sprintf("INSERT INTO t VALUES (%d)", i)
+		if _, err := s.Exec(ctx, &execRequest{Tenant: "default", SQL: sql}); err != nil {
+			t.Fatalf("insert row %d: %v", i, err)
+		}
+	}
+
+	resp, err := s.Query(ctx, &queryRequest{Tenant: "default", SQL: "SELECT id FROM t"})
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if resp.Error != "" {
+		t.Fatalf("query error: %s", resp.Error)
+	}
+	if !resp.Truncated {
+		t.Fatal("expected response to be marked truncated")
+	}
+	if len(resp.Rows) != 2 {
+		t.Fatalf("len(Rows) = %d, want 2 (capped by maxResponseRows)", len(resp.Rows))
+	}
+	if resp.Count != 2 {
+		t.Fatalf("Count = %d, want 2", resp.Count)
+	}
+
+	// Raising the cap above the row count must not mark the response truncated.
+	s.maxResponseRows = 100
+	resp, err = s.Query(ctx, &queryRequest{Tenant: "default", SQL: "SELECT id FROM t"})
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if resp.Truncated {
+		t.Fatal("expected response not to be truncated when under the cap")
+	}
+	if len(resp.Rows) != 5 {
+		t.Fatalf("len(Rows) = %d, want 5", len(resp.Rows))
+	}
+}
+
+// TestInstrumentHTTPAlwaysLogsFailures verifies that a non-2xx HTTP response
+// is logged even with verbose logging (-v) disabled, while a successful
+// response stays silent -- matching the "silent by default" fix that made
+// failures always observable without leaking request content into the log.
+func TestInstrumentHTTPAlwaysLogsFailures(t *testing.T) {
+	s := &server{verbose: false, metrics: newMetricsRegistry()}
+
+	var buf bytes.Buffer
+	origOutput := log.Writer()
+	origFlags := log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(origOutput)
+		log.SetFlags(origFlags)
+	}()
+
+	failing := s.instrumentHTTP("/api/test", func(w http.ResponseWriter, r *http.Request) {
+		writeErrorJSON(w, http.StatusBadRequest, "boom")
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/test", nil)
+	rec := httptest.NewRecorder()
+	failing(rec, req)
+
+	logged := buf.String()
+	if !strings.Contains(logged, "FAILED") {
+		t.Fatalf("expected a FAILED log line for a non-2xx response with verbose=false, got: %q", logged)
+	}
+	if !strings.Contains(logged, "route=/api/test") || !strings.Contains(logged, "status=400") {
+		t.Fatalf("expected FAILED log to include route and status, got: %q", logged)
+	}
+
+	buf.Reset()
+	ok := s.instrumentHTTP("/api/ok", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
+	req2 := httptest.NewRequest(http.MethodGet, "/api/ok", nil)
+	rec2 := httptest.NewRecorder()
+	ok(rec2, req2)
+
+	if strings.Contains(buf.String(), "FAILED") {
+		t.Fatalf("expected no failure log for a 200 response, got: %q", buf.String())
 	}
 }

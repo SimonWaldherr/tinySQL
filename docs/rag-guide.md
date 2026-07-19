@@ -91,6 +91,16 @@ combines normalized similarity, exponential recency decay, and a quality
 signal; `RAG_HYBRID_SCORE` (similarity + recency) and `RECENCY_SCORE` are the
 simpler variants. Use `_vec_similarity` from `VEC_SEARCH` directly:
 
+**Cosine only:** `RAG_HYBRID_SCORE`/`RAG_RANK_SCORE` normalize similarity
+assuming it already falls in the cosine `[-1, 1]` range (`(sim + 1) / 2`,
+clamped to `[0, 1]`). `_vec_similarity` only satisfies that for the `cosine`
+metric. For `l2`/`euclidean`, `manhattan`/`l1`, or `dot`/`inner_product`
+searches, `_vec_similarity` is an unbounded, always-non-positive value that
+clamps to a flat `0` for nearly every row — the similarity term silently
+drops out and ranking degrades to recency/quality only, with no error. Use
+the `cosine` metric when reranking with these functions, or pre-normalize
+your similarity into `[-1, 1]` before calling them.
+
 ```sql
 WITH hits AS (
     SELECT * FROM VEC_SEARCH('chunks', 'embedding', VEC_FROM_JSON('[0.1, 0.0, 0.9]'), 20, 'cosine')
