@@ -33,7 +33,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "failed to open %s: %v\n", src, err)
 		os.Exit(2)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	sections, err := referencegen.Generate(f)
 	if err != nil {
@@ -51,7 +51,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "failed to create %s: %v\n", outFile, err)
 		os.Exit(2)
 	}
-	defer of.Close()
+	defer func() { _ = of.Close() }()
 
 	if err := referencegen.Encode(of, sections); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to write json: %v\n", err)

@@ -86,7 +86,7 @@ func evalGunzipFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("gunzip(): %v", err)
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 
 	uncompressed, err := io.ReadAll(reader)
 	if err != nil {

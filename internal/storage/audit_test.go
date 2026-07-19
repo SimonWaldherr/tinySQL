@@ -96,7 +96,7 @@ func TestAuditLogFilePersistenceAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen OpenAuditLog: %v", err)
 	}
-	defer log2.Close()
+	defer func() { _ = log2.Close() }()
 	entries := log2.Entries()
 	if len(entries) != 2 {
 		t.Fatalf("expected 2 entries after reopen, got %d", len(entries))

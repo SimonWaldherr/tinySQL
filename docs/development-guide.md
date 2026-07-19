@@ -35,6 +35,7 @@ Useful targets:
 | `make test` / `make test-all` | Run root tests plus standalone module tests for query file demos. |
 | `make test-unit` | Run short unit tests. |
 | `make test-jsonv2` | Exercise storage and engine persistence tests with Go's experimental JSON v2 implementation; it is a compatibility gate, not a production default. |
+| `make test-query-files` / `make test-fsql` | Run the standalone query-files and filesystem-query module tests. |
 | `make test-query-files-wasm` | Run tests inside `cmd/query_files_wasm`. |
 | `make coverage` | Run tests and open an HTML coverage report. |
 | `make bench` | Run Go benchmarks with allocation output. |
@@ -63,7 +64,9 @@ Notes:
 - `make verify` runs `make fmt`, so it may modify tracked Go files.
 - Go 1.26's `testing/synctest` is used for virtual-time concurrency tests;
   keep new timing-sensitive tests deterministic rather than adding real sleeps.
-- CI compiles all browser and Node WASM targets in addition to the host build.
+- `make verify-ci` builds all host Go packages plus the `query_files` CLI and
+  its WASM artifact. Run `make build-wasm-browser` or `make build-wasm-node`
+  separately when changing those browser or Node integration targets.
 - `make update-gh-pages` creates or refreshes a local worktree for the
   `gh-pages` branch and commits only when the generated static demo changed.
 - `make push-gh-pages` pushes only `gh-pages`; push `main` separately after

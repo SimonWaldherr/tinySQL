@@ -17,7 +17,7 @@ func TestGenReferenceWritesOutput(t *testing.T) {
 
 	// Run main with working dir set to temp dir
 	oldWd, _ := os.Getwd()
-	defer os.Chdir(oldWd)
+	defer func() { _ = os.Chdir(oldWd) }()
 	if err := os.Chdir(dir); err != nil {
 		t.Fatalf("chdir failed: %v", err)
 	}

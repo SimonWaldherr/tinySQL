@@ -86,6 +86,35 @@ func main() {
 For a broader feature reference, see [FUNCTIONS.sql](./FUNCTIONS.sql),
 [example_showcase.sql](./example_showcase.sql), and the Go tests.
 
+## Fluent query builder
+
+For programmatic query construction, use the root package's fluent builder.
+`Build` returns a statement that can be passed directly to `Execute`, while
+`ToSQL` is useful for logging or inspecting the generated SQL.
+
+```go
+activeTags := tsql.SelectStar().
+    From("tags").
+    Where(tsql.Eq(tsql.Col("active"), tsql.Val(true)))
+
+query := tsql.Select(tsql.Col("name")).
+    From("items").
+    Where(tsql.Exists(activeTags)).
+    OrderBy("name").
+    Build()
+
+rs, err := tsql.Execute(ctx, db, "default", query)
+if err != nil {
+    panic(err)
+}
+```
+
+The builder supports projections, joins, CTEs, ordering, limits, expressions,
+and `Exists`/`NotExists` subquery predicates. See the executable
+[`ExampleExists`](./example_exists_test.go) and
+[`Example_viewsAndMaterializedViews`](./view_examples_test.go) for complete
+examples.
+
 ## Optional import profiles
 
 The core has no SQLite or Shapefile runtime dependency. Enable specialized
@@ -155,6 +184,31 @@ exports use SQLite-compatible `X'...'` literals.
 declared types, affinity, constraints, row count, and an ordered typed-row
 SHA-256 fingerprint. It can be paired with CSV, JSON, or SQL data exports for
 verifiable transfers.
+
+The public `github.com/SimonWaldherr/tinySQL/exporter` package exports a
+`ResultSet` as CSV, TSV, JSON, NDJSON, XML, GOB, or SQL. JSON preserves BLOB
+values with a tagged Base64 envelope by default; set
+`Options.JSONBinaryMode` to `"legacy-string"` only when compatibility with
+plain Base64 JSON strings is required.
+
+```go
+import (
+    "bytes"
+
+    "github.com/SimonWaldherr/tinySQL/exporter"
+)
+
+var out bytes.Buffer
+if err := exporter.ExportJSON(&out, rs, exporter.Options{PrettyJSON: true}); err != nil {
+    panic(err)
+}
+// out contains a JSON array of result-row objects.
+```
+
+Use `ExportNDJSON` for streaming one JSON object per row, and
+`ExportTableManifest` when a schema and data fingerprint should accompany an
+export. The runnable [`ExampleExportJSON`](./exporter/example_test.go) shows
+the minimal JSON path.
 
 ## Vector search cache and analytics
 

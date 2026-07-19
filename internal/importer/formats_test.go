@@ -32,7 +32,9 @@ func TestImportFile_JSONAndOpenFile(t *testing.T) {
 		t.Fatalf("create temp file: %v", err)
 	}
 	_, _ = f.WriteString("[{\"id\":1,\"name\":\"A\"},{\"id\":2,\"name\":\"B\"}]")
-	f.Close()
+	if err := f.Close(); err != nil {
+		t.Fatalf("close temp file: %v", err)
+	}
 
 	res, err := ImportFile(ctx, db, "default", "", fn, &ImportOptions{CreateTable: true, TypeInference: true})
 	if err != nil {
@@ -64,7 +66,7 @@ func TestImportByContent_CSVDetection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open temp: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	res, err := importByContent(ctx, db, "default", "auto_table", f, &ImportOptions{CreateTable: true, HeaderMode: "present"})
 	if err != nil {
@@ -122,7 +124,9 @@ func TestImportCSV_Gzip(t *testing.T) {
 	var gz bytes.Buffer
 	gw := gzip.NewWriter(&gz)
 	_, _ = gw.Write(raw.Bytes())
-	gw.Close()
+	if err := gw.Close(); err != nil {
+		t.Fatalf("close gzip writer: %v", err)
+	}
 
 	ctx := context.Background()
 	db := storage.NewDB()

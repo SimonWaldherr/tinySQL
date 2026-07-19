@@ -465,7 +465,7 @@ func syncDir(dir string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if err := f.Sync(); err != nil {
 		// Some filesystems do not support directory fsync.
 		if errors.Is(err, os.ErrInvalid) ||
@@ -530,23 +530,23 @@ func (b *DiskBackend) writeTableFile(path, tenant string, t *Table) (int64, erro
 	if b.encryptor != nil {
 		var buf bytes.Buffer
 		if err := b.encodeTableInto(&buf, dt); err != nil {
-			f.Close()
+			_ = f.Close()
 			_ = os.Remove(tmp)
 			return 0, err
 		}
 		ciphertext, err := b.encryptor.Encrypt(buf.Bytes())
 		if err != nil {
-			f.Close()
+			_ = f.Close()
 			_ = os.Remove(tmp)
 			return 0, fmt.Errorf("encrypt table file: %w", err)
 		}
 		if _, err := f.Write(ciphertext); err != nil {
-			f.Close()
+			_ = f.Close()
 			_ = os.Remove(tmp)
 			return 0, err
 		}
 		if err := f.Sync(); err != nil {
-			f.Close()
+			_ = f.Close()
 			_ = os.Remove(tmp)
 			return 0, err
 		}
@@ -667,7 +667,7 @@ func (b *DiskBackend) readTableFile(path string) (*Table, error) {
 	var closers []io.Closer
 	defer func() {
 		for i := len(closers) - 1; i >= 0; i-- {
-			closers[i].Close()
+			_ = closers[i].Close()
 		}
 	}()
 

@@ -60,24 +60,24 @@ func NewPageBackend(cfg PageBackendConfig) (*PageBackend, error) {
 	var cat *Catalog
 	if cfg.ReadOnly {
 		if pager.Superblock().CatalogRoot == InvalidPageID {
-			pager.Close()
+			_ = pager.Close()
 			return nil, fmt.Errorf("read-only page backend has no published catalog")
 		}
 		cat, err = OpenCatalog(pager, 0)
 		if err != nil {
-			pager.Close()
+			_ = pager.Close()
 			return nil, fmt.Errorf("open read-only catalog: %w", err)
 		}
 	} else {
 		// Open or create catalog within a transaction.
 		txID, txErr := pager.BeginTx()
 		if txErr != nil {
-			pager.Close()
+			_ = pager.Close()
 			return nil, txErr
 		}
 		cat, err = OpenCatalog(pager, txID)
 		if err != nil {
-			pager.Close()
+			_ = pager.Close()
 			return nil, fmt.Errorf("open catalog: %w", err)
 		}
 		// Update superblock with catalog root.
@@ -85,7 +85,7 @@ func NewPageBackend(cfg PageBackendConfig) (*PageBackend, error) {
 			sb.CatalogRoot = cat.Root()
 		})
 		if err := pager.CommitTx(txID); err != nil {
-			pager.Close()
+			_ = pager.Close()
 			return nil, err
 		}
 	}
@@ -223,7 +223,7 @@ func (pb *PageBackend) SaveTable(tenant string, td *TableData) error {
 	// Create a new B+Tree for the table.
 	bt, err := CreateBTree(pb.pager, txID)
 	if err != nil {
-		pb.pager.AbortTx(txID)
+		_ = pb.pager.AbortTx(txID)
 		return err
 	}
 
@@ -233,7 +233,7 @@ func (pb *PageBackend) SaveTable(tenant string, td *TableData) error {
 		key := RowKey(int64(i))
 		encBuf = MarshalRow(row, encBuf)
 		if err := bt.Insert(txID, key, encBuf); err != nil {
-			pb.pager.AbortTx(txID)
+			_ = pb.pager.AbortTx(txID)
 			return fmt.Errorf("insert row %d: %w", i, err)
 		}
 	}
@@ -242,16 +242,16 @@ func (pb *PageBackend) SaveTable(tenant string, td *TableData) error {
 	for _, index := range td.Indexes {
 		indexTree, createErr := CreateBTree(pb.pager, txID)
 		if createErr != nil {
-			pb.pager.AbortTx(txID)
+			_ = pb.pager.AbortTx(txID)
 			return fmt.Errorf("create index %s: %w", index.Name, createErr)
 		}
 		for _, entry := range index.Entries {
 			if len(entry.Key) == 0 || len(entry.RowIDs) == 0 {
-				pb.pager.AbortTx(txID)
+				_ = pb.pager.AbortTx(txID)
 				return fmt.Errorf("index %s has invalid entry", index.Name)
 			}
 			if err := indexTree.Insert(txID, entry.Key, marshalRowIDs(entry.RowIDs)); err != nil {
-				pb.pager.AbortTx(txID)
+				_ = pb.pager.AbortTx(txID)
 				return fmt.Errorf("insert index %s: %w", index.Name, err)
 			}
 		}
@@ -275,7 +275,7 @@ func (pb *PageBackend) SaveTable(tenant string, td *TableData) error {
 		Version:    version,
 	}
 	if err := pb.catalog.PutEntry(txID, catEntry); err != nil {
-		pb.pager.AbortTx(txID)
+		_ = pb.pager.AbortTx(txID)
 		return err
 	}
 	// Update superblock catalog root in case it changed.
@@ -422,7 +422,7 @@ func (pb *PageBackend) DeleteTable(tenant, name string) error {
 	}
 
 	if err := pb.catalog.DeleteEntry(txID, tenant, name); err != nil {
-		pb.pager.AbortTx(txID)
+		_ = pb.pager.AbortTx(txID)
 		return err
 	}
 	return pb.pager.CommitTx(txID)

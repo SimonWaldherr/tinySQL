@@ -1053,6 +1053,7 @@ func TestMustCompile(t *testing.T) {
 	compiled := tsql.MustCompile(cache, "SELECT * FROM test")
 	if compiled == nil {
 		t.Fatal("MustCompile should return compiled query")
+		return
 	}
 
 	if compiled.SQL != "SELECT * FROM test" {

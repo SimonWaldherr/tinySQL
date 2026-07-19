@@ -1,0 +1,17 @@
+version: "2"
+
+
+linters:
+  exclusions:
+    rules:
+      # Test helpers intentionally use cleanup operations whose failures cannot
+      # make the assertion more meaningful. Production code remains strict.
+      - path: "_test\\.go"
+        linters:
+          - errcheck
+      # Command packages are interactive demos and CLI frontends. Their output
+      # and flag-parser errors are handled at their command boundaries; library
+      # packages remain subject to errcheck.
+      - path: "^cmd/"
+        linters:
+          - errcheck

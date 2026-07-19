@@ -136,10 +136,18 @@ func TestSlottedPage_UpdateInPlace(t *testing.T) {
 func TestSlottedPage_Compact(t *testing.T) {
 	buf := make([]byte, DefaultPageSize)
 	sp := InitSlottedPage(buf, PageTypeBTreeLeaf, 1)
-	sp.InsertRecord([]byte("aaaa"))
-	sp.InsertRecord([]byte("bbbb"))
-	sp.InsertRecord([]byte("cccc"))
-	sp.DeleteRecord(1)
+	if _, err := sp.InsertRecord([]byte("aaaa")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sp.InsertRecord([]byte("bbbb")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sp.InsertRecord([]byte("cccc")); err != nil {
+		t.Fatal(err)
+	}
+	if err := sp.DeleteRecord(1); err != nil {
+		t.Fatal(err)
+	}
 	sp.Compact()
 	if sp.LiveRecords() != 2 {
 		t.Fatalf("after compact: live=%d want 2", sp.LiveRecords())
@@ -224,7 +232,9 @@ func TestWAL_WriteAndRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("append commit: %v", err)
 	}
-	wf.Close()
+	if err := wf.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	records, err := ReadAllRecords(walPath)
 	if err != nil {
@@ -254,10 +264,18 @@ func TestWAL_Truncate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wf.AppendRecord(&WALRecord{Type: WALRecordBegin, TxID: 1})
-	wf.AppendRecord(&WALRecord{Type: WALRecordCommit, TxID: 1})
-	wf.Truncate()
-	wf.Close()
+	if _, err := wf.AppendRecord(&WALRecord{Type: WALRecordBegin, TxID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wf.AppendRecord(&WALRecord{Type: WALRecordCommit, TxID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wf.Truncate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := wf.Close(); err != nil {
+		t.Fatal(err)
+	}
 	records, _ := ReadAllRecords(walPath)
 	if len(records) != 0 {
 		t.Fatalf("after truncate: got %d records, want 0", len(records))
@@ -271,12 +289,22 @@ func TestWAL_CorruptTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wf.AppendRecord(&WALRecord{Type: WALRecordBegin, TxID: 1})
-	wf.AppendRecord(&WALRecord{Type: WALRecordCommit, TxID: 1})
-	wf.Close()
+	if _, err := wf.AppendRecord(&WALRecord{Type: WALRecordBegin, TxID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wf.AppendRecord(&WALRecord{Type: WALRecordCommit, TxID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wf.Close(); err != nil {
+		t.Fatal(err)
+	}
 	f, _ := os.OpenFile(walPath, os.O_WRONLY|os.O_APPEND, 0644)
-	f.Write([]byte("GARBAGE"))
-	f.Close()
+	if _, err := f.Write([]byte("GARBAGE")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
 	records, err := ReadAllRecords(walPath)
 	if err != nil {
 		t.Fatalf("read with corrupt tail: %v", err)
@@ -297,7 +325,7 @@ func newTestPager(t *testing.T) *Pager {
 	if err != nil {
 		t.Fatalf("OpenPager: %v", err)
 	}
-	t.Cleanup(func() { p.Close() })
+	t.Cleanup(func() { _ = p.Close() })
 	return p
 }
 
@@ -365,7 +393,7 @@ func TestPager_ReadOnlyConcurrentColdReadSingleflight(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 
 	const workers = 64
 	start := make(chan struct{})
@@ -414,21 +442,29 @@ func TestPager_Checkpoint(t *testing.T) {
 	txID, _ := p.BeginTx()
 	pid, buf := p.AllocPage()
 	leaf := InitBTreePage(buf, pid, true)
-	leaf.InsertLeafEntry(LeafEntry{Key: []byte("hello"), Value: []byte("world")})
+	if _, err := leaf.InsertLeafEntry(LeafEntry{Key: []byte("hello"), Value: []byte("world")}); err != nil {
+		t.Fatal(err)
+	}
 	SetPageCRC(buf)
-	p.WritePage(txID, pid, buf)
+	if err := p.WritePage(txID, pid, buf); err != nil {
+		t.Fatal(err)
+	}
 	p.UnpinPage(pid)
-	p.CommitTx(txID)
+	if err := p.CommitTx(txID); err != nil {
+		t.Fatal(err)
+	}
 	if err := p.Checkpoint(); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
-	p.Close()
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	p2, err := OpenPager(PagerConfig{DBPath: dbPath, PageSize: DefaultPageSize})
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	defer p2.Close()
+	defer func() { _ = p2.Close() }()
 	buf2, err := p2.ReadPage(pid)
 	if err != nil {
 		t.Fatalf("read after reopen: %v", err)
@@ -453,7 +489,9 @@ func TestBTree_InsertAndGet(t *testing.T) {
 	if err := bt.Insert(txID, []byte("key2"), []byte("value2")); err != nil {
 		t.Fatal(err)
 	}
-	p.CommitTx(txID)
+	if err := p.CommitTx(txID); err != nil {
+		t.Fatal(err)
+	}
 	val, found, err := bt.Get([]byte("key1"))
 	if err != nil {
 		t.Fatal(err)
@@ -474,7 +512,9 @@ func TestBTree_Delete(t *testing.T) {
 	p := newTestPager(t)
 	txID, _ := p.BeginTx()
 	bt, _ := CreateBTree(p, txID)
-	bt.Insert(txID, []byte("a"), []byte("1"))
+	if err := bt.Insert(txID, []byte("a"), []byte("1")); err != nil {
+		t.Fatal(err)
+	}
 	bt.Insert(txID, []byte("b"), []byte("2"))
 	bt.Insert(txID, []byte("c"), []byte("3"))
 	p.CommitTx(txID)
@@ -772,6 +812,7 @@ func TestPageBackend_SaveAndLoad(t *testing.T) {
 	}
 	if got == nil {
 		t.Fatal("table not found")
+		return
 	}
 	if len(got.Rows) != 2 {
 		t.Fatalf("rows: got %d want 2", len(got.Rows))

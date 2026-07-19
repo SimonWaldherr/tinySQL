@@ -35,7 +35,7 @@ func pagerTempDir(b *testing.B) string {
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Cleanup(func() { os.RemoveAll(dir) })
+	b.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return dir
 }
 
@@ -48,7 +48,7 @@ func newBenchPageBackend(b *testing.B) *PageBackend {
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Cleanup(func() { pb.Close() })
+	b.Cleanup(func() { _ = pb.Close() })
 	return pb
 }
 

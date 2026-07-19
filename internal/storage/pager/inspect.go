@@ -44,7 +44,7 @@ func InspectPage(dbPath string, pageID PageID, pageSize int) (*PageInfo, error) 
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	buf := make([]byte, pageSize)
 	off := int64(pageID) * int64(pageSize)
@@ -97,7 +97,7 @@ func VerifyDB(dbPath string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	fi, err := f.Stat()
 	if err != nil {
@@ -167,7 +167,7 @@ func DumpTree(dbPath string, rootPageID PageID, pageSize int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var sb strings.Builder
 	var dump func(pid PageID, depth int) error
@@ -282,7 +282,7 @@ func InspectWAL(walPath string) (*WALInfo, error) {
 		if _, err := f.ReadAt(hdr[:], 0); err == nil {
 			info.PageSize = int(binary.LittleEndian.Uint32(hdr[12:16]))
 		}
-		f.Close()
+		_ = f.Close()
 	}
 
 	return info, nil
@@ -308,7 +308,7 @@ func InspectSuperblock(dbPath string) (*SuperblockInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	buf := make([]byte, MaxPageSize)
 	n, err := f.ReadAt(buf, 0)

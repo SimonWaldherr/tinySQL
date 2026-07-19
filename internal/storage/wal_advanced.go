@@ -218,7 +218,7 @@ func OpenAdvancedWAL(config AdvancedWALConfig) (*AdvancedWAL, error) {
 	if config.CheckpointPath != "" {
 		w, err := ReadCheckpointWatermark(config.CheckpointPath)
 		if err != nil {
-			file.Close()
+			_ = file.Close()
 			return nil, fmt.Errorf("read checkpoint watermark: %w", err)
 		}
 		checkpointWatermark = LSN(w)
@@ -814,25 +814,25 @@ func hashWALValue(h io.Writer, v any) {
 			_, _ = h.Write(b[:])
 		}
 	case []any:
-		io.WriteString(h, "[")
+		_, _ = io.WriteString(h, "[")
 		for _, e := range t {
 			hashWALValue(h, e)
 		}
-		io.WriteString(h, "]")
+		_, _ = io.WriteString(h, "]")
 	case map[string]any:
 		keys := make([]string, 0, len(t))
 		for k := range t {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
-		io.WriteString(h, "{")
+		_, _ = io.WriteString(h, "{")
 		for _, k := range keys {
-			fmt.Fprintf(h, "%q:", k)
+			_, _ = fmt.Fprintf(h, "%q:", k)
 			hashWALValue(h, t[k])
 		}
-		io.WriteString(h, "}")
+		_, _ = io.WriteString(h, "}")
 	default:
-		fmt.Fprintf(h, "%T%v;", v, v)
+		_, _ = fmt.Fprintf(h, "%T%v;", v, v)
 	}
 }
 
@@ -843,12 +843,12 @@ func (w *AdvancedWAL) legacyChecksum(record *WALRecord) uint32 {
 	enc := gob.NewEncoder(&buf)
 
 	// Encode everything except the checksum field
-	enc.Encode(record.LSN)
-	enc.Encode(record.TxID)
-	enc.Encode(record.OpType)
-	enc.Encode(record.Tenant)
-	enc.Encode(record.Table)
-	enc.Encode(record.RowID)
+	_ = enc.Encode(record.LSN)
+	_ = enc.Encode(record.TxID)
+	_ = enc.Encode(record.OpType)
+	_ = enc.Encode(record.Tenant)
+	_ = enc.Encode(record.Table)
+	_ = enc.Encode(record.RowID)
 
 	data := buf.Bytes()
 	var sum uint32

@@ -16,7 +16,7 @@ func tmpPageBackend(t *testing.T) *PageBackend {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { pb.Close() })
+	t.Cleanup(func() { _ = pb.Close() })
 	return pb
 }
 
@@ -98,12 +98,18 @@ func TestGC_SimulatedOrphans(t *testing.T) {
 		pid, buf := pb.pager.AllocPage()
 		InitBTreePage(buf, pid, true) // give it valid content
 		SetPageCRC(buf)
-		pb.pager.WritePage(txID, pid, buf)
+		if err := pb.pager.WritePage(txID, pid, buf); err != nil {
+			t.Fatal(err)
+		}
 		pb.pager.UnpinPage(pid)
 		orphanIDs = append(orphanIDs, pid)
 	}
-	pb.pager.CommitTx(txID)
-	pb.pager.Checkpoint()
+	if err := pb.pager.CommitTx(txID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pb.pager.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
 
 	t.Logf("orphan page IDs: %v", orphanIDs)
 
@@ -157,11 +163,17 @@ func TestGC_Idempotent(t *testing.T) {
 		pid, buf := pb.pager.AllocPage()
 		InitBTreePage(buf, pid, true)
 		SetPageCRC(buf)
-		pb.pager.WritePage(txID, pid, buf)
+		if err := pb.pager.WritePage(txID, pid, buf); err != nil {
+			t.Fatal(err)
+		}
 		pb.pager.UnpinPage(pid)
 	}
-	pb.pager.CommitTx(txID)
-	pb.pager.Checkpoint()
+	if err := pb.pager.CommitTx(txID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pb.pager.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
 
 	// First GC reclaims orphans.
 	r1, err := pb.GC()
@@ -199,6 +211,7 @@ func TestGC_DataIntegrity(t *testing.T) {
 	}
 	if td == nil {
 		t.Fatal("table not found after GC")
+		return
 	}
 	if len(td.Rows) != 100 {
 		t.Errorf("expected 100 rows, got %d", len(td.Rows))
@@ -230,11 +243,17 @@ func TestGC_Persistence(t *testing.T) {
 		pid, buf := pb.pager.AllocPage()
 		InitBTreePage(buf, pid, true)
 		SetPageCRC(buf)
-		pb.pager.WritePage(txID, pid, buf)
+		if err := pb.pager.WritePage(txID, pid, buf); err != nil {
+			t.Fatal(err)
+		}
 		pb.pager.UnpinPage(pid)
 	}
-	pb.pager.CommitTx(txID)
-	pb.pager.Checkpoint()
+	if err := pb.pager.CommitTx(txID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pb.pager.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
 
 	r, err := pb.GC()
 	if err != nil {
@@ -244,14 +263,16 @@ func TestGC_Persistence(t *testing.T) {
 		t.Errorf("expected ≥4 reclaimed, got %d", r.Reclaimed)
 	}
 	freeAfter := r.FreeAfter
-	pb.Close()
+	if err := pb.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Phase 2: Reopen and verify free list persisted.
 	pb2, err := NewPageBackend(PageBackendConfig{Path: dbPath})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pb2.Close()
+	defer func() { _ = pb2.Close() }()
 
 	// Should have approximately the same number of free pages.
 	freeNow := pb2.pager.freeMgr.Count()

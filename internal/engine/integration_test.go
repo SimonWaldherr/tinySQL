@@ -160,6 +160,7 @@ func TestSelectOrderByLimitOffsetFastPath(t *testing.T) {
 		}
 		if rs == nil {
 			t.Fatalf("expected result set for %s", tc.name)
+			return
 		}
 
 		got := make([]int, 0, len(rs.Rows))

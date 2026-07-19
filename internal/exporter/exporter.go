@@ -128,8 +128,8 @@ func writeManifestCell(w io.Writer, v any) {
 	default:
 		kind, value = fmt.Sprintf("%T", v), fmt.Sprint(v)
 	}
-	fmt.Fprintf(w, "%s:%d:%s", kind, len(value), value)
-	w.Write([]byte{0})
+	_, _ = fmt.Fprintf(w, "%s:%d:%s", kind, len(value), value)
+	_, _ = w.Write([]byte{0})
 }
 
 func valueToString(v any, binaryEncoding string) string {

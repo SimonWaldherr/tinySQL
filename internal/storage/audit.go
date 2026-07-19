@@ -108,17 +108,17 @@ func OpenAuditLog(path string) (*AuditLog, error) {
 		}
 		var e AuditEntry
 		if err := json.Unmarshal(line, &e); err != nil {
-			f.Close()
+			_ = f.Close()
 			return nil, fmt.Errorf("audit log %s: corrupt entry at line %d: %w", path, len(a.entries)+1, err)
 		}
 		a.entries = append(a.entries, e)
 	}
 	if err := scanner.Err(); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("audit log %s: read: %w", path, err)
 	}
 	if err := a.verifyLocked(); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("audit log %s: %w (log may have been tampered with)", path, err)
 	}
 	if n := len(a.entries); n > 0 {
@@ -129,7 +129,7 @@ func OpenAuditLog(path string) (*AuditLog, error) {
 	// land at EOF regardless of this seek, but Seek keeps f's offset
 	// consistent with an append-only mental model.
 	if _, err := f.Seek(0, io.SeekEnd); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("audit log %s: seek: %w", path, err)
 	}
 	a.writer = bufio.NewWriter(f)
@@ -161,9 +161,9 @@ func (a *AuditLog) Append(tenant, user, statement string, success bool, errMsg s
 
 	if a.writer != nil {
 		if b, err := json.Marshal(e); err == nil {
-			a.writer.Write(b)
-			a.writer.WriteByte('\n')
-			a.writer.Flush()
+			_, _ = a.writer.Write(b)
+			_ = a.writer.WriteByte('\n')
+			_ = a.writer.Flush()
 		}
 	}
 	return e

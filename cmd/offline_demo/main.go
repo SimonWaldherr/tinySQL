@@ -58,7 +58,7 @@ func run(ctx context.Context, cfg config, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if cfg.readOnly {
 		db.SetReadOnly(true)
@@ -77,15 +77,15 @@ func run(ctx context.Context, cfg config, out io.Writer) error {
 		}{source, db.IsReadOnly(), cfg.query, results})
 	}
 
-	fmt.Fprintf(out, "Offline POI demo (%s, read-only=%t)\n", source, db.IsReadOnly())
-	fmt.Fprintf(out, "Search: %q — %d result(s)\n\n", cfg.query, len(results))
+	_, _ = fmt.Fprintf(out, "Offline POI demo (%s, read-only=%t)\n", source, db.IsReadOnly())
+	_, _ = fmt.Fprintf(out, "Search: %q — %d result(s)\n\n", cfg.query, len(results))
 	if len(results) == 0 {
 		return nil
 	}
-	fmt.Fprintln(out, "ID  NAME                 CATEGORY       CITY")
-	fmt.Fprintln(out, "--  -------------------  -------------  ----------")
+	_, _ = fmt.Fprintln(out, "ID  NAME                 CATEGORY       CITY")
+	_, _ = fmt.Fprintln(out, "--  -------------------  -------------  ----------")
 	for _, p := range results {
-		fmt.Fprintf(out, "%-2d  %-19s  %-13s  %s\n", p.ID, p.Name, p.Category, p.City)
+		_, _ = fmt.Fprintf(out, "%-2d  %-19s  %-13s  %s\n", p.ID, p.Name, p.Category, p.City)
 	}
 	return nil
 }

@@ -21,6 +21,7 @@ The tree below highlights the most relevant paths rather than every single file.
 |-- builder.go                Query/build helpers for the public API
 |-- agent_context.go          Compact database metadata snapshot builder
 |-- driver/                   Public `database/sql` driver wrapper
+|-- exporter/                 Public ResultSet export helpers
 |-- internal/                 Engine, storage, importer, and driver internals
 |-- cmd/                      Executables, demos, web apps, and WASM builds
 |-- odbc/                     ODBC bridge and its tests
@@ -87,7 +88,10 @@ Some `cmd/` subtrees contain their own support assets:
 ## Data and examples
 
 - `data/` contains small sample datasets for demos, tests, and documentation.
-- `example_test.go`, `import_example_test.go`, and `example_showcase.sql` demonstrate the public API and SQL features.
+- `example_test.go`, `example_exists_test.go`, `example_view_dependencies_test.go`,
+  `import_example_test.go`, and `example_showcase.sql` demonstrate the public API
+  and SQL features. Examples in `exporter/example_test.go` demonstrate the
+  public export facade.
 - `tests/examples.yml` stores additional example-driven test data.
 
 If you want, the next step is to add a generated tree view or a more detailed module map for one of the major subsystems.

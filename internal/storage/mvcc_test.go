@@ -13,6 +13,7 @@ func TestMVCCBasicTransaction(t *testing.T) {
 	tx := mvcc.BeginTx(SnapshotIsolation)
 	if tx == nil {
 		t.Fatal("failed to begin transaction")
+		return
 	}
 	if tx.Status != TxStatusInProgress {
 		t.Errorf("expected status InProgress, got %v", tx.Status)
@@ -207,6 +208,7 @@ func TestMVCCTable(t *testing.T) {
 	version := table.GetVisibleVersion(mvcc, tx2, rowID)
 	if version == nil {
 		t.Fatal("expected to find row version")
+		return
 	}
 	if version.Data[0] != 1 || version.Data[1] != "Alice" {
 		t.Errorf("unexpected row data: %v", version.Data)
@@ -240,6 +242,7 @@ func TestMVCCTableUpdate(t *testing.T) {
 	version := table.GetVisibleVersion(mvcc, tx3, rowID)
 	if version == nil {
 		t.Fatal("expected to find row version")
+		return
 	}
 	if version.Data[1] != 200 {
 		t.Errorf("expected value 200, got %v", version.Data[1])
@@ -309,14 +312,16 @@ func TestMVCCGarbageCollection(t *testing.T) {
 // TestMVCCCommitLogPruning proves two properties of the commitLog GC:
 //
 // (a) commitLog entries for read-only (write-free) transactions are
-//     eventually evicted once the GC watermark advances past their commit
-//     timestamp, so a long-running process doing many short-lived
-//     transactions does not accumulate commitLog entries forever.
+//
+//	eventually evicted once the GC watermark advances past their commit
+//	timestamp, so a long-running process doing many short-lived
+//	transactions does not accumulate commitLog entries forever.
 //
 // (b) an entry still needed for visibility -- i.e. a transaction that wrote
-//     a still-live row -- is NOT pruned no matter how far the watermark
-//     advances afterwards, and that row remains visible to later
-//     transactions.
+//
+//	a still-live row -- is NOT pruned no matter how far the watermark
+//	advances afterwards, and that row remains visible to later
+//	transactions.
 func TestMVCCCommitLogPruning(t *testing.T) {
 	mvcc := NewMVCCManager()
 	cols := []Column{{Name: "id", Type: IntType}}
@@ -367,6 +372,7 @@ func TestMVCCCommitLogPruning(t *testing.T) {
 	version := table.GetVisibleVersion(mvcc, txN, rowID)
 	if version == nil {
 		t.Fatal("row created by tx1 should still be visible after the watermark advanced past its commit")
+		return
 	}
 	if version.Data[0] != 1 {
 		t.Errorf("unexpected row data: %v", version.Data)
@@ -402,6 +408,7 @@ func TestMVCCCommitLogPruningKeepsActiveSnapshot(t *testing.T) {
 	version := table.GetVisibleVersion(mvcc, reader, rowID)
 	if version == nil {
 		t.Fatal("row should still be visible to the long-lived reader despite later commitLog pruning")
+		return
 	}
 	if version.Data[0] != 42 {
 		t.Errorf("unexpected row data: %v", version.Data)

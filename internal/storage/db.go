@@ -940,7 +940,7 @@ func loadGOBInto(db *DB, filename string) (bool, error) {
 		}
 		return false, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var dump []diskTable
 	var r io.Reader = bufio.NewReader(f)
@@ -949,7 +949,7 @@ func loadGOBInto(db *DB, filename string) (bool, error) {
 		if gzErr != nil {
 			return false, gzErr
 		}
-		defer gr.Close()
+		defer func() { _ = gr.Close() }()
 		r = gr
 	}
 	dec := gob.NewDecoder(r)
@@ -989,7 +989,7 @@ func ReadCheckpointWatermark(filename string) (uint64, error) {
 		}
 		return 0, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var r io.Reader = bufio.NewReader(f)
 	if strings.HasSuffix(strings.ToLower(filename), ".gz") {
@@ -997,7 +997,7 @@ func ReadCheckpointWatermark(filename string) (uint64, error) {
 		if gzErr != nil {
 			return 0, gzErr
 		}
-		defer gr.Close()
+		defer func() { _ = gr.Close() }()
 		r = gr
 	}
 	dec := gob.NewDecoder(r)
@@ -1226,7 +1226,7 @@ func (db *DB) DeepClone() *DB {
 	out.wal = db.wal
 	for tn, tdb := range db.tenants {
 		for _, t := range tdb.tables {
-			out.Put(tn, cloneTable(t))
+			_ = out.Put(tn, cloneTable(t))
 		}
 	}
 	return out
@@ -1605,7 +1605,7 @@ func (db *DB) loadBackendCatalog() error {
 		}
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var dc diskCatalog
 	if err := gob.NewDecoder(bufio.NewReader(f)).Decode(&dc); err != nil {
@@ -1872,7 +1872,7 @@ func LoadFromFile(filename string) (*DB, error) {
 		}
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	var dump []diskTable
 	var r io.Reader = bufio.NewReader(f)
 	if strings.HasSuffix(strings.ToLower(filename), ".gz") {
@@ -1880,7 +1880,7 @@ func LoadFromFile(filename string) (*DB, error) {
 		if gzErr != nil {
 			return nil, gzErr
 		}
-		defer gr.Close()
+		defer func() { _ = gr.Close() }()
 		r = gr
 	}
 	dec := gob.NewDecoder(r)
@@ -2589,7 +2589,7 @@ func OpenWAL(db *DB, cfg WALConfig) (*WALManager, error) {
 	}
 	size, err := f.Seek(0, io.SeekEnd)
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, err
 	}
 	cw := &countingWriter{w: f, n: size}
@@ -2716,7 +2716,7 @@ func (w *WALManager) Checkpoint(db *DB) error {
 		return err
 	}
 	if _, err := f.Seek(0, io.SeekEnd); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	w.file = f
@@ -2788,7 +2788,7 @@ func replayWAL(db *DB, walPath string) (nextSeq, nextTxID, committed uint64, tru
 		}
 		return 0, 0, 0, false, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	cr := &countingReader{r: f}
 	dec := gob.NewDecoder(cr)
 	pending := make(map[uint64][]walOperation)

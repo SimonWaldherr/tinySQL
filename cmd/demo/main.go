@@ -150,7 +150,7 @@ func (e *executor) run(q string) error {
 		if err != nil {
 			return err
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 		cols, _ := rows.Columns()
 		switch e.output {
 		case "csv":
@@ -331,7 +331,7 @@ func runScriptFile(exec *executor, path string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	return runScript(exec, f, path)
 }
 
@@ -441,7 +441,7 @@ func demoListAllTableNames(db *sql.DB) []string {
 		fmt.Println("Error:", err)
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var tables []string
 	for rows.Next() {
 		var n string
@@ -605,7 +605,7 @@ func printTableSchema(db *sql.DB, table string) {
 			return
 		}
 		cols, _ := r.Columns()
-		r.Close()
+		_ = r.Close()
 		fmt.Printf("Table: %s\n", table)
 		for _, c := range cols {
 			fmt.Printf("  %s\n", c)
@@ -650,7 +650,7 @@ func importFile(db *sql.DB, path, table string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
@@ -866,38 +866,38 @@ func printRows(out io.Writer, rows *sql.Rows, cols []string) {
 
 	// Header
 	for i, c := range cols {
-		fmt.Fprint(out, padRight(c, width[i]))
+		_, _ = fmt.Fprint(out, padRight(c, width[i]))
 		if i < len(cols)-1 {
-			fmt.Fprint(out, "  ")
+			_, _ = fmt.Fprint(out, "  ")
 		}
 	}
-	fmt.Fprintln(out)
+	_, _ = fmt.Fprintln(out)
 	for i := range cols {
-		fmt.Fprint(out, strings.Repeat("-", width[i]))
+		_, _ = fmt.Fprint(out, strings.Repeat("-", width[i]))
 		if i < len(cols)-1 {
-			fmt.Fprint(out, "  ")
+			_, _ = fmt.Fprint(out, "  ")
 		}
 	}
-	fmt.Fprintln(out)
+	_, _ = fmt.Fprintln(out)
 
 	// Rows
 	for _, r := range data {
 		for i, c := range cols {
-			fmt.Fprint(out, padRight(cell(r[c]), width[i]))
+			_, _ = fmt.Fprint(out, padRight(cell(r[c]), width[i]))
 			if i < len(cols)-1 {
-				fmt.Fprint(out, "  ")
+				_, _ = fmt.Fprint(out, "  ")
 			}
 		}
-		fmt.Fprintln(out)
+		_, _ = fmt.Fprintln(out)
 	}
-	fmt.Fprintf(out, "(%d row(s))\n", len(data))
+	_, _ = fmt.Fprintf(out, "(%d row(s))\n", len(data))
 }
 
 // printRowsCSV writes rows as CSV.
 func printRowsCSV(out io.Writer, rows *sql.Rows, cols []string) {
 	data := scanRows(rows, cols)
 	w := csv.NewWriter(out)
-	w.Write(cols)
+	_ = w.Write(cols)
 	for _, r := range data {
 		var record []string
 		for _, c := range cols {
@@ -908,7 +908,7 @@ func printRowsCSV(out io.Writer, rows *sql.Rows, cols []string) {
 				record = append(record, fmt.Sprintf("%v", v))
 			}
 		}
-		w.Write(record)
+		_ = w.Write(record)
 	}
 	w.Flush()
 }
@@ -926,7 +926,7 @@ func printRowsJSON(out io.Writer, rows *sql.Rows, cols []string) {
 	}
 	enc := json.NewEncoder(out)
 	enc.SetIndent("", "  ")
-	enc.Encode(jsonData)
+	_ = enc.Encode(jsonData)
 }
 
 // printRowsNDJSON writes one JSON object per row. It avoids a result-sized

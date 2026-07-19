@@ -665,7 +665,7 @@ func (p *Parser) parseExplain() (Statement, error) {
 func (p *Parser) parseAnalyze() (Statement, error) {
 	p.next()
 	stmt := &Analyze{}
-	if p.cur.Typ != tEOF && !(p.cur.Typ == tSymbol && p.cur.Val == ";") {
+	if p.cur.Typ != tEOF && (p.cur.Typ != tSymbol || p.cur.Val != ";") {
 		stmt.Table = p.parseQualifiedIdentLike()
 		if stmt.Table == "" {
 			return nil, p.errf("expected table name after ANALYZE")

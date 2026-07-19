@@ -280,18 +280,18 @@ func OpenPager(cfg PagerConfig) (*Pager, error) {
 		sb := NewSuperblock(uint32(ps))
 		buf := MarshalSuperblock(sb, ps)
 		if _, err := f.WriteAt(buf, 0); err != nil {
-			f.Close()
+			_ = f.Close()
 			return nil, fmt.Errorf("write superblock: %w", err)
 		}
 		if err := f.Sync(); err != nil {
-			f.Close()
+			_ = f.Close()
 			return nil, err
 		}
 		p.sb = sb
 	} else {
 		sb, err := p.readSuperblock()
 		if err != nil {
-			f.Close()
+			_ = f.Close()
 			return nil, err
 		}
 		p.sb = sb
@@ -300,7 +300,7 @@ func OpenPager(cfg PagerConfig) (*Pager, error) {
 		// Load free list.
 		if sb.FreeListRoot != InvalidPageID {
 			if err := p.freeMgr.LoadFromDisk(sb.FreeListRoot, p.readPageRaw); err != nil {
-				f.Close()
+				_ = f.Close()
 				return nil, fmt.Errorf("load freelist: %w", err)
 			}
 		}
@@ -316,17 +316,17 @@ func OpenPager(cfg PagerConfig) (*Pager, error) {
 	p.walPath = walPath
 	if cfg.ReadOnly {
 		if info, err := os.Stat(walPath); err == nil && info.Size() > WALFileHdrSize {
-			f.Close()
+			_ = f.Close()
 			return nil, fmt.Errorf("read-only pager refuses active WAL %q", walPath)
 		} else if err != nil && !os.IsNotExist(err) {
-			f.Close()
+			_ = f.Close()
 			return nil, err
 		}
 		return p, nil
 	}
 	wf, err := OpenWALFile(walPath, p.pageSize)
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("open WAL file: %w", err)
 	}
 	p.wal = wf
@@ -334,8 +334,8 @@ func OpenPager(cfg PagerConfig) (*Pager, error) {
 	// If WAL has records, perform recovery before accepting new writes.
 	if !isNew {
 		if err := p.Recover(); err != nil {
-			wf.Close()
-			f.Close()
+			_ = wf.Close()
+			_ = f.Close()
 			return nil, fmt.Errorf("WAL recovery: %w", err)
 		}
 	}

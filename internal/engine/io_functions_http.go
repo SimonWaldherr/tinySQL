@@ -33,7 +33,7 @@ func evalHTTPFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("http(): %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("http(): server returned status %d", resp.StatusCode)

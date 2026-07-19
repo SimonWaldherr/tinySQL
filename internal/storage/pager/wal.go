@@ -112,12 +112,12 @@ func OpenWALFile(path string, pageSize int) (*WALFile, error) {
 
 	if exists {
 		if err := wf.validateHeader(); err != nil {
-			f.Close()
+			_ = f.Close()
 			return nil, err
 		}
 	} else {
 		if err := wf.writeHeader(); err != nil {
-			f.Close()
+			_ = f.Close()
 			return nil, err
 		}
 	}
@@ -125,7 +125,7 @@ func OpenWALFile(path string, pageSize int) (*WALFile, error) {
 	// Initialise writePos to the end of the file.
 	endPos, err := f.Seek(0, io.SeekEnd)
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("seek WAL end: %w", err)
 	}
 	wf.writePos = endPos
@@ -303,7 +303,7 @@ func ReadAllRecords(path string) ([]*WALRecord, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	// Skip the file header.
 	if _, err := f.Seek(WALFileHdrSize, io.SeekStart); err != nil {

@@ -6461,20 +6461,6 @@ func alignRecursiveCTERows(accRs *ResultSet, nextRs *ResultSet, cteName string) 
 	return alignedRows
 }
 
-// addNewRowsToRecursiveCTE adds new rows to accumulator, tracking duplicates
-func addNewRowsToRecursiveCTE(accRows []Row, newRows []Row, targetCols []string, seen map[string]bool) ([]Row, int) {
-	newAdded := 0
-	for _, r := range newRows {
-		sig := rowSignature(r, targetCols)
-		if !seen[sig] {
-			seen[sig] = true
-			accRows = append(accRows, r)
-			newAdded++
-		}
-	}
-	return accRows, newAdded
-}
-
 // recursiveCTEMaxRows caps the total accumulated rows a recursive CTE may
 // produce, guarding against fan-out recursive terms (e.g. a self-join) that
 // grow exponentially and would otherwise exhaust memory well before iterLimit

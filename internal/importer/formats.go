@@ -79,7 +79,7 @@ func ImportFile(
 	if err != nil {
 		return nil, fmt.Errorf("open file: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	// Import based on format
 	switch ext {
@@ -159,18 +159,24 @@ func importByContent(
 	trimmed := strings.TrimSpace(string(peek))
 	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
 		// Seek back to start
-		f.Seek(0, 0)
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return nil, fmt.Errorf("rewind JSON input: %w", err)
+		}
 		return ImportJSON(ctx, db, tenant, tableName, f, opts)
 	}
 
 	// Check for XML
 	if strings.HasPrefix(trimmed, "<?xml") || strings.HasPrefix(trimmed, "<") {
-		f.Seek(0, 0)
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return nil, fmt.Errorf("rewind XML input: %w", err)
+		}
 		return ImportXML(ctx, db, tenant, tableName, f, opts)
 	}
 
 	// Default to CSV with auto-detection
-	f.Seek(0, 0)
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("rewind CSV input: %w", err)
+	}
 	return ImportCSV(ctx, db, tenant, tableName, f, opts)
 }
 
