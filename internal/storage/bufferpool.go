@@ -311,6 +311,7 @@ func (bp *BufferPool) Get(tenant, name string) (*Table, bool) {
 	cached.mu.Lock()
 	cached.LastAccess = time.Now()
 	cached.AccessCount++
+	table := cached.Table
 	cached.mu.Unlock()
 
 	// Update LRU
@@ -319,7 +320,7 @@ func (bp *BufferPool) Get(tenant, name string) (*Table, bool) {
 	// Record hit
 	bp.recordHit()
 
-	return cached.Table, true
+	return table, true
 }
 
 // Remove removes a table from the buffer pool.

@@ -210,6 +210,32 @@ Use `ExportNDJSON` for streaming one JSON object per row, and
 export. The runnable [`ExampleExportJSON`](./exporter/example_test.go) shows
 the minimal JSON path.
 
+## SQL formatting
+
+Use `BeautifySQL` to make SQL suitable for logs, code review, or an editor;
+use `MinifySQL` when a compact query is more useful for transport or storage.
+Both functions are dependency-free and preserve string literals, quoted
+identifiers, and comments. `MinifySQL` also keeps the newline after a `--`
+comment, since removing it would turn the rest of the statement into a
+comment.
+
+```go
+query := "select id,name from users where status = 'active' and id=42"
+
+pretty := tinysql.BeautifySQL(query)
+// SELECT id, name
+// FROM users
+// WHERE status = 'active'
+// AND id = 42
+
+compact := tinysql.MinifySQL(pretty)
+// SELECT id,name FROM users WHERE status='active' AND id=42
+```
+
+The executable [`ExampleBeautifySQL`](./sql_format_example_test.go) documents
+the full round trip. The command-line equivalent is
+`sqltools beautify`; `sqltools normalize` provides canonical comparison output.
+
 ## Vector search cache and analytics
 
 VEC_SEARCH already maintains bounded internal column and ANN-index caches.

@@ -699,7 +699,7 @@ const DEMO_RELEASE_FEATURES = [
     { area: 'Analytics SQL', feature: 'CTE views, materialized views, PIVOT, RETURNING, EXPLAIN', added: '2026-06-21 to 2026-07-08', browser_demo: 'Direct multi-statement SQL recipes' },
     { area: 'Catalog', feature: 'sys.* metadata, dependencies, functions, procedures, SQLite-compatible PRAGMAs', added: '2026-06-21 to 2026-07-08', browser_demo: 'Direct catalog queries' },
     { area: 'Security/Ops', feature: 'RBAC, audit logs, encryption, WAL/storage, tinysqld, MCP server', added: '2026-05-14 to 2026-07-05', browser_demo: 'Feature matrix and metadata queries; server-side examples in Go tools' },
-    { area: 'Developer UX', feature: 'tinyORM, public importer/resultutil/sqlutil/jobs/standards packages, gh-pages workflow', added: '2026-07-05 to 2026-07-08', browser_demo: 'Documented and linked from demo README' }
+    { area: 'Developer UX', feature: 'tinyORM, public importer/resultutil/sqlutil/jobs/standards packages, SQL BeautifySQL/MinifySQL helpers, gh-pages workflow', added: '2026-07-05 to 2026-07-19', browser_demo: 'Go API docs are linked from the top bar' }
 ];
 
 const SHAREABLE_DEMOS = {

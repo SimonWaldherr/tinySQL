@@ -33,6 +33,32 @@ Die Beispiele in diesem Repository sind bewusst unterschiedlich aufgebaut:
 
 ### 2. Integration in Go-Projekte
 
+#### SQL-Text formatieren und komprimieren
+
+TinySQL kann SQL auch ohne Datenbankinstanz formatiert ausgeben. Das ist
+praktisch fuer Editoren, Logs, Review-Tools und Caches. Die beiden Funktionen
+arbeiten ohne externe Abhaengigkeiten oder Parser-Roundtrip: Literale, quoted
+identifiers und Kommentare bleiben unveraendert.
+
+```go
+source := "select id,name from users where note = 'two  spaces' and id=42"
+
+pretty := tinysql.BeautifySQL(source)
+// SELECT id, name
+// FROM users
+// WHERE note = 'two  spaces'
+// AND id = 42
+
+compact := tinysql.MinifySQL(pretty)
+// SELECT id,name FROM users WHERE note='two  spaces' AND id=42
+```
+
+`BeautifySQL` strukturiert die wichtigsten SQL-Klauseln und schreibt bekannte
+Keywords gross. `MinifySQL` entfernt nur bedeutungslose Leerzeichen. Bei
+`--`-Kommentaren bleibt der Zeilenumbruch erhalten, weil der folgende SQL-Text
+sonst Teil des Kommentars waere. Die Funktionen validieren kein SQL; fuer
+Syntaxpruefungen verwende `ParseSQL` oder `sqltools validate`.
+
 #### Direktes API-Embedding
 
 Wenn du TinySQL als Engine in deinem Go-Projekt verwenden willst, ist das die direkteste Variante:
