@@ -629,3 +629,143 @@ func BenchmarkCompareTopK_VecSearchVsOrderBy(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkVecSearchConcurrent measures VEC_SEARCH under concurrent callers
+// with the result cache and analytics both at their documented default (off)
+// — the state every embedding application starts in. Rows are kept below
+// vecSearchParallelMinRows (4096) so each call takes the single-goroutine
+// path inside vecSearchTopK; that isolates vecQueryCacheState's (former)
+// global-mutex overhead from the per-query worker-pool fan-out, which is a
+// separate concern already covered by the other VEC_SEARCH benchmarks. A
+// small table also keeps each call's own useful work short, so two
+// process-wide Lock/Unlock round trips per call are a large fraction of wall
+// time and any contention between goroutines shows up clearly rather than
+// getting lost in scan noise. Run with -cpu=1,2,4,8 (or more) to see whether
+// throughput scales with cores, which it cannot while every goroutine
+// serializes on one shared lock.
+func BenchmarkVecSearchConcurrent(b *testing.B) {
+	db := makeVecSearchBenchmarkTable(512, 64)
+	fn := &VecSearchTableFunc{}
+	env := ExecEnv{ctx: context.Background(), tenant: "default", db: db}
+	query := make([]float64, 64)
+	for i := range query {
+		query[i] = float64(i) / 64.0
+	}
+	args := []Expr{
+		&Literal{Val: "vec_docs"},
+		&Literal{Val: "embedding"},
+		&Literal{Val: query},
+		&Literal{Val: 5},
+		&Literal{Val: "cosine"},
+	}
+	ConfigureVectorCache(VectorCacheConfig{})
+	// Warm the column cache before timing, same reasoning as the flat-scan
+	// benchmarks below: without this, whichever calibration attempt ends up
+	// reported pays one unpredictable cold-build cost inside RunParallel,
+	// where it also races several goroutines against getVecColumnCache's
+	// build-coalescing channel instead of the mutex this benchmark targets.
+	if _, err := fn.Execute(context.Background(), args, env, Row{}); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			rs, err := fn.Execute(context.Background(), args, env, Row{})
+			if err != nil {
+				b.Fatal(err)
+			}
+			if len(rs.Rows) != 5 {
+				b.Fatal("expected top-5 results")
+			}
+		}
+	})
+}
+
+// BenchmarkVecSearchFlatScanLargeEmbedding exercises the flat-scan column
+// cache at a corpus size and embedding width representative of a real RAG
+// deployment (50k chunks, 768 dims — a common BERT/sentence-transformer
+// size), large enough that per-row cache/TLB misses from a scattered
+// [][]float64 column cache dominate over the small-table benchmarks above
+// (4096/12000 rows at 64 dims, whose ~512B rows can still fit close together
+// under the allocator regardless of layout).
+func BenchmarkVecSearchFlatScanLargeEmbedding(b *testing.B) {
+	db := makeVecSearchBenchmarkTable(50000, 768)
+	fn := &VecSearchTableFunc{}
+	env := ExecEnv{ctx: context.Background(), tenant: "default", db: db}
+	query := make([]float64, 768)
+	for i := range query {
+		query[i] = float64(i) / 768.0
+	}
+	args := []Expr{
+		&Literal{Val: "vec_docs"},
+		&Literal{Val: "embedding"},
+		&Literal{Val: query},
+		&Literal{Val: 10},
+		&Literal{Val: "cosine"},
+	}
+
+	// Warm the column cache before timing starts (matches benchmarkVecSearchIndexed's
+	// pattern above): the one-time cold build of a 50k-row/768-dim column is a
+	// separate cost from steady-state scan latency, and go test's benchtime-based
+	// calibration re-invokes this whole function (rebuilding db and the cache)
+	// on every calibration attempt — without a warm-up call, whichever attempt
+	// happens to become the reported one mixes in one cold build at an
+	// unpredictable weight, making ns/op and allocs/op incomparable across runs.
+	if _, err := fn.Execute(context.Background(), args, env, Row{}); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rs, err := fn.Execute(context.Background(), args, env, Row{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(rs.Rows) != 10 {
+			b.Fatalf("expected top-10 results, got %d", len(rs.Rows))
+		}
+	}
+}
+
+// BenchmarkVecSearchFlatScanManySmallEmbeddings targets the opposite corner
+// of the memory-layout tradeoff from BenchmarkVecSearchFlatScanLargeEmbedding:
+// many rows (200k) with a small embedding (64 dims, 512 bytes/row). The full
+// column here (~100MB) is far larger than any CPU cache, and each row's own
+// payload is small, so the fixed per-row cost of following one more pointer
+// indirection to find a scattered allocation is a much larger fraction of
+// that row's total cost than it is for a 768-dim/6KB row — this is where a
+// contiguous backing buffer should show its clearest win.
+func BenchmarkVecSearchFlatScanManySmallEmbeddings(b *testing.B) {
+	db := makeVecSearchBenchmarkTable(200000, 64)
+	fn := &VecSearchTableFunc{}
+	env := ExecEnv{ctx: context.Background(), tenant: "default", db: db}
+	query := make([]float64, 64)
+	for i := range query {
+		query[i] = float64(i) / 64.0
+	}
+	args := []Expr{
+		&Literal{Val: "vec_docs"},
+		&Literal{Val: "embedding"},
+		&Literal{Val: query},
+		&Literal{Val: 10},
+		&Literal{Val: "cosine"},
+	}
+	if _, err := fn.Execute(context.Background(), args, env, Row{}); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rs, err := fn.Execute(context.Background(), args, env, Row{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(rs.Rows) != 10 {
+			b.Fatalf("expected top-10 results, got %d", len(rs.Rows))
+		}
+	}
+}

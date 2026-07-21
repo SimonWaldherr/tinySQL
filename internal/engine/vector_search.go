@@ -222,8 +222,34 @@ type vecSearchColumnCacheKey struct {
 }
 
 type vecSearchColumnCacheEntry struct {
-	table      *storage.Table
-	version    int
+	table *storage.Table
+	// version is the table.Version this entry was built from; every DML
+	// statement bumps table.Version (see executeUpdate/executeInsert/
+	// executeDelete in exec.go), so a version mismatch in
+	// getVecColumnCache forces a rebuild before any stale copy in data
+	// could ever be observed. That is what makes copying (below) safe.
+	version int
+	// data is the single contiguous backing buffer for every valid row's
+	// vector, packed tightly in row order (row i's region immediately
+	// follows row i-1's — no padding, no fixed dims*numRows stride, because
+	// a column mid-embedding-migration can have mixed-length rows, and a row
+	// whose length doesn't match the query is excluded downstream rather
+	// than hard-errored — see validCacheRow/vecSearchTopKRange). Packing by
+	// each row's own true length preserves that "exclude, don't reject"
+	// behavior exactly while still making row-to-row scan steps sequential
+	// in memory instead of chasing N independent heap allocations.
+	//
+	// data is kept as an explicit field for documentation/debuggability even
+	// though it is not strictly load-bearing for GC correctness — any live
+	// vectors[i] sub-slice already pins the whole backing array.
+	data []float64
+	// vectors keeps its historical [][]float64 type so every existing
+	// cache.vectors[i] read across the package (vector_index.go,
+	// vector_warm.go, ...) keeps compiling and behaving identically. Each
+	// element is either nil (row invalid/excluded — zero value, never
+	// assigned) or a data[off:off+n:off+n] view into data (cap==len, so a
+	// stray append onto a returned vector reallocates instead of corrupting
+	// the next row's region of data).
 	vectors    [][]float64
 	norms      []float64
 	normsReady bool
@@ -332,13 +358,31 @@ func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeN
 	}
 }
 
+// buildVecColumnCache extracts one table column into a cache entry backed by
+// a single contiguous []float64 buffer instead of one heap allocation per
+// row. A flat scan, an IVF list scan, and an HNSW graph traversal all walk
+// cache.vectors row by row; with N independent allocations, each step
+// followed a slice header to a separately-allocated block scattered across
+// the heap, so the CPU could not prefetch row i+1 while still processing row
+// i even though the access pattern is a plain sequential scan. Packing every
+// valid row into one buffer turns that into real sequential memory access.
+//
+// This is a two-pass build: pass 1 classifies each row exactly as before
+// (skip missing/nil cells, skip whatever vecRowValue rejects) and tallies the
+// total float64 count; pass 2 makes the one allocation for all row data and
+// copies each valid row into its own tightly-packed region, in row order.
+// Two passes (rather than growing one slice with append) avoid repeated
+// reallocate-and-recopy of the whole buffer as it grows — exactly the
+// allocator churn this rebuild is meant to eliminate. Rows are packed by
+// their own true length, not a fixed dims*len(table.Rows) stride: a column
+// mid-embedding-migration can be ragged (mixed lengths across rows), and a
+// row whose length doesn't match the query is excluded at search time
+// (vecSearchTopKRange, validCacheRow), never truncated or hard-errored here.
 func buildVecColumnCache(table *storage.Table, colIdx int, includeNorms bool) vecSearchColumnCacheEntry {
-	vectors := make([][]float64, len(table.Rows))
-	var norms []float64
-	if includeNorms {
-		norms = make([]float64, len(table.Rows))
-	}
-	valid := make([]bool, len(table.Rows))
+	n := len(table.Rows)
+	valid := make([]bool, n)
+	raw := make([][]float64, n) // scratch: each row's vecRowValue() result, pre-copy
+	total := 0
 
 	for i, r := range table.Rows {
 		if colIdx >= len(r) || r[colIdx] == nil {
@@ -348,13 +392,32 @@ func buildVecColumnCache(table *storage.Table, colIdx int, includeNorms bool) ve
 		if !ok {
 			continue
 		}
-		if includeNorms {
-			norms[i] = vectorL2Norm(vec)
-		}
 		valid[i] = true
-		vectors[i] = vec
+		raw[i] = vec
+		total += len(vec)
 	}
-	return vecSearchColumnCacheEntry{table: table, version: table.Version, vectors: vectors, norms: norms, normsReady: includeNorms, valid: valid}
+
+	data := make([]float64, total)
+	vectors := make([][]float64, n)
+	var norms []float64
+	if includeNorms {
+		norms = make([]float64, n)
+	}
+	cursor := 0
+	for i := 0; i < n; i++ {
+		if !valid[i] {
+			continue // vectors[i] stays nil (zero value) — identical to before
+		}
+		vec := raw[i]
+		dst := data[cursor : cursor+len(vec) : cursor+len(vec)] // cap==len: append reallocates, never corrupts row i+1
+		copy(dst, vec)
+		vectors[i] = dst
+		if includeNorms {
+			norms[i] = vectorL2Norm(dst)
+		}
+		cursor += len(vec)
+	}
+	return vecSearchColumnCacheEntry{table: table, version: table.Version, data: data, vectors: vectors, norms: norms, normsReady: includeNorms, valid: valid}
 }
 
 func vectorL2Norm(v []float64) float64 {

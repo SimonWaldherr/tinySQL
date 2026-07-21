@@ -1075,7 +1075,39 @@ func (db *DB) Get(tn, name string) (*Table, error) {
 		}
 	}
 
-	return nil, fmt.Errorf("no such table %q (tenant %q)", name, tn)
+	return nil, db.noSuchTableError(tn, name)
+}
+
+// noSuchTableError builds the "no such table" error for Get, adding a
+// "did you mean ...?" hint when an existing table name is a close typo
+// match. This is a plain edit-distance heuristic (see suggestSimilar), not
+// an AI feature — it only fires on the already-slow not-found path.
+func (db *DB) noSuchTableError(tn, name string) error {
+	if suggestion := suggestSimilar(name, db.candidateTableNames(tn)); suggestion != "" {
+		return fmt.Errorf("no such table %q (tenant %q) - did you mean %q?", name, tn, suggestion)
+	}
+	return fmt.Errorf("no such table %q (tenant %q)", name, tn)
+}
+
+// candidateTableNames lists table names known for the tenant, both resident
+// in memory and (if a backend is attached) on disk, for typo suggestions.
+func (db *DB) candidateTableNames(tn string) []string {
+	db.mu.RLock()
+	td := db.getTenantRO(tn)
+	var names []string
+	if td != nil {
+		names = make([]string, 0, len(td.tables))
+		for _, t := range td.tables {
+			names = append(names, t.Name)
+		}
+	}
+	db.mu.RUnlock()
+	if db.backend != nil {
+		if diskNames, err := db.backend.ListTableNames(tn); err == nil {
+			names = append(names, diskNames...)
+		}
+	}
+	return names
 }
 
 // backendTablesEvictable reports modes whose backend, rather than DB.tenants,
@@ -1142,7 +1174,7 @@ func (db *DB) Drop(tn, name string) error {
 		return onDisk, true
 	}()
 	if !found {
-		return fmt.Errorf("no such table %q (tenant %q)", name, tn)
+		return db.noSuchTableError(tn, name)
 	}
 
 	if db.backend != nil && onDisk {

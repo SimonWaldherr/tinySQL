@@ -18,7 +18,6 @@
 package engine
 
 import (
-	"container/heap"
 	"context"
 	"crypto/md5"
 	crand "crypto/rand"
@@ -1985,16 +1984,48 @@ func (h orderedValueRowHeap) Swap(i, j int) {
 	h.items[i], h.items[j] = h.items[j], h.items[i]
 }
 
-func (h *orderedValueRowHeap) Push(x any) {
-	h.items = append(h.items, x.(orderedValueRow))
+// orderedValueRowHeapPush/pushBounded's Fix path replicate container/heap's
+// up/down algorithm directly on the concrete type instead of going through
+// heap.Interface. heap.Push/Fix take/operate via an `any`-boxing Push method,
+// which forces every orderedValueRow (a Row map plus a keys slice) to be
+// heap-allocated just to box it into the interface — on an ORDER BY ... LIMIT
+// N query this is up to N allocations purely from filling the top-N heap,
+// mirroring the same fix already applied to vecScoredHeap (vector_search.go)
+// and vecMinScoredHeap (vector_index.go).
+func orderedValueRowHeapPush(h *orderedValueRowHeap, v orderedValueRow) {
+	h.items = append(h.items, v)
+	orderedValueRowHeapUp(*h, len(h.items)-1)
 }
 
-func (h *orderedValueRowHeap) Pop() any {
-	old := h.items
-	n := len(old)
-	item := old[n-1]
-	h.items = old[:n-1]
-	return item
+func orderedValueRowHeapUp(h orderedValueRowHeap, j int) {
+	for {
+		i := (j - 1) / 2
+		if i == j || !h.Less(j, i) {
+			break
+		}
+		h.Swap(i, j)
+		j = i
+	}
+}
+
+func orderedValueRowHeapDown(h orderedValueRowHeap, i0 int) {
+	n := h.Len()
+	i := i0
+	for {
+		j1 := 2*i + 1
+		if j1 >= n || j1 < 0 {
+			break
+		}
+		j := j1
+		if j2 := j1 + 1; j2 < n && h.Less(j2, j1) {
+			j = j2
+		}
+		if !h.Less(j, i) {
+			break
+		}
+		h.Swap(i, j)
+		i = j
+	}
 }
 
 func (h *orderedValueRowHeap) pushBounded(item orderedValueRow, keepCount int) {
@@ -2002,12 +2033,12 @@ func (h *orderedValueRowHeap) pushBounded(item orderedValueRow, keepCount int) {
 		return
 	}
 	if len(h.items) < keepCount {
-		heap.Push(h, item)
+		orderedValueRowHeapPush(h, item)
 		return
 	}
 	if compareOrderedValueRows(h.orderBy, h.items[0], item) > 0 {
 		h.items[0] = item
-		heap.Fix(h, 0)
+		orderedValueRowHeapDown(*h, 0)
 	}
 }
 
@@ -2591,7 +2622,7 @@ func evalJoinRawVarRef(plan *simpleJoinPlan, left, right []any, ex *VarRef) (any
 	if i, ok := plan.rightIndex[name]; ok {
 		return right[i], nil
 	}
-	return nil, fmt.Errorf("unknown column %q", ex.Name)
+	return nil, unknownColumnErr(ex.Name, columnSuggestion(ex.Name, plan.leftIndex, plan.rightIndex))
 }
 
 func evalJoinRawIsNull(plan *simpleJoinPlan, left, right []any, ex *IsNull) (any, error) {
@@ -2854,7 +2885,13 @@ func executeSimpleSingleGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, r
 func executeSimpleMultiGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, rawPlan *simpleSelectPlan) (*ResultSet, bool, error) {
 	groups := make(map[string]*simpleAggregateState)
 	order := make([]*simpleAggregateState, 0)
-	var keyBuf strings.Builder
+	// keyBuf is reused across rows via keyBuf[:0] (retaining its backing
+	// array) rather than resetting a *strings.Builder to nil every row — see
+	// the writeFmtKeyPart doc comment. Real GROUP BY workloads have far fewer
+	// distinct groups than rows, so most rows hit the zero-allocation map
+	// lookup below and only the first row of each group pays for a real
+	// string allocation.
+	keyBuf := make([]byte, 0, 64)
 	for rowIdx, raw := range plan.table.Rows {
 		if rowIdx&63 == 0 {
 			if err := checkCtx(env.ctx); err != nil {
@@ -2869,16 +2906,16 @@ func executeSimpleMultiGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, ra
 			continue
 		}
 
-		keyBuf.Reset()
+		keyBuf = keyBuf[:0]
 		for i, groupCol := range plan.groupCols {
 			if i > 0 {
-				keyBuf.WriteByte('\x1f')
+				keyBuf = append(keyBuf, '\x1f')
 			}
-			writeFmtKeyPart(&keyBuf, raw[groupCol])
+			keyBuf = writeFmtKeyPart(keyBuf, raw[groupCol])
 		}
-		key := keyBuf.String()
-		state, exists := groups[key]
+		state, exists := groups[string(keyBuf)]
 		if !exists {
+			key := string(keyBuf)
 			values := make([]any, len(plan.groupCols))
 			for i, groupCol := range plan.groupCols {
 				values[i] = raw[groupCol]
@@ -3047,7 +3084,7 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 		}
 		groupCol, ok := colIndex[strings.ToLower(groupRef.Name)]
 		if !ok {
-			return nil, true, fmt.Errorf("unknown column %q", groupRef.Name)
+			return nil, true, unknownColumnErr(groupRef.Name, columnSuggestion(groupRef.Name, colIndex))
 		}
 		groupCols[i] = groupCol
 		if _, exists := groupPositions[groupCol]; !exists {
@@ -3120,7 +3157,7 @@ func buildSimpleAggregateProjection(it SelectItem, idx int, colIndex map[string]
 	if ref, ok := it.Expr.(*VarRef); ok {
 		refCol, ok := colIndex[strings.ToLower(ref.Name)]
 		if !ok {
-			return simpleAggregateProjection{}, "", false, false, fmt.Errorf("unknown column %q", ref.Name)
+			return simpleAggregateProjection{}, "", false, false, unknownColumnErr(ref.Name, columnSuggestion(ref.Name, colIndex))
 		}
 		groupIndex, grouped := groupPositions[refCol]
 		if !grouped {
@@ -3397,16 +3434,45 @@ func (h orderedRawRowHeap) Swap(i, j int) {
 	h.items[i], h.items[j] = h.items[j], h.items[i]
 }
 
-func (h *orderedRawRowHeap) Push(x any) {
-	h.items = append(h.items, x.(orderedRawRow))
+// orderedRawRowHeapPush and its Fix-path counterpart below replicate
+// container/heap's up/down algorithm directly on the concrete type instead of
+// going through heap.Interface — same rationale and pattern as
+// orderedValueRowHeapPush above: heap.Push boxes each orderedRawRow into an
+// `any`, costing one allocation per row while the top-N heap fills.
+func orderedRawRowHeapPush(h *orderedRawRowHeap, v orderedRawRow) {
+	h.items = append(h.items, v)
+	orderedRawRowHeapUp(*h, len(h.items)-1)
 }
 
-func (h *orderedRawRowHeap) Pop() any {
-	old := h.items
-	n := len(old)
-	item := old[n-1]
-	h.items = old[:n-1]
-	return item
+func orderedRawRowHeapUp(h orderedRawRowHeap, j int) {
+	for {
+		i := (j - 1) / 2
+		if i == j || !h.Less(j, i) {
+			break
+		}
+		h.Swap(i, j)
+		j = i
+	}
+}
+
+func orderedRawRowHeapDown(h orderedRawRowHeap, i0 int) {
+	n := h.Len()
+	i := i0
+	for {
+		j1 := 2*i + 1
+		if j1 >= n || j1 < 0 {
+			break
+		}
+		j := j1
+		if j2 := j1 + 1; j2 < n && h.Less(j2, j1) {
+			j = j2
+		}
+		if !h.Less(j, i) {
+			break
+		}
+		h.Swap(i, j)
+		i = j
+	}
 }
 
 func (h *orderedRawRowHeap) pushBounded(item orderedRawRow, keepCount int) {
@@ -3414,12 +3480,12 @@ func (h *orderedRawRowHeap) pushBounded(item orderedRawRow, keepCount int) {
 		return
 	}
 	if len(h.items) < keepCount {
-		heap.Push(h, item)
+		orderedRawRowHeapPush(h, item)
 		return
 	}
 	if compareOrderedRawRows(h.plan, h.items[0], item) > 0 {
 		h.items[0] = item
-		heap.Fix(h, 0)
+		orderedRawRowHeapDown(*h, 0)
 	}
 }
 
@@ -5304,10 +5370,7 @@ func evalRawExpr(plan *simpleSelectPlan, raw []any, e Expr) (any, error) {
 		}
 		i, ok := plan.colIndex[key]
 		if !ok {
-			if strings.Contains(ex.Name, ".") {
-				return nil, fmt.Errorf("unknown column reference %q", ex.Name)
-			}
-			return nil, fmt.Errorf("unknown column %q", ex.Name)
+			return nil, unknownColumnErr(ex.Name, columnSuggestion(ex.Name, plan.colIndex))
 		}
 		if i < 0 || i >= len(raw) {
 			return nil, fmt.Errorf("column %q is out of range", ex.Name)
@@ -5686,15 +5749,15 @@ func intersectRows(leftRows, rightRows []Row, cols []string) []Row {
 }
 
 func rowSignature(row Row, cols []string) string {
-	var buf strings.Builder
+	buf := make([]byte, 0, 64)
 	for i, col := range cols {
 		if i > 0 {
-			buf.WriteByte('|')
+			buf = append(buf, '|')
 		}
 		val, _ := getVal(row, col)
-		writeFmtKeyPart(&buf, val)
+		buf = writeFmtKeyPart(buf, val)
 	}
-	return buf.String()
+	return string(buf)
 }
 
 func processJoins(env ExecEnv, joins []JoinClause, cur []Row) ([]Row, error) {
@@ -6079,21 +6142,22 @@ func processPivot(env ExecEnv, pv *PivotClause, filtered []Row) ([]Row, error) {
 	}
 	groups := make(map[string]*group)
 	var order []string
-	var keyBuf strings.Builder
+	keyBuf := make([]byte, 0, 64)
 	for _, r := range filtered {
-		keyBuf.Reset()
-		values := make([]any, len(groupCols))
+		keyBuf = keyBuf[:0]
 		for i, c := range groupCols {
-			v := r[c]
-			values[i] = v
 			if i > 0 {
-				keyBuf.WriteByte('\x1f')
+				keyBuf = append(keyBuf, '\x1f')
 			}
-			writeFmtKeyPart(&keyBuf, v)
+			keyBuf = writeFmtKeyPart(keyBuf, r[c])
 		}
-		gk := keyBuf.String()
-		g, ok := groups[gk]
+		g, ok := groups[string(keyBuf)]
 		if !ok {
+			gk := string(keyBuf)
+			values := make([]any, len(groupCols))
+			for i, c := range groupCols {
+				values[i] = r[c]
+			}
 			g = &group{values: values}
 			groups[gk] = g
 			order = append(order, gk)
@@ -6170,36 +6234,49 @@ func collectVarRefNames(e Expr) map[string]bool {
 
 //nolint:gocyclo // Aggregation flow must cover grouping, HAVING, and projection variants.
 func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []string, error) {
-	groups := make(map[string][]Row, len(filtered)/2) // Estimate group count
+	// groups maps a composite key to a *[]Row rather than []Row directly so
+	// appending a row to an EXISTING group never needs to write the map again
+	// (see below) — only inserting a brand-new group does.
+	groups := make(map[string]*[]Row, len(filtered)/2) // Estimate group count
 	orderKeys := make([]string, 0, len(filtered)/2)
 	outRows := make([]Row, 0, len(filtered)/2)
 	outCols := make([]string, 0, len(s.Projs))
 	colSet := make(map[string]struct{}, len(s.Projs))
 
-	// Build the composite group key directly into a reused builder instead of
-	// collecting per-column strings into a slice and strings.Join-ing them —
-	// avoids one slice + one string allocation per group-by expression, per row.
-	var keyBuf strings.Builder
+	// keyBuf is reused across rows via keyBuf[:0] (retaining its backing
+	// array) rather than resetting a *strings.Builder to nil every row — see
+	// the writeFmtKeyPart doc comment. `groups[string(keyBuf)]` for the
+	// existence check is a compiler-optimized zero-allocation map lookup (Go
+	// elides the []byte->string conversion when the result is only read);
+	// materializing a real, independently-owned string via string(keyBuf)
+	// only happens for a row that starts a brand-new group. Real GROUP BY
+	// workloads have far fewer distinct groups than rows, so this turns
+	// per-row key-string allocation into per-distinct-group allocation.
+	keyBuf := make([]byte, 0, 64)
 	for _, r := range filtered {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, nil, err
 		}
-		keyBuf.Reset()
+		keyBuf = keyBuf[:0]
 		for i, g := range s.GroupBy {
 			v, err := evalExpr(env, g, r)
 			if err != nil {
 				return nil, nil, err
 			}
 			if i > 0 {
-				keyBuf.WriteByte('\x1f')
+				keyBuf = append(keyBuf, '\x1f')
 			}
-			writeFmtKeyPart(&keyBuf, v)
+			keyBuf = writeFmtKeyPart(keyBuf, v)
 		}
-		ks := keyBuf.String()
-		if _, ok := groups[ks]; !ok {
+		grp, ok := groups[string(keyBuf)]
+		if !ok {
+			ks := string(keyBuf)
 			orderKeys = append(orderKeys, ks)
+			rows := make([]Row, 0, 4)
+			grp = &rows
+			groups[ks] = grp
 		}
-		groups[ks] = append(groups[ks], r)
+		*grp = append(*grp, r)
 	}
 
 	// A whole-table aggregate (no GROUP BY) always produces exactly one row,
@@ -6214,7 +6291,10 @@ func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []str
 	}
 
 	for _, k := range orderKeys {
-		rows := groups[k]
+		var rows []Row
+		if grp := groups[k]; grp != nil {
+			rows = *grp
+		}
 		if s.Having != nil {
 			hv, err := evalAggregate(env, s.Having, rows)
 			if err != nil {
@@ -6935,10 +7015,13 @@ func evalVarRef(env ExecEnv, ex *VarRef, row Row) (any, error) {
 			return v, nil
 		}
 	}
-	if strings.Contains(ex.Name, ".") {
-		return nil, fmt.Errorf("unknown column reference %q", ex.Name)
+	var suggestion string
+	if env.triggerRow != nil {
+		suggestion = columnSuggestionFromRow(ex.Name, row, env.triggerRow)
+	} else {
+		suggestion = columnSuggestionFromRow(ex.Name, row)
 	}
-	return nil, fmt.Errorf("unknown column %q", ex.Name)
+	return nil, unknownColumnErr(ex.Name, suggestion)
 }
 
 func evalIsNull(env ExecEnv, ex *IsNull, row Row) (any, error) {
@@ -10844,9 +10927,7 @@ func addRightNulls(m Row, alias string, t *storage.Table) {
 }
 
 func fmtKeyPart(v any) string {
-	var b strings.Builder
-	writeFmtKeyPart(&b, v)
-	return b.String()
+	return string(writeFmtKeyPart(make([]byte, 0, 32), v))
 }
 
 func comparableKeyPart(v any) any {
@@ -10868,39 +10949,54 @@ func comparableKeyPart(v any) any {
 	}
 }
 
-// writeFmtKeyPart writes a typed, self-delimiting key part directly to a
-// builder. Self-delimiting text and JSON payloads are essential for composite
-// keys: a user string may contain the separator used by GROUP BY, DISTINCT,
-// or set-operation callers.
-func writeFmtKeyPart(b *strings.Builder, v any) {
+// writeFmtKeyPart appends a typed, self-delimiting key part to buf and
+// returns the extended slice, following the standard Go "AppendX" pattern
+// (like strconv.AppendInt) instead of writing through a *strings.Builder.
+// Self-delimiting text and JSON payloads are essential for composite keys: a
+// user string may contain the separator used by GROUP BY, DISTINCT, or
+// set-operation callers.
+//
+// Callers building a composite key across many rows (GROUP BY, PIVOT,
+// DISTINCT) should reuse one []byte across rows via `buf = buf[:0]` before
+// each row, not `var buf strings.Builder; buf.Reset()` — Builder.Reset nils
+// its internal buffer, so every row's first write starts from zero capacity
+// and must reallocate from scratch; slicing to buf[:0] keeps the backing
+// array and lets append reuse it once row-to-row key sizes stabilize. Pair
+// that with a zero-allocation map lookup via `m[string(buf)]` (the Go
+// compiler special-cases a map index/comprehension whose key is a
+// string-conversion of a []byte to skip the conversion's allocation when the
+// result is only read, not stored) and materialize a real, independently-
+// owned string via `string(buf)` only on the rarer "first time seeing this
+// group" path — turning per-row key-string allocation into per-distinct-
+// group allocation.
+func writeFmtKeyPart(buf []byte, v any) []byte {
 	switch x := v.(type) {
 	case nil:
-		b.WriteString("N;")
+		return append(buf, "N;"...)
 	case int:
-		b.WriteString("I")
-		b.WriteString(strconv.Itoa(x))
-		b.WriteByte(';')
+		buf = append(buf, 'I')
+		buf = strconv.AppendInt(buf, int64(x), 10)
+		return append(buf, ';')
 	case float64:
-		b.WriteString("F")
-		b.WriteString(strconv.FormatFloat(x, 'g', -1, 64))
-		b.WriteByte(';')
+		buf = append(buf, 'F')
+		buf = strconv.AppendFloat(buf, x, 'g', -1, 64)
+		return append(buf, ';')
 	case bool:
 		if x {
-			b.WriteString("B1;")
-		} else {
-			b.WriteString("B0;")
+			return append(buf, "B1;"...)
 		}
+		return append(buf, "B0;"...)
 	case string:
-		b.WriteByte('S')
-		b.WriteString(strconv.Itoa(len(x)))
-		b.WriteByte(':')
-		b.WriteString(x)
+		buf = append(buf, 'S')
+		buf = strconv.AppendInt(buf, int64(len(x)), 10)
+		buf = append(buf, ':')
+		return append(buf, x...)
 	default:
 		byt, _ := storage.JSONMarshal(x)
-		b.WriteByte('J')
-		b.WriteString(strconv.Itoa(len(byt)))
-		b.WriteByte(':')
-		b.Write(byt)
+		buf = append(buf, 'J')
+		buf = strconv.AppendInt(buf, int64(len(byt)), 10)
+		buf = append(buf, ':')
+		return append(buf, byt...)
 	}
 }
 
@@ -10912,20 +11008,23 @@ func distinctRows(rows []Row, cols []string) []Row {
 	for i, c := range cols {
 		lcCols[i] = strings.ToLower(c)
 	}
-	var buf strings.Builder
+	// buf is reused across rows via buf[:0] — see the writeFmtKeyPart doc
+	// comment. seen[string(buf)] is a zero-allocation lookup; a real string
+	// is only materialized for a row that is actually distinct so far.
+	buf := make([]byte, 0, 64)
 	for _, r := range rows {
-		buf.Reset()
+		buf = buf[:0]
 		for i, c := range lcCols {
 			if i > 0 {
-				buf.WriteByte('|')
+				buf = append(buf, '|')
 			}
-			writeFmtKeyPart(&buf, r[c])
+			buf = writeFmtKeyPart(buf, r[c])
 		}
-		key := buf.String()
-		if !seen[key] {
-			seen[key] = true
-			out = append(out, r)
+		if seen[string(buf)] {
+			continue
 		}
+		seen[string(buf)] = true
+		out = append(out, r)
 	}
 	return out
 }

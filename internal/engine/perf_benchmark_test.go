@@ -96,6 +96,16 @@ func BenchmarkOrderByWithLimit(b *testing.B) {
 	runBench(b, db, `SELECT id, val FROM t ORDER BY val DESC LIMIT 20`)
 }
 
+// BenchmarkGroupByOrderByLimit combines all three clauses in one query. GROUP
+// BY plus ORDER BY always takes processAggregateQuery followed by
+// applySortOrderWithLimit's top-N heap — the aggregate fast path
+// (executeSimpleAggregateFastPath) excludes any query with an ORDER BY, so
+// this exact shape never gets the raw-row heap used by BenchmarkOrderByWithLimit.
+func BenchmarkGroupByOrderByLimit(b *testing.B) {
+	db := setupPerfTable(b, 20000)
+	runBench(b, db, `SELECT grp, COUNT(*) as n, AVG(val) as a FROM t GROUP BY grp ORDER BY a DESC LIMIT 10`)
+}
+
 // ─────────────────────────── JOIN ──────────────────────────────────────────
 
 func setupJoinTables(b *testing.B, leftRows, rightRows int) *storage.DB {

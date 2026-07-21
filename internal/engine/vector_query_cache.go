@@ -6,6 +6,7 @@ import (
 	"math"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -80,6 +81,22 @@ var vecQueryCacheState = struct {
 	misses    uint64
 	evictions uint64
 	events    []VectorQueryEvent
+	// cacheEnabled and analyticsEnabled mirror cfg.ResultCacheEntries>0 &&
+	// cfg.ResultCacheTTL>0, and cfg.Analytics, respectively. They exist purely
+	// as a lock-free fast path for the VEC_SEARCH hot path (every single
+	// search call, regardless of table size or index mode, used to pay two
+	// full Lock/Unlock round trips on this one global mutex just to learn
+	// "disabled" — see vecQueryCacheEnabled and recordVecQuery below).
+	// ConfigureVectorCache is the ONLY writer, and it stores both atomics
+	// while still holding the mutex, in the same critical section as the cfg
+	// write they mirror — so concurrent ConfigureVectorCache calls can never
+	// leave the atomics reflecting an older cfg than the one currently
+	// stored. Readers never treat these as a second source of truth for a
+	// mutation: getVecQueryCache/putVecQueryCache/recordVecQuery's slow path
+	// all re-check the authoritative, lock-protected cfg before touching
+	// entries/events.
+	cacheEnabled     atomic.Bool
+	analyticsEnabled atomic.Bool
 }{entries: make(map[vecQueryCacheKey]vecQueryCacheEntry)}
 
 func ConfigureVectorCache(cfg VectorCacheConfig) {
@@ -110,6 +127,10 @@ func ConfigureVectorCache(cfg VectorCacheConfig) {
 	if !cfg.Analytics {
 		vecQueryCacheState.events = nil
 	}
+	// Publish the fast-path flags last, still inside this critical section,
+	// so they always end up consistent with the cfg this same call just set.
+	vecQueryCacheState.cacheEnabled.Store(cfg.ResultCacheEntries > 0 && cfg.ResultCacheTTL > 0)
+	vecQueryCacheState.analyticsEnabled.Store(cfg.Analytics)
 }
 
 func VectorCacheAnalytics() VectorCacheStats {
@@ -133,10 +154,12 @@ func VectorCacheAnalytics() VectorCacheStats {
 
 // vecQueryCacheEnabled reports whether the opt-in result cache is active. When
 // it is off (the default), the search path skips hashing the query vector.
+// Lock-free atomic read — called on every VEC_SEARCH invocation, so it must
+// not contend with concurrent searches on other goroutines; see the
+// cacheEnabled field comment on vecQueryCacheState for why this is safe
+// without the mutex.
 func vecQueryCacheEnabled() bool {
-	vecQueryCacheState.Lock()
-	defer vecQueryCacheState.Unlock()
-	return vecQueryCacheState.cfg.ResultCacheEntries > 0 && vecQueryCacheState.cfg.ResultCacheTTL > 0
+	return vecQueryCacheState.cacheEnabled.Load()
 }
 
 func vecQueryKey(tenant string, tableName, colName string, version int, a vecSearchArgs) vecQueryCacheKey {
@@ -203,8 +226,19 @@ func purgeVecQueryCacheFor(tenant, table string) {
 }
 
 func recordVecQuery(event VectorQueryEvent) {
+	// Fast path: analytics is off by default, so the overwhelmingly common
+	// call (every VEC_SEARCH invocation makes one) skips the mutex entirely.
+	// See the analyticsEnabled field comment on vecQueryCacheState.
+	if !vecQueryCacheState.analyticsEnabled.Load() {
+		return
+	}
 	vecQueryCacheState.Lock()
 	defer vecQueryCacheState.Unlock()
+	// Re-check under the lock: cfg is the sole source of truth. A concurrent
+	// ConfigureVectorCache call may have disabled analytics between the
+	// atomic load above and acquiring the lock here; without this recheck an
+	// in-flight call could resurrect vecQueryCacheState.events right after
+	// ConfigureVectorCache had just cleared it to nil.
 	if !vecQueryCacheState.cfg.Analytics {
 		return
 	}

@@ -1027,6 +1027,89 @@ func TestVecSearchResultCacheAndAnalytics(t *testing.T) {
 	}
 }
 
+// TestVecSearchConcurrentWithCacheReconfiguration races many concurrent
+// VEC_SEARCH callers against concurrent ConfigureVectorCache calls that
+// flip the result cache and analytics on and off. It exists to guard the
+// lock-free atomic.Bool fast path in vecQueryCacheEnabled/recordVecQuery
+// (vector_query_cache.go): those functions read cacheEnabled/analyticsEnabled
+// without the mutex, so a wrong implementation could plausibly corrupt
+// vecQueryCacheState.entries/events under exactly this interleaving even
+// though neither TestVecSearchResultCacheAndAnalytics above (sequential) nor
+// TestVecQueryCacheExpiryWithSynctest (no concurrent Configure calls)
+// exercises that interleaving. Without -race available in every environment
+// this repo is built in, this test still catches the outward symptoms a
+// broken fast path would produce: panics, wrong VEC_SEARCH results, or an
+// impossible (negative, or over the configured max) analytics snapshot.
+func TestVecSearchConcurrentWithCacheReconfiguration(t *testing.T) {
+	ConfigureVectorCache(VectorCacheConfig{})
+	t.Cleanup(func() { ConfigureVectorCache(VectorCacheConfig{}) })
+
+	db := setupTestDB()
+	execSQL(t, db, `CREATE TABLE concurrent_vectors (id INT, embedding VECTOR)`)
+	execSQL(t, db, `INSERT INTO concurrent_vectors VALUES (1, '[1.0, 0.0]'), (2, '[0.0, 1.0]')`)
+	q := `SELECT id FROM VEC_SEARCH('concurrent_vectors', 'embedding', '[1.0, 0.0]', 1, 'cosine', 'flat')`
+
+	const (
+		searchers  = 16
+		configurers = 4
+		duration   = 200 * time.Millisecond
+	)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	wg.Add(searchers)
+	for i := 0; i < searchers; i++ {
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				rs := execSQL(t, db, q)
+				if len(rs.Rows) != 1 {
+					t.Errorf("expected 1 row, got %d", len(rs.Rows))
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Add(configurers)
+	for i := 0; i < configurers; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if i%2 == 0 {
+					ConfigureVectorCache(VectorCacheConfig{ResultCacheEntries: 8, ResultCacheTTL: time.Minute, Analytics: true, AnalyticsWindow: time.Minute, AnalyticsMaxEvents: 8})
+				} else {
+					ConfigureVectorCache(VectorCacheConfig{})
+				}
+				_ = VectorCacheAnalytics()
+			}
+		}()
+	}
+
+	time.Sleep(duration)
+	close(stop)
+	wg.Wait()
+
+	stats := VectorCacheAnalytics()
+	if stats.Hits > uint64(searchers)*1_000_000 || stats.Misses > uint64(searchers)*1_000_000 {
+		t.Fatalf("implausible analytics snapshot after concurrent run: %#v", stats)
+	}
+	if len(stats.RecentQueries) > 8 {
+		t.Fatalf("analytics events exceeded configured max: got %d, want <= 8", len(stats.RecentQueries))
+	}
+}
+
 func mustVecJSON(t *testing.T, vec []float64) string {
 	t.Helper()
 	b, err := json.Marshal(vec)
