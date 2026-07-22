@@ -126,3 +126,38 @@ func TestSecondaryIndexMixedNumericEqualityFallsBackToCorrectScan(t *testing.T) 
 		}
 	}
 }
+
+func TestPrimaryKeyConstraintIndexPointSeek(t *testing.T) {
+	db := storage.NewDB()
+	executeIndexSQL(t, db, `CREATE TABLE users (id INT PRIMARY KEY, name TEXT)`)
+	executeIndexSQL(t, db, `INSERT INTO users VALUES (1, 'Ada'), (2, 'Grace'), (3, 'Linus')`)
+
+	stmt := mustParse(`SELECT name FROM users WHERE id = 2`).(*Select)
+	plan, ok, err := buildSimpleSelectPlan(ExecEnv{ctx: context.Background(), tenant: "default", db: db}, stmt)
+	if err != nil || !ok {
+		t.Fatalf("primary-key plan = %#v, ok=%v, err=%v", plan, ok, err)
+	}
+	if plan.scanType != "CONSTRAINT INDEX POINT SEEK" || plan.indexName != "id" || len(plan.rowIDs) != 1 || plan.rowIDs[0] != 1 {
+		t.Fatalf("primary-key access path = %#v", plan)
+	}
+
+	rs, err := Execute(context.Background(), db, "default", stmt)
+	if err != nil || len(rs.Rows) != 1 || rs.Rows[0]["name"] != "Grace" {
+		t.Fatalf("primary-key lookup = %#v, err=%v", rs, err)
+	}
+
+	// 2.0 compares equal to the stored integer 2. The constraint seek merges
+	// compatible numeric buckets, preserving SQL's numeric equality semantics.
+	floatStmt := mustParse(`SELECT name FROM users WHERE id = 2.0`).(*Select)
+	floatPlan, ok, err := buildSimpleSelectPlan(ExecEnv{ctx: context.Background(), tenant: "default", db: db}, floatStmt)
+	if err != nil || !ok {
+		t.Fatalf("numeric compatibility plan = %#v, ok=%v, err=%v", floatPlan, ok, err)
+	}
+	if floatPlan.scanType != "CONSTRAINT INDEX POINT SEEK" || len(floatPlan.rowIDs) != 1 || floatPlan.rowIDs[0] != 1 {
+		t.Fatalf("numeric compatibility access path = %#v", floatPlan)
+	}
+	rs, err = Execute(context.Background(), db, "default", floatStmt)
+	if err != nil || len(rs.Rows) != 1 || rs.Rows[0]["name"] != "Grace" {
+		t.Fatalf("numeric compatibility lookup = %#v, err=%v", rs, err)
+	}
+}

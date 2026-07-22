@@ -1050,9 +1050,9 @@ func TestVecSearchConcurrentWithCacheReconfiguration(t *testing.T) {
 	q := `SELECT id FROM VEC_SEARCH('concurrent_vectors', 'embedding', '[1.0, 0.0]', 1, 'cosine', 'flat')`
 
 	const (
-		searchers  = 16
+		searchers   = 16
 		configurers = 4
-		duration   = 200 * time.Millisecond
+		duration    = 200 * time.Millisecond
 	)
 	stop := make(chan struct{})
 	var wg sync.WaitGroup

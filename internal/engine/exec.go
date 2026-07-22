@@ -4213,6 +4213,16 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 		plan.residualFilter = residual
 		plan.coveringIndex = projectionsCoveredByIndex(plan.projs, idx, table)
 		plan.estimatedRows = len(rowIDs)
+	} else if rowIDs, column, residual, ok := selectConstraintIndex(table, plan.colIndex, s.Where); ok {
+		// PRIMARY KEY and UNIQUE enforcement already maintains this hash index
+		// incrementally for DML. Reusing it here avoids a full table scan for
+		// the common key lookup shape without adding another persistent index.
+		plan.rowIDs = rowIDs
+		plan.scanType = "CONSTRAINT INDEX POINT SEEK"
+		plan.indexName = column
+		plan.indexPredicates = []string{column + " = ?"}
+		plan.residualFilter = residual
+		plan.estimatedRows = len(rowIDs)
 	}
 	return &plan, true, nil
 }
@@ -4451,6 +4461,84 @@ func selectSecondaryIndex(table *storage.Table, colIndex map[string]int, where E
 		return nil, nil, nil, false
 	}
 	return chosen, values, predicates, totalTerms != len(values)
+}
+
+// selectConstraintIndex finds a single-column PRIMARY KEY or UNIQUE equality
+// predicate that can reuse the in-memory constraint index. Constraint indexes
+// are hash maps, so unlike materialized secondary indexes they only support
+// complete point lookups. The normal raw filter still runs over the located
+// rows, preserving residual predicates and SQL's three-valued logic.
+func selectConstraintIndex(table *storage.Table, colIndex map[string]int, where Expr) ([]int, string, bool, bool) {
+	if table == nil || where == nil {
+		return nil, "", false, false
+	}
+	equalities := make(map[int]any)
+	totalTerms := collectEqualityTerms(where, colIndex, equalities)
+	for colIdx, value := range equalities {
+		if colIdx < 0 || colIdx >= len(table.Cols) {
+			continue
+		}
+		column := table.Cols[colIdx]
+		if column.Constraint != storage.PrimaryKey && column.Constraint != storage.Unique {
+			continue
+		}
+		rows := lookupConstraintIndexRows(getConstraintIndex(table, colIdx), value)
+		return rows, column.Name, totalTerms != 1, true
+	}
+	return nil, "", false, false
+}
+
+// lookupConstraintIndexRows returns every bucket that rawEqual could consider
+// equal to value. The constraint hash map keeps int, int64, and float64 as
+// separate Go keys, while SQL equality deliberately treats their numerically
+// equal values as identical. Merging at most three buckets preserves that SQL
+// behavior without falling back to a full scan.
+func lookupConstraintIndexRows(index *constraintIndexEntry, value any) []int {
+	if index == nil {
+		return nil
+	}
+	buckets := make([][]int, 0, 3)
+	add := func(v any) {
+		if rows := index.rows[comparableKeyPart(v)]; len(rows) > 0 {
+			buckets = append(buckets, rows)
+		}
+	}
+	add(value)
+	switch v := value.(type) {
+	case int:
+		add(int64(v))
+		add(float64(v))
+	case int64:
+		if int64(int(v)) == v {
+			add(int(v))
+		}
+		add(float64(v))
+	case float64:
+		if !math.IsNaN(v) {
+			if float64(int(v)) == v {
+				add(int(v))
+			}
+			if float64(int64(v)) == v {
+				add(int64(v))
+			}
+		}
+	}
+	if len(buckets) == 0 {
+		return nil
+	}
+	if len(buckets) == 1 {
+		return buckets[0]
+	}
+	rowCount := 0
+	for _, bucket := range buckets {
+		rowCount += len(bucket)
+	}
+	rows := make([]int, 0, rowCount)
+	for _, bucket := range buckets {
+		rows = append(rows, bucket...)
+	}
+	sort.Ints(rows) // preserve the observable table-scan order
+	return rows
 }
 
 func isNumericSQLValue(value any) bool {

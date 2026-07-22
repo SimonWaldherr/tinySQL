@@ -397,7 +397,7 @@ func openTinyPointQuery(mode storage.StorageMode) func(b *testing.B) pointQueryO
 
 		return pointQueryOps{
 			populate: func(n int) {
-				stmt, _ := tinysql.ParseSQL("CREATE TABLE IF NOT EXISTS t (id INT, name STRING, score FLOAT64)")
+				stmt, _ := tinysql.ParseSQL("CREATE TABLE IF NOT EXISTS t (id INT PRIMARY KEY, name STRING, score FLOAT64)")
 				tinysql.Execute(ctx, db, "default", stmt)
 				for i := 0; i < n; i++ {
 					ins, _ := tinysql.ParseSQL(fmt.Sprintf(
