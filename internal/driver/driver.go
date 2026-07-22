@@ -525,6 +525,7 @@ type conn struct {
 	txBase     *storage.DB // Snapshot base used for conflict detection
 	shadow     *storage.DB // Snapshot copy (MVCC-light)
 	txReadOnly bool        // Active tx requested as read-only
+	txDirty    bool        // A successful write ran against shadow.
 }
 
 func (c *conn) Prepare(query string) (driver.Stmt, error) {
@@ -538,6 +539,9 @@ func (c *conn) Close() error              { c.srv.saveIfNeeded(); return nil }
 func (c *conn) Begin() (driver.Tx, error) { return c.BeginTx(context.Background(), driver.TxOptions{}) }
 
 func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	if c.inTx {
+		return nil, fmt.Errorf("tinysql: transaction already active")
+	}
 	// Only the default isolation level is supported; other levels are rejected.
 	switch opts.Isolation {
 	case driver.IsolationLevel(0): // Default
@@ -554,6 +558,7 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 		c.txBase = nil
 		c.shadow = nil
 		c.txReadOnly = true
+		c.txDirty = false
 		return &tx{c: c}, nil
 	}
 
@@ -579,6 +584,7 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 	c.txBase = base
 	c.shadow = shadow
 	c.txReadOnly = opts.ReadOnly
+	c.txDirty = false
 	return &tx{c: c}, nil
 }
 
@@ -612,10 +618,13 @@ func (c *conn) commitTx() error {
 	// clone (shadow != nil, txBase == nil). Either way there is nothing to
 	// commit, so skip the writer lock and change-collection entirely.
 	if c.txReadOnly {
-		c.inTx = false
-		c.txBase = nil
-		c.shadow = nil
-		c.txReadOnly = false
+		c.clearTxState()
+		return nil
+	}
+	// A BEGIN/COMMIT pair with no successful write cannot change the shared
+	// database, so it needs neither the writer slot nor change collection.
+	if !c.txDirty {
+		c.clearTxState()
 		return nil
 	}
 	if c.shadow == nil {
@@ -632,10 +641,7 @@ func (c *conn) commitTx() error {
 	newDB := c.shadow
 	changes := storage.CollectWALChanges(c.txBase, newDB)
 	if err := c.detectTxConflicts(oldDB, changes); err != nil {
-		c.inTx = false
-		c.txBase = nil
-		c.shadow = nil
-		c.txReadOnly = false
+		c.clearTxState()
 		return err
 	}
 	wal := oldDB.WAL()
@@ -657,10 +663,7 @@ func (c *conn) commitTx() error {
 	}
 	c.srv.saveIfNeeded()
 
-	c.inTx = false
-	c.txBase = nil
-	c.shadow = nil
-	c.txReadOnly = false
+	c.clearTxState()
 	return nil
 }
 
@@ -689,11 +692,16 @@ func (c *conn) rollbackTx() error {
 	if !c.inTx {
 		return fmt.Errorf("tinysql: no active transaction")
 	}
+	c.clearTxState()
+	return nil
+}
+
+func (c *conn) clearTxState() {
 	c.inTx = false
 	c.txBase = nil
 	c.shadow = nil
 	c.txReadOnly = false
-	return nil
+	c.txDirty = false
 }
 
 // ------------------- exec / query -------------------
@@ -887,6 +895,14 @@ func (c *conn) execTransactionControl(ctx context.Context, sqlStr string) (drive
 			return nil, true, err
 		}
 		return driver.RowsAffected(0), true, nil
+	case "BEGIN READ ONLY", "BEGIN TRANSACTION READ ONLY", "START TRANSACTION READ ONLY":
+		if c.inTx {
+			return nil, true, fmt.Errorf("tinysql: transaction already active")
+		}
+		if _, err := c.BeginTx(ctx, driver.TxOptions{ReadOnly: true}); err != nil {
+			return nil, true, err
+		}
+		return driver.RowsAffected(0), true, nil
 	case "COMMIT", "COMMIT TRANSACTION":
 		if err := c.commitTx(); err != nil {
 			return nil, true, err
@@ -969,6 +985,7 @@ func (c *conn) execStatement(ctx context.Context, st engine.Statement) (driver.R
 				return nil, err
 			}
 			rs = r
+			c.txDirty = true
 		} else {
 			if err := c.srv.acquireWriter(ctx); err != nil {
 				return nil, err

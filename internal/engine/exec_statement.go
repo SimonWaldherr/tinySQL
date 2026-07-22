@@ -81,8 +81,8 @@ func appendOnlySnapshotTarget(db *storage.DB, tenant string, stmt Statement) (st
 		return "", false
 	}
 	catalog := db.Catalog()
-	if len(catalog.GetTriggers(s.Table, storage.TriggerTiming("BEFORE"), storage.TriggerEvent("INSERT"))) > 0 ||
-		len(catalog.GetTriggers(s.Table, storage.TriggerTiming("AFTER"), storage.TriggerEvent("INSERT"))) > 0 {
+	before, after := catalog.GetTriggersForEvent(s.Table, storage.TriggerInsert)
+	if len(before) > 0 || len(after) > 0 {
 		return "", false
 	}
 	table, err := db.Get(tenant, s.Table)
@@ -122,8 +122,8 @@ func tableScopedSnapshotTarget(db *storage.DB, tenant string, stmt Statement) (s
 		return "", false
 	}
 	catalog := db.Catalog()
-	if len(catalog.GetTriggers(table, storage.TriggerTiming("BEFORE"), event)) > 0 ||
-		len(catalog.GetTriggers(table, storage.TriggerTiming("AFTER"), event)) > 0 {
+	before, after := catalog.GetTriggersForEvent(table, event)
+	if len(before) > 0 || len(after) > 0 {
 		return "", false
 	}
 	return table, true

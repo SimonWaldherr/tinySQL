@@ -90,6 +90,40 @@ func TestSelectStarFastPathOrderByAndLimit(t *testing.T) {
 	expectInt(t, rs.Rows[0]["id"], 6, "offset rank0.id")
 }
 
+func TestSelectFloatOrderByLimitFastPath(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+	if _, err := Execute(ctx, db, "default", mustParse(`CREATE TABLE t (id INT, score FLOAT)`)); err != nil {
+		t.Fatal(err)
+	}
+	for _, values := range []string{"(1, 1.5)", "(2, 9.5)", "(3, 4.0)", "(4, 7.0)"} {
+		if _, err := Execute(ctx, db, "default", mustParse(`INSERT INTO t VALUES `+values)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	stmt := mustParse(`SELECT id, score FROM t ORDER BY score DESC LIMIT 2 OFFSET 1`).(*Select)
+	plan, ok, err := buildSimpleSelectPlan(ExecEnv{ctx: ctx, tenant: "default", db: db}, stmt)
+	if err != nil || !ok {
+		t.Fatalf("float ordered plan = %#v, ok=%v, err=%v", plan, ok, err)
+	}
+	column, ok := simpleFloatOrderColumn(plan)
+	if !ok || column != 1 {
+		t.Fatalf("float order column = %d, %v; want 1, true", column, ok)
+	}
+
+	rs, handled, err := executeSimpleSelectOrderedFastPath(ExecEnv{ctx: ctx, tenant: "default", db: db}, plan)
+	if err != nil || !handled {
+		t.Fatalf("float ordered fast path = %#v, handled=%v, err=%v", rs, handled, err)
+	}
+	if len(rs.Rows) != 2 {
+		t.Fatalf("row count = %d, want 2", len(rs.Rows))
+	}
+	// Descending scores are 9.5, 7.0, 4.0, 1.5; OFFSET 1 starts at id 4.
+	expectInt(t, rs.Rows[0]["id"], 4, "float order offset row")
+	expectInt(t, rs.Rows[1]["id"], 3, "float order final row")
+}
+
 func TestSelectStarFastPathUnfilteredLimitOffset(t *testing.T) {
 	db := storage.NewDB()
 	execSQL(t, db, `CREATE TABLE t (id INT)`)

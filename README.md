@@ -61,6 +61,10 @@ func main() {
   window functions, PIVOT, EXPLAIN, and common SQLite-compatible PRAGMAs.
 - Views, materialized views, triggers, table-valued functions, system catalog
   views, job scheduling, and multi-tenancy.
+- Row triggers support `BEFORE`/`AFTER` INSERT, UPDATE, and DELETE, including
+  `DELETE FROM table` without a WHERE clause. Trigger side effects participate
+  in the surrounding statement's rollback; recursive chains stop safely after
+  32 nested executions.
 - Constraints: single-column PRIMARY KEY, UNIQUE, and FOREIGN KEY with
   referential actions, plus `NOT NULL` and literal `DEFAULT` values.
 - SQLite-style type declarations and affinities, including `INTEGER`, `REAL`,
@@ -79,6 +83,16 @@ func main() {
 - Direct multi-row `INSERT`, `UPDATE`, and `DELETE` are statement-atomic,
   including trigger side effects; materialized secondary indexes are updated
   incrementally instead of rebuilt after each mutation.
+- The `database/sql` driver supports snapshot-based cross-statement
+  transactions with `BEGIN`, `COMMIT`, and `ROLLBACK` (or Go's `BeginTx`).
+  `BEGIN [TRANSACTION] READ ONLY` rejects writes while retaining a stable read
+  snapshot; concurrent writes to the same changed table are reported as a
+  retryable transaction conflict.
+- Common hot paths use specialized raw execution where it is safe: direct
+  `ORDER BY FLOAT ... LIMIT` pagination, simple aggregates, JOIN/WHERE filter
+  pushdown, and triggerless INSERTs. See [BENCHMARKS.md](./BENCHMARKS.md) for
+  scope, fallback rules, and reproducible measurements; run
+  `make bench-hotpaths` for the focused local suite.
 - Browser WASM demos run the engine directly in the browser. Their loaders use
   a pre-compressed `.wasm.gz` artifact when the browser supports streaming
   decompression and fall back to the regular `.wasm` file.
@@ -114,6 +128,48 @@ and `Exists`/`NotExists` subquery predicates. See the executable
 [`ExampleExists`](./example_exists_test.go) and
 [`Example_viewsAndMaterializedViews`](./view_examples_test.go) for complete
 examples.
+
+## Transactions and triggers
+
+Use the standard Go driver for transactions that span several statements. A
+transaction sees its own writes; a conflicting concurrent commit on the same
+changed table returns a retryable transaction-conflict error. `SAVEPOINT` is
+not implemented.
+
+```go
+import (
+    "context"
+    "errors"
+
+    tsqldriver "github.com/SimonWaldherr/tinySQL/driver"
+)
+
+db, err := tsqldriver.OpenInMemory("default")
+if err != nil {
+    panic(err)
+}
+defer db.Close()
+
+tx, err := db.BeginTx(context.Background(), nil)
+if err != nil {
+    panic(err)
+}
+if _, err = tx.Exec(`INSERT INTO users VALUES (2, 'Bob')`); err != nil {
+    _ = tx.Rollback()
+    panic(err)
+}
+if err = tx.Commit(); err != nil {
+    if errors.Is(err, tsqldriver.ErrTransactionConflict) {
+        panic("retry transaction")
+    }
+    panic(err)
+}
+```
+
+For SQL-issued read snapshots, use `BEGIN READ ONLY` (also accepted as
+`BEGIN TRANSACTION READ ONLY`) followed by `COMMIT` or `ROLLBACK`. Row
+triggers run for each affected row, including a WHERE-less DELETE; all writes
+performed by their bodies are rolled back if the outer statement fails.
 
 ## Optional import profiles
 
@@ -297,7 +353,8 @@ TinySQL is not a PostgreSQL/MySQL replacement. Important current limits:
 - Single-process database engine; no built-in replication, clustering,
   failover, sharding, or distributed transactions.
 - Direct multi-row `INSERT`, `UPDATE`, and `DELETE` statements are atomic,
-  including their trigger side effects. Cross-statement transactions and
+  including their trigger side effects. Cross-statement transactions are
+  available through the `database/sql` driver; nested transactions and
   `SAVEPOINT` are not implemented.
 - No composite primary keys or composite foreign keys.
 - No CHECK constraints, UPSERT/ON CONFLICT, SAVEPOINT, ATTACH/DETACH, VACUUM,

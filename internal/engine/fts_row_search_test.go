@@ -158,11 +158,10 @@ func TestRowToTextEnablesWholeRowLike(t *testing.T) {
 	}
 }
 
-func TestRowToTextBypassesRawFastPathCorrectly(t *testing.T) {
-	// A single-table, no-join query is exactly the shape that would be
-	// eligible for the raw/fast execution path. If ROW_TO_TEXT() were not
-	// excluded from it, the raw path would evaluate it against an empty
-	// substituted row and every comparison would silently return false.
+func TestRowToTextUsesRawFastPathCorrectly(t *testing.T) {
+	// A single-table whole-row predicate can now use the raw path. It must
+	// preserve ROW_TO_TEXT's output rather than evaluating against the empty
+	// placeholder row used by ordinary raw function calls.
 	db := storage.NewDB()
 	ctx := context.Background()
 	Execute(ctx, db, "default", mustParse(`CREATE TABLE t (id INT, note TEXT)`))
@@ -170,9 +169,27 @@ func TestRowToTextBypassesRawFastPathCorrectly(t *testing.T) {
 		s := strconv.Itoa(i)
 		Execute(ctx, db, "default", mustParse(`INSERT INTO t VALUES (`+s+`, 'note-`+s+`')`))
 	}
-	rs := execSQL(t, db, `SELECT id FROM t WHERE ROW_TO_TEXT() LIKE '%note-7%'`)
+	stmt := mustParse(`SELECT id FROM t WHERE ROW_TO_TEXT() LIKE '%note-7%'`).(*Select)
+	plan, ok, err := buildSimpleSelectPlan(ExecEnv{ctx: ctx, tenant: "default", db: db}, stmt)
+	if err != nil || !ok {
+		t.Fatalf("ROW_TO_TEXT raw plan = %#v, ok=%v, err=%v", plan, ok, err)
+	}
+	rs, err := Execute(ctx, db, "default", stmt)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(rs.Rows) == 0 {
-		t.Fatal("ROW_TO_TEXT() returned no matches — likely evaluated against an empty row in the raw fast path")
+		t.Fatal("ROW_TO_TEXT() returned no matches from the raw fast path")
+	}
+
+	// ROW_TO_TEXT's observable order is sorted by unqualified column name,
+	// rather than storage position. Verify the raw implementation keeps that
+	// behavior both in a WHERE predicate and as a projected value.
+	execSQL(t, db, `CREATE TABLE row_text_order (zeta TEXT, alpha TEXT)`)
+	execSQL(t, db, `INSERT INTO row_text_order VALUES ('z', 'a')`)
+	rs = execSQL(t, db, `SELECT ROW_TO_TEXT() AS text FROM row_text_order WHERE ROW_TO_TEXT() LIKE 'a z'`)
+	if len(rs.Rows) != 1 || rs.Rows[0]["text"] != "a z" {
+		t.Fatalf("raw ROW_TO_TEXT order = %#v, want a z", rs.Rows)
 	}
 }
 

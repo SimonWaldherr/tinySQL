@@ -994,6 +994,28 @@ func TestSQLTransactionControlCommands(t *testing.T) {
 	}
 }
 
+func TestSQLBeginReadOnly(t *testing.T) {
+	d := &drv{}
+	rawConn, err := d.Open("mem://")
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	c := rawConn.(*conn)
+	ctx := context.Background()
+	if _, err := c.ExecContext(ctx, "CREATE TABLE tx_read_only (id INT)", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ExecContext(ctx, "BEGIN TRANSACTION READ ONLY", nil); err != nil {
+		t.Fatalf("BEGIN READ ONLY failed: %v", err)
+	}
+	if _, err := c.ExecContext(ctx, "INSERT INTO tx_read_only VALUES (1)", nil); err == nil || !strings.Contains(err.Error(), "read-only transaction") {
+		t.Fatalf("write error = %v, want read-only transaction", err)
+	}
+	if _, err := c.ExecContext(ctx, "ROLLBACK", nil); err != nil {
+		t.Fatalf("ROLLBACK failed: %v", err)
+	}
+}
+
 func TestTransactionCommitMergesUnrelatedConcurrentChanges(t *testing.T) {
 	s := newServer(storage.NewDB(), cfg{})
 	d := &drv{srv: s}

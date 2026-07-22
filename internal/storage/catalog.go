@@ -906,6 +906,27 @@ func (c *CatalogManager) GetTriggers(table string, timing TriggerTiming, event T
 	return out
 }
 
+// GetTriggersForEvent returns the BEFORE and AFTER row-trigger lists for one
+// table/event pair while holding the catalog lock only once. DML executors
+// resolve both timings together before entering their row loop, avoiding two
+// full catalog scans per statement and any lookup work per affected row.
+func (c *CatalogManager) GetTriggersForEvent(table string, event TriggerEvent) (before, after []*CatalogTrigger) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, t := range c.triggers {
+		if !strings.EqualFold(t.Table, table) || t.Event != event {
+			continue
+		}
+		switch t.Timing {
+		case TriggerBefore:
+			before = append(before, t)
+		case TriggerAfter:
+			after = append(after, t)
+		}
+	}
+	return before, after
+}
+
 // ListTriggers returns all registered trigger definitions.
 func (c *CatalogManager) ListTriggers() []*CatalogTrigger {
 	c.mu.RLock()

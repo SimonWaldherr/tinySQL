@@ -8,7 +8,7 @@ SHELL := /usr/bin/env bash
 .PHONY: build-gh-pages-demo update-gh-pages push-gh-pages
 .PHONY: test-all test-unit test-integration test-jsonv2 coverage build-check verify verify-ci
 .PHONY: test-query-files test-query-files-wasm test-fsql
-.PHONY: run-wasm-browser run-wasm-node-demo deps update-deps tidy bench script-lint docker-build info
+.PHONY: run-wasm-browser run-wasm-node-demo deps update-deps tidy bench bench-engine bench-hotpaths script-lint docker-build info
 .DEFAULT_GOAL := help
 
 # Variables
@@ -21,6 +21,7 @@ LDFLAGS := -ldflags "-X main.Version=$(VERSION)"
 GO_BUILD_FLAGS := $(GOFLAGS) $(LDFLAGS)
 GO_TEST_FLAGS ?= -v
 COVERPROFILE ?= coverage.out
+BENCH_COUNT ?= 3
 WASM_BROWSER_SCRIPT := ./$(CMD_DIR)/wasm_browser/build.sh
 WASM_NODE_SCRIPT := ./$(CMD_DIR)/wasm_node/build.sh
 QUERY_FILES_DIR := ./$(CMD_DIR)/query_files
@@ -233,6 +234,17 @@ coverage: test-all
 bench:
 	@echo "$(GREEN)Running benchmarks...$(NC)"
 	$(GO) test -bench=. -benchmem ./...
+
+## bench-engine: Run all execution-engine microbenchmarks
+bench-engine:
+	@echo "$(GREEN)Running engine benchmarks...$(NC)"
+	$(GO) test -run=none -bench=. -benchmem ./internal/engine
+
+## bench-hotpaths: Benchmark optimized SELECT, INSERT, and trigger hot paths
+bench-hotpaths:
+	@echo "$(GREEN)Running hot-path benchmarks ($(BENCH_COUNT)x)...$(NC)"
+	$(GO) test -run=none -bench='^(BenchmarkOrderByWithLimit|BenchmarkInsertIntoLargePKTable|BenchmarkTriggerBatchInsert)$$' -benchmem -count=$(BENCH_COUNT) ./internal/engine
+	$(GO) test -run=none -bench='^BenchmarkExecute_Insert$$' -benchmem -count=$(BENCH_COUNT) .
 
 ## lint: Run linter (golangci-lint)
 lint:

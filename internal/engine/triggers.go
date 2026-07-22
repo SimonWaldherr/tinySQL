@@ -30,7 +30,13 @@ type triggerWhenCacheEntry struct {
 // executeDropTrigger), but this cap is a backstop against unbounded growth
 // from deployments that keep churning through distinct trigger names without
 // ever dropping the old ones.
-const triggerCacheMaxEntries = 256
+const (
+	triggerCacheMaxEntries = 256
+	// maxTriggerDepth prevents a self-referential trigger chain from growing
+	// the Go stack until the process fails. Nested triggers share ExecEnv, so
+	// the limit covers both direct and indirect recursion.
+	maxTriggerDepth = 32
+)
 
 var (
 	triggerCacheMu   sync.RWMutex
@@ -93,9 +99,21 @@ func executeDropTrigger(env ExecEnv, s *DropTrigger) (*ResultSet, error) {
 // newRow contains the NEW pseudo-row values (for INSERT/UPDATE).
 // oldRow contains the OLD pseudo-row values (for UPDATE/DELETE).
 func fireTriggers(env ExecEnv, table string, timing string, event string, newRow Row, oldRow Row) error {
-	triggers := env.db.Catalog().GetTriggers(table,
-		storage.TriggerTiming(timing),
-		storage.TriggerEvent(event))
+	before, after := env.db.Catalog().GetTriggersForEvent(table, storage.TriggerEvent(event))
+	var triggers []*storage.CatalogTrigger
+	switch storage.TriggerTiming(timing) {
+	case storage.TriggerBefore:
+		triggers = before
+	case storage.TriggerAfter:
+		triggers = after
+	}
+	return fireTriggerList(env, triggers, newRow, oldRow)
+}
+
+// fireTriggerList runs a list resolved before the DML row loop. Trigger
+// definitions cannot change while the outer statement holds the write lock,
+// so reusing this list prevents catalog scans and slice allocations per row.
+func fireTriggerList(env ExecEnv, triggers []*storage.CatalogTrigger, newRow Row, oldRow Row) error {
 	if len(triggers) == 0 {
 		return nil
 	}
@@ -111,6 +129,11 @@ func fireTriggers(env ExecEnv, table string, timing string, event string, newRow
 // executeTrigger runs a single trigger's body in an enriched environment that
 // exposes NEW.<col> and OLD.<col> pseudo-columns.
 func executeTrigger(env ExecEnv, trig *storage.CatalogTrigger, newRow Row, oldRow Row) error {
+	if env.triggerDepth >= maxTriggerDepth {
+		return fmt.Errorf("maximum trigger nesting depth (%d) exceeded", maxTriggerDepth)
+	}
+	env.triggerDepth++
+
 	// Build an enriched row with new.col and old.col
 	trigRow := make(Row)
 	for k, v := range newRow {
@@ -174,9 +197,12 @@ func cacheTriggerBody(name, body string, stmts []Statement) {
 func triggerBodyStatements(trig *storage.CatalogTrigger) ([]Statement, error) {
 	triggerCacheMu.RLock()
 	if cached, ok := triggerBodyCache[trig.Name]; ok && cached.body == trig.Body {
-		stmts := append([]Statement(nil), cached.stmts...)
 		triggerCacheMu.RUnlock()
-		return stmts, nil
+		// The cached slice and parsed ASTs are read-only during execution;
+		// query-plan caches embedded in statements synchronize their own
+		// mutable state. Returning it directly removes one allocation for
+		// every fired trigger.
+		return cached.stmts, nil
 	}
 	triggerCacheMu.RUnlock()
 
@@ -185,7 +211,7 @@ func triggerBodyStatements(trig *storage.CatalogTrigger) ([]Statement, error) {
 		return nil, err
 	}
 	cacheTriggerBody(trig.Name, trig.Body, stmts)
-	return append([]Statement(nil), stmts...), nil
+	return stmts, nil
 }
 
 // cacheTriggerWhen caches a compiled WHEN expression under the owning

@@ -13,6 +13,10 @@ import "strings"
 type StatementSnapshot struct {
 	tables  map[string]map[string]tableState
 	catalog diskCatalog
+	// appendOnly is the compact rollback state for a triggerless, index-free
+	// INSERT. Keeping it outside tables avoids allocating two small maps for
+	// every ordinary INSERT while preserving the same in-place restore path.
+	appendOnly *appendOnlyTableState
 	// full is false for a table-scoped snapshot. Such snapshots restore only
 	// the table that the statement can mutate, leaving unrelated tables in
 	// place. This avoids cloning an entire database for ordinary DML.
@@ -20,15 +24,15 @@ type StatementSnapshot struct {
 }
 
 type tableState struct {
-	table      *Table
-	state      *Table
-	appendOnly *appendOnlyTableState
+	table *Table
+	state *Table
 }
 
 // appendOnlyTableState is the minimal rollback point for an INSERT that can
 // only append rows. It deliberately avoids copying existing rows; callers
 // must ensure that no secondary index or other side effect is mutated.
 type appendOnlyTableState struct {
+	table     *Table
 	rowCount  int
 	version   int
 	stats     *TableStats
@@ -92,18 +96,13 @@ func (db *DB) SnapshotForAppendOnlyTableStatement(tenant, name string) (*Stateme
 	if err != nil {
 		return nil, err
 	}
-	key := strings.ToLower(table.Name)
 	return &StatementSnapshot{
-		tables: map[string]map[string]tableState{
-			tenant: {key: {
-				table: table,
-				appendOnly: &appendOnlyTableState{
-					rowCount:  len(table.Rows),
-					version:   table.Version,
-					stats:     cloneTableStats(table.Stats),
-					dirtyFrom: table.dirtyFrom,
-				},
-			}},
+		appendOnly: &appendOnlyTableState{
+			table:     table,
+			rowCount:  len(table.Rows),
+			version:   table.Version,
+			stats:     cloneTableStats(table.Stats),
+			dirtyFrom: table.dirtyFrom,
 		},
 		catalog: catalogToDisk(db.Catalog()),
 	}, nil
@@ -118,7 +117,9 @@ func (db *DB) RestoreStatementSnapshot(snapshot *StatementSnapshot) {
 	}
 
 	db.mu.Lock()
-	if snapshot.full {
+	if snapshot.appendOnly != nil {
+		restoreAppendOnlyTable(snapshot.appendOnly)
+	} else if snapshot.full {
 		restored := make(map[string]*tenantDB, len(snapshot.tables))
 		for tenant, tables := range snapshot.tables {
 			tenantDB := &tenantDB{tables: make(map[string]*Table, len(tables))}
@@ -147,19 +148,18 @@ func (db *DB) RestoreStatementSnapshot(snapshot *StatementSnapshot) {
 }
 
 func restoreStatementTable(saved tableState) {
-	if saved.appendOnly != nil {
-		table := saved.table
-		state := saved.appendOnly
-		if table == nil {
-			return
-		}
-		table.Rows = table.Rows[:state.rowCount:state.rowCount]
-		table.Version = state.version
-		table.Stats = cloneTableStats(state.stats)
-		table.dirtyFrom = state.dirtyFrom
+	restoreTable(saved.table, saved.state)
+}
+
+func restoreAppendOnlyTable(state *appendOnlyTableState) {
+	if state == nil || state.table == nil {
 		return
 	}
-	restoreTable(saved.table, saved.state)
+	table := state.table
+	table.Rows = table.Rows[:state.rowCount:state.rowCount]
+	table.Version = state.version
+	table.Stats = cloneTableStats(state.stats)
+	table.dirtyFrom = state.dirtyFrom
 }
 
 // CollectWALChangesFromSnapshot computes the same per-table change set as

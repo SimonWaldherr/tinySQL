@@ -169,6 +169,32 @@ func TestAggregateFastPathMultipleGroupColumnsWithSeparatorValues(t *testing.T) 
 	}
 }
 
+func TestAggregateFastPathSingleGroupPreservesValueTypes(t *testing.T) {
+	// The single-column fast path uses a string key internally for allocation-
+	// free lookups. Its key must retain the old map[any] type distinction: raw
+	// int, int64, float64, and NULL values are separate SQL groups here.
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE typed_groups (grp INT)`)
+	table, err := db.Get("default", "typed_groups")
+	if err != nil {
+		t.Fatalf("get table: %v", err)
+	}
+	table.Rows = [][]any{
+		{int(1)}, {int(1)},
+		{int64(1)}, {int64(1)},
+		{float64(1)}, {float64(1)},
+		{nil}, {nil},
+	}
+
+	rs := execSQL(t, db, `SELECT grp, COUNT(*) AS count FROM typed_groups GROUP BY grp`)
+	if len(rs.Rows) != 4 {
+		t.Fatalf("groups = %#v, want four type-distinct groups", rs.Rows)
+	}
+	for _, row := range rs.Rows {
+		expectInt(t, row["count"], 2, "typed group count")
+	}
+}
+
 func TestAggregateFastPathWithWhere(t *testing.T) {
 	db := setupOrdersTable(t)
 	rs := execSQL(t, db, `
@@ -187,6 +213,64 @@ func TestAggregateFastPathWithWhere(t *testing.T) {
 	expectFloat(t, byCustomer[2]["total"], 40, 1e-9, "sum cust 2 filtered")
 	// customer 3: 100 qualifies
 	expectFloat(t, byCustomer[3]["total"], 100, 1e-9, "sum cust 3 filtered")
+}
+
+func TestAggregateFastPathHaving(t *testing.T) {
+	db := setupOrdersTable(t)
+	stmt := mustParse(`
+		SELECT customer_id, COUNT(*) AS count, SUM(amount) AS total
+		FROM orders
+		GROUP BY customer_id
+		HAVING COUNT(*) >= 2 AND SUM(amount) >= 45
+	`).(*Select)
+	plan, ok, err := buildSimpleAggregatePlan(ExecEnv{ctx: context.Background(), tenant: "default", db: db}, stmt)
+	if err != nil || !ok {
+		t.Fatalf("HAVING aggregate plan = %#v, ok=%v, err=%v", plan, ok, err)
+	}
+
+	rs := execSQL(t, db, `
+		SELECT customer_id, COUNT(*) AS count, SUM(amount) AS total
+		FROM orders
+		GROUP BY customer_id
+		HAVING COUNT(*) >= 2 AND SUM(amount) >= 45
+	`)
+	if len(rs.Rows) != 1 {
+		t.Fatalf("HAVING rows = %#v, want one", rs.Rows)
+	}
+	row := rs.Rows[0]
+	expectInt(t, row["customer_id"], 2, "customer id")
+	expectInt(t, row["count"], 3, "count")
+	expectFloat(t, row["total"], 45, 1e-9, "total")
+}
+
+func TestAggregateFastPathOrderByLimit(t *testing.T) {
+	db := setupOrdersTable(t)
+	stmt := mustParse(`
+		SELECT customer_id, SUM(amount) AS total
+		FROM orders
+		GROUP BY customer_id
+		ORDER BY total DESC
+		LIMIT 2 OFFSET 1
+	`).(*Select)
+	plan, ok, err := buildSimpleAggregatePlan(ExecEnv{ctx: context.Background(), tenant: "default", db: db}, stmt)
+	if err != nil || !ok {
+		t.Fatalf("ordered aggregate plan = %#v, ok=%v, err=%v", plan, ok, err)
+	}
+
+	rs := execSQL(t, db, `
+		SELECT customer_id, SUM(amount) AS total
+		FROM orders
+		GROUP BY customer_id
+		ORDER BY total DESC
+		LIMIT 2 OFFSET 1
+	`)
+	if len(rs.Rows) != 2 {
+		t.Fatalf("ordered aggregate rows = %#v, want two", rs.Rows)
+	}
+	expectInt(t, rs.Rows[0]["customer_id"], 2, "first customer id")
+	expectFloat(t, rs.Rows[0]["total"], 45, 1e-9, "first total")
+	expectInt(t, rs.Rows[1]["customer_id"], 1, "second customer id")
+	expectFloat(t, rs.Rows[1]["total"], 30, 1e-9, "second total")
 }
 
 // TestAggregateFastPathDecimalSum verifies that SUM/AVG over raw *big.Rat

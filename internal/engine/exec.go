@@ -103,6 +103,10 @@ type ExecEnv struct {
 	// NEW.col/OLD.col resolve even though the body statement's own row
 	// context (e.g. an INSERT's VALUES row) has no such columns.
 	triggerRow Row
+	// triggerDepth is incremented for nested trigger bodies. It is deliberately
+	// part of the value-style execution environment so child statements inherit
+	// the current depth without any process-global state.
+	triggerDepth int
 	// statementWAL is shared by nested DML (for example trigger bodies) so
 	// AdvancedWAL emits a single commit only after the outer statement has
 	// completed successfully.
@@ -564,15 +568,13 @@ func executeInsert(env ExecEnv, s *Insert) (*ResultSet, error) {
 func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) (*ResultSet, error) {
 	expected := len(t.Cols)
 	returningRows := make([]Row, 0, len(s.Rows))
-	// buildTableRow allocates a map(2*len(cols)) per call; GetTriggers takes
-	// a catalog RLock per call. Both were previously paid unconditionally on
-	// every inserted row even when there were no triggers and no RETURNING
-	// to consume the built row — hoist the trigger-existence check and
-	// column-name slice out of the loop, and skip the row-map build entirely
-	// when nothing will use it.
+	// buildTableRow allocates a map(2*len(cols)); resolve both timing lists
+	// once before the row loop and skip that map entirely when neither triggers
+	// nor RETURNING needs it.
 	tablePrefix := strings.ToLower(s.Table) + "."
-	hasBefore := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("BEFORE"), storage.TriggerEvent("INSERT"))) > 0
-	hasAfter := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("AFTER"), storage.TriggerEvent("INSERT"))) > 0
+	beforeTriggers, afterTriggers := env.db.Catalog().GetTriggersForEvent(s.Table, storage.TriggerInsert)
+	hasBefore := len(beforeTriggers) > 0
+	hasAfter := len(afterTriggers) > 0
 	needsRow := hasBefore || hasAfter || len(s.Returning) > 0
 	wal, err := beginWALAuto(env, s.Table)
 	if err != nil {
@@ -608,7 +610,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 			newRow = buildTableRow(t.Cols, tablePrefix, row)
 		}
 		if hasBefore {
-			if err := fireTriggers(env, s.Table, "BEFORE", "INSERT", newRow, nil); err != nil {
+			if err := fireTriggerList(env, beforeTriggers, newRow, nil); err != nil {
 				return nil, err
 			}
 		}
@@ -620,7 +622,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 			return nil, err
 		}
 		if hasAfter {
-			if err := fireTriggers(env, s.Table, "AFTER", "INSERT", newRow, nil); err != nil {
+			if err := fireTriggerList(env, afterTriggers, newRow, nil); err != nil {
 				return nil, err
 			}
 		}
@@ -652,8 +654,9 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	}
 	returningRows := make([]Row, 0, len(s.Rows))
 	tablePrefix := strings.ToLower(s.Table) + "."
-	hasBefore := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("BEFORE"), storage.TriggerEvent("INSERT"))) > 0
-	hasAfter := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("AFTER"), storage.TriggerEvent("INSERT"))) > 0
+	beforeTriggers, afterTriggers := env.db.Catalog().GetTriggersForEvent(s.Table, storage.TriggerInsert)
+	hasBefore := len(beforeTriggers) > 0
+	hasAfter := len(afterTriggers) > 0
 	needsRow := hasBefore || hasAfter || len(s.Returning) > 0
 	wal, err := beginWALAuto(env, s.Table)
 	if err != nil {
@@ -692,7 +695,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			newRow = buildTableRow(t.Cols, tablePrefix, row)
 		}
 		if hasBefore {
-			if err := fireTriggers(env, s.Table, "BEFORE", "INSERT", newRow, nil); err != nil {
+			if err := fireTriggerList(env, beforeTriggers, newRow, nil); err != nil {
 				return nil, err
 			}
 		}
@@ -704,7 +707,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			return nil, err
 		}
 		if hasAfter {
-			if err := fireTriggers(env, s.Table, "AFTER", "INSERT", newRow, nil); err != nil {
+			if err := fireTriggerList(env, afterTriggers, newRow, nil); err != nil {
 				return nil, err
 			}
 		}
@@ -936,8 +939,9 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 	n := 0
 	returningRows := make([]Row, 0)
 	tablePrefix := strings.ToLower(s.Table) + "."
-	hasBefore := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("BEFORE"), storage.TriggerEvent("UPDATE"))) > 0
-	hasAfter := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("AFTER"), storage.TriggerEvent("UPDATE"))) > 0
+	beforeTriggers, afterTriggers := env.db.Catalog().GetTriggersForEvent(s.Table, storage.TriggerUpdate)
+	hasBefore := len(beforeTriggers) > 0
+	hasAfter := len(afterTriggers) > 0
 	needsNewRow := hasAfter || len(s.Returning) > 0
 	wal, err := beginWALAuto(env, s.Table)
 	if err != nil {
@@ -962,7 +966,7 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 			// map from the same data.
 			oldRow := row
 			if hasBefore {
-				if err := fireTriggers(env, s.Table, "BEFORE", "UPDATE", row, oldRow); err != nil {
+				if err := fireTriggerList(env, beforeTriggers, row, oldRow); err != nil {
 					return nil, err
 				}
 			}
@@ -998,7 +1002,7 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 				newRow = buildTableRow(t.Cols, tablePrefix, t.Rows[ri])
 			}
 			if hasAfter {
-				if err := fireTriggers(env, s.Table, "AFTER", "UPDATE", newRow, oldRow); err != nil {
+				if err := fireTriggerList(env, afterTriggers, newRow, oldRow); err != nil {
 					return nil, err
 				}
 			}
@@ -1044,7 +1048,7 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 		return nil, ok, err
 	}
 
-	rawPlan := &simpleSelectPlan{colIndex: plan.colIndex, where: plan.where, filter: buildRawFilter(plan.colIndex, plan.where)}
+	rawPlan := &simpleSelectPlan{table: plan.table, colIndex: plan.colIndex, where: plan.where, filter: buildRawFilter(plan.colIndex, plan.where), rowTextCols: rawRowTextColumns(plan.colIndex)}
 	updated := 0
 	values := make([]any, len(plan.sets))
 	wal, err := beginWALAuto(env, s.Table)
@@ -1112,8 +1116,8 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 }
 
 func buildSimpleUpdatePlan(env ExecEnv, s *Update) (*simpleUpdatePlan, bool, error) {
-	if len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("BEFORE"), storage.TriggerEvent("UPDATE"))) > 0 ||
-		len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("AFTER"), storage.TriggerEvent("UPDATE"))) > 0 {
+	before, after := env.db.Catalog().GetTriggersForEvent(s.Table, storage.TriggerUpdate)
+	if len(before) > 0 || len(after) > 0 {
 		return nil, false, nil
 	}
 	if !isSimpleRawPredicate(s.Where) {
@@ -1160,7 +1164,11 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	if err != nil {
 		return nil, err
 	}
-	if s.Where == nil {
+	beforeDelTriggers, afterDelTriggers := env.db.Catalog().GetTriggersForEvent(s.Table, storage.TriggerDelete)
+	hasTriggers := len(beforeDelTriggers) > 0 || len(afterDelTriggers) > 0
+	// A DELETE without WHERE is still row-triggered. Preserve the compact
+	// whole-table path only when no trigger can observe individual OLD rows.
+	if s.Where == nil && !hasTriggers {
 		del := len(t.Rows)
 		if len(s.Returning) > 0 {
 			tablePrefix := strings.ToLower(s.Table) + "."
@@ -1206,11 +1214,9 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	}
 
 	// Fast path: no triggers and a simple predicate – skip the full Row map allocation.
-	hasTriggers := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("BEFORE"), storage.TriggerEvent("DELETE"))) > 0 ||
-		len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("AFTER"), storage.TriggerEvent("DELETE"))) > 0
 	if !hasTriggers && len(s.Returning) == 0 && isSimpleRawPredicate(s.Where) {
 		colIndex := simpleColumnIndex(t, s.Table)
-		rawPlan := &simpleSelectPlan{colIndex: colIndex, where: s.Where, filter: buildRawFilter(colIndex, s.Where)}
+		rawPlan := &simpleSelectPlan{table: t, colIndex: colIndex, where: s.Where, filter: buildRawFilter(colIndex, s.Where), rowTextCols: rawRowTextColumns(colIndex)}
 		kept := make([][]any, 0, len(t.Rows))
 		oldToNew := make(map[int]int, len(t.Rows))
 		del := 0
@@ -1254,23 +1260,27 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	del := 0
 	returningRows := make([]Row, 0)
 	tablePrefix := strings.ToLower(s.Table) + "."
-	hasBeforeDel := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("BEFORE"), storage.TriggerEvent("DELETE"))) > 0
-	hasAfterDel := len(env.db.Catalog().GetTriggers(s.Table, storage.TriggerTiming("AFTER"), storage.TriggerEvent("DELETE"))) > 0
+	hasBeforeDel := len(beforeDelTriggers) > 0
+	hasAfterDel := len(afterDelTriggers) > 0
 	for i, r := range t.Rows {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
 		}
 		row := buildTableRow(t.Cols, tablePrefix, r)
-		v, err := evalExpr(env, s.Where, row)
-		if err != nil {
-			return nil, err
+		match := true
+		if s.Where != nil {
+			v, err := evalExpr(env, s.Where, row)
+			if err != nil {
+				return nil, err
+			}
+			match = toTri(v) == tvTrue
 		}
-		if toTri(v) != tvTrue {
+		if !match {
 			oldToNew[i] = len(kept)
 			kept = append(kept, r)
 		} else {
 			if hasBeforeDel {
-				if err := fireTriggers(env, s.Table, "BEFORE", "DELETE", nil, row); err != nil {
+				if err := fireTriggerList(env, beforeDelTriggers, nil, row); err != nil {
 					return nil, err
 				}
 			}
@@ -1278,7 +1288,7 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 				return nil, err
 			}
 			if hasAfterDel {
-				if err := fireTriggers(env, s.Table, "AFTER", "DELETE", nil, row); err != nil {
+				if err := fireTriggerList(env, afterDelTriggers, nil, row); err != nil {
 					return nil, err
 				}
 			}
@@ -2251,6 +2261,10 @@ type simpleSelectPlan struct {
 	offset     *int
 	outputCols []string
 	rowMapCap  int
+	// rowTextCols contains raw column positions in the same sorted-name order
+	// as ROW_TO_TEXT's Row-map implementation. It is prepared once per plan so
+	// ROW_TO_TEXT predicates do not need to materialize a Row map per input.
+	rowTextCols []int
 	// rowIDs is nil for a table scan. A non-nil slice is a materialized
 	// secondary-index point/prefix seek and contains table row positions.
 	rowIDs []int
@@ -2298,15 +2312,17 @@ type simpleProjection struct {
 }
 
 type simpleJoinPlan struct {
-	left       *storage.Table
-	right      *storage.Table
-	leftIndex  map[string]int
-	rightIndex map[string]int
-	leftKey    int
-	rightKey   int
-	where      Expr
-	projs      []simpleProjection
-	outputCols []string
+	left        *storage.Table
+	right       *storage.Table
+	leftIndex   map[string]int
+	rightIndex  map[string]int
+	leftKey     int
+	rightKey    int
+	where       Expr
+	leftFilter  func([]any) (bool, error)
+	rightFilter func([]any) (bool, error)
+	projs       []simpleProjection
+	outputCols  []string
 }
 
 func executeSimpleJoinFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error) {
@@ -2317,6 +2333,15 @@ func executeSimpleJoinFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error)
 
 	rightByKey := make(map[any][][]any, len(plan.right.Rows))
 	for _, right := range plan.right.Rows {
+		if plan.rightFilter != nil {
+			match, err := plan.rightFilter(right)
+			if err != nil {
+				return nil, true, err
+			}
+			if !match {
+				continue
+			}
+		}
 		key := comparableKeyPart(right[plan.rightKey])
 		rightByKey[key] = append(rightByKey[key], right)
 	}
@@ -2327,6 +2352,15 @@ func executeSimpleJoinFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error)
 		if i&63 == 0 {
 			if err := checkCtx(env.ctx); err != nil {
 				return nil, true, err
+			}
+		}
+		if plan.leftFilter != nil {
+			match, err := plan.leftFilter(left)
+			if err != nil {
+				return nil, true, err
+			}
+			if !match {
+				continue
 			}
 		}
 		matches := rightByKey[comparableKeyPart(left[plan.leftKey])]
@@ -2379,7 +2413,7 @@ func buildSimpleJoinPlan(env ExecEnv, s *Select) (*simpleJoinPlan, bool, error) 
 		return nil, false, nil
 	}
 
-	return &simpleJoinPlan{
+	plan := &simpleJoinPlan{
 		left:       left,
 		right:      right,
 		leftIndex:  leftIndex,
@@ -2389,7 +2423,197 @@ func buildSimpleJoinPlan(env ExecEnv, s *Select) (*simpleJoinPlan, bool, error) 
 		where:      s.Where,
 		projs:      projs,
 		outputCols: outputCols,
-	}, true, nil
+	}
+	plan.leftFilter, plan.rightFilter, plan.where = buildSimpleJoinFilters(s.Where, leftIndex, rightIndex)
+	return plan, true, nil
+}
+
+// buildSimpleJoinFilters pushes safe, single-table AND terms below an inner
+// hash join. Only specialized raw filters are pushed: they have the same
+// "true keeps, false/unknown rejects" behavior as WHERE while avoiding
+// user-defined expression errors on rows that would never join. All other
+// terms remain in plan.where and are evaluated after a key match.
+func buildSimpleJoinFilters(where Expr, leftIndex, rightIndex map[string]int) (func([]any) (bool, error), func([]any) (bool, error), Expr) {
+	var leftTerms, rightTerms, residualTerms []Expr
+	collectSimpleJoinFilterTerms(where, leftIndex, rightIndex, &leftTerms, &rightTerms, &residualTerms)
+	leftFilter, leftResidual := buildSimpleJoinSideFilter(leftIndex, leftTerms)
+	rightFilter, rightResidual := buildSimpleJoinSideFilter(rightIndex, rightTerms)
+	residualTerms = append(residualTerms, leftResidual...)
+	residualTerms = append(residualTerms, rightResidual...)
+	return leftFilter, rightFilter, joinAndTerms(residualTerms)
+}
+
+// collectSimpleJoinFilterTerms only splits AND expressions. OR and all other
+// expression shapes stay intact; a whole expression is pushed only when it
+// references exactly one input side.
+func collectSimpleJoinFilterTerms(e Expr, leftIndex, rightIndex map[string]int, leftTerms, rightTerms, residualTerms *[]Expr) {
+	if e == nil {
+		return
+	}
+	if binary, ok := e.(*Binary); ok && binary.Op == "AND" {
+		collectSimpleJoinFilterTerms(binary.Left, leftIndex, rightIndex, leftTerms, rightTerms, residualTerms)
+		collectSimpleJoinFilterTerms(binary.Right, leftIndex, rightIndex, leftTerms, rightTerms, residualTerms)
+		return
+	}
+	switch simpleJoinExprSide(e, leftIndex, rightIndex) {
+	case 1:
+		*leftTerms = append(*leftTerms, e)
+	case 2:
+		*rightTerms = append(*rightTerms, e)
+	default:
+		*residualTerms = append(*residualTerms, e)
+	}
+}
+
+// simpleJoinExprSide returns a bit set: 1=left, 2=right. Literal-only
+// expressions return zero and remain residual so their existing evaluation
+// timing and errors are unchanged.
+func simpleJoinExprSide(e Expr, leftIndex, rightIndex map[string]int) uint8 {
+	switch ex := e.(type) {
+	case nil, *Literal:
+		return 0
+	case *VarRef:
+		name := ex.Lower
+		if name == "" {
+			name = strings.ToLower(ex.Name)
+		}
+		_, left := leftIndex[name]
+		_, right := rightIndex[name]
+		if left && !right {
+			return 1
+		}
+		if right && !left {
+			return 2
+		}
+		return 3
+	case *Unary:
+		return simpleJoinExprSide(ex.Expr, leftIndex, rightIndex)
+	case *IsNull:
+		return simpleJoinExprSide(ex.Expr, leftIndex, rightIndex)
+	case *Binary:
+		return simpleJoinExprSide(ex.Left, leftIndex, rightIndex) | simpleJoinExprSide(ex.Right, leftIndex, rightIndex)
+	case *LikeExpr:
+		return simpleJoinExprSide(ex.Expr, leftIndex, rightIndex) |
+			simpleJoinExprSide(ex.Pattern, leftIndex, rightIndex) |
+			simpleJoinExprSide(ex.Escape, leftIndex, rightIndex)
+	case *RegexpExpr:
+		return simpleJoinExprSide(ex.Expr, leftIndex, rightIndex) | simpleJoinExprSide(ex.Pattern, leftIndex, rightIndex)
+	case *BetweenExpr:
+		return simpleJoinExprSide(ex.Expr, leftIndex, rightIndex) |
+			simpleJoinExprSide(ex.Lo, leftIndex, rightIndex) |
+			simpleJoinExprSide(ex.Hi, leftIndex, rightIndex)
+	case *InExpr:
+		side := simpleJoinExprSide(ex.Expr, leftIndex, rightIndex)
+		for _, value := range ex.Values {
+			side |= simpleJoinExprSide(value, leftIndex, rightIndex)
+		}
+		return side
+	default:
+		return 3
+	}
+}
+
+func buildSimpleJoinSideFilter(colIndex map[string]int, terms []Expr) (func([]any) (bool, error), []Expr) {
+	filters := make([]func([]any) (bool, error), 0, len(terms))
+	residual := make([]Expr, 0, len(terms))
+	for _, term := range terms {
+		if !simpleJoinPushdownSafe(term) {
+			residual = append(residual, term)
+			continue
+		}
+		filter := buildRawFilterSpecialized(colIndex, term)
+		if filter == nil {
+			residual = append(residual, term)
+			continue
+		}
+		filters = append(filters, filter)
+	}
+	if len(filters) == 0 {
+		return nil, residual
+	}
+	return func(raw []any) (bool, error) {
+		for _, filter := range filters {
+			match, err := filter(raw)
+			if err != nil || !match {
+				return false, err
+			}
+		}
+		return true, nil
+	}, residual
+}
+
+// simpleJoinPushdownSafe accepts only specialized filters that cannot surface
+// a per-row comparison/type error before the join finds a matching pair.
+// This keeps error timing and behavior of unusual expressions on the general
+// residual path intact.
+func simpleJoinPushdownSafe(e Expr) bool {
+	switch ex := e.(type) {
+	case *VarRef:
+		return true
+	case *IsNull:
+		_, ok := ex.Expr.(*VarRef)
+		return ok
+	case *Binary:
+		switch ex.Op {
+		case "AND", "OR":
+			return simpleJoinPushdownSafe(ex.Left) && simpleJoinPushdownSafe(ex.Right)
+		case "=", "!=", "<>":
+			return simpleJoinColumnLiteralComparison(ex.Left, ex.Right) || simpleJoinColumnLiteralComparison(ex.Right, ex.Left)
+		case "<", "<=", ">", ">=":
+			return simpleJoinOrderComparison(ex.Left, ex.Right) || simpleJoinOrderComparison(ex.Right, ex.Left)
+		}
+	case *LikeExpr:
+		_, ref := ex.Expr.(*VarRef)
+		_, pattern := ex.Pattern.(*Literal)
+		return ref && pattern && ex.Escape == nil
+	case *RegexpExpr:
+		_, ref := ex.Expr.(*VarRef)
+		_, pattern := ex.Pattern.(*Literal)
+		return ref && pattern
+	case *InExpr:
+		if _, ok := ex.Expr.(*VarRef); !ok {
+			return false
+		}
+		for _, value := range ex.Values {
+			if _, ok := value.(*Literal); !ok {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func simpleJoinColumnLiteralComparison(left, right Expr) bool {
+	_, ref := left.(*VarRef)
+	_, literal := right.(*Literal)
+	return ref && literal
+}
+
+func simpleJoinOrderComparison(left, right Expr) bool {
+	_, ref := left.(*VarRef)
+	literal, ok := right.(*Literal)
+	if !ref || !ok {
+		return false
+	}
+	switch literal.Val.(type) {
+	case int, int64, float64, string:
+		return true
+	default:
+		return false
+	}
+}
+
+func joinAndTerms(terms []Expr) Expr {
+	var out Expr
+	for _, term := range terms {
+		if out == nil {
+			out = term
+			continue
+		}
+		out = &Binary{Op: "AND", Left: out, Right: term}
+	}
+	return out
 }
 
 func simpleJoinSelectEligible(s *Select) bool {
@@ -2792,6 +3016,10 @@ type simpleAggregatePlan struct {
 	colIndex   map[string]int
 	groupCols  []int
 	where      Expr
+	having     Expr
+	orderBy    []OrderItem
+	limit      *int
+	offset     *int
 	projs      []simpleAggregateProjection
 	outputCols []string
 }
@@ -2841,7 +3069,7 @@ func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 		return nil, ok, err
 	}
 
-	rawPlan := &simpleSelectPlan{colIndex: plan.colIndex, where: plan.where, filter: buildRawFilter(plan.colIndex, plan.where)}
+	rawPlan := &simpleSelectPlan{table: plan.table, colIndex: plan.colIndex, where: plan.where, filter: buildRawFilter(plan.colIndex, plan.where), rowTextCols: rawRowTextColumns(plan.colIndex)}
 	if len(plan.groupCols) == 1 {
 		return executeSimpleSingleGroupAggregate(env, plan, rawPlan)
 	}
@@ -2849,9 +3077,16 @@ func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 }
 
 func executeSimpleSingleGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, rawPlan *simpleSelectPlan) (*ResultSet, bool, error) {
-	groups := make(map[any]*simpleAggregateState)
+	// A map[any] looks natural here, but converting a string group value from
+	// a row into an interface makes it escape on every lookup.  On a large
+	// text GROUP BY that turns one otherwise allocation-free scan into one
+	// allocation per input row.  Use the same framed key representation as the
+	// multi-column path instead: string(keyBuf) is allocation-free for a map
+	// lookup, while a stable string is materialized only for a new group.
+	groups := make(map[string]*simpleAggregateState)
 	order := make([]*simpleAggregateState, 0)
 	groupCol := plan.groupCols[0]
+	keyBuf := make([]byte, 0, 32)
 	for i, raw := range plan.table.Rows {
 		// Check context cancellation every 64 rows to reduce channel-select overhead.
 		if i&63 == 0 {
@@ -2868,18 +3103,19 @@ func executeSimpleSingleGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, r
 		}
 
 		groupValue := raw[groupCol]
-		key := comparableKeyPart(groupValue)
-		state, exists := groups[key]
+		keyBuf = writeSingleGroupKey(keyBuf[:0], groupValue)
+		state, exists := groups[string(keyBuf)]
 		if !exists {
 			state = newSimpleAggregateState([]any{groupValue}, len(plan.projs))
-			groups[key] = state
+			groups[string(keyBuf)] = state
 			order = append(order, state)
 		}
 		if err := accumulateSimpleAggregateState(env, rawPlan, raw, state, plan.projs); err != nil {
 			return nil, true, err
 		}
 	}
-	return simpleAggregateResultSet(plan, order), true, nil
+	rs, err := finalizeSimpleAggregateResultSet(env, plan, order)
+	return rs, true, err
 }
 
 func executeSimpleMultiGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, rawPlan *simpleSelectPlan) (*ResultSet, bool, error) {
@@ -2928,7 +3164,8 @@ func executeSimpleMultiGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, ra
 			return nil, true, err
 		}
 	}
-	return simpleAggregateResultSet(plan, order), true, nil
+	rs, err := finalizeSimpleAggregateResultSet(env, plan, order)
+	return rs, true, err
 }
 
 func newSimpleAggregateState(groupValues []any, projections int) *simpleAggregateState {
@@ -3015,41 +3252,241 @@ func accumulateSimpleAggregateState(env ExecEnv, rawPlan *simpleSelectPlan, raw 
 	return nil
 }
 
+// finalizeSimpleAggregateResultSet applies a supported HAVING expression to
+// aggregate states before materializing result maps. This preserves the raw
+// scan for common HAVING clauses such as COUNT(*) > 10 instead of falling
+// back to rowsFromTable and allocating a Row map for every input row.
+func finalizeSimpleAggregateResultSet(env ExecEnv, plan *simpleAggregatePlan, order []*simpleAggregateState) (*ResultSet, error) {
+	if plan.having != nil {
+		kept := order[:0]
+		for i, state := range order {
+			if i&63 == 0 {
+				if err := checkCtx(env.ctx); err != nil {
+					return nil, err
+				}
+			}
+			match, err := evalSimpleAggregateHaving(env, plan, state, plan.having)
+			if err != nil {
+				return nil, err
+			}
+			if match {
+				kept = append(kept, state)
+			}
+		}
+		order = kept
+	}
+	result := simpleAggregateResultSet(plan, order)
+	if len(plan.orderBy) > 0 {
+		result.Rows = applySortOrderWithLimit(plan.orderBy, result.Rows, plan.limit, plan.offset)
+	}
+	result.Rows = applyOffsetLimit(&Select{Limit: plan.limit, Offset: plan.offset}, result.Rows)
+	return result, nil
+}
+
 func simpleAggregateResultSet(plan *simpleAggregatePlan, order []*simpleAggregateState) *ResultSet {
 	outRows := make([]Row, 0, len(order))
 	for _, state := range order {
 		out := make(Row, len(plan.projs))
 		for i, proj := range plan.projs {
-			switch proj.kind {
-			case aggGroupCol:
-				putVal(out, proj.name, state.groupValues[proj.groupIndex])
-			case aggCount:
-				putVal(out, proj.name, state.counts[i])
-			case aggSum:
-				if state.useRat != nil && state.useRat[i] {
-					putVal(out, proj.name, state.sumRat[i])
-				} else {
-					putVal(out, proj.name, state.sumFloat[i])
-				}
-			case aggAvg:
-				if state.counts[i] == 0 {
-					putVal(out, proj.name, nil)
-				} else if state.useRat != nil && state.useRat[i] {
-					putVal(out, proj.name, new(big.Rat).Quo(state.sumRat[i], big.NewRat(int64(state.counts[i]), 1)))
-				} else {
-					putVal(out, proj.name, state.sumFloat[i]/float64(state.counts[i]))
-				}
-			case aggMin, aggMax:
-				if state.haveMinMax[i] {
-					putVal(out, proj.name, state.minmax[i])
-				} else {
-					putVal(out, proj.name, nil)
-				}
-			}
+			putVal(out, proj.name, simpleAggregateProjectionValue(state, proj, i))
 		}
 		outRows = append(outRows, out)
 	}
 	return &ResultSet{Cols: plan.outputCols, Rows: outRows}
+}
+
+func simpleAggregateProjectionValue(state *simpleAggregateState, proj simpleAggregateProjection, i int) any {
+	switch proj.kind {
+	case aggGroupCol:
+		return state.groupValues[proj.groupIndex]
+	case aggCount:
+		return state.counts[i]
+	case aggSum:
+		if state.useRat != nil && state.useRat[i] {
+			return state.sumRat[i]
+		}
+		return state.sumFloat[i]
+	case aggAvg:
+		if state.counts[i] == 0 {
+			return nil
+		}
+		if state.useRat != nil && state.useRat[i] {
+			return new(big.Rat).Quo(state.sumRat[i], big.NewRat(int64(state.counts[i]), 1))
+		}
+		return state.sumFloat[i] / float64(state.counts[i])
+	case aggMin, aggMax:
+		if state.haveMinMax[i] {
+			return state.minmax[i]
+		}
+	}
+	return nil
+}
+
+// simpleAggregateHavingSupported limits the HAVING fast path to expressions
+// whose values are available from the aggregate state. Queries outside this
+// subset continue through the general aggregate evaluator unchanged.
+func simpleAggregateHavingSupported(plan *simpleAggregatePlan, e Expr) bool {
+	switch ex := e.(type) {
+	case *Literal:
+		return true
+	case *VarRef:
+		_, ok := simpleAggregateGroupValue(plan, nil, ex)
+		return ok
+	case *FuncCall:
+		_, ok := simpleAggregateProjectionForFunc(plan, ex)
+		return ok
+	case *Unary:
+		return (ex.Op == "+" || ex.Op == "-" || ex.Op == "NOT") && simpleAggregateHavingSupported(plan, ex.Expr)
+	case *Binary:
+		return (ex.Op == "AND" || ex.Op == "OR" || isComparisonOp(ex.Op) || isArithmeticOp(ex.Op)) &&
+			simpleAggregateHavingSupported(plan, ex.Left) && simpleAggregateHavingSupported(plan, ex.Right)
+	case *IsNull:
+		return simpleAggregateHavingSupported(plan, ex.Expr)
+	default:
+		return false
+	}
+}
+
+// evalSimpleAggregateHaving first binds grouped-column and aggregate values
+// from state into literals, then delegates the SQL operators to evalExpr. The
+// latter keeps NULL and three-valued-logic behavior identical to the general
+// aggregate path without materializing source rows as Row maps.
+func evalSimpleAggregateHaving(env ExecEnv, plan *simpleAggregatePlan, state *simpleAggregateState, e Expr) (bool, error) {
+	bound, ok, err := bindSimpleAggregateHaving(plan, state, e)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, fmt.Errorf("unsupported HAVING expression in simple aggregate plan")
+	}
+	v, err := evalExpr(env, bound, Row{})
+	if err != nil {
+		return false, err
+	}
+	return toTri(v) == tvTrue, nil
+}
+
+func bindSimpleAggregateHaving(plan *simpleAggregatePlan, state *simpleAggregateState, e Expr) (Expr, bool, error) {
+	switch ex := e.(type) {
+	case *Literal:
+		return ex, true, nil
+	case *VarRef:
+		value, ok := simpleAggregateGroupValue(plan, state, ex)
+		if !ok {
+			return nil, false, nil
+		}
+		return &Literal{Val: value}, true, nil
+	case *FuncCall:
+		idx, ok := simpleAggregateProjectionForFunc(plan, ex)
+		if !ok {
+			return nil, false, nil
+		}
+		return &Literal{Val: simpleAggregateProjectionValue(state, plan.projs[idx], idx)}, true, nil
+	case *Unary:
+		inner, ok, err := bindSimpleAggregateHaving(plan, state, ex.Expr)
+		if err != nil || !ok {
+			return nil, ok, err
+		}
+		return &Unary{Op: ex.Op, Expr: inner}, true, nil
+	case *Binary:
+		left, ok, err := bindSimpleAggregateHaving(plan, state, ex.Left)
+		if err != nil || !ok {
+			return nil, ok, err
+		}
+		right, ok, err := bindSimpleAggregateHaving(plan, state, ex.Right)
+		if err != nil || !ok {
+			return nil, ok, err
+		}
+		return &Binary{Op: ex.Op, Left: left, Right: right}, true, nil
+	case *IsNull:
+		inner, ok, err := bindSimpleAggregateHaving(plan, state, ex.Expr)
+		if err != nil || !ok {
+			return nil, ok, err
+		}
+		return &IsNull{Expr: inner, Negate: ex.Negate}, true, nil
+	default:
+		return nil, false, nil
+	}
+}
+
+func simpleAggregateGroupValue(plan *simpleAggregatePlan, state *simpleAggregateState, ref *VarRef) (any, bool) {
+	name := ref.Lower
+	if name == "" {
+		name = strings.ToLower(ref.Name)
+	}
+	col, ok := plan.colIndex[name]
+	if !ok {
+		return nil, false
+	}
+	for i, groupCol := range plan.groupCols {
+		if groupCol == col {
+			if state == nil {
+				return nil, true
+			}
+			return state.groupValues[i], true
+		}
+	}
+	return nil, false
+}
+
+func simpleAggregateProjectionForFunc(plan *simpleAggregatePlan, fc *FuncCall) (int, bool) {
+	if fc == nil || fc.Distinct || fc.Over != nil {
+		return 0, false
+	}
+	var kind aggKind
+	switch fc.Name {
+	case "COUNT":
+		kind = aggCount
+		if fc.Star {
+			if len(fc.Args) != 0 {
+				return 0, false
+			}
+		} else if len(fc.Args) != 1 {
+			return 0, false
+		}
+	case "SUM":
+		kind = aggSum
+	case "AVG":
+		kind = aggAvg
+	case "MIN":
+		kind = aggMin
+	case "MAX":
+		kind = aggMax
+	default:
+		return 0, false
+	}
+	if kind != aggCount && (fc.Star || len(fc.Args) != 1) {
+		return 0, false
+	}
+	var arg Expr
+	if !fc.Star {
+		arg = fc.Args[0]
+	}
+	for i, proj := range plan.projs {
+		if proj.kind == kind && simpleAggregateArgumentsEqual(proj.arg, arg) {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// simpleAggregateArgumentsEqual deliberately accepts only the direct column
+// and literal expressions that dominate HAVING clauses. More complex
+// aggregate arguments safely use the established general path.
+func simpleAggregateArgumentsEqual(left, right Expr) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	switch l := left.(type) {
+	case *VarRef:
+		r, ok := right.(*VarRef)
+		return ok && strings.EqualFold(l.Name, r.Name)
+	case *Literal:
+		r, ok := right.(*Literal)
+		return ok && l.Parameter == r.Parameter && rawEqual(l.Val, r.Val)
+	default:
+		return false
+	}
 }
 
 func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, bool, error) {
@@ -3099,19 +3536,27 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 	if !eligible || !hasAgg {
 		return nil, false, nil
 	}
-	return &simpleAggregatePlan{
+	plan := &simpleAggregatePlan{
 		table:      table,
 		colIndex:   colIndex,
 		groupCols:  groupCols,
 		where:      s.Where,
+		having:     s.Having,
+		orderBy:    s.OrderBy,
+		limit:      s.Limit,
+		offset:     s.Offset,
 		projs:      projs,
 		outputCols: outputCols,
-	}, true, nil
+	}
+	if plan.having != nil && !simpleAggregateHavingSupported(plan, plan.having) {
+		return nil, false, nil
+	}
+	return plan, true, nil
 }
 
 func simpleAggregateEligibleSelect(s *Select) bool {
 	return !s.Distinct && len(s.DistinctOn) <= 0 && len(s.CTEs) <= 0 && len(s.Joins) <= 0 &&
-		s.Having == nil && s.Union == nil && len(s.OrderBy) <= 0 && s.Limit == nil && s.Offset == nil &&
+		s.Union == nil &&
 		s.From.Table != "" && s.From.Subquery == nil && s.From.TableFunc == nil && len(s.GroupBy) > 0 &&
 		s.Pivot == nil && !isSQLiteSchemaTable(s.From.Table)
 }
@@ -3308,6 +3753,151 @@ type orderedRawRow struct {
 	keys []any
 }
 
+// floatOrderedRawRow is the narrow top-N representation for ORDER BY on a
+// physical FLOAT/FLOAT64 column. Keeping the sort key unboxed avoids the
+// generic compare/type-switch path for every heap comparison. It is used only
+// after simpleFloatOrderColumn has verified every source value is float64;
+// all nullable, mixed-type, indexed, or filtered queries retain the general
+// orderedRawRow implementation below.
+type floatOrderedRawRow struct {
+	raw []any
+	key float64
+}
+
+// simpleFloatOrderColumn recognizes the common pagination shape
+//
+//	SELECT ... FROM t ORDER BY float_column [ASC|DESC] LIMIT n [OFFSET m]
+//
+// without a WHERE clause or index RowID set. The schema test avoids an extra
+// table scan for non-float ORDER BY queries; the caller still checks the raw
+// values, because direct storage callers may bypass SQL coercion.
+func simpleFloatOrderColumn(plan *simpleSelectPlan) (int, bool) {
+	if plan == nil || plan.table == nil || plan.where != nil || plan.rowIDs != nil || plan.limit == nil ||
+		len(plan.orderBy) != 1 || len(plan.orderExprs) != 1 {
+		return 0, false
+	}
+	ref, ok := plan.orderExprs[0].(*VarRef)
+	if !ok {
+		return 0, false
+	}
+	idx, ok := plan.colIndex[strings.ToLower(ref.Name)]
+	if !ok || idx < 0 || idx >= len(plan.table.Cols) {
+		return 0, false
+	}
+	switch plan.table.Cols[idx].Type {
+	case storage.Float64Type, storage.FloatType:
+		return idx, true
+	default:
+		return 0, false
+	}
+}
+
+// executeSimpleSelectFloatOrderedTopN performs the verified float-only
+// variant of the ordered raw fast path. Its ordering intentionally uses the
+// same < and > comparisons as compareFloat, including treating NaN as equal
+// to every other value, so it preserves the generic comparator's behavior.
+func executeSimpleSelectFloatOrderedTopN(env ExecEnv, plan *simpleSelectPlan, sourceRows [][]any, column, keepCount int) (*ResultSet, error) {
+	topRows := floatOrderedRawRowHeap{
+		desc:  plan.orderBy[0].Desc,
+		items: make([]floatOrderedRawRow, 0, simpleSelectInitialCap(plan)),
+	}
+	for i, raw := range sourceRows {
+		if i&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, err
+			}
+		}
+		topRows.pushBounded(floatOrderedRawRow{raw: raw, key: raw[column].(float64)}, keepCount)
+	}
+
+	rows := topRows.items
+	sort.SliceStable(rows, func(i, j int) bool {
+		return compareOrderedFloat(rows[i].key, rows[j].key, topRows.desc) < 0
+	})
+	start := 0
+	if plan.offset != nil && *plan.offset > 0 {
+		start = *plan.offset
+	}
+	if start > len(rows) {
+		return &ResultSet{Cols: plan.outputCols, Rows: []Row{}}, nil
+	}
+	rows = rows[start:]
+	if *plan.limit < len(rows) {
+		rows = rows[:*plan.limit]
+	}
+
+	outRows := make([]Row, 0, len(rows))
+	for _, item := range rows {
+		out, err := projectRawRow(plan, item.raw)
+		if err != nil {
+			return nil, err
+		}
+		outRows = append(outRows, out)
+	}
+	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, nil
+}
+
+type floatOrderedRawRowHeap struct {
+	desc  bool
+	items []floatOrderedRawRow
+}
+
+func (h floatOrderedRawRowHeap) less(i, j int) bool {
+	// The heap root is the worst retained row, hence the reversed comparison.
+	return compareOrderedFloat(h.items[i].key, h.items[j].key, h.desc) > 0
+}
+
+func (h floatOrderedRawRowHeap) swap(i, j int) {
+	h.items[i], h.items[j] = h.items[j], h.items[i]
+}
+
+func (h *floatOrderedRawRowHeap) pushBounded(item floatOrderedRawRow, keepCount int) {
+	if len(h.items) < keepCount {
+		h.items = append(h.items, item)
+		for j := len(h.items) - 1; j > 0; {
+			i := (j - 1) / 2
+			if !h.less(j, i) {
+				break
+			}
+			h.swap(i, j)
+			j = i
+		}
+		return
+	}
+	if compareOrderedFloat(h.items[0].key, item.key, h.desc) <= 0 {
+		return
+	}
+	h.items[0] = item
+	for i, n := 0, len(h.items); ; {
+		left := 2*i + 1
+		if left >= n {
+			return
+		}
+		child := left
+		if right := left + 1; right < n && h.less(right, left) {
+			child = right
+		}
+		if !h.less(child, i) {
+			return
+		}
+		h.swap(i, child)
+		i = child
+	}
+}
+
+func compareOrderedFloat(a, b float64, desc bool) int {
+	cmp := 0
+	if a < b {
+		cmp = -1
+	} else if a > b {
+		cmp = 1
+	}
+	if desc {
+		return -cmp
+	}
+	return cmp
+}
+
 func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*ResultSet, bool, error) {
 	if plan.limit != nil && *plan.limit == 0 {
 		return &ResultSet{Cols: plan.outputCols, Rows: []Row{}}, true, nil
@@ -3326,6 +3916,32 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 		}
 		if keepCount > rowCount {
 			keepCount = rowCount
+		}
+	}
+	if column, ok := simpleFloatOrderColumn(plan); ok {
+		// Verify storage values before entering the unboxed path. SQL INSERT
+		// coercion makes this true for normal FLOAT/FLOAT64 tables; direct
+		// storage callers can still provide NULL or a different Go type, which
+		// must follow generic SQL ordering instead.
+		allFloat64 := true
+		for i, raw := range sourceRows {
+			if i&63 == 0 {
+				if err := checkCtx(env.ctx); err != nil {
+					return nil, true, err
+				}
+			}
+			if column >= len(raw) {
+				allFloat64 = false
+				break
+			}
+			if _, ok := raw[column].(float64); !ok {
+				allFloat64 = false
+				break
+			}
+		}
+		if allFloat64 {
+			rs, err := executeSimpleSelectFloatOrderedTopN(env, plan, sourceRows, column, keepCount)
+			return rs, true, err
 		}
 	}
 
@@ -3666,6 +4282,7 @@ func loadSimpleSelectPlanTemplate(table *storage.Table, s *Select, reusableSchem
 		offset:        s.Offset,
 		outputCols:    outputCols,
 		rowMapCap:     simpleProjectionMapCap(projs),
+		rowTextCols:   rawRowTextColumns(colIndex),
 		scanType:      "TABLE SCAN",
 		estimatedRows: len(table.Rows),
 	}
@@ -4146,6 +4763,29 @@ func simpleColumnIndex(t *storage.Table, alias string) map[string]int {
 	return idx
 }
 
+// rawRowTextColumns maps ROW_TO_TEXT's sorted unqualified Row-map keys back
+// to physical raw-row indexes. simpleColumnIndex already gives the same
+// resolution used by the raw fast path; sorting names here matches
+// evalRowToTextFunc's observable output order.
+func rawRowTextColumns(colIndex map[string]int) []int {
+	type column struct {
+		name string
+		idx  int
+	}
+	cols := make([]column, 0, len(colIndex))
+	for name, idx := range colIndex {
+		if !strings.Contains(name, ".") {
+			cols = append(cols, column{name: name, idx: idx})
+		}
+	}
+	sort.Slice(cols, func(i, j int) bool { return cols[i].name < cols[j].name })
+	indexes := make([]int, len(cols))
+	for i, col := range cols {
+		indexes[i] = col.idx
+	}
+	return indexes
+}
+
 func simpleSelectInitialCap(plan *simpleSelectPlan) int {
 	rows := simplePlanRows(plan)
 	if plan.limit != nil {
@@ -4211,7 +4851,7 @@ func isSimpleRawExpr(e Expr) bool {
 		if ex.Over != nil {
 			return false
 		}
-		if rowAwareFuncNames[ex.Name] {
+		if rowAwareFuncNames[ex.Name] && ex.Name != "ROW_TO_TEXT" {
 			// Reads the ambient Row directly; the raw path pre-evaluates
 			// args and substitutes an empty Row, which would silently
 			// always return "". Must go through the general evaluator.
@@ -4229,14 +4869,9 @@ func isSimpleRawExpr(e Expr) bool {
 }
 
 // rowAwareFuncNames lists scalar functions that read the ambient Row map
-// directly rather than only their own evaluated arguments (e.g. ROW_TO_TEXT).
-// Such calls must never execute through a raw ([]any + evalRawExpr) fast
-// path, which resolves each arg into a Literal and then substitutes an
-// empty Row — see evalRawFuncCall. Checked both by isSimpleRawExpr (gates
-// whole-plan eligibility) and exprHasRowAwareFuncCall (gates the AND/OR
-// raw-filter fallback in buildRawFilter, a separate mechanism that can
-// invoke evalRawExpr on a sub-expression even when the overall plan looked
-// eligible).
+// directly rather than only their evaluated arguments. ROW_TO_TEXT is the
+// one exception: evalRawRowToText supplies it with precomputed raw indexes,
+// so it can safely stay on the raw execution path.
 var rowAwareFuncNames = map[string]bool{
 	"ROW_TO_TEXT": true,
 }
@@ -4270,7 +4905,7 @@ func exprHasRowAwareFuncCall(e Expr) bool {
 		}
 		return false
 	case *FuncCall:
-		if rowAwareFuncNames[ex.Name] {
+		if rowAwareFuncNames[ex.Name] && ex.Name != "ROW_TO_TEXT" {
 			return true
 		}
 		for _, arg := range ex.Args {
@@ -4387,7 +5022,7 @@ func buildRawExprFilter(colIndex map[string]int, e Expr) func([]any) (bool, erro
 	if !isSimpleRawExpr(e) || exprHasRowAwareFuncCall(e) {
 		return nil
 	}
-	plan := &simpleSelectPlan{colIndex: colIndex}
+	plan := &simpleSelectPlan{colIndex: colIndex, rowTextCols: rawRowTextColumns(colIndex)}
 	return func(raw []any) (bool, error) {
 		v, err := evalRawExpr(plan, raw, e)
 		if err != nil {
@@ -4487,10 +5122,9 @@ func buildRawAndFilter(colIndex map[string]int, leftExpr, rightExpr Expr) func([
 	// Exactly one side compiled. The specialized side is cheap (raw slice
 	// access + comparison), so it runs first regardless of written order;
 	// the expression side runs only on surviving rows. The fallback
-	// evaluates via evalRawExpr(plan, raw, expr), which substitutes an
-	// empty Row for any FuncCall — wrong for a row-aware function like
-	// ROW_TO_TEXT. Refuse to build a raw filter at all in that case so the
-	// caller falls back to the general (correct) Row-based evaluator.
+	// evaluates via evalRawExpr(plan, raw, expr). Unsupported row-aware
+	// functions still force the general evaluator; ROW_TO_TEXT has a raw
+	// implementation with precomputed column indexes and is safe here.
 	if left == nil {
 		if exprHasRowAwareFuncCall(leftExpr) {
 			return nil
@@ -4504,7 +5138,7 @@ func buildRawAndFilter(colIndex map[string]int, leftExpr, rightExpr Expr) func([
 }
 
 func buildRawAndFilterWithFallback(colIndex map[string]int, expr Expr, fastFilter func([]any) (bool, error)) func([]any) (bool, error) {
-	plan := &simpleSelectPlan{colIndex: colIndex}
+	plan := &simpleSelectPlan{colIndex: colIndex, rowTextCols: rawRowTextColumns(colIndex)}
 	return func(raw []any) (bool, error) {
 		fast, err := fastFilter(raw)
 		if err != nil || !fast {
@@ -4553,9 +5187,8 @@ func buildRawOrFilter(colIndex map[string]int, leftExpr, rightExpr Expr) func([]
 	}
 
 	// See the matching comment in buildRawAndFilter: the specialized (cheap)
-	// side short-circuits first; the fallback evaluates the unbuildable side
-	// via evalRawExpr with an empty Row, which is wrong for row-aware
-	// functions.
+	// side short-circuits first. Unsupported row-aware functions still use the
+	// general evaluator, while ROW_TO_TEXT is safe on the raw path.
 	if left == nil {
 		if exprHasRowAwareFuncCall(leftExpr) {
 			return nil
@@ -4570,7 +5203,7 @@ func buildRawOrFilter(colIndex map[string]int, leftExpr, rightExpr Expr) func([]
 }
 
 func buildRawOrFilterWithFallback(colIndex map[string]int, expr Expr, fastFilter func([]any) (bool, error)) func([]any) (bool, error) {
-	plan := &simpleSelectPlan{colIndex: colIndex}
+	plan := &simpleSelectPlan{colIndex: colIndex, rowTextCols: rawRowTextColumns(colIndex)}
 	return func(raw []any) (bool, error) {
 		fast, err := fastFilter(raw)
 		if err != nil || fast {
@@ -5429,10 +6062,11 @@ func evalRawBetween(plan *simpleSelectPlan, raw []any, ex *BetweenExpr) (any, er
 // FuncCall copy (which escapes through the map-dispatched handler) and an
 // empty Row map on every row made the allocator — not the function body —
 // the dominant cost of expression-heavy scans (e.g. per-row
-// VEC_COSINE_SIMILARITY in RAG queries). Handlers only read the wrappers to
-// extract argument values and never retain them, so recycling the backing
-// structs through a pool is safe; nested calls simply draw their own
-// scratch instance.
+// VEC_COSINE_SIMILARITY in RAG queries). ROW_TO_TEXT is handled separately
+// because it intentionally reads every ambient row value. Other handlers
+// only read the wrappers to extract argument values and never retain them,
+// so recycling the backing structs through a pool is safe; nested calls
+// simply draw their own scratch instance.
 type rawCallScratch struct {
 	call FuncCall
 	args []Expr
@@ -5452,6 +6086,9 @@ var rawEmptyRow = Row{}
 func evalRawFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, error) {
 	if ex.Over != nil {
 		return nil, fmt.Errorf("window function %s is not supported in raw expression evaluation", ex.Name)
+	}
+	if ex.Name == "ROW_TO_TEXT" {
+		return evalRawRowToText(plan, raw, ex)
 	}
 	sc := rawCallScratchPool.Get().(*rawCallScratch)
 	defer rawCallScratchPool.Put(sc)
@@ -5475,6 +6112,28 @@ func evalRawFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, erro
 	}
 	sc.call = FuncCall{Name: ex.Name, Args: args, Star: ex.Star, Distinct: ex.Distinct}
 	return evalFuncCall(ExecEnv{}, &sc.call, rawEmptyRow)
+}
+
+// evalRawRowToText is the raw-row equivalent of evalRowToTextFunc. The
+// public function orders unqualified Row-map keys alphabetically, so the
+// plan caches the corresponding raw indexes in that same order. This keeps
+// whole-row LIKE searches correct without allocating the qualified and
+// unqualified map entries that rowsFromTable normally needs.
+func evalRawRowToText(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, error) {
+	if len(ex.Args) > 0 {
+		return nil, fmt.Errorf("ROW_TO_TEXT expects no arguments")
+	}
+	var sb strings.Builder
+	for _, col := range plan.rowTextCols {
+		if col < 0 || col >= len(raw) || raw[col] == nil {
+			continue
+		}
+		if sb.Len() > 0 {
+			sb.WriteByte(' ')
+		}
+		fmt.Fprint(&sb, raw[col])
+	}
+	return sb.String(), nil
 }
 
 func evalRawUnary(plan *simpleSelectPlan, raw []any, ex *Unary) (any, error) {
@@ -7713,9 +8372,9 @@ func evalNowFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 //
 //	SELECT * FROM orders WHERE ROW_TO_TEXT() LIKE '%acme corp%' AND status = 'open'
 //
-// This reads the ambient Row directly rather than evaluating ex.Args, so it
-// must never run through the raw fast path (which pre-evaluates args and
-// substitutes an empty Row) — see the *FuncCall case in isSimpleRawExpr.
+// The general evaluator reads the ambient Row directly. The raw fast path
+// uses evalRawRowToText, which preserves this function's sorted unqualified
+// column order while reading physical row values instead.
 func evalRowToTextFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if len(ex.Args) > 0 {
 		return nil, fmt.Errorf("ROW_TO_TEXT expects no arguments")
@@ -10997,6 +11656,21 @@ func writeFmtKeyPart(buf []byte, v any) []byte {
 		buf = strconv.AppendInt(buf, int64(len(byt)), 10)
 		buf = append(buf, ':')
 		return append(buf, byt...)
+	}
+}
+
+// writeSingleGroupKey returns a stable, typed key for the one-column GROUP BY
+// fast path. Its type distinctions match comparableKeyPart, which this path
+// used before it switched from map[any] to map[string]. In particular, int
+// and int64 remain distinct keys even when their numeric values are equal.
+func writeSingleGroupKey(buf []byte, v any) []byte {
+	switch x := v.(type) {
+	case int64:
+		buf = append(buf, 'L')
+		buf = strconv.AppendInt(buf, x, 10)
+		return append(buf, ';')
+	default:
+		return writeFmtKeyPart(buf, v)
 	}
 }
 
