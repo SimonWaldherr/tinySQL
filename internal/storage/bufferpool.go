@@ -111,6 +111,15 @@ type BufferPool struct {
 	stats *CacheStats
 
 	mu sync.RWMutex
+
+	// evictionSaver, if set, is invoked synchronously by evictLRU for each
+	// candidate table right before it is dropped from the cache, so a
+	// backend can flush an unsaved mutation before the pool's pointer to it
+	// — possibly the only remaining reference — disappears. It must not
+	// call back into this BufferPool's own Put/Get/Remove/Snapshot: evictLRU
+	// always runs with bp.mu already held, and sync.RWMutex is not
+	// reentrant.
+	evictionSaver func(tenant, name string, table *Table)
 }
 
 // CachedTable wraps a table with caching metadata.
@@ -287,6 +296,41 @@ func (bp *BufferPool) Put(tenant, name string, table *Table) error {
 	return nil
 }
 
+// SetEvictionSaver installs the callback evictLRU invokes on each table it
+// is about to drop from the cache. See the evictionSaver field for the
+// no-reentrancy constraint.
+func (bp *BufferPool) SetEvictionSaver(f func(tenant, name string, table *Table)) {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	bp.evictionSaver = f
+}
+
+// PooledEntry is one resident cache entry returned by Snapshot.
+type PooledEntry struct {
+	Tenant string
+	Name   string
+	Table  *Table
+}
+
+// Snapshot returns every table currently resident in the pool. The returned
+// Table pointers are shared with the cache (and with whatever caller is
+// still holding the lease DB.Get returned) — callers must not assume
+// exclusive access to them.
+func (bp *BufferPool) Snapshot() []PooledEntry {
+	bp.mu.RLock()
+	defer bp.mu.RUnlock()
+	out := make([]PooledEntry, 0)
+	for tenant, tc := range bp.cache {
+		for name, cached := range tc {
+			cached.mu.RLock()
+			t := cached.Table
+			cached.mu.RUnlock()
+			out = append(out, PooledEntry{Tenant: tenant, Name: name, Table: t})
+		}
+	}
+	return out
+}
+
 // Get retrieves a table from the buffer pool.
 func (bp *BufferPool) Get(tenant, name string) (*Table, bool) {
 	key := tenant + ":" + name
@@ -377,6 +421,12 @@ func (bp *BufferPool) evictLRU(needed int64) {
 		// Parse key
 		tenant, name := bp.parseKey(key)
 		if tenantCache, exists := bp.cache[tenant]; exists {
+			// Give the backend a chance to persist this table before its
+			// pool-held pointer — possibly the only remaining reference to
+			// an in-place mutation — is dropped for good.
+			if bp.evictionSaver != nil {
+				bp.evictionSaver(tenant, name, cached.Table)
+			}
 			delete(tenantCache, name)
 			freed += cached.Size
 			evicted++

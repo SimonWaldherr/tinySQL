@@ -62,6 +62,19 @@ func NewHybridBackend(dir string, maxMemoryBytes int64, compress bool, mode Stor
 		TrackAccessPatterns: true,
 	}
 	pool := NewBufferPool(policy)
+	// A pool eviction (triggered from within LoadTable/Get on an unrelated
+	// table) must not silently drop a dirty table that was mutated in place
+	// after being loaded — see the DB.Get doc comment on the query-scoped
+	// lease. Save it first, going straight to disk (not through
+	// HybridBackend.SaveTable, which would call pool.Put and deadlock: this
+	// callback runs with bp.mu already held).
+	pool.SetEvictionSaver(func(tenant, name string, t *Table) {
+		if disk.IsDirty(tenant, name, t.Version) {
+			if err := disk.SaveTable(tenant, t); err != nil {
+				log.Printf("warning: flush-before-evict failed for %s/%s: %v", tenant, name, err)
+			}
+		}
+	})
 
 	return &HybridBackend{
 		disk:  disk,
@@ -254,3 +267,23 @@ func (h *HybridBackend) Stats() BackendStats {
 // Disk returns the underlying DiskBackend for advanced operations
 // (e.g. migration, metadata access).
 func (h *HybridBackend) Disk() *DiskBackend { return h.disk }
+
+// IsDirty delegates to the underlying DiskBackend's version-based dirty
+// check, satisfying the dirtyTracker interface DB.Sync uses for both
+// db.tenants entries and PooledTables leases.
+func (h *HybridBackend) IsDirty(tenant, name string, currentVersion int) bool {
+	return h.disk.IsDirty(tenant, name, currentVersion)
+}
+
+// PooledTables returns every table currently resident in the buffer pool,
+// satisfying the pooledTableSource interface. DB.Sync/DB.Close use this to
+// find and flush a table that DB.Get loaded lazily for this evictable
+// storage mode (ModeHybrid/ModeIndex) without registering it in DB.tenants.
+func (h *HybridBackend) PooledTables() []PooledTableRef {
+	entries := h.pool.Snapshot()
+	out := make([]PooledTableRef, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, PooledTableRef{Tenant: e.Tenant, Table: e.Table})
+	}
+	return out
+}

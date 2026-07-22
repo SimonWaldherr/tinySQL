@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,6 +30,20 @@ type PagedIndexBackend struct {
 	// traversal plus JSON decode on every prepared point lookup.
 	metadataMu sync.RWMutex
 	metadata   map[string]*pagedIndexTableMetadata
+
+	// pool caches whole *Table objects (rows included) loaded via LoadTable,
+	// as a bounded, evictable lease — mirroring HybridBackend's BufferPool.
+	// Without it, a mutation made in place on the *Table DB.Get returns for
+	// this evictable storage mode (see DB.backendTablesEvictable) would be
+	// invisible to both a later LoadTable in the same process (LoadTable
+	// used to always decode a fresh copy from the pager) and to DB.Sync.
+	pool *BufferPool
+
+	// versions tracks the version at last load/save per tenant+table,
+	// mirroring DiskBackend.versions, so IsDirty can tell whether a pooled
+	// table needs to be re-saved.
+	versionsMu sync.Mutex
+	versions   map[string]int
 }
 
 // pagedIndexTableMetadata is the immutable serving descriptor cached per
@@ -71,12 +86,49 @@ func NewPagedIndexBackend(dir string, maxMemoryBytes int64, readOnly bool) (*Pag
 	if err != nil {
 		return nil, err
 	}
-	b := &PagedIndexBackend{page: pb, path: path, metadata: make(map[string]*pagedIndexTableMetadata)}
+	poolBudget := maxMemoryBytes
+	if poolBudget <= 0 {
+		poolBudget = 64 * 1024 * 1024
+	}
+	pool := NewBufferPool(&MemoryPolicy{
+		MaxMemoryBytes:      poolBudget,
+		Strategy:            StrategyLRU,
+		EvictionThreshold:   0.85,
+		EnableEviction:      true,
+		EvictionBatchSize:   5,
+		TrackAccessPatterns: true,
+	})
+	b := &PagedIndexBackend{
+		page:     pb,
+		path:     path,
+		metadata: make(map[string]*pagedIndexTableMetadata),
+		pool:     pool,
+		versions: make(map[string]int),
+	}
+	// A pool eviction (triggered from within LoadTable on an unrelated
+	// table) must not silently drop a dirty table that was mutated in place
+	// after being loaded — see the DB.Get doc comment on the query-scoped
+	// lease. Save it first, going straight to the pager (not through
+	// PagedIndexBackend.SaveTable, which would call pool.Put and deadlock:
+	// this callback runs with the pool's own lock already held).
+	pool.SetEvictionSaver(func(tenant, name string, t *Table) {
+		if b.IsDirty(tenant, name, t.Version) {
+			if err := b.saveToPager(tenant, t); err != nil {
+				log.Printf("warning: flush-before-evict failed for paged index %s/%s: %v", tenant, name, err)
+			}
+		}
+	})
 	b.readOnly.Store(readOnly)
 	return b, nil
 }
 
 func (b *PagedIndexBackend) LoadTable(tenant, name string) (*Table, error) {
+	tn := strings.ToLower(tenant)
+	lc := strings.ToLower(name)
+	if t, ok := b.pool.Get(tn, lc); ok {
+		return t, nil
+	}
+
 	td, err := b.page.LoadTable(tenant, name)
 	if err != nil || td == nil {
 		return nil, err
@@ -89,10 +141,26 @@ func (b *PagedIndexBackend) LoadTable(tenant, name string) (*Table, error) {
 			return nil, fmt.Errorf("rebuild paged index %s: %w", index.Name, err)
 		}
 	}
+
+	b.versionsMu.Lock()
+	b.versions[pagedMetadataKey(tenant, name)] = t.Version
+	b.versionsMu.Unlock()
+
+	if err := b.pool.Put(tn, lc, t); err != nil {
+		// Can't fit in the bounded pool (e.g. memory limit without room to
+		// evict). Still return the table; it just won't be cached, and a
+		// mutation made on it is durable only via an explicit SaveTable/Put.
+		_ = err
+	}
+
 	return t, nil
 }
 
-func (b *PagedIndexBackend) SaveTable(tenant string, t *Table) error {
+// saveToPager writes t to the underlying pager and records the saved
+// version, without touching the table-object pool. Used by both SaveTable
+// (which additionally refreshes the pool entry) and the pool's
+// eviction-saver callback (which must not call back into the pool).
+func (b *PagedIndexBackend) saveToPager(tenant string, t *Table) error {
 	if b.IsReadOnly() {
 		return ErrReadOnlyStorage
 	}
@@ -116,7 +184,46 @@ func (b *PagedIndexBackend) SaveTable(tenant string, t *Table) error {
 		return err
 	}
 	b.dropMetadata(tenant, t.Name)
+	b.versionsMu.Lock()
+	b.versions[pagedMetadataKey(tenant, t.Name)] = t.Version
+	b.versionsMu.Unlock()
 	return nil
+}
+
+func (b *PagedIndexBackend) SaveTable(tenant string, t *Table) error {
+	if err := b.saveToPager(tenant, t); err != nil {
+		return err
+	}
+	tn := strings.ToLower(tenant)
+	lc := strings.ToLower(t.Name)
+	if err := b.pool.Put(tn, lc, t); err != nil {
+		log.Printf("warning: paged index cache update failed for %s/%s: %v", tn, lc, err)
+	}
+	return nil
+}
+
+// IsDirty reports whether name's in-memory version has diverged from the
+// version last saved to the pager. Satisfies the dirtyTracker interface.
+func (b *PagedIndexBackend) IsDirty(tenant, name string, currentVersion int) bool {
+	b.versionsMu.Lock()
+	defer b.versionsMu.Unlock()
+	if v, ok := b.versions[pagedMetadataKey(tenant, name)]; ok {
+		return currentVersion != v
+	}
+	return true // unknown -> assume dirty
+}
+
+// PooledTables returns every table currently resident in the table-object
+// pool, satisfying the pooledTableSource interface. DB.Sync/DB.Close use
+// this to find and flush a table that DB.Get loaded lazily for
+// ModePagedIndex without registering it in DB.tenants.
+func (b *PagedIndexBackend) PooledTables() []PooledTableRef {
+	entries := b.pool.Snapshot()
+	out := make([]PooledTableRef, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, PooledTableRef{Tenant: e.Tenant, Table: e.Table})
+	}
+	return out
 }
 
 func (b *PagedIndexBackend) DeleteTable(tenant, name string) error {
@@ -127,6 +234,10 @@ func (b *PagedIndexBackend) DeleteTable(tenant, name string) error {
 		return err
 	}
 	b.dropMetadata(tenant, name)
+	b.pool.Remove(strings.ToLower(tenant), strings.ToLower(name))
+	b.versionsMu.Lock()
+	delete(b.versions, pagedMetadataKey(tenant, name))
+	b.versionsMu.Unlock()
 	return nil
 }
 

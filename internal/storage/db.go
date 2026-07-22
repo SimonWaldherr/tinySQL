@@ -1060,12 +1060,22 @@ func (db *DB) Get(tn, name string) (*Table, error) {
 			return nil, fmt.Errorf("backend load %s/%s: %w", tn, name, err)
 		}
 		if t != nil {
-			// ModeIndex and ModeHybrid own loaded tables through their bounded
-			// buffer pool. Retaining another pointer in DB.tenants would turn a
-			// cache eviction into a no-op and make memory grow with every table
-			// ever queried. The caller's reference is a query-scoped lease: it
-			// remains valid while that statement holds DB.contentMu, and becomes
-			// collectible once both caller and pool release it.
+			// ModeIndex, ModeHybrid, and ModePagedIndex own loaded tables
+			// through their own bounded pool rather than DB.tenants.
+			// Retaining another pointer in DB.tenants would turn a cache
+			// eviction into a no-op and make memory grow with every table
+			// ever queried. This does not put mutations at risk: the
+			// returned *Table is the very same pointer the backend's pool
+			// holds, so an in-place INSERT/UPDATE/DELETE stays visible to
+			// that pool. DB.Sync and DB.Close additionally consult the
+			// backend's PooledTables (when it implements pooledTableSource)
+			// to find and flush exactly these leases, and the pool itself
+			// flushes a dirty table before dropping it under memory
+			// pressure (see BufferPool.evictionSaver). So the caller's
+			// reference is a query-scoped lease for memory-retention
+			// purposes only — it remains valid while that statement holds
+			// DB.contentMu and becomes collectible once both caller and
+			// pool release it — never for durability.
 			if !db.backendTablesEvictable() {
 				db.mu.Lock()
 				db.getTenant(tn).tables[strings.ToLower(t.Name)] = t
@@ -2380,30 +2390,53 @@ func (db *DB) Sync() error {
 		return nil
 	}
 
-	// For disk/hybrid backends, save all in-memory tables that are dirty.
+	// For disk/hybrid/paged-index backends, save all resident tables that
+	// are dirty. "Resident" is two sets: db.tenants (every non-evictable
+	// mode, plus any table Put into this process) and — for the evictable
+	// modes ModeIndex/ModeHybrid/ModePagedIndex — whatever the backend's own
+	// bounded pool currently holds. DB.Get returns a query-scoped lease for
+	// the latter without ever registering it in db.tenants (see
+	// backendTablesEvictable), so skipping pooledTableSource here would
+	// silently drop any mutation made on such a lease: Sync/Close would
+	// keep returning nil while the table was never actually re-saved.
 	if db.storageMode == ModeDisk || db.storageMode == ModeJSON || db.storageMode == ModeHybrid || db.storageMode == ModeIndex || db.storageMode == ModePagedIndex {
-		db.mu.RLock()
+		dc, hasDirtyTracker := db.backend.(dirtyTracker)
+
 		type entry struct {
 			tenant string
 			table  *Table
 		}
 		var toSave []entry
+		seen := make(map[string]bool) // tenant\x00lower(table name)
+
+		db.mu.RLock()
 		for tn, tdb := range db.tenants {
 			for _, t := range tdb.tables {
-				if disk, ok := db.backend.(*DiskBackend); ok {
-					if disk.IsDirty(tn, t.Name, t.Version) {
-						toSave = append(toSave, entry{tn, t})
-					}
-				} else if hybrid, ok := db.backend.(*HybridBackend); ok {
-					if hybrid.Disk().IsDirty(tn, t.Name, t.Version) {
-						toSave = append(toSave, entry{tn, t})
-					}
-				} else {
-					toSave = append(toSave, entry{tn, t})
+				seen[tn+"\x00"+strings.ToLower(t.Name)] = true
+				if hasDirtyTracker && !dc.IsDirty(tn, t.Name, t.Version) {
+					continue
 				}
+				toSave = append(toSave, entry{tn, t})
 			}
 		}
 		db.mu.RUnlock()
+
+		// db.tenants entries take precedence: a table already covered above
+		// (e.g. HybridBackend/PagedIndexBackend's SaveTable mirrors a Put
+		// into their own pool too) must not be saved twice.
+		if ps, ok := db.backend.(pooledTableSource); ok {
+			for _, ref := range ps.PooledTables() {
+				key := strings.ToLower(ref.Tenant) + "\x00" + strings.ToLower(ref.Table.Name)
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				if hasDirtyTracker && !dc.IsDirty(ref.Tenant, ref.Table.Name, ref.Table.Version) {
+					continue
+				}
+				toSave = append(toSave, entry{ref.Tenant, ref.Table})
+			}
+		}
 
 		for _, e := range toSave {
 			if err := db.backend.SaveTable(e.tenant, e.table); err != nil {

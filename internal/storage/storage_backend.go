@@ -243,6 +243,36 @@ type StorageBackend interface {
 	Stats() BackendStats
 }
 
+// PooledTableRef identifies one table object currently resident in a storage
+// backend's own bounded cache — outside DB.tenants — for an evictable
+// storage mode (ModeIndex, ModeHybrid, ModePagedIndex; see
+// DB.backendTablesEvictable). DB.Get returns exactly this *Table pointer as
+// a query-scoped lease without registering it in DB.tenants, so a mutation
+// applied in place (as the SQL engine's INSERT/UPDATE/DELETE do) is only
+// reachable through the backend's own pool. DB.Sync and DB.Close use
+// pooledTableSource.PooledTables to find and flush these leases; without it
+// a table that was never re-registered in DB.tenants could be mutated,
+// "successfully" synced/closed, and then lose the mutation on next open.
+type PooledTableRef struct {
+	Tenant string
+	Table  *Table
+}
+
+// pooledTableSource is implemented by backends that own such a bounded pool
+// of loaded tables (HybridBackend for ModeHybrid/ModeIndex, PagedIndexBackend
+// for ModePagedIndex).
+type pooledTableSource interface {
+	PooledTables() []PooledTableRef
+}
+
+// dirtyTracker is implemented by backends that can report whether a table's
+// current in-memory version has diverged from the version last durably
+// saved. DB.Sync uses it — for both DB.tenants entries and pooledTableSource
+// leases — to skip re-saving a table that has not actually changed.
+type dirtyTracker interface {
+	IsDirty(tenant, name string, currentVersion int) bool
+}
+
 // BackendStats provides observability into storage backend behaviour.
 type BackendStats struct {
 	Mode             StorageMode
