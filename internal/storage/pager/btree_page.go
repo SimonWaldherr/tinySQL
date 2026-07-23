@@ -60,10 +60,7 @@ const (
 	leafFlagOverflow uint16 = 1 << 0
 )
 
-// ───────────────────────────────────────────────────────────────────────────
 // BTreePage wraps a page buffer as a B+Tree node.
-// ───────────────────────────────────────────────────────────────────────────
-
 type BTreePage struct {
 	buf      []byte
 	pageSize int
@@ -98,10 +95,12 @@ func InitBTreePage(buf []byte, id PageID, leaf bool) *BTreePage {
 
 // ── Accessors ──────────────────────────────────────────────────────────────
 
+// IsLeaf reports whether bp is a leaf node.
 func (bp *BTreePage) IsLeaf() bool {
 	return bp.buf[btreeIsLeafOff] == 1
 }
 
+// KeyCount returns the number of keys stored in bp.
 func (bp *BTreePage) KeyCount() int {
 	return int(binary.LittleEndian.Uint16(bp.buf[btreeKeyCountOff:]))
 }
@@ -110,34 +109,42 @@ func (bp *BTreePage) setKeyCount(n int) {
 	binary.LittleEndian.PutUint16(bp.buf[btreeKeyCountOff:], uint16(n))
 }
 
+// PageID returns bp's persistent page identifier.
 func (bp *BTreePage) PageID() PageID {
 	return PageID(binary.LittleEndian.Uint32(bp.buf[4:8]))
 }
 
+// RightChild returns the rightmost child page of an internal node.
 func (bp *BTreePage) RightChild() PageID {
 	return PageID(binary.LittleEndian.Uint32(bp.buf[btreeRightChildOff:]))
 }
 
+// SetRightChild updates the rightmost child page of an internal node.
 func (bp *BTreePage) SetRightChild(pid PageID) {
 	binary.LittleEndian.PutUint32(bp.buf[btreeRightChildOff:], uint32(pid))
 }
 
+// NextLeaf returns the next leaf in the linked leaf chain.
 func (bp *BTreePage) NextLeaf() PageID {
 	return PageID(binary.LittleEndian.Uint32(bp.buf[btreeNextLeafOff:]))
 }
 
+// SetNextLeaf updates the next-leaf link.
 func (bp *BTreePage) SetNextLeaf(pid PageID) {
 	binary.LittleEndian.PutUint32(bp.buf[btreeNextLeafOff:], uint32(pid))
 }
 
+// PrevLeaf returns the previous leaf in the linked leaf chain.
 func (bp *BTreePage) PrevLeaf() PageID {
 	return PageID(binary.LittleEndian.Uint32(bp.buf[btreePrevLeafOff:]))
 }
 
+// SetPrevLeaf updates the previous-leaf link.
 func (bp *BTreePage) SetPrevLeaf(pid PageID) {
 	binary.LittleEndian.PutUint32(bp.buf[btreePrevLeafOff:], uint32(pid))
 }
 
+// Bytes returns the page's mutable backing buffer.
 func (bp *BTreePage) Bytes() []byte { return bp.buf }
 
 // ── Slotted-page helpers (custom offsets) ─────────────────────────────────

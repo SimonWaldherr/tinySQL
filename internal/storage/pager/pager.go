@@ -724,6 +724,7 @@ type PagerCacheStats struct {
 	MaxPages        int
 }
 
+// CacheStats returns a snapshot of the pager's in-memory page cache.
 func (p *Pager) CacheStats() PagerCacheStats {
 	p.pool.mu.Lock()
 	cached := len(p.pool.pages)

@@ -38,6 +38,14 @@ func TestCatalogWrappers(t *testing.T) {
 		t.Fatalf("expected people_view in objects: %#v", objects)
 	}
 
+	columns, err := ListColumns(ctx, db, "default")
+	if err != nil {
+		t.Fatalf("ListColumns: %v", err)
+	}
+	if len(columns) != 2 || columns[0].TableName != "people" || columns[0].Name != "id" || columns[1].Name != "name" {
+		t.Fatalf("unexpected columns: %#v", columns)
+	}
+
 	profile, err := BuildAgentContext(ctx, db, "default", DefaultAgentContextConfig())
 	if err != nil {
 		t.Fatalf("BuildAgentContext: %v", err)

@@ -10,6 +10,7 @@ import (
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
+// ImportMBTiles reports that MBTiles import requires the sqliteimport build tag.
 func ImportMBTiles(
 	ctx context.Context,
 	db *storage.DB,
@@ -21,6 +22,7 @@ func ImportMBTiles(
 	return nil, fmt.Errorf("MBTiles/SQLite import requires the sqliteimport build tag")
 }
 
+// ImportMBTilesReader reports that MBTiles import requires the sqliteimport build tag.
 func ImportMBTilesReader(
 	ctx context.Context,
 	db *storage.DB,

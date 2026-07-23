@@ -11,7 +11,11 @@ import (
 
 // Options controls exporter behavior.
 type Options = ie.Options
+
+// TableManifest is the portable table schema and data-fingerprint document.
 type TableManifest = ie.TableManifest
+
+// ManifestColumn describes one column in a TableManifest.
 type ManifestColumn = ie.ManifestColumn
 
 // ExportCSV writes ResultSet rows as CSV to w.

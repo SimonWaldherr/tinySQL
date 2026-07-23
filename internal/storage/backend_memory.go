@@ -20,13 +20,22 @@ func NewMemoryBackend(savePath string) *MemoryBackend {
 
 func (m *MemoryBackend) setDB(db *DB) { m.db = db }
 
+// LoadTable reports no durable table because memory mode has no backing store.
 func (m *MemoryBackend) LoadTable(_, _ string) (*Table, error) { return nil, nil }
-func (m *MemoryBackend) SaveTable(_ string, _ *Table) error    { return nil }
-func (m *MemoryBackend) DeleteTable(_, _ string) error         { return nil }
 
+// SaveTable is a no-op because memory mode keeps rows in the owning DB.
+func (m *MemoryBackend) SaveTable(_ string, _ *Table) error { return nil }
+
+// DeleteTable is a no-op because memory mode has no durable table files.
+func (m *MemoryBackend) DeleteTable(_, _ string) error { return nil }
+
+// ListTableNames reports no durable table names in memory mode.
 func (m *MemoryBackend) ListTableNames(_ string) ([]string, error) { return nil, nil }
-func (m *MemoryBackend) TableExists(_, _ string) bool              { return false }
 
+// TableExists reports false because memory mode has no durable table files.
+func (m *MemoryBackend) TableExists(_, _ string) bool { return false }
+
+// Sync is a no-op because memory mode has no durable writes to flush.
 func (m *MemoryBackend) Sync() error { return nil }
 
 func (m *MemoryBackend) Close() error {

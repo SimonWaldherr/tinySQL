@@ -2276,8 +2276,11 @@ type simpleSelectPlan struct {
 	indexName       string
 	indexPredicates []string
 	residualFilter  bool
-	coveringIndex   bool
-	estimatedRows   int
+	// filterFullyCovered marks access paths that already applied every WHERE
+	// predicate, avoiding a redundant raw predicate evaluation per matched row.
+	filterFullyCovered bool
+	coveringIndex      bool
+	estimatedRows      int
 }
 
 // simpleSelectPlanCache stores the parameter-independent shape of a parsed
@@ -3677,9 +3680,13 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 				return nil, true, err
 			}
 		}
-		match, err := evalRawWhere(plan, raw)
-		if err != nil {
-			return nil, true, err
+		match := plan.filterFullyCovered
+		if !match {
+			var err error
+			match, err = evalRawWhere(plan, raw)
+			if err != nil {
+				return nil, true, err
+			}
 		}
 		if !match {
 			continue
@@ -4222,6 +4229,7 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 		plan.indexName = column
 		plan.indexPredicates = []string{column + " = ?"}
 		plan.residualFilter = residual
+		plan.filterFullyCovered = !residual
 		plan.estimatedRows = len(rowIDs)
 	}
 	return &plan, true, nil
@@ -4237,6 +4245,7 @@ func resetSimplePlanAccess(plan *simpleSelectPlan, rows int) {
 	plan.indexName = ""
 	plan.indexPredicates = nil
 	plan.residualFilter = false
+	plan.filterFullyCovered = false
 	plan.coveringIndex = false
 	plan.estimatedRows = rows
 }
@@ -4483,6 +4492,11 @@ func selectConstraintIndex(table *storage.Table, colIndex map[string]int, where 
 			continue
 		}
 		rows := lookupConstraintIndexRows(getConstraintIndex(table, colIdx), value)
+		// A non-nil empty slice distinguishes an indexed negative lookup from
+		// the nil RowID set used for a table scan.
+		if rows == nil {
+			rows = []int{}
+		}
 		return rows, column.Name, totalTerms != 1, true
 	}
 	return nil, "", false, false

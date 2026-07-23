@@ -408,6 +408,7 @@ func buildJSONSampleData(records []map[string]any, colNames []string) [][]string
 	return sampleData
 }
 
+// ImportJSON imports JSON records from src into tableName for tenant.
 func ImportJSON(
 	ctx context.Context,
 	db *storage.DB,

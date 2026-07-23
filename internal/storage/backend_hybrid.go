@@ -229,6 +229,7 @@ func (h *HybridBackend) Close() error {
 	return h.disk.Close()
 }
 
+// Mode reports the configured hybrid storage mode.
 func (h *HybridBackend) Mode() StorageMode { return h.mode }
 
 // SetEncryptor forwards table-file encryption to the underlying DiskBackend.
@@ -241,6 +242,7 @@ func (h *HybridBackend) SetReadOnly(readOnly bool) {
 	h.disk.SetReadOnly(readOnly)
 }
 
+// Stats returns combined disk and in-memory cache statistics.
 func (h *HybridBackend) Stats() BackendStats {
 	ds := h.disk.Stats()
 	ps := h.pool.GetStats()

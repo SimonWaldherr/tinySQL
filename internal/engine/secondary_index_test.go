@@ -140,6 +140,9 @@ func TestPrimaryKeyConstraintIndexPointSeek(t *testing.T) {
 	if plan.scanType != "CONSTRAINT INDEX POINT SEEK" || plan.indexName != "id" || len(plan.rowIDs) != 1 || plan.rowIDs[0] != 1 {
 		t.Fatalf("primary-key access path = %#v", plan)
 	}
+	if !plan.filterFullyCovered {
+		t.Fatal("fully indexed primary-key lookup should skip duplicate filtering")
+	}
 
 	rs, err := Execute(context.Background(), db, "default", stmt)
 	if err != nil || len(rs.Rows) != 1 || rs.Rows[0]["name"] != "Grace" {
@@ -159,5 +162,23 @@ func TestPrimaryKeyConstraintIndexPointSeek(t *testing.T) {
 	rs, err = Execute(context.Background(), db, "default", floatStmt)
 	if err != nil || len(rs.Rows) != 1 || rs.Rows[0]["name"] != "Grace" {
 		t.Fatalf("numeric compatibility lookup = %#v, err=%v", rs, err)
+	}
+
+	residualStmt := mustParse(`SELECT name FROM users WHERE id = 2 AND name = 'Ada'`).(*Select)
+	residualPlan, ok, err := buildSimpleSelectPlan(ExecEnv{ctx: context.Background(), tenant: "default", db: db}, residualStmt)
+	if err != nil || !ok {
+		t.Fatalf("residual primary-key plan = %#v, ok=%v, err=%v", residualPlan, ok, err)
+	}
+	if residualPlan.filterFullyCovered {
+		t.Fatal("additional non-indexed predicate must retain filtering")
+	}
+	rs, err = Execute(context.Background(), db, "default", residualStmt)
+	if err != nil || len(rs.Rows) != 0 {
+		t.Fatalf("residual primary-key lookup = %#v, err=%v", rs, err)
+	}
+
+	missing := execSQL(t, db, `SELECT name FROM users WHERE id = 99`)
+	if len(missing.Rows) != 0 {
+		t.Fatalf("negative primary-key lookup = %#v", missing.Rows)
 	}
 }

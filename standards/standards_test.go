@@ -3,6 +3,8 @@ package standards
 import (
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -35,5 +37,24 @@ func TestFormatTimeUsesUTCAndRFC3339(t *testing.T) {
 	ts := time.Date(2026, 7, 5, 12, 30, 0, 0, loc)
 	if got := FormatTime(ts); got != "2026-07-05T10:30:00Z" {
 		t.Fatalf("FormatTime = %q", got)
+	}
+}
+
+func TestProblemWriterAndSQLStateEdgeCases(t *testing.T) {
+	problem := NewProblem(http.StatusUnprocessableEntity, "", "invalid row", "/rows/1")
+	recorder := httptest.NewRecorder()
+	WriteProblem(recorder, problem)
+	if recorder.Code != http.StatusUnprocessableEntity || recorder.Header().Get("Content-Type") != MediaTypeProblemJSON || !strings.Contains(recorder.Body.String(), `"detail":"invalid row"`) {
+		t.Fatalf("WriteProblem response = status:%d headers:%v body:%s", recorder.Code, recorder.Header(), recorder.Body.String())
+	}
+
+	if _, err := ParseTime("not-a-time"); err == nil {
+		t.Fatal("ParseTime accepted invalid input")
+	}
+	if (&SQLStateError{}).Error() != "" || (&SQLStateError{}).Unwrap() != nil {
+		t.Fatal("empty SQLStateError should be safe to inspect")
+	}
+	if WithSQLState("", nil) != nil || SQLState(errors.New("plain")) != "" {
+		t.Fatal("SQLSTATE helpers handled nil or plain errors incorrectly")
 	}
 }

@@ -12,6 +12,7 @@ import (
 type StatementKind string
 
 const (
+	// StatementKind values classify SQL statements at a coarse, stable level.
 	KindUnknown                StatementKind = "unknown"
 	KindSelect                 StatementKind = "select"
 	KindExplain                StatementKind = "explain"

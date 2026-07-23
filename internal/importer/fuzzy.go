@@ -719,6 +719,7 @@ func fuzzyCoerceJSONValue(v interface{}, colType storage.ColType) interface{} {
 	}
 }
 
+// FuzzyImportJSON imports JSON after applying the configured recovery rules.
 func FuzzyImportJSON(
 	ctx context.Context,
 	db *storage.DB,

@@ -27,7 +27,7 @@ func newBenchmarkDB(b *testing.B, rows int) (*DB, context.Context) {
 	db := NewDB()
 	b.Cleanup(func() { _ = db.Close() })
 
-	mustBenchmarkExec(b, ctx, db, "CREATE TABLE users (id INT, name TEXT, age INT, active BOOL, score FLOAT)")
+	mustBenchmarkExec(b, ctx, db, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT, active BOOL, score FLOAT)")
 	for i := 0; i < rows; i++ {
 		mustBenchmarkExec(b, ctx, db, fmt.Sprintf(
 			"INSERT INTO users VALUES (%d, 'user_%d', %d, %t, %.2f)",

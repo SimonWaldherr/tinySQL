@@ -9,21 +9,23 @@ import (
 )
 
 const (
-	// RFC 8259 JSON media type, sent with an explicit UTF-8 charset for HTTP.
+	// MediaTypeJSON is the RFC 8259 JSON media type with an explicit UTF-8 charset.
 	MediaTypeJSON = "application/json; charset=utf-8"
 
-	// RFC 9457 Problem Details for HTTP APIs.
+	// MediaTypeProblemJSON is the RFC 9457 Problem Details media type.
 	MediaTypeProblemJSON = "application/problem+json"
 
-	// RFC 4180 CSV and common tab-separated values media types.
+	// MediaTypeCSV is the RFC 4180 CSV media type with an explicit UTF-8 charset.
 	MediaTypeCSV = "text/csv; charset=utf-8"
+	// MediaTypeTSV is the tab-separated-values media type with an explicit UTF-8 charset.
 	MediaTypeTSV = "text/tab-separated-values; charset=utf-8"
 
-	// XML 1.0 and ECMA-376 / ISO/IEC 29500 spreadsheet exports.
-	MediaTypeXML  = "application/xml; charset=utf-8"
+	// MediaTypeXML is the XML 1.0 media type with an explicit UTF-8 charset.
+	MediaTypeXML = "application/xml; charset=utf-8"
+	// MediaTypeXLSX is the Office Open XML spreadsheet media type.
 	MediaTypeXLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
-	// SQLSTATE class/code values from ISO/IEC 9075 and common vendor practice.
+	// SQLStateSuccessfulCompletion is the ISO/IEC 9075 SQLSTATE success code.
 	SQLStateSuccessfulCompletion = "00000"
 	SQLStateWarning              = "01000"
 	SQLStateNoData               = "02000"
