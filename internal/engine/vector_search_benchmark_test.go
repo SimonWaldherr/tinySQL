@@ -13,6 +13,7 @@ import (
 )
 
 var vectorMathBenchmarkSink float64
+var vectorMathBenchmarkIntSink int
 
 func makeVectorMathBenchmarkInputs(dims int) ([]float64, []float64) {
 	a := make([]float64, dims)
@@ -75,6 +76,79 @@ func BenchmarkVectorL1DistanceUnrolled768(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		vectorMathBenchmarkSink = vectorL1Unrolled(a, vecB)
+	}
+}
+
+// BenchmarkVectorHammingDistance768 measures vectorHammingDistance (which
+// dispatches to the portable 4-way-unrolled vectorHammingUnrolled — see the
+// design-rationale comment on vectorHammingDistance in vector_math.go for why
+// this metric intentionally has no hand-rolled SIMD kernel) against a plain,
+// non-unrolled reference loop (naiveHamming, already defined in
+// vector_math_unroll_test.go for correctness cross-checking and reused here).
+// Run side by side so any future change to either implementation shows up as
+// a relative regression/improvement, not just an absolute number.
+func BenchmarkVectorHammingDistance768(b *testing.B) {
+	a, vecB := makeVectorMathBenchmarkInputs(768)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		vectorMathBenchmarkIntSink = vectorHammingDistance(a, vecB)
+	}
+}
+
+func BenchmarkVectorHammingNaive768(b *testing.B) {
+	a, vecB := makeVectorMathBenchmarkInputs(768)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		vectorMathBenchmarkIntSink = naiveHamming(a, vecB)
+	}
+}
+
+// makeCentroidBenchmarkInputs builds `vectors` deterministic 768-ish-dim
+// vectors for VEC_CENTROID-style accumulation benchmarks below.
+func makeCentroidBenchmarkInputs(vectors, dims int) [][]float64 {
+	vecs := make([][]float64, vectors)
+	for v := 0; v < vectors; v++ {
+		vec := make([]float64, dims)
+		for i := range vec {
+			vec[i] = math.Sin(float64(i)*0.11+float64(v)) * 0.75
+		}
+		vecs[v] = vec
+	}
+	return vecs
+}
+
+// BenchmarkVectorCentroidAccumulate768x8 and
+// BenchmarkVectorCentroidAccumulateNaive768x8 mirror evalVecCentroid's own
+// usage of vectorAccumulateUnrolled: a fresh zeroed accumulator per call,
+// with each of 8 768-dim source vectors folded into it in turn (see
+// VEC_CENTROID in vector_functions.go). naiveAccumulate is the trivial
+// reference loop already defined in vector_math_unroll_test.go for
+// correctness cross-checking, reused here for the timing comparison.
+func BenchmarkVectorCentroidAccumulate768x8(b *testing.B) {
+	vecs := makeCentroidBenchmarkInputs(8, 768)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out := make([]float64, 768)
+		for _, v := range vecs {
+			vectorAccumulateUnrolled(out, v)
+		}
+		vectorMathBenchmarkSink = out[0]
+	}
+}
+
+func BenchmarkVectorCentroidAccumulateNaive768x8(b *testing.B) {
+	vecs := makeCentroidBenchmarkInputs(8, 768)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out := make([]float64, 768)
+		for _, v := range vecs {
+			naiveAccumulate(out, v)
+		}
+		vectorMathBenchmarkSink = out[0]
 	}
 }
 
@@ -766,6 +840,76 @@ func BenchmarkVecSearchFlatScanManySmallEmbeddings(b *testing.B) {
 		}
 		if len(rs.Rows) != 10 {
 			b.Fatalf("expected top-10 results, got %d", len(rs.Rows))
+		}
+	}
+}
+
+// makeHammingBenchmarkTable builds a table of binary-quantized-style
+// embeddings (each element is exactly 0.0 or 1.0, as VEC_BINARY_QUANTIZE
+// would produce) so VEC_HAMMING_DISTANCE comparisons below are meaningful
+// rather than degenerating to "everything differs".
+func makeHammingBenchmarkTable(rows, dims int) *storage.DB {
+	db := storage.NewDB()
+	table := storage.NewTable("hamming_docs", []storage.Column{
+		{Name: "id", Type: storage.IntType},
+		{Name: "embedding", Type: storage.VectorType},
+	}, false)
+
+	for i := 0; i < rows; i++ {
+		vec := make([]float64, dims)
+		for d := 0; d < dims; d++ {
+			// Deterministic pseudo-random bit pattern per row/dim.
+			if math.Sin(float64(i)*0.31+float64(d)*0.53) > 0 {
+				vec[d] = 1.0
+			}
+		}
+		table.Rows = append(table.Rows, []any{i, vec})
+	}
+
+	if err := db.Put("default", table); err != nil {
+		panic(err)
+	}
+	return db
+}
+
+// BenchmarkOrderByHammingDistanceLimit measures the one usage pattern that
+// actually puts VEC_HAMMING_DISTANCE (and, transitively, the unrolled
+// portable kernel it dispatches to) on a per-row hot path today: a full
+// table scan computing the distance for every row via ORDER BY ... LIMIT,
+// mirroring BenchmarkOrderByVectorLimit_NoWhere above but for Hamming
+// distance over binary-quantized embeddings instead of cosine similarity.
+// This is the benchmark that's actually representative of real-world
+// relevance, since none of VEC_HAMMING_DISTANCE/VEC_CENTROID are confirmed
+// to sit on any other hot path in tinySQL today.
+func BenchmarkOrderByHammingDistanceLimit(b *testing.B) {
+	const rows, dims = 12000, 768
+	db := makeHammingBenchmarkTable(rows, dims)
+	query := make([]float64, dims)
+	for i := range query {
+		if math.Cos(float64(i)*0.17) > 0 {
+			query[i] = 1.0
+		}
+	}
+	queryJSON, err := json.Marshal(query)
+	if err != nil {
+		b.Fatal(err)
+	}
+	stmt := mustParse(`
+		SELECT id, VEC_HAMMING_DISTANCE(embedding, VEC_FROM_JSON('` + string(queryJSON) + `')) AS hdist
+		FROM hamming_docs
+		ORDER BY hdist ASC
+		LIMIT 20
+	`)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rs, err := Execute(context.Background(), db, "default", stmt)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(rs.Rows) != 20 {
+			b.Fatalf("expected 20 results, got %d", len(rs.Rows))
 		}
 	}
 }

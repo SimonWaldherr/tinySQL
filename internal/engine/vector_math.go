@@ -119,6 +119,75 @@ func vectorCosineUnrolled(a, b []float64) (dot, normA2, normB2 float64) {
 	return d0 + d1, n0 + n1, m0 + m1
 }
 
+// vectorHammingDistance counts the positions where the (a[i] > 0) sign bit
+// of a differs from that of b, clamped to the shorter of the two lengths.
+//
+// Unlike Dot/L2Squared/L1/Cosine above, this is a comparison-and-count
+// reduction rather than an arithmetic multiply-accumulate or
+// subtract-accumulate, so it doesn't fit the existing AVX2/SSE2/NEON kernel
+// template those metrics share — a real SIMD kernel would need genuinely new
+// instruction selection (packed compare + popcount-style reduction), not a
+// mirror of an existing one. Given VEC_HAMMING_DISTANCE isn't confirmed to
+// sit on any per-row hot path today, and given the same caution
+// vector_math_arm64.go already applies to vectorL1Kernel — hand-derived SIMD
+// bit patterns that can't be validated on real hardware risk silently
+// corrupting results instead of failing to build — the deliberate choice
+// here is to ship only a portable, well-tested, 4-way-unrolled Go
+// implementation on every architecture (amd64 included), and dispatch it the
+// same way the other metrics dispatch their kernels so a future contributor
+// can drop in a real kernel later without touching call sites.
+func vectorHammingDistance(a, b []float64) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	return vectorHammingUnrolled(a[:n], b[:n])
+}
+
+func vectorHammingUnrolled(a, b []float64) int {
+	var c0, c1, c2, c3 int
+	i := 0
+	for ; i+3 < len(a); i += 4 {
+		if (a[i] > 0) != (b[i] > 0) {
+			c0++
+		}
+		if (a[i+1] > 0) != (b[i+1] > 0) {
+			c1++
+		}
+		if (a[i+2] > 0) != (b[i+2] > 0) {
+			c2++
+		}
+		if (a[i+3] > 0) != (b[i+3] > 0) {
+			c3++
+		}
+	}
+	count := c0 + c1 + c2 + c3
+	for ; i < len(a); i++ {
+		if (a[i] > 0) != (b[i] > 0) {
+			count++
+		}
+	}
+	return count
+}
+
+// vectorAccumulateUnrolled adds src into dst elementwise, in place. Used by
+// VEC_CENTROID's running sum. This is an accumulation, not a pairwise
+// reduction, so it doesn't fit the existing dot/L2/L1/cosine kernel shape —
+// a portable unrolled loop only, no new SIMD assembly (same reasoning as
+// vectorHammingUnrolled above: unconfirmed hot path, not worth new asm risk).
+func vectorAccumulateUnrolled(dst, src []float64) {
+	i := 0
+	for ; i+3 < len(dst); i += 4 {
+		dst[i] += src[i]
+		dst[i+1] += src[i+1]
+		dst[i+2] += src[i+2]
+		dst[i+3] += src[i+3]
+	}
+	for ; i < len(dst); i++ {
+		dst[i] += src[i]
+	}
+}
+
 func vectorDistance(metric string, a, b []float64, normA, normB float64) (float64, bool) {
 	if len(a) != len(b) {
 		return 0, false

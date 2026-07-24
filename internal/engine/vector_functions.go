@@ -850,11 +850,20 @@ func evalVecQuantize(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 
 	levels := math.Pow(2, float64(bits)) - 1
 	out := make([]float64, len(vec))
-	for i, v := range vec {
-		// Quantize: normalize to [0,1], scale to levels, round, scale back
-		normalized := (v - minV) / rangeV
-		quantized := math.Round(normalized * levels)
-		out[i] = quantized/levels*rangeV + minV
+	// Quantize: normalize to [0,1], scale to levels, round, scale back. Each
+	// element is independent (no cross-element state), so this is a clean
+	// 4-way unroll (same style as vectorL1Unrolled in vector_math.go) unlike
+	// the min/max search above, whose running-min/running-max tracking is a
+	// data-dependent reduction that doesn't unroll cleanly.
+	i := 0
+	for ; i+3 < len(vec); i += 4 {
+		out[i] = math.Round((vec[i]-minV)/rangeV*levels)/levels*rangeV + minV
+		out[i+1] = math.Round((vec[i+1]-minV)/rangeV*levels)/levels*rangeV + minV
+		out[i+2] = math.Round((vec[i+2]-minV)/rangeV*levels)/levels*rangeV + minV
+		out[i+3] = math.Round((vec[i+3]-minV)/rangeV*levels)/levels*rangeV + minV
+	}
+	for ; i < len(vec); i++ {
+		out[i] = math.Round((vec[i]-minV)/rangeV*levels)/levels*rangeV + minV
 	}
 	return out, nil
 }
@@ -1052,8 +1061,25 @@ func evalVecBinaryQuantize(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return nil, fmt.Errorf("VEC_BINARY_QUANTIZE: %w", err)
 	}
 	out := make([]float64, len(vec))
-	for i, v := range vec {
-		if v > 0 {
+	// Each element maps independently to 0/1, so this is a clean 4-way
+	// unroll (same style as vectorL1Unrolled in vector_math.go).
+	i := 0
+	for ; i+3 < len(vec); i += 4 {
+		if vec[i] > 0 {
+			out[i] = 1.0
+		}
+		if vec[i+1] > 0 {
+			out[i+1] = 1.0
+		}
+		if vec[i+2] > 0 {
+			out[i+2] = 1.0
+		}
+		if vec[i+3] > 0 {
+			out[i+3] = 1.0
+		}
+	}
+	for ; i < len(vec); i++ {
+		if vec[i] > 0 {
 			out[i] = 1.0
 		}
 	}
@@ -1083,21 +1109,7 @@ func evalVecHammingDistance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if len(a) != len(b) {
 		return nil, fmt.Errorf("VEC_HAMMING_DISTANCE: dimension mismatch %d vs %d", len(a), len(b))
 	}
-	var dist int
-	for i := range a {
-		ai := 0
-		if a[i] > 0 {
-			ai = 1
-		}
-		bi := 0
-		if b[i] > 0 {
-			bi = 1
-		}
-		if ai != bi {
-			dist++
-		}
-	}
-	return dist, nil
+	return vectorHammingDistance(a, b), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1123,9 +1135,7 @@ func evalVecCentroid(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	dim := len(vecs[0])
 	out := make([]float64, dim)
 	for _, v := range vecs {
-		for i, x := range v {
-			out[i] += x
-		}
+		vectorAccumulateUnrolled(out, v)
 	}
 	n := float64(len(vecs))
 	for i := range out {
