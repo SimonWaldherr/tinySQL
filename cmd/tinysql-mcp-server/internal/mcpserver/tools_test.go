@@ -404,6 +404,145 @@ func TestMaxRows_TruncatesResults(t *testing.T) {
 	}
 }
 
+// ─── rag_search tests ─────────────────────────────────────────────────────────
+
+// setupRagSearchTable creates a small chunked table with VECTOR embeddings
+// used by the rag_search tests below.
+func setupRagSearchTable(t *testing.T, s *Server) {
+	t.Helper()
+	mustExec(t, s, `CREATE TABLE rag_search_demo (
+		doc_id      TEXT,
+		chunk_index INT,
+		chunk_text  TEXT,
+		embedding   VECTOR
+	)`)
+	mustExec(t, s, `INSERT INTO rag_search_demo VALUES
+		('doc-1', 0, 'TinySQL is a lightweight embeddable SQL engine', '[0.9, 0.1, 0.0]'),
+		('doc-1', 1, 'It supports vector search and full-text search', '[0.85, 0.15, 0.05]'),
+		('doc-1', 2, 'RAG pipelines combine retrieval with generation', '[0.1, 0.0, 0.9]'),
+		('doc-2', 0, 'Full-text search uses BM25 ranking', '[0.2, 0.0, 0.8]')`)
+}
+
+func TestRagSearch_VectorOnly(t *testing.T) {
+	s := New(openTestStore(t))
+	setupRagSearchTable(t, s)
+
+	res, err := s.HandleRagSearch(context.Background(), RagSearchArgs{
+		Table:        "rag_search_demo",
+		VectorColumn: "embedding",
+		QueryVector:  []float64{0.9, 0.1, 0.0},
+		K:            2,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("rag_search error: %s", contentText(res))
+	}
+	text := contentText(res)
+	if !strings.Contains(text, "\"doc_id\": \"doc-1\"") {
+		t.Errorf("expected doc-1 in top result, got: %s", text)
+	}
+	if !strings.Contains(text, "2 row(s) returned") {
+		t.Errorf("expected 2 rows returned, got: %s", text)
+	}
+}
+
+func TestRagSearch_HybridRRF(t *testing.T) {
+	s := New(openTestStore(t))
+	setupRagSearchTable(t, s)
+
+	res, err := s.HandleRagSearch(context.Background(), RagSearchArgs{
+		Table:        "rag_search_demo",
+		VectorColumn: "embedding",
+		QueryVector:  []float64{0.9, 0.1, 0.0},
+		K:            3,
+		Options: `{"text_column":"chunk_text","text_query":"full-text search",` +
+			`"key_columns":["doc_id","chunk_index"]}`,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("rag_search hybrid error: %s", contentText(res))
+	}
+	text := contentText(res)
+	if !strings.Contains(text, "_rrf_score") {
+		t.Errorf("expected _rrf_score column in hybrid result, got: %s", text)
+	}
+}
+
+func TestRagSearch_HybridWithExpansion(t *testing.T) {
+	s := New(openTestStore(t))
+	setupRagSearchTable(t, s)
+
+	res, err := s.HandleRagSearch(context.Background(), RagSearchArgs{
+		Table:        "rag_search_demo",
+		VectorColumn: "embedding",
+		QueryVector:  []float64{0.9, 0.1, 0.0},
+		K:            2,
+		Options: `{"text_column":"chunk_text","text_query":"vector search",` +
+			`"key_columns":["doc_id","chunk_index"],"expand_before":1,"expand_after":1,` +
+			`"doc_id_column":"doc_id","chunk_index_column":"chunk_index"}`,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("rag_search expand error: %s", contentText(res))
+	}
+	text := contentText(res)
+	if !strings.Contains(text, "_context_rank") {
+		t.Errorf("expected _context_rank column in expanded result, got: %s", text)
+	}
+}
+
+func TestRagSearch_RejectsMissingTable(t *testing.T) {
+	s := New(openTestStore(t))
+	res, err := s.HandleRagSearch(context.Background(), RagSearchArgs{
+		VectorColumn: "embedding",
+		QueryVector:  []float64{1, 0},
+		K:            1,
+	})
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if !res.IsError {
+		t.Error("rag_search should reject a missing table name")
+	}
+}
+
+func TestRagSearch_RejectsEmptyQueryVector(t *testing.T) {
+	s := New(openTestStore(t))
+	res, err := s.HandleRagSearch(context.Background(), RagSearchArgs{
+		Table:        "rag_search_demo",
+		VectorColumn: "embedding",
+		K:            1,
+	})
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if !res.IsError {
+		t.Error("rag_search should reject an empty query_vector")
+	}
+}
+
+func TestRagSearch_RejectsNonPositiveK(t *testing.T) {
+	s := New(openTestStore(t))
+	res, err := s.HandleRagSearch(context.Background(), RagSearchArgs{
+		Table:        "rag_search_demo",
+		VectorColumn: "embedding",
+		QueryVector:  []float64{1, 0},
+		K:            0,
+	})
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if !res.IsError {
+		t.Error("rag_search should reject k <= 0")
+	}
+}
+
 // ─── no internal imports test ─────────────────────────────────────────────────
 
 // TestNoInternalImports verifies that no file in the tinysql-mcp-server

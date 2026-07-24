@@ -158,7 +158,40 @@ func (f *RAGContextFromTableFunc) Execute(ctx context.Context, args []Expr, env 
 	if err != nil {
 		return nil, err
 	}
+	// Validate every hit row's doc/chunk columns up front, so a malformed or
+	// mistyped hit set still produces the original hard error instead of
+	// ragExpandContextFrom's own lenient per-row skip (that leniency exists
+	// so ragExpandContextFrom can also serve RAG_SEARCH's in-memory, not
+	// necessarily uniform, fused result set — see its doc comment — but
+	// RAG_CONTEXT_FROM's own contract with real callers is to fail loudly on
+	// a bad column name or a non-numeric chunk index, exactly as it did
+	// before the extract-method refactor).
+	for hitIdx := 0; hitIdx < hits.len(); hitIdx++ {
+		hit := hits.outputRow(hitIdx)
+		if _, ok := ragValue(hit, hitDocCol); !ok {
+			return nil, fmt.Errorf("RAG_CONTEXT_FROM: hit column %q not found", hitDocCol)
+		}
+		chunkVal, ok := ragValue(hit, hitChunkCol)
+		if !ok {
+			return nil, fmt.Errorf("RAG_CONTEXT_FROM: hit column %q not found", hitChunkCol)
+		}
+		if _, err := toInt(chunkVal); err != nil {
+			return nil, fmt.Errorf("RAG_CONTEXT_FROM %s: %w", hitChunkCol, err)
+		}
+	}
 
+	return ragExpandContextFrom(source, hits, docCol, chunkCol, hitDocCol, hitChunkCol, before, after), nil
+}
+
+// ragExpandContextFrom implements the neighbor-expansion core of
+// RAG_CONTEXT_FROM: build a per-document chunk index over source, then for
+// each row in hits find neighboring chunks (within before/after of the hit's
+// chunk position), merging overlapping provenance across hits and ranking by
+// (hit rank, hit order, |offset|, chunk identity). Extracted verbatim from
+// RAGContextFromTableFunc.Execute so RAG_SEARCH (rag_search.go) can reuse the
+// exact same expansion logic against an in-memory fused result set instead of
+// a named table/CTE.
+func ragExpandContextFrom(source, hits ragSource, docCol, chunkCol, hitDocCol, hitChunkCol string, before, after int) *ResultSet {
 	contexts := ragBuildContextIndex(source, docCol, chunkCol)
 	cols := append(append([]string{}, source.cols...), "_hit_rank", "_context_offset", "_context_rank", "_context_hits")
 	candidates := make(map[ragContextKey]*ragContextCandidate)
@@ -166,15 +199,21 @@ func (f *RAGContextFromTableFunc) Execute(ctx context.Context, args []Expr, env 
 		hit := hits.outputRow(hitIdx)
 		docID, ok := ragValue(hit, hitDocCol)
 		if !ok {
-			return nil, fmt.Errorf("RAG_CONTEXT_FROM: hit column %q not found", hitDocCol)
+			// Column presence is validated up front by the caller (see
+			// RAGContextFromTableFunc.Execute) against every current caller's
+			// hit set; a row that still lacks it (e.g. a sparse in-memory
+			// fused result set built directly by RAG_SEARCH) is skipped rather
+			// than aborting the whole expansion, since this helper has no
+			// error return.
+			continue
 		}
 		chunkVal, ok := ragValue(hit, hitChunkCol)
 		if !ok {
-			return nil, fmt.Errorf("RAG_CONTEXT_FROM: hit column %q not found", hitChunkCol)
+			continue
 		}
 		centerChunk, err := toInt(chunkVal)
 		if err != nil {
-			return nil, fmt.Errorf("RAG_CONTEXT_FROM %s: %w", hitChunkCol, err)
+			continue
 		}
 
 		matches := contexts.find(docID, centerChunk, before, after)
@@ -228,7 +267,7 @@ func (f *RAGContextFromTableFunc) Execute(ctx context.Context, args []Expr, env 
 		r["_context_hits"] = candidate.hitCount
 		out = append(out, r)
 	}
-	return &ResultSet{Cols: cols, Rows: out}, nil
+	return &ResultSet{Cols: cols, Rows: out}
 }
 
 type ragSource struct {
@@ -532,8 +571,16 @@ func ragCopyOutputRow(cols []string, src Row) Row {
 	return out
 }
 
+// ragHitRank resolves a retrieval hit's rank for context-expansion provenance
+// ordering. _rrf_rank is checked before _vec_rank: a RAG_SEARCH hybrid-mode
+// hit set can carry both (a row matched by the vector pass keeps its partial
+// _vec_rank alongside the final fused _rrf_rank), and _rrf_rank — reflecting
+// the combined vector+text ranking — is the more authoritative signal for a
+// hybrid hit set. Callers whose rows never carry "_rrf_rank" (every existing
+// RAG_CONTEXT_FROM caller before RAG_SEARCH) are unaffected: the lookup for
+// that column simply never matches, falling through exactly as before.
 func ragHitRank(hit Row, fallback int) int {
-	for _, col := range []string{"_vec_rank", "_hit_rank", "rank"} {
+	for _, col := range []string{"_rrf_rank", "_vec_rank", "_hit_rank", "rank"} {
 		if v, ok := ragValue(hit, col); ok {
 			if n, err := toInt(v); err == nil {
 				return n

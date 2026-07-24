@@ -246,3 +246,61 @@ codes and numbers aren't mangled by stemming). `CONTAINS_SCORE` returns a
 
 See [BENCHMARKS.md](../BENCHMARKS.md) for measured numbers on the vector and
 RAG query paths.
+
+## 7. RAG_SEARCH: composed retrieval in one call
+
+Sections 2, 4, and 5 above hand-assemble vector search, context expansion,
+and hybrid RRF fusion from `VEC_SEARCH`, `RAG_CONTEXT_FROM`, and
+`FTS_SEARCH`. `RAG_SEARCH(table, vector_column, query_vector, k
+[, options_json])` composes all three into a single table-valued function
+call for the common case where you don't need to hand-write that pipeline
+yourself.
+
+Vector-only (equivalent to plain `VEC_SEARCH`, one call):
+
+```sql
+SELECT * FROM RAG_SEARCH('chunks', 'embedding', VEC_FROM_JSON('[0.1, 0.0, 0.9]'), 5);
+```
+
+Hybrid vector + BM25 keyword search, fused with reciprocal rank fusion — the
+`options_json` 5th argument replaces the manual `LEFT JOIN` + RRF-score
+expression from section 5. `key_columns` is required in hybrid mode: it's how
+`RAG_SEARCH` matches a row across the independently-fetched vector and text
+candidate sets:
+
+```sql
+SELECT * FROM RAG_SEARCH('chunks', 'embedding', VEC_FROM_JSON('[0.1, 0.0, 0.9]'), 5, '{
+  "text_column": "chunk_text",
+  "text_query": "timeout OR retry",
+  "key_columns": ["doc_id", "chunk_index"]
+}');
+```
+
+Hybrid search plus neighbor-chunk context expansion — replaces wrapping the
+hybrid CTE in `RAG_CONTEXT_FROM` as in section 4 — in one call:
+
+```sql
+SELECT * FROM RAG_SEARCH('chunks', 'embedding', VEC_FROM_JSON('[0.1, 0.0, 0.9]'), 5, '{
+  "text_column": "chunk_text",
+  "text_query": "timeout OR retry",
+  "key_columns": ["doc_id", "chunk_index"],
+  "expand_before": 1,
+  "expand_after": 1,
+  "doc_id_column": "doc_id",
+  "chunk_index_column": "chunk_index"
+}')
+ORDER BY _context_rank;
+```
+
+`RAG_SEARCH` sidesteps both footguns called out above **by construction**: it
+computes its own `_vec_similarity`/`_vec_rank`/`_fts_rank`/`_rrf_score` (or
+`_context_offset`/`_context_rank` in expansion mode) internally rather than
+trusting a caller-supplied column, so neither the [distance-vs-similarity
+mixup](#2-retrieve-vec_search) (feeding `_vec_distance` where a similarity is
+expected) nor the [metric-mismatch silent
+degradation](#3-rerank-blend-similarity-with-freshness-and-quality) (a
+non-cosine `_vec_similarity` collapsing to 0 inside `RAG_RANK_SCORE`) can
+arise — there is no caller-supplied similarity column to get wrong. Reach for
+`VEC_SEARCH`/`FTS_SEARCH`/`RAG_CONTEXT_FROM` directly (sections 2, 4, 5) when
+you need a custom ranking expression, extra filters in the join, or scoring
+beyond plain RRF; reach for `RAG_SEARCH` for everything else.

@@ -53,6 +53,45 @@ RAG_CONTEXT_FROM(table, doc_id_col, chunk_index_col, hits_table, hit_doc_id_col,
     deduplicated. Returns _hit_rank, _context_offset, _context_hits,
     _context_rank alongside the source columns.
 
+RAG_SEARCH(table, vector_column, query_vector, k [, options_json])
+    Composes VEC_SEARCH + FTS_SEARCH (hybrid RRF fusion) + RAG_CONTEXT_FROM
+    (neighbor-chunk expansion) into a single call, so a typical RAG retrieval
+    pipeline no longer needs to be hand-assembled from those three
+    primitives. Vector-only by default; options_json (5th arg, a JSON
+    string) opts into hybrid fusion and/or context expansion:
+      metric              same as VEC_SEARCH (default 'cosine')
+      index               same as VEC_SEARCH (default 'flat')
+      text_column          }  set both to enable BM25 hybrid fusion via RRF
+      text_query           }  (requires key_columns too)
+      key_columns         []string identifying a row across the independent
+                           vector/text candidate sets (required for hybrid)
+      auto_or_expand       OR-expand text_query's terms (default true) —
+                           see FTS_SEARCH's implicit-AND caveat
+      candidate_k          candidates fetched per pass before fusion/truncation
+                           to k (default k*4)
+      rrf_k                RRF constant (default 60)
+      expand_before,
+      expand_after         }  set either to enable RAG_CONTEXT_FROM-style
+      doc_id_column,       }  neighbor-chunk expansion of the final hit set
+      chunk_index_column   }  (doc_id_column/chunk_index_column required)
+    Returns every column of ` + "`table`" + ` plus whichever of _vec_distance/
+    _vec_similarity/_vec_rank, _fts_score/_fts_rank, _rrf_score/_rrf_rank,
+    or _hit_rank/_context_offset/_context_hits/_context_rank apply to the
+    requested mode. Because RAG_SEARCH computes its own similarity/rank
+    values internally (rather than trusting a caller-supplied column), it
+    sidesteps the distance-vs-similarity and metric-mismatch footguns noted
+    under VEC_SEARCH above by construction.
+    Example (hybrid + context expansion in one call):
+      SELECT * FROM RAG_SEARCH('chunks', 'embedding', VEC_FROM_JSON('[0.1,0.2,0.9]'), 5, '{
+        "text_column": "chunk_text",
+        "text_query": "timeout OR retry",
+        "key_columns": ["doc_id", "chunk_index"],
+        "expand_before": 1,
+        "expand_after": 1,
+        "doc_id_column": "doc_id",
+        "chunk_index_column": "chunk_index"
+      }')
+
 ## Scalar functions
 
 Vector construction / serialization:

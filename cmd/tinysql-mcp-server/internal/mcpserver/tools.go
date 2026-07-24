@@ -52,6 +52,15 @@ type SampleTableArgs struct {
 	Limit     int    `json:"limit,omitempty" jsonschema:"Maximum number of rows to return (default 10)"`
 }
 
+// RagSearchArgs is the input schema for the rag_search tool.
+type RagSearchArgs struct {
+	Table        string    `json:"table" jsonschema:"Name of the table to search"`
+	VectorColumn string    `json:"vector_column" jsonschema:"Name of the VECTOR column to search"`
+	QueryVector  []float64 `json:"query_vector" jsonschema:"Query embedding vector"`
+	K            int       `json:"k" jsonschema:"Number of results to return"`
+	Options      string    `json:"options,omitempty" jsonschema:"Optional JSON object controlling metric/index, hybrid BM25 fusion, and neighbor-chunk context expansion (metric, index, text_column, text_query, auto_or_expand, candidate_k, rrf_k, key_columns, expand_before, expand_after, doc_id_column, chunk_index_column); see the tinysql://functions resource for the full shape and defaults"` // raw JSON passthrough matching ragSearchOptions
+}
+
 // ─── server ────────────────────────────────────────────────────────────────────
 
 // Server wraps an MCP server and the tinySQL store, wiring tools, resources,
@@ -239,6 +248,54 @@ func (s *Server) HandleSampleTable(ctx context.Context, args SampleTableArgs) (*
 	rows, cols, truncated, err := s.queryRows(ctx, q)
 	if err != nil {
 		return toolErrorf("sample_table failed: %v", err)
+	}
+	return queryResultContent(rows, cols, truncated)
+}
+
+// HandleRagSearch executes a composed RAG retrieval: k-NN vector search,
+// optional BM25 hybrid fusion (reciprocal rank fusion), and optional
+// neighbor-chunk context expansion, all via the single RAG_SEARCH
+// table-valued function.
+func (s *Server) HandleRagSearch(ctx context.Context, args RagSearchArgs) (*mcp.CallToolResult, error) {
+	table := strings.TrimSpace(args.Table)
+	if table == "" {
+		return toolErrorf("table is required")
+	}
+	col := strings.TrimSpace(args.VectorColumn)
+	if col == "" {
+		return toolErrorf("vector_column is required")
+	}
+	if len(args.QueryVector) == 0 {
+		return toolErrorf("query_vector must not be empty")
+	}
+	if args.K <= 0 {
+		return toolErrorf("k must be a positive integer")
+	}
+
+	vecJSON, err := json.Marshal(args.QueryVector)
+	if err != nil {
+		return toolErrorf("marshal query_vector: %v", err)
+	}
+
+	// table, vector_column, the query vector (via VEC_FROM_JSON), k, and the
+	// options JSON are all bound as placeholder parameters in a
+	// table-valued-function argument position (RAG_SEARCH's FROM-clause
+	// arg list), not just a WHERE-clause literal.
+	var (
+		q    string
+		vals []any
+	)
+	if strings.TrimSpace(args.Options) == "" {
+		q = "SELECT * FROM RAG_SEARCH(?, ?, VEC_FROM_JSON(?), ?)"
+		vals = []any{table, col, string(vecJSON), args.K}
+	} else {
+		q = "SELECT * FROM RAG_SEARCH(?, ?, VEC_FROM_JSON(?), ?, ?)"
+		vals = []any{table, col, string(vecJSON), args.K, args.Options}
+	}
+
+	rows, cols, truncated, err := s.queryRowsArgs(ctx, q, vals...)
+	if err != nil {
+		return toolErrorf("rag_search failed: %v", err)
 	}
 	return queryResultContent(rows, cols, truncated)
 }

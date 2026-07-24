@@ -15,10 +15,10 @@ func TestFunctionsCatalogListsRAGSurface(t *testing.T) {
 	mustContain := []string{
 		"VEC_SEARCH", "VEC_TOP_K", "VEC_WARM",
 		"FTS_SEARCH", "FTS_MATCH", "FTS_RANK",
-		"RAG_CONTEXT", "RAG_CONTEXT_FROM",
+		"RAG_CONTEXT", "RAG_CONTEXT_FROM", "RAG_SEARCH",
 		"RECENCY_SCORE", "RAG_HYBRID_SCORE", "RAG_RANK_SCORE",
 		"_vec_similarity", "_vec_distance", "_vec_rank",
-		"_fts_score", "_fts_rank",
+		"_fts_score", "_fts_rank", "_rrf_score", "_rrf_rank",
 	}
 	for _, name := range mustContain {
 		if !strings.Contains(functionsCatalog, name) {

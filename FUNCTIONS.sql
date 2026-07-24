@@ -1119,6 +1119,55 @@ SELECT VEC_AVG(VEC_FROM_JSON('[0.9, 0.1, 0.0, 0.0]'), VEC_FROM_JSON('[0.8, 0.2, 
 DROP TABLE vec_demo_docs;
 DROP TABLE vec_demo_kb;
 
+-- ---- RAG_SEARCH: composed retrieval (one call) ----
+
+-- RAG_SEARCH(table, vector_column, query_vector, k [, options_json]) composes
+-- VEC_SEARCH + FTS_SEARCH (hybrid reciprocal rank fusion) + RAG_CONTEXT_FROM
+-- (neighbor-chunk expansion) into a single table-valued function, instead of
+-- hand-assembling that pipeline from the three primitives above.
+
+CREATE TABLE rag_search_demo (
+    doc_id      TEXT,
+    chunk_index INT,
+    chunk_text  TEXT,
+    embedding   VECTOR
+);
+INSERT INTO rag_search_demo VALUES
+    ('doc-1', 0, 'TinySQL is a lightweight embeddable SQL engine', '[0.9, 0.1, 0.0]'),
+    ('doc-1', 1, 'It supports vector search and full-text search', '[0.85, 0.15, 0.05]'),
+    ('doc-1', 2, 'RAG pipelines combine retrieval with generation', '[0.1, 0.0, 0.9]'),
+    ('doc-2', 0, 'Full-text search uses BM25 ranking', '[0.2, 0.0, 0.8]');
+
+-- 1. Vector-only search (equivalent to VEC_SEARCH, one call)
+SELECT doc_id, chunk_index, chunk_text, _vec_distance, _vec_similarity, _vec_rank
+FROM RAG_SEARCH('rag_search_demo', 'embedding', VEC_FROM_JSON('[0.9, 0.1, 0.0]'), 2);
+
+-- 2. Hybrid vector + BM25 keyword search fused via reciprocal rank fusion
+-- (RRF). key_columns is required in hybrid mode: it's how RAG_SEARCH matches
+-- a row across the independently-fetched vector and text candidate sets.
+SELECT doc_id, chunk_index, chunk_text, _rrf_score, _rrf_rank
+FROM RAG_SEARCH('rag_search_demo', 'embedding', VEC_FROM_JSON('[0.9, 0.1, 0.0]'), 3, '{
+    "text_column": "chunk_text",
+    "text_query": "full-text search",
+    "key_columns": ["doc_id", "chunk_index"]
+}');
+
+-- 3. Hybrid search plus neighbor-chunk context expansion, in one call
+-- (replaces wrapping the hybrid result in RAG_CONTEXT_FROM separately).
+SELECT doc_id, chunk_index, chunk_text, _hit_rank, _context_offset, _context_rank
+FROM RAG_SEARCH('rag_search_demo', 'embedding', VEC_FROM_JSON('[0.9, 0.1, 0.0]'), 2, '{
+    "text_column": "chunk_text",
+    "text_query": "vector search",
+    "key_columns": ["doc_id", "chunk_index"],
+    "expand_before": 1,
+    "expand_after": 1,
+    "doc_id_column": "doc_id",
+    "chunk_index_column": "chunk_index"
+}')
+ORDER BY _context_rank;
+
+DROP TABLE rag_search_demo;
+
 -- ============================================================
 -- END OF EXAMPLES
 -- ============================================================

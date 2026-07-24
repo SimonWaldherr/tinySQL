@@ -907,6 +907,56 @@ func ftsIDFLookup(entry ftsDocCacheEntry) ftsIDFFunc {
 	}
 }
 
+// ftsAutoOrExpandStopWords holds the natural-language stopword list used by
+// ftsAutoOrExpand. It intentionally duplicates (rather than reuses) the
+// smaller ftsStopWords map above: ftsStopWords is tuned for FTS_MATCH/
+// FTS_RANK's own tokenizer (which already strips punctuation and applies
+// stemming), while this list targets raw natural-language questions/queries
+// coming from RAG_SEARCH callers and additionally covers question words
+// ("what", "how", ...) and a handful of German stopwords, ported verbatim
+// from cmd/ragdemo/main.go's ftsQuery() helper.
+var ftsAutoOrExpandStopWords = map[string]bool{
+	"a": true, "an": true, "and": true, "are": true, "as": true, "at": true,
+	"be": true, "before": true, "can": true, "do": true, "does": true, "for": true,
+	"from": true, "how": true, "i": true, "in": true, "is": true, "it": true,
+	"of": true, "on": true, "or": true, "the": true, "this": true, "to": true,
+	"what": true, "which": true, "with": true,
+	"als": true, "auf": true, "das": true, "der": true, "die": true, "ein": true,
+	"eine": true, "für": true, "fuer": true, "ich": true, "jede": true, "mit": true,
+	"setze": true, "und": true, "wie": true,
+}
+
+// ftsAutoOrExpand turns a natural-language question into an explicit
+// OR-joined FTS_SEARCH query. FTS_SEARCH treats adjacent terms as an implicit
+// AND (see ftsParseAnd above), which is useful for search-box syntax but too
+// strict for verbose natural-language queries — a single unmatched word
+// (often a stopword) would otherwise sink the whole query to zero hits.
+// Tokenizing on non-alphanumeric runes, dropping stopwords/duplicates, and
+// OR-joining what remains turns "what is the capital of France" into
+// "capital OR france", matching if any remaining content word matches.
+//
+// Ported from cmd/ragdemo/main.go's ftsQuery() helper (internal/engine cannot
+// import cmd/ragdemo, so the logic is duplicated here rather than shared).
+func ftsAutoOrExpand(query string) string {
+	fields := strings.FieldsFunc(strings.ToLower(query), func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' && r != '-'
+	})
+	seen := make(map[string]bool)
+	terms := make([]string, 0, len(fields))
+	for _, field := range fields {
+		field = strings.Trim(field, "-")
+		if len([]rune(field)) < 2 || ftsAutoOrExpandStopWords[field] || seen[field] {
+			continue
+		}
+		seen[field] = true
+		terms = append(terms, field)
+	}
+	if len(terms) == 0 {
+		return strings.TrimSpace(query)
+	}
+	return strings.Join(terms, " OR ")
+}
+
 // ─────────────────────────── FTS_SEARCH table-valued function ─────────────────
 
 // ftsScored pairs a table row index with its computed relevance score.

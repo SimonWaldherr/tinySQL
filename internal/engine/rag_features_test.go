@@ -741,3 +741,336 @@ func TestRAGContextFromMergesOverlappingHitProvenance(t *testing.T) {
 		}
 	}
 }
+
+// ─────────────────────────── RAG_SEARCH (composed retrieval) ────────────────
+
+// TestRAGSearchVectorOnly checks that a plain (no-options, or metric-only)
+// RAG_SEARCH call behaves exactly like VEC_SEARCH truncated to k: results
+// come back in descending-similarity order and carry VEC_SEARCH's own
+// trailing columns.
+func TestRAGSearchVectorOnly(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	Execute(ctx, db, "default", mustParse(`
+		CREATE TABLE rag_docs (id INT, content TEXT, embedding VECTOR)
+	`))
+	Execute(ctx, db, "default", mustParse(`
+		INSERT INTO rag_docs VALUES
+			(1, 'Go is a compiled systems programming language', '[1.0, 0.1, 0.0]'),
+			(2, 'Python is popular for data science and machine learning', '[0.0, 0.9, 0.1]'),
+			(3, 'Rust provides memory safety without garbage collection', '[0.1, 0.0, 1.0]'),
+			(4, 'Go programming with goroutines for concurrency', '[0.9, 0.2, 0.0]')
+	`))
+
+	// Query vector closest to id=1, then id=4 (cosine similarity).
+	rs := execSQL(t, db, `
+		SELECT * FROM RAG_SEARCH('rag_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 2)
+	`)
+	if len(rs.Rows) != 2 {
+		t.Fatalf("RAG_SEARCH vector-only: expected 2 rows, got %d", len(rs.Rows))
+	}
+	if rs.Rows[0]["id"] != 1 || rs.Rows[1]["id"] != 4 {
+		t.Fatalf("RAG_SEARCH vector-only: expected ids [1,4] in similarity order, got [%v,%v]", rs.Rows[0]["id"], rs.Rows[1]["id"])
+	}
+	for _, col := range []string{"_vec_distance", "_vec_similarity", "_vec_rank"} {
+		if _, ok := rs.Rows[0][col]; !ok {
+			t.Errorf("RAG_SEARCH vector-only: expected column %q in result", col)
+		}
+	}
+	if rs.Rows[0]["_vec_rank"] != 1 {
+		t.Errorf("RAG_SEARCH vector-only: expected top row _vec_rank=1, got %v", rs.Rows[0]["_vec_rank"])
+	}
+
+	// Same, but with an explicit metric-only options object (no hybrid/expand).
+	rsMetric := execSQL(t, db, `
+		SELECT * FROM RAG_SEARCH('rag_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 2, '{"metric": "cosine"}')
+	`)
+	if len(rsMetric.Rows) != 2 || rsMetric.Rows[0]["id"] != 1 || rsMetric.Rows[1]["id"] != 4 {
+		t.Fatalf("RAG_SEARCH with metric-only options: expected ids [1,4], got %v/%v (%d rows)", rsMetric.Rows[0]["id"], rsMetric.Rows[1]["id"], len(rsMetric.Rows))
+	}
+}
+
+// TestRAGSearchHybridRRF verifies that turning on hybrid text+vector fusion
+// changes the ranking versus a vector-only call in a way that demonstrates
+// the FTS signal actually contributed: a row that's a strong text match but
+// weak vector match should climb into the top-k under hybrid mode even
+// though it does not appear in the vector-only top-k.
+func TestRAGSearchHybridRRF(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	Execute(ctx, db, "default", mustParse(`
+		CREATE TABLE hybrid_docs (id INT, content TEXT, embedding VECTOR)
+	`))
+	Execute(ctx, db, "default", mustParse(`
+		INSERT INTO hybrid_docs VALUES
+			(1, 'quantum entanglement physics breakthrough', '[1.0, 0.0, 0.0]'),
+			(2, 'cooking recipes for dinner',                 '[0.0, 0.0, 1.0]'),
+			(3, 'gardening tips for spring',                  '[0.0, 0.1, 0.9]'),
+			(4, 'financial markets update',                   '[0.9, 0.0, 0.1]')
+	`))
+
+	// Vector-only: query vector [0,0,1] is closest to id=2, then id=3; id=1
+	// (perpendicular to the query) ranks last.
+	rsVecOnly := execSQL(t, db, `
+		SELECT * FROM RAG_SEARCH('hybrid_docs', 'embedding', VEC_FROM_JSON('[0.0, 0.0, 1.0]'), 2)
+	`)
+	if len(rsVecOnly.Rows) != 2 || rsVecOnly.Rows[0]["id"] != 2 || rsVecOnly.Rows[1]["id"] != 3 {
+		t.Fatalf("RAG_SEARCH vector-only baseline: expected ids [2,3], got %v/%v", rsVecOnly.Rows[0]["id"], rsVecOnly.Rows[1]["id"])
+	}
+
+	// Hybrid: id=1 is the only document matching the text query ("quantum
+	// entanglement"), so it should be pulled into the top-2 by RRF fusion
+	// even though its vector similarity to the query is the weakest of all.
+	rsHybrid := execSQL(t, db, `
+		SELECT * FROM RAG_SEARCH('hybrid_docs', 'embedding', VEC_FROM_JSON('[0.0, 0.0, 1.0]'), 2, '{
+			"text_column": "content",
+			"text_query": "quantum entanglement",
+			"key_columns": ["id"]
+		}')
+	`)
+	if len(rsHybrid.Rows) != 2 {
+		t.Fatalf("RAG_SEARCH hybrid: expected 2 rows, got %d", len(rsHybrid.Rows))
+	}
+	if rsHybrid.Rows[0]["id"] != 1 {
+		t.Fatalf("RAG_SEARCH hybrid: expected text-strong id=1 to rank first, got %v (full: %v/%v)", rsHybrid.Rows[0]["id"], rsHybrid.Rows[0]["id"], rsHybrid.Rows[1]["id"])
+	}
+	if rsHybrid.Rows[1]["id"] == 3 {
+		t.Fatalf("RAG_SEARCH hybrid: expected id=3 (pure vector runner-up) to be displaced by the text-strong id=1, got %v/%v", rsHybrid.Rows[0]["id"], rsHybrid.Rows[1]["id"])
+	}
+	for _, col := range []string{"_vec_rank", "_fts_rank", "_rrf_score", "_rrf_rank"} {
+		if _, ok := rsHybrid.Rows[0][col]; !ok {
+			t.Errorf("RAG_SEARCH hybrid: expected column %q on top row, got row %#v", col, rsHybrid.Rows[0])
+		}
+	}
+	if rsHybrid.Rows[0]["_rrf_rank"] != 1 {
+		t.Errorf("RAG_SEARCH hybrid: expected top row _rrf_rank=1, got %v", rsHybrid.Rows[0]["_rrf_rank"])
+	}
+}
+
+// TestRAGSearchAutoOrExpansion proves that RAG_SEARCH's hybrid text pass
+// defaults to ftsAutoOrExpand's OR-expansion: a verbose natural-language
+// query that FTS_SEARCH's own implicit-AND parsing would match against
+// nothing (every stray stopword like "what"/"is" becomes a required AND
+// term) still contributes an FTS hit once routed through RAG_SEARCH.
+func TestRAGSearchAutoOrExpansion(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	Execute(ctx, db, "default", mustParse(`
+		CREATE TABLE geo_docs (id INT, content TEXT, embedding VECTOR)
+	`))
+	Execute(ctx, db, "default", mustParse(`
+		INSERT INTO geo_docs VALUES
+			(1, 'Paris is the capital of France', '[1.0, 0.0]'),
+			(2, 'Random unrelated text about weather', '[0.0, 1.0]')
+	`))
+
+	nlQuery := "what is the capital of France"
+
+	// Baseline: FTS_SEARCH's own implicit-AND parsing treats every token in
+	// the raw query (including stopwords like "what"/"is") as a required
+	// term, so nothing in this corpus matches all of them at once.
+	rsFTSDirect := execSQL(t, db, `SELECT * FROM FTS_SEARCH('geo_docs', '`+nlQuery+`', 5)`)
+	if len(rsFTSDirect.Rows) != 0 {
+		t.Fatalf("FTS_SEARCH direct implicit-AND: expected 0 matches for verbose NL query, got %d", len(rsFTSDirect.Rows))
+	}
+
+	// RAG_SEARCH hybrid (default auto_or_expand=true) should still surface an
+	// FTS contribution: id=1 ("capital of France") must carry _fts_rank,
+	// proving the OR-expanded query ("capital OR france", after stopword
+	// removal) matched it, while id=2 must not.
+	rsHybrid := execSQL(t, db, `
+		SELECT * FROM RAG_SEARCH('geo_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0]'), 2, '{
+			"text_column": "content",
+			"text_query": "`+nlQuery+`",
+			"key_columns": ["id"]
+		}')
+	`)
+	if len(rsHybrid.Rows) != 2 {
+		t.Fatalf("RAG_SEARCH hybrid auto-or: expected 2 rows, got %d", len(rsHybrid.Rows))
+	}
+	var row1, row2 Row
+	for _, r := range rsHybrid.Rows {
+		switch r["id"] {
+		case 1:
+			row1 = r
+		case 2:
+			row2 = r
+		}
+	}
+	if row1 == nil {
+		t.Fatalf("RAG_SEARCH hybrid auto-or: expected id=1 in results, got %#v", rsHybrid.Rows)
+	}
+	if _, ok := row1["_fts_rank"]; !ok {
+		t.Errorf("RAG_SEARCH hybrid auto-or: expected id=1 to carry _fts_rank (OR-expanded match), row=%#v", row1)
+	}
+	if row2 != nil {
+		if _, ok := row2["_fts_rank"]; ok {
+			t.Errorf("RAG_SEARCH hybrid auto-or: expected id=2 to have no _fts_rank (no OR-term match), row=%#v", row2)
+		}
+	}
+}
+
+// TestRAGSearchExpandsContext checks that expand_before/expand_after on
+// RAG_SEARCH produces the same neighbor-expansion contract as
+// RAG_CONTEXT_FROM: _hit_rank/_context_offset/_context_rank/_context_hits.
+func TestRAGSearchExpandsContext(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	Execute(ctx, db, "default", mustParse(`
+		CREATE TABLE rag_chunks (
+			doc_id TEXT,
+			chunk_index INT,
+			chunk_text TEXT,
+			embedding VECTOR
+		)
+	`))
+	Execute(ctx, db, "default", mustParse(`
+		INSERT INTO rag_chunks VALUES
+			('doc-a', 0, 'intro', '[0.0, 1.0]'),
+			('doc-a', 1, 'setup', '[0.8, 0.2]'),
+			('doc-a', 2, 'answer', '[1.0, 0.0]'),
+			('doc-b', 0, 'other', '[0.0, 1.0]')
+	`))
+
+	rs := execSQL(t, db, `
+		SELECT doc_id, chunk_index, chunk_text, _hit_rank, _context_offset, _context_rank, _context_hits
+		FROM RAG_SEARCH('rag_chunks', 'embedding', VEC_FROM_JSON('[1.0, 0.0]'), 1, '{
+			"expand_before": 1,
+			"expand_after": 0,
+			"doc_id_column": "doc_id",
+			"chunk_index_column": "chunk_index"
+		}')
+		ORDER BY _context_rank
+	`)
+	if len(rs.Rows) != 2 {
+		t.Fatalf("RAG_SEARCH expand: expected 2 rows, got %d", len(rs.Rows))
+	}
+	if rs.Rows[0]["chunk_index"] != 1 || rs.Rows[1]["chunk_index"] != 2 {
+		t.Fatalf("RAG_SEARCH expand: expected chunks 1 and 2, got %v / %v", rs.Rows[0]["chunk_index"], rs.Rows[1]["chunk_index"])
+	}
+	if rs.Rows[0]["_context_offset"] != -1 || rs.Rows[1]["_context_offset"] != 0 {
+		t.Fatalf("RAG_SEARCH expand: unexpected offsets: %v / %v", rs.Rows[0]["_context_offset"], rs.Rows[1]["_context_offset"])
+	}
+	if rs.Rows[0]["_hit_rank"] != 1 || rs.Rows[1]["_hit_rank"] != 1 {
+		t.Fatalf("RAG_SEARCH expand: expected hit rank 1 for both context rows, got %v / %v", rs.Rows[0]["_hit_rank"], rs.Rows[1]["_hit_rank"])
+	}
+	if rs.Rows[0]["_context_rank"] != 1 || rs.Rows[1]["_context_rank"] != 2 {
+		t.Fatalf("RAG_SEARCH expand: unexpected context rank ordering: %v / %v", rs.Rows[0]["_context_rank"], rs.Rows[1]["_context_rank"])
+	}
+	if rs.Rows[0]["_context_hits"] != 1 || rs.Rows[1]["_context_hits"] != 1 {
+		t.Fatalf("RAG_SEARCH expand: expected _context_hits=1 for both rows, got %v / %v", rs.Rows[0]["_context_hits"], rs.Rows[1]["_context_hits"])
+	}
+	if rs.Rows[0]["chunk_text"] != "setup" || rs.Rows[1]["chunk_text"] != "answer" {
+		t.Fatalf("RAG_SEARCH expand: unexpected chunk_text: %v / %v", rs.Rows[0]["chunk_text"], rs.Rows[1]["chunk_text"])
+	}
+}
+
+// TestRAGSearchRequiresKeyColumnsForHybrid checks that enabling hybrid mode
+// (text_column+text_query) without key_columns fails with a clear error
+// instead of silently fusing rows with an empty composite key.
+func TestRAGSearchRequiresKeyColumnsForHybrid(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	Execute(ctx, db, "default", mustParse(`CREATE TABLE nokey_docs (id INT, content TEXT, embedding VECTOR)`))
+	Execute(ctx, db, "default", mustParse(`INSERT INTO nokey_docs VALUES (1, 'hello world', '[1.0, 0.0]')`))
+
+	_, err := Execute(ctx, db, "default", mustParse(`
+		SELECT * FROM RAG_SEARCH('nokey_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0]'), 1, '{
+			"text_column": "content",
+			"text_query": "hello"
+		}')
+	`))
+	if err == nil {
+		t.Fatal("RAG_SEARCH: expected error when hybrid mode is missing key_columns, got nil")
+	}
+	if !strings.Contains(err.Error(), "key_columns") {
+		t.Errorf("RAG_SEARCH: expected error to mention key_columns, got: %v", err)
+	}
+}
+
+// TestRAGSearchInvalidMetric checks that an unknown metric in the options
+// JSON produces a clear error.
+func TestRAGSearchInvalidMetric(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	Execute(ctx, db, "default", mustParse(`CREATE TABLE metric_docs (id INT, embedding VECTOR)`))
+	Execute(ctx, db, "default", mustParse(`INSERT INTO metric_docs VALUES (1, '[1.0, 0.0]')`))
+
+	_, err := Execute(ctx, db, "default", mustParse(`
+		SELECT * FROM RAG_SEARCH('metric_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0]'), 1, '{"metric": "bogus"}')
+	`))
+	if err == nil {
+		t.Fatal("RAG_SEARCH: expected error for unknown metric, got nil")
+	}
+	if !strings.Contains(err.Error(), "unknown metric") {
+		t.Errorf("RAG_SEARCH: expected error to mention unknown metric, got: %v", err)
+	}
+}
+
+// TestRAGSearchInvalidOptionsJSON checks that malformed options JSON produces
+// a clear error rather than a panic or silent misbehavior.
+func TestRAGSearchInvalidOptionsJSON(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	Execute(ctx, db, "default", mustParse(`CREATE TABLE badjson_docs (id INT, embedding VECTOR)`))
+	Execute(ctx, db, "default", mustParse(`INSERT INTO badjson_docs VALUES (1, '[1.0, 0.0]')`))
+
+	_, err := Execute(ctx, db, "default", mustParse(`
+		SELECT * FROM RAG_SEARCH('badjson_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0]'), 1, '{not valid json')
+	`))
+	if err == nil {
+		t.Fatal("RAG_SEARCH: expected error for invalid options JSON, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid options JSON") {
+		t.Errorf("RAG_SEARCH: expected error to mention invalid options JSON, got: %v", err)
+	}
+}
+
+// TestRAGSearchViaJoin is a sanity check that RAG_SEARCH works generically as
+// a FROM-clause table function used inside a JOIN (not just a standalone
+// SELECT FROM RAG_SEARCH(...)), since the TableFunction registry dispatches
+// any registered function through the same processJoins code path.
+func TestRAGSearchViaJoin(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	Execute(ctx, db, "default", mustParse(`
+		CREATE TABLE rag_docs (id INT, content TEXT, embedding VECTOR)
+	`))
+	Execute(ctx, db, "default", mustParse(`
+		INSERT INTO rag_docs VALUES
+			(1, 'Go is a compiled systems programming language', '[1.0, 0.1, 0.0]'),
+			(2, 'Python is popular for data science and machine learning', '[0.0, 0.9, 0.1]'),
+			(3, 'Rust provides memory safety without garbage collection', '[0.1, 0.0, 1.0]'),
+			(4, 'Go programming with goroutines for concurrency', '[0.9, 0.2, 0.0]')
+	`))
+	Execute(ctx, db, "default", mustParse(`
+		CREATE TABLE doc_meta (id INT, label TEXT)
+	`))
+	Execute(ctx, db, "default", mustParse(`
+		INSERT INTO doc_meta VALUES (1, 'lang-go'), (2, 'lang-py'), (3, 'lang-rust'), (4, 'lang-go2')
+	`))
+
+	rs := execSQL(t, db, `
+		SELECT m.label AS label, r.id AS doc_id, r._vec_rank AS vec_rank
+		FROM doc_meta AS m
+		JOIN RAG_SEARCH('rag_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 2) AS r ON r.id = m.id
+		ORDER BY vec_rank
+	`)
+	if len(rs.Rows) != 2 {
+		t.Fatalf("RAG_SEARCH via JOIN: expected 2 rows, got %d", len(rs.Rows))
+	}
+	if rs.Rows[0]["doc_id"] != 1 || rs.Rows[0]["label"] != "lang-go" {
+		t.Fatalf("RAG_SEARCH via JOIN: expected top row id=1/label=lang-go, got id=%v label=%v", rs.Rows[0]["doc_id"], rs.Rows[0]["label"])
+	}
+	if rs.Rows[1]["doc_id"] != 4 || rs.Rows[1]["label"] != "lang-go2" {
+		t.Fatalf("RAG_SEARCH via JOIN: expected second row id=4/label=lang-go2, got id=%v label=%v", rs.Rows[1]["doc_id"], rs.Rows[1]["label"])
+	}
+}

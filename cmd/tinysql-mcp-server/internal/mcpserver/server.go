@@ -94,6 +94,14 @@ func registerTools(srv *mcp.Server, s *Server) {
 		res, err := s.HandleSampleTable(ctx, args)
 		return res, nil, err
 	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "rag_search",
+		Description: "Composed RAG retrieval in one call: k-NN vector search over vector_column, optional BM25 hybrid fusion via reciprocal rank fusion (set text_column/text_query/key_columns in options), and optional neighbor-chunk context expansion (set expand_before/expand_after/doc_id_column/chunk_index_column in options). See the tinysql://functions resource for the full options_json shape and defaults.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, args RagSearchArgs) (*mcp.CallToolResult, any, error) {
+		res, err := s.HandleRagSearch(ctx, args)
+		return res, nil, err
+	})
 }
 
 // ─── resource registration ────────────────────────────────────────────────────
