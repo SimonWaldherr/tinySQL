@@ -193,6 +193,66 @@ func TestRowToTextUsesRawFastPathCorrectly(t *testing.T) {
 	}
 }
 
+// TestRowToTextMultiTermAndIsColumnAndOrderIndependent guards the
+// buildRawRowToTextAndFilter fast path: ANDing several ROW_TO_TEXT() LIKE
+// terms is the documented idiom for "row contains all of these words,
+// regardless of column or word order" (unlike a single LIKE pattern, which
+// is order-dependent). Terms may land in different columns and in either
+// order across rows; only rows containing every term must match. LIKE is
+// case-sensitive by default (see TestRowToTextEnablesWholeRowLike), so the
+// fixture matches the stored casing except where ILIKE is exercised below.
+func TestRowToTextMultiTermAndIsColumnAndOrderIndependent(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+	Execute(ctx, db, "default", mustParse(`CREATE TABLE orders (id INT, sku TEXT, note TEXT)`))
+	// Row 1: "urgent" and "widget" both present, but in reversed column/word
+	// order relative to how the query lists them.
+	Execute(ctx, db, "default", mustParse(`INSERT INTO orders VALUES (1, 'widget-1', 'urgent request')`))
+	// Row 2: only "urgent", missing "widget" anywhere in the row.
+	Execute(ctx, db, "default", mustParse(`INSERT INTO orders VALUES (2, 'gadget-2', 'urgent request')`))
+	// Row 3: both terms present in the same column, reversed order.
+	Execute(ctx, db, "default", mustParse(`INSERT INTO orders VALUES (3, 'n/a', 'widget urgent order')`))
+
+	stmt := mustParse(`SELECT id FROM orders WHERE ROW_TO_TEXT() LIKE '%urgent%' AND ROW_TO_TEXT() LIKE '%widget%'`).(*Select)
+	plan, ok, err := buildSimpleSelectPlan(ExecEnv{ctx: ctx, tenant: "default", db: db}, stmt)
+	if err != nil || !ok {
+		t.Fatalf("multi-term ROW_TO_TEXT raw plan = %#v, ok=%v, err=%v", plan, ok, err)
+	}
+
+	rs := execSQL(t, db, `SELECT id FROM orders WHERE ROW_TO_TEXT() LIKE '%urgent%' AND ROW_TO_TEXT() LIKE '%widget%'`)
+	gotIDs := map[int]bool{}
+	for _, row := range rs.Rows {
+		n, _ := toInt(row["id"])
+		gotIDs[n] = true
+	}
+	if len(gotIDs) != 2 || !gotIDs[1] || !gotIDs[3] {
+		t.Fatalf("expected rows 1 and 3 only, got %+v", rs.Rows)
+	}
+
+	// A third term combined with a plain column predicate: the ROW_TO_TEXT()
+	// terms are pulled out of the AND chain and compiled together, while the
+	// unrelated column predicate still applies via the normal path.
+	rs = execSQL(t, db, `SELECT id FROM orders WHERE ROW_TO_TEXT() LIKE '%urgent%' AND ROW_TO_TEXT() LIKE '%widget%' AND sku = 'widget-1'`)
+	if len(rs.Rows) != 1 {
+		t.Fatalf("expected only row 1, got %+v", rs.Rows)
+	}
+	expectInt(t, rs.Rows[0]["id"], 1, "id")
+
+	// NOT LIKE / ILIKE terms mixed into the same AND chain still narrow
+	// correctly: rows 1 and 3 contain "urgent" and "widget" (matched
+	// case-insensitively against the query's uppercase "WIDGET") but not
+	// "gadget"; row 2 is excluded because it has no "widget" at all.
+	rs = execSQL(t, db, `SELECT id FROM orders WHERE ROW_TO_TEXT() LIKE '%urgent%' AND ROW_TO_TEXT() ILIKE '%WIDGET%' AND ROW_TO_TEXT() NOT LIKE '%gadget%'`)
+	gotIDs = map[int]bool{}
+	for _, row := range rs.Rows {
+		n, _ := toInt(row["id"])
+		gotIDs[n] = true
+	}
+	if len(gotIDs) != 2 || !gotIDs[1] || !gotIDs[3] {
+		t.Fatalf("expected rows 1 and 3 only, got %+v", rs.Rows)
+	}
+}
+
 // TestFTSSearchTopKOrderWithManyMatches guards the bounded top-k heap
 // selection in FTSSearchTableFunc.Execute (replacing collect-all-then-sort):
 // with far more matching docs than k requested, the returned rows must still

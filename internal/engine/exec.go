@@ -5071,6 +5071,16 @@ func evalRawWhere(plan *simpleSelectPlan, raw []any) (bool, error) {
 // Returns nil when the expression is too complex to compile, in which case
 // evalRawExpr is used as the fallback.
 func buildRawFilter(colIndex map[string]int, e Expr) func([]any) (bool, error) {
+	// Column-independent, order-independent multi-term text search — e.g.
+	// `WHERE ROW_TO_TEXT() LIKE '%urgent%' AND ROW_TO_TEXT() LIKE '%widget%'`
+	// — is the documented idiom for "find rows containing all of these
+	// words, regardless of which column or what order" (see
+	// TestRowToTextEnablesWholeRowLike). Recognize that shape before the
+	// generic compilers below so the whole-row text is built once per row
+	// and reused across every term, instead of once per term.
+	if f := buildRawRowToTextAndFilter(colIndex, e); f != nil {
+		return f
+	}
 	if f := buildRawFilterSpecialized(colIndex, e); f != nil {
 		return f
 	}
@@ -5084,6 +5094,142 @@ func buildRawFilter(colIndex map[string]int, e Expr) func([]any) (bool, error) {
 	// column per row; on scoring-heavy RAG scans that map traffic — not the
 	// predicate itself — dominated the query cost.
 	return buildRawExprFilter(colIndex, e)
+}
+
+// flattenAndConjuncts splits a (possibly deeply nested, e.g. left- or
+// right-associative) chain of AND-combined Binary nodes into its leaf
+// conjuncts, in left-to-right order. A non-AND node returns a single-element
+// slice containing itself.
+func flattenAndConjuncts(e Expr) []Expr {
+	b, ok := e.(*Binary)
+	if !ok || b.Op != "AND" {
+		return []Expr{e}
+	}
+	return append(flattenAndConjuncts(b.Left), flattenAndConjuncts(b.Right)...)
+}
+
+// combineAndConjuncts is the inverse of flattenAndConjuncts: it rebuilds a
+// left-associative AND chain from a conjunct list, or nil for an empty list
+// (buildRawFilter/buildRawFilterSpecialized both treat a nil expression as
+// "always true").
+func combineAndConjuncts(exprs []Expr) Expr {
+	if len(exprs) == 0 {
+		return nil
+	}
+	out := exprs[0]
+	for _, x := range exprs[1:] {
+		out = &Binary{Op: "AND", Left: out, Right: x}
+	}
+	return out
+}
+
+// rowToTextLikeMatcher recognizes `ROW_TO_TEXT() LIKE 'literal'` (optionally
+// NOT LIKE / ILIKE) and compiles its pattern into a plain string matcher.
+// GLOB patterns and an explicit ESCAPE clause are left to the general path —
+// both are rare for this idiom and not worth the extra cases here.
+func rowToTextLikeMatcher(e Expr) (func(string) bool, bool) {
+	like, ok := e.(*LikeExpr)
+	if !ok || like.GlobStyle || like.Escape != nil {
+		return nil, false
+	}
+	call, ok := like.Expr.(*FuncCall)
+	if !ok || call.Name != "ROW_TO_TEXT" || len(call.Args) != 0 {
+		return nil, false
+	}
+	lit, ok := like.Pattern.(*Literal)
+	if !ok {
+		return nil, false
+	}
+	pattern, ok := lit.Val.(string)
+	if !ok {
+		return nil, false
+	}
+	match := compileLikeStringMatcher(pattern, like.CaseInsensitive)
+	if like.Negate {
+		return func(s string) bool { return !match(s) }, true
+	}
+	return match, true
+}
+
+// compileLikeStringMatcher compiles a literal LIKE/ILIKE pattern (% and _
+// wildcards, no ESCAPE/GLOB) into the cheapest possible func(string) bool,
+// mirroring the shape-detection buildCompiledLikeFilter/buildCompiledILikeFilter
+// use for column LIKE — exact/prefix/suffix/substring patterns skip the
+// general backtracking matcher entirely.
+func compileLikeStringMatcher(pattern string, caseInsensitive bool) func(string) bool {
+	pat := pattern
+	if caseInsensitive {
+		pat = strings.ToLower(pattern)
+	}
+	norm := func(s string) string {
+		if caseInsensitive {
+			return strings.ToLower(s)
+		}
+		return s
+	}
+	switch {
+	case !strings.ContainsAny(pat, "%_"):
+		return func(s string) bool { return norm(s) == pat }
+	case strings.HasSuffix(pat, "%") && !strings.ContainsAny(pat[:len(pat)-1], "%_"):
+		prefix := pat[:len(pat)-1]
+		return func(s string) bool { return strings.HasPrefix(norm(s), prefix) }
+	case strings.HasPrefix(pat, "%") && !strings.ContainsAny(pat[1:], "%_"):
+		suffix := pat[1:]
+		return func(s string) bool { return strings.HasSuffix(norm(s), suffix) }
+	case strings.HasPrefix(pat, "%") && strings.HasSuffix(pat, "%") &&
+		len(pat) >= 2 && !strings.ContainsAny(pat[1:len(pat)-1], "%_"):
+		mid := pat[1 : len(pat)-1]
+		return func(s string) bool { return strings.Contains(norm(s), mid) }
+	default:
+		return func(s string) bool { return matchLikePattern(norm(s), pat, '\\') }
+	}
+}
+
+// buildRawRowToTextAndFilter detects 2+ `ROW_TO_TEXT() LIKE 'term'` conjuncts
+// within an AND chain and compiles them into a single pass: the whole-row
+// text is built once per row and checked against every term, rather than
+// once per term (each of which previously fell through to
+// buildRawExprFilter and independently rebuilt the concatenated row text —
+// O(terms) rebuilds of O(columns) work per row instead of one). Any other
+// conjuncts in the chain (plain column predicates, etc.) are compiled
+// separately through the normal buildRawFilter path and checked afterward.
+// Returns nil when fewer than 2 such conjuncts are present, leaving
+// buildRawFilterSpecialized/buildRawExprFilter to handle the expression as
+// before.
+func buildRawRowToTextAndFilter(colIndex map[string]int, e Expr) func([]any) (bool, error) {
+	conjuncts := flattenAndConjuncts(e)
+	if len(conjuncts) < 2 {
+		return nil
+	}
+	var matchers []func(string) bool
+	var rest []Expr
+	for _, c := range conjuncts {
+		if m, ok := rowToTextLikeMatcher(c); ok {
+			matchers = append(matchers, m)
+		} else {
+			rest = append(rest, c)
+		}
+	}
+	if len(matchers) < 2 {
+		return nil
+	}
+	restFilter := buildRawFilter(colIndex, combineAndConjuncts(rest))
+	if restFilter == nil {
+		// Some remaining conjunct can't run on the raw path (e.g. a
+		// subquery); abandon this optimization and let the caller fall
+		// back to the slower but always-correct per-conjunct compilation.
+		return nil
+	}
+	cols := rawRowTextColumns(colIndex)
+	return func(raw []any) (bool, error) {
+		text := rawRowToText(cols, raw)
+		for _, m := range matchers {
+			if !m(text) {
+				return false, nil
+			}
+		}
+		return restFilter(raw)
+	}
 }
 
 // buildRawFilterSpecialized compiles the predicate forms with dedicated,
@@ -5112,6 +5258,8 @@ func buildRawFilterSpecialized(colIndex map[string]int, e Expr) func([]any) (boo
 		return buildRawFilterRegexp(colIndex, ex)
 	case *InExpr:
 		return buildRawFilterIn(colIndex, ex)
+	case *FuncCall:
+		return buildRawFilterFuncCall(colIndex, ex)
 	}
 	return nil
 }
@@ -5453,6 +5601,66 @@ func buildRawFilterRegexp(colIndex map[string]int, ex *RegexpExpr) func([]any) (
 			return !matched, nil
 		}
 		return matched, nil
+	}
+}
+
+// buildRawFilterFuncCall dispatches specialized raw-path compilation for
+// function-call predicates. Returns nil (falling back to the generic
+// evalFuncCall-based path) for any function it doesn't recognize.
+func buildRawFilterFuncCall(colIndex map[string]int, ex *FuncCall) func([]any) (bool, error) {
+	switch ex.Name {
+	case "CONTAINS_ALL", "CONTAINS_ANY":
+		return buildRawFilterContains(colIndex, ex)
+	}
+	return nil
+}
+
+// buildRawFilterContains compiles CONTAINS_ALL/CONTAINS_ANY with literal
+// string terms into a closure that evaluates the searched text once per row
+// (reusing the raw-path evalRawExpr, so a ROW_TO_TEXT() first argument still
+// gets its cheap precomputed-column-index handling) and checks it against
+// precompiled lowercase terms directly, skipping the generic
+// rawCallScratchPool + map-dispatch path used for arbitrary function calls.
+// Must stay behaviorally identical to evalContainsAll/evalContainsAny in
+// fts.go (same case-insensitive substring semantics, same nil-text handling).
+func buildRawFilterContains(colIndex map[string]int, ex *FuncCall) func([]any) (bool, error) {
+	if len(ex.Args) < 2 || !isSimpleRawExpr(ex.Args[0]) || exprHasRowAwareFuncCall(ex.Args[0]) {
+		return nil
+	}
+	terms := make([]string, 0, len(ex.Args)-1)
+	for _, arg := range ex.Args[1:] {
+		lit, ok := arg.(*Literal)
+		if !ok {
+			return nil
+		}
+		s, ok := lit.Val.(string)
+		if !ok {
+			return nil
+		}
+		terms = append(terms, strings.ToLower(s))
+	}
+	all := ex.Name == "CONTAINS_ALL"
+	plan := &simpleSelectPlan{colIndex: colIndex, rowTextCols: rawRowTextColumns(colIndex)}
+	textExpr := ex.Args[0]
+	return func(raw []any) (bool, error) {
+		v, err := evalRawExpr(plan, raw, textExpr)
+		if err != nil {
+			return false, err
+		}
+		if v == nil {
+			return false, nil
+		}
+		text := strings.ToLower(fmt.Sprintf("%v", v))
+		for _, term := range terms {
+			found := strings.Contains(text, term)
+			if all && !found {
+				return false, nil
+			}
+			if !all && found {
+				return true, nil
+			}
+		}
+		return all, nil
 	}
 }
 
@@ -6225,8 +6433,17 @@ func evalRawRowToText(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, err
 	if len(ex.Args) > 0 {
 		return nil, fmt.Errorf("ROW_TO_TEXT expects no arguments")
 	}
+	return rawRowToText(plan.rowTextCols, raw), nil
+}
+
+// rawRowToText concatenates the given raw column positions (already in
+// ROW_TO_TEXT's sorted-unqualified-name order) into one space-separated
+// string. Factored out of evalRawRowToText so buildRawRowToTextAndFilter can
+// build the same string once per row and reuse it across every ROW_TO_TEXT()
+// LIKE term in an AND chain, instead of each term rebuilding it independently.
+func rawRowToText(cols []int, raw []any) string {
 	var sb strings.Builder
-	for _, col := range plan.rowTextCols {
+	for _, col := range cols {
 		if col < 0 || col >= len(raw) || raw[col] == nil {
 			continue
 		}
@@ -6235,7 +6452,7 @@ func evalRawRowToText(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, err
 		}
 		fmt.Fprint(&sb, raw[col])
 	}
-	return sb.String(), nil
+	return sb.String()
 }
 
 func evalRawUnary(plan *simpleSelectPlan, raw []any, ex *Unary) (any, error) {

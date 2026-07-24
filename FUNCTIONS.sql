@@ -191,6 +191,31 @@ INSERT INTO row_to_text_demo VALUES (2, 'Globex', 'closed');
 SELECT id FROM row_to_text_demo WHERE ROW_TO_TEXT() LIKE '%Acme%' AND status = 'open';
 DROP TABLE row_to_text_demo;
 
+-- CONTAINS_ALL / CONTAINS_ANY / CONTAINS_SCORE: a friendlier, case-insensitive
+-- alternative to chaining "ROW_TO_TEXT() LIKE '%term%' AND ROW_TO_TEXT() LIKE
+-- '%other%' ..." for each term. Terms are literal substrings, not patterns —
+-- unlike LIKE, '%' and '_' have no wildcard meaning here.
+CREATE TABLE contains_demo (id INT, description TEXT);
+INSERT INTO contains_demo VALUES (1, 'Widget A2000 - blue, waterproof');
+INSERT INTO contains_demo VALUES (2, 'Widget B300 - red');
+INSERT INTO contains_demo VALUES (3, 'Gadget C100 - blue, waterproof, wireless');
+
+-- CONTAINS_ALL: every term must be present (case-insensitive substring match)
+SELECT id, description FROM contains_demo
+WHERE CONTAINS_ALL(description, 'blue', 'waterproof');
+
+-- CONTAINS_ANY: at least one term must be present
+SELECT id, description FROM contains_demo
+WHERE CONTAINS_ANY(description, 'wireless', 'red');
+
+-- CONTAINS_SCORE: count of matched terms (0..N) - use in ORDER BY to rank
+-- rows by how many search terms they contain
+SELECT id, description, CONTAINS_SCORE(description, 'blue', 'waterproof', 'wireless') as match_count
+FROM contains_demo
+ORDER BY match_count DESC;
+
+DROP TABLE contains_demo;
+
 -- ============================================================
 -- NUMERIC FUNCTIONS
 -- ============================================================

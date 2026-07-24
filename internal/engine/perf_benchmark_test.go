@@ -191,6 +191,24 @@ func BenchmarkRowToTextRowScan(b *testing.B) {
 	runBench(b, db, `SELECT id FROM t WHERE ROW_TO_TEXT() LIKE '%number 123%' AND grp = 'group-23'`)
 }
 
+// BenchmarkRowToTextMultiTermAndRowScan measures the column-independent,
+// order-independent multi-term idiom — several ROW_TO_TEXT() LIKE terms
+// ANDed together — that buildRawRowToTextAndFilter compiles into a single
+// whole-row-text build per row instead of one rebuild per term.
+func BenchmarkRowToTextMultiTermAndRowScan(b *testing.B) {
+	db := setupPerfTable(b, 20000)
+	runBench(b, db, `SELECT id FROM t WHERE ROW_TO_TEXT() LIKE '%number%' AND ROW_TO_TEXT() LIKE '%lorem%' AND ROW_TO_TEXT() LIKE '%123%'`)
+}
+
+// BenchmarkContainsAllRowScan measures the CONTAINS_ALL(ROW_TO_TEXT(), ...)
+// raw fast-path predicate (buildRawFilterContains): a case-insensitive,
+// literal-term whole-row search, compiled into a specialized closure instead
+// of falling through to the generic per-row function-dispatch path.
+func BenchmarkContainsAllRowScan(b *testing.B) {
+	db := setupPerfTable(b, 20000)
+	runBench(b, db, `SELECT id FROM t WHERE CONTAINS_ALL(ROW_TO_TEXT(), 'number', 'lorem', '123')`)
+}
+
 // ─────────────────────────── FTS_SEARCH ────────────────────────────────────
 
 func setupFTSPerfTable(b *testing.B, rows int) *storage.DB {

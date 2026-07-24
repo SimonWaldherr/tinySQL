@@ -11,6 +11,9 @@
 //   - FTS_HIGHLIGHT(text, query [, before, after]) – full-text highlighting alias
 //   - BM25(text, query)      – alias for FTS_RANK
 //   - FTS_SEARCH table-valued function for corpus-level k-nearest search
+//   - CONTAINS_ALL(text, term1, term2, ...)   – true iff every term is a substring of text
+//   - CONTAINS_ANY(text, term1, term2, ...)   – true iff any term is a substring of text
+//   - CONTAINS_SCORE(text, term1, term2, ...) – count of the given terms found in text
 //
 // Query syntax supported by FTS_MATCH / FTS_RANK:
 //
@@ -21,6 +24,17 @@
 //	A OR B       – either term must match
 //	NOT A        – term must not match
 //	A B          – implicit AND (same as A AND B)
+//
+// FTS_MATCH / FTS_RANK vs. CONTAINS_ALL / CONTAINS_ANY / CONTAINS_SCORE:
+// FTS_MATCH and FTS_RANK tokenize, stem, and strip stop words from both the
+// text and the query, and support a rich boolean query language (phrases,
+// prefix wildcards, NOT, nested AND/OR) — they're the right choice for
+// natural-language search boxes. CONTAINS_ALL, CONTAINS_ANY, and
+// CONTAINS_SCORE instead do a raw case-insensitive substring match against a
+// fixed list of literal terms, with no tokenizing, stemming, or query syntax
+// — they're the right choice for exact codes/IDs/numbers (which stemming
+// would mangle), or for a simple "must contain all/any of these words"
+// filter without learning FTS_MATCH's query grammar.
 package engine
 
 import (
@@ -254,6 +268,9 @@ func getFTSFunctions() map[string]funcHandler {
 		"BM25":           evalFTSRank, // alias
 		"MATCH":          evalFTSMatch,
 		"FTS_WORD_COUNT": evalFTSWordCount,
+		"CONTAINS_ALL":   evalContainsAll,
+		"CONTAINS_ANY":   evalContainsAny,
+		"CONTAINS_SCORE": evalContainsScore,
 	}
 }
 
@@ -650,6 +667,90 @@ func evalFTSWordCount(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return 0, nil
 	}
 	return len(strings.Fields(fmt.Sprintf("%v", v))), nil
+}
+
+// ─────────────────────────── CONTAINS_ALL / CONTAINS_ANY / CONTAINS_SCORE ────
+//
+// These are a deliberately simpler sibling to FTS_MATCH/FTS_RANK: plain
+// case-insensitive substring search over N literal terms, with no
+// tokenizing, stemming, stop-word removal, or boolean query syntax. Useful
+// for users who just want "does this text contain all/any of these words"
+// without learning FTS_MATCH's query grammar, and for matching exact
+// substrings (IDs, codes, numbers) that stemming would otherwise mangle.
+
+// evalContainsTerms evaluates ex.Args[0] as the text and ex.Args[1:] as the
+// literal terms, returning how many terms were found as a case-insensitive
+// substring of text. ok is false when there weren't enough arguments to
+// evaluate, or when text itself is nil; callers treat !ok as "no text" and
+// return false/false/0 without erroring, matching evalFTSMatch's existing
+// NULL-input convention.
+func evalContainsTerms(env ExecEnv, ex *FuncCall, row Row) (matched int, ok bool, err error) {
+	if len(ex.Args) < 2 {
+		return 0, false, fmt.Errorf("%s expects at least 2 arguments: (text, term1[, term2, ...])", ex.Name)
+	}
+	textVal, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return 0, false, err
+	}
+	if textVal == nil {
+		return 0, false, nil
+	}
+	text := strings.ToLower(fmt.Sprintf("%v", textVal))
+	for _, arg := range ex.Args[1:] {
+		termVal, err := evalExpr(env, arg, row)
+		if err != nil {
+			return 0, false, err
+		}
+		if termVal == nil {
+			continue
+		}
+		term := strings.ToLower(fmt.Sprintf("%v", termVal))
+		if strings.Contains(text, term) {
+			matched++
+		}
+	}
+	return matched, true, nil
+}
+
+// evalContainsAll returns true iff every term argument is found as a
+// case-insensitive substring of text.
+func evalContainsAll(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	matched, ok, err := evalContainsTerms(env, ex, row)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return false, nil
+	}
+	return matched == len(ex.Args)-1, nil
+}
+
+// evalContainsAny returns true iff at least one term argument is found as a
+// case-insensitive substring of text.
+func evalContainsAny(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	matched, ok, err := evalContainsTerms(env, ex, row)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return false, nil
+	}
+	return matched > 0, nil
+}
+
+// evalContainsScore returns how many of the given term arguments were found
+// as a case-insensitive substring of text (0..N, N = number of term args).
+// Intended for "ORDER BY CONTAINS_SCORE(...) DESC" ranking by how many
+// search words matched.
+func evalContainsScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	matched, ok, err := evalContainsTerms(env, ex, row)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return 0, nil
+	}
+	return matched, nil
 }
 
 // ─────────────────────────── FTS_SEARCH document cache ────────────────────────

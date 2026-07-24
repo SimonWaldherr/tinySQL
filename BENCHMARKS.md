@@ -280,6 +280,122 @@ Correctness is unaffected: `TestVecSearchWithANNIndexModes` and
 (`internal/engine/vector_test.go`) already cover HNSW/IVF result correctness
 against exact search and pass unchanged.
 
+### Vector search (`VEC_SEARCH`): lock-free hot path and a contiguous column cache
+
+Two more `VEC_SEARCH` fixes, orthogonal to the HNSW work above — one for
+concurrent serving, one for scan throughput on larger corpora.
+
+**1. Lock-free hot path.** Every single `VEC_SEARCH` call — regardless of
+table size or index mode, and even with the optional result cache and
+analytics both at their documented default of *off* — used to take two full
+`Lock()`/`Unlock()` round trips on one process-wide `sync.Mutex`
+(`vecQueryCacheState` in `internal/engine/vector_query_cache.go`): once to
+check "is the result cache enabled" (`vecQueryCacheEnabled`), once to check
+"is analytics enabled" (`recordVecQuery`, which locked *before* checking).
+The actual per-search work (flat scan / IVF / HNSW) is read-only and already
+parallelized internally across worker goroutines — this mutex added pure
+serialization with no compensating benefit for the common case, and got
+worse the more concurrent callers there were (e.g. a server handling several
+simultaneous RAG requests against a shared `*DB`).
+
+Fixed by mirroring the two boolean flags this hot path actually needs
+(`cacheEnabled`, `analyticsEnabled`) into two `atomic.Bool` fields, written
+only by `ConfigureVectorCache` inside its existing critical section. Every
+other read is now a lock-free atomic load; any actual mutation
+(`getVecQueryCache`, `putVecQueryCache`, `recordVecQuery`'s slow path) still
+re-validates against the authoritative, mutex-protected config before
+touching shared state, so a stale atomic read can cause at most one wasted
+lookup — never a wrong or corrupted result.
+
+The clearest evidence is a block profile (`-blockprofile`, which measures
+time goroutines spend *waiting* on synchronization, not just wall clock):
+under a concurrent `VEC_SEARCH` benchmark, `sync.(*Mutex).Lock` accounted for
+0.10s of 5.89s of all recorded blocking time before the fix, attributed
+precisely to `vecQueryCacheEnabled`/`recordVecQuery` — and disappears from the
+profile entirely afterward. Wall-clock throughput (`BenchmarkVecSearchConcurrent`,
+`-count=5`, median of 5 runs) only clearly separates from noise once enough
+goroutines are actually contending for the lock:
+
+| `-cpu=N` (concurrent goroutines) | before (median ns/op) | after (median ns/op) |
+|---|---|---|
+| 1 | 15.8 µs | 15.5 µs (≈ noise) |
+| 4 | 5.3 µs | 5.2 µs (≈ noise) |
+| 8 | 5.8 µs | 4.5 µs (≈22% faster) |
+
+This machine has 6 physical / 12 logical cores, so `-cpu=8` is the first
+setting here with enough concurrent callers to make lock queuing visible in
+wall-clock terms; the block-profile result is the more reliable signal at any
+concurrency level, since it measures the removed contention directly instead
+of inferring it from a noisy ns/op delta.
+
+**2. Contiguous column cache.** `VEC_SEARCH`'s per-`(tenant, table, column)`
+cache (`vecSearchColumnCacheEntry` in `internal/engine/vector_search.go`)
+used to store each row's vector as its own independently-heap-allocated
+`[]float64` — `N` separate allocations scattered across the heap for an
+`N`-row column. A flat scan, an IVF list scan, and an HNSW graph traversal
+all walk this cache row by row; with scattered allocations, each step first
+had to follow a pointer to find out where the *next* row even lived, which
+defeats hardware prefetching for what is otherwise a plain sequential scan.
+
+Fixed by packing every valid row into one contiguous backing buffer at cache-
+build time (`buildVecColumnCache`), with each row's slice becoming a `cap ==
+len` view into that buffer instead of its own allocation. Rows keep their own
+true length rather than a fixed stride, so tables with mixed-length vectors
+(e.g. mid-embedding-migration) behave exactly as before — a row whose length
+doesn't match the query is still excluded at search time, never truncated.
+`cache.vectors[i]` keeps its `[][]float64` type, so every existing reader in
+`vector_index.go` (IVF, HNSW) and `vector_warm.go` (`VEC_WARM` diagnostics)
+needed no changes at all.
+
+The effect scales with how large a fraction of each row's cost is "find the
+row" versus "read the row": it's small for wide embeddings (768 dims = 6 KB/row,
+so the fixed per-row indirection is a small fraction of the data actually
+streamed) and clearer for narrow ones at a large corpus size (64 dims =
+512 bytes/row, far more rows needed to move the same total data, so the same
+fixed overhead recurs far more often per byte scanned):
+
+| Benchmark (`-count=3`, median) | before | after |
+|---|---|---|
+| 50k rows × 768 dims, `-cpu=1` | 19.9 ms | 20.1 ms (≈ noise) |
+| 50k rows × 768 dims, `-cpu=4` | 12.1 ms | 11.5 ms (≈5% faster) |
+| 200k rows × 64 dims, `-cpu=1` | 9.9 ms | 9.5 ms (≈5% faster) |
+| 200k rows × 64 dims, `-cpu=4` | 5.0 ms | 4.4 ms (≈14% faster) |
+
+Both tables' row counts exceed `vecSearchParallelMinRows` (4096), so the
+`-cpu=4` numbers already include `VEC_SEARCH`'s pre-existing internal
+parallel-scan fan-out on both sides of the comparison — the extra lift from
+`-cpu=1` to `-cpu=4` is *not* purely the memory-layout fix; it also reflects
+contiguous memory holding up better under several goroutines scanning the
+same column concurrently (shared last-level cache and memory bandwidth get
+contended less by one big buffer than by thousands of scattered ones).
+
+**Trade-off worth knowing:** for columns storing a native `VECTOR`
+(`[]float64`) value directly (not a JSON string), the old cache *aliased*
+each row's data at zero extra memory cost. The new cache *copies* it into the
+shared buffer, so a warmed cache for such a column holds roughly two live
+copies of that column's data — the original in `table.Rows` and the packed
+copy in the cache — for as long as both stay alive. For a JSON-string-encoded
+vector column, memory is unaffected either way, since building the cache
+already allocated one fresh `[]float64` per row via `json.Unmarshal` before
+this change; the fix just consolidates those into one buffer instead of many.
+This trades memory for scan speed — the same trade-off every dedicated vector
+index makes — and only applies to `VECTOR`-typed columns while a search cache
+for them is warm.
+
+Correctness: `TestVecWarmMixedDimensionalityReported`, `TestVecSearchNaNRowExcluded`,
+`TestVecSearchTopKWorkerPanicRecovered` (constructs a cache entry literal,
+bypassing the builder entirely), and the full `TestVecSearchWithANNIndexModes`/
+`TestVecSearchANNIndexInvalidatesOnTableVersion` suite all pass unchanged.
+`TestVecSearchConcurrentWithCacheReconfiguration` (new) races concurrent
+`VEC_SEARCH` callers against concurrent `ConfigureVectorCache` calls as a
+regression guard for the lock-free fast path.
+
+Reproduce with:
+
+```sh
+go test -run '^$' -bench 'BenchmarkVecSearchConcurrent|BenchmarkVecSearchFlatScanLargeEmbedding|BenchmarkVecSearchFlatScanManySmallEmbeddings' -benchmem -count=3 -cpu=1,4,8 ./internal/engine/...
+```
+
 ### Row materialization (`rowsFromTable`): removed a redundant per-row map check
 
 `rowsFromTable` (`internal/engine/exec.go`) builds the `Row`
@@ -308,6 +424,88 @@ Reproduce with:
 
 ```sh
 go test -bench='BenchmarkGroupByTwoColumns|BenchmarkSelectStarFullScan' -benchmem ./internal/engine/...
+```
+
+### `GROUP BY` composite keys and `ORDER BY ... LIMIT` top-N heaps: two allocation hot spots
+
+Profiling `BenchmarkGroupByTwoColumns` (20,000 rows, 2 group-by columns, 50
+distinct groups) showed 92% of all allocations in the whole benchmark run
+coming from one place: `writeFmtKeyPart`, the helper every `GROUP BY`
+(`executeSimpleMultiGroupAggregate`, `processAggregateQuery`), `PIVOT`
+(`processPivot`), and `DISTINCT` (`distinctRows`) path in
+`internal/engine/exec.go` uses to build a composite group key. The cause:
+each of these built the key into a `strings.Builder` reset via
+`keyBuf.Reset()` once per row — but `Reset` sets the builder's internal
+buffer to `nil`, discarding its capacity, so *every single row* paid for a
+brand-new backing-array allocation to hold its key, then immediately
+materialized that key as a `string` map key even when the group already
+existed (the overwhelmingly common case once past the first few rows).
+
+Fixed two things together:
+
+1. `writeFmtKeyPart` now appends to a reused `[]byte` (`buf = buf[:0]` before
+   each row keeps the backing array instead of discarding it), following the
+   standard `strconv.AppendInt`-style Go idiom instead of writing through a
+   `*strings.Builder`.
+2. Group lookups use `groups[string(keyBuf)]` for the existence check — the
+   Go compiler elides the `[]byte`→`string` conversion's allocation when the
+   result of a map index expression is only read, not stored — and only
+   materialize a real, independently-owned string via `string(keyBuf)` for a
+   row that starts a **new** group. `processAggregateQuery`'s group map
+   changed from `map[string][]Row` to `map[string]*[]Row` so that appending a
+   row to an *existing* group mutates through the already-held pointer
+   instead of writing the map again (verified empirically that
+   `m[string(b)] = v` on an existing key still allocates — reading is free,
+   writing never is, regardless of whether the key already exists).
+
+Net effect: per-row key allocation becomes per-*distinct-group* allocation.
+For workloads with far fewer groups than rows (typical `GROUP BY`), this is a
+large win; `PIVOT` and `DISTINCT` get the same fix for the same reason.
+
+Separately, `ORDER BY ... LIMIT N`'s top-N heap (both the simple-select raw
+fast path and the general row-map path used after `GROUP BY`) went through
+`container/heap`'s interface-based `Push`/`Fix`, which boxes every candidate
+row into an `any` to satisfy `heap.Interface` — up to `N` allocations just to
+fill the heap. Replaced with the same direct, non-interface sift-up/sift-down
+functions already used for `vecScoredHeap`/`vecMinScoredHeap` in the vector
+search path (see above) — same algorithm, zero boxing.
+
+| Benchmark (20,000 rows, `-count=3`, median) | before | after |
+|---|---|---|
+| `... GROUP BY grp, sub` (2-col key, 50 groups) | 63,191 allocs, 1.40 MB, ~5.3 ms | 3,541 allocs, 0.29 MB, ~2.2 ms (**~18x fewer allocs, ~2.4x faster**) |
+| `... GROUP BY grp HAVING COUNT(*) > 100` | 120,947 allocs, 15.4 MB | 80,947 allocs, 14.6 MB (allocs **-33%**; wall-clock unchanged — this query's cost is dominated elsewhere) |
+| `... GROUP BY grp ORDER BY a DESC LIMIT 10` | 120,864 allocs, 15.4 MB, ~21.9 ms | 80,853 allocs, 14.6 MB, ~20.9 ms (allocs **-33%**, modest latency gain) |
+| `... ORDER BY val DESC LIMIT 20` (raw fast path, no `GROUP BY`) | 70 allocs, 11.5 KB, ~5.5 ms | 49 allocs, 10.2 KB, ~4.2 ms (**-30% allocs, ~24% faster**) |
+| `... ORDER BY val DESC` / `... ORDER BY grp, sub, val DESC` (no `LIMIT`) | unchanged | unchanged (no heap involved without `LIMIT`) |
+| `GROUP BY grp` (single column, no `HAVING`) | unchanged | unchanged (already used a simpler key path, untouched by this fix) |
+
+The `HAVING` and `GROUP BY + ORDER BY + LIMIT` rows show why allocation count
+and wall-clock time aren't the same metric: both queries' allocation count
+drops by a third from this fix, but their overall latency is dominated by
+other work (aggregate evaluation across `big.Rat`/`HAVING` re-checks), so the
+wall-clock benefit is smaller and noisier than the allocation reduction alone
+would suggest. The 2-column `GROUP BY` benchmark isolates the fix itself
+(nothing else changed) and shows the fix's full effect: allocation count
+scales with **distinct groups** instead of **rows** after this change, so
+the gap widens further on tables with many rows and few groups.
+
+Correctness: verified byte-for-byte identical output against the
+pre-optimization implementation (stashed the change, re-ran the same
+queries) for `GROUP BY` key building, the `ORDER BY ... LIMIT` top-N heap
+(including tie-break behavior — a heap-based top-N does not guarantee
+insertion-order stability for ties on the sort column *alone*, unchanged by
+this fix either way; write a secondary `ORDER BY` column to get a fully
+determined order, same as any SQL engine), and the whole-table-aggregate
+"one synthesized row over zero matching rows" edge case forced through the
+general path via a `JOIN`. The full existing suite
+(`TestGroupByHaving`, `TestPivot*`, `TestAggregateFastPath*`,
+`TestSelectOrderByLimitOffsetFastPath`, `TestSelectStarFastPath*`, and the
+whole `internal/engine` package) passes unchanged.
+
+Reproduce with:
+
+```sh
+go test -bench='BenchmarkGroupByTwoColumns|BenchmarkGroupByWithHaving|BenchmarkGroupByOrderByLimit|BenchmarkOrderByWithLimit' -benchmem -count=3 ./internal/engine/...
 ```
 
 ### RAG scalar-function path: constant folding, fused SIMD cosine, AVX2+FMA kernels

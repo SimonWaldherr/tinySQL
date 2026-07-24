@@ -183,8 +183,45 @@ For a lighter variant, retrieve by vector and rerank with the scalar
 `0.7 * _vec_similarity + 0.3 * FTS_RANK(chunk_text, 'query terms')`.
 `FTS_SNIPPET` and `FTS_HIGHLIGHT` format the matched passages for prompts.
 
+When you don't need BM25 ranking or tokenization at all — exact codes, IDs,
+or a quick multi-term filter — `CONTAINS_ALL(text, term1, term2, ...)`,
+`CONTAINS_ANY(text, term1, term2, ...)`, and `CONTAINS_SCORE(text, term1,
+term2, ...)` do a plain case-insensitive substring match against literal
+terms, with none of `FTS_MATCH`'s tokenizing/stemming/query syntax (so exact
+codes and numbers aren't mangled by stemming). `CONTAINS_SCORE` returns a
+0..N count of matched terms, usable directly in `ORDER BY` for a simple
+"how many of these terms appear" ranking.
+
 ## 6. Serving and performance notes
 
+- **Concurrent requests no longer serialize on a global lock.** `VEC_SEARCH`
+  used to take two mutex round trips per call just to check whether the
+  optional result cache/analytics were enabled — pure overhead at the
+  documented default (off), and it got worse the more goroutines called
+  `VEC_SEARCH` at once. That check is now lock-free, so a server handling
+  many simultaneous RAG requests against one shared `*DB` sees searches scale
+  with available cores instead of queuing on that check. Nothing to
+  configure — this applies automatically.
+- **Vector scans benefit from a larger, warmed corpus.** The per-column
+  vector cache now packs every row into one contiguous buffer instead of one
+  allocation per row, which mainly helps once a column is large enough that
+  it doesn't fit in CPU cache (tens of thousands of rows and up). Call
+  `VEC_WARM` after a bulk load so this packing happens once, up front, rather
+  than on the first query. One trade-off: for a native `VECTOR` column (not a
+  JSON-encoded one), a warmed cache now holds two copies of that column's
+  data in memory (original rows + packed cache) — budget for roughly double
+  the vector column's raw size while the cache stays warm. See
+  [BENCHMARKS.md](../BENCHMARKS.md#vector-search-vec_search-lock-free-hot-path-and-a-contiguous-column-cache)
+  for measured numbers.
+- **Prefer `RAG_CONTEXT_FROM` over calling `RAG_CONTEXT` per hit.**
+  `RAG_CONTEXT_FROM` builds its document/chunk index once per query and
+  reuses it for every retrieval hit; `RAG_CONTEXT` rebuilds a fresh index on
+  *every call*, by design, because it's meant for a single known chunk. Call
+  it once per `VEC_SEARCH` hit in a loop instead of using `RAG_CONTEXT_FROM`
+  for the whole hit set, and context expansion cost goes from scaling with
+  the window size to scaling with `k × table size` — on a large chunk table
+  with an ANN index (`ivf`/`hnsw`) making `VEC_SEARCH` itself sub-linear,
+  this loop can end up costing more than the vector search it followed.
 - **Load once, serve read-only.** Bulk-insert into a snapshot, then reopen it
   with `ReadOnly: true` and run `VEC_WARM` at startup (full example in the
   [Storage & Persistence Guide](./storage-guide.md#read-only-serving)).

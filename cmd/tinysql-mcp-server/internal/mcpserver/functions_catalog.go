@@ -83,6 +83,15 @@ Full-text (standalone — no corpus statistics, unlike FTS_SEARCH):
   FTS_SNIPPET(text, query [, before, after, ellipsis, max_tokens])
   FTS_HIGHLIGHT(text, query [, before, after])  simpler FTS_SNIPPET alias
   FTS_WORD_COUNT(text)
+  CONTAINS_ALL(text, term1, term2, ...)    -> bool, ALL terms present.
+                              Simpler than FTS_MATCH: no tokenizing/stemming,
+                              plain case-insensitive substring match. Good for
+                              exact codes/IDs/numbers or a quick "must contain
+                              everything" filter without FTS_MATCH's syntax.
+  CONTAINS_ANY(text, term1, term2, ...)    -> bool, ANY term present (same
+                              case-insensitive substring semantics)
+  CONTAINS_SCORE(text, term1, term2, ...)  -> int count of terms found (0..N),
+                              handy in ORDER BY to rank by term-match count
 
 RAG scoring (combine retrieval signals into one rank):
   RECENCY_SCORE(ts, half_life_days [, now])
