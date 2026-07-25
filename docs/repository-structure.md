@@ -4,6 +4,9 @@ Three layers: the public Go API at the repository root, engine and storage
 internals under `internal/`, and tools/demos under `cmd/`. The tree below
 highlights the relevant paths, not every file.
 
+For what the layers do, how a statement flows through them, and which invariants
+to preserve when changing internals, see [architecture.md](./architecture.md).
+
 ## Top level
 
 ```text

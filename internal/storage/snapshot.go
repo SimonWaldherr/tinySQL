@@ -1,0 +1,167 @@
+// Copies of a database: the deep clone and the transaction snapshot pair the
+// SQL driver runs a transaction against, and the row-less metadata snapshot the
+// engine diffs for write-ahead logging.
+//
+// Every clone must carry the runtime state that is not tenant data — see
+// DB.copyRuntimeState in db.go. Hand-copying individual fields here is what
+// once left a promoted clone without its write-ahead log.
+package storage
+
+// DeepClone creates a full copy of the database (MVCC-light snapshot).
+// Note: This is not copy-on-write; it creates a full copy (simple but O(n)).
+//
+// The result is a shadow: it carries the full runtime state and schema of the
+// original, but statements executed against it do not write to the WAL. Call
+// PromoteShadow if it is going to replace the live database.
+func (db *DB) DeepClone() *DB {
+	out := NewDB()
+	db.copyRuntimeState(out, true)
+	markShadow(out)
+	for tn, tdb := range db.tenants {
+		for _, t := range tdb.tables {
+			out.upsertTable(tn, cloneTable(t))
+		}
+	}
+	return out
+}
+
+// SnapshotForTx creates the pair of snapshots a SQL transaction needs while
+// copying row data only once instead of twice.
+//
+// shadow is a full deep clone that receives the transaction's writes. base is
+// a lightweight snapshot that records each table's identity and Version but no
+// rows: the only consumers of the base — CollectWALChanges and the driver's
+// conflict detection — read Table.Version and table existence exclusively and
+// never inspect rows. Copying rows into the base (as DeepClonePair does) would
+// therefore waste memory proportional to the entire database on every Begin.
+func (db *DB) SnapshotForTx() (base *DB, shadow *DB) {
+	base = NewDB()
+	shadow = NewDB()
+	// The shadow needs the full schema — views, triggers, materialized views,
+	// jobs, RBAC — or a statement inside the transaction cannot resolve a view
+	// and its triggers silently never fire. It gets its own deep copy so
+	// uncommitted DDL stays invisible to the live database until COMMIT.
+	db.copyRuntimeState(shadow, true)
+	markShadow(shadow)
+	// The base is only ever read for table identity and Version (by
+	// CollectWALChanges and the driver's conflict detection), so it needs no
+	// runtime state at all. It is still flagged as a shadow so an accidental
+	// write against it can never reach a WAL.
+	markShadow(base)
+	for tn, tdb := range db.tenants {
+		for _, t := range tdb.tables {
+			base.upsertTable(tn, cloneTableMeta(t))
+			shadow.upsertTable(tn, cloneTable(t))
+		}
+	}
+	return base, shadow
+}
+
+// cloneTableMeta copies a table's identity, schema and Version but not its
+// rows. It backs the row-less snapshots — SnapshotForTx's conflict-detection
+// base and MetaSnapshot's WAL diff pre-image — where only Version and
+// existence are ever read. Cols are shared by reference: neither snapshot is
+// mutated, and any schema change bumps Version, so a stale shared header
+// cannot hide a change.
+func cloneTableMeta(t *Table) *Table {
+	nt := NewTable(t.Name, t.Cols, t.IsTemp)
+	nt.Version = t.Version
+	return nt
+}
+
+func cloneTable(t *Table) *Table {
+	cols := make([]Column, len(t.Cols))
+	copy(cols, t.Cols)
+	nt := NewTable(t.Name, cols, t.IsTemp)
+	nt.Version = t.Version
+	nt.Indexes = cloneSecondaryIndexes(t.Indexes)
+	nt.Stats = cloneTableStats(t.Stats)
+	nt.dirtyFrom = t.dirtyFrom
+	nt.dirtyRows = append([]int(nil), t.dirtyRows...)
+	nt.dirtyRowsState = t.dirtyRowsState
+	nt.Rows = cloneRows(t.Rows)
+	return nt
+}
+
+// cloneRows copies all row headers into a single backing array. A statement
+// snapshot commonly clones tens of thousands of rows; keeping the cells
+// contiguous avoids one allocation per row while preserving the original
+// per-row append semantics through a full slice expression.
+func cloneRows(rows [][]any) [][]any {
+	cloned := make([][]any, len(rows))
+	maxInt := int(^uint(0) >> 1)
+	totalCells := 0
+	for _, row := range rows {
+		if len(row) > maxInt-totalCells {
+			// The contiguous allocation cannot be represented. This is only
+			// reachable for an impossibly large in-memory table on supported
+			// platforms, but retain the safe per-row behavior rather than
+			// overflowing the allocation size.
+			return cloneRowsIndividually(rows)
+		}
+		totalCells += len(row)
+	}
+
+	cells := make([]any, totalCells)
+	offset := 0
+	for i, row := range rows {
+		end := offset + len(row)
+		// Restrict capacity to the row length. Before this optimization each
+		// row was independently allocated with cap == len, so append must not
+		// be able to overwrite the next row in the shared backing array.
+		copyRow := cells[offset:end:end]
+		for j, value := range row {
+			copyRow[j] = cloneCell(value)
+		}
+		cloned[i] = copyRow
+		offset = end
+	}
+	return cloned
+}
+
+func cloneRowsIndividually(rows [][]any) [][]any {
+	cloned := make([][]any, len(rows))
+	for i, row := range rows {
+		copyRow := make([]any, len(row))
+		for j, value := range row {
+			copyRow[j] = cloneCell(value)
+		}
+		cloned[i] = copyRow
+	}
+	return cloned
+}
+
+// cloneCell preserves snapshot isolation for mutable binary values. Other
+// scalar values are immutable/value types at the storage boundary.
+func cloneCell(v any) any {
+	if b, ok := v.([]byte); ok {
+		return append([]byte(nil), b...)
+	}
+	return v
+}
+
+// MetaSnapshot captures every table's identity and Version but none of its
+// rows. It is the "before" image the engine diffs against to decide what one
+// statement changed for WALManager logging.
+//
+// It replaces the previous approach of reusing the statement's full rollback
+// snapshot for that diff, which forced a deep copy of the entire database on
+// every INSERT into a WAL-backed database and still could not see a CREATE or
+// DROP TABLE, because DDL takes no rollback snapshot at all. A metadata
+// snapshot costs O(number of tables) and detects created, dropped and mutated
+// tables alike.
+func (db *DB) MetaSnapshot() *DB {
+	if db == nil {
+		return nil
+	}
+	out := NewDB()
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	for tn, tdb := range db.tenants {
+		for key, t := range tdb.tables {
+			td := out.getTenant(tn)
+			td.tables[key] = cloneTableMeta(t)
+		}
+	}
+	return out
+}

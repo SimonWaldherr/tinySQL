@@ -305,6 +305,7 @@ The authenticated `GET /api/analytics/vector` endpoint exists only with
 | [Command line tools](./docs/cli-guide.md) | Using the `cmd/tinysql` CLI, REPL, servers, file-query tools, and the browser playground |
 | [Development guide](./docs/development-guide.md) | Running tests, the Makefile, building the WASM demo |
 | [Memory optimization](./docs/memory-optimization.md) | Where tinySQL spends memory, landed wins, and proposals for further reductions |
+| [Architecture](./docs/architecture.md) | How the layers fit together, the life of a statement, and the invariants to preserve when changing internals |
 | [Repository structure](./docs/repository-structure.md) | Codebase layout for contributors |
 | [Benchmarks](./BENCHMARKS.md) | TinySQL-vs-SQLite numbers and internal optimization history |
 
