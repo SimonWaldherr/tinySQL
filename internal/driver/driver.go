@@ -526,6 +526,15 @@ type conn struct {
 	shadow     *storage.DB // Snapshot copy (MVCC-light)
 	txReadOnly bool        // Active tx requested as read-only
 	txDirty    bool        // A successful write ran against shadow.
+	// txCatalogRev is the shadow catalog's revision when the transaction began,
+	// and txCatalog a copy of its contents. commitTx uses the revision as a
+	// cheap gate — unchanged means nothing touched the catalog at all — and the
+	// contents to tell an actual change (CREATE VIEW/TRIGGER/JOB, GRANT,
+	// materialized-view staleness) from incidental bookkeeping that ordinary
+	// DML performs. Only an actual change is installed on the live database,
+	// and only if no concurrent change would be discarded by doing so.
+	txCatalogRev uint64
+	txCatalog    storage.CatalogSnapshot
 }
 
 func (c *conn) Prepare(query string) (driver.Stmt, error) {
@@ -559,6 +568,7 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 		c.shadow = nil
 		c.txReadOnly = true
 		c.txDirty = false
+		c.txCatalogRev = 0
 		return &tx{c: c}, nil
 	}
 
@@ -585,6 +595,10 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 	c.shadow = shadow
 	c.txReadOnly = opts.ReadOnly
 	c.txDirty = false
+	// The shadow's catalog is a private deep copy of the live one, so its
+	// contents here are also the live contents at BEGIN.
+	c.txCatalogRev = shadow.Catalog().Revision()
+	c.txCatalog = shadow.SnapshotCatalog()
 	return &tx{c: c}, nil
 }
 
@@ -624,6 +638,10 @@ func (c *conn) commitTx() error {
 	// A BEGIN/COMMIT pair with no successful write cannot change the shared
 	// database, so it needs neither the writer slot nor change collection.
 	if !c.txDirty {
+		if err := c.shadow.AbortAmbientWALTx(); err != nil {
+			c.clearTxState()
+			return err
+		}
 		c.clearTxState()
 		return nil
 	}
@@ -640,9 +658,34 @@ func (c *conn) commitTx() error {
 	oldDB := c.srv.db
 	newDB := c.shadow
 	changes := storage.CollectWALChanges(c.txBase, newDB)
+	// The transaction's catalog work — CREATE VIEW/TRIGGER/JOB, GRANT, and the
+	// materialized-view staleness marks DML leaves behind — lives on the
+	// shadow's private catalog copy and is not part of `changes`, which covers
+	// tables only. It has to be published with the transaction rather than
+	// silently dropped at COMMIT.
+	//
+	// The revision counter is only a gate: ordinary DML takes the catalog's
+	// write lock even when it changes nothing there, so a bumped revision does
+	// not by itself mean this transaction has catalog state to commit. Compare
+	// the contents to find out.
+	catalogChanged := false
+	var shadowCatalog storage.CatalogSnapshot
+	if newDB.Catalog().Revision() != c.txCatalogRev {
+		shadowCatalog = newDB.SnapshotCatalog()
+		catalogChanged = !shadowCatalog.Equal(c.txCatalog)
+	}
 	if err := c.detectTxConflicts(oldDB, changes); err != nil {
+		_ = c.shadow.AbortAmbientWALTx()
 		c.clearTxState()
 		return err
+	}
+	if catalogChanged && !oldDB.SnapshotCatalog().Equal(c.txCatalog) {
+		// Another connection changed the catalog after this transaction began.
+		// Installing this transaction's copy would discard that change, so
+		// report a retryable conflict instead.
+		_ = c.shadow.AbortAmbientWALTx()
+		c.clearTxState()
+		return fmt.Errorf("%w on the system catalog", ErrTransactionConflict)
 	}
 	wal := oldDB.WAL()
 	needCheckpoint := false
@@ -653,8 +696,14 @@ func (c *conn) commitTx() error {
 			return err
 		}
 	}
+	if err := newDB.CommitAmbientWALTx(); err != nil {
+		return err
+	}
 	if err := oldDB.ApplyWALChanges(changes); err != nil {
 		return err
+	}
+	if catalogChanged {
+		oldDB.AdoptCatalog(newDB.Catalog())
 	}
 	if wal != nil && needCheckpoint {
 		if err := wal.Checkpoint(oldDB); err != nil {
@@ -692,8 +741,12 @@ func (c *conn) rollbackTx() error {
 	if !c.inTx {
 		return fmt.Errorf("tinysql: no active transaction")
 	}
+	// Discarding the shadow is enough for the in-memory state, but ModeAdvancedWAL
+	// has already written this block's row operations to disk. Record the abort so
+	// recovery discards them instead of replaying rolled-back rows.
+	err := c.shadow.AbortAmbientWALTx()
 	c.clearTxState()
-	return nil
+	return err
 }
 
 func (c *conn) clearTxState() {
@@ -702,6 +755,7 @@ func (c *conn) clearTxState() {
 	c.shadow = nil
 	c.txReadOnly = false
 	c.txDirty = false
+	c.txCatalogRev = 0
 }
 
 // ------------------- exec / query -------------------
@@ -926,24 +980,6 @@ func normalizeTransactionSQL(sqlStr string) string {
 	return strings.Join(strings.Fields(strings.ToUpper(s)), " ")
 }
 
-// writeTargetTable returns the single table name modified by a DML/DDL statement.
-func writeTargetTable(st engine.Statement) string {
-	switch s := st.(type) {
-	case *engine.Insert:
-		return s.Table
-	case *engine.Update:
-		return s.Table
-	case *engine.Delete:
-		return s.Table
-	case *engine.CreateTable:
-		return s.Name
-	case *engine.DropTable:
-		return s.Name
-	default:
-		return ""
-	}
-}
-
 // affectedRows extracts the affected-row count from an UPDATE/DELETE result.
 // The engine returns a single {countCell: n} row for the plain form; a
 // RETURNING clause instead projects one row per affected row.
@@ -980,6 +1016,14 @@ func (c *conn) execStatement(ctx context.Context, st engine.Statement) (driver.R
 		}
 		var rs *engine.ResultSet
 		if c.inTx {
+			// ModeAdvancedWAL logs row operations as they happen. Open one WAL
+			// transaction for the whole block (lazily, on its first write) so
+			// recovery replays it only once this connection commits. Without
+			// that grouping every statement was its own committed WAL
+			// transaction, and a ROLLBACK left it on disk to be replayed.
+			if _, err := c.shadow.BeginAmbientWALTx(); err != nil {
+				return nil, err
+			}
 			r, err := engine.Execute(ctx, c.currentDB(), c.tenant, st)
 			if err != nil {
 				return nil, err
@@ -993,35 +1037,21 @@ func (c *conn) execStatement(ctx context.Context, st engine.Statement) (driver.R
 			defer c.srv.releaseWriter()
 			c.srv.mu.Lock()
 			defer c.srv.mu.Unlock()
-			base := c.srv.db
-			wal := base.WAL()
-			var needCheckpoint bool
+			// Run the statement against the live database in every storage
+			// mode, ModeWAL included. The engine appends it to the WAL itself
+			// (internal/engine.maybeLogToWALManager) and rolls the statement
+			// back if that append fails, so the log still leads the change.
+			//
+			// ModeWAL used to be special-cased here: the statement ran against
+			// a clone which then replaced the live database. That swap silently
+			// discarded everything the clone did not copy — on a still-empty
+			// database the WAL itself, so nothing was ever logged again; also
+			// the catalog, the backend and the audit log — left the job
+			// scheduler pointing at the superseded instance, and logged every
+			// write twice, once from the engine and once from here.
 			var err error
-			if wal != nil {
-				// Clone only the single table being modified instead of the
-				// entire database. All other tables are shared by reference.
-				target := writeTargetTable(st)
-				shadow := base.ShallowCloneForTable(c.tenant, target)
-				if rs, err = engine.Execute(ctx, shadow, c.tenant, st); err != nil {
-					return nil, err
-				}
-				changes := storage.CollectWALChanges(base, shadow)
-				if len(changes) > 0 {
-					needCheckpoint, err = wal.LogTransaction(changes)
-					if err != nil {
-						return nil, err
-					}
-				}
-				c.srv.db = shadow
-				if needCheckpoint {
-					if err := wal.Checkpoint(shadow); err != nil {
-						return nil, err
-					}
-				}
-			} else {
-				if rs, err = engine.Execute(ctx, base, c.tenant, st); err != nil {
-					return nil, err
-				}
+			if rs, err = engine.Execute(ctx, c.srv.db, c.tenant, st); err != nil {
+				return nil, err
 			}
 			c.srv.saveIfNeeded()
 		}

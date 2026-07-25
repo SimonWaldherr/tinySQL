@@ -991,6 +991,10 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 			patchConstraintIndexRow(t, ri, t.Rows[ri], nextRow)
 			before := r
 			t.Rows[ri] = nextRow
+			// Report the row so the WAL can log it alone instead of the whole
+			// table. Triggers below may write here too; anything that adds or
+			// removes rows invalidates the list through MarkDirtyFrom.
+			t.MarkRowUpdated(ri)
 			if err := t.UpdateSecondaryIndexRow(ri, before, nextRow); err != nil {
 				return nil, err
 			}
@@ -1018,7 +1022,9 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 	t.Version++
 	if n > 0 {
 		t.InvalidateStats()
-		t.MarkDirtyFrom(-1) // UPDATE is non-append; force full-table WAL
+		// The per-row MarkRowUpdated calls above already marked the table
+		// non-append. Forcing MarkDirtyFrom(-1) here as well would discard the
+		// row list they built and send the whole table to the WAL.
 		markDependentMaterializedViewsStale(env, s.Table)
 	}
 	if len(s.Returning) > 0 {
@@ -1094,6 +1100,7 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 		patchConstraintIndexRow(plan.table, ri, plan.table.Rows[ri], nextRow)
 		before := raw
 		plan.table.Rows[ri] = nextRow
+		plan.table.MarkRowUpdated(ri)
 		if err := plan.table.UpdateSecondaryIndexRow(ri, before, nextRow); err != nil {
 			return nil, true, err
 		}
@@ -1109,7 +1116,6 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 	plan.table.Version++
 	if updated > 0 {
 		plan.table.InvalidateStats()
-		plan.table.MarkDirtyFrom(-1)
 		markDependentMaterializedViewsStale(env, s.Table)
 	}
 	return &ResultSet{Cols: []string{"updated"}, Rows: []Row{{"updated": updated}}}, true, nil

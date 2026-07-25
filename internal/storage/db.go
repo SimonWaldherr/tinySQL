@@ -23,6 +23,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -348,7 +349,27 @@ type Table struct {
 	// For append-only workloads (INSERT without UPDATE/DELETE), this
 	// enables the WAL to log only new rows instead of the entire table.
 	dirtyFrom int
+	// dirtyRows lists the rows an UPDATE replaced in place since the last
+	// ResetDirty, letting the WAL log those rows instead of the whole table.
+	// It is only trusted while dirtyRowsState is dirtyRowsExact; anything that
+	// adds, removes or reorders rows takes the state to dirtyRowsUnknown
+	// through MarkDirtyFrom, and the WAL falls back to a full-table record.
+	// The fallback is the safe direction: a missed MarkRowUpdated costs one
+	// oversized record, never a lost change.
+	dirtyRows      []int
+	dirtyRowsState dirtyRowsState
 }
+
+// dirtyRowsState distinguishes "no in-place updates recorded yet" from "the
+// recorded list is complete" and from "row positions moved, so no list can
+// describe this change".
+type dirtyRowsState uint8
+
+const (
+	dirtyRowsNone dirtyRowsState = iota
+	dirtyRowsExact
+	dirtyRowsUnknown
+)
 
 // ColumnStats summarizes one column as of TableStats.AnalyzedAt. Min and Max
 // are display values for introspection; the planner currently uses row and
@@ -504,7 +525,12 @@ func statsNumber(value any) (float64, bool) {
 // The -1 (full-table) sentinel is sticky: once a mutation within a transaction
 // forces a full-table entry, a later append-only INSERT must not downgrade it
 // to a delta, or the earlier UPDATE/DELETE would be lost on WAL recovery.
+// Any call also gives up on the in-place row list: an append shifts nothing but
+// adds rows the list cannot describe, and an explicit -1 from a caller that is
+// not reporting individual rows means the shape of the change is unknown.
 func (t *Table) MarkDirtyFrom(idx int) {
+	t.dirtyRows = nil
+	t.dirtyRowsState = dirtyRowsUnknown
 	if idx < 0 {
 		t.dirtyFrom = -1
 		return
@@ -518,11 +544,43 @@ func (t *Table) MarkDirtyFrom(idx int) {
 	t.dirtyFrom = idx
 }
 
+// MarkRowUpdated records that row idx was replaced in place, so the WAL can log
+// that row instead of the entire table. UPDATE is the only shape this fits: it
+// changes row contents without changing how many rows there are or where they
+// sit.
+//
+// Callers must report every row they change. Reporting none is safe — the WAL
+// writes the whole table, as it always did. Reporting some but not all is not,
+// so a mutation path that cannot enumerate its rows must call MarkDirtyFrom(-1)
+// instead, which permanently gives up the list for this dirty window.
+func (t *Table) MarkRowUpdated(idx int) {
+	t.dirtyFrom = -1
+	if t.dirtyRowsState == dirtyRowsUnknown || idx < 0 {
+		return
+	}
+	t.dirtyRowsState = dirtyRowsExact
+	t.dirtyRows = append(t.dirtyRows, idx)
+}
+
 // DirtyFrom returns the first dirty row index, or -1 if non-append-only.
 func (t *Table) DirtyFrom() int { return t.dirtyFrom }
 
+// DirtyRows returns the in-place updated row indices and whether that list is
+// known to be complete. A false second result means the caller must treat the
+// whole table as changed.
+func (t *Table) DirtyRows() ([]int, bool) {
+	if t.dirtyRowsState != dirtyRowsExact || len(t.dirtyRows) == 0 {
+		return nil, false
+	}
+	return t.dirtyRows, true
+}
+
 // ResetDirty marks the table as clean (called after WAL checkpoint).
-func (t *Table) ResetDirty() { t.dirtyFrom = len(t.Rows) }
+func (t *Table) ResetDirty() {
+	t.dirtyFrom = len(t.Rows)
+	t.dirtyRows = nil
+	t.dirtyRowsState = dirtyRowsNone
+}
 
 // ColIndex returns the zero-based index of the named column.
 func (t *Table) ColIndex(name string) (int, error) {
@@ -633,6 +691,200 @@ type DB struct {
 	// day) use this to guarantee cache/index stability: no write can invalidate
 	// vector index or column caches, and the WAL is never appended to.
 	readOnly atomic.Bool
+
+	// shadow marks this database as an uncommitted working copy — the private
+	// snapshot the SQL driver runs a BEGIN…COMMIT block against. StatementWAL
+	// reports no log for a shadow, so the engine cannot append a statement
+	// that a later ROLLBACK would discard; the driver logs the whole
+	// transaction against the live database when it commits. See
+	// SnapshotForTx and PromoteShadow.
+	shadow atomic.Bool
+
+	// ambientWALTx is the AdvancedWAL transaction that every statement running
+	// against this database joins instead of opening its own. The SQL driver
+	// sets it on a transaction shadow so a multi-statement BEGIN…COMMIT block
+	// becomes one AdvancedWAL transaction, committed or aborted as a unit.
+	// Zero means "no ambient transaction: each statement is its own".
+	ambientWALTx atomic.Uint64
+}
+
+// BeginAmbientWALTx opens one AdvancedWAL transaction that every subsequent
+// statement executed against db joins, instead of each statement logging its
+// own implicitly-committed transaction. The SQL driver calls it on a
+// transaction shadow at BEGIN so that recovery replays the block only if
+// CommitAmbientWALTx ran; AbortAmbientWALTx marks it rolled back.
+//
+// It is idempotent, so the driver can call it lazily before the first write in
+// a block instead of writing a begin record for every read-only BEGIN. It is a
+// no-op returning false when no AdvancedWAL is attached.
+func (db *DB) BeginAmbientWALTx() (bool, error) {
+	if db == nil {
+		return false, nil
+	}
+	wal := db.AdvancedWAL()
+	if wal == nil {
+		return false, nil
+	}
+	if _, open := db.AmbientWALTx(); open {
+		return true, nil
+	}
+	txID := wal.NewAutoTxID()
+	if _, err := wal.LogBegin(txID); err != nil {
+		return false, err
+	}
+	db.ambientWALTx.Store(uint64(txID))
+	return true, nil
+}
+
+// AmbientWALTx returns the ambient AdvancedWAL transaction, if one is open.
+func (db *DB) AmbientWALTx() (TxID, bool) {
+	if db == nil {
+		return 0, false
+	}
+	v := db.ambientWALTx.Load()
+	return TxID(v), v != 0
+}
+
+// CommitAmbientWALTx writes the commit record for the ambient transaction and
+// clears it. Recovery replays the transaction's operations only after seeing
+// this record.
+func (db *DB) CommitAmbientWALTx() error {
+	txID, ok := db.AmbientWALTx()
+	if !ok {
+		return nil
+	}
+	db.ambientWALTx.Store(0)
+	wal := db.AdvancedWAL()
+	if wal == nil {
+		return nil
+	}
+	_, err := wal.LogCommit(txID)
+	return err
+}
+
+// AbortAmbientWALTx writes the abort record for the ambient transaction and
+// clears it, so recovery discards whatever the rolled-back block logged.
+func (db *DB) AbortAmbientWALTx() error {
+	txID, ok := db.AmbientWALTx()
+	if !ok {
+		return nil
+	}
+	db.ambientWALTx.Store(0)
+	wal := db.AdvancedWAL()
+	if wal == nil {
+		return nil
+	}
+	_, err := wal.LogAbort(txID)
+	return err
+}
+
+// copyRuntimeState copies everything that is not tenant/table data onto out:
+// the write-ahead logs, the storage backend, the audit log, the MVCC
+// coordinator, the job scheduler, the open configuration, the storage mode and
+// the read-only flag.
+//
+// Every clone constructor must call it. Before it existed each one hand-copied
+// only .wal, so a clone that the driver promoted to be the live database
+// silently lost its backend, catalog, audit log and scheduler — and a clone of
+// an empty database lost the WAL too, which stopped a fresh ModeWAL database
+// from ever logging again after its first write.
+//
+// isolateCatalog selects how catalog-resident state (views, triggers,
+// materialized-view freshness, jobs, RBAC) is carried over:
+//
+//   - true deep-copies it, so the clone can be mutated for the lifetime of a
+//     transaction without the live database observing uncommitted DDL. The
+//     driver installs the result at COMMIT.
+//   - false shares the live instance, which is what a single autocommit
+//     statement needs: the engine's own StatementSnapshot already restores the
+//     catalog if that statement fails, and the statement holds the writer lock
+//     throughout, so no reader can observe the intermediate state.
+func (db *DB) copyRuntimeState(out *DB, isolateCatalog bool) {
+	if db == nil || out == nil {
+		return
+	}
+	db.mu.RLock()
+	out.wal = db.wal
+	out.advancedWAL = db.advancedWAL
+	out.auditLog = db.auditLog
+	out.mvcc = db.mvcc
+	out.scheduler = db.scheduler
+	out.backend = db.backend
+	out.storageMode = db.storageMode
+	out.config = db.config
+	out.lastRecovery = db.lastRecovery
+	db.mu.RUnlock()
+	out.readOnly.Store(db.readOnly.Load())
+
+	live := db.Catalog()
+	if isolateCatalog {
+		copied := diskToCatalog(catalogToDisk(live))
+		copied.setRevision(live.Revision())
+		out.setCatalog(copied)
+	} else {
+		out.setCatalog(live)
+	}
+
+	db.extensionsMu.RLock()
+	if len(db.extensions) > 0 {
+		out.extensions = make(map[string]ExtensionInfo, len(db.extensions))
+		for k, v := range db.extensions {
+			out.extensions[k] = v
+		}
+	}
+	db.extensionsMu.RUnlock()
+}
+
+// markShadow flags out as an uncommitted working copy. See DB.shadow.
+func markShadow(out *DB) {
+	if out != nil {
+		out.shadow.Store(true)
+	}
+}
+
+// PromoteShadow clears the shadow flag, declaring that this database's
+// contents are committed and that statements executed against it from now on
+// are responsible for their own write-ahead logging. Only the SQL driver calls
+// it, after it has durably logged the transaction that produced the shadow.
+func (db *DB) PromoteShadow() {
+	if db != nil {
+		db.shadow.Store(false)
+	}
+}
+
+// IsShadow reports whether this database is an uncommitted working copy.
+func (db *DB) IsShadow() bool {
+	return db != nil && db.shadow.Load()
+}
+
+// StatementWAL returns the WALManager that a statement executing against db
+// must append to, or nil when statement-level logging is not this database's
+// responsibility.
+//
+// It differs from WAL in exactly one case: a transaction shadow, where it
+// returns nil. A statement inside BEGIN…COMMIT is not durable until the
+// transaction commits, so logging it as it runs would leave a committed-looking
+// record on disk that recovery replays even when the transaction was rolled
+// back. The driver logs the transaction as a whole against the live database
+// instead.
+func (db *DB) StatementWAL() *WALManager {
+	if db == nil || db.shadow.Load() {
+		return nil
+	}
+	return db.WAL()
+}
+
+// StatementAdvancedWAL is the AdvancedWAL counterpart of StatementWAL. Unlike
+// the basic WALManager, AdvancedWAL records row-level operations grouped into
+// explicit transactions, so a shadow does not have to stop logging: it logs
+// into the ambient transaction the driver opened at BEGIN (see
+// BeginAmbientWALTx), which recovery only replays once a matching commit
+// record exists.
+func (db *DB) StatementAdvancedWAL() *AdvancedWAL {
+	if db == nil {
+		return nil
+	}
+	return db.AdvancedWAL()
 }
 
 // SetReadOnly toggles read-only mode. While enabled, the SQL engine rejects
@@ -1260,35 +1512,20 @@ func (db *DB) ListTables(tn string) []*Table {
 
 // DeepClone creates a full copy of the database (MVCC-light snapshot).
 // Note: This is not copy-on-write; it creates a full copy (simple but O(n)).
+//
+// The result is a shadow: it carries the full runtime state and schema of the
+// original, but statements executed against it do not write to the WAL. Call
+// PromoteShadow if it is going to replace the live database.
 func (db *DB) DeepClone() *DB {
-	if len(db.tenants) == 0 {
-		return NewDB()
-	}
 	out := NewDB()
-	out.wal = db.wal
+	db.copyRuntimeState(out, true)
+	markShadow(out)
 	for tn, tdb := range db.tenants {
 		for _, t := range tdb.tables {
-			_ = out.Put(tn, cloneTable(t))
+			out.upsertTable(tn, cloneTable(t))
 		}
 	}
 	return out
-}
-
-// DeepClonePair creates two independent full copies in one traversal. The SQL
-// driver uses this for transaction begin: one immutable base snapshot for
-// conflict detection and one mutable shadow that receives transaction writes.
-func (db *DB) DeepClonePair() (*DB, *DB) {
-	base := NewDB()
-	shadow := NewDB()
-	base.wal = db.wal
-	shadow.wal = db.wal
-	for tn, tdb := range db.tenants {
-		for _, t := range tdb.tables {
-			base.upsertTable(tn, cloneTable(t))
-			shadow.upsertTable(tn, cloneTable(t))
-		}
-	}
-	return base, shadow
 }
 
 // SnapshotForTx creates the pair of snapshots a SQL transaction needs while
@@ -1303,8 +1540,17 @@ func (db *DB) DeepClonePair() (*DB, *DB) {
 func (db *DB) SnapshotForTx() (base *DB, shadow *DB) {
 	base = NewDB()
 	shadow = NewDB()
-	base.wal = db.wal
-	shadow.wal = db.wal
+	// The shadow needs the full schema — views, triggers, materialized views,
+	// jobs, RBAC — or a statement inside the transaction cannot resolve a view
+	// and its triggers silently never fire. It gets its own deep copy so
+	// uncommitted DDL stays invisible to the live database until COMMIT.
+	db.copyRuntimeState(shadow, true)
+	markShadow(shadow)
+	// The base is only ever read for table identity and Version (by
+	// CollectWALChanges and the driver's conflict detection), so it needs no
+	// runtime state at all. It is still flagged as a shadow so an accidental
+	// write against it can never reach a WAL.
+	markShadow(base)
 	for tn, tdb := range db.tenants {
 		for _, t := range tdb.tables {
 			base.upsertTable(tn, cloneTableMeta(t))
@@ -1315,10 +1561,11 @@ func (db *DB) SnapshotForTx() (base *DB, shadow *DB) {
 }
 
 // cloneTableMeta copies a table's identity, schema and Version but not its
-// rows. It backs the transaction base snapshot from SnapshotForTx, where only
-// Version and existence are ever read. Cols are shared by reference: the base
-// is never mutated, and any schema change bumps Version, so a stale shared
-// header cannot cause a missed conflict.
+// rows. It backs the row-less snapshots — SnapshotForTx's conflict-detection
+// base and MetaSnapshot's WAL diff pre-image — where only Version and
+// existence are ever read. Cols are shared by reference: neither snapshot is
+// mutated, and any schema change bumps Version, so a stale shared header
+// cannot hide a change.
 func cloneTableMeta(t *Table) *Table {
 	nt := NewTable(t.Name, t.Cols, t.IsTemp)
 	nt.Version = t.Version
@@ -1333,6 +1580,8 @@ func cloneTable(t *Table) *Table {
 	nt.Indexes = cloneSecondaryIndexes(t.Indexes)
 	nt.Stats = cloneTableStats(t.Stats)
 	nt.dirtyFrom = t.dirtyFrom
+	nt.dirtyRows = append([]int(nil), t.dirtyRows...)
+	nt.dirtyRowsState = t.dirtyRowsState
 	nt.Rows = cloneRows(t.Rows)
 	return nt
 }
@@ -1394,30 +1643,27 @@ func cloneCell(v any) any {
 	return v
 }
 
-// ShallowCloneForTable creates a lightweight copy of the database that
-// deep-copies only the specified table and shares all others by reference.
-// This is safe when the caller knows only the target table will be mutated
-// (single-statement DML). For a database with many tables, this is
-// dramatically cheaper than DeepClone — O(rows in target table) instead of
-// O(rows in all tables).
-func (db *DB) ShallowCloneForTable(tenant, tableName string) *DB {
-	if len(db.tenants) == 0 {
-		return NewDB()
+// MetaSnapshot captures every table's identity and Version but none of its
+// rows. It is the "before" image the engine diffs against to decide what one
+// statement changed for WALManager logging.
+//
+// It replaces the previous approach of reusing the statement's full rollback
+// snapshot for that diff, which forced a deep copy of the entire database on
+// every INSERT into a WAL-backed database and still could not see a CREATE or
+// DROP TABLE, because DDL takes no rollback snapshot at all. A metadata
+// snapshot costs O(number of tables) and detects created, dropped and mutated
+// tables alike.
+func (db *DB) MetaSnapshot() *DB {
+	if db == nil {
+		return nil
 	}
 	out := NewDB()
-	out.wal = db.wal
-	targetTenant := strings.ToLower(tenant)
-	targetKey := strings.ToLower(tableName)
+	db.mu.RLock()
+	defer db.mu.RUnlock()
 	for tn, tdb := range db.tenants {
-		for _, t := range tdb.tables {
-			key := strings.ToLower(t.Name)
-			if tn == targetTenant && key == targetKey {
-				// Deep-copy the target table that will be mutated.
-				out.upsertTable(tn, cloneTable(t))
-			} else {
-				// Share by reference — these tables are read-only in this operation.
-				out.upsertTable(tn, t)
-			}
+		for key, t := range tdb.tables {
+			td := out.getTenant(tn)
+			td.tables[key] = cloneTableMeta(t)
 		}
 	}
 	return out
@@ -1460,6 +1706,79 @@ type diskCatalog struct {
 	JobRuns      []*CatalogJobHistory
 	NextRun      int64
 	Triggers     []*CatalogTrigger
+	// RBAC carries the users/roles/grants. It must be part of every catalog
+	// snapshot, not just the persisted ones: diskCatalog is also the in-memory
+	// rollback form used by StatementSnapshot, so omitting RBAC here silently
+	// dropped every user on any failed statement — and because enforcement is
+	// opt-in via HasUsers, dropping the last user turns authorization OFF
+	// instead of denying access. A nil value means "no RBAC state in this
+	// snapshot" (older files), which decodes to an empty, disabled-by-default
+	// rbacState exactly as before.
+	RBAC *diskRBAC
+}
+
+// diskRBAC is the serializable form of rbacState. Passwords are stored as the
+// same bcrypt hashes rbacState holds in memory; nothing is decrypted or
+// re-hashed by a round trip.
+type diskRBAC struct {
+	Users    []CatalogUser
+	Roles    []CatalogRole
+	Disabled bool
+}
+
+// rbacToDisk snapshots the RBAC state. The returned value shares no memory
+// with c, so a later mutation cannot reach back into a snapshot.
+func rbacToDisk(r *rbacState) *diskRBAC {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := &diskRBAC{
+		Users:    make([]CatalogUser, 0, len(r.users)),
+		Roles:    make([]CatalogRole, 0, len(r.roles)),
+		Disabled: r.disabled,
+	}
+	for _, u := range r.users {
+		if u == nil {
+			continue
+		}
+		cp := *u
+		cp.Roles = append([]string(nil), u.Roles...)
+		out.Users = append(out.Users, cp)
+	}
+	for _, role := range r.roles {
+		if role == nil {
+			continue
+		}
+		cp := *role
+		cp.Grants = append([]Grant(nil), role.Grants...)
+		out.Roles = append(out.Roles, cp)
+	}
+	sort.Slice(out.Users, func(i, j int) bool { return out.Users[i].Name < out.Users[j].Name })
+	sort.Slice(out.Roles, func(i, j int) bool { return out.Roles[i].Name < out.Roles[j].Name })
+	return out
+}
+
+// diskToRBAC rebuilds rbacState from a snapshot. A nil snapshot yields a
+// fresh, empty state so pre-RBAC catalog files keep loading unchanged.
+func diskToRBAC(d *diskRBAC) *rbacState {
+	r := newRBACState()
+	if d == nil {
+		return r
+	}
+	r.disabled = d.Disabled
+	for i := range d.Users {
+		cp := d.Users[i]
+		cp.Roles = append([]string(nil), d.Users[i].Roles...)
+		r.users[strings.ToLower(cp.Name)] = &cp
+	}
+	for i := range d.Roles {
+		cp := d.Roles[i]
+		cp.Grants = append([]Grant(nil), d.Roles[i].Grants...)
+		r.roles[strings.ToLower(cp.Name)] = &cp
+	}
+	return r
 }
 
 func catalogToDisk(c *CatalogManager) diskCatalog {
@@ -1529,7 +1848,91 @@ func catalogToDisk(c *CatalogManager) diskCatalog {
 		cp := *t
 		dc.Triggers = append(dc.Triggers, &cp)
 	}
+	dc.RBAC = rbacToDisk(c.rbac)
+	sortDiskCatalog(&dc)
 	return dc
+}
+
+// sortDiskCatalog puts every slice in a deterministic order. The slices are
+// built by ranging over maps, so without this the same catalog encodes
+// differently on each call — which makes two snapshots of identical content
+// compare unequal (see CatalogSnapshot.Equal, used to decide whether a
+// transaction really changed the catalog) and makes checkpoint files differ
+// byte-for-byte between runs of the same data.
+func sortDiskCatalog(dc *diskCatalog) {
+	sort.Slice(dc.Tables, func(i, j int) bool {
+		if dc.Tables[i].Schema != dc.Tables[j].Schema {
+			return dc.Tables[i].Schema < dc.Tables[j].Schema
+		}
+		return dc.Tables[i].Name < dc.Tables[j].Name
+	})
+	sort.Slice(dc.Views, func(i, j int) bool {
+		if dc.Views[i].Schema != dc.Views[j].Schema {
+			return dc.Views[i].Schema < dc.Views[j].Schema
+		}
+		return dc.Views[i].Name < dc.Views[j].Name
+	})
+	sort.Slice(dc.MViews, func(i, j int) bool {
+		if dc.MViews[i].Schema != dc.MViews[j].Schema {
+			return dc.MViews[i].Schema < dc.MViews[j].Schema
+		}
+		return dc.MViews[i].Name < dc.MViews[j].Name
+	})
+	sort.Slice(dc.Dependencies, func(i, j int) bool {
+		a, b := dc.Dependencies[i], dc.Dependencies[j]
+		if a.Schema != b.Schema {
+			return a.Schema < b.Schema
+		}
+		if a.ObjectName != b.ObjectName {
+			return a.ObjectName < b.ObjectName
+		}
+		if a.DependsOnSchema != b.DependsOnSchema {
+			return a.DependsOnSchema < b.DependsOnSchema
+		}
+		if a.DependsOnName != b.DependsOnName {
+			return a.DependsOnName < b.DependsOnName
+		}
+		return a.DependencyType < b.DependencyType
+	})
+	sort.Slice(dc.Indexes, func(i, j int) bool {
+		a, b := dc.Indexes[i], dc.Indexes[j]
+		if a.Tenant != b.Tenant {
+			return a.Tenant < b.Tenant
+		}
+		if a.Schema != b.Schema {
+			return a.Schema < b.Schema
+		}
+		return a.Name < b.Name
+	})
+	sort.Slice(dc.Funcs, func(i, j int) bool {
+		if dc.Funcs[i].Schema != dc.Funcs[j].Schema {
+			return dc.Funcs[i].Schema < dc.Funcs[j].Schema
+		}
+		return dc.Funcs[i].Name < dc.Funcs[j].Name
+	})
+	sort.Slice(dc.Jobs, func(i, j int) bool { return dc.Jobs[i].Name < dc.Jobs[j].Name })
+	sort.Slice(dc.Triggers, func(i, j int) bool { return dc.Triggers[i].Name < dc.Triggers[j].Name })
+}
+
+// CatalogSnapshot is an opaque, comparable copy of a catalog's contents. It
+// exists so the SQL driver can tell "this transaction created a view" from
+// "this transaction ran an INSERT that happened to touch catalog bookkeeping",
+// which a revision counter alone cannot distinguish.
+type CatalogSnapshot struct {
+	dc diskCatalog
+}
+
+// SnapshotCatalog copies this database's catalog contents for later comparison.
+func (db *DB) SnapshotCatalog() CatalogSnapshot {
+	if db == nil {
+		return CatalogSnapshot{dc: catalogToDisk(nil)}
+	}
+	return CatalogSnapshot{dc: catalogToDisk(db.Catalog())}
+}
+
+// Equal reports whether two snapshots hold the same catalog contents.
+func (s CatalogSnapshot) Equal(other CatalogSnapshot) bool {
+	return reflect.DeepEqual(s.dc, other.dc)
 }
 
 func diskToCatalog(dc diskCatalog) *CatalogManager {
@@ -1620,6 +2023,7 @@ func diskToCatalog(dc diskCatalog) *CatalogManager {
 		cp := *t
 		c.triggers[cp.Name] = &cp
 	}
+	c.rbac = diskToRBAC(dc.RBAC)
 	return c
 }
 
@@ -1737,6 +2141,66 @@ func tableToDiskRange(tn string, t *Table, from, to int) diskTable {
 		dt.Rows[i-from] = row
 	}
 	return dt
+}
+
+// tableToDiskRows serializes the schema plus only the rows at the given
+// indices, and returns those indices in the same order as the serialized rows
+// so a replay can put each one back where it belongs. Indices are sorted and
+// deduplicated, and any that no longer address a row are dropped.
+func tableToDiskRows(tn string, t *Table, indexes []int) (diskTable, []int) {
+	wanted := append([]int(nil), indexes...)
+	sort.Ints(wanted)
+	kept := wanted[:0]
+	prev := -1
+	for _, idx := range wanted {
+		if idx == prev || idx < 0 || idx >= len(t.Rows) {
+			continue
+		}
+		kept = append(kept, idx)
+		prev = idx
+	}
+
+	dt := diskTable{
+		Tenant:  tn,
+		Name:    t.Name,
+		IsTemp:  t.IsTemp,
+		Version: t.Version,
+		Cols:    make([]diskColumn, len(t.Cols)),
+		Rows:    make([][]any, 0, len(kept)),
+		Indexes: cloneSecondaryIndexes(t.Indexes),
+		Stats:   cloneTableStats(t.Stats),
+	}
+	for i, c := range t.Cols {
+		dt.Cols[i] = diskColumn(c)
+	}
+	for _, idx := range kept {
+		dt.Rows = append(dt.Rows, diskRowFromTable(t, t.Rows[idx]))
+	}
+	return dt, kept
+}
+
+// diskRowFromTable converts one row to its on-disk representation, applying the
+// same JSON normalization tableToDiskRange does.
+func diskRowFromTable(t *Table, r []any) []any {
+	row := make([]any, len(r))
+	for j, v := range r {
+		if v == nil {
+			row[j] = nil
+			continue
+		}
+		if j < len(t.Cols) && t.Cols[j].Type == JsonType {
+			switch vv := v.(type) {
+			case string:
+				row[j] = vv
+			default:
+				b, _ := JSONMarshal(v)
+				row[j] = string(b)
+			}
+		} else {
+			row[j] = v
+		}
+	}
+	return row
 }
 
 // normalizeVectorValue coerces a decoded vector cell back into []float64.
@@ -2026,6 +2490,7 @@ const (
 	walRecordDropTable
 	walRecordCommit
 	walRecordAppendRows // delta: only the new rows appended by INSERT
+	walRecordUpdateRows // delta: only the rows an UPDATE replaced in place
 )
 
 type walRecord struct {
@@ -2036,6 +2501,9 @@ type walRecord struct {
 	Table     *diskTable
 	Type      walRecordType
 	WrittenAt int64
+	// RowIndexes positions Table.Rows for walRecordUpdateRows: row i of the
+	// record replaces row RowIndexes[i] of the table. Unused by other types.
+	RowIndexes []int
 }
 
 type walOperation struct {
@@ -2043,6 +2511,8 @@ type walOperation struct {
 	name       string
 	drop       bool
 	appendOnly bool
+	// rowIndexes is set for an update-rows delta, positioning table.Rows.
+	rowIndexes []int
 	table      *diskTable
 }
 
@@ -2713,13 +3183,23 @@ func (w *WALManager) LogTransaction(changes []WALChange) (bool, error) {
 			rec.Type = walRecordDropTable
 		} else if ch.Table != nil {
 			dirty := ch.Table.DirtyFrom()
-			if dirty >= 0 && dirty < len(ch.Table.Rows) {
+			updated, exact := ch.Table.DirtyRows()
+			switch {
+			case dirty >= 0 && dirty < len(ch.Table.Rows):
 				// Append-only change: write only the new rows.
 				dt := tableToDiskRange(ch.Tenant, ch.Table, dirty, len(ch.Table.Rows))
 				rec.Type = walRecordAppendRows
 				rec.Table = &dt
-			} else {
-				// Full table change (UPDATE, DELETE, CREATE, or unknown).
+			case exact && len(updated) < len(ch.Table.Rows):
+				// In-place UPDATE: write only the rows that changed. Without
+				// this an UPDATE of one row in a large table serialized and
+				// fsynced every row in it.
+				dt, idx := tableToDiskRows(ch.Tenant, ch.Table, updated)
+				rec.Type = walRecordUpdateRows
+				rec.Table = &dt
+				rec.RowIndexes = idx
+			default:
+				// Full table change (DELETE, CREATE, or unknown shape).
 				dt := tableToDisk(ch.Tenant, ch.Table)
 				rec.Type = walRecordApplyTable
 				rec.Table = &dt
@@ -2903,6 +3383,23 @@ func handleWalRecord(db *DB, rec walRecord, pending map[uint64][]walOperation, c
 		}
 		dt := *rec.Table
 		pending[rec.TxID] = append(pending[rec.TxID], walOperation{tenant: rec.Tenant, name: dt.Name, table: &dt, appendOnly: true})
+	case walRecordUpdateRows:
+		if rec.Table == nil || len(rec.RowIndexes) != len(rec.Table.Rows) {
+			// A record whose positions do not line up with its rows cannot be
+			// applied safely. Dropping the operation and keeping the rest of the
+			// transaction would resurrect a partial state, so drop the whole
+			// transaction: without a matching commit its other operations are
+			// discarded too.
+			delete(pending, rec.TxID)
+			return
+		}
+		dt := *rec.Table
+		pending[rec.TxID] = append(pending[rec.TxID], walOperation{
+			tenant:     rec.Tenant,
+			name:       dt.Name,
+			table:      &dt,
+			rowIndexes: append([]int(nil), rec.RowIndexes...),
+		})
 	case walRecordDropTable:
 		pending[rec.TxID] = append(pending[rec.TxID], walOperation{tenant: rec.Tenant, name: rec.TableName, drop: true})
 	case walRecordCommit:
@@ -2927,11 +3424,40 @@ func handleWalRecord(db *DB, rec walRecord, pending map[uint64][]walOperation, c
 				}
 				// Fallback: table not found, apply as full table.
 			}
+			if op.rowIndexes != nil {
+				// Delta replay: put each logged row back at its own position.
+				existing, _ := db.Get(op.tenant, op.name)
+				if existing != nil && rowIndexesFit(op.rowIndexes, len(existing.Rows)) {
+					delta := diskToTable(*op.table)
+					for i, idx := range op.rowIndexes {
+						existing.Rows[idx] = delta.Rows[i]
+					}
+					existing.Version = delta.Version
+					_ = existing.RebuildSecondaryIndexes()
+					continue
+				}
+				// The table is gone, or shorter than the record expects: this
+				// delta describes rows that no longer exist, so there is nothing
+				// meaningful to replay. Skip it rather than writing a table that
+				// holds only the updated rows.
+				continue
+			}
 			db.upsertTable(op.tenant, diskToTable(*op.table))
 		}
 		delete(pending, rec.TxID)
 		*committed++
 	}
+}
+
+// rowIndexesFit reports whether every position in an update-rows delta still
+// addresses a row of the table being recovered.
+func rowIndexesFit(indexes []int, rows int) bool {
+	for _, idx := range indexes {
+		if idx < 0 || idx >= rows {
+			return false
+		}
+	}
+	return true
 }
 
 type countingReader struct {

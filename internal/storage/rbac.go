@@ -151,8 +151,8 @@ func (c *CatalogManager) HasUsers() bool {
 // CreateUser; this method is for the narrower case of a database that
 // *has* users defined but shouldn't enforce against them right now.
 func (c *CatalogManager) SetRBACEnabled(enabled bool) {
-	c.rbac.mu.Lock()
-	defer c.rbac.mu.Unlock()
+	c.lockRBACWrite()
+	defer c.unlockRBACWrite()
 	c.rbac.disabled = !enabled
 }
 
@@ -182,8 +182,8 @@ func (c *CatalogManager) CreateUser(name, password string, roles []string) error
 		return fmt.Errorf("user %q: password must not be empty", name)
 	}
 	key := strings.ToLower(name)
-	c.rbac.mu.Lock()
-	defer c.rbac.mu.Unlock()
+	c.lockRBACWrite()
+	defer c.unlockRBACWrite()
 	if _, exists := c.rbac.users[key]; exists {
 		return fmt.Errorf("user %q already exists", name)
 	}
@@ -203,8 +203,8 @@ func (c *CatalogManager) CreateUser(name, password string, roles []string) error
 // DropUser removes a user. Returns an error if it doesn't exist.
 func (c *CatalogManager) DropUser(name string) error {
 	key := strings.ToLower(name)
-	c.rbac.mu.Lock()
-	defer c.rbac.mu.Unlock()
+	c.lockRBACWrite()
+	defer c.unlockRBACWrite()
 	if _, exists := c.rbac.users[key]; !exists {
 		return fmt.Errorf("user %q does not exist", name)
 	}
@@ -217,8 +217,8 @@ func (c *CatalogManager) DropUser(name string) error {
 // enabled). A disabled user fails Authenticate.
 func (c *CatalogManager) SetUserDisabled(name string, disabled bool) error {
 	key := strings.ToLower(name)
-	c.rbac.mu.Lock()
-	defer c.rbac.mu.Unlock()
+	c.lockRBACWrite()
+	defer c.unlockRBACWrite()
 	u, exists := c.rbac.users[key]
 	if !exists {
 		return fmt.Errorf("user %q does not exist", name)
@@ -231,8 +231,8 @@ func (c *CatalogManager) SetUserDisabled(name string, disabled bool) error {
 // granting a role the user already has is not an error.
 func (c *CatalogManager) GrantRoleToUser(userName, roleName string) error {
 	userKey, roleKey := strings.ToLower(userName), strings.ToLower(roleName)
-	c.rbac.mu.Lock()
-	defer c.rbac.mu.Unlock()
+	c.lockRBACWrite()
+	defer c.unlockRBACWrite()
 	u, exists := c.rbac.users[userKey]
 	if !exists {
 		return fmt.Errorf("user %q does not exist", userName)
@@ -253,8 +253,8 @@ func (c *CatalogManager) GrantRoleToUser(userName, roleName string) error {
 // didn't have that role.
 func (c *CatalogManager) RevokeRoleFromUser(userName, roleName string) error {
 	userKey := strings.ToLower(userName)
-	c.rbac.mu.Lock()
-	defer c.rbac.mu.Unlock()
+	c.lockRBACWrite()
+	defer c.unlockRBACWrite()
 	u, exists := c.rbac.users[userKey]
 	if !exists {
 		return fmt.Errorf("user %q does not exist", userName)
@@ -301,8 +301,8 @@ func (c *CatalogManager) CreateRole(name string) error {
 		return fmt.Errorf("role name must not be empty")
 	}
 	key := strings.ToLower(name)
-	c.rbac.mu.Lock()
-	defer c.rbac.mu.Unlock()
+	c.lockRBACWrite()
+	defer c.unlockRBACWrite()
 	if _, exists := c.rbac.roles[key]; exists {
 		return fmt.Errorf("role %q already exists", name)
 	}
@@ -316,8 +316,8 @@ func (c *CatalogManager) CreateRole(name string) error {
 // how DropTrigger etc. don't cascade either.
 func (c *CatalogManager) DropRole(name string) error {
 	key := strings.ToLower(name)
-	c.rbac.mu.Lock()
-	defer c.rbac.mu.Unlock()
+	c.lockRBACWrite()
+	defer c.unlockRBACWrite()
 	if _, exists := c.rbac.roles[key]; !exists {
 		return fmt.Errorf("role %q does not exist", name)
 	}
@@ -329,8 +329,8 @@ func (c *CatalogManager) DropRole(name string) error {
 // "*" as a wildcard.
 func (c *CatalogManager) GrantPermission(roleName string, perm Permission, schema, table string) error {
 	key := strings.ToLower(roleName)
-	c.rbac.mu.Lock()
-	defer c.rbac.mu.Unlock()
+	c.lockRBACWrite()
+	defer c.unlockRBACWrite()
 	r, exists := c.rbac.roles[key]
 	if !exists {
 		return fmt.Errorf("role %q does not exist", roleName)
@@ -356,8 +356,8 @@ func (c *CatalogManager) RevokePermission(roleName string, perm Permission, sche
 	if table == "" {
 		table = "*"
 	}
-	c.rbac.mu.Lock()
-	defer c.rbac.mu.Unlock()
+	c.lockRBACWrite()
+	defer c.unlockRBACWrite()
 	r, exists := c.rbac.roles[key]
 	if !exists {
 		return fmt.Errorf("role %q does not exist", roleName)

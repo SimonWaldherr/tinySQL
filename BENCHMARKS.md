@@ -189,6 +189,74 @@ of losing to it. `SUM`/`AVG` still fall back to `big.Rat` accumulation
 value, so correctness for exact-decimal columns is unchanged — only the
 common all-numeric case got faster.
 
+## Parity suite: both engines through `database/sql`, durability matched
+
+The results above drive tinySQL through `tinysql.Execute` and SQLite through
+`database/sql`. That is the right shape for comparing storage backends, but it
+gives tinySQL a head start on the question people actually ask — *can I replace
+SQLite with this?* — because it skips the driver, placeholder binding and
+row-scanning path that the SQLite side pays for.
+
+[`benchmarks/sqlite_parity_benchmark_test.go`](benchmarks/sqlite_parity_benchmark_test.go)
+puts both engines behind `database/sql` with bound parameters, one connection
+each, on matched schemas:
+
+| Configuration | Durability |
+|---|---|
+| `tinySQL/mem` | none (in-memory) |
+| `SQLite/mem` | none (`:memory:`) |
+| `tinySQL/wal` | `ModeWAL`, log fsynced on every committed statement |
+| `SQLite/wal-full` | `journal_mode=WAL`, `synchronous=FULL` — the honest counterpart to `tinySQL/wal` |
+| `SQLite/wal-norm` | `journal_mode=WAL`, `synchronous=NORMAL` — what most applications actually run |
+
+```sh
+go test ./benchmarks/ -run='^$' -bench=Parity -benchtime=100x -count=2
+```
+
+Table `bench(id PK, name, score, bucket)` with 10,000 rows and an index on
+`bucket`; ns/op, same machine as above, two runs shown as a range:
+
+| Workload | tinySQL/mem | SQLite/mem | tinySQL/wal | SQLite/wal-full | SQLite/wal-norm |
+|---|---|---|---|---|---|
+| INSERT, autocommit (1 row) | **12–21 µs** | 13–15 µs | 1.19–1.21 ms | 1.18–1.22 ms | 0.09 ms |
+| INSERT, 100 rows in one tx | 10.0–11.8 ms | **2.6–3.7 ms** | 8.2–12.9 ms | **3.1–3.5 ms** | 1.6–2.2 ms |
+| UPDATE by primary key | 0.95–1.06 ms | **17 µs** | 4.2–6.5 ms | **1.25 ms** | 0.14–0.17 ms |
+| Point lookup by primary key | 29–42 µs | **25–28 µs** | **30–41 µs** | 68–74 µs | 30–34 µs |
+| Range scan (156 of 10,000 rows) | 317–439 µs | **234–260 µs** | 305–336 µs | 257–296 µs | 257–262 µs |
+| `GROUP BY` + `COUNT`/`SUM`, 64 groups | **1.31 ms** | 7.0–7.3 ms | **1.34–1.95 ms** | 8.3–17.1 ms | 23–30 ms |
+| 2-table JOIN + `GROUP BY` | 31–48 ms | **10.4–33.9 ms** | 48–68 ms | **10.4–12.4 ms** | 8.7–10.6 ms |
+
+Vector k-NN, top-10 over 10,000 unit vectors of dimension 128, in-memory:
+
+| Operation | ns/op |
+|---|---|
+| `tinySQL` `VEC_SEARCH(..., 'cosine')`, flat index, warmed | **0.44–0.46 ms** |
+| `SQLite` + application-side scan (`SELECT` all vectors, rank in Go) | 18.2–19.3 ms |
+
+These two are not the same operation and should not be read as "tinySQL's k-NN
+beats SQLite's". Plain SQLite has no k-NN; the second row is what an application
+without a vector extension has to do, and the ~40x gap is the cost of that
+missing capability, not an engine-vs-engine result.
+
+### What the parity numbers say
+
+- **Durable single-statement writes are at parity.** `tinySQL/wal` and
+  `SQLite/wal-full` land within a few percent of each other, because both are
+  bounded by one fsync per statement rather than by engine work. The
+  `SQLite/wal-norm` column is 13x faster than either and is the honest
+  reminder that most SQLite deployments are not running with `synchronous=FULL`.
+- **Aggregation is tinySQL's strongest result** — 5x faster than SQLite in
+  memory and 6–17x faster on the durable configuration.
+- **UPDATE is the largest remaining gap.** Logging only the rows an UPDATE
+  actually replaced, instead of the whole table, took `tinySQL/wal` from
+  31–48 ms to 4.2–6.5 ms; what remains is engine-side, and in-memory UPDATE is
+  still ~60x slower than SQLite. Two causes, both measured: `WHERE id = ?`
+  scans every row instead of seeking the primary key, and the statement's
+  rollback point deep-copies every cell of the table. See "Next steps".
+- **JOIN is 3–5x slower** than SQLite and is the second gap worth closing.
+- **Batched inserts are ~3x slower** than SQLite: a transaction commit
+  re-serializes each changed table rather than appending row deltas.
+
 ## Takeaways
 
 - **tinySQL wins decisively on read-heavy and low-latency-write workloads**
@@ -214,6 +282,18 @@ common all-numeric case got faster.
 
 ## Next steps (tracked as follow-up work, not yet implemented)
 
+0. Close the UPDATE gap measured by the parity suite, in the order the profile
+   ranks them:
+   a. Seek the primary key for `WHERE pk = ?` in UPDATE/DELETE instead of
+      scanning every row (the same planner work item as step 1 below).
+   b. Replace the whole-table rollback clone for an in-place UPDATE with an
+      undo journal of the rows it replaced. A single-row UPDATE currently
+      deep-copies every cell of the table to get a rollback point; that is
+      ~1 ms of the ~1 ms in-memory figure. Copying only row headers is *not* a
+      valid shortcut — `TestFullStatementSnapshotRestoresAllTablesAndDropsNewTables`
+      documents that a snapshot also protects against in-place cell writes.
+   c. Append row deltas at COMMIT instead of re-serializing each changed table,
+      which is what makes batched inserts ~3x slower than SQLite.
 1. Add real index-based `WHERE`-clause point lookups to tinySQL's query
    planner (`CREATE INDEX` is currently a no-op — see
    `executeCreateIndex` in `internal/engine/exec.go`), then add an

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -55,7 +56,15 @@ type CatalogTrigger struct {
 // lookup helpers used by the rest of the system for introspection and
 // scheduling. CatalogManager is safe for concurrent use.
 type CatalogManager struct {
-	mu           sync.RWMutex
+	mu sync.RWMutex
+	// revision counts mutations. The SQL driver's commit path reads it to
+	// decide whether a transaction changed catalog-resident state — views,
+	// triggers, jobs, RBAC, materialized-view freshness — and therefore has a
+	// catalog to install alongside its table changes. Without it those
+	// changes were silently dropped at COMMIT, since only tables were
+	// merged. Every write goes through lockWrite/unlockWrite (or the RBAC
+	// pair), so a newly added mutator cannot forget to bump it.
+	revision     atomic.Uint64
 	tables       map[string]*CatalogTable
 	columns      map[string][]CatalogColumn
 	views        map[string]*CatalogView
@@ -68,6 +77,49 @@ type CatalogManager struct {
 	nextRun      int64
 	triggers     map[string]*CatalogTrigger // keyed by trigger name
 	rbac         *rbacState                 // users/roles/grants; see rbac.go
+}
+
+// lockWrite takes the catalog's write lock. Always pair it with unlockWrite:
+// that is where the revision counter is bumped, which is how the SQL driver
+// detects a transaction's catalog changes at COMMIT time.
+func (c *CatalogManager) lockWrite() { c.mu.Lock() }
+
+// unlockWrite records the mutation and releases the catalog's write lock.
+func (c *CatalogManager) unlockWrite() {
+	c.revision.Add(1)
+	c.mu.Unlock()
+}
+
+// lockRBACWrite and unlockRBACWrite are the same pair for the RBAC sub-state,
+// which has its own mutex but shares the catalog's revision counter: a GRANT
+// must be committed with its transaction exactly like a CREATE VIEW.
+func (c *CatalogManager) lockRBACWrite() { c.rbac.mu.Lock() }
+
+func (c *CatalogManager) unlockRBACWrite() {
+	c.revision.Add(1)
+	c.rbac.mu.Unlock()
+}
+
+// Revision returns a counter that increases on every catalog mutation. It is
+// only meaningful for comparison against an earlier reading of the same
+// catalog instance (or of a snapshot taken from it), never across instances.
+func (c *CatalogManager) Revision() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.revision.Load()
+}
+
+// setRevision restores a revision counter onto a freshly decoded catalog. A
+// rollback replaces the whole CatalogManager, so without this the driver
+// would see the counter jump backwards to zero and conclude that a
+// transaction which had in fact changed (and then partially rolled back) the
+// catalog had left it untouched.
+func (c *CatalogManager) setRevision(v uint64) {
+	if c == nil {
+		return
+	}
+	c.revision.Store(v)
 }
 
 // NewCatalogManager allocates and returns an initialized CatalogManager.
@@ -226,8 +278,8 @@ type CatalogJobHistory struct {
 // The provided `cols` slice is converted to `CatalogColumn` entries and
 // stored under the key `schema.name`.
 func (c *CatalogManager) RegisterTable(schema, name string, cols []Column) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.lockWrite()
+	defer c.unlockWrite()
 
 	key := schema + "." + name
 	c.tables[key] = &CatalogTable{
@@ -283,8 +335,8 @@ func catalogDefaultValue(v any) string {
 
 // RegisterView registers a view definition under `schema.name`.
 func (c *CatalogManager) RegisterView(schema, name, sqlText string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.lockWrite()
+	defer c.unlockWrite()
 
 	key := schema + "." + name
 	now := time.Now()
@@ -307,8 +359,8 @@ func (c *CatalogManager) RegisterView(schema, name, sqlText string) error {
 
 // DeleteView removes a view definition and its catalog table entry.
 func (c *CatalogManager) DeleteView(schema, name string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.lockWrite()
+	defer c.unlockWrite()
 	key := schema + "." + name
 	if _, ok := c.views[key]; !ok {
 		return fmt.Errorf("view %q not found", name)
@@ -337,8 +389,8 @@ func (c *CatalogManager) RegisterMaterializedView(mv *CatalogMaterializedView) e
 	if mv == nil || mv.Name == "" {
 		return fmt.Errorf("materialized view name cannot be empty")
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.lockWrite()
+	defer c.unlockWrite()
 	if mv.Schema == "" {
 		mv.Schema = "main"
 	}
@@ -368,8 +420,8 @@ func (c *CatalogManager) RegisterMaterializedView(mv *CatalogMaterializedView) e
 
 // DeleteMaterializedView removes a materialized view definition.
 func (c *CatalogManager) DeleteMaterializedView(schema, name string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.lockWrite()
+	defer c.unlockWrite()
 	key := schema + "." + name
 	if _, ok := c.mviews[key]; !ok {
 		return fmt.Errorf("materialized view %q not found", name)
@@ -407,8 +459,8 @@ func (c *CatalogManager) GetMaterializedViews() []*CatalogMaterializedView {
 
 // TryBeginMaterializedViewRefresh marks a materialized view as refreshing.
 func (c *CatalogManager) TryBeginMaterializedViewRefresh(schema, name string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.lockWrite()
+	defer c.unlockWrite()
 	mv := c.mviews[schema+"."+name]
 	if mv == nil || mv.IsRefreshing {
 		return false
@@ -420,8 +472,8 @@ func (c *CatalogManager) TryBeginMaterializedViewRefresh(schema, name string) bo
 
 // FinishMaterializedViewRefresh updates refresh bookkeeping.
 func (c *CatalogManager) FinishMaterializedViewRefresh(schema, name string, refreshedAt time.Time, durationMs int64, rowCount int64, errMsg string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.lockWrite()
+	defer c.unlockWrite()
 	mv := c.mviews[schema+"."+name]
 	if mv == nil {
 		return fmt.Errorf("materialized view %q not found", name)
@@ -443,8 +495,8 @@ func (c *CatalogManager) FinishMaterializedViewRefresh(schema, name string, refr
 
 // SetDependencies replaces the dependency list for a catalog object.
 func (c *CatalogManager) SetDependencies(schema, objectName, objectType string, deps []CatalogDependency) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.lockWrite()
+	defer c.unlockWrite()
 	key := schema + "." + objectName
 	if len(deps) == 0 {
 		delete(c.dependencies, key)
@@ -509,8 +561,8 @@ func (c *CatalogManager) RegisterIndexForTenant(tenant string, idx *CatalogIndex
 	if idx.Table == "" {
 		return fmt.Errorf("index table cannot be empty")
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.lockWrite()
+	defer c.unlockWrite()
 	if idx.Schema == "" {
 		idx.Schema = "main"
 	}
@@ -532,8 +584,8 @@ func (c *CatalogManager) DeleteIndex(schema, name string) error {
 
 // DeleteIndexForTenant removes a stored index definition from one tenant.
 func (c *CatalogManager) DeleteIndexForTenant(tenant, schema, name string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.lockWrite()
+	defer c.unlockWrite()
 	key := catalogIndexKey(tenant, schema, name)
 	if _, ok := c.indexes[key]; !ok {
 		return fmt.Errorf("index %q not found", name)
@@ -551,8 +603,8 @@ func (c *CatalogManager) DeleteIndexesForTable(table string) {
 // DeleteIndexesForTenantTable removes all indexes registered for a table in
 // one tenant only.
 func (c *CatalogManager) DeleteIndexesForTenantTable(tenant, table string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.lockWrite()
+	defer c.unlockWrite()
 	for key, idx := range c.indexes {
 		if idx.Tenant != "" && normalizeCatalogTenant(idx.Tenant) == normalizeCatalogTenant(tenant) && strings.EqualFold(idx.Table, table) {
 			delete(c.indexes, key)
@@ -640,8 +692,8 @@ func legacyCatalogIndexKey(schema, name string) string {
 // MarkMaterializedViewsStaleByDependency marks opt-in materialized views stale
 // when they depend on the changed object. It returns the affected view names.
 func (c *CatalogManager) MarkMaterializedViewsStaleByDependency(schema, changedName string) []string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.lockWrite()
+	defer c.unlockWrite()
 	changedKey := strings.ToLower(schema + "." + changedName)
 	affected := make([]string, 0)
 	for key, deps := range c.dependencies {
@@ -665,8 +717,8 @@ func (c *CatalogManager) MarkMaterializedViewsStaleByDependency(schema, changedN
 
 // RegisterFunction registers or updates a function's metadata.
 func (c *CatalogManager) RegisterFunction(fn *CatalogFunction) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.lockWrite()
+	defer c.unlockWrite()
 
 	key := fn.Schema + "." + fn.Name
 	c.funcs[key] = fn
@@ -676,8 +728,8 @@ func (c *CatalogManager) RegisterFunction(fn *CatalogFunction) error {
 // RegisterJob adds a new scheduled job or updates an existing entry.
 // Job names must be non-empty.
 func (c *CatalogManager) RegisterJob(job *CatalogJob) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.lockWrite()
+	defer c.unlockWrite()
 
 	if job.Name == "" {
 		return fmt.Errorf("job name cannot be empty")
@@ -740,8 +792,8 @@ func (c *CatalogManager) UpdateJobRuntime(name string, lastRun, nextRun time.Tim
 // Passing nil for nextRun clears NextRunAt, which is expected for completed
 // one-shot jobs.
 func (c *CatalogManager) UpdateJobRuntimePtr(name string, lastRun time.Time, nextRun *time.Time) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.lockWrite()
+	defer c.unlockWrite()
 
 	job, ok := c.jobs[name]
 	if !ok {
@@ -757,8 +809,8 @@ func (c *CatalogManager) UpdateJobRuntimePtr(name string, lastRun time.Time, nex
 // DeleteJob removes a job from the catalog, returning an error when the
 // job does not exist.
 func (c *CatalogManager) DeleteJob(name string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.lockWrite()
+	defer c.unlockWrite()
 
 	if _, ok := c.jobs[name]; !ok {
 		return fmt.Errorf("job %q not found", name)
@@ -770,8 +822,8 @@ func (c *CatalogManager) DeleteJob(name string) error {
 
 // AddJobHistory appends a job execution history row and assigns a run id.
 func (c *CatalogManager) AddJobHistory(run *CatalogJobHistory) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.lockWrite()
+	defer c.unlockWrite()
 
 	if run == nil {
 		return fmt.Errorf("job history cannot be nil")
@@ -870,8 +922,8 @@ func (c *CatalogManager) RegisterTrigger(t *CatalogTrigger) error {
 	if t == nil || t.Name == "" {
 		return fmt.Errorf("trigger name cannot be empty")
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.lockWrite()
+	defer c.unlockWrite()
 	if t.CreatedAt.IsZero() {
 		t.CreatedAt = time.Now()
 	}
@@ -882,8 +934,8 @@ func (c *CatalogManager) RegisterTrigger(t *CatalogTrigger) error {
 // DropTrigger removes a named trigger from the catalog. It returns an error
 // when the trigger does not exist.
 func (c *CatalogManager) DropTrigger(name string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.lockWrite()
+	defer c.unlockWrite()
 	if _, ok := c.triggers[name]; !ok {
 		return fmt.Errorf("trigger %q not found", name)
 	}
@@ -964,6 +1016,27 @@ func (db *DB) setCatalog(catalog *CatalogManager) {
 	db.catalogMu.Lock()
 	db.catalog = catalog
 	db.catalogMu.Unlock()
+}
+
+// AdoptCatalog installs a catalog produced elsewhere as this database's own.
+// The SQL driver calls it at COMMIT to publish the catalog work a transaction
+// did on its private copy — creating a view or trigger, granting a permission,
+// marking a materialized view stale. Those changes are not table data and so
+// are invisible to ApplyWALChanges; before this existed they were silently
+// discarded by a successful commit.
+//
+// The caller is responsible for having established that no concurrent change
+// is being overwritten (see conn.commitTx's revision check). The revision
+// counter is carried forward so it stays monotonic for the next comparison.
+func (db *DB) AdoptCatalog(catalog *CatalogManager) {
+	if db == nil || catalog == nil {
+		return
+	}
+	current := db.Catalog().Revision()
+	if catalog.Revision() <= current {
+		catalog.setRevision(current + 1)
+	}
+	db.setCatalog(catalog)
 }
 
 // StartJobScheduler starts the database job scheduler with the given executor.
