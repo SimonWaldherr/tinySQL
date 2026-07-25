@@ -37,12 +37,12 @@ func TestVecHammingUnrolledMatchesNaive(t *testing.T) {
 	for _, n := range sizes {
 		t.Run(sizeName(n), func(t *testing.T) {
 			cases := map[string][2][]float64{
-				"all-zero":     {zeros(n), zeros(n)},
-				"all-equal":    {pattern(n, 1), pattern(n, 1)},
+				"all-zero":      {zeros(n), zeros(n)},
+				"all-equal":     {pattern(n, 1), pattern(n, 1)},
 				"all-different": {zeros(n), pattern(n, 1)},
-				"alternating":  {alternating(n), zeros(n)},
-				"negative":     {negatives(n), zeros(n)},
-				"random":       {randomVec(n, 1), randomVec(n, 2)},
+				"alternating":   {alternating(n), zeros(n)},
+				"negative":      {negatives(n), zeros(n)},
+				"random":        {randomVec(n, 1), randomVec(n, 2)},
 			}
 			for name, ab := range cases {
 				a, b := ab[0], ab[1]
