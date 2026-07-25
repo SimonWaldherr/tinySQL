@@ -709,7 +709,7 @@ func TestServerSaveIfNeeded(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "db.gob")
 	s := &server{db: db, filePath: path, autosave: true}
-	s.saveIfNeeded()
+	s.persistBestEffort()
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("expected autosave to create file: %v", err)
 	}

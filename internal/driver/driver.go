@@ -323,17 +323,17 @@ func (s *server) release(pool chan struct{}) {
 	}
 }
 
-// saveIfNeeded persists the database to disk when autosave is enabled.
-// saveIfNeeded performs a best-effort persistence of the in-memory DB to
-// disk when autosave is enabled. Errors are logged but not returned; callers
-// typically call this from cleanup paths where returning an error would be
-// inconvenient.
-func (s *server) saveIfNeeded() {
+// persist flushes the database to its durable storage and reports whether that
+// succeeded. Callers that are about to acknowledge a write to the application
+// must propagate the error: reporting success for a statement whose durable
+// write failed loses data silently, and the in-memory state then disagrees with
+// what a restart will find.
+func (s *server) persist() error {
 	// A read-only open must be observational: physical connection closes and
 	// database/sql pool churn must never create manifests, checkpoints, WAL
 	// files, or rewritten snapshots.
 	if s.db == nil || s.db.IsReadOnly() {
-		return
+		return nil
 	}
 	if s.usesStorageBackend {
 		// Disk-backed modes (ModeDisk, ModeJSON, ModeHybrid, ModeIndex)
@@ -343,14 +343,24 @@ func (s *server) saveIfNeeded() {
 		// doc comment). Always sync here regardless of the autosave flag —
 		// choosing a durable mode is itself the opt-in.
 		if err := s.db.Sync(); err != nil {
-			log.Printf("sync failed: %v", err)
+			return fmt.Errorf("tinysql: sync to durable storage failed: %w", err)
 		}
-		return
+		return nil
 	}
 	if s.autosave && s.filePath != "" {
 		if err := storage.SaveToFile(s.db, s.filePath); err != nil {
-			log.Printf("autosave failed: %v", err)
+			return fmt.Errorf("tinysql: autosave to %s failed: %w", s.filePath, err)
 		}
+	}
+	return nil
+}
+
+// persistBestEffort is persist for cleanup paths that have no caller left to
+// report to, such as a physical connection being closed by the pool. The error
+// is logged and also recorded on the database, where HealthCheck surfaces it.
+func (s *server) persistBestEffort() {
+	if err := s.persist(); err != nil {
+		log.Printf("tinysql: %v", err)
 	}
 }
 
@@ -544,8 +554,52 @@ func (c *conn) Prepare(query string) (driver.Stmt, error) {
 	prepared, _ := buildPreparedQuery(query)
 	return &stmt{c: c, sql: query, prepared: prepared}, nil
 }
-func (c *conn) Close() error              { c.srv.saveIfNeeded(); return nil }
+func (c *conn) Close() error {
+	// A connection can be closed with a SQL-level BEGIN still open, because
+	// database/sql does not know about a transaction started by Exec("BEGIN")
+	// rather than by BeginTx. Discard it here so the shadow is not leaked and no
+	// ModeAdvancedWAL transaction is left without an abort record.
+	c.discardOpenTx()
+	c.srv.persistBestEffort()
+	return nil
+}
 func (c *conn) Begin() (driver.Tx, error) { return c.BeginTx(context.Background(), driver.TxOptions{}) }
+
+// ResetSession implements driver.SessionResetter. database/sql calls it before
+// handing a pooled connection to the next user.
+//
+// Without it, a connection returned to the pool with an open transaction — the
+// shape an application produces by running Exec("BEGIN") and then forgetting to
+// commit, or by having the statement after BEGIN fail — stayed in that
+// transaction forever. Every later write on that connection went to the
+// abandoned shadow and was silently discarded, and no other connection could
+// see any of it. Rolling back here makes the connection clean for its next user
+// and matches what every other database/sql driver does.
+func (c *conn) ResetSession(ctx context.Context) error {
+	if c.srv == nil || c.srv.db == nil {
+		return driver.ErrBadConn
+	}
+	c.discardOpenTx()
+	return nil
+}
+
+// IsValid implements driver.Validator so the pool discards a connection whose
+// database has been closed underneath it instead of returning errors from it.
+func (c *conn) IsValid() bool {
+	return c.srv != nil && c.srv.db != nil && !c.srv.db.IsClosed()
+}
+
+// discardOpenTx rolls back a transaction still open on this connection. It is
+// deliberately quiet: the caller is a lifecycle hook, and there is nobody left
+// to report a rollback failure to.
+func (c *conn) discardOpenTx() {
+	if !c.inTx {
+		return
+	}
+	if err := c.rollbackTx(); err != nil {
+		log.Printf("tinysql: discarding abandoned transaction: %v", err)
+	}
+}
 
 func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
 	if c.inTx {
@@ -710,10 +764,13 @@ func (c *conn) commitTx() error {
 			return err
 		}
 	}
-	c.srv.saveIfNeeded()
-
+	// The transaction is applied in memory at this point, so clear its state
+	// either way — but do not report a successful COMMIT if the durable write
+	// failed. An application that got "commit ok" and then lost the rows on
+	// restart has no way to detect that; an error it can retry or alert on.
+	persistErr := c.srv.persist()
 	c.clearTxState()
-	return nil
+	return persistErr
 }
 
 func (c *conn) detectTxConflicts(current *storage.DB, changes []storage.WALChange) error {
@@ -1053,7 +1110,11 @@ func (c *conn) execStatement(ctx context.Context, st engine.Statement) (driver.R
 			if rs, err = engine.Execute(ctx, c.srv.db, c.tenant, st); err != nil {
 				return nil, err
 			}
-			c.srv.saveIfNeeded()
+			// Fail the statement if it could not be made durable, rather than
+			// acknowledging a write that a restart will not find.
+			if err := c.srv.persist(); err != nil {
+				return nil, err
+			}
 		}
 		// Report affected rows for UPDATE/DELETE. The engine returns a single
 		// {updated|deleted: n} cell for the plain form; a RETURNING clause

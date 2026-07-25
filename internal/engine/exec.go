@@ -4286,7 +4286,7 @@ func loadSimpleSelectPlanTemplate(table *storage.Table, s *Select, reusableSchem
 			return nil, false, nil
 		}
 	}
-	orderExprs, ok := buildSimpleSelectOrderExprs(s.OrderBy, projs)
+	orderExprs, ok := buildSimpleSelectOrderExprs(s.OrderBy, projs, colIndex)
 	if !ok {
 		return nil, false, nil
 	}
@@ -4835,10 +4835,10 @@ func buildSimpleSelectProjection(it SelectItem, idx int, colIndex map[string]int
 	}, true
 }
 
-func buildSimpleSelectOrderExprs(orderBy []OrderItem, projs []simpleProjection) ([]Expr, bool) {
+func buildSimpleSelectOrderExprs(orderBy []OrderItem, projs []simpleProjection, colIndex map[string]int) ([]Expr, bool) {
 	orderExprs := make([]Expr, 0, len(orderBy))
 	for _, oi := range orderBy {
-		expr, ok := findSimpleSelectOrderExpr(oi.Col, projs)
+		expr, ok := findSimpleSelectOrderExpr(oi.Col, projs, colIndex)
 		if !ok {
 			return nil, false
 		}
@@ -4847,11 +4847,24 @@ func buildSimpleSelectOrderExprs(orderBy []OrderItem, projs []simpleProjection) 
 	return orderExprs, true
 }
 
-func findSimpleSelectOrderExpr(col string, projs []simpleProjection) (Expr, bool) {
+// findSimpleSelectOrderExpr resolves one ORDER BY term. Output names win, as SQL
+// requires — an alias shadows a same-named source column — and a term that names
+// no output column falls back to a source column of the scanned table.
+//
+// That fallback is what makes ORDER BY on a column the SELECT list does not
+// project work here. Without it this plan declined the query, and the general
+// path it fell back to looked the term up in the already-projected row, found
+// nothing, compared every row equal and returned them in physical order — a
+// silently unsorted result for a query as ordinary as
+// "SELECT name FROM t ORDER BY created_at".
+func findSimpleSelectOrderExpr(col string, projs []simpleProjection, colIndex map[string]int) (Expr, bool) {
 	for _, p := range projs {
 		if strings.EqualFold(p.name, col) {
 			return p.expr, true
 		}
+	}
+	if _, ok := colIndex[strings.ToLower(col)]; ok {
+		return &VarRef{Name: col}, true
 	}
 	return nil, false
 }
@@ -7348,6 +7361,18 @@ func processNonAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []
 	outCols := make([]string, 0, len(s.Projs))
 	colSet := make(map[string]struct{}, len(s.Projs))
 
+	// ORDER BY may name a column the SELECT list does not project. Sorting runs
+	// on the projected rows, so such a column has to be carried across the
+	// projection or the sort finds nothing to compare and silently returns rows
+	// in physical order. The values go into the row under the ordering name but
+	// deliberately not into outCols, so they order the result without appearing
+	// in it — and only when the projection has not already produced that name,
+	// since an output alias must win over a same-named source column.
+	orderCols := make([]string, 0, len(s.OrderBy))
+	for _, oi := range s.OrderBy {
+		orderCols = append(orderCols, strings.ToLower(oi.Col))
+	}
+
 	// Check if any window functions are used
 	hasWindowFunctions := anyWindowInSelect(s.Projs)
 
@@ -7399,7 +7424,27 @@ func processNonAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []
 				outCols = append(outCols, name)
 			}
 		}
+		for _, col := range orderCols {
+			if _, projected := out[col]; projected {
+				continue
+			}
+			if v, ok := r[col]; ok {
+				out[col] = v
+			}
+		}
 		outRows = append(outRows, out)
+	}
+	// An ORDER BY term that names neither an output column nor a source column
+	// cannot sort anything. Report it instead of returning rows in physical
+	// order, which is what a typo in an ORDER BY clause used to produce. With no
+	// rows there is nothing to resolve names against, and the result is empty
+	// either way.
+	if len(outRows) > 0 {
+		for _, col := range orderCols {
+			if _, ok := outRows[0][col]; !ok {
+				return nil, nil, fmt.Errorf("ORDER BY: no such column %q", col)
+			}
+		}
 	}
 	return outRows, outCols, nil
 }

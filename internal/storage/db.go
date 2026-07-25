@@ -857,6 +857,18 @@ func (db *DB) IsShadow() bool {
 	return db != nil && db.shadow.Load()
 }
 
+// IsClosed reports whether Close has completed for this database. The SQL
+// driver uses it to let the connection pool discard connections whose database
+// went away underneath them, rather than returning errors from each one.
+func (db *DB) IsClosed() bool {
+	if db == nil {
+		return true
+	}
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.closed
+}
+
 // StatementWAL returns the WALManager that a statement executing against db
 // must append to, or nil when statement-level logging is not this database's
 // responsibility.
@@ -2314,11 +2326,16 @@ func SaveToFile(db *DB, filename string, extra ...any) error {
 	if err := os.MkdirAll(filepath.Dir(filename), 0o755); err != nil && !errors.Is(err, os.ErrExist) {
 		return err
 	}
-	tmp := filename + ".tmp"
-	f, err := os.Create(tmp)
+	// A unique temporary name, not a fixed "<filename>.tmp". Two saves of the
+	// same database can overlap — driver autosave on one connection while
+	// another checkpoints, or two goroutines calling Sync — and a shared
+	// temporary meant they wrote into the same file and then raced to rename it,
+	// so the promoted snapshot could be one save's header over another's body.
+	f, err := os.CreateTemp(filepath.Dir(filename), filepath.Base(filename)+".tmp*")
 	if err != nil {
 		return err
 	}
+	tmp := f.Name()
 	fail := func(err error) error {
 		_ = f.Close()
 		_ = os.Remove(tmp)
@@ -2639,6 +2656,17 @@ type WALManager struct {
 	lastCheckpoint     time.Time
 	closed             bool
 	recovery           RecoveryStatus
+	// checkpointWatermark is the highest Seq the checkpoint file already
+	// reflects. Checkpointing writes the snapshot first and only then truncates
+	// the log, so a crash in between leaves a log whose records are all already
+	// in the snapshot; replaying them would apply each append-rows delta a
+	// second time and duplicate committed rows. Recovery skips every record at
+	// or below this mark.
+	//
+	// Seq therefore has to keep increasing across checkpoints. Resetting it to 1
+	// after a truncation, as this used to, would make the next records compare
+	// below a watermark from before the truncation and be skipped.
+	checkpointWatermark uint64
 }
 
 func (db *DB) attachWAL(wal *WALManager) {
@@ -3111,9 +3139,19 @@ func OpenWAL(db *DB, cfg WALConfig) (*WALManager, error) {
 		basePath = strings.TrimSuffix(basePath, ".gz")
 	}
 	walPath := basePath + ".wal"
-	nextSeq, nextTxID, committed, truncated, err := replayWAL(db, walPath)
+	// The checkpoint that OpenDB has already loaded into db records how far it
+	// reflects the log. Records at or below that mark are already in db; applying
+	// them again would duplicate rows appended by an append-rows delta.
+	watermark, err := ReadCheckpointWatermark(cfg.Path)
 	if err != nil {
 		return nil, err
+	}
+	nextSeq, nextTxID, committed, truncated, err := replayWAL(db, walPath, watermark)
+	if err != nil {
+		return nil, err
+	}
+	if nextSeq <= watermark {
+		nextSeq = watermark + 1
 	}
 	if err := os.MkdirAll(filepath.Dir(cfg.Path), 0o755); err != nil && !errors.Is(err, os.ErrExist) {
 		return nil, err
@@ -3130,8 +3168,9 @@ func OpenWAL(db *DB, cfg WALConfig) (*WALManager, error) {
 	cw := &countingWriter{w: f, n: size}
 	writer := bufio.NewWriter(cw)
 	wm := &WALManager{
-		path:               walPath,
-		checkpointPath:     cfg.Path,
+		path:                walPath,
+		checkpointWatermark: watermark,
+		checkpointPath:      cfg.Path,
 		checkpointEvery:    cfg.CheckpointEvery,
 		checkpointInterval: cfg.CheckpointInterval,
 		checkpointMaxBytes: normalizeCheckpointMaxBytes(cfg.CheckpointMaxBytes),
@@ -3244,7 +3283,12 @@ func (w *WALManager) Checkpoint(db *DB) error {
 	if w.checkpointPath == "" {
 		return nil
 	}
-	if err := SaveToFile(db, w.checkpointPath); err != nil {
+	// Everything written so far is in db and therefore in the snapshot about to
+	// be saved. Record that as the watermark inside the snapshot itself, so a
+	// crash before the truncation below does not replay records the snapshot
+	// already contains.
+	watermark := w.nextSeq - 1
+	if err := SaveToFile(db, w.checkpointPath, watermark); err != nil {
 		return err
 	}
 	if err := w.flushSync(); err != nil {
@@ -3268,7 +3312,8 @@ func (w *WALManager) Checkpoint(db *DB) error {
 	w.bytes = &countingWriter{w: f}
 	w.writer = bufio.NewWriter(w.bytes)
 	w.encoder = gob.NewEncoder(w.writer)
-	w.nextSeq = 1
+	// Seq deliberately keeps counting from where it was: see checkpointWatermark.
+	w.checkpointWatermark = watermark
 	w.txSinceCheckpoint = 0
 	w.lastCheckpoint = time.Now()
 	return nil
@@ -3325,7 +3370,9 @@ func (w *WALManager) flushSync() error {
 	return nil
 }
 
-func replayWAL(db *DB, walPath string) (nextSeq, nextTxID, committed uint64, truncated bool, err error) {
+// replayWAL applies the log to db. Records at or below watermark are skipped:
+// the checkpoint db was loaded from already reflects them.
+func replayWAL(db *DB, walPath string, watermark uint64) (nextSeq, nextTxID, committed uint64, truncated bool, err error) {
 	f, err := os.Open(walPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -3334,25 +3381,41 @@ func replayWAL(db *DB, walPath string) (nextSeq, nextTxID, committed uint64, tru
 		return 0, 0, 0, false, err
 	}
 	defer func() { _ = f.Close() }()
-	cr := &countingReader{r: f}
+	cr := newCountingReader(f)
 	dec := gob.NewDecoder(cr)
 	pending := make(map[uint64][]walOperation)
 	var lastSeq uint64
 	var lastTx uint64
 	var lastGood int64
+	lastSeq = watermark
 	for {
 		var rec walRecord
 		if err := dec.Decode(&rec); err != nil {
+			// A clean end of file: everything in the log decoded and was applied.
+			//
+			// EOF can also mean "gob stopped early" rather than "no more data": a
+			// run of zero bytes decodes as a zero-length message, which gob
+			// reports as EOF. Leaving such a remainder in place would make every
+			// record appended after it invisible to the next recovery — silent
+			// loss of committed data — so an unconsumed remainder counts as a
+			// damaged tail, like any other decode error.
 			if errors.Is(err, io.EOF) {
-				break
-			}
-			if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.ErrNoProgress) {
-				if lastGood >= 0 {
-					_ = os.Truncate(walPath, lastGood)
+				if size, statErr := fileSize(f); statErr != nil || lastGood >= size {
+					return lastSeq + 1, lastTx + 1, committed, false, nil
 				}
-				return lastSeq + 1, lastTx + 1, committed, true, nil
 			}
-			return 0, 0, 0, false, err
+			// The tail is damaged: a write interrupted by a crash, a partially
+			// flushed buffer, a corrupted or zero-filled byte range. Everything up
+			// to lastGood decoded cleanly and has been applied, so cut the log
+			// there and report the truncation rather than refusing to open the
+			// database. Treating a damaged tail as fatal left the database
+			// permanently unopenable, with no way to reach the data that had in
+			// fact recovered fine.
+			_ = f.Close()
+			if truncErr := os.Truncate(walPath, lastGood); truncErr != nil {
+				return 0, 0, 0, false, fmt.Errorf("truncate torn wal at %d: %w", lastGood, truncErr)
+			}
+			return lastSeq + 1, lastTx + 1, committed, true, nil
 		}
 		lastGood = cr.n
 		if rec.Seq > lastSeq {
@@ -3361,9 +3424,13 @@ func replayWAL(db *DB, walPath string) (nextSeq, nextTxID, committed uint64, tru
 		if rec.TxID > lastTx {
 			lastTx = rec.TxID
 		}
+		if rec.Seq != 0 && rec.Seq <= watermark {
+			// Already reflected in the checkpoint this database was loaded from.
+			// Applying it again would duplicate rows for an append-rows delta.
+			continue
+		}
 		handleWalRecord(db, rec, pending, &committed)
 	}
-	return lastSeq + 1, lastTx + 1, committed, false, nil
 }
 
 // handleWalRecord processes a single WAL record and updates pending map and committed count.
@@ -3460,15 +3527,63 @@ func rowIndexesFit(indexes []int, rows int) bool {
 	return true
 }
 
+// fileSize reports the size of an open file.
+func fileSize(f *os.File) (int64, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
+// countingReader tracks how many bytes have been consumed, so a torn WAL can be
+// truncated at the end of its last complete record.
+//
+// It implements io.ByteReader on purpose. gob.NewDecoder wraps a reader that
+// does not in a bufio.Reader of its own, which reads ahead: the count then
+// reflects how much the decoder pulled rather than how much it used, and
+// truncating at that offset either cuts into a good record or leaves part of a
+// torn one behind — the latter making the database unopenable on the next start.
+// Implementing ReadByte makes gob read straight through, so the count is exact.
 type countingReader struct {
-	r io.Reader
-	n int64
+	r  io.Reader
+	br *bufio.Reader
+	n  int64
+}
+
+func newCountingReader(r io.Reader) *countingReader {
+	return &countingReader{r: r, br: bufio.NewReader(r)}
 }
 
 func (c *countingReader) Read(p []byte) (int, error) {
-	n, err := c.r.Read(p)
+	if c.br == nil {
+		n, err := c.r.Read(p)
+		c.n += int64(n)
+		return n, err
+	}
+	n, err := c.br.Read(p)
 	c.n += int64(n)
 	return n, err
+}
+
+func (c *countingReader) ReadByte() (byte, error) {
+	if c.br == nil {
+		var buf [1]byte
+		n, err := c.r.Read(buf[:])
+		c.n += int64(n)
+		if n == 1 {
+			return buf[0], nil
+		}
+		if err == nil {
+			err = io.ErrNoProgress
+		}
+		return 0, err
+	}
+	b, err := c.br.ReadByte()
+	if err == nil {
+		c.n++
+	}
+	return b, err
 }
 
 // countingWriter tracks the number of bytes written through it. Used to
