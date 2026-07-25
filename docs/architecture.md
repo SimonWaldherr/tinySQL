@@ -3,7 +3,10 @@
 How tinySQL is put together, what each layer owns, and the invariants that are
 easy to break. Read this before changing anything under `internal/`.
 
-For where files live, see [repository-structure.md](./repository-structure.md).
+Everything here is also drawn, in
+[architecture-diagrams.md](./architecture-diagrams.md) — start there if you
+would rather see the shapes first. For where files live, see
+[repository-structure.md](./repository-structure.md).
 
 ## Layers
 
