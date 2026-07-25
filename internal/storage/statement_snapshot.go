@@ -32,11 +32,13 @@ type tableState struct {
 // only append rows. It deliberately avoids copying existing rows; callers
 // must ensure that no secondary index or other side effect is mutated.
 type appendOnlyTableState struct {
-	table     *Table
-	rowCount  int
-	version   int
-	stats     *TableStats
-	dirtyFrom int
+	table          *Table
+	rowCount       int
+	version        int
+	stats          *TableStats
+	dirtyFrom      int
+	dirtyRows      []int
+	dirtyRowsState dirtyRowsState
 }
 
 // SnapshotForStatement captures all table and catalog state needed to undo a
@@ -98,11 +100,13 @@ func (db *DB) SnapshotForAppendOnlyTableStatement(tenant, name string) (*Stateme
 	}
 	return &StatementSnapshot{
 		appendOnly: &appendOnlyTableState{
-			table:     table,
-			rowCount:  len(table.Rows),
-			version:   table.Version,
-			stats:     cloneTableStats(table.Stats),
-			dirtyFrom: table.dirtyFrom,
+			table:          table,
+			rowCount:       len(table.Rows),
+			version:        table.Version,
+			stats:          cloneTableStats(table.Stats),
+			dirtyFrom:      table.dirtyFrom,
+			dirtyRows:      append([]int(nil), table.dirtyRows...),
+			dirtyRowsState: table.dirtyRowsState,
 		},
 		catalog: catalogToDisk(db.Catalog()),
 	}, nil
@@ -144,7 +148,14 @@ func (db *DB) RestoreStatementSnapshot(snapshot *StatementSnapshot) {
 	// CatalogManager has its own lock and includes materialized-view stale
 	// state changed by DML. Reconstructing it from the deep-copy disk form is
 	// less error-prone than selectively undoing each catalog side effect.
-	db.setCatalog(diskToCatalog(snapshot.catalog))
+	//
+	// The revision counter must keep moving forward across the replacement: a
+	// rollback is itself a change, and a caller comparing revisions to decide
+	// whether it has catalog state to commit (see conn.commitTx) would
+	// otherwise see the counter reset to zero and conclude nothing happened.
+	restored := diskToCatalog(snapshot.catalog)
+	restored.setRevision(db.Catalog().Revision() + 1)
+	db.setCatalog(restored)
 }
 
 func restoreStatementTable(saved tableState) {
@@ -160,28 +171,8 @@ func restoreAppendOnlyTable(state *appendOnlyTableState) {
 	table.Version = state.version
 	table.Stats = cloneTableStats(state.stats)
 	table.dirtyFrom = state.dirtyFrom
-}
-
-// CollectWALChangesFromSnapshot computes the same per-table change set as
-// CollectWALChanges, using a StatementSnapshot's pre-statement table clones
-// as the "before" side instead of a second live *DB. This lets a single
-// statement executed directly through engine.Execute drive WALManager
-// logging (see internal/engine/wal_logging.go) without cloning the whole
-// database purely to diff it — SnapshotForStatement already captured
-// exactly the "before" state this needs, for rollback purposes.
-func CollectWALChangesFromSnapshot(snapshot *StatementSnapshot, next *DB) []WALChange {
-	if snapshot == nil || next == nil {
-		return nil
-	}
-	tenants := make(map[string]*tenantDB, len(snapshot.tables))
-	for tenant, tables := range snapshot.tables {
-		td := &tenantDB{tables: make(map[string]*Table, len(tables))}
-		for name, saved := range tables {
-			td.tables[name] = saved.state
-		}
-		tenants[tenant] = td
-	}
-	return CollectWALChanges(&DB{tenants: tenants}, next)
+	table.dirtyRows = append([]int(nil), state.dirtyRows...)
+	table.dirtyRowsState = state.dirtyRowsState
 }
 
 func restoreTable(dst, saved *Table) {
@@ -198,4 +189,6 @@ func restoreTable(dst, saved *Table) {
 	dst.Version = copy.Version
 	dst.Stats = copy.Stats
 	dst.dirtyFrom = copy.dirtyFrom
+	dst.dirtyRows = copy.dirtyRows
+	dst.dirtyRowsState = copy.dirtyRowsState
 }

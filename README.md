@@ -4,14 +4,12 @@
 [![DOI](https://zenodo.org/badge/1065449861.svg)](https://doi.org/10.5281/zenodo.17216339)
 [![GoDoc](https://godoc.org/github.com/SimonWaldherr/tinySQL?status.svg)](https://godoc.org/github.com/SimonWaldherr/tinySQL)
 
-TinySQL is a lightweight SQL database engine written in pure Go. It is built for
-learning database internals, embedding in Go programs, demos, tests, and
-single-process workloads that need a small SQL layer without external services.
+TinySQL is a lightweight SQL database engine in pure Go, for learning database
+internals, embedding in Go programs, demos, tests, and single-process workloads
+that need a small SQL layer without external services.
 
-Demos:
-
-- Video: [youtu.be/W28-aBk3BL0](https://youtu.be/W28-aBk3BL0)
-- Browser playground: [simonwaldherr.github.io/tinySQL](https://simonwaldherr.github.io/tinySQL/)
+Demos: [video](https://youtu.be/W28-aBk3BL0),
+[browser playground](https://simonwaldherr.github.io/tinySQL/).
 
 ## Install
 
@@ -22,7 +20,7 @@ go get github.com/SimonWaldherr/tinySQL@latest
 Requirements: Go 1.26.5+ (the minimum patched release for the Go 1.26
 standard-library security fixes).
 
-## Quick Start
+## Quick start
 
 ```go
 package main
@@ -61,10 +59,10 @@ func main() {
   window functions, PIVOT, EXPLAIN, and common SQLite-compatible PRAGMAs.
 - Views, materialized views, triggers, table-valued functions, system catalog
   views, job scheduling, and multi-tenancy.
-- Row triggers support `BEFORE`/`AFTER` INSERT, UPDATE, and DELETE, including
-  `DELETE FROM table` without a WHERE clause. Trigger side effects participate
-  in the surrounding statement's rollback; recursive chains stop safely after
-  32 nested executions.
+- Row triggers for `BEFORE`/`AFTER` INSERT, UPDATE, and DELETE, including
+  `DELETE FROM table` without a WHERE clause. Trigger side effects roll back
+  with the surrounding statement; recursive chains stop after 32 nested
+  executions.
 - Constraints: single-column PRIMARY KEY, UNIQUE, and FOREIGN KEY with
   referential actions, plus `NOT NULL` and literal `DEFAULT` values.
 - SQLite-style type declarations and affinities, including `INTEGER`, `REAL`,
@@ -77,34 +75,33 @@ func main() {
 - Operational hooks for health checks, lifecycle management, read-only mode,
   RBAC, audit logging, and encryption at rest for `ModeDisk`, `ModeJSON`,
   `ModeHybrid`, and `ModeIndex` table files.
-- `ANALYZE` persists exact table and column statistics; `sys.statistics`
-  exposes them and the planner uses fresh distinct-count estimates to prefer
-  more selective equality indexes.
+- `ANALYZE` persists exact table and column statistics; `sys.statistics` exposes
+  them, and the planner uses fresh distinct-count estimates to prefer more
+  selective equality indexes.
 - Direct multi-row `INSERT`, `UPDATE`, and `DELETE` are statement-atomic,
   including trigger side effects; materialized secondary indexes are updated
   incrementally instead of rebuilt after each mutation.
-- The `database/sql` driver supports snapshot-based cross-statement
-  transactions with `BEGIN`, `COMMIT`, and `ROLLBACK` (or Go's `BeginTx`).
+- The `database/sql` driver supports snapshot-based cross-statement transactions
+  via `BEGIN`, `COMMIT`, `ROLLBACK`, or Go's `BeginTx`.
   `BEGIN [TRANSACTION] READ ONLY` rejects writes while retaining a stable read
   snapshot; concurrent writes to the same changed table are reported as a
   retryable transaction conflict.
-- Common hot paths use specialized raw execution where it is safe: direct
+- Specialized raw execution on hot paths where it is safe: direct
   `ORDER BY FLOAT ... LIMIT` pagination, simple aggregates, JOIN/WHERE filter
-  pushdown, and triggerless INSERTs. See [BENCHMARKS.md](./BENCHMARKS.md) for
-  scope, fallback rules, and reproducible measurements; run
-  `make bench-hotpaths` for the focused local suite.
-- Browser WASM demos run the engine directly in the browser. Their loaders use
-  a pre-compressed `.wasm.gz` artifact when the browser supports streaming
+  pushdown, and triggerless INSERTs. [BENCHMARKS.md](./BENCHMARKS.md) documents
+  scope, fallback rules, and reproducible measurements; `make bench-hotpaths`
+  runs the focused local suite.
+- Browser WASM demos run the engine in the browser. Their loaders use a
+  pre-compressed `.wasm.gz` artifact when the browser supports streaming
   decompression and fall back to the regular `.wasm` file.
 
-For a broader feature reference, see [FUNCTIONS.sql](./FUNCTIONS.sql),
+Broader feature reference: [FUNCTIONS.sql](./FUNCTIONS.sql),
 [example_showcase.sql](./example_showcase.sql), and the Go tests.
 
 ## Fluent query builder
 
-For programmatic query construction, use the root package's fluent builder.
-`Build` returns a statement that can be passed directly to `Execute`, while
-`ToSQL` is useful for logging or inspecting the generated SQL.
+`Build` returns a statement for `Execute`; `ToSQL` renders the generated SQL for
+logging or inspection.
 
 ```go
 activeTags := tsql.SelectStar().
@@ -117,24 +114,18 @@ query := tsql.Select(tsql.Col("name")).
     OrderBy("name").
     Build()
 
-rs, err := tsql.Execute(ctx, db, "default", query)
-if err != nil {
-    panic(err)
-}
+rs, err := tsql.Execute(ctx, db, "default", query) // handle err
 ```
 
-The builder supports projections, joins, CTEs, ordering, limits, expressions,
-and `Exists`/`NotExists` subquery predicates. See the executable
+Projections, joins, CTEs, ordering, limits, expressions, and
+`Exists`/`NotExists` subquery predicates are supported. See
 [`ExampleExists`](./example_exists_test.go) and
-[`Example_viewsAndMaterializedViews`](./view_examples_test.go) for complete
-examples.
+[`Example_viewsAndMaterializedViews`](./view_examples_test.go).
 
 ## Transactions and triggers
 
-Use the standard Go driver for transactions that span several statements. A
-transaction sees its own writes; a conflicting concurrent commit on the same
-changed table returns a retryable transaction-conflict error. `SAVEPOINT` is
-not implemented.
+Use the Go driver for transactions spanning several statements. A transaction
+sees its own writes. `SAVEPOINT` is not implemented.
 
 ```go
 import (
@@ -158,18 +149,17 @@ if _, err = tx.Exec(`INSERT INTO users VALUES (2, 'Bob')`); err != nil {
     _ = tx.Rollback()
     panic(err)
 }
-if err = tx.Commit(); err != nil {
-    if errors.Is(err, tsqldriver.ErrTransactionConflict) {
-        panic("retry transaction")
-    }
+if err = tx.Commit(); errors.Is(err, tsqldriver.ErrTransactionConflict) {
+    panic("retry transaction") // conflict is retryable
+} else if err != nil {
     panic(err)
 }
 ```
 
-For SQL-issued read snapshots, use `BEGIN READ ONLY` (also accepted as
-`BEGIN TRANSACTION READ ONLY`) followed by `COMMIT` or `ROLLBACK`. Row
-triggers run for each affected row, including a WHERE-less DELETE; all writes
-performed by their bodies are rolled back if the outer statement fails.
+For SQL-issued read snapshots use `BEGIN READ ONLY` (also accepted as
+`BEGIN TRANSACTION READ ONLY`) followed by `COMMIT` or `ROLLBACK`. Row triggers
+run for each affected row, including a WHERE-less DELETE; all writes performed
+by their bodies are rolled back if the outer statement fails.
 
 ## Optional import profiles
 
@@ -188,22 +178,21 @@ go build -tags=sqliteimport,shapefile ./...
 ```
 
 Without the respective tag, the import API remains available but returns a
-clear feature-disabled error. SQLite remains the recommended production
-backend for standard MBTiles serving.
+clear feature-disabled error. SQLite remains the recommended production backend
+for standard MBTiles serving.
 
 ## Statically linked Go extensions
 
-Applications can add an extension by importing its Go package and activating
-it for one database instance. This is intentionally static rather than a Go
-shared-object plugin, so it remains portable across Go, TinyGo, and WebAssembly
-builds.
+An application adds an extension by importing its Go package and activating it
+for one database instance. Static linking rather than Go shared-object plugins
+keeps this portable across Go, TinyGo, and WebAssembly builds.
 
 ```go
 type ExampleExtension struct{}
 
 func (ExampleExtension) ExtensionInfo() tinysql.ExtensionInfo {
     return tinysql.ExtensionInfo{
-        Name: "example",
+        Name:    "example",
         Version: "1.0.0",
         Capabilities: []tinysql.ExtensionCapability{
             tinysql.CapabilityFilesystem,
@@ -236,44 +225,25 @@ UTF-8 is rejected instead of silently replaced. BLOB values stay binary:
 CSV/XML use self-identifying Base64 or hex, JSON uses a BLOB envelope, and SQL
 exports use SQLite-compatible `X'...'` literals.
 
+`github.com/SimonWaldherr/tinySQL/exporter` exports a `ResultSet` as CSV, TSV,
+JSON, NDJSON, XML, GOB, or SQL. JSON preserves BLOB values with a tagged Base64
+envelope by default; set `Options.JSONBinaryMode` to `"legacy-string"` only when
+compatibility with plain Base64 JSON strings is required. `ExportJSON(w, rs,
+exporter.Options{PrettyJSON: true})` writes a JSON array of result-row objects;
+`ExportNDJSON` streams one JSON object per row.
+
 `exporter.ExportTableManifest` writes a versioned JSON schema manifest with
 declared types, affinity, constraints, row count, and an ordered typed-row
-SHA-256 fingerprint. It can be paired with CSV, JSON, or SQL data exports for
-verifiable transfers.
-
-The public `github.com/SimonWaldherr/tinySQL/exporter` package exports a
-`ResultSet` as CSV, TSV, JSON, NDJSON, XML, GOB, or SQL. JSON preserves BLOB
-values with a tagged Base64 envelope by default; set
-`Options.JSONBinaryMode` to `"legacy-string"` only when compatibility with
-plain Base64 JSON strings is required.
-
-```go
-import (
-    "bytes"
-
-    "github.com/SimonWaldherr/tinySQL/exporter"
-)
-
-var out bytes.Buffer
-if err := exporter.ExportJSON(&out, rs, exporter.Options{PrettyJSON: true}); err != nil {
-    panic(err)
-}
-// out contains a JSON array of result-row objects.
-```
-
-Use `ExportNDJSON` for streaming one JSON object per row, and
-`ExportTableManifest` when a schema and data fingerprint should accompany an
-export. The runnable [`ExampleExportJSON`](./exporter/example_test.go) shows
-the minimal JSON path.
+SHA-256 fingerprint, to accompany a CSV, JSON, or SQL data export for verifiable
+transfers. Runnable example:
+[`ExampleExportJSON`](./exporter/example_test.go).
 
 ## SQL formatting
 
-Use `BeautifySQL` to make SQL suitable for logs, code review, or an editor;
-use `MinifySQL` when a compact query is more useful for transport or storage.
-Both functions are dependency-free and preserve string literals, quoted
-identifiers, and comments. `MinifySQL` also keeps the newline after a `--`
-comment, since removing it would turn the rest of the statement into a
-comment.
+`BeautifySQL` formats SQL for logs, review, or an editor; `MinifySQL` compacts it
+for transport or storage. Both are dependency-free and preserve string literals,
+quoted identifiers, and comments. `MinifySQL` keeps the newline after a `--`
+comment, since removing it would comment out the rest of the statement.
 
 ```go
 query := "select id,name from users where status = 'active' and id=42"
@@ -288,20 +258,18 @@ compact := tinysql.MinifySQL(pretty)
 // SELECT id,name FROM users WHERE status='active' AND id=42
 ```
 
-The executable [`ExampleBeautifySQL`](./sql_format_example_test.go) documents
-the full round trip. The command-line equivalent is
-`sqltools beautify`; `sqltools normalize` provides canonical comparison output.
+[`ExampleBeautifySQL`](./sql_format_example_test.go) documents the full round
+trip. The command-line equivalents are `sqltools beautify` and
+`sqltools normalize` (canonical comparison output).
 
 ## Vector search cache and analytics
 
-VEC_SEARCH already maintains bounded internal column and ANN-index caches.
-The optional result cache stores only deterministic top-K row IDs, never RAG
-answers or raw query vectors. Its key includes tenant, table version, column,
-metric, index mode, `k`, and a vector hash, so table mutations invalidate
-results naturally.
-
-The default is deliberately lean: no result cache and no analytics. Enable a
-small bounded cache only for repeated queries:
+VEC_SEARCH always maintains bounded internal column and ANN-index caches. The
+optional result cache stores only deterministic top-K row IDs, never RAG answers
+or raw query vectors. Its key includes tenant, table version, column, metric,
+index mode, `k`, and a vector hash, so table mutations invalidate results
+naturally. Defaults: no result cache, no analytics. Enable a small bounded cache
+only for repeated queries:
 
 ```go
 cfg := tsql.DefaultVectorCacheConfig()
@@ -323,12 +291,10 @@ For `tinysqld`:
 tinysqld -analytics -vector-cache-entries 128 -vector-cache-ttl 30s
 ```
 
-The authenticated `GET /api/analytics/vector` endpoint is available only with
+The authenticated `GET /api/analytics/vector` endpoint exists only with
 `-analytics`; otherwise it returns `404`.
 
 ## Guides
-
-Pick the guide that matches what you're building:
 
 | Guide | Scenario |
 |---|---|
@@ -339,6 +305,8 @@ Pick the guide that matches what you're building:
 | [Command line tools](./docs/cli-guide.md) | Using the `cmd/tinysql` CLI, REPL, servers, file-query tools, and the browser playground |
 | [Development guide](./docs/development-guide.md) | Running tests, the Makefile, building the WASM demo |
 | [Memory optimization](./docs/memory-optimization.md) | Where tinySQL spends memory, landed wins, and proposals for further reductions |
+| [Architecture](./docs/architecture.md) | How the layers fit together, the life of a statement, and the invariants to preserve when changing internals |
+| [Architecture in diagrams](./docs/architecture-diagrams.md) | The same material drawn: the stack, the core types, a write and a transaction end to end, query planning, the write-ahead log and recovery, and choosing a storage mode |
 | [Repository structure](./docs/repository-structure.md) | Codebase layout for contributors |
 | [Benchmarks](./BENCHMARKS.md) | TinySQL-vs-SQLite numbers and internal optimization history |
 
@@ -348,7 +316,7 @@ before pairing them with a non-cosine `VEC_SEARCH` metric.
 
 ## Limitations
 
-TinySQL is not a PostgreSQL/MySQL replacement. Important current limits:
+TinySQL is not a PostgreSQL/MySQL replacement. Current limits:
 
 - Single-process database engine; no built-in replication, clustering,
   failover, sharding, or distributed transactions.
@@ -359,15 +327,15 @@ TinySQL is not a PostgreSQL/MySQL replacement. Important current limits:
 - No composite primary keys or composite foreign keys.
 - No CHECK constraints, UPSERT/ON CONFLICT, SAVEPOINT, ATTACH/DETACH, VACUUM,
   partial indexes, generated columns, or persistent ANN vector index files.
-- Materialized secondary indexes currently support equality point/prefix seeks
-  on their leading columns. They are maintained incrementally for
-  `INSERT`/`UPDATE` and remapped on `DELETE`, then persisted with
-  snapshots/backends; pager-native incremental index pages and range planning
-  are not implemented yet. `ModeIndex`/`ModeHybrid` now keep backend-loaded
-  tables out of the permanent DB catalog and enforce their buffer-pool budget,
-  but the legacy GOB table codec still decodes a full table on a cache miss.
-  They are therefore not yet suitable as a strict per-record, multi-gigabyte
-  MBTiles serving engine; SQLite remains the production MBTiles default.
+- Materialized secondary indexes support only equality point/prefix seeks on
+  their leading columns. They are maintained incrementally for `INSERT`/`UPDATE`,
+  remapped on `DELETE`, and persisted with snapshots/backends; pager-native
+  incremental index pages and range planning are not implemented yet.
+  `ModeIndex`/`ModeHybrid` keep backend-loaded tables out of the permanent DB
+  catalog and enforce their buffer-pool budget, but the legacy GOB table codec
+  still decodes a full table on a cache miss, so they are not yet suitable as a
+  strict per-record, multi-gigabyte MBTiles serving engine; SQLite remains the
+  production MBTiles default.
 - RBAC checks are coarse and single-table oriented.
 - Encryption at rest currently covers table files for `ModeDisk`, `ModeJSON`,
   `ModeHybrid`, and `ModeIndex`, not WAL-backed modes or metadata files.
@@ -376,7 +344,7 @@ TinySQL is not a PostgreSQL/MySQL replacement. Important current limits:
 
 Evaluate these limits before using TinySQL for production-critical data.
 
-## Project Goals
+## Project goals
 
 TinySQL is primarily an educational and embeddable SQL engine. It demonstrates
 SQL parsing, AST construction, execution, storage backends, Go's `database/sql`

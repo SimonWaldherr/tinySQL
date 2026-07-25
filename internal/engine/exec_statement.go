@@ -25,8 +25,18 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 		defer db.UnlockContentForWrite()
 	}
 
+	// walBefore is the pre-image WALManager logging diffs against. It is taken
+	// for every mutating statement, not just DML, so that CREATE/DROP/ALTER
+	// TABLE are logged too — a schema change that never reaches the log is
+	// replayed onto a database that no longer has the table.
+	var walBefore *storage.DB
+	if !isReadOnlyStatement(stmt) && db.StatementWAL() != nil {
+		walBefore = db.MetaSnapshot()
+	}
+
 	var snapshot *storage.StatementSnapshot
-	if isAtomicDML(stmt) {
+	switch {
+	case isAtomicDML(stmt):
 		var snapshotErr error
 		if table, ok := appendOnlySnapshotTarget(db, tenant, stmt); ok {
 			snapshot, snapshotErr = db.SnapshotForAppendOnlyTableStatement(tenant, table)
@@ -39,6 +49,13 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 			recordAudit(ctx, db, tenant, stmt, snapshotErr)
 			return nil, snapshotErr
 		}
+	case walBefore != nil:
+		// A statement that will be written to the WAL needs a rollback point
+		// even when it is not DML: if the log append fails, the change must not
+		// remain in memory, or this process would keep serving a table that
+		// recovery will not reconstruct. DDL is rare enough that the full
+		// snapshot is the right trade here.
+		snapshot = db.SnapshotForStatement()
 	}
 	defer func() { recordAudit(ctx, db, tenant, stmt, err) }()
 	defer func() {
@@ -60,13 +77,13 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 		}
 	}()
 
-	statementWAL := newStatementWAL(db.AdvancedWAL())
+	statementWAL := newStatementWAL(db)
 	rs, err = execStmt(ExecEnv{ctx: ctx, tenant: tenant, db: db, statementWAL: statementWAL, now: time.Now()}, stmt)
 	if err == nil {
 		err = statementWAL.commit()
 	}
 	if err == nil {
-		err = maybeLogToWALManager(db, snapshot)
+		err = maybeLogToWALManager(db, walBefore)
 	}
 	return rs, err
 }
@@ -77,7 +94,7 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 // snapshot. The same is true for every trigger-capable statement.
 func appendOnlySnapshotTarget(db *storage.DB, tenant string, stmt Statement) (string, bool) {
 	s, ok := stmt.(*Insert)
-	if !ok || db.WAL() != nil {
+	if !ok {
 		return "", false
 	}
 	catalog := db.Catalog()
@@ -97,12 +114,6 @@ func appendOnlySnapshotTarget(db *storage.DB, tenant string, stmt Statement) (st
 // cloning every table on each statement. Triggers and FK cascades can write
 // elsewhere, so they deliberately retain the full-database snapshot.
 func tableScopedSnapshotTarget(db *storage.DB, tenant string, stmt Statement) (string, bool) {
-	// WALManager derives its persistence record by comparing the complete
-	// pre-statement database with the current one. Keep its complete snapshot
-	// so unrelated tables are not mistaken for newly-created WAL entries.
-	if db.WAL() != nil {
-		return "", false
-	}
 	var table string
 	var event storage.TriggerEvent
 	switch s := stmt.(type) {

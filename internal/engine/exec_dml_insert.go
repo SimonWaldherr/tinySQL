@@ -1,0 +1,378 @@
+// INSERT, the column defaults it applies, and the per-row constraint checks
+// every mutating statement shares. The constraint-index cache lives here too:
+// it is the lookup structure that makes PRIMARY KEY and UNIQUE enforcement
+// something other than a full scan per row.
+package engine
+
+import (
+	"fmt"
+	"strings"
+	"sync"
+
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
+)
+
+func executeInsert(env ExecEnv, s *Insert) (*ResultSet, error) {
+	if len(s.Rows) == 0 {
+		return nil, fmt.Errorf("INSERT requires at least one VALUES clause")
+	}
+	t, err := env.db.Get(env.tenant, s.Table)
+	if err != nil {
+		return nil, err
+	}
+	tmp := Row{}
+	if len(s.Cols) == 0 {
+		return executeInsertAllColumns(env, s, t, tmp)
+	}
+	return executeInsertSpecificColumns(env, s, t, tmp)
+}
+
+func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) (*ResultSet, error) {
+	expected := len(t.Cols)
+	returningRows := make([]Row, 0, len(s.Rows))
+	// buildTableRow allocates a map(2*len(cols)); resolve both timing lists
+	// once before the row loop and skip that map entirely when neither triggers
+	// nor RETURNING needs it.
+	tablePrefix := strings.ToLower(s.Table) + "."
+	beforeTriggers, afterTriggers := env.db.Catalog().GetTriggersForEvent(s.Table, storage.TriggerInsert)
+	hasBefore := len(beforeTriggers) > 0
+	hasAfter := len(afterTriggers) > 0
+	needsRow := hasBefore || hasAfter || len(s.Returning) > 0
+	wal, err := beginWALAuto(env, s.Table)
+	if err != nil {
+		return nil, err
+	}
+	for _, vals := range s.Rows {
+		if len(vals) != expected {
+			return nil, fmt.Errorf("INSERT expects %d values", expected)
+		}
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, err
+		}
+		row := make([]any, expected)
+		for i, e := range vals {
+			v, err := evalExpr(env, e, tmp)
+			if err != nil {
+				return nil, err
+			}
+			cv, err := coerceColumnValue(v, t.Cols[i])
+			if err != nil {
+				return nil, fmt.Errorf("column %q: %w", t.Cols[i].Name, err)
+			}
+			row[i] = cv
+		}
+		if err := validateRowConstraints(env, t, row, -1); err != nil {
+			return nil, err
+		}
+		if err := t.CheckSecondaryIndexConstraints(row, -1); err != nil {
+			return nil, err
+		}
+		var newRow Row
+		if needsRow {
+			newRow = buildTableRow(t.Cols, tablePrefix, row)
+		}
+		if hasBefore {
+			if err := fireTriggerList(env, beforeTriggers, newRow, nil); err != nil {
+				return nil, err
+			}
+		}
+		t.Rows = append(t.Rows, row)
+		if err := t.InsertSecondaryIndexRow(len(t.Rows)-1, row); err != nil {
+			return nil, err
+		}
+		if err := wal.logInsert(env, len(t.Rows)-1, row, t.Cols); err != nil {
+			return nil, err
+		}
+		if hasAfter {
+			if err := fireTriggerList(env, afterTriggers, newRow, nil); err != nil {
+				return nil, err
+			}
+		}
+		if len(s.Returning) > 0 {
+			returningRows = append(returningRows, newRow)
+		}
+	}
+	if err := wal.commit(); err != nil {
+		return nil, err
+	}
+	t.Version++
+	t.InvalidateStats()
+	t.MarkDirtyFrom(len(t.Rows) - len(s.Rows))
+	markDependentMaterializedViewsStale(env, s.Table)
+	if len(s.Returning) > 0 {
+		return projectReturningRows(env, t.Cols, s.Returning, returningRows)
+	}
+	return nil, nil
+}
+
+func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) (*ResultSet, error) {
+	colIdx := make([]int, len(s.Cols))
+	for i, name := range s.Cols {
+		idx, err := t.ColIndex(name)
+		if err != nil {
+			return nil, err
+		}
+		colIdx[i] = idx
+	}
+	returningRows := make([]Row, 0, len(s.Rows))
+	tablePrefix := strings.ToLower(s.Table) + "."
+	beforeTriggers, afterTriggers := env.db.Catalog().GetTriggersForEvent(s.Table, storage.TriggerInsert)
+	hasBefore := len(beforeTriggers) > 0
+	hasAfter := len(afterTriggers) > 0
+	needsRow := hasBefore || hasAfter || len(s.Returning) > 0
+	wal, err := beginWALAuto(env, s.Table)
+	if err != nil {
+		return nil, err
+	}
+	for _, vals := range s.Rows {
+		if len(vals) != len(s.Cols) {
+			return nil, fmt.Errorf("INSERT column/value mismatch")
+		}
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, err
+		}
+		row := make([]any, len(t.Cols))
+		if err := applyColumnDefaults(row, t.Cols); err != nil {
+			return nil, err
+		}
+		for i, idx := range colIdx {
+			v, err := evalExpr(env, vals[i], tmp)
+			if err != nil {
+				return nil, err
+			}
+			cv, err := coerceColumnValue(v, t.Cols[idx])
+			if err != nil {
+				return nil, fmt.Errorf("column %q: %w", t.Cols[idx].Name, err)
+			}
+			row[idx] = cv
+		}
+		if err := validateRowConstraints(env, t, row, -1); err != nil {
+			return nil, err
+		}
+		if err := t.CheckSecondaryIndexConstraints(row, -1); err != nil {
+			return nil, err
+		}
+		var newRow Row
+		if needsRow {
+			newRow = buildTableRow(t.Cols, tablePrefix, row)
+		}
+		if hasBefore {
+			if err := fireTriggerList(env, beforeTriggers, newRow, nil); err != nil {
+				return nil, err
+			}
+		}
+		t.Rows = append(t.Rows, row)
+		if err := t.InsertSecondaryIndexRow(len(t.Rows)-1, row); err != nil {
+			return nil, err
+		}
+		if err := wal.logInsert(env, len(t.Rows)-1, row, t.Cols); err != nil {
+			return nil, err
+		}
+		if hasAfter {
+			if err := fireTriggerList(env, afterTriggers, newRow, nil); err != nil {
+				return nil, err
+			}
+		}
+		if len(s.Returning) > 0 {
+			returningRows = append(returningRows, newRow)
+		}
+	}
+	if err := wal.commit(); err != nil {
+		return nil, err
+	}
+	t.Version++
+	t.InvalidateStats()
+	t.MarkDirtyFrom(len(t.Rows) - len(s.Rows))
+	markDependentMaterializedViewsStale(env, s.Table)
+	if len(s.Returning) > 0 {
+		return projectReturningRows(env, t.Cols, s.Returning, returningRows)
+	}
+	return nil, nil
+}
+
+// applyColumnDefaults initializes an INSERT row before explicitly named
+// columns overwrite their positions. Defaults are copied before coercion so a
+// BLOB default can never be shared and mutated through a stored row.
+func applyColumnDefaults(row []any, cols []storage.Column) error {
+	for i, col := range cols {
+		if !col.HasDefault {
+			continue
+		}
+		v := col.DefaultValue
+		if b, ok := v.([]byte); ok {
+			v = append([]byte(nil), b...)
+		}
+		cv, err := coerceColumnValue(v, col)
+		if err != nil {
+			return fmt.Errorf("default for column %q: %w", col.Name, err)
+		}
+		row[i] = cv
+	}
+	return nil
+}
+
+func validateRowConstraints(env ExecEnv, t *storage.Table, row []any, excludeRow int) error {
+	for colIdx, col := range t.Cols {
+		if colIdx >= len(row) {
+			return fmt.Errorf("row missing constrained column %q", col.Name)
+		}
+		val := row[colIdx]
+		if col.NotNull && isNull(val) {
+			return fmt.Errorf("NOT NULL column %q cannot be NULL", col.Name)
+		}
+		if col.Constraint == storage.NoConstraint {
+			continue
+		}
+		switch col.Constraint {
+		case storage.PrimaryKey:
+			if isNull(val) {
+				return fmt.Errorf("PRIMARY KEY column %q cannot be NULL", col.Name)
+			}
+			if constraintValueExists(t, colIdx, val, excludeRow) {
+				return fmt.Errorf("duplicate PRIMARY KEY value for column %q", col.Name)
+			}
+		case storage.Unique:
+			if isNull(val) {
+				continue
+			}
+			if constraintValueExists(t, colIdx, val, excludeRow) {
+				return fmt.Errorf("duplicate UNIQUE value for column %q", col.Name)
+			}
+		case storage.ForeignKey:
+			if isNull(val) {
+				continue
+			}
+			if col.ForeignKey == nil {
+				return fmt.Errorf("FOREIGN KEY column %q has no reference target", col.Name)
+			}
+			refTable, err := env.db.Get(env.tenant, col.ForeignKey.Table)
+			if err != nil {
+				return fmt.Errorf("FOREIGN KEY column %q references missing table %q", col.Name, col.ForeignKey.Table)
+			}
+			refIdx, err := refTable.ColIndex(col.ForeignKey.Column)
+			if err != nil {
+				return fmt.Errorf("FOREIGN KEY column %q references missing column %q.%q", col.Name, col.ForeignKey.Table, col.ForeignKey.Column)
+			}
+			if !constraintValueExists(refTable, refIdx, val, -1) {
+				return fmt.Errorf("FOREIGN KEY violation on column %q: value %v not found in %s.%s", col.Name, val, col.ForeignKey.Table, col.ForeignKey.Column)
+			}
+		}
+	}
+	return nil
+}
+
+// constraintIndexes caches, per (table, column), a hash map from an
+// already-used column value to the row indices holding it. This turns
+// PRIMARY KEY / UNIQUE / FOREIGN KEY existence checks from an O(n) scan of
+// the whole table (paid on every INSERT/UPDATE) into an O(1) lookup — the
+// difference between ~10s and ~10ms when bulk-inserting 10k rows into a
+// table that already has 100k.
+//
+// Maintenance is incremental rather than invalidate-and-rebuild-on-any-
+// change, because a naive "rebuild when table.Version changes" cache would
+// pay the full O(n) rebuild on literally every row of a multi-row INSERT
+// (each row bumps Version), erasing the benefit entirely:
+//   - INSERT only appends, so getConstraintIndex just indexes whatever rows
+//     have been added since rowCount was last recorded — including rows
+//     added earlier in the very same multi-row INSERT statement.
+//   - UPDATE overwrites a row in place without changing the row count, so
+//     it can't be detected by growth; patchConstraintIndexRow moves that
+//     one row from its old value's bucket to its new one directly.
+//   - DELETE removes rows and shifts every subsequent row's index, which
+//     the incremental scheme can't reconcile cheaply, so
+//     invalidateConstraintIndexes drops the cache outright and the next
+//     check rebuilds it from scratch.
+type constraintIndexKey struct {
+	table  *storage.Table
+	colIdx int
+}
+
+type constraintIndexEntry struct {
+	rowCount int // rows already reflected in `rows`, i.e. t.Rows[:rowCount]
+	rows     map[any][]int
+}
+
+var (
+	constraintIndexMu sync.Mutex
+	constraintIndexes = make(map[constraintIndexKey]*constraintIndexEntry)
+)
+
+func getConstraintIndex(t *storage.Table, colIdx int) *constraintIndexEntry {
+	key := constraintIndexKey{table: t, colIdx: colIdx}
+	constraintIndexMu.Lock()
+	defer constraintIndexMu.Unlock()
+
+	e, ok := constraintIndexes[key]
+	if !ok || e.rowCount > len(t.Rows) {
+		// First use for this column, or the table shrank (DELETE already
+		// invalidates explicitly; this is a defensive fallback in case some
+		// row-removing path doesn't).
+		e = &constraintIndexEntry{rows: make(map[any][]int, len(t.Rows))}
+		constraintIndexes[key] = e
+	}
+	for i := e.rowCount; i < len(t.Rows); i++ {
+		r := t.Rows[i]
+		if colIdx >= len(r) || r[colIdx] == nil {
+			continue
+		}
+		k := comparableKeyPart(r[colIdx])
+		e.rows[k] = append(e.rows[k], i)
+	}
+	e.rowCount = len(t.Rows)
+	return e
+}
+
+// invalidateConstraintIndexes drops every cached constraint index for a
+// table. Call before any operation that can remove or reorder existing rows
+// (DELETE) or replace the table wholesale (DROP TABLE) — the incremental
+// index only knows how to grow by appending or patch a single row in place.
+func invalidateConstraintIndexes(t *storage.Table) {
+	constraintIndexMu.Lock()
+	for k := range constraintIndexes {
+		if k.table == t {
+			delete(constraintIndexes, k)
+		}
+	}
+	constraintIndexMu.Unlock()
+}
+
+// patchConstraintIndexRow updates every cached constraint index for a table
+// after row rowIdx is overwritten in place (UPDATE), moving it from its old
+// value's bucket to its new one instead of invalidating the whole cache.
+func patchConstraintIndexRow(t *storage.Table, rowIdx int, oldRow, newRow []any) {
+	constraintIndexMu.Lock()
+	defer constraintIndexMu.Unlock()
+	for k, e := range constraintIndexes {
+		if k.table != t || k.colIdx >= len(oldRow) || k.colIdx >= len(newRow) {
+			continue
+		}
+		oldVal, newVal := oldRow[k.colIdx], newRow[k.colIdx]
+		if rawEqual(oldVal, newVal) {
+			continue
+		}
+		if oldVal != nil {
+			ok := comparableKeyPart(oldVal)
+			bucket := e.rows[ok]
+			for i, ri := range bucket {
+				if ri == rowIdx {
+					e.rows[ok] = append(bucket[:i], bucket[i+1:]...)
+					break
+				}
+			}
+		}
+		if newVal != nil {
+			nk := comparableKeyPart(newVal)
+			e.rows[nk] = append(e.rows[nk], rowIdx)
+		}
+	}
+}
+
+func constraintValueExists(t *storage.Table, colIdx int, val any, excludeRow int) bool {
+	idx := getConstraintIndex(t, colIdx)
+	for _, rowIdx := range idx.rows[comparableKeyPart(val)] {
+		if rowIdx != excludeRow {
+			return true
+		}
+	}
+	return false
+}

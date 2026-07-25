@@ -1,7 +1,7 @@
 # tinyORM Demo
 
-This small executable demonstrates tinyORM's additive migration, inserts,
-named-parameter selection, and primary-key lookup without any external service.
+Demonstrates tinyORM's additive migration, inserts, named-parameter selection,
+and primary-key lookup without any external service.
 
 ```bash
 go run ./cmd/tinyorm_demo

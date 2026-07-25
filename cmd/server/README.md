@@ -1,31 +1,15 @@
-# tinySQL HTTP / gRPC Server (`server`)
+# tinySQL HTTP / gRPC server (`server`)
 
-A production-oriented server that exposes a tinySQL database over HTTP (JSON
-REST API) and gRPC (JSON codec). Supports optional bearer-token authentication,
-TLS on both transports, request size and timeout limits, trusted-proxy
-configuration, and peer-to-peer federation for read fan-out across multiple
-instances.
-
-## Build
+Serves a tinySQL database over HTTP (JSON REST) and gRPC (JSON codec), with
+optional bearer-token auth, TLS, size/timeout limits, trusted proxies, and
+peer-to-peer federation for read fan-out.
 
 ```bash
-cd cmd/server
-go build -o server .
-```
+cd cmd/server && go build -o server .
 
-## Quick start
-
-```bash
-# In-memory, no auth, HTTP only
 ./server -http :8080 -dsn "mem://?tenant=default"
-
-# File-backed with auth token
-./server -http :8080 -dsn "file:/var/lib/tinysql/data.db?tenant=main&autosave=1" \
-         -auth "my-secret-token"
-
-# HTTP + gRPC, with peer federation
-./server -http :8080 -grpc :9090 \
-         -dsn "mem://?tenant=default" \
+./server -http :8080 -grpc :9090 -auth "my-secret-token" \
+         -dsn "file:/var/lib/tinysql/data.db?tenant=main&autosave=1" \
          -peers "node2:9090,node3:9090"
 ```
 
@@ -33,141 +17,84 @@ go build -o server .
 
 ### Core
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-dsn` | Storage DSN | `mem://?tenant=default` |
-| `-http` | HTTP listen address | `:8080` |
-| `-grpc` | gRPC listen address (disabled if empty) | — |
-| `-auth` | Bearer token for all requests | — |
-| `-tenant` | Default tenant name | `default` |
-| `-peers` | Comma-separated `host:grpcPort` peers for federation | — |
-| `-v` | Verbose logging | `false` |
+| Flag | Default | Description |
+|---|---|---|
+| `-dsn` | `mem://?tenant=default` | Storage DSN (`mem://` or `file:/path.db?tenant=...&autosave=1`) |
+| `-http` | `:8080` | HTTP listen address (empty disables HTTP) |
+| `-grpc` | `:9090` | gRPC listen address (empty disables gRPC) |
+| `-auth` | — | Bearer token for HTTP and gRPC |
+| `-tenant` | `default` | Default tenant if a request omits one |
+| `-peers` | — | Comma-separated `host:grpcPort` peers for federation |
+| `-analytics` | `false` | Collect vector-cache analytics and expose vector cache metrics via `/metrics` and `/api/status` (matches `cmd/tinysqld`) |
+| `-vector-cache-entries` | `0` | `VEC_SEARCH` result-cache entries (0 disables the cache) |
+| `-vector-cache-ttl` | `30s` | `VEC_SEARCH` result-cache TTL once entries are enabled |
+| `-v` | `false` | Verbose logging |
 
 ### TLS
 
 | Flag | Description |
-|------|-------------|
-| `-tls-min-version` | Minimum TLS version (`1.2` or `1.3`) |
-| `-http-tls-cert` / `-http-tls-key` | Certificate/key for HTTP TLS |
-| `-grpc-tls-cert` / `-grpc-tls-key` | Certificate/key for gRPC TLS |
-| `-peer-tls` | Enable TLS when connecting to peers |
-| `-peer-tls-ca` | CA certificate for peer TLS |
-| `-peer-tls-server-name` | Override server name for peer TLS verification |
-| `-peer-tls-skip-verify` | Disable peer TLS certificate verification |
+|---|---|
+| `-tls-min-version` | Minimum TLS version, `1.2` (default) or `1.3` |
+| `-http-tls-cert` / `-http-tls-key` | HTTP certificate/key; setting both enables HTTPS |
+| `-grpc-tls-cert` / `-grpc-tls-key` | gRPC certificate/key |
+| `-peer-tls` | Use TLS when calling federation peers |
+| `-peer-tls-ca` | CA bundle for peer TLS verification |
+| `-peer-tls-server-name` | Server name override for peer TLS verification |
+| `-peer-tls-skip-verify` | Skip peer TLS certificate verification (unsafe) |
 
 ### Limits
 
 | Flag | Default | Description |
-|------|---------|-------------|
-| `-max-body-bytes` | `1048576` | Maximum HTTP request body size |
-| `-max-sql-bytes` | `65536` | Maximum SQL statement size |
-| `-grpc-max-recv-bytes` | `4194304` | gRPC max receive message size |
-| `-grpc-max-send-bytes` | `4194304` | gRPC max send message size |
+|---|---|---|
+| `-max-body-bytes` | `1048576` | Max HTTP request body size (1 MiB) |
+| `-max-sql-bytes` | `262144` | Max SQL statement size (256 KiB) |
+| `-max-response-rows` | `100000` | Max rows in a query response before truncation (0 = unlimited); a federated query caps the combined total across all peers, not each source independently |
+| `-max-response-bytes` | `67108864` | Max approximate JSON-encoded size of a response's rows before truncation (64 MiB; 0 = unlimited) |
+| `-max-concurrent-queries` | `32` | Max concurrent Exec/Query executions across HTTP and gRPC (0 = unlimited); bounds engine load independently of `internal/driver`'s reader pool (default 4), which is sized for a single embedded connection |
+| `-grpc-max-recv-bytes` | `4194304` | gRPC max receive message size (4 MiB) |
+| `-grpc-max-send-bytes` | `4194304` | gRPC max send message size (4 MiB) |
 
 ### Timeouts
 
 | Flag | Default | Description |
-|------|---------|-------------|
+|---|---|---|
 | `-request-timeout` | `30s` | Per-request execution timeout |
-| `-peer-timeout` | `5s` | Timeout for federated peer calls |
-| `-shutdown-timeout` | `10s` | Graceful shutdown deadline |
+| `-peer-timeout` | `10s` | Timeout for federated peer calls |
+| `-shutdown-timeout` | `15s` | Graceful shutdown deadline |
 
 ### HTTP hardening
 
 | Flag | Default | Description |
-|------|---------|-------------|
-| `-trusted-proxies` | — | Comma-separated CIDR ranges of trusted proxies |
-| `-http-read-timeout` | `15s` | HTTP server read timeout |
+|---|---|---|
+| `-trusted-proxies` | — | Comma-separated trusted proxy CIDRs/IPs for `X-Forwarded-For` handling |
+| `-http-read-timeout` | `15s` | HTTP read timeout |
 | `-http-read-header-timeout` | `5s` | HTTP header read timeout |
-| `-http-write-timeout` | `30s` | HTTP server write timeout |
-| `-http-idle-timeout` | `60s` | HTTP keep-alive idle timeout |
-| `-http-max-header-bytes` | `8192` | Maximum HTTP header size |
-
-## HTTP API
-
-All request and response bodies are JSON.
-
-### `POST /api/exec`
-
-Execute a DML/DDL statement (no result rows returned).
-
-```json
-{ "tenant": "default", "sql": "CREATE TABLE t (id INT, name TEXT)" }
-```
-
-Response: `{ "rows_affected": 0, "elapsed_ms": 1 }`
-
-### `POST /api/query`
-
-Execute a SELECT and return rows.
-
-```json
-{ "tenant": "default", "sql": "SELECT * FROM t" }
-```
-
-Optional request-level timeout override:
-
-```json
-{ "tenant": "default", "sql": "SELECT * FROM t", "timeout_ms": 5000 }
-```
-
-Response:
-
-```json
-{
-  "columns": ["id", "name"],
-  "rows": [[1, "Alice"]],
-  "elapsed_ms": 2
-}
-```
-
-### `GET /api/status`
-
-Returns server version, uptime, and tenant list.
-
-### `GET /api/cluster/status`
-
-Returns cluster health information for configured federation peers, including
-per-peer reachability and response duration.
-
-### `POST /api/federated/query`
-
-Fan-out a read query to all configured peers and merge results.
-Supports optional `timeout_ms` and `peer_timeout_ms` overrides in the request
-body.
-
-### `GET /healthz` / `GET /readyz`
-
-Liveness and readiness probes (return `200 OK` when healthy).
-
-### `GET /metrics`
-
-Prometheus-compatible metrics endpoint.
-
-## Load testing
-
-A built-in load generator lives in [`loadtest/`](loadtest/):
-
-```bash
-cd cmd/server
-go build -o ../../bin/tinysql-loadtest ./loadtest
-
-./bin/tinysql-loadtest \
-  -url http://127.0.0.1:8080/api/query \
-  -tenant default \
-  -sql "SELECT 1" \
-  -requests 10000 \
-  -concurrency 100
-```
-
-See [loadtest/README.md](loadtest/README.md) for full options.
+| `-http-write-timeout` | `30s` | HTTP write timeout |
+| `-http-idle-timeout` | `120s` | Keep-alive idle timeout |
+| `-http-max-header-bytes` | `1048576` | Max HTTP header size (1 MiB) |
 
 ## Authentication
 
-Pass the bearer token in the `Authorization` header:
+When `-auth` is set, every endpoint except `/healthz` and `/readyz` requires the
+token in the `Authorization` header — including `/metrics`. Federated peer calls
+send the same token as gRPC `authorization` metadata.
 
-```bash
-curl -H "Authorization: Bearer my-secret-token" \
-     -d '{"tenant":"default","sql":"SELECT 1"}' \
-     http://localhost:8080/api/query
-```
+## HTTP API (JSON bodies)
+
+- `POST /api/exec` — DML/DDL; `{"tenant","sql"}` in, `{"rows_affected",
+  "elapsed_ms"}` out.
+- `POST /api/query` — SELECT with rows; `{"tenant","sql","timeout_ms"}` in
+  (`timeout_ms` overrides `-request-timeout`), `{"columns","rows","elapsed_ms"}`
+  out.
+- `POST /api/federated/query` — fan out a read to all peers and merge results;
+  accepts `timeout_ms` and `peer_timeout_ms` overrides.
+- `GET /api/status` — version, uptime, tenant list.
+- `GET /api/cluster/status` — peer health, reachability, response duration.
+- `GET /metrics` — Prometheus-compatible metrics (auth-protected).
+- `GET /healthz`, `GET /readyz` — probes, `200 OK` when healthy; never
+  auth-protected.
+
+## Load testing
+
+From `cmd/server`, `go build -o ../../bin/tinysql-loadtest ./loadtest`; options
+in [loadtest/README.md](loadtest/README.md).

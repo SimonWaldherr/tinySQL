@@ -1,8 +1,8 @@
 # Storage & Persistence Guide
 
-TinySQL separates the SQL engine from how data is persisted. All storage
-modes share the same engine and `*DB`/`database/sql` API, so switching modes
-never changes application code — only the `StorageConfig`/DSN.
+TinySQL separates the SQL engine from how data is persisted. All storage modes
+share the same engine and `*DB`/`database/sql` API, so switching modes changes
+only the `StorageConfig`/DSN, never application code.
 
 See also: [Developer Integration Guide](./developer-integration.md) for
 `database/sql` connection pooling, timeouts, and config patterns beyond the
@@ -45,18 +45,18 @@ External projects should import `github.com/SimonWaldherr/tinySQL/driver`, not
 `tinysql` implements `database/sql/driver.DriverContext`. One call to
 `sql.Open("tinysql", dsn)` creates one lazy Connector and therefore exactly one
 shared tinySQL `storage.DB` for all physical connections in that `*sql.DB`.
-Connection-local state (transactions, prepared statements and cursor state)
-remains separate. A second `sql.Open`, including one with identical `mem://`
-text, deliberately receives a separate in-memory database. Do not rely on a
-global driver cache for sharing; pass one `*sql.DB` to the application
-components which should share data.
+Connection-local state (transactions, prepared statements, cursor state) stays
+separate. A second `sql.Open`, including one with identical `mem://` text,
+deliberately receives a separate in-memory database. Do not rely on a global
+driver cache for sharing; pass one `*sql.DB` to the components that should
+share data.
 
 `SetDefaultDB` and `OpenWithDB` remain available for embedding. They apply only
 to the legacy empty DSN (`OpenWithDB` calls `Open("")`); a named `mem://` or
 `file:` DSN never inherits that default database.
 
 DSN query options are URL-decoded, must occur once, and reject unknown or
-malformed values. Supported options are:
+malformed values:
 
 | Option | Accepted value | Meaning |
 |---|---|---|
@@ -120,8 +120,9 @@ tsql.Execute(context.Background(), serveDB, "default", warmStmt)
 ```
 
 `ReadOnly` rejects `INSERT`, `UPDATE`, `DELETE`, and DDL. `SELECT`, `EXPLAIN`,
-and `PRAGMA` still run. This pattern pairs well with [RAG serving](./rag-guide.md#6-serving-and-performance-notes):
-`VEC_WARM` prebuilds ANN indexes once at startup instead of on the first query.
+and `PRAGMA` still run. This pairs with
+[RAG serving](./rag-guide.md#6-serving-and-performance-notes): `VEC_WARM`
+prebuilds ANN indexes at startup instead of on the first query.
 
 For `disk`, `json`, `index`, and `hybrid`, a read-only open requires an existing
 directory and never creates a manifest, table file, checkpoint, or WAL file.
@@ -132,15 +133,15 @@ checkpointed artifact for serving instead.
 
 ### Bounded ModeIndex/Hybrid residency
 
-On reopen, `ModeIndex` and `ModeHybrid` no longer put backend-loaded tables in
-the DB tenant catalog. Their only long-lived owner is the bounded buffer pool;
-an oversized table is returned for the current statement but is not admitted to
-that pool. This prevents memory from growing with every *different* table
-looked up and makes `max_memory_bytes` a hard pool-admission bound.
+On reopen, `ModeIndex` and `ModeHybrid` do not put backend-loaded tables in the
+DB tenant catalog. Their only long-lived owner is the bounded buffer pool; an
+oversized table is returned for the current statement but is not admitted to
+that pool. This keeps memory from growing with every *different* table looked
+up and makes `max_memory_bytes` a hard pool-admission bound.
 
-The current legacy table-file codec still decodes one complete table for a
-cache miss. Consequently `max_memory_bytes` bounds retained cache residency,
-not the temporary allocation for one oversized table. It is safe against the
-former catalog leak, but it is not yet a page/record-level MBTiles serving
-format. For multi-gigabyte `images` tables, use SQLite for production MBTiles
-serving until the pager-native immutable index format is introduced.
+The legacy table-file codec still decodes one complete table for a cache miss,
+so `max_memory_bytes` bounds retained cache residency, not the temporary
+allocation for one oversized table. It is safe against the former catalog leak,
+but it is not yet a page/record-level MBTiles serving format. For
+multi-gigabyte `images` tables, use SQLite for production MBTiles serving until
+the pager-native immutable index format is introduced.

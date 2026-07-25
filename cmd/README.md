@@ -1,156 +1,245 @@
 # tinySQL Command Variants
 
-This repo ships multiple binaries under `cmd/` for different use-cases. Each
-tool has its own README with full documentation — click the links below.
+Binaries under `cmd/`, each with its own README.
 
-| Tool | README |
-|------|--------|
-| demo | [README](demo/README.md) |
-| repl | [README](repl/README.md) |
-| server | [README](server/README.md) |
-| tinysqld | [README](tinysqld/README.md) |
-| tinysql | [README](tinysql/README.md) |
-| sqltools | [README](sqltools/README.md) |
-| tinysqlpage | [README](tinysqlpage/README.md) |
-| studio | [README](studio/README.md) |
-| wasm_browser | [README](wasm_browser/README.md) |
-| wasm_node | [README](wasm_node/README.md) |
-| query_files | [README](query_files/README.md) |
-| query_files_wasm | [README](query_files_wasm/README.md) |
-| catalog_demo | [README](catalog_demo/README.md) |
-| debug | [README](debug/README.md) |
-| fsql | [README](fsql/README.md) |
-| migrate | [README](migrate/README.md) |
+Conventions:
 
----
-
-- demo
-  - A simple demo that creates tables, inserts sample data, and runs example queries.
-  - Build: `go build ./cmd/demo`
-  - Run: `./demo -dsn "mem://?tenant=default"`
-
-- repl
-  - Interactive SQL REPL on top of database/sql. Supports multiple output formats (table, csv, tsv, json, yaml, markdown), echo mode, and optional HTML output.
-  - Build: `go build ./cmd/repl`
-  - Run: `./repl -dsn "mem://?tenant=default"`
-  - Flags: `-dsn`, `-echo`, `-format <table|csv|tsv|json|yaml|markdown>`, `-beautiful`, `-html`, `-errors-only`
-
-- server
-  - HTTP JSON API and gRPC (JSON codec) server with optional federation across peers.
-  - Build: `cd cmd/server && go build .`
-  - Run: `./server -http :8080 -grpc :9090 -dsn "mem://?tenant=default" -peers "host1:9090,host2:9090"`
-  - Flags:
-    - Core: `-dsn`, `-http <addr>`, `-grpc <addr>`, `-auth <token>`, `-peers <addr,...>`, `-tenant <name>`, `-v`
-    - TLS: `-tls-min-version`, `-http-tls-cert`, `-http-tls-key`, `-grpc-tls-cert`, `-grpc-tls-key`, `-peer-tls`, `-peer-tls-ca`, `-peer-tls-server-name`, `-peer-tls-skip-verify`
-    - Limits: `-max-body-bytes`, `-max-sql-bytes`, `-grpc-max-recv-bytes`, `-grpc-max-send-bytes`
-    - Timeouts: `-request-timeout`, `-peer-timeout`, `-shutdown-timeout`
-    - HTTP hardening: `-trusted-proxies`, `-http-read-timeout`, `-http-read-header-timeout`, `-http-write-timeout`, `-http-idle-timeout`, `-http-max-header-bytes`
-  - HTTP Endpoints:
-    - POST /api/exec {tenant, sql, timeout_ms?}
-    - POST /api/query {tenant, sql, timeout_ms?}
-    - GET  /api/status
-    - GET  /api/cluster/status
-    - POST /api/federated/query {tenant, sql, timeout_ms?, peer_timeout_ms?}
-    - GET  /healthz
-    - GET  /readyz
-    - GET  /metrics
-
-- tinysqld
-  - Enterprise DBMS daemon entry point. Opens the enterprise runtime profile with durable storage, starts the job scheduler, and exposes a minimal HTTP API.
-  - Build: `go build ./cmd/tinysqld`
-  - Run: `./tinysqld -data ./tinysqld-data -storage disk -tenant default -http 127.0.0.1:8088`
-  - Check configuration: `./tinysqld -data ./tinysqld-data -storage disk -check`
-  - Endpoints: `GET /healthz`, `GET /readyz`, `GET /api/status`, `POST /api/exec`, `POST /api/query`, `GET /api/catalog/tables`, `GET /api/catalog/columns`, `GET /api/jobs`, `GET /api/job-history`, `POST /api/jobs/run`
-  - Flags: `-data`, `-storage <disk|hybrid|index|wal|advanced_wal>`, `-tenant`, `-http`, `-auth`, `-request-timeout`, `-check`
-
-- tinysql
-  - SQLite-compatible CLI with file-based and in-memory database support. Accepts a filename as the database path (`:memory:` for in-memory), optional inline SQL as a positional argument, and supports utility subcommands (`tables`, `schema`, `insert`, `query`, `export`).
-  - Build: `go build ./cmd/tinysql`
-  - Run interactive REPL: `./tinysql mydb.dat`
-  - Run inline SQL: `./tinysql mydb.dat "SELECT * FROM users"`
-  - Flags: `-tenant`, `-mode <column|list|csv|json|table>`, `-header`, `-echo`, `-cmd <sql>`, `-batch`, `-output <file>`
-
-- sqltools
-  - SQL utility toolkit: format (beautify), validate, explain, list templates, and an interactive REPL with schema browsing and query history.
-  - Build: `go build ./cmd/sqltools`
-  - Run: `./sqltools beautify "select * from users where id=1"`
-  - Subcommands:
-    - `beautify [-upper=true] <sql>` – format a SQL statement
-    - `validate <sql>` – check SQL syntax
-    - `explain <sql>` – show a query execution plan
-    - `templates` – list built-in query templates
-    - `repl [-tenant=default]` – interactive SQL tools shell
-
-- tinysqlpage
-  - HTTP server that renders SQL-driven web pages. Each URL path maps to a `.sql` file in the pages directory; query results are turned into HTML components and served via a template.
-  - Build: `go build ./cmd/tinysqlpage`
-  - Run: `./tinysqlpage -addr :8080 -pages ./cmd/tinysqlpage/pages -seed ./cmd/tinysqlpage/sample_data.sql`
-  - Flags: `-addr <listen>`, `-pages <dir>`, `-seed <sql-file>`, `-css <file>`, `-template <file>`
-  - Health check: GET /healthz
-
-- studio
-  - Desktop GUI application built with [Wails](https://wails.io/). Provides a native window for running SQL queries against tinySQL.
-  - Requires Wails CLI: `go install github.com/wailsapp/wails/v2/cmd/wails@latest`
-  - Build: `cd cmd/studio && wails build`
-  - Dev mode: `cd cmd/studio && wails dev`
-
-- wasm_browser
-  - Builds tinySQL to WebAssembly for browsers. A modern UI is provided in `web/`.
-  - Build only: `cd cmd/wasm_browser && ./build.sh --build-only`
-  - Build & serve: `cd cmd/wasm_browser && ./build.sh --serve` then open http://localhost:8080
-  - Manual build: `cd cmd/wasm_browser && GOOS=js GOARCH=wasm go build -o web/tinySQL.wasm . && cp "$(go env GOROOT)/lib/wasm/wasm_exec.js" web/`
-
-- wasm_node
-  - Builds tinySQL to WebAssembly for Node.js and provides a Node runner.
-  - Build only: `cd cmd/wasm_node && ./build.sh --build-only`
-  - Build & run demo: `cd cmd/wasm_node && ./build.sh --run`
-  - Manual build: `cd cmd/wasm_node && GOOS=js GOARCH=wasm go build -o tinySQL.wasm . && cp "$(go env GOROOT)/lib/wasm/wasm_exec.js" ./`
-  - Run: `node wasm_runner.js` or `node wasm_runner.js query "SELECT 1"`
-
-- query_files
-  - Query CSV, JSON, and XML files using SQL via a web UI or CLI. See [cmd/query_files/README.md](./query_files/README.md) for full documentation.
-  - Build: `go build -o query_files ./cmd/query_files`
-  - Web mode: `./query_files -web -port 8080 -datadir ./data`
-  - CLI mode: `./query_files -query "SELECT * FROM users" users.csv`
-
-- query_files_wasm
-  - WebAssembly build of the query_files tool for use directly in the browser. This is the source for the gh-pages playground at https://simonwaldherr.github.io/tinySQL/.
-  - Includes an intro page, shareable URL-hash demos, mobile-optimized SQL editor, file imports, geodata recipes, FTS/vector search examples, and result export.
-  - Build: `cd cmd/query_files_wasm && ./build.sh --build-only`
-  - Build & serve: `cd cmd/query_files_wasm && ./build.sh --serve`
-  - Build gh-pages artifacts: `make build-gh-pages-demo`
-  - Update gh-pages branch in a worktree and commit: `make update-gh-pages`
-  - Open `index.html` in a browser (requires a local HTTP server due to WASM MIME type).
-
-- catalog_demo
-  - Demonstrates the tinySQL catalog and job scheduler APIs by registering tables and scheduling SQL jobs.
-  - Build: `go build ./cmd/catalog_demo`
-  - Run: `./catalog_demo`
-
-- debug
-  - SQL diagnostic tool: parse and execute SQL statements against an in-memory database, print results and per-statement timing. See [cmd/debug/README.md](./debug/README.md).
-  - Build: `go build ./cmd/debug`
-  - Run: `./debug -sql "SELECT 1 + 1 AS result"`
-  - Flags: `-sql`, `-timing`, `-verbose`
-
-- fsql
-  - Treat the filesystem as a relational database. Register named mounts and query file metadata, text lines, CSV rows, and JSON rows using SQL. See [cmd/fsql/README.md](./fsql/README.md).
-  - Build: `cd cmd/fsql && go build -o fsql .`
-  - Register mount: `./fsql mount logs /var/log`
-  - Query: `./fsql --mount /var/log "SELECT path, size FROM files('root', true) WHERE ext = 'log'"`
-
-- migrate
-  - Data pipeline CLI: import CSV/JSON into tinySQL, connect to external databases (PostgreSQL, MySQL, SQLite, MS SQL), and transfer data between any combination of sources and targets. See [cmd/migrate/README.md](./migrate/README.md).
-  - Build: `cd cmd/migrate && go build -o migrate .`
-  - Import and query: `migrate import-file -file users.csv -query "SELECT * FROM users"`
-  - Web UI: `migrate web`
-
-- server/loadtest
-  - Lightweight HTTP load generator for `cmd/server`.
-  - Build: `cd cmd/server && go build -o ../../bin/tinysql-loadtest ./loadtest`
-  - Run: `./bin/tinysql-loadtest -url http://127.0.0.1:8080/api/query -requests 10000 -concurrency 100`
-
-Notes:
-- The in-memory DSN is `mem://?tenant=default`. Files can be persisted using `file:/path/to/db.dat?tenant=<name>&autosave=1`.
-- `repl` and `tinysql` rely on the internal `database/sql` driver registration (`_ ".../internal/driver"`).
+- In-memory DSN: `mem://?tenant=default`. File-backed:
+  `file:/path/to/db.dat?tenant=<name>&autosave=1`.
+- `repl` and `tinysql` rely on the internal `database/sql` driver registration
+  (`_ ".../internal/driver"`).
 - `server` uses `internal/storage` directly with the same DSN conventions.
+
+## [demo](demo/README.md)
+
+Creates tables, inserts sample data, runs example queries.
+
+```bash
+go build ./cmd/demo
+./demo -dsn "mem://?tenant=default"
+```
+
+## [repl](repl/README.md)
+
+Interactive SQL REPL on top of `database/sql`, with multiple output formats,
+echo mode, and optional HTML output.
+
+```bash
+go build ./cmd/repl
+./repl -dsn "mem://?tenant=default"
+```
+
+Flags: `-dsn`, `-echo`, `-format <table|csv|tsv|json|yaml|markdown>`,
+`-beautiful`, `-html`, `-errors-only`
+
+## [server](server/README.md)
+
+HTTP JSON API and gRPC (JSON codec) server with optional federation across
+peers.
+
+```bash
+cd cmd/server && go build .
+./server -http :8080 -grpc :9090 -dsn "mem://?tenant=default" -peers "host1:9090,host2:9090"
+```
+
+Flags:
+
+- Core: `-dsn`, `-http <addr>`, `-grpc <addr>`, `-auth <token>`,
+  `-peers <addr,...>`, `-tenant <name>`, `-v`
+- TLS: `-tls-min-version`, `-http-tls-cert`, `-http-tls-key`,
+  `-grpc-tls-cert`, `-grpc-tls-key`, `-peer-tls`, `-peer-tls-ca`,
+  `-peer-tls-server-name`, `-peer-tls-skip-verify`
+- Limits: `-max-body-bytes`, `-max-sql-bytes`, `-grpc-max-recv-bytes`,
+  `-grpc-max-send-bytes`
+- Timeouts: `-request-timeout`, `-peer-timeout`, `-shutdown-timeout`
+- HTTP hardening: `-trusted-proxies`, `-http-read-timeout`,
+  `-http-read-header-timeout`, `-http-write-timeout`, `-http-idle-timeout`,
+  `-http-max-header-bytes`
+
+HTTP endpoints:
+
+- `POST /api/exec` `{tenant, sql, timeout_ms?}`
+- `POST /api/query` `{tenant, sql, timeout_ms?}`
+- `POST /api/federated/query` `{tenant, sql, timeout_ms?, peer_timeout_ms?}`
+- `GET /api/status`, `GET /api/cluster/status`
+- `GET /healthz`, `GET /readyz`, `GET /metrics`
+
+### [server/loadtest](server/loadtest/README.md)
+
+HTTP load generator for `cmd/server`.
+
+```bash
+cd cmd/server && go build -o ../../bin/tinysql-loadtest ./loadtest
+./bin/tinysql-loadtest -url http://127.0.0.1:8080/api/query -requests 10000 -concurrency 100
+```
+
+## [tinysqld](tinysqld/README.md)
+
+Enterprise DBMS daemon: enterprise runtime profile with durable storage, job
+scheduler, and a minimal HTTP API.
+
+```bash
+go build ./cmd/tinysqld
+./tinysqld -data ./tinysqld-data -storage disk -tenant default -http 127.0.0.1:8088
+./tinysqld -data ./tinysqld-data -storage disk -check   # validate configuration
+```
+
+Flags: `-data`, `-storage <disk|hybrid|index|wal|advanced_wal>`, `-tenant`,
+`-http`, `-auth`, `-request-timeout`, `-check`
+
+Endpoints: `GET /healthz`, `GET /readyz`, `GET /api/status`,
+`POST /api/exec`, `POST /api/query`, `GET /api/catalog/tables`,
+`GET /api/catalog/columns`, `GET /api/jobs`, `GET /api/job-history`,
+`POST /api/jobs/run`
+
+## [tinysql](tinysql/README.md)
+
+SQLite-compatible CLI. Takes the database path as first argument
+(`:memory:` for in-memory) and optional inline SQL as a positional argument.
+Subcommands: `tables`, `schema`, `insert`, `query`, `export`.
+
+```bash
+go build ./cmd/tinysql
+./tinysql mydb.dat
+./tinysql mydb.dat "SELECT * FROM users"
+```
+
+Flags: `-tenant`, `-mode <column|list|csv|json|table>`, `-header`, `-echo`,
+`-cmd <sql>`, `-batch`, `-output <file>`
+
+## [sqltools](sqltools/README.md)
+
+SQL utility toolkit.
+
+```bash
+go build ./cmd/sqltools
+./sqltools beautify "select * from users where id=1"
+```
+
+Subcommands:
+
+- `beautify [-upper=true] <sql>` — format a statement
+- `validate <sql>` — check syntax
+- `explain <sql>` — show a query execution plan
+- `templates` — list built-in query templates
+- `repl [-tenant=default]` — interactive shell with schema browsing and history
+
+## [tinysqlpage](tinysqlpage/README.md)
+
+HTTP server rendering SQL-driven pages: each URL path maps to a `.sql` file in
+the pages directory, and results become HTML components in a template.
+
+```bash
+go build ./cmd/tinysqlpage
+./tinysqlpage -addr :8080 -pages ./cmd/tinysqlpage/pages -seed ./cmd/tinysqlpage/sample_data.sql
+```
+
+Flags: `-addr <listen>`, `-pages <dir>`, `-seed <sql-file>`, `-css <file>`,
+`-template <file>`. Health check: `GET /healthz`.
+
+## [studio](studio/README.md)
+
+Desktop GUI built with [Wails](https://wails.io/), requires the Wails CLI.
+
+```bash
+go install github.com/wailsapp/wails/v2/cmd/wails@latest
+cd cmd/studio && wails build   # or: wails dev
+```
+
+## [wasm_browser](wasm_browser/README.md)
+
+WebAssembly build for browsers; UI in `web/`.
+
+```bash
+cd cmd/wasm_browser && ./build.sh --build-only
+cd cmd/wasm_browser && ./build.sh --serve   # then open http://localhost:8080
+
+# manual
+GOOS=js GOARCH=wasm go build -o web/tinySQL.wasm . && cp "$(go env GOROOT)/lib/wasm/wasm_exec.js" web/
+```
+
+## [wasm_node](wasm_node/README.md)
+
+WebAssembly build for Node.js, plus a Node runner.
+
+```bash
+cd cmd/wasm_node && ./build.sh --build-only
+cd cmd/wasm_node && ./build.sh --run
+
+# manual
+GOOS=js GOARCH=wasm go build -o tinySQL.wasm . && cp "$(go env GOROOT)/lib/wasm/wasm_exec.js" ./
+node wasm_runner.js
+node wasm_runner.js query "SELECT 1"
+```
+
+## [query_files](query_files/README.md)
+
+Query CSV, JSON, and XML files with SQL, via web UI or CLI.
+
+```bash
+go build -o query_files ./cmd/query_files
+./query_files -web -port 8080 -datadir ./data
+./query_files -query "SELECT * FROM users" users.csv
+```
+
+## [query_files_wasm](query_files_wasm/README.md)
+
+WASM build of `query_files`, and the source of the gh-pages playground at
+https://simonwaldherr.github.io/tinySQL/. Includes an intro page, shareable
+URL-hash demos, a mobile-optimized SQL editor, file imports, geodata recipes,
+FTS/vector search examples, and result export.
+
+```bash
+cd cmd/query_files_wasm && ./build.sh --build-only
+cd cmd/query_files_wasm && ./build.sh --serve
+make build-gh-pages-demo   # static gh-pages artifacts
+make update-gh-pages       # update and commit the gh-pages branch in a worktree
+```
+
+Opening `index.html` directly does not work; a local HTTP server is required
+for the WASM MIME type.
+
+## [catalog_demo](catalog_demo/README.md)
+
+Demonstrates the catalog and job scheduler APIs by registering tables and
+scheduling SQL jobs.
+
+```bash
+go build ./cmd/catalog_demo
+./catalog_demo
+```
+
+## [debug](debug/README.md)
+
+Parses and executes SQL against an in-memory database, printing results and
+per-statement timing.
+
+```bash
+go build ./cmd/debug
+./debug -sql "SELECT 1 + 1 AS result"
+```
+
+Flags: `-sql`, `-timing`, `-verbose`
+
+## [fsql](fsql/README.md)
+
+Treats the filesystem as a relational database: register named mounts and
+query file metadata, text lines, CSV rows, and JSON rows with SQL.
+
+```bash
+cd cmd/fsql && go build -o fsql .
+./fsql mount logs /var/log
+./fsql --mount /var/log "SELECT path, size FROM files('root', true) WHERE ext = 'log'"
+```
+
+## [migrate](migrate/README.md)
+
+Data pipeline CLI: import CSV/JSON into tinySQL, connect to external databases
+(PostgreSQL, MySQL, SQLite, MS SQL), and transfer data between any combination
+of sources and targets.
+
+```bash
+cd cmd/migrate && go build -o migrate .
+migrate import-file -file users.csv -query "SELECT * FROM users"
+migrate web
+```

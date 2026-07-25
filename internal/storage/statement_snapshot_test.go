@@ -115,7 +115,10 @@ func TestTableScopedSnapshotsRejectMissingTable(t *testing.T) {
 	}
 }
 
-func TestCollectWALChangesFromStatementSnapshot(t *testing.T) {
+// TestCollectWALChangesFromMetaSnapshot covers the pre-image the engine diffs
+// against for WALManager logging: a row-less metadata snapshot must report an
+// updated table, a created table and a dropped table alike.
+func TestCollectWALChangesFromMetaSnapshot(t *testing.T) {
 	db := NewDB()
 	t.Cleanup(func() { _ = db.Close() })
 	table := NewTable("items", []Column{{Name: "id", Type: IntType}}, false)
@@ -123,15 +126,39 @@ func TestCollectWALChangesFromStatementSnapshot(t *testing.T) {
 	if err := db.Put("default", table); err != nil {
 		t.Fatal(err)
 	}
+	doomed := NewTable("doomed", []Column{{Name: "id", Type: IntType}}, false)
+	if err := db.Put("default", doomed); err != nil {
+		t.Fatal(err)
+	}
+
+	before := db.MetaSnapshot()
 
 	db.LockContentForWrite()
-	snapshot := db.SnapshotForStatement()
 	table.Rows[0][0] = 2
 	table.Version++
 	db.UnlockContentForWrite()
+	if err := db.Put("default", NewTable("fresh", []Column{{Name: "id", Type: IntType}}, false)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Drop("default", "doomed"); err != nil {
+		t.Fatal(err)
+	}
 
-	changes := CollectWALChangesFromSnapshot(snapshot, db)
-	if len(changes) != 1 || changes[0].Name != "items" || changes[0].Drop {
-		t.Fatalf("changes = %#v, want one update for items", changes)
+	changes := CollectWALChanges(before, db)
+	got := make(map[string]bool, len(changes))
+	for _, ch := range changes {
+		got[ch.Name] = ch.Drop
+	}
+	if len(changes) != 3 {
+		t.Fatalf("changes = %#v, want one entry each for items, fresh and doomed", changes)
+	}
+	if drop, ok := got["items"]; !ok || drop {
+		t.Errorf("items: want an update, got drop=%v present=%v", drop, ok)
+	}
+	if drop, ok := got["fresh"]; !ok || drop {
+		t.Errorf("fresh: want a create, got drop=%v present=%v", drop, ok)
+	}
+	if drop, ok := got["doomed"]; !ok || !drop {
+		t.Errorf("doomed: want a drop, got drop=%v present=%v", drop, ok)
 	}
 }

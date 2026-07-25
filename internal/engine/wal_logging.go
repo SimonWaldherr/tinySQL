@@ -44,9 +44,27 @@ type statementWAL struct {
 	wal     *storage.AdvancedWAL
 	txID    storage.TxID
 	started bool
+	// ambient is set when txID belongs to a transaction the SQL driver owns.
+	// Such a transaction must not be committed per statement.
+	ambient bool
 }
 
-func newStatementWAL(wal *storage.AdvancedWAL) *statementWAL {
+// newStatementWAL binds a statement to the AdvancedWAL, if one is attached.
+//
+// When db has an ambient transaction — the SQL driver opened one for a
+// BEGIN…COMMIT block — the statement joins it and never writes a commit
+// record of its own: the driver commits or aborts the whole block, and
+// recovery replays it only in the committed case. Otherwise the statement is
+// its own implicitly-committed transaction, which is the correct autocommit
+// behavior.
+func newStatementWAL(db *storage.DB) *statementWAL {
+	wal := db.StatementAdvancedWAL()
+	if wal == nil {
+		return &statementWAL{}
+	}
+	if txID, ok := db.AmbientWALTx(); ok {
+		return &statementWAL{wal: wal, txID: txID, started: true, ambient: true}
+	}
 	return &statementWAL{wal: wal}
 }
 
@@ -63,7 +81,7 @@ func (s *statementWAL) begin() error {
 }
 
 func (s *statementWAL) commit() error {
-	if s == nil || s.wal == nil || !s.started {
+	if s == nil || s.wal == nil || !s.started || s.ambient {
 		return nil
 	}
 	_, err := s.wal.LogCommit(s.txID)
@@ -141,20 +159,25 @@ func (a *walAuto) commit() error {
 }
 
 // maybeLogToWALManager drives the basic WALManager (ModeWAL) for one
-// successfully completed INSERT/UPDATE/DELETE statement executed directly
-// through engine.Execute, mirroring internal/driver's own
-// commitTx/execStatement handling of the same WAL. snapshot is the
-// statement's pre-execution StatementSnapshot (already captured
-// unconditionally for atomic-DML rollback, see executeStatement); db is the
-// now-mutated, live database. A no-op when no WALManager is attached, when
-// there's no snapshot to diff against, or when the statement touched no
-// table.
-func maybeLogToWALManager(db *storage.DB, snapshot *storage.StatementSnapshot) error {
-	wal := db.WAL()
-	if wal == nil || snapshot == nil {
+// successfully completed mutating statement. before is the metadata-only
+// pre-execution image captured by executeStatement (see storage.DB.MetaSnapshot);
+// db is the now-mutated database. It is the single place where a statement
+// reaches WALManager: the SQL driver logs only whole transactions, and a
+// transaction shadow reports no StatementWAL at all, so no change is ever
+// written twice or written before it is committed.
+//
+// Diffing a metadata image rather than the statement's rollback snapshot is
+// what lets DDL be logged: CREATE/DROP TABLE take no rollback snapshot, but
+// they do change the set of tables and their versions.
+//
+// A no-op when no WALManager is this database's responsibility, when there is
+// no pre-image, or when the statement changed no table.
+func maybeLogToWALManager(db *storage.DB, before *storage.DB) error {
+	wal := db.StatementWAL()
+	if wal == nil || before == nil {
 		return nil
 	}
-	changes := storage.CollectWALChangesFromSnapshot(snapshot, db)
+	changes := storage.CollectWALChanges(before, db)
 	if len(changes) == 0 {
 		return nil
 	}

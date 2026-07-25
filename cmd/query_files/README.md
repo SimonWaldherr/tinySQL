@@ -1,126 +1,56 @@
 # tinySQL File Query Tool
 
-Query CSV, JSON, and XML files using SQL syntax from the command line or an interactive shell, powered by the tinySQL engine.
+Query CSV, JSON, and XML files with SQL, either one-shot from the command line
+or in an interactive shell.
 
-## Features
-
-- **Multiple File Formats**: CSV (with auto-delimiter detection), JSON, and XML
-- **Multiple Output Formats**: Table, JSON, and CSV
-- **CLI Mode**: One-shot query execution for scripting and automation
-- **Interactive Mode**: Live SQL shell with table listing and execution statistics
-- **Parallel Loading**: Load multiple files concurrently with `-parallel`
-- **Fuzzy Import**: Tolerant parsing for malformed or inconsistent files
-- **Query Caching**: Optional result caching for repeated queries
-- **Full SQL Support**: WHERE, ORDER BY, GROUP BY, JOIN, aggregations, and more
-
-## Quick Start
-
-### Build
+## Build
 
 ```bash
 go build -o query_files .
 ```
 
-### Run a query
+## Usage
 
 ```bash
-./query_files -query "SELECT * FROM users LIMIT 10" users.csv
-```
-
-### Interactive shell
-
-```bash
-./query_files -interactive data/
-```
-
-## Usage Examples
-
-### Command Line Mode
-
-#### Basic Query
-```bash
+# One-shot query
 ./query_files -query "SELECT * FROM users WHERE age > 25" users.csv
-```
 
-#### Multiple Files with JOIN
-```bash
+# Join across files and formats
 ./query_files -query "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id" users.csv orders.json
-```
 
-#### Different Output Formats
-```bash
-# JSON output
+# Output formats: table (default), json, csv
 ./query_files -query "SELECT name, age FROM users" -output json users.csv
 
-# CSV output
-./query_files -query "SELECT * FROM users ORDER BY age" -output csv users.json
+# Explicit CSV delimiter
+./query_files -query "SELECT * FROM data" -delimiter ";" data.csv
 
-# Table output (default)
-./query_files -query "SELECT name, COUNT(*) as count FROM users GROUP BY name" users.xml
-```
-
-#### Parallel loading of many files
-```bash
+# Parallel loading of many files
 ./query_files -parallel -workers 8 \
-  -query "SELECT u.name, SUM(o.amount) as total FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.name" \
+  -query "SELECT u.name, SUM(o.amount) AS total FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.name" \
   users.csv orders.json
-```
 
-### Interactive Mode
-```bash
+# Interactive shell over a directory: multiple queries, table listing, timings
 ./query_files -interactive ./data
 ```
 
-In interactive mode you can run multiple queries, list loaded tables, and see timing statistics.
+Table names default to the filename without extension, so a query over
+`users.csv` selects `FROM users`. Redirect output to convert formats:
 
-## SQL Query Examples
-
-### Basic Queries
-```sql
--- Select all data
-SELECT * FROM users LIMIT 10
-
--- Filter with WHERE
-SELECT name, age FROM users WHERE age > 25
-
--- Order results
-SELECT * FROM users ORDER BY age DESC
-
--- Count records
-SELECT COUNT(*) as total FROM users
+```bash
+./query_files -query "SELECT * FROM users" -output json users.csv > users.json
 ```
 
-### Aggregations
-```sql
--- Group by with count
-SELECT city, COUNT(*) as count FROM users GROUP BY city
+The engine supports WHERE, ORDER BY, GROUP BY, JOIN (including LEFT JOIN), and
+aggregations (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`):
 
--- Multiple aggregates
-SELECT
-  city,
-  COUNT(*) as total,
-  AVG(age) as avg_age,
-  MIN(age) as min_age,
-  MAX(age) as max_age
+```sql
+SELECT city, COUNT(*) AS total, AVG(age) AS avg_age
 FROM users
 GROUP BY city
+ORDER BY total DESC
 ```
 
-### Joins (multiple files)
-```sql
--- Inner join
-SELECT u.name, o.amount
-FROM users u
-JOIN orders o ON u.id = o.user_id
-
--- Left join with aggregation
-SELECT u.name, COUNT(o.id) as order_count
-FROM users u
-LEFT JOIN orders o ON u.id = o.user_id
-GROUP BY u.name
-```
-
-## Command Line Options
+## Command line options
 
 | Flag | Description | Default |
 |------|-------------|---------|
@@ -132,32 +62,22 @@ GROUP BY u.name
 | `-verbose` | Print timing and statistics | `false` |
 | `-fuzzy` | Tolerate malformed CSV/JSON files | `true` |
 | `-cache` | Enable query result caching | `true` |
-| `-cache-size` | Query cache capacity | `256` |
+| `-cache-size` | Query cache capacity (ignored with `-cache=false`) | `256` |
 | `-parallel` | Load input files concurrently | `false` |
-| `-workers` | Number of parallel load workers | `4` |
+| `-workers` | Number of parallel load workers (with `-parallel`) | `4` |
 | `-query-timeout` | Per-query timeout (`0` = no timeout) | `30s` |
 
-## File Format Support
+## File format support
 
-### CSV Files
-- Automatic header detection
-- Auto-delimiter detection (comma, semicolon, tab, pipe) or explicit override
-- Type inference (INT, FLOAT, BOOL, TEXT)
-- Fuzzy mode for inconsistent or malformed files
+- **CSV**: header detection, auto-delimiter detection (comma, semicolon, tab,
+  pipe) or explicit override, type inference (INT, FLOAT, BOOL, TEXT), fuzzy
+  mode for inconsistent files.
+- **JSON**: array-of-objects or single object, flexible schema handling.
+- **XML**: automatic record detection, element-to-column mapping, attribute
+  support.
 
-### JSON Files
-- Array-of-objects format
-- Single-object format
-- Flexible schema handling
+## Sample inputs
 
-### XML Files
-- Automatic record detection
-- Element-to-column mapping
-- Attribute support
-
-## Sample Data Files
-
-**users.csv**
 ```csv
 name,age,city
 John,25,New York
@@ -165,7 +85,6 @@ Alice,30,Paris
 Bob,22,London
 ```
 
-**orders.json**
 ```json
 [
   {"id": 1, "user_id": 1, "amount": 100.50},
@@ -173,7 +92,6 @@ Bob,22,London
 ]
 ```
 
-**products.xml**
 ```xml
 <?xml version="1.0"?>
 <products>
@@ -185,35 +103,5 @@ Bob,22,London
 </products>
 ```
 
-## Practical Examples
-
-### Data Analysis
-```bash
-# Top customers by total spend
-./query_files -query "SELECT customer, SUM(amount) as total FROM orders GROUP BY customer ORDER BY total DESC LIMIT 5" orders.csv
-
-# Sales by region
-./query_files -query "SELECT region, AVG(sales) as avg_sales FROM sales_data GROUP BY region" sales.json
-```
-
-### Data Transformation
-```bash
-# Convert CSV to JSON
-./query_files -query "SELECT * FROM users" -output json users.csv > users_output.json
-
-# Filter and export specific columns
-./query_files -query "SELECT name, email FROM contacts WHERE active = true" -output csv contacts.xml > active_contacts.csv
-```
-
-### Custom Delimiter
-```bash
-./query_files -query "SELECT * FROM data" -delimiter ";" data.csv
-```
-
-## Error Handling
-
-Clear error messages are provided for:
-- Unsupported file formats
-- SQL syntax errors
-- Type conversion issues
-- Missing files or insufficient permissions
+Errors are reported for unsupported file formats, SQL syntax errors, type
+conversion failures, and missing or unreadable files.

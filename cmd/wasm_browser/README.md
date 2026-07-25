@@ -1,12 +1,9 @@
 # tinySQL WASM Browser (`wasm_browser`)
 
-Compiles tinySQL to **WebAssembly** and serves it with a modern browser UI.
-The entire SQL engine runs client-side — no server required after the initial
-file download.
+Compiles tinySQL to WebAssembly and serves it with a browser UI. The SQL engine
+runs client-side; no server is needed after the initial file download.
 
 ## Build
-
-### All-in-one script
 
 ```bash
 cd cmd/wasm_browser
@@ -21,9 +18,9 @@ cd cmd/wasm_browser
 ./build.sh --skip-build --serve
 ```
 
-Then open **http://localhost:8080** in your browser.
+Then open http://localhost:8080.
 
-### Manual build
+Manual equivalent:
 
 ```bash
 cd cmd/wasm_browser
@@ -43,8 +40,7 @@ cd web && python3 -m http.server 8080
 
 ## JavaScript API
 
-The WASM module exposes `window.tinySQL` functions callable from the browser
-console or your own JavaScript:
+The module exposes `window.tinySQL`:
 
 | Function | Description |
 |----------|-------------|
@@ -59,17 +55,15 @@ console or your own JavaScript:
 
 ## Notes
 
-- The SQL engine still runs in memory. The browser demo persists a compact
-  database snapshot to `localStorage` after successful mutations and restores
-  it on reload.
-- Clear the browser's site data for the demo origin to reset the persisted
-  snapshot.
+- The engine runs in memory. The demo persists a compact database snapshot to
+  `localStorage` after successful mutations and restores it on reload. Clear the
+  browser's site data for the demo origin to reset it.
 - WASM files must be served over HTTP (not `file://`) due to browser security
   restrictions — use the built-in server or any static file host.
 - Modern browsers load the generated `tinySQL.wasm.gz` companion and stream it
   through `DecompressionStream`; older browsers and hosts that already apply
   compression fall back to `tinySQL.wasm` automatically.
-- The browser API executes directly against TinySQL's engine instead of through
+- The browser API executes directly against tinySQL's engine instead of through
   `database/sql`; this reduces bundle size and avoids connection-pool overhead.
 - Set `window.tinySQLWasmDebug = true` before loading the module to enable
   diagnostic console logs; normal query paths stay quiet.

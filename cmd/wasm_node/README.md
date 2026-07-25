@@ -1,12 +1,9 @@
 # tinySQL WASM Node.js (`wasm_node`)
 
-Compiles tinySQL to **WebAssembly** for use in Node.js. A small
-`wasm_runner.js` script bootstraps the WASM module and exposes the tinySQL
-engine to Node.js scripts and the command line.
+Compiles tinySQL to WebAssembly for Node.js. `wasm_runner.js` bootstraps the
+module and exposes the engine to Node scripts and the command line.
 
 ## Build
-
-### All-in-one script
 
 ```bash
 cd cmd/wasm_node
@@ -16,12 +13,13 @@ cd cmd/wasm_node
 
 # Build and run the built-in demo
 ./build.sh --run
+./build.sh --run --query "SELECT 42"
 
 # Run existing assets without rebuilding
 ./build.sh --skip-build --run
 ```
 
-### Manual build
+Manual equivalent:
 
 ```bash
 cd cmd/wasm_node
@@ -32,31 +30,25 @@ cp "$(go env GOROOT)/lib/wasm/wasm_exec.js" ./
 ## Run
 
 ```bash
-# Default status command
-node wasm_runner.js
-
-# One-shot query
+node wasm_runner.js                                             # status (default)
 node wasm_runner.js query "SELECT 1 AS n, 'hello' AS greeting"
-
-# Execute one statement
 node wasm_runner.js exec "CREATE TABLE t (id INT)"
 ```
 
 The runner starts the Go runtime asynchronously and waits until the global
-`tinySQL` API is ready; it then opens an in-memory database, runs the selected
-command, and closes it again. `status` is the default command.
+`tinySQL` API is ready, then opens an in-memory database, runs the command, and
+closes it again.
 
 ## Embed in your own Node script
 
-Use `wasm_runner.js` as the bootstrap reference: instantiate `tinySQL.wasm`,
-call `go.run(instance)` without awaiting its never-ending runtime promise, and
-wait for `global.tinySQL`. The runner is a CLI helper, not a CommonJS module.
+Use `wasm_runner.js` as the bootstrap reference: instantiate `tinySQL.wasm`, call
+`go.run(instance)` without awaiting its never-ending runtime promise, and wait
+for `global.tinySQL`. The runner is a CLI helper, not a CommonJS module.
 
 ## Notes
 
 - Requires Node.js 18+ (WebAssembly support).
-- The database is **in-memory** and does not persist between Node.js process
-  runs.
+- The database is in-memory and does not persist between Node process runs.
 - Builds use stripped symbols and optionally `wasm-opt` when Binaryen is
   installed.
 - For the browser variant see [`../wasm_browser/`](../wasm_browser/).

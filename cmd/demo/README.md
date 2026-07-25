@@ -1,16 +1,7 @@
 # tinySQL SQL Playground (`demo`)
 
-A practical SQL playground that seeds sample data into an in-memory (or file-backed) tinySQL database and lets you explore it interactively or via a SQL script.
-
-## Features
-
-- **Seed mode** – Creates `users`, `orders`, `order_audit`, `sales`, `articles`, and `docs` sample tables.
-- **Feature tour** – Runs a guided tour of joins, PIVOT/window functions, JSON, triggers, full-text search, vector search, CTEs, temp tables, UPDATE/DELETE.
-- **Script mode** – Executes any SQL script file (`.sql`) statement by statement.
-- **Interactive REPL** – Drops into a live SQL shell after setup.
-- **Timer** – Optionally prints per-statement execution time.
-- **Pipeline output** – Use `-output ndjson` for one JSON record per result row.
-- **Persistent storage** – Point at a file-based DSN to persist data across runs.
+Seeds sample data into an in-memory or file-backed tinySQL database and lets you
+explore it via a guided feature tour, a SQL script, or an interactive REPL.
 
 ## Build
 
@@ -24,41 +15,35 @@ go build -o demo .
 demo [OPTIONS]
 
 Options:
-  -dsn string       Storage DSN (default: in-memory)
-                      mem://?tenant=default
+  -dsn string       Storage DSN (default: mem://?tenant=default)
                       file:/tmp/mydb.db?tenant=main&autosave=1
   -seed             Populate sample tables (default: true)
   -script FILE      Execute SQL statements from FILE
   -interactive      Start interactive SQL shell after setup
   -timer            Print execution time for every statement
-  -quiet            Suppress DDL/DML confirmation output
+  -quiet            Suppress DDL/DML confirmation output; only SELECT results
+  -output string    Output format: table (default), csv, json, ndjson
 ```
+
+Without `-script` or `-interactive`, the default run is a feature tour covering
+joins, PIVOT/window functions, JSON, triggers, full-text search, vector search,
+CTEs, temp tables, and UPDATE/DELETE.
 
 ## Examples
 
-### Built-in feature tour (default)
-
 ```bash
-./demo
+./demo                                   # feature tour on freshly seeded data
+./demo -script my_queries.sql            # run a script against seeded tables
+./demo -interactive                      # seed, then open a REPL
+./demo -timer -script heavy_queries.sql  # time every statement
+./demo -output ndjson -script report.sql | jq -c .
+
+# Persist to a file, then reuse it without reseeding
+./demo -dsn "file:/tmp/mydb.db?tenant=main" -interactive
+./demo -dsn "file:/tmp/mydb.db?tenant=main" -seed=false -script report.sql
 ```
 
-Runs the full feature tour against freshly seeded sample data.
-
-### Execute a SQL script
-
-```bash
-./demo -script my_queries.sql
-```
-
-Executes every statement in `my_queries.sql` against the seeded tables.
-
-### Interactive playground
-
-```bash
-./demo -interactive
-```
-
-Seeds sample data and opens a REPL where you can enter any SQL:
+REPL session:
 
 ```
 tinySQL playground — type SQL ending with ';' to execute, '.quit' to exit.
@@ -75,39 +60,10 @@ sql> .quit
 Bye.
 ```
 
-### Persistent database
-
-```bash
-./demo -dsn "file:/tmp/mydb.db?tenant=main" -interactive
-```
-
-The database is saved to `/tmp/mydb.db`; run again without `-seed` to keep existing data:
-
-```bash
-./demo -dsn "file:/tmp/mydb.db?tenant=main" -seed=false -interactive
-```
-
-### Skip seeding, run a script on an existing database
-
-```bash
-./demo -dsn "file:/tmp/mydb.db?tenant=main" -seed=false -script report.sql
-```
-
-### Time every statement
-
-```bash
-./demo -timer -script heavy_queries.sql
-```
-
-### Stream results to another tool
-
-```bash
-./demo -output ndjson -script report.sql | jq -c .
-```
-
 ## Sample data
 
-After seeding, six tables are available. The most commonly used are:
+Seeding creates `users`, `orders`, `order_audit`, `sales`, `articles`, and
+`docs`.
 
 **`users`** (id INT, name TEXT, email TEXT, active BOOL)
 
@@ -128,4 +84,4 @@ After seeding, six tables are available. The most commonly used are:
 
 `order_audit` records inserted order IDs through an `AFTER INSERT` trigger;
 `sales`, `articles`, and `docs` power the PIVOT/window, full-text, and vector
-search steps in the feature tour.
+search steps of the feature tour.

@@ -1,44 +1,46 @@
 # TinySQL Developer Integration Guide
 
-This guide explains how to embed TinySQL in three common setups:
+How to embed TinySQL in three setups:
 
 1. Native Go applications
 2. Browser/WASM applications
-3. Custom web frontends that talk to a WASM-backed TinySQL runtime
+3. Custom web frontends talking to a WASM-backed TinySQL runtime
 
-It is based on the repo examples in `example_test.go`, `import_example_test.go`, `cmd/demo`, `cmd/ragdemo`, `cmd/query_files_wasm`, and `cmd/wasm_browser`.
+Sources: `example_test.go`, `import_example_test.go`, `cmd/demo`, `cmd/ragdemo`,
+`cmd/query_files_wasm`, `cmd/wasm_browser`, `example_showcase.sql`.
 
-> **Vector search & RAG:** TinySQL is also a first-class retrieval backend
-> (vector k-NN, BM25 full-text, hybrid retrieval, RAG context expansion). If
-> you are embedding it for AI/RAG, start with the
-> [RAG / AI usage guide](./rag-guide.md) and the runnable `cmd/ragdemo`.
+> **Vector search & RAG:** TinySQL is also a retrieval backend (vector k-NN,
+> BM25 full-text, hybrid retrieval, RAG context expansion). For AI/RAG use,
+> start with the [RAG / AI usage guide](./rag-guide.md) and `cmd/ragdemo`.
 
-## Deutsch
+## English
 
-### 1. Ueberblick
+### 1. Overview
 
-TinySQL kann auf drei Ebenen integriert werden:
+Three integration levels:
 
-- **Direkt in Go**: Du arbeitest mit dem Paket `github.com/SimonWaldherr/tinySQL` und rufst Parser, Ausfuehrung und Importfunktionen direkt auf.
-- **Ueber `database/sql`**: Wenn du bereits ein SQL-typisches Projekt hast, importiere das oeffentliche Paket `github.com/SimonWaldherr/tinySQL/driver` und sprich TinySQL wie eine Datenbank per DSN an.
-- **Im Browser via WASM**: Der Build `cmd/query_files_wasm` zeigt, wie TinySQL als WebAssembly-Modul laeuft und aus JavaScript angesprochen wird.
+- **Directly in Go**: import `github.com/SimonWaldherr/tinySQL` and call the
+  parser, execution, and import helpers.
+- **Through `database/sql`**: import the public package
+  `github.com/SimonWaldherr/tinySQL/driver` and open TinySQL through a DSN.
+- **In the browser via WASM**: `cmd/query_files_wasm` runs TinySQL as a
+  WebAssembly module driven from JavaScript.
 
-Die Beispiele in diesem Repository sind bewusst unterschiedlich aufgebaut:
+Example files, each covering a different level:
 
-- `example_test.go` zeigt die direkte Go-Nutzung mit `NewDB`, `NewParser` und `Execute`.
-- `import_example_test.go` zeigt CSV-, JSON-, Datei- und Auto-Importe.
-- `cmd/demo/main.go` zeigt die Nutzung ueber `database/sql`.
-- `cmd/query_files_wasm/main.go` und `cmd/query_files_wasm/app.js` zeigen die Browser-Integration.
-- `example_showcase.sql` zeigt typische SQL-Funktionen, die TinySQL bereits abdeckt.
+- `example_test.go` — direct Go usage with `NewDB`, `NewParser`, `Execute`
+- `import_example_test.go` — CSV, JSON, file, and auto-detection imports
+- `cmd/demo/main.go` — the `database/sql` integration
+- `cmd/query_files_wasm/main.go` and `app.js` — browser integration
+- `example_showcase.sql` — the SQL surface TinySQL supports
 
-### 2. Integration in Go-Projekte
+### 2. Integrating TinySQL into Go projects
 
-#### SQL-Text formatieren und komprimieren
+#### Formatting and minifying SQL text
 
-TinySQL kann SQL auch ohne Datenbankinstanz formatiert ausgeben. Das ist
-praktisch fuer Editoren, Logs, Review-Tools und Caches. Die beiden Funktionen
-arbeiten ohne externe Abhaengigkeiten oder Parser-Roundtrip: Literale, quoted
-identifiers und Kommentare bleiben unveraendert.
+TinySQL can format SQL without a database instance — useful for editors, logs,
+review tools, and cache keys. No parser roundtrip is involved: literals, quoted
+identifiers, and comments stay unchanged.
 
 ```go
 source := "select id,name from users where note = 'two  spaces' and id=42"
@@ -53,349 +55,11 @@ compact := tinysql.MinifySQL(pretty)
 // SELECT id,name FROM users WHERE note='two  spaces' AND id=42
 ```
 
-`BeautifySQL` strukturiert die wichtigsten SQL-Klauseln und schreibt bekannte
-Keywords gross. `MinifySQL` entfernt nur bedeutungslose Leerzeichen. Bei
-`--`-Kommentaren bleibt der Zeilenumbruch erhalten, weil der folgende SQL-Text
-sonst Teil des Kommentars waere. Die Funktionen validieren kein SQL; fuer
-Syntaxpruefungen verwende `ParseSQL` oder `sqltools validate`.
-
-#### Direktes API-Embedding
-
-Wenn du TinySQL als Engine in deinem Go-Projekt verwenden willst, ist das die direkteste Variante:
-
-```go
-package main
-
-import (
-    "context"
-    "fmt"
-
-    tinysql "github.com/SimonWaldherr/tinySQL"
-)
-
-func main() {
-    db := tinysql.NewDB()
-
-    stmt, err := tinysql.ParseSQL(`CREATE TABLE users (id INT, name TEXT)`)
-    if err != nil {
-        panic(err)
-    }
-    _, err = tinysql.Execute(context.Background(), db, "default", stmt)
-    if err != nil {
-        panic(err)
-    }
-
-    stmt, _ = tinysql.ParseSQL(`INSERT INTO users VALUES (1, 'Alice')`)
-    _, _ = tinysql.Execute(context.Background(), db, "default", stmt)
-
-    stmt, _ = tinysql.ParseSQL(`SELECT id, name FROM users`)
-    rs, err := tinysql.Execute(context.Background(), db, "default", stmt)
-    if err != nil {
-        panic(err)
-    }
-
-    for _, row := range rs.Rows {
-      id, _ := tinysql.GetVal(row, "id")
-      name, _ := tinysql.GetVal(row, "name")
-      fmt.Println(id, name)
-    }
-}
-```
-
-Wichtige Punkte:
-
-- `tinysql.NewDB()` erzeugt eine neue In-Memory-Datenbank.
-- Der Tenant-Name ist im Beispiel `default`. Das ist auch der Standard in den Browser- und CLI-Beispielen.
-- `tinysql.ParseSQL(...)` und `tinysql.Execute(...)` sind die niedrigste gemeinsame Ebene, wenn du volle Kontrolle willst.
-- Wenn du mehrere Statements ausfuehren willst, kannst du den SQL-Text vorher splitten oder die vorhandenen Helfer aus dem WASM-Tool als Vorbild nehmen.
-
-#### `database/sql` verwenden
-
-Wenn du schon mit `database/sql` arbeitest, ist das oeffentliche Paket `github.com/SimonWaldherr/tinySQL/driver` die sauberste Integration.
-
-Wichtig fuer Go-Projekte: `internal/` ist ein Sprachfeature. Pakete unter `internal/` duerfen nur aus demselben Modul importiert werden. Deshalb koennen die Beispiele unter `cmd/` zwar `github.com/SimonWaldherr/tinySQL/internal/driver` nutzen, externe Tools und Anwendungen aber nicht. Fuer andere Module ist `github.com/SimonWaldherr/tinySQL/driver` der stabile Einstiegspunkt.
-
-```go
-package main
-
-import (
-    "context"
-	"errors"
-    "fmt"
-    "time"
-
-    tsqldriver "github.com/SimonWaldherr/tinySQL/driver"
-)
-
-func main() {
-    cfg := tsqldriver.DefaultOpenConfig()
-    cfg.Tenant = "default"
-    cfg.BusyTimeout = 500 * time.Millisecond
-
-    db, err := tsqldriver.OpenWithConfig(context.Background(), cfg)
-    if err != nil {
-        panic(err)
-    }
-    defer db.Close()
-
-    _, _ = db.Exec(`CREATE TABLE users (id INT, name TEXT)`)
-    _, _ = db.Exec(`INSERT INTO users VALUES (?, ?)`, 1, "Alice")
-
-    row := db.QueryRow(`SELECT name FROM users WHERE id = ?`, 1)
-    var name string
-    if err := row.Scan(&name); err != nil {
-        panic(err)
-    }
-
-    fmt.Println(name)
-}
-```
-
-DSN-Muster aus dem Repo:
-
-- In-Memory: `mem://?tenant=default`
-- Datei-basiert: `file:/pfad/zur/db.dat?tenant=default&autosave=1`
-- Mit Pooling/Busy-Timeout: `mem://?tenant=default&pool_readers=4&pool_writers=1&busy_timeout=250ms`
-
-Nuetzliche Helfer aus dem oeffentlichen Driver-Paket:
-
-- `driver.Open(dsn)` fuer den direkten `database/sql`-Einstieg
-- `driver.DefaultOpenConfig()` + `driver.OpenWithConfig(ctx, cfg)` fuer klar getrennte Settings (DSN, Pooling, Ping-Timeout)
-- `driver.OpenInMemory("default")` fuer kurzlebige Tests oder Werkzeuge
-- `driver.OpenFile("/pfad/zur/db.dat")` fuer dateibasierte Tools
-
-Best Practice fuer Timeouts und Settings:
-
-- DSN fuer tinySQL-spezifische Optionen (`tenant`, `autosave`, `pool_readers`, `pool_writers`, `busy_timeout`)
-- `database/sql` fuer Pool-Parameter (`MaxOpenConns`, `MaxIdleConns`, `ConnMaxLifetime`, `ConnMaxIdleTime`)
-- pro Anfrage/Query immer `context.WithTimeout(...)` + `ExecContext`/`QueryContext`/`PingContext` nutzen
-
-#### Transaktionen und konkurrierende Schreibvorgaenge
-
-Der Driver verwendet bei `BeginTx` einen Snapshot. Aenderungen an verschiedenen
-Tabellen koennen parallel committed werden; aendert eine andere Verbindung
-dieselbe Tabelle zwischen `BEGIN` und `COMMIT`, wird der Commit abgelehnt statt
-die fremde Aenderung zu ueberschreiben. Solche Konflikte sind mit
-`errors.Is(err, driver.ErrTransactionConflict)` erkennbar und sollten von der
-Anwendung bei Bedarf mit einem erneuten Lesen und Retry behandelt werden.
-
-```go
-if err := tx.Commit(); errors.Is(err, tsqldriver.ErrTransactionConflict) {
-    // Daten erneut lesen und die fachliche Operation bei Bedarf wiederholen.
-}
-```
-
-#### Eigene Werkzeuge und Erweiterungen bauen
-
-Wenn du ein eigenes Tool auf tinySQL aufsetzt, halte deine Imports auf der oeffentlichen API:
-
-- `github.com/SimonWaldherr/tinySQL` fuer Engine, Parser, Importer und stabile Typen
-- `github.com/SimonWaldherr/tinySQL/driver` fuer `database/sql`
-
-Die Root-API re-exportiert bewusst wichtige Typen aus internen Paketen, damit andere Projekte keine `internal/...`-Imports brauchen. Wenn dein Tool eigene tabellenwertige Funktionen bereitstellen soll, nutze `tinysql.RegisterExternalTableFunc(...)` als Erweiterungspunkt statt direkt gegen `internal/engine` zu entwickeln.
-
-#### Dateien importieren
-
-Die Import-Helfer sind ideal, wenn deine Anwendung CSV, JSON oder XML nach tinySQL laden soll. Die Beispiele in `import_example_test.go` sind die beste Referenz.
-
-```go
-result, err := tinysql.ImportCSV(ctx, db, "default", "users",
-    strings.NewReader(csvData), &tinysql.ImportOptions{
-        CreateTable:   true,
-        TypeInference: true,
-        HeaderMode:    "present",
-    })
-```
-
-Typische Helfer:
-
-- `ImportCSV(...)`
-- `ImportJSON(...)`
-- `ImportFile(...)`
-- `OpenFile(...)`
-
-Empfehlungen:
-
-- Nutze `CreateTable: true`, wenn du aus externen Dateien direkt Tabellen erzeugen willst.
-- Nutze `TypeInference: true`, wenn Spalten automatisch typisiert werden sollen.
-- Nutze `HeaderMode: "present"`, wenn das Format garantiert Kopfzeilen hat.
-- Nutze die Options aus den Beispielen als Startpunkt, statt die Importlogik neu zu schreiben.
-
-### 3. Integration in WASM-Projekte
-
-Der Browser-Build `cmd/query_files_wasm` zeigt das komplette Muster:
-
-1. Go wird mit `GOOS=js GOARCH=wasm` kompiliert.
-2. `wasm_exec.js` wird mit ausgeliefert.
-3. Eine kleine HTML/JS-App laedt das WASM-Modul.
-4. TinySQL exportiert globale Funktionen an `window`.
-
-Build:
-
-```bash
-cd cmd/query_files_wasm
-./build.sh --build-only
-```
-
-Oder lokal mit Server:
-
-```bash
-cd cmd/query_files_wasm
-./build.sh --serve
-```
-
-Wichtig: Das Modul muss ueber HTTP oder HTTPS laufen. `file://` funktioniert fuer Browser-WASM in der Regel nicht sauber, weil `fetch()` und MIME-Typen benoetigt werden.
-
-Der mitgelieferte Loader versucht auf statischen Hosts zuerst
-`query_files.wasm.gz` und streamt ihn mit `DecompressionStream` in den
-WebAssembly-Compiler. Fehlt diese Browser-API oder liefert der Host bereits
-HTTP-Kompression, faellt er automatisch auf `query_files.wasm` zurueck. Fuer
-ein eigenes Frontend kannst du den Loader aus `cmd/query_files_wasm/app.js`
-uebernehmen.
-
-#### Exportierte JS-Funktionen
-
-`cmd/query_files_wasm/main.go` bindet diese Funktionen an `window`:
-
-- `importFile(fileName, fileContent, tableName)`
-- `executeQuery(sql)`
-- `executeMulti(sql)`
-- `clearDatabase()`
-- `dropTable(tableName)`
-- `listTables()`
-- `exportResults(format)`
-- `getTableSchema(tableName)`
-
-Die Rueckgaben sind JSON-objektartige Strukturen. Beispiele aus dem Code:
-
-- Erfolg bei Query: `success`, `columns`, `rows`, `durationMs`, optional `statementsRun`
-- Fehler: `success: false`, `error`
-- Import: `tableName`, `rowsImported`, `rowsSkipped`, `columns`, `warnings`, `delimiter`, `hadHeader`
-- Export: `data`, `mimeType`, `ext`
-
-#### Minimaler Browser-Start
-
-```html
-<script src="wasm_exec.js"></script>
-<script>
-  async function bootTinySQL() {
-    const go = new Go();
-    const result = await WebAssembly.instantiateStreaming(
-      fetch("query_files.wasm"),
-      go.importObject
-    );
-    go.run(result.instance);
-
-    const queryResult = window.executeQuery("SELECT 1 AS one");
-    console.log(queryResult);
-  }
-
-  bootTinySQL();
-</script>
-```
-
-#### Praktisches Frontend-Muster
-
-Die UI in `cmd/query_files_wasm/app.js` nutzt denselben Ablauf wie ein eigenes Projekt:
-
-- Erst warten, bis die WASM-Funktionen bereit sind.
-- Dann Datei-Uploads als JSON- oder Textinhalt an `importFile(...)` uebergeben.
-- Fuer SQL mit mehreren Statements `executeMulti(...)` verwenden.
-- Fuer Schema-Ansichten `getTableSchema(...)` aufrufen.
-- Fuer Export-Buttons `exportResults("csv" | "json" | "xml")` verwenden.
-
-Das `Load Demo + Large Tables`-Beispiel in der UI zeigt ausserdem einen guten Integrationsfall fuer groessere Datensaetze: erst Demo-Tabellen laden, dann eine Abfrage ausfuehren, die JOINs, Aggregationen und Gruppierungen kombiniert.
-
-### 4. Integration in eigene Web-Frontends
-
-Wenn du ein eigenes React-, Vue-, Svelte- oder Vanilla-JS-Frontend baust, ist die Architektur einfach:
-
-1. Baue ein kleines WASM-Init-Modul.
-2. Speichere die exportierten Funktionen in einem Wrapper-Objekt.
-3. Trenne UI-State und DB-State klar.
-4. Reagiere auf Ladezustand, Fehler und leere Resultate.
-
-Empfohlene Struktur:
-
-```text
-src/
-  wasm/
-    boot.js
-  components/
-    QueryEditor.tsx
-    ResultTable.tsx
-  services/
-    tinySqlClient.ts
-```
-
-Ein robuster Wrapper kann so aussehen:
-
-```js
-export async function initTinySql() {
-  const go = new Go();
-  const wasm = await WebAssembly.instantiateStreaming(
-    fetch("/tinySQL.wasm"),
-    go.importObject
-  );
-  go.run(wasm.instance);
-
-  return {
-    execute: (sql) => window.executeQuery(sql),
-    executeMulti: (sql) => window.executeMulti(sql),
-    importFile: (fileName, content, tableName) =>
-      window.importFile(fileName, content, tableName),
-    exportResults: (format) => window.exportResults(format),
-    schema: (tableName) => window.getTableSchema(tableName)
-  };
-}
-```
-
-#### Was du im Frontend beachten solltest
-
-- Warte mit UI-Aktionen, bis die WASM-Initialisierung abgeschlossen ist.
-- Behandle grosse Ergebnisse bewusst, weil alles im Browser-Speicher liegt.
-- Nutze `executeMulti`, wenn dein Editor mehrere Statements erlauben soll.
-- Wenn du CSV/JSON/XML hochlaedst, kannst du die Browser-Datei zuerst lesen und den Text an `importFile(...)` weiterreichen.
-- In der referenzierten UI werden Excel-Dateien im Browser mit SheetJS gelesen und pro Sheet als JSON importiert.
-
-### 5. Was die Beispiele im Repo zeigen
-
-`example_showcase.sql` zeigt, dass TinySQL im Projekt fuer mehr als nur einfache SELECTs genutzt wird:
-
-- Datumsfunktionen wie `NOW`, `DATE_TRUNC`, `EOMONTH`
-- Stringfunktionen wie `UPPER`, `LOWER`, `LENGTH`, `SPLIT`
-- Regex- und Array-Funktionen
-- JOINs, GROUP BY, HAVING und Temp Tables
-- JSON-Ausdruecke und Aktualisierungen
-
-Das ist wichtig fuer Entwickler: TinySQL ist nicht nur eine Lern-Demo, sondern kann als kleiner Embedded-SQL-Kern fuer realistische Arbeitsablaeufe dienen.
-
-### 6. Praktische Grenzen und Empfehlungen
-
-- Die WASM-Beispiele begrenzen SQL-Text auf eine groessere, aber endliche Maximalgroesse. Im Browser-Code liegt sie bei 256 KiB.
-- Query-Timeouts sind im Browser-Tool standardmaessig aktiv.
-- In Browser-Setups gibt es standardmaessig keine Dateisystem-Persistenz; wenn du Persistenz brauchst, musst du sie im Frontend oder im Go-Host selbst umsetzen.
-- Fuehre echte Integrations-Tests gegen die jeweiligen Einstiegspunkte aus: Go-API, `database/sql`, WASM-API und UI.
-
-## English
-
-### 1. Overview
-
-TinySQL can be integrated at three levels:
-
-- **Directly in Go**: use the package `github.com/SimonWaldherr/tinySQL` and call the parser, execution, and import helpers directly.
-- **Through `database/sql`**: if your project already uses SQL-style APIs, import the public package `github.com/SimonWaldherr/tinySQL/driver` and access TinySQL through a DSN.
-- **In the browser via WASM**: `cmd/query_files_wasm` shows how TinySQL runs as a WebAssembly module and is controlled from JavaScript.
-
-The repository examples are intentionally complementary:
-
-- `example_test.go` shows direct Go usage with `NewDB`, `NewParser`, and `Execute`.
-- `import_example_test.go` shows CSV, JSON, file, and auto-detection imports.
-- `cmd/demo/main.go` shows the `database/sql` integration.
-- `cmd/query_files_wasm/main.go` and `cmd/query_files_wasm/app.js` show browser integration.
-- `example_showcase.sql` demonstrates the SQL surface TinySQL already supports.
-
-### 2. Integrating TinySQL into Go projects
+`BeautifySQL` structures the main clauses and upcases known keywords.
+`MinifySQL` removes only insignificant whitespace. For `--` comments the line
+break is preserved, otherwise the following SQL would become part of the
+comment. Neither function validates SQL; use `ParseSQL` or `sqltools validate`
+for syntax checks.
 
 #### Direct API embedding
 
@@ -433,9 +97,9 @@ func main() {
     }
 
     for _, row := range rs.Rows {
-      id, _ := tinysql.GetVal(row, "id")
-      name, _ := tinysql.GetVal(row, "name")
-      fmt.Println(id, name)
+        id, _ := tinysql.GetVal(row, "id")
+        name, _ := tinysql.GetVal(row, "name")
+        fmt.Println(id, name)
     }
 }
 ```
@@ -443,14 +107,21 @@ func main() {
 Key points:
 
 - `tinysql.NewDB()` creates a fresh in-memory database.
-- The tenant name in the examples is `default`, which is also the standard tenant in the browser and CLI code.
-- `tinysql.ParseSQL(...)` and `tinysql.Execute(...)` are the lowest-level primitives if you want exact control.
+- The tenant in all examples is `default`, also the standard tenant in the
+  browser and CLI code.
+- `tinysql.ParseSQL(...)` and `tinysql.Execute(...)` are the lowest-level
+  primitives. For multiple statements, split the SQL text yourself or reuse the
+  helpers from the WASM tool.
 
 #### Using `database/sql`
 
-If your code already expects a `database/sql` handle, the public package `github.com/SimonWaldherr/tinySQL/driver` is usually the cleanest route.
+If your code already expects a `database/sql` handle,
+`github.com/SimonWaldherr/tinySQL/driver` is the supported entry point.
+Anything below `internal/` can only be imported from inside this module, so
+external tools and applications cannot import
+`github.com/SimonWaldherr/tinySQL/internal/driver`.
 
-Important Go detail: `internal/` is one of Go's package visibility rules. Anything below `internal/` can only be imported from within the same module tree. That is why the repository's own commands can use `github.com/SimonWaldherr/tinySQL/internal/driver`, while external tools cannot. For other modules, `github.com/SimonWaldherr/tinySQL/driver` is the supported entry point.
+Minimal DSN-based open:
 
 ```go
 package main
@@ -482,29 +153,74 @@ func main() {
 }
 ```
 
+Same thing with an explicit config instead of a hand-built DSN:
+
+```go
+// needs "context" and "time" in addition to the imports above
+cfg := tsqldriver.DefaultOpenConfig()
+cfg.Tenant = "default"
+cfg.BusyTimeout = 500 * time.Millisecond
+
+db, err := tsqldriver.OpenWithConfig(context.Background(), cfg)
+```
+
 DSN patterns from the repo:
 
 - In-memory: `mem://?tenant=default`
 - File-backed: `file:/path/to/db.dat?tenant=default&autosave=1`
+- Pooling and busy timeout:
+  `mem://?tenant=default&pool_readers=4&pool_writers=1&busy_timeout=250ms`
 
-Useful helpers from the public driver package:
+Recognized DSN options (an unknown or malformed option is an error, not a
+silent default): `tenant`, `autosave`, `pool_readers` (aliases `read_pool`,
+`reader_pool`), `pool_writers` (aliases `write_pool`, `writer_pool`),
+`busy_timeout` (alias `busytimeout`), `mode`, `max_memory_bytes`, `read_only`,
+`sync_on_mutate`, `compress_files`, `checkpoint_every`, `checkpoint_interval`,
+`checkpoint_max_bytes`. Booleans accept `1/true/yes/on` and `0/false/no/off`.
 
+Helpers in the public driver package:
+
+- `driver.DriverName` — the registered `database/sql` driver name, `tinysql`
 - `driver.Open(dsn)` for direct `database/sql` integration
+- `driver.DefaultOpenConfig()` + `driver.OpenWithConfig(ctx, cfg)` for separated
+  settings (DSN, pooling, ping timeout)
 - `driver.OpenInMemory("default")` for tests and short-lived tools
 - `driver.OpenFile("/path/to/db.dat")` for file-backed tools
+- `driver.OpenWithDB(db)` to wrap an existing `*storage.DB`
+
+Use the DSN for tinySQL-specific options, `database/sql` for pool parameters
+(`MaxOpenConns`, `MaxIdleConns`, `ConnMaxLifetime`, `ConnMaxIdleTime`), and
+`context.WithTimeout(...)` with `ExecContext`/`QueryContext`/`PingContext` per
+query.
+
+#### Transactions and concurrent writes
+
+`BeginTx` takes a snapshot. Changes to different tables can commit in parallel;
+if another connection modifies the same table between `BEGIN` and `COMMIT`, the
+commit is rejected instead of overwriting the foreign change. Detect this with
+`errors.Is(err, driver.ErrTransactionConflict)` and, where it matters, re-read
+and retry the business operation.
+
+```go
+if err := tx.Commit(); errors.Is(err, tsqldriver.ErrTransactionConflict) {
+    // Re-read the data and repeat the operation if needed.
+}
+```
 
 #### Building your own tools and extensions
 
-When you build tooling on top of tinySQL, keep your imports on the public surface:
-
-- `github.com/SimonWaldherr/tinySQL` for the engine, parser, importers, and stable re-exported types
-- `github.com/SimonWaldherr/tinySQL/driver` for `database/sql`
-
-The root package deliberately re-exports the important types from internal packages so external projects do not need `internal/...` imports. If your tool needs custom table-valued functions, use `tinysql.RegisterExternalTableFunc(...)` instead of depending on `internal/engine`.
+Keep imports on the public surface: `github.com/SimonWaldherr/tinySQL` for the
+engine, parser, importers, and stable types, plus
+`github.com/SimonWaldherr/tinySQL/driver` for `database/sql`. The root package
+deliberately re-exports the important internal types so external projects need
+no `internal/...` imports. For custom table-valued functions use
+`tinysql.RegisterExternalTableFunc(...)` instead of depending on
+`internal/engine`.
 
 #### Importing files
 
-Use the import helpers when your application needs to load CSV, JSON, or XML into TinySQL. The examples in `import_example_test.go` are the best reference.
+Use the import helpers to load CSV, JSON, or XML into TinySQL.
+`import_example_test.go` is the reference.
 
 ```go
 result, err := tinysql.ImportCSV(ctx, db, "default", "users",
@@ -515,49 +231,41 @@ result, err := tinysql.ImportCSV(ctx, db, "default", "users",
     })
 ```
 
-Typical helpers:
+Helpers: `ImportCSV(...)`, `ImportJSON(...)`, `ImportFile(...)`,
+`OpenFile(...)`.
 
-- `ImportCSV(...)`
-- `ImportJSON(...)`
-- `ImportFile(...)`
-- `OpenFile(...)`
+Recommended options:
 
-Recommended defaults:
-
-- `CreateTable: true` when you want tables created automatically.
-- `TypeInference: true` when you want automatic column typing.
-- `HeaderMode: "present"` when the input format definitely has a header row.
+- `CreateTable: true` to create tables from external files automatically.
+- `TypeInference: true` for automatic column typing.
+- `HeaderMode: "present"` when the input definitely has a header row.
 
 ### 3. Integrating TinySQL into WASM projects
 
-The browser build in `cmd/query_files_wasm` demonstrates the full pattern:
+`cmd/query_files_wasm` demonstrates the full pattern:
 
 1. Compile Go with `GOOS=js GOARCH=wasm`.
 2. Ship `wasm_exec.js` with the page.
 3. Load the WASM module from a small HTML/JS app.
 4. Expose TinySQL functions on `window`.
 
-Build:
-
 ```bash
 cd cmd/query_files_wasm
-./build.sh --build-only
+./build.sh --build-only    # build only (-b)
+./build.sh --serve         # build, then serve on http://localhost:8080 (-s)
+./build.sh --skip-build --serve
 ```
 
-Or serve locally:
+Serving needs `python3` or `php` on the machine.
 
-```bash
-cd cmd/query_files_wasm
-./build.sh --serve
-```
+The module must be served over HTTP or HTTPS. `file://` URLs generally do not
+work for browser WASM because `fetch()` and MIME types are required.
 
-The module should be served over HTTP or HTTPS. Browsers generally do not handle WASM initialization reliably from `file://` URLs because `fetch()` and MIME types matter.
-
-On static hosts, the bundled loader first tries `query_files.wasm.gz` and
-streams it through `DecompressionStream` into the WebAssembly compiler. It
-falls back to `query_files.wasm` when that API is unavailable or the host
-already applies HTTP compression. Reuse the loader in
-`cmd/query_files_wasm/app.js` for a custom frontend.
+On static hosts the bundled loader first tries `query_files.wasm.gz` and
+streams it through `DecompressionStream` into the WebAssembly compiler. It falls
+back to `query_files.wasm` when that API is unavailable or the host already
+applies HTTP compression. Reuse the loader from `cmd/query_files_wasm/app.js`
+for a custom frontend.
 
 #### Exported JS functions
 
@@ -571,12 +279,16 @@ already applies HTTP compression. Reuse the loader in
 - `listTables()`
 - `exportResults(format)`
 - `getTableSchema(tableName)`
+- `exportDatabase()`
+- `importDatabase(...)`
 
-The returned values are JSON-like objects. From the code you can expect:
+Return values are JSON-like objects:
 
-- Query success: `success`, `columns`, `rows`, `durationMs`, optional `statementsRun`
+- Query success: `success`, `columns`, `rows`, `durationMs`, optional
+  `statementsRun`
 - Failure: `success: false`, `error`
-- Import: `tableName`, `rowsImported`, `rowsSkipped`, `columns`, `warnings`, `delimiter`, `hadHeader`
+- Import: `tableName`, `rowsImported`, `rowsSkipped`, `columns`, `warnings`,
+  `delimiter`, `hadHeader`
 - Export: `data`, `mimeType`, `ext`
 
 #### Minimal browser bootstrap
@@ -602,19 +314,21 @@ The returned values are JSON-like objects. From the code you can expect:
 
 #### Practical frontend pattern
 
-The UI in `cmd/query_files_wasm/app.js` follows the same flow you would use in your own application:
+The UI in `cmd/query_files_wasm/app.js` follows the flow you would use yourself:
 
 - Wait for WASM initialization before enabling the editor.
-- Send uploaded file contents to `importFile(...)`.
+- Send uploaded file contents (JSON or text) to `importFile(...)`.
 - Use `executeMulti(...)` when the SQL text contains multiple statements.
-- Call `getTableSchema(...)` for schema panels or metadata views.
+- Call `getTableSchema(...)` for schema panels and metadata views.
 - Use `exportResults("csv" | "json" | "xml")` for download buttons.
 
-The `Load Demo + Large Tables` button is a good integration example for larger datasets: seed tables first, then run a query that combines joins, grouping, and aggregation.
+The `Load Demo + Large Tables` button is a good example for larger datasets:
+seed the demo tables first, then run a query combining joins, grouping, and
+aggregation.
 
 ### 4. Integrating TinySQL into custom web frontends
 
-If you build a React, Vue, Svelte, or vanilla JS frontend, the architecture stays simple:
+For a React, Vue, Svelte, or vanilla JS frontend:
 
 1. Create a small WASM bootstrap module.
 2. Wrap the exported functions in a client object.
@@ -634,7 +348,7 @@ src/
     tinySqlClient.ts
 ```
 
-A robust client wrapper can look like this:
+A client wrapper:
 
 ```js
 export async function initTinySql() {
@@ -659,30 +373,99 @@ export async function initTinySql() {
 #### Frontend considerations
 
 - Do not enable query actions before WASM is ready.
-- Treat large result sets carefully because everything lives in browser memory.
+- Treat large result sets carefully: everything lives in browser memory.
 - Use `executeMulti` if your editor accepts multiple SQL statements.
-- For CSV/JSON/XML uploads, read the file in the browser and pass the text to `importFile(...)`.
-- In the reference UI, Excel files are read with SheetJS and each sheet is imported as JSON.
+- For CSV/JSON/XML uploads, read the file in the browser and pass the text to
+  `importFile(...)`.
+- In the reference UI, Excel files are read with SheetJS and each sheet is
+  imported as JSON.
 
 ### 5. What the repository examples demonstrate
 
-`example_showcase.sql` shows that TinySQL already covers much more than simple `SELECT` queries:
-
-- date and time functions such as `NOW`, `DATE_TRUNC`, and `EOMONTH`
-- string functions such as `UPPER`, `LOWER`, `LENGTH`, and `SPLIT`
-- regex and array helpers
-- joins, grouping, `HAVING`, and temp tables
-- JSON expressions and updates
-
-This matters for developers: TinySQL is not just a teaching demo; it can serve as a compact embedded SQL core for realistic workflows.
+`example_showcase.sql` covers more than simple `SELECT` queries: date and time
+functions (`NOW`, `DATE_TRUNC`, `EOMONTH`), string functions (`UPPER`, `LOWER`,
+`LENGTH`, `SPLIT`), regex and array helpers, joins, grouping, `HAVING`, temp
+tables, and JSON expressions and updates.
 
 ### 6. Practical limits and recommendations
 
-- The WASM examples keep SQL input bounded; in `cmd/query_files_wasm` the limit is 256 KiB.
+- The WASM examples bound SQL input; in `cmd/query_files_wasm` the limit is
+  256 KiB (`maxSQLBytes`).
 - Query timeouts are enabled by default in the browser tool.
-- Browser setups do not provide persistence by default; if you need persistence, implement it in the frontend or host Go process.
-- Test against all relevant entry points: Go API, `database/sql`, WASM API, and UI.
+- Browser setups have no filesystem persistence by default; implement it in the
+  frontend or in the Go host if you need it.
+- Test against every entry point you use: Go API, `database/sql`, WASM API, UI.
 
-## Summary
+For Go-only apps prefer the direct package API or the `database/sql` driver. For
+browser apps follow the `cmd/query_files_wasm` pattern: compile to WASM, expose
+a small JS API, let the frontend own UI state while TinySQL owns data and query
+execution.
 
-For Go-only apps, prefer the direct package API or the `database/sql` driver. For browser apps, follow the `cmd/query_files_wasm` pattern: compile to WASM, expose a small JS API, then let your frontend own the UI state while TinySQL owns the data and query execution.
+## Deutsch
+
+Der englische Abschnitt ist die vollstaendige Referenz und enthaelt alle
+Codebeispiele; dieser Abschnitt fasst dieselben Fakten zusammen.
+
+### 1. Ueberblick
+
+TinySQL kann auf drei Ebenen integriert werden:
+
+- **Direkt in Go**: Paket `github.com/SimonWaldherr/tinySQL`, Parser,
+  Ausfuehrung und Importfunktionen direkt aufrufen.
+- **Ueber `database/sql`**: oeffentliches Paket
+  `github.com/SimonWaldherr/tinySQL/driver` importieren und TinySQL per DSN
+  ansprechen.
+- **Im Browser via WASM**: `cmd/query_files_wasm` laeuft als WebAssembly-Modul
+  und wird aus JavaScript gesteuert.
+
+### 2. Integration in Go-Projekte
+
+- `BeautifySQL` / `MinifySQL`: SQL formatieren bzw. komprimieren ohne
+  Datenbankinstanz und ohne Parser-Roundtrip. Kein SQL-Check — dafuer
+  `ParseSQL` oder `sqltools validate`.
+- `NewDB` / `ParseSQL` / `Execute`: niedrigste Ebene mit voller Kontrolle,
+  Standard-Tenant `default`. Mehrere Statements vorher selbst splitten.
+- `database/sql`: nur ueber `github.com/SimonWaldherr/tinySQL/driver`. Pakete
+  unter `internal/` duerfen nur aus demselben Modul importiert werden, externe
+  Tools koennen `internal/driver` also nicht nutzen. DSN-Muster, DSN-Optionen
+  und Helfer siehe englischer Abschnitt 2.
+- Transaktionen: `BeginTx` arbeitet auf einem Snapshot; Commit-Konflikte mit
+  `errors.Is(err, driver.ErrTransactionConflict)` erkennen und die fachliche
+  Operation wiederholen.
+- Eigene tabellenwertige Funktionen ueber
+  `tinysql.RegisterExternalTableFunc(...)` registrieren, nicht gegen
+  `internal/engine` entwickeln.
+- Import von CSV/JSON/XML: `ImportCSV`, `ImportJSON`, `ImportFile`, `OpenFile`;
+  Referenz ist `import_example_test.go`.
+
+### 3. Integration in WASM- und Frontend-Projekte
+
+Mit `GOOS=js GOARCH=wasm` kompilieren, `wasm_exec.js` mit ausliefern, Modul aus
+einer kleinen HTML/JS-App laden, Funktionen an `window` exportieren. Build in
+`cmd/query_files_wasm` ueber `./build.sh --build-only` bzw. `./build.sh --serve`.
+
+Wichtig: Das Modul muss ueber HTTP oder HTTPS laufen. `file://` funktioniert
+fuer Browser-WASM in der Regel nicht sauber, weil `fetch()` und MIME-Typen
+benoetigt werden.
+
+Der mitgelieferte Loader versucht auf statischen Hosts zuerst
+`query_files.wasm.gz` und streamt ihn mit `DecompressionStream` in den
+WebAssembly-Compiler. Fehlt diese Browser-API oder liefert der Host bereits
+HTTP-Kompression, faellt er auf `query_files.wasm` zurueck. Fuer ein eigenes
+Frontend kann der Loader aus `cmd/query_files_wasm/app.js` uebernommen werden.
+
+Exportierte JS-Funktionen, Rueckgabeobjekte und der Wrapper-Code stehen in den
+englischen Abschnitten 3 und 4.
+
+### 4. Grenzen und Empfehlungen
+
+- Der Browser-Code begrenzt SQL-Text auf 256 KiB (`maxSQLBytes`).
+- Query-Timeouts sind im Browser-Tool standardmaessig aktiv.
+- In Browser-Setups gibt es keine Dateisystem-Persistenz; sie muss im Frontend
+  oder im Go-Host selbst umgesetzt werden.
+- Grosse Ergebnisse liegen komplett im Browser-Speicher; UI-Aktionen erst nach
+  abgeschlossener WASM-Initialisierung freigeben.
+- In der Referenz-UI werden Excel-Dateien mit SheetJS gelesen und pro Sheet als
+  JSON importiert.
+- Integrations-Tests gegen alle genutzten Einstiegspunkte fahren: Go-API,
+  `database/sql`, WASM-API und UI.

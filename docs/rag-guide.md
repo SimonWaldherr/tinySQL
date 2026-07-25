@@ -1,10 +1,8 @@
 # Using TinySQL for RAG
 
-TinySQL ships everything a single-process RAG (Retrieval-Augmented
-Generation) pipeline needs — vector storage, SIMD-accelerated k-NN search,
-BM25 full-text search, recency/quality scoring, and chunk-context expansion —
-embedded in your Go program, with no external vector database. All examples
-below run as-is.
+TinySQL provides vector storage, SIMD-accelerated k-NN search, BM25 full-text
+search, recency/quality scoring, and chunk-context expansion in-process, with
+no external vector database.
 
 See also: [Storage & Persistence Guide](./storage-guide.md) for read-only
 serving, and [Developer Integration Guide](./developer-integration.md) for
@@ -12,8 +10,8 @@ embedding TinySQL in Go, `database/sql`, or WASM.
 
 ## 1. Store chunks and embeddings
 
-Declare the embedding column as `VECTOR` (alias: `EMBEDDING`). Embeddings come
-from your embedding model; TinySQL stores them as `[]float64`.
+Declare the embedding column as `VECTOR` (alias: `EMBEDDING`); TinySQL stores
+it as `[]float64`.
 
 ```sql
 CREATE TABLE chunks (
@@ -30,9 +28,9 @@ INSERT INTO chunks VALUES
      '2026-07-01 10:00:00', 0.9, VEC_FROM_JSON('[0.12, -0.03, 0.87]'));
 ```
 
-From Go, pass the vector directly as a query parameter — both a `[]float64`
-value and a JSON string through `VEC_FROM_JSON(?)` work with the
-`database/sql` driver:
+From Go, pass the vector directly as a parameter — a `[]float64` value or a
+JSON string through `VEC_FROM_JSON(?)` both work with the `database/sql`
+driver:
 
 ```go
 vec := embed(chunkText) // []float64 from your embedding model
@@ -41,11 +39,10 @@ db.ExecContext(ctx, `INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?)`,
 ```
 
 `VEC_TO_BYTES`/`VEC_FROM_BYTES` round-trip vectors through a compact float32
-encoding — half the size of `float64` *on the wire*, which is useful as a
-portable serialization/interchange format for export or transport. Note the
-current `VEC_TO_BYTES` output is a hex string, so storing it in a `TEXT` column
-is **not** smaller than a native `VECTOR`; treat it as an interchange format,
-not an in-table memory optimization.
+encoding — half the size of `float64` *on the wire*, useful for export or
+transport. The current `VEC_TO_BYTES` output is a hex string, so storing it in
+a `TEXT` column is **not** smaller than a native `VECTOR`; treat it as
+interchange only, not an in-table memory optimization.
 
 ## 2. Retrieve: VEC_SEARCH
 
@@ -65,41 +62,41 @@ FROM VEC_SEARCH('chunks', 'embedding', VEC_FROM_JSON('[0.1, 0.0, 0.9]'), 5, 'cos
 Metrics: `cosine` (default), `l2`/`euclidean`, `manhattan`/`l1`,
 `dot`/`inner_product`. Index modes:
 
-| Index | Behavior | Use when |
-|---|---|---|
-| `flat` (default) | Exact scan; SIMD + multi-core, column cache | Default choice; stays in low single-digit ms up to ~100k rows |
-| `ivf` | Approximate (inverted file); ~2-3x faster than flat | Larger tables, small recall loss acceptable |
-| `hnsw` | Approximate graph; fastest repeated queries, highest build cost | Static data, many queries; prebuild with `VEC_WARM` |
+| Index | Behavior |
+|---|---|
+| `flat` (default) | Exact scan; SIMD + multi-core, column cache. Low single-digit ms up to ~100k rows |
+| `ivf` | Approximate (inverted file), ~2-3x faster than flat; for larger tables where small recall loss is acceptable |
+| `hnsw` | Approximate graph; fastest repeated queries, highest build cost. For static data with many queries; prebuild with `VEC_WARM` |
 
 Indexes and column caches build lazily on first query and invalidate
-automatically on writes. After a bulk load, prebuild them explicitly so no
-query pays the one-time cost:
+automatically on writes. After a bulk load, prebuild them so no query pays the
+one-time cost:
 
 ```sql
 SELECT * FROM VEC_WARM('chunks', 'embedding', 'cosine', 'hnsw');
 ```
 
 Prefer `VEC_SEARCH` over `ORDER BY VEC_COSINE_SIMILARITY(...) LIMIT k` for
-plain k-NN — it uses cached norms, a top-k heap, and a parallel scan
-(~7x faster at 12k rows). The `ORDER BY` form is still fast and the right
-tool when the ranking expression blends more than similarity.
+plain k-NN — it uses cached norms, a top-k heap, and a parallel scan (~7x
+faster at 12k rows). The `ORDER BY` form is still fast and is the right tool
+when the ranking expression blends more than similarity.
 
 ## 3. Rerank: blend similarity with freshness and quality
 
 `RAG_RANK_SCORE(similarity, ts, half_life_days, quality [, w_sim, w_rec, w_q])`
 combines normalized similarity, exponential recency decay, and a quality
 signal; `RAG_HYBRID_SCORE` (similarity + recency) and `RECENCY_SCORE` are the
-simpler variants. Use `_vec_similarity` from `VEC_SEARCH` directly:
+simpler variants. Use `_vec_similarity` from `VEC_SEARCH` directly.
 
 **Cosine only:** `RAG_HYBRID_SCORE`/`RAG_RANK_SCORE` normalize similarity
 assuming it already falls in the cosine `[-1, 1]` range (`(sim + 1) / 2`,
 clamped to `[0, 1]`). `_vec_similarity` only satisfies that for the `cosine`
 metric. For `l2`/`euclidean`, `manhattan`/`l1`, or `dot`/`inner_product`
 searches, `_vec_similarity` is an unbounded, always-non-positive value that
-clamps to a flat `0` for nearly every row — the similarity term silently
-drops out and ranking degrades to recency/quality only, with no error. Use
-the `cosine` metric when reranking with these functions, or pre-normalize
-your similarity into `[-1, 1]` before calling them.
+clamps to a flat `0` for nearly every row — the similarity term silently drops
+out and ranking degrades to recency/quality only, with no error. Use the
+`cosine` metric when reranking with these functions, or pre-normalize your
+similarity into `[-1, 1]` first.
 
 ```sql
 WITH hits AS (
@@ -112,20 +109,18 @@ ORDER BY score DESC
 LIMIT 5;
 ```
 
-`RECENCY_SCORE`/`RAG_HYBRID_SCORE`/`RAG_RANK_SCORE` all take an optional
-trailing `now` argument. When omitted, they default to the timestamp the
-current SQL statement started executing (stable across every row of one
-query, so ranking within a single result set is self-consistent) — not a
-fresh `time.Now()` per row. Pass `now` explicitly for scores that must stay
-identical across separate statement executions (e.g. golden-file tests, or
-pipelines run at different times over the same data).
+All three take an optional trailing `now`. When omitted it defaults to the
+timestamp the current statement started executing — stable across every row of
+one query, so ranking within a result set is self-consistent, but not a fresh
+`time.Now()` per row. Pass `now` explicitly when scores must stay identical
+across separate statement executions (golden-file tests, or pipelines run at
+different times over the same data).
 
-Retrieve generously (k=20), rerank, then keep the top few — reranking is
-cheap compared to a second retrieval round.
+Retrieve generously (k=20), rerank, then keep the top few — reranking is cheap
+compared to a second retrieval round.
 
 ## 4. Expand context: neighboring chunks
 
-LLM answers improve when retrieved chunks arrive with their surrounding text.
 `RAG_CONTEXT_FROM` takes a hit set (a CTE or table) and returns each hit plus
 its neighbors within the same document, annotated with `_hit_rank`,
 `_context_offset` (position relative to the best supporting hit), and
@@ -143,16 +138,15 @@ ORDER BY _context_rank;
 
 The trailing `1, 1` fetches one chunk before and one after each hit.
 `RAG_CONTEXT` does the same for a single known chunk. Overlapping windows are
-deduplicated: `_context_hits` is the number of retrieved hits that contributed
-that chunk, while `_hit_rank` and `_context_offset` come from its best-ranked
-supporting hit. This gives prompt builders a cheap, explainable confidence
-signal without repeating text.
+deduplicated: `_context_hits` counts the retrieved hits that contributed a
+chunk, while `_hit_rank` and `_context_offset` come from its best-ranked
+supporting hit — a confidence signal without repeating text.
 
 ## 5. Hybrid retrieval: vectors + keywords
 
 Embeddings miss exact identifiers, error codes, and rare terms; BM25 misses
-paraphrases. Fuse both with reciprocal rank fusion (RRF) over `VEC_SEARCH`
-and `FTS_SEARCH`:
+paraphrases. Fuse both with reciprocal rank fusion (RRF) over `VEC_SEARCH` and
+`FTS_SEARCH`:
 
 ```sql
 SELECT c.doc_id, c.chunk_index, c.chunk_text,
@@ -173,73 +167,61 @@ LIMIT 5;
 Always pass the text column(s) to `FTS_SEARCH` explicitly (the trailing
 `'chunk_text'` above). With no column list it searches *every* column,
 including the `embedding` VECTOR — tokenizing thousands of float values into
-the index, wasting memory and polluting ranking. Also note that `FTS_SEARCH`
-treats adjacent terms as an implicit **AND**, so a verbose natural-language
-question can match nothing; for question-style input, OR-expand the terms
-(e.g. `'error OR timeout OR retry'`) or keep queries to the key terms.
+the index, wasting memory and polluting ranking. `FTS_SEARCH` also treats
+adjacent terms as an implicit **AND**, so a verbose natural-language question
+can match nothing; OR-expand the terms (`'error OR timeout OR retry'`) or keep
+queries to the key terms.
 
-For a lighter variant, retrieve by vector and rerank with the scalar
-`FTS_RANK` (BM25) inside one CTE:
+Lighter variant: retrieve by vector and rerank with the scalar `FTS_RANK`
+(BM25) inside one CTE:
 `0.7 * _vec_similarity + 0.3 * FTS_RANK(chunk_text, 'query terms')`.
-`FTS_SNIPPET` and `FTS_HIGHLIGHT` format the matched passages for prompts.
+`FTS_SNIPPET` and `FTS_HIGHLIGHT` format matched passages for prompts.
 
-When you don't need BM25 ranking or tokenization at all — exact codes, IDs,
-or a quick multi-term filter — `CONTAINS_ALL(text, term1, term2, ...)`,
-`CONTAINS_ANY(text, term1, term2, ...)`, and `CONTAINS_SCORE(text, term1,
-term2, ...)` do a plain case-insensitive substring match against literal
-terms, with none of `FTS_MATCH`'s tokenizing/stemming/query syntax (so exact
-codes and numbers aren't mangled by stemming). `CONTAINS_SCORE` returns a
-0..N count of matched terms, usable directly in `ORDER BY` for a simple
-"how many of these terms appear" ranking.
+When BM25 ranking and tokenization aren't needed — exact codes, IDs, or a
+quick multi-term filter — `CONTAINS_ALL(text, term1, term2, ...)`,
+`CONTAINS_ANY(...)`, and `CONTAINS_SCORE(...)` do a case-insensitive substring
+match against literal terms, with none of `FTS_MATCH`'s
+tokenizing/stemming/query syntax (so codes and numbers aren't mangled by
+stemming). `CONTAINS_SCORE` returns a 0..N count of matched terms, usable
+directly in `ORDER BY`.
 
 ## 6. Serving and performance notes
 
-- **Concurrent requests no longer serialize on a global lock.** `VEC_SEARCH`
-  used to take two mutex round trips per call just to check whether the
-  optional result cache/analytics were enabled — pure overhead at the
-  documented default (off), and it got worse the more goroutines called
-  `VEC_SEARCH` at once. That check is now lock-free, so a server handling
-  many simultaneous RAG requests against one shared `*DB` sees searches scale
-  with available cores instead of queuing on that check. Nothing to
-  configure — this applies automatically.
-- **Vector scans benefit from a larger, warmed corpus.** The per-column
-  vector cache now packs every row into one contiguous buffer instead of one
-  allocation per row, which mainly helps once a column is large enough that
-  it doesn't fit in CPU cache (tens of thousands of rows and up). Call
-  `VEC_WARM` after a bulk load so this packing happens once, up front, rather
-  than on the first query. One trade-off: for a native `VECTOR` column (not a
-  JSON-encoded one), a warmed cache now holds two copies of that column's
-  data in memory (original rows + packed cache) — budget for roughly double
-  the vector column's raw size while the cache stays warm. See
+- **Concurrent requests do not serialize on a global lock.** The check for
+  whether the optional result cache/analytics are enabled is lock-free, so a
+  server serving many simultaneous RAG requests from one shared `*DB` scales
+  with available cores. Nothing to configure.
+- **Vector scans benefit from a warmed corpus.** The per-column vector cache
+  packs every row into one contiguous buffer instead of one allocation per
+  row, which mainly helps once a column no longer fits in CPU cache (tens of
+  thousands of rows and up). Call `VEC_WARM` after a bulk load so the packing
+  happens once, up front. Trade-off: for a native `VECTOR` column (not a
+  JSON-encoded one), a warmed cache holds two copies of that column's data in
+  memory (original rows + packed cache) — budget roughly double the vector
+  column's raw size while the cache stays warm. See
   [BENCHMARKS.md](../BENCHMARKS.md#vector-search-vec_search-lock-free-hot-path-and-a-contiguous-column-cache)
   for measured numbers.
-- **Prefer `RAG_CONTEXT_FROM` over calling `RAG_CONTEXT` per hit.**
-  `RAG_CONTEXT_FROM` builds its document/chunk index once per query and
-  reuses it for every retrieval hit; `RAG_CONTEXT` rebuilds a fresh index on
-  *every call*, by design, because it's meant for a single known chunk. Call
-  it once per `VEC_SEARCH` hit in a loop instead of using `RAG_CONTEXT_FROM`
-  for the whole hit set, and context expansion cost goes from scaling with
-  the window size to scaling with `k × table size` — on a large chunk table
-  with an ANN index (`ivf`/`hnsw`) making `VEC_SEARCH` itself sub-linear,
-  this loop can end up costing more than the vector search it followed.
+- **Prefer `RAG_CONTEXT_FROM` over calling `RAG_CONTEXT` per hit.** Both build
+  a document/chunk index and binary-search each requested window, but
+  `RAG_CONTEXT_FROM` builds that index once per query while `RAG_CONTEXT`
+  rebuilds it on *every call*, by design, because it targets a single known
+  chunk. Looping `RAG_CONTEXT` over `VEC_SEARCH` hits takes expansion cost
+  from scaling with the window size to scaling with `k × table size` — on a
+  large chunk table where an ANN index (`ivf`/`hnsw`) makes `VEC_SEARCH`
+  sub-linear, that loop can cost more than the search it followed. Keep
+  `chunk_index` monotonic within a document for predictable prompt ordering.
 - **Load once, serve read-only.** Bulk-insert into a snapshot, then reopen it
   with `ReadOnly: true` and run `VEC_WARM` at startup (full example in the
   [Storage & Persistence Guide](./storage-guide.md#read-only-serving)).
 - **Query-vector literals are free.** `VEC_FROM_JSON('[...]')` with a literal
-  argument is folded to a constant at parse time — it is not re-parsed per
-  row, so passing the query vector as JSON text costs nothing.
+  argument is folded to a constant at parse time, not re-parsed per row.
 - **SIMD is automatic.** Distance kernels use AVX2+FMA on amd64 (detected at
   startup, SSE2 fallback) and NEON on arm64, with a portable fallback
-  everywhere else; no build tags or cgo required.
-- **Repeated statements skip the parser.** Through the `database/sql`
-  driver, SELECT/EXPLAIN statements up to 8 KB are cached by their final
-  SQL text, so re-issued query templates don't re-parse. Vector caches and
-  ANN indexes are dropped eagerly on `DROP TABLE` and bounded overall, so
-  long-running services don't accumulate memory from schema churn.
-- **Context expansion scales with the window, not the source × hit count.**
-  `RAG_CONTEXT` and `RAG_CONTEXT_FROM` build a document/chunk index once per
-  query and binary-search each requested window. Keep `chunk_index` monotonic
-  within a document for predictable prompt ordering.
+  elsewhere; no build tags or cgo.
+- **Repeated statements skip the parser.** Through the `database/sql` driver,
+  SELECT/EXPLAIN statements up to 8 KB are cached by their final SQL text.
+  Vector caches and ANN indexes are dropped eagerly on `DROP TABLE` and
+  bounded overall, so schema churn doesn't accumulate memory.
 - **Exposing the schema to an LLM agent:** `tsql.BuildAgentContext(...)`
   renders a compact, token-budgeted schema summary for system prompts, and
   `cmd/tinysql-mcp-server` serves the database over MCP.
@@ -249,35 +231,22 @@ RAG query paths.
 
 ## 7. RAG_SEARCH: composed retrieval in one call
 
-Sections 2, 4, and 5 above hand-assemble vector search, context expansion,
-and hybrid RRF fusion from `VEC_SEARCH`, `RAG_CONTEXT_FROM`, and
-`FTS_SEARCH`. `RAG_SEARCH(table, vector_column, query_vector, k
-[, options_json])` composes all three into a single table-valued function
-call for the common case where you don't need to hand-write that pipeline
-yourself.
+`RAG_SEARCH(table, vector_column, query_vector, k [, options_json])` composes
+vector search, context expansion, and hybrid RRF fusion — sections 2, 4, and 5
+hand-assembled — into a single table-valued function call.
 
-Vector-only (equivalent to plain `VEC_SEARCH`, one call):
+Vector-only (equivalent to plain `VEC_SEARCH`):
 
 ```sql
 SELECT * FROM RAG_SEARCH('chunks', 'embedding', VEC_FROM_JSON('[0.1, 0.0, 0.9]'), 5);
 ```
 
-Hybrid vector + BM25 keyword search, fused with reciprocal rank fusion — the
-`options_json` 5th argument replaces the manual `LEFT JOIN` + RRF-score
-expression from section 5. `key_columns` is required in hybrid mode: it's how
-`RAG_SEARCH` matches a row across the independently-fetched vector and text
-candidate sets:
-
-```sql
-SELECT * FROM RAG_SEARCH('chunks', 'embedding', VEC_FROM_JSON('[0.1, 0.0, 0.9]'), 5, '{
-  "text_column": "chunk_text",
-  "text_query": "timeout OR retry",
-  "key_columns": ["doc_id", "chunk_index"]
-}');
-```
-
-Hybrid search plus neighbor-chunk context expansion — replaces wrapping the
-hybrid CTE in `RAG_CONTEXT_FROM` as in section 4 — in one call:
+Hybrid vector + BM25 fused with RRF, plus neighbor-chunk expansion —
+replacing the manual `LEFT JOIN` + RRF expression of section 5 and the
+`RAG_CONTEXT_FROM` wrapper of section 4. `key_columns` is required in hybrid
+mode: it is how `RAG_SEARCH` matches a row across the independently fetched
+vector and text candidate sets. Drop the `expand_*`/`*_column` keys for hybrid
+search without expansion.
 
 ```sql
 SELECT * FROM RAG_SEARCH('chunks', 'embedding', VEC_FROM_JSON('[0.1, 0.0, 0.9]'), 5, '{
@@ -292,15 +261,12 @@ SELECT * FROM RAG_SEARCH('chunks', 'embedding', VEC_FROM_JSON('[0.1, 0.0, 0.9]')
 ORDER BY _context_rank;
 ```
 
-`RAG_SEARCH` sidesteps both footguns called out above **by construction**: it
-computes its own `_vec_similarity`/`_vec_rank`/`_fts_rank`/`_rrf_score` (or
+`RAG_SEARCH` sidesteps both footguns above **by construction**: it computes
+its own `_vec_similarity`/`_vec_rank`/`_fts_rank`/`_rrf_score` (or
 `_context_offset`/`_context_rank` in expansion mode) internally rather than
 trusting a caller-supplied column, so neither the [distance-vs-similarity
-mixup](#2-retrieve-vec_search) (feeding `_vec_distance` where a similarity is
-expected) nor the [metric-mismatch silent
-degradation](#3-rerank-blend-similarity-with-freshness-and-quality) (a
-non-cosine `_vec_similarity` collapsing to 0 inside `RAG_RANK_SCORE`) can
-arise — there is no caller-supplied similarity column to get wrong. Reach for
-`VEC_SEARCH`/`FTS_SEARCH`/`RAG_CONTEXT_FROM` directly (sections 2, 4, 5) when
-you need a custom ranking expression, extra filters in the join, or scoring
-beyond plain RRF; reach for `RAG_SEARCH` for everything else.
+mixup](#2-retrieve-vec_search) nor the [metric-mismatch silent
+degradation](#3-rerank-blend-similarity-with-freshness-and-quality) can arise.
+Reach for `VEC_SEARCH`/`FTS_SEARCH`/`RAG_CONTEXT_FROM` directly when you need
+a custom ranking expression, extra filters in the join, or scoring beyond
+plain RRF; reach for `RAG_SEARCH` otherwise.
