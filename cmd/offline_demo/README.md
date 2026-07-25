@@ -1,8 +1,7 @@
 # Offline POI demo
 
-This demo shows a deliberately small embedded use case: create or reopen a
-local POI snapshot, put it into read-only mode, and search it without a server,
-network access, or SQLite dependency.
+Create or reopen a local POI snapshot, put it into read-only mode, and search it
+without a server, network access, or SQLite dependency.
 
 ```bash
 # In-memory dataset
@@ -15,6 +14,8 @@ go run ./cmd/offline_demo -snapshot /tmp/tinysql-poi.snapshot -query museum
 go run ./cmd/offline_demo -snapshot /tmp/tinysql-poi.snapshot -json
 ```
 
-The demo intentionally uses a tiny dataset. It illustrates the lifecycle and
-read-only behavior for embedded applications; it is not a substitute for the
-dedicated POI-index or standard MBTiles paths used with larger map datasets.
+Further flags: `-rebuild` ignores an existing snapshot, `-read-only` (default
+true) rejects writes after the dataset is loaded or created.
+
+The tiny dataset only illustrates the lifecycle and read-only behavior; larger
+map datasets use the dedicated POI-index or MBTiles paths.

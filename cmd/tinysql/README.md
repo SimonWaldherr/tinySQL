@@ -1,8 +1,7 @@
 # tinySQL CLI (`tinysql`)
 
-A SQLite-compatible command-line interface for tinySQL. Accepts a database file
-path (or `:memory:`) and runs in interactive REPL mode, executes inline SQL, or
-dispatches named subcommands for common operations.
+SQLite-style CLI for tinySQL: REPL, inline SQL, piped scripts,
+`sqlite-utils`-style subcommands.
 
 ## Build
 
@@ -13,96 +12,66 @@ go build -o tinysql ./cmd/tinysql
 ## Usage
 
 ```
-tinysql [FLAGS] <database> [SQL]
-tinysql [FLAGS] <database> <subcommand> [subcommand-flags]
+tinysql [FLAGS] [<database>] [SQL...]
+tinysql <subcommand> [subcommand-flags] <database> [args...]
 ```
 
-`<database>` is either a file path or `:memory:` for an in-memory database.
+`<database>` is a file path or `:memory:` (default). A file-backed database is
+created if missing and saved on exit and after each dirty statement.
+Subcommands are matched on the first argument, so they must precede any flags.
 
 ## Flags
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-tenant` | Tenant namespace | `default` |
+| `-tenant` | Tenant/schema name | `default` |
 | `-mode` | Output mode: `column`, `list`, `csv`, `json`, `table` | `column` |
-| `-header` | Print column headers | `true` |
-| `-echo` | Echo each SQL statement before executing | `false` |
-| `-cmd` | Execute this SQL then exit | — |
-| `-batch` | Batch mode: suppress prompts, exit on first error | `false` |
-| `-output` | Write results to this file instead of stdout | — |
+| `-header` | Include column headers | `true` |
+| `-echo` | Echo SQL before execution | `false` |
+| `-cmd` | Run this SQL and exit | — |
+| `-batch` | Force batch mode (error if no SQL) | `false` |
+| `-output` | Write output to this file, not stdout | — |
 
-## Interactive REPL
+SQL source precedence: `-cmd`, then trailing positional SQL, then stdin when
+piped. With none of those and no `-batch`, the REPL starts.
 
-```bash
-# In-memory database
-./tinysql :memory:
+## REPL
 
-# File-backed database (created if it doesn't exist)
-./tinysql mydb.dat
-```
-
-Special commands inside the REPL:
+Prompt is `tinysql> ` (`   ...> ` while a statement is incomplete). Ctrl+C
+discards a partial statement; on an empty buffer it exits.
 
 | Command | Description |
 |---------|-------------|
-| `.tables` | List all tables |
-| `.schema [table]` | Show CREATE TABLE for one or all tables |
-| `.mode <mode>` | Change output mode |
-| `.headers on\|off` | Toggle column headers |
-| `.output <file>` | Redirect output to a file |
-| `.quit` / `.exit` | Exit |
-| `.help` | Show available commands |
-
-## Inline SQL
-
-```bash
-./tinysql mydb.dat "SELECT * FROM users LIMIT 5"
-```
+| `.help` | Show help |
+| `.exit` / `.quit` | Exit |
+| `.tables` | List table names |
+| `.schema ?TABLE?` | Show CREATE statements |
+| `.mode MODE` | Set output mode (no arg: print current) |
+| `.headers on\|off` | Toggle header display |
+| `.timer on\|off` | Toggle SQL timer (no arg: print state) |
+| `.nullvalue STRING` | Print STRING for NULL values |
+| `.read FILENAME` | Execute SQL in FILENAME |
+| `.save FILENAME` | Write in-memory database to FILENAME |
+| `.dump [TABLE...]` | Dump tables as INSERT statements |
+| `.import FILE [TABLE]` | Import a CSV/JSON file into a table |
+| `.count [TABLE...]` | Show row counts |
+| `.stats` | Database statistics |
 
 ## Subcommands
 
-### `tables` — List tables
+Subcommand flags must precede the database argument.
 
 ```bash
-./tinysql mydb.dat tables
-```
-
-### `schema` — Show table schema
-
-```bash
-./tinysql mydb.dat schema users
-```
-
-### `insert` — Bulk insert from a file
-
-```bash
-./tinysql mydb.dat insert -file data.csv -table users
-```
-
-### `query` — Execute a query and write to a file
-
-```bash
-./tinysql mydb.dat query -sql "SELECT * FROM users" -output results.csv -format csv
-```
-
-### `export` — Export a table
-
-```bash
-./tinysql mydb.dat export -table users -output users.json -format json
+./tinysql tables mydb.dat  # -tenant NAME, -json
+./tinysql schema mydb.dat  # CREATE statements; -tenant NAME
+./tinysql query -mode csv mydb.dat "SELECT * FROM users"  # -tenant, -mode (default table)
+./tinysql insert mydb.dat users '{"id":1,"name":"Alice"}' # JSON rows; -tenant NAME
 ```
 
 ## Examples
 
 ```bash
-# One-shot query with JSON output
-./tinysql :memory: -mode json "SELECT 1 AS n, 'hello' AS greeting"
-
-# Batch mode for scripting (exit on error)
-./tinysql mydb.dat -batch -cmd "INSERT INTO log VALUES (NOW(), 'ping')"
-
-# Pipe a SQL script
-cat setup.sql | ./tinysql mydb.dat -batch
-
-# Redirect results to a file
-./tinysql mydb.dat -output report.txt "SELECT * FROM sales ORDER BY amount DESC"
+cat setup.sql | ./tinysql mydb.dat
+./tinysql mydb.dat -cmd "INSERT INTO log VALUES (NOW(), 'ping')"
+./tinysql mydb.dat -output report.txt -mode json "SELECT * FROM sales"
 ```

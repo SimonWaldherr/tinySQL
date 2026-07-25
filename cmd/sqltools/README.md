@@ -1,7 +1,7 @@
 # tinySQL SQL Toolkit (`sqltools`)
 
-A multi-purpose SQL utility that bundles a formatter, validator, query explainer,
-template library, and interactive REPL into a single binary.
+Formatter, validator, linter, normalizer, differ, query explainer, template
+library, and interactive REPL in one binary.
 
 ## Build
 
@@ -15,103 +15,59 @@ go build -o sqltools ./cmd/sqltools
 sqltools <subcommand> [options] [args...]
 ```
 
+Every SQL-taking subcommand accepts the statement inline, as `@file.sql`, or as
+a single `-` argument to read stdin.
+
 ## Subcommands
 
-### `beautify` — Format a SQL statement
+| Subcommand | Description |
+|------------|-------------|
+| `beautify [-upper=true] <sql>` | Format a statement (`-upper` uppercases keywords) |
+| `validate <sql>` | Check syntax; exit 1 on invalid SQL |
+| `explain <sql>` | Print the execution plan |
+| `lint <sql>` | Multi-rule analysis; exit 1 if any issue is `error` severity |
+| `normalize [-placeholders] <sql>` | Canonicalize SQL for comparison |
+| `diff <fileA.sql> <fileB.sql>` | Compare two SQL files |
+| `templates` | List built-in query templates with SQL and parameters |
+| `repl [-tenant=default]` | Interactive shell against an in-memory tenant |
 
-```bash
-./sqltools beautify "select id,name from users where id=1"
-```
-
-Output:
-
-```sql
-SELECT
-  id,
-  name
-FROM
-  users
-WHERE
-  id = 1
-```
-
-Options:
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-upper` | Convert keywords to uppercase | `true` |
-
-### `validate` — Check SQL syntax
-
-```bash
-./sqltools validate "SELECT * FROM users WHERE"
-# exit code 1 + error message on invalid SQL
-
-./sqltools validate "SELECT id FROM users"
-# exit code 0 + "OK"
-
-# Read one statement from standard input
-printf 'SELECT id FROM users' | ./sqltools validate -
-```
-
-### `explain` — Show a query execution plan
-
-Parses the SQL and prints a human-readable description of the execution steps
+`validate` prints `✓ Valid SELECT statement` plus any `⚠ Warning` lines, or
+`✗ Invalid SQL: <error>` and exits 1. `explain` prints the execution steps
 tinySQL would use (table scan, join order, filter pushdown, etc.).
 
-```bash
-./sqltools explain "SELECT u.name, COUNT(o.id) FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.name"
-```
-
-### `templates` — List built-in query templates
-
-Prints a catalogue of common SQL patterns (CREATE TABLE, SELECT with JOIN, CTE,
-window function, etc.) that can be used as starting points.
-
-```bash
-./sqltools templates
-```
-
-### `repl` — Interactive SQL tools shell
-
-An enhanced REPL with schema browsing, query history, and access to all
-subcommands as slash-commands.
+## repl
 
 ```bash
 ./sqltools repl
-./sqltools repl -tenant mydb
+./sqltools repl -tenant analytics
 ```
-
-Options:
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-tenant` | Tenant name for the in-memory database | `default` |
-
-Inside the REPL:
 
 | Command | Description |
 |---------|-------------|
-| `/beautify <sql>` | Format a statement |
-| `/validate <sql>` | Validate syntax |
-| `/explain <sql>` | Show execution plan |
-| `/templates` | List templates |
-| `.tables` | List tables |
-| `.schema <table>` | Show table schema |
 | `.help` | Show help |
-| `.quit` | Exit |
+| `.quit` / `.exit` | Exit |
+| `.tables` | List tables |
+| `.schema [table]` | Show schema (all tables or one) |
+| `.history [n]` | Show last n queries (default 10) |
+| `.beautify <sql>` | Format SQL |
+| `.validate <sql>` | Check syntax |
+| `.explain <sql>` | Show query plan |
+| `.export <csv\|json\|ndjson\|sql> <file> <sql>` | Export results to a file |
+| `.template <name>` | Show one template |
+| `.templates` | List all templates |
 
-Use `.export ndjson output.ndjson SELECT ...` for a streaming JSON Lines export.
+Anything else is executed as SQL. `.export ndjson out.ndjson SELECT ...` gives
+a JSON Lines export.
 
 ## Examples
 
 ```bash
-# Format and validate in one pipeline
-./sqltools beautify "select*from t" | ./sqltools validate
+# Format, then validate the formatted output
+./sqltools beautify "select*from t" | ./sqltools validate -
 
-# Quick explain from a file
-cat query.sql | xargs ./sqltools explain
+# Compare two revisions of a query
+./sqltools diff old.sql new.sql
 
-# Start interactive session against an in-memory tenant
-./sqltools repl -tenant analytics
+# Normalize with literals replaced by placeholders
+./sqltools normalize -placeholders "SELECT * FROM t WHERE id = 42"
 ```

@@ -1,8 +1,6 @@
 # tinySQL Interactive REPL (`repl`)
 
-An interactive SQL shell built on top of Go's `database/sql` interface and the
-tinySQL driver. Supports multiple output formats, echo mode, optional HTML
-output, and in-memory or file-backed databases.
+An interactive SQL shell over `database/sql` and the tinySQL driver.
 
 ## Build
 
@@ -17,76 +15,52 @@ repl [FLAGS]
 
 Flags:
   -dsn string
-        Storage DSN (default: in-memory)
-        Examples:
-          mem://?tenant=default
-          file:/tmp/mydb.db?tenant=main&autosave=1
+        Storage DSN (default "mem://?tenant=default")
+        e.g. file:/tmp/mydb.db?tenant=main&autosave=1
   -format string
-        Output format: table | csv | tsv | json | yaml | markdown (default: "table")
+        Output format: table | csv | tsv | json | yaml | markdown (default "table")
   -echo
         Echo each SQL statement before executing it
   -beautiful
-        Enable enhanced table borders (box-drawing characters)
+        Pretty-print SQL blocks and results (groups statements until the next SELECT)
   -html
-        Emit results as HTML tables instead of text
+        Emit a single HTML page of SQL blocks and results (for redirected input)
   -errors-only
-        Suppress successful results; only print errors
+        Only print queries/results that produce errors
 ```
-
-## Quick start
-
-### In-memory database (default)
 
 ```bash
 ./repl
-```
-
-### File-backed database
-
-```bash
 ./repl -dsn "file:/tmp/demo.db?tenant=main&autosave=1"
-```
-
-### JSON output format
-
-```bash
 ./repl -format json
-```
-
-### Markdown output (great for copy-paste into docs)
-
-```bash
 ./repl -format markdown
 ```
 
+`markdown` emits GitHub-flavoured tables; `json` an array of objects; `yaml` a
+sequence. `md` is accepted as an alias for `markdown`.
+
 ## Interactive commands
 
-Inside the REPL, type any SQL statement ending with `;` to execute it.
-Special dot-commands:
+Type SQL ending with `;` to execute. Dot-commands:
 
 | Command | Description |
 |---------|-------------|
-| `.quit` / `.exit` | Exit the REPL |
-| `.tables` | List all tables |
-| `.schema <table>` | Show CREATE TABLE statement |
 | `.help` | Show available commands |
+| `.quit` / `.exit` | Exit |
+| `.tables` | List all tables |
+| `.schema [TABLE]` | Show CREATE TABLE (all tables, or one) |
+| `.count [TABLE...]` | Show row counts |
+| `.dump [TABLE...]` | Dump table(s) as INSERT statements |
+| `.read FILE` | Execute SQL from a file |
+| `.clear` | Clear the screen |
 
-## Output formats
-
-| Format | Description |
-|--------|-------------|
-| `table` | ASCII-aligned columns (default) |
-| `csv` | Comma-separated values |
-| `tsv` | Tab-separated values |
-| `json` | JSON array of objects |
-| `yaml` | YAML sequence |
-| `markdown` | GitHub-flavoured Markdown table |
+`.help` also advertises `.output FORMAT` and `.timer on|off`, but neither is
+implemented — they fall through and are treated as SQL. Set the format with
+`-format` instead.
 
 ## Example session
 
 ```
-tinySQL repl — type SQL ending with ';' or a dot-command.
-
 sql> CREATE TABLE users (id INT, name TEXT, active BOOL);
 (ok)
 
@@ -99,9 +73,5 @@ sql> SELECT * FROM users WHERE active = TRUE;
   1 | Alice
 (1 row(s))
 
-sql> .tables
-users
-
 sql> .quit
-Bye.
 ```

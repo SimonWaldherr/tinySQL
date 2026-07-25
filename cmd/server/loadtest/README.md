@@ -1,33 +1,15 @@
-# tinySQL Server Loadtest
+# tinySQL server loadtest
 
-Small built-in load generator for the `cmd/server` HTTP query endpoint.
+`cmd/server` query load tester. `go build -o tinysql-loadtest .`
 
-## Build
+| Flag | Default | Description |
+|---|---|---|
+| `-url` | `http://127.0.0.1:8080/api/query` | Endpoint |
+| `-auth` | — | Bearer token (omit if server has none) |
+| `-tenant` | `default` | Tenant |
+| `-sql` | `SELECT 1` | Query |
+| `-requests` | `1000` | Requests |
+| `-concurrency` | `20` | Workers |
+| `-timeout` | `5s` | Client timeout |
 
-```bash
-go build -o tinysql-loadtest .
-```
-
-## Run
-
-```bash
-./bin/tinysql-loadtest \
-  -url http://127.0.0.1:8080/api/query \
-  -tenant default \
-  -sql "SELECT 1" \
-  -requests 10000 \
-  -concurrency 100
-```
-
-Optional auth:
-
-```bash
-./bin/tinysql-loadtest -auth "$TOKEN" ...
-```
-
-The tool prints:
-
-- total duration
-- achieved RPS
-- transport vs HTTP errors
-- latency: average, p50, p95, p99, max
+Reports duration, RPS, errors, latency (avg, p50/p95/p99, max).

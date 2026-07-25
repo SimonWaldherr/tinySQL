@@ -1,23 +1,18 @@
 # tinySQL Page Server (`tinysqlpage`)
 
-An HTTP server that renders **SQL-driven web pages**. Each URL path maps to a
-`.sql` file in a configurable pages directory; the queries produce structured
-result sets that are automatically converted into HTML components (hero banner,
-stat cards, data table, text blocks) and served through a customisable template.
+An HTTP server that renders SQL-driven web pages. Each URL path maps to a `.sql`
+file in a pages directory; result sets are converted into HTML components (hero
+banner, stat cards, data table, text blocks) and served through a customisable
+template.
 
-## Build
+## Build and run
 
 ```bash
 go build -o tinysqlpage ./cmd/tinysqlpage
-```
 
-## Run
-
-```bash
-# Default — uses the bundled sample pages and seed data
+# bundled sample pages and seed data
 ./tinysqlpage
 
-# Custom configuration
 ./tinysqlpage \
   -addr :8080 \
   -pages ./cmd/tinysqlpage/pages \
@@ -31,27 +26,23 @@ go build -o tinysqlpage ./cmd/tinysqlpage
 | `-addr` | HTTP listen address | `:8080` |
 | `-pages` | Directory containing `.sql` page definitions | `cmd/tinysqlpage/pages` |
 | `-seed` | SQL file executed at startup to populate demo data | `cmd/tinysqlpage/sample_data.sql` |
-| `-css` | Path to a custom CSS file (replaces the built-in dark theme) | — |
-| `-template` | Path to a custom HTML template file | — |
-| `-request-timeout` | Maximum time for one page's SQL rendering; `0` disables it | `5s` |
+| `-css` | Custom CSS file (replaces the built-in dark theme) | — |
+| `-template` | Custom HTML template file | — |
+| `-request-timeout` | Maximum SQL rendering time per request; `0` disables it | `5s` |
 
 ## How it works
 
-1. At startup, `-seed` SQL is executed to populate the in-memory database.
-2. Every HTTP `GET /some/path` loads `<pages-dir>/some/path.sql`.
-3. Each SQL statement is executed; result sets with a `component` column are
-   turned into HTML components.
+1. At startup, `-seed` SQL populates the in-memory database.
+2. `GET /some/path` loads `<pages-dir>/some/path.sql`.
+3. Each statement runs; result sets with a `component` column become HTML
+   components.
 4. Components are assembled and rendered through the HTML template.
 
-Navigation links are auto-generated from the `.sql` files found in the pages
-directory. You can control labels and ordering with SQL comment front-matter:
+Each request uses the caller's context and the configured timeout, so a
+cancelled client connection or a slow query does not keep rendering work alive.
 
-```sql
--- nav_label: Dashboard
--- nav_order: 1
--- title: Sales Dashboard
-SELECT 'hero' AS component, 'Sales Dashboard' AS title, 'Live metrics' AS subtitle;
-```
+Navigation links are auto-generated from the `.sql` files in the pages
+directory. Labels, ordering and page title come from SQL comment front-matter.
 
 ## Component types
 
@@ -68,6 +59,7 @@ SELECT 'hero' AS component, 'Sales Dashboard' AS title, 'Live metrics' AS subtit
 ```sql
 -- nav_label: Home
 -- nav_order: 0
+-- title: Sales Dashboard
 SELECT 'hero' AS component, 'My Dashboard' AS title, 'Powered by tinySQL' AS subtitle;
 
 SELECT 'stat_list' AS component,
@@ -90,15 +82,12 @@ LIMIT 10;
 |------|-------------|
 | `/` | Renders `index.sql` |
 | `/<page>` | Renders `<page>.sql` |
-| `/healthz` | Liveness probe (returns `200 OK`) |
-
-Each request uses the caller's context and the configured timeout. A cancelled
-client connection or a slow query therefore does not keep rendering work alive.
+| `/healthz` | Liveness probe (`200 OK`) |
 
 ## Custom template
 
-Pass `-template path/to/page.html`. The template uses Go's `html/template`
-syntax with these fields:
+Pass `-template path/to/page.html`. The template is parsed with Go's
+`html/template` and receives:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -117,3 +106,6 @@ syntax with these fields:
 </body>
 </html>
 ```
+
+Legacy `{{TITLE}}`, `{{STYLES}}`, `{{NAV}}` and `{{BODY}}` placeholders are
+rewritten to the fields above before parsing.

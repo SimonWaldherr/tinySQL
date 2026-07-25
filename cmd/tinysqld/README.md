@@ -1,94 +1,60 @@
-# tinySQL DBMS Daemon (`tinysqld`)
+# tinySQL DBMS daemon (`tinysqld`)
 
-`tinysqld` is the future enterprise DBMS entry point. It is intentionally
-separate from the existing `cmd/server` command so current HTTP/gRPC server
-behavior remains compatible while the DBMS runtime grows.
-
-## Current Scope
-
-- Opens the `OpenEnterprise` product profile.
-- Requires durable storage.
-- Starts the job scheduler through the enterprise profile.
-- Exposes a minimal HTTP DBMS API.
-- Reports DB health, storage, scheduler, WAL, and recovery state.
-- Waits for a shutdown signal and shuts down gracefully.
-
-Use `cmd/server` for the older HTTP/gRPC API server while `tinysqld` grows into
-the enterprise DBMS entry point.
-
-## Build
+The enterprise DBMS entry point, separate from `cmd/server` so the older
+HTTP/gRPC API server stays compatible. It opens the `OpenEnterprise` product
+profile, requires durable storage, starts the job scheduler through that
+profile, exposes a minimal HTTP DBMS API for DB health, storage, scheduler, WAL
+and recovery state, and shuts down gracefully on a signal.
 
 ```bash
 go build ./cmd/tinysqld
-```
 
-## Run
-
-```bash
 ./tinysqld -data ./tinysqld-data -storage disk -tenant default -http 127.0.0.1:8088
-```
-
-## Check Configuration
-
-```bash
-./tinysqld -data ./tinysqld-data -storage disk -check
 ```
 
 ## Flags
 
-- `-data`: durable database path or directory.
-- `-storage`: storage mode; one of `disk`, `hybrid`, `index`, `wal`, `advanced_wal`.
-- `-tenant`: default tenant, `default` if omitted.
-- `-http`: HTTP listen address, `127.0.0.1:8088` by default. Empty disables HTTP.
-- `-auth`: optional bearer token for API endpoints.
-- `-request-timeout`: maximum SQL request duration.
-- `-http-read-timeout`: HTTP read timeout.
-- `-http-write-timeout`: HTTP write timeout.
-- `-shutdown-timeout`: graceful shutdown timeout.
-- `-check`: open the runtime, print status, then exit.
+| Flag | Default | Description |
+|---|---|---|
+| `-data` | — | Durable database path or directory |
+| `-storage` | `disk` | Storage mode: `disk`, `hybrid`, `index`, `wal`, `advanced_wal` |
+| `-tenant` | `default` | Default tenant |
+| `-http` | `127.0.0.1:8088` | HTTP listen address; empty disables HTTP |
+| `-auth` | — | Optional bearer token for API endpoints |
+| `-request-timeout` | `30s` | Maximum SQL request duration |
+| `-http-read-timeout` | `10s` | HTTP read timeout |
+| `-http-write-timeout` | `30s` | HTTP write timeout |
+| `-shutdown-timeout` | `10s` | Graceful shutdown timeout |
+| `-analytics` | `false` | Enable the vector-cache analytics endpoint and event window |
+| `-vector-cache-entries` | `0` | `VEC_SEARCH` result-cache entries (0 disables) |
+| `-vector-cache-ttl` | `30s` | `VEC_SEARCH` result-cache TTL once entries are enabled |
+| `-check` | `false` | Open the runtime, print status, then exit |
 
 ## HTTP API
 
 Unauthenticated:
 
-- `GET /healthz`: DB health snapshot; returns `503` if storage is closed or closing.
-- `GET /readyz`: readiness plus health; returns `503` while not ready or unhealthy.
+- `GET /healthz` — DB health snapshot; `503` if storage is closed or closing.
+- `GET /readyz` — readiness plus health; `503` while not ready or unhealthy.
 
-Authenticated when `-auth` is set:
+Authenticated when `-auth` is set, via `Authorization: Bearer <token>` or
+`X-TinySQL-Auth: <token>`:
 
-- `GET /api/status`: runtime status, backend stats, and DB health.
-- `POST /api/exec`
-- `POST /api/query`
+- `GET /api/status` — runtime status, backend stats, DB health.
+- `GET /api/analytics/vector` — vector-cache analytics (requires `-analytics`).
+- `POST /api/exec`, `POST /api/query`
 - `GET /api/catalog/tables`
 - `GET /api/catalog/columns` (real table schemas from `sys.columns`)
-- `GET /api/jobs`
-- `GET /api/job-history`
+- `GET /api/jobs`, `GET /api/job-history`
 - `POST /api/jobs/run`
 
-SQL request body:
+SQL request body; `POST /api/jobs/run` takes `name` instead of `sql`:
 
 ```json
 {
   "tenant": "default",
   "sql": "SELECT name FROM users",
   "timeout_ms": 5000
-}
-```
-
-Auth accepts either:
-
-```text
-Authorization: Bearer <token>
-X-TinySQL-Auth: <token>
-```
-
-Run a registered job immediately:
-
-```json
-{
-  "tenant": "default",
-  "name": "nightly_maintenance",
-  "timeout_ms": 30000
 }
 ```
 
