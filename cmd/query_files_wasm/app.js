@@ -909,7 +909,7 @@ function renderIntroPage() {
     if (!resultsContainer || decodeDemoHash()) {
         return;
     }
-    const starterDemoIDs = ['files', 'analytics', 'geo', 'rag', 'ragsearch', 'contains', 'vectormath', 'statistics', 'sqlfeatures', 'catalog', 'release', 'ragcontext'];
+    const starterDemoIDs = ['analytics', 'geo'];
     const cards = starterDemoIDs.map((id) => [id, SHAREABLE_DEMOS[id]]).map(([id, demo]) => `
         <div class="intro-card">
             <h3>${demo.icon} ${escapeHtml(demo.title)}</h3>
@@ -927,34 +927,71 @@ function renderIntroPage() {
             <section class="intro-hero">
                 <div>
                     <div class="intro-kicker">tinySQL WebAssembly playground</div>
-                    <h2>Explore your data locally — files, analytics, maps, and AI-ready search.</h2>
+                    <h2>Run SQL on local files, without sending them anywhere.</h2>
                     <p class="intro-copy">
-                        Start with a file, a reporting workflow, or geodata. tinySQL runs as a static WASM app:
-                        no account, no backend, and your local snapshot stays in this browser.
+                        Add a file, write a query, and inspect the result. Everything runs in this browser — no account or backend required.
                     </p>
                     <div class="intro-actions">
-                        <button onclick="showUploadDialog()">Upload a file</button>
-                        <button onclick="loadShareableDemo('analytics')">Explore analytics</button>
-                        <button onclick="loadShareableDemo('geo')">Open geodata lab</button>
-                        <button class="secondary" onclick="loadShareableDemo('rag')">Try AI search</button>
+                        <button onclick="showUploadDialog()">Add a file</button>
+                        <button class="secondary" onclick="loadShareableDemo('analytics')">Try sample data</button>
                     </div>
                 </div>
                 <div class="intro-metrics">
-                    <div class="intro-metric"><strong>Local-first</strong><span>No backend, no account, snapshot stays in the browser.</span></div>
-                    <div class="intro-metric"><strong>Typed imports</strong><span>CSV, JSON, YAML, XML, Excel, GeoJSON, KML, OSM, routing graph.</span></div>
-                    <div class="intro-metric"><strong>SQL-rich</strong><span>CTEs, views, PIVOT, windows, geospatial functions, FTS, vector search.</span></div>
+                    <div class="intro-metric"><strong>1. Add data</strong><span>CSV, JSON, Excel, GeoJSON and more.</span></div>
+                    <div class="intro-metric"><strong>2. Write SQL</strong><span>Autocomplete and formatting are built in.</span></div>
+                    <div class="intro-metric"><strong>3. Export results</strong><span>Copy or download the result in common formats.</span></div>
                 </div>
             </section>
             <section class="feature-strip">
-                <div class="feature-pill"><strong>Geodata-ready</strong>Distance, radius, bbox and routing-graph examples.</div>
-                <div class="feature-pill"><strong>AI-compatible</strong>Full-text, vector similarity, and composed RAG_SEARCH retrieval recipes.</div>
-                <div class="feature-pill"><strong>Release-aware</strong>Recent tinySQL features are grouped into runnable recipes.</div>
-                <div class="feature-pill"><strong>Shareable</strong>Demo data and SQL travel in the URL hash.</div>
-                <div class="feature-pill"><strong>Exportable</strong>Copy or export query results as CSV, TSV, Markdown, JSON, XML.</div>
+                <div class="feature-pill"><strong>Files</strong>Typed local imports for everyday data work.</div>
+                <div class="feature-pill"><strong>Maps</strong>Distance, radius and routing-graph SQL.</div>
+                <div class="feature-pill"><strong>SQL features</strong>Views, PIVOT, windows and export-ready results.</div>
             </section>
             <section class="intro-grid">${cards}</section>
+            <p class="intro-note">More examples appear in the data panel after loading a sample. Shareable links preserve both the query and its demo data.</p>
         </div>
     `;
+}
+
+function closeUtilityMenu() {
+    const menu = document.getElementById('utilityMenu');
+    const trigger = document.getElementById('toolsTrigger');
+    menu?.classList.add('hidden');
+    trigger?.setAttribute('aria-expanded', 'false');
+}
+
+function toggleUtilityMenu() {
+    const menu = document.getElementById('utilityMenu');
+    const trigger = document.getElementById('toolsTrigger');
+    if (!menu || !trigger) return;
+    const isOpening = menu.classList.contains('hidden');
+    menu.classList.toggle('hidden', !isOpening);
+    trigger.setAttribute('aria-expanded', String(isOpening));
+}
+
+function toggleDemoQueries() {
+    const content = document.getElementById('demoQueryContent');
+    const trigger = document.getElementById('demoQueriesToggle');
+    if (!content || !trigger) return;
+    const isOpening = content.classList.contains('hidden');
+    content.classList.toggle('hidden', !isOpening);
+    trigger.setAttribute('aria-expanded', String(isOpening));
+}
+
+function closeResultsExportMenu() {
+    const menu = document.getElementById('resultsExportMenu');
+    const trigger = document.getElementById('resultsExportTrigger');
+    menu?.classList.add('hidden');
+    trigger?.setAttribute('aria-expanded', 'false');
+}
+
+function toggleResultsExportMenu() {
+    const menu = document.getElementById('resultsExportMenu');
+    const trigger = document.getElementById('resultsExportTrigger');
+    if (!menu || !trigger) return;
+    const isOpening = menu.classList.contains('hidden');
+    menu.classList.toggle('hidden', !isOpening);
+    trigger.setAttribute('aria-expanded', String(isOpening));
 }
 
 const DEMO_TABLES = {
@@ -1225,6 +1262,21 @@ document.addEventListener('DOMContentLoaded', () => {
     setupSqlAutocomplete();
     renderIntroPage();
     initWasm();
+
+    document.addEventListener('click', (event) => {
+        if (!event.target.closest('.topbar-menu')) {
+            closeUtilityMenu();
+        }
+        if (!event.target.closest('.results-export')) {
+            closeResultsExportMenu();
+        }
+    });
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+            closeUtilityMenu();
+            closeResultsExportMenu();
+        }
+    });
     
     // Setup demo buttons
     const loadAllDemosBtn = document.getElementById('loadAllDemosBtn');
@@ -1469,7 +1521,7 @@ function syncEditorHighlight() {
 function renderSqlHighlight(text) {
     const raw = String(text || '');
     if (!raw) {
-        return '<span class="sql-token muted">Type SQL to see highlighting</span>';
+        return '';
     }
 
     let html = '';
@@ -2392,11 +2444,16 @@ function renderResults(data) {
             <div class="results-actions">
                 <button onclick="copyResultsToClipboard()">Copy Results</button>
                 <button id="openVanillaGridBtn" onclick="openInVanillaGrid()" disabled>Open in VanillaGrid</button>
-                <button onclick="doExport('csv')">Export CSV</button>
-                <button onclick="doExport('tsv')">Export TSV</button>
-                <button onclick="doExport('md')">Export Markdown</button>
-                <button onclick="doExport('json')">Export JSON</button>
-                <button onclick="doExport('xml')">Export XML</button>
+                <div class="results-export">
+                    <button id="resultsExportTrigger" onclick="toggleResultsExportMenu()" aria-expanded="false" aria-controls="resultsExportMenu">Export</button>
+                    <div id="resultsExportMenu" class="results-export-menu hidden" role="menu" aria-label="Export result">
+                        <button role="menuitem" onclick="doExport('csv'); closeResultsExportMenu()">CSV</button>
+                        <button role="menuitem" onclick="doExport('tsv'); closeResultsExportMenu()">TSV</button>
+                        <button role="menuitem" onclick="doExport('md'); closeResultsExportMenu()">Markdown</button>
+                        <button role="menuitem" onclick="doExport('json'); closeResultsExportMenu()">JSON</button>
+                        <button role="menuitem" onclick="doExport('xml'); closeResultsExportMenu()">XML</button>
+                    </div>
+                </div>
             </div>
         </div>
         <div class="results-toolbar">

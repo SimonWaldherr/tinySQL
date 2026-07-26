@@ -61,10 +61,10 @@
         .topbar {
             background: #2d2d30;
             border-bottom: 1px solid #3e3e42;
-            padding: 12px 16px;
+            padding: 10px 16px;
             display: flex;
             align-items: center;
-            gap: 16px;
+            gap: 8px;
             flex: 0 0 auto;
         }
 
@@ -109,6 +109,42 @@
         .topbar button:hover {
             background: #1177bb;
         }
+
+        .topbar .topbar-secondary,
+        .topbar .tools-trigger {
+            background: transparent;
+            border: 1px solid #4b4b50;
+            color: #d4d4d4;
+        }
+
+        .topbar .topbar-secondary:hover,
+        .topbar .tools-trigger:hover { background: #3e3e42; }
+
+        .topbar-menu { position: relative; }
+
+        .utility-menu {
+            position: absolute;
+            top: calc(100% + 8px);
+            right: 0;
+            z-index: 100;
+            width: 190px;
+            padding: 6px;
+            background: #252526;
+            border: 1px solid #4b4b50;
+            border-radius: 6px;
+            box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+        }
+
+        .utility-menu button {
+            width: 100%;
+            min-height: 32px;
+            padding: 7px 9px;
+            background: transparent;
+            color: #d4d4d4;
+            text-align: left;
+        }
+
+        .utility-menu button:hover { background: #3e3e42; }
 
         .topbar button:focus-visible,
         .sidebar-header button:focus-visible,
@@ -208,8 +244,8 @@
         .intro-page {
             display: flex;
             flex-direction: column;
-            gap: 18px;
-            max-width: 1180px;
+            gap: 14px;
+            max-width: 980px;
             margin: 0 auto;
         }
 
@@ -217,10 +253,10 @@
             border: 1px solid #3e3e42;
             background: #252526;
             border-radius: 6px;
-            padding: 20px;
+            padding: 24px;
             display: grid;
-            grid-template-columns: minmax(0, 1.4fr) minmax(240px, 0.8fr);
-            gap: 18px;
+            grid-template-columns: minmax(0, 1fr) minmax(220px, 0.65fr);
+            gap: 28px;
             align-items: start;
         }
 
@@ -308,7 +344,7 @@
 
         .feature-strip {
             display: grid;
-            grid-template-columns: repeat(4, minmax(0, 1fr));
+            grid-template-columns: repeat(3, minmax(0, 1fr));
             gap: 10px;
         }
 
@@ -376,6 +412,12 @@
             flex-wrap: wrap;
             gap: 8px;
             margin-top: auto;
+        }
+
+        .intro-note {
+            color: #999;
+            font-size: 12px;
+            line-height: 1.5;
         }
 
         .vg-header-actions {
@@ -752,6 +794,23 @@
             justify-content: flex-end;
         }
 
+        .results-export {
+            position: relative;
+        }
+
+        .results-export-menu {
+            position: absolute;
+            top: calc(100% + 6px);
+            right: 0;
+            z-index: 50;
+            min-width: 128px;
+            padding: 6px;
+            background: #252526;
+            border: 1px solid #4b4b50;
+            border-radius: 6px;
+            box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+        }
+
         .results-toolbar {
             display: flex;
             flex-wrap: wrap;
@@ -840,6 +899,12 @@
 
         .results-actions button:hover {
             background: #505050;
+        }
+
+        .results-export-menu button {
+            width: 100%;
+            text-align: left;
+            background: transparent;
         }
 
         .results-actions button:disabled {
@@ -1084,10 +1149,33 @@
 
         /* Query Examples */
         .examples {
-            padding: 12px;
+            margin-top: auto;
+            padding: 0 12px 12px;
             border-top: 1px solid #3e3e42;
             background: #252526;
         }
+
+        .examples-toggle {
+            width: 100%;
+            padding: 12px 0;
+            cursor: pointer;
+            border: 0;
+            background: transparent;
+            color: #bdbdbd;
+            font-size: 12px;
+            font-weight: 600;
+            text-align: left;
+        }
+
+        .examples-toggle::before {
+            content: '›';
+            display: inline-block;
+            margin-right: 7px;
+            color: #9cdcfe;
+            font-size: 16px;
+            line-height: 10px;
+        }
+        .examples-toggle[aria-expanded="true"]::before { transform: rotate(90deg); }
 
         .examples-title {
             font-size: 12px;
@@ -1562,14 +1650,17 @@
     <!-- Top Bar -->
     <div class="topbar">
         <h1>tinySQL <span class="topbar-tag">browser lab</span></h1>
-        <button onclick="showUploadDialog()" aria-label="Upload a data file">📁 Your data</button>
-        <button onclick="loadShareableDemo('analytics')" aria-label="Run analytics demo">📊 Analytics</button>
-        <button onclick="loadShareableDemo('geo')" style="background: #236f52;" aria-label="Run geodata demo">🗺️ Geodata</button>
-        <button onclick="loadShareableDemo('rag')" style="background: #7d2d7d;" aria-label="Run AI search demo">✦ AI search</button>
-        <button onclick="window.open('https://github.com/SimonWaldherr/tinySQL#sql-formatting', '_blank', 'noopener')" style="background: #325d88;" aria-label="Open Go API documentation">📚 Go API</button>
-        <button onclick="importClipboardData()" aria-label="Import data from clipboard">📋 Clipboard</button>
-        <button onclick="toggleHistory()" style="background: #3e3e42;" aria-label="Toggle query history">📜 History</button>
+        <button onclick="showUploadDialog()" aria-label="Upload a data file">Add data</button>
+        <button class="topbar-secondary" onclick="loadShareableDemo('analytics')" aria-label="Load sample data">Try a sample</button>
         <div class="spacer"></div>
+        <div class="topbar-menu">
+            <button id="toolsTrigger" class="tools-trigger" onclick="toggleUtilityMenu()" aria-label="Open utility menu" aria-expanded="false" aria-controls="utilityMenu">Tools</button>
+            <div id="utilityMenu" class="utility-menu hidden" role="menu">
+                <button role="menuitem" onclick="importClipboardData(); closeUtilityMenu()">Paste from clipboard</button>
+                <button role="menuitem" onclick="toggleHistory(); closeUtilityMenu()">Query history</button>
+                <button role="menuitem" onclick="window.open('https://github.com/SimonWaldherr/tinySQL#sql-formatting', '_blank', 'noopener'); closeUtilityMenu()">Go API documentation</button>
+            </div>
+        </div>
         <div class="status">
             <div class="status-indicator"></div>
             <span id="statusText" role="status" aria-live="polite" aria-atomic="true">Ready</span>
@@ -1607,11 +1698,13 @@
             </div>
             <div id="schemaPanel" class="schema-panel hidden" role="region" aria-hidden="true" aria-labelledby="schemaPanelTitle" tabindex="-1"></div>
             <div id="demoQueries" class="examples hidden">
+                <button id="demoQueriesToggle" class="examples-toggle" type="button" onclick="toggleDemoQueries()" aria-expanded="false" aria-controls="demoQueryContent">Queries for loaded data</button>
+                <div id="demoQueryContent" class="hidden">
                 <div class="examples-title">Demo Queries</div>
                 <div class="demo-filter" role="group" aria-label="Filter demo queries">
                     <button type="button" class="active" data-demo-filter="all" onclick="setDemoQueryGroup('all')">All</button>
                     <button type="button" data-demo-filter="geo" onclick="setDemoQueryGroup('geo')">Geo</button>
-                    <button type="button" data-demo-filter="search" onclick="setDemoQueryGroup('search')">Search/RAG</button>
+                    <button type="button" data-demo-filter="search" onclick="setDemoQueryGroup('search')">Search</button>
                     <button type="button" data-demo-filter="analytics" onclick="setDemoQueryGroup('analytics')">Analytics</button>
                     <button type="button" data-demo-filter="recent" onclick="setDemoQueryGroup('recent')">Recent</button>
                 </div>
@@ -1726,6 +1819,7 @@
                 <div class="example-query" onclick="setQuery('-- In-memory stored procedure\nCALL demo_table_summary()')">
                     🧾 Stored Procedure
                 </div>
+                </div>
             </div>
             <div id="historyPanel" class="history-section hidden">
                 <div class="history-title">
@@ -1752,21 +1846,8 @@
                 <div class="editor-shell">
                     <pre id="sqlHighlight" class="sql-highlighter" aria-hidden="true"></pre>
                     <label for="queryEditor" class="sr-only">SQL query editor</label>
-                    <textarea id="queryEditor" placeholder="Enter your SQL query here...
-Example: SELECT * FROM users WHERE age > 25
-
-Supported features:
-- SELECT, WHERE, ORDER BY, GROUP BY, HAVING
-- JOIN (INNER, LEFT, RIGHT, FULL), CTE (WITH)
-- Window functions (ROW_NUMBER, SUM OVER, …)
-- Aggregations: COUNT, SUM, AVG, MIN, MAX
-- CASE expressions, sub-queries, PIVOT, RETURNING
-- Views, materialized views, EXPLAIN, PRAGMA
-- Geo: ST_DISTANCE, ST_DWITHIN, ST_WITHIN_BBOX
-- Search: FTS_SEARCH, FTS_SNIPPET, VEC_SEARCH, RAG_CONTEXT, hybrid retrieval
-- Multi-statement (separated by ;)
-- Import: CSV, JSON, YAML, XML, GeoJSON, KML, OSM, routing graph, Excel
--- Export: CSV, JSON, XML" aria-describedby="editorHelp" aria-expanded="false"></textarea>
+                    <textarea id="queryEditor" placeholder="Write a SQL query…
+Example: SELECT * FROM my_table LIMIT 100;" aria-describedby="editorHelp" aria-expanded="false"></textarea>
                     <div id="autocompletePanel" class="autocomplete-panel hidden" role="listbox" aria-label="SQL suggestions" aria-hidden="true"></div>
                     <div id="editorLineCount" class="editor-line-count"></div>
                 </div>

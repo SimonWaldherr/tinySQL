@@ -166,7 +166,7 @@ update-gh-pages: build-gh-pages-demo
 		if [ "$$(git -C "$$worktree" branch --show-current)" != "$$branch" ]; then \
 			echo "$(RED)$$worktree is not on branch $$branch$(NC)"; exit 1; \
 		fi; \
-		if ! git -C "$$worktree" diff --quiet || ! git -C "$$worktree" diff --cached --quiet; then \
+		if [ -n "$$(git -C "$$worktree" status --porcelain)" ]; then \
 			echo "$(RED)$$worktree has uncommitted changes; refusing to overwrite them$(NC)"; exit 1; \
 		fi; \
 	else \
