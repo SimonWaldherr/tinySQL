@@ -29,8 +29,10 @@ Flags:
   --version         Print version and exit
 ```
 
-Flags are parsed before the subcommand, so they must come first. `index build`
-prints a not-implemented notice.
+Global flags are parsed before the subcommand. For `query`, `--mount`,
+`--scope`, and `--output` may alternatively appear immediately after `query`,
+which is convenient when the SQL is the final argument. `index build` prints a
+not-implemented notice.
 
 ## Named mounts
 
@@ -63,6 +65,9 @@ fsql --mount /var/log "SELECT path, size FROM files('/', true) WHERE ext = 'log'
 
 # Use a named scope as the root
 fsql --scope logs "SELECT name, size FROM files('logs') ORDER BY size DESC LIMIT 10"
+
+# Query-specific flags can follow the subcommand
+fsql query --scope logs --output json "SELECT name, size FROM files('/')"
 
 # Output formats
 fsql --output json --mount /tmp "SELECT name, size FROM files('/')"

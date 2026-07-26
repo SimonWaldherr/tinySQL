@@ -56,8 +56,8 @@ anything changed. `make push-gh-pages` also pushes the branch.
   `.routinggraph`, `.graph.json`, ...)
 - single- and multi-statement SQL execution, schema inspection, table removal
 - query history, editor state, and database snapshot in local storage
-- result filtering, sorting, table copy, VanillaGrid pivot view, and exports as
-  CSV, TSV, Markdown, JSON, and XML
+- paged result browsing, filtering, sorting, table copy, VanillaGrid pivot
+  view, and exports as CSV, TSV, Markdown, JSON, and XML
 - intro page with guided recipes: file analytics, geodata, FTS/vector search,
   RAG context expansion, joins/reporting
 - geodata examples: point extraction, distance matrices, radius filters,
@@ -107,3 +107,7 @@ editor to the encoded query, and runs it when `autoRun` is true.
 - `exportDatabase()`
 - `importDatabase(snapshot)`
 - `exportResults(format)`
+
+`executeMulti` recognizes statement separators only outside SQL strings, quoted
+identifiers, and line/block comments, so scripts can safely contain semicolons
+in those constructs.

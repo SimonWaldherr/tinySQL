@@ -5,7 +5,8 @@ let currentResults = null;
 const HISTORY_KEY = 'tinysql_query_history_v1';
 const DB_SNAPSHOT_KEY = 'tinysql_query_files_db_snapshot_v1';
 const EDITOR_STATE_KEY = 'tinysql_query_files_editor_v1';
-const RESULT_RENDER_LIMIT = 500;
+const DEFAULT_RESULT_PAGE_SIZE = 100;
+const RESULT_PAGE_SIZES = [50, 100, 250, 500];
 const DEMO_HASH_PREFIX = 'demo=';
 const SQL_KEYWORDS = [
     'SELECT', 'FROM', 'WHERE', 'JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'FULL JOIN', 'INNER JOIN', 'CROSS JOIN',
@@ -52,6 +53,8 @@ let resultViewState = {
     filterText: '',
     sortColumn: '',
     sortDirection: 'asc',
+    page: 1,
+    pageSize: DEFAULT_RESULT_PAGE_SIZE,
 };
 let editorSaveTimer = null;
 let snapshotSaveTimer = null;
@@ -1708,178 +1711,149 @@ async function handleFiles(files) {
         return;
     }
     
+    let imported = 0;
     for (const file of files) {
-        await importSingleFile(file);
+        if (await importSingleFile(file)) {
+            imported += 1;
+        }
+    }
+    if (files.length > 1) {
+        updateStatus(`Imported ${imported} of ${files.length} file(s)`);
     }
 }
 
-// Import a single file
+function readFile(file, method) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error(`Failed to read file: ${file.name}`));
+        reader[method](file);
+    });
+}
+
+// Import a single file. Awaiting file reads keeps multi-file imports ordered
+// and avoids racing status/table updates.
 async function importSingleFile(file) {
     const fileName = file.name.toLowerCase();
-    
-    // Check if it's an Excel file
     if (fileName.endsWith('.xlsx') || fileName.endsWith('.xls')) {
-        return await importExcelFile(file);
+        return importExcelFile(file);
     }
-    
-    const reader = new FileReader();
-    
-    reader.onload = async (e) => {
-        const content = e.target.result;
+
+    try {
+        const content = await readFile(file, 'readAsText');
         const tableName = sanitizeTableName(file.name);
-        
         updateStatus(`Importing ${file.name}...`);
-        
-        try {
-            // Check if WASM functions are available
-            if (typeof wasmApi.importFile !== 'function') {
-                throw new Error('WASM importFile function not available. Make sure WASM is initialized.');
-            }
-            
-            console.log('Calling WASM importFile with:', file.name, tableName);
-            const result = wasmApi.importFile(file.name, content, tableName);
-            console.log('WASM importFile result:', result);
-            
-            if (!result) {
-                throw new Error('WASM importFile returned undefined/null');
-            }
-            
-            if (typeof result !== 'object') {
-                throw new Error(`WASM importFile returned invalid type: ${typeof result}`);
-            }
-            
-            if (result.success) {
-                // Add table to current tables
-                const tableInfo = {
-                    name: tableName,
-                    rowCount: result.rowsImported,
-                    columns: Array.isArray(result.columns) ? result.columns.map(c => String(c)) : []
-                };
-                
-                // Update or add table
-                const existingIndex = currentTables.findIndex(t => t.name === tableName);
-                if (existingIndex >= 0) {
-                    currentTables[existingIndex] = tableInfo;
-                } else {
-                    currentTables.push(tableInfo);
-                }
-                
-                renderTables();
-                if (isRoutingGraphFile(file.name)) {
-                    loadTables();
-                }
-                
-                let message = `Imported ${result.rowsImported} rows into "${tableName}"`;
-                if (result.rowsSkipped > 0) {
-                    message += ` (${result.rowsSkipped} skipped)`;
-                }
-                updateStatus(message);
 
-                // Prefill query editor with a working example for this table
-                const editor = document.getElementById('queryEditor');
-                const defaultQuery = `SELECT * FROM ${tableName} LIMIT 10`;
-                if (!editor.value || /SELECT \* FROM (mytable|table1|table2)/i.test(editor.value)) {
-                    editor.value = defaultQuery;
-                    syncEditorHighlight();
-                    saveEditorState();
-                }
-
-                // Ensure Execute is enabled
-                const executeBtn = document.getElementById('executeBtn');
-                if (executeBtn) executeBtn.disabled = false;
-                scheduleDatabaseSnapshotSave();
-            } else {
-                alert(`Import failed: ${result.error || 'Unknown error'}`);
-                updateStatus('Import failed');
-                console.error('Import failed:', result);
-            }
-        } catch (err) {
-            alert(`Import error: ${err.message}`);
-            updateStatus('Import failed');
+        if (typeof wasmApi.importFile !== 'function') {
+            throw new Error('WASM importFile function not available. Make sure WASM is initialized.');
         }
-    };
-    
-    reader.onerror = () => {
-        alert(`Failed to read file: ${file.name}`);
-    };
-    
-    reader.readAsText(file);
+
+        const result = wasmApi.importFile(file.name, content, tableName);
+        if (!result || typeof result !== 'object') {
+            throw new Error('WASM importFile returned an invalid result');
+        }
+        if (!result.success) {
+            throw new Error(result.error || 'Unknown import error');
+        }
+
+        const tableInfo = {
+            name: tableName,
+            rowCount: result.rowsImported,
+            columns: Array.isArray(result.columns) ? result.columns.map(c => String(c)) : []
+        };
+        const existingIndex = currentTables.findIndex(t => t.name === tableName);
+        if (existingIndex >= 0) {
+            currentTables[existingIndex] = tableInfo;
+        } else {
+            currentTables.push(tableInfo);
+        }
+
+        renderTables();
+        if (isRoutingGraphFile(file.name)) {
+            loadTables();
+        }
+
+        let message = `Imported ${result.rowsImported} rows into "${tableName}"`;
+        if (result.rowsSkipped > 0) {
+            message += ` (${result.rowsSkipped} skipped)`;
+        }
+        updateStatus(message);
+
+        const editor = document.getElementById('queryEditor');
+        const defaultQuery = `SELECT * FROM ${tableName} LIMIT 10`;
+        if (!editor.value || /SELECT \* FROM (mytable|table1|table2)/i.test(editor.value)) {
+            editor.value = defaultQuery;
+            syncEditorHighlight();
+            saveEditorState();
+        }
+
+        const executeBtn = document.getElementById('executeBtn');
+        if (executeBtn) executeBtn.disabled = false;
+        scheduleDatabaseSnapshotSave();
+        return true;
+    } catch (err) {
+        alert(`Import error: ${err.message}`);
+        updateStatus('Import failed');
+        console.error('Import failed:', err);
+        return false;
+    }
 }
 
 // Import Excel file using SheetJS
 async function importExcelFile(file) {
     if (typeof XLSX === 'undefined') {
         alert('Excel support library not loaded. Please refresh the page.');
-        return;
+        return false;
     }
 
     updateStatus(`Reading Excel file: ${file.name}...`);
 
-    const reader = new FileReader();
-    
-    reader.onload = async (e) => {
-        try {
-            const data = new Uint8Array(e.target.result);
-            const workbook = XLSX.read(data, { type: 'array' });
-            
-            // Import each sheet as a separate table
-            for (const sheetName of workbook.SheetNames) {
-                const worksheet = workbook.Sheets[sheetName];
-                const jsonData = XLSX.utils.sheet_to_json(worksheet);
-                
-                if (jsonData.length === 0) {
-                    console.log(`Sheet "${sheetName}" is empty, skipping`);
-                    continue;
-                }
-                
-                const tableName = sanitizeTableName(sheetName);
-                const jsonContent = JSON.stringify(jsonData);
-                
-                updateStatus(`Importing sheet: ${sheetName}...`);
-                
-                const result = wasmApi.importFile(`${sheetName}.json`, jsonContent, tableName);
-                
-                if (result && result.success) {
-                    const tableInfo = {
-                        name: tableName,
-                        rowCount: result.rowsImported,
-                        columns: Array.isArray(result.columns) ? result.columns.map(c => String(c)) : []
-                    };
-                    
-                    const existingIndex = currentTables.findIndex(t => t.name === tableName);
-                    if (existingIndex >= 0) {
-                        currentTables[existingIndex] = tableInfo;
-                    } else {
-                        currentTables.push(tableInfo);
-                    }
-                }
+    try {
+        const data = new Uint8Array(await readFile(file, 'readAsArrayBuffer'));
+        const workbook = XLSX.read(data, { type: 'array' });
+        let importedSheets = 0;
+
+        for (const sheetName of workbook.SheetNames) {
+            const worksheet = workbook.Sheets[sheetName];
+            const jsonData = XLSX.utils.sheet_to_json(worksheet);
+            if (jsonData.length === 0) {
+                continue;
             }
-            
-            renderTables();
-            updateStatus(`Excel file imported: ${workbook.SheetNames.length} sheet(s)`);
-            
-            // Enable execute button
-            document.getElementById('executeBtn').disabled = false;
-            
-            // Set example query for first table
-            if (currentTables.length > 0) {
-                const firstTable = currentTables[0].name;
-                document.getElementById('queryEditor').value = `SELECT * FROM ${firstTable} LIMIT 10`;
-                syncEditorHighlight();
-                saveEditorState();
+
+            const tableName = sanitizeTableName(sheetName);
+            updateStatus(`Importing sheet: ${sheetName}...`);
+            const result = wasmApi.importFile(`${sheetName}.json`, JSON.stringify(jsonData), tableName);
+            if (!result?.success) {
+                console.error(`Failed to import sheet "${sheetName}":`, result?.error || 'unknown error');
+                continue;
             }
-            scheduleDatabaseSnapshotSave();
-        } catch (err) {
-            alert(`Failed to parse Excel file: ${err.message}`);
-            updateStatus('Excel import failed');
+
+            const tableInfo = {
+                name: tableName,
+                rowCount: result.rowsImported,
+                columns: Array.isArray(result.columns) ? result.columns.map(c => String(c)) : []
+            };
+            const existingIndex = currentTables.findIndex(t => t.name === tableName);
+            if (existingIndex >= 0) currentTables[existingIndex] = tableInfo;
+            else currentTables.push(tableInfo);
+            importedSheets += 1;
         }
-    };
-    
-    reader.onerror = () => {
-        alert(`Failed to read Excel file: ${file.name}`);
-    };
-    
-    reader.readAsArrayBuffer(file);
+
+        renderTables();
+        updateStatus(`Excel file imported: ${importedSheets} sheet(s)`);
+        const executeBtn = document.getElementById('executeBtn');
+        if (executeBtn) executeBtn.disabled = false;
+        if (currentTables.length > 0) {
+            const firstTable = currentTables[0].name;
+            setQuery(`SELECT * FROM ${quoteSqlIdentifier(firstTable)} LIMIT 10`);
+        }
+        scheduleDatabaseSnapshotSave();
+        return importedSheets > 0;
+    } catch (err) {
+        alert(`Failed to parse Excel file: ${err.message}`);
+        updateStatus('Excel import failed');
+        return false;
+    }
 }
 
 // Sanitize table name
@@ -2173,6 +2147,8 @@ function clearAllTables() {
         filterText: '',
         sortColumn: '',
         sortDirection: 'asc',
+        page: 1,
+        pageSize: DEFAULT_RESULT_PAGE_SIZE,
     };
     renderTables();
     const resultsContainer = document.getElementById('resultsContainer');
@@ -2260,6 +2236,8 @@ async function onExecuteClick() {
                 filterText: '',
                 sortColumn: '',
                 sortDirection: 'asc',
+                page: 1,
+                pageSize: DEFAULT_RESULT_PAGE_SIZE,
             };
             currentResults = {
                 columns: cols,
@@ -2330,8 +2308,16 @@ function renderResults(data) {
     const displayedRows = visible ? visible.rows : [];
     const displayedColumns = visible ? visible.columns : [];
     const totalRows = data.rows.length;
-    const renderedRows = displayedRows.slice(0, RESULT_RENDER_LIMIT);
-    const renderIsLimited = displayedRows.length > renderedRows.length;
+    const pageSize = RESULT_PAGE_SIZES.includes(resultViewState.pageSize)
+        ? resultViewState.pageSize
+        : DEFAULT_RESULT_PAGE_SIZE;
+    const totalPages = Math.max(1, Math.ceil(displayedRows.length / pageSize));
+    const page = Math.min(Math.max(1, resultViewState.page), totalPages);
+    resultViewState.page = page;
+    const rowStart = (page - 1) * pageSize;
+    const renderedRows = displayedRows.slice(rowStart, rowStart + pageSize);
+    const renderIsPaginated = displayedRows.length > pageSize;
+    const rowEnd = rowStart + renderedRows.length;
 
     if (!visible || displayedRows.length === 0) {
         window.clearVanillaGrid?.();
@@ -2359,7 +2345,7 @@ function renderResults(data) {
                 <strong>${displayedRows.length}</strong> / <strong>${totalRows}</strong> rows • 
                 <strong>${displayedColumns.length}</strong> columns • 
                 ${data.duration}
-                ${renderIsLimited ? `<br><span>Showing first ${renderedRows.length} rows for browser performance. Export uses the full filtered result.</span>` : ''}
+                ${renderIsPaginated ? `<br><span>Showing rows ${rowStart + 1}–${rowEnd}; exports use the full filtered result.</span>` : ''}
             </div>
             <div class="results-actions">
                 <button onclick="copyResultsToClipboard()">Copy Results</button>
@@ -2390,6 +2376,12 @@ function renderResults(data) {
                     <option value="desc" ${resultViewState.sortDirection === 'desc' ? 'selected' : ''}>Descending</option>
                 </select>
             </label>
+            <label>
+                Rows per page
+                <select id="resultPageSize" onchange="updateResultPageSize()">
+                    ${RESULT_PAGE_SIZES.map((size) => `<option value="${size}" ${pageSize === size ? 'selected' : ''}>${size}</option>`).join('')}
+                </select>
+            </label>
             <button onclick="clearResultViewFilters()">Reset View</button>
         </div>
         <div class="result-table-wrap">
@@ -2410,7 +2402,7 @@ function renderResults(data) {
             <tbody>
                 ${renderedRows.map((row, idx) => `
                     <tr onclick="this.classList.toggle('selected-row')">
-                        <td class="row-num-col">${idx + 1}</td>
+                        <td class="row-num-col">${rowStart + idx + 1}</td>
                         ${displayedColumns.map(col => {
                             const value = row[col];
                             return formatCell(value);
@@ -2420,6 +2412,13 @@ function renderResults(data) {
             </tbody>
         </table>
         </div>
+        ${renderIsPaginated ? `
+            <div class="result-pagination" aria-label="Result pages">
+                <button onclick="changeResultPage(-1)" ${page === 1 ? 'disabled' : ''}>Previous</button>
+                <span>Page ${page} of ${totalPages}</span>
+                <button onclick="changeResultPage(1)" ${page === totalPages ? 'disabled' : ''}>Next</button>
+            </div>
+        ` : ''}
     `;
 
     resultsContainer.innerHTML = tableHtml;
@@ -2643,15 +2642,17 @@ function updateResultViewState() {
     const selectionStart = keepFilterFocus && typeof filterInput?.selectionStart === 'number' ? filterInput.selectionStart : null;
     const selectionEnd = keepFilterFocus && typeof filterInput?.selectionEnd === 'number' ? filterInput.selectionEnd : null;
 
-    if (filterInput) {
-        resultViewState.filterText = filterInput.value;
+    const filterText = filterInput ? filterInput.value : resultViewState.filterText;
+    const sortColumn = sortSelect ? sortSelect.value : resultViewState.sortColumn;
+    const sortDirectionValue = sortDirection ? sortDirection.value : resultViewState.sortDirection;
+    if (filterText !== resultViewState.filterText ||
+        sortColumn !== resultViewState.sortColumn ||
+        sortDirectionValue !== resultViewState.sortDirection) {
+        resultViewState.page = 1;
     }
-    if (sortSelect) {
-        resultViewState.sortColumn = sortSelect.value;
-    }
-    if (sortDirection) {
-        resultViewState.sortDirection = sortDirection.value;
-    }
+    resultViewState.filterText = filterText;
+    resultViewState.sortColumn = sortColumn;
+    resultViewState.sortDirection = sortDirectionValue;
 
     if (currentResults) {
         renderResults(currentResults);
@@ -2671,6 +2672,7 @@ function clearResultViewFilters() {
     resultViewState.filterText = '';
     resultViewState.sortColumn = '';
     resultViewState.sortDirection = 'asc';
+    resultViewState.page = 1;
     if (currentResults) {
         renderResults(currentResults);
     }
@@ -2688,6 +2690,30 @@ function sortResultsBy(column) {
         resultViewState.sortDirection = 'asc';
     }
 
+    resultViewState.page = 1;
+
+    renderResults(currentResults);
+}
+
+function updateResultPageSize() {
+    const pageSize = Number(document.getElementById('resultPageSize')?.value);
+    if (!RESULT_PAGE_SIZES.includes(pageSize)) {
+        return;
+    }
+    resultViewState.pageSize = pageSize;
+    resultViewState.page = 1;
+    if (currentResults) {
+        renderResults(currentResults);
+    }
+}
+
+function changeResultPage(delta) {
+    if (!currentResults || !Number.isInteger(delta)) {
+        return;
+    }
+    const visible = getVisibleResults(currentResults);
+    const totalPages = Math.max(1, Math.ceil(visible.rows.length / resultViewState.pageSize));
+    resultViewState.page = Math.min(Math.max(1, resultViewState.page + delta), totalPages);
     renderResults(currentResults);
 }
 

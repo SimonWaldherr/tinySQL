@@ -102,3 +102,39 @@ func TestCollectLoadJobs_WithExplicitTable(t *testing.T) {
 		t.Fatal("expected error when -table used with multiple files")
 	}
 }
+
+func TestCollectLoadJobs_DeduplicatesFilesAndRejectsTableCollisions(t *testing.T) {
+	dir := t.TempDir()
+	usersCSV := filepath.Join(dir, "users.csv")
+	usersJSON := filepath.Join(dir, "users.json")
+	if err := os.WriteFile(usersCSV, []byte("id\n1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(usersJSON, []byte(`[{"id":2}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	jobs, err := collectLoadJobs([]string{usersCSV, usersCSV}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("expected duplicate input to be loaded once, got %d jobs", len(jobs))
+	}
+
+	if _, err := collectLoadJobs([]string{usersCSV, usersJSON}, ""); err == nil {
+		t.Fatal("expected an error for files that map to the same table name")
+	}
+}
+
+func TestNewRunnerCachesOnlyInteractiveQueries(t *testing.T) {
+	config := Config{CacheEnabled: true, CacheSize: defaultCacheSize}
+	if got := newRunner(config).queryCache; got != nil {
+		t.Fatal("one-shot runner should not allocate a query cache")
+	}
+
+	config.Interactive = true
+	if got := newRunner(config).queryCache; got == nil {
+		t.Fatal("interactive runner should allocate a query cache")
+	}
+}

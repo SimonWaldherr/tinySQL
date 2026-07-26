@@ -134,6 +134,22 @@ func TestLinesFunc_Filter(t *testing.T) {
 	}
 }
 
+func TestLinesFunc_LongLine(t *testing.T) {
+	setup(t)
+
+	longLine := strings.Repeat("x", 128*1024)
+	f := writeTempFile(t, longLine+"\n")
+	sql := fmt.Sprintf(`SELECT line FROM lines('%s')`, f)
+	rs := execQuery(t, sql)
+
+	if len(rs.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rs.Rows))
+	}
+	if got := rs.Rows[0]["line"]; got != longLine {
+		t.Fatalf("long line was truncated or rejected: got %d bytes, want %d", len(fmt.Sprint(got)), len(longLine))
+	}
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // csv_rows() tests
 // ─────────────────────────────────────────────────────────────────────────────
