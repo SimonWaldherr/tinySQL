@@ -45,9 +45,11 @@ make update-gh-pages
 make push-gh-pages
 ```
 
-`make update-gh-pages` builds the WASM artifacts, checks out the `gh-pages`
-branch into `.gh-pages-worktree`, copies the static demo files, and commits when
-anything changed. `make push-gh-pages` also pushes the branch.
+`make build-gh-pages-demo` reuses the WASM build when neither its Go inputs nor
+the Go WASM runtime changed, then validates the deployable assets. `make
+update-gh-pages` reuses a clean `gh-pages` worktree, copies only changed files,
+and commits only when generated content differs. It refuses to overwrite a
+dirty worktree. `make push-gh-pages` also pushes the branch.
 
 ## UI capabilities
 
@@ -63,7 +65,10 @@ anything changed. `make push-gh-pages` also pushes the branch.
 - geodata examples: point extraction, distance matrices, radius filters,
   bounding boxes, zone membership, routing graph nodes, route edges
 - search examples: `FTS_SEARCH`, `FTS_RANK`, `FTS_SNIPPET`, `BM25`,
-  `VEC_SEARCH`, `VEC_COSINE_SIMILARITY`, `RAG_CONTEXT_FROM`, hybrid retrieval
+  `VEC_SEARCH`, `VEC_COSINE_SIMILARITY`, `RAG_CONTEXT_FROM`, `RAG_SEARCH`,
+  `CONTAINS_ALL`/`CONTAINS_ANY`/`CONTAINS_SCORE`, and hybrid retrieval
+- recent vector/planning examples: `VEC_HAMMING_DISTANCE`, `VEC_CENTROID`,
+  `ANALYZE`, and `sys.statistics`
 - analytics examples: `PIVOT`, `RETURNING`, `EXPLAIN`, SQLite-compatible
   `PRAGMA`, views, materialized views, `sys.*` metadata
 - in-memory stored procedure demos via `CALL demo_table_summary()` and

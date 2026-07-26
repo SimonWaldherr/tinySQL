@@ -26,8 +26,8 @@ make build-all
 | `make build-all` | Build the CLI plus the common command demos into `bin/`. |
 | `make build-query-files-wasm` | Build the browser playground WASM artifacts. |
 | `make build-wasm-browser` / `make build-wasm-node` | Build the browser or Node WASM API bundles. |
-| `make build-gh-pages-demo` | Build the static files for the GitHub Pages demo. |
-| `make update-gh-pages` | Build the demo, refresh the `gh-pages` worktree, commit only if the generated demo changed. |
+| `make build-gh-pages-demo` | Incrementally build and validate the static files for the GitHub Pages demo. |
+| `make update-gh-pages` | Reuse a clean `gh-pages` worktree, sync only changed assets, and commit only if the generated demo changed. |
 | `make push-gh-pages` | Run `update-gh-pages` and push `gh-pages` (only that branch). |
 | `make test` / `make test-all` | Root tests plus the standalone query-file demo modules. |
 | `make test-unit` | Short unit tests. |

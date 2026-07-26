@@ -18,9 +18,11 @@ const SQL_KEYWORDS = [
     'PIVOT', 'RETURNING', 'EXPLAIN', 'PRAGMA',
     'ST_MAKEPOINT', 'ST_POINT', 'ST_X', 'ST_Y', 'ST_DISTANCE', 'ST_DWITHIN', 'ST_WITHIN_BBOX',
     'GEO_POINT', 'GEO_DISTANCE', 'GEO_WITHIN_BBOX', 'FTS_MATCH', 'FTS_RANK', 'FTS_SEARCH',
-    'FTS_SNIPPET', 'BM25', 'VEC_FROM_JSON', 'VEC_SEARCH', 'VEC_COSINE_SIMILARITY',
-    'VEC_DISTANCE', 'RAG_CONTEXT', 'RAG_CONTEXT_FROM', 'RAG_HYBRID_SCORE', 'RAG_RANK_SCORE',
-    'RECENCY_SCORE', 'HASH', 'URL_PARSE', 'YAML_GET', 'CALL', 'ROUND'
+    'FTS_SNIPPET', 'BM25', 'CONTAINS_ALL', 'CONTAINS_ANY', 'CONTAINS_SCORE',
+    'VEC_FROM_JSON', 'VEC_SEARCH', 'VEC_COSINE_SIMILARITY', 'VEC_BINARY_QUANTIZE',
+    'VEC_HAMMING_DISTANCE', 'VEC_CENTROID', 'VEC_DISTANCE',
+    'RAG_CONTEXT', 'RAG_CONTEXT_FROM', 'RAG_SEARCH', 'RAG_HYBRID_SCORE', 'RAG_RANK_SCORE',
+    'RECENCY_SCORE', 'HASH', 'URL_PARSE', 'YAML_GET', 'CALL', 'ANALYZE', 'ROUND'
 ];
 // Safe references to WASM-exported functions (set after init)
 let wasmApi = {
@@ -693,6 +695,10 @@ const DEMO_RAG_CHUNKS = [
 ];
 
 const DEMO_RELEASE_FEATURES = [
+    { area: 'Search/RAG', feature: 'RAG_SEARCH composed vector, keyword, and context retrieval', added: '2026-07-25', browser_demo: 'Direct RAG_SEARCH table function with reciprocal-rank fusion and neighbor expansion' },
+    { area: 'Search/RAG', feature: 'CONTAINS_ALL, CONTAINS_ANY, CONTAINS_SCORE literal text matching', added: '2026-07-24', browser_demo: 'Direct case-insensitive filter and ranking over imported text' },
+    { area: 'Vector math', feature: 'VEC_HAMMING_DISTANCE and VEC_CENTROID helpers', added: '2026-07-25', browser_demo: 'Direct browser-side binary-signature comparison and centroid calculation' },
+    { area: 'Query planning', feature: 'ANALYZE and sys.statistics planner metadata', added: '2026-07-15', browser_demo: 'Direct ANALYZE plus sys.statistics introspection' },
     { area: 'Geodata', feature: 'GeoJSON importer', added: '2026-07-08', browser_demo: 'Direct upload/import and ST_* SQL examples' },
     { area: 'Geodata', feature: 'KML ExtendedData, SchemaData, MultiGeometry, altitude', added: '2026-07-08', browser_demo: 'Direct .kml import' },
     { area: 'Geodata', feature: 'OSM XML nodes, ways, relations, refs, geometry', added: '2026-07-08', browser_demo: 'Direct .osm/.osm.xml import' },
@@ -729,6 +735,38 @@ const SHAREABLE_DEMOS = {
         tables: ['ai_docs'],
         autoRun: true,
         query: `-- Shareable RAG demo: full-text + vector score\nSELECT title, category,\n       FTS_RANK(content, 'vector OR search') AS text_rank,\n       VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[1.0, 0.0, 0.0]')) AS vector_similarity\nFROM ai_docs\nWHERE FTS_MATCH(content, 'vector OR search')\nORDER BY vector_similarity DESC`
+    },
+    ragsearch: {
+        title: 'Composed RAG search',
+        description: 'New: one table-valued function combines vector retrieval, keyword fusion, and neighboring context chunks.',
+        icon: '🧠',
+        tables: ['rag_chunks'],
+        autoRun: true,
+        query: `-- New: RAG_SEARCH composes vector + text retrieval + context expansion\nSELECT doc_id, chunk_index, chunk_text, _hit_rank, _context_offset, _context_rank\nFROM RAG_SEARCH('rag_chunks', 'embedding', VEC_FROM_JSON('[0.8, 0.6, 0.1]'), 2, '{\n    "text_column": "chunk_text",\n    "text_query": "vector search RAG",\n    "key_columns": ["doc_id", "chunk_index"],\n    "expand_before": 1,\n    "expand_after": 1,\n    "doc_id_column": "doc_id",\n    "chunk_index_column": "chunk_index"\n}')\nORDER BY _context_rank`
+    },
+    contains: {
+        title: 'Literal multi-term search',
+        description: 'New: case-insensitive CONTAINS_ALL, CONTAINS_ANY, and CONTAINS_SCORE for straightforward text filtering and ranking.',
+        icon: '🔎',
+        tables: ['ai_docs'],
+        autoRun: true,
+        query: `-- New: literal, case-insensitive multi-term matching (not LIKE wildcards)\nSELECT title, category,\n       CONTAINS_SCORE(content, 'vector', 'search', 'retrieval') AS matched_terms\nFROM ai_docs\nWHERE CONTAINS_ANY(content, 'vector', 'retrieval')\nORDER BY matched_terms DESC, title`
+    },
+    vectormath: {
+        title: 'Binary vectors and centroids',
+        description: 'New: compare compact binary signatures with Hamming distance and derive representative vectors with VEC_CENTROID.',
+        icon: '📐',
+        tables: ['ai_docs'],
+        autoRun: true,
+        query: `-- New: portable Hamming distance and centroid helpers\nSELECT title,\n       VEC_HAMMING_DISTANCE(VEC_BINARY_QUANTIZE(embedding), VEC_FROM_JSON('[1,0,0]')) AS hamming_distance,\n       VEC_CENTROID(embedding, VEC_FROM_JSON('[1,0,0]')) AS midpoint_vector\nFROM ai_docs\nORDER BY hamming_distance, title`
+    },
+    statistics: {
+        title: 'Planner statistics',
+        description: 'New: ANALYZE persists exact table statistics, visible through sys.statistics and used for index selection.',
+        icon: '📈',
+        tables: ['sales'],
+        autoRun: true,
+        query: `-- New: collect exact column statistics for the query planner\nANALYZE sales;\nSELECT column_name, row_count, distinct_count, null_count, min, max, is_stale\nFROM sys.statistics\nWHERE table_name = 'sales'\nORDER BY column_name`
     },
     ragcontext: {
         title: 'RAG context expansion',
@@ -871,7 +909,7 @@ function renderIntroPage() {
     if (!resultsContainer || decodeDemoHash()) {
         return;
     }
-    const starterDemoIDs = ['files', 'analytics', 'geo', 'rag', 'sqlfeatures', 'catalog', 'release', 'ragcontext'];
+    const starterDemoIDs = ['files', 'analytics', 'geo', 'rag', 'ragsearch', 'contains', 'vectormath', 'statistics', 'sqlfeatures', 'catalog', 'release', 'ragcontext'];
     const cards = starterDemoIDs.map((id) => [id, SHAREABLE_DEMOS[id]]).map(([id, demo]) => `
         <div class="intro-card">
             <h3>${demo.icon} ${escapeHtml(demo.title)}</h3>
@@ -909,7 +947,7 @@ function renderIntroPage() {
             </section>
             <section class="feature-strip">
                 <div class="feature-pill"><strong>Geodata-ready</strong>Distance, radius, bbox and routing-graph examples.</div>
-                <div class="feature-pill"><strong>AI-compatible</strong>Full-text, vector similarity, and optional RAG-style retrieval recipes.</div>
+                <div class="feature-pill"><strong>AI-compatible</strong>Full-text, vector similarity, and composed RAG_SEARCH retrieval recipes.</div>
                 <div class="feature-pill"><strong>Release-aware</strong>Recent tinySQL features are grouped into runnable recipes.</div>
                 <div class="feature-pill"><strong>Shareable</strong>Demo data and SQL travel in the URL hash.</div>
                 <div class="feature-pill"><strong>Exportable</strong>Copy or export query results as CSV, TSV, Markdown, JSON, XML.</div>
@@ -1267,7 +1305,7 @@ function inferDemoQueryGroup(text) {
     const label = String(text || '').toLowerCase();
     if (label.includes('recent') || label.includes('release') || label.includes('catalog') ||
         label.includes('pragma') || label.includes('explain') || label.includes('pivot') ||
-        label.includes('returning') || label.includes('view')) {
+        label.includes('returning') || label.includes('view') || label.includes('analyze')) {
         return 'recent';
     }
     if (label.includes('geo') || label.includes('bbox') || label.includes('node') ||
@@ -1312,6 +1350,10 @@ const DEMO_QUERY_REQUIREMENTS = {
     '🧩 Hybrid Retrieval': 'ai_docs',
     '🔗 RAG Context': 'rag_chunks',
     '✂️ FTS Snippet': 'ai_docs',
+    '🧠 RAG_SEARCH': 'rag_chunks',
+    '🔎 CONTAINS Search': 'ai_docs',
+    '📐 Vector Helpers': 'ai_docs',
+    '📈 ANALYZE Statistics': 'sales',
 };
 
 function demoQueryRequirements(item) {

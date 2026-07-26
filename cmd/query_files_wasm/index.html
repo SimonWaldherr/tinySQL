@@ -1705,6 +1705,18 @@
                 <div class="example-query" onclick="setQuery('-- FTS snippet and BM25-style score\nSELECT title,\n       FTS_SNIPPET(content, \'vector search\', \'<mark>\', \'</mark>\', \' ... \', 12) AS snippet,\n       BM25(content, \'vector search\') AS score\nFROM ai_docs\nWHERE FTS_MATCH(content, \'vector OR search\')\nORDER BY score DESC')">
                     ✂️ FTS Snippet
                 </div>
+                <div class="example-query" onclick="setQuery('-- New: RAG_SEARCH combines vector, text, and neighboring context\nSELECT doc_id, chunk_index, chunk_text, _hit_rank, _context_offset\nFROM RAG_SEARCH(\'rag_chunks\', \'embedding\', VEC_FROM_JSON(\'[0.8,0.6,0.1]\'), 2, \'{&quot;text_column&quot;:&quot;chunk_text&quot;,&quot;text_query&quot;:&quot;vector search RAG&quot;,&quot;key_columns&quot;:[&quot;doc_id&quot;,&quot;chunk_index&quot;],&quot;expand_before&quot;:1,&quot;expand_after&quot;:1,&quot;doc_id_column&quot;:&quot;doc_id&quot;,&quot;chunk_index_column&quot;:&quot;chunk_index&quot;}\')\nORDER BY _context_rank')">
+                    🧠 RAG_SEARCH
+                </div>
+                <div class="example-query" onclick="setQuery('-- New: literal multi-term search and ranking\nSELECT title, CONTAINS_SCORE(content, \'vector\', \'search\', \'retrieval\') AS matched_terms\nFROM ai_docs\nWHERE CONTAINS_ANY(content, \'vector\', \'retrieval\')\nORDER BY matched_terms DESC')">
+                    🔎 CONTAINS Search
+                </div>
+                <div class="example-query" onclick="setQuery('-- New: Hamming distance and vector centroids\nSELECT title,\n       VEC_HAMMING_DISTANCE(VEC_BINARY_QUANTIZE(embedding), VEC_FROM_JSON(\'[1,0,0]\')) AS hamming_distance,\n       VEC_CENTROID(embedding, VEC_FROM_JSON(\'[1,0,0]\')) AS midpoint_vector\nFROM ai_docs\nORDER BY hamming_distance')">
+                    📐 Vector Helpers
+                </div>
+                <div class="example-query" onclick="setQuery('-- New: planner statistics\nANALYZE sales;\nSELECT column_name, row_count, distinct_count, null_count, min, max, is_stale\nFROM sys.statistics\nWHERE table_name = \'sales\'\nORDER BY column_name')">
+                    📈 ANALYZE Statistics
+                </div>
                 <div class="example-query" onclick="setQuery('-- sys catalog: functions and procedures\nSELECT name, function_type, language\nFROM sys.functions\nWHERE name LIKE \'ST_%\' OR name LIKE \'RAG_%\' OR name IN (\'FTS_SEARCH\', \'VEC_SEARCH\')\nUNION ALL\nSELECT name, storage AS function_type, language\nFROM sys.procedures\nORDER BY name')">
                     🧭 sys Catalog
                 </div>
