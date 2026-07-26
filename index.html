@@ -3,7 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TinySQL Editor</title>
+    <title>tinySQL — Local SQL for Go, browser tools and embedded data</title>
+    <meta name="description" content="tinySQL is a pure-Go, local-first SQL engine for browser tools, Go applications, embedded systems and local data workflows.">
     <link rel="stylesheet" href="https://simonwaldherr.github.io/vanillagrid.js/vanillagrid.css">
     <link rel="stylesheet" href="https://simonwaldherr.github.io/vanillagrid.js/vg-pivot-d3.css">
     <style>
@@ -23,6 +24,19 @@
             color: #d4d4d4;
             overflow: hidden;
         }
+
+        body.landing-mode {
+            display: block;
+            height: auto;
+            min-height: 100vh;
+            overflow-x: hidden;
+            overflow-y: auto;
+            background: #17191f;
+        }
+
+        .landing-mode .main { display: none; }
+        .studio-mode .landing-page { display: none; }
+        .landing-mode .studio-only { display: none !important; }
 
         .hidden {
             display: none !important;
@@ -68,7 +82,8 @@
             flex: 0 0 auto;
         }
 
-        .topbar h1 {
+        .topbar h1,
+        .brand-link {
             font-size: 16px;
             font-weight: 600;
             color: #fff;
@@ -77,7 +92,12 @@
             gap: 8px;
         }
 
-        .topbar h1::before {
+        .brand-link {
+            text-decoration: none;
+        }
+
+        .topbar h1::before,
+        .brand-link::before {
             content: "▦";
             font-size: 20px;
         }
@@ -145,6 +165,151 @@
         }
 
         .utility-menu button:hover { background: #3e3e42; }
+
+        .landing-page {
+            min-height: calc(100vh - 55px);
+            padding: 0 22px 72px;
+        }
+
+        .landing-shell {
+            max-width: 1120px;
+            margin: 0 auto;
+        }
+
+        .landing-hero {
+            display: grid;
+            grid-template-columns: minmax(0, 1.1fr) minmax(270px, 0.7fr);
+            gap: 48px;
+            align-items: center;
+            min-height: 530px;
+            padding: 76px 0 52px;
+        }
+
+        .landing-eyebrow {
+            color: #9cdcfe;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0.1em;
+            margin-bottom: 18px;
+            text-transform: uppercase;
+        }
+
+        .landing-hero h1 {
+            color: #f8fafc;
+            font-size: clamp(46px, 6vw, 74px);
+            letter-spacing: -0.065em;
+            line-height: 0.98;
+            max-width: 720px;
+        }
+
+        .landing-hero h1 em {
+            background: linear-gradient(110deg, #9cdcfe, #9fa8ff 55%, #cc9cff);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+            font-style: normal;
+        }
+
+        .landing-lede {
+            color: #bac5d5;
+            font-size: 18px;
+            line-height: 1.65;
+            margin-top: 24px;
+            max-width: 680px;
+        }
+
+        .landing-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 30px;
+        }
+
+        .landing-actions a,
+        .landing-actions button {
+            border: 1px solid #465166;
+            border-radius: 5px;
+            color: #e7edf7;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            padding: 11px 15px;
+            text-decoration: none;
+        }
+
+        .landing-actions button {
+            background: #0e639c;
+            border-color: #1177bb;
+        }
+
+        .landing-actions a { background: transparent; }
+        .landing-actions button:hover { background: #1177bb; }
+        .landing-actions a:hover { background: #293244; }
+
+        .landing-panel {
+            background: linear-gradient(145deg, #232936, #1b1f28);
+            border: 1px solid #3d475a;
+            border-radius: 8px;
+            box-shadow: 0 22px 58px rgba(0, 0, 0, 0.28);
+            padding: 22px;
+        }
+
+        .landing-panel-title {
+            color: #f2f6fc;
+            font-size: 13px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        .landing-panel code {
+            color: #c7d7f0;
+            display: block;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 13px;
+            line-height: 1.75;
+            margin-top: 16px;
+            white-space: pre-wrap;
+        }
+
+        .landing-panel code span { color: #9cdcfe; }
+
+        .landing-panel-note {
+            border-top: 1px solid #3d475a;
+            color: #9ca7b8;
+            font-size: 12px;
+            line-height: 1.5;
+            margin-top: 18px;
+            padding-top: 15px;
+        }
+
+        .landing-use-cases {
+            border-top: 1px solid #303846;
+            display: grid;
+            gap: 14px;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            padding-top: 28px;
+        }
+
+        .landing-use-case {
+            background: #1d222c;
+            border: 1px solid #323b4b;
+            border-radius: 6px;
+            padding: 18px;
+        }
+
+        .landing-use-case strong {
+            color: #f4f7fb;
+            display: block;
+            font-size: 15px;
+            margin-bottom: 8px;
+        }
+
+        .landing-use-case p {
+            color: #aeb9c8;
+            font-size: 13px;
+            line-height: 1.55;
+        }
 
         .topbar button:focus-visible,
         .sidebar-header button:focus-visible,
@@ -1487,6 +1652,15 @@
         }
 
         @media (max-width: 900px) {
+            .landing-page { padding: 0 16px 44px; }
+            .landing-hero {
+                gap: 30px;
+                grid-template-columns: 1fr;
+                min-height: auto;
+                padding: 52px 0 38px;
+            }
+            .landing-use-cases { grid-template-columns: 1fr; }
+
             .topbar {
                 gap: 8px;
                 overflow-x: auto;
@@ -1584,6 +1758,12 @@
         }
 
         @media (max-width: 520px) {
+            .landing-hero h1 { font-size: 42px; }
+            .landing-lede { font-size: 16px; }
+            .landing-actions { display: grid; }
+            .landing-actions a,
+            .landing-actions button { text-align: center; }
+
             .topbar button {
                 padding: 6px 10px;
                 font-size: 12px;
@@ -1645,15 +1825,16 @@
         }
     </style>
 </head>
-<body>
-    <a class="skip-link" href="#queryEditor">Skip to query editor</a>
+<body class="landing-mode">
+    <a class="skip-link" href="#launchStudio">Skip to query studio</a>
     <!-- Top Bar -->
     <div class="topbar">
-        <h1>tinySQL <span class="topbar-tag">browser lab</span></h1>
-        <button onclick="showUploadDialog()" aria-label="Upload a data file">Add data</button>
-        <button class="topbar-secondary" onclick="loadShareableDemo('analytics')" aria-label="Load sample data">Try a sample</button>
+        <a class="brand-link" href="#top" onclick="showLanding(); return false;">tinySQL <span class="topbar-tag">browser lab</span></a>
+        <button id="launchStudio" class="landing-launch" onclick="openStudio()">Open browser studio</button>
+        <button class="studio-only" onclick="showUploadDialog()" aria-label="Upload a data file">Add data</button>
+        <button class="topbar-secondary studio-only" onclick="loadShareableDemo('analytics')" aria-label="Load sample data">Try a sample</button>
         <div class="spacer"></div>
-        <div class="topbar-menu">
+        <div class="topbar-menu studio-only">
             <button id="toolsTrigger" class="tools-trigger" onclick="toggleUtilityMenu()" aria-label="Open utility menu" aria-expanded="false" aria-controls="utilityMenu">Tools</button>
             <div id="utilityMenu" class="utility-menu hidden" role="menu">
                 <button role="menuitem" onclick="importClipboardData(); closeUtilityMenu()">Paste from clipboard</button>
@@ -1661,11 +1842,37 @@
                 <button role="menuitem" onclick="window.open('https://github.com/SimonWaldherr/tinySQL#sql-formatting', '_blank', 'noopener'); closeUtilityMenu()">Go API documentation</button>
             </div>
         </div>
-        <div class="status">
+        <div class="status studio-only">
             <div class="status-indicator"></div>
             <span id="statusText" role="status" aria-live="polite" aria-atomic="true">Ready</span>
         </div>
     </div>
+
+    <main id="landingPage" class="landing-page">
+        <div class="landing-shell">
+            <section id="top" class="landing-hero" aria-labelledby="landingTitle">
+                <div>
+                    <p class="landing-eyebrow">Pure Go · Local-first · SQL without the ceremony</p>
+                    <h1 id="landingTitle">One SQL core.<br><em>Wherever your data runs.</em></h1>
+                    <p class="landing-lede">tinySQL is a compact database engine for Go applications, browser-delivered tools, embedded systems and local data workflows — where heavyweight infrastructure does not fit.</p>
+                    <div class="landing-actions">
+                        <button onclick="openStudio()">Open browser studio →</button>
+                        <a href="https://github.com/SimonWaldherr/tinySQL" target="_blank" rel="noreferrer">Read the source ↗</a>
+                    </div>
+                </div>
+                <aside class="landing-panel" aria-label="tinySQL query example">
+                    <div class="landing-panel-title">Local query, no service required</div>
+                    <code><span>SELECT</span> region, SUM(revenue)<br><span>FROM</span> local_sales<br><span>GROUP BY</span> region<br><span>ORDER BY</span> SUM(revenue) <span>DESC</span>;</code>
+                    <p class="landing-panel-note">Run the same SQL inside a Go process, directly in the browser, or alongside a local file workflow.</p>
+                </aside>
+            </section>
+            <section class="landing-use-cases" aria-label="tinySQL use cases">
+                <article class="landing-use-case"><strong>Browser tools</strong><p>Import local files, query them with SQL and export the result — without a backend.</p></article>
+                <article class="landing-use-case"><strong>Go and embedded</strong><p>Keep storage and query logic close to the application with one compact, pure-Go core.</p></article>
+                <article class="landing-use-case"><strong>Local data work</strong><p>Use joins, geodata, full-text and vector helpers only when the workflow needs them.</p></article>
+            </section>
+        </div>
+    </main>
 
     <!-- Main Layout -->
     <div class="main">
