@@ -5,7 +5,7 @@ SHELL := /usr/bin/env bash
 .PHONY: build-all build-repl build-server build-demo build-cli build-debug build-catalog
 .PHONY: build-wasm-browser build-wasm-node build-studio build-tinysqlpage build-migrate
 .PHONY: build-query-files build-query-files-wasm build-fsql run-query-files-demo
-.PHONY: build-gh-pages-demo update-gh-pages push-gh-pages
+.PHONY: build-gh-pages-demo check-gh-pages-demo update-gh-pages push-gh-pages
 .PHONY: test-all test-unit test-integration test-jsonv2 coverage build-check verify verify-ci
 .PHONY: test-query-files test-query-files-wasm test-fsql
 .PHONY: run-wasm-browser run-wasm-node-demo deps update-deps tidy bench bench-engine bench-hotpaths script-lint docker-build info
@@ -134,35 +134,63 @@ build-query-files-wasm:
 	@echo "$(GREEN)Building query_files_wasm...$(NC)"
 	@$(QUERY_FILES_WASM_SCRIPT) --build-only
 
-## build-gh-pages-demo: Build the static WASM demo used by gh-pages
-build-gh-pages-demo: build-query-files-wasm
-	@echo "$(GREEN)✓ gh-pages demo artifacts built$(NC)"
+## build-gh-pages-demo: Build or reuse the static WASM demo used by gh-pages
+build-gh-pages-demo:
+	@echo "$(GREEN)Building gh-pages demo (incremental)...$(NC)"
+	@$(QUERY_FILES_WASM_SCRIPT) --if-needed --build-only
+	@$(MAKE) --no-print-directory check-gh-pages-demo
+	@echo "$(GREEN)✓ gh-pages demo artifacts ready$(NC)"
 
-## update-gh-pages: Build demo, check out gh-pages in a worktree, update and commit it
-update-gh-pages: build-gh-pages-demo
-	@echo "$(GREEN)Updating $(GH_PAGES_BRANCH) from $(QUERY_FILES_WASM_DIR)...$(NC)"
-	@if [ -e "$(GH_PAGES_WORKTREE)" ] && [ ! -f "$(GH_PAGES_WORKTREE)/.git" ] && [ ! -d "$(GH_PAGES_WORKTREE)/.git" ]; then \
-		echo "$(RED)$(GH_PAGES_WORKTREE) exists but is not a git worktree$(NC)"; \
-		exit 1; \
-	fi
-	@if [ -e "$(GH_PAGES_WORKTREE)" ]; then \
-		git worktree remove --force "$(GH_PAGES_WORKTREE)"; \
-	fi
-	@git worktree add "$(GH_PAGES_WORKTREE)" "$(GH_PAGES_BRANCH)"
+## check-gh-pages-demo: Validate the deployable static gh-pages assets
+check-gh-pages-demo:
 	@for file in $(GH_PAGES_DEMO_FILES); do \
-		if [ -f "$(QUERY_FILES_WASM_DIR)/$$file" ]; then \
-			cp "$(QUERY_FILES_WASM_DIR)/$$file" "$(GH_PAGES_WORKTREE)/$$file"; \
-		else \
-			rm -f "$(GH_PAGES_WORKTREE)/$$file"; \
+		if [ ! -s "$(QUERY_FILES_WASM_DIR)/$$file" ]; then \
+			echo "$(RED)missing or empty gh-pages asset: $$file$(NC)"; \
+			exit 1; \
 		fi; \
 	done
-	@touch "$(GH_PAGES_WORKTREE)/.nojekyll"
-	@cd "$(GH_PAGES_WORKTREE)" && git add -A .nojekyll $(GH_PAGES_DEMO_FILES) && \
-		if git diff --cached --quiet; then \
-			echo "$(YELLOW)$(GH_PAGES_BRANCH) already up to date$(NC)"; \
-		else \
-			git commit -m "$(GH_PAGES_COMMIT_MESSAGE)"; \
-		fi
+	@if command -v gzip >/dev/null 2>&1; then gzip -t "$(QUERY_FILES_WASM_DIR)/query_files.wasm.gz"; fi
+	@if command -v node >/dev/null 2>&1; then node --check "$(QUERY_FILES_WASM_DIR)/app.js"; else echo "$(YELLOW)node not installed; skipping JavaScript syntax check$(NC)"; fi
+	@if command -v xmllint >/dev/null 2>&1; then xmllint --html --noout "$(QUERY_FILES_WASM_DIR)/index.html"; else echo "$(YELLOW)xmllint not installed; skipping HTML validation$(NC)"; fi
+
+## update-gh-pages: Build demo, safely sync changed assets into gh-pages, and commit them
+update-gh-pages: build-gh-pages-demo
+	@set -e; \
+	worktree="$(GH_PAGES_WORKTREE)"; \
+	branch="$(GH_PAGES_BRANCH)"; \
+	echo "$(GREEN)Synchronizing $$branch from $(QUERY_FILES_WASM_DIR)...$(NC)"; \
+	if [ -e "$$worktree" ]; then \
+		if ! git -C "$$worktree" rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
+			echo "$(RED)$$worktree exists but is not a git worktree$(NC)"; exit 1; \
+		fi; \
+		if [ "$$(git -C "$$worktree" branch --show-current)" != "$$branch" ]; then \
+			echo "$(RED)$$worktree is not on branch $$branch$(NC)"; exit 1; \
+		fi; \
+		if [ -n "$$(git -C "$$worktree" status --porcelain)" ]; then \
+			echo "$(RED)$$worktree has uncommitted changes; refusing to overwrite them$(NC)"; exit 1; \
+		fi; \
+	else \
+		git worktree add "$$worktree" "$$branch"; \
+	fi; \
+	changed=0; \
+	for file in $(GH_PAGES_DEMO_FILES); do \
+		source="$(QUERY_FILES_WASM_DIR)/$$file"; destination="$$worktree/$$file"; \
+		if [ -f "$$source" ]; then \
+			if [ ! -f "$$destination" ] || ! cmp -s "$$source" "$$destination"; then cp "$$source" "$$destination"; changed=1; fi; \
+		elif [ -e "$$destination" ]; then \
+			rm -f "$$destination"; changed=1; \
+		fi; \
+	done; \
+	if [ ! -f "$$worktree/.nojekyll" ]; then touch "$$worktree/.nojekyll"; changed=1; fi; \
+	cd "$$worktree"; \
+	git add -A -- .nojekyll $(GH_PAGES_DEMO_FILES); \
+	if git diff --cached --quiet; then \
+		echo "$(YELLOW)$$branch already up to date$(NC)"; \
+	elif [ "$$changed" -eq 1 ]; then \
+		git commit -m "$(GH_PAGES_COMMIT_MESSAGE)"; \
+	else \
+		echo "$(YELLOW)No generated asset changes to commit$(NC)"; \
+	fi
 
 ## push-gh-pages: Update and push the gh-pages demo branch
 push-gh-pages: update-gh-pages

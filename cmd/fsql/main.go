@@ -83,13 +83,6 @@ func run(args []string) error {
 		return fmt.Errorf("initialise scope manager: %w", err)
 	}
 
-	// Build the scope resolver: if --mount is given it takes precedence,
-	// otherwise fall back to named mounts, then direct path resolution.
-	resolver := buildResolver(mgr, *mountFlag, *scopeFlag)
-
-	// Register FSQL table-valued functions with the tinySQL engine.
-	adapter.RegisterAll(resolver)
-
 	cmd := strings.ToLower(remaining[0])
 	cmdArgs := remaining[1:]
 
@@ -101,11 +94,12 @@ func run(args []string) error {
 	case "mounts":
 		return cmdMounts(mgr)
 	case "query":
-		return cmdQuery(cmdArgs, *outputFlag)
+		return cmdQuery(mgr, cmdArgs, *mountFlag, *scopeFlag, *outputFlag)
 	case "index":
 		return cmdIndex(cmdArgs)
 	default:
 		// Treat the first argument as a SQL query (shorthand)
+		adapter.RegisterAll(buildResolver(mgr, *mountFlag, *scopeFlag))
 		return executeQuery(remaining[0], *outputFlag)
 	}
 }
@@ -152,10 +146,14 @@ func cmdMounts(mgr *scope.Manager) error {
 	return w.Flush()
 }
 
-func cmdQuery(args []string, output string) error {
-	// Support: fsql query [--scope <name>] <sql>
+func cmdQuery(mgr *scope.Manager, args []string, mountPath, scopeName, output string) error {
+	// Query-specific flags allow the conventional `fsql query --scope logs ...`
+	// form while preserving support for flags placed before the subcommand.
 	qfs := flag.NewFlagSet("query", flag.ContinueOnError)
-	_ = qfs.String("scope", "", "Named scope") // already parsed at top level
+	qfs.SetOutput(os.Stderr)
+	queryMount := qfs.String("mount", mountPath, "Ad-hoc root path for this query")
+	queryScope := qfs.String("scope", scopeName, "Named scope for this query")
+	queryOutput := qfs.String("output", output, "Output format: table, csv, json")
 	if err := qfs.Parse(args); err != nil {
 		return err
 	}
@@ -163,7 +161,8 @@ func cmdQuery(args []string, output string) error {
 		return fmt.Errorf("usage: fsql query <sql>")
 	}
 	sql := strings.Join(qfs.Args(), " ")
-	return executeQuery(sql, output)
+	adapter.RegisterAll(buildResolver(mgr, *queryMount, *queryScope))
+	return executeQuery(sql, *queryOutput)
 }
 
 func cmdIndex(args []string) error {
@@ -207,13 +206,15 @@ func executeQuery(sql, output string) error {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func printResultSet(rs *tinysql.ResultSet, format string) error {
-	switch strings.ToLower(format) {
+	switch strings.ToLower(strings.TrimSpace(format)) {
 	case "json":
 		return printJSON(rs)
 	case "csv":
 		return printCSV(rs)
-	default:
+	case "table", "":
 		return printTable(rs)
+	default:
+		return fmt.Errorf("invalid output format %q (valid: table, csv, json)", format)
 	}
 }
 

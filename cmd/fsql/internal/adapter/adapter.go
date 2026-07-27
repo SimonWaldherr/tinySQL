@@ -85,20 +85,24 @@ func (f *filesFunc) Execute(ctx context.Context, args []any) (*tinysql.ResultSet
 		if !recursive && info.IsDir() && p != root {
 			return filepath.SkipDir
 		}
+		name := info.Name()
+		ext := strings.TrimPrefix(filepath.Ext(name), ".")
+		modTime := info.ModTime().Format(time.RFC3339)
+		isDir := info.IsDir()
 		r := tinysql.Row{
 			"path":     p,
-			"name":     info.Name(),
+			"name":     name,
 			"size":     info.Size(),
-			"ext":      strings.TrimPrefix(filepath.Ext(info.Name()), "."),
-			"mod_time": info.ModTime().Format(time.RFC3339),
-			"is_dir":   info.IsDir(),
+			"ext":      ext,
+			"mod_time": modTime,
+			"is_dir":   isDir,
 			// expose both qualified and unqualified names (lower-cased)
 			"files.path":     p,
-			"files.name":     info.Name(),
+			"files.name":     name,
 			"files.size":     info.Size(),
-			"files.ext":      strings.TrimPrefix(filepath.Ext(info.Name()), "."),
-			"files.mod_time": info.ModTime().Format(time.RFC3339),
-			"files.is_dir":   info.IsDir(),
+			"files.ext":      ext,
+			"files.mod_time": modTime,
+			"files.is_dir":   isDir,
 		}
 		rows = append(rows, r)
 		return nil
@@ -143,10 +147,13 @@ func (f *linesFunc) Execute(ctx context.Context, args []any) (*tinysql.ResultSet
 	cols := []string{"line_number", "line"}
 	var rows []tinysql.Row
 	scanner := bufio.NewScanner(fh)
+	// The Scanner default (64 KiB) is too small for exported JSON, stack traces,
+	// and other log lines this command is intended to query.
+	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
 	lineNum := 0
 	for scanner.Scan() {
 		if ctx.Err() != nil {
-			break
+			return nil, ctx.Err()
 		}
 		lineNum++
 		text := scanner.Text()
@@ -218,7 +225,7 @@ func (f *csvRowsFunc) Execute(ctx context.Context, args []any) (*tinysql.ResultS
 
 	for {
 		if ctx.Err() != nil {
-			break
+			return nil, ctx.Err()
 		}
 		record, err := reader.Read()
 		if err == io.EOF {
@@ -276,6 +283,9 @@ func (f *jsonRowsFunc) ValidateArgCount(n int) error {
 }
 
 func (f *jsonRowsFunc) Execute(ctx context.Context, args []any) (*tinysql.ResultSet, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	path, err := resolvePathArg(f.resolve, args[0])
 	if err != nil {
 		return nil, fmt.Errorf("json_rows(): %w", err)
@@ -294,6 +304,9 @@ func (f *jsonRowsFunc) Execute(ctx context.Context, args []any) (*tinysql.Result
 	var root any
 	if err := json.Unmarshal(data, &root); err != nil {
 		return nil, fmt.Errorf("json_rows(): parse %q: %w", path, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	// Navigate to the requested path

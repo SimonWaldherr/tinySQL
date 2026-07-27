@@ -48,17 +48,13 @@ type loadJob struct {
 }
 
 type Runner struct {
-	db         *tinysql.DB
-	tenant     string
-	config     Config
-	queryCache *tinysql.QueryCache
+	db             *tinysql.DB
+	tenant         string
+	config         Config
+	queryCache     *tinysql.QueryCache
+	loadedTables   map[string]string
+	loadedTablesMu sync.RWMutex
 }
-
-// Track loaded table names for interactive status.
-var (
-	tableNames    = make(map[string]string)
-	tableNamesMux sync.RWMutex
-)
 
 func main() {
 	config, err := parseFlags()
@@ -184,11 +180,15 @@ func parseDelimiterSpec(raw string) ([]rune, error) {
 
 func newRunner(config Config) *Runner {
 	r := &Runner{
-		db:     tinysql.NewDB(),
-		tenant: defaultTenant,
-		config: config,
+		db:           tinysql.NewDB(),
+		tenant:       defaultTenant,
+		config:       config,
+		loadedTables: make(map[string]string),
 	}
-	if config.CacheEnabled {
+	// A one-shot invocation executes exactly one query, so compiling into an
+	// LRU cache only adds allocation and locking overhead. The interactive
+	// shell, on the other hand, benefits when a query is run repeatedly.
+	if config.CacheEnabled && config.Interactive {
 		r.queryCache = tinysql.NewQueryCache(config.CacheSize)
 	}
 	return r
@@ -301,20 +301,40 @@ func (r *Runner) loadJobsParallel(jobs []loadJob) error {
 		workers = 1
 	}
 
-	jobCh := make(chan loadJob, len(jobs))
-	errCh := make(chan error, len(jobs))
+	jobCh := make(chan loadJob)
+	done := make(chan struct{})
+	var (
+		firstErr error
+		errOnce  sync.Once
+	)
+	recordErr := func(err error) {
+		errOnce.Do(func() {
+			firstErr = err
+			close(done)
+		})
+	}
 
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for job := range jobCh {
+			for {
+				var job loadJob
+				var ok bool
+				select {
+				case <-done:
+					return
+				case job, ok = <-jobCh:
+					if !ok {
+						return
+					}
+				}
 				start := time.Now()
 				err := r.loadFile(job.file, job.tableName)
 				if err != nil {
-					errCh <- fmt.Errorf("failed to load %s: %w", job.file, err)
-					continue
+					recordErr(fmt.Errorf("failed to load %s: %w", job.file, err))
+					return
 				}
 				if r.config.Verbose {
 					fmt.Fprintf(os.Stderr, "✓ Loaded %s in %v\n", job.file, time.Since(start))
@@ -323,20 +343,18 @@ func (r *Runner) loadJobsParallel(jobs []loadJob) error {
 		}()
 	}
 
+dispatch:
 	for _, job := range jobs {
-		jobCh <- job
+		select {
+		case <-done:
+			break dispatch
+		case jobCh <- job:
+		}
 	}
 	close(jobCh)
 
 	wg.Wait()
-	close(errCh)
-
-	for err := range errCh {
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	return firstErr
 }
 
 func collectLoadJobs(inputs []string, explicitTable string) ([]loadJob, error) {
@@ -357,17 +375,32 @@ func collectLoadJobs(inputs []string, explicitTable string) ([]loadJob, error) {
 		return nil, fmt.Errorf("no supported files found")
 	}
 
-	if explicitTable != "" && len(files) > 1 {
+	sort.Strings(files)
+	uniqueFiles := make([]string, 0, len(files))
+	seenFiles := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		file = filepath.Clean(file)
+		if _, seen := seenFiles[file]; seen {
+			continue
+		}
+		seenFiles[file] = struct{}{}
+		uniqueFiles = append(uniqueFiles, file)
+	}
+	if explicitTable != "" && len(uniqueFiles) > 1 {
 		return nil, fmt.Errorf("-table can only be used with a single input file")
 	}
 
-	sort.Strings(files)
-	jobs := make([]loadJob, 0, len(files))
-	for _, file := range files {
+	jobs := make([]loadJob, 0, len(uniqueFiles))
+	tableSources := make(map[string]string, len(uniqueFiles))
+	for _, file := range uniqueFiles {
 		tableName := explicitTable
 		if tableName == "" {
 			tableName = getTableNameFromFile(file)
 		}
+		if previous, exists := tableSources[tableName]; exists {
+			return nil, fmt.Errorf("files %s and %s both map to table %q; rename one input file", previous, file, tableName)
+		}
+		tableSources[tableName] = file
 		jobs = append(jobs, loadJob{file: file, tableName: tableName})
 	}
 	return jobs, nil
@@ -422,10 +455,6 @@ func isSupportedFile(path string) bool {
 }
 
 func (r *Runner) loadFile(filename, tableName string) error {
-	tableNamesMux.Lock()
-	tableNames[filename] = tableName
-	tableNamesMux.Unlock()
-
 	file, err := os.Open(filename)
 	if err != nil {
 		return err
@@ -484,6 +513,7 @@ func (r *Runner) loadFile(filename, tableName string) error {
 			}
 			fmt.Fprintf(os.Stderr, "  Imported %d rows, skipped %d rows\n", result.RowsInserted, result.RowsSkipped)
 		}
+		r.recordLoadedTable(filename, tableName)
 		return nil
 	}
 
@@ -513,7 +543,14 @@ func (r *Runner) loadFile(filename, tableName string) error {
 	if r.config.Verbose {
 		fmt.Fprintf(os.Stderr, "  Imported %d rows\n", result.RowsInserted)
 	}
+	r.recordLoadedTable(filename, tableName)
 	return nil
+}
+
+func (r *Runner) recordLoadedTable(filename, tableName string) {
+	r.loadedTablesMu.Lock()
+	r.loadedTables[filename] = tableName
+	r.loadedTablesMu.Unlock()
 }
 
 func runInteractiveMode(config Config) {
@@ -555,7 +592,7 @@ func runInteractiveMode(config Config) {
 			printHelp()
 			continue
 		case "tables", "show tables", ".tables":
-			showTables()
+			showTables(runner)
 			continue
 		case "stats", ".stats":
 			showStats(runner)
@@ -609,9 +646,9 @@ func (r *Runner) clearCache() {
 }
 
 func showStats(r *Runner) {
-	tableNamesMux.RLock()
-	tCount := len(tableNames)
-	tableNamesMux.RUnlock()
+	r.loadedTablesMu.RLock()
+	tCount := len(r.loadedTables)
+	r.loadedTablesMu.RUnlock()
 
 	cacheSize := 0
 	cacheMax := 0
@@ -632,17 +669,17 @@ func showStats(r *Runner) {
 	fmt.Println("╚════════════════════════════════════════════════════════════════╝")
 }
 
-func showTables() {
-	tableNamesMux.RLock()
-	defer tableNamesMux.RUnlock()
+func showTables(r *Runner) {
+	r.loadedTablesMu.RLock()
+	defer r.loadedTablesMu.RUnlock()
 
-	if len(tableNames) == 0 {
+	if len(r.loadedTables) == 0 {
 		fmt.Println("No tables loaded")
 		return
 	}
 
-	keys := make([]string, 0, len(tableNames))
-	for filename := range tableNames {
+	keys := make([]string, 0, len(r.loadedTables))
+	for filename := range r.loadedTables {
 		keys = append(keys, filename)
 	}
 	sort.Strings(keys)
@@ -651,7 +688,7 @@ func showTables() {
 	fmt.Println("║  Loaded Tables                                                 ║")
 	fmt.Println("╠════════════════════════════════════════════════════════════════╣")
 	for _, filename := range keys {
-		tableName := tableNames[filename]
+		tableName := r.loadedTables[filename]
 		fmt.Printf("║  %-30s → %-30s ║\n", filepath.Base(filename), tableName)
 	}
 	fmt.Println("╚════════════════════════════════════════════════════════════════╝")

@@ -6,6 +6,7 @@
 #   ./build.sh --serve    Build, then start a local HTTP server on port 8080
 #   ./build.sh --skip-build --serve
 #                         Serve existing artefacts without rebuilding
+#   ./build.sh --if-needed Build only when inputs or the Go WASM runtime changed
 #   ./build.sh --clean    Remove generated artefacts and exit
 #
 set -euo pipefail
@@ -15,6 +16,7 @@ cd "$SCRIPT_DIR"
 
 PORT="${PORT:-8080}"
 WASM_OUT="query_files.wasm"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." >/dev/null && pwd -P)"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 filesize() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null || echo 0; }
@@ -25,11 +27,13 @@ elapsed()  { echo "$(( $(date +%s) - $1 ))s"; }
 SERVE=false
 CLEAN=false
 SKIP_BUILD=false
+IF_NEEDED=false
 for arg in "$@"; do
     case "$arg" in
         --serve|-s)  SERVE=true ;;
         --build-only|-b) SERVE=false ;;
         --skip-build) SKIP_BUILD=true ;;
+        --if-needed) IF_NEEDED=true ;;
         --clean|-c)  CLEAN=true ;;
         --help|-h)
             sed -n '2,10s/^# //p' "$SCRIPT_DIR/build.sh"
@@ -40,6 +44,45 @@ for arg in "$@"; do
     esac
 done
 
+wasm_exec_source() {
+    local goroot_path
+    goroot_path="$(go env GOROOT)"
+    for candidate in \
+        "${goroot_path}/lib/wasm/wasm_exec.js" \
+        "${goroot_path}/misc/wasm/wasm_exec.js"; do
+        if [ -f "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+artifacts_are_current() {
+    [ -s "$WASM_OUT" ] && [ -s "wasm_exec.js" ] || return 1
+    if command -v gzip >/dev/null 2>&1 && [ ! -s "${WASM_OUT}.gz" ]; then
+        return 1
+    fi
+    if find "$REPO_ROOT" \
+        -path "$REPO_ROOT/.git" -prune -o \
+        -path "$REPO_ROOT/cmd" -prune -o \
+        -type f -name '*.go' -newer "$WASM_OUT" -print -quit | grep -q .; then
+        return 1
+    fi
+    for source in "$REPO_ROOT/go.mod" "$REPO_ROOT/go.sum"; do
+        [ "$source" -nt "$WASM_OUT" ] && return 1
+    done
+    if find "$SCRIPT_DIR" -maxdepth 1 -type f \
+        \( -name '*.go' -o -name 'go.mod' -o -name 'go.sum' -o -name 'build.sh' \) \
+        -newer "$WASM_OUT" -print -quit | grep -q .; then
+        return 1
+    fi
+    local runtime_source
+    runtime_source="$(wasm_exec_source)" || return 1
+    [ "$runtime_source" -nt "wasm_exec.js" ] && return 1
+    return 0
+}
+
 if $CLEAN; then
     echo "🧹 Cleaning generated files…"
     rm -f "$WASM_OUT" "${WASM_OUT}.gz" wasm_exec.js
@@ -48,15 +91,20 @@ if $CLEAN; then
 fi
 
 # ── pre-flight checks ───────────────────────────────────────────────────────
+if ! $SKIP_BUILD && ! command -v go >/dev/null 2>&1; then
+    echo "❌ Go toolchain not found. Install Go from https://go.dev/dl/"
+    exit 1
+fi
+
+if $IF_NEEDED && ! $SKIP_BUILD && artifacts_are_current; then
+    SKIP_BUILD=true
+    echo "♻️  WASM artifacts are current; skipping rebuild."
+fi
+
 if ! $SKIP_BUILD; then
     echo "🔨 Building TinySQL Query Files WASM…"
 else
     echo "⏭️  Skipping build; using existing WASM artefacts…"
-fi
-
-if ! $SKIP_BUILD && ! command -v go >/dev/null 2>&1; then
-    echo "❌ Go toolchain not found. Install Go from https://go.dev/dl/"
-    exit 1
 fi
 
 if ! $SKIP_BUILD; then
@@ -78,17 +126,8 @@ if ! $SKIP_BUILD; then
 
     # ── copy wasm_exec.js ────────────────────────────────────────────────────
     echo "📋 Copying wasm_exec.js…"
-    GOROOT_PATH="$(go env GOROOT)"
-    WASM_EXEC=""
-    for candidate in \
-        "${GOROOT_PATH}/lib/wasm/wasm_exec.js" \
-        "${GOROOT_PATH}/misc/wasm/wasm_exec.js"; do
-        if [ -f "$candidate" ]; then
-            WASM_EXEC="$candidate"
-            break
-        fi
-    done
-    if [ -z "$WASM_EXEC" ] || [ ! -f "$WASM_EXEC" ]; then
+    WASM_EXEC="$(wasm_exec_source || true)"
+    if [ -z "$WASM_EXEC" ]; then
         echo "❌ Could not find wasm_exec.js in Go installation (GOROOT=$(go env GOROOT))"
         exit 1
     fi

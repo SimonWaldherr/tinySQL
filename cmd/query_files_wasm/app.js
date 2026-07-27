@@ -5,7 +5,8 @@ let currentResults = null;
 const HISTORY_KEY = 'tinysql_query_history_v1';
 const DB_SNAPSHOT_KEY = 'tinysql_query_files_db_snapshot_v1';
 const EDITOR_STATE_KEY = 'tinysql_query_files_editor_v1';
-const RESULT_RENDER_LIMIT = 500;
+const DEFAULT_RESULT_PAGE_SIZE = 100;
+const RESULT_PAGE_SIZES = [50, 100, 250, 500];
 const DEMO_HASH_PREFIX = 'demo=';
 const SQL_KEYWORDS = [
     'SELECT', 'FROM', 'WHERE', 'JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'FULL JOIN', 'INNER JOIN', 'CROSS JOIN',
@@ -17,9 +18,11 @@ const SQL_KEYWORDS = [
     'PIVOT', 'RETURNING', 'EXPLAIN', 'PRAGMA',
     'ST_MAKEPOINT', 'ST_POINT', 'ST_X', 'ST_Y', 'ST_DISTANCE', 'ST_DWITHIN', 'ST_WITHIN_BBOX',
     'GEO_POINT', 'GEO_DISTANCE', 'GEO_WITHIN_BBOX', 'FTS_MATCH', 'FTS_RANK', 'FTS_SEARCH',
-    'FTS_SNIPPET', 'BM25', 'VEC_FROM_JSON', 'VEC_SEARCH', 'VEC_COSINE_SIMILARITY',
-    'VEC_DISTANCE', 'RAG_CONTEXT', 'RAG_CONTEXT_FROM', 'RAG_HYBRID_SCORE', 'RAG_RANK_SCORE',
-    'RECENCY_SCORE', 'HASH', 'URL_PARSE', 'YAML_GET', 'CALL', 'ROUND'
+    'FTS_SNIPPET', 'BM25', 'CONTAINS_ALL', 'CONTAINS_ANY', 'CONTAINS_SCORE',
+    'VEC_FROM_JSON', 'VEC_SEARCH', 'VEC_COSINE_SIMILARITY', 'VEC_BINARY_QUANTIZE',
+    'VEC_HAMMING_DISTANCE', 'VEC_CENTROID', 'VEC_DISTANCE',
+    'RAG_CONTEXT', 'RAG_CONTEXT_FROM', 'RAG_SEARCH', 'RAG_HYBRID_SCORE', 'RAG_RANK_SCORE',
+    'RECENCY_SCORE', 'HASH', 'URL_PARSE', 'YAML_GET', 'CALL', 'ANALYZE', 'ROUND'
 ];
 // Safe references to WASM-exported functions (set after init)
 let wasmApi = {
@@ -52,6 +55,8 @@ let resultViewState = {
     filterText: '',
     sortColumn: '',
     sortDirection: 'asc',
+    page: 1,
+    pageSize: DEFAULT_RESULT_PAGE_SIZE,
 };
 let editorSaveTimer = null;
 let snapshotSaveTimer = null;
@@ -690,6 +695,10 @@ const DEMO_RAG_CHUNKS = [
 ];
 
 const DEMO_RELEASE_FEATURES = [
+    { area: 'Search/RAG', feature: 'RAG_SEARCH composed vector, keyword, and context retrieval', added: '2026-07-25', browser_demo: 'Direct RAG_SEARCH table function with reciprocal-rank fusion and neighbor expansion' },
+    { area: 'Search/RAG', feature: 'CONTAINS_ALL, CONTAINS_ANY, CONTAINS_SCORE literal text matching', added: '2026-07-24', browser_demo: 'Direct case-insensitive filter and ranking over imported text' },
+    { area: 'Vector math', feature: 'VEC_HAMMING_DISTANCE and VEC_CENTROID helpers', added: '2026-07-25', browser_demo: 'Direct browser-side binary-signature comparison and centroid calculation' },
+    { area: 'Query planning', feature: 'ANALYZE and sys.statistics planner metadata', added: '2026-07-15', browser_demo: 'Direct ANALYZE plus sys.statistics introspection' },
     { area: 'Geodata', feature: 'GeoJSON importer', added: '2026-07-08', browser_demo: 'Direct upload/import and ST_* SQL examples' },
     { area: 'Geodata', feature: 'KML ExtendedData, SchemaData, MultiGeometry, altitude', added: '2026-07-08', browser_demo: 'Direct .kml import' },
     { area: 'Geodata', feature: 'OSM XML nodes, ways, relations, refs, geometry', added: '2026-07-08', browser_demo: 'Direct .osm/.osm.xml import' },
@@ -726,6 +735,38 @@ const SHAREABLE_DEMOS = {
         tables: ['ai_docs'],
         autoRun: true,
         query: `-- Shareable RAG demo: full-text + vector score\nSELECT title, category,\n       FTS_RANK(content, 'vector OR search') AS text_rank,\n       VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[1.0, 0.0, 0.0]')) AS vector_similarity\nFROM ai_docs\nWHERE FTS_MATCH(content, 'vector OR search')\nORDER BY vector_similarity DESC`
+    },
+    ragsearch: {
+        title: 'Composed RAG search',
+        description: 'New: one table-valued function combines vector retrieval, keyword fusion, and neighboring context chunks.',
+        icon: '🧠',
+        tables: ['rag_chunks'],
+        autoRun: true,
+        query: `-- New: RAG_SEARCH composes vector + text retrieval + context expansion\nSELECT doc_id, chunk_index, chunk_text, _hit_rank, _context_offset, _context_rank\nFROM RAG_SEARCH('rag_chunks', 'embedding', VEC_FROM_JSON('[0.8, 0.6, 0.1]'), 2, '{\n    "text_column": "chunk_text",\n    "text_query": "vector search RAG",\n    "key_columns": ["doc_id", "chunk_index"],\n    "expand_before": 1,\n    "expand_after": 1,\n    "doc_id_column": "doc_id",\n    "chunk_index_column": "chunk_index"\n}')\nORDER BY _context_rank`
+    },
+    contains: {
+        title: 'Literal multi-term search',
+        description: 'New: case-insensitive CONTAINS_ALL, CONTAINS_ANY, and CONTAINS_SCORE for straightforward text filtering and ranking.',
+        icon: '🔎',
+        tables: ['ai_docs'],
+        autoRun: true,
+        query: `-- New: literal, case-insensitive multi-term matching (not LIKE wildcards)\nSELECT title, category,\n       CONTAINS_SCORE(content, 'vector', 'search', 'retrieval') AS matched_terms\nFROM ai_docs\nWHERE CONTAINS_ANY(content, 'vector', 'retrieval')\nORDER BY matched_terms DESC, title`
+    },
+    vectormath: {
+        title: 'Binary vectors and centroids',
+        description: 'New: compare compact binary signatures with Hamming distance and derive representative vectors with VEC_CENTROID.',
+        icon: '📐',
+        tables: ['ai_docs'],
+        autoRun: true,
+        query: `-- New: portable Hamming distance and centroid helpers\nSELECT title,\n       VEC_HAMMING_DISTANCE(VEC_BINARY_QUANTIZE(embedding), VEC_FROM_JSON('[1,0,0]')) AS hamming_distance,\n       VEC_CENTROID(embedding, VEC_FROM_JSON('[1,0,0]')) AS midpoint_vector\nFROM ai_docs\nORDER BY hamming_distance, title`
+    },
+    statistics: {
+        title: 'Planner statistics',
+        description: 'New: ANALYZE persists exact table statistics, visible through sys.statistics and used for index selection.',
+        icon: '📈',
+        tables: ['sales'],
+        autoRun: true,
+        query: `-- New: collect exact column statistics for the query planner\nANALYZE sales;\nSELECT column_name, row_count, distinct_count, null_count, min, max, is_stale\nFROM sys.statistics\nWHERE table_name = 'sales'\nORDER BY column_name`
     },
     ragcontext: {
         title: 'RAG context expansion',
@@ -868,7 +909,7 @@ function renderIntroPage() {
     if (!resultsContainer || decodeDemoHash()) {
         return;
     }
-    const starterDemoIDs = ['files', 'analytics', 'geo', 'rag', 'sqlfeatures', 'catalog', 'release', 'ragcontext'];
+    const starterDemoIDs = ['analytics', 'geo'];
     const cards = starterDemoIDs.map((id) => [id, SHAREABLE_DEMOS[id]]).map(([id, demo]) => `
         <div class="intro-card">
             <h3>${demo.icon} ${escapeHtml(demo.title)}</h3>
@@ -886,34 +927,71 @@ function renderIntroPage() {
             <section class="intro-hero">
                 <div>
                     <div class="intro-kicker">tinySQL WebAssembly playground</div>
-                    <h2>Explore your data locally — files, analytics, maps, and AI-ready search.</h2>
+                    <h2>Run SQL on local files, without sending them anywhere.</h2>
                     <p class="intro-copy">
-                        Start with a file, a reporting workflow, or geodata. tinySQL runs as a static WASM app:
-                        no account, no backend, and your local snapshot stays in this browser.
+                        Add a file, write a query, and inspect the result. Everything runs in this browser — no account or backend required.
                     </p>
                     <div class="intro-actions">
-                        <button onclick="showUploadDialog()">Upload a file</button>
-                        <button onclick="loadShareableDemo('analytics')">Explore analytics</button>
-                        <button onclick="loadShareableDemo('geo')">Open geodata lab</button>
-                        <button class="secondary" onclick="loadShareableDemo('rag')">Try AI search</button>
+                        <button onclick="showUploadDialog()">Add a file</button>
+                        <button class="secondary" onclick="loadShareableDemo('analytics')">Try sample data</button>
                     </div>
                 </div>
                 <div class="intro-metrics">
-                    <div class="intro-metric"><strong>Local-first</strong><span>No backend, no account, snapshot stays in the browser.</span></div>
-                    <div class="intro-metric"><strong>Typed imports</strong><span>CSV, JSON, YAML, XML, Excel, GeoJSON, KML, OSM, routing graph.</span></div>
-                    <div class="intro-metric"><strong>SQL-rich</strong><span>CTEs, views, PIVOT, windows, geospatial functions, FTS, vector search.</span></div>
+                    <div class="intro-metric"><strong>1. Add data</strong><span>CSV, JSON, Excel, GeoJSON and more.</span></div>
+                    <div class="intro-metric"><strong>2. Write SQL</strong><span>Autocomplete and formatting are built in.</span></div>
+                    <div class="intro-metric"><strong>3. Export results</strong><span>Copy or download the result in common formats.</span></div>
                 </div>
             </section>
             <section class="feature-strip">
-                <div class="feature-pill"><strong>Geodata-ready</strong>Distance, radius, bbox and routing-graph examples.</div>
-                <div class="feature-pill"><strong>AI-compatible</strong>Full-text, vector similarity, and optional RAG-style retrieval recipes.</div>
-                <div class="feature-pill"><strong>Release-aware</strong>Recent tinySQL features are grouped into runnable recipes.</div>
-                <div class="feature-pill"><strong>Shareable</strong>Demo data and SQL travel in the URL hash.</div>
-                <div class="feature-pill"><strong>Exportable</strong>Copy or export query results as CSV, TSV, Markdown, JSON, XML.</div>
+                <div class="feature-pill"><strong>Files</strong>Typed local imports for everyday data work.</div>
+                <div class="feature-pill"><strong>Maps</strong>Distance, radius and routing-graph SQL.</div>
+                <div class="feature-pill"><strong>SQL features</strong>Views, PIVOT, windows and export-ready results.</div>
             </section>
             <section class="intro-grid">${cards}</section>
+            <p class="intro-note">More examples appear in the data panel after loading a sample. Shareable links preserve both the query and its demo data.</p>
         </div>
     `;
+}
+
+function closeUtilityMenu() {
+    const menu = document.getElementById('utilityMenu');
+    const trigger = document.getElementById('toolsTrigger');
+    menu?.classList.add('hidden');
+    trigger?.setAttribute('aria-expanded', 'false');
+}
+
+function toggleUtilityMenu() {
+    const menu = document.getElementById('utilityMenu');
+    const trigger = document.getElementById('toolsTrigger');
+    if (!menu || !trigger) return;
+    const isOpening = menu.classList.contains('hidden');
+    menu.classList.toggle('hidden', !isOpening);
+    trigger.setAttribute('aria-expanded', String(isOpening));
+}
+
+function toggleDemoQueries() {
+    const content = document.getElementById('demoQueryContent');
+    const trigger = document.getElementById('demoQueriesToggle');
+    if (!content || !trigger) return;
+    const isOpening = content.classList.contains('hidden');
+    content.classList.toggle('hidden', !isOpening);
+    trigger.setAttribute('aria-expanded', String(isOpening));
+}
+
+function closeResultsExportMenu() {
+    const menu = document.getElementById('resultsExportMenu');
+    const trigger = document.getElementById('resultsExportTrigger');
+    menu?.classList.add('hidden');
+    trigger?.setAttribute('aria-expanded', 'false');
+}
+
+function toggleResultsExportMenu() {
+    const menu = document.getElementById('resultsExportMenu');
+    const trigger = document.getElementById('resultsExportTrigger');
+    if (!menu || !trigger) return;
+    const isOpening = menu.classList.contains('hidden');
+    menu.classList.toggle('hidden', !isOpening);
+    trigger.setAttribute('aria-expanded', String(isOpening));
 }
 
 const DEMO_TABLES = {
@@ -1184,6 +1262,21 @@ document.addEventListener('DOMContentLoaded', () => {
     setupSqlAutocomplete();
     renderIntroPage();
     initWasm();
+
+    document.addEventListener('click', (event) => {
+        if (!event.target.closest('.topbar-menu')) {
+            closeUtilityMenu();
+        }
+        if (!event.target.closest('.results-export')) {
+            closeResultsExportMenu();
+        }
+    });
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+            closeUtilityMenu();
+            closeResultsExportMenu();
+        }
+    });
     
     // Setup demo buttons
     const loadAllDemosBtn = document.getElementById('loadAllDemosBtn');
@@ -1264,7 +1357,7 @@ function inferDemoQueryGroup(text) {
     const label = String(text || '').toLowerCase();
     if (label.includes('recent') || label.includes('release') || label.includes('catalog') ||
         label.includes('pragma') || label.includes('explain') || label.includes('pivot') ||
-        label.includes('returning') || label.includes('view')) {
+        label.includes('returning') || label.includes('view') || label.includes('analyze')) {
         return 'recent';
     }
     if (label.includes('geo') || label.includes('bbox') || label.includes('node') ||
@@ -1309,6 +1402,10 @@ const DEMO_QUERY_REQUIREMENTS = {
     '🧩 Hybrid Retrieval': 'ai_docs',
     '🔗 RAG Context': 'rag_chunks',
     '✂️ FTS Snippet': 'ai_docs',
+    '🧠 RAG_SEARCH': 'rag_chunks',
+    '🔎 CONTAINS Search': 'ai_docs',
+    '📐 Vector Helpers': 'ai_docs',
+    '📈 ANALYZE Statistics': 'sales',
 };
 
 function demoQueryRequirements(item) {
@@ -1424,7 +1521,7 @@ function syncEditorHighlight() {
 function renderSqlHighlight(text) {
     const raw = String(text || '');
     if (!raw) {
-        return '<span class="sql-token muted">Type SQL to see highlighting</span>';
+        return '';
     }
 
     let html = '';
@@ -1708,178 +1805,149 @@ async function handleFiles(files) {
         return;
     }
     
+    let imported = 0;
     for (const file of files) {
-        await importSingleFile(file);
+        if (await importSingleFile(file)) {
+            imported += 1;
+        }
+    }
+    if (files.length > 1) {
+        updateStatus(`Imported ${imported} of ${files.length} file(s)`);
     }
 }
 
-// Import a single file
+function readFile(file, method) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error(`Failed to read file: ${file.name}`));
+        reader[method](file);
+    });
+}
+
+// Import a single file. Awaiting file reads keeps multi-file imports ordered
+// and avoids racing status/table updates.
 async function importSingleFile(file) {
     const fileName = file.name.toLowerCase();
-    
-    // Check if it's an Excel file
     if (fileName.endsWith('.xlsx') || fileName.endsWith('.xls')) {
-        return await importExcelFile(file);
+        return importExcelFile(file);
     }
-    
-    const reader = new FileReader();
-    
-    reader.onload = async (e) => {
-        const content = e.target.result;
+
+    try {
+        const content = await readFile(file, 'readAsText');
         const tableName = sanitizeTableName(file.name);
-        
         updateStatus(`Importing ${file.name}...`);
-        
-        try {
-            // Check if WASM functions are available
-            if (typeof wasmApi.importFile !== 'function') {
-                throw new Error('WASM importFile function not available. Make sure WASM is initialized.');
-            }
-            
-            console.log('Calling WASM importFile with:', file.name, tableName);
-            const result = wasmApi.importFile(file.name, content, tableName);
-            console.log('WASM importFile result:', result);
-            
-            if (!result) {
-                throw new Error('WASM importFile returned undefined/null');
-            }
-            
-            if (typeof result !== 'object') {
-                throw new Error(`WASM importFile returned invalid type: ${typeof result}`);
-            }
-            
-            if (result.success) {
-                // Add table to current tables
-                const tableInfo = {
-                    name: tableName,
-                    rowCount: result.rowsImported,
-                    columns: Array.isArray(result.columns) ? result.columns.map(c => String(c)) : []
-                };
-                
-                // Update or add table
-                const existingIndex = currentTables.findIndex(t => t.name === tableName);
-                if (existingIndex >= 0) {
-                    currentTables[existingIndex] = tableInfo;
-                } else {
-                    currentTables.push(tableInfo);
-                }
-                
-                renderTables();
-                if (isRoutingGraphFile(file.name)) {
-                    loadTables();
-                }
-                
-                let message = `Imported ${result.rowsImported} rows into "${tableName}"`;
-                if (result.rowsSkipped > 0) {
-                    message += ` (${result.rowsSkipped} skipped)`;
-                }
-                updateStatus(message);
 
-                // Prefill query editor with a working example for this table
-                const editor = document.getElementById('queryEditor');
-                const defaultQuery = `SELECT * FROM ${tableName} LIMIT 10`;
-                if (!editor.value || /SELECT \* FROM (mytable|table1|table2)/i.test(editor.value)) {
-                    editor.value = defaultQuery;
-                    syncEditorHighlight();
-                    saveEditorState();
-                }
-
-                // Ensure Execute is enabled
-                const executeBtn = document.getElementById('executeBtn');
-                if (executeBtn) executeBtn.disabled = false;
-                scheduleDatabaseSnapshotSave();
-            } else {
-                alert(`Import failed: ${result.error || 'Unknown error'}`);
-                updateStatus('Import failed');
-                console.error('Import failed:', result);
-            }
-        } catch (err) {
-            alert(`Import error: ${err.message}`);
-            updateStatus('Import failed');
+        if (typeof wasmApi.importFile !== 'function') {
+            throw new Error('WASM importFile function not available. Make sure WASM is initialized.');
         }
-    };
-    
-    reader.onerror = () => {
-        alert(`Failed to read file: ${file.name}`);
-    };
-    
-    reader.readAsText(file);
+
+        const result = wasmApi.importFile(file.name, content, tableName);
+        if (!result || typeof result !== 'object') {
+            throw new Error('WASM importFile returned an invalid result');
+        }
+        if (!result.success) {
+            throw new Error(result.error || 'Unknown import error');
+        }
+
+        const tableInfo = {
+            name: tableName,
+            rowCount: result.rowsImported,
+            columns: Array.isArray(result.columns) ? result.columns.map(c => String(c)) : []
+        };
+        const existingIndex = currentTables.findIndex(t => t.name === tableName);
+        if (existingIndex >= 0) {
+            currentTables[existingIndex] = tableInfo;
+        } else {
+            currentTables.push(tableInfo);
+        }
+
+        renderTables();
+        if (isRoutingGraphFile(file.name)) {
+            loadTables();
+        }
+
+        let message = `Imported ${result.rowsImported} rows into "${tableName}"`;
+        if (result.rowsSkipped > 0) {
+            message += ` (${result.rowsSkipped} skipped)`;
+        }
+        updateStatus(message);
+
+        const editor = document.getElementById('queryEditor');
+        const defaultQuery = `SELECT * FROM ${tableName} LIMIT 10`;
+        if (!editor.value || /SELECT \* FROM (mytable|table1|table2)/i.test(editor.value)) {
+            editor.value = defaultQuery;
+            syncEditorHighlight();
+            saveEditorState();
+        }
+
+        const executeBtn = document.getElementById('executeBtn');
+        if (executeBtn) executeBtn.disabled = false;
+        scheduleDatabaseSnapshotSave();
+        return true;
+    } catch (err) {
+        alert(`Import error: ${err.message}`);
+        updateStatus('Import failed');
+        console.error('Import failed:', err);
+        return false;
+    }
 }
 
 // Import Excel file using SheetJS
 async function importExcelFile(file) {
     if (typeof XLSX === 'undefined') {
         alert('Excel support library not loaded. Please refresh the page.');
-        return;
+        return false;
     }
 
     updateStatus(`Reading Excel file: ${file.name}...`);
 
-    const reader = new FileReader();
-    
-    reader.onload = async (e) => {
-        try {
-            const data = new Uint8Array(e.target.result);
-            const workbook = XLSX.read(data, { type: 'array' });
-            
-            // Import each sheet as a separate table
-            for (const sheetName of workbook.SheetNames) {
-                const worksheet = workbook.Sheets[sheetName];
-                const jsonData = XLSX.utils.sheet_to_json(worksheet);
-                
-                if (jsonData.length === 0) {
-                    console.log(`Sheet "${sheetName}" is empty, skipping`);
-                    continue;
-                }
-                
-                const tableName = sanitizeTableName(sheetName);
-                const jsonContent = JSON.stringify(jsonData);
-                
-                updateStatus(`Importing sheet: ${sheetName}...`);
-                
-                const result = wasmApi.importFile(`${sheetName}.json`, jsonContent, tableName);
-                
-                if (result && result.success) {
-                    const tableInfo = {
-                        name: tableName,
-                        rowCount: result.rowsImported,
-                        columns: Array.isArray(result.columns) ? result.columns.map(c => String(c)) : []
-                    };
-                    
-                    const existingIndex = currentTables.findIndex(t => t.name === tableName);
-                    if (existingIndex >= 0) {
-                        currentTables[existingIndex] = tableInfo;
-                    } else {
-                        currentTables.push(tableInfo);
-                    }
-                }
+    try {
+        const data = new Uint8Array(await readFile(file, 'readAsArrayBuffer'));
+        const workbook = XLSX.read(data, { type: 'array' });
+        let importedSheets = 0;
+
+        for (const sheetName of workbook.SheetNames) {
+            const worksheet = workbook.Sheets[sheetName];
+            const jsonData = XLSX.utils.sheet_to_json(worksheet);
+            if (jsonData.length === 0) {
+                continue;
             }
-            
-            renderTables();
-            updateStatus(`Excel file imported: ${workbook.SheetNames.length} sheet(s)`);
-            
-            // Enable execute button
-            document.getElementById('executeBtn').disabled = false;
-            
-            // Set example query for first table
-            if (currentTables.length > 0) {
-                const firstTable = currentTables[0].name;
-                document.getElementById('queryEditor').value = `SELECT * FROM ${firstTable} LIMIT 10`;
-                syncEditorHighlight();
-                saveEditorState();
+
+            const tableName = sanitizeTableName(sheetName);
+            updateStatus(`Importing sheet: ${sheetName}...`);
+            const result = wasmApi.importFile(`${sheetName}.json`, JSON.stringify(jsonData), tableName);
+            if (!result?.success) {
+                console.error(`Failed to import sheet "${sheetName}":`, result?.error || 'unknown error');
+                continue;
             }
-            scheduleDatabaseSnapshotSave();
-        } catch (err) {
-            alert(`Failed to parse Excel file: ${err.message}`);
-            updateStatus('Excel import failed');
+
+            const tableInfo = {
+                name: tableName,
+                rowCount: result.rowsImported,
+                columns: Array.isArray(result.columns) ? result.columns.map(c => String(c)) : []
+            };
+            const existingIndex = currentTables.findIndex(t => t.name === tableName);
+            if (existingIndex >= 0) currentTables[existingIndex] = tableInfo;
+            else currentTables.push(tableInfo);
+            importedSheets += 1;
         }
-    };
-    
-    reader.onerror = () => {
-        alert(`Failed to read Excel file: ${file.name}`);
-    };
-    
-    reader.readAsArrayBuffer(file);
+
+        renderTables();
+        updateStatus(`Excel file imported: ${importedSheets} sheet(s)`);
+        const executeBtn = document.getElementById('executeBtn');
+        if (executeBtn) executeBtn.disabled = false;
+        if (currentTables.length > 0) {
+            const firstTable = currentTables[0].name;
+            setQuery(`SELECT * FROM ${quoteSqlIdentifier(firstTable)} LIMIT 10`);
+        }
+        scheduleDatabaseSnapshotSave();
+        return importedSheets > 0;
+    } catch (err) {
+        alert(`Failed to parse Excel file: ${err.message}`);
+        updateStatus('Excel import failed');
+        return false;
+    }
 }
 
 // Sanitize table name
@@ -2173,6 +2241,8 @@ function clearAllTables() {
         filterText: '',
         sortColumn: '',
         sortDirection: 'asc',
+        page: 1,
+        pageSize: DEFAULT_RESULT_PAGE_SIZE,
     };
     renderTables();
     const resultsContainer = document.getElementById('resultsContainer');
@@ -2260,6 +2330,8 @@ async function onExecuteClick() {
                 filterText: '',
                 sortColumn: '',
                 sortDirection: 'asc',
+                page: 1,
+                pageSize: DEFAULT_RESULT_PAGE_SIZE,
             };
             currentResults = {
                 columns: cols,
@@ -2330,8 +2402,16 @@ function renderResults(data) {
     const displayedRows = visible ? visible.rows : [];
     const displayedColumns = visible ? visible.columns : [];
     const totalRows = data.rows.length;
-    const renderedRows = displayedRows.slice(0, RESULT_RENDER_LIMIT);
-    const renderIsLimited = displayedRows.length > renderedRows.length;
+    const pageSize = RESULT_PAGE_SIZES.includes(resultViewState.pageSize)
+        ? resultViewState.pageSize
+        : DEFAULT_RESULT_PAGE_SIZE;
+    const totalPages = Math.max(1, Math.ceil(displayedRows.length / pageSize));
+    const page = Math.min(Math.max(1, resultViewState.page), totalPages);
+    resultViewState.page = page;
+    const rowStart = (page - 1) * pageSize;
+    const renderedRows = displayedRows.slice(rowStart, rowStart + pageSize);
+    const renderIsPaginated = displayedRows.length > pageSize;
+    const rowEnd = rowStart + renderedRows.length;
 
     if (!visible || displayedRows.length === 0) {
         window.clearVanillaGrid?.();
@@ -2359,16 +2439,21 @@ function renderResults(data) {
                 <strong>${displayedRows.length}</strong> / <strong>${totalRows}</strong> rows • 
                 <strong>${displayedColumns.length}</strong> columns • 
                 ${data.duration}
-                ${renderIsLimited ? `<br><span>Showing first ${renderedRows.length} rows for browser performance. Export uses the full filtered result.</span>` : ''}
+                ${renderIsPaginated ? `<br><span>Showing rows ${rowStart + 1}–${rowEnd}; exports use the full filtered result.</span>` : ''}
             </div>
             <div class="results-actions">
                 <button onclick="copyResultsToClipboard()">Copy Results</button>
                 <button id="openVanillaGridBtn" onclick="openInVanillaGrid()" disabled>Open in VanillaGrid</button>
-                <button onclick="doExport('csv')">Export CSV</button>
-                <button onclick="doExport('tsv')">Export TSV</button>
-                <button onclick="doExport('md')">Export Markdown</button>
-                <button onclick="doExport('json')">Export JSON</button>
-                <button onclick="doExport('xml')">Export XML</button>
+                <div class="results-export">
+                    <button id="resultsExportTrigger" onclick="toggleResultsExportMenu()" aria-expanded="false" aria-controls="resultsExportMenu">Export</button>
+                    <div id="resultsExportMenu" class="results-export-menu hidden" role="menu" aria-label="Export result">
+                        <button role="menuitem" onclick="doExport('csv'); closeResultsExportMenu()">CSV</button>
+                        <button role="menuitem" onclick="doExport('tsv'); closeResultsExportMenu()">TSV</button>
+                        <button role="menuitem" onclick="doExport('md'); closeResultsExportMenu()">Markdown</button>
+                        <button role="menuitem" onclick="doExport('json'); closeResultsExportMenu()">JSON</button>
+                        <button role="menuitem" onclick="doExport('xml'); closeResultsExportMenu()">XML</button>
+                    </div>
+                </div>
             </div>
         </div>
         <div class="results-toolbar">
@@ -2388,6 +2473,12 @@ function renderResults(data) {
                 <select id="resultSortDirection" onchange="updateResultViewState()">
                     <option value="asc" ${resultViewState.sortDirection === 'asc' ? 'selected' : ''}>Ascending</option>
                     <option value="desc" ${resultViewState.sortDirection === 'desc' ? 'selected' : ''}>Descending</option>
+                </select>
+            </label>
+            <label>
+                Rows per page
+                <select id="resultPageSize" onchange="updateResultPageSize()">
+                    ${RESULT_PAGE_SIZES.map((size) => `<option value="${size}" ${pageSize === size ? 'selected' : ''}>${size}</option>`).join('')}
                 </select>
             </label>
             <button onclick="clearResultViewFilters()">Reset View</button>
@@ -2410,7 +2501,7 @@ function renderResults(data) {
             <tbody>
                 ${renderedRows.map((row, idx) => `
                     <tr onclick="this.classList.toggle('selected-row')">
-                        <td class="row-num-col">${idx + 1}</td>
+                        <td class="row-num-col">${rowStart + idx + 1}</td>
                         ${displayedColumns.map(col => {
                             const value = row[col];
                             return formatCell(value);
@@ -2420,6 +2511,13 @@ function renderResults(data) {
             </tbody>
         </table>
         </div>
+        ${renderIsPaginated ? `
+            <div class="result-pagination" aria-label="Result pages">
+                <button onclick="changeResultPage(-1)" ${page === 1 ? 'disabled' : ''}>Previous</button>
+                <span>Page ${page} of ${totalPages}</span>
+                <button onclick="changeResultPage(1)" ${page === totalPages ? 'disabled' : ''}>Next</button>
+            </div>
+        ` : ''}
     `;
 
     resultsContainer.innerHTML = tableHtml;
@@ -2643,15 +2741,17 @@ function updateResultViewState() {
     const selectionStart = keepFilterFocus && typeof filterInput?.selectionStart === 'number' ? filterInput.selectionStart : null;
     const selectionEnd = keepFilterFocus && typeof filterInput?.selectionEnd === 'number' ? filterInput.selectionEnd : null;
 
-    if (filterInput) {
-        resultViewState.filterText = filterInput.value;
+    const filterText = filterInput ? filterInput.value : resultViewState.filterText;
+    const sortColumn = sortSelect ? sortSelect.value : resultViewState.sortColumn;
+    const sortDirectionValue = sortDirection ? sortDirection.value : resultViewState.sortDirection;
+    if (filterText !== resultViewState.filterText ||
+        sortColumn !== resultViewState.sortColumn ||
+        sortDirectionValue !== resultViewState.sortDirection) {
+        resultViewState.page = 1;
     }
-    if (sortSelect) {
-        resultViewState.sortColumn = sortSelect.value;
-    }
-    if (sortDirection) {
-        resultViewState.sortDirection = sortDirection.value;
-    }
+    resultViewState.filterText = filterText;
+    resultViewState.sortColumn = sortColumn;
+    resultViewState.sortDirection = sortDirectionValue;
 
     if (currentResults) {
         renderResults(currentResults);
@@ -2671,6 +2771,7 @@ function clearResultViewFilters() {
     resultViewState.filterText = '';
     resultViewState.sortColumn = '';
     resultViewState.sortDirection = 'asc';
+    resultViewState.page = 1;
     if (currentResults) {
         renderResults(currentResults);
     }
@@ -2688,6 +2789,30 @@ function sortResultsBy(column) {
         resultViewState.sortDirection = 'asc';
     }
 
+    resultViewState.page = 1;
+
+    renderResults(currentResults);
+}
+
+function updateResultPageSize() {
+    const pageSize = Number(document.getElementById('resultPageSize')?.value);
+    if (!RESULT_PAGE_SIZES.includes(pageSize)) {
+        return;
+    }
+    resultViewState.pageSize = pageSize;
+    resultViewState.page = 1;
+    if (currentResults) {
+        renderResults(currentResults);
+    }
+}
+
+function changeResultPage(delta) {
+    if (!currentResults || !Number.isInteger(delta)) {
+        return;
+    }
+    const visible = getVisibleResults(currentResults);
+    const totalPages = Math.max(1, Math.ceil(visible.rows.length / resultViewState.pageSize));
+    resultViewState.page = Math.min(Math.max(1, resultViewState.page + delta), totalPages);
     renderResults(currentResults);
 }
 

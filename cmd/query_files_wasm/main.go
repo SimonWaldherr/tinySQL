@@ -328,6 +328,9 @@ func executeMulti(this js.Value, args []js.Value) interface{} {
 	}
 
 	start := time.Now()
+	// Do not leave a previous query exportable when this batch fails part-way
+	// through. Earlier statements may still have mutated the local database.
+	lastResult = nil
 	var lastRS *tinysql.ResultSet
 	for i, stmtRaw := range stmts {
 		stmtSQL, err := normalizeSQLInput(stmtRaw)
@@ -602,44 +605,6 @@ func stringsToInterfaces(ss []string) []interface{} {
 		out[i] = s
 	}
 	return out
-}
-
-// splitStatements splits a multi-statement SQL string on semicolons,
-// ignoring semicolons inside single-quoted string literals.
-func splitStatements(raw string) []string {
-	var stmts []string
-	var cur strings.Builder
-	inQuote := false
-
-	for i := 0; i < len(raw); i++ {
-		ch := raw[i]
-		if ch == '\'' {
-			if inQuote && i+1 < len(raw) && raw[i+1] == '\'' {
-				// SQL escaped quote inside literal.
-				cur.WriteByte(ch)
-				cur.WriteByte(raw[i+1])
-				i++
-				continue
-			}
-			inQuote = !inQuote
-			cur.WriteByte(ch)
-			continue
-		}
-		if ch == ';' && !inQuote {
-			s := strings.TrimSpace(cur.String())
-			if s != "" {
-				stmts = append(stmts, s)
-			}
-			cur.Reset()
-			continue
-		}
-		cur.WriteByte(ch)
-	}
-
-	if s := strings.TrimSpace(cur.String()); s != "" {
-		stmts = append(stmts, s)
-	}
-	return stmts
 }
 
 // parseSimpleXML converts row-based XML into []map[string]string so it can be
