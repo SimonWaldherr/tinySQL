@@ -74,6 +74,21 @@ dirty worktree. `make push-gh-pages` also pushes the branch.
 - in-memory stored procedure demos via `CALL demo_table_summary()` and
   `CALL demo_release_features()`
 
+## Keyboard shortcuts
+
+The editor supports:
+
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl`/`Cmd`+`Enter` | Run the current query |
+| `Ctrl`/`Cmd`+`Space` | Open autocomplete suggestions |
+| `Ctrl`/`Cmd`+`Shift`+`F` | Format the query |
+| `Tab` / `Shift`+`Tab` | Indent / unindent the selection |
+| `↑` (empty editor) | Recall the last query from history |
+| `(`, `'`, `"` | Auto-close the matching bracket/quote |
+
+Also reachable from the **Tools** menu in the toolbar.
+
 ## Shareable demos
 
 The app reads URL hashes of the form `#demo=<base64url-json>`, where the decoded

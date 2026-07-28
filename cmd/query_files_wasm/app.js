@@ -1455,7 +1455,10 @@ function setDemoQueryGroup(group) {
 }
 
 function updateDemoQueryVisibility() {
-    const loadedTables = new Set(currentTables.map((table) => String(table.name).toLowerCase()));
+    // Includes virtual tables (e.g. routing-graph views) and pending
+    // client-side tables, not just imported/loaded ones, so demo queries
+    // that target those never get stuck marked "unavailable".
+    const loadedTables = new Set(getKnownTableNames().map((name) => name.toLowerCase()));
     let availableCount = 0;
 
     document.querySelectorAll('.example-query').forEach((item) => {
@@ -2052,11 +2055,11 @@ function renderTables() {
                 : `<span class="table-badge imported">imported</span>`;
 
             return `
-            <div class="table-item" onclick="selectTable('${escapeHtml(table.name)}')">
+            <div class="table-item" data-table-name="${escapeHtml(table.name)}" role="button" tabindex="0" aria-label="Select table ${escapeHtml(table.name)}">
                 <div class="table-name">
                     ${escapeHtml(table.name)} ${badgeHtml}
-                    <span class="table-remove" onclick="event.stopPropagation(); removeTable('${escapeHtml(table.name)}')" title="Remove table">✕</span>
-                    <span class="table-info-btn" onclick="event.stopPropagation(); showTableInfo('${escapeHtml(table.name)}')" title="Show schema">ℹ</span>
+                    <span class="table-remove" data-action="remove-table" role="button" tabindex="0" title="Remove table" aria-label="Remove table ${escapeHtml(table.name)}">✕</span>
+                    <span class="table-info-btn" data-action="show-table-info" role="button" tabindex="0" title="Show schema" aria-label="Show schema for ${escapeHtml(table.name)}">ℹ</span>
                 </div>
                 <div class="table-meta">
                     <span>📝 ${table.rowCount} rows</span>
@@ -2077,16 +2080,16 @@ function renderTables() {
     if (virtuals.length > 0) {
         const collapsed = window._virtualCollapsed !== false;
         html += `
-            <div class="table-section-label virtual-toggle" onclick="toggleVirtualTables()">
+            <div class="table-section-label virtual-toggle" onclick="toggleVirtualTables()" role="button" tabindex="0">
                 <span>${collapsed ? '▶' : '▼'} Virtual Tables (${virtuals.length})</span>
             </div>`;
         if (!collapsed) {
             html += virtuals.map(vt => `
-                <div class="table-item virtual-table-item" onclick="selectTable('${escapeHtml(vt.name)}')">
+                <div class="table-item virtual-table-item" data-table-name="${escapeHtml(vt.name)}" role="button" tabindex="0" aria-label="Select table ${escapeHtml(vt.name)}">
                     <div class="table-name">
                         ${escapeHtml(vt.name)}
                         <span class="table-badge virtual">virtual</span>
-                        <span class="table-info-btn" onclick="event.stopPropagation(); showTableInfo('${escapeHtml(vt.name)}')" title="Show schema">ℹ</span>
+                        <span class="table-info-btn" data-action="show-table-info" role="button" tabindex="0" title="Show schema" aria-label="Show schema for ${escapeHtml(vt.name)}">ℹ</span>
                     </div>
                     <div class="table-meta"><span>computed at query time</span></div>
                 </div>
@@ -2095,6 +2098,56 @@ function renderTables() {
     }
 
     tableList.innerHTML = html;
+    setupTableListDelegation();
+}
+
+// Delegated click/keydown handling for the table list. Table names can
+// originate from an untrusted shared-demo URL hash, so they are never
+// interpolated into inline event-handler strings (HTML-entity decoding of
+// an escaped `'` would re-open the JS string and allow script injection);
+// instead they travel through data-* attributes and are read back as data.
+let tableListDelegationReady = false;
+function setupTableListDelegation() {
+    if (tableListDelegationReady) {
+        return;
+    }
+    tableListDelegationReady = true;
+    const tableList = document.getElementById('tableList');
+    if (!tableList) {
+        return;
+    }
+    tableList.addEventListener('click', (event) => {
+        const actionEl = event.target.closest('[data-action]');
+        if (actionEl) {
+            event.stopPropagation();
+            const item = actionEl.closest('[data-table-name]');
+            const name = item ? item.dataset.tableName : null;
+            if (!name) {
+                return;
+            }
+            if (actionEl.dataset.action === 'remove-table') {
+                removeTable(name);
+            } else if (actionEl.dataset.action === 'show-table-info') {
+                showTableInfo(name);
+            }
+            return;
+        }
+        const item = event.target.closest('[data-table-name]');
+        if (item) {
+            selectTable(item.dataset.tableName);
+        }
+    });
+    tableList.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') {
+            return;
+        }
+        const target = event.target.closest('[role="button"]');
+        if (!target) {
+            return;
+        }
+        event.preventDefault();
+        target.click();
+    });
 }
 
 // Toggle virtual table section collapsed state
@@ -2136,9 +2189,19 @@ function showTableInfo(tableName) {
                 </tbody>
             </table>
             <div class="schema-actions">
-                <button onclick="setQuery('SELECT * FROM ${quoteSqlIdentifier(tableName)} LIMIT 100'); closeSchemaPanel();">SELECT *</button>
+                <button type="button" class="schema-select-all">SELECT *</button>
             </div>
         `;
+        const selectAllBtn = panel.querySelector('.schema-select-all');
+        if (selectAllBtn) {
+            // tableName is closed over directly (never re-serialized into HTML/JS
+            // source), so it is safe even if it contains quotes from an untrusted
+            // shared-demo payload.
+            selectAllBtn.addEventListener('click', () => {
+                setQuery(`SELECT * FROM ${quoteSqlIdentifier(tableName)} LIMIT 100`);
+                closeSchemaPanel();
+            });
+        }
         panel.classList.remove('hidden');
         panel.focus();
     }
@@ -2155,6 +2218,9 @@ function closeSchemaPanel() {
 
 // Remove table
 function removeTable(tableName) {
+    if (!confirm(`Remove table "${tableName}"? This cannot be undone.`)) {
+        return;
+    }
     const isPending = Object.prototype.hasOwnProperty.call(pendingClientTables, tableName);
 
     if (!isPending && wasmReady && typeof wasmApi.dropTable === 'function') {
@@ -2290,16 +2356,39 @@ function formatQuery() {
     if (!editor) {
         return;
     }
-    let query = editor.value.trim();
-    
-    // Basic SQL formatting
-    query = query
-        .replace(/\s+/g, ' ')
-        .replace(/\b(SELECT|FROM|WHERE|JOIN|LEFT JOIN|RIGHT JOIN|INNER JOIN|FULL JOIN|CROSS JOIN|ON|ORDER BY|GROUP BY|HAVING|LIMIT|OFFSET|UNION|UNION ALL|INTERSECT|EXCEPT|WITH)\b/gi, '\n$1')
-        .replace(/,/g, ',\n  ')
-        .trim();
-    
-    editor.value = query;
+    const query = editor.value.trim();
+
+    // Only reformat whitespace/keywords/commas *outside* string literals and
+    // comments. Otherwise a value like 'Doe, John' gets its comma reflowed
+    // and a `-- note` comment gets mangled — and since collapsing the
+    // newline that ends a line comment would silently comment out the rest
+    // of the query on next execution, that newline is deliberately preserved.
+    const PROTECTED_PATTERN = /(--[^\n]*|\/\*[\s\S]*?\*\/|'(?:''|[^'])*')/g;
+    const KEYWORD_PATTERN = /\b(SELECT|FROM|WHERE|JOIN|LEFT JOIN|RIGHT JOIN|INNER JOIN|FULL JOIN|CROSS JOIN|ON|ORDER BY|GROUP BY|HAVING|LIMIT|OFFSET|UNION|UNION ALL|INTERSECT|EXCEPT|WITH)\b/gi;
+
+    const formatOutside = (text, afterLineComment) => {
+        const keepLeadingNewline = afterLineComment && /^\s*\n/.test(text);
+        const body = text
+            .replace(/\s+/g, ' ')
+            .replace(KEYWORD_PATTERN, '\n$1')
+            .replace(/,/g, ',\n  ');
+        return keepLeadingNewline ? '\n' + body.replace(/^ /, '') : body;
+    };
+
+    let formatted = '';
+    let lastIndex = 0;
+    let afterLineComment = false;
+    let match;
+    PROTECTED_PATTERN.lastIndex = 0;
+    while ((match = PROTECTED_PATTERN.exec(query)) !== null) {
+        formatted += formatOutside(query.slice(lastIndex, match.index), afterLineComment);
+        formatted += match[0];
+        afterLineComment = match[0].startsWith('--');
+        lastIndex = match.index + match[0].length;
+    }
+    formatted += formatOutside(query.slice(lastIndex), afterLineComment);
+
+    editor.value = formatted.trim();
     syncEditorHighlight();
     saveEditorState();
 }
@@ -2480,7 +2569,7 @@ function renderResults(data) {
         <div class="results-toolbar">
             <label>
                 Filter
-                <input id="resultFilterInput" type="search" value="${escapeHtml(resultViewState.filterText)}" placeholder="Search rows..." oninput="updateResultViewState()">
+                <input id="resultFilterInput" type="search" value="${escapeHtml(resultViewState.filterText)}" placeholder="Search rows..." oninput="scheduleResultFilterUpdate()">
             </label>
             <label>
                 Sort by
@@ -2511,7 +2600,7 @@ function renderResults(data) {
                     <th class="row-num-col">#</th>
                     ${displayedColumns.map(col => `
                         <th class="sortable-column" aria-sort="${resultViewState.sortColumn === col ? (resultViewState.sortDirection === 'asc' ? 'ascending' : 'descending') : 'none'}">
-                            <button class="column-sort-button" onclick="sortResultsBy(${JSON.stringify(col)})" title="Sort by ${escapeHtml(col)}">
+                            <button class="column-sort-button" data-col="${escapeHtml(col)}" title="Sort by ${escapeHtml(col)}">
                                 <span>${escapeHtml(col)}</span>
                                 <span class="column-sort-indicator">${getSortIndicator(col)}</span>
                             </button>
@@ -2543,6 +2632,25 @@ function renderResults(data) {
 
     resultsContainer.innerHTML = tableHtml;
     setOpenVanillaGridEnabled(true);
+    setupResultsSortDelegation(resultsContainer);
+}
+
+// Delegated click handling for column-sort-button headers. Column names can
+// come straight from imported file headers or an untrusted shared-demo
+// payload, so they travel via the data-col attribute instead of being
+// interpolated into an inline onclick string.
+let resultsSortDelegationReady = false;
+function setupResultsSortDelegation(resultsContainer) {
+    if (resultsSortDelegationReady) {
+        return;
+    }
+    resultsSortDelegationReady = true;
+    resultsContainer.addEventListener('click', (event) => {
+        const btn = event.target.closest('.column-sort-button');
+        if (btn) {
+            sortResultsBy(btn.dataset.col);
+        }
+    });
 }
 
 // Format table cell with truncation for long values
@@ -2658,6 +2766,8 @@ function showToast(message, type = 'info') {
     if (!container) {
         container = document.createElement('div');
         container.id = 'toastContainer';
+        container.setAttribute('role', 'status');
+        container.setAttribute('aria-live', 'polite');
         container.style.cssText = 'position:fixed;bottom:16px;right:16px;z-index:9999;display:flex;flex-direction:column;gap:8px;pointer-events:none;';
         document.body.appendChild(container);
     }
@@ -2752,6 +2862,14 @@ function compareResultValues(leftValue, rightValue) {
     const leftText = String(leftValue);
     const rightText = String(rightValue);
     return leftText.localeCompare(rightText, undefined, { numeric: true, sensitivity: 'base' });
+}
+
+let resultFilterTimer = null;
+function scheduleResultFilterUpdate() {
+    // Debounced so filtering the (potentially 5-10k row) results table
+    // doesn't rebuild the whole grid on every keystroke.
+    window.clearTimeout(resultFilterTimer);
+    resultFilterTimer = window.setTimeout(updateResultViewState, 200);
 }
 
 function updateResultViewState() {
@@ -3276,7 +3394,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // Auto-close brackets and quotes
         const AUTO_PAIRS = { '(': ')', "'": "'", '"': '"' };
-        if (AUTO_PAIRS[event.key] && !event.ctrlKey && !event.metaKey) {
+        const AUTO_CLOSERS = new Set([')', "'", '"']);
+        if (AUTO_PAIRS[event.key] && !event.ctrlKey && !event.metaKey && !event.altKey) {
             const start = event.target.selectionStart;
             const end = event.target.selectionEnd;
             const selected = event.target.value.substring(start, end);
@@ -3287,6 +3406,33 @@ document.addEventListener('DOMContentLoaded', () => {
                 event.target.value = event.target.value.substring(0, start) + wrapped + event.target.value.substring(end);
                 event.target.selectionStart = start + 1;
                 event.target.selectionEnd = end + 1;
+                syncEditorHighlight();
+                return;
+            }
+            const nextChar = event.target.value.charAt(end);
+            if (nextChar === AUTO_PAIRS[event.key] && event.key !== '(') {
+                // Typing a quote right before its own auto-inserted closer: step over it
+                // instead of inserting a second one.
+                event.preventDefault();
+                event.target.selectionStart = event.target.selectionEnd = end + 1;
+                syncEditorHighlight();
+                return;
+            }
+            event.preventDefault();
+            const pair = event.key + AUTO_PAIRS[event.key];
+            event.target.value = event.target.value.substring(0, start) + pair + event.target.value.substring(end);
+            event.target.selectionStart = event.target.selectionEnd = start + 1;
+            syncEditorHighlight();
+            return;
+        }
+        if (AUTO_CLOSERS.has(event.key) && !event.ctrlKey && !event.metaKey && !event.altKey) {
+            const start = event.target.selectionStart;
+            const end = event.target.selectionEnd;
+            if (start === end && event.target.value.charAt(start) === event.key) {
+                // Step over an auto-inserted closing bracket/quote instead of
+                // inserting a redundant one.
+                event.preventDefault();
+                event.target.selectionStart = event.target.selectionEnd = start + 1;
                 syncEditorHighlight();
                 return;
             }

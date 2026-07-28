@@ -5,6 +5,17 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>tinySQL — Local SQL for Go, browser tools and embedded data</title>
     <meta name="description" content="tinySQL is a pure-Go, local-first SQL engine for browser tools, Go applications, embedded systems and local data workflows.">
+    <meta name="theme-color" content="#0e639c">
+    <link rel="canonical" href="https://simonwaldherr.github.io/tinySQL/">
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230e639c'/%3E%3Crect x='14' y='16' width='36' height='32' rx='3' fill='none' stroke='%23ffffff' stroke-width='4'/%3E%3Cline x1='14' y1='28' x2='50' y2='28' stroke='%23ffffff' stroke-width='4'/%3E%3Cline x1='30' y1='16' x2='30' y2='48' stroke='%23ffffff' stroke-width='4'/%3E%3C/svg%3E">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="tinySQL">
+    <meta property="og:title" content="tinySQL — Local SQL for Go, browser tools and embedded data">
+    <meta property="og:description" content="tinySQL is a pure-Go, local-first SQL engine for browser tools, Go applications, embedded systems and local data workflows.">
+    <meta property="og:url" content="https://simonwaldherr.github.io/tinySQL/">
+    <meta name="twitter:card" content="summary">
+    <meta name="twitter:title" content="tinySQL — Local SQL for Go, browser tools and embedded data">
+    <meta name="twitter:description" content="tinySQL is a pure-Go, local-first SQL engine for browser tools, Go applications, embedded systems and local data workflows.">
     <link rel="stylesheet" href="https://simonwaldherr.github.io/vanillagrid.js/vanillagrid.css">
     <link rel="stylesheet" href="https://simonwaldherr.github.io/vanillagrid.js/vg-pivot-d3.css">
     <style>
@@ -147,7 +158,7 @@
             top: calc(100% + 8px);
             right: 0;
             z-index: 100;
-            width: 190px;
+            width: 240px;
             padding: 6px;
             background: #252526;
             border: 1px solid #4b4b50;
@@ -165,6 +176,43 @@
         }
 
         .utility-menu button:hover { background: #3e3e42; }
+
+        .utility-menu-separator {
+            height: 1px;
+            background: #3e3e42;
+            margin: 6px 2px;
+        }
+
+        .utility-menu-shortcuts {
+            padding: 4px 9px 6px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .utility-menu-shortcuts .shortcut-label {
+            font-weight: 600;
+            color: #ccc;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            margin-bottom: 2px;
+        }
+
+        .utility-menu-shortcuts div {
+            font-size: 11px;
+            color: #999;
+        }
+
+        .utility-menu-shortcuts kbd {
+            background: #1e1e1e;
+            border: 1px solid #3e3e42;
+            border-radius: 3px;
+            padding: 1px 5px;
+            font-family: Consolas, Monaco, monospace;
+            font-size: 10px;
+            color: #9cdcfe;
+        }
 
         .landing-page {
             min-height: calc(100vh - 55px);
@@ -404,185 +452,6 @@
             display: flex;
             flex-direction: column;
             gap: 4px;
-        }
-
-        .intro-page {
-            display: flex;
-            flex-direction: column;
-            gap: 14px;
-            max-width: 980px;
-            margin: 0 auto;
-        }
-
-        .intro-hero {
-            border: 1px solid #3e3e42;
-            background: #252526;
-            border-radius: 6px;
-            padding: 24px;
-            display: grid;
-            grid-template-columns: minmax(0, 1fr) minmax(220px, 0.65fr);
-            gap: 28px;
-            align-items: start;
-        }
-
-        .intro-kicker {
-            color: #9cdcfe;
-            font-size: 12px;
-            font-weight: 700;
-            text-transform: uppercase;
-            margin-bottom: 8px;
-        }
-
-        .intro-hero h2 {
-            color: #fff;
-            font-size: 28px;
-            line-height: 1.15;
-            margin-bottom: 10px;
-        }
-
-        .intro-copy {
-            color: #c8c8c8;
-            font-size: 14px;
-            line-height: 1.55;
-            max-width: 760px;
-        }
-
-        .intro-actions {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-            margin-top: 16px;
-        }
-
-        .intro-actions button,
-        .intro-card-actions button {
-            background: #0e639c;
-            border: none;
-            color: #fff;
-            padding: 8px 12px;
-            border-radius: 4px;
-            font-size: 13px;
-            cursor: pointer;
-            min-height: 34px;
-        }
-
-        .intro-actions .secondary,
-        .intro-card-actions .secondary {
-            background: #3e3e42;
-            color: #d4d4d4;
-        }
-
-        .intro-actions button:hover,
-        .intro-card-actions button:hover {
-            background: #1177bb;
-        }
-
-        .intro-actions .secondary:hover,
-        .intro-card-actions .secondary:hover {
-            background: #505050;
-        }
-
-        .intro-metrics {
-            display: grid;
-            grid-template-columns: 1fr;
-            gap: 8px;
-        }
-
-        .intro-metric {
-            background: #1e1e1e;
-            border: 1px solid #3e3e42;
-            border-radius: 4px;
-            padding: 10px;
-        }
-
-        .intro-metric strong {
-            display: block;
-            color: #fff;
-            font-size: 17px;
-            margin-bottom: 2px;
-        }
-
-        .intro-metric span {
-            color: #999;
-            font-size: 12px;
-        }
-
-        .feature-strip {
-            display: grid;
-            grid-template-columns: repeat(3, minmax(0, 1fr));
-            gap: 10px;
-        }
-
-        .feature-pill {
-            background: #252526;
-            border: 1px solid #3e3e42;
-            border-radius: 4px;
-            padding: 10px;
-            color: #d4d4d4;
-            font-size: 12px;
-            line-height: 1.35;
-        }
-
-        .feature-pill strong {
-            display: block;
-            color: #fff;
-            font-size: 13px;
-            margin-bottom: 3px;
-        }
-
-        .intro-grid {
-            display: grid;
-            grid-template-columns: repeat(2, minmax(0, 1fr));
-            gap: 12px;
-        }
-
-        .intro-card {
-            background: #252526;
-            border: 1px solid #3e3e42;
-            border-radius: 6px;
-            padding: 14px;
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-        }
-
-        .intro-card h3 {
-            color: #fff;
-            font-size: 16px;
-            margin: 0;
-        }
-
-        .intro-card p {
-            color: #a9a9a9;
-            font-size: 13px;
-            line-height: 1.45;
-        }
-
-        .intro-card code {
-            background: #1e1e1e;
-            border: 1px solid #3e3e42;
-            border-radius: 4px;
-            color: #ce9178;
-            display: block;
-            font-size: 11px;
-            line-height: 1.45;
-            overflow: hidden;
-            padding: 8px;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-        }
-
-        .intro-card-actions {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-            margin-top: auto;
-        }
-
-        .intro-note {
-            color: #999;
-            font-size: 12px;
-            line-height: 1.5;
         }
 
         .vg-header-actions {
@@ -1755,6 +1624,25 @@
             .result-table-wrap {
                 max-height: 48vh;
             }
+
+            /* Enlarge small icon/text controls inside the sidebar drawer,
+               which becomes a touch surface at this breakpoint. */
+            .table-remove,
+            .table-info-btn {
+                min-width: 32px;
+                min-height: 32px;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                padding: 6px;
+            }
+
+            .history-title button,
+            .schema-actions button,
+            .demo-filter button {
+                min-height: 40px;
+                padding: 8px 10px;
+            }
         }
 
         @media (max-width: 520px) {
@@ -1804,24 +1692,6 @@
                 padding: 10px;
             }
 
-            .intro-hero,
-            .intro-grid,
-            .feature-strip {
-                grid-template-columns: 1fr;
-            }
-
-            .intro-hero {
-                padding: 16px;
-            }
-
-            .intro-hero h2 {
-                font-size: 23px;
-            }
-
-            .intro-card code {
-                white-space: normal;
-                word-break: break-word;
-            }
         }
     </style>
 </head>
@@ -1840,6 +1710,15 @@
                 <button role="menuitem" onclick="importClipboardData(); closeUtilityMenu()">Paste from clipboard</button>
                 <button role="menuitem" onclick="toggleHistory(); closeUtilityMenu()">Query history</button>
                 <button role="menuitem" onclick="window.open('https://github.com/SimonWaldherr/tinySQL#sql-formatting', '_blank', 'noopener'); closeUtilityMenu()">Go API documentation</button>
+                <div class="utility-menu-separator" role="separator"></div>
+                <div class="utility-menu-shortcuts" role="group" aria-label="Keyboard shortcuts">
+                    <div class="shortcut-label">Keyboard shortcuts</div>
+                    <div><kbd>Ctrl/⌘+Enter</kbd> Run query</div>
+                    <div><kbd>Ctrl/⌘+Space</kbd> Autocomplete</div>
+                    <div><kbd>Ctrl/⌘+Shift+F</kbd> Format query</div>
+                    <div><kbd>Tab</kbd> Indent selection</div>
+                    <div><kbd>↑</kbd> Recall last query</div>
+                </div>
             </div>
         </div>
         <div class="status studio-only">

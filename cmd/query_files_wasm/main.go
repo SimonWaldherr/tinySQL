@@ -452,7 +452,7 @@ func listTables(this js.Value, args []js.Value) interface{} {
 		})
 	}
 
-	sysNames := []string{"tables", "columns", "constraints", "indexes", "views", "functions", "variables", "status", "memory", "storage", "config", "connections"}
+	sysNames := []string{"tables", "columns", "constraints", "indexes", "views", "functions", "variables", "status", "memory", "storage", "config", "connections", "objects", "dependencies", "statistics"}
 	for _, n := range sysNames {
 		out = append(out, map[string]interface{}{
 			"name":    "sys." + n,
@@ -546,8 +546,7 @@ func exportResults(this js.Value, args []js.Value) interface{} {
 		for _, row := range lastResult.Rows {
 			rec := make([]string, len(lastResult.Cols))
 			for i, c := range lastResult.Cols {
-				v := row[strings.ToLower(c)]
-				if v != nil {
+				if v, ok := tinysql.GetVal(row, c); ok && v != nil {
 					rec[i] = fmt.Sprintf("%v", v)
 				}
 			}
@@ -560,7 +559,8 @@ func exportResults(this js.Value, args []js.Value) interface{} {
 		for i, row := range lastResult.Rows {
 			m := make(map[string]interface{}, len(lastResult.Cols))
 			for _, c := range lastResult.Cols {
-				m[c] = row[strings.ToLower(c)]
+				v, _ := tinysql.GetVal(row, c)
+				m[c] = v
 			}
 			out[i] = m
 		}
@@ -574,7 +574,7 @@ func exportResults(this js.Value, args []js.Value) interface{} {
 			buf.WriteString("  <row>\n")
 			for _, c := range lastResult.Cols {
 				tag := xmlTagName(c)
-				v := row[strings.ToLower(c)]
+				v, _ := tinysql.GetVal(row, c)
 				text := ""
 				if v != nil {
 					text = fmt.Sprintf("%v", v)
