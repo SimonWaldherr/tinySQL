@@ -22,11 +22,11 @@ func executeRecentFeatureSQL(t *testing.T, db *tinysql.DB, sql string) *tinysql.
 
 func TestRecentEngineFeaturesAreAvailableToTheWASMModule(t *testing.T) {
 	db := tinysql.NewDB()
-	executeRecentFeatureSQL(t, db, `CREATE TABLE docs (doc_id TEXT, chunk_index INT, chunk_text TEXT, embedding VECTOR)`)
+	executeRecentFeatureSQL(t, db, `CREATE TABLE docs (chunk_id INT PRIMARY KEY, doc_id TEXT, chunk_index INT, chunk_text TEXT, embedding VECTOR)`)
 	executeRecentFeatureSQL(t, db, `INSERT INTO docs VALUES
-		('guide', 0, 'Vector search retrieves semantically related chunks.', '[1.0, 0.0, 0.0]'),
-		('guide', 1, 'RAG search can add neighboring context chunks.', '[0.8, 0.2, 0.0]'),
-		('other', 0, 'Geodata uses routes and coordinates.', '[0.0, 0.0, 1.0]')`)
+		(1, 'guide', 0, 'Vector search retrieves semantically related chunks.', '[1.0, 0.0, 0.0]'),
+		(2, 'guide', 1, 'RAG search can add neighboring context chunks.', '[0.8, 0.2, 0.0]'),
+		(3, 'other', 0, 'Geodata uses routes and coordinates.', '[0.0, 0.0, 1.0]')`)
 
 	contains := executeRecentFeatureSQL(t, db, `SELECT CONTAINS_ALL(chunk_text, 'vector', 'search') AS all_terms,
 		CONTAINS_ANY(chunk_text, 'routes', 'search') AS any_term,
@@ -56,6 +56,16 @@ func TestRecentEngineFeaturesAreAvailableToTheWASMModule(t *testing.T) {
 		}')`)
 	if len(rag.Rows) == 0 || rag.Rows[0]["_hit_rank"] == nil || rag.Rows[0]["_context_rank"] == nil {
 		t.Fatalf("RAG_SEARCH result = %#v", rag)
+	}
+
+	hybrid := executeRecentFeatureSQL(t, db, `SELECT chunk_id, _vec_rank, _fts_rank, _rrf_rank
+		FROM HYBRID_SEARCH(
+			'docs', 'embedding', 'chunk_text', 'vect?r* OR context',
+			VEC_FROM_JSON('[1.0,0.0,0.0]'), 2
+		)
+		ORDER BY _rrf_rank`)
+	if len(hybrid.Rows) == 0 || hybrid.Rows[0]["_rrf_rank"] == nil {
+		t.Fatalf("HYBRID_SEARCH result = %#v", hybrid)
 	}
 
 	executeRecentFeatureSQL(t, db, `ANALYZE docs`)

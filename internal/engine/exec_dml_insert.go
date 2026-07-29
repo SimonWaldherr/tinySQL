@@ -322,6 +322,21 @@ func getConstraintIndex(t *storage.Table, colIdx int) *constraintIndexEntry {
 	return e
 }
 
+// currentConstraintIndex returns an already complete cache entry without
+// building one. Point DELETE uses this to avoid allocating an O(n) hash map on
+// the first operation after loading a table; a cold delete can scan one key
+// column once and still avoid the much larger rollback clone.
+func currentConstraintIndex(t *storage.Table, colIdx int) *constraintIndexEntry {
+	key := constraintIndexKey{table: t, colIdx: colIdx}
+	constraintIndexMu.Lock()
+	defer constraintIndexMu.Unlock()
+	entry := constraintIndexes[key]
+	if entry == nil || entry.rowCount != len(t.Rows) {
+		return nil
+	}
+	return entry
+}
+
 // invalidateConstraintIndexes drops every cached constraint index for a
 // table. Call before any operation that can remove or reorder existing rows
 // (DELETE) or replace the table wholesale (DROP TABLE) — the incremental

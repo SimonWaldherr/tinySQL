@@ -144,13 +144,16 @@ SELECT REGEXP_REPLACE('Hello123World456', '\d+', 'X') as numbers_replaced;
 -- FULL-TEXT SEARCH FUNCTIONS
 -- ============================================================
 
--- FTS_MATCH: boolean match against a query (single term, phrase, boolean, prefix)
+-- FTS_MATCH: boolean match against a query (term, phrase, boolean, wildcard)
 SELECT FTS_MATCH('the quick brown fox', 'fox') as has_fox;
 SELECT FTS_MATCH('the quick brown fox', 'quick AND fox') as has_both;
 SELECT FTS_MATCH('the quick brown fox', 'cat OR fox') as has_either;
 SELECT FTS_MATCH('the quick brown fox', 'NOT cat') as lacks_cat;
 SELECT FTS_MATCH('the quick brown fox jumps', '"quick brown"') as has_phrase;
 SELECT FTS_MATCH('the database stores information', 'inform*') as has_prefix;
+-- ? / _ match one character; * / % match zero or more characters.
+SELECT FTS_MATCH('colour palette', 'colo?r') as single_char_wildcard;
+SELECT FTS_MATCH('database systems', 'data%') as multi_char_wildcard;
 
 -- FTS_RANK / BM25: relevance score for the same query syntax (higher = more relevant)
 SELECT FTS_RANK('the quick brown fox', 'fox AND quick') as relevance;
@@ -1167,6 +1170,34 @@ FROM RAG_SEARCH('rag_search_demo', 'embedding', VEC_FROM_JSON('[0.9, 0.1, 0.0]')
 ORDER BY _context_rank;
 
 DROP TABLE rag_search_demo;
+
+-- ---- HYBRID_SEARCH: one search term, semantic + full-text ----
+
+-- The query vector is the embedding of the same search term, generated with
+-- the model used to populate the VECTOR column. The PRIMARY KEY is used
+-- automatically to fuse vector and BM25 candidate lists.
+CREATE TABLE hybrid_search_demo (
+    id        INT PRIMARY KEY,
+    content   TEXT,
+    embedding VECTOR
+);
+INSERT INTO hybrid_search_demo VALUES
+    (1, 'database timeout retry guide', '[1.0, 0.0, 0.0]'),
+    (2, 'general systems handbook',      '[0.8, 0.2, 0.0]'),
+    (3, 'unrelated cooking notes',       '[0.0, 1.0, 0.0]');
+
+SELECT id, content, _vec_similarity, _fts_score, _rrf_score, _rrf_rank
+FROM HYBRID_SEARCH(
+    'hybrid_search_demo', 'embedding', 'content', 'time?ut retry*',
+    VEC_FROM_JSON('[0.9, 0.1, 0.0]'), 3
+)
+ORDER BY _rrf_rank;
+
+-- VEC_HYBRID_SEARCH is an alias. Tables without a PRIMARY KEY provide the
+-- identity columns via the optional JSON object:
+-- '{"key_columns":["doc_id","chunk_index"],"index":"hnsw","candidate_k":50}'
+
+DROP TABLE hybrid_search_demo;
 
 -- ============================================================
 -- END OF EXAMPLES

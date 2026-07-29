@@ -38,7 +38,11 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 	switch {
 	case isAtomicDML(stmt):
 		var snapshotErr error
-		if table, ok := appendOnlySnapshotTarget(db, tenant, stmt); ok {
+		if table, rowIDs, ok := rowUpdateSnapshotTarget(db, tenant, stmt); ok {
+			snapshot, snapshotErr = db.SnapshotForRowUpdateStatement(tenant, table, rowIDs)
+		} else if table, rowIDs, ok := rowDeleteSnapshotTarget(db, tenant, stmt); ok {
+			snapshot, snapshotErr = db.SnapshotForRowDeleteStatement(tenant, table, rowIDs)
+		} else if table, ok := appendOnlySnapshotTarget(db, tenant, stmt); ok {
 			snapshot, snapshotErr = db.SnapshotForAppendOnlyTableStatement(tenant, table)
 		} else if table, ok := tableScopedSnapshotTarget(db, tenant, stmt); ok {
 			snapshot, snapshotErr = db.SnapshotForTableStatement(tenant, table)
@@ -107,6 +111,76 @@ func appendOnlySnapshotTarget(db *storage.DB, tenant string, stmt Statement) (st
 		return "", false
 	}
 	return s.Table, true
+}
+
+// rowUpdateSnapshotTarget identifies a point UPDATE whose constraint-index
+// candidate set bounds every row the statement can replace. The compact
+// snapshot is safe only when no trigger/FK can write elsewhere and none of the
+// assigned columns belongs to a secondary index.
+func rowUpdateSnapshotTarget(db *storage.DB, tenant string, stmt Statement) (string, []int, bool) {
+	s, ok := stmt.(*Update)
+	if !ok || tenantHasAnyForeignKeys(ExecEnv{tenant: tenant, db: db}) {
+		return "", nil, false
+	}
+	before, after := db.Catalog().GetTriggersForEvent(s.Table, storage.TriggerUpdate)
+	if len(before) > 0 || len(after) > 0 {
+		return "", nil, false
+	}
+	table, err := db.Get(tenant, s.Table)
+	if err != nil || updateTouchesSecondaryIndex(table, s) {
+		return "", nil, false
+	}
+	colIndex := simpleColumnIndex(table, s.Table)
+	rowIDs, _, _, found := selectConstraintIndex(table, colIndex, s.Where)
+	if !found {
+		return "", nil, false
+	}
+	return s.Table, rowIDs, true
+}
+
+func updateTouchesSecondaryIndex(table *storage.Table, s *Update) bool {
+	if table == nil || len(table.Indexes) == 0 {
+		return false
+	}
+	updated := make(map[int]struct{}, len(s.Sets))
+	for name := range s.Sets {
+		if col, err := table.ColIndex(name); err == nil {
+			updated[col] = struct{}{}
+		}
+	}
+	for _, index := range table.Indexes {
+		for _, name := range index.Columns {
+			if col, err := table.ColIndex(name); err == nil {
+				if _, ok := updated[col]; ok {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// rowDeleteSnapshotTarget identifies a single-row DELETE whose rollback can
+// reinsert one saved row instead of cloning the full table.
+func rowDeleteSnapshotTarget(db *storage.DB, tenant string, stmt Statement) (string, []int, bool) {
+	s, ok := stmt.(*Delete)
+	if !ok || tenantHasAnyForeignKeys(ExecEnv{tenant: tenant, db: db}) {
+		return "", nil, false
+	}
+	before, after := db.Catalog().GetTriggersForEvent(s.Table, storage.TriggerDelete)
+	if len(before) > 0 || len(after) > 0 {
+		return "", nil, false
+	}
+	table, err := db.Get(tenant, s.Table)
+	if err != nil || len(table.Indexes) > 0 {
+		return "", nil, false
+	}
+	colIndex := simpleColumnIndex(table, s.Table)
+	rowIDs, _, _, found := selectDeleteConstraintRows(table, colIndex, s.Where)
+	if !found || len(rowIDs) > 1 {
+		return "", nil, false
+	}
+	return s.Table, rowIDs, true
 }
 
 // tableScopedSnapshotTarget identifies DML that cannot mutate a table other

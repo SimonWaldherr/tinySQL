@@ -58,15 +58,18 @@ dirty worktree. `make push-gh-pages` also pushes the branch.
   `.routinggraph`, `.graph.json`, ...)
 - single- and multi-statement SQL execution, schema inspection, table removal
 - query history, editor state, and database snapshot in local storage
-- paged result browsing, filtering, sorting, table copy, VanillaGrid pivot
-  view, and exports as CSV, TSV, Markdown, JSON, and XML
+- WASM-side result paging, filtering, and sorting, so large result sets stay in
+  Go memory instead of being copied wholesale into JavaScript; table copy,
+  VanillaGrid pivot view, and exports as CSV, TSV, Markdown, JSON, and XML
 - intro page with guided recipes: file analytics, geodata, FTS/vector search,
   RAG context expansion, joins/reporting
 - geodata examples: point extraction, distance matrices, radius filters,
   bounding boxes, zone membership, routing graph nodes, route edges
 - search examples: `FTS_SEARCH`, `FTS_RANK`, `FTS_SNIPPET`, `BM25`,
-  `VEC_SEARCH`, `VEC_COSINE_SIMILARITY`, `RAG_CONTEXT_FROM`, `RAG_SEARCH`,
-  `CONTAINS_ALL`/`CONTAINS_ANY`/`CONTAINS_SCORE`, and hybrid retrieval
+  `VEC_SEARCH`, `VEC_COSINE_SIMILARITY`, `HYBRID_SEARCH`,
+  `RAG_CONTEXT_FROM`, `RAG_SEARCH`,
+  `CONTAINS_ALL`/`CONTAINS_ANY`/`CONTAINS_SCORE`, plus `?`/`_`
+  single-character and `*`/`%` multi-character FTS wildcards
 - recent vector/planning examples: `VEC_HAMMING_DISTANCE`, `VEC_CENTROID`,
   `ANALYZE`, and `sys.statistics`
 - analytics examples: `PIVOT`, `RETURNING`, `EXPLAIN`, SQLite-compatible
@@ -80,7 +83,7 @@ The editor supports:
 
 | Shortcut | Action |
 | --- | --- |
-| `Ctrl`/`Cmd`+`Enter` | Run the current query |
+| `Ctrl`/`Cmd`+`Enter` | Run the selected SQL, or the full editor |
 | `Ctrl`/`Cmd`+`Space` | Open autocomplete suggestions |
 | `Ctrl`/`Cmd`+`Shift`+`F` | Format the query |
 | `Tab` / `Shift`+`Tab` | Indent / unindent the selection |
@@ -120,6 +123,7 @@ editor to the encoded query, and runs it when `autoRun` is true.
 - `importFile(fileName, fileContent, tableName)`
 - `executeQuery(sql)`
 - `executeMulti(sql)`
+- `getResultPage(offset, limit, filterText, sortColumn, sortDirection)`
 - `listTables()`
 - `getTableSchema(tableName)`
 - `dropTable(tableName)`
@@ -131,3 +135,31 @@ editor to the encoded query, and runs it when `autoRun` is true.
 `executeMulti` recognizes statement separators only outside SQL strings, quoted
 identifiers, and line/block comments, so scripts can safely contain semicolons
 in those constructs.
+
+Query execution returns only the first result page plus `totalRows`. Use
+`getResultPage` for subsequent pages and WASM-side filtering/sorting.
+`exportResults` still exports the complete unfiltered result.
+
+## Recommended RAG workflow
+
+Use a table with a stable primary key, a normalized text column, and a `VECTOR`
+column. Generate the query embedding with the same model used at ingestion,
+then call `HYBRID_SEARCH` so exact terms, wildcard patterns, and semantic
+similarity contribute to one reciprocal-rank-fused result:
+
+```sql
+SELECT chunk_id, chunk_text, _vec_rank, _fts_rank, _rrf_rank, _rrf_score
+FROM HYBRID_SEARCH(
+  'rag_chunks',
+  'embedding',
+  'search_text',
+  'auth?nticat* OR SSO',
+  VEC_FROM_JSON('[0.12, -0.07, 0.31]'),
+  20
+)
+ORDER BY _rrf_rank;
+```
+
+The full production-oriented schema, ingestion, chunking, tuning, evaluation,
+and context-expansion recommendations are in
+[`docs/rag-guide.md`](../../docs/rag-guide.md).

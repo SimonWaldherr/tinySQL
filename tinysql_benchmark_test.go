@@ -93,8 +93,11 @@ func BenchmarkExecute_CreateTable(b *testing.B) {
 }
 
 func BenchmarkExecute_Insert(b *testing.B) {
-	db, ctx := newBenchmarkDB(b, 0)
-	stmt, err := ParseSQL("INSERT INTO users VALUES (1, 'Alice', 30, true, 42.5)")
+	db := NewDB()
+	b.Cleanup(func() { _ = db.Close() })
+	ctx := context.Background()
+	mustBenchmarkExec(b, ctx, db, "CREATE TABLE inserts (id INT, name TEXT, age INT, active BOOL, score FLOAT)")
+	stmt, err := ParseSQL("INSERT INTO inserts VALUES (1, 'Alice', 30, true, 42.5)")
 	if err != nil {
 		b.Fatal(err)
 	}

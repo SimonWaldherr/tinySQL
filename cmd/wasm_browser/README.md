@@ -65,6 +65,19 @@ The module exposes `window.tinySQL`:
   compression fall back to `tinySQL.wasm` automatically.
 - The browser API executes directly against tinySQL's engine instead of through
   `database/sql`; this reduces bundle size and avoids connection-pool overhead.
+- Repeated SQL text is served from a bounded compile cache, avoiding parser work
+  on hot query paths.
 - Set `window.tinySQLWasmDebug = true` before loading the module to enable
   diagnostic console logs; normal query paths stay quiet.
 - For a Node.js variant see [`../wasm_node/`](../wasm_node/).
+
+## Performance benchmark
+
+Run the repeat-query benchmark against a built browser module:
+
+```bash
+node wasm_benchmark.js web/tinySQL.wasm 10000
+```
+
+The output reports elapsed time, throughput, and microseconds per query or
+update as JSON. Pass another WASM file as the first argument to compare builds.

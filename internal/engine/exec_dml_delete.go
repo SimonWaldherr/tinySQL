@@ -14,10 +14,6 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Removing rows shifts every subsequent row's index, which the
-	// incremental constraint index can't reconcile cheaply — drop it and
-	// let the next INSERT/UPDATE rebuild it from scratch.
-	invalidateConstraintIndexes(t)
 	if err := checkForeignKeysBeforeDelete(env, t, s.Where); err != nil {
 		return nil, err
 	}
@@ -27,6 +23,18 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	}
 	beforeDelTriggers, afterDelTriggers := env.db.Catalog().GetTriggersForEvent(s.Table, storage.TriggerDelete)
 	hasTriggers := len(beforeDelTriggers) > 0 || len(afterDelTriggers) > 0
+	if !hasTriggers && len(s.Returning) == 0 && isSimpleRawPredicate(s.Where) {
+		colIndex := simpleColumnIndex(t, s.Table)
+		if rowIDs, _, _, found := selectDeleteConstraintRows(t, colIndex, s.Where); found {
+			return executeConstraintPointDelete(env, s, t, wal, colIndex, rowIDs)
+		}
+	}
+
+	// Multi-row DELETE shifts every subsequent row's position. Drop the
+	// incremental constraint cache and let the next point operation rebuild it.
+	// The point path above delays invalidation until it actually removes a row.
+	invalidateConstraintIndexes(t)
+
 	// A DELETE without WHERE is still row-triggered. Preserve the compact
 	// whole-table path only when no trigger can observe individual OLD rows.
 	if s.Where == nil && !hasTriggers {
@@ -174,6 +182,95 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 		return projectReturningRows(env, t.Cols, s.Returning, returningRows)
 	}
 	return &ResultSet{Cols: []string{"deleted"}, Rows: []Row{{"deleted": del}}}, nil
+}
+
+func executeConstraintPointDelete(env ExecEnv, s *Delete, table *storage.Table, wal *walAuto, colIndex map[string]int, rowIDs []int) (*ResultSet, error) {
+	rawPlan := &simpleSelectPlan{
+		table:       table,
+		colIndex:    colIndex,
+		where:       s.Where,
+		filter:      buildRawFilter(colIndex, s.Where),
+		rowTextCols: rawRowTextColumns(colIndex),
+	}
+	deleteRowID := -1
+	for _, rowID := range rowIDs {
+		if rowID < 0 || rowID >= len(table.Rows) {
+			continue
+		}
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, err
+		}
+		match, err := evalRawWhere(rawPlan, table.Rows[rowID])
+		if err != nil {
+			return nil, err
+		}
+		if !match {
+			continue
+		}
+		if err := wal.logDelete(env, rowID, table.Rows[rowID], table.Cols); err != nil {
+			return nil, err
+		}
+		deleteRowID = rowID
+		break
+	}
+	if err := wal.commit(); err != nil {
+		return nil, err
+	}
+
+	if deleteRowID >= 0 {
+		last := len(table.Rows) - 1
+		copy(table.Rows[deleteRowID:], table.Rows[deleteRowID+1:])
+		table.Rows[last] = nil
+		table.Rows = table.Rows[:last]
+		table.DeleteSecondaryIndexRow(deleteRowID)
+		invalidateConstraintIndexes(table)
+		table.InvalidateStats()
+		table.MarkDirtyFrom(-1)
+		markDependentMaterializedViewsStale(env, s.Table)
+	}
+	// Preserve DELETE's established version semantics: a successfully executed
+	// predicate advances the table version even when it matches no row.
+	table.Version++
+	deleted := 0
+	if deleteRowID >= 0 {
+		deleted = 1
+	}
+	return &ResultSet{Cols: []string{"deleted"}, Rows: []Row{{"deleted": deleted}}}, nil
+}
+
+// selectDeleteConstraintRows reuses a warm PRIMARY KEY/UNIQUE cache when one
+// exists. On a cold table it scans only the constrained column and stops at the
+// first match, avoiding an O(n) hash-map build immediately before DELETE would
+// invalidate that map because row positions shift.
+func selectDeleteConstraintRows(table *storage.Table, colIndex map[string]int, where Expr) ([]int, string, bool, bool) {
+	if table == nil || where == nil {
+		return nil, "", false, false
+	}
+	equalities := make(map[int]any)
+	totalTerms := collectEqualityTerms(where, colIndex, equalities)
+	for colIdx, value := range equalities {
+		if colIdx < 0 || colIdx >= len(table.Cols) {
+			continue
+		}
+		column := table.Cols[colIdx]
+		if column.Constraint != storage.PrimaryKey && column.Constraint != storage.Unique {
+			continue
+		}
+		if index := currentConstraintIndex(table, colIdx); index != nil {
+			rows := lookupConstraintIndexRows(index, value)
+			if rows == nil {
+				rows = []int{}
+			}
+			return rows, column.Name, totalTerms != 1, true
+		}
+		for rowID, row := range table.Rows {
+			if colIdx < len(row) && rawEqual(row[colIdx], value) {
+				return []int{rowID}, column.Name, totalTerms != 1, true
+			}
+		}
+		return []int{}, column.Name, totalTerms != 1, true
+	}
+	return nil, "", false, false
 }
 
 func buildTableRow(cols []storage.Column, tablePrefix string, values []any) Row {

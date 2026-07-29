@@ -73,6 +73,98 @@ func TestAppendOnlyStatementSnapshotTruncatesRowsAndRestoresMetadata(t *testing.
 	}
 }
 
+func TestRowUpdateStatementSnapshotRestoresOnlyCandidatesAndMetadata(t *testing.T) {
+	db := NewDB()
+	t.Cleanup(func() { _ = db.Close() })
+
+	table := NewTable("items", []Column{{Name: "id", Type: IntType}, {Name: "payload", Type: BlobType}}, false)
+	table.Rows = [][]any{{1, []byte("one")}, {2, []byte("two")}}
+	table.Version = 7
+	table.dirtyFrom = 1
+	table.dirtyRows = []int{0}
+	table.dirtyRowsState = dirtyRowsExact
+	table.Stats = &TableStats{RowCount: 2, Columns: map[string]ColumnStats{"id": {DistinctCount: 2}}}
+	if err := db.Put("default", table); err != nil {
+		t.Fatal(err)
+	}
+
+	db.LockContentForWrite()
+	snapshot, err := db.SnapshotForRowUpdateStatement("default", "items", []int{1})
+	if err != nil {
+		db.UnlockContentForWrite()
+		t.Fatal(err)
+	}
+	table.Rows[0] = []any{10, []byte("ten")}
+	table.Rows[1] = []any{20, []byte("twenty")}
+	table.Version++
+	table.dirtyFrom = 0
+	table.dirtyRows = []int{1}
+	table.Stats = &TableStats{RowCount: 2, Stale: true}
+	db.RestoreStatementSnapshot(snapshot)
+	db.UnlockContentForWrite()
+
+	if got := table.Rows[0][0]; got != 10 {
+		t.Fatalf("non-candidate row was restored: got %v, want 10", got)
+	}
+	if got := table.Rows[1][0]; got != 2 {
+		t.Fatalf("candidate row after restore = %v, want 2", got)
+	}
+	if got := string(table.Rows[1][1].([]byte)); got != "two" {
+		t.Fatalf("candidate BLOB after restore = %q, want two", got)
+	}
+	if table.Version != 7 || table.dirtyFrom != 1 || table.dirtyRowsState != dirtyRowsExact {
+		t.Fatalf("metadata after restore = version %d, dirtyFrom %d, dirty state %d", table.Version, table.dirtyFrom, table.dirtyRowsState)
+	}
+	if len(table.dirtyRows) != 1 || table.dirtyRows[0] != 0 {
+		t.Fatalf("dirty rows after restore = %#v, want [0]", table.dirtyRows)
+	}
+	if table.Stats == nil || table.Stats.Stale || table.Stats.Columns["id"].DistinctCount != 2 {
+		t.Fatalf("statistics were not restored: %#v", table.Stats)
+	}
+}
+
+func TestRowDeleteStatementSnapshotReinsertsCandidateAndMetadata(t *testing.T) {
+	db := NewDB()
+	t.Cleanup(func() { _ = db.Close() })
+
+	table := NewTable("items", []Column{{Name: "id", Type: IntType}, {Name: "payload", Type: BlobType}}, false)
+	table.Rows = [][]any{{1, []byte("one")}, {2, []byte("two")}, {3, []byte("three")}}
+	table.Version = 9
+	table.dirtyFrom = 2
+	table.Stats = &TableStats{RowCount: 3, Columns: map[string]ColumnStats{"id": {DistinctCount: 3}}}
+	if err := db.Put("default", table); err != nil {
+		t.Fatal(err)
+	}
+
+	db.LockContentForWrite()
+	snapshot, err := db.SnapshotForRowDeleteStatement("default", "items", []int{1})
+	if err != nil {
+		db.UnlockContentForWrite()
+		t.Fatal(err)
+	}
+	copy(table.Rows[1:], table.Rows[2:])
+	table.Rows[len(table.Rows)-1] = nil
+	table.Rows = table.Rows[:len(table.Rows)-1]
+	table.Version++
+	table.dirtyFrom = -1
+	table.Stats = &TableStats{RowCount: 2, Stale: true}
+	db.RestoreStatementSnapshot(snapshot)
+	db.UnlockContentForWrite()
+
+	if len(table.Rows) != 3 || table.Rows[0][0] != 1 || table.Rows[1][0] != 2 || table.Rows[2][0] != 3 {
+		t.Fatalf("rows after point-delete restore = %#v", table.Rows)
+	}
+	if got := string(table.Rows[1][1].([]byte)); got != "two" {
+		t.Fatalf("restored BLOB = %q, want two", got)
+	}
+	if table.Version != 9 || table.dirtyFrom != 2 {
+		t.Fatalf("metadata after restore = version %d, dirtyFrom %d; want 9, 2", table.Version, table.dirtyFrom)
+	}
+	if table.Stats == nil || table.Stats.Stale || table.Stats.Columns["id"].DistinctCount != 3 {
+		t.Fatalf("statistics were not restored: %#v", table.Stats)
+	}
+}
+
 func TestFullStatementSnapshotRestoresAllTablesAndDropsNewTables(t *testing.T) {
 	db := NewDB()
 	t.Cleanup(func() { _ = db.Close() })
@@ -112,6 +204,12 @@ func TestTableScopedSnapshotsRejectMissingTable(t *testing.T) {
 	}
 	if _, err := db.SnapshotForAppendOnlyTableStatement("default", "missing"); err == nil {
 		t.Fatal("append-only snapshot of missing table succeeded")
+	}
+	if _, err := db.SnapshotForRowUpdateStatement("default", "missing", []int{0}); err == nil {
+		t.Fatal("row-update snapshot of missing table succeeded")
+	}
+	if _, err := db.SnapshotForRowDeleteStatement("default", "missing", []int{0}); err == nil {
+		t.Fatal("row-delete snapshot of missing table succeeded")
 	}
 }
 

@@ -20,7 +20,7 @@ const SQL_KEYWORDS = [
     'GEO_POINT', 'GEO_DISTANCE', 'GEO_WITHIN_BBOX', 'FTS_MATCH', 'FTS_RANK', 'FTS_SEARCH',
     'FTS_SNIPPET', 'BM25', 'CONTAINS_ALL', 'CONTAINS_ANY', 'CONTAINS_SCORE',
     'VEC_FROM_JSON', 'VEC_SEARCH', 'VEC_COSINE_SIMILARITY', 'VEC_BINARY_QUANTIZE',
-    'VEC_HAMMING_DISTANCE', 'VEC_CENTROID', 'VEC_DISTANCE',
+    'VEC_HAMMING_DISTANCE', 'VEC_CENTROID', 'VEC_DISTANCE', 'HYBRID_SEARCH', 'VEC_HYBRID_SEARCH',
     'RAG_CONTEXT', 'RAG_CONTEXT_FROM', 'RAG_SEARCH', 'RAG_HYBRID_SCORE', 'RAG_RANK_SCORE',
     'RECENCY_SCORE', 'HASH', 'URL_PARSE', 'YAML_GET', 'CALL', 'ANALYZE', 'ROUND'
 ];
@@ -29,6 +29,7 @@ let wasmApi = {
     importFile: null,
     executeQuery: null,
     executeMulti: null,
+    getResultPage: null,
     clearDatabase: null,
     dropTable: null,
     listTables: null,
@@ -310,6 +311,7 @@ async function initWasm() {
         wasmApi.importFile = window.importFile;
         wasmApi.executeQuery = window.executeQuery;
         wasmApi.executeMulti = window.executeMulti;
+        wasmApi.getResultPage = window.getResultPage;
         wasmApi.clearDatabase = window.clearDatabase;
         wasmApi.dropTable = window.dropTable;
         wasmApi.listTables = window.listTables;
@@ -686,6 +688,20 @@ const DEMO_AI_DOCS = [
     }
 ];
 
+const DEMO_AI_DOCS_SQL = `DROP TABLE IF EXISTS ai_docs;
+CREATE TABLE ai_docs (
+    id INT PRIMARY KEY,
+    title TEXT,
+    category TEXT,
+    content TEXT,
+    embedding VECTOR
+);
+INSERT INTO ai_docs VALUES
+    (1, 'Vector Search', 'ai', 'Vector search finds semantically similar records with embeddings and nearest-neighbor ranking.', '[1.0, 0.0, 0.0]'),
+    (2, 'Full Text Search', 'search', 'Full text search ranks documents by matching query terms, phrases, and boolean expressions.', '[0.0, 1.0, 0.0]'),
+    (3, 'Geo Analytics', 'geo', 'Geo analytics combines coordinates, distances, bounding boxes, and routing graph data.', '[0.0, 0.0, 1.0]'),
+    (4, 'Hybrid Retrieval', 'ai', 'Hybrid retrieval combines full text ranking with vector similarity for RAG applications.', '[0.8, 0.2, 0.0]')`;
+
 const DEMO_RAG_CHUNKS = [
     { doc_id: 'tinySQL', chunk_index: 0, chunk_text: 'tinySQL added browser-ready file analytics, query history, snapshots, and shareable URL hash demos.', quality: 0.78, created_at: '2026-07-08 10:00:00', embedding: '[0.9, 0.2, 0.0]' },
     { doc_id: 'tinySQL', chunk_index: 1, chunk_text: 'Geodata imports now cover GeoJSON, KML ExtendedData and MultiGeometry, OSM XML, routing graph NDJSON, Shapefile ZIP, and MBTiles metadata.', quality: 0.94, created_at: '2026-07-08 11:00:00', embedding: '[1.0, 0.1, 0.1]' },
@@ -693,6 +709,23 @@ const DEMO_RAG_CHUNKS = [
     { doc_id: 'tinySQL', chunk_index: 3, chunk_text: 'SQL analytics gained CTE views, materialized views, PIVOT, RETURNING, EXPLAIN, SQLite-compatible PRAGMA metadata, and richer sys catalog tables.', quality: 0.91, created_at: '2026-07-08 13:00:00', embedding: '[0.4, 0.9, 0.2]' },
     { doc_id: 'ops', chunk_index: 0, chunk_text: 'Operational work added RBAC, audit logging, storage and WAL improvements, tinysqld HTTP APIs, MCP server tools, and tinyORM examples.', quality: 0.86, created_at: '2026-07-08 14:00:00', embedding: '[0.2, 0.4, 1.0]' }
 ];
+
+const DEMO_RAG_CHUNKS_SQL = `DROP TABLE IF EXISTS rag_chunks;
+CREATE TABLE rag_chunks (
+    chunk_id INT PRIMARY KEY,
+    doc_id TEXT,
+    chunk_index INT,
+    chunk_text TEXT,
+    quality FLOAT,
+    created_at TEXT,
+    embedding VECTOR
+);
+INSERT INTO rag_chunks VALUES
+    (1, 'tinySQL', 0, 'tinySQL added browser-ready file analytics, query history, snapshots, and shareable URL hash demos.', 0.78, '2026-07-08 10:00:00', '[0.9, 0.2, 0.0]'),
+    (2, 'tinySQL', 1, 'Geodata imports now cover GeoJSON, KML ExtendedData and MultiGeometry, OSM XML, routing graph NDJSON, Shapefile ZIP, and MBTiles metadata.', 0.94, '2026-07-08 11:00:00', '[1.0, 0.1, 0.1]'),
+    (3, 'tinySQL', 2, 'RAG helpers combine FTS snippets, vector search, context expansion, recency scoring, and quality-weighted hybrid ranking.', 0.96, '2026-07-08 12:00:00', '[0.8, 0.6, 0.1]'),
+    (4, 'tinySQL', 3, 'SQL analytics gained CTE views, materialized views, PIVOT, RETURNING, EXPLAIN, SQLite-compatible PRAGMA metadata, and richer sys catalog tables.', 0.91, '2026-07-08 13:00:00', '[0.4, 0.9, 0.2]'),
+    (5, 'ops', 0, 'Operational work added RBAC, audit logging, storage and WAL improvements, tinysqld HTTP APIs, MCP server tools, and tinyORM examples.', 0.86, '2026-07-08 14:00:00', '[0.2, 0.4, 1.0]')`;
 
 const DEMO_RELEASE_FEATURES = [
     { area: 'Search/RAG', feature: 'RAG_SEARCH composed vector, keyword, and context retrieval', added: '2026-07-25', browser_demo: 'Direct RAG_SEARCH table function with reciprocal-rank fusion and neighbor expansion' },
@@ -729,12 +762,12 @@ const SHAREABLE_DEMOS = {
         query: `-- Shareable Geo demo: zones + hubs\nSELECT z.zone_name, p.city, p.role,\n       ROUND(ST_DISTANCE(p.geometry, ST_MakePoint(13.4050, 52.5200)) / 1000, 1) AS km_from_berlin\nFROM places_geo p\nJOIN geo_zones z ON ST_WITHIN_BBOX(p.geometry, z.min_lon, z.min_lat, z.max_lon, z.max_lat)\nORDER BY z.zone_name, km_from_berlin`
     },
     rag: {
-        title: 'FTS + vector retrieval',
-        description: 'A compact RAG-style corpus with full-text ranking and vector similarity running in the browser.',
+        title: 'Hybrid vector + wildcard search',
+        description: 'One term drives semantic vector and wildcard-aware full-text retrieval, fused with reciprocal-rank fusion.',
         icon: '🧠',
         tables: ['ai_docs'],
         autoRun: true,
-        query: `-- Shareable RAG demo: full-text + vector score\nSELECT title, category,\n       FTS_RANK(content, 'vector OR search') AS text_rank,\n       VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[1.0, 0.0, 0.0]')) AS vector_similarity\nFROM ai_docs\nWHERE FTS_MATCH(content, 'vector OR search')\nORDER BY vector_similarity DESC`
+        query: `-- Hybrid search: ? matches one character, * matches many\nSELECT id, title, category, _vec_rank, _fts_rank, _rrf_rank, _rrf_score\nFROM HYBRID_SEARCH(\n    'ai_docs', 'embedding', 'content', 'vect?r* OR retrieval',\n    VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 4,\n    '{"key_columns":["id"]}'\n)\nORDER BY _rrf_rank`
     },
     ragsearch: {
         title: 'Composed RAG search',
@@ -821,7 +854,7 @@ function getDemoDefaultQuery(tableName) {
         routes_rg: `SELECT edge_id, source, target, distance, duration, mode\nFROM routes_rg\nORDER BY distance`,
         geo_zones: `SELECT z.zone_name, p.city, p.role\nFROM places_geo p\nJOIN geo_zones z ON ST_WITHIN_BBOX(p.geometry, z.min_lon, z.min_lat, z.max_lon, z.max_lat)\nORDER BY z.zone_name, p.city`,
         settings_yaml: `SELECT service, region, active, replicas\nFROM settings_yaml\nORDER BY service`,
-        ai_docs: `SELECT title, category,\n       FTS_RANK(content, 'vector OR search') AS text_rank,\n       VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[1.0, 0.0, 0.0]')) AS vector_similarity\nFROM ai_docs\nWHERE FTS_MATCH(content, 'vector OR search')\nORDER BY vector_similarity DESC`,
+        ai_docs: `SELECT id, title, category, _vec_rank, _fts_rank, _rrf_rank, _rrf_score\nFROM HYBRID_SEARCH(\n    'ai_docs', 'embedding', 'content', 'vect?r* OR retrieval',\n    VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 4,\n    '{"key_columns":["id"]}'\n)\nORDER BY _rrf_rank`,
         rag_chunks: `WITH topk AS (\n    SELECT doc_id, chunk_index, _vec_rank\n    FROM VEC_SEARCH('rag_chunks', 'embedding', VEC_FROM_JSON('[0.8, 0.6, 0.1]'), 1, 'cosine')\n)\nSELECT doc_id, chunk_index, chunk_text, _hit_rank, _context_offset\nFROM RAG_CONTEXT_FROM('rag_chunks', 'doc_id', 'chunk_index', 'topk', 'doc_id', 'chunk_index', 1)\nORDER BY _context_rank`,
         release_features: `SELECT area, feature, browser_demo\nFROM release_features\nORDER BY area, feature`
     };
@@ -848,11 +881,15 @@ function demoTablePayload(tableName) {
     }
     const data = typeof demo.getData === 'function' ? demo.getData() : demo.data;
     const fileName = demo.fileName || `${tableName}.json`;
-    return {
+    const payload = {
         name: tableName,
         fileName,
         content: typeof data === 'string' ? data : JSON.stringify(data),
     };
+    if (demo.setupSQL) {
+        payload.setupSQL = typeof demo.setupSQL === 'function' ? demo.setupSQL() : demo.setupSQL;
+    }
+    return payload;
 }
 
 function buildShareableDemoPayload(demoId) {
@@ -926,7 +963,7 @@ function renderIntroPage() {
     if (!resultsContainer || decodeDemoHash()) {
         return;
     }
-    const starterDemoIDs = ['analytics', 'geo'];
+    const starterDemoIDs = ['analytics', 'geo', 'rag'];
     const cards = starterDemoIDs.map((id) => [id, SHAREABLE_DEMOS[id]]).map(([id, demo]) => `
         <div class="intro-card">
             <h3>${demo.icon} ${escapeHtml(demo.title)}</h3>
@@ -1077,12 +1114,14 @@ const DEMO_TABLES = {
     ai_docs: {
         name: 'ai_docs',
         fileName: 'ai_docs.json',
-        getData: () => DEMO_AI_DOCS
+        getData: () => DEMO_AI_DOCS,
+        setupSQL: DEMO_AI_DOCS_SQL
     },
     rag_chunks: {
         name: 'rag_chunks',
         fileName: 'rag_chunks.json',
-        getData: () => DEMO_RAG_CHUNKS
+        getData: () => DEMO_RAG_CHUNKS,
+        setupSQL: DEMO_RAG_CHUNKS_SQL
     },
     release_features: {
         name: 'release_features',
@@ -1109,12 +1148,19 @@ async function loadDemoTable(tableName) {
 
         if (wasmReady && typeof wasmApi.importFile === 'function') {
             try {
-                const result = wasmApi.importFile(fileName, fileContent, tableName);
+                const result = demo.setupSQL && typeof wasmApi.executeMulti === 'function'
+                    ? wasmApi.executeMulti(demo.setupSQL)
+                    : wasmApi.importFile(fileName, fileContent, tableName);
                 if (result && result.success) {
+                    const schema = demo.setupSQL && typeof wasmApi.getTableSchema === 'function'
+                        ? wasmApi.getTableSchema(tableName)
+                        : null;
                     const tableInfo = {
                         name: tableName,
-                        rowCount: result.rowsImported,
-                        columns: Array.isArray(result.columns) ? result.columns.map(c => String(c)) : []
+                        rowCount: schema?.success ? schema.rows : result.rowsImported,
+                        columns: schema?.success && Array.isArray(schema.columns)
+                            ? schema.columns.map(c => typeof c === 'object' ? String(c.name) : String(c))
+                            : (Array.isArray(result.columns) ? result.columns.map(c => String(c)) : [])
                     };
                     const existingIndex = currentTables.findIndex(t => t.name === tableName);
                     if (existingIndex >= 0) {
@@ -1126,7 +1172,7 @@ async function loadDemoTable(tableName) {
                     if (isRoutingGraphFile(fileName)) {
                         loadTables();
                     }
-                    updateStatus(`Demo table "${tableName}" loaded: ${result.rowsImported} rows`);
+                    updateStatus(`Demo table "${tableName}" loaded: ${tableInfo.rowCount} rows`);
                     if (Object.prototype.hasOwnProperty.call(DEMO_TABLES, tableName)) {
                         showDemoQueries();
                     }
@@ -1166,14 +1212,21 @@ async function importDemoPayloadTable(table) {
         throw new Error('Invalid demo table payload');
     }
     const fileName = table.fileName || `${table.name}.json`;
-    const result = wasmApi.importFile(fileName, table.content, table.name);
+    const result = typeof table.setupSQL === 'string' && table.setupSQL.trim() && typeof wasmApi.executeMulti === 'function'
+        ? wasmApi.executeMulti(table.setupSQL)
+        : wasmApi.importFile(fileName, table.content, table.name);
     if (!result || !result.success) {
         throw new Error(result?.error || `Import failed for ${table.name}`);
     }
+    const schema = typeof wasmApi.getTableSchema === 'function'
+        ? wasmApi.getTableSchema(table.name)
+        : null;
     return {
         name: table.name,
-        rowCount: result.rowsImported,
-        columns: Array.isArray(result.columns) ? result.columns.map(c => String(c)) : [],
+        rowCount: schema?.success ? schema.rows : result.rowsImported,
+        columns: schema?.success && Array.isArray(schema.columns)
+            ? schema.columns.map(c => typeof c === 'object' ? String(c.name) : String(c))
+            : (Array.isArray(result.columns) ? result.columns.map(c => String(c)) : []),
     };
 }
 
@@ -1420,7 +1473,7 @@ const DEMO_QUERY_REQUIREMENTS = {
     '⚙️ YAML Import': 'settings_yaml',
     '🔎 FTS Search': 'ai_docs',
     '🧠 Vector Search': 'ai_docs',
-    '🧩 Hybrid Retrieval': 'ai_docs',
+    '🧩 HYBRID_SEARCH + Wildcards': 'ai_docs',
     '🔗 RAG Context': 'rag_chunks',
     '✂️ FTS Snippet': 'ai_docs',
     '🧠 RAG_SEARCH': 'rag_chunks',
@@ -2395,7 +2448,9 @@ function formatQuery() {
 
 // Execute query (UI handler)
 async function onExecuteClick() {
-    const query = document.getElementById('queryEditor').value.trim();
+    const editor = document.getElementById('queryEditor');
+    const selectedQuery = editor.value.slice(editor.selectionStart, editor.selectionEnd).trim();
+    const query = selectedQuery || editor.value.trim();
     
     if (!query) {
         alert('Please enter a query');
@@ -2446,17 +2501,21 @@ async function onExecuteClick() {
             currentResults = {
                 columns: cols,
                 rows: rows,
-                rowCount: rows.length,
-                duration: duration
+                rowCount: Number.isFinite(Number(result.totalRows)) ? Number(result.totalRows) : rows.length,
+                filteredRowCount: Number.isFinite(Number(result.filteredRows)) ? Number(result.filteredRows) : rows.length,
+                pageOffset: Number.isFinite(Number(result.pageOffset)) ? Number(result.pageOffset) : 0,
+                serverPaged: Boolean(result.serverPaged && typeof wasmApi.getResultPage === 'function'),
+                pageKey: `1|${DEFAULT_RESULT_PAGE_SIZE}|||asc`,
+                duration: duration,
             };
             renderResults(currentResults);
-            updateStatus(`Query completed: ${currentResults.rowCount} rows in ${duration}${result.statementsRun > 1 ? ` (${result.statementsRun} statements)` : ''}`);
-            pushHistory(query, duration, rows.length);
+            pushHistory(query, duration, currentResults.rowCount);
             saveEditorState();
             if (sqlMayMutate(query)) {
                 loadTables();
                 scheduleDatabaseSnapshotSave();
             }
+            updateStatus(`Query completed: ${currentResults.rowCount} rows in ${duration}${result.statementsRun > 1 ? ` (${result.statementsRun} statements)` : ''}`);
         } else {
             const errMsg = result && result.error ? result.error : 'Unknown error';
             resultsContainer.innerHTML = `
@@ -2508,22 +2567,47 @@ function renderResults(data) {
         return;
     }
 
-    const visible = getVisibleResults(data);
-    const displayedRows = visible ? visible.rows : [];
-    const displayedColumns = visible ? visible.columns : [];
-    const totalRows = data.rows.length;
     const pageSize = RESULT_PAGE_SIZES.includes(resultViewState.pageSize)
         ? resultViewState.pageSize
         : DEFAULT_RESULT_PAGE_SIZE;
-    const totalPages = Math.max(1, Math.ceil(displayedRows.length / pageSize));
+    const pageKey = `${resultViewState.page}|${pageSize}|${resultViewState.filterText}|${resultViewState.sortColumn}|${resultViewState.sortDirection}`;
+    if (data.serverPaged && data.pageKey !== pageKey) {
+        const pageOffset = (Math.max(1, resultViewState.page) - 1) * pageSize;
+        const pageResult = wasmApi.getResultPage(
+            pageOffset,
+            pageSize,
+            resultViewState.filterText,
+            resultViewState.sortColumn,
+            resultViewState.sortDirection
+        );
+        if (!pageResult || !pageResult.success) {
+            resultsContainer.innerHTML = `
+                <div class="error-message">
+                    <strong>Result paging failed:</strong> ${escapeHtml(pageResult?.error || 'Unknown error')}
+                </div>
+            `;
+            return;
+        }
+        data.rows = Array.isArray(pageResult.rows) ? pageResult.rows : [];
+        data.filteredRowCount = Number(pageResult.filteredRows) || 0;
+        data.pageOffset = Number(pageResult.pageOffset) || 0;
+        data.pageKey = pageKey;
+    }
+
+    const visible = getVisibleResults(data);
+    const displayedRows = visible ? visible.rows : [];
+    const displayedColumns = visible ? visible.columns : [];
+    const totalRows = data.serverPaged ? data.rowCount : data.rows.length;
+    const filteredRows = data.serverPaged ? data.filteredRowCount : displayedRows.length;
+    const totalPages = Math.max(1, Math.ceil(filteredRows / pageSize));
     const page = Math.min(Math.max(1, resultViewState.page), totalPages);
     resultViewState.page = page;
-    const rowStart = (page - 1) * pageSize;
-    const renderedRows = displayedRows.slice(rowStart, rowStart + pageSize);
-    const renderIsPaginated = displayedRows.length > pageSize;
+    const rowStart = data.serverPaged ? data.pageOffset : (page - 1) * pageSize;
+    const renderedRows = data.serverPaged ? displayedRows : displayedRows.slice(rowStart, rowStart + pageSize);
+    const renderIsPaginated = filteredRows > pageSize;
     const rowEnd = rowStart + renderedRows.length;
 
-    if (!visible || displayedRows.length === 0) {
+    if (!visible || filteredRows === 0) {
         window.clearVanillaGrid?.();
         setOpenVanillaGridEnabled(false);
         resultsContainer.innerHTML = `
@@ -2546,10 +2630,10 @@ function renderResults(data) {
     const tableHtml = `
         <div class="results-header">
             <div class="results-info">
-                <strong>${displayedRows.length}</strong> / <strong>${totalRows}</strong> rows • 
-                <strong>${displayedColumns.length}</strong> columns • 
+                <strong>${filteredRows}</strong> / <strong>${totalRows}</strong> rows •
+                <strong>${displayedColumns.length}</strong> columns •
                 ${data.duration}
-                ${renderIsPaginated ? `<br><span>Showing rows ${rowStart + 1}–${rowEnd}; exports use the full filtered result.</span>` : ''}
+                ${renderIsPaginated ? `<br><span>Showing rows ${rowStart + 1}–${rowEnd}. Filtering and sorting run in WASM; copy and grid use this page.</span>` : ''}
             </div>
             <div class="results-actions">
                 <button onclick="copyResultsToClipboard()">Copy Results</button>
@@ -2813,6 +2897,15 @@ function getVisibleResults(source = currentResults) {
         return null;
     }
 
+    if (source.serverPaged) {
+        return {
+            columns: source.columns.slice(),
+            rows: source.rows.slice(),
+            rowCount: source.filteredRowCount,
+            duration: source.duration,
+        };
+    }
+
     let rows = source.rows.slice();
     const filterText = resultViewState.filterText.trim().toLowerCase();
     if (filterText) {
@@ -2950,7 +3043,8 @@ function changeResultPage(delta) {
         return;
     }
     const visible = getVisibleResults(currentResults);
-    const totalPages = Math.max(1, Math.ceil(visible.rows.length / resultViewState.pageSize));
+    const resultCount = currentResults.serverPaged ? currentResults.filteredRowCount : visible.rows.length;
+    const totalPages = Math.max(1, Math.ceil(resultCount / resultViewState.pageSize));
     resultViewState.page = Math.min(Math.max(1, resultViewState.page + delta), totalPages);
     renderResults(currentResults);
 }

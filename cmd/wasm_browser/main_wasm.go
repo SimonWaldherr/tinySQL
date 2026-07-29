@@ -16,6 +16,8 @@ import (
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
+const wasmQueryCacheSize = 256
+
 // Global state
 var (
 	ctx = context.Background()
@@ -28,6 +30,7 @@ var (
 	transactionDB *storage.DB
 	wasmTenant    = "default"
 	wasmConnected bool
+	queryCache    = tsql.NewQueryCache(wasmQueryCacheSize)
 )
 
 // QueryResult represents the result of a SQL query
@@ -100,6 +103,7 @@ func bindStorageDB(next *storage.DB, dsn string) error {
 	transactionDB = nil
 	wasmTenant = tenant
 	wasmConnected = true
+	queryCache.Clear()
 	return nil
 }
 
@@ -134,11 +138,11 @@ func executeWASMStatement(sqlText string) (*tsql.ResultSet, error) {
 	if source == nil {
 		return nil, fmt.Errorf("database not opened")
 	}
-	stmt, err := tsql.ParseSQL(sqlText)
+	compiled, err := queryCache.Compile(sqlText)
 	if err != nil {
 		return nil, err
 	}
-	return tsql.Execute(ctx, source, wasmTenant, stmt)
+	return tsql.ExecuteCompiled(ctx, source, wasmTenant, compiled)
 }
 
 // jsOpen opens a database connection
@@ -452,11 +456,14 @@ func jsQuery(this js.Value, args []js.Value) any {
 		Rows:    make([][]any, 0, len(resultSet.Rows)),
 	}
 
+	lowerColumns := make([]string, len(resultSet.Cols))
+	for i, column := range resultSet.Cols {
+		lowerColumns[i] = strings.ToLower(column)
+	}
 	for _, sourceRow := range resultSet.Rows {
 		row := make([]any, len(resultSet.Cols))
-		for i, column := range resultSet.Cols {
-			value, _ := tsql.GetVal(sourceRow, column)
-			row[i] = convertValue(value)
+		for i, column := range lowerColumns {
+			row[i] = convertValue(sourceRow[column])
 		}
 		result.Rows = append(result.Rows, row)
 	}
@@ -476,6 +483,7 @@ func jsClose(this js.Value, args []js.Value) any {
 	transactionDB = nil
 	wasmStorageDB = nil
 	wasmConnected = false
+	queryCache.Clear()
 
 	logInfo("Database connection closed successfully")
 	return jsonResponse(APIResponse{Success: true, Message: "Database closed"})

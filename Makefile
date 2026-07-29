@@ -268,10 +268,10 @@ bench-engine:
 	@echo "$(GREEN)Running engine benchmarks...$(NC)"
 	$(GO) test -run=none -bench=. -benchmem ./internal/engine
 
-## bench-hotpaths: Benchmark optimized SELECT, INSERT, and trigger hot paths
+## bench-hotpaths: Benchmark optimized SELECT, INSERT, UPDATE, DELETE, and trigger hot paths
 bench-hotpaths:
 	@echo "$(GREEN)Running hot-path benchmarks ($(BENCH_COUNT)x)...$(NC)"
-	$(GO) test -run=none -bench='^(BenchmarkOrderByWithLimit|BenchmarkInsertIntoLargePKTable|BenchmarkTriggerBatchInsert)$$' -benchmem -count=$(BENCH_COUNT) ./internal/engine
+	$(GO) test -run=none -bench='^(BenchmarkOrderByWithLimit|BenchmarkInsertIntoLargePKTable|BenchmarkUpdateByPrimaryKey|BenchmarkDeleteByPrimaryKey|BenchmarkTriggerBatchInsert)$$' -benchmem -count=$(BENCH_COUNT) ./internal/engine
 	$(GO) test -run=none -bench='^BenchmarkExecute_Insert$$' -benchmem -count=$(BENCH_COUNT) .
 
 ## lint: Run linter (golangci-lint)

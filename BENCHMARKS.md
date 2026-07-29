@@ -199,12 +199,10 @@ missing capability, not an engine-vs-engine result.
   faster than either — most SQLite deployments do not run `synchronous=FULL`.
 - **Aggregation is tinySQL's strongest result** — 5x faster than SQLite in
   memory, 6–17x faster on the durable configuration.
-- **UPDATE is the largest remaining gap.** Logging only the rows an UPDATE
-  actually replaced, instead of the whole table, took `tinySQL/wal` from
-  31–48 ms to 4.2–6.5 ms; what remains is engine-side, and in-memory UPDATE is
-  still ~60x slower than SQLite. Two measured causes: `WHERE id = ?` scans every
-  row instead of seeking the primary key, and the statement's rollback point
-  deep-copies every cell of the table.
+- **Primary-key UPDATE no longer scans or snapshots the whole table.** The
+  constraint index bounds both execution and the atomic rollback point to the
+  candidate row. Trigger/FK updates and assignments touching a secondary index
+  retain the conservative full snapshot.
 - **JOIN is 3–5x slower** than SQLite — the second gap worth closing.
 - **Batched inserts are ~3x slower**: a transaction commit re-serializes each
   changed table rather than appending row deltas.
@@ -222,32 +220,52 @@ missing capability, not an engine-vs-engine result.
   writes: no incremental/append writes at the page level yet, so every
   `SaveTable` serializes the whole table. A known optimization target, not the
   page format's ceiling.
-- `PointQuery` is currently unfair to SQLite in tinySQL's favor (index seek vs.
-  full scan); an indexed point-query benchmark is the natural addition.
+- Primary-key and UNIQUE point lookups reuse the in-memory constraint index;
+  secondary-index comparisons should still create equivalent indexes on both
+  engines.
+
+### Primary-key UPDATE fast path
+
+`BenchmarkParityUpdateByPK/tinySQL/mem`, 10,000 rows, 100 point updates per
+sample, five samples on Apple M2 Max:
+
+| metric (median) | before | after | change |
+|---|---:|---:|---:|
+| latency | 304,049 ns/op | 7,657 ns/op | **39.7x faster** |
+| allocated bytes | 984,592 B/op | 4,607 B/op | **99.5% less** |
+| allocations | 220 allocs/op | 96 allocs/op | **56% less** |
+
+The execution plan seeks the existing PRIMARY KEY/UNIQUE constraint hash and
+still evaluates the complete predicate on the candidate, so residual `AND`
+terms preserve SQL semantics. Statement atomicity uses a row-local snapshot
+that deep-copies mutable BLOB cells and restores table statistics and WAL dirty
+metadata on failure.
+
+### Primary-key DELETE fast path
+
+`BenchmarkDeleteByPrimaryKey`, 20,000 rows, one successful point delete per
+sample, ten samples on Apple M2 Max:
+
+| constraint cache | latency (median) | allocated bytes | vs. previous 1.51 ms |
+|---|---:|---:|---:|
+| warm | 24.4 µs | 2,944 B/op | **61.8x faster** |
+| cold | 89.3 µs | 2,880 B/op | **16.9x faster** |
+
+Before the change, DELETE allocated about 2.53 MB/op for a full rollback clone,
+survivor slice, and row-position map. The point path now saves one rollback row,
+evaluates the complete predicate only on the constraint candidate, shifts the
+remaining row headers in place, and adjusts secondary-index RowIDs without an
+O(n) map. A cold constraint cache deliberately scans just the constrained
+column rather than building a hash table that the successful delete would
+immediately invalidate.
 
 ## Next steps
 
-1. Close the UPDATE gap measured by the parity suite, in profile order:
-   a. Seek the primary key for `WHERE pk = ?` in UPDATE/DELETE instead of
-      scanning every row.
-   b. Replace the whole-table rollback clone for an in-place UPDATE with an undo
-      journal of the rows it replaced. A single-row UPDATE deep-copies every
-      cell of the table to get a rollback point; that is ~1 ms of the ~1 ms
-      in-memory figure. Copying only row headers is *not* a valid shortcut —
-      `TestFullStatementSnapshotRestoresAllTablesAndDropsNewTables` documents
-      that a snapshot also protects against in-place cell writes.
-   c. Append row deltas at COMMIT instead of re-serializing each changed table,
-      which is what makes batched inserts ~3x slower than SQLite.
-2. Make the tinySQL side of `PointQuery` use an index. `CREATE INDEX` builds a
-   real secondary index (`executeCreateIndex`,
-   `internal/engine/exec_ddl_table.go`) and the planner seeks it for equality
-   point/prefix predicates (`selectSecondaryIndex`, `internal/engine/exec.go`),
-   but a declared `PRIMARY KEY` does not create one — so either index the PK
-   column implicitly or add an indexed point-query benchmark comparing
-   index-seek vs. index-seek.
-3. Extend the row-count sweep beyond current sizes (10k/100k rows) to find where
+1. Append row deltas at transaction COMMIT instead of re-serializing each
+   changed table, which is what makes batched inserts ~3x slower than SQLite.
+2. Extend the row-count sweep beyond current sizes (10k/100k rows) to find where
    the bulk-insert crossover with SQLite happens.
-4. Extend the raw-row aggregate fast path to multi-column `GROUP BY` (currently
+3. Extend the raw-row aggregate fast path to multi-column `GROUP BY` (currently
    a single group-by column) and to `HAVING` clauses that only reference
    already-computed aggregates.
 

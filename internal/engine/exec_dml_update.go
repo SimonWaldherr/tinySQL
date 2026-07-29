@@ -132,6 +132,7 @@ type simpleUpdatePlan struct {
 	colIndex map[string]int
 	where    Expr
 	sets     []simpleUpdateSet
+	rowIDs   []int
 }
 
 type simpleUpdateSet struct {
@@ -155,9 +156,22 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 	if err != nil {
 		return nil, true, err
 	}
-	for ri, raw := range plan.table.Rows {
+	candidateCount := len(plan.table.Rows)
+	indexed := plan.rowIDs != nil
+	if indexed {
+		candidateCount = len(plan.rowIDs)
+	}
+	for candidate := 0; candidate < candidateCount; candidate++ {
+		ri := candidate
+		if indexed {
+			ri = plan.rowIDs[candidate]
+			if ri < 0 || ri >= len(plan.table.Rows) {
+				continue
+			}
+		}
+		raw := plan.table.Rows[ri]
 		// Check context cancellation every 64 rows to reduce channel-select overhead.
-		if ri&63 == 0 {
+		if candidate&63 == 0 {
 			if err := checkCtx(env.ctx); err != nil {
 				return nil, true, err
 			}
@@ -240,10 +254,15 @@ func buildSimpleUpdatePlan(env ExecEnv, s *Update) (*simpleUpdatePlan, bool, err
 		}
 		sets = append(sets, simpleUpdateSet{col: col, expr: expr})
 	}
+	var rowIDs []int
+	if candidates, _, _, found := selectConstraintIndex(table, colIndex, s.Where); found {
+		rowIDs = candidates
+	}
 	return &simpleUpdatePlan{
 		table:    table,
 		colIndex: colIndex,
 		where:    s.Where,
 		sets:     sets,
+		rowIDs:   rowIDs,
 	}, true, nil
 }

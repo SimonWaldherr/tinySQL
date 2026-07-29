@@ -19,7 +19,7 @@
 //
 //	word         – single term
 //	"phrase"     – exact phrase (consecutive tokens)
-//	word*        – prefix wildcard
+//	word*        – wildcard term (* / % = any sequence, ? / _ = one character)
 //	A AND B      – both terms must match
 //	A OR B       – either term must match
 //	NOT A        – term must not match
@@ -184,9 +184,12 @@ func evalFTSSnippet(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		querySet[q] = true
 	}
 
-	// isHighlighted checks if a word matches any query term or prefix.
+	// isHighlighted checks if a word matches any positive query atom.
 	isHighlighted := func(w string) bool {
 		stemmed := ftsStem(strings.ToLower(w))
+		if ftsHighlightToken(node, stemmed) {
+			return true
+		}
 		if querySet[stemmed] {
 			return true
 		}
@@ -252,6 +255,29 @@ func evalFTSSnippet(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	return sb.String(), nil
 }
 
+func ftsHighlightToken(node *ftsQueryNode, token string) bool {
+	if node == nil {
+		return false
+	}
+	switch node.op {
+	case "TERM":
+		return node.term == token
+	case "PREFIX":
+		return strings.HasPrefix(token, node.prefix)
+	case "WILDCARD":
+		return ftsWildcardMatch(node.pattern, token)
+	case "PHRASE":
+		for _, term := range node.phrase {
+			if term == token {
+				return true
+			}
+		}
+	case "AND", "OR":
+		return ftsHighlightToken(node.left, token) || ftsHighlightToken(node.right, token)
+	}
+	return false
+}
+
 // evalFTSHighlight is an alias for FTS_SNIPPET with a simpler 2-argument API.
 // FTS_HIGHLIGHT(text, query [, before, after]) highlights all matching tokens.
 func evalFTSHighlight(env ExecEnv, ex *FuncCall, row Row) (any, error) {
@@ -278,14 +304,26 @@ func getFTSFunctions() map[string]funcHandler {
 
 // ftsQueryNode represents one node in a parsed boolean FTS query tree.
 type ftsQueryNode struct {
-	op      string   // "AND", "OR", "NOT", "TERM", "PHRASE", "PREFIX"
+	op      string   // "AND", "OR", "NOT", "TERM", "PHRASE", "PREFIX", "WILDCARD"
 	term    string   // for TERM / PREFIX
 	phrase  []string // for PHRASE (stemmed tokens)
 	prefix  string   // for PREFIX (stem prefix without trailing *)
+	pattern []ftsWildcardAtom
 	left    *ftsQueryNode
 	right   *ftsQueryNode
 	operand *ftsQueryNode // for NOT
 }
+
+type ftsWildcardAtom struct {
+	rune rune
+	kind uint8
+}
+
+const (
+	ftsWildcardLiteral uint8 = iota
+	ftsWildcardOne
+	ftsWildcardMany
+)
 
 // ftsParseQuery converts a user query string into a boolean query tree.
 // Supported syntax:
@@ -392,7 +430,7 @@ func ftsParseUnary(tokens []string, pos int) (*ftsQueryNode, int) {
 	return ftsParseAtom(tokens, pos)
 }
 
-// ftsParseAtom parses a single atom: TERM, PHRASE, or PREFIX.
+// ftsParseAtom parses a single atom: TERM, PHRASE, PREFIX, or WILDCARD.
 func ftsParseAtom(tokens []string, pos int) (*ftsQueryNode, int) {
 	if pos >= len(tokens) {
 		return nil, pos
@@ -416,11 +454,16 @@ func ftsParseAtom(tokens []string, pos int) (*ftsQueryNode, int) {
 		return &ftsQueryNode{op: "PHRASE", phrase: stemmed}, pos
 	}
 
-	// Prefix wildcard.
-	if strings.HasSuffix(tok, "*") {
-		pfx := strings.ToLower(strings.TrimSuffix(tok, "*"))
+	// Keep the original prefix fast path for the common "word*" spelling.
+	// General wildcard terms below add * / % (zero or more characters) and
+	// ? / _ (exactly one character), anywhere inside a token.
+	if pfxRaw, ok := ftsSimplePrefix(tok); ok {
+		pfx := strings.ToLower(pfxRaw)
 		pfx = ftsStem(pfx) // stem the prefix
 		return &ftsQueryNode{op: "PREFIX", prefix: pfx}, pos
+	}
+	if pattern, ok := ftsCompileWildcard(tok); ok {
+		return &ftsQueryNode{op: "WILDCARD", pattern: pattern}, pos
 	}
 
 	// Plain term.
@@ -433,6 +476,96 @@ func ftsParseAtom(tokens []string, pos int) (*ftsQueryNode, int) {
 		term = strings.ToLower(tok)
 	}
 	return &ftsQueryNode{op: "TERM", term: term}, pos
+}
+
+// ftsSimplePrefix recognizes the historically-supported unescaped "word*"
+// form. Keeping it separate preserves stemming of the literal prefix while
+// more general wildcard patterns operate on the already-normalized index
+// tokens.
+func ftsSimplePrefix(s string) (string, bool) {
+	runes := []rune(s)
+	if len(runes) < 2 || (runes[len(runes)-1] != '*' && runes[len(runes)-1] != '%') {
+		return "", false
+	}
+	for i, r := range runes {
+		if r == '\\' || ((r == '*' || r == '?' || r == '%' || r == '_') && i != len(runes)-1) {
+			return "", false
+		}
+	}
+	return string(runes[:len(runes)-1]), true
+}
+
+// ftsCompileWildcard compiles a token wildcard without regular expressions,
+// so matching stays allocation-free in the FTS_SEARCH document loop.
+// Backslash quotes the next rune. SQL LIKE aliases (% and _) are accepted in
+// addition to the search-box spellings (* and ?).
+func ftsCompileWildcard(s string) ([]ftsWildcardAtom, bool) {
+	var atoms []ftsWildcardAtom
+	escaped := false
+	hasWildcard := false
+	for _, r := range []rune(strings.ToLower(s)) {
+		if escaped {
+			atoms = append(atoms, ftsWildcardAtom{rune: r, kind: ftsWildcardLiteral})
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			continue
+		}
+		switch r {
+		case '*', '%':
+			hasWildcard = true
+			if len(atoms) == 0 || atoms[len(atoms)-1].kind != ftsWildcardMany {
+				atoms = append(atoms, ftsWildcardAtom{kind: ftsWildcardMany})
+			}
+		case '?', '_':
+			hasWildcard = true
+			atoms = append(atoms, ftsWildcardAtom{kind: ftsWildcardOne})
+		default:
+			atoms = append(atoms, ftsWildcardAtom{rune: r, kind: ftsWildcardLiteral})
+		}
+	}
+	if escaped {
+		atoms = append(atoms, ftsWildcardAtom{rune: '\\', kind: ftsWildcardLiteral})
+	}
+	return atoms, hasWildcard
+}
+
+// ftsWildcardMatch matches one normalized token with the usual linear greedy
+// glob algorithm. FTS index tokens are ASCII letters/digits by construction,
+// so byte indexing is also character indexing and the hot document loop stays
+// allocation-free.
+func ftsWildcardMatch(pattern []ftsWildcardAtom, token string) bool {
+	tokenPos, patternPos := 0, 0
+	starPos, starTokenPos := -1, 0
+	for tokenPos < len(token) {
+		if patternPos < len(pattern) &&
+			(pattern[patternPos].kind == ftsWildcardOne ||
+				(pattern[patternPos].kind == ftsWildcardLiteral &&
+					pattern[patternPos].rune == rune(token[tokenPos]))) {
+			tokenPos++
+			patternPos++
+			continue
+		}
+		if patternPos < len(pattern) && pattern[patternPos].kind == ftsWildcardMany {
+			starPos = patternPos
+			patternPos++
+			starTokenPos = tokenPos
+			continue
+		}
+		if starPos >= 0 {
+			starTokenPos++
+			tokenPos = starTokenPos
+			patternPos = starPos + 1
+			continue
+		}
+		return false
+	}
+	for patternPos < len(pattern) && pattern[patternPos].kind == ftsWildcardMany {
+		patternPos++
+	}
+	return patternPos == len(pattern)
 }
 
 // ─────────────────────────── Match / Score using query tree ──────────────────
@@ -460,6 +593,8 @@ func ftsCollectTerms(node *ftsQueryNode, out map[string]bool) {
 		}
 	case "PREFIX":
 		out[node.prefix+"*"] = true
+	case "WILDCARD":
+		// Highlighting uses the query tree directly for wildcard terms.
 	case "NOT":
 		// Don't highlight negated terms.
 	case "AND", "OR":
@@ -479,6 +614,13 @@ func ftsMatchNode(node *ftsQueryNode, freq map[string]int, tokens []string) bool
 	case "PREFIX":
 		for tok := range freq {
 			if strings.HasPrefix(tok, node.prefix) {
+				return true
+			}
+		}
+		return false
+	case "WILDCARD":
+		for tok := range freq {
+			if ftsWildcardMatch(node.pattern, tok) {
 				return true
 			}
 		}
@@ -552,6 +694,14 @@ func ftsScoreNode(node *ftsQueryNode, freq map[string]int, normDocLen float64, i
 		var s float64
 		for tok, f := range freq {
 			if strings.HasPrefix(tok, node.prefix) {
+				s += termScore(tok, f)
+			}
+		}
+		return s
+	case "WILDCARD":
+		var s float64
+		for tok, f := range freq {
+			if ftsWildcardMatch(node.pattern, tok) {
 				s += termScore(tok, f)
 			}
 		}
@@ -939,7 +1089,8 @@ var ftsAutoOrExpandStopWords = map[string]bool{
 // import cmd/ragdemo, so the logic is duplicated here rather than shared).
 func ftsAutoOrExpand(query string) string {
 	fields := strings.FieldsFunc(strings.ToLower(query), func(r rune) bool {
-		return (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' && r != '-'
+		return (r < 'a' || r > 'z') && (r < '0' || r > '9') &&
+			r != '_' && r != '-' && r != '*' && r != '?' && r != '%' && r != '\\'
 	})
 	seen := make(map[string]bool)
 	terms := make([]string, 0, len(fields))

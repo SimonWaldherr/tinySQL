@@ -282,6 +282,85 @@ func BenchmarkInsertIntoLargePKTable(b *testing.B) {
 	}
 }
 
+// BenchmarkUpdateByPrimaryKey measures the common point-update path, including
+// statement atomicity. The constraint seek and row-local rollback snapshot
+// should keep work independent of the 20k-row table size.
+func BenchmarkUpdateByPrimaryKey(b *testing.B) {
+	db := storage.NewDB()
+	ctx := context.Background()
+	if _, err := Execute(ctx, db, "default", mustParse(
+		`CREATE TABLE updates (id INT PRIMARY KEY, score FLOAT, bucket INT)`)); err != nil {
+		b.Fatal(err)
+	}
+	table, err := db.Get("default", "updates")
+	if err != nil {
+		b.Fatal(err)
+	}
+	const rows = 20000
+	table.Rows = make([][]any, rows)
+	for i := 0; i < rows; i++ {
+		table.Rows[i] = []any{float64(i), float64(i), float64(i % 64)}
+	}
+	table.Version++
+	if _, err := Execute(ctx, db, "default", mustParse(
+		`CREATE INDEX idx_updates_bucket ON updates(bucket)`)); err != nil {
+		b.Fatal(err)
+	}
+	stmt := mustParse(`UPDATE updates SET score = 42 WHERE id = 12345`)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := Execute(ctx, db, "default", stmt); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkDeleteByPrimaryKey measures a point delete from a 20k-row table.
+// Use -benchtime=1x when comparing the successful-delete latency; subsequent
+// iterations intentionally measure the cold negative-lookup scan.
+func BenchmarkDeleteByPrimaryKey(b *testing.B) {
+	benchmarkDeleteByPrimaryKey(b, true)
+}
+
+func BenchmarkDeleteByPrimaryKeyColdConstraintCache(b *testing.B) {
+	benchmarkDeleteByPrimaryKey(b, false)
+}
+
+func benchmarkDeleteByPrimaryKey(b *testing.B, warmConstraintCache bool) {
+	db := storage.NewDB()
+	ctx := context.Background()
+	if _, err := Execute(ctx, db, "default", mustParse(
+		`CREATE TABLE deletes (id INT PRIMARY KEY, score FLOAT, bucket INT)`)); err != nil {
+		b.Fatal(err)
+	}
+	table, err := db.Get("default", "deletes")
+	if err != nil {
+		b.Fatal(err)
+	}
+	const rows = 20000
+	table.Rows = make([][]any, rows)
+	for i := 0; i < rows; i++ {
+		table.Rows[i] = []any{float64(i), float64(i), float64(i % 64)}
+	}
+	table.Version++
+	if warmConstraintCache {
+		// Direct row seeding bypasses normal INSERT constraint checks, which
+		// build this cache incrementally. Warm it to match a real table.
+		_ = getConstraintIndex(table, 0)
+	}
+	stmt := mustParse(`DELETE FROM deletes WHERE id = 12345`)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := Execute(ctx, db, "default", stmt); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkFTSSearchColdEachTime forces a cache rebuild every iteration by
 // bumping the table version, isolating the tokenization cost the cache
 // otherwise amortizes.

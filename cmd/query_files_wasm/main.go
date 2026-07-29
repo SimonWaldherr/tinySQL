@@ -49,6 +49,7 @@ func main() {
 	js.Global().Set("importFile", js.FuncOf(importFile))
 	js.Global().Set("executeQuery", js.FuncOf(executeQuery))
 	js.Global().Set("executeMulti", js.FuncOf(executeMulti))
+	js.Global().Set("getResultPage", js.FuncOf(getResultPage))
 	js.Global().Set("clearDatabase", js.FuncOf(clearDatabase))
 	js.Global().Set("dropTable", js.FuncOf(dropTable))
 	js.Global().Set("listTables", js.FuncOf(listTables))
@@ -72,7 +73,7 @@ func registerDemoStoredProcedures() {
 		return ctx.ExecuteSQL(`
 			SELECT 'Geo imports' AS area, 'GeoJSON, KML, OSM XML, routing graph, Shapefile ZIP, MBTiles' AS feature, 'partly direct in browser; binary formats in Go/CLI/server' AS wasm_status
 			UNION ALL SELECT 'Spatial SQL', 'ST_MakePoint, ST_X, ST_Y, ST_DISTANCE, ST_DWITHIN, ST_WITHIN_BBOX', 'direct'
-			UNION ALL SELECT 'Search/RAG', 'FTS_SEARCH, FTS_RANK, FTS_SNIPPET, VEC_SEARCH, RAG_CONTEXT, hybrid scoring', 'direct'
+			UNION ALL SELECT 'Search/RAG', 'HYBRID_SEARCH, wildcard FTS, VEC_SEARCH, RAG_SEARCH, RAG_CONTEXT', 'direct'
 			UNION ALL SELECT 'Analytics SQL', 'CTEs, views, materialized views, PIVOT, window functions, RETURNING, EXPLAIN', 'direct'
 			UNION ALL SELECT 'Introspection', 'sys.tables, sys.columns, sys.functions, sys.objects, sys.dependencies, PRAGMA compatibility', 'direct'
 			UNION ALL SELECT 'Operations', 'RBAC, audit logs, WAL/storage, tinysqld, MCP server, tinyORM', 'core/server-side; showcased as metadata and SQL recipes'
@@ -117,14 +118,14 @@ func executeSQLText(sqlText string) (*tinysql.ResultSet, error) {
 	return result, nil
 }
 
-func resultRowsToJS(result *tinysql.ResultSet) []interface{} {
-	safeRows := make([]interface{}, 0, len(result.Rows))
-	for _, row := range result.Rows {
-		outRow := make(map[string]interface{}, len(result.Cols))
-		for _, col := range result.Cols {
+func resultRowsToJS(columns []string, rows []tinysql.Row) []interface{} {
+	safeRows := make([]interface{}, 0, len(rows))
+	for _, row := range rows {
+		outRow := make(map[string]interface{}, len(columns))
+		for _, col := range columns {
 			val, ok := tinysql.GetVal(row, col)
 			if !ok || val == nil {
-				outRow[col] = ""
+				outRow[col] = nil
 				continue
 			}
 			switch v := val.(type) {
@@ -153,16 +154,63 @@ func successResultPayload(result *tinysql.ResultSet, statementsRun int) map[stri
 		return payload
 	}
 
+	page := buildResultPage(result, 0, defaultResultPageSize, "", "", "asc")
 	payload := map[string]interface{}{
-		"success":    true,
-		"columns":    stringsToInterfaces(result.Cols),
-		"rows":       resultRowsToJS(result),
-		"durationMs": lastQueryDurMs,
+		"success":      true,
+		"columns":      stringsToInterfaces(result.Cols),
+		"rows":         resultRowsToJS(result.Cols, page.Rows),
+		"totalRows":    page.TotalRows,
+		"filteredRows": page.FilteredRows,
+		"pageOffset":   page.Offset,
+		"pageLimit":    page.Limit,
+		"serverPaged":  true,
+		"durationMs":   lastQueryDurMs,
 	}
 	if statementsRun > 0 {
 		payload["statementsRun"] = statementsRun
 	}
 	return payload
+}
+
+// getResultPage filters, sorts, and pages the latest query result inside Go.
+// This avoids materializing thousands of row objects across syscall/js when
+// the browser can only render a small page at a time.
+func getResultPage(this js.Value, args []js.Value) interface{} {
+	if lastResult == nil {
+		return jsErr("No query result available")
+	}
+
+	offset := 0
+	limit := defaultResultPageSize
+	filterText := ""
+	sortColumn := ""
+	sortDirection := "asc"
+	if len(args) > 0 {
+		offset = args[0].Int()
+	}
+	if len(args) > 1 {
+		limit = args[1].Int()
+	}
+	if len(args) > 2 {
+		filterText = args[2].String()
+	}
+	if len(args) > 3 {
+		sortColumn = args[3].String()
+	}
+	if len(args) > 4 {
+		sortDirection = args[4].String()
+	}
+
+	page := buildResultPage(lastResult, offset, limit, filterText, sortColumn, sortDirection)
+	return map[string]interface{}{
+		"success":      true,
+		"columns":      stringsToInterfaces(lastResult.Cols),
+		"rows":         resultRowsToJS(lastResult.Cols, page.Rows),
+		"totalRows":    page.TotalRows,
+		"filteredRows": page.FilteredRows,
+		"pageOffset":   page.Offset,
+		"pageLimit":    page.Limit,
+	}
 }
 
 // importFile imports a file (CSV, JSON, XML) into the database.

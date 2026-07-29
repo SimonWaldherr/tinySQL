@@ -1875,8 +1875,8 @@
                 <div class="example-query" onclick="setQuery('-- Vector nearest-neighbor search\nSELECT title, category, _vec_distance, _vec_rank\nFROM VEC_SEARCH(\'ai_docs\', \'embedding\', VEC_FROM_JSON(\'[1.0, 0.0, 0.0]\'), 3, \'cosine\')')">
                     🧠 Vector Search
                 </div>
-                <div class="example-query" onclick="setQuery('-- Hybrid text + vector ranking\nSELECT title, category,\n       FTS_RANK(content, \'vector OR search\') AS text_rank,\n       VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON(\'[1.0, 0.0, 0.0]\')) AS vector_similarity\nFROM ai_docs\nWHERE FTS_MATCH(content, \'vector OR search\')\nORDER BY vector_similarity DESC')">
-                    🧩 Hybrid Retrieval
+                <div class="example-query" onclick="setQuery('-- Native hybrid search: ? = one character, * = many\nSELECT id, title, category, _vec_rank, _fts_rank, _rrf_rank, _rrf_score\nFROM HYBRID_SEARCH(\n    \'ai_docs\', \'embedding\', \'content\', \'vect?r* OR retrieval\',\n    VEC_FROM_JSON(\'[1.0, 0.0, 0.0]\'), 4,\n    \'{&quot;key_columns&quot;:[&quot;id&quot;]}\'\n)\nORDER BY _rrf_rank')">
+                    🧩 HYBRID_SEARCH + Wildcards
                 </div>
                 <div class="example-query" onclick="setQuery('-- RAG context expansion from vector top-k\nWITH topk AS (\n    SELECT doc_id, chunk_index, _vec_rank\n    FROM VEC_SEARCH(\'rag_chunks\', \'embedding\', VEC_FROM_JSON(\'[0.8, 0.6, 0.1]\'), 1, \'cosine\')\n)\nSELECT doc_id, chunk_index, chunk_text, _hit_rank, _context_offset\nFROM RAG_CONTEXT_FROM(\'rag_chunks\', \'doc_id\', \'chunk_index\', \'topk\', \'doc_id\', \'chunk_index\', 1)\nORDER BY _context_rank')">
                     🔗 RAG Context
@@ -1927,7 +1927,7 @@
                     <button class="btn-secondary" onclick="clearQuery()" aria-label="Clear query editor">Clear</button>
                     <button class="btn-secondary" onclick="formatQuery()" aria-label="Format SQL query">Format</button>
                     <button class="btn-secondary" onclick="copyQueryToClipboard()" aria-label="Copy SQL query">Copy SQL</button>
-                    <div class="editor-hint">Ctrl/Cmd+Enter to run • Ctrl/Cmd+Space autocomplete • Tab to indent • ↑ recall last query</div>
+                    <div class="editor-hint">Ctrl/Cmd+Enter runs the selection or full query • Ctrl/Cmd+Space autocomplete • Tab to indent • ↑ recall last query</div>
                 </div>
                 <div class="editor-shell">
                     <pre id="sqlHighlight" class="sql-highlighter" aria-hidden="true"></pre>
@@ -1937,7 +1937,7 @@ Example: SELECT * FROM my_table LIMIT 100;" aria-describedby="editorHelp" aria-e
                     <div id="autocompletePanel" class="autocomplete-panel hidden" role="listbox" aria-label="SQL suggestions" aria-hidden="true"></div>
                     <div id="editorLineCount" class="editor-line-count"></div>
                 </div>
-                <div id="editorHelp" class="sr-only">Write SQL here. Use Ctrl or Command plus Enter to execute. Use Tab to indent and the up arrow to recall the last query when the editor is empty.</div>
+                <div id="editorHelp" class="sr-only">Write SQL here. Use Ctrl or Command plus Enter to execute the selected SQL, or the full editor when nothing is selected. Use Tab to indent and the up arrow to recall the last query when the editor is empty.</div>
             </div>
 
             <!-- Results Area -->

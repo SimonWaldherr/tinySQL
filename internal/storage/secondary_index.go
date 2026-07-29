@@ -181,6 +181,32 @@ func (t *Table) ReindexSecondaryIndexRows(oldToNew map[int]int) {
 	}
 }
 
+// DeleteSecondaryIndexRow removes one stable row position and shifts every
+// later RowID down by one. Point DELETE uses this to avoid allocating an
+// old-to-new map proportional to the whole table.
+func (t *Table) DeleteSecondaryIndexRow(rowID int) {
+	for _, index := range t.Indexes {
+		entries := index.Entries[:0]
+		for _, entry := range index.Entries {
+			rowIDs := entry.RowIDs[:0]
+			for _, oldID := range entry.RowIDs {
+				switch {
+				case oldID < rowID:
+					rowIDs = append(rowIDs, oldID)
+				case oldID > rowID:
+					rowIDs = append(rowIDs, oldID-1)
+				}
+			}
+			if len(rowIDs) == 0 {
+				continue
+			}
+			entry.RowIDs = rowIDs
+			entries = append(entries, entry)
+		}
+		index.Entries = entries
+	}
+}
+
 // ClearSecondaryIndexes removes all RowIDs while retaining CREATE INDEX
 // metadata, as required after DELETE without a WHERE clause.
 func (t *Table) ClearSecondaryIndexes() {

@@ -74,3 +74,30 @@ func TestSecondaryIndexDeltasMaintainLookupAndDeleteRowMapping(t *testing.T) {
 		t.Fatalf("key after delete remap = %v", rows)
 	}
 }
+
+func TestDeleteSecondaryIndexRowRemovesAndShiftsRowIDs(t *testing.T) {
+	table := NewTable("events", []Column{{Name: "id", Type: IntType}, {Name: "kind", Type: TextType}}, false)
+	table.Rows = [][]any{{1, "a"}, {2, "b"}, {3, "a"}, {4, "c"}}
+	if err := table.CreateSecondaryIndex("idx_kind", []string{"kind"}, false); err != nil {
+		t.Fatal(err)
+	}
+
+	copy(table.Rows[1:], table.Rows[2:])
+	table.Rows[len(table.Rows)-1] = nil
+	table.Rows = table.Rows[:len(table.Rows)-1]
+	table.DeleteSecondaryIndexRow(1)
+
+	index := table.FindSecondaryIndex([]string{"kind"})
+	rows, err := table.LookupSecondaryIndexPoint(index, []any{"a"})
+	if err != nil || len(rows) != 2 || rows[0] != 0 || rows[1] != 1 {
+		t.Fatalf("a rows after point delete = %v, %v", rows, err)
+	}
+	rows, err = table.LookupSecondaryIndexPoint(index, []any{"b"})
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("deleted key rows = %v, %v", rows, err)
+	}
+	rows, err = table.LookupSecondaryIndexPoint(index, []any{"c"})
+	if err != nil || len(rows) != 1 || rows[0] != 2 {
+		t.Fatalf("c rows after point delete = %v, %v", rows, err)
+	}
+}
