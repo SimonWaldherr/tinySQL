@@ -26,6 +26,12 @@ Modern browsers load `query_files.wasm.gz` with streaming decompression. The
 loader falls back to the uncompressed `.wasm` asset on older browsers or servers
 that already apply HTTP compression.
 
+When Binaryen is installed, release builds run one
+`wasm-opt --all-features -Oz` pass. The result replaces the Go build only when
+it is smaller and passes `WebAssembly.validate`; otherwise the script keeps the
+original Go-generated module. The intentionally omitted `--converge` mode adds
+substantial build time for negligible compressed-size savings.
+
 ## Run locally
 
 ```bash

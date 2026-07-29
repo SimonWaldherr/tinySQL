@@ -22,6 +22,23 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." >/dev/null && pwd -P)"
 filesize() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null || echo 0; }
 human()    { numfmt --to=iec-i --suffix=B "$1" 2>/dev/null || echo "$1 bytes"; }
 elapsed()  { echo "$(( $(date +%s) - $1 ))s"; }
+validate_wasm() {
+    local wasm_file="$1"
+    if command -v node >/dev/null 2>&1; then
+        node -e '
+            const fs = require("fs");
+            const file = process.argv[1];
+            if (!WebAssembly.validate(fs.readFileSync(file))) {
+                console.error(`WebAssembly.validate failed for ${file}`);
+                process.exit(1);
+            }
+        ' "$wasm_file"
+    else
+        # wasm-opt validates while reading/writing even when no optimization
+        # pass is requested.
+        wasm-opt --all-features "$wasm_file" -o /dev/null
+    fi
+}
 
 # ── flags ────────────────────────────────────────────────────────────────────
 SERVE=false
@@ -136,34 +153,31 @@ if ! $SKIP_BUILD; then
 
     # ── optional wasm-opt / wasm-strip ──────────────────────────────────────
     if command -v wasm-opt >/dev/null 2>&1; then
-        echo "🔧 Optimising with wasm-opt (trying multiple strategies)…"
+        echo "🔧 Optimising with wasm-opt -Oz (single release pass)…"
 
-        VARIANTS=(
-            "--enable-bulk-memory -Oz --strip-debug"
-            "--enable-bulk-memory -Oz --strip-debug --converge"
-            "--enable-bulk-memory -O3 --strip-debug --converge"
-        )
-
-        BEST_SIZE=$(filesize "$WASM_OUT")
-
-        for v in "${VARIANTS[@]}"; do
-            TMP_OUT="${WASM_OUT}.opt.tmp"
-            # shellcheck disable=SC2086
-            if wasm-opt $v -o "$TMP_OUT" "$WASM_OUT" 2>/dev/null; then
-                sz=$(filesize "$TMP_OUT")
-                if [ "$sz" -gt 0 ] && [ "$sz" -lt "$BEST_SIZE" ]; then
-                    echo "   ✅ $v → $(human "$sz") (saved $(( BEST_SIZE - sz )) bytes)"
-                    mv -f "$TMP_OUT" "$WASM_OUT"
-                    BEST_SIZE=$sz
-                else
-                    rm -f "$TMP_OUT"
-                fi
+        ORIGINAL_SIZE=$(filesize "$WASM_OUT")
+        TMP_OUT="${WASM_OUT}.opt.tmp"
+        # Go 1.26 emits bulk-memory and non-trapping float-to-int operations.
+        # --all-features lets Binaryen validate those instructions; the former
+        # --enable-bulk-memory-only invocation silently rejected the module.
+        if wasm-opt --all-features -Oz --strip-debug -o "$TMP_OUT" "$WASM_OUT"; then
+            OPTIMIZED_SIZE=$(filesize "$TMP_OUT")
+            if [ "$OPTIMIZED_SIZE" -gt 0 ] &&
+               [ "$OPTIMIZED_SIZE" -lt "$ORIGINAL_SIZE" ] &&
+               validate_wasm "$TMP_OUT"; then
+                mv -f "$TMP_OUT" "$WASM_OUT"
+                echo "   ✅ Validated $(human "$OPTIMIZED_SIZE") (saved $(( ORIGINAL_SIZE - OPTIMIZED_SIZE )) bytes)"
             else
                 rm -f "$TMP_OUT"
+                echo "   ⚠️  Optimized output was invalid or not smaller; keeping the Go build"
             fi
-        done
+        else
+            rm -f "$TMP_OUT"
+            echo "   ⚠️  wasm-opt failed; keeping the validated Go build"
+        fi
 
-        echo "   Final optimised size: $(human "$BEST_SIZE")"
+        validate_wasm "$WASM_OUT"
+        echo "   Final validated size: $(human "$(filesize "$WASM_OUT")")"
     elif command -v wasm-strip >/dev/null 2>&1; then
         echo "🔧 Stripping debug sections with wasm-strip…"
         wasm-strip "$WASM_OUT" || true
