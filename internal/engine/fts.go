@@ -1063,8 +1063,9 @@ func ftsIDFLookup(entry ftsDocCacheEntry) ftsIDFFunc {
 // FTS_RANK's own tokenizer (which already strips punctuation and applies
 // stemming), while this list targets raw natural-language questions/queries
 // coming from RAG_SEARCH callers and additionally covers question words
-// ("what", "how", ...) and a handful of German stopwords, ported verbatim
-// from cmd/ragdemo/main.go's ftsQuery() helper.
+// ("what", "how", ...) and a handful of German stopwords. This is now the only
+// copy: cmd/ragdemo used to carry an identical list for its own hand-rolled
+// FTS pass and now relies on RAG_SEARCH's auto_or_expand instead.
 var ftsAutoOrExpandStopWords = map[string]bool{
 	"a": true, "an": true, "and": true, "are": true, "as": true, "at": true,
 	"be": true, "before": true, "can": true, "do": true, "does": true, "for": true,
@@ -1084,9 +1085,6 @@ var ftsAutoOrExpandStopWords = map[string]bool{
 // Tokenizing on non-alphanumeric runes, dropping stopwords/duplicates, and
 // OR-joining what remains turns "what is the capital of France" into
 // "capital OR france", matching if any remaining content word matches.
-//
-// Ported from cmd/ragdemo/main.go's ftsQuery() helper (internal/engine cannot
-// import cmd/ragdemo, so the logic is duplicated here rather than shared).
 func ftsAutoOrExpand(query string) string {
 	fields := strings.FieldsFunc(strings.ToLower(query), func(r rune) bool {
 		return (r < 'a' || r > 'z') && (r < '0' || r > '9') &&

@@ -9,7 +9,7 @@
 //	SELECT * FROM RAG_SEARCH('chunks', 'embedding', query_vector, 5)
 //
 //	SELECT * FROM RAG_SEARCH('chunks', 'embedding', query_vector, 5, '{
-//	  "text_column": "chunk_text",
+//	  "text_columns": ["heading", "chunk_text"],
 //	  "text_query": "what is the capital of France",
 //	  "key_columns": ["doc_id", "chunk_index"],
 //	  "expand_before": 1,
@@ -32,6 +32,7 @@ type ragSearchOptions struct {
 	Metric           string   `json:"metric"`
 	Index            string   `json:"index"`
 	TextColumn       string   `json:"text_column"`
+	TextColumns      []string `json:"text_columns"`
 	TextQuery        string   `json:"text_query"`
 	AutoOrExpand     *bool    `json:"auto_or_expand"`
 	CandidateK       int      `json:"candidate_k"`
@@ -116,7 +117,8 @@ func (f *RAGSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 		candidateK = k
 	}
 
-	hybrid := opts.TextColumn != "" && opts.TextQuery != ""
+	textColumns := ragSearchTextColumns(&opts)
+	hybrid := len(textColumns) > 0 && opts.TextQuery != ""
 
 	// ---- Vector pass -------------------------------------------------
 	vecArgs := []Expr{
@@ -153,7 +155,9 @@ func (f *RAGSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 			&Literal{Val: vecArgsParsed.tableName},
 			&Literal{Val: ftsQuery},
 			&Literal{Val: candidateK},
-			&Literal{Val: opts.TextColumn},
+		}
+		for _, col := range textColumns {
+			ftsArgs = append(ftsArgs, &Literal{Val: col})
 		}
 		ftsResult, err := (&FTSSearchTableFunc{}).Execute(ctx, ftsArgs, env, row)
 		if err != nil {
@@ -188,6 +192,26 @@ func (f *RAGSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 	}
 
 	return result, nil
+}
+
+// ragSearchTextColumns resolves the BM25 columns from the singular
+// text_column and the plural text_columns options, in that order, dropping
+// case-insensitive duplicates. Duplicates matter beyond tidiness: FTS_SEARCH
+// scores each column it is handed, so naming one twice would double-count its
+// term frequencies against the rest.
+func ragSearchTextColumns(opts *ragSearchOptions) []string {
+	seen := make(map[string]bool, len(opts.TextColumns)+1)
+	out := make([]string, 0, len(opts.TextColumns)+1)
+	for _, col := range append([]string{opts.TextColumn}, opts.TextColumns...) {
+		col = strings.TrimSpace(col)
+		lc := strings.ToLower(col)
+		if col == "" || seen[lc] {
+			continue
+		}
+		seen[lc] = true
+		out = append(out, col)
+	}
+	return out
 }
 
 // ragSearchTruncate returns rs re-sliced to at most k rows, preserving

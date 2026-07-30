@@ -4,8 +4,14 @@ Makes retrieval quality inspectable instead of judging only the final LLM
 answer. Chunks the repository Markdown docs, gets embeddings from an
 OpenAI-compatible LM Studio server, stores them in TinySQL, and reports the
 retrieved chunks, cosine similarities, vector/BM25 ranks, Hit@k, and MRR.
-Hybrid mode reranks the semantic candidate set with BM25, so a weak
-keyword-only hit cannot displace a strong semantic match.
+
+Retrieval itself is a single `RAG_SEARCH` call. Hybrid mode hands the engine a
+text query alongside the query vector and it fuses the vector and BM25 rankings
+with reciprocal-rank fusion, so a chunk either retriever found can reach the
+final results — including one matched only by an exact identifier the embedding
+model does not represent well. Because fusion happens in the engine, the
+printed `vec=` and `fts=` ranks show which pass contributed each hit, and `-`
+means that pass did not return it at all.
 
 Start LM Studio's local server on port 1234 and load an embedding model. Then:
 
@@ -29,6 +35,12 @@ The built-in quality gate requires every expected source *and marker-bearing
 chunk* to occur in the top-k results, so a neighboring but irrelevant chunk
 does not count as a success.
 
+Chunking is heading-aware: each chunk is labeled with its full heading path
+(`VEC_SEARCH › Options`) rather than the nearest heading alone, and a `#` line
+inside a fenced code block is treated as a shell comment, not a section break.
+
 On the repository docs with Granite Embedding 278M Multilingual, the tested
 default of 900 characters with 250 characters overlap reached 100% Hit@5,
-66.7% Hit@1, and 0.792 MRR across the built-in English/German questions.
+66.7% Hit@1, and 0.792 MRR across the built-in English/German questions. Those
+figures predate the switch to engine-side RRF fusion; rerun the suite to
+measure the current pipeline.

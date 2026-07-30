@@ -972,6 +972,78 @@ func TestRAGSearchExpandsContext(t *testing.T) {
 // TestRAGSearchRequiresKeyColumnsForHybrid checks that enabling hybrid mode
 // (text_column+text_query) without key_columns fails with a clear error
 // instead of silently fusing rows with an empty composite key.
+// TestRAGSearchHybridMultipleTextColumns covers text_columns: a chunked-
+// document corpus carries its most discriminative words in a short heading,
+// not the body, and a single-column BM25 pass cannot see them. Here the only
+// occurrence of "goroutines" is in a heading, and the row whose heading
+// matches must be fused into the top-k even though its vector similarity is
+// the weakest in the table.
+func TestRAGSearchHybridMultipleTextColumns(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	Execute(ctx, db, "default", mustParse(`
+		CREATE TABLE multicol_docs (id INT, heading TEXT, content TEXT, embedding VECTOR)
+	`))
+	Execute(ctx, db, "default", mustParse(`
+		INSERT INTO multicol_docs VALUES
+			(1, 'Concurrency with goroutines', 'lightweight threads scheduled by the runtime', '[1.0, 0.0, 0.0]'),
+			(2, 'Cooking',                     'recipes for dinner',                          '[0.0, 0.0, 1.0]'),
+			(3, 'Gardening',                   'tips for spring planting',                    '[0.0, 0.1, 0.9]')
+	`))
+
+	// Body-only BM25 cannot match "goroutines", so id=1 stays out of the top-2.
+	rsBodyOnly := execSQL(t, db, `
+		SELECT * FROM RAG_SEARCH('multicol_docs', 'embedding', VEC_FROM_JSON('[0.0, 0.0, 1.0]'), 2, '{
+			"text_column": "content",
+			"text_query": "goroutines",
+			"key_columns": ["id"]
+		}')
+	`)
+	for _, r := range rsBodyOnly.Rows {
+		if r["id"] == 1 {
+			t.Fatalf("body-only BM25 should not have matched the heading-only term, got %#v", rsBodyOnly.Rows)
+		}
+	}
+
+	// Searching the heading too surfaces it.
+	rsBoth := execSQL(t, db, `
+		SELECT * FROM RAG_SEARCH('multicol_docs', 'embedding', VEC_FROM_JSON('[0.0, 0.0, 1.0]'), 2, '{
+			"text_columns": ["heading", "content"],
+			"text_query": "goroutines",
+			"key_columns": ["id"]
+		}')
+	`)
+	if len(rsBoth.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rsBoth.Rows))
+	}
+	if rsBoth.Rows[0]["id"] != 1 {
+		t.Fatalf("expected heading match id=1 to rank first, got %#v", rsBoth.Rows)
+	}
+	if _, ok := rsBoth.Rows[0]["_fts_rank"]; !ok {
+		t.Errorf("expected _fts_rank on the heading-matched row, got %#v", rsBoth.Rows[0])
+	}
+
+	// text_column and text_columns compose, and naming a column in both must
+	// not double-count it: the result is identical either way.
+	rsMerged := execSQL(t, db, `
+		SELECT * FROM RAG_SEARCH('multicol_docs', 'embedding', VEC_FROM_JSON('[0.0, 0.0, 1.0]'), 2, '{
+			"text_column": "heading",
+			"text_columns": ["heading", "content"],
+			"text_query": "goroutines",
+			"key_columns": ["id"]
+		}')
+	`)
+	if len(rsMerged.Rows) != len(rsBoth.Rows) {
+		t.Fatalf("merged column list changed the row count: %d vs %d", len(rsMerged.Rows), len(rsBoth.Rows))
+	}
+	for i := range rsMerged.Rows {
+		if rsMerged.Rows[i]["id"] != rsBoth.Rows[i]["id"] {
+			t.Fatalf("merged column list changed ranking at %d: %v vs %v", i, rsMerged.Rows[i]["id"], rsBoth.Rows[i]["id"])
+		}
+	}
+}
+
 func TestRAGSearchRequiresKeyColumnsForHybrid(t *testing.T) {
 	db := storage.NewDB()
 	ctx := context.Background()

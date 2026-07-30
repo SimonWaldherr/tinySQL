@@ -22,8 +22,43 @@ func TestChunkMarkdownKeepsHeadingAndBounds(t *testing.T) {
 			t.Fatalf("chunk exceeds bound: %d", len([]rune(c.Text)))
 		}
 	}
-	if chunks[len(chunks)-1].Heading != "FTS" {
+	// Nested headings carry their parent path: "FTS" alone is far less
+	// informative to an embedding model than "Title › FTS".
+	if chunks[len(chunks)-1].Heading != "Title › FTS" {
 		t.Fatalf("last heading = %q", chunks[len(chunks)-1].Heading)
+	}
+}
+
+// A "#" line inside a fenced code block is a shell comment, not a heading.
+// Treating it as one splits a code example into fragments and mislabels the
+// section it belongs to — a real risk on a corpus of CLI documentation.
+func TestChunkMarkdownIgnoresHeadingsInsideCodeFences(t *testing.T) {
+	doc := "# CLI\nrun it:\n```bash\n# build the index\ntinysql warm --table docs\n```\ndone\n## Next\ntext"
+	chunks := chunkMarkdown(doc, 900, 100)
+	if len(chunks) != 2 {
+		t.Fatalf("expected 2 sections, got %d: %+v", len(chunks), chunks)
+	}
+	if chunks[0].Heading != "CLI" {
+		t.Fatalf("first heading = %q, want %q", chunks[0].Heading, "CLI")
+	}
+	if !strings.Contains(chunks[0].Text, "# build the index") || !strings.Contains(chunks[0].Text, "tinysql warm") {
+		t.Fatalf("code fence was split out of its section: %q", chunks[0].Text)
+	}
+	if chunks[1].Heading != "CLI › Next" {
+		t.Fatalf("second heading = %q, want %q", chunks[1].Heading, "CLI › Next")
+	}
+}
+
+// Deeper-then-shallower headings must pop the trail rather than accumulate, so
+// a sibling section does not inherit its predecessor's children.
+func TestChunkMarkdownPopsHeadingTrail(t *testing.T) {
+	doc := "# A\n### deep\nx\n## B\ny"
+	chunks := chunkMarkdown(doc, 900, 100)
+	if len(chunks) != 2 {
+		t.Fatalf("expected 2 chunks, got %d: %+v", len(chunks), chunks)
+	}
+	if chunks[1].Heading != "A › B" {
+		t.Fatalf("heading = %q, want %q", chunks[1].Heading, "A › B")
 	}
 }
 
@@ -104,10 +139,63 @@ func TestBuildDBInsertsQueryableRows(t *testing.T) {
 	}
 }
 
-func TestFTSQueryUsesKeywordsWithOR(t *testing.T) {
-	got := ftsQuery("How do I prebuild the HNSW vector index after loading?")
-	want := "prebuild OR hnsw OR vector OR index OR after OR loading"
-	if got != want {
-		t.Fatalf("ftsQuery = %q, want %q", got, want)
+// TestRetrieveSQLHybridRequestsFusedColumns pins the contract retrieve()
+// depends on: hybrid mode must ask RAG_SEARCH for both passes plus the fused
+// score, and must identify rows across those passes with key_columns. Without
+// key_columns RAG_SEARCH rejects the call; without _rrf_score the demo would
+// silently fall back to ranking a fused result by vector similarity alone.
+func TestRetrieveSQLHybridRequestsFusedColumns(t *testing.T) {
+	cfg := config{topK: 5, candidateK: 15, hybrid: true}
+	sql, err := retrieveSQL(cfg, []float64{0.5, -0.25}, "How do I set a query timeout?")
+	if err != nil {
+		t.Fatalf("retrieveSQL: %v", err)
+	}
+	for _, want := range []string{
+		"_rrf_score", "_fts_rank", "_vec_similarity",
+		`"text_columns":["heading","chunk_text"]`,
+		`"key_columns":["doc_id","chunk_index"]`,
+		`"candidate_k":15`,
+		"VEC_FROM_JSON('[0.5,-0.25]')",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("hybrid SQL missing %q:\n%s", want, sql)
+		}
+	}
+	if _, err := tsql.ParseSQL(sql); err != nil {
+		t.Fatalf("hybrid SQL does not parse: %v\n%s", err, sql)
+	}
+}
+
+// A vector-only run must not select the fusion columns: RAG_SEARCH only emits
+// _fts_rank/_rrf_score when hybrid options are supplied, so selecting them
+// unconditionally would fail the query outright.
+func TestRetrieveSQLVectorOnlyOmitsFusionColumns(t *testing.T) {
+	sql, err := retrieveSQL(config{topK: 3, candidateK: 9}, []float64{1}, "anything")
+	if err != nil {
+		t.Fatalf("retrieveSQL: %v", err)
+	}
+	for _, unwanted := range []string{"_rrf_score", "_fts_rank", "text_query"} {
+		if strings.Contains(sql, unwanted) {
+			t.Fatalf("vector-only SQL should not mention %q:\n%s", unwanted, sql)
+		}
+	}
+	if _, err := tsql.ParseSQL(sql); err != nil {
+		t.Fatalf("vector-only SQL does not parse: %v\n%s", err, sql)
+	}
+}
+
+// A quote in the question must survive into the options JSON as SQL-escaped
+// text; an unescaped one would terminate the options string literal early and
+// turn a user question into a parse error (or worse, stray SQL).
+func TestRetrieveSQLEscapesQuotesInQuery(t *testing.T) {
+	sql, err := retrieveSQL(config{topK: 2, candidateK: 4, hybrid: true}, []float64{1}, "what's a chunk's index?")
+	if err != nil {
+		t.Fatalf("retrieveSQL: %v", err)
+	}
+	if strings.Contains(sql, "what's") {
+		t.Fatalf("query quote left unescaped:\n%s", sql)
+	}
+	if _, err := tsql.ParseSQL(sql); err != nil {
+		t.Fatalf("SQL with quoted query does not parse: %v\n%s", err, sql)
 	}
 }

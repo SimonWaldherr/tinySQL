@@ -58,7 +58,7 @@ type RagSearchArgs struct {
 	VectorColumn string    `json:"vector_column" jsonschema:"Name of the VECTOR column to search"`
 	QueryVector  []float64 `json:"query_vector" jsonschema:"Query embedding vector"`
 	K            int       `json:"k" jsonschema:"Number of results to return"`
-	Options      string    `json:"options,omitempty" jsonschema:"Optional JSON object controlling metric/index, hybrid BM25 fusion, and neighbor-chunk context expansion (metric, index, text_column, text_query, auto_or_expand, candidate_k, rrf_k, key_columns, expand_before, expand_after, doc_id_column, chunk_index_column); see the tinysql://functions resource for the full shape and defaults"` // raw JSON passthrough matching ragSearchOptions
+	Options      string    `json:"options,omitempty" jsonschema:"Optional JSON object controlling metric/index, hybrid BM25 fusion, and neighbor-chunk context expansion (metric, index, text_column, text_columns, text_query, auto_or_expand, candidate_k, rrf_k, key_columns, expand_before, expand_after, doc_id_column, chunk_index_column); see the tinysql://functions resource for the full shape and defaults"` // raw JSON passthrough matching ragSearchOptions
 }
 
 // ─── server ────────────────────────────────────────────────────────────────────

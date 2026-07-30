@@ -61,8 +61,12 @@ RAG_SEARCH(table, vector_column, query_vector, k [, options_json])
     string) opts into hybrid fusion and/or context expansion:
       metric              same as VEC_SEARCH (default 'cosine')
       index               same as VEC_SEARCH (default 'flat')
-      text_column          }  set both to enable BM25 hybrid fusion via RRF
-      text_query           }  (requires key_columns too)
+      text_column          }  set a text source and a query to enable BM25
+      text_columns         }  hybrid fusion via RRF (requires key_columns too).
+      text_query           }  text_columns searches several columns in one
+                              pass — prefer it on a chunk table so a short,
+                              discriminative heading contributes lexical
+                              signal alongside the body text.
       key_columns         []string identifying a row across the independent
                            vector/text candidate sets (required for hybrid)
       auto_or_expand       OR-expand text_query's terms (default true) —
@@ -83,7 +87,7 @@ RAG_SEARCH(table, vector_column, query_vector, k [, options_json])
     under VEC_SEARCH above by construction.
     Example (hybrid + context expansion in one call):
       SELECT * FROM RAG_SEARCH('chunks', 'embedding', VEC_FROM_JSON('[0.1,0.2,0.9]'), 5, '{
-        "text_column": "chunk_text",
+        "text_columns": ["heading", "chunk_text"],
         "text_query": "timeout OR retry",
         "key_columns": ["doc_id", "chunk_index"],
         "expand_before": 1,

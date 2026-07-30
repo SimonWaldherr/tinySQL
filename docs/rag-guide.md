@@ -434,10 +434,35 @@ quality because a larger candidate pool can also introduce noise.
 | many known hits plus neighbors | `RAG_CONTEXT_FROM` |
 
 `RAG_SEARCH(table, vector_column, query_vector, k [, options_json])` remains
-the lower-level composed API. Hybrid mode supplies `text_column`, `text_query`,
-and `key_columns` in its JSON options. `HYBRID_SEARCH` is preferable for the
-common case because the text query is positional and a primary key is detected
+the lower-level composed API. Hybrid mode supplies a text source
+(`text_column`, or `text_columns` for several at once), `text_query`, and
+`key_columns` in its JSON options. `HYBRID_SEARCH` is preferable for the common
+case because the text query is positional and a primary key is detected
 automatically.
+
+On a chunk table, prefer `text_columns` over `text_column` and include the
+heading:
+
+```sql
+SELECT * FROM RAG_SEARCH('rag_chunks', 'embedding', ?, 6, '{
+  "text_columns": ["heading", "chunk_text"],
+  "text_query": "vector index warm up",
+  "key_columns": ["doc_id", "chunk_index"]
+}')
+```
+
+A heading is short and highly discriminative, and BM25's length normalization
+rewards a match in a short field, so headings recover exactly the queries that
+name a section by title. Do not add the vector column to the list — stringified
+embeddings are BM25 noise.
+
+Whichever API is used, let the engine fuse the two retrievers. Reranking the
+vector candidate set in application code with a bonus for lexical matches is
+not hybrid retrieval: the application only ever sees rows the vector pass
+already returned, so a chunk found by keyword alone — often an exact identifier
+match, the most precise signal available — is discarded before scoring. RRF
+fuses the two ranked lists, which is why it takes the *union* of the candidate
+sets.
 
 ## 7. Filtering, authorization, and multi-tenancy
 

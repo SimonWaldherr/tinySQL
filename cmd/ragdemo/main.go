@@ -33,6 +33,11 @@ type chunk struct {
 	Embedding            []float64
 }
 
+// hit is one final retrieval result. VectorRank/FTSRank are 0 when that pass
+// did not return the chunk at all, which under hybrid fusion is normal: a hit
+// may come from either pass alone. Similarity is only meaningful when
+// VectorRank > 0. Score is the RRF score under hybrid retrieval and the cosine
+// similarity otherwise, so it is comparable within a run but not across modes.
 type hit struct {
 	Chunk      chunk
 	VectorRank int
@@ -96,6 +101,7 @@ func run(ctx context.Context, cfg config) error {
 	client := &lmClient{baseURL: strings.TrimRight(cfg.baseURL, "/"), http: &http.Client{Timeout: 3 * time.Minute}}
 
 	started := time.Now()
+	dims := 0
 	for start := 0; start < len(chunks); start += cfg.batchSize {
 		end := min(start+cfg.batchSize, len(chunks))
 		inputs := make([]string, end-start)
@@ -107,6 +113,20 @@ func run(ctx context.Context, cfg config) error {
 			return fmt.Errorf("embed chunks %d-%d: %w", start+1, end, err)
 		}
 		for i := range vectors {
+			// A short-circuited or partially-loaded embedding model can answer
+			// with a different width than it did for the previous batch. Cosine
+			// against a mixed-width column is not a weaker ranking, it is a
+			// meaningless one, so fail here instead of reporting the metrics of
+			// a corpus that cannot be compared against itself.
+			if len(vectors[i]) == 0 {
+				return fmt.Errorf("embedding model returned an empty vector for chunk %d", start+i+1)
+			}
+			if dims == 0 {
+				dims = len(vectors[i])
+			}
+			if len(vectors[i]) != dims {
+				return fmt.Errorf("embedding model returned %d dimensions for chunk %d, %d for the first chunk", len(vectors[i]), start+i+1, dims)
+			}
 			chunks[start+i].Embedding = vectors[i]
 		}
 		fmt.Fprintf(os.Stderr, "\rembedding chunks: %d/%d", end, len(chunks))
@@ -117,10 +137,14 @@ func run(ctx context.Context, cfg config) error {
 	if err != nil {
 		return err
 	}
+	corpus := make(map[string]chunk, len(chunks))
+	for _, c := range chunks {
+		corpus[key(c.DocID, c.Index)] = c
+	}
 	fmt.Printf("Corpus: %d chunks from %s | dimensions: %d | chunk=%d overlap=%d\n", len(chunks), cfg.docsDir, len(chunks[0].Embedding), cfg.chunkSize, cfg.overlap)
 
 	if cfg.query != "" {
-		hits, err := retrieve(ctx, client, db, chunks, cfg, cfg.query)
+		hits, err := retrieve(ctx, client, db, corpus, cfg, cfg.query)
 		if err != nil {
 			return err
 		}
@@ -134,7 +158,7 @@ func run(ctx context.Context, cfg config) error {
 		}
 		return nil
 	}
-	return evaluate(ctx, client, db, chunks, cfg)
+	return evaluate(ctx, client, db, corpus, cfg)
 }
 
 func loadChunks(dir string, size, overlap int) ([]chunk, error) {
@@ -167,11 +191,21 @@ func loadChunks(dir string, size, overlap int) ([]chunk, error) {
 
 // chunkMarkdown keeps headings attached to their section and only uses overlap
 // when a section itself is too long. This avoids blending unrelated sections.
+//
+// Two details matter for retrieval quality on documentation corpora. Lines
+// inside a fenced code block are never read as headings — technical docs are
+// full of shell comments ("# build the index"), and treating those as section
+// boundaries shreds the very code examples a question is usually about. And
+// each chunk carries the full heading path ("VEC_SEARCH › Options"), not just
+// the nearest heading, because deep headings are frequently generic words that
+// carry no meaning detached from their parent.
 func chunkMarkdown(s string, size, overlap int) []chunk {
 	lines := strings.Split(strings.ReplaceAll(s, "\r\n", "\n"), "\n")
-	heading := "Document"
+	var trail []string
 	var section []string
 	var out []chunk
+	heading := "Document"
+	inFence := false
 	flush := func() {
 		body := strings.TrimSpace(strings.Join(section, "\n"))
 		section = section[:0]
@@ -184,9 +218,23 @@ func chunkMarkdown(s string, size, overlap int) []chunk {
 	}
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "#") && len(strings.TrimLeft(trimmed, "#")) < len(trimmed) {
+		if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
+			inFence = !inFence
+			section = append(section, line)
+			continue
+		}
+		level := 0
+		if !inFence {
+			level = len(trimmed) - len(strings.TrimLeft(trimmed, "#"))
+		}
+		if level > 0 && level < len(trimmed) {
 			flush()
-			heading = strings.TrimSpace(strings.TrimLeft(trimmed, "#"))
+			title := strings.TrimSpace(strings.Trim(strings.TrimLeft(trimmed, "#"), "#"))
+			if title == "" {
+				continue
+			}
+			trail = append(trail[:min(level-1, len(trail))], title)
+			heading = strings.Join(trail, " › ")
 			continue
 		}
 		section = append(section, line)
@@ -261,83 +309,98 @@ func buildDB(chunks []chunk) (*tsql.DB, error) {
 	return db, nil
 }
 
-func retrieve(ctx context.Context, client *lmClient, db *tsql.DB, chunks []chunk, cfg config, query string) ([]hit, error) {
+// retrieveSQL builds the RAG_SEARCH call for one query embedding. Fusion is
+// left to the engine deliberately: RAG_SEARCH runs the vector and BM25 passes
+// over the same candidate_k window and reciprocal-rank-fuses their union, so a
+// chunk found by keyword alone still reaches the final ranking. Reranking in Go
+// cannot reproduce that — application code only ever sees the vector candidate
+// set, so every lexical-only hit is gone before scoring starts.
+func retrieveSQL(cfg config, queryVec []float64, query string) (string, error) {
+	opts := map[string]any{
+		"metric":      "cosine",
+		"index":       "flat",
+		"candidate_k": cfg.candidateK,
+	}
+	cols := "doc_id, chunk_index, _vec_similarity, _vec_rank"
+	if cfg.hybrid {
+		// heading is searched alongside the body: a section title is short but
+		// highly discriminative, and BM25 length normalization rewards that.
+		opts["text_columns"] = []string{"heading", "chunk_text"}
+		opts["text_query"] = query
+		opts["key_columns"] = []string{"doc_id", "chunk_index"}
+		cols += ", _fts_rank, _rrf_score"
+	}
+	optsJSON, err := json.Marshal(opts)
+	if err != nil {
+		return "", fmt.Errorf("marshal RAG_SEARCH options: %w", err)
+	}
+	vecJSON, err := json.Marshal(queryVec)
+	if err != nil {
+		return "", fmt.Errorf("marshal query vector: %w", err)
+	}
+	return fmt.Sprintf(
+		`SELECT %s FROM RAG_SEARCH('rag_chunks', 'embedding', VEC_FROM_JSON('%s'), %d, '%s')`,
+		cols, vecJSON, cfg.topK, sqlQuote(string(optsJSON)),
+	), nil
+}
+
+func retrieve(ctx context.Context, client *lmClient, db *tsql.DB, corpus map[string]chunk, cfg config, query string) ([]hit, error) {
 	vectors, err := client.embed(ctx, cfg.embeddingModel, []string{query})
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
 	}
-	qJSON, _ := json.Marshal(vectors[0])
-	sql := fmt.Sprintf(`SELECT doc_id, chunk_index, heading, chunk_text, _vec_similarity, _vec_rank FROM VEC_SEARCH('rag_chunks', 'embedding', VEC_FROM_JSON('%s'), %d, 'cosine', 'flat')`, qJSON, cfg.candidateK)
-	stmt, err := tsql.ParseSQL(sql)
+	sql, err := retrieveSQL(cfg, vectors[0], query)
 	if err != nil {
 		return nil, err
+	}
+	stmt, err := tsql.ParseSQL(sql)
+	if err != nil {
+		return nil, fmt.Errorf("parse RAG_SEARCH query: %w", err)
 	}
 	rs, err := tsql.Execute(ctx, db, "default", stmt)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("execute RAG_SEARCH query: %w", err)
 	}
-	byKey := make(map[string]*hit)
+
+	// RAG_SEARCH returns rows best-first, so the result order *is* the ranking.
+	hits := make([]hit, 0, len(rs.Rows))
 	for _, row := range rs.Rows {
-		doc, _ := value[string](row, "doc_id")
-		idx, _ := intValue(row, "chunk_index")
-		rank, _ := intValue(row, "_vec_rank")
-		similarity, _ := value[float64](row, "_vec_similarity")
-		c := findChunk(chunks, doc, idx)
-		byKey[key(doc, idx)] = &hit{Chunk: c, VectorRank: rank, Similarity: similarity}
-	}
-
-	if cfg.hybrid {
-		ftsSQL := fmt.Sprintf(`SELECT doc_id, chunk_index, _fts_rank FROM FTS_SEARCH('rag_chunks', '%s', %d, 'doc_id', 'heading', 'chunk_text')`, sqlQuote(ftsQuery(query)), cfg.candidateK)
-		ftsStmt, err := tsql.ParseSQL(ftsSQL)
-		if err != nil {
-			return nil, fmt.Errorf("parse FTS query: %w", err)
+		doc, ok := value[string](row, "doc_id")
+		if !ok {
+			return nil, fmt.Errorf("RAG_SEARCH row is missing doc_id: %v", row)
 		}
-		fts, err := tsql.Execute(ctx, db, "default", ftsStmt)
-		if err != nil {
-			return nil, fmt.Errorf("execute FTS query: %w", err)
+		idx, ok := intValue(row, "chunk_index")
+		if !ok {
+			return nil, fmt.Errorf("RAG_SEARCH row %s is missing chunk_index: %v", doc, row)
 		}
-		for _, row := range fts.Rows {
-			doc, _ := value[string](row, "doc_id")
-			idx, _ := intValue(row, "chunk_index")
-			rank, _ := intValue(row, "_fts_rank")
-			k := key(doc, idx)
-			h := byKey[k]
-			if h != nil {
-				h.FTSRank = rank
-			}
+		c, ok := corpus[key(doc, idx)]
+		if !ok {
+			return nil, fmt.Errorf("RAG_SEARCH returned unknown chunk %s#%d", doc, idx)
 		}
-	}
-
-	hits := make([]hit, 0, len(byKey))
-	for _, h := range byKey {
+		h := hit{Chunk: c}
+		// A lexical-only hit carries no _vec_* columns and a vector-only hit no
+		// _fts_*, so an absent column means "not found by that pass" — hence
+		// the rank-0 sentinel rather than an error.
+		h.VectorRank, _ = intValue(row, "_vec_rank")
+		h.Similarity, _ = floatValue(row, "_vec_similarity")
+		h.FTSRank, _ = intValue(row, "_fts_rank")
 		if cfg.hybrid {
-			// Rerank semantic candidates conservatively: exact terms may move a
-			// close candidate up, but cannot replace it with a weak lexical hit.
-			h.Score = h.Similarity
-			if h.FTSRank > 0 {
-				h.Score += .035 * float64(cfg.candidateK-h.FTSRank+1) / float64(cfg.candidateK)
+			h.Score, ok = floatValue(row, "_rrf_score")
+			if !ok {
+				return nil, fmt.Errorf("RAG_SEARCH hybrid row %s#%d is missing _rrf_score", doc, idx)
 			}
 		} else {
 			h.Score = h.Similarity
 		}
-		hits = append(hits, *h)
-	}
-	sort.Slice(hits, func(i, j int) bool {
-		if hits[i].Score == hits[j].Score {
-			return hits[i].Similarity > hits[j].Similarity
-		}
-		return hits[i].Score > hits[j].Score
-	})
-	if len(hits) > cfg.topK {
-		hits = hits[:cfg.topK]
+		hits = append(hits, h)
 	}
 	return hits, nil
 }
 
-func evaluate(ctx context.Context, client *lmClient, db *tsql.DB, chunks []chunk, cfg config) error {
+func evaluate(ctx context.Context, client *lmClient, db *tsql.DB, corpus map[string]chunk, cfg config) error {
 	hitsAt1, hitsAtK, reciprocalRank := 0, 0, 0.0
 	for _, tc := range evalCases {
-		hits, err := retrieve(ctx, client, db, chunks, cfg, tc.Query)
+		hits, err := retrieve(ctx, client, db, corpus, cfg, tc.Query)
 		if err != nil {
 			return fmt.Errorf("evaluation %q: %w", tc.Name, err)
 		}
@@ -382,13 +445,17 @@ func printHits(query string, hits []hit) {
 		if utf8.RuneCountInString(preview) > 190 {
 			preview = string([]rune(preview)[:190]) + "…"
 		}
-		fmt.Printf("  %d. %s#%d [%s] sim=%.4f vec=%s fts=%s score=%.6f\n     %s\n", i+1, h.Chunk.DocID, h.Chunk.Index, h.Chunk.Heading, h.Similarity, rankString(h.VectorRank), rankString(h.FTSRank), h.Score, preview)
+		sim := "-"
+		if h.VectorRank > 0 {
+			sim = fmt.Sprintf("%.4f", h.Similarity)
+		}
+		fmt.Printf("  %d. %s#%d [%s] sim=%s vec=%s fts=%s score=%.6f\n     %s\n", i+1, h.Chunk.DocID, h.Chunk.Index, h.Chunk.Heading, sim, rankString(h.VectorRank), rankString(h.FTSRank), h.Score, preview)
 	}
 }
 
 func modeName(c config) string {
 	if c.hybrid {
-		return "vector + BM25 rerank"
+		return "vector + BM25, RRF-fused"
 	}
 	return "vector"
 }
@@ -402,49 +469,7 @@ func rankString(n int) string {
 
 func key(doc string, idx int) string { return fmt.Sprintf("%s\x00%d", doc, idx) }
 
-func findChunk(chunks []chunk, doc string, idx int) chunk {
-	for _, c := range chunks {
-		if c.DocID == doc && c.Index == idx {
-			return c
-		}
-	}
-	return chunk{DocID: doc, Index: idx}
-}
-
 func sqlQuote(s string) string { return strings.ReplaceAll(s, "'", "''") }
-
-// ftsQuery turns a natural-language question into an explicit OR query.
-// TinySQL intentionally treats adjacent FTS terms as AND, which is useful for
-// search syntax but too strict for verbose user questions.
-func ftsQuery(s string) string {
-	stop := map[string]bool{
-		"a": true, "an": true, "and": true, "are": true, "as": true, "at": true,
-		"be": true, "before": true, "can": true, "do": true, "does": true, "for": true,
-		"from": true, "how": true, "i": true, "in": true, "is": true, "it": true,
-		"of": true, "on": true, "or": true, "the": true, "this": true, "to": true,
-		"what": true, "which": true, "with": true,
-		"als": true, "auf": true, "das": true, "der": true, "die": true, "ein": true,
-		"eine": true, "für": true, "fuer": true, "ich": true, "jede": true, "mit": true,
-		"setze": true, "und": true, "wie": true,
-	}
-	fields := strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
-		return (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' && r != '-'
-	})
-	seen := make(map[string]bool)
-	terms := make([]string, 0, len(fields))
-	for _, field := range fields {
-		field = strings.Trim(field, "-")
-		if len([]rune(field)) < 2 || stop[field] || seen[field] {
-			continue
-		}
-		seen[field] = true
-		terms = append(terms, field)
-	}
-	if len(terms) == 0 {
-		return strings.TrimSpace(s)
-	}
-	return strings.Join(terms, " OR ")
-}
 
 func value[T any](row tsql.Row, name string) (T, bool) {
 	var zero T
@@ -457,17 +482,31 @@ func value[T any](row tsql.Row, name string) (T, bool) {
 }
 
 func intValue(row tsql.Row, name string) (int, bool) {
+	f, ok := floatValue(row, name)
+	return int(f), ok
+}
+
+// floatValue reads a numeric column without assuming which numeric type the
+// engine chose. A plain v.(float64) assertion would yield a silent zero for a
+// float32 or integer-typed column, which for a similarity or a rank is
+// indistinguishable from a legitimately-computed value — precisely the kind of
+// scoring bug that shows up only as slightly-wrong rankings.
+func floatValue(row tsql.Row, name string) (float64, bool) {
 	v, ok := tsql.GetVal(row, name)
 	if !ok {
 		return 0, false
 	}
 	switch n := v.(type) {
-	case int:
-		return n, true
-	case int64:
-		return int(n), true
 	case float64:
-		return int(n), true
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	case int64:
+		return float64(n), true
 	default:
 		return 0, false
 	}
