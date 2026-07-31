@@ -577,3 +577,97 @@ ordering, so predicate order in SQL text no longer matters.
 go test -bench='BenchmarkHybridOrderBy|BenchmarkWhereVectorAndSimpleCondition' -benchmem ./internal/engine/...
 go test -bench='BenchmarkRepeatedSelectViaDriver' -benchmem ./internal/driver/...
 ```
+
+### Full-text search: an inverted index for the RAG lexical branch
+
+`docs/rag-guide.md` recommends `HYBRID_SEARCH` as the default RAG retriever: a
+vector pass and a BM25 pass, fused with RRF. Nothing measured that combination
+end to end, so `BenchmarkRAGHybridSearch` and friends were added in
+`internal/engine/rag_workload_benchmark_test.go`.
+
+The fixture matters. The pre-existing FTS benchmark gave every document the
+identical body text, so every document matched every query and BM25 selectivity
+was unobservable. The new corpus is Zipf-distributed (20,000 chunks x 120 tokens,
+4,000-term vocabulary) with a rare-identifier family present in 3 documents
+each — the exact-match case hybrid retrieval exists to serve.
+
+Measured on that corpus, the **lexical branch was ~98% of hybrid retrieval cost**
+(43.9 ms of 44.8 ms; the vector branch was 4.8 ms). `FTS_SEARCH` scored every
+document in the corpus on every query, so a term in 3 of 20,000 chunks cost the
+same as one in all of them. A CPU profile put the time in string-keyed map
+operations (`mapaccess1_faststr` 21%, `ctrlGroup.matchH2` 11%, `memeqbody` 9%)
+plus `maps.Iter.Next` at 12% — the latter being per-document iteration of each
+document's frequency map to expand a wildcard.
+
+Two structures in the existing tokenized-document cache fix both, invalidated by
+`table.Version` exactly like the cache itself (`internal/engine/fts_index.go`):
+
+1. **Postings** — term to ascending row indices. A query's candidate set is
+   derived from them, so documents that cannot match are never scored. The map
+   replaces the former `docFreq map[string]int`: a term's document frequency is
+   its postings length.
+2. **A term dictionary** (the postings key set) — a wildcard resolves against it
+   once per query. This corpus has 4,167 unique terms against 2,400,500 token
+   instances, so a wildcard does 4,167 comparisons instead of 2.4 million.
+
+Restricting candidates cannot change results: `ftsScoredLess` is a total order on
+(score desc, rowIdx asc) and `ftsPushTopK` admits candidates only under that same
+order, so the top-k is a function of the candidate *set*, not of iteration order.
+Candidates are still verified with `ftsMatchNode` and scored with `ftsScoreNode`.
+`NOT` yields no restriction — a document containing none of the query's terms can
+satisfy a negation — so `a OR NOT b` correctly falls back to a full scan while
+`a AND NOT b` still restricts to `a`.
+
+A candidate set covering more than half the corpus is not materialized: it would
+save no scoring work and cost an allocation a plain scan does not. That keeps the
+fallback paths allocation-identical to before (verified in the table below).
+
+| Benchmark (20k chunks, 96 dims) | before | after |
+|---|---|---|
+| Selective term (3 of 20,000 docs) | 979 µs | **37 µs (26x)** |
+| Prefix wildcard | 62.8 ms | **310 µs (202x)** |
+| Quoted phrase | 26.9 ms | 23.1 ms (1.16x) |
+| Four-term OR (all common terms) | 13.09 ms, 98,712 B/op | 13.53 ms, 98,712 B/op |
+| Single corpus-wide term | 6.48 ms, 40,808 B/op | 6.90 ms, 40,808 B/op |
+| `HYBRID_SEARCH` end to end | 14.4 ms | 15.3 ms |
+| Cold cache rebuild | 884 ms, **231 MB** | **707 ms**, **192 MB** |
+
+Read honestly: the index pays off where query terms are selective and costs 3-6%
+where they are not. The "four-term OR" and "corpus-wide term" rows use terms
+present in most of the corpus, where no candidate strategy can help — they are
+the control, and their byte-identical allocation counts show the fallback itself
+adds no work, so that 3-6% is the cost of consulting the postings map and
+resolving the query against it. `HYBRID_SEARCH` pays the same overhead because
+its lexical query here is four common terms; a question containing any selective
+term takes the fast path instead.
+
+Every pair was run alternately from binaries built from the same tree, best-of-N,
+because this machine's run-to-run variance otherwise **exceeds the effects being
+measured** — an unchanged binary produced 951 ms, 1234 ms, 1733 ms and 3411 ms for
+the same cold-cache benchmark on four consecutive runs. Two conclusions drawn from
+single runs during this work turned out to be noise, so the alternating-binary
+comparison is not optional here.
+
+The memory result is better than the index alone would suggest, because
+profiling the build turned up an unrelated sizing bug next to it. Each document's
+term-frequency map was created with `make(map[string]int, len(tokens))` — sized by
+*token* count, though it only ever holds *distinct* terms. Prose repeats words, so
+that hint overshoots by enough to push the map's internal group count past a
+power-of-two boundary and allocate a full extra doubling that is never used, once
+per document, retained for the life of the cache. Sizing by an estimate of the
+distinct count instead cut 61 MB, more than paying for the 23 MB of postings: the
+corpus now costs **17% less memory than before the index was added**.
+
+This also fixed a latent bug. `ftsScoreNode` summed a `float64` per matching
+token while ranging over a Go map; map iteration order is randomized and float
+addition is not associative, so identical wildcard queries against an unchanged
+corpus returned scores differing in their final bits (`term1*` gave
+`142.8432967294423`, then `...4227`, then `...4233`). Summing over a sorted term
+list makes them reproducible. `TestFTSGoldenQueryGrammar` pins this across 20
+query shapes, and `TestFTSCandidateRestrictionMatchesFullScan` checks every shape
+against a full-scan reference implementation.
+
+```sh
+go test -bench='BenchmarkRAG' -benchmem ./internal/engine/...
+go test -run='TestFTSGolden|TestFTSCandidate|TestFTSExpanded|TestFTSNegation' ./internal/engine/...
+```

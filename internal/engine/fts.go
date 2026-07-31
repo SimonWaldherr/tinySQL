@@ -4,7 +4,9 @@
 // Design:
 //   - CREATE VIRTUAL TABLE t USING fts(col1, col2) creates a regular tinySQL
 //     table with FTS indexing enabled.
-//   - INSERT/UPDATE/DELETE automatically maintain an in-memory inverted index.
+//   - FTS_SEARCH builds a tokenized-document cache and an inverted index (term
+//     postings) lazily per searched column set, invalidated by table.Version —
+//     so writes need no index maintenance, and the next search rebuilds.
 //   - FTS_MATCH(text, query) – boolean match check with phrase/boolean query support
 //   - FTS_RANK(text, query)  – BM25-like relevance score
 //   - FTS_SNIPPET(text, query [, before, after, ellipsis, max_tokens]) – highlighted snippet
@@ -41,6 +43,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -595,6 +598,12 @@ func ftsCollectTerms(node *ftsQueryNode, out map[string]bool) {
 		out[node.prefix+"*"] = true
 	case "WILDCARD":
 		// Highlighting uses the query tree directly for wildcard terms.
+	case ftsExpandedOp:
+		// A dictionary-resolved PREFIX/WILDCARD: its terms are literal, so they
+		// can be highlighted directly.
+		for _, t := range node.phrase {
+			out[t] = true
+		}
 	case "NOT":
 		// Don't highlight negated terms.
 	case "AND", "OR":
@@ -621,6 +630,18 @@ func ftsMatchNode(node *ftsQueryNode, freq map[string]int, tokens []string) bool
 	case "WILDCARD":
 		for tok := range freq {
 			if ftsWildcardMatch(node.pattern, tok) {
+				return true
+			}
+		}
+		return false
+	case ftsExpandedOp:
+		// A PREFIX/WILDCARD already resolved against the corpus dictionary
+		// (ftsExpandQuery): matching means the document holds one of those
+		// terms. Equivalent to the two cases above — every document token is a
+		// dictionary term — but it tests a short term list instead of scanning
+		// the document's whole token set.
+		for _, term := range node.phrase {
+			if freq[term] > 0 {
 				return true
 			}
 		}
@@ -667,6 +688,41 @@ const phraseMatchBonus = 1.5
 // in which case term scores are left unweighted (IDF factor of 1).
 type ftsIDFFunc func(term string) float64
 
+// ftsSumMatchingTerms sums termScore over the frequency-map entries satisfying
+// matches, in ascending term order.
+//
+// Sorting is not cosmetic. Summing float64 values while ranging over a Go map
+// accumulates them in a randomized order, and float addition is not
+// associative, so the same query over the same text used to produce scores that
+// differed in their final bits from one call to the next — enough to reorder
+// near-tied results and to make any threshold on the score unreliable. Ordering
+// the terms makes the result reproducible.
+//
+// The corpus-backed search path does not reach this function: ftsExpandQuery
+// resolves PREFIX/WILDCARD nodes against the dictionary once per query, which
+// is both deterministic and far cheaper than a per-document scan. This path
+// serves the single-text scalar functions (FTS_RANK/BM25), where there is no
+// corpus dictionary to expand against.
+func ftsSumMatchingTerms(freq map[string]int, termScore func(string, int) float64, matches func(string) bool) float64 {
+	var matched []string
+	for tok := range freq {
+		if matches(tok) {
+			matched = append(matched, tok)
+		}
+	}
+	if len(matched) == 0 {
+		return 0
+	}
+	if len(matched) > 1 {
+		sort.Strings(matched)
+	}
+	var s float64
+	for _, tok := range matched {
+		s += termScore(tok, freq[tok])
+	}
+	return s
+}
+
 // ftsScoreNode computes a BM25-style score for a parsed query tree.
 // normDocLen is the document length already normalized by the corpus
 // average (docLen/avgdl); callers with no corpus (evalFTSRank) pass 1.0,
@@ -691,18 +747,21 @@ func ftsScoreNode(node *ftsQueryNode, freq map[string]int, normDocLen float64, i
 	case "TERM":
 		return termScore(node.term, freq[node.term])
 	case "PREFIX":
-		var s float64
-		for tok, f := range freq {
-			if strings.HasPrefix(tok, node.prefix) {
-				s += termScore(tok, f)
-			}
-		}
-		return s
+		return ftsSumMatchingTerms(freq, termScore, func(tok string) bool {
+			return strings.HasPrefix(tok, node.prefix)
+		})
 	case "WILDCARD":
+		return ftsSumMatchingTerms(freq, termScore, func(tok string) bool {
+			return ftsWildcardMatch(node.pattern, tok)
+		})
+	case ftsExpandedOp:
+		// Terms are pre-resolved and sorted, so this sums in a deterministic
+		// order over the same (term, frequency) pairs the PREFIX/WILDCARD cases
+		// above would visit. Absent terms score 0 and are skipped.
 		var s float64
-		for tok, f := range freq {
-			if ftsWildcardMatch(node.pattern, tok) {
-				s += termScore(tok, f)
+		for _, term := range node.phrase {
+			if f := freq[term]; f > 0 {
+				s += termScore(term, f)
 			}
 		}
 		return s
@@ -930,15 +989,29 @@ type ftsDocCacheEntry struct {
 	table   *storage.Table
 	version int
 	docs    []ftsCachedDoc
-	// avgDocLen and docFreq are corpus-wide BM25 statistics gathered for
+	// avgDocLen and postings are corpus-wide BM25 statistics gathered for
 	// free while building docs below (one pass, already touching every
 	// token). avgDocLen normalizes each document's length so long documents
-	// aren't penalized by their absolute token count; docFreq (document
-	// frequency per term) feeds IDF so rare terms outweigh common ones.
+	// aren't penalized by their absolute token count; postings yields the
+	// document frequency per term, which feeds IDF so rare terms outweigh
+	// common ones.
 	avgDocLen float64
-	docFreq   map[string]int
-	numDocs   int
+	// postings maps each term to the ascending indices of the documents
+	// containing it, and doubles as the corpus term dictionary. It replaces the
+	// former docFreq map[string]int: a term's document frequency is exactly
+	// len(postings[term]), because the build loop below visits each document
+	// once and appends each of its distinct terms once.
+	//
+	// It serves two purposes beyond IDF. FTS_SEARCH derives a candidate row set
+	// from it so documents that cannot match are never scored, and wildcards are
+	// resolved against its key set once per query instead of against every token
+	// of every document. See fts_index.go.
+	postings map[string][]int32
+	numDocs  int
 }
+
+// docFreq returns the number of documents containing term.
+func (e ftsDocCacheEntry) docFreq(term string) int { return len(e.postings[term]) }
 
 // ftsDocCacheMaxEntries bounds the tokenized-document cache the same way the
 // vector column cache is bounded: each entry pins a *storage.Table, so without
@@ -992,7 +1065,7 @@ func getFTSDocCache(tenant string, table *storage.Table, cols []int) ftsDocCache
 	ftsDocCacheMu.RUnlock()
 
 	docs := make([]ftsCachedDoc, len(table.Rows))
-	docFreq := make(map[string]int)
+	postings := make(map[string][]int32)
 	var totalLen float64
 	var numDocs int
 	var sb strings.Builder
@@ -1013,15 +1086,29 @@ func getFTSDocCache(tenant string, table *storage.Table, cols []int) ftsDocCache
 		if len(tokens) == 0 {
 			continue
 		}
-		freq := make(map[string]int, len(tokens))
+		// Sized by distinct terms, not by token count. These maps are retained
+		// for the life of the cache entry — one per document — so their capacity
+		// is a corpus-scale memory cost. A document's token count overshoots its
+		// distinct-term count by enough to push the map's internal group count
+		// past a power-of-two boundary, which allocates a full extra doubling
+		// that is never used. Three quarters of the token count approximates the
+		// distinct count for prose: close enough to stay under that boundary,
+		// and generous enough that a document with unusually little repetition
+		// grows its map once rather than repeatedly. Measured on the 20k-chunk
+		// RAG fixture, this alone cut the retained cache from 231 MB to 192 MB.
+		freq := make(map[string]int, len(tokens)*3/4+1)
 		for _, t := range tokens {
 			freq[t]++
 		}
 		docs[ri] = ftsCachedDoc{freq: freq, tokens: tokens, docLen: float64(len(tokens)), valid: true}
 		totalLen += float64(len(tokens))
 		numDocs++
+		// Rows are visited in ascending index order and each distinct term of a
+		// document is appended once, so every postings list is ascending and
+		// duplicate-free — the precondition the union/intersection helpers in
+		// fts_index.go rely on.
 		for term := range freq {
-			docFreq[term]++
+			postings[term] = append(postings[term], int32(ri))
 		}
 	}
 
@@ -1030,7 +1117,7 @@ func getFTSDocCache(tenant string, table *storage.Table, cols []int) ftsDocCache
 		avgDocLen = totalLen / float64(numDocs)
 	}
 
-	entry := ftsDocCacheEntry{table: table, version: table.Version, docs: docs, avgDocLen: avgDocLen, docFreq: docFreq, numDocs: numDocs}
+	entry := ftsDocCacheEntry{table: table, version: table.Version, docs: docs, avgDocLen: avgDocLen, postings: postings, numDocs: numDocs}
 	ftsDocCacheMu.Lock()
 	if _, exists := ftsDocCache[key]; !exists {
 		evictOverCap(ftsDocCache, ftsDocCacheMaxEntries)
@@ -1049,7 +1136,7 @@ func ftsIDFLookup(entry ftsDocCacheEntry) ftsIDFFunc {
 	}
 	n := float64(entry.numDocs)
 	return func(term string) float64 {
-		df := entry.docFreq[term]
+		df := entry.docFreq(term)
 		if df == 0 {
 			return 0
 		}
@@ -1329,25 +1416,43 @@ func (f *FTSSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 	cache := getFTSDocCache(tenant, table, searchCols)
 	idf := ftsIDFLookup(cache)
 
+	// Resolve PREFIX/WILDCARD atoms against the corpus dictionary once, then
+	// derive the rows that could possibly match. Both come from the postings
+	// index built with the document cache; see fts_index.go for why restricting
+	// the candidate set cannot change the result.
+	node = ftsExpandQuery(node, cache.postings)
+	candidates := ftsQueryCandidates(node, cache.postings, len(cache.docs))
+
 	// Bounded top-k selection (O(m log k) for m candidate docs) instead of
 	// collecting every match into a slice and sorting the whole thing
 	// (O(m log m)) — the same fix VEC_SEARCH already applies via
 	// vecScoredHeap/topKFromHeap in vector_search.go. Only the k best-scoring
 	// docs are ever retained.
 	heapRows := make(ftsScoredHeap, 0, k)
-	for ri, doc := range cache.docs {
+	score := func(ri int, doc ftsCachedDoc) {
 		if !doc.valid {
-			continue
+			return
 		}
 		if node != nil && !ftsMatchNode(node, doc.freq, doc.tokens) {
-			continue
+			return
 		}
 		normDocLen := doc.docLen
 		if cache.avgDocLen > 0 {
 			normDocLen = doc.docLen / cache.avgDocLen
 		}
-		score := ftsScoreNode(node, doc.freq, normDocLen, idf)
-		ftsPushTopK(&heapRows, ri, score, k)
+		ftsPushTopK(&heapRows, ri, ftsScoreNode(node, doc.freq, normDocLen, idf), k)
+	}
+
+	if !candidates.unrestricted && ftsCandidateScanIsCheaper(candidates.rows, len(cache.docs)) {
+		for _, ri := range candidates.rows {
+			if int(ri) < len(cache.docs) {
+				score(int(ri), cache.docs[ri])
+			}
+		}
+	} else {
+		for ri, doc := range cache.docs {
+			score(ri, doc)
+		}
 	}
 	results := ftsTopKFromHeap(&heapRows, k)
 

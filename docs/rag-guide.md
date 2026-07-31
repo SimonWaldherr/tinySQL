@@ -693,7 +693,8 @@ query execution and index warm-up.
 | many duplicate hits | chunks/overlap are too large | reduce overlap and use context expansion |
 | correct chunk is just outside top-k | candidate window too small | increase `candidate_k` and reevaluate |
 | low-looking `_rrf_score` | RRF scores are reciprocal ranks | sort by `_rrf_rank`; do not treat score as probability |
-| first query is slow | lazy vector/index build | run `VEC_WARM` before traffic |
+| first query is slow | lazy vector/FTS index build | run `VEC_WARM`, and issue one throwaway `FTS_SEARCH`/`HYBRID_SEARCH` per searched column set, before admitting traffic |
+| lexical search is slow on every query | query terms appear in most chunks, so no candidate restriction is possible | check term selectivity; a corpus-wide term always costs a full BM25 pass |
 | ANN loses relevant hits | approximate recall loss | compare with `flat`, then retune or stay exact |
 | answer ignores correct evidence | prompt/context problem | reduce context, improve source labels and grounding rules |
 | unauthorized source appears | post-filter used as security | isolate tenants/corpora before retrieval |
@@ -728,6 +729,20 @@ FROM FTS_SEARCH(
 
 Always pass explicit text columns. With no column list, `FTS_SEARCH` searches
 every column, including vectors and metadata.
+
+`FTS_SEARCH` builds a term-postings index alongside its tokenized-document
+cache, per searched column set, invalidated by the table version. Queries whose
+terms are selective — exact identifiers, error codes, product names, the cases
+the lexical branch exists for — only score the documents that can match, and
+wildcards resolve against the corpus term dictionary once per query instead of
+against every token of every document. A term that appears in most of the corpus
+cannot be narrowed, so it still costs a full BM25 pass; that is a property of the
+query, not a tuning knob. See [BENCHMARKS.md](../BENCHMARKS.md) for measured
+figures.
+
+Both caches are built lazily on first search. There is no `VEC_WARM` equivalent
+for the lexical side, so a serving deployment should issue one throwaway query
+per searched column set during startup, alongside `VEC_WARM`.
 
 ### Explicit hybrid RRF
 
