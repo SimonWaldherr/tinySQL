@@ -13,30 +13,59 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
+// ftsDocStrings rebuilds one document's tokens and term frequencies directly
+// from the source row text.
+//
+// The cache stores documents as term ids in shared arenas, so reading it would
+// make the oracle below depend on the very representation it is meant to check.
+// Re-tokenizing the source keeps the reference implementation independent: it
+// shares only ftsTokenize with the code under test.
+func ftsDocStrings(table *storage.Table, cols []int, rowIdx int) (map[string]int, []string) {
+	var sb strings.Builder
+	row := table.Rows[rowIdx]
+	for _, ci := range cols {
+		if ci < len(row) && row[ci] != nil {
+			if sb.Len() > 0 {
+				sb.WriteByte(' ')
+			}
+			fmt.Fprintf(&sb, "%v", row[ci])
+		}
+	}
+	tokens := ftsTokenize(sb.String())
+	freq := make(map[string]int, len(tokens))
+	for _, t := range tokens {
+		freq[t]++
+	}
+	return freq, tokens
+}
+
 // ftsReferenceTopK is the deliberately naive implementation: score every
-// document in the corpus, keep the k best. It is what FTS_SEARCH did before the
+// document in the corpus with the original string-keyed ftsMatchNode and
+// ftsScoreNode, and keep the k best. It is what FTS_SEARCH did before the
 // inverted index existed, and it is the oracle the index is checked against.
-func ftsReferenceTopK(cache ftsDocCacheEntry, node *ftsQueryNode, k int) []ftsScored {
+func ftsReferenceTopK(table *storage.Table, cols []int, cache ftsDocCacheEntry, node *ftsQueryNode, k int) []ftsScored {
 	idf := ftsIDFLookup(cache)
 	heapRows := make(ftsScoredHeap, 0, k)
 	for ri, doc := range cache.docs {
 		if !doc.valid {
 			continue
 		}
-		if node != nil && !ftsMatchNode(node, doc.freq, doc.tokens) {
+		freq, tokens := ftsDocStrings(table, cols, ri)
+		if node != nil && !ftsMatchNode(node, freq, tokens) {
 			continue
 		}
 		normDocLen := doc.docLen
 		if cache.avgDocLen > 0 {
 			normDocLen = doc.docLen / cache.avgDocLen
 		}
-		ftsPushTopK(&heapRows, ri, ftsScoreNode(node, doc.freq, normDocLen, idf), k)
+		ftsPushTopK(&heapRows, ri, ftsScoreNode(node, freq, normDocLen, idf), k)
 	}
 	return ftsTopKFromHeap(&heapRows, k)
 }
@@ -68,7 +97,7 @@ func TestFTSCandidateRestrictionMatchesFullScan(t *testing.T) {
 				return
 			}
 			expanded := ftsExpandQuery(node, cache.postings)
-			want := ftsReferenceTopK(cache, expanded, k)
+			want := ftsReferenceTopK(table, []int{textIdx}, cache, expanded, k)
 
 			sql := fmt.Sprintf(
 				`SELECT chunk_id, _fts_score FROM FTS_SEARCH('rag_chunks', %s, %d, 'search_text')`,
@@ -152,7 +181,11 @@ func TestFTSCandidatesAreSuperset(t *testing.T) {
 		}
 		missing := 0
 		for ri, doc := range cache.docs {
-			if !doc.valid || !ftsMatchNode(expanded, doc.freq, doc.tokens) {
+			if !doc.valid {
+				continue
+			}
+			freq, tokens := ftsDocStrings(table, []int{textIdx}, ri)
+			if !ftsMatchNode(expanded, freq, tokens) {
 				continue
 			}
 			if !inCandidates[int32(ri)] {
@@ -199,7 +232,7 @@ func TestFTSExpandedScoringMatchesPatternScoring(t *testing.T) {
 			expanded := ftsExpandQuery(original, cache.postings)
 
 			compared := 0
-			for _, doc := range cache.docs {
+			for ri, doc := range cache.docs {
 				if !doc.valid {
 					continue
 				}
@@ -207,13 +240,14 @@ func TestFTSExpandedScoringMatchesPatternScoring(t *testing.T) {
 				if cache.avgDocLen > 0 {
 					normDocLen = doc.docLen / cache.avgDocLen
 				}
-				wantMatch := ftsMatchNode(original, doc.freq, doc.tokens)
-				gotMatch := ftsMatchNode(expanded, doc.freq, doc.tokens)
+				freq, tokens := ftsDocStrings(table, []int{textIdx}, ri)
+				wantMatch := ftsMatchNode(original, freq, tokens)
+				gotMatch := ftsMatchNode(expanded, freq, tokens)
 				if wantMatch != gotMatch {
 					t.Fatalf("match disagreement: pattern says %v, expanded says %v", wantMatch, gotMatch)
 				}
-				want := ftsScoreNode(original, doc.freq, normDocLen, idf)
-				got := ftsScoreNode(expanded, doc.freq, normDocLen, idf)
+				want := ftsScoreNode(original, freq, normDocLen, idf)
+				got := ftsScoreNode(expanded, freq, normDocLen, idf)
 				if want != 0 || got != 0 {
 					if diff := math.Abs(want - got); diff > 1e-9*math.Max(math.Abs(want), 1) {
 						t.Fatalf("score disagreement: pattern %v vs expanded %v (diff %g)", want, got, diff)
@@ -392,17 +426,40 @@ func TestFTSPostingsMatchDocumentFrequency(t *testing.T) {
 	if got := cache.docFreq("absent"); got != 0 {
 		t.Errorf("docFreq of an absent term = %d, want 0", got)
 	}
-	// Recount document frequency straight from the cached documents.
+	// Recount document frequency from the source text, and check the compact
+	// per-document term runs agree with it. This cross-checks three
+	// representations against each other: the postings lists, the arena-backed
+	// term runs, and the raw text.
 	for term := range cache.postings {
-		n := 0
-		for _, doc := range cache.docs {
-			if doc.valid && doc.freq[term] > 0 {
-				n++
+		id, ok := cache.termIDs[term]
+		if !ok {
+			t.Errorf("term %q has postings but no term id", term)
+			continue
+		}
+		fromText, fromRuns := 0, 0
+		for ri, doc := range cache.docs {
+			if !doc.valid {
+				continue
+			}
+			freq, _ := ftsDocStrings(table, []int{bodyIdx}, ri)
+			if freq[term] > 0 {
+				fromText++
+			}
+			if got := cache.termFrequency(doc, id); got > 0 {
+				fromRuns++
+				if got != freq[term] {
+					t.Errorf("row %d term %q: term run says %d, source text says %d",
+						ri, term, got, freq[term])
+				}
 			}
 		}
-		if n != len(cache.postings[term]) {
+		if fromText != len(cache.postings[term]) {
 			t.Errorf("term %q: postings has %d entries, %d documents contain it",
-				term, len(cache.postings[term]), n)
+				term, len(cache.postings[term]), fromText)
+		}
+		if fromRuns != fromText {
+			t.Errorf("term %q: term runs report %d documents, source text %d",
+				term, fromRuns, fromText)
 		}
 	}
 }
@@ -535,7 +592,7 @@ func TestFTSParallelScanMatchesSerialScan(t *testing.T) {
 		node = ftsExpandQuery(node, cache.postings)
 		cands := ftsQueryCandidates(node, cache.postings, len(cache.docs))
 		restricted := !cands.unrestricted && ftsCandidateScanIsCheaper(cands.rows, len(cache.docs))
-		bound := ftsBindIDF(node, idf)
+		bound := ftsBindIDF(node, idf, cache.termIDs)
 
 		const k = 12
 		parallel, err := ftsScanTopK(ctx, cache, bound, idf, cands.rows, restricted, k)

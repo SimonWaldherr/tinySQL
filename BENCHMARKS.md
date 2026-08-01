@@ -742,3 +742,80 @@ restricted enough to scan serially, is the shape worth revisiting.
 go test -bench='BenchmarkRAG' -benchmem ./internal/engine/...
 go test -run='TestFTSParallel|TestRAGContextIndex' ./internal/engine/...
 ```
+
+### Documents as term ids in shared arenas
+
+After the previous two rounds, profiling `HYBRID_SEARCH` still put **68% of its
+time in `mapaccess1_faststr`** — at roughly 110 ns per lookup, far above the cost
+of hashing a short string. The lookups were not slow because of hashing; they were
+missing cache. Each document owned a `freq map[string]int`, so scoring a corpus
+walked 20,000 independently allocated maps and every probe landed in cold memory.
+String keys also meant hashing and comparing bytes for a value the corpus already
+had an integer for.
+
+Two changes, in `ftsCachedDoc` and `getFTSDocCache`:
+
+- **Term ids.** Every corpus term gets a dense `int32`. Query terms resolve through
+  the dictionary once per query, in the same pass that binds their IDF, so the
+  per-document hot loop compares integers. A term absent from the corpus resolves
+  to `-1`, which no document contains, so it simply never matches.
+- **Shared arenas.** A document is now four offsets into per-entry arenas instead
+  of two heap objects: its distinct terms and their frequencies as one ascending
+  run (so a frequency lookup is a binary search over contiguous `int32`s), and its
+  tokens in order for phrase matching. Scoring successive documents walks memory
+  sequentially.
+
+`ftsMatchNode` and `ftsScoreNode` were also fused into one tree walk
+(`ftsEvalNode`): both walked the same tree performing the same lookups, so every
+matching document paid twice. That is worth less than it sounds — `ftsMatchNode`'s
+OR already short-circuited on the first common term, so only one lookup in five
+was redundant for the four-term query — and it measured ~14% on a single-term
+query, ~2% on hybrid.
+
+The arenas' final size is unknown until every row is tokenized, so `append` grew
+them by repeated doubling, churning about as many bytes again as it kept. After 64
+documents the average length is extrapolated and the whole estimate reserved in
+one step, which costs ~14% more retained memory in overshoot and saves ~37% of the
+build's allocation.
+
+Cumulative against the pre-index baseline (minima of four alternating rounds), and
+against the previous commit:
+
+| Benchmark (20k chunks, 96 dims) | pre-index | previous | now | total |
+|---|---|---|---|---|
+| `HYBRID_SEARCH` + expansion | 16.44 ms | 2.98 ms | **2.11 ms** | **7.8x** |
+| `HYBRID_SEARCH` | 10.70 ms | 2.74 ms | **2.12 ms** | **5.0x** |
+| BM25 branch (four-term OR) | 9.24 ms | 2.11 ms | **1.32 ms** | **7.0x** |
+| Single corpus-wide term | 2.96 ms | 908 µs | **500 µs** | **5.9x** |
+| Quoted phrase | 18.18 ms | 4.72 ms | **1.78 ms** | **10.2x** |
+| Selective term (3 of 20,000) | 571 µs | 19.4 µs | **17.1 µs** | **33x** |
+| Prefix wildcard | 43.76 ms | 239 µs | **195 µs** | **224x** |
+
+Phrase matching gains most (2.7x on top of the previous round) because it compares
+token ids instead of strings, over a contiguous run.
+
+Memory, measured as retained heap for one 20k-chunk corpus
+(`TestRAGCacheFootprint`), is the more important result for how large a corpus fits:
+
+| | retained | per chunk |
+|---|---|---|
+| before | 139.7 MB | 6,986 B |
+| after | **39.3 MB** | **1,963 B** |
+
+That is **3.6x less**, against searched text of roughly 1.4 KB per chunk — the
+cache now costs about 1.4x the text it indexes, where it used to cost 5x. Build
+allocation also fell from 192 MB to 152 MB per rebuild.
+
+Correctness rests on the same differential test, strengthened: its oracle no longer
+reads the cache at all. `ftsDocStrings` re-tokenizes each document from the source
+row text and scores it with the original string-keyed `ftsMatchNode`/`ftsScoreNode`,
+so the reference implementation shares only `ftsTokenize` with the code under test,
+and the comparison is still exact float equality.
+`TestFTSPostingsMatchDocumentFrequency` additionally cross-checks three
+representations against each other: the postings lists, the arena term runs, and
+the raw text.
+
+```sh
+go test -bench='BenchmarkRAG' -benchmem ./internal/engine/...
+go test -run='TestRAGCacheFootprint' -v ./internal/engine/...
+```

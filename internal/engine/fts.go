@@ -329,6 +329,12 @@ type ftsQueryNode struct {
 	idfBound bool
 	termIDF  float64   // TERM
 	termIDFs []float64 // PHRASE / EXPANDED, parallel to phrase
+
+	// Corpus term ids resolved alongside the IDF weights, so the per-document
+	// hot loop compares int32s instead of hashing and comparing strings. -1
+	// means the term is absent from the corpus.
+	termID   int32   // TERM
+	termIDNs []int32 // PHRASE / EXPANDED, parallel to phrase
 }
 
 type ftsWildcardAtom struct {
@@ -1021,11 +1027,31 @@ func evalContainsScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 // or a dashboard) until the table is mutated. Mirrors the vecSearchColumnCache
 // pattern in vector_search.go: keyed by (tenant, table, column set), and
 // invalidated by table.Version.
+// ftsCachedDoc describes one document as slices into the cache entry's shared
+// arenas rather than as its own heap objects.
+//
+// It used to hold a freq map[string]int plus a tokens []string per document. That
+// cost two allocations per document and made scoring the corpus a walk over
+// thousands of independently allocated maps: profiling a RAG SELECT put 68% of
+// its time in mapaccess1_faststr at roughly 110ns per lookup, which is far above
+// the cost of hashing a short string — the lookups were missing cache on every
+// probe. String keys also meant hashing and comparing bytes for a value the
+// corpus already knows an integer for.
+//
+// Both are now runs inside per-entry arenas, so scoring successive documents
+// walks memory sequentially and compares int32s:
+//
+//   - termStart/termCount index entry.docTermIDs and entry.docTermCounts, sorted
+//     ascending by term ID so a term's frequency is a binary search.
+//   - tokenStart/tokenCount index entry.docTokenIDs, in document order, which is
+//     what phrase matching needs.
 type ftsCachedDoc struct {
-	freq   map[string]int
-	tokens []string
-	docLen float64
-	valid  bool
+	termStart  int32
+	termCount  int32
+	tokenStart int32
+	tokenCount int32
+	docLen     float64
+	valid      bool
 }
 
 type ftsDocCacheKey struct {
@@ -1057,10 +1083,48 @@ type ftsDocCacheEntry struct {
 	// of every document. See fts_index.go.
 	postings map[string][]int32
 	numDocs  int
+
+	// termIDs assigns each corpus term a dense integer id. Query terms are
+	// resolved through it once per query (ftsBindIDF), after which every
+	// per-document lookup compares int32s instead of hashing and comparing
+	// strings.
+	termIDs map[string]int32
+	// docTermIDs/docTermCounts hold each document's distinct terms and their
+	// frequencies, as one ascending run per document (see ftsCachedDoc).
+	docTermIDs    []int32
+	docTermCounts []int32
+	// docTokenIDs holds each document's tokens in order, for phrase matching.
+	docTokenIDs []int32
 }
 
 // docFreq returns the number of documents containing term.
 func (e ftsDocCacheEntry) docFreq(term string) int { return len(e.postings[term]) }
+
+// termFrequency returns how often the term with id appears in doc, or 0.
+//
+// The document's terms are a short ascending run, so this is a branchy binary
+// search over contiguous int32s — a few cache-resident comparisons, against the
+// pointer-chasing map probe it replaces.
+func (e ftsDocCacheEntry) termFrequency(doc ftsCachedDoc, id int32) int {
+	lo, hi := doc.termStart, doc.termStart+doc.termCount
+	for lo < hi {
+		mid := (lo + hi) / 2
+		switch v := e.docTermIDs[mid]; {
+		case v < id:
+			lo = mid + 1
+		case v > id:
+			hi = mid
+		default:
+			return int(e.docTermCounts[mid])
+		}
+	}
+	return 0
+}
+
+// docTokens returns doc's token ids in document order.
+func (e ftsDocCacheEntry) docTokens(doc ftsCachedDoc) []int32 {
+	return e.docTokenIDs[doc.tokenStart : doc.tokenStart+doc.tokenCount]
+}
 
 // ftsDocCacheMaxEntries bounds the tokenized-document cache the same way the
 // vector column cache is bounded: each entry pins a *storage.Table, so without
@@ -1100,6 +1164,52 @@ func ftsColsCacheKey(cols []int) string {
 	return b.String()
 }
 
+// ftsArenaEstimateAfter is how many documents to tokenize before extrapolating
+// the arena sizes from their average length. Small enough to happen early,
+// large enough that one unusually short or long document does not skew it.
+const ftsArenaEstimateAfter = 64
+
+// ftsReserve returns s with capacity for at least want elements, preserving its
+// contents and length. It is a no-op when the capacity already suffices.
+func ftsReserve(s []int32, want int) []int32 {
+	if want <= cap(s) {
+		return s
+	}
+	grown := make([]int32, len(s), want)
+	copy(grown, s)
+	return grown
+}
+
+// ftsWriteValue appends v's default formatting to sb.
+//
+// The generic path is fmt.Fprintf(sb, "%v", v), which reflects on every value.
+// Building the cache stringifies every searched column of every row, so for a
+// corpus that is one reflective call per cell. These cases cover what storage
+// actually holds in a text column and produce byte-identical output to %v; any
+// other type still falls through to fmt.
+func ftsWriteValue(sb *strings.Builder, v any) {
+	switch t := v.(type) {
+	case string:
+		sb.WriteString(t)
+	case int:
+		sb.WriteString(strconv.Itoa(t))
+	case int64:
+		sb.WriteString(strconv.FormatInt(t, 10))
+	case bool:
+		if t {
+			sb.WriteString("true")
+		} else {
+			sb.WriteString("false")
+		}
+	default:
+		// float64 deliberately stays here: %v uses %g-style shortest
+		// representation with rules that strconv.FormatFloat only reproduces
+		// with care, and getting it wrong would silently change which tokens a
+		// numeric column contributes.
+		fmt.Fprintf(sb, "%v", v)
+	}
+}
+
 // getFTSDocCache returns the tokenized documents (plus corpus-wide BM25
 // stats) for the given column set, (re)building them if the table has
 // changed since the last call.
@@ -1115,9 +1225,17 @@ func getFTSDocCache(tenant string, table *storage.Table, cols []int) ftsDocCache
 
 	docs := make([]ftsCachedDoc, len(table.Rows))
 	postings := make(map[string][]int32)
+	termIDs := make(map[string]int32)
+	var termNames []string // id -> term, for building the string-keyed postings map
+	var docTermIDs, docTermCounts, docTokenIDs []int32
 	var totalLen float64
 	var numDocs int
 	var sb strings.Builder
+	// counts is reused across documents to tally one document's term
+	// frequencies. It is indexed by term id and cleared only for the ids this
+	// document touched, so it stays O(document) per row rather than O(corpus).
+	var counts []int32
+	var touched []int32
 	for ri, r := range table.Rows {
 		sb.Reset()
 		for _, ci := range cols {
@@ -1125,7 +1243,7 @@ func getFTSDocCache(tenant string, table *storage.Table, cols []int) ftsDocCache
 				if sb.Len() > 0 {
 					sb.WriteByte(' ')
 				}
-				fmt.Fprintf(&sb, "%v", r[ci])
+				ftsWriteValue(&sb, r[ci])
 			}
 		}
 		if sb.Len() == 0 {
@@ -1135,28 +1253,66 @@ func getFTSDocCache(tenant string, table *storage.Table, cols []int) ftsDocCache
 		if len(tokens) == 0 {
 			continue
 		}
-		// Sized by distinct terms, not by token count. These maps are retained
-		// for the life of the cache entry — one per document — so their capacity
-		// is a corpus-scale memory cost. A document's token count overshoots its
-		// distinct-term count by enough to push the map's internal group count
-		// past a power-of-two boundary, which allocates a full extra doubling
-		// that is never used. Three quarters of the token count approximates the
-		// distinct count for prose: close enough to stay under that boundary,
-		// and generous enough that a document with unusually little repetition
-		// grows its map once rather than repeatedly. Measured on the 20k-chunk
-		// RAG fixture, this alone cut the retained cache from 231 MB to 192 MB.
-		freq := make(map[string]int, len(tokens)*3/4+1)
+
+		tokenStart := int32(len(docTokenIDs))
+		touched = touched[:0]
 		for _, t := range tokens {
-			freq[t]++
+			id, ok := termIDs[t]
+			if !ok {
+				id = int32(len(termIDs))
+				termIDs[t] = id
+				termNames = append(termNames, t)
+				counts = append(counts, 0)
+			}
+			if counts[id] == 0 {
+				touched = append(touched, id)
+			}
+			counts[id]++
+			docTokenIDs = append(docTokenIDs, id)
 		}
-		docs[ri] = ftsCachedDoc{freq: freq, tokens: tokens, docLen: float64(len(tokens)), valid: true}
+
+		// Each document's terms are stored as one ascending run so a frequency
+		// lookup is a binary search (see ftsDocCacheEntry.termFrequency).
+		sort.Slice(touched, func(i, j int) bool { return touched[i] < touched[j] })
+		termStart := int32(len(docTermIDs))
+		for _, id := range touched {
+			docTermIDs = append(docTermIDs, id)
+			docTermCounts = append(docTermCounts, counts[id])
+			counts[id] = 0 // reset for the next document
+		}
+
+		docs[ri] = ftsCachedDoc{
+			termStart:  termStart,
+			termCount:  int32(len(touched)),
+			tokenStart: tokenStart,
+			tokenCount: int32(len(tokens)),
+			docLen:     float64(len(tokens)),
+			valid:      true,
+		}
 		totalLen += float64(len(tokens))
 		numDocs++
+		// The arenas' final size is unknown until every row is tokenized, so
+		// append would grow them by repeated doubling — for a large corpus that
+		// churns roughly as many bytes again as it keeps. Once enough documents
+		// have been seen to average their length, reserve the whole estimate in
+		// one step. Overshooting slightly is preferable to several more copies of
+		// a multi-megabyte arena; a corpus that exceeds the estimate simply falls
+		// back to appending.
+		if numDocs == ftsArenaEstimateAfter {
+			perDoc := len(docTokenIDs)/numDocs + 1
+			rows := len(table.Rows)
+			docTokenIDs = ftsReserve(docTokenIDs, perDoc*rows*5/4)
+			termsPerDoc := len(docTermIDs)/numDocs + 1
+			docTermIDs = ftsReserve(docTermIDs, termsPerDoc*rows*5/4)
+			docTermCounts = ftsReserve(docTermCounts, termsPerDoc*rows*5/4)
+		}
 		// Rows are visited in ascending index order and each distinct term of a
 		// document is appended once, so every postings list is ascending and
 		// duplicate-free — the precondition the union/intersection helpers in
-		// fts_index.go rely on.
-		for term := range freq {
+		// fts_index.go rely on. touched is already deduplicated, so this needs no
+		// second pass over the tokens.
+		for _, id := range touched {
+			term := termNames[id]
 			postings[term] = append(postings[term], int32(ri))
 		}
 	}
@@ -1166,7 +1322,14 @@ func getFTSDocCache(tenant string, table *storage.Table, cols []int) ftsDocCache
 		avgDocLen = totalLen / float64(numDocs)
 	}
 
-	entry := ftsDocCacheEntry{table: table, version: table.Version, docs: docs, avgDocLen: avgDocLen, postings: postings, numDocs: numDocs}
+	entry := ftsDocCacheEntry{
+		table: table, version: table.Version, docs: docs,
+		avgDocLen: avgDocLen, postings: postings, numDocs: numDocs,
+		termIDs:       termIDs,
+		docTermIDs:    docTermIDs,
+		docTermCounts: docTermCounts,
+		docTokenIDs:   docTokenIDs,
+	}
 	ftsDocCacheMu.Lock()
 	if _, exists := ftsDocCache[key]; !exists {
 		evictOverCap(ftsDocCache, ftsDocCacheMaxEntries)
@@ -1474,7 +1637,7 @@ func (f *FTSSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 	// Resolve every term's IDF once for the whole query rather than once per
 	// scored document (see ftsBindIDF). Candidate derivation above still uses
 	// the unbound tree; binding only rewrites scoring weights.
-	node = ftsBindIDF(node, idf)
+	node = ftsBindIDF(node, idf, cache.termIDs)
 
 	// Bounded top-k selection (O(m log k) for m candidate docs) instead of
 	// collecting every match into a slice and sorting the whole thing

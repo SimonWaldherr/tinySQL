@@ -133,6 +133,135 @@ func ftsScanTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQueryNode
 	return ftsTopKFromHeap(merged, k), nil
 }
 
+// ftsEvalNode decides whether a document matches and what it scores in a single
+// walk of the query tree.
+//
+// ftsMatchNode and ftsScoreNode walk the same tree and perform the same
+// freq[term] lookups, so every matching document used to hash and compare each
+// query term twice. Those lookups were 68% of a RAG SELECT's runtime, and half
+// of them were redundant.
+//
+// The results are identical to calling the two functions in sequence, which
+// TestFTSCandidateRestrictionMatchesFullScan verifies: its oracle still uses the
+// separate functions, so any divergence here fails that test. The two remain the
+// implementation for the single-text scalar functions (FTS_MATCH/FTS_RANK),
+// which have no corpus and cannot use the bound-IDF form.
+//
+// Short-circuiting is preserved where it is observable. AND returns as soon as
+// its left side fails to match, because a non-matching document's score is
+// discarded by the caller. OR must still evaluate both sides even once the left
+// matches, since its score is the maximum of the two — exactly what
+// ftsScoreNode already did.
+func ftsEvalNode(cache ftsDocCacheEntry, doc ftsCachedDoc, node *ftsQueryNode, normDocLen float64) (bool, float64) {
+	if node == nil {
+		return false, 0
+	}
+	// Mirrors ftsScoreNode's arithmetic exactly, including the order of
+	// operations: float multiplication is not associative, so scaling by IDF
+	// after the division is load-bearing for bit-identical scores.
+	lengthNorm := bm25K1 * (1 - bm25B + bm25B*normDocLen)
+	score := func(weight float64, f int) float64 {
+		tf := float64(f)
+		if tf == 0 {
+			return 0
+		}
+		s := (tf * (bm25K1 + 1)) / (tf + lengthNorm)
+		return s * weight
+	}
+
+	switch node.op {
+	case "TERM":
+		f := cache.termFrequency(doc, node.termID)
+		return f > 0, score(node.termIDF, f)
+
+	case ftsExpandedOp:
+		matched := false
+		var sum float64
+		for i, id := range node.termIDNs {
+			f := cache.termFrequency(doc, id)
+			if f == 0 {
+				continue
+			}
+			matched = true
+			sum += score(node.termIDFs[i], f)
+		}
+		return matched, sum
+
+	case "PHRASE":
+		if len(node.phrase) == 0 {
+			// ftsMatchNode treats an empty phrase as matching; ftsScoreNode
+			// scores it 0. Both are preserved.
+			return true, 0
+		}
+		if !ftsPhraseMatchIDs(node.termIDNs, cache.docTokens(doc)) {
+			return false, 0
+		}
+		var sum float64
+		for i, id := range node.termIDNs {
+			sum += score(node.termIDFs[i], cache.termFrequency(doc, id))
+		}
+		return true, sum * phraseMatchBonus
+
+	case "AND":
+		leftMatched, leftScore := ftsEvalNode(cache, doc, node.left, normDocLen)
+		if !leftMatched {
+			return false, 0
+		}
+		rightMatched, rightScore := ftsEvalNode(cache, doc, node.right, normDocLen)
+		if !rightMatched {
+			return false, 0
+		}
+		return true, leftScore + rightScore
+
+	case "OR":
+		leftMatched, leftScore := ftsEvalNode(cache, doc, node.left, normDocLen)
+		rightMatched, rightScore := ftsEvalNode(cache, doc, node.right, normDocLen)
+		if leftScore > rightScore {
+			return leftMatched || rightMatched, leftScore
+		}
+		return leftMatched || rightMatched, rightScore
+
+	case "NOT":
+		matched, _ := ftsEvalNode(cache, doc, node.operand, normDocLen)
+		return !matched, 0
+
+	default:
+		// PREFIX/WILDCARD reach here only if the tree was never expanded, which
+		// cannot happen on the corpus path (ftsExpandQuery runs first and
+		// ftsBindIDF resolves the result). Treat as no match rather than
+		// silently scoring, so a future caller that skips expansion fails
+		// visibly in tests instead of returning wrong scores.
+		return false, 0
+	}
+}
+
+// ftsPhraseMatchIDs reports whether tokens contains phrase as a consecutive
+// subsequence, comparing term ids. Same algorithm as ftsPhraseMatch, on int32s
+// instead of strings.
+func ftsPhraseMatchIDs(phrase []int32, tokens []int32) bool {
+	if len(phrase) == 0 || len(phrase) > len(tokens) {
+		return len(phrase) == 0
+	}
+	for _, id := range phrase {
+		if id < 0 {
+			return false // a term absent from the corpus cannot appear
+		}
+	}
+	for i := 0; i <= len(tokens)-len(phrase); i++ {
+		match := true
+		for j, p := range phrase {
+			if tokens[i+j] != p {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
 // ftsScanRange scores the half-open slice [start, end) of either the candidate
 // row list (restricted) or the whole corpus, returning a size-k heap.
 func ftsScanRange(ctx context.Context, cache ftsDocCacheEntry, node *ftsQueryNode, idf ftsIDFFunc, rows []int32, restricted bool, start, end, k int) (ftsScoredHeap, error) {
@@ -154,14 +283,22 @@ func ftsScanRange(ctx context.Context, cache ftsDocCacheEntry, node *ftsQueryNod
 		if !doc.valid {
 			continue
 		}
-		if node != nil && !ftsMatchNode(node, doc.freq, doc.tokens) {
-			continue
-		}
 		normDocLen := doc.docLen
 		if cache.avgDocLen > 0 {
 			normDocLen = doc.docLen / cache.avgDocLen
 		}
-		ftsPushTopK(&heapRows, ri, ftsScoreNode(node, doc.freq, normDocLen, idf), k)
+		if node == nil {
+			// A nil query tree previously bypassed the match check and scored
+			// every valid document 0. FTS_SEARCH rejects an empty query before
+			// reaching here, but preserve the behavior for direct callers.
+			ftsPushTopK(&heapRows, ri, 0, k)
+			continue
+		}
+		matched, score := ftsEvalNode(cache, doc, node, normDocLen)
+		if !matched {
+			continue
+		}
+		ftsPushTopK(&heapRows, ri, score, k)
 	}
 	return heapRows, nil
 }
@@ -245,25 +382,38 @@ func ftsExpandQuery(node *ftsQueryNode, postings map[string][]int32) *ftsQueryNo
 // derived from. PREFIX and WILDCARD nodes are left unbound — on this path
 // ftsExpandQuery has already replaced them, and where it has not (the
 // single-text scalar functions) there is no corpus to bind against.
-func ftsBindIDF(node *ftsQueryNode, idf ftsIDFFunc) *ftsQueryNode {
+func ftsBindIDF(node *ftsQueryNode, idf ftsIDFFunc, termIDs map[string]int32) *ftsQueryNode {
 	if node == nil || idf == nil {
 		return node
 	}
+	// A term the corpus has never seen gets id -1, which no document run
+	// contains, so it simply never matches — the same outcome as a zero
+	// frequency from the string map.
+	lookup := func(term string) int32 {
+		if id, ok := termIDs[term]; ok {
+			return id
+		}
+		return -1
+	}
 	switch node.op {
 	case "TERM":
-		return &ftsQueryNode{op: "TERM", term: node.term, idfBound: true, termIDF: idf(node.term)}
+		return &ftsQueryNode{op: "TERM", term: node.term,
+			idfBound: true, termIDF: idf(node.term), termID: lookup(node.term)}
 	case "PHRASE", ftsExpandedOp:
 		weights := make([]float64, len(node.phrase))
+		ids := make([]int32, len(node.phrase))
 		for i, term := range node.phrase {
 			weights[i] = idf(term)
+			ids[i] = lookup(term)
 		}
-		return &ftsQueryNode{op: node.op, phrase: node.phrase, idfBound: true, termIDFs: weights}
+		return &ftsQueryNode{op: node.op, phrase: node.phrase,
+			idfBound: true, termIDFs: weights, termIDNs: ids}
 	case "AND", "OR":
 		return &ftsQueryNode{op: node.op,
-			left:  ftsBindIDF(node.left, idf),
-			right: ftsBindIDF(node.right, idf)}
+			left:  ftsBindIDF(node.left, idf, termIDs),
+			right: ftsBindIDF(node.right, idf, termIDs)}
 	case "NOT":
-		return &ftsQueryNode{op: "NOT", operand: ftsBindIDF(node.operand, idf)}
+		return &ftsQueryNode{op: "NOT", operand: ftsBindIDF(node.operand, idf, termIDs)}
 	default:
 		return node
 	}
