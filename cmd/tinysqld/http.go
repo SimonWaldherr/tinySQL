@@ -23,6 +23,8 @@ type daemonConfig struct {
 	MaxBodyBytes   int64
 	MaxSQLBytes    int
 	Analytics      bool
+	// Tiles enables the public /tiles/ XYZ endpoint (see tiles.go).
+	Tiles bool
 }
 
 type daemon struct {
@@ -33,6 +35,7 @@ type daemon struct {
 	maxBodyBytes   int64
 	maxSQLBytes    int
 	analytics      bool
+	tiles          bool
 	startedAt      time.Time
 	ready          atomic.Bool
 }
@@ -93,6 +96,7 @@ func newDaemon(inst *tinysql.Instance, cfg daemonConfig) *daemon {
 		maxBodyBytes:   maxBodyBytes,
 		maxSQLBytes:    maxSQLBytes,
 		analytics:      cfg.Analytics,
+		tiles:          cfg.Tiles,
 		startedAt:      time.Now(),
 	}
 	d.ready.Store(true)
@@ -112,6 +116,14 @@ func (d *daemon) routes() http.Handler {
 	mux.HandleFunc("/api/jobs", d.requireAuth(d.handleJobs))
 	mux.HandleFunc("/api/job-history", d.requireAuth(d.handleJobHistory))
 	mux.HandleFunc("/api/jobs/run", d.requireAuth(d.handleRunJob))
+	if d.tiles {
+		// Deliberately outside requireAuth: a browser cannot attach an
+		// Authorization header to an <img>/map tile request, so a bearer-token
+		// gate would make the endpoint unusable for its only purpose. It is off
+		// unless -tiles is passed, so nothing is exposed by default. Put a proxy
+		// in front for referer/IP restrictions or signed URLs.
+		mux.HandleFunc("/tiles/", d.handleTiles)
+	}
 	return mux
 }
 

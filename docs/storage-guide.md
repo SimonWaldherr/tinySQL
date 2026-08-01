@@ -142,6 +142,27 @@ up and makes `max_memory_bytes` a hard pool-admission bound.
 The legacy table-file codec still decodes one complete table for a cache miss,
 so `max_memory_bytes` bounds retained cache residency, not the temporary
 allocation for one oversized table. It is safe against the former catalog leak,
-but it is not yet a page/record-level MBTiles serving format. For
-multi-gigabyte `images` tables, use SQLite for production MBTiles serving until
-the pager-native immutable index format is introduced.
+but it is not yet a page/record-level MBTiles serving format.
+
+### Serving MBTiles
+
+For a tileset that fits in memory, tinySQL serves tiles at the same speed as
+SQLite. The per-request query is a point lookup on
+`(zoom_level, tile_column, tile_row)`; with a composite index on those columns it
+is an index seek, measured at parity with SQLite's `:memory:` and roughly 4-5x
+faster than a SQLite file — see
+[BENCHMARKS.md](../BENCHMARKS.md#mbtiles-tile-serving-tinysql-vs-sqlite). Create
+the index explicitly; a declared `PRIMARY KEY` does not create one:
+
+```sql
+CREATE INDEX tile_index ON tiles (zoom_level, tile_column, tile_row);
+```
+
+`cmd/tinysqld -tiles` then serves `/tiles/{tileset}/{z}/{x}/{y}.{ext}` plus
+TileJSON, handling the XYZ-to-TMS row conversion.
+
+For a tileset **larger than memory**, use SQLite, or query the `.mbtiles` in
+place with `importer.OpenMBTiles`, whose `Zooms` and `WithoutTileData` options
+read only the zoom levels or only the tile index you need. A pager-native
+immutable format that would serve a multi-gigabyte tileset directly from tinySQL
+is not implemented.

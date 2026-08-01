@@ -72,6 +72,11 @@ func main() {
   context expansion.
 - Geodata imports and SQL helpers for GeoJSON, KML, OSM XML, Shapefiles,
   MBTiles, routing graphs, points, distance, radius, and bounding-box queries.
+- Map tiles: Web Mercator addressing functions (`TILE_X`, `TILE_Y`, `TILE_ZXY`,
+  `TILE_BBOX`, `TILE_QUADKEY`, and `TILE_FLIP_Y` for the XYZ/TMS row
+  convention), MBTiles import/export, in-place `.mbtiles` querying, and an
+  optional XYZ tile endpoint in `tinysqld`. See
+  [Serving map tiles](#serving-map-tiles).
 - Operational hooks for health checks, lifecycle management, read-only mode,
   RBAC, audit logging, and encryption at rest for `ModeDisk`, `ModeJSON`,
   `ModeHybrid`, and `ModeIndex` table files.
@@ -178,8 +183,10 @@ go build -tags=sqliteimport,shapefile ./...
 ```
 
 Without the respective tag, the import API remains available but returns a
-clear feature-disabled error. SQLite remains the recommended production backend
-for standard MBTiles serving.
+clear feature-disabled error. The tags are only needed to *read and write*
+`.mbtiles` files; serving a tileset already loaded into tinySQL needs neither.
+For a tileset larger than memory, SQLite remains the better backend — see
+[Serving map tiles](#serving-map-tiles).
 
 ## Statically linked Go extensions
 
@@ -237,6 +244,81 @@ declared types, affinity, constraints, row count, and an ordered typed-row
 SHA-256 fingerprint, to accompany a CSV, JSON, or SQL data export for verifiable
 transfers. Runnable example:
 [`ExampleExportJSON`](./exporter/example_test.go).
+
+## Serving map tiles
+
+MBTiles is a SQLite database with a prescribed schema, so tinySQL treats a
+tileset as an ordinary table plus the addressing functions and transport that
+make it usable as a map.
+
+**The row convention.** Web clients and `/{z}/{x}/{y}.png` URLs count tile rows
+from the top (XYZ); the MBTiles specification stores them counted from the
+bottom (TMS). They differ by `2^zoom - 1 - y`, and getting it wrong yields a
+vertically mirrored map that looks almost right. `TILE_FLIP_Y` is the one
+explicit conversion; every other tile function speaks XYZ:
+
+```sql
+-- The tile covering Berlin at zoom 14, ready for an MBTiles lookup.
+SELECT TILE_ZXY(13.405, 52.520, 14);
+-- {"tile_row":11010,"x":8802,"y":5373,"z":14}
+
+SELECT tile_data FROM tiles
+WHERE zoom_level = 14
+  AND tile_column = TILE_X(13.405, 14)
+  AND tile_row    = TILE_FLIP_Y(TILE_Y(52.520, 14), 14);
+```
+
+Also available: `TILE_LON`/`TILE_LAT` (tile edges), `TILE_BBOX` (bounds as
+`[west, south, east, north]`), `TILE_QUADKEY`/`TILE_FROM_QUADKEY`,
+`TILE_PARENT`, `TILE_CONTAINS`, and `TILE_COUNT`.
+
+**Index the tileset.** A declared `PRIMARY KEY` does not create an index, and a
+tile lookup without one is a full scan:
+
+```sql
+CREATE INDEX tile_index ON tiles (zoom_level, tile_column, tile_row);
+```
+
+With it, a tile lookup is an index seek — measured at parity with SQLite's
+`:memory:` and roughly 4-5x faster than a SQLite file
+([BENCHMARKS.md](./BENCHMARKS.md)).
+
+**Import, export, or query in place.** These need the `sqliteimport` build tag,
+which pulls in the SQLite driver used to read and write `.mbtiles` files:
+
+```go
+// Import a tileset. Tiles stream in bounded batches, so the file need not fit in RAM.
+importer.ImportMBTiles(ctx, db, "default", "tiles", "berlin.mbtiles",
+    &importer.ImportOptions{CreateTable: true, BatchSize: 1000})
+
+// Write a spec-compliant .mbtiles that any MBTiles tool can read.
+importer.ExportMBTiles(ctx, db, "default", "out.mbtiles",
+    &importer.ExportMBTilesOptions{TileRowIsTMS: true})
+
+// Query a large tileset without copying it: overview zooms only, or index only.
+importer.OpenMBTiles(ctx, db, "default", "planet.mbtiles",
+    &importer.OpenMBTilesOptions{Zooms: []int{0, 1, 2, 3, 4}})
+importer.OpenMBTiles(ctx, db, "default", "planet.mbtiles",
+    &importer.OpenMBTilesOptions{WithoutTileData: true}) // addressing + size + hash
+```
+
+**Serve tiles over HTTP** with `tinysqld -tiles`:
+
+```text
+GET /tiles/{tileset}/{z}/{x}/{y}.{ext}   one tile (XYZ; flipped to TMS internally)
+GET /tiles/{tileset}.json                TileJSON 3.0.0
+GET /tiles/{tileset}/metadata            raw MBTiles metadata rows
+```
+
+Content-Type and Content-Encoding follow the tileset's `format` metadata, so
+`pbf` tiles are served as gzipped protobuf, which is how MBTiles stores them.
+The endpoint is **unauthenticated by design** — a browser cannot attach a bearer
+token to a map-tile request — so it is off unless `-tiles` is passed. Put a
+proxy in front for referer/IP restrictions or signed URLs.
+
+A tileset larger than memory is still better served by SQLite, or queried in
+place with `OpenMBTiles`; see the
+[Storage & Persistence Guide](./docs/storage-guide.md).
 
 ## SQL formatting
 

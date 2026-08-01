@@ -819,3 +819,67 @@ the raw text.
 go test -bench='BenchmarkRAG' -benchmem ./internal/engine/...
 go test -run='TestRAGCacheFootprint' -v ./internal/engine/...
 ```
+
+## MBTiles tile serving: tinySQL vs SQLite
+
+A tile server runs exactly one query per request:
+
+```sql
+SELECT tile_data FROM tiles
+WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?
+```
+
+so that point lookup decides whether tinySQL can replace SQLite for MBTiles
+serving. `benchmarks/tile_serving_benchmark_test.go` runs it through
+`database/sql` on both engines with bound parameters and one connection, over a
+full zoom-8 grid (65,536 tiles, 800-byte payloads), fetching random tiles to
+defeat any single-tile cache.
+
+The first measurement was not close: **4.64 ms for tinySQL against 13 µs for
+SQLite**, growing linearly with the tileset while SQLite stayed flat. The
+composite index existed and was never used.
+
+The cause was not a missing planner rule but a safety check that cost more than
+the work it guarded. SQL compares `1` and `1.0` as equal while the durable index
+encoding tags integers and floats differently, so a numeric seek is only sound
+when no row that compares equal is stored under the other tag.
+`numericSecondaryIndexSeekSafe` established that by **scanning every row, once per
+indexed column** — three full table scans per tile lookup, to decide whether a
+seek was permitted. An indexed point lookup was therefore slower than the scan it
+replaced.
+
+Whether a column holds any `float64` is a property of the column, not of the
+literal being sought. Cached per `(table, table.Version)` like every other cache
+in the engine, it is computed once per table version, and an integer literal
+against a float-free column is then decided without touching a row
+(`internal/engine/index_seek_safety.go`). Float literals keep the original
+per-value scan, because `-0.0` and `0.0` compare equal but encode differently, so
+no column-level summary can prove a float seek sound.
+
+| Tile lookup (65,536 tiles, 800 B payload) | before | after |
+|---|---|---|
+| tinySQL/mem | 4.64 ms | **8.7 µs (533x)** |
+| SQLite/mem (`:memory:`) | 8.6 µs | 8.6 µs |
+| SQLite/file (WAL, the real MBTiles case) | 40-65 µs | 40-65 µs |
+
+Steady state over three alternating rounds, tinySQL vs SQLite/mem:
+8.68/8.59, 12.63/12.91, 9.64/9.66 µs — **parity**, and 4-5x faster than
+SQLite/file. At 4,096 tiles both are ~6-8 µs.
+
+Read the two SQLite rows separately. `:memory:` is the fast bound, not how
+MBTiles is deployed; a tileset on disk is the honest comparison, and tinySQL beats
+it several times over once the tileset is resident.
+
+Profiling what remains shows the lookup itself is no longer the cost: SQL lexing
+(`ToUpper`, `tokenizeBlob`, `Fields`) and hex encode/decode of the BLOB payload
+dominate. Those are shared with every other query shape rather than specific to
+tiles, and are where further tile-serving work should go.
+
+This benchmark was also what exposed the scale of the effect. Note the iteration
+count: at `-benchtime=200x` tinySQL measured 15-19 µs against SQLite's 8-10 µs,
+because statement-cache warm-up had not amortized. Only at 3000x does either
+engine reach steady state, which is the regime a server runs in.
+
+```sh
+go test -run=none -bench='BenchmarkTileLookup' -benchtime=3000x ./benchmarks/...
+```

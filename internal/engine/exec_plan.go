@@ -449,6 +449,18 @@ func numericSecondaryIndexSeekSafe(table *storage.Table, colPos int, value any) 
 		return numericPagedIndexSeekSafe(table.Cols[colPos], value)
 	}
 
+	// An integer literal against a column holding no float64 cannot be shadowed
+	// by a differently encoded row: anything comparing equal must itself be an
+	// integer, and int and int64 encode identically. That verdict comes from a
+	// per-(table, version) column summary, so repeated lookups do not re-scan
+	// the table — see index_seek_safety.go for why this path exists.
+	if isIntegerSQLValue(value) && !numericColumnHasFloat(table, colPos) {
+		return true
+	}
+
+	// Everything else keeps the exact per-value check. A float literal needs it:
+	// -0.0 and 0.0 compare equal but encode differently, so no column-level
+	// summary can prove a float seek sound.
 	for _, row := range table.Rows {
 		if colPos >= len(row) || !isNumericSQLValue(row[colPos]) {
 			continue
