@@ -316,8 +316,10 @@ The endpoint is **unauthenticated by design** — a browser cannot attach a bear
 token to a map-tile request — so it is off unless `-tiles` is passed. Put a
 proxy in front for referer/IP restrictions or signed URLs.
 
-A tileset larger than memory is still better served by SQLite, or queried in
-place with `OpenMBTiles`; see the
+For a tileset **larger than memory**, use `-storage paged_index`: an immutable
+page store whose tile lookup resolves a B+Tree and materializes only the located
+row, instead of decoding the whole table. Only equality predicates take that
+per-record path today, which is what a tile lookup is. See the
 [Storage & Persistence Guide](./docs/storage-guide.md).
 
 ## SQL formatting

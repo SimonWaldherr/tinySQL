@@ -18,7 +18,7 @@ import (
 func main() {
 	var (
 		dataPath     = flag.String("data", "", "Durable database path or directory")
-		storageMode  = flag.String("storage", "disk", "Storage mode: disk, hybrid, index, wal, advanced_wal")
+		storageMode  = flag.String("storage", "disk", "Storage mode: memory, disk, json, hybrid, index, wal, advanced_wal, paged_index (immutable page store; serves tiles per record without loading the table, pair with -read-only)")
 		tenant       = flag.String("tenant", "default", "Default tenant")
 		httpAddr     = flag.String("http", "127.0.0.1:8088", "HTTP listen address; empty disables HTTP")
 		authToken    = flag.String("auth", "", "Optional bearer token for API endpoints")

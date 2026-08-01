@@ -161,8 +161,27 @@ CREATE INDEX tile_index ON tiles (zoom_level, tile_column, tile_row);
 `cmd/tinysqld -tiles` then serves `/tiles/{tileset}/{z}/{x}/{y}.{ext}` plus
 TileJSON, handling the XYZ-to-TMS row conversion.
 
-For a tileset **larger than memory**, use SQLite, or query the `.mbtiles` in
-place with `importer.OpenMBTiles`, whose `Zooms` and `WithoutTileData` options
-read only the zoom levels or only the tile index you need. A pager-native
-immutable format that would serve a multi-gigabyte tileset directly from tinySQL
-is not implemented.
+For a tileset **larger than memory**, use `ModePagedIndex`. It is an immutable
+page store, and a complete composite equality predicate — exactly a tile lookup —
+resolves its B+Tree and materializes only the located row, so it never decodes the
+whole table the way the `ModeIndex`/`ModeHybrid` GOB codec does:
+
+```bash
+# Build the artifact once (writable), then serve it read-only.
+tinysqld -data /srv/tiles -storage paged_index -tiles
+```
+
+Measured on a 65,536-tile fixture with an 800-byte payload and a 32 MiB page
+budget, a warm tile lookup is in the same range as a SQLite file — see
+[BENCHMARKS.md](../BENCHMARKS.md). Two caveats worth knowing before relying on it:
+
+- Each page-cache **miss** allocates a fresh page buffer, so a working set far
+  larger than `max_memory_bytes` allocates ~11 KB per lookup. Size the page
+  budget to the hot zoom levels rather than the whole tileset.
+- Only *equality* predicates take the per-record path today. A range predicate on
+  a paged table falls back to the full-table compatibility path, so the range
+  seeks described above do not yet apply to `ModePagedIndex`.
+
+`importer.OpenMBTiles` remains the option when you would rather query an existing
+`.mbtiles` in place; its `Zooms` and `WithoutTileData` options read only the zoom
+levels or only the tile index you need.

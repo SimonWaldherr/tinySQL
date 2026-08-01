@@ -26,6 +26,7 @@ import (
 	"testing"
 
 	_ "github.com/SimonWaldherr/tinySQL/driver"
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 	_ "modernc.org/sqlite"
 )
 
@@ -199,4 +200,115 @@ func BenchmarkTilesetLoad(b *testing.B) {
 			}
 		})
 	}
+}
+
+// ─────────────────── disk-backed tile serving: the honest case ───────────────
+//
+// The comparisons above put an in-memory tinySQL against an in-memory SQLite.
+// That is not how a tileset is deployed: a navigation device or a tile server
+// holds the tiles on disk. tinySQL's answer for that is ModePagedIndex, an
+// immutable page store whose complete-composite-equality lookup resolves a
+// B+Tree and materializes only the located row — it never decodes the whole
+// table, which the legacy ModeIndex/ModeHybrid codec does.
+//
+// This benchmark measures that path against a SQLite file on the *same* fixture
+// and the *same* single-lookup query as BenchmarkTileLookup64k, so the numbers
+// are comparable to each other rather than to a differently shaped test.
+
+// buildPagedTileset writes an immutable paged-index artifact holding a tileset,
+// then returns the directory. The artifact is produced once, mutably, and served
+// read-only, which is how a published tileset is meant to be used.
+func buildPagedTileset(b *testing.B, side int) string {
+	b.Helper()
+	dir := filepath.Join(tmpDir(b), "paged-tiles")
+	db, err := storage.OpenDB(storage.StorageConfig{
+		Mode:           storage.ModePagedIndex,
+		Path:           dir,
+		MaxMemoryBytes: 256 << 20,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	tiles := storage.NewTable("tiles", []storage.Column{
+		{Name: "zoom_level", Type: storage.IntType},
+		{Name: "tile_column", Type: storage.IntType},
+		{Name: "tile_row", Type: storage.IntType},
+		{Name: "tile_data", Type: storage.BlobType},
+	}, false)
+	payload := make([]byte, tileBenchPayload)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	for col := 0; col < side; col++ {
+		for row := 0; row < side; row++ {
+			// Each tile gets its own slice: the page codec stores what it is given,
+			// and sharing one backing array across rows would not represent a real
+			// tileset's payloads.
+			tile := append([]byte(nil), payload...)
+			tile[0] = byte(col)
+			tile[1] = byte(row)
+			tiles.Rows = append(tiles.Rows, []any{tileBenchZoom, col, row, tile})
+		}
+	}
+	if err := tiles.CreateSecondaryIndex("tile_index",
+		[]string{"zoom_level", "tile_column", "tile_row"}, true); err != nil {
+		b.Fatal(err)
+	}
+	if err := db.Put("default", tiles); err != nil {
+		b.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		b.Fatal(err)
+	}
+	return dir
+}
+
+// BenchmarkTileLookupOnDisk compares disk-backed tile serving: tinySQL's
+// immutable page store against a SQLite file.
+func BenchmarkTileLookupOnDisk(b *testing.B) {
+	const side = 256 // 65,536 tiles, matching BenchmarkTileLookup64k
+
+	b.Run("tinySQL/paged_index", func(b *testing.B) {
+		dir := buildPagedTileset(b, side)
+		db, err := sql.Open("tinysql",
+			"file:"+dir+"?mode=paged_index&read_only=1&max_memory_bytes=32MiB&pool_readers=8")
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer db.Close()
+		if err := db.Ping(); err != nil {
+			b.Fatal(err)
+		}
+		stmt, err := db.Prepare(
+			`SELECT tile_data FROM tiles WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?`)
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer stmt.Close()
+		// One pass to fill the bounded page cache, so the measurement is serving
+		// latency rather than first-traversal cost.
+		var warm []byte
+		if err := stmt.QueryRow(tileBenchZoom, 0, 0).Scan(&warm); err != nil {
+			b.Fatalf("warm-up: %v", err)
+		}
+
+		rng := rand.New(rand.NewSource(0x7113))
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			var data []byte
+			col, row := rng.Intn(side), rng.Intn(side)
+			if err := stmt.QueryRow(tileBenchZoom, col, row).Scan(&data); err != nil {
+				b.Fatalf("tile %d/%d/%d: %v", tileBenchZoom, col, row, err)
+			}
+			if len(data) != tileBenchPayload {
+				b.Fatalf("tile %d/%d/%d returned %d bytes", tileBenchZoom, col, row, len(data))
+			}
+		}
+	})
+
+	b.Run("SQLite/file", func(b *testing.B) {
+		eng := tileEngines()[2] // SQLite/file, WAL + synchronous=NORMAL
+		benchmarkTileLookup(b, eng, true, 1<<20)
+	})
 }

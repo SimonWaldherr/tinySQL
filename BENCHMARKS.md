@@ -965,3 +965,55 @@ this compares like-for-like B-tree indexes and does not claim parity with it.
 go test -run=none -bench='BenchmarkViewport|BenchmarkCategoryInViewport' -benchtime=200x ./benchmarks/...
 go test -run='TestRangeIndex' ./internal/engine/...
 ```
+
+### Tile serving from disk: the case that actually ships
+
+The tile numbers above put an in-memory tinySQL against an in-memory SQLite,
+which is not how a tileset is deployed. A navigation device or tile server holds
+tiles on disk, and for tilesets past RAM the answer is `ModePagedIndex`: an
+immutable page store whose complete-composite-equality lookup — exactly a tile
+lookup — resolves a B+Tree and materializes only the located row. It never decodes
+the whole table, which the legacy `ModeIndex`/`ModeHybrid` GOB codec does, and
+which is why the docs used to send multi-gigabyte tilesets to SQLite.
+
+`BenchmarkTileLookupOnDisk` runs the same 65,536-tile fixture and the same
+single-lookup query as the in-memory benchmark, against a 32 MiB page budget, so
+the two are comparable:
+
+| Tile lookup, 65,536 tiles, 800 B payload, on disk | ns/op across 3 rounds | B/op |
+|---|---|---|
+| tinySQL `paged_index` (read-only) | 59.8 / 57.3 / 60.6 µs | 15,432 |
+| SQLite file (WAL, `synchronous=NORMAL`) | 38.5 / 109.0 / 112.4 µs | ~2,600 |
+
+Read the spread, not just the minimum. tinySQL lands within 6% across rounds;
+SQLite's file path varies by 3x. On minima SQLite is ahead (38.5 vs 57.3 µs); on
+medians tinySQL is (58 vs 109 µs). Calling either "faster" from these numbers
+would be overreaching — they are in the same range, with tinySQL the more
+predictable of the two, which is what a p95 tile-latency budget cares about.
+
+Where tinySQL clearly loses is allocation: **15.4 KB per lookup against SQLite's
+~2.6 KB**. Profiling the query path attributes 33.3 MB of 39.8 MB — 84% — to
+`Pager.readPageRaw`, which allocates a fresh page buffer on every buffer-pool
+miss. With a working set well past `max_memory_bytes` most lookups miss, so this
+is ~11 KB of garbage per tile.
+
+Recycling those buffers is the obvious fix and is **not implemented**, for a
+stated reason: a page buffer may only be reused once nothing decoded from it is
+still referenced, and proving that across the row codec, B+Tree records and BLOB
+materialization is an aliasing audit, not a patch. Getting it wrong corrupts data
+silently, which is strictly worse than allocating. Until then, size the page
+budget to the hot zoom levels rather than to the whole tileset.
+
+One further limit: only *equality* predicates take the per-record paged path. A
+range predicate against a `ModePagedIndex` table falls back to the full-table
+compatibility path, so the range seeks documented above do not yet apply to it.
+That matters for POI queries on a disk-backed database, not for tiles.
+
+`cmd/tinysqld/tiles_paged_test.go` covers the deployment end to end: an artifact
+built writable, reopened read-only, and served over `/tiles/{z}/{x}/{y}` with the
+XYZ-to-TMS flip intact.
+
+```sh
+go test -run=none -bench='BenchmarkTileLookupOnDisk' -benchtime=3000x ./benchmarks/...
+go test -run='TestTileEndpointOverPagedIndex' ./cmd/tinysqld/...
+```
