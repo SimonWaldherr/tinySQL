@@ -409,10 +409,14 @@ TinySQL is not a PostgreSQL/MySQL replacement. Current limits:
 - No composite primary keys or composite foreign keys.
 - No CHECK constraints, UPSERT/ON CONFLICT, SAVEPOINT, ATTACH/DETACH, VACUUM,
   partial indexes, generated columns, or persistent ANN vector index files.
-- Materialized secondary indexes support only equality point/prefix seeks on
-  their leading columns. They are maintained incrementally for `INSERT`/`UPDATE`,
-  remapped on `DELETE`, and persisted with snapshots/backends; pager-native
-  incremental index pages and range planning are not implemented yet.
+- Materialized secondary indexes serve equality point/prefix seeks and, on
+  **numeric** columns, ordered range seeks (`>`, `>=`, `<`, `<=`, `BETWEEN`,
+  optionally after an equality prefix). Text and BLOB ranges still scan: their
+  index keys are length-framed, so byte order is not value order. There is no
+  R-tree, so a two-dimensional predicate narrows on one axis and filters the
+  other. Indexes are maintained incrementally for `INSERT`/`UPDATE`, remapped on
+  `DELETE`, and persisted with snapshots/backends; pager-native incremental index
+  pages are not implemented yet.
   `ModeIndex`/`ModeHybrid` keep backend-loaded tables out of the permanent DB
   catalog and enforce their buffer-pool budget, but the legacy GOB table codec
   still decodes a full table on a cache miss, so they are not yet suitable as a

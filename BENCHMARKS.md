@@ -883,3 +883,67 @@ engine reach steady state, which is the regime a server runs in.
 ```sh
 go test -run=none -bench='BenchmarkTileLookup' -benchtime=3000x ./benchmarks/...
 ```
+
+## Spatial range queries: bounding boxes on a POI layer
+
+Every viewport redraw and every "what is near me" is the same query:
+
+```sql
+SELECT id FROM poi WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?
+```
+
+`selectSecondaryIndex` handled equality only, so this fell through to a table
+scan even with an index on `(lat, lon)` — the index existed and no range
+predicate could reach it. `EXPLAIN` said `TABLE SCAN` for a bounding box, a
+one-sided `lat > ?`, and `GEO_DWITHIN` alike.
+
+A range seek is possible because index entries are a byte-sorted array and the
+numeric key encoding is order-preserving: integers are stored big-endian with the
+sign bit flipped, float64 with its bits flipped for negatives, so comparing
+encoded bytes compares the numbers. `LookupSecondaryIndexRange`
+(`internal/storage/secondary_index_range.go`) walks that order; the planner picks
+an equality prefix plus one bounded column, the standard B-tree access shape
+(`internal/engine/plan_range_index.go`).
+
+Three restrictions are correctness requirements rather than tuning choices:
+
+- **Text and BLOB columns cannot range-seek.** Their keys are framed as
+  tag + 4-byte length + payload, so byte order compares the *length* first:
+  `'z'` sorts before `'aa'`. A walk would return the wrong rows, so these fall
+  back to a scan.
+- **A column mixing integers and floats cannot either.** The two carry different
+  type tags, so every integer sorts before every float regardless of value. The
+  cached column profile detects this and the planner falls back.
+- **Signed zero moves the bound.** `-0.0` and `0.0` compare equal but `-0.0`
+  encodes strictly below `+0.0`, so a walk bounded by `+0.0` would skip a stored
+  `-0.0` on `v >= 0.0` and wrongly include it on `v < 0.0`. The bound is moved to
+  the zero that brackets both. This was a real bug caught by the differential
+  test, not a hypothetical.
+
+Because the range constrains only one index column, the result is a superset and
+the residual `WHERE` still runs — which is exactly what makes a two-dimensional
+predicate work: the walk narrows to the latitude band, `lon` is filtered per row.
+That is not an R-tree, and it is not presented as one.
+
+50,000 POIs over a 10° square, a 0.05° viewport at a random position per
+iteration, both engines through `database/sql` with the same B-tree index:
+
+| | tinySQL | SQLite | |
+|---|---|---|---|
+| Viewport, no index | 11.08 ms | 14.07 ms | the previous behaviour |
+| Viewport, `(lat, lon)` index | **235 µs** | 143 µs | **47x faster**; 1.6x behind SQLite |
+| `cat = ?` + viewport, `(cat, lat)` index | **63 µs** | 125 µs | **2x faster than SQLite** |
+
+The composite row is the more representative one — a map asks for *one layer* in
+a viewport, not every POI — and there tinySQL wins. On the pure two-axis box
+SQLite is still ahead because it can filter the second column inside the index,
+while tinySQL fetches the row to evaluate `lon`. Evaluating trailing index
+components during the walk is the obvious next step and is not implemented.
+
+SQLite's R\*Tree module would be a stronger structure for genuine 2-D search;
+this compares like-for-like B-tree indexes and does not claim parity with it.
+
+```sh
+go test -run=none -bench='BenchmarkViewport|BenchmarkCategoryInViewport' -benchtime=200x ./benchmarks/...
+go test -run='TestRangeIndex' ./internal/engine/...
+```

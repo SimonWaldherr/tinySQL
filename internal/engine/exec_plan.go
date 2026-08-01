@@ -4,6 +4,7 @@
 package engine
 
 import (
+	"errors"
 	"math"
 	"sort"
 	"strings"
@@ -72,7 +73,21 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 	}
 	plan := *template
 	resetSimplePlanAccess(&plan, len(table.Rows))
-	if idx, values, predicates, residual := selectSecondaryIndex(table, plan.colIndex, s.Where); idx != nil {
+	idx, values, predicates, residual := selectSecondaryIndex(table, plan.colIndex, s.Where)
+	rangePlan, haveRange := selectRangeIndex(table, plan.colIndex, s.Where)
+	// A range plan is preferred only when it matches at least as many equality
+	// columns as the equality-only plan would. Then it is the same key prefix plus
+	// one bounded column, so it is strictly narrower. When the equality plan
+	// matches more columns — its index covers predicates the range index does not —
+	// it stays, because comparing across different indexes would need selectivity
+	// estimates this planner does not have.
+	if haveRange && idx != nil && len(rangePlan.prefix) < len(values) {
+		haveRange = false
+	}
+	if haveRange {
+		idx = nil
+	}
+	if idx != nil {
 		var rowIDs []int
 		var seekErr error
 		if len(values) == len(idx.Columns) {
@@ -90,6 +105,27 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 		plan.residualFilter = residual
 		plan.coveringIndex = projectionsCoveredByIndex(plan.projs, idx, table)
 		plan.estimatedRows = len(rowIDs)
+	} else if haveRange {
+		// Equality prefix plus one range column. The range does not constrain
+		// trailing index columns, so the result is a superset and the residual
+		// WHERE still runs — which is what lets a two-dimensional predicate such
+		// as a bounding box narrow to one band and filter the other axis.
+		rowIDs, seekErr := table.LookupSecondaryIndexRange(rangePlan.index, rangePlan.prefix, rangePlan.lo, rangePlan.hi)
+		if seekErr != nil {
+			if !errors.Is(seekErr, storage.ErrIndexRangeUnsupported) {
+				return nil, true, seekErr
+			}
+			// The index cannot order this range after all; leave the plan as the
+			// table scan resetSimplePlanAccess already set up.
+		} else {
+			plan.rowIDs = rowIDs
+			plan.scanType = "INDEX RANGE SCAN"
+			plan.indexName = rangePlan.index.Name
+			plan.indexPredicates = rangePlan.predicates
+			plan.residualFilter = true
+			plan.coveringIndex = projectionsCoveredByIndex(plan.projs, rangePlan.index, table)
+			plan.estimatedRows = len(rowIDs)
+		}
 	} else if rowIDs, column, residual, ok := selectConstraintIndex(table, plan.colIndex, s.Where); ok {
 		// PRIMARY KEY and UNIQUE enforcement already maintains this hash index
 		// incrementally for DML. Reusing it here avoids a full table scan for

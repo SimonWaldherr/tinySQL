@@ -33,11 +33,18 @@ import (
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
-// numericColumnProfile records, per column, whether any row holds a float64.
+// numericColumnProfile records, per column, which numeric encodings appear.
+//
+// Both are tracked because the two questions asked of it differ. A point seek
+// needs "does this column hold any float64" (an integer literal is then
+// unambiguous). A range seek needs the stronger "is the column uniformly one
+// kind", since integers and floats carry different type tags and sort as
+// separate blocks, so a mixed column has no order to walk.
 type numericColumnProfile struct {
 	table    *storage.Table
 	version  int
 	hasFloat []bool
+	hasInt   []bool
 }
 
 // numericProfileMaxEntries bounds the cache. Each entry pins its *storage.Table,
@@ -50,22 +57,30 @@ var (
 	numericProfileCache = make(map[string]numericColumnProfile)
 )
 
-// numericColumnHasFloat reports whether any row stores a float64 in colPos.
-func numericColumnHasFloat(table *storage.Table, colPos int) bool {
+// numericColumnProfileFor returns the cached column profile, rebuilding it when
+// the table has changed.
+func numericColumnProfileFor(table *storage.Table) numericColumnProfile {
 	key := table.Name
 
 	numericProfileMu.RLock()
 	entry, ok := numericProfileCache[key]
 	numericProfileMu.RUnlock()
-	if !ok || entry.table != table || entry.version != table.Version {
-		entry = buildNumericColumnProfile(table)
-		numericProfileMu.Lock()
-		if _, exists := numericProfileCache[key]; !exists {
-			evictOverCap(numericProfileCache, numericProfileMaxEntries)
-		}
-		numericProfileCache[key] = entry
-		numericProfileMu.Unlock()
+	if ok && entry.table == table && entry.version == table.Version {
+		return entry
 	}
+	entry = buildNumericColumnProfile(table)
+	numericProfileMu.Lock()
+	if _, exists := numericProfileCache[key]; !exists {
+		evictOverCap(numericProfileCache, numericProfileMaxEntries)
+	}
+	numericProfileCache[key] = entry
+	numericProfileMu.Unlock()
+	return entry
+}
+
+// numericColumnHasFloat reports whether any row stores a float64 in colPos.
+func numericColumnHasFloat(table *storage.Table, colPos int) bool {
+	entry := numericColumnProfileFor(table)
 	if colPos < 0 || colPos >= len(entry.hasFloat) {
 		// Unknown column: report "may hold floats" so the caller takes the exact
 		// per-value path rather than trusting an absent summary.
@@ -74,28 +89,50 @@ func numericColumnHasFloat(table *storage.Table, colPos int) bool {
 	return entry.hasFloat[colPos]
 }
 
-// buildNumericColumnProfile scans the table once, recording every column that
-// holds at least one float64.
+// numericColumnIsAllFloat reports whether colPos holds float64 values and no
+// integers, i.e. whether a float-keyed range walk over it is ordered. A column
+// with neither kind (empty, or all NULL/text) is not all-float.
+func numericColumnIsAllFloat(table *storage.Table, colPos int) bool {
+	entry := numericColumnProfileFor(table)
+	if colPos < 0 || colPos >= len(entry.hasFloat) || colPos >= len(entry.hasInt) {
+		return false
+	}
+	return entry.hasFloat[colPos] && !entry.hasInt[colPos]
+}
+
+// buildNumericColumnProfile scans the table once, recording which numeric
+// encodings each column holds.
 func buildNumericColumnProfile(table *storage.Table) numericColumnProfile {
 	hasFloat := make([]bool, len(table.Cols))
-	remaining := len(table.Cols)
+	hasInt := make([]bool, len(table.Cols))
+	settled := 0 // columns where both kinds are known present: nothing left to learn
 	for _, row := range table.Rows {
 		for i := 0; i < len(row) && i < len(hasFloat); i++ {
-			if hasFloat[i] {
+			if hasFloat[i] && hasInt[i] {
 				continue
 			}
-			if _, isFloat := row[i].(float64); isFloat {
-				hasFloat[i] = true
-				remaining--
+			switch row[i].(type) {
+			case float64:
+				if !hasFloat[i] {
+					hasFloat[i] = true
+					if hasInt[i] {
+						settled++
+					}
+				}
+			case int, int64:
+				if !hasInt[i] {
+					hasInt[i] = true
+					if hasFloat[i] {
+						settled++
+					}
+				}
 			}
 		}
-		// Every column has already been shown to hold a float; nothing more to
-		// learn from the remaining rows.
-		if remaining == 0 {
+		if settled == len(hasFloat) {
 			break
 		}
 	}
-	return numericColumnProfile{table: table, version: table.Version, hasFloat: hasFloat}
+	return numericColumnProfile{table: table, version: table.Version, hasFloat: hasFloat, hasInt: hasInt}
 }
 
 // purgeNumericProfilesFor drops cached column profiles for one table, called from
