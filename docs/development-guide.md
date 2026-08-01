@@ -34,6 +34,7 @@ make build-all
 | `make test-jsonv2` | Storage/engine persistence tests against Go's experimental JSON v2 — a compatibility gate, not a production default. |
 | `make test-query-files` / `make test-fsql` | Standalone query-files and filesystem-query module tests. |
 | `make test-query-files-wasm` | Tests inside `cmd/query_files_wasm`. |
+| `cd odbc && make linux` | Build the c-shared ODBC driver from its nested Go module. |
 | `make coverage` | Run tests and open an HTML coverage report. |
 | `make bench` | Benchmarks with allocation output. |
 | `make fmt` / `make fmt-check` | Format Go files / check formatting without modifying. |
@@ -49,6 +50,20 @@ make build-all
 artifact. Run `make build-wasm-browser` or `make build-wasm-node` separately
 when changing those targets. Push `main` separately after committing source
 changes.
+
+### Nested module dependencies
+
+The ODBC driver has its own `go.mod` and `go.sum`. Keep them in sync with the
+root module whenever the root SQLite dependency changes:
+
+```bash
+go mod tidy -diff                 # from the repository root
+(cd odbc && go mod tidy)
+CGO_ENABLED=1 make -C odbc linux
+```
+
+Running `go mod tidy` in the repository root does not update `odbc/`; a stale
+nested module otherwise fails with `go: updates to go.mod needed` in CI.
 
 Variables are overridable:
 

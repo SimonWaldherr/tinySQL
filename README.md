@@ -378,6 +378,33 @@ tinysqld -analytics -vector-cache-entries 128 -vector-cache-ttl 30s
 The authenticated `GET /api/analytics/vector` endpoint exists only with
 `-analytics`; otherwise it returns `404`.
 
+## Reproduzierbare Builds (CI, WASM und ODBC)
+
+Die Root-Module und die eigenständigen Unterprojekte werden jeweils aus ihrem
+eigenen Verzeichnis gebaut. Nach einer Änderung der Abhängigkeiten im Root-
+Modul muss das ODBC-Untermodul deshalb ebenfalls synchronisiert werden:
+
+```bash
+go mod download
+go mod tidy -diff                 # Root-Modul prüfen
+
+cd odbc
+go mod tidy                      # odbc/go.mod und odbc/go.sum aktualisieren
+CGO_ENABLED=1 make linux
+```
+
+Die Browser-WASM-Ziele werden aus dem Repository-Root gebaut:
+
+```bash
+GOOS=js GOARCH=wasm go build -trimpath -o /tmp/tinysql-browser.wasm ./cmd/wasm_browser
+```
+
+`go: updates to go.mod needed` bedeutet immer, dass der Befehl im falschen
+Modulkontext oder mit veralteten Moduldateien ausgeführt wurde. Befehl und
+`go mod tidy` müssen im selben Verzeichnis laufen; die generierten Änderungen
+gehören anschließend in den Commit. Für den ODBC-Build ist das `odbc/`, für
+den Browser-WASM-Build das Repository-Root.
+
 ## Guides
 
 | Guide | Scenario |
