@@ -211,6 +211,24 @@ func (lx *lexer) tokenizeNumber(start int) token {
 			break
 		}
 	}
+	// Accept SQL/scientific notation (for example 1.25e-3). Only consume the
+	// exponent marker when it is followed by at least one digit; otherwise an
+	// identifier beginning with `e` remains a separate token and produces the
+	// normal parser diagnostic.
+	exponent := lx.pos
+	if lx.pos < len(lx.s) && (lx.s[lx.pos] == 'e' || lx.s[lx.pos] == 'E') {
+		lx.pos++
+		if lx.pos < len(lx.s) && (lx.s[lx.pos] == '+' || lx.s[lx.pos] == '-') {
+			lx.pos++
+		}
+		digits := lx.pos
+		for lx.pos < len(lx.s) && unicode.IsDigit(lx.peek()) {
+			lx.next()
+		}
+		if lx.pos == digits {
+			lx.pos = exponent
+		}
+	}
 	return token{Typ: tNumber, Val: lx.s[start:lx.pos], Pos: start}
 }
 

@@ -47,3 +47,15 @@ func TestParseInsertMultipleRows(t *testing.T) {
 		t.Fatalf("expected both value rows to have 2 expressions, first=%d second=%d", len(ins.Rows[0]), len(ins.Rows[1]))
 	}
 }
+
+func TestParseScientificNumber(t *testing.T) {
+	for _, sql := range []string{
+		"SELECT 1.25e-3",
+		"SELECT 6E+2",
+		"SELECT -4e-7",
+	} {
+		if _, err := NewParser(sql).ParseStatement(); err != nil {
+			t.Fatalf("failed to parse scientific literal %q: %v", sql, err)
+		}
+	}
+}
