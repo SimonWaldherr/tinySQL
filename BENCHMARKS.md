@@ -22,6 +22,24 @@ Two suites, with different fairness properties:
 go test -run=none -bench=. -benchtime=100x ./benchmarks/...
 ```
 
+## What "SQLite" means in this file — and what it does not
+
+Every `SQLite/…` row here is [`modernc.org/sqlite`](https://pkg.go.dev/modernc.org/sqlite),
+a machine-translated pure-Go port. **It is not the C SQLite** that a typical
+application ships, whether as the system library or a bundled `libsqlite3`.
+
+That choice is deliberate and it is the right like-for-like target for this
+project: tinySQL is pure Go, builds under TinyGo and WebAssembly, and needs no
+CGo, so the honest question it answers is *"can this replace the pure-Go SQLite I
+am already using?"*
+
+It does **not** answer *"is this as fast as SQLite?"* The C implementation is
+generally faster than the Go port, and none of these measurements bound that gap:
+the development machine used for them has `CGO_ENABLED=0`, so a CGo-based driver
+cannot even be built here, let alone measured. Anyone weighing tinySQL against C
+SQLite — for example when the alternative is the platform's own SQLite — should
+measure that pairing themselves before relying on any factor stated below.
+
 ## Machine / environment for the numbers below
 
 - Intel Core i7-10850H @ 2.70GHz, Windows, `GOMAXPROCS` default (12),

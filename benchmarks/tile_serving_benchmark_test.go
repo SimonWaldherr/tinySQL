@@ -15,6 +15,9 @@ package benchmarks
 // connection, so the comparison includes the driver, parameter binding and row
 // scanning that a real server pays. Tiles are random per iteration, defeating
 // any single-tile cache and matching how a map client pans across a viewport.
+//
+// "SQLite" here is modernc.org/sqlite, the pure-Go port -- not the C
+// implementation. See the note at the top of BENCHMARKS.md.
 
 import (
 	"database/sql"
