@@ -724,6 +724,7 @@ func decideHeader(records [][]string, mode string) bool {
 	body := records[1:]
 	cols := len(first)
 	headerish := 0
+	numericHeaderCells := 0
 
 	for c := 0; c < cols; c++ {
 		headNum := looksNumeric(first[c])
@@ -741,8 +742,27 @@ func decideHeader(records [][]string, mode string) bool {
 		if rows > 0 && !headNum && float64(dataNum)/float64(rows) > 0.6 {
 			headerish++
 		}
+		if headNum {
+			numericHeaderCells++
+		}
 	}
-	return float64(headerish)/float64(cols) >= 0.5
+	if float64(headerish)/float64(cols) >= 0.5 {
+		return true
+	}
+
+	// The ratio test above needs half the columns to be numeric in the body,
+	// which misses the most ordinary shape of all: an attribute table with one
+	// numeric id and several text columns. For "id,name,note" over "1,alice,x"
+	// only one of three columns qualifies, so the file was treated as
+	// header-less — column names became col_1..col_3 and the header row was
+	// inserted as data, silently corrupting the import.
+	//
+	// A single type disagreement is strong evidence on its own, provided no
+	// header cell is itself numeric: a real data row would not have text where
+	// every other row has a number. Requiring numericHeaderCells == 0 is what
+	// keeps a genuinely header-less numeric file (whose first row looks like its
+	// others) from being misread.
+	return numericHeaderCells == 0 && headerish > 0
 }
 
 func looksNumeric(s string) bool {

@@ -98,3 +98,32 @@ func FuzzyImportCSV(ctx context.Context, db *tinysql.DB, tenant, tableName strin
 func FuzzyImportJSON(ctx context.Context, db *tinysql.DB, tenant, tableName string, src io.Reader, opts *FuzzyImportOptions) (*ImportResult, error) {
 	return ii.FuzzyImportJSON(ctx, db, tenant, tableName, src, opts)
 }
+
+// ─────────────────────────── MBTiles tilesets ────────────────────────────────
+
+// ExportMBTilesOptions configures writing a tileset to an .mbtiles file.
+type ExportMBTilesOptions = ii.ExportMBTilesOptions
+
+// ExportMBTilesResult reports what an export wrote.
+type ExportMBTilesResult = ii.ExportMBTilesResult
+
+// OpenMBTilesOptions configures querying an .mbtiles file in place.
+type OpenMBTilesOptions = ii.OpenMBTilesOptions
+
+// OpenMBTilesResult reports what an in-place open exposed.
+type OpenMBTilesResult = ii.OpenMBTilesResult
+
+// ExportMBTiles writes a tinySQL tileset to filePath as a spec-compliant MBTiles
+// (SQLite) database, so the result is usable by any MBTiles-aware tool.
+// Requires the sqliteimport build tag.
+func ExportMBTiles(ctx context.Context, db *tinysql.DB, tenant, filePath string, opts *ExportMBTilesOptions) (*ExportMBTilesResult, error) {
+	return ii.ExportMBTiles(ctx, db, tenant, filePath, opts)
+}
+
+// OpenMBTiles exposes an existing .mbtiles file as queryable tinySQL tables
+// without copying the whole tileset. Use OpenMBTilesOptions.Zooms and
+// WithoutTileData to work with a tileset larger than memory.
+// Requires the sqliteimport build tag.
+func OpenMBTiles(ctx context.Context, db *tinysql.DB, tenant, filePath string, opts *OpenMBTilesOptions) (*OpenMBTilesResult, error) {
+	return ii.OpenMBTiles(ctx, db, tenant, filePath, opts)
+}

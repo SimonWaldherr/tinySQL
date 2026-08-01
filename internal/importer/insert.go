@@ -24,12 +24,15 @@ func createTable(ctx context.Context, db *storage.DB, tenant, tableName string, 
 		}
 	}
 
-	// Create new table
-	tbl := &storage.Table{
-		Name: tableName,
-		Cols: cols,
-		Rows: make([][]any, 0),
-	}
+	// Build through storage.NewTable rather than a struct literal: it populates
+	// the table's private column-position map, which Table.ColIndex is the only
+	// reader of. A literal leaves that map nil, so ColIndex fails for every
+	// column of an imported table. Ordinary SELECT/INSERT still worked (the
+	// executor resolves names by scanning Cols), which is why this stayed
+	// unnoticed — but every feature that resolves a column up front does not:
+	// VEC_SEARCH, FTS_SEARCH and HYBRID_SEARCH all call ColIndex, so vector and
+	// full-text queries against imported data failed with "unknown column".
+	tbl := storage.NewTable(tableName, cols, false)
 
 	// Add to database (creates if not exists)
 	if err := db.Put(tenant, tbl); err != nil {
