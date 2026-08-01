@@ -408,15 +408,38 @@ func evalBitmapAnd(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 }
 
 // ─────────────────────────── BLOB helpers ────────────────────────────────────
-// BLOBs are stored as hex-encoded strings (lowercase hex) or raw []byte values.
-// All BLOB_ functions accept either representation.
+//
+// A BLOB value is a []byte. That is what an X'hex' literal parses to (see
+// parse_expr_operand.go), what a BLOB column stores (coerceToBlob), and what the
+// database/sql driver binds and scans. Every function here that *returns a blob*
+// therefore returns []byte, so its result can be inserted into a BLOB column and
+// composed with the others:
+//
+//	INSERT INTO t (data) VALUES (BLOB_FROM_HEX('89504e47'))
+//
+// These functions used to return a lowercase hex *string* instead, which made
+// exactly that insert fail with "cannot convert string to BLOB" — the documented
+// way to build binary data could not be stored in the column type meant to hold
+// it. Rejecting plain text for a BLOB column is deliberate (see
+// internal/driver/blob_test.go), so the constructors were the side to fix.
+//
+// The two functions that *render* a blob — BLOB_HEX and BLOB_TO_BASE64 — still
+// return strings, because a rendering is text by definition. BLOB_HEX is how you
+// get the old hex output back:
+//
+//	SELECT BLOB_HEX(BLOB_CONCAT(a, b));   -- 'deadbeef'
+//
+// blobDecode still accepts a hex string, so existing SQL that passes hex text to
+// these functions keeps working.
 
-// blobDecode decodes a BLOB value (hex string or []byte) to raw bytes.
-// The preferred storage format is a lowercase hex string as produced by
-// blobEncode. As a convenience, plain (non-hex) strings are accepted and
-// treated as raw UTF-8 byte sequences, enabling text blobs. If you need
-// to store arbitrary binary data always use BLOB_FROM_HEX/BLOB_FROM_BASE64
-// to avoid ambiguity with plain text strings.
+// blobDecode decodes a BLOB value (raw []byte, hex string, or plain text) to raw
+// bytes.
+//
+// The ambiguity in the string cases is inherent and worth stating: a string that
+// happens to be valid hex is decoded as hex, and anything else is taken as raw
+// UTF-8. So 'deadbeef' means four bytes while 'hello' means five. Pass a []byte
+// (from a BLOB column, an X'...' literal, or one of the constructors below) when
+// the distinction matters.
 func blobDecode(v any) ([]byte, error) {
 	switch x := v.(type) {
 	case []byte:
@@ -439,8 +462,9 @@ func blobDecode(v any) ([]byte, error) {
 	}
 }
 
-// blobEncode encodes raw bytes to a lowercase hex string for storage.
-func blobEncode(b []byte) string {
+// blobHexString renders raw bytes as lowercase hex. Used only by BLOB_HEX, which
+// exists to produce text; functions returning a blob return the bytes themselves.
+func blobHexString(b []byte) string {
 	return hex.EncodeToString(b)
 }
 
@@ -479,10 +503,11 @@ func evalBlobHex(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return blobEncode(b), nil
+	return blobHexString(b), nil
 }
 
-// evalBlobFromHex decodes a hex string into a BLOB (stored as hex string).
+// evalBlobFromHex decodes a hex string into a BLOB. Returns []byte, so the
+// result can be stored in a BLOB column.
 func evalBlobFromHex(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if len(ex.Args) != 1 {
 		return nil, fmt.Errorf("BLOB_FROM_HEX expects 1 argument: (hex_string)")
@@ -502,7 +527,7 @@ func evalBlobFromHex(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("BLOB_FROM_HEX: %w", err)
 	}
-	return blobEncode(b), nil
+	return b, nil
 }
 
 // evalBlobSubstr extracts a byte substring from a BLOB.
@@ -539,13 +564,15 @@ func evalBlobSubstr(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return nil, fmt.Errorf("BLOB_SUBSTR length: %w", err)
 	}
 	if start < 0 || start >= len(b) {
-		return blobEncode([]byte{}), nil
+		return []byte{}, nil
 	}
 	end := start + length
 	if end > len(b) {
 		end = len(b)
 	}
-	return blobEncode(b[start:end]), nil
+	// Copied rather than sub-sliced: the result may be stored in a column, and a
+	// sub-slice would keep the whole source blob reachable and alias its bytes.
+	return append([]byte(nil), b[start:end]...), nil
 }
 
 // evalBlobConcat concatenates two BLOBs.
@@ -577,7 +604,7 @@ func evalBlobConcat(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	result := make([]byte, len(a)+len(b))
 	copy(result, a)
 	copy(result[len(a):], b)
-	return blobEncode(result), nil
+	return result, nil
 }
 
 // evalBlobToBase64 encodes a BLOB as a base64 string.
@@ -599,7 +626,8 @@ func evalBlobToBase64(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	return base64.StdEncoding.EncodeToString(b), nil
 }
 
-// evalBlobFromBase64 decodes a base64 string into a BLOB.
+// evalBlobFromBase64 decodes a base64 string into a BLOB. Returns []byte, so the
+// result can be stored in a BLOB column.
 func evalBlobFromBase64(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if len(ex.Args) != 1 {
 		return nil, fmt.Errorf("BLOB_FROM_BASE64 expects 1 argument: (base64_string)")
@@ -623,7 +651,7 @@ func evalBlobFromBase64(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 			return nil, fmt.Errorf("BLOB_FROM_BASE64: %w", err)
 		}
 	}
-	return blobEncode(b), nil
+	return b, nil
 }
 
 // evalBlobEqual returns true if two BLOBs contain identical bytes.

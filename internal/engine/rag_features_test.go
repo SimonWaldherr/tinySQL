@@ -3,6 +3,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"math"
 	"strings"
@@ -175,54 +176,72 @@ func TestBlobHex(t *testing.T) {
 	}
 }
 
+// blobResultBytes asserts a BLOB-returning function produced raw bytes.
+//
+// The functions that return a blob return []byte, not a hex string, so their
+// result can be inserted into a BLOB column (see the BLOB helpers section in
+// extra_types.go). BLOB_HEX renders bytes as hex when text is wanted.
+func blobResultBytes(t *testing.T, v any) []byte {
+	t.Helper()
+	b, ok := v.([]byte)
+	if !ok {
+		t.Fatalf("expected []byte from a BLOB-returning function, got %T (%v)", v, v)
+	}
+	return b
+}
+
 func TestBlobFromHex(t *testing.T) {
 	db := storage.NewDB()
 	rs := execSQL(t, db, `SELECT BLOB_FROM_HEX('deadbeef') as b`)
-	b, ok := rs.Rows[0]["b"].(string)
-	if !ok {
-		t.Fatalf("expected string, got %T", rs.Rows[0]["b"])
+	if got := blobResultBytes(t, rs.Rows[0]["b"]); !bytes.Equal(got, []byte{0xde, 0xad, 0xbe, 0xef}) {
+		t.Errorf("expected bytes deadbeef, got %x", got)
 	}
-	if b != "deadbeef" {
-		t.Errorf("expected 'deadbeef', got %q", b)
+	// Rendering the same value as hex reproduces the historical output.
+	rs = execSQL(t, db, `SELECT BLOB_HEX(BLOB_FROM_HEX('deadbeef')) as h`)
+	if rs.Rows[0]["h"] != "deadbeef" {
+		t.Errorf("BLOB_HEX(BLOB_FROM_HEX(..)) = %v, want 'deadbeef'", rs.Rows[0]["h"])
 	}
 }
 
 func TestBlobSubstr(t *testing.T) {
 	db := storage.NewDB()
-	// 'deadbeef' = [0xde, 0xad, 0xbe, 0xef], substr(1, 2) = [0xad, 0xbe] = 'adbe'
+	// 'deadbeef' decodes to [0xde, 0xad, 0xbe, 0xef]; substr(1, 2) = [0xad, 0xbe].
 	rs := execSQL(t, db, `SELECT BLOB_SUBSTR('deadbeef', 1, 2) as s`)
-	s, ok := rs.Rows[0]["s"].(string)
-	if !ok {
-		t.Fatalf("expected string, got %T", rs.Rows[0]["s"])
+	if got := blobResultBytes(t, rs.Rows[0]["s"]); !bytes.Equal(got, []byte{0xad, 0xbe}) {
+		t.Errorf("expected bytes adbe, got %x", got)
 	}
-	if s != "adbe" {
-		t.Errorf("expected 'adbe', got %q", s)
+	// Out of range yields an empty blob, not NULL.
+	rs = execSQL(t, db, `SELECT BLOB_SUBSTR('deadbeef', 99, 2) as s`)
+	if got := blobResultBytes(t, rs.Rows[0]["s"]); len(got) != 0 {
+		t.Errorf("out-of-range substr returned %x, want an empty blob", got)
 	}
 }
 
 func TestBlobConcat(t *testing.T) {
 	db := storage.NewDB()
-	// 'dead' + 'beef' = 'deadbeef'
 	rs := execSQL(t, db, `SELECT BLOB_CONCAT('dead', 'beef') as b`)
-	b, ok := rs.Rows[0]["b"].(string)
-	if !ok {
-		t.Fatalf("expected string, got %T", rs.Rows[0]["b"])
+	if got := blobResultBytes(t, rs.Rows[0]["b"]); !bytes.Equal(got, []byte{0xde, 0xad, 0xbe, 0xef}) {
+		t.Errorf("expected bytes deadbeef, got %x", got)
 	}
-	if b != "deadbeef" {
-		t.Errorf("expected 'deadbeef', got %q", b)
+	// Concatenating blob-typed values (not hex text) must work the same way,
+	// which is what makes the functions composable.
+	rs = execSQL(t, db, `SELECT BLOB_HEX(BLOB_CONCAT(X'dead', X'beef')) as h`)
+	if rs.Rows[0]["h"] != "deadbeef" {
+		t.Errorf("BLOB_CONCAT over X'' literals = %v, want 'deadbeef'", rs.Rows[0]["h"])
 	}
 }
 
 func TestBlobBase64RoundTrip(t *testing.T) {
 	db := storage.NewDB()
-	// Encode then decode should give back the original.
+	// Encode then decode should give back the original bytes.
 	rs := execSQL(t, db, `SELECT BLOB_FROM_BASE64(BLOB_TO_BASE64('deadbeef')) as b`)
-	b, ok := rs.Rows[0]["b"].(string)
-	if !ok {
-		t.Fatalf("expected string, got %T", rs.Rows[0]["b"])
+	if got := blobResultBytes(t, rs.Rows[0]["b"]); !bytes.Equal(got, []byte{0xde, 0xad, 0xbe, 0xef}) {
+		t.Errorf("BLOB base64 round-trip failed: got %x", got)
 	}
-	if b != "deadbeef" {
-		t.Errorf("BLOB base64 round-trip failed: got %q", b)
+	// BLOB_TO_BASE64 renders text, so it stays a string.
+	rs = execSQL(t, db, `SELECT BLOB_TO_BASE64(X'deadbeef') as s`)
+	if _, ok := rs.Rows[0]["s"].(string); !ok {
+		t.Errorf("BLOB_TO_BASE64 returned %T, want a string", rs.Rows[0]["s"])
 	}
 }
 

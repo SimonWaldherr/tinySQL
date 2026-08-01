@@ -372,14 +372,15 @@ func TestTileFunctionsAgainstTileTable(t *testing.T) {
 	db := storage.NewDB()
 	ctx := context.Background()
 	for _, sql := range []string{
-		`CREATE TABLE tiles (zoom_level INT, tile_column INT, tile_row INT, label TEXT)`,
+		`CREATE TABLE tiles (zoom_level INT, tile_column INT, tile_row INT, tile_data BLOB, label TEXT)`,
 		// tile_row values are TMS, as the MBTiles specification stores them: XYZ
-		// row 0 (northernmost) is tile_row 2^zoom-1. Real tile_data BLOBs are
-		// exercised by the MBTiles import/export round-trip test.
-		`INSERT INTO tiles VALUES (1, 0, 1, 'north-west')`,
-		`INSERT INTO tiles VALUES (1, 1, 1, 'north-east')`,
-		`INSERT INTO tiles VALUES (1, 0, 0, 'south-west')`,
-		`INSERT INTO tiles VALUES (1, 1, 0, 'south-east')`,
+		// row 0 (northernmost) is tile_row 2^zoom-1. tile_data holds a real BLOB
+		// built the way the docs recommend, which is also the shape an MBTiles
+		// tileset has.
+		`INSERT INTO tiles VALUES (1, 0, 1, BLOB_FROM_HEX('89504e470d0a1a0a'), 'north-west')`,
+		`INSERT INTO tiles VALUES (1, 1, 1, BLOB_FROM_HEX('89504e470d0a1a0a'), 'north-east')`,
+		`INSERT INTO tiles VALUES (1, 0, 0, BLOB_FROM_HEX('89504e470d0a1a0a'), 'south-west')`,
+		`INSERT INTO tiles VALUES (1, 1, 0, BLOB_FROM_HEX('89504e470d0a1a0a'), 'south-east')`,
 	} {
 		if _, err := Execute(ctx, db, "default", mustParse(sql)); err != nil {
 			t.Fatalf("%s: %v", sql, err)
