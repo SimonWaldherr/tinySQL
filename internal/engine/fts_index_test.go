@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"sync"
 	"testing"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -402,6 +403,165 @@ func TestFTSPostingsMatchDocumentFrequency(t *testing.T) {
 		if n != len(cache.postings[term]) {
 			t.Errorf("term %q: postings has %d entries, %d documents contain it",
 				term, len(cache.postings[term]), n)
+		}
+	}
+}
+
+// TestFTSParallelScanIsDeterministic exercises the parallel BM25 scan from many
+// goroutines at once and requires every result to be identical.
+//
+// It stands in for the race detector, which cannot run in this environment
+// (-race requires cgo). A behavioral check is weaker than the detector, but it
+// does catch the failure modes that matter here: workers sharing a heap,
+// partition arithmetic that drops or double-counts a document, and any
+// dependence of the merged top-k on which worker finished first.
+func TestFTSParallelScanIsDeterministic(t *testing.T) {
+	db := ragBenchCorpus(t)
+	ctx := context.Background()
+
+	// Corpus-wide terms force the full parallel scan; the selective ones take the
+	// restricted path, which is partitioned by the same code.
+	queries := []string{
+		"term0",
+		"term3 OR term7",
+		"needle42",
+		"needle4*",
+		`"term0 term1"`,
+		"term3 AND NOT term7",
+	}
+
+	type result struct {
+		ids    []string
+		scores []float64
+	}
+	run := func(q string) result {
+		sql := fmt.Sprintf(
+			`SELECT chunk_id, _fts_score FROM FTS_SEARCH('rag_chunks', %s, 10, 'search_text')`,
+			sqlQuote(q))
+		rs, err := Execute(ctx, db, "default", mustParse(sql))
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		var out result
+		for _, r := range rs.Rows {
+			id, _ := r["chunk_id"].(string)
+			out.ids = append(out.ids, id)
+			out.scores = append(out.scores, toFloatOrFail(t, r["_fts_score"]))
+		}
+		return out
+	}
+
+	// Establish the expected answer for each query serially first, so the
+	// concurrent runs are compared against a known value rather than merely
+	// against each other.
+	want := make(map[string]result, len(queries))
+	for _, q := range queries {
+		want[q] = run(q)
+	}
+
+	const goroutines = 16
+	const iterations = 8
+	var wg sync.WaitGroup
+	errs := make(chan string, goroutines*iterations*len(queries))
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for it := 0; it < iterations; it++ {
+				// Stagger which query each goroutine starts on so different
+				// queries genuinely overlap in time.
+				q := queries[(g+it)%len(queries)]
+				got := run(q)
+				exp := want[q]
+				if len(got.ids) != len(exp.ids) {
+					errs <- fmt.Sprintf("%s: got %d rows, want %d", q, len(got.ids), len(exp.ids))
+					continue
+				}
+				for i := range got.ids {
+					if got.ids[i] != exp.ids[i] || got.scores[i] != exp.scores[i] {
+						errs <- fmt.Sprintf("%s rank %d: got (%s, %v), want (%s, %v)",
+							q, i+1, got.ids[i], got.scores[i], exp.ids[i], exp.scores[i])
+						break
+					}
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(errs)
+
+	reported := 0
+	for msg := range errs {
+		if reported < 5 {
+			t.Error(msg)
+		}
+		reported++
+	}
+	if reported > 0 {
+		t.Errorf("%d concurrent executions disagreed with the serial result", reported)
+	}
+}
+
+// TestFTSParallelScanMatchesSerialScan pins that partitioning the scan does not
+// change the answer, by comparing against a single-worker scan of the same
+// corpus directly through ftsScanTopK.
+func TestFTSParallelScanMatchesSerialScan(t *testing.T) {
+	db := ragBenchCorpus(t)
+	table, err := db.Get("default", "rag_chunks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	textIdx, err := table.ColIndex("search_text")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache := getFTSDocCache("default", table, []int{textIdx})
+	idf := ftsIDFLookup(cache)
+	ctx := context.Background()
+
+	if got := ftsScanWorkerCount(len(cache.docs)); got < 2 {
+		t.Fatalf("fixture of %d docs should scan in parallel, worker count = %d",
+			len(cache.docs), got)
+	}
+	if got := ftsScanWorkerCount(ftsScanParallelMinDocs - 1); got != 1 {
+		t.Errorf("below the threshold the scan should be serial, worker count = %d", got)
+	}
+
+	for _, tc := range ftsGoldenQueries {
+		node := ftsParseQuery(tc.query)
+		if node == nil {
+			continue
+		}
+		node = ftsExpandQuery(node, cache.postings)
+		cands := ftsQueryCandidates(node, cache.postings, len(cache.docs))
+		restricted := !cands.unrestricted && ftsCandidateScanIsCheaper(cands.rows, len(cache.docs))
+		bound := ftsBindIDF(node, idf)
+
+		const k = 12
+		parallel, err := ftsScanTopK(ctx, cache, bound, idf, cands.rows, restricted, k)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.query, err)
+		}
+		// Force the serial path over the identical input.
+		total := len(cache.docs)
+		if restricted {
+			total = len(cands.rows)
+		}
+		h, err := ftsScanRange(ctx, cache, bound, idf, cands.rows, restricted, 0, total, k)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.query, err)
+		}
+		serial := ftsTopKFromHeap(&h, k)
+
+		if len(parallel) != len(serial) {
+			t.Errorf("%s: parallel returned %d rows, serial %d", tc.query, len(parallel), len(serial))
+			continue
+		}
+		for i := range parallel {
+			if parallel[i] != serial[i] {
+				t.Errorf("%s rank %d: parallel %+v != serial %+v",
+					tc.query, i+1, parallel[i], serial[i])
+			}
 		}
 	}
 }

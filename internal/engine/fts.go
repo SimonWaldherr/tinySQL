@@ -315,6 +315,20 @@ type ftsQueryNode struct {
 	left    *ftsQueryNode
 	right   *ftsQueryNode
 	operand *ftsQueryNode // for NOT
+
+	// Precomputed BM25 inverse document frequencies, filled by ftsBindIDF for
+	// the corpus-backed search path. IDF depends only on the term and the
+	// corpus, so it is constant for a whole query — but it used to be looked up
+	// through the ftsIDFLookup closure once per (term, document) pair, costing a
+	// postings map lookup and a math.Log per call. On a 20k-document corpus that
+	// is tens of thousands of redundant logarithms per query. Binding them once
+	// turns the inner loop into a multiply.
+	//
+	// idfBound distinguishes "bound, and the weight really is 0" (a term absent
+	// from the corpus) from "not bound".
+	idfBound bool
+	termIDF  float64   // TERM
+	termIDFs []float64 // PHRASE / EXPANDED, parallel to phrase
 }
 
 type ftsWildcardAtom struct {
@@ -732,19 +746,40 @@ func ftsScoreNode(node *ftsQueryNode, freq map[string]int, normDocLen float64, i
 	if node == nil {
 		return 0
 	}
+	// lengthNorm is the BM25 denominator's document-length component, identical
+	// for every term in this document — hoisted out of termScore so it is
+	// computed once per document rather than once per term.
+	lengthNorm := bm25K1 * (1 - bm25B + bm25B*normDocLen)
 	termScore := func(term string, f int) float64 {
 		tf := float64(f)
 		if tf == 0 {
 			return 0
 		}
-		s := (tf * (bm25K1 + 1)) / (tf + bm25K1*(1-bm25B+bm25B*normDocLen))
+		s := (tf * (bm25K1 + 1)) / (tf + lengthNorm)
 		if idf != nil {
 			s *= idf(term)
 		}
 		return s
 	}
+	// weightedScore is termScore with the term's IDF already resolved by
+	// ftsBindIDF, which is the corpus-backed path's hot loop.
+	// The operation order deliberately mirrors termScore's (divide, then scale by
+	// IDF) rather than the more natural-looking weight*tf/denominator: float
+	// multiplication is not associative, so reordering would shift scores in
+	// their final bits and silently change result ordering for near-ties.
+	weightedScore := func(weight float64, f int) float64 {
+		tf := float64(f)
+		if tf == 0 {
+			return 0
+		}
+		s := (tf * (bm25K1 + 1)) / (tf + lengthNorm)
+		return s * weight
+	}
 	switch node.op {
 	case "TERM":
+		if node.idfBound {
+			return weightedScore(node.termIDF, freq[node.term])
+		}
 		return termScore(node.term, freq[node.term])
 	case "PREFIX":
 		return ftsSumMatchingTerms(freq, termScore, func(tok string) bool {
@@ -759,6 +794,14 @@ func ftsScoreNode(node *ftsQueryNode, freq map[string]int, normDocLen float64, i
 		// order over the same (term, frequency) pairs the PREFIX/WILDCARD cases
 		// above would visit. Absent terms score 0 and are skipped.
 		var s float64
+		if node.idfBound {
+			for i, term := range node.phrase {
+				if f := freq[term]; f > 0 {
+					s += weightedScore(node.termIDFs[i], f)
+				}
+			}
+			return s
+		}
 		for _, term := range node.phrase {
 			if f := freq[term]; f > 0 {
 				s += termScore(term, f)
@@ -771,8 +814,14 @@ func ftsScoreNode(node *ftsQueryNode, freq map[string]int, normDocLen float64, i
 		}
 		// Score as sum of term scores (phrase match bonus)
 		var s float64
-		for _, t := range node.phrase {
-			s += termScore(t, freq[t])
+		if node.idfBound {
+			for i, t := range node.phrase {
+				s += weightedScore(node.termIDFs[i], freq[t])
+			}
+		} else {
+			for _, t := range node.phrase {
+				s += termScore(t, freq[t])
+			}
 		}
 		return s * phraseMatchBonus // phrase match bonus
 	case "AND":
@@ -1422,39 +1471,22 @@ func (f *FTSSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 	// the candidate set cannot change the result.
 	node = ftsExpandQuery(node, cache.postings)
 	candidates := ftsQueryCandidates(node, cache.postings, len(cache.docs))
+	// Resolve every term's IDF once for the whole query rather than once per
+	// scored document (see ftsBindIDF). Candidate derivation above still uses
+	// the unbound tree; binding only rewrites scoring weights.
+	node = ftsBindIDF(node, idf)
 
 	// Bounded top-k selection (O(m log k) for m candidate docs) instead of
 	// collecting every match into a slice and sorting the whole thing
 	// (O(m log m)) — the same fix VEC_SEARCH already applies via
 	// vecScoredHeap/topKFromHeap in vector_search.go. Only the k best-scoring
-	// docs are ever retained.
-	heapRows := make(ftsScoredHeap, 0, k)
-	score := func(ri int, doc ftsCachedDoc) {
-		if !doc.valid {
-			return
-		}
-		if node != nil && !ftsMatchNode(node, doc.freq, doc.tokens) {
-			return
-		}
-		normDocLen := doc.docLen
-		if cache.avgDocLen > 0 {
-			normDocLen = doc.docLen / cache.avgDocLen
-		}
-		ftsPushTopK(&heapRows, ri, ftsScoreNode(node, doc.freq, normDocLen, idf), k)
+	// docs are ever retained. ftsScanTopK additionally splits the scan across
+	// workers once there are enough documents to be worth it.
+	restricted := !candidates.unrestricted && ftsCandidateScanIsCheaper(candidates.rows, len(cache.docs))
+	results, err := ftsScanTopK(ctx, cache, node, idf, candidates.rows, restricted, k)
+	if err != nil {
+		return nil, fmt.Errorf("FTS_SEARCH: %w", err)
 	}
-
-	if !candidates.unrestricted && ftsCandidateScanIsCheaper(candidates.rows, len(cache.docs)) {
-		for _, ri := range candidates.rows {
-			if int(ri) < len(cache.docs) {
-				score(int(ri), cache.docs[ri])
-			}
-		}
-	} else {
-		for ri, doc := range cache.docs {
-			score(ri, doc)
-		}
-	}
-	results := ftsTopKFromHeap(&heapRows, k)
 
 	resultCols := make([]string, 0, len(table.Cols)+2)
 	for _, c := range table.Cols {

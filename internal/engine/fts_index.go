@@ -27,9 +27,144 @@ package engine
 // scored with ftsScoreNode, the output is identical to a full scan.
 
 import (
+	"context"
+	"fmt"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 )
+
+const (
+	// Thresholds for parallelizing the BM25 scan, mirroring
+	// vecSearchParallelMinRows/vecSearchParallelChunkRows in vector_search.go:
+	// below these sizes the goroutine and merge overhead outweighs the scan.
+	ftsScanParallelMinDocs   = 4096
+	ftsScanParallelChunkDocs = 2048
+)
+
+// ftsScanWorkerCount picks a worker count for scanning docs documents.
+func ftsScanWorkerCount(docs int) int {
+	if docs < ftsScanParallelMinDocs {
+		return 1
+	}
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 2 {
+		return 1
+	}
+	if maxByDocs := (docs + ftsScanParallelChunkDocs - 1) / ftsScanParallelChunkDocs; workers > maxByDocs {
+		workers = maxByDocs
+	}
+	if workers < 2 {
+		return 1
+	}
+	return workers
+}
+
+// ftsScanTopK matches and scores the documents a query could hit and returns the
+// k best, scanning in parallel across workers when there are enough documents to
+// justify it. The vector branch has scanned in parallel for some time
+// (vecSearchTopK); the BM25 branch was single-threaded, which made it the
+// long pole of hybrid retrieval on a many-core machine whenever the query's
+// terms were too common for the postings index to narrow.
+//
+// Partitioning cannot affect the result. ftsScoredLess is a total order on
+// (score desc, rowIdx asc) and every heap operation here — per-worker pushes and
+// the final merge — uses it, so the k best documents and their order depend only
+// on which documents were scanned, never on how they were divided up or in which
+// order workers finished.
+func ftsScanTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQueryNode, idf ftsIDFFunc, rows []int32, restricted bool, k int) ([]ftsScored, error) {
+	total := len(cache.docs)
+	if restricted {
+		total = len(rows)
+	}
+
+	workers := ftsScanWorkerCount(total)
+	if workers == 1 {
+		h, err := ftsScanRange(ctx, cache, node, idf, rows, restricted, 0, total, k)
+		if err != nil {
+			return nil, err
+		}
+		return ftsTopKFromHeap(&h, k), nil
+	}
+
+	type workerResult struct {
+		heapRows ftsScoredHeap
+		err      error
+	}
+	results := make([]workerResult, workers)
+	var wg sync.WaitGroup
+	chunk := (total + workers - 1) / workers
+
+	for worker := 0; worker < workers; worker++ {
+		start := worker * chunk
+		end := start + chunk
+		if end > total {
+			end = total
+		}
+		if start >= end {
+			continue
+		}
+		wg.Add(1)
+		go func(worker, start, end int) {
+			defer wg.Done()
+			// Contain a panic as an ordinary worker error rather than letting it
+			// crash the process, matching vecSearchTopK's behavior.
+			defer func() {
+				if r := recover(); r != nil {
+					results[worker].err = fmt.Errorf("FTS_SEARCH: worker panic: %v", r)
+				}
+			}()
+			h, err := ftsScanRange(ctx, cache, node, idf, rows, restricted, start, end, k)
+			results[worker] = workerResult{heapRows: h, err: err}
+		}(worker, start, end)
+	}
+	wg.Wait()
+
+	merged := &ftsScoredHeap{}
+	for i := range results {
+		if results[i].err != nil {
+			return nil, results[i].err
+		}
+		for _, sr := range ftsTopKFromHeap(&results[i].heapRows, k) {
+			ftsPushTopK(merged, sr.rowIdx, sr.score, k)
+		}
+	}
+	return ftsTopKFromHeap(merged, k), nil
+}
+
+// ftsScanRange scores the half-open slice [start, end) of either the candidate
+// row list (restricted) or the whole corpus, returning a size-k heap.
+func ftsScanRange(ctx context.Context, cache ftsDocCacheEntry, node *ftsQueryNode, idf ftsIDFFunc, rows []int32, restricted bool, start, end, k int) (ftsScoredHeap, error) {
+	heapRows := make(ftsScoredHeap, 0, k)
+	for i := start; i < end; i++ {
+		if i&1023 == 0 {
+			if err := checkCtx(ctx); err != nil {
+				return nil, err
+			}
+		}
+		ri := i
+		if restricted {
+			ri = int(rows[i])
+			if ri < 0 || ri >= len(cache.docs) {
+				continue
+			}
+		}
+		doc := cache.docs[ri]
+		if !doc.valid {
+			continue
+		}
+		if node != nil && !ftsMatchNode(node, doc.freq, doc.tokens) {
+			continue
+		}
+		normDocLen := doc.docLen
+		if cache.avgDocLen > 0 {
+			normDocLen = doc.docLen / cache.avgDocLen
+		}
+		ftsPushTopK(&heapRows, ri, ftsScoreNode(node, doc.freq, normDocLen, idf), k)
+	}
+	return heapRows, nil
+}
 
 // ftsCandidates is the set of rows a query could possibly match.
 //
@@ -92,6 +227,44 @@ func ftsExpandQuery(node *ftsQueryNode, postings map[string][]int32) *ftsQueryNo
 		return &ftsQueryNode{op: "NOT", operand: operand}
 	default:
 		// TERM and PHRASE need no expansion.
+		return node
+	}
+}
+
+// ftsBindIDF returns a copy of node with every term's inverse document
+// frequency precomputed, so scoring a document costs a multiply instead of a
+// closure call, a postings lookup and a math.Log per term.
+//
+// IDF is a function of the term and the corpus alone, so it is invariant across
+// the documents a single query scores — yet ftsScoreNode used to evaluate it
+// once per (term, document) pair. On a 20,000-document corpus a four-term query
+// paid 80,000 logarithms to compute four distinct values.
+//
+// Nodes are copied rather than annotated in place: a caller's parsed tree may be
+// reused across queries and corpora, and IDF is only valid for the corpus it was
+// derived from. PREFIX and WILDCARD nodes are left unbound — on this path
+// ftsExpandQuery has already replaced them, and where it has not (the
+// single-text scalar functions) there is no corpus to bind against.
+func ftsBindIDF(node *ftsQueryNode, idf ftsIDFFunc) *ftsQueryNode {
+	if node == nil || idf == nil {
+		return node
+	}
+	switch node.op {
+	case "TERM":
+		return &ftsQueryNode{op: "TERM", term: node.term, idfBound: true, termIDF: idf(node.term)}
+	case "PHRASE", ftsExpandedOp:
+		weights := make([]float64, len(node.phrase))
+		for i, term := range node.phrase {
+			weights[i] = idf(term)
+		}
+		return &ftsQueryNode{op: node.op, phrase: node.phrase, idfBound: true, termIDFs: weights}
+	case "AND", "OR":
+		return &ftsQueryNode{op: node.op,
+			left:  ftsBindIDF(node.left, idf),
+			right: ftsBindIDF(node.right, idf)}
+	case "NOT":
+		return &ftsQueryNode{op: "NOT", operand: ftsBindIDF(node.operand, idf)}
+	default:
 		return node
 	}
 }

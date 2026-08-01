@@ -671,3 +671,74 @@ against a full-scan reference implementation.
 go test -bench='BenchmarkRAG' -benchmem ./internal/engine/...
 go test -run='TestFTSGolden|TestFTSCandidate|TestFTSExpanded|TestFTSNegation' ./internal/engine/...
 ```
+
+### RAG SELECT latency: bound IDF, a parallel BM25 scan, and a cached neighbor index
+
+With the postings index in place, profiling a full RAG `SELECT` — the
+`HYBRID_SEARCH` query from `docs/rag-guide.md`, including neighbor-chunk
+expansion — showed the remaining time was not in retrieval logic at all. Three
+findings, each fixed independently:
+
+**1. IDF was recomputed per (term, document) pair.** `ftsScoreNode` obtained a
+term's inverse document frequency through the `ftsIDFLookup` closure, which does
+a postings map lookup and a `math.Log` on every call. IDF depends only on the
+term and the corpus, so a four-term query over 20,000 documents evaluated 80,000
+logarithms to produce four distinct values. `ftsBindIDF`
+(`internal/engine/fts_index.go`) resolves them once into the query tree, turning
+the inner loop into a multiply. The arithmetic deliberately keeps the original
+operation order (divide, then scale by IDF) rather than the tidier
+`weight*tf/denominator`: float multiplication is not associative, so reordering
+would shift scores in their last bits and reorder near-ties.
+
+**2. The BM25 scan was single-threaded** while the vector branch had been
+parallel for some time (`vecSearchTopK`). That made the lexical pass the long
+pole on a many-core machine whenever a query's terms were too common for the
+postings index to narrow. `ftsScanTopK` now splits the scan across workers with
+the same thresholds and per-worker-heap merge the vector path uses. Partitioning
+cannot change the answer — `ftsScoredLess` is a total order on
+(score desc, rowIdx asc) and every heap operation uses it — which
+`TestFTSParallelScanMatchesSerialScan` checks against a forced single-worker scan
+for every query shape.
+
+**3. The neighbor-chunk expansion index was rebuilt on every query.**
+`ragBuildContextIndex` scanned the whole source table per call, and resolved its
+two column names through `strings.ToLower` plus a map lookup *per cell* — 40,000
+of each for a 20,000-row corpus, before reading any data. The index is a pure
+function of the table's contents and those two columns, so it is now cached like
+the vector and document caches: keyed by (tenant, table, columns), validated
+against `table.Version`, purged by `DROP TABLE`. Column positions are resolved
+once. This is what made expansion nearly free.
+
+Cumulative effect, measured against the pre-index baseline (minima of four
+alternating rounds):
+
+| Benchmark (20k chunks, 96 dims) | before | after | |
+|---|---|---|---|
+| `HYBRID_SEARCH` + expansion (the guide's query) | 19.02 ms, 2,350,936 B/op | **2.95 ms, 236,810 B/op** | 6.4x, 9.9x less memory |
+| `HYBRID_SEARCH` | 11.88 ms | **3.11 ms** | 3.8x |
+| BM25 branch (four-term OR) | 10.82 ms | **1.95 ms** | 5.6x |
+| Single corpus-wide term | 3.89 ms | **0.95 ms** | 4.1x |
+| Quoted phrase | 22.84 ms | **4.38 ms** | 5.2x |
+| Selective term (3 of 20,000) | 712 µs | **23 µs** | 30x |
+| Prefix wildcard | 53.12 ms | **212 µs** | 250x |
+| `RAG_CONTEXT_FROM` top-k | 4.17 ms, 1,759,125 B/op | **1.04 ms, 350,731 B/op** | 4.0x, 5.0x less memory |
+
+Expansion now costs so little that `HYBRID_SEARCH` with and without it measure
+the same within noise. Per-query allocation rises 6-16% on the paths that scan in
+parallel (per-worker heaps) and falls tenfold on the expansion path.
+
+**One change was measured and rejected.** Running the vector and BM25 passes
+concurrently in `RAG_SEARCH` looks like an obvious win, and it was implemented,
+tested and benchmarked. But both passes now saturate every core internally, so
+overlapping them mostly oversubscribes: repeated alternating measurements
+disagreed about the sign of the effect (12% faster in one careful run, 32% slower
+in the next, against a noise floor that reached 20x on this machine). It was
+reverted rather than shipped — the concurrency, its panic handling and its
+error-precedence reasoning are real complexity, and no demonstrable benefit paid
+for them. A conditional version, overlapping only when the lexical side is
+restricted enough to scan serially, is the shape worth revisiting.
+
+```sh
+go test -bench='BenchmarkRAG' -benchmem ./internal/engine/...
+go test -run='TestFTSParallel|TestRAGContextIndex' ./internal/engine/...
+```

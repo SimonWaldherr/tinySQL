@@ -5,7 +5,97 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
+
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
+
+// ─────────────────────── neighbor-chunk index cache ──────────────────────────
+//
+// The per-document chunk index is a pure function of the source table's contents
+// and the two column names, but it used to be rebuilt on every expansion — a
+// full scan of the corpus per query, which became the dominant cost of a RAG
+// SELECT once retrieval itself was made fast. It is cached here the same way the
+// vector column cache and the tokenized-document cache are: keyed by
+// (tenant, table, columns), validated against the table pointer and
+// table.Version, and rebuilt lazily whenever either changes.
+//
+// Entries are immutable once published, so concurrent queries share one index.
+
+type ragContextIndexCacheKey struct {
+	tenant   string
+	table    string
+	docCol   string // lower-cased
+	chunkCol string // lower-cased
+}
+
+type ragContextIndexCacheEntry struct {
+	table   *storage.Table
+	version int
+	index   ragContextIndex
+}
+
+// ragContextIndexCacheMaxEntries bounds the cache for the same reason the vector
+// and FTS caches are bounded: each entry pins its *storage.Table, so without a
+// cap a process that cycles through many tables or column pairs would retain one
+// table per orphaned key.
+const ragContextIndexCacheMaxEntries = 256
+
+var (
+	ragContextIndexCacheMu sync.RWMutex
+	ragContextIndexCache   = make(map[ragContextIndexCacheKey]ragContextIndexCacheEntry)
+)
+
+// purgeRAGContextCachesFor drops cached neighbor indexes for one table, called
+// from DROP TABLE. Purging is always safe: the index rebuilds lazily.
+func purgeRAGContextCachesFor(tenant, table string) {
+	if tenant == "" {
+		tenant = "default"
+	}
+	ragContextIndexCacheMu.Lock()
+	for k := range ragContextIndexCache {
+		if k.tenant == tenant && k.table == table {
+			delete(ragContextIndexCache, k)
+		}
+	}
+	ragContextIndexCacheMu.Unlock()
+}
+
+// getRAGContextIndex returns the neighbor-chunk index for source, building it
+// only when no valid cached copy exists. Sources without a stable identity (CTE
+// results, in-memory fused hit sets) are always built fresh.
+func getRAGContextIndex(source ragSource, docCol, chunkCol string) ragContextIndex {
+	if !source.tableSource || source.table == nil {
+		return ragBuildContextIndex(source, docCol, chunkCol)
+	}
+	key := ragContextIndexCacheKey{
+		tenant:   source.tenant,
+		table:    source.table.Name,
+		docCol:   strings.ToLower(docCol),
+		chunkCol: strings.ToLower(chunkCol),
+	}
+
+	ragContextIndexCacheMu.RLock()
+	entry, ok := ragContextIndexCache[key]
+	ragContextIndexCacheMu.RUnlock()
+	if ok && entry.table == source.table && entry.version == source.table.Version {
+		return entry.index
+	}
+
+	index := ragBuildContextIndex(source, docCol, chunkCol)
+
+	ragContextIndexCacheMu.Lock()
+	if _, exists := ragContextIndexCache[key]; !exists {
+		evictOverCap(ragContextIndexCache, ragContextIndexCacheMaxEntries)
+	}
+	ragContextIndexCache[key] = ragContextIndexCacheEntry{
+		table:   source.table,
+		version: source.table.Version,
+		index:   index,
+	}
+	ragContextIndexCacheMu.Unlock()
+	return index
+}
 
 // RAG_CONTEXT loads neighboring chunks for a single retrieved chunk.
 //
@@ -192,7 +282,7 @@ func (f *RAGContextFromTableFunc) Execute(ctx context.Context, args []Expr, env 
 // exact same expansion logic against an in-memory fused result set instead of
 // a named table/CTE.
 func ragExpandContextFrom(source, hits ragSource, docCol, chunkCol, hitDocCol, hitChunkCol string, before, after int) *ResultSet {
-	contexts := ragBuildContextIndex(source, docCol, chunkCol)
+	contexts := getRAGContextIndex(source, docCol, chunkCol)
 	cols := append(append([]string{}, source.cols...), "_hit_rank", "_context_offset", "_context_rank", "_context_hits")
 	candidates := make(map[ragContextKey]*ragContextCandidate)
 	for hitIdx := 0; hitIdx < hits.len(); hitIdx++ {
@@ -276,6 +366,12 @@ type ragSource struct {
 	rawRows     [][]any
 	columnIdx   map[string]int
 	tableSource bool
+	// tenant and table identify a named-table source so its neighbor-chunk
+	// index can be cached and invalidated by table.Version. Both are zero for
+	// CTE and in-memory sources, which are per-query values with no stable
+	// identity to cache under.
+	tenant string
+	table  *storage.Table
 }
 
 type ragContextRow struct {
@@ -361,7 +457,8 @@ func ragLoadSource(env ExecEnv, name string) (ragSource, error) {
 	for i, col := range table.Cols {
 		columnIdx[strings.ToLower(col.Name)] = i
 	}
-	return ragSource{cols: cols, rawRows: table.Rows, columnIdx: columnIdx, tableSource: true}, nil
+	return ragSource{cols: cols, rawRows: table.Rows, columnIdx: columnIdx, tableSource: true,
+		tenant: tenant, table: table}, nil
 }
 
 func (source ragSource) len() int {
@@ -426,6 +523,38 @@ func ragFindContextRows(source ragSource, docCol, chunkCol string, docID any, ce
 
 func ragBuildContextIndex(source ragSource, docCol, chunkCol string) ragContextIndex {
 	contexts := ragContextIndex{byDocument: make(map[ragDocumentKey][]ragContextRow)}
+
+	if source.tableSource {
+		// Resolve the two column positions once rather than per cell.
+		// source.value lower-cases the column name and hashes it on every call,
+		// so scanning a 20,000-row corpus for two columns cost 40,000
+		// strings.ToLower calls and 40,000 map lookups before reading any data.
+		docIdx, docOK := source.columnIdx[strings.ToLower(docCol)]
+		chunkIdx, chunkOK := source.columnIdx[strings.ToLower(chunkCol)]
+		if !docOK || !chunkOK {
+			// Same outcome as the generic loop below, which would skip every row.
+			return contexts
+		}
+		for rowIndex, raw := range source.rawRows {
+			if docIdx >= len(raw) || chunkIdx >= len(raw) {
+				continue
+			}
+			chunkIndex, err := toInt(raw[chunkIdx])
+			if err != nil {
+				continue
+			}
+			docVal := raw[docIdx]
+			key := ragContextDocumentKey(docVal)
+			contexts.byDocument[key] = append(contexts.byDocument[key], ragContextRow{
+				sourceRow:  rowIndex,
+				docID:      docVal,
+				chunkIndex: chunkIndex,
+			})
+		}
+		ragSortContextIndex(contexts)
+		return contexts
+	}
+
 	for rowIndex := 0; rowIndex < source.len(); rowIndex++ {
 		docVal, ok := source.value(rowIndex, docCol)
 		if !ok {
@@ -447,12 +576,18 @@ func ragBuildContextIndex(source ragSource, docCol, chunkCol string) ragContextI
 		})
 	}
 
+	ragSortContextIndex(contexts)
+	return contexts
+}
+
+// ragSortContextIndex orders each document's chunks by chunk index, which is
+// what lets find() binary-search a neighbor window.
+func ragSortContextIndex(contexts ragContextIndex) {
 	for _, chunks := range contexts.byDocument {
 		sort.SliceStable(chunks, func(i, j int) bool {
 			return chunks[i].chunkIndex < chunks[j].chunkIndex
 		})
 	}
-	return contexts
 }
 
 func (idx ragContextIndex) find(docID any, centerChunk, before, after int) []ragContextRow {

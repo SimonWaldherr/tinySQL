@@ -63,6 +63,7 @@ func executeDropTable(env ExecEnv, s *DropTable) (*ResultSet, error) {
 		// rows, or a panic on an out-of-range index) and leak FTS memory.
 		purgeVecQueryCacheFor(tenant, t.Name)
 		purgeFTSCachesFor(tenant, t.Name)
+		purgeRAGContextCachesFor(tenant, t.Name)
 		env.db.Catalog().DeleteIndexesForTenantTable(env.tenant, s.Name)
 	}
 	return nil, env.db.Drop(env.tenant, s.Name)
