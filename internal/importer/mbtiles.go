@@ -53,7 +53,41 @@ func ImportMBTiles(
 	}
 	defer sqlRows.Close()
 
-	rows := make([][]any, 0)
+	// Tiles are inserted in bounded batches rather than collected into one slice
+	// first. A tileset is the one import where that distinction decides whether
+	// the operation is possible at all: a country-scale .mbtiles runs to many
+	// gigabytes of tile blobs, and buffering them all before the first INSERT
+	// needs the whole file resident. Only opts.BatchSize tiles are held now.
+	//
+	// insertTypedRows applies CreateTable and Truncate on every call, so those
+	// run for the first batch only; later batches append.
+	batchSize := opts.BatchSize
+	if batchSize <= 0 {
+		batchSize = 1000
+	}
+	appendOpts := *opts
+	appendOpts.CreateTable = false
+	appendOpts.Truncate = false
+
+	rows := make([][]any, 0, batchSize)
+	batchOpts := opts
+	flush := func() error {
+		if len(rows) == 0 {
+			return nil
+		}
+		batchResult := &ImportResult{Encoding: "binary", Errors: make([]string, 0), ColumnNames: colNames, ColumnTypes: colTypes}
+		if err := insertTypedRows(ctx, db, tenant, tableName, colNames, colTypes, rows, batchOpts, batchResult); err != nil {
+			return err
+		}
+		result.RowsInserted += batchResult.RowsInserted
+		result.RowsSkipped += batchResult.RowsSkipped
+		result.Errors = append(result.Errors, batchResult.Errors...)
+		// Reuse the buffer; the rows just handed over were copied into the table.
+		rows = rows[:0]
+		batchOpts = &appendOpts
+		return nil
+	}
+
 	for sqlRows.Next() {
 		var zoom, col, row int
 		var tile []byte
@@ -66,13 +100,23 @@ func ImportMBTiles(
 			preview = base64.StdEncoding.EncodeToString(tile)
 		}
 		rows = append(rows, []any{zoom, col, row, tile, len(tile), fmt.Sprintf("%x", hash), preview})
+		if len(rows) >= batchSize {
+			if err := flush(); err != nil {
+				return nil, err
+			}
+		}
 	}
 	if err := sqlRows.Err(); err != nil {
 		return nil, fmt.Errorf("read mbtiles tiles: %w", err)
 	}
-
-	if err := insertTypedRows(ctx, db, tenant, tableName, colNames, colTypes, rows, opts, result); err != nil {
+	if err := flush(); err != nil {
 		return nil, err
+	}
+	// An empty tileset still has to create the table, which no batch did.
+	if result.RowsInserted == 0 && opts.CreateTable {
+		if err := insertTypedRows(ctx, db, tenant, tableName, colNames, colTypes, nil, opts, result); err != nil {
+			return nil, err
+		}
 	}
 	return result, nil
 }

@@ -55,6 +55,9 @@ func getAllFunctions() map[string]funcHandler {
 		for k, v := range getGeoFunctions() {
 			m[k] = v
 		}
+		for k, v := range getTileFunctions() {
+			m[k] = v
+		}
 		allFunctions = m
 	})
 	return allFunctions
