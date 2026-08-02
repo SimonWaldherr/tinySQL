@@ -308,6 +308,19 @@ importer.OpenMBTiles(ctx, db, "default", "planet.mbtiles",
     &importer.OpenMBTilesOptions{WithoutTileData: true}) // addressing + size + hash
 ```
 
+**Importing a tileset larger than memory** needs `-storage paged_index`
+(`storage.ModePagedIndex`) on the destination `*DB`. Against that backend,
+`ImportMBTiles`/`ExportMBTiles` append and read each batch straight to and
+from the on-disk B+Tree instead of materializing the whole table — a
+country-or-continent-scale tileset stays proportional to `BatchSize` in
+memory, not to its total size. Measured importing 500,000 tiles (~750 MB of
+tile data) into a database capped at 32 MB: peak heap stayed at **34.5 MB**.
+At 50,000 tiles, this path also outperforms the pre-existing bulk-load one on
+every axis — see [BENCHMARKS.md](./BENCHMARKS.md#mbtiles-import-a-tileset-larger-than-memory).
+No API changes: this is automatic whenever the destination is
+`ModePagedIndex` and the table already exists (create it, and its unique
+index if any, before importing).
+
 **Serve tiles over HTTP** with `tinysqld -tiles`:
 
 ```text

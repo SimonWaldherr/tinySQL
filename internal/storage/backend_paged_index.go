@@ -202,6 +202,49 @@ func (b *PagedIndexBackend) SaveTable(tenant string, t *Table) error {
 	return nil
 }
 
+// AppendRows adds newRows (and their unique-index keys) to an existing
+// table's on-disk B+Trees without reading or rewriting rows already there --
+// see pager.PageBackend.AppendRows. Memory and I/O cost are proportional to
+// len(newRows), not to how much of the table already exists, which is what
+// makes building a tileset larger than memory possible: SaveTable cannot do
+// this, since it always frees and rebuilds the whole tree from a complete row
+// set. ImportMBTiles (internal/importer) uses this for a PagedIndexBackend
+// destination.
+//
+// The table must already exist (created once via SaveTable/CreateTable) and
+// declare its unique index; AppendRows only appends.
+func (b *PagedIndexBackend) AppendRows(tenant, name string, newRows [][]any, newIndexKeys map[string][][]byte) (int64, error) {
+	if b.IsReadOnly() {
+		return 0, ErrReadOnlyStorage
+	}
+	firstRowID, err := b.page.AppendRows(tenant, name, newRows, newIndexKeys)
+	if err != nil {
+		return 0, err
+	}
+	// The table root and index roots just changed on disk. Drop the cheap
+	// locator cache (LookupIndexRows would otherwise keep resolving against a
+	// stale root) and any pooled *Table, whose Rows/Version would otherwise
+	// be stale for a caller that later does a plain Get. The next Get/Put
+	// reloads fresh from disk and repopulates both.
+	b.dropMetadata(tenant, name)
+	tn := strings.ToLower(tenant)
+	lc := strings.ToLower(name)
+	b.pool.Remove(tn, lc)
+	b.versionsMu.Lock()
+	delete(b.versions, pagedMetadataKey(tenant, name))
+	b.versionsMu.Unlock()
+	return firstRowID, nil
+}
+
+// ScanRows streams a table's rows to fn without materializing all of them at
+// once -- see pager.PageBackend.ScanTableRows. This bypasses both LoadTable
+// and the table-object pool entirely: a caller using it wants to read a
+// table that may be far larger than the pool's memory budget, so pooling it
+// (or any part of it) would defeat the point.
+func (b *PagedIndexBackend) ScanRows(tenant, name string, fn func(row []any) bool) error {
+	return b.page.ScanTableRows(tenant, name, fn)
+}
+
 // IsDirty reports whether name's in-memory version has diverged from the
 // version last saved to the pager. Satisfies the dirtyTracker interface.
 func (b *PagedIndexBackend) IsDirty(tenant, name string, currentVersion int) bool {

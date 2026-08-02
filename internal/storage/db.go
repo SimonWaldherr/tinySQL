@@ -13,6 +13,7 @@
 package storage
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -486,6 +487,76 @@ func (db *DB) PagedIndexRows(tenant, table, indexName string, values []any) ([][
 		return nil, false, nil
 	}
 	return backend.LookupIndexRows(tenant, table, indexName, values)
+}
+
+// AppendRowsFast appends newRows to tenant/tableName, maintaining every
+// declared unique secondary index, without materializing rows already on
+// disk -- when the attached backend is ModePagedIndex (see
+// PagedIndexBackend.AppendRows). ok is false when there is no such backend
+// attached, or the table has no catalog entry yet (it must already exist,
+// e.g. via Put/CreateTable): the caller should fall back to its normal
+// db.Get-then-append path. A true result with a non-nil error means the
+// fast path was attempted and failed -- do not also apply newRows through
+// the fallback path in that case, or they will be double-inserted.
+//
+// ImportMBTiles (internal/importer) is the motivating caller: without this,
+// importing a tileset larger than memory needs the whole destination table
+// resident by the time the import finishes, for every storage mode
+// including paged, because nothing durable happens until that in-memory
+// slice is eventually saved -- and PagedIndexBackend.SaveTable's "replace
+// everything" rebuild would make every batch after the first cost the size
+// of everything imported so far, not just its own size.
+func (db *DB) AppendRowsFast(tenant, tableName string, newRows [][]any) (ok bool, err error) {
+	backend, isPaged := db.backend.(*PagedIndexBackend)
+	if !isPaged {
+		return false, nil
+	}
+	meta, err := backend.IndexMetadata(tenant, tableName)
+	if err != nil {
+		return false, err
+	}
+	if meta == nil {
+		return false, nil
+	}
+	newIndexKeys := make(map[string][][]byte, len(meta.Indexes))
+	for _, idx := range meta.Indexes {
+		if !idx.Unique {
+			continue
+		}
+		keys := make([][]byte, len(newRows))
+		for i, row := range newRows {
+			key, kErr := meta.indexKey(idx.Columns, row)
+			if kErr != nil {
+				return true, fmt.Errorf("index %q: %w", idx.Name, kErr)
+			}
+			keys[i] = key
+		}
+		newIndexKeys[idx.Name] = keys
+	}
+	if _, err := backend.AppendRows(tenant, tableName, newRows, newIndexKeys); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+// ScanRowsFast streams tenant/tableName's rows to fn without materializing
+// the whole table -- when the attached backend is ModePagedIndex (see
+// PagedIndexBackend.ScanRows). ok is false when there is no such backend
+// attached; the caller should fall back to Get and range over table.Rows.
+// fn returning false stops the scan early.
+//
+// ExportMBTiles (internal/importer) is the motivating caller: writing a
+// tileset larger than memory back out to a .mbtiles file should not first
+// need to load it into memory, which is what Get would otherwise force.
+func (db *DB) ScanRowsFast(tenant, tableName string, fn func(row []any) bool) (ok bool, err error) {
+	backend, isPaged := db.backend.(*PagedIndexBackend)
+	if !isPaged {
+		return false, nil
+	}
+	if err := backend.ScanRows(tenant, tableName, fn); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 // SetBackend attaches a StorageBackend and sets the storage mode. This is

@@ -1054,3 +1054,93 @@ XYZ-to-TMS flip intact.
 go test -run=none -bench='BenchmarkTileLookupOnDisk' -benchtime=3000x ./benchmarks/...
 go test -run='TestTileEndpointOverPagedIndex' ./cmd/tinysqld/...
 ```
+
+## MBTiles import: a tileset larger than memory
+
+The section above establishes that *serving* a `ModePagedIndex` tileset larger
+than memory already worked: a point lookup resolves a B+Tree and materializes
+only the located row. *Building* that tileset in the first place did not have
+the same property, for a reason specific to how the paged backend persists a
+table.
+
+`PagedIndexBackend.SaveTable` "replaces the entire table contents (drop +
+recreate of the tree)" — its own doc comment. `ImportMBTiles` already streamed
+its *source* scan in bounded batches, one SQLite row cursor at a time, but the
+*destination* side had no equivalent: `db.Get` on a `ModePagedIndex` table
+loads every row via `PageBackend.LoadTable`, and nothing durable happened
+until that in-memory table was eventually saved — at which point SaveTable's
+full rebuild needed the complete row set in memory anyway. A country-scale
+`.mbtiles` runs to gigabytes of tile blobs; building one this way needed the
+whole thing resident regardless of how the source was read.
+
+`pager.PageBackend.AppendRows` (`internal/storage/pager/backend.go`) is the
+missing primitive: it inserts new rows into an *existing* B+Tree in place —
+using the same `BTree.Insert` SaveTable already calls, just without freeing
+and rebuilding the tree first — and does the same for each declared unique
+secondary index. `storage.DB.AppendRowsFast` computes each index's canonical
+key per row and calls it; `internal/importer.insertTypedRows` calls that for
+every batch when the destination is `ModePagedIndex`, falling back to the
+original db.Get-and-append path for every other storage mode, unchanged. The
+symmetric read-side gap — exporting a `ModePagedIndex` tileset back to
+`.mbtiles` also called `db.Get` — is closed the same way, with
+`PageBackend.ScanTableRows`/`DB.ScanRowsFast` streaming rows to the SQLite
+writer one B+Tree leaf at a time instead of collecting them into a slice
+first.
+
+One correctness-adjacent fix was necessary to make batching itself safe:
+`PageBackend.CommitTx` durably records a transaction but does not flush or
+clean dirty pages — only `Checkpoint` does, and `PageBufferPool.evictOne` by
+design never evicts a dirty page (it is the only copy of data the WAL has not
+yet been checkpointed to). Without a checkpoint between batches, every batch's
+newly dirty pages stayed pinned in the pool, so each subsequent page
+allocation had to scan a *growing* list of unevictable pages before giving up
+— `AppendRows`'s per-batch cost was accidentally `O(rows imported so far)`,
+not `O(batch size)`. `AppendRows` now checkpoints once per call, tying
+checkpoint frequency to the caller's own `BatchSize` instead of adding a
+separate tuning knob.
+
+A second, unrelated bug compounded this during development: `insertTypedRows`
+called the shared `applyDefaults`, whose `CreateTable` heuristic ("enable it
+when neither `CreateTable` nor `Truncate` is explicitly set") cannot
+distinguish a caller's explicit `false` from an unset field. Every batch after
+the first passes `CreateTable: false` to mean "the table already exists" —
+`applyDefaults` flipped it back to `true` anyway, so `createTable`'s
+`db.Put`-fails-then-`db.Get`-fallback fired before *every* batch, forcing a
+full-table read before each one. Harmless waste for the in-memory default
+(`db.Get` is a cached-pointer return there); silently catastrophic for
+`ModePagedIndex`, where it turned into a real disk scan of everything
+imported so far, repeated on every batch. `insertTypedRows` no longer calls
+`applyDefaults`: every real caller (`ImportMBTiles`, `OpenMBTiles`,
+`ImportOSM`, `ImportRoutingGraph`) already normalizes its own options once at
+its own entry point before deriving a per-batch copy, which is what needs to
+survive unchanged.
+
+**Memory**, importing 500,000 tiles (~750 MB of tile payloads, 1500 B each)
+into a database capped at 32 MB (`MaxMemoryBytes`):
+
+| | before any of the above | after |
+|---|---|---|
+| peak heap during import | would need ~750 MB+ resident | **34.5 MB** |
+| elapsed (500k tiles, seed + import) | did not finish in 5 minutes | 26.3 s |
+
+**Speed and allocation**, `BenchmarkPagedIndexMBTilesImport{AppendRows,SaveTableRebuild}`,
+50,000 tiles, `BatchSize` 1000, `-benchtime=1x`:
+
+| | AppendRows (after) | SaveTable rebuild (equivalent to before) |
+|---|---|---|
+| elapsed | 3.20 s | 4.10 s |
+| heap resident after import | 48.6 MB | 517 MB (10.6x) |
+| peak RSS | 123.7 MB | 1032.3 MB (8.3x) |
+| allocations | 5.08 M | 24.05 M (4.7x) |
+| throughput | 15,614 rows/s | 12,204 rows/s |
+
+SaveTable's memory cost is proportional to the *total* table size and grows
+without bound as more of it is imported; AppendRows's is proportional to one
+batch and stays flat regardless of how large the tileset gets. At 50,000 rows
+the gap is already 8-10x; it widens with scale, which is the entire point for
+a continent-sized `.mbtiles`.
+
+```sh
+go test ./benchmarks -run '^$' -bench BenchmarkPagedIndexMBTilesImport -benchmem -benchtime=1x
+go test -tags=sqliteimport ./internal/importer/... -run 'TestImportMBTilesPagedIndex|TestExportMBTilesStreamsFromPagedIndex' -v
+```

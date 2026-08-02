@@ -63,9 +63,23 @@ func ExportMBTiles(
 		return nil, fmt.Errorf("export mbtiles: stat %s: %w", filePath, err)
 	}
 
-	tiles, err := db.Get(tenant, opts.TilesTable)
-	if err != nil {
-		return nil, fmt.Errorf("export mbtiles: tiles table %q: %w", opts.TilesTable, err)
+	// A schema-only lookup is enough to resolve the tile columns, and it is
+	// the cheap kind on a ModePagedIndex backend (catalog only, no row scan)
+	// -- unlike db.Get, which would materialize the whole tiles table just to
+	// read its column list. mbtilesWriteTiles below does the equivalent
+	// schema/rows split for the tile data itself.
+	var tiles *storage.Table
+	if meta, ok, metaErr := db.PagedIndexMetadata(tenant, opts.TilesTable); metaErr != nil {
+		return nil, fmt.Errorf("export mbtiles: tiles table %q: %w", opts.TilesTable, metaErr)
+	} else if ok {
+		tiles = meta
+	}
+	if tiles == nil {
+		var err error
+		tiles, err = db.Get(tenant, opts.TilesTable)
+		if err != nil {
+			return nil, fmt.Errorf("export mbtiles: tiles table %q: %w", opts.TilesTable, err)
+		}
 	}
 	idx, err := mbtilesTileColumns(tiles)
 	if err != nil {
@@ -83,7 +97,7 @@ func ExportMBTiles(
 	}
 
 	result := &ExportMBTilesResult{MinZoom: -1, MaxZoom: -1}
-	if err := mbtilesWriteTiles(ctx, dst, tiles, idx, opts, result); err != nil {
+	if err := mbtilesWriteTiles(ctx, dst, db, tenant, opts.TilesTable, tiles, idx, opts, result); err != nil {
 		return nil, err
 	}
 	if err := mbtilesWriteMetadata(ctx, dst, db, tenant, opts, result); err != nil {
@@ -135,9 +149,18 @@ func mbtilesCreateSchema(ctx context.Context, dst *sql.DB) error {
 	return nil
 }
 
+// mbtilesWriteTiles writes every row of the tenant's tiles table to dst.
+//
+// It streams through db.ScanRowsFast when the source is ModePagedIndex,
+// reading one B+Tree leaf at a time, so exporting a tileset larger than
+// memory does not first need db.Get to load the whole thing (the write side
+// of what AppendRowsFast does for import). Every other storage mode falls
+// back to ranging over tiles.Rows, unchanged from before this existed.
 func mbtilesWriteTiles(
 	ctx context.Context,
 	dst *sql.DB,
+	db *storage.DB,
+	tenant, tableName string,
 	tiles *storage.Table,
 	idx mbtilesTileIdx,
 	opts *ExportMBTilesOptions,
@@ -174,11 +197,8 @@ func mbtilesWriteTiles(
 		return nil
 	}
 
-	for rowNum, row := range tiles.Rows {
-		if err := ctx.Err(); err != nil {
-			_ = commit()
-			return err
-		}
+	rowNum := 0
+	writeRow := func(row []any) error {
 		zoom, err := mbtilesInt(row, idx.zoom, "zoom_level", rowNum)
 		if err != nil {
 			return err
@@ -230,6 +250,46 @@ func mbtilesWriteTiles(
 			if err := commit(); err != nil {
 				return err
 			}
+		}
+		rowNum++
+		return nil
+	}
+
+	var streamErr error
+	streamed, scanErr := db.ScanRowsFast(tenant, tableName, func(row []any) bool {
+		if err := ctx.Err(); err != nil {
+			streamErr = err
+			return false
+		}
+		if err := writeRow(row); err != nil {
+			streamErr = err
+			return false
+		}
+		return true
+	})
+	if streamed {
+		// A callback returning false to stop the scan early is not itself an
+		// error to ScanRange/ScanRowsFast, so streamErr (our own reason for
+		// stopping) and scanErr (a pager-level failure) are checked
+		// separately -- either one means the export did not fully complete.
+		if scanErr != nil {
+			_ = commit()
+			return scanErr
+		}
+		if streamErr != nil {
+			_ = commit()
+			return streamErr
+		}
+		return commit()
+	}
+
+	for _, row := range tiles.Rows {
+		if err := ctx.Err(); err != nil {
+			_ = commit()
+			return err
+		}
+		if err := writeRow(row); err != nil {
+			return err
 		}
 	}
 	return commit()

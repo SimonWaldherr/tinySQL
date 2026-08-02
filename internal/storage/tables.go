@@ -158,6 +158,33 @@ func (db *DB) Put(tn string, t *Table) error {
 	return nil
 }
 
+// DiscardCachedTable drops tenant/name from the DB's in-memory table cache
+// without persisting it first, then reports whether it was present.
+//
+// Put always caches the table it creates in db.tenants, even for the
+// evictable backends (ModeIndex/ModeHybrid/ModePagedIndex) that otherwise
+// keep loaded tables out of db.tenants precisely so they can be evicted (see
+// Get). A caller that then writes directly to the backend -- bypassing that
+// cached pointer entirely, as AppendRowsFast does -- leaves it stale: it
+// still reads back whatever Put originally wrote (typically an empty table),
+// not what is now on disk. DiscardCachedTable clears that stale pointer so
+// the next Get falls through to the backend and sees current data.
+//
+// This is only safe when the backend is already known to be authoritative
+// for tenant/name. Calling it on a table whose in-memory copy has mutations
+// the backend does not yet have loses those mutations.
+func (db *DB) DiscardCachedTable(tenant, name string) bool {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	td := db.getTenant(tenant)
+	lc := strings.ToLower(name)
+	if _, ok := td.tables[lc]; !ok {
+		return false
+	}
+	delete(td.tables, lc)
+	return true
+}
+
 // Drop removes a table from the tenant (and from the backend if attached).
 func (db *DB) Drop(tn, name string) error {
 	if db.IsReadOnly() {

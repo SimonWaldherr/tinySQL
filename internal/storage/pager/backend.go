@@ -195,6 +195,46 @@ func (pb *PageBackend) LoadTable(tenant, name string) (*TableData, error) {
 	}, nil
 }
 
+// ScanTableRows streams a table's rows to fn in key order, one B+Tree leaf
+// page at a time, instead of collecting them all into one slice the way
+// LoadTable does. fn returning false stops the scan early, same as
+// BTree.ScanRange. Memory use is bounded by one leaf's worth of rows (plus
+// whatever overflow pages a single oversized row needs), not by the table's
+// total size -- the reader side of the same "larger than memory" property
+// AppendRows gives the writer side. ExportMBTiles (internal/importer) is the
+// motivating caller: writing out a tileset larger than memory should not
+// need loading it into memory first.
+func (pb *PageBackend) ScanTableRows(tenant, name string, fn func(row []any) bool) error {
+	pb.mu.RLock()
+	defer pb.mu.RUnlock()
+
+	entry, err := pb.catalog.GetEntry(tenant, name)
+	if err != nil {
+		return err
+	}
+	if entry == nil {
+		return fmt.Errorf("scan rows: no such table %s/%s", tenant, name)
+	}
+
+	bt := NewBTree(pb.pager, entry.RootPageID)
+	var decodeErr error
+	err = bt.ScanRange(RowKey(0), nil, func(key, val []byte) bool {
+		row, decErr := UnmarshalRow(val)
+		if decErr != nil {
+			decodeErr = decErr
+			return false
+		}
+		return fn(row)
+	})
+	if decodeErr != nil {
+		return fmt.Errorf("scan table %s/%s: %w", tenant, name, decodeErr)
+	}
+	if err != nil {
+		return fmt.Errorf("scan table %s/%s: %w", tenant, name, err)
+	}
+	return nil
+}
+
 // SaveTable persists all rows of a table into a B+Tree.
 // This replaces the entire table contents (drop + recreate of the tree).
 func (pb *PageBackend) SaveTable(tenant string, td *TableData) error {
@@ -288,6 +328,111 @@ func (pb *PageBackend) SaveTable(tenant string, td *TableData) error {
 	}
 
 	return nil
+}
+
+// AppendRows inserts newRows into an existing table's B+Tree in place,
+// without reading or rewriting any row already on disk, and inserts
+// newIndexKeys into the existing unique secondary-index B+Trees the same way.
+//
+// This is what SaveTable cannot do: SaveTable always frees the whole existing
+// tree and rebuilds it from a complete row set, so its cost -- and the memory
+// needed to hold that complete row set -- grows with the table's total size.
+// Building a tileset far larger than memory means every batch after the
+// first must cost only its own size, not the size of everything imported so
+// far; AppendRows is the primitive that makes that possible. See
+// ImportMBTiles in internal/importer, which uses it when the destination is
+// paged-index storage.
+//
+// newIndexKeys maps index name to one canonical key per row in newRows, in
+// the same order; a nil/empty key skips that row for that index. Only unique
+// indexes are meaningful here: a duplicate key is rejected by neither this
+// method nor the underlying B+Tree (which stores the last write), so the
+// caller is responsible for uniqueness -- true for a well-formed MBTiles
+// source, whose own UNIQUE index already guarantees it.
+//
+// Returns the row ID assigned to newRows[0]; subsequent rows are numbered
+// sequentially from there.
+func (pb *PageBackend) AppendRows(tenant, name string, newRows [][]any, newIndexKeys map[string][][]byte) (int64, error) {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	entry, err := pb.catalog.GetEntry(tenant, name)
+	if err != nil {
+		return 0, err
+	}
+	if entry == nil {
+		return 0, fmt.Errorf("append rows: no such table %s/%s", tenant, name)
+	}
+
+	txID, err := pb.pager.BeginTx()
+	if err != nil {
+		return 0, err
+	}
+
+	firstRowID := entry.RowCount
+	bt := NewBTree(pb.pager, entry.RootPageID)
+	var encBuf []byte
+	for i, row := range newRows {
+		key := RowKey(firstRowID + int64(i))
+		encBuf = MarshalRow(row, encBuf)
+		if err := bt.Insert(txID, key, encBuf); err != nil {
+			_ = pb.pager.AbortTx(txID)
+			return 0, fmt.Errorf("append row %d: %w", i, err)
+		}
+	}
+	entry.RootPageID = bt.Root()
+
+	for idxPos := range entry.Indexes {
+		idx := &entry.Indexes[idxPos]
+		keys, ok := newIndexKeys[idx.Name]
+		if !ok {
+			continue
+		}
+		idxTree := NewBTree(pb.pager, idx.RootPageID)
+		for i, key := range keys {
+			if len(key) == 0 || i >= len(newRows) {
+				continue
+			}
+			rowID := firstRowID + int64(i)
+			if err := idxTree.Insert(txID, key, marshalRowIDs([]int{int(rowID)})); err != nil {
+				_ = pb.pager.AbortTx(txID)
+				return 0, fmt.Errorf("append index %s entry %d: %w", idx.Name, i, err)
+			}
+		}
+		idx.RootPageID = idxTree.Root()
+	}
+
+	entry.RowCount = firstRowID + int64(len(newRows))
+	entry.Version++
+	if err := pb.catalog.PutEntry(txID, *entry); err != nil {
+		_ = pb.pager.AbortTx(txID)
+		return 0, err
+	}
+	pb.pager.UpdateSuperblock(func(sb *Superblock) {
+		sb.CatalogRoot = pb.catalog.Root()
+	})
+	if err := pb.pager.CommitTx(txID); err != nil {
+		return 0, err
+	}
+
+	// CommitTx durably records the transaction in the WAL but does not flush
+	// or clean dirty pages -- only Checkpoint does that (see its doc
+	// comment). Without one here, every page this batch touched -- and every
+	// batch before it in the same import -- stays pinned dirty and
+	// unevictable in the buffer pool: pager.PageBufferPool.evictOne only
+	// evicts clean pages, by design, since a dirty page is the only copy of
+	// data the WAL has not yet been checkpointed to. Across many batches
+	// that turns AppendRows's O(batch) cost into an effectively O(rows so
+	// far) cost per batch, since every allocation has to scan a growing list
+	// of unevictable pages before giving up -- the whole point of batching
+	// is lost. Checkpointing once per batch keeps the dirty set bounded to
+	// one batch's worth, tying checkpoint frequency to the caller's own
+	// BatchSize instead of adding a separate tuning knob.
+	if err := pb.Sync(); err != nil {
+		return firstRowID, fmt.Errorf("checkpoint after append: %w", err)
+	}
+
+	return firstRowID, nil
 }
 
 // LookupIndexRows follows an immutable secondary-index B+Tree and loads only
