@@ -335,7 +335,7 @@
             border-top: 1px solid #303846;
             display: grid;
             gap: 14px;
-            grid-template-columns: repeat(3, minmax(0, 1fr));
+            grid-template-columns: repeat(4, minmax(0, 1fr));
             padding-top: 28px;
         }
 
@@ -1736,6 +1736,7 @@
                     <p class="landing-lede">tinySQL is a compact database engine for Go applications, browser-delivered tools, embedded systems and local data workflows — where heavyweight infrastructure does not fit.</p>
                     <div class="landing-actions">
                         <button onclick="openStudio()">Open browser studio →</button>
+                        <a href="tiles-demo.html">MBTiles demo: a map served by SQL →</a>
                         <a href="https://github.com/SimonWaldherr/tinySQL" target="_blank" rel="noreferrer">Read the source ↗</a>
                     </div>
                 </div>
@@ -1749,6 +1750,7 @@
                 <article class="landing-use-case"><strong>Browser tools</strong><p>Import local files, query them with SQL and export the result — without a backend.</p></article>
                 <article class="landing-use-case"><strong>Go and embedded</strong><p>Keep storage and query logic close to the application with one compact, pure-Go core.</p></article>
                 <article class="landing-use-case"><strong>Local data work</strong><p>Use joins, geodata, full-text and vector helpers only when the workflow needs them.</p></article>
+                <article class="landing-use-case"><strong><a href="tiles-demo.html" style="color:inherit;">MBTiles serving</a></strong><p>Pan a live map whose every tile is one <code>SELECT</code> — see the <a href="tiles-demo.html">MBTiles demo</a>.</p></article>
             </section>
         </div>
     </main>
