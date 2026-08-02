@@ -167,6 +167,14 @@ func (bp *BTreePage) slotDirEnd() int {
 func (bp *BTreePage) freeSpace() int {
 	return bp.freeSpaceEnd() - bp.slotDirEnd() - slotEntrySize
 }
+
+// btreeRecordCapacity is the total record-plus-slot budget of an empty B+Tree
+// page. Split decisions must use this exact budget: a slot directory entry is
+// allocated for every record, so counting only record payload bytes can still
+// overfill the right-hand page after a split.
+func btreeRecordCapacity(pageSize int) int {
+	return pageSize - btreeSlotDirOff
+}
 func (bp *BTreePage) getSlotEntry(i int) SlotEntry {
 	off := btreeSlotDirOff + i*slotEntrySize
 	return SlotEntry{
@@ -224,6 +232,10 @@ func marshalInternalRecord(entry InternalEntry) []byte {
 	binary.LittleEndian.PutUint16(rec[4:6], uint16(len(entry.Key)))
 	copy(rec[6:], entry.Key)
 	return rec
+}
+
+func internalRecordFootprint(entry InternalEntry) int {
+	return len(marshalInternalRecord(entry)) + slotEntrySize
 }
 
 // unmarshalInternalRecord parses an internal record.
@@ -329,6 +341,10 @@ func marshalLeafRecord(entry LeafEntry) []byte {
 	binary.LittleEndian.PutUint16(rec[off+2:off+4], uint16(vl))
 	copy(rec[off+4:], entry.Value)
 	return rec
+}
+
+func leafRecordFootprint(entry LeafEntry) int {
+	return len(marshalLeafRecord(entry)) + slotEntrySize
 }
 
 // unmarshalLeafRecord parses a leaf record.

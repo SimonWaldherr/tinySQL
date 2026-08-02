@@ -156,7 +156,7 @@ func tileScalar(n int) string { return strconv.Itoa(n) }
 // table is not an error: a tiles table alone is still servable, just without a
 // declared format.
 func (d *daemon) tilesetMetadata(ctx context.Context, tenant, name string) map[string]string {
-	rs, err := d.executeSQL(ctx, tenant, fmt.Sprintf("SELECT name, value FROM %s_metadata", name))
+	rs, err := d.executeTileSQL(ctx, tenant, fmt.Sprintf("SELECT name, value FROM %s_metadata", name))
 	if err != nil || rs == nil {
 		return nil
 	}
@@ -187,7 +187,7 @@ func (d *daemon) handleTile(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := d.tileQueryContext(r)
 	defer cancel()
 
-	rs, err := d.executeSQL(ctx, tenant, fmt.Sprintf(
+	rs, err := d.executeTileSQL(ctx, tenant, fmt.Sprintf(
 		"SELECT tile_data FROM %s WHERE zoom_level = %s AND tile_column = %s AND tile_row = %s LIMIT 1",
 		name, tileScalar(z), tileScalar(x), tileScalar(tileRowForRequest(z, y))))
 	if err != nil {
@@ -314,7 +314,7 @@ func (d *daemon) handleTileMetadata(w http.ResponseWriter, r *http.Request, rawN
 // observedZoomRange derives a zoom range from the tiles table when metadata does
 // not declare one.
 func (d *daemon) observedZoomRange(ctx context.Context, tenant, name string) (int, int, bool) {
-	rs, err := d.executeSQL(ctx, tenant, fmt.Sprintf(
+	rs, err := d.executeTileSQL(ctx, tenant, fmt.Sprintf(
 		"SELECT MIN(zoom_level) AS lo, MAX(zoom_level) AS hi FROM %s", name))
 	if err != nil || rs == nil || len(rs.Rows) == 0 {
 		return 0, 0, false

@@ -57,6 +57,33 @@ update-gh-pages` reuses a clean `gh-pages` worktree, copies only changed files,
 and commits only when generated content differs. It refuses to overwrite a
 dirty worktree. `make push-gh-pages` also pushes the branch.
 
+## MBTiles demo (`tiles-demo.html`)
+
+A second, focused page: a Leaflet map whose every tile is fetched with one SQL
+query (`SELECT tile_data FROM tiles WHERE zoom_level = z AND tile_column = x
+AND tile_row = TILE_FLIP_Y(y, z)`), run live by the same `query_files.wasm`
+module through `window.executeQuery`. A sidebar logs each query with its
+timing and whether its exact SQL text was already seen this session (and is
+therefore eligible for the WASM module's compiled-query cache), shows the
+tileset's MBTiles metadata, and lets you click the map to run `TILE_ZXY`,
+`TILE_QUADKEY` and `TILE_BBOX` for that point.
+
+The tileset is generated, non-geographic art (value noise, quantized into flat
+color bands) — see [`cmd/mbtilesdemo`](../mbtilesdemo) at the repo root. That
+generator round-trips the tileset through tinySQL's real MBTiles pipeline
+(`importer.ExportMBTiles` then `importer.ImportMBTiles`) and writes two
+outputs consumed here: `demo.mbtiles` (a genuine spec-compliant file, offered
+as a download on the page) and `tiles-demo-data.js` (the same tileset as a
+tinySQL snapshot, loaded once via `importDatabase`). Regenerate both with:
+
+```bash
+go run -tags=sqliteimport ./cmd/mbtilesdemo
+```
+
+`tiles-demo.html`/`tiles-demo.js`/`tiles-demo-data.js`/`demo.mbtiles` are
+included in `GH_PAGES_DEMO_FILES` in the repo root `Makefile`, so `make
+update-gh-pages` picks up regenerated files the same way it does `app.js`.
+
 ## UI capabilities
 
 - imports for CSV/TSV/TXT, JSON/JSONL/NDJSON, YAML, XML, Excel (`.xlsx`,

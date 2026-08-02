@@ -38,6 +38,13 @@ type daemon struct {
 	tiles          bool
 	startedAt      time.Time
 	ready          atomic.Bool
+	// tileQueryCache holds parsed/planned ASTs for the tile-serving hot path
+	// (tiles.go), keyed by the exact literal SQL text a tile request builds.
+	// A map viewport re-requests the same handful of z/x/y tiles from many
+	// clients, so caching by literal text -- not just a generic query cache --
+	// turns repeat tile fetches into a parse-free plan reuse instead of a fresh
+	// ParseSQL on every HTTP request. See executeTileSQL.
+	tileQueryCache *tinysql.QueryCache
 }
 
 type sqlRequest struct {
@@ -98,6 +105,7 @@ func newDaemon(inst *tinysql.Instance, cfg daemonConfig) *daemon {
 		analytics:      cfg.Analytics,
 		tiles:          cfg.Tiles,
 		startedAt:      time.Now(),
+		tileQueryCache: tinysql.NewQueryCache(4096),
 	}
 	d.ready.Store(true)
 	return d
@@ -450,6 +458,24 @@ func (d *daemon) executeSQL(ctx context.Context, tenant, sqlText string) (*tinys
 		return nil, tinysql.WithSQLState(tinysql.SQLStateSyntaxError, err)
 	}
 	return tinysql.Execute(ctx, d.inst.DB, tenant, stmt)
+}
+
+// executeTileSQL runs SQL built by the tile-serving path (tiles.go) through
+// d.tileQueryCache instead of ParseSQL, so a tile that has already been
+// requested once -- the common case, since a map viewport is a handful of
+// tiles re-fetched by every client that pans across it -- reuses the parsed
+// statement and its cached access-plan shape instead of paying a fresh parse
+// on every HTTP request. Every literal in the SQL is either the validated
+// tileset name (tilesetName) or an integer produced by tileScalar, so caching
+// by exact text carries no injection risk and the cache is bounded (LRU), so
+// an unbounded stream of distinct tile coordinates just evicts cold entries
+// rather than growing without limit.
+func (d *daemon) executeTileSQL(ctx context.Context, tenant, sqlText string) (*tinysql.ResultSet, error) {
+	compiled, err := tinysql.Compile(d.tileQueryCache, sqlText)
+	if err != nil {
+		return nil, tinysql.WithSQLState(tinysql.SQLStateSyntaxError, err)
+	}
+	return tinysql.ExecuteCompiled(ctx, d.inst.DB, tenant, compiled)
 }
 
 func buildCatalogJob(req createJobRequest) (*tinysql.CatalogJob, error) {

@@ -17,7 +17,7 @@ import (
 type BTree struct {
 	pager          *Pager
 	root           PageID
-	overflowThresh int // max inline value bytes
+	overflowThresh int // preferred maximum encoded inline leaf record footprint
 }
 
 // NewBTree creates a handle to an existing B+Tree with the given root.
@@ -30,10 +30,12 @@ func NewBTree(p *Pager, root PageID) *BTree {
 	}
 }
 
-// overflowThresholdFor computes the max inline value size given page size.
+// overflowThresholdFor computes the preferred maximum encoded inline record
+// footprint. It deliberately reserves most of a leaf page for neighbouring
+// records, while Insert still makes the final decision from the complete wire
+// representation (key, headers, value/reference and slot entry).
 func overflowThresholdFor(pageSize int) int {
-	usable := pageSize - btreeSlotDirOff - 64 // rough overhead
-	t := usable / 4
+	t := btreeRecordCapacity(pageSize) / 4
 	if t < 256 {
 		t = 256
 	}
@@ -133,22 +135,47 @@ func (bt *BTree) findLeafPinned(key []byte) (PageID, []byte, error) {
 
 // Insert adds or updates a key-value pair within the given transaction.
 func (bt *BTree) Insert(txID TxID, key, value []byte) error {
-	entry := LeafEntry{Key: key}
-
-	if len(value) > bt.overflowThresh {
-		// Store as overflow.
-		overflowHead, err := bt.writeOverflow(txID, value)
-		if err != nil {
-			return err
-		}
-		entry.Overflow = true
-		entry.OverflowPageID = overflowHead
-		entry.TotalSize = uint32(len(value))
-	} else {
-		entry.Value = value
+	entry, err := bt.makeLeafEntry(txID, key, value)
+	if err != nil {
+		return err
 	}
 
 	return bt.insertIntoTree(txID, key, entry)
+}
+
+// makeLeafEntry chooses the inline or overflow representation using the
+// complete encoded record size. Value length alone is insufficient: a long key
+// plus headers and its slot entry can make an otherwise modest BLOB impossible
+// to place on a leaf page.
+func (bt *BTree) makeLeafEntry(txID TxID, key, value []byte) (LeafEntry, error) {
+	if len(key) > int(^uint16(0)) {
+		return LeafEntry{}, fmt.Errorf("btree key too large: %d bytes", len(key))
+	}
+	inline := LeafEntry{Key: key, Value: value}
+	inlineSize := leafRecordFootprint(inline)
+	capacity := btreeRecordCapacity(bt.pager.pageSize)
+	if inlineSize <= capacity && inlineSize <= bt.overflowThresh {
+		return inline, nil
+	}
+
+	// A leaf overflow record replaces the inline value length and payload with
+	// a fixed page reference and total size. Compare the two fully encoded
+	// forms, rather than using len(value), so small values with long keys remain
+	// inline while records that cannot fit an empty leaf are always overflowed.
+	overflow := LeafEntry{Key: key, Overflow: true, TotalSize: uint32(len(value))}
+	overflowSize := leafRecordFootprint(overflow)
+	if overflowSize <= capacity && (inlineSize > capacity || overflowSize < inlineSize) {
+		head, err := bt.writeOverflow(txID, value)
+		if err != nil {
+			return LeafEntry{}, err
+		}
+		overflow.OverflowPageID = head
+		return overflow, nil
+	}
+	if inlineSize <= capacity {
+		return inline, nil
+	}
+	return LeafEntry{}, fmt.Errorf("btree leaf record too large: encoded %d bytes exceeds page capacity %d", inlineSize, capacity)
 }
 
 func (bt *BTree) insertIntoTree(txID TxID, key []byte, entry LeafEntry) error {
@@ -226,8 +253,14 @@ func (bt *BTree) insertWithSplit(txID TxID, path []PageID, entry LeafEntry) erro
 		merged = append(merged, entry)
 	}
 
-	// Split into two halves.
-	mid := len(merged) / 2
+	// Split by encoded bytes, not entry count. A count midpoint can put several
+	// large records on the right and fail after the old page has already been
+	// proved to fit.
+	mid, err := bt.leafSplitIndex(merged)
+	if err != nil {
+		bt.pager.UnpinPage(leafID)
+		return err
+	}
 	leftEntries := merged[:mid]
 	rightEntries := merged[mid:]
 	splitKey := rightEntries[0].Key
@@ -288,6 +321,42 @@ func (bt *BTree) insertWithSplit(txID TxID, path []PageID, entry LeafEntry) erro
 	return bt.insertIntoParent(txID, path[:len(path)-1], leafID, splitKey, rightID)
 }
 
+func (bt *BTree) leafSplitIndex(entries []LeafEntry) (int, error) {
+	if len(entries) < 2 {
+		return 0, fmt.Errorf("cannot split leaf with %d entries", len(entries))
+	}
+	capacity := btreeRecordCapacity(bt.pager.pageSize)
+	total := 0
+	for _, entry := range entries {
+		size := leafRecordFootprint(entry)
+		if size > capacity {
+			return 0, fmt.Errorf("leaf record footprint %d exceeds page capacity %d", size, capacity)
+		}
+		total += size
+	}
+
+	leftBytes := 0
+	best, bestSkew := -1, 0
+	for split := 1; split < len(entries); split++ {
+		leftBytes += leafRecordFootprint(entries[split-1])
+		rightBytes := total - leftBytes
+		if leftBytes > capacity || rightBytes > capacity {
+			continue
+		}
+		skew := leftBytes - rightBytes
+		if skew < 0 {
+			skew = -skew
+		}
+		if best == -1 || skew < bestSkew {
+			best, bestSkew = split, skew
+		}
+	}
+	if best == -1 {
+		return 0, fmt.Errorf("cannot byte-balance %d leaf records into %d-byte pages", len(entries), capacity)
+	}
+	return best, nil
+}
+
 func (bt *BTree) insertIntoParent(txID TxID, path []PageID, leftID PageID, key []byte, rightID PageID) error {
 	if len(path) == 0 {
 		// Need a new root.
@@ -300,47 +369,70 @@ func (bt *BTree) insertIntoParent(txID TxID, path []PageID, leftID PageID, key [
 		return err
 	}
 	bp := WrapBTreePage(buf)
-
-	newEntry := InternalEntry{ChildID: leftID, Key: key}
-	if err := bp.InsertInternalEntry(newEntry); err != nil {
-		// Parent full — split internal.
-		bt.pager.UnpinPage(parentID)
-		return bt.splitInternal(txID, path, leftID, key, rightID)
+	entries, rightChild, err := internalEntriesAfterChildSplit(bp, leftID, key, rightID)
+	bt.pager.UnpinPage(parentID)
+	if err != nil {
+		return err
 	}
-	// Internal page invariant: for sorted entries e[0..n-1] plus RightChild,
-	// e[i].ChildID is the subtree strictly left of e[i].Key, and the subtree
-	// strictly right of e[i].Key is e[i+1].ChildID (or RightChild if e[i] is
-	// last). leftID/rightID are the two halves of a child page that just
-	// split, so together they replace one old child pointer at this level:
-	// leftID takes over the "left of key" role (already set by
-	// InsertInternalEntry above), and the position immediately right of the
-	// new key — e[i+1].ChildID, or RightChild if key ended up last — must
-	// become rightID, overwriting whatever pointer used to sit there.
-	sc := bp.slotCount()
-	for i := 0; i < sc; i++ {
-		e := bp.GetInternalEntry(i)
-		if bytes.Equal(e.Key, key) {
-			if i+1 < sc {
-				next := bp.GetInternalEntry(i + 1)
-				next.ChildID = rightID
-				rec := marshalInternalRecord(next)
-				bp.setSlotEntry(i+1, SlotEntry{})
-				// Rewrite slot i+1.
-				newEnd := bp.freeSpaceEnd() - len(rec)
-				copy(bp.buf[newEnd:], rec)
-				bp.setFreeSpaceEnd(newEnd)
-				bp.setSlotEntry(i+1, SlotEntry{Offset: uint16(newEnd), Length: uint16(len(rec))})
-			} else {
-				// Last separator — set RightChild = rightID.
-				bp.SetRightChild(rightID)
-			}
+
+	// Rebuild from logical entries. This avoids fragmented slot space and keeps
+	// the child pointer immediately right of the new separator correct.
+	newBuf := make([]byte, bt.pager.pageSize)
+	newBP := InitBTreePage(newBuf, parentID, false)
+	if err := buildInternalPage(newBP, entries, rightChild); err == nil {
+		SetPageCRC(newBuf)
+		return bt.pager.WritePage(txID, parentID, newBuf)
+	}
+	return bt.splitInternal(txID, path, entries, rightChild)
+}
+
+func internalEntriesAfterChildSplit(bp *BTreePage, leftID PageID, key []byte, rightID PageID) ([]InternalEntry, PageID, error) {
+	n := bp.slotCount()
+	keys := make([][]byte, n)
+	children := make([]PageID, n+1)
+	for i := 0; i < n; i++ {
+		entry := bp.GetInternalEntry(i)
+		keys[i] = entry.Key
+		children[i] = entry.ChildID
+	}
+	children[n] = bp.RightChild()
+
+	pos := -1
+	for i, child := range children {
+		if child == leftID {
+			pos = i
 			break
 		}
 	}
+	if pos == -1 {
+		return nil, InvalidPageID, fmt.Errorf("parent does not reference split child %d", leftID)
+	}
+	if (pos > 0 && bytes.Compare(keys[pos-1], key) >= 0) || (pos < len(keys) && bytes.Compare(key, keys[pos]) >= 0) {
+		return nil, InvalidPageID, fmt.Errorf("split separator %q is out of parent order", key)
+	}
 
-	SetPageCRC(buf)
-	bt.pager.UnpinPage(parentID)
-	return bt.pager.WritePage(txID, parentID, buf)
+	keys = append(keys, nil)
+	copy(keys[pos+1:], keys[pos:])
+	keys[pos] = key
+	children = append(children, InvalidPageID)
+	copy(children[pos+2:], children[pos+1:])
+	children[pos+1] = rightID
+
+	entries := make([]InternalEntry, len(keys))
+	for i := range keys {
+		entries[i] = InternalEntry{ChildID: children[i], Key: keys[i]}
+	}
+	return entries, children[len(children)-1], nil
+}
+
+func buildInternalPage(bp *BTreePage, entries []InternalEntry, rightChild PageID) error {
+	for _, entry := range entries {
+		if err := bp.InsertInternalEntry(entry); err != nil {
+			return err
+		}
+	}
+	bp.SetRightChild(rightChild)
+	return nil
 }
 
 // splitInternal handles inserting a new separator into an internal page
@@ -350,112 +442,29 @@ func (bt *BTree) insertIntoParent(txID TxID, path []PageID, leftID PageID, key [
 // midpoint into a reused left page (parentID) and a freshly allocated right
 // page, and pushes the middle key one level up via a recursive
 // insertIntoParent call — the standard B+tree internal-split algorithm.
-func (bt *BTree) splitInternal(txID TxID, path []PageID, leftChildID PageID, key []byte, rightChildID PageID) error {
+func (bt *BTree) splitInternal(txID TxID, path []PageID, entries []InternalEntry, rightChild PageID) error {
 	parentID := path[len(path)-1]
-	buf, err := bt.pager.ReadPage(parentID)
+	mid, err := bt.internalSplitIndex(entries)
 	if err != nil {
 		return err
 	}
-	bp := WrapBTreePage(buf)
-
-	// Collect all entries + new entry.
-	entries := bp.GetAllInternalEntries()
-	oldRight := bp.RightChild()
-
-	// Insert new entry in sorted order.
-	newEntry := InternalEntry{ChildID: leftChildID, Key: key}
-	merged := make([]InternalEntry, 0, len(entries)+1)
-	inserted := false
-	for _, e := range entries {
-		if !inserted && bytes.Compare(key, e.Key) < 0 {
-			merged = append(merged, newEntry)
-			inserted = true
-		}
-		merged = append(merged, e)
-	}
-	if !inserted {
-		merged = append(merged, newEntry)
-	}
-
-	// Split: left gets [0..mid-1], pushUpKey = merged[mid].Key, right gets [mid+1..].
-	mid := len(merged) / 2
-	pushUpKey := merged[mid].Key
-	leftEntries := merged[:mid]
-	rightEntries := merged[mid+1:]
-	midChildRight := merged[mid].ChildID // this becomes the left part of push-up
+	pushUpKey := entries[mid].Key
+	leftEntries := entries[:mid]
+	rightEntries := entries[mid+1:]
+	leftRightChild := entries[mid].ChildID
 
 	// Rewrite left internal (reuse parentID).
 	leftBuf := make([]byte, bt.pager.pageSize)
 	leftBP := InitBTreePage(leftBuf, parentID, false)
-	for _, e := range leftEntries {
-		if err := leftBP.InsertInternalEntry(e); err != nil {
-			return fmt.Errorf("split internal left: %w", err)
-		}
-	}
-	// Exactly one of three cases determines where rightChildID (the new
-	// right half from the child split) ends up, based on where the new
-	// separator key landed relative to the split point mid:
-	//   1. key == pushUpKey: key itself became the separator pushed up to
-	//      the grandparent, so leftChildID becomes the left page's
-	//      RightChild, and rightChildID becomes the right page's first
-	//      entry's ChildID (both "sides" of the pushed-up key).
-	//   2. key landed in leftEntries: the left page's RightChild — which
-	//      would otherwise be midChildRight, the old pointer at the split
-	//      boundary — is redirected to rightChildID, since rightChildID is
-	//      now the correct pointer immediately right of key.
-	//   3. key landed in rightEntries: same "right of key" fixup as
-	//      insertIntoParent above, just applied to the newly-allocated
-	//      right internal page instead of an existing one.
-	foundInLeft := false
-	for _, e := range leftEntries {
-		if bytes.Equal(e.Key, key) {
-			foundInLeft = true
-			break
-		}
-	}
-	if bytes.Equal(pushUpKey, key) {
-		// The new key IS the push-up key.
-		leftBP.SetRightChild(leftChildID)
-		// Right side starts with rightChildID.
-		if len(rightEntries) > 0 {
-			rightEntries[0] = InternalEntry{ChildID: rightChildID, Key: rightEntries[0].Key}
-		}
-	} else if foundInLeft {
-		leftBP.SetRightChild(rightChildID)
-	} else {
-		leftBP.SetRightChild(midChildRight)
+	if err := buildInternalPage(leftBP, leftEntries, leftRightChild); err != nil {
+		return fmt.Errorf("split internal left: %w", err)
 	}
 
 	// Allocate right internal.
 	newRightID, rightBuf := bt.pager.AllocPage()
 	rightInternalBP := InitBTreePage(rightBuf, newRightID, false)
-	for _, e := range rightEntries {
-		if err := rightInternalBP.InsertInternalEntry(e); err != nil {
-			return fmt.Errorf("split internal right: %w", err)
-		}
-	}
-	rightInternalBP.SetRightChild(oldRight)
-
-	// If the new key ended up in the right side, fix child pointers.
-	if !foundInLeft && !bytes.Equal(pushUpKey, key) {
-		// The new entry is in rightEntries; fix rightChildID placement.
-		for i := 0; i < rightInternalBP.slotCount(); i++ {
-			e := rightInternalBP.GetInternalEntry(i)
-			if bytes.Equal(e.Key, key) {
-				if i+1 < rightInternalBP.slotCount() {
-					next := rightInternalBP.GetInternalEntry(i + 1)
-					next.ChildID = rightChildID
-					rec := marshalInternalRecord(next)
-					newEnd := rightInternalBP.freeSpaceEnd() - len(rec)
-					copy(rightInternalBP.buf[newEnd:], rec)
-					rightInternalBP.setFreeSpaceEnd(newEnd)
-					rightInternalBP.setSlotEntry(i+1, SlotEntry{Offset: uint16(newEnd), Length: uint16(len(rec))})
-				} else {
-					rightInternalBP.SetRightChild(rightChildID)
-				}
-				break
-			}
-		}
+	if err := buildInternalPage(rightInternalBP, rightEntries, rightChild); err != nil {
+		return fmt.Errorf("split internal right: %w", err)
 	}
 
 	// Write both pages.
@@ -467,11 +476,46 @@ func (bt *BTree) splitInternal(txID TxID, path []PageID, leftChildID PageID, key
 	if err := bt.pager.WritePage(txID, newRightID, rightBuf); err != nil {
 		return err
 	}
-	bt.pager.UnpinPage(parentID)
 	bt.pager.UnpinPage(newRightID)
 
 	// Push separator up.
 	return bt.insertIntoParent(txID, path[:len(path)-1], parentID, pushUpKey, newRightID)
+}
+
+func (bt *BTree) internalSplitIndex(entries []InternalEntry) (int, error) {
+	if len(entries) < 3 {
+		return 0, fmt.Errorf("cannot split internal page with %d entries", len(entries))
+	}
+	capacity := btreeRecordCapacity(bt.pager.pageSize)
+	total := 0
+	for _, entry := range entries {
+		size := internalRecordFootprint(entry)
+		if size > capacity {
+			return 0, fmt.Errorf("internal record footprint %d exceeds page capacity %d", size, capacity)
+		}
+		total += size
+	}
+
+	leftBytes := 0
+	best, bestSkew := -1, 0
+	for mid := 1; mid < len(entries)-1; mid++ {
+		leftBytes += internalRecordFootprint(entries[mid-1])
+		rightBytes := total - leftBytes - internalRecordFootprint(entries[mid])
+		if leftBytes > capacity || rightBytes > capacity {
+			continue
+		}
+		skew := leftBytes - rightBytes
+		if skew < 0 {
+			skew = -skew
+		}
+		if best == -1 || skew < bestSkew {
+			best, bestSkew = mid, skew
+		}
+	}
+	if best == -1 {
+		return 0, fmt.Errorf("cannot byte-balance %d internal records into %d-byte pages", len(entries), capacity)
+	}
+	return best, nil
 }
 
 func (bt *BTree) createNewRoot(txID TxID, leftID PageID, key []byte, rightID PageID) error {

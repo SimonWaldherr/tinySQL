@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
@@ -103,6 +104,70 @@ func TestTileEndpointFlipsXYZToTMS(t *testing.T) {
 			t.Errorf("%s returned %q, want %q — the XYZ/TMS row flip is wrong",
 				tc.path, got, tc.want)
 		}
+	}
+}
+
+// TestTileEndpointRepeatedRequestsUseCache exercises the tile SQL query cache
+// (daemon.tileQueryCache / executeTileSQL): the same tile URL is requested many
+// times, which is the case that cache is for -- a map viewport re-fetches the
+// same handful of tiles from every client that pans across it. A stale or
+// corrupted cache entry would show up as a wrong or missing tile body on a
+// later request, not just the first one.
+func TestTileEndpointRepeatedRequestsUseCache(t *testing.T) {
+	h := newTileDaemon(t, true)
+	for i := 0; i < 25; i++ {
+		rec := getTile(t, h, "/tiles/world/1/0/0.pbf")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d: status %d, want 200", i, rec.Code)
+		}
+		if got := rec.Body.String(); got != "north-west" {
+			t.Fatalf("request %d: body %q, want %q", i, got, "north-west")
+		}
+	}
+}
+
+// TestTileEndpointConcurrentRequests runs many goroutines against a mix of
+// cached and fresh tile URLs concurrently, so a data race on the shared
+// tileQueryCache or on a cached statement's plan (run with -race) fails the
+// test instead of surfacing later as a production heisenbug.
+func TestTileEndpointConcurrentRequests(t *testing.T) {
+	h := newTileDaemon(t, true)
+	paths := []struct {
+		path string
+		want string
+	}{
+		{"/tiles/world/1/0/0.pbf", "north-west"},
+		{"/tiles/world/1/1/0.pbf", "north-east"},
+		{"/tiles/world/1/0/1.pbf", "south-west"},
+		{"/tiles/world/1/1/1.pbf", "south-east"},
+		{"/tiles/world/0/0/0.pbf", "world"},
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan string, len(paths)*20)
+	for i := 0; i < 20; i++ {
+		for _, tc := range paths {
+			wg.Add(1)
+			go func(tc struct {
+				path string
+				want string
+			}) {
+				defer wg.Done()
+				rec := getTile(t, h, tc.path)
+				if rec.Code != http.StatusOK {
+					errs <- fmt.Sprintf("%s: status %d, want 200", tc.path, rec.Code)
+					return
+				}
+				if got := rec.Body.String(); got != tc.want {
+					errs <- fmt.Sprintf("%s: body %q, want %q", tc.path, got, tc.want)
+				}
+			}(tc)
+		}
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
 	}
 }
 

@@ -251,6 +251,12 @@ MBTiles is a SQLite database with a prescribed schema, so tinySQL treats a
 tileset as an ordinary table plus the addressing functions and transport that
 make it usable as a map.
 
+**See it live:** the [MBTiles demo](https://simonwaldherr.github.io/tinySQL/tiles-demo.html)
+is a map whose every tile is one SQL query, run by tinySQL compiled to
+WebAssembly, right in the browser tab — no tile server. The sidebar shows the
+exact SQL for each tile fetch, and a click runs `TILE_ZXY`/`TILE_QUADKEY`/
+`TILE_BBOX` for that point (source: [`cmd/mbtilesdemo`](./cmd/mbtilesdemo)).
+
 **The row convention.** Web clients and `/{z}/{x}/{y}.png` URLs count tile rows
 from the top (XYZ); the MBTiles specification stores them counted from the
 bottom (TMS). They differ by `2^zoom - 1 - y`, and getting it wrong yields a
@@ -315,6 +321,15 @@ Content-Type and Content-Encoding follow the tileset's `format` metadata, so
 The endpoint is **unauthenticated by design** — a browser cannot attach a bearer
 token to a map-tile request — so it is off unless `-tiles` is passed. Put a
 proxy in front for referer/IP restrictions or signed URLs.
+
+Every tile route runs through a bounded query cache keyed by the exact SQL a
+request builds, so a tile that has already been served once reuses its parsed
+statement and access-plan shape instead of paying a fresh parse per request —
+the common case, since a map viewport is a handful of tiles re-fetched by every
+client that pans across it. Measured on the same machine as the benchmarks
+above, a repeat tile lookup drops from 3085 ns/op (65 allocs) to 568 ns/op (6
+allocs) — see `BenchmarkTileLookupCached` in
+[cmd/tinysqld/tiles_benchmark_test.go](./cmd/tinysqld/tiles_benchmark_test.go).
 
 For a tileset **larger than memory**, use `-storage paged_index`: an immutable
 page store whose tile lookup resolves a B+Tree and materializes only the located

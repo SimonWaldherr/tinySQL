@@ -30,7 +30,7 @@ QUERY_FILES_WASM_SCRIPT := $(QUERY_FILES_WASM_DIR)/build.sh
 GH_PAGES_BRANCH ?= gh-pages
 GH_PAGES_WORKTREE ?= .gh-pages-worktree
 GH_PAGES_COMMIT_MESSAGE ?= Update gh-pages demo
-GH_PAGES_DEMO_FILES := index.html app.js query_files.wasm query_files.wasm.gz wasm_exec.js
+GH_PAGES_DEMO_FILES := index.html app.js query_files.wasm query_files.wasm.gz wasm_exec.js tiles-demo.html tiles-demo.js tiles-demo-data.js demo.mbtiles
 
 # Color output
 GREEN := \033[0;32m
@@ -150,8 +150,15 @@ check-gh-pages-demo:
 		fi; \
 	done
 	@if command -v gzip >/dev/null 2>&1; then gzip -t "$(QUERY_FILES_WASM_DIR)/query_files.wasm.gz"; fi
-	@if command -v node >/dev/null 2>&1; then node --check "$(QUERY_FILES_WASM_DIR)/app.js"; else echo "$(YELLOW)node not installed; skipping JavaScript syntax check$(NC)"; fi
-	@if command -v xmllint >/dev/null 2>&1; then xmllint --html --noout "$(QUERY_FILES_WASM_DIR)/index.html"; else echo "$(YELLOW)xmllint not installed; skipping HTML validation$(NC)"; fi
+	@if command -v node >/dev/null 2>&1; then \
+		node --check "$(QUERY_FILES_WASM_DIR)/app.js"; \
+		node --check "$(QUERY_FILES_WASM_DIR)/tiles-demo.js"; \
+		node --check "$(QUERY_FILES_WASM_DIR)/tiles-demo-data.js"; \
+	else echo "$(YELLOW)node not installed; skipping JavaScript syntax check$(NC)"; fi
+	@if command -v xmllint >/dev/null 2>&1; then \
+		xmllint --html --noout "$(QUERY_FILES_WASM_DIR)/index.html"; \
+		xmllint --html --noout "$(QUERY_FILES_WASM_DIR)/tiles-demo.html"; \
+	else echo "$(YELLOW)xmllint not installed; skipping HTML validation$(NC)"; fi
 
 ## update-gh-pages: Build demo, safely sync changed assets into gh-pages, and commit them
 update-gh-pages: build-gh-pages-demo

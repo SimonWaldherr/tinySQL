@@ -893,6 +893,43 @@ Profiling what remains shows the lookup itself is no longer the cost: SQL lexing
 dominate. Those are shared with every other query shape rather than specific to
 tiles, and are where further tile-serving work should go.
 
+### `tinysqld -tiles`: caching the HTTP layer's own SQL, not just the index seek
+
+The measurements above go through `database/sql` with a prepared statement and
+bound `?` parameters, so the SQL is lexed and planned exactly once no matter how
+many tiles are fetched. `cmd/tinysqld`'s `/tiles/` HTTP handler did not have
+that luxury: tinySQL's public `Execute` takes no bind parameters, so each
+request built a literal SQL string with `fmt.Sprintf` (tile coordinates already
+validated and range-checked, so this carries no injection risk) and called
+`tinysql.ParseSQL` fresh, every time — paying full lexing and parsing on every
+tile a browser ever requested, including tiles it had already served.
+
+A map viewport is a handful of tiles re-fetched by every client that pans
+across it, so most of that parsing was repeated on SQL text the daemon had
+already seen. `executeTileSQL` (`cmd/tinysqld/http.go`) runs the three
+tile-serving queries — the tile lookup, its metadata row, and the observed
+zoom range — through a bounded `tinysql.QueryCache` (`tinysql.Compile` /
+`tinysql.ExecuteCompiled`) keyed by that exact literal SQL text instead of
+`tinysql.ParseSQL`. A tile requested for the second time reuses its parsed
+statement and the access-plan shape cached on that statement's AST node, the
+same mechanism `Compile`/`ExecuteCompiled` document for any repeated query.
+
+| Tile lookup, in-process (`cmd/tinysqld`) | before (`ParseSQL` per request) | after (`executeTileSQL`, warm) |
+|---|---|---|
+| latency | 3085 ns/op | **568 ns/op (5.4x)** |
+| allocations | 65 allocs/op, 3568 B/op | 6 allocs/op, 736 B/op |
+
+```sh
+go test ./cmd/tinysqld -run '^$' -bench TileLookup -benchmem -count 3
+```
+
+See `BenchmarkTileLookupUncached`/`BenchmarkTileLookupCached` in
+[cmd/tinysqld/tiles_benchmark_test.go](./cmd/tinysqld/tiles_benchmark_test.go).
+The cache is bounded (LRU, 4,096 entries), so a crawler requesting an unbounded
+stream of distinct tile coordinates evicts cold entries rather than growing
+without limit; it does not change results, since a cached statement re-reads
+the live table on every execution and only the parsed shape is memoized.
+
 This benchmark was also what exposed the scale of the effect. Note the iteration
 count: at `-benchtime=200x` tinySQL measured 15-19 µs against SQLite's 8-10 µs,
 because statement-cache warm-up had not amortized. Only at 3000x does either

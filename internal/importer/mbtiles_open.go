@@ -112,12 +112,8 @@ func OpenMBTiles(
 	batchSize := 1000
 	appendOpts := &ImportOptions{CreateTable: false, Truncate: false}
 	applyDefaults(appendOpts)
-	appendOpts.CreateTable = false
-	appendOpts.Truncate = false
 	batchOpts := &ImportOptions{CreateTable: true, Truncate: true}
 	applyDefaults(batchOpts)
-	batchOpts.CreateTable = true
-	batchOpts.Truncate = true
 
 	rows := make([][]any, 0, batchSize)
 	current := batchOpts
