@@ -110,10 +110,16 @@ func OpenMBTiles(
 	}
 
 	batchSize := 1000
+	// Not applyDefaults(appendOpts): its CreateTable heuristic ("enable it
+	// when neither CreateTable nor Truncate is explicitly set") cannot tell
+	// this struct's explicit false apart from an unset field, and would flip
+	// CreateTable back to true here -- which is exactly what appendOpts
+	// exists to say "no" to for every batch after the first. See the same
+	// reasoning in insertTypedRows (geodata_helpers.go), which no longer
+	// calls applyDefaults for this reason. BatchSize needs no default here:
+	// insertTypedRows supplies its own when unset.
 	appendOpts := &ImportOptions{CreateTable: false, Truncate: false}
-	applyDefaults(appendOpts)
 	batchOpts := &ImportOptions{CreateTable: true, Truncate: true}
-	applyDefaults(batchOpts)
 
 	rows := make([][]any, 0, batchSize)
 	current := batchOpts

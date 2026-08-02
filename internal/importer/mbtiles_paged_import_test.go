@@ -284,3 +284,42 @@ func TestExportMBTilesStreamsFromPagedIndex(t *testing.T) {
 		}
 	}
 }
+
+// TestOpenMBTilesPagedIndexManyBatches exercises OpenMBTiles's own batching
+// (mbtiles_open.go), which builds its own appendOpts rather than going
+// through ImportMBTiles -- and, before this fix, called applyDefaults on it
+// directly, which flipped CreateTable back to true on every batch for the
+// same reason described on insertTypedRows. A small batch size against a
+// tileset with many more rows than one batch is what makes that regression
+// visible: every batch after the first would force a full-table reload.
+func TestOpenMBTilesPagedIndexManyBatches(t *testing.T) {
+	ctx := context.Background()
+	const n = 6_000
+
+	srcPath := filepath.Join(t.TempDir(), "src.mbtiles")
+	seedMBTilesN(t, srcPath, n)
+
+	dir := filepath.Join(t.TempDir(), "dst")
+	db := openPagedIndexDB(t, dir, false)
+
+	res, err := OpenMBTiles(ctx, db, "default", srcPath, &OpenMBTilesOptions{})
+	if err != nil {
+		t.Fatalf("open in place: %v", err)
+	}
+	if res.TilesExposed != n {
+		t.Fatalf("TilesExposed = %d, want %d", res.TilesExposed, n)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	ro := openPagedIndexDB(t, dir, true)
+	defer ro.Close()
+	table, err := ro.Get("default", "tiles")
+	if err != nil {
+		t.Fatalf("get tiles: %v", err)
+	}
+	if len(table.Rows) != n {
+		t.Fatalf("full scan: %d rows, want %d", len(table.Rows), n)
+	}
+}
