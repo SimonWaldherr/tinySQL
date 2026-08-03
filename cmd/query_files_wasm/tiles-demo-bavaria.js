@@ -163,6 +163,11 @@ function registerTinySQLProtocol() {
 function buildStyle() {
     return {
         version: 8,
+        // MapLibre rejects a style outright -- every layer, not just the
+        // labels -- if any layer's layout uses "text-field" without a
+        // top-level "glyphs" template to fetch the label font from. The
+        // 'places' layer below needs this to render at all.
+        glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
         sources: {
             osm: {
                 type: 'vector',
