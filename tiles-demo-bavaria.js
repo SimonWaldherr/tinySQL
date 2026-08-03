@@ -7,11 +7,11 @@
 // .github/workflows/bavaria-mbtiles.yml for how this tileset is built.
 'use strict';
 
-// Published by .github/workflows/bavaria-mbtiles.yml to a rolling release
-// tag, not committed to the repository: a real district's tiles run to
-// several MB, which would otherwise bloat git history on every rebuild (see
-// that workflow file's own comment on this).
-const SNAPSHOT_URL = 'https://github.com/SimonWaldherr/tinySQL/releases/download/bavaria-demo-latest/snapshot.b64';
+// Published by .github/workflows/bavaria-mbtiles.yml directly into the
+// gh-pages branch, rather than fetched from a GitHub Release at runtime.
+// Release downloads redirect to a storage host without CORS headers, while
+// this relative URL is served from the page's own origin.
+const SNAPSHOT_URL = 'bavaria-snapshot.b64';
 
 // Generous approximation of the Landkreis Dingolfing-Landau bounding box --
 // see the same constant's comment in scripts/build-bavaria-tiles.sh for why
@@ -279,7 +279,7 @@ async function main() {
         snapshotText = (await response.text()).trim();
     } catch (error) {
         setStatus(
-            'Failed to fetch the tileset (' + error.message + '). ' +
+            'Failed to fetch the same-origin tileset snapshot (' + error.message + '). ' +
             'It is published by a monthly GitHub Actions job and may not exist yet on a fresh fork — see .github/workflows/bavaria-mbtiles.yml.',
             'error'
         );
