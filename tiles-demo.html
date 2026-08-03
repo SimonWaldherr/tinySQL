@@ -31,7 +31,6 @@
         .topbar.collapsed { padding: 4px 12px; }
         .topbar.collapsed h1, .topbar.collapsed .topbar-badge { display: none; }
         .expand-btn {
-            margin-left: auto;
             border: 1px solid #3e3e42;
             border-radius: 999px;
             background: #2d2d30;
@@ -42,7 +41,7 @@
             white-space: nowrap;
         }
         .expand-btn:hover { background: #0e639c; color: #fff; }
-        .topbar.collapsed .expand-btn { margin-left: 8px; }
+        .topbar.collapsed .expand-btn { margin-left: auto; }
         .brand-link {
             font-size: 16px;
             font-weight: 600;
@@ -73,8 +72,9 @@
         }
         .layout {
             display: flex;
-            height: calc(100% - 48px);
+            height: calc(100% - var(--topbar-h, 48px));
         }
+        .sidebar.collapsed { display: none; }
         #map {
             flex: 1 1 auto;
             background: #0b1622;
@@ -247,18 +247,27 @@
         .toggle-row { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #c7d0da; }
         .toggle-row input { accent-color: #0e639c; }
         #editorHint { font-size: 11px; color: #7a8291; margin-top: 4px; }
+
+        /* Terrain editor: sculpt tools painted onto tiles via terrain_edits. */
+        button.op-button.terrain-tool[data-terrain-tool="mountain"].active { background: #8a6d3b; border-color: #a9834c; }
+        button.op-button.terrain-tool[data-terrain-tool="dig"].active,
+        button.op-button.terrain-tool[data-terrain-tool="river"].active { background: #1f7096; border-color: #2a8bb8; }
+        #terrainHint { font-size: 11px; color: #7a8291; margin-top: 6px; }
+        .terrain-radius-row { display: flex; align-items: center; gap: 8px; font-size: 11px; color: #9ca7b8; margin-top: 8px; }
+        .terrain-radius-row input[type="range"] { flex: 1 1 auto; accent-color: #0e639c; }
     </style>
 </head>
 <body>
-    <div class="topbar">
+    <div class="topbar" id="topbar">
         <a class="brand-link" href="index.html">tinySQL</a>
         <h1>MBTiles demo — every tile is a SQL row</h1>
         <span class="topbar-badge">WASM · runs entirely in this tab</span>
+        <button class="expand-btn" id="expandBtn" onclick="toggleMapExpanded()">⤢ Expand map</button>
     </div>
     <div id="contextMenu"></div>
     <div class="layout">
         <div id="map"></div>
-        <div class="sidebar">
+        <div class="sidebar" id="sidebar">
             <div class="panel">
                 <h2>How this map is served</h2>
                 <p>There is no tile server here. tinySQL, compiled to WebAssembly, holds one <code class="mono">tiles</code> table (<code class="mono">zoom_level, tile_column, tile_row, tile_data</code>) and every tile the map draws is the result of one query, run in this tab:</p>
@@ -291,6 +300,22 @@
                 <p>Place your own named markers with a real <code class="mono">INSERT INTO custom_markers</code>; right-click one to <code class="mono">DELETE</code> it. A small foundation for building something game-like on top of this map.</p>
                 <label class="toggle-row"><input type="checkbox" id="editorModeToggle" onchange="setEditorMode(this.checked)"> Enable editor mode</label>
                 <div id="editorHint">Off — clicking the map explores a point as usual.</div>
+            </div>
+
+            <div class="panel">
+                <h2>Terrain editor <span id="terrainEditCount" style="color:#7a8291;font-weight:normal;">0</span> edits</h2>
+                <p>Sculpt the generated terrain with a real <code class="mono">terrain_edits</code> table — each brush stroke is one <code class="mono">INSERT</code>; tiles re-query and re-composite it live as you pan and zoom.</p>
+                <div class="btn-row">
+                    <button class="op-button terrain-tool" data-terrain-tool="mountain" onclick="setTerrainTool('mountain')">⛰ Mountain</button>
+                    <button class="op-button terrain-tool" data-terrain-tool="dig" onclick="setTerrainTool('dig')">⛏ Dig</button>
+                    <button class="op-button terrain-tool" data-terrain-tool="river" onclick="setTerrainTool('river')">〜 River (drag)</button>
+                    <button class="op-button" onclick="clearTerrainEdits()">Clear all</button>
+                </div>
+                <div class="terrain-radius-row">
+                    <span>Brush size</span>
+                    <input type="range" id="terrainRadius" min="1" max="10" value="4" step="1" oninput="setTerrainRadius(this.value)">
+                </div>
+                <div id="terrainHint">No tool selected — pick Mountain, Dig or River, then click (or drag, for River) the map.</div>
             </div>
 
             <div class="panel">

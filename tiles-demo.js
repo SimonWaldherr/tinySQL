@@ -10,7 +10,7 @@ const MAX_ZOOM = 4;
 const seenSQL = new Set();
 const stats = { rendered: 0, repeats: 0, totalMs: 0, queries: 0 };
 let wasmReady = false;
-let map, boundsLayer;
+let map, boundsLayer, tileLayer;
 let settlementMarkers = new Map(); // name -> L.CircleMarker
 let selectedSettlements = []; // up to 2 settlement names, in click order
 let routeLayer = null, midpointMarker = null;
@@ -19,6 +19,28 @@ let shapeBoundsLayer = null, shapeCentroidMarker = null;
 let uploadedShape = null, lastShapeGeometry = null, lastShapeName = 'shape';
 let editorMode = false;
 let customMarkers = new Map(); // name -> L.Marker
+let terrainTool = null; // null | 'mountain' | 'dig' | 'river'
+let terrainEdits = []; // cached rows from terrain_edits: {u, v, radius, delta, kind}
+let terrainRadius = 0.04; // brush radius in the same [0,1) world-space units as u/v
+let isPaintingRiver = false;
+let lastRiverScreenPoint = null;
+let mapExpanded = false;
+
+// uForLon/vForLat convert real longitude/latitude back into the continuous
+// [0,1) world-space coordinates the tile generator sampled noise at -- the
+// exact inverse of lonForU/latForV in cmd/mbtilesdemo/settlements.go -- so a
+// brush stroke placed at a clicked lat/lng lands on the same world-space
+// point the terrain pixel under it was generated from.
+function uForLon(lon) {
+    return (((lon + 180) % 360 + 360) % 360) / 360;
+}
+
+function vForLat(lat) {
+    const latRad = lat * Math.PI / 180;
+    const x = Math.tan(latRad);
+    const asinh = Math.log(x + Math.sqrt(x * x + 1));
+    return (1 - asinh / Math.PI) / 2;
+}
 
 function setStatus(text, ready) {
     document.getElementById('statusText').textContent = text;
@@ -92,17 +114,64 @@ function wrapTileX(x, z) {
     return ((x % n) + n) % n;
 }
 
+// paintTerrainEdits composites cached terrain_edits rows (see the "Terrain
+// editor" panel) onto a tile's canvas as soft radial brushes -- mountains as
+// a pale rocky/snow highlight, digs and rivers as a blue water tint. Edits
+// are stored in the same continuous [0,1) world-space u/v the base tileset
+// was generated in (uForLon/vForLat), so they stay correctly positioned
+// across zoom levels without re-deriving pixel coordinates per level.
+function paintTerrainEdits(ctx, z, x, y) {
+    if (!terrainEdits.length) return;
+    const n = 1 << z;
+    const u0 = x / n, u1 = (x + 1) / n;
+    const v0 = y / n, v1 = (y + 1) / n;
+    for (const edit of terrainEdits) {
+        // Also test the horizontal world-wrap neighbors so a brush painted
+        // near the antimeridian still shows on tiles that wrap to the other
+        // side of it.
+        for (const du of [-1, 0, 1]) {
+            const eu = edit.u + du;
+            if (eu + edit.radius < u0 || eu - edit.radius > u1) continue;
+            if (edit.v + edit.radius < v0 || edit.v - edit.radius > v1) continue;
+            const px = (eu - u0) / (u1 - u0) * 256;
+            const py = (edit.v - v0) / (v1 - v0) * 256;
+            const pr = edit.radius / (u1 - u0) * 256;
+            drawTerrainBrush(ctx, px, py, pr, edit.delta);
+        }
+    }
+}
+
+function drawTerrainBrush(ctx, px, py, pr, delta) {
+    if (pr <= 0) return;
+    const gradient = ctx.createRadialGradient(px, py, 0, px, py, pr);
+    if (delta < 0) {
+        gradient.addColorStop(0, 'rgba(24,70,120,0.95)');
+        gradient.addColorStop(0.7, 'rgba(31,112,150,0.55)');
+        gradient.addColorStop(1, 'rgba(31,112,150,0)');
+    } else {
+        gradient.addColorStop(0, 'rgba(238,238,238,0.95)');
+        gradient.addColorStop(0.45, 'rgba(150,145,140,0.8)');
+        gradient.addColorStop(1, 'rgba(150,145,140,0)');
+    }
+    ctx.fillStyle = gradient;
+    ctx.beginPath();
+    ctx.arc(px, py, pr, 0, Math.PI * 2);
+    ctx.fill();
+}
+
 const TinySQLTileLayer = L.GridLayer.extend({
-    createTile: function (coords) {
-        const tile = document.createElement('img');
-        tile.width = 256;
-        tile.height = 256;
-        tile.alt = '';
+    // createTile is async (takes `done`) because the base tile has to decode
+    // as an <img> before it can be drawn onto the canvas terrain_edits are
+    // composited onto -- see https://leafletjs.com/reference.html#gridlayer-createtile.
+    createTile: function (coords, done) {
+        const canvas = document.createElement('canvas');
+        canvas.width = 256;
+        canvas.height = 256;
 
         const n = 1 << coords.z;
         if (coords.y < 0 || coords.y >= n) {
-            tile.src = 'data:image/png;base64,' + TRANSPARENT_PNG;
-            return tile;
+            done(null, canvas);
+            return canvas;
         }
         const x = wrapTileX(coords.x, coords.z);
         const sql =
@@ -110,12 +179,20 @@ const TinySQLTileLayer = L.GridLayer.extend({
             ' AND tile_column = ' + x +
             ' AND tile_row = TILE_FLIP_Y(' + coords.y + ', ' + coords.z + ') LIMIT 1';
         const res = runSQL(sql, { kind: 'tile' });
-        if (res && res.success && res.rows && res.rows.length && res.rows[0].tile_data) {
-            tile.src = 'data:image/png;base64,' + res.rows[0].tile_data;
-        } else {
-            tile.src = 'data:image/png;base64,' + TRANSPARENT_PNG;
-        }
-        return tile;
+        const base64 = (res && res.success && res.rows && res.rows.length && res.rows[0].tile_data) || TRANSPARENT_PNG;
+
+        const img = new Image();
+        img.onload = function () {
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, 256, 256);
+            paintTerrainEdits(ctx, coords.z, x, coords.y);
+            done(null, canvas);
+        };
+        img.onerror = function () {
+            done(new Error('tile image failed to decode'), canvas);
+        };
+        img.src = 'data:image/png;base64,' + base64;
+        return canvas;
     },
 });
 
@@ -131,7 +208,7 @@ function initMap() {
         attributionControl: false,
         zoomControl: true,
     });
-    new TinySQLTileLayer({
+    tileLayer = new TinySQLTileLayer({
         tileSize: 256,
         minZoom: 0,
         maxZoom: MAX_ZOOM,
@@ -143,6 +220,19 @@ function initMap() {
 
     map.on('click', onMapClick);
     map.on('contextmenu', onMapContextMenu);
+    initTerrainDrawing();
+}
+
+// toggleMapExpanded frees up both axes for the map: it hides the sidebar
+// (more width) and collapses the topbar to a slim strip (more height), then
+// tells Leaflet to recompute its container size, since CSS alone doesn't
+// trigger that.
+function toggleMapExpanded() {
+    mapExpanded = !mapExpanded;
+    document.getElementById('sidebar').classList.toggle('collapsed', mapExpanded);
+    document.getElementById('topbar').classList.toggle('collapsed', mapExpanded);
+    document.getElementById('expandBtn').textContent = mapExpanded ? '⤡ Restore layout' : '⤢ Expand map';
+    if (map) setTimeout(() => map.invalidateSize(), 0);
 }
 
 // ── Editor mode: place/remove named markers with real INSERT/DELETE ───────
@@ -223,6 +313,115 @@ function removeCustomMarker(name) {
     const marker = customMarkers.get(name);
     if (marker) map.removeLayer(marker);
     customMarkers.delete(name);
+}
+
+// ── Terrain editor: dig, raise mountains, carve rivers ─────────────────────
+//
+// A `terrain_edits` table alongside `tiles`: one row per brush stroke, in
+// the same continuous [0,1) world-space u/v the base tileset's noise field
+// was sampled at (see uForLon/vForLat above). TinySQLTileLayer.createTile
+// re-queries the cached rows and composites them onto every visible tile, so
+// a stroke shows up immediately across every zoom level, not just the one
+// it was drawn at.
+
+function ensureTerrainEditsTable() {
+    runSQL('CREATE TABLE IF NOT EXISTS terrain_edits (u FLOAT64, v FLOAT64, radius FLOAT64, delta FLOAT64, kind TEXT)', { kind: 'terrain' });
+}
+
+function refreshTerrainEdits() {
+    const res = runSQL('SELECT u, v, radius, delta, kind FROM terrain_edits', { kind: 'terrain' });
+    terrainEdits = (res && res.success && res.rows) || [];
+    document.getElementById('terrainEditCount').textContent = String(terrainEdits.length);
+}
+
+function redrawTiles() {
+    if (tileLayer) tileLayer.redraw();
+}
+
+function setTerrainTool(tool) {
+    terrainTool = (terrainTool === tool) ? null : tool;
+    document.querySelectorAll('[data-terrain-tool]').forEach((btn) => {
+        btn.classList.toggle('active', btn.dataset.terrainTool === terrainTool);
+    });
+    const hint = document.getElementById('terrainHint');
+    if (!terrainTool) {
+        hint.textContent = 'No tool selected — pick Mountain, Dig or River, then click (or drag, for River) the map.';
+    } else if (terrainTool === 'river') {
+        hint.textContent = 'River — click and drag across the map to carve a channel. Editor mode and point-explore are paused while a tool is active.';
+    } else {
+        hint.textContent = (terrainTool === 'mountain' ? 'Mountain' : 'Dig') + ' — click the map to paint. Editor mode and point-explore are paused while a tool is active.';
+    }
+}
+
+function setTerrainRadius(sliderValue) {
+    // The slider is a small integer (1-10) for a friendly UI; map it onto the
+    // actual [0,1) world-space brush radius terrain_edits stores.
+    terrainRadius = Number(sliderValue) * 0.01;
+}
+
+function insertTerrainEdit(lat, lng, radius, delta, kind) {
+    const sql =
+        'INSERT INTO terrain_edits VALUES (' + uForLon(lng) + ', ' + vForLat(lat) + ', ' +
+        radius + ', ' + delta + ', ' + quoteSQL(kind) + ')';
+    runSQL(sql, { kind: 'terrain' });
+}
+
+function paintTerrainAt(lat, lng) {
+    const delta = terrainTool === 'mountain' ? 0.6 : -0.6;
+    insertTerrainEdit(lat, lng, terrainRadius, delta, terrainTool);
+    refreshTerrainEdits();
+    redrawTiles();
+}
+
+function clearTerrainEdits() {
+    runSQL('DELETE FROM terrain_edits', { kind: 'terrain' });
+    refreshTerrainEdits();
+    redrawTiles();
+}
+
+// initTerrainDrawing wires a click-and-drag "River" stroke: it disables map
+// panning for the duration of the drag (otherwise Leaflet would just pan the
+// map instead of letting the user draw), inserts one small water-colored
+// edit every few screen pixels of movement, then re-enables panning and
+// redraws once on mouseup rather than after every point.
+function initTerrainDrawing() {
+    map.on('mousedown', (e) => {
+        if (terrainTool !== 'river') return;
+        isPaintingRiver = true;
+        lastRiverScreenPoint = null;
+        map.dragging.disable();
+        paintRiverPoint(e.latlng);
+        L.DomEvent.preventDefault(e.originalEvent);
+    });
+    map.on('mousemove', (e) => {
+        if (!isPaintingRiver) return;
+        paintRiverPoint(e.latlng);
+    });
+    const stopPaintingRiver = () => {
+        if (!isPaintingRiver) return;
+        isPaintingRiver = false;
+        map.dragging.enable();
+        refreshTerrainEdits();
+        redrawTiles();
+    };
+    map.on('mouseup', stopPaintingRiver);
+    map.getContainer().addEventListener('mouseleave', stopPaintingRiver);
+}
+
+let riverPointsSinceRedraw = 0;
+
+function paintRiverPoint(latlng) {
+    const pt = map.latLngToContainerPoint(latlng);
+    if (lastRiverScreenPoint && pt.distanceTo(lastRiverScreenPoint) < 8) return;
+    lastRiverScreenPoint = pt;
+    insertTerrainEdit(latlng.lat, latlng.lng, terrainRadius * 0.6, -0.4, 'river');
+    // Redraw every few points for feedback while dragging, without paying
+    // the cost of a full tile re-query on every single mousemove.
+    if (++riverPointsSinceRedraw >= 3) {
+        riverPointsSinceRedraw = 0;
+        refreshTerrainEdits();
+        redrawTiles();
+    }
 }
 
 // ── Right-click context menu ───────────────────────────────────────────────
@@ -573,6 +772,14 @@ function downloadShapeResult() {
 function onMapClick(e, forceExplore) {
     const lat = e.latlng.lat;
     const lng = ((e.latlng.lng + 180) % 360 + 360) % 360 - 180;
+    if (terrainTool && !forceExplore) {
+        // River strokes are already handled by the mousedown/mousemove/
+        // mouseup drag handlers in initTerrainDrawing; a plain click still
+        // reaches here afterwards; just swallow it so it doesn't also fall
+        // through to point-explore or marker placement below.
+        if (terrainTool !== 'river') paintTerrainAt(lat, lng);
+        return;
+    }
     if (editorMode && !forceExplore) {
         addCustomMarker(lat, lng);
         return;
@@ -705,6 +912,8 @@ async function main() {
     loadSettlements();
     ensureCustomMarkersTable();
     loadCustomMarkers();
+    ensureTerrainEditsTable();
+    refreshTerrainEdits();
     runShapeOperation('original');
     setStatus('Ready — pan and zoom, measure settlements, or edit a shape', true);
 }
