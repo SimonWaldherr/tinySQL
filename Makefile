@@ -155,10 +155,20 @@ check-gh-pages-demo:
 		node --check "$(QUERY_FILES_WASM_DIR)/tiles-demo.js"; \
 		node --check "$(QUERY_FILES_WASM_DIR)/tiles-demo-data.js"; \
 	else echo "$(YELLOW)node not installed; skipping JavaScript syntax check$(NC)"; fi
-	@if command -v xmllint >/dev/null 2>&1; then \
-		xmllint --html --noout "$(QUERY_FILES_WASM_DIR)/index.html"; \
-		xmllint --html --noout "$(QUERY_FILES_WASM_DIR)/tiles-demo.html"; \
-	else echo "$(YELLOW)xmllint not installed; skipping HTML validation$(NC)"; fi
+	@if command -v tidy >/dev/null 2>&1; then \
+		validate_html() { \
+			output="$$(mktemp /tmp/tinysql-html.XXXXXX)" || return 1; \
+			tidy -q -e "$$1" >"$$output" 2>&1 || true; \
+			if grep -qi 'Error:' "$$output"; then cat "$$output"; rm -f "$$output"; return 1; fi; \
+			rm -f "$$output"; \
+		}; \
+		validate_html "$(QUERY_FILES_WASM_DIR)/index.html"; \
+		validate_html "$(QUERY_FILES_WASM_DIR)/tiles-demo.html"; \
+	elif command -v xmllint >/dev/null 2>&1; then \
+		echo "$(YELLOW)HTML Tidy not installed; using xmllint's legacy HTML parser for a basic parse check$(NC)"; \
+		xmllint --html --noout "$(QUERY_FILES_WASM_DIR)/index.html" 2>/dev/null; \
+		xmllint --html --noout "$(QUERY_FILES_WASM_DIR)/tiles-demo.html" 2>/dev/null; \
+	else echo "$(YELLOW)HTML validator not installed; skipping HTML validation$(NC)"; fi
 
 ## update-gh-pages: Build demo, safely sync changed assets into gh-pages, and commit them
 update-gh-pages: build-gh-pages-demo
