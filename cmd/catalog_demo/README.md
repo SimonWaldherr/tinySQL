@@ -1,5 +1,8 @@
 # tinySQL Catalog & Scheduler Demo (`catalog_demo`)
 
+Part of [TinySQL](../../README.md). This focused demo complements the root
+guide's SQL and operational overview.
+
 Registers tables, views, and functions in the tinySQL catalog, then schedules
 recurring and one-shot SQL jobs executed by the real tinySQL engine.
 

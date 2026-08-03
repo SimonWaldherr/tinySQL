@@ -1,5 +1,8 @@
 # tinySQL Studio (`studio`)
 
+Part of [TinySQL](../../README.md). See the root guide for engine capabilities,
+imports, persistence, and limitations.
+
 A native desktop GUI for tinySQL built with [Wails](https://wails.io/): write
 and run SQL, import CSV/JSON files, browse the schema and export results,
 backed by an embedded in-memory tinySQL database. Dark theme by default, with a

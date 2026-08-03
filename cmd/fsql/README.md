@@ -1,5 +1,8 @@
 # fsql — Filesystem Query Language
 
+Part of [TinySQL](../../README.md). See the root guide for SQL capabilities and
+the [command index](../README.md) for adjacent tools.
+
 Query the filesystem with SQL. `fsql` exposes file metadata, text file lines,
 CSV rows, and JSON rows as table-valued functions backed by the tinySQL engine.
 It lives in its own Go module (`cmd/fsql/go.mod`) and must be built from its

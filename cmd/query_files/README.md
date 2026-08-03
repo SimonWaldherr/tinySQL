@@ -1,5 +1,8 @@
 # tinySQL File Query Tool
 
+Part of [TinySQL](../../README.md). See the root guide for SQL features,
+import/export behavior, and project limitations.
+
 Query CSV, JSON, and XML files with SQL, either one-shot from the command line
 or in an interactive shell.
 

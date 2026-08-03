@@ -1,5 +1,8 @@
 # tinySQL HTTP / gRPC server (`server`)
 
+Part of [TinySQL](../../README.md). See the root guide for the engine feature
+set and [tinysqld](../tinysqld/README.md) for the durable DBMS profile.
+
 Serves a tinySQL database over HTTP (JSON REST) and gRPC (JSON codec), with
 optional bearer-token auth, TLS, size/timeout limits, trusted proxies, and
 peer-to-peer federation for read fan-out.

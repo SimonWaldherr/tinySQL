@@ -419,6 +419,10 @@ function shapeOperationExpression(operation) {
             ', ' + numeric('affineScale', 0.8) + ', ' + numeric('affineRotate', 18) + ')';
     case 'drop-holes':
         return 'ST_REMOVE_HOLES(geometry)';
+    case 'clean':
+        return 'ST_CLEAN(geometry)';
+    case 'snap':
+        return 'ST_SNAPTOGRID(geometry, ' + numeric('snapGrid', 1) + ')';
     default:
         return 'geometry';
     }
@@ -431,6 +435,8 @@ function shapeOperationLabel(operation) {
         smooth: 'ST_SMOOTH · one Chaikin pass',
         affine: 'ST_AFFINE · shift, scale and rotate',
         'drop-holes': 'ST_REMOVE_HOLES',
+        clean: 'ST_CLEAN · remove repeated vertices and close rings',
+        snap: 'ST_SNAPTOGRID · round to a coordinate grid',
     }[operation] || operation;
 }
 
@@ -465,7 +471,9 @@ function runShapeOperation(operation) {
             ' AS geometry FROM mapshaper_shapes WHERE name = ' + quoteSQL(name);
     const sql =
         'WITH selected AS (' + selectedSourceSQL + ') ' +
-        'SELECT name, kind, description, source_geometry, geometry, ST_BBOX(geometry) AS bbox, ' +
+        'ST_CENTROID(geometry) AS centroid FROM selected';
+        'SELECT name, kind, description, source_geometry, geometry, ST_ISVALID(geometry) AS is_valid, ST_BBOX(geometry) AS bbox, ' +
+        'ST_CENTROID(geometry) AS centroid FROM selected';
         'ST_CENTROID(geometry) AS centroid FROM selected';
     document.getElementById('shapeSQL').textContent = sql;
     const res = runSQL(sql, { kind: 'mapshaper' });
@@ -514,6 +522,7 @@ function runShapeOperation(operation) {
     out.textContent =
         row.name + ' · ' + row.kind + '\n' + row.description + '\n' +
         'operation  ' + shapeOperationLabel(operation) + '\n' +
+        'valid      ' + (row.is_valid ? 'yes' : 'no') + '\n' +
         'bbox       [' + bbox.map((n) => Number(n).toFixed(2)).join(', ') + ']\n' +
         'centroid   ' + Number(centroid.coordinates[1]).toFixed(2) + ', ' + Number(centroid.coordinates[0]).toFixed(2);
 }

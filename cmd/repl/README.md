@@ -1,5 +1,8 @@
 # tinySQL Interactive REPL (`repl`)
 
+Part of [TinySQL](../../README.md). See the root guide for supported SQL,
+storage modes, and limitations.
+
 An interactive SQL shell over `database/sql` and the tinySQL driver.
 
 ## Build

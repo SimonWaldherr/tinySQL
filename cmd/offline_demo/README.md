@@ -1,5 +1,8 @@
 # Offline POI demo
 
+Part of [TinySQL](../../README.md). See the root GIS and storage sections for
+the broader map-data workflow.
+
 Create or reopen a local POI snapshot, put it into read-only mode, and search it
 without a server, network access, or SQLite dependency.
 

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -18,35 +19,43 @@ type geoPoint struct {
 
 func getGeoFunctions() map[string]funcHandler {
 	return map[string]funcHandler{
-		"GEO_POINT":          evalGeoPoint,
-		"ST_MAKEPOINT":       evalGeoPoint,
-		"ST_POINT":           evalGeoPoint,
-		"GEO_LON":            evalGeoLon,
-		"GEO_X":              evalGeoLon,
-		"ST_X":               evalGeoLon,
-		"GEO_LAT":            evalGeoLat,
-		"GEO_Y":              evalGeoLat,
-		"ST_Y":               evalGeoLat,
-		"GEO_DISTANCE":       evalGeoDistance,
-		"HAVERSINE":          evalGeoDistance,
-		"ST_DISTANCE":        evalGeoDistance,
-		"GEO_DWITHIN":        evalGeoDWithin,
-		"ST_DWITHIN":         evalGeoDWithin,
-		"GEO_WITHIN_BBOX":    evalGeoWithinBBox,
-		"ST_WITHIN_BBOX":     evalGeoWithinBBox,
-		"GEO_BEARING":        evalGeoBearing,
-		"ST_AZIMUTH":         evalGeoBearing,
-		"GEO_DESTINATION":    evalGeoDestination,
-		"ST_PROJECT":         evalGeoDestination,
-		"GEO_MIDPOINT":       evalGeoMidpoint,
-		"ST_MIDPOINT":        evalGeoMidpoint,
-		"GEO_WITHIN_POLYGON": evalGeoWithinPolygon,
-		"ST_WITHIN":          evalGeoWithinPolygon,
-		"ST_CONTAINS":        evalGeoPolygonContains,
-		"GEO_POLYGON_AREA":   evalGeoPolygonArea,
-		"ST_AREA":            evalGeoPolygonArea,
-		"GEO_LENGTH":         evalGeoLength,
-		"ST_LENGTH":          evalGeoLength,
+		"GEO_POINT":                 evalGeoPoint,
+		"ST_MAKEPOINT":              evalGeoPoint,
+		"ST_POINT":                  evalGeoPoint,
+		"GEO_LON":                   evalGeoLon,
+		"GEO_X":                     evalGeoLon,
+		"ST_X":                      evalGeoLon,
+		"GEO_LAT":                   evalGeoLat,
+		"GEO_Y":                     evalGeoLat,
+		"ST_Y":                      evalGeoLat,
+		"GEO_DISTANCE":              evalGeoDistance,
+		"HAVERSINE":                 evalGeoDistance,
+		"ST_DISTANCE":               evalGeoDistance,
+		"GEO_DWITHIN":               evalGeoDWithin,
+		"ST_DWITHIN":                evalGeoDWithin,
+		"GEO_WITHIN_BBOX":           evalGeoWithinBBox,
+		"ST_WITHIN_BBOX":            evalGeoWithinBBox,
+		"GEO_BEARING":               evalGeoBearing,
+		"ST_AZIMUTH":                evalGeoBearing,
+		"GEO_DESTINATION":           evalGeoDestination,
+		"ST_PROJECT":                evalGeoDestination,
+		"GEO_MIDPOINT":              evalGeoMidpoint,
+		"ST_MIDPOINT":               evalGeoMidpoint,
+		"GEO_WITHIN_POLYGON":        evalGeoWithinPolygon,
+		"ST_WITHIN":                 evalGeoWithinPolygon,
+		"ST_CONTAINS":               evalGeoPolygonContains,
+		"GEO_POLYGON_AREA":          evalGeoPolygonArea,
+		"ST_AREA":                   evalGeoPolygonArea,
+		"GEO_LENGTH":                evalGeoLength,
+		"ST_LENGTH":                 evalGeoLength,
+		"GEO_BUFFER":                evalGeoBuffer,
+		"ST_BUFFER":                 evalGeoBuffer,
+		"GEO_CONVEX_HULL":           evalGeoConvexHull,
+		"ST_CONVEXHULL":             evalGeoConvexHull,
+		"GEO_ENVELOPE":              evalGeoEnvelope,
+		"ST_ENVELOPE":               evalGeoEnvelope,
+		"GEO_LINE_INTERPOLATE":      evalGeoLineInterpolate,
+		"ST_LINE_INTERPOLATE_POINT": evalGeoLineInterpolate,
 	}
 }
 
@@ -273,9 +282,10 @@ func evalGeoDestination(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 }
 
 // evalGeoWithinPolygon reports whether a point lies within a GeoJSON Polygon
-// (its exterior ring, minus any holes). Point-first argument order matches
-// GEO_WITHIN_BBOX; ST_WITHIN mirrors PostGIS's ST_Within(geomA, geomB) =
-// "A is within B", which for (point, polygon) is the same order.
+// or MultiPolygon (any one of its parts; each part's exterior ring minus its
+// own holes). Point-first argument order matches GEO_WITHIN_BBOX; ST_WITHIN
+// mirrors PostGIS's ST_Within(geomA, geomB) = "A is within B", which for
+// (point, polygon) is the same order.
 func evalGeoWithinPolygon(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err := requireArgs(ex.Name, ex, 2, 2); err != nil {
 		return nil, err
@@ -284,22 +294,22 @@ func evalGeoWithinPolygon(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	poly, err := evalGeoPolygonArg(env, ex, row, 1)
+	mp, err := evalGeoPolygonArg(env, ex, row, 1)
 	if err != nil {
 		return nil, err
 	}
-	return pointInPolygon(p, poly), nil
+	return pointInMultiPolygon(p, mp), nil
 }
 
 // evalGeoPolygonContains is ST_CONTAINS(polygon, point), PostGIS's
 // ST_Contains(geomA, geomB) = "A contains B" order -- the reverse of
 // GEO_WITHIN_POLYGON/ST_WITHIN's point-first order. Both compute the same
-// point-in-polygon predicate.
+// point-in-polygon(-or-multipolygon) predicate.
 func evalGeoPolygonContains(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err := requireArgs(ex.Name, ex, 2, 2); err != nil {
 		return nil, err
 	}
-	poly, err := evalGeoPolygonArg(env, ex, row, 0)
+	mp, err := evalGeoPolygonArg(env, ex, row, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -307,21 +317,214 @@ func evalGeoPolygonContains(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return pointInPolygon(p, poly), nil
+	return pointInMultiPolygon(p, mp), nil
 }
 
-// evalGeoPolygonArea returns a GeoJSON Polygon's area in square meters
-// (exterior ring minus any holes), computed on the sphere rather than by
-// projecting to a plane first -- see ringAreaMeters.
+// evalGeoPolygonArea returns a GeoJSON Polygon or MultiPolygon's area in
+// square meters (each part's exterior ring minus its own holes, summed for a
+// MultiPolygon), computed on the sphere rather than by projecting to a plane
+// first -- see ringAreaMeters.
 func evalGeoPolygonArea(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err := requireArgs(ex.Name, ex, 1, 1); err != nil {
 		return nil, err
 	}
-	poly, err := evalGeoPolygonArg(env, ex, row, 0)
+	mp, err := evalGeoPolygonArg(env, ex, row, 0)
 	if err != nil {
 		return nil, err
 	}
-	return polygonAreaMeters(poly), nil
+	return multiPolygonAreaMeters(mp), nil
+}
+
+// evalGeoBuffer approximates a circular buffer of radiusMeters around a
+// point as a regular polygon, using the same forward-geodesic projection
+// GEO_DESTINATION uses at `segments` equally spaced bearings (default 32,
+// which keeps the circle visually smooth without an excessive vertex count;
+// callers needing more or less detail can pass a third argument from 8 to
+// 256). This is the standard way to turn "within X meters of here" into a
+// polygon usable with GEO_WITHIN_POLYGON/ST_INTERSECTS-style predicates, or
+// simply to draw a service-area circle on a map.
+func evalGeoBuffer(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if err := requireArgs(ex.Name, ex, 2, 3); err != nil {
+		return nil, err
+	}
+	p, err := evalGeoPointArg(env, ex, row, 0)
+	if err != nil {
+		return nil, err
+	}
+	radius, err := evalGeoFloatArg(env, ex, row, 1)
+	if err != nil {
+		return nil, err
+	}
+	if math.IsNaN(radius) || math.IsInf(radius, 0) || radius <= 0 {
+		return nil, fmt.Errorf("%s radius must be a finite positive number of meters", ex.Name)
+	}
+	segments := 32
+	if len(ex.Args) == 3 {
+		n, err := evalGeoFloatArg(env, ex, row, 2)
+		if err != nil {
+			return nil, err
+		}
+		if n != math.Trunc(n) || n < 8 || n > 256 {
+			return nil, fmt.Errorf("%s segments must be an integer from 8 to 256", ex.Name)
+		}
+		segments = int(n)
+	}
+	ring := make([]any, 0, segments+1)
+	for i := 0; i < segments; i++ {
+		bearing := float64(i) * 360 / float64(segments)
+		destLat, destLon := destinationPoint(p.Lat, p.Lon, bearing, radius)
+		ring = append(ring, []float64{destLon, destLat})
+	}
+	ring = append(ring, ring[0]) // GeoJSON rings must be explicitly closed
+	body, err := json.Marshal(map[string]any{"type": "Polygon", "coordinates": []any{ring}})
+	if err != nil {
+		return nil, err
+	}
+	return string(body), nil
+}
+
+// evalGeoConvexHull returns the convex hull of every vertex in a Point,
+// MultiPoint, LineString, MultiLineString, Polygon or MultiPolygon as a
+// GeoJSON Polygon. The hull is computed in plain lon/lat space (Andrew's
+// monotone chain) rather than on the sphere -- a planar approximation that
+// is standard practice for this operation and entirely adequate at the
+// regional extents tinySQL geometries realistically span; a rigorous
+// spherical hull needs a different algorithm and is out of scope here.
+func evalGeoConvexHull(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if err := requireArgs(ex.Name, ex, 1, 1); err != nil {
+		return nil, err
+	}
+	value, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+	points, err := collectAllPositions(value)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", ex.Name, err)
+	}
+	hull, err := convexHull(points)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", ex.Name, err)
+	}
+	ring := make([]any, 0, len(hull)+1)
+	for _, p := range hull {
+		ring = append(ring, []float64{p.Lon, p.Lat})
+	}
+	ring = append(ring, ring[0])
+	body, err := json.Marshal(map[string]any{"type": "Polygon", "coordinates": []any{ring}})
+	if err != nil {
+		return nil, err
+	}
+	return string(body), nil
+}
+
+// evalGeoEnvelope returns a geometry's bounding box as a GeoJSON Polygon
+// (rather than the [minLon, minLat, maxLon, maxLat] array GEO_BBOX/ST_BBOX
+// return), for when the caller wants to draw it, intersect it, or feed it
+// into GEO_WITHIN_POLYGON directly. It reuses evalGeoBBox (geo_editing.go)
+// rather than re-walking the geometry a second way.
+func evalGeoEnvelope(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if err := requireArgs(ex.Name, ex, 1, 1); err != nil {
+		return nil, err
+	}
+	bboxResult, err := evalGeoBBox(env, ex, row)
+	if err != nil {
+		return nil, err
+	}
+	if bboxResult == nil {
+		return nil, nil
+	}
+	bboxJSON, ok := bboxResult.(string)
+	if !ok {
+		return nil, fmt.Errorf("%s: unexpected bounding box result type %T", ex.Name, bboxResult)
+	}
+	var bbox []float64
+	if err := json.Unmarshal([]byte(bboxJSON), &bbox); err != nil || len(bbox) != 4 {
+		return nil, fmt.Errorf("%s: could not read bounding box: %w", ex.Name, err)
+	}
+	minLon, minLat, maxLon, maxLat := bbox[0], bbox[1], bbox[2], bbox[3]
+	ring := []any{
+		[]float64{minLon, minLat},
+		[]float64{maxLon, minLat},
+		[]float64{maxLon, maxLat},
+		[]float64{minLon, maxLat},
+		[]float64{minLon, minLat},
+	}
+	body, err := json.Marshal(map[string]any{"type": "Polygon", "coordinates": []any{ring}})
+	if err != nil {
+		return nil, err
+	}
+	return string(body), nil
+}
+
+// evalGeoLineInterpolate returns the point a given fraction (0 to 1) of the
+// way along a LineString's total great-circle length -- fraction 0 is the
+// first vertex, 1 the last, 0.5 the midpoint by distance (not by vertex
+// count). Useful for placing a marker partway along a route, or sampling a
+// track at regular intervals. Between the two vertices bracketing the
+// target distance, the point is linearly interpolated in lon/lat space
+// (the vertices themselves are already straight-line segments in the
+// stored data, not great-circle arcs, so this matches how the line is
+// actually drawn rather than introducing spherical curvature it doesn't have).
+func evalGeoLineInterpolate(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if err := requireArgs(ex.Name, ex, 2, 2); err != nil {
+		return nil, err
+	}
+	ls, err := evalGeoLineStringArg(env, ex, row, 0)
+	if err != nil {
+		return nil, err
+	}
+	fraction, err := evalGeoFloatArg(env, ex, row, 1)
+	if err != nil {
+		return nil, err
+	}
+	if math.IsNaN(fraction) || fraction < 0 || fraction > 1 {
+		return nil, fmt.Errorf("%s fraction must be between 0 and 1", ex.Name)
+	}
+	if len(ls) == 1 {
+		return geoPointJSON(ls[0].Lon, ls[0].Lat, nil)
+	}
+
+	segLengths := make([]float64, len(ls)-1)
+	total := 0.0
+	for i := 1; i < len(ls); i++ {
+		d := haversineMeters(ls[i-1].Lat, ls[i-1].Lon, ls[i].Lat, ls[i].Lon)
+		segLengths[i-1] = d
+		total += d
+	}
+	if total == 0 {
+		return geoPointJSON(ls[0].Lon, ls[0].Lat, nil)
+	}
+
+	target := fraction * total
+	covered := 0.0
+	for i, segLen := range segLengths {
+		if covered+segLen >= target || i == len(segLengths)-1 {
+			t := 0.0
+			if segLen > 0 {
+				t = clampUnitInterval((target - covered) / segLen)
+			}
+			lon := ls[i].Lon + (ls[i+1].Lon-ls[i].Lon)*t
+			lat := ls[i].Lat + (ls[i+1].Lat-ls[i].Lat)*t
+			return geoPointJSON(lon, lat, nil)
+		}
+		covered += segLen
+	}
+	last := ls[len(ls)-1] // unreachable: the loop always returns on its final segment
+	return geoPointJSON(last.Lon, last.Lat, nil)
+}
+
+func clampUnitInterval(t float64) float64 {
+	if t < 0 {
+		return 0
+	}
+	if t > 1 {
+		return 1
+	}
+	return t
 }
 
 // evalGeoLength returns a GeoJSON LineString's length in meters: the sum of
@@ -434,19 +637,27 @@ type geoPolygon struct {
 	Rings []geoRing
 }
 
+// geoMultiPolygon is one or more polygons: a GeoJSON Polygon parses as a
+// single-element geoMultiPolygon, and a MultiPolygon as all of its parts.
+// GEO_WITHIN_POLYGON/ST_CONTAINS treat membership in any part as membership
+// in the whole; GEO_POLYGON_AREA sums every part's area.
+type geoMultiPolygon struct {
+	Polygons []geoPolygon
+}
+
 // geoLineString is a GeoJSON LineString: an ordered sequence of vertices.
 type geoLineString []geoPoint
 
-func evalGeoPolygonArg(env ExecEnv, ex *FuncCall, row Row, idx int) (geoPolygon, error) {
+func evalGeoPolygonArg(env ExecEnv, ex *FuncCall, row Row, idx int) (geoMultiPolygon, error) {
 	v, err := evalExpr(env, ex.Args[idx], row)
 	if err != nil {
-		return geoPolygon{}, err
+		return geoMultiPolygon{}, err
 	}
-	poly, err := geoPolygonFromValue(v)
+	mp, err := geoMultiPolygonFromValue(v)
 	if err != nil {
-		return geoPolygon{}, fmt.Errorf("%s arg%d: %w", ex.Name, idx+1, err)
+		return geoMultiPolygon{}, fmt.Errorf("%s arg%d: %w", ex.Name, idx+1, err)
 	}
-	return poly, nil
+	return mp, nil
 }
 
 func evalGeoLineStringArg(env ExecEnv, ex *FuncCall, row Row, idx int) (geoLineString, error) {
@@ -461,15 +672,45 @@ func evalGeoLineStringArg(env ExecEnv, ex *FuncCall, row Row, idx int) (geoLineS
 	return ls, nil
 }
 
-func geoPolygonFromValue(v any) (geoPolygon, error) {
+// geoMultiPolygonFromValue accepts either a GeoJSON Polygon (returned as a
+// single-element geoMultiPolygon) or a MultiPolygon (every part parsed the
+// same way polygonFromRingsValue parses a Polygon's own coordinates).
+func geoMultiPolygonFromValue(v any) (geoMultiPolygon, error) {
 	obj, err := geoObjectFromValue(v)
 	if err != nil {
-		return geoPolygon{}, err
+		return geoMultiPolygon{}, err
 	}
-	if typ, _ := obj["type"].(string); !strings.EqualFold(typ, "Polygon") {
-		return geoPolygon{}, fmt.Errorf("expected GeoJSON Polygon")
+	typ, _ := obj["type"].(string)
+	switch {
+	case strings.EqualFold(typ, "Polygon"):
+		poly, err := polygonFromRingsValue(obj["coordinates"])
+		if err != nil {
+			return geoMultiPolygon{}, err
+		}
+		return geoMultiPolygon{Polygons: []geoPolygon{poly}}, nil
+	case strings.EqualFold(typ, "MultiPolygon"):
+		rawPolygons, ok := obj["coordinates"].([]any)
+		if !ok || len(rawPolygons) == 0 {
+			return geoMultiPolygon{}, fmt.Errorf("multipolygon coordinates must be a non-empty array of polygons")
+		}
+		mp := geoMultiPolygon{Polygons: make([]geoPolygon, 0, len(rawPolygons))}
+		for i, rawPolygon := range rawPolygons {
+			poly, err := polygonFromRingsValue(rawPolygon)
+			if err != nil {
+				return geoMultiPolygon{}, fmt.Errorf("polygon %d: %w", i, err)
+			}
+			mp.Polygons = append(mp.Polygons, poly)
+		}
+		return mp, nil
+	default:
+		return geoMultiPolygon{}, fmt.Errorf("expected GeoJSON Polygon or MultiPolygon")
 	}
-	rawRings, ok := obj["coordinates"].([]any)
+}
+
+// polygonFromRingsValue parses one Polygon's own "coordinates" value: an
+// array of rings, the first the exterior boundary and the rest holes.
+func polygonFromRingsValue(v any) (geoPolygon, error) {
+	rawRings, ok := v.([]any)
 	if !ok || len(rawRings) == 0 {
 		return geoPolygon{}, fmt.Errorf("polygon coordinates must be a non-empty array of rings")
 	}
@@ -477,13 +718,13 @@ func geoPolygonFromValue(v any) (geoPolygon, error) {
 	for i, rawRing := range rawRings {
 		positions, ok := rawRing.([]any)
 		if !ok || len(positions) < 4 {
-			return geoPolygon{}, fmt.Errorf("polygon ring %d must have at least 4 positions (a closed ring)", i)
+			return geoPolygon{}, fmt.Errorf("ring %d must have at least 4 positions (a closed ring)", i)
 		}
 		ring := make(geoRing, 0, len(positions))
 		for j, rawPos := range positions {
 			p, err := geoPositionFromValue(rawPos)
 			if err != nil {
-				return geoPolygon{}, fmt.Errorf("polygon ring %d position %d: %w", i, j, err)
+				return geoPolygon{}, fmt.Errorf("ring %d position %d: %w", i, j, err)
 			}
 			ring = append(ring, p)
 		}
@@ -648,6 +889,156 @@ func polygonAreaMeters(poly geoPolygon) float64 {
 		return 0
 	}
 	return area
+}
+
+// pointInMultiPolygon reports whether p is inside any one of mp's parts.
+func pointInMultiPolygon(p geoPoint, mp geoMultiPolygon) bool {
+	for _, poly := range mp.Polygons {
+		if pointInPolygon(p, poly) {
+			return true
+		}
+	}
+	return false
+}
+
+// multiPolygonAreaMeters sums every part's area (a GeoJSON MultiPolygon's
+// parts are not expected to overlap, so a plain sum is the standard,
+// PostGIS-matching definition of its total area).
+func multiPolygonAreaMeters(mp geoMultiPolygon) float64 {
+	total := 0.0
+	for _, poly := range mp.Polygons {
+		total += polygonAreaMeters(poly)
+	}
+	return total
+}
+
+// ── Vertex collection and convex hull ────────────────────────────────────
+
+// collectAllPositions extracts every coordinate position from any GeoJSON
+// geometry (Point, MultiPoint, LineString, MultiLineString, Polygon,
+// MultiPolygon). GEO_CONVEX_HULL is the only caller: it needs the vertex
+// set, not which lines or rings connect them.
+func collectAllPositions(v any) ([]geoPoint, error) {
+	obj, err := geoObjectFromValue(v)
+	if err != nil {
+		return nil, err
+	}
+	typ, _ := obj["type"].(string)
+	switch strings.ToLower(typ) {
+	case "point":
+		p, err := geoPositionFromValue(obj["coordinates"])
+		if err != nil {
+			return nil, err
+		}
+		return []geoPoint{p}, nil
+	case "multipoint", "linestring":
+		return positionsFromArray(obj["coordinates"])
+	case "multilinestring", "polygon":
+		return positionsFromNestedArray(obj["coordinates"], 1)
+	case "multipolygon":
+		return positionsFromNestedArray(obj["coordinates"], 2)
+	default:
+		return nil, fmt.Errorf("unsupported or missing GeoJSON geometry type %q", typ)
+	}
+}
+
+func positionsFromArray(v any) ([]geoPoint, error) {
+	raw, ok := v.([]any)
+	if !ok {
+		return nil, fmt.Errorf("coordinates must be an array")
+	}
+	out := make([]geoPoint, 0, len(raw))
+	for i, item := range raw {
+		p, err := geoPositionFromValue(item)
+		if err != nil {
+			return nil, fmt.Errorf("position %d: %w", i, err)
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+// positionsFromNestedArray flattens `depth` levels of grouping (rings within
+// a polygon; polygons, each with its own rings, within a multipolygon) down
+// to one flat point list.
+func positionsFromNestedArray(v any, depth int) ([]geoPoint, error) {
+	raw, ok := v.([]any)
+	if !ok {
+		return nil, fmt.Errorf("coordinates must be an array")
+	}
+	var out []geoPoint
+	for i, item := range raw {
+		var points []geoPoint
+		var err error
+		if depth == 1 {
+			points, err = positionsFromArray(item)
+		} else {
+			points, err = positionsFromNestedArray(item, depth-1)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("group %d: %w", i, err)
+		}
+		out = append(out, points...)
+	}
+	return out, nil
+}
+
+// convexHull computes the convex hull of points via Andrew's monotone
+// chain: sort by (lon, lat), then build the lower and upper hull chains,
+// discarding a point whenever the last three make a non-left turn (cross
+// product <= 0 also drops collinear points, keeping the hull's minimal
+// vertex set). O(n log n) via the sort; the scan itself is linear.
+func convexHull(points []geoPoint) ([]geoPoint, error) {
+	uniq := dedupePoints(points)
+	if len(uniq) < 3 {
+		return nil, fmt.Errorf("need at least 3 distinct points for a hull, got %d", len(uniq))
+	}
+	sort.Slice(uniq, func(i, j int) bool {
+		if uniq[i].Lon != uniq[j].Lon {
+			return uniq[i].Lon < uniq[j].Lon
+		}
+		return uniq[i].Lat < uniq[j].Lat
+	})
+
+	cross := func(o, a, b geoPoint) float64 {
+		return (a.Lon-o.Lon)*(b.Lat-o.Lat) - (a.Lat-o.Lat)*(b.Lon-o.Lon)
+	}
+
+	lower := make([]geoPoint, 0, len(uniq))
+	for _, p := range uniq {
+		for len(lower) >= 2 && cross(lower[len(lower)-2], lower[len(lower)-1], p) <= 0 {
+			lower = lower[:len(lower)-1]
+		}
+		lower = append(lower, p)
+	}
+	upper := make([]geoPoint, 0, len(uniq))
+	for i := len(uniq) - 1; i >= 0; i-- {
+		p := uniq[i]
+		for len(upper) >= 2 && cross(upper[len(upper)-2], upper[len(upper)-1], p) <= 0 {
+			upper = upper[:len(upper)-1]
+		}
+		upper = append(upper, p)
+	}
+
+	hull := append(lower[:len(lower)-1], upper[:len(upper)-1]...)
+	if len(hull) < 3 {
+		return nil, fmt.Errorf("points are collinear; no polygon hull exists")
+	}
+	return hull, nil
+}
+
+func dedupePoints(points []geoPoint) []geoPoint {
+	seen := make(map[[2]float64]bool, len(points))
+	out := make([]geoPoint, 0, len(points))
+	for _, p := range points {
+		key := [2]float64{p.Lon, p.Lat}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, p)
+	}
+	return out
 }
 
 func geoFloat(v any) (float64, error) {

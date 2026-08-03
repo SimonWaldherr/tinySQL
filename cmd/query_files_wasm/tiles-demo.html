@@ -312,6 +312,8 @@
                     <button class="op-button" data-operation="smooth" onclick="runShapeOperation('smooth')">Smooth</button>
                     <button class="op-button" data-operation="affine" onclick="runShapeOperation('affine')">Affine</button>
                     <button class="op-button" data-operation="drop-holes" onclick="runShapeOperation('drop-holes')">Drop holes</button>
+                    <button class="op-button" data-operation="clean" onclick="runShapeOperation('clean')">Clean</button>
+                    <button class="op-button" data-operation="snap" onclick="runShapeOperation('snap')">Snap grid</button>
                 </div>
                 <div class="shape-parameters">
                     <label>simplify tolerance<input class="shape-select shape-input" id="simplifyTolerance" type="number" value="2" min="0" step="0.1"></label>
@@ -320,6 +322,7 @@
                     <label>shift y<input class="shape-select shape-input" id="affineShiftY" type="number" value="0" step="0.1"></label>
                     <label>scale<input class="shape-select shape-input" id="affineScale" type="number" value="0.8" step="0.1"></label>
                     <label>rotate °<input class="shape-select shape-input" id="affineRotate" type="number" value="18" step="1"></label>
+                    <label>snap grid<input class="shape-select shape-input" id="snapGrid" type="number" value="1" min="0.000001" step="0.1"></label>
                 </div>
                 <div class="sql-template mono" id="shapeSQL" style="margin-top:8px; font-size:10.5px;">Loading geometry…</div>
                 <div id="shapeResult" class="mono" style="margin-top:8px;">Choose an operation…</div>

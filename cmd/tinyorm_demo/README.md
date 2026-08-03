@@ -1,5 +1,8 @@
 # tinyORM Demo
 
+Part of [TinySQL](../../README.md). See the [command index](../README.md) for
+other runnable examples and tools.
+
 Demonstrates tinyORM's additive migration, inserts, named-parameter selection,
 and primary-key lookup without any external service.
 

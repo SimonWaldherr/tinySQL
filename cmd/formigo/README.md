@@ -1,5 +1,8 @@
 # Formigo
 
+Part of [TinySQL](../../README.md). Formigo is an application example; consult
+the root guide for TinySQL capabilities and storage limitations.
+
 Single-binary form app: embedded templates, Bootstrap UI, tinySQL storage (or
 Microsoft SQL Server), sessions, CSRF protection, role-based authorization.
 

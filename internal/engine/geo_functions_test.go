@@ -177,6 +177,40 @@ func TestGeoAffineRejectsPartialAnchor(t *testing.T) {
 	}
 }
 
+func TestGeoCleanSnapAndValidity(t *testing.T) {
+	db := storage.NewDB()
+	line := `{"type":"LineString","coordinates":[[0,0],[0,0],[0.49,0.51],[1.49,1.51],[1.49,1.51]]}`
+	rs, err := Execute(context.Background(), db, "default", mustParse(fmt.Sprintf(`
+		SELECT GEO_CLEAN('%s') AS clean,
+		       ST_SNAPTOGRID('%s', 1) AS snapped,
+		       GEO_IS_VALID('%s') AS valid,
+		       ST_ISVALID('{"type":"Polygon","coordinates":[[[0,0],[1,0],[0,0]]]}') AS invalid
+	`, line, line, line)))
+	if err != nil {
+		t.Fatalf("clean/snap/validity: %v", err)
+	}
+	var clean, snapped map[string]any
+	if err := json.Unmarshal([]byte(rs.Rows[0]["clean"].(string)), &clean); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(rs.Rows[0]["snapped"].(string)), &snapped); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(clean["coordinates"].([]any)); got != 3 {
+		t.Fatalf("clean retained %d points, want 3", got)
+	}
+	coords := snapped["coordinates"].([]any)
+	if fmt.Sprint(coords) != "[[0 0] [0 1] [1 2]]" {
+		t.Fatalf("snapped = %v", coords)
+	}
+	if got, _ := rs.Rows[0]["valid"].(bool); !got {
+		t.Fatal("valid line reported false")
+	}
+	if got, _ := rs.Rows[0]["invalid"].(bool); got {
+		t.Fatal("invalid polygon reported true")
+	}
+}
+
 func TestGeoDistanceCoordinates(t *testing.T) {
 	db := storage.NewDB()
 	rs, err := Execute(context.Background(), db, "default", mustParse(`

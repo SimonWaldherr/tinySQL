@@ -1,5 +1,8 @@
 # tinySQL SQL Toolkit (`sqltools`)
 
+Part of [TinySQL](../../README.md). See the root guide for the SQL feature set
+and the [development guide](../../docs/development-guide.md) for workflows.
+
 Formatter, validator, linter, normalizer, differ, query explainer, template
 library, and interactive REPL in one binary.
 

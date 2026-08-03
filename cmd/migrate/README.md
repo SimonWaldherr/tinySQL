@@ -1,5 +1,8 @@
 # tinySQL Data Migration Tool
 
+Part of [TinySQL](../../README.md). See the root guide for supported import
+formats, export behavior, and optional build tags.
+
 CLI for data pipelines. Moves data between CSV/TSV/JSON/YAML/XML files,
 tinySQL, and external databases (MySQL/MariaDB, PostgreSQL, SQLite, MS SQL
 Server), using tinySQL as an in-memory hub: data can be queried, joined,

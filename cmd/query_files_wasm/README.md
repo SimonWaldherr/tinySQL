@@ -1,5 +1,8 @@
 # query_files_wasm
 
+Part of [TinySQL](../../README.md). The root guide covers the current GIS
+functions; this guide covers the browser build and local-first UI.
+
 Browser-based tinySQL playground (Go WASM plus static HTML/JS UI). This command
 builds the static app published on GitHub Pages:
 
@@ -78,12 +81,13 @@ them (drawn on the map). See [`settlements.go`](../mbtilesdemo/settlements.go).
 
 A `mapshaper_shapes` GeoJSON layer powers the **Mapshaper-style editing**
 panel. It executes `ST_SIMPLIFY`, `ST_SMOOTH`, `ST_AFFINE`, and
-`ST_REMOVE_HOLES` against a line, a polygon with a hole, and a multipolygon,
-then displays the result with its `ST_BBOX` and `ST_CENTROID`. The dashed
-outline remains the source geometry so the transformation is directly visible.
-You can also upload any GeoJSON object, tune simplification, smoothing, or
-affine parameters, and download the transformed result without sending the
-file anywhere. See [`shapes.go`](../mbtilesdemo/shapes.go).
+`ST_REMOVE_HOLES`, `ST_CLEAN`, and `ST_SNAPTOGRID` against a line, a polygon
+with a hole, and a multipolygon, then displays the result with its
+`ST_ISVALID`, `ST_BBOX`, and `ST_CENTROID`. The dashed outline remains the
+source geometry so the transformation is directly visible. You can also upload
+any GeoJSON object, tune simplification, smoothing, affine, or snapping
+parameters, and download the transformed result without sending the file
+anywhere. See [`shapes.go`](../mbtilesdemo/shapes.go).
 
 The tileset is generated, non-geographic art (value noise, quantized into flat
 color bands) — see [`cmd/mbtilesdemo`](../mbtilesdemo) at the repo root. That

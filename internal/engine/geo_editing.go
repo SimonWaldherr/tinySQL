@@ -22,6 +22,12 @@ func getGeoEditingFunctions() map[string]funcHandler {
 		"ST_SMOOTH":       evalGeoSmooth,
 		"GEO_DROP_HOLES":  evalGeoDropHoles,
 		"ST_REMOVE_HOLES": evalGeoDropHoles,
+		"GEO_CLEAN":       evalGeoClean,
+		"ST_CLEAN":        evalGeoClean,
+		"GEO_SNAP":        evalGeoSnap,
+		"ST_SNAPTOGRID":   evalGeoSnap,
+		"GEO_IS_VALID":    evalGeoIsValid,
+		"ST_ISVALID":      evalGeoIsValid,
 	}
 }
 

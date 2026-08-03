@@ -1,5 +1,8 @@
 # AccessWeb
 
+Part of [TinySQL](../../README.md). See the root guide for engine capabilities,
+storage choices, and current limitations.
+
 Browser-based database manager for
 [tinySQL](https://github.com/SimonWaldherr/tinySQL): a datasheet browser, record
 editor, table designer, SQL editor and CSV/JSON export, with no dependencies

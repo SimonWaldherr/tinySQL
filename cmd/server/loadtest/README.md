@@ -1,5 +1,7 @@
 # tinySQL server loadtest
 
+Companion to [`cmd/server`](../README.md) in [TinySQL](../../../README.md).
+
 `cmd/server` query load tester. `go build -o tinysql-loadtest .`
 
 | Flag | Default | Description |

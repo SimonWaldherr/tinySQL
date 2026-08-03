@@ -1,5 +1,8 @@
 # tinySQL SQL Playground (`demo`)
 
+Part of [TinySQL](../../README.md). Use the root guide for the current feature,
+GIS, storage, and import overview.
+
 Seeds sample data into an in-memory or file-backed tinySQL database and lets you
 explore it via a guided feature tour, a SQL script, or an interactive REPL.
 

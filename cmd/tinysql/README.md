@@ -1,5 +1,8 @@
 # tinySQL CLI (`tinysql`)
 
+Part of [TinySQL](../../README.md). See the root guide for SQL, GIS, storage,
+and import capabilities.
+
 SQLite-style CLI for tinySQL: REPL, inline SQL, piped scripts,
 `sqlite-utils`-style subcommands.
 
