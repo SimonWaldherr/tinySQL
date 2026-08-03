@@ -143,35 +143,65 @@ func (bt *BTree) Insert(txID TxID, key, value []byte) error {
 	return bt.insertIntoTree(txID, key, entry)
 }
 
-// makeLeafEntry chooses the inline or overflow representation using the
-// complete encoded record size. Value length alone is insufficient: a long key
-// plus headers and its slot entry can make an otherwise modest BLOB impossible
-// to place on a leaf page.
+// leafEntryNeedsOverflow reports whether key/value should be stored as an
+// overflow reference rather than inline in a leaf record, using the complete
+// encoded record size for both representations. Value length alone is
+// insufficient: a long key plus headers and the record's own slot-directory
+// entry can make an otherwise modest BLOB impossible to place on a leaf page.
+//
+// The decision depends only on pageSize, key and value -- never on how full
+// any particular destination page happens to be right now. A record that
+// would only overflow because the current page is already busy needs a
+// split, not an overflow: basing the choice on live free space would make
+// overflow placement depend on insertion order and page-fill history, so the
+// same row could round-trip through overflow on one import and stay inline
+// on another. Every accepted inline record must therefore be sized against
+// an *empty* page (btreeRecordCapacity), which is exactly what
+// leafRecordFootprint against that capacity guarantees.
+func leafEntryNeedsOverflow(pageSize int, key, value []byte) bool {
+	capacity := btreeRecordCapacity(pageSize)
+	inlineSize := leafRecordFootprint(LeafEntry{Key: key, Value: value})
+	if inlineSize > capacity {
+		// Cannot be placed inline under any circumstance, even alone on an
+		// otherwise empty page. This is not a preference: it is the only way
+		// the record could ever be stored, short of erroring out entirely.
+		return true
+	}
+	if inlineSize <= overflowThresholdFor(pageSize) {
+		return false
+	}
+	// Above the preferred threshold but still inline-able: only actually
+	// switch to overflow if the reference form is both storable and smaller,
+	// so a modest value with a very long key is not needlessly pushed out.
+	overflowSize := leafRecordFootprint(LeafEntry{Key: key, Overflow: true, TotalSize: uint32(len(value))})
+	return overflowSize <= capacity && overflowSize < inlineSize
+}
+
+// makeLeafEntry builds the inline or overflow leaf representation for
+// key/value, writing the overflow chain when leafEntryNeedsOverflow says to.
 func (bt *BTree) makeLeafEntry(txID TxID, key, value []byte) (LeafEntry, error) {
 	if len(key) > int(^uint16(0)) {
 		return LeafEntry{}, fmt.Errorf("btree key too large: %d bytes", len(key))
 	}
-	inline := LeafEntry{Key: key, Value: value}
-	inlineSize := leafRecordFootprint(inline)
 	capacity := btreeRecordCapacity(bt.pager.pageSize)
-	if inlineSize <= capacity && inlineSize <= bt.overflowThresh {
-		return inline, nil
+
+	if leafEntryNeedsOverflow(bt.pager.pageSize, key, value) {
+		overflow := LeafEntry{Key: key, Overflow: true, TotalSize: uint32(len(value))}
+		if overflowSize := leafRecordFootprint(overflow); overflowSize <= capacity {
+			head, err := bt.writeOverflow(txID, value)
+			if err != nil {
+				return LeafEntry{}, err
+			}
+			overflow.OverflowPageID = head
+			return overflow, nil
+		}
+		// The overflow reference itself does not fit -- only possible with an
+		// enormous key -- so fall through to the inline check below, which
+		// reports a precise error if inline does not fit either.
 	}
 
-	// A leaf overflow record replaces the inline value length and payload with
-	// a fixed page reference and total size. Compare the two fully encoded
-	// forms, rather than using len(value), so small values with long keys remain
-	// inline while records that cannot fit an empty leaf are always overflowed.
-	overflow := LeafEntry{Key: key, Overflow: true, TotalSize: uint32(len(value))}
-	overflowSize := leafRecordFootprint(overflow)
-	if overflowSize <= capacity && (inlineSize > capacity || overflowSize < inlineSize) {
-		head, err := bt.writeOverflow(txID, value)
-		if err != nil {
-			return LeafEntry{}, err
-		}
-		overflow.OverflowPageID = head
-		return overflow, nil
-	}
+	inline := LeafEntry{Key: key, Value: value}
+	inlineSize := leafRecordFootprint(inline)
 	if inlineSize <= capacity {
 		return inline, nil
 	}
@@ -251,6 +281,38 @@ func (bt *BTree) insertWithSplit(txID TxID, path []PageID, entry LeafEntry) erro
 	}
 	if !inserted {
 		merged = append(merged, entry)
+	}
+
+	// The page may have failed to hold merged's entries only because
+	// UpdateLeafEntry/InsertLeafEntry never reclaim a record's old slot when
+	// it moves or is replaced -- dead space accumulates until the page is
+	// rewritten from scratch, which is exactly what a split's "left" half
+	// does below. Before paying for an actual split (a new sibling page and a
+	// parent-separator update), check whether the *live* entries, freshly
+	// packed with no dead space, still fit in one page; if so, rewrite this
+	// leaf in place and stop. This is not an optimization only: a leaf with a
+	// single entry has nowhere to send a "right" half at all, so
+	// leafSplitIndex below would fail outright on the very case a bare
+	// replace-of-the-only-key produces (merged has exactly one entry).
+	capacity := btreeRecordCapacity(bt.pager.pageSize)
+	mergedFootprint := 0
+	for _, e := range merged {
+		mergedFootprint += leafRecordFootprint(e)
+	}
+	if mergedFootprint <= capacity {
+		freshBuf := make([]byte, bt.pager.pageSize)
+		freshBP := InitBTreePage(freshBuf, leafID, true)
+		for _, e := range merged {
+			if _, err := freshBP.InsertLeafEntry(e); err != nil {
+				bt.pager.UnpinPage(leafID)
+				return fmt.Errorf("leaf compaction insert: %w", err)
+			}
+		}
+		freshBP.SetNextLeaf(bp.NextLeaf())
+		freshBP.SetPrevLeaf(bp.PrevLeaf())
+		SetPageCRC(freshBuf)
+		bt.pager.UnpinPage(leafID)
+		return bt.pager.WritePage(txID, leafID, freshBuf)
 	}
 
 	// Split by encoded bytes, not entry count. A count midpoint can put several

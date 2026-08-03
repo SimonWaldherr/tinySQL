@@ -45,3 +45,6 @@ formigo.db.wal
 /.gomodcache
 benchmarks/cpu.out
 benchmarks/mem.out
+demo.mbtiles
+/mbtilesdemo
+/mbtilesregion

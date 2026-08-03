@@ -245,6 +245,84 @@ SHA-256 fingerprint, to accompany a CSV, JSON, or SQL data export for verifiable
 transfers. Runnable example:
 [`ExampleExportJSON`](./exporter/example_test.go).
 
+## Geospatial queries
+
+Points, distances, bearings, polygons and lines are ordinary GeoJSON values —
+`TEXT`/`JSON` columns holding `{"type":"Point","coordinates":[lon,lat]}` and
+friends — read and written with built-in SQL functions, no extension to load:
+
+```sql
+CREATE TABLE places (name TEXT, geometry JSON);
+INSERT INTO places VALUES ('Berlin', GEO_POINT(13.4050, 52.5200));
+INSERT INTO places VALUES ('Munich', GEO_POINT(11.5755, 48.1372));
+
+-- Great-circle distance, bearing, and the point halfway between two rows.
+SELECT a.name AS from_city, b.name AS to_city,
+       GEO_DISTANCE(a.geometry, b.geometry)  AS meters,
+       GEO_BEARING(a.geometry, b.geometry)   AS initial_bearing_deg,
+       GEO_MIDPOINT(a.geometry, b.geometry)  AS midpoint
+FROM places a JOIN places b ON a.name = 'Berlin' AND b.name = 'Munich';
+
+-- Project a point 10 km northeast of Berlin (dead reckoning). The 4-argument
+-- form takes (lat, lon, ...), matching GEO_DISTANCE's coordinate form.
+SELECT GEO_DESTINATION(52.5200, 13.4050, 45, 10000);
+
+-- Point-in-polygon (rings may include holes; GeoJSON Polygon convention:
+-- coordinates[0] is the exterior ring, coordinates[1:] are holes) and a
+-- LineString's length, e.g. from a routing-graph import.
+SELECT p.name FROM places p JOIN zones z ON GEO_WITHIN_POLYGON(p.geometry, z.service_area);
+SELECT name FROM zones WHERE GEO_LENGTH(route) > 5000;
+```
+
+Every function is also available under its PostGIS-style `ST_*` name (with
+matching argument order — `ST_Within(point, polygon)`/`ST_Contains(polygon,
+point)` follow PostGIS's own "A is within B" vs. "A contains B" convention)
+for drop-in familiarity:
+
+| Purpose | Function | `ST_*` alias |
+|---|---|---|
+| Build/read a point | `GEO_POINT(lon, lat[, z])`, `GEO_LON`, `GEO_LAT` | `ST_MAKEPOINT`/`ST_POINT`, `ST_X`, `ST_Y` |
+| Great-circle distance (meters) | `GEO_DISTANCE(a, b)` or `(lat1,lon1,lat2,lon2)` | `ST_DISTANCE`, `HAVERSINE` |
+| Within a radius | `GEO_DWITHIN(a, b, meters)` | `ST_DWITHIN` |
+| Within a bounding box | `GEO_WITHIN_BBOX(point, minLon, minLat, maxLon, maxLat)` | `ST_WITHIN_BBOX` |
+| Initial compass bearing | `GEO_BEARING(a, b)` | `ST_AZIMUTH` |
+| Project point + bearing + distance | `GEO_DESTINATION(point, bearingDeg, meters)` | `ST_PROJECT` |
+| Great-circle midpoint | `GEO_MIDPOINT(a, b)` | `ST_MIDPOINT` |
+| Point-in-polygon (holes supported) | `GEO_WITHIN_POLYGON(point, polygon)` | `ST_WITHIN`, `ST_CONTAINS(polygon, point)` |
+| Polygon area (spherical, m²) | `GEO_POLYGON_AREA(polygon)` | `ST_AREA` |
+| LineString length (meters) | `GEO_LENGTH(linestring)` | `ST_LENGTH` |
+| Geometry simplification | `GEO_SIMPLIFY(geometry, tolerance[, method])` | `ST_SIMPLIFY` |
+| Bounding box | `GEO_BBOX(geometry)` | `ST_BBOX` |
+| Centroid | `GEO_CENTROID(geometry)` | `ST_CENTROID` |
+| Affine transform | `GEO_AFFINE(geometry, shiftX, shiftY, scale, rotateDeg[, anchorX, anchorY])` | `ST_AFFINE` |
+| Chaikin smoothing | `GEO_SMOOTH(geometry, iterations)` | `ST_SMOOTH` |
+| Remove polygon holes | `GEO_DROP_HOLES(geometry)` | `ST_REMOVE_HOLES` |
+
+`GEO_SIMPLIFY` supports `dp`/`douglas-peucker` (the default),
+`visvalingam-effective`, and `visvalingam-weighted`. Douglas-Peucker tolerance
+uses source coordinate units; Visvalingam tolerances use squared source units.
+LineString, Polygon, MultiLineString, MultiPolygon, GeometryCollection,
+Feature, and FeatureCollection values are supported. Polygon rings remain
+closed and retain at least three distinct vertices.
+
+`GEO_AFFINE` applies a uniform planar scale and clockwise-positive rotation
+around the geometry's bounding-box center by default; pass `anchorX, anchorY`
+to choose an explicit anchor. `GEO_SMOOTH` applies one or more Chaikin corner-
+cutting passes. These editing functions operate in source coordinate units.
+
+Distance, bearing, destination and polygon-area math run on the sphere
+(haversine / great-circle formulas and, for area, the same trapezoidal
+spherical-excess integration Android's Maps Utils library uses) rather than
+projecting to a plane first, so results stay accurate regardless of polygon
+size or latitude. Runnable examples:
+[`geo_functions_test.go`](./internal/engine/geo_functions_test.go).
+
+For importing geodata into these shapes, see GeoJSON, KML, OSM XML, Shapefile,
+and routing-graph import in `internal/importer`; for R-tree-backed spatial
+indexing, see [Limitations](#limitations) — a bounding-box predicate today
+narrows on one axis via a regular index and filters the other, and
+`GEO_WITHIN_POLYGON` is an unindexed per-row test, not yet index-accelerated.
+
 ## Serving map tiles
 
 MBTiles is a SQLite database with a prescribed schema, so tinySQL treats a
@@ -334,6 +412,17 @@ Content-Type and Content-Encoding follow the tileset's `format` metadata, so
 The endpoint is **unauthenticated by design** — a browser cannot attach a bearer
 token to a map-tile request — so it is off unless `-tiles` is passed. Put a
 proxy in front for referer/IP restrictions or signed URLs.
+
+Every response — a tile, TileJSON, or the metadata document — carries an
+`ETag` (a truncated SHA-256 of the exact bytes served) and `Cache-Control:
+public, max-age=3600`. A request with a matching `If-None-Match` gets a
+bodyless `304` instead of a re-download, and for the tile route the metadata
+lookup that resolves `Content-Type` is skipped too, since a 304 sends no
+entity headers to need it for. TileJSON also forwards `vector_layers` and
+`tilestats` when the tileset's metadata carries the `json` key that
+tippecanoe and similar vector-tile generators write, so a client reading the
+served TileJSON — not the `.mbtiles` file directly — still sees the layer
+info a style or inspector needs.
 
 Every tile route runs through a bounded query cache keyed by the exact SQL a
 request builds, so a tile that has already been served once reuses its parsed

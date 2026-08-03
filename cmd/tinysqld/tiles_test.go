@@ -364,6 +364,133 @@ func TestTileHeadRequest(t *testing.T) {
 	}
 }
 
+// TestTileEndpointConditionalGet checks the ETag/If-None-Match cache-validation
+// path: a client that already has the exact tile bytes must get a bodyless 304
+// instead of re-downloading them, and a stale or absent validator must still
+// get the full tile.
+func TestTileEndpointConditionalGet(t *testing.T) {
+	h := newTileDaemon(t, true)
+
+	first := getTile(t, h, "/tiles/world/1/0/0.pbf")
+	if first.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200", first.Code)
+	}
+	etag := first.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("no ETag header on a tile response")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/tiles/world/1/0/0.pbf", nil)
+	req.Header.Set("If-None-Match", etag)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotModified {
+		t.Fatalf("If-None-Match: %q -> status %d, want 304", etag, rec.Code)
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("304 response carried a %d-byte body, want none", rec.Body.Len())
+	}
+	if got := rec.Header().Get("ETag"); got != etag {
+		t.Errorf("304 ETag = %q, want %q", got, etag)
+	}
+
+	// A different tile has a different ETag, so the same validator must not
+	// short-circuit it.
+	req = httptest.NewRequest(http.MethodGet, "/tiles/world/1/1/0.pbf", nil)
+	req.Header.Set("If-None-Match", etag)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("a stale If-None-Match returned %d, want 200 with the fresh tile", rec.Code)
+	}
+	if got := rec.Body.String(); got != "north-east" {
+		t.Errorf("body %q, want north-east", got)
+	}
+
+	// No validator at all: ordinary 200, same as before this feature existed.
+	rec = getTile(t, h, "/tiles/world/1/0/0.pbf")
+	if rec.Code != http.StatusOK {
+		t.Errorf("plain GET status %d, want 200", rec.Code)
+	}
+}
+
+// TestTileJSONVectorLayersPassthrough checks that the `json` metadata row a
+// vector-tile generator (tippecanoe and similar tools) writes is surfaced as
+// TileJSON's own vector_layers/tilestats keys, so a client reading the served
+// TileJSON document — not the .mbtiles file directly — still sees the layer
+// info a style or inspector needs.
+func TestTileJSONVectorLayersPassthrough(t *testing.T) {
+	inst := &tinysql.Instance{DB: storage.NewDB()}
+	tiles := storage.NewTable("vt", []storage.Column{
+		{Name: "zoom_level", Type: storage.IntType},
+		{Name: "tile_column", Type: storage.IntType},
+		{Name: "tile_row", Type: storage.IntType},
+		{Name: "tile_data", Type: storage.BlobType},
+	}, false)
+	tiles.Rows = [][]any{{0, 0, 0, []byte("tile")}}
+	tiles.Version++
+	if err := inst.DB.Put("default", tiles); err != nil {
+		t.Fatal(err)
+	}
+
+	vectorLayersJSON := `{"vector_layers":[{"id":"roads","fields":{"name":"String"}}],"tilestats":{"layerCount":1}}`
+	meta := storage.NewTable("vt_metadata", []storage.Column{
+		{Name: "name", Type: storage.TextType},
+		{Name: "value", Type: storage.TextType},
+	}, false)
+	meta.Rows = [][]any{
+		{"name", "Vector Test"},
+		{"format", "pbf"},
+		{"json", vectorLayersJSON},
+	}
+	meta.Version++
+	if err := inst.DB.Put("default", meta); err != nil {
+		t.Fatal(err)
+	}
+
+	h := newDaemon(inst, daemonConfig{DefaultTenant: "default", Tiles: true}).routes()
+	rec := getTile(t, h, "/tiles/vt.json")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("TileJSON is not valid JSON: %v", err)
+	}
+	layers, ok := got["vector_layers"].([]any)
+	if !ok || len(layers) != 1 {
+		t.Fatalf("vector_layers = %v, want the one layer from the json metadata row", got["vector_layers"])
+	}
+	layer, _ := layers[0].(map[string]any)
+	if layer["id"] != "roads" {
+		t.Errorf("vector_layers[0].id = %v, want roads", layer["id"])
+	}
+	stats, ok := got["tilestats"].(map[string]any)
+	if !ok || stats["layerCount"] != float64(1) {
+		t.Errorf("tilestats = %v, want layerCount 1", got["tilestats"])
+	}
+}
+
+// TestTileJSONETagChangesWithContent checks the discovery document itself is
+// cacheable and its validator reflects its own content, not a copy of the
+// tile route's.
+func TestTileJSONETagChangesWithContent(t *testing.T) {
+	h := newTileDaemon(t, true)
+	first := getTile(t, h, "/tiles/world.json")
+	etag := first.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("no ETag on TileJSON response")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/tiles/world.json", nil)
+	req.Header.Set("If-None-Match", etag)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotModified {
+		t.Errorf("repeat TileJSON fetch with a matching If-None-Match: status %d, want 304", rec.Code)
+	}
+}
+
 // TestTileTenantIsolation checks the tenant query parameter selects the right
 // database, so one daemon can serve several tenants' tilesets.
 func TestTileTenantIsolation(t *testing.T) {

@@ -185,3 +185,58 @@ budget, a warm tile lookup is in the same range as a SQLite file — see
 `importer.OpenMBTiles` remains the option when you would rather query an existing
 `.mbtiles` in place; its `Zooms` and `WithoutTileData` options read only the zoom
 levels or only the tile index you need.
+
+### B+Tree leaf/internal splits are byte-balanced, not count-balanced
+
+A `ModePagedIndex` table with variable-size records — the `images` half of an
+MBTiles projection is the case that surfaced it — used to split a full leaf
+page at the entry-count midpoint (`len(merged) / 2`). With records of very
+different encoded size, a count midpoint can leave one side of the split
+holding several large records whose combined bytes exceed a fresh page, even
+though the two sides together fit in two pages. A real regional tileset (158
+MiB, 11,465 `images` rows, mixed BLOB sizes in the 1.4–2.5 KiB range) failed
+importing into `ModePagedIndex` with exactly this shape of error:
+
+```
+insert row 10784: split right insert: btree page full: need 1569, have 1536 free
+```
+
+`internal/storage/pager/btree.go` now splits both leaf and internal pages by
+*encoded byte footprint* (`leafSplitIndex`/`internalSplitIndex`): the split
+point is chosen so both sides fit within one page's capacity, minimizing the
+byte-size skew between them rather than the entry-count skew. The overflow
+decision (inline value vs. a page-reference record) is a dedicated,
+pageSize-only function, `leafEntryNeedsOverflow`, so it never depends on how
+full any particular page happens to be at insert time — the same key/value
+pair overflows (or doesn't) the same way regardless of insertion order. A
+related gap in the same area is also fixed: replacing the *sole* record in a
+single-entry leaf with a larger value used to be handled by the same
+count-based split path and could fail outright (a one-entry set has no second
+side to split into); an oversized replace or insert first tries a from-scratch
+compaction of the leaf's live entries — which reclaims dead space earlier
+in-place updates never free — and only allocates a sibling page if the live
+content genuinely does not fit one page.
+
+**File-format compatibility:** this is a write-path *algorithm* change, not a
+page-layout change. Every on-disk structure — page header, slotted-page
+layout, leaf/internal record encoding, overflow-page chains, the free list,
+the superblock — is byte-for-byte identical to before; `CurrentFormatVersion`
+(`internal/storage/pager/superblock.go`) is unchanged. A `paged_index`
+artifact published by an older tinySQL build opens and reads correctly under
+the fixed code, and an artifact written by the fixed code reads correctly
+under older code too — the fix only changes *which* keys a writer places on
+which page during a split, never how a page's bytes are interpreted. There is
+nothing to migrate; rebuilding an artifact is only useful to get the more
+balanced page layout itself (marginally better fill and fewer future splits),
+not for correctness.
+
+Regression coverage: `internal/storage/pager/btree_split_regression_test.go`
+(exact boundary sizes from the report, all three key orders, replace/delete/
+insert cycles checked for leaked overflow pages, and multi-level internal-split
+invariants) and `internal/engine/paged_index_mbtiles_regression_test.go` (the
+same failure reproduced and fixed at the SQL/engine layer, including a real
+`UPDATE`/`DELETE`/`INSERT` sequence against overflow-sized BLOBs and a
+durable close + read-only reopen). Read-path performance for the MBTiles
+`map`→`tile_id`→`images` access shape, including size-class-isolated,
+concurrent-reader and open/reopen benchmarks, lives in
+[BENCHMARKS.md](../BENCHMARKS.md#mbtiles-import-a-tileset-larger-than-memory).

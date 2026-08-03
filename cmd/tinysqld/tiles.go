@@ -19,6 +19,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -55,6 +58,53 @@ func tileFormatFor(format string) tileFormat {
 	}
 	// Unknown formats are sent as opaque bytes rather than guessed at.
 	return tileFormat{contentType: "application/octet-stream"}
+}
+
+// tileETag computes a strong ETag for a response body. Every tile route is a
+// deterministic function of the stored bytes, so hashing them lets a browser,
+// CDN, or `curl -z`/If-None-Match re-request skip the transfer entirely
+// instead of only relying on the coarser Cache-Control max-age.
+func tileETag(body []byte) string {
+	sum := sha256.Sum256(body)
+	// 16 bytes (128 bits) is far more than enough to distinguish tiles and
+	// keeps the header short; this is a cache-validation token, not a security
+	// digest.
+	return `"` + hex.EncodeToString(sum[:16]) + `"`
+}
+
+// etagMatches reports whether the client's If-None-Match value — a
+// comma-separated list of (optionally weak, "W/"-prefixed) ETags, or "*" —
+// already covers etag.
+func etagMatches(ifNoneMatch, etag string) bool {
+	ifNoneMatch = strings.TrimSpace(ifNoneMatch)
+	if ifNoneMatch == "" {
+		return false
+	}
+	if ifNoneMatch == "*" {
+		return true
+	}
+	for _, tok := range strings.Split(ifNoneMatch, ",") {
+		tok = strings.TrimPrefix(strings.TrimSpace(tok), "W/")
+		if tok == etag {
+			return true
+		}
+	}
+	return false
+}
+
+// writeNotModifiedIfCached sets ETag and Cache-Control, then reports whether
+// the request's If-None-Match already covers this body. When it does, the
+// caller must skip writing Content-Type/Content-Length/body: RFC 7232 4.1
+// only allows a 304 to carry validator and caching headers, not entity ones.
+func writeNotModifiedIfCached(w http.ResponseWriter, r *http.Request, body []byte, cacheControl string) bool {
+	etag := tileETag(body)
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", cacheControl)
+	if etagMatches(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return true
+	}
+	return false
 }
 
 // tilesetName validates the tileset path segment before it reaches SQL.
@@ -209,14 +259,20 @@ func (d *daemon) handleTile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Tilesets are immutable in practice; a rebuild publishes a new tileset.
+	// Checking If-None-Match here, before the metadata lookup below, means a
+	// client that already has this exact tile cached also skips paying for
+	// that second query.
+	if writeNotModifiedIfCached(w, r, data, "public, max-age=3600") {
+		return
+	}
+
 	format := tileFormatFor(d.tilesetMetadata(ctx, tenant, name)["format"])
 	w.Header().Set("Content-Type", format.contentType)
 	if format.contentEncoding != "" {
 		w.Header().Set("Content-Encoding", format.contentEncoding)
 	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-	// Tilesets are immutable in practice; a rebuild publishes a new tileset.
-	w.Header().Set("Cache-Control", "public, max-age=3600")
 	if r.Method == http.MethodHead {
 		w.WriteHeader(http.StatusOK)
 		return
@@ -291,7 +347,50 @@ func (d *daemon) handleTileJSON(w http.ResponseWriter, r *http.Request, rawName 
 	if center, ok := parseFloatList(meta["center"], 3); ok {
 		out["center"] = center
 	}
-	writeJSON(w, http.StatusOK, out)
+	// Vector tilesets built by tippecanoe and similar tools record a `json`
+	// metadata row: a JSON-encoded object carrying vector_layers (the layer
+	// names and fields a style or inspector needs) and tilestats. TileJSON 3.0
+	// defines both as top-level keys, so a client that reads this document
+	// directly — rather than the mbtiles file — gets the same layer info.
+	if extra, ok := parseJSONMetadata(meta["json"]); ok {
+		if vl, ok := extra["vector_layers"]; ok {
+			out["vector_layers"] = vl
+		}
+		if ts, ok := extra["tilestats"]; ok {
+			out["tilestats"] = ts
+		}
+	}
+	writeCacheableJSON(w, r, out, "public, max-age=3600")
+}
+
+// parseJSONMetadata decodes an MBTiles `json` metadata value into a map. An
+// empty or malformed value is not an error: the field is optional and only a
+// handful of tileset generators write it.
+func parseJSONMetadata(raw string) (map[string]any, bool) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, false
+	}
+	var out map[string]any
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+// writeCacheableJSON marshals v once so it can both be hashed for ETag and
+// written, honoring If-None-Match the same way the tile route does.
+func writeCacheableJSON(w http.ResponseWriter, r *http.Request, v any, cacheControl string) {
+	body, err := json.Marshal(v)
+	if err != nil {
+		writeErrorJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if writeNotModifiedIfCached(w, r, body, cacheControl) {
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 
 func (d *daemon) handleTileMetadata(w http.ResponseWriter, r *http.Request, rawName string) {
@@ -308,7 +407,7 @@ func (d *daemon) handleTileMetadata(w http.ResponseWriter, r *http.Request, rawN
 		writeErrorJSON(w, http.StatusNotFound, "no metadata table for tileset "+name)
 		return
 	}
-	writeJSON(w, http.StatusOK, meta)
+	writeCacheableJSON(w, r, meta, "public, max-age=3600")
 }
 
 // observedZoomRange derives a zoom range from the tiles table when metadata does

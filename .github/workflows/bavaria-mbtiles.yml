@@ -1,0 +1,91 @@
+name: Bavaria MBTiles Demo (Dingolfing-Landau)
+
+# Builds a real, OpenStreetMap-derived vector tileset for the Landkreis
+# Dingolfing-Landau and publishes it to a rolling GitHub Release so
+# cmd/query_files_wasm/tiles-demo-bavaria.html can fetch it at runtime --
+# deliberately not committed into the git tree, unlike cmd/mbtilesdemo's tiny
+# synthetic tileset, since a real district's tiles run to several MB and
+# would otherwise bloat repo history on every rebuild.
+#
+# This job downloads Geofabrik's Niederbayern extract, clips and tiles it
+# (see scripts/build-bavaria-tiles.sh for the osmium/tippecanoe details and
+# why they run outside Go), then imports the result through tinySQL's own
+# ImportMBTiles (cmd/mbtilesregion) to produce the browser snapshot.
+#
+# Manual and monthly rather than on every push: it downloads a multi-hundred-
+# MB regional extract and runs a multi-minute native toolchain, which has no
+# business gating ordinary PRs.
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: '17 3 1 * *' # 03:17 UTC on the 1st of each month
+
+permissions:
+  contents: write # to publish the release asset
+
+env:
+  RELEASE_TAG: bavaria-demo-latest
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ${{ github.workspace }}/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.mod', '**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      # osmium-tool: apt (Ubuntu's universe repo carries a recent enough
+      # build). tippecanoe: no Ubuntu package, so build the small, fast-to-
+      # compile release tag from source -- this is the standard install path
+      # documented in the tippecanoe README for CI environments.
+      - name: Install osmium-tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y osmium-tool
+
+      - name: Install tippecanoe
+        run: |
+          sudo apt-get install -y build-essential libsqlite3-dev zlib1g-dev
+          git clone --depth 1 --branch 2.63.0 https://github.com/felt/tippecanoe.git /tmp/tippecanoe
+          make -C /tmp/tippecanoe -j"$(nproc)"
+          sudo make -C /tmp/tippecanoe install
+
+      - name: Build the tileset (download, extract, tile)
+        run: ./scripts/build-bavaria-tiles.sh build/bavaria
+
+      - name: Import through tinySQL and build the browser snapshot
+        run: |
+          go run -tags=sqliteimport ./cmd/mbtilesregion \
+            -in build/bavaria/dingolfing-landau.mbtiles \
+            -out build/bavaria/artifacts \
+            -table tiles
+
+      - name: Publish to the rolling release
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" \
+              --title "Bavaria MBTiles demo data (Dingolfing-Landau)" \
+              --notes "Auto-published by .github/workflows/bavaria-mbtiles.yml. Source: Geofabrik niederbayern-latest.osm.pbf, © OpenStreetMap contributors (ODbL)." \
+              --prerelease
+          gh release upload "$RELEASE_TAG" \
+            build/bavaria/artifacts/snapshot.b64 \
+            build/bavaria/dingolfing-landau.mbtiles \
+            --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}

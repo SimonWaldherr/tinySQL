@@ -68,6 +68,23 @@ therefore eligible for the WASM module's compiled-query cache), shows the
 tileset's MBTiles metadata, and lets you click the map to run `TILE_ZXY`,
 `TILE_QUADKEY` and `TILE_BBOX` for that point.
 
+A `settlements` table (procedurally named and placed points of interest, one
+row per marker, geometry stored as the same GeoJSON `GEO_POINT` shape) sits
+alongside `tiles` to demonstrate `GEO_DISTANCE`/`GEO_BEARING`/`GEO_MIDPOINT`
+against real rows: clicking the map runs a `GEO_DISTANCE` + `ORDER BY ... LIMIT
+1` nearest-settlement query, and clicking two markers runs one query
+computing the distance, initial bearing and great-circle midpoint between
+them (drawn on the map). See [`settlements.go`](../mbtilesdemo/settlements.go).
+
+A `mapshaper_shapes` GeoJSON layer powers the **Mapshaper-style editing**
+panel. It executes `ST_SIMPLIFY`, `ST_SMOOTH`, `ST_AFFINE`, and
+`ST_REMOVE_HOLES` against a line, a polygon with a hole, and a multipolygon,
+then displays the result with its `ST_BBOX` and `ST_CENTROID`. The dashed
+outline remains the source geometry so the transformation is directly visible.
+You can also upload any GeoJSON object, tune simplification, smoothing, or
+affine parameters, and download the transformed result without sending the
+file anywhere. See [`shapes.go`](../mbtilesdemo/shapes.go).
+
 The tileset is generated, non-geographic art (value noise, quantized into flat
 color bands) — see [`cmd/mbtilesdemo`](../mbtilesdemo) at the repo root. That
 generator round-trips the tileset through tinySQL's real MBTiles pipeline

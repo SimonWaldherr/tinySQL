@@ -286,6 +286,8 @@ func benchmarkLatencyCorpus(b *testing.B, artifactBytes int64, lookup func(int))
 	b.ReportMetric(float64(percentileDuration(latencies, 99))/1e3, "p99_us")
 	b.ReportMetric(float64(after.HeapAlloc), "heap_B")
 	b.ReportMetric(float64(after.HeapAlloc-before.HeapAlloc), "heap_delta_B")
+	b.ReportMetric(float64(after.NumGC-before.NumGC), "gc_cycles")
+	b.ReportMetric(float64(after.PauseTotalNs-before.PauseTotalNs)/1e6, "gc_pause_ms")
 	if rss := benchmarkPeakRSSBytes(); rss > 0 {
 		b.ReportMetric(float64(rss), "peak_rss_B")
 	}

@@ -210,7 +210,64 @@ func buildBrowserDB(roundTrip *storage.DB) (*storage.DB, error) {
 		return nil, err
 	}
 
+	if err := addSettlementsTable(demo); err != nil {
+		return nil, fmt.Errorf("build settlements: %w", err)
+	}
+	if err := addMapshaperShapesTable(demo); err != nil {
+		return nil, fmt.Errorf("build mapshaper shapes: %w", err)
+	}
+
 	return demo, nil
+}
+
+// addSettlementsTable adds the points-of-interest layer the demo page uses to
+// show GEO_DISTANCE/GEO_BEARING/GEO_MIDPOINT running against real rows, not
+// just literal coordinates. geometry is stored as the same GeoJSON Point text
+// GEO_POINT() itself produces (see geoPointJSON in settlements.go), so it
+// needs no conversion before reaching those functions.
+func addSettlementsTable(demo *storage.DB) error {
+	places := buildSettlements()
+	settlements := storage.NewTable("settlements", []storage.Column{
+		{Name: "name", Type: storage.TextType},
+		{Name: "geometry", Type: storage.TextType},
+		{Name: "biome", Type: storage.TextType},
+		{Name: "population", Type: storage.IntType},
+	}, false)
+	for _, s := range places {
+		geom, err := geoPointJSON(s.Lon, s.Lat)
+		if err != nil {
+			return fmt.Errorf("encode settlement %q: %w", s.Name, err)
+		}
+		settlements.Rows = append(settlements.Rows, []any{s.Name, geom, s.Biome, s.Population})
+	}
+	settlements.Version++
+	if err := settlements.CreateSecondaryIndex("settlements_name", []string{"name"}, true); err != nil {
+		return fmt.Errorf("index settlements: %w", err)
+	}
+	fmt.Printf("placed %d settlements\n", len(places))
+	return demo.Put("default", settlements)
+}
+
+// addMapshaperShapesTable provides a small geometry layer for the browser's
+// editing panel. Keeping these as GeoJSON text makes every operation run
+// through tinySQL's GEO_*/ST_* functions, just like user-supplied geometry.
+func addMapshaperShapesTable(demo *storage.DB) error {
+	shapes := buildMapshaperShapes()
+	table := storage.NewTable("mapshaper_shapes", []storage.Column{
+		{Name: "name", Type: storage.TextType},
+		{Name: "kind", Type: storage.TextType},
+		{Name: "geometry", Type: storage.TextType},
+		{Name: "description", Type: storage.TextType},
+	}, false)
+	for _, shape := range shapes {
+		table.Rows = append(table.Rows, []any{shape.Name, shape.Kind, shape.Geometry, shape.Description})
+	}
+	table.Version++
+	if err := table.CreateSecondaryIndex("mapshaper_shapes_name", []string{"name"}, true); err != nil {
+		return fmt.Errorf("index mapshaper shapes: %w", err)
+	}
+	fmt.Printf("added %d mapshaper editing shapes\n", len(shapes))
+	return demo.Put("default", table)
 }
 
 func writeAssets(outDir string, demoDB *storage.DB, mbtilesPath string) error {
