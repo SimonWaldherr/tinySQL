@@ -200,13 +200,22 @@ FROM places a JOIN places b
 | Radius check | `GEO_DWITHIN` | `ST_DWITHIN` |
 | Bounding-box check | `GEO_WITHIN_BBOX` | `ST_WITHIN_BBOX` |
 | Bearing / midpoint / destination | `GEO_BEARING`, `GEO_MIDPOINT`, `GEO_DESTINATION` | `ST_AZIMUTH`, `ST_MIDPOINT`, `ST_PROJECT` |
-| Point in polygon | `GEO_WITHIN_POLYGON` | `ST_WITHIN`, `ST_CONTAINS` |
+| Point in polygon/multipolygon | `GEO_WITHIN_POLYGON` | `ST_WITHIN`, `ST_CONTAINS` |
 | Polygon area / line length | `GEO_POLYGON_AREA`, `GEO_LENGTH` | `ST_AREA`, `ST_LENGTH` |
+| Circular buffer around a point | `GEO_BUFFER(point, meters[, segments])` | `ST_BUFFER` |
+| Convex hull of a geometry's vertices | `GEO_CONVEX_HULL` | `ST_CONVEXHULL` |
+| Bounding box as a polygon | `GEO_ENVELOPE` | `ST_ENVELOPE` |
+| Point at a fraction along a line | `GEO_LINE_INTERPOLATE(line, fraction)` | `ST_LINE_INTERPOLATE_POINT` |
 
-Distance, bearing, destination, length, and area calculations operate on the
-sphere; distances are meters and polygon areas are square meters. Coordinates
-in raw four-number forms use `(lat, lon, lat, lon)`; GeoJSON remains
-`[lon, lat]`.
+Distance, bearing, destination, length, area, and buffer calculations operate
+on the sphere; distances are meters and polygon areas are square meters.
+Coordinates in raw four-number forms use `(lat, lon, lat, lon)`; GeoJSON
+remains `[lon, lat]`. `GEO_WITHIN_POLYGON`/`ST_CONTAINS`/`GEO_POLYGON_AREA`
+accept a GeoJSON `MultiPolygon` as well as a `Polygon` — membership in any
+part counts as membership in the whole, and area sums every part.
+`GEO_LINE_INTERPOLATE` splits by actual distance along the line, not by
+vertex count. `GEO_CONVEX_HULL` computes the hull in plain lon/lat space
+(a standard planar approximation, not a rigorous spherical hull).
 
 ### Geometry editing and quality
 

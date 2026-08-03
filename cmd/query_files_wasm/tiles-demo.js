@@ -471,9 +471,7 @@ function runShapeOperation(operation) {
             ' AS geometry FROM mapshaper_shapes WHERE name = ' + quoteSQL(name);
     const sql =
         'WITH selected AS (' + selectedSourceSQL + ') ' +
-        'ST_CENTROID(geometry) AS centroid FROM selected';
         'SELECT name, kind, description, source_geometry, geometry, ST_ISVALID(geometry) AS is_valid, ST_BBOX(geometry) AS bbox, ' +
-        'ST_CENTROID(geometry) AS centroid FROM selected';
         'ST_CENTROID(geometry) AS centroid FROM selected';
     document.getElementById('shapeSQL').textContent = sql;
     const res = runSQL(sql, { kind: 'mapshaper' });

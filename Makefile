@@ -30,7 +30,7 @@ QUERY_FILES_WASM_SCRIPT := $(QUERY_FILES_WASM_DIR)/build.sh
 GH_PAGES_BRANCH ?= gh-pages
 GH_PAGES_WORKTREE ?= .gh-pages-worktree
 GH_PAGES_COMMIT_MESSAGE ?= Update gh-pages demo
-GH_PAGES_DEMO_FILES := index.html app.js query_files.wasm query_files.wasm.gz wasm_exec.js tiles-demo.html tiles-demo.js tiles-demo-data.js demo.mbtiles
+GH_PAGES_DEMO_FILES := index.html app.js query_files.wasm query_files.wasm.gz wasm_exec.js tiles-demo.html tiles-demo.js tiles-demo-data.js demo.mbtiles tiles-demo-bavaria.html tiles-demo-bavaria.js
 
 # Color output
 GREEN := \033[0;32m

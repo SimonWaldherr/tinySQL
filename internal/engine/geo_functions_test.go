@@ -562,3 +562,250 @@ func TestGeoLengthAndAreaAndPolygonRejectWrongGeometryType(t *testing.T) {
 		}
 	}
 }
+
+const geoTestTwoSquaresMultiPolygon = `{"type":"MultiPolygon","coordinates":[` +
+	`[[[0,0],[0,1],[1,1],[1,0],[0,0]]],` +
+	`[[[10,10],[10,11],[11,11],[11,10],[10,10]]]` +
+	`]}`
+
+// TestGeoWithinPolygonAcceptsMultiPolygon checks GEO_WITHIN_POLYGON/
+// ST_CONTAINS against a MultiPolygon of two disjoint unit squares: a point
+// must read as "within" if it falls inside *either* part, and "not within"
+// if it falls in neither -- previously this errored outright, since
+// geoPolygonFromValue only accepted a bare Polygon.
+func TestGeoWithinPolygonAcceptsMultiPolygon(t *testing.T) {
+	db := storage.NewDB()
+	rs, err := Execute(context.Background(), db, "default", mustParse(fmt.Sprintf(`
+		SELECT
+			GEO_WITHIN_POLYGON(GEO_POINT(0.5, 0.5), '%s') AS in_first_part,
+			GEO_WITHIN_POLYGON(GEO_POINT(10.5, 10.5), '%s') AS in_second_part,
+			GEO_WITHIN_POLYGON(GEO_POINT(5, 5), '%s') AS in_neither,
+			ST_CONTAINS('%s', GEO_POINT(0.5, 0.5)) AS contains_alias
+	`, geoTestTwoSquaresMultiPolygon, geoTestTwoSquaresMultiPolygon, geoTestTwoSquaresMultiPolygon, geoTestTwoSquaresMultiPolygon)))
+	if err != nil {
+		t.Fatalf("GEO_WITHIN_POLYGON on MultiPolygon: %v", err)
+	}
+	if got := rs.Rows[0]["in_first_part"]; got != true {
+		t.Errorf("in_first_part = %#v, want true", got)
+	}
+	if got := rs.Rows[0]["in_second_part"]; got != true {
+		t.Errorf("in_second_part = %#v, want true", got)
+	}
+	if got := rs.Rows[0]["in_neither"]; got != false {
+		t.Errorf("in_neither = %#v, want false", got)
+	}
+	if got := rs.Rows[0]["contains_alias"]; got != true {
+		t.Errorf("contains_alias = %#v, want true", got)
+	}
+}
+
+// TestGeoPolygonAreaSumsMultiPolygonParts checks that a MultiPolygon's area
+// equals the sum of each part's area computed independently (each part run
+// back through GEO_POLYGON_AREA as a standalone Polygon).
+func TestGeoPolygonAreaSumsMultiPolygonParts(t *testing.T) {
+	db := storage.NewDB()
+	rs, err := Execute(context.Background(), db, "default", mustParse(fmt.Sprintf(`
+		SELECT
+			GEO_POLYGON_AREA('%s') AS multi_area,
+			GEO_POLYGON_AREA('{"type":"Polygon","coordinates":[[[0,0],[0,1],[1,1],[1,0],[0,0]]]}') AS part1_area,
+			GEO_POLYGON_AREA('{"type":"Polygon","coordinates":[[[10,10],[10,11],[11,11],[11,10],[10,10]]]}') AS part2_area
+	`, geoTestTwoSquaresMultiPolygon)))
+	if err != nil {
+		t.Fatalf("GEO_POLYGON_AREA on MultiPolygon: %v", err)
+	}
+	multiArea := rs.Rows[0]["multi_area"].(float64)
+	part1 := rs.Rows[0]["part1_area"].(float64)
+	part2 := rs.Rows[0]["part2_area"].(float64)
+	want := part1 + part2
+	if relErr := math.Abs(multiArea-want) / want; relErr > 1e-9 {
+		t.Fatalf("multi_area = %v, want part1(%v) + part2(%v) = %v", multiArea, part1, part2, want)
+	}
+}
+
+// TestGeoBufferVerticesAreAtTheRequestedRadius checks GEO_BUFFER's polygon:
+// every vertex must be (very close to) radius meters from the center, the
+// ring must be explicitly closed, and it must have the requested segment
+// count plus the closing vertex.
+func TestGeoBufferVerticesAreAtTheRequestedRadius(t *testing.T) {
+	db := storage.NewDB()
+	const radius = 5000.0
+	rs, err := Execute(context.Background(), db, "default", mustParse(fmt.Sprintf(
+		`SELECT ST_BUFFER(GEO_POINT(13.4050, 52.5200), %v, 16) AS buf`, radius)))
+	if err != nil {
+		t.Fatalf("ST_BUFFER: %v", err)
+	}
+	var buf struct {
+		Type        string         `json:"type"`
+		Coordinates [][][2]float64 `json:"coordinates"`
+	}
+	if err := json.Unmarshal([]byte(rs.Rows[0]["buf"].(string)), &buf); err != nil {
+		t.Fatalf("invalid buffer GeoJSON: %v", err)
+	}
+	if buf.Type != "Polygon" {
+		t.Fatalf("buffer type = %q, want Polygon", buf.Type)
+	}
+	if len(buf.Coordinates) != 1 {
+		t.Fatalf("buffer has %d rings, want 1", len(buf.Coordinates))
+	}
+	ring := buf.Coordinates[0]
+	if len(ring) != 17 { // 16 segments + the closing repeat of the first vertex
+		t.Fatalf("buffer ring has %d positions, want 17 (16 segments + close)", len(ring))
+	}
+	first, last := ring[0], ring[len(ring)-1]
+	if first != last {
+		t.Fatalf("buffer ring is not closed: first=%v last=%v", first, last)
+	}
+	for i, pos := range ring[:len(ring)-1] {
+		got := haversineMeters(52.5200, 13.4050, pos[1], pos[0])
+		if math.Abs(got-radius) > 1 {
+			t.Errorf("vertex %d is %v meters from center, want %v", i, got, radius)
+		}
+	}
+}
+
+// TestGeoBufferRejectsInvalidArguments checks the radius and segment-count
+// validation errors rather than silently producing a degenerate polygon.
+func TestGeoBufferRejectsInvalidArguments(t *testing.T) {
+	db := storage.NewDB()
+	for _, sql := range []string{
+		`SELECT GEO_BUFFER(GEO_POINT(0, 0), 0)`,
+		`SELECT GEO_BUFFER(GEO_POINT(0, 0), -100)`,
+		`SELECT GEO_BUFFER(GEO_POINT(0, 0), 1000, 4)`,   // below the 8 minimum
+		`SELECT GEO_BUFFER(GEO_POINT(0, 0), 1000, 300)`, // above the 256 maximum
+		`SELECT GEO_BUFFER(GEO_POINT(0, 0), 1000, 8.5)`, // not an integer
+	} {
+		if _, err := Execute(context.Background(), db, "default", mustParse(sql)); err == nil {
+			t.Errorf("%s: expected a validation error, got none", sql)
+		}
+	}
+}
+
+// TestGeoConvexHullExcludesInteriorPoints checks the classic case: a square
+// plus its own center point. The hull must be exactly the 4 corners -- the
+// center point must not appear as a hull vertex.
+func TestGeoConvexHullExcludesInteriorPoints(t *testing.T) {
+	db := storage.NewDB()
+	rs, err := Execute(context.Background(), db, "default", mustParse(`
+		SELECT GEO_CONVEX_HULL('{"type":"MultiPoint","coordinates":[[0,0],[0,10],[10,10],[10,0],[5,5]]}') AS hull
+	`))
+	if err != nil {
+		t.Fatalf("GEO_CONVEX_HULL: %v", err)
+	}
+	var hull struct {
+		Coordinates [][][2]float64 `json:"coordinates"`
+	}
+	if err := json.Unmarshal([]byte(rs.Rows[0]["hull"].(string)), &hull); err != nil {
+		t.Fatalf("invalid hull GeoJSON: %v", err)
+	}
+	ring := hull.Coordinates[0]
+	// 4 distinct corners + 1 closing repeat = 5, not 6: the interior point
+	// (5, 5) must have been discarded, not kept as a fifth hull vertex.
+	if len(ring) != 5 {
+		t.Fatalf("hull ring has %d positions, want 5 (4 corners + close); interior point may have leaked in: %v", len(ring), ring)
+	}
+	for _, pos := range ring {
+		if pos == [2]float64{5, 5} {
+			t.Fatalf("hull ring contains the interior point (5,5): %v", ring)
+		}
+	}
+}
+
+// TestGeoConvexHullRejectsCollinearPoints checks that points with no area
+// (all on one line) report an error rather than a degenerate polygon.
+func TestGeoConvexHullRejectsCollinearPoints(t *testing.T) {
+	db := storage.NewDB()
+	_, err := Execute(context.Background(), db, "default", mustParse(
+		`SELECT GEO_CONVEX_HULL('{"type":"MultiPoint","coordinates":[[0,0],[1,1],[2,2],[3,3]]}')`))
+	if err == nil {
+		t.Fatal("expected an error for collinear points, got none")
+	}
+}
+
+// TestGeoEnvelopeRoundTripsWithBBox checks that ST_ENVELOPE's rectangular
+// Polygon has exactly the same bounding box as the original geometry --
+// wrapping GEO_BBOX's array as a polygon must not shift or distort it.
+func TestGeoEnvelopeRoundTripsWithBBox(t *testing.T) {
+	db := storage.NewDB()
+	geometry := `{"type":"Polygon","coordinates":[[[35,-13],[48,-19],[66,-13],[74,1],[65,17],[46,20],[31,7],[35,-13]]]}`
+	rs, err := Execute(context.Background(), db, "default", mustParse(fmt.Sprintf(`
+		SELECT ST_BBOX('%s') AS original_bbox, ST_BBOX(ST_ENVELOPE('%s')) AS envelope_bbox
+	`, geometry, geometry)))
+	if err != nil {
+		t.Fatalf("ST_ENVELOPE round trip: %v", err)
+	}
+	if rs.Rows[0]["original_bbox"] != rs.Rows[0]["envelope_bbox"] {
+		t.Fatalf("envelope bbox = %v, want it to match the original bbox %v", rs.Rows[0]["envelope_bbox"], rs.Rows[0]["original_bbox"])
+	}
+}
+
+// TestGeoLineInterpolateEndpointsAndMidpoint checks fraction 0/1 return the
+// exact first/last vertex, and fraction 0.5 on a straight 2-point line
+// (where distance-based and arithmetic-mean interpolation coincide) returns
+// the arithmetic midpoint.
+func TestGeoLineInterpolateEndpointsAndMidpoint(t *testing.T) {
+	db := storage.NewDB()
+	line := `'{"type":"LineString","coordinates":[[10,20],[30,40]]}'`
+	rs, err := Execute(context.Background(), db, "default", mustParse(fmt.Sprintf(`
+		SELECT
+			GEO_LON(GEO_LINE_INTERPOLATE(%s, 0)) AS start_lon,
+			GEO_LAT(GEO_LINE_INTERPOLATE(%s, 0)) AS start_lat,
+			GEO_LON(GEO_LINE_INTERPOLATE(%s, 1)) AS end_lon,
+			GEO_LAT(GEO_LINE_INTERPOLATE(%s, 1)) AS end_lat,
+			GEO_LON(ST_LINE_INTERPOLATE_POINT(%s, 0.5)) AS mid_lon,
+			GEO_LAT(ST_LINE_INTERPOLATE_POINT(%s, 0.5)) AS mid_lat
+	`, line, line, line, line, line, line)))
+	if err != nil {
+		t.Fatalf("GEO_LINE_INTERPOLATE: %v", err)
+	}
+	expectFloat(t, rs.Rows[0]["start_lon"], 10, 1e-9, "start_lon")
+	expectFloat(t, rs.Rows[0]["start_lat"], 20, 1e-9, "start_lat")
+	expectFloat(t, rs.Rows[0]["end_lon"], 30, 1e-9, "end_lon")
+	expectFloat(t, rs.Rows[0]["end_lat"], 40, 1e-9, "end_lat")
+	expectFloat(t, rs.Rows[0]["mid_lon"], 20, 1e-6, "mid_lon")
+	expectFloat(t, rs.Rows[0]["mid_lat"], 30, 1e-6, "mid_lat")
+}
+
+// TestGeoLineInterpolateIsDistanceBasedNotVertexBased checks the important
+// distinction: interpolating at fraction 0.5 on a line with very unequal
+// segment lengths must land 50% of the way by *distance*, not jump to the
+// middle *vertex*. The expected point is computed independently here using
+// the same haversineMeters GEO_LENGTH already relies on as an oracle.
+func TestGeoLineInterpolateIsDistanceBasedNotVertexBased(t *testing.T) {
+	db := storage.NewDB()
+	// A meridian (constant longitude), so linear lon/lat interpolation between
+	// bracketing vertices is also exact great-circle interpolation here --
+	// isolating the distance-vs-vertex-fraction behavior from any curvature
+	// approximation.
+	seg1 := haversineMeters(0, 0, 1, 0)  // (lat 0 -> 1), short
+	seg2 := haversineMeters(1, 0, 10, 0) // (lat 1 -> 10), long
+	total := seg1 + seg2
+	target := 0.5 * total
+	wantLat := 1 + (target-seg1)/seg2*(10-1)
+
+	rs, err := Execute(context.Background(), db, "default", mustParse(
+		`SELECT GEO_LAT(GEO_LINE_INTERPOLATE('{"type":"LineString","coordinates":[[0,0],[0,1],[0,10]]}', 0.5)) AS lat`))
+	if err != nil {
+		t.Fatalf("GEO_LINE_INTERPOLATE: %v", err)
+	}
+	got := rs.Rows[0]["lat"].(float64)
+	if math.Abs(got-wantLat) > 1e-6 {
+		t.Fatalf("interpolated lat = %v, want %v (distance-based, not the middle vertex at lat=1)", got, wantLat)
+	}
+	if math.Abs(got-1) < 1 {
+		t.Fatalf("interpolated lat = %v landed near the middle *vertex* (lat=1) instead of splitting by distance", got)
+	}
+}
+
+// TestGeoLineInterpolateRejectsOutOfRangeFraction checks fraction must be
+// within [0, 1].
+func TestGeoLineInterpolateRejectsOutOfRangeFraction(t *testing.T) {
+	db := storage.NewDB()
+	for _, sql := range []string{
+		`SELECT GEO_LINE_INTERPOLATE('{"type":"LineString","coordinates":[[0,0],[1,1]]}', -0.1)`,
+		`SELECT GEO_LINE_INTERPOLATE('{"type":"LineString","coordinates":[[0,0],[1,1]]}', 1.1)`,
+	} {
+		if _, err := Execute(context.Background(), db, "default", mustParse(sql)); err == nil {
+			t.Errorf("%s: expected a range error, got none", sql)
+		}
+	}
+}
