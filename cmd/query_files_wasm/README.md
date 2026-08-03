@@ -89,6 +89,11 @@ any GeoJSON object, tune simplification, smoothing, affine, or snapping
 parameters, and download the transformed result without sending the file
 anywhere. See [`shapes.go`](../mbtilesdemo/shapes.go).
 
+`tiles-demo-bavaria.html` is a separate real-data MapLibre demonstration. Its
+monthly build publishes the sizeable snapshot into the `gh-pages` branch as a
+same-origin asset; it must not fetch the GitHub Release download URL at runtime,
+because the release redirect does not permit browser CORS access.
+
 The tileset is generated, non-geographic art (value noise, quantized into flat
 color bands) — see [`cmd/mbtilesdemo`](../mbtilesdemo) at the repo root. That
 generator round-trips the tileset through tinySQL's real MBTiles pipeline

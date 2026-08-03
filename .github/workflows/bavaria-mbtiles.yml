@@ -1,11 +1,10 @@
 name: Bavaria MBTiles Demo (Dingolfing-Landau)
 
 # Builds a real, OpenStreetMap-derived vector tileset for the Landkreis
-# Dingolfing-Landau and publishes it to a rolling GitHub Release so
-# cmd/query_files_wasm/tiles-demo-bavaria.html can fetch it at runtime --
-# deliberately not committed into the git tree, unlike cmd/mbtilesdemo's tiny
-# synthetic tileset, since a real district's tiles run to several MB and
-# would otherwise bloat repo history on every rebuild.
+# Dingolfing-Landau and publishes it to a rolling GitHub Release and the
+# gh-pages branch. The browser loads the gh-pages copy from its own origin:
+# GitHub Release downloads redirect to a storage host without browser CORS
+# access. The multi-megabyte snapshot stays out of the main repository history.
 #
 # This job downloads Geofabrik's Niederbayern extract, clips and tiles it
 # (see scripts/build-bavaria-tiles.sh for the osmium/tippecanoe details and
@@ -89,3 +88,21 @@ jobs:
             --clobber
         env:
           GH_TOKEN: ${{ github.token }}
+
+      - name: Publish same-origin snapshot to gh-pages
+        run: |
+          set -euo pipefail
+          pages_dir="$(mktemp -d)"
+          trap 'rm -rf "$pages_dir"' EXIT
+          git fetch origin gh-pages:gh-pages
+          git worktree add "$pages_dir" gh-pages
+          cp build/bavaria/artifacts/snapshot.b64 "$pages_dir/bavaria-snapshot.b64"
+          git -C "$pages_dir" add bavaria-snapshot.b64
+          if git -C "$pages_dir" diff --cached --quiet; then
+            echo "gh-pages Bavaria snapshot is already current"
+            exit 0
+          fi
+          git -C "$pages_dir" config user.name "github-actions[bot]"
+          git -C "$pages_dir" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$pages_dir" commit -m "Update Bavaria demo snapshot"
+          git -C "$pages_dir" push origin gh-pages
