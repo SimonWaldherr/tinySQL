@@ -26,8 +26,22 @@
             display: flex;
             align-items: center;
             gap: 10px;
-            height: 48px;
+            height: var(--topbar-h, 48px);
         }
+        .topbar.collapsed { padding: 4px 12px; }
+        .topbar.collapsed h1, .topbar.collapsed .topbar-badge { display: none; }
+        .expand-btn {
+            border: 1px solid #3e3e42;
+            border-radius: 999px;
+            background: #2d2d30;
+            color: #9cdcfe;
+            font-size: 11px;
+            padding: 4px 10px;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        .expand-btn:hover { background: #0e639c; color: #fff; }
+        .topbar.collapsed .expand-btn { margin-left: auto; }
         .brand-link {
             font-size: 16px;
             font-weight: 600;
@@ -56,7 +70,8 @@
             padding: 3px 10px;
             white-space: nowrap;
         }
-        .layout { display: flex; height: calc(100% - 48px); }
+        .layout { display: flex; height: calc(100% - var(--topbar-h, 48px)); }
+        .sidebar.collapsed { display: none; }
         #map { flex: 1 1 auto; background: #16181a; min-width: 0; }
         .sidebar {
             width: 380px;
@@ -112,7 +127,7 @@
         table.meta-table td:first-child { color: #9cdcfe; white-space: nowrap; padding-right: 8px; }
         table.meta-table td:last-child { color: #d4d4d4; word-break: break-word; }
         .btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
-        a.btn {
+        a.btn, button.btn {
             display: inline-block;
             background: #0e639c;
             color: #fff;
@@ -120,10 +135,15 @@
             font-size: 11.5px;
             padding: 6px 10px;
             border-radius: 4px;
+            border: none;
+            cursor: pointer;
+            font-family: inherit;
         }
-        a.btn:hover { background: #1177bb; }
-        a.btn.secondary { background: #3d475a; }
-        a.btn.secondary:hover { background: #4b5468; }
+        a.btn:hover, button.btn:hover { background: #1177bb; }
+        a.btn.secondary, button.btn.secondary { background: #3d475a; }
+        a.btn.secondary:hover, button.btn.secondary:hover { background: #4b5468; }
+        button.btn.active { background: #4ec9b0; color: #16181a; }
+        #zoomButtons button { min-width: 44px; }
         #status { font-size: 11px; color: #9ca7b8; padding: 4px 0 0; }
         .status-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #f0ad4e; margin-right: 5px; }
         .status-dot.ready { background: #4ec9b0; }
@@ -139,6 +159,55 @@
         .attribution-note a { color: #9cdcfe; }
         .maplibregl-ctrl-attrib { background: rgba(37, 37, 38, 0.8); color: #c7d0da; }
         .maplibregl-ctrl-attrib a { color: #9cdcfe; }
+        .maplibregl-popup-content {
+            background: #252526;
+            color: #d4d4d4;
+            font-size: 11.5px;
+            line-height: 1.5;
+            padding: 10px 12px;
+            border: 1px solid #3e3e42;
+            border-radius: 6px;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+        }
+        .click-popup .maplibregl-popup-tip {
+            border-top-color: #252526;
+            border-bottom-color: #252526;
+            border-left-color: #252526;
+            border-right-color: #252526;
+        }
+        .maplibregl-popup-close-button { color: #9ca7b8; font-size: 16px; padding: 0 4px; }
+        .maplibregl-popup-close-button:hover { background: #3d475a; color: #fff; }
+        .popup-layer { display: inline-block; margin-top: 2px; font-size: 10px; color: #9cdcfe; text-transform: uppercase; letter-spacing: 0.04em; }
+        #pointResult, #featureResult {
+            background: #1e1e1e;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            padding: 8px 10px;
+            color: #b5cea8;
+            white-space: pre-wrap;
+            word-break: break-word;
+            min-height: 20px;
+        }
+        .toggle-list { display: flex; flex-direction: column; gap: 6px; }
+        .toggle-row { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #c7d0da; }
+        .toggle-row input { accent-color: #0e639c; }
+        .legend-dot { display: inline-block; width: 9px; height: 9px; border-radius: 2px; border: 1px solid #1e1e1e; flex: 0 0 auto; }
+        button.op-button {
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            background: #2d2d30;
+            color: #d4d4d4;
+            font-size: 11px;
+            padding: 5px 8px;
+            cursor: pointer;
+        }
+        button.op-button:hover { background: #0e639c; border-color: #1177bb; color: #fff; }
+        .zoom-bar-row { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #c7d0da; margin: 3px 0; }
+        .zoom-bar-row .zoom-label { width: 26px; color: #9cdcfe; text-align: right; }
+        .zoom-bar-track { flex: 1 1 auto; background: #1e1e1e; border: 1px solid #3e3e42; border-radius: 3px; height: 10px; overflow: hidden; }
+        .zoom-bar-fill { display: block; height: 100%; background: #0e639c; }
+        .zoom-bar-row .zoom-count { width: 50px; text-align: right; color: #9ca7b8; }
+        #zoomCoverageNote { font-size: 11.5px; color: #9ca7b8; margin-top: 8px; line-height: 1.5; }
         @media (max-width: 820px) {
             .layout { flex-direction: column; }
             .sidebar { width: 100%; max-height: 46vh; border-left: none; border-top: 1px solid #3e3e42; }
@@ -146,14 +215,15 @@
     </style>
 </head>
 <body>
-    <div class="topbar">
+    <div class="topbar" id="topbar">
         <a class="brand-link" href="index.html">tinySQL</a>
         <h1>Bavaria demo — real OpenStreetMap tiles, every one a SQL row</h1>
         <span class="topbar-badge">WASM · runs entirely in this tab</span>
+        <button class="expand-btn" id="expandBtn" onclick="toggleMapExpanded()">⤢ Expand map</button>
     </div>
     <div class="layout">
         <div id="map"></div>
-        <div class="sidebar">
+        <div class="sidebar" id="sidebar">
             <div class="panel">
                 <h2>How this map is served</h2>
                 <p>Same idea as the <a href="tiles-demo.html" style="color:#9cdcfe">generative-art tiles demo</a>, with real data: tinySQL, compiled to WebAssembly, holds one <code class="mono">tiles</code> table and every vector tile MapLibre GL requests is the result of one query, run in this tab through a custom <code class="mono">tinysql://</code> protocol:</p>
@@ -168,8 +238,38 @@
             </div>
 
             <div class="panel">
+                <h2>Explore a point</h2>
+                <p>Click anywhere on the map. This runs <code class="mono">TILE_ZXY</code>, <code class="mono">TILE_QUADKEY</code>, <code class="mono">TILE_BBOX</code> and <code class="mono">TILE_PARENT</code> for that point at the current zoom, checks whether a tile is actually stored there, and outlines it in teal. It also lists the real OSM tags of whatever feature sits under the pixel you clicked.</p>
+                <div id="pointResult" class="mono">click the map…</div>
+                <div id="featureResult" class="mono" style="margin-top:6px;">no feature inspected yet…</div>
+            </div>
+
+            <div class="panel">
+                <h2>Layers</h2>
+                <p>Every layer below is filtered live from the same <code class="mono">osm</code> vector tiles by one OSM tag (<code class="mono">["has","building"]</code>, etc.) — toggle them to see the tileset feature by feature.</p>
+                <div class="toggle-list">
+                    <label class="toggle-row"><input type="checkbox" checked onchange="setLayerVisibility('landuse', this.checked)"><span class="legend-dot" style="background:#3c4a2e;"></span>Landuse &amp; land cover</label>
+                    <label class="toggle-row"><input type="checkbox" checked onchange="setLayerVisibility('water', this.checked)"><span class="legend-dot" style="background:#274b6d;"></span>Water</label>
+                    <label class="toggle-row"><input type="checkbox" checked onchange="setLayerVisibility('waterway', this.checked)"><span class="legend-dot" style="background:#3f7ab0;"></span>Waterways</label>
+                    <label class="toggle-row"><input type="checkbox" checked onchange="setLayerVisibility('roads', this.checked)"><span class="legend-dot" style="background:#d9a24a;"></span>Roads (by class) &amp; paths</label>
+                    <label class="toggle-row"><input type="checkbox" checked onchange="setLayerVisibility('buildings', this.checked)"><span class="legend-dot" style="background:#5b5147;"></span>Buildings</label>
+                    <label class="toggle-row"><input type="checkbox" checked onchange="setLayerVisibility('places', this.checked)"><span class="legend-dot" style="background:#e8e8e8;"></span>Place labels</label>
+                </div>
+            </div>
+
+            <div class="panel">
                 <h2>Attribution &amp; license</h2>
                 <div class="attribution-note">Map data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a>, <a href="https://opendatacommons.org/licenses/odbl/" target="_blank" rel="noopener">ODbL</a>. Extract via <a href="https://www.geofabrik.de/" target="_blank" rel="noopener">Geofabrik</a>. Unlike the generative-art demo, this page shows real geographic data.</div>
+            </div>
+
+            <div class="panel">
+                <h2>Zoom levels</h2>
+                <p>The vector source's <code class="mono">minzoom</code>/<code class="mono">maxzoom</code> and the buttons below come from this tileset's own <code class="mono">tiles_metadata</code> row (tippecanoe's <code class="mono">-zg</code> picks it from the actual data density), not a guessed constant.</p>
+                <div class="stat-row"><span>Current zoom</span><b id="zoomCurrent">–</b></div>
+                <div class="stat-row"><span>Tileset zoom range</span><b id="zoomRange">–</b></div>
+                <div class="btn-row" id="zoomButtons">
+                    <button class="btn secondary" onclick="fitRegion()">Fit region</button>
+                </div>
             </div>
 
             <div class="panel">
@@ -178,6 +278,26 @@
                 <div class="stat-row"><span>Repeat SQL text (cache-eligible)</span><b id="statRepeat">0%</b></div>
                 <div class="stat-row"><span>Avg. query time</span><b id="statAvg">–</b></div>
                 <div id="queryLog"></div>
+            </div>
+
+            <div class="panel">
+                <h2>Tile density by zoom</h2>
+                <p>A real <code class="mono">GROUP BY</code> aggregate over the <code class="mono">tiles</code> table, one bar per zoom level:</p>
+                <div class="sql-template mono" style="font-size:10.5px;"><span class="kw">SELECT</span> zoom_level, <span class="fn">COUNT</span>(*) <span class="kw">FROM</span> tiles <span class="kw">GROUP BY</span> zoom_level <span class="kw">ORDER BY</span> zoom_level</div>
+                <div id="zoomHistogram" style="margin-top:8px;"></div>
+                <p id="zoomCoverageNote">Loading…</p>
+            </div>
+
+            <div class="panel">
+                <h2>Jump to a town</h2>
+                <p>A few real municipalities inside Landkreis Dingolfing-Landau, as a starting point for exploring the tileset.</p>
+                <div class="btn-row">
+                    <button class="op-button" onclick="flyToTown(12.5, 48.6333)">Dingolfing</button>
+                    <button class="op-button" onclick="flyToTown(12.6939, 48.6689)">Landau a.d. Isar</button>
+                    <button class="op-button" onclick="flyToTown(12.6333, 48.5667)">Reisbach</button>
+                    <button class="op-button" onclick="flyToTown(12.75, 48.7333)">Wallersdorf</button>
+                    <button class="op-button" onclick="flyToTown(12.85, 48.633)">Eichendorf</button>
+                </div>
             </div>
 
             <div class="panel">
