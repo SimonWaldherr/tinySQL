@@ -1392,7 +1392,22 @@ func ftsAutoOrExpand(query string) string {
 	seen := make(map[string]bool)
 	terms := make([]string, 0, len(fields))
 	for _, field := range fields {
-		field = strings.Trim(field, "-")
+		// '-' and '?' are excluded from the FieldsFunc boundary above so a
+		// deliberate mid-word wildcard survives (e.g. "wom?n", "well-known"),
+		// but a leading/trailing '?' left over after splitting is virtually
+		// always a natural-language question mark, not an intentional
+		// single-character wildcard — the last word of "what's on the
+		// menu?" would otherwise become "menu?", which ftsCompileWildcard
+		// (fts.go) reads as "menu" plus exactly one more required
+		// character, matching nothing (the indexed token is plain "menu")
+		// and silently zeroing the keyword half of every hybrid score for
+		// virtually any real question, since almost all of them end in "?".
+		// '*'/'%'/'\\' are deliberately NOT trimmed here: unlike '?', they
+		// essentially never occur as incidental natural-language
+		// punctuation, so a trailing one is almost always an intentional
+		// prefix wildcard (e.g. "program*") that auto-expand should
+		// preserve verbatim into the OR-joined query.
+		field = strings.Trim(field, "-?")
 		if len([]rune(field)) < 2 || ftsAutoOrExpandStopWords[field] || seen[field] {
 			continue
 		}
