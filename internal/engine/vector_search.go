@@ -498,15 +498,20 @@ func buildVecDistanceFunc(metric string, query []float64, queryNorm float64, cac
 	}
 }
 
-// vecCheckedDistance wraps vectorDistance with a NaN guard. A NaN or
+// vecCheckedDistance wraps vectorRankingDistance with a NaN guard. A NaN or
 // Inf-derived-NaN vector component (e.g. dividing by a zero-ish norm that
 // underflowed, or a NaN stored via a non-SQL insertion path) can produce a
 // NaN distance even though vectorDistance's own "ok" contract only rejects
 // dimension mismatches and zero-norm vectors. Treat a NaN result the same as
 // any other invalid-row case (ok=false) so it is excluded from top-k
 // consideration instead of poisoning the heap (see pushTopK).
+//
+// Returns a ranking-only distance (see vectorRankingDistance) — every caller
+// of buildVecDistanceFunc's returned closure funnels into
+// vecSearchTopKWithIndex, which finalizes the small top-k result once
+// instead of every candidate paying for it during the scan.
 func vecCheckedDistance(metric string, a, b []float64, normA, normB float64) (float64, bool) {
-	dist, ok := vectorDistance(metric, a, b, normA, normB)
+	dist, ok := vectorRankingDistance(metric, a, b, normA, normB)
 	if !ok || math.IsNaN(dist) {
 		return 0, false
 	}

@@ -198,6 +198,12 @@ func normalizeVecIndexMode(mode string) string {
 	}
 }
 
+// vecSearchTopKWithIndex is the single choke point every index mode's
+// search funnels through before a result ever reaches a caller. Internally,
+// flat/IVF/HNSW all rank candidates using vectorRankingDistance (skipping
+// l2's sqrt until it's actually needed); finalizeVecScoredRows converts the
+// (at most k) surviving rows back to real distances exactly once here,
+// rather than every candidate the scan/traversal considered paying for it.
 func vecSearchTopKWithIndex(
 	ctx context.Context,
 	tenant string,
@@ -209,23 +215,45 @@ func vecSearchTopKWithIndex(
 	cache vecSearchColumnCacheEntry,
 	distFn vecDistanceFunc,
 ) ([]vecScoredRow, error) {
+	var rows []vecScoredRow
+	var err error
 	switch args.indexMode {
 	case vecIndexFlat:
-		return vecSearchTopK(ctx, table.Rows, queryLen, args.k, cache, distFn)
+		rows, err = vecSearchTopK(ctx, table.Rows, queryLen, args.k, cache, distFn)
 	case vecIndexIVF:
-		idx, err := getVecIVFIndex(ctx, tenant, table, colIdx, args.metric, queryLen, cache)
-		if err != nil {
-			return nil, err
+		var idx *vecIVFIndex
+		idx, err = getVecIVFIndex(ctx, tenant, table, colIdx, args.metric, queryLen, cache)
+		if err == nil {
+			rows, err = idx.search(ctx, args.queryVec, queryNorm, args.k, cache)
 		}
-		return idx.search(ctx, args.queryVec, queryNorm, args.k, cache)
 	case vecIndexHNSW:
-		idx, err := getVecHNSWIndex(ctx, tenant, table, colIdx, args.metric, queryLen, cache)
-		if err != nil {
-			return nil, err
+		var idx *vecHNSWIndex
+		idx, err = getVecHNSWIndex(ctx, tenant, table, colIdx, args.metric, queryLen, cache)
+		if err == nil {
+			rows, err = idx.search(ctx, args.queryVec, queryNorm, args.k, cache)
 		}
-		return idx.search(ctx, args.queryVec, queryNorm, args.k, cache)
 	default:
-		return vecSearchTopK(ctx, table.Rows, queryLen, args.k, cache, distFn)
+		rows, err = vecSearchTopK(ctx, table.Rows, queryLen, args.k, cache, distFn)
+	}
+	if err != nil {
+		return nil, err
+	}
+	finalizeVecScoredRows(args.metric, rows)
+	return rows, nil
+}
+
+// finalizeVecScoredRows converts every row's ranking-only distance (see
+// vectorRankingDistance) into the real distance vectorDistance would have
+// returned, in place. Cheap to call unconditionally: for every metric
+// except l2 vectorFinalizeDistance is already a no-op, and rows is bounded
+// to k (or fewer) entries regardless of how many candidates the scan or
+// graph traversal that produced it considered.
+func finalizeVecScoredRows(metric string, rows []vecScoredRow) {
+	if metric != "l2" {
+		return
+	}
+	for i := range rows {
+		rows[i].distance = vectorFinalizeDistance(metric, rows[i].distance)
 	}
 }
 
@@ -296,7 +324,7 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 		if err := checkCtx(ctx); err != nil {
 			return nil, err
 		}
-		idx.centroidNorms = centroidNorms(idx.centroids)
+		idx.centroidNorms = centroidNormsFor(metric, idx.centroids)
 		clear(sums)
 		clear(counts)
 		for i, rowIdx := range rows {
@@ -309,10 +337,7 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 			assignments[i] = c
 			counts[c]++
 			base := c * dims
-			vec := cache.vectors[rowIdx]
-			for d := 0; d < dims; d++ {
-				sums[base+d] += vec[d]
-			}
+			vectorAccumulateUnrolled(sums[base:base+dims], cache.vectors[rowIdx])
 		}
 		for c := range idx.centroids {
 			// A centroid can end up with zero assigned rows this iteration
@@ -349,7 +374,10 @@ func (idx *vecIVFIndex) search(ctx context.Context, query []float64, queryNorm f
 	probes := chooseIVFNProbe(len(idx.centroids), k)
 	centroidHeap := &vecScoredHeap{}
 	for i, c := range idx.centroids {
-		dist, ok := vectorDistance(idx.metric, c, query, idx.centroidNorms[i], queryNorm)
+		// Selecting which centroids to probe, not a value ever exposed to a
+		// caller — ranking-only distance is enough (see rowDistance below
+		// for the row-level equivalent).
+		dist, ok := vectorRankingDistance(idx.metric, c, query, idx.centroidNorms[i], queryNorm)
 		if !ok {
 			continue
 		}
@@ -674,11 +702,15 @@ func rowNormFor(metric string, cache vecSearchColumnCacheEntry, rowIdx int) floa
 	return rowNorm(cache, rowIdx)
 }
 
+// rowDistance returns a ranking-only distance (see vectorRankingDistance):
+// every call site is internal graph/list traversal, never a value exposed
+// directly to a caller without first passing through
+// vecSearchTopKWithIndex's finalize step.
 func rowDistance(metric string, query []float64, queryNorm float64, cache vecSearchColumnCacheEntry, rowIdx int) (float64, bool) {
 	if rowIdx < 0 || rowIdx >= len(cache.vectors) || !cache.valid[rowIdx] {
 		return 0, false
 	}
-	return vectorDistance(metric, cache.vectors[rowIdx], query, rowNormFor(metric, cache, rowIdx), queryNorm)
+	return vectorRankingDistance(metric, cache.vectors[rowIdx], query, rowNormFor(metric, cache, rowIdx), queryNorm)
 }
 
 func centroidNorms(centroids [][]float64) []float64 {
@@ -689,11 +721,27 @@ func centroidNorms(centroids [][]float64) []float64 {
 	return norms
 }
 
+// centroidNormsFor is centroidNorms gated by metricNeedsNorms: idx.centroidNorms
+// is indexed unconditionally by nearestCentroid/search (idx.centroidNorms[i]),
+// so it must always have one entry per centroid, but only cosine ever reads
+// the values — l2/manhattan/dot ignore normA/normB entirely (vectorDistance).
+// Returning a zero-filled slice of the same length for those metrics skips
+// vectorL2Norm's sqrt per centroid per k-means iteration for no behavior
+// change, mirroring rowNormFor's same gating for per-row norms.
+func centroidNormsFor(metric string, centroids [][]float64) []float64 {
+	if !metricNeedsNorms(metric) {
+		return make([]float64, len(centroids))
+	}
+	return centroidNorms(centroids)
+}
+
+// nearestCentroid only ever returns an index, never the distance itself, so
+// it uses the cheaper ranking-only distance (see vectorRankingDistance).
 func nearestCentroid(metric string, vec []float64, vecNorm float64, centroids [][]float64, norms []float64) int {
 	best := 0
 	bestDist := math.MaxFloat64
 	for i, c := range centroids {
-		dist, ok := vectorDistance(metric, c, vec, norms[i], vecNorm)
+		dist, ok := vectorRankingDistance(metric, c, vec, norms[i], vecNorm)
 		if !ok {
 			continue
 		}

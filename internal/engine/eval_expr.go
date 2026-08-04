@@ -222,7 +222,14 @@ func evalLike(env ExecEnv, ex *LikeExpr, row Row) (any, error) {
 			}
 			escapeChar = rune(escapeStr[0])
 		}
-		if ex.CaseInsensitive {
+		if ex.Escape == nil {
+			// Default backslash escape is what compileLikeStringMatcher
+			// supports (see its doc comment) and the common case: route
+			// through the cached, shape-detected matcher instead of
+			// re-lowercasing and re-running the general backtracking
+			// matcher on every row.
+			matched = compileCachedLikeMatcher(pattern, ex.CaseInsensitive)(str)
+		} else if ex.CaseInsensitive {
 			matched = matchLikePattern(strings.ToLower(str), strings.ToLower(pattern), escapeChar)
 		} else {
 			matched = matchLikePattern(str, pattern, escapeChar)

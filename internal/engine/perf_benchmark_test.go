@@ -183,6 +183,23 @@ func BenchmarkRegexpRowScan(b *testing.B) {
 	runBench(b, db, `SELECT id FROM t WHERE note REGEXP 'number [0-9]{3}0'`)
 }
 
+// BenchmarkFTSMatchRowScan measures FTS_MATCH used as a per-row WHERE
+// predicate with a constant multi-term boolean query — before
+// parseCachedFTSQuery (fts_query_cache.go), every row reparsed the identical
+// query string from scratch.
+func BenchmarkFTSMatchRowScan(b *testing.B) {
+	db := setupPerfTable(b, 20000)
+	runBench(b, db, `SELECT id FROM t WHERE FTS_MATCH(note, 'number OR lorem')`)
+}
+
+// BenchmarkFTSRankRowScan measures FTS_RANK used as a per-row ORDER BY
+// expression over every row — the same reparse-per-row concern as
+// BenchmarkFTSMatchRowScan, on the scoring path instead of the match path.
+func BenchmarkFTSRankRowScan(b *testing.B) {
+	db := setupPerfTable(b, 20000)
+	runBench(b, db, `SELECT id, FTS_RANK(note, 'number OR lorem') as score FROM t ORDER BY score DESC LIMIT 20`)
+}
+
 // BenchmarkRowToTextRowScan measures the ROW_TO_TEXT() ad-hoc whole-row
 // search predicate, combined with a plain column condition (the shape that
 // previously tripped the buildRawFilter AND-fallback bug).

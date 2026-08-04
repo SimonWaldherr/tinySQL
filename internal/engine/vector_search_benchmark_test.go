@@ -451,6 +451,51 @@ func BenchmarkVecSearchIndexModesSameTable(b *testing.B) {
 	}
 }
 
+// BenchmarkVecSearchIndexModesSameTableL2 is BenchmarkVecSearchIndexModesSameTable's
+// l2-metric twin: l2's flat/IVF/HNSW paths all defer math.Sqrt to the final
+// (at most k) results instead of paying it per candidate/edge (see
+// vectorRankingDistance/finalizeVecScoredRows in vector_math.go/
+// vector_index.go), so this demonstrates that win across all three index
+// modes the cosine-only version above can't exercise.
+func BenchmarkVecSearchIndexModesSameTableL2(b *testing.B) {
+	db := makeRAGHybridBenchmarkTable(12000, 64)
+	fn := &VecSearchTableFunc{}
+	env := ExecEnv{ctx: context.Background(), tenant: "default", db: db}
+	query := make([]float64, 64)
+	for i := range query {
+		query[i] = math.Cos(0.08*float64(i) + 0.5)
+	}
+
+	for _, indexMode := range []string{"flat", "ivf", "hnsw"} {
+		indexMode := indexMode
+		b.Run(indexMode, func(b *testing.B) {
+			args := []Expr{
+				&Literal{Val: "rag_hybrid"},
+				&Literal{Val: "embedding"},
+				&Literal{Val: query},
+				&Literal{Val: 20},
+				&Literal{Val: "l2"},
+				&Literal{Val: indexMode},
+			}
+			if _, err := fn.Execute(context.Background(), args, env, Row{}); err != nil {
+				b.Fatal(err)
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				rs, err := fn.Execute(context.Background(), args, env, Row{})
+				if err != nil {
+					b.Fatal(err)
+				}
+				if len(rs.Rows) == 0 || len(rs.Rows) > 20 {
+					b.Fatalf("expected up to 20 results, got %d", len(rs.Rows))
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkWhereVectorAndSimpleCondition_VectorThenScalar(b *testing.B) {
 	benchmarkWhereAndVector(b, true)
 }

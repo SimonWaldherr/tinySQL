@@ -208,3 +208,38 @@ func vectorDistance(metric string, a, b []float64, normA, normB float64) (float6
 		return 0, false
 	}
 }
+
+// vectorRankingDistance is vectorDistance for every purpose except deciding
+// which rows rank best: for "l2" it skips the sqrt and returns the squared
+// distance instead. Since sqrt is monotonic over non-negative reals, ranking
+// by squared distance produces the identical ordering (and therefore
+// identical top-k selection) as ranking by real distance — the real value is
+// only needed once, on the small set of final results a query returns, not
+// on every candidate a flat scan, IVF list, or HNSW graph traversal
+// considers. Every other metric already avoids unnecessary sqrt calls
+// (cosine needs none at all; manhattan/dot don't involve one), so this is
+// identical to vectorDistance for them.
+//
+// Callers must run the result through vectorFinalizeDistance exactly once,
+// at the point a value crosses from "internal ranking" to "exposed to the
+// caller" (e.g. VEC_SEARCH's _vec_distance column) — see
+// vecSearchTopKWithIndex, the single choke point every index mode's search
+// funnels through, for where that happens today.
+func vectorRankingDistance(metric string, a, b []float64, normA, normB float64) (float64, bool) {
+	if metric == "l2" {
+		if len(a) != len(b) {
+			return 0, false
+		}
+		return vectorL2Squared(a, b), true
+	}
+	return vectorDistance(metric, a, b, normA, normB)
+}
+
+// vectorFinalizeDistance converts a vectorRankingDistance value back into the
+// real distance vectorDistance would have returned for the same inputs.
+func vectorFinalizeDistance(metric string, rankingDistance float64) float64 {
+	if metric == "l2" {
+		return math.Sqrt(rankingDistance)
+	}
+	return rankingDistance
+}

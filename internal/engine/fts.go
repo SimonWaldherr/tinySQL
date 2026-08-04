@@ -180,11 +180,23 @@ func evalFTSSnippet(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	}
 
 	// Build highlight set from the parsed boolean query tree.
-	node := ftsParseQuery(fmt.Sprintf("%v", queryVal))
+	queryStr := ftsValueToString(queryVal)
+	node := parseCachedFTSQuery(queryStr)
 	querySet := ftsQueryTerms(node)
 	// Also add simple tokenized terms for backward compatibility.
-	for _, q := range ftsTokenize(fmt.Sprintf("%v", queryVal)) {
+	for _, q := range ftsTokenize(queryStr) {
 		querySet[q] = true
+	}
+
+	// Wildcard prefixes ("prefix*" entries in querySet) are precomputed once
+	// here rather than re-scanned from isHighlighted on every single word:
+	// the query has a handful of terms but potentially many words to check,
+	// so this turns an O(words × queryTerms) scan into O(words + queryTerms).
+	var wildcardPrefixes []string
+	for tok := range querySet {
+		if strings.HasSuffix(tok, "*") {
+			wildcardPrefixes = append(wildcardPrefixes, strings.TrimSuffix(tok, "*"))
+		}
 	}
 
 	// isHighlighted checks if a word matches any positive query atom.
@@ -196,19 +208,15 @@ func evalFTSSnippet(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		if querySet[stemmed] {
 			return true
 		}
-		// Check prefix wildcards (stored as "prefix*").
-		for tok := range querySet {
-			if strings.HasSuffix(tok, "*") {
-				pfx := strings.TrimSuffix(tok, "*")
-				if strings.HasPrefix(stemmed, pfx) {
-					return true
-				}
+		for _, pfx := range wildcardPrefixes {
+			if strings.HasPrefix(stemmed, pfx) {
+				return true
 			}
 		}
 		return false
 	}
 
-	words := strings.Fields(fmt.Sprintf("%v", textVal))
+	words := strings.Fields(ftsValueToString(textVal))
 
 	// Find first match index.
 	matchIdx := -1
@@ -864,8 +872,8 @@ func evalFTSMatch(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if textVal == nil || queryVal == nil {
 		return false, nil
 	}
-	text := fmt.Sprintf("%v", textVal)
-	query := fmt.Sprintf("%v", queryVal)
+	text := ftsValueToString(textVal)
+	query := ftsValueToString(queryVal)
 
 	tokens := ftsTokenize(text)
 	freq := make(map[string]int, len(tokens))
@@ -873,7 +881,7 @@ func evalFTSMatch(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		freq[t]++
 	}
 
-	node := ftsParseQuery(query)
+	node := parseCachedFTSQuery(query)
 	if node == nil {
 		return false, nil
 	}
@@ -896,8 +904,8 @@ func evalFTSRank(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if textVal == nil || queryVal == nil {
 		return 0.0, nil
 	}
-	text := fmt.Sprintf("%v", textVal)
-	query := fmt.Sprintf("%v", queryVal)
+	text := ftsValueToString(textVal)
+	query := ftsValueToString(queryVal)
 
 	tokens := ftsTokenize(text)
 	if len(tokens) == 0 {
@@ -909,7 +917,7 @@ func evalFTSRank(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		freq[t]++
 	}
 
-	node := ftsParseQuery(query)
+	node := parseCachedFTSQuery(query)
 	if node == nil {
 		return 0.0, nil
 	}
@@ -930,7 +938,7 @@ func evalFTSWordCount(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if v == nil {
 		return 0, nil
 	}
-	return len(strings.Fields(fmt.Sprintf("%v", v))), nil
+	return len(strings.Fields(ftsValueToString(v))), nil
 }
 
 // ─────────────────────────── CONTAINS_ALL / CONTAINS_ANY / CONTAINS_SCORE ────
@@ -959,7 +967,7 @@ func evalContainsTerms(env ExecEnv, ex *FuncCall, row Row) (matched int, ok bool
 	if textVal == nil {
 		return 0, false, nil
 	}
-	text := strings.ToLower(fmt.Sprintf("%v", textVal))
+	text := strings.ToLower(ftsValueToString(textVal))
 	for _, arg := range ex.Args[1:] {
 		termVal, err := evalExpr(env, arg, row)
 		if err != nil {
@@ -968,7 +976,7 @@ func evalContainsTerms(env ExecEnv, ex *FuncCall, row Row) (matched int, ok bool
 		if termVal == nil {
 			continue
 		}
-		term := strings.ToLower(fmt.Sprintf("%v", termVal))
+		term := strings.ToLower(ftsValueToString(termVal))
 		if strings.Contains(text, term) {
 			matched++
 		}
@@ -1208,6 +1216,19 @@ func ftsWriteValue(sb *strings.Builder, v any) {
 		// numeric column contributes.
 		fmt.Fprintf(sb, "%v", v)
 	}
+}
+
+// ftsValueToString formats v exactly as fmt.Sprintf("%v", v) would, but
+// through ftsWriteValue's type-switch fast path for the scalar kinds
+// (string, int, int64, bool) that dominate real column values passed to
+// FTS_MATCH/FTS_RANK/FTS_SNIPPET/CONTAINS_*, all of which run per row.
+func ftsValueToString(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	var sb strings.Builder
+	ftsWriteValue(&sb, v)
+	return sb.String()
 }
 
 // getFTSDocCache returns the tokenized documents (plus corpus-wide BM25
@@ -1632,7 +1653,7 @@ func (f *FTSSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 		}
 	}
 
-	node := ftsParseQuery(query)
+	node := parseCachedFTSQuery(query)
 	if node == nil {
 		// Empty or all-stopword query matches nothing. Without this guard every
 		// valid document scores 0 (ftsScoreNode(nil,...) == 0) and k arbitrary
