@@ -112,6 +112,19 @@ type ImportOptions struct {
 	// StrictTypes when true causes import to fail if data doesn't match detected types (default false).
 	// When false, falls back to TEXT on type conversion errors.
 	StrictTypes bool
+
+	// TopoJSONObject selects a single top-level "objects" key when importing
+	// a TopoJSON Topology (ImportTopoJSON). Empty imports every object; if
+	// more than one object key exists in that case, each resulting row gets
+	// an added "topo_object" property naming its source object, so a
+	// multi-object Topology's provenance isn't silently lost. Ignored by
+	// every other importer.
+	TopoJSONObject string
+
+	// XLSXSheet selects a single worksheet by name when importing an Excel
+	// workbook (ImportXLSX). Empty selects the workbook's first sheet in
+	// declared order. Ignored by every other importer.
+	XLSXSheet string
 }
 
 // ImportResult returns metadata about the import operation.

@@ -58,6 +58,7 @@ func executeDropTable(env ExecEnv, s *DropTable) (*ResultSet, error) {
 			tenant = "default"
 		}
 		purgeVectorCachesFor(tenant, t.Name)
+		purgeGeoGridCachesFor(tenant, t.Name)
 		// Also drop the query-result cache and FTS caches for this table.
 		// Otherwise a DROP + recreate can serve stale top-K row IDs (wrong
 		// rows, or a panic on an out-of-range index) and leak FTS memory.

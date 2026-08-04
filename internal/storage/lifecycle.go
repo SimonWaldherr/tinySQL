@@ -106,7 +106,7 @@ func (db *DB) Sync() error {
 	// backendTablesEvictable), so skipping pooledTableSource here would
 	// silently drop any mutation made on such a lease: Sync/Close would
 	// keep returning nil while the table was never actually re-saved.
-	if db.storageMode == ModeDisk || db.storageMode == ModeJSON || db.storageMode == ModeHybrid || db.storageMode == ModeIndex || db.storageMode == ModePagedIndex {
+	if db.storageMode == ModeDisk || db.storageMode == ModeJSON || db.storageMode == ModeHybrid || db.storageMode == ModeIndex || db.storageMode == ModePagedIndex || db.storageMode == ModeSQLite {
 		dc, hasDirtyTracker := db.backend.(dirtyTracker)
 
 		type entry struct {

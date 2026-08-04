@@ -277,6 +277,10 @@ func evalWindowFunction(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return evalCumeDist(partitionRows, currentIdx, ex.Over.OrderBy), nil
 	case "NTILE":
 		return evalNtile(env, ex, partitionRows, currentIdx, row)
+	case "EQUAL_INTERVAL":
+		return evalEqualInterval(env, ex, partitionRows, currentIdx, row)
+	case "NATURAL_BREAKS":
+		return evalNaturalBreaks(env, ex, partitionRows, currentIdx, row)
 	case "LAG":
 		return evalLagFunction(env, ex, partitionRows, currentIdx, row)
 	case "LEAD":

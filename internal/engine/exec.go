@@ -61,6 +61,12 @@ func getAllFunctions() map[string]funcHandler {
 		for k, v := range getGeoEditingFunctions() {
 			m[k] = v
 		}
+		for k, v := range getGeoRelateFunctions() {
+			m[k] = v
+		}
+		for k, v := range getGeoClipFunctions() {
+			m[k] = v
+		}
 		for k, v := range getTileFunctions() {
 			m[k] = v
 		}

@@ -380,6 +380,10 @@ func (db *DB) backendCatalogPath() (string, bool) {
 	switch db.storageMode {
 	case ModeDisk, ModeHybrid, ModeIndex, ModeJSON:
 		return filepath.Join(db.config.Path, ".catalog.gob"), true
+	case ModeSQLite:
+		// Path is the .sqlite file itself, not a directory, so the catalog
+		// sidecar sits next to it rather than inside it.
+		return db.config.Path + ".catalog.gob", true
 	default:
 		return "", false
 	}

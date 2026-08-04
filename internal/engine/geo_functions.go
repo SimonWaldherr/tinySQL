@@ -207,13 +207,22 @@ func evalGeoWithinBBox(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	return geoPointWithinBBox(p, minLon, minLat, maxLon, maxLat), nil
+}
+
+// geoPointWithinBBox is the shared bounding-box containment test behind
+// GEO_WITHIN_BBOX/ST_WITHIN_BBOX. GEO_SEARCH's bbox-mode residual filter
+// (spatial_index.go) calls this directly too, rather than re-deriving the
+// same six lines, so both paths agree on bounds ordering and inclusivity by
+// construction.
+func geoPointWithinBBox(p geoPoint, minLon, minLat, maxLon, maxLat float64) bool {
 	if minLon > maxLon {
 		minLon, maxLon = maxLon, minLon
 	}
 	if minLat > maxLat {
 		minLat, maxLat = maxLat, minLat
 	}
-	return p.Lon >= minLon && p.Lon <= maxLon && p.Lat >= minLat && p.Lat <= maxLat, nil
+	return p.Lon >= minLon && p.Lon <= maxLon && p.Lat >= minLat && p.Lat <= maxLat
 }
 
 // evalGeoBearing returns the initial compass bearing (0-360°, clockwise from
@@ -783,6 +792,88 @@ func geoObjectFromJSON(body []byte) (map[string]any, error) {
 		return nil, err
 	}
 	return obj, nil
+}
+
+// canonicalGeoJSON decodes v as a GeoJSON Geometry object (Point, MultiPoint,
+// LineString, MultiLineString, Polygon, MultiPolygon, or GeometryCollection --
+// deliberately not Feature or FeatureCollection, which bundle non-geometry
+// data that has no home in a single GEOMETRY column; extract .geometry first
+// if you have one of those), validates its structural shape, and re-marshals
+// it with encoding/json to get stable, canonical key ordering (json.Marshal
+// sorts map keys). This is what both GEOMETRY column coercion
+// (coerceToGeometry, coerce.go) and CAST(x AS GEOMETRY) (castValue,
+// builtin_string.go) use, so a value entering the database through either
+// path ends up as identical, predictable text.
+func canonicalGeoJSON(v any) (string, error) {
+	obj, err := geoObjectFromValue(v)
+	if err != nil {
+		return "", err
+	}
+	if err := validateGeometryShape(obj); err != nil {
+		return "", err
+	}
+	body, err := json.Marshal(obj)
+	if err != nil {
+		return "", fmt.Errorf("encode geometry: %w", err)
+	}
+	return string(body), nil
+}
+
+// validateGeometryShape checks that object is a structurally well-formed
+// GeoJSON Geometry: a legal "type" plus coordinates (or, for
+// GeometryCollection, child geometries) whose nesting depth is consistent
+// with that type. It is deliberately not stricter than the rest of this
+// file's parsers (geoPointFromValue, geoMultiPolygonFromValue,
+// geoLineStringFromValue, collectAllPositions all already accept exactly
+// this shape) -- and it is deliberately more lenient than GEO_IS_VALID in
+// one respect: it does not require closed rings or deduplicated vertices,
+// since polygonFromRingsValue/pointInRing already tolerate both. Use
+// GEO_IS_VALID/GEO_CLEAN separately to check those stronger, optional
+// invariants.
+func validateGeometryShape(object map[string]any) error {
+	typ, _ := object["type"].(string)
+	switch strings.ToLower(typ) {
+	case "point":
+		_, err := geoPositionFromValue(object["coordinates"])
+		return err
+	case "multipoint":
+		_, err := positionsFromArray(object["coordinates"])
+		return err
+	case "linestring":
+		positions, err := positionsFromArray(object["coordinates"])
+		if err != nil {
+			return err
+		}
+		if len(positions) < 2 {
+			return fmt.Errorf("LineString needs at least 2 positions")
+		}
+		return nil
+	case "multilinestring", "polygon":
+		_, err := positionsFromNestedArray(object["coordinates"], 1)
+		return err
+	case "multipolygon":
+		_, err := positionsFromNestedArray(object["coordinates"], 2)
+		return err
+	case "geometrycollection":
+		geometries, ok := object["geometries"].([]any)
+		if !ok {
+			return fmt.Errorf("GeometryCollection geometries must be an array")
+		}
+		for i, g := range geometries {
+			child, ok := g.(map[string]any)
+			if !ok {
+				return fmt.Errorf("geometry %d: expected a GeoJSON geometry object", i)
+			}
+			if err := validateGeometryShape(child); err != nil {
+				return fmt.Errorf("geometry %d: %w", i, err)
+			}
+		}
+		return nil
+	case "feature", "featurecollection":
+		return fmt.Errorf("GEOMETRY columns hold a Geometry, not a %s; extract .geometry first", typ)
+	default:
+		return fmt.Errorf("unsupported or missing GeoJSON geometry type %q", typ)
+	}
 }
 
 // geoPositionFromValue parses one GeoJSON position: [lon, lat] or

@@ -1,0 +1,106 @@
+package engine
+
+import (
+	"context"
+	"fmt"
+	"testing"
+
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
+)
+
+func geoSearchIDSet(t *testing.T, db *storage.DB, sql string) map[int]bool {
+	t.Helper()
+	rs, err := Execute(context.Background(), db, "default", mustParse(sql))
+	if err != nil {
+		t.Fatalf("%s: %v", sql, err)
+	}
+	got := make(map[int]bool, len(rs.Rows))
+	for _, row := range rs.Rows {
+		id, ok := row["id"].(int)
+		if !ok {
+			t.Fatalf("%s: id column is %T, want int", sql, row["id"])
+		}
+		got[id] = true
+	}
+	return got
+}
+
+func geoSearchPoint(id int, lon, lat float64) string {
+	return fmt.Sprintf(`INSERT INTO points VALUES (%d, '{"type":"Point","coordinates":[%v,%v]}')`, id, lon, lat)
+}
+
+func TestGeoSearchBBoxMode(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE points (id INT, geom GEOMETRY)`)
+
+	inside := map[int][2]float64{1: {0.1, 0.1}, 2: {0.5, 0.9}, 5: {0.99, 0.01}}
+	outside := map[int][2]float64{3: {5, 5}, 4: {-3, -3}, 6: {1.5, 1.5}}
+	for id, p := range inside {
+		execSQL(t, db, geoSearchPoint(id, p[0], p[1]))
+	}
+	for id, p := range outside {
+		execSQL(t, db, geoSearchPoint(id, p[0], p[1]))
+	}
+	// A wider scatter of far-away points so the grid index buckets across
+	// more than one cell.
+	nextID := 7
+	for lon := 2.0; lon <= 8.0; lon += 2.0 {
+		for lat := 2.0; lat <= 8.0; lat += 2.0 {
+			execSQL(t, db, geoSearchPoint(nextID, lon, lat))
+			nextID++
+		}
+	}
+
+	got := geoSearchIDSet(t, db, `SELECT id FROM GEO_SEARCH('points', 'geom', 'bbox', 0, 0, 1, 1)`)
+	for id := range inside {
+		if !got[id] {
+			t.Errorf("GEO_SEARCH bbox missing expected inside point id=%d; got %v", id, got)
+		}
+	}
+	for id := range outside {
+		if got[id] {
+			t.Errorf("GEO_SEARCH bbox unexpectedly returned outside point id=%d; got %v", id, got)
+		}
+	}
+	if len(got) != len(inside) {
+		t.Errorf("GEO_SEARCH bbox returned %d rows, want %d: %v", len(got), len(inside), got)
+	}
+
+	// Inserting a new matching row must invalidate the cached grid index
+	// (keyed by table.Version) so a later query sees it.
+	execSQL(t, db, geoSearchPoint(100, 0.05, 0.05))
+	got2 := geoSearchIDSet(t, db, `SELECT id FROM GEO_SEARCH('points', 'geom', 'bbox', 0, 0, 1, 1)`)
+	if !got2[100] {
+		t.Errorf("GEO_SEARCH bbox did not see a row inserted after the index was first built; got %v", got2)
+	}
+}
+
+func TestGeoSearchRadiusMode(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE points (id INT, geom GEOMETRY)`)
+	execSQL(t, db, geoSearchPoint(1, 0, 0.01))  // ~1113 m from (0,0)
+	execSQL(t, db, geoSearchPoint(2, 0, 0.1))   // ~11132 m from (0,0)
+	execSQL(t, db, geoSearchPoint(3, 0.01, 0))  // ~1113 m from (0,0)
+	execSQL(t, db, geoSearchPoint(4, -5, -5))   // far away
+
+	got := geoSearchIDSet(t, db, `SELECT id FROM GEO_SEARCH('points', 'geom', 'radius', 0, 0, 2000)`)
+	want := map[int]bool{1: true, 3: true}
+	if len(got) != len(want) {
+		t.Fatalf("GEO_SEARCH radius returned %v, want %v", got, want)
+	}
+	for id := range want {
+		if !got[id] {
+			t.Errorf("GEO_SEARCH radius missing expected point id=%d; got %v", id, got)
+		}
+	}
+}
+
+func TestGeoSearchRejectsUnknownMode(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE points (id INT, geom GEOMETRY)`)
+	execSQL(t, db, geoSearchPoint(1, 0, 0))
+	if _, err := Execute(context.Background(), db, "default", mustParse(
+		`SELECT id FROM GEO_SEARCH('points', 'geom', 'nonsense', 0, 0, 1, 1)`)); err == nil {
+		t.Errorf("GEO_SEARCH with an unknown mode succeeded, want an error")
+	}
+}

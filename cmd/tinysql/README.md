@@ -28,12 +28,13 @@ Subcommands are matched on the first argument, so they must precede any flags.
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-tenant` | Tenant/schema name | `default` |
-| `-mode` | Output mode: `column`, `list`, `csv`, `json`, `table` | `column` |
+| `-mode` | Output mode: `column`, `list`, `csv`, `json`, `table`, `geojson`, `topojson` | `column` |
 | `-header` | Include column headers | `true` |
 | `-echo` | Echo SQL before execution | `false` |
 | `-cmd` | Run this SQL and exit | — |
 | `-batch` | Force batch mode (error if no SQL) | `false` |
 | `-output` | Write output to this file, not stdout | — |
+| `-geom-col` | Geometry column for `-mode geojson\|topojson` | auto-detected |
 
 SQL source precedence: `-cmd`, then trailing positional SQL, then stdin when
 piped. With none of those and no `-batch`, the REPL starts.
@@ -56,7 +57,7 @@ discards a partial statement; on an empty buffer it exits.
 | `.read FILENAME` | Execute SQL in FILENAME |
 | `.save FILENAME` | Write in-memory database to FILENAME |
 | `.dump [TABLE...]` | Dump tables as INSERT statements |
-| `.import FILE [TABLE]` | Import a CSV/JSON file into a table |
+| `.import FILE [TABLE]` | Import a file into a table (CSV, TSV, JSON, GeoJSON, TopoJSON, KML, OSM XML, ...) |
 | `.count [TABLE...]` | Show row counts |
 | `.stats` | Database statistics |
 

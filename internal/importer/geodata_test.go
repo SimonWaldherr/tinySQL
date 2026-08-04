@@ -238,4 +238,12 @@ func TestImportFileMapExtensions(t *testing.T) {
 		t.Fatal("expected .osm.pbf to return an unsupported-format error")
 	}
 
+	topoFile := filepath.Join(dir, "regions.topojson")
+	topoDoc := `{"type":"Topology","arcs":[],"objects":{"regions":{"type":"Point","coordinates":[1,2],"properties":{"name":"a"}}}}`
+	if err := os.WriteFile(topoFile, []byte(topoDoc), 0o644); err != nil {
+		t.Fatalf("write topojson: %v", err)
+	}
+	if _, err := ImportFile(ctx, db, "default", "topo_file", topoFile, &ImportOptions{CreateTable: true}); err != nil {
+		t.Fatalf("ImportFile .topojson: %v", err)
+	}
 }

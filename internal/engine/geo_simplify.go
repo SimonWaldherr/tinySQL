@@ -95,14 +95,19 @@ func simplifyGeoJSONValue(value any, tolerance float64, method string) (map[stri
 }
 
 func geoSimplifyObject(value any) (map[string]any, error) {
+	// The map[string]any case is deep-cloned directly instead of round-tripped
+	// through json.Marshal+Unmarshal: callers throughout the geo package (geo
+	// editing/quality/simplify/aggregate, spatial index building) pass in
+	// values that may alias a table cell or an already-decoded parent object,
+	// and every caller mutates the returned map in place — so this still must
+	// return a fully independent clone, just built directly instead of paying
+	// for a JSON text encode+decode round trip to get one.
+	if x, ok := value.(map[string]any); ok {
+		return geoDeepCloneObject(x), nil
+	}
+
 	var data []byte
 	switch x := value.(type) {
-	case map[string]any:
-		var err error
-		data, err = json.Marshal(x)
-		if err != nil {
-			return nil, fmt.Errorf("encode geometry: %w", err)
-		}
 	case json.RawMessage:
 		data = x
 	case []byte:
@@ -121,6 +126,50 @@ func geoSimplifyObject(value any) (map[string]any, error) {
 		return nil, fmt.Errorf("GeoJSON value must be an object")
 	}
 	return object, nil
+}
+
+// geoDeepCloneObject deep-clones a map[string]any exactly as a
+// json.Marshal+Unmarshal round trip through the same map would, without
+// paying for the text encode/decode: every nested map/slice is rebuilt
+// (never shared with the input), and any numeric type a JSON round trip
+// would normalize to float64 (int/int32/int64/json.Number) is normalized the
+// same way, so callers see identical value types whether the object reached
+// them via a real JSON parse or via this clone.
+func geoDeepCloneObject(m map[string]any) map[string]any {
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = geoDeepCloneValue(v)
+	}
+	return out
+}
+
+func geoDeepCloneValue(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		return geoDeepCloneObject(t)
+	case []any:
+		out := make([]any, len(t))
+		for i, e := range t {
+			out[i] = geoDeepCloneValue(e)
+		}
+		return out
+	case int:
+		return float64(t)
+	case int32:
+		return float64(t)
+	case int64:
+		return float64(t)
+	case json.Number:
+		f, err := t.Float64()
+		if err != nil {
+			return t
+		}
+		return f
+	default:
+		// string, float64, bool, nil, and anything else already matches what
+		// a JSON round trip would produce, and is copied by value already.
+		return v
+	}
 }
 
 func simplifyGeoJSONObject(object map[string]any, tolerance float64, method string) error {

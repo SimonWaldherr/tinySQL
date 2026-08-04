@@ -39,7 +39,7 @@
   {
     "section": "FULL-TEXT SEARCH FUNCTIONS",
     "examples": [
-      "SELECT FTS_MATCH('the quick brown fox', 'fox') as has_fox;\nSELECT FTS_MATCH('the quick brown fox', 'quick AND fox') as has_both;\nSELECT FTS_MATCH('the quick brown fox', 'cat OR fox') as has_either;\nSELECT FTS_MATCH('the quick brown fox', 'NOT cat') as lacks_cat;\nSELECT FTS_MATCH('the quick brown fox jumps', '\"quick brown\"') as has_phrase;\nSELECT FTS_MATCH('the database stores information', 'inform*') as has_prefix;",
+      "SELECT FTS_MATCH('the quick brown fox', 'fox') as has_fox;\nSELECT FTS_MATCH('the quick brown fox', 'quick AND fox') as has_both;\nSELECT FTS_MATCH('the quick brown fox', 'cat OR fox') as has_either;\nSELECT FTS_MATCH('the quick brown fox', 'NOT cat') as lacks_cat;\nSELECT FTS_MATCH('the quick brown fox jumps', '\"quick brown\"') as has_phrase;\nSELECT FTS_MATCH('the database stores information', 'inform*') as has_prefix;\nSELECT FTS_MATCH('colour palette', 'colo?r') as single_char_wildcard;\nSELECT FTS_MATCH('database systems', 'data%') as multi_char_wildcard;",
       "SELECT FTS_RANK('the quick brown fox', 'fox AND quick') as relevance;\nSELECT BM25('the quick brown fox', 'fox AND quick') as relevance_alias;",
       "SELECT FTS_SNIPPET('the quick brown fox', 'fox', '\u003cem\u003e', '\u003c/em\u003e', '', 10) as excerpt;",
       "SELECT FTS_WORD_COUNT('hello world foo') as token_count;",
@@ -47,7 +47,12 @@
       "SELECT id, title, _fts_score, _fts_rank\nFROM FTS_SEARCH('fts_demo_articles', 'programming language', 2)\nORDER BY _fts_rank;",
       "SELECT id, title FROM FTS_SEARCH('fts_demo_articles', 'relational', 5, 'body');",
       "DROP TABLE fts_demo_articles;",
-      "CREATE TABLE row_to_text_demo (id INT, customer TEXT, status TEXT);\nINSERT INTO row_to_text_demo VALUES (1, 'Acme Corp', 'open');\nINSERT INTO row_to_text_demo VALUES (2, 'Globex', 'closed');\nSELECT id FROM row_to_text_demo WHERE ROW_TO_TEXT() LIKE '%Acme%' AND status = 'open';\nDROP TABLE row_to_text_demo;"
+      "CREATE TABLE row_to_text_demo (id INT, customer TEXT, status TEXT);\nINSERT INTO row_to_text_demo VALUES (1, 'Acme Corp', 'open');\nINSERT INTO row_to_text_demo VALUES (2, 'Globex', 'closed');\nSELECT id FROM row_to_text_demo WHERE ROW_TO_TEXT() LIKE '%Acme%' AND status = 'open';\nDROP TABLE row_to_text_demo;",
+      "CREATE TABLE contains_demo (id INT, description TEXT);\nINSERT INTO contains_demo VALUES (1, 'Widget A2000 - blue, waterproof');\nINSERT INTO contains_demo VALUES (2, 'Widget B300 - red');\nINSERT INTO contains_demo VALUES (3, 'Gadget C100 - blue, waterproof, wireless');",
+      "SELECT id, description FROM contains_demo\nWHERE CONTAINS_ALL(description, 'blue', 'waterproof');",
+      "SELECT id, description FROM contains_demo\nWHERE CONTAINS_ANY(description, 'wireless', 'red');",
+      "SELECT id, description, CONTAINS_SCORE(description, 'blue', 'waterproof', 'wireless') as match_count\nFROM contains_demo\nORDER BY match_count DESC;",
+      "DROP TABLE contains_demo;"
     ]
   },
   {
@@ -289,7 +294,90 @@
       "SELECT * FROM VEC_SEARCH('vec_demo_kb', 'embedding', VEC_FROM_JSON('[0.85, 0.15, 0.05, 0.0]'), 2);",
       "SELECT content,\n       VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[0.85, 0.15, 0.05, 0.0]')) as relevance\nFROM vec_demo_kb\nORDER BY relevance DESC;",
       "SELECT VEC_AVG(VEC_FROM_JSON('[0.9, 0.1, 0.0, 0.0]'), VEC_FROM_JSON('[0.8, 0.2, 0.1, 0.0]')) as expanded_query;",
-      "DROP TABLE vec_demo_docs;\nDROP TABLE vec_demo_kb;"
+      "DROP TABLE vec_demo_docs;\nDROP TABLE vec_demo_kb;",
+      "CREATE TABLE rag_search_demo (\n    doc_id      TEXT,\n    chunk_index INT,\n    chunk_text  TEXT,\n    embedding   VECTOR\n);\nINSERT INTO rag_search_demo VALUES\n    ('doc-1', 0, 'TinySQL is a lightweight embeddable SQL engine', '[0.9, 0.1, 0.0]'),\n    ('doc-1', 1, 'It supports vector search and full-text search', '[0.85, 0.15, 0.05]'),\n    ('doc-1', 2, 'RAG pipelines combine retrieval with generation', '[0.1, 0.0, 0.9]'),\n    ('doc-2', 0, 'Full-text search uses BM25 ranking', '[0.2, 0.0, 0.8]');",
+      "SELECT doc_id, chunk_index, chunk_text, _vec_distance, _vec_similarity, _vec_rank\nFROM RAG_SEARCH('rag_search_demo', 'embedding', VEC_FROM_JSON('[0.9, 0.1, 0.0]'), 2);",
+      "SELECT doc_id, chunk_index, chunk_text, _rrf_score, _rrf_rank\nFROM RAG_SEARCH('rag_search_demo', 'embedding', VEC_FROM_JSON('[0.9, 0.1, 0.0]'), 3, '{\n    \"text_column\": \"chunk_text\",\n    \"text_query\": \"full-text search\",\n    \"key_columns\": [\"doc_id\", \"chunk_index\"]\n}');",
+      "SELECT doc_id, chunk_index, chunk_text, _hit_rank, _context_offset, _context_rank\nFROM RAG_SEARCH('rag_search_demo', 'embedding', VEC_FROM_JSON('[0.9, 0.1, 0.0]'), 2, '{\n    \"text_column\": \"chunk_text\",\n    \"text_query\": \"vector search\",\n    \"key_columns\": [\"doc_id\", \"chunk_index\"],\n    \"expand_before\": 1,\n    \"expand_after\": 1,\n    \"doc_id_column\": \"doc_id\",\n    \"chunk_index_column\": \"chunk_index\"\n}')\nORDER BY _context_rank;",
+      "DROP TABLE rag_search_demo;",
+      "CREATE TABLE hybrid_search_demo (\n    id        INT PRIMARY KEY,\n    content   TEXT,\n    embedding VECTOR\n);\nINSERT INTO hybrid_search_demo VALUES\n    (1, 'database timeout retry guide', '[1.0, 0.0, 0.0]'),\n    (2, 'general systems handbook',      '[0.8, 0.2, 0.0]'),\n    (3, 'unrelated cooking notes',       '[0.0, 1.0, 0.0]');",
+      "SELECT id, content, _vec_similarity, _fts_score, _rrf_score, _rrf_rank\nFROM HYBRID_SEARCH(\n    'hybrid_search_demo', 'embedding', 'content', 'time?ut retry*',\n    VEC_FROM_JSON('[0.9, 0.1, 0.0]'), 3\n)\nORDER BY _rrf_rank;",
+      "DROP TABLE hybrid_search_demo;"
+    ]
+  },
+  {
+    "section": "GEOSPATIAL FUNCTIONS",
+    "examples": [
+      "CREATE TABLE geo_demo (name TEXT, geometry GEOMETRY);\nINSERT INTO geo_demo VALUES ('Berlin', '{\"type\":\"Point\",\"coordinates\":[13.4050,52.5200]}');\nINSERT INTO geo_demo VALUES ('Munich', '{\"type\":\"Point\",\"coordinates\":[11.5755,48.1372]}');",
+      "SELECT GEO_POINT(13.4050, 52.5200) AS berlin;",
+      "SELECT ST_MAKEPOINT(13.4050, 52.5200) AS berlin,\n       ST_POINT(13.4050, 52.5200) AS also_berlin;",
+      "SELECT GEO_LON(geometry) AS lon, ST_X(geometry) AS lon_alias\nFROM geo_demo WHERE name = 'Berlin';",
+      "SELECT GEO_LAT(geometry) AS lat, ST_Y(geometry) AS lat_alias\nFROM geo_demo WHERE name = 'Berlin';",
+      "SELECT a.name, b.name, GEO_DISTANCE(a.geometry, b.geometry) AS meters\nFROM geo_demo a JOIN geo_demo b ON a.name = 'Berlin' AND b.name = 'Munich';",
+      "SELECT GEO_DISTANCE(52.5200, 13.4050, 48.1372, 11.5755) AS meters;",
+      "SELECT GEO_DWITHIN(\n    '{\"type\":\"Point\",\"coordinates\":[13.4050,52.5200]}',\n    '{\"type\":\"Point\",\"coordinates\":[13.4060,52.5205]}',\n    200) AS within_200m;",
+      "SELECT GEO_WITHIN_BBOX(geometry, 5, 47, 15, 55) AS in_germany_ish\nFROM geo_demo WHERE name = 'Berlin';",
+      "SELECT a.name, b.name, GEO_BEARING(a.geometry, b.geometry) AS bearing_deg\nFROM geo_demo a JOIN geo_demo b ON a.name = 'Berlin' AND b.name = 'Munich';",
+      "SELECT a.name, b.name, GEO_MIDPOINT(a.geometry, b.geometry) AS midpoint\nFROM geo_demo a JOIN geo_demo b ON a.name = 'Berlin' AND b.name = 'Munich';",
+      "SELECT GEO_DESTINATION(geometry, 90, 10000) AS ten_km_east\nFROM geo_demo WHERE name = 'Berlin';",
+      "SELECT\n    GEO_WITHIN_POLYGON(\n        '{\"type\":\"Point\",\"coordinates\":[0.5,0.5]}',\n        '{\"type\":\"Polygon\",\"coordinates\":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}'\n    ) AS point_inside,\n    ST_CONTAINS(\n        '{\"type\":\"Polygon\",\"coordinates\":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}',\n        '{\"type\":\"Point\",\"coordinates\":[9,9]}'\n    ) AS point_outside;",
+      "SELECT GEO_POLYGON_AREA(\n    '{\"type\":\"Polygon\",\"coordinates\":[[[13.0,52.0],[13.1,52.0],[13.1,52.1],[13.0,52.1],[13.0,52.0]]]}'\n) AS square_meters;",
+      "SELECT GEO_LENGTH(\n    '{\"type\":\"LineString\",\"coordinates\":[[13.40,52.52],[13.41,52.52],[13.41,52.53]]}'\n) AS meters;",
+      "SELECT GEO_INTERSECTS(\n    '{\"type\":\"Polygon\",\"coordinates\":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}',\n    '{\"type\":\"Polygon\",\"coordinates\":[[[0.5,0.5],[1.5,0.5],[1.5,1.5],[0.5,1.5],[0.5,0.5]]]}'\n) AS overlapping_squares;",
+      "SELECT GEO_DISJOINT(\n    '{\"type\":\"Polygon\",\"coordinates\":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}',\n    '{\"type\":\"Polygon\",\"coordinates\":[[[10,10],[11,10],[11,11],[10,11],[10,10]]]}'\n) AS far_apart_squares;",
+      "SELECT GEO_EQUALS(\n    '{\"type\":\"Polygon\",\"coordinates\":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}',\n    '{\"type\":\"Polygon\",\"coordinates\":[[[1,0],[1,1],[0,1],[0,0],[1,0]]]}'\n) AS same_square_rotated_start;",
+      "SELECT GEO_BUFFER(geometry, 500, 16) AS half_km_circle\nFROM geo_demo WHERE name = 'Berlin';",
+      "SELECT GEO_CONVEX_HULL(\n    '{\"type\":\"MultiPoint\",\"coordinates\":[[0,0],[2,0],[2,2],[0,2],[1,1]]}'\n) AS hull;",
+      "SELECT GEO_ENVELOPE(\n    '{\"type\":\"LineString\",\"coordinates\":[[0,0],[3,1],[1,4]]}'\n) AS bbox_polygon;",
+      "SELECT GEO_LINE_INTERPOLATE(\n    '{\"type\":\"LineString\",\"coordinates\":[[13.40,52.52],[13.50,52.60]]}', 0.5\n) AS midway;",
+      "SELECT GEO_CLIP(\n    '{\"type\":\"Polygon\",\"coordinates\":[[[0,0],[4,0],[4,4],[0,4],[0,0]]]}',\n    '{\"type\":\"Polygon\",\"coordinates\":[[[1,1],[3,1],[3,3],[1,3],[1,1]]]}'\n) AS clipped_to_inner_square;"
+    ]
+  },
+  {
+    "section": "GEOSPATIAL: EDITING AND QUALITY",
+    "examples": [
+      "SELECT GEO_SIMPLIFY(\n    '{\"type\":\"LineString\",\"coordinates\":[[0,0],[1,0.05],[2,0],[3,2],[4,2]]}',\n    0.2, 'dp'\n) AS simplified;",
+      "SELECT GEO_BBOX(\n    '{\"type\":\"Polygon\",\"coordinates\":[[[-2,-2],[-2,2],[2,2],[2,-2],[-2,-2]]]}'\n) AS bbox;",
+      "SELECT GEO_CENTROID(\n    '{\"type\":\"Polygon\",\"coordinates\":[[[-2,-2],[-2,2],[2,2],[2,-2],[-2,-2]]]}'\n) AS centroid;",
+      "SELECT GEO_AFFINE(\n    '{\"type\":\"Point\",\"coordinates\":[1,0]}', 0, 0, 1.0, 90, 0, 0\n) AS rotated_90deg_around_origin;",
+      "SELECT GEO_SMOOTH(\n    '{\"type\":\"LineString\",\"coordinates\":[[0,0],[1,1],[2,0]]}', 1\n) AS smoothed;",
+      "SELECT GEO_DROP_HOLES(\n    '{\"type\":\"Polygon\",\"coordinates\":[[[-2,-2],[-2,2],[2,2],[2,-2],[-2,-2]],[[-1,-1],[-1,1],[1,1],[1,-1],[-1,-1]]]}'\n) AS outer_ring_only;",
+      "SELECT GEO_CLEAN(\n    '{\"type\":\"LineString\",\"coordinates\":[[0,0],[0,0],[1,1],[2,2]]}'\n) AS deduplicated;",
+      "SELECT GEO_SNAP(\n    '{\"type\":\"Point\",\"coordinates\":[13.40473,52.52019]}', 0.001\n) AS snapped;",
+      "SELECT GEO_IS_VALID('{\"type\":\"Point\",\"coordinates\":[13.40,52.52]}') AS valid,\n       GEO_IS_VALID('{\"type\":\"Polygon\",\"coordinates\":[[[0,0],[1,1]]]}') AS invalid_too_few_points;",
+      "CREATE TABLE geo_typed_demo (id INT, shape GEOMETRY);\nINSERT INTO geo_typed_demo VALUES (1, '{\"type\":\"Point\",\"coordinates\":[13.40,52.52]}');\nSELECT id, shape FROM geo_typed_demo;",
+      "SELECT CAST('{\"coordinates\":[1,2],\"type\":\"Point\"}' AS GEOMETRY) AS canonical;",
+      "DROP TABLE geo_typed_demo;"
+    ]
+  },
+  {
+    "section": "GEOSPATIAL: REGION OPERATIONS, SEARCH, AND CLASSIFICATION",
+    "examples": [
+      "CREATE TABLE geo_region_demo (region TEXT, footprint GEOMETRY, population FLOAT);\nINSERT INTO geo_region_demo VALUES ('north', '{\"type\":\"Polygon\",\"coordinates\":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}', 100);\nINSERT INTO geo_region_demo VALUES ('north', '{\"type\":\"Polygon\",\"coordinates\":[[[1,0],[2,0],[2,1],[1,1],[1,0]]]}', 300);\nINSERT INTO geo_region_demo VALUES ('south', '{\"type\":\"Polygon\",\"coordinates\":[[[10,10],[11,10],[11,11],[10,11],[10,10]]]}', 50);",
+      "SELECT region, GEO_DISSOLVE(footprint) AS boundary\nFROM geo_region_demo GROUP BY region ORDER BY region;",
+      "SELECT region, GEO_UNION_AGG(footprint) AS boundary\nFROM geo_region_demo GROUP BY region ORDER BY region;",
+      "SELECT region, GEO_BBOX_AGG(footprint) AS bbox\nFROM geo_region_demo GROUP BY region ORDER BY region;",
+      "SELECT region, GEO_CENTROID_AGG(footprint, population) AS weighted_centroid\nFROM geo_region_demo GROUP BY region ORDER BY region;",
+      "SELECT region FROM GEO_SEARCH('geo_region_demo', 'footprint', 'bbox', -1, -1, 3, 3);\nSELECT region FROM GEO_SEARCH('geo_region_demo', 'footprint', 'radius', 0.5, 0.5, 200000);",
+      "DROP TABLE geo_region_demo;",
+      "CREATE TABLE geo_kpi_demo (district TEXT, buildings INT);\nINSERT INTO geo_kpi_demo VALUES ('a', 5);\nINSERT INTO geo_kpi_demo VALUES ('b', 12);\nINSERT INTO geo_kpi_demo VALUES ('c', 48);\nINSERT INTO geo_kpi_demo VALUES ('d', 51);\nINSERT INTO geo_kpi_demo VALUES ('e', 95);",
+      "SELECT district, buildings,\n       EQUAL_INTERVAL(3) OVER (ORDER BY buildings) AS equal_interval_class,\n       NATURAL_BREAKS(3) OVER (ORDER BY buildings) AS natural_breaks_class,\n       NTILE(3) OVER (ORDER BY buildings) AS quantile_class\nFROM geo_kpi_demo ORDER BY buildings;",
+      "DROP TABLE geo_kpi_demo;\nDROP TABLE geo_demo;"
+    ]
+  },
+  {
+    "section": "TILE FUNCTIONS",
+    "examples": [
+      "SELECT TILE_X(13.405, 14) AS col, TILE_Y(52.520, 14) AS row;",
+      "SELECT TILE_ZXY(13.405, 52.520, 14) AS tile;",
+      "SELECT TILE_FLIP_Y(TILE_Y(52.520, 14), 14) AS tms_row;",
+      "SELECT TILE_LON(TILE_X(13.405, 14), 14) AS west_edge,\n       TILE_LAT(TILE_Y(52.520, 14), 14) AS north_edge;",
+      "SELECT TILE_BBOX(14, TILE_X(13.405, 14), TILE_Y(52.520, 14)) AS bounds;",
+      "SELECT TILE_QUADKEY(14, TILE_X(13.405, 14), TILE_Y(52.520, 14)) AS quadkey;\nSELECT TILE_FROM_QUADKEY('12020120310320') AS tile;",
+      "SELECT TILE_PARENT(14, TILE_X(13.405, 14), TILE_Y(52.520, 14)) AS parent;",
+      "SELECT TILE_COUNT(10) AS tiles_at_zoom_10;",
+      "SELECT TILE_CONTAINS(14, TILE_X(13.405, 14), TILE_Y(52.520, 14), 13.405, 52.520) AS covers_point;",
+      "CREATE TABLE tile_lookup_demo (zoom_level INT, tile_column INT, tile_row INT, tile_data BLOB);\nINSERT INTO tile_lookup_demo VALUES\n    (14, TILE_X(13.405, 14), TILE_FLIP_Y(TILE_Y(52.520, 14), 14), BLOB_FROM_HEX('00'));\nSELECT tile_data FROM tile_lookup_demo\nWHERE zoom_level = 14\n  AND tile_column = TILE_X(13.405, 14)\n  AND tile_row = TILE_FLIP_Y(TILE_Y(52.520, 14), 14);\nDROP TABLE tile_lookup_demo;"
     ]
   }
 ]

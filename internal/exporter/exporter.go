@@ -270,6 +270,156 @@ func ExportNDJSON(w io.Writer, rs *engine.ResultSet, opts Options) error {
 	return nil
 }
 
+// geometryCellBytes resolves a result-cell value into raw JSON bytes
+// describing a GeoJSON geometry object, handling every shape a GEOMETRY
+// column's cell can hold: the canonical Go string produced by the engine's
+// GEOMETRY column type, or the legacy json.RawMessage/[]byte shape produced
+// by importers that predate that type (ImportGeoJSON, ImportOSM, ...) and
+// bypass column coercion entirely. Returns nil for anything that isn't
+// JSON, rather than erroring -- see the callers' "one bad cell shouldn't
+// abort the whole export" policy.
+func geometryCellBytes(v any) []byte {
+	switch x := v.(type) {
+	case string:
+		if json.Valid([]byte(x)) {
+			return []byte(x)
+		}
+		return nil
+	case []byte:
+		return x
+	case json.RawMessage:
+		return []byte(x)
+	case map[string]any:
+		b, err := json.Marshal(x)
+		if err != nil {
+			return nil
+		}
+		return b
+	default:
+		return nil
+	}
+}
+
+func looksLikeGeoJSONGeometry(v any) bool {
+	raw := geometryCellBytes(v)
+	if raw == nil {
+		return false
+	}
+	var probe struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return false
+	}
+	switch strings.ToLower(probe.Type) {
+	case "point", "multipoint", "linestring", "multilinestring", "polygon", "multipolygon", "geometrycollection":
+		return true
+	default:
+		return false
+	}
+}
+
+// resolveGeometryColumn returns geomCol unchanged if set, otherwise
+// auto-detects: exactly one column whose first non-null value looks like a
+// GeoJSON geometry object. Zero or more than one candidate is an error --
+// silently picking one of several candidates could export the wrong column.
+func resolveGeometryColumn(rs *engine.ResultSet, geomCol string) (string, error) {
+	if geomCol != "" {
+		return geomCol, nil
+	}
+	var candidates []string
+	for _, c := range rs.Cols {
+		lc := strings.ToLower(c)
+		for _, r := range rs.Rows {
+			v := r[lc]
+			if v == nil {
+				continue
+			}
+			if looksLikeGeoJSONGeometry(v) {
+				candidates = append(candidates, c)
+			}
+			break
+		}
+	}
+	switch len(candidates) {
+	case 1:
+		return candidates[0], nil
+	case 0:
+		return "", fmt.Errorf("no geometry column found; pass an explicit column name")
+	default:
+		return "", fmt.Errorf("multiple candidate geometry columns %v; pass an explicit column name", candidates)
+	}
+}
+
+// ExportGeoJSON writes ResultSet rows as an RFC 7946 GeoJSON
+// FeatureCollection. geomCol names the column whose value becomes each
+// Feature's "geometry"; every other selected column (except a redundant
+// "geometry_type" column, if present -- ImportGeoJSON's own naming
+// convention, so an imported-then-reselected table round-trips cleanly)
+// becomes a "properties" entry. Pass "" for geomCol to auto-detect via
+// resolveGeometryColumn.
+//
+// A row whose geometry cell is nil, or doesn't parse as JSON, becomes a
+// Feature with "geometry": null (legal per RFC 7946 §3.2) rather than
+// aborting the export -- one bad cell should not lose every other row.
+func ExportGeoJSON(w io.Writer, rs *engine.ResultSet, geomCol string, opts Options) error {
+	geomCol, err := resolveGeometryColumn(rs, geomCol)
+	if err != nil {
+		return fmt.Errorf("ExportGeoJSON: %w", err)
+	}
+	lowerGeomCol := strings.ToLower(geomCol)
+
+	if _, err := io.WriteString(w, `{"type":"FeatureCollection","features":[`); err != nil {
+		return err
+	}
+	for i, r := range rs.Rows {
+		if i > 0 {
+			if _, err := io.WriteString(w, ","); err != nil {
+				return err
+			}
+		}
+		if _, err := io.WriteString(w, `{"type":"Feature","geometry":`); err != nil {
+			return err
+		}
+		geomBytes := geometryCellBytes(r[lowerGeomCol])
+		if geomBytes == nil {
+			if _, err := io.WriteString(w, "null"); err != nil {
+				return err
+			}
+		} else if _, err := w.Write(geomBytes); err != nil {
+			return err
+		}
+		if _, err := io.WriteString(w, `,"properties":`); err != nil {
+			return err
+		}
+		props := make(map[string]any, len(rs.Cols))
+		for _, c := range rs.Cols {
+			lc := strings.ToLower(c)
+			if lc == lowerGeomCol || lc == "geometry_type" {
+				continue
+			}
+			props[c] = jsonValue(r[lc], opts)
+		}
+		var b []byte
+		if opts.PrettyJSON {
+			b, err = json.MarshalIndent(props, "", "  ")
+		} else {
+			b, err = json.Marshal(props)
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := w.Write(b); err != nil {
+			return err
+		}
+		if _, err := io.WriteString(w, "}"); err != nil {
+			return err
+		}
+	}
+	_, err = io.WriteString(w, "]}\n")
+	return err
+}
+
 func jsonValue(v any, opts Options) any {
 	b, ok := v.([]byte)
 	if !ok || strings.EqualFold(opts.JSONBinaryMode, "legacy-string") {

@@ -357,6 +357,8 @@ func isKeyword(up string) bool {
 		"OVER", "PARTITION", "ROWS", "RANGE", "BETWEEN", "UNBOUNDED", "PRECEDING", "FOLLOWING", "CURRENT", "ROW",
 		// Vector / embedding types and functions
 		"VECTOR", "EMBEDDING",
+		// Spatial geometry type
+		"GEOMETRY", "GEOM",
 		"VEC_FROM_JSON", "VEC_TO_JSON", "VEC_DIM", "VEC_NORM", "VEC_NORMALIZE",
 		"VEC_ADD", "VEC_SUB", "VEC_MUL", "VEC_SCALE",
 		"VEC_DOT", "VEC_DOT_PRODUCT", "VEC_INNER_PRODUCT",

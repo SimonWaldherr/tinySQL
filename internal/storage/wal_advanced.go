@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -154,9 +155,6 @@ type AdvancedWAL struct {
 	// silently duplicating every row written since the previous checkpoint.
 	checkpointWatermark LSN
 
-	// Compression enabled
-	compress bool
-
 	closed bool
 }
 
@@ -169,14 +167,23 @@ type WALTxState struct {
 }
 
 // AdvancedWALConfig configures the advanced WAL.
+//
+// There is deliberately no Compress option here: the live WAL log is a
+// continuously-appended, crash-recoverable stream, and compressing it
+// safely would need a materially more complex design (resumable framing,
+// truncation handling that doesn't regress the per-record checksum's
+// corruption detection). Compression for ModeAdvancedWAL instead applies to
+// the periodic checkpoint snapshot only, via CheckpointPath's ".gz" suffix
+// (see OpenDB's ModeAdvancedWAL case) — a checkpoint is a whole snapshot
+// written once and read back whole, so it can reuse SaveToFile/
+// loadGOBInto's existing, already-tested gzip support with no new risk.
 type AdvancedWALConfig struct {
 	Path               string
 	CheckpointPath     string
 	CheckpointEvery    uint64        // Checkpoint after N records
 	CheckpointInterval time.Duration // Checkpoint after duration
 	CheckpointMaxBytes int64         // Checkpoint once WAL exceeds this size (0 = 64 MB default, <0 disables)
-	Compress           bool
-	BufferSize         int // Buffer size for writing
+	BufferSize         int           // Buffer size for writing
 }
 
 // OpenAdvancedWAL creates or opens a WAL with full ACID semantics.
@@ -235,7 +242,6 @@ func OpenAdvancedWAL(config AdvancedWALConfig) (*AdvancedWAL, error) {
 		checkpointMaxBytes:  normalizeCheckpointMaxBytes(config.CheckpointMaxBytes),
 		lastCheckpoint:      time.Now(),
 		activeTxs:           make(map[TxID]*WALTxState),
-		compress:            config.Compress,
 		nextLSN:             checkpointWatermark + 1,
 		checkpointWatermark: checkpointWatermark,
 	}
@@ -568,6 +574,14 @@ func (w *AdvancedWAL) Recover(db *DB) (int, error) {
 	aborted := make(map[TxID]bool)
 
 	recovered := 0
+	// Tables touched by at least one replayed operation. Rebuilding secondary
+	// indexes and invalidating stats is deferred until after the whole WAL
+	// has been scanned (see the loop below) and done once per table here,
+	// instead of after every single replayed row: replaying M operations
+	// against a table already carrying secondary-index metadata previously
+	// cost O(M) full index rebuilds (each itself O(rows log rows)) instead
+	// of one.
+	touchedTables := make(map[*Table]struct{})
 	// Seed from the checkpoint's own watermark (loaded in OpenAdvancedWAL),
 	// not zero, so nextLSN below continues monotonically even when the WAL
 	// file has nothing left to scan (e.g. a cleanly truncated WAL after a
@@ -623,8 +637,12 @@ func (w *AdvancedWAL) Recover(db *DB) (int, error) {
 			// Apply all operations for this transaction
 			if ops, exists := pending[record.TxID]; exists {
 				for _, op := range ops {
-					if err := w.applyOperation(db, op); err != nil {
+					table, err := w.applyOperation(db, op)
+					if err != nil {
 						return recovered, fmt.Errorf("apply operation at LSN %d: %w", op.LSN, err)
+					}
+					if table != nil {
+						touchedTables[table] = struct{}{}
 					}
 					recovered++
 				}
@@ -645,24 +663,38 @@ func (w *AdvancedWAL) Recover(db *DB) (int, error) {
 		}
 	}
 
+	// Now that every record has been applied, bring each touched table's
+	// derived state (secondary indexes, cached stats, dirty tracking) up to
+	// date exactly once, regardless of how many operations it replayed.
+	for table := range touchedTables {
+		if err := table.RebuildSecondaryIndexes(); err != nil {
+			return recovered, err
+		}
+		table.InvalidateStats()
+		table.MarkDirtyFrom(-1)
+	}
+
 	// Update next LSN
 	w.nextLSN = maxLSN + 1
 
 	return recovered, nil
 }
 
-// applyOperation applies a single WAL operation to the database.
-func (w *AdvancedWAL) applyOperation(db *DB, record *WALRecord) error {
+// applyOperation applies a single WAL operation to the database, returning
+// the table it touched (or nil for a no-op delete/update against a table
+// that no longer exists) so the caller can defer index/stats maintenance
+// until the whole WAL has been replayed instead of redoing it per op.
+func (w *AdvancedWAL) applyOperation(db *DB, record *WALRecord) (*Table, error) {
 	table, err := db.Get(record.Tenant, record.Table)
 	if err != nil {
 		// Table doesn't exist - create it
 		if record.OpType == WALOpInsert || record.OpType == WALOpUpdate {
 			table = NewTable(record.Table, record.Columns, false)
 			if err := db.Put(record.Tenant, table); err != nil {
-				return err
+				return nil, err
 			}
 		} else {
-			return nil // Ignore delete/update for non-existent table
+			return nil, nil // Ignore delete/update for non-existent table
 		}
 	}
 
@@ -699,17 +731,10 @@ func (w *AdvancedWAL) applyOperation(db *DB, record *WALRecord) error {
 		table.Version++
 	}
 	// A recovered table can already own materialized secondary-index metadata
-	// from its last checkpoint. Replay changes rows directly, so rebuild those
-	// indexes before exposing the recovered table to the executor; otherwise a
-	// subsequent indexed lookup can silently miss recovered rows or retain old
-	// row positions after a delete.
-	if err := table.RebuildSecondaryIndexes(); err != nil {
-		return err
-	}
-	table.InvalidateStats()
-	table.MarkDirtyFrom(-1)
-
-	return nil
+	// from its last checkpoint, and replay changes rows directly. The caller
+	// (Recover) rebuilds indexes/stats for this table once after the whole
+	// WAL has been replayed, rather than after every individual op here.
+	return table, nil
 }
 
 // rowsEqual compares two rows for equality.
@@ -757,6 +782,16 @@ func (w *AdvancedWAL) flush() error {
 // detection than the legacy additive checksum.
 var walCRCTable = crc32.MakeTable(crc32.Castagnoli)
 
+// Package-level constants for hashWALImage's framing bytes: sharing one
+// preallocated slice per marker across every checksum computation, instead
+// of converting a string literal to []byte at every call, means the h.Write
+// escape cost is paid once for the package's lifetime rather than per call.
+var (
+	walOpenBracket  = []byte("[")
+	walCloseBracket = []byte("]")
+	walTildeMarker  = []byte("~")
+)
+
 // calculateChecksum computes a CRC32-Castagnoli checksum over every record
 // field — including the before/after row images, which the legacy checksum
 // did not cover, so image corruption previously went undetected.
@@ -776,10 +811,25 @@ func (w *AdvancedWAL) calculateChecksum(record *WALRecord) uint32 {
 	_, _ = h.Write([]byte{0})
 	writeU64(uint64(record.RowID))
 	writeU64(uint64(record.Timestamp.UnixNano()))
-	hashWALImage(h, record.BeforeImage)
-	hashWALImage(h, record.AfterImage)
+	// scratch is reused across every value/column below instead of each
+	// hashWALValue call declaring its own local buffer: a buffer whose slice
+	// is handed to h.Write (an interface method) escapes to the heap, so one
+	// shared, heap-allocated-once buffer beats one fresh escape per value.
+	var scratch [40]byte
+	hashWALImage(h, record.BeforeImage, &scratch)
+	hashWALImage(h, record.AfterImage, &scratch)
+	// One buffer + one Write per column instead of five separate calls
+	// (three of them single-byte literals, one a dynamic-string conversion):
+	// each separate call to h.Write on the interface is a distinct potential
+	// heap escape, whereas building "c<name>;<type>;" once in scratch and
+	// writing it in a single call amortizes to the one shared allocation.
 	for _, c := range record.Columns {
-		_, _ = fmt.Fprintf(h, "c%s;%d;", c.Name, int(c.Type))
+		b := append(scratch[:0], 'c')
+		b = append(b, c.Name...)
+		b = append(b, ';')
+		b = strconv.AppendInt(b, int64(c.Type), 10)
+		b = append(b, ';')
+		_, _ = h.Write(b)
 	}
 	return h.Sum32()
 }
@@ -788,24 +838,62 @@ func (w *AdvancedWAL) calculateChecksum(record *WALRecord) uint32 {
 // The encoding must be identical before writing and after a gob round-trip:
 // time.Time loses its monotonic clock reading in gob, so it is hashed via
 // UnixNano, and maps are hashed in sorted key order.
-func hashWALImage(h io.Writer, image []any) {
+func hashWALImage(h io.Writer, image []any, scratch *[40]byte) {
 	if image == nil {
-		_, _ = io.WriteString(h, "~")
+		_, _ = h.Write(walTildeMarker)
 		return
 	}
-	_, _ = io.WriteString(h, "[")
+	_, _ = h.Write(walOpenBracket)
 	for _, v := range image {
-		hashWALValue(h, v)
+		hashWALValue(h, v, scratch)
 	}
-	_, _ = io.WriteString(h, "]")
+	_, _ = h.Write(walCloseBracket)
 }
 
-func hashWALValue(h io.Writer, v any) {
+func hashWALValue(h io.Writer, v any, scratch *[40]byte) {
 	switch t := v.(type) {
 	case nil:
 		_, _ = io.WriteString(h, "n;")
 	case time.Time:
 		_, _ = fmt.Fprintf(h, "t%d;", t.UnixNano())
+	// Fast paths for the scalar kinds that make up the overwhelming majority
+	// of logged column values, avoiding fmt.Fprintf's reflection overhead on
+	// every value of every row image of every WAL record. These must produce
+	// bytes identical to what the "%T%v;" fallback below would have written
+	// for the same value — testdata/wal_fixtures/advancedwal_legacy.wal has
+	// checksums baked in against that exact format, so this is a speed-only
+	// change, not a format change (see TestAdvancedWALFixtureReplaysCorrectly).
+	case int64:
+		b := append(scratch[:0], "int64"...)
+		b = strconv.AppendInt(b, t, 10)
+		b = append(b, ';')
+		_, _ = h.Write(b)
+	case int:
+		b := append(scratch[:0], "int"...)
+		b = strconv.AppendInt(b, int64(t), 10)
+		b = append(b, ';')
+		_, _ = h.Write(b)
+	case float64:
+		b := append(scratch[:0], "float64"...)
+		b = strconv.AppendFloat(b, t, 'g', -1, 64)
+		b = append(b, ';')
+		_, _ = h.Write(b)
+	case string:
+		// append(dst, t...) copies t's bytes directly (a compiler-recognized
+		// idiom), unlike io.WriteString(h, t) which — since crc32's digest
+		// doesn't implement io.StringWriter — falls back to a fresh []byte(t)
+		// allocation the compiler cannot elide through the h.Write interface
+		// call.
+		b := append(scratch[:0], "string"...)
+		b = append(b, t...)
+		b = append(b, ';')
+		_, _ = h.Write(b)
+	case bool:
+		if t {
+			_, _ = io.WriteString(h, "booltrue;")
+		} else {
+			_, _ = io.WriteString(h, "boolfalse;")
+		}
 	case []float64:
 		_, _ = io.WriteString(h, "V")
 		var b [8]byte
@@ -816,7 +904,7 @@ func hashWALValue(h io.Writer, v any) {
 	case []any:
 		_, _ = io.WriteString(h, "[")
 		for _, e := range t {
-			hashWALValue(h, e)
+			hashWALValue(h, e, scratch)
 		}
 		_, _ = io.WriteString(h, "]")
 	case map[string]any:
@@ -828,7 +916,7 @@ func hashWALValue(h io.Writer, v any) {
 		_, _ = io.WriteString(h, "{")
 		for _, k := range keys {
 			_, _ = fmt.Fprintf(h, "%q:", k)
-			hashWALValue(h, t[k])
+			hashWALValue(h, t[k], scratch)
 		}
 		_, _ = io.WriteString(h, "}")
 	default:

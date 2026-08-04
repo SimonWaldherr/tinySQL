@@ -179,20 +179,30 @@ func evalGeoCentroid(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	return geoCentroidFromValue(ex.Name, value)
+}
+
+// geoCentroidFromValue computes GEO_CENTROID's result for an already-
+// evaluated GeoJSON value. Shared by evalGeoCentroid (which evaluates its
+// FuncCall argument expression first) and evalAggregateGeoCentroidAgg in
+// geo_aggregate.go, which already holds the per-row value from its own
+// evalExpr call and would otherwise need to wrap it in a throwaway
+// FuncCall+Literal expression, once per row, just to reuse evalGeoCentroid.
+func geoCentroidFromValue(name string, value any) (any, error) {
 	if value == nil {
 		return nil, nil
 	}
 	object, err := geoSimplifyObject(value)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", ex.Name, err)
+		return nil, fmt.Errorf("%s: %w", name, err)
 	}
 	acc := geoCentroidAccumulator{}
 	if err := collectGeoCentroid(object, &acc); err != nil {
-		return nil, fmt.Errorf("%s: %w", ex.Name, err)
+		return nil, fmt.Errorf("%s: %w", name, err)
 	}
 	if acc.Weight == 0 {
 		if len(acc.Fallback) == 0 {
-			return nil, fmt.Errorf("%s: geometry has no coordinates", ex.Name)
+			return nil, fmt.Errorf("%s: geometry has no coordinates", name)
 		}
 		for _, point := range acc.Fallback {
 			acc.X += point.X

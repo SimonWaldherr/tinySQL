@@ -32,16 +32,21 @@ type Config struct {
 	Timer     bool
 	NullValue string
 	Mode      OutputMode
+	// GeomCol names the geometry column for ModeGeoJSON/ModeTopoJSON.
+	// Empty auto-detects it (see exporter.ExportGeoJSON/ExportTopoJSON).
+	GeomCol string
 }
 
 type OutputMode string
 
 const (
-	ModeColumn OutputMode = "column"
-	ModeList   OutputMode = "list"
-	ModeCSV    OutputMode = "csv"
-	ModeJSON   OutputMode = "json"
-	ModeTable  OutputMode = "table"
+	ModeColumn   OutputMode = "column"
+	ModeList     OutputMode = "list"
+	ModeCSV      OutputMode = "csv"
+	ModeJSON     OutputMode = "json"
+	ModeTable    OutputMode = "table"
+	ModeGeoJSON  OutputMode = "geojson"
+	ModeTopoJSON OutputMode = "topojson"
 )
 
 func main() {
@@ -78,12 +83,13 @@ func runCLI(args []string) error {
 
 	var (
 		tenant  = fs.String("tenant", "default", "Tenant/schema name")
-		mode    = fs.String("mode", "column", "Output mode: column|list|csv|json|table")
+		mode    = fs.String("mode", "column", "Output mode: column|list|csv|json|table|geojson|topojson")
 		headers = fs.Bool("header", true, "Include column headers")
 		echo    = fs.Bool("echo", false, "Echo SQL before execution")
 		cmd     = fs.String("cmd", "", "Run specific SQL and exit")
 		batch   = fs.Bool("batch", false, "Force batch mode")
 		outFile = fs.String("output", "", "Write output to file")
+		geomCol = fs.String("geom-col", "", "Geometry column for -mode geojson|topojson (auto-detected if omitted)")
 	)
 
 	if err := fs.Parse(args); err != nil {
@@ -98,6 +104,7 @@ func runCLI(args []string) error {
 		Batch:     *batch,
 		Mode:      OutputMode(*mode),
 		NullValue: "", // default empty for column mode, usually
+		GeomCol:   *geomCol,
 	}
 
 	// Determine Database Path
@@ -346,8 +353,8 @@ func printHelp(out io.Writer) {
 .exit                  Exit this program
 .headers on|off        Turn display of headers on or off
 .help                  Show this message
-.import FILE [TABLE]   Import CSV/JSON file into table
-.mode MODE             Set output mode (column, list, csv, json, table)
+.import FILE [TABLE]   Import a file into a table (CSV, TSV, JSON, GeoJSON, TopoJSON, KML, OSM XML, ...)
+.mode MODE             Set output mode (column, list, csv, json, table, geojson, topojson)
 .nullvalue STRING      Use STRING in place of NULL values
 .read FILENAME         Execute SQL in FILENAME
 .save FILENAME         Write in-memory database into FILENAME
@@ -418,46 +425,31 @@ func dumpTables(out io.Writer, db *tsql.DB, tenant string, args []string) error 
 	return nil
 }
 
-// importFileCmd imports a CSV/JSON file into a table.
+// importFileCmd imports a file into a table. It delegates to the shared
+// tsql.ImportFile extension dispatcher -- the same one importer.OpenFile and
+// every other public entry point uses -- instead of hand-duplicating a
+// narrow subset of its format list here. Before this, ".import" only
+// understood .csv/.tsv/.json even though ImportFile has long supported
+// .geojson/.topojson/.kml/.osm/.mbtiles/.shp/... too; delegating fixes both
+// that pre-existing gap and adds .topojson in one change.
 func importFileCmd(db *tsql.DB, tenant string, args []string, out io.Writer) error {
 	filePath := args[0]
 	tableName := ""
 	if len(args) > 1 {
 		tableName = args[1]
-	} else {
-		base := filepath.Base(filePath)
-		tableName = strings.TrimSuffix(base, filepath.Ext(base))
 	}
 
-	f, err := os.Open(filePath)
+	ctx := context.Background()
+	result, err := tsql.ImportFile(ctx, db, tenant, tableName, filePath, nil)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
-	ctx := context.Background()
-	ext := strings.ToLower(filepath.Ext(filePath))
-
-	switch ext {
-	case ".csv", ".tsv":
-		opts := &tsql.ImportOptions{}
-		if ext == ".tsv" {
-			opts.DelimiterCandidates = []rune{'\t'}
-		}
-		result, err := tsql.ImportCSV(ctx, db, tenant, tableName, f, opts)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(out, "Imported %d rows into %s\n", result.RowsInserted, tableName)
-	case ".json":
-		result, err := tsql.ImportJSON(ctx, db, tenant, tableName, f, nil)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(out, "Imported %d rows into %s\n", result.RowsInserted, tableName)
-	default:
-		return fmt.Errorf("unsupported format: %s (use .csv, .tsv, .json)", ext)
+	if tableName == "" {
+		base := filepath.Base(filePath)
+		tableName = strings.TrimSuffix(base, filepath.Ext(base))
 	}
+	fmt.Fprintf(out, "Imported %d rows into %s\n", result.RowsInserted, tableName)
 	return nil
 }
 
@@ -614,6 +606,10 @@ func getPrinter(mode OutputMode) Printer {
 		return &CSVPrinter{}
 	case ModeJSON:
 		return &JSONPrinter{}
+	case ModeGeoJSON:
+		return &GeoJSONPrinter{}
+	case ModeTopoJSON:
+		return &TopoJSONPrinter{}
 	case ModeList:
 		return &ListPrinter{}
 	case ModeColumn, ModeTable:
@@ -688,6 +684,23 @@ type JSONPrinter struct{}
 
 func (jp *JSONPrinter) Print(out io.Writer, rs *tsql.ResultSet, cfg *Config) error {
 	return exporter.ExportJSON(out, rs, exporter.Options{PrettyJSON: true})
+}
+
+// GeoJSONPrinter writes a query result as an RFC 7946 FeatureCollection.
+// cfg.GeomCol selects the geometry column ("" auto-detects it).
+type GeoJSONPrinter struct{}
+
+func (gp *GeoJSONPrinter) Print(out io.Writer, rs *tsql.ResultSet, cfg *Config) error {
+	return exporter.ExportGeoJSON(out, rs, cfg.GeomCol, exporter.Options{PrettyJSON: true})
+}
+
+// TopoJSONPrinter writes a query result as a TopoJSON v3 Topology, the
+// format Power BI Shape Maps and most BI/mapping tools prefer over
+// GeoJSON. cfg.GeomCol selects the geometry column ("" auto-detects it).
+type TopoJSONPrinter struct{}
+
+func (tp *TopoJSONPrinter) Print(out io.Writer, rs *tsql.ResultSet, cfg *Config) error {
+	return exporter.ExportTopoJSON(out, rs, cfg.GeomCol, "", exporter.Options{PrettyJSON: true})
 }
 
 // ---- Helpers ----------------------------------------------------------------

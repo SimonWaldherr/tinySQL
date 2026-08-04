@@ -641,7 +641,9 @@ func isAggregateName(name string) bool {
 	case "COUNT", "SUM", "AVG", "MIN", "MAX",
 		"GROUP_CONCAT", "STRING_AGG",
 		"FIRST", "LAST",
-		"MIN_BY", "MAX_BY", "ARG_MIN", "ARG_MAX":
+		"MIN_BY", "MAX_BY", "ARG_MIN", "ARG_MAX",
+		"GEO_DISSOLVE", "GEO_UNION_AGG", "ST_UNION",
+		"GEO_BBOX_AGG", "GEO_CENTROID_AGG":
 		return true
 	}
 	return false
@@ -654,7 +656,8 @@ func isWindowFuncName(name string) bool {
 		"LAG", "LEAD",
 		"FIRST_VALUE", "LAST_VALUE",
 		"MOVING_SUM", "MOVING_AVG",
-		"NTILE", "PERCENT_RANK", "CUME_DIST":
+		"NTILE", "PERCENT_RANK", "CUME_DIST",
+		"EQUAL_INTERVAL", "NATURAL_BREAKS":
 		return true
 	}
 	return false

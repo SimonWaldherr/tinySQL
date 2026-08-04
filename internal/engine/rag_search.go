@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -93,6 +94,16 @@ func (f *RAGSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 		}
 	}
 
+	return ragSearchExecute(ctx, env, row, vecArgsParsed, opts)
+}
+
+// ragSearchExecute is RAG_SEARCH's body once the shared (table, column,
+// query_vector, k) prefix and the options struct are already resolved.
+// RAGSearchTableFunc.Execute reaches it after parsing an options JSON
+// string argument; HybridSearchTableFunc.Execute calls it directly with an
+// already-populated ragSearchOptions, skipping a marshal-to-JSON-just-to-
+// immediately-unmarshal-it-back round trip through this same function.
+func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed vecSearchArgs, opts ragSearchOptions) (*ResultSet, error) {
 	metric := vecArgsParsed.metric
 	if opts.Metric != "" {
 		metric = normalizeVecMetric(opts.Metric)
@@ -253,9 +264,35 @@ func ragSearchKey(r Row, keyCols []string) string {
 			b.WriteByte('\x1f')
 		}
 		v, _ := ragValue(r, col)
-		fmt.Fprintf(&b, "%v", v)
+		ragWriteKeyValue(&b, v)
 	}
 	return b.String()
+}
+
+// ragWriteKeyValue mirrors ftsWriteValue's fast-path/fallback split (see
+// fts.go): a type switch over the scalar kinds that make up real key-column
+// values (row IDs, chunk indexes, doc IDs) avoids fmt.Fprintf's reflection
+// overhead per key column per candidate row during fusion. float64
+// deliberately stays on the %v fallback, same as ftsWriteValue, since its
+// shortest-round-trip formatting needs care to reproduce exactly via
+// strconv.
+func ragWriteKeyValue(b *strings.Builder, v any) {
+	switch t := v.(type) {
+	case string:
+		b.WriteString(t)
+	case int:
+		b.WriteString(strconv.Itoa(t))
+	case int64:
+		b.WriteString(strconv.FormatInt(t, 10))
+	case bool:
+		if t {
+			b.WriteString("true")
+		} else {
+			b.WriteString("false")
+		}
+	default:
+		fmt.Fprintf(b, "%v", v)
+	}
 }
 
 // ragFusedRow tracks one candidate row's merged data plus its RRF inputs

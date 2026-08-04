@@ -64,7 +64,7 @@ malformed values:
 | `autosave` | `0/1`, `true/false`, `yes/no`, `on/off` | Legacy GOB snapshot persistence |
 | `pool_readers`, `pool_writers` | non-negative integer | Driver admission limit (`0` = no driver limit) |
 | `busy_timeout` | Go duration or integer milliseconds | Wait bound for the driver pool |
-| `mode` | `memory`, `disk`, `json`, `index`, `hybrid`, `wal`, `advanced_wal` | Storage backend |
+| `mode` | `memory`, `disk`, `json`, `index`, `hybrid`, `wal`, `advanced_wal`, `paged_index`, `sqlite` | Storage backend |
 | `max_memory_bytes` | bytes, `KiB`/`MiB`/`GiB`, or decimal `KB`/`MB`/`GB` | Hybrid/Index buffer-pool budget |
 | `read_only` | strict boolean | Reject mutations and persistence actions |
 | `sync_on_mutate`, `compress_files` | strict boolean | Storage behaviour |
@@ -83,9 +83,11 @@ For a file-backed storage mode, all storage values are forwarded to
 | `ModeDisk` | `disk` | One GOB file per table |
 | `ModeJSON` | `json` | One readable JSON file per table |
 | `ModeWAL` | `wal` | Older WAL mode; manual logging |
-| `ModeAdvancedWAL` | `advanced_wal` | Row-level WAL logged automatically on writes |
+| `ModeAdvancedWAL` | `advanced_wal` | Row-level WAL logged automatically on writes; `compress_files` gzips the periodic checkpoint snapshot only, not the live log |
 | `ModeIndex` | `index` | Schemas in memory, rows on disk |
 | `ModeHybrid` | `hybrid` | LRU buffer pool with spill-to-disk behavior |
+| `ModePagedIndex` | `paged_index` | Immutable page-oriented artifact for large read-mostly workloads |
+| `ModeSQLite` | `sqlite` | Each table is a native table in a real `.sqlite` file, readable by any SQLite tool (requires the `sqliteimport` build tag) |
 
 JSON mode example:
 
@@ -95,6 +97,28 @@ db, err := tsql.OpenDB(tsql.StorageConfig{
     Path: "./data/tinysql",
 })
 ```
+
+SQLite mode example (build with `-tags=sqliteimport`; `Path` is a file, not a
+directory):
+
+```go
+db, err := tsql.OpenDB(tsql.StorageConfig{
+    Mode: tsql.ModeSQLite,
+    Path: "./data/tinysql.sqlite",
+})
+```
+
+Or via a DSN: `file:./data/tinysql.sqlite?tenant=default&mode=sqlite`.
+
+Columns whose values map cleanly onto SQLite's native storage classes
+(integers, floats, strings, booleans, blobs) are stored as native
+INTEGER/REAL/TEXT/BLOB columns, so `sqlite3`/DB Browser for SQLite/etc. can
+query the file directly. Types with no native SQLite equivalent — Decimal,
+UUID, time values, JSON, vectors, geometry — are stored as JSON-encoded text
+in the same table, the same lossy-to-string convention `ModeJSON` already
+uses for those types. Views, RBAC, and other catalog state are persisted to
+a `<path>.catalog.gob` sidecar file next to the `.sqlite` file, the same
+mechanism `ModeDisk`/`ModeJSON` use.
 
 ## Read-only serving
 

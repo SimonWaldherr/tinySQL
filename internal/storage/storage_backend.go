@@ -73,6 +73,13 @@ const (
 	// B+Trees, so an exact index seek can load only index and referenced row
 	// pages instead of decoding a complete table file.
 	ModePagedIndex
+
+	// ModeSQLite stores every table as a native table in a real SQLite
+	// database file (via the pure-Go modernc.org/sqlite driver), so the
+	// resulting file is directly readable by any SQLite tool — sqlite3,
+	// DB Browser for SQLite, etc. Requires the sqliteimport build tag; see
+	// backend_sqlite_unsupported.go for the error returned without it.
+	ModeSQLite
 )
 
 // String returns a human-readable label for the StorageMode.
@@ -94,6 +101,8 @@ func (m StorageMode) String() string {
 		return "json"
 	case ModePagedIndex:
 		return "paged_index"
+	case ModeSQLite:
+		return "sqlite"
 	default:
 		return fmt.Sprintf("StorageMode(%d)", int(m))
 	}
@@ -119,8 +128,10 @@ func ParseStorageMode(s string) (StorageMode, error) {
 		return ModeJSON, nil
 	case "paged_index", "pagedindex", "page_index":
 		return ModePagedIndex, nil
+	case "sqlite":
+		return ModeSQLite, nil
 	default:
-		return ModeMemory, fmt.Errorf("unknown storage mode %q (valid: memory, wal, disk, index, hybrid, advanced_wal, json, paged_index)", s)
+		return ModeMemory, fmt.Errorf("unknown storage mode %q (valid: memory, wal, disk, index, hybrid, advanced_wal, json, paged_index, sqlite)", s)
 	}
 }
 
@@ -145,7 +156,12 @@ type StorageConfig struct {
 	// Slower but provides immediate durability for ModeDisk / ModeHybrid.
 	SyncOnMutate bool
 
-	// CompressFiles enables gzip compression for table files on disk.
+	// CompressFiles enables gzip compression for table files on disk
+	// (ModeDisk, ModeJSON, ModeHybrid, ModeIndex). For ModeAdvancedWAL it
+	// instead compresses the periodic checkpoint snapshot only — the live
+	// WAL log itself is never compressed, since it is a continuously
+	// appended, crash-recoverable stream rather than a point-in-time
+	// artifact (see OpenDB's ModeAdvancedWAL case).
 	CompressFiles bool
 
 	// CheckpointEvery controls how many committed WAL transactions trigger

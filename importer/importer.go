@@ -44,9 +44,21 @@ func ImportXML(ctx context.Context, db *tinysql.DB, tenant, tableName string, sr
 	return ii.ImportXML(ctx, db, tenant, tableName, src, opts)
 }
 
+// ImportXLSX imports the first worksheet (or opts.XLSXSheet) of an Excel
+// workbook from src.
+func ImportXLSX(ctx context.Context, db *tinysql.DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
+	return ii.ImportXLSX(ctx, db, tenant, tableName, src, opts)
+}
+
 // ImportGeoJSON imports GeoJSON feature data from src.
 func ImportGeoJSON(ctx context.Context, db *tinysql.DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
 	return ii.ImportGeoJSON(ctx, db, tenant, tableName, src, opts)
+}
+
+// ImportTopoJSON imports a TopoJSON Topology from src, resolving arc
+// references back to plain geometry coordinates before import.
+func ImportTopoJSON(ctx context.Context, db *tinysql.DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
+	return ii.ImportTopoJSON(ctx, db, tenant, tableName, src, opts)
 }
 
 // ImportKML imports KML placemark data from src.

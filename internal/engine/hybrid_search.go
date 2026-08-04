@@ -116,18 +116,19 @@ func (f *HybridSearchTableFunc) Execute(ctx context.Context, args []Expr, env Ex
 		}
 	}
 
-	optionsJSON, err := json.Marshal(opts)
-	if err != nil {
-		return nil, fmt.Errorf("%s options: %w", f.Name(), err)
-	}
-	ragArgs := []Expr{
+	// Call RAG_SEARCH's shared body directly with the already-populated opts
+	// struct instead of marshaling it to a JSON string argument only to have
+	// RAGSearchTableFunc.Execute immediately unmarshal it back.
+	vecArgsParsed, err := vecParseArgs(env, []Expr{
 		&Literal{Val: tableName},
 		&Literal{Val: vectorColumn},
 		args[4],
 		args[5],
-		&Literal{Val: string(optionsJSON)},
+	}, row)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", f.Name(), err)
 	}
-	result, err := (&RAGSearchTableFunc{}).Execute(ctx, ragArgs, env, row)
+	result, err := ragSearchExecute(ctx, env, row, vecArgsParsed, opts)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", f.Name(), err)
 	}

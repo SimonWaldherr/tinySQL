@@ -86,6 +86,9 @@ func ImportFile(
 	case ".geojson":
 		return ImportGeoJSON(ctx, db, tenant, tableName, f, opts)
 
+	case ".topojson":
+		return ImportTopoJSON(ctx, db, tenant, tableName, f, opts)
+
 	case ".kml":
 		return ImportKML(ctx, db, tenant, tableName, f, opts)
 
@@ -113,6 +116,9 @@ func ImportFile(
 		}
 		opts.DelimiterCandidates = []rune{'\t'}
 		return ImportCSV(ctx, db, tenant, tableName, f, opts)
+
+	case ".xlsx":
+		return ImportXLSX(ctx, db, tenant, tableName, f, opts)
 
 	case ".json":
 		if isRoutingGraphJSON {

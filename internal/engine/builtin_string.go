@@ -961,6 +961,8 @@ func castValue(val any, targetType string) (any, error) {
 			return strings.ToLower(v) == "true" || v == "1", nil
 		}
 		return false, nil
+	case "GEOMETRY", "GEOM":
+		return coerceToGeometry(val)
 	default:
 		return nil, fmt.Errorf("unsupported cast type: %s", targetType)
 	}

@@ -55,6 +55,14 @@ var typeKeywordMap = map[string]storage.ColType{
 	// Vector types (for RAG / embedding storage)
 	"VECTOR":    storage.VectorType,
 	"EMBEDDING": storage.VectorType,
+	// Spatial types (GeoJSON geometry storage). GEOMETRY(SRID)-style
+	// parameters are not supported: a parenthesized argument after the type
+	// name is only recognized here when the base name also matches a
+	// sqliteAffinity substring rule, which "GEOMETRY" does not, so
+	// GEOMETRY(4326) would silently fall through to DECIMAL exactly like the
+	// unparameterized keyword did before this entry existed.
+	"GEOMETRY": storage.GeometryType,
+	"GEOM":     storage.GeometryType,
 	// Extra data types
 	"YAML":   storage.YAMLType,
 	"URL":    storage.URLType,

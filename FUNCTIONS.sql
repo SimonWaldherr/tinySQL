@@ -1200,5 +1200,334 @@ ORDER BY _rrf_rank;
 DROP TABLE hybrid_search_demo;
 
 -- ============================================================
+-- GEOSPATIAL FUNCTIONS
+-- ============================================================
+
+-- Geometry is stored and returned as GeoJSON, either in a plain TEXT/JSON
+-- column or in the dedicated GEOMETRY column type (validated on write and
+-- canonicalized to stable text). Raw four-number coordinate arguments use
+-- (lat, lon, lat, lon); GeoJSON itself stays [lon, lat].
+
+CREATE TABLE geo_demo (name TEXT, geometry GEOMETRY);
+INSERT INTO geo_demo VALUES ('Berlin', '{"type":"Point","coordinates":[13.4050,52.5200]}');
+INSERT INTO geo_demo VALUES ('Munich', '{"type":"Point","coordinates":[11.5755,48.1372]}');
+
+-- GEO_POINT: build a GeoJSON Point from (lon, lat[, z])
+SELECT GEO_POINT(13.4050, 52.5200) AS berlin;
+
+-- ST_MAKEPOINT / ST_POINT: aliases of GEO_POINT
+SELECT ST_MAKEPOINT(13.4050, 52.5200) AS berlin,
+       ST_POINT(13.4050, 52.5200) AS also_berlin;
+
+-- GEO_LON / GEO_X: read a Point's longitude. ST_X is the alias.
+SELECT GEO_LON(geometry) AS lon, ST_X(geometry) AS lon_alias
+FROM geo_demo WHERE name = 'Berlin';
+
+-- GEO_LAT / GEO_Y: read a Point's latitude. ST_Y is the alias.
+SELECT GEO_LAT(geometry) AS lat, ST_Y(geometry) AS lat_alias
+FROM geo_demo WHERE name = 'Berlin';
+
+-- GEO_DISTANCE: great-circle distance in meters between two points.
+-- HAVERSINE and ST_DISTANCE are aliases.
+SELECT a.name, b.name, GEO_DISTANCE(a.geometry, b.geometry) AS meters
+FROM geo_demo a JOIN geo_demo b ON a.name = 'Berlin' AND b.name = 'Munich';
+
+-- GEO_DISTANCE also accepts four raw (lat1, lon1, lat2, lon2) numbers
+SELECT GEO_DISTANCE(52.5200, 13.4050, 48.1372, 11.5755) AS meters;
+
+-- GEO_DWITHIN: true if two points are within a given radius (meters).
+-- ST_DWITHIN is the alias.
+SELECT GEO_DWITHIN(
+    '{"type":"Point","coordinates":[13.4050,52.5200]}',
+    '{"type":"Point","coordinates":[13.4060,52.5205]}',
+    200) AS within_200m;
+
+-- GEO_WITHIN_BBOX: true if a point falls inside [minLon, minLat, maxLon, maxLat].
+-- ST_WITHIN_BBOX is the alias.
+SELECT GEO_WITHIN_BBOX(geometry, 5, 47, 15, 55) AS in_germany_ish
+FROM geo_demo WHERE name = 'Berlin';
+
+-- GEO_BEARING: initial compass bearing (0-360 clockwise from north) from the
+-- first point toward the second. ST_AZIMUTH is the alias.
+SELECT a.name, b.name, GEO_BEARING(a.geometry, b.geometry) AS bearing_deg
+FROM geo_demo a JOIN geo_demo b ON a.name = 'Berlin' AND b.name = 'Munich';
+
+-- GEO_MIDPOINT: great-circle midpoint between two points. ST_MIDPOINT is the alias.
+SELECT a.name, b.name, GEO_MIDPOINT(a.geometry, b.geometry) AS midpoint
+FROM geo_demo a JOIN geo_demo b ON a.name = 'Berlin' AND b.name = 'Munich';
+
+-- GEO_DESTINATION: project a point along a bearing for a distance (meters).
+-- ST_PROJECT is the alias.
+SELECT GEO_DESTINATION(geometry, 90, 10000) AS ten_km_east
+FROM geo_demo WHERE name = 'Berlin';
+
+-- GEO_WITHIN_POLYGON: point-in-polygon(-or-multipolygon) test.
+-- ST_WITHIN is the alias; ST_CONTAINS takes the same two arguments reversed
+-- (polygon, point), matching PostGIS's ST_Contains(A, B) = "A contains B".
+SELECT
+    GEO_WITHIN_POLYGON(
+        '{"type":"Point","coordinates":[0.5,0.5]}',
+        '{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}'
+    ) AS point_inside,
+    ST_CONTAINS(
+        '{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}',
+        '{"type":"Point","coordinates":[9,9]}'
+    ) AS point_outside;
+
+-- GEO_POLYGON_AREA: area in square meters, exterior ring minus holes.
+-- ST_AREA is the alias. Accepts a Polygon or MultiPolygon.
+SELECT GEO_POLYGON_AREA(
+    '{"type":"Polygon","coordinates":[[[13.0,52.0],[13.1,52.0],[13.1,52.1],[13.0,52.1],[13.0,52.0]]]}'
+) AS square_meters;
+
+-- GEO_LENGTH: sum of great-circle segment lengths of a LineString, in meters.
+-- ST_LENGTH is the alias.
+SELECT GEO_LENGTH(
+    '{"type":"LineString","coordinates":[[13.40,52.52],[13.41,52.52],[13.41,52.53]]}'
+) AS meters;
+
+-- GEO_INTERSECTS: true if two geometries (point/line/polygon, any combination)
+-- share at least one point. ST_INTERSECTS is the alias. Respects polygon
+-- holes: a shape nested in another's hole is NOT reported as intersecting.
+SELECT GEO_INTERSECTS(
+    '{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}',
+    '{"type":"Polygon","coordinates":[[[0.5,0.5],[1.5,0.5],[1.5,1.5],[0.5,1.5],[0.5,0.5]]]}'
+) AS overlapping_squares;
+
+-- GEO_DISJOINT: the exact negation of GEO_INTERSECTS. ST_DISJOINT is the alias.
+SELECT GEO_DISJOINT(
+    '{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}',
+    '{"type":"Polygon","coordinates":[[[10,10],[11,10],[11,11],[10,11],[10,10]]]}'
+) AS far_apart_squares;
+
+-- GEO_EQUALS: same coordinates, allowing for a different start vertex,
+-- winding direction, or Polygon-vs-single-part-MultiPolygon wrapping (NOT
+-- full OGC point-set equality -- two differently-vertexized polygons
+-- covering the same area are not detected as equal). ST_EQUALS is the alias.
+SELECT GEO_EQUALS(
+    '{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}',
+    '{"type":"Polygon","coordinates":[[[1,0],[1,1],[0,1],[0,0],[1,0]]]}'
+) AS same_square_rotated_start;
+
+-- GEO_BUFFER: approximate a circular buffer (meters) around a point as a
+-- regular polygon; the optional 3rd argument sets the vertex count (8-256,
+-- default 32). ST_BUFFER is the alias.
+SELECT GEO_BUFFER(geometry, 500, 16) AS half_km_circle
+FROM geo_demo WHERE name = 'Berlin';
+
+-- GEO_CONVEX_HULL: convex hull of every vertex in a geometry, as a Polygon.
+-- ST_CONVEXHULL is the alias. Computed in plain lon/lat space (a standard
+-- planar approximation, not a rigorous spherical hull).
+SELECT GEO_CONVEX_HULL(
+    '{"type":"MultiPoint","coordinates":[[0,0],[2,0],[2,2],[0,2],[1,1]]}'
+) AS hull;
+
+-- GEO_ENVELOPE: a geometry's bounding box as a Polygon (vs. GEO_BBOX's plain
+-- array). ST_ENVELOPE is the alias.
+SELECT GEO_ENVELOPE(
+    '{"type":"LineString","coordinates":[[0,0],[3,1],[1,4]]}'
+) AS bbox_polygon;
+
+-- GEO_LINE_INTERPOLATE: the point a fraction (0-1) of the way along a
+-- LineString, by actual distance, not vertex count. ST_LINE_INTERPOLATE_POINT
+-- is the alias.
+SELECT GEO_LINE_INTERPOLATE(
+    '{"type":"LineString","coordinates":[[13.40,52.52],[13.50,52.60]]}', 0.5
+) AS midway;
+
+-- GEO_CLIP: Sutherland-Hodgman clip of a geometry to a convex boundary
+-- polygon. ST_CLIP is the alias. Rejects a non-convex boundary unless the
+-- optional 3rd argument (allow_nonconvex) is true -- a best-effort,
+-- not-guaranteed-correct result in that case.
+SELECT GEO_CLIP(
+    '{"type":"Polygon","coordinates":[[[0,0],[4,0],[4,4],[0,4],[0,0]]]}',
+    '{"type":"Polygon","coordinates":[[[1,1],[3,1],[3,3],[1,3],[1,1]]]}'
+) AS clipped_to_inner_square;
+
+-- ============================================================
+-- GEOSPATIAL: EDITING AND QUALITY
+-- ============================================================
+
+-- GEO_SIMPLIFY: reduce vertex count. Accepts Douglas-Peucker ('dp', the
+-- default), 'visvalingam-effective', and 'visvalingam-weighted'.
+-- ST_SIMPLIFY is the alias.
+SELECT GEO_SIMPLIFY(
+    '{"type":"LineString","coordinates":[[0,0],[1,0.05],[2,0],[3,2],[4,2]]}',
+    0.2, 'dp'
+) AS simplified;
+
+-- GEO_BBOX: bounding box as [minLon, minLat, maxLon, maxLat]. ST_BBOX is the alias.
+SELECT GEO_BBOX(
+    '{"type":"Polygon","coordinates":[[[-2,-2],[-2,2],[2,2],[2,-2],[-2,-2]]]}'
+) AS bbox;
+
+-- GEO_CENTROID: area/length-weighted centroid of a geometry. ST_CENTROID is the alias.
+SELECT GEO_CENTROID(
+    '{"type":"Polygon","coordinates":[[[-2,-2],[-2,2],[2,2],[2,-2],[-2,-2]]]}'
+) AS centroid;
+
+-- GEO_AFFINE: shift, scale, and rotate a geometry around an anchor (default
+-- anchor: the geometry's own bbox center; here given explicitly as the last
+-- two arguments). ST_AFFINE is the alias.
+SELECT GEO_AFFINE(
+    '{"type":"Point","coordinates":[1,0]}', 0, 0, 1.0, 90, 0, 0
+) AS rotated_90deg_around_origin;
+
+-- GEO_SMOOTH: Chaikin corner-cutting smoothing, 0-8 iterations. ST_SMOOTH is the alias.
+SELECT GEO_SMOOTH(
+    '{"type":"LineString","coordinates":[[0,0],[1,1],[2,0]]}', 1
+) AS smoothed;
+
+-- GEO_DROP_HOLES: remove every hole from a Polygon/MultiPolygon, keeping only
+-- exterior rings. ST_REMOVE_HOLES is the alias.
+SELECT GEO_DROP_HOLES(
+    '{"type":"Polygon","coordinates":[[[-2,-2],[-2,2],[2,2],[2,-2],[-2,-2]],[[-1,-1],[-1,1],[1,1],[1,-1],[-1,-1]]]}'
+) AS outer_ring_only;
+
+-- GEO_CLEAN: remove repeated consecutive vertices and normalize ring closure.
+-- ST_CLEAN is the alias. Rejects a result collapsing below the GeoJSON
+-- minimum vertex count instead of returning invalid output.
+SELECT GEO_CLEAN(
+    '{"type":"LineString","coordinates":[[0,0],[0,0],[1,1],[2,2]]}'
+) AS deduplicated;
+
+-- GEO_SNAP: round coordinates to a grid, then clean. ST_SNAPTOGRID is the alias.
+SELECT GEO_SNAP(
+    '{"type":"Point","coordinates":[13.40473,52.52019]}', 0.001
+) AS snapped;
+
+-- GEO_IS_VALID: structural GeoJSON check (not full topology validation --
+-- no self-intersection detection). ST_ISVALID is the alias.
+SELECT GEO_IS_VALID('{"type":"Point","coordinates":[13.40,52.52]}') AS valid,
+       GEO_IS_VALID('{"type":"Polygon","coordinates":[[[0,0],[1,1]]]}') AS invalid_too_few_points;
+
+-- CREATE TABLE ... GEOMETRY: a first-class, validated, canonicalizing column
+-- type (not just TEXT/JSON). A bare number or a Feature/FeatureCollection is
+-- rejected -- a GEOMETRY column holds a Geometry.
+CREATE TABLE geo_typed_demo (id INT, shape GEOMETRY);
+INSERT INTO geo_typed_demo VALUES (1, '{"type":"Point","coordinates":[13.40,52.52]}');
+SELECT id, shape FROM geo_typed_demo;
+
+-- CAST(x AS GEOMETRY) validates and canonicalizes the same way a column write does
+SELECT CAST('{"coordinates":[1,2],"type":"Point"}' AS GEOMETRY) AS canonical;
+
+DROP TABLE geo_typed_demo;
+
+-- ============================================================
+-- GEOSPATIAL: REGION OPERATIONS, SEARCH, AND CLASSIFICATION
+-- ============================================================
+
+-- Mapshaper-inspired region-editing verbs and BI-oriented helpers for
+-- turning raw geometry into location-based KPIs and choropleth dashboards.
+
+CREATE TABLE geo_region_demo (region TEXT, footprint GEOMETRY, population FLOAT);
+INSERT INTO geo_region_demo VALUES ('north', '{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}', 100);
+INSERT INTO geo_region_demo VALUES ('north', '{"type":"Polygon","coordinates":[[[1,0],[2,0],[2,1],[1,1],[1,0]]]}', 300);
+INSERT INTO geo_region_demo VALUES ('south', '{"type":"Polygon","coordinates":[[[10,10],[11,10],[11,11],[10,11],[10,10]]]}', 50);
+
+-- GEO_DISSOLVE: merge every geometry in a group into one, by cancelling
+-- shared directed edges between adjacent polygons. GEO_UNION_AGG and
+-- ST_UNION are the same operation under aggregate-style names. Correct for
+-- topologically-clean, vertex-aligned adjacent input (e.g. this project's
+-- own output, or real GIS boundary data) -- NOT a general polygon-boolean-
+-- union for overlapping-but-misaligned input.
+SELECT region, GEO_DISSOLVE(footprint) AS boundary
+FROM geo_region_demo GROUP BY region ORDER BY region;
+
+-- GEO_UNION_AGG / ST_UNION: aliases of GEO_DISSOLVE
+SELECT region, GEO_UNION_AGG(footprint) AS boundary
+FROM geo_region_demo GROUP BY region ORDER BY region;
+
+-- GEO_BBOX_AGG: bounding box across every geometry in a group.
+SELECT region, GEO_BBOX_AGG(footprint) AS bbox
+FROM geo_region_demo GROUP BY region ORDER BY region;
+
+-- GEO_CENTROID_AGG: (optionally weighted) centroid across a group. The
+-- optional weight combines with GEO_CENTROID's own area/length weighting --
+-- here, a population-weighted centroid of already-area-weighted per-row centroids.
+SELECT region, GEO_CENTROID_AGG(footprint, population) AS weighted_centroid
+FROM geo_region_demo GROUP BY region ORDER BY region;
+
+-- GEO_SEARCH: an indexed bbox/radius search over a table, backed by a lazy,
+-- per-table grid index invalidated automatically on writes. Exact for Point
+-- columns; for polygon/line columns it indexes by centroid (a large shape
+-- whose edge -- not centroid -- clips into the window is a false negative;
+-- use GEO_INTERSECTS for exact shape overlap).
+SELECT region FROM GEO_SEARCH('geo_region_demo', 'footprint', 'bbox', -1, -1, 3, 3);
+SELECT region FROM GEO_SEARCH('geo_region_demo', 'footprint', 'radius', 0.5, 0.5, 200000);
+
+DROP TABLE geo_region_demo;
+
+-- EQUAL_INTERVAL / NATURAL_BREAKS: choropleth classification window
+-- functions, bucketing a KPI column into N legend classes. Quantile
+-- classification needs no new function -- NTILE(n) OVER (ORDER BY kpi)
+-- already does that.
+CREATE TABLE geo_kpi_demo (district TEXT, buildings INT);
+INSERT INTO geo_kpi_demo VALUES ('a', 5);
+INSERT INTO geo_kpi_demo VALUES ('b', 12);
+INSERT INTO geo_kpi_demo VALUES ('c', 48);
+INSERT INTO geo_kpi_demo VALUES ('d', 51);
+INSERT INTO geo_kpi_demo VALUES ('e', 95);
+
+SELECT district, buildings,
+       EQUAL_INTERVAL(3) OVER (ORDER BY buildings) AS equal_interval_class,
+       NATURAL_BREAKS(3) OVER (ORDER BY buildings) AS natural_breaks_class,
+       NTILE(3) OVER (ORDER BY buildings) AS quantile_class
+FROM geo_kpi_demo ORDER BY buildings;
+
+DROP TABLE geo_kpi_demo;
+DROP TABLE geo_demo;
+
+-- ============================================================
+-- TILE FUNCTIONS
+-- ============================================================
+
+-- Web Mercator XYZ tile addressing, for working with MBTiles tilesets in
+-- SQL. XYZ (web clients, /{z}/{x}/{y}.png) counts rows from the top; TMS
+-- (what MBTiles stores in tiles.tile_row) counts rows from the bottom.
+
+-- TILE_X / TILE_Y: the XYZ tile column/row containing (lon, zoom) / (lat, zoom)
+SELECT TILE_X(13.405, 14) AS col, TILE_Y(52.520, 14) AS row;
+
+-- TILE_ZXY: the covering tile at one call, including the MBTiles TMS row
+SELECT TILE_ZXY(13.405, 52.520, 14) AS tile;
+
+-- TILE_FLIP_Y: convert an XYZ row to/from the MBTiles TMS tile_row (its own
+-- inverse). TILE_ROW_TMS is the alias.
+SELECT TILE_FLIP_Y(TILE_Y(52.520, 14), 14) AS tms_row;
+
+-- TILE_LON / TILE_LAT: the (west, north) edge of a tile
+SELECT TILE_LON(TILE_X(13.405, 14), 14) AS west_edge,
+       TILE_LAT(TILE_Y(52.520, 14), 14) AS north_edge;
+
+-- TILE_BBOX: a tile's geographic bounds as [west, south, east, north]
+SELECT TILE_BBOX(14, TILE_X(13.405, 14), TILE_Y(52.520, 14)) AS bounds;
+
+-- TILE_QUADKEY / TILE_FROM_QUADKEY: Bing Maps quadkey encoding, and its inverse
+SELECT TILE_QUADKEY(14, TILE_X(13.405, 14), TILE_Y(52.520, 14)) AS quadkey;
+SELECT TILE_FROM_QUADKEY('12020120310320') AS tile;
+
+-- TILE_PARENT: the containing tile one zoom level up (NULL at zoom 0)
+SELECT TILE_PARENT(14, TILE_X(13.405, 14), TILE_Y(52.520, 14)) AS parent;
+
+-- TILE_COUNT: how many tiles a fully populated zoom level holds (4^zoom)
+SELECT TILE_COUNT(10) AS tiles_at_zoom_10;
+
+-- TILE_CONTAINS: whether a tile covers a point (edges belong to the tile on
+-- their north/west sides, matching TILE_X/TILE_Y's own assignment)
+SELECT TILE_CONTAINS(14, TILE_X(13.405, 14), TILE_Y(52.520, 14), 13.405, 52.520) AS covers_point;
+
+-- A tiles table lookup, converting the client's XYZ row to the MBTiles TMS
+-- row stored on disk:
+CREATE TABLE tile_lookup_demo (zoom_level INT, tile_column INT, tile_row INT, tile_data BLOB);
+INSERT INTO tile_lookup_demo VALUES
+    (14, TILE_X(13.405, 14), TILE_FLIP_Y(TILE_Y(52.520, 14), 14), BLOB_FROM_HEX('00'));
+SELECT tile_data FROM tile_lookup_demo
+WHERE zoom_level = 14
+  AND tile_column = TILE_X(13.405, 14)
+  AND tile_row = TILE_FLIP_Y(TILE_Y(52.520, 14), 14);
+DROP TABLE tile_lookup_demo;
+
+-- ============================================================
 -- END OF EXAMPLES
 -- ============================================================

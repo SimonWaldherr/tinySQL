@@ -48,6 +48,8 @@ func coerceToTypeAllowNull(v any, t storage.ColType) (any, error) {
 		return coerceToJson(v)
 	case storage.VectorType:
 		return coerceToVector(v)
+	case storage.GeometryType:
+		return coerceToGeometry(v)
 	case storage.BlobType:
 		return coerceToBlob(v)
 	default:
@@ -241,6 +243,22 @@ func coerceToVector(v any) (any, error) {
 		return out, nil
 	default:
 		return nil, fmt.Errorf("cannot convert %T to VECTOR", v)
+	}
+}
+
+// coerceToGeometry converts a value to canonical GeoJSON text for GEOMETRY
+// columns. Accepts a GeoJSON string, []byte, json.RawMessage, or an
+// already-decoded map[string]any; validates that its "type" is one of the
+// GeoJSON Geometry types (not Feature/FeatureCollection); and returns the
+// re-marshaled, canonically-ordered text. See canonicalGeoJSON/
+// validateGeometryShape in geo_functions.go, which do the actual decoding
+// and validation this just gates by input shape.
+func coerceToGeometry(v any) (any, error) {
+	switch v.(type) {
+	case string, []byte, json.RawMessage, map[string]any:
+		return canonicalGeoJSON(v)
+	default:
+		return nil, fmt.Errorf("cannot convert %T to GEOMETRY", v)
 	}
 }
 

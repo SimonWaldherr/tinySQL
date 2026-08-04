@@ -16,7 +16,9 @@ func isAggregate(e Expr) bool {
 	case *FuncCall:
 		switch ex.Name {
 		case "COUNT", "SUM", "AVG", "MIN", "MAX", "MEDIAN",
-			"MIN_BY", "MAX_BY", "ARG_MIN", "ARG_MAX":
+			"MIN_BY", "MAX_BY", "ARG_MIN", "ARG_MAX",
+			"GEO_DISSOLVE", "GEO_UNION_AGG", "ST_UNION",
+			"GEO_BBOX_AGG", "GEO_CENTROID_AGG":
 			return true
 		}
 	case *Unary:
@@ -77,6 +79,12 @@ func evalAggregateFuncCall(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 		return evalAggregateMaxBy(env, ex, rows)
 	case "VEC_AVG":
 		return evalAggregateVecAvg(env, ex, rows)
+	case "GEO_DISSOLVE", "GEO_UNION_AGG", "ST_UNION":
+		return evalAggregateGeoDissolve(env, ex, rows)
+	case "GEO_BBOX_AGG":
+		return evalAggregateGeoBBoxAgg(env, ex, rows)
+	case "GEO_CENTROID_AGG":
+		return evalAggregateGeoCentroidAgg(env, ex, rows)
 	default:
 		// For non-aggregate functions like DATEDIFF, LEFT, etc., evaluate their arguments
 		// in the aggregate context first, then call the function

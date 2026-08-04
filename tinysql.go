@@ -1017,15 +1017,16 @@ func NewAdvancedWAL(path string) (*AdvancedWAL, error) {
 		CheckpointPath:     path + ".checkpoint",
 		CheckpointEvery:    1000,
 		CheckpointInterval: 300000000000, // 5 minutes in nanoseconds
-		Compress:           false,
-		BufferSize:         65536, // 64KB
+		BufferSize:         65536,        // 64KB
 	})
 }
 
 // OpenAdvancedWAL creates or opens a WAL with custom configuration.
 //
-// This provides full control over WAL behavior including checkpoint intervals,
-// compression, and buffer sizes.
+// This provides full control over WAL behavior including checkpoint
+// intervals and buffer sizes. Checkpoint-snapshot compression is configured
+// separately, via StorageConfig.CompressFiles when opening through OpenDB
+// with Mode: ModeAdvancedWAL — the live WAL log itself is never compressed.
 //
 // Example:
 //
@@ -1034,7 +1035,6 @@ func NewAdvancedWAL(path string) (*AdvancedWAL, error) {
 //	    CheckpointPath:     "data/checkpoint",
 //	    CheckpointEvery:    5000,
 //	    CheckpointInterval: 10 * time.Minute,
-//	    Compress:           true,
 //	    BufferSize:         128 * 1024,
 //	})
 //

@@ -71,6 +71,7 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 			for _, table := range db.ListTables(rollbackTenant) {
 				invalidateConstraintIndexes(table)
 				purgeVectorCachesFor(rollbackTenant, table.Name)
+				purgeGeoGridCachesFor(rollbackTenant, table.Name)
 				purgeVecQueryCacheFor(rollbackTenant, table.Name)
 			}
 		}

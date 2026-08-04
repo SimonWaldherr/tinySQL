@@ -69,6 +69,17 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 			return nil, fmt.Errorf("read-only open requires a storage directory, got %q", cfg.Path)
 		}
 	}
+	// ModeSQLite's Path is a single database file, not a directory — a
+	// read-only open must require that file to already exist instead.
+	if cfg.ReadOnly && cfg.Mode == ModeSQLite {
+		info, err := os.Stat(cfg.Path)
+		if err != nil {
+			return nil, fmt.Errorf("read-only open requires an existing sqlite file %q: %w", cfg.Path, err)
+		}
+		if info.IsDir() {
+			return nil, fmt.Errorf("read-only open requires a sqlite database file, got a directory %q", cfg.Path)
+		}
+	}
 
 	db := &DB{
 		tenants:     map[string]*tenantDB{},
@@ -120,7 +131,22 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 		if cfg.Path == "" {
 			return nil, fmt.Errorf("ModeAdvancedWAL requires a Path")
 		}
+		// CompressFiles only affects the periodic checkpoint snapshot's file
+		// name, never the live WAL log itself: SaveToFile/loadGOBInto/
+		// ReadCheckpointWatermark already gzip-compress transparently based
+		// on a ".gz" suffix (the same convention DiskBackend.fileExt uses
+		// for ModeDisk/ModeJSON), and a checkpoint is a whole snapshot
+		// written once and read back whole — unlike the WAL log, which is
+		// continuously appended to and must survive a crash mid-write, so
+		// compressing it would require a materially riskier design (framing
+		// a resumable gzip stream, handling a truncated block during
+		// recovery without regressing the existing per-record checksum's
+		// corruption detection). See wal_advanced.go's Checkpoint/Recover
+		// for that log-vs-snapshot split.
 		checkpointPath := cfg.Path + ".checkpoint"
+		if cfg.CompressFiles {
+			checkpointPath += ".gz"
+		}
 		checkpointLoaded, err := loadGOBInto(db, checkpointPath)
 		if err != nil {
 			return nil, fmt.Errorf("open advanced wal checkpoint: %w", err)
@@ -131,7 +157,6 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 			CheckpointEvery:    cfg.CheckpointEvery,
 			CheckpointInterval: cfg.CheckpointInterval,
 			CheckpointMaxBytes: cfg.CheckpointMaxBytes,
-			Compress:           cfg.CompressFiles,
 			BufferSize:         64 * 1024,
 		}
 		wal, err := OpenAdvancedWAL(walCfg)
@@ -228,6 +253,17 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 		if err != nil {
 			return nil, fmt.Errorf("open paged index db: %w", err)
 		}
+		db.backend = backend
+
+	case ModeSQLite:
+		if cfg.Path == "" {
+			return nil, fmt.Errorf("ModeSQLite requires a Path")
+		}
+		backend, err := NewSQLiteBackend(cfg.Path)
+		if err != nil {
+			return nil, fmt.Errorf("open sqlite db: %w", err)
+		}
+		backend.SetReadOnly(cfg.ReadOnly)
 		db.backend = backend
 
 	default:
