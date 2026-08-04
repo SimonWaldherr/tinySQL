@@ -18,15 +18,16 @@ const SNAPSHOT_URL = 'bavaria-snapshot.b64';
 // this is a rectangle rather than the exact administrative polygon.
 const DINGOLFING_BOUNDS = [12.25, 48.53, 12.90, 48.80];
 
-// A few real municipalities inside the Landkreis (coordinates from each
-// town's German Wikipedia infobox), for the "Jump to a town" panel -- a
+// A few real municipalities inside the Landkreis (coordinates and population
+// from each town's German Wikipedia infobox, population as of 31 Dec 2025),
+// for the "Jump to a town" panel and the choropleth panel below -- a
 // starting point when exploring the tileset rather than an exhaustive list.
 const TOWNS = [
-    { name: 'Dingolfing', lon: 12.5, lat: 48.6333 },
-    { name: 'Landau a.d. Isar', lon: 12.6939, lat: 48.6689 },
-    { name: 'Reisbach', lon: 12.6333, lat: 48.5667 },
-    { name: 'Wallersdorf', lon: 12.75, lat: 48.7333 },
-    { name: 'Eichendorf', lon: 12.85, lat: 48.633 },
+    { name: 'Dingolfing', lon: 12.5, lat: 48.6333, population: 20890 },
+    { name: 'Landau a.d. Isar', lon: 12.6939, lat: 48.6689, population: 14776 },
+    { name: 'Reisbach', lon: 12.6333, lat: 48.5667, population: 7673 },
+    { name: 'Wallersdorf', lon: 12.75, lat: 48.7333, population: 7271 },
+    { name: 'Eichendorf', lon: 12.85, lat: 48.633, population: 6671 },
 ];
 
 // Vector layers a click can land on and pull real OSM tags from -- every
@@ -46,6 +47,12 @@ const stats = { rendered: 0, repeats: 0, totalMs: 0, queries: 0 };
 let map;
 let mapExpanded = false;
 let exploreLayerReady = false;
+let tileFlashLayerReady = false;
+let tileFlashCounter = 0;
+// tileFlashFeatures backs the 'tile-flash' layer below -- pruned by both a
+// hard cap and each flash's own removal timeout, so a fast pan never grows
+// this without bound.
+const tileFlashFeatures = [];
 
 // Used only if tiles_metadata is missing minzoom/maxzoom -- every real
 // tippecanoe/ExportMBTiles output writes both (see mbtilesWriteMetadata in
@@ -104,6 +111,20 @@ function updateStats() {
     const avg = stats.queries ? stats.totalMs / stats.queries : 0;
     document.getElementById('statAvg').textContent = avg.toFixed(2) + ' ms';
     document.getElementById('queryCount').textContent = '(' + stats.queries + ' run)';
+    updateTileLoadBadge();
+}
+
+// updateTileLoadBadge keeps the small overlay directly on the map (not just
+// the sidebar, which is easy to not be looking at) in sync with how many
+// tiles have actually been queried so far -- the same stats.rendered count
+// the sidebar's "Tiles rendered" row shows, surfaced right where the
+// flashes themselves appear so the two reinforce each other.
+function updateTileLoadBadge() {
+    const badge = document.getElementById('tileLoadBadge');
+    if (!badge) return;
+    badge.textContent = stats.rendered === 1
+        ? '1 tile loaded via SQL — pan or zoom for more'
+        : stats.rendered + ' tiles loaded via SQL — pan or zoom for more';
 }
 
 function loadMetadata() {
@@ -216,6 +237,108 @@ async function gunzip(bytes) {
 // registerTinySQLProtocol makes MapLibre GL fetch vector tiles by running
 // SQL instead of an HTTP request. tiles: ['tinysql://{z}/{x}/{y}'] in the
 // style's source is what routes requests here.
+// tileBoundsLonLat mirrors tile_functions.go's tileWestLon/tileNorthLat (the
+// standard Web Mercator inverse) in plain JS, purely to position the "tile
+// just loaded" flash rectangle below without an extra SQL round-trip on
+// every single tile request -- TILE_BBOX already does the real thing
+// elsewhere (see "Explore a point"), this is just a decorative overlay.
+function tileBoundsLonLat(z, x, y) {
+    const n = Math.pow(2, z);
+    const west = (x / n) * 360 - 180;
+    const east = ((x + 1) / n) * 360 - 180;
+    const toLat = (row) => {
+        const rad = Math.PI * (1 - (2 * row) / n);
+        return (180 / Math.PI) * Math.atan(Math.sinh(rad));
+    };
+    return [west, toLat(y + 1), east, toLat(y)]; // [west, south, east, north], XYZ y
+}
+
+// ── "Loaded on demand" visualization ───────────────────────────────────────
+//
+// The whole point of this demo is that there is no preloaded tileset sitting
+// in memory waiting to be revealed -- each tile MapLibre draws is the result
+// of one SQL query, run at the moment it's first needed. Because that query
+// runs against an already-imported in-memory table, it resolves in
+// well under a millisecond, which paradoxically makes the "loaded on demand"
+// behavior *invisible*: panning looks instantaneous, indistinguishable from
+// everything having been fetched upfront. flashTileLoad makes each
+// individual tile fetch visible: a colored rectangle appears over the tile
+// that was *just* queried and fades out over tileFlashFadeMs -- an animation
+// duration chosen for human perception, independent of how fast the query
+// itself actually ran. Panning to a fresh area lights up tile by tile, the
+// way a real remote tile server would look with visible network latency;
+// panning back to an already-decoded area (MapLibre's own client-side tile
+// cache, not tinySQL's) shows no flash at all, since no new query ran.
+const tileFlashFadeMs = 700;
+const tileFlashHoldMs = 60; // time at full opacity before the fade-out starts
+
+function ensureTileFlashLayer() {
+    if (tileFlashLayerReady) return;
+    map.addSource('tile-flash', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+    map.addLayer({
+        id: 'tile-flash-fill', type: 'fill', source: 'tile-flash',
+        paint: {
+            'fill-color': ['case', ['get', 'found'], '#4ec9b0', '#f14c4c'],
+            'fill-opacity': ['coalesce', ['feature-state', 'opacity'], 0],
+            'fill-opacity-transition': { duration: tileFlashFadeMs, delay: 0 },
+        },
+    });
+    map.addLayer({
+        id: 'tile-flash-line', type: 'line', source: 'tile-flash',
+        paint: {
+            'line-color': ['case', ['get', 'found'], '#4ec9b0', '#f14c4c'],
+            'line-width': 2,
+            'line-opacity': ['coalesce', ['feature-state', 'opacity'], 0],
+            'line-opacity-transition': { duration: tileFlashFadeMs, delay: 0 },
+        },
+    });
+    tileFlashLayerReady = true;
+}
+
+// flashTileLoad briefly highlights the tile at bbox -- teal for a tile that
+// was actually found and drawn, a thinner red dashed-feeling outline (via
+// the same fill/line paint, lower peak opacity) for a coordinate that was
+// queried but came back empty, so even "nothing here" is visibly a live
+// query rather than a gap that was simply never asked about.
+function flashTileLoad(bbox, found) {
+    if (!map) return;
+    ensureTileFlashLayer();
+    const flashId = ++tileFlashCounter;
+    const feature = {
+        type: 'Feature',
+        id: flashId,
+        properties: { found },
+        geometry: {
+            type: 'Polygon',
+            coordinates: [[
+                [bbox[0], bbox[1]], [bbox[2], bbox[1]], [bbox[2], bbox[3]], [bbox[0], bbox[3]], [bbox[0], bbox[1]],
+            ]],
+        },
+    };
+    tileFlashFeatures.push(feature);
+    if (tileFlashFeatures.length > 80) tileFlashFeatures.splice(0, tileFlashFeatures.length - 80);
+    map.getSource('tile-flash').setData({ type: 'FeatureCollection', features: tileFlashFeatures });
+
+    const peakOpacity = found ? 0.55 : 0.3;
+    map.setFeatureState({ source: 'tile-flash', id: flashId }, { opacity: peakOpacity });
+    // Two nested rAFs guarantee the peak-opacity state is actually painted
+    // for at least one frame before the transition below starts animating
+    // it back down -- otherwise the fade could start from 0 and the flash
+    // would never visibly appear at all.
+    requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+            map.setFeatureState({ source: 'tile-flash', id: flashId }, { opacity: 0 });
+        });
+    });
+    setTimeout(() => {
+        const idx = tileFlashFeatures.findIndex((f) => f.id === flashId);
+        if (idx !== -1) {
+            tileFlashFeatures.splice(idx, 1);
+            map.getSource('tile-flash').setData({ type: 'FeatureCollection', features: tileFlashFeatures });
+        }
+    }, tileFlashHoldMs + tileFlashFadeMs + 200);
+}
+
 function registerTinySQLProtocol() {
     const urlPattern = /^tinysql:\/\/(\d+)\/(\d+)\/(\d+)$/;
     maplibregl.addProtocol('tinysql', async (params) => {
@@ -238,10 +361,12 @@ function registerTinySQLProtocol() {
             // A sparse tileset legitimately has no tile at some coordinates;
             // MapLibre treats a thrown error as "nothing to draw here", the
             // vector-tile equivalent of the raster demo's transparent PNG.
+            flashTileLoad(tileBoundsLonLat(z, x, y), false);
             throw new Error('no tile at ' + z + '/' + x + '/' + y);
         }
         const compressed = base64ToBytes(res.rows[0].tile_data);
         const bytes = await gunzip(compressed);
+        flashTileLoad(tileBoundsLonLat(z, x, y), true);
         return { data: bytes.buffer };
     });
 }
@@ -427,6 +552,10 @@ function initMap(zoomRange) {
             map.on('mouseleave', id, () => { map.getCanvas().style.cursor = ''; });
         }
     });
+    // The choropleth panel adds its own MapLibre source/layers, which
+    // requires the style to already be loaded -- same requirement
+    // ensureExploreLayer's callers already guard for on click.
+    map.on('load', initChoropleth);
 }
 
 // setLayerVisibility toggles one of buildStyle()'s layers on or off -- a
@@ -449,6 +578,149 @@ function setLayerVisibility(layerId, visible) {
 function flyToTown(lon, lat) {
     if (!map) return;
     map.flyTo({ center: [lon, lat], zoom: Math.max(map.getZoom(), 13) });
+}
+
+// ── Choropleth: population-density KPI, computed live in SQL ──────────────
+//
+// TOWNS' Wikipedia-sourced population figures are real; the region each town
+// is colored by is a uniform CHOROPLETH_BUFFER_METERS-radius GEO_BUFFER
+// circle around its point, NOT a real municipal boundary -- this tileset
+// carries per-OSM-element data (buildings, roads, ...), not administrative
+// boundary polygons, so there is nothing to dissolve a real boundary from.
+// Density is therefore an illustrative approximation, not a statistic to
+// cite -- the point of this panel is that GEO_BUFFER, GEO_POLYGON_AREA, and
+// EQUAL_INTERVAL/NATURAL_BREAKS/NTILE are real, live SQL running against
+// tinySQL-WASM for every class change, not client-side JavaScript math.
+const CHOROPLETH_BUFFER_METERS = 3000;
+const CHOROPLETH_CLASSES = 3;
+// One hue (blue), light -> dark: the standard sequential/magnitude encoding
+// for a choropleth legend. Class 1 is the lowest-density bucket.
+const CHOROPLETH_COLORS = ['#9ec5f4', '#3987e5', '#104281'];
+const CHOROPLETH_CLASS_LABELS = ['Lower density', 'Medium density', 'Higher density'];
+const CHOROPLETH_METHODS = {
+    natural_breaks: 'NATURAL_BREAKS',
+    equal_interval: 'EQUAL_INTERVAL',
+    quantile: 'NTILE',
+};
+let choroplethLayerReady = false;
+
+// setupChoroplethTable creates and populates the `towns` table once, through
+// ordinary INSERT statements (GEO_POINT builds each row's GEOMETRY value),
+// exactly the way any real dataset would land in tinySQL.
+function setupChoroplethTable() {
+    runSQL('CREATE TABLE towns (name TEXT, geom GEOMETRY, population INT)', { kind: 'choropleth' });
+    for (const t of TOWNS) {
+        const name = t.name.replace(/'/g, "''");
+        runSQL(
+            "INSERT INTO towns VALUES ('" + name + "', GEO_POINT(" + t.lon + ', ' + t.lat + '), ' + t.population + ')',
+            { kind: 'choropleth' }
+        );
+    }
+}
+
+// runChoroplethQuery computes each town's buffer region and density in an
+// inner query, then classifies the density column with whichever window
+// function the sidebar selector chose. The classifier reads the inner
+// query's `density` column directly (a derived table, not a repeated
+// expression), so GEO_BUFFER/GEO_POLYGON_AREA each run exactly once per row.
+function runChoroplethQuery(methodKey) {
+    const fn = CHOROPLETH_METHODS[methodKey] || CHOROPLETH_METHODS.natural_breaks;
+    const sql =
+        'SELECT name, population, region, density, ' +
+        fn + '(' + CHOROPLETH_CLASSES + ') OVER (ORDER BY density) AS bucket ' +
+        'FROM (SELECT name, population, GEO_BUFFER(geom, ' + CHOROPLETH_BUFFER_METERS + ') AS region, ' +
+        'population / (GEO_POLYGON_AREA(GEO_BUFFER(geom, ' + CHOROPLETH_BUFFER_METERS + ')) / 1000000.0) AS density ' +
+        'FROM towns) t ORDER BY name';
+    return runSQL(sql, { kind: 'choropleth' });
+}
+
+// ensureChoroplethLayer lazily adds the fill+outline layers for the towns'
+// buffer regions, colored by the `bucket` property SQL just computed.
+function ensureChoroplethLayer() {
+    if (choroplethLayerReady) return;
+    map.addSource('choropleth', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+    map.addLayer({
+        id: 'choropleth-fill', type: 'fill', source: 'choropleth',
+        paint: {
+            'fill-color': [
+                'match', ['get', 'bucket'],
+                1, CHOROPLETH_COLORS[0], 2, CHOROPLETH_COLORS[1], 3, CHOROPLETH_COLORS[2],
+                '#888888',
+            ],
+            'fill-opacity': 0.55,
+        },
+    });
+    map.addLayer({
+        id: 'choropleth-outline', type: 'line', source: 'choropleth',
+        paint: { 'line-color': '#1e1e1e', 'line-width': 1 },
+    });
+    choroplethLayerReady = true;
+}
+
+// renderChoroplethLegend rebuilds the legend swatches and the per-town
+// density table from the classified rows SQL just returned.
+function renderChoroplethLegend(rows) {
+    const legend = document.getElementById('choroplethLegend');
+    const statsBody = document.querySelector('#choroplethStats tbody');
+    if (!legend || !statsBody) return;
+
+    legend.innerHTML = '';
+    for (let i = 0; i < CHOROPLETH_CLASSES; i++) {
+        const row = document.createElement('div');
+        row.className = 'toggle-row';
+        row.innerHTML = '<span class="legend-dot" style="background:' + CHOROPLETH_COLORS[i] + ';"></span>' + CHOROPLETH_CLASS_LABELS[i];
+        legend.appendChild(row);
+    }
+
+    statsBody.innerHTML = '';
+    const sorted = rows.slice().sort((a, b) => Number(b.density) - Number(a.density));
+    for (const row of sorted) {
+        const tr = document.createElement('tr');
+        const name = document.createElement('td');
+        name.textContent = row.name;
+        const density = document.createElement('td');
+        density.textContent = Number(row.density).toFixed(0) + ' /km²';
+        tr.appendChild(name);
+        tr.appendChild(density);
+        statsBody.appendChild(tr);
+    }
+}
+
+// setChoroplethMethod re-runs the classification query for the chosen
+// method and redraws the map layer and legend -- called on page load with
+// the default method, and again every time the sidebar selector changes.
+function setChoroplethMethod(methodKey) {
+    if (!map) return;
+    const res = runChoroplethQuery(methodKey);
+    if (!res || !res.success || !res.rows) return;
+    ensureChoroplethLayer();
+
+    const features = [];
+    for (const row of res.rows) {
+        let region;
+        try {
+            region = JSON.parse(row.region);
+        } catch (err) {
+            continue;
+        }
+        features.push({
+            type: 'Feature',
+            properties: {
+                name: row.name,
+                population: Number(row.population),
+                density: Number(row.density),
+                bucket: Number(row.bucket),
+            },
+            geometry: region,
+        });
+    }
+    map.getSource('choropleth').setData({ type: 'FeatureCollection', features });
+    renderChoroplethLegend(res.rows);
+}
+
+function initChoropleth() {
+    setupChoroplethTable();
+    setChoroplethMethod(document.getElementById('choroplethMethod')?.value || 'natural_breaks');
 }
 
 // ensureExploreLayer lazily adds a GeoJSON source/layer for outlining

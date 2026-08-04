@@ -72,7 +72,23 @@
         }
         .layout { display: flex; height: calc(100% - var(--topbar-h, 48px)); }
         .sidebar.collapsed { display: none; }
-        #map { flex: 1 1 auto; background: #16181a; min-width: 0; }
+        .map-wrap { position: relative; flex: 1 1 auto; min-width: 0; }
+        #map { position: absolute; inset: 0; background: #16181a; }
+        .tile-load-badge {
+            position: absolute;
+            top: 12px;
+            right: 12px;
+            z-index: 5;
+            background: rgba(30, 30, 30, 0.85);
+            border: 1px solid #3e3e42;
+            border-radius: 999px;
+            padding: 5px 12px;
+            font-size: 11px;
+            color: #9cdcfe;
+            white-space: nowrap;
+            pointer-events: none;
+        }
+        .tile-load-badge::before { content: "◱ "; }
         .sidebar {
             width: 380px;
             flex: 0 0 auto;
@@ -222,7 +238,10 @@
         <button class="expand-btn" id="expandBtn" onclick="toggleMapExpanded()">⤢ Expand map</button>
     </div>
     <div class="layout">
-        <div id="map"></div>
+        <div class="map-wrap">
+            <div id="map"></div>
+            <div class="tile-load-badge" id="tileLoadBadge">0 tiles loaded via SQL — pan or zoom for more</div>
+        </div>
         <div class="sidebar" id="sidebar">
             <div class="panel">
                 <h2>How this map is served</h2>
@@ -230,6 +249,7 @@
                 <div class="sql-template mono"><span class="kw">SELECT</span> tile_data <span class="kw">FROM</span> tiles
 <span class="kw">WHERE</span> zoom_level = <b>z</b> <span class="kw">AND</span> tile_column = <b>x</b>
   <span class="kw">AND</span> tile_row = <span class="fn">TILE_FLIP_Y</span>(<b>y</b>, <b>z</b>)</div>
+                <p>Nothing is preloaded: the snapshot below is just a <code class="mono">tiles</code> table sitting in memory, and every one of its rows is only turned into a rendered tile the moment MapLibre actually asks for it. Because that query runs in-process, it resolves in well under a millisecond — too fast to notice on its own — so <b>watch for the flash</b>: every tile just fetched briefly lights up <span style="color:#4ec9b0">teal</span> (found and drawn) or <span style="color:#f14c4c">red</span> (queried, nothing there) right on the map, then fades. Pan or zoom to a fresh area and you'll see it light up tile by tile, one <code class="mono">SELECT</code> per square; pan back to somewhere already decoded and nothing flashes, because no new query ran — that's MapLibre's own client-side tile cache, not tinySQL's.</p>
                 <p>The tileset itself is <a href="https://download.geofabrik.de/europe/germany/bayern.html" style="color:#9cdcfe">Landkreis Dingolfing-Landau</a>, extracted monthly from Geofabrik's <code class="mono">niederbayern-latest.osm.pbf</code> by <a href="https://github.com/SimonWaldherr/tinySQL/blob/main/.github/workflows/bavaria-mbtiles.yml" style="color:#9cdcfe">a GitHub Actions job</a> (osmium-tool clips the region, tippecanoe builds the vector tiles), then imported through tinySQL's real <code class="mono">ImportMBTiles</code> — see <a href="https://github.com/SimonWaldherr/tinySQL/tree/main/scripts/build-bavaria-tiles.sh" style="color:#9cdcfe">build-bavaria-tiles.sh</a> and <a href="https://github.com/SimonWaldherr/tinySQL/tree/main/cmd/mbtilesregion" style="color:#9cdcfe">cmd/mbtilesregion</a>.</p>
                 <div class="btn-row">
                     <a class="btn" href="https://github.com/SimonWaldherr/tinySQL/releases/tag/bavaria-demo-latest">Tileset release</a>
@@ -255,6 +275,23 @@
                     <label class="toggle-row"><input type="checkbox" checked onchange="setLayerVisibility('buildings', this.checked)"><span class="legend-dot" style="background:#5b5147;"></span>Buildings</label>
                     <label class="toggle-row"><input type="checkbox" checked onchange="setLayerVisibility('places', this.checked)"><span class="legend-dot" style="background:#e8e8e8;"></span>Place labels</label>
                 </div>
+            </div>
+
+            <div class="panel">
+                <h2>Choropleth: population density</h2>
+                <p>A real, live SQL query — <code class="mono">GEO_BUFFER</code>, <code class="mono">GEO_POLYGON_AREA</code>, and a window-function classifier — run against a small <code class="mono">towns</code> table (real population figures, from each municipality's German Wikipedia infobox), not client-side JavaScript math. Each town's colored region is a uniform 3&nbsp;km buffer circle standing in for a real municipal boundary polygon, since this tileset carries per-OSM-element data, not administrative boundaries. Inspired by a <a href="https://maps.aimpulse.com/osm/addresses/" style="color:#9cdcfe">similar real address-density choropleth</a>.</p>
+                <label class="toggle-row" style="margin-bottom:8px;">
+                    <span>Classify by</span>
+                    <select id="choroplethMethod" onchange="setChoroplethMethod(this.value)" style="margin-left:auto;background:#1e1e1e;color:#d4d4d4;border:1px solid #3e3e42;border-radius:4px;padding:3px 6px;font-size:11.5px;">
+                        <option value="natural_breaks" selected>Natural breaks (Jenks)</option>
+                        <option value="equal_interval">Equal interval</option>
+                        <option value="quantile">Quantile (NTILE)</option>
+                    </select>
+                </label>
+                <div class="toggle-list" id="choroplethLegend"></div>
+                <table class="meta-table" id="choroplethStats" style="margin-top:8px;">
+                    <tbody></tbody>
+                </table>
             </div>
 
             <div class="panel">
