@@ -345,7 +345,9 @@ func evalRawLike(plan *simpleSelectPlan, raw []any, ex *LikeExpr) (any, error) {
 				escapeChar = rune(escStr[0])
 			}
 		}
-		if ex.CaseInsensitive {
+		if ex.Escape == nil {
+			matched = compileCachedLikeMatcher(pattern, ex.CaseInsensitive)(str)
+		} else if ex.CaseInsensitive {
 			matched = matchLikePattern(strings.ToLower(str), strings.ToLower(pattern), escapeChar)
 		} else {
 			matched = matchLikePattern(str, pattern, escapeChar)

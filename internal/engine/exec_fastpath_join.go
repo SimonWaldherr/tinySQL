@@ -601,6 +601,9 @@ func evalJoinRawLikeMatch(plan *simpleJoinPlan, left, right []any, ex *LikeExpr,
 			escapeChar = rune(escStr[0])
 		}
 	}
+	if ex.Escape == nil {
+		return compileCachedLikeMatcher(pattern, ex.CaseInsensitive)(str), nil
+	}
 	if ex.CaseInsensitive {
 		return matchLikePattern(strings.ToLower(str), strings.ToLower(pattern), escapeChar), nil
 	}
