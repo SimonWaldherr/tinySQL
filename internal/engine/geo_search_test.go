@@ -78,10 +78,10 @@ func TestGeoSearchBBoxMode(t *testing.T) {
 func TestGeoSearchRadiusMode(t *testing.T) {
 	db := storage.NewDB()
 	execSQL(t, db, `CREATE TABLE points (id INT, geom GEOMETRY)`)
-	execSQL(t, db, geoSearchPoint(1, 0, 0.01))  // ~1113 m from (0,0)
-	execSQL(t, db, geoSearchPoint(2, 0, 0.1))   // ~11132 m from (0,0)
-	execSQL(t, db, geoSearchPoint(3, 0.01, 0))  // ~1113 m from (0,0)
-	execSQL(t, db, geoSearchPoint(4, -5, -5))   // far away
+	execSQL(t, db, geoSearchPoint(1, 0, 0.01)) // ~1113 m from (0,0)
+	execSQL(t, db, geoSearchPoint(2, 0, 0.1))  // ~11132 m from (0,0)
+	execSQL(t, db, geoSearchPoint(3, 0.01, 0)) // ~1113 m from (0,0)
+	execSQL(t, db, geoSearchPoint(4, -5, -5))  // far away
 
 	got := geoSearchIDSet(t, db, `SELECT id FROM GEO_SEARCH('points', 'geom', 'radius', 0, 0, 2000)`)
 	want := map[int]bool{1: true, 3: true}
