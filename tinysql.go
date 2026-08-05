@@ -1214,6 +1214,40 @@ func ImportMBTilesReader(ctx context.Context, db *DB, tenant, tableName string, 
 	return importer.ImportMBTilesReader(ctx, db, tenant, tableName, src, opts)
 }
 
+// MBTiles artifact API. Artifacts are portable, read-only, atomically
+// published paged-index directories intended for large MBTiles datasets.
+type MBTilesArtifactSchema = importer.MBTilesArtifactSchema
+type MBTilesArtifactOptions = importer.MBTilesArtifactOptions
+type MBTilesProgress = importer.MBTilesProgress
+type MBTilesResourceEstimate = importer.MBTilesResourceEstimate
+type MBTilesArtifactTable = importer.MBTilesArtifactTable
+type MBTilesArtifactIndex = importer.MBTilesArtifactIndex
+type MBTilesArtifactManifest = importer.MBTilesArtifactManifest
+type MBTilesArtifactResult = importer.MBTilesArtifactResult
+type MBTilesReader = importer.MBTilesReader
+
+const (
+	MBTilesSchemaAuto       = importer.MBTilesSchemaAuto
+	MBTilesSchemaFlat       = importer.MBTilesSchemaFlat
+	MBTilesSchemaNormalized = importer.MBTilesSchemaNormalized
+)
+
+func ImportMBTilesArtifact(ctx context.Context, sourcePath, artifactPath string, opts *MBTilesArtifactOptions) (*MBTilesArtifactResult, error) {
+	return importer.ImportMBTilesArtifact(ctx, sourcePath, artifactPath, opts)
+}
+
+func ValidateMBTilesArtifact(ctx context.Context, artifactPath string) (*MBTilesArtifactManifest, error) {
+	return importer.ValidateMBTilesArtifact(ctx, artifactPath)
+}
+
+func OpenMBTilesArtifact(ctx context.Context, artifactPath string, maxMemoryBytes int64) (*DB, *MBTilesArtifactManifest, error) {
+	return importer.OpenMBTilesArtifact(ctx, artifactPath, maxMemoryBytes)
+}
+
+func OpenMBTilesReader(ctx context.Context, artifactPath string, maxMemoryBytes int64) (*MBTilesReader, error) {
+	return importer.OpenMBTilesReader(ctx, artifactPath, maxMemoryBytes)
+}
+
 // ImportRoutingGraph imports routing graph JSON or CSV edge-list data from a reader.
 func ImportRoutingGraph(ctx context.Context, db *DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
 	return importer.ImportRoutingGraph(ctx, db, tenant, tableName, src, opts)

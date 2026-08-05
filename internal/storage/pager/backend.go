@@ -371,6 +371,40 @@ func (pb *PageBackend) AppendRows(tenant, name string, newRows [][]any, newIndex
 
 	firstRowID := entry.RowCount
 	bt := NewBTree(pb.pager, entry.RootPageID)
+	// Unique secondary indexes must reject duplicates before any row or index
+	// page is changed. BTree.Insert is an upsert primitive, so silently letting
+	// it see a duplicate would overwrite an existing locator and make an import
+	// appear successful while losing a tile.
+	for _, index := range entry.Indexes {
+		if !index.Unique {
+			continue
+		}
+		keys, ok := newIndexKeys[index.Name]
+		if !ok {
+			continue
+		}
+		seen := make(map[string]struct{}, len(keys))
+		idxTree := NewBTree(pb.pager, index.RootPageID)
+		for i, key := range keys {
+			if i >= len(newRows) || len(key) == 0 {
+				continue
+			}
+			if _, exists := seen[string(key)]; exists {
+				_ = pb.pager.AbortTx(txID)
+				return 0, fmt.Errorf("append index %s row %d: duplicate key within batch", index.Name, i)
+			}
+			seen[string(key)] = struct{}{}
+			found, lookupErr := idxTree.GetValue(key, func([]byte) error { return nil })
+			if lookupErr != nil {
+				_ = pb.pager.AbortTx(txID)
+				return 0, fmt.Errorf("check index %s row %d: %w", index.Name, i, lookupErr)
+			}
+			if found {
+				_ = pb.pager.AbortTx(txID)
+				return 0, fmt.Errorf("append index %s row %d: duplicate key", index.Name, i)
+			}
+		}
+	}
 	var encBuf []byte
 	for i, row := range newRows {
 		key := RowKey(firstRowID + int64(i))
@@ -469,6 +503,62 @@ func (pb *PageBackend) LookupIndexRowsByRoot(tableRoot, indexRoot PageID, indexN
 		return nil, false, nil
 	}
 	return pb.lookupIndexRowsLocked(tableRoot, indexRoot, indexName, key)
+}
+
+// ScanIndexRowsRange streams rows selected by an ordered composite index. It
+// is the range counterpart to LookupIndexRows and deliberately invokes the
+// callback per row so spatial windows do not materialize a whole tile band.
+func (pb *PageBackend) ScanIndexRowsRange(tenant, table, indexName string, startKey, endKey []byte, fn func([]any) bool) error {
+	pb.mu.RLock()
+	defer pb.mu.RUnlock()
+	entry, err := pb.catalog.GetEntry(tenant, table)
+	if err != nil || entry == nil {
+		return err
+	}
+	var index *IndexInfo
+	for i := range entry.Indexes {
+		if strings.EqualFold(entry.Indexes[i].Name, indexName) {
+			index = &entry.Indexes[i]
+			break
+		}
+	}
+	if index == nil || index.RootPageID == InvalidPageID {
+		return fmt.Errorf("range index %s is missing", indexName)
+	}
+	indexTree := NewBTree(pb.pager, index.RootPageID)
+	tableTree := NewBTree(pb.pager, entry.RootPageID)
+	var scanErr error
+	err = indexTree.ScanRange(startKey, endKey, func(_ []byte, value []byte) bool {
+		ids, decodeErr := unmarshalRowIDs(value)
+		if decodeErr != nil {
+			scanErr = decodeErr
+			return false
+		}
+		for _, id := range ids {
+			var row []any
+			found, getErr := tableTree.GetValue(RowKey(id), func(encoded []byte) error {
+				var err error
+				row, err = UnmarshalRow(encoded)
+				return err
+			})
+			if getErr != nil {
+				scanErr = getErr
+				return false
+			}
+			if !found {
+				scanErr = fmt.Errorf("index %s refers to missing row %d", indexName, id)
+				return false
+			}
+			if !fn(row) {
+				return false
+			}
+		}
+		return true
+	})
+	if scanErr != nil {
+		return scanErr
+	}
+	return err
 }
 
 func (pb *PageBackend) lookupIndexRowsLocked(tableRoot, indexRoot PageID, indexName string, key []byte) ([][]any, bool, error) {

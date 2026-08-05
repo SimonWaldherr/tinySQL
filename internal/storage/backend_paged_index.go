@@ -197,7 +197,11 @@ func (b *PagedIndexBackend) SaveTable(tenant string, t *Table) error {
 	tn := strings.ToLower(tenant)
 	lc := strings.ToLower(t.Name)
 	if err := b.pool.Put(tn, lc, t); err != nil {
-		log.Printf("warning: paged index cache update failed for %s/%s: %v", tn, lc, err)
+		// The pager write above is durable; cache admission is an optional
+		// optimization for compatibility callers that explicitly SaveTable a
+		// table larger than the serving budget. Bounded MBTiles builds use
+		// AppendRows and never rely on this cache admission path.
+		log.Printf("info: paged index cache admission skipped for %s/%s: %v", tn, lc, err)
 	}
 	return nil
 }
@@ -401,6 +405,11 @@ func (b *PagedIndexBackend) LookupIndexRows(tenant, table, indexName string, val
 		return nil, false, nil
 	}
 	return b.page.LookupIndexRowsByRoot(metadata.tableRoot, root, indexName, CanonicalIndexKey(values))
+}
+
+// ScanIndexRowsRange streams rows in an ordered composite-index interval.
+func (b *PagedIndexBackend) ScanIndexRowsRange(tenant, table, indexName string, startValues, endValues []any, fn func([]any) bool) error {
+	return b.page.ScanIndexRowsRange(tenant, table, indexName, CanonicalIndexKey(startValues), CanonicalIndexKey(endValues), fn)
 }
 
 func storageColumnsToPager(cols []Column) []pager.ColumnInfo {

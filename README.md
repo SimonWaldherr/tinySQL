@@ -334,6 +334,11 @@ tuned for tens of thousands of rows.
 
 ## Map tiles and MBTiles
 
+For multi-gigabyte, read-mostly datasets, see
+[`docs/mbtiles-artifacts.md`](docs/mbtiles-artifacts.md) for the bounded
+`dataset.tinysql` importer, validated artifact format, TMS reader API and
+SQLite comparison procedure.
+
 The map demo fetches every tile with live SQL in WebAssembly. Its source is in
 [`cmd/mbtilesdemo`](./cmd/mbtilesdemo).
 

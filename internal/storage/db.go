@@ -489,6 +489,19 @@ func (db *DB) PagedIndexRows(tenant, table, indexName string, values []any) ([][
 	return backend.LookupIndexRows(tenant, table, indexName, values)
 }
 
+// ScanPagedIndexRange streams rows selected by an ordered composite index.
+// startValues and endValues use the same value types as PagedIndexRows.
+func (db *DB) ScanPagedIndexRange(tenant, table, indexName string, startValues, endValues []any, fn func([]any) bool) (bool, error) {
+	backend, ok := db.backend.(*PagedIndexBackend)
+	if !ok {
+		return false, nil
+	}
+	if err := backend.ScanIndexRowsRange(tenant, table, indexName, startValues, endValues, fn); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
 // AppendRowsFast appends newRows to tenant/tableName, maintaining every
 // declared unique secondary index, without materializing rows already on
 // disk -- when the attached backend is ModePagedIndex (see

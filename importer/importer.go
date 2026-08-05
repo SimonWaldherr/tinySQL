@@ -125,6 +125,46 @@ type OpenMBTilesOptions = ii.OpenMBTilesOptions
 // OpenMBTilesResult reports what an in-place open exposed.
 type OpenMBTilesResult = ii.OpenMBTilesResult
 
+// MBTilesArtifactSchema selects the physical representation of a published
+// dataset.tinysql artifact.
+type MBTilesArtifactSchema = ii.MBTilesArtifactSchema
+type MBTilesArtifactOptions = ii.MBTilesArtifactOptions
+type MBTilesProgress = ii.MBTilesProgress
+type MBTilesResourceEstimate = ii.MBTilesResourceEstimate
+type MBTilesArtifactTable = ii.MBTilesArtifactTable
+type MBTilesArtifactIndex = ii.MBTilesArtifactIndex
+type MBTilesArtifactManifest = ii.MBTilesArtifactManifest
+type MBTilesArtifactResult = ii.MBTilesArtifactResult
+type MBTilesReader = ii.MBTilesReader
+
+const (
+	MBTilesSchemaAuto       = ii.MBTilesSchemaAuto
+	MBTilesSchemaFlat       = ii.MBTilesSchemaFlat
+	MBTilesSchemaNormalized = ii.MBTilesSchemaNormalized
+)
+
+// ImportMBTilesArtifact builds and atomically publishes a validated
+// dataset.tinysql directory. It is available with the sqliteimport build tag.
+func ImportMBTilesArtifact(ctx context.Context, sourcePath, artifactPath string, opts *MBTilesArtifactOptions) (*MBTilesArtifactResult, error) {
+	return ii.ImportMBTilesArtifact(ctx, sourcePath, artifactPath, opts)
+}
+
+// ValidateMBTilesArtifact verifies the marker, manifest, checksums, table
+// counts, unique tile keys, index coverage and tile payload parity.
+func ValidateMBTilesArtifact(ctx context.Context, artifactPath string) (*MBTilesArtifactManifest, error) {
+	return ii.ValidateMBTilesArtifact(ctx, artifactPath)
+}
+
+// OpenMBTilesArtifact validates an artifact before opening its read-only
+// paged-index database.
+func OpenMBTilesArtifact(ctx context.Context, artifactPath string, maxMemoryBytes int64) (*tinysql.DB, *MBTilesArtifactManifest, error) {
+	return ii.OpenMBTilesArtifact(ctx, artifactPath, maxMemoryBytes)
+}
+
+func OpenMBTilesReader(ctx context.Context, artifactPath string, maxMemoryBytes int64) (*MBTilesReader, error) {
+	return ii.OpenMBTilesReader(ctx, artifactPath, maxMemoryBytes)
+}
+
 // ExportMBTiles writes a tinySQL tileset to filePath as a spec-compliant MBTiles
 // (SQLite) database, so the result is usable by any MBTiles-aware tool.
 // Requires the sqliteimport build tag.

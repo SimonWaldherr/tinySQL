@@ -18,6 +18,13 @@ Two suites, with different fairness properties:
   connection each, on matched schemas and matched durability. This is the suite
   that answers "can I replace SQLite with this?".
 
+The published-artifact comparison is in
+[`benchmarks/mbtiles_artifact_benchmark_test.go`](benchmarks/mbtiles_artifact_benchmark_test.go).
+It compares the bounded `dataset.tinysql` import with a SQLite MBTiles copy and
+reports import time, artifact/database bytes and validated open+point time. Use
+`-benchtime=1x` for that lifecycle benchmark; the access benchmark is suitable
+for repeated latency samples and reports p50/p95/p99.
+
 ```sh
 go test -run=none -bench=. -benchtime=100x ./benchmarks/...
 ```
