@@ -255,14 +255,14 @@ func artifactTableExists(ctx context.Context, db *sql.DB, table string) (bool, e
 }
 
 func estimateArtifactResources(ctx context.Context, db *sql.DB, schema artifactSourceSchema, sourceBytes int64, diskPath string, opts *MBTilesArtifactOptions) (MBTilesResourceEstimate, error) {
-	var rows, maxTile int64
+	var rows, maxTile, totalTileBytes int64
 	var query string
 	if schema == artifactSourceFlat {
-		query = "SELECT COUNT(*), COALESCE(MAX(length(tile_data)),0) FROM tiles"
+		query = "SELECT COUNT(*), COALESCE(MAX(length(tile_data)),0), COALESCE(SUM(length(tile_data)),0) FROM tiles"
 	} else {
-		query = "SELECT COUNT(*), COALESCE(MAX(length(tile_data)),0) FROM images"
+		query = "SELECT COUNT(*), COALESCE(MAX(length(tile_data)),0), COALESCE(SUM(length(tile_data)),0) FROM images"
 	}
-	if err := db.QueryRowContext(ctx, query).Scan(&rows, &maxTile); err != nil {
+	if err := db.QueryRowContext(ctx, query).Scan(&rows, &maxTile, &totalTileBytes); err != nil {
 		return MBTilesResourceEstimate{}, fmt.Errorf("estimate MBTiles resources: %w", err)
 	}
 	mapRows, imageRows := rows, rows
@@ -281,7 +281,7 @@ func estimateArtifactResources(ctx context.Context, db *sql.DB, schema artifactS
 	}
 	batch := opts.BatchSize
 	memory := maxTile*int64(batch) + int64(batch)*768 + 2*int64(1<<20)
-	disk := sourceBytes + maxTile*rows + rows*320 + int64(8<<20)
+	disk := sourceBytes + totalTileBytes + rows*320 + int64(8<<20)
 	return MBTilesResourceEstimate{
 		SourceBytes: sourceBytes, TileCount: mapRows, MapRows: mapRows, ImageRows: imageRows, MetadataRows: metadataRows,
 		EstimatedMemory: memory, EstimatedDisk: disk,
@@ -651,14 +651,26 @@ func artifactDataFileNames(root string) []string {
 func checksumFiles(root string, names []string) (map[string]string, error) {
 	out := make(map[string]string, len(names))
 	for _, name := range names {
-		b, err := os.ReadFile(filepath.Join(root, name))
+		sum, err := checksumFile(filepath.Join(root, name))
 		if err != nil {
 			return nil, fmt.Errorf("checksum %s: %w", name, err)
 		}
-		h := sha256.Sum256(b)
-		out[name] = hex.EncodeToString(h[:])
+		out[name] = sum
 	}
 	return out, nil
+}
+
+func checksumFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 func writeChecksumsFile(root string) error {
 	names := append([]string{"manifest.json"}, artifactDataFileNames(root)...)
@@ -669,12 +681,11 @@ func writeChecksumsFile(root string) error {
 	}
 	defer f.Close()
 	for _, name := range names {
-		b, err := os.ReadFile(filepath.Join(root, name))
+		sum, err := checksumFile(filepath.Join(root, name))
 		if err != nil {
 			return err
 		}
-		h := sha256.Sum256(b)
-		if _, err := fmt.Fprintf(f, "%s  %s\n", hex.EncodeToString(h[:]), name); err != nil {
+		if _, err := fmt.Fprintf(f, "%s  %s\n", sum, name); err != nil {
 			return err
 		}
 	}
@@ -709,12 +720,21 @@ func publishArtifact(tmp, target string, replace bool) error {
 	}
 	backup := target + ".rollback"
 	_ = os.RemoveAll(backup)
-	if err := os.Rename(target, backup); err != nil {
+	if _, err := os.Lstat(target); err == nil {
+		if err := os.Rename(target, backup); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	if err := os.Rename(tmp, target); err != nil {
-		_ = os.Rename(backup, target)
+		if _, backupErr := os.Lstat(backup); backupErr == nil {
+			_ = os.Rename(backup, target)
+		}
 		return err
 	}
-	return os.RemoveAll(backup)
+	if _, err := os.Lstat(backup); err == nil {
+		return os.RemoveAll(backup)
+	}
+	return nil
 }

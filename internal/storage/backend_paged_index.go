@@ -74,7 +74,11 @@ func NewPagedIndexBackend(dir string, maxMemoryBytes int64, readOnly bool) (*Pag
 			return nil, fmt.Errorf("read-only paged index requires published artifact %q: %w", path, err)
 		}
 	}
-	maxPages := int(maxMemoryBytes / pager.DefaultPageSize)
+	// The page cache and table-object pool are separate residents. Splitting
+	// the caller's budget here makes MaxMemoryBytes a backend-wide limit rather
+	// than allowing each cache to consume the full amount independently.
+	pageBudget, poolBudget := splitPagedIndexMemoryBudget(maxMemoryBytes)
+	maxPages := int(pageBudget / pager.DefaultPageSize)
 	if maxPages < 1 {
 		maxPages = 1
 	}
@@ -85,10 +89,6 @@ func NewPagedIndexBackend(dir string, maxMemoryBytes int64, readOnly bool) (*Pag
 	})
 	if err != nil {
 		return nil, err
-	}
-	poolBudget := maxMemoryBytes
-	if poolBudget <= 0 {
-		poolBudget = 64 * 1024 * 1024
 	}
 	pool := NewBufferPool(&MemoryPolicy{
 		MaxMemoryBytes:      poolBudget,
@@ -120,6 +120,23 @@ func NewPagedIndexBackend(dir string, maxMemoryBytes int64, readOnly bool) (*Pag
 	})
 	b.readOnly.Store(readOnly)
 	return b, nil
+}
+
+func splitPagedIndexMemoryBudget(maxMemoryBytes int64) (pageBudget, poolBudget int64) {
+	if maxMemoryBytes <= 0 {
+		maxMemoryBytes = 64 * 1024 * 1024
+	}
+	// Point and range access use the pager directly; table objects are only a
+	// compatibility cache for callers that explicitly load whole tables.
+	pageBudget = maxMemoryBytes * 3 / 4
+	poolBudget = maxMemoryBytes - pageBudget
+	if pageBudget < pager.DefaultPageSize {
+		pageBudget = pager.DefaultPageSize
+	}
+	if poolBudget < pager.DefaultPageSize {
+		poolBudget = pager.DefaultPageSize
+	}
+	return pageBudget, poolBudget
 }
 
 func (b *PagedIndexBackend) LoadTable(tenant, name string) (*Table, error) {

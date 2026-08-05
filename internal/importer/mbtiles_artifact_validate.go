@@ -13,11 +13,27 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"time"
 
 	_ "modernc.org/sqlite"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
+
+type artifactValidationFingerprint struct {
+	files map[string]artifactValidationFile
+}
+
+type artifactValidationFile struct {
+	size    int64
+	modTime time.Time
+}
+
+var artifactValidationCache = struct {
+	sync.Mutex
+	entries map[string]artifactValidationFingerprint
+}{entries: make(map[string]artifactValidationFingerprint)}
 
 func ValidateMBTilesArtifact(ctx context.Context, artifactPath string) (*MBTilesArtifactManifest, error) {
 	return validateArtifact(ctx, artifactPath, true)
@@ -81,6 +97,22 @@ func validateArtifact(ctx context.Context, root string, requireComplete bool) (*
 	if coordinate, _ := config["coordinate_system"].(string); coordinate != "TMS" {
 		return nil, errors.New("artifact does not declare TMS coordinates")
 	}
+	var fingerprint artifactValidationFingerprint
+	if requireComplete {
+		fingerprint, err = artifactFingerprint(root)
+		if err != nil {
+			return nil, err
+		}
+		// A strict validation is expensive by design (it streams every
+		// checksummed byte and validates index reachability). Serializing the
+		// first validation lets concurrent readers share that proof. A normal
+		// filesystem mutation changes size or mtime and invalidates the entry.
+		artifactValidationCache.Lock()
+		defer artifactValidationCache.Unlock()
+		if cached, ok := artifactValidationCache.entries[root]; ok && sameArtifactFingerprint(cached, fingerprint) {
+			return &manifest, nil
+		}
+	}
 
 	db, err := storage.OpenDB(storage.StorageConfig{Mode: storage.ModePagedIndex, Path: filepath.Join(root, "database"), MaxMemoryBytes: 64 << 20, ReadOnly: true})
 	if err != nil {
@@ -111,7 +143,39 @@ func validateArtifact(ctx context.Context, root string, requireComplete bool) (*
 	if expected, _ := manifest.IndexConfig["tile_digest_sha256"].(string); expected != "" && expected != digest {
 		return nil, fmt.Errorf("tile digest mismatch: got %s want %s", digest, expected)
 	}
+	if requireComplete {
+		artifactValidationCache.entries[root] = fingerprint
+	}
 	return &manifest, nil
+}
+
+func artifactFingerprint(root string) (artifactValidationFingerprint, error) {
+	names := append([]string{"COMPLETE", "manifest.json", "checksums.sha256"}, artifactDataFileNames(root)...)
+	fingerprint := artifactValidationFingerprint{files: make(map[string]artifactValidationFile, len(names))}
+	for _, name := range names {
+		info, err := os.Stat(filepath.Join(root, name))
+		if err != nil {
+			return artifactValidationFingerprint{}, fmt.Errorf("stat artifact file %s: %w", name, err)
+		}
+		if !info.Mode().IsRegular() {
+			return artifactValidationFingerprint{}, fmt.Errorf("artifact file %s is not regular", name)
+		}
+		fingerprint.files[name] = artifactValidationFile{size: info.Size(), modTime: info.ModTime()}
+	}
+	return fingerprint, nil
+}
+
+func sameArtifactFingerprint(a, b artifactValidationFingerprint) bool {
+	if len(a.files) != len(b.files) {
+		return false
+	}
+	for name, af := range a.files {
+		bf, ok := b.files[name]
+		if !ok || af.size != bf.size || !af.modTime.Equal(bf.modTime) {
+			return false
+		}
+	}
+	return true
 }
 
 func validateArtifactImages(ctx context.Context, db *storage.DB) error {
@@ -177,11 +241,11 @@ func verifyArtifactChecksums(root string, manifest MBTilesArtifactManifest, mani
 		return fmt.Errorf("manifest checksum mismatch")
 	}
 	for name, expected := range listed {
-		data, err := os.ReadFile(filepath.Join(root, name))
+		got, err := checksumFile(filepath.Join(root, name))
 		if err != nil {
 			return fmt.Errorf("checksum file %s: %w", name, err)
 		}
-		if checksumBytes(data) != expected {
+		if got != expected {
 			return fmt.Errorf("checksum mismatch for %s", name)
 		}
 		if name != "manifest.json" && manifest.Checksums[name] != expected {
