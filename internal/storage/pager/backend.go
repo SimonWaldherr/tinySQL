@@ -505,6 +505,42 @@ func (pb *PageBackend) LookupIndexRowsByRoot(tableRoot, indexRoot PageID, indexN
 	return pb.lookupIndexRowsLocked(tableRoot, indexRoot, indexName, key)
 }
 
+// LookupUniqueIndexRowColumnByRoot resolves one unique index entry and decodes
+// only the requested table column. It avoids allocating a row-ID slice, an
+// outer rows slice and values for columns the typed caller does not consume.
+func (pb *PageBackend) LookupUniqueIndexRowColumnByRoot(tableRoot, indexRoot PageID, indexName string, key []byte, column int, visit func(any) error) (bool, error) {
+	pb.mu.RLock()
+	defer pb.mu.RUnlock()
+	if tableRoot == InvalidPageID || indexRoot == InvalidPageID {
+		return false, nil
+	}
+	var rowID int64
+	found, err := NewBTree(pb.pager, indexRoot).GetValue(key, func(value []byte) error {
+		if len(value) != 12 || binary.BigEndian.Uint32(value[:4]) != 1 {
+			return fmt.Errorf("unique index %s has invalid row locator", indexName)
+		}
+		rowID = int64(binary.BigEndian.Uint64(value[4:12]))
+		return nil
+	})
+	if err != nil || !found {
+		return found, err
+	}
+	found, err = NewBTree(pb.pager, tableRoot).GetValue(RowKey(rowID), func(encoded []byte) error {
+		value, decodeErr := UnmarshalRowColumn(encoded, column)
+		if decodeErr != nil {
+			return decodeErr
+		}
+		return visit(value)
+	})
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, fmt.Errorf("index %s refers to missing row %d", indexName, rowID)
+	}
+	return true, nil
+}
+
 // ScanIndexRowsRange streams rows selected by an ordered composite index. It
 // is the range counterpart to LookupIndexRows and deliberately invokes the
 // callback per row so spatial windows do not materialize a whole tile band.

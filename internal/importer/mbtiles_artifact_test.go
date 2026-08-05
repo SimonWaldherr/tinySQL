@@ -74,6 +74,21 @@ CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, t
 	if err != nil || !found || !bytes.Equal(data, []byte{3, 4}) {
 		t.Fatalf("point lookup: found=%v data=%v err=%v", found, data, err)
 	}
+	callbackData := []byte(nil)
+	found, err = reader.LookupTileFunc(context.Background(), 1, 1, 1, func(tile []byte) error {
+		callbackData = tile
+		return nil
+	})
+	if err != nil || !found || !bytes.Equal(callbackData, []byte{3, 4}) {
+		t.Fatalf("callback point lookup: found=%v data=%v err=%v", found, callbackData, err)
+	}
+	// The callback receives a decoded caller-owned BLOB, never a mutable page
+	// cache slice. Mutating it cannot alter the next lookup.
+	callbackData[0] = 99
+	data, found, err = reader.LookupTile(context.Background(), 1, 1, 1)
+	if err != nil || !found || !bytes.Equal(data, []byte{3, 4}) {
+		t.Fatalf("callback payload mutated a later lookup: found=%v data=%v err=%v", found, data, err)
+	}
 	var ranged int
 	if err := reader.ScanTileRange(context.Background(), 1, 0, 1, 0, 1, func(_, _, _ int, _ []byte) bool { ranged++; return true }); err != nil {
 		t.Fatal(err)

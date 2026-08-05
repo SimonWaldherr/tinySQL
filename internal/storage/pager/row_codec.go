@@ -257,3 +257,113 @@ func UnmarshalRow(data []byte) ([]any, error) {
 	}
 	return row, nil
 }
+
+// UnmarshalRowColumn decodes only one requested column. Columns before it are
+// bounds-checked and skipped without constructing interface values. This is
+// useful for typed index readers that need one BLOB or identifier from a wide
+// row and have already validated the complete immutable artifact at open.
+func UnmarshalRowColumn(data []byte, column int) (any, error) {
+	if len(data) < 2 {
+		return nil, fmt.Errorf("row data too short")
+	}
+	colCount := int(binary.LittleEndian.Uint16(data[:2]))
+	if column < 0 || column >= colCount {
+		return nil, fmt.Errorf("row column %d outside [0,%d)", column, colCount)
+	}
+	off := 2
+	for i := 0; i <= column; i++ {
+		if off >= len(data) {
+			return nil, fmt.Errorf("unexpected end of row at column %d", i)
+		}
+		tag := data[off]
+		off++
+		want := i == column
+		switch tag {
+		case tagNil:
+			if want {
+				return nil, nil
+			}
+		case tagBool:
+			if off >= len(data) {
+				return nil, fmt.Errorf("truncated bool at column %d", i)
+			}
+			value := data[off] != 0
+			off++
+			if want {
+				return value, nil
+			}
+		case tagInt64:
+			if off+8 > len(data) {
+				return nil, fmt.Errorf("truncated int64 at column %d", i)
+			}
+			value := float64(int64(binary.LittleEndian.Uint64(data[off : off+8])))
+			off += 8
+			if want {
+				return value, nil
+			}
+		case tagFloat64:
+			if off+8 > len(data) {
+				return nil, fmt.Errorf("truncated float64 at column %d", i)
+			}
+			value := math.Float64frombits(binary.LittleEndian.Uint64(data[off : off+8]))
+			off += 8
+			if want {
+				return value, nil
+			}
+		case tagString, tagBytes:
+			if off+2 > len(data) {
+				return nil, fmt.Errorf("truncated value len at column %d", i)
+			}
+			length := int(binary.LittleEndian.Uint16(data[off : off+2]))
+			off += 2
+			if off+length > len(data) {
+				return nil, fmt.Errorf("truncated value data at column %d", i)
+			}
+			payload := data[off : off+length]
+			off += length
+			if want {
+				if tag == tagString {
+					return string(payload), nil
+				}
+				return append([]byte(nil), payload...), nil
+			}
+		case tagVecF64:
+			if off+4 > len(data) {
+				return nil, fmt.Errorf("truncated vector len at column %d", i)
+			}
+			n := int(binary.LittleEndian.Uint32(data[off : off+4]))
+			off += 4
+			if n < 0 || off+n*8 > len(data) {
+				return nil, fmt.Errorf("truncated vector data at column %d", i)
+			}
+			if want {
+				vector := make([]float64, n)
+				for j := range vector {
+					vector[j] = math.Float64frombits(binary.LittleEndian.Uint64(data[off+j*8 : off+(j+1)*8]))
+				}
+				return vector, nil
+			}
+			off += n * 8
+		case tagLongString, tagLongBytes:
+			if off+4 > len(data) {
+				return nil, fmt.Errorf("truncated long value len at column %d", i)
+			}
+			length := int(binary.LittleEndian.Uint32(data[off : off+4]))
+			off += 4
+			if length < 0 || length > MaxValueBytes || off+length > len(data) {
+				return nil, fmt.Errorf("truncated long value data at column %d", i)
+			}
+			payload := data[off : off+length]
+			off += length
+			if want {
+				if tag == tagLongString {
+					return string(payload), nil
+				}
+				return append([]byte(nil), payload...), nil
+			}
+		default:
+			return nil, fmt.Errorf("unknown tag 0x%02x at column %d", tag, i)
+		}
+	}
+	return nil, fmt.Errorf("row column %d was not decoded", column)
+}

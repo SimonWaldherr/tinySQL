@@ -386,6 +386,13 @@ func CanonicalIndexKey(values []any) []byte {
 	return canonicalIndexKeyInto(nil, values)
 }
 
+// AppendCanonicalIndexValue appends one value using the durable index-key
+// encoding. Typed hot paths can provide stack-backed scratch space and avoid
+// the growing allocations incurred by CanonicalIndexKey's general []any API.
+func AppendCanonicalIndexValue(dst []byte, value any) []byte {
+	return appendCanonicalIndexValue(dst, value)
+}
+
 // CanonicalIndexValueEqual reports whether two individual values have the
 // same durable index encoding. The hot primitive forms avoid constructing
 // temporary []any and []byte values, while the fallback deliberately uses the

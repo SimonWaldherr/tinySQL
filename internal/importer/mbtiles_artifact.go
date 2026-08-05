@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"time"
 
@@ -21,8 +21,6 @@ import (
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
-
-const mbtilesArtifactFormatVersion = 1
 
 type artifactSourceSchema string
 
@@ -38,7 +36,11 @@ func ImportMBTilesArtifact(ctx context.Context, sourcePath, artifactPath string,
 	if opts == nil {
 		opts = &MBTilesArtifactOptions{}
 	}
-	opts = cloneArtifactOptions(opts)
+	var err error
+	opts, err = cloneArtifactOptions(opts)
+	if err != nil {
+		return nil, fmt.Errorf("copy MBTiles artifact options: %w", err)
+	}
 	if opts.BatchSize <= 0 {
 		opts.BatchSize = 1000
 	}
@@ -165,6 +167,10 @@ func ImportMBTilesArtifact(ctx context.Context, sourcePath, artifactPath string,
 		return nil, fmt.Errorf("close imported database: %w", err)
 	}
 	closeDB = false
+	// The mutable writer cache is no longer useful once the database has been
+	// checkpointed. Return it before checksum and read-only validation allocate
+	// their own streaming buffers, keeping the phases from stacking in RSS.
+	debug.FreeOSMemory()
 
 	indexConfig := artifactIndexConfig(destinationSchema)
 	if err := writeJSONFile(filepath.Join(tmp, "indexes", "config.json"), indexConfig); err != nil {
@@ -178,6 +184,7 @@ func ImportMBTilesArtifact(ctx context.Context, sourcePath, artifactPath string,
 		Source:         filepath.Base(sourcePath),
 		SourceBytes:    info.Size(),
 		Resources:      estimate,
+		Provenance:     opts.Provenance,
 		Tables:         artifactTableManifest(destinationSchema, estimate.TileCount, estimate.ImageRows, int64(len(metadataRows))),
 		IndexConfig:    indexConfig,
 		Checksums:      map[string]string{},
@@ -200,9 +207,9 @@ func ImportMBTilesArtifact(ctx context.Context, sourcePath, artifactPath string,
 	if err := os.WriteFile(filepath.Join(tmp, "COMPLETE"), []byte(""), 0o644); err != nil {
 		return nil, fmt.Errorf("write completion marker: %w", err)
 	}
-	if _, err := validateArtifact(ctx, tmp, true); err != nil {
-		return nil, fmt.Errorf("validate completed artifact: %w", err)
-	}
+	// The only mutation after the complete validation above is creation of the
+	// zero-byte marker. Readers in a new process still perform the strict
+	// checksum and logical validation before opening the published path.
 	if err := syncArtifactTree(tmp); err != nil {
 		return nil, err
 	}
@@ -215,9 +222,29 @@ func ImportMBTilesArtifact(ctx context.Context, sourcePath, artifactPath string,
 	return &MBTilesArtifactResult{ArtifactPath: artifactPath, Manifest: manifest, Estimate: estimate}, nil
 }
 
-func cloneArtifactOptions(in *MBTilesArtifactOptions) *MBTilesArtifactOptions {
+func cloneArtifactOptions(in *MBTilesArtifactOptions) (*MBTilesArtifactOptions, error) {
 	out := *in
-	return &out
+	provenance, err := cloneArtifactProvenance(in.Provenance)
+	if err != nil {
+		return nil, err
+	}
+	out.Provenance = provenance
+	return &out, nil
+}
+
+func cloneArtifactProvenance(in map[string]any) (map[string]any, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	encoded, err := json.Marshal(in)
+	if err != nil {
+		return nil, fmt.Errorf("encode provenance as JSON: %w", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(encoded, &out); err != nil {
+		return nil, fmt.Errorf("decode provenance as JSON: %w", err)
+	}
+	return out, nil
 }
 
 func detectArtifactSourceSchema(ctx context.Context, db *sql.DB) (artifactSourceSchema, error) {
@@ -348,38 +375,6 @@ func readArtifactMetadata(ctx context.Context, db *sql.DB) ([][]any, string, err
 		return nil, "", fmt.Errorf("read MBTiles metadata: %w", err)
 	}
 	return rows, hex.EncodeToString(h.Sum(nil)), nil
-}
-
-func hashMetadata(h io.Writer, name, value string) {
-	var b [4]byte
-	binary.BigEndian.PutUint32(b[:], uint32(len(name)))
-	_, _ = h.Write(b[:])
-	_, _ = io.WriteString(h, name)
-	binary.BigEndian.PutUint32(b[:], uint32(len(value)))
-	_, _ = h.Write(b[:])
-	_, _ = io.WriteString(h, value)
-}
-
-func hashTile(h io.Writer, z, x, y int, data []byte) {
-	var b [8]byte
-	for _, v := range []int{z, x, y} {
-		binary.BigEndian.PutUint64(b[:], uint64(int64(v)))
-		_, _ = h.Write(b[:])
-	}
-	binary.BigEndian.PutUint64(b[:], uint64(len(data)))
-	_, _ = h.Write(b[:])
-	_, _ = h.Write(data)
-}
-
-func validateTileCoordinate(z, x, y int) error {
-	if z < 0 || z > 30 {
-		return fmt.Errorf("invalid MBTiles zoom %d", z)
-	}
-	limit := 1 << z
-	if x < 0 || y < 0 || x >= limit || y >= limit {
-		return fmt.Errorf("invalid TMS tile coordinate z=%d x=%d y=%d", z, x, y)
-	}
-	return nil
 }
 
 type artifactProgress struct {
@@ -631,23 +626,6 @@ func writeJSONFile(path string, value any) error {
 	b = append(b, '\n')
 	return os.WriteFile(path, b, 0o644)
 }
-func artifactDataFileNames(root string) []string {
-	var names []string
-	for _, dir := range []string{"database", "indexes"} {
-		_ = filepath.Walk(filepath.Join(root, dir), func(path string, info os.FileInfo, err error) error {
-			if err == nil && info.Mode().IsRegular() {
-				rel, relErr := filepath.Rel(root, path)
-				if relErr == nil {
-					names = append(names, filepath.ToSlash(rel))
-				}
-			}
-			return nil
-		})
-	}
-	sort.Strings(names)
-	return names
-}
-
 func checksumFiles(root string, names []string) (map[string]string, error) {
 	out := make(map[string]string, len(names))
 	for _, name := range names {
@@ -660,18 +638,6 @@ func checksumFiles(root string, names []string) (map[string]string, error) {
 	return out, nil
 }
 
-func checksumFile(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
-}
 func writeChecksumsFile(root string) error {
 	names := append([]string{"manifest.json"}, artifactDataFileNames(root)...)
 	sort.Strings(names)

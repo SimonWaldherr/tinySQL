@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -21,9 +22,10 @@ import (
 // their GOB compatibility, while published `paged_index` artifacts have an
 // explicit format boundary and can be opened safely read-only.
 type PagedIndexBackend struct {
-	page     *pager.PageBackend
-	path     string
-	readOnly atomic.Bool
+	page             *pager.PageBackend
+	path             string
+	memoryLimitBytes int64
+	readOnly         atomic.Bool
 
 	// metadata contains schema and index roots only (never rows/BLOBs). It is
 	// immutable after a published read-only open and avoids a catalog B+Tree
@@ -74,6 +76,7 @@ func NewPagedIndexBackend(dir string, maxMemoryBytes int64, readOnly bool) (*Pag
 			return nil, fmt.Errorf("read-only paged index requires published artifact %q: %w", path, err)
 		}
 	}
+	maxMemoryBytes = normalizePagedIndexMemoryLimit(maxMemoryBytes)
 	// The page cache and table-object pool are separate residents. Splitting
 	// the caller's budget here makes MaxMemoryBytes a backend-wide limit rather
 	// than allowing each cache to consume the full amount independently.
@@ -99,11 +102,12 @@ func NewPagedIndexBackend(dir string, maxMemoryBytes int64, readOnly bool) (*Pag
 		TrackAccessPatterns: true,
 	})
 	b := &PagedIndexBackend{
-		page:     pb,
-		path:     path,
-		metadata: make(map[string]*pagedIndexTableMetadata),
-		pool:     pool,
-		versions: make(map[string]int),
+		page:             pb,
+		path:             path,
+		memoryLimitBytes: maxMemoryBytes,
+		metadata:         make(map[string]*pagedIndexTableMetadata),
+		pool:             pool,
+		versions:         make(map[string]int),
 	}
 	// A pool eviction (triggered from within LoadTable on an unrelated
 	// table) must not silently drop a dirty table that was mutated in place
@@ -123,9 +127,7 @@ func NewPagedIndexBackend(dir string, maxMemoryBytes int64, readOnly bool) (*Pag
 }
 
 func splitPagedIndexMemoryBudget(maxMemoryBytes int64) (pageBudget, poolBudget int64) {
-	if maxMemoryBytes <= 0 {
-		maxMemoryBytes = 64 * 1024 * 1024
-	}
+	maxMemoryBytes = normalizePagedIndexMemoryLimit(maxMemoryBytes)
 	// Point and range access use the pager directly; table objects are only a
 	// compatibility cache for callers that explicitly load whole tables.
 	pageBudget = maxMemoryBytes * 3 / 4
@@ -137,6 +139,20 @@ func splitPagedIndexMemoryBudget(maxMemoryBytes int64) (pageBudget, poolBudget i
 		poolBudget = pager.DefaultPageSize
 	}
 	return pageBudget, poolBudget
+}
+
+func normalizePagedIndexMemoryLimit(maxMemoryBytes int64) int64 {
+	if maxMemoryBytes <= 0 {
+		return 64 * 1024 * 1024
+	}
+	// A pager frame and a compatibility table-pool floor are both required.
+	// Report this effective bound rather than claiming an impossible smaller
+	// budget to callers and BackendStats observers.
+	minimum := int64(2 * pager.DefaultPageSize)
+	if maxMemoryBytes < minimum {
+		return minimum
+	}
+	return maxMemoryBytes
 }
 
 func (b *PagedIndexBackend) LoadTable(tenant, name string) (*Table, error) {
@@ -337,10 +353,14 @@ func (b *PagedIndexBackend) Stats() BackendStats {
 		hitRate = float64(stats.CacheHits) / float64(total)
 	}
 	return BackendStats{
-		Mode:             ModePagedIndex,
-		DiskUsedBytes:    size,
-		MemoryUsedBytes:  int64(stats.CachedPages+stats.TransientFrames) * int64(stats.PageSize),
-		MemoryLimitBytes: int64(stats.PageSize) * int64(b.page.MaxCachePages()),
+		Mode:            ModePagedIndex,
+		DiskUsedBytes:   size,
+		MemoryUsedBytes: int64(stats.CachedPages+stats.TransientFrames)*int64(stats.PageSize) + b.pool.GetMemoryUsage(),
+		// MaxMemoryBytes is a backend-wide budget shared by the pager and the
+		// compatibility table pool. The page cache is intentionally only one
+		// portion of it, so reporting its rounded page capacity here would make
+		// operational metrics contradict the caller's configured bound.
+		MemoryLimitBytes: b.memoryLimitBytes,
 		CacheHitRate:     hitRate,
 		SyncCount:        stats.SyncCount,
 		LoadCount:        stats.LoadCount,
@@ -422,6 +442,52 @@ func (b *PagedIndexBackend) LookupIndexRows(tenant, table, indexName string, val
 		return nil, false, nil
 	}
 	return b.page.LookupIndexRowsByRoot(metadata.tableRoot, root, indexName, CanonicalIndexKey(values))
+}
+
+// PagedIndexLocator is an immutable resolved table/index pair. It is valid for
+// the lifetime of its read-only PagedIndexBackend and lets typed serving paths
+// bypass repeated catalog and metadata-map work.
+type PagedIndexLocator struct {
+	page      *pager.PageBackend
+	tableRoot pager.PageID
+	indexRoot pager.PageID
+	indexName string
+}
+
+// LocateIndex resolves one physical index without reading table rows.
+func (b *PagedIndexBackend) LocateIndex(tenant, table, indexName string) (*PagedIndexLocator, bool, error) {
+	key := pagedMetadataKey(tenant, table)
+	b.metadataMu.RLock()
+	metadata := b.metadata[key]
+	b.metadataMu.RUnlock()
+	if metadata == nil {
+		if _, err := b.IndexMetadata(tenant, table); err != nil {
+			return nil, false, err
+		}
+		b.metadataMu.RLock()
+		metadata = b.metadata[key]
+		b.metadataMu.RUnlock()
+	}
+	if metadata == nil {
+		return nil, false, nil
+	}
+	root, ok := metadata.indexRoot[strings.ToLower(indexName)]
+	if !ok || root == pager.InvalidPageID {
+		return nil, false, nil
+	}
+	return &PagedIndexLocator{page: b.page, tableRoot: metadata.tableRoot, indexRoot: root, indexName: indexName}, true, nil
+}
+
+// LookupUniqueColumn performs an exact seek through a unique index and
+// invokes visit with one decoded column from the matching table row.
+func (locator *PagedIndexLocator) LookupUniqueColumn(key []byte, column int, visit func(any) error) (bool, error) {
+	if locator == nil || locator.page == nil {
+		return false, errors.New("paged index locator is unavailable")
+	}
+	if visit == nil {
+		return false, errors.New("paged index locator callback is nil")
+	}
+	return locator.page.LookupUniqueIndexRowColumnByRoot(locator.tableRoot, locator.indexRoot, locator.indexName, key, column, visit)
 }
 
 // ScanIndexRowsRange streams rows in an ordered composite-index interval.

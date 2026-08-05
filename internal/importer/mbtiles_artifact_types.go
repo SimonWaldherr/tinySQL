@@ -18,10 +18,14 @@ const (
 
 // MBTilesArtifactOptions controls a bounded, publish-on-success import.
 type MBTilesArtifactOptions struct {
-	Schema          MBTilesArtifactSchema
-	BatchSize       int
-	MaxMemoryBytes  int64
-	MinFreeBytes    int64
+	Schema         MBTilesArtifactSchema
+	BatchSize      int
+	MaxMemoryBytes int64
+	MinFreeBytes   int64
+	// Provenance is optional caller-supplied, JSON-compatible source context.
+	// tinySQL preserves it in the checksummed manifest but does not interpret
+	// application-specific fields such as an OSM generator configuration.
+	Provenance      map[string]any
 	Progress        func(MBTilesProgress)
 	ProgressEvery   time.Duration
 	ReplaceExisting bool
@@ -78,6 +82,7 @@ type MBTilesArtifactManifest struct {
 	Source         string                  `json:"source"`
 	SourceBytes    int64                   `json:"source_bytes"`
 	Resources      MBTilesResourceEstimate `json:"resources"`
+	Provenance     map[string]any          `json:"provenance,omitempty"`
 	Tables         []MBTilesArtifactTable  `json:"tables"`
 	IndexConfig    map[string]any          `json:"index_config"`
 	Checksums      map[string]string       `json:"checksums"`
@@ -93,6 +98,9 @@ type MBTilesArtifactResult struct {
 // MBTilesReader is a validated, read-only tile reader. Each reader owns one
 // pager handle; separate readers are safe to use concurrently.
 type MBTilesReader struct {
-	db       *storage.DB
-	manifest *MBTilesArtifactManifest
+	db            *storage.DB
+	manifest      *MBTilesArtifactManifest
+	metadataIndex *storage.PagedIndexLocator
+	tileIndex     *storage.PagedIndexLocator
+	imageIndex    *storage.PagedIndexLocator
 }

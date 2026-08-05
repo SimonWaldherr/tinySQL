@@ -1,4 +1,4 @@
-//go:build sqliteimport && !js && !wasm && !baremetal
+//go:build !js && !wasm && !baremetal
 
 package importer
 
@@ -16,8 +16,6 @@ import (
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
-
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
@@ -34,6 +32,11 @@ var artifactValidationCache = struct {
 	sync.Mutex
 	entries map[string]artifactValidationFingerprint
 }{entries: make(map[string]artifactValidationFingerprint)}
+
+// Validation streams tables and indexes and therefore does not benefit from
+// the larger interactive-reader cache. Keep first-open RSS bounded even for
+// multi-gigabyte artifacts.
+const artifactValidationMemoryBytes int64 = 32 << 20
 
 func ValidateMBTilesArtifact(ctx context.Context, artifactPath string) (*MBTilesArtifactManifest, error) {
 	return validateArtifact(ctx, artifactPath, true)
@@ -83,6 +86,23 @@ func validateArtifact(ctx context.Context, root string, requireComplete bool) (*
 	if len(manifest.Tables) == 0 {
 		return nil, errors.New("manifest contains no tables")
 	}
+	var fingerprint artifactValidationFingerprint
+	if requireComplete {
+		fingerprint, err = artifactFingerprint(root)
+		if err != nil {
+			return nil, err
+		}
+		// A strict validation is expensive by design (it streams every
+		// checksummed byte and validates index reachability). Serialize and
+		// share the first complete proof before doing either expensive phase.
+		// A normal filesystem mutation changes size or mtime and invalidates
+		// the entry; a new process always performs a fresh strict validation.
+		artifactValidationCache.Lock()
+		defer artifactValidationCache.Unlock()
+		if cached, ok := artifactValidationCache.entries[root]; ok && sameArtifactFingerprint(cached, fingerprint) {
+			return &manifest, nil
+		}
+	}
 	if err := verifyArtifactChecksums(root, manifest, manifestBytes); err != nil {
 		return nil, err
 	}
@@ -97,24 +117,7 @@ func validateArtifact(ctx context.Context, root string, requireComplete bool) (*
 	if coordinate, _ := config["coordinate_system"].(string); coordinate != "TMS" {
 		return nil, errors.New("artifact does not declare TMS coordinates")
 	}
-	var fingerprint artifactValidationFingerprint
-	if requireComplete {
-		fingerprint, err = artifactFingerprint(root)
-		if err != nil {
-			return nil, err
-		}
-		// A strict validation is expensive by design (it streams every
-		// checksummed byte and validates index reachability). Serializing the
-		// first validation lets concurrent readers share that proof. A normal
-		// filesystem mutation changes size or mtime and invalidates the entry.
-		artifactValidationCache.Lock()
-		defer artifactValidationCache.Unlock()
-		if cached, ok := artifactValidationCache.entries[root]; ok && sameArtifactFingerprint(cached, fingerprint) {
-			return &manifest, nil
-		}
-	}
-
-	db, err := storage.OpenDB(storage.StorageConfig{Mode: storage.ModePagedIndex, Path: filepath.Join(root, "database"), MaxMemoryBytes: 64 << 20, ReadOnly: true})
+	db, err := storage.OpenDB(storage.StorageConfig{Mode: storage.ModePagedIndex, Path: filepath.Join(root, "database"), MaxMemoryBytes: artifactValidationMemoryBytes, ReadOnly: true})
 	if err != nil {
 		return nil, fmt.Errorf("open artifact database for validation: %w", err)
 	}

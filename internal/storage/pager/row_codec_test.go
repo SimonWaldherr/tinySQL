@@ -121,6 +121,56 @@ func TestRowCodec_LongStringAndBytes(t *testing.T) {
 	}
 }
 
+func TestUnmarshalRowColumn(t *testing.T) {
+	longText := string(bytes.Repeat([]byte("x"), 70_000))
+	longBytes := bytes.Repeat([]byte{0xAB}, 70_000)
+	row := []any{int64(42), "tile-id", []byte{1, 2, 3}, true, []float64{1.5, 2.5}, longText, longBytes, nil}
+	encoded := MarshalRow(row, nil)
+	for column := range row {
+		got, err := UnmarshalRowColumn(encoded, column)
+		if err != nil {
+			t.Fatalf("column %d: %v", column, err)
+		}
+		want := row[column]
+		switch expected := want.(type) {
+		case int64:
+			if got != float64(expected) {
+				t.Fatalf("column %d = %#v, want %v", column, got, expected)
+			}
+		case []byte:
+			if value, ok := got.([]byte); !ok || !bytes.Equal(value, expected) {
+				t.Fatalf("column %d = %T, want matching []byte", column, got)
+			}
+		case []float64:
+			value, ok := got.([]float64)
+			if !ok || len(value) != len(expected) {
+				t.Fatalf("column %d = %#v, want %#v", column, got, expected)
+			}
+			for i := range expected {
+				if value[i] != expected[i] {
+					t.Fatalf("column %d vector differs at %d", column, i)
+				}
+			}
+		default:
+			if got != want {
+				t.Fatalf("column %d = %#v, want %#v", column, got, want)
+			}
+		}
+	}
+	if _, err := UnmarshalRowColumn(encoded, -1); err == nil {
+		t.Fatal("negative column unexpectedly accepted")
+	}
+	if _, err := UnmarshalRowColumn(encoded, len(row)); err == nil {
+		t.Fatal("out-of-range column unexpectedly accepted")
+	}
+	corrupt := MarshalRow([]any{"ok", []byte("bad")}, nil)
+	corrupt[len(corrupt)-1] = 0
+	corrupt = corrupt[:len(corrupt)-1]
+	if _, err := UnmarshalRowColumn(corrupt, 1); err == nil {
+		t.Fatal("truncated requested column unexpectedly accepted")
+	}
+}
+
 func BenchmarkMarshalRowVector(b *testing.B) {
 	vec := make([]float64, 768)
 	for i := range vec {
@@ -169,5 +219,15 @@ func BenchmarkUnmarshalRow(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		_, _ = UnmarshalRow(data)
+	}
+}
+
+func BenchmarkUnmarshalRowColumn(b *testing.B) {
+	row := []any{float64(42), "user_12345", 98.7, []byte("tile")}
+	data := MarshalRow(row, nil)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = UnmarshalRowColumn(data, 3)
 	}
 }

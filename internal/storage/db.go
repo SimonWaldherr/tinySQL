@@ -489,6 +489,16 @@ func (db *DB) PagedIndexRows(tenant, table, indexName string, values []any) ([][
 	return backend.LookupIndexRows(tenant, table, indexName, values)
 }
 
+// LocatePagedIndex resolves one immutable physical index for a typed serving
+// path. The boolean is false for non-paged backends or missing indexes.
+func (db *DB) LocatePagedIndex(tenant, table, indexName string) (*PagedIndexLocator, bool, error) {
+	backend, ok := db.backend.(*PagedIndexBackend)
+	if !ok {
+		return nil, false, nil
+	}
+	return backend.LocateIndex(tenant, table, indexName)
+}
+
 // ScanPagedIndexRange streams rows selected by an ordered composite index.
 // startValues and endValues use the same value types as PagedIndexRows.
 func (db *DB) ScanPagedIndexRange(tenant, table, indexName string, startValues, endValues []any, fn func([]any) bool) (bool, error) {

@@ -186,7 +186,7 @@ Helpers in the public driver package:
   settings (DSN, pooling, ping timeout)
 - `driver.OpenInMemory("default")` for tests and short-lived tools
 - `driver.OpenFile("/path/to/db.dat")` for file-backed tools
-- `driver.OpenWithDB(db)` to wrap an existing `*storage.DB`
+- `driver.OpenWithDB(db)` to wrap an existing `*tinysql.DB`
 
 Use the DSN for tinySQL-specific options, `database/sql` for pool parameters
 (`MaxOpenConns`, `MaxIdleConns`, `ConnMaxLifetime`, `ConnMaxIdleTime`), and

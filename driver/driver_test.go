@@ -3,7 +3,7 @@ package driver
 import (
 	"testing"
 
-	"github.com/SimonWaldherr/tinySQL/internal/storage"
+	tinysql "github.com/SimonWaldherr/tinySQL"
 )
 
 func TestOpenInMemory(t *testing.T) {
@@ -18,8 +18,9 @@ func TestOpenInMemory(t *testing.T) {
 		t.Fatalf("db.Ping failed: %v", err)
 	}
 
-	// Also verify OpenWithDB accepts an existing storage.DB
-	sdb := storage.NewDB()
+	// Also verify OpenWithDB accepts a public tinySQL DB without an external
+	// application importing the internal/storage implementation package.
+	sdb := tinysql.NewDB()
 	sqlDB, err := OpenWithDB(sdb)
 	if err != nil {
 		t.Fatalf("OpenWithDB error: %v", err)
