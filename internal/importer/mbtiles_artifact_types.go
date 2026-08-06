@@ -1,6 +1,7 @@
 package importer
 
 import (
+	"context"
 	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -93,6 +94,31 @@ type MBTilesArtifactResult struct {
 	ArtifactPath string
 	Manifest     MBTilesArtifactManifest
 	Estimate     MBTilesResourceEstimate
+}
+
+// TileArtifactInfo describes a repeatable tile stream before an artifact is
+// created. The importer verifies the declared counts while consuming it.
+type TileArtifactInfo struct {
+	Name         string
+	SourceBytes  int64
+	TileCount    int64
+	TileBytes    int64
+	MaxTileBytes int64
+	Metadata     map[string]string
+}
+
+// TileArtifactTile is one TMS tile emitted by TileArtifactSource.
+type TileArtifactTile struct {
+	Z, X, Y int
+	Data    []byte
+}
+
+// TileArtifactSource is a repeatable source for direct artifact generation.
+// ScanTiles may emit keys in any order. Data remains source-owned for the
+// duration of the callback.
+type TileArtifactSource interface {
+	Info(context.Context) (TileArtifactInfo, error)
+	ScanTiles(context.Context, func(TileArtifactTile) error) error
 }
 
 // MBTilesReader is a validated, read-only tile reader. Each reader owns one

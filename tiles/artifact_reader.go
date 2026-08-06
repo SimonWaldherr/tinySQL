@@ -32,6 +32,53 @@ func ImportMBTiles(ctx context.Context, sourcePath, artifactPath string, opts *I
 	}, nil
 }
 
+// ImportTiles streams a repeatable tile source directly into a validated,
+// immutable artifact without creating an intermediate MBTiles database.
+func ImportTiles(ctx context.Context, source Source, artifactPath string, opts *ImportOptions) (*ImportResult, error) {
+	if source == nil {
+		return nil, errors.New("tiles: source is nil")
+	}
+	internalOptions, err := toInternalImportOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+	result, err := importer.ImportTileArtifact(ctx, tileSourceAdapter{source: source}, artifactPath, internalOptions)
+	if err != nil {
+		if errors.Is(err, importer.ErrTileArtifactImportUnavailable) {
+			return nil, ErrArtifactImportUnavailable
+		}
+		return nil, err
+	}
+	return &ImportResult{
+		ArtifactPath: result.ArtifactPath,
+		Info:         artifactInfo(&result.Manifest),
+		Estimate:     resourceEstimate(result.Estimate),
+	}, nil
+}
+
+type tileSourceAdapter struct{ source Source }
+
+func (a tileSourceAdapter) Info(ctx context.Context) (importer.TileArtifactInfo, error) {
+	info, err := a.source.Info(ctx)
+	if err != nil {
+		return importer.TileArtifactInfo{}, err
+	}
+	metadata := make(map[string]string, len(info.Metadata))
+	for name, value := range info.Metadata {
+		metadata[name] = value
+	}
+	return importer.TileArtifactInfo{
+		Name: info.Name, SourceBytes: info.SourceBytes, TileCount: info.TileCount,
+		TileBytes: info.TileBytes, MaxTileBytes: info.MaxTileBytes, Metadata: metadata,
+	}, nil
+}
+
+func (a tileSourceAdapter) ScanTiles(ctx context.Context, visit func(importer.TileArtifactTile) error) error {
+	return a.source.ScanTiles(ctx, func(tile Tile) error {
+		return visit(importer.TileArtifactTile{Z: tile.Key.Z, X: tile.Key.X, Y: tile.Key.Y, Data: tile.Data})
+	})
+}
+
 // ValidateArtifact runs the complete checksum, schema, unique-key, index and
 // logical digest audit. It is safe to call before changing a publication
 // pointer or deploying an artifact to a reader fleet.

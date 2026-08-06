@@ -118,6 +118,59 @@ func TestPublicArtifactReaderContract(t *testing.T) {
 	}
 }
 
+func TestImportTilesStreamsWithoutMBTiles(t *testing.T) {
+	ctx := context.Background()
+	source := fixtureTileSource{tiles: []tiles.Tile{
+		{Key: tiles.Key{Z: 1, X: 1, Y: 0}, Data: []byte("se")},
+		{Key: tiles.Key{Z: 1, X: 0, Y: 1}, Data: []byte("nw")},
+	}}
+	artifact := filepath.Join(t.TempDir(), "direct.ttiles")
+	result, err := tiles.ImportTiles(ctx, source, artifact, &tiles.ImportOptions{BatchSize: 1, MaxMemoryBytes: 8 << 20})
+	if err != nil {
+		t.Fatalf("direct import: %v", err)
+	}
+	if result.Info.Source != "fixture.pmtiles" || result.Info.Schema != tiles.SchemaFlat {
+		t.Fatalf("unexpected direct artifact info: %#v", result.Info)
+	}
+	reader, err := tiles.OpenArtifact(ctx, artifact, tiles.OpenOptions{})
+	if err != nil {
+		t.Fatalf("open direct artifact: %v", err)
+	}
+	defer reader.Close()
+	for _, want := range source.tiles {
+		got, found, err := reader.Lookup(ctx, want.Key)
+		if err != nil || !found || !bytes.Equal(got.Data, want.Data) {
+			t.Fatalf("lookup %v: data=%q found=%t err=%v", want.Key, got.Data, found, err)
+		}
+	}
+}
+
+type fixtureTileSource struct{ tiles []tiles.Tile }
+
+func (s fixtureTileSource) Info(context.Context) (tiles.SourceInfo, error) {
+	var total, largest int64
+	for _, tile := range s.tiles {
+		size := int64(len(tile.Data))
+		total += size
+		if size > largest {
+			largest = size
+		}
+	}
+	return tiles.SourceInfo{Name: "fixture.pmtiles", SourceBytes: 123, TileCount: int64(len(s.tiles)), TileBytes: total, MaxTileBytes: largest, Metadata: map[string]string{"format": "pbf"}}, nil
+}
+
+func (s fixtureTileSource) ScanTiles(ctx context.Context, visit func(tiles.Tile) error) error {
+	for _, tile := range s.tiles {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := visit(tile); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func TestPublicReaderParallelAcrossRestarts(t *testing.T) {
 	ctx := context.Background()
 	source := filepath.Join(t.TempDir(), "source.mbtiles")

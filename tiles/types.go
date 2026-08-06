@@ -29,6 +29,10 @@ var ErrSQLiteImportUnavailable = errors.New("tiles: MBTiles import requires a bu
 // offline cache protocol rather than opening server artifact files directly.
 var ErrArtifactReaderUnavailable = errors.New("tiles: artifact readers are unavailable on this target")
 
+// ErrArtifactImportUnavailable is returned on targets that cannot create a
+// native paged artifact.
+var ErrArtifactImportUnavailable = errors.New("tiles: artifact import is unavailable on this target")
+
 // CoordinateSystem identifies the row convention used by tile keys.
 type CoordinateSystem string
 
@@ -98,6 +102,26 @@ func (r Range) Validate() error {
 type Tile struct {
 	Key  Key    `json:"key"`
 	Data []byte `json:"-"`
+}
+
+// SourceInfo describes a repeatable tile stream before an artifact import
+// starts. Counts are used for bounded resource planning and verified while the
+// stream is consumed. Metadata is copied by ImportTiles.
+type SourceInfo struct {
+	Name         string
+	SourceBytes  int64
+	TileCount    int64
+	TileBytes    int64
+	MaxTileBytes int64
+	Metadata     map[string]string
+}
+
+// Source is a repeatable, bounded producer of TMS tiles. ScanTiles may emit
+// tiles in any order, but every key must be unique. Tile data is only retained
+// for the duration of visit; ImportTiles copies it into its bounded batch.
+type Source interface {
+	Info(context.Context) (SourceInfo, error)
+	ScanTiles(context.Context, func(Tile) error) error
 }
 
 // Reader is the serving-path contract. Implementations are read-only and

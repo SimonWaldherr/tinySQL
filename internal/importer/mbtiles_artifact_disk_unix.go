@@ -1,4 +1,4 @@
-//go:build (linux || darwin || freebsd || openbsd || netbsd) && sqliteimport && !js && !wasm && !baremetal
+//go:build (linux || darwin || freebsd || openbsd || netbsd) && !js && !wasm && !baremetal
 
 package importer
 

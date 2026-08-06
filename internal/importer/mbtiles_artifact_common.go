@@ -19,6 +19,8 @@ const mbtilesArtifactFormatVersion = 1
 // published tinySQL artifact does not need SQLite on supported native targets.
 var ErrMBTilesArtifactSQLiteUnavailable = errors.New("MBTiles import requires a build with -tags=sqliteimport")
 
+var ErrTileArtifactImportUnavailable = errors.New("tile artifact import requires a native builder")
+
 func hashMetadata(h io.Writer, name, value string) {
 	var b [4]byte
 	binary.BigEndian.PutUint32(b[:], uint32(len(name)))
