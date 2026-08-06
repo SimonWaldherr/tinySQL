@@ -150,6 +150,13 @@ func appendTaggedString(buf []byte, s string) []byte {
 
 // UnmarshalRow decodes a row from the compact binary format.
 func UnmarshalRow(data []byte) ([]any, error) {
+	return unmarshalRow(data, true)
+}
+
+// unmarshalRow decodes a complete row. When copyBytes is false, BLOB columns
+// alias query-owned data; callers must never use that mode for an inline view
+// into a pinned pager page.
+func unmarshalRow(data []byte, copyBytes bool) ([]any, error) {
 	if len(data) < 2 {
 		return nil, fmt.Errorf("row data too short")
 	}
@@ -205,9 +212,13 @@ func UnmarshalRow(data []byte) ([]any, error) {
 			if off+blen > len(data) {
 				return nil, fmt.Errorf("truncated bytes data at column %d", i)
 			}
-			dst := make([]byte, blen)
-			copy(dst, data[off:off+blen])
-			row[i] = dst
+			if copyBytes {
+				dst := make([]byte, blen)
+				copy(dst, data[off:off+blen])
+				row[i] = dst
+			} else {
+				row[i] = data[off : off+blen]
+			}
 			off += blen
 		case tagVecF64:
 			if off+4 > len(data) {
@@ -244,9 +255,13 @@ func UnmarshalRow(data []byte) ([]any, error) {
 			if blen < 0 || blen > MaxValueBytes || off+blen > len(data) {
 				return nil, fmt.Errorf("truncated long bytes data at column %d", i)
 			}
-			dst := make([]byte, blen)
-			copy(dst, data[off:off+blen])
-			row[i] = dst
+			if copyBytes {
+				dst := make([]byte, blen)
+				copy(dst, data[off:off+blen])
+				row[i] = dst
+			} else {
+				row[i] = data[off : off+blen]
+			}
 			off += blen
 		default:
 			return nil, fmt.Errorf("unknown tag 0x%02x at column %d", tag, i)
@@ -263,6 +278,18 @@ func UnmarshalRow(data []byte) ([]any, error) {
 // useful for typed index readers that need one BLOB or identifier from a wide
 // row and have already validated the complete immutable artifact at open.
 func UnmarshalRowColumn(data []byte, column int) (any, error) {
+	return unmarshalRowColumn(data, column, true)
+}
+
+// unmarshalOwnedRowColumn decodes a column from query-owned row memory. BLOBs
+// may alias data because the caller transfers ownership of the complete row to
+// the returned value; this removes a second payload-sized copy on large-value
+// serving paths. It must never be used with a view into a pinned pager page.
+func unmarshalOwnedRowColumn(data []byte, column int) (any, error) {
+	return unmarshalRowColumn(data, column, false)
+}
+
+func unmarshalRowColumn(data []byte, column int, copyBytes bool) (any, error) {
 	if len(data) < 2 {
 		return nil, fmt.Errorf("row data too short")
 	}
@@ -325,7 +352,10 @@ func UnmarshalRowColumn(data []byte, column int) (any, error) {
 				if tag == tagString {
 					return string(payload), nil
 				}
-				return append([]byte(nil), payload...), nil
+				if copyBytes {
+					return append([]byte(nil), payload...), nil
+				}
+				return payload, nil
 			}
 		case tagVecF64:
 			if off+4 > len(data) {
@@ -359,7 +389,10 @@ func UnmarshalRowColumn(data []byte, column int) (any, error) {
 				if tag == tagLongString {
 					return string(payload), nil
 				}
-				return append([]byte(nil), payload...), nil
+				if copyBytes {
+					return append([]byte(nil), payload...), nil
+				}
+				return payload, nil
 			}
 		default:
 			return nil, fmt.Errorf("unknown tag 0x%02x at column %d", tag, i)

@@ -174,8 +174,8 @@ func (pb *PageBackend) LoadTable(tenant, name string) (*TableData, error) {
 	// Read all rows from the table's B+Tree.
 	bt := NewBTree(pb.pager, entry.RootPageID)
 	rows := make([][]any, 0, entry.RowCount)
-	err = bt.ScanRange(RowKey(0), nil, func(key, val []byte) bool {
-		row, decErr := UnmarshalRow(val)
+	err = bt.scanRange(RowKey(0), nil, func(key, val []byte, owned bool) bool {
+		row, decErr := unmarshalRow(val, !owned)
 		if decErr != nil {
 			return false
 		}
@@ -218,8 +218,8 @@ func (pb *PageBackend) ScanTableRows(tenant, name string, fn func(row []any) boo
 
 	bt := NewBTree(pb.pager, entry.RootPageID)
 	var decodeErr error
-	err = bt.ScanRange(RowKey(0), nil, func(key, val []byte) bool {
-		row, decErr := UnmarshalRow(val)
+	err = bt.scanRange(RowKey(0), nil, func(key, val []byte, owned bool) bool {
+		row, decErr := unmarshalRow(val, !owned)
 		if decErr != nil {
 			decodeErr = decErr
 			return false
@@ -525,13 +525,48 @@ func (pb *PageBackend) LookupUniqueIndexRowColumnByRoot(tableRoot, indexRoot Pag
 	if err != nil || !found {
 		return found, err
 	}
-	found, err = NewBTree(pb.pager, tableRoot).GetValue(RowKey(rowID), func(encoded []byte) error {
-		value, decodeErr := UnmarshalRowColumn(encoded, column)
+	var rowKey [8]byte
+	binary.BigEndian.PutUint64(rowKey[:], uint64(rowID))
+	found, err = NewBTree(pb.pager, tableRoot).getValue(rowKey[:], func(encoded []byte, owned bool) error {
+		value, decodeErr := unmarshalRowColumn(encoded, column, !owned)
 		if decodeErr != nil {
 			return decodeErr
 		}
 		return visit(value)
 	})
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, fmt.Errorf("index %s refers to missing row %d", indexName, rowID)
+	}
+	return true, nil
+}
+
+// LookupUniqueIndexRowExistsByRoot follows a unique index locator and proves
+// that its table row exists without reading the row value. It validates the
+// same durable 12-byte locator used by typed lookups while avoiding overflow
+// BLOB I/O for integrity checks that need reachability only.
+func (pb *PageBackend) LookupUniqueIndexRowExistsByRoot(tableRoot, indexRoot PageID, indexName string, key []byte) (bool, error) {
+	pb.mu.RLock()
+	defer pb.mu.RUnlock()
+	if tableRoot == InvalidPageID || indexRoot == InvalidPageID {
+		return false, nil
+	}
+	var rowID int64
+	found, err := NewBTree(pb.pager, indexRoot).GetValue(key, func(value []byte) error {
+		if len(value) != 12 || binary.BigEndian.Uint32(value[:4]) != 1 {
+			return fmt.Errorf("unique index %s has invalid row locator", indexName)
+		}
+		rowID = int64(binary.BigEndian.Uint64(value[4:12]))
+		return nil
+	})
+	if err != nil || !found {
+		return found, err
+	}
+	var rowKey [8]byte
+	binary.BigEndian.PutUint64(rowKey[:], uint64(rowID))
+	found, err = NewBTree(pb.pager, tableRoot).Contains(rowKey[:])
 	if err != nil {
 		return false, err
 	}
@@ -572,9 +607,9 @@ func (pb *PageBackend) ScanIndexRowsRange(tenant, table, indexName string, start
 		}
 		for _, id := range ids {
 			var row []any
-			found, getErr := tableTree.GetValue(RowKey(id), func(encoded []byte) error {
+			found, getErr := tableTree.getValue(RowKey(id), func(encoded []byte, owned bool) error {
 				var err error
-				row, err = UnmarshalRow(encoded)
+				row, err = unmarshalRow(encoded, !owned)
 				return err
 			})
 			if getErr != nil {
@@ -616,9 +651,9 @@ func (pb *PageBackend) lookupIndexRowsLocked(tableRoot, indexRoot PageID, indexN
 	rowsTree := NewBTree(pb.pager, tableRoot)
 	for _, rowID := range rowIDs {
 		var row []any
-		found, err := rowsTree.GetValue(RowKey(rowID), func(encoded []byte) error {
+		found, err := rowsTree.getValue(RowKey(rowID), func(encoded []byte, owned bool) error {
 			var decodeErr error
-			row, decodeErr = UnmarshalRow(encoded)
+			row, decodeErr = unmarshalRow(encoded, !owned)
 			return decodeErr
 		})
 		if err != nil {

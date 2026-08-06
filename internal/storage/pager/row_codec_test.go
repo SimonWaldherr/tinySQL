@@ -171,6 +171,43 @@ func TestUnmarshalRowColumn(t *testing.T) {
 	}
 }
 
+func TestUnmarshalOwnedRowColumnCanAliasOwnedBlob(t *testing.T) {
+	encoded := MarshalRow([]any{float64(1), []byte("tile")}, nil)
+	value, err := unmarshalOwnedRowColumn(encoded, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, ok := value.([]byte)
+	if !ok || !bytes.Equal(blob, []byte("tile")) {
+		t.Fatalf("owned column = %T %q", value, blob)
+	}
+	blob[0] = 'T'
+	decoded, err := UnmarshalRowColumn(encoded, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(decoded.([]byte)); got != "Tile" {
+		t.Fatalf("owned BLOB did not alias transferred row: %q", got)
+	}
+}
+
+func TestUnmarshalOwnedRowCanAliasOwnedBlobs(t *testing.T) {
+	encoded := MarshalRow([]any{[]byte("short"), bytes.Repeat([]byte("L"), 70_000)}, nil)
+	row, err := unmarshalRow(encoded, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row[0].([]byte)[0] = 'S'
+	row[1].([]byte)[0] = 'X'
+	decoded, err := UnmarshalRow(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(decoded[0].([]byte)) != "Short" || decoded[1].([]byte)[0] != 'X' {
+		t.Fatal("owned row BLOBs did not alias transferred row data")
+	}
+}
+
 func BenchmarkMarshalRowVector(b *testing.B) {
 	vec := make([]float64, 768)
 	for i := range vec {

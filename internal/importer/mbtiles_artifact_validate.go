@@ -122,24 +122,26 @@ func validateArtifact(ctx context.Context, root string, requireComplete bool) (*
 		return nil, fmt.Errorf("open artifact database for validation: %w", err)
 	}
 	defer db.Close()
+	tableRows := make(map[string]int64, len(manifest.Tables))
 	for _, table := range manifest.Tables {
 		if err := validateArtifactTable(ctx, db, table); err != nil {
 			return nil, err
 		}
+		tableRows[table.Name] = table.Rows
 	}
-	metadataDigest, err := validateArtifactMetadata(ctx, db)
+	metadataDigest, err := validateArtifactMetadata(ctx, db, tableRows["metadata"])
 	if err != nil {
 		return nil, err
 	}
 	if expected, _ := manifest.IndexConfig["metadata_digest_sha256"].(string); expected != "" && expected != metadataDigest {
 		return nil, fmt.Errorf("metadata digest mismatch: got %s want %s", metadataDigest, expected)
 	}
-	digest, err := validateArtifactTiles(ctx, db, manifest.Schema)
+	digest, err := validateArtifactTiles(ctx, db, manifest.Schema, tableRows)
 	if err != nil {
 		return nil, err
 	}
 	if manifest.Schema == MBTilesSchemaNormalized {
-		if err := validateArtifactImages(ctx, db); err != nil {
+		if err := validateArtifactImages(ctx, db, tableRows["images"]); err != nil {
 			return nil, err
 		}
 	}
@@ -181,10 +183,15 @@ func sameArtifactFingerprint(a, b artifactValidationFingerprint) bool {
 	return true
 }
 
-func validateArtifactImages(ctx context.Context, db *storage.DB) error {
+func validateArtifactImages(ctx context.Context, db *storage.DB, expectedRows int64) error {
+	imageIndex, found, err := db.LocatePagedIndex("default", "images", "images_tile_id")
+	if err != nil || !found {
+		return fmt.Errorf("validate images: locate image index: found=%v err=%v", found, err)
+	}
 	var callbackErr error
 	var previous []byte
-	_, err := db.ScanRowsFast("default", "images", func(row []any) bool {
+	var count int64
+	_, err = db.ScanRowsFast("default", "images", func(row []any) bool {
 		if len(row) != 2 {
 			callbackErr = errors.New("image row has wrong arity")
 			return false
@@ -200,8 +207,9 @@ func validateArtifactImages(ctx context.Context, db *storage.DB) error {
 			return false
 		}
 		previous = append(previous[:0], key...)
-		indexed, handled, lookupErr := db.PagedIndexRows("default", "images", "images_tile_id", []any{id})
-		if lookupErr != nil || !handled || len(indexed) != 1 {
+		count++
+		indexed, lookupErr := imageIndex.ContainsUnique(key)
+		if lookupErr != nil || !indexed {
 			callbackErr = fmt.Errorf("image index incomplete for %q", id)
 			return false
 		}
@@ -216,6 +224,9 @@ func validateArtifactImages(ctx context.Context, db *storage.DB) error {
 	}
 	if callbackErr != nil {
 		return fmt.Errorf("validate images: %w", callbackErr)
+	}
+	if count != expectedRows {
+		return fmt.Errorf("validate images: row count %d want %d", count, expectedRows)
 	}
 	return nil
 }
@@ -289,22 +300,19 @@ func validateArtifactTable(ctx context.Context, db *storage.DB, want MBTilesArti
 			return fmt.Errorf("table %s index %s mismatch", want.Name, index.Name)
 		}
 	}
-	var count int64
-	_, err = db.ScanRowsFast("default", want.Name, func([]any) bool { count++; return true })
-	if err != nil {
-		return fmt.Errorf("scan table %s: %w", want.Name, err)
-	}
-	if count != want.Rows {
-		return fmt.Errorf("table %s row count %d want %d", want.Name, count, want.Rows)
-	}
 	return nil
 }
 
-func validateArtifactMetadata(ctx context.Context, db *storage.DB) (string, error) {
+func validateArtifactMetadata(ctx context.Context, db *storage.DB, expectedRows int64) (string, error) {
+	metadataIndex, found, err := db.LocatePagedIndex("default", "metadata", "metadata_name")
+	if err != nil || !found {
+		return "", fmt.Errorf("validate metadata: locate metadata index: found=%v err=%v", found, err)
+	}
 	h := sha256.New()
 	var callbackErr error
 	var previous []byte
-	_, err := db.ScanRowsFast("default", "metadata", func(row []any) bool {
+	var count int64
+	_, err = db.ScanRowsFast("default", "metadata", func(row []any) bool {
 		if len(row) != 2 {
 			callbackErr = errors.New("metadata row has wrong arity")
 			return false
@@ -321,8 +329,9 @@ func validateArtifactMetadata(ctx context.Context, db *storage.DB) (string, erro
 			return false
 		}
 		previous = append(previous[:0], key...)
-		indexed, handled, lookupErr := db.PagedIndexRows("default", "metadata", "metadata_name", []any{name})
-		if lookupErr != nil || !handled || len(indexed) != 1 {
+		count++
+		indexed, lookupErr := metadataIndex.ContainsUnique(key)
+		if lookupErr != nil || !indexed {
 			callbackErr = fmt.Errorf("metadata index incomplete for %q", name)
 			return false
 		}
@@ -335,15 +344,23 @@ func validateArtifactMetadata(ctx context.Context, db *storage.DB) (string, erro
 	if callbackErr != nil {
 		return "", fmt.Errorf("validate metadata: %w", callbackErr)
 	}
+	if count != expectedRows {
+		return "", fmt.Errorf("validate metadata: row count %d want %d", count, expectedRows)
+	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func validateArtifactTiles(ctx context.Context, db *storage.DB, schema MBTilesArtifactSchema) (string, error) {
+func validateArtifactTiles(ctx context.Context, db *storage.DB, schema MBTilesArtifactSchema, expectedRows map[string]int64) (string, error) {
 	h := sha256.New()
 	if schema == MBTilesSchemaFlat {
+		tileIndex, found, err := db.LocatePagedIndex("default", "tiles", "tiles_zxy")
+		if err != nil || !found {
+			return "", fmt.Errorf("validate tiles: locate tile index: found=%v err=%v", found, err)
+		}
 		var callbackErr error
 		var previous []byte
-		_, err := db.ScanRowsFast("default", "tiles", func(row []any) bool {
+		var count int64
+		_, err = db.ScanRowsFast("default", "tiles", func(row []any) bool {
 			if len(row) != 4 {
 				callbackErr = errors.New("tile row has wrong arity")
 				return false
@@ -366,8 +383,9 @@ func validateArtifactTiles(ctx context.Context, db *storage.DB, schema MBTilesAr
 				return false
 			}
 			previous = append(previous[:0], key...)
-			indexed, handled, lookupErr := db.PagedIndexRows("default", "tiles", "tiles_zxy", []any{z, x, y})
-			if lookupErr != nil || !handled || len(indexed) != 1 {
+			count++
+			indexed, lookupErr := tileIndex.ContainsUnique(key)
+			if lookupErr != nil || !indexed {
 				callbackErr = fmt.Errorf("tile index incomplete for z=%d x=%d y=%d", z, x, y)
 				return false
 			}
@@ -380,11 +398,23 @@ func validateArtifactTiles(ctx context.Context, db *storage.DB, schema MBTilesAr
 		if callbackErr != nil {
 			return "", fmt.Errorf("validate tiles: %w", callbackErr)
 		}
+		if count != expectedRows["tiles"] {
+			return "", fmt.Errorf("validate tiles: row count %d want %d", count, expectedRows["tiles"])
+		}
 		return hex.EncodeToString(h.Sum(nil)), nil
+	}
+	mapIndex, found, err := db.LocatePagedIndex("default", "map", "map_zxy")
+	if err != nil || !found {
+		return "", fmt.Errorf("validate normalized tiles: locate map index: found=%v err=%v", found, err)
+	}
+	imageIndex, found, err := db.LocatePagedIndex("default", "images", "images_tile_id")
+	if err != nil || !found {
+		return "", fmt.Errorf("validate normalized tiles: locate image index: found=%v err=%v", found, err)
 	}
 	var callbackErr error
 	var previous []byte
-	_, err := db.ScanRowsFast("default", "map", func(row []any) bool {
+	var count int64
+	_, err = db.ScanRowsFast("default", "map", func(row []any) bool {
 		if len(row) != 4 {
 			callbackErr = errors.New("map row has wrong arity")
 			return false
@@ -407,17 +437,24 @@ func validateArtifactTiles(ctx context.Context, db *storage.DB, schema MBTilesAr
 			return false
 		}
 		previous = append(previous[:0], key...)
-		indexed, handled, lookupErr := db.PagedIndexRows("default", "map", "map_zxy", []any{z, x, y})
-		if lookupErr != nil || !handled || len(indexed) != 1 {
+		count++
+		indexed, lookupErr := mapIndex.ContainsUnique(key)
+		if lookupErr != nil || !indexed {
 			callbackErr = fmt.Errorf("map index incomplete for z=%d x=%d y=%d", z, x, y)
 			return false
 		}
-		images, handled, e := db.PagedIndexRows("default", "images", "images_tile_id", []any{id})
-		if e != nil || !handled || len(images) != 1 {
-			return false
-		}
-		data, ok := images[0][1].([]byte)
-		if !ok {
+		var data []byte
+		imageKey := storage.CanonicalIndexKey([]any{id})
+		imageFound, lookupErr := imageIndex.LookupUniqueColumn(imageKey, 1, func(raw any) error {
+			var ok bool
+			data, ok = raw.([]byte)
+			if !ok {
+				return errors.New("image tile_data has wrong type")
+			}
+			return nil
+		})
+		if lookupErr != nil || !imageFound {
+			callbackErr = fmt.Errorf("image index incomplete for tile_id %q", id)
 			return false
 		}
 		hashTile(h, z, x, y, data)
@@ -428,6 +465,9 @@ func validateArtifactTiles(ctx context.Context, db *storage.DB, schema MBTilesAr
 	}
 	if callbackErr != nil {
 		return "", fmt.Errorf("validate normalized tiles: %w", callbackErr)
+	}
+	if count != expectedRows["map"] {
+		return "", fmt.Errorf("validate normalized tiles: row count %d want %d", count, expectedRows["map"])
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }

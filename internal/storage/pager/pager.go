@@ -364,6 +364,46 @@ func (p *Pager) readPageRaw(id PageID) ([]byte, error) {
 	return buf, nil
 }
 
+// readContiguousPagesRaw reads a bounded physical run with one ReadAt call.
+// It deliberately does not admit the pages to the buffer pool: callers use it
+// only for a cold, immutable BLOB tail, where the first normal page lookup has
+// already established cache affinity for a later warm lookup. The caller must
+// verify each page it actually consumes, because a linked chain can stop
+// before the end of the physical run.
+func (p *Pager) readContiguousPagesRaw(first PageID, count int) ([]byte, error) {
+	if count < 1 {
+		return nil, fmt.Errorf("contiguous page count must be positive")
+	}
+	maxInt := int(^uint(0) >> 1)
+	if count > maxInt/p.pageSize {
+		return nil, fmt.Errorf("contiguous page read is too large: %d pages", count)
+	}
+	last := uint64(first) + uint64(count) - 1
+	if last > uint64(^PageID(0)) {
+		return nil, fmt.Errorf("contiguous page range starts at %d and exceeds page-id space", first)
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	buf := make([]byte, count*p.pageSize)
+	off := int64(first) * int64(p.pageSize)
+	p.cacheMisses.Add(int64(count))
+	p.pageReads.Add(int64(count))
+	if _, err := p.file.ReadAt(buf, off); err != nil {
+		return nil, fmt.Errorf("read contiguous pages %d..%d: %w", first, PageID(last), err)
+	}
+	return buf, nil
+}
+
+// pageCached is a non-mutating cache-affinity hint. It is intentionally not a
+// reservation: another lookup may evict the frame before the caller uses it,
+// but the hint only chooses between two equivalent read paths.
+func (p *Pager) pageCached(id PageID) bool {
+	p.pool.mu.Lock()
+	_, ok := p.pool.pages[id]
+	p.pool.mu.Unlock()
+	return ok
+}
+
 // writePageRaw writes a page directly to the database file (no cache).
 func (p *Pager) writePageRaw(id PageID, buf []byte) error {
 	SetPageCRC(buf)

@@ -102,6 +102,18 @@ func TestPagedIndexLargeMBTilesProjectionRoundTrip(t *testing.T) {
 	if reader.Stats().LoadCount != 0 {
 		t.Fatalf("metadata lookup materialized a table: LoadCount=%d", reader.Stats().LoadCount)
 	}
+	imageLocator, found, err := reader.LocateIndex("default", "images", "images_tile_id")
+	if err != nil || !found {
+		t.Fatalf("locate image index: found=%v err=%v", found, err)
+	}
+	present, err := imageLocator.ContainsUnique(CanonicalIndexKey([]any{"tile-00000-00000000"}))
+	if err != nil || !present {
+		t.Fatalf("contains existing image: present=%v err=%v", present, err)
+	}
+	present, err = imageLocator.ContainsUnique(CanonicalIndexKey([]any{"missing"}))
+	if err != nil || present {
+		t.Fatalf("contains missing image: present=%v err=%v", present, err)
+	}
 
 	// Full map -> tile_id -> tile_data parity through on-disk secondary-index
 	// seeks. These lookups never call LoadTable and remain bounded by the pager

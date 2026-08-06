@@ -490,6 +490,15 @@ func (locator *PagedIndexLocator) LookupUniqueColumn(key []byte, column int, vis
 	return locator.page.LookupUniqueIndexRowColumnByRoot(locator.tableRoot, locator.indexRoot, locator.indexName, key, column, visit)
 }
 
+// ContainsUnique proves that a unique index key resolves to an existing table
+// row without loading that row's value or any overflow BLOB pages.
+func (locator *PagedIndexLocator) ContainsUnique(key []byte) (bool, error) {
+	if locator == nil || locator.page == nil {
+		return false, errors.New("paged index locator is unavailable")
+	}
+	return locator.page.LookupUniqueIndexRowExistsByRoot(locator.tableRoot, locator.indexRoot, locator.indexName, key)
+}
+
 // ScanIndexRowsRange streams rows in an ordered composite-index interval.
 func (b *PagedIndexBackend) ScanIndexRowsRange(tenant, table, indexName string, startValues, endValues []any, fn func([]any) bool) error {
 	return b.page.ScanIndexRowsRange(tenant, table, indexName, CanonicalIndexKey(startValues), CanonicalIndexKey(endValues), fn)

@@ -63,12 +63,40 @@ func (bt *BTree) Root() PageID { return bt.root }
 // Get looks up a key. Returns (value, true) or (nil, false).
 // Handles overflow pages transparently.
 func (bt *BTree) Get(key []byte) ([]byte, bool, error) {
-	var result []byte
-	found, err := bt.GetValue(key, func(value []byte) error {
-		result = append(result, value...)
-		return nil
-	})
-	return result, found, err
+	leafID, buf, err := bt.findLeafPinned(key)
+	if err != nil {
+		return nil, false, err
+	}
+	defer bt.pager.UnpinPage(leafID)
+
+	bp := WrapBTreePage(buf)
+	pos, found := bp.FindLeafEntry(key)
+	if !found {
+		return nil, false, nil
+	}
+	value, overflow, overflowPageID, totalSize := bp.leafValueAt(pos)
+	if overflow {
+		// readOverflow already returns query-owned memory. Returning it directly
+		// avoids the second full-value copy formerly made through GetValue.
+		value, err = bt.readOverflow(overflowPageID, totalSize)
+		return value, true, err
+	}
+	// Inline values point into the pinned page cache and therefore still need
+	// one defensive copy before the leaf is unpinned.
+	return append([]byte(nil), value...), true, nil
+}
+
+// Contains reports whether key exists without loading or assembling its value.
+// This matters for large overflow-backed rows when an index validator only
+// needs to prove that a row locator resolves to a physical table entry.
+func (bt *BTree) Contains(key []byte) (bool, error) {
+	leafID, buf, err := bt.findLeafPinned(key)
+	if err != nil {
+		return false, err
+	}
+	defer bt.pager.UnpinPage(leafID)
+	_, found := WrapBTreePage(buf).FindLeafEntry(key)
+	return found, nil
 }
 
 // GetValue resolves key and invokes visit while the containing page remains
@@ -77,6 +105,15 @@ func (bt *BTree) Get(key []byte) ([]byte, bool, error) {
 // index locators and row codecs to decode directly from page memory without
 // allocating a throw-away copy for every B+Tree comparison.
 func (bt *BTree) GetValue(key []byte, visit func(value []byte) error) (bool, error) {
+	return bt.getValue(key, func(value []byte, _ bool) error {
+		return visit(value)
+	})
+}
+
+// getValue is the ownership-aware variant used by typed row decoders. owned
+// is true only for an assembled overflow value; inline values still point into
+// the pinned leaf page for the duration of visit.
+func (bt *BTree) getValue(key []byte, visit func(value []byte, owned bool) error) (bool, error) {
 	leafID, buf, err := bt.findLeafPinned(key)
 	if err != nil {
 		return false, err
@@ -95,7 +132,7 @@ func (bt *BTree) GetValue(key []byte, visit func(value []byte) error) (bool, err
 			return false, err
 		}
 	}
-	if err := visit(value); err != nil {
+	if err := visit(value, overflow); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -640,6 +677,14 @@ func (bt *BTree) Delete(txID TxID, key []byte) (bool, error) {
 // ScanRange calls fn for each key-value pair where startKey <= key <= endKey.
 // If endKey is nil, scans to the end. If fn returns false, the scan stops.
 func (bt *BTree) ScanRange(startKey, endKey []byte, fn func(key, value []byte) bool) error {
+	return bt.scanRange(startKey, endKey, func(key, value []byte, _ bool) bool {
+		return fn(key, value)
+	})
+}
+
+// scanRange is the ownership-aware scan used by row decoders. owned is true
+// for an assembled overflow value and false for an inline leaf-page view.
+func (bt *BTree) scanRange(startKey, endKey []byte, fn func(key, value []byte, owned bool) bool) error {
 	leafID, err := bt.findLeaf(startKey)
 	if err != nil {
 		return err
@@ -672,7 +717,7 @@ func (bt *BTree) ScanRange(startKey, endKey []byte, fn func(key, value []byte) b
 			} else {
 				val = entry.Value
 			}
-			if !fn(entry.Key, val) {
+			if !fn(entry.Key, val, entry.Overflow) {
 				bt.pager.UnpinPage(leafID)
 				return nil
 			}
@@ -744,21 +789,126 @@ func (bt *BTree) writeOverflow(txID TxID, data []byte) (PageID, error) {
 	return headID, nil
 }
 
+const overflowReadBatchPages = 32
+
 func (bt *BTree) readOverflow(headID PageID, totalSize uint32) ([]byte, error) {
-	result := make([]byte, 0, totalSize)
+	maxInt := int(^uint(0) >> 1)
+	if uint64(totalSize) > uint64(maxInt) {
+		return nil, fmt.Errorf("overflow value size %d does not fit in memory", totalSize)
+	}
+	targetSize := int(totalSize)
+	result := make([]byte, 0, targetSize)
 	pid := headID
+	// Only the first, cold overflow page needs the cache-affinity check. Once
+	// a chain is warm, retain the normal pager path without taking an extra
+	// buffer-pool lock for every following overflow page.
+	coalesceColdTail := bt.pager.readOnly && !bt.pager.pageCached(headID)
 	for pid != InvalidPageID {
+		// Do the first page through the normal pager so it is available to a
+		// following warm lookup. A physically contiguous cold tail can then be
+		// consumed in a few ReadAt calls without sacrificing the normal cache
+		// path on later requests.
 		buf, err := bt.pager.ReadPage(pid)
 		if err != nil {
 			return nil, err
 		}
-		op := WrapOverflowPage(buf)
-		result = append(result, op.Data()...)
-		next := op.NextOverflow()
+		data, next, err := overflowPageContents(pid, buf)
 		bt.pager.UnpinPage(pid)
+		if err != nil {
+			return nil, err
+		}
+		if len(data) > targetSize-len(result) {
+			return nil, fmt.Errorf("overflow chain %d exceeds declared size %d", headID, totalSize)
+		}
+		result = append(result, data...)
+		if len(result) == targetSize {
+			if next != InvalidPageID {
+				return nil, fmt.Errorf("overflow chain %d exceeds declared size %d", headID, totalSize)
+			}
+			return result, nil
+		}
+
+		// Immutable artifacts commonly allocate BLOB overflow pages in one
+		// contiguous run. Coalesce only a cold tail; mutable pagers must retain
+		// transaction/cache semantics, and warm tails stay on the existing LRU
+		// path. A non-contiguous chain cleanly falls back to one-page reads.
+		if coalesceColdTail && next == pid+1 {
+			pid, err = bt.readContiguousOverflowTail(next, targetSize, &result)
+			if err != nil {
+				return nil, err
+			}
+			coalesceColdTail = false
+			continue
+		}
 		pid = next
 	}
+	if len(result) != targetSize {
+		return nil, fmt.Errorf("overflow chain %d has %d bytes, want %d", headID, len(result), totalSize)
+	}
 	return result, nil
+}
+
+// readContiguousOverflowTail advances through a physically adjacent overflow
+// run. It only validates pages actually reached by the logical next pointer;
+// a non-adjacent successor simply returns to the ordinary pager path.
+func (bt *BTree) readContiguousOverflowTail(pid PageID, targetSize int, result *[]byte) (PageID, error) {
+	capacity := OverflowCapacity(bt.pager.pageSize)
+	for pid != InvalidPageID && len(*result) < targetSize {
+		remainingPages := (targetSize - len(*result) + capacity - 1) / capacity
+		batchPages := min(remainingPages, overflowReadBatchPages)
+		buf, err := bt.pager.readContiguousPagesRaw(pid, batchPages)
+		if err != nil {
+			// The physical read can reach EOF when a logically valid chain
+			// jumps elsewhere. Revert to the established one-page path, which
+			// remains the correctness fallback for every non-contiguous case.
+			return pid, nil
+		}
+		batchStart := pid
+		for index := 0; index < batchPages; index++ {
+			pageID := PageID(uint64(batchStart) + uint64(index))
+			page := buf[index*bt.pager.pageSize : (index+1)*bt.pager.pageSize]
+			if err := VerifyPageCRC(page); err != nil {
+				return InvalidPageID, err
+			}
+			data, next, err := overflowPageContents(pageID, page)
+			if err != nil {
+				return InvalidPageID, err
+			}
+			if len(data) > targetSize-len(*result) {
+				return InvalidPageID, fmt.Errorf("overflow chain exceeds declared size %d", targetSize)
+			}
+			*result = append(*result, data...)
+			if len(*result) == targetSize {
+				if next != InvalidPageID {
+					return InvalidPageID, fmt.Errorf("overflow chain exceeds declared size %d", targetSize)
+				}
+				return InvalidPageID, nil
+			}
+			if next != pageID+1 {
+				return next, nil
+			}
+			pid = next
+		}
+	}
+	return pid, nil
+}
+
+func overflowPageContents(id PageID, buf []byte) ([]byte, PageID, error) {
+	if len(buf) < overflowDataOff {
+		return nil, InvalidPageID, fmt.Errorf("overflow page %d is shorter than its header", id)
+	}
+	header := UnmarshalHeader(buf)
+	if header.Type != PageTypeOverflow {
+		return nil, InvalidPageID, fmt.Errorf("page %d has type %s, want overflow", id, header.Type)
+	}
+	if header.ID != id {
+		return nil, InvalidPageID, fmt.Errorf("overflow page id %d, want %d", header.ID, id)
+	}
+	op := WrapOverflowPage(buf)
+	if dataLen := op.DataLen(); dataLen > OverflowCapacity(len(buf)) {
+		return nil, InvalidPageID, fmt.Errorf("overflow page %d data length %d exceeds capacity", id, dataLen)
+	}
+	return op.Data(), op.NextOverflow(), nil
 }
 
 func (bt *BTree) freeOverflowChain(headID PageID) {

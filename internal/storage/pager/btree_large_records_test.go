@@ -137,6 +137,117 @@ func TestBTreeOverflowDecisionUsesEncodedLeafRecordSize(t *testing.T) {
 	}
 }
 
+func TestBTreeGetReturnsCallerOwnedValues(t *testing.T) {
+	p := newTestPager(t)
+	txID, err := p.BeginTx()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bt, err := CreateBTree(p, txID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := map[string][]byte{
+		"inline":   []byte("small value"),
+		"overflow": bytes.Repeat([]byte{0xAB}, OverflowCapacity(DefaultPageSize)*3+17),
+	}
+	for key, value := range values {
+		if err := bt.Insert(txID, []byte(key), value); err != nil {
+			t.Fatalf("insert %s: %v", key, err)
+		}
+	}
+	if err := p.CommitTx(txID); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range values {
+		present, err := bt.Contains([]byte(key))
+		if err != nil || !present {
+			t.Fatalf("contains %s: present=%v err=%v", key, present, err)
+		}
+		got, found, err := bt.Get([]byte(key))
+		if err != nil || !found || !bytes.Equal(got, want) {
+			t.Fatalf("first get %s: found=%v err=%v", key, found, err)
+		}
+		got[0] ^= 0xff
+		again, found, err := bt.Get([]byte(key))
+		if err != nil || !found || !bytes.Equal(again, want) {
+			t.Fatalf("mutation escaped into %s storage: found=%v err=%v", key, found, err)
+		}
+	}
+	if present, err := bt.Contains([]byte("missing")); err != nil || present {
+		t.Fatalf("contains missing: present=%v err=%v", present, err)
+	}
+}
+
+func TestBTreeColdContiguousOverflowLeavesTailUncached(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "overflow.pages")
+	p, err := OpenPager(PagerConfig{DBPath: path, PageSize: DefaultPageSize, MaxCachePages: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	txID, err := p.BeginTx()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bt, err := CreateBTree(p, txID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := []byte("large-contiguous-value")
+	capacity := OverflowCapacity(DefaultPageSize)
+	value := make([]byte, capacity*40+137)
+	for index := range value {
+		value[index] = byte(index * 31)
+	}
+	if err := bt.Insert(txID, key, value); err != nil {
+		t.Fatal(err)
+	}
+	root := bt.Root()
+	if err := p.CommitTx(txID); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	overflowPages := (len(value) + capacity - 1) / capacity
+	reader, err := OpenPager(PagerConfig{
+		DBPath:        path,
+		PageSize:      DefaultPageSize,
+		MaxCachePages: overflowPages + 8,
+		ReadOnly:      true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	readTree := NewBTree(reader, root)
+	got, found, err := readTree.Get(key)
+	if err != nil || !found {
+		t.Fatalf("cold get: found=%v err=%v", found, err)
+	}
+	if !bytes.Equal(got, value) {
+		t.Fatal("cold get returned different bytes")
+	}
+	first := reader.CacheStats()
+	if first.CachedPages >= overflowPages {
+		t.Fatalf("cold contiguous tail filled cache: cached=%d overflow-pages=%d", first.CachedPages, overflowPages)
+	}
+
+	got, found, err = readTree.Get(key)
+	if err != nil || !found {
+		t.Fatalf("warm get: found=%v err=%v", found, err)
+	}
+	if !bytes.Equal(got, value) {
+		t.Fatal("warm get returned different bytes")
+	}
+	second := reader.CacheStats()
+	if second.CachedPages <= first.CachedPages {
+		t.Fatalf("warm get did not use normal cache path: before=%d after=%d", first.CachedPages, second.CachedPages)
+	}
+}
+
 func testTilePayload(i int) []byte {
 	var size int
 	switch i % 8 {
