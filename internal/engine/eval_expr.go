@@ -103,19 +103,19 @@ func evalVarRef(env ExecEnv, ex *VarRef, row Row) (any, error) {
 	// Trigger bodies reference NEW.col/OLD.col, which aren't part of the row
 	// being built by the statement the trigger body itself is executing (an
 	// INSERT into a different table, say) — env.triggerRow carries them
-	// separately. See executeTrigger in triggers.go.
+	// separately. See executeTrigger and triggerRowBinding in triggers.go.
 	if env.triggerRow != nil {
 		lower := ex.Lower
 		if lower == "" {
 			lower = strings.ToLower(ex.Name)
 		}
-		if v, ok := getValLower(env.triggerRow, lower); ok {
+		if v, ok := lookupTriggerRow(env.triggerRow, lower); ok {
 			return v, nil
 		}
 	}
 	var suggestion string
 	if env.triggerRow != nil {
-		suggestion = columnSuggestionFromRow(ex.Name, row, env.triggerRow)
+		suggestion = columnSuggestionFromRow(ex.Name, row, triggerRowSuggestionRow(env.triggerRow))
 	} else {
 		suggestion = columnSuggestionFromRow(ex.Name, row)
 	}

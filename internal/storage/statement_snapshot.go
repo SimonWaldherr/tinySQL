@@ -312,8 +312,17 @@ func restoreRowDeleteTable(state *rowDeleteTableState) {
 	if state.rowID >= 0 {
 		switch len(table.Rows) {
 		case state.rowCount - 1:
-			table.Rows = table.Rows[:state.rowCount]
-			copy(table.Rows[state.rowID+1:], table.Rows[state.rowID:state.rowCount-1])
+			// The point DELETE this undoes removed state.rowID via
+			// swap-and-pop: it moved what was then the last row into
+			// state.rowID's slot and truncated. Undo that exactly: grow the
+			// slice back to its original length, move the row now sitting
+			// at state.rowID back out to the end (where it lived before the
+			// delete), then restore the deleted row at state.rowID. When
+			// state.rowID was itself the last row, "moving it back to the
+			// end" and "restoring it at state.rowID" are the same slot, so
+			// this degrades to a plain append+overwrite.
+			table.Rows = append(table.Rows, nil)
+			table.Rows[state.rowCount-1] = table.Rows[state.rowID]
 			table.Rows[state.rowID] = state.row
 		case state.rowCount:
 			table.Rows[state.rowID] = state.row

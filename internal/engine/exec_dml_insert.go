@@ -435,6 +435,61 @@ func patchConstraintIndexRow(t *storage.Table, rowIdx int, oldRow, newRow []any)
 	}
 }
 
+// patchConstraintIndexSwapRemove updates every cached constraint index after
+// a point DELETE removes deleteRowID via swap-and-pop: lastRow (the table's
+// last row, previously at lastRowID) now lives at deleteRowID, and lastRowID
+// no longer exists. Call this before table.Rows is mutated, passing the
+// table's pre-delete row count as oldLen.
+//
+// Only an entry that is fully caught up with the table (e.rowCount ==
+// oldLen, the same condition currentConstraintIndex checks) can be patched
+// from just these two rows' old and new values -- a partial entry may
+// already have indexed deleteRowID's old value without having reached
+// lastRowID yet, and patching it from these two rows alone would leave it
+// internally inconsistent. Such entries are dropped instead, exactly like
+// invalidateConstraintIndexes but scoped to the one lagging column rather
+// than every column on the table.
+func patchConstraintIndexSwapRemove(t *storage.Table, deleteRowID int, deletedRow []any, lastRowID int, lastRow []any, oldLen int) {
+	constraintIndexMu.Lock()
+	defer constraintIndexMu.Unlock()
+	for k, e := range constraintIndexes {
+		if k.table != t {
+			continue
+		}
+		if e.rowCount != oldLen {
+			delete(constraintIndexes, k)
+			continue
+		}
+		colIdx := k.colIdx
+		if colIdx < len(deletedRow) {
+			if oldVal := deletedRow[colIdx]; oldVal != nil {
+				removeConstraintIndexBucketEntry(e, oldVal, deleteRowID)
+			}
+		}
+		if deleteRowID != lastRowID && colIdx < len(lastRow) {
+			if newVal := lastRow[colIdx]; newVal != nil {
+				removeConstraintIndexBucketEntry(e, newVal, lastRowID)
+				k := comparableKeyPart(newVal)
+				e.rows[k] = append(e.rows[k], deleteRowID)
+			}
+		}
+		e.rowCount = oldLen - 1
+	}
+}
+
+// removeConstraintIndexBucketEntry removes rowIdx from val's bucket in e, if
+// present.
+func removeConstraintIndexBucketEntry(e *constraintIndexEntry, val any, rowIdx int) {
+	k := comparableKeyPart(val)
+	bucket := e.rows[k]
+	for i, ri := range bucket {
+		if ri == rowIdx {
+			e.rows[k] = append(bucket[:i], bucket[i+1:]...)
+			break
+		}
+	}
+}
+
 func constraintValueExists(t *storage.Table, colIdx int, val any, excludeRow int) bool {
 	idx := getConstraintIndex(t, colIdx)
 	for _, rowIdx := range idx.rows[comparableKeyPart(val)] {

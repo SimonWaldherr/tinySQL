@@ -326,6 +326,7 @@ func processNonAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []
 	// If window functions are present, set up window context
 	if hasWindowFunctions {
 		env.windowRows = filtered
+		env.windowPartitions = newWindowPartitionCache()
 	}
 
 	for rowIdx, r := range filtered {

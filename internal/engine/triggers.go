@@ -126,6 +126,57 @@ func fireTriggerList(env ExecEnv, triggers []*storage.CatalogTrigger, newRow Row
 	return nil
 }
 
+// triggerRowBinding lets NEW.<col>/OLD.<col>/bare-<col> references inside a
+// trigger's WHEN clause and body resolve directly against the newRow/oldRow
+// maps the firing INSERT/UPDATE/DELETE already built for its own WHERE and
+// RETURNING evaluation, instead of copying every one of their (already
+// duplicated, table-qualified-plus-bare) keys into a third map under
+// new./old.-renamed keys on every single trigger firing.
+//
+// newRow and oldRow are themselves produced by buildTableRow, so each already
+// maps both a column's bare lowercased name and its table-qualified name to
+// the same value; lookupTriggerRow strips a leading "new."/"old." and reuses
+// that existing key space instead of re-deriving it.
+type triggerRowBinding struct {
+	newRow Row
+	oldRow Row
+}
+
+// lookupTriggerRow resolves a lowercased column reference against a trigger's
+// NEW/OLD bindings exactly as the old copied-map shape did: "new."-prefixed
+// and bare references resolve against newRow (bare defaults to NEW, matching
+// SQL trigger convention — OLD requires the explicit prefix), and
+// "old."-prefixed references resolve against oldRow. A nil newRow or oldRow
+// (INSERT has no OLD row, DELETE has no NEW row) is a no-op lookup, matching
+// ranging over a nil map in the old implementation.
+func lookupTriggerRow(tb *triggerRowBinding, lower string) (any, bool) {
+	switch {
+	case strings.HasPrefix(lower, "new."):
+		return getValLower(tb.newRow, lower[len("new."):])
+	case strings.HasPrefix(lower, "old."):
+		return getValLower(tb.oldRow, lower[len("old."):])
+	default:
+		return getValLower(tb.newRow, lower)
+	}
+}
+
+// triggerRowSuggestionRow reconstructs the merged new./old./bare-keyed map
+// the old implementation always built, purely to source "did you mean...?"
+// candidates on the cold unknown-column-error path — see
+// columnSuggestionFromRow. Correctness there matters more than allocating,
+// and this path is only ever reached once a query has already failed.
+func triggerRowSuggestionRow(tb *triggerRowBinding) Row {
+	row := make(Row, len(tb.newRow)*2+len(tb.oldRow))
+	for k, v := range tb.newRow {
+		row["new."+k] = v
+		row[k] = v
+	}
+	for k, v := range tb.oldRow {
+		row["old."+k] = v
+	}
+	return row
+}
+
 // executeTrigger runs a single trigger's body in an enriched environment that
 // exposes NEW.<col> and OLD.<col> pseudo-columns.
 func executeTrigger(env ExecEnv, trig *storage.CatalogTrigger, newRow Row, oldRow Row) error {
@@ -134,22 +185,20 @@ func executeTrigger(env ExecEnv, trig *storage.CatalogTrigger, newRow Row, oldRo
 	}
 	env.triggerDepth++
 
-	// Build an enriched row with new.col and old.col
-	trigRow := make(Row)
-	for k, v := range newRow {
-		trigRow["new."+k] = v
-		trigRow[k] = v
-	}
-	for k, v := range oldRow {
-		trigRow["old."+k] = v
-	}
+	// Bind NEW.col/OLD.col/bare-col lookups directly against newRow/oldRow
+	// (see triggerRowBinding) rather than pre-copying every key into a third
+	// map. Set before the WHEN check too, so WHEN and the body resolve
+	// columns the same way (evalVarRef falls back to env.triggerRow whenever
+	// its row argument doesn't have the reference — passing nil below for
+	// WHEN's row argument routes it through that same fallback).
+	env.triggerRow = &triggerRowBinding{newRow: newRow, oldRow: oldRow}
 
 	if strings.TrimSpace(trig.WhenExpr) != "" {
 		whenExpr, err := triggerWhenExpr(trig.Name, trig.WhenExpr)
 		if err != nil {
 			return err
 		}
-		ok, err := evalExpr(env, whenExpr, trigRow)
+		ok, err := evalExpr(env, whenExpr, nil)
 		if err != nil {
 			return err
 		}
@@ -162,11 +211,6 @@ func executeTrigger(env ExecEnv, trig *storage.CatalogTrigger, newRow Row, oldRo
 	if err != nil {
 		return err
 	}
-
-	// Make NEW.col/OLD.col resolvable inside the body statements themselves
-	// (e.g. "INSERT INTO audit_log VALUES (NEW.id, ...)") via evalVarRef's
-	// env.triggerRow fallback.
-	env.triggerRow = trigRow
 
 	for _, stmt := range stmts {
 		// execStmt, not Execute: trigger bodies run inside the INSERT/UPDATE/

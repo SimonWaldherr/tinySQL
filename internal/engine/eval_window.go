@@ -249,19 +249,11 @@ func evalWindowFunction(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return nil, fmt.Errorf("window function context not available")
 	}
 
-	// Apply PARTITION BY to get relevant partition
-	partitionRows := allRows
-	if len(ex.Over.PartitionBy) > 0 {
-		partitionRows = filterPartition(env, allRows, ex.Over.PartitionBy, row)
-	}
-
-	// Apply ORDER BY to partition
-	if len(ex.Over.OrderBy) > 0 {
-		partitionRows = sortRows(partitionRows, ex.Over.OrderBy)
-	}
-
-	// Find current row position in partition
-	currentIdx := findRowIndex(partitionRows, row, env.windowIndex)
+	// Partition + sort the window's rows, and locate the current row within
+	// that partition. See windowPartitionCache: this is memoized per distinct
+	// PARTITION BY key so a query with N output rows across P partitions does
+	// the O(N)-filter + O(N log N)-sort work P times, not N times.
+	partitionRows, currentIdx := resolveWindowPartition(env, ex, allRows, row)
 
 	// Evaluate the specific window function
 	switch ex.Name {
@@ -400,6 +392,194 @@ func evalNtile(env ExecEnv, ex *FuncCall, partitionRows []Row, currentIdx int, r
 		return remainder + (currentIdx - boundary) + 1, nil
 	}
 	return remainder + (currentIdx-boundary)/base + 1, nil
+}
+
+// windowPartitionCache memoizes, per window-function call site (the specific
+// *FuncCall AST node for one OVER clause in the SELECT list -- stable across
+// every output row of one query) and PARTITION BY key, the partitioned+
+// ordered row set together with a lookup from a row's position in
+// env.windowRows (the query's full, unpartitioned row set -- what
+// env.windowIndex holds for the row currently being evaluated) to that row's
+// position within the partition.
+//
+// evalWindowFunction runs once per output row -- that is correct SQL
+// semantics, RANK/LAG/etc. can differ row to row -- but building the
+// partition (filterPartition's O(N) scan, plus sortRows's O(N log N) sort
+// when the OVER clause has an ORDER BY) only needs to happen once per
+// distinct partition. Without this cache, a query with P partitions pays for
+// that build P times too many: once per row instead of once per partition,
+// turning an O(N log N) query into O(N^2 log N). This mirrors the memoization
+// eval_window_classify.go's natBreaksCache uses for NATURAL_BREAKS's DP, but
+// scoped to one query execution (a fresh cache per processNonAggregateQuery
+// call, via ExecEnv.windowPartitions) rather than a package-level cache:
+// this cache holds full Row slices, so keeping it alive across separate query
+// executions would grow unbounded and risk serving stale rows for a reused
+// *FuncCall (e.g. via tinysql.ExecuteCompiled).
+type windowPartitionCache struct {
+	entries map[windowPartitionCacheKey]*windowPartitionEntry
+}
+
+type windowPartitionCacheKey struct {
+	fn        *FuncCall
+	partition string
+}
+
+type windowPartitionEntry struct {
+	rows []Row
+	// posByOrigIdx maps a row's index within env.windowRows to that row's
+	// position within rows (post partition-filter, post sort). Built once
+	// per partition (see buildWindowPartition) so evalWindowFunction can
+	// locate the current row in O(1) via env.windowIndex instead of
+	// findRowIndex's O(P) rowsEqual scan.
+	posByOrigIdx map[int]int
+}
+
+func newWindowPartitionCache() *windowPartitionCache {
+	return &windowPartitionCache{entries: make(map[windowPartitionCacheKey]*windowPartitionEntry)}
+}
+
+// resolveWindowPartition returns the partitioned+ordered row set for one
+// window-function evaluation and the current row's index within it, building
+// that row set at most once per distinct partition (see windowPartitionCache)
+// instead of once per output row.
+func resolveWindowPartition(env ExecEnv, ex *FuncCall, allRows []Row, row Row) ([]Row, int) {
+	cache := env.windowPartitions
+	if cache == nil {
+		// Defensive fallback: windowRows was set up without a cache (not
+		// reachable via the normal exec_group.go path, but this function
+		// stays correct on its own rather than trusting a cross-file
+		// invariant). Same behavior as before this cache existed.
+		partitionRows := allRows
+		if len(ex.Over.PartitionBy) > 0 {
+			partitionRows = filterPartition(env, allRows, ex.Over.PartitionBy, row)
+		}
+		if len(ex.Over.OrderBy) > 0 {
+			partitionRows = sortRows(partitionRows, ex.Over.OrderBy)
+		}
+		return partitionRows, findRowIndex(partitionRows, row, env.windowIndex)
+	}
+
+	key := windowPartitionCacheKey{fn: ex, partition: formatWindowPartitionKey(env, ex.Over.PartitionBy, row)}
+	entry, ok := cache.entries[key]
+	if !ok {
+		entry = buildWindowPartition(env, ex, allRows, row)
+		cache.entries[key] = entry
+	}
+
+	if pos, ok := entry.posByOrigIdx[env.windowIndex]; ok {
+		return entry.rows, pos
+	}
+	// env.windowIndex didn't resolve to a position (e.g. an unset/invalid
+	// hint) -- fall back to the same content-equality scan evalWindowFunction
+	// always used, so correctness never depends on the hint being right.
+	return entry.rows, findRowIndex(entry.rows, row, -1)
+}
+
+// buildWindowPartition filters allRows down to currentRow's partition,
+// applies the OVER clause's ORDER BY (if any), and records each surviving
+// row's original index (its position in allRows, i.e. env.windowRows) so its
+// position within the partition can be looked up in O(1) later.
+func buildWindowPartition(env ExecEnv, ex *FuncCall, allRows []Row, currentRow Row) *windowPartitionEntry {
+	var rows []Row
+	var origIdx []int
+	if len(ex.Over.PartitionBy) > 0 {
+		rows, origIdx = filterPartitionIndexed(env, allRows, ex.Over.PartitionBy, currentRow)
+	} else {
+		rows = allRows
+		origIdx = make([]int, len(allRows))
+		for i := range origIdx {
+			origIdx[i] = i
+		}
+	}
+
+	if len(ex.Over.OrderBy) > 0 {
+		rows, origIdx = sortRowsIndexed(rows, origIdx, ex.Over.OrderBy)
+	}
+
+	posByOrigIdx := make(map[int]int, len(origIdx))
+	for pos, oi := range origIdx {
+		posByOrigIdx[oi] = pos
+	}
+	return &windowPartitionEntry{rows: rows, posByOrigIdx: posByOrigIdx}
+}
+
+// filterPartitionIndexed is filterPartition plus, for each surviving row,
+// that row's index within allRows -- the same indexing env.windowIndex uses
+// -- so the caller can build an O(1) orig-index -> partition-position lookup
+// instead of a per-row rowsEqual scan (see windowPartitionCache).
+func filterPartitionIndexed(env ExecEnv, allRows []Row, partitionBy []Expr, currentRow Row) ([]Row, []int) {
+	// Evaluate partition expressions for current row
+	currentPartition := make([]any, len(partitionBy))
+	for i, expr := range partitionBy {
+		val, err := evalExpr(env, expr, currentRow)
+		if err != nil {
+			continue
+		}
+		currentPartition[i] = val
+	}
+
+	// Filter rows with same partition values, keeping their original index
+	var rows []Row
+	var idx []int
+	for i, r := range allRows {
+		match := true
+		for pi, expr := range partitionBy {
+			val, err := evalExpr(env, expr, r)
+			cmp, cmpErr := compare(val, currentPartition[pi])
+			if err != nil || cmpErr != nil || cmp != 0 {
+				match = false
+				break
+			}
+		}
+		if match {
+			rows = append(rows, r)
+			idx = append(idx, i)
+		}
+	}
+	return rows, idx
+}
+
+// sortRowsIndexed is sortRows plus tracking, through the same permutation,
+// each row's index within allRows -- so the caller can build the
+// orig-index -> sorted-position lookup windowPartitionCache needs. It must
+// apply the exact same ordering (including tie-breaking) as sortRows: it
+// drives the sort from one permutation of positions using the identical
+// comparator (compareOrderedValueRows over the same per-row keys extracted
+// by buildOrderByValues) and the same sort.SliceStable, so ties resolve
+// exactly as they do in sortRows -- by original relative order.
+func sortRowsIndexed(rows []Row, origIdx []int, orderBy []OrderItem) ([]Row, []int) {
+	sorted := make([]Row, len(rows))
+	copy(sorted, rows)
+	sortedIdx := make([]int, len(origIdx))
+	copy(sortedIdx, origIdx)
+	if len(orderBy) == 0 || len(sorted) <= 1 {
+		return sorted, sortedIdx
+	}
+
+	lcOrdCols := make([]string, len(orderBy))
+	for i, oi := range orderBy {
+		lcOrdCols[i] = strings.ToLower(oi.Col)
+	}
+	items := make([]orderedValueRow, len(sorted))
+	for i, r := range sorted {
+		items[i] = buildOrderByValues(r, lcOrdCols)
+	}
+
+	perm := make([]int, len(sorted))
+	for i := range perm {
+		perm[i] = i
+	}
+	sort.SliceStable(perm, func(i, j int) bool {
+		return compareOrderedValueRows(orderBy, items[perm[i]], items[perm[j]]) < 0
+	})
+
+	outRows := make([]Row, len(sorted))
+	outIdx := make([]int, len(sorted))
+	for pos, p := range perm {
+		outRows[pos] = items[p].row
+		outIdx[pos] = sortedIdx[p]
+	}
+	return outRows, outIdx
 }
 
 // filterPartition returns rows that match the partition of the current row

@@ -142,9 +142,13 @@ func TestRowDeleteStatementSnapshotReinsertsCandidateAndMetadata(t *testing.T) {
 		db.UnlockContentForWrite()
 		t.Fatal(err)
 	}
-	copy(table.Rows[1:], table.Rows[2:])
-	table.Rows[len(table.Rows)-1] = nil
-	table.Rows = table.Rows[:len(table.Rows)-1]
+	// Swap-and-pop, mirroring executeConstraintPointDelete: move the last
+	// row into the deleted slot, then truncate, instead of shifting every
+	// later row down by one.
+	last := len(table.Rows) - 1
+	table.Rows[1] = table.Rows[last]
+	table.Rows[last] = nil
+	table.Rows = table.Rows[:last]
 	table.Version++
 	table.dirtyFrom = -1
 	table.Stats = &TableStats{RowCount: 2, Stale: true}

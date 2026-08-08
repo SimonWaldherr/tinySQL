@@ -275,7 +275,7 @@ func finalizeSimpleAggregateResultSet(env ExecEnv, plan *simpleAggregatePlan, or
 		}
 		order = kept
 	}
-	result := simpleAggregateResultSet(plan, order)
+	result := simpleAggregateResultSet(plan.projs, plan.outputCols, order)
 	if len(plan.orderBy) > 0 {
 		result.Rows = applySortOrderWithLimit(plan.orderBy, result.Rows, plan.limit, plan.offset)
 	}
@@ -283,16 +283,22 @@ func finalizeSimpleAggregateResultSet(env ExecEnv, plan *simpleAggregatePlan, or
 	return result, nil
 }
 
-func simpleAggregateResultSet(plan *simpleAggregatePlan, order []*simpleAggregateState) *ResultSet {
+// simpleAggregateResultSet materializes one output Row per accumulated group.
+// It takes projections/outputCols directly (rather than a *simpleAggregatePlan)
+// so the join+aggregate fast path (exec_fastpath_join_aggregate.go) can share
+// it too: that path accumulates simpleAggregateState the same way this file's
+// single-table paths do, but its rows come from joined (left, right) pairs
+// instead of plan.table.Rows, so it has no simpleAggregatePlan of its own.
+func simpleAggregateResultSet(projs []simpleAggregateProjection, outputCols []string, order []*simpleAggregateState) *ResultSet {
 	outRows := make([]Row, 0, len(order))
 	for _, state := range order {
-		out := make(Row, len(plan.projs))
-		for i, proj := range plan.projs {
+		out := make(Row, len(projs))
+		for i, proj := range projs {
 			putVal(out, proj.name, simpleAggregateProjectionValue(state, proj, i))
 		}
 		outRows = append(outRows, out)
 	}
-	return &ResultSet{Cols: plan.outputCols, Rows: outRows}
+	return &ResultSet{Cols: outputCols, Rows: outRows}
 }
 
 func simpleAggregateProjectionValue(state *simpleAggregateState, proj simpleAggregateProjection, i int) any {

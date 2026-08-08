@@ -19,6 +19,15 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 	// an active CTE; otherwise recursive and chained CTEs are treated as
 	// missing physical tables.
 	if !selectReferencesCTE(cteEnv, s) {
+		// Tried before the plain join and plain aggregate fast paths: both of
+		// those deliberately reject any query that has both a JOIN and a
+		// GROUP BY (see their eligibility checks), so this is the only fast
+		// path that can claim that shape. Trying it first is not load-bearing
+		// for correctness -- the other two already reject this shape either
+		// way -- but keeps the more specific check first.
+		if rs, ok, err := executeSimpleJoinAggregateFastPath(cteEnv, s); ok || err != nil {
+			return rs, err
+		}
 		if rs, ok, err := executeSimpleJoinFastPath(cteEnv, s); ok || err != nil {
 			return rs, err
 		}

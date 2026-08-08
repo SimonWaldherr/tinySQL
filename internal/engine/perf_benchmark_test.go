@@ -148,6 +148,22 @@ func BenchmarkJoinHashJoinAboveThreshold(b *testing.B) {
 	runBench(b, db, `SELECT l.id, l.val, r.extra FROM l JOIN r ON l.id = r.id`)
 }
 
+// BenchmarkJoinGroupBySingleColumnFastPath is sized identically to
+// BenchmarkJoinHashJoinAboveThreshold (so, before this fast path existed, the
+// join itself would have used the hash-join path) but adds a single-column
+// GROUP BY on the join key. Before executeSimpleJoinAggregateFastPath
+// (exec_fastpath_join_aggregate.go), this exact shape always fell through to
+// the generic Row-map join (exec_join.go) followed by processAggregateQuery
+// (exec_group.go), which buffers every joined row per group and re-scans
+// each group's buffer once per aggregate expression -- the redundant re-scan
+// the fast path exists to avoid. B/op is the primary signal that re-scan is
+// gone: it should be far below BenchmarkJoinHashJoinAboveThreshold's, since
+// no per-row Row map or per-group row buffer is ever materialized.
+func BenchmarkJoinGroupBySingleColumnFastPath(b *testing.B) {
+	db := setupJoinTables(b, 5000, 5000)
+	runBench(b, db, `SELECT l.id, COUNT(*) as n FROM l JOIN r ON l.id = r.id GROUP BY l.id`)
+}
+
 // ─────────────────────────── Row scan / allocation ─────────────────────────
 
 // BenchmarkSelectStarFullScan measures the cost of materializing every row

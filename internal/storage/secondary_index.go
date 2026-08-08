@@ -218,6 +218,44 @@ func (t *Table) DeleteSecondaryIndexRow(rowID int) {
 	}
 }
 
+// SwapRemoveSecondaryIndexRow updates every materialized secondary index
+// after a point DELETE removes deleteRowID via swap-and-pop: the caller
+// moves its current last row (lastRowID, with values lastRow) into
+// deleteRowID's slot and truncates, instead of shifting every subsequent
+// row down by one. Only two row positions are affected, so this patches
+// exactly those entries instead of rescanning the whole index the way
+// ReindexSecondaryIndexRows (bulk shift) or DeleteSecondaryIndexRow (single
+// shift-compact) do.
+//
+// deletedRow is the row being removed (its values before the swap).
+// lastRow is the row that swap-and-pop relocates from lastRowID to
+// deleteRowID; when deleteRowID == lastRowID the delete removed the table's
+// last row and nothing moves. names is the table's index names in sorted
+// order (see SortedIndexNames), computed once per statement by the caller.
+func (t *Table) SwapRemoveSecondaryIndexRow(deleteRowID int, deletedRow []any, lastRowID int, lastRow []any, names []string) error {
+	delUpdates, err := t.indexRowKeys(deletedRow, names)
+	if err != nil {
+		return err
+	}
+	if deleteRowID == lastRowID {
+		for _, u := range delUpdates {
+			removeSecondaryIndexRowID(u.index, u.key, deleteRowID)
+		}
+		return nil
+	}
+	lastUpdates, err := t.indexRowKeys(lastRow, names)
+	if err != nil {
+		return err
+	}
+	for i, u := range delUpdates {
+		removeSecondaryIndexRowID(u.index, u.key, deleteRowID)
+		lu := lastUpdates[i]
+		removeSecondaryIndexRowID(lu.index, lu.key, lastRowID)
+		insertSecondaryIndexRowID(lu.index, lu.key, deleteRowID)
+	}
+	return nil
+}
+
 // ClearSecondaryIndexes removes all RowIDs while retaining CREATE INDEX
 // metadata, as required after DELETE without a WHERE clause.
 func (t *Table) ClearSecondaryIndexes() {

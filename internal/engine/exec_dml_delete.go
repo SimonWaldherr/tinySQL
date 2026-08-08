@@ -4,6 +4,7 @@
 package engine
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -220,12 +221,26 @@ func executeConstraintPointDelete(env ExecEnv, s *Delete, table *storage.Table, 
 	}
 
 	if deleteRowID >= 0 {
-		last := len(table.Rows) - 1
-		copy(table.Rows[deleteRowID:], table.Rows[deleteRowID+1:])
+		// Swap-and-pop: move the table's last row into the deleted slot and
+		// truncate, instead of shifting every subsequent row down by one.
+		// That shift was O(n) on every single-row DELETE and, worse, forced
+		// a wholesale constraint-index invalidation afterward because every
+		// index entry pointing past deleteRowID went stale. Swap-and-pop
+		// moves exactly one row, so only that row's constraint- and
+		// secondary-index entries need patching.
+		oldLen := len(table.Rows)
+		last := oldLen - 1
+		deletedRow := table.Rows[deleteRowID]
+		lastRow := table.Rows[last]
+		patchConstraintIndexSwapRemove(table, deleteRowID, deletedRow, last, lastRow, oldLen)
+		indexNames := rawIndexNames(table)
+		sort.Strings(indexNames)
+		if err := table.SwapRemoveSecondaryIndexRow(deleteRowID, deletedRow, last, lastRow, indexNames); err != nil {
+			return nil, err
+		}
+		table.Rows[deleteRowID] = lastRow
 		table.Rows[last] = nil
 		table.Rows = table.Rows[:last]
-		table.DeleteSecondaryIndexRow(deleteRowID)
-		invalidateConstraintIndexes(table)
 		table.InvalidateStats()
 		table.MarkDirtyFrom(-1)
 		markDependentMaterializedViewsStale(env, s.Table)

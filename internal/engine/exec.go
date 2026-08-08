@@ -94,12 +94,22 @@ type ExecEnv struct {
 	ctes        map[string]*ResultSet // For CTE support
 	windowRows  []Row                 // All rows for window function context
 	windowIndex int                   // Current row index in window context
+	// windowPartitions memoizes, per window-function call site and PARTITION
+	// BY key, the partitioned+ordered row set built from windowRows -- see
+	// windowPartitionCache in eval_window.go for why. Initialized alongside
+	// windowRows (exec_group.go) whenever a query uses window functions;
+	// nil otherwise.
+	windowPartitions *windowPartitionCache
 	viewDepth   int
-	// triggerRow carries new.<col>/old.<col> pseudo-columns while executing a
-	// trigger body statement (see executeTrigger in triggers.go), so
-	// NEW.col/OLD.col resolve even though the body statement's own row
-	// context (e.g. an INSERT's VALUES row) has no such columns.
-	triggerRow Row
+	// triggerRow binds new.<col>/old.<col>/bare-col pseudo-columns while
+	// executing a trigger body statement (see executeTrigger and
+	// triggerRowBinding in triggers.go), so NEW.col/OLD.col resolve even
+	// though the body statement's own row context (e.g. an INSERT's VALUES
+	// row) has no such columns. It resolves directly against the newRow/
+	// oldRow maps the firing DML statement already built (for its own
+	// WHERE/RETURNING evaluation), rather than a third map merging copies of
+	// both under renamed keys.
+	triggerRow *triggerRowBinding
 	// triggerDepth is incremented for nested trigger bodies. It is deliberately
 	// part of the value-style execution environment so child statements inherit
 	// the current depth without any process-global state.
