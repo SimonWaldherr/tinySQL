@@ -902,6 +902,12 @@ func applyOperation(db *DB, record *WALRecord) (*Table, error) {
 		if !found {
 			// Row not found - treat as insert
 			table.Rows = append(table.Rows, record.AfterImage)
+		} else {
+			// An in-place replacement, unlike the insert fallback above, so
+			// anything keyed on "only appends happened since I last looked"
+			// (see Table.noteStructuralChange) must not treat this table as
+			// append-only anymore.
+			table.noteStructuralChange()
 		}
 		table.Version++
 
@@ -910,6 +916,7 @@ func applyOperation(db *DB, record *WALRecord) (*Table, error) {
 		for i, row := range table.Rows {
 			if rowsEqual(row, record.BeforeImage) {
 				table.Rows = append(table.Rows[:i], table.Rows[i+1:]...)
+				table.noteStructuralChange()
 				break
 			}
 		}

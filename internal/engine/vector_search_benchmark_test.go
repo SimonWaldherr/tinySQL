@@ -271,6 +271,45 @@ func benchmarkVecSearchIndexed(b *testing.B, indexMode string) {
 	}
 }
 
+// benchmarkVecSearchIndexedK mirrors benchmarkVecSearchIndexed but takes an
+// explicit k, so callers can measure VEC_SEARCH well above the 64-result
+// ceiling chooseHNSWEfSearch used to hard-cap its graph-search beam (ef) at
+// — see BenchmarkVecSearchCosineTopK100_HNSWCached/
+// BenchmarkVecSearchCosineTopK200_HNSWCached below.
+func benchmarkVecSearchIndexedK(b *testing.B, indexMode string, k int) {
+	db := makeRAGHybridBenchmarkTable(12000, 64)
+	fn := &VecSearchTableFunc{}
+	env := ExecEnv{ctx: context.Background(), tenant: "default", db: db}
+	query := make([]float64, 64)
+	for i := range query {
+		query[i] = math.Cos(0.08*float64(i) + 0.5)
+	}
+	args := []Expr{
+		&Literal{Val: "rag_hybrid"},
+		&Literal{Val: "embedding"},
+		&Literal{Val: query},
+		&Literal{Val: k},
+		&Literal{Val: "cosine"},
+		&Literal{Val: indexMode},
+	}
+
+	if _, err := fn.Execute(context.Background(), args, env, Row{}); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rs, err := fn.Execute(context.Background(), args, env, Row{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(rs.Rows) == 0 || len(rs.Rows) > k {
+			b.Fatalf("expected up to %d results, got %d", k, len(rs.Rows))
+		}
+	}
+}
+
 func makeWhereAndBenchmarkTable(rows, dims int) *storage.DB {
 	db := storage.NewDB()
 	table := storage.NewTable("rag_docs", []storage.Column{
@@ -410,6 +449,33 @@ func BenchmarkVecSearchCosineTopK_IVFCached(b *testing.B) {
 
 func BenchmarkVecSearchCosineTopK_HNSWCached(b *testing.B) {
 	benchmarkVecSearchIndexed(b, "hnsw")
+}
+
+// BenchmarkVecSearchCosineTopK100_HNSWCached and
+// BenchmarkVecSearchCosineTopK200_HNSWCached exercise VEC_SEARCH's HNSW path
+// at k values above chooseHNSWEfSearch's old fixed ceiling of 64. Before
+// that ceiling was removed, vecHNSWIndex.search's graph-search beam
+// (efSearch) topped out at 64 regardless of k, so any k > 64 always
+// produced fewer than k graph candidates and fell through to
+// vecSearchTopK's full flat scan on every single call — paying for both
+// the graph traversal and the linear scan, with the index providing zero
+// benefit for exactly this "top-100/200 for downstream reranking" RAG
+// pattern. Their _IVFCached siblings are measured the same way as a
+// same-corpus reference point (IVF was never affected by this bug).
+func BenchmarkVecSearchCosineTopK100_HNSWCached(b *testing.B) {
+	benchmarkVecSearchIndexedK(b, "hnsw", 100)
+}
+
+func BenchmarkVecSearchCosineTopK100_IVFCached(b *testing.B) {
+	benchmarkVecSearchIndexedK(b, "ivf", 100)
+}
+
+func BenchmarkVecSearchCosineTopK200_HNSWCached(b *testing.B) {
+	benchmarkVecSearchIndexedK(b, "hnsw", 200)
+}
+
+func BenchmarkVecSearchCosineTopK200_IVFCached(b *testing.B) {
+	benchmarkVecSearchIndexedK(b, "ivf", 200)
 }
 
 func BenchmarkVecSearchIndexModesSameTable(b *testing.B) {

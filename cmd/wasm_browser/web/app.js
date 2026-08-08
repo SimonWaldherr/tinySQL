@@ -56,7 +56,7 @@
           const res = await window.tinySQL.open();
           console.log('[Reference] open() result:', res);
           // Parse JSON response if it's a string
-          const result = typeof res === 'string' ? JSON.parse(res) : res;
+          const result = res;
           if (result && result.success) {
             dbConnected = true;
             console.log('[Reference] dbConnected set to true');
@@ -210,7 +210,7 @@
     document.getElementById('btnListTables').addEventListener('click', async () => {
       if (!wasmReady || !dbConnected) return showNotification(i18n[document.getElementById('langSelect').value].wasmNotReady, 'error');
       const res = await window.tinySQL.listTables();
-      const parsed = typeof res === 'string' ? JSON.parse(res) : res;
+      const parsed = res;
       if (parsed.error) {
         showNotification(parsed.error, 'error');
         return;
@@ -227,7 +227,7 @@
       const tbl = document.getElementById('tblNameInput').value.trim();
       if (!tbl) return showNotification('Please provide a table name', 'error');
       const res = await window.tinySQL.describeTable(tbl);
-      const parsed = typeof res === 'string' ? JSON.parse(res) : res;
+      const parsed = res;
       if (parsed.error) { showNotification(parsed.error, 'error'); return; }
       const cols = parsed.columns || [];
       let html = `<div class="function-card"><h3>Table: ${escapeHtml(parsed.table)}</h3><div>Rows: ${parsed.rows}</div><table style="margin-top:0.5rem;width:100%"><thead><tr><th>Name</th><th>Type</th><th>Primary</th></tr></thead><tbody>`;
@@ -243,7 +243,7 @@
       const sql = document.getElementById('explainSql').value.trim();
       if (!sql) return showNotification('Please provide SQL to explain', 'error');
       const res = await window.tinySQL.explain(sql);
-      const parsed = typeof res === 'string' ? JSON.parse(res) : res;
+      const parsed = res;
       if (parsed.error) { showNotification(parsed.error, 'error'); return; }
       const plan = parsed.plan || [];
       let html = `<div class="function-card"><h3>Explain</h3><div class="explain-steps">`;
@@ -259,7 +259,7 @@
       if (!wasmReady || !dbConnected) return showNotification(i18n[document.getElementById('langSelect').value].wasmNotReady, 'error');
       try {
         const res = await window.tinySQL.exec('BEGIN;');
-        const parsed = typeof res === 'string' ? JSON.parse(res) : res;
+        const parsed = res;
         if (parsed && parsed.error) throw new Error(parsed.error);
         showNotification('Transaction begun', 'success', 2500);
       } catch (err) {
@@ -271,7 +271,7 @@
       if (!wasmReady || !dbConnected) return showNotification(i18n[document.getElementById('langSelect').value].wasmNotReady, 'error');
       try {
         const res = await window.tinySQL.exec('COMMIT;');
-        const parsed = typeof res === 'string' ? JSON.parse(res) : res;
+        const parsed = res;
         if (parsed && parsed.error) throw new Error(parsed.error);
         showNotification('Transaction committed', 'success', 2500);
       } catch (err) {
@@ -283,7 +283,7 @@
       if (!wasmReady || !dbConnected) return showNotification(i18n[document.getElementById('langSelect').value].wasmNotReady, 'error');
       try {
         const res = await window.tinySQL.exec('ROLLBACK;');
-        const parsed = typeof res === 'string' ? JSON.parse(res) : res;
+        const parsed = res;
         if (parsed && parsed.error) throw new Error(parsed.error);
         showNotification('Transaction rolled back', 'success', 2500);
       } catch (err) {
@@ -305,7 +305,7 @@
       try {
         // common meta table for many SQL engines
         const res = await window.tinySQL.query(`SELECT name, sql FROM sqlite_master WHERE type='view';`);
-        const parsed = typeof res === 'string' ? JSON.parse(res) : res;
+        const parsed = res;
         if (parsed.error) { showNotification(parsed.error, 'error'); return; }
         const html = '<div class="function-card"><h3>Views</h3>' + renderTable(parsed) + '</div>';
         document.getElementById('content').insertAdjacentHTML('afterbegin', html);
@@ -320,12 +320,12 @@
       try {
         // count tables
         const tablesRes = await window.tinySQL.query(`SELECT COUNT(*) as table_count FROM sqlite_master WHERE type='table';`);
-        const tablesParsed = typeof tablesRes === 'string' ? JSON.parse(tablesRes) : tablesRes;
+        const tablesParsed = tablesRes;
         const viewsRes = await window.tinySQL.query(`SELECT COUNT(*) as view_count FROM sqlite_master WHERE type='view';`);
-        const viewsParsed = typeof viewsRes === 'string' ? JSON.parse(viewsRes) : viewsRes;
+        const viewsParsed = viewsRes;
 
         const listRes = await window.tinySQL.query(`SELECT name FROM sqlite_master WHERE type='table' LIMIT 100;`);
-        const listParsed = typeof listRes === 'string' ? JSON.parse(listRes) : listRes;
+        const listParsed = listRes;
 
         let html = `<div class="function-card"><h3>Metadata</h3><div style="display:flex;gap:1rem;flex-wrap:wrap;">`;
         html += `<div>Tables: ${tablesParsed.rows && tablesParsed.rows[0] ? tablesParsed.rows[0][0] : '0'}</div><div>Views: ${viewsParsed.rows && viewsParsed.rows[0] ? viewsParsed.rows[0][0] : '0'}</div></div>`;
@@ -436,7 +436,7 @@
 
       try {
         const res = await window.tinySQL.query(sql);
-        const result = typeof res === 'string' ? JSON.parse(res) : res;
+        const result = res;
         if (result.error) {
           modalResult.innerHTML = `<div style="color: red;">Error: ${escapeHtml(result.error)}</div>`;
         } else {
@@ -476,12 +476,12 @@
           const start = stmt.split(/\s+/)[0].toLowerCase();
           if (start === 'select' || start === 'with') {
             const r = await window.tinySQL.query(stmt + ';');
-            const parsed = typeof r === 'string' ? JSON.parse(r) : r;
+            const parsed = r;
             if (parsed && parsed.error) throw new Error(parsed.error);
             lastQueryResult = parsed;
           } else {
             const r = await window.tinySQL.exec(stmt + ';');
-            const parsed = typeof r === 'string' ? JSON.parse(r) : r;
+            const parsed = r;
             if (parsed && parsed.error) throw new Error(parsed.error);
           }
         }
@@ -697,8 +697,8 @@
           window.tinySQL.query('SELECT name, function_type FROM catalog.functions ORDER BY function_type, name'),
           window.tinySQL.query('SELECT name FROM sys.procedures ORDER BY name')
         ]);
-        const functionResult = typeof functionResponse === 'string' ? JSON.parse(functionResponse) : functionResponse;
-        const procedureResult = typeof procedureResponse === 'string' ? JSON.parse(procedureResponse) : procedureResponse;
+        const functionResult = functionResponse;
+        const procedureResult = procedureResponse;
         if (functionResult.error) throw new Error(functionResult.error);
         if (procedureResult.error) throw new Error(procedureResult.error);
 
@@ -822,7 +822,7 @@
         await window.tinySQL.exec('BEGIN;');
         for (const s of stmts) {
           const r = await window.tinySQL.exec(s);
-          const parsed = typeof r === 'string' ? JSON.parse(r) : r;
+          const parsed = r;
           if (parsed && parsed.error) throw new Error(parsed.error);
         }
         await window.tinySQL.exec('COMMIT;');
@@ -830,7 +830,7 @@
         // refresh schema browser if present
         if (typeof renderSchemaList === 'function') {
           const res = await window.tinySQL.listTables();
-          const parsed = typeof res === 'string' ? JSON.parse(res) : res;
+          const parsed = res;
           renderSchemaList(parsed.tables || []);
         }
       } catch (err) {

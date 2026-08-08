@@ -37,14 +37,15 @@ async function main() {
   const cmd = args[0] || 'status';
   const sql = args.slice(1).join(' ');
 
-  const parse = (s) => typeof s === 'string' ? JSON.parse(s) : s;
-
+  // db.* calls now return native JS objects/arrays directly (via
+  // syscall/js.ValueOf on the Go side) instead of JSON strings, so no
+  // JSON.parse round trip is needed here any more.
   switch (cmd) {
     case 'exec':
-      console.log(parse(db.exec(sql)));
+      console.log(db.exec(sql));
       break;
     case 'query':
-      const res = parse(db.query(sql));
+      const res = db.query(sql);
       console.log(res);
       if (res && res.columns && res.rows) {
         console.table(res.rows.map(r => Object.fromEntries(res.columns.map((c,i)=>[c,r[i]]))));
@@ -52,10 +53,10 @@ async function main() {
       break;
     case 'status':
     default:
-      console.log(parse(db.status()));
+      console.log(db.status());
   }
 
-  console.log(parse(db.close()));
+  console.log(db.close());
 }
 
 main().catch(err => { console.error(err); process.exit(1); });

@@ -83,7 +83,7 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 	}()
 
 	statementWAL := newStatementWAL(db)
-	rs, err = execStmt(ExecEnv{ctx: ctx, tenant: tenant, db: db, statementWAL: statementWAL, now: time.Now()}, stmt)
+	rs, err = execStmt(ExecEnv{ctx: ctx, tenant: tenant, db: db, statementWAL: statementWAL, now: time.Now(), subqueryCache: newSubqueryResultCache()}, stmt)
 	if err == nil {
 		err = statementWAL.commit()
 	}

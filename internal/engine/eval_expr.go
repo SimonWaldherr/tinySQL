@@ -273,9 +273,11 @@ func evalRegexpExpr(env ExecEnv, ex *RegexpExpr, row Row) (any, error) {
 	return matched, nil
 }
 
-// evalExistsExpr evaluates EXISTS (subquery).
+// evalExistsExpr evaluates EXISTS (subquery). See evalCachedSubquery for how
+// repeated evaluations of the same *ExistsExpr node within one statement
+// execution avoid re-running the subquery when it is safe to do so.
 func evalExistsExpr(env ExecEnv, ex *ExistsExpr) (any, error) {
-	rs, err := executeSelect(env, ex.Select)
+	rs, err := evalCachedSubquery(env, ex, ex.Select)
 	if err != nil {
 		return nil, err
 	}
@@ -449,7 +451,14 @@ func evalCaseExpr(env ExecEnv, ex *CaseExpr, row Row) (any, error) {
 }
 
 func evalSubqueryExpr(env ExecEnv, ex *SubqueryExpr) (any, error) {
-	rs, err := executeSelect(env, ex.Select)
+	// Also the path evalIn (evalIn's IN (SELECT ...) form, eval_expr.go)
+	// reaches through evalExpr's generic *SubqueryExpr dispatch: ex.Values
+	// holds a single *SubqueryExpr there, so evalExpr calls this function for
+	// that case too, and this cache lookup covers it for free. See
+	// evalCachedSubquery for how repeated evaluations of the same
+	// *SubqueryExpr node within one statement execution avoid re-running the
+	// subquery when it is safe to do so.
+	rs, err := evalCachedSubquery(env, ex, ex.Select)
 	if err != nil {
 		return nil, err
 	}

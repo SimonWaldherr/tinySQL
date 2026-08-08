@@ -597,7 +597,10 @@ SELECT * FROM users;"></textarea>
     }
 
     function parseApiResult(result) {
-      return typeof result === 'string' ? JSON.parse(result) : (result || {});
+      // tinySQL's WASM API now returns native JS objects/arrays directly
+      // (via syscall/js.ValueOf) instead of JSON strings, so no JSON.parse
+      // round trip is needed here any more.
+      return result || {};
     }
 
     function sqlMayMutate(sql) {

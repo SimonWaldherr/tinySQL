@@ -421,7 +421,9 @@ SELECT * FROM users;"></textarea>
     async function handleApiCall(apiCall, successMessage) {
       try {
         const result = apiCall();
-        const parsed = typeof result === 'string' ? JSON.parse(result) : result;
+        // tinySQL's WASM API now returns native JS objects/arrays directly
+        // (via syscall/js.ValueOf) instead of JSON strings.
+        const parsed = result;
         
         if (parsed.error) {
           showResult(parsed.error, 'error');

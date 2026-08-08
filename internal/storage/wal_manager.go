@@ -447,6 +447,11 @@ func handleWalRecord(db *DB, rec walRecord, pending map[uint64][]walOperation, c
 						existing.Rows[idx] = delta.Rows[i]
 					}
 					existing.Version = delta.Version
+					// Replaces existing rows in place, so anything keyed on
+					// "only appends happened since I last looked" (see
+					// Table.noteStructuralChange) must not treat this table
+					// as append-only anymore.
+					existing.noteStructuralChange()
 					_ = existing.RebuildSecondaryIndexes()
 					continue
 				}

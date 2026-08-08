@@ -50,14 +50,27 @@ type vecIVFIndex struct {
 }
 
 type vecHNSWIndex struct {
-	table     *storage.Table
-	version   int
-	metric    string
-	dims      int
-	entry     int
-	maxLevel  int
-	levels    []int
-	neighbors [][][]int
+	table   *storage.Table
+	version int
+	// structVersion is the table's StructVersion() as of the last time this
+	// graph was fully built or incrementally extended. Equal to the table's
+	// current StructVersion() proves every row this graph already indexes
+	// (rows [0, len(levels))) is unchanged, so the only possible reason
+	// idx.version can be behind table.Version is that rows were appended —
+	// see canExtendVecHNSWIndex.
+	structVersion int
+	metric        string
+	dims          int
+	entry         int
+	maxLevel      int
+	levels        []int
+	neighbors     [][][]int
+	// mu guards every field above against extendVecHNSWIndex mutating an
+	// already-published graph (see getVecHNSWIndex) while a concurrent
+	// search() call is reading it. A freshly built graph (buildVecHNSWIndex)
+	// needs no locking: it is not reachable through the cache, and therefore
+	// not visible to any other goroutine, until after it is fully built.
+	mu sync.RWMutex
 }
 
 type vecMinScoredHeap []vecScoredRow
@@ -176,7 +189,17 @@ func acquireVisited(n int) []bool {
 		clear(v)
 		return v
 	}
-	return make([]bool, n)
+	// Grow with slack (like append's own doubling growth) rather than
+	// exactly n: a caller whose required size creeps up by a little on
+	// every call — e.g. extendVecHNSWIndex, called once per single-row
+	// INSERT, with n following the table's row count up by one each time —
+	// would otherwise force a fresh allocation on every single call despite
+	// the pool existing, since the previous release's capacity is always
+	// exactly one short of what the next acquire needs. The extra
+	// capacity is never visible to callers (every acquireVisited caller
+	// only ever sees the v[:n] returned here), so this is purely an
+	// internal amortization, not a behavior change.
+	return make([]bool, n, n+n/2+64)
 }
 
 func releaseVisited(v []bool) {
@@ -415,7 +438,8 @@ func getVecHNSWIndex(ctx context.Context, tenant string, table *storage.Table, c
 		vecHNSWCacheMu.RUnlock()
 
 		vecHNSWCacheMu.Lock()
-		if idx := vecHNSWCache[key]; idx != nil && idx.table == table && idx.version == table.Version && idx.dims == dims {
+		idx := vecHNSWCache[key]
+		if idx != nil && idx.table == table && idx.version == table.Version && idx.dims == dims {
 			vecHNSWCacheMu.Unlock()
 			return idx, nil
 		}
@@ -424,11 +448,42 @@ func getVecHNSWIndex(ctx context.Context, tenant string, table *storage.Table, c
 			<-call.done
 			continue
 		}
+
+		// A cached graph that is stale only because rows were appended since
+		// it was built or last extended (no UPDATE, DELETE, or schema change
+		// happened in between — see canExtendVecHNSWIndex) can grow in place
+		// instead of being discarded and rebuilt from scratch. This mirrors
+		// the incremental-append/full-rebuild-on-anything-else split already
+		// used for constraintIndexes (exec_dml_insert.go): appends are cheap
+		// to absorb, everything else re-derives the whole structure.
+		if canExtendVecHNSWIndex(idx, table, dims) {
+			call := &vecIndexBuildCall{done: make(chan struct{})}
+			vecHNSWBuilds[key] = call
+			vecHNSWCacheMu.Unlock()
+
+			idx.mu.Lock()
+			err := extendVecHNSWIndex(ctx, idx, cache)
+			if err == nil {
+				idx.version = table.Version
+				idx.structVersion = table.StructVersion()
+			}
+			idx.mu.Unlock()
+
+			vecHNSWCacheMu.Lock()
+			delete(vecHNSWBuilds, key)
+			close(call.done)
+			vecHNSWCacheMu.Unlock()
+			if err != nil {
+				return nil, err
+			}
+			return idx, nil
+		}
+
 		call := &vecIndexBuildCall{done: make(chan struct{})}
 		vecHNSWBuilds[key] = call
 		vecHNSWCacheMu.Unlock()
 
-		idx, err := buildVecHNSWIndex(ctx, table, metric, dims, cache)
+		newIdx, err := buildVecHNSWIndex(ctx, table, metric, dims, cache)
 
 		vecHNSWCacheMu.Lock()
 		delete(vecHNSWBuilds, key)
@@ -436,24 +491,43 @@ func getVecHNSWIndex(ctx context.Context, tenant string, table *storage.Table, c
 			if _, exists := vecHNSWCache[key]; !exists {
 				evictOverCap(vecHNSWCache, vecIndexCacheMaxEntries)
 			}
-			vecHNSWCache[key] = idx
+			vecHNSWCache[key] = newIdx
 		}
 		close(call.done)
 		vecHNSWCacheMu.Unlock()
-		return idx, err
+		return newIdx, err
 	}
+}
+
+// canExtendVecHNSWIndex reports whether idx can grow in place to cover
+// table's current rows instead of being rebuilt from scratch. This is safe
+// exactly when table.StructVersion() has not moved since idx was last built
+// or extended: that counter only advances on UPDATE, DELETE, or a schema
+// change (see Table.noteStructuralChange), never on INSERT, so an unchanged
+// value proves every row idx already indexes still holds exactly what it did
+// then — the table can only have grown by appending. The row-count check is
+// a second, independent guard against the same conclusion reached unsafely
+// (e.g. a table rolled back to fewer rows than idx has already indexed,
+// which would otherwise still show an unchanged StructVersion).
+func canExtendVecHNSWIndex(idx *vecHNSWIndex, table *storage.Table, dims int) bool {
+	return idx != nil &&
+		idx.table == table &&
+		idx.dims == dims &&
+		idx.structVersion == table.StructVersion() &&
+		len(idx.levels) <= len(table.Rows)
 }
 
 func buildVecHNSWIndex(ctx context.Context, table *storage.Table, metric string, dims int, cache vecSearchColumnCacheEntry) (*vecHNSWIndex, error) {
 	idx := &vecHNSWIndex{
-		table:     table,
-		version:   table.Version,
-		metric:    metric,
-		dims:      dims,
-		entry:     -1,
-		maxLevel:  -1,
-		levels:    make([]int, len(cache.vectors)),
-		neighbors: make([][][]int, len(cache.vectors)),
+		table:         table,
+		version:       table.Version,
+		structVersion: table.StructVersion(),
+		metric:        metric,
+		dims:          dims,
+		entry:         -1,
+		maxLevel:      -1,
+		levels:        make([]int, len(cache.vectors)),
+		neighbors:     make([][][]int, len(cache.vectors)),
 	}
 
 	visited := make([]bool, len(cache.vectors))
@@ -471,47 +545,127 @@ func buildVecHNSWIndex(ctx context.Context, table *storage.Table, metric string,
 		if !validCacheRow(cache, rowIdx, dims) {
 			continue
 		}
-		level := hnswLevel(rowIdx)
-		idx.levels[rowIdx] = level
-		idx.neighbors[rowIdx] = make([][]int, level+1)
-		if idx.entry < 0 {
-			idx.entry = rowIdx
-			idx.maxLevel = level
-			continue
-		}
-
-		current := idx.entry
-		query := cache.vectors[rowIdx]
-		queryNorm := rowNormFor(metric, cache, rowIdx)
-		for layer := idx.maxLevel; layer > level; layer-- {
-			best := idx.searchLayer(query, queryNorm, current, 1, layer, cache, visited, scratch)
-			if len(best) > 0 {
-				current = best[0].rowIdx
-			}
-		}
-		upper := level
-		if idx.maxLevel < upper {
-			upper = idx.maxLevel
-		}
-		for layer := upper; layer >= 0; layer-- {
-			candidates := idx.searchLayer(query, queryNorm, current, vecHNSWEfConstruction, layer, cache, visited, scratch)
-			selected := selectHNSWNeighbors(candidates, vecHNSWM)
-			for _, nb := range selected {
-				idx.addHNSWLink(rowIdx, nb.rowIdx, layer, cache)
-			}
-			if len(selected) > 0 {
-				current = selected[0].rowIdx
-			}
-		}
-		if level > idx.maxLevel {
-			idx.entry = rowIdx
-			idx.maxLevel = level
-		}
+		idx.insertHNSWNode(rowIdx, cache, visited, scratch)
 	}
 	return idx, nil
 }
 
+// extendVecHNSWIndex grows an already-built HNSW graph in place by inserting
+// every row appended to the table since idx was last built or extended,
+// using insertHNSWNode — the exact same per-row insert logic
+// buildVecHNSWIndex uses for a from-scratch build. The resulting graph is
+// therefore structurally identical to one built from scratch on the same
+// final data (same neighbor selection, same pruning, same entry-point
+// evolution), not merely "a working graph".
+//
+// Callers must already have established, via canExtendVecHNSWIndex, that
+// only appends — never an UPDATE, DELETE, or schema change — happened to
+// the table since idx.version; this function does not re-check that and
+// trusts idx's existing rows [0, len(idx.levels)) to still be exactly what
+// they were.
+//
+// idx is the same object already published in vecHNSWCache, so the caller
+// must hold idx.mu for writing for the duration of this call — a concurrent
+// search() call may be reading idx through a reference obtained earlier.
+//
+// If ctx is cancelled partway through, idx.levels/idx.neighbors are
+// truncated back to the last row fully inserted (every link created so far
+// only ever points at rows below that point, since a node can only link to
+// something already reachable in the graph) so idx is left in exactly the
+// state a shorter, successful extend would have produced — never partially
+// linked. idx.version/structVersion are left untouched on error, so the next
+// getVecHNSWIndex call sees it as still eligible for (and resumes) an
+// incremental extend from that point, rather than paying for a full rebuild.
+func extendVecHNSWIndex(ctx context.Context, idx *vecHNSWIndex, cache vecSearchColumnCacheEntry) error {
+	oldRows := len(idx.levels)
+	newRows := len(cache.vectors)
+	if newRows <= oldRows {
+		return nil
+	}
+	idx.levels = append(idx.levels, make([]int, newRows-oldRows)...)
+	idx.neighbors = append(idx.neighbors, make([][][]int, newRows-oldRows)...)
+
+	// Sized to the final row count up front, exactly like buildVecHNSWIndex's
+	// visited array, since traversal while inserting a new row can touch any
+	// row already linked into the graph, old or newly inserted earlier in
+	// this same call. Pooled (see acquireVisited/search) rather than a plain
+	// make(): a from-scratch build pays one allocation for the whole build,
+	// but every single-row INSERT that reaches this function would otherwise
+	// pay a fresh O(existing rows) allocation of its own on every call — an
+	// allocation cost that grows with table size defeating the entire point
+	// of extending in place instead of rebuilding.
+	visited := acquireVisited(newRows)
+	defer releaseVisited(visited)
+	scratch := acquireHNSWScratch()
+	defer releaseHNSWScratch(scratch)
+	for rowIdx := oldRows; rowIdx < newRows; rowIdx++ {
+		if rowIdx&1023 == 0 {
+			if err := checkCtx(ctx); err != nil {
+				idx.levels = idx.levels[:rowIdx]
+				idx.neighbors = idx.neighbors[:rowIdx]
+				return err
+			}
+		}
+		if !validCacheRow(cache, rowIdx, idx.dims) {
+			continue
+		}
+		idx.insertHNSWNode(rowIdx, cache, visited, scratch)
+	}
+	return nil
+}
+
+// insertHNSWNode inserts rowIdx into idx's graph. It assumes idx.levels and
+// idx.neighbors already have a slot allocated for every index up to rowIdx
+// (as both buildVecHNSWIndex and extendVecHNSWIndex arrange before calling
+// this), and that rows below rowIdx are already fully inserted. Shared by
+// both, so a from-scratch build and an incremental extend grow the exact
+// same graph structure via the exact same logic.
+func (idx *vecHNSWIndex) insertHNSWNode(rowIdx int, cache vecSearchColumnCacheEntry, visited []bool, scratch *vecHNSWScratch) {
+	level := hnswLevel(rowIdx)
+	idx.levels[rowIdx] = level
+	idx.neighbors[rowIdx] = make([][]int, level+1)
+	if idx.entry < 0 {
+		idx.entry = rowIdx
+		idx.maxLevel = level
+		return
+	}
+
+	current := idx.entry
+	query := cache.vectors[rowIdx]
+	queryNorm := rowNormFor(idx.metric, cache, rowIdx)
+	for layer := idx.maxLevel; layer > level; layer-- {
+		best := idx.searchLayer(query, queryNorm, current, 1, layer, cache, visited, scratch)
+		if len(best) > 0 {
+			current = best[0].rowIdx
+		}
+	}
+	upper := level
+	if idx.maxLevel < upper {
+		upper = idx.maxLevel
+	}
+	for layer := upper; layer >= 0; layer-- {
+		candidates := idx.searchLayer(query, queryNorm, current, vecHNSWEfConstruction, layer, cache, visited, scratch)
+		selected := selectHNSWNeighbors(candidates, vecHNSWM)
+		for _, nb := range selected {
+			idx.addHNSWLink(rowIdx, nb.rowIdx, layer, cache)
+		}
+		if len(selected) > 0 {
+			current = selected[0].rowIdx
+		}
+	}
+	if level > idx.maxLevel {
+		idx.entry = rowIdx
+		idx.maxLevel = level
+	}
+}
+
 func (idx *vecHNSWIndex) search(ctx context.Context, query []float64, queryNorm float64, k int, cache vecSearchColumnCacheEntry) ([]vecScoredRow, error) {
+	// extendVecHNSWIndex can mutate this same, already-published object in
+	// place (see getVecHNSWIndex); a plain full rebuild never touches an
+	// object once published, so this read lock costs nothing extra in that
+	// (still far more common) case beyond an uncontended RWMutex RLock.
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
 	if idx.entry < 0 {
 		return nil, nil
 	}
@@ -793,13 +947,25 @@ func hnswLevel(rowIdx int) int {
 	return level
 }
 
+// chooseHNSWEfSearch picks the graph-search beam width (ef) for a
+// requested top-k. Below a floor of 16 it widens the beam so tiny k still
+// gets a reasonable exploration budget; from 16 up it tracks k directly
+// (ef == k), same as it always has for k in that range.
+//
+// It used to also clamp ef to a ceiling of 64, which meant any k > 64 got
+// an ef strictly less than k. Since searchLayer's result set is bounded to
+// at most ef entries (see searchLayer below), that made
+// resultHeap.Len() < k in search() unconditionally true whenever k > 64,
+// so every such call fell through to vecSearchTopK's full flat scan —
+// paying for the graph traversal *and* the fallback, with the index
+// providing no benefit at all for k > 64 (e.g. top-100/200 reranking
+// queries). Dropping the ceiling and extending the existing ef == k
+// relationship past 64 lets the graph search return k results directly
+// for arbitrarily large k, exactly as it already did for k in [16, 64].
 func chooseHNSWEfSearch(k int) int {
 	ef := k
 	if ef < 16 {
 		ef = 16
-	}
-	if ef > 64 {
-		ef = 64
 	}
 	return ef
 }

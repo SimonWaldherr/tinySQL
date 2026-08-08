@@ -104,6 +104,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 	if err := wal.commit(); err != nil {
 		return nil, err
 	}
+	tryFastPathAppend(env, s.Table, t, len(s.Rows))
 	t.Version++
 	t.InvalidateStats()
 	t.MarkDirtyFrom(len(t.Rows) - len(s.Rows))
@@ -197,6 +198,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	if err := wal.commit(); err != nil {
 		return nil, err
 	}
+	tryFastPathAppend(env, s.Table, t, len(s.Rows))
 	t.Version++
 	t.InvalidateStats()
 	t.MarkDirtyFrom(len(t.Rows) - len(s.Rows))
@@ -205,6 +207,34 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 		return projectReturningRows(env, t.Cols, s.Returning, returningRows)
 	}
 	return nil, nil
+}
+
+// tryFastPathAppend opportunistically hands the rows this INSERT statement
+// just appended to t.Rows straight to the storage backend via
+// db.AppendRowsFast, which -- for a ModePagedIndex backend only -- writes
+// them incrementally into the on-disk B+Trees (cost proportional to
+// newRowCount, not to the table's existing size) instead of leaving them to
+// be picked up by the next db.Sync's full backend.SaveTable rewrite (cost
+// proportional to the whole table). See AppendRowsFast's doc comment.
+//
+// This never affects the statement's outcome or in-memory bookkeeping: the
+// rows are already durably reflected in t.Rows and the WAL by the time this
+// runs (both happen unchanged, above). ok=false (no paged-index backend
+// attached, or the table has no backend catalog entry yet) and ok=true with
+// a non-nil err (the fast path was attempted and failed, e.g. a transient
+// backend/IO error) are both silently ignored: either way, t.Version keeps
+// incrementing as it always did, so the existing Sync()-driven
+// backend.SaveTable path -- unchanged -- remains the durability backstop
+// for these rows, exactly as if this fast path did not exist. Swallowing
+// the error here (rather than failing the statement) preserves INSERT's
+// existing error semantics -- constraint/type errors are the only way
+// INSERT fails, exactly as before this fast path existed.
+func tryFastPathAppend(env ExecEnv, tableName string, t *storage.Table, newRowCount int) {
+	if newRowCount <= 0 || newRowCount > len(t.Rows) {
+		return
+	}
+	newRows := t.Rows[len(t.Rows)-newRowCount:]
+	_, _ = env.db.AppendRowsFast(env.tenant, tableName, newRows)
 }
 
 // applyColumnDefaults initializes an INSERT row before explicitly named

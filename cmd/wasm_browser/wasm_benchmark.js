@@ -14,6 +14,10 @@ if (!Number.isInteger(iterations) || iterations < 1) {
 }
 
 function parse(response) {
+  // tinySQL's WASM API now returns native JS objects/arrays directly (via
+  // syscall/js.ValueOf) instead of JSON strings, so no JSON.parse round trip
+  // is needed here any more. Kept as a passthrough so this benchmark still
+  // works unmodified against older tinySQL.wasm builds that returned strings.
   return typeof response === 'string' ? JSON.parse(response) : response;
 }
 

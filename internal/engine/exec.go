@@ -100,7 +100,16 @@ type ExecEnv struct {
 	// windowRows (exec_group.go) whenever a query uses window functions;
 	// nil otherwise.
 	windowPartitions *windowPartitionCache
-	viewDepth   int
+	// subqueryCache memoizes the result of executing a WHERE/SELECT-list
+	// EXISTS/scalar/IN subquery's SELECT, keyed by the owning AST node, so a
+	// provably uncorrelated subquery inside e.g. a WHERE clause executes once
+	// per statement instead of once per outer row -- see evalCachedSubquery
+	// (eval_subquery_cache.go) and isSelectCorrelated for the safety check
+	// gating which nodes are eligible. Set once per top-level Execute() call
+	// (exec_statement.go), mirroring windowPartitions: never reused across
+	// separate executions, even of the same cached/compiled statement.
+	subqueryCache *subqueryResultCache
+	viewDepth     int
 	// triggerRow binds new.<col>/old.<col>/bare-col pseudo-columns while
 	// executing a trigger body statement (see executeTrigger and
 	// triggerRowBinding in triggers.go), so NEW.col/OLD.col resolve even

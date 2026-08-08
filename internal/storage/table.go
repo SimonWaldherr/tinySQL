@@ -38,6 +38,17 @@ type Table struct {
 	// oversized record, never a lost change.
 	dirtyRows      []int
 	dirtyRowsState dirtyRowsState
+	// structVersion increments on every mutation that changes or removes an
+	// existing row's content (UPDATE, DELETE, a cascaded foreign-key action,
+	// or a schema change) but never on a pure append of new rows. Unlike
+	// dirtyFrom/dirtyRows it is never reset by ResetDirty, so it stays valid
+	// as a signal across an arbitrarily long window, not just since the last
+	// WAL checkpoint. See noteStructuralChange and StructVersion: this exists
+	// so a derived structure that only knows how to grow by appending (e.g.
+	// the HNSW vector index in engine/vector_index.go) can tell "only inserts
+	// happened since I was built" from "something else happened" without
+	// paying for a full rebuild on every append.
+	structVersion int
 }
 
 // dirtyRowsState distinguishes "no in-place updates recorded yet" from "the
@@ -213,6 +224,7 @@ func (t *Table) MarkDirtyFrom(idx int) {
 	t.dirtyRowsState = dirtyRowsUnknown
 	if idx < 0 {
 		t.dirtyFrom = -1
+		t.noteStructuralChange()
 		return
 	}
 	if t.dirtyFrom < 0 {
@@ -235,12 +247,33 @@ func (t *Table) MarkDirtyFrom(idx int) {
 // instead, which permanently gives up the list for this dirty window.
 func (t *Table) MarkRowUpdated(idx int) {
 	t.dirtyFrom = -1
+	t.noteStructuralChange()
 	if t.dirtyRowsState == dirtyRowsUnknown || idx < 0 {
 		return
 	}
 	t.dirtyRowsState = dirtyRowsExact
 	t.dirtyRows = append(t.dirtyRows, idx)
 }
+
+// noteStructuralChange records that an existing row's content changed,
+// moved, or was removed, or that the schema changed. Every caller that
+// currently forces a full-table WAL entry (MarkDirtyFrom(-1)) or records an
+// in-place row replacement (MarkRowUpdated) is exactly such a case, so both
+// call this instead of requiring every one of their own call sites (DELETE,
+// UPDATE, DDL, foreign-key cascades) to remember to report it separately.
+// WAL replay and replication apply rows directly without going through
+// either method, so those paths call this directly too — see
+// applyOperation in wal_advanced.go and the update-rows delta branch in
+// wal_manager.go.
+func (t *Table) noteStructuralChange() {
+	t.structVersion++
+}
+
+// StructVersion returns the current structural-change counter. See
+// noteStructuralChange's doc comment. Equality across two observations
+// proves no row indexed at the earlier observation has since changed
+// content or been removed — the table may only have grown by appending.
+func (t *Table) StructVersion() int { return t.structVersion }
 
 // DirtyFrom returns the first dirty row index, or -1 if non-append-only.
 func (t *Table) DirtyFrom() int { return t.dirtyFrom }

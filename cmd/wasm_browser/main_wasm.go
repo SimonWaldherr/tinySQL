@@ -4,8 +4,8 @@ package main
 
 import (
 	"context"
+	"encoding"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"syscall/js"
@@ -33,20 +33,90 @@ var (
 	queryCache    = tsql.NewQueryCache(wasmQueryCacheSize)
 )
 
-// QueryResult represents the result of a SQL query
-type QueryResult struct {
-	Columns []string      `json:"columns"`
-	Rows    [][]any       `json:"rows"`
-	Error   string        `json:"error,omitempty"`
-	Count   int           `json:"count"`
-	Elapsed time.Duration `json:"elapsed_ms"`
+// apiResult builds the standardized API response shape as a plain
+// map[string]any so it can be handed directly to js.FuncOf's automatic
+// js.ValueOf conversion, instead of being JSON-marshaled and re-parsed on the
+// JS side. Field names and the omitempty-style omission of empty
+// error/message match the previous APIResponse struct's `json:"..."` tags
+// exactly.
+func apiResult(success bool, errMsg, message string) map[string]any {
+	m := map[string]any{"success": success}
+	if errMsg != "" {
+		m["error"] = errMsg
+	}
+	if message != "" {
+		m["message"] = message
+	}
+	return m
 }
 
-// APIResponse represents a standardized API response
-type APIResponse struct {
-	Success bool   `json:"success"`
-	Error   string `json:"error,omitempty"`
-	Message string `json:"message,omitempty"`
+// queryResultMap builds the QueryResult response shape as a plain
+// map[string]any. columns/rows are passed through stringsToAny/rowsToAny so a
+// nil slice still round-trips as JS null (matching what json.Marshal produced
+// for a nil []string/[][]any with no `omitempty`), while a non-nil-but-empty
+// slice round-trips as an empty JS array. elapsedNs mirrors the previous
+// `Elapsed time.Duration` field: time.Duration has no MarshalJSON/MarshalText,
+// so it always serialized as a plain nanosecond count under the (mislabeled)
+// "elapsed_ms" key -- preserved here bit-for-bit rather than "fixed".
+func queryResultMap(columns []string, rows [][]any, errMsg string, count int, elapsedNs int64) map[string]any {
+	m := map[string]any{
+		"columns":    stringsToAny(columns),
+		"rows":       rowsToAny(rows),
+		"count":      count,
+		"elapsed_ms": elapsedNs,
+	}
+	if errMsg != "" {
+		m["error"] = errMsg
+	}
+	return m
+}
+
+// stringsToAny converts a []string to []any for js.ValueOf, preserving nil.
+// The return type is `any`, not `[]any`: a nil []string boxed into a []any
+// return value would still carry the concrete type []any inside the
+// interface, so js.ValueOf's `case []any:` would match it and produce an
+// empty JS array instead of `case nil:` producing JS null. Returning bare
+// `nil` from an `any`-returning function keeps it a true nil interface,
+// matching what json.Marshal produced for a nil slice (JSON null).
+func stringsToAny(ss []string) any {
+	if ss == nil {
+		return nil
+	}
+	out := make([]any, len(ss))
+	for i, s := range ss {
+		out[i] = s
+	}
+	return out
+}
+
+// rowsToAny converts a [][]any to []any for js.ValueOf, preserving nil (see
+// stringsToAny for why the return type must be `any` rather than `[]any`).
+// Each inner []any is already js.ValueOf-safe (see convertValue) and needs
+// no further conversion -- only the outer container's type needs to become
+// the literal []any that js.ValueOf recognizes.
+func rowsToAny(rows [][]any) any {
+	if rows == nil {
+		return nil
+	}
+	out := make([]any, len(rows))
+	for i, r := range rows {
+		out[i] = r
+	}
+	return out
+}
+
+// planStepsToJS converts a []PlanStep to []any of map[string]any for js.ValueOf.
+func planStepsToJS(steps []PlanStep) []any {
+	out := make([]any, len(steps))
+	for i, s := range steps {
+		out[i] = map[string]any{
+			"operation": s.Operation,
+			"object":    s.Object,
+			"cost":      s.Cost,
+			"details":   s.Details,
+		}
+	}
+	return out
 }
 
 // Logger for WASM environment
@@ -162,63 +232,63 @@ func jsOpen(this js.Value, args []js.Value) any {
 
 	if err := bindStorageDB(storage.NewDB(), dsn); err != nil {
 		logError("Failed to open database", err)
-		return jsonResponse(APIResponse{Success: false, Error: err.Error()})
+		return apiResult(false, err.Error(), "")
 	}
 
 	logInfo("Database connection established successfully")
-	return jsonResponse(APIResponse{Success: true, Message: "Database opened successfully"})
+	return apiResult(true, "", "Database opened successfully")
 }
 
 // jsExportDB serializes the current in-memory database as a base64 GOB snapshot.
 func jsExportDB(this js.Value, args []js.Value) any {
 	source := currentStorageDB()
 	if source == nil {
-		return jsonResponse(APIResponse{Success: false, Error: "database not opened"})
+		return apiResult(false, "database not opened", "")
 	}
 	data, err := storage.SaveToBytes(source)
 	if err != nil {
 		logError("Failed to export database", err)
-		return jsonResponse(APIResponse{Success: false, Error: err.Error()})
+		return apiResult(false, err.Error(), "")
 	}
-	return jsonResponse(map[string]any{
+	return map[string]any{
 		"success":    true,
 		"message":    "Database exported successfully",
 		"data":       base64.StdEncoding.EncodeToString(data),
 		"size_bytes": len(data),
-	})
+	}
 }
 
 // jsImportDB replaces the current in-memory database with a base64 GOB snapshot.
 func jsImportDB(this js.Value, args []js.Value) any {
 	if err := validateArgs(args, 1, js.TypeString); err != nil {
-		return jsonResponse(APIResponse{Success: false, Error: err.Error()})
+		return apiResult(false, err.Error(), "")
 	}
 
 	encoded := strings.TrimSpace(args[0].String())
 	if encoded == "" {
-		return jsonResponse(APIResponse{Success: false, Error: "snapshot must not be empty"})
+		return apiResult(false, "snapshot must not be empty", "")
 	}
 
 	data, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
-		return jsonResponse(APIResponse{Success: false, Error: fmt.Sprintf("invalid base64 snapshot: %v", err)})
+		return apiResult(false, fmt.Sprintf("invalid base64 snapshot: %v", err), "")
 	}
 	loaded, err := storage.LoadFromBytes(data)
 	if err != nil {
 		logError("Failed to import database", err)
-		return jsonResponse(APIResponse{Success: false, Error: err.Error()})
+		return apiResult(false, err.Error(), "")
 	}
 	if err = bindStorageDB(loaded, "mem://?tenant=default"); err != nil {
 		logError("Failed to bind imported database", err)
-		return jsonResponse(APIResponse{Success: false, Error: err.Error()})
+		return apiResult(false, err.Error(), "")
 	}
 
 	logInfo("Database snapshot imported successfully")
-	return jsonResponse(map[string]any{
+	return map[string]any{
 		"success":    true,
 		"message":    "Database imported successfully",
 		"size_bytes": len(data),
-	})
+	}
 }
 
 // jsBegin starts a new transaction
@@ -226,11 +296,11 @@ func jsBegin(this js.Value, args []js.Value) any {
 	logInfo("Starting transaction...")
 
 	if currentStorageDB() == nil {
-		return jsonResponse(APIResponse{Success: false, Error: "database not opened"})
+		return apiResult(false, "database not opened", "")
 	}
 
 	if transactionDB != nil {
-		return jsonResponse(APIResponse{Success: false, Error: "transaction already active"})
+		return apiResult(false, "transaction already active", "")
 	}
 
 	// A snapshot copy keeps the browser API transactional without linking the
@@ -238,37 +308,39 @@ func jsBegin(this js.Value, args []js.Value) any {
 	snapshot, err := storage.SaveToBytes(wasmStorageDB)
 	if err != nil {
 		logError("Failed to snapshot transaction", err)
-		return jsonResponse(APIResponse{Success: false, Error: err.Error()})
+		return apiResult(false, err.Error(), "")
 	}
 	transactionDB, err = storage.LoadFromBytes(snapshot)
 	if err != nil {
 		logError("Failed to open transaction snapshot", err)
-		return jsonResponse(APIResponse{Success: false, Error: err.Error()})
+		return apiResult(false, err.Error(), "")
 	}
 
 	logInfo("Transaction started successfully")
-	return jsonResponse(APIResponse{Success: true, Message: "Transaction started"})
+	return apiResult(true, "", "Transaction started")
+}
+
+// PlanStep is one step of the simplified EXPLAIN plan built by jsExplain.
+type PlanStep struct {
+	Operation string `json:"operation"`
+	Object    string `json:"object"`
+	Cost      string `json:"cost"`
+	Details   string `json:"details"`
 }
 
 // jsExplain returns a simple query plan for a given SQL string.
 func jsExplain(this js.Value, args []js.Value) any {
 	if len(args) < 1 || args[0].Type() != js.TypeString {
-		return jsonResponse(APIResponse{Success: false, Error: "sql string required"})
+		return apiResult(false, "sql string required", "")
 	}
 	sqlStr := args[0].String()
 
 	stmt, err := tsql.ParseSQL(sqlStr)
 	if err != nil {
-		return jsonResponse(map[string]any{"error": err.Error()})
+		return map[string]any{"error": err.Error()}
 	}
 
 	// Build a simple plan representation
-	type PlanStep struct {
-		Operation string `json:"operation"`
-		Object    string `json:"object"`
-		Cost      string `json:"cost"`
-		Details   string `json:"details"`
-	}
 	plan := make([]PlanStep, 0)
 
 	switch s := stmt.(type) {
@@ -311,14 +383,14 @@ func jsExplain(this js.Value, args []js.Value) any {
 		plan = append(plan, PlanStep{Operation: "UNKNOWN", Object: "-", Cost: "-", Details: "Cannot build plan for this statement type"})
 	}
 
-	return jsonResponse(map[string]any{"plan": plan})
+	return map[string]any{"plan": planStepsToJS(plan)}
 }
 
 // jsListTables returns all table names in the current storage DB tenant.
 func jsListTables(this js.Value, args []js.Value) any {
 	source := currentStorageDB()
 	if source == nil {
-		return jsonResponse(map[string]any{"error": "database not initialized"})
+		return map[string]any{"error": "database not initialized"}
 	}
 	tenant := wasmTenant
 	if len(args) > 0 && args[0].Type() == js.TypeString {
@@ -329,17 +401,17 @@ func jsListTables(this js.Value, args []js.Value) any {
 	for _, t := range tables {
 		names = append(names, t.Name)
 	}
-	return jsonResponse(map[string]any{"tables": names})
+	return map[string]any{"tables": stringsToAny(names)}
 }
 
 // jsDescribeTable returns column information for a given table.
 func jsDescribeTable(this js.Value, args []js.Value) any {
 	source := currentStorageDB()
 	if source == nil {
-		return jsonResponse(map[string]any{"error": "database not initialized"})
+		return map[string]any{"error": "database not initialized"}
 	}
 	if len(args) < 1 || args[0].Type() != js.TypeString {
-		return jsonResponse(map[string]any{"error": "table name required"})
+		return map[string]any{"error": "table name required"}
 	}
 	tenant := wasmTenant
 	tableName := args[0].String()
@@ -348,13 +420,13 @@ func jsDescribeTable(this js.Value, args []js.Value) any {
 	}
 	t, err := source.Get(tenant, tableName)
 	if err != nil || t == nil {
-		return jsonResponse(map[string]any{"error": fmt.Sprintf("table %s not found", tableName)})
+		return map[string]any{"error": fmt.Sprintf("table %s not found", tableName)}
 	}
-	cols := make([]map[string]any, 0, len(t.Cols))
+	cols := make([]any, 0, len(t.Cols))
 	for _, c := range t.Cols {
 		cols = append(cols, map[string]any{"name": c.Name, "type": c.Type.String(), "primary": c.Constraint == storage.PrimaryKey})
 	}
-	return jsonResponse(map[string]any{"table": tableName, "columns": cols, "rows": len(t.Rows)})
+	return map[string]any{"table": tableName, "columns": cols, "rows": len(t.Rows)}
 }
 
 // jsCommit commits the current transaction
@@ -362,13 +434,13 @@ func jsCommit(this js.Value, args []js.Value) any {
 	logInfo("Committing transaction...")
 
 	if transactionDB == nil {
-		return jsonResponse(APIResponse{Success: false, Error: "no active transaction"})
+		return apiResult(false, "no active transaction", "")
 	}
 
 	wasmStorageDB = transactionDB
 	transactionDB = nil
 	logInfo("Transaction committed successfully")
-	return jsonResponse(APIResponse{Success: true, Message: "Transaction committed"})
+	return apiResult(true, "", "Transaction committed")
 }
 
 // jsRollback rolls back the current transaction
@@ -376,22 +448,22 @@ func jsRollback(this js.Value, args []js.Value) any {
 	logInfo("Rolling back transaction...")
 
 	if transactionDB == nil {
-		return jsonResponse(APIResponse{Success: false, Error: "no active transaction"})
+		return apiResult(false, "no active transaction", "")
 	}
 
 	transactionDB = nil
 	logInfo("Transaction rolled back successfully")
-	return jsonResponse(APIResponse{Success: true, Message: "Transaction rolled back"})
+	return apiResult(true, "", "Transaction rolled back")
 }
 
 // jsExec executes a SQL statement
 func jsExec(this js.Value, args []js.Value) any {
 	if err := validateArgs(args, 1, js.TypeString); err != nil {
-		return jsonResponse(APIResponse{Success: false, Error: err.Error()})
+		return apiResult(false, err.Error(), "")
 	}
 
 	if currentStorageDB() == nil {
-		return jsonResponse(APIResponse{Success: false, Error: "database not opened"})
+		return apiResult(false, "database not opened", "")
 	}
 
 	sqlStr := args[0].String()
@@ -414,27 +486,24 @@ func jsExec(this js.Value, args []js.Value) any {
 
 	if err != nil {
 		logError("SQL execution failed", err)
-		return jsonResponse(APIResponse{Success: false, Error: err.Error()})
+		return apiResult(false, err.Error(), "")
 	}
 
 	rowsAffected := resultRowsAffected(result)
 
 	logInfo(fmt.Sprintf("SQL executed successfully in %v, rows affected: %d", elapsed, rowsAffected))
 
-	return jsonResponse(APIResponse{
-		Success: true,
-		Message: fmt.Sprintf("Executed successfully. Rows affected: %d, Elapsed: %v", rowsAffected, elapsed),
-	})
+	return apiResult(true, "", fmt.Sprintf("Executed successfully. Rows affected: %d, Elapsed: %v", rowsAffected, elapsed))
 }
 
 // jsQuery executes a SQL query and returns results
 func jsQuery(this js.Value, args []js.Value) any {
 	if err := validateArgs(args, 1, js.TypeString); err != nil {
-		return jsonResponse(QueryResult{Error: err.Error()})
+		return queryResultMap(nil, nil, err.Error(), 0, 0)
 	}
 
 	if currentStorageDB() == nil {
-		return jsonResponse(QueryResult{Error: "database not opened"})
+		return queryResultMap(nil, nil, "database not opened", 0, 0)
 	}
 
 	sqlStr := args[0].String()
@@ -444,17 +513,14 @@ func jsQuery(this js.Value, args []js.Value) any {
 	resultSet, err := executeWASMStatement(sqlStr)
 	if err != nil {
 		logError("Query execution failed", err)
-		return jsonResponse(QueryResult{Error: err.Error()})
+		return queryResultMap(nil, nil, err.Error(), 0, 0)
 	}
 	if resultSet == nil {
 		resultSet = &tsql.ResultSet{}
 	}
 
-	// Prepare result structure
-	result := QueryResult{
-		Columns: resultSet.Cols,
-		Rows:    make([][]any, 0, len(resultSet.Rows)),
-	}
+	// Prepare result rows
+	rows := make([][]any, 0, len(resultSet.Rows))
 
 	lowerColumns := make([]string, len(resultSet.Cols))
 	for i, column := range resultSet.Cols {
@@ -465,15 +531,15 @@ func jsQuery(this js.Value, args []js.Value) any {
 		for i, column := range lowerColumns {
 			row[i] = convertValue(sourceRow[column])
 		}
-		result.Rows = append(result.Rows, row)
+		rows = append(rows, row)
 	}
 
-	result.Count = len(result.Rows)
-	result.Elapsed = time.Since(start)
+	count := len(rows)
+	elapsed := time.Since(start)
 
-	logInfo(fmt.Sprintf("Query executed successfully in %v, returned %d rows", result.Elapsed, result.Count))
+	logInfo(fmt.Sprintf("Query executed successfully in %v, returned %d rows", elapsed, count))
 
-	return jsonResponse(result)
+	return queryResultMap(resultSet.Cols, rows, "", count, int64(elapsed))
 }
 
 // jsClose closes the database connection
@@ -486,7 +552,7 @@ func jsClose(this js.Value, args []js.Value) any {
 	queryCache.Clear()
 
 	logInfo("Database connection closed successfully")
-	return jsonResponse(APIResponse{Success: true, Message: "Database closed"})
+	return apiResult(true, "", "Database closed")
 }
 
 // jsStatus returns the current status of the database
@@ -506,12 +572,18 @@ func jsStatus(this js.Value, args []js.Value) any {
 		}
 	}
 
-	return jsonResponse(status)
+	return status
 }
 
 // Helper functions
 
-// convertValue converts database values to JSON-compatible types
+// convertValue converts database row values directly into types accepted by
+// syscall/js.ValueOf, reproducing the same display semantics the previous
+// json.Marshal-based path produced for each concrete type: []byte and
+// time.Time keep their bespoke formatting, and any other value that isn't
+// already one of ValueOf's native scalar kinds gets the same text
+// json.Marshal would have produced via encoding.TextMarshaler (e.g. *big.Rat
+// for DECIMAL/MONEY, uuid.UUID) or, failing that, a fmt.Sprintf fallback.
 func convertValue(val any) any {
 	if val == nil {
 		return nil
@@ -524,8 +596,18 @@ func convertValue(val any) any {
 		return convertValue(*v)
 	case time.Time:
 		return v.Format(time.RFC3339)
-	default:
+	case string, bool,
+		int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64,
+		float32, float64:
 		return v
+	case encoding.TextMarshaler:
+		if text, err := v.MarshalText(); err == nil {
+			return string(text)
+		}
+		return fmt.Sprintf("%v", val)
+	default:
+		return fmt.Sprintf("%v", val)
 	}
 }
 
@@ -544,16 +626,6 @@ func resultRowsAffected(result *tsql.ResultSet) int {
 		}
 	}
 	return len(result.Rows)
-}
-
-// jsonResponse marshals any value to JSON string
-func jsonResponse(v any) string {
-	b, err := json.Marshal(v)
-	if err != nil {
-		logError("Failed to marshal JSON response", err)
-		return `{"error":"internal JSON marshaling error"}`
-	}
-	return string(b)
 }
 
 // registerAPI registers all API functions with JavaScript
