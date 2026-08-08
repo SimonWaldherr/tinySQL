@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -129,6 +130,142 @@ func TestConstraintIndexSurvivesDropAndRecreate(t *testing.T) {
 	execConstraintSQL(t, ctx, db, "INSERT INTO t VALUES (1)")
 	rs := queryConstraintSQL(t, ctx, db, "SELECT COUNT(*) as n FROM t")
 	expectInt(t, rs.Rows[0]["n"], 1, "row count in recreated table")
+}
+
+// TestColumnConstraintsUpdateStillRejectsChangedColumnViolation guards the
+// UPDATE-time scoping of validateRowConstraints to changed columns: when a
+// statement changes both an unconstrained column and a UNIQUE column in the
+// same row, a genuine violation on the UNIQUE column must still be caught
+// exactly as if every column were re-validated from scratch, and the row
+// must be left untouched by the rejected statement.
+func TestColumnConstraintsUpdateStillRejectsChangedColumnViolation(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	execConstraintSQL(t, ctx, db, "CREATE TABLE accounts (id INT PRIMARY KEY, email TEXT UNIQUE, note TEXT)")
+	execConstraintSQL(t, ctx, db, "INSERT INTO accounts VALUES (1, 'a@example.test', 'x'), (2, 'b@example.test', 'y')")
+
+	// note is unconstrained; email is UNIQUE and collides with row 1's value.
+	// Both are changed by the same statement, so the UNIQUE violation must
+	// still surface.
+	expectConstraintErr(t, ctx, db, "UPDATE accounts SET note = 'z', email = 'a@example.test' WHERE id = 2", "UNIQUE")
+
+	rs := queryConstraintSQL(t, ctx, db, "SELECT email, note FROM accounts WHERE id = 2")
+	if len(rs.Rows) != 1 || rs.Rows[0]["email"] != "b@example.test" || rs.Rows[0]["note"] != "y" {
+		t.Fatalf("failed update mutated row: %#v", rs.Rows)
+	}
+}
+
+// TestForeignKeyConstraintStillCatchesChangedColumnViolationAmongMultipleSets
+// is the FOREIGN KEY analogue of the test above: parent_id is the changed,
+// violating column; label is a second changed-but-unconstrained column in
+// the same statement. The FK violation must still block the whole update.
+func TestForeignKeyConstraintStillCatchesChangedColumnViolationAmongMultipleSets(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	execConstraintSQL(t, ctx, db, "CREATE TABLE parents (id INT PRIMARY KEY)")
+	execConstraintSQL(t, ctx, db, "INSERT INTO parents VALUES (1), (2)")
+	execConstraintSQL(t, ctx, db, "CREATE TABLE children (id INT PRIMARY KEY, parent_id INT FOREIGN KEY REFERENCES parents(id), label TEXT)")
+	execConstraintSQL(t, ctx, db, "INSERT INTO children VALUES (10, 1, 'a')")
+
+	expectConstraintErr(t, ctx, db, "UPDATE children SET label = 'b', parent_id = 99 WHERE id = 10", "FOREIGN KEY")
+
+	rs := queryConstraintSQL(t, ctx, db, "SELECT parent_id, label FROM children WHERE id = 10")
+	if len(rs.Rows) != 1 || rs.Rows[0]["parent_id"] != 1 || rs.Rows[0]["label"] != "a" {
+		t.Fatalf("failed foreign-key update mutated row: %#v", rs.Rows)
+	}
+}
+
+// TestColumnConstraintsSameValueSetIsNotTreatedAsChanged guards the "did the
+// value actually change" diff itself: a SET clause that assigns a UNIQUE
+// column back to the value it already holds must not be treated as a
+// change (and in particular must not spuriously self-conflict), while a
+// real duplicate must still be rejected.
+func TestColumnConstraintsSameValueSetIsNotTreatedAsChanged(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	execConstraintSQL(t, ctx, db, "CREATE TABLE accounts (id INT PRIMARY KEY, email TEXT UNIQUE)")
+	execConstraintSQL(t, ctx, db, "INSERT INTO accounts VALUES (1, 'a@example.test'), (2, 'b@example.test')")
+
+	// Setting email back to its own current value must succeed.
+	execConstraintSQL(t, ctx, db, "UPDATE accounts SET email = 'a@example.test' WHERE id = 1")
+
+	// Setting it to someone else's value must still fail.
+	expectConstraintErr(t, ctx, db, "UPDATE accounts SET email = 'b@example.test' WHERE id = 1", "UNIQUE")
+}
+
+// TestValidateRowConstraintsDoesNotScaleWithUntouchedColumns is the
+// alloc-count regression guard for scoping validateRowConstraints to
+// changed columns during UPDATE. Before that scoping, every UNIQUE/PRIMARY
+// KEY/FOREIGN KEY column on the table paid for a constraint-index lookup
+// (and the interface-boxing comparableKeyPart does to use its value as a
+// map key) regardless of whether the statement's SET clauses touched it.
+//
+// This calls validateRowConstraints directly (white-box, same package)
+// rather than going through a full UPDATE statement, deliberately: routing
+// through Execute would also measure buildSimpleUpdatePlan/simpleColumnIndex
+// rebuilding a column-name index over every column on every call, which
+// scales with total column count for reasons unrelated to this stage and
+// would swamp the signal this test is after. Passing changedCols directly
+// isolates exactly the function this stage changed.
+func TestValidateRowConstraintsDoesNotScaleWithUntouchedColumns(t *testing.T) {
+	build := func(numUniqueCols int) (ExecEnv, *storage.Table, []any, int) {
+		db := storage.NewDB()
+		ctx := context.Background()
+
+		cols := "id INT PRIMARY KEY, touched INT"
+		vals := "1, 0"
+		for i := 0; i < numUniqueCols; i++ {
+			cols += fmt.Sprintf(", u%d TEXT UNIQUE", i)
+			vals += fmt.Sprintf(", 'v%d'", i)
+		}
+		execConstraintSQL(t, ctx, db, "CREATE TABLE scale_test ("+cols+")")
+		execConstraintSQL(t, ctx, db, "INSERT INTO scale_test VALUES ("+vals+")")
+
+		tbl, err := db.Get("default", "scale_test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		touchedIdx, err := tbl.ColIndex("touched")
+		if err != nil {
+			t.Fatal(err)
+		}
+		env := ExecEnv{ctx: ctx, tenant: "default", db: db}
+		row := append([]any(nil), tbl.Rows[0]...)
+		row[touchedIdx] = 999
+
+		// Warm the PRIMARY KEY column's constraint index so the measured
+		// calls don't pay for its one-time build, mirroring a real UPDATE
+		// that already ran the full check once via INSERT.
+		if err := validateRowConstraints(env, tbl, row, 0, nil); err != nil {
+			t.Fatal(err)
+		}
+		return env, tbl, row, touchedIdx
+	}
+
+	measure := func(numUniqueCols int) float64 {
+		env, tbl, row, touchedIdx := build(numUniqueCols)
+		changedCols := []int{touchedIdx}
+		return testing.AllocsPerRun(50, func() {
+			if err := validateRowConstraints(env, tbl, row, 0, changedCols); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+
+	few := measure(1)
+	many := measure(8)
+
+	// A generous tolerance: the point is "flat", not "identical to the last
+	// decimal place". Before scoping to changed columns, each of the 7 extra
+	// untouched UNIQUE columns cost at least one allocation (comparableKeyPart
+	// reboxing a string for the map lookup), so checking every column
+	// (changedCols == nil) here would fail this by a wide margin.
+	if many > few+2 {
+		t.Fatalf("allocs/op scaled with untouched UNIQUE column count: 1 untouched col=%.1f allocs, 8 untouched cols=%.1f allocs", few, many)
+	}
 }
 
 func execConstraintSQL(t *testing.T, ctx context.Context, db *storage.DB, sql string) {

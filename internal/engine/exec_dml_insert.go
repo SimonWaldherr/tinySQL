@@ -70,7 +70,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 			}
 			row[i] = cv
 		}
-		if err := validateRowConstraints(env, t, row, -1); err != nil {
+		if err := validateRowConstraints(env, t, row, -1, nil); err != nil {
 			return nil, err
 		}
 		if err := t.CheckSecondaryIndexConstraints(row, -1); err != nil {
@@ -163,7 +163,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			}
 			row[idx] = cv
 		}
-		if err := validateRowConstraints(env, t, row, -1); err != nil {
+		if err := validateRowConstraints(env, t, row, -1, nil); err != nil {
 			return nil, err
 		}
 		if err := t.CheckSecondaryIndexConstraints(row, -1); err != nil {
@@ -228,51 +228,87 @@ func applyColumnDefaults(row []any, cols []storage.Column) error {
 	return nil
 }
 
-func validateRowConstraints(env ExecEnv, t *storage.Table, row []any, excludeRow int) error {
-	for colIdx, col := range t.Cols {
-		if colIdx >= len(row) {
-			return fmt.Errorf("row missing constrained column %q", col.Name)
+// validateRowConstraints checks row's constrained columns (NOT NULL,
+// PRIMARY KEY, UNIQUE, FOREIGN KEY) against t's schema.
+//
+// changedCols controls which columns are actually checked:
+//   - nil means "every constrained column", which INSERT always passes since
+//     a freshly-built row has no prior state to diff against and every
+//     column's value is new.
+//   - a non-nil slice (empty or not) restricts the check to just those column
+//     indices. UPDATE call sites use this: a column whose value didn't
+//     change by this statement was already valid before it ran (nothing else
+//     in the same statement can have invalidated it — see the call sites for
+//     why), so re-validating it is redundant work, including the FOREIGN KEY
+//     case's db.Get/ColIndex/constraint-index lookup against the referenced
+//     table. Byte-identical error behavior versus the pre-scoping full scan
+//     requires changedCols to be sorted ascending: this function still visits
+//     columns in that order, matching the original range over t.Cols, so
+//     when more than one changed column is in violation the same one wins.
+func validateRowConstraints(env ExecEnv, t *storage.Table, row []any, excludeRow int, changedCols []int) error {
+	if changedCols == nil {
+		for colIdx := range t.Cols {
+			if err := validateOneRowConstraint(env, t, row, excludeRow, colIdx); err != nil {
+				return err
+			}
 		}
-		val := row[colIdx]
-		if col.NotNull && isNull(val) {
-			return fmt.Errorf("NOT NULL column %q cannot be NULL", col.Name)
+		return nil
+	}
+	for _, colIdx := range changedCols {
+		if err := validateOneRowConstraint(env, t, row, excludeRow, colIdx); err != nil {
+			return err
 		}
-		if col.Constraint == storage.NoConstraint {
-			continue
+	}
+	return nil
+}
+
+// validateOneRowConstraint is validateRowConstraints's per-column body,
+// factored out so the "check everything" (INSERT) and "check only the
+// changed columns" (UPDATE) loops share identical logic and error text.
+func validateOneRowConstraint(env ExecEnv, t *storage.Table, row []any, excludeRow int, colIdx int) error {
+	col := t.Cols[colIdx]
+	if colIdx >= len(row) {
+		return fmt.Errorf("row missing constrained column %q", col.Name)
+	}
+	val := row[colIdx]
+	if col.NotNull && isNull(val) {
+		return fmt.Errorf("NOT NULL column %q cannot be NULL", col.Name)
+	}
+	if col.Constraint == storage.NoConstraint {
+		return nil
+	}
+	switch col.Constraint {
+	case storage.PrimaryKey:
+		if isNull(val) {
+			return fmt.Errorf("PRIMARY KEY column %q cannot be NULL", col.Name)
 		}
-		switch col.Constraint {
-		case storage.PrimaryKey:
-			if isNull(val) {
-				return fmt.Errorf("PRIMARY KEY column %q cannot be NULL", col.Name)
-			}
-			if constraintValueExists(t, colIdx, val, excludeRow) {
-				return fmt.Errorf("duplicate PRIMARY KEY value for column %q", col.Name)
-			}
-		case storage.Unique:
-			if isNull(val) {
-				continue
-			}
-			if constraintValueExists(t, colIdx, val, excludeRow) {
-				return fmt.Errorf("duplicate UNIQUE value for column %q", col.Name)
-			}
-		case storage.ForeignKey:
-			if isNull(val) {
-				continue
-			}
-			if col.ForeignKey == nil {
-				return fmt.Errorf("FOREIGN KEY column %q has no reference target", col.Name)
-			}
-			refTable, err := env.db.Get(env.tenant, col.ForeignKey.Table)
-			if err != nil {
-				return fmt.Errorf("FOREIGN KEY column %q references missing table %q", col.Name, col.ForeignKey.Table)
-			}
-			refIdx, err := refTable.ColIndex(col.ForeignKey.Column)
-			if err != nil {
-				return fmt.Errorf("FOREIGN KEY column %q references missing column %q.%q", col.Name, col.ForeignKey.Table, col.ForeignKey.Column)
-			}
-			if !constraintValueExists(refTable, refIdx, val, -1) {
-				return fmt.Errorf("FOREIGN KEY violation on column %q: value %v not found in %s.%s", col.Name, val, col.ForeignKey.Table, col.ForeignKey.Column)
-			}
+		if constraintValueExists(t, colIdx, val, excludeRow) {
+			return fmt.Errorf("duplicate PRIMARY KEY value for column %q", col.Name)
+		}
+	case storage.Unique:
+		if isNull(val) {
+			return nil
+		}
+		if constraintValueExists(t, colIdx, val, excludeRow) {
+			return fmt.Errorf("duplicate UNIQUE value for column %q", col.Name)
+		}
+	case storage.ForeignKey:
+		if isNull(val) {
+			return nil
+		}
+		if col.ForeignKey == nil {
+			return fmt.Errorf("FOREIGN KEY column %q has no reference target", col.Name)
+		}
+		refTable, err := env.db.Get(env.tenant, col.ForeignKey.Table)
+		if err != nil {
+			return fmt.Errorf("FOREIGN KEY column %q references missing table %q", col.Name, col.ForeignKey.Table)
+		}
+		refIdx, err := refTable.ColIndex(col.ForeignKey.Column)
+		if err != nil {
+			return fmt.Errorf("FOREIGN KEY column %q references missing column %q.%q", col.Name, col.ForeignKey.Table, col.ForeignKey.Column)
+		}
+		if !constraintValueExists(refTable, refIdx, val, -1) {
+			return fmt.Errorf("FOREIGN KEY violation on column %q: value %v not found in %s.%s", col.Name, val, col.ForeignKey.Table, col.ForeignKey.Column)
 		}
 	}
 	return nil

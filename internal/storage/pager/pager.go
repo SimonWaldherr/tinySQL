@@ -557,7 +557,18 @@ func (p *Pager) WritePage(txID TxID, id PageID, buf []byte) error {
 		f = &PageFrame{id: id, buf: make([]byte, p.pageSize)}
 		p.pool.put(f)
 	}
-	copy(f.buf, buf)
+	// When the frame was already cached, the caller may have obtained buf via
+	// ReadPage (which hands out the frame's own backing array) and mutated it
+	// in place before calling WritePage with that same slice. In that case
+	// f.buf and buf share a backing array and the copy is a full page-size
+	// no-op. Detect that by comparing the address of each slice's first
+	// element -- valid without unsafe -- rather than assuming aliasing from
+	// ok alone: some call sites pass a freshly built buffer even for an
+	// already-cached page id, and that case must still be copied.
+	aliased := ok && len(f.buf) > 0 && len(buf) > 0 && &f.buf[0] == &buf[0]
+	if !aliased {
+		copy(f.buf, buf)
+	}
 	f.dirty = true
 	f.lsn = lsn
 	p.pool.mu.Unlock()

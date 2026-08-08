@@ -246,7 +246,7 @@ func setNullForeignKeyReference(env ExecEnv, ref fkReference, changes map[any]fk
 		before := append([]any(nil), child.Rows[rowID]...)
 		after := append([]any(nil), before...)
 		after[ref.childColIdx] = nil
-		if err := validateRowConstraints(env, child, after, rowID); err != nil {
+		if err := validateRowConstraints(env, child, after, rowID, nil); err != nil {
 			return err
 		}
 		if err := child.CheckSecondaryIndexConstraints(after, rowID); err != nil {

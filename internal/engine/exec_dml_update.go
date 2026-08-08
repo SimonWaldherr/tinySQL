@@ -72,6 +72,15 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 				}
 			}
 			nextRow := append([]any(nil), t.Rows[ri]...)
+			// changedCols scopes constraint validation below to columns whose
+			// value this statement actually altered on this row: an untouched
+			// column's existing value was already valid before this UPDATE
+			// and nothing else in this loop iteration can have invalidated
+			// it, so re-checking it (including, for FOREIGN KEY, a lookup
+			// against the referenced table) is redundant. Sorted ascending
+			// so that when more than one changed column is in violation, the
+			// same one wins as when every column was checked in t.Cols order.
+			changedCols := make([]int, 0, len(setIdx))
 			for i, ex := range setIdx {
 				v, err := evalExpr(env, ex, row)
 				if err != nil {
@@ -81,9 +90,13 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 				if err != nil {
 					return nil, err
 				}
+				if !rawEqual(t.Rows[ri][i], cv) {
+					changedCols = append(changedCols, i)
+				}
 				nextRow[i] = cv
 			}
-			if err := validateRowConstraints(env, t, nextRow, ri); err != nil {
+			sort.Ints(changedCols)
+			if err := validateRowConstraints(env, t, nextRow, ri, changedCols); err != nil {
 				return nil, err
 			}
 			if err := t.CheckSecondaryIndexConstraints(nextRow, ri); err != nil {
@@ -227,10 +240,17 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 			values[i] = cv
 		}
 		nextRow := append([]any(nil), raw...)
+		// See the identical comment in executeUpdate: only columns whose
+		// value this row's SET clauses actually changed need re-validating.
+		changedCols := make([]int, 0, len(plan.sets))
 		for i, set := range plan.sets {
+			if !rawEqual(raw[set.col], values[i]) {
+				changedCols = append(changedCols, set.col)
+			}
 			nextRow[set.col] = values[i]
 		}
-		if err := validateRowConstraints(env, plan.table, nextRow, ri); err != nil {
+		sort.Ints(changedCols)
+		if err := validateRowConstraints(env, plan.table, nextRow, ri, changedCols); err != nil {
 			return nil, true, err
 		}
 		if err := plan.table.CheckSecondaryIndexConstraints(nextRow, ri); err != nil {
