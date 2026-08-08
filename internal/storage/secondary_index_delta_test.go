@@ -42,7 +42,7 @@ func TestSecondaryIndexDeltasMaintainLookupAndDeleteRowMapping(t *testing.T) {
 
 	inserted := []any{3, "a"}
 	table.Rows = append(table.Rows, inserted)
-	if err := table.InsertSecondaryIndexRow(2, inserted); err != nil {
+	if err := table.InsertSecondaryIndexRow(2, inserted, table.SortedIndexNames()); err != nil {
 		t.Fatal(err)
 	}
 	index := table.FindSecondaryIndex([]string{"kind"})
@@ -53,7 +53,7 @@ func TestSecondaryIndexDeltasMaintainLookupAndDeleteRowMapping(t *testing.T) {
 
 	before, after := table.Rows[2], []any{3, "c"}
 	table.Rows[2] = after
-	if err := table.UpdateSecondaryIndexRow(2, before, after); err != nil {
+	if err := table.UpdateSecondaryIndexRow(2, before, after, table.SortedIndexNames()); err != nil {
 		t.Fatal(err)
 	}
 	rows, _ = table.LookupSecondaryIndexPoint(index, []any{"a"})

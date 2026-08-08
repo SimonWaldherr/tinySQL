@@ -187,6 +187,14 @@ type AdvancedWAL struct {
 	// predates a checkpoint from a previous run.
 	checkpointDataWatermark LSN
 
+	// loggedTables tracks, for this AdvancedWAL instance's lifetime, every
+	// (tenant, table) pair whose first Insert/Update record has already been
+	// logged with WALRecord.Columns populated -- see loggedColumnsFor's doc
+	// comment for why only that first record needs it. Lazily initialized by
+	// loggedColumnsFor; a nil map (the zero value, e.g. a bare &AdvancedWAL{}
+	// in a test that never logs anything) is never dereferenced.
+	loggedTables map[tableKey]struct{}
+
 	// epoch identifies which "incarnation" of this WAL/checkpoint pair a
 	// replica is talking to: a random, non-zero value minted once, the
 	// first time OpenAdvancedWAL creates wal.path fresh (see
@@ -392,6 +400,53 @@ func (w *AdvancedWAL) LogBegin(txID TxID) (LSN, error) {
 	return lsn, nil
 }
 
+// tableKey identifies a table within a tenant, for AdvancedWAL.loggedTables
+// (see loggedColumnsFor).
+type tableKey struct {
+	tenant string
+	table  string
+}
+
+// loggedColumnsFor reports whether an Insert/Update record about to be
+// logged for (tenant, table) must carry its full column schema in
+// WALRecord.Columns, returning cols verbatim if so and nil otherwise. Must
+// be called with w.mu held (LogInsert/LogUpdate already hold it).
+//
+// applyOperation (below) reads record.Columns in exactly one place: the
+// "table doesn't exist yet on the applying side" bootstrap branch, entered
+// only for WALOpInsert/WALOpUpdate (a delete can never bootstrap-create a
+// table -- see LogDelete, which never populates Columns at all). Once that
+// branch has fired once for a table -- whether during this process's own
+// crash recovery (Recover) or on a replication feed's receiving end
+// (ApplyWALRecord, wal_feed.go) -- every later checkpoint snapshot (a full
+// DB snapshot, never a WAL replay) is guaranteed to already contain that
+// table, so no later record for it can ever hit the bootstrap branch again.
+// loggedTables tracks, for this AdvancedWAL instance's lifetime, which
+// (tenant, table) pairs have already had their first Insert/Update logged
+// with Columns populated, so every following record for that table can
+// safely omit it -- avoiding a gob encode of the full column descriptor
+// (names, types, constraints, foreign key pointers) on every single
+// row-level record, the overwhelming common case.
+//
+// This is deliberately per-process, not persisted or derived from
+// checkpoint state: a fresh AdvancedWAL instance (e.g. after a restart)
+// starts with an empty map and will redundantly re-populate Columns on the
+// very next Insert/Update per table even when that table already existed
+// before the restart -- one wasted encode per table per process lifetime at
+// worst, never a correctness problem, and far cheaper than the per-row cost
+// this replaces.
+func (w *AdvancedWAL) loggedColumnsFor(tenant, table string, cols []Column) []Column {
+	if w.loggedTables == nil {
+		w.loggedTables = make(map[tableKey]struct{})
+	}
+	key := tableKey{tenant, table}
+	if _, seen := w.loggedTables[key]; seen {
+		return nil
+	}
+	w.loggedTables[key] = struct{}{}
+	return cols
+}
+
 // LogInsert logs a row insertion.
 func (w *AdvancedWAL) LogInsert(txID TxID, tenant, table string, rowID int64, data []any, cols []Column) (LSN, error) {
 	w.mu.Lock()
@@ -408,7 +463,7 @@ func (w *AdvancedWAL) LogInsert(txID TxID, tenant, table string, rowID int64, da
 		Table:      table,
 		RowID:      rowID,
 		AfterImage: data,
-		Columns:    cols,
+		Columns:    w.loggedColumnsFor(tenant, table, cols),
 		Timestamp:  time.Now(),
 	}
 	record.Checksum = w.calculateChecksum(record)
@@ -442,7 +497,7 @@ func (w *AdvancedWAL) LogUpdate(txID TxID, tenant, table string, rowID int64, be
 		RowID:       rowID,
 		BeforeImage: before,
 		AfterImage:  after,
-		Columns:     cols,
+		Columns:     w.loggedColumnsFor(tenant, table, cols),
 		Timestamp:   time.Now(),
 	}
 	record.Checksum = w.calculateChecksum(record)
@@ -460,6 +515,13 @@ func (w *AdvancedWAL) LogUpdate(txID TxID, tenant, table string, rowID int64, be
 }
 
 // LogDelete logs a row deletion.
+//
+// cols is accepted for API symmetry with LogInsert/LogUpdate (existing
+// callers pass it) but deliberately never stored on the record: applyOperation
+// (below) only ever reads record.Columns in its bootstrap branch for
+// WALOpInsert/WALOpUpdate -- a delete falls through to "ignore delete/update
+// for non-existent table" and never creates anything, so no delete record,
+// first-for-its-table or not, ever needs its schema.
 func (w *AdvancedWAL) LogDelete(txID TxID, tenant, table string, rowID int64, before []any, cols []Column) (LSN, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -475,7 +537,6 @@ func (w *AdvancedWAL) LogDelete(txID TxID, tenant, table string, rowID int64, be
 		Table:       table,
 		RowID:       rowID,
 		BeforeImage: before,
-		Columns:     cols,
 		Timestamp:   time.Now(),
 	}
 	record.Checksum = w.calculateChecksum(record)

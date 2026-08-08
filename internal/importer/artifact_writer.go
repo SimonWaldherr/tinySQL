@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"time"
 
@@ -247,7 +248,11 @@ func syncArtifactTree(root string) error {
 	names := append([]string{"manifest.json"}, artifactDataFileNames(root)...)
 	names = append(names, "checksums.sha256", "COMPLETE")
 	for _, name := range names {
-		f, err := os.OpenFile(filepath.Join(root, name), os.O_RDONLY, 0)
+		// Opened O_RDWR (not O_RDONLY) purely so Sync has a handle with write
+		// access: on Windows, FlushFileBuffers requires GENERIC_WRITE and
+		// fails with "Access is denied" on a read-only handle, even though
+		// the equivalent fsync on Unix accepts a read-only fd.
+		f, err := os.OpenFile(filepath.Join(root, name), os.O_RDWR, 0)
 		if err != nil {
 			return err
 		}
@@ -258,6 +263,12 @@ func syncArtifactTree(root string) error {
 		if err = f.Close(); err != nil {
 			return err
 		}
+	}
+	if runtime.GOOS == "windows" {
+		// Directory fsync is not portable on Windows (FlushFileBuffers on a
+		// directory handle fails with "Access is denied"); the per-file
+		// syncs above already made each file's own contents durable.
+		return nil
 	}
 	d, err := os.Open(root)
 	if err != nil {

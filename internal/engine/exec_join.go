@@ -130,9 +130,12 @@ func processInnerJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) 
 
 	// Fall back to original nested loop for small datasets
 	joined := make([]Row, 0, len(leftRows)*len(rightRows)/4) // Estimate result size
-	for _, l := range leftRows {
-		if err := checkCtx(env.ctx); err != nil {
-			return nil, err
+	for i, l := range leftRows {
+		// Check context cancellation every 64 rows to reduce channel-select overhead.
+		if i&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, err
+			}
 		}
 		for _, r := range rightRows {
 			m := mergeRows(l, r)
@@ -173,9 +176,12 @@ func processLeftJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr, r
 
 	// Fall back to original nested loop for small datasets
 	joined := make([]Row, 0, len(leftRows)) // At least one row per left row
-	for _, l := range leftRows {
-		if err := checkCtx(env.ctx); err != nil {
-			return nil, err
+	for i, l := range leftRows {
+		// Check context cancellation every 64 rows to reduce channel-select overhead.
+		if i&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, err
+			}
 		}
 		matched := false
 		for _, r := range rightRows {
@@ -208,9 +214,12 @@ func processRightJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) 
 	if len(leftRows) > 0 {
 		leftKeys = keysOfRow(leftRows[0])
 	}
-	for _, r := range rightRows {
-		if err := checkCtx(env.ctx); err != nil {
-			return nil, err
+	for i, r := range rightRows {
+		// Check context cancellation every 64 rows to reduce channel-select overhead.
+		if i&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, err
+			}
 		}
 		matched := false
 		for _, l := range leftRows {
@@ -256,9 +265,12 @@ func processFullOuterJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Ex
 		leftKeys = keysOfRow(leftRows[0])
 	}
 
-	for _, l := range leftRows {
-		if err := checkCtx(env.ctx); err != nil {
-			return nil, err
+	for i, l := range leftRows {
+		// Check context cancellation every 64 rows to reduce channel-select overhead.
+		if i&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, err
+			}
 		}
 		matchedAny := false
 		for ri, r := range rightRows {
@@ -302,9 +314,12 @@ func applyWhereClause(env ExecEnv, where Expr, rows []Row) ([]Row, error) {
 		return rows, nil
 	}
 	filtered := make([]Row, 0, len(rows)/2) // Estimate half will match
-	for _, r := range rows {
-		if err := checkCtx(env.ctx); err != nil {
-			return nil, err
+	for i, r := range rows {
+		// Check context cancellation every 64 rows to reduce channel-select overhead.
+		if i&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, err
+			}
 		}
 		v, err := evalExpr(env, where, r)
 		if err != nil {

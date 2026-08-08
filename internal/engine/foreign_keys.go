@@ -13,6 +13,7 @@ package engine
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -236,6 +237,11 @@ func setNullForeignKeyReference(env ExecEnv, ref fkReference, changes map[any]fk
 	if err != nil {
 		return err
 	}
+	// The index set cannot change mid-statement, so its sorted name list is
+	// computed once here instead of being rebuilt and re-sorted twice per row
+	// (once for the before key, once for the after key).
+	indexNames := rawIndexNames(child)
+	sort.Strings(indexNames)
 	for _, rowID := range matchingRows {
 		before := append([]any(nil), child.Rows[rowID]...)
 		after := append([]any(nil), before...)
@@ -248,7 +254,7 @@ func setNullForeignKeyReference(env ExecEnv, ref fkReference, changes map[any]fk
 		}
 		patchConstraintIndexRow(child, rowID, before, after)
 		child.Rows[rowID] = after
-		if err := child.UpdateSecondaryIndexRow(rowID, before, after); err != nil {
+		if err := child.UpdateSecondaryIndexRow(rowID, before, after, indexNames); err != nil {
 			return err
 		}
 		if err := wal.logUpdate(env, rowID, before, after, child.Cols); err != nil {
@@ -328,6 +334,11 @@ func cascadeForeignKeyReference(env ExecEnv, ref fkReference, changes map[any]fk
 	if err != nil {
 		return err
 	}
+	// The index set cannot change mid-statement, so its sorted name list is
+	// computed once here instead of being rebuilt and re-sorted twice per row
+	// (once for the before key, once for the after key).
+	indexNames := rawIndexNames(child)
+	sort.Strings(indexNames)
 	for _, update := range updates {
 		before := append([]any(nil), child.Rows[update.rowID]...)
 		after := append([]any(nil), before...)
@@ -342,7 +353,7 @@ func cascadeForeignKeyReference(env ExecEnv, ref fkReference, changes map[any]fk
 		}
 		patchConstraintIndexRow(child, update.rowID, before, after)
 		child.Rows[update.rowID] = after
-		if err := child.UpdateSecondaryIndexRow(update.rowID, before, after); err != nil {
+		if err := child.UpdateSecondaryIndexRow(update.rowID, before, after, indexNames); err != nil {
 			return err
 		}
 		if err := wal.logUpdate(env, update.rowID, before, after, child.Cols); err != nil {
@@ -401,8 +412,9 @@ func checkForeignKeysBeforeDelete(env ExecEnv, t *storage.Table, where Expr) err
 		matched = t.Rows
 	} else {
 		tablePrefix := strings.ToLower(t.Name) + "."
+		keys := newTableRowKeys(t.Cols, tablePrefix)
 		for _, r := range t.Rows {
-			row := buildTableRow(t.Cols, tablePrefix, r)
+			row := buildTableRow(keys, r)
 			v, err := evalExpr(env, where, row)
 			if err != nil {
 				return err
@@ -444,9 +456,10 @@ func checkForeignKeysBeforeUpdate(env ExecEnv, t *storage.Table, s *Update) erro
 	}
 
 	tablePrefix := strings.ToLower(t.Name) + "."
+	keys := newTableRowKeys(t.Cols, tablePrefix)
 	changesByCol := make(map[int]map[any]fkChange, len(setIdx))
 	for _, r := range t.Rows {
-		row := buildTableRow(t.Cols, tablePrefix, r)
+		row := buildTableRow(keys, r)
 		match := s.Where == nil
 		if !match {
 			v, err := evalExpr(env, s.Where, row)

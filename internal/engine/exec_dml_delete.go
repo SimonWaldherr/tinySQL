@@ -41,9 +41,10 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 		del := len(t.Rows)
 		if len(s.Returning) > 0 {
 			tablePrefix := strings.ToLower(s.Table) + "."
+			keys := newTableRowKeys(t.Cols, tablePrefix)
 			returningRows := make([]Row, 0, len(t.Rows))
 			for _, r := range t.Rows {
-				returningRows = append(returningRows, buildTableRow(t.Cols, tablePrefix, r))
+				returningRows = append(returningRows, buildTableRow(keys, r))
 			}
 			if del > 0 {
 				for i, r := range t.Rows {
@@ -129,13 +130,14 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	del := 0
 	returningRows := make([]Row, 0)
 	tablePrefix := strings.ToLower(s.Table) + "."
+	keys := newTableRowKeys(t.Cols, tablePrefix)
 	hasBeforeDel := len(beforeDelTriggers) > 0
 	hasAfterDel := len(afterDelTriggers) > 0
 	for i, r := range t.Rows {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
 		}
-		row := buildTableRow(t.Cols, tablePrefix, r)
+		row := buildTableRow(keys, r)
 		match := true
 		if s.Where != nil {
 			v, err := evalExpr(env, s.Where, row)
@@ -273,13 +275,35 @@ func selectDeleteConstraintRows(table *storage.Table, colIndex map[string]int, w
 	return nil, "", false, false
 }
 
-func buildTableRow(cols []storage.Column, tablePrefix string, values []any) Row {
-	row := make(Row, len(cols)*2)
+// tableRowKeys precomputes, once per statement, the two Row map keys every
+// column needs: its lowercased name and tablePrefix+lowercased name. cols and
+// tablePrefix never change from row to row within a single UPDATE/DELETE, so
+// recomputing strings.ToLower and the prefix concatenation for every row (as
+// buildTableRow used to do inline) was pure per-row waste on statements that
+// touch many rows. Callers build this once before their row loop and pass it
+// to buildTableRow for every row.
+type tableRowKeys struct {
+	key    []string // lowercased column name, one per column
+	prefix []string // tablePrefix + lowercased column name, one per column
+}
+
+func newTableRowKeys(cols []storage.Column, tablePrefix string) tableRowKeys {
+	key := make([]string, len(cols))
+	prefix := make([]string, len(cols))
 	for i, c := range cols {
-		key := strings.ToLower(c.Name)
+		k := strings.ToLower(c.Name)
+		key[i] = k
+		prefix[i] = tablePrefix + k
+	}
+	return tableRowKeys{key: key, prefix: prefix}
+}
+
+func buildTableRow(keys tableRowKeys, values []any) Row {
+	row := make(Row, len(keys.key)*2)
+	for i, key := range keys.key {
 		val := values[i]
 		row[key] = val
-		row[tablePrefix+key] = val
+		row[keys.prefix[i]] = val
 	}
 	return row
 }

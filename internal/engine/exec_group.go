@@ -194,9 +194,12 @@ func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []str
 	// workloads have far fewer distinct groups than rows, so this turns
 	// per-row key-string allocation into per-distinct-group allocation.
 	keyBuf := make([]byte, 0, 64)
-	for _, r := range filtered {
-		if err := checkCtx(env.ctx); err != nil {
-			return nil, nil, err
+	for i, r := range filtered {
+		// Check context cancellation every 64 rows to reduce channel-select overhead.
+		if i&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, nil, err
+			}
 		}
 		keyBuf = keyBuf[:0]
 		for i, g := range s.GroupBy {
@@ -326,8 +329,11 @@ func processNonAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []
 	}
 
 	for rowIdx, r := range filtered {
-		if err := checkCtx(env.ctx); err != nil {
-			return nil, nil, err
+		// Check context cancellation every 64 rows to reduce channel-select overhead.
+		if rowIdx&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, nil, err
+			}
 		}
 
 		// Set window index for current row

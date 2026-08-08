@@ -3,6 +3,7 @@
 package engine
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -33,10 +34,16 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 	n := 0
 	returningRows := make([]Row, 0)
 	tablePrefix := strings.ToLower(s.Table) + "."
+	keys := newTableRowKeys(t.Cols, tablePrefix)
 	beforeTriggers, afterTriggers := env.db.Catalog().GetTriggersForEvent(s.Table, storage.TriggerUpdate)
 	hasBefore := len(beforeTriggers) > 0
 	hasAfter := len(afterTriggers) > 0
 	needsNewRow := hasAfter || len(s.Returning) > 0
+	// The index set cannot change mid-statement, so its sorted name list is
+	// computed once here instead of being rebuilt and re-sorted twice per row
+	// (once for the before key, once for the after key).
+	indexNames := rawIndexNames(t)
+	sort.Strings(indexNames)
 	wal, err := beginWALAuto(env, s.Table)
 	if err != nil {
 		return nil, err
@@ -45,7 +52,7 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
 		}
-		row := buildTableRow(t.Cols, tablePrefix, r)
+		row := buildTableRow(keys, r)
 		ok := true
 		if s.Where != nil {
 			v, err := evalExpr(env, s.Where, row)
@@ -89,7 +96,7 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 			// table. Triggers below may write here too; anything that adds or
 			// removes rows invalidates the list through MarkDirtyFrom.
 			t.MarkRowUpdated(ri)
-			if err := t.UpdateSecondaryIndexRow(ri, before, nextRow); err != nil {
+			if err := t.UpdateSecondaryIndexRow(ri, before, nextRow, indexNames); err != nil {
 				return nil, err
 			}
 			if err := wal.logUpdate(env, ri, before, nextRow, t.Cols); err != nil {
@@ -97,7 +104,7 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 			}
 			var newRow Row
 			if needsNewRow {
-				newRow = buildTableRow(t.Cols, tablePrefix, t.Rows[ri])
+				newRow = buildTableRow(keys, t.Rows[ri])
 			}
 			if hasAfter {
 				if err := fireTriggerList(env, afterTriggers, newRow, oldRow); err != nil {
@@ -127,6 +134,25 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 	return &ResultSet{Cols: []string{"updated"}, Rows: []Row{{"updated": n}}}, nil
 }
 
+// rawIndexNames collects a table's secondary index names, unsorted. Callers
+// are expected to sort.Strings the result themselves inline, right after
+// calling this -- NOT through another wrapper function. This one is small
+// enough for the compiler to inline at each call site (`go build -gcflags=-m`
+// confirms "can inline rawIndexNames"), so the make+append it contains proves
+// non-escaping there and stays stack-allocated, exactly like the map-to-slice
+// build indexRowKeys used to do inline on every row before this change. A
+// wrapper that also calls sort.Strings itself is NOT small enough to inline,
+// which forces its returned slice to escape to heap on every call -- that
+// was tried and measured (see the stage 2 commit notes) to cost one extra
+// heap allocation per statement versus this split form.
+func rawIndexNames(t *storage.Table) []string {
+	names := make([]string, 0, len(t.Indexes))
+	for name := range t.Indexes {
+		names = append(names, name)
+	}
+	return names
+}
+
 type simpleUpdatePlan struct {
 	table    *storage.Table
 	colIndex map[string]int
@@ -152,6 +178,11 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 	rawPlan := &simpleSelectPlan{table: plan.table, colIndex: plan.colIndex, where: plan.where, filter: buildRawFilter(plan.colIndex, plan.where), rowTextCols: rawRowTextColumns(plan.colIndex)}
 	updated := 0
 	values := make([]any, len(plan.sets))
+	// The index set cannot change mid-statement, so its sorted name list is
+	// computed once here instead of being rebuilt and re-sorted twice per row
+	// (once for the before key, once for the after key).
+	indexNames := rawIndexNames(plan.table)
+	sort.Strings(indexNames)
 	wal, err := beginWALAuto(env, s.Table)
 	if err != nil {
 		return nil, true, err
@@ -209,7 +240,7 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 		before := raw
 		plan.table.Rows[ri] = nextRow
 		plan.table.MarkRowUpdated(ri)
-		if err := plan.table.UpdateSecondaryIndexRow(ri, before, nextRow); err != nil {
+		if err := plan.table.UpdateSecondaryIndexRow(ri, before, nextRow, indexNames); err != nil {
 			return nil, true, err
 		}
 		if err := wal.logUpdate(env, ri, before, nextRow, plan.table.Cols); err != nil {

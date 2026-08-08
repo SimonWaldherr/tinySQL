@@ -123,8 +123,13 @@ func (t *Table) RebuildSecondaryIndexes() error {
 // secondary index. It avoids rebuilding unaffected keys after every INSERT.
 // Call it only after the row has been appended to t.Rows and constraints have
 // been checked.
-func (t *Table) InsertSecondaryIndexRow(rowID int, row []any) error {
-	updates, err := t.indexRowKeys(row)
+//
+// names is the table's index names in sorted order (see SortedIndexNames).
+// The caller computes it once per statement, since the index set never
+// changes mid-statement, instead of paying a rebuild-from-map-plus-sort on
+// every single row of a multi-row INSERT.
+func (t *Table) InsertSecondaryIndexRow(rowID int, row []any, names []string) error {
+	updates, err := t.indexRowKeys(row, names)
 	if err != nil {
 		return err
 	}
@@ -137,12 +142,18 @@ func (t *Table) InsertSecondaryIndexRow(rowID int, row []any) error {
 // UpdateSecondaryIndexRow moves one stable row position between composite
 // keys. Row positions do not change during UPDATE, so this is O(indexes ·
 // log(keys)) instead of rescanning the table.
-func (t *Table) UpdateSecondaryIndexRow(rowID int, before, after []any) error {
-	beforeKeys, err := t.indexRowKeys(before)
+//
+// names is the table's index names in sorted order (see SortedIndexNames),
+// computed once per statement by the caller. Without it this rebuilt and
+// sorted the same name list from t.Indexes twice per row -- once for the
+// before key, once for the after key -- even though the index set is
+// identical for both and does not change mid-statement.
+func (t *Table) UpdateSecondaryIndexRow(rowID int, before, after []any, names []string) error {
+	beforeKeys, err := t.indexRowKeys(before, names)
 	if err != nil {
 		return err
 	}
-	afterKeys, err := t.indexRowKeys(after)
+	afterKeys, err := t.indexRowKeys(after, names)
 	if err != nil {
 		return err
 	}
@@ -220,13 +231,26 @@ type secondaryIndexRowKey struct {
 	key   []byte
 }
 
-func (t *Table) indexRowKeys(row []any) ([]secondaryIndexRowKey, error) {
-	updates := make([]secondaryIndexRowKey, 0, len(t.Indexes))
+// SortedIndexNames returns this table's secondary index names (the same
+// lower-cased keys used by t.Indexes) in sorted order, for callers that just
+// want the list (e.g. tests). engine's INSERT/UPDATE hot paths deliberately
+// do not call this: sort.Strings inside the function body keeps the
+// compiler from inlining it, which forces the returned slice to escape to
+// heap on every call. They instead inline the equivalent of this function
+// (see rawIndexNames in internal/engine) and call sort.Strings themselves at
+// the call site, which the compiler can prove non-escaping and keep on the
+// stack -- one heap allocation saved per statement instead of per row.
+func (t *Table) SortedIndexNames() []string {
 	names := make([]string, 0, len(t.Indexes))
 	for name := range t.Indexes {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	return names
+}
+
+func (t *Table) indexRowKeys(row []any, names []string) ([]secondaryIndexRowKey, error) {
+	updates := make([]secondaryIndexRowKey, 0, len(names))
 	for _, name := range names {
 		index := t.Indexes[name]
 		key, err := t.indexKey(index.Columns, row)

@@ -6,6 +6,7 @@ package engine
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -34,10 +35,18 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 	// once before the row loop and skip that map entirely when neither triggers
 	// nor RETURNING needs it.
 	tablePrefix := strings.ToLower(s.Table) + "."
+	keys := newTableRowKeys(t.Cols, tablePrefix)
 	beforeTriggers, afterTriggers := env.db.Catalog().GetTriggersForEvent(s.Table, storage.TriggerInsert)
 	hasBefore := len(beforeTriggers) > 0
 	hasAfter := len(afterTriggers) > 0
 	needsRow := hasBefore || hasAfter || len(s.Returning) > 0
+	// The index set cannot change mid-statement, so its sorted name list is
+	// computed once here instead of being rebuilt and re-sorted on every row.
+	// rawIndexNames is deliberately called (not storage.Table.SortedIndexNames)
+	// so this stays inlined and allocation-free at the call site; see its doc
+	// comment in exec_dml_update.go.
+	indexNames := rawIndexNames(t)
+	sort.Strings(indexNames)
 	wal, err := beginWALAuto(env, s.Table)
 	if err != nil {
 		return nil, err
@@ -69,7 +78,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 		}
 		var newRow Row
 		if needsRow {
-			newRow = buildTableRow(t.Cols, tablePrefix, row)
+			newRow = buildTableRow(keys, row)
 		}
 		if hasBefore {
 			if err := fireTriggerList(env, beforeTriggers, newRow, nil); err != nil {
@@ -77,7 +86,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 			}
 		}
 		t.Rows = append(t.Rows, row)
-		if err := t.InsertSecondaryIndexRow(len(t.Rows)-1, row); err != nil {
+		if err := t.InsertSecondaryIndexRow(len(t.Rows)-1, row, indexNames); err != nil {
 			return nil, err
 		}
 		if err := wal.logInsert(env, len(t.Rows)-1, row, t.Cols); err != nil {
@@ -116,10 +125,18 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	}
 	returningRows := make([]Row, 0, len(s.Rows))
 	tablePrefix := strings.ToLower(s.Table) + "."
+	keys := newTableRowKeys(t.Cols, tablePrefix)
 	beforeTriggers, afterTriggers := env.db.Catalog().GetTriggersForEvent(s.Table, storage.TriggerInsert)
 	hasBefore := len(beforeTriggers) > 0
 	hasAfter := len(afterTriggers) > 0
 	needsRow := hasBefore || hasAfter || len(s.Returning) > 0
+	// The index set cannot change mid-statement, so its sorted name list is
+	// computed once here instead of being rebuilt and re-sorted on every row.
+	// rawIndexNames is deliberately called (not storage.Table.SortedIndexNames)
+	// so this stays inlined and allocation-free at the call site; see its doc
+	// comment in exec_dml_update.go.
+	indexNames := rawIndexNames(t)
+	sort.Strings(indexNames)
 	wal, err := beginWALAuto(env, s.Table)
 	if err != nil {
 		return nil, err
@@ -154,7 +171,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 		}
 		var newRow Row
 		if needsRow {
-			newRow = buildTableRow(t.Cols, tablePrefix, row)
+			newRow = buildTableRow(keys, row)
 		}
 		if hasBefore {
 			if err := fireTriggerList(env, beforeTriggers, newRow, nil); err != nil {
@@ -162,7 +179,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			}
 		}
 		t.Rows = append(t.Rows, row)
-		if err := t.InsertSecondaryIndexRow(len(t.Rows)-1, row); err != nil {
+		if err := t.InsertSecondaryIndexRow(len(t.Rows)-1, row, indexNames); err != nil {
 			return nil, err
 		}
 		if err := wal.logInsert(env, len(t.Rows)-1, row, t.Cols); err != nil {
