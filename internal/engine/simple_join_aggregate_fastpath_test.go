@@ -275,4 +275,3 @@ func TestJoinAggregateFastPathOutputColumnOrder(t *testing.T) {
 		}
 	}
 }
-

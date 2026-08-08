@@ -278,4 +278,3 @@ func kmlMultiGeometryValue(multi kmlMultiGeometry) any {
 	}
 	return map[string]any{"type": "GeometryCollection", "geometries": geometries}
 }
-
