@@ -227,15 +227,7 @@ func ImportCSV(
 	}
 
 	// Type inference
-	var colTypes []storage.ColType
-	if opts.TypeInference {
-		colTypes = inferColumnTypes(sampleData, len(colNames), opts)
-	} else {
-		colTypes = make([]storage.ColType, len(colNames))
-		for i := range colTypes {
-			colTypes[i] = storage.TextType
-		}
-	}
+	colTypes := inferOrDefaultColumnTypes(sampleData, len(colNames), opts)
 	result.ColumnTypes = colTypes
 
 	// Create / truncate table as requested
@@ -721,16 +713,41 @@ func naiveSplitOutsideQuotes(ln string, delim rune) []string {
 	return out
 }
 
-func decideHeader(records [][]string, mode string) bool {
+// explicitOrTooShortHeader resolves the header-mode question either from an
+// explicit mode string or from having too few records to decide at all,
+// returning the answer and whether it was decided here (decided == false
+// means the caller must run its own heuristic).
+func explicitOrTooShortHeader(records [][]string, mode string) (value bool, decided bool) {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "present":
-		return true
+		return true, true
 	case "absent":
-		return false
+		return false, true
 	}
-
 	if len(records) < 2 {
-		return false
+		return false, true
+	}
+	return false, false
+}
+
+// columnNumericRatio scans column col of body and reports how many of its
+// cells parse as numeric, out of how many rows had that column at all.
+func columnNumericRatio(body [][]string, col int) (numericCount, rows int) {
+	for _, r := range body {
+		if col >= len(r) {
+			continue
+		}
+		if looksNumeric(r[col]) {
+			numericCount++
+		}
+		rows++
+	}
+	return numericCount, rows
+}
+
+func decideHeader(records [][]string, mode string) bool {
+	if v, decided := explicitOrTooShortHeader(records, mode); decided {
+		return v
 	}
 
 	first := records[0]
@@ -741,17 +758,7 @@ func decideHeader(records [][]string, mode string) bool {
 
 	for c := 0; c < cols; c++ {
 		headNum := looksNumeric(first[c])
-		dataNum := 0
-		rows := 0
-		for _, r := range body {
-			if c >= len(r) {
-				continue
-			}
-			if looksNumeric(r[c]) {
-				dataNum++
-			}
-			rows++
-		}
+		dataNum, rows := columnNumericRatio(body, c)
 		if rows > 0 && !headNum && float64(dataNum)/float64(rows) > 0.6 {
 			headerish++
 		}

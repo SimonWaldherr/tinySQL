@@ -9,16 +9,6 @@ import (
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
-// OpenMBTilesResult reports what an in-place open exposed. Declared here too so
-// callers compile on targets without the SQLite driver.
-type OpenMBTilesResult struct {
-	TilesExposed    int64
-	MetadataExposed int64
-	MinZoom         int
-	MaxZoom         int
-	Truncated       bool
-}
-
 // ExportMBTiles reports that MBTiles export requires the sqliteimport build tag.
 func ExportMBTiles(
 	ctx context.Context,

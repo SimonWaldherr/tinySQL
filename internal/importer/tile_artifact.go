@@ -32,15 +32,7 @@ func ImportTileArtifact(ctx context.Context, source TileArtifactSource, artifact
 	if err != nil {
 		return nil, fmt.Errorf("copy tile artifact options: %w", err)
 	}
-	if opts.BatchSize <= 0 {
-		opts.BatchSize = 1000
-	}
-	if opts.MaxMemoryBytes <= 0 {
-		opts.MaxMemoryBytes = 64 << 20
-	}
-	if opts.ProgressEvery <= 0 {
-		opts.ProgressEvery = 250 * time.Millisecond
-	}
+	applyArtifactOptionDefaults(opts)
 	if opts.Schema == "" || opts.Schema == MBTilesSchemaAuto {
 		opts.Schema = MBTilesSchemaFlat
 	}
@@ -85,27 +77,17 @@ func ImportTileArtifact(ctx context.Context, source TileArtifactSource, artifact
 	if opts.Progress != nil {
 		opts.Progress(MBTilesProgress{Phase: "preflight", TotalRows: estimate.TileCount, BatchSize: opts.BatchSize, Estimate: &estimate})
 	}
-	if estimate.EstimatedMemory > opts.MaxMemoryBytes {
-		return nil, fmt.Errorf("insufficient memory for tile stream import: need %d bytes, limit %d bytes", estimate.EstimatedMemory, opts.MaxMemoryBytes)
+	if err := checkArtifactResourceBudget(estimate, opts, "tile stream import"); err != nil {
+		return nil, err
 	}
-	if estimate.AvailableDisk >= 0 && estimate.AvailableDisk < estimate.EstimatedDisk+opts.MinFreeBytes {
-		return nil, fmt.Errorf("insufficient disk space for tile stream import: need %d bytes plus reserve %d, available %d", estimate.EstimatedDisk, opts.MinFreeBytes, estimate.AvailableDisk)
+	if err := ensureArtifactTargetAvailable(artifactPath, opts.ReplaceExisting); err != nil {
+		return nil, err
 	}
-	if _, err := os.Stat(artifactPath); err == nil && !opts.ReplaceExisting {
-		return nil, fmt.Errorf("artifact already exists: %s", artifactPath)
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("inspect artifact target: %w", err)
-	}
-	tmp, err := os.MkdirTemp(parent, ".tinysql-artifact-*")
+	tmp, err := newTempArtifactDir(parent)
 	if err != nil {
-		return nil, fmt.Errorf("create temporary artifact: %w", err)
+		return nil, err
 	}
 	defer os.RemoveAll(tmp)
-	for _, dir := range []string{"database", "indexes"} {
-		if err := os.Mkdir(filepath.Join(tmp, dir), 0o755); err != nil {
-			return nil, fmt.Errorf("create artifact directory %s: %w", dir, err)
-		}
-	}
 	db, err := storage.OpenDB(storage.StorageConfig{Mode: storage.ModePagedIndex, Path: filepath.Join(tmp, "database"), MaxMemoryBytes: opts.MaxMemoryBytes})
 	if err != nil {
 		return nil, fmt.Errorf("create paged-index database: %w", err)

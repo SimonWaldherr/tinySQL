@@ -160,7 +160,14 @@ func LoadFromFile(filename string) (*DB, error) {
 
 // SaveToWriter writes a snapshot of the database to an arbitrary writer.
 // It does not attach or alter WAL configuration.
-func SaveToWriter(db *DB, w io.Writer) error {
+//
+// Like SaveToFile, it gob-encodes each value in extra, in order, immediately
+// after the table dump and catalog — letting a caller carry small auxiliary
+// state (e.g. a replication watermark LSN, see SnapshotWithWatermark)
+// alongside the snapshot in the same encoded stream. Existing callers that
+// pass no extra values are unaffected; the encoded format for them is
+// unchanged.
+func SaveToWriter(db *DB, w io.Writer, extra ...any) error {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	// Pre-allocate dump slice with estimated capacity
@@ -182,12 +189,26 @@ func SaveToWriter(db *DB, w io.Writer) error {
 	if err := enc.Encode(catalogToDisk(db.Catalog())); err != nil {
 		return err
 	}
+	for _, v := range extra {
+		if err := enc.Encode(v); err != nil {
+			return err
+		}
+	}
 	return bw.Flush()
 }
 
 // LoadFromReader loads a database snapshot from an arbitrary reader.
 // The returned DB has no WAL attached.
-func LoadFromReader(r io.Reader) (*DB, error) {
+//
+// extra mirrors SaveToWriter's extra parameter: each element must be a
+// pointer, and is decoded in order from whatever trailing values follow the
+// table dump and catalog in the stream (see SaveToWriter). If the stream has
+// fewer trailing values than len(extra) — e.g. it was written by an older
+// caller that passed no extra values — decoding stops at the first EOF and
+// any remaining pointers in extra are left untouched, matching
+// ReadCheckpointWatermark's "predates this field: nothing to fill in"
+// behavior rather than erroring.
+func LoadFromReader(r io.Reader, extra ...any) (*DB, error) {
 	dec := gob.NewDecoder(bufio.NewReader(r))
 	var dump []diskTable
 	if err := dec.Decode(&dump); err != nil {
@@ -206,19 +227,29 @@ func LoadFromReader(r io.Reader) (*DB, error) {
 	} else if !errors.Is(err, io.EOF) {
 		return nil, err
 	}
+	for _, v := range extra {
+		if err := dec.Decode(v); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, err
+		}
+	}
 	return db, nil
 }
 
-// SaveToBytes serializes the database snapshot to a byte slice.
-func SaveToBytes(db *DB) ([]byte, error) {
+// SaveToBytes serializes the database snapshot to a byte slice. extra is
+// passed through to SaveToWriter unchanged.
+func SaveToBytes(db *DB, extra ...any) ([]byte, error) {
 	var buf bytes.Buffer
-	if err := SaveToWriter(db, &buf); err != nil {
+	if err := SaveToWriter(db, &buf, extra...); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
 }
 
-// LoadFromBytes loads a database from a byte slice.
-func LoadFromBytes(b []byte) (*DB, error) {
-	return LoadFromReader(bytes.NewReader(b))
+// LoadFromBytes loads a database from a byte slice. extra is passed through
+// to LoadFromReader unchanged.
+func LoadFromBytes(b []byte, extra ...any) (*DB, error) {
+	return LoadFromReader(bytes.NewReader(b), extra...)
 }

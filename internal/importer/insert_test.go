@@ -77,7 +77,7 @@ func TestStreamInsertCSV(t *testing.T) {
 	r := csvReaderFromString(csvData)
 
 	opts := &ImportOptions{BatchSize: 1, TypeInference: false}
-	rows, skipped, errs := streamInsertCSV(ctx, db, "default", "stream_tbl", colNames, colTypes, nil, r, opts)
+	rows, skipped, errs := insertCSVRecords(ctx, db, "default", "stream_tbl", colNames, colTypes, nil, r, opts)
 	if rows != 2 || skipped != 0 || len(errs) != 0 {
 		t.Fatalf("streamInsertCSV unexpected: rows=%d skipped=%d errs=%v", rows, skipped, errs)
 	}

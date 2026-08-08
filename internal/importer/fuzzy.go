@@ -217,15 +217,8 @@ func fuzzyInsertRows(db *storage.DB, tenant, tableName string, headers []string,
 // fuzzyDecideHeader is a more lenient header detection that also checks for
 // typical header patterns like lowercase/capitalized names
 func fuzzyDecideHeader(records [][]string, mode string) bool {
-	switch strings.ToLower(strings.TrimSpace(mode)) {
-	case "present":
-		return true
-	case "absent":
-		return false
-	}
-
-	if len(records) < 2 {
-		return false
+	if v, decided := explicitOrTooShortHeader(records, mode); decided {
+		return v
 	}
 
 	first := records[0]
@@ -251,17 +244,7 @@ func fuzzyDecideHeader(records [][]string, mode string) bool {
 
 		// Check if first row is NOT numeric but data IS
 		headNum := looksNumeric(headVal)
-		dataNum := 0
-		rows := 0
-		for _, r := range body {
-			if c >= len(r) {
-				continue
-			}
-			if looksNumeric(r[c]) {
-				dataNum++
-			}
-			rows++
-		}
+		dataNum, rows := columnNumericRatio(body, c)
 
 		// Header-like if: (typical name pattern) OR (non-numeric header with >60% numeric data)
 		if isTypicalHeader {

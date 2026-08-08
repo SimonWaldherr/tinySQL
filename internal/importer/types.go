@@ -53,6 +53,19 @@ func inferColumnTypes(sampleData [][]string, numCols int, opts *ImportOptions) [
 	return types
 }
 
+// inferOrDefaultColumnTypes runs inferColumnTypes when opts.TypeInference is
+// set, otherwise returns numCols columns all typed as storage.TextType.
+func inferOrDefaultColumnTypes(sample [][]string, numCols int, opts *ImportOptions) []storage.ColType {
+	if opts.TypeInference {
+		return inferColumnTypes(sample, numCols, opts)
+	}
+	colTypes := make([]storage.ColType, numCols)
+	for i := range colTypes {
+		colTypes[i] = storage.TextType
+	}
+	return colTypes
+}
+
 // detectValueType attempts to parse a single value and returns its most specific type.
 func detectValueType(val string, dateFormats []string) storage.ColType {
 	if val == "" {
@@ -143,7 +156,6 @@ func determineColumnType(votes map[storage.ColType]int) storage.ColType {
 	intCount := votes[storage.IntType]
 	floatCount := votes[storage.Float64Type]
 	timeCount := votes[storage.TimeType]
-	// textCount := votes[storage.TextType] // Keep for potential future use
 
 	threshold := float64(totalVotes) * 0.80
 

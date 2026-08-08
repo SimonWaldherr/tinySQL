@@ -175,15 +175,7 @@ func ImportXLSX(
 	if opts.SampleRecords > 0 && len(sample) > opts.SampleRecords {
 		sample = sample[:opts.SampleRecords]
 	}
-	var colTypes []storage.ColType
-	if opts.TypeInference {
-		colTypes = inferColumnTypes(sample, len(colNames), opts)
-	} else {
-		colTypes = make([]storage.ColType, len(colNames))
-		for i := range colTypes {
-			colTypes[i] = storage.TextType
-		}
-	}
+	colTypes := inferOrDefaultColumnTypes(sample, len(colNames), opts)
 	result.ColumnTypes = colTypes
 
 	if opts.CreateTable {

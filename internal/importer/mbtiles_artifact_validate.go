@@ -12,7 +12,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -48,7 +50,7 @@ func OpenMBTilesArtifact(ctx context.Context, artifactPath string, maxMemoryByte
 		return nil, nil, err
 	}
 	if maxMemoryBytes <= 0 {
-		maxMemoryBytes = 64 << 20
+		maxMemoryBytes = defaultArtifactMaxMemoryBytes
 	}
 	db, err := storage.OpenDB(storage.StorageConfig{Mode: storage.ModePagedIndex, Path: filepath.Join(artifactPath, "database"), MaxMemoryBytes: maxMemoryBytes, ReadOnly: true})
 	if err != nil {
@@ -183,13 +185,32 @@ func sameArtifactFingerprint(a, b artifactValidationFingerprint) bool {
 	return true
 }
 
+// duplicateKeyCursor tracks the most recently seen canonical index key while
+// scanning rows in key order, so a caller can detect a duplicate key without
+// buffering every key seen so far. Rows must be scanned in strictly
+// increasing key order, which every ScanRowsFast caller here already relies
+// on for its row-count check.
+type duplicateKeyCursor struct {
+	previous []byte
+}
+
+// advance reports whether key duplicates the previous key, then records key
+// as the new previous key when it does not. It performs no I/O.
+func (c *duplicateKeyCursor) advance(key []byte) (duplicate bool) {
+	if bytes.Equal(c.previous, key) {
+		return true
+	}
+	c.previous = append(c.previous[:0], key...)
+	return false
+}
+
 func validateArtifactImages(ctx context.Context, db *storage.DB, expectedRows int64) error {
 	imageIndex, found, err := db.LocatePagedIndex("default", "images", "images_tile_id")
 	if err != nil || !found {
 		return fmt.Errorf("validate images: locate image index: found=%v err=%v", found, err)
 	}
 	var callbackErr error
-	var previous []byte
+	cursor := duplicateKeyCursor{}
 	var count int64
 	_, err = db.ScanRowsFast("default", "images", func(row []any) bool {
 		if len(row) != 2 {
@@ -202,11 +223,10 @@ func validateArtifactImages(ctx context.Context, db *storage.DB, expectedRows in
 			return false
 		}
 		key := storage.CanonicalIndexKey([]any{id})
-		if bytes.Equal(previous, key) {
+		if cursor.advance(key) {
 			callbackErr = fmt.Errorf("duplicate image key %q", id)
 			return false
 		}
-		previous = append(previous[:0], key...)
 		count++
 		indexed, lookupErr := imageIndex.ContainsUnique(key)
 		if lookupErr != nil || !indexed {
@@ -243,7 +263,7 @@ func verifyArtifactChecksums(root string, manifest MBTilesArtifactManifest, mani
 		if _, err := fmt.Sscanf(scanner.Text(), "%64s  %s", &sum, &name); err != nil || len(sum) != 64 {
 			return fmt.Errorf("invalid checksum line %q", scanner.Text())
 		}
-		if filepath.Clean(name) != name || filepath.IsAbs(name) || name == "checksums.sha256" || name == "COMPLETE" {
+		if strings.ContainsRune(name, '\\') || path.Clean(name) != name || filepath.IsAbs(name) || name == "checksums.sha256" || name == "COMPLETE" {
 			return fmt.Errorf("invalid checksum path %q", name)
 		}
 		listed[name] = sum
@@ -310,7 +330,7 @@ func validateArtifactMetadata(ctx context.Context, db *storage.DB, expectedRows 
 	}
 	h := sha256.New()
 	var callbackErr error
-	var previous []byte
+	cursor := duplicateKeyCursor{}
 	var count int64
 	_, err = db.ScanRowsFast("default", "metadata", func(row []any) bool {
 		if len(row) != 2 {
@@ -324,11 +344,10 @@ func validateArtifactMetadata(ctx context.Context, db *storage.DB, expectedRows 
 			return false
 		}
 		key := storage.CanonicalIndexKey([]any{name})
-		if bytes.Equal(previous, key) {
+		if cursor.advance(key) {
 			callbackErr = fmt.Errorf("duplicate metadata key %q", name)
 			return false
 		}
-		previous = append(previous[:0], key...)
 		count++
 		indexed, lookupErr := metadataIndex.ContainsUnique(key)
 		if lookupErr != nil || !indexed {
@@ -358,7 +377,7 @@ func validateArtifactTiles(ctx context.Context, db *storage.DB, schema MBTilesAr
 			return "", fmt.Errorf("validate tiles: locate tile index: found=%v err=%v", found, err)
 		}
 		var callbackErr error
-		var previous []byte
+		cursor := duplicateKeyCursor{}
 		var count int64
 		_, err = db.ScanRowsFast("default", "tiles", func(row []any) bool {
 			if len(row) != 4 {
@@ -378,11 +397,10 @@ func validateArtifactTiles(ctx context.Context, db *storage.DB, schema MBTilesAr
 				return false
 			}
 			key := storage.CanonicalIndexKey([]any{z, x, y})
-			if bytes.Equal(previous, key) {
+			if cursor.advance(key) {
 				callbackErr = fmt.Errorf("duplicate tile key z=%d x=%d y=%d", z, x, y)
 				return false
 			}
-			previous = append(previous[:0], key...)
 			count++
 			indexed, lookupErr := tileIndex.ContainsUnique(key)
 			if lookupErr != nil || !indexed {
@@ -412,7 +430,7 @@ func validateArtifactTiles(ctx context.Context, db *storage.DB, schema MBTilesAr
 		return "", fmt.Errorf("validate normalized tiles: locate image index: found=%v err=%v", found, err)
 	}
 	var callbackErr error
-	var previous []byte
+	cursor := duplicateKeyCursor{}
 	var count int64
 	_, err = db.ScanRowsFast("default", "map", func(row []any) bool {
 		if len(row) != 4 {
@@ -432,11 +450,10 @@ func validateArtifactTiles(ctx context.Context, db *storage.DB, schema MBTilesAr
 			return false
 		}
 		key := storage.CanonicalIndexKey([]any{z, x, y})
-		if bytes.Equal(previous, key) {
+		if cursor.advance(key) {
 			callbackErr = fmt.Errorf("duplicate tile key z=%d x=%d y=%d", z, x, y)
 			return false
 		}
-		previous = append(previous[:0], key...)
 		count++
 		indexed, lookupErr := mapIndex.ContainsUnique(key)
 		if lookupErr != nil || !indexed {

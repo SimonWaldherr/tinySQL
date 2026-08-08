@@ -356,47 +356,5 @@ func ImportTopoJSON(
 	if err != nil {
 		return nil, err
 	}
-
-	propKeys := buildGeoJSONColumns(features)
-	colNames := sanitizeColumnNames(append([]string{}, propKeys...))
-	colNames = append(colNames, "geometry_type", "geometry")
-
-	sampleData := buildGeoJSONSampleData(features, propKeys)
-
-	var colTypes []storage.ColType
-	if opts.TypeInference {
-		colTypes = inferColumnTypes(sampleData, len(propKeys), opts)
-	} else {
-		colTypes = make([]storage.ColType, len(propKeys))
-		for i := range colTypes {
-			colTypes[i] = storage.TextType
-		}
-	}
-	colTypes = append(colTypes, storage.TextType, storage.GeometryType)
-
-	result := &ImportResult{Encoding: "utf-8", Errors: make([]string, 0), ColumnNames: colNames, ColumnTypes: colTypes}
-
-	if opts.CreateTable {
-		if err := createTable(ctx, db, tenant, tableName, colNames, colTypes); err != nil {
-			return nil, err
-		}
-	}
-	if opts.Truncate {
-		if err := truncateTable(ctx, db, tenant, tableName); err != nil {
-			return nil, err
-		}
-	}
-
-	tbl, err := db.Get(tenant, tableName)
-	if err != nil {
-		return nil, fmt.Errorf("get table: %w", err)
-	}
-
-	for i, f := range features {
-		row := buildGeoJSONRow(f, propKeys, colTypes, opts, i, result)
-		tbl.Rows = append(tbl.Rows, row)
-		result.RowsInserted++
-	}
-
-	return result, nil
+	return importGeoFeatures(ctx, db, tenant, tableName, features, opts)
 }

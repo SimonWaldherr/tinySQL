@@ -32,24 +32,8 @@ import (
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
-// OpenMBTilesResult reports what an in-place open exposed.
-type OpenMBTilesResult struct {
-	TilesExposed    int64
-	MetadataExposed int64
-	MinZoom         int
-	MaxZoom         int
-	// Truncated is true when MaxTiles stopped the read before the source was
-	// exhausted, so the exposed table is a partial view.
-	Truncated bool
-}
-
 func applyOpenDefaults(opts *OpenMBTilesOptions) {
-	if opts.TilesTable == "" {
-		opts.TilesTable = "tiles"
-	}
-	if opts.MetadataTable == "" {
-		opts.MetadataTable = opts.TilesTable + "_metadata"
-	}
+	opts.TilesTable, opts.MetadataTable = mbtilesDefaultTableNames(opts.TilesTable, opts.MetadataTable)
 }
 
 // OpenMBTiles exposes an existing .mbtiles file as queryable tinySQL tables
@@ -109,7 +93,7 @@ func OpenMBTiles(
 		colTypes = append(colTypes, storage.BlobType)
 	}
 
-	batchSize := 1000
+	batchSize := mbtilesDefaultBatchSize
 	// Not applyDefaults(appendOpts): its CreateTable heuristic ("enable it
 	// when neither CreateTable nor Truncate is explicitly set") cannot tell
 	// this struct's explicit false apart from an unset field, and would flip

@@ -26,14 +26,9 @@ import (
 )
 
 func applyExportDefaults(opts *ExportMBTilesOptions) {
-	if opts.TilesTable == "" {
-		opts.TilesTable = "tiles"
-	}
-	if opts.MetadataTable == "" {
-		opts.MetadataTable = opts.TilesTable + "_metadata"
-	}
+	opts.TilesTable, opts.MetadataTable = mbtilesDefaultTableNames(opts.TilesTable, opts.MetadataTable)
 	if opts.BatchSize <= 0 {
-		opts.BatchSize = 1000
+		opts.BatchSize = mbtilesDefaultBatchSize
 	}
 }
 

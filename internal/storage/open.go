@@ -366,3 +366,51 @@ func ReadCheckpointWatermark(filename string) (uint64, error) {
 	}
 	return watermark, nil
 }
+
+// ReadCheckpointEpoch reads the WAL epoch identifier a checkpoint file may
+// carry right after its table dump, catalog, and watermark (see SaveToFile's
+// extra parameter and AdvancedWAL.Checkpoint, which writes watermark then
+// epoch, in that order) -- see AdvancedWAL.epoch's doc comment for what the
+// epoch identifies. Returns 0 with no error if the file doesn't exist, is
+// empty, or simply predates the epoch field (an older checkpoint, or one
+// written before this feature existed) -- all of which mean "no epoch
+// recorded," the reserved sentinel OpenAdvancedWAL treats as "nothing to
+// compare against, do not manufacture epoch churn for a plain restart."
+func ReadCheckpointEpoch(filename string) (uint64, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	defer func() { _ = f.Close() }()
+
+	var r io.Reader = bufio.NewReader(f)
+	if strings.HasSuffix(strings.ToLower(filename), ".gz") {
+		gr, gzErr := gzip.NewReader(r)
+		if gzErr != nil {
+			return 0, gzErr
+		}
+		defer func() { _ = gr.Close() }()
+		r = gr
+	}
+	dec := gob.NewDecoder(r)
+	var dump []diskTable
+	if err := dec.Decode(&dump); err != nil {
+		return 0, nil // empty or unreadable as a snapshot: nothing to skip
+	}
+	var dc diskCatalog
+	if err := dec.Decode(&dc); err != nil {
+		return 0, nil // no catalog section: predates any watermark/epoch too
+	}
+	var watermark uint64
+	if err := dec.Decode(&watermark); err != nil {
+		return 0, nil // predates the watermark being written: predates epoch too
+	}
+	var epoch uint64
+	if err := dec.Decode(&epoch); err != nil {
+		return 0, nil // predates the epoch being written: nothing to compare
+	}
+	return epoch, nil
+}

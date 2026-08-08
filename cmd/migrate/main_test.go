@@ -2,9 +2,14 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"encoding/csv"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -148,6 +153,113 @@ func TestQuoteIdentifier(t *testing.T) {
 			got := quoteIdentifier(tt.driver, tt.name)
 			if got != tt.want {
 				t.Errorf("quoteIdentifier(%q, %q) = %q, want %q", tt.driver, tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestExportToExternalSQLiteCharacterization pins exportToExternal's
+// existing end-to-end behavior against a real database/sql target (SQLite,
+// the only external driver this repo can exercise without a live server)
+// before placeholderFor is extracted from its inline per-dialect
+// placeholder switch below. SQLite requires "?" placeholders, so this also
+// exercises (and locks in) the "default" branch of that switch -- if the
+// extraction ever changed what gets generated for a non-postgres driver,
+// every statement here would fail to execute rather than silently drifting.
+func TestExportToExternalSQLiteCharacterization(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "export_target.db")
+
+	extDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer extDB.Close()
+
+	result := &tinysql.ResultSet{
+		Cols: []string{"id", "name", "qty"},
+		Rows: []tinysql.Row{
+			{"id": int64(1), "name": "Alice", "qty": int64(10)},
+			{"id": int64(2), "name": "Bob", "qty": int64(20)},
+		},
+	}
+
+	count, err := exportToExternal(extDB, "sqlite", result, "exported_items", true)
+	if err != nil {
+		t.Fatalf("exportToExternal failed: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("count = %d, want 2", count)
+	}
+
+	rows, err := extDB.QueryContext(ctx, `SELECT "id", "name", "qty" FROM "exported_items" ORDER BY "id"`)
+	if err != nil {
+		t.Fatalf("query exported table: %v", err)
+	}
+	defer rows.Close()
+
+	type got struct {
+		id   int64
+		name string
+		qty  int64
+	}
+	var gotRows []got
+	for rows.Next() {
+		var g got
+		if err := rows.Scan(&g.id, &g.name, &g.qty); err != nil {
+			t.Fatalf("scan row: %v", err)
+		}
+		gotRows = append(gotRows, g)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err: %v", err)
+	}
+
+	want := []got{{1, "Alice", 10}, {2, "Bob", 20}}
+	if len(gotRows) != len(want) {
+		t.Fatalf("got %d rows, want %d: %+v", len(gotRows), len(want), gotRows)
+	}
+	for i := range want {
+		if gotRows[i] != want[i] {
+			t.Errorf("row %d = %+v, want %+v", i, gotRows[i], want[i])
+		}
+	}
+
+	// A second export into the same (already existing) table, with
+	// createTable still true, must not error -- buildExternalCreateTable
+	// uses CREATE TABLE IF NOT EXISTS, and the plain INSERT path must keep
+	// working against a pre-existing table.
+	count2, err := exportToExternal(extDB, "sqlite", result, "exported_items", true)
+	if err != nil {
+		t.Fatalf("second exportToExternal failed: %v", err)
+	}
+	if count2 != 2 {
+		t.Fatalf("second count = %d, want 2", count2)
+	}
+}
+
+func TestPlaceholderFor(t *testing.T) {
+	tests := []struct {
+		driver string
+		idx    int
+		want   string
+	}{
+		{"mysql", 0, "?"},
+		{"mysql", 3, "?"},
+		{"postgres", 0, "$1"},
+		{"postgres", 3, "$4"},
+		{"sqlserver", 0, "?"},
+		{"sqlserver", 3, "?"},
+		{"sqlite", 0, "?"},
+		{"sqlite", 3, "?"},
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%s/%d", tt.driver, tt.idx), func(t *testing.T) {
+			got := placeholderFor(tt.driver, tt.idx)
+			if got != tt.want {
+				t.Errorf("placeholderFor(%q, %d) = %q, want %q", tt.driver, tt.idx, got, tt.want)
 			}
 		})
 	}
@@ -317,5 +429,162 @@ func TestImportXMLFile(t *testing.T) {
 	}
 	if len(result.Rows) != 2 {
 		t.Errorf("expected 2 rows, got %d", len(result.Rows))
+	}
+}
+
+// makeSourceSQLiteDB creates a small sqlite file at path with a table "src"
+// (id, name) containing 2 rows, for use as an import-db source.
+func makeSourceSQLiteDB(t *testing.T, path string) {
+	t.Helper()
+	srcDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open source sqlite db: %v", err)
+	}
+	defer srcDB.Close()
+
+	if _, err := srcDB.Exec("CREATE TABLE src (id INTEGER, name TEXT)"); err != nil {
+		t.Fatalf("create source table: %v", err)
+	}
+	if _, err := srcDB.Exec("INSERT INTO src (id, name) VALUES (1, 'Alice'), (2, 'Bob')"); err != nil {
+		t.Fatalf("insert source rows: %v", err)
+	}
+}
+
+// csvCountValue runs runImportDB with a -tinyquery that counts rows in the
+// imported table, writing csv output to a temp file, and returns the parsed
+// count.
+func csvCountValue(t *testing.T, args []string) int {
+	t.Helper()
+	if err := runImportDB(args); err != nil {
+		t.Fatalf("runImportDB(%v) failed: %v", args, err)
+	}
+	outFile := ""
+	for i, a := range args {
+		if a == "-output" && i+1 < len(args) {
+			outFile = args[i+1]
+		}
+	}
+	if outFile == "" {
+		t.Fatalf("test bug: no -output arg found in %v", args)
+	}
+	data, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("read output file: %v", err)
+	}
+	recs, err := csv.NewReader(strings.NewReader(string(data))).ReadAll()
+	if err != nil {
+		t.Fatalf("parse csv output %q: %v", string(data), err)
+	}
+	if len(recs) != 2 || len(recs[1]) != 1 {
+		t.Fatalf("unexpected csv shape %v (raw %q)", recs, string(data))
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(recs[1][0]))
+	if err != nil {
+		t.Fatalf("parse count %q: %v", recs[1][0], err)
+	}
+	return n
+}
+
+// TestImportDBOmittedDBFileBehavesLikeBefore verifies the critical
+// non-breaking constraint: when -db-file is omitted, import-db must use a
+// fresh empty DB on every invocation and never persist anything. Running the
+// same import twice must produce the same row count each time (no
+// accumulation across runs, no error, no ambient file created).
+func TestImportDBOmittedDBFileBehavesLikeBefore(t *testing.T) {
+	tmpDir := t.TempDir()
+	srcPath := filepath.Join(tmpDir, "source.db")
+	makeSourceSQLiteDB(t, srcPath)
+
+	out1 := filepath.Join(tmpDir, "out1.csv")
+	out2 := filepath.Join(tmpDir, "out2.csv")
+
+	baseArgs := func(out string) []string {
+		return []string{
+			"-dsn", srcPath,
+			"-source-table", "src",
+			"-table", "imported",
+			"-tinyquery", "SELECT COUNT(*) AS c FROM imported",
+			"-format", "csv",
+			"-output", out,
+		}
+	}
+
+	count1 := csvCountValue(t, baseArgs(out1))
+	count2 := csvCountValue(t, baseArgs(out2))
+
+	if count1 != 2 {
+		t.Errorf("run 1: expected count 2, got %d", count1)
+	}
+	if count2 != 2 {
+		t.Errorf("run 2: expected count 2, got %d (should not accumulate without -db-file)", count2)
+	}
+}
+
+// TestImportDBWithDBFileAccumulatesAcrossRuns verifies that passing -db-file
+// loads the existing tinySQL DB at start and saves it back at the end, so
+// that a second invocation against the same file sees the first invocation's
+// data without re-importing it.
+func TestImportDBWithDBFileAccumulatesAcrossRuns(t *testing.T) {
+	tmpDir := t.TempDir()
+	srcPath := filepath.Join(tmpDir, "source.db")
+	makeSourceSQLiteDB(t, srcPath)
+
+	dbFile := filepath.Join(tmpDir, "persist.gob")
+
+	if _, err := os.Stat(dbFile); err == nil {
+		t.Fatalf("db file %s should not exist before run 1", dbFile)
+	}
+
+	// Run 1: import into "run1_tbl", persisting to dbFile (which doesn't
+	// exist yet, so this is effectively the "create on first run" path).
+	run1Args := []string{
+		"-dsn", srcPath,
+		"-source-table", "src",
+		"-table", "run1_tbl",
+		"-db-file", dbFile,
+	}
+	if err := runImportDB(run1Args); err != nil {
+		t.Fatalf("run 1 runImportDB failed: %v", err)
+	}
+
+	if _, err := os.Stat(dbFile); err != nil {
+		t.Fatalf("expected db file %s to be created by run 1: %v", dbFile, err)
+	}
+
+	// Run 2: import into "run2_tbl" against the SAME dbFile. If -db-file is
+	// working correctly, this run loads run 1's persisted DB (which already
+	// contains run1_tbl) before adding run2_tbl, and saves both back.
+	run2Args := []string{
+		"-dsn", srcPath,
+		"-source-table", "src",
+		"-table", "run2_tbl",
+		"-db-file", dbFile,
+	}
+	if err := runImportDB(run2Args); err != nil {
+		t.Fatalf("run 2 runImportDB failed: %v", err)
+	}
+
+	// Load the persisted file directly (independent of any in-process state)
+	// and confirm run1_tbl's rows are visible without having been re-imported
+	// in run 2, i.e. the DB loaded on run 2 already contained run 1's table.
+	loaded, err := tinysql.LoadFromFile(dbFile)
+	if err != nil {
+		t.Fatalf("LoadFromFile(%s) failed: %v", dbFile, err)
+	}
+	defer func() { _ = loaded.Close() }()
+
+	ctx := context.Background()
+	for _, tbl := range []string{"run1_tbl", "run2_tbl"} {
+		stmt, err := tinysql.ParseSQL("SELECT * FROM " + tbl)
+		if err != nil {
+			t.Fatalf("ParseSQL for %s failed: %v", tbl, err)
+		}
+		result, err := tinysql.Execute(ctx, loaded, "default", stmt)
+		if err != nil {
+			t.Fatalf("Execute for %s failed: %v", tbl, err)
+		}
+		if len(result.Rows) != 2 {
+			t.Errorf("table %s: expected 2 rows in persisted db, got %d", tbl, len(result.Rows))
+		}
 	}
 }

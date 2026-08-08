@@ -64,6 +64,21 @@ func truncateTable(ctx context.Context, db *storage.DB, tenant, tableName string
 // Data Insertion
 // ============================================================================
 
+// flushInsertBatch appends batch to tenant/tableName's rows and returns how
+// many rows were added, along with the batch slice reset to length 0 for
+// reuse. It is a no-op (0, batch, nil) when batch is empty.
+func flushInsertBatch(db *storage.DB, tenant, tableName string, batch [][]any) (rowsAdded int64, remaining [][]any, err error) {
+	if len(batch) == 0 {
+		return 0, batch, nil
+	}
+	tbl, err := db.Get(tenant, tableName)
+	if err != nil {
+		return 0, batch, fmt.Errorf("get table: %w", err)
+	}
+	tbl.Rows = append(tbl.Rows, batch...)
+	return int64(len(batch)), batch[:0], nil
+}
+
 // insertAllRecords inserts all CSV records from memory into the table with batching.
 func insertAllRecords(
 	ctx context.Context,
@@ -81,21 +96,12 @@ func insertAllRecords(
 
 	// Helper to flush batch
 	flushBatch := func() error {
-		if len(batch) == 0 {
-			return nil
-		}
-
-		// Get table and append rows directly
-		tbl, err := db.Get(tenant, tableName)
+		added, rest, err := flushInsertBatch(db, tenant, tableName, batch)
 		if err != nil {
-			return fmt.Errorf("get table: %w", err)
+			return err
 		}
-
-		// Append batch to table rows
-		tbl.Rows = append(tbl.Rows, batch...)
-
-		rowsInserted += int64(len(batch))
-		batch = batch[:0] // Clear batch
+		rowsInserted += added
+		batch = rest
 		return nil
 	}
 
@@ -158,18 +164,12 @@ func insertCSVRecords(
 	rowNum := 0
 
 	flushBatch := func() error {
-		if len(batch) == 0 {
-			return nil
-		}
-
-		tbl, err := db.Get(tenant, tableName)
+		added, rest, err := flushInsertBatch(db, tenant, tableName, batch)
 		if err != nil {
-			return fmt.Errorf("get table: %w", err)
+			return err
 		}
-
-		tbl.Rows = append(tbl.Rows, batch...)
-		rowsInserted += int64(len(batch))
-		batch = batch[:0]
+		rowsInserted += added
+		batch = rest
 		return nil
 	}
 
@@ -231,28 +231,6 @@ func insertCSVRecords(
 	}
 
 	return rowsInserted, rowsSkipped, errors
-}
-
-// streamInsertCSV reads CSV records and inserts them into the table with batching.
-// DEPRECATED: Use insertAllRecords instead for simpler in-memory processing.
-//
-//nolint:gocyclo // Legacy streaming importer must juggle many error and batching branches.
-func streamInsertCSV(
-	ctx context.Context,
-	db *storage.DB,
-	tenant string,
-	tableName string,
-	colNames []string,
-	colTypes []storage.ColType,
-	firstDataRow []string,
-	csvr *csv.Reader,
-	opts *ImportOptions,
-) (rowsInserted int64, rowsSkipped int64, errors []string) {
-	initialRecords := make([][]string, 0, 1)
-	if firstDataRow != nil {
-		initialRecords = append(initialRecords, firstDataRow)
-	}
-	return insertCSVRecords(ctx, db, tenant, tableName, colNames, colTypes, initialRecords, csvr, opts)
 }
 
 // convertRow converts a CSV record to a typed row for insertion.

@@ -65,3 +65,30 @@ type OpenMBTilesOptions struct {
 	// makes coverage and integrity queries cheap.
 	WithoutTileData bool
 }
+
+// OpenMBTilesResult reports what an in-place open exposed.
+type OpenMBTilesResult struct {
+	TilesExposed    int64
+	MetadataExposed int64
+	MinZoom         int
+	MaxZoom         int
+	// Truncated is true when MaxTiles stopped the read before the source was
+	// exhausted, so the exposed table is a partial view.
+	Truncated bool
+}
+
+// mbtilesDefaultBatchSize is the tile batch size used by ImportMBTiles,
+// OpenMBTiles and ExportMBTiles when the caller leaves BatchSize unset.
+const mbtilesDefaultBatchSize = 1000
+
+// mbtilesDefaultTableNames fills in "tiles" and "<tiles>_metadata" for
+// whichever of the two names the caller left blank.
+func mbtilesDefaultTableNames(tiles, metadata string) (string, string) {
+	if tiles == "" {
+		tiles = "tiles"
+	}
+	if metadata == "" {
+		metadata = tiles + "_metadata"
+	}
+	return tiles, metadata
+}

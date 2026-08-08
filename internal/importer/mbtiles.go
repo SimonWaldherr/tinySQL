@@ -63,7 +63,7 @@ func ImportMBTiles(
 	// run for the first batch only; later batches append.
 	batchSize := opts.BatchSize
 	if batchSize <= 0 {
-		batchSize = 1000
+		batchSize = mbtilesDefaultBatchSize
 	}
 	appendOpts := *opts
 	appendOpts.CreateTable = false

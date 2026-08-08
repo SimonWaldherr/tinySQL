@@ -2,6 +2,7 @@ package importer
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -195,37 +196,17 @@ func buildGeoJSONRow(f map[string]any, propKeys []string, colTypes []storage.Col
 	return row
 }
 
-// ImportGeoJSON imports a GeoJSON file. It supports FeatureCollection and
-// individual Feature objects. Properties become table columns; geometry is
-// stored in a `geometry` column with type GeometryType.
-func ImportGeoJSON(
-	ctx context.Context,
-	db *storage.DB,
-	tenant string,
-	tableName string,
-	src io.Reader,
-	opts *ImportOptions,
-) (*ImportResult, error) {
-	if opts == nil {
-		opts = &ImportOptions{}
-	}
-	applyDefaults(opts)
-
-	// Extract features from GeoJSON
-	features, err := extractGeoJSONFeatures(src)
-	if err != nil {
-		return nil, err
-	}
-
-	// Build column names
+// importGeoFeatures builds columns/types, creates or truncates the
+// destination table, and inserts one row per feature. It is the shared tail
+// of ImportGeoJSON and ImportTopoJSON, which differ only in how they obtain
+// features.
+func importGeoFeatures(ctx context.Context, db *storage.DB, tenant, tableName string, features []map[string]any, opts *ImportOptions) (*ImportResult, error) {
 	propKeys := buildGeoJSONColumns(features)
 	colNames := sanitizeColumnNames(append([]string{}, propKeys...))
 	colNames = append(colNames, "geometry_type", "geometry")
 
-	// Build sample data for type inference
 	sampleData := buildGeoJSONSampleData(features, propKeys)
 
-	// Infer types for properties; geometry column uses GeometryType
 	var colTypes []storage.ColType
 	if opts.TypeInference {
 		colTypes = inferColumnTypes(sampleData, len(propKeys), opts)
@@ -250,7 +231,6 @@ func ImportGeoJSON(
 		}
 	}
 
-	// Insert rows
 	tbl, err := db.Get(tenant, tableName)
 	if err != nil {
 		return nil, fmt.Errorf("get table: %w", err)
@@ -263,4 +243,39 @@ func ImportGeoJSON(
 	}
 
 	return result, nil
+}
+
+// ImportGeoJSON imports a GeoJSON file. It supports FeatureCollection and
+// individual Feature objects. Properties become table columns; geometry is
+// stored in a `geometry` column with type GeometryType.
+func ImportGeoJSON(
+	ctx context.Context,
+	db *storage.DB,
+	tenant string,
+	tableName string,
+	src io.Reader,
+	opts *ImportOptions,
+) (*ImportResult, error) {
+	if opts == nil {
+		opts = &ImportOptions{}
+	}
+	applyDefaults(opts)
+
+	features, err := extractGeoJSONFeatures(src)
+	if err != nil {
+		return nil, err
+	}
+	return importGeoFeatures(ctx, db, tenant, tableName, features, opts)
+}
+
+// marshalFeaturesAndImportGeoJSON wraps features as a GeoJSON FeatureCollection
+// and imports it via ImportGeoJSON. Shared by the KML and Shapefile importers,
+// which build features via different decoders but converge on this same tail.
+func marshalFeaturesAndImportGeoJSON(ctx context.Context, db *storage.DB, tenant, tableName string, features []map[string]any, opts *ImportOptions) (*ImportResult, error) {
+	fc := map[string]any{"type": "FeatureCollection", "features": features}
+	b, err := json.Marshal(fc)
+	if err != nil {
+		return nil, fmt.Errorf("marshal featurecollection: %w", err)
+	}
+	return ImportGeoJSON(ctx, db, tenant, tableName, bytes.NewReader(b), opts)
 }

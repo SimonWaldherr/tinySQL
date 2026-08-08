@@ -3,9 +3,7 @@
 package importer
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -66,14 +64,7 @@ func ImportShapefile(
 
 	// Reuse GeoJSON importer logic by marshaling features to an in-memory
 	// FeatureCollection JSON and delegating to ImportGeoJSON via decoder.
-	fc := map[string]any{"type": "FeatureCollection", "features": features}
-	b, err := json.Marshal(fc)
-	if err != nil {
-		return nil, fmt.Errorf("marshal featurecollection: %w", err)
-	}
-
-	// Call ImportGeoJSON using a bytes.Reader
-	return ImportGeoJSON(ctx, db, tenant, tableName, bytes.NewReader(b), opts)
+	return marshalFeaturesAndImportGeoJSON(ctx, db, tenant, tableName, features, opts)
 }
 
 // ImportShapefileZip imports a ZIP archive containing a .shp file and its
@@ -140,12 +131,7 @@ func ImportShapefileZip(
 		return nil, fmt.Errorf("no features found in shapefile zip %s", filepath.Base(tmpName))
 	}
 
-	fc := map[string]any{"type": "FeatureCollection", "features": features}
-	b, err := json.Marshal(fc)
-	if err != nil {
-		return nil, fmt.Errorf("marshal featurecollection: %w", err)
-	}
-	return ImportGeoJSON(ctx, db, tenant, tableName, bytes.NewReader(b), opts)
+	return marshalFeaturesAndImportGeoJSON(ctx, db, tenant, tableName, features, opts)
 }
 
 func shpGeometryFromShape(shape shp.Shape) any {

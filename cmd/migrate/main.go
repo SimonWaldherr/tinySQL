@@ -193,9 +193,50 @@ func runImportDB(args []string) error {
 	output := fs.String("output", "", "Output file for query results")
 	format := fs.String("format", "table", "Output format: table, json, csv")
 	verbose := fs.Bool("verbose", false, "Verbose output")
+	dbFile := fs.String("db-file", "", "Path to a tinySQL DB file to load before importing and save after (enables incremental imports across separate runs). If omitted, a fresh in-memory DB is used and nothing is persisted.")
+	mode := fs.String("mode", "full", `Sync mode: "full" (default, always appends rows) or "incremental" (delete-aware upsert using a persisted sync state)`)
+	keyCol := fs.String("key-col", "", "Comma-separated key column name(s); required for -mode=incremental unless -allow-hash-identity is set")
+	allowHashIdentity := fs.Bool("allow-hash-identity", false, "Use a synthetic identity derived from the full row when the source table has no natural key column (-mode=incremental only)")
+	watermarkCol := fs.String("watermark-col", "", "Optional watermark column used to fetch only changed rows (-mode=incremental only)")
+	stateFile := fs.String("state-file", "", "Override the default sync state file location (-mode=incremental only)")
 
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	if *mode != "full" && *mode != "incremental" {
+		return fmt.Errorf(`invalid -mode %q: must be "full" or "incremental"`, *mode)
+	}
+
+	if *mode == "incremental" {
+		if *sourceQuery != "" {
+			return fmt.Errorf("-mode=incremental requires a plain -source-table; -query is not supported for incremental sync")
+		}
+		if *sourceTable == "" {
+			return fmt.Errorf("-mode=incremental requires -source-table")
+		}
+		keyCols := parseKeyCols(*keyCol)
+		if len(keyCols) == 0 && !*allowHashIdentity {
+			return fmt.Errorf("-mode=incremental requires -key-col or -allow-hash-identity")
+		}
+		if *dsn == "" {
+			return fmt.Errorf("database DSN is required (-dsn)")
+		}
+		targetTable := *table
+		if targetTable == "" {
+			targetTable = sanitizeTableName(*sourceTable)
+		}
+		return runImportDBIncremental(importDBIncrementalConfig{
+			dsn:               *dsn,
+			sourceTable:       *sourceTable,
+			targetTable:       targetTable,
+			keyCols:           keyCols,
+			allowHashIdentity: *allowHashIdentity,
+			watermarkCol:      *watermarkCol,
+			stateFilePath:     *stateFile,
+			dbFile:            *dbFile,
+			verbose:           *verbose,
+		})
 	}
 
 	if *dsn == "" {
@@ -229,7 +270,19 @@ func runImportDB(args []string) error {
 		return fmt.Errorf("failed to ping %s: %v", driver, err)
 	}
 
-	db := tinysql.NewDB()
+	var db *tinysql.DB
+	if *dbFile != "" {
+		if _, statErr := os.Stat(*dbFile); statErr == nil {
+			db, err = tinysql.LoadFromFile(*dbFile)
+			if err != nil {
+				return fmt.Errorf("failed to load db file %s: %v", *dbFile, err)
+			}
+		} else {
+			db = tinysql.NewDB()
+		}
+	} else {
+		db = tinysql.NewDB()
+	}
 	ctx := context.Background()
 	tenant := "default"
 
@@ -242,11 +295,25 @@ func runImportDB(args []string) error {
 		fmt.Fprintf(os.Stderr, "✓ Imported %d rows into table '%s' in %v\n", count, *table, time.Since(start))
 	}
 
+	var runErr error
 	if *tinyQuery != "" {
-		return executeAndOutput(db, ctx, tenant, *tinyQuery, *output, *format, *verbose)
+		runErr = executeAndOutput(db, ctx, tenant, *tinyQuery, *output, *format, *verbose)
 	}
 
-	return nil
+	if *dbFile != "" {
+		saveErr := tinysql.SaveToFile(db, *dbFile)
+		// Loading via tinysql.LoadFromFile attaches a WAL manager (an open
+		// file handle) to db; release it now that the snapshot has been
+		// written, rather than leaking it until process exit.
+		if closeErr := db.Close(); closeErr != nil && saveErr == nil {
+			saveErr = closeErr
+		}
+		if saveErr != nil && runErr == nil {
+			runErr = fmt.Errorf("failed to save db file %s: %v", *dbFile, saveErr)
+		}
+	}
+
+	return runErr
 }
 
 // ============================================================================
@@ -319,9 +386,49 @@ func runExportDB(args []string) error {
 	target := fs.String("target", "", "Target table name in external database")
 	createTable := fs.Bool("create", true, "Create target table if it doesn't exist")
 	verbose := fs.Bool("verbose", false, "Verbose output")
+	mode := fs.String("mode", "full", `Sync mode: "full" (default, always appends rows) or "incremental" (delete-aware upsert using a persisted sync state)`)
+	keyCol := fs.String("key-col", "", "Comma-separated key column name(s); required for -mode=incremental unless -allow-hash-identity is set")
+	allowHashIdentity := fs.Bool("allow-hash-identity", false, "Use a synthetic identity derived from the full row when the source table has no natural key column (-mode=incremental only)")
+	watermarkCol := fs.String("watermark-col", "", "Optional watermark column used to fetch only changed rows (-mode=incremental only)")
+	stateFile := fs.String("state-file", "", "Override the default sync state file location (-mode=incremental only)")
 
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	if *mode != "full" && *mode != "incremental" {
+		return fmt.Errorf(`invalid -mode %q: must be "full" or "incremental"`, *mode)
+	}
+
+	if *mode == "incremental" {
+		if *query != "" {
+			return fmt.Errorf("-mode=incremental requires a plain -table; -query is not supported for incremental sync")
+		}
+		if *table == "" {
+			return fmt.Errorf("-mode=incremental requires -table")
+		}
+		keyCols := parseKeyCols(*keyCol)
+		if len(keyCols) == 0 && !*allowHashIdentity {
+			return fmt.Errorf("-mode=incremental requires -key-col or -allow-hash-identity")
+		}
+		if *dsn == "" {
+			return fmt.Errorf("target DSN is required (-dsn)")
+		}
+		targetTable := *target
+		if targetTable == "" {
+			targetTable = *table
+		}
+		return runExportDBIncremental(exportDBIncrementalConfig{
+			dsn:               *dsn,
+			table:             *table,
+			targetTable:       targetTable,
+			keyCols:           keyCols,
+			allowHashIdentity: *allowHashIdentity,
+			watermarkCol:      *watermarkCol,
+			stateFilePath:     *stateFile,
+			filesFlag:         *files,
+			verbose:           *verbose,
+		})
 	}
 
 	if *dsn == "" {
@@ -1082,12 +1189,7 @@ func exportToExternal(extDB *sql.DB, driver string, result *tinysql.ResultSet, t
 	// Build insert statement with placeholders
 	placeholders := make([]string, len(result.Cols))
 	for i := range placeholders {
-		switch driver {
-		case "postgres":
-			placeholders[i] = "$" + strconv.Itoa(i+1)
-		default:
-			placeholders[i] = "?"
-		}
+		placeholders[i] = placeholderFor(driver, i)
 	}
 
 	quotedCols := make([]string, len(result.Cols))
@@ -1443,6 +1545,23 @@ func formatValue(val any) string {
 	default:
 		s := fmt.Sprintf("%v", v)
 		return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+	}
+}
+
+// placeholderFor returns the bind-parameter placeholder for the idx'th
+// (0-based) positional argument of a parameterized statement against
+// driver. postgres (lib/pq) uses numbered placeholders ($1, $2, ...); every
+// other driver in this package (mysql, sqlserver, sqlite) accepts the
+// ordinal "?" placeholder. This is the exact logic exportToExternal used
+// inline before extraction -- see
+// TestExportToExternalSQLiteCharacterization, which pins exportToExternal's
+// end-to-end behavior against the "?" branch across that extraction.
+func placeholderFor(driver string, idx int) string {
+	switch driver {
+	case "postgres":
+		return "$" + strconv.Itoa(idx+1)
+	default:
+		return "?"
 	}
 }
 

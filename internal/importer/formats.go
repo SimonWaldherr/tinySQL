@@ -246,15 +246,7 @@ func ImportYAML(
 		sampleData = append(sampleData, row)
 	}
 
-	var colTypes []storage.ColType
-	if opts.TypeInference {
-		colTypes = inferColumnTypes(sampleData, len(colNames), opts)
-	} else {
-		colTypes = make([]storage.ColType, len(colNames))
-		for i := range colTypes {
-			colTypes[i] = storage.TextType
-		}
-	}
+	colTypes := inferOrDefaultColumnTypes(sampleData, len(colNames), opts)
 
 	result := &ImportResult{Encoding: "utf-8", Errors: make([]string, 0), ColumnNames: colNames, ColumnTypes: colTypes}
 
@@ -456,15 +448,7 @@ func ImportJSON(
 	sampleData := buildJSONSampleData(records, colNames)
 
 	// Infer types
-	var colTypes []storage.ColType
-	if opts.TypeInference {
-		colTypes = inferColumnTypes(sampleData, len(colNames), opts)
-	} else {
-		colTypes = make([]storage.ColType, len(colNames))
-		for i := range colTypes {
-			colTypes[i] = storage.TextType
-		}
-	}
+	colTypes := inferOrDefaultColumnTypes(sampleData, len(colNames), opts)
 	result.ColumnTypes = colTypes
 
 	// Create table
@@ -575,15 +559,7 @@ func ImportXML(
 	result.ColumnNames = colNames
 
 	sampleData := buildJSONSampleData(records, colNames)
-	var colTypes []storage.ColType
-	if opts.TypeInference {
-		colTypes = inferColumnTypes(sampleData, len(colNames), opts)
-	} else {
-		colTypes = make([]storage.ColType, len(colNames))
-		for i := range colTypes {
-			colTypes[i] = storage.TextType
-		}
-	}
+	colTypes := inferOrDefaultColumnTypes(sampleData, len(colNames), opts)
 	result.ColumnTypes = colTypes
 
 	if opts.CreateTable {

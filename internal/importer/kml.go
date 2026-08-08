@@ -2,9 +2,7 @@ package importer
 
 import (
 	"bufio"
-	"bytes"
 	"context"
-	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -148,13 +146,7 @@ func ImportKML(
 	}
 
 	// Marshal to FeatureCollection and delegate to ImportGeoJSON
-	fc := map[string]any{"type": "FeatureCollection", "features": features}
-	b, err := json.Marshal(fc)
-	if err != nil {
-		return nil, fmt.Errorf("marshal featurecollection: %w", err)
-	}
-
-	return ImportGeoJSON(ctx, db, tenant, tableName, bytesNewReader(b), opts)
+	return marshalFeaturesAndImportGeoJSON(ctx, db, tenant, tableName, features, opts)
 }
 
 func collectKMLPlacemarks(root kml) []kmlPlacemark {
@@ -287,4 +279,3 @@ func kmlMultiGeometryValue(multi kmlMultiGeometry) any {
 	return map[string]any{"type": "GeometryCollection", "geometries": geometries}
 }
 
-func bytesNewReader(b []byte) *bytes.Reader { return bytes.NewReader(b) }

@@ -10,6 +10,7 @@ package storage
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
 	"encoding/gob"
 	"errors"
@@ -155,7 +156,84 @@ type AdvancedWAL struct {
 	// silently duplicating every row written since the previous checkpoint.
 	checkpointWatermark LSN
 
+	// checkpointDataWatermark is the highest LSN of any real, committed
+	// operation that a checkpoint has captured -- committedLSN at the exact
+	// moment Checkpoint ran, captured before that call's checkpoint-marker
+	// record consumes its own (necessarily later) LSN. It exists
+	// specifically for ReadCommittedSince's ErrReplicaTooFarBehind check
+	// (wal_feed.go), which must not reuse checkpointWatermark directly: the
+	// marker record's LSN is always at least one past the last real commit
+	// (checkpointWatermark == committedLSN+1 in the common case, more if
+	// other non-data LSNs were consumed around the same moment), so a
+	// replica's sinceLSN -- always a real operation's LSN, from a previous
+	// Bootstrap or ReadCommittedSince call, never a marker's -- can
+	// legitimately equal committedLSN while still being numerically less
+	// than checkpointWatermark. Comparing against checkpointWatermark there
+	// would reject a replica that is not actually missing anything, and
+	// would do so on every poll after every checkpoint that isn't
+	// immediately followed by a new write -- not a rare boundary case but a
+	// standing risk of spinning in an unbounded re-bootstrap loop against an
+	// otherwise idle primary.
+	//
+	// Initialized from checkpointWatermark itself at open time (the only
+	// information available before this process has run a checkpoint of
+	// its own) and refined to the precise value on every subsequent
+	// Checkpoint call. It is deliberately never persisted: a fresh process
+	// falling back to the coarser checkpointWatermark right after it
+	// restarts, before its own first checkpoint, keeps that narrow window
+	// exactly as conservative as this field not existing at all --
+	// unlike letting it reset to zero across a restart would, which would
+	// silently defeat the whole check for any replica whose sinceLSN
+	// predates a checkpoint from a previous run.
+	checkpointDataWatermark LSN
+
+	// epoch identifies which "incarnation" of this WAL/checkpoint pair a
+	// replica is talking to: a random, non-zero value minted once, the
+	// first time OpenAdvancedWAL creates wal.path fresh (see
+	// OpenAdvancedWAL), and carried forward across every later open of the
+	// same WAL by being persisted in the checkpoint file alongside
+	// checkpointWatermark (see Checkpoint and ReadCheckpointEpoch). 0 is
+	// reserved as the "no epoch recorded" sentinel for a pre-existing WAL/
+	// checkpoint pair that predates this field (upgrading a running
+	// deployment must not manufacture spurious epoch churn on an ordinary
+	// restart), so OpenAdvancedWAL only ever mints a fresh non-zero epoch
+	// when wal.path itself did not already exist -- never merely because a
+	// checkpoint carrying one is missing.
+	//
+	// A replication feed (see SnapshotWithWatermark, and cmd/server's
+	// Bootstrap/GetChangesSince handlers, which surface this in every
+	// response) uses a change in epoch to detect that the primary's WAL/
+	// checkpoint files were wiped or restored from backup out from under an
+	// already-syncing replica: LSNs alone cannot catch this reliably, since
+	// a fresh WAL restarts LSN numbering from 1 and could easily assign
+	// small LSNs that still look "not yet requested" to a replica's stale,
+	// numerically-larger sinceLSN from the previous incarnation. A replica
+	// that sees its remembered epoch stop matching must never keep applying
+	// records incrementally against the new incarnation's unrelated
+	// history -- it must re-bootstrap from scratch instead.
+	epoch uint64
+
 	closed bool
+}
+
+// newWALEpoch returns a fresh, non-zero random identifier for
+// OpenAdvancedWAL to tag a newly created WAL file with (see
+// AdvancedWAL.epoch's doc comment for what it is for and why 0 is reserved).
+func newWALEpoch() uint64 {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand.Read failing is effectively unheard of on any real
+		// platform. Fall back to a coarse but still-useful discriminator
+		// rather than silently leaving the epoch at the reserved zero
+		// sentinel, which would make a genuinely fresh WAL indistinguishable
+		// from "no epoch recorded" and defeat the safety net entirely.
+		return uint64(time.Now().UnixNano()) | 1
+	}
+	e := binary.BigEndian.Uint64(b[:])
+	if e == 0 {
+		e = 1
+	}
+	return e
 }
 
 // WALTxState tracks the state of a transaction in the WAL.
@@ -208,6 +286,15 @@ func OpenAdvancedWAL(config AdvancedWALConfig) (*AdvancedWAL, error) {
 		return nil, fmt.Errorf("create WAL directory: %w", err)
 	}
 
+	// Recorded before O_CREATE below can bring the file into existence, so
+	// it reflects whether this call is creating wal.path fresh -- the only
+	// condition under which a new epoch (see AdvancedWAL.epoch's doc
+	// comment) is minted.
+	walFileExisted := false
+	if _, statErr := os.Stat(config.Path); statErr == nil {
+		walFileExisted = true
+	}
+
 	// Open or create WAL file
 	file, err := os.OpenFile(config.Path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
@@ -222,6 +309,7 @@ func OpenAdvancedWAL(config AdvancedWALConfig) (*AdvancedWAL, error) {
 	writer := bufio.NewWriterSize(cw, config.BufferSize)
 
 	var checkpointWatermark LSN
+	var epoch uint64
 	if config.CheckpointPath != "" {
 		w, err := ReadCheckpointWatermark(config.CheckpointPath)
 		if err != nil {
@@ -229,21 +317,37 @@ func OpenAdvancedWAL(config AdvancedWALConfig) (*AdvancedWAL, error) {
 			return nil, fmt.Errorf("read checkpoint watermark: %w", err)
 		}
 		checkpointWatermark = LSN(w)
+
+		e, err := ReadCheckpointEpoch(config.CheckpointPath)
+		if err != nil {
+			_ = file.Close()
+			return nil, fmt.Errorf("read checkpoint epoch: %w", err)
+		}
+		epoch = e
+	}
+	if !walFileExisted {
+		// A genuinely fresh WAL: mint a new epoch now, regardless of
+		// whatever a stale/mismatched checkpoint file happened to carry.
+		// Persisted lazily -- the same as checkpointWatermark itself -- the
+		// next time Checkpoint runs.
+		epoch = newWALEpoch()
 	}
 
 	wal := &AdvancedWAL{
-		path:                config.Path,
-		checkpointPath:      config.CheckpointPath,
-		file:                file,
-		bytes:               cw,
-		writer:              writer,
-		checkpointEvery:     config.CheckpointEvery,
-		checkpointInterval:  config.CheckpointInterval,
-		checkpointMaxBytes:  normalizeCheckpointMaxBytes(config.CheckpointMaxBytes),
-		lastCheckpoint:      time.Now(),
-		activeTxs:           make(map[TxID]*WALTxState),
-		nextLSN:             checkpointWatermark + 1,
-		checkpointWatermark: checkpointWatermark,
+		path:                    config.Path,
+		checkpointPath:          config.CheckpointPath,
+		file:                    file,
+		bytes:                   cw,
+		writer:                  writer,
+		checkpointEvery:         config.CheckpointEvery,
+		checkpointInterval:      config.CheckpointInterval,
+		checkpointMaxBytes:      normalizeCheckpointMaxBytes(config.CheckpointMaxBytes),
+		lastCheckpoint:          time.Now(),
+		activeTxs:               make(map[TxID]*WALTxState),
+		nextLSN:                 checkpointWatermark + 1,
+		checkpointWatermark:     checkpointWatermark,
+		checkpointDataWatermark: checkpointWatermark,
+		epoch:                   epoch,
 	}
 
 	wal.encoder = gob.NewEncoder(writer)
@@ -492,7 +596,13 @@ func (w *AdvancedWAL) Checkpoint(db *DB) error {
 	// mutation). If a crash lands between this save and the WAL truncation
 	// below, Recover uses the watermark to skip re-applying records this
 	// snapshot already contains, instead of silently duplicating them.
-	if err := SaveToFile(db, w.checkpointPath, uint64(lsn)); err != nil {
+	//
+	// w.epoch rides along as a second extra value (see ReadCheckpointEpoch,
+	// which decodes it back out in that same order) so a replication feed
+	// reading this checkpoint later can tell this WAL's identity apart from
+	// any other incarnation that might come to occupy the same path (see
+	// AdvancedWAL.epoch's doc comment).
+	if err := SaveToFile(db, w.checkpointPath, uint64(lsn), w.epoch); err != nil {
 		return fmt.Errorf("checkpoint save: %w", err)
 	}
 
@@ -517,6 +627,15 @@ func (w *AdvancedWAL) Checkpoint(db *DB) error {
 	w.recordsSinceCP = 0
 	w.lastCheckpoint = time.Now()
 	w.checkpointWatermark = lsn
+	// Refines checkpointDataWatermark to the precise value for this
+	// process's lifetime -- committedLSN is unchanged by everything above
+	// (only nextLSN/checkpointWatermark move), so this is exactly "the
+	// highest real, committed LSN this checkpoint's snapshot captured," not
+	// the checkpoint marker's own (necessarily later) LSN. See
+	// checkpointDataWatermark's doc comment for why ReadCommittedSince
+	// (wal_feed.go) needs this distinction to avoid rejecting a replica
+	// that is not actually missing anything.
+	w.checkpointDataWatermark = w.committedLSN
 	// nextLSN is deliberately NOT reset here: LSN is documented as globally
 	// unique and monotonically increasing for the database's lifetime (see
 	// the LSN doc comment and GetNextLSN/GetCommittedLSN/GetFlushedLSN,
@@ -637,7 +756,7 @@ func (w *AdvancedWAL) Recover(db *DB) (int, error) {
 			// Apply all operations for this transaction
 			if ops, exists := pending[record.TxID]; exists {
 				for _, op := range ops {
-					table, err := w.applyOperation(db, op)
+					table, err := applyOperation(db, op)
 					if err != nil {
 						return recovered, fmt.Errorf("apply operation at LSN %d: %w", op.LSN, err)
 					}
@@ -684,7 +803,12 @@ func (w *AdvancedWAL) Recover(db *DB) (int, error) {
 // the table it touched (or nil for a no-op delete/update against a table
 // that no longer exists) so the caller can defer index/stats maintenance
 // until the whole WAL has been replayed instead of redoing it per op.
-func (w *AdvancedWAL) applyOperation(db *DB, record *WALRecord) (*Table, error) {
+//
+// This is a plain function, not a method: it needs no AdvancedWAL state
+// (nor does rowsEqual, below) — only db and the record being applied — so it
+// can be reused as-is by ApplyWALRecord (wal_feed.go) for a replication
+// feed's apply path without needing a *AdvancedWAL to call it on.
+func applyOperation(db *DB, record *WALRecord) (*Table, error) {
 	table, err := db.Get(record.Tenant, record.Table)
 	if err != nil {
 		// Table doesn't exist - create it
@@ -708,7 +832,7 @@ func (w *AdvancedWAL) applyOperation(db *DB, record *WALRecord) (*Table, error) 
 		found := false
 		for i, row := range table.Rows {
 			// Simple comparison - in production would need proper row ID tracking
-			if w.rowsEqual(row, record.BeforeImage) {
+			if rowsEqual(row, record.BeforeImage) {
 				table.Rows[i] = record.AfterImage
 				found = true
 				break
@@ -723,7 +847,7 @@ func (w *AdvancedWAL) applyOperation(db *DB, record *WALRecord) (*Table, error) 
 	case WALOpDelete:
 		// Find and remove the row
 		for i, row := range table.Rows {
-			if w.rowsEqual(row, record.BeforeImage) {
+			if rowsEqual(row, record.BeforeImage) {
 				table.Rows = append(table.Rows[:i], table.Rows[i+1:]...)
 				break
 			}
@@ -738,7 +862,7 @@ func (w *AdvancedWAL) applyOperation(db *DB, record *WALRecord) (*Table, error) 
 }
 
 // rowsEqual compares two rows for equality.
-func (w *AdvancedWAL) rowsEqual(a, b []any) bool {
+func rowsEqual(a, b []any) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -982,6 +1106,15 @@ func (w *AdvancedWAL) GetCommittedLSN() LSN {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.committedLSN
+}
+
+// Epoch returns this WAL's current epoch identifier -- see AdvancedWAL.epoch's
+// doc comment for what it identifies and why a replication feed compares it
+// across calls instead of relying on LSNs alone.
+func (w *AdvancedWAL) Epoch() uint64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.epoch
 }
 
 // GetFlushedLSN returns the LSN of the last flushed record.

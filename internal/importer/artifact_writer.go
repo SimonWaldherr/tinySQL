@@ -40,6 +40,67 @@ func cloneArtifactProvenance(in map[string]any) (map[string]any, error) {
 	return out, nil
 }
 
+// defaultArtifactMaxMemoryBytes bounds how much memory an artifact import or
+// open holds if the caller leaves MaxMemoryBytes unset.
+const defaultArtifactMaxMemoryBytes = 64 << 20
+
+// applyArtifactOptionDefaults fills in the batching/memory/progress-interval
+// defaults shared by ImportMBTilesArtifact and ImportTileArtifact. Schema
+// defaulting is deliberately left to each caller, since the two disagree on
+// what an empty Schema means.
+func applyArtifactOptionDefaults(opts *MBTilesArtifactOptions) {
+	if opts.BatchSize <= 0 {
+		opts.BatchSize = 1000
+	}
+	if opts.MaxMemoryBytes <= 0 {
+		opts.MaxMemoryBytes = defaultArtifactMaxMemoryBytes
+	}
+	if opts.ProgressEvery <= 0 {
+		opts.ProgressEvery = 250 * time.Millisecond
+	}
+}
+
+// checkArtifactResourceBudget returns an error if the estimated memory or
+// disk requirement for an import of the given kind (e.g. "MBTiles import",
+// "tile stream import") exceeds opts' configured limits.
+func checkArtifactResourceBudget(estimate MBTilesResourceEstimate, opts *MBTilesArtifactOptions, kind string) error {
+	if estimate.EstimatedMemory > opts.MaxMemoryBytes {
+		return fmt.Errorf("insufficient memory for %s: need %d bytes, limit %d bytes", kind, estimate.EstimatedMemory, opts.MaxMemoryBytes)
+	}
+	if estimate.AvailableDisk >= 0 && estimate.AvailableDisk < estimate.EstimatedDisk+opts.MinFreeBytes {
+		return fmt.Errorf("insufficient disk space for %s: need %d bytes plus reserve %d, available %d", kind, estimate.EstimatedDisk, opts.MinFreeBytes, estimate.AvailableDisk)
+	}
+	return nil
+}
+
+// ensureArtifactTargetAvailable rejects an existing artifact path unless
+// replace is set.
+func ensureArtifactTargetAvailable(artifactPath string, replace bool) error {
+	if _, err := os.Stat(artifactPath); err == nil && !replace {
+		return fmt.Errorf("artifact already exists: %s", artifactPath)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect artifact target: %w", err)
+	}
+	return nil
+}
+
+// newTempArtifactDir creates the ".tinysql-artifact-*" staging directory
+// (with its "database" and "indexes" subdirectories) that an artifact import
+// builds inside before publishing. The caller owns cleanup, typically via
+// `defer os.RemoveAll(dir)` on the returned path.
+func newTempArtifactDir(parent string) (string, error) {
+	tmp, err := os.MkdirTemp(parent, ".tinysql-artifact-*")
+	if err != nil {
+		return "", fmt.Errorf("create temporary artifact: %w", err)
+	}
+	for _, dir := range []string{"database", "indexes"} {
+		if err := os.Mkdir(filepath.Join(tmp, dir), 0o755); err != nil {
+			return "", fmt.Errorf("create artifact directory %s: %w", dir, err)
+		}
+	}
+	return tmp, nil
+}
+
 func createArtifactTables(db *storage.DB, schema MBTilesArtifactSchema) error {
 	metadata := storage.NewTable("metadata", []storage.Column{{Name: "name", Type: storage.TextType}, {Name: "value", Type: storage.TextType}}, false)
 	if err := metadata.CreateSecondaryIndex("metadata_name", []string{"name"}, true); err != nil {

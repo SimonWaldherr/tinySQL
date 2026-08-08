@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -154,6 +156,63 @@ type queryResponse struct {
 	Truncated bool             `json:"truncated,omitempty"`
 }
 
+// bootstrapRequest/bootstrapResponse and getChangesSinceRequest/
+// getChangesSinceResponse are the primary-side RPC types for one-way WAL
+// replication (see server.Bootstrap and server.GetChangesSince). Tenant is
+// accepted on both requests for parity with execRequest/queryRequest and
+// forward compatibility with per-tenant replication, but is not yet used to
+// scope the snapshot or the WAL read: storage.SnapshotWithWatermark and
+// storage.ReadCommittedSince both operate on the whole database (every
+// tenant) today.
+//
+// SnapshotGob and RecordsGob are gob-encoded payloads carried as opaque
+// bytes inside a JSON envelope (the gRPC call itself still uses the
+// existing jsonCodec). Running WALRecord payloads through jsonCodec
+// directly would lose concrete Go types held in BeforeImage/AfterImage
+// (int64, *big.Rat, uuid.UUID, time.Time, ...) via the json.Unmarshal-into-
+// "any" round trip -- fine for display-only Query responses, unsafe for
+// replicated row data that must be applied byte-for-byte equivalent on the
+// replica. gob preserves those concrete types, and the WAL file already
+// gob-encodes WALRecord, so no new type registration is needed.
+type bootstrapRequest struct {
+	Tenant string `json:"tenant"`
+}
+
+type bootstrapResponse struct {
+	SnapshotGob  []byte `json:"snapshot_gob"`
+	WatermarkLSN uint64 `json:"watermark_lsn"`
+
+	// Epoch identifies the primary's current WAL/checkpoint incarnation
+	// (see storage.AdvancedWAL.Epoch's doc comment). A replica remembers it
+	// and compares it against every later GetChangesSinceResponse.Epoch: a
+	// mismatch means the primary's WAL/checkpoint files were wiped or
+	// restored from backup since this bootstrap, and incremental polling
+	// can no longer be trusted -- a fresh Bootstrap is required.
+	Epoch uint64 `json:"epoch"`
+}
+
+type getChangesSinceRequest struct {
+	Tenant   string `json:"tenant"`
+	SinceLSN uint64 `json:"since_lsn"`
+}
+
+type getChangesSinceResponse struct {
+	RecordsGob []byte `json:"records_gob"`
+	ResumeLSN  uint64 `json:"resume_lsn"`
+
+	// Epoch mirrors bootstrapResponse.Epoch, repeated on every poll rather
+	// than left implicit from Bootstrap. This is deliberate, not just
+	// belt-and-suspenders: a primary reset to a fresh WAL restarts LSN
+	// numbering from 1, so a stale, numerically-larger sinceLSN from a
+	// replica's previous incarnation can land safely inside the reset
+	// primary's own (small) LSN range and return zero new records with no
+	// error at all -- ErrReplicaTooFarBehind/codes.OutOfRange never fires in
+	// that case, since the reset primary's checkpoint watermark starts back
+	// at 0. Only comparing Epoch on every single poll response, not just at
+	// Bootstrap, catches that silent case.
+	Epoch uint64 `json:"epoch"`
+}
+
 // gRPC JSON codec
 type jsonCodec struct{}
 
@@ -165,6 +224,8 @@ func (jsonCodec) Unmarshal(data []byte, v any) error { return json.Unmarshal(dat
 type TinySQLServer interface {
 	Exec(context.Context, *execRequest) (*execResponse, error)
 	Query(context.Context, *queryRequest) (*queryResponse, error)
+	Bootstrap(context.Context, *bootstrapRequest) (*bootstrapResponse, error)
+	GetChangesSince(context.Context, *getChangesSinceRequest) (*getChangesSinceResponse, error)
 }
 
 func registerTinySQLServer(s *grpc.Server, srv TinySQLServer) {
@@ -174,8 +235,16 @@ func registerTinySQLServer(s *grpc.Server, srv TinySQLServer) {
 		Methods: []grpc.MethodDesc{
 			{MethodName: "Exec", Handler: _TinySQL_Exec_Handler},
 			{MethodName: "Query", Handler: _TinySQL_Query_Handler},
+			{MethodName: "Bootstrap", Handler: _TinySQL_Bootstrap_Handler},
+			{MethodName: "GetChangesSince", Handler: _TinySQL_GetChangesSince_Handler},
 		},
-		Streams:  []grpc.StreamDesc{},
+		Streams: []grpc.StreamDesc{
+			{
+				StreamName:    "GetChanges",
+				Handler:       _TinySQL_GetChanges_Handler,
+				ServerStreams: true,
+			},
+		},
 		Metadata: "tinysql", // informational
 	}, srv)
 }
@@ -208,6 +277,141 @@ func _TinySQL_Query_Handler(srv any, ctx context.Context, dec func(any) error, i
 		return srv.(TinySQLServer).Query(ctx, req.(*queryRequest))
 	}
 	return interceptor(ctx, in, info, handler)
+}
+
+func _TinySQL_Bootstrap_Handler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
+	in := new(bootstrapRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TinySQLServer).Bootstrap(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{Server: srv, FullMethod: "/tinysql.TinySQL/Bootstrap"}
+	handler := func(ctx context.Context, req any) (any, error) {
+		return srv.(TinySQLServer).Bootstrap(ctx, req.(*bootstrapRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _TinySQL_GetChangesSince_Handler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
+	in := new(getChangesSinceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TinySQLServer).GetChangesSince(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{Server: srv, FullMethod: "/tinysql.TinySQL/GetChangesSince"}
+	handler := func(ctx context.Context, req any) (any, error) {
+		return srv.(TinySQLServer).GetChangesSince(ctx, req.(*getChangesSinceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// _TinySQL_GetChanges_Handler is the gRPC server-streaming counterpart of
+// _TinySQL_GetChangesSince_Handler/server.GetChangesSince: rather than a
+// replica repeatedly invoking a unary RPC and sleeping between calls
+// itself (see runReplicaPollLoop in replica.go), it holds one stream open
+// and pushes new committed WAL records to the replica as soon as they
+// exist, via the exact same WAL-read-and-gob-encode logic GetChangesSince
+// uses (s.computeChangesSince) -- falling back to the same
+// 25ms-to-1s backoff schedule runReplicaPollLoop uses client-side
+// (replicaMinPollBackoff/replicaMaxPollBackoff/replicaNextBackoff/
+// replicaSleep, all defined in replica.go, package-shared) when there is
+// nothing new to send.
+//
+// grpc.UnaryInterceptor (installed once on the whole *grpc.Server in
+// startGRPCServer) only wraps methods dispatched through a
+// grpc.MethodDesc -- i.e. unary RPCs -- and is never invoked for a
+// grpc.StreamDesc-registered RPC like this one, so this handler performs
+// its own auth check inline, reusing the exact
+// metadata/bearerToken/isAuthorized helpers grpcUnaryInterceptor uses for
+// Exec/Query/Bootstrap/GetChangesSince.
+func _TinySQL_GetChanges_Handler(srv any, stream grpc.ServerStream) (err error) {
+	s, ok := srv.(*server)
+	if !ok {
+		// registerTinySQLServer only ever registers a *server, but guard
+		// defensively rather than panicking on an unexpected type.
+		return status.Error(codes.Internal, "unexpected server type")
+	}
+
+	// grpc-go does not recover panics in stream handlers the way
+	// grpcUnaryInterceptor recovers them for unary ones (there is no
+	// stream-interceptor equivalent installed), so an unrecovered panic
+	// here would crash the whole process rather than just failing this one
+	// RPC. Guard the same way grpcUnaryInterceptor does for unary calls.
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("panic in gRPC stream /tinysql.TinySQL/GetChanges: %v", rec)
+			err = status.Error(codes.Internal, "internal server error")
+		}
+	}()
+
+	if s.authToken != "" {
+		token := ""
+		if md, ok := metadata.FromIncomingContext(stream.Context()); ok {
+			if vals := md.Get("authorization"); len(vals) > 0 {
+				token = bearerToken(vals[0])
+			}
+		}
+		if !s.isAuthorized(token) {
+			return status.Error(codes.Unauthenticated, "unauthorized")
+		}
+	}
+
+	var req getChangesSinceRequest
+	if err := stream.RecvMsg(&req); err != nil {
+		return err
+	}
+
+	ctx := stream.Context()
+	sinceLSN := req.SinceLSN
+	backoff := replicaMinPollBackoff
+
+	// lastSentEpoch tracks the primary's WAL epoch as of the last message
+	// actually pushed down this stream. It starts at 0, which no real
+	// AdvancedWAL epoch ever is (see storage.AdvancedWAL's epoch field doc
+	// comment; TestBootstrapAndGetChangesSince asserts a fresh epoch is
+	// nonzero), so the very first loop iteration below always sends --
+	// even if there happen to be zero new records right now. Without this,
+	// a primary that gets reset to a fresh epoch with nothing new past the
+	// replica's stale sinceLSN (a real scenario: a backup restore right
+	// after the exact point a replica last read) would never send
+	// anything on this stream at all, and the replica would have no way to
+	// learn its epoch no longer matches -- unlike the unary GetChangesSince
+	// transport, which returns Epoch on every single call regardless of
+	// whether anything is new. Once the first message (or any epoch
+	// change) has been sent, an ordinary empty poll goes back to being
+	// silent, matching the streaming design's "push only when there is
+	// something worth pushing" intent.
+	lastSentEpoch := uint64(0)
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		resp, n, err := s.computeChangesSince(sinceLSN)
+		if err != nil {
+			return err
+		}
+
+		if n > 0 || resp.Epoch != lastSentEpoch {
+			if err := stream.SendMsg(resp); err != nil {
+				return err
+			}
+			sinceLSN = resp.ResumeLSN
+			lastSentEpoch = resp.Epoch
+			backoff = replicaMinPollBackoff
+			continue
+		}
+
+		if !replicaSleep(ctx, backoff) {
+			return ctx.Err()
+		}
+		backoff = replicaNextBackoff(backoff)
+	}
 }
 
 // server state
@@ -646,6 +850,81 @@ func (s *server) Query(ctx context.Context, req *queryRequest) (*queryResponse, 
 		Count:     len(rows),
 		Truncated: truncated,
 	}, nil
+}
+
+// errNoAdvancedWAL is returned (wrapped in a gRPC FailedPrecondition status)
+// by Bootstrap and GetChangesSince when the database has no AdvancedWAL
+// attached -- i.e. it is not running with a DSN mode=advanced_wal -- so
+// there is no LSN watermark or WAL log to replicate from. Both handlers
+// check this explicitly rather than letting a nil *storage.AdvancedWAL
+// reach storage.SnapshotWithWatermark/storage.ReadCommittedSince and panic.
+var errNoAdvancedWAL = errors.New("database is not running with an advanced WAL (start with a DSN mode=advanced_wal to enable replication)")
+
+// Bootstrap implements the primary side of one-way WAL replication's
+// initial sync: it returns a consistent snapshot of the whole database
+// together with the WAL LSN watermark up to which that snapshot is known to
+// be complete, for a replica (see runReplicaBootstrap in replica.go) to
+// decode via storage.LoadFromBytes and then resume from via
+// GetChangesSince(sinceLSN=watermark).
+func (s *server) Bootstrap(ctx context.Context, req *bootstrapRequest) (*bootstrapResponse, error) {
+	wal := s.db.AdvancedWAL()
+	if wal == nil {
+		return nil, status.Error(codes.FailedPrecondition, errNoAdvancedWAL.Error())
+	}
+
+	data, watermark, epoch, err := storage.SnapshotWithWatermark(s.db, wal)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "snapshot: %v", err)
+	}
+
+	return &bootstrapResponse{SnapshotGob: data, WatermarkLSN: watermark, Epoch: epoch}, nil
+}
+
+// GetChangesSince implements the primary side of WAL polling: it returns
+// every committed WAL record after req.SinceLSN, gob-encoded into
+// RecordsGob (see the type comment on getChangesSinceResponse for why this
+// does not go through jsonCodec), plus the LSN a caller should pass as
+// SinceLSN on its next call (see storage.ReadCommittedSince).
+//
+// storage.ErrReplicaTooFarBehind -- req.SinceLSN already checkpointed and
+// truncated out of the live WAL -- is mapped to codes.OutOfRange rather
+// than the generic codes.Internal every other read failure gets, so a
+// replica (see replica.go's pollChangesSinceOnce) can distinguish "you must
+// re-bootstrap" from an ordinary transient error and react accordingly
+// instead of retrying a now-unserviceable range forever.
+func (s *server) GetChangesSince(ctx context.Context, req *getChangesSinceRequest) (*getChangesSinceResponse, error) {
+	resp, _, err := s.computeChangesSince(req.SinceLSN)
+	return resp, err
+}
+
+// computeChangesSince reads and gob-encodes every committed WAL record
+// after sinceLSN (see storage.ReadCommittedSince) into the response shape
+// both GetChangesSince (one-shot, unary) and _TinySQL_GetChanges_Handler
+// (repeatedly, in its streaming send loop) return to a replica. recordCount
+// is the number of WALRecord values RecordsGob carries, returned alongside
+// so a caller (specifically the streaming handler, deciding whether there
+// is anything new to push right now) doesn't have to gob-decode
+// RecordsGob just to find out.
+func (s *server) computeChangesSince(sinceLSN uint64) (resp *getChangesSinceResponse, recordCount int, err error) {
+	wal := s.db.AdvancedWAL()
+	if wal == nil {
+		return nil, 0, status.Error(codes.FailedPrecondition, errNoAdvancedWAL.Error())
+	}
+
+	records, resumeLSN, err := storage.ReadCommittedSince(wal, sinceLSN)
+	if err != nil {
+		if errors.Is(err, storage.ErrReplicaTooFarBehind) {
+			return nil, 0, status.Error(codes.OutOfRange, err.Error())
+		}
+		return nil, 0, status.Errorf(codes.Internal, "read WAL: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(records); err != nil {
+		return nil, 0, status.Errorf(codes.Internal, "encode WAL records: %v", err)
+	}
+
+	return &getChangesSinceResponse{RecordsGob: buf.Bytes(), ResumeLSN: resumeLSN, Epoch: wal.Epoch()}, len(records), nil
 }
 
 // truncateRows caps rows to at most maxRows entries and/or an approximate
@@ -1414,6 +1693,10 @@ func openFileDBFromDSN(dsn string) (*storage.DB, string, error) {
 func run() error {
 	flag.Parse()
 
+	if replicaOf := strings.TrimSpace(*flagReplicaOf); replicaOf != "" {
+		return runReplica(replicaOf)
+	}
+
 	httpAddr, grpcAddr, minTLSVersion, trustedProxies, err := parseRunConfig()
 	if err != nil {
 		return err
@@ -1453,7 +1736,7 @@ func run() error {
 		return err
 	}
 
-	grpcSrv, err := startGRPCServer(srv, db, grpcAddr, minTLSVersion, errChan)
+	grpcSrv, _, err := startGRPCServer(srv, db, grpcAddr, minTLSVersion, errChan)
 	if err != nil {
 		return err
 	}
@@ -1635,15 +1918,20 @@ func startHTTPServer(srv *server, db *storage.DB, httpAddr string, minTLSVersion
 	return httpSrv, nil
 }
 
-func startGRPCServer(srv *server, db *storage.DB, grpcAddr string, minTLSVersion uint16, errChan chan<- error) (*grpc.Server, error) {
+// startGRPCServer returns the *grpc.Server plus the address it actually
+// bound to (net.Listener.Addr().String()) -- distinct from grpcAddr when
+// grpcAddr uses ":0" or "host:0" for an OS-assigned port, which tests use to
+// get a free loopback port for a real in-process primary (see
+// cmd/server/replica_test.go).
+func startGRPCServer(srv *server, db *storage.DB, grpcAddr string, minTLSVersion uint16, errChan chan<- error) (*grpc.Server, string, error) {
 	if grpcAddr == "" {
-		return nil, nil
+		return nil, "", nil
 	}
 	lis, err := net.Listen("tcp", grpcAddr)
 	if err != nil {
 		srv.ready.Store(false)
 		_ = db.Close()
-		return nil, fmt.Errorf("grpc listen: %w", err)
+		return nil, "", fmt.Errorf("grpc listen: %w", err)
 	}
 
 	grpcOpts := []grpc.ServerOption{
@@ -1656,7 +1944,7 @@ func startGRPCServer(srv *server, db *storage.DB, grpcAddr string, minTLSVersion
 		srv.ready.Store(false)
 		_ = lis.Close()
 		_ = db.Close()
-		return nil, err
+		return nil, "", err
 	}
 	if grpcTLSCfg != nil {
 		grpcOpts = append(grpcOpts, grpc.Creds(credentials.NewTLS(grpcTLSCfg)))
@@ -1665,17 +1953,18 @@ func startGRPCServer(srv *server, db *storage.DB, grpcAddr string, minTLSVersion
 	grpcSrv := grpc.NewServer(grpcOpts...)
 	registerTinySQLServer(grpcSrv, srv)
 
+	boundAddr := lis.Addr().String()
 	go func() {
 		proto := "plaintext"
 		if *flagGRPCTLSCert != "" && *flagGRPCTLSKey != "" {
 			proto = "tls"
 		}
-		log.Printf("gRPC listening on %s (%s)", grpcAddr, proto)
+		log.Printf("gRPC listening on %s (%s)", boundAddr, proto)
 		if serveErr := grpcSrv.Serve(lis); serveErr != nil && !errors.Is(serveErr, grpc.ErrServerStopped) {
 			errChan <- fmt.Errorf("grpc serve: %w", serveErr)
 		}
 	}()
-	return grpcSrv, nil
+	return grpcSrv, boundAddr, nil
 }
 
 func waitForServerStop(errChan <-chan error) error {
