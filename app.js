@@ -302,6 +302,10 @@ function sqlMayMutate(sql) {
 
 // Initialize WASM
 async function initWasm() {
+    const statusIndicator = document.querySelector('.status-indicator');
+    statusIndicator?.classList.remove('ready', 'failed');
+    statusIndicator?.classList.add('loading');
+    updateStatus('Loading local engine…');
     const go = new Go();
     
     try {
@@ -329,7 +333,8 @@ async function initWasm() {
         ));
         
         updateStatus("Ready");
-        document.querySelector('.status-indicator').classList.add('ready');
+        statusIndicator?.classList.remove('loading', 'failed');
+        statusIndicator?.classList.add('ready');
         document.getElementById('executeBtn').disabled = false;
         const hashDemoPayload = decodeDemoHash();
         if (!hashDemoPayload) {
@@ -372,7 +377,8 @@ async function initWasm() {
     } catch (err) {
         console.error("Failed to load WASM:", err);
         updateStatus("Failed to load WASM");
-        document.querySelector('.status-indicator').classList.add('failed');
+        statusIndicator?.classList.remove('loading', 'ready');
+        statusIndicator?.classList.add('failed');
     }
 }
 
@@ -1977,7 +1983,8 @@ async function importSingleFile(file) {
 // Import Excel file using SheetJS
 async function importExcelFile(file) {
     if (typeof XLSX === 'undefined') {
-        alert('Excel support library not loaded. Please refresh the page.');
+        showToast('Excel support is unavailable right now. Try CSV or JSON, or refresh the page.', 'error');
+        updateStatus('Excel support unavailable');
         return false;
     }
 
@@ -2090,13 +2097,7 @@ function renderTables() {
 
     updateDemoQueryVisibility();
     if (!hasAny) {
-        tableList.innerHTML = `
-            <div class="empty-state">
-                <div class="empty-state-icon">📊</div>
-                <div class="empty-state-title">No Tables Loaded</div>
-                <div class="empty-state-text">Upload a file to get started</div>
-            </div>
-        `;
+        tableList.innerHTML = emptyTablesMarkup();
         return;
     }
 
@@ -2156,6 +2157,21 @@ function renderTables() {
 
     tableList.innerHTML = html;
     setupTableListDelegation();
+}
+
+function emptyTablesMarkup() {
+    return `
+        <div class="empty-state empty-tables-state">
+            <div class="empty-state-icon">📊</div>
+            <div class="empty-state-title">No Tables Loaded</div>
+            <div class="empty-state-text">Start with a local file or a guided sample.</div>
+            <div class="empty-state-actions">
+                <button class="empty-state-action" type="button" onclick="showUploadDialog()">Add a file</button>
+                <button class="empty-state-action secondary" type="button" onclick="loadShareableDemo('analytics')">Try sample data</button>
+            </div>
+            <div class="empty-state-hint">Nothing leaves this browser.</div>
+        </div>
+    `;
 }
 
 // Delegated click/keydown handling for the table list. Table names can
@@ -2872,6 +2888,8 @@ function showToast(message, type = 'info') {
     }, 3000);
 }
 
+window.showToast = showToast;
+
 // Update status
 function updateStatus(text) {
     const statusText = document.getElementById('statusText');
@@ -2891,6 +2909,10 @@ function openInVanillaGrid() {
     const visible = getVisibleResults();
     if (!visible || !Array.isArray(visible.rows) || visible.rows.length === 0) {
         alert('No results to visualize yet. Execute a query with rows first.');
+        return;
+    }
+    if (typeof window.renderVanillaGrid !== 'function') {
+        showToast('Pivot Grid is unavailable. The table view and exports still work.', 'error');
         return;
     }
     window.renderVanillaGrid?.(visible);
