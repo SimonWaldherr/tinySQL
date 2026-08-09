@@ -1095,6 +1095,194 @@
             line-height: 1.5;
         }
 
+        .empty-state-actions {
+            display: flex;
+            justify-content: center;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 18px;
+        }
+
+        .empty-state-action {
+            background: #0e639c;
+            border: 1px solid #1177bb;
+            border-radius: 4px;
+            color: #fff;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            min-height: 34px;
+            padding: 7px 12px;
+        }
+
+        .empty-state-action:hover {
+            background: #1177bb;
+        }
+
+        .empty-state-action.secondary {
+            background: #3e3e42;
+            border-color: #505050;
+            color: #d4d4d4;
+        }
+
+        .empty-state-action.secondary:hover {
+            background: #505050;
+        }
+
+        .empty-state-hint {
+            color: #777;
+            font-size: 11px;
+            margin-top: 12px;
+        }
+
+        /* First-run studio guide */
+        .intro-page {
+            max-width: 1080px;
+            margin: 0 auto;
+            padding: 8px 0 28px;
+        }
+
+        .intro-hero {
+            display: grid;
+            grid-template-columns: minmax(0, 1.25fr) minmax(240px, 0.75fr);
+            gap: 22px;
+            align-items: stretch;
+            padding: 22px;
+            background: linear-gradient(135deg, #232936, #1f242d);
+            border: 1px solid #3d475a;
+            border-radius: 8px;
+        }
+
+        .intro-kicker {
+            color: #9cdcfe;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        .intro-hero h2 {
+            color: #f4f7fb;
+            font-size: clamp(24px, 3vw, 34px);
+            letter-spacing: -0.03em;
+            line-height: 1.08;
+            margin-top: 10px;
+            max-width: 620px;
+        }
+
+        .intro-copy {
+            color: #b7c2d1;
+            font-size: 14px;
+            line-height: 1.6;
+            margin-top: 12px;
+            max-width: 620px;
+        }
+
+        .intro-actions,
+        .intro-card-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .intro-actions { margin-top: 18px; }
+
+        .intro-actions button,
+        .intro-card-actions button {
+            background: #0e639c;
+            border: 1px solid #1177bb;
+            border-radius: 4px;
+            color: #fff;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            min-height: 34px;
+            padding: 7px 12px;
+        }
+
+        .intro-actions button:hover,
+        .intro-card-actions button:hover { background: #1177bb; }
+
+        .intro-actions .secondary,
+        .intro-card-actions .secondary {
+            background: #3e3e42;
+            border-color: #505050;
+            color: #d4d4d4;
+        }
+
+        .intro-actions .secondary:hover,
+        .intro-card-actions .secondary:hover { background: #505050; }
+
+        .intro-metrics {
+            display: grid;
+            gap: 8px;
+        }
+
+        .intro-metric {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            padding: 12px 14px;
+            background: rgba(14, 99, 156, 0.12);
+            border: 1px solid #3d475a;
+            border-radius: 5px;
+        }
+
+        .intro-metric strong { color: #f4f7fb; font-size: 13px; }
+        .intro-metric span { color: #9ca7b8; font-size: 12px; line-height: 1.45; margin-top: 4px; }
+
+        .feature-strip {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 10px;
+            margin-top: 16px;
+        }
+
+        .feature-pill {
+            color: #aeb9c8;
+            font-size: 12px;
+            line-height: 1.45;
+            padding: 12px 14px;
+            background: #252a33;
+            border: 1px solid #343d4d;
+            border-radius: 5px;
+        }
+
+        .feature-pill strong { color: #dce7f6; display: block; margin-bottom: 3px; }
+
+        .intro-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 12px;
+            margin-top: 18px;
+        }
+
+        .intro-card {
+            display: flex;
+            flex-direction: column;
+            min-height: 176px;
+            padding: 16px;
+            background: #252526;
+            border: 1px solid #3e3e42;
+            border-radius: 6px;
+        }
+
+        .intro-card h3 { color: #f4f7fb; font-size: 15px; }
+        .intro-card p { color: #aeb9c8; font-size: 12px; line-height: 1.55; margin-top: 8px; }
+        .intro-card code {
+            display: block;
+            overflow: hidden;
+            color: #9cdcfe;
+            font-family: 'Consolas', monospace;
+            font-size: 11px;
+            margin-top: 10px;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .intro-card-actions { margin-top: auto; padding-top: 14px; }
+        .intro-note { color: #7f8998; font-size: 12px; line-height: 1.5; margin-top: 14px; }
+
         .example-query {
             display: block;
             width: 100%;
@@ -1530,6 +1718,10 @@
             }
             .landing-use-cases { grid-template-columns: 1fr; }
 
+            .intro-hero,
+            .intro-grid,
+            .feature-strip { grid-template-columns: 1fr; }
+
             .topbar {
                 gap: 8px;
                 overflow-x: auto;
@@ -1652,6 +1844,15 @@
             .landing-actions a,
             .landing-actions button { text-align: center; }
 
+            .intro-page { padding-top: 0; }
+            .intro-hero { padding: 16px; }
+            .intro-actions,
+            .intro-card-actions,
+            .empty-state-actions { display: grid; }
+            .intro-actions button,
+            .intro-card-actions button,
+            .empty-state-action { width: 100%; }
+
             .topbar button {
                 padding: 6px 10px;
                 font-size: 12px;
@@ -1722,8 +1923,8 @@
             </div>
         </div>
         <div class="status studio-only">
-            <div class="status-indicator"></div>
-            <span id="statusText" role="status" aria-live="polite" aria-atomic="true">Ready</span>
+            <div class="status-indicator loading"></div>
+            <span id="statusText" role="status" aria-live="polite" aria-atomic="true">Loading local engine…</span>
         </div>
     </div>
 
@@ -1770,7 +1971,7 @@
             </div>
             <div class="upload-area">
                 <label class="upload-btn" for="fileInput">
-                    📤 Upload File
+                    📤 Drop files here or browse
                 </label>
                 <input type="file" id="fileInput" accept=".csv,.tsv,.txt,.json,.jsonl,.ndjson,.yaml,.yml,.xml,.geojson,.kml,.osm,.rg,.routinggraph,.routing-graph,.routing_graph,.xlsx,.xls" multiple onchange="handleFileUpload(event)" aria-describedby="uploadHelp">
                 <div id="uploadHelp" style="font-size: 11px; color: #888; margin-top: 8px; padding: 0 4px;">
@@ -1781,7 +1982,12 @@
                 <div class="empty-state">
                     <div class="empty-state-icon">📊</div>
                     <div class="empty-state-title">No Tables Loaded</div>
-                    <div class="empty-state-text">Upload a file or load from disk</div>
+                    <div class="empty-state-text">Start with a local file or a guided sample.</div>
+                    <div class="empty-state-actions">
+                        <button class="empty-state-action" type="button" onclick="showUploadDialog()">Add a file</button>
+                        <button class="empty-state-action secondary" type="button" onclick="loadShareableDemo('analytics')">Try sample data</button>
+                    </div>
+                    <div class="empty-state-hint">Nothing leaves this browser.</div>
                 </div>
             </div>
             <div id="schemaPanel" class="schema-panel hidden" role="region" aria-hidden="true" aria-labelledby="schemaPanelTitle" tabindex="-1"></div>
@@ -2003,6 +2209,13 @@ Example: SELECT * FROM my_table LIMIT 100;" aria-describedby="editorHelp" aria-e
             const mountNode = document.querySelector(mountSelector);
 
             if (!section || !mountNode) {
+                return;
+            }
+
+            if (typeof window.VanillaGrid !== 'function') {
+                if (typeof window.showToast === 'function') {
+                    window.showToast('Pivot Grid is unavailable. The table view and exports still work.', 'error');
+                }
                 return;
             }
 
