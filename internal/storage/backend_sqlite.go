@@ -257,6 +257,12 @@ func (b *SQLiteBackend) SaveTable(tenant string, t *Table) error {
 	if err != nil {
 		return fmt.Errorf("save table %s.%s: encode columns: %w", tenant, t.Name, err)
 	}
+	// t.Indexes is JSON-marshaled directly below (json.Marshal only sees the
+	// exported Entries field, never the runtime-only skip list), so it must
+	// be synced from the live skip list right now.
+	for _, idx := range t.Indexes {
+		idx.materialize()
+	}
 	indexesJSON, err := json.Marshal(t.Indexes)
 	if err != nil {
 		return fmt.Errorf("save table %s.%s: encode indexes: %w", tenant, t.Name, err)

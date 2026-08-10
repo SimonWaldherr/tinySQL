@@ -33,7 +33,10 @@ func TestCompositeSecondaryIndexPointAndPrefixSeek(t *testing.T) {
 		t.Fatal(err)
 	}
 	idx := table.FindSecondaryIndex([]string{"zoom_level", "tile_column", "tile_row"})
-	if idx == nil || len(idx.Entries) != 4 {
+	// idx.Entries is a serialization-only artifact now (materialized only at a
+	// persistence boundary, not kept in sync on every mutation), so check the
+	// live skip-list key count via idx.Len() instead of reading Entries here.
+	if idx == nil || idx.Len() != 4 {
 		t.Fatalf("materialized index = %#v", idx)
 	}
 

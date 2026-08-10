@@ -41,6 +41,9 @@ func coerceToTypeAllowNull(v any, t storage.ColType) (any, error) {
 	case storage.FloatType:
 		return coerceToFloat(v)
 	case storage.TextType:
+		if s, ok := v.(string); ok {
+			return s, nil
+		}
 		return fmt.Sprintf("%v", v), nil
 	case storage.BoolType:
 		return coerceToBool(v)
@@ -75,6 +78,9 @@ func coerceColumnValue(v any, col storage.Column) (any, error) {
 		// SQLite does not coerce BLOB values when applying TEXT affinity.
 		if _, ok := v.([]byte); ok {
 			return v, nil
+		}
+		if s, ok := v.(string); ok {
+			return s, nil
 		}
 		return fmt.Sprintf("%v", v), nil
 	case storage.AffinityNumeric:

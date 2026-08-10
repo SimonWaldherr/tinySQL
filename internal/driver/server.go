@@ -32,6 +32,27 @@ type server struct {
 	// via DB.Sync() (which flushes dirty tables to whatever backend is
 	// attached — GOB, JSON, ...), not via a whole-database GOB snapshot.
 	usesStorageBackend bool
+
+	// persistDebounce is zero by default, meaning persist() below always
+	// takes the immediate synchronous path (unchanged behavior). When
+	// positive (persist_debounce_ms DSN option), persist() defers the actual
+	// sync to at most one per debounce window; see persist's doc comment.
+	persistDebounce time.Duration
+
+	persistMu    sync.Mutex
+	persistTimer *time.Timer
+	// persistDirty is true when a debounced persist() call has been
+	// requested since the last actual sync completed. It lets
+	// runDebouncedPersist and flushPersist tell "nothing to do" (e.g.
+	// debounce enabled but this server never actually wrote anything) apart
+	// from "a sync is owed", so neither one performs surprise I/O that the
+	// immediate/default path would never have done.
+	persistDirty bool
+	// persistSyncCount counts every actual underlying sync performed by
+	// persistNow, whether reached directly (debounce off) or via the
+	// debounce timer/flush (debounce on). It is cheap bookkeeping kept for
+	// tests and diagnostics; it has no effect on behavior.
+	persistSyncCount uint64
 }
 
 func newServer(db *storage.DB, c cfg) *server {
@@ -41,6 +62,7 @@ func newServer(db *storage.DB, c cfg) *server {
 		autosave:           c.autosave,
 		busyTimeout:        c.busyTimeout,
 		usesStorageBackend: c.modeSet && c.mode != storage.ModeMemory,
+		persistDebounce:    c.persistDebounce,
 	}
 	if c.maxReaders > 0 {
 		s.readerPool = make(chan struct{}, c.maxReaders)
@@ -142,6 +164,23 @@ func (s *server) release(pool chan struct{}) {
 // must propagate the error: reporting success for a statement whose durable
 // write failed loses data silently, and the in-memory state then disagrees with
 // what a restart will find.
+//
+// By default (persistDebounce == 0, the only behavior before that option
+// existed) every call takes the immediate path below and performs its sync
+// synchronously before returning, exactly as always.
+//
+// When persistDebounce is positive (opt in via the persist_debounce_ms DSN
+// option), persist() instead marks the database as needing a sync and
+// returns immediately without error; the actual sync runs at most once per
+// debounce window, on a timer, so a burst of N rapid statements against the
+// same connection pool collapses into far fewer than N actual
+// backend.SaveTable/Sync calls. This changes durability timing: a crash
+// within the debounce window can lose the most recent statement(s) that
+// would otherwise have been immediately durable. The obligation to
+// eventually sync is never dropped — a timer is always pending while there
+// is unsynced work, and flushPersist (called from the connector's Close, the
+// sql.DB.Close() path) forces one final synchronous sync so a clean process
+// exit never leaves a debounced write unflushed.
 func (s *server) persist() error {
 	// A read-only open must be observational: physical connection closes and
 	// database/sql pool churn must never create manifests, checkpoints, WAL
@@ -149,6 +188,24 @@ func (s *server) persist() error {
 	if s.db == nil || s.db.IsReadOnly() {
 		return nil
 	}
+	if s.persistDebounce <= 0 {
+		return s.persistNow()
+	}
+	s.schedulePersist()
+	return nil
+}
+
+// persistNow performs the actual, unconditional, synchronous durable sync.
+// It is the entire body of persist() before debouncing existed, extracted
+// so both the immediate path and the deferred (timer/flush) paths share one
+// implementation.
+func (s *server) persistNow() error {
+	if s.db == nil || s.db.IsReadOnly() {
+		return nil
+	}
+	s.persistMu.Lock()
+	s.persistSyncCount++
+	s.persistMu.Unlock()
 	if s.usesStorageBackend {
 		// Disk-backed modes (ModeDisk, ModeJSON, ModeHybrid, ModeIndex)
 		// persist via their attached backend's Sync, not a whole-database
@@ -167,6 +224,63 @@ func (s *server) persist() error {
 		}
 	}
 	return nil
+}
+
+// schedulePersist records that a sync is owed and, if none is already
+// pending, starts a timer that performs it after persistDebounce elapses.
+// Calls that arrive while a timer is already pending just ride along with
+// it — that coalescing is the entire point of the option: N calls inside one
+// window produce one persistNow, not N.
+func (s *server) schedulePersist() {
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
+	s.persistDirty = true
+	if s.persistTimer != nil {
+		return
+	}
+	s.persistTimer = time.AfterFunc(s.persistDebounce, s.runDebouncedPersist)
+}
+
+// runDebouncedPersist is the timer callback: it performs the sync owed by
+// whichever persist() calls scheduled or rode along with this window, then
+// clears the pending state so the next persist() call starts a fresh timer.
+// There is no caller left to report a failure to here, so it is logged —
+// the same best-effort posture persistBestEffort already uses for cleanup
+// paths, and DB.Sync additionally records its own failures for HealthCheck.
+func (s *server) runDebouncedPersist() {
+	s.persistMu.Lock()
+	s.persistTimer = nil
+	dirty := s.persistDirty
+	s.persistDirty = false
+	s.persistMu.Unlock()
+	if !dirty {
+		return
+	}
+	if err := s.persistNow(); err != nil {
+		log.Printf("tinysql: debounced persist failed: %v", err)
+	}
+}
+
+// flushPersist cancels any pending debounce timer and, if a sync is owed,
+// performs it synchronously now. It is a no-op — zero extra work, zero extra
+// I/O — whenever there is nothing owed, which is always true when debouncing
+// is off, so calling it unconditionally from a shutdown path never changes
+// the default (debounce disabled) behavior. Shutdown paths call it so a
+// pending debounced sync is never silently lost when the process exits
+// cleanly.
+func (s *server) flushPersist() error {
+	s.persistMu.Lock()
+	if s.persistTimer != nil {
+		s.persistTimer.Stop()
+		s.persistTimer = nil
+	}
+	dirty := s.persistDirty
+	s.persistDirty = false
+	s.persistMu.Unlock()
+	if !dirty {
+		return nil
+	}
+	return s.persistNow()
 }
 
 // persistBestEffort is persist for cleanup paths that have no caller left to

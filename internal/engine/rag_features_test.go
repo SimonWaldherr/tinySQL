@@ -5,8 +5,10 @@ package engine
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1163,5 +1165,141 @@ func TestRAGSearchViaJoin(t *testing.T) {
 	}
 	if rs.Rows[1]["doc_id"] != 4 || rs.Rows[1]["label"] != "lang-go2" {
 		t.Fatalf("RAG_SEARCH via JOIN: expected second row id=4/label=lang-go2, got id=%v label=%v", rs.Rows[1]["doc_id"], rs.Rows[1]["label"])
+	}
+}
+
+// TestRAGSearchHybridConcurrentDeterministic exercises ragSearchExecute's
+// hybrid mode, where the vector pass and the FTS pass now run concurrently
+// (see the goroutine fork in ragSearchExecute, rag_search.go) instead of one
+// after the other. The corpus is large enough, and the lexical/vector
+// signals deliberately decorrelated enough, that both passes return
+// genuinely different candidate sets and RRF fusion has real blending to do
+// -- a trivial single-row corpus could pass even with a subtly broken fuse
+// or a race that only sometimes drops a row.
+//
+// This Windows dev environment has no cgo, so `go test -race` cannot verify
+// the concurrent fork directly (see internal repo notes on that
+// limitation). Repeated execution under real concurrent load is the closest
+// available substitute: any data race on the shared row/env values passed
+// into both goroutines, or on a cache either pass rebuilds lazily, would be
+// expected to eventually surface here as a wrong row, a wrong score, or a
+// result that differs between runs.
+func TestRAGSearchHybridConcurrentDeterministic(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	Execute(ctx, db, "default", mustParse(`
+		CREATE TABLE hybrid_stress_docs (id INT PRIMARY KEY, content TEXT, embedding VECTOR)
+	`))
+
+	const rows = 300
+	var sb strings.Builder
+	sb.WriteString("INSERT INTO hybrid_stress_docs VALUES ")
+	for i := 0; i < rows; i++ {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		// Every 7th row is a strong lexical match ("keyword"/"target"), but
+		// its embedding still tracks a plain function of i like every other
+		// row -- lexical rank and vector rank are decorrelated, so fusion
+		// must genuinely combine two different candidate sets rather than
+		// one pass trivially subsuming the other.
+		content := "filler words about nothing in particular"
+		if i%7 == 0 {
+			content = "keyword bearing document about the target topic"
+		}
+		x := math.Cos(0.05 * float64(i))
+		y := math.Sin(0.05 * float64(i))
+		sb.WriteString(fmt.Sprintf("(%d, '%s', '[%.6f, %.6f]')", i, content, x, y))
+	}
+	Execute(ctx, db, "default", mustParse(sb.String()))
+
+	// SELECT * (not an explicit column list): RAG_SEARCH deliberately omits
+	// _vec_rank/_fts_rank/etc. from a row absent from that pass's candidate
+	// set (see the "Absent-column convention" comment on ragSearchFuse) --
+	// projecting one of those columns by name would error for such a row.
+	// _rrf_rank/_rrf_score are always present on every row, so ORDER BY
+	// _rrf_rank is safe regardless.
+	query := `
+		SELECT *
+		FROM RAG_SEARCH('hybrid_stress_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0]'), 10, '{
+			"text_column": "content",
+			"text_query": "keyword target",
+			"key_columns": ["id"],
+			"candidate_k": 40
+		}')
+		ORDER BY _rrf_rank
+	`
+	stmt := mustParse(query)
+
+	// Golden run: every later run (sequential or concurrent) must reproduce
+	// this exact row set, in this exact order, byte-for-byte.
+	golden := execSQL(t, db, query)
+	if len(golden.Rows) != 10 {
+		t.Fatalf("hybrid stress query: expected 10 rows, got %d", len(golden.Rows))
+	}
+	sawVecOnly, sawFTSOnly, sawBoth := false, false, false
+	for _, r := range golden.Rows {
+		_, hasVec := r["_vec_rank"]
+		_, hasFTS := r["_fts_rank"]
+		switch {
+		case hasVec && hasFTS:
+			sawBoth = true
+		case hasVec:
+			sawVecOnly = true
+		case hasFTS:
+			sawFTSOnly = true
+		}
+	}
+	if !sawBoth {
+		t.Fatalf("hybrid stress query: expected at least one row present in both candidate sets, golden=%#v", golden.Rows)
+	}
+	if !sawVecOnly && !sawFTSOnly {
+		t.Logf("hybrid stress query: every top-10 row matched both passes (weaker test signal, not a failure): golden=%#v", golden.Rows)
+	}
+	goldenStr := fmt.Sprintf("%v", golden.Rows)
+
+	// Sequential repetition: run the same query many times in a row.
+	for i := 0; i < 25; i++ {
+		rs, err := Execute(ctx, db, "default", stmt)
+		if err != nil {
+			t.Fatalf("sequential run %d: %v", i, err)
+		}
+		if got := fmt.Sprintf("%v", rs.Rows); got != goldenStr {
+			t.Fatalf("sequential run %d: result diverged from golden run\ngolden: %s\ngot:    %s", i, goldenStr, got)
+		}
+	}
+
+	// Concurrent repetition: many goroutines executing the same hybrid query
+	// against the same *storage.DB at once, so the per-call vector-pass/
+	// FTS-pass goroutine fork genuinely interleaves across calls too, not
+	// just within one call.
+	const workers = 20
+	var wg sync.WaitGroup
+	errs := make([]error, workers)
+	mismatches := make([]string, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			rs, err := Execute(ctx, db, "default", stmt)
+			if err != nil {
+				errs[w] = err
+				return
+			}
+			if got := fmt.Sprintf("%v", rs.Rows); got != goldenStr {
+				mismatches[w] = got
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	for w := 0; w < workers; w++ {
+		if errs[w] != nil {
+			t.Errorf("concurrent worker %d: %v", w, errs[w])
+		}
+		if mismatches[w] != "" {
+			t.Errorf("concurrent worker %d: result diverged from golden run\ngolden: %s\ngot:    %s", w, goldenStr, mismatches[w])
+		}
 	}
 }

@@ -27,7 +27,7 @@ func tableToDiskRange(tn string, t *Table, from, to int) diskTable {
 		Version: t.Version,
 		Cols:    make([]diskColumn, len(t.Cols)),
 		Rows:    make([][]any, to-from),
-		Indexes: cloneSecondaryIndexes(t.Indexes),
+		Indexes: materializeSecondaryIndexesForEncode(t.Indexes),
 		Stats:   cloneTableStats(t.Stats),
 	}
 	for i, c := range t.Cols {
@@ -82,7 +82,7 @@ func tableToDiskRows(tn string, t *Table, indexes []int) (diskTable, []int) {
 		Version: t.Version,
 		Cols:    make([]diskColumn, len(t.Cols)),
 		Rows:    make([][]any, 0, len(kept)),
-		Indexes: cloneSecondaryIndexes(t.Indexes),
+		Indexes: materializeSecondaryIndexesForEncode(t.Indexes),
 		Stats:   cloneTableStats(t.Stats),
 	}
 	for i, c := range t.Cols {

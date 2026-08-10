@@ -96,6 +96,12 @@ func applyDSNOption(c *cfg, key, value string) error {
 			return err
 		}
 		c.checkpointMaxBytes = sz
+	case "persist_debounce_ms":
+		ms, err := parseNonNegativeUint(value, key)
+		if err != nil {
+			return err
+		}
+		c.persistDebounce = time.Duration(ms) * time.Millisecond
 	default:
 		return fmt.Errorf("tinysql: unsupported DSN option %q", key)
 	}

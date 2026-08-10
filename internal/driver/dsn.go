@@ -39,6 +39,15 @@ type cfg struct {
 	checkpointEvery    uint64
 	checkpointInterval time.Duration
 	checkpointMaxBytes int64
+
+	// persistDebounce is OFF by default (zero value): every write-shaped
+	// statement's persist() call performs its durable sync synchronously and
+	// immediately, exactly as before this option existed. When set to a
+	// positive duration via the persist_debounce_ms DSN option, persist()
+	// instead coalesces a burst of rapid statements into at most one actual
+	// sync per debounce window — see server.persist's doc comment for the
+	// durability tradeoff this introduces.
+	persistDebounce time.Duration
 }
 
 // parseDSN parses a tinySQL DSN into a driver configuration.

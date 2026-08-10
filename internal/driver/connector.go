@@ -8,6 +8,7 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"io"
+	"log"
 	"sync"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -171,5 +172,22 @@ func (c *connector) Close() error {
 	if !c.ownsServer || c.srv == nil || c.srv.db == nil {
 		return nil
 	}
-	return c.srv.db.Close()
+	// flushPersist is a no-op whenever nothing is owed — in particular
+	// whenever persist_debounce_ms was never set — so this unconditional
+	// call never changes behavior for anyone not using that option. For a
+	// connection that opted into debouncing, it forces any sync still
+	// pending inside the current window to happen now, so a clean
+	// sql.DB.Close() never leaves a debounced write unflushed: db.Close()
+	// below only performs its own Sync for storage-backend modes (see
+	// DB.Sync), and never for the legacy autosave-to-file scheme, so
+	// skipping this would silently lose the last debounce window's write
+	// for that scheme.
+	flushErr := c.srv.flushPersist()
+	if flushErr != nil {
+		log.Printf("tinysql: final flush before close failed: %v", flushErr)
+	}
+	if err := c.srv.db.Close(); err != nil {
+		return err
+	}
+	return flushErr
 }

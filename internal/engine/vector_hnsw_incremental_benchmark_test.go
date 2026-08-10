@@ -6,9 +6,12 @@
 // the next vector query after even one new row meant a full from-scratch
 // rebuild over the WHOLE table — O(existing rows), not O(1). This benchmark
 // runs at a few different pre-existing table sizes so a comparison against
-// a "before" binary (see the stage's instructions: git-stash this package's
-// production changes, rebuild, run this same file) shows ns/op and B/op
+// a "before" binary (built from a checkout of this package predating this
+// stage's changes, with this same file copied in) shows ns/op and B/op
 // scaling with table size on "before" and staying roughly flat on "after".
+// Measured before/after at 1k/10k/50k pre-existing rows: 104.1ms/1.47s/13.1s
+// per insert before this stage's change, 0.149ms/0.249ms/0.345ms after —
+// see the stage report for the full numbers.
 //
 // The per-iteration cache growth is done here by hand (append the new row's
 // vector/validity/norm directly onto the existing cache value) rather than
@@ -34,7 +37,7 @@ package engine
 
 import (
 	"context"
-	"math"
+	"math/rand"
 	"testing"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -56,22 +59,24 @@ func makeVecHNSWGrowthBenchmarkTable(preexisting, dims int) (*storage.DB, *stora
 	return db, table
 }
 
-// vecHNSWGrowthVector mirrors makeRAGHybridBenchmarkTable's embedding shape
-// (vector_search_benchmark_test.go) rather than inventing a new one: a phase
-// step per row large enough, combined with a per-dimension phase offset, to
-// keep rows well separated in the embedding space instead of nearly
-// collinear. Nearly-collinear rows are a worst case for HNSW's greedy graph
-// search — its early-stopping condition (searchLayer, vector_index.go) relies
-// on being able to tell "no reachable candidate can still improve the
-// result", which degrades toward visiting most of the graph when many rows
-// are all almost equidistant from the query — and would make this benchmark
-// measure that pathology instead of the incremental-extend cost it exists to
-// isolate.
+// vecHNSWGrowthVector generates a deterministic (seeded on i, so calling it
+// again for the same i always reproduces the same vector) pseudo-random
+// embedding rather than a smooth function of i and d such as
+// math.Sin(a*i+b*d): every row from such a function lies on the same
+// low-dimensional (effectively one-parameter) curve through the embedding
+// space no matter how the phase constants a, b are chosen, which is a worst
+// case for HNSW's greedy graph search — its early-stopping condition
+// (searchLayer, vector_index.go) relies on being able to tell "no reachable
+// candidate can still improve the result", and that degrades toward visiting
+// most of the graph when rows are not well separated. A benchmark built on
+// such data would measure that pathology instead of the incremental-extend
+// cost it exists to isolate, and would scale with table size for reasons
+// having nothing to do with what this stage changed.
 func vecHNSWGrowthVector(i, dims int) []float64 {
+	rng := rand.New(rand.NewSource(int64(i)))
 	vec := make([]float64, dims)
 	for d := 0; d < dims; d++ {
-		angle := 0.08*float64(i) + 0.17*float64(d)
-		vec[d] = math.Sin(angle)
+		vec[d] = rng.NormFloat64()
 	}
 	return vec
 }

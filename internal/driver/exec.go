@@ -267,6 +267,10 @@ func (c *conn) execStatement(ctx context.Context, st engine.Statement) (driver.R
 	}
 
 	if isWrite {
+		// This connection has now attempted a write; Close() must persist,
+		// mirroring the persist() call that follows a successful write below
+		// (directly here for autocommit, via commitTx for a transaction).
+		c.wrote = true
 		if c.srv.db.IsReadOnly() || (c.inTx && c.txReadOnly) {
 			return nil, fmt.Errorf("tinysql: write attempted in read-only transaction")
 		}

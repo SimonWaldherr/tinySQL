@@ -206,6 +206,11 @@ func (b *PagedIndexBackend) saveToPager(tenant string, t *Table) error {
 		Indexes: make([]pager.IndexInfo, 0, len(t.Indexes)),
 	}
 	for _, index := range t.Indexes {
+		// This Entries slice becomes the physical B+Tree index pages the
+		// pager builds below (see pb.pager.SaveTable), not just compatibility
+		// metadata -- so it must reflect the live skip list right now, not
+		// whatever Entries held after the last materialize.
+		index.materialize()
 		td.Indexes = append(td.Indexes, pager.IndexInfo{
 			Name:    index.Name,
 			Columns: append([]string(nil), index.Columns...),

@@ -64,16 +64,22 @@ var ftsStopWords = map[string]bool{
 
 // ftsTokenize splits text into lowercase tokens, removing stop words.
 func ftsTokenize(text string) []string {
-	// Replace punctuation with spaces.
+	// Replace punctuation with spaces, lowercasing letters in the same pass
+	// instead of a second strings.ToLower over the whole result: only
+	// a-z/A-Z/0-9 ever survive this loop, so ToLower could only ever affect
+	// the A-Z case, which is folded in directly here.
 	var sb strings.Builder
 	for _, r := range text {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
 			sb.WriteRune(r)
-		} else {
+		case r >= 'A' && r <= 'Z':
+			sb.WriteRune(r + ('a' - 'A'))
+		default:
 			sb.WriteRune(' ')
 		}
 	}
-	raw := strings.Fields(strings.ToLower(sb.String()))
+	raw := strings.Fields(sb.String())
 	out := raw[:0]
 	for _, w := range raw {
 		if !ftsStopWords[w] && len(w) > 1 {

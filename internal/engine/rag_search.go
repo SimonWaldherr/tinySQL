@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // ragSearchOptions is the optional 5th-argument JSON payload for RAG_SEARCH.
@@ -131,7 +132,8 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 	textColumns := ragSearchTextColumns(&opts)
 	hybrid := len(textColumns) > 0 && opts.TextQuery != ""
 
-	// ---- Vector pass -------------------------------------------------
+	// ---- Vector pass arguments (built up front: no dependency on either
+	// pass's result) ----------------------------------------------------
 	vecArgs := []Expr{
 		&Literal{Val: vecArgsParsed.tableName},
 		&Literal{Val: vecArgsParsed.colName},
@@ -140,13 +142,13 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 		&Literal{Val: metric},
 		&Literal{Val: index},
 	}
-	vecResult, err := (&VecSearchTableFunc{}).Execute(ctx, vecArgs, env, row)
-	if err != nil {
-		return nil, fmt.Errorf("RAG_SEARCH: vector pass: %w", err)
-	}
 
 	var result *ResultSet
 	if !hybrid {
+		vecResult, err := (&VecSearchTableFunc{}).Execute(ctx, vecArgs, env, row)
+		if err != nil {
+			return nil, fmt.Errorf("RAG_SEARCH: vector pass: %w", err)
+		}
 		result = ragSearchTruncate(vecResult, k)
 	} else {
 		if len(opts.KeyColumns) == 0 {
@@ -170,9 +172,59 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 		for _, col := range textColumns {
 			ftsArgs = append(ftsArgs, &Literal{Val: col})
 		}
-		ftsResult, err := (&FTSSearchTableFunc{}).Execute(ctx, ftsArgs, env, row)
-		if err != nil {
-			return nil, fmt.Errorf("RAG_SEARCH: text pass: %w", err)
+
+		// The vector pass and the FTS pass are independent reads with no
+		// data dependency between them: ftsArgs above does not use
+		// vecResult, and each pass hits its own cache (the vector column/
+		// IVF/HNSW/query-result caches vs. the FTS tokenized-document/
+		// query-parse caches). Running them concurrently instead of
+		// sequentially bounds this stage's latency by
+		// max(vecTime, ftsTime) instead of vecTime+ftsTime.
+		//
+		// Safety: each goroutine below writes only to its own pre-declared
+		// result/error variable, never a variable the other writes too.
+		// env and row are shared but read-only from both call sites here
+		// (verified by reading VecSearchTableFunc.Execute and
+		// FTSSearchTableFunc.Execute in full): neither writes into the row
+		// map, nor through any pointer/map field reachable from env
+		// (env.db, env.ctes, env.subqueryCache, env.statementWAL, etc. are
+		// all untouched by a pure VEC_SEARCH/FTS_SEARCH read). Every cache
+		// either side can lazily build — vecSearchColumnCache/vecIVFCache/
+		// vecHNSWCache/the opt-in vector query-result cache (vector_search.go,
+		// vector_index.go, vector_query_cache.go) and the FTS document/
+		// query-parse caches (fts.go, fts_query_cache.go) — already
+		// synchronizes itself with a mutex, RWMutex, or atomic, because
+		// concurrent callers (e.g. two simultaneous VEC_SEARCH queries from
+		// different connections) were already possible before this change.
+		// Both passes only read *storage.Table (Rows/Cols/Version); the only
+		// writers of those fields are DML statements, which take DB's
+		// exclusive content lock (see Execute's doc comment in exec.go) and
+		// therefore cannot run concurrently with the read-locked SELECT that
+		// reaches this function.
+		var (
+			wg                   sync.WaitGroup
+			vecResult, ftsResult *ResultSet
+			vecErr, ftsErr       error
+		)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			vecResult, vecErr = (&VecSearchTableFunc{}).Execute(ctx, vecArgs, env, row)
+		}()
+		go func() {
+			defer wg.Done()
+			ftsResult, ftsErr = (&FTSSearchTableFunc{}).Execute(ctx, ftsArgs, env, row)
+		}()
+		wg.Wait()
+
+		if vecErr != nil {
+			if ftsErr != nil {
+				return nil, fmt.Errorf("RAG_SEARCH: vector pass: %w (text pass also failed: %v)", vecErr, ftsErr)
+			}
+			return nil, fmt.Errorf("RAG_SEARCH: vector pass: %w", vecErr)
+		}
+		if ftsErr != nil {
+			return nil, fmt.Errorf("RAG_SEARCH: text pass: %w", ftsErr)
 		}
 
 		rrfK := opts.RRFK

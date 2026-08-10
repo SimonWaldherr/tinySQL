@@ -33,6 +33,16 @@ type conn struct {
 	// and only if no concurrent change would be discarded by doing so.
 	txCatalogRev uint64
 	txCatalog    storage.CatalogSnapshot
+
+	// wrote is set the first time this connection executes a statement that
+	// is not a pure read (see execStatement's isWrite switch — the same
+	// decision point that gates the per-statement/per-commit persist() call).
+	// Close() uses it to skip persistBestEffort() for connections that never
+	// wrote, so read-only pool churn (idle reaping, ConnMaxLifetime) does not
+	// pay for a durable-storage sync that could not possibly have anything to
+	// flush. A connection that wrote even once still persists on Close(),
+	// unchanged from before — this only removes work that was pure overhead.
+	wrote bool
 }
 
 func (c *conn) Prepare(query string) (driver.Stmt, error) {
@@ -49,7 +59,9 @@ func (c *conn) Close() error {
 	// rather than by BeginTx. Discard it here so the shadow is not leaked and no
 	// ModeAdvancedWAL transaction is left without an abort record.
 	c.discardOpenTx()
-	c.srv.persistBestEffort()
+	if c.wrote {
+		c.srv.persistBestEffort()
+	}
 	return nil
 }
 

@@ -96,15 +96,13 @@ func (t *Table) LookupSecondaryIndexRange(idx *SecondaryIndex, prefix []any, lo,
 	// components: any key sharing the prefix whose range component is below the
 	// bound sorts before it.
 	seek := append(append([]byte(nil), prefixKey...), loEnc...)
-	start := sort.Search(len(idx.Entries), func(i int) bool {
-		return bytes.Compare(idx.Entries[i].Key, seek) >= 0
-	})
 
 	var out []int
-	for i := start; i < len(idx.Entries); i++ {
-		key := idx.Entries[i].Key
+	var rangeErr error
+	i := 0
+	idx.hydrate().Range(seek, func(key []byte, rowIDs []int) bool {
 		if !bytes.HasPrefix(key, prefixKey) {
-			break // left the equality prefix; entries are sorted, so nothing follows
+			return false // left the equality prefix; entries are sorted, so nothing follows
 		}
 		off := len(prefixKey)
 		if off+numericComponentLen > len(key) {
@@ -112,14 +110,16 @@ func (t *Table) LookupSecondaryIndexRange(idx *SecondaryIndex, prefix []any, lo,
 			// not uniformly numeric after all and byte order does not track value
 			// order. Abandon the seek instead of returning rows chosen by the
 			// wrong comparison.
-			return nil, fmt.Errorf("%w: entry %d has a non-numeric range component", ErrIndexRangeUnsupported, i)
+			rangeErr = fmt.Errorf("%w: entry %d has a non-numeric range component", ErrIndexRangeUnsupported, i)
+			return false
 		}
 		component := key[off : off+numericComponentLen]
 		if component[0] != loHiTag(loEnc, hiEnc) {
 			// A differently tagged component (an integer where the bounds are
 			// floats, say) sorts as a block rather than by value.
-			return nil, fmt.Errorf("%w: entry %d component tag %#x does not match the bounds",
+			rangeErr = fmt.Errorf("%w: entry %d component tag %#x does not match the bounds",
 				ErrIndexRangeUnsupported, i, component[0])
+			return false
 		}
 
 		if !lo.Absent {
@@ -127,16 +127,22 @@ func (t *Table) LookupSecondaryIndexRange(idx *SecondaryIndex, prefix []any, lo,
 			// Reachable only for an exclusive bound: the seek above already
 			// skipped everything strictly below loEnc.
 			if cmp < 0 || (cmp == 0 && !lo.Inclusive) {
-				continue
+				i++
+				return true
 			}
 		}
 		if !hi.Absent {
 			cmp := bytes.Compare(component, hiEnc)
 			if cmp > 0 || (cmp == 0 && !hi.Inclusive) {
-				break // past the bound, and the rest sorts higher still
+				return false // past the bound, and the rest sorts higher still
 			}
 		}
-		out = append(out, idx.Entries[i].RowIDs...)
+		out = append(out, rowIDs...)
+		i++
+		return true
+	})
+	if rangeErr != nil {
+		return nil, rangeErr
 	}
 	sort.Ints(out)
 	return out, nil

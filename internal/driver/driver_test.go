@@ -222,6 +222,38 @@ func TestParseDSNStorageOptionsAreStrictAndComplete(t *testing.T) {
 	}
 }
 
+// TestParseDSNPersistDebounce guards the Stage 2 opt-in option: unset means
+// zero, which is the only value that keeps persist() on its original
+// immediate/synchronous path, and the option accepts only a non-negative
+// integer count of milliseconds.
+func TestParseDSNPersistDebounce(t *testing.T) {
+	c, err := parseDSN("mem://?persist_debounce_ms=25")
+	if err != nil {
+		t.Fatalf("parseDSN returned error: %v", err)
+	}
+	if c.persistDebounce != 25*time.Millisecond {
+		t.Fatalf("expected persistDebounce=25ms, got %s", c.persistDebounce)
+	}
+
+	c2, err := parseDSN("mem://")
+	if err != nil {
+		t.Fatalf("parseDSN returned error: %v", err)
+	}
+	if c2.persistDebounce != 0 {
+		t.Fatalf("expected persistDebounce=0 by default, got %s", c2.persistDebounce)
+	}
+
+	for _, dsn := range []string{
+		"mem://?persist_debounce_ms=-5",
+		"mem://?persist_debounce_ms=nope",
+		"mem://?persist_debounce_ms=",
+	} {
+		if _, err := parseDSN(dsn); err == nil {
+			t.Fatalf("expected strict parse error for %q", dsn)
+		}
+	}
+}
+
 func TestConnectorSharesOneStorageDBPerSQLDB(t *testing.T) {
 	var (
 		mu     sync.Mutex
@@ -1226,6 +1258,260 @@ func TestConnClosePersistsWhenAutosave(t *testing.T) {
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("expected autosave file: %v", err)
+	}
+}
+
+// TestConnCloseSkipsPersistWhenReadOnly is the counterpart to
+// TestConnClosePersistsWhenAutosave: a connection that never executed
+// anything but SELECT must not pay for a persist on Close(). The table it
+// reads is seeded directly through engine.Execute, bypassing the driver
+// entirely, so the only thing that could possibly create the autosave file
+// is Close() itself persisting the (already-durable, unchanged) database.
+func TestConnCloseSkipsPersistWhenReadOnly(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "db.gob")
+
+	db := storage.NewDB()
+	ctx := context.Background()
+	seed := func(sqlText string) {
+		st, err := engine.NewParser(sqlText).ParseStatement()
+		if err != nil {
+			t.Fatalf("parse %q failed: %v", sqlText, err)
+		}
+		if _, err := engine.Execute(ctx, db, "default", st); err != nil {
+			t.Fatalf("seed %q failed: %v", sqlText, err)
+		}
+	}
+	seed("CREATE TABLE t (id INT)")
+	seed("INSERT INTO t VALUES (1)")
+
+	s := newServer(db, cfg{filePath: path, autosave: true})
+	d := &drv{srv: s}
+	rawConn, err := d.Open("")
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	c := rawConn.(*conn)
+
+	if _, err := c.QueryContext(ctx, "SELECT id FROM t", nil); err != nil {
+		t.Fatalf("select failed: %v", err)
+	}
+	if _, err := c.QueryContext(ctx, "SELECT id FROM t WHERE id = 1", nil); err != nil {
+		t.Fatalf("select failed: %v", err)
+	}
+	if c.wrote {
+		t.Fatalf("expected wrote to remain false after only SELECTs")
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("expected no autosave file for a read-only connection, stat err=%v", err)
+	}
+}
+
+// TestConnCloseStillPersistsWhenWritten guards the correctness side of the
+// same change: a connection that executed even one write must persist on
+// Close() exactly as it always has, regardless of any other connection's
+// (non-)activity on the shared server.
+func TestConnCloseStillPersistsWhenWritten(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "db.gob")
+
+	s := newServer(storage.NewDB(), cfg{filePath: path, autosave: true})
+	d := &drv{srv: s}
+
+	// A read-only connection on the same server must still not persist.
+	roConn, err := d.Open("")
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	ro := roConn.(*conn)
+	if _, err := ro.QueryContext(context.Background(), "SELECT 1 AS x", nil); err != nil {
+		t.Fatalf("read-only probe query failed: %v", err)
+	}
+	if ro.wrote {
+		t.Fatalf("expected wrote to remain false after only a SELECT")
+	}
+	if err := ro.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("expected no autosave file yet, stat err=%v", err)
+	}
+
+	// A connection that writes must persist on Close(), unchanged from today.
+	wConn, err := d.Open("")
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	wc := wConn.(*conn)
+	if _, err := wc.ExecContext(context.Background(), "CREATE TABLE w (id INT)", nil); err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+	if !wc.wrote {
+		t.Fatalf("expected wrote to be true after a write statement")
+	}
+	if err := wc.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected autosave file after a write connection closed: %v", err)
+	}
+}
+
+// TestServerPersistDebounceDefaultIsImmediate guards the single most
+// important invariant of the persist_debounce_ms option: unset (the zero
+// value), every persist() call still performs its sync synchronously and
+// immediately, exactly as it did before the option existed. No coalescing,
+// no timer, no deferred work.
+func TestServerPersistDebounceDefaultIsImmediate(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "db.gob")
+	s := newServer(storage.NewDB(), cfg{filePath: path, autosave: true})
+
+	for i := 0; i < 5; i++ {
+		if err := s.persist(); err != nil {
+			t.Fatalf("persist %d failed: %v", i, err)
+		}
+		// Every call must be synchronous: the file must exist right after
+		// the very first call, not just eventually.
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected immediate autosave after persist %d: %v", i, err)
+		}
+	}
+	if s.persistSyncCount != 5 {
+		t.Fatalf("expected 5 immediate syncs with debounce off, got %d", s.persistSyncCount)
+	}
+}
+
+// TestServerPersistDebounceCoalescesBurst is the core Stage 2 behavior: many
+// persist() calls arriving within one debounce window must collapse into a
+// single actual sync, and — without any further call — that sync must still
+// happen once the window elapses. The obligation to eventually sync is
+// never dropped, only delayed.
+func TestServerPersistDebounceCoalescesBurst(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "db.gob")
+	const window = 30 * time.Millisecond
+	s := newServer(storage.NewDB(), cfg{filePath: path, autosave: true, persistDebounce: window})
+
+	const calls = 20
+	for i := 0; i < calls; i++ {
+		if err := s.persist(); err != nil {
+			t.Fatalf("persist %d failed: %v", i, err)
+		}
+	}
+	// The window has not elapsed yet: nothing should have been synced, and
+	// in particular the autosave file must not exist yet.
+	s.persistMu.Lock()
+	countRightAfterBurst := s.persistSyncCount
+	s.persistMu.Unlock()
+	if countRightAfterBurst != 0 {
+		t.Fatalf("expected 0 syncs before the debounce window elapses, got %d", countRightAfterBurst)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("expected no autosave file before the debounce window elapses, stat err=%v", err)
+	}
+
+	time.Sleep(6 * window)
+
+	s.persistMu.Lock()
+	finalCount := s.persistSyncCount
+	s.persistMu.Unlock()
+	if finalCount != 1 {
+		t.Fatalf("expected exactly 1 actual sync for %d debounced persist() calls, got %d", calls, finalCount)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected autosave file once the debounce window elapsed: %v", err)
+	}
+}
+
+// TestServerFlushPersistForcesFinalSync is the shutdown-path guarantee: a
+// debounced sync still pending inside its window must not be lost if
+// something forces a flush (the connector's Close, reached from
+// sql.DB.Close(), does this) before the timer would have fired on its own.
+// It also checks the no-op side: flushing with nothing pending must not
+// perform a surprise extra sync.
+func TestServerFlushPersistForcesFinalSync(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "db.gob")
+	s := newServer(storage.NewDB(), cfg{filePath: path, autosave: true, persistDebounce: time.Hour})
+
+	if err := s.persist(); err != nil {
+		t.Fatalf("persist failed: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("expected no autosave file before flush, stat err=%v", err)
+	}
+
+	if err := s.flushPersist(); err != nil {
+		t.Fatalf("flushPersist failed: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected autosave file after flushPersist: %v", err)
+	}
+	if s.persistSyncCount != 1 {
+		t.Fatalf("expected exactly 1 sync from flushPersist, got %d", s.persistSyncCount)
+	}
+
+	// Nothing pending now: a second flush must be a true no-op.
+	if err := s.flushPersist(); err != nil {
+		t.Fatalf("second flushPersist failed: %v", err)
+	}
+	if s.persistSyncCount != 1 {
+		t.Fatalf("expected flushPersist with nothing pending to do no extra work, got count %d", s.persistSyncCount)
+	}
+}
+
+// TestConnectorCloseFlushesPendingDebouncedPersist is the end-to-end version
+// of TestServerFlushPersistForcesFinalSync: a write through database/sql
+// with persist_debounce_ms set to something far longer than the test, then
+// an immediate sql.DB.Close() with no wait, must still leave the write
+// durable on disk. connector.Close() forces that final flush; db.Close()
+// alone would not have, since Sync() (which db.Close() calls directly) is
+// only wired to the disk-backed storage-backend modes, never to this
+// legacy autosave-to-file scheme.
+func TestConnectorCloseFlushesPendingDebouncedPersist(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "debounced.gob")
+	// 3600000ms = 1 hour: far longer than this test could possibly take, so
+	// the debounce timer will not have fired on its own by the time Close()
+	// runs below.
+	dsn := "file:" + path + "?autosave=1&persist_debounce_ms=3600000"
+
+	db, err := sql.Open("tinysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE t (id INT)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO t VALUES (1)`); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("expected no autosave file yet (debounce pending), stat err=%v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected autosave file after Close despite pending debounce: %v", err)
+	}
+
+	reopened, err := sql.Open("tinysql", "file:"+path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	row := reopened.QueryRow(`SELECT id FROM t WHERE id = 1`)
+	var id int
+	if err := row.Scan(&id); err != nil {
+		t.Fatalf("query after reopen: %v", err)
+	}
+	if id != 1 {
+		t.Fatalf("got id=%d, want 1", id)
 	}
 }
 
