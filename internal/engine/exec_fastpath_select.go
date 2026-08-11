@@ -190,9 +190,7 @@ func executeSimpleSelectFloatOrderedTopN(env ExecEnv, plan *simpleSelectPlan, so
 	}
 
 	rows := topRows.items
-	sort.SliceStable(rows, func(i, j int) bool {
-		return compareOrderedFloat(rows[i].key, rows[j].key, topRows.desc) < 0
-	})
+	sort.Stable(floatOrderedRawRowsAsc{desc: topRows.desc, items: rows})
 	start := 0
 	if plan.offset != nil && *plan.offset > 0 {
 		start = *plan.offset
@@ -263,6 +261,22 @@ func (h *floatOrderedRawRowHeap) pushBounded(item floatOrderedRawRow, keepCount 
 		i = child
 	}
 }
+
+// floatOrderedRawRowsAsc adapts a []floatOrderedRawRow slice to sort.Interface
+// with a concrete Swap, avoiding the reflect.Swapper-based Swap that
+// sort.Slice/SliceStable builds for element types it doesn't special-case
+// (see orderedRawRowsAsc below for the same fix on the more expensive
+// generic path).
+type floatOrderedRawRowsAsc struct {
+	desc  bool
+	items []floatOrderedRawRow
+}
+
+func (s floatOrderedRawRowsAsc) Len() int { return len(s.items) }
+func (s floatOrderedRawRowsAsc) Less(i, j int) bool {
+	return compareOrderedFloat(s.items[i].key, s.items[j].key, s.desc) < 0
+}
+func (s floatOrderedRawRowsAsc) Swap(i, j int) { s.items[i], s.items[j] = s.items[j], s.items[i] }
 
 func compareOrderedFloat(a, b float64, desc bool) int {
 	cmp := 0
@@ -387,9 +401,7 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 		rows = topRows.items
 	}
 
-	sort.SliceStable(rows, func(i, j int) bool {
-		return compareOrderedRawRows(plan, rows[i], rows[j]) < 0
-	})
+	sort.Stable(orderedRawRowsAsc{plan: plan, items: rows})
 
 	start := 0
 	if plan.offset != nil && *plan.offset > 0 {
@@ -413,6 +425,25 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 	}
 	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, true, nil
 }
+
+// orderedRawRowsAsc adapts a []orderedRawRow slice to sort.Interface with a
+// concrete Swap. orderedRawRow holds a raw-row slice plus a key/keys slice —
+// large enough and pointer-heavy enough that reflect.Swapper (what
+// sort.Slice/SliceStable uses internally) falls back to a generic
+// reflect-driven memmove per swap instead of a direct assignment. This is
+// the dominant cost on a full (non-LIMIT) ORDER BY: profiling
+// BenchmarkOrderByMultiColumnNoLimit showed ~15% of CPU time in
+// reflectlite.Swapper/typedmemmove alone.
+type orderedRawRowsAsc struct {
+	plan  *simpleSelectPlan
+	items []orderedRawRow
+}
+
+func (s orderedRawRowsAsc) Len() int { return len(s.items) }
+func (s orderedRawRowsAsc) Less(i, j int) bool {
+	return compareOrderedRawRows(s.plan, s.items[i], s.items[j]) < 0
+}
+func (s orderedRawRowsAsc) Swap(i, j int) { s.items[i], s.items[j] = s.items[j], s.items[i] }
 
 type orderedRawRowHeap struct {
 	plan  *simpleSelectPlan

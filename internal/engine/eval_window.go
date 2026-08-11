@@ -539,14 +539,30 @@ func filterPartitionIndexed(env ExecEnv, allRows []Row, partitionBy []Expr, curr
 	return rows, idx
 }
 
+// orderedValuePermAsc sorts a permutation of indices into items rather than
+// items itself, so the caller can recover each row's original position.
+// A concrete Swap (on the []int permutation) sidesteps sort.Slice's
+// reflect.Swapper, same rationale as orderedValueRowsAsc in exec_sort.go.
+type orderedValuePermAsc struct {
+	orderBy []OrderItem
+	items   []orderedValueRow
+	perm    []int
+}
+
+func (s orderedValuePermAsc) Len() int { return len(s.perm) }
+func (s orderedValuePermAsc) Less(i, j int) bool {
+	return compareOrderedValueRows(s.orderBy, s.items[s.perm[i]], s.items[s.perm[j]]) < 0
+}
+func (s orderedValuePermAsc) Swap(i, j int) { s.perm[i], s.perm[j] = s.perm[j], s.perm[i] }
+
 // sortRowsIndexed is sortRows plus tracking, through the same permutation,
 // each row's index within allRows -- so the caller can build the
 // orig-index -> sorted-position lookup windowPartitionCache needs. It must
 // apply the exact same ordering (including tie-breaking) as sortRows: it
 // drives the sort from one permutation of positions using the identical
 // comparator (compareOrderedValueRows over the same per-row keys extracted
-// by buildOrderByValues) and the same sort.SliceStable, so ties resolve
-// exactly as they do in sortRows -- by original relative order.
+// by buildOrderByValues) and the same stable sort, so ties resolve exactly
+// as they do in sortRows -- by original relative order.
 func sortRowsIndexed(rows []Row, origIdx []int, orderBy []OrderItem) ([]Row, []int) {
 	sorted := make([]Row, len(rows))
 	copy(sorted, rows)
@@ -569,9 +585,7 @@ func sortRowsIndexed(rows []Row, origIdx []int, orderBy []OrderItem) ([]Row, []i
 	for i := range perm {
 		perm[i] = i
 	}
-	sort.SliceStable(perm, func(i, j int) bool {
-		return compareOrderedValueRows(orderBy, items[perm[i]], items[perm[j]]) < 0
-	})
+	sort.Stable(orderedValuePermAsc{orderBy: orderBy, items: items, perm: perm})
 
 	outRows := make([]Row, len(sorted))
 	outIdx := make([]int, len(sorted))
@@ -632,9 +646,7 @@ func sortRows(rows []Row, orderBy []OrderItem) []Row {
 	for i, row := range sorted {
 		items[i] = buildOrderByValues(row, lcOrdCols)
 	}
-	sort.SliceStable(items, func(i, j int) bool {
-		return compareOrderedValueRows(orderBy, items[i], items[j]) < 0
-	})
+	sort.Stable(orderedValueRowsAsc{orderBy: orderBy, items: items})
 	for i, item := range items {
 		sorted[i] = item.row
 	}

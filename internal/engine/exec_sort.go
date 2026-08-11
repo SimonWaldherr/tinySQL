@@ -26,9 +26,7 @@ func applySortOrder(orderBy []OrderItem, outRows []Row) []Row {
 	for i, row := range outRows {
 		items[i] = buildOrderByValues(row, lcOrdCols)
 	}
-	sort.SliceStable(items, func(i, j int) bool {
-		return compareOrderedValueRows(orderBy, items[i], items[j]) < 0
-	})
+	sort.Stable(orderedValueRowsAsc{orderBy: orderBy, items: items})
 	for i, item := range items {
 		outRows[i] = item.row
 	}
@@ -113,6 +111,25 @@ func (h *orderedValueRowHeap) pushBounded(item orderedValueRow, keepCount int) {
 	}
 }
 
+// orderedValueRowsAsc adapts a []orderedValueRow slice to sort.Interface with
+// a concrete Swap. sort.Slice/SliceStable instead build their Swap from
+// reflect.Swapper, which falls back to a generic reflect-driven memmove for
+// any element type it doesn't special-case (anything above 16 bytes, or
+// smaller but containing pointers) — orderedValueRow (a Row map pointer plus
+// a keys slice) hits that slow path on every swap. A concrete Swap is a
+// plain two-field assignment, same fix already applied to the heap types
+// below via orderedValueRowHeapPush/Fix instead of container/heap.
+type orderedValueRowsAsc struct {
+	orderBy []OrderItem
+	items   []orderedValueRow
+}
+
+func (s orderedValueRowsAsc) Len() int { return len(s.items) }
+func (s orderedValueRowsAsc) Less(i, j int) bool {
+	return compareOrderedValueRows(s.orderBy, s.items[i], s.items[j]) < 0
+}
+func (s orderedValueRowsAsc) Swap(i, j int) { s.items[i], s.items[j] = s.items[j], s.items[i] }
+
 func compareOrderedValueRows(orderBy []OrderItem, a, b orderedValueRow) int {
 	for i, oi := range orderBy {
 		cmp := compareOrderedValue(a.keys[i], b.keys[i], oi.Desc)
@@ -183,9 +200,7 @@ func applySortOrderWithLimit(orderBy []OrderItem, outRows []Row, limit, offset *
 		items = topRows.items
 	}
 
-	sort.SliceStable(items, func(i, j int) bool {
-		return compareOrderedValueRows(orderBy, items[i], items[j]) < 0
-	})
+	sort.Stable(orderedValueRowsAsc{orderBy: orderBy, items: items})
 
 	sorted := make([]Row, len(items))
 	for i, item := range items {
