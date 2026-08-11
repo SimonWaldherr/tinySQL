@@ -63,7 +63,9 @@ CGO_ENABLED=1 make -C odbc linux
 ```
 
 Running `go mod tidy` in the repository root does not update `odbc/`; a stale
-nested module otherwise fails with `go: updates to go.mod needed` in CI.
+nested module otherwise fails with `go: updates to go.mod needed` in CI. Use
+`make tidy-all` after changing root dependencies to tidy the root module and
+every nested example, tool, and driver module discovered in the repository.
 
 Variables are overridable:
 

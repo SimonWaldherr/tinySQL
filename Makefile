@@ -8,7 +8,7 @@ SHELL := /usr/bin/env bash
 .PHONY: build-gh-pages-demo check-gh-pages-demo update-gh-pages push-gh-pages
 .PHONY: test-all test-unit test-integration test-jsonv2 coverage build-check verify verify-ci
 .PHONY: test-query-files test-query-files-wasm test-fsql
-.PHONY: run-wasm-browser run-wasm-node-demo deps update-deps tidy bench bench-engine bench-hotpaths script-lint docker-build info
+.PHONY: run-wasm-browser run-wasm-node-demo deps update-deps tidy tidy-all bench bench-engine bench-hotpaths script-lint docker-build info
 .DEFAULT_GOAL := help
 
 # Variables
@@ -349,6 +349,15 @@ build-check:
 tidy:
 	@echo "$(GREEN)Tidying dependencies...$(NC)"
 	$(GO) mod tidy
+
+## tidy-all: Tidy the root module and every nested example, tool, and driver module
+tidy-all:
+	@echo "$(GREEN)Tidying all Go modules...$(NC)"
+	@while IFS= read -r mod; do \
+		dir="$${mod%/go.mod}"; \
+		echo "$(GREEN)→ $$dir$(NC)"; \
+		(cd "$$dir" && $(GO) mod tidy); \
+	done < <(find . -name go.mod -not -path './.git/*' -print | LC_ALL=C sort)
 
 ## verify: Run fmt, vet, lint and test
 verify: fmt vet lint test
