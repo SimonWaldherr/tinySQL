@@ -139,7 +139,10 @@ func (p *Parser) parseSelect() (*Select, error) {
 	if err := p.expectKeyword("SELECT"); err != nil {
 		return nil, err
 	}
-	sel := &Select{simplePlanCache: &simpleSelectPlanCache{}}
+	sel := &Select{
+		simplePlanCache:     &simpleSelectPlanCache{},
+		simpleJoinPlanCache: &simpleJoinPlanCache{},
+	}
 
 	// Parse DISTINCT
 	if err := p.parseDistinct(sel); err != nil {

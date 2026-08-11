@@ -82,6 +82,15 @@ func buildSimpleJoinPlan(env ExecEnv, s *Select) (*simpleJoinPlan, bool, error) 
 	if err != nil {
 		return nil, true, err
 	}
+	cache := s.simpleJoinPlanCache
+	cacheable := cache != nil && !exprContainsBoundParameter(s.Where)
+	if cacheable {
+		cache.mu.Lock()
+		defer cache.mu.Unlock()
+		if cache.plan != nil && cache.left == left && cache.right == right {
+			return cache.plan, true, nil
+		}
+	}
 
 	leftIndex := simpleColumnIndex(left, aliasOr(s.From))
 	rightIndex := simpleColumnIndex(right, aliasOr(s.Joins[0].Right))
@@ -110,6 +119,11 @@ func buildSimpleJoinPlan(env ExecEnv, s *Select) (*simpleJoinPlan, bool, error) 
 		outputCols: outputCols,
 	}
 	plan.leftFilter, plan.rightFilter, plan.where = buildSimpleJoinFilters(s.Where, leftIndex, rightIndex)
+	if cacheable {
+		cache.left = left
+		cache.right = right
+		cache.plan = plan
+	}
 	return plan, true, nil
 }
 

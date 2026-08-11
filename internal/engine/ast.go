@@ -348,6 +348,10 @@ type Select struct {
 	// simplePlanCache is initialized by the parser and stores only immutable
 	// plan shape. Parameter values and index RowIDs are rebound for every run.
 	simplePlanCache *simpleSelectPlanCache
+	// simpleJoinPlanCache stores the immutable shape of the two-table raw join
+	// fast path. It is kept separate from simplePlanCache because a join has two
+	// source-table identities to validate.
+	simpleJoinPlanCache *simpleJoinPlanCache
 }
 
 // PivotClause represents "PIVOT (agg(value_expr) FOR pivot_col IN (v1 [AS a1], v2 [AS a2], ...))".

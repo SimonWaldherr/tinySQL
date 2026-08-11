@@ -212,3 +212,14 @@ type simpleJoinPlan struct {
 	projs       []simpleProjection
 	outputCols  []string
 }
+
+// simpleJoinPlanCache holds only the compiled, parameter-independent join
+// shape. The table pointers are part of the cache key: DDL can replace a table
+// object, while ordinary DML safely updates rows on the same object under the
+// content lock held by executeStatement.
+type simpleJoinPlanCache struct {
+	mu    sync.Mutex
+	left  *storage.Table
+	right *storage.Table
+	plan  *simpleJoinPlan
+}

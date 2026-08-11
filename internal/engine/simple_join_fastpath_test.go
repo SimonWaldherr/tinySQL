@@ -45,3 +45,33 @@ func TestSimpleJoinFastPathPushesSingleSideWhereTerms(t *testing.T) {
 	expectInt(t, rs.Rows[0]["user_id"], 1, "user id")
 	expectInt(t, rs.Rows[0]["order_id"], 10, "order id")
 }
+
+func TestSimpleJoinFastPathCachesPlanForRepeatedStatement(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE left_rows (id INT, name TEXT)`)
+	execSQL(t, db, `CREATE TABLE right_rows (id INT, value TEXT)`)
+	execSQL(t, db, `INSERT INTO left_rows VALUES (1, 'one')`)
+	execSQL(t, db, `INSERT INTO right_rows VALUES (1, 'value')`)
+
+	stmt := mustParse(`SELECT l.name, r.value FROM left_rows l JOIN right_rows r ON l.id = r.id`).(*Select)
+	env := ExecEnv{ctx: context.Background(), tenant: "default", db: db}
+	first, ok, err := buildSimpleJoinPlan(env, stmt)
+	if err != nil || !ok {
+		t.Fatalf("first join plan = %#v, ok=%v, err=%v", first, ok, err)
+	}
+	second, ok, err := buildSimpleJoinPlan(env, stmt)
+	if err != nil || !ok {
+		t.Fatalf("second join plan = %#v, ok=%v, err=%v", second, ok, err)
+	}
+	if first != second {
+		t.Fatal("repeated statement did not reuse its simple join plan")
+	}
+
+	rs, err := Execute(context.Background(), db, "default", stmt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rs.Rows) != 1 || rs.Rows[0]["l.name"] != "one" || rs.Rows[0]["r.value"] != "value" {
+		t.Fatalf("cached join result = %#v", rs)
+	}
+}
