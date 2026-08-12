@@ -59,6 +59,22 @@ jobs:
             GOOS=js GOARCH=wasm go build -trimpath -o /tmp/query-files.wasm .
           )
 
+      # Keep a second compiler in CI: TinyGo makes the browser/Node artifact
+      # materially smaller, while the standard Go builds above remain the
+      # compatibility baseline. The official image keeps the Go/TinyGo
+      # toolchain pair reproducible and avoids installing LLVM on the runner.
+      - name: Build and smoke-test TinyGo Node WASM
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp \
+            --env XDG_CACHE_HOME=/tmp/.cache \
+            --volume "$PWD:/src" \
+            --workdir /src/cmd/wasm_node \
+            tinygo/tinygo:0.41.1 \
+            sh -lc 'WASM_COMPILER=tinygo ./build.sh --build-only'
+          node cmd/wasm_node/wasm_runner.js query 'SELECT 1 AS ready'
+
       - name: Run go vet
         run: go vet ./...
 

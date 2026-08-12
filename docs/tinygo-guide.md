@@ -13,6 +13,24 @@ path.
 tinygo run -target=wasm ./examples/tinygo-smoke
 ```
 
+## Browser and Node bundles
+
+The browser and Node WASM build scripts can use TinyGo for substantially
+smaller release artifacts while retaining the same JavaScript API. The default
+compiler remains the standard Go toolchain.
+
+```bash
+cd cmd/wasm_browser
+WASM_COMPILER=tinygo ./build.sh --build-only
+
+cd ../wasm_node
+WASM_COMPILER=tinygo ./build.sh --run --query "SELECT 1 AS ready"
+```
+
+The script copies the TinyGo-matched `wasm_exec.js`; do not mix it with the
+standard Go runtime shim. Benchmark application queries before switching a
+production deployment, since artifact size and query throughput can trade off.
+
 The smallest supported embedded integration: create an in-memory database,
 parse SQL, execute a query.
 

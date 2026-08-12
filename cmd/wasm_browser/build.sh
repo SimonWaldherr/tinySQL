@@ -8,6 +8,9 @@ PORT="${PORT:-8080}"
 SERVE=false
 SKIP_BUILD=false
 WASM_OUT="web/tinySQL.wasm"
+# Set WASM_COMPILER=tinygo to prioritize a substantially smaller artifact.
+# The default remains Go so existing builds keep their current toolchain.
+WASM_COMPILER="${WASM_COMPILER:-go}"
 
 usage() {
     cat <<'EOF'
@@ -17,6 +20,8 @@ Usage:
   ./build.sh --build-only    Build only (explicit)
   ./build.sh --skip-build --serve
                              Serve existing assets without rebuilding
+  WASM_COMPILER=tinygo ./build.sh --build-only
+                             Build with TinyGo for a smaller artifact
 EOF
 }
 
@@ -91,22 +96,43 @@ find_wasm_exec() {
     return 1
 }
 
+build_wasm() {
+    case "$WASM_COMPILER" in
+        go)
+            local wasm_exec_path
+            wasm_exec_path="$(find_wasm_exec || true)"
+            if [[ -z "$wasm_exec_path" ]]; then
+                echo "wasm_exec.js not found in GOROOT ($(go env GOROOT))" >&2
+                exit 1
+            fi
+            cp "$wasm_exec_path" web/wasm_exec.js
+            # shellcheck disable=SC2086
+            GOOS=js GOARCH=wasm go build ${GOFLAGS:-} -trimpath -buildvcs=false -ldflags "-s -w" -o "$WASM_OUT" .
+            ;;
+        tinygo)
+            if ! command -v tinygo >/dev/null 2>&1; then
+                echo "tinygo not found; install TinyGo or use WASM_COMPILER=go" >&2
+                exit 1
+            fi
+            cp "$(tinygo env TINYGOROOT)/targets/wasm_exec.js" web/wasm_exec.js
+            tinygo build -target=wasm -no-debug -o "$WASM_OUT" .
+            ;;
+        *)
+            echo "unsupported WASM_COMPILER=$WASM_COMPILER (expected go or tinygo)" >&2
+            exit 2
+            ;;
+    esac
+}
+
 if ! command -v go >/dev/null 2>&1; then
     echo "go toolchain not found" >&2
     exit 1
 fi
 
 if [[ "$SKIP_BUILD" == false ]]; then
-    echo "Building WASM module"
+    echo "Building WASM module with $WASM_COMPILER"
     mkdir -p web
-    WASM_EXEC_PATH="$(find_wasm_exec || true)"
-    if [[ -z "$WASM_EXEC_PATH" ]]; then
-        echo "wasm_exec.js not found in GOROOT ($(go env GOROOT))" >&2
-        exit 1
-    fi
-    cp "$WASM_EXEC_PATH" web/wasm_exec.js
-    # shellcheck disable=SC2086
-    GOOS=js GOARCH=wasm go build ${GOFLAGS:-} -trimpath -buildvcs=false -ldflags "-s -w" -o "$WASM_OUT" .
+    build_wasm
     optimise_wasm
     if command -v gzip >/dev/null 2>&1; then
         gzip -9 -c "$WASM_OUT" > "${WASM_OUT}.gz" 2>/dev/null || true
