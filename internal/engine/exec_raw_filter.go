@@ -555,7 +555,7 @@ func buildRawFilterContains(colIndex map[string]int, ex *FuncCall) func([]any) (
 		if v == nil {
 			return false, nil
 		}
-		text := strings.ToLower(fmt.Sprintf("%v", v))
+		text := strings.ToLower(ftsValueToString(v))
 		for _, term := range terms {
 			found := strings.Contains(text, term)
 			if all && !found {
@@ -1035,10 +1035,16 @@ func buildCompiledGlobFilter(colIdx int, pattern string, caseInsensitive, negate
 // It pre-builds typed maps for all-int and all-string value sets for O(1) lookup.
 func buildInFilter(colIdx int, litVals []any, negate bool) func([]any) (bool, error) {
 	// Try to build typed sets for O(1) lookup.
-	allInt, allStr := true, true
+	allInt, allInt64, allFloat64, allStr := true, true, true, true
 	for _, v := range litVals {
 		if _, ok := v.(int); !ok {
 			allInt = false
+		}
+		if _, ok := v.(int64); !ok {
+			allInt64 = false
+		}
+		if _, ok := v.(float64); !ok {
+			allFloat64 = false
 		}
 		if _, ok := v.(string); !ok {
 			allStr = false
@@ -1076,6 +1082,90 @@ func buildInFilter(colIdx int, litVals []any, negate bool) func([]any) (bool, er
 			}
 			if ai, ok := a.(int); ok {
 				_, found := set[ai]
+				return found, nil
+			}
+			for _, v := range litVals {
+				if rawEqual(a, v) {
+					return true, nil
+				}
+			}
+			return false, nil
+		}
+	}
+
+	if allInt64 {
+		set := make(map[int64]struct{}, len(litVals))
+		for _, v := range litVals {
+			set[v.(int64)] = struct{}{}
+		}
+		if negate {
+			return func(raw []any) (bool, error) {
+				a := raw[colIdx]
+				if a == nil {
+					return false, nil
+				}
+				if ai, ok := a.(int64); ok {
+					_, found := set[ai]
+					return !found, nil
+				}
+				// Fall back for type mismatches (e.g., stored as int).
+				for _, v := range litVals {
+					if rawEqual(a, v) {
+						return false, nil
+					}
+				}
+				return true, nil
+			}
+		}
+		return func(raw []any) (bool, error) {
+			a := raw[colIdx]
+			if a == nil {
+				return false, nil
+			}
+			if ai, ok := a.(int64); ok {
+				_, found := set[ai]
+				return found, nil
+			}
+			for _, v := range litVals {
+				if rawEqual(a, v) {
+					return true, nil
+				}
+			}
+			return false, nil
+		}
+	}
+
+	if allFloat64 {
+		set := make(map[float64]struct{}, len(litVals))
+		for _, v := range litVals {
+			set[v.(float64)] = struct{}{}
+		}
+		if negate {
+			return func(raw []any) (bool, error) {
+				a := raw[colIdx]
+				if a == nil {
+					return false, nil
+				}
+				if af, ok := a.(float64); ok {
+					_, found := set[af]
+					return !found, nil
+				}
+				// Fall back for type mismatches (e.g., stored as int).
+				for _, v := range litVals {
+					if rawEqual(a, v) {
+						return false, nil
+					}
+				}
+				return true, nil
+			}
+		}
+		return func(raw []any) (bool, error) {
+			a := raw[colIdx]
+			if a == nil {
+				return false, nil
+			}
+			if af, ok := a.(float64); ok {
+				_, found := set[af]
 				return found, nil
 			}
 			for _, v := range litVals {

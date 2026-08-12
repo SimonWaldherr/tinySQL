@@ -123,7 +123,13 @@ update-gh-pages` picks up regenerated files the same way it does `app.js`.
 - intro page with guided recipes: file analytics, geodata, FTS/vector search,
   RAG context expansion, joins/reporting
 - geodata examples: point extraction, distance matrices, radius filters,
-  bounding boxes, zone membership, routing graph nodes, route edges
+  bounding boxes, zone membership, routing graph nodes, route edges,
+  `GEO_DISSOLVE`/`GEO_CENTROID_AGG` region aggregates, indexed `GEO_SEARCH`
+  bbox lookups, `GEO_INTERSECTS`/`GEO_DISJOINT`/`GEO_CLIP` geometry relations
+  and clipping, `GEO_CONVEX_HULL`/`GEO_ENVELOPE`/`GEO_LINE_INTERPOLATE`
+  construction, `GEO_BUFFER` service-area circles, and
+  `GEO_BEARING`/`GEO_MIDPOINT`/`GEO_DESTINATION`/`GEO_WITHIN_POLYGON`/
+  `GEO_POLYGON_AREA`/`GEO_LENGTH` measurement
 - search examples: `FTS_SEARCH`, `FTS_RANK`, `FTS_SNIPPET`, `BM25`,
   `VEC_SEARCH`, `VEC_COSINE_SIMILARITY`, `HYBRID_SEARCH`,
   `RAG_CONTEXT_FROM`, `RAG_SEARCH`,
@@ -132,7 +138,10 @@ update-gh-pages` picks up regenerated files the same way it does `app.js`.
 - recent vector/planning examples: `VEC_HAMMING_DISTANCE`, `VEC_CENTROID`,
   `ANALYZE`, and `sys.statistics`
 - analytics examples: `PIVOT`, `RETURNING`, `EXPLAIN`, SQLite-compatible
-  `PRAGMA`, views, materialized views, `sys.*` metadata
+  `PRAGMA`, views, materialized views, `sys.*` metadata, `EQUAL_INTERVAL`/
+  `NATURAL_BREAKS` choropleth classification window functions
+- developer UX examples: `BLOB_FROM_HEX`/`BLOB_FROM_BASE64` constructing
+  storable blobs, read back with `BLOB_HEX`/`BLOB_LENGTH`
 - in-memory stored procedure demos via `CALL demo_table_summary()` and
   `CALL demo_release_features()`
 

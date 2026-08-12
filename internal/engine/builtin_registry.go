@@ -217,7 +217,7 @@ func evalRowToTextFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		if sb.Len() > 0 {
 			sb.WriteByte(' ')
 		}
-		fmt.Fprintf(&sb, "%v", v)
+		ftsWriteValue(&sb, v)
 	}
 	return sb.String(), nil
 }

@@ -561,10 +561,13 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 }
 
 func simpleAggregateEligibleSelect(s *Select) bool {
-	return !s.Distinct && len(s.DistinctOn) <= 0 && len(s.CTEs) <= 0 && len(s.Joins) <= 0 &&
+	if !(!s.Distinct && len(s.DistinctOn) <= 0 && len(s.CTEs) <= 0 && len(s.Joins) <= 0 &&
 		s.Union == nil &&
 		s.From.Table != "" && s.From.Subquery == nil && s.From.TableFunc == nil && len(s.GroupBy) > 0 &&
-		s.Pivot == nil && !isSQLiteSchemaTable(s.From.Table)
+		s.Pivot == nil && !isSQLiteSchemaTable(s.From.Table)) {
+		return false
+	}
+	return !isCatalogOrSysTableRef(s.From.Table)
 }
 
 func buildSimpleAggregateProjections(s *Select, colIndex map[string]int, groupPositions map[int]int) ([]simpleAggregateProjection, []string, bool, bool, error) {
