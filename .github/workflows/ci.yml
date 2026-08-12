@@ -59,22 +59,6 @@ jobs:
             GOOS=js GOARCH=wasm go build -trimpath -o /tmp/query-files.wasm .
           )
 
-      # Keep a second compiler in CI: TinyGo makes the browser/Node artifact
-      # materially smaller, while the standard Go builds above remain the
-      # compatibility baseline. The official image keeps the Go/TinyGo
-      # toolchain pair reproducible and avoids installing LLVM on the runner.
-      - name: Build and smoke-test TinyGo Node WASM
-        run: |
-          docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            --env HOME=/tmp \
-            --env XDG_CACHE_HOME=/tmp/.cache \
-            --volume "$PWD:/src" \
-            --workdir /src/cmd/wasm_node \
-            tinygo/tinygo:0.41.1 \
-            sh -lc 'WASM_COMPILER=tinygo ./build.sh --build-only'
-          node cmd/wasm_node/wasm_runner.js query 'SELECT 1 AS ready'
-
       - name: Run go vet
         run: go vet ./...
 
@@ -94,6 +78,29 @@ jobs:
         run: |
           go tool cover -func=coverage.out -o coverage.txt
           tail -1 coverage.txt >> $GITHUB_STEP_SUMMARY
+
+  # This intentionally runs independently of the main test job: TinyGo is an
+  # optional release compiler, so its smoke test must not extend the critical
+  # path of Go tests. It skips wasm-opt, whose output-size work is validated
+  # locally/release builds and is irrelevant to the runtime ABI check.
+  tinygo-wasm:
+    name: TinyGo WASM smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Build and smoke-test Node WASM
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp \
+            --env XDG_CACHE_HOME=/tmp/.cache \
+            --volume "$PWD:/src" \
+            --workdir /src/cmd/wasm_node \
+            tinygo/tinygo:0.41.1 \
+            sh -lc 'WASM_COMPILER=tinygo WASM_OPTIMIZE=false ./build.sh --build-only'
+          node cmd/wasm_node/wasm_runner.js query 'SELECT 1 AS ready'
 
   vector-simd-amd64:
     name: Vector SIMD (linux/amd64)

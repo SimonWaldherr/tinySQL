@@ -29,6 +29,10 @@ human() { numfmt --to=iec-i --suffix=B "$1" 2>/dev/null || echo "$1 bytes"; }
 
 optimise_wasm() {
     local best_size variant temp size
+    if [[ "${WASM_OPTIMIZE:-true}" != "true" ]]; then
+        echo "Skipping WASM optimisation (WASM_OPTIMIZE=${WASM_OPTIMIZE})"
+        return
+    fi
     if ! command -v wasm-opt >/dev/null 2>&1; then
         echo "Tip: install Binaryen (wasm-opt) for additional WASM size optimisation"
         return
