@@ -738,6 +738,23 @@ INSERT INTO rag_chunks VALUES
     (5, 'ops', 0, 'Operational work added RBAC, audit logging, storage and WAL improvements, tinysqld HTTP APIs, MCP server tools, and tinyORM examples.', 0.86, '2026-07-08 14:00:00', '[0.2, 0.4, 1.0]')`;
 
 const DEMO_RELEASE_FEATURES = [
+    { area: 'Performance', feature: 'RAG/FTS arena-backed document cache, parallel BM25 scan, subquery result cache, secondary-index skiplists, and ORDER BY/window-function sorts that avoid reflect.Swapper', added: '2026-07-26 to 2026-08-11', browser_demo: 'Invisible speed-up under existing SQL; nothing new to run' },
+    { area: 'Security/Ops', feature: 'cmd/migrate incremental external-database sync and cmd/server replica mode', added: '2026-08-08', browser_demo: 'Go/CLI-only; server-side examples in cmd/migrate and cmd/server, not reachable from the browser build' },
+    { area: 'Geodata', feature: 'MBTiles disk-backed tile serving (tinysqld -tiles HTTP endpoint, paged-index tile storage, direct tile-artifact import)', added: '2026-08-01 to 2026-08-06', browser_demo: 'Go/CLI/server-side; documented in browser feature matrix' },
+    { area: 'Storage', feature: 'ModeSQLite backend: persist tinySQL tables as a native SQLite file via modernc.org/sqlite (-tags sqliteimport)', added: '2026-08-04', browser_demo: 'Go/CLI-only; excluded from the WASM build by build tag' },
+    { area: 'Geodata', feature: 'GEO_DISSOLVE/GEO_UNION_AGG/ST_UNION, GEO_BBOX_AGG, GEO_CENTROID_AGG region aggregates and GEO_SEARCH indexed bbox/radius table search', added: '2026-08-04', browser_demo: 'Direct scalar/aggregate SQL and table function ("GEO_DISSOLVE Regions" and "GEO_SEARCH Bbox" recipes)' },
+    { area: 'Geodata', feature: 'GEO_CLIP polygon clipping and GEO_INTERSECTS/GEO_DISJOINT/GEO_EQUALS geometry relations', added: '2026-08-04', browser_demo: 'Direct SQL ("GEO_CLIP & Relations" recipe)' },
+    { area: 'Geodata', feature: 'EQUAL_INTERVAL / NATURAL_BREAKS choropleth classification window functions', added: '2026-08-04', browser_demo: 'Direct window functions ("Choropleth Classes" recipe); also demoed on the standalone tiles-demo-bavaria.html choropleth panel' },
+    { area: 'Developer UX', feature: 'TopoJSON and XLSX import/export (internal/importer, internal/exporter)', added: '2026-08-04', browser_demo: 'Go API-only; the browser demo\'s .xlsx upload uses a client-side JS library instead, and there is no export option for either format' },
+    { area: 'Geodata', feature: 'GEO_BUFFER, GEO_CONVEX_HULL, GEO_ENVELOPE, GEO_LINE_INTERPOLATE geometry construction', added: '2026-08-03', browser_demo: 'Direct SQL ("GEO_BUFFER Circle" and "GEO_CONVEX_HULL & Envelope" recipes); GEO_BUFFER also powers the tiles-demo-bavaria.html choropleth panel' },
+    { area: 'Geodata', feature: 'GEO_CLEAN, GEO_SNAP/ST_SNAPTOGRID, GEO_IS_VALID geometry quality checks', added: '2026-08-03', browser_demo: 'Direct ST_CLEAN/ST_SNAPTOGRID/ST_ISVALID recipes on the tiles-demo.html Mapshaper-style editing panel' },
+    { area: 'Geodata', feature: 'GEO_BBOX/GEO_CENTROID/GEO_AFFINE/GEO_SMOOTH/GEO_DROP_HOLES editing and GEO_SIMPLIFY simplification', added: '2026-08-03', browser_demo: 'Direct ST_BBOX/ST_CENTROID/ST_AFFINE/ST_SMOOTH/ST_REMOVE_HOLES/ST_SIMPLIFY recipes on the tiles-demo.html Mapshaper-style editing panel' },
+    { area: 'Geodata', feature: 'GEO_BEARING/ST_AZIMUTH, GEO_DESTINATION/ST_PROJECT, GEO_MIDPOINT, GEO_WITHIN_POLYGON/ST_CONTAINS, GEO_POLYGON_AREA, GEO_LENGTH', added: '2026-08-03', browser_demo: 'Direct SQL ("Route Bearing & Midpoint" and "GEO_DESTINATION & Area" recipes); GEO_BEARING/GEO_MIDPOINT also demoed on tiles-demo.html' },
+    { area: 'Query planning', feature: 'Ordered range seeks on numeric secondary indexes (BETWEEN/one-sided comparisons now use the index instead of a table scan)', added: '2026-08-01', browser_demo: 'Visible only via EXPLAIN plan shape; no dedicated example' },
+    { area: 'Analytics SQL', feature: 'Scientific-notation numeric literals (e.g. 1.25e-3) now parse', added: '2026-08-02', browser_demo: 'No dedicated example; usable in any numeric expression' },
+    { area: 'Geodata', feature: 'TILE_X/TILE_Y/TILE_ZXY/TILE_FLIP_Y/TILE_LON/TILE_LAT/TILE_BBOX/TILE_QUADKEY/TILE_FROM_QUADKEY/TILE_PARENT/TILE_COUNT/TILE_CONTAINS tile-addressing functions', added: '2026-08-01', browser_demo: 'TILE_ZXY/TILE_FLIP_Y/TILE_BBOX/TILE_QUADKEY/TILE_PARENT/TILE_COUNT demoed on tiles-demo.html and tiles-demo-bavaria.html; TILE_X/TILE_Y/TILE_LON/TILE_LAT/TILE_FROM_QUADKEY/TILE_CONTAINS have no example anywhere' },
+    { area: 'Developer UX', feature: 'BLOB_FROM_HEX/BLOB_FROM_BASE64/BLOB_SUBSTR/BLOB_CONCAT now return storable blobs instead of hex text, so they can be inserted directly into BLOB columns', added: '2026-08-01', browser_demo: 'Direct SQL ("BLOB Constructors" recipe)' },
+    { area: 'Search/RAG', feature: 'HYBRID_SEARCH: one call fuses BM25 keyword and vector retrieval by reciprocal-rank fusion, given a search term and a query vector', added: '2026-07-29', browser_demo: 'Direct HYBRID_SEARCH table function ("HYBRID_SEARCH + Wildcards" recipe and the ai_docs default query)' },
     { area: 'Search/RAG', feature: 'RAG_SEARCH composed vector, keyword, and context retrieval', added: '2026-07-25', browser_demo: 'Direct RAG_SEARCH table function with reciprocal-rank fusion and neighbor expansion' },
     { area: 'Search/RAG', feature: 'CONTAINS_ALL, CONTAINS_ANY, CONTAINS_SCORE literal text matching', added: '2026-07-24', browser_demo: 'Direct case-insensitive filter and ranking over imported text' },
     { area: 'Vector math', feature: 'VEC_HAMMING_DISTANCE and VEC_CENTROID helpers', added: '2026-07-25', browser_demo: 'Direct browser-side binary-signature comparison and centroid calculation' },
@@ -1490,6 +1507,9 @@ const DEMO_QUERY_REQUIREMENTS = {
     '🔎 CONTAINS Search': 'ai_docs',
     '📐 Vector Helpers': 'ai_docs',
     '📈 ANALYZE Statistics': 'sales',
+    '🎨 Choropleth Classes': 'sales',
+    '🟢 GEO_BUFFER Circle': 'places_geo',
+    '🧭 Route Bearing & Midpoint': 'places_geo',
 };
 
 function demoQueryRequirements(item) {

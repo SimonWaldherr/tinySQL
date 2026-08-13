@@ -69,6 +69,7 @@ func ftsTokenize(text string) []string {
 	// a-z/A-Z/0-9 ever survive this loop, so ToLower could only ever affect
 	// the A-Z case, which is folded in directly here.
 	var sb strings.Builder
+	sb.Grow(len(text))
 	for _, r := range text {
 		switch {
 		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':

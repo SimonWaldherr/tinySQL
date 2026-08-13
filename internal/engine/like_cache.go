@@ -1,6 +1,9 @@
 package engine
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // evalLike previously re-lowercased the pattern (for ILIKE) and always ran
 // the general backtracking matcher on every single row, even for
@@ -16,6 +19,12 @@ import "sync"
 // node, so it also helps a LIKE whose pattern is a non-literal expression
 // that happens to evaluate to a repeated value across rows — a case the
 // literal-only raw-filter fast path can't cover at all.
+//
+// Backed by a sync.Map rather than a map+RWMutex: this is a read-mostly,
+// small-keyspace cache (the same handful of patterns get looked up on every
+// row of a scan), which is exactly sync.Map's target workload — repeat
+// lookups of an already-cached key hit its lock-free read map instead of
+// paying an RLock/RUnlock pair per row.
 const likeMatcherCacheMaxEntries = 256
 
 type likeMatcherCacheKey struct {
@@ -24,30 +33,37 @@ type likeMatcherCacheKey struct {
 }
 
 var (
-	likeMatcherCacheMu sync.RWMutex
-	likeMatcherCache   = make(map[likeMatcherCacheKey]func(string) bool, 64)
+	likeMatcherCache      atomic.Pointer[sync.Map]
+	likeMatcherCacheCount atomic.Int64
 )
+
+func init() {
+	likeMatcherCache.Store(&sync.Map{})
+}
 
 // compileCachedLikeMatcher returns a func(string) bool for a LIKE/ILIKE
 // pattern (default '\' escape, no GLOB — see evalLike) from a global,
 // bounded, concurrency-safe cache.
 func compileCachedLikeMatcher(pattern string, caseInsensitive bool) func(string) bool {
 	key := likeMatcherCacheKey{pattern: pattern, caseInsensitive: caseInsensitive}
-	likeMatcherCacheMu.RLock()
-	m := likeMatcherCache[key]
-	likeMatcherCacheMu.RUnlock()
-	if m != nil {
-		return m
+	m := likeMatcherCache.Load()
+	if v, ok := m.Load(key); ok {
+		return v.(func(string) bool)
 	}
-	m = compileLikeStringMatcher(pattern, caseInsensitive)
-	likeMatcherCacheMu.Lock()
-	if len(likeMatcherCache) >= likeMatcherCacheMaxEntries {
+	matcher := compileLikeStringMatcher(pattern, caseInsensitive)
+	if likeMatcherCacheCount.Add(1) > likeMatcherCacheMaxEntries {
 		// Simple full reset, same tradeoff compileCachedRegexp makes: no LRU
 		// bookkeeping, and a reset is rare with a reasonable working set of
-		// distinct patterns.
-		likeMatcherCache = make(map[likeMatcherCacheKey]func(string) bool, 64)
+		// distinct patterns. A concurrent reset racing this one just means
+		// whichever store lands last wins; the loser's entry is simply
+		// recomputed on its next lookup, which is harmless since
+		// compileLikeStringMatcher is a pure function of its arguments.
+		fresh := &sync.Map{}
+		fresh.Store(key, matcher)
+		likeMatcherCache.Store(fresh)
+		likeMatcherCacheCount.Store(1)
+	} else {
+		m.Store(key, matcher)
 	}
-	likeMatcherCache[key] = m
-	likeMatcherCacheMu.Unlock()
-	return m
+	return matcher
 }

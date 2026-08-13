@@ -316,11 +316,21 @@ func joinAndTerms(terms []Expr) Expr {
 }
 
 func simpleJoinSelectEligible(s *Select) bool {
-	return !s.Distinct && len(s.DistinctOn) <= 0 && len(s.CTEs) <= 0 && len(s.GroupBy) <= 0 &&
+	if !(!s.Distinct && len(s.DistinctOn) <= 0 && len(s.CTEs) <= 0 && len(s.GroupBy) <= 0 &&
 		s.Having == nil && s.Union == nil && len(s.OrderBy) <= 0 && s.Limit == nil && s.Offset == nil &&
 		s.From.Table != "" && s.From.Subquery == nil && s.From.TableFunc == nil && len(s.Joins) == 1 &&
 		s.Joins[0].Type == JoinInner && s.Joins[0].Right.Table != "" && s.Pivot == nil &&
-		s.Joins[0].Right.Subquery == nil && s.Joins[0].Right.TableFunc == nil && !isSQLiteSchemaTable(s.From.Table) && !isSQLiteSchemaTable(s.Joins[0].Right.Table)
+		s.Joins[0].Right.Subquery == nil && s.Joins[0].Right.TableFunc == nil && !isSQLiteSchemaTable(s.From.Table) && !isSQLiteSchemaTable(s.Joins[0].Right.Table)) {
+		return false
+	}
+	return !isCatalogOrSysTableRef(s.From.Table) && !isCatalogOrSysTableRef(s.Joins[0].Right.Table)
+}
+
+// isCatalogOrSysTableRef reports whether name refers to a virtual catalog.*
+// or sys.* table, which env.db.Get cannot resolve as a physical table.
+func isCatalogOrSysTableRef(name string) bool {
+	lower := strings.ToLower(name)
+	return strings.HasPrefix(lower, "catalog.") || strings.HasPrefix(lower, "sys.")
 }
 
 func loadSimpleJoinTables(env ExecEnv, s *Select) (*storage.Table, *storage.Table, error) {

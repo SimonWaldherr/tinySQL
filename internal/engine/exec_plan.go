@@ -658,7 +658,7 @@ func simpleSelectEligible(s *Select) bool {
 		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil {
 		return false
 	}
-	if strings.Contains(strings.ToLower(s.From.Table), ".") {
+	if isCatalogOrSysTableRef(s.From.Table) {
 		return false
 	}
 	if isSQLiteSchemaTable(s.From.Table) {

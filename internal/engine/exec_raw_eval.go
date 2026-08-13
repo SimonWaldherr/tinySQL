@@ -228,7 +228,7 @@ func rawRowToText(cols []int, raw []any) string {
 		if sb.Len() > 0 {
 			sb.WriteByte(' ')
 		}
-		fmt.Fprint(&sb, raw[col])
+		ftsWriteValue(&sb, raw[col])
 	}
 	return sb.String()
 }
