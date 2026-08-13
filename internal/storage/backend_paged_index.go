@@ -495,6 +495,19 @@ func (locator *PagedIndexLocator) LookupUniqueColumn(key []byte, column int, vis
 	return locator.page.LookupUniqueIndexRowColumnByRoot(locator.tableRoot, locator.indexRoot, locator.indexName, key, column, visit)
 }
 
+// LookupUniqueBytesColumn performs an exact unique seek and decodes one BLOB
+// column without converting it through any. It is the low-allocation route for
+// immutable artifact payloads.
+func (locator *PagedIndexLocator) LookupUniqueBytesColumn(key []byte, column int, visit func([]byte) error) (bool, error) {
+	if locator == nil || locator.page == nil {
+		return false, errors.New("paged index locator is unavailable")
+	}
+	if visit == nil {
+		return false, errors.New("paged index locator callback is nil")
+	}
+	return locator.page.LookupUniqueIndexRowBytesColumnByRoot(locator.tableRoot, locator.indexRoot, locator.indexName, key, column, visit)
+}
+
 // ContainsUnique proves that a unique index key resolves to an existing table
 // row without loading that row's value or any overflow BLOB pages.
 func (locator *PagedIndexLocator) ContainsUnique(key []byte) (bool, error) {

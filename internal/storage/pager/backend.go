@@ -543,6 +543,45 @@ func (pb *PageBackend) LookupUniqueIndexRowColumnByRoot(tableRoot, indexRoot Pag
 	return true, nil
 }
 
+// LookupUniqueIndexRowBytesColumnByRoot is the concrete-BLOB variant of
+// LookupUniqueIndexRowColumnByRoot. It is for typed serving paths that always
+// read a BLOB column (notably immutable tile artifacts), avoiding interface
+// boxing and a type assertion per request.
+func (pb *PageBackend) LookupUniqueIndexRowBytesColumnByRoot(tableRoot, indexRoot PageID, indexName string, key []byte, column int, visit func([]byte) error) (bool, error) {
+	pb.mu.RLock()
+	defer pb.mu.RUnlock()
+	if tableRoot == InvalidPageID || indexRoot == InvalidPageID {
+		return false, nil
+	}
+	var rowID int64
+	found, err := NewBTree(pb.pager, indexRoot).GetValue(key, func(value []byte) error {
+		if len(value) != 12 || binary.BigEndian.Uint32(value[:4]) != 1 {
+			return fmt.Errorf("unique index %s has invalid row locator", indexName)
+		}
+		rowID = int64(binary.BigEndian.Uint64(value[4:12]))
+		return nil
+	})
+	if err != nil || !found {
+		return found, err
+	}
+	var rowKey [8]byte
+	binary.BigEndian.PutUint64(rowKey[:], uint64(rowID))
+	found, err = NewBTree(pb.pager, tableRoot).getValue(rowKey[:], func(encoded []byte, owned bool) error {
+		value, decodeErr := unmarshalRowBytesColumn(encoded, column, !owned)
+		if decodeErr != nil {
+			return decodeErr
+		}
+		return visit(value)
+	})
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, fmt.Errorf("index %s refers to missing row %d", indexName, rowID)
+	}
+	return true, nil
+}
+
 // LookupUniqueIndexRowExistsByRoot follows a unique index locator and proves
 // that its table row exists without reading the row value. It validates the
 // same durable 12-byte locator used by typed lookups while avoiding overflow

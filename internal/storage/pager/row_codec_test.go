@@ -191,6 +191,32 @@ func TestUnmarshalOwnedRowColumnCanAliasOwnedBlob(t *testing.T) {
 	}
 }
 
+func TestUnmarshalRowBytesColumn(t *testing.T) {
+	short := []byte("tile")
+	long := bytes.Repeat([]byte{0xAB}, 70_000)
+	encoded := MarshalRow([]any{float64(1), "tile-id", short, long}, nil)
+	for _, column := range []int{2, 3} {
+		got, err := unmarshalRowBytesColumn(encoded, column, true)
+		if err != nil {
+			t.Fatalf("column %d: %v", column, err)
+		}
+		want := short
+		if column == 3 {
+			want = long
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("column %d = %d bytes, want matching payload", column, len(got))
+		}
+		got[0] ^= 0xff
+		if bytes.Equal(got, want) {
+			t.Fatalf("column %d was not copied from pinned memory", column)
+		}
+	}
+	if _, err := unmarshalRowBytesColumn(encoded, 1, true); err == nil {
+		t.Fatal("string column unexpectedly decoded as bytes")
+	}
+}
+
 func TestUnmarshalOwnedRowCanAliasOwnedBlobs(t *testing.T) {
 	encoded := MarshalRow([]any{[]byte("short"), bytes.Repeat([]byte("L"), 70_000)}, nil)
 	row, err := unmarshalRow(encoded, false)
@@ -220,6 +246,28 @@ func BenchmarkMarshalRowVector(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		buf = MarshalRow(row, buf)
 	}
+}
+
+func BenchmarkUnmarshalTileBlobColumn(b *testing.B) {
+	encoded := MarshalRow([]any{float64(14), float64(8624), float64(5462), bytes.Repeat([]byte{0x7F}, 8<<10)}, nil)
+	b.Run("generic", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			value, err := UnmarshalRowColumn(encoded, 3)
+			if err != nil || len(value.([]byte)) != 8<<10 {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("bytes", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			value, err := unmarshalRowBytesColumn(encoded, 3, true)
+			if err != nil || len(value) != 8<<10 {
+				b.Fatal(err)
+			}
+		}
+	})
 }
 
 func TestRowCodec_BufferReuse(t *testing.T) {

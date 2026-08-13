@@ -212,13 +212,7 @@ func (r *MBTilesReader) LookupTileFunc(ctx context.Context, z, x, y int, fn func
 	key = storage.AppendCanonicalIndexValue(key, x)
 	key = storage.AppendCanonicalIndexValue(key, y)
 	if r.manifest.Schema == MBTilesSchemaFlat {
-		return r.tileIndex.LookupUniqueColumn(key, 3, func(raw any) error {
-			data, ok := raw.([]byte)
-			if !ok {
-				return errors.New("tile_data has invalid type")
-			}
-			return fn(data)
-		})
+		return r.tileIndex.LookupUniqueBytesColumn(key, 3, fn)
 	}
 	var id string
 	found, err := r.tileIndex.LookupUniqueColumn(key, 3, func(raw any) error {
@@ -234,13 +228,7 @@ func (r *MBTilesReader) LookupTileFunc(ctx context.Context, z, x, y int, fn func
 	}
 	var imageKeyBuffer [128]byte
 	imageKey := storage.AppendCanonicalIndexValue(imageKeyBuffer[:0], id)
-	return r.imageIndex.LookupUniqueColumn(imageKey, 1, func(raw any) error {
-		data, ok := raw.([]byte)
-		if !ok {
-			return errors.New("tile_data has invalid type")
-		}
-		return fn(data)
-	})
+	return r.imageIndex.LookupUniqueBytesColumn(imageKey, 1, fn)
 }
 
 // ScanTileRange streams a TMS rectangle. A z/x/y B+Tree cannot express a

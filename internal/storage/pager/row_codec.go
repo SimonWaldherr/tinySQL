@@ -289,6 +289,99 @@ func unmarshalOwnedRowColumn(data []byte, column int) (any, error) {
 	return unmarshalRowColumn(data, column, false)
 }
 
+// unmarshalRowBytesColumn is the BLOB-only counterpart to unmarshalRowColumn.
+// Paged artifact readers use it for tile payloads on every request. Keeping
+// the value concrete avoids interface boxing and the subsequent type assertion
+// in the direct tile-serving path. As with unmarshalRowColumn, copyBytes is
+// required when data aliases a pinned cache page.
+func unmarshalRowBytesColumn(data []byte, column int, copyBytes bool) ([]byte, error) {
+	if len(data) < 2 {
+		return nil, fmt.Errorf("row data too short")
+	}
+	colCount := int(binary.LittleEndian.Uint16(data[:2]))
+	if column < 0 || column >= colCount {
+		return nil, fmt.Errorf("row column %d outside [0,%d)", column, colCount)
+	}
+	off := 2
+	for i := 0; i <= column; i++ {
+		if off >= len(data) {
+			return nil, fmt.Errorf("unexpected end of row at column %d", i)
+		}
+		tag := data[off]
+		off++
+		want := i == column
+		switch tag {
+		case tagNil:
+			if want {
+				return nil, fmt.Errorf("row column %d is not bytes", column)
+			}
+		case tagBool:
+			if off+1 > len(data) {
+				return nil, fmt.Errorf("truncated bool at column %d", i)
+			}
+			off++
+		case tagInt64, tagFloat64:
+			if off+8 > len(data) {
+				return nil, fmt.Errorf("truncated number at column %d", i)
+			}
+			off += 8
+		case tagString, tagBytes:
+			if off+2 > len(data) {
+				return nil, fmt.Errorf("truncated value len at column %d", i)
+			}
+			length := int(binary.LittleEndian.Uint16(data[off : off+2]))
+			off += 2
+			if off+length > len(data) {
+				return nil, fmt.Errorf("truncated value data at column %d", i)
+			}
+			payload := data[off : off+length]
+			off += length
+			if want {
+				if tag != tagBytes {
+					return nil, fmt.Errorf("row column %d is not bytes", column)
+				}
+				if copyBytes {
+					return append([]byte(nil), payload...), nil
+				}
+				return payload, nil
+			}
+		case tagVecF64:
+			if off+4 > len(data) {
+				return nil, fmt.Errorf("truncated vector len at column %d", i)
+			}
+			length := int(binary.LittleEndian.Uint32(data[off : off+4]))
+			off += 4
+			if length < 0 || off+length*8 > len(data) {
+				return nil, fmt.Errorf("truncated vector data at column %d", i)
+			}
+			off += length * 8
+		case tagLongString, tagLongBytes:
+			if off+4 > len(data) {
+				return nil, fmt.Errorf("truncated long value len at column %d", i)
+			}
+			length := int(binary.LittleEndian.Uint32(data[off : off+4]))
+			off += 4
+			if length < 0 || length > MaxValueBytes || off+length > len(data) {
+				return nil, fmt.Errorf("truncated long value data at column %d", i)
+			}
+			payload := data[off : off+length]
+			off += length
+			if want {
+				if tag != tagLongBytes {
+					return nil, fmt.Errorf("row column %d is not bytes", column)
+				}
+				if copyBytes {
+					return append([]byte(nil), payload...), nil
+				}
+				return payload, nil
+			}
+		default:
+			return nil, fmt.Errorf("unknown tag 0x%02x at column %d", tag, i)
+		}
+	}
+	return nil, fmt.Errorf("row column %d was not decoded", column)
+}
+
 func unmarshalRowColumn(data []byte, column int, copyBytes bool) (any, error) {
 	if len(data) < 2 {
 		return nil, fmt.Errorf("row data too short")
