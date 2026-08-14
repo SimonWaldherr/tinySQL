@@ -313,6 +313,25 @@ func applyWhereClause(env ExecEnv, where Expr, rows []Row) ([]Row, error) {
 	if where == nil {
 		return rows, nil
 	}
+	if filter := buildRowWhereFilter(where); filter != nil {
+		filtered := make([]Row, 0, len(rows)/2)
+		for i, r := range rows {
+			if i&63 == 0 {
+				if err := checkCtx(env.ctx); err != nil {
+					return nil, err
+				}
+			}
+			t, err := filter(r)
+			if err != nil {
+				return nil, err
+			}
+			if t == tvTrue {
+				filtered = append(filtered, r)
+			}
+		}
+		return filtered, nil
+	}
+
 	filtered := make([]Row, 0, len(rows)/2) // Estimate half will match
 	for i, r := range rows {
 		// Check context cancellation every 64 rows to reduce channel-select overhead.
@@ -330,4 +349,218 @@ func applyWhereClause(env ExecEnv, where Expr, rows []Row) ([]Row, error) {
 		}
 	}
 	return filtered, nil
+}
+
+type rowWhereTriFilter func(Row) (int, error)
+
+func buildRowWhereFilter(where Expr) rowWhereTriFilter {
+	switch ex := where.(type) {
+	case *VarRef:
+		key := ex.Lower
+		if key == "" {
+			key = strings.ToLower(ex.Name)
+		}
+		name := ex.Name
+		if name == "" {
+			name = key
+		}
+		return func(r Row) (int, error) {
+			v, ok := r[key]
+			if !ok {
+				return tvFalse, unknownColumnErr(name, columnSuggestionFromRow(name, r))
+			}
+			return toTri(v), nil
+		}
+
+	case *Unary:
+		if ex.Op != "NOT" {
+			return nil
+		}
+		inner := buildRowWhereFilter(ex.Expr)
+		if inner == nil {
+			return nil
+		}
+		return func(r Row) (int, error) {
+			t, err := inner(r)
+			if err != nil {
+				return tvFalse, err
+			}
+			return triNot(t), nil
+		}
+
+	case *IsNull:
+		ref, ok := ex.Expr.(*VarRef)
+		if !ok {
+			return nil
+		}
+		key := ref.Lower
+		if key == "" {
+			key = strings.ToLower(ref.Name)
+		}
+		name := ref.Name
+		if name == "" {
+			name = key
+		}
+		return func(r Row) (int, error) {
+			v, ok := r[key]
+			if !ok {
+				return tvFalse, unknownColumnErr(name, columnSuggestionFromRow(name, r))
+			}
+			res := isNull(v)
+			if ex.Negate {
+				res = !res
+			}
+			return toTri(res), nil
+		}
+
+	case *Binary:
+		switch ex.Op {
+		case "AND":
+			left := buildRowWhereFilter(ex.Left)
+			right := buildRowWhereFilter(ex.Right)
+			if left == nil || right == nil {
+				return nil
+			}
+			return func(r Row) (int, error) {
+				lt, err := left(r)
+				if err != nil || lt == tvFalse {
+					return tvFalse, err
+				}
+				rt, err := right(r)
+				if err != nil {
+					return tvFalse, err
+				}
+				return triAnd(lt, rt), nil
+			}
+		case "OR":
+			left := buildRowWhereFilter(ex.Left)
+			right := buildRowWhereFilter(ex.Right)
+			if left == nil || right == nil {
+				return nil
+			}
+			return func(r Row) (int, error) {
+				lt, err := left(r)
+				if err != nil {
+					return tvFalse, err
+				}
+				if lt == tvTrue {
+					return tvTrue, nil
+				}
+				rt, err := right(r)
+				if err != nil {
+					return tvFalse, err
+				}
+				return triOr(lt, rt), nil
+			}
+		}
+		if isComparisonOp(ex.Op) {
+			return buildRowComparisonFilter(ex)
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
+func buildRowComparisonFilter(ex *Binary) rowWhereTriFilter {
+	if leftRef, ok := ex.Left.(*VarRef); ok {
+		leftKey := leftRef.Lower
+		if leftKey == "" {
+			leftKey = strings.ToLower(leftRef.Name)
+		}
+		leftName := leftRef.Name
+		if leftName == "" {
+			leftName = leftKey
+		}
+
+		if rightLit, ok := ex.Right.(*Literal); ok {
+			return func(r Row) (int, error) {
+				leftVal, ok := r[leftKey]
+				if !ok {
+					return tvFalse, unknownColumnErr(leftName, columnSuggestionFromRow(leftName, r))
+				}
+				return triCompareVals(leftVal, rightLit.Val, ex.Op)
+			}
+		}
+
+		if rightRef, ok := ex.Right.(*VarRef); ok {
+			rightKey := rightRef.Lower
+			if rightKey == "" {
+				rightKey = strings.ToLower(rightRef.Name)
+			}
+			rightName := rightRef.Name
+			if rightName == "" {
+				rightName = rightKey
+			}
+			return func(r Row) (int, error) {
+				leftVal, ok := r[leftKey]
+				if !ok {
+					return tvFalse, unknownColumnErr(leftName, columnSuggestionFromRow(leftName, r))
+				}
+				rightVal, ok := r[rightKey]
+				if !ok {
+					return tvFalse, unknownColumnErr(rightName, columnSuggestionFromRow(rightName, r))
+				}
+				return triCompareVals(leftVal, rightVal, ex.Op)
+			}
+		}
+	}
+
+	if leftLit, ok := ex.Left.(*Literal); ok {
+		if rightRef, ok := ex.Right.(*VarRef); ok {
+			rightKey := rightRef.Lower
+			if rightKey == "" {
+				rightKey = strings.ToLower(rightRef.Name)
+			}
+			rightName := rightRef.Name
+			if rightName == "" {
+				rightName = rightKey
+			}
+			op := reverseComparisonOp(ex.Op)
+			return func(r Row) (int, error) {
+				rightVal, ok := r[rightKey]
+				if !ok {
+					return tvFalse, unknownColumnErr(rightName, columnSuggestionFromRow(rightName, r))
+				}
+				return triCompareVals(leftLit.Val, rightVal, op)
+			}
+		}
+	}
+
+	return nil
+}
+
+func triCompareVals(left, right any, op string) (int, error) {
+	if left == nil || right == nil {
+		return tvUnknown, nil
+	}
+	switch op {
+	case "=":
+		return boolToTri(rawEqual(left, right)), nil
+	case "!=", "<>":
+		return boolToTri(!rawEqual(left, right)), nil
+	default:
+		cmp, err := compare(left, right)
+		if err != nil {
+			return tvFalse, err
+		}
+		switch op {
+		case "<":
+			return boolToTri(cmp < 0), nil
+		case "<=":
+			return boolToTri(cmp <= 0), nil
+		case ">":
+			return boolToTri(cmp > 0), nil
+		case ">=":
+			return boolToTri(cmp >= 0), nil
+		}
+		return tvFalse, nil
+	}
+}
+
+func boolToTri(v bool) int {
+	if v {
+		return tvTrue
+	}
+	return tvFalse
 }

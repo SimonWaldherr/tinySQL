@@ -18,6 +18,9 @@ func applySortOrder(orderBy []OrderItem, outRows []Row) []Row {
 	if len(orderBy) == 0 || len(outRows) <= 1 {
 		return outRows
 	}
+	if len(orderBy) == 1 {
+		return applySortOrderSingle(orderBy[0], outRows)
+	}
 	lcOrdCols := make([]string, len(orderBy))
 	for idx, oi := range orderBy {
 		lcOrdCols[idx] = strings.ToLower(oi.Col)
@@ -148,9 +151,112 @@ func buildOrderByValues(row Row, lcOrdCols []string) orderedValueRow {
 	return orderedValueRow{row: row, keys: keys}
 }
 
+type orderedValueRowSingle struct {
+	row Row
+	key any
+}
+
+type orderedValueRowsSingleAsc struct {
+	desc  bool
+	items []orderedValueRowSingle
+}
+
+func (s orderedValueRowsSingleAsc) Len() int { return len(s.items) }
+func (s orderedValueRowsSingleAsc) Less(i, j int) bool {
+	return compareOrderedValue(s.items[i].key, s.items[j].key, s.desc) < 0
+}
+func (s orderedValueRowsSingleAsc) Swap(i, j int) { s.items[i], s.items[j] = s.items[j], s.items[i] }
+
+type orderedValueRowSingleHeap struct {
+	desc  bool
+	items []orderedValueRowSingle
+}
+
+func (h orderedValueRowSingleHeap) Len() int { return len(h.items) }
+
+func (h orderedValueRowSingleHeap) Less(i, j int) bool {
+	return compareOrderedValue(h.items[i].key, h.items[j].key, h.desc) > 0
+}
+
+func (h orderedValueRowSingleHeap) Swap(i, j int) {
+	h.items[i], h.items[j] = h.items[j], h.items[i]
+}
+
+func orderedValueRowSingleHeapPush(h *orderedValueRowSingleHeap, v orderedValueRowSingle) {
+	h.items = append(h.items, v)
+	orderedValueRowSingleHeapUp(*h, len(h.items)-1)
+}
+
+func orderedValueRowSingleHeapUp(h orderedValueRowSingleHeap, j int) {
+	for {
+		i := (j - 1) / 2
+		if i == j || !h.Less(j, i) {
+			break
+		}
+		h.Swap(i, j)
+		j = i
+	}
+}
+
+func orderedValueRowSingleHeapDown(h orderedValueRowSingleHeap, i0 int) {
+	n := h.Len()
+	i := i0
+	for {
+		j1 := 2*i + 1
+		if j1 >= n || j1 < 0 {
+			break
+		}
+		j := j1
+		if j2 := j1 + 1; j2 < n && h.Less(j2, j1) {
+			j = j2
+		}
+		if !h.Less(j, i) {
+			break
+		}
+		h.Swap(i, j)
+		i = j
+	}
+}
+
+func (h *orderedValueRowSingleHeap) pushBounded(item orderedValueRowSingle, keepCount int) {
+	if keepCount <= 0 {
+		return
+	}
+	if len(h.items) < keepCount {
+		orderedValueRowSingleHeapPush(h, item)
+		return
+	}
+	if compareOrderedValue(h.items[0].key, item.key, h.desc) > 0 {
+		h.items[0] = item
+		orderedValueRowSingleHeapDown(*h, 0)
+	}
+}
+
+func applySortOrderSingle(orderBy OrderItem, outRows []Row) []Row {
+	lcOrdCol := strings.ToLower(orderBy.Col)
+	items := make([]orderedValueRowSingle, len(outRows))
+	for i, row := range outRows {
+		items[i] = orderedValueRowSingle{
+			row: row,
+			key: row[lcOrdCol],
+		}
+	}
+	sort.Stable(orderedValueRowsSingleAsc{
+		desc:  orderBy.Desc,
+		items: items,
+	})
+	for i, item := range items {
+		outRows[i] = item.row
+	}
+	return outRows
+}
+
 func applySortOrderWithLimit(orderBy []OrderItem, outRows []Row, limit, offset *int) []Row {
 	if len(orderBy) == 0 || len(outRows) <= 1 {
 		return outRows
+	}
+	if len(orderBy) == 1 {
+		return applySortOrderWithLimitSingle(orderBy[0], outRows, limit, offset)
 	}
 	if limit != nil && *limit <= 0 {
 		return []Row{}
@@ -201,6 +307,63 @@ func applySortOrderWithLimit(orderBy []OrderItem, outRows []Row, limit, offset *
 	}
 
 	sort.Stable(orderedValueRowsAsc{orderBy: orderBy, items: items})
+
+	sorted := make([]Row, len(items))
+	for i, item := range items {
+		sorted[i] = item.row
+	}
+	return sorted
+}
+
+func applySortOrderWithLimitSingle(orderBy OrderItem, outRows []Row, limit, offset *int) []Row {
+	if limit != nil && *limit <= 0 {
+		return []Row{}
+	}
+	if limit == nil && offset == nil {
+		return applySortOrderSingle(orderBy, outRows)
+	}
+
+	lcOrdCol := strings.ToLower(orderBy.Col)
+	keepCount := len(outRows)
+	if limit != nil {
+		keepCount = *limit
+		if offset != nil {
+			keepCount += *offset
+		}
+		if keepCount > len(outRows) {
+			keepCount = len(outRows)
+		}
+	}
+	if keepCount <= 0 {
+		return []Row{}
+	}
+
+	items := make([]orderedValueRowSingle, 0, min(cap(outRows), keepCount))
+	useTopN := limit != nil && keepCount > 0 && keepCount < len(outRows)
+	var topRows orderedValueRowSingleHeap
+	if useTopN {
+		topRows = orderedValueRowSingleHeap{
+			desc:  orderBy.Desc,
+			items: make([]orderedValueRowSingle, 0, min(cap(outRows), keepCount)),
+		}
+	}
+
+	for _, row := range outRows {
+		item := orderedValueRowSingle{row: row, key: row[lcOrdCol]}
+		if useTopN {
+			topRows.pushBounded(item, keepCount)
+		} else {
+			items = append(items, item)
+		}
+	}
+	if useTopN {
+		items = topRows.items
+	}
+
+	sort.Stable(orderedValueRowsSingleAsc{
+		desc:  orderBy.Desc,
+		items: items,
+	})
 
 	sorted := make([]Row, len(items))
 	for i, item := range items {

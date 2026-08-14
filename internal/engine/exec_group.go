@@ -4,8 +4,11 @@ package engine
 
 import (
 	"fmt"
+	"math/big"
 	"sort"
 	"strings"
+
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 func processGroupByHaving(env ExecEnv, s *Select, filtered []Row) ([]Row, []string, error) {
@@ -175,6 +178,12 @@ func collectVarRefNames(e Expr) map[string]bool {
 
 //nolint:gocyclo // Aggregation flow must cover grouping, HAVING, and projection variants.
 func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []string, error) {
+	if fastRows, fastCols, handled, err := processAggregateQueryFastPath(env, s, filtered); err != nil {
+		return nil, nil, err
+	} else if handled {
+		return fastRows, fastCols, nil
+	}
+
 	// groups maps a composite key to a *[]Row rather than []Row directly so
 	// appending a row to an EXISTING group never needs to write the map again
 	// (see below) — only inserting a brand-new group does.
@@ -303,10 +312,332 @@ func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []str
 	return outRows, outCols, nil
 }
 
+type aggregateProjectionArg struct {
+	key        string
+	name       string
+	literal    any
+	hasArg     bool
+	hasLiteral bool
+}
+
+func processAggregateQueryFastPath(env ExecEnv, s *Select, filtered []Row) ([]Row, []string, bool, error) {
+	if s.Having != nil || anyWindowInSelect(s.Projs) {
+		return nil, nil, false, nil
+	}
+
+	groupKeys := make([]string, len(s.GroupBy))
+	groupNames := make([]string, len(s.GroupBy))
+	groupPos := make(map[string]int, len(s.GroupBy))
+	for i, g := range s.GroupBy {
+		ref, ok := g.(*VarRef)
+		if !ok {
+			return nil, nil, false, nil
+		}
+		key := ref.Lower
+		if key == "" {
+			key = strings.ToLower(ref.Name)
+		}
+		name := ref.Name
+		if name == "" {
+			name = key
+		}
+		if key == "" {
+			return nil, nil, false, nil
+		}
+		groupKeys[i] = key
+		groupNames[i] = name
+		if _, seen := groupPos[key]; !seen {
+			groupPos[key] = i
+		}
+	}
+
+	projs := make([]simpleAggregateProjection, len(s.Projs))
+	args := make([]aggregateProjectionArg, len(s.Projs))
+	outCols := make([]string, 0, len(s.Projs))
+	colSet := make(map[string]struct{}, len(s.Projs))
+	hasAgg := false
+
+	for i, it := range s.Projs {
+		proj, arg, ok, err := compileAggregateProjectionForFastPath(it, i, groupPos)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if !ok {
+			return nil, nil, false, nil
+		}
+		projs[i] = proj
+		args[i] = arg
+		if proj.kind != aggGroupCol {
+			hasAgg = true
+		}
+		name := projName(it, i)
+		if _, seen := colSet[name]; !seen {
+			colSet[name] = struct{}{}
+			outCols = append(outCols, name)
+		}
+	}
+
+	if len(s.GroupBy) == 0 && !hasAgg {
+		return nil, nil, false, nil
+	}
+
+	groupCapacity := len(filtered) / 2
+	if groupCapacity < 1 {
+		groupCapacity = 1
+	}
+	groups := make(map[string]*simpleAggregateState, groupCapacity)
+	order := make([]*simpleAggregateState, 0)
+	keyBuf := make([]byte, 0, 64)
+	groupValues := make([]any, len(groupKeys))
+
+	if len(s.GroupBy) == 0 {
+		state := newSimpleAggregateState(nil, len(s.Projs))
+		groups[""] = state
+		order = append(order, state)
+	}
+
+	for rowIdx, r := range filtered {
+		if rowIdx&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, nil, false, err
+			}
+		}
+		var state *simpleAggregateState
+		if len(groupKeys) > 0 {
+			keyBuf = keyBuf[:0]
+			for gi, gkey := range groupKeys {
+				v, ok := r[gkey]
+				if !ok {
+					return nil, nil, false, unknownColumnErr(groupNames[gi], columnSuggestionFromRow(groupNames[gi], r))
+				}
+				groupValues[gi] = v
+				if gi > 0 {
+					keyBuf = append(keyBuf, '\x1f')
+				}
+				keyBuf = writeFmtKeyPart(keyBuf, v)
+			}
+			key := string(keyBuf)
+			st, ok := groups[key]
+			if !ok {
+				values := append(make([]any, 0, len(groupValues)), groupValues...)
+				st = newSimpleAggregateState(values, len(s.Projs))
+				groups[key] = st
+				order = append(order, st)
+			}
+			state = st
+		} else {
+			state = groups[""]
+		}
+
+		if err := accumulateSimpleAggregateStateFromRow(r, state, projs, args); err != nil {
+			return nil, nil, false, err
+		}
+	}
+
+	result := simpleAggregateResultSet(projs, outCols, order)
+	return result.Rows, result.Cols, true, nil
+}
+
+func compileAggregateProjectionForFastPath(it SelectItem, idx int, groupPos map[string]int) (simpleAggregateProjection, aggregateProjectionArg, bool, error) {
+	name := projName(it, idx)
+	if it.Star {
+		return simpleAggregateProjection{}, aggregateProjectionArg{}, false, nil
+	}
+
+	if ref, ok := it.Expr.(*VarRef); ok {
+		key := ref.Lower
+		if key == "" {
+			key = strings.ToLower(ref.Name)
+		}
+		if key == "" {
+			return simpleAggregateProjection{}, aggregateProjectionArg{}, false, nil
+		}
+		groupIndex, grouped := groupPos[key]
+		if !grouped {
+			return simpleAggregateProjection{}, aggregateProjectionArg{}, false, nil
+		}
+		return simpleAggregateProjection{
+			name:       name,
+			kind:       aggGroupCol,
+			groupIndex: groupIndex,
+		}, aggregateProjectionArg{}, true, nil
+	}
+
+	fc, ok := it.Expr.(*FuncCall)
+	if !ok || fc.Over != nil || fc.Distinct || len(fc.Name) == 0 {
+		return simpleAggregateProjection{}, aggregateProjectionArg{}, false, nil
+	}
+
+	proj := simpleAggregateProjection{
+		name: name,
+	}
+	switch fc.Name {
+	case "COUNT":
+		proj.kind = aggCount
+		if fc.Star {
+			if len(fc.Args) != 0 {
+				return simpleAggregateProjection{}, aggregateProjectionArg{}, false, nil
+			}
+			return proj, aggregateProjectionArg{}, true, nil
+		}
+		if len(fc.Args) != 1 {
+			return simpleAggregateProjection{}, aggregateProjectionArg{}, false, nil
+		}
+		arg, ok := aggregateArgFromExpr(fc.Args[0])
+		if !ok {
+			return simpleAggregateProjection{}, aggregateProjectionArg{}, false, nil
+		}
+		return proj, arg, true, nil
+	case "SUM", "AVG", "MIN", "MAX":
+		switch fc.Name {
+		case "SUM":
+			proj.kind = aggSum
+		case "AVG":
+			proj.kind = aggAvg
+		case "MIN":
+			proj.kind = aggMin
+		case "MAX":
+			proj.kind = aggMax
+		}
+		if fc.Star || len(fc.Args) != 1 {
+			return simpleAggregateProjection{}, aggregateProjectionArg{}, false, nil
+		}
+		arg, ok := aggregateArgFromExpr(fc.Args[0])
+		if !ok {
+			return simpleAggregateProjection{}, aggregateProjectionArg{}, false, nil
+		}
+		return proj, arg, true, nil
+	default:
+		return simpleAggregateProjection{}, aggregateProjectionArg{}, false, nil
+	}
+}
+
+func aggregateArgFromExpr(e Expr) (aggregateProjectionArg, bool) {
+	switch ex := e.(type) {
+	case *VarRef:
+		key := ex.Lower
+		if key == "" {
+			key = strings.ToLower(ex.Name)
+		}
+		name := ex.Name
+		if name == "" {
+			name = key
+		}
+		if key == "" {
+			return aggregateProjectionArg{}, false
+		}
+		return aggregateProjectionArg{
+			hasArg: true,
+			key:    key,
+			name:   name,
+		}, true
+	case *Literal:
+		return aggregateProjectionArg{
+			hasArg:     true,
+			hasLiteral: true,
+			literal:    ex.Val,
+		}, true
+	default:
+		return aggregateProjectionArg{}, false
+	}
+}
+
+func aggregateProjectionArgValue(r Row, arg aggregateProjectionArg) (any, error) {
+	if !arg.hasArg {
+		return nil, nil
+	}
+	if arg.hasLiteral {
+		return arg.literal, nil
+	}
+	v, ok := r[arg.key]
+	if !ok {
+		return nil, unknownColumnErr(arg.name, columnSuggestionFromRow(arg.name, r))
+	}
+	return v, nil
+}
+
+func accumulateSimpleAggregateStateFromRow(r Row, state *simpleAggregateState, projs []simpleAggregateProjection, args []aggregateProjectionArg) error {
+	for i, proj := range projs {
+		switch proj.kind {
+		case aggGroupCol:
+			continue
+		case aggCount:
+			if !args[i].hasArg {
+				state.counts[i]++
+				continue
+			}
+			v, err := aggregateProjectionArgValue(r, args[i])
+			if err != nil {
+				return err
+			}
+			if v != nil {
+				state.counts[i]++
+			}
+		case aggSum, aggAvg:
+			v, err := aggregateProjectionArgValue(r, args[i])
+			if err != nil {
+				return err
+			}
+			if v == nil {
+				continue
+			}
+			if f, ok := numeric(v); ok {
+				if state.useRat != nil && state.useRat[i] {
+					state.sumRat[i].Add(state.sumRat[i], new(big.Rat).SetFloat64(f))
+				} else {
+					state.sumFloat[i] += f
+				}
+				state.counts[i]++
+				continue
+			}
+			if rv, ok := storage.DecimalFromAny(v); ok {
+				if state.useRat == nil {
+					state.useRat = make([]bool, len(projs))
+					state.sumRat = make([]*big.Rat, len(projs))
+				}
+				if !state.useRat[i] {
+					state.sumRat[i] = new(big.Rat)
+					if state.counts[i] > 0 {
+						state.sumRat[i].SetFloat64(state.sumFloat[i])
+					}
+					state.useRat[i] = true
+				}
+				state.sumRat[i].Add(state.sumRat[i], new(big.Rat).Set(rv))
+				state.counts[i]++
+			}
+		case aggMin, aggMax:
+			v, err := aggregateProjectionArgValue(r, args[i])
+			if err != nil {
+				return err
+			}
+			if v == nil {
+				continue
+			}
+			if !state.haveMinMax[i] {
+				state.minmax[i] = v
+				state.haveMinMax[i] = true
+				continue
+			}
+			cmp, err := compare(v, state.minmax[i])
+			if err != nil {
+				continue
+			}
+			if (proj.kind == aggMin && cmp < 0) || (proj.kind == aggMax && cmp > 0) {
+				state.minmax[i] = v
+			}
+		}
+	}
+	return nil
+}
+
 func processNonAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []string, error) {
 	outRows := make([]Row, 0, len(filtered))
 	outCols := make([]string, 0, len(s.Projs))
 	colSet := make(map[string]struct{}, len(s.Projs))
+	type directSelectProjection struct {
+		name string
+		key  string
+	}
 
 	// ORDER BY may name a column the SELECT list does not project. Sorting runs
 	// on the projected rows, so such a column has to be carried across the
@@ -322,6 +653,37 @@ func processNonAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []
 
 	// Check if any window functions are used
 	hasWindowFunctions := anyWindowInSelect(s.Projs)
+	isDirectSelect := !hasWindowFunctions
+	directProjs := make([]directSelectProjection, 0, len(s.Projs))
+	if isDirectSelect {
+		for i, it := range s.Projs {
+			ref, ok := it.Expr.(*VarRef)
+			if !ok || it.Star {
+				isDirectSelect = false
+				break
+			}
+			key := ref.Lower
+			if key == "" {
+				key = strings.ToLower(ref.Name)
+			}
+			if key == "" {
+				isDirectSelect = false
+				break
+			}
+			directProjs = append(directProjs, directSelectProjection{
+				name: projName(it, i),
+				key:  key,
+			})
+		}
+	}
+	if isDirectSelect {
+		for _, p := range directProjs {
+			if _, seen := colSet[p.name]; !seen {
+				colSet[p.name] = struct{}{}
+				outCols = append(outCols, p.name)
+			}
+		}
+	}
 
 	// If window functions are present, set up window context
 	if hasWindowFunctions {
@@ -343,36 +705,46 @@ func processNonAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []
 		}
 
 		out := Row{}
-		for i, it := range s.Projs {
-			if it.Star {
-				for col, v := range r {
-					putVal(out, col, v)
-					if strings.Contains(col, ".") {
-						last := strings.LastIndex(col, ".")
-						base := col[last+1:]
-						putVal(out, base, v)
-						if _, seen := colSet[base]; !seen {
-							colSet[base] = struct{}{}
-							outCols = append(outCols, base)
-						}
-					} else {
-						if _, seen := colSet[col]; !seen {
-							colSet[col] = struct{}{}
-							outCols = append(outCols, col)
+		if isDirectSelect {
+			for _, p := range directProjs {
+				v, ok := r[p.key]
+				if !ok {
+					return nil, nil, unknownColumnErr(p.name, columnSuggestionFromRow(p.name, r))
+				}
+				putVal(out, p.name, v)
+			}
+		} else {
+			for i, it := range s.Projs {
+				if it.Star {
+					for col, v := range r {
+						putVal(out, col, v)
+						if strings.Contains(col, ".") {
+							last := strings.LastIndex(col, ".")
+							base := col[last+1:]
+							putVal(out, base, v)
+							if _, seen := colSet[base]; !seen {
+								colSet[base] = struct{}{}
+								outCols = append(outCols, base)
+							}
+						} else {
+							if _, seen := colSet[col]; !seen {
+								colSet[col] = struct{}{}
+								outCols = append(outCols, col)
+							}
 						}
 					}
+					continue
 				}
-				continue
-			}
-			val, err := evalExpr(env, it.Expr, r)
-			if err != nil {
-				return nil, nil, err
-			}
-			name := projName(it, i)
-			putVal(out, name, val)
-			if _, seen := colSet[name]; !seen {
-				colSet[name] = struct{}{}
-				outCols = append(outCols, name)
+				val, err := evalExpr(env, it.Expr, r)
+				if err != nil {
+					return nil, nil, err
+				}
+				name := projName(it, i)
+				putVal(out, name, val)
+				if _, seen := colSet[name]; !seen {
+					colSet[name] = struct{}{}
+					outCols = append(outCols, name)
+				}
 			}
 		}
 		for _, col := range orderCols {
