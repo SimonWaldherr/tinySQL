@@ -11,6 +11,48 @@ permissions:
   contents: read
 
 jobs:
+  # Refuses compiled output and oversized blobs before they reach main.
+  # .gitignore stops the accident on a machine that has the repo checked out;
+  # this stops it on the one path that matters regardless of anybody's local
+  # git config, and it is why the ignore rules must live in the repo rather
+  # than in a personal global gitignore. Two binaries have reached this
+  # repository's history already (query_files.wasm, tinySQL.test).
+  no-binaries:
+    name: No binaries or oversized files
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Reject committed build artifacts
+        run: |
+          set -euo pipefail
+          # Extensions that are always build output, never source.
+          if bad=$(git ls-files | grep -iE '\.(exe|dll|so|dylib|a|o|wasm|test|prof|pprof|trace)$' || true); [ -n "$bad" ]; then
+            echo "::error::Compiled artifacts are tracked in git:"
+            echo "$bad"
+            echo "Add them to .gitignore and 'git rm --cached' them."
+            exit 1
+          fi
+          echo "No compiled artifacts tracked."
+
+      - name: Reject oversized files
+        env:
+          # Largest legitimate file today is a ~720 KB generated JS demo
+          # dataset, so 2 MiB leaves room without letting a binary through.
+          MAX_BYTES: 2097152
+        run: |
+          set -euo pipefail
+          oversized=$(git ls-tree -r -l HEAD \
+            | awk -v max="$MAX_BYTES" '$4 != "-" && $4+0 > max {printf "%.1f MB  %s\n", $4/1048576, $5}')
+          if [ -n "$oversized" ]; then
+            echo "::error::Files over $((MAX_BYTES / 1048576)) MiB are tracked in git:"
+            echo "$oversized"
+            echo "Large fixtures belong outside the repository, or behind Git LFS."
+            exit 1
+          fi
+          echo "No file exceeds $((MAX_BYTES / 1048576)) MiB."
+
   test:
     runs-on: ubuntu-latest
     steps:
