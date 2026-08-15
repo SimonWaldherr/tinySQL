@@ -138,7 +138,7 @@ build_wasm() {
     esac
 }
 
-if ! command -v go >/dev/null 2>&1; then
+if [[ "$WASM_COMPILER" == "go" ]] && ! command -v go >/dev/null 2>&1; then
     echo "go toolchain not found" >&2
     exit 1
 fi
