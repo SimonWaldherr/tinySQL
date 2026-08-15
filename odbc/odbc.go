@@ -150,14 +150,18 @@ func valueToString(v any) string {
 
 // Global handle registry
 var (
-	envMu    sync.RWMutex
-	envMap           = make(map[uintptr]*environment)
-	envNext  uintptr = 1
-	connMap          = make(map[uintptr]*connection)
-	connNext uintptr = 1
-	stmtMap          = make(map[uintptr]*statement)
-	stmtNext uintptr = 1
+	envMu   sync.RWMutex
+	envMap  = make(map[uintptr]*environment)
+	connMap = make(map[uintptr]*connection)
+	stmtMap = make(map[uintptr]*statement)
 )
+
+// newHandle creates an opaque C-owned token for an ODBC handle. Keeping this
+// allocation in C makes it safe to return through the ODBC void* API; Go
+// pointers must never be retained by C callers.
+func newHandle() C.SQLPOINTER {
+	return C.SQLPOINTER(C.malloc(C.size_t(1)))
+}
 
 // environment represents an ODBC environment (HENV)
 type environment struct {
@@ -198,10 +202,13 @@ func SQLAllocHandle(handleType C.SQLSMALLINT, inputHandle C.SQLPOINTER, outputHa
 
 	switch handleType {
 	case C.SQL_HANDLE_ENV:
-		env := &environment{id: envNext}
-		envNext++
+		handle := newHandle()
+		if handle == nil {
+			return C.SQL_ERROR
+		}
+		env := &environment{id: uintptr(handle)}
 		envMap[env.id] = env
-		*outputHandlePtr = C.SQLPOINTER(unsafe.Pointer(uintptr(env.id)))
+		*outputHandlePtr = handle
 		return C.SQL_SUCCESS
 
 	case C.SQL_HANDLE_DBC:
@@ -209,14 +216,17 @@ func SQLAllocHandle(handleType C.SQLSMALLINT, inputHandle C.SQLPOINTER, outputHa
 		if _, ok := envMap[envID]; !ok {
 			return C.SQL_INVALID_HANDLE
 		}
+		handle := newHandle()
+		if handle == nil {
+			return C.SQL_ERROR
+		}
 		conn := &connection{
-			id:     connNext,
+			id:     uintptr(handle),
 			envID:  envID,
 			tenant: "default",
 		}
-		connNext++
 		connMap[conn.id] = conn
-		*outputHandlePtr = C.SQLPOINTER(unsafe.Pointer(uintptr(conn.id)))
+		*outputHandlePtr = handle
 		return C.SQL_SUCCESS
 
 	case C.SQL_HANDLE_STMT:
@@ -224,13 +234,16 @@ func SQLAllocHandle(handleType C.SQLSMALLINT, inputHandle C.SQLPOINTER, outputHa
 		if _, ok := connMap[connID]; !ok {
 			return C.SQL_INVALID_HANDLE
 		}
+		handle := newHandle()
+		if handle == nil {
+			return C.SQL_ERROR
+		}
 		stmt := &statement{
-			id:     stmtNext,
+			id:     uintptr(handle),
 			connID: connID,
 		}
-		stmtNext++
 		stmtMap[stmt.id] = stmt
-		*outputHandlePtr = C.SQLPOINTER(unsafe.Pointer(uintptr(stmt.id)))
+		*outputHandlePtr = handle
 		return C.SQL_SUCCESS
 
 	default:
@@ -247,17 +260,26 @@ func SQLFreeHandle(handleType C.SQLSMALLINT, handle C.SQLPOINTER) C.SQLRETURN {
 	id := uintptr(handle)
 	switch handleType {
 	case C.SQL_HANDLE_ENV:
+		if _, ok := envMap[id]; !ok {
+			return C.SQL_INVALID_HANDLE
+		}
 		delete(envMap, id)
-		return C.SQL_SUCCESS
 	case C.SQL_HANDLE_DBC:
+		if _, ok := connMap[id]; !ok {
+			return C.SQL_INVALID_HANDLE
+		}
 		delete(connMap, id)
-		return C.SQL_SUCCESS
 	case C.SQL_HANDLE_STMT:
+		if _, ok := stmtMap[id]; !ok {
+			return C.SQL_INVALID_HANDLE
+		}
 		delete(stmtMap, id)
-		return C.SQL_SUCCESS
 	default:
 		return C.SQL_ERROR
 	}
+
+	C.free(unsafe.Pointer(handle))
+	return C.SQL_SUCCESS
 }
 
 // SQLSetEnvAttr sets attributes on an ODBC environment handle. Only

@@ -2,9 +2,11 @@ module github.com/SimonWaldherr/tinySQL/odbc
 
 go 1.26.5
 
+toolchain go1.26.6
+
 replace github.com/SimonWaldherr/tinySQL => ../
 
-require github.com/SimonWaldherr/tinySQL v0.16.0
+require github.com/SimonWaldherr/tinySQL v0.33.0
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
