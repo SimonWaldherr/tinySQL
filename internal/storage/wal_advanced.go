@@ -891,13 +891,9 @@ func applyOperation(db *DB, record *WALRecord) (*Table, error) {
 	case WALOpUpdate:
 		// Find and update the row
 		found := false
-		for i, row := range table.Rows {
-			// Simple comparison - in production would need proper row ID tracking
-			if rowsEqual(row, record.BeforeImage) {
-				table.Rows[i] = record.AfterImage
-				found = true
-				break
-			}
+		if i, ok := locateLoggedRow(table, record); ok {
+			table.Rows[i] = record.AfterImage
+			found = true
 		}
 		if !found {
 			// Row not found - treat as insert
@@ -915,15 +911,12 @@ func applyOperation(db *DB, record *WALRecord) (*Table, error) {
 
 	case WALOpDelete:
 		// Find and remove the row
-		for i, row := range table.Rows {
-			if rowsEqual(row, record.BeforeImage) {
-				table.Rows = append(table.Rows[:i], table.Rows[i+1:]...)
-				table.noteStructuralChange()
-				// Every later row shifts down one position, which executor
-				// state built from row positions cannot reconcile.
-				table.dropDerived()
-				break
-			}
+		if i, ok := locateLoggedRow(table, record); ok {
+			table.Rows = append(table.Rows[:i], table.Rows[i+1:]...)
+			table.noteStructuralChange()
+			// Every later row shifts down one position, which executor
+			// state built from row positions cannot reconcile.
+			table.dropDerived()
 		}
 		table.Version++
 	}
@@ -934,13 +927,42 @@ func applyOperation(db *DB, record *WALRecord) (*Table, error) {
 	return table, nil
 }
 
+// locateLoggedRow finds the row a WAL update/delete record refers to.
+//
+// Every record carries the row position it was written at (see LogUpdate and
+// LogDelete), so replay checks that position first and only falls back to
+// scanning when it does not hold the expected before-image — which it will not
+// when an earlier delete in the same log shifted rows down, or when the log is
+// replayed onto a base that does not match the one it was written against.
+// Before the hint was consulted, every record cost a scan of the whole table,
+// making replay of a heavily-updated table quadratic in its row count.
+func locateLoggedRow(table *Table, record *WALRecord) (int, bool) {
+	if hint := int(record.RowID); hint >= 0 && hint < len(table.Rows) {
+		if rowsEqual(table.Rows[hint], record.BeforeImage) {
+			return hint, true
+		}
+	}
+	for i, row := range table.Rows {
+		if rowsEqual(row, record.BeforeImage) {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
 // rowsEqual compares two rows for equality.
+//
+// It compares cell by cell through CanonicalIndexValueEqual rather than with
+// Go's `!=`. Comparing two `any` values directly panics at runtime ("comparing
+// uncomparable type") as soon as either side holds a slice or map — which is
+// every BLOB, VECTOR and JSON column this package supports — so recovering a
+// WAL that touched such a table used to crash the process instead of replaying.
 func rowsEqual(a, b []any) bool {
 	if len(a) != len(b) {
 		return false
 	}
 	for i := range a {
-		if a[i] != b[i] {
+		if !CanonicalIndexValueEqual(a[i], b[i]) {
 			return false
 		}
 	}

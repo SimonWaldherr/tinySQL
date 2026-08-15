@@ -8,17 +8,35 @@ import (
 )
 
 func tableToDisk(tn string, t *Table) diskTable {
-	return tableToDiskRange(tn, t, 0, len(t.Rows))
+	// A whole-table image is installed on replay by decoding it and putting it
+	// in place (see handleWalRecord's walRecordApplyTable branch, and
+	// diskToTable), so it is the one shape that has to carry the table's
+	// materialized secondary indexes.
+	return tableToDiskRangeIndexed(tn, t, 0, len(t.Rows), true)
 }
 
 // tableToDiskRange serializes the table schema and rows in [from, to).
 // Used by the WAL to write only newly appended rows.
+//
+// The record it produces carries no secondary indexes: replaying an
+// append-rows delta reads only its rows and version and then rebuilds the
+// indexes from the table (see handleWalRecord), so materializing them here
+// would make every single-row INSERT walk, deep-copy twice, gob-encode and
+// fsync the table's entire secondary index — work whose result is discarded.
 func tableToDiskRange(tn string, t *Table, from, to int) diskTable {
+	return tableToDiskRangeIndexed(tn, t, from, to, false)
+}
+
+func tableToDiskRangeIndexed(tn string, t *Table, from, to int, includeIndexes bool) diskTable {
 	if from < 0 {
 		from = 0
 	}
 	if to > len(t.Rows) {
 		to = len(t.Rows)
+	}
+	var indexes map[string]*SecondaryIndex
+	if includeIndexes {
+		indexes = materializeSecondaryIndexesForEncode(t.Indexes)
 	}
 	dt := diskTable{
 		Tenant:  tn,
@@ -27,7 +45,7 @@ func tableToDiskRange(tn string, t *Table, from, to int) diskTable {
 		Version: t.Version,
 		Cols:    make([]diskColumn, len(t.Cols)),
 		Rows:    make([][]any, to-from),
-		Indexes: materializeSecondaryIndexesForEncode(t.Indexes),
+		Indexes: indexes,
 		Stats:   cloneTableStats(t.Stats),
 	}
 	for i, c := range t.Cols {
@@ -82,8 +100,9 @@ func tableToDiskRows(tn string, t *Table, indexes []int) (diskTable, []int) {
 		Version: t.Version,
 		Cols:    make([]diskColumn, len(t.Cols)),
 		Rows:    make([][]any, 0, len(kept)),
-		Indexes: materializeSecondaryIndexesForEncode(t.Indexes),
-		Stats:   cloneTableStats(t.Stats),
+		// See tableToDiskRange: a delta record's Indexes field is never read
+		// back, so materializing it is pure cost on every UPDATE.
+		Stats: cloneTableStats(t.Stats),
 	}
 	for i, c := range t.Cols {
 		dt.Cols[i] = diskColumn(c)

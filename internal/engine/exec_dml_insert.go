@@ -32,16 +32,31 @@ func executeInsert(env ExecEnv, s *Insert) (*ResultSet, error) {
 
 func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) (*ResultSet, error) {
 	expected := len(t.Cols)
-	returningRows := make([]Row, 0, len(s.Rows))
-	// buildTableRow allocates a map(2*len(cols)); resolve both timing lists
-	// once before the row loop and skip that map entirely when neither triggers
-	// nor RETURNING needs it.
-	tablePrefix := strings.ToLower(s.Table) + "."
-	keys := newTableRowKeys(t.Cols, tablePrefix)
 	beforeTriggers, afterTriggers := planTriggers(env.planFor(s), env, s.Table, storage.TriggerInsert)
 	hasBefore := len(beforeTriggers) > 0
 	hasAfter := len(afterTriggers) > 0
+	// buildTableRow allocates a map(2*len(cols)); resolve both timing lists
+	// once before the row loop and skip that map entirely when neither triggers
+	// nor RETURNING needs it.
 	needsRow := hasBefore || hasAfter || len(s.Returning) > 0
+	// Both of these are for RETURNING and trigger rows only. Building them
+	// unconditionally charged every plain INSERT a slice sized to its row count
+	// plus one string concatenation per column, none of which anything read.
+	var returningRows []Row
+	if len(s.Returning) > 0 {
+		returningRows = make([]Row, 0, len(s.Rows))
+	}
+	var keys tableRowKeys
+	if needsRow {
+		keys = newTableRowKeys(t.Cols, strings.ToLower(s.Table)+".")
+	}
+	// Only safe without triggers: a trigger body can run DDL between rows, so
+	// a parent table resolved for row 1 need not still be the table row 2
+	// should be checked against. See fkTargetCache.
+	var fks *fkTargetCache
+	if !hasBefore && !hasAfter {
+		fks = newFKTargetCache()
+	}
 	// The index set cannot change mid-statement, so its sorted name list is
 	// computed once here instead of being rebuilt and re-sorted on every row.
 	// rawIndexNames is deliberately called (not storage.Table.SortedIndexNames)
@@ -72,7 +87,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 			}
 			row[i] = cv
 		}
-		if err := validateRowConstraints(env, t, row, -1, nil); err != nil {
+		if err := validateRowConstraintsWith(env, t, row, -1, nil, fks); err != nil {
 			return nil, err
 		}
 		if err := t.CheckSecondaryIndexConstraints(row, -1); err != nil {
@@ -126,13 +141,27 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 		}
 		colIdx[i] = idx
 	}
-	returningRows := make([]Row, 0, len(s.Rows))
-	tablePrefix := strings.ToLower(s.Table) + "."
-	keys := newTableRowKeys(t.Cols, tablePrefix)
 	beforeTriggers, afterTriggers := planTriggers(env.planFor(s), env, s.Table, storage.TriggerInsert)
 	hasBefore := len(beforeTriggers) > 0
 	hasAfter := len(afterTriggers) > 0
 	needsRow := hasBefore || hasAfter || len(s.Returning) > 0
+	// See executeInsertAllColumns: neither is read unless a trigger or a
+	// RETURNING clause asks for the row map.
+	var returningRows []Row
+	if len(s.Returning) > 0 {
+		returningRows = make([]Row, 0, len(s.Rows))
+	}
+	var keys tableRowKeys
+	if needsRow {
+		keys = newTableRowKeys(t.Cols, strings.ToLower(s.Table)+".")
+	}
+	// Only safe without triggers: a trigger body can run DDL between rows, so
+	// a parent table resolved for row 1 need not still be the table row 2
+	// should be checked against. See fkTargetCache.
+	var fks *fkTargetCache
+	if !hasBefore && !hasAfter {
+		fks = newFKTargetCache()
+	}
 	// The index set cannot change mid-statement, so its sorted name list is
 	// computed once here instead of being rebuilt and re-sorted on every row.
 	// rawIndexNames is deliberately called (not storage.Table.SortedIndexNames)
@@ -166,7 +195,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			}
 			row[idx] = cv
 		}
-		if err := validateRowConstraints(env, t, row, -1, nil); err != nil {
+		if err := validateRowConstraintsWith(env, t, row, -1, nil, fks); err != nil {
 			return nil, err
 		}
 		if err := t.CheckSecondaryIndexConstraints(row, -1); err != nil {
@@ -278,16 +307,72 @@ func applyColumnDefaults(row []any, cols []storage.Column) error {
 //     columns in that order, matching the original range over t.Cols, so
 //     when more than one changed column is in violation the same one wins.
 func validateRowConstraints(env ExecEnv, t *storage.Table, row []any, excludeRow int, changedCols []int) error {
+	return validateRowConstraintsWith(env, t, row, excludeRow, changedCols, nil)
+}
+
+// fkTarget is one resolved FOREIGN KEY reference: the parent table and the
+// position of the referenced column in it.
+type fkTarget struct {
+	table  *storage.Table
+	colIdx int
+	err    error
+}
+
+// fkTargetCache resolves each FOREIGN KEY column's parent table and column
+// index once per statement rather than once per row.
+//
+// Both are pure functions of the column's *storage.ForeignKeyRef, which is
+// part of the schema, so within one statement the answer is fixed — but
+// getting it costs a db.Get, and in the disk-backed storage modes a db.Get for
+// a parent table that is not resident is a *backend load of that whole table*.
+// Paying it per row turned a bulk INSERT into one parent load per inserted row.
+//
+// Callers must only supply a cache when no trigger can run between rows: a
+// trigger body may execute DDL, and dropping and recreating the parent table
+// mid-statement would leave a cached pointer addressing the old one. See
+// executeInsertAllColumns for the gate.
+type fkTargetCache struct {
+	targets map[*storage.ForeignKeyRef]fkTarget
+}
+
+func newFKTargetCache() *fkTargetCache {
+	return &fkTargetCache{targets: make(map[*storage.ForeignKeyRef]fkTarget, 1)}
+}
+
+// resolve returns the parent table and referenced column index for ref,
+// consulting the cache when one is supplied.
+func (c *fkTargetCache) resolve(env ExecEnv, col storage.Column) fkTarget {
+	if c != nil {
+		if hit, ok := c.targets[col.ForeignKey]; ok {
+			return hit
+		}
+	}
+	var out fkTarget
+	refTable, err := env.db.Get(env.tenant, col.ForeignKey.Table)
+	if err != nil {
+		out.err = fmt.Errorf("FOREIGN KEY column %q references missing table %q", col.Name, col.ForeignKey.Table)
+	} else if refIdx, idxErr := refTable.ColIndex(col.ForeignKey.Column); idxErr != nil {
+		out.err = fmt.Errorf("FOREIGN KEY column %q references missing column %q.%q", col.Name, col.ForeignKey.Table, col.ForeignKey.Column)
+	} else {
+		out.table, out.colIdx = refTable, refIdx
+	}
+	if c != nil {
+		c.targets[col.ForeignKey] = out
+	}
+	return out
+}
+
+func validateRowConstraintsWith(env ExecEnv, t *storage.Table, row []any, excludeRow int, changedCols []int, fks *fkTargetCache) error {
 	if changedCols == nil {
 		for colIdx := range t.Cols {
-			if err := validateOneRowConstraint(env, t, row, excludeRow, colIdx); err != nil {
+			if err := validateOneRowConstraint(env, t, row, excludeRow, colIdx, fks); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 	for _, colIdx := range changedCols {
-		if err := validateOneRowConstraint(env, t, row, excludeRow, colIdx); err != nil {
+		if err := validateOneRowConstraint(env, t, row, excludeRow, colIdx, fks); err != nil {
 			return err
 		}
 	}
@@ -297,7 +382,7 @@ func validateRowConstraints(env ExecEnv, t *storage.Table, row []any, excludeRow
 // validateOneRowConstraint is validateRowConstraints's per-column body,
 // factored out so the "check everything" (INSERT) and "check only the
 // changed columns" (UPDATE) loops share identical logic and error text.
-func validateOneRowConstraint(env ExecEnv, t *storage.Table, row []any, excludeRow int, colIdx int) error {
+func validateOneRowConstraint(env ExecEnv, t *storage.Table, row []any, excludeRow int, colIdx int, fks *fkTargetCache) error {
 	col := t.Cols[colIdx]
 	if colIdx >= len(row) {
 		return fmt.Errorf("row missing constrained column %q", col.Name)
@@ -331,14 +416,11 @@ func validateOneRowConstraint(env ExecEnv, t *storage.Table, row []any, excludeR
 		if col.ForeignKey == nil {
 			return fmt.Errorf("FOREIGN KEY column %q has no reference target", col.Name)
 		}
-		refTable, err := env.db.Get(env.tenant, col.ForeignKey.Table)
-		if err != nil {
-			return fmt.Errorf("FOREIGN KEY column %q references missing table %q", col.Name, col.ForeignKey.Table)
+		target := fks.resolve(env, col)
+		if target.err != nil {
+			return target.err
 		}
-		refIdx, err := refTable.ColIndex(col.ForeignKey.Column)
-		if err != nil {
-			return fmt.Errorf("FOREIGN KEY column %q references missing column %q.%q", col.Name, col.ForeignKey.Table, col.ForeignKey.Column)
-		}
+		refTable, refIdx := target.table, target.colIdx
 		if !constraintValueExists(refTable, refIdx, val, -1) {
 			return fmt.Errorf("FOREIGN KEY violation on column %q: value %v not found in %s.%s", col.Name, val, col.ForeignKey.Table, col.ForeignKey.Column)
 		}

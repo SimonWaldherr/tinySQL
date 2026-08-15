@@ -94,13 +94,18 @@ func (s *statementWAL) commit() error {
 // (typically via defer, checking the returned error only where a mid-loop
 // failure should abort the statement — see executeInsertAllColumns for the
 // pattern).
+//
+// With no AdvancedWAL attached — the default — it returns a nil *walAuto
+// rather than an inert allocated one. Every method on the type is written to
+// accept a nil receiver, so callers need no extra check and every mutating
+// statement saves an allocation it would otherwise make and never use.
 func beginWALAuto(env ExecEnv, table string) (*walAuto, error) {
 	if env.statementWAL != nil {
 		if err := env.statementWAL.begin(); err != nil {
 			return nil, err
 		}
 		if env.statementWAL.wal == nil {
-			return &walAuto{}, nil
+			return nil, nil
 		}
 		return &walAuto{
 			wal:            env.statementWAL.wal,
@@ -111,7 +116,7 @@ func beginWALAuto(env ExecEnv, table string) (*walAuto, error) {
 	}
 	wal := env.db.AdvancedWAL()
 	if wal == nil {
-		return &walAuto{}, nil
+		return nil, nil
 	}
 	txID := wal.NewAutoTxID()
 	if _, err := wal.LogBegin(txID); err != nil {
