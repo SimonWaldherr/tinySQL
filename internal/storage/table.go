@@ -374,6 +374,49 @@ func (t *Table) ResetDirty() {
 	t.dirtyRowsState = dirtyRowsNone
 }
 
+// AddColumn appends a column to the table's schema and backfills every
+// existing row with a NULL for it.
+//
+// Cols and the lower-cased name index ColIndex answers from are two
+// representations of the same thing, and only this package can keep them in
+// step — colPos is unexported and is built once, by NewTable. A caller that
+// appends to Cols directly (which is what ALTER TABLE ADD COLUMN did) ends up
+// with a column that is present in the schema and in every row but that no
+// lookup can resolve.
+//
+// The duplicate check is case-insensitive, matching ColIndex: two columns
+// whose names differ only in case would be indistinguishable to every lookup,
+// and the second would shadow the first in colPos.
+func (t *Table) AddColumn(col Column) error {
+	key := strings.ToLower(col.Name)
+	if key == "" {
+		return fmt.Errorf("column name cannot be empty")
+	}
+	if t.colPos == nil {
+		t.colPos = make(map[string]int, len(t.Cols)+1)
+		for i, c := range t.Cols {
+			t.colPos[strings.ToLower(c.Name)] = i
+		}
+	}
+	if _, exists := t.colPos[key]; exists {
+		return fmt.Errorf("column %q already exists on table %q", col.Name, t.Name)
+	}
+	// Everything above this line only reads, so a rejected AddColumn leaves
+	// the table exactly as it found it. ALTER TABLE takes no rollback snapshot
+	// unless a write-ahead log is attached, so being all-or-nothing by
+	// construction is what makes it safe.
+	t.Cols = append(t.Cols, col)
+	t.colPos[key] = len(t.Cols) - 1
+	for i := range t.Rows {
+		t.Rows[i] = append(t.Rows[i], nil)
+	}
+	// Every existing row's contents changed, so a derived structure that only
+	// knows how to grow by appending rows must rebuild rather than assume it
+	// is still current. See noteStructuralChange.
+	t.noteStructuralChange()
+	return nil
+}
+
 // ColIndex returns the zero-based index of the named column.
 func (t *Table) ColIndex(name string) (int, error) {
 	i, ok := t.colPos[strings.ToLower(name)]

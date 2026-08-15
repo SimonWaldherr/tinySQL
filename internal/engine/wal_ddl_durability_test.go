@@ -123,3 +123,45 @@ func TestWALCreateThenInsertThenDropOtherTable(t *testing.T) {
 		t.Errorf("keep has %d rows after restart, want 2", got)
 	}
 }
+
+// TestWALAlterTableAddColumnIsDurableViaEngineExecute covers the schema change
+// that used to be impossible to make at all: ALTER TABLE ADD COLUMN mutates
+// the live table in place and relies on the version bump plus the full-table
+// dirty sentinel to reach the log, exactly as CREATE INDEX does. If either
+// were missing, the recovered table would be back to its old column list and
+// the backfilled cells would be gone.
+func TestWALAlterTableAddColumnIsDurableViaEngineExecute(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ddlalter")
+
+	db := walDDLDB(t, path)
+	execWAL(t, db, "public", `CREATE TABLE kv (id INT, name TEXT)`)
+	execWAL(t, db, "public", `INSERT INTO kv VALUES (1, 'one')`)
+	execWAL(t, db, "public", `ALTER TABLE kv ADD COLUMN extra TEXT`)
+	execWAL(t, db, "public", `UPDATE kv SET extra = 'filled' WHERE id = 1`)
+	execWAL(t, db, "public", `INSERT INTO kv VALUES (2, 'two', 'fresh')`)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	reopened := walDDLDB(t, path)
+	defer reopened.Close()
+	table, err := reopened.Get("public", "kv")
+	if err != nil {
+		t.Fatalf("table missing after restart: %v", err)
+	}
+	if len(table.Cols) != 3 || table.Cols[2].Name != "extra" {
+		t.Fatalf("recovered columns = %#v, want a third column named extra", table.Cols)
+	}
+	// The recovered table has to be addressable by name too, not just wide
+	// enough: recovery rebuilds it from the disk form, which is a different
+	// path from the one ALTER TABLE took.
+	if idx, err := table.ColIndex("extra"); err != nil || idx != 2 {
+		t.Fatalf("ColIndex(extra) after restart = %d, %v; want 2, nil", idx, err)
+	}
+	if got := countWAL(t, reopened, "public", `SELECT id FROM kv WHERE extra = 'filled'`); got != 1 {
+		t.Fatalf("rows matching the pre-ALTER row's backfilled value = %d, want 1", got)
+	}
+	if got := countWAL(t, reopened, "public", `SELECT id FROM kv WHERE extra = 'fresh'`); got != 1 {
+		t.Fatalf("rows matching the post-ALTER row = %d, want 1", got)
+	}
+}
