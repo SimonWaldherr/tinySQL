@@ -6,6 +6,7 @@ package storage
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -49,6 +50,61 @@ type Table struct {
 	// happened since I was built" from "something else happened" without
 	// paying for a full rebuild on every append.
 	structVersion int
+	// derived is a slot for executor-owned state that is a pure function of
+	// this table's contents and can always be rebuilt from them: today, the
+	// constraint-value index that turns PRIMARY KEY and UNIQUE enforcement
+	// into a hash lookup instead of a full scan (see internal/engine).
+	// storage neither builds nor interprets it, which is why the type is any.
+	//
+	// It lives on the table rather than in a process-global map keyed by
+	// *Table, which is where the engine used to keep it, because that map
+	//   - put every constrained INSERT/UPDATE in the process behind a single
+	//     mutex, so writers to unrelated tables contended with each other and
+	//     with readers;
+	//   - made each maintenance operation cost O(cached columns across every
+	//     table in the process) rather than O(this table's columns); and
+	//   - never dropped an entry, so every table that was ever written — every
+	//     transaction shadow, every evicted backend page, every dropped table —
+	//     stayed reachable, with all of its rows, for the process's lifetime.
+	//
+	// A clone starts with an empty slot: a clone is a different table, and
+	// this state describes the one it was built from.
+	derivedMu sync.Mutex
+	derived   any
+}
+
+// DerivedLock locks this table's derived-state slot. Derived and SetDerived
+// may only be called while it is held; pair it with DerivedUnlock.
+//
+// The lock is per-table by design: two statements writing different tables
+// never meet on it, which is the entire reason the state moved here. Two
+// touching the *same* table are already serialized by DB's content lock — this
+// exists for the paths that hold only its read side, where two concurrent
+// SELECTs can both find a cold cache and try to build it.
+func (t *Table) DerivedLock() { t.derivedMu.Lock() }
+
+// DerivedUnlock releases the lock taken by DerivedLock.
+func (t *Table) DerivedUnlock() { t.derivedMu.Unlock() }
+
+// Derived returns the executor state stored on this table, or nil. The caller
+// must hold DerivedLock.
+func (t *Table) Derived() any { return t.derived }
+
+// SetDerived stores executor state on this table; nil discards it. The caller
+// must hold DerivedLock.
+func (t *Table) SetDerived(v any) { t.derived = v }
+
+// dropDerived discards this table's executor state without the caller having
+// to take the lock itself. Every storage-side path that replaces rows behind
+// the executor's back — a rollback restore, a WAL replay — must call it: the
+// state describes rows that are no longer there.
+func (t *Table) dropDerived() {
+	if t == nil {
+		return
+	}
+	t.derivedMu.Lock()
+	t.derived = nil
+	t.derivedMu.Unlock()
 }
 
 // dirtyRowsState distinguishes "no in-place updates recorded yet" from "the
@@ -245,10 +301,33 @@ func (t *Table) MarkDirtyFrom(idx int) {
 // writes the whole table, as it always did. Reporting some but not all is not,
 // so a mutation path that cannot enumerate its rows must call MarkDirtyFrom(-1)
 // instead, which permanently gives up the list for this dirty window.
+//
+// The list is bounded in two ways, because ResetDirty is only reached at a WAL
+// checkpoint: a database with no WAL attached never resets it at all, and one
+// with a WAL still accumulates between checkpoints. Every rollback snapshot
+// carries this list, so an unbounded one makes repeated UPDATEs quadratic.
 func (t *Table) MarkRowUpdated(idx int) {
 	t.dirtyFrom = -1
 	t.noteStructuralChange()
 	if t.dirtyRowsState == dirtyRowsUnknown || idx < 0 {
+		return
+	}
+	// Bound 1: repeatedly rewriting the same row — a counter, a status
+	// column, a claimed queue slot — is a common shape, and re-appending idx
+	// would grow the list (and the WAL record built from it, which writes
+	// each listed row separately) without describing anything new.
+	if n := len(t.dirtyRows); n > 0 && t.dirtyRows[n-1] == idx {
+		t.dirtyRowsState = dirtyRowsExact
+		return
+	}
+	// Bound 2: once the list is no shorter than the table, LogTransaction
+	// writes the whole table anyway (see its `len(updated) < len(Rows)`
+	// guard), so continuing to extend it buys nothing and costs memory plus
+	// a longer copy in every rollback snapshot. Give it up at exactly that
+	// point; dirtyRowsUnknown is the documented safe direction.
+	if len(t.dirtyRows)+1 >= len(t.Rows) {
+		t.dirtyRows = nil
+		t.dirtyRowsState = dirtyRowsUnknown
 		return
 	}
 	t.dirtyRowsState = dirtyRowsExact

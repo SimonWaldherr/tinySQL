@@ -207,7 +207,6 @@ func loadSimpleSelectPlanTemplate(table *storage.Table, s *Select, reusableSchem
 		offset:        s.Offset,
 		outputCols:    outputCols,
 		rowMapCap:     simpleProjectionMapCap(projs),
-		rowTextCols:   rawRowTextColumns(colIndex),
 		scanType:      "TABLE SCAN",
 		estimatedRows: len(table.Rows),
 	}

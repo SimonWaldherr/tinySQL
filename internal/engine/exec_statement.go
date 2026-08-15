@@ -34,17 +34,20 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 		walBefore = db.MetaSnapshot()
 	}
 
+	var planStorage dmlPlan
+	plan := newDMLPlan(&planStorage, db, tenant, stmt)
+
 	var snapshot *storage.StatementSnapshot
 	switch {
 	case isAtomicDML(stmt):
 		var snapshotErr error
-		if table, rowIDs, ok := rowUpdateSnapshotTarget(db, tenant, stmt); ok {
+		if table, rowIDs, ok := rowUpdateSnapshotTarget(plan); ok {
 			snapshot, snapshotErr = db.SnapshotForRowUpdateStatement(tenant, table, rowIDs)
-		} else if table, rowIDs, ok := rowDeleteSnapshotTarget(db, tenant, stmt); ok {
+		} else if table, rowIDs, ok := rowDeleteSnapshotTarget(plan); ok {
 			snapshot, snapshotErr = db.SnapshotForRowDeleteStatement(tenant, table, rowIDs)
-		} else if table, ok := appendOnlySnapshotTarget(db, tenant, stmt); ok {
+		} else if table, ok := appendOnlySnapshotTarget(plan); ok {
 			snapshot, snapshotErr = db.SnapshotForAppendOnlyTableStatement(tenant, table)
-		} else if table, ok := tableScopedSnapshotTarget(db, tenant, stmt); ok {
+		} else if table, ok := tableScopedSnapshotTarget(plan); ok {
 			snapshot, snapshotErr = db.SnapshotForTableStatement(tenant, table)
 		} else {
 			snapshot = db.SnapshotForStatement()
@@ -61,20 +64,19 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 		// snapshot is the right trade here.
 		snapshot = db.SnapshotForStatement()
 	}
+	// Runs after the rollback defer below (defers unwind last-in-first-out), so
+	// the snapshot is only disarmed once it can no longer be needed. Without
+	// it, a statement's armed catalog rollback point would still be installed
+	// when the next statement mutated the catalog, and would capture that
+	// statement's pre-image instead. See storage.ReleaseStatementSnapshot.
+	defer db.ReleaseStatementSnapshot(snapshot)
 	defer func() { recordAudit(ctx, db, tenant, stmt, err) }()
 	defer func() {
 		if err == nil || snapshot == nil {
 			return
 		}
 		db.RestoreStatementSnapshot(snapshot)
-		for _, rollbackTenant := range db.ListTenants() {
-			for _, table := range db.ListTables(rollbackTenant) {
-				invalidateConstraintIndexes(table)
-				purgeVectorCachesFor(rollbackTenant, table.Name)
-				purgeGeoGridCachesFor(rollbackTenant, table.Name)
-				purgeVecQueryCacheFor(rollbackTenant, table.Name)
-			}
-		}
+		purgeCachesAfterRollback(db, snapshot)
 	}()
 	defer func() {
 		if r := recover(); r != nil {
@@ -83,7 +85,7 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 	}()
 
 	statementWAL := newStatementWAL(db)
-	rs, err = execStmt(ExecEnv{ctx: ctx, tenant: tenant, db: db, statementWAL: statementWAL, now: time.Now(), subqueryCache: newSubqueryResultCache()}, stmt)
+	rs, err = execStmt(ExecEnv{ctx: ctx, tenant: tenant, db: db, statementWAL: statementWAL, now: time.Now(), subqueryCache: newSubqueryResultCache(), dml: plan}, stmt)
 	if err == nil {
 		err = statementWAL.commit()
 	}
@@ -93,22 +95,212 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 	return rs, err
 }
 
+// purgeCachesAfterRollback drops the derived state that a rolled-back
+// statement may have built from rows that are no longer there: the
+// constraint-value index, and the vector/geo/vector-query caches, which are
+// keyed by name rather than by table pointer and so cannot notice the restore
+// themselves.
+//
+// It is scoped to the tables the snapshot actually restored. A statement whose
+// rollback point covers one table is, by construction, a statement that no
+// trigger and no foreign-key action could have taken outside that table — the
+// snapshot selectors above only choose those shapes under exactly that
+// condition. Purging everything instead meant one rejected INSERT threw away
+// every other table's warm caches, for every caller in the process.
+func purgeCachesAfterRollback(db *storage.DB, snapshot *storage.StatementSnapshot) {
+	refs, scoped := snapshot.RestoredTables()
+	if !scoped {
+		for _, rollbackTenant := range db.ListTenants() {
+			for _, table := range db.ListTables(rollbackTenant) {
+				invalidateConstraintIndexes(table)
+				purgeVectorCachesFor(rollbackTenant, table.Name)
+				purgeGeoGridCachesFor(rollbackTenant, table.Name)
+				purgeVecQueryCacheFor(rollbackTenant, table.Name)
+			}
+		}
+		return
+	}
+	for _, ref := range refs {
+		if table, err := db.Get(ref.Tenant, ref.Table); err == nil {
+			invalidateConstraintIndexes(table)
+		}
+		purgeVectorCachesFor(ref.Tenant, ref.Table)
+		purgeGeoGridCachesFor(ref.Tenant, ref.Table)
+		purgeVecQueryCacheFor(ref.Tenant, ref.Table)
+	}
+}
+
+// dmlPlan is the planning work executeStatement has to do anyway, in order to
+// choose the cheapest rollback snapshot for a mutating statement, kept so the
+// DML handler that runs immediately afterwards reuses it instead of computing
+// the same values a second time. Before it existed, a point UPDATE built its
+// column index and ran its constraint-index seek twice per statement — once
+// while picking a snapshot shape, once in buildSimpleUpdatePlan — which
+// measured at roughly 30% of the statement's total cost.
+//
+// Reuse is sound because nothing between those two points can invalidate it:
+// executeStatement holds the content write lock across both, and everything it
+// does in between (the WAL metadata pre-image, taking the rollback snapshot,
+// binding the statement WAL) only reads.
+//
+// Every field is an optimization with no semantics of its own. A consumer that
+// finds no plan — nested DML dispatched through execStmt, a handler called
+// directly by a test, or a field this statement shape does not precompute —
+// computes the value itself exactly as before.
+type dmlPlan struct {
+	// stmt is the identity guard: see ExecEnv.planFor.
+	stmt Statement
+	// table is the statement's target table, or nil when it does not resolve.
+	// The handler reports that lookup error itself, with its own wording.
+	table *storage.Table
+	// tenantFK is tenantHasAnyForeignKeys for this statement's tenant, which
+	// costs a full ListTables (two allocations, a sort, and a backend
+	// directory listing in the disk-backed modes) per call. tenantFKKnown is
+	// false when the statement shape never asks for it, so a future consumer
+	// that does cannot silently read the zero value as "no foreign keys".
+	tenantFK      bool
+	tenantFKKnown bool
+	before, after []*storage.CatalogTrigger
+	// colIndex and rowIDs are populated only for the statement shapes whose
+	// handler is going to need them again; a nil colIndex means "not
+	// precomputed". rowIDsFound mirrors the seek's own found result, which is
+	// distinct from an empty candidate set (an indexed negative lookup).
+	colIndex    map[string]int
+	rowIDs      []int
+	rowIDsFound bool
+}
+
+func (p *dmlPlan) hasTriggers() bool { return len(p.before) > 0 || len(p.after) > 0 }
+
+// planTable returns the target table a plan already resolved, or nil when
+// there is no plan or the lookup failed. A nil result means the caller must
+// call db.Get itself — which is also how the lookup error reaches the caller
+// with the wording it has always had.
+func planTable(plan *dmlPlan) *storage.Table {
+	if plan == nil {
+		return nil
+	}
+	return plan.table
+}
+
+// planTriggers returns the statement's trigger lists, falling back to a
+// catalog lookup when nothing was precomputed.
+func planTriggers(plan *dmlPlan, env ExecEnv, table string, event storage.TriggerEvent) (before, after []*storage.CatalogTrigger) {
+	if plan != nil {
+		return plan.before, plan.after
+	}
+	return env.db.Catalog().GetTriggersForEvent(table, event)
+}
+
+// planColumnIndex returns the precomputed lower-cased column index for the
+// statement's target table, or nil when the plan did not build one.
+func planColumnIndex(plan *dmlPlan) map[string]int {
+	if plan == nil {
+		return nil
+	}
+	return plan.colIndex
+}
+
+// planConstraintRows returns the precomputed constraint-index candidate set
+// and whether the seek found an index to use, falling back to seek() when the
+// plan holds no precomputed answer. A non-nil colIndex is what marks the pair
+// as precomputed: newDMLPlan only ever fills them in together.
+func planConstraintRows(plan *dmlPlan, seek func() ([]int, bool)) ([]int, bool) {
+	if plan != nil && plan.colIndex != nil {
+		return plan.rowIDs, plan.rowIDsFound
+	}
+	return seek()
+}
+
+// planTenantHasForeignKeys answers tenantHasAnyForeignKeys for stmt, reusing
+// the plan's answer when there is one. The uncached call lists every table in
+// the tenant — two allocations and a sort, plus a backend directory listing in
+// the disk-backed storage modes — so a statement that asks more than once pays
+// for it more than once.
+func planTenantHasForeignKeys(env ExecEnv, stmt Statement) bool {
+	if plan := env.planFor(stmt); plan != nil && plan.tenantFKKnown {
+		return plan.tenantFK
+	}
+	return tenantHasAnyForeignKeys(env)
+}
+
+// newDMLPlan precomputes the shared facts about a mutating statement into out,
+// returning it. It returns nil for anything that is not INSERT/UPDATE/DELETE,
+// which is also what every consumer treats as "compute it yourself".
+//
+// The caller supplies the storage so an ordinary statement does not pay a heap
+// allocation for the plan itself.
+func newDMLPlan(out *dmlPlan, db *storage.DB, tenant string, stmt Statement) *dmlPlan {
+	var name string
+	var event storage.TriggerEvent
+	switch s := stmt.(type) {
+	case *Insert:
+		name, event = s.Table, storage.TriggerInsert
+	case *Update:
+		name, event = s.Table, storage.TriggerUpdate
+	case *Delete:
+		name, event = s.Table, storage.TriggerDelete
+	default:
+		return nil
+	}
+	plan := out
+	plan.stmt = stmt
+	plan.before, plan.after = db.Catalog().GetTriggersForEvent(name, event)
+	// Deliberately not computed for INSERT: nothing on the INSERT path asks
+	// for it (per-column FOREIGN KEY validation goes through
+	// validateOneRowConstraint instead), and the answer costs a full
+	// ListTables — two allocations, a sort, and a backend directory listing
+	// in the disk-backed storage modes.
+	if _, isInsert := stmt.(*Insert); !isInsert {
+		plan.tenantFK = tenantHasAnyForeignKeys(ExecEnv{tenant: tenant, db: db})
+		plan.tenantFKKnown = true
+	}
+	table, err := db.Get(tenant, name)
+	if err != nil {
+		return plan
+	}
+	plan.table = table
+	if plan.hasTriggers() {
+		// Every consumer of colIndex/rowIDs below is disabled by a trigger.
+		return plan
+	}
+	switch s := stmt.(type) {
+	case *Update:
+		// Precomputed under exactly the conditions that make both
+		// rowUpdateSnapshotTarget and executeSimpleUpdateFastPath want them:
+		// a tenant with foreign keys disables both.
+		if plan.tenantFK {
+			return plan
+		}
+		plan.colIndex = simpleColumnIndex(table, s.Table)
+		if s.Where != nil {
+			plan.rowIDs, _, _, plan.rowIDsFound = selectConstraintIndex(table, plan.colIndex, s.Where)
+		}
+	case *Delete:
+		// Both consumers (rowDeleteSnapshotTarget and executeDelete's point
+		// path) do nothing without a WHERE clause.
+		if s.Where == nil {
+			return plan
+		}
+		plan.colIndex = simpleColumnIndex(table, s.Table)
+		plan.rowIDs, _, _, plan.rowIDsFound = selectDeleteConstraintRows(table, plan.colIndex, s.Where)
+	}
+	return plan
+}
+
 // appendOnlySnapshotTarget identifies the narrow INSERT fast path whose
 // failed execution can be rolled back by truncating appended rows. Secondary
 // indexes can be changed as rows are inserted, so they retain a cloned-table
 // snapshot. The same is true for every trigger-capable statement.
-func appendOnlySnapshotTarget(db *storage.DB, tenant string, stmt Statement) (string, bool) {
-	s, ok := stmt.(*Insert)
-	if !ok {
+func appendOnlySnapshotTarget(plan *dmlPlan) (string, bool) {
+	if plan == nil {
 		return "", false
 	}
-	catalog := db.Catalog()
-	before, after := catalog.GetTriggersForEvent(s.Table, storage.TriggerInsert)
-	if len(before) > 0 || len(after) > 0 {
+	s, ok := plan.stmt.(*Insert)
+	if !ok || plan.hasTriggers() {
 		return "", false
 	}
-	table, err := db.Get(tenant, s.Table)
-	if err != nil || len(table.Indexes) > 0 {
+	if plan.table == nil || len(plan.table.Indexes) > 0 {
 		return "", false
 	}
 	return s.Table, true
@@ -118,25 +310,21 @@ func appendOnlySnapshotTarget(db *storage.DB, tenant string, stmt Statement) (st
 // candidate set bounds every row the statement can replace. The compact
 // snapshot is safe only when no trigger/FK can write elsewhere and none of the
 // assigned columns belongs to a secondary index.
-func rowUpdateSnapshotTarget(db *storage.DB, tenant string, stmt Statement) (string, []int, bool) {
-	s, ok := stmt.(*Update)
-	if !ok || tenantHasAnyForeignKeys(ExecEnv{tenant: tenant, db: db}) {
+func rowUpdateSnapshotTarget(plan *dmlPlan) (string, []int, bool) {
+	if plan == nil {
 		return "", nil, false
 	}
-	before, after := db.Catalog().GetTriggersForEvent(s.Table, storage.TriggerUpdate)
-	if len(before) > 0 || len(after) > 0 {
+	s, ok := plan.stmt.(*Update)
+	if !ok || plan.tenantFK || plan.hasTriggers() {
 		return "", nil, false
 	}
-	table, err := db.Get(tenant, s.Table)
-	if err != nil || updateTouchesSecondaryIndex(table, s) {
+	if plan.table == nil || updateTouchesSecondaryIndex(plan.table, s) {
 		return "", nil, false
 	}
-	colIndex := simpleColumnIndex(table, s.Table)
-	rowIDs, _, _, found := selectConstraintIndex(table, colIndex, s.Where)
-	if !found {
+	if !plan.rowIDsFound {
 		return "", nil, false
 	}
-	return s.Table, rowIDs, true
+	return s.Table, plan.rowIDs, true
 }
 
 func updateTouchesSecondaryIndex(table *storage.Table, s *Update) bool {
@@ -163,56 +351,47 @@ func updateTouchesSecondaryIndex(table *storage.Table, s *Update) bool {
 
 // rowDeleteSnapshotTarget identifies a single-row DELETE whose rollback can
 // reinsert one saved row instead of cloning the full table.
-func rowDeleteSnapshotTarget(db *storage.DB, tenant string, stmt Statement) (string, []int, bool) {
-	s, ok := stmt.(*Delete)
-	if !ok || tenantHasAnyForeignKeys(ExecEnv{tenant: tenant, db: db}) {
+func rowDeleteSnapshotTarget(plan *dmlPlan) (string, []int, bool) {
+	if plan == nil {
 		return "", nil, false
 	}
-	before, after := db.Catalog().GetTriggersForEvent(s.Table, storage.TriggerDelete)
-	if len(before) > 0 || len(after) > 0 {
+	s, ok := plan.stmt.(*Delete)
+	if !ok || plan.tenantFK || plan.hasTriggers() {
 		return "", nil, false
 	}
-	table, err := db.Get(tenant, s.Table)
-	if err != nil || len(table.Indexes) > 0 {
+	if plan.table == nil || len(plan.table.Indexes) > 0 {
 		return "", nil, false
 	}
-	colIndex := simpleColumnIndex(table, s.Table)
-	rowIDs, _, _, found := selectDeleteConstraintRows(table, colIndex, s.Where)
-	if !found || len(rowIDs) > 1 {
+	if !plan.rowIDsFound || len(plan.rowIDs) > 1 {
 		return "", nil, false
 	}
-	return s.Table, rowIDs, true
+	return s.Table, plan.rowIDs, true
 }
 
 // tableScopedSnapshotTarget identifies DML that cannot mutate a table other
 // than its target. In that common case a table-scoped rollback point avoids
 // cloning every table on each statement. Triggers and FK cascades can write
 // elsewhere, so they deliberately retain the full-database snapshot.
-func tableScopedSnapshotTarget(db *storage.DB, tenant string, stmt Statement) (string, bool) {
-	var table string
-	var event storage.TriggerEvent
-	switch s := stmt.(type) {
+func tableScopedSnapshotTarget(plan *dmlPlan) (string, bool) {
+	if plan == nil || plan.hasTriggers() {
+		return "", false
+	}
+	switch s := plan.stmt.(type) {
 	case *Insert:
-		table, event = s.Table, storage.TriggerEvent("INSERT")
+		return s.Table, true
 	case *Update:
-		if tenantHasAnyForeignKeys(ExecEnv{tenant: tenant, db: db}) {
+		if plan.tenantFK {
 			return "", false
 		}
-		table, event = s.Table, storage.TriggerEvent("UPDATE")
+		return s.Table, true
 	case *Delete:
-		if tenantHasAnyForeignKeys(ExecEnv{tenant: tenant, db: db}) {
+		if plan.tenantFK {
 			return "", false
 		}
-		table, event = s.Table, storage.TriggerEvent("DELETE")
+		return s.Table, true
 	default:
 		return "", false
 	}
-	catalog := db.Catalog()
-	before, after := catalog.GetTriggersForEvent(table, event)
-	if len(before) > 0 || len(after) > 0 {
-		return "", false
-	}
-	return table, true
 }
 
 func isAtomicDML(stmt Statement) bool {

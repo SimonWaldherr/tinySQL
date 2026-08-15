@@ -77,12 +77,25 @@ type CatalogManager struct {
 	nextRun      int64
 	triggers     map[string]*CatalogTrigger // keyed by trigger name
 	rbac         *rbacState                 // users/roles/grants; see rbac.go
+	// pending is the statement rollback point waiting to be materialized. It
+	// is what makes a StatementSnapshot's catalog half copy-on-write; see
+	// catalogRollback in statement_snapshot.go.
+	pending atomic.Pointer[catalogRollback]
 }
 
 // lockWrite takes the catalog's write lock. Always pair it with unlockWrite:
 // that is where the revision counter is bumped, which is how the SQL driver
 // detects a transaction's catalog changes at COMMIT time.
-func (c *CatalogManager) lockWrite() { c.mu.Lock() }
+//
+// It is also where an armed statement rollback point copies the catalog, so
+// that a statement which never mutates the catalog — which is every ordinary
+// INSERT/UPDATE/DELETE — does not pay for a copy it will not use. The capture
+// happens here rather than in the snapshot constructor precisely because
+// every mutator funnels through this pair.
+func (c *CatalogManager) lockWrite() {
+	c.capturePendingRollback()
+	c.mu.Lock()
+}
 
 // unlockWrite records the mutation and releases the catalog's write lock.
 func (c *CatalogManager) unlockWrite() {
@@ -90,10 +103,25 @@ func (c *CatalogManager) unlockWrite() {
 	c.mu.Unlock()
 }
 
+// capturePendingRollback materializes an armed rollback point before the
+// caller mutates the catalog. It must run *outside* c.mu, since the copy it
+// takes reads the catalog under c.mu.RLock.
+func (c *CatalogManager) capturePendingRollback() {
+	if c == nil {
+		return
+	}
+	if cr := c.pending.Load(); cr != nil {
+		cr.capture()
+	}
+}
+
 // lockRBACWrite and unlockRBACWrite are the same pair for the RBAC sub-state,
 // which has its own mutex but shares the catalog's revision counter: a GRANT
 // must be committed with its transaction exactly like a CREATE VIEW.
-func (c *CatalogManager) lockRBACWrite() { c.rbac.mu.Lock() }
+func (c *CatalogManager) lockRBACWrite() {
+	c.capturePendingRollback()
+	c.rbac.mu.Lock()
+}
 
 func (c *CatalogManager) unlockRBACWrite() {
 	c.revision.Add(1)
@@ -692,9 +720,20 @@ func legacyCatalogIndexKey(schema, name string) string {
 // MarkMaterializedViewsStaleByDependency marks opt-in materialized views stale
 // when they depend on the changed object. It returns the affected view names.
 func (c *CatalogManager) MarkMaterializedViewsStaleByDependency(schema, changedName string) []string {
+	changedKey := strings.ToLower(schema + "." + changedName)
+	// Every successful mutating statement calls this, and almost none of them
+	// has an opt-in materialized view depending on the table it wrote. Settle
+	// that under the read lock first. Taking the write lock unconditionally
+	// made every INSERT/UPDATE/DELETE in the process queue behind one mutex,
+	// bump the revision counter (which makes the SQL driver's COMMIT path run
+	// a full catalog copy and deep-compare for every transaction), and — once
+	// the statement rollback point became copy-on-write — take the very
+	// catalog copy this exists to avoid.
+	if !c.anyMaterializedViewDependsOn(changedKey) {
+		return nil
+	}
 	c.lockWrite()
 	defer c.unlockWrite()
-	changedKey := strings.ToLower(schema + "." + changedName)
 	affected := make([]string, 0)
 	for key, deps := range c.dependencies {
 		mv := c.mviews[key]
@@ -713,6 +752,31 @@ func (c *CatalogManager) MarkMaterializedViewsStaleByDependency(schema, changedN
 		}
 	}
 	return affected
+}
+
+// anyMaterializedViewDependsOn reports whether any opt-in materialized view
+// declares a dependency on changedKey, i.e. whether
+// MarkMaterializedViewsStaleByDependency would actually change anything. It
+// visits exactly the entries that function's loop does, under the read lock
+// and without allocating.
+func (c *CatalogManager) anyMaterializedViewDependsOn(changedKey string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.mviews) == 0 {
+		return false
+	}
+	for key, deps := range c.dependencies {
+		mv := c.mviews[key]
+		if mv == nil || !mv.InvalidateOnChange {
+			continue
+		}
+		for _, dep := range deps {
+			if strings.ToLower(dep.DependsOnSchema+"."+dep.DependsOnName) == changedKey {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // RegisterFunction registers or updates a function's metadata.

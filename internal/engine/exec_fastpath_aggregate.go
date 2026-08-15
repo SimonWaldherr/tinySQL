@@ -69,7 +69,7 @@ func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 		return nil, ok, err
 	}
 
-	rawPlan := &simpleSelectPlan{table: plan.table, colIndex: plan.colIndex, where: plan.where, filter: buildRawFilter(plan.colIndex, plan.where), rowTextCols: rawRowTextColumns(plan.colIndex)}
+	rawPlan := &simpleSelectPlan{table: plan.table, colIndex: plan.colIndex, where: plan.where, filter: buildRawFilter(plan.colIndex, plan.where)}
 	if len(plan.groupCols) == 1 {
 		return executeSimpleSingleGroupAggregate(env, plan, rawPlan)
 	}

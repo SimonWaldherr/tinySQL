@@ -177,6 +177,11 @@ func buildRawExprFilter(colIndex map[string]int, e Expr) func([]any) (bool, erro
 	if !isSimpleRawExpr(e) || exprHasRowAwareFuncCall(e) {
 		return nil
 	}
+	// Eager, not lazy: this plan is captured by the closure below, and that
+	// closure can end up in a cached plan template (see
+	// loadSimpleSelectPlanTemplate) shared by concurrently executing
+	// statements. Building rowTextCols on first use would then be a write
+	// from two goroutines at once.
 	plan := &simpleSelectPlan{colIndex: colIndex, rowTextCols: rawRowTextColumns(colIndex)}
 	return func(raw []any) (bool, error) {
 		v, err := evalRawExpr(plan, raw, e)
@@ -293,6 +298,11 @@ func buildRawAndFilter(colIndex map[string]int, leftExpr, rightExpr Expr) func([
 }
 
 func buildRawAndFilterWithFallback(colIndex map[string]int, expr Expr, fastFilter func([]any) (bool, error)) func([]any) (bool, error) {
+	// Eager, not lazy: this plan is captured by the closure below, and that
+	// closure can end up in a cached plan template (see
+	// loadSimpleSelectPlanTemplate) shared by concurrently executing
+	// statements. Building rowTextCols on first use would then be a write
+	// from two goroutines at once.
 	plan := &simpleSelectPlan{colIndex: colIndex, rowTextCols: rawRowTextColumns(colIndex)}
 	return func(raw []any) (bool, error) {
 		fast, err := fastFilter(raw)
@@ -358,6 +368,11 @@ func buildRawOrFilter(colIndex map[string]int, leftExpr, rightExpr Expr) func([]
 }
 
 func buildRawOrFilterWithFallback(colIndex map[string]int, expr Expr, fastFilter func([]any) (bool, error)) func([]any) (bool, error) {
+	// Eager, not lazy: this plan is captured by the closure below, and that
+	// closure can end up in a cached plan template (see
+	// loadSimpleSelectPlanTemplate) shared by concurrently executing
+	// statements. Building rowTextCols on first use would then be a write
+	// from two goroutines at once.
 	plan := &simpleSelectPlan{colIndex: colIndex, rowTextCols: rawRowTextColumns(colIndex)}
 	return func(raw []any) (bool, error) {
 		fast, err := fastFilter(raw)
@@ -545,6 +560,11 @@ func buildRawFilterContains(colIndex map[string]int, ex *FuncCall) func([]any) (
 		terms = append(terms, strings.ToLower(s))
 	}
 	all := ex.Name == "CONTAINS_ALL"
+	// Eager, not lazy: this plan is captured by the closure below, and that
+	// closure can end up in a cached plan template (see
+	// loadSimpleSelectPlanTemplate) shared by concurrently executing
+	// statements. Building rowTextCols on first use would then be a write
+	// from two goroutines at once.
 	plan := &simpleSelectPlan{colIndex: colIndex, rowTextCols: rawRowTextColumns(colIndex)}
 	textExpr := ex.Args[0]
 	return func(raw []any) (bool, error) {

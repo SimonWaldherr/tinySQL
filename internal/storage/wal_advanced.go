@@ -906,8 +906,10 @@ func applyOperation(db *DB, record *WALRecord) (*Table, error) {
 			// An in-place replacement, unlike the insert fallback above, so
 			// anything keyed on "only appends happened since I last looked"
 			// (see Table.noteStructuralChange) must not treat this table as
-			// append-only anymore.
+			// append-only anymore, and executor state derived from the old
+			// row contents has to go.
 			table.noteStructuralChange()
+			table.dropDerived()
 		}
 		table.Version++
 
@@ -917,6 +919,9 @@ func applyOperation(db *DB, record *WALRecord) (*Table, error) {
 			if rowsEqual(row, record.BeforeImage) {
 				table.Rows = append(table.Rows[:i], table.Rows[i+1:]...)
 				table.noteStructuralChange()
+				// Every later row shifts down one position, which executor
+				// state built from row positions cannot reconcile.
+				table.dropDerived()
 				break
 			}
 		}

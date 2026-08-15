@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -17,9 +16,12 @@ func executeInsert(env ExecEnv, s *Insert) (*ResultSet, error) {
 	if len(s.Rows) == 0 {
 		return nil, fmt.Errorf("INSERT requires at least one VALUES clause")
 	}
-	t, err := env.db.Get(env.tenant, s.Table)
-	if err != nil {
-		return nil, err
+	t := planTable(env.planFor(s))
+	if t == nil {
+		var err error
+		if t, err = env.db.Get(env.tenant, s.Table); err != nil {
+			return nil, err
+		}
 	}
 	tmp := Row{}
 	if len(s.Cols) == 0 {
@@ -36,7 +38,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 	// nor RETURNING needs it.
 	tablePrefix := strings.ToLower(s.Table) + "."
 	keys := newTableRowKeys(t.Cols, tablePrefix)
-	beforeTriggers, afterTriggers := env.db.Catalog().GetTriggersForEvent(s.Table, storage.TriggerInsert)
+	beforeTriggers, afterTriggers := planTriggers(env.planFor(s), env, s.Table, storage.TriggerInsert)
 	hasBefore := len(beforeTriggers) > 0
 	hasAfter := len(afterTriggers) > 0
 	needsRow := hasBefore || hasAfter || len(s.Returning) > 0
@@ -127,7 +129,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	returningRows := make([]Row, 0, len(s.Rows))
 	tablePrefix := strings.ToLower(s.Table) + "."
 	keys := newTableRowKeys(t.Cols, tablePrefix)
-	beforeTriggers, afterTriggers := env.db.Catalog().GetTriggersForEvent(s.Table, storage.TriggerInsert)
+	beforeTriggers, afterTriggers := planTriggers(env.planFor(s), env, s.Table, storage.TriggerInsert)
 	hasBefore := len(beforeTriggers) > 0
 	hasAfter := len(afterTriggers) > 0
 	needsRow := hasBefore || hasAfter || len(s.Returning) > 0
@@ -344,12 +346,20 @@ func validateOneRowConstraint(env ExecEnv, t *storage.Table, row []any, excludeR
 	return nil
 }
 
-// constraintIndexes caches, per (table, column), a hash map from an
+// constraintIndexSet caches, per column of one table, a hash map from an
 // already-used column value to the row indices holding it. This turns
 // PRIMARY KEY / UNIQUE / FOREIGN KEY existence checks from an O(n) scan of
 // the whole table (paid on every INSERT/UPDATE) into an O(1) lookup — the
 // difference between ~10s and ~10ms when bulk-inserting 10k rows into a
 // table that already has 100k.
+//
+// It is stored on the table itself, through storage.Table's derived-state
+// slot, and guarded by that table's own lock. It used to live in a
+// process-global map keyed by (*storage.Table, column), which meant that a
+// write to any table in the process contended with every other, that
+// maintaining one row cost a scan of every cached column of every table, and
+// that nothing was ever released — see storage.Table.derived for the full
+// account.
 //
 // Maintenance is incremental rather than invalidate-and-rebuild-on-any-
 // change, because a naive "rebuild when table.Version changes" cache would
@@ -365,9 +375,8 @@ func validateOneRowConstraint(env ExecEnv, t *storage.Table, row []any, excludeR
 //     the incremental scheme can't reconcile cheaply, so
 //     invalidateConstraintIndexes drops the cache outright and the next
 //     check rebuilds it from scratch.
-type constraintIndexKey struct {
-	table  *storage.Table
-	colIdx int
+type constraintIndexSet struct {
+	cols map[int]*constraintIndexEntry
 }
 
 type constraintIndexEntry struct {
@@ -375,23 +384,29 @@ type constraintIndexEntry struct {
 	rows     map[any][]int
 }
 
-var (
-	constraintIndexMu sync.Mutex
-	constraintIndexes = make(map[constraintIndexKey]*constraintIndexEntry)
-)
+// constraintIndexSetOf returns the table's cached set, creating it when
+// create is true. The caller must hold t.DerivedLock.
+func constraintIndexSetOf(t *storage.Table, create bool) *constraintIndexSet {
+	set, _ := t.Derived().(*constraintIndexSet)
+	if set == nil && create {
+		set = &constraintIndexSet{cols: make(map[int]*constraintIndexEntry, 1)}
+		t.SetDerived(set)
+	}
+	return set
+}
 
 func getConstraintIndex(t *storage.Table, colIdx int) *constraintIndexEntry {
-	key := constraintIndexKey{table: t, colIdx: colIdx}
-	constraintIndexMu.Lock()
-	defer constraintIndexMu.Unlock()
+	t.DerivedLock()
+	defer t.DerivedUnlock()
 
-	e, ok := constraintIndexes[key]
-	if !ok || e.rowCount > len(t.Rows) {
+	set := constraintIndexSetOf(t, true)
+	e := set.cols[colIdx]
+	if e == nil || e.rowCount > len(t.Rows) {
 		// First use for this column, or the table shrank (DELETE already
 		// invalidates explicitly; this is a defensive fallback in case some
 		// row-removing path doesn't).
 		e = &constraintIndexEntry{rows: make(map[any][]int, len(t.Rows))}
-		constraintIndexes[key] = e
+		set.cols[colIdx] = e
 	}
 	for i := e.rowCount; i < len(t.Rows); i++ {
 		r := t.Rows[i]
@@ -410,10 +425,13 @@ func getConstraintIndex(t *storage.Table, colIdx int) *constraintIndexEntry {
 // the first operation after loading a table; a cold delete can scan one key
 // column once and still avoid the much larger rollback clone.
 func currentConstraintIndex(t *storage.Table, colIdx int) *constraintIndexEntry {
-	key := constraintIndexKey{table: t, colIdx: colIdx}
-	constraintIndexMu.Lock()
-	defer constraintIndexMu.Unlock()
-	entry := constraintIndexes[key]
+	t.DerivedLock()
+	defer t.DerivedUnlock()
+	set := constraintIndexSetOf(t, false)
+	if set == nil {
+		return nil
+	}
+	entry := set.cols[colIdx]
 	if entry == nil || entry.rowCount != len(t.Rows) {
 		return nil
 	}
@@ -425,26 +443,29 @@ func currentConstraintIndex(t *storage.Table, colIdx int) *constraintIndexEntry 
 // (DELETE) or replace the table wholesale (DROP TABLE) — the incremental
 // index only knows how to grow by appending or patch a single row in place.
 func invalidateConstraintIndexes(t *storage.Table) {
-	constraintIndexMu.Lock()
-	for k := range constraintIndexes {
-		if k.table == t {
-			delete(constraintIndexes, k)
-		}
+	if t == nil {
+		return
 	}
-	constraintIndexMu.Unlock()
+	t.DerivedLock()
+	t.SetDerived(nil)
+	t.DerivedUnlock()
 }
 
 // patchConstraintIndexRow updates every cached constraint index for a table
 // after row rowIdx is overwritten in place (UPDATE), moving it from its old
 // value's bucket to its new one instead of invalidating the whole cache.
 func patchConstraintIndexRow(t *storage.Table, rowIdx int, oldRow, newRow []any) {
-	constraintIndexMu.Lock()
-	defer constraintIndexMu.Unlock()
-	for k, e := range constraintIndexes {
-		if k.table != t || k.colIdx >= len(oldRow) || k.colIdx >= len(newRow) {
+	t.DerivedLock()
+	defer t.DerivedUnlock()
+	set := constraintIndexSetOf(t, false)
+	if set == nil {
+		return
+	}
+	for colIdx, e := range set.cols {
+		if colIdx >= len(oldRow) || colIdx >= len(newRow) {
 			continue
 		}
-		oldVal, newVal := oldRow[k.colIdx], newRow[k.colIdx]
+		oldVal, newVal := oldRow[colIdx], newRow[colIdx]
 		if rawEqual(oldVal, newVal) {
 			continue
 		}
@@ -480,17 +501,17 @@ func patchConstraintIndexRow(t *storage.Table, rowIdx int, oldRow, newRow []any)
 // invalidateConstraintIndexes but scoped to the one lagging column rather
 // than every column on the table.
 func patchConstraintIndexSwapRemove(t *storage.Table, deleteRowID int, deletedRow []any, lastRowID int, lastRow []any, oldLen int) {
-	constraintIndexMu.Lock()
-	defer constraintIndexMu.Unlock()
-	for k, e := range constraintIndexes {
-		if k.table != t {
-			continue
-		}
+	t.DerivedLock()
+	defer t.DerivedUnlock()
+	set := constraintIndexSetOf(t, false)
+	if set == nil {
+		return
+	}
+	for colIdx, e := range set.cols {
 		if e.rowCount != oldLen {
-			delete(constraintIndexes, k)
+			delete(set.cols, colIdx)
 			continue
 		}
-		colIdx := k.colIdx
 		if colIdx < len(deletedRow) {
 			if oldVal := deletedRow[colIdx]; oldVal != nil {
 				removeConstraintIndexBucketEntry(e, oldVal, deleteRowID)

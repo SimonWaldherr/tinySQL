@@ -143,6 +143,23 @@ func simpleColumnIndex(t *storage.Table, alias string) map[string]int {
 // to physical raw-row indexes. simpleColumnIndex already gives the same
 // resolution used by the raw fast path; sorting names here matches
 // evalRowToTextFunc's observable output order.
+// rowTextColumns returns the plan's ROW_TO_TEXT column order, building it on
+// first use. See simpleSelectPlan.rowTextCols for why it is not eager.
+//
+// Building it here needs no lock because every plan this method can be reached
+// through is private to one executing statement: the DML fast paths construct
+// theirs per statement, and loadSimpleSelectPlanTemplate's cached template is
+// only ever used through a `plan := *template` value copy. Plans that are
+// genuinely shared — the ones captured by the filter closures in
+// exec_raw_filter.go, which travel inside those cached templates — fill this
+// field in eagerly at construction instead, and so never reach this code.
+func (plan *simpleSelectPlan) rowTextColumns() []int {
+	if plan.rowTextCols == nil {
+		plan.rowTextCols = rawRowTextColumns(plan.colIndex)
+	}
+	return plan.rowTextCols
+}
+
 func rawRowTextColumns(colIndex map[string]int) []int {
 	type column struct {
 		name string

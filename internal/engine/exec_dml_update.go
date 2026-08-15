@@ -10,15 +10,18 @@ import (
 )
 
 func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
-	if !tenantHasAnyForeignKeys(env) {
+	if !planTenantHasForeignKeys(env, s) {
 		if rs, ok, err := executeSimpleUpdateFastPath(env, s); ok || err != nil {
 			return rs, err
 		}
 	}
 
-	t, err := env.db.Get(env.tenant, s.Table)
-	if err != nil {
-		return nil, err
+	t := planTable(env.planFor(s))
+	if t == nil {
+		var err error
+		if t, err = env.db.Get(env.tenant, s.Table); err != nil {
+			return nil, err
+		}
 	}
 	if err := checkForeignKeysBeforeUpdate(env, t, s); err != nil {
 		return nil, err
@@ -35,7 +38,7 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 	returningRows := make([]Row, 0)
 	tablePrefix := strings.ToLower(s.Table) + "."
 	keys := newTableRowKeys(t.Cols, tablePrefix)
-	beforeTriggers, afterTriggers := env.db.Catalog().GetTriggersForEvent(s.Table, storage.TriggerUpdate)
+	beforeTriggers, afterTriggers := planTriggers(env.planFor(s), env, s.Table, storage.TriggerUpdate)
 	hasBefore := len(beforeTriggers) > 0
 	hasAfter := len(afterTriggers) > 0
 	needsNewRow := hasAfter || len(s.Returning) > 0
@@ -188,7 +191,7 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 		return nil, ok, err
 	}
 
-	rawPlan := &simpleSelectPlan{table: plan.table, colIndex: plan.colIndex, where: plan.where, filter: buildRawFilter(plan.colIndex, plan.where), rowTextCols: rawRowTextColumns(plan.colIndex)}
+	rawPlan := &simpleSelectPlan{table: plan.table, colIndex: plan.colIndex, where: plan.where, filter: buildRawFilter(plan.colIndex, plan.where)}
 	updated := 0
 	values := make([]any, len(plan.sets))
 	// The index set cannot change mid-statement, so its sorted name list is
@@ -281,7 +284,8 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 }
 
 func buildSimpleUpdatePlan(env ExecEnv, s *Update) (*simpleUpdatePlan, bool, error) {
-	before, after := env.db.Catalog().GetTriggersForEvent(s.Table, storage.TriggerUpdate)
+	stmtPlan := env.planFor(s)
+	before, after := planTriggers(stmtPlan, env, s.Table, storage.TriggerUpdate)
 	if len(before) > 0 || len(after) > 0 {
 		return nil, false, nil
 	}
@@ -289,11 +293,20 @@ func buildSimpleUpdatePlan(env ExecEnv, s *Update) (*simpleUpdatePlan, bool, err
 		return nil, false, nil
 	}
 
-	table, err := env.db.Get(env.tenant, s.Table)
-	if err != nil {
-		return nil, true, err
+	table := planTable(stmtPlan)
+	if table == nil {
+		var err error
+		if table, err = env.db.Get(env.tenant, s.Table); err != nil {
+			return nil, true, err
+		}
 	}
-	colIndex := simpleColumnIndex(table, s.Table)
+	// newDMLPlan resolved the column index and the constraint seek already, to
+	// decide this statement's rollback snapshot shape; both are pure functions
+	// of state that cannot have changed since.
+	colIndex := planColumnIndex(stmtPlan)
+	if colIndex == nil {
+		colIndex = simpleColumnIndex(table, s.Table)
+	}
 	sets := make([]simpleUpdateSet, 0, len(s.Sets))
 	for name, expr := range s.Sets {
 		if !isSimpleRawExpr(expr) {
@@ -306,7 +319,10 @@ func buildSimpleUpdatePlan(env ExecEnv, s *Update) (*simpleUpdatePlan, bool, err
 		sets = append(sets, simpleUpdateSet{col: col, expr: expr})
 	}
 	var rowIDs []int
-	if candidates, _, _, found := selectConstraintIndex(table, colIndex, s.Where); found {
+	if candidates, found := planConstraintRows(stmtPlan, func() ([]int, bool) {
+		rows, _, _, ok := selectConstraintIndex(table, colIndex, s.Where)
+		return rows, ok
+	}); found {
 		rowIDs = candidates
 	}
 	return &simpleUpdatePlan{

@@ -443,6 +443,10 @@ func handleWalRecord(db *DB, rec walRecord, pending map[uint64][]walOperation, c
 				existing, _ := db.Get(op.tenant, op.name)
 				if existing != nil && rowIndexesFit(op.rowIndexes, len(existing.Rows)) {
 					delta := diskToTable(*op.table)
+					// Replaces rows without changing the row count, so
+					// executor state derived from them cannot detect the
+					// change by itself and has to be dropped here.
+					existing.dropDerived()
 					for i, idx := range op.rowIndexes {
 						existing.Rows[idx] = delta.Rows[i]
 					}

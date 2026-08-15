@@ -3,6 +3,7 @@ package storage
 import (
 	"fmt"
 	"strings"
+	"sync"
 )
 
 // StatementSnapshot is an in-memory rollback point for one SQL statement.
@@ -14,8 +15,11 @@ import (
 // restored in place. This keeps a caller holding a *Table obtained through
 // DB.Get from observing a failed statement's half-applied row changes.
 type StatementSnapshot struct {
-	tables  map[string]map[string]tableState
-	catalog diskCatalog
+	tables map[string]map[string]tableState
+	// tenant is the tenant a compact (single-table) snapshot belongs to; the
+	// map-shaped forms carry it as their key instead. See RestoredTables.
+	tenant  string
+	catalog *catalogRollback
 	// appendOnly is the compact rollback state for a triggerless, index-free
 	// INSERT. Keeping it outside tables avoids allocating two small maps for
 	// every ordinary INSERT while preserving the same in-place restore path.
@@ -36,6 +40,146 @@ type tableState struct {
 	table *Table
 	state *Table
 }
+
+// TableRef names one table for a caller that has to act on it by name, such as
+// the executor purging its name-keyed caches after a rollback.
+type TableRef struct {
+	Tenant string
+	Table  string
+}
+
+// RestoredTables reports the tables RestoreStatementSnapshot can put back.
+// ok is false for a whole-database snapshot, where the caller must assume any
+// table may have changed.
+//
+// It exists so a failed statement's cache cleanup is scoped to what that
+// statement could actually have touched. The executor used to walk every
+// tenant and every table on any failure and drop each one's constraint,
+// vector and geo caches — so one rejected INSERT threw away warm caches
+// belonging to tables it never looked at, in the process, for every other
+// caller. A snapshot narrow enough to restore one table is by construction
+// narrow enough to have changed only that one: the compact and table-scoped
+// shapes are only chosen when no trigger and no foreign-key action can write
+// elsewhere.
+func (s *StatementSnapshot) RestoredTables() ([]TableRef, bool) {
+	if s == nil {
+		return nil, true
+	}
+	switch {
+	case s.appendOnly != nil:
+		return []TableRef{{Tenant: s.tenant, Table: s.appendOnly.table.Name}}, true
+	case s.rowUpdate != nil:
+		return []TableRef{{Tenant: s.tenant, Table: s.rowUpdate.table.Name}}, true
+	case s.rowDelete != nil:
+		return []TableRef{{Tenant: s.tenant, Table: s.rowDelete.table.Name}}, true
+	case s.full:
+		return nil, false
+	}
+	refs := make([]TableRef, 0, len(s.tables))
+	for tenant, tables := range s.tables {
+		for _, saved := range tables {
+			refs = append(refs, TableRef{Tenant: tenant, Table: saved.table.Name})
+		}
+	}
+	return refs, true
+}
+
+// catalogRollback is the catalog half of a StatementSnapshot, captured lazily.
+//
+// The catalog copy it holds is expensive out of proportion to how often it is
+// needed: catalogToDisk deep-copies every table, column, view, index,
+// function, job, trigger and RBAC record, then sorts ten slices — work
+// proportional to the size of the whole database, paid by every mutating
+// statement, to undo a change that the overwhelming majority of statements
+// never make. An ordinary INSERT/UPDATE/DELETE touches the catalog only
+// through MarkMaterializedViewsStaleByDependency, which now returns without
+// taking the write lock unless a materialized view actually depends on the
+// table.
+//
+// So the copy is deferred to the first catalog mutation instead. Arming
+// installs this on the CatalogManager; CatalogManager.lockWrite and
+// lockRBACWrite — the pair every single mutator funnels through — call
+// capture() before applying their change. What capture() then reads is by
+// construction the pre-statement catalog: it runs before the first mutation.
+type catalogRollback struct {
+	catalog *CatalogManager
+	mu      sync.Mutex
+	taken   bool
+	state   diskCatalog
+}
+
+// armCatalogRollback installs a fresh, uncaptured rollback point on c.
+//
+// Only one can be armed at a time, which is all a statement needs:
+// executeStatement takes at most one snapshot per statement and holds the
+// database's content write lock for the statement's whole duration. Arming
+// overwrites rather than stacking, so a snapshot that was somehow never
+// released cannot pin the catalog into copying forever.
+func armCatalogRollback(c *CatalogManager) *catalogRollback {
+	if c == nil {
+		return nil
+	}
+	cr := &catalogRollback{catalog: c}
+	c.pending.Store(cr)
+	return cr
+}
+
+// capture takes the catalog copy, once. Callers reach it from lockWrite
+// before c.mu is held, which is required: catalogToDisk read-locks c.mu.
+func (cr *catalogRollback) capture() {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	if cr.taken {
+		return
+	}
+	cr.state = catalogToDisk(cr.catalog)
+	cr.taken = true
+}
+
+// release disarms this rollback point so later statements' catalog writes are
+// not captured into it. It is idempotent, and deliberately only clears the
+// slot when it still holds cr.
+func (cr *catalogRollback) release() {
+	if cr == nil || cr.catalog == nil {
+		return
+	}
+	cr.catalog.pending.CompareAndSwap(cr, nil)
+}
+
+// captured reports whether the statement mutated the catalog at all, i.e.
+// whether there is anything to roll back.
+func (cr *catalogRollback) captured() bool {
+	if cr == nil {
+		return false
+	}
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	return cr.taken
+}
+
+// ReleaseStatementSnapshot discards a snapshot that will not be used, because
+// its statement succeeded. Callers must invoke it exactly once per snapshot
+// they take, whether or not they also called RestoreStatementSnapshot: it is
+// what stops the next statement's catalog writes from being captured into
+// this statement's rollback point.
+func (db *DB) ReleaseStatementSnapshot(snapshot *StatementSnapshot) {
+	if snapshot == nil {
+		return
+	}
+	snapshot.catalog.release()
+}
+
+// captureDirtyRows returns the rollback value for Table.dirtyRows.
+//
+// It deliberately keeps the slice header rather than copying the elements.
+// The list is append-only within one dirty window: MarkRowUpdated only ever
+// appends, and MarkDirtyFrom only ever replaces it with nil. So whatever the
+// statement does, the first len(rows) elements of this backing array still
+// hold the pre-statement contents when the rollback runs — an append either
+// wrote past them or reallocated away from them entirely. Copying them was an
+// O(dirty rows) allocation on every mutating statement, which made a run of
+// UPDATEs against the same table quadratic.
+func captureDirtyRows(t *Table) []int { return t.dirtyRows }
 
 // appendOnlyTableState is the minimal rollback point for an INSERT that can
 // only append rows. It deliberately avoids copying existing rows; callers
@@ -85,7 +229,7 @@ func (db *DB) SnapshotForStatement() *StatementSnapshot {
 	}
 	snapshot := &StatementSnapshot{
 		tables:  make(map[string]map[string]tableState),
-		catalog: catalogToDisk(db.Catalog()),
+		catalog: armCatalogRollback(db.Catalog()),
 		full:    true,
 	}
 	db.mu.RLock()
@@ -117,7 +261,7 @@ func (db *DB) SnapshotForTableStatement(tenant, name string) (*StatementSnapshot
 		tables: map[string]map[string]tableState{
 			tenant: {key: {table: table, state: cloneTable(table)}},
 		},
-		catalog: catalogToDisk(db.Catalog()),
+		catalog: armCatalogRollback(db.Catalog()),
 	}, nil
 }
 
@@ -134,16 +278,17 @@ func (db *DB) SnapshotForAppendOnlyTableStatement(tenant, name string) (*Stateme
 		return nil, err
 	}
 	return &StatementSnapshot{
+		tenant: tenant,
 		appendOnly: &appendOnlyTableState{
 			table:          table,
 			rowCount:       len(table.Rows),
 			version:        table.Version,
 			stats:          cloneTableStats(table.Stats),
 			dirtyFrom:      table.dirtyFrom,
-			dirtyRows:      append([]int(nil), table.dirtyRows...),
+			dirtyRows:      captureDirtyRows(table),
 			dirtyRowsState: table.dirtyRowsState,
 		},
-		catalog: catalogToDisk(db.Catalog()),
+		catalog: armCatalogRollback(db.Catalog()),
 	}, nil
 }
 
@@ -168,6 +313,7 @@ func (db *DB) SnapshotForRowUpdateStatement(tenant, name string, rowIDs []int) (
 		rows[i] = table.Rows[rowID]
 	}
 	return &StatementSnapshot{
+		tenant: tenant,
 		rowUpdate: &rowUpdateTableState{
 			table:          table,
 			rowIDs:         append([]int(nil), rowIDs...),
@@ -175,10 +321,10 @@ func (db *DB) SnapshotForRowUpdateStatement(tenant, name string, rowIDs []int) (
 			version:        table.Version,
 			stats:          cloneTableStats(table.Stats),
 			dirtyFrom:      table.dirtyFrom,
-			dirtyRows:      append([]int(nil), table.dirtyRows...),
+			dirtyRows:      captureDirtyRows(table),
 			dirtyRowsState: table.dirtyRowsState,
 		},
-		catalog: catalogToDisk(db.Catalog()),
+		catalog: armCatalogRollback(db.Catalog()),
 	}, nil
 }
 
@@ -207,6 +353,7 @@ func (db *DB) SnapshotForRowDeleteStatement(tenant, name string, rowIDs []int) (
 		row = cloneRows([][]any{table.Rows[rowID]})[0]
 	}
 	return &StatementSnapshot{
+		tenant: tenant,
 		rowDelete: &rowDeleteTableState{
 			table:          table,
 			rowID:          rowID,
@@ -215,10 +362,10 @@ func (db *DB) SnapshotForRowDeleteStatement(tenant, name string, rowIDs []int) (
 			version:        table.Version,
 			stats:          cloneTableStats(table.Stats),
 			dirtyFrom:      table.dirtyFrom,
-			dirtyRows:      append([]int(nil), table.dirtyRows...),
+			dirtyRows:      captureDirtyRows(table),
 			dirtyRowsState: table.dirtyRowsState,
 		},
-		catalog: catalogToDisk(db.Catalog()),
+		catalog: armCatalogRollback(db.Catalog()),
 	}, nil
 }
 
@@ -263,13 +410,23 @@ func (db *DB) RestoreStatementSnapshot(snapshot *StatementSnapshot) {
 	// state changed by DML. Reconstructing it from the deep-copy disk form is
 	// less error-prone than selectively undoing each catalog side effect.
 	//
-	// The revision counter must keep moving forward across the replacement: a
-	// rollback is itself a change, and a caller comparing revisions to decide
-	// whether it has catalog state to commit (see conn.commitTx) would
-	// otherwise see the counter reset to zero and conclude nothing happened.
-	restored := diskToCatalog(snapshot.catalog)
-	restored.setRevision(db.Catalog().Revision() + 1)
-	db.setCatalog(restored)
+	// Nothing to reconstruct unless the statement actually mutated the catalog:
+	// the copy is taken on the first such mutation (see catalogRollback), so
+	// "not captured" means the catalog is still exactly as this statement
+	// found it. Skipping the replacement in that case is not only cheaper, it
+	// also leaves the *CatalogManager pointer intact — which matters to any
+	// long-lived holder of one, such as Scheduler.
+	//
+	// The revision counter must keep moving forward across a replacement that
+	// does happen: a rollback is itself a change, and a caller comparing
+	// revisions to decide whether it has catalog state to commit (see
+	// conn.commitTx) would otherwise see the counter reset to zero and
+	// conclude nothing happened.
+	if snapshot.catalog.captured() {
+		restored := diskToCatalog(snapshot.catalog.state)
+		restored.setRevision(db.Catalog().Revision() + 1)
+		db.setCatalog(restored)
+	}
 }
 
 func restoreStatementTable(saved tableState) {
@@ -281,11 +438,12 @@ func restoreAppendOnlyTable(state *appendOnlyTableState) {
 		return
 	}
 	table := state.table
+	table.dropDerived()
 	table.Rows = table.Rows[:state.rowCount:state.rowCount]
 	table.Version = state.version
 	table.Stats = cloneTableStats(state.stats)
 	table.dirtyFrom = state.dirtyFrom
-	table.dirtyRows = append([]int(nil), state.dirtyRows...)
+	table.dirtyRows = state.dirtyRows
 	table.dirtyRowsState = state.dirtyRowsState
 }
 
@@ -294,13 +452,14 @@ func restoreRowUpdateTable(state *rowUpdateTableState) {
 		return
 	}
 	table := state.table
+	table.dropDerived()
 	for i, rowID := range state.rowIDs {
 		table.Rows[rowID] = state.rows[i]
 	}
 	table.Version = state.version
 	table.Stats = cloneTableStats(state.stats)
 	table.dirtyFrom = state.dirtyFrom
-	table.dirtyRows = append([]int(nil), state.dirtyRows...)
+	table.dirtyRows = state.dirtyRows
 	table.dirtyRowsState = state.dirtyRowsState
 }
 
@@ -309,6 +468,7 @@ func restoreRowDeleteTable(state *rowDeleteTableState) {
 		return
 	}
 	table := state.table
+	table.dropDerived()
 	if state.rowID >= 0 {
 		switch len(table.Rows) {
 		case state.rowCount - 1:
@@ -331,7 +491,7 @@ func restoreRowDeleteTable(state *rowDeleteTableState) {
 	table.Version = state.version
 	table.Stats = cloneTableStats(state.stats)
 	table.dirtyFrom = state.dirtyFrom
-	table.dirtyRows = append([]int(nil), state.dirtyRows...)
+	table.dirtyRows = state.dirtyRows
 	table.dirtyRowsState = state.dirtyRowsState
 }
 
@@ -339,6 +499,9 @@ func restoreTable(dst, saved *Table) {
 	if dst == nil || saved == nil {
 		return
 	}
+	// Executor state describes the rows being replaced, not the ones coming
+	// back. It rebuilds on next use.
+	dst.dropDerived()
 	copy := cloneTable(saved)
 	dst.Name = copy.Name
 	dst.Cols = copy.Cols

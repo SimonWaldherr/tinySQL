@@ -95,7 +95,7 @@ func TestPrimaryKeyUpdateUsesBoundedRowsWhenSecondaryIndexIsUntouched(t *testing
 	}
 
 	update := mustParse(`UPDATE users SET score = 42 WHERE id = 2`).(*Update)
-	tableName, rowIDs, ok := rowUpdateSnapshotTarget(db, "default", update)
+	tableName, rowIDs, ok := rowUpdateSnapshotTarget(newDMLPlan(&dmlPlan{}, db, "default", update))
 	if !ok || tableName != "users" || len(rowIDs) != 1 || rowIDs[0] != 1 {
 		t.Fatalf("bounded update target = %q, %#v, %v; want users, [1], true", tableName, rowIDs, ok)
 	}
@@ -128,7 +128,7 @@ func TestPrimaryKeyUpdateUsesBoundedRowsWhenSecondaryIndexIsUntouched(t *testing
 	}
 
 	indexedUpdate := mustParse(`UPDATE users SET bucket = 99 WHERE id = 2`).(*Update)
-	if _, _, ok := rowUpdateSnapshotTarget(db, "default", indexedUpdate); ok {
+	if _, _, ok := rowUpdateSnapshotTarget(newDMLPlan(&dmlPlan{}, db, "default", indexedUpdate)); ok {
 		t.Fatal("update of a secondary-indexed column used the compact rollback snapshot")
 	}
 }
@@ -146,7 +146,7 @@ func TestPrimaryKeyDeleteUsesBoundedRowsAndMaintainsSecondaryIndexes(t *testing.
 	}
 
 	residual := mustParse(`DELETE FROM users WHERE id = 2 AND bucket = 999`).(*Delete)
-	tableName, rowIDs, ok := rowDeleteSnapshotTarget(db, "default", residual)
+	tableName, rowIDs, ok := rowDeleteSnapshotTarget(newDMLPlan(&dmlPlan{}, db, "default", residual))
 	if !ok || tableName != "users" || len(rowIDs) != 1 || rowIDs[0] != 1 {
 		t.Fatalf("bounded delete target = %q, %#v, %v; want users, [1], true", tableName, rowIDs, ok)
 	}
@@ -162,7 +162,7 @@ func TestPrimaryKeyDeleteUsesBoundedRowsAndMaintainsSecondaryIndexes(t *testing.
 		t.Fatal(err)
 	}
 	pointDelete := mustParse(`DELETE FROM users WHERE id = 2`).(*Delete)
-	if _, _, ok := rowDeleteSnapshotTarget(db, "default", pointDelete); ok {
+	if _, _, ok := rowDeleteSnapshotTarget(newDMLPlan(&dmlPlan{}, db, "default", pointDelete)); ok {
 		t.Fatal("secondary-indexed table used the compact delete snapshot")
 	}
 	rs, err = Execute(ctx, db, "default", pointDelete)

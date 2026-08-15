@@ -11,9 +11,13 @@ import (
 )
 
 func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
-	t, err := env.db.Get(env.tenant, s.Table)
-	if err != nil {
-		return nil, err
+	stmtPlan := env.planFor(s)
+	t := planTable(stmtPlan)
+	if t == nil {
+		var err error
+		if t, err = env.db.Get(env.tenant, s.Table); err != nil {
+			return nil, err
+		}
 	}
 	if err := checkForeignKeysBeforeDelete(env, t, s.Where); err != nil {
 		return nil, err
@@ -22,11 +26,19 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	if err != nil {
 		return nil, err
 	}
-	beforeDelTriggers, afterDelTriggers := env.db.Catalog().GetTriggersForEvent(s.Table, storage.TriggerDelete)
+	beforeDelTriggers, afterDelTriggers := planTriggers(stmtPlan, env, s.Table, storage.TriggerDelete)
 	hasTriggers := len(beforeDelTriggers) > 0 || len(afterDelTriggers) > 0
 	if !hasTriggers && len(s.Returning) == 0 && isSimpleRawPredicate(s.Where) {
-		colIndex := simpleColumnIndex(t, s.Table)
-		if rowIDs, _, _, found := selectDeleteConstraintRows(t, colIndex, s.Where); found {
+		// newDMLPlan already resolved both of these while choosing this
+		// statement's rollback snapshot shape; see planConstraintRows.
+		colIndex := planColumnIndex(stmtPlan)
+		if colIndex == nil {
+			colIndex = simpleColumnIndex(t, s.Table)
+		}
+		if rowIDs, found := planConstraintRows(stmtPlan, func() ([]int, bool) {
+			rows, _, _, ok := selectDeleteConstraintRows(t, colIndex, s.Where)
+			return rows, ok
+		}); found {
 			return executeConstraintPointDelete(env, s, t, wal, colIndex, rowIDs)
 		}
 	}
@@ -87,7 +99,7 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	// Fast path: no triggers and a simple predicate – skip the full Row map allocation.
 	if !hasTriggers && len(s.Returning) == 0 && isSimpleRawPredicate(s.Where) {
 		colIndex := simpleColumnIndex(t, s.Table)
-		rawPlan := &simpleSelectPlan{table: t, colIndex: colIndex, where: s.Where, filter: buildRawFilter(colIndex, s.Where), rowTextCols: rawRowTextColumns(colIndex)}
+		rawPlan := &simpleSelectPlan{table: t, colIndex: colIndex, where: s.Where, filter: buildRawFilter(colIndex, s.Where)}
 		kept := make([][]any, 0, len(t.Rows))
 		oldToNew := make(map[int]int, len(t.Rows))
 		del := 0
@@ -189,11 +201,10 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 
 func executeConstraintPointDelete(env ExecEnv, s *Delete, table *storage.Table, wal *walAuto, colIndex map[string]int, rowIDs []int) (*ResultSet, error) {
 	rawPlan := &simpleSelectPlan{
-		table:       table,
-		colIndex:    colIndex,
-		where:       s.Where,
-		filter:      buildRawFilter(colIndex, s.Where),
-		rowTextCols: rawRowTextColumns(colIndex),
+		table:    table,
+		colIndex: colIndex,
+		where:    s.Where,
+		filter:   buildRawFilter(colIndex, s.Where),
 	}
 	deleteRowID := -1
 	for _, rowID := range rowIDs {

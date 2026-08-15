@@ -211,7 +211,7 @@ func evalRawRowToText(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, err
 	if len(ex.Args) > 0 {
 		return nil, fmt.Errorf("ROW_TO_TEXT expects no arguments")
 	}
-	return rawRowToText(plan.rowTextCols, raw), nil
+	return rawRowToText(plan.rowTextColumns(), raw), nil
 }
 
 // rawRowToText concatenates the given raw column positions (already in

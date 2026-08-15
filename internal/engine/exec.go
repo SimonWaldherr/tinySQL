@@ -138,6 +138,23 @@ type ExecEnv struct {
 	// same "now" and ranks consistently. The zero value falls back to
 	// time.Now() (see envNow), which is what ExecEnv{} in tests gets.
 	now time.Time
+	// dml carries the planning work executeStatement already performed to pick
+	// this statement's rollback snapshot, so the DML handler that runs
+	// immediately afterwards does not repeat it. See dmlPlan; nil means
+	// "nothing precomputed", which every consumer handles.
+	dml *dmlPlan
+}
+
+// planFor returns the precomputed plan for stmt, or nil when this environment
+// has none. The identity check is the safety mechanism: nested DML (a trigger
+// body, a foreign-key cascade) is dispatched through execStmt carrying the
+// *outer* statement's environment, so a plan is only usable by the exact
+// statement it was built for.
+func (env ExecEnv) planFor(stmt Statement) *dmlPlan {
+	if env.dml == nil || env.dml.stmt != stmt {
+		return nil
+	}
+	return env.dml
 }
 
 // envNow returns the statement's evaluation timestamp, falling back to

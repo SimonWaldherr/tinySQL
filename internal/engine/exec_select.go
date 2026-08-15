@@ -149,6 +149,11 @@ type simpleSelectPlan struct {
 	// rowTextCols contains raw column positions in the same sorted-name order
 	// as ROW_TO_TEXT's Row-map implementation. It is prepared once per plan so
 	// ROW_TO_TEXT predicates do not need to materialize a Row map per input.
+	// Read it through rowTextColumns, never directly: it is built on first
+	// use, because only ROW_TO_TEXT reads it and almost no statement calls
+	// ROW_TO_TEXT — building it up front charged every raw-path INSERT,
+	// UPDATE, DELETE and SELECT a map walk, an allocation and a sort for a
+	// value nothing then looked at.
 	rowTextCols []int
 	// rowIDs is nil for a table scan. A non-nil slice is a materialized
 	// secondary-index point/prefix seek and contains table row positions.
