@@ -485,6 +485,21 @@ func (c *CatalogManager) GetMaterializedViews() []*CatalogMaterializedView {
 	return out
 }
 
+// HasMaterializedViews reports whether any materialized view is registered.
+//
+// It exists for the DML path, which asks after every successful mutating
+// statement whether that statement invalidated a materialized view. Databases
+// with none — the overwhelming majority — should not pay for splitting the
+// table name and building a dependency key to find that out.
+func (c *CatalogManager) HasMaterializedViews() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.mviews) > 0
+}
+
 // TryBeginMaterializedViewRefresh marks a materialized view as refreshing.
 func (c *CatalogManager) TryBeginMaterializedViewRefresh(schema, name string) bool {
 	c.lockWrite()
@@ -755,10 +770,16 @@ func (c *CatalogManager) MarkMaterializedViewsStaleByDependency(schema, changedN
 }
 
 // anyMaterializedViewDependsOn reports whether any opt-in materialized view
-// declares a dependency on changedKey, i.e. whether
+// declares a dependency on changedKey *and is not already stale*, i.e. whether
 // MarkMaterializedViewsStaleByDependency would actually change anything. It
 // visits exactly the entries that function's loop does, under the read lock
 // and without allocating.
+//
+// Skipping views that are already stale matters as much as skipping databases
+// with none: mv.IsStale is set unconditionally, so without this check a
+// database whose view went stale on its first write would take the catalog's
+// write lock — and, through it, the copy-on-write catalog snapshot — on every
+// single mutating statement from then on, forever.
 func (c *CatalogManager) anyMaterializedViewDependsOn(changedKey string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -767,7 +788,7 @@ func (c *CatalogManager) anyMaterializedViewDependsOn(changedKey string) bool {
 	}
 	for key, deps := range c.dependencies {
 		mv := c.mviews[key]
-		if mv == nil || !mv.InvalidateOnChange {
+		if mv == nil || !mv.InvalidateOnChange || mv.IsStale {
 			continue
 		}
 		for _, dep := range deps {

@@ -403,10 +403,14 @@ func cascadeForeignKeyReference(env ExecEnv, ref fkReference, changes map[any]fk
 // evaluating WHERE twice when (and only when) the tenant has any foreign
 // keys defined at all (tenantHasAnyForeignKeys short-circuits the common
 // case where none exist).
-func checkForeignKeysBeforeDelete(env ExecEnv, t *storage.Table, where Expr) error {
-	if !tenantHasAnyForeignKeys(env) {
+func checkForeignKeysBeforeDelete(env ExecEnv, t *storage.Table, s *Delete) error {
+	// The statement plan already answered this while choosing a rollback
+	// snapshot shape. Recomputing it costs a full sorted ListTables, and a
+	// backend directory listing in the disk-backed storage modes.
+	if !planTenantHasForeignKeys(env, s) {
 		return nil
 	}
+	where := s.Where
 	var matched [][]any
 	if where == nil {
 		matched = t.Rows
@@ -434,7 +438,9 @@ func checkForeignKeysBeforeDelete(env ExecEnv, t *storage.Table, where Expr) err
 // references, and enforces RESTRICT/CASCADE/SET NULL for those specific
 // value changes before the real update runs.
 func checkForeignKeysBeforeUpdate(env ExecEnv, t *storage.Table, s *Update) error {
-	if !tenantHasAnyForeignKeys(env) {
+	// See checkForeignKeysBeforeDelete: reuse the statement plan's answer
+	// rather than listing the tenant's tables again.
+	if !planTenantHasForeignKeys(env, s) {
 		return nil
 	}
 

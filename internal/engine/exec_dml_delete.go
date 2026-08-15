@@ -19,7 +19,7 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 			return nil, err
 		}
 	}
-	if err := checkForeignKeysBeforeDelete(env, t, s.Where); err != nil {
+	if err := checkForeignKeysBeforeDelete(env, t, s); err != nil {
 		return nil, err
 	}
 	wal, err := beginWALAuto(env, s.Table)
@@ -335,6 +335,14 @@ func buildTableRow(keys tableRowKeys, values []any) Row {
 }
 
 func markDependentMaterializedViewsStale(env ExecEnv, tableName string) {
+	catalog := env.db.Catalog()
+	// Asked after every successful mutating statement, so the answer for a
+	// database with no materialized views has to be free. Everything below —
+	// lower-casing the name, splitting it, building the dependency key — is
+	// allocation the common case should not do.
+	if !catalog.HasMaterializedViews() {
+		return
+	}
 	if strings.HasPrefix(strings.ToLower(tableName), "__mv_") {
 		return
 	}
@@ -342,25 +350,39 @@ func markDependentMaterializedViewsStale(env ExecEnv, tableName string) {
 	if schema == "" {
 		schema = "main"
 	}
-	_ = env.db.Catalog().MarkMaterializedViewsStaleByDependency(schema, name)
+	_ = catalog.MarkMaterializedViewsStaleByDependency(schema, name)
 }
 
 func projectReturningRows(env ExecEnv, cols []storage.Column, projs []SelectItem, rows []Row) (*ResultSet, error) {
 	outRows := make([]Row, 0, len(rows))
 	outCols := returningOutputCols(cols, projs)
 
+	// Every output key is a pure function of the projection list and the
+	// schema, neither of which changes from row to row. Deriving them inside
+	// the loop meant two strings.ToLower per column per row for RETURNING *,
+	// and an fmt.Sprintf plus a ToLower per row for any unaliased expression
+	// (RETURNING id*2), all of it recomputing the same strings.
+	lowerCols := make([]string, len(cols))
+	for i, c := range cols {
+		lowerCols[i] = strings.ToLower(c.Name)
+	}
+	projKeys := make([]string, len(projs))
+	for i, it := range projs {
+		if !it.Star {
+			projKeys[i] = strings.ToLower(projName(it, i))
+		}
+	}
+
 	for _, r := range rows {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
 		}
-		out := Row{}
+		out := make(Row, len(outCols))
 		for i, it := range projs {
 			if it.Star {
-				for _, c := range cols {
-					name := c.Name
-					lowerName := strings.ToLower(name)
-					val, _ := getValLower(r, lowerName)
-					putVal(out, name, val)
+				for ci := range cols {
+					val, _ := getValLower(r, lowerCols[ci])
+					out[lowerCols[ci]] = val
 				}
 				continue
 			}
@@ -368,7 +390,7 @@ func projectReturningRows(env ExecEnv, cols []storage.Column, projs []SelectItem
 			if err != nil {
 				return nil, err
 			}
-			putVal(out, projName(it, i), val)
+			out[projKeys[i]] = val
 		}
 		outRows = append(outRows, out)
 	}

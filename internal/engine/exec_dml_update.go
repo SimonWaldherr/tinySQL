@@ -136,8 +136,13 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 	if err := wal.commit(); err != nil {
 		return nil, err
 	}
-	t.Version++
+	// Only a statement that actually replaced a row has changed this table.
+	// Bumping the version unconditionally told CollectWALChanges that the
+	// table had changed, so an UPDATE whose WHERE matched nothing wrote a
+	// full-table WAL record and fsynced it — and invalidated every cache that
+	// keys on Version — for a statement that did nothing.
 	if n > 0 {
+		t.Version++
 		t.InvalidateStats()
 		// The per-row MarkRowUpdated calls above already marked the table
 		// non-append. Forcing MarkDirtyFrom(-1) here as well would discard the
@@ -275,8 +280,10 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 		return nil, true, err
 	}
 
-	plan.table.Version++
+	// See executeUpdate: a statement that matched no row has not changed the
+	// table, and saying otherwise costs a full-table WAL record.
 	if updated > 0 {
+		plan.table.Version++
 		plan.table.InvalidateStats()
 		markDependentMaterializedViewsStale(env, s.Table)
 	}

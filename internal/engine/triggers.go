@@ -118,8 +118,11 @@ func fireTriggerList(env ExecEnv, triggers []*storage.CatalogTrigger, newRow Row
 		return nil
 	}
 
+	// One binding for the whole list: every trigger fired for this row sees
+	// the same NEW/OLD rows, and executeTrigger only ever reads through it.
+	binding := &triggerRowBinding{newRow: newRow, oldRow: oldRow}
 	for _, trig := range triggers {
-		if err := executeTrigger(env, trig, newRow, oldRow); err != nil {
+		if err := executeTrigger(env, trig, binding); err != nil {
 			return fmt.Errorf("trigger %q: %w", trig.Name, err)
 		}
 	}
@@ -179,7 +182,7 @@ func triggerRowSuggestionRow(tb *triggerRowBinding) Row {
 
 // executeTrigger runs a single trigger's body in an enriched environment that
 // exposes NEW.<col> and OLD.<col> pseudo-columns.
-func executeTrigger(env ExecEnv, trig *storage.CatalogTrigger, newRow Row, oldRow Row) error {
+func executeTrigger(env ExecEnv, trig *storage.CatalogTrigger, binding *triggerRowBinding) error {
 	if env.triggerDepth >= maxTriggerDepth {
 		return fmt.Errorf("maximum trigger nesting depth (%d) exceeded", maxTriggerDepth)
 	}
@@ -191,9 +194,9 @@ func executeTrigger(env ExecEnv, trig *storage.CatalogTrigger, newRow Row, oldRo
 	// columns the same way (evalVarRef falls back to env.triggerRow whenever
 	// its row argument doesn't have the reference — passing nil below for
 	// WHEN's row argument routes it through that same fallback).
-	env.triggerRow = &triggerRowBinding{newRow: newRow, oldRow: oldRow}
+	env.triggerRow = binding
 
-	if strings.TrimSpace(trig.WhenExpr) != "" {
+	if trig.WhenExpr != "" && strings.TrimSpace(trig.WhenExpr) != "" {
 		whenExpr, err := triggerWhenExpr(trig.Name, trig.WhenExpr)
 		if err != nil {
 			return err
