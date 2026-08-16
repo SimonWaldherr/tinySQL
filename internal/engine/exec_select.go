@@ -216,6 +216,11 @@ type simpleJoinPlan struct {
 	rightFilter func([]any) (bool, error)
 	projs       []simpleProjection
 	outputCols  []string
+	// rightLookup is an immutable hash index of the right input for the most
+	// recently observed table version. It avoids rebuilding the same index for
+	// every execution of a prepared read query; a write to the right table
+	// changes Version and forces a rebuild before its next use.
+	rightLookup simpleJoinRightLookupCache
 }
 
 // simpleJoinPlanCache holds only the compiled, parameter-independent join
@@ -227,4 +232,22 @@ type simpleJoinPlanCache struct {
 	left  *storage.Table
 	right *storage.Table
 	plan  *simpleJoinPlan
+}
+
+// simpleJoinAggregatePlanCache holds a compiled join-and-aggregate shape for
+// repeated executions of the same parsed SELECT. Table identities are kept in
+// the key for the same reason as simpleJoinPlanCache: DDL may replace either
+// table object, whereas row changes do not invalidate column resolution.
+type simpleJoinAggregatePlanCache struct {
+	mu    sync.Mutex
+	left  *storage.Table
+	right *storage.Table
+	plan  *simpleJoinAggregatePlan
+}
+
+type simpleJoinRightLookupCache struct {
+	mu      sync.RWMutex
+	table   *storage.Table
+	version int
+	byKey   map[any][][]any
 }

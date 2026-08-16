@@ -44,29 +44,9 @@ func executeSimpleJoinAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, boo
 		return nil, ok, err
 	}
 
-	rightByKey := make(map[any][][]any, len(plan.join.right.Rows))
-	for _, right := range plan.join.right.Rows {
-		if plan.join.rightFilter != nil {
-			match, err := plan.join.rightFilter(right)
-			if err != nil {
-				return nil, true, err
-			}
-			if !match {
-				continue
-			}
-		}
-		keyVal := right[plan.join.rightKey]
-		if keyVal == nil {
-			// SQL equality never matches NULL, so a NULL join key can never
-			// participate in an equi-join match (mirrors the generic
-			// HashJoinOptimizer's getJoinKey/"if key != nil" skip in
-			// optimizations.go) -- unlike comparableKeyPart's plain map
-			// lookup, which would otherwise let two NULL keys collide on the
-			// same map bucket and incorrectly "match" each other.
-			continue
-		}
-		key := comparableKeyPart(keyVal)
-		rightByKey[key] = append(rightByKey[key], right)
+	rightByKey, err := plan.join.rightRowsByKey()
+	if err != nil {
+		return nil, true, err
 	}
 
 	groups := make(map[string]*simpleAggregateState)
@@ -224,6 +204,18 @@ func buildSimpleJoinAggregatePlan(env ExecEnv, s *Select) (*simpleJoinAggregateP
 	if err != nil {
 		return nil, true, err
 	}
+	cache := s.simpleJoinAggregatePlanCache
+	// A bound parameter can be stored in an expression node while the parsed
+	// statement is reused. Cache only parameter-independent plans, exactly as
+	// the plain join fast path does.
+	cacheable := cache != nil && !exprContainsBoundParameter(s.Where)
+	if cacheable {
+		cache.mu.Lock()
+		defer cache.mu.Unlock()
+		if cache.plan != nil && cache.left == left && cache.right == right {
+			return cache.plan, true, nil
+		}
+	}
 
 	leftIndex := simpleColumnIndex(left, aliasOr(s.From))
 	rightIndex := simpleColumnIndex(right, aliasOr(s.Joins[0].Right))
@@ -256,13 +248,19 @@ func buildSimpleJoinAggregatePlan(env ExecEnv, s *Select) (*simpleJoinAggregateP
 	}
 	joinPlan.leftFilter, joinPlan.rightFilter, joinPlan.where = buildSimpleJoinFilters(s.Where, leftIndex, rightIndex)
 
-	return &simpleJoinAggregatePlan{
+	plan := &simpleJoinAggregatePlan{
 		join:       joinPlan,
 		groupSide:  groupSide,
 		groupCol:   groupCol,
 		projs:      projs,
 		outputCols: outputCols,
-	}, true, nil
+	}
+	if cacheable {
+		cache.left = left
+		cache.right = right
+		cache.plan = plan
+	}
+	return plan, true, nil
 }
 
 // simpleJoinAggregateEligibleSelect mirrors simpleJoinSelectEligible exactly,

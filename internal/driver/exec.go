@@ -256,73 +256,81 @@ func affectedRows(rs *engine.ResultSet, countCell string) int64 {
 	return int64(len(rs.Rows))
 }
 
-func (c *conn) execStatement(ctx context.Context, st engine.Statement) (driver.Result, error) {
-	// Only SELECT/EXPLAIN/PRAGMA are guaranteed read-only. Treat every other
-	// parsed statement as a write for connection scheduling so DDL, indexes,
-	// views, jobs and RBAC cannot bypass the writer gate.
-	isWrite := true
+// isWriteStatement identifies statements that need the writer slot and the
+// durability path. SELECT, EXPLAIN, and PRAGMA are the only guaranteed reads;
+// conservatively scheduling all other statements as writes keeps DDL, catalog
+// actions, jobs, and RBAC from bypassing the writer gate.
+func isWriteStatement(st engine.Statement) bool {
 	switch st.(type) {
 	case *engine.Select, *engine.Explain, *engine.Pragma:
-		isWrite = false
+		return false
+	}
+	return true
+}
+
+// executeWriteStatement executes a write using the one canonical locking,
+// transaction, WAL, and persistence path. QueryContext uses it for DML
+// RETURNING so those rows do not accidentally run under a reader lock or skip
+// the durability acknowledgement that ExecContext provides.
+func (c *conn) executeWriteStatement(ctx context.Context, st engine.Statement) (*engine.ResultSet, error) {
+	// This connection has now attempted a write; Close() must persist,
+	// mirroring the persist() call that follows a successful write below
+	// (directly here for autocommit, via commitTx for a transaction).
+	c.wrote = true
+	if c.srv.db.IsReadOnly() || (c.inTx && c.txReadOnly) {
+		return nil, fmt.Errorf("tinysql: write attempted in read-only transaction")
+	}
+	if c.inTx {
+		// ModeAdvancedWAL logs row operations as they happen. Open one WAL
+		// transaction for the whole block (lazily, on its first write) so
+		// recovery replays it only once this connection commits. Without
+		// that grouping every statement was its own committed WAL transaction,
+		// and a ROLLBACK left it on disk to be replayed.
+		if _, err := c.shadow.BeginAmbientWALTx(); err != nil {
+			return nil, err
+		}
+		rs, err := engine.Execute(ctx, c.currentDB(), c.tenant, st)
+		if err != nil {
+			return nil, err
+		}
+		c.txDirty = true
+		return rs, nil
 	}
 
-	if isWrite {
-		// This connection has now attempted a write; Close() must persist,
-		// mirroring the persist() call that follows a successful write below
-		// (directly here for autocommit, via commitTx for a transaction).
-		c.wrote = true
-		if c.srv.db.IsReadOnly() || (c.inTx && c.txReadOnly) {
-			return nil, fmt.Errorf("tinysql: write attempted in read-only transaction")
-		}
-		var rs *engine.ResultSet
-		if c.inTx {
-			// ModeAdvancedWAL logs row operations as they happen. Open one WAL
-			// transaction for the whole block (lazily, on its first write) so
-			// recovery replays it only once this connection commits. Without
-			// that grouping every statement was its own committed WAL
-			// transaction, and a ROLLBACK left it on disk to be replayed.
-			if _, err := c.shadow.BeginAmbientWALTx(); err != nil {
-				return nil, err
-			}
-			r, err := engine.Execute(ctx, c.currentDB(), c.tenant, st)
-			if err != nil {
-				return nil, err
-			}
-			rs = r
-			c.txDirty = true
-		} else {
-			if err := c.srv.acquireWriter(ctx); err != nil {
-				return nil, err
-			}
-			defer c.srv.releaseWriter()
-			c.srv.mu.Lock()
-			defer c.srv.mu.Unlock()
-			// Run the statement against the live database in every storage
-			// mode, ModeWAL included. The engine appends it to the WAL itself
-			// (internal/engine.maybeLogToWALManager) and rolls the statement
-			// back if that append fails, so the log still leads the change.
-			//
-			// ModeWAL used to be special-cased here: the statement ran against
-			// a clone which then replaced the live database. That swap silently
-			// discarded everything the clone did not copy — on a still-empty
-			// database the WAL itself, so nothing was ever logged again; also
-			// the catalog, the backend and the audit log — left the job
-			// scheduler pointing at the superseded instance, and logged every
-			// write twice, once from the engine and once from here.
-			var err error
-			if rs, err = engine.Execute(ctx, c.srv.db, c.tenant, st); err != nil {
-				return nil, err
-			}
-			// Fail the statement if it could not be made durable, rather than
-			// acknowledging a write that a restart will not find.
-			if err := c.srv.persist(); err != nil {
-				return nil, err
-			}
+	if err := c.srv.acquireWriter(ctx); err != nil {
+		return nil, err
+	}
+	defer c.srv.releaseWriter()
+	c.srv.mu.Lock()
+	defer c.srv.mu.Unlock()
+	// Run the statement against the live database in every storage mode,
+	// ModeWAL included. The engine appends it to the WAL itself and rolls the
+	// statement back if that append fails, so the log still leads the change.
+	rs, err := engine.Execute(ctx, c.srv.db, c.tenant, st)
+	if err != nil {
+		return nil, err
+	}
+	// Fail the statement if it could not be made durable, rather than
+	// acknowledging a write that a restart will not find.
+	if err := c.srv.persist(); err != nil {
+		return nil, err
+	}
+	return rs, nil
+}
+
+func (c *conn) execStatement(ctx context.Context, st engine.Statement) (driver.Result, error) {
+	if isWriteStatement(st) {
+		rs, err := c.executeWriteStatement(ctx, st)
+		if err != nil {
+			return nil, err
 		}
 		// Report affected rows for UPDATE/DELETE. The engine returns a single
 		// {updated|deleted: n} cell for the plain form; a RETURNING clause
-		// projects one row per affected row. INSERT has no engine-side count.
-		switch st.(type) {
+		// projects one row per affected row. INSERT's AST retains its VALUES
+		// rows, which is the database/sql-visible inserted count.
+		switch s := st.(type) {
+		case *engine.Insert:
+			return driver.RowsAffected(int64(len(s.Rows))), nil
 		case *engine.Update:
 			return driver.RowsAffected(affectedRows(rs, "updated")), nil
 		case *engine.Delete:

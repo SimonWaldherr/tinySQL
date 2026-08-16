@@ -16,7 +16,7 @@ new timing-sensitive tests deterministic instead of adding real sleeps.
 
 ```bash
 make deps
-make verify-ci
+make ci
 make build-all
 ```
 
@@ -34,6 +34,9 @@ make build-all
 | `make test-jsonv2` | Storage/engine persistence tests against Go's experimental JSON v2 — a compatibility gate, not a production default. |
 | `make test-query-files` / `make test-fsql` | Standalone query-files and filesystem-query module tests. |
 | `make test-query-files-wasm` | Tests inside `cmd/query_files_wasm`. |
+| `make wasm-check` | Compile the standard-Go browser, Node, and query-files WebAssembly targets without retaining artifacts. |
+| `make tinygo-wasm` | Build and execute the Node WASM smoke test using the pinned TinyGo Docker image. |
+| `make ci` | The complete standard-Go GitHub Actions matrix: formatting, module verification, native/WASM builds, vet, tests, race detection, and coverage. |
 | `cd odbc && make linux` | Build the c-shared ODBC driver from its nested Go module. |
 | `make coverage` | Run tests and open an HTML coverage report. |
 | `make bench` | Benchmarks with allocation output. |
@@ -41,7 +44,7 @@ make build-all
 | `make vet` | `go vet ./...`. |
 | `make lint` | `golangci-lint`; must be installed locally. |
 | `make verify` | Mutating local check: fmt, vet, lint, tests. Runs `make fmt`, so it may rewrite tracked Go files. |
-| `make verify-ci` | Non-mutating CI-style check: fmt-check, vet, build-check, tests. Safest pre-push check. |
+| `make verify-ci` | Quick non-mutating CI-style check: fmt-check, vet, build-check, tests. |
 | `make clean` | Remove binaries, WASM artifacts, coverage files, WAL leftovers. |
 | `make run-repl` / `make run-server` / `make run-demo` | Build and start the corresponding demo. |
 | `make info` | Print build version, Go version, configured paths. |
@@ -62,10 +65,10 @@ go mod tidy -diff                 # from the repository root
 CGO_ENABLED=1 make -C odbc linux
 ```
 
-Running `go mod tidy` in the repository root does not update `odbc/`; a stale
-nested module otherwise fails with `go: updates to go.mod needed` in CI. Use
-`make tidy-all` after changing root dependencies to tidy the root module and
-every nested example, tool, and driver module discovered in the repository.
+Running `go mod tidy` in the repository root does not update nested modules;
+a stale module otherwise fails independently in CI. Use `make tidy-all` after
+changing shared dependencies to tidy every tracked module. `make modules-verify`
+checks checksums across that same tracked set without touching untracked work.
 
 Variables are overridable:
 

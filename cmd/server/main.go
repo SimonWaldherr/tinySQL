@@ -1535,6 +1535,13 @@ func applyStorageOptions(values url.Values, cfg *storage.StorageConfig) error {
 	if err := parseOptionalDuration(values, "checkpoint_interval", &cfg.CheckpointInterval); err != nil {
 		return err
 	}
+	if raw := strings.TrimSpace(values.Get("wal_sync")); raw != "" {
+		mode, err := storage.ParseWALSyncMode(raw)
+		if err != nil {
+			return fmt.Errorf("wal_sync: %w", err)
+		}
+		cfg.WALSync = mode
+	}
 	return nil
 }
 

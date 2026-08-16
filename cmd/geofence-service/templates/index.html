@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Geofence Service</title><link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header><div><strong>Geofence Service</strong><span>lokale Zonen- und Ereignisüberwachung</span></div><button id="refresh">Aktualisieren</button></header>
+  <main>
+    <section class="panel map-panel"><h1>Übersicht</h1><svg id="map" viewBox="0 0 800 430" role="img" aria-label="Zonen und Fahrzeugpositionen"></svg><p class="hint">Die Übersicht skaliert auf die vorhandenen GeoJSON-Zonen und letzten Positionen.</p></section>
+    <section class="panel"><h2>Position melden</h2><form id="position-form"><label>Fahrzeug <select name="vehicle_id" id="vehicle"></select></label><div class="two"><label>Längengrad <input name="lon" type="number" step="any" required value="11.54"></label><label>Breitengrad <input name="lat" type="number" step="any" required value="48.13"></label></div><button>Position speichern</button></form><p id="position-message" class="message"></p></section>
+    <section class="panel"><h2>Neue Zone</h2><form id="zone-form"><label>Name <input name="name" required placeholder="Kundengelände"></label><label>GeoJSON-Polygon <textarea name="geometry" rows="6" required placeholder='{"type":"Polygon","coordinates":[…]}'></textarea></label><button>Zone anlegen</button></form></section>
+    <section class="panel"><h2>Neues Fahrzeug</h2><form id="vehicle-form" class="inline"><input name="name" required placeholder="Fahrzeugname"><button>Anlegen</button></form></section>
+    <section class="panel wide"><h2>Ereignisse</h2><div class="table-wrap"><table><thead><tr><th>Zeit</th><th>Fahrzeug</th><th>Ereignis</th><th>Zone</th><th>Position</th></tr></thead><tbody id="events"></tbody></table></div></section>
+  </main><script src="/static/app.js"></script>
+</body></html>

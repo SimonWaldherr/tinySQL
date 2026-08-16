@@ -176,7 +176,11 @@ silent default): `tenant`, `autosave`, `pool_readers` (aliases `read_pool`,
 `reader_pool`), `pool_writers` (aliases `write_pool`, `writer_pool`),
 `busy_timeout` (alias `busytimeout`), `mode`, `max_memory_bytes`, `read_only`,
 `sync_on_mutate`, `compress_files`, `checkpoint_every`, `checkpoint_interval`,
-`checkpoint_max_bytes`. Booleans accept `1/true/yes/on` and `0/false/no/off`.
+`checkpoint_max_bytes`, `wal_sync`. Booleans accept `1/true/yes/on` and
+`0/false/no/off`. `wal_sync` accepts `full` (the default, strongest available
+flush) or `normal` (ordinary fsync on every WAL commit). On macOS, `normal`
+matches SQLite `synchronous=FULL` without SQLite's separate `fullfsync=ON`;
+it is not equivalent to SQLite `synchronous=NORMAL`.
 
 Helpers in the public driver package:
 

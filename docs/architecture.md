@@ -173,8 +173,8 @@ was not.
 | Mode | Data | Durability |
 |---|---|---|
 | `ModeMemory` | RAM | explicit `SaveToFile`, or `Close` with a path |
-| `ModeWAL` | RAM | log fsynced per committed statement, periodic full checkpoint |
-| `ModeAdvancedWAL` | RAM | row-level log, transaction begin/commit/abort records |
+| `ModeWAL` | RAM | log synchronously flushed per committed statement, periodic full checkpoint |
+| `ModeAdvancedWAL` | RAM | row-level log, transaction begin/commit/abort records, synchronously flushed commits |
 | `ModeDisk` | one GOB file per table, loaded on demand | flushed on `Sync`/`Close` |
 | `ModeJSON` | as `ModeDisk`, human-readable | flushed on `Sync`/`Close` |
 | `ModeIndex` | schemas in RAM, rows on disk | flushed on `Sync`/`Close` |
@@ -182,7 +182,9 @@ was not.
 | `ModePagedIndex` | rows and indexes in separate B+Trees | immutable artifact, read-mostly |
 
 `ModeWAL` is the mode to compare against SQLite: an acknowledged write survives
-a crash. See [BENCHMARKS.md](../BENCHMARKS.md) for what that costs.
+a crash. Its default `wal_sync=full` selects the strongest available OS flush;
+`wal_sync=normal` selects ordinary fsync but still flushes every commit. See
+[BENCHMARKS.md](../BENCHMARKS.md) for tier-matched SQLite comparisons.
 
 ## Where to look
 

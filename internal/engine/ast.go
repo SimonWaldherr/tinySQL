@@ -352,6 +352,10 @@ type Select struct {
 	// fast path. It is kept separate from simplePlanCache because a join has two
 	// source-table identities to validate.
 	simpleJoinPlanCache *simpleJoinPlanCache
+	// simpleJoinAggregatePlanCache stores the immutable shape of the two-table
+	// join-and-single-group fast path. It is separate from simpleJoinPlanCache
+	// because aggregate projections and the grouping column are compiled too.
+	simpleJoinAggregatePlanCache *simpleJoinAggregatePlanCache
 }
 
 // PivotClause represents "PIVOT (agg(value_expr) FOR pivot_col IN (v1 [AS a1], v2 [AS a2], ...))".

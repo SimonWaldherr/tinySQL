@@ -35,9 +35,19 @@ limitations, start with the [root README](../README.md).
 | Goal | Command | Notes |
 | --- | --- | --- |
 | Catalog and scheduler APIs | [`catalog_demo`](./catalog_demo/README.md) | Tables, views, functions, jobs |
+| Search a support knowledge base | [`supportdesk`](./supportdesk/README.md) | Driver, transactions, trigger, view, CTE, full-text search |
 | Local read-only POI snapshot | [`offline_demo`](./offline_demo/README.md) | No service or network required |
 | Evaluate local RAG retrieval | [`ragdemo`](./ragdemo/README.md) | Requires a local embedding server |
 | Explore tinyORM | [`tinyorm_demo`](./tinyorm_demo/README.md) | Migrations and named parameters |
+
+## Practical local applications
+
+| Goal | Command | Notes |
+| --- | --- | --- |
+| Track zone entry and exit events | [`geofence-service`](./geofence-service/README.md) | GeoJSON zones, GPS API, event UI |
+| Search a local document directory | [`docsearch`](./docsearch/README.md) | Persistent full-text index and browser UI |
+| Validate CSV before importing it | [`import-validate`](./import-validate/README.md) | Rules, error history, explicit commit |
+| Record work and break time | [`worklog`](./worklog/README.md) | Timeout checkout, reports, CSV export |
 
 ## Browser and WebAssembly
 

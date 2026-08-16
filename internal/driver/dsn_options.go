@@ -96,6 +96,12 @@ func applyDSNOption(c *cfg, key, value string) error {
 			return err
 		}
 		c.checkpointMaxBytes = sz
+	case "wal_sync":
+		mode, err := storage.ParseWALSyncMode(value)
+		if err != nil {
+			return fmt.Errorf("tinysql: %w", err)
+		}
+		c.walSync = mode
 	case "persist_debounce_ms":
 		ms, err := parseNonNegativeUint(value, key)
 		if err != nil {

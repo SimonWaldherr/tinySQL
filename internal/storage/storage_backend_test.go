@@ -115,7 +115,7 @@ func TestDefaultStorageConfig(t *testing.T) {
 		{ModeMemory, 0, 0, 0},
 		{ModeHybrid, 256 * 1024 * 1024, 0, 0},
 		{ModeIndex, 64 * 1024 * 1024, 0, 0},
-		{ModeWAL, 0, 32, 30 * time.Second},
+		{ModeWAL, 0, 1000, 30 * time.Second},
 		{ModeAdvancedWAL, 0, 1000, 5 * time.Minute},
 		{ModeJSON, 0, 0, 0},
 	}
@@ -134,6 +134,71 @@ func TestDefaultStorageConfig(t *testing.T) {
 		if got.CheckpointInterval != tc.wantInterval {
 			t.Fatalf("CheckpointInterval for %v = %s, want %s", tc.mode, got.CheckpointInterval, tc.wantInterval)
 		}
+		if got.WALSync != WALSyncFull {
+			t.Fatalf("WALSync for %v = %s, want %s", tc.mode, got.WALSync, WALSyncFull)
+		}
+	}
+}
+
+func TestParseWALSyncMode(t *testing.T) {
+	tests := []struct {
+		input string
+		want  WALSyncMode
+		err   bool
+	}{
+		{"full", WALSyncFull, false},
+		{" FULL ", WALSyncFull, false},
+		{"normal", WALSyncNormal, false},
+		{"NoRmAl", WALSyncNormal, false},
+		{"", WALSyncFull, true},
+		{"unsafe", WALSyncFull, true},
+	}
+	for _, tc := range tests {
+		got, err := ParseWALSyncMode(tc.input)
+		if (err != nil) != tc.err {
+			t.Errorf("ParseWALSyncMode(%q) error = %v, wantErr %v", tc.input, err, tc.err)
+			continue
+		}
+		if !tc.err && got != tc.want {
+			t.Errorf("ParseWALSyncMode(%q) = %v, want %v", tc.input, got, tc.want)
+		}
+	}
+	if WALSyncFull.String() != "full" || WALSyncNormal.String() != "normal" {
+		t.Fatalf("unexpected WAL sync mode strings: full=%q normal=%q", WALSyncFull, WALSyncNormal)
+	}
+}
+
+func TestWALSyncConfigPropagationAndValidation(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "basic")
+	db, err := OpenDB(StorageConfig{Mode: ModeWAL, Path: base, WALSync: WALSyncNormal})
+	if err != nil {
+		t.Fatalf("open ModeWAL with normal sync: %v", err)
+	}
+	if got := db.WAL(); got == nil || got.syncMode != WALSyncNormal {
+		t.Fatalf("ModeWAL sync mode = %#v, want normal", got)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close ModeWAL: %v", err)
+	}
+
+	advancedPath := filepath.Join(t.TempDir(), "advanced.wal")
+	db, err = OpenDB(StorageConfig{Mode: ModeAdvancedWAL, Path: advancedPath, WALSync: WALSyncNormal})
+	if err != nil {
+		t.Fatalf("open ModeAdvancedWAL with normal sync: %v", err)
+	}
+	if got := db.AdvancedWAL(); got == nil || got.syncMode != WALSyncNormal {
+		t.Fatalf("ModeAdvancedWAL sync mode = %#v, want normal", got)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close ModeAdvancedWAL: %v", err)
+	}
+
+	invalid := WALSyncMode(99)
+	if _, err := OpenWAL(NewDB(), WALConfig{Path: filepath.Join(t.TempDir(), "bad"), SyncMode: invalid}); err == nil {
+		t.Fatal("OpenWAL accepted an unsupported sync mode")
+	}
+	if _, err := OpenAdvancedWAL(AdvancedWALConfig{Path: filepath.Join(t.TempDir(), "bad.wal"), SyncMode: invalid}); err == nil {
+		t.Fatal("OpenAdvancedWAL accepted an unsupported sync mode")
 	}
 }
 

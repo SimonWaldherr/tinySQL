@@ -13,14 +13,22 @@ package benchmarks
 // Here both engines go through database/sql with bound parameters, on schemas
 // and durability settings chosen to match:
 //
-//	tinySQL/mem          in-memory, no durability      SQLite/mem       :memory:
-//	tinySQL/wal          WAL, fsync per statement      SQLite/wal-full  journal_mode=WAL, synchronous=FULL
-//	                                                   SQLite/wal-norm  journal_mode=WAL, synchronous=NORMAL
+//	tinySQL/mem              in-memory, no durability       SQLite/mem             :memory:
+//	tinySQL/wal-fsync        WAL, ordinary fsync/commit      SQLite/wal-fsync       synchronous=FULL, fullfsync=OFF
+//	tinySQL/wal-fullflush    WAL, strongest OS flush/commit  SQLite/wal-fullflush   synchronous=FULL, fullfsync=ON
+//	                                                              SQLite/wal-normal  synchronous=NORMAL (weaker durability)
 //
-// SQLite/wal-full is the honest counterpart to tinySQL's ModeWAL, which syncs
-// the log on every committed statement. SQLite/wal-norm is included because it
-// is what most applications actually run, and the gap between the two shows how
-// much of any difference is fsync rather than engine work.
+// The two WAL tiers distinguish *when* a commit sync happens from the strength
+// of that sync. In particular, Go's File.Sync requests F_FULLFSYNC on macOS,
+// while SQLite synchronous=FULL uses ordinary fsync unless fullfsync is also
+// enabled. tinySQL's default remains the stronger full-flush policy; users can
+// opt into wal_sync=normal for the SQLite synchronous=FULL peer. SQLite's
+// synchronous=NORMAL is intentionally retained only as a weaker-throughput
+// reference, never as a durability-equivalent comparison.
+//
+// Automatic checkpoints are pushed beyond the timed workload in every WAL
+// tier. Commit latency and checkpoint latency are separate measurements; a
+// checkpoint must not be charged to a randomly selected autocommit operation.
 //
 // Every engine gets MaxOpenConns(1). SQLite needs it for :memory: (each
 // connection would otherwise get its own empty database) and it removes pool
@@ -87,32 +95,53 @@ func parityEngines() []parityEngine {
 			createBuckets: liteBuckets,
 		},
 		{
-			name: "tinySQL/wal",
+			name: "tinySQL/wal-fsync",
 			open: func(b *testing.B) *sql.DB {
 				path := filepath.Join(tmpDir(b), "parity")
-				return openParity(b, "tinysql", "file:"+path+"?tenant=default&mode=wal")
+				return openParity(b, "tinysql", "file:"+path+"?tenant=default&mode=wal&wal_sync=normal&checkpoint_every=1000000&checkpoint_interval=1h&checkpoint_max_bytes=-1")
 			},
 			createRows:    tinyRows,
 			indexRows:     bucketIndex,
 			createBuckets: tinyBuckets,
 		},
 		{
-			name: "SQLite/wal-full",
+			name: "tinySQL/wal-fullflush",
+			open: func(b *testing.B) *sql.DB {
+				path := filepath.Join(tmpDir(b), "parity")
+				return openParity(b, "tinysql", "file:"+path+"?tenant=default&mode=wal&wal_sync=full&checkpoint_every=1000000&checkpoint_interval=1h&checkpoint_max_bytes=-1")
+			},
+			createRows:    tinyRows,
+			indexRows:     bucketIndex,
+			createBuckets: tinyBuckets,
+		},
+		{
+			name: "SQLite/wal-fsync",
 			open: func(b *testing.B) *sql.DB {
 				path := filepath.Join(tmpDir(b), "parity.sqlite")
 				return openParity(b, "sqlite",
-					"file:"+path+"?_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=busy_timeout(5000)")
+					"file:"+path+"?_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=fullfsync(OFF)&_pragma=wal_autocheckpoint(0)&_pragma=busy_timeout(5000)")
 			},
 			createRows:    liteRows,
 			indexRows:     bucketIndex,
 			createBuckets: liteBuckets,
 		},
 		{
-			name: "SQLite/wal-norm",
+			name: "SQLite/wal-fullflush",
 			open: func(b *testing.B) *sql.DB {
 				path := filepath.Join(tmpDir(b), "parity.sqlite")
 				return openParity(b, "sqlite",
-					"file:"+path+"?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)")
+					"file:"+path+"?_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=fullfsync(ON)&_pragma=checkpoint_fullfsync(ON)&_pragma=wal_autocheckpoint(0)&_pragma=busy_timeout(5000)")
+			},
+			createRows:    liteRows,
+			indexRows:     bucketIndex,
+			createBuckets: liteBuckets,
+		},
+		{
+			name: "SQLite/wal-normal",
+			open: func(b *testing.B) *sql.DB {
+				path := filepath.Join(tmpDir(b), "parity.sqlite")
+				return openParity(b, "sqlite",
+					"file:"+path+"?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=fullfsync(OFF)&_pragma=wal_autocheckpoint(0)&_pragma=busy_timeout(5000)")
 			},
 			createRows:    liteRows,
 			indexRows:     bucketIndex,

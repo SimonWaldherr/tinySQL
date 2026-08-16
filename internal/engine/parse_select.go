@@ -140,8 +140,9 @@ func (p *Parser) parseSelect() (*Select, error) {
 		return nil, err
 	}
 	sel := &Select{
-		simplePlanCache:     &simpleSelectPlanCache{},
-		simpleJoinPlanCache: &simpleJoinPlanCache{},
+		simplePlanCache:              &simpleSelectPlanCache{},
+		simpleJoinPlanCache:          &simpleJoinPlanCache{},
+		simpleJoinAggregatePlanCache: &simpleJoinAggregatePlanCache{},
 	}
 
 	// Parse DISTINCT

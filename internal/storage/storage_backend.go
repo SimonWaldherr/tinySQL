@@ -108,6 +108,52 @@ func (m StorageMode) String() string {
 	}
 }
 
+// WALSyncMode controls the durability barrier used for each committed WAL
+// transaction. Its zero value deliberately preserves the historical strongest
+// available behavior.
+type WALSyncMode uint8
+
+const (
+	// WALSyncFull asks the operating system for its strongest available file
+	// flush. On macOS this is F_FULLFSYNC; on other platforms it is File.Sync.
+	// It is the default because it preserves the durability behavior WAL modes
+	// exposed before sync policy became configurable.
+	WALSyncFull WALSyncMode = iota
+
+	// WALSyncNormal uses a regular fsync. On macOS this matches SQLite's
+	// synchronous=FULL behavior unless SQLite's separate fullfsync pragma is
+	// enabled. A committed transaction is still flushed before it is
+	// acknowledged, but sudden-power-loss guarantees depend on the filesystem
+	// and hardware write cache.
+	WALSyncNormal
+)
+
+// String returns the canonical configuration spelling for a WAL sync mode.
+func (m WALSyncMode) String() string {
+	switch m {
+	case WALSyncFull:
+		return "full"
+	case WALSyncNormal:
+		return "normal"
+	default:
+		return fmt.Sprintf("WALSyncMode(%d)", m)
+	}
+}
+
+// ParseWALSyncMode parses a WAL sync policy. Keep this separate from storage
+// modes: both affect durability, but one chooses a backend and the other
+// chooses its per-commit flush strength.
+func ParseWALSyncMode(s string) (WALSyncMode, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "full":
+		return WALSyncFull, nil
+	case "normal":
+		return WALSyncNormal, nil
+	default:
+		return WALSyncFull, fmt.Errorf("unknown WAL sync mode %q (valid: full, normal)", s)
+	}
+}
+
 // ParseStorageMode converts a string representation back to a StorageMode.
 // It is case-insensitive and returns an error for unknown values.
 func ParseStorageMode(s string) (StorageMode, error) {
@@ -164,12 +210,13 @@ type StorageConfig struct {
 	// artifact (see OpenDB's ModeAdvancedWAL case).
 	CompressFiles bool
 
-	// CheckpointEvery controls how many committed WAL transactions trigger
-	// an automatic checkpoint (ModeWAL only). Zero means default (32).
+	// CheckpointEvery controls how many WAL work units trigger an automatic
+	// checkpoint: committed transactions in ModeWAL and row-operation records
+	// in ModeAdvancedWAL. Zero means the mode default (1000).
 	CheckpointEvery uint64
 
-	// CheckpointInterval controls the maximum time between checkpoints
-	// (ModeWAL only). Zero means default (30 s).
+	// CheckpointInterval controls the maximum time between checkpoints. Zero
+	// means the mode default (30 s for ModeWAL, 5 min for ModeAdvancedWAL).
 	CheckpointInterval time.Duration
 
 	// CheckpointMaxBytes forces a checkpoint once the WAL file exceeds this
@@ -177,6 +224,13 @@ type StorageConfig struct {
 	// (ModeWAL / ModeAdvancedWAL). Zero means default (64 MB); negative
 	// disables the size trigger.
 	CheckpointMaxBytes int64
+
+	// WALSync controls the durability barrier for ModeWAL and ModeAdvancedWAL
+	// commits. The default WALSyncFull retains the historic strongest-flush
+	// behavior. WALSyncNormal uses a regular fsync, matching SQLite
+	// synchronous=FULL on macOS unless SQLite's separate fullfsync pragma is
+	// enabled.
+	WALSync WALSyncMode
 
 	// ReadOnly opens the database in read-only mode: the SQL engine rejects
 	// all mutating statements. Ideal for serve-only phases (e.g. load at
@@ -207,7 +261,10 @@ func DefaultStorageConfig(mode StorageMode) StorageConfig {
 	case ModePagedIndex:
 		cfg.MaxMemoryBytes = 64 * 1024 * 1024
 	case ModeWAL:
-		cfg.CheckpointEvery = 32
+		// Keep checkpoints infrequent enough that a small write burst does not
+		// repeatedly serialize the whole in-memory database. WAL growth remains
+		// bounded by the 30-second and 64 MiB defaults.
+		cfg.CheckpointEvery = 1000
 		cfg.CheckpointInterval = 30 * time.Second
 	case ModeAdvancedWAL:
 		cfg.CheckpointEvery = 1000

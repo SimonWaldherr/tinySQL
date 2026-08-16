@@ -246,13 +246,17 @@ func TestServerStorageOptionHelpers(t *testing.T) {
 		"max_memory_mb":       []string{"2"},
 		"checkpoint_every":    []string{"7"},
 		"checkpoint_interval": []string{"2s"},
+		"wal_sync":            []string{"normal"},
 	}
 	cfg := storage.StorageConfig{}
 	if err := applyStorageOptions(values, &cfg); err != nil {
 		t.Fatalf("applyStorageOptions failed: %v", err)
 	}
-	if !cfg.CompressFiles || !cfg.SyncOnMutate || cfg.MaxMemoryBytes != 2*1024*1024 || cfg.CheckpointEvery != 7 || cfg.CheckpointInterval != 2*time.Second {
+	if !cfg.CompressFiles || !cfg.SyncOnMutate || cfg.MaxMemoryBytes != 2*1024*1024 || cfg.CheckpointEvery != 7 || cfg.CheckpointInterval != 2*time.Second || cfg.WALSync != storage.WALSyncNormal {
 		t.Fatalf("unexpected storage config: %#v", cfg)
+	}
+	if err := applyStorageOptions(url.Values{"wal_sync": []string{"unsafe"}}, &storage.StorageConfig{}); err == nil {
+		t.Fatal("expected invalid wal_sync to fail")
 	}
 
 	var b bool

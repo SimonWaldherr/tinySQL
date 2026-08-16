@@ -177,24 +177,38 @@ allocations) and wins at every size, by ~3.7x at the largest. `SUM`/`AVG` still
 fall back to `big.Rat` accumulation when they meet a `DECIMAL`/`MONEY` value, so
 exact-decimal correctness is unchanged — only the all-numeric case got faster.
 
-## Suite 2: parity — both engines through `database/sql`, durability matched
+## Suite 2: parity — both engines through `database/sql`, durability tiered
 
 | Configuration | Durability |
 |---|---|
 | `tinySQL/mem` | none (in-memory) |
 | `SQLite/mem` | none (`:memory:`) |
-| `tinySQL/wal` | `ModeWAL`, log fsynced on every committed statement |
-| `SQLite/wal-full` | `journal_mode=WAL`, `synchronous=FULL` — the honest counterpart to `tinySQL/wal` |
-| `SQLite/wal-norm` | `journal_mode=WAL`, `synchronous=NORMAL` — what most applications actually run |
+| `tinySQL/wal-fsync` | `ModeWAL`, `wal_sync=normal`: ordinary fsync on every committed statement |
+| `SQLite/wal-fsync` | `journal_mode=WAL`, `synchronous=FULL`, `fullfsync=OFF`: ordinary fsync on every commit |
+| `tinySQL/wal-fullflush` | `ModeWAL`, default `wal_sync=full`: strongest available OS flush on every committed statement (`F_FULLFSYNC` on macOS) |
+| `SQLite/wal-fullflush` | `journal_mode=WAL`, `synchronous=FULL`, `fullfsync=ON` (and `checkpoint_fullfsync=ON`) |
+| `SQLite/wal-normal` | `journal_mode=WAL`, `synchronous=NORMAL`: deliberately weaker durability reference |
+
+`wal_sync=normal` does **not** mean SQLite `synchronous=NORMAL`: tinySQL still
+flushes every acknowledged commit. It is the peer of SQLite
+`synchronous=FULL` without `fullfsync`. The parity benchmark disables automatic
+checkpoints during its timed commit loops so checkpoint work is not charged to
+an arbitrary operation; checkpoint latency should be benchmarked separately.
 
 ```sh
 go test ./benchmarks/ -run='^$' -bench=Parity -benchtime=100x -count=2
 ```
 
-Table `bench(id PK, name, score, bucket)` with 10,000 rows and an index on
-`bucket`; ns/op, same machine as above, two runs shown as a range:
+### Historical results before the durability-tier split
 
-| Workload | tinySQL/mem | SQLite/mem | tinySQL/wal | SQLite/wal-full | SQLite/wal-norm |
+Table `bench(id PK, name, score, bucket)` with 10,000 rows and an index on
+`bucket`; ns/op, same machine as above, two runs shown as a range. These
+historical values use tinySQL's old/default full-flush path alongside SQLite
+`synchronous=FULL` without `fullfsync`; on macOS those are **not** matched
+durability tiers and must not be read as a durable-write-parity claim. Re-run
+the current benchmark matrix for a tier-matched result on the target host.
+
+| Workload | tinySQL/mem | SQLite/mem | tinySQL/wal-fullflush | SQLite/wal-fsync | SQLite/wal-normal |
 |---|---|---|---|---|---|
 | INSERT, autocommit (1 row) | **12–21 µs** | 13–15 µs | 1.19–1.21 ms | 1.18–1.22 ms | 0.09 ms |
 | INSERT, 100 rows in one tx | 10.0–11.8 ms | **2.6–3.7 ms** | 8.2–12.9 ms | **3.1–3.5 ms** | 1.6–2.2 ms |
@@ -218,17 +232,22 @@ missing capability, not an engine-vs-engine result.
 
 ### What the parity numbers say
 
-- **Durable single-statement writes are at parity.** `tinySQL/wal` and
-  `SQLite/wal-full` land within a few percent of each other, both bounded by one
-  fsync per statement rather than by engine work. `SQLite/wal-norm` is 13x
-  faster than either — most SQLite deployments do not run `synchronous=FULL`.
+- **Do not infer durable-write parity from the historical WAL columns.** On
+  macOS tinySQL's default full flush is stronger than SQLite
+  `synchronous=FULL` without `fullfsync`; use the current `wal-fsync` or
+  `wal-fullflush` matched tier instead. `SQLite/wal-normal` remains a
+  deliberately weaker throughput reference.
 - **Aggregation is tinySQL's strongest result** — 5x faster than SQLite in
   memory, 6–17x faster on the durable configuration.
 - **Primary-key UPDATE no longer scans or snapshots the whole table.** The
   constraint index bounds both execution and the atomic rollback point to the
   candidate row. Trigger/FK updates and assignments touching a secondary index
   retain the conservative full snapshot.
-- **JOIN is 3–5x slower** than SQLite — the second gap worth closing.
+- **Simple two-table equality JOINs are now a tinySQL strength.** The raw
+  hash-join path caches its compiled shape and the right-hand lookup until that
+  table changes. In the current `BenchmarkParityJoin` it takes about 0.45 ms
+  versus SQLite's 3.0 ms on this machine. More complex join shapes still use
+  the generic executor and remain the next JOIN-performance target.
 - **Batched inserts are ~3x slower**: a transaction commit re-serializes each
   changed table rather than appending row deltas.
 
@@ -240,7 +259,8 @@ missing capability, not an engine-vs-engine result.
   embedded, allocation-light, single-process, without SQLite's
   transactional-durability machinery in the hot path.
 - SQLite pulls ahead on large bulk inserts (1000+ rows in one loop), indexed
-  point lookups, batched-transaction inserts and JOINs.
+  point lookups and batched-transaction inserts. Complex or multi-way JOINs
+  that cannot use tinySQL's raw equality-join path need separate measurement.
 - `tinySQL-Page`, the direct B+Tree backend, is the slowest option for bulk
   writes: no incremental/append writes at the page level yet, so every
   `SaveTable` serializes the whole table. A known optimization target, not the

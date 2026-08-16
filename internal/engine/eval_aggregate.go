@@ -202,14 +202,18 @@ func evalAggregateSumAvg(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 			continue
 		}
 	}
+	// SQL aggregates other than COUNT return NULL when there are no non-NULL
+	// input values. This covers both a genuinely empty group and a group whose
+	// argument evaluates to NULL for every row (for example a PIVOT bucket
+	// with no matching source rows).
+	if n == 0 {
+		return nil, nil
+	}
 	if ex.Name == "SUM" {
 		if useRat {
 			return sumRat, nil
 		}
 		return sumFloat, nil
-	}
-	if n == 0 {
-		return nil, nil
 	}
 	if useRat {
 		avg := new(big.Rat).Quo(sumRat, big.NewRat(int64(n), 1))

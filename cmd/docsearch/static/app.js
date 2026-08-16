@@ -1,0 +1,8 @@
+const $ = s => document.querySelector(s); let results=[];
+async function api(url, options){const r=await fetch(url,options);const d=await r.json();if(!r.ok)throw new Error(d.error||'Anfrage fehlgeschlagen');return d}
+function el(tag, content){const x=document.createElement(tag);if(content!==undefined)x.textContent=content;return x}
+function render(items){results=items;const list=$('#list');list.replaceChildren();$('#count').textContent=`${items.length} Ergebnis${items.length===1?'':'se'}`;if(!items.length){const p=el('p','Keine passenden Dokumente.');p.className='empty';list.append(p);return}items.forEach(d=>{const b=el('button');b.className='result';b.append(el('strong',d.title),el('small',d.path),el('span',d.snippet));b.onclick=()=>show(d,b);list.append(b)})}
+async function show(d,button){document.querySelectorAll('.result').forEach(x=>x.classList.remove('active'));button.classList.add('active');const doc=await api(`/api/documents/${d.id}`);const box=$('#preview');box.replaceChildren(el('h2',doc.title),el('p',doc.path).classList.add('path'),el('pre',doc.content))}
+async function search(){const q=$('#query').value.trim();const d=await api('/api/search?q='+encodeURIComponent(q));render(d.results)}
+$('#search-form').onsubmit=e=>{e.preventDefault();search().catch(e=>alert(e.message))};$('#reindex').onclick=async()=>{const b=$('#reindex');b.disabled=true;b.textContent='Indexiere …';try{const d=await api('/api/reindex',{method:'POST'});$('#status').textContent=`${d.documents} Dokumente indexiert`;await search()}catch(e){alert(e.message)}finally{b.disabled=false;b.textContent='Index aktualisieren'}};
+api('/api/status').then(d=>$('#status').textContent=`${d.documents} Dokumente im lokalen Index`).catch(()=>{});search().catch(e=>alert(e.message));

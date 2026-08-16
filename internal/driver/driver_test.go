@@ -199,20 +199,21 @@ func TestDSNAliases(t *testing.T) {
 }
 
 func TestParseDSNStorageOptionsAreStrictAndComplete(t *testing.T) {
-	c, err := parseDSN("file:/tmp/tiny?tenant=tiles&mode=index&autosave=1&pool_readers=4&pool_writers=2&busy_timeout=125ms&max_memory_bytes=64MiB&read_only=0&sync_on_mutate=true&compress_files=false&checkpoint_every=9&checkpoint_interval=2s&checkpoint_max_bytes=512MiB")
+	c, err := parseDSN("file:/tmp/tiny?tenant=tiles&mode=index&autosave=1&pool_readers=4&pool_writers=2&busy_timeout=125ms&max_memory_bytes=64MiB&read_only=0&sync_on_mutate=true&compress_files=false&checkpoint_every=9&checkpoint_interval=2s&checkpoint_max_bytes=512MiB&wal_sync=normal")
 	if err != nil {
 		t.Fatalf("parse DSN: %v", err)
 	}
 	if c.maxMemoryBytes != 64<<20 || c.checkpointMaxBytes != 512<<20 {
 		t.Fatalf("byte options = memory %d checkpoint %d", c.maxMemoryBytes, c.checkpointMaxBytes)
 	}
-	if c.checkpointEvery != 9 || c.checkpointInterval != 2*time.Second || !c.syncOnMutate || c.compressFiles || c.readOnly {
+	if c.checkpointEvery != 9 || c.checkpointInterval != 2*time.Second || !c.syncOnMutate || c.compressFiles || c.readOnly || c.walSync != storage.WALSyncNormal {
 		t.Fatalf("storage options not preserved: %#v", c)
 	}
 	for _, dsn := range []string{
 		"mem://?max_memory_bytes=not-a-size",
 		"mem://?read_only=maybe",
 		"mem://?checkpoint_interval=-1s",
+		"mem://?wal_sync=unsafe",
 		"mem://?unknown_option=1",
 		"mem://?tenant=a&tenant=b",
 	} {
@@ -347,7 +348,7 @@ func TestConnectorSharesOneStorageDBPerSQLDB(t *testing.T) {
 
 func TestConnectorForwardsStorageConfig(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "artifact")
-	dsn := "file:" + dir + "?mode=index&max_memory_bytes=64MiB&sync_on_mutate=1&compress_files=1&checkpoint_every=7&checkpoint_interval=3s&checkpoint_max_bytes=512MiB"
+	dsn := "file:" + dir + "?mode=index&max_memory_bytes=64MiB&sync_on_mutate=1&compress_files=1&checkpoint_every=7&checkpoint_interval=3s&checkpoint_max_bytes=512MiB&wal_sync=normal"
 	co, err := (&drv{}).OpenConnector(dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -359,7 +360,7 @@ func TestConnectorForwardsStorageConfig(t *testing.T) {
 	c := raw.(*conn)
 	defer c.srv.db.Close()
 	got := c.srv.db.Config()
-	if got == nil || got.Mode != storage.ModeIndex || got.MaxMemoryBytes != 64<<20 || !got.SyncOnMutate || !got.CompressFiles || got.CheckpointEvery != 7 || got.CheckpointInterval != 3*time.Second || got.CheckpointMaxBytes != 512<<20 {
+	if got == nil || got.Mode != storage.ModeIndex || got.MaxMemoryBytes != 64<<20 || !got.SyncOnMutate || !got.CompressFiles || got.CheckpointEvery != 7 || got.CheckpointInterval != 3*time.Second || got.CheckpointMaxBytes != 512<<20 || got.WALSync != storage.WALSyncNormal {
 		t.Fatalf("storage config was not forwarded: %#v", got)
 	}
 	if stats := c.srv.db.BackendStats(); stats.MemoryLimitBytes != 64<<20 {

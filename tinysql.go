@@ -369,6 +369,18 @@ func WithAuditText(ctx context.Context, sqlText string) context.Context {
 // Different modes trade off speed, memory usage, and durability.
 type StorageMode = storage.StorageMode
 
+// WALSyncMode controls the per-commit flush strength used by WAL storage
+// modes. WALSyncFull is the default; WALSyncNormal opts into regular fsync
+// where the platform distinguishes it from a full hardware flush.
+type WALSyncMode = storage.WALSyncMode
+
+const (
+	// WALSyncFull preserves the historic strongest available WAL flush.
+	WALSyncFull = storage.WALSyncFull
+	// WALSyncNormal uses a regular fsync while retaining synchronous commits.
+	WALSyncNormal = storage.WALSyncNormal
+)
+
 // StorageConfig configures database storage behaviour. Pass to OpenDB to
 // create a database with the desired persistence strategy.
 type StorageConfig = storage.StorageConfig
@@ -602,6 +614,11 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 // or "hybrid" into a StorageMode constant (case-insensitive).
 func ParseStorageMode(s string) (StorageMode, error) {
 	return storage.ParseStorageMode(s)
+}
+
+// ParseWALSyncMode parses "full" or "normal" for StorageConfig.WALSync.
+func ParseWALSyncMode(s string) (WALSyncMode, error) {
+	return storage.ParseWALSyncMode(s)
 }
 
 // DefaultStorageConfig returns a StorageConfig with sensible defaults for

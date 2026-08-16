@@ -118,6 +118,7 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 			CheckpointEvery:    cfg.CheckpointEvery,
 			CheckpointInterval: cfg.CheckpointInterval,
 			CheckpointMaxBytes: cfg.CheckpointMaxBytes,
+			SyncMode:           cfg.WALSync,
 		}
 		wal, err := OpenWAL(db, walCfg)
 		if err != nil {
@@ -158,6 +159,7 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 			CheckpointInterval: cfg.CheckpointInterval,
 			CheckpointMaxBytes: cfg.CheckpointMaxBytes,
 			BufferSize:         64 * 1024,
+			SyncMode:           cfg.WALSync,
 		}
 		wal, err := OpenAdvancedWAL(walCfg)
 		if err != nil {

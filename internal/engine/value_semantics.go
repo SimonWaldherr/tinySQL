@@ -5,6 +5,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -161,6 +162,8 @@ func compare(a, b any) (int, error) {
 		return compareString(ax, b)
 	case bool:
 		return compareBool(ax, b)
+	case []byte:
+		return compareBytes(ax, b)
 	}
 	if fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b) {
 		return 0, nil
@@ -260,6 +263,17 @@ func compareBool(ax bool, b any) (int, error) {
 		return 0, nil
 	}
 	return 0, fmt.Errorf("incomparable bool and %T", b)
+}
+
+// compareBytes applies SQLite-style bytewise ordering to BLOBs. Equality is a
+// particularly important case: BLOB values are slices and therefore cannot be
+// compared with Go's == operator or with the raw fast path's scalar cases.
+func compareBytes(ax []byte, b any) (int, error) {
+	bx, ok := b.([]byte)
+	if !ok {
+		return 0, fmt.Errorf("incomparable []byte and %T", b)
+	}
+	return bytes.Compare(ax, bx), nil
 }
 
 func compareForOrder(a, b any, desc bool) int {

@@ -18,6 +18,9 @@ type WALConfig struct {
 	Path               string
 	CheckpointEvery    uint64
 	CheckpointInterval time.Duration
+	// SyncMode controls the commit flush. Its zero value, WALSyncFull,
+	// preserves ModeWAL's historic strongest-flush behavior.
+	SyncMode WALSyncMode
 	// CheckpointMaxBytes forces a checkpoint once the WAL file exceeds this
 	// size, bounding WAL growth independently of transaction count and time.
 	// Zero means default (64 MB); negative disables the size trigger.
@@ -26,6 +29,8 @@ type WALConfig struct {
 
 // defaultCheckpointMaxBytes bounds WAL growth when no explicit limit is set.
 const defaultCheckpointMaxBytes = 64 << 20 // 64 MB
+
+const defaultWALCheckpointEvery = 1000
 
 // normalizeCheckpointMaxBytes maps the config convention (0 = default,
 // negative = disabled) onto the internal one (0 = disabled).
@@ -47,6 +52,7 @@ type WALManager struct {
 	checkpointEvery    uint64
 	checkpointInterval time.Duration
 	checkpointMaxBytes int64
+	syncMode           WALSyncMode
 	file               *os.File
 	bytes              *countingWriter
 	writer             *bufio.Writer
@@ -76,10 +82,13 @@ func OpenWAL(db *DB, cfg WALConfig) (*WALManager, error) {
 		return nil, nil
 	}
 	if cfg.CheckpointEvery == 0 {
-		cfg.CheckpointEvery = 32
+		cfg.CheckpointEvery = defaultWALCheckpointEvery
 	}
 	if cfg.CheckpointInterval <= 0 {
 		cfg.CheckpointInterval = 30 * time.Second
+	}
+	if cfg.SyncMode != WALSyncFull && cfg.SyncMode != WALSyncNormal {
+		return nil, fmt.Errorf("unsupported WAL sync mode %q", cfg.SyncMode)
 	}
 	basePath := cfg.Path
 	if strings.HasSuffix(strings.ToLower(basePath), ".gz") {
@@ -121,6 +130,7 @@ func OpenWAL(db *DB, cfg WALConfig) (*WALManager, error) {
 		checkpointEvery:     cfg.CheckpointEvery,
 		checkpointInterval:  cfg.CheckpointInterval,
 		checkpointMaxBytes:  normalizeCheckpointMaxBytes(cfg.CheckpointMaxBytes),
+		syncMode:            cfg.SyncMode,
 		file:                f,
 		bytes:               cw,
 		writer:              writer,
@@ -282,7 +292,7 @@ func (w *WALManager) Close() error {
 		}
 	}
 	if w.file != nil {
-		if err := w.file.Sync(); err != nil {
+		if err := syncWALFile(w.file, w.syncMode); err != nil {
 			return err
 		}
 		if err := w.file.Close(); err != nil {
@@ -310,7 +320,7 @@ func (w *WALManager) flushSync() error {
 		}
 	}
 	if w.file != nil {
-		if err := w.file.Sync(); err != nil {
+		if err := syncWALFile(w.file, w.syncMode); err != nil {
 			return err
 		}
 	}

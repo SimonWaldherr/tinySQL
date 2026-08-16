@@ -308,6 +308,13 @@ func simpleAggregateProjectionValue(state *simpleAggregateState, proj simpleAggr
 	case aggCount:
 		return state.counts[i]
 	case aggSum:
+		// Match evalAggregateSumAvg: SUM over no non-NULL input values is
+		// NULL, not the float accumulator's zero value. In particular this
+		// keeps the raw aggregate fast paths consistent with PIVOT and the
+		// general aggregate evaluator.
+		if state.counts[i] == 0 {
+			return nil
+		}
 		if state.useRat != nil && state.useRat[i] {
 			return state.sumRat[i]
 		}

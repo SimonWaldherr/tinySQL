@@ -16,19 +16,9 @@ func executeSimpleJoinFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error)
 		return nil, ok, err
 	}
 
-	rightByKey := make(map[any][][]any, len(plan.right.Rows))
-	for _, right := range plan.right.Rows {
-		if plan.rightFilter != nil {
-			match, err := plan.rightFilter(right)
-			if err != nil {
-				return nil, true, err
-			}
-			if !match {
-				continue
-			}
-		}
-		key := comparableKeyPart(right[plan.rightKey])
-		rightByKey[key] = append(rightByKey[key], right)
+	rightByKey, err := plan.rightRowsByKey()
+	if err != nil {
+		return nil, true, err
 	}
 
 	outRows := make([]Row, 0, min(len(plan.left.Rows), len(plan.right.Rows)))
@@ -48,7 +38,11 @@ func executeSimpleJoinFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error)
 				continue
 			}
 		}
-		matches := rightByKey[comparableKeyPart(left[plan.leftKey])]
+		leftKey := left[plan.leftKey]
+		if leftKey == nil {
+			continue
+		}
+		matches := rightByKey[comparableKeyPart(leftKey)]
 		for _, right := range matches {
 			match, err := evalJoinRawWhere(plan, left, right)
 			if err != nil {
@@ -65,6 +59,54 @@ func executeSimpleJoinFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error)
 		}
 	}
 	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, true, nil
+}
+
+// rightRowsByKey returns a version-validated index of the right join input.
+// Queries hold the database content read lock for their full execution, so a
+// published index remains immutable while callers use it. Writers obtain the
+// exclusive content lock and increment Table.Version, causing the next query
+// to rebuild the index from the new rows.
+func (p *simpleJoinPlan) rightRowsByKey() (map[any][][]any, error) {
+	cache := &p.rightLookup
+	cache.mu.RLock()
+	if cache.table == p.right && cache.version == p.right.Version {
+		byKey := cache.byKey
+		cache.mu.RUnlock()
+		return byKey, nil
+	}
+	cache.mu.RUnlock()
+
+	byKey := make(map[any][][]any, len(p.right.Rows))
+	for _, right := range p.right.Rows {
+		if p.rightFilter != nil {
+			match, err := p.rightFilter(right)
+			if err != nil {
+				return nil, err
+			}
+			if !match {
+				continue
+			}
+		}
+		keyVal := right[p.rightKey]
+		// SQL equality never matches NULL. Besides preserving that semantic, not
+		// indexing NULL avoids a false match when both join inputs have NULL in
+		// their key column.
+		if keyVal == nil {
+			continue
+		}
+		key := comparableKeyPart(keyVal)
+		byKey[key] = append(byKey[key], right)
+	}
+
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if cache.table == p.right && cache.version == p.right.Version {
+		return cache.byKey, nil
+	}
+	cache.table = p.right
+	cache.version = p.right.Version
+	cache.byKey = byKey
+	return byKey, nil
 }
 
 func buildSimpleJoinPlan(env ExecEnv, s *Select) (*simpleJoinPlan, bool, error) {

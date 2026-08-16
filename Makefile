@@ -6,9 +6,9 @@ SHELL := /usr/bin/env bash
 .PHONY: build-wasm-browser build-wasm-node build-studio build-tinysqlpage build-migrate
 .PHONY: build-query-files build-query-files-wasm build-fsql run-query-files-demo
 .PHONY: build-gh-pages-demo check-gh-pages-demo update-gh-pages push-gh-pages
-.PHONY: test-all test-unit test-integration test-jsonv2 coverage build-check verify verify-ci
+.PHONY: test-all test-unit test-integration test-jsonv2 test-ci coverage build-check wasm-check tinygo-wasm ci verify verify-ci
 .PHONY: test-query-files test-query-files-wasm test-fsql
-.PHONY: run-wasm-browser run-wasm-node-demo deps update-deps tidy tidy-all bench bench-engine bench-hotpaths script-lint docker-build info
+.PHONY: run-wasm-browser run-wasm-node-demo deps deps-all update-deps tidy tidy-all modules-verify bench bench-engine bench-hotpaths script-lint docker-build info
 .DEFAULT_GOAL := help
 
 # Variables
@@ -24,6 +24,9 @@ COVERPROFILE ?= coverage.out
 BENCH_COUNT ?= 3
 WASM_BROWSER_SCRIPT := ./$(CMD_DIR)/wasm_browser/build.sh
 WASM_NODE_SCRIPT := ./$(CMD_DIR)/wasm_node/build.sh
+TINYGO_IMAGE ?= tinygo/tinygo:0.41.1
+TINYGO_PATH := /usr/local/tinygo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+TINYGO_DOCKER_USER := $(shell id -u):$(shell id -g)
 QUERY_FILES_DIR := ./$(CMD_DIR)/query_files
 QUERY_FILES_WASM_DIR := ./$(CMD_DIR)/query_files_wasm
 QUERY_FILES_WASM_SCRIPT := $(QUERY_FILES_WASM_DIR)/build.sh
@@ -31,6 +34,7 @@ GH_PAGES_BRANCH ?= gh-pages
 GH_PAGES_WORKTREE ?= .gh-pages-worktree
 GH_PAGES_COMMIT_MESSAGE ?= Update gh-pages demo
 GH_PAGES_DEMO_FILES := index.html app.js query_files.wasm query_files.wasm.gz wasm_exec.js tiles-demo.html tiles-demo.js tiles-demo-data.js demo.mbtiles tiles-demo-bavaria.html tiles-demo-bavaria.js
+GO_MOD_FILES := $(shell git ls-files -- 'go.mod' ':(glob)**/go.mod' | LC_ALL=C sort)
 
 # Color output
 GREEN := \033[0;32m
@@ -116,6 +120,34 @@ build-wasm-browser:
 build-wasm-node:
 	@echo "$(GREEN)Building WASM for Node.js...$(NC)"
 	@$(WASM_NODE_SCRIPT) --build-only
+
+## wasm-check: Compile every WebAssembly target without leaving build artifacts behind
+wasm-check:
+	@echo "$(GREEN)Checking WebAssembly targets...$(NC)"
+	@tmpdir="$$(mktemp -d)"; \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	GOOS=js GOARCH=wasm $(GO) build -trimpath -o "$$tmpdir/tinysql-browser.wasm" ./$(CMD_DIR)/wasm_browser; \
+	GOOS=js GOARCH=wasm $(GO) build -trimpath -o "$$tmpdir/tinysql-node.wasm" ./$(CMD_DIR)/wasm_node; \
+	(cd $(QUERY_FILES_WASM_DIR) && GOOS=js GOARCH=wasm $(GO) build -trimpath -o "$$tmpdir/query-files.wasm" .); \
+	echo "$(GREEN)✓ WebAssembly targets compile$(NC)"
+
+## tinygo-wasm: Build and smoke-test the Node WASM bundle with the pinned TinyGo Docker image
+tinygo-wasm:
+	@echo "$(GREEN)Running TinyGo WASM smoke test ($(TINYGO_IMAGE))...$(NC)"
+	@command -v docker >/dev/null || (echo "$(RED)docker is required for TinyGo validation$(NC)" && exit 1)
+	@command -v node >/dev/null || (echo "$(RED)node is required for the WASM smoke test$(NC)" && exit 1)
+	@set -eu; \
+	trap 'rm -f cmd/wasm_node/tinySQL.wasm cmd/wasm_node/wasm_exec.js' EXIT; \
+	docker run --rm \
+		--user "$(TINYGO_DOCKER_USER)" \
+		--env HOME=/tmp \
+		--env XDG_CACHE_HOME=/tmp/.cache \
+		--env PATH="$(TINYGO_PATH)" \
+		--volume "$(CURDIR):/src" \
+		--workdir /src/cmd/wasm_node \
+		$(TINYGO_IMAGE) \
+		sh -c 'WASM_COMPILER=tinygo WASM_OPTIMIZE=false ./build.sh --build-only'; \
+	node cmd/wasm_node/wasm_runner.js query 'SELECT 1 AS ready'
 
 ## build-query-files: Build standalone query_files CLI
 build-query-files:
@@ -255,6 +287,19 @@ test-jsonv2:
 	@echo "$(GREEN)Testing JSON v2 compatibility...$(NC)"
 	GOEXPERIMENT=jsonv2 $(GO) test $(GO_TEST_FLAGS) ./internal/storage ./internal/engine
 
+## test-ci: Run the complete non-TinyGo test matrix used by continuous integration
+test-ci:
+	@echo "$(GREEN)Running CI test matrix...$(NC)"
+	$(GO) test ./... -count=1
+	$(MAKE) --no-print-directory test-query-files GO_TEST_FLAGS=-count=1
+	$(MAKE) --no-print-directory test-query-files-wasm GO_TEST_FLAGS=-count=1
+	GOEXPERIMENT=jsonv2 $(GO) test ./internal/storage ./internal/engine -count=1
+	$(GO) test ./... -race -count=1
+	$(MAKE) --no-print-directory test-query-files GO_TEST_FLAGS='-race -count=1'
+	$(MAKE) --no-print-directory test-query-files-wasm GO_TEST_FLAGS='-race -count=1'
+	$(GO) test -coverprofile=$(COVERPROFILE) ./...
+	$(GO) tool cover -func=$(COVERPROFILE)
+
 ## test-query-files: Run tests for cmd/query_files module
 test-query-files:
 	@echo "$(GREEN)Running query_files tests...$(NC)"
@@ -342,8 +387,9 @@ vet:
 build-check:
 	@echo "$(GREEN)Building all Go packages...$(NC)"
 	$(GO) build $(GOFLAGS) ./...
-	$(MAKE) build-query-files
-	$(MAKE) build-query-files-wasm
+	@tmpdir="$$(mktemp -d)"; \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	(cd $(QUERY_FILES_DIR) && $(GO) build $(GOFLAGS) -o "$$tmpdir/query_files" .)
 
 ## tidy: Tidy dependencies
 tidy:
@@ -352,12 +398,21 @@ tidy:
 
 ## tidy-all: Tidy the root module and every nested example, tool, and driver module
 tidy-all:
-	@echo "$(GREEN)Tidying all Go modules...$(NC)"
-	@while IFS= read -r mod; do \
-		dir="$${mod%/go.mod}"; \
+	@echo "$(GREEN)Tidying tracked Go modules...$(NC)"
+	@for mod in $(GO_MOD_FILES); do \
+		dir="$$(dirname "$$mod")"; \
 		echo "$(GREEN)→ $$dir$(NC)"; \
 		(cd "$$dir" && $(GO) mod tidy); \
-	done < <(find . -name go.mod -not -path './.git/*' -print | LC_ALL=C sort)
+	done
+
+## modules-verify: Download and verify checksums for every tracked Go module
+modules-verify:
+	@echo "$(GREEN)Downloading and verifying tracked Go modules...$(NC)"
+	@for mod in $(GO_MOD_FILES); do \
+		dir="$$(dirname "$$mod")"; \
+		echo "$(GREEN)→ $$dir$(NC)"; \
+		(cd "$$dir" && $(GO) mod download && $(GO) mod verify); \
+	done
 
 ## verify: Run fmt, vet, lint and test
 verify: fmt vet lint test
@@ -366,6 +421,10 @@ verify: fmt vet lint test
 ## verify-ci: CI-safe verification (non-mutating)
 verify-ci: fmt-check vet build-check test-all
 	@echo "$(GREEN)✓ CI verification passed$(NC)"
+
+## ci: Run the complete standard-Go CI matrix
+ci: fmt-check modules-verify build-check wasm-check vet test-ci
+	@echo "$(GREEN)✓ Standard-Go CI verification passed$(NC)"
 
 ## clean: Remove build artifacts
 clean:
@@ -399,11 +458,23 @@ deps:
 	@echo "$(GREEN)Downloading dependencies...$(NC)"
 	$(GO) mod download
 
-## update-deps: Update dependencies
+## deps-all: Download dependencies for every tracked Go module
+deps-all:
+	@echo "$(GREEN)Downloading dependencies for tracked Go modules...$(NC)"
+	@for mod in $(GO_MOD_FILES); do \
+		dir="$$(dirname "$$mod")"; \
+		echo "$(GREEN)→ $$dir$(NC)"; \
+		(cd "$$dir" && $(GO) mod download); \
+	done
+
+## update-deps: Update dependencies in every tracked Go module
 update-deps:
-	@echo "$(GREEN)Updating dependencies...$(NC)"
-	$(GO) get -u ./...
-	$(GO) mod tidy
+	@echo "$(GREEN)Updating dependencies in tracked Go modules...$(NC)"
+	@for mod in $(GO_MOD_FILES); do \
+		dir="$$(dirname "$$mod")"; \
+		echo "$(GREEN)→ $$dir$(NC)"; \
+		(cd "$$dir" && $(GO) get -t -u ./... && $(GO) mod tidy); \
+	done
 
 ## docker-build: Build Docker image
 docker-build:

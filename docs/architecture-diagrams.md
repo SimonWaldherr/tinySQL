@@ -377,11 +377,12 @@ flowchart TD
     style ModeWAL fill:#e8f5e8,stroke:#5c8a5c
 ```
 
-`ModeWAL` is the mode to compare against SQLite: an acknowledged write survives a
-crash. [BENCHMARKS.md](../BENCHMARKS.md) shows what that costs — durable
-single-statement writes land within a few percent of SQLite at
-`synchronous=FULL`, because both are bounded by one fsync rather than by engine
-work.
+`ModeWAL` is the mode to compare against SQLite when an acknowledged write must
+survive a crash. Compare equivalent flush tiers: `wal_sync=normal` performs an
+ordinary fsync per commit and corresponds to SQLite `synchronous=FULL` without
+`fullfsync`; the default `wal_sync=full` uses the strongest available OS flush
+(including `F_FULLFSYNC` on macOS) and must be compared with SQLite
+`fullfsync=ON`. [BENCHMARKS.md](../BENCHMARKS.md) contains both tiers.
 
 ## Where a change belongs
 

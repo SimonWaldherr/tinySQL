@@ -3,6 +3,7 @@
 package engine
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 	"sync"
@@ -10,7 +11,8 @@ import (
 
 // rawEqual performs a type-aware equality check between two interface values
 // without going through the generic compare() function.  It covers the value
-// types that tinySQL stores in table rows (int, int64, float64, string, bool).
+// types that tinySQL stores in table rows (int, int64, float64, string, bool,
+// and []byte BLOBs).
 func rawEqual(a, b any) bool {
 	if a == nil {
 		return b == nil
@@ -53,6 +55,10 @@ func rawEqual(a, b any) bool {
 	case bool:
 		if bv, ok := b.(bool); ok {
 			return av == bv
+		}
+	case []byte:
+		if bv, ok := b.([]byte); ok {
+			return bytes.Equal(av, bv)
 		}
 	}
 	return false

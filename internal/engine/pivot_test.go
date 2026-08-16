@@ -104,6 +104,32 @@ func TestPivotMissingValueIsNullOrZero(t *testing.T) {
 	}
 }
 
+func TestPivotMissingValueUsesEmptyAggregateSemantics(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE t (grp TEXT, cat TEXT, val INT)`)
+	execSQL(t, db, `INSERT INTO t VALUES ('A', 'x', 10)`)
+
+	// A PIVOT output bucket with no matching rows is an empty aggregate input.
+	// SQLite-style semantics are NULL for value aggregates and zero for COUNT.
+	for _, agg := range []string{"SUM", "AVG", "MIN", "MAX"} {
+		t.Run(agg, func(t *testing.T) {
+			rs := execSQL(t, db, `SELECT * FROM t PIVOT (`+agg+`(val) FOR cat IN ('x' AS present, 'y' AS missing))`)
+			if len(rs.Rows) != 1 {
+				t.Fatalf("expected 1 group, got %d: %+v", len(rs.Rows), rs.Rows)
+			}
+			if got := rs.Rows[0]["missing"]; got != nil {
+				t.Fatalf("%s over unmatched PIVOT value = %v, want NULL", agg, got)
+			}
+		})
+	}
+
+	rs := execSQL(t, db, `SELECT * FROM t PIVOT (COUNT(val) FOR cat IN ('x' AS present, 'y' AS missing))`)
+	if len(rs.Rows) != 1 {
+		t.Fatalf("expected 1 group, got %d: %+v", len(rs.Rows), rs.Rows)
+	}
+	expectInt(t, rs.Rows[0]["missing"], 0, "COUNT over unmatched PIVOT value")
+}
+
 func TestPivotWithWhereFiltersSourceRows(t *testing.T) {
 	db := setupPivotSalesTable(t)
 	// WHERE filters the source rows before pivoting.

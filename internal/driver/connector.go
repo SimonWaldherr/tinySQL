@@ -143,6 +143,7 @@ func (c *connector) openServer() (*server, error) {
 		sc.CheckpointEvery = c.cfg.checkpointEvery
 		sc.CheckpointInterval = c.cfg.checkpointInterval
 		sc.CheckpointMaxBytes = c.cfg.checkpointMaxBytes
+		sc.WALSync = c.cfg.walSync
 		db, err = storage.OpenDB(sc)
 	case c.cfg.filePath != "":
 		if c.cfg.readOnly {

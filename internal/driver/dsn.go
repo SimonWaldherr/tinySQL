@@ -39,6 +39,10 @@ type cfg struct {
 	checkpointEvery    uint64
 	checkpointInterval time.Duration
 	checkpointMaxBytes int64
+	// walSync is the per-commit flush strength used by WAL storage modes.
+	// Its zero value is WALSyncFull, preserving historical durability for
+	// callers that do not opt in to the SQLite-compatible normal policy.
+	walSync storage.WALSyncMode
 
 	// persistDebounce is OFF by default (zero value): every write-shaped
 	// statement's persist() call performs its durable sync synchronously and

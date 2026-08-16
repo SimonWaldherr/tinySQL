@@ -77,6 +77,36 @@ func TestJoinAggregateFastPathEligibility(t *testing.T) {
 	}
 }
 
+func TestJoinAggregateFastPathCachesPlanForRepeatedStatement(t *testing.T) {
+	db := setupJoinAggTables(t)
+	stmt := mustParse(`
+		SELECT c.name, COUNT(*) AS n
+		FROM orders o JOIN custs c ON o.cust_id = c.id
+		GROUP BY c.name
+	`).(*Select)
+	env := ExecEnv{ctx: context.Background(), tenant: "default", db: db}
+
+	first, ok, err := buildSimpleJoinAggregatePlan(env, stmt)
+	if err != nil || !ok {
+		t.Fatalf("first join aggregate plan = %#v, ok=%v, err=%v", first, ok, err)
+	}
+	second, ok, err := buildSimpleJoinAggregatePlan(env, stmt)
+	if err != nil || !ok {
+		t.Fatalf("second join aggregate plan = %#v, ok=%v, err=%v", second, ok, err)
+	}
+	if first != second {
+		t.Fatal("repeated statement did not reuse its join aggregate plan")
+	}
+
+	rs, err := Execute(context.Background(), db, "default", stmt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rs.Rows) != 2 {
+		t.Fatalf("cached join aggregate result = %#v, want two groups", rs)
+	}
+}
+
 func TestJoinAggregateFastPathCountSumAvgMinMax(t *testing.T) {
 	db := setupJoinAggTables(t)
 	rs := execSQL(t, db, `

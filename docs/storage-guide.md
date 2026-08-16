@@ -68,9 +68,10 @@ malformed values:
 | `max_memory_bytes` | bytes, `KiB`/`MiB`/`GiB`, or decimal `KB`/`MB`/`GB` | Hybrid/Index buffer-pool budget |
 | `read_only` | strict boolean | Reject mutations and persistence actions |
 | `sync_on_mutate`, `compress_files` | strict boolean | Storage behaviour |
-| `checkpoint_every` | unsigned integer | WAL checkpoint transaction count |
+| `checkpoint_every` | unsigned integer | WAL checkpoint cadence (transactions in `wal`; row-operation records in `advanced_wal`) |
 | `checkpoint_interval` | non-negative Go duration | WAL checkpoint interval |
 | `checkpoint_max_bytes` | size, or `-1` to disable | WAL size trigger |
+| `wal_sync` | `full` (default) or `normal` | WAL commit flush strength; `normal` is ordinary fsync on every commit, not SQLite `synchronous=NORMAL` |
 
 For a file-backed storage mode, all storage values are forwarded to
 `storage.OpenDB(StorageConfig{...})`; they are not merely driver hints.

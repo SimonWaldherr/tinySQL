@@ -134,6 +134,7 @@ type AdvancedWAL struct {
 	checkpointEvery    uint64
 	checkpointInterval time.Duration
 	checkpointMaxBytes int64
+	syncMode           WALSyncMode
 	lastCheckpoint     time.Time
 	recordsSinceCP     uint64
 
@@ -270,6 +271,9 @@ type AdvancedWALConfig struct {
 	CheckpointInterval time.Duration // Checkpoint after duration
 	CheckpointMaxBytes int64         // Checkpoint once WAL exceeds this size (0 = 64 MB default, <0 disables)
 	BufferSize         int           // Buffer size for writing
+	// SyncMode controls the commit flush. Its zero value, WALSyncFull,
+	// preserves the historic strongest-flush behavior.
+	SyncMode WALSyncMode
 }
 
 // OpenAdvancedWAL creates or opens a WAL with full ACID semantics.
@@ -286,6 +290,9 @@ func OpenAdvancedWAL(config AdvancedWALConfig) (*AdvancedWAL, error) {
 	}
 	if config.BufferSize == 0 {
 		config.BufferSize = 64 * 1024 // 64KB default
+	}
+	if config.SyncMode != WALSyncFull && config.SyncMode != WALSyncNormal {
+		return nil, fmt.Errorf("unsupported WAL sync mode %q", config.SyncMode)
 	}
 
 	// Ensure directory exists
@@ -350,6 +357,7 @@ func OpenAdvancedWAL(config AdvancedWALConfig) (*AdvancedWAL, error) {
 		checkpointEvery:         config.CheckpointEvery,
 		checkpointInterval:      config.CheckpointInterval,
 		checkpointMaxBytes:      normalizeCheckpointMaxBytes(config.CheckpointMaxBytes),
+		syncMode:                config.SyncMode,
 		lastCheckpoint:          time.Now(),
 		activeTxs:               make(map[TxID]*WALTxState),
 		nextLSN:                 checkpointWatermark + 1,
@@ -990,7 +998,7 @@ func (w *AdvancedWAL) flush() error {
 	if w.file == nil {
 		return nil
 	}
-	if err := w.file.Sync(); err != nil {
+	if err := syncWALFile(w.file, w.syncMode); err != nil {
 		return err
 	}
 	return nil
