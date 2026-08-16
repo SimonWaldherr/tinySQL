@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Offline POI Explorer</title><link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header><div><strong>Offline POI Explorer</strong><span id="status">Lade lokalen Snapshot …</span></div></header>
+  <main>
+    <section class="panel"><form id="search"><input id="query" autofocus value="München" placeholder="Ort, Kategorie oder Name durchsuchen"><button>Suchen</button><button type="button" id="all">Alle POIs</button></form></section>
+    <section class="layout"><div class="panel"><h1 id="count">Treffer</h1><div id="results"></div></div><div class="panel"><h2>Karte</h2><svg id="map" viewBox="0 0 680 420" role="img" aria-label="Positionen der gefundenen Orte"></svg><p class="hint">Die Daten bleiben im lokalen TinySQL-Snapshot; externe Kartenkacheln werden nicht geladen.</p></div></section>
+  </main><script src="/static/app.js"></script>
+</body></html>

@@ -81,6 +81,52 @@ func TestRecursiveCTEBypassesPhysicalTableFastPath(t *testing.T) {
 	}
 }
 
+func TestRecursiveCTECompoundLimitBoundsWholeCTE(t *testing.T) {
+	db := storage.NewDB()
+	for _, tc := range []struct {
+		name string
+		sql  string
+		want []int
+	}{
+		{
+			name: "limit-stops-an-unbounded-recursion",
+			sql: `
+				WITH RECURSIVE cnt AS (
+					SELECT 1 AS n
+					UNION ALL
+					SELECT n + 1 AS n FROM cnt
+					LIMIT 3
+				)
+				SELECT n FROM cnt ORDER BY n`,
+			want: []int{1, 2, 3},
+		},
+		{
+			name: "limit-and-offset-apply-after-recursive-work",
+			sql: `
+				WITH RECURSIVE cnt AS (
+					SELECT 1 AS n
+					UNION ALL
+					SELECT n + 1 AS n FROM cnt
+					LIMIT 3 OFFSET 1
+				)
+				SELECT n FROM cnt ORDER BY n`,
+			want: []int{2, 3, 4},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rs := execSQL(t, db, tc.sql)
+			if len(rs.Rows) != len(tc.want) {
+				t.Fatalf("rows = %#v, want %d rows", rs.Rows, len(tc.want))
+			}
+			for i, want := range tc.want {
+				if got := expectAsInt(t, rs.Rows[i]["n"]); got != want {
+					t.Fatalf("row %d = %d, want %d", i, got, want)
+				}
+			}
+		})
+	}
+}
+
 func TestRecursiveCTEFanOutJoinExceedsRowLimitInsteadOfExhaustingMemory(t *testing.T) {
 	// Lower the row cap for the duration of this test so it can prove the
 	// limit trips without actually allocating millions of rows.

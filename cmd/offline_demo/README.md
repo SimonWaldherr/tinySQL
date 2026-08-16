@@ -1,24 +1,61 @@
-# Offline POI demo
+# Offline POI explorer
 
-Part of [TinySQL](../../README.md). See the root GIS and storage sections for
-the broader map-data workflow.
+Kleines Local-first-Beispiel für einen durchsuchbaren POI-Snapshot. Es läuft
+ohne SQLite, externen Dienst oder Netzverbindung und kann denselben Snapshot
+wahlweise per CLI oder in einem Browser-Explorer durchsuchen.
 
-Create or reopen a local POI snapshot, put it into read-only mode, and search it
-without a server, network access, or SQLite dependency.
+## Start
 
 ```bash
-# In-memory dataset
+# Flüchtiger Beispieldatensatz im Speicher
 go run ./cmd/offline_demo
 
-# Build a reusable local snapshot, then reopen it on the next run
+# Wiederverwendbaren Snapshot erzeugen oder erneut öffnen
 go run ./cmd/offline_demo -snapshot /tmp/tinysql-poi.snapshot -query museum
 
-# Stable output for scripts
+# Maschinenlesbare Ausgabe
 go run ./cmd/offline_demo -snapshot /tmp/tinysql-poi.snapshot -json
+
+# Browser-Explorer für denselben Snapshot
+go run ./cmd/offline_demo -web -addr 127.0.0.1:8086 \
+  -snapshot /tmp/tinysql-poi.snapshot
+# http://localhost:8086
 ```
 
-Further flags: `-rebuild` ignores an existing snapshot, `-read-only` (default
-true) rejects writes after the dataset is loaded or created.
+## Snapshot-Lebenszyklus
 
-The tiny dataset only illustrates the lifecycle and read-only behavior; larger
-map datasets use the dedicated POI-index or MBTiles paths.
+Ohne `-snapshot` erzeugt das Programm den kleinen Beispieldatensatz im
+Speicher. Mit einem Pfad lädt es einen vorhandenen Snapshot oder erzeugt ihn
+beim ersten Aufruf. `-rebuild` ignoriert einen vorhandenen Snapshot und schreibt
+den Beispieldatensatz neu. `-read-only` ist standardmäßig `true` und sperrt die
+Datenbank nach dem Laden bzw. Anlegen gegen weitere Änderungen.
+
+| Option | Standard | Bedeutung |
+| --- | --- | --- |
+| `-snapshot` | leer | Snapshot-Datei, die erzeugt oder wiederverwendet wird |
+| `-query` | `München` | Suche in Name, Stadt oder Kategorie |
+| `-json` | `false` | Stabile JSON-Ausgabe statt einer Texttabelle |
+| `-rebuild` | `false` | Vorhandenen Snapshot durch Beispieldaten ersetzen |
+| `-read-only` | `true` | Schreibzugriffe nach dem Laden bzw. Erzeugen ablehnen |
+| `-web` | `false` | Browser-Explorer statt CLI-Ausgabe starten |
+| `-addr` | `:8086` | HTTP-Adresse im Webmodus |
+
+## Browser-API und Datenschutz
+
+Der Webmodus stellt nur lesende Endpunkte bereit:
+
+| Methode | Pfad | Zweck |
+| --- | --- | --- |
+| `GET` | `/healthz` | Einfacher Health-Check |
+| `GET` | `/api/status` | Quelle, Read-only-Status und Anzahl der POIs |
+| `GET` | `/api/search?q=<begriff>` | Trefferliste; ohne `q` alle POIs |
+
+Die Oberfläche lädt keine externen Kartenkacheln und überträgt den Snapshot
+nicht an einen Kartendienst. Ein eventuell sichtbarer OpenStreetMap-Link wird
+erst nach einem bewussten Klick geöffnet; dabei sendet der Browser die
+Koordinaten an OpenStreetMap. Für lokale Nutzung den Webserver an
+`127.0.0.1:8086` binden.
+
+Der kleine Datensatz zeigt nur den Snapshot- und Read-only-Lebenszyklus. Für
+größere Kartenbestände sind die dedizierten POI-Index- oder MBTiles-Pfade
+vorgesehen.

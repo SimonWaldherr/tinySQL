@@ -129,27 +129,56 @@ func TestWindowPartitionLagLeadNoCrossPartitionLeakage(t *testing.T) {
 	}
 }
 
-// TestWindowPartitionFirstLastValuePerPartition verifies FIRST_VALUE/
-// LAST_VALUE are computed per-partition, not over the whole table.
+// TestWindowPartitionFirstLastValuePerPartition verifies FIRST_VALUE and the
+// three useful LAST_VALUE frame forms. In particular, SQLite's implicit frame
+// with ORDER BY ends at the final peer of the current row, not at the end of
+// the partition. The 90/90 and 70/70 salary ties make that distinction
+// observable.
 func TestWindowPartitionFirstLastValuePerPartition(t *testing.T) {
 	db := setupPartitionTable(t)
 	rs := execSQL(t, db, `SELECT dept, name,
 		FIRST_VALUE(name) OVER (PARTITION BY dept ORDER BY sal DESC) AS fv,
-		LAST_VALUE(name) OVER (PARTITION BY dept ORDER BY sal DESC) AS lv
+		LAST_VALUE(name) OVER (PARTITION BY dept ORDER BY sal DESC) AS default_lv,
+		LAST_VALUE(name) OVER (
+			PARTITION BY dept ORDER BY sal DESC
+			ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+		) AS rows_lv,
+		LAST_VALUE(name) OVER (
+			PARTITION BY dept ORDER BY sal DESC
+			RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+		) AS range_lv,
+		LAST_VALUE(name) OVER (
+			PARTITION BY dept ORDER BY sal DESC
+			ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+		) AS full_lv
 		FROM employees ORDER BY dept, sal DESC, name`)
 
 	wantFirst := map[string]string{"A": "Ben", "B": "Gary", "C": "Ivy"}
-	wantLast := map[string]string{"A": "Fay", "B": "Hank", "C": "Ivy"}
+	wantDefaultLast := map[string]string{
+		"Ben": "Alice", "Alice": "Alice", "Cara": "Cara", "Dan": "Eve", "Eve": "Eve", "Fay": "Fay",
+		"Gary": "Hank", "Hank": "Hank", "Ivy": "Ivy",
+	}
+	wantFullLast := map[string]string{"A": "Fay", "B": "Hank", "C": "Ivy"}
 	if len(rs.Rows) != 9 {
 		t.Fatalf("expected 9 rows, got %d", len(rs.Rows))
 	}
 	for _, row := range rs.Rows {
 		dept := row["dept"].(string)
+		name := row["name"].(string)
 		if got := row["fv"]; got != wantFirst[dept] {
-			t.Errorf("FIRST_VALUE for dept %s row %v: want %s, got %v", dept, row["name"], wantFirst[dept], got)
+			t.Errorf("FIRST_VALUE for dept %s row %s: want %s, got %v", dept, name, wantFirst[dept], got)
 		}
-		if got := row["lv"]; got != wantLast[dept] {
-			t.Errorf("LAST_VALUE for dept %s row %v: want %s, got %v", dept, row["name"], wantLast[dept], got)
+		if got := row["default_lv"]; got != wantDefaultLast[name] {
+			t.Errorf("default LAST_VALUE for dept %s row %s: want %s, got %v", dept, name, wantDefaultLast[name], got)
+		}
+		if got := row["rows_lv"]; got != name {
+			t.Errorf("ROWS CURRENT ROW LAST_VALUE for dept %s row %s: want %s, got %v", dept, name, name, got)
+		}
+		if got := row["range_lv"]; got != wantDefaultLast[name] {
+			t.Errorf("RANGE CURRENT ROW LAST_VALUE for dept %s row %s: want %s, got %v", dept, name, wantDefaultLast[name], got)
+		}
+		if got := row["full_lv"]; got != wantFullLast[dept] {
+			t.Errorf("full-frame LAST_VALUE for dept %s row %s: want %s, got %v", dept, name, wantFullLast[dept], got)
 		}
 	}
 }

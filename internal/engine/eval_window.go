@@ -5,6 +5,7 @@ package engine
 
 import (
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 )
@@ -157,7 +158,12 @@ func evalFirstValue(env ExecEnv, ex *FuncCall, partitionRows []Row) (any, error)
 	return evalExpr(env, ex.Args[0], partitionRows[0])
 }
 
-// evalLastValue evaluates the LAST_VALUE window function
+// evalLastValue evaluates the LAST_VALUE window function. SQLite's implicit
+// frame for a window with ORDER BY is RANGE BETWEEN UNBOUNDED PRECEDING AND
+// CURRENT ROW, so CURRENT ROW extends through all following peer rows. With
+// no ORDER BY, every row is a peer and the implicit frame covers the whole
+// partition. An explicit ROWS frame deliberately retains its row-position
+// semantics.
 func evalLastValue(env ExecEnv, ex *FuncCall, partitionRows []Row, currentIdx int) (any, error) {
 	if len(ex.Args) == 0 {
 		return nil, fmt.Errorf("LAST_VALUE requires an argument")
@@ -165,12 +171,50 @@ func evalLastValue(env ExecEnv, ex *FuncCall, partitionRows []Row, currentIdx in
 	if len(partitionRows) == 0 {
 		return nil, nil
 	}
-	// Use frame end if specified
-	endIdx := len(partitionRows) - 1
-	if ex.Over.Frame != nil {
-		endIdx = calculateFrameEnd(currentIdx, len(partitionRows), ex.Over.Frame)
-	}
+	endIdx := lastValueFrameEnd(partitionRows, currentIdx, ex.Over)
 	return evalExpr(env, ex.Args[0], partitionRows[endIdx])
+}
+
+// lastValueFrameEnd resolves the end of LAST_VALUE's effective frame. The
+// parser represents an omitted frame as nil, rather than materializing SQL's
+// implicit RANGE frame, so that case belongs here instead of in
+// calculateFrameEnd. For the supported RANGE ... CURRENT ROW forms, peers are
+// included at the end just like SQLite. RANGE offset bounds remain subject to
+// the engine's existing positional frame implementation.
+func lastValueFrameEnd(partitionRows []Row, currentIdx int, over *OverClause) int {
+	if currentIdx < 0 {
+		currentIdx = 0
+	}
+	if currentIdx >= len(partitionRows) {
+		currentIdx = len(partitionRows) - 1
+	}
+
+	if over == nil || over.Frame == nil {
+		if over == nil || len(over.OrderBy) == 0 {
+			return len(partitionRows) - 1
+		}
+		return lastWindowPeerIndex(partitionRows, currentIdx, over.OrderBy)
+	}
+
+	frame := over.Frame
+	if strings.EqualFold(frame.Mode, "RANGE") && frame.EndType == "CURRENT" {
+		return lastWindowPeerIndex(partitionRows, currentIdx, over.OrderBy)
+	}
+	return calculateFrameEnd(currentIdx, len(partitionRows), frame)
+}
+
+// lastWindowPeerIndex returns the final row in currentIdx's ORDER BY peer
+// group. With no ORDER BY all rows are peers, as required by RANGE CURRENT
+// ROW semantics.
+func lastWindowPeerIndex(partitionRows []Row, currentIdx int, orderBy []OrderItem) int {
+	if len(orderBy) == 0 {
+		return len(partitionRows) - 1
+	}
+	endIdx := currentIdx
+	for endIdx+1 < len(partitionRows) && rowsOrderTie(partitionRows[endIdx+1], partitionRows[currentIdx], orderBy) {
+		endIdx++
+	}
+	return endIdx
 }
 
 // evalMovingAggregate evaluates MOVING_SUM and MOVING_AVG window functions
@@ -394,13 +438,13 @@ func evalNtile(env ExecEnv, ex *FuncCall, partitionRows []Row, currentIdx int, r
 	return remainder + (currentIdx-boundary)/base + 1, nil
 }
 
-// windowPartitionCache memoizes, per window-function call site (the specific
-// *FuncCall AST node for one OVER clause in the SELECT list -- stable across
-// every output row of one query) and PARTITION BY key, the partitioned+
-// ordered row set together with a lookup from a row's position in
-// env.windowRows (the query's full, unpartitioned row set -- what
-// env.windowIndex holds for the row currently being evaluated) to that row's
-// position within the partition.
+// windowPartitionCache memoizes, per structural PARTITION BY/ORDER BY shape
+// and PARTITION BY key, the partitioned+ordered row set together with a
+// lookup from a row's position in env.windowRows (the query's full,
+// unpartitioned row set -- what env.windowIndex holds for the row currently
+// being evaluated) to that row's position within the partition. This lets
+// multiple functions such as LAG and LEAD share their sorted partitions when
+// their OVER clauses have the same partitioning and ordering.
 //
 // evalWindowFunction runs once per output row -- that is correct SQL
 // semantics, RANK/LAG/etc. can differ row to row -- but building the
@@ -416,12 +460,24 @@ func evalNtile(env ExecEnv, ex *FuncCall, partitionRows []Row, currentIdx int, r
 // executions would grow unbounded and risk serving stale rows for a reused
 // *FuncCall (e.g. via tinysql.ExecuteCompiled).
 type windowPartitionCache struct {
-	entries map[windowPartitionCacheKey]*windowPartitionEntry
+	entries     map[windowPartitionCacheKey]*windowPartitionEntry
+	shapeByFunc map[*FuncCall]*windowPartitionShape
+	shapes      []*windowPartitionShape
 }
 
 type windowPartitionCacheKey struct {
-	fn        *FuncCall
+	shape     *windowPartitionShape
 	partition string
+}
+
+// windowPartitionShape contains exactly the OVER-clause fields that affect
+// which rows belong to a partition and their sequence inside it. Frame bounds
+// intentionally do not appear here: they affect only a function's lookup
+// within an already-built partition, not partition construction itself.
+type windowPartitionShape struct {
+	partitionBy []Expr
+	orderBy     []OrderItem
+	shareable   bool
 }
 
 type windowPartitionEntry struct {
@@ -435,7 +491,10 @@ type windowPartitionEntry struct {
 }
 
 func newWindowPartitionCache() *windowPartitionCache {
-	return &windowPartitionCache{entries: make(map[windowPartitionCacheKey]*windowPartitionEntry)}
+	return &windowPartitionCache{
+		entries:     make(map[windowPartitionCacheKey]*windowPartitionEntry),
+		shapeByFunc: make(map[*FuncCall]*windowPartitionShape),
+	}
 }
 
 // resolveWindowPartition returns the partitioned+ordered row set for one
@@ -459,7 +518,8 @@ func resolveWindowPartition(env ExecEnv, ex *FuncCall, allRows []Row, row Row) (
 		return partitionRows, findRowIndex(partitionRows, row, env.windowIndex)
 	}
 
-	key := windowPartitionCacheKey{fn: ex, partition: formatWindowPartitionKey(env, ex.Over.PartitionBy, row)}
+	shape := cache.shapeFor(ex)
+	key := windowPartitionCacheKey{shape: shape, partition: formatWindowPartitionKey(env, shape.partitionBy, row)}
 	entry, ok := cache.entries[key]
 	if !ok {
 		entry = buildWindowPartition(env, ex, allRows, row)
@@ -473,6 +533,165 @@ func resolveWindowPartition(env ExecEnv, ex *FuncCall, allRows []Row, row Row) (
 	// hint) -- fall back to the same content-equality scan evalWindowFunction
 	// always used, so correctness never depends on the hint being right.
 	return entry.rows, findRowIndex(entry.rows, row, -1)
+}
+
+// shapeFor returns the canonical partition-building shape for one function
+// call. Expressions containing function calls, subqueries, or unknown AST
+// nodes are intentionally not shared: evaluation can be volatile or have
+// dependencies that structural comparison cannot prove equivalent. Common
+// column/literal/arithmetic PARTITION BY expressions are safe to share.
+func (cache *windowPartitionCache) shapeFor(ex *FuncCall) *windowPartitionShape {
+	if shape, ok := cache.shapeByFunc[ex]; ok {
+		return shape
+	}
+
+	shape := &windowPartitionShape{
+		partitionBy: ex.Over.PartitionBy,
+		orderBy:     ex.Over.OrderBy,
+		shareable:   windowPartitionExpressionsShareable(ex.Over.PartitionBy),
+	}
+	if shape.shareable {
+		for _, existing := range cache.shapes {
+			if existing.shareable && windowPartitionShapesEqual(existing, shape) {
+				cache.shapeByFunc[ex] = existing
+				return existing
+			}
+		}
+	}
+
+	cache.shapes = append(cache.shapes, shape)
+	cache.shapeByFunc[ex] = shape
+	return shape
+}
+
+func windowPartitionShapesEqual(left, right *windowPartitionShape) bool {
+	if len(left.partitionBy) != len(right.partitionBy) || len(left.orderBy) != len(right.orderBy) {
+		return false
+	}
+	for i := range left.partitionBy {
+		if !windowPartitionExprEqual(left.partitionBy[i], right.partitionBy[i]) {
+			return false
+		}
+	}
+	for i := range left.orderBy {
+		if left.orderBy[i].Desc != right.orderBy[i].Desc || !strings.EqualFold(left.orderBy[i].Col, right.orderBy[i].Col) {
+			return false
+		}
+	}
+	return true
+}
+
+func windowPartitionExpressionsShareable(exprs []Expr) bool {
+	for _, expr := range exprs {
+		if !windowPartitionExprShareable(expr) {
+			return false
+		}
+	}
+	return true
+}
+
+func windowPartitionExprShareable(expr Expr) bool {
+	switch ex := expr.(type) {
+	case *VarRef, *Literal:
+		return true
+	case *Unary:
+		return windowPartitionExprShareable(ex.Expr)
+	case *Binary:
+		return windowPartitionExprShareable(ex.Left) && windowPartitionExprShareable(ex.Right)
+	case *IsNull:
+		return windowPartitionExprShareable(ex.Expr)
+	case *BetweenExpr:
+		return windowPartitionExprShareable(ex.Expr) && windowPartitionExprShareable(ex.Lo) && windowPartitionExprShareable(ex.Hi)
+	case *InExpr:
+		if !windowPartitionExprShareable(ex.Expr) {
+			return false
+		}
+		for _, value := range ex.Values {
+			if !windowPartitionExprShareable(value) {
+				return false
+			}
+		}
+		return true
+	case *LikeExpr:
+		return windowPartitionExprShareable(ex.Expr) && windowPartitionExprShareable(ex.Pattern) &&
+			(ex.Escape == nil || windowPartitionExprShareable(ex.Escape))
+	case *RegexpExpr:
+		return windowPartitionExprShareable(ex.Expr) && windowPartitionExprShareable(ex.Pattern)
+	case *CaseExpr:
+		if ex.Operand != nil && !windowPartitionExprShareable(ex.Operand) {
+			return false
+		}
+		for _, when := range ex.Whens {
+			if !windowPartitionExprShareable(when.When) || !windowPartitionExprShareable(when.Then) {
+				return false
+			}
+		}
+		return ex.Else == nil || windowPartitionExprShareable(ex.Else)
+	default:
+		return false
+	}
+}
+
+// windowPartitionExprEqual performs a conservative structural equality check
+// for the deterministic expression shapes windowPartitionExprShareable
+// accepts. Unknown shapes are never shared, so false is always safe here.
+func windowPartitionExprEqual(left, right Expr) bool {
+	switch l := left.(type) {
+	case *VarRef:
+		r, ok := right.(*VarRef)
+		return ok && strings.EqualFold(l.Name, r.Name)
+	case *Literal:
+		r, ok := right.(*Literal)
+		return ok && l.Parameter == r.Parameter && reflect.DeepEqual(l.Val, r.Val)
+	case *Unary:
+		r, ok := right.(*Unary)
+		return ok && l.Op == r.Op && windowPartitionExprEqual(l.Expr, r.Expr)
+	case *Binary:
+		r, ok := right.(*Binary)
+		return ok && l.Op == r.Op && windowPartitionExprEqual(l.Left, r.Left) && windowPartitionExprEqual(l.Right, r.Right)
+	case *IsNull:
+		r, ok := right.(*IsNull)
+		return ok && l.Negate == r.Negate && windowPartitionExprEqual(l.Expr, r.Expr)
+	case *BetweenExpr:
+		r, ok := right.(*BetweenExpr)
+		return ok && l.Negate == r.Negate && windowPartitionExprEqual(l.Expr, r.Expr) &&
+			windowPartitionExprEqual(l.Lo, r.Lo) && windowPartitionExprEqual(l.Hi, r.Hi)
+	case *InExpr:
+		r, ok := right.(*InExpr)
+		if !ok || l.Negate != r.Negate || len(l.Values) != len(r.Values) || !windowPartitionExprEqual(l.Expr, r.Expr) {
+			return false
+		}
+		for i := range l.Values {
+			if !windowPartitionExprEqual(l.Values[i], r.Values[i]) {
+				return false
+			}
+		}
+		return true
+	case *LikeExpr:
+		r, ok := right.(*LikeExpr)
+		return ok && l.Negate == r.Negate && l.CaseInsensitive == r.CaseInsensitive && l.GlobStyle == r.GlobStyle &&
+			windowPartitionExprEqual(l.Expr, r.Expr) && windowPartitionExprEqual(l.Pattern, r.Pattern) &&
+			windowPartitionExprEqual(l.Escape, r.Escape)
+	case *RegexpExpr:
+		r, ok := right.(*RegexpExpr)
+		return ok && l.Negate == r.Negate && l.SimilarTo == r.SimilarTo &&
+			windowPartitionExprEqual(l.Expr, r.Expr) && windowPartitionExprEqual(l.Pattern, r.Pattern)
+	case *CaseExpr:
+		r, ok := right.(*CaseExpr)
+		if !ok || len(l.Whens) != len(r.Whens) || !windowPartitionExprEqual(l.Operand, r.Operand) || !windowPartitionExprEqual(l.Else, r.Else) {
+			return false
+		}
+		for i := range l.Whens {
+			if !windowPartitionExprEqual(l.Whens[i].When, r.Whens[i].When) || !windowPartitionExprEqual(l.Whens[i].Then, r.Whens[i].Then) {
+				return false
+			}
+		}
+		return true
+	case nil:
+		return right == nil
+	default:
+		return false
+	}
 }
 
 // buildWindowPartition filters allRows down to currentRow's partition,

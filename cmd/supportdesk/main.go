@@ -32,7 +32,17 @@ type ticket struct {
 
 func main() {
 	query := flag.String("query", "password", "Knowledge-base search query")
+	web := flag.Bool("web", false, "Serve the support desk in a browser")
+	addr := flag.String("addr", ":8087", "HTTP listen address when -web is set")
+	dsn := flag.String("dsn", "file:supportdesk.db?autosave=1", "TinySQL DSN when -web is set")
 	flag.Parse()
+	if *web {
+		if err := serveSupportDesk(context.Background(), *addr, *dsn); err != nil {
+			fmt.Fprintln(os.Stderr, "supportdesk:", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if err := run(context.Background(), *query, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "supportdesk:", err)

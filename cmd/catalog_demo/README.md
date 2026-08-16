@@ -1,31 +1,69 @@
 # tinySQL Catalog & Scheduler Demo (`catalog_demo`)
 
-Part of [TinySQL](../../README.md). This focused demo complements the root
-guide's SQL and operational overview.
+Dieses Beispiel registriert Tabellen, Views und Funktionen im tinySQL-Katalog
+und führt wiederkehrende sowie einmalige SQL-Jobs durch die echte tinySQL-
+Engine aus. Neben dem kompakten Konsolenmodus gibt es ein Browser-Dashboard für
+den laufenden Scheduler.
 
-Registers tables, views, and functions in the tinySQL catalog, then schedules
-recurring and one-shot SQL jobs executed by the real tinySQL engine.
+## Gezeigte Funktionen
 
-## What it shows
+- Katalogregistrierung: `RegisterTable`, `RegisterView`, `RegisterFunction`
+- Kataloginspektion: `GetTables`, `GetColumns`, `ListJobs`
+- `INTERVAL`-Job: SQL in einem festen Millisekundenintervall ausführen
+- `ONCE`-Job: SQL zu einem absoluten Zeitpunkt ausführen
+- Eigener `JobExecutor`, der SQL parst, ausführt und Ergebnisse protokolliert
+- Scheduler-Lebenszyklus: `StartJobScheduler` / `StopJobScheduler`
 
-- Catalog registration: `RegisterTable`, `RegisterView`, `RegisterFunction`
-- Catalog introspection: `GetTables`, `GetColumns`, `ListJobs`
-- INTERVAL job: SQL re-run every N milliseconds
-- ONCE job: SQL scheduled at an absolute point in time
-- A custom `JobExecutor` that parses and executes SQL, printing results
-- Scheduler lifecycle: `StartJobScheduler` / `StopJobScheduler`
-
-## Build and run
+## Start
 
 ```bash
-go build -o catalog_demo ./cmd/catalog_demo
-./catalog_demo
+go run ./cmd/catalog_demo
+
+# Browser-Dashboard für den laufenden Scheduler
+go run ./cmd/catalog_demo -web -addr 127.0.0.1:8089
+# http://localhost:8089
 ```
 
-No flags. The demo runs for about 6 seconds, prints job output, reports job
-status, then exits.
+Ohne `-web` läuft die Konsolen-Demo etwa sechs Sekunden, druckt Job-Ausgaben,
+zeigt den Status und beendet sich anschließend. Dort läuft
+`refresh_event_stats` alle zwei Sekunden; `integrity_check` wird ungefähr zwei
+Sekunden nach dem Start einmalig ausgeführt.
 
-## Expected output (abridged)
+Mit `-web` bleibt der Scheduler aktiv und zeigt registrierte Tabellen, Job-
+Zeitpläne, letzte Ausführungen sowie eine sichere manuelle Ausführung der
+bereits registrierten Jobs. Die Oberfläche akzeptiert kein frei eingegebenes
+SQL, sondern führt ausschließlich die im Katalog hinterlegten Jobs aus. In
+diesem Modus läuft `refresh_event_stats` alle 15 Sekunden und
+`integrity_check` einmalig eine Minute nach dem Start. Beide Jobs lassen sich
+auch manuell anstoßen.
+
+| Option | Standard | Bedeutung |
+| --- | --- | --- |
+| `-web` | `false` | Browser-Dashboard statt der endlichen Konsolen-Demo starten |
+| `-addr` | `:8089` | HTTP-Adresse im Webmodus |
+
+Der Browsermodus verwendet einen frischen In-memory-Datensatz. Tabellen,
+Schedulerstatus und die bis zu 30 zuletzt angezeigten Läufe gehen beim Neustart
+verloren.
+
+## Browser-API
+
+| Methode | Pfad | Zweck |
+| --- | --- | --- |
+| `GET` | `/healthz` | Einfacher Health-Check |
+| `GET` | `/api/state` | Registrierte Tabellen, Jobstatus und jüngste Läufe |
+| `POST` | `/api/jobs/{name}/run` | Einen bereits registrierten Job manuell ausführen |
+
+Beispiel:
+
+```bash
+curl -X POST http://127.0.0.1:8089/api/jobs/refresh_event_stats/run
+```
+
+Die Anwendung hat keine Anmeldung. Für lokale Nutzung an `127.0.0.1` binden;
+vor einem Netzwerkbetrieb Authentifizierung und TLS ergänzen.
+
+## Erwartete Konsolenausgabe (gekürzt)
 
 ```
 === tinySQL Catalog & Scheduler Demo ===
@@ -54,7 +92,7 @@ status, then exits.
 === Demo Complete ===
 ```
 
-## Key APIs used
+## Verwendete Kern-APIs
 
 ```go
 catalog := tdb.Catalog()
@@ -71,5 +109,5 @@ tdb.StartJobScheduler(executor)
 tdb.StopJobScheduler()
 ```
 
-See [catalog.go](../../internal/storage/catalog.go) and
-[scheduler.go](../../internal/storage/scheduler.go) for the full API.
+Die vollständigen APIs stehen in [catalog.go](../../internal/storage/catalog.go)
+und [scheduler.go](../../internal/storage/scheduler.go).

@@ -159,15 +159,22 @@ func TestWindowPartitionCacheMatchesOldImplementation_MultiColumnPartition(t *te
 	compareOldVsNewForOverClause(t, "PARTITION BY dept, sal ORDER BY id", over, allRows)
 }
 
-// TestWindowPartitionCacheReusedAcrossMultipleFuncCalls confirms the cache
-// key is scoped per *FuncCall AST node, not just per partition value: two
-// different window-function call sites with the identical OVER clause shape
-// must not cross-contaminate each other's cached partitions (each gets its
-// own cache entry, keyed by its own *FuncCall pointer).
+// TestWindowPartitionCacheReusedAcrossMultipleFuncCalls confirms two different
+// window-function call sites with the same PARTITION BY/ORDER BY shape reuse
+// one partition build. Frames and function names do not affect the partition
+// rows or their ordering, so sharing is safe and avoids a second sort.
 func TestWindowPartitionCacheReusedAcrossMultipleFuncCalls(t *testing.T) {
 	allRows := buildPartitionCacheFixture()
 	over1 := &OverClause{PartitionBy: []Expr{newVarRef("dept")}, OrderBy: []OrderItem{{Col: "sal", Desc: true}}}
-	over2 := &OverClause{PartitionBy: []Expr{newVarRef("dept")}, OrderBy: []OrderItem{{Col: "sal", Desc: true}}}
+	over2 := &OverClause{
+		PartitionBy: []Expr{newVarRef("dept")},
+		OrderBy:     []OrderItem{{Col: "sal", Desc: true}},
+		Frame: &WindowFrame{
+			Mode:      "ROWS",
+			StartType: "UNBOUNDED_PRECEDING",
+			EndType:   "CURRENT",
+		},
+	}
 	ex1 := &FuncCall{Name: "ROW_NUMBER", Over: over1}
 	ex2 := &FuncCall{Name: "RANK", Over: over2}
 
@@ -177,17 +184,49 @@ func TestWindowPartitionCacheReusedAcrossMultipleFuncCalls(t *testing.T) {
 		rows1, idx1 := resolveWindowPartition(env, ex1, allRows, row)
 		rows2, idx2 := resolveWindowPartition(env, ex2, allRows, row)
 		// Same OVER clause shape and same current row -> same partition
-		// content and same resolved position, just from two independent
-		// cache entries.
+		// content and same resolved position from the shared cache entry.
 		if !idsEqual(rowIDs(rows1), rowIDs(rows2)) {
-			t.Errorf("row id=%v: independent cache entries for equivalent OVER clauses diverged: %v vs %v",
+			t.Errorf("row id=%v: shared cache entries for equivalent OVER clauses diverged: %v vs %v",
 				row["id"], rowIDs(rows1), rowIDs(rows2))
 		}
 		if idx1 != idx2 {
-			t.Errorf("row id=%v: independent cache entries resolved different positions: %d vs %d", row["id"], idx1, idx2)
+			t.Errorf("row id=%v: equivalent OVER clauses resolved different positions: %d vs %d", row["id"], idx1, idx2)
 		}
 	}
-	if len(env.windowPartitions.entries) < 6 {
-		t.Errorf("expected at least 6 cache entries (3 partitions x 2 FuncCall sites), got %d", len(env.windowPartitions.entries))
+	if got := len(env.windowPartitions.entries); got != 3 {
+		t.Errorf("expected 3 cache entries (one shared shape x 3 partitions), got %d", got)
+	}
+}
+
+// TestWindowPartitionCacheKeepsDifferentShapesSeparate ensures sharing is
+// based on both PARTITION BY and ORDER BY. The two calls visit the same three
+// department partitions, but their opposite sort directions must not reuse a
+// row order or current-row position from the other shape.
+func TestWindowPartitionCacheKeepsDifferentShapesSeparate(t *testing.T) {
+	allRows := buildPartitionCacheFixture()
+	desc := &FuncCall{
+		Name: "LAG",
+		Over: &OverClause{PartitionBy: []Expr{newVarRef("dept")}, OrderBy: []OrderItem{{Col: "sal", Desc: true}}},
+	}
+	asc := &FuncCall{
+		Name: "LEAD",
+		Over: &OverClause{PartitionBy: []Expr{newVarRef("dept")}, OrderBy: []OrderItem{{Col: "sal", Desc: false}}},
+	}
+
+	env := ExecEnv{windowRows: allRows, windowPartitions: newWindowPartitionCache()}
+	sawDifferentOrder := false
+	for i, row := range allRows {
+		env.windowIndex = i
+		descRows, _ := resolveWindowPartition(env, desc, allRows, row)
+		ascRows, _ := resolveWindowPartition(env, asc, allRows, row)
+		if !idsEqual(rowIDs(descRows), rowIDs(ascRows)) {
+			sawDifferentOrder = true
+		}
+	}
+	if !sawDifferentOrder {
+		t.Fatal("fixture did not produce a distinguishable ascending/descending partition")
+	}
+	if got := len(env.windowPartitions.entries); got != 6 {
+		t.Errorf("expected 6 cache entries (2 shapes x 3 partitions), got %d", got)
 	}
 }

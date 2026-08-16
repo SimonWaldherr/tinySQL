@@ -27,14 +27,26 @@ func BenchmarkWindowRowNumberManyPartitions(b *testing.B) {
 	runBench(b, db, `SELECT id, grp, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val DESC) AS rn FROM t`)
 }
 
-// BenchmarkWindowLagLeadManyPartitions covers the two-window-function-calls-
-// per-row case (LAG and LEAD in the same SELECT list, same OVER clause
-// shape): each is its own *FuncCall cache entry, so this also demonstrates
-// that memoizing per call site doesn't multiply the partition-build cost by
-// the number of window functions in the query beyond the expected 2x.
+// BenchmarkWindowLagLeadManyPartitions covers two window functions in the
+// same SELECT list with the same PARTITION BY/ORDER BY shape. They should
+// share each partition's filter+sort work, while keeping separate per-row
+// LAG/LEAD evaluation.
 func BenchmarkWindowLagLeadManyPartitions(b *testing.B) {
 	db := setupPerfTable(b, 5000)
 	runBench(b, db, `SELECT id, grp,
+		LAG(val) OVER (PARTITION BY grp ORDER BY val DESC) AS lg,
+		LEAD(val) OVER (PARTITION BY grp ORDER BY val DESC) AS ld
+		FROM t`)
+}
+
+// BenchmarkWindowThreeSharedOverManyPartitions extends the shared-shape case
+// to a positional, a backward-looking, and a forward-looking window function.
+// It catches regressions that only become visible once more than two SELECT
+// expressions reference the same partition ordering.
+func BenchmarkWindowThreeSharedOverManyPartitions(b *testing.B) {
+	db := setupPerfTable(b, 5000)
+	runBench(b, db, `SELECT id, grp,
+		ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val DESC) AS rn,
 		LAG(val) OVER (PARTITION BY grp ORDER BY val DESC) AS lg,
 		LEAD(val) OVER (PARTITION BY grp ORDER BY val DESC) AS ld
 		FROM t`)

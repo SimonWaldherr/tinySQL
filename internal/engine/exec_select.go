@@ -3,6 +3,7 @@
 package engine
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 
@@ -39,6 +40,21 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 		}
 	}
 
+	// ORDER BY/LIMIT/OFFSET after a set operation belong to the whole compound
+	// result, not to its left-most term.  Keep the term's projection free of
+	// those global clauses: besides avoiding a premature sort/page, this
+	// prevents a non-projected source sort key from leaking into the maps that
+	// are later compared positionally by UNION/EXCEPT/INTERSECT.
+	compound := s.Union != nil
+	term := s
+	if compound {
+		termCopy := *s
+		termCopy.OrderBy = nil
+		termCopy.Limit = nil
+		termCopy.Offset = nil
+		term = &termCopy
+	}
+
 	// FROM (Tabelle, CTE oder Subselect) - now optional
 	leftRows, err := resolveFromClause(cteEnv, cteEnv, s)
 	if err != nil {
@@ -60,19 +76,19 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 	}
 
 	// GROUP/HAVING
-	outRows, outCols, err := processGroupByHaving(cteEnv, s, filtered)
+	outRows, outCols, err := processGroupByHaving(cteEnv, term, filtered)
 	if err != nil {
 		return nil, err
 	}
 
 	// DISTINCT
-	if s.Distinct {
+	if term.Distinct {
 		// If DISTINCT ON (...) was used, apply DISTINCT ON semantics: keep first
 		// row per distinct-on key. The ORDER BY clause controls which row is
 		// considered "first"; so apply ORDER BY first if present.
-		if len(s.DistinctOn) > 0 {
+		if len(term.DistinctOn) > 0 {
 			var err error
-			outRows, err = applyDistinctOn(cteEnv, s, outRows)
+			outRows, err = applyDistinctOn(cteEnv, term, outRows)
 			if err != nil {
 				return nil, err
 			}
@@ -81,21 +97,26 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 		}
 	}
 
-	// ORDER BY
-	if len(s.OrderBy) > 0 {
-		outRows = applySortOrderWithLimit(s.OrderBy, outRows, s.Limit, s.Offset)
-	}
-
-	// OFFSET/LIMIT (applied before UNION to each individual SELECT)
-	baseRows := applyOffsetLimit(s, outRows)
-
-	// Handle UNION operations
-	resultRows := baseRows
+	// A simple SELECT applies its tail directly.  For a compound SELECT the
+	// parser attaches that tail to the outer Select, so defer it until every
+	// right-hand term has been combined below.
+	resultRows := outRows
 	resultCols := outCols
-
-	if s.Union != nil {
+	var orderAliases map[string]string
+	if compound && len(s.OrderBy) > 0 {
+		orderAliases = make(map[string]string, len(resultCols))
+		for _, col := range resultCols {
+			orderAliases[strings.ToLower(col)] = col
+		}
+	}
+	if !compound {
+		if len(s.OrderBy) > 0 {
+			resultRows = applySortOrderWithLimit(s.OrderBy, resultRows, s.Limit, s.Offset)
+		}
+		resultRows = applyOffsetLimit(s, resultRows)
+	} else {
 		var err error
-		resultRows, resultCols, err = processUnionClauses(cteEnv, s.Union, resultRows, resultCols)
+		resultRows, resultCols, err = processUnionClauses(cteEnv, s.Union, resultRows, resultCols, orderAliases)
 		if err != nil {
 			return nil, err
 		}
@@ -103,8 +124,41 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 
 	if len(resultCols) == 0 {
 		resultCols = columnsFromRows(resultRows)
+		if orderAliases != nil {
+			for _, col := range resultCols {
+				if _, exists := orderAliases[strings.ToLower(col)]; !exists {
+					orderAliases[strings.ToLower(col)] = col
+				}
+			}
+		}
+	}
+	if compound {
+		if len(s.OrderBy) > 0 {
+			compoundOrderBy, err := resolveCompoundOrderBy(s.OrderBy, orderAliases)
+			if err != nil {
+				return nil, err
+			}
+			resultRows = applySortOrderWithLimit(compoundOrderBy, resultRows, s.Limit, s.Offset)
+		}
+		resultRows = applyOffsetLimit(s, resultRows)
 	}
 	return &ResultSet{Cols: resultCols, Rows: resultRows}, nil
+}
+
+// resolveCompoundOrderBy maps every trailing ORDER BY alias to the canonical
+// left-most result-column name.  SQLite permits an alias defined by a later
+// term as long as it identifies the corresponding result position.
+func resolveCompoundOrderBy(orderBy []OrderItem, aliases map[string]string) ([]OrderItem, error) {
+	resolved := make([]OrderItem, len(orderBy))
+	for i, item := range orderBy {
+		canonical, found := aliases[strings.ToLower(item.Col)]
+		if !found {
+			return nil, fmt.Errorf("ORDER BY: no such column %q", item.Col)
+		}
+		resolved[i] = item
+		resolved[i].Col = canonical
+	}
+	return resolved, nil
 }
 
 // selectReferencesCTE reports whether a SELECT needs rows bound in the active

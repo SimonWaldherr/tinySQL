@@ -14,12 +14,12 @@ import (
 )
 
 type Place struct {
-	ID      int     `db:"id,pk"`
-	Name    string  `db:"name"`
-	Country string  `db:"country"`
-	Lat     float64 `db:"lat"`
-	Lon     float64 `db:"lon"`
-	Active  bool    `db:"active"`
+	ID      int     `db:"id,pk" json:"id"`
+	Name    string  `db:"name" json:"name"`
+	Country string  `db:"country" json:"country"`
+	Lat     float64 `db:"lat" json:"lat"`
+	Lon     float64 `db:"lon" json:"lon"`
+	Active  bool    `db:"active" json:"active"`
 }
 
 func (Place) TableName() string { return "places" }
@@ -27,7 +27,16 @@ func (Place) TableName() string { return "places" }
 func main() {
 	format := flag.String("format", "text", "Output format: text or json")
 	includeInactive := flag.Bool("include-inactive", false, "Include inactive places in the country result")
+	web := flag.Bool("web", false, "Serve the persistent places directory in a browser")
+	addr := flag.String("addr", ":8088", "HTTP listen address when -web is set")
+	snapshot := flag.String("snapshot", "places.snapshot", "Snapshot path when -web is set (empty for in-memory)")
 	flag.Parse()
+	if *web {
+		if err := servePlaces(context.Background(), *addr, *snapshot); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if err := run(context.Background(), os.Stdout, *format, *includeInactive); err != nil {
 		log.Fatal(err)
 	}

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 )
@@ -35,6 +37,20 @@ func TestRunCreatesAndReusesSnapshot(t *testing.T) {
 	}
 	if payload.Source != "snapshot" || len(payload.Results) != 2 {
 		t.Fatalf("unexpected reused snapshot output: %#v", payload)
+	}
+}
+
+func TestWebSearchReturnsSnapshotPOIs(t *testing.T) {
+	db, _, err := openPOIDatabase(context.Background(), config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &offlineApp{db: db, source: "in-memory dataset", readOnly: true}
+	req := httptest.NewRequest(http.MethodGet, "/api/search?q=museum", nil)
+	res := httptest.NewRecorder()
+	a.search(res, req)
+	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte("Deutsches Museum")) {
+		t.Fatalf("search response: %d %s", res.Code, res.Body.String())
 	}
 }
 

@@ -30,24 +30,30 @@ limitations, start with the [root README](../README.md).
 | Desktop SQL application | [`studio`](./studio/README.md) | Wails desktop app |
 | MCP server for AI hosts | [`tinysql-mcp-server`](./tinysql-mcp-server/README.md) | stdio Model Context Protocol server |
 
-## Demos and reference applications
+## Reference and local applications
 
 | Goal | Command | Notes |
 | --- | --- | --- |
-| Catalog and scheduler APIs | [`catalog_demo`](./catalog_demo/README.md) | Tables, views, functions, jobs |
-| Search a support knowledge base | [`supportdesk`](./supportdesk/README.md) | Driver, transactions, trigger, view, CTE, full-text search |
-| Local read-only POI snapshot | [`offline_demo`](./offline_demo/README.md) | No service or network required |
+| Inspect catalog and scheduled jobs | [`catalog_demo`](./catalog_demo/README.md) | Console demo or browser dashboard for tables, views, functions, and jobs |
+| Search a support knowledge base | [`supportdesk`](./supportdesk/README.md) | Console demo or persistent browser help desk with FTS and tickets |
+| Explore a read-only POI snapshot | [`offline_demo`](./offline_demo/README.md) | CLI snapshot search or browser explorer; no map tiles required |
 | Evaluate local RAG retrieval | [`ragdemo`](./ragdemo/README.md) | Requires a local embedding server |
-| Explore tinyORM | [`tinyorm_demo`](./tinyorm_demo/README.md) | Migrations and named parameters |
+| Explore tinyORM | [`tinyorm_demo`](./tinyorm_demo/README.md) | CLI demo or persistent places directory with migrations and named parameters |
 
 ## Practical local applications
 
 | Goal | Command | Notes |
 | --- | --- | --- |
-| Track zone entry and exit events | [`geofence-service`](./geofence-service/README.md) | GeoJSON zones, GPS API, event UI |
-| Search a local document directory | [`docsearch`](./docsearch/README.md) | Persistent full-text index and browser UI |
-| Validate CSV before importing it | [`import-validate`](./import-validate/README.md) | Rules, error history, explicit commit |
-| Record work and break time | [`worklog`](./worklog/README.md) | Timeout checkout, reports, CSV export |
+| Track zone entry and exit events | [`geofence-service`](./geofence-service/README.md) | GeoJSON zones, browser UI, and position-ingest API (`:8091`) |
+| Search a local document directory | [`docsearch`](./docsearch/README.md) | Persistent full-text index and browser UI (`:8092`) |
+| Validate CSV before importing it | [`import-validate`](./import-validate/README.md) | Rules, error history, and explicit commit (`:8093`) |
+| Record work and break time | [`worklog`](./worklog/README.md) | Timeout checkout, reports, and CSV export (`:8094`) |
+
+The application-specific browser modes in the two sections above expose small
+JSON APIs for local integrations. They intentionally do not implement login,
+authorization, or TLS. Bind them to loopback with `-addr 127.0.0.1:<port>` for
+local use, or put them behind suitable authentication and TLS before exposing
+them to a network.
 
 ## Browser and WebAssembly
 

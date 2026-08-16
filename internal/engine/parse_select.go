@@ -136,6 +136,34 @@ func (p *Parser) parseSelect() (*Select, error) {
 		return nil, err
 	}
 	defer p.exitRecursion()
+
+	// A compound SELECT owns its trailing ORDER BY/LIMIT/OFFSET clause.  Parse
+	// all of its SELECT terms before that tail so an ORDER BY after
+	// "... UNION SELECT ..." is attached to the compound result, not to the
+	// final right-hand term.  Besides matching SQL's grammar, this keeps each
+	// term independent and leaves parseUnionClause with a flat, left-to-right
+	// chain rather than recursively nesting the rest of the compound query in
+	// the first right-hand term.
+	sel, err := p.parseSelectTerm()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.parseUnionClause(sel); err != nil {
+		return nil, err
+	}
+	if err := p.parseOrderByClause(sel); err != nil {
+		return nil, err
+	}
+	if err := p.parseLimitOffset(sel); err != nil {
+		return nil, err
+	}
+	return sel, nil
+}
+
+// parseSelectTerm parses one SELECT core within a compound SELECT.  It
+// deliberately stops before UNION/EXCEPT/INTERSECT and the compound tail;
+// parseSelect coordinates those clauses around one or more terms.
+func (p *Parser) parseSelectTerm() (*Select, error) {
 	if err := p.expectKeyword("SELECT"); err != nil {
 		return nil, err
 	}
@@ -184,22 +212,6 @@ func (p *Parser) parseSelect() (*Select, error) {
 	if err := p.parseHavingClause(sel); err != nil {
 		return nil, err
 	}
-
-	// Parse ORDER BY
-	if err := p.parseOrderByClause(sel); err != nil {
-		return nil, err
-	}
-
-	// Parse LIMIT and OFFSET
-	if err := p.parseLimitOffset(sel); err != nil {
-		return nil, err
-	}
-
-	// Parse UNION clauses
-	if err := p.parseUnionClause(sel); err != nil {
-		return nil, err
-	}
-
 	return sel, nil
 }
 
@@ -714,8 +726,9 @@ func (p *Parser) parseUnionClause(sel *Select) error {
 			p.next()
 		}
 
-		// Parse the right-hand SELECT
-		rightSelect, err := p.parseSelect()
+		// Parse only a single SELECT term.  The enclosing parseSelect call owns
+		// the remaining set-operation chain and the one trailing compound tail.
+		rightSelect, err := p.parseSelectTerm()
 		if err != nil {
 			return err
 		}

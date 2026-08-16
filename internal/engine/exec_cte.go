@@ -134,6 +134,12 @@ func evalRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
 
 	anchor := *cte.Select
 	anchor.Union = nil
+	// A recursive CTE's ORDER BY/LIMIT/OFFSET belongs to the complete compound
+	// result. Do not let the anchor consume it while the recursive member sees
+	// no tail at all.
+	anchor.OrderBy = nil
+	anchor.Limit = nil
+	anchor.Offset = nil
 
 	recursiveSel := union.Right
 	if recursiveSel == nil {
@@ -153,18 +159,29 @@ func evalRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
 	}
 
 	seen := make(map[string]bool)
+	var signatureColumns []string
+	var signatureBuf []byte
+	if union.Type == UnionDistinct {
+		signatureColumns = setOperationColumnKeys(accRs.Cols)
+		signatureBuf = make([]byte, 0, 64)
+	}
 	accRows := make([]Row, 0, len(accRs.Rows))
 	frontier := make([]Row, 0, len(accRs.Rows))
 	for _, row := range accRs.Rows {
 		if union.Type == UnionDistinct {
-			sig := rowSignature(row, accRs.Cols)
-			if seen[sig] {
+			signatureBuf = appendSetOperationSignature(signatureBuf[:0], row, signatureColumns)
+			if seen[string(signatureBuf)] {
 				continue
 			}
-			seen[sig] = true
+			seen[string(signatureBuf)] = true
 		}
 		accRows = append(accRows, row)
 		frontier = append(frontier, row)
+	}
+	maxRows := recursiveCTEWorkLimit(cte.Select)
+	if maxRows >= 0 && len(accRows) >= maxRows {
+		accRows = accRows[:maxRows]
+		frontier = nil
 	}
 
 	iterLimit := 1024
@@ -187,8 +204,22 @@ func evalRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
 		}
 		alignedRows := alignRecursiveCTERows(accRs, nextRs, cte.Name)
 		if union.Type == UnionAll {
+			if maxRows >= 0 {
+				remaining := maxRows - len(accRows)
+				if remaining <= 0 {
+					frontier = nil
+					break
+				}
+				if len(alignedRows) > remaining {
+					alignedRows = alignedRows[:remaining]
+				}
+			}
 			accRows = append(accRows, alignedRows...)
 			frontier = alignedRows
+			if maxRows >= 0 && len(accRows) >= maxRows {
+				frontier = nil
+				break
+			}
 			if len(accRows) > recursiveCTEMaxRows {
 				return nil, fmt.Errorf("recursive CTE %s exceeded row limit %d", cte.Name, recursiveCTEMaxRows)
 			}
@@ -197,13 +228,17 @@ func evalRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
 
 		frontier = frontier[:0]
 		for _, row := range alignedRows {
-			sig := rowSignature(row, accRs.Cols)
-			if seen[sig] {
+			signatureBuf = appendSetOperationSignature(signatureBuf[:0], row, signatureColumns)
+			if seen[string(signatureBuf)] {
 				continue
 			}
-			seen[sig] = true
+			seen[string(signatureBuf)] = true
 			accRows = append(accRows, row)
 			frontier = append(frontier, row)
+			if maxRows >= 0 && len(accRows) >= maxRows {
+				frontier = nil
+				break
+			}
 		}
 		if len(accRows) > recursiveCTEMaxRows {
 			return nil, fmt.Errorf("recursive CTE %s exceeded row limit %d", cte.Name, recursiveCTEMaxRows)
@@ -212,5 +247,35 @@ func evalRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
 	if len(frontier) > 0 {
 		return nil, fmt.Errorf("recursive CTE %s exceeded iteration limit %d", cte.Name, iterLimit)
 	}
+	accRows = applyRecursiveCTECompoundTail(cte.Select, accRows)
 	return &ResultSet{Cols: accRs.Cols, Rows: accRows}, nil
+}
+
+// recursiveCTEWorkLimit returns the maximum number of rows the recursive
+// working table needs before its compound LIMIT/OFFSET tail is finalised. A
+// bounded CTE must stop producing rows at that point; merely trimming after
+// recursion would still overflow the iteration cap for an otherwise infinite
+// `... UNION ALL ... LIMIT n` query.
+func recursiveCTEWorkLimit(s *Select) int {
+	if s.Limit == nil || *s.Limit < 0 {
+		return -1
+	}
+	if *s.Limit == 0 {
+		return 0
+	}
+	offset := 0
+	if s.Offset != nil && *s.Offset > 0 {
+		offset = *s.Offset
+	}
+	if offset > int(^uint(0)>>1)-*s.Limit {
+		return -1
+	}
+	return offset + *s.Limit
+}
+
+func applyRecursiveCTECompoundTail(s *Select, rows []Row) []Row {
+	if len(s.OrderBy) > 0 {
+		rows = applySortOrderWithLimit(s.OrderBy, rows, s.Limit, s.Offset)
+	}
+	return applyOffsetLimit(s, rows)
 }

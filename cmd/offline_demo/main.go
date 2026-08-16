@@ -8,10 +8,14 @@ package main
 
 import (
 	"context"
+	"embed"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"html/template"
 	"io"
+	"log"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -25,6 +29,8 @@ type config struct {
 	json     bool
 	rebuild  bool
 	readOnly bool
+	web      bool
+	addr     string
 }
 
 type poi struct {
@@ -43,14 +49,58 @@ func main() {
 	flag.BoolVar(&cfg.json, "json", false, "Write stable JSON instead of a text table")
 	flag.BoolVar(&cfg.rebuild, "rebuild", false, "Ignore an existing snapshot and rebuild the sample dataset")
 	flag.BoolVar(&cfg.readOnly, "read-only", true, "Reject writes after loading or creating the dataset")
+	flag.BoolVar(&cfg.web, "web", false, "Serve the local POI explorer in a browser")
+	flag.StringVar(&cfg.addr, "addr", ":8086", "HTTP listen address when -web is set")
 	flag.Parse()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
+	if cfg.web {
+		if err := serveWeb(ctx, cfg); err != nil {
+			fmt.Fprintln(os.Stderr, "offline_demo:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(ctx, cfg, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "offline_demo:", err)
 		os.Exit(1)
 	}
+}
+
+//go:embed templates/*.html static/*
+var webAssets embed.FS
+
+type offlineApp struct {
+	db       *tinysql.DB
+	source   string
+	readOnly bool
+	tpl      *template.Template
+}
+
+func serveWeb(ctx context.Context, cfg config) error {
+	db, source, err := openPOIDatabase(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	if cfg.readOnly {
+		db.SetReadOnly(true)
+	}
+	tpl, err := template.ParseFS(webAssets, "templates/*.html")
+	if err != nil {
+		return err
+	}
+	a := &offlineApp{db: db, source: source, readOnly: db.IsReadOnly(), tpl: tpl}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", a.index)
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		writeOfflineJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	})
+	mux.HandleFunc("GET /api/status", a.status)
+	mux.HandleFunc("GET /api/search", a.search)
+	mux.Handle("GET /static/", http.FileServer(http.FS(webAssets)))
+	log.Printf("offline POI explorer listening on %s (%s, read-only=%t)", cfg.addr, source, db.IsReadOnly())
+	return http.ListenAndServe(cfg.addr, offlineSecurityHeaders(mux))
 }
 
 func run(ctx context.Context, cfg config, out io.Writer) error {

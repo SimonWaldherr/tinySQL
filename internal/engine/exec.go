@@ -94,11 +94,11 @@ type ExecEnv struct {
 	ctes        map[string]*ResultSet // For CTE support
 	windowRows  []Row                 // All rows for window function context
 	windowIndex int                   // Current row index in window context
-	// windowPartitions memoizes, per window-function call site and PARTITION
-	// BY key, the partitioned+ordered row set built from windowRows -- see
-	// windowPartitionCache in eval_window.go for why. Initialized alongside
-	// windowRows (exec_group.go) whenever a query uses window functions;
-	// nil otherwise.
+	// windowPartitions memoizes, per structural PARTITION BY/ORDER BY shape
+	// and PARTITION BY key, the partitioned+ordered row set built from
+	// windowRows -- see windowPartitionCache in eval_window.go for why.
+	// Initialized alongside windowRows (exec_group.go) whenever a query uses
+	// window functions; nil otherwise.
 	windowPartitions *windowPartitionCache
 	// subqueryCache memoizes the result of executing a WHERE/SELECT-list
 	// EXISTS/scalar/IN subquery's SELECT, keyed by the owning AST node, so a

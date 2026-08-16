@@ -13,8 +13,10 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -57,6 +59,16 @@ func formatFirstRow(rs *tinysql.ResultSet) string {
 }
 
 func main() {
+	web := flag.Bool("web", false, "Serve a scheduler dashboard in a browser")
+	addr := flag.String("addr", ":8089", "HTTP listen address when -web is set")
+	flag.Parse()
+	if *web {
+		if err := serveCatalogDashboard(*addr); err != nil {
+			fmt.Fprintln(os.Stderr, "catalog_demo:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	fmt.Println("=== tinySQL Catalog & Scheduler Demo ===")
 	fmt.Println()
 

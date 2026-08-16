@@ -130,6 +130,62 @@ func TestSQLiteDifferentialSelects(t *testing.T) {
 			args: []any{"paid"},
 		},
 		{
+			name: "union-all-positional-aliases",
+			sql: `SELECT id AS value FROM customers WHERE id <= 2
+				UNION ALL
+				SELECT id AS ignored_value FROM orders WHERE id IN (10, 11)
+				ORDER BY value`,
+		},
+		{
+			name: "union-distinct-positional-aliases",
+			sql: `SELECT customer_id AS value FROM orders WHERE id IN (10, 11)
+				UNION
+				SELECT id AS ignored_value FROM customers WHERE id IN (1, 2)
+				ORDER BY value`,
+		},
+		{
+			name: "except-positional-aliases",
+			sql: `SELECT id AS value FROM customers WHERE id <= 4
+				EXCEPT
+				SELECT customer_id AS ignored_value FROM orders WHERE customer_id IS NOT NULL
+				ORDER BY value`,
+		},
+		{
+			name: "intersect-positional-aliases",
+			sql: `SELECT id AS value FROM customers WHERE id <= 4
+				INTERSECT
+				SELECT customer_id AS ignored_value FROM orders WHERE customer_id IS NOT NULL
+				ORDER BY value`,
+		},
+		{
+			name: "compound-order-limit-offset",
+			sql: `SELECT id AS value FROM customers WHERE id <= 3
+				UNION ALL
+				SELECT id AS ignored_value FROM orders WHERE id IN (10, 11)
+				ORDER BY ignored_value DESC
+				LIMIT 3 OFFSET 1`,
+		},
+		{
+			name: "except-removes-left-duplicates",
+			sql: `SELECT 1 AS value
+				UNION ALL SELECT 1 AS ignored_value
+				EXCEPT SELECT 2 AS other_value`,
+		},
+		{
+			name: "set-operations-match-integer-and-real",
+			sql: `SELECT 1 AS value
+				UNION SELECT 1.0 AS ignored_value`,
+		},
+		{
+			name: "recursive-cte-compound-limit",
+			sql: `WITH RECURSIVE cnt AS (
+					SELECT 1 AS n
+					UNION ALL SELECT n + 1 AS n FROM cnt
+					LIMIT 3
+				)
+				SELECT n AS value FROM cnt ORDER BY value`,
+		},
+		{
 			name: "single-row-in-subquery",
 			sql: `SELECT id AS id, name AS name
 				FROM customers
@@ -143,6 +199,17 @@ func TestSQLiteDifferentialSelects(t *testing.T) {
 				ROW_NUMBER() OVER (PARTITION BY status ORDER BY id) AS row_number
 				FROM orders
 				ORDER BY status, id`,
+		},
+		{
+			name: "window-last-value-default-peer-frame",
+			sql: `SELECT id AS id, status AS status,
+				LAST_VALUE(id) OVER (PARTITION BY status ORDER BY status) AS default_last,
+				LAST_VALUE(id) OVER (
+					PARTITION BY status ORDER BY status
+					ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+				) AS rows_last
+				FROM orders
+				ORDER BY id`,
 		},
 		{
 			name: "blob-binding",

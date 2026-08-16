@@ -78,11 +78,16 @@ cmd/
 |-- migrate/             Import/export and database transfer pipeline
 |-- fsql/                Filesystem-as-SQL tool
 |-- demo/                Lightweight demo program
-|-- offline_demo/        Offline-oriented demo
+|-- catalog_demo/        Catalog and scheduler console demo plus web dashboard
+|-- docsearch/           Local document search and persistent full-text index
+|-- geofence-service/    GeoJSON geofencing service with browser frontend
+|-- import-validate/     CSV validation and explicit import workflow
+|-- offline_demo/        Read-only POI snapshot CLI and browser explorer
 |-- ragdemo/             Retrieval-augmented generation demo
-|-- tinyorm_demo/        ORM helper demo
+|-- supportdesk/         Support knowledge base and ticketing example
+|-- tinyorm_demo/        tinyORM CLI demo and persistent places directory
+|-- worklog/             Local work-time tracker with reports and CSV export
 |-- debug/               SQL diagnostic helper
-|-- catalog_demo/        Catalog and job scheduler demo
 `-- tinysql-mcp-server/  MCP server for tinySQL
 ```
 
