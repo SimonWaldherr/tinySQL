@@ -632,14 +632,8 @@ func evalJoinRawLike(plan *simpleJoinPlan, left, right []any, ex *LikeExpr) (any
 	if val == nil || patVal == nil {
 		return false, nil
 	}
-	str, ok := val.(string)
-	if !ok {
-		str = fmt.Sprintf("%v", val)
-	}
-	pattern, ok := patVal.(string)
-	if !ok {
-		pattern = fmt.Sprintf("%v", patVal)
-	}
+	str := valueText(val)
+	pattern := valueText(patVal)
 	matched, err := evalJoinRawLikeMatch(plan, left, right, ex, str, pattern)
 	if err != nil {
 		return nil, err
@@ -688,8 +682,8 @@ func evalJoinRawRegexp(plan *simpleJoinPlan, left, right []any, ex *RegexpExpr) 
 	if val == nil || patVal == nil {
 		return false, nil
 	}
-	str := fmt.Sprintf("%v", val)
-	pat := fmt.Sprintf("%v", patVal)
+	str := valueText(val)
+	pat := valueText(patVal)
 	if ex.SimilarTo {
 		pat = similarToRegexp(pat)
 	}

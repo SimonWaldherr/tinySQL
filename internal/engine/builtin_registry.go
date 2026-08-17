@@ -150,9 +150,9 @@ func evalFuncCall(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return evalWindowFunction(env, ex, row)
 	}
 
-	if ex.handler != nil {
+	if h := boundFuncHandler(ex); h != nil {
 		// Resolved once at parse time; skips the registry lookup per call.
-		return ex.handler(env, ex, row)
+		return h(env, ex, row)
 	}
 	builtinFunctions := getAllFunctions()
 	if handler, ok := builtinFunctions[ex.Name]; ok {
@@ -167,12 +167,31 @@ func evalFuncCall(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 // bindFuncHandler resolves a parsed call's registry handler once. Parse-time
 // resolution keeps evaluation free of both the map lookup and any lazy-write
 // race — the field is only ever written here, before the statement is shared.
-// Unknown names stay nil and produce their error at evaluation, as before.
+// Unknown names stay unresolved and produce their error at evaluation, as
+// before. See FuncCall.handlerIdx for why this is an index, not a func value.
 func bindFuncHandler(fc *FuncCall) *FuncCall {
-	if h, ok := getAllFunctions()[fc.Name]; ok {
-		fc.handler = h
+	if idx, ok := funcHandlerIndex()[fc.Name]; ok {
+		fc.handlerIdx = idx
 	}
 	return fc
+}
+
+// boundFuncHandler returns the handler bound at parse time, or nil when the
+// call was not bound (hand-constructed node, or an unknown function name).
+//
+// It reads allFuncTable directly rather than through funcHandlerTable(),
+// deliberately: this runs once per function call per row, and going through
+// the accessor would re-enter getAllFunctions() — a sync.Once check — on
+// every evaluation. A non-zero handlerIdx is itself proof the table is built,
+// because only bindFuncHandler sets it and it obtains the index from
+// funcHandlerIndex(), which completes the Once first. The table write
+// therefore happens-before the handlerIdx write, which happens-before this
+// node becoming reachable by any reader.
+func boundFuncHandler(ex *FuncCall) funcHandler {
+	if ex.handlerIdx <= 0 {
+		return nil
+	}
+	return allFuncTable[ex.handlerIdx-1]
 }
 
 // Wrapper functions to match funcHandler signature

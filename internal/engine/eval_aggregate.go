@@ -135,7 +135,7 @@ func evalAggregateCount(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 			}
 			if v != nil {
 				// Convert to string for deduplication
-				key := fmt.Sprintf("%v", v)
+				key := valueText(v)
 				seen[key] = true
 			}
 		}

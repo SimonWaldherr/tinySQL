@@ -32,6 +32,12 @@ import (
 var (
 	allFunctions     map[string]funcHandler
 	allFunctionsOnce sync.Once
+	// allFuncTable holds the same handlers as allFunctions, addressed by the
+	// 1-based index allFuncIndex maps each name to. Parsed FuncCall nodes
+	// store that index so evaluation needs no map lookup — see
+	// FuncCall.handlerIdx for why an index rather than the func value.
+	allFuncTable []funcHandler
+	allFuncIndex map[string]int32
 )
 
 func getAllFunctions() map[string]funcHandler {
@@ -71,8 +77,26 @@ func getAllFunctions() map[string]funcHandler {
 			m[k] = v
 		}
 		allFunctions = m
+		allFuncTable = make([]funcHandler, 0, len(m))
+		allFuncIndex = make(map[string]int32, len(m))
+		for name, h := range m {
+			allFuncTable = append(allFuncTable, h)
+			allFuncIndex[name] = int32(len(allFuncTable))
+		}
 	})
 	return allFunctions
+}
+
+// funcHandlerTable and funcHandlerIndex expose the flattened registry, both
+// initialized by the same sync.Once as allFunctions.
+func funcHandlerTable() []funcHandler {
+	getAllFunctions()
+	return allFuncTable
+}
+
+func funcHandlerIndex() map[string]int32 {
+	getAllFunctions()
+	return allFuncIndex
 }
 
 // Row represents a single result row mapped by lower-cased column name.

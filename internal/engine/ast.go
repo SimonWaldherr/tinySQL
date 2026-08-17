@@ -44,12 +44,23 @@ type (
 		Star     bool
 		Distinct bool        // For COUNT(DISTINCT col)
 		Over     *OverClause // For window functions
-		// handler is the registry entry for Name, resolved once at parse time
-		// (bindFuncHandler) so per-row evaluation skips the registry map
-		// lookup. Nil for hand-constructed nodes, which fall back to the
-		// lookup in evalFuncCall. Never written after parse: sharing a parsed
-		// statement across goroutines stays race-free.
-		handler funcHandler
+		// handlerIdx is 1 + the position of Name's handler in
+		// funcHandlerTable, resolved once at parse time (bindFuncHandler) so
+		// per-row evaluation skips the registry map lookup. Zero means
+		// unresolved — hand-constructed nodes and unknown names — and falls
+		// back to the lookup in evalFuncCall.
+		//
+		// It is an index, not a funcHandler, on purpose: FuncCall nodes are
+		// compared with reflect.DeepEqual (orderByProjectionName resolves an
+		// ORDER BY term against the SELECT list that way), and DeepEqual
+		// reports two func values unequal unless both are nil. A func field
+		// here would therefore make every ORDER BY COUNT(*) stop matching its
+		// projection and fail to parse. Equal names get equal indexes, so
+		// DeepEqual keeps working.
+		//
+		// Never written after parse: sharing a parsed statement across
+		// goroutines stays race-free.
+		handlerIdx int32
 	}
 	// InExpr represents "expr IN (val1, val2, ...)"
 	InExpr struct {

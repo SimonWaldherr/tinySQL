@@ -71,7 +71,7 @@ func coerceToTypeAllowNull(v any, t storage.ColType) (any, error) {
 		if s, ok := v.(string); ok {
 			return s, nil
 		}
-		return fmt.Sprintf("%v", v), nil
+		return valueText(v), nil
 	case storage.BoolType:
 		return coerceToBool(v)
 	case storage.JsonType:
@@ -109,7 +109,7 @@ func coerceColumnValue(v any, col storage.Column) (any, error) {
 		if s, ok := v.(string); ok {
 			return s, nil
 		}
-		return fmt.Sprintf("%v", v), nil
+		return valueText(v), nil
 	case storage.AffinityNumeric:
 		return coerceSQLiteNumeric(v)
 	case storage.AffinityBlob:

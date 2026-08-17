@@ -205,11 +205,11 @@ func evalRawFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, erro
 		args[i] = &lits[i]
 	}
 	sc.call = FuncCall{Name: ex.Name, Args: args, Star: ex.Star, Distinct: ex.Distinct}
-	if ex.handler != nil {
+	if h := boundFuncHandler(ex); h != nil {
 		// Handler resolved at parse time; call it directly instead of going
 		// back through evalFuncCall's registry dispatch. ex.Over was already
 		// rejected above, so this cannot bypass the window-function check.
-		return ex.handler(ExecEnv{}, &sc.call, rawEmptyRow)
+		return h(ExecEnv{}, &sc.call, rawEmptyRow)
 	}
 	return evalFuncCall(ExecEnv{}, &sc.call, rawEmptyRow)
 }

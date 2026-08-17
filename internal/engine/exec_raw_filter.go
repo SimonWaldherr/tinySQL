@@ -509,14 +509,10 @@ func buildRawFilterRegexp(colIndex map[string]int, ex *RegexpExpr) func([]any) (
 	}
 	negate := ex.Negate
 	return func(raw []any) (bool, error) {
-		s, ok := raw[colIdx].(string)
-		if !ok {
-			if raw[colIdx] == nil {
-				return false, nil
-			}
-			s = fmt.Sprintf("%v", raw[colIdx])
+		if raw[colIdx] == nil {
+			return false, nil
 		}
-		matched := re.MatchString(s)
+		matched := re.MatchString(valueText(raw[colIdx]))
 		if negate {
 			return !matched, nil
 		}

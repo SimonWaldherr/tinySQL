@@ -149,7 +149,7 @@ func parseFTSSnippetOpts(env ExecEnv, ex *FuncCall, row Row) (ftsSnippetOpts, er
 		if len(ex.Args) > d.idx {
 			v, err := evalExpr(env, ex.Args[d.idx], row)
 			if err == nil && v != nil {
-				d.apply(fmt.Sprintf("%v", v))
+				d.apply(valueText(v))
 			}
 		}
 	}
@@ -1217,25 +1217,25 @@ func ftsWriteValue(sb *strings.Builder, v any) {
 			sb.WriteString("false")
 		}
 	default:
-		// float64 deliberately stays here: %v uses %g-style shortest
-		// representation with rules that strconv.FormatFloat only reproduces
-		// with care, and getting it wrong would silently change which tokens a
-		// numeric column contributes.
-		fmt.Fprintf(sb, "%v", v)
+		// float64 used to stay on the fmt path here, out of caution that %v's
+		// shortest-'g' rules were hard to reproduce with strconv — getting it
+		// wrong would silently change which tokens a numeric column
+		// contributes. valueText (coerce.go) takes that fast path, and
+		// TestValueTextMatchesSprintfFloatSweep pins it against fmt across
+		// exponent thresholds, subnormals, non-finite values and ~30k
+		// adjacent representable floats, so routing float64 through it is
+		// safe. Remaining types still reach fmt inside valueText.
+		sb.WriteString(valueText(v))
 	}
 }
 
-// ftsValueToString formats v exactly as fmt.Sprintf("%v", v) would, but
-// through ftsWriteValue's type-switch fast path for the scalar kinds
-// (string, int, int64, bool) that dominate real column values passed to
-// FTS_MATCH/FTS_RANK/FTS_SNIPPET/CONTAINS_*, all of which run per row.
+// ftsValueToString formats v exactly as fmt.Sprintf("%v", v) would, for the
+// column values passed to FTS_MATCH/FTS_RANK/FTS_SNIPPET/CONTAINS_*, all of
+// which run per row. It is valueText — kept as a named alias because callers
+// read as FTS code, and TestFTSValueToStringMatchesValueText pins the two
+// (and ftsWriteValue) to the same output.
 func ftsValueToString(v any) string {
-	if s, ok := v.(string); ok {
-		return s
-	}
-	var sb strings.Builder
-	ftsWriteValue(&sb, v)
-	return sb.String()
+	return valueText(v)
 }
 
 // getFTSDocCache returns the tokenized documents (plus corpus-wide BM25

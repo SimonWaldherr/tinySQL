@@ -165,7 +165,7 @@ func compare(a, b any) (int, error) {
 	case []byte:
 		return compareBytes(ax, b)
 	}
-	if fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b) {
+	if valueText(a) == valueText(b) {
 		return 0, nil
 	}
 	return 0, fmt.Errorf("incomparable %T and %T", a, b)
