@@ -44,6 +44,12 @@ type (
 		Star     bool
 		Distinct bool        // For COUNT(DISTINCT col)
 		Over     *OverClause // For window functions
+		// handler is the registry entry for Name, resolved once at parse time
+		// (bindFuncHandler) so per-row evaluation skips the registry map
+		// lookup. Nil for hand-constructed nodes, which fall back to the
+		// lookup in evalFuncCall. Never written after parse: sharing a parsed
+		// statement across goroutines stays race-free.
+		handler funcHandler
 	}
 	// InExpr represents "expr IN (val1, val2, ...)"
 	InExpr struct {

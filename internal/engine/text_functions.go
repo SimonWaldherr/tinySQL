@@ -51,7 +51,7 @@ func (f *TextChunksTableFunc) Execute(ctx context.Context, args []Expr, env Exec
 	if textVal == nil {
 		return &ResultSet{Cols: []string{"chunk_index", "chunk_text", "start_pos", "end_pos"}, Rows: nil}, nil
 	}
-	text := fmt.Sprintf("%v", textVal)
+	text := valueText(textVal)
 
 	chunkSizeVal, err := evalExpr(env, args[1], row)
 	if err != nil {
@@ -83,7 +83,7 @@ func (f *TextChunksTableFunc) Execute(ctx context.Context, args []Expr, env Exec
 	if len(args) >= 4 {
 		uv, err := evalExpr(env, args[3], row)
 		if err == nil && uv != nil {
-			unit = strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", uv)))
+			unit = strings.ToLower(strings.TrimSpace(valueText(uv)))
 		}
 	}
 
@@ -185,7 +185,7 @@ func evalTextWordCount(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if v == nil {
 		return 0, nil
 	}
-	return len(strings.Fields(fmt.Sprintf("%v", v))), nil
+	return len(strings.Fields(valueText(v))), nil
 }
 
 // evalTextCharCount returns the number of Unicode code points in text.
@@ -200,7 +200,7 @@ func evalTextCharCount(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if v == nil {
 		return 0, nil
 	}
-	return utf8.RuneCountInString(fmt.Sprintf("%v", v)), nil
+	return utf8.RuneCountInString(valueText(v)), nil
 }
 
 // evalTextTruncate truncates text to at most max_len characters.
@@ -229,11 +229,11 @@ func evalTextTruncate(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if len(ex.Args) == 3 {
 		ev, err := evalExpr(env, ex.Args[2], row)
 		if err == nil && ev != nil {
-			ellipsis = fmt.Sprintf("%v", ev)
+			ellipsis = valueText(ev)
 		}
 	}
 
-	text := fmt.Sprintf("%v", v)
+	text := valueText(v)
 	runes := []rune(text)
 	if len(runes) <= maxLen {
 		return text, nil

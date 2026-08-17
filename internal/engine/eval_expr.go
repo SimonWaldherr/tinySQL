@@ -190,15 +190,8 @@ func evalLike(env ExecEnv, ex *LikeExpr, row Row) (any, error) {
 	}
 
 	// Convert to strings
-	str, ok := val.(string)
-	if !ok {
-		str = fmt.Sprintf("%v", val)
-	}
-
-	pattern, ok := patternVal.(string)
-	if !ok {
-		pattern = fmt.Sprintf("%v", patternVal)
-	}
+	str := valueText(val)
+	pattern := valueText(patternVal)
 
 	var matched bool
 	if ex.GlobStyle {
@@ -257,8 +250,8 @@ func evalRegexpExpr(env ExecEnv, ex *RegexpExpr, row Row) (any, error) {
 		// not false, so an enclosing NOT stays excluded rather than flipping.
 		return nil, nil
 	}
-	str := fmt.Sprintf("%v", val)
-	pattern := fmt.Sprintf("%v", patternVal)
+	str := valueText(val)
+	pattern := valueText(patternVal)
 	if ex.SimilarTo {
 		pattern = similarToRegexp(pattern)
 	}

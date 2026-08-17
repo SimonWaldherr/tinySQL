@@ -102,6 +102,35 @@ func buildSimpleSelectOrderExprs(orderBy []OrderItem, projs []simpleProjection, 
 	return orderExprs, true
 }
 
+// simpleSelectOrderCols resolves every ORDER BY expression to its raw column
+// index. It returns nil unless all terms are direct column references — the
+// overwhelmingly common shape — in which case the ordered fast path can read
+// sort keys straight out of the raw rows instead of calling evalRawExpr (a
+// map lookup per term per row) and, for multi-column orders, allocating a
+// keys slice per row.
+func simpleSelectOrderCols(orderExprs []Expr, colIndex map[string]int, colCount int) []int {
+	if len(orderExprs) == 0 {
+		return nil
+	}
+	cols := make([]int, len(orderExprs))
+	for i, e := range orderExprs {
+		ref, ok := e.(*VarRef)
+		if !ok {
+			return nil
+		}
+		key := ref.Lower
+		if key == "" {
+			key = strings.ToLower(ref.Name)
+		}
+		idx, found := colIndex[key]
+		if !found || idx < 0 || idx >= colCount {
+			return nil
+		}
+		cols[i] = idx
+	}
+	return cols
+}
+
 // findSimpleSelectOrderExpr resolves one ORDER BY term. Output names win, as SQL
 // requires — an alias shadows a same-named source column — and a term that names
 // no output column falls back to a source column of the scanned table.

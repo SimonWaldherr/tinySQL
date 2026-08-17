@@ -45,7 +45,7 @@ func (p *Parser) parseFuncCallWithName(name string) (Expr, error) {
 			return nil, err
 		}
 		// Return CAST as a function with the type as a literal string
-		return &FuncCall{Name: name, Args: []Expr{expr, &Literal{Val: typeName}}}, nil
+		return bindFuncHandler(&FuncCall{Name: name, Args: []Expr{expr, &Literal{Val: typeName}}}), nil
 	}
 
 	// Handle COUNT(*)
@@ -54,7 +54,7 @@ func (p *Parser) parseFuncCallWithName(name string) (Expr, error) {
 		if err := p.expectSymbol(")"); err != nil {
 			return nil, err
 		}
-		return &FuncCall{Name: name, Star: true}, nil
+		return bindFuncHandler(&FuncCall{Name: name, Star: true}), nil
 	}
 
 	// Check for DISTINCT keyword after opening parenthesis
@@ -94,7 +94,7 @@ func (p *Parser) parseFuncCallWithName(name string) (Expr, error) {
 		overClause = oc
 	}
 
-	return foldConstFuncCall(&FuncCall{Name: name, Args: args, Distinct: distinct, Over: overClause}), nil
+	return foldConstFuncCall(bindFuncHandler(&FuncCall{Name: name, Args: args, Distinct: distinct, Over: overClause})), nil
 }
 
 // parseOverClause parses the OVER (PARTITION BY ... ORDER BY ... frame) clause

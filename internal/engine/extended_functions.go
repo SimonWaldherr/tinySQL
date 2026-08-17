@@ -352,8 +352,8 @@ func evalRegexpMatch(env ExecEnv, args []Expr, row Row) (any, error) {
 		return false, nil
 	}
 
-	str := fmt.Sprintf("%v", strVal)
-	pattern := fmt.Sprintf("%v", patternVal)
+	str := valueText(strVal)
+	pattern := valueText(patternVal)
 
 	re, err := compileCachedRegexp(pattern)
 	if err != nil {
@@ -387,8 +387,8 @@ func evalRegexpExtract(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, nil
 	}
 
-	str := fmt.Sprintf("%v", strVal)
-	pattern := fmt.Sprintf("%v", patternVal)
+	str := valueText(strVal)
+	pattern := valueText(patternVal)
 
 	re, err := compileCachedRegexp(pattern)
 	if err != nil {
@@ -435,9 +435,9 @@ func evalRegexpReplace(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, nil
 	}
 
-	str := fmt.Sprintf("%v", strVal)
-	pattern := fmt.Sprintf("%v", patternVal)
-	replacement := fmt.Sprintf("%v", replVal)
+	str := valueText(strVal)
+	pattern := valueText(patternVal)
+	replacement := valueText(replVal)
 
 	re, err := compileCachedRegexp(pattern)
 	if err != nil {
@@ -473,8 +473,8 @@ func evalSplit(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, nil
 	}
 
-	str := fmt.Sprintf("%v", strVal)
-	delim := fmt.Sprintf("%v", delimVal)
+	str := valueText(strVal)
+	delim := valueText(delimVal)
 
 	parts := strings.Split(str, delim)
 	result := make([]any, len(parts))
@@ -643,12 +643,12 @@ func evalArrayJoin(env ExecEnv, args []Expr, row Row) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		delimiter = fmt.Sprintf("%v", delimVal)
+		delimiter = valueText(delimVal)
 	}
 
 	parts := make([]string, len(arr))
 	for i, elem := range arr {
-		parts[i] = fmt.Sprintf("%v", elem)
+		parts[i] = valueText(elem)
 	}
 
 	return strings.Join(parts, delimiter), nil
@@ -682,7 +682,7 @@ func evalArrayDistinct(env ExecEnv, args []Expr, row Row) (any, error) {
 	result := make([]any, 0)
 
 	for _, elem := range arr {
-		key := fmt.Sprintf("%v", elem)
+		key := valueText(elem)
 		if !seen[key] {
 			seen[key] = true
 			result = append(result, elem)
@@ -936,8 +936,8 @@ func evalLevenshteinFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if aVal == nil || bVal == nil {
 		return nil, nil
 	}
-	s := fmt.Sprintf("%v", aVal)
-	t := fmt.Sprintf("%v", bVal)
+	s := valueText(aVal)
+	t := valueText(bVal)
 	return levenshtein(s, t), nil
 }
 

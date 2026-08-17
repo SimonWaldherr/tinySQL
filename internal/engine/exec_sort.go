@@ -28,8 +28,9 @@ func applySortOrder(orderBy []OrderItem, outRows []Row) []Row {
 	items := make([]orderedValueRow, len(outRows))
 	for i, row := range outRows {
 		items[i] = buildOrderByValues(row, lcOrdCols)
+		items[i].idx = i
 	}
-	sort.Stable(orderedValueRowsAsc{orderBy: orderBy, items: items})
+	sort.Sort(orderedValueRowsAsc{orderBy: orderBy, items: items})
 	for i, item := range items {
 		outRows[i] = item.row
 	}
@@ -39,6 +40,10 @@ func applySortOrder(orderBy []OrderItem, outRows []Row) []Row {
 type orderedValueRow struct {
 	row  Row
 	keys []any
+	// idx is the row's position in pre-sort order; comparators break key
+	// ties on it, so the unstable sort.Sort (pdqsort) reproduces exactly the
+	// order sort.Stable produced, without symMerge's extra element moves.
+	idx int
 }
 
 type orderedValueRowHeap struct {
@@ -49,7 +54,13 @@ type orderedValueRowHeap struct {
 func (h orderedValueRowHeap) Len() int { return len(h.items) }
 
 func (h orderedValueRowHeap) Less(i, j int) bool {
-	return compareOrderedValueRows(h.orderBy, h.items[i], h.items[j]) > 0
+	// Root = worst retained row; among equal keys the later row is worse, so
+	// the bounded top-N keeps exactly the rows a full stable sort plus
+	// truncation would keep.
+	if cmp := compareOrderedValueRows(h.orderBy, h.items[i], h.items[j]); cmp != 0 {
+		return cmp > 0
+	}
+	return h.items[i].idx > h.items[j].idx
 }
 
 func (h orderedValueRowHeap) Swap(i, j int) {
@@ -129,7 +140,10 @@ type orderedValueRowsAsc struct {
 
 func (s orderedValueRowsAsc) Len() int { return len(s.items) }
 func (s orderedValueRowsAsc) Less(i, j int) bool {
-	return compareOrderedValueRows(s.orderBy, s.items[i], s.items[j]) < 0
+	if cmp := compareOrderedValueRows(s.orderBy, s.items[i], s.items[j]); cmp != 0 {
+		return cmp < 0
+	}
+	return s.items[i].idx < s.items[j].idx
 }
 func (s orderedValueRowsAsc) Swap(i, j int) { s.items[i], s.items[j] = s.items[j], s.items[i] }
 
@@ -154,6 +168,7 @@ func buildOrderByValues(row Row, lcOrdCols []string) orderedValueRow {
 type orderedValueRowSingle struct {
 	row Row
 	key any
+	idx int
 }
 
 type orderedValueRowsSingleAsc struct {
@@ -163,7 +178,10 @@ type orderedValueRowsSingleAsc struct {
 
 func (s orderedValueRowsSingleAsc) Len() int { return len(s.items) }
 func (s orderedValueRowsSingleAsc) Less(i, j int) bool {
-	return compareOrderedValue(s.items[i].key, s.items[j].key, s.desc) < 0
+	if cmp := compareOrderedValue(s.items[i].key, s.items[j].key, s.desc); cmp != 0 {
+		return cmp < 0
+	}
+	return s.items[i].idx < s.items[j].idx
 }
 func (s orderedValueRowsSingleAsc) Swap(i, j int) { s.items[i], s.items[j] = s.items[j], s.items[i] }
 
@@ -175,7 +193,12 @@ type orderedValueRowSingleHeap struct {
 func (h orderedValueRowSingleHeap) Len() int { return len(h.items) }
 
 func (h orderedValueRowSingleHeap) Less(i, j int) bool {
-	return compareOrderedValue(h.items[i].key, h.items[j].key, h.desc) > 0
+	// See orderedValueRowHeap.Less: later rows lose ties, matching a full
+	// stable sort plus truncation.
+	if cmp := compareOrderedValue(h.items[i].key, h.items[j].key, h.desc); cmp != 0 {
+		return cmp > 0
+	}
+	return h.items[i].idx > h.items[j].idx
 }
 
 func (h orderedValueRowSingleHeap) Swap(i, j int) {
@@ -239,9 +262,10 @@ func applySortOrderSingle(orderBy OrderItem, outRows []Row) []Row {
 		items[i] = orderedValueRowSingle{
 			row: row,
 			key: row[lcOrdCol],
+			idx: i,
 		}
 	}
-	sort.Stable(orderedValueRowsSingleAsc{
+	sort.Sort(orderedValueRowsSingleAsc{
 		desc:  orderBy.Desc,
 		items: items,
 	})
@@ -294,8 +318,9 @@ func applySortOrderWithLimit(orderBy []OrderItem, outRows []Row, limit, offset *
 		}
 	}
 
-	for _, row := range outRows {
+	for i, row := range outRows {
 		item := buildOrderByValues(row, lcOrdCols)
+		item.idx = i
 		if useTopN {
 			topRows.pushBounded(item, keepCount)
 		} else {
@@ -306,7 +331,7 @@ func applySortOrderWithLimit(orderBy []OrderItem, outRows []Row, limit, offset *
 		items = topRows.items
 	}
 
-	sort.Stable(orderedValueRowsAsc{orderBy: orderBy, items: items})
+	sort.Sort(orderedValueRowsAsc{orderBy: orderBy, items: items})
 
 	sorted := make([]Row, len(items))
 	for i, item := range items {
@@ -348,8 +373,8 @@ func applySortOrderWithLimitSingle(orderBy OrderItem, outRows []Row, limit, offs
 		}
 	}
 
-	for _, row := range outRows {
-		item := orderedValueRowSingle{row: row, key: row[lcOrdCol]}
+	for i, row := range outRows {
+		item := orderedValueRowSingle{row: row, key: row[lcOrdCol], idx: i}
 		if useTopN {
 			topRows.pushBounded(item, keepCount)
 		} else {
@@ -360,7 +385,7 @@ func applySortOrderWithLimitSingle(orderBy OrderItem, outRows []Row, limit, offs
 		items = topRows.items
 	}
 
-	sort.Stable(orderedValueRowsSingleAsc{
+	sort.Sort(orderedValueRowsSingleAsc{
 		desc:  orderBy.Desc,
 		items: items,
 	})

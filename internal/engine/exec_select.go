@@ -191,6 +191,12 @@ type simpleSelectPlan struct {
 	projs      []simpleProjection
 	orderBy    []OrderItem
 	orderExprs []Expr
+	// orderCols maps each ORDER BY term to its raw column index when every
+	// term is a direct column reference; nil when any term needs expression
+	// evaluation. With it set, the ordered fast path skips per-row
+	// evalRawExpr map lookups and (for multi-column orders) the per-row
+	// keys slice.
+	orderCols []int
 	where      Expr
 	// filter is a pre-compiled, allocation-free version of where for the most
 	// common patterns (col op literal, boolean column, AND/OR of those). When
