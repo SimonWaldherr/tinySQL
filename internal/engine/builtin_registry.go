@@ -60,7 +60,7 @@ func getBuiltinFunctions() map[string]funcHandler {
 		"CAST":              evalCastFunc,
 		"REPLACE":           evalReplaceFunc,
 		"INSTR":             evalInstrFunc,
-		"LOCATE":            evalInstrFunc,
+		"LOCATE":            evalLocateFunc,
 		"POSITION":          evalPositionFunc,
 		"ABS":               evalAbsFunc,
 		"ROUND":             evalRoundFunc,
@@ -613,6 +613,10 @@ func evalConcatWsFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 
 func evalPositionFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	return evalPosition(env, ex.Args, row)
+}
+
+func evalLocateFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalLocate(env, ex.Args, row)
 }
 
 func evalDayOfWeekFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {

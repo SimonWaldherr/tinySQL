@@ -57,6 +57,32 @@ func (p *Parser) parseFuncCallWithName(name string) (Expr, error) {
 		return bindFuncHandler(&FuncCall{Name: name, Star: true}), nil
 	}
 
+	// POSITION supports both its SQL-standard `POSITION(needle IN haystack)`
+	// form and the comma form used by the other scalar functions. Parse the
+	// first operand below predicate precedence so `IN` remains the separator
+	// instead of being consumed as an IN predicate.
+	if name == "POSITION" {
+		needle, err := p.parseAddSub()
+		if err != nil {
+			return nil, err
+		}
+		if p.cur.Typ == tKeyword && p.cur.Val == "IN" {
+			p.next()
+		} else if p.cur.Typ == tSymbol && p.cur.Val == "," {
+			p.next()
+		} else {
+			return nil, p.errf("POSITION expects IN or ',' between its arguments")
+		}
+		haystack, err := p.parseAddSub()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectSymbol(")"); err != nil {
+			return nil, err
+		}
+		return foldConstFuncCall(bindFuncHandler(&FuncCall{Name: name, Args: []Expr{needle, haystack}})), nil
+	}
+
 	// Check for DISTINCT keyword after opening parenthesis
 	distinct := false
 	if p.cur.Typ == tKeyword && p.cur.Val == "DISTINCT" {

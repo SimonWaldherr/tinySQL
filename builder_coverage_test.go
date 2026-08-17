@@ -198,3 +198,18 @@ func TestBuilderRightJoinRendering(t *testing.T) {
 		t.Fatalf("right join not rendered: %q", got)
 	}
 }
+
+func TestBuilderUpdateRenderingIsDeterministic(t *testing.T) {
+	stmt := Update("users").
+		Set("name", Val("Ada")).
+		Set("age", Add(Col("age"), Val(1))).
+		Where(Eq(Col("id"), Val(1))).
+		Build()
+
+	want := "UPDATE users SET age = (age + 1), name = 'Ada' WHERE (id = 1)"
+	for i := 0; i < 50; i++ {
+		if got := ToSQL(stmt); got != want {
+			t.Fatalf("ToSQL run %d = %q, want %q", i, got, want)
+		}
+	}
+}

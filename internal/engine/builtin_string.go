@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 func evalCoalesce(env ExecEnv, args []Expr, row Row) (any, error) {
@@ -180,12 +181,13 @@ func evalTrimCommon(env ExecEnv, name string, side trimSide, args []Expr, row Ro
 		if err != nil {
 			return nil, err
 		}
-		if cutsetVal != nil {
-			if cutsetStr, ok := cutsetVal.(string); ok {
-				cutset = cutsetStr
-			} else {
-				return nil, fmt.Errorf("%s cutset must be a string", name)
-			}
+		if cutsetVal == nil {
+			return nil, nil
+		}
+		if cutsetStr, ok := cutsetVal.(string); ok {
+			cutset = cutsetStr
+		} else {
+			return nil, fmt.Errorf("%s cutset must be a string", name)
 		}
 	}
 
@@ -331,7 +333,23 @@ func evalLength(env ExecEnv, args []Expr, row Row) (any, error) {
 
 	str := valueText(val)
 
-	return len(str), nil
+	return utf8.RuneCountInString(str), nil
+}
+
+// stringRunes returns str as characters rather than UTF-8 bytes. SQL string
+// positions and lengths are character-based, and byte indexing can otherwise
+// split a multi-byte character into invalid UTF-8.
+func stringRunes(str string) []rune { return []rune(str) }
+
+func stringPrefix(str string, length int) string {
+	runes := stringRunes(str)
+	if length <= 0 {
+		return ""
+	}
+	if length >= len(runes) {
+		return str
+	}
+	return string(runes[:length])
 }
 
 //nolint:gocyclo // SUBSTRING handling covers varying arity, coercion, and bounds checks.
@@ -356,6 +374,9 @@ func evalSubstring(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if startVal == nil {
+		return nil, nil
+	}
 	startAny, err := coerceToInt(startVal)
 	if err != nil {
 		return nil, fmt.Errorf("SUBSTRING start position must be numeric")
@@ -364,11 +385,21 @@ func evalSubstring(env ExecEnv, args []Expr, row Row) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("SUBSTRING start position must be an integer")
 	}
-	start = start - 1 // Convert to 0-indexed
+	runes := stringRunes(str)
+	// SQL positions start at one. Negative positions count from the end;
+	// zero remains a forgiving alias for the first character.
+	switch {
+	case start > 0:
+		start--
+	case start < 0:
+		start += len(runes)
+	default:
+		start = 0
+	}
 	if start < 0 {
 		start = 0
 	}
-	if start >= len(str) {
+	if start >= len(runes) {
 		return "", nil
 	}
 
@@ -377,6 +408,9 @@ func evalSubstring(env ExecEnv, args []Expr, row Row) (any, error) {
 		lengthVal, err := evalExpr(env, args[2], row)
 		if err != nil {
 			return nil, err
+		}
+		if lengthVal == nil {
+			return nil, nil
 		}
 		lengthAny, err := coerceToInt(lengthVal)
 		if err != nil {
@@ -387,14 +421,17 @@ func evalSubstring(env ExecEnv, args []Expr, row Row) (any, error) {
 			return nil, fmt.Errorf("SUBSTRING length must be an integer")
 		}
 
-		end := start + length
-		if end > len(str) {
-			end = len(str)
+		if length <= 0 {
+			return "", nil
 		}
-		return str[start:end], nil
+		end := start + length
+		if end > len(runes) {
+			end = len(runes)
+		}
+		return string(runes[start:end]), nil
 	}
 
-	return str[start:], nil
+	return string(runes[start:]), nil
 }
 
 func evalLeft(env ExecEnv, args []Expr, row Row) (any, error) {
@@ -416,6 +453,9 @@ func evalLeft(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if lenVal == nil {
+		return nil, nil
+	}
 	lenAny, err := coerceToInt(lenVal)
 	if err != nil {
 		return nil, fmt.Errorf("LEFT length must be numeric")
@@ -428,13 +468,13 @@ func evalLeft(env ExecEnv, args []Expr, row Row) (any, error) {
 	if length < 0 {
 		return "", nil
 	}
-	if length >= len(str) {
+	if length >= utf8.RuneCountInString(str) {
 		if _, ok := val.(string); ok {
 			return val, nil
 		}
 		return str, nil
 	}
-	return str[:length], nil
+	return stringPrefix(str, length), nil
 }
 
 func evalRight(env ExecEnv, args []Expr, row Row) (any, error) {
@@ -456,6 +496,9 @@ func evalRight(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if lenVal == nil {
+		return nil, nil
+	}
 	lenAny, err := coerceToInt(lenVal)
 	if err != nil {
 		return nil, fmt.Errorf("RIGHT length must be numeric")
@@ -468,13 +511,14 @@ func evalRight(env ExecEnv, args []Expr, row Row) (any, error) {
 	if length < 0 {
 		return "", nil
 	}
-	if length >= len(str) {
+	runes := stringRunes(str)
+	if length >= len(runes) {
 		if _, ok := val.(string); ok {
 			return val, nil
 		}
 		return str, nil
 	}
-	return str[len(str)-length:], nil
+	return string(runes[len(runes)-length:]), nil
 }
 
 func evalReplace(env ExecEnv, args []Expr, row Row) (any, error) {
@@ -494,14 +538,23 @@ func evalReplace(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if fromVal == nil {
+		return nil, nil
+	}
 	from := valueText(fromVal)
 
 	toVal, err := evalExpr(env, args[2], row)
 	if err != nil {
 		return nil, err
 	}
+	if toVal == nil {
+		return nil, nil
+	}
 	to := valueText(toVal)
 
+	if from == "" {
+		return str, nil
+	}
 	return strings.ReplaceAll(str, from, to), nil
 }
 
@@ -514,7 +567,7 @@ func evalInstr(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, err
 	}
 	if val == nil {
-		return 0, nil
+		return nil, nil
 	}
 	str := valueText(val)
 
@@ -522,13 +575,16 @@ func evalInstr(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if searchVal == nil {
+		return nil, nil
+	}
 	search := valueText(searchVal)
 
 	idx := strings.Index(str, search)
 	if idx == -1 {
 		return 0, nil
 	}
-	return idx + 1, nil // 1-based index
+	return utf8.RuneCountInString(str[:idx]) + 1, nil // 1-based character index
 }
 
 func evalReverse(env ExecEnv, args []Expr, row Row) (any, error) {
@@ -566,6 +622,9 @@ func evalRepeat(env ExecEnv, args []Expr, row Row) (any, error) {
 	countVal, err := evalExpr(env, args[1], row)
 	if err != nil {
 		return nil, err
+	}
+	if countVal == nil {
+		return nil, nil
 	}
 	countAny, err := coerceToInt(countVal)
 	if err != nil {
@@ -616,13 +675,16 @@ func evalLpad(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if lenVal == nil {
+		return nil, nil
+	}
 	lenAny, err := coerceToInt(lenVal)
 	if err != nil {
 		return nil, fmt.Errorf("LPAD length must be numeric")
 	}
 	length, ok := lenAny.(int)
 	if !ok || length < 0 {
-		return str, nil
+		return "", nil
 	}
 
 	pad := " "
@@ -631,17 +693,21 @@ func evalLpad(env ExecEnv, args []Expr, row Row) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		pad = valueText(padVal)
-		if pad == "" {
-			pad = " "
+		if padVal == nil {
+			return nil, nil
 		}
+		pad = valueText(padVal)
 	}
 
-	if len(str) >= length {
-		return str[:length], nil
+	strRunes := stringRunes(str)
+	if len(strRunes) >= length {
+		return string(strRunes[:length]), nil
 	}
-	needed := length - len(str)
-	padding := strings.Repeat(pad, (needed/len(pad))+1)[:needed]
+	if pad == "" {
+		return str, nil
+	}
+	needed := length - len(strRunes)
+	padding := stringPrefix(strings.Repeat(pad, (needed/utf8.RuneCountInString(pad))+1), needed)
 	return padding + str, nil
 }
 
@@ -662,13 +728,16 @@ func evalRpad(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if lenVal == nil {
+		return nil, nil
+	}
 	lenAny, err := coerceToInt(lenVal)
 	if err != nil {
 		return nil, fmt.Errorf("RPAD length must be numeric")
 	}
 	length, ok := lenAny.(int)
 	if !ok || length < 0 {
-		return str, nil
+		return "", nil
 	}
 
 	pad := " "
@@ -677,17 +746,21 @@ func evalRpad(env ExecEnv, args []Expr, row Row) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		pad = valueText(padVal)
-		if pad == "" {
-			pad = " "
+		if padVal == nil {
+			return nil, nil
 		}
+		pad = valueText(padVal)
 	}
 
-	if len(str) >= length {
-		return str[:length], nil
+	strRunes := stringRunes(str)
+	if len(strRunes) >= length {
+		return string(strRunes[:length]), nil
 	}
-	needed := length - len(str)
-	padding := strings.Repeat(pad, (needed/len(pad))+1)[:needed]
+	if pad == "" {
+		return str, nil
+	}
+	needed := length - len(strRunes)
+	padding := stringPrefix(strings.Repeat(pad, (needed/utf8.RuneCountInString(pad))+1), needed)
 	return str + padding, nil
 }
 
@@ -778,11 +851,14 @@ func evalInitcap(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if val == nil {
+		return nil, nil
+	}
 	s := valueText(val)
 	words := strings.Fields(s)
 	for i, word := range words {
-		if len(word) > 0 {
-			words[i] = strings.ToUpper(string(word[0])) + strings.ToLower(word[1:])
+		if first, width := utf8.DecodeRuneInString(word); width > 0 {
+			words[i] = strings.ToUpper(string(first)) + strings.ToLower(word[width:])
 		}
 	}
 	return strings.Join(words, " "), nil
@@ -803,6 +879,9 @@ func evalSplitPart(env ExecEnv, args []Expr, row Row) (any, error) {
 	partVal, err := evalExpr(env, args[2], row)
 	if err != nil {
 		return nil, err
+	}
+	if strVal == nil || delimVal == nil || partVal == nil {
+		return nil, nil
 	}
 	s := valueText(strVal)
 	delim := valueText(delimVal)
@@ -842,6 +921,9 @@ func evalConcatWs(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if sepVal == nil {
+		return nil, nil
+	}
 	sep := valueText(sepVal)
 	var parts []string
 	for _, arg := range args[1:] {
@@ -869,13 +951,24 @@ func evalPosition(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if subVal == nil || strVal == nil {
+		return nil, nil
+	}
 	sub := valueText(subVal)
 	str := valueText(strVal)
 	idx := strings.Index(str, sub)
 	if idx < 0 {
 		return 0, nil
 	}
-	return idx + 1, nil
+	return utf8.RuneCountInString(str[:idx]) + 1, nil
+}
+
+func evalLocate(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("LOCATE expects 2 arguments: (substring, string)")
+	}
+	// LOCATE has the reverse argument order of INSTR.
+	return evalInstr(env, []Expr{args[1], args[0]}, row)
 }
 
 func evalTypeof(env ExecEnv, args []Expr, row Row) (any, error) {

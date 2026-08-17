@@ -8,6 +8,7 @@ package tinysql
 import (
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -806,18 +807,21 @@ func ToSQL(stmt engine.Statement) string {
 
 func selectToSQL(s *engine.Select) string {
 	var sb strings.Builder
-
-	buildCTEs(&sb, s.CTEs)
-	buildSelectClause(&sb, s)
-	buildFromClause(&sb, s.From)
-	buildJoinClauses(&sb, s.Joins)
-	buildWhereClause(&sb, s.Where)
-	buildGroupByClause(&sb, s.GroupBy)
-	buildHavingClause(&sb, s.Having)
-	buildOrderByClause(&sb, s.OrderBy)
-	buildLimitOffsetClauses(&sb, s.Limit, s.Offset)
-
+	sb.Grow(estimateSelectSQLSize(s))
+	writeSelectSQL(&sb, s)
 	return sb.String()
+}
+
+func writeSelectSQL(sb *strings.Builder, s *engine.Select) {
+	buildCTEs(sb, s.CTEs)
+	buildSelectClause(sb, s)
+	buildFromClause(sb, s.From)
+	buildJoinClauses(sb, s.Joins)
+	buildWhereClause(sb, s.Where)
+	buildGroupByClause(sb, s.GroupBy)
+	buildHavingClause(sb, s.Having)
+	buildOrderByClause(sb, s.OrderBy)
+	buildLimitOffsetClauses(sb, s.Limit, s.Offset)
 }
 
 // Helper: build CTEs clause
@@ -830,10 +834,113 @@ func buildCTEs(sb *strings.Builder, ctes []engine.CTE) {
 			}
 			sb.WriteString(cte.Name)
 			sb.WriteString(" AS (")
-			sb.WriteString(selectToSQL(cte.Select))
+			writeSelectSQL(sb, cte.Select)
 			sb.WriteString(")")
 		}
 		sb.WriteString(" ")
+	}
+}
+
+func estimateSelectSQLSize(s *engine.Select) int {
+	n := len("SELECT ")
+	for _, proj := range s.Projs {
+		if proj.Star {
+			n++
+		} else {
+			n += estimateExprSQLSize(proj.Expr)
+		}
+		if proj.Alias != "" {
+			n += len(" AS ") + len(proj.Alias)
+		}
+		n += len(", ")
+	}
+	if s.Distinct {
+		n += len("DISTINCT ")
+	}
+	if s.From.Table != "" {
+		n += len(" FROM ") + len(s.From.Table)
+		if s.From.Alias != "" {
+			n += len(" AS ") + len(s.From.Alias)
+		}
+	}
+	for _, join := range s.Joins {
+		n += len(" INNER JOIN ") + len(join.Right.Table) + len(" ON ") + estimateExprSQLSize(join.On)
+		if join.Right.Alias != "" {
+			n += len(" AS ") + len(join.Right.Alias)
+		}
+	}
+	if s.Where != nil {
+		n += len(" WHERE ") + estimateExprSQLSize(s.Where)
+	}
+	for _, expr := range s.GroupBy {
+		n += estimateExprSQLSize(expr) + len(", ")
+	}
+	if len(s.GroupBy) > 0 {
+		n += len(" GROUP BY ")
+	}
+	if s.Having != nil {
+		n += len(" HAVING ") + estimateExprSQLSize(s.Having)
+	}
+	for _, order := range s.OrderBy {
+		n += len(order.Col) + len(", ")
+		if order.Desc {
+			n += len(" DESC")
+		}
+	}
+	if len(s.OrderBy) > 0 {
+		n += len(" ORDER BY ")
+	}
+	if s.Limit != nil {
+		n += len(" LIMIT ") + 20
+	}
+	if s.Offset != nil {
+		n += len(" OFFSET ") + 20
+	}
+	for _, cte := range s.CTEs {
+		n += len("WITH  AS ()") + len(cte.Name) + estimateSelectSQLSize(cte.Select)
+	}
+	return n
+}
+
+func estimateExprSQLSize(e engine.Expr) int {
+	if e == nil {
+		return len("NULL")
+	}
+	switch ex := e.(type) {
+	case *engine.Literal:
+		switch value := ex.Val.(type) {
+		case nil:
+			return len("NULL")
+		case string:
+			return len(value) + 2 + strings.Count(value, "'")
+		case []byte:
+			return len(value)*2 + len("X''")
+		case bool:
+			return len("FALSE")
+		default:
+			return 24
+		}
+	case *engine.VarRef:
+		return len(ex.Name)
+	case *engine.Binary:
+		return estimateExprSQLSize(ex.Left) + len(ex.Op) + estimateExprSQLSize(ex.Right) + 4
+	case *engine.Unary:
+		return len(ex.Op) + estimateExprSQLSize(ex.Expr) + 3
+	case *engine.IsNull:
+		if ex.Negate {
+			return estimateExprSQLSize(ex.Expr) + len("( IS NOT NULL)")
+		}
+		return estimateExprSQLSize(ex.Expr) + len("( IS NULL)")
+	case *engine.FuncCall:
+		n := len(ex.Name) + 2
+		for _, arg := range ex.Args {
+			n += estimateExprSQLSize(arg) + len(", ")
+		}
+		return n
+	case *engine.ExistsExpr:
+		return len("EXISTS ()") + estimateSelectSQLSize(ex.Select)
+	default:
+		return 1
 	}
 }
 
@@ -850,7 +957,7 @@ func buildSelectClause(sb *strings.Builder, s *engine.Select) {
 		if proj.Star {
 			sb.WriteString("*")
 		} else {
-			sb.WriteString(exprToSQL(proj.Expr))
+			writeExprSQL(sb, proj.Expr)
 			if proj.Alias != "" {
 				sb.WriteString(" AS ")
 				sb.WriteString(proj.Alias)
@@ -888,7 +995,7 @@ func buildJoinClauses(sb *strings.Builder, joins []engine.JoinClause) {
 			sb.WriteString(join.Right.Alias)
 		}
 		sb.WriteString(" ON ")
-		sb.WriteString(exprToSQL(join.On))
+		writeExprSQL(sb, join.On)
 	}
 }
 
@@ -896,7 +1003,7 @@ func buildJoinClauses(sb *strings.Builder, joins []engine.JoinClause) {
 func buildWhereClause(sb *strings.Builder, where engine.Expr) {
 	if where != nil {
 		sb.WriteString(" WHERE ")
-		sb.WriteString(exprToSQL(where))
+		writeExprSQL(sb, where)
 	}
 }
 
@@ -908,7 +1015,7 @@ func buildGroupByClause(sb *strings.Builder, groupBy []engine.Expr) {
 			if i > 0 {
 				sb.WriteString(", ")
 			}
-			sb.WriteString(exprToSQL(g))
+			writeExprSQL(sb, g)
 		}
 	}
 }
@@ -917,7 +1024,7 @@ func buildGroupByClause(sb *strings.Builder, groupBy []engine.Expr) {
 func buildHavingClause(sb *strings.Builder, having engine.Expr) {
 	if having != nil {
 		sb.WriteString(" HAVING ")
-		sb.WriteString(exprToSQL(having))
+		writeExprSQL(sb, having)
 	}
 }
 
@@ -940,10 +1047,12 @@ func buildOrderByClause(sb *strings.Builder, orderBy []engine.OrderItem) {
 // Helper: build LIMIT/OFFSET clauses
 func buildLimitOffsetClauses(sb *strings.Builder, limit *int, offset *int) {
 	if limit != nil {
-		fmt.Fprintf(sb, " LIMIT %d", *limit)
+		sb.WriteString(" LIMIT ")
+		sb.WriteString(strconv.Itoa(*limit))
 	}
 	if offset != nil {
-		fmt.Fprintf(sb, " OFFSET %d", *offset)
+		sb.WriteString(" OFFSET ")
+		sb.WriteString(strconv.Itoa(*offset))
 	}
 }
 
@@ -966,7 +1075,7 @@ func insertToSQL(i *engine.Insert) string {
 			if ci > 0 {
 				sb.WriteString(", ")
 			}
-			sb.WriteString(exprToSQL(val))
+			writeExprSQL(&sb, val)
 		}
 		sb.WriteString(")")
 	}
@@ -978,19 +1087,22 @@ func updateToSQL(u *engine.Update) string {
 	sb.WriteString("UPDATE ")
 	sb.WriteString(u.Table)
 	sb.WriteString(" SET ")
-	i := 0
-	for col, val := range u.Sets {
+	cols := make([]string, 0, len(u.Sets))
+	for col := range u.Sets {
+		cols = append(cols, col)
+	}
+	sort.Strings(cols)
+	for i, col := range cols {
 		if i > 0 {
 			sb.WriteString(", ")
 		}
 		sb.WriteString(col)
 		sb.WriteString(" = ")
-		sb.WriteString(exprToSQL(val))
-		i++
+		writeExprSQL(&sb, u.Sets[col])
 	}
 	if u.Where != nil {
 		sb.WriteString(" WHERE ")
-		sb.WriteString(exprToSQL(u.Where))
+		writeExprSQL(&sb, u.Where)
 	}
 	return sb.String()
 }
@@ -1001,7 +1113,7 @@ func deleteToSQL(d *engine.Delete) string {
 	sb.WriteString(d.Table)
 	if d.Where != nil {
 		sb.WriteString(" WHERE ")
-		sb.WriteString(exprToSQL(d.Where))
+		writeExprSQL(&sb, d.Where)
 	}
 	return sb.String()
 }
@@ -1061,27 +1173,47 @@ func literalToSQL(v any) string {
 }
 
 func exprToSQL(e engine.Expr) string {
+	var sb strings.Builder
+	writeExprSQL(&sb, e)
+	return sb.String()
+}
+
+// writeExprSQL renders directly into one builder so nested expressions do not
+// allocate a temporary SQL string at each tree level.
+func writeExprSQL(sb *strings.Builder, e engine.Expr) {
 	if e == nil {
-		return "NULL"
+		sb.WriteString("NULL")
+		return
 	}
 	switch ex := e.(type) {
 	case *engine.Literal:
-		return literalToSQL(ex.Val)
+		sb.WriteString(literalToSQL(ex.Val))
 	case *engine.VarRef:
-		return ex.Name
-	case *engine.Binary:
-		return fmt.Sprintf("(%s %s %s)", exprToSQL(ex.Left), ex.Op, exprToSQL(ex.Right))
-	case *engine.Unary:
-		return fmt.Sprintf("%s (%s)", ex.Op, exprToSQL(ex.Expr))
-	case *engine.IsNull:
-		if ex.Negate {
-			return fmt.Sprintf("(%s IS NOT NULL)", exprToSQL(ex.Expr))
-		}
-		return fmt.Sprintf("(%s IS NULL)", exprToSQL(ex.Expr))
-	case *engine.FuncCall:
-		var sb strings.Builder
 		sb.WriteString(ex.Name)
-		sb.WriteString("(")
+	case *engine.Binary:
+		sb.WriteByte('(')
+		writeExprSQL(sb, ex.Left)
+		sb.WriteByte(' ')
+		sb.WriteString(ex.Op)
+		sb.WriteByte(' ')
+		writeExprSQL(sb, ex.Right)
+		sb.WriteByte(')')
+	case *engine.Unary:
+		sb.WriteString(ex.Op)
+		sb.WriteString(" (")
+		writeExprSQL(sb, ex.Expr)
+		sb.WriteByte(')')
+	case *engine.IsNull:
+		sb.WriteByte('(')
+		writeExprSQL(sb, ex.Expr)
+		if ex.Negate {
+			sb.WriteString(" IS NOT NULL)")
+			return
+		}
+		sb.WriteString(" IS NULL)")
+	case *engine.FuncCall:
+		sb.WriteString(ex.Name)
+		sb.WriteByte('(')
 		for i, arg := range ex.Args {
 			if i > 0 {
 				sb.WriteString(", ")
@@ -1089,16 +1221,17 @@ func exprToSQL(e engine.Expr) string {
 			// The star in COUNT(*) is carried as a "*" string literal; render it
 			// bare rather than quoting it as a string value.
 			if lit, ok := arg.(*engine.Literal); ok && lit.Val == "*" {
-				sb.WriteString("*")
+				sb.WriteByte('*')
 				continue
 			}
-			sb.WriteString(exprToSQL(arg))
+			writeExprSQL(sb, arg)
 		}
-		sb.WriteString(")")
-		return sb.String()
+		sb.WriteByte(')')
 	case *engine.ExistsExpr:
-		return fmt.Sprintf("EXISTS (%s)", selectToSQL(ex.Select))
+		sb.WriteString("EXISTS (")
+		writeSelectSQL(sb, ex.Select)
+		sb.WriteByte(')')
 	default:
-		return "?"
+		sb.WriteByte('?')
 	}
 }
