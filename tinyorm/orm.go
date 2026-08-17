@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -139,13 +140,21 @@ func (db *DB) Select(ctx context.Context, dest any, where string, params any) er
 	if err != nil {
 		return err
 	}
-	out := reflect.MakeSlice(sliceValue.Type(), 0, len(rs.Rows))
-	for _, row := range rs.Rows {
-		item := reflect.New(elemType).Elem()
-		if err := scanStructValue(item, row, meta); err != nil {
+	sliceType := sliceValue.Type()
+	out := reflect.MakeSlice(sliceType, len(rs.Rows), len(rs.Rows))
+	pointerElements := sliceType.Elem().Kind() == reflect.Pointer
+	for i, row := range rs.Rows {
+		if pointerElements {
+			item := reflect.New(elemType)
+			if err := scanStructValue(item.Elem(), row, meta); err != nil {
+				return err
+			}
+			out.Index(i).Set(item)
+			continue
+		}
+		if err := scanStructValue(out.Index(i), row, meta); err != nil {
 			return err
 		}
-		out = reflect.Append(out, item)
 	}
 	sliceValue.Set(out)
 	return nil
@@ -185,35 +194,48 @@ func (db *DB) execSQL(ctx context.Context, sql string) (*tinysql.ResultSet, erro
 var ErrNotFound = fmt.Errorf("tinyorm: not found")
 
 type modelMeta struct {
-	typ    reflect.Type
-	table  string
-	fields []fieldMeta
+	typ           reflect.Type
+	table         string
+	fields        []fieldMeta
+	primary       int
+	selectListSQL string
 }
 
 type fieldMeta struct {
-	index   int
-	name    string
-	column  string
-	sqlType string
-	pk      bool
-	unique  bool
+	index       int
+	name        string
+	column      string
+	lowerColumn string
+	sqlType     string
+	pk          bool
+	unique      bool
 }
 
+// modelMetaCache keeps the reflection-derived, immutable mapping for each
+// struct type. ORM operations use the same model shape repeatedly, so this
+// avoids rediscovering tags, column types, and table names on every query.
+var modelMetaCache sync.Map // map[reflect.Type]*modelMeta
+
+type namedFieldMeta struct {
+	index     int
+	columnKey string
+	fieldKey  string
+}
+
+// namedFieldCache stores the parameter names derived from exported struct
+// fields. BindNamed is often called in request paths, where repeating this tag
+// parsing and snake_case conversion is unnecessary work.
+var namedFieldCache sync.Map // map[reflect.Type][]namedFieldMeta
+
 func (m modelMeta) primaryField() *fieldMeta {
-	for i := range m.fields {
-		if m.fields[i].pk {
-			return &m.fields[i]
-		}
+	if m.primary >= 0 && m.primary < len(m.fields) {
+		return &m.fields[m.primary]
 	}
 	return nil
 }
 
 func (m modelMeta) selectList() string {
-	cols := make([]string, len(m.fields))
-	for i, f := range m.fields {
-		cols[i] = quoteIdent(f.column)
-	}
-	return strings.Join(cols, ", ")
+	return m.selectListSQL
 }
 
 func describeModel(model any) (modelMeta, error) {
@@ -231,7 +253,11 @@ func describeType(t reflect.Type) (modelMeta, error) {
 	if t.Kind() != reflect.Struct {
 		return modelMeta{}, fmt.Errorf("tinyorm: model must be a struct, got %s", t.Kind())
 	}
-	meta := modelMeta{typ: t, table: tableNameFor(t)}
+	if cached, ok := modelMetaCache.Load(t); ok {
+		return *cached.(*modelMeta), nil
+	}
+
+	meta := modelMeta{typ: t, table: tableNameFor(t), primary: -1}
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
 		if sf.PkgPath != "" {
@@ -245,16 +271,28 @@ func describeType(t reflect.Type) (modelMeta, error) {
 		if name == "" {
 			name = snakeCase(sf.Name)
 		}
-		meta.fields = append(meta.fields, fieldMeta{
-			index:   i,
-			name:    sf.Name,
-			column:  name,
-			sqlType: sqlTypeFor(sf.Type),
-			pk:      opts["pk"] || opts["primary"] || opts["primarykey"],
-			unique:  opts["unique"],
-		})
+		field := fieldMeta{
+			index:       i,
+			name:        sf.Name,
+			column:      name,
+			lowerColumn: strings.ToLower(name),
+			sqlType:     sqlTypeFor(sf.Type),
+			pk:          opts["pk"] || opts["primary"] || opts["primarykey"],
+			unique:      opts["unique"],
+		}
+		if field.pk && meta.primary == -1 {
+			meta.primary = len(meta.fields)
+		}
+		meta.fields = append(meta.fields, field)
 	}
-	return meta, nil
+	cols := make([]string, len(meta.fields))
+	for i, f := range meta.fields {
+		cols[i] = quoteIdent(f.column)
+	}
+	meta.selectListSQL = strings.Join(cols, ", ")
+
+	actual, _ := modelMetaCache.LoadOrStore(t, &meta)
+	return *actual.(*modelMeta), nil
 }
 
 func modelValue(model any) (modelMeta, reflect.Value, error) {
@@ -368,7 +406,7 @@ func scanStructValue(v reflect.Value, row tinysql.Row, meta modelMeta) error {
 		if !field.CanSet() {
 			continue
 		}
-		val, ok := row[strings.ToLower(f.column)]
+		val, ok := row[f.lowerColumn]
 		if !ok {
 			val, ok = row[f.column]
 		}
@@ -594,27 +632,51 @@ func namedValues(params any) (map[string]any, error) {
 	}
 	switch v.Kind() {
 	case reflect.Map:
+		out = make(map[string]any, v.Len())
 		for _, key := range v.MapKeys() {
 			out[strings.ToLower(fmt.Sprintf("%v", key.Interface()))] = v.MapIndex(key).Interface()
 		}
 	case reflect.Struct:
 		t := v.Type()
-		for i := 0; i < t.NumField(); i++ {
-			sf := t.Field(i)
-			if sf.PkgPath != "" {
-				continue
+		fields := namedFieldsFor(t)
+		out = make(map[string]any, len(fields)*2)
+		for _, field := range fields {
+			value := v.Field(field.index).Interface()
+			out[field.columnKey] = value
+			if field.fieldKey != field.columnKey {
+				out[field.fieldKey] = value
 			}
-			name, _ := parseDBTag(sf.Tag.Get("db"))
-			if name == "" {
-				name = snakeCase(sf.Name)
-			}
-			out[strings.ToLower(name)] = v.Field(i).Interface()
-			out[strings.ToLower(sf.Name)] = v.Field(i).Interface()
 		}
 	default:
 		return nil, fmt.Errorf("tinyorm: params must be map or struct")
 	}
 	return out, nil
+}
+
+func namedFieldsFor(t reflect.Type) []namedFieldMeta {
+	if cached, ok := namedFieldCache.Load(t); ok {
+		return cached.([]namedFieldMeta)
+	}
+
+	fields := make([]namedFieldMeta, 0, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		if sf.PkgPath != "" {
+			continue
+		}
+		name, _ := parseDBTag(sf.Tag.Get("db"))
+		if name == "" {
+			name = snakeCase(sf.Name)
+		}
+		fields = append(fields, namedFieldMeta{
+			index:     i,
+			columnKey: strings.ToLower(name),
+			fieldKey:  strings.ToLower(sf.Name),
+		})
+	}
+
+	actual, _ := namedFieldCache.LoadOrStore(t, fields)
+	return actual.([]namedFieldMeta)
 }
 
 func sqlLiteral(v any) string {
@@ -627,8 +689,30 @@ func sqlLiteral(v any) string {
 			return "true"
 		}
 		return "false"
-	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
-		return fmt.Sprintf("%v", x)
+	case int:
+		return strconv.Itoa(x)
+	case int8:
+		return strconv.FormatInt(int64(x), 10)
+	case int16:
+		return strconv.FormatInt(int64(x), 10)
+	case int32:
+		return strconv.FormatInt(int64(x), 10)
+	case int64:
+		return strconv.FormatInt(x, 10)
+	case uint:
+		return strconv.FormatUint(uint64(x), 10)
+	case uint8:
+		return strconv.FormatUint(uint64(x), 10)
+	case uint16:
+		return strconv.FormatUint(uint64(x), 10)
+	case uint32:
+		return strconv.FormatUint(uint64(x), 10)
+	case uint64:
+		return strconv.FormatUint(x, 10)
+	case float32:
+		return strconv.FormatFloat(float64(x), 'f', -1, 32)
+	case float64:
+		return strconv.FormatFloat(x, 'f', -1, 64)
 	case string:
 		return "'" + strings.ReplaceAll(x, "'", "''") + "'"
 	case []byte:
