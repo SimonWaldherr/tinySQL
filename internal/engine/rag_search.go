@@ -357,6 +357,25 @@ type ragFusedRow struct {
 	rrfScore float64
 }
 
+// ragOrderByScoreAsc sorts a []string of fused-row keys by descending RRF
+// score, falling back to each row's unique insertion order. A concrete Swap
+// (a single string-header assignment) replaces reflect.Swapper's generic,
+// pointer-aware swap.
+type ragOrderByScoreAsc struct {
+	fused map[string]*ragFusedRow
+	order []string
+}
+
+func (s ragOrderByScoreAsc) Len() int { return len(s.order) }
+func (s ragOrderByScoreAsc) Less(i, j int) bool {
+	a, b := s.fused[s.order[i]], s.fused[s.order[j]]
+	if a.rrfScore != b.rrfScore {
+		return a.rrfScore > b.rrfScore
+	}
+	return a.order < b.order
+}
+func (s ragOrderByScoreAsc) Swap(i, j int) { s.order[i], s.order[j] = s.order[j], s.order[i] }
+
 // ragSearchFuse reciprocal-rank-fuses vecResult and ftsResult into one
 // ResultSet, matching rows across the two sets by concatenating their
 // keyCols values into a composite key.
@@ -444,13 +463,14 @@ func ragSearchFuse(vecResult, ftsResult *ResultSet, keyCols []string, rrfK float
 		fr.rrfScore = score
 	}
 
-	sort.SliceStable(order, func(i, j int) bool {
-		a, b := fused[order[i]], fused[order[j]]
-		if a.rrfScore != b.rrfScore {
-			return a.rrfScore > b.rrfScore
-		}
-		return a.order < b.order
-	})
+	// A concrete sort.Interface with a direct Swap avoids reflect.Swapper's
+	// generic path, which sort.Slice/SliceStable fall back to for any element
+	// type containing a pointer — a plain string included, per the same
+	// rationale documented on orderedRawRowsAsc (exec_fastpath_select.go).
+	// fr.order is a unique insertion sequence number (see ragFusedRow), so the
+	// comparator is already a strict total order and sort.Sort (pdqsort)
+	// reproduces the exact order sort.SliceStable did, without symMerge.
+	sort.Sort(ragOrderByScoreAsc{fused: fused, order: order})
 
 	baseColSet := make(map[string]bool)
 	baseCols := make([]string, 0, len(vecBase)+len(ftsBase))

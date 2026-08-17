@@ -334,19 +334,14 @@ func ragExpandContextFrom(source, hits ragSource, docCol, chunkCol, hitDocCol, h
 	for _, candidate := range candidates {
 		ordered = append(ordered, candidate)
 	}
-	sort.Slice(ordered, func(i, j int) bool {
-		left, right := ordered[i], ordered[j]
-		if left.hitRank != right.hitRank {
-			return left.hitRank < right.hitRank
-		}
-		if left.hitIndex != right.hitIndex {
-			return left.hitIndex < right.hitIndex
-		}
-		if left.offset != right.offset {
-			return left.offset < right.offset
-		}
-		return ragContextKeyLess(ragContextIdentity(left.context.docID, left.context.chunkIndex), ragContextIdentity(right.context.docID, right.context.chunkIndex))
-	})
+	// sort.Slice already runs the same unstable pdqsort as sort.Sort; the win
+	// here is only in the Swap. sort.Slice builds its Swap via reflect.Swapper,
+	// which falls back to a generic, pointer-aware swap for any element type
+	// containing a pointer — *ragContextCandidate is one word but still a
+	// pointer (same rationale as orderedRawRowsAsc in
+	// exec_fastpath_select.go). A concrete sort.Interface's Swap is a direct
+	// two-word assignment instead.
+	sort.Sort(ragContextCandidatesAsc(ordered))
 
 	out := make([]Row, 0, len(ordered))
 	for rank, candidate := range ordered {
@@ -408,6 +403,69 @@ type ragContextCandidate struct {
 	offset   int
 	hitIndex int
 	hitCount int
+}
+
+// ragContextCandidatesAsc gives []*ragContextCandidate a concrete Swap; see
+// its use in ragExpandContextFrom for why reflect.Swapper needs sidestepping
+// here.
+type ragContextCandidatesAsc []*ragContextCandidate
+
+func (s ragContextCandidatesAsc) Len() int { return len(s) }
+func (s ragContextCandidatesAsc) Less(i, j int) bool {
+	left, right := s[i], s[j]
+	if left.hitRank != right.hitRank {
+		return left.hitRank < right.hitRank
+	}
+	if left.hitIndex != right.hitIndex {
+		return left.hitIndex < right.hitIndex
+	}
+	if left.offset != right.offset {
+		return left.offset < right.offset
+	}
+	return ragContextKeyLess(ragContextIdentity(left.context.docID, left.context.chunkIndex), ragContextIdentity(right.context.docID, right.context.chunkIndex))
+}
+func (s ragContextCandidatesAsc) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+
+// ragContextRowsAsc orders []ragContextRow by chunkIndex, falling back to
+// original position on ties (duplicate chunk indexes for one document are
+// possible with imperfect input data). The idx tie-break is what lets
+// sort.Sort (pdqsort) replace sort.SliceStable's O(n log² n) merge while
+// reproducing the exact stable order — same pattern as orderedRawRowsAsc's
+// idx field (exec_fastpath_select.go), and a concrete Swap sidesteps
+// reflect.Swapper the same way: ragContextRow embeds an `any` (docID), so it
+// contains a pointer and misses reflect.Swapper's non-pointer fast paths
+// regardless of the struct's size.
+type ragContextRowsAsc struct {
+	rows []ragContextRow
+	idx  []int32
+}
+
+func newRagContextRowsAsc(rows []ragContextRow) ragContextRowsAsc {
+	idx := make([]int32, len(rows))
+	for i := range idx {
+		idx[i] = int32(i)
+	}
+	return ragContextRowsAsc{rows: rows, idx: idx}
+}
+
+func (s ragContextRowsAsc) Len() int { return len(s.idx) }
+func (s ragContextRowsAsc) Less(i, j int) bool {
+	pi, pj := s.idx[i], s.idx[j]
+	if s.rows[pi].chunkIndex != s.rows[pj].chunkIndex {
+		return s.rows[pi].chunkIndex < s.rows[pj].chunkIndex
+	}
+	return pi < pj
+}
+func (s ragContextRowsAsc) Swap(i, j int) {
+	s.rows[i], s.rows[j] = s.rows[j], s.rows[i]
+	s.idx[i], s.idx[j] = s.idx[j], s.idx[i]
+}
+
+// sortRagContextRows sorts rows by chunkIndex in place, preserving relative
+// order among duplicate chunk indexes exactly like the sort.SliceStable call
+// it replaces.
+func sortRagContextRows(rows []ragContextRow) {
+	sort.Sort(newRagContextRowsAsc(rows))
 }
 
 func ragStringArg(env ExecEnv, args []Expr, row Row, idx int, name string) (string, error) {
@@ -515,9 +573,7 @@ func ragFindContextRows(source ragSource, docCol, chunkCol string, docID any, ce
 		}
 		matches = append(matches, ragContextRow{sourceRow: rowIndex, docID: docVal, chunkIndex: chunkIndex})
 	}
-	sort.SliceStable(matches, func(i, j int) bool {
-		return matches[i].chunkIndex < matches[j].chunkIndex
-	})
+	sortRagContextRows(matches)
 	return matches
 }
 
@@ -584,9 +640,7 @@ func ragBuildContextIndex(source ragSource, docCol, chunkCol string) ragContextI
 // what lets find() binary-search a neighbor window.
 func ragSortContextIndex(contexts ragContextIndex) {
 	for _, chunks := range contexts.byDocument {
-		sort.SliceStable(chunks, func(i, j int) bool {
-			return chunks[i].chunkIndex < chunks[j].chunkIndex
-		})
+		sortRagContextRows(chunks)
 	}
 }
 
