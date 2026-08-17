@@ -160,6 +160,57 @@ func TestTrimImprovements(t *testing.T) {
 	if got := queryScalar(t, db, `TRIM(NULL)`); got != nil {
 		t.Errorf("TRIM(NULL): got %v", got)
 	}
+	if got := queryScalar(t, db, `TRIM(' x ', NULL)`); got != nil {
+		t.Errorf("TRIM with NULL cutset: got %v", got)
+	}
+}
+
+func TestStringColumnFunctionsUnicodeAndNullSemantics(t *testing.T) {
+	db := storage.NewDB()
+
+	for _, tc := range []struct {
+		expr string
+		want any
+	}{
+		{`LENGTH('hé日本')`, 4},
+		{`CHAR_LENGTH('hé日本')`, 4},
+		{`LEFT('hé日本', 3)`, "hé日"},
+		{`RIGHT('hé日本', 2)`, "日本"},
+		{`SUBSTRING('hé日本', 2, 2)`, "é日"},
+		{`SUBSTRING('hé日本', -2, 2)`, "日本"},
+		{`SUBSTRING('hé日本', 2, -1)`, ""},
+		{`LPAD('é', 3, '日')`, "日日é"},
+		{`RPAD('é', 3, '日')`, "é日日"},
+		{`INSTR('hé日本', '日本')`, 3},
+		{`POSITION('日本' IN 'hé日本')`, 3},
+		{`LOCATE('日本', 'hé日本')`, 3},
+		{`REPLACE('abc', '', 'x')`, "abc"},
+		{`INITCAP('éCOLE 日本語')`, "École 日本語"},
+	} {
+		if got := queryScalar(t, db, tc.expr); got != tc.want {
+			t.Errorf("%s = %#v, want %#v", tc.expr, got, tc.want)
+		}
+	}
+
+	for _, expr := range []string{
+		`LEFT('abc', NULL)`,
+		`RIGHT('abc', NULL)`,
+		`SUBSTRING('abc', NULL, 1)`,
+		`LPAD('abc', NULL, 'x')`,
+		`RPAD('abc', 4, NULL)`,
+		`REPLACE('abc', NULL, 'x')`,
+		`REPLACE('abc', 'a', NULL)`,
+		`INSTR('abc', NULL)`,
+		`POSITION(NULL IN 'abc')`,
+		`LOCATE(NULL, 'abc')`,
+		`INITCAP(NULL)`,
+		`CONCAT_WS(NULL, 'a', 'b')`,
+		`SPLIT_PART('a,b', NULL, 1)`,
+	} {
+		if got := queryScalar(t, db, expr); got != nil {
+			t.Errorf("%s = %#v, want NULL", expr, got)
+		}
+	}
 }
 
 func TestRegexpCachedAndCorrect(t *testing.T) {
