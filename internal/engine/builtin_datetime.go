@@ -178,7 +178,7 @@ func evalStrftime(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	format := fmt.Sprintf("%v", formatVal)
+	format := valueText(formatVal)
 
 	var t time.Time
 	if len(args) == 2 {
@@ -329,7 +329,7 @@ func parseDateTime(val any) (time.Time, error) {
 	if t, ok := val.(time.Time); ok {
 		return t, nil
 	}
-	str := fmt.Sprintf("%v", val)
+	str := valueText(val)
 	formats := []string{
 		time.RFC3339,
 		"2006-01-02 15:04:05",
@@ -455,7 +455,7 @@ func evalDateAdd(env ExecEnv, args []Expr, row Row) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("DATE_ADD: interval must be numeric")
 	}
-	unit := strings.ToUpper(fmt.Sprintf("%v", unitVal))
+	unit := strings.ToUpper(valueText(unitVal))
 
 	switch unit {
 	case "YEAR", "YEARS":
@@ -503,7 +503,7 @@ func evalDateSub(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, fmt.Errorf("DATE_SUB: interval must be numeric")
 	}
 	interval = -interval // Negate for subtraction
-	unit := strings.ToUpper(fmt.Sprintf("%v", unitVal))
+	unit := strings.ToUpper(valueText(unitVal))
 
 	switch unit {
 	case "YEAR", "YEARS":

@@ -172,10 +172,7 @@ func evalTrimCommon(env ExecEnv, name string, side trimSide, args []Expr, row Ro
 	if val == nil {
 		return nil, nil
 	}
-	str, ok := val.(string)
-	if !ok {
-		str = fmt.Sprintf("%v", val)
-	}
+	str := valueText(val)
 
 	cutset := ""
 	if len(args) == 2 {
@@ -192,25 +189,34 @@ func evalTrimCommon(env ExecEnv, name string, side trimSide, args []Expr, row Ro
 		}
 	}
 
+	var trimmed string
 	if cutset == "" {
 		// Default: Unicode-aware whitespace trimming.
 		switch side {
 		case trimLeft:
-			return strings.TrimLeftFunc(str, unicode.IsSpace), nil
+			trimmed = strings.TrimLeftFunc(str, unicode.IsSpace)
 		case trimRight:
-			return strings.TrimRightFunc(str, unicode.IsSpace), nil
+			trimmed = strings.TrimRightFunc(str, unicode.IsSpace)
 		default:
-			return strings.TrimSpace(str), nil
+			trimmed = strings.TrimSpace(str)
+		}
+	} else {
+		switch side {
+		case trimLeft:
+			trimmed = strings.TrimLeft(str, cutset)
+		case trimRight:
+			trimmed = strings.TrimRight(str, cutset)
+		default:
+			trimmed = strings.Trim(str, cutset)
 		}
 	}
-	switch side {
-	case trimLeft:
-		return strings.TrimLeft(str, cutset), nil
-	case trimRight:
-		return strings.TrimRight(str, cutset), nil
-	default:
-		return strings.Trim(str, cutset), nil
+	// Nothing trimmed from a string argument: hand back the argument's
+	// interface value instead of re-boxing the identical string — one heap
+	// allocation per row saved on the common no-op trim.
+	if _, ok := val.(string); ok && len(trimmed) == len(str) {
+		return val, nil
 	}
+	return trimmed, nil
 }
 
 func evalLTrim(env ExecEnv, args []Expr, row Row) (any, error) {
@@ -253,12 +259,16 @@ func evalUpper(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, nil
 	}
 
-	str, ok := val.(string)
-	if !ok {
-		str = fmt.Sprintf("%v", val)
-	}
+	str := valueText(val)
 
-	return strings.ToUpper(str), nil
+	upper := strings.ToUpper(str)
+	// ToUpper returns str itself when no rune changes; reuse the argument's
+	// interface box in that case (== short-circuits on identical backing
+	// pointers before comparing bytes).
+	if _, ok := val.(string); ok && upper == str {
+		return val, nil
+	}
+	return upper, nil
 }
 
 func evalLower(env ExecEnv, args []Expr, row Row) (any, error) {
@@ -275,12 +285,14 @@ func evalLower(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, nil
 	}
 
-	str, ok := val.(string)
-	if !ok {
-		str = fmt.Sprintf("%v", val)
-	}
+	str := valueText(val)
 
-	return strings.ToLower(str), nil
+	lower := strings.ToLower(str)
+	// Same no-change box reuse as evalUpper.
+	if _, ok := val.(string); ok && lower == str {
+		return val, nil
+	}
+	return lower, nil
 }
 
 func evalConcat(env ExecEnv, args []Expr, row Row) (any, error) {
@@ -296,11 +308,7 @@ func evalConcat(env ExecEnv, args []Expr, row Row) (any, error) {
 		}
 
 		if val != nil {
-			str, ok := val.(string)
-			if !ok {
-				str = fmt.Sprintf("%v", val)
-			}
-			sb.WriteString(str)
+			sb.WriteString(valueText(val))
 		}
 	}
 
@@ -321,10 +329,7 @@ func evalLength(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, nil
 	}
 
-	str, ok := val.(string)
-	if !ok {
-		str = fmt.Sprintf("%v", val)
-	}
+	str := valueText(val)
 
 	return len(str), nil
 }
@@ -344,10 +349,7 @@ func evalSubstring(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, nil
 	}
 
-	str, ok := val.(string)
-	if !ok {
-		str = fmt.Sprintf("%v", val)
-	}
+	str := valueText(val)
 
 	// Get start position (1-indexed in SQL)
 	startVal, err := evalExpr(env, args[1], row)
@@ -408,10 +410,7 @@ func evalLeft(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, nil
 	}
 
-	str, ok := val.(string)
-	if !ok {
-		str = fmt.Sprintf("%v", val)
-	}
+	str := valueText(val)
 
 	lenVal, err := evalExpr(env, args[1], row)
 	if err != nil {
@@ -429,7 +428,10 @@ func evalLeft(env ExecEnv, args []Expr, row Row) (any, error) {
 	if length < 0 {
 		return "", nil
 	}
-	if length > len(str) {
+	if length >= len(str) {
+		if _, ok := val.(string); ok {
+			return val, nil
+		}
 		return str, nil
 	}
 	return str[:length], nil
@@ -448,10 +450,7 @@ func evalRight(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, nil
 	}
 
-	str, ok := val.(string)
-	if !ok {
-		str = fmt.Sprintf("%v", val)
-	}
+	str := valueText(val)
 
 	lenVal, err := evalExpr(env, args[1], row)
 	if err != nil {
@@ -469,7 +468,10 @@ func evalRight(env ExecEnv, args []Expr, row Row) (any, error) {
 	if length < 0 {
 		return "", nil
 	}
-	if length > len(str) {
+	if length >= len(str) {
+		if _, ok := val.(string); ok {
+			return val, nil
+		}
 		return str, nil
 	}
 	return str[len(str)-length:], nil
@@ -486,19 +488,19 @@ func evalReplace(env ExecEnv, args []Expr, row Row) (any, error) {
 	if val == nil {
 		return nil, nil
 	}
-	str := fmt.Sprintf("%v", val)
+	str := valueText(val)
 
 	fromVal, err := evalExpr(env, args[1], row)
 	if err != nil {
 		return nil, err
 	}
-	from := fmt.Sprintf("%v", fromVal)
+	from := valueText(fromVal)
 
 	toVal, err := evalExpr(env, args[2], row)
 	if err != nil {
 		return nil, err
 	}
-	to := fmt.Sprintf("%v", toVal)
+	to := valueText(toVal)
 
 	return strings.ReplaceAll(str, from, to), nil
 }
@@ -514,13 +516,13 @@ func evalInstr(env ExecEnv, args []Expr, row Row) (any, error) {
 	if val == nil {
 		return 0, nil
 	}
-	str := fmt.Sprintf("%v", val)
+	str := valueText(val)
 
 	searchVal, err := evalExpr(env, args[1], row)
 	if err != nil {
 		return nil, err
 	}
-	search := fmt.Sprintf("%v", searchVal)
+	search := valueText(searchVal)
 
 	idx := strings.Index(str, search)
 	if idx == -1 {
@@ -540,7 +542,7 @@ func evalReverse(env ExecEnv, args []Expr, row Row) (any, error) {
 	if val == nil {
 		return nil, nil
 	}
-	str := fmt.Sprintf("%v", val)
+	str := valueText(val)
 	runes := []rune(str)
 	for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
 		runes[i], runes[j] = runes[j], runes[i]
@@ -559,7 +561,7 @@ func evalRepeat(env ExecEnv, args []Expr, row Row) (any, error) {
 	if val == nil {
 		return nil, nil
 	}
-	str := fmt.Sprintf("%v", val)
+	str := valueText(val)
 
 	countVal, err := evalExpr(env, args[1], row)
 	if err != nil {
@@ -584,7 +586,7 @@ func evalPrintf(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	format := fmt.Sprintf("%v", formatVal)
+	format := valueText(formatVal)
 
 	fmtArgs := make([]any, len(args)-1)
 	for i := 1; i < len(args); i++ {
@@ -608,7 +610,7 @@ func evalLpad(env ExecEnv, args []Expr, row Row) (any, error) {
 	if val == nil {
 		return nil, nil
 	}
-	str := fmt.Sprintf("%v", val)
+	str := valueText(val)
 
 	lenVal, err := evalExpr(env, args[1], row)
 	if err != nil {
@@ -629,7 +631,7 @@ func evalLpad(env ExecEnv, args []Expr, row Row) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		pad = fmt.Sprintf("%v", padVal)
+		pad = valueText(padVal)
 		if pad == "" {
 			pad = " "
 		}
@@ -654,7 +656,7 @@ func evalRpad(env ExecEnv, args []Expr, row Row) (any, error) {
 	if val == nil {
 		return nil, nil
 	}
-	str := fmt.Sprintf("%v", val)
+	str := valueText(val)
 
 	lenVal, err := evalExpr(env, args[1], row)
 	if err != nil {
@@ -675,7 +677,7 @@ func evalRpad(env ExecEnv, args []Expr, row Row) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		pad = fmt.Sprintf("%v", padVal)
+		pad = valueText(padVal)
 		if pad == "" {
 			pad = " "
 		}
@@ -743,7 +745,7 @@ func evalAscii(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := fmt.Sprintf("%v", val)
+	s := valueText(val)
 	if len(s) == 0 {
 		return 0, nil
 	}
@@ -776,7 +778,7 @@ func evalInitcap(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := fmt.Sprintf("%v", val)
+	s := valueText(val)
 	words := strings.Fields(s)
 	for i, word := range words {
 		if len(word) > 0 {
@@ -802,8 +804,8 @@ func evalSplitPart(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := fmt.Sprintf("%v", strVal)
-	delim := fmt.Sprintf("%v", delimVal)
+	s := valueText(strVal)
+	delim := valueText(delimVal)
 	part, ok := numeric(partVal)
 	if !ok {
 		return nil, fmt.Errorf("SPLIT_PART: part must be numeric")
@@ -827,7 +829,7 @@ func evalQuote(env ExecEnv, args []Expr, row Row) (any, error) {
 	if val == nil {
 		return "NULL", nil
 	}
-	s := fmt.Sprintf("%v", val)
+	s := valueText(val)
 	escaped := strings.ReplaceAll(s, "'", "''")
 	return "'" + escaped + "'", nil
 }
@@ -840,7 +842,7 @@ func evalConcatWs(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	sep := fmt.Sprintf("%v", sepVal)
+	sep := valueText(sepVal)
 	var parts []string
 	for _, arg := range args[1:] {
 		v, err := evalExpr(env, arg, row)
@@ -848,7 +850,7 @@ func evalConcatWs(env ExecEnv, args []Expr, row Row) (any, error) {
 			return nil, err
 		}
 		if v != nil {
-			parts = append(parts, fmt.Sprintf("%v", v))
+			parts = append(parts, valueText(v))
 		}
 	}
 	return strings.Join(parts, sep), nil
@@ -867,8 +869,8 @@ func evalPosition(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	sub := fmt.Sprintf("%v", subVal)
-	str := fmt.Sprintf("%v", strVal)
+	sub := valueText(subVal)
+	str := valueText(strVal)
 	idx := strings.Index(str, sub)
 	if idx < 0 {
 		return 0, nil
@@ -940,14 +942,14 @@ func castValue(val any, targetType string) (any, error) {
 
 	switch targetType {
 	case "TEXT", "STRING", "VARCHAR", "CHAR":
-		return fmt.Sprintf("%v", val), nil
+		return valueText(val), nil
 	case "INT", "INTEGER":
 		return coerceToInt(val)
 	case "FLOAT", "REAL", "DOUBLE", "NUMERIC":
 		if f, ok := numeric(val); ok {
 			return f, nil
 		}
-		str := fmt.Sprintf("%v", val)
+		str := valueText(val)
 		return strconv.ParseFloat(str, 64)
 	case "BOOL", "BOOLEAN":
 		switch v := val.(type) {

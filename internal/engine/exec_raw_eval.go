@@ -205,6 +205,12 @@ func evalRawFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, erro
 		args[i] = &lits[i]
 	}
 	sc.call = FuncCall{Name: ex.Name, Args: args, Star: ex.Star, Distinct: ex.Distinct}
+	if ex.handler != nil {
+		// Handler resolved at parse time; call it directly instead of going
+		// back through evalFuncCall's registry dispatch. ex.Over was already
+		// rejected above, so this cannot bypass the window-function check.
+		return ex.handler(ExecEnv{}, &sc.call, rawEmptyRow)
+	}
 	return evalFuncCall(ExecEnv{}, &sc.call, rawEmptyRow)
 }
 
@@ -325,14 +331,8 @@ func evalRawLike(plan *simpleSelectPlan, raw []any, ex *LikeExpr) (any, error) {
 		// evalRawUnary's NOT case, which relies on toTri/triNot).
 		return nil, nil
 	}
-	str, ok := val.(string)
-	if !ok {
-		str = fmt.Sprintf("%v", val)
-	}
-	pattern, ok := patVal.(string)
-	if !ok {
-		pattern = fmt.Sprintf("%v", patVal)
-	}
+	str := valueText(val)
+	pattern := valueText(patVal)
 	var matched bool
 	if ex.GlobStyle {
 		if ex.CaseInsensitive {
@@ -380,8 +380,8 @@ func evalRawRegexp(plan *simpleSelectPlan, raw []any, ex *RegexpExpr) (any, erro
 		// not false, so an enclosing NOT stays excluded rather than flipping.
 		return nil, nil
 	}
-	str := fmt.Sprintf("%v", val)
-	pattern := fmt.Sprintf("%v", patVal)
+	str := valueText(val)
+	pattern := valueText(patVal)
 	if ex.SimilarTo {
 		pattern = similarToRegexp(pattern)
 	}

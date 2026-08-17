@@ -201,6 +201,7 @@ func loadSimpleSelectPlanTemplate(table *storage.Table, s *Select, reusableSchem
 		projs:         projs,
 		orderBy:       s.OrderBy,
 		orderExprs:    orderExprs,
+		orderCols:     simpleSelectOrderCols(orderExprs, colIndex, len(table.Cols)),
 		where:         s.Where,
 		filter:        filter,
 		limit:         s.Limit,

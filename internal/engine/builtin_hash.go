@@ -21,7 +21,7 @@ func evalSoundex(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := strings.ToUpper(fmt.Sprintf("%v", val))
+	s := strings.ToUpper(valueText(val))
 	if len(s) == 0 {
 		return "", nil
 	}
@@ -59,7 +59,7 @@ func evalHex(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := fmt.Sprintf("%v", val)
+	s := valueText(val)
 	return fmt.Sprintf("%X", []byte(s)), nil
 }
 
@@ -71,7 +71,7 @@ func evalUnhex(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := fmt.Sprintf("%v", val)
+	s := valueText(val)
 	if len(s)%2 != 0 {
 		s = "0" + s
 	}
@@ -110,10 +110,7 @@ func evalMD5(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, nil
 	}
 
-	str, ok := val.(string)
-	if !ok {
-		str = fmt.Sprintf("%v", val)
-	}
+	str := valueText(val)
 
 	// MD5 hash
 	hasher := md5.New()
@@ -135,10 +132,7 @@ func evalSHA1(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, nil
 	}
 
-	str, ok := val.(string)
-	if !ok {
-		str = fmt.Sprintf("%v", val)
-	}
+	str := valueText(val)
 
 	// SHA1 hash
 	hasher := sha1.New()
@@ -160,10 +154,7 @@ func evalSHA256(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, nil
 	}
 
-	str, ok := val.(string)
-	if !ok {
-		str = fmt.Sprintf("%v", val)
-	}
+	str := valueText(val)
 
 	// SHA256 hash
 	hasher := sha256.New()
@@ -185,10 +176,7 @@ func evalSHA512(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, nil
 	}
 
-	str, ok := val.(string)
-	if !ok {
-		str = fmt.Sprintf("%v", val)
-	}
+	str := valueText(val)
 
 	// SHA512 hash
 	hasher := sha512.New()
@@ -210,10 +198,7 @@ func evalBase64(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, nil
 	}
 
-	str, ok := val.(string)
-	if !ok {
-		str = fmt.Sprintf("%v", val)
-	}
+	str := valueText(val)
 
 	// Base64 encode
 	encoded := base64.StdEncoding.EncodeToString([]byte(str))
@@ -234,10 +219,7 @@ func evalBase64Decode(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, nil
 	}
 
-	str, ok := val.(string)
-	if !ok {
-		str = fmt.Sprintf("%v", val)
-	}
+	str := valueText(val)
 
 	// Base64 decode
 	decoded, err := base64.StdEncoding.DecodeString(str)

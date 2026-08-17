@@ -12,6 +12,33 @@ import (
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
+// valueText renders a scalar exactly like fmt.Sprintf("%v", v) but without
+// entering fmt for the types SQL values actually take. Scalar functions
+// coerce arguments to text with this on every call of every row; fmt's
+// reflection walk — and, for strings, its needless copy — dominated their
+// profiles. Types without a fast case (e.g. []byte, whose %v form is the
+// decimal byte list) fall back to fmt to keep output byte-identical.
+func valueText(v any) string {
+	switch s := v.(type) {
+	case string:
+		return s
+	case int:
+		return strconv.Itoa(s)
+	case int64:
+		return strconv.FormatInt(s, 10)
+	case float64:
+		// %v formats float64 as strconv's shortest 'g' form.
+		return strconv.FormatFloat(s, 'g', -1, 64)
+	case bool:
+		if s {
+			return "true"
+		}
+		return "false"
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
 func inferType(v any) storage.ColType {
 	switch v.(type) {
 	case int, int64:

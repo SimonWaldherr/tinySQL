@@ -770,7 +770,13 @@ type orderedValuePermAsc struct {
 
 func (s orderedValuePermAsc) Len() int { return len(s.perm) }
 func (s orderedValuePermAsc) Less(i, j int) bool {
-	return compareOrderedValueRows(s.orderBy, s.items[s.perm[i]], s.items[s.perm[j]]) < 0
+	if cmp := compareOrderedValueRows(s.orderBy, s.items[s.perm[i]], s.items[s.perm[j]]); cmp != 0 {
+		return cmp < 0
+	}
+	// perm starts as the identity permutation, so its values are original
+	// positions: breaking key ties on them makes the unstable sort.Sort
+	// reproduce exactly the stable order sort.Stable used to produce.
+	return s.perm[i] < s.perm[j]
 }
 func (s orderedValuePermAsc) Swap(i, j int) { s.perm[i], s.perm[j] = s.perm[j], s.perm[i] }
 
@@ -780,8 +786,8 @@ func (s orderedValuePermAsc) Swap(i, j int) { s.perm[i], s.perm[j] = s.perm[j], 
 // apply the exact same ordering (including tie-breaking) as sortRows: it
 // drives the sort from one permutation of positions using the identical
 // comparator (compareOrderedValueRows over the same per-row keys extracted
-// by buildOrderByValues) and the same stable sort, so ties resolve exactly
-// as they do in sortRows -- by original relative order.
+// by buildOrderByValues) and the same original-position tie-break, so ties
+// resolve exactly as they do in sortRows -- by original relative order.
 func sortRowsIndexed(rows []Row, origIdx []int, orderBy []OrderItem) ([]Row, []int) {
 	sorted := make([]Row, len(rows))
 	copy(sorted, rows)
@@ -804,7 +810,7 @@ func sortRowsIndexed(rows []Row, origIdx []int, orderBy []OrderItem) ([]Row, []i
 	for i := range perm {
 		perm[i] = i
 	}
-	sort.Stable(orderedValuePermAsc{orderBy: orderBy, items: items, perm: perm})
+	sort.Sort(orderedValuePermAsc{orderBy: orderBy, items: items, perm: perm})
 
 	outRows := make([]Row, len(sorted))
 	outIdx := make([]int, len(sorted))
@@ -864,8 +870,9 @@ func sortRows(rows []Row, orderBy []OrderItem) []Row {
 	items := make([]orderedValueRow, len(sorted))
 	for i, row := range sorted {
 		items[i] = buildOrderByValues(row, lcOrdCols)
+		items[i].idx = i
 	}
-	sort.Stable(orderedValueRowsAsc{orderBy: orderBy, items: items})
+	sort.Sort(orderedValueRowsAsc{orderBy: orderBy, items: items})
 	for i, item := range items {
 		sorted[i] = item.row
 	}

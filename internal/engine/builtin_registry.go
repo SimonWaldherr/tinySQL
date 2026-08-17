@@ -150,6 +150,10 @@ func evalFuncCall(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return evalWindowFunction(env, ex, row)
 	}
 
+	if ex.handler != nil {
+		// Resolved once at parse time; skips the registry lookup per call.
+		return ex.handler(env, ex, row)
+	}
 	builtinFunctions := getAllFunctions()
 	if handler, ok := builtinFunctions[ex.Name]; ok {
 		return handler(env, ex, row)
@@ -158,6 +162,17 @@ func evalFuncCall(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return handler(env, ex, row)
 	}
 	return nil, fmt.Errorf("unknown function: %s", ex.Name)
+}
+
+// bindFuncHandler resolves a parsed call's registry handler once. Parse-time
+// resolution keeps evaluation free of both the map lookup and any lazy-write
+// race — the field is only ever written here, before the statement is shared.
+// Unknown names stay nil and produce their error at evaluation, as before.
+func bindFuncHandler(fc *FuncCall) *FuncCall {
+	if h, ok := getAllFunctions()[fc.Name]; ok {
+		fc.handler = h
+	}
+	return fc
 }
 
 // Wrapper functions to match funcHandler signature

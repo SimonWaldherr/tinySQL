@@ -37,7 +37,7 @@ func evalYAMLParse(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if v == nil {
 		return nil, nil
 	}
-	text := fmt.Sprintf("%v", v)
+	text := valueText(v)
 	// Very lightweight check: non-empty and no unmatched braces/brackets.
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -63,8 +63,8 @@ func evalYAMLGet(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if yamlVal == nil || pathVal == nil {
 		return nil, nil
 	}
-	yamlText := fmt.Sprintf("%v", yamlVal)
-	path := fmt.Sprintf("%v", pathVal)
+	yamlText := valueText(yamlVal)
+	path := valueText(pathVal)
 
 	// Simple line-by-line YAML key lookup for the first path segment.
 	// Handles only top-level scalar keys.
@@ -102,7 +102,7 @@ func evalURLParse(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if v == nil {
 		return nil, nil
 	}
-	raw := fmt.Sprintf("%v", v)
+	raw := valueText(v)
 	u, err := url.Parse(raw)
 	if err != nil {
 		return nil, fmt.Errorf("URL_PARSE: %w", err)
@@ -130,7 +130,7 @@ func evalURLEncode(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if v == nil {
 		return nil, nil
 	}
-	return url.QueryEscape(fmt.Sprintf("%v", v)), nil
+	return url.QueryEscape(valueText(v)), nil
 }
 
 // evalURLDecode percent-decodes a URL-encoded string.
@@ -145,7 +145,7 @@ func evalURLDecode(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if v == nil {
 		return nil, nil
 	}
-	decoded, err := url.QueryUnescape(fmt.Sprintf("%v", v))
+	decoded, err := url.QueryUnescape(valueText(v))
 	if err != nil {
 		return nil, fmt.Errorf("URL_DECODE: %w", err)
 	}
@@ -171,7 +171,7 @@ func evalHashFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if algVal == nil || textVal == nil {
 		return nil, nil
 	}
-	alg := strings.ToLower(fmt.Sprintf("%v", algVal))
+	alg := strings.ToLower(valueText(algVal))
 	// Hash the actual bytes. fmt.Sprintf("%v", []byte{...}) renders a decimal
 	// list ("[104 105]"), so a BLOB would otherwise be hashed as that text
 	// rather than its bytes, yielding a digest of the wrong data.
@@ -182,7 +182,7 @@ func evalHashFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	case string:
 		data = []byte(v)
 	default:
-		data = []byte(fmt.Sprintf("%v", textVal))
+		data = []byte(valueText(textVal))
 	}
 
 	switch alg {
@@ -270,7 +270,7 @@ func evalBitmapSet(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	}
 	bmStr := ""
 	if bmVal != nil {
-		bmStr = fmt.Sprintf("%v", bmVal)
+		bmStr = valueText(bmVal)
 	}
 	bm, err := bitmapDecode(bmStr)
 	if err != nil {
@@ -304,7 +304,7 @@ func evalBitmapGet(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if bitN < 0 || bitN >= bitmapMaxBytes*8 {
 		return false, nil
 	}
-	bmStr := fmt.Sprintf("%v", bmVal)
+	bmStr := valueText(bmVal)
 	bm, err := bitmapDecode(bmStr)
 	if err != nil {
 		return nil, err
@@ -325,7 +325,7 @@ func evalBitmapCount(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if bmVal == nil {
 		return 0, nil
 	}
-	bmStr := fmt.Sprintf("%v", bmVal)
+	bmStr := valueText(bmVal)
 	bm, err := bitmapDecode(bmStr)
 	if err != nil {
 		return nil, err
@@ -351,11 +351,11 @@ func evalBitmapOr(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	}
 	aStr := ""
 	if aVal != nil {
-		aStr = fmt.Sprintf("%v", aVal)
+		aStr = valueText(aVal)
 	}
 	bStr := ""
 	if bVal != nil {
-		bStr = fmt.Sprintf("%v", bVal)
+		bStr = valueText(bVal)
 	}
 	a, err := bitmapDecode(aStr)
 	if err != nil {
@@ -386,11 +386,11 @@ func evalBitmapAnd(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	}
 	aStr := ""
 	if aVal != nil {
-		aStr = fmt.Sprintf("%v", aVal)
+		aStr = valueText(aVal)
 	}
 	bStr := ""
 	if bVal != nil {
-		bStr = fmt.Sprintf("%v", bVal)
+		bStr = valueText(bVal)
 	}
 	a, err := bitmapDecode(aStr)
 	if err != nil {

@@ -221,7 +221,17 @@ type floatOrderedRawRowHeap struct {
 
 func (h floatOrderedRawRowHeap) less(i, j int) bool {
 	// The heap root is the worst retained row, hence the reversed comparison.
-	return compareOrderedFloat(h.items[i].key, h.items[j].key, h.desc) > 0
+	// Direct float comparisons — semantically identical to the generic
+	// comparator (NaN ranks equal to everything, ties are not less) but small
+	// enough to inline into every heap level of every pushed row.
+	a, b := h.items[i].key, h.items[j].key
+	if a < b {
+		return h.desc
+	}
+	if a > b {
+		return !h.desc
+	}
+	return false
 }
 
 func (h floatOrderedRawRowHeap) swap(i, j int) {
@@ -241,8 +251,17 @@ func (h *floatOrderedRawRowHeap) pushBounded(item floatOrderedRawRow, keepCount 
 		}
 		return
 	}
-	if compareOrderedFloat(h.items[0].key, item.key, h.desc) <= 0 {
-		return
+	// Insert only when item is strictly better than the current worst (the
+	// root); ties — including NaN, which compares equal to everything — keep
+	// the incumbent. Direct comparisons for the same inlining reason as less.
+	if h.desc {
+		if !(item.key > h.items[0].key) {
+			return
+		}
+	} else {
+		if !(item.key < h.items[0].key) {
+			return
+		}
 	}
 	h.items[0] = item
 	for i, n := 0, len(h.items); ; {
@@ -274,22 +293,19 @@ type floatOrderedRawRowsAsc struct {
 
 func (s floatOrderedRawRowsAsc) Len() int { return len(s.items) }
 func (s floatOrderedRawRowsAsc) Less(i, j int) bool {
-	return compareOrderedFloat(s.items[i].key, s.items[j].key, s.desc) < 0
+	// Direct float comparisons; NaN ranks equal to everything and ties are
+	// not less, so sort.Stable keeps their existing order.
+	a, b := s.items[i].key, s.items[j].key
+	if a < b {
+		return !s.desc
+	}
+	if a > b {
+		return s.desc
+	}
+	return false
 }
 func (s floatOrderedRawRowsAsc) Swap(i, j int) { s.items[i], s.items[j] = s.items[j], s.items[i] }
 
-func compareOrderedFloat(a, b float64, desc bool) int {
-	cmp := 0
-	if a < b {
-		cmp = -1
-	} else if a > b {
-		cmp = 1
-	}
-	if desc {
-		return -cmp
-	}
-	return cmp
-}
 
 func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*ResultSet, bool, error) {
 	if plan.limit != nil && *plan.limit == 0 {
@@ -339,6 +355,11 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 	}
 
 	rows := make([]orderedRawRow, 0, simpleSelectInitialCap(plan))
+	// keyArena backs the per-row keys slices of multi-column orders in a few
+	// large chunks. Freshly packed keys sort measurably faster than reads
+	// scattered across per-row allocations or the raw rows themselves, and
+	// the chunks cost a handful of allocations instead of one per row.
+	var keyArena []any
 	var topRows orderedRawRowHeap
 	useTopN := keepCount > 0
 	if useTopN {
@@ -369,28 +390,47 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 		if !match {
 			continue
 		}
-		if len(plan.orderExprs) == 1 {
+		var item orderedRawRow
+		switch {
+		case plan.orderCols != nil:
+			// Every ORDER BY term is a direct column reference: read sort
+			// keys straight out of the raw row instead of the per-term
+			// evalRawExpr map lookups.
+			for k, col := range plan.orderCols {
+				if col >= len(raw) {
+					// Same error evalRawExpr raises for a ragged raw row;
+					// orderCols non-nil guarantees every term is a *VarRef.
+					return nil, true, fmt.Errorf("column %q is out of range", plan.orderExprs[k].(*VarRef).Name)
+				}
+			}
+			if len(plan.orderCols) == 1 {
+				item = orderedRawRow{raw: raw, key: raw[plan.orderCols[0]]}
+			} else {
+				var keys []any
+				keyArena, keys = reserveKeySlots(keyArena, len(plan.orderCols))
+				for i, col := range plan.orderCols {
+					keys[i] = raw[col]
+				}
+				item = orderedRawRow{raw: raw, keys: keys}
+			}
+		case len(plan.orderExprs) == 1:
 			key, err := evalRawExpr(plan, raw, plan.orderExprs[0])
 			if err != nil {
 				return nil, true, err
 			}
-			item := orderedRawRow{raw: raw, key: key}
-			if useTopN {
-				topRows.pushBounded(item, keepCount)
-			} else {
-				rows = append(rows, item)
+			item = orderedRawRow{raw: raw, key: key}
+		default:
+			var keys []any
+			keyArena, keys = reserveKeySlots(keyArena, len(plan.orderExprs))
+			for i, expr := range plan.orderExprs {
+				v, err := evalRawExpr(plan, raw, expr)
+				if err != nil {
+					return nil, true, err
+				}
+				keys[i] = v
 			}
-			continue
+			item = orderedRawRow{raw: raw, keys: keys}
 		}
-		keys := make([]any, len(plan.orderExprs))
-		for i, expr := range plan.orderExprs {
-			v, err := evalRawExpr(plan, raw, expr)
-			if err != nil {
-				return nil, true, err
-			}
-			keys[i] = v
-		}
-		item := orderedRawRow{raw: raw, keys: keys}
 		if useTopN {
 			topRows.pushBounded(item, keepCount)
 		} else {
@@ -401,23 +441,34 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 		rows = topRows.items
 	}
 
-	sort.Stable(orderedRawRowsAsc{plan: plan, items: rows})
+	// Sort a permutation of positions instead of the items themselves: a swap
+	// moves 4 bytes instead of a whole orderedRawRow, which is what dominates
+	// large sorts. perm starts as the identity permutation, so its values are
+	// pre-sort positions; breaking comparator ties on them makes the unstable
+	// (pdqsort) sort.Sort reproduce exactly the order sort.Stable produced
+	// here before — scan order for full sorts, heap order for top-N — without
+	// symMerge's O(n log² n) element moves.
+	perm := make([]int32, len(rows))
+	for i := range perm {
+		perm[i] = int32(i)
+	}
+	sort.Sort(orderedRawRowsPermAsc{plan: plan, items: rows, perm: perm})
 
 	start := 0
 	if plan.offset != nil && *plan.offset > 0 {
 		start = *plan.offset
 	}
-	if start > len(rows) {
+	if start > len(perm) {
 		return &ResultSet{Cols: plan.outputCols, Rows: []Row{}}, true, nil
 	}
-	rows = rows[start:]
-	if plan.limit != nil && *plan.limit < len(rows) {
-		rows = rows[:*plan.limit]
+	perm = perm[start:]
+	if plan.limit != nil && *plan.limit < len(perm) {
+		perm = perm[:*plan.limit]
 	}
 
-	outRows := make([]Row, 0, len(rows))
-	for _, item := range rows {
-		out, err := projectRawRow(plan, item.raw)
+	outRows := make([]Row, 0, len(perm))
+	for _, p := range perm {
+		out, err := projectRawRow(plan, rows[p].raw)
 		if err != nil {
 			return nil, true, err
 		}
@@ -426,24 +477,48 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, true, nil
 }
 
-// orderedRawRowsAsc adapts a []orderedRawRow slice to sort.Interface with a
-// concrete Swap. orderedRawRow holds a raw-row slice plus a key/keys slice —
-// large enough and pointer-heavy enough that reflect.Swapper (what
-// sort.Slice/SliceStable uses internally) falls back to a generic
-// reflect-driven memmove per swap instead of a direct assignment. This is
-// the dominant cost on a full (non-LIMIT) ORDER BY: profiling
-// BenchmarkOrderByMultiColumnNoLimit showed ~15% of CPU time in
-// reflectlite.Swapper/typedmemmove alone.
-type orderedRawRowsAsc struct {
-	plan  *simpleSelectPlan
-	items []orderedRawRow
+// rawKeyArenaChunkRows sizes keyArena chunks in rows' worth of keys. Chunking
+// keeps allocation proportional to matched rows — a selective WHERE must not
+// pre-pay key storage for the whole table — while keeping each chunk's keys
+// densely packed for the sort comparator.
+const rawKeyArenaChunkRows = 4096
+
+// reserveKeySlots carves a length-k keys slice out of arena, starting a fresh
+// chunk when the current one is full. Full chunks stay referenced by the item
+// key slices already pointing into them; the capped three-index views can
+// never overlap.
+func reserveKeySlots(arena []any, k int) (newArena, keys []any) {
+	if len(arena)+k > cap(arena) {
+		arena = make([]any, 0, rawKeyArenaChunkRows*k)
+	}
+	start := len(arena)
+	arena = arena[: start+k : cap(arena)]
+	return arena, arena[start : start+k : start+k]
 }
 
-func (s orderedRawRowsAsc) Len() int { return len(s.items) }
-func (s orderedRawRowsAsc) Less(i, j int) bool {
-	return compareOrderedRawRows(s.plan, s.items[i], s.items[j]) < 0
+// orderedRawRowsPermAsc sorts a permutation of positions into items rather
+// than items itself. orderedRawRow is a 64-byte, pointer-heavy struct, so
+// swapping elements directly is the dominant sort cost at scale; swapping
+// int32 positions moves 4 bytes. perm must start as the identity permutation:
+// its values are pre-sort positions, and the comparator breaks key ties on
+// them, which both pins a total order (so the pdqsort result is unique) and
+// reproduces stable-sort semantics. int32 suffices because these are indexes
+// into an in-memory row slice.
+type orderedRawRowsPermAsc struct {
+	plan  *simpleSelectPlan
+	items []orderedRawRow
+	perm  []int32
 }
-func (s orderedRawRowsAsc) Swap(i, j int) { s.items[i], s.items[j] = s.items[j], s.items[i] }
+
+func (s orderedRawRowsPermAsc) Len() int { return len(s.perm) }
+func (s orderedRawRowsPermAsc) Less(i, j int) bool {
+	pi, pj := s.perm[i], s.perm[j]
+	if cmp := compareOrderedRawRows(s.plan, s.items[pi], s.items[pj]); cmp != 0 {
+		return cmp < 0
+	}
+	return pi < pj
+}
+func (s orderedRawRowsPermAsc) Swap(i, j int) { s.perm[i], s.perm[j] = s.perm[j], s.perm[i] }
 
 type orderedRawRowHeap struct {
 	plan  *simpleSelectPlan
