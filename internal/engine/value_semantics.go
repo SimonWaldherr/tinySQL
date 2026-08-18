@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -27,6 +28,23 @@ func putVal(row Row, key string, val any) { row[strings.ToLower(key)] = val }
 
 func isNull(v any) bool { return v == nil }
 
+// numeric reports whether v is a plain machine number (int/int64/float64),
+// returning its float64 value when so.
+//
+// *big.Rat/big.Rat -- this engine's exact-decimal representation --
+// deliberately do NOT match here, even though they are numeric in the SQL
+// sense. Every caller that checks numeric() first (exec_fastpath_aggregate.go
+// SUM/AVG, eval_aggregate.go's SUM/AVG and unary +/-) falls back to
+// storage.DecimalFromAny specifically to keep DECIMAL/MONEY accumulation
+// exact via big.Rat instead of collapsing it through a lossy float64. Adding
+// a big.Rat case here was tried and reverted: it made numeric() report true
+// for a DECIMAL value, so every one of those callers took the fast (lossy)
+// branch on the very first row of a group -- before their own
+// useRat/DecimalFromAny fallback ever got a chance to engage -- turning
+// `SELECT SUM(decimal_col)` into a float64 approximation instead of an exact
+// big.Rat sum (caught by TestAggregateFastPathDecimalSum). Call
+// storage.DecimalFromAny directly wherever a big.Rat needs to be treated as
+// numeric; do not extend this function to accept it.
 func numeric(v any) (float64, bool) {
 	switch x := v.(type) {
 	case int:
@@ -47,6 +65,12 @@ func coerceToFloat(v any) (any, error) {
 		return float64(x), nil
 	case float64:
 		return x, nil
+	case *big.Rat:
+		f, _ := x.Float64()
+		return f, nil
+	case big.Rat:
+		f, _ := x.Float64()
+		return f, nil
 	case string:
 		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
 		if err != nil {
@@ -88,6 +112,8 @@ func truthy(v any) bool {
 	case bool:
 		return x
 	case int:
+		return x != 0
+	case int64:
 		return x != 0
 	case float64:
 		return x != 0
@@ -156,6 +182,8 @@ func compare(a, b any) (int, error) {
 		return compareBigRat(&ax, b)
 	case int:
 		return compareInt(ax, b)
+	case int64:
+		return compareInt64(ax, b)
 	case float64:
 		return compareFloat(ax, b)
 	case string:
@@ -164,6 +192,8 @@ func compare(a, b any) (int, error) {
 		return compareBool(ax, b)
 	case []byte:
 		return compareBytes(ax, b)
+	case time.Time:
+		return compareTime(ax, b)
 	}
 	if valueText(a) == valueText(b) {
 		return 0, nil
@@ -226,6 +256,51 @@ func compareInt(ax int, b any) (int, error) {
 	return 0, fmt.Errorf("incomparable int and %T", b)
 }
 
+// compareInt64 mirrors compareInt for a left-hand int64 value. Without it,
+// compare()'s outer type switch had no case for int64 at all (despite
+// compareInt itself handling a right-hand int64, and numeric() listing it as
+// a recognized numeric kind) — any comparison with an int64 on the left fell
+// through to the text-equality-only fallback at the end of compare(), which
+// returns an error for any two int64 values that are not textually equal.
+// That error is silently swallowed by compareForOrder (used by every
+// generic-path ORDER BY), turning into "equal" — a silent wrong sort order,
+// not a visible failure. int64 reaches raw rows from direct storage callers
+// (see the ORDER BY float fast path's own caveat about this) even though SQL
+// INSERT coercion normalizes it to int first.
+func compareInt64(ax int64, b any) (int, error) {
+	// fast path: avoid float64 conversion for same-type comparisons.
+	switch bv := b.(type) {
+	case int64:
+		if ax < bv {
+			return -1, nil
+		}
+		if ax > bv {
+			return 1, nil
+		}
+		return 0, nil
+	case int:
+		bi := int64(bv)
+		if ax < bi {
+			return -1, nil
+		}
+		if ax > bi {
+			return 1, nil
+		}
+		return 0, nil
+	}
+	if f, ok := numeric(b); ok {
+		af := float64(ax)
+		if af < f {
+			return -1, nil
+		}
+		if af > f {
+			return 1, nil
+		}
+		return 0, nil
+	}
+	return 0, fmt.Errorf("incomparable int64 and %T", b)
+}
+
 func compareFloat(ax float64, b any) (int, error) {
 	if f, ok := numeric(b); ok {
 		if ax < f {
@@ -274,6 +349,35 @@ func compareBytes(ax []byte, b any) (int, error) {
 		return 0, fmt.Errorf("incomparable []byte and %T", b)
 	}
 	return bytes.Compare(ax, bx), nil
+}
+
+// compareTime orders two time.Time values chronologically. Without this
+// case, compare() had no way to order NOW()/GETDATE()/CURRENT_TIMESTAMP
+// (evalNowFunc returns time.Now() directly) or DATE_ADD/DATE_SUB (which
+// return the computed time.Time unformatted): both fell to compare()'s
+// text-equality-only fallback. That fallback is unreliable here even for
+// equality, because time.Now() carries a monotonic-clock reading that two
+// separately-taken timestamps essentially never share, so even
+// %v-equivalent formatting rarely produced equal strings for the "same"
+// instant. `ORDER BY` on such a column silently no-op'd (compareForOrder
+// swallows the resulting error into 0), and a WHERE comparison raised
+// "incomparable time.Time and time.Time" instead of evaluating true/false.
+// Before/Equal/After correctly prefer the monotonic reading when both
+// operands have one, matching time.Time's own documented comparison
+// semantics.
+func compareTime(ax time.Time, b any) (int, error) {
+	bx, ok := b.(time.Time)
+	if !ok {
+		return 0, fmt.Errorf("incomparable time.Time and %T", b)
+	}
+	switch {
+	case ax.Before(bx):
+		return -1, nil
+	case ax.After(bx):
+		return 1, nil
+	default:
+		return 0, nil
+	}
 }
 
 func compareForOrder(a, b any, desc bool) int {

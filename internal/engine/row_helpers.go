@@ -113,11 +113,50 @@ func cloneRow(r Row) Row {
 	return m
 }
 
+// addRightNulls fills in NULLs for the right side of an unmatched (or
+// possibly-matched, see below) row's columns.
+//
+// Both the qualified ("alias.col") and unqualified ("col") keys are guarded
+// by an existence check. The unqualified guard was already here; the
+// qualified one was missing, which mattered for exactly one caller:
+// processLeftJoin's >500-row branch calls this on every row the hash join
+// produced, including rows that matched and already carry the right table's
+// real values under their qualified keys — an unconditional write there
+// silently overwrote a correct match with NULL. The other callers
+// (processLeftJoin's small-table fallback, processFullOuterJoin) only ever
+// call this on rows confirmed unmatched, where the qualified key was never
+// set, so the guard is a no-op for them — same observable behavior, just
+// expressed uniformly instead of relying on each call site to only invoke
+// this function when it's already safe to do so unconditionally.
 func addRightNulls(m Row, alias string, t *storage.Table) {
 	for _, c := range t.Cols {
-		putVal(m, alias+"."+c.Name, nil)
+		if _, ex := m[strings.ToLower(alias+"."+c.Name)]; !ex {
+			putVal(m, alias+"."+c.Name, nil)
+		}
 		if _, ex := m[strings.ToLower(c.Name)]; !ex {
 			putVal(m, c.Name, nil)
+		}
+	}
+}
+
+// addLeftNulls fills in NULLs for the left side of an unmatched right-outer
+// row (processRightJoin, processFullOuterJoin's right-only pass), guarded by
+// an existence check for the same reason addRightNulls needs one: leftKeys
+// is a sample of key names taken from an arbitrary left row (to learn what
+// the left side's columns are called, not because it corresponds to this
+// particular right row), and it always includes the left table's unqualified
+// column names. When the right table shares an unqualified column name with
+// the left table (the common case that makes the join's bare column names
+// ambiguous in the first place), m — the unmatched right row — already
+// carries its own real value under that same unqualified key. Nulling it
+// unconditionally replaced that real value with NULL for every row with no
+// left match, deterministically (not depending on map iteration order, since
+// this loop iterates the fixed leftKeys slice rather than a row map) but
+// still wrongly.
+func addLeftNulls(m Row, leftKeys []string) {
+	for _, k := range leftKeys {
+		if _, ex := m[k]; !ex {
+			m[k] = nil
 		}
 	}
 }
@@ -173,6 +212,20 @@ func writeFmtKeyPart(buf []byte, v any) []byte {
 		buf = append(buf, 'I')
 		buf = strconv.AppendInt(buf, int64(x), 10)
 		return append(buf, ';')
+	case int64:
+		// 'L' ("long"), distinct from int's 'I' prefix: int and int64 must
+		// remain distinct keys even when their numeric values are equal (see
+		// writeSingleGroupKey's doc comment, which used to be the only place
+		// this case was handled). Without this case here, every multi-column
+		// GROUP BY/PIVOT/DISTINCT key builder (executeSimpleMultiGroupAggregate,
+		// processAggregateQuery, processPivot, distinctRows, set-op dedup — every
+		// caller of this function except the single-column GROUP BY fast path)
+		// fell through to the default branch below and paid a full JSON marshal
+		// per row for an int64-typed grouping column, instead of this 2-line
+		// integer append.
+		buf = append(buf, 'L')
+		buf = strconv.AppendInt(buf, x, 10)
+		return append(buf, ';')
 	case float64:
 		buf = append(buf, 'F')
 		buf = strconv.AppendFloat(buf, x, 'g', -1, 64)
@@ -199,16 +252,11 @@ func writeFmtKeyPart(buf []byte, v any) []byte {
 // writeSingleGroupKey returns a stable, typed key for the one-column GROUP BY
 // fast path. Its type distinctions match comparableKeyPart, which this path
 // used before it switched from map[any] to map[string]. In particular, int
-// and int64 remain distinct keys even when their numeric values are equal.
+// and int64 remain distinct keys even when their numeric values are equal —
+// now guaranteed directly by writeFmtKeyPart, which this delegates to
+// entirely.
 func writeSingleGroupKey(buf []byte, v any) []byte {
-	switch x := v.(type) {
-	case int64:
-		buf = append(buf, 'L')
-		buf = strconv.AppendInt(buf, x, 10)
-		return append(buf, ';')
-	default:
-		return writeFmtKeyPart(buf, v)
-	}
+	return writeFmtKeyPart(buf, v)
 }
 
 func distinctRows(rows []Row, cols []string) []Row {

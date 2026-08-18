@@ -250,7 +250,17 @@ func evalRawUnary(plan *simpleSelectPlan, raw []any, ex *Unary) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	switch ex.Op {
+	return applyUnaryOp(ex.Op, v)
+}
+
+// applyUnaryOp applies a unary +/-/NOT operator to an already-evaluated
+// operand. Factored out of evalRawUnary so evalJoinRawUnary
+// (exec_fastpath_join.go) can reach the same switch directly instead of
+// wrapping its operand in a synthetic &simpleSelectPlan{}/&Unary{}/&Literal{}
+// trio purely to call evalRawUnary — three heap allocations per row, on a
+// join fast path whose whole purpose is avoiding per-row allocation.
+func applyUnaryOp(op string, v any) (any, error) {
+	switch op {
 	case "+":
 		if f, ok := numeric(v); ok {
 			return f, nil
@@ -270,7 +280,7 @@ func evalRawUnary(plan *simpleSelectPlan, raw []any, ex *Unary) (any, error) {
 	case "NOT":
 		return triToValue(triNot(toTri(v))), nil
 	default:
-		return nil, fmt.Errorf("unknown unary operator: %s", ex.Op)
+		return nil, fmt.Errorf("unknown unary operator: %s", op)
 	}
 }
 

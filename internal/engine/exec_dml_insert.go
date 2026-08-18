@@ -64,6 +64,10 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 	// comment in exec_dml_update.go.
 	indexNames := rawIndexNames(t)
 	sort.Strings(indexNames)
+	// Which columns can ever fail validateOneRowConstraint is a pure function
+	// of the schema; computed once here instead of validateRowConstraintsWith
+	// visiting every column of the table (constrained or not) on every row.
+	constrainedCols := constrainedColumnIndices(t.Cols)
 	wal, err := beginWALAuto(env, s.Table)
 	if err != nil {
 		return nil, err
@@ -87,7 +91,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 			}
 			row[i] = cv
 		}
-		if err := validateRowConstraintsWith(env, t, row, -1, nil, fks); err != nil {
+		if err := validateRowConstraintsWith(env, t, row, -1, constrainedCols, fks); err != nil {
 			return nil, err
 		}
 		if err := t.CheckSecondaryIndexConstraints(row, -1); err != nil {
@@ -169,6 +173,10 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	// comment in exec_dml_update.go.
 	indexNames := rawIndexNames(t)
 	sort.Strings(indexNames)
+	// See executeInsertAllColumns: both are pure functions of the schema,
+	// computed once per statement instead of per row.
+	constrainedCols := constrainedColumnIndices(t.Cols)
+	hasDefaults := tableHasDefaults(t.Cols)
 	wal, err := beginWALAuto(env, s.Table)
 	if err != nil {
 		return nil, err
@@ -181,8 +189,10 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			return nil, err
 		}
 		row := make([]any, len(t.Cols))
-		if err := applyColumnDefaults(row, t.Cols); err != nil {
-			return nil, err
+		if hasDefaults {
+			if err := applyColumnDefaults(row, t.Cols); err != nil {
+				return nil, err
+			}
 		}
 		for i, idx := range colIdx {
 			v, err := evalExpr(env, vals[i], tmp)
@@ -195,7 +205,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			}
 			row[idx] = cv
 		}
-		if err := validateRowConstraintsWith(env, t, row, -1, nil, fks); err != nil {
+		if err := validateRowConstraintsWith(env, t, row, -1, constrainedCols, fks); err != nil {
 			return nil, err
 		}
 		if err := t.CheckSecondaryIndexConstraints(row, -1); err != nil {
@@ -271,6 +281,46 @@ func tryFastPathAppend(env ExecEnv, tableName string, t *storage.Table, newRowCo
 // applyColumnDefaults initializes an INSERT row before explicitly named
 // columns overwrite their positions. Defaults are copied before coercion so a
 // BLOB default can never be shared and mutated through a stored row.
+// tableHasDefaults reports whether any column of t declares a default value.
+// Whether a table has any default-valued column is a pure function of its
+// schema, invariant for the whole statement — computed once per INSERT here
+// instead of applyColumnDefaults re-scanning every column of the table on
+// every single row when the answer is always "no defaults to apply".
+func tableHasDefaults(cols []storage.Column) bool {
+	for _, c := range cols {
+		if c.HasDefault {
+			return true
+		}
+	}
+	return false
+}
+
+// constrainedColumnIndices returns, in ascending column-index order, every
+// column validateOneRowConstraint could ever reject (NOT NULL or a
+// PRIMARY KEY/UNIQUE/FOREIGN KEY constraint). INSERT always validates every
+// inserted row against the table's full constraint set, but passing this
+// instead of a nil changedCols to validateRowConstraintsWith turns that
+// per-row loop from O(len(t.Cols)) into O(constrained-column-count): most
+// columns of most tables carry no constraint at all, and
+// validateOneRowConstraint's own early return for them still costs a
+// function call and two field reads per column per row. Ascending order
+// preserves validateRowConstraintsWith's existing first-failure-wins error
+// semantics, same as ranging over t.Cols directly did.
+func constrainedColumnIndices(cols []storage.Column) []int {
+	// Always non-nil, even when empty: validateRowConstraintsWith treats a
+	// nil changedCols as "no restriction, check every column" -- an empty
+	// slice for a table with zero constrained columns must instead mean
+	// "nothing to check", not accidentally re-trigger the full scan this
+	// function exists to avoid.
+	idx := make([]int, 0, len(cols))
+	for i, c := range cols {
+		if c.NotNull || c.Constraint != storage.NoConstraint {
+			idx = append(idx, i)
+		}
+	}
+	return idx
+}
+
 func applyColumnDefaults(row []any, cols []storage.Column) error {
 	for i, col := range cols {
 		if !col.HasDefault {

@@ -547,20 +547,28 @@ func applyDistinctOn(env ExecEnv, s *Select, outRows []Row) ([]Row, error) {
 	}
 	seen := make(map[string]bool)
 	var res []Row
+	// keyBuf is reused across rows via buf[:0] and encoded with the same
+	// self-delimiting writeFmtKeyPart scheme GROUP BY/PIVOT/DISTINCT/set-op
+	// dedup already use (row_helpers.go) instead of fmt.Sprintf+strings.Join:
+	// no per-value reflection walk, no per-row []string/Join allocation, and
+	// (as a side effect of self-delimiting parts) no risk of two different
+	// value tuples colliding because a string value happened to contain the
+	// old "|" separator literally.
+	keyBuf := make([]byte, 0, 64)
 	for _, r := range outRows {
-		var parts []string
+		keyBuf = keyBuf[:0]
 		for _, e := range s.DistinctOn {
 			v, err := evalExpr(env, e, r)
 			if err != nil {
 				return nil, err
 			}
-			parts = append(parts, fmt.Sprintf("%v", v))
+			keyBuf = writeFmtKeyPart(keyBuf, v)
 		}
-		key := strings.Join(parts, "|")
-		if !seen[key] {
-			seen[key] = true
-			res = append(res, r)
+		if seen[string(keyBuf)] {
+			continue
 		}
+		seen[string(keyBuf)] = true
+		res = append(res, r)
 	}
 	return res, nil
 }

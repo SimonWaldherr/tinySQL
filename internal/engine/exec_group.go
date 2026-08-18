@@ -261,12 +261,20 @@ func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []str
 		for i, it := range s.Projs {
 			if it.Star {
 				if len(rows) > 0 {
-					for col, v := range rows[0] {
+					// See the identical pattern (and its explanation) in
+					// processNonAggregateQuery: base must only be written
+					// from a qualified sibling when rows[0] itself has no
+					// unqualified key for it, or the value silently depends
+					// on Go's randomized map iteration order.
+					src := rows[0]
+					for col, v := range src {
 						putVal(out, col, v)
 						if strings.Contains(col, ".") {
 							last := strings.LastIndex(col, ".")
 							base := col[last+1:]
-							putVal(out, base, v)
+							if _, hasUnqualified := src[base]; !hasUnqualified {
+								putVal(out, base, v)
+							}
 							if _, seen := colSet[base]; !seen {
 								colSet[base] = struct{}{}
 								outCols = append(outCols, base)
@@ -716,12 +724,34 @@ func processNonAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []
 		} else {
 			for i, it := range s.Projs {
 				if it.Star {
+					// Range over r's keys to discover them -- Go
+					// deliberately randomizes map iteration order, so
+					// nothing here may depend on which key is visited
+					// first or last.
+					//
+					// base (the unqualified name a bare "SELECT *" column
+					// takes, e.g. "id" for both "a.id" and "b.id") must
+					// therefore never be *written* from a qualified
+					// sibling's value: whether r itself already has an
+					// unqualified "id" key is a static property of r, not
+					// of iteration order, and when it does, that value --
+					// copied verbatim by the else branch below whenever
+					// `range r` happens to visit the unqualified key
+					// itself -- is already the one true answer (mergeRows
+					// resolved it at merge time, right side overwriting
+					// left on a name collision). Deriving it again from an
+					// arbitrary qualified key here, unconditionally, meant
+					// two joined tables sharing a column name produced a
+					// different, non-deterministic answer for that bare
+					// column on every single run of the identical query.
 					for col, v := range r {
 						putVal(out, col, v)
 						if strings.Contains(col, ".") {
 							last := strings.LastIndex(col, ".")
 							base := col[last+1:]
-							putVal(out, base, v)
+							if _, hasUnqualified := r[base]; !hasUnqualified {
+								putVal(out, base, v)
+							}
 							if _, seen := colSet[base]; !seen {
 								colSet[base] = struct{}{}
 								outCols = append(outCols, base)

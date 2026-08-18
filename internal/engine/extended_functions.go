@@ -720,17 +720,30 @@ func evalArraySort(env ExecEnv, args []Expr, row Row) (any, error) {
 	result := make([]any, len(arr))
 	copy(result, arr)
 
-	// Sort using compare
-	sort.Slice(result, func(i, j int) bool {
-		cmp, err := compare(result[i], result[j])
-		if err != nil {
-			return false // Keep original order if comparison fails
-		}
-		return cmp < 0
-	})
+	// sort.Slice builds its Swap via reflect.Swapper, which falls back to a
+	// generic, pointer-aware swap for []any -- every element is an interface
+	// value. ARRAY_SORT runs once per row for every row where it appears, so
+	// this is a per-row cost; a concrete sort.Interface's Swap is a direct
+	// one-word assignment instead (same rationale as orderedRawRowsAsc,
+	// exec_fastpath_select.go). sort.Slice already runs the same unstable
+	// pdqsort as sort.Sort, so this changes only the Swap, not the algorithm.
+	sort.Sort(arraySortAsc(result))
 
 	return result, nil
 }
+
+// arraySortAsc gives ARRAY_SORT's []any a concrete Swap; see evalArraySort.
+type arraySortAsc []any
+
+func (s arraySortAsc) Len() int { return len(s) }
+func (s arraySortAsc) Less(i, j int) bool {
+	cmp, err := compare(s[i], s[j])
+	if err != nil {
+		return false // Keep original order if comparison fails
+	}
+	return cmp < 0
+}
+func (s arraySortAsc) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
 
 // ==================== Window Functions ====================
 //

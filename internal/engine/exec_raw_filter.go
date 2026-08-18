@@ -9,7 +9,6 @@ package engine
 
 import (
 	"fmt"
-	"regexp"
 	"strings"
 )
 
@@ -503,7 +502,13 @@ func buildRawFilterRegexp(colIndex map[string]int, ex *RegexpExpr) func([]any) (
 	if ex.SimilarTo {
 		pattern = similarToRegexp(pattern)
 	}
-	re, err := regexp.Compile(pattern)
+	// compileCachedRegexp, not regexp.Compile directly: every other
+	// regex-evaluating path in the engine (eval_expr.go, exec_fastpath_join.go,
+	// exec_raw_eval.go, extended_functions.go) already goes through the shared
+	// bounded cache in regex_cache.go so a previously-seen pattern is not
+	// recompiled from scratch on every query; this was the one site that
+	// bypassed it.
+	re, err := compileCachedRegexp(pattern)
 	if err != nil {
 		return nil
 	}

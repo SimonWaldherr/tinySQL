@@ -617,7 +617,7 @@ func evalJoinRawUnary(plan *simpleJoinPlan, left, right []any, ex *Unary) (any, 
 	if err != nil {
 		return nil, err
 	}
-	return evalRawUnary(&simpleSelectPlan{}, nil, &Unary{Op: ex.Op, Expr: &Literal{Val: v}})
+	return applyUnaryOp(ex.Op, v)
 }
 
 func evalJoinRawLike(plan *simpleJoinPlan, left, right []any, ex *LikeExpr) (any, error) {

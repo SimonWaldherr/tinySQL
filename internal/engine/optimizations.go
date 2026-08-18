@@ -82,13 +82,21 @@ func (h *HashJoinOptimizer) processHashJoin(leftRows, rightRows []Row, condition
 		probeColumn = condition.RightColumn
 	}
 
+	// buildColumn/probeColumn never change across the whole join, so lowercase
+	// them once here instead of inside getJoinKey, which used to redo
+	// strings.ToLower(column) on every single build row and every single probe
+	// row -- the >500-row case this optimizer targets, so the cost scaled with
+	// the larger input.
+	lowerBuildColumn := strings.ToLower(buildColumn)
+	lowerProbeColumn := strings.ToLower(probeColumn)
+
 	// Build hash table
 	hashTable := make(map[any][]Row)
 	for _, row := range buildRows {
 		if err := checkCtx(h.env.ctx); err != nil {
 			return nil, err
 		}
-		key := h.getJoinKey(row, buildColumn)
+		key := h.getJoinKey(row, buildColumn, lowerBuildColumn)
 		if key != nil {
 			hashTable[key] = append(hashTable[key], row)
 		}
@@ -106,7 +114,7 @@ func (h *HashJoinOptimizer) processHashJoin(leftRows, rightRows []Row, condition
 			return nil, err
 		}
 
-		key := h.getJoinKey(probeRow, probeColumn)
+		key := h.getJoinKey(probeRow, probeColumn, lowerProbeColumn)
 		matched := false
 
 		if key != nil {
@@ -138,10 +146,13 @@ func (h *HashJoinOptimizer) processHashJoin(leftRows, rightRows []Row, condition
 	return result, nil
 }
 
-// getJoinKey extracts the join key from a row
-func (h *HashJoinOptimizer) getJoinKey(row Row, column string) any {
+// getJoinKey extracts the join key from a row. lowerColumn is
+// strings.ToLower(column), computed once by the caller instead of on every
+// row: column/lowerColumn are the same loop-invariant join column name for
+// every row of a given build/probe phase.
+func (h *HashJoinOptimizer) getJoinKey(row Row, column, lowerColumn string) any {
 	// Try different column name formats
-	if val, exists := row[strings.ToLower(column)]; exists {
+	if val, exists := row[lowerColumn]; exists {
 		return val
 	}
 	if val, exists := row[column]; exists {
@@ -150,7 +161,7 @@ func (h *HashJoinOptimizer) getJoinKey(row Row, column string) any {
 
 	// Try qualified names
 	for key, val := range row {
-		if strings.HasSuffix(strings.ToLower(key), "."+strings.ToLower(column)) {
+		if strings.HasSuffix(strings.ToLower(key), "."+lowerColumn) {
 			return val
 		}
 	}

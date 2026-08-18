@@ -394,6 +394,31 @@ func benchmarkDeleteByPrimaryKey(b *testing.B, warmConstraintCache bool) {
 	}
 }
 
+// BenchmarkDeleteMatchesNothing measures a DELETE whose WHERE clause matches
+// zero rows on a 20,000-row table with a secondary index. The raw-predicate
+// fast path used to pay a full row-slice copy and a full secondary-index
+// rebuild unconditionally, even when nothing matched and neither had
+// actually changed; see the `if del > 0` gate in exec_dml_delete.go.
+func BenchmarkDeleteMatchesNothing(b *testing.B) {
+	db := setupPerfTable(b, 20000)
+	ctx := context.Background()
+	if _, err := Execute(ctx, db, "default", mustParse(`CREATE INDEX idx_grp ON t (grp)`)); err != nil {
+		b.Fatal(err)
+	}
+	stmt := mustParse(`DELETE FROM t WHERE id = -1`)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rs, err := Execute(ctx, db, "default", stmt)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if rs.Rows[0]["deleted"] != 0 {
+			b.Fatalf("expected 0 deleted, got %v", rs.Rows[0]["deleted"])
+		}
+	}
+}
+
 // BenchmarkFTSSearchColdEachTime forces a cache rebuild every iteration by
 // bumping the table version, isolating the tokenization cost the cache
 // otherwise amortizes.

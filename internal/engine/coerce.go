@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/big"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -53,6 +55,10 @@ func inferType(v any) storage.ColType {
 		return storage.VectorType
 	case []byte:
 		return storage.BlobType
+	case *big.Rat, big.Rat:
+		return storage.DecimalType
+	case time.Time:
+		return storage.DateTimeType
 	default:
 		return storage.JsonType
 	}
@@ -199,6 +205,12 @@ func coerceToInt(v any) (any, error) {
 		return int(x), nil
 	case float64:
 		return int(x), nil
+	case *big.Rat:
+		f, _ := x.Float64()
+		return int(f), nil
+	case big.Rat:
+		f, _ := x.Float64()
+		return int(f), nil
 	case string:
 		n, err := strconv.Atoi(strings.TrimSpace(x))
 		if err != nil {
@@ -219,10 +231,25 @@ func coerceToBool(v any) (any, error) {
 	switch x := v.(type) {
 	case bool:
 		return x, nil
-	case int, int64:
+	case int:
+		return x != 0, nil
+	case int64:
+		// Deliberately its own case, not merged with `int` into `case int,
+		// int64:`. In a multi-type case, x keeps the switch's static type
+		// (any), so `x != 0` became an interface comparison between
+		// any(int64 value) and the untyped constant 0 (defaulting to int)
+		// -- different dynamic types are never interface-equal regardless
+		// of numeric value, so int64(0) != 0 evaluated to true and
+		// coerceToBool(int64(0)) incorrectly returned true instead of
+		// false. Splitting the case gives x the concrete type int64, so
+		// `x != 0` is a normal numeric comparison again.
 		return x != 0, nil
 	case float64:
 		return x != 0, nil
+	case *big.Rat:
+		return x.Sign() != 0, nil
+	case big.Rat:
+		return x.Sign() != 0, nil
 	case string:
 		s := strings.ToLower(strings.TrimSpace(x))
 		return s == "true" || s == "1" || s == "t" || s == "yes", nil

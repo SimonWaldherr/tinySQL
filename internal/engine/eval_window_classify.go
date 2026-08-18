@@ -82,7 +82,7 @@ func formatWindowPartitionKey(env ExecEnv, partitionBy []Expr, row Row) string {
 			b.WriteString("<error>")
 			continue
 		}
-		fmt.Fprintf(&b, "%v", v)
+		b.WriteString(valueText(v))
 	}
 	return b.String()
 }

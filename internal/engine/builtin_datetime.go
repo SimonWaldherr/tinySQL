@@ -5,6 +5,9 @@ package engine
 
 import (
 	"fmt"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -430,24 +433,193 @@ func evalQuarter(env ExecEnv, args []Expr, row Row) (any, error) {
 	return (int(t.Month())-1)/3 + 1, nil
 }
 
+// applyDateUnitShift adds interval count of unit to t. Calendar units
+// (YEAR/MONTH/WEEK/DAY) go through time.AddDate, which correctly accounts for
+// variable month lengths and, because it operates on the local calendar date
+// rather than a fixed span of nanoseconds, DST transitions ("add 1 day"
+// across a spring-forward stays at the same wall-clock hour); clock units
+// (HOUR/MINUTE/SECOND) go through time.Add, a fixed-duration shift instead.
+// Keeping these two mechanisms separate — never adding "1 day" as
+// 24*time.Hour — is what makes DATE_ADD/DATE_SUB correct across a DST
+// boundary; the two both used to inline this same switch verbatim.
+func applyDateUnitShift(t time.Time, interval float64, unit string) (time.Time, error) {
+	switch unit {
+	case "YEAR", "YEARS":
+		return t.AddDate(int(interval), 0, 0), nil
+	case "MONTH", "MONTHS":
+		return t.AddDate(0, int(interval), 0), nil
+	case "WEEK", "WEEKS":
+		// Scale to days BEFORE truncating, not after: int(interval)*7 (the
+		// previous version) truncated interval to a whole *week count*
+		// first, so 1.9 WEEK became int(1.9)*7 = 7 days instead of the 13
+		// days a caller who wrote 13.3 DAY (the same duration) would get --
+		// up to nearly 7 days silently discarded, unlike every other unit
+		// here, which only ever loses a fraction of one output unit.
+		return t.AddDate(0, 0, int(interval*7)), nil
+	case "DAY", "DAYS":
+		return t.AddDate(0, 0, int(interval)), nil
+	case "HOUR", "HOURS":
+		return t.Add(time.Duration(interval) * time.Hour), nil
+	case "MINUTE", "MINUTES":
+		return t.Add(time.Duration(interval) * time.Minute), nil
+	case "SECOND", "SECONDS":
+		return t.Add(time.Duration(interval) * time.Second), nil
+	default:
+		return t, fmt.Errorf("unknown unit '%s'", unit)
+	}
+}
+
+// isoDurationRE matches an ISO 8601 duration: an optional leading '-', then
+// "P", an optional date part (years/months/weeks/days), and an optional
+// "T"-prefixed time part (hours/minutes/seconds) -- e.g. "P1Y2M3D", "PT1H30M",
+// "P1DT12H", "-P1D". All components are plain non-negative integers; ISO 8601
+// permits a fractional value on the single lowest-order component present,
+// but no caller of DATE_ADD/DATE_SUB/PARSE_DURATION has needed that yet and
+// supporting it correctly (only the last component, and only when no
+// lower-order one follows) is easy to get subtly wrong, so it is rejected
+// with a clear parse error instead of silently truncated.
+var isoDurationRE = regexp.MustCompile(
+	`^(-)?P(?:(\d+)Y)?(?:(\d+)M)?(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$`)
+
+// isoDuration holds the parsed components of an ISO 8601 duration, split
+// into calendar (years/months/weeks/days) and clock (hours/minutes/seconds)
+// parts -- the same split applyDateUnitShift's per-unit callers already use,
+// generalized so every component of one duration string applies through a
+// single DST-safe shift instead of requiring one DATE_ADD call per unit.
+// Loosely modeled on the idea github.com/senseyeio/duration's Duration type
+// uses (parse once, shift via AddDate for the calendar part and Add for the
+// clock part), not on its code.
+type isoDuration struct {
+	years, months, weeks, days int
+	hours, minutes, seconds    int
+}
+
+// parseISO8601Duration parses s as an ISO 8601 duration. At least one
+// component must be present: a bare "P" or "PT" -- syntactically matched by
+// isoDurationRE, since every component group is individually optional -- is
+// rejected as malformed rather than accepted as a zero-length duration,
+// matching every reference implementation's treatment of it.
+func parseISO8601Duration(s string) (isoDuration, error) {
+	m := isoDurationRE.FindStringSubmatch(s)
+	if m == nil {
+		return isoDuration{}, fmt.Errorf("invalid ISO 8601 duration %q", s)
+	}
+	negative := m[1] == "-"
+	present := false
+	var fieldErr error
+	field := func(g string) int {
+		if g == "" {
+			return 0
+		}
+		present = true
+		// isoDurationRE's digit groups ((\d+)) have no length cap, so a
+		// component with enough digits to exceed int's range is
+		// syntactically valid input, and strconv.Atoi correctly reports
+		// that as a range error rather than silently clamping. An earlier
+		// version of this function discarded that error on the mistaken
+		// assumption that a regex-captured digit run "cannot fail" to
+		// parse -- it can, and doing so let a duration like
+		// "P99999999999999999999Y" silently become years=math.MaxInt64,
+		// which then overflowed time.Time.AddDate's internal arithmetic and
+		// produced a date *before* the input instead of erroring.
+		n, err := strconv.Atoi(g)
+		if err != nil && fieldErr == nil {
+			fieldErr = fmt.Errorf("component %q out of range", g)
+		}
+		return n
+	}
+	d := isoDuration{
+		years:   field(m[2]),
+		months:  field(m[3]),
+		weeks:   field(m[4]),
+		days:    field(m[5]),
+		hours:   field(m[6]),
+		minutes: field(m[7]),
+		seconds: field(m[8]),
+	}
+	if fieldErr != nil {
+		return isoDuration{}, fmt.Errorf("invalid ISO 8601 duration %q: %w", s, fieldErr)
+	}
+	if !present {
+		return isoDuration{}, fmt.Errorf("invalid ISO 8601 duration %q: no components", s)
+	}
+	// A "T" designator with nothing after it (e.g. "P1DT") is malformed the
+	// same way a bare "P"/"PT" is: isoDurationRE's H/M/S groups inside the T
+	// clause are each individually optional, so the regex alone accepts "T"
+	// followed by nothing. The match is the whole (anchored) string, so any
+	// "T" in it is the designator -- there is no other place the grammar
+	// permits a literal "T".
+	if strings.Contains(s, "T") && m[6] == "" && m[7] == "" && m[8] == "" {
+		return isoDuration{}, fmt.Errorf("invalid ISO 8601 duration %q: 'T' with no time components", s)
+	}
+	if negative {
+		d.years, d.months, d.weeks, d.days = -d.years, -d.months, -d.weeks, -d.days
+		d.hours, d.minutes, d.seconds = -d.hours, -d.minutes, -d.seconds
+	}
+	return d, nil
+}
+
+// shift applies d to t, negating every component first when negate is true
+// (DATE_SUB's 2-argument form). The calendar components combine into one
+// AddDate call and the clock components into one Add call, each applied
+// exactly once, rather than one call per component.
+func (d isoDuration) shift(t time.Time, negate bool) time.Time {
+	sign := 1
+	if negate {
+		sign = -1
+	}
+	t = t.AddDate(sign*d.years, sign*d.months, sign*(d.weeks*7+d.days))
+	if d.hours != 0 || d.minutes != 0 || d.seconds != 0 {
+		clock := time.Duration(d.hours)*time.Hour +
+			time.Duration(d.minutes)*time.Minute +
+			time.Duration(d.seconds)*time.Second
+		t = t.Add(time.Duration(sign) * clock)
+	}
+	return t
+}
+
+// evalDateAdd implements two call forms:
+//
+//	DATE_ADD(date, interval, unit)     -- e.g. DATE_ADD(created_at, 1, 'DAY')
+//	DATE_ADD(date, iso8601_duration)   -- e.g. DATE_ADD(created_at, 'P1Y2M10D')
+//
+// The 2-argument form applies every component of one ISO 8601 duration
+// string in a single shift, instead of requiring one 3-argument call per
+// unit.
 func evalDateAdd(env ExecEnv, args []Expr, row Row) (any, error) {
-	if len(args) != 3 {
-		return nil, fmt.Errorf("DATE_ADD expects 3 arguments: (date, interval, unit)")
+	if len(args) != 2 && len(args) != 3 {
+		return nil, fmt.Errorf("DATE_ADD expects (date, interval, unit) or (date, iso8601_duration)")
 	}
 	dateVal, err := evalExpr(env, args[0], row)
 	if err != nil {
 		return nil, err
 	}
+	t, err := parseDateTime(dateVal)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(args) == 2 {
+		durVal, err := evalExpr(env, args[1], row)
+		if err != nil {
+			return nil, err
+		}
+		durStr, ok := durVal.(string)
+		if !ok {
+			return nil, fmt.Errorf("DATE_ADD: 2-argument form expects an ISO 8601 duration string, got %T", durVal)
+		}
+		dur, err := parseISO8601Duration(durStr)
+		if err != nil {
+			return nil, fmt.Errorf("DATE_ADD: %w", err)
+		}
+		return dur.shift(t, false), nil
+	}
+
 	intervalVal, err := evalExpr(env, args[1], row)
 	if err != nil {
 		return nil, err
 	}
 	unitVal, err := evalExpr(env, args[2], row)
-	if err != nil {
-		return nil, err
-	}
-
-	t, err := parseDateTime(dateVal)
 	if err != nil {
 		return nil, err
 	}
@@ -455,46 +627,51 @@ func evalDateAdd(env ExecEnv, args []Expr, row Row) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("DATE_ADD: interval must be numeric")
 	}
-	unit := strings.ToUpper(valueText(unitVal))
-
-	switch unit {
-	case "YEAR", "YEARS":
-		t = t.AddDate(int(interval), 0, 0)
-	case "MONTH", "MONTHS":
-		t = t.AddDate(0, int(interval), 0)
-	case "DAY", "DAYS":
-		t = t.AddDate(0, 0, int(interval))
-	case "HOUR", "HOURS":
-		t = t.Add(time.Duration(interval) * time.Hour)
-	case "MINUTE", "MINUTES":
-		t = t.Add(time.Duration(interval) * time.Minute)
-	case "SECOND", "SECONDS":
-		t = t.Add(time.Duration(interval) * time.Second)
-	default:
-		return nil, fmt.Errorf("DATE_ADD: unknown unit '%s'", unit)
+	result, err := applyDateUnitShift(t, interval, strings.ToUpper(valueText(unitVal)))
+	if err != nil {
+		return nil, fmt.Errorf("DATE_ADD: %w", err)
 	}
-	return t, nil
+	return result, nil
 }
 
+// evalDateSub mirrors evalDateAdd's two call forms with the shift negated:
+//
+//	DATE_SUB(date, interval, unit)
+//	DATE_SUB(date, iso8601_duration)
 func evalDateSub(env ExecEnv, args []Expr, row Row) (any, error) {
-	if len(args) != 3 {
-		return nil, fmt.Errorf("DATE_SUB expects 3 arguments: (date, interval, unit)")
+	if len(args) != 2 && len(args) != 3 {
+		return nil, fmt.Errorf("DATE_SUB expects (date, interval, unit) or (date, iso8601_duration)")
 	}
-	// DATE_SUB is just DATE_ADD with negated interval
 	dateVal, err := evalExpr(env, args[0], row)
 	if err != nil {
 		return nil, err
 	}
+	t, err := parseDateTime(dateVal)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(args) == 2 {
+		durVal, err := evalExpr(env, args[1], row)
+		if err != nil {
+			return nil, err
+		}
+		durStr, ok := durVal.(string)
+		if !ok {
+			return nil, fmt.Errorf("DATE_SUB: 2-argument form expects an ISO 8601 duration string, got %T", durVal)
+		}
+		dur, err := parseISO8601Duration(durStr)
+		if err != nil {
+			return nil, fmt.Errorf("DATE_SUB: %w", err)
+		}
+		return dur.shift(t, true), nil
+	}
+
 	intervalVal, err := evalExpr(env, args[1], row)
 	if err != nil {
 		return nil, err
 	}
 	unitVal, err := evalExpr(env, args[2], row)
-	if err != nil {
-		return nil, err
-	}
-
-	t, err := parseDateTime(dateVal)
 	if err != nil {
 		return nil, err
 	}
@@ -503,23 +680,155 @@ func evalDateSub(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, fmt.Errorf("DATE_SUB: interval must be numeric")
 	}
 	interval = -interval // Negate for subtraction
-	unit := strings.ToUpper(valueText(unitVal))
-
-	switch unit {
-	case "YEAR", "YEARS":
-		t = t.AddDate(int(interval), 0, 0)
-	case "MONTH", "MONTHS":
-		t = t.AddDate(0, int(interval), 0)
-	case "DAY", "DAYS":
-		t = t.AddDate(0, 0, int(interval))
-	case "HOUR", "HOURS":
-		t = t.Add(time.Duration(interval) * time.Hour)
-	case "MINUTE", "MINUTES":
-		t = t.Add(time.Duration(interval) * time.Minute)
-	case "SECOND", "SECONDS":
-		t = t.Add(time.Duration(interval) * time.Second)
-	default:
-		return nil, fmt.Errorf("DATE_SUB: unknown unit '%s'", unit)
+	result, err := applyDateUnitShift(t, interval, strings.ToUpper(valueText(unitVal)))
+	if err != nil {
+		return nil, fmt.Errorf("DATE_SUB: %w", err)
 	}
-	return t, nil
+	return result, nil
+}
+
+// evalOverlaps implements OVERLAPS(start1, end1, start2, end2): whether the
+// half-open ranges [start1, end1) and [start2, end2) share any instant.
+// Half-open is this engine's existing range convention (used, for instance,
+// by the raw-fastpath BETWEEN/range predicates) and is also the SQL:2011
+// OVERLAPS predicate's own default: two ranges that only touch at an
+// endpoint -- one range's end equal to the other's start -- do not overlap.
+// A NULL argument makes the result NULL rather than a comparison error,
+// matching this engine's general NULL-propagation rule for scalar
+// functions. There is no infix `(start1, end1) OVERLAPS (start2, end2)`
+// syntax here -- that needs row-constructor grammar this parser does not
+// have -- so this is exposed as a plain 4-argument function instead.
+func evalOverlaps(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 4 {
+		return nil, fmt.Errorf("OVERLAPS expects 4 arguments: (start1, end1, start2, end2)")
+	}
+	var times [4]time.Time
+	for i, a := range args {
+		v, err := evalExpr(env, a, row)
+		if err != nil {
+			return nil, err
+		}
+		if v == nil {
+			return nil, nil
+		}
+		t, err := parseDateTime(v)
+		if err != nil {
+			return nil, fmt.Errorf("OVERLAPS argument %d: %w", i+1, err)
+		}
+		times[i] = t
+	}
+	start1, end1, start2, end2 := times[0], times[1], times[2], times[3]
+	// A genuinely reversed range (end before start) is almost certainly a
+	// caller mistake, so it errors instead of silently normalizing the pair
+	// the way some engines do. A zero-width range (start == end) is a valid
+	// "instant" -- it is handled explicitly below, not by this check.
+	if end1.Before(start1) {
+		return nil, fmt.Errorf("OVERLAPS: end1 is before start1")
+	}
+	if end2.Before(start2) {
+		return nil, fmt.Errorf("OVERLAPS: end2 is before start2")
+	}
+
+	// A zero-width range needs its own containment check. The general test
+	// below (start1 < end2 && start2 < end1) only correctly detects overlap
+	// between two positive-width ranges; fed a degenerate one, it silently
+	// degrades into "is this point strictly interior to the other range",
+	// which disagrees with that range's own half-open convention at its
+	// start boundary -- a point exactly at the other range's start IS
+	// contained in [start,end), but the general test would say false there.
+	// SQL:2011's own OVERLAPS predicate special-cases instants for exactly
+	// this reason. Two instants are defined here as never overlapping, even
+	// when equal: each represents the empty set [x,x), and the intersection
+	// of two empty sets is empty regardless of where they sit.
+	if start1.Equal(end1) && start2.Equal(end2) {
+		return false, nil
+	}
+	if start1.Equal(end1) {
+		return !start1.Before(start2) && start1.Before(end2), nil
+	}
+	if start2.Equal(end2) {
+		return !start2.Before(start1) && start2.Before(end1), nil
+	}
+	return start1.Before(end2) && start2.Before(end1), nil
+}
+
+// evalRangeMerge implements RANGE_MERGE(ranges): given an array of [start,
+// end] pairs, returns the minimal set of non-overlapping [start, end] pairs
+// covering the same instants, sorted by start. Touching ranges (one range's
+// end equal to the next range's start) merge into one, consistent with
+// evalOverlaps' half-open convention -- [1,2) and [2,3) merge into [1,3),
+// the same way two contiguous calendar days should coalesce into one
+// two-day span rather than being reported as a "gap-free" pair of separate
+// ranges.
+//
+// The merge itself is a sort-by-start-then-sweep, extending the last kept
+// range's end whenever the next range starts at or before it -- the same
+// algorithm shape github.com/senseyeio/spaniel uses for its Union operation
+// (not its code, and without spaniel's per-span configurable open/closed
+// boundary type, which this engine has no use for yet).
+func evalRangeMerge(env ExecEnv, args []Expr, row Row) (any, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("RANGE_MERGE expects 1 argument: (ranges)")
+	}
+	arrVal, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	if arrVal == nil {
+		return nil, nil
+	}
+	arr, ok := arrVal.([]any)
+	if !ok {
+		return nil, fmt.Errorf("RANGE_MERGE: argument must be an array of [start, end] pairs")
+	}
+
+	type timeRange struct{ start, end time.Time }
+	ranges := make([]timeRange, 0, len(arr))
+	for i, elem := range arr {
+		pair, ok := elem.([]any)
+		if !ok || len(pair) != 2 {
+			return nil, fmt.Errorf("RANGE_MERGE: element %d is not a [start, end] pair", i)
+		}
+		start, err := parseDateTime(pair[0])
+		if err != nil {
+			return nil, fmt.Errorf("RANGE_MERGE: element %d start: %w", i, err)
+		}
+		end, err := parseDateTime(pair[1])
+		if err != nil {
+			return nil, fmt.Errorf("RANGE_MERGE: element %d end: %w", i, err)
+		}
+		if end.Before(start) {
+			return nil, fmt.Errorf("RANGE_MERGE: element %d has end before start", i)
+		}
+		ranges = append(ranges, timeRange{start, end})
+	}
+	if len(ranges) == 0 {
+		return []any{}, nil
+	}
+
+	// Plain sort.Slice, deliberately: RANGE_MERGE's input is one function
+	// argument's worth of ranges (dozens at most in any realistic query, not
+	// the thousands-of-rows scale the ORDER BY paths elsewhere in this engine
+	// optimize for), where reflect.Swapper's overhead is not worth a concrete
+	// sort.Interface type to avoid.
+	sort.Slice(ranges, func(i, j int) bool { return ranges[i].start.Before(ranges[j].start) })
+
+	merged := make([]timeRange, 0, len(ranges))
+	merged = append(merged, ranges[0])
+	for _, r := range ranges[1:] {
+		last := &merged[len(merged)-1]
+		if !r.start.After(last.end) {
+			if r.end.After(last.end) {
+				last.end = r.end
+			}
+			continue
+		}
+		merged = append(merged, r)
+	}
+
+	out := make([]any, len(merged))
+	for i, r := range merged {
+		out[i] = []any{r.start, r.end}
+	}
+	return out, nil
 }

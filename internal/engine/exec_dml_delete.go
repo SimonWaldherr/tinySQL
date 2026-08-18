@@ -126,10 +126,16 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 		if err := wal.commit(); err != nil {
 			return nil, err
 		}
-		t.Rows = kept
 		t.Version++
-		t.ReindexSecondaryIndexRows(oldToNew)
+		// A predicate that matched nothing left kept byte-for-byte identical
+		// to t.Rows and oldToNew as the identity mapping -- skip the row-slice
+		// swap and the full index rebuild in that case, the same way UPDATE
+		// already avoids re-touching a table it didn't change (see this
+		// file's UPDATE path) and executeConstraintPointDelete already gates
+		// its own reindex on having actually removed a row.
 		if del > 0 {
+			t.Rows = kept
+			t.ReindexSecondaryIndexRows(oldToNew)
 			t.InvalidateStats()
 			t.MarkDirtyFrom(-1)
 			markDependentMaterializedViewsStale(env, s.Table)
@@ -185,10 +191,11 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	if err := wal.commit(); err != nil {
 		return nil, err
 	}
-	t.Rows = kept
 	t.Version++
-	t.ReindexSecondaryIndexRows(oldToNew)
+	// See the raw-predicate fast path above for why this is gated on del > 0.
 	if del > 0 {
+		t.Rows = kept
+		t.ReindexSecondaryIndexRows(oldToNew)
 		t.InvalidateStats()
 		t.MarkDirtyFrom(-1) // DELETE is non-append; force full-table WAL
 		markDependentMaterializedViewsStale(env, s.Table)

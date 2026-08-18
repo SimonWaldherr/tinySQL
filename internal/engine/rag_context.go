@@ -426,46 +426,35 @@ func (s ragContextCandidatesAsc) Less(i, j int) bool {
 }
 func (s ragContextCandidatesAsc) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
 
-// ragContextRowsAsc orders []ragContextRow by chunkIndex, falling back to
-// original position on ties (duplicate chunk indexes for one document are
-// possible with imperfect input data). The idx tie-break is what lets
-// sort.Sort (pdqsort) replace sort.SliceStable's O(n log² n) merge while
-// reproducing the exact stable order — same pattern as orderedRawRowsAsc's
-// idx field (exec_fastpath_select.go), and a concrete Swap sidesteps
-// reflect.Swapper the same way: ragContextRow embeds an `any` (docID), so it
+// ragContextRowsAsc orders []ragContextRow by chunkIndex with a concrete
+// Swap, sidestepping reflect.Swapper the same way orderedRawRowsAsc does
+// (exec_fastpath_select.go): ragContextRow embeds an `any` (docID), so it
 // contains a pointer and misses reflect.Swapper's non-pointer fast paths
 // regardless of the struct's size.
-type ragContextRowsAsc struct {
-	rows []ragContextRow
-	idx  []int32
-}
+//
+// This intentionally keeps sort.Stable rather than converting to sort.Sort
+// via an index tie-break (the pattern used for the larger ORDER BY sorts).
+// Measured on BenchmarkRAGContextSingle: the two callers here
+// (ragFindContextRows's per-hit matches, and each per-document group in
+// ragSortContextIndex) sort tens of elements at most, where symMerge's
+// O(n log² n) vs pdqsort's O(n log n) is not a measurable difference, but the
+// tie-break needs its own index slice — a real per-call heap allocation that
+// a sort this small never earns back. Avoiding reflect.Swapper is the whole
+// win at this size; sort.Stable's own algorithm needs no such slice.
+type ragContextRowsAsc []ragContextRow
 
-func newRagContextRowsAsc(rows []ragContextRow) ragContextRowsAsc {
-	idx := make([]int32, len(rows))
-	for i := range idx {
-		idx[i] = int32(i)
-	}
-	return ragContextRowsAsc{rows: rows, idx: idx}
-}
-
-func (s ragContextRowsAsc) Len() int { return len(s.idx) }
-func (s ragContextRowsAsc) Less(i, j int) bool {
-	pi, pj := s.idx[i], s.idx[j]
-	if s.rows[pi].chunkIndex != s.rows[pj].chunkIndex {
-		return s.rows[pi].chunkIndex < s.rows[pj].chunkIndex
-	}
-	return pi < pj
-}
-func (s ragContextRowsAsc) Swap(i, j int) {
-	s.rows[i], s.rows[j] = s.rows[j], s.rows[i]
-	s.idx[i], s.idx[j] = s.idx[j], s.idx[i]
-}
+func (s ragContextRowsAsc) Len() int { return len(s) }
+func (s ragContextRowsAsc) Less(i, j int) bool { return s[i].chunkIndex < s[j].chunkIndex }
+func (s ragContextRowsAsc) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 
 // sortRagContextRows sorts rows by chunkIndex in place, preserving relative
 // order among duplicate chunk indexes exactly like the sort.SliceStable call
 // it replaces.
 func sortRagContextRows(rows []ragContextRow) {
-	sort.Sort(newRagContextRowsAsc(rows))
+	if len(rows) <= 1 {
+		return
+	}
+	sort.Stable(ragContextRowsAsc(rows))
 }
 
 func ragStringArg(env ExecEnv, args []Expr, row Row, idx int, name string) (string, error) {

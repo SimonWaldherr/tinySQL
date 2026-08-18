@@ -124,17 +124,19 @@ func getBuiltinFunctions() map[string]funcHandler {
 		"HEX":        evalHexFunc,
 		"UNHEX":      evalUnhexFunc,
 		// Additional functions
-		"UUID":       evalUuidFunc,
-		"TYPEOF":     evalTypeofFunc,
-		"VERSION":    evalVersionFunc,
-		"DAYOFWEEK":  evalDayOfWeekFunc,
-		"DAYOFYEAR":  evalDayOfYearFunc,
-		"WEEKOFYEAR": evalWeekOfYearFunc,
-		"QUARTER":    evalQuarterFunc,
-		"DATE_ADD":   evalDateAddFunc,
-		"DATE_SUB":   evalDateSubFunc,
-		"DATEADD":    evalDateAddFunc,
-		"DATESUB":    evalDateSubFunc,
+		"UUID":        evalUuidFunc,
+		"TYPEOF":      evalTypeofFunc,
+		"VERSION":     evalVersionFunc,
+		"DAYOFWEEK":   evalDayOfWeekFunc,
+		"DAYOFYEAR":   evalDayOfYearFunc,
+		"WEEKOFYEAR":  evalWeekOfYearFunc,
+		"QUARTER":     evalQuarterFunc,
+		"DATE_ADD":    evalDateAddFunc,
+		"DATE_SUB":    evalDateSubFunc,
+		"DATEADD":     evalDateAddFunc,
+		"DATESUB":     evalDateSubFunc,
+		"OVERLAPS":    evalOverlapsFunc,
+		"RANGE_MERGE": evalRangeMergeFunc,
 	}
 }
 
@@ -613,6 +615,14 @@ func evalConcatWsFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 
 func evalPositionFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	return evalPosition(env, ex.Args, row)
+}
+
+func evalOverlapsFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalOverlaps(env, ex.Args, row)
+}
+
+func evalRangeMergeFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalRangeMerge(env, ex.Args, row)
 }
 
 func evalLocateFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {

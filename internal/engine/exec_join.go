@@ -239,9 +239,7 @@ func processRightJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) 
 		}
 		if !matched {
 			m := cloneRow(r)
-			for _, k := range leftKeys {
-				m[k] = nil
-			}
+			addLeftNulls(m, leftKeys)
 			joined = append(joined, m)
 		}
 	}
@@ -301,9 +299,7 @@ func processFullOuterJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Ex
 			continue
 		}
 		m := cloneRow(r)
-		for _, k := range leftKeys {
-			m[k] = nil
-		}
+		addLeftNulls(m, leftKeys)
 		joined = append(joined, m)
 	}
 	return joined, nil
