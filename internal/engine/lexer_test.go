@@ -103,7 +103,7 @@ func TestLexerSymbols(t *testing.T) {
 
 // TestLexerStringLiteral pins tokenizeString's zero-copy fast path (plain
 // literal, no embedded quote) against its strings.Builder-based fallback
-// (an embedded '' escape forces the slow path), including a literal that
+// (an embedded ” escape forces the slow path), including a literal that
 // contains multi-byte UTF-8 content to confirm the byte-wise quote scan
 // doesn't misfire on continuation bytes.
 func TestLexerStringLiteral(t *testing.T) {

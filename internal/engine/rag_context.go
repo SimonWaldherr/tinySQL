@@ -443,7 +443,7 @@ func (s ragContextCandidatesAsc) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
 // win at this size; sort.Stable's own algorithm needs no such slice.
 type ragContextRowsAsc []ragContextRow
 
-func (s ragContextRowsAsc) Len() int { return len(s) }
+func (s ragContextRowsAsc) Len() int           { return len(s) }
 func (s ragContextRowsAsc) Less(i, j int) bool { return s[i].chunkIndex < s[j].chunkIndex }
 func (s ragContextRowsAsc) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 

@@ -306,7 +306,6 @@ func (s floatOrderedRawRowsAsc) Less(i, j int) bool {
 }
 func (s floatOrderedRawRowsAsc) Swap(i, j int) { s.items[i], s.items[j] = s.items[j], s.items[i] }
 
-
 func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*ResultSet, bool, error) {
 	if plan.limit != nil && *plan.limit == 0 {
 		return &ResultSet{Cols: plan.outputCols, Rows: []Row{}}, true, nil
