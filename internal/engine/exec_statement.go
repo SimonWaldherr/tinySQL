@@ -289,9 +289,24 @@ func newDMLPlan(out *dmlPlan, db *storage.DB, tenant string, stmt Statement) *dm
 }
 
 // appendOnlySnapshotTarget identifies the narrow INSERT fast path whose
-// failed execution can be rolled back by truncating appended rows. Secondary
-// indexes can be changed as rows are inserted, so they retain a cloned-table
-// snapshot. The same is true for every trigger-capable statement.
+// failed execution can be rolled back by truncating appended rows and, when
+// the table carries secondary indexes, removing exactly those rows' entries
+// from each one (see restoreAppendOnlyTable). A table with any OTHER
+// mutating side effect a plain row-truncate cannot undo — a trigger, most
+// prominently, which can write to arbitrary other tables — still needs the
+// full cloned-table snapshot; that is the only remaining disqualifier here.
+//
+// A secondary index used to disqualify a table from this path entirely,
+// because rollback only truncated table.Rows and left the index pointing at
+// rows about to disappear. That made every INSERT into an indexed table
+// (idx_chunks_source_chunk-style corpora especially) pay a full
+// cloneTable/cloneRows copy of the table's ENTIRE current row set on every
+// single statement, independent of how many rows that statement actually
+// inserted -- turning bulk ingestion into an indexed table quadratic in the
+// table's final size. restoreAppendOnlyTable now undoes the index inserts
+// too, so that cost is gone on the (overwhelmingly common) successful path;
+// only an actual rollback pays a now much smaller O(rows this statement
+// appended) price instead of the old O(table size) one.
 func appendOnlySnapshotTarget(plan *dmlPlan) (string, bool) {
 	if plan == nil {
 		return "", false
@@ -300,7 +315,7 @@ func appendOnlySnapshotTarget(plan *dmlPlan) (string, bool) {
 	if !ok || plan.hasTriggers() {
 		return "", false
 	}
-	if plan.table == nil || len(plan.table.Indexes) > 0 {
+	if plan.table == nil {
 		return "", false
 	}
 	return s.Table, true

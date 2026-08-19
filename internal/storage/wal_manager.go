@@ -341,6 +341,14 @@ func replayWAL(db *DB, walPath string, watermark uint64) (nextSeq, nextTxID, com
 	cr := newCountingReader(f)
 	dec := gob.NewDecoder(cr)
 	pending := make(map[uint64][]walOperation)
+	// touched collects every table a delta record (append/update) landed on
+	// across the whole replay, so its secondary indexes can be rebuilt once at
+	// the end instead of once per committed transaction (see
+	// rebuildTouchedIndexes): replay never reads a table's indexes mid-pass, so
+	// deferring is safe, and it turns what used to be O(transactions · table
+	// size · log table size) for N small/autocommit transactions into a single
+	// O(table size · log table size) rebuild per touched table.
+	touched := make(map[TableRef]struct{})
 	var lastSeq uint64
 	var lastTx uint64
 	var lastGood int64
@@ -358,6 +366,7 @@ func replayWAL(db *DB, walPath string, watermark uint64) (nextSeq, nextTxID, com
 			// damaged tail, like any other decode error.
 			if errors.Is(err, io.EOF) {
 				if size, statErr := fileSize(f); statErr != nil || lastGood >= size {
+					rebuildTouchedIndexes(db, touched)
 					return lastSeq + 1, lastTx + 1, committed, false, nil
 				}
 			}
@@ -372,6 +381,7 @@ func replayWAL(db *DB, walPath string, watermark uint64) (nextSeq, nextTxID, com
 			if truncErr := os.Truncate(walPath, lastGood); truncErr != nil {
 				return 0, 0, 0, false, fmt.Errorf("truncate torn wal at %d: %w", lastGood, truncErr)
 			}
+			rebuildTouchedIndexes(db, touched)
 			return lastSeq + 1, lastTx + 1, committed, true, nil
 		}
 		lastGood = cr.n
@@ -386,12 +396,25 @@ func replayWAL(db *DB, walPath string, watermark uint64) (nextSeq, nextTxID, com
 			// Applying it again would duplicate rows for an append-rows delta.
 			continue
 		}
-		handleWalRecord(db, rec, pending, &committed)
+		handleWalRecord(db, rec, pending, &committed, touched)
+	}
+}
+
+// rebuildTouchedIndexes rebuilds secondary indexes for every table a replayed
+// delta record touched. Called once at the end of replayWAL instead of once
+// per committed transaction inside handleWalRecord.
+func rebuildTouchedIndexes(db *DB, touched map[TableRef]struct{}) {
+	for ref := range touched {
+		if t, err := db.Get(ref.Tenant, ref.Table); err == nil && t != nil && len(t.Indexes) > 0 {
+			_ = t.RebuildSecondaryIndexes()
+		}
 	}
 }
 
 // handleWalRecord processes a single WAL record and updates pending map and committed count.
-func handleWalRecord(db *DB, rec walRecord, pending map[uint64][]walOperation, committed *uint64) {
+// touched accumulates the tables an append/update delta landed on; see
+// rebuildTouchedIndexes.
+func handleWalRecord(db *DB, rec walRecord, pending map[uint64][]walOperation, committed *uint64, touched map[TableRef]struct{}) {
 	switch rec.Type {
 	case walRecordBegin:
 		pending[rec.TxID] = nil
@@ -441,9 +464,12 @@ func handleWalRecord(db *DB, rec walRecord, pending map[uint64][]walOperation, c
 					existing.Rows = append(existing.Rows, delta.Rows...)
 					existing.Version = delta.Version
 					// WAL deltas carry rows, while the existing table owns the
-					// durable index definitions. Rebuild so recovered index row IDs
-					// and table rows are atomically consistent.
-					_ = existing.RebuildSecondaryIndexes()
+					// durable index definitions. Index row IDs and table rows must
+					// end up atomically consistent, but rebuilding here would redo
+					// it once per committed transaction; record the table instead
+					// and let rebuildTouchedIndexes do it once after the whole
+					// replay finishes.
+					touched[TableRef{Tenant: op.tenant, Table: op.name}] = struct{}{}
 					continue
 				}
 				// Fallback: table not found, apply as full table.
@@ -466,7 +492,7 @@ func handleWalRecord(db *DB, rec walRecord, pending map[uint64][]walOperation, c
 					// Table.noteStructuralChange) must not treat this table
 					// as append-only anymore.
 					existing.noteStructuralChange()
-					_ = existing.RebuildSecondaryIndexes()
+					touched[TableRef{Tenant: op.tenant, Table: op.name}] = struct{}{}
 					continue
 				}
 				// The table is gone, or shorter than the record expects: this

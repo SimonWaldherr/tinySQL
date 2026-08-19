@@ -46,6 +46,53 @@ func BenchmarkAdvancedWALCalculateChecksum(b *testing.B) {
 	}
 }
 
+// benchWALBlobCols is a row shape carrying a BLOB and a narrow-int column.
+// The narrow-int (uint32) column benefits from hashWALValue's fast path (see
+// its comment: skipping %T's reflect.TypeOf call is a large relative win for
+// a lone scalar). The BLOB column deliberately does not: fmt already has a
+// non-reflective, pooled-buffer fast path for []byte under %v, and a
+// hand-rolled replacement measured slower, so hashWALValue still falls
+// through to fmt for it. This benchmark exists to show the net effect on a
+// row shape that carries both.
+var benchWALBlobCols = []Column{
+	{Name: "id", Type: IntType},
+	{Name: "flags", Type: Uint32Type},
+	{Name: "payload", Type: BlobType},
+}
+
+func benchWALBlobRow(i int) []any {
+	payload := make([]byte, 256)
+	for j := range payload {
+		payload[j] = byte((i + j) % 256)
+	}
+	return []any{int64(i), uint32(i), payload}
+}
+
+// BenchmarkAdvancedWALCalculateChecksumBlob isolates calculateChecksum for a
+// row carrying both a narrow-int and a BLOB column (see benchWALBlobCols).
+func BenchmarkAdvancedWALCalculateChecksumBlob(b *testing.B) {
+	wal := &AdvancedWAL{}
+	before := benchWALBlobRow(1)
+	after := benchWALBlobRow(2)
+	record := &WALRecord{
+		LSN:         1,
+		TxID:        1,
+		OpType:      WALOpUpdate,
+		Tenant:      "default",
+		Table:       "bench",
+		RowID:       1,
+		BeforeImage: before,
+		AfterImage:  after,
+		Columns:     benchWALBlobCols,
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = wal.calculateChecksum(record)
+	}
+}
+
 // BenchmarkAdvancedWALLogInsert measures single-row insert-transaction
 // logging throughput end to end (LogBegin+LogInsert+LogCommit), the
 // dominant per-statement cost for autocommit writes.

@@ -1121,6 +1121,63 @@ func hashWALValue(h io.Writer, v any, scratch *[40]byte) {
 		} else {
 			_, _ = io.WriteString(h, "boolfalse;")
 		}
+	// Narrow integer columns (INT8/INT16/INT32/UINT/UINT8/UINT16/UINT32/
+	// UINT64) used to fall through to the reflection-based "%T%v;" fallback
+	// below. For a lone scalar, %T's reflect.TypeOf(v).String() call is the
+	// dominant cost (measured ~29x for int32: fallback 3799 ns/op vs. this
+	// fast path 130 ns/op, io.Discard-isolated), so hardcoding the type name
+	// string instead pays off even though the value itself is cheap to
+	// format either way. These fast paths must stay byte-identical to that
+	// fallback for the same reason the scalar cases above do.
+	//
+	// []byte (BLOB) deliberately has no such case: unlike the scalar %T cost
+	// above, fmt's fmt.(*pp).printArg already special-cases []byte under %v
+	// via fmtBytes -- a non-reflective loop over the concrete []byte that
+	// writes into a buffer pooled across calls -- so it is not paying the
+	// reflection cost this file exists to avoid. A from-scratch
+	// reimplementation was tried and measured 4x slower for a 256-byte
+	// value (one fresh per-call allocation losing to fmt's pooled buffer),
+	// so it was reverted rather than kept for symmetry with the int cases.
+	case int8:
+		b := append(scratch[:0], "int8"...)
+		b = strconv.AppendInt(b, int64(t), 10)
+		b = append(b, ';')
+		_, _ = h.Write(b)
+	case int16:
+		b := append(scratch[:0], "int16"...)
+		b = strconv.AppendInt(b, int64(t), 10)
+		b = append(b, ';')
+		_, _ = h.Write(b)
+	case int32:
+		b := append(scratch[:0], "int32"...)
+		b = strconv.AppendInt(b, int64(t), 10)
+		b = append(b, ';')
+		_, _ = h.Write(b)
+	case uint:
+		b := append(scratch[:0], "uint"...)
+		b = strconv.AppendUint(b, uint64(t), 10)
+		b = append(b, ';')
+		_, _ = h.Write(b)
+	case uint8:
+		b := append(scratch[:0], "uint8"...)
+		b = strconv.AppendUint(b, uint64(t), 10)
+		b = append(b, ';')
+		_, _ = h.Write(b)
+	case uint16:
+		b := append(scratch[:0], "uint16"...)
+		b = strconv.AppendUint(b, uint64(t), 10)
+		b = append(b, ';')
+		_, _ = h.Write(b)
+	case uint32:
+		b := append(scratch[:0], "uint32"...)
+		b = strconv.AppendUint(b, uint64(t), 10)
+		b = append(b, ';')
+		_, _ = h.Write(b)
+	case uint64:
+		b := append(scratch[:0], "uint64"...)
+		b = strconv.AppendUint(b, t, 10)
+		b = append(b, ';')
+		_, _ = h.Write(b)
 	case []float64:
 		_, _ = io.WriteString(h, "V")
 		var b [8]byte

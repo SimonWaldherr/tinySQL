@@ -113,6 +113,56 @@ func TestSecondaryIndexUniqueInvalidationAndSnapshotPersistence(t *testing.T) {
 	}
 }
 
+// TestAppendOnlyRollbackRemovesIndexEntriesOnUniqueViolation guards
+// appendOnlySnapshotTarget/restoreAppendOnlyTable (exec_statement.go /
+// statement_snapshot.go) now allowing the cheap append-only rollback path for
+// a table with secondary indexes, not just an index-free one: a multi-row
+// INSERT that fails partway through — here, a later row's key colliding with
+// an earlier row of the SAME statement under a UNIQUE index — must roll back
+// every row this statement appended, in the table AND in every secondary
+// index, exactly as the old full-table-clone snapshot did. A stale index
+// entry surviving the rollback would let a later INSERT's row silently alias
+// it (same rowID, different content) instead of being cleanly absent.
+func TestAppendOnlyRollbackRemovesIndexEntriesOnUniqueViolation(t *testing.T) {
+	db := storage.NewDB()
+	executeIndexSQL(t, db, `CREATE TABLE t (id INT, val TEXT)`)
+	executeIndexSQL(t, db, `CREATE UNIQUE INDEX idx_t_id ON t(id)`)
+	executeIndexSQL(t, db, `INSERT INTO t VALUES (1, 'first')`)
+
+	stmt, err := NewParser(`INSERT INTO t VALUES (2, 'a'), (3, 'b'), (2, 'c')`).ParseStatement()
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if _, err := Execute(context.Background(), db, "default", stmt); err == nil {
+		t.Fatalf("want a unique-constraint error from the duplicate id=2 row, got none")
+	}
+
+	table, err := db.Get("default", "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(table.Rows) != 1 {
+		t.Fatalf("want the failed statement's rows fully rolled back (only the pre-existing id=1 row left), got %d rows: %#v", len(table.Rows), table.Rows)
+	}
+
+	idx := table.FindSecondaryIndex([]string{"id"})
+	if idx == nil {
+		t.Fatal("expected idx_t_id to still exist")
+	}
+	if idx.Len() != 1 {
+		t.Fatalf("want exactly the pre-existing id=1 key left in the index, got %d keys", idx.Len())
+	}
+	// Re-insert id=2 (freed by the rollback) to prove the index has no stale
+	// leftover entry: neither one that would spuriously reject it as a
+	// duplicate, nor one that could alias a NEW row landing at the same row
+	// position.
+	executeIndexSQL(t, db, `INSERT INTO t VALUES (2, 'retry')`)
+	got := executeIndexSQL(t, db, `SELECT val FROM t WHERE id = 2`)
+	if len(got.Rows) != 1 || got.Rows[0]["val"] != "retry" {
+		t.Fatalf("id=2 lookup after retry = %#v", got.Rows)
+	}
+}
+
 func TestSecondaryIndexMixedNumericEqualityFallsBackToCorrectScan(t *testing.T) {
 	db := storage.NewDB()
 	executeIndexSQL(t, db, `CREATE TABLE values_by_id (id ANY, value TEXT)`)

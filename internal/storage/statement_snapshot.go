@@ -20,9 +20,11 @@ type StatementSnapshot struct {
 	// map-shaped forms carry it as their key instead. See RestoredTables.
 	tenant  string
 	catalog *catalogRollback
-	// appendOnly is the compact rollback state for a triggerless, index-free
-	// INSERT. Keeping it outside tables avoids allocating two small maps for
-	// every ordinary INSERT while preserving the same in-place restore path.
+	// appendOnly is the compact rollback state for a triggerless INSERT that
+	// can only append rows (secondary indexes included -- see
+	// restoreAppendOnlyTable). Keeping it outside tables avoids allocating two
+	// small maps for every ordinary INSERT while preserving the same in-place
+	// restore path.
 	appendOnly *appendOnlyTableState
 	// rowUpdate is the compact rollback state for a triggerless UPDATE whose
 	// constraint-index seek bounds the only rows it can replace.
@@ -267,8 +269,11 @@ func (db *DB) SnapshotForTableStatement(tenant, name string) (*StatementSnapshot
 
 // SnapshotForAppendOnlyTableStatement captures the lightweight rollback state
 // for a statement that can only append rows to one table. It is intended for
-// the executor's triggerless, index-free INSERT fast path; other callers must
-// use SnapshotForTableStatement or SnapshotForStatement.
+// the executor's triggerless INSERT fast path (see appendOnlySnapshotTarget in
+// package engine) and works whether or not the table carries secondary
+// indexes -- restoreAppendOnlyTable removes an appended row's index entries
+// before truncating it away. Other callers must use SnapshotForTableStatement
+// or SnapshotForStatement.
 func (db *DB) SnapshotForAppendOnlyTableStatement(tenant, name string) (*StatementSnapshot, error) {
 	if db == nil {
 		return nil, nil
@@ -438,6 +443,7 @@ func restoreAppendOnlyTable(state *appendOnlyTableState) {
 		return
 	}
 	table := state.table
+	removeAppendedIndexEntries(table, state.rowCount)
 	table.dropDerived()
 	table.Rows = table.Rows[:state.rowCount:state.rowCount]
 	table.Version = state.version
@@ -445,6 +451,46 @@ func restoreAppendOnlyTable(state *appendOnlyTableState) {
 	table.dirtyFrom = state.dirtyFrom
 	table.dirtyRows = state.dirtyRows
 	table.dirtyRowsState = state.dirtyRowsState
+}
+
+// removeAppendedIndexEntries undoes InsertSecondaryIndexRow for every row
+// appended since rowCount, so a rolled-back append-only INSERT never leaves a
+// materialized secondary index pointing at rows about to be truncated away
+// (a stale entry would otherwise alias whatever unrelated row a future
+// INSERT happens to place at that same position).
+//
+// This only runs on the rollback path — a failed multi-row INSERT, most
+// commonly a later row violating a UNIQUE secondary index against an earlier
+// row in the same statement — which the ordinary successful commit never
+// reaches. It costs O(rows this statement appended × indexes), not O(table
+// size): appendOnlySnapshotTarget (package engine) now allows this fast path
+// for any triggerless INSERT regardless of secondary indexes specifically
+// because this makes that trade safe, in exchange for the previous
+// alternative of a full cloneTable/cloneRows copy on every single INSERT
+// into an indexed table, successful or not.
+func removeAppendedIndexEntries(table *Table, rowCount int) {
+	if len(table.Indexes) == 0 || len(table.Rows) <= rowCount {
+		return
+	}
+	appended := table.Rows[rowCount:]
+	for _, idx := range table.Indexes {
+		// hydrate() takes idx.mu, so call it once per index rather than once
+		// per (index, row) pair: the skip list it returns cannot change out
+		// from under this loop, since the caller holds DB's write lock for
+		// the whole statement.
+		fast := idx.hydrate()
+		for i, row := range appended {
+			key, err := table.indexKey(idx.Columns, row)
+			if err != nil {
+				// The row was never actually indexed under a key that no
+				// longer resolves (e.g. a column dropped mid-rollback is not
+				// a real scenario here, but indexKey's contract already
+				// returns an error rather than panic) — nothing to remove.
+				continue
+			}
+			fast.Remove(key, rowCount+i)
+		}
+	}
 }
 
 func restoreRowUpdateTable(state *rowUpdateTableState) {

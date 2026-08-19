@@ -1,11 +1,41 @@
 package storage
 
 import (
+	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+// TestHashWALValueMatchesFallbackFormat locks in the contract documented on
+// hashWALValue's narrow-integer fast paths: each must render byte-identical
+// output to the reflection-based "%T%v;" fallback it replaces, because
+// testdata/wal_fixtures/advancedwal_legacy.wal has checksums baked in against
+// that exact format (see TestAdvancedWALFixtureReplaysCorrectly). A fast path
+// that drifts from this format would make replaying an existing, perfectly
+// valid on-disk WAL file written before the fast path existed fail checksum
+// verification after an upgrade. []byte is included too even though it has
+// no dedicated fast path (see hashWALValue's comment on why) -- pinning that
+// it still matches the fallback guards against a future change accidentally
+// breaking that assumption.
+func TestHashWALValueMatchesFallbackFormat(t *testing.T) {
+	values := []any{
+		int8(-5), int8(127), int16(-1000), int16(32767), int32(-70000), int32(2147483647),
+		uint(7), uint8(0), uint8(200), uint16(50000), uint32(4000000000), uint64(18000000000000000000),
+		[]byte{}, []byte{0, 1, 255}, []byte("hello"),
+	}
+	var scratch [40]byte
+	for _, v := range values {
+		var got bytes.Buffer
+		hashWALValue(&got, v, &scratch)
+		want := fmt.Sprintf("%T%v;", v, v)
+		if got.String() != want {
+			t.Errorf("hashWALValue(%#v) = %q, want %q (must match %%T%%v; fallback)", v, got.String(), want)
+		}
+	}
+}
 
 func TestAdvancedWALBasic(t *testing.T) {
 	tmpDir := t.TempDir()
