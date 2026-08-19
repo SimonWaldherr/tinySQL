@@ -65,6 +65,22 @@ func (p *Parser) parseUnary() (Expr, error) {
 	return p.parsePrimary()
 }
 
+// numberLiteralIsFloat reports whether a tNumber token's text can only parse
+// as a float: it contains '.', 'e' or 'E'. strconv.Atoi/ParseInt require
+// every byte to be a decimal digit (plus an optional leading sign the lexer
+// never includes in a tNumber token), so any of these three bytes makes
+// integer parsing an unconditional failure -- checked here without calling
+// into strconv at all, let alone paying for its allocating error path twice.
+func numberLiteralIsFloat(s string) bool {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '.', 'e', 'E':
+			return true
+		}
+	}
+	return false
+}
+
 //nolint:gocyclo // Primary expression parsing covers numerous literal and sub-expression forms.
 func (p *Parser) parsePrimary() (Expr, error) {
 	switch p.cur.Typ {
@@ -74,11 +90,22 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		// Try platform int first (most common). Fall back to int64 before float
 		// so integers that exceed a 32-bit int (on wasm32/TinyGo) keep exact
 		// integer semantics instead of silently becoming float64.
-		if n, err := strconv.Atoi(val); err == nil {
-			return &Literal{Val: n}, nil
-		}
-		if n64, err := strconv.ParseInt(val, 10, 64); err == nil {
-			return &Literal{Val: n64}, nil
+		//
+		// A literal containing '.', 'e' or 'E' can never parse as an integer
+		// -- the lexer only emits digits, at most one '.', and an optional
+		// exponent into a tNumber token (see tokenizeNumber) -- so checking
+		// for those bytes first (cheap, no allocation) skips straight to
+		// ParseFloat instead of paying for two guaranteed-failing Atoi/
+		// ParseInt calls first. Both failure paths allocate a *strconv.NumError,
+		// so every float literal parsed (e.g. every row of a bulk INSERT into
+		// a FLOAT column) used to cost two wasted allocations before this.
+		if !numberLiteralIsFloat(val) {
+			if n, err := strconv.Atoi(val); err == nil {
+				return &Literal{Val: n}, nil
+			}
+			if n64, err := strconv.ParseInt(val, 10, 64); err == nil {
+				return &Literal{Val: n64}, nil
+			}
 		}
 		f, _ := strconv.ParseFloat(val, 64)
 		return &Literal{Val: f}, nil
