@@ -101,6 +101,25 @@ type BufferPool struct {
 	// Current memory usage (atomic for lock-free reads)
 	currentMemory atomic.Int64
 
+	// Hit/miss/eviction counters, atomic for the same reason currentMemory
+	// is: Get() — the hottest call on this type, invoked on every table
+	// reference under Hybrid/PagedIndex storage modes — used to take
+	// stats.mu once per call just to increment one of these two counters.
+	// Kept outside CacheStats itself (unlike stats.HitRate/EvictionSize/
+	// TablesInMemory, which change far less often and stay mutex-protected)
+	// so GetStats's public CacheStats snapshot type keeps its plain int64
+	// fields; see recordHit/recordMiss/GetStats.
+	cacheHits     atomic.Int64
+	cacheMisses   atomic.Int64
+	evictionCount atomic.Int64
+
+	// pinnedSet/ignoreSet are policy.PinnedTables/IgnoreTables (an admin-set
+	// config list, fixed for this pool's lifetime) indexed into a map once at
+	// construction, so isPinned/isIgnored — checked on every single Put — are
+	// O(1) instead of an O(len(PinnedTables)+len(IgnoreTables)) linear scan.
+	pinnedSet map[string]bool
+	ignoreSet map[string]bool
+
 	// Table cache: tenant -> table name -> cached table
 	cache map[string]map[string]*CachedTable
 
@@ -180,14 +199,30 @@ func NewBufferPool(policy *MemoryPolicy) *BufferPool {
 	}
 
 	bp := &BufferPool{
-		policy: policy,
-		cache:  make(map[string]map[string]*CachedTable),
-		lru:    NewLRUQueue(),
-		stats:  &CacheStats{MemoryLimit: policy.MaxMemoryBytes},
+		policy:    policy,
+		cache:     make(map[string]map[string]*CachedTable),
+		lru:       NewLRUQueue(),
+		stats:     &CacheStats{MemoryLimit: policy.MaxMemoryBytes},
+		pinnedSet: toSet(policy.PinnedTables),
+		ignoreSet: toSet(policy.IgnoreTables),
 	}
 
 	bp.currentMemory.Store(0)
 	return bp
+}
+
+// toSet builds a lookup set from a name list; nil for an empty list so
+// isPinned/isIgnored's map read on a pool with no configured names stays a
+// single nil-map lookup (always false) rather than allocating an empty map.
+func toSet(names []string) map[string]bool {
+	if len(names) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(names))
+	for _, name := range names {
+		set[name] = true
+	}
+	return set
 }
 
 // NewLRUQueue creates an empty LRU queue.
@@ -431,8 +466,8 @@ func (bp *BufferPool) evictLRU(needed int64) {
 			freed += cached.Size
 			evicted++
 
+			bp.evictionCount.Add(1)
 			bp.stats.mu.Lock()
-			bp.stats.EvictionCount++
 			bp.stats.EvictionSize += cached.Size
 			bp.stats.TablesInMemory--
 			bp.stats.mu.Unlock()
@@ -444,22 +479,12 @@ func (bp *BufferPool) evictLRU(needed int64) {
 
 // isPinned checks if a table should always stay in memory.
 func (bp *BufferPool) isPinned(name string) bool {
-	for _, pinned := range bp.policy.PinnedTables {
-		if pinned == name {
-			return true
-		}
-	}
-	return false
+	return bp.pinnedSet[name]
 }
 
 // isIgnored checks if a table should not be cached.
 func (bp *BufferPool) isIgnored(name string) bool {
-	for _, ignored := range bp.policy.IgnoreTables {
-		if ignored == name {
-			return true
-		}
-	}
-	return false
+	return bp.ignoreSet[name]
 }
 
 // parseKey splits "tenant:table" into components.
@@ -472,26 +497,16 @@ func (bp *BufferPool) parseKey(key string) (tenant, name string) {
 	return "", key
 }
 
-// recordHit increments cache hit counter.
+// recordHit increments the cache hit counter. Lock-free: see the
+// BufferPool.cacheHits field comment.
 func (bp *BufferPool) recordHit() {
-	bp.stats.mu.Lock()
-	bp.stats.CacheHits++
-	total := bp.stats.CacheHits + bp.stats.CacheMisses
-	if total > 0 {
-		bp.stats.HitRate = float64(bp.stats.CacheHits) / float64(total)
-	}
-	bp.stats.mu.Unlock()
+	bp.cacheHits.Add(1)
 }
 
-// recordMiss increments cache miss counter.
+// recordMiss increments the cache miss counter. Lock-free: see the
+// BufferPool.cacheHits field comment.
 func (bp *BufferPool) recordMiss() {
-	bp.stats.mu.Lock()
-	bp.stats.CacheMisses++
-	total := bp.stats.CacheHits + bp.stats.CacheMisses
-	if total > 0 {
-		bp.stats.HitRate = float64(bp.stats.CacheHits) / float64(total)
-	}
-	bp.stats.mu.Unlock()
+	bp.cacheMisses.Add(1)
 }
 
 // updateStats updates computed statistics.
@@ -504,16 +519,22 @@ func (bp *BufferPool) updateStats() {
 	if bp.policy.MaxMemoryBytes > 0 {
 		bp.stats.MemoryUtilization = float64(memUsed) / float64(bp.policy.MaxMemoryBytes)
 	}
-
-	total := bp.stats.CacheHits + bp.stats.CacheMisses
-	if total > 0 {
-		bp.stats.HitRate = float64(bp.stats.CacheHits) / float64(total)
-	}
 	bp.stats.mu.Unlock()
 }
 
-// GetStats returns a copy of current statistics.
+// GetStats returns a copy of current statistics. HitRate is computed fresh
+// from the live hit/miss counters rather than a stored field: those counters
+// change on every Get (see recordHit/recordMiss), far more often than
+// updateStats runs (Put/Remove only), so a stored HitRate would read stale
+// after any Get-only stretch.
 func (bp *BufferPool) GetStats() CacheStats {
+	hits := bp.cacheHits.Load()
+	misses := bp.cacheMisses.Load()
+	var hitRate float64
+	if total := hits + misses; total > 0 {
+		hitRate = float64(hits) / float64(total)
+	}
+
 	bp.stats.mu.RLock()
 	defer bp.stats.mu.RUnlock()
 
@@ -522,10 +543,10 @@ func (bp *BufferPool) GetStats() CacheStats {
 		MemoryUsed:        bp.stats.MemoryUsed,
 		MemoryLimit:       bp.stats.MemoryLimit,
 		MemoryUtilization: bp.stats.MemoryUtilization,
-		CacheHits:         bp.stats.CacheHits,
-		CacheMisses:       bp.stats.CacheMisses,
-		HitRate:           bp.stats.HitRate,
-		EvictionCount:     bp.stats.EvictionCount,
+		CacheHits:         hits,
+		CacheMisses:       misses,
+		HitRate:           hitRate,
+		EvictionCount:     bp.evictionCount.Load(),
 		EvictionSize:      bp.stats.EvictionSize,
 		TablesInMemory:    bp.stats.TablesInMemory,
 		TablesOnDisk:      bp.stats.TablesOnDisk,
