@@ -1,9 +1,41 @@
 package storage
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
+
+// BenchmarkBufferPoolGetParallel drives concurrent Get calls against a
+// handful of resident tables -- the hot path for Hybrid/PagedIndex storage
+// modes, where db.Get funnels every table reference through here (see
+// bufferpool.go's Get doc). recordHit/recordMiss used to take bp.stats.mu on
+// every single call; b.RunParallel is what would have shown that mutex
+// serializing otherwise-independent concurrent readers.
+func BenchmarkBufferPoolGetParallel(b *testing.B) {
+	bp := NewBufferPool(DefaultMemoryPolicy())
+	cols := []Column{{Name: "id", Type: IntType}}
+	const tableCount = 8
+	names := make([]string, tableCount)
+	for i := range names {
+		names[i] = fmt.Sprintf("t%d", i)
+		table := NewTable("t", cols, false)
+		table.Rows = [][]any{{1}, {2}, {3}}
+		if err := bp.Put("default", names[i], table); err != nil {
+			b.Fatalf("put: %v", err)
+		}
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			bp.Get("default", names[i%tableCount])
+			i++
+		}
+	})
+}
 
 func TestBufferPoolBasic(t *testing.T) {
 	policy := &MemoryPolicy{

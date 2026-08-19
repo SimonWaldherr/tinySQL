@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -72,6 +73,97 @@ func TestSchedulerScheduleJobVariants(t *testing.T) {
 	}
 	if err := s.scheduleJob(&CatalogJob{Name: "unknown", ScheduleType: "NEVER"}); err == nil {
 		t.Fatal("expected unknown schedule type to fail")
+	}
+}
+
+// concurrencyTrackingExecutor blocks every call on release (closed once the
+// test has observed the expected number of concurrent calls), so the test
+// can assert both the peak concurrency the scheduler allowed and that every
+// job eventually still runs once slots free up.
+type concurrencyTrackingExecutor struct {
+	mu      sync.Mutex
+	current int
+	maxSeen int
+	started int
+	release chan struct{}
+}
+
+func (e *concurrencyTrackingExecutor) ExecuteSQL(ctx context.Context, sql string) (interface{}, error) {
+	e.mu.Lock()
+	e.current++
+	e.started++
+	if e.current > e.maxSeen {
+		e.maxSeen = e.current
+	}
+	e.mu.Unlock()
+
+	select {
+	case <-e.release:
+	case <-ctx.Done():
+	}
+
+	e.mu.Lock()
+	e.current--
+	e.mu.Unlock()
+	return "ok", nil
+}
+
+// TestSchedulerMaxConcurrentJobsLimitsExecution guards the fix for many
+// enabled jobs whose schedules coincide firing an unbounded burst of
+// goroutines that all contend for DB's write lock at once (see
+// Scheduler.sem's doc comment): SetMaxConcurrentJobs(2) with 6 jobs
+// triggered together must never let more than 2 execute their SQL
+// concurrently, while still eventually running all 6 once earlier ones
+// finish and free their slot.
+func TestSchedulerMaxConcurrentJobsLimitsExecution(t *testing.T) {
+	db := NewDB()
+	exec := &concurrencyTrackingExecutor{release: make(chan struct{})}
+	s := NewScheduler(db, exec)
+	s.SetMaxConcurrentJobs(2)
+
+	const jobCount = 6
+	for i := 0; i < jobCount; i++ {
+		job := &CatalogJob{Name: fmt.Sprintf("job%d", i), SQLText: "SELECT 1", ScheduleType: "ONCE", Enabled: true}
+		if err := db.Catalog().RegisterJob(job); err != nil {
+			t.Fatalf("RegisterJob %s failed: %v", job.Name, err)
+		}
+		s.executeJob(job)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		exec.mu.Lock()
+		cur := exec.current
+		exec.mu.Unlock()
+		if cur == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected exactly 2 concurrently executing jobs (the configured max), got %d", cur)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Give any bug that would let a 3rd job slip through a moment to show up
+	// before releasing the first 2.
+	time.Sleep(20 * time.Millisecond)
+	exec.mu.Lock()
+	stillTwo := exec.current
+	exec.mu.Unlock()
+	if stillTwo != 2 {
+		t.Fatalf("concurrent executions drifted to %d before release, want 2", stillTwo)
+	}
+
+	close(exec.release)
+	s.wg.Wait()
+
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+	if exec.maxSeen != 2 {
+		t.Fatalf("peak concurrent executions = %d, want 2 (SetMaxConcurrentJobs limit)", exec.maxSeen)
+	}
+	if exec.started != jobCount {
+		t.Fatalf("jobs started = %d, want all %d to eventually run", exec.started, jobCount)
 	}
 }
 

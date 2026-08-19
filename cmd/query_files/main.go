@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -20,10 +21,19 @@ import (
 
 const (
 	defaultTenant       = "default"
-	defaultWorkers      = 4
 	defaultCacheSize    = 256
 	defaultQueryTimeout = 30 * time.Second
 )
+
+// defaultWorkers scales the -workers default to the machine instead of a
+// fixed 4: a fixed default under-uses a large-core machine's parallel file
+// loading and, on a 1-2 core machine, mildly oversubscribes it.
+func defaultWorkers() int {
+	if n := runtime.GOMAXPROCS(0); n > 0 {
+		return n
+	}
+	return 1
+}
 
 type Config struct {
 	Files               []string
@@ -93,7 +103,7 @@ func parseFlags() (Config, error) {
 	flag.BoolVar(&config.CacheEnabled, "cache", true, "Enable query caching for better performance")
 	flag.IntVar(&config.CacheSize, "cache-size", defaultCacheSize, "Query cache size (ignored when -cache=false)")
 	flag.BoolVar(&config.ParallelLoad, "parallel", false, "Load files in parallel")
-	flag.IntVar(&config.MaxWorkers, "workers", defaultWorkers, "Number of parallel workers (with -parallel)")
+	flag.IntVar(&config.MaxWorkers, "workers", defaultWorkers(), "Number of parallel workers (with -parallel)")
 	flag.DurationVar(&config.QueryTimeout, "query-timeout", defaultQueryTimeout, "Per-query timeout (0 disables timeout)")
 
 	flag.Usage = func() {

@@ -1085,22 +1085,25 @@ func (s *server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 		Error    string `json:"error,omitempty"`
 	}
 
-	type peerRes struct {
-		status peerStatus
-	}
-
 	ctx, cancel := s.withRequestTimeout(r.Context())
 	defer cancel()
 
-	ch := make(chan peerRes, len(s.peers))
-	var wg sync.WaitGroup
+	addrs := make([]string, 0, len(s.peers))
 	for _, raw := range s.peers {
-		addr := strings.TrimSpace(raw)
-		if addr == "" {
-			continue
+		if addr := strings.TrimSpace(raw); addr != "" {
+			addrs = append(addrs, addr)
 		}
+	}
+
+	// Every goroutine below finishes (wg.Wait) before anything reads peers,
+	// so an indexed slice each goroutine writes its own slot of is enough —
+	// no channel handoff needed, matching the pattern this codebase already
+	// uses for its other worker fan-outs (e.g. vecSearchTopK/ftsScanTopK).
+	peers := make([]peerStatus, len(addrs))
+	var wg sync.WaitGroup
+	for i, addr := range addrs {
 		wg.Add(1)
-		go func(addr string) {
+		go func(i int, addr string) {
 			defer wg.Done()
 			start := time.Now()
 			_, err := grpcQuery(ctx, addr, &queryRequest{Tenant: s.defaultT, SQL: "SELECT 1"}, s.authToken, s.peerTimeout, *flagGRPCMaxRecv, s.peerDialCreds)
@@ -1112,18 +1115,14 @@ func (s *server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				status.Error = err.Error()
 			}
-			ch <- peerRes{status: status}
-		}(addr)
+			peers[i] = status
+		}(i, addr)
 	}
-
 	wg.Wait()
-	close(ch)
 
-	peers := make([]peerStatus, 0, len(s.peers))
 	healthy := 0
-	for res := range ch {
-		peers = append(peers, res.status)
-		if res.status.Healthy {
+	for _, p := range peers {
+		if p.Healthy {
 			healthy++
 		}
 	}
@@ -1185,23 +1184,30 @@ func (s *server) handleFederatedQuery(w http.ResponseWriter, r *http.Request) {
 		localCh <- local
 	}()
 
-	ch := make(chan peerRes, len(s.peers))
-	var wg sync.WaitGroup
+	addrs := make([]string, 0, len(s.peers))
 	for _, raw := range s.peers {
-		addr := strings.TrimSpace(raw)
-		if addr == "" {
-			continue
+		if addr := strings.TrimSpace(raw); addr != "" {
+			addrs = append(addrs, addr)
 		}
+	}
+
+	// wg.Wait below runs before results is read, so — as in
+	// handleClusterStatus — an indexed slice each goroutine writes its own
+	// slot of replaces the channel a single-producer-per-slot fan-out
+	// doesn't need.
+	results := make([]peerRes, len(addrs))
+	var wg sync.WaitGroup
+	for i, addr := range addrs {
 		wg.Add(1)
-		go func(addr string) {
+		go func(i int, addr string) {
 			defer wg.Done()
 			out, err := grpcQuery(r.Context(), addr, &queryRequest{Tenant: req.Tenant, SQL: req.SQL, TimeoutMS: req.TimeoutMS}, s.authToken, peerTimeout, *flagGRPCMaxRecv, s.peerDialCreds)
 			if err != nil {
-				ch <- peerRes{err: err}
+				results[i] = peerRes{err: err}
 				return
 			}
-			ch <- peerRes{rows: out.Rows, cols: out.Columns, truncated: out.Truncated}
-		}(addr)
+			results[i] = peerRes{rows: out.Rows, cols: out.Columns, truncated: out.Truncated}
+		}(i, addr)
 	}
 
 	local := <-localCh
@@ -1215,9 +1221,8 @@ func (s *server) handleFederatedQuery(w http.ResponseWriter, r *http.Request) {
 	truncated := local.Truncated
 
 	wg.Wait()
-	close(ch)
 
-	for res := range ch {
+	for _, res := range results {
 		if res.err != nil {
 			if s.verbose {
 				log.Printf("federation peer error: %v", res.err)

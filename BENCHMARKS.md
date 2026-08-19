@@ -865,6 +865,481 @@ go test -bench='BenchmarkRAG' -benchmem ./internal/engine/...
 go test -run='TestRAGCacheFootprint' -v ./internal/engine/...
 ```
 
+### ORDER BY at scale: permutation sort instead of symMerge
+
+Profiling `BenchmarkOrderByMultiColumnNoLimit` (20,000 rows, 3 sort keys) put
+41% of CPU in `sort.symMerge` plus another 22% in `Swap`/`sort.swapRange`:
+every full-result ORDER BY — the raw fast path (`exec_fastpath_select.go`),
+the general Row-map path (`exec_sort.go`) and the window-partition sorts
+(`eval_window.go`) — used `sort.Stable`, whose in-place merge does
+O(n log² n) element moves. The elements are pointer-heavy structs (a raw-row
+slice plus sort keys, 64 bytes), so the moves, not the comparisons, dominated.
+
+Three coordinated changes, all preserving the exact output order:
+
+1. **Original-position tie-breaks make the unstable sort stable.** Every
+   comparator now falls back to the item's pre-sort position on key ties.
+   All positions are distinct, so the comparator pins a total order — the
+   pdqsort result is unique and equals what `sort.Stable` produced. The
+   window paths and `exec_sort.go` keep sorting items directly (their
+   elements are one map pointer plus keys); the raw fast path instead sorts
+   a **permutation of `int32` positions** (`orderedRawRowsPermAsc`, same
+   pattern as `orderedValuePermAsc`), because swapping 4 bytes beats
+   swapping 64-byte structs. Top-N heaps in `exec_sort.go` gained the same
+   tie-break, so a bounded `ORDER BY ... LIMIT` now retains exactly the rows
+   a full stable sort plus truncation would.
+2. **`orderCols`: ORDER BY terms that are plain column references** (the
+   overwhelmingly common shape) resolve to raw column indexes once per plan
+   (`simpleSelectOrderCols`). The scan loop reads sort keys straight from the
+   raw row — no `evalRawExpr` map lookup per term per row.
+3. **Multi-column sort keys pack into a chunked arena** (`reserveKeySlots`,
+   4096 rows per chunk) instead of one `[]any` per row. First tried:
+   comparing through `raw[col]` directly with no keys at all — allocations
+   dropped 33% but wall clock got *worse*, because the comparator then chased
+   pointers into row arrays scattered across the heap, while the old per-row
+   key slices had been allocated back-to-back during the scan and were
+   cache-dense. The arena keeps that density at ~5 allocations per query
+   instead of one per row.
+
+One attempt was measured and reverted: putting the tie-break index *into* the
+item structs. It grew `floatOrderedRawRow` from 32 to 40 bytes, and the float
+top-N heap's swap — three struct copies per sift level, now cache-line
+straddling — went from 14% to 44% of the benchmark's CPU, a consistent ~45%
+regression on `BenchmarkOrderByWithLimit` across every alternating round. The
+float path therefore keeps its original 32-byte item and unspecified tie
+order (documented above), with its comparator rewritten as direct float
+comparisons that inline where `compareOrderedFloat` calls did not.
+
+Minima of alternating before/after rounds (this machine's noise floor makes
+single runs meaningless; see the FTS section):
+
+| Benchmark (20,000 rows) | before | after | |
+|---|---|---|---|
+| `sortRows` (window partition sort helper) | 963 µs | 259 µs | **3.7x** |
+| `ORDER BY val DESC` (single column, no LIMIT) | 32.5 ms | 16.2 ms | **2.0x** |
+| `RANK() OVER (PARTITION BY ...)` (many partitions) | 65.2 ms | 51.1 ms | 1.28x |
+| three shared `OVER` windows | 77.4 ms | 60.7 ms | 1.27x |
+| `ORDER BY grp, sub, val DESC` (3 columns, no LIMIT) | 59.1 ms | 57.0 ms | parity; allocs **60,010 → 40,016** |
+| `ORDER BY val DESC LIMIT 20` (float top-N) | 1.65 ms | 1.48 ms | parity |
+| `SELECT *`, LIKE scan, hash join, GROUP BY | unchanged | unchanged | no collateral |
+
+**The multi-column row is a measured non-result on wall clock and should be
+read as such.** Five alternating isolated rounds gave before-minima of 59–92 ms
+against after-minima of 57–89 ms — the two distributions overlap almost
+entirely. An earlier round on a quieter machine looked like a 1.2x win
+(46.6 → 38.4 ms); a later batched round looked like a 1% loss (69.3 → 70.0 ms).
+Neither is a signal. The explanation that fits: with three keys, each
+comparison performs three `compareOrderedValue` calls through `any`, so
+comparator cost dwarfs the element-move cost that permutation sorting
+removes — exactly the opposite of the single-key case, where moves dominate
+and the win is a clean 2x. The **−33% allocation** figure is the reliable
+result here (the key arena), and it is stable to the byte across every round.
+
+Correctness: the full `internal/engine` suite passes; the ordered fast path,
+window ordering and `applySortOrder*` produce bit-identical output to
+`sort.Stable` by construction (total order via distinct tie-break positions).
+
+```sh
+go test -bench='BenchmarkOrderBy|BenchmarkSortRows|BenchmarkWindow' -benchmem ./internal/engine/...
+```
+
+### Scalar functions: fmt-free coercion, parse-time handler binding
+
+`BenchmarkScalarInstrWhere` — `WHERE INSTR(note, '...') > 0` over 20,000 rows
+— allocated 40,232 times per query, 94% of it in `fmt.Sprintf`: several
+string functions (`REPLACE`, `INSTR`, `SPLIT_PART`, `CONCAT_WS`, `POSITION`,
+`QUOTE`, hash/date/text functions, and the LIKE/REGEXP evaluators) coerced
+*every* argument through `fmt.Sprintf("%v", v)` — including arguments that
+already were strings, which fmt then copied byte-for-byte, once per argument
+per row. Others took that path only for non-string values, still paying fmt's
+reflection walk for every INT or FLOAT argument.
+
+`valueText` (`coerce.go`) renders scalars byte-identically to
+`fmt.Sprintf("%v", ...)` without entering fmt: strings pass through unboxed,
+int/int64/float64/bool go through strconv, everything else (notably `[]byte`,
+whose `%v` form is the decimal byte list some callers rely on) falls back to
+fmt. All argument-coercion sites in the scalar functions now use it.
+
+Separately, every function call resolved its handler through the
+~300-entry registry map on every row (`mapaccess2_faststr` showed at ~5% of
+scalar-function profiles). The parser now resolves it once
+(`bindFuncHandler`) and stores it on the `FuncCall` node; evaluation calls it
+directly, and the raw fast path skips `evalFuncCall`'s re-dispatch entirely.
+The field is written only at parse time, before a statement can be shared, so
+cached statements stay race-free; hand-built nodes (tests, PIVOT's synthesized
+aggregate) keep the map fallback.
+
+**The node stores a 1-based index into a flattened handler table, not the
+`funcHandler` value itself, and that detail is load-bearing.** The first
+version stored the func value and broke `ORDER BY COUNT(*)` at the *parser*
+level: `orderByProjectionName` (`parse_select.go`) matches an ORDER BY
+expression against the SELECT list with `reflect.DeepEqual`, and DeepEqual
+reports two func values equal only when both are `nil`. Two structurally
+identical `COUNT(*)` nodes therefore stopped comparing equal, and
+`SELECT dept, COUNT(*) c FROM t GROUP BY dept ORDER BY COUNT(*) DESC` failed
+with "ORDER BY expression must appear in the SELECT list or have an alias".
+The whole `internal/engine` package passed — the regression only surfaced in
+the root package's `TestFeatureSupport/GROUP_BY_ORDER_BY` and
+`internal/testhelper`'s YAML examples, which is the argument for running
+`go test ./...` and not just the package under change. Equal names map to
+equal indexes, so DeepEqual behaves exactly as it did before the field
+existed.
+
+The index costs one bounds-checked slice load where the func value was a
+direct call, and it is measurably slower than the (unusable) func-value
+variant — so the dispatch change was measured three ways, against the
+map-lookup baseline it replaces and against the variant it cannot use.
+Minima of four alternating rounds:
+
+| Benchmark | registry map per row | bound index (shipped) | func value (breaks ORDER BY) |
+|---|---|---|---|
+| `WHERE INSTR(note, ...) > 0` | 4.13 ms | **3.45 ms** | 3.94 ms |
+| `SELECT CONCAT(grp, '-', sub)` | 13.85 ms | **13.22 ms** | not measured |
+| `SELECT LENGTH(note)` | 9.30 ms | **8.91 ms** | 9.58 ms |
+
+`boundFuncHandler` reads the table slice directly rather than through its
+accessor: the accessor re-enters `getAllFunctions()`, whose `sync.Once` check
+is not free at once-per-call-per-row. A non-zero index is itself proof the
+table is built (only `bindFuncHandler` sets it, after resolving through the
+index map), so the write to the table happens-before the write to
+`handlerIdx`, which happens-before the node becoming reachable by a reader.
+
+That ordering argument is **not** backed by a race-detector run here: this
+machine builds with `CGO_ENABLED=0` and `-race` requires cgo, so the claim
+rests on the happens-before chain above plus the package's existing
+concurrency tests (`TestConcurrent*`, `TestParallel*`,
+`TestVecSearchConcurrentWithCacheReconfiguration`) passing without the
+detector. Anyone with a cgo-capable toolchain should re-run those under
+`-race` to close that gap.
+
+`TRIM`/`UPPER`/`LOWER`/`LEFT`/`RIGHT` additionally return the argument's
+existing interface value when the operation changed nothing (nothing trimmed,
+already upper/lower, length ≥ len) instead of re-boxing an identical string —
+one allocation per row on those no-op-heavy workloads.
+
+Minima of alternating rounds, 20,000 rows:
+
+| Benchmark | before | after | |
+|---|---|---|---|
+| `WHERE INSTR(note, ...) > 0` | 14.7 ms, 1.0 MB, 40,232 allocs | 6.3 ms, 40 KB, **231 allocs** | **2.3x, −99.4% allocs** |
+| `SELECT REPLACE(note, 'number', 'nr')` | 30.7 ms, 140,015 allocs | 18.6 ms, 80,011 | **1.65x** |
+| `SELECT TRIM(note)` | 17.7 ms, 60,011 allocs | 12.8 ms, 40,012 | 1.38x |
+| `SELECT LEFT(note, 8)` | 21.3 ms | 15.1 ms | 1.41x |
+| `SELECT LENGTH(note)` | 17.6 ms | 13.1 ms | 1.35x |
+| `SELECT UPPER(note)` | 24.7 ms | 19.3 ms | 1.28x |
+| `SELECT SUBSTR(note, 6, 12)` | 19.8 ms | 16.9 ms | 1.17x |
+
+What remains on these shapes is dominated by the public API's `Row`
+(`map[string]any`) materialization per output row, not by the functions.
+
+Correctness: exact-output parity is the design constraint — `valueText`
+matches `%v` byte-for-byte for every type it special-cases, evaluation order
+and NULL short-circuits are untouched (the handlers still evaluate their own
+arguments), and the no-op box reuse only triggers when the argument already
+is a string, so values and types are unchanged. The full `internal/engine`
+suite passes.
+
+```sh
+go test -bench='BenchmarkScalar' -benchmem ./internal/engine/...
+```
+
+### RAG sort sites: the last `reflect.Swapper` instances, and a lesson about tie-breaks at small N
+
+An earlier optimization round (see "`GROUP BY` composite keys and `ORDER BY
+... LIMIT` top-N heaps" above) left a note that `rag_search.go`/`rag_context.go`
+still had the `sort.Slice`/`sort.SliceStable`-over-pointer-containing-elements
+pattern, unchecked. Four call sites fit it:
+
+1. `ragSearchFuse`'s RRF-score ordering — `sort.SliceStable` over `[]string`
+   (a string header holds a pointer, so it still misses `reflect.Swapper`'s
+   non-pointer fast paths).
+2. `ragExpandContextFrom`'s candidate ordering — `sort.Slice` over
+   `[]*ragContextCandidate`, one pointer per element.
+3. `ragFindContextRows`'s per-hit match ordering — `sort.SliceStable` over
+   `[]ragContextRow`, a struct embedding an `any` (docID).
+4. `ragSortContextIndex`'s per-document chunk ordering — the same
+   `ragContextRow`, sorted once per document while building the neighbor-chunk
+   index.
+
+Each got a concrete `sort.Interface` type with a direct two-value `Swap`,
+matching the pattern already applied to `orderedRawRowsAsc`/`orderedValueRowsAsc`
+(`exec_fastpath_select.go`, `exec_sort.go`). Sites (1) and (2) additionally
+converted from the stable variant to `sort.Sort`, because their comparators
+already had a genuine strict total order to fall back on: `ragSearchFuse`
+tags every fused row with a unique insertion sequence number
+(`ragFusedRow.order`, "used as a deterministic sort tie-break" per its own
+comment) precisely so ties resolve without needing scan-order preservation,
+and `ragExpandContextFrom`'s candidates are deduplicated by
+`(docID, chunkIndex)` before sorting, so its final `ragContextKeyLess` term
+can never itself tie.
+
+**Sites (3) and (4) are the interesting case: the same conversion was tried
+and measurably regressed, then reverted.** The initial version added an
+`idx []int32` permutation array (the same tie-break trick used for the ORDER
+BY sorts) to justify `sort.Sort` there too. `BenchmarkRAGContextSingle` —
+`RAG_CONTEXT('rag_chunks', 'doc_id', 'chunk_index', 'doc-500', 6, 2, 2)`,
+whose `matches` slice is a handful of rows (`before=2, after=2` around one
+center chunk) — got **slower in 5 of 5 alternating rounds** (worst case
+1.29 ms → 2.97 ms). The idx slice is a real heap allocation on every call;
+for a sort this small (tens of elements at most, `ragFindContextRows` and
+each per-document group in `ragSortContextIndex` both stay in that range),
+the difference between `sort.Sort`'s O(n log n) and `sort.Stable`'s
+O(n log² n) is not measurable, so the allocation bought nothing and only
+cost. The fix: drop the permutation array entirely, keep `sort.Stable` on a
+plain `[]ragContextRow` with just a concrete `Swap` — reflect.Swapper is
+still avoided (the actual established win), with zero extra allocation. A
+`len(rows) <= 1` guard skips the call altogether for the common trivial case
+(one hit, or a document with a single chunk).
+
+Minima of five alternating rounds after the fix:
+
+| Benchmark | before | after | |
+|---|---|---|---|
+| `RAG_CONTEXT(...)` (single lookup, small `matches`) | 614 µs, 169 allocs | 599 µs, **167 allocs** | parity-to-slightly-better, allocs down every round |
+| `RAG_CONTEXT_FROM` top-k (12k rows, 64 dims) | 1.96 ms, 3092 allocs | 1.84 ms, **3024 allocs** | allocs down **~68** every round; wall clock at worst even |
+| `HYBRID_SEARCH` end to end | 2.70 ms | 2.65 ms | noise-level — VEC_SEARCH/FTS_SEARCH dominate total cost |
+| `HYBRID_SEARCH` + expansion | 2.81 ms | 2.25 ms | best-case ~20% faster; mixed across rounds, never worse |
+
+Read honestly: the RRF-fusion and context-expansion sorts are a small slice of
+total query time next to vector/lexical retrieval itself, so end-to-end wall
+clock is mostly within this machine's noise floor. The allocation counts are
+the trustworthy signal — they are deterministic, not subject to timing
+variance, and they improved in every single round measured. The general
+lesson, worth keeping for the next `reflect.Swapper` site found: **the
+Stable→Sort-via-tie-break conversion pays for itself only at the row counts
+the earlier ORDER BY work targeted (thousands+); below roughly a few hundred
+elements, a bare concrete-Swap `sort.Stable` captures the whole win with no
+allocation risk.**
+
+Correctness: `TestRAGSearchHybridConcurrentDeterministic`,
+`TestRAGContextFromMergesOverlappingHitProvenance`, and the full RAG/FTS test
+set in `internal/engine` pass unchanged — the tie-break arguments above are
+exactly what the tests would catch if wrong (score/order ties resolving
+differently, or a changed neighbor-expansion rank).
+
+```sh
+go test -bench='BenchmarkRAGContextFromTopK|BenchmarkRAGContextSingle|BenchmarkRAGHybridSearch' -benchmem ./internal/engine/...
+go test -run='TestRAG|TestFTSCandidate|TestFTSParallel' ./internal/engine/...
+```
+
+### Correctness found in passing: `compare()` had no `int64` case
+
+Not a performance item, but found while re-reading `value_semantics.go` during
+this round of work and worth recording here rather than in a silent commit:
+`compare()` (the function every comparison operator, `ORDER BY`, `DISTINCT`
+and `GROUP BY` equality ultimately goes through) had a type switch for
+`*big.Rat`, `big.Rat`, `int`, `float64`, `string`, `bool`, `[]byte` — but not
+`int64`, even though `compareInt` already handled a *right-hand* `int64` and
+`numeric()` already listed `int64` as a recognized numeric kind. A left-hand
+`int64` fell through to the function's final fallback, which only checks
+text equality: two *different* `int64` values produced `("incomparable int64
+and int64", error)` rather than an ordering.
+
+That alone would just be a visible error. The actual failure mode is worse:
+`compareForOrder`, the comparator behind every generic-path `ORDER BY`,
+**swallows `compare()`'s error and returns `0`** ("equal") instead of
+propagating it — so two different `int64` values silently sorted as ties,
+producing a wrong, unsorted-looking result with nothing surfaced anywhere.
+`int64` reaches raw rows from direct storage callers even though ordinary SQL
+`INSERT` coercion normalizes it to `int` first (`coerceToInt`), so this was
+reachable by exactly the callers the ORDER BY float fast path's own comment
+already warns about ("direct storage callers can still provide … a different
+Go type").
+
+Fixed with a `compareInt64` mirroring `compareInt`'s structure (same-type
+fast path, then `int`, then `numeric()` fallback), added as `case int64:` in
+`compare()`'s switch. `value_semantics_test.go` (new) pins both the direct
+`compare()` behavior and the `compareForOrder` silent-tie failure mode;
+temporarily reverting the fix reproduces both failures, confirming the tests
+are not vacuous.
+
+```sh
+go test -run='TestCompareInt64|TestCompareForOrderInt64' -v ./internal/engine/...
+```
+
+## Correctness audit: three silent-wrong-result JOIN bugs, and a family of missing type-switch cases
+
+A follow-up pass — triggered by a multi-agent scan of subsystems not yet
+touched by the perf work above, each finding independently re-verified
+against the current source before being trusted — turned up bugs more
+serious than anything fixed so far in this document: several produced wrong
+query results silently, with no error, on ordinary queries. These are
+listed in roughly descending order of how bad the failure mode is.
+
+### JOIN: two tables sharing a column name could get the wrong answer, non-deterministically
+
+`SELECT * FROM a LEFT JOIN b ON a.id = b.id` (or `RIGHT`/`FULL OUTER`), where
+both `a` and `b` have a column named `id`, could return a *different, wrong*
+answer for the bare `id` column on every single run of the identical query
+— not a consistent bug, an actually non-deterministic one. Reproduced with
+200 back-to-back identical queries against a 4-row table showing the
+unqualified `id` flipping between a's real value and `NULL` run to run.
+
+The root cause: `processNonAggregateQuery` and `processAggregateQuery`
+(`exec_group.go`) expand `SELECT *` by `range`-ing over the row's map to
+discover its keys — and Go deliberately randomizes map iteration order.
+Whichever of `a.id`/`b.id` the range happened to visit *last* silently
+overwrote the row's unqualified `id` entry, regardless of which one already
+held the correct, already-resolved value from the join's own merge step.
+Fix: only ever write the unqualified name from a qualified sibling when the
+row doesn't already carry that unqualified key itself (it does, for any
+column two joined tables share) — the existing value, which reflects the
+join's own deterministic "right side wins on a name collision" rule
+(`mergeRows`), is authoritative and must not be re-derived from a random
+qualified key.
+
+Two further, related bugs share the same "unmatched-side NULL-fill
+overwrites a value that was already correct" shape, both narrower than the
+one above but real:
+
+- **`addRightNulls`** (`row_helpers.go`), called on *every* result row of
+  `processLeftJoin`'s `>500`-row hash-join branch — not just unmatched ones
+  — unconditionally nulled the right table's qualified columns
+  (`"b.col"`). A `LEFT JOIN` on tables where either side exceeds 500 rows
+  silently returned `NULL` for `b.col` even on rows that matched, wherever
+  `b.col` was referenced by its qualified name (`SELECT b.name AS bname`).
+  Fixed by adding the same existence check the function's unqualified branch
+  already had.
+- **`processRightJoin`/`processFullOuterJoin`**'s inline left-column nulling
+  for an unmatched right row unconditionally nulled *every* key from a
+  sample left row — including the shared unqualified name, blanking the
+  right row's own real value for it. Deterministic (not random, since this
+  loop iterates a fixed key list rather than a row map) but still wrong.
+  Fixed with the same existence-check pattern, factored into a shared
+  `addLeftNulls` helper.
+
+Six regression tests (`join_ambiguous_column_test.go`) cover all three,
+including 200-iteration repeats for the two non-deterministic cases; each
+was confirmed to fail without its fix via a temporary revert before being
+trusted. The full `internal/engine` suite passes unchanged.
+
+```sh
+go test -run='TestLeftJoinLarge|TestSelectStarLeftJoinAmbiguous|TestSelectStarGroupByJoinAmbiguous|TestRightJoinUnmatchedKeeps|TestFullOuterJoinUnmatchedRightKeeps' -v ./internal/engine/...
+```
+
+### `compare()`/`coerceToBool`/`truthy`: a family of missing type-switch cases
+
+Beyond the `int64` gap fixed earlier in this document, the same audit found
+several siblings with the identical shape — a value type this engine
+genuinely produces, silently mishandled by a helper whose type switch never
+learned about it:
+
+| Function | Missing case | Consequence |
+|---|---|---|
+| `compare()` | `time.Time` | `NOW()`/`DATE_ADD` results fall to a text-equality fallback that is unreliable even for equality (monotonic clock reading); `ORDER BY` on such a column silently no-ops (`compareForOrder` swallows the error), `WHERE` raises "incomparable" |
+| `truthy()` | `int64` | Any `int64` value — even a genuinely truthy one — evaluated as `false`; backs `WHERE`-clause bare-column truthiness |
+| `coerceToBool()` | `int64` handling was **wrong**, not missing | `case int, int64: return x != 0` is an interface comparison in a shared-type-switch case (`x` keeps static type `any`), and different dynamic types are never interface-equal — `int64(0) != 0` evaluated to `true`. `CAST(int64_zero AS BOOL)` returned `true` |
+| `numeric()`, `coerceToFloat()`, `coerceToInt()`, `coerceToBool()` | `*big.Rat`/`big.Rat` (this engine's DECIMAL type) | `CAST(decimal_expr AS FLOAT/INT/BOOL)` and `DATE_ADD`'s numeric-interval check rejected a genuine DECIMAL value outright |
+| `inferType()` | `*big.Rat`/`big.Rat`, `time.Time` | `CREATE TABLE t AS SELECT price*qty AS total FROM orders` (a DECIMAL expression) or `... AS SELECT NOW() ...` silently created the new column as `JsonType` instead of `DecimalType`/`DateTimeType` |
+
+**One fix was implemented, benchmarked, and reverted within the same
+session** — a cautionary tale about this exact style of fix. Adding
+`*big.Rat`/`big.Rat` to `numeric()` itself (not just the coercion functions)
+looked consistent with the table above, and initially passed its own new
+test. But `numeric()` is used elsewhere as a fast-path *discriminator*:
+`exec_fastpath_aggregate.go` and `eval_aggregate.go`'s `SUM`/`AVG`/unary
+`+`/`-` all check `numeric(v)` first and only fall back to
+`storage.DecimalFromAny`'s exact `big.Rat` accumulation when `numeric()`
+says no. Making `numeric()` accept `big.Rat` meant every one of those
+callers took the fast (lossy) branch on the *first row of a group*, before
+their own exact-decimal fallback ever ran — `SELECT SUM(decimal_col)`
+silently became a float64 approximation instead of an exact fraction,
+caught immediately by the pre-existing `TestAggregateFastPathDecimalSum`
+(`expected *big.Rat sum for group 1, got float64 (30.299999999999997)`).
+Reverted; `numeric()`'s doc comment now states explicitly why it must never
+gain a `big.Rat` case, and a new `TestNumericExcludesBigRat` pins the
+negative. The other four functions have no such fast-path role and keep
+their `big.Rat` cases safely.
+
+Regression tests for every row in the table (`value_semantics_types_test.go`),
+each confirmed to fail without its fix via a temporary revert.
+
+```sh
+go test -run='TestCompareTime|TestTruthyInt64|TestCoerceToBoolInt64Zero|TestNumericExcludesBigRat|TestCoerceToFloatBigRat|TestCoerceToIntBigRat|TestCoerceToBoolBigRat|TestInferTypeBigRatAndTime' -v ./internal/engine/...
+```
+
+### Smaller performance fixes from the same audit
+
+Once the correctness findings above were fixed, the remaining audit
+findings were ordinary performance opportunities matching patterns already
+established in this document — implemented, low-risk, each verified by the
+existing or a new benchmark:
+
+- **`writeFmtKeyPart` gained an `int64` case.** Every multi-column
+  `GROUP BY`/`PIVOT`/`DISTINCT`/set-op key builder calls this function; an
+  `int64`-typed grouping column previously fell to the `default` branch's
+  full JSON marshal per row instead of a two-line integer append.
+  `writeSingleGroupKey` (the single-column `GROUP BY` fast path, which
+  already special-cased `int64` for exactly this reason) now simply
+  delegates to it.
+- **Hash-join build/probe loop stopped re-lowercasing a loop-invariant
+  column name on every row.** `buildColumn`/`probeColumn` never change
+  across a join; `getJoinKey` now takes the pre-lowered form instead of
+  calling `strings.ToLower` per build row and per probe row in the
+  `>500`-row path.
+- **`DELETE` no longer rebuilds the row slice and secondary indexes when
+  its predicate matched zero rows.** Both the raw-predicate fast path and
+  the trigger/RETURNING path gated `t.Rows = kept` /
+  `t.ReindexSecondaryIndexRows(oldToNew)` on `del > 0`, mirroring the
+  pattern `UPDATE` already uses next to it. Measured on a 20,000-row table
+  with one secondary index, four alternating rounds: **11.8–12.8 ms after
+  vs. 13.7–18.5 ms before, allocations down ~750 every round.**
+- **`INSERT`'s constraint check now visits only columns that can ever
+  fail.** `validateRowConstraintsWith` used to walk every column of the
+  table per row; both `executeInsertAllColumns` and
+  `executeInsertSpecificColumns` now precompute the constrained-column
+  index list once per statement (`constrainedColumnIndices`) instead of
+  passing `nil` (all columns) on every row.
+- **`applyColumnDefaults` is skipped entirely when no column has a
+  default,** a schema-invariant fact now computed once per `INSERT`
+  statement (`tableHasDefaults`) instead of scanning every column of every
+  row to find out there was nothing to do.
+- **`ARRAY_SORT` and the unary `+`/`-`/`NOT` join fast path** got the same
+  two fixes already applied elsewhere in this document: a concrete
+  `sort.Interface` (`arraySortAsc`) instead of `sort.Slice`'s
+  `reflect.Swapper` fallback for `[]any`, and `evalJoinRawUnary` now calls
+  a shared `applyUnaryOp(op, value)` directly instead of allocating a
+  `&simpleSelectPlan{}`/`&Unary{}`/`&Literal{}` trio purely to reach
+  `evalRawUnary`'s switch.
+- **`buildRawFilterRegexp`** now calls the shared `compileCachedRegexp`
+  instead of `regexp.Compile` directly — it was the one REGEXP/RLIKE/SIMILAR
+  TO evaluation path in the engine that bypassed the process-wide compiled-
+  pattern cache every other one already uses.
+- **`applyDistinctOn`** (`SELECT DISTINCT ON`) and
+  **`formatWindowPartitionKey`** (window `PARTITION BY` key, called once per
+  partition column per output row) switched from `fmt.Sprintf`/`fmt.Fprintf`
+  to `valueText`/`writeFmtKeyPart` — the same fmt-avoidance sweep applied
+  earlier in this document, missed by it because these two call sites live
+  outside `internal/engine`'s scalar-function files.
+
+```sh
+go test -bench='BenchmarkDeleteMatchesNothing' -benchmem ./internal/engine/...
+```
+
+### Deferred: three window-function complexity findings, not implemented this round
+
+The same audit found three real algorithmic-complexity issues in window
+function evaluation, deliberately left unfixed this round — each needs a
+new per-(shape, partition) cache structure threaded through existing
+memoization, which is a larger, riskier change than anything else in this
+section, and deserves its own dedicated verification pass rather than
+being rushed alongside everything above:
+
+- **Partition build is O(N·K) instead of O(N)** for a query with K
+  distinct partition values (`filterPartitionIndexed` re-scans all N rows
+  from scratch for every newly-seen partition key).
+- **`DENSE_RANK`/`RANK` are O(P²) per partition** (`evalDenseRankFunction`
+  rescans from the partition's start on every output row instead of
+  computing the whole partition's rank sequence in one forward pass).
+- **`MOVING_SUM`/`MOVING_AVG` are O(N·window) instead of O(N) amortized**
+  (`evalMovingAggregate` re-sums its entire window from scratch every row
+  instead of maintaining a running sum across successive, mostly-overlapping
+  windows).
+
+All three would need a small per-(shape, partition) running-state cache,
+similar in shape to the existing `windowPartitionEntry`/`natBreaksCache`
+memoization already in `eval_window.go`/`eval_window_classify.go`.
+
 ## MBTiles tile serving: tinySQL vs SQLite
 
 A tile server runs exactly one query per request:
@@ -1278,4 +1753,169 @@ go test ./benchmarks -run '^$' -bench BenchmarkPagedIndexMBTilesAccessParallel -
 go test ./benchmarks -run '^$' -bench BenchmarkPagedIndexMBTilesOpenReopen -benchmem -benchtime=200x
 go test ./internal/storage/pager/... -run 'TestBTreeExactBoundarySizesAllKeyOrders|TestBTreeReplaceDeleteInsertOverflowSequenceNoLeak|TestBTreeMultiLevelSplitInvariants|TestLeafEntryNeedsOverflowBoundary' -v
 go test ./internal/engine/... -run TestPagedIndexRegionalMBTilesReplaceDeleteInsert -v
+```
+
+## Lexer: ASCII fast paths, scratch-buffer reuse, and zero-copy string/symbol tokens
+
+Every prior round this session optimized the parser or the engine above it;
+the lexer itself (`internal/engine/lexer.go`) had never been profiled. It
+turned out to have the same shape of problem as everything else found this
+session: correct code, but paying full Unicode-table and allocation costs on
+the overwhelmingly common ASCII/no-escape case.
+
+Profiling `BenchmarkLexerNextTokenOnly` (a new benchmark added this round
+that drains a token stream without building any AST, isolating lexer cost
+from parser recursion) with `-memprofilerate=1` showed allocation flat-cost
+concentrated in three places: `upper()`'s `[]byte(s)` + `string(b)` pair on
+every keyword/identifier, `tokenizeSymbol()`'s `string(rune)` conversion on
+every single-character token (parens, commas, operators — the single most
+frequent token shape in real SQL), and `tokenizeString()`/`tokenizeQuotedIdent()`
+unconditionally building through a `strings.Builder` even when the literal
+contains no escaped quote.
+
+Fixes, in the order they were made:
+
+- **`peek()`/`next()`/`skipWS()`/`tokenizeIdentOrKeyword()`**: added an ASCII
+  byte-value fast path (`c < utf8.RuneSelf`) ahead of
+  `utf8.DecodeRuneInString`/`unicode.IsSpace`/`unicode.IsLetter`, falling back
+  to the general Unicode path only the moment a non-ASCII byte is seen.
+  Verified against genuinely multi-byte identifiers (`héllo`, `café_table`,
+  `日本語`, `naïve_col`) — a byte-wise fast path that mishandles a continuation
+  byte would corrupt exactly this input, so `lexer_test.go` pins it directly
+  end-to-end through `CREATE TABLE`/`INSERT`/`SELECT`.
+- **`upperInto(s string) string`**: new method with a `scratch []byte` field
+  on `*lexer`, reused (grown only when a longer candidate appears) across
+  every token of one parsed statement — the same buffer-reuse pattern already
+  used elsewhere in the engine (`writeFmtKeyPart`, `applyDistinctOn`). Cuts the
+  has-lowercase-ASCII path from 2 allocations to 1. The original free-standing
+  `upper()` function is kept unchanged for two cold call sites
+  (`parse_column_type.go`, `parse_statement.go`) that don't need it.
+- **`tokenizeSymbol()`**: single-character tokens now slice into a
+  package-level precomputed 128-byte string (`asciiSingleChar`, built once at
+  init so `asciiSingleChar[b] == byte(b)`) instead of converting a rune to a
+  string — Go string slicing shares the backing array, so this is genuinely
+  zero-allocation, unlike the next bullet's dead end. Two-character operators
+  (`<=`, `<>`, `>=`, `!=`) return Go string constants directly instead of the
+  old `string(a)+string(b)` concatenation.
+- **`tokenizeString()`/`tokenizeQuotedIdent()`**: both now scan ahead
+  byte-by-byte for the closing quote before building anything. If a plain
+  close is found with no doubled-quote (`''`/`""`) escape on the way, the
+  token value is the original string sliced directly
+  (`lx.s[contentStart:i]`) — zero-copy, and skips the decode/re-encode
+  `strings.Builder.WriteRune` does per byte even for plain ASCII. Only when a
+  doubled-quote escape is actually present does it fall back to the original,
+  unchanged `strings.Builder`-based path. A single-byte ASCII quote can never
+  equal a continuation byte of a multi-byte UTF-8 sequence, so the byte-wise
+  scan is safe on arbitrary Unicode content without decoding runes at all.
+
+### A dead end worth recording: `string(byte(r))` does not avoid an allocation
+
+The first attempt at `tokenizeSymbol()` used `string(byte(r))` for
+single-character symbols, on the assumption that converting a `byte` (as
+opposed to a `rune`) to a `string` has some compiler-recognized
+single-byte-value fast path. It doesn't. A direct isolated benchmark of both
+conversions came back identical: **`string(rune)` and `string(byte(r))` both
+allocate ~23 ns/op, 1 alloc/op, 4 B/op** for a runtime (non-constant) value —
+Go has no free byte→string conversion. This was caught not by a test failure
+but by the A/B benchmark's allocation counts coming back *higher* than
+before instead of lower on the first attempt, which prompted checking the
+assumption directly rather than trusting it. The actual zero-allocation
+technique is slicing into a precomputed string table (`asciiSingleChar`
+above), confirmed by the same isolated benchmark at **1.5 ns/op, 0
+allocs/op**. This mirrors the `numeric()`/`big.Rat` and small-*N*
+permutation-sort reversals earlier in this document: another plausible Go
+performance belief that turned out to be wrong under direct measurement.
+
+### Results
+
+New tests (`lexer_test.go`): Unicode identifiers (bare and end-to-end through
+a real `CREATE TABLE`/`INSERT`/`SELECT`), every single- and double-character
+symbol/operator plus boundary cases (`<==` → `<=`, `=`; `a<b` → `a`, `<`,
+`b`), whitespace and both comment forms in combination, keyword
+case-insensitivity across a scratch-buffer growth-then-shrink sequence, and
+string/quoted-identifier literals covering both the zero-copy fast path and
+the doubled-quote escape fallback (including a literal with multi-byte
+content). All pass, and the full `internal/engine` suite (`go test
+./internal/engine/... -count=1`) passes with no regressions.
+
+Four alternating A/B rounds (`-benchtime=300x`, alternating before/after
+binaries per round rather than running each once in sequence, per this
+machine's documented 2–3x run-to-run noise) gave a consistent picture. On
+this noisy machine, allocation counts are the trustworthy signal (they don't
+vary round to round at all), so they're reported alongside the noisier
+wall-clock minima across all 4 rounds:
+
+| benchmark | allocs/op before → after | ns/op min before → min after |
+|---|---|---|
+| `BenchmarkLexerNextTokenOnly` (pure lexer) | 68 → 35 (−49%) | 11,860 → 9,845 |
+| `BenchmarkParseBulkInsert` (200-row `VALUES`) | 5,425 → 3,222 (−41%) | 800,813 → 651,319 |
+| `BenchmarkParseComplexSelect` (multi-join, window fn, `DATE_ADD`) | 147 → 114 (−22%) | 32,350 → 33,761 |
+| `BenchmarkParseSimpleSelect` | 30 → 30 (unchanged — too few symbol/keyword tokens to move the needle) | 7,443 → 3,918 |
+
+`ParseComplexSelect`'s minimum went the "wrong" way in this particular
+4-round set (33,761 > 32,350) even though its allocation count dropped 22%
+same as always — one "before" round happened to land unusually low (32,350
+vs. that same round's own neighbors at 48–52k), which is exactly the kind of
+single-round fluke this machine's documented 2–3x noise produces. This is
+the reason allocation counts, not ns/op minima, are treated as the
+trustworthy signal throughout this document: they are bit-for-bit identical
+across every round, while wall-clock minima can and do flip sign on any
+individual benchmark in any individual 4-round set. Averaged over multiple
+independent 4-round sets taken during this work, `ParseComplexSelect` and
+every other benchmark were consistently faster after, matching their
+allocation-count improvement.
+
+An adversarial-review workflow (4 independent lenses — fast-path/slow-path
+correctness, Unicode byte-boundary safety, EOF/empty-input edge cases, test
+coverage gaps — each finding then put through 3 independent refutation
+attempts) was run against the diff before considering this done, the same
+process used earlier in this document for the JOIN and date/time bugs. It
+found one real bug, reported independently by all four lenses and confirmed
+by all 12 refutation attempts:
+
+### Found by adversarial review: the fast path silently dropped UTF-8 sanitization
+
+The pre-diff `tokenizeString`/`tokenizeQuotedIdent` built every token through
+`lx.next()` (which decodes via `utf8.DecodeRuneInString`) and
+`strings.Builder.WriteRune`. Go's `utf8.DecodeRuneInString` returns
+`utf8.RuneError` (U+FFFD) for any malformed byte, and `WriteRune` re-encodes
+that as its 3-byte UTF-8 form — so the old lexer *always* silently replaced
+invalid UTF-8 inside a string or quoted-identifier literal with the
+replacement character, guaranteeing every token value was valid UTF-8. The
+zero-copy fast path bypassed this entirely: it located the closing quote with
+a raw byte scan and, when no `''`/`""` escape was present (the common case),
+returned `lx.s[contentStart:i]` verbatim — including any malformed bytes,
+unchanged. For example, lexing the 3-byte literal `'` + `0x80` + `'` returned
+the raw invalid byte under the new code instead of the 3-byte U+FFFD
+replacement the old code always produced. Not a panic or crash — `lx.pos`
+bookkeeping was unaffected, since a literal ASCII quote byte can never
+collide with a UTF-8 continuation byte — purely a silent change in returned
+byte content whenever a literal contained malformed UTF-8 and took the fast
+path.
+
+Fixed by validating the fast-path slice with `utf8.ValidString` before
+returning it, falling back to the sanitizing slow path only when the content
+is genuinely malformed:
+
+```go
+if content := lx.s[contentStart:i]; utf8.ValidString(content) {
+    lx.pos = i + 1
+    return token{Typ: tString, Val: content, Pos: start}
+}
+break // malformed UTF-8 -- fall back to the slow path to sanitize it
+```
+
+`utf8.ValidString` is a single allocation-free linear scan, cheaper than the
+old decode-then-rebuild path it replaces, so this costs nothing in the
+overwhelmingly common case (valid UTF-8, no escape): the four benchmarks'
+allocation counts are bit-for-bit identical before and after this fix. Two
+new tests (`TestLexerStringLiteralMalformedUTF8`,
+`TestLexerQuotedIdentifierMalformedUTF8`) pin the old and new lexer to agree
+on malformed input (lone continuation bytes, invalid lead bytes, truncated
+multi-byte sequences, both standalone and embedded mid-literal).
+
+```sh
+go test ./internal/engine/... -run 'TestLexer' -count=1 -v
+go test ./internal/engine/... -count=1
+go test ./internal/engine/... -run '^$' -bench 'BenchmarkParseSimpleSelect|BenchmarkParseComplexSelect|BenchmarkParseBulkInsert|BenchmarkLexerNextTokenOnly' -benchmem -benchtime=300x
 ```

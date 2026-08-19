@@ -25,6 +25,34 @@ type Scheduler struct {
 	started     bool
 	wg          sync.WaitGroup
 	executor    JobExecutor // Interface for executing SQL
+
+	// sem bounds how many jobs execute their SQL concurrently. Per-job
+	// NoOverlap only dedups repeat runs of the *same* job; nothing else
+	// stopped many different enabled INTERVAL/CRON jobs whose schedules
+	// happened to coincide from all firing at once, each spawning a
+	// goroutine that immediately contends for DB's write lock. A job beyond
+	// the limit queues on this channel (a plain semaphore, acquired in
+	// executeJob's goroutine) instead of piling on immediately. Sized in
+	// NewScheduler; see SetMaxConcurrentJobs to change it.
+	sem chan struct{}
+}
+
+// defaultMaxConcurrentJobs is the default width of Scheduler.sem.
+const defaultMaxConcurrentJobs = 8
+
+// SetMaxConcurrentJobs changes how many jobs may execute their SQL at once.
+// Replaces the semaphore outright, so it only affects jobs that acquire a
+// slot after this call -- safe to call before Start, or while running
+// (jobs already holding a slot on the old channel still release it there,
+// which is harmless since nothing reads that channel anymore). n <= 0 is
+// ignored.
+func (s *Scheduler) SetMaxConcurrentJobs(n int) {
+	if n <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sem = make(chan struct{}, n)
 }
 
 // JobExecutor interface allows the scheduler to execute SQL without circular dependencies
@@ -49,6 +77,7 @@ func NewScheduler(db *DB, executor JobExecutor) *Scheduler {
 		cronEntries: make(map[string]cron.EntryID),
 		stopCh:      make(chan struct{}),
 		executor:    executor,
+		sem:         make(chan struct{}, defaultMaxConcurrentJobs),
 	}
 }
 
@@ -349,6 +378,27 @@ func (s *Scheduler) executeJob(job *CatalogJob) {
 				log.Printf("Job %q panicked: %v", job.Name, r)
 			}
 		}()
+
+		// Wait for a concurrency slot, honoring the job's own timeout/
+		// Stop-triggered cancellation instead of blocking forever on it. A
+		// job that never gets a slot returns here with status still
+		// "SUCCEEDED"; the history defer above already converts that to
+		// "CANCELED" whenever ctx.Err() != nil, so no separate handling is
+		// needed for "canceled while queued" vs. "canceled while running".
+		//
+		// Read s.sem once into a local so this goroutine's acquire and its
+		// deferred release always target the same channel even if
+		// SetMaxConcurrentJobs swaps s.sem while this job is queued or
+		// running.
+		s.mu.RLock()
+		sem := s.sem
+		s.mu.RUnlock()
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+		case <-ctx.Done():
+			return
+		}
 
 		log.Printf("Executing job %q", job.Name)
 
