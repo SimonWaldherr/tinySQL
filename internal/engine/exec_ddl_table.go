@@ -26,19 +26,28 @@ func executeCreateTable(env ExecEnv, s *CreateTable) (*ResultSet, error) {
 	if err != nil {
 		return nil, err
 	}
+	// lowerNames is computed once per column instead of once per (row,
+	// column) pair: CREATE TABLE AS SELECT's row-copy loop used to call
+	// strings.ToLower(c.Name) len(rs.Rows) times per column, recomputing the
+	// same string every time since the column set is fixed for the whole
+	// statement.
 	cols := make([]storage.Column, len(rs.Cols))
+	lowerNames := make([]string, len(rs.Cols))
 	for i, c := range rs.Cols {
+		lower := strings.ToLower(c)
+		lowerNames[i] = lower
 		typ := storage.TextType
 		if len(rs.Rows) > 0 {
-			typ = inferType(rs.Rows[0][strings.ToLower(c)])
+			typ = inferType(rs.Rows[0][lower])
 		}
 		cols[i] = storage.Column{Name: c, Type: typ}
 	}
 	t := storage.NewTable(s.Name, cols, s.IsTemp)
+	t.Rows = make([][]any, 0, len(rs.Rows))
 	for _, r := range rs.Rows {
 		row := make([]any, len(cols))
-		for i, c := range cols {
-			row[i] = r[strings.ToLower(c.Name)]
+		for i, lower := range lowerNames {
+			row[i] = r[lower]
 		}
 		t.Rows = append(t.Rows, row)
 	}
