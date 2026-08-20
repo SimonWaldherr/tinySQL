@@ -16,27 +16,46 @@ package engine
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sync/atomic"
 	"testing"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
-// parallelDMLTables is the number of distinct tables (or tenants) the parallel
-// benchmarks spread their writers over. It is deliberately larger than this
-// machine's core count so that every RunParallel worker gets its own table and
-// contention can only come from shared engine state, not from two workers
-// picking the same table.
-const parallelDMLTables = 32
+// parallelDMLMinTables keeps small machines from measuring an accidentally
+// tiny table catalog. parallelDMLTableCount additionally grows with
+// GOMAXPROCS: RunParallel starts one worker per logical processor by default,
+// and every worker must own a distinct table for this benchmark to measure
+// only shared engine contention.
+const parallelDMLMinTables = 32
 
-// setupParallelDMLTables creates parallelDMLTables tables, each seeded with
+func parallelDMLTableCount() int {
+	if workers := runtime.GOMAXPROCS(0); workers > parallelDMLMinTables {
+		return workers
+	}
+	return parallelDMLMinTables
+}
+
+func TestParallelDMLTableCountCoversRunParallelWorkers(t *testing.T) {
+	const workers = 64
+	previous := runtime.GOMAXPROCS(workers)
+	t.Cleanup(func() { runtime.GOMAXPROCS(previous) })
+
+	if got := parallelDMLTableCount(); got < workers {
+		t.Fatalf("parallel DML tables = %d, want at least %d RunParallel workers", got, workers)
+	}
+}
+
+// setupParallelDMLTables creates one table per RunParallel worker (with a
+// minimum of parallelDMLMinTables), each seeded with
 // seedRows rows, and returns the database. Tables are named t0..tN-1 and share
 // the schema (id INT PRIMARY KEY, bucket INT, val TEXT).
 func setupParallelDMLTables(b *testing.B, tenants bool, seedRows int) *storage.DB {
 	b.Helper()
 	db := storage.NewDB()
 	ctx := context.Background()
-	for i := 0; i < parallelDMLTables; i++ {
+	for i := 0; i < parallelDMLTableCount(); i++ {
 		tenant, name := parallelDMLTarget(tenants, i)
 		if _, err := Execute(ctx, db, tenant, mustParse(
 			fmt.Sprintf(`CREATE TABLE %s (id INT PRIMARY KEY, bucket INT, val TEXT)`, name))); err != nil {
@@ -70,12 +89,13 @@ func parallelDMLTarget(tenants bool, i int) (string, string) {
 func benchmarkParallelInsert(b *testing.B, tenants bool) {
 	db := setupParallelDMLTables(b, tenants, 0)
 	ctx := context.Background()
+	tableCount := parallelDMLTableCount()
 	var worker atomic.Int64
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
-		id := int(worker.Add(1)-1) % parallelDMLTables
+		id := int(worker.Add(1)-1) % tableCount
 		tenant, name := parallelDMLTarget(tenants, id)
 		// Each worker owns its table, so it also owns the primary keys it
 		// inserts: no two workers can collide on the PK index.
@@ -91,8 +111,8 @@ func benchmarkParallelInsert(b *testing.B, tenants bool) {
 	})
 }
 
-// BenchmarkParallelInsertDistinctTables writes into 32 tables of one tenant
-// from every available core at once. Compare against
+// BenchmarkParallelInsertDistinctTables writes into one table per available
+// core (at least 32) in one tenant. Compare against
 // BenchmarkSerialInsertOneTable.
 func BenchmarkParallelInsertDistinctTables(b *testing.B) { benchmarkParallelInsert(b, false) }
 
@@ -123,12 +143,13 @@ func benchmarkParallelPointUpdate(b *testing.B, tenants bool) {
 	const seedRows = 5000
 	db := setupParallelDMLTables(b, tenants, seedRows)
 	ctx := context.Background()
+	tableCount := parallelDMLTableCount()
 	var worker atomic.Int64
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
-		id := int(worker.Add(1)-1) % parallelDMLTables
+		id := int(worker.Add(1)-1) % tableCount
 		tenant, name := parallelDMLTarget(tenants, id)
 		stmt := mustParse(fmt.Sprintf(`UPDATE %s SET val = 'y' WHERE id = 1234`, name))
 		for pb.Next() {
@@ -171,13 +192,14 @@ func BenchmarkParallelReadWriteMix(b *testing.B) {
 	const seedRows = 5000
 	db := setupParallelDMLTables(b, false, seedRows)
 	ctx := context.Background()
+	tableCount := parallelDMLTableCount()
 	var worker atomic.Int64
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		id := int(worker.Add(1) - 1)
-		table := fmt.Sprintf("t%d", id%parallelDMLTables)
+		table := fmt.Sprintf("t%d", id%tableCount)
 		// Every fourth worker writes; the rest read a different table.
 		write := id%4 == 0
 		var stmt Statement

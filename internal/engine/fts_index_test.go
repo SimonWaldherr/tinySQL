@@ -15,7 +15,9 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -137,6 +139,150 @@ func TestFTSCandidateRestrictionMatchesFullScan(t *testing.T) {
 				t.Logf("%s: restricted to %d of %d rows", tc.query, len(cands.rows), len(cache.docs))
 			}
 		})
+	}
+}
+
+// TestFTSDocCacheCoalescesConcurrentColdBuilds holds the first cache builder
+// so every peer encounters the same cold key. Exactly one caller may tokenize
+// the corpus; the rest must wait for that entry and reuse it.
+func TestFTSDocCacheCoalescesConcurrentColdBuilds(t *testing.T) {
+	const (
+		tenant  = "fts-cold-cache-coalesce"
+		tableID = "fts_cold_cache_coalesce"
+		readers = 16
+	)
+	table := storage.NewTable(tableID, []storage.Column{{Name: "body", Type: storage.TextType}}, false)
+	table.Rows = [][]any{{"concurrent cache build one"}, {"concurrent cache build two"}}
+	table.Version = 1
+	purgeFTSCachesFor(tenant, tableID)
+
+	leaderStarted := make(chan struct{})
+	waitersJoined := make(chan struct{})
+	releaseLeader := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseLeader) }) }
+	var builds atomic.Int32
+	var waiters atomic.Int32
+	oldHook := ftsDocCacheBuildHook
+	oldWaitHook := ftsDocCacheWaitHook
+	ftsDocCacheBuildHook = func() {
+		if builds.Add(1) == 1 {
+			close(leaderStarted)
+		}
+		<-releaseLeader
+	}
+	ftsDocCacheWaitHook = func() {
+		if waiters.Add(1) == readers-1 {
+			close(waitersJoined)
+		}
+	}
+
+	var wg sync.WaitGroup
+	t.Cleanup(func() {
+		release()
+		wg.Wait()
+		ftsDocCacheBuildHook = oldHook
+		ftsDocCacheWaitHook = oldWaitHook
+		purgeFTSCachesFor(tenant, tableID)
+	})
+
+	ready := make(chan struct{}, readers)
+	start := make(chan struct{})
+	errs := make(chan error, readers)
+	for range readers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ready <- struct{}{}
+			<-start
+			cache := getFTSDocCache(tenant, table, []int{0})
+			if cache.table != table || cache.version != table.Version || cache.numDocs != len(table.Rows) {
+				errs <- fmt.Errorf("unexpected cache entry: table=%p version=%d docs=%d", cache.table, cache.version, cache.numDocs)
+			}
+		}()
+	}
+	for range readers {
+		<-ready
+	}
+	close(start)
+
+	select {
+	case <-leaderStarted:
+	case <-time.After(time.Second):
+		release()
+		wg.Wait()
+		t.Fatal("FTS cache leader did not start")
+	}
+	select {
+	case <-waitersJoined:
+	case <-time.After(time.Second):
+		release()
+		wg.Wait()
+		t.Fatalf("only %d of %d followers joined the in-flight FTS build", waiters.Load(), readers-1)
+	}
+	gotBuilds := builds.Load()
+	release()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Error(err)
+		}
+	}
+	if gotBuilds != 1 {
+		t.Fatalf("cold FTS cache builds = %d, want 1", gotBuilds)
+	}
+}
+
+// TestFTSDocCacheBuildPanicDoesNotStrandCall ensures a recovered builder
+// panic cannot leave an in-flight call behind and make the next request wait
+// forever.
+func TestFTSDocCacheBuildPanicDoesNotStrandCall(t *testing.T) {
+	const (
+		tenant  = "fts-cache-panic-cleanup"
+		tableID = "fts_cache_panic_cleanup"
+	)
+	table := storage.NewTable(tableID, []storage.Column{{Name: "body", Type: storage.TextType}}, false)
+	table.Rows = [][]any{{"panic cleanup corpus"}}
+	table.Version = 1
+	purgeFTSCachesFor(tenant, tableID)
+
+	var calls atomic.Int32
+	oldHook := ftsDocCacheBuildHook
+	oldWaitHook := ftsDocCacheWaitHook
+	ftsDocCacheBuildHook = func() {
+		if calls.Add(1) == 1 {
+			panic("test FTS cache builder panic")
+		}
+	}
+	ftsDocCacheWaitHook = nil
+	t.Cleanup(func() {
+		ftsDocCacheBuildHook = oldHook
+		ftsDocCacheWaitHook = oldWaitHook
+		purgeFTSCachesFor(tenant, tableID)
+	})
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		getFTSDocCache(tenant, table, []int{0})
+	}()
+	if recovered == nil {
+		t.Fatal("FTS cache builder panic was not propagated")
+	}
+
+	result := make(chan ftsDocCacheEntry, 1)
+	go func() { result <- getFTSDocCache(tenant, table, []int{0}) }()
+	select {
+	case cache := <-result:
+		if cache.table != table || cache.numDocs != 1 {
+			t.Fatalf("cache after panic = %#v", cache)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("FTS cache remained blocked after builder panic")
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("builder calls = %d, want 2", got)
 	}
 }
 

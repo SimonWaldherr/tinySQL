@@ -1147,9 +1147,21 @@ func (e ftsDocCacheEntry) docTokens(doc ftsCachedDoc) []int32 {
 // searches many distinct column sets) leaks one pinned table per orphaned key.
 const ftsDocCacheMaxEntries = 256
 
+type ftsDocCacheBuildCall struct{ done chan struct{} }
+
 var (
 	ftsDocCacheMu sync.RWMutex
 	ftsDocCache   = make(map[ftsDocCacheKey]ftsDocCacheEntry)
+	// ftsDocCacheBuilds coalesces concurrent cold reads for the same
+	// tokenized document set. Without it, a request burst can make every
+	// caller tokenize the whole corpus before one cache entry wins.
+	ftsDocCacheBuilds = make(map[ftsDocCacheKey]*ftsDocCacheBuildCall)
+	// ftsDocCacheBuildHook lets the focused coalescing test hold a leader
+	// build long enough for followers to join. It is always nil in production.
+	ftsDocCacheBuildHook func()
+	// ftsDocCacheWaitHook lets that test observe followers after they have
+	// joined an in-flight build. It is always nil in production.
+	ftsDocCacheWaitHook func()
 )
 
 // purgeFTSCachesFor drops the tokenized-document cache for one table, called
@@ -1244,12 +1256,50 @@ func ftsValueToString(v any) string {
 func getFTSDocCache(tenant string, table *storage.Table, cols []int) ftsDocCacheEntry {
 	key := ftsDocCacheKey{tenant: tenant, table: table.Name, cols: ftsColsCacheKey(cols)}
 
-	ftsDocCacheMu.RLock()
-	if e, ok := ftsDocCache[key]; ok && e.table == table && e.version == table.Version {
+	var call *ftsDocCacheBuildCall
+	for {
+		ftsDocCacheMu.RLock()
+		if e, ok := ftsDocCache[key]; ok && e.table == table && e.version == table.Version {
+			ftsDocCacheMu.RUnlock()
+			return e
+		}
 		ftsDocCacheMu.RUnlock()
-		return e
+
+		ftsDocCacheMu.Lock()
+		if e, ok := ftsDocCache[key]; ok && e.table == table && e.version == table.Version {
+			ftsDocCacheMu.Unlock()
+			return e
+		}
+		if call := ftsDocCacheBuilds[key]; call != nil {
+			ftsDocCacheMu.Unlock()
+			if ftsDocCacheWaitHook != nil {
+				ftsDocCacheWaitHook()
+			}
+			<-call.done
+			continue
+		}
+		call = &ftsDocCacheBuildCall{done: make(chan struct{})}
+		ftsDocCacheBuilds[key] = call
+		ftsDocCacheMu.Unlock()
+		break
 	}
-	ftsDocCacheMu.RUnlock()
+
+	published := false
+	defer func() {
+		if published {
+			return
+		}
+		ftsDocCacheMu.Lock()
+		if ftsDocCacheBuilds[key] == call {
+			delete(ftsDocCacheBuilds, key)
+			close(call.done)
+		}
+		ftsDocCacheMu.Unlock()
+	}()
+
+	if ftsDocCacheBuildHook != nil {
+		ftsDocCacheBuildHook()
+	}
 
 	docs := make([]ftsCachedDoc, len(table.Rows))
 	postings := make(map[string][]int32)
@@ -1363,6 +1413,9 @@ func getFTSDocCache(tenant string, table *storage.Table, cols []int) ftsDocCache
 		evictOverCap(ftsDocCache, ftsDocCacheMaxEntries)
 	}
 	ftsDocCache[key] = entry
+	delete(ftsDocCacheBuilds, key)
+	close(call.done)
+	published = true
 	ftsDocCacheMu.Unlock()
 	return entry
 }
