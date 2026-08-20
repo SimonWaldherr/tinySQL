@@ -458,12 +458,16 @@ func (c *conn) executeWriteStatement(ctx context.Context, st engine.Statement) (
 		return nil, err
 	}
 	defer c.srv.releaseWriter()
-	c.srv.mu.Lock()
-	defer c.srv.mu.Unlock()
-	// Run the statement against the live database in every storage mode,
-	// ModeWAL included. The engine appends it to the WAL itself and rolls the
-	// statement back if that append fails, so the log still leads the change.
-	rs, err := engine.Execute(ctx, c.srv.db, c.tenant, st)
+	// writeMu serializes this write against every other writer for its whole
+	// span, mutation and persist alike -- see its doc comment on server.
+	// mu.Lock() below is narrower: held only while the statement actually
+	// mutates c.srv.db, so a concurrent SELECT (mu.RLock()) is blocked only
+	// for that in-memory step, not for the persist() call's disk I/O after
+	// it. persist() is still fully serialized against other writers by
+	// writeMu, which is what makes releasing mu before calling it safe.
+	c.srv.writeMu.Lock()
+	defer c.srv.writeMu.Unlock()
+	rs, err := c.executeAndLockContent(ctx, st)
 	if err != nil {
 		return nil, err
 	}
@@ -473,6 +477,18 @@ func (c *conn) executeWriteStatement(ctx context.Context, st engine.Statement) (
 		return nil, err
 	}
 	return rs, nil
+}
+
+// executeAndLockContent runs st against the live database under mu.Lock(),
+// releasing it as soon as engine.Execute returns rather than leaving it held
+// for whatever the caller does afterward (persist()'s disk I/O, notably).
+// Run the statement against the live database in every storage mode,
+// ModeWAL included: the engine appends it to the WAL itself and rolls the
+// statement back if that append fails, so the log still leads the change.
+func (c *conn) executeAndLockContent(ctx context.Context, st engine.Statement) (*engine.ResultSet, error) {
+	c.srv.mu.Lock()
+	defer c.srv.mu.Unlock()
+	return engine.Execute(ctx, c.srv.db, c.tenant, st)
 }
 
 func (c *conn) execStatement(ctx context.Context, st engine.Statement) (driver.Result, error) {

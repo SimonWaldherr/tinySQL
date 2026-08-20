@@ -134,16 +134,31 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 	}
 	defer c.srv.releaseReader()
 	c.srv.mu.RLock()
-	// A read-only transaction produces no changes to merge, so it needs only a
-	// single stable read snapshot and no conflict-detection base. A read-write
-	// transaction needs a mutable shadow plus a lightweight version-only base
-	// (SnapshotForTx copies rows once, not twice).
+	// DeepClone/SnapshotForTx read every table's live Rows/Cols/Version --
+	// exactly what storage.DB.contentMu exists to guard against a concurrent
+	// mutation of the same fields (see its doc comment in
+	// internal/storage/db.go). server.mu.RLock() above only coordinates with
+	// this *driver*'s own writers; it says nothing about a caller that
+	// mutates the same *storage.DB directly through engine.Execute/
+	// tinysql.Execute -- the job scheduler (internal/storage/scheduler.go),
+	// reachable when an app shares one DB between a driver server and
+	// StartJobScheduler via SetDefaultDB. Taking contentMu for read here
+	// closes that gap: LockContentForRead/LockContentForWrite is the same
+	// choke point executeStatement already uses for every ordinary
+	// statement, driver-mediated or not.
+	c.srv.db.LockContentForRead()
 	var base, shadow *storage.DB
 	if opts.ReadOnly {
 		shadow = c.srv.db.DeepClone()
 	} else {
+		// A read-only transaction produces no changes to merge, so it needs
+		// only a single stable read snapshot and no conflict-detection base.
+		// A read-write transaction needs a mutable shadow plus a
+		// lightweight version-only base (SnapshotForTx copies rows once,
+		// not twice).
 		base, shadow = c.srv.db.SnapshotForTx()
 	}
+	c.srv.db.UnlockContentForRead()
 	c.srv.mu.RUnlock()
 
 	c.inTx = true

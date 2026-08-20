@@ -19,7 +19,26 @@ import (
 // server coordinates access to the shared storage.DB and manages
 // concurrency primitives plus optional persistence hooks.
 type server struct {
-	mu          sync.RWMutex
+	// mu excludes readers (RLock) only while a writer is actually mutating
+	// db -- engine.Execute for an autocommit statement, or the
+	// conflict-detection-through-ApplyWALChanges span of a transaction
+	// commit (see tx.go's commitTxApply). It is deliberately NOT held for a
+	// write's subsequent durability I/O (persist(), a WAL checkpoint): that
+	// I/O only reads already-settled data through locks a concurrent
+	// SELECT's read path already takes too (see writeMu's doc comment), so
+	// holding mu across it would block every reader for the full duration
+	// of a disk write for no correctness reason.
+	mu sync.RWMutex
+	// writeMu serializes writers against each other for a whole statement
+	// or commit -- mutation AND durability I/O -- preserving the
+	// write-write exclusivity mu alone used to provide before its scope was
+	// narrowed to mutation only. It does NOT exclude readers: a writer
+	// holding writeMu during its persist phase (after releasing mu) can
+	// run concurrently with any number of readers holding mu.RLock(), which
+	// is the whole point. Every code path that mutates the live db through
+	// this server must hold writeMu for its entire mutation+persist span,
+	// the same way every one already holds mu for the mutation span alone.
+	writeMu     sync.Mutex
 	db          *storage.DB
 	filePath    string
 	autosave    bool
@@ -53,6 +72,15 @@ type server struct {
 	// debounce timer/flush (debounce on). It is cheap bookkeeping kept for
 	// tests and diagnostics; it has no effect on behavior.
 	persistSyncCount uint64
+
+	// persistDelayForTest, when non-nil, is called at the start of
+	// persistNow, before any real durability I/O. It exists solely so a
+	// concurrency test can make a write's persist phase last long enough to
+	// deterministically observe (without depending on real disk speed,
+	// which is noisy on this project's dev machine) that it no longer
+	// blocks concurrent reads the way holding mu across it used to. Always
+	// nil in production; never set outside a test.
+	persistDelayForTest func()
 }
 
 func newServer(db *storage.DB, c cfg) *server {
@@ -206,6 +234,9 @@ func (s *server) persistNow() error {
 	s.persistMu.Lock()
 	s.persistSyncCount++
 	s.persistMu.Unlock()
+	if s.persistDelayForTest != nil {
+		s.persistDelayForTest()
+	}
 	if s.usesStorageBackend {
 		// Disk-backed modes (ModeDisk, ModeJSON, ModeHybrid, ModeIndex)
 		// persist via their attached backend's Sync, not a whole-database
