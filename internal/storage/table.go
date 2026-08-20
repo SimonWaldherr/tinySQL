@@ -67,10 +67,36 @@ type Table struct {
 	//     transaction shadow, every evicted backend page, every dropped table —
 	//     stayed reachable, with all of its rows, for the process's lifetime.
 	//
-	// A clone starts with an empty slot: a clone is a different table, and
-	// this state describes the one it was built from.
+	// A clone starts with an empty slot unless the stored value implements
+	// DerivedCloner, in which case cloneTable copies it: cloneTable's row
+	// copy is byte-identical to the source at the moment of cloning, so
+	// derived state describing "these rows have these values" remains
+	// exactly as true of the clone as of the table it was built from, until
+	// the two independently diverge afterwards. Skipping that copy when
+	// possible was never a correctness requirement, only the simplest
+	// choice; see DerivedCloner for why it stopped being simplest once a
+	// per-transaction table clone (SnapshotForTx, called on every db.Begin())
+	// made "rebuild this from scratch" a per-transaction cost, not a
+	// per-table one.
 	derivedMu sync.Mutex
 	derived   any
+}
+
+// DerivedCloner is implemented by derived state (see the field above) that
+// knows how to produce an independent copy of itself. cloneTable checks for
+// it via a type assertion so storage never has to know the concrete type
+// stored there — today, only internal/engine's constraint-index cache
+// implements it. Derived state that does not implement DerivedCloner is
+// simply dropped on clone, exactly as before this interface existed.
+//
+// CloneDerived must return a value that shares no mutable state with the
+// receiver: the clone and the table it was cloned from immediately start
+// diverging independently (new rows appended, rows rolled back, etc.), so
+// anything shared between them (e.g. a map, or a []int slice that either
+// side might later append to) would let one side's later mutation corrupt
+// the other's cached state.
+type DerivedCloner interface {
+	CloneDerived() any
 }
 
 // DerivedLock locks this table's derived-state slot. Derived and SetDerived

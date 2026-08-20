@@ -158,6 +158,40 @@ func (db *DB) Put(tn string, t *Table) error {
 	return nil
 }
 
+// Replace overwrites tenant/name with t in one step, unlike a Drop followed
+// by a Put: those are two separate lock acquisitions, so a concurrent reader
+// calling Get in between them observes the table as briefly not existing at
+// all, even though conceptually it never stopped having data (see
+// refreshMaterializedView, the caller this exists for -- a materialized
+// view's cache table is rebuilt by dropping the old one and putting the
+// new one back under the same name). Replace instead reassigns the table
+// map's entry directly under a single db.mu.Lock, so there is no window
+// where tenant/name is absent. Unlike Put it never rejects an existing
+// table -- that check exists for CREATE TABLE's "already exists" error,
+// which does not apply to a caller that is deliberately replacing content.
+func (db *DB) Replace(tn string, t *Table) error {
+	if db.IsReadOnly() {
+		return ErrReadOnlyStorage
+	}
+	func() {
+		db.mu.Lock()
+		defer db.mu.Unlock()
+		td := db.getTenant(tn)
+		td.tables[strings.ToLower(t.Name)] = t
+	}()
+	if db.backend != nil {
+		// SaveTable overwrites an existing on-disk table (every backend's
+		// periodic full-sync path already calls it against tables it saved
+		// before), so this needs no preceding DeleteTable -- which would
+		// reopen the same absent-in-between window on the backend's file(s)
+		// that this method exists to close for the in-memory map.
+		if err := db.backend.SaveTable(tn, t); err != nil {
+			return fmt.Errorf("backend save %s/%s: %w", tn, t.Name, err)
+		}
+	}
+	return nil
+}
+
 // DiscardCachedTable drops tenant/name from the DB's in-memory table cache
 // without persisting it first, then reports whether it was present.
 //

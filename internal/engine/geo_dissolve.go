@@ -48,6 +48,17 @@ const geoDissolveDefaultSnapDegrees = 1e-7
 
 type geoDissolveEdge [2]geoPoint
 
+// geoDissolveEdgesByLess sorts geoDissolveEdge values by edgeLess. A
+// concrete sort.Interface instead of sort.Slice's comparator closure, for
+// the same reason as geoPointsByLonLat: geoDissolveEdge is two geoPoints,
+// each carrying a pointer field, so sort.Slice's reflect.Swapper falls back
+// to a per-swap typedmemmove instead of a plain value swap.
+type geoDissolveEdgesByLess []geoDissolveEdge
+
+func (s geoDissolveEdgesByLess) Len() int           { return len(s) }
+func (s geoDissolveEdgesByLess) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s geoDissolveEdgesByLess) Less(i, j int) bool { return edgeLess(s[i], s[j]) }
+
 // dissolvePolygons merges every polygon/multipolygon part in parts into the
 // minimal set of rings via shared-edge cancellation, snapping coordinates
 // to snapDegrees first (geoDissolveDefaultSnapDegrees if snapDegrees <= 0)
@@ -133,7 +144,7 @@ func reassembleDissolvedRings(net map[geoDissolveEdge]int) ([][]geoPoint, error)
 	// otherwise the same input, dissolved twice, could come back as
 	// geometrically identical but differently-rotated/reversed rings.
 	for v := range edgesFrom {
-		sort.Slice(edgesFrom[v], func(i, j int) bool { return edgeLess(edgesFrom[v][i], edgesFrom[v][j]) })
+		sort.Sort(geoDissolveEdgesByLess(edgesFrom[v]))
 	}
 
 	var rings [][]geoPoint

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -372,6 +373,64 @@ func setupMaterializedViewBenchmark(b *testing.B, ctx context.Context, db *stora
 		WITH DATA
 	`)); err != nil {
 		b.Fatal(err)
+	}
+}
+
+// TestMaterializedViewConcurrentAutoRefreshNoRace guards a concurrency
+// concern raised during a prior audit: multiple concurrent SELECTs can each
+// independently decide a materialized view is stale (they all run under
+// only the database's shared/read lock, same as any other SELECT), and
+// ensureMaterializedViewCache/refreshMaterializedView then mutate the
+// tenant's table map via db.Drop+db.Put -- a map write, not a read. If
+// nothing serialized that, many goroutines refreshing the same view at once
+// would be a concurrent map write (an unrecoverable Go runtime panic, not
+// merely a wrong answer).
+//
+// It is in fact already prevented, by two independent mechanisms tested
+// together here: CatalogManager.TryBeginMaterializedViewRefresh's IsRefreshing
+// flag (set/checked under the catalog's own write lock) lets only one
+// goroutine at a time enter refreshMaterializedView for a given view, and
+// DB.Put/DB.Drop each take DB.mu for their own map mutation regardless of
+// which table is involved -- so even refreshes of *different* views could
+// never race on the shared table map either way. This test exists to catch
+// a regression in either guard, not to establish them for the first time.
+func TestMaterializedViewConcurrentAutoRefreshNoRace(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	mvExecSQL(t, ctx, db, "CREATE TABLE events (kind TEXT, amount INT)")
+	mvExecSQL(t, ctx, db, "INSERT INTO events VALUES ('sale', 10)")
+	mvExecSQL(t, ctx, db, `
+		CREATE MATERIALIZED VIEW sale_totals AS
+		SELECT SUM(amount) AS total FROM events WHERE kind = 'sale'
+		REFRESH ON STALE AFTER 1ms
+		WITH DATA
+	`)
+
+	const goroutines = 32
+	const iterations = 40
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines*iterations)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				if _, err := Execute(ctx, db, "default", mustParse("SELECT total FROM sale_totals")); err != nil {
+					errs <- err
+				}
+				// A brief pause lets StaleAfterMs actually elapse between
+				// hits from the same goroutine, so most iterations really do
+				// race to refresh rather than all landing inside one
+				// goroutine's refresh window.
+				time.Sleep(50 * time.Microsecond)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("concurrent SELECT against an auto-refreshing materialized view: %v", err)
 	}
 }
 

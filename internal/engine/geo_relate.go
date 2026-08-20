@@ -555,12 +555,7 @@ func geoPointSetsEqual(aObj, bObj map[string]any) (any, error) {
 }
 
 func sortGeoPoints(pts []geoPoint) {
-	sort.Slice(pts, func(i, j int) bool {
-		if pts[i].Lon != pts[j].Lon {
-			return pts[i].Lon < pts[j].Lon
-		}
-		return pts[i].Lat < pts[j].Lat
-	})
+	sort.Sort(geoPointsByLonLat(pts))
 }
 
 func geoLineSetsEqual(aObj, bObj map[string]any) (any, error) {

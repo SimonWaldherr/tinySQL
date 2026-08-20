@@ -516,6 +516,32 @@ type constraintIndexEntry struct {
 	rows     map[any][]int
 }
 
+// CloneDerived implements storage.DerivedCloner, so a per-transaction table
+// clone (storage.cloneTable, invoked by every db.Begin()) can start with an
+// already-built constraint index instead of forcing the transaction's first
+// constrained INSERT/UPDATE to rebuild it from scratch by rescanning every
+// row -- which, across many short transactions against one growing table,
+// used to make total constraint-checking work O(transactions x table_size)
+// instead of O(table_size) amortized.
+//
+// Every map (set.cols itself, each entry's rows map, and each rows value's
+// []int slice) is copied rather than referenced, matching DerivedCloner's
+// contract that the clone and the original must share no mutable state:
+// getConstraintIndex/patchConstraintIndexRow/patchConstraintIndexSwapRemove
+// all mutate these in place, and the cloned table's rows diverge
+// independently from the source's the moment either one is next written.
+func (set *constraintIndexSet) CloneDerived() any {
+	cloned := &constraintIndexSet{cols: make(map[int]*constraintIndexEntry, len(set.cols))}
+	for colIdx, entry := range set.cols {
+		rows := make(map[any][]int, len(entry.rows))
+		for k, ids := range entry.rows {
+			rows[k] = append([]int(nil), ids...)
+		}
+		cloned.cols[colIdx] = &constraintIndexEntry{rowCount: entry.rowCount, rows: rows}
+	}
+	return cloned
+}
+
 // constraintIndexSetOf returns the table's cached set, creating it when
 // create is true. The caller must hold t.DerivedLock.
 func constraintIndexSetOf(t *storage.Table, create bool) *constraintIndexSet {

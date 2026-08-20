@@ -80,6 +80,13 @@ func cloneTable(t *Table) *Table {
 	nt.dirtyRows = append([]int(nil), t.dirtyRows...)
 	nt.dirtyRowsState = t.dirtyRowsState
 	nt.Rows = cloneRows(t.Rows)
+	// See DerivedCloner's doc comment: nt.Rows above is a byte-identical copy
+	// of t.Rows at this instant, so cloneable derived state (the constraint-
+	// index cache, today) describing those rows is equally valid for nt.
+	// Everything else is dropped, unchanged from before this existed.
+	if cloner, ok := t.derived.(DerivedCloner); ok {
+		nt.derived = cloner.CloneDerived()
+	}
 	return nt
 }
 

@@ -364,10 +364,13 @@ func refreshMaterializedView(env ExecEnv, name string) (err error) {
 		cache.Rows = append(cache.Rows, row)
 	}
 	rowCount = int64(len(cache.Rows))
-	if _, err := env.db.Get(env.tenant, mv.CacheTableName); err == nil {
-		if err := env.db.Drop(env.tenant, mv.CacheTableName); err != nil {
-			return err
-		}
-	}
-	return env.db.Put(env.tenant, cache)
+	// Replace, not Drop-then-Put: those are two separate lock acquisitions,
+	// so a concurrent SELECT calling ensureMaterializedViewCache's own
+	// env.db.Get could land in the gap between them and see the cache table
+	// as briefly not existing, which drops it out of the "cache already
+	// exists" fast path that would otherwise swallow a same-instant
+	// "already refreshing" error from a second concurrent refresher --
+	// surfacing that error to the SELECT instead of silently serving the
+	// (still valid) existing cache. Replace closes that window.
+	return env.db.Replace(env.tenant, cache)
 }

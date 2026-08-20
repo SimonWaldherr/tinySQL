@@ -78,17 +78,98 @@ For a file-backed storage mode, all storage values are forwarded to
 
 ## Storage modes
 
-| Mode | String | Notes |
-|---|---|---|
-| `ModeMemory` | `memory` | Default; in-memory, optional GOB snapshot via `Path` |
-| `ModeDisk` | `disk` | One GOB file per table |
-| `ModeJSON` | `json` | One readable JSON file per table |
-| `ModeWAL` | `wal` | Older WAL mode; manual logging |
-| `ModeAdvancedWAL` | `advanced_wal` | Row-level WAL logged automatically on writes; `compress_files` gzips the periodic checkpoint snapshot only, not the live log |
-| `ModeIndex` | `index` | Schemas in memory, rows on disk |
-| `ModeHybrid` | `hybrid` | LRU buffer pool with spill-to-disk behavior |
-| `ModePagedIndex` | `paged_index` | Immutable page-oriented artifact for large read-mostly workloads |
-| `ModeSQLite` | `sqlite` | Each table is a native table in a real `.sqlite` file, readable by any SQLite tool (requires the `sqliteimport` build tag) |
+A "mode" here means exactly one thing: `StorageMode` picks which backend
+manages where table data lives (RAM, disk, or a bounded mix) and how it's
+persisted. Everything else that sounds like a mode — `read_only`, `wal_sync`,
+checkpoint cadence, `compress_files`, encryption — is a separate, orthogonal
+setting layered on top of whichever backend you pick; see
+["Orthogonal settings"](#orthogonal-settings-not-modes) below. There are nine
+`StorageMode` values, which is more than most projects need to know about at
+once — the decision guide below exists so you don't have to read all nine
+doc comments to pick one.
+
+### Which mode should I use?
+
+Work through these questions in order; stop at the first one that applies.
+
+1. **Does the whole dataset comfortably fit in RAM, and would losing
+   unsaved changes on a crash be acceptable** (a short-lived process, a test,
+   an analytics job, a cache you can rebuild)? → **`ModeMemory`**. Fastest
+   mode, and the right default unless a later question says otherwise. Add
+   `Path` if you want an explicit snapshot on `Close`/`SaveToFile`, but that's
+   not crash durability — see the next question.
+2. **Same as above, but a crash must never lose a committed write?** →
+   **`ModeAdvancedWAL`** (row-level WAL, full ACID durability, point-in-time
+   recovery — the mode to reach for by default when durability matters).
+   `ModeWAL` (whole-table-diff, periodic checkpoint) still exists for
+   compatibility with older setups, but has no advantage over AdvancedWAL for
+   new work.
+3. **Is the dataset bigger than comfortably fits in RAM?**
+   - Read-mostly, built or rebuilt as a batch (tile serving, a published
+     search index, a nightly export)? → **`ModePagedIndex`**. An exact-match
+     index seek loads only the B+Tree pages it touches instead of decoding a
+     whole table file.
+   - Write-heavy or an unpredictable access pattern, and you want tinySQL to
+     manage a memory budget automatically? → **`ModeHybrid`** (LRU buffer
+     pool; hot tables stay resident, cold ones spill to disk under
+     `max_memory_bytes`).
+   - You mainly want to avoid holding every table's *rows* in RAM at once,
+     and can accept a table being decoded whole on each cold access? →
+     **`ModeIndex`** (schema stays resident, rows load on demand) or
+     **`ModeDisk`** (nothing stays resident; simplest of the disk-backed
+     modes).
+4. **Do the on-disk files need to be human-readable, diffable, or
+   hand-editable** (debugging, version control, a non-Go tool reading them)?
+   → **`ModeJSON`** instead of `ModeDisk` — same lazy-load behavior, JSON
+   instead of GOB, at the cost of larger files and some types (Decimal, UUID)
+   round-tripping as plain strings.
+5. **Does the file need to open in *other* SQLite tools** (the `sqlite3`
+   CLI, DB Browser for SQLite, a BI tool that speaks SQLite natively)? →
+   **`ModeSQLite`** (requires the `sqliteimport` build tag).
+
+Still unsure? Start with `ModeMemory` (or `ModeAdvancedWAL` if a crash must
+not lose data), and only move to `Hybrid`/`Index`/`PagedIndex` once you've
+actually measured that the dataset doesn't fit in memory — most applications
+never need to.
+
+### Reference table
+
+| Mode | String | RAM usage | Crash durability | Best for | Main tradeoff |
+|---|---|---|---|---|---|
+| `ModeMemory` | `memory` | Whole dataset | None, unless snapshotted | Default: analytics, tests, caches, short-lived processes | Fastest, but loses everything since the last snapshot on a crash |
+| `ModeAdvancedWAL` | `advanced_wal` | Whole dataset | Full, row-level, point-in-time recovery | Production writes that must survive a crash | Per-statement WAL write cost (tunable via `wal_sync`) |
+| `ModeWAL` | `wal` | Whole dataset | Whole-table-diff, periodic checkpoint | Legacy; kept for compatibility | Coarser durability granularity than AdvancedWAL |
+| `ModeDisk` | `disk` | ~0 (loaded on demand) | One durable GOB file per table | Minimizing idle RAM, simplicity | Whole table decoded on every cold access |
+| `ModeJSON` | `json` | ~0 (loaded on demand) | One durable JSON file per table | Same as Disk, plus files you need to read/diff/hand-edit | Larger files; some types serialize as plain strings |
+| `ModeIndex` | `index` | Schema only | One durable file per table | Many tables, only a few of them "hot" | Rows still fully decoded per access, like Disk |
+| `ModeHybrid` | `hybrid` | Bounded (`max_memory_bytes`) | One durable file per table | Mixed/unpredictable workloads bigger than you want fully resident | LRU eviction — a working set that thrashes the budget re-decodes often |
+| `ModePagedIndex` | `paged_index` | Bounded (page cache) | Durable, immutable artifact | Read-mostly data far larger than RAM (tile serving, published datasets) | Built/rebuilt rather than incrementally heavy-written; only equality seeks skip a full decode today |
+| `ModeSQLite` | `sqlite` | ~0 (delegates to SQLite) | Durable `.sqlite` file | Interop with other SQLite tooling | Requires the `sqliteimport` build tag; some tinySQL types serialize as JSON text |
+
+### Orthogonal settings (not modes)
+
+These apply *within* whichever mode you picked above; they are configuration
+knobs, not alternative backends:
+
+- **`read_only`** — reject all mutations; see
+  ["Read-only serving"](#read-only-serving) below. Works with every mode
+  except `wal`/`advanced_wal`, whose recovery code needs write access to the
+  WAL sidecar files.
+- **`wal_sync`: `full` (default) or `normal`** — how hard `ModeWAL`/
+  `ModeAdvancedWAL` push each commit to disk. `full` asks the OS for its
+  strongest available flush (`F_FULLFSYNC` on macOS); `normal` is an
+  ordinary `fsync` — faster, but its power-loss guarantee then depends on
+  the filesystem and hardware write cache, same distinction as SQLite's
+  `synchronous` pragma (though the exact levels don't map 1:1 — see the
+  driver's DSN option table above).
+- **`checkpoint_every` / `checkpoint_interval` / `checkpoint_max_bytes`** —
+  how often a WAL mode folds its log into a fresh snapshot. Tuning, not a
+  mode choice.
+- **`compress_files`** — gzip the on-disk files (`disk`/`hybrid`/`index`/
+  `json`) or, for `advanced_wal`, only the periodic checkpoint snapshot
+  (never the live log). Smaller files, more CPU per write.
+- **`EncryptionKey`** — encrypts data at rest, independent of which backend
+  manages it.
 
 JSON mode example:
 
