@@ -51,8 +51,15 @@ type subqueryResultCache struct {
 	entries map[Expr]*subqueryCacheEntry
 }
 
+// newSubqueryResultCache returns an empty cache with entries left nil: most
+// statements (plain INSERT/UPDATE/DELETE with no WHERE subquery, and even
+// most SELECTs) never call evalCachedSubquery at all, so allocating the map
+// unconditionally on every statement execution charged every one of them a
+// map allocation nothing would ever read. Reads on a nil map are already
+// safe zero-value lookups; evalCachedSubquery allocates the map lazily on
+// its first actual write.
 func newSubqueryResultCache() *subqueryResultCache {
-	return &subqueryResultCache{entries: make(map[Expr]*subqueryCacheEntry)}
+	return &subqueryResultCache{}
 }
 
 // evalCachedSubquery runs sel -- the SELECT owned by node, an *ExistsExpr or
@@ -81,6 +88,9 @@ func evalCachedSubquery(env ExecEnv, node Expr, sel *Select) (*ResultSet, error)
 	entry, ok := cache.entries[node]
 	if !ok {
 		entry = &subqueryCacheEntry{correlated: isSelectCorrelated(sel)}
+		if cache.entries == nil {
+			cache.entries = make(map[Expr]*subqueryCacheEntry, 1)
+		}
 		cache.entries[node] = entry
 	}
 	if entry.correlated {

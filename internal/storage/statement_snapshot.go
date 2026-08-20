@@ -107,7 +107,13 @@ type catalogRollback struct {
 	catalog *CatalogManager
 	mu      sync.Mutex
 	taken   bool
-	state   diskCatalog
+	// state is allocated only in capture(), not when the rollback point is
+	// armed: diskCatalog is a ~240+ byte struct (eight slice headers, a map,
+	// an int64 and a pointer), and arming happens on every mutating
+	// statement while capture() -- the deep copy -- runs for only the small
+	// minority that actually touch the catalog. A pointer keeps the common
+	// case (armed, never captured) allocation-free.
+	state *diskCatalog
 }
 
 // armCatalogRollback installs a fresh, uncaptured rollback point on c.
@@ -134,7 +140,8 @@ func (cr *catalogRollback) capture() {
 	if cr.taken {
 		return
 	}
-	cr.state = catalogToDisk(cr.catalog)
+	dc := catalogToDisk(cr.catalog)
+	cr.state = &dc
 	cr.taken = true
 }
 
@@ -428,7 +435,7 @@ func (db *DB) RestoreStatementSnapshot(snapshot *StatementSnapshot) {
 	// conn.commitTx) would otherwise see the counter reset to zero and
 	// conclude nothing happened.
 	if snapshot.catalog.captured() {
-		restored := diskToCatalog(snapshot.catalog.state)
+		restored := diskToCatalog(*snapshot.catalog.state)
 		restored.setRevision(db.Catalog().Revision() + 1)
 		db.setCatalog(restored)
 	}

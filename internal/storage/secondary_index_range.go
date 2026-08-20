@@ -97,7 +97,11 @@ func (t *Table) LookupSecondaryIndexRange(idx *SecondaryIndex, prefix []any, lo,
 	// bound sorts before it.
 	seek := append(append([]byte(nil), prefixKey...), loEnc...)
 
-	var out []int
+	// A small starting capacity cuts the append-driven reallocation chain
+	// (0->1->2->4->...) that would otherwise run on every range seek: most
+	// seeks match at least a handful of rows, and even a seek that matches
+	// hundreds still reallocates only a few times instead of eight-plus.
+	out := make([]int, 0, 16)
 	var rangeErr error
 	i := 0
 	idx.hydrate().Range(seek, func(key []byte, rowIDs []int) bool {

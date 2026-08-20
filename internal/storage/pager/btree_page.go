@@ -491,14 +491,29 @@ func (bp *BTreePage) GetAllLeafEntries() []LeafEntry {
 // entry[i-1].key <= key < entry[i].key → entry[i].child,
 // key >= entry[last].key → RightChild.
 func (bp *BTreePage) SearchInternal(key []byte) PageID {
+	// Binary search for the first entry whose key is strictly greater than
+	// key, matching the linear scan's semantics exactly (entries are sorted
+	// ascending, maintained by InsertInternalEntry's own binary-searched
+	// insertion position in searchInternal below) but in O(log entries)
+	// comparisons instead of O(entries) -- entries here is bounded by page
+	// fanout, so this only matters once a tree has enough internal nodes for
+	// that constant factor (up to ~200 comparisons per level on an 8KB page)
+	// to add up across a root-to-leaf descent.
 	sc := bp.slotCount()
-	for i := 0; i < sc; i++ {
-		rec := bp.getRecord(i)
-		childID := PageID(binary.LittleEndian.Uint32(rec[:4]))
+	lo, hi := 0, sc
+	for lo < hi {
+		mid := (lo + hi) / 2
+		rec := bp.getRecord(mid)
 		kl := int(binary.LittleEndian.Uint16(rec[4:6]))
 		if bytes.Compare(key, rec[6:6+kl]) < 0 {
-			return childID
+			hi = mid
+		} else {
+			lo = mid + 1
 		}
+	}
+	if lo < sc {
+		rec := bp.getRecord(lo)
+		return PageID(binary.LittleEndian.Uint32(rec[:4]))
 	}
 	return bp.RightChild()
 }

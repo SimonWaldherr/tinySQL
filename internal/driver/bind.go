@@ -19,8 +19,12 @@ func bindPlaceholders(sqlStr string, args []driver.NamedValue) (string, error) {
 	}
 	used := make([]bool, len(lits))
 
+	litLen := 0
+	for _, lit := range lits {
+		litLen += len(lit)
+	}
 	var sb strings.Builder
-	sb.Grow(len(sqlStr) + len(lits)*8)
+	sb.Grow(len(sqlStr) + litLen)
 	argi := 0
 	n := len(sqlStr)
 	for i := 0; i < n; i++ {

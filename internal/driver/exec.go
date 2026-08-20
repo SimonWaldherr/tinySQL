@@ -15,6 +15,24 @@ import (
 )
 
 func (c *conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	// database/sql routes db.Exec/tx.Exec straight here whenever the driver
+	// implements driver.ExecerContext (conn does) -- an explicit db.Prepare
+	// is never involved, so stmt.go's prepared/pooled AST reuse never
+	// engages for this extremely common calling pattern (an application
+	// re-issuing the same parameterized INSERT/UPDATE/DELETE text with new
+	// bound values on every call, e.g. a batch-insert loop). execPreparedFor
+	// gives that same shape the same benefit: skip bindPlaceholders' text
+	// render (which hex-encodes every []byte argument into a SQL literal)
+	// and the full lex/parse pass that would otherwise follow, per call.
+	if pq, _ := execPreparedFor(query); pq != nil && len(args) == len(pq.markers) {
+		if exec, err := pq.acquire(); err == nil {
+			defer pq.release(exec)
+			for i, arg := range args {
+				exec.params[i].Val = driverValueLiteral(arg.Value)
+			}
+			return c.execStatement(ctx, exec.statement)
+		}
+	}
 	sqlStr, err := bindPlaceholders(query, args)
 	if err != nil {
 		return nil, err
@@ -23,11 +41,118 @@ func (c *conn) ExecContext(ctx context.Context, query string, args []driver.Name
 }
 
 func (c *conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	// Mirrors ExecContext above for db.Query/tx.Query, but only takes the
+	// cached-AST path for a plain SELECT: querySQL's text path additionally
+	// knows how to run a DML statement with a RETURNING clause under the
+	// write/persistence path instead of a bare reader lock (see
+	// isWriteStatement/executeWriteStatement in query.go), and duplicating
+	// that branching here is not worth the risk for what would be an unusual
+	// way to call RETURNING. A cached INSERT/UPDATE/DELETE AST (built by an
+	// ExecContext call reusing the same text) is simply not reused here;
+	// queryPreparedAdHoc reports ok=false and this falls back to the
+	// existing text path.
+	if pq, _ := execPreparedFor(query); pq != nil && len(args) == len(pq.markers) {
+		if rows, ok, err := c.queryPreparedAdHoc(ctx, pq, args); ok {
+			return rows, err
+		}
+	}
 	sqlStr, err := bindPlaceholders(query, args)
 	if err != nil {
 		return nil, err
 	}
 	return c.querySQL(ctx, sqlStr)
+}
+
+// queryPreparedAdHoc runs a cached prepared-AST SELECT for QueryContext's
+// ad-hoc (no explicit db.Prepare) callers. ok is false -- with no error worth
+// reporting -- when pq's cached AST is not a plain SELECT, or acquiring an
+// execution failed; the caller falls back to the text-binding path.
+func (c *conn) queryPreparedAdHoc(ctx context.Context, pq *preparedQuery, args []driver.NamedValue) (driver.Rows, bool, error) {
+	exec, err := pq.acquire()
+	if err != nil {
+		return nil, false, nil
+	}
+	if _, ok := exec.statement.(*engine.Select); !ok {
+		pq.release(exec)
+		return nil, false, nil
+	}
+	defer pq.release(exec)
+	for i, arg := range args {
+		exec.params[i].Val = driverValueLiteral(arg.Value)
+	}
+	rows, err := c.queryStatement(ctx, exec.statement)
+	return rows, true, err
+}
+
+// execPreparedCache is a bounded, process-wide cache of preparedQuery
+// templates for ad-hoc DML/SELECT issued via ExecContext/QueryContext
+// (i.e. without an explicit db.Prepare call). Keyed by the raw, unbound SQL
+// text -- the point is to look this up *before* paying bindPlaceholders'
+// text-render cost, unlike parsedStmtCache below which is keyed by the
+// already-substituted text.
+//
+// A *preparedQuery's AST references tables/columns only by name (see
+// engine.Insert/Update/Delete/Select) and resolves them fresh against
+// whichever *storage.DB and tenant the caller's engine.Execute/queryStatement/
+// execStatement call supplies -- it carries no assumption about which
+// database it runs against, the same way parsedStmtCache's shared SELECT ASTs
+// already don't. Sharing one process-wide, so the same INSERT text reused
+// against a different connection (or a different tinySQL database entirely)
+// still gets a cache hit; acquire()/release()'s existing pool protocol is
+// what already makes concurrent reuse of one preparedQuery race-free for
+// db.Prepare-based callers, and that protocol does not care who called it.
+var (
+	execPreparedMu    sync.RWMutex
+	execPreparedCache = make(map[string]*preparedQuery)
+)
+
+const (
+	execPreparedCacheMaxEntries = 256
+	execPreparedCacheMaxSQLLen  = 8 << 10
+)
+
+// execPreparedFor returns a cached preparedQuery for sqlStr, building and
+// caching one on a cold miss. It returns a nil *preparedQuery -- never an
+// error worth surfacing -- when sqlStr is too long to cache, uses numbered
+// ($1/:1) rather than positional (?) placeholders, has no placeholders at
+// all, or is not a SELECT/INSERT/UPDATE/DELETE: callers fall back to the
+// text-binding path unchanged in every such case, which remains the sole
+// source of truth for a genuine syntax error (buildPreparedQuery's own
+// error, e.g. "prepared fast path supports ... only", is deliberately
+// swallowed here rather than surfaced, so a shape this cache does not serve
+// still gets the same error text it always did).
+func execPreparedFor(sqlStr string) (*preparedQuery, error) {
+	if len(sqlStr) > execPreparedCacheMaxSQLLen {
+		return nil, nil
+	}
+	execPreparedMu.RLock()
+	pq := execPreparedCache[sqlStr]
+	execPreparedMu.RUnlock()
+	if pq != nil {
+		return pq, nil
+	}
+	built, err := buildPreparedQuery(sqlStr)
+	if err != nil || built == nil {
+		return nil, nil
+	}
+	execPreparedMu.Lock()
+	if existing := execPreparedCache[sqlStr]; existing != nil {
+		built = existing
+	} else {
+		if len(execPreparedCache) >= execPreparedCacheMaxEntries {
+			// Random eviction via map iteration order, matching
+			// parsedStmtCache: a bad eviction just costs one rebuild.
+			for k := range execPreparedCache {
+				if len(execPreparedCache) < execPreparedCacheMaxEntries {
+					break
+				}
+				delete(execPreparedCache, k)
+			}
+		}
+		execPreparedCache[sqlStr] = built
+	}
+	execPreparedMu.Unlock()
+	return built, nil
 }
 
 // Non-context fallbacks
@@ -185,14 +310,46 @@ func parseCacheCandidate(sqlStr string) bool {
 
 //nolint:gocyclo // execSQL coordinates parsing, locking, WAL, and transaction paths.
 func (c *conn) execSQL(ctx context.Context, sqlStr string) (driver.Result, error) {
-	if res, handled, err := c.execTransactionControl(ctx, sqlStr); handled {
-		return res, err
+	// Transaction-control statements are always short and keyword-only, so
+	// bail out before normalizeTransactionSQL's ToUpper/Fields/Join pass
+	// unless the text could plausibly be one: that pass used to run over the
+	// full substituted SQL text of every statement, including a bulk INSERT
+	// with kilobytes of inlined literals.
+	if looksLikeTransactionControl(sqlStr) {
+		if res, handled, err := c.execTransactionControl(ctx, sqlStr); handled {
+			return res, err
+		}
 	}
 	st, err := parseSQLCached(sqlStr)
 	if err != nil {
 		return nil, err
 	}
 	return c.execStatement(ctx, st)
+}
+
+// looksLikeTransactionControl reports whether sqlStr's first keyword could
+// start a transaction-control statement, without allocating or scanning past
+// it. It is intentionally over-inclusive (BEGIN/START/COMMIT/ROLLBACK cover
+// every case execTransactionControl actually recognizes) -- the full,
+// authoritative check still happens there; this only skips that check's
+// whole-string ToUpper/Fields/Join cost for the common case of a statement
+// that plainly starts with SELECT/INSERT/UPDATE/DELETE/etc.
+func looksLikeTransactionControl(sqlStr string) bool {
+	s := strings.TrimLeft(sqlStr, " \t\r\n")
+	end := 0
+	for end < len(s) && end < 16 {
+		ch := s[end]
+		if (ch < 'A' || ch > 'Z') && (ch < 'a' || ch > 'z') {
+			break
+		}
+		end++
+	}
+	switch strings.ToUpper(s[:end]) {
+	case "BEGIN", "START", "COMMIT", "ROLLBACK":
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *conn) execTransactionControl(ctx context.Context, sqlStr string) (driver.Result, bool, error) {

@@ -8,6 +8,7 @@
 package engine
 
 import (
+	"cmp"
 	"fmt"
 	"strings"
 )
@@ -419,6 +420,23 @@ func buildRawComparisonFilter(colIndex map[string]int, ex *Binary) func([]any) (
 	return nil
 }
 
+// orderedCompareOp applies op to an already-typed ordered pair, shared by
+// buildBoundLiteralFilter's per-type fast paths below.
+func orderedCompareOp[T cmp.Ordered](a, b T, op string) (bool, error) {
+	switch op {
+	case "<":
+		return a < b, nil
+	case "<=":
+		return a <= b, nil
+	case ">":
+		return a > b, nil
+	case ">=":
+		return a >= b, nil
+	default:
+		return false, fmt.Errorf("unsupported comparison operator %q", op)
+	}
+}
+
 // buildBoundLiteralFilter reads the current parameter value on every call.
 // Prepared statements mutate Literal.Val under their statement mutex, while
 // the cached plan shape and closure stay immutable.
@@ -433,6 +451,54 @@ func buildBoundLiteralFilter(colIdx int, op string, literal *Literal) func([]any
 			return rawEqual(a, b), nil
 		case "!=", "<>":
 			return !rawEqual(a, b), nil
+		}
+		// literal.Val changes on every call -- it is the bound parameter --
+		// so it cannot be specialized once at compile time the way
+		// buildColLiteralFilter's fixed-literal closures are. This inline
+		// type switch is still far cheaper than compare()'s nested dispatch
+		// (compare -> compareInt/compareInt64/compareFloat -> numeric(b)):
+		// profiling a bound-parameter spatial range seek (a prepared query
+		// re-executed with new bounds per call, e.g. a viewport/bounding-box
+		// query) showed that nested dispatch as a dominant cost of the
+		// residual-filter recheck. Integer pairs stay in their integer width
+		// (matching compareInt/compareInt64's own "no float64 conversion for
+		// same-kind comparisons" precision guarantee) instead of widening
+		// through float64 the way numericFast would; float64 on either side
+		// widens the other, matching compareFloat. Anything else (decimal,
+		// time.Time, []byte, mixed non-numeric types) falls through to the
+		// general comparator, unchanged.
+		switch av := a.(type) {
+		case float64:
+			switch bv := b.(type) {
+			case float64:
+				return orderedCompareOp(av, bv, op)
+			case int:
+				return orderedCompareOp(av, float64(bv), op)
+			case int64:
+				return orderedCompareOp(av, float64(bv), op)
+			}
+		case int:
+			switch bv := b.(type) {
+			case int:
+				return orderedCompareOp(int64(av), int64(bv), op)
+			case int64:
+				return orderedCompareOp(int64(av), bv, op)
+			case float64:
+				return orderedCompareOp(float64(av), bv, op)
+			}
+		case int64:
+			switch bv := b.(type) {
+			case int64:
+				return orderedCompareOp(av, bv, op)
+			case int:
+				return orderedCompareOp(av, int64(bv), op)
+			case float64:
+				return orderedCompareOp(float64(av), bv, op)
+			}
+		case string:
+			if bv, ok := b.(string); ok {
+				return orderedCompareOp(av, bv, op)
+			}
 		}
 		comparison, err := compare(a, b)
 		if err != nil {

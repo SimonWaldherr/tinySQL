@@ -63,6 +63,9 @@ func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
 }
 
 func (s *stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	if s.prepared != nil {
+		return s.execPrepared(ctx, args)
+	}
 	sqlStr, err := bindPlaceholders(s.sql, args)
 	if err != nil {
 		return nil, err
@@ -94,6 +97,27 @@ func (s *stmt) queryPrepared(ctx context.Context, args []driver.NamedValue) (dri
 		exec.params[i].Val = driverValueLiteral(arg.Value)
 	}
 	return s.c.queryStatement(ctx, exec.statement)
+}
+
+// execPrepared runs a prepared INSERT/UPDATE/DELETE straight off its pooled
+// AST, mirroring queryPrepared's SELECT path. This is what lets a repeated
+// prepared DML statement skip both the bindPlaceholders text render (which,
+// for a []byte argument, otherwise hex-encodes it into a SQL literal only to
+// have the parser immediately decode that hex back into bytes) and the full
+// lex/parse pass that a text-based Exec always pays.
+func (s *stmt) execPrepared(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	if len(args) != len(s.prepared.markers) {
+		return nil, fmt.Errorf("tinysql: expected %d placeholder arguments, got %d", len(s.prepared.markers), len(args))
+	}
+	exec, err := s.prepared.acquire()
+	if err != nil {
+		return nil, err
+	}
+	defer s.prepared.release(exec)
+	for i, arg := range args {
+		exec.params[i].Val = driverValueLiteral(arg.Value)
+	}
+	return s.c.execStatement(ctx, exec.statement)
 }
 
 func driverValueLiteral(v any) any {
@@ -159,8 +183,18 @@ func (p *preparedQuery) newExecution() (*preparedExecution, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, ok := statement.(*engine.Select); !ok {
-		return nil, fmt.Errorf("tinysql: prepared fast path supports SELECT only")
+	// SELECT reuses its ResultSet-producing path unchanged (queryPrepared).
+	// INSERT/UPDATE/DELETE are read-only over their own AST during execution
+	// (executeInsert/executeUpdate/executeDelete only ever read s.Rows/
+	// s.Sets/s.Where to evaluate values and rebind via evalExpr; nothing
+	// mutates the statement node itself), so the same acquire/rebind-
+	// literals/release cycle that already makes concurrent SELECT reuse
+	// race-free is equally safe for them. Any other statement kind (DDL,
+	// transaction control, etc.) keeps the text-parse fallback.
+	switch statement.(type) {
+	case *engine.Select, *engine.Insert, *engine.Update, *engine.Delete:
+	default:
+		return nil, fmt.Errorf("tinysql: prepared fast path supports SELECT/INSERT/UPDATE/DELETE only")
 	}
 	markerPositions := make(map[string]int, len(p.markers))
 	for i, marker := range p.markers {
@@ -254,6 +288,17 @@ func collectPreparedLiterals(v reflect.Value, markers map[string]int, params []*
 	case reflect.Slice, reflect.Array:
 		for i := 0; i < v.Len(); i++ {
 			collectPreparedLiterals(v.Index(i), markers, params)
+		}
+	case reflect.Map:
+		// engine.Update.Sets is a map[string]Expr, so a placeholder in a SET
+		// clause ("SET col = ?") only surfaces through this case. Map values
+		// read via MapIndex are not addressable, but that is fine here: the
+		// literal we need is the *engine.Literal pointer itself (the value
+		// stored in the interface), not a field to write through the map --
+		// literal.Val is mutated by acquire()/release() through that pointer,
+		// which is the same object the map's Sets entry holds either way.
+		for _, k := range v.MapKeys() {
+			collectPreparedLiterals(v.MapIndex(k), markers, params)
 		}
 	}
 }

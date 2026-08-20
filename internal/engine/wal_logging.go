@@ -49,6 +49,14 @@ type statementWAL struct {
 	ambient bool
 }
 
+// noWALStatement is the shared, immutable return value of newStatementWAL
+// for the (common) case where no AdvancedWAL is attached. Every method on
+// *statementWAL checks s.wal == nil and returns before touching any other
+// field, so this zero-value instance is never mutated and is safe to hand
+// out to any number of concurrent statements instead of heap-allocating a
+// fresh, identical one per statement.
+var noWALStatement = &statementWAL{}
+
 // newStatementWAL binds a statement to the AdvancedWAL, if one is attached.
 //
 // When db has an ambient transaction — the SQL driver opened one for a
@@ -60,7 +68,7 @@ type statementWAL struct {
 func newStatementWAL(db *storage.DB) *statementWAL {
 	wal := db.StatementAdvancedWAL()
 	if wal == nil {
-		return &statementWAL{}
+		return noWALStatement
 	}
 	if txID, ok := db.AmbientWALTx(); ok {
 		return &statementWAL{wal: wal, txID: txID, started: true, ambient: true}
