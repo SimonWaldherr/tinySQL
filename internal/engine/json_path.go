@@ -44,6 +44,24 @@ func parseJSONPath(s string) []pathPart {
 	return out
 }
 
+// arrayIndex resolves a path part to a slice index for a []any container.
+// Bracket syntax ("items[0]") already sets p.idx >= 0 explicitly. A bare dot
+// segment ("items.0") always parses to {key: "0", idx: -1} -- parseJSONPath
+// has no way to know ahead of time whether "0" will land on a map or an
+// array -- so once the segment lands on a []any (which has no other way to
+// be addressed than by position), it is resolved here by parsing p.key as a
+// decimal index. ok is false when neither source yields a valid index.
+func arrayIndex(p pathPart) (int, bool) {
+	if p.idx >= 0 {
+		return p.idx, true
+	}
+	n, err := strconv.Atoi(p.key)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
 func jsonGet(v any, path string) any {
 	if v == nil || path == "" {
 		return nil
@@ -55,11 +73,11 @@ func jsonGet(v any, path string) any {
 		case map[string]any:
 			cur = c[p.key]
 		case []any:
-			if p.idx >= 0 && p.idx < len(c) {
-				cur = c[p.idx]
-			} else {
+			idx, ok := arrayIndex(p)
+			if !ok || idx >= len(c) {
 				return nil
 			}
+			cur = c[idx]
 		default:
 			return nil
 		}
@@ -99,26 +117,27 @@ func jsonSet(v any, path string, value any) any {
 			}
 			if c[p.key] == nil {
 				// Create next level structure
-				if parts[i+1].idx >= 0 {
-					c[p.key] = make([]any, parts[i+1].idx+1)
+				if nextIdx, ok := arrayIndex(parts[i+1]); ok {
+					c[p.key] = make([]any, nextIdx+1)
 				} else {
 					c[p.key] = make(map[string]any)
 				}
 			}
 			cur = c[p.key]
 		case []any:
-			if p.idx < 0 || p.idx >= len(c) {
+			idx, ok := arrayIndex(p)
+			if !ok || idx >= len(c) {
 				return v
 			}
-			if c[p.idx] == nil {
+			if c[idx] == nil {
 				// Create next level structure
-				if parts[i+1].idx >= 0 {
-					c[p.idx] = make([]any, parts[i+1].idx+1)
+				if nextIdx, ok := arrayIndex(parts[i+1]); ok {
+					c[idx] = make([]any, nextIdx+1)
 				} else {
-					c[p.idx] = make(map[string]any)
+					c[idx] = make(map[string]any)
 				}
 			}
-			cur = c[p.idx]
+			cur = c[idx]
 		default:
 			return v
 		}
@@ -133,14 +152,15 @@ func jsonSet(v any, path string, value any) any {
 		}
 		c[lastPart.key] = value
 	case []any:
-		if lastPart.idx < 0 {
-			return v // Invalid: trying to use string key on array
+		idx, ok := arrayIndex(lastPart)
+		if !ok {
+			return v // Invalid: trying to use a non-numeric key on array
 		}
 		// Extend array if needed
-		for len(c) <= lastPart.idx {
+		for len(c) <= idx {
 			c = append(c, nil)
 		}
-		c[lastPart.idx] = value
+		c[idx] = value
 		// Update the reference in the parent
 		if len(parts) > 1 {
 			parentParts := parts[:len(parts)-1]
@@ -150,7 +170,9 @@ func jsonSet(v any, path string, value any) any {
 				case map[string]any:
 					parent = pc[p.key]
 				case []any:
-					parent = pc[p.idx]
+					if pidx, ok := arrayIndex(p); ok && pidx < len(pc) {
+						parent = pc[pidx]
+					}
 				}
 			}
 			lastParentPart := parentParts[len(parentParts)-1]
@@ -158,7 +180,9 @@ func jsonSet(v any, path string, value any) any {
 			case map[string]any:
 				pc[lastParentPart.key] = c
 			case []any:
-				pc[lastParentPart.idx] = c
+				if pidx, ok := arrayIndex(lastParentPart); ok && pidx < len(pc) {
+					pc[pidx] = c
+				}
 			}
 		} else {
 			v = c

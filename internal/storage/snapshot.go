@@ -138,13 +138,57 @@ func cloneRowsIndividually(rows [][]any) [][]any {
 	return cloned
 }
 
-// cloneCell preserves snapshot isolation for mutable binary values. Other
-// scalar values are immutable/value types at the storage boundary.
+// cloneCell preserves snapshot isolation for mutable reference-typed values.
+// Plain scalars (int, string, float64, bool, time.Time, *big.Rat, ...) are
+// immutable/value types at the storage boundary and pass through unchanged.
+//
+// A JSON column's cell is not a string: coerceToJson (internal/engine/
+// coerce.go) parses it once at write time into map[string]any/[]any, and
+// json_path.go's JSON_SET mutates that structure in place rather than
+// copying it. Without cloneJSONValue below, a clone's row and the live row it
+// was cloned from shared the same map/slice object, so an UPDATE ... SET
+// col = JSON_SET(col, ...) against a transaction snapshot (SnapshotForTx/
+// DeepClone, used by both the SQL driver's BeginTx and the WASM browser/Node
+// APIs) mutated the live, pre-transaction database immediately -- a mutation
+// ROLLBACK could not undo, since there was never an independent copy to roll
+// back to. A VECTOR column's []float64 is defensively copied too, even
+// though no current function mutates one in place, since a shared slice
+// silently stops being an isolation bug only for as long as that stays true.
 func cloneCell(v any) any {
-	if b, ok := v.([]byte); ok {
-		return append([]byte(nil), b...)
+	switch x := v.(type) {
+	case []byte:
+		return append([]byte(nil), x...)
+	case []float64:
+		return append([]float64(nil), x...)
+	case map[string]any, []any:
+		return cloneJSONValue(x)
+	default:
+		return v
 	}
-	return v
+}
+
+// cloneJSONValue deep-copies a value tree of the shape json.Unmarshal
+// produces into `any` (nested map[string]any/[]any with scalar leaves), so
+// cloneCell can hand a JSON/array column's clone its own independent
+// structure. Leaves (strings, numbers, bools, nil) are immutable and pass
+// through unchanged.
+func cloneJSONValue(v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, val := range x {
+			out[k] = cloneJSONValue(val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(x))
+		for i, val := range x {
+			out[i] = cloneJSONValue(val)
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 // MetaSnapshot captures every table's identity and Version but none of its

@@ -103,10 +103,17 @@ func rowsToAny(rows [][]any) any {
 	return out
 }
 
-// Logger for WASM environment
-func logInfo(msg string) {
+// Logger for WASM environment. The debug-flag check runs before format is
+// ever evaluated, so a disabled logger (the default) costs one JS boundary
+// crossing instead of also paying for fmt's reflection-driven formatting on
+// every jsExec/jsQuery call -- the hot path for a SQL-in-the-browser API.
+func logInfo(format string, args ...any) {
 	if !js.Global().Get("tinySQLWasmDebug").Truthy() {
 		return
+	}
+	msg := format
+	if len(args) > 0 {
+		msg = fmt.Sprintf(format, args...)
 	}
 	if console := js.Global().Get("console"); console.Truthy() {
 		console.Call("log", fmt.Sprintf("[tinySQL-WASM] %s", msg))
@@ -210,9 +217,9 @@ func jsOpen(this js.Value, args []js.Value) any {
 	// Override with provided DSN if available
 	if len(args) > 0 && args[0].Type() == js.TypeString {
 		dsn = args[0].String()
-		logInfo(fmt.Sprintf("Using provided DSN: %s", dsn))
+		logInfo("Using provided DSN: %s", dsn)
 	} else {
-		logInfo(fmt.Sprintf("Using default DSN: %s", dsn))
+		logInfo("Using default DSN: %s", dsn)
 	}
 
 	if err := bindStorageDB(storage.NewDB(), dsn); err != nil {
@@ -236,18 +243,19 @@ func jsBegin(this js.Value, args []js.Value) any {
 		return apiResult(false, "transaction already active", "")
 	}
 
-	// A snapshot copy keeps the Node API transactional without linking the
-	// database/sql driver. Save/Load preserves rows, indexes and catalog state.
-	snapshot, err := storage.SaveToBytes(wasmStorageDB)
-	if err != nil {
-		logError("Failed to snapshot transaction", err)
-		return apiResult(false, err.Error(), "")
-	}
-	transactionDB, err = storage.LoadFromBytes(snapshot)
-	if err != nil {
-		logError("Failed to open transaction snapshot", err)
-		return apiResult(false, err.Error(), "")
-	}
+	// DeepClone keeps the Node API transactional without linking the
+	// database/sql driver -- the same in-memory MVCC-light clone the SQL
+	// driver's own BeginTx uses (internal/driver/conn.go), instead of the
+	// previous round trip through storage.SaveToBytes/LoadFromBytes. That
+	// GOB round trip paid for reflection-based serialization twice per BEGIN
+	// and, worse, silently dropped runtime state DeepClone preserves (WAL,
+	// audit log, MVCC coordinator, scheduler, storage backend, config,
+	// extensions): LoadFromBytes only ever reconstructs tables and the
+	// catalog. LockContentForRead/UnlockContentForRead mirrors BeginTx's own
+	// guard against a concurrent mutation of the live rows DeepClone reads.
+	wasmStorageDB.LockContentForRead()
+	transactionDB = wasmStorageDB.DeepClone()
+	wasmStorageDB.UnlockContentForRead()
 
 	logInfo("Transaction started successfully")
 	return apiResult(true, "", "Transaction started")
@@ -261,6 +269,7 @@ func jsCommit(this js.Value, args []js.Value) any {
 		return apiResult(false, "no active transaction", "")
 	}
 
+	transactionDB.PromoteShadow()
 	wasmStorageDB = transactionDB
 	transactionDB = nil
 	logInfo("Transaction committed successfully")
@@ -291,7 +300,7 @@ func jsExec(this js.Value, args []js.Value) any {
 	}
 
 	sqlStr := args[0].String()
-	logInfo(fmt.Sprintf("Executing SQL: %s", sqlStr))
+	logInfo("Executing SQL: %s", sqlStr)
 
 	start := time.Now()
 	result, err := executeWASMStatement(sqlStr)
@@ -309,7 +318,7 @@ func jsExec(this js.Value, args []js.Value) any {
 	// message-shape compatibility with callers that parse this string.
 	const lastInsertId = 0
 
-	logInfo(fmt.Sprintf("SQL executed successfully in %v, rows affected: %d", elapsed, rowsAffected))
+	logInfo("SQL executed successfully in %v, rows affected: %d", elapsed, rowsAffected)
 
 	return apiResult(true, "", fmt.Sprintf("Executed successfully. Rows affected: %d, Last insert ID: %d, Elapsed: %v",
 		rowsAffected, lastInsertId, elapsed))
@@ -326,7 +335,7 @@ func jsQuery(this js.Value, args []js.Value) any {
 	}
 
 	sqlStr := args[0].String()
-	logInfo(fmt.Sprintf("Executing query: %s", sqlStr))
+	logInfo("Executing query: %s", sqlStr)
 
 	start := time.Now()
 	resultSet, err := executeWASMStatement(sqlStr)
@@ -356,7 +365,7 @@ func jsQuery(this js.Value, args []js.Value) any {
 	count := len(rows)
 	elapsed := time.Since(start)
 
-	logInfo(fmt.Sprintf("Query executed successfully in %v, returned %d rows", elapsed, count))
+	logInfo("Query executed successfully in %v, returned %d rows", elapsed, count)
 
 	return queryResultMap(resultSet.Cols, rows, "", count, int64(elapsed))
 }
