@@ -38,7 +38,7 @@ func processJoins(env ExecEnv, joins []JoinClause, cur []Row) ([]Row, error) {
 			}
 			rightTable = &storage.Table{Name: j.Right.Alias, Cols: cols}
 		} else if cteResult, exists := env.ctes[strings.ToLower(j.Right.Table)]; exists {
-			rightRows = rowsFromCTEResult(cteResult, j.Right)
+			rightRows = rowsFromCTEResult(env, cteResult, j.Right)
 			rightTable = resultSetTable(aliasOr(j.Right), cteResult.Cols)
 		} else if j.Right.TableFunc != nil {
 			tf := j.Right.TableFunc

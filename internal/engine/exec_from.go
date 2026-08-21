@@ -90,7 +90,7 @@ func resolveTableSource(cteEnv ExecEnv, env ExecEnv, s *Select) ([]Row, error) {
 	if cteEnv.ctes != nil {
 		cteName := strings.ToLower(s.From.Table)
 		if cteResult, exists := cteEnv.ctes[cteName]; exists {
-			return rowsFromCTEResult(cteResult, s.From), nil
+			return rowsFromCTEResult(cteEnv, cteResult, s.From), nil
 		}
 	}
 
@@ -115,27 +115,56 @@ func resolveTableSource(cteEnv ExecEnv, env ExecEnv, s *Select) ([]Row, error) {
 // rowsFromCTEResult materializes a CTE ResultSet as a FROM/JOIN source. It
 // retains unqualified names plus both the CTE name and alias qualifiers, so a
 // CTE behaves identically whether it appears on the left of FROM or right of
-// a JOIN.
-func rowsFromCTEResult(cteResult *ResultSet, source FromItem) []Row {
+// a JOIN. Non-recursive CTEs memoize this conversion per source qualifier:
+// converting their result repeatedly is otherwise pure allocation and map
+// copy work when earlier sibling CTEs or nested queries reuse them.
+func rowsFromCTEResult(env ExecEnv, cteResult *ResultSet, source FromItem) []Row {
 	cteName := strings.ToLower(source.Table)
 	qualifier := cteName
 	if source.Alias != "" {
 		qualifier = strings.ToLower(source.Alias)
 	}
+	keysPerColumn := 2
+	if qualifier != cteName {
+		keysPerColumn++
+	}
+	var cacheKey cteRowCacheKey
+	if cteResult.cteCacheable && env.cteRowCache != nil {
+		cacheKey = cteRowCacheKey{result: cteResult, cteName: cteName, qualifier: qualifier}
+		if rows, ok := env.cteRowCache.load(cacheKey); ok {
+			return rows
+		}
+	}
+	columnKeys := make([]string, len(cteResult.Cols))
+	cteKeys := make([]string, len(cteResult.Cols))
+	qualifierKeys := make([]string, len(cteResult.Cols))
+	for i, col := range cteResult.Cols {
+		columnKeys[i] = strings.ToLower(col)
+		cteKeys[i] = cteName + "." + columnKeys[i]
+		if qualifier != cteName {
+			qualifierKeys[i] = qualifier + "." + columnKeys[i]
+		}
+	}
 	rows := make([]Row, len(cteResult.Rows))
 	for i, row := range cteResult.Rows {
-		out := make(Row)
-		for _, col := range cteResult.Cols {
-			v, ok := getVal(row, col)
+		// The row contains the unqualified value, the CTE-qualified value,
+		// and (when different) the source-alias-qualified value.
+		out := make(Row, len(cteResult.Cols)*keysPerColumn)
+		for colIdx, key := range columnKeys {
+			v, ok := getValLower(row, key)
 			if !ok {
 				continue
 			}
-			key := strings.ToLower(col)
 			out[key] = v
-			out[cteName+"."+key] = v
-			out[qualifier+"."+key] = v
+			out[cteKeys[colIdx]] = v
+			if qualifier != cteName {
+				out[qualifierKeys[colIdx]] = v
+			}
 		}
 		rows[i] = out
+	}
+	if cteResult.cteCacheable && env.cteRowCache != nil {
+		return env.cteRowCache.store(cacheKey, rows)
 	}
 	return rows
 }

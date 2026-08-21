@@ -29,6 +29,18 @@ func BenchmarkCTEReferencedTwice(b *testing.B) {
 		SELECT a.grp, a.n, b.a FROM grouped a JOIN grouped b ON a.grp = b.grp ORDER BY a.grp`)
 }
 
+// BenchmarkCTEReferencedBySiblingCTEs measures reuse of the source-row cache.
+// Both sibling CTEs read c with the same source qualifier, so c's ResultSet is
+// converted into Row maps once rather than copied once per sibling.
+func BenchmarkCTEReferencedBySiblingCTEs(b *testing.B) {
+	db := setupPerfTable(b, 20000)
+	runBench(b, db, `
+		WITH c AS (SELECT id, grp, val FROM t),
+		     a AS (SELECT id, grp FROM c WHERE id < 10000),
+		     d AS (SELECT id, val FROM c WHERE id < 10000)
+		SELECT a.id, a.grp, d.val FROM a JOIN d ON a.id = d.id`)
+}
+
 // BenchmarkRecursiveCTEChain measures a recursive CTE's per-iteration cost:
 // evalRecursiveCTE (exec_cte.go) tracks only the previous iteration's
 // frontier rather than rescanning the whole accumulated result set, so this
