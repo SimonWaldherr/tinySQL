@@ -109,6 +109,49 @@ type Row map[string]any
 type ResultSet struct {
 	Cols []string
 	Rows []Row
+	// cteCacheable marks ResultSets materialized by a non-recursive CTE.
+	// They are immutable for the lifetime of one statement, so the converted
+	// row maps used by FROM/JOIN can safely be shared by repeated references.
+	cteCacheable bool
+}
+
+// cteRowCache keeps the row-map representation of a materialized CTE scoped
+// to one statement execution. The cache must not outlive that execution: its
+// values deliberately contain the CTE's current rows, rather than a copy that
+// could be reused after the underlying tables have changed.
+type cteRowCache struct {
+	mu      sync.RWMutex
+	entries map[cteRowCacheKey][]Row
+}
+
+type cteRowCacheKey struct {
+	result    *ResultSet
+	cteName   string
+	qualifier string
+}
+
+func newCTERowCache() *cteRowCache {
+	return &cteRowCache{}
+}
+
+func (c *cteRowCache) load(key cteRowCacheKey) ([]Row, bool) {
+	c.mu.RLock()
+	rows, ok := c.entries[key]
+	c.mu.RUnlock()
+	return rows, ok
+}
+
+func (c *cteRowCache) store(key cteRowCacheKey, rows []Row) []Row {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if existing, ok := c.entries[key]; ok {
+		return existing
+	}
+	if c.entries == nil {
+		c.entries = make(map[cteRowCacheKey][]Row)
+	}
+	c.entries[key] = rows
+	return rows
 }
 
 type ExecEnv struct {
@@ -116,6 +159,7 @@ type ExecEnv struct {
 	tenant      string
 	db          *storage.DB
 	ctes        map[string]*ResultSet // For CTE support
+	cteRowCache *cteRowCache          // materialized CTE source rows, per statement
 	windowRows  []Row                 // All rows for window function context
 	windowIndex int                   // Current row index in window context
 	// windowPartitions memoizes, per structural PARTITION BY/ORDER BY shape

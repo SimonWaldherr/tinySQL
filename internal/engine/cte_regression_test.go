@@ -61,6 +61,35 @@ func TestCTEColumnAliasCountMustMatchResult(t *testing.T) {
 	}
 }
 
+func TestCTERowCacheReusesSameSourceAndKeepsAliasMapsSeparate(t *testing.T) {
+	cteResult := &ResultSet{
+		Cols:         []string{"id"},
+		Rows:         []Row{{"id": 7}},
+		cteCacheable: true,
+	}
+	env := ExecEnv{cteRowCache: newCTERowCache()}
+
+	first := rowsFromCTEResult(env, cteResult, FromItem{Table: "items", Alias: "i"})
+	second := rowsFromCTEResult(env, cteResult, FromItem{Table: "items", Alias: "i"})
+	if len(first) != 1 || len(second) != 1 || &first[0] != &second[0] {
+		t.Fatal("matching CTE sources should reuse their materialized row maps")
+	}
+	if first[0]["id"] != 7 || first[0]["items.id"] != 7 || first[0]["i.id"] != 7 {
+		t.Fatalf("cached CTE row = %#v", first[0])
+	}
+
+	otherAlias := rowsFromCTEResult(env, cteResult, FromItem{Table: "items", Alias: "j"})
+	if len(otherAlias) != 1 || &first[0] == &otherAlias[0] {
+		t.Fatal("different CTE aliases require separate qualified row maps")
+	}
+	if otherAlias[0]["j.id"] != 7 {
+		t.Fatalf("alias-qualified CTE row = %#v", otherAlias[0])
+	}
+	if got := len(env.cteRowCache.entries); got != 2 {
+		t.Fatalf("cached CTE sources = %d, want 2", got)
+	}
+}
+
 func TestRecursiveCTEBypassesPhysicalTableFastPath(t *testing.T) {
 	db := storage.NewDB()
 	rs := execSQL(t, db, `

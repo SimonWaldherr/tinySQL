@@ -19,6 +19,9 @@ func processCTEs(env ExecEnv, s *Select) (ExecEnv, error) {
 	// and copy outer bindings so nested WITH queries retain their scope.
 	cteEnv := env
 	cteEnv.ctes = make(map[string]*ResultSet, len(env.ctes)+len(s.CTEs))
+	if cteEnv.cteRowCache == nil {
+		cteEnv.cteRowCache = newCTERowCache()
+	}
 	for name, rs := range env.ctes {
 		cteEnv.ctes[strings.ToLower(name)] = rs
 	}
@@ -33,6 +36,10 @@ func processCTEs(env ExecEnv, s *Select) (ExecEnv, error) {
 			if err != nil {
 				return env, err
 			}
+			// A non-recursive CTE is evaluated once before its consumers run,
+			// making its ResultSet immutable for this statement. Its FROM/JOIN
+			// row maps can therefore be memoized safely.
+			rs.cteCacheable = true
 			cteEnv.ctes[strings.ToLower(cte.Name)] = rs
 			continue
 		}
