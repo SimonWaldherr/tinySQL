@@ -250,6 +250,44 @@ so `max_memory_bytes` bounds retained cache residency, not the temporary
 allocation for one oversized table. It is safe against the former catalog leak,
 but it is not yet a page/record-level MBTiles serving format.
 
+### Telling a cold cache from a budget that can never fit
+
+A low `CacheHitRate` has two very different causes, and picking the wrong one
+wastes a tuning cycle:
+
+- The working set is simply **colder or larger than the budget**. Raising
+  `max_memory_bytes` helps proportionally.
+- One table **exceeds the budget outright**. No eviction can make room for it,
+  so it is refused by the pool and decoded from disk on *every* access, forever.
+  Raising the budget helps only once it clears that one table's size.
+
+`BackendStats` separates them. `AdmissionRejects` counts refusals, and
+`LargestRejectedBytes` is the largest size refused — i.e. the budget floor that
+would make the worst offender cacheable:
+
+```go
+st := db.BackendStats()
+if st.AdmissionRejects > 0 {
+    log.Printf("raise max_memory_bytes past %d bytes: %d cache admissions refused",
+        st.LargestRejectedBytes, st.AdmissionRejects)
+}
+```
+
+Both are zero for backends without a table cache. `tinysqld` exposes them on
+`/status` as `admission_rejects` and `largest_rejected_bytes`, and the backend
+also logs the first refusal per table with the table's estimated size.
+
+Two caveats when reading the numbers. The size is `EstimateTableSize`, which
+extrapolates from the table's first row, so a table with widely varying row
+widths (long `TEXT` values in some rows only) can be mis-estimated in either
+direction — treat `LargestRejectedBytes` as a starting point, then confirm
+`AdmissionRejects` stops climbing. And admission is checked against the space
+left *after* eviction, which cannot touch `PinnedTables`: a table comfortably
+below the total budget can still be refused when pinned tables hold most of it.
+The `EvictionThreshold` (0.85) only decides when eviction kicks in; with
+eviction enabled, as `ModeHybrid`/`ModeIndex` always have it, the full
+`MaxMemoryBytes` remains usable.
+
 ### Serving MBTiles
 
 For a tileset that fits in memory, tinySQL serves tiles at the same speed as

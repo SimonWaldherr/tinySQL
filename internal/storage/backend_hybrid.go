@@ -31,6 +31,13 @@ type HybridBackend struct {
 	dirtyLock sync.Mutex
 
 	loadCount atomic.Int64
+
+	// rejectedLogged holds the tenant:name keys already reported by
+	// noteAdmissionReject. A table too big for the budget is refused on
+	// every access, so logging per call would emit one line per query for
+	// as long as the process runs; the operator needs the fact once, and
+	// BackendStats.AdmissionRejects carries the ongoing count.
+	rejectedLogged sync.Map
 }
 
 // NewHybridBackend creates a HybridBackend.
@@ -107,14 +114,28 @@ func (h *HybridBackend) LoadTable(tenant, name string) (*Table, error) {
 
 	h.loadCount.Add(1)
 
-	// Cache in buffer pool (may trigger eviction of cold tables)
+	// Cache in buffer pool (may trigger eviction of cold tables). A refusal
+	// is not an error for this caller — the table lease is still valid and
+	// is returned below — but it does mean this load will repeat on every
+	// future access, so it must not vanish silently.
 	if err := h.pool.Put(tn, lc, t); err != nil {
-		// If we can't cache (e.g. memory exceeded without eviction), still return
-		// the table. It just won't be cached.
-		_ = err
+		h.noteAdmissionReject(tn, lc, EstimateTableSize(t), err)
 	}
 
 	return t, nil
+}
+
+// noteAdmissionReject reports the first time a table could not be admitted
+// to the buffer pool. Everything after the first report for that table is
+// left to BackendStats.AdmissionRejects / LargestRejectedBytes, which count
+// every refusal without flooding the log.
+func (h *HybridBackend) noteAdmissionReject(tenant, name string, size int64, cause error) {
+	if _, loaded := h.rejectedLogged.LoadOrStore(tenant+":"+name, struct{}{}); loaded {
+		return
+	}
+	limit := h.pool.policy.MaxMemoryBytes
+	log.Printf("tinysql: table %s/%s (~%d bytes) does not fit the %s buffer pool budget of %d bytes and will be re-read from disk on every access; raise MaxMemoryBytes/max_memory_bytes above the table size to cache it (%v)",
+		tenant, name, size, h.mode, limit, cause)
 }
 
 // SaveTable writes to disk and updates the cache.
@@ -126,9 +147,11 @@ func (h *HybridBackend) SaveTable(tenant string, t *Table) error {
 	lc := strings.ToLower(t.Name)
 	tn := strings.ToLower(tenant)
 
-	// Update cache
+	// Update cache. Routed through the same once-per-table report as the
+	// read path: an oversized table is refused on every save too, and a
+	// write loop over it would otherwise log a line per statement.
 	if err := h.pool.Put(tn, lc, t); err != nil {
-		log.Printf("warning: cache update failed for %s/%s: %v", tn, lc, err)
+		h.noteAdmissionReject(tn, lc, EstimateTableSize(t), err)
 	}
 
 	// Clear dirty flag
@@ -253,16 +276,18 @@ func (h *HybridBackend) Stats() BackendStats {
 	}
 
 	return BackendStats{
-		Mode:             h.mode,
-		TablesInMemory:   ps.TablesInMemory,
-		TablesOnDisk:     ds.TablesOnDisk,
-		MemoryUsedBytes:  ps.MemoryUsed,
-		MemoryLimitBytes: ps.MemoryLimit,
-		DiskUsedBytes:    ds.DiskUsedBytes,
-		CacheHitRate:     hitRate,
-		SyncCount:        ds.SyncCount,
-		LoadCount:        h.loadCount.Load(),
-		EvictionCount:    ps.EvictionCount,
+		Mode:                 h.mode,
+		TablesInMemory:       ps.TablesInMemory,
+		TablesOnDisk:         ds.TablesOnDisk,
+		MemoryUsedBytes:      ps.MemoryUsed,
+		MemoryLimitBytes:     ps.MemoryLimit,
+		DiskUsedBytes:        ds.DiskUsedBytes,
+		CacheHitRate:         hitRate,
+		SyncCount:            ds.SyncCount,
+		LoadCount:            h.loadCount.Load(),
+		EvictionCount:        ps.EvictionCount,
+		AdmissionRejects:     ps.AdmissionRejects,
+		LargestRejectedBytes: ps.LargestRejectedBytes,
 	}
 }
 

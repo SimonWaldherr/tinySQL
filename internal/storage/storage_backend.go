@@ -158,6 +158,10 @@ func ParseWALSyncMode(s string) (WALSyncMode, error) {
 // It is case-insensitive and returns an error for unknown values.
 func ParseStorageMode(s string) (StorageMode, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
+	// "memory" is the one value that means something in both dialects: it is a
+	// real tinySQL storage mode AND a SQLite access mode. It keeps resolving to
+	// ModeMemory, which is also what a SQLite user writing mode=memory wants,
+	// so it must stay out of the access-mode branch below.
 	case "memory", "mem", "ram", "":
 		return ModeMemory, nil
 	case "wal":
@@ -176,6 +180,19 @@ func ParseStorageMode(s string) (StorageMode, error) {
 		return ModePagedIndex, nil
 	case "sqlite":
 		return ModeSQLite, nil
+	// SQLite's mode= URI parameter selects an ACCESS mode; tinySQL's mode=
+	// selects a storage BACKEND. Same key, entirely different universe, so a
+	// migrant's mode=ro used to be answered with the true but useless "unknown
+	// storage mode". Name the collision instead.
+	//
+	// These are deliberately errors and never translated. mode=rwc means
+	// "open read/write, create if missing" — that is not a backend choice at
+	// all, and guessing one would silently pick a durability policy (and a file
+	// layout) the caller never asked for. mode=ro is likewise a request the
+	// caller must restate as read_only=1 plus an explicit backend, because
+	// "read-only" says nothing about *what* is being read.
+	case "ro", "rw", "rwc":
+		return ModeMemory, fmt.Errorf("mode=%s is a SQLite access mode; in tinySQL mode= selects a storage backend (memory, wal, disk, index, hybrid, advanced_wal, json, paged_index, sqlite). Request read-only access with read_only=1 and name a persistent backend as well, e.g. mode=disk&read_only=1", strings.ToLower(strings.TrimSpace(s)))
 	default:
 		return ModeMemory, fmt.Errorf("unknown storage mode %q (valid: memory, wal, disk, index, hybrid, advanced_wal, json, paged_index, sqlite)", s)
 	}
@@ -358,6 +375,15 @@ type BackendStats struct {
 	SyncCount        int64
 	LoadCount        int64
 	EvictionCount    int64
+	// AdmissionRejects and LargestRejectedBytes are populated by the
+	// table-cache backends (ModeHybrid / ModeIndex). A nonzero
+	// AdmissionRejects means at least one table does not fit
+	// MemoryLimitBytes even after eviction and is therefore decoded from
+	// disk on every access; raising the budget past LargestRejectedBytes is
+	// what makes it cacheable. They stay zero for backends without a table
+	// cache.
+	AdmissionRejects     int64
+	LargestRejectedBytes int64
 	// PageReads and cache counters are populated by page-oriented backends.
 	// They are zero for legacy table-file backends which do not expose pages.
 	PageReads   int64

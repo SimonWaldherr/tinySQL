@@ -171,15 +171,56 @@ func (p *Parser) parseColumnType() (parsedColumnType, error) {
 	return parsedColumnType{typ: typ, declared: declared, affinity: affinity}, nil
 }
 
+// nonKeywordConstraintWords are constraint-introducing words that are
+// deliberately absent from the lexer's keyword allow-list, so they arrive as
+// tIdent tokens carrying their original spelling. They are matched by name
+// here instead of being promoted to keywords because a keyword is global:
+// "CHECK", "COLLATE" and "CONSTRAINT" are all plausible column names, and
+// making them keywords would change how they lex in every expression in every
+// statement to fix a problem that only exists inside a column definition.
+var nonKeywordConstraintWords = map[string]bool{
+	"CHECK":         true,
+	"COLLATE":       true,
+	"GENERATED":     true,
+	"AUTOINCREMENT": true,
+	"CONSTRAINT":    true,
+}
+
+// constraintWord returns the current token as an upper-case constraint word,
+// or "" when the token cannot introduce a constraint at all. Keywords keep
+// their already-uppercased value; the words above are recognised in their
+// tIdent form. Callers must still decide which words are meaningful in their
+// position — this only normalises the spelling.
+func (p *Parser) constraintWord() string {
+	switch p.cur.Typ {
+	case tKeyword:
+		return p.cur.Val
+	case tIdent:
+		if w := upper(p.cur.Val); nonKeywordConstraintWords[w] {
+			return w
+		}
+	}
+	return ""
+}
+
+// isColumnTypeTerminator reports whether the current token ends the declared
+// type of a column definition.
+//
+// CHECK, GENERATED, AS, COLLATE, AUTOINCREMENT and CONSTRAINT were missing
+// here, and their absence was not a cosmetic gap: parseColumnType's loop
+// swallowed them (plus any parenthesised argument) into the declared type
+// string, so "b INT CHECK (b > 0)" produced a column of declared type
+// "INT CHECK(b>0)" whose predicate nothing ever enforced -- an unenforced
+// CHECK accepts exactly the rows it exists to reject. Terminating the type
+// hands these clauses to parseColumnConstraints, which rejects the ones
+// tinySQL cannot honour by name instead of pretending to support them.
 func (p *Parser) isColumnTypeTerminator() bool {
 	if p.cur.Typ == tSymbol && (p.cur.Val == "," || p.cur.Val == ")") {
 		return true
 	}
-	if p.cur.Typ != tKeyword {
-		return false
-	}
-	switch p.cur.Val {
-	case "PRIMARY", "FOREIGN", "UNIQUE", "REFERENCES", "NOT", "NULL", "DEFAULT":
+	switch p.constraintWord() {
+	case "PRIMARY", "FOREIGN", "UNIQUE", "REFERENCES", "NOT", "NULL", "DEFAULT",
+		"CHECK", "GENERATED", "AS", "COLLATE", "AUTOINCREMENT", "CONSTRAINT":
 		return true
 	default:
 		return false

@@ -31,7 +31,7 @@ func getBuiltinFunctions() map[string]funcHandler {
 		"MAX":               evalAggregateSingle,
 		"NOW":               evalNowFunc,
 		"GETDATE":           evalNowFunc,
-		"CURRENT_TIME":      evalNowFunc,
+		"CURRENT_TIME":      evalCurrentTimeFunc,
 		"CURRENT_TIMESTAMP": evalNowFunc,
 		"CURRENT_DATE":      evalCurrentDateFunc,
 		"TODAY":             evalTodayFunc,
@@ -81,6 +81,9 @@ func getBuiltinFunctions() map[string]funcHandler {
 		"STRFTIME":          evalStrftimeFunc,
 		"DATE":              evalDateFunc,
 		"TIME":              evalTimeFunc,
+		"DATETIME":          evalDatetimeFunc,
+		"JULIANDAY":         evalJuliandayFunc,
+		"UNIXEPOCH":         evalUnixepochFunc,
 		"YEAR":              evalYearFunc,
 		"MONTH":             evalMonthFunc,
 		"DAY":               evalDayFunc,
@@ -217,7 +220,24 @@ func evalJSONExtendedFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	return evalJSONExtended(env, ex, row)
 }
 
+// requireNoArgs guards the clock functions, which take none.
+//
+// They used to ignore whatever they were given, so NOW('+1 day') returned the
+// current instant — the same silent-modifier-swallow that made
+// date('2024-01-01', '+1 day') answer with the unmodified date. Rejecting the
+// argument is the honest answer; DATE_ADD/DATE_SUB do the arithmetic.
+func requireNoArgs(ex *FuncCall) error {
+	if len(ex.Args) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s expects no arguments (date/time modifiers are not supported); "+
+		"use DATE_ADD/DATE_SUB for date arithmetic", strings.ToUpper(ex.Name))
+}
+
 func evalNowFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if err := requireNoArgs(ex); err != nil {
+		return nil, err
+	}
 	return time.Now(), nil
 }
 
@@ -259,12 +279,32 @@ func evalRowToTextFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 }
 
 func evalCurrentDateFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if err := requireNoArgs(ex); err != nil {
+		return nil, err
+	}
 	now := time.Now()
 	y, m, d := now.Date()
 	return time.Date(y, m, d, 0, 0, 0, 0, now.Location()), nil
 }
 
+// evalCurrentTimeFunc implements CURRENT_TIME as the time of day, "HH:MM:SS".
+//
+// It was aliased to evalNowFunc and so returned a full timestamp — a value
+// carrying the very date component the name says it drops, which made
+// CURRENT_TIME and CURRENT_TIMESTAMP indistinguishable. SQL's CURRENT_TIME and
+// SQLite's are both time-of-day only; this now matches TIME(), the function it
+// is the zero-argument shorthand for.
+func evalCurrentTimeFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if err := requireNoArgs(ex); err != nil {
+		return nil, err
+	}
+	return time.Now().Format("15:04:05"), nil
+}
+
 func evalTodayFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if err := requireNoArgs(ex); err != nil {
+		return nil, err
+	}
 	now := time.Now()
 	y, m, d := now.Date()
 	return time.Date(y, m, d, 0, 0, 0, 0, now.Location()), nil
@@ -451,6 +491,18 @@ func evalDateFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 
 func evalTimeFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	return evalTime(env, ex.Args, row)
+}
+
+func evalDatetimeFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalDatetime(env, ex.Args, row)
+}
+
+func evalJuliandayFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalJulianday(env, ex.Args, row)
+}
+
+func evalUnixepochFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalUnixepoch(env, ex.Args, row)
 }
 
 func evalYearFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {

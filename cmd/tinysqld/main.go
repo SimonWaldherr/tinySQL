@@ -18,7 +18,7 @@ import (
 func main() {
 	var (
 		dataPath     = flag.String("data", "", "Durable database path or directory")
-		storageMode  = flag.String("storage", "disk", "Storage mode: memory, disk, json, hybrid, index, wal, advanced_wal, paged_index (immutable page store; serves tiles per record without loading the table, pair with -read-only)")
+		storageMode  = flag.String("storage", "disk", "Storage mode: disk, json, hybrid, index, wal, advanced_wal, paged_index (immutable page store; serves tiles per record without loading the table, pair with -read-only). Not memory: this profile requires durable storage")
 		tenant       = flag.String("tenant", "default", "Default tenant")
 		httpAddr     = flag.String("http", "127.0.0.1:8088", "HTTP listen address; empty disables HTTP")
 		authToken    = flag.String("auth", "", "Optional bearer token for API endpoints")
@@ -31,6 +31,7 @@ func main() {
 		cacheTTL     = flag.Duration("vector-cache-ttl", 30*time.Second, "VEC_SEARCH result-cache TTL once entries are enabled")
 		tiles        = flag.Bool("tiles", false, "Serve tilesets over the public /tiles/{tileset}/{z}/{x}/{y} XYZ endpoint (unauthenticated)")
 		check        = flag.Bool("check", false, "Open the DBMS runtime, print status, then exit")
+		readOnly     = flag.Bool("read-only", false, "Open the database read-only: reject all mutations and DDL. Not supported by wal/advanced_wal, whose recovery needs write access")
 	)
 	flag.Parse()
 	tinysql.ConfigureVectorCache(tinysql.VectorCacheConfig{ResultCacheEntries: *cacheEntries, ResultCacheTTL: *cacheTTL, Analytics: *analytics})
@@ -41,8 +42,9 @@ func main() {
 	}
 
 	inst, err := tinysql.OpenEnterprise(tinysql.StorageConfig{
-		Mode: mode,
-		Path: *dataPath,
+		Mode:     mode,
+		Path:     *dataPath,
+		ReadOnly: *readOnly,
 	}, *tenant)
 	if err != nil {
 		log.Fatal(err)
@@ -53,7 +55,7 @@ func main() {
 		}
 	}()
 
-	fmt.Printf("tinySQL DBMS initialized: mode=%s storage=%s tenant=%s\n", inst.Mode, inst.DB.StorageMode(), inst.Tenant)
+	fmt.Printf("tinySQL DBMS initialized: mode=%s storage=%s tenant=%s read_only=%v\n", inst.Mode, inst.DB.StorageMode(), inst.Tenant, *readOnly)
 	fmt.Println("job scheduler: enabled")
 
 	if *check {

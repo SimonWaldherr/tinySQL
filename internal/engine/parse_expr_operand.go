@@ -7,12 +7,24 @@ import (
 	"strconv"
 )
 
+// parseAddSub parses the additive tier: + and -, plus the string
+// concatenation operator ||.
+//
+// SQLite actually binds || tighter than * and /, so strictly speaking it
+// belongs on its own tier between parseMulDiv and parseUnary. It lives here
+// instead because the two placements can only disagree when concatenation and
+// multiplicative arithmetic meet in one unparenthesised expression
+// ("a || b * 2"), where SQLite multiplies the concatenated *text* — a shape
+// that does not occur in real queries, and never in one whose author expected
+// a meaningful result. Keeping || on an existing tier avoids adding a level to
+// the precedence chain, which every nested expression pays for twice: once in
+// call depth and once against maxParseDepth.
 func (p *Parser) parseAddSub() (Expr, error) {
 	l, err := p.parseMulDiv()
 	if err != nil {
 		return nil, err
 	}
-	for p.cur.Typ == tSymbol && (p.cur.Val == "+" || p.cur.Val == "-") {
+	for p.cur.Typ == tSymbol && (p.cur.Val == "+" || p.cur.Val == "-" || p.cur.Val == "||") {
 		op := p.cur.Val
 		p.next()
 		r, err := p.parseMulDiv()

@@ -10,6 +10,20 @@ import (
 
 func executePragma(env ExecEnv, p *Pragma) (*ResultSet, error) {
 	name := strings.ToLower(strings.TrimSpace(p.Name))
+	// The parser has always accepted the assignment form and stored the
+	// right-hand side in p.Value, but this function only ever switched on the
+	// name -- so `PRAGMA foreign_keys = OFF` answered 1 with foreign keys still
+	// enforced, and `PRAGMA journal_mode = WAL` answered "memory". A SQLite
+	// migrant's durability preamble therefore reported success while changing
+	// nothing at all, which is strictly worse than refusing it: the caller
+	// walks away believing it got WAL durability or a relaxed FK check.
+	// Every knob a PRAGMA would touch here is settled once at Open time from
+	// the DSN, so there is no runtime state for an assignment to write. Reject
+	// it loudly and name the DSN option that does configure the same thing.
+	// The read form (p.Value == nil) is deliberately untouched.
+	if p.Value != nil {
+		return nil, pragmaReadOnlyError(name, p.Name)
+	}
 	switch name {
 	case "table_info", "table_xinfo":
 		if len(p.Args) != 1 {
@@ -36,6 +50,26 @@ func executePragma(env ExecEnv, p *Pragma) (*ResultSet, error) {
 		return pragmaCompileOptions(), nil
 	default:
 		return nil, fmt.Errorf("unsupported PRAGMA %q", p.Name)
+	}
+}
+
+// pragmaReadOnlyError explains why `PRAGMA <name> = <value>` cannot work and,
+// where an equivalent knob exists, points at the DSN option that owns it. The
+// mapping is worth spelling out per pragma rather than emitting one generic
+// message: the person hitting this is porting a SQLite preamble and needs to
+// know where the setting moved to, not merely that it is gone.
+func pragmaReadOnlyError(name, rawName string) error {
+	switch name {
+	case "journal_mode":
+		return fmt.Errorf(`PRAGMA %s is read-only in tinySQL; the journal strategy follows the storage mode chosen at open time via the DSN option "mode=" (for example "mode=wal" or "mode=advancedwal")`, rawName)
+	case "synchronous":
+		return fmt.Errorf(`PRAGMA %s is read-only in tinySQL; use the DSN option "wal_sync=" to choose how aggressively the write-ahead log is fsynced`, rawName)
+	case "foreign_keys":
+		return fmt.Errorf("PRAGMA %s is read-only in tinySQL and has no DSN equivalent: foreign key enforcement is unconditional and cannot be turned off", rawName)
+	case "cache_size":
+		return fmt.Errorf(`PRAGMA %s is read-only in tinySQL; use the DSN option "max_memory_bytes=" to bound how much table data stays resident`, rawName)
+	default:
+		return fmt.Errorf("PRAGMA %s is read-only in tinySQL", rawName)
 	}
 }
 
@@ -135,28 +169,92 @@ func sqliteBoolInt(v bool) int {
 	return 0
 }
 
+// sqliteJournalMode reports the SQLite journal_mode keyword that most honestly
+// describes a tinySQL storage mode. Honesty matters more than familiarity here:
+// journal_mode is the value tooling reads to decide whether a crash leaves a
+// recoverable database behind, so a value must never promise a guarantee the
+// mode does not actually provide.
 func sqliteJournalMode(mode storage.StorageMode) string {
 	switch mode {
 	case storage.ModeWAL, storage.ModeAdvancedWAL:
 		return "wal"
+	case storage.ModeSQLite:
+		// ModeSQLite writes into a real SQLite file, and that file is opened
+		// with PRAGMA journal_mode=WAL by the backend itself (see
+		// internal/storage/backend_sqlite.go). "wal" is the literal truth for
+		// it, not an approximation -- it used to fall through to the default
+		// arm and report a rollback journal it does not use.
+		return "wal"
 	case storage.ModeMemory:
 		return "memory"
 	default:
-		return "delete"
+		// ModeDisk/ModeJSON/ModeIndex/ModeHybrid/ModePagedIndex persist by
+		// snapshotting whole tables. None of them keeps a rollback journal and
+		// none offers crash-atomic commit across several tables, so the former
+		// "delete" was an affirmative lie: it tells a reader that a journal
+		// file exists and will be replayed or rolled back on restart, and that
+		// ROLLBACK is therefore well defined. "off" is SQLite's own documented
+		// value for "no rollback journal, and the behaviour of ROLLBACK is
+		// undefined", which is exactly what these modes guarantee.
+		return "off"
+	}
+}
+
+// sqliteMasterCols is the sqlite_master/sqlite_schema shape, in SQLite's own
+// ordinal order. Positional consumers -- ORMs and migration tools that scan
+// row[3] for rootpage and row[4] for sql -- depend on both the membership and
+// the order, so nothing may be inserted, appended, or reordered here. tinySQL's
+// own extra columns live on tinysql_schema instead (see schemaTableKind).
+//
+// Known gap that cannot be closed from this file: `SELECT *` builds its output
+// order by ranging over the Row map in the star expansion in exec_group.go, so
+// for any map-backed virtual source it emits Go's randomized map order rather
+// than the order below. Naming the columns explicitly
+// (SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master) is ordered
+// correctly. Making `SELECT *` ordinal-stable needs a column-order channel
+// from resolveFromClause into that star expansion.
+var sqliteMasterCols = []string{"type", "name", "tbl_name", "rootpage", "sql"}
+
+// schemaTableKind distinguishes the two catalogue views that sqliteSchemaRows
+// feeds. They share every row; they differ only in which columns are visible.
+type schemaTableKind int
+
+const (
+	// notSchemaTable means the name is an ordinary table reference.
+	notSchemaTable schemaTableKind = iota
+	// sqliteCompatSchema is sqlite_master / sqlite_schema: strictly SQLite's
+	// five columns, so anything written against real SQLite keeps working.
+	sqliteCompatSchema
+	// tinysqlSchema is tinysql_schema / tinysql_master: the same rows plus
+	// tinySQL's schema and full_name columns. This exists because sqlite_master
+	// used to leak those two extras, which broke positional reads; rather than
+	// dropping the information, it moved to a name that cannot be mistaken for
+	// SQLite's and is free to carry tinySQL-specific columns.
+	tinysqlSchema
+)
+
+func classifySchemaTable(name string) schemaTableKind {
+	switch strings.ToLower(strings.Trim(strings.TrimSpace(name), `"'`)) {
+	case "sqlite_schema", "sqlite_master":
+		return sqliteCompatSchema
+	case "tinysql_schema", "tinysql_master":
+		return tinysqlSchema
+	default:
+		return notSchemaTable
 	}
 }
 
 func isSQLiteSchemaTable(name string) bool {
-	switch strings.ToLower(strings.Trim(strings.TrimSpace(name), `"'`)) {
-	case "sqlite_schema", "sqlite_master":
-		return true
-	default:
-		return false
-	}
+	return classifySchemaTable(name) != notSchemaTable
 }
 
 func resolveSQLiteSchemaTable(env ExecEnv, s *Select) []Row {
 	rows := sqliteSchemaRows(env)
+	if classifySchemaTable(s.From.Table) == sqliteCompatSchema {
+		for i, r := range rows {
+			rows[i] = projectSQLiteMasterRow(r)
+		}
+	}
 	if s.From.Alias != "" {
 		for _, r := range rows {
 			for k, v := range r {
@@ -210,6 +308,18 @@ func sqliteSchemaRows(env ExecEnv) []Row {
 		return ni < nj
 	})
 	return rows
+}
+
+// projectSQLiteMasterRow narrows a catalogue row to SQLite's five columns.
+// sqliteSchemaRows keeps building the richer row because PRAGMA table_list and
+// sqliteColumnCount both need schema/full_name to resolve a schema-qualified
+// table; only the sqlite_master/sqlite_schema projection drops them.
+func projectSQLiteMasterRow(r Row) Row {
+	out := make(Row, len(sqliteMasterCols))
+	for _, col := range sqliteMasterCols {
+		putVal(out, col, r[col])
+	}
+	return out
 }
 
 func sqliteSchemaRow(typ, schema, name, tableName, sql string) Row {

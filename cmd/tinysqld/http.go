@@ -201,6 +201,11 @@ func (d *daemon) handleStatus(w http.ResponseWriter, r *http.Request) {
 			"sync_count":         stats.SyncCount,
 			"load_count":         stats.LoadCount,
 			"eviction_count":     stats.EvictionCount,
+			// Nonzero admission_rejects means some table exceeds
+			// memory_limit_bytes and is decoded from disk on every access;
+			// largest_rejected_bytes is the budget it would take to cache it.
+			"admission_rejects":      stats.AdmissionRejects,
+			"largest_rejected_bytes": stats.LargestRejectedBytes,
 		},
 	})
 }

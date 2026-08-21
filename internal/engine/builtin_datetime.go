@@ -173,9 +173,74 @@ func parseTimeValue(val any) (time.Time, error) {
 	}
 }
 
+// ───────────────── the SQLite date/time function family ──────────────────────
+//
+// DATE, TIME, DATETIME, JULIANDAY, UNIXEPOCH and STRFTIME all share one
+// calling convention in SQLite: an optional time value (defaulting to 'now'),
+// followed by any number of *modifiers* — '+1 day', 'start of month', 'utc',
+// 'weekday 0' and so on. This engine implements the time value and none of the
+// modifiers, and the three helpers below make that boundary explicit at every
+// entry point instead of per function.
+//
+// Timezone note: SQLite's 'now' and its rendering are UTC unless the
+// 'localtime' modifier is given. Here 'now' is the local wall clock, because
+// every other clock in this engine already is — NOW(), GETDATE(),
+// CURRENT_TIMESTAMP, CURRENT_DATE and TODAY all read time.Now() and keep its
+// location. Having datetime('now') disagree with CURRENT_TIMESTAMP inside the
+// same query would be a worse surprise than disagreeing with sqlite3 on a
+// machine that is not set to UTC, so the family follows the engine.
+
+// rejectDateModifiers errors when a SQLite date/time function is handed
+// modifier arguments beyond its time value.
+//
+// Erroring is the point. evalDate used to read args[0] and return, so
+// date('2024-01-01', '+1 day') answered "2024-01-01": a plausible-looking
+// wrong date, which is strictly worse than no answer, because nothing in the
+// result hints that a day was meant to be added. The modifier language is not
+// implemented here; DATE_ADD/DATE_SUB (which take an ISO 8601 duration or an
+// interval/unit pair) are this engine's date arithmetic.
+func rejectDateModifiers(fn string, args []Expr, accepted int) error {
+	if len(args) <= accepted {
+		return nil
+	}
+	return fmt.Errorf("%s: date/time modifiers are not supported (%d extra argument(s) given); "+
+		"use DATE_ADD/DATE_SUB for date arithmetic", fn, len(args)-accepted)
+}
+
+// parseSQLiteTimeValue parses one time value of the SQLite date/time family:
+// parseDateTime, plus SQLite's 'now' literal. 'now' is matched
+// case-insensitively and after trimming, the way SQLite treats it, and only in
+// this family — parseDateTime itself is shared with YEAR/MONTH/DATEDIFF/
+// OVERLAPS and others where a bare 'now' string is far more likely to be
+// malformed data than an intentional clock read.
+func parseSQLiteTimeValue(val any) (time.Time, error) {
+	if s, ok := val.(string); ok && strings.EqualFold(strings.TrimSpace(s), "now") {
+		return time.Now(), nil
+	}
+	return parseDateTime(val)
+}
+
+// sqliteTimeArg resolves the time value at args[valueIdx] — or 'now' when the
+// argument is absent — and rejects anything after it as an unsupported
+// modifier. valueIdx is 0 for DATE/TIME/DATETIME/JULIANDAY/UNIXEPOCH and 1 for
+// STRFTIME, whose first argument is the format string.
+func sqliteTimeArg(env ExecEnv, fn string, args []Expr, valueIdx int, row Row) (time.Time, error) {
+	if err := rejectDateModifiers(fn, args, valueIdx+1); err != nil {
+		return time.Time{}, err
+	}
+	if len(args) <= valueIdx {
+		return time.Now(), nil
+	}
+	val, err := evalExpr(env, args[valueIdx], row)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return parseSQLiteTimeValue(val)
+}
+
 func evalStrftime(env ExecEnv, args []Expr, row Row) (any, error) {
-	if len(args) < 1 || len(args) > 2 {
-		return nil, fmt.Errorf("STRFTIME expects 1-2 arguments: (format[, datetime])")
+	if len(args) < 1 {
+		return nil, fmt.Errorf("STRFTIME expects at least 1 argument: (format[, datetime])")
 	}
 	formatVal, err := evalExpr(env, args[0], row)
 	if err != nil {
@@ -183,55 +248,72 @@ func evalStrftime(env ExecEnv, args []Expr, row Row) (any, error) {
 	}
 	format := valueText(formatVal)
 
-	var t time.Time
-	if len(args) == 2 {
-		dtVal, err := evalExpr(env, args[1], row)
-		if err != nil {
-			return nil, err
-		}
-		t, err = parseDateTime(dtVal)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		t = time.Now()
+	t, err := sqliteTimeArg(env, "STRFTIME", args, 1, row)
+	if err != nil {
+		return nil, err
 	}
-
 	return strftimeFormat(t, format), nil
 }
 
 func evalDate(env ExecEnv, args []Expr, row Row) (any, error) {
-	var t time.Time
-	if len(args) == 0 {
-		t = time.Now()
-	} else {
-		val, err := evalExpr(env, args[0], row)
-		if err != nil {
-			return nil, err
-		}
-		t, err = parseDateTime(val)
-		if err != nil {
-			return nil, err
-		}
+	t, err := sqliteTimeArg(env, "DATE", args, 0, row)
+	if err != nil {
+		return nil, err
 	}
 	return t.Format("2006-01-02"), nil
 }
 
 func evalTime(env ExecEnv, args []Expr, row Row) (any, error) {
-	var t time.Time
-	if len(args) == 0 {
-		t = time.Now()
-	} else {
-		val, err := evalExpr(env, args[0], row)
-		if err != nil {
-			return nil, err
-		}
-		t, err = parseDateTime(val)
-		if err != nil {
-			return nil, err
-		}
+	t, err := sqliteTimeArg(env, "TIME", args, 0, row)
+	if err != nil {
+		return nil, err
 	}
 	return t.Format("15:04:05"), nil
+}
+
+// evalDatetime implements SQLite's datetime(): "YYYY-MM-DD HH:MM:SS" text, not
+// a time.Time. The distinction matters — NOW() and DATE_ADD() in this engine
+// return time.Time values, which render with Go's full nanosecond-and-zone
+// form; a caller writing datetime(...) is asking for SQLite's fixed-width
+// rendering and gets exactly that.
+func evalDatetime(env ExecEnv, args []Expr, row Row) (any, error) {
+	t, err := sqliteTimeArg(env, "DATETIME", args, 0, row)
+	if err != nil {
+		return nil, err
+	}
+	return t.Format("2006-01-02 15:04:05"), nil
+}
+
+// unixEpochJulianDay is the Julian Day Number of 1970-01-01T00:00:00Z. Julian
+// days start at noon UT, hence the .5.
+const unixEpochJulianDay = 2440587.5
+
+// evalJulianday implements SQLite's julianday(): the number of days since noon
+// UT on 24 November 4714 BC, as a float.
+//
+// Seconds and nanoseconds are scaled separately rather than going through
+// UnixNano, which overflows int64 outside roughly 1678–2262 — a range
+// julianday() itself has no trouble with, and quietly wrapping would turn a
+// far-future date into a far-past one.
+func evalJulianday(env ExecEnv, args []Expr, row Row) (any, error) {
+	t, err := sqliteTimeArg(env, "JULIANDAY", args, 0, row)
+	if err != nil {
+		return nil, err
+	}
+	const secondsPerDay = 86400.0
+	return float64(t.Unix())/secondsPerDay +
+		float64(t.Nanosecond())/(secondsPerDay*1e9) + unixEpochJulianDay, nil
+}
+
+// evalUnixepoch implements SQLite's unixepoch(): whole seconds since the Unix
+// epoch, as an integer. Returned as int64 so it lands in an INT column and
+// compares as a number rather than as text.
+func evalUnixepoch(env ExecEnv, args []Expr, row Row) (any, error) {
+	t, err := sqliteTimeArg(env, "UNIXEPOCH", args, 0, row)
+	if err != nil {
+		return nil, err
+	}
+	return t.Unix(), nil
 }
 
 func evalYear(env ExecEnv, args []Expr, row Row) (any, error) {

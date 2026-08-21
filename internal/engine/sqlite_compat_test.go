@@ -88,7 +88,13 @@ func TestSQLitePragmaOperationalCompatibility(t *testing.T) {
 	}{
 		{"PRAGMA database_list", "name", "main"},
 		{"PRAGMA foreign_keys", "foreign_keys", 1},
-		{"PRAGMA foreign_keys = ON", "foreign_keys", 1},
+		// `PRAGMA foreign_keys = ON` used to be asserted here as returning 1.
+		// That pinned the bug: the assignment form was parsed, its value
+		// discarded, and the current value echoed back -- so `= OFF` also
+		// "succeeded" while foreign keys stayed enforced. The assignment form
+		// is now a hard error and is covered by
+		// TestSQLitePragmaAssignmentIsRejected; only the read form belongs in
+		// this table.
 		{"PRAGMA journal_mode", "journal_mode", "memory"},
 		{"PRAGMA integrity_check", "integrity_check", "ok"},
 		{"PRAGMA quick_check", "quick_check", "ok"},

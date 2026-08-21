@@ -113,6 +113,18 @@ type BufferPool struct {
 	cacheMisses   atomic.Int64
 	evictionCount atomic.Int64
 
+	// admissionRejects counts Put calls refused because the table does not
+	// fit the budget even after eviction, and largestRejectedBytes is the
+	// biggest size ever refused. Together they separate the two reasons a
+	// hit rate can be low: a merely cold working set (rejects stay 0, a
+	// larger budget helps) versus a table that no eviction can make room
+	// for (rejects climb on every access, and only a budget above
+	// largestRejectedBytes will ever cache it). Without them both look
+	// identical from the outside — see HybridBackend.LoadTable, whose
+	// caller learns nothing from a refused Put.
+	admissionRejects     atomic.Int64
+	largestRejectedBytes atomic.Int64
+
 	// pinnedSet/ignoreSet are policy.PinnedTables/IgnoreTables (an admin-set
 	// config list, fixed for this pool's lifetime) indexed into a map once at
 	// construction, so isPinned/isIgnored — checked on every single Put — are
@@ -185,6 +197,14 @@ type CacheStats struct {
 
 	EvictionCount int64
 	EvictionSize  int64
+
+	// AdmissionRejects counts table caching attempts refused because the
+	// table exceeds the budget even after eviction; LargestRejectedBytes is
+	// the largest size refused. A nonzero AdmissionRejects means some table
+	// is being re-read from disk on every single access, which a larger
+	// budget fixes only once it clears LargestRejectedBytes.
+	AdmissionRejects     int64
+	LargestRejectedBytes int64
 
 	TablesInMemory int
 	TablesOnDisk   int
@@ -270,9 +290,11 @@ func (bp *BufferPool) Put(tenant, name string, table *Table) error {
 				// cannot be admitted; callers still receive their query-scoped
 				// table lease but it is deliberately not cached.
 				if bp.currentMemory.Load()+tableSize > bp.policy.MaxMemoryBytes {
+					bp.recordAdmissionReject(tableSize)
 					return fmt.Errorf("memory limit exceeded: table requires %d bytes with %d/%d resident", tableSize, bp.currentMemory.Load(), bp.policy.MaxMemoryBytes)
 				}
 			} else {
+				bp.recordAdmissionReject(tableSize)
 				return fmt.Errorf("memory limit exceeded: %d/%d bytes",
 					currentMem, bp.policy.MaxMemoryBytes)
 			}
@@ -509,6 +531,22 @@ func (bp *BufferPool) recordMiss() {
 	bp.cacheMisses.Add(1)
 }
 
+// recordAdmissionReject notes one Put refused for want of budget space and
+// keeps the running maximum of refused sizes. Both counters are advisory
+// telemetry, so the max is raced up with a plain compare-and-swap loop
+// rather than serialized behind bp.mu: losing a concurrent update can only
+// mean the reported maximum lags one rejection behind, never that it
+// reports a size that was not actually refused.
+func (bp *BufferPool) recordAdmissionReject(size int64) {
+	bp.admissionRejects.Add(1)
+	for {
+		prev := bp.largestRejectedBytes.Load()
+		if size <= prev || bp.largestRejectedBytes.CompareAndSwap(prev, size) {
+			return
+		}
+	}
+}
+
 // updateStats updates computed statistics.
 func (bp *BufferPool) updateStats() {
 	memUsed := bp.currentMemory.Load()
@@ -548,8 +586,12 @@ func (bp *BufferPool) GetStats() CacheStats {
 		HitRate:           hitRate,
 		EvictionCount:     bp.evictionCount.Load(),
 		EvictionSize:      bp.stats.EvictionSize,
-		TablesInMemory:    bp.stats.TablesInMemory,
-		TablesOnDisk:      bp.stats.TablesOnDisk,
+
+		AdmissionRejects:     bp.admissionRejects.Load(),
+		LargestRejectedBytes: bp.largestRejectedBytes.Load(),
+
+		TablesInMemory: bp.stats.TablesInMemory,
+		TablesOnDisk:   bp.stats.TablesOnDisk,
 	}
 }
 

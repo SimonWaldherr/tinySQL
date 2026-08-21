@@ -536,10 +536,33 @@ func evalBinary(env ExecEnv, ex *Binary, row Row) (any, error) {
 	switch ex.Op {
 	case "+", "-", "*", "/":
 		return evalArithmeticBinary(ex.Op, lv, rv)
+	case "||":
+		return evalConcatOperator(lv, rv), nil
 	case "=", "!=", "<>", "<", "<=", ">", ">=":
 		return evalComparisonBinary(ex.Op, lv, rv)
 	}
 	return nil, fmt.Errorf("unknown binary operator: %s", ex.Op)
+}
+
+// evalConcatOperator implements ||.
+//
+// It deliberately does NOT reuse the CONCAT builtin (evalConcat), because the
+// two disagree about NULL and both are right: SQLite's || yields NULL when
+// either operand is NULL, while SQLite's CONCAT() function (3.44+, which
+// evalConcat matches) skips NULL arguments. Routing || through CONCAT would
+// turn `first_name || middle_name || last_name` from "NULL until every part is
+// present" into a silently gap-filled string — the kind of wrong answer that
+// only shows up in production data.
+//
+// Non-text operands are coerced to text with stringifySQLValue rather than
+// valueText because it renders []byte as its bytes (SQLite likewise casts a
+// BLOB to text for ||), where valueText would produce the Go decimal byte
+// list "[65 66]". Both operands are non-nil here, so its nil case is unused.
+func evalConcatOperator(lv, rv any) any {
+	if lv == nil || rv == nil {
+		return nil
+	}
+	return stringifySQLValue(lv) + stringifySQLValue(rv)
 }
 
 func evalLogicalBinary(env ExecEnv, ex *Binary, row Row) (any, error) {

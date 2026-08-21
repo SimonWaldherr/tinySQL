@@ -329,11 +329,16 @@ func (c *conn) execSQL(ctx context.Context, sqlStr string) (driver.Result, error
 
 // looksLikeTransactionControl reports whether sqlStr's first keyword could
 // start a transaction-control statement, without allocating or scanning past
-// it. It is intentionally over-inclusive (BEGIN/START/COMMIT/ROLLBACK cover
+// it. It is intentionally over-inclusive (BEGIN/START/COMMIT/END/ROLLBACK cover
 // every case execTransactionControl actually recognizes) -- the full,
 // authoritative check still happens there; this only skips that check's
 // whole-string ToUpper/Fields/Join cost for the common case of a statement
 // that plainly starts with SELECT/INSERT/UPDATE/DELETE/etc.
+//
+// END is routed even though it is a keyword inside CASE ... END and trigger
+// bodies, because no statement in this dialect *starts* with END: the only
+// first-word END is SQLite's COMMIT synonym. Routing it here costs a
+// non-matching statement nothing but one classify pass.
 func looksLikeTransactionControl(sqlStr string) bool {
 	s := strings.TrimLeft(sqlStr, " \t\r\n")
 	end := 0
@@ -345,37 +350,90 @@ func looksLikeTransactionControl(sqlStr string) bool {
 		end++
 	}
 	switch strings.ToUpper(s[:end]) {
-	case "BEGIN", "START", "COMMIT", "ROLLBACK":
+	case "BEGIN", "START", "COMMIT", "END", "ROLLBACK":
 		return true
 	default:
 		return false
 	}
 }
 
+// txAction is the transaction verb a control statement resolves to, or txNone
+// when the statement is not transaction control at all and must be handed to
+// the engine.
+type txAction int
+
+const (
+	txNone txAction = iota
+	txBegin
+	txCommit
+	txRollback
+)
+
+// classifyTransactionSQL maps an already-normalized (upper-cased,
+// whitespace-collapsed, semicolon-stripped) statement onto a transaction verb.
+//
+// It exists so the SQLite spellings a migrant actually types resolve instead of
+// falling through to the engine, where they surfaced as a baffling
+// `no such table "..."`. Two groups are deliberately folded together:
+//
+//   - END / END TRANSACTION are SQLite's synonyms for COMMIT.
+//   - BEGIN DEFERRED / IMMEDIATE / EXCLUSIVE all mean plain BEGIN here. That is
+//     not a white lie: tinySQL serializes writers behind a writer semaphore
+//     acquired for the whole transaction, so every tinySQL transaction already
+//     behaves like SQLite's IMMEDIATE (a write lock taken up front) rather than
+//     like SQLite's deferred default (lock taken at first write, hence
+//     SQLITE_BUSY mid-transaction). Honoring the strongest of the three and
+//     accepting the weaker spellings as that is strictly closer to what the
+//     engine does than rejecting them.
+//
+// Nothing here matches SAVEPOINT, RELEASE, or ROLLBACK TO <name>. Those are
+// left to fail on purpose: there is no nested-transaction support in this
+// engine, so aliasing `ROLLBACK TO sp` onto a full ROLLBACK would silently
+// discard work the caller expected to keep, and aliasing SAVEPOINT onto a no-op
+// would make the following ROLLBACK TO look like it worked. A confusing error
+// beats silent data loss -- do not "helpfully" add them without real savepoints.
+func classifyTransactionSQL(norm string) (txAction, bool) {
+	switch norm {
+	case "COMMIT", "COMMIT TRANSACTION", "END", "END TRANSACTION":
+		return txCommit, false
+	case "ROLLBACK", "ROLLBACK TRANSACTION":
+		return txRollback, false
+	}
+	// READ ONLY is a suffix on any BEGIN/START form, so strip it once here
+	// instead of doubling the case list below.
+	readOnly := false
+	if rest, cut := strings.CutSuffix(norm, " READ ONLY"); cut {
+		readOnly = true
+		norm = rest
+	}
+	switch norm {
+	case "BEGIN", "BEGIN TRANSACTION",
+		"BEGIN DEFERRED", "BEGIN DEFERRED TRANSACTION",
+		"BEGIN IMMEDIATE", "BEGIN IMMEDIATE TRANSACTION",
+		"BEGIN EXCLUSIVE", "BEGIN EXCLUSIVE TRANSACTION",
+		"START TRANSACTION":
+		return txBegin, readOnly
+	}
+	return txNone, false
+}
+
 func (c *conn) execTransactionControl(ctx context.Context, sqlStr string) (driver.Result, bool, error) {
-	switch normalizeTransactionSQL(sqlStr) {
-	case "BEGIN", "BEGIN TRANSACTION", "START TRANSACTION":
+	action, readOnly := classifyTransactionSQL(normalizeTransactionSQL(sqlStr))
+	switch action {
+	case txBegin:
 		if c.inTx {
 			return nil, true, fmt.Errorf("tinysql: transaction already active")
 		}
-		if _, err := c.BeginTx(ctx, driver.TxOptions{}); err != nil {
+		if _, err := c.BeginTx(ctx, driver.TxOptions{ReadOnly: readOnly}); err != nil {
 			return nil, true, err
 		}
 		return driver.RowsAffected(0), true, nil
-	case "BEGIN READ ONLY", "BEGIN TRANSACTION READ ONLY", "START TRANSACTION READ ONLY":
-		if c.inTx {
-			return nil, true, fmt.Errorf("tinysql: transaction already active")
-		}
-		if _, err := c.BeginTx(ctx, driver.TxOptions{ReadOnly: true}); err != nil {
-			return nil, true, err
-		}
-		return driver.RowsAffected(0), true, nil
-	case "COMMIT", "COMMIT TRANSACTION":
+	case txCommit:
 		if err := c.commitTx(); err != nil {
 			return nil, true, err
 		}
 		return driver.RowsAffected(0), true, nil
-	case "ROLLBACK", "ROLLBACK TRANSACTION":
+	case txRollback:
 		if err := c.rollbackTx(); err != nil {
 			return nil, true, err
 		}

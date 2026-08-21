@@ -51,6 +51,20 @@ func evalSoundex(env ExecEnv, args []Expr, row Row) (any, error) {
 	return string(result), nil
 }
 
+// evalHex implements SQLite's hex(X): the upper-case hexadecimal rendering of
+// X's bytes. For a BLOB that is the blob's own bytes; for every other type it
+// is the UTF-8 bytes of X's text rendering, which is why hex(123) is '313233'
+// (the digits) and not '7B'.
+//
+// The []byte case must be handled before valueText, not through it: []byte has
+// no fast case in valueText, so it fell through to fmt's %v, whose []byte form
+// is the decimal byte list "[1 2]". hex(X'0102') therefore returned
+// '5B3120325D' — the hex of that Go rendering, punctuation and all — instead of
+// '0102'.
+//
+// Deliberately not blobDecode: that helper decodes a hex-looking *string* as
+// hex, but SQLite's hex('0102') is the hex of the four text characters
+// ('30313032'), so only a real []byte counts as a blob here.
 func evalHex(env ExecEnv, args []Expr, row Row) (any, error) {
 	if len(args) != 1 {
 		return nil, fmt.Errorf("HEX expects 1 argument")
@@ -59,8 +73,18 @@ func evalHex(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := valueText(val)
-	return fmt.Sprintf("%X", []byte(s)), nil
+	if val == nil {
+		// NULL in, NULL out, like MD5/SHA*/BASE64 below. SQLite's own
+		// hex(NULL) yields '' because it casts NULL to an empty blob, so
+		// this is a deliberate deviation in favour of the engine-wide
+		// NULL-propagation rule for scalar functions; the previous
+		// behaviour — the hex of the string "<nil>" — matched neither.
+		return nil, nil
+	}
+	if b, ok := val.([]byte); ok {
+		return fmt.Sprintf("%X", b), nil
+	}
+	return fmt.Sprintf("%X", []byte(valueText(val))), nil
 }
 
 func evalUnhex(env ExecEnv, args []Expr, row Row) (any, error) {

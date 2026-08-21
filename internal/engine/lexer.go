@@ -372,7 +372,8 @@ func buildASCIISingleCharTable() string {
 
 // Helper: tokenize symbols and operators. Every case here is a specific
 // ASCII literal, so its result is either a slice of asciiSingleChar or (for
-// the two-character operators) a string constant -- both zero-allocation.
+// the two-character operators <=, <>, >=, != and ||) a string constant --
+// both zero-allocation.
 // The default branch can still see a non-ASCII rune (any character
 // nextToken() didn't already route elsewhere), so it keeps the original,
 // rune-safe conversion, which does allocate but only for that rare input.
@@ -381,6 +382,18 @@ func (lx *lexer) tokenizeSymbol(start int) token {
 	switch r {
 	case '(', ')', ',', '*', '+', '-', '/', '.', ';', '?':
 		lx.next()
+		return token{Typ: tSymbol, Val: asciiSingleChar[r : r+1], Pos: start}
+	case '|':
+		// "||" is SQL's string concatenation operator. A lone '|' stays a
+		// single-character symbol, exactly as the default branch produced
+		// before this case existed, so that "a | b" keeps failing with the
+		// parser's unexpected-token error instead of being silently read as a
+		// concatenation (or as a bitwise OR, which tinySQL does not have).
+		lx.next()
+		if lx.peek() == '|' {
+			lx.next()
+			return token{Typ: tSymbol, Val: "||", Pos: start}
+		}
 		return token{Typ: tSymbol, Val: asciiSingleChar[r : r+1], Pos: start}
 	case '=', '<', '>', '!':
 		a := lx.next()

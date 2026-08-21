@@ -1441,3 +1441,69 @@ func TestDB_BackendStats(t *testing.T) {
 	}
 	_ = db2.Close()
 }
+
+// TestHybridBackendReportsAdmissionRejects covers the signal a budget-tuned
+// ModeHybrid deployment depends on: a table too big for the pool is refused
+// on every access and re-read from disk each time, which used to be
+// indistinguishable from a merely cold cache. AdmissionRejects must count
+// those refusals and LargestRejectedBytes must name the budget that would
+// fix it, while a table that does fit leaves both at zero.
+func TestHybridBackendReportsAdmissionRejects(t *testing.T) {
+	big := makeTestTable("big", 4000)
+	budget := EstimateTableSize(big) / 4
+
+	b, err := NewHybridBackend(t.TempDir(), budget, false, ModeHybrid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	if err := b.SaveTable("default", big); err != nil {
+		t.Fatal(err)
+	}
+	// Each load must re-read from disk, because the table can never be
+	// admitted to a pool smaller than itself.
+	for i := 0; i < 3; i++ {
+		if _, err := b.LoadTable("default", "big"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	st := b.Stats()
+	if st.AdmissionRejects == 0 {
+		t.Fatal("AdmissionRejects: got 0, want the refusals for an oversized table")
+	}
+	if st.LargestRejectedBytes <= budget {
+		t.Errorf("LargestRejectedBytes: got %d, want a size above the %d byte budget", st.LargestRejectedBytes, budget)
+	}
+	if st.LoadCount < 3 {
+		t.Errorf("LoadCount: got %d, want at least the 3 disk reads a never-cached table forces", st.LoadCount)
+	}
+}
+
+func TestHybridBackendNoAdmissionRejectsWhenTableFits(t *testing.T) {
+	small := makeTestTable("small", 10)
+
+	b, err := NewHybridBackend(t.TempDir(), 8*1024*1024, false, ModeHybrid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	if err := b.SaveTable("default", small); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := b.LoadTable("default", "small"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	st := b.Stats()
+	if st.AdmissionRejects != 0 {
+		t.Errorf("AdmissionRejects: got %d, want 0 for a table well inside the budget", st.AdmissionRejects)
+	}
+	if st.LargestRejectedBytes != 0 {
+		t.Errorf("LargestRejectedBytes: got %d, want 0", st.LargestRejectedBytes)
+	}
+}
