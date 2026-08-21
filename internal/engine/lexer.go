@@ -276,12 +276,22 @@ func (lx *lexer) tokenizeQuotedIdent(start int) token {
 func (lx *lexer) tokenizeNumber(start int) token {
 	dot := false
 	for lx.pos < len(lx.s) {
-		ch := lx.peek()
+		if ch := lx.s[lx.pos]; ch < utf8.RuneSelf {
+			if (ch >= '0' && ch <= '9') || (!dot && ch == '.') {
+				if ch == '.' {
+					dot = true
+				}
+				lx.pos++
+				continue
+			}
+			break
+		}
+		ch, w := utf8.DecodeRuneInString(lx.s[lx.pos:])
 		if unicode.IsDigit(ch) || (!dot && ch == '.') {
 			if ch == '.' {
 				dot = true
 			}
-			lx.pos++
+			lx.pos += w
 		} else {
 			break
 		}
@@ -317,9 +327,11 @@ func (lx *lexer) tokenizeNumber(start int) token {
 // identifier (e.g. 'héllo') still lexes correctly -- the rune width w is
 // exactly what keeps that case correct.
 func (lx *lexer) tokenizeIdentOrKeyword(start int) token {
+	hasDot := false
 	for lx.pos < len(lx.s) {
 		if c := lx.s[lx.pos]; c < utf8.RuneSelf {
 			if isIdentASCIIByte(c) {
+				hasDot = hasDot || c == '.'
 				lx.pos++
 				continue
 			}
@@ -333,6 +345,13 @@ func (lx *lexer) tokenizeIdentOrKeyword(start int) token {
 		}
 	}
 	val := lx.s[start:lx.pos]
+	// A dotted token is necessarily a qualified identifier: no keyword in
+	// the grammar contains '.', so avoid allocating an uppercased copy merely
+	// to reject it from isKeyword. Qualified references dominate joins and
+	// projections, making this a hot-path allocation reduction.
+	if hasDot {
+		return token{Typ: tIdent, Val: val, Pos: start}
+	}
 	if up := lx.upperInto(val); isKeyword(up) {
 		return token{Typ: tKeyword, Val: up, Pos: start}
 	}

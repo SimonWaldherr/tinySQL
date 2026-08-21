@@ -57,6 +57,15 @@ func TestLexerUnicodeIdentifier(t *testing.T) {
 	}
 }
 
+func TestLexerQualifiedIdentifiersDoNotBecomeKeywords(t *testing.T) {
+	for _, sql := range []string{"orders.id", "select.value", "WHERE.name"} {
+		toks := lexAll(t, sql)
+		if len(toks) != 1 || toks[0].Typ != tIdent || toks[0].Val != sql {
+			t.Errorf("lexAll(%q) = %+v, want one qualified identifier", sql, toks)
+		}
+	}
+}
+
 // TestLexerUnicodeIdentifierInQuery exercises the same thing inside a real
 // statement, through the parser, end to end.
 func TestLexerUnicodeIdentifierInQuery(t *testing.T) {

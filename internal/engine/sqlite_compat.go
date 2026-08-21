@@ -268,9 +268,20 @@ func resolveSQLiteSchemaTable(env ExecEnv, s *Select) []Row {
 }
 
 func sqliteSchemaRows(env ExecEnv) []Row {
-	rows := make([]Row, 0)
-	for _, tn := range env.db.ListTenants() {
-		for _, t := range env.db.ListTables(tn) {
+	tenants := env.db.ListTenants()
+	tablesByTenant := make([][]*storage.Table, len(tenants))
+	tableCount := 0
+	for i, tn := range tenants {
+		tablesByTenant[i] = env.db.ListTables(tn)
+		tableCount += len(tablesByTenant[i])
+	}
+	catalog := env.db.Catalog()
+	views := catalog.GetViews()
+	materializedViews := catalog.GetMaterializedViews()
+	triggers := catalog.ListTriggers()
+	rows := make([]Row, 0, tableCount+len(views)+len(materializedViews)+len(triggers))
+	for i := range tenants {
+		for _, t := range tablesByTenant[i] {
 			if strings.HasPrefix(strings.ToLower(t.Name), "__mv_") {
 				continue
 			}
@@ -278,15 +289,15 @@ func sqliteSchemaRows(env ExecEnv) []Row {
 			rows = append(rows, sqliteSchemaRow("table", schema, name, name, sqliteCreateTableSQL(schema, name, t)))
 		}
 	}
-	for _, v := range env.db.Catalog().GetViews() {
+	for _, v := range views {
 		fullName := catalogDisplayName(v.Schema, v.Name)
 		rows = append(rows, sqliteSchemaRow("view", v.Schema, v.Name, v.Name, "CREATE VIEW "+sqliteIdent(fullName)+" AS "+v.SQLText))
 	}
-	for _, v := range env.db.Catalog().GetMaterializedViews() {
+	for _, v := range materializedViews {
 		fullName := catalogDisplayName(v.Schema, v.Name)
 		rows = append(rows, sqliteSchemaRow("view", v.Schema, v.Name, v.Name, "CREATE MATERIALIZED VIEW "+sqliteIdent(fullName)+" AS "+v.SQLText))
 	}
-	for _, tr := range env.db.Catalog().ListTriggers() {
+	for _, tr := range triggers {
 		sql := "CREATE TRIGGER " + sqliteIdent(tr.Name) + " " + string(tr.Timing) + " " + string(tr.Event) + " ON " + sqliteIdent(tr.Table)
 		if tr.ForEachRow {
 			sql += " FOR EACH ROW"
@@ -323,44 +334,62 @@ func projectSQLiteMasterRow(r Row) Row {
 }
 
 func sqliteSchemaRow(typ, schema, name, tableName, sql string) Row {
-	r := make(Row)
-	putVal(r, "type", typ)
-	putVal(r, "name", name)
-	putVal(r, "tbl_name", tableName)
-	putVal(r, "rootpage", 0)
-	putVal(r, "sql", sql)
-	putVal(r, "schema", schema)
-	putVal(r, "full_name", catalogDisplayName(schema, name))
-	return r
+	return Row{
+		"type":      typ,
+		"name":      name,
+		"tbl_name":  tableName,
+		"rootpage":  0,
+		"sql":       sql,
+		"schema":    schema,
+		"full_name": catalogDisplayName(schema, name),
+	}
 }
 
 func sqliteCreateTableSQL(schema, name string, t *storage.Table) string {
-	parts := make([]string, 0, len(t.Cols))
-	for _, c := range t.Cols {
+	// Build directly instead of allocating one intermediate string per column
+	// and a parts slice solely for strings.Join. sqlite_schema is commonly
+	// queried by migration tools over every table at once, so this removes a
+	// proportional amount of short-lived garbage from that path.
+	var b strings.Builder
+	b.Grow(24 + len(schema) + len(name) + len(t.Cols)*24)
+	b.WriteString("CREATE TABLE ")
+	writeSQLiteIdent(&b, catalogDisplayName(schema, name))
+	b.WriteString(" (")
+	for i, c := range t.Cols {
+		if i > 0 {
+			b.WriteString(", ")
+		}
 		declaredType := c.DeclaredType
 		if declaredType == "" {
 			declaredType = c.Type.String()
 		}
-		part := sqliteIdent(c.Name) + " " + declaredType
+		writeSQLiteIdent(&b, c.Name)
+		b.WriteByte(' ')
+		b.WriteString(declaredType)
 		switch c.Constraint {
 		case storage.PrimaryKey:
-			part += " PRIMARY KEY"
+			b.WriteString(" PRIMARY KEY")
 		case storage.Unique:
-			part += " UNIQUE"
+			b.WriteString(" UNIQUE")
 		case storage.ForeignKey:
 			if c.ForeignKey != nil {
-				part += " REFERENCES " + sqliteIdent(c.ForeignKey.Table) + "(" + sqliteIdent(c.ForeignKey.Column) + ")"
+				b.WriteString(" REFERENCES ")
+				writeSQLiteIdent(&b, c.ForeignKey.Table)
+				b.WriteByte('(')
+				writeSQLiteIdent(&b, c.ForeignKey.Column)
+				b.WriteByte(')')
 			}
 		}
 		if c.NotNull && c.Constraint != storage.PrimaryKey {
-			part += " NOT NULL"
+			b.WriteString(" NOT NULL")
 		}
 		if c.HasDefault {
-			part += " DEFAULT " + sqliteDefaultSQL(c.DefaultValue)
+			b.WriteString(" DEFAULT ")
+			b.WriteString(sqliteDefaultSQL(c.DefaultValue))
 		}
-		parts = append(parts, part)
 	}
-	return "CREATE TABLE " + sqliteIdent(catalogDisplayName(schema, name)) + " (" + strings.Join(parts, ", ") + ")"
+	b.WriteByte(')')
+	return b.String()
 }
 
 func sqliteDefaultSQL(v any) string {
@@ -378,6 +407,17 @@ func sqliteDefaultSQL(v any) string {
 
 func sqliteIdent(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+func writeSQLiteIdent(b *strings.Builder, name string) {
+	b.WriteByte('"')
+	for i := 0; i < len(name); i++ {
+		if name[i] == '"' {
+			b.WriteByte('"')
+		}
+		b.WriteByte(name[i])
+	}
+	b.WriteByte('"')
 }
 
 func sqliteColumnCount(env ExecEnv, schemaRow Row) int {

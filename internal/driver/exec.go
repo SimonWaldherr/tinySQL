@@ -300,12 +300,8 @@ func parseCacheCandidate(sqlStr string) bool {
 	if end == 0 {
 		return false
 	}
-	switch strings.ToUpper(sqlStr[:end]) {
-	case "SELECT", "EXPLAIN":
-		return true
-	default:
-		return false
-	}
+	keyword := sqlStr[:end]
+	return asciiKeywordEqual(keyword, "SELECT") || asciiKeywordEqual(keyword, "EXPLAIN")
 }
 
 //nolint:gocyclo // execSQL coordinates parsing, locking, WAL, and transaction paths.
@@ -349,12 +345,32 @@ func looksLikeTransactionControl(sqlStr string) bool {
 		}
 		end++
 	}
-	switch strings.ToUpper(s[:end]) {
-	case "BEGIN", "START", "COMMIT", "END", "ROLLBACK":
-		return true
-	default:
+	keyword := s[:end]
+	return asciiKeywordEqual(keyword, "BEGIN") ||
+		asciiKeywordEqual(keyword, "START") ||
+		asciiKeywordEqual(keyword, "COMMIT") ||
+		asciiKeywordEqual(keyword, "END") ||
+		asciiKeywordEqual(keyword, "ROLLBACK")
+}
+
+// asciiKeywordEqual compares a source keyword with its uppercase SQL spelling
+// without allocating an uppercased temporary. Both callers have already
+// limited input to ASCII letters, so byte-wise folding is equivalent to
+// strings.ToUpper for the classification decision.
+func asciiKeywordEqual(s, upper string) bool {
+	if len(s) != len(upper) {
 		return false
 	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'a' && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		if c != upper[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // txAction is the transaction verb a control statement resolves to, or txNone

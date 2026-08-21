@@ -144,41 +144,45 @@ func (m WALSyncMode) String() string {
 // modes: both affect durability, but one chooses a backend and the other
 // chooses its per-commit flush strength.
 func ParseWALSyncMode(s string) (WALSyncMode, error) {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "full":
+	raw := s
+	s = strings.TrimSpace(s)
+	switch {
+	case strings.EqualFold(s, "full"):
 		return WALSyncFull, nil
-	case "normal":
+	case strings.EqualFold(s, "normal"):
 		return WALSyncNormal, nil
 	default:
-		return WALSyncFull, fmt.Errorf("unknown WAL sync mode %q (valid: full, normal)", s)
+		return WALSyncFull, fmt.Errorf("unknown WAL sync mode %q (valid: full, normal)", raw)
 	}
 }
 
 // ParseStorageMode converts a string representation back to a StorageMode.
 // It is case-insensitive and returns an error for unknown values.
 func ParseStorageMode(s string) (StorageMode, error) {
-	switch strings.ToLower(strings.TrimSpace(s)) {
+	raw := s
+	s = strings.TrimSpace(s)
+	switch {
 	// "memory" is the one value that means something in both dialects: it is a
 	// real tinySQL storage mode AND a SQLite access mode. It keeps resolving to
 	// ModeMemory, which is also what a SQLite user writing mode=memory wants,
 	// so it must stay out of the access-mode branch below.
-	case "memory", "mem", "ram", "":
+	case s == "", strings.EqualFold(s, "memory"), strings.EqualFold(s, "mem"), strings.EqualFold(s, "ram"):
 		return ModeMemory, nil
-	case "wal":
+	case strings.EqualFold(s, "wal"):
 		return ModeWAL, nil
-	case "disk":
+	case strings.EqualFold(s, "disk"):
 		return ModeDisk, nil
-	case "index":
+	case strings.EqualFold(s, "index"):
 		return ModeIndex, nil
-	case "hybrid":
+	case strings.EqualFold(s, "hybrid"):
 		return ModeHybrid, nil
-	case "advanced_wal", "advancedwal":
+	case strings.EqualFold(s, "advanced_wal"), strings.EqualFold(s, "advancedwal"):
 		return ModeAdvancedWAL, nil
-	case "json":
+	case strings.EqualFold(s, "json"):
 		return ModeJSON, nil
-	case "paged_index", "pagedindex", "page_index":
+	case strings.EqualFold(s, "paged_index"), strings.EqualFold(s, "pagedindex"), strings.EqualFold(s, "page_index"):
 		return ModePagedIndex, nil
-	case "sqlite":
+	case strings.EqualFold(s, "sqlite"):
 		return ModeSQLite, nil
 	// SQLite's mode= URI parameter selects an ACCESS mode; tinySQL's mode=
 	// selects a storage BACKEND. Same key, entirely different universe, so a
@@ -191,10 +195,10 @@ func ParseStorageMode(s string) (StorageMode, error) {
 	// layout) the caller never asked for. mode=ro is likewise a request the
 	// caller must restate as read_only=1 plus an explicit backend, because
 	// "read-only" says nothing about *what* is being read.
-	case "ro", "rw", "rwc":
-		return ModeMemory, fmt.Errorf("mode=%s is a SQLite access mode; in tinySQL mode= selects a storage backend (memory, wal, disk, index, hybrid, advanced_wal, json, paged_index, sqlite). Request read-only access with read_only=1 and name a persistent backend as well, e.g. mode=disk&read_only=1", strings.ToLower(strings.TrimSpace(s)))
+	case strings.EqualFold(s, "ro"), strings.EqualFold(s, "rw"), strings.EqualFold(s, "rwc"):
+		return ModeMemory, fmt.Errorf("mode=%s is a SQLite access mode; in tinySQL mode= selects a storage backend (memory, wal, disk, index, hybrid, advanced_wal, json, paged_index, sqlite). Request read-only access with read_only=1 and name a persistent backend as well, e.g. mode=disk&read_only=1", strings.ToLower(s))
 	default:
-		return ModeMemory, fmt.Errorf("unknown storage mode %q (valid: memory, wal, disk, index, hybrid, advanced_wal, json, paged_index, sqlite)", s)
+		return ModeMemory, fmt.Errorf("unknown storage mode %q (valid: memory, wal, disk, index, hybrid, advanced_wal, json, paged_index, sqlite)", raw)
 	}
 }
 

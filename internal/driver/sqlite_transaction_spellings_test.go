@@ -91,6 +91,19 @@ func TestLooksLikeTransactionControlRoutesEND(t *testing.T) {
 	}
 }
 
+func TestParseCacheCandidateIgnoresKeywordCaseWithoutChangingEligibility(t *testing.T) {
+	for _, sql := range []string{"SELECT 1", "select 1", "  ExPlAiN SELECT 1"} {
+		if !parseCacheCandidate(sql) {
+			t.Errorf("parseCacheCandidate(%q) = false, want true", sql)
+		}
+	}
+	for _, sql := range []string{"SELECTED 1", "INSERT INTO t VALUES (1)", "-- SELECT 1"} {
+		if parseCacheCandidate(sql) {
+			t.Errorf("parseCacheCandidate(%q) = true, want false", sql)
+		}
+	}
+}
+
 // TestSQLiteTransactionSpellingsCommitAndRollback runs the new spellings
 // through the real Exec path: BEGIN IMMEDIATE ... END must durably commit, and
 // BEGIN EXCLUSIVE ... ROLLBACK must discard.
