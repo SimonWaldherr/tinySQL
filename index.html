@@ -2029,6 +2029,9 @@
                 <div class="example-query" onclick="setQuery('-- PIVOT: product revenue by region\nSELECT region, widget_a, widget_b, widget_c\nFROM sales\nPIVOT (SUM(quantity * unit_price) FOR product IN (\'Widget A\' AS widget_a, \'Widget B\' AS widget_b, \'Widget C\' AS widget_c))\nORDER BY region')">
                     🧮 SQL PIVOT
                 </div>
+                <div class="example-query" onclick="setQuery('-- New: EQUAL_INTERVAL and NATURAL_BREAKS choropleth classification\nWITH region_revenue AS (\n    SELECT region, SUM(quantity * unit_price) AS revenue\n    FROM sales GROUP BY region\n)\nSELECT region, revenue,\n       EQUAL_INTERVAL(3) OVER (ORDER BY revenue) AS equal_class,\n       NATURAL_BREAKS(3) OVER (ORDER BY revenue) AS jenks_class\nFROM region_revenue ORDER BY revenue')">
+                    🎨 Choropleth Classes
+                </div>
                 <div class="example-query" onclick="setQuery('-- Views, materialized views, RETURNING\nDROP MATERIALIZED VIEW IF EXISTS demo_revenue_mv;\nDROP VIEW IF EXISTS demo_paid_orders;\nCREATE VIEW demo_paid_orders AS\nSELECT customer_name, region, product, quantity * unit_price AS revenue\nFROM sales\nWHERE status = \'Delivered\';\nCREATE MATERIALIZED VIEW demo_revenue_mv AS\nSELECT region, SUM(revenue) AS revenue\nFROM demo_paid_orders\nGROUP BY region\nWITH DATA;\nINSERT INTO sales VALUES (1011, \'Acme Corp\', \'Widget D\', 10, 120.00, \'2024-03-01\', \'North\', \'Delivered\') RETURNING order_id, customer_name, quantity * unit_price AS returned_total;\nREFRESH MATERIALIZED VIEW demo_revenue_mv;\nSELECT region, revenue\nFROM demo_revenue_mv\nORDER BY revenue DESC')">
                     🧱 Views + RETURNING
                 </div>
@@ -2040,6 +2043,9 @@
                 </div>
                 <div class="example-query" onclick="setQuery('-- Multi-statement: create and query\nCREATE TABLE temp (id INTEGER, label TEXT);\nINSERT INTO temp VALUES (1, \'alpha\');\nINSERT INTO temp VALUES (2, \'beta\');\nSELECT * FROM temp')">
                     🔁 Multi-Statement
+                </div>
+                <div class="example-query" onclick="setQuery('-- New: BLOB_FROM_HEX/BLOB_FROM_BASE64 build storable blobs directly\nCREATE TABLE files_demo (id INT, data BLOB, label TEXT);\nINSERT INTO files_demo VALUES (1, BLOB_FROM_HEX(\'89504E470D0A1A0A\'), \'png-header\');\nINSERT INTO files_demo VALUES (2, BLOB_FROM_BASE64(\'aGVsbG8=\'), \'base64-hello\');\nSELECT id, label, BLOB_HEX(data) AS hex_str, BLOB_LENGTH(data) AS byte_len\nFROM files_demo ORDER BY id')">
+                    🧬 BLOB Constructors
                 </div>
                 <div class="example-query" onclick="setQuery('-- Large sales cube\nSELECT region, channel, category,\n       COUNT(*) AS orders,\n       SUM(order_total) AS revenue\nFROM sales_large\nGROUP BY region, channel, category\nORDER BY revenue DESC')">
                     🧮 Large Sales Cube
@@ -2073,6 +2079,27 @@
                 </div>
                 <div class="example-query" onclick="setQuery('-- Hubs within 450 km of Munich\nSELECT name, city,\n       ROUND(ST_DISTANCE(geometry, ST_MakePoint(11.5755, 48.1372)) / 1000, 1) AS km_from_munich\nFROM places_geo\nWHERE ST_DWITHIN(geometry, ST_MakePoint(11.5755, 48.1372), 450000)\nORDER BY km_from_munich')">
                     🎯 Munich Radius
+                </div>
+                <div class="example-query" onclick="setQuery('-- New: GEO_DISSOLVE merges touching regions, GEO_CENTROID_AGG weights by population\nCREATE TABLE geo_region_demo (region TEXT, footprint GEOMETRY, population FLOAT);\nINSERT INTO geo_region_demo VALUES (\'north\', \'{&quot;type&quot;:&quot;Polygon&quot;,&quot;coordinates&quot;:[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}\', 100);\nINSERT INTO geo_region_demo VALUES (\'north\', \'{&quot;type&quot;:&quot;Polygon&quot;,&quot;coordinates&quot;:[[[1,0],[2,0],[2,1],[1,1],[1,0]]]}\', 300);\nINSERT INTO geo_region_demo VALUES (\'south\', \'{&quot;type&quot;:&quot;Polygon&quot;,&quot;coordinates&quot;:[[[10,10],[11,10],[11,11],[10,11],[10,10]]]}\', 50);\nSELECT region, GEO_DISSOLVE(footprint) AS boundary, GEO_CENTROID_AGG(footprint, population) AS weighted_centroid\nFROM geo_region_demo GROUP BY region ORDER BY region')">
+                    🧩 GEO_DISSOLVE Regions
+                </div>
+                <div class="example-query" onclick="setQuery('-- New: GEO_SEARCH indexes geometries for fast bbox/radius lookups\nCREATE TABLE geo_search_demo (label TEXT, footprint GEOMETRY);\nINSERT INTO geo_search_demo VALUES (\'near\', \'{&quot;type&quot;:&quot;Point&quot;,&quot;coordinates&quot;:[0.5,0.5]}\');\nINSERT INTO geo_search_demo VALUES (\'far\', \'{&quot;type&quot;:&quot;Point&quot;,&quot;coordinates&quot;:[10,10]}\');\nSELECT label FROM GEO_SEARCH(\'geo_search_demo\', \'footprint\', \'bbox\', -1, -1, 3, 3)')">
+                    🔎 GEO_SEARCH Bbox
+                </div>
+                <div class="example-query" onclick="setQuery('-- New: GEO_INTERSECTS/GEO_DISJOINT relations and GEO_CLIP polygon clipping\nSELECT GEO_INTERSECTS(\'{&quot;type&quot;:&quot;Polygon&quot;,&quot;coordinates&quot;:[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}\', \'{&quot;type&quot;:&quot;Polygon&quot;,&quot;coordinates&quot;:[[[0.5,0.5],[1.5,0.5],[1.5,1.5],[0.5,1.5],[0.5,0.5]]]}\') AS overlapping,\n       GEO_DISJOINT(\'{&quot;type&quot;:&quot;Polygon&quot;,&quot;coordinates&quot;:[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}\', \'{&quot;type&quot;:&quot;Polygon&quot;,&quot;coordinates&quot;:[[[5,5],[6,5],[6,6],[5,6],[5,5]]]}\') AS far_apart,\n       GEO_CLIP(\'{&quot;type&quot;:&quot;Polygon&quot;,&quot;coordinates&quot;:[[[0,0],[4,0],[4,4],[0,4],[0,0]]]}\', \'{&quot;type&quot;:&quot;Polygon&quot;,&quot;coordinates&quot;:[[[1,1],[3,1],[3,3],[1,3],[1,1]]]}\') AS clipped')">
+                    🔀 GEO_CLIP &amp; Relations
+                </div>
+                <div class="example-query" onclick="setQuery('-- New: GEO_CONVEX_HULL, GEO_ENVELOPE, and GEO_LINE_INTERPOLATE geometry construction\nSELECT GEO_CONVEX_HULL(\'{&quot;type&quot;:&quot;MultiPoint&quot;,&quot;coordinates&quot;:[[0,0],[2,0],[2,2],[0,2],[1,1]]}\') AS hull,\n       GEO_ENVELOPE(\'{&quot;type&quot;:&quot;MultiPoint&quot;,&quot;coordinates&quot;:[[0,0],[2,0],[2,2],[0,2],[1,1]]}\') AS envelope,\n       GEO_LINE_INTERPOLATE(\'{&quot;type&quot;:&quot;LineString&quot;,&quot;coordinates&quot;:[[0,0],[10,10]]}\', 0.5) AS line_midpoint')">
+                    ⭕ GEO_CONVEX_HULL &amp; Envelope
+                </div>
+                <div class="example-query" onclick="setQuery('-- New: GEO_BUFFER approximates a circular service area around a point\nSELECT name, city, GEO_BUFFER(geometry, 500, 16) AS half_km_circle\nFROM places_geo\nWHERE city = \'Berlin\'')">
+                    🟢 GEO_BUFFER Circle
+                </div>
+                <div class="example-query" onclick="setQuery('-- New: GEO_BEARING and GEO_MIDPOINT between every pair of hubs\nSELECT a.city AS origin, b.city AS destination,\n       ROUND(GEO_BEARING(a.geometry, b.geometry), 1) AS bearing_deg,\n       GEO_MIDPOINT(a.geometry, b.geometry) AS midpoint\nFROM places_geo a\nJOIN places_geo b ON a.city < b.city\nORDER BY origin, destination')">
+                    🧭 Route Bearing &amp; Midpoint
+                </div>
+                <div class="example-query" onclick="setQuery('-- New: GEO_DESTINATION projects a point, GEO_WITHIN_POLYGON/GEO_POLYGON_AREA/GEO_LENGTH measure shapes\nSELECT GEO_DESTINATION(\'{&quot;type&quot;:&quot;Point&quot;,&quot;coordinates&quot;:[13.4050,52.5200]}\', 45, 10000) AS destination_pt,\n       GEO_WITHIN_POLYGON(\'{&quot;type&quot;:&quot;Point&quot;,&quot;coordinates&quot;:[0.5,0.5]}\', \'{&quot;type&quot;:&quot;Polygon&quot;,&quot;coordinates&quot;:[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}\') AS is_within,\n       GEO_POLYGON_AREA(\'{&quot;type&quot;:&quot;Polygon&quot;,&quot;coordinates&quot;:[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}\') AS area_sqm,\n       GEO_LENGTH(\'{&quot;type&quot;:&quot;LineString&quot;,&quot;coordinates&quot;:[[0,0],[0,1]]}\') AS length_m')">
+                    📐 GEO_DESTINATION &amp; Area
                 </div>
                 <div class="example-query" onclick="setQuery('-- YAML import demo\nSELECT service, region, active, replicas\nFROM settings_yaml\nORDER BY service')">
                     ⚙️ YAML Import
