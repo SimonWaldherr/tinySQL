@@ -514,7 +514,7 @@ func isKeyword(up string) bool {
 		"JOIN", "LEFT", "RIGHT", "FULL", "CROSS", "OUTER", "ON", "AS",
 		"UNION", "ALL", "EXCEPT", "INTERSECT", "WITH",
 		"CREATE", "TABLE", "TEMP", "DROP", "ALTER", "ADD", "COLUMN",
-		"INSERT", "INTO", "VALUES",
+		"INSERT", "INTO", "VALUES", "CONFLICT", "DO", "NOTHING", "RENAME",
 		"UPDATE", "SET", "DELETE", "RETURNING",
 		"CALL",
 		"MATERIALIZED", "REFRESH", "STALE", "AFTER", "EVERY", "DAILY", "AT",

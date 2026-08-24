@@ -285,17 +285,20 @@ type DropTrigger struct {
 
 // AlterTable represents an ALTER TABLE statement.
 type AlterTable struct {
-	Table     string
-	AddColumn *storage.Column // For ADD COLUMN
-	// Future: DropColumn, RenameColumn, etc.
+	Table            string
+	AddColumn        *storage.Column // For ADD COLUMN
+	RenameColumnFrom string
+	RenameColumnTo   string
 }
 
 // Insert represents an INSERT statement.
 type Insert struct {
-	Table     string
-	Cols      []string
-	Rows      [][]Expr
-	Returning []SelectItem
+	Table               string
+	Cols                []string
+	Rows                [][]Expr
+	Select              *Select // INSERT INTO ... SELECT ...
+	OnConflictDoNothing bool
+	Returning           []SelectItem
 }
 
 // Update represents an UPDATE statement.

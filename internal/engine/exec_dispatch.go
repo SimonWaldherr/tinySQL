@@ -124,12 +124,12 @@ func executeAnalyze(env ExecEnv, s *Analyze) (*ResultSet, error) {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
 		}
-		stats := table.Analyze()
+		rowCount, columnCount, analyzedAt := table.AnalyzeSummary()
 		row := Row{}
 		putVal(row, "table_name", table.Name)
-		putVal(row, "row_count", stats.RowCount)
-		putVal(row, "column_count", len(stats.Columns))
-		putVal(row, "analyzed_at", stats.AnalyzedAt)
+		putVal(row, "row_count", rowCount)
+		putVal(row, "column_count", columnCount)
+		putVal(row, "analyzed_at", analyzedAt)
 		rows = append(rows, row)
 	}
 	return &ResultSet{Cols: []string{"table_name", "row_count", "column_count", "analyzed_at"}, Rows: rows}, nil

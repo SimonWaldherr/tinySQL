@@ -1,6 +1,8 @@
 // ALTER TABLE.
 package engine
 
+import "strings"
+
 func executeAlterTable(env ExecEnv, s *AlterTable) (*ResultSet, error) {
 	t, err := env.db.Get(env.tenant, s.Table)
 	if err != nil {
@@ -29,6 +31,34 @@ func executeAlterTable(env ExecEnv, s *AlterTable) (*ResultSet, error) {
 		// column list rather than a row delta.
 		t.Version++
 		t.MarkDirtyFrom(-1)
+	}
+	if s.RenameColumnFrom != "" {
+		if err := t.RenameColumn(s.RenameColumnFrom, s.RenameColumnTo); err != nil {
+			return nil, err
+		}
+		// Index definitions exist both on the table (for execution) and in the
+		// catalog (for sys.indexes/PRAGMA introspection and persistence).
+		env.db.Catalog().RenameIndexColumnForTenant(env.tenant, s.Table, s.RenameColumnFrom, s.RenameColumnTo)
+		invalidateConstraintIndexes(t)
+		for _, child := range env.db.ListTables(env.tenant) {
+			updated := false
+			for colIdx := range child.Cols {
+				ref := child.Cols[colIdx].ForeignKey
+				if ref == nil || !strings.EqualFold(ref.Table, s.Table) || !strings.EqualFold(ref.Column, s.RenameColumnFrom) {
+					continue
+				}
+				ref.Column = s.RenameColumnTo
+				updated = true
+			}
+			if updated {
+				child.Version++
+				child.MarkDirtyFrom(-1)
+				invalidateConstraintIndexes(child)
+			}
+		}
+		t.Version++
+		t.MarkDirtyFrom(-1)
+		markDependentMaterializedViewsStale(env, s.Table)
 	}
 
 	return nil, nil

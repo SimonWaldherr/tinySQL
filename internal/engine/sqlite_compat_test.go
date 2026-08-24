@@ -127,3 +127,79 @@ func TestSQLitePragmaOperationalCompatibility(t *testing.T) {
 		t.Fatalf("compile_options missing ENABLE_VECTOR: %#v", rs.Rows)
 	}
 }
+
+func TestSQLitePragmaIndexIntrospection(t *testing.T) {
+	db := setupTestDB()
+	ctx := context.Background()
+	for _, sql := range []string{
+		`CREATE INDEX idx_users_name_email ON users(name, email)`,
+		`CREATE UNIQUE INDEX idx_users_email ON users(email)`,
+	} {
+		if _, err := Execute(ctx, db, "main", mustParseSys(sql)); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+
+	rs, err := Execute(ctx, db, "main", mustParseSys(`PRAGMA index_list(users)`))
+	if err != nil {
+		t.Fatalf("PRAGMA index_list: %v", err)
+	}
+	if got, want := rs.Cols, []string{"seq", "name", "unique", "origin", "partial"}; len(got) != len(want) {
+		t.Fatalf("index_list cols = %v, want %v", got, want)
+	}
+	indexes := map[string]Row{}
+	for _, row := range rs.Rows {
+		indexes[row["name"].(string)] = row
+	}
+	if row := indexes["idx_users_name_email"]; row == nil || row["unique"] != 0 || row["origin"] != "c" || row["partial"] != 0 {
+		t.Fatalf("ordinary index row = %#v", row)
+	}
+	if row := indexes["idx_users_email"]; row == nil || row["unique"] != 1 {
+		t.Fatalf("unique index row = %#v", row)
+	}
+
+	rs, err = Execute(ctx, db, "main", mustParseSys(`PRAGMA index_info(idx_users_name_email)`))
+	if err != nil {
+		t.Fatalf("PRAGMA index_info: %v", err)
+	}
+	if len(rs.Rows) != 2 {
+		t.Fatalf("index_info rows = %#v, want two columns", rs.Rows)
+	}
+	if first, second := rs.Rows[0], rs.Rows[1]; first["seqno"] != 0 || first["cid"] != 1 || first["name"] != "name" || second["seqno"] != 1 || second["cid"] != 2 || second["name"] != "email" {
+		t.Fatalf("index_info rows = %#v", rs.Rows)
+	}
+
+	rs, err = Execute(ctx, db, "main", mustParseSys(`PRAGMA index_info(missing_index)`))
+	if err != nil {
+		t.Fatalf("unknown PRAGMA index_info: %v", err)
+	}
+	if len(rs.Rows) != 0 {
+		t.Fatalf("unknown index_info rows = %#v, want empty", rs.Rows)
+	}
+}
+
+func TestSQLitePragmaForeignKeyList(t *testing.T) {
+	db := setupTestDB()
+	rs, err := Execute(context.Background(), db, "main", mustParseSys(`PRAGMA foreign_key_list(orders)`))
+	if err != nil {
+		t.Fatalf("PRAGMA foreign_key_list: %v", err)
+	}
+	if got, want := rs.Cols, []string{"id", "seq", "table", "from", "to", "on_update", "on_delete", "match"}; len(got) != len(want) {
+		t.Fatalf("foreign_key_list cols = %v, want %v", got, want)
+	}
+	if len(rs.Rows) != 1 {
+		t.Fatalf("foreign_key_list rows = %#v, want one FK", rs.Rows)
+	}
+	row := rs.Rows[0]
+	if row["id"] != 0 || row["seq"] != 0 || row["table"] != "users" || row["from"] != "user_id" || row["to"] != "id" || row["on_update"] != "NO ACTION" || row["on_delete"] != "NO ACTION" || row["match"] != "NONE" {
+		t.Fatalf("foreign_key_list row = %#v", row)
+	}
+
+	rs, err = Execute(context.Background(), db, "main", mustParseSys(`PRAGMA foreign_key_list(missing_table)`))
+	if err != nil {
+		t.Fatalf("unknown PRAGMA foreign_key_list: %v", err)
+	}
+	if len(rs.Rows) != 0 {
+		t.Fatalf("unknown foreign_key_list rows = %#v, want empty", rs.Rows)
+	}
+}

@@ -177,6 +177,20 @@ func NewTable(name string, cols []Column, isTemp bool) *Table {
 // deliberately: transparent and correct inputs are more useful than a sampled
 // model whose accuracy would need separate policy and tuning.
 func (t *Table) Analyze() *TableStats {
+	return cloneTableStats(t.analyze())
+}
+
+// AnalyzeSummary refreshes the persisted statistics and returns just the
+// values needed by callers that report ANALYZE progress. It avoids cloning
+// every per-column statistic when the detailed result will not be inspected.
+// The caller must already provide the same table-content synchronization that
+// is required for Analyze.
+func (t *Table) AnalyzeSummary() (rowCount, columnCount int, analyzedAt time.Time) {
+	stats := t.analyze()
+	return stats.RowCount, len(stats.Columns), stats.AnalyzedAt
+}
+
+func (t *Table) analyze() *TableStats {
 	stats := &TableStats{
 		RowCount:   len(t.Rows),
 		Columns:    make(map[string]ColumnStats, len(t.Cols)),
@@ -192,7 +206,7 @@ func (t *Table) Analyze() *TableStats {
 				continue
 			}
 			value := row[colIdx]
-			distinct[string(CanonicalIndexKey([]any{value}))] = struct{}{}
+			distinct[analyzeDistinctKey(value)] = struct{}{}
 			if !columnStats.HasMinMax || statsLess(value, minValue) {
 				minValue = value
 			}
@@ -209,7 +223,15 @@ func (t *Table) Analyze() *TableStats {
 		stats.Columns[strings.ToLower(column.Name)] = columnStats
 	}
 	t.Stats = stats
-	return cloneTableStats(stats)
+	return stats
+}
+
+// analyzeDistinctKey uses the same durable, type-tagged representation as
+// secondary indexes. The stack-backed buffer avoids allocating a temporary
+// []byte for the common scalar case; only the map-owned string is retained.
+func analyzeDistinctKey(value any) string {
+	var buffer [64]byte
+	return string(AppendCanonicalIndexValue(buffer[:0], value))
 }
 
 // InvalidateStats marks the previous ANALYZE result stale after a mutation.
@@ -439,6 +461,51 @@ func (t *Table) AddColumn(col Column) error {
 	// Every existing row's contents changed, so a derived structure that only
 	// knows how to grow by appending rows must rebuild rather than assume it
 	// is still current. See noteStructuralChange.
+	t.noteStructuralChange()
+	return nil
+}
+
+// RenameColumn changes one column name while preserving its physical position
+// and every stored value. Secondary-index keys are positional, so their live
+// entries remain valid; their column metadata and the lookup index are updated
+// to make future writes and query planning use the new name.
+func (t *Table) RenameColumn(from, to string) error {
+	fromKey := strings.ToLower(from)
+	toKey := strings.ToLower(to)
+	if toKey == "" {
+		return fmt.Errorf("column name cannot be empty")
+	}
+	if t.colPos == nil {
+		t.colPos = make(map[string]int, len(t.Cols))
+		for i, col := range t.Cols {
+			t.colPos[strings.ToLower(col.Name)] = i
+		}
+	}
+	columnIdx, exists := t.colPos[fromKey]
+	if !exists {
+		return fmt.Errorf("unknown column %q on table %q", from, t.Name)
+	}
+	if existing, exists := t.colPos[toKey]; exists && existing != columnIdx {
+		return fmt.Errorf("column %q already exists on table %q", to, t.Name)
+	}
+	t.Cols[columnIdx].Name = to
+	delete(t.colPos, fromKey)
+	t.colPos[toKey] = columnIdx
+	for _, index := range t.Indexes {
+		for i, column := range index.Columns {
+			if strings.EqualFold(column, from) {
+				index.Columns[i] = to
+			}
+		}
+	}
+	if t.Stats != nil {
+		if columnStats, ok := t.Stats.Columns[fromKey]; ok {
+			delete(t.Stats.Columns, fromKey)
+			t.Stats.Columns[toKey] = columnStats
+		}
+	}
+	// Derived executor state may retain column names, unlike the positional
+	// secondary-index entries above.
 	t.noteStructuralChange()
 	return nil
 }

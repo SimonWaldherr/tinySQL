@@ -655,6 +655,25 @@ func (c *CatalogManager) DeleteIndexesForTenantTable(tenant, table string) {
 	}
 }
 
+// RenameIndexColumnForTenant updates the introspection definition of every
+// index on one table. Materialized index entries live on storage.Table and are
+// updated by Table.RenameColumn; this method keeps sys.indexes and persistence
+// metadata in step with that physical change.
+func (c *CatalogManager) RenameIndexColumnForTenant(tenant, table, from, to string) {
+	c.lockWrite()
+	defer c.unlockWrite()
+	for _, idx := range c.indexes {
+		if normalizeCatalogTenant(idx.Tenant) != normalizeCatalogTenant(tenant) || !strings.EqualFold(idx.Table, table) {
+			continue
+		}
+		for i, column := range idx.Columns {
+			if strings.EqualFold(column, from) {
+				idx.Columns[i] = to
+			}
+		}
+	}
+}
+
 // GetIndex retrieves a default-tenant index definition by schema and name.
 // New engine code should use GetIndexForTenant.
 func (c *CatalogManager) GetIndex(schema, name string) (*CatalogIndex, bool) {

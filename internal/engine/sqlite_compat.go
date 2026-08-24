@@ -32,6 +32,21 @@ func executePragma(env ExecEnv, p *Pragma) (*ResultSet, error) {
 		return pragmaTableInfo(env, p.Args[0], name == "table_xinfo"), nil
 	case "table_list":
 		return pragmaTableList(env), nil
+	case "index_list":
+		if len(p.Args) != 1 {
+			return nil, fmt.Errorf("PRAGMA %s requires exactly one table name", p.Name)
+		}
+		return pragmaIndexList(env, p.Args[0]), nil
+	case "index_info":
+		if len(p.Args) != 1 {
+			return nil, fmt.Errorf("PRAGMA %s requires exactly one index name", p.Name)
+		}
+		return pragmaIndexInfo(env, p.Args[0]), nil
+	case "foreign_key_list":
+		if len(p.Args) != 1 {
+			return nil, fmt.Errorf("PRAGMA %s requires exactly one table name", p.Name)
+		}
+		return pragmaForeignKeyList(env, p.Args[0]), nil
 	case "database_list":
 		return pragmaDatabaseList(env), nil
 	case "schema_version":
@@ -127,6 +142,95 @@ func pragmaTableList(env ExecEnv) *ResultSet {
 			"strict": 0,
 		}
 		rows = append(rows, row)
+	}
+	return &ResultSet{Cols: cols, Rows: rows}
+}
+
+// pragmaIndexList exposes explicitly-created secondary indexes in SQLite's
+// index_list shape. tinySQL does not surface its constraint-enforcement
+// structures as fictitious sqlite_autoindex_* entries, so this intentionally
+// reports only the index definitions users can create and drop by name.
+func pragmaIndexList(env ExecEnv, tableName string) *ResultSet {
+	cols := []string{"seq", "name", "unique", "origin", "partial"}
+	_, tableName = splitObjectName(strings.Trim(tableName, `"'`))
+	indexes := env.db.Catalog().GetIndexesForTenant(env.tenant)
+	matching := make([]*storage.CatalogIndex, 0, len(indexes))
+	for _, idx := range indexes {
+		if strings.EqualFold(idx.Table, tableName) {
+			matching = append(matching, idx)
+		}
+	}
+	sort.Slice(matching, func(i, j int) bool {
+		return strings.ToLower(matching[i].Name) < strings.ToLower(matching[j].Name)
+	})
+	rows := make([]Row, len(matching))
+	for i, idx := range matching {
+		rows[i] = Row{
+			"seq":     i,
+			"name":    idx.Name,
+			"unique":  sqliteBoolInt(idx.Unique),
+			"origin":  "c", // SQLite's marker for CREATE INDEX.
+			"partial": 0,
+		}
+	}
+	return &ResultSet{Cols: cols, Rows: rows}
+}
+
+// pragmaIndexInfo returns the ordinal and table-column position for each
+// column in one explicitly-created secondary index. Like SQLite, an unknown
+// index returns an empty result set rather than an error, which makes schema
+// probing by drivers straightforward.
+func pragmaIndexInfo(env ExecEnv, indexName string) *ResultSet {
+	cols := []string{"seqno", "cid", "name"}
+	schema, indexName := splitObjectName(strings.Trim(indexName, `"'`))
+	idx, found := env.db.Catalog().GetIndexForTenant(env.tenant, schema, indexName)
+	if !found {
+		return &ResultSet{Cols: cols}
+	}
+	table, err := env.db.Get(env.tenant, idx.Table)
+	if err != nil {
+		return &ResultSet{Cols: cols}
+	}
+	rows := make([]Row, 0, len(idx.Columns))
+	for seq, name := range idx.Columns {
+		cid, err := table.ColIndex(name)
+		if err != nil {
+			// Catalog metadata can outlive an ALTER/DROP failure; omit only the
+			// stale column and preserve SQLite's empty-or-partial introspection
+			// behavior instead of turning a metadata probe into a query error.
+			continue
+		}
+		rows = append(rows, Row{"seqno": seq, "cid": cid, "name": table.Cols[cid].Name})
+	}
+	return &ResultSet{Cols: cols, Rows: rows}
+}
+
+// pragmaForeignKeyList exposes column-level foreign-key metadata in SQLite's
+// foreign_key_list shape. tinySQL supports one local column per foreign key,
+// so every emitted constraint has sequence number zero.
+func pragmaForeignKeyList(env ExecEnv, tableName string) *ResultSet {
+	cols := []string{"id", "seq", "table", "from", "to", "on_update", "on_delete", "match"}
+	_, tableName = splitObjectName(strings.Trim(tableName, `"'`))
+	table, err := env.db.Get(env.tenant, tableName)
+	if err != nil {
+		return &ResultSet{Cols: cols}
+	}
+	rows := make([]Row, 0)
+	for _, col := range table.Cols {
+		if col.Constraint != storage.ForeignKey || col.ForeignKey == nil {
+			continue
+		}
+		fk := col.ForeignKey
+		rows = append(rows, Row{
+			"id":        len(rows),
+			"seq":       0,
+			"table":     fk.Table,
+			"from":      col.Name,
+			"to":        fk.Column,
+			"on_update": fk.OnUpdate.String(),
+			"on_delete": fk.OnDelete.String(),
+			"match":     "NONE",
+		})
 	}
 	return &ResultSet{Cols: cols, Rows: rows}
 }

@@ -30,10 +30,25 @@ func (p *Parser) parseInsert() (Statement, error) {
 			break
 		}
 	}
-	if err := p.expectKeyword("VALUES"); err != nil {
-		return nil, err
+	var rows [][]Expr
+	var selectSource *Select
+	var err error
+	switch p.cur.Val {
+	case "VALUES":
+		p.next()
+		rows, err = p.parseInsertValueRows()
+		if err != nil {
+			return nil, err
+		}
+	case "SELECT", "WITH":
+		selectSource, err = p.parseSelectWithCTE()
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, p.errf("expected VALUES or SELECT")
 	}
-	rows, err := p.parseInsertValueRows()
+	onConflictDoNothing, err := p.parseInsertOnConflict()
 	if err != nil {
 		return nil, err
 	}
@@ -41,7 +56,29 @@ func (p *Parser) parseInsert() (Statement, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Insert{Table: tname, Cols: cols, Rows: rows, Returning: returning}, nil
+	return &Insert{Table: tname, Cols: cols, Rows: rows, Select: selectSource, OnConflictDoNothing: onConflictDoNothing, Returning: returning}, nil
+}
+
+// parseInsertOnConflict supports PostgreSQL's target-less conflict action.
+// A conflict target and DO UPDATE need composite-constraint metadata that the
+// current catalog does not yet represent, so reject them explicitly instead
+// of silently applying a different conflict policy.
+func (p *Parser) parseInsertOnConflict() (bool, error) {
+	if p.cur.Typ != tKeyword || p.cur.Val != "ON" {
+		return false, nil
+	}
+	p.next()
+	if err := p.expectKeyword("CONFLICT"); err != nil {
+		return false, err
+	}
+	if err := p.expectKeyword("DO"); err != nil {
+		return false, err
+	}
+	if p.cur.Typ != tKeyword || p.cur.Val != "NOTHING" {
+		return false, p.errf("only ON CONFLICT DO NOTHING is supported")
+	}
+	p.next()
+	return true, nil
 }
 
 func (p *Parser) parseInsertValueRows() ([][]Expr, error) {

@@ -13,7 +13,15 @@ import (
 )
 
 func executeInsert(env ExecEnv, s *Insert) (*ResultSet, error) {
-	if len(s.Rows) == 0 {
+	rows := s.Rows
+	if s.Select != nil {
+		rs, err := execStmt(env, s.Select)
+		if err != nil {
+			return nil, err
+		}
+		rows = insertRowsFromResultSet(rs)
+	}
+	if len(rows) == 0 && s.Select == nil {
 		return nil, fmt.Errorf("INSERT requires at least one VALUES clause")
 	}
 	t := planTable(env.planFor(s))
@@ -25,12 +33,28 @@ func executeInsert(env ExecEnv, s *Insert) (*ResultSet, error) {
 	}
 	tmp := Row{}
 	if len(s.Cols) == 0 {
-		return executeInsertAllColumns(env, s, t, tmp)
+		return executeInsertAllColumns(env, s, t, tmp, rows)
 	}
-	return executeInsertSpecificColumns(env, s, t, tmp)
+	return executeInsertSpecificColumns(env, s, t, tmp, rows)
 }
 
-func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) (*ResultSet, error) {
+// insertRowsFromResultSet adapts a SELECT result to INSERT's existing
+// expression-based row path. Literals preserve the selected values exactly,
+// while the ordinary INSERT coercion, constraint, trigger, index and WAL paths
+// remain shared with VALUES inserts.
+func insertRowsFromResultSet(rs *ResultSet) [][]Expr {
+	rows := make([][]Expr, len(rs.Rows))
+	for rowIdx, resultRow := range rs.Rows {
+		row := make([]Expr, len(rs.Cols))
+		for colIdx, column := range rs.Cols {
+			row[colIdx] = &Literal{Val: resultRow[strings.ToLower(column)]}
+		}
+		rows[rowIdx] = row
+	}
+	return rows
+}
+
+func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, rows [][]Expr) (*ResultSet, error) {
 	expected := len(t.Cols)
 	beforeTriggers, afterTriggers := planTriggers(env.planFor(s), env, s.Table, storage.TriggerInsert)
 	hasBefore := len(beforeTriggers) > 0
@@ -44,7 +68,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 	// plus one string concatenation per column, none of which anything read.
 	var returningRows []Row
 	if len(s.Returning) > 0 {
-		returningRows = make([]Row, 0, len(s.Rows))
+		returningRows = make([]Row, 0, len(rows))
 	}
 	var keys tableRowKeys
 	if needsRow {
@@ -72,7 +96,8 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 	if err != nil {
 		return nil, err
 	}
-	for _, vals := range s.Rows {
+	inserted := 0
+	for _, vals := range rows {
 		if len(vals) != expected {
 			return nil, fmt.Errorf("INSERT expects %d values", expected)
 		}
@@ -90,6 +115,14 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 				return nil, fmt.Errorf("column %q: %w", t.Cols[i].Name, err)
 			}
 			row[i] = cv
+		}
+		if s.OnConflictDoNothing {
+			if err := validateInsertNonUniqueConstraints(env, t, row, constrainedCols, fks); err != nil {
+				return nil, err
+			}
+			if insertConflictsUniqueConstraint(t, row) {
+				continue
+			}
 		}
 		if err := validateRowConstraintsWith(env, t, row, -1, constrainedCols, fks); err != nil {
 			return nil, err
@@ -121,22 +154,25 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) 
 		if len(s.Returning) > 0 {
 			returningRows = append(returningRows, newRow)
 		}
+		inserted++
 	}
 	if err := wal.commit(); err != nil {
 		return nil, err
 	}
-	tryFastPathAppend(env, s.Table, t, len(s.Rows))
-	t.Version++
-	t.InvalidateStats()
-	t.MarkDirtyFrom(len(t.Rows) - len(s.Rows))
-	markDependentMaterializedViewsStale(env, s.Table)
+	if inserted > 0 {
+		tryFastPathAppend(env, s.Table, t, inserted)
+		t.Version++
+		t.InvalidateStats()
+		t.MarkDirtyFrom(len(t.Rows) - inserted)
+		markDependentMaterializedViewsStale(env, s.Table)
+	}
 	if len(s.Returning) > 0 {
 		return projectReturningRows(env, t.Cols, s.Returning, returningRows)
 	}
 	return nil, nil
 }
 
-func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row) (*ResultSet, error) {
+func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, rows [][]Expr) (*ResultSet, error) {
 	colIdx := make([]int, len(s.Cols))
 	for i, name := range s.Cols {
 		idx, err := t.ColIndex(name)
@@ -153,7 +189,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	// RETURNING clause asks for the row map.
 	var returningRows []Row
 	if len(s.Returning) > 0 {
-		returningRows = make([]Row, 0, len(s.Rows))
+		returningRows = make([]Row, 0, len(rows))
 	}
 	var keys tableRowKeys
 	if needsRow {
@@ -181,7 +217,8 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	if err != nil {
 		return nil, err
 	}
-	for _, vals := range s.Rows {
+	inserted := 0
+	for _, vals := range rows {
 		if len(vals) != len(s.Cols) {
 			return nil, fmt.Errorf("INSERT column/value mismatch")
 		}
@@ -204,6 +241,14 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 				return nil, fmt.Errorf("column %q: %w", t.Cols[idx].Name, err)
 			}
 			row[idx] = cv
+		}
+		if s.OnConflictDoNothing {
+			if err := validateInsertNonUniqueConstraints(env, t, row, constrainedCols, fks); err != nil {
+				return nil, err
+			}
+			if insertConflictsUniqueConstraint(t, row) {
+				continue
+			}
 		}
 		if err := validateRowConstraintsWith(env, t, row, -1, constrainedCols, fks); err != nil {
 			return nil, err
@@ -235,19 +280,64 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 		if len(s.Returning) > 0 {
 			returningRows = append(returningRows, newRow)
 		}
+		inserted++
 	}
 	if err := wal.commit(); err != nil {
 		return nil, err
 	}
-	tryFastPathAppend(env, s.Table, t, len(s.Rows))
-	t.Version++
-	t.InvalidateStats()
-	t.MarkDirtyFrom(len(t.Rows) - len(s.Rows))
-	markDependentMaterializedViewsStale(env, s.Table)
+	if inserted > 0 {
+		tryFastPathAppend(env, s.Table, t, inserted)
+		t.Version++
+		t.InvalidateStats()
+		t.MarkDirtyFrom(len(t.Rows) - inserted)
+		markDependentMaterializedViewsStale(env, s.Table)
+	}
 	if len(s.Returning) > 0 {
 		return projectReturningRows(env, t.Cols, s.Returning, returningRows)
 	}
 	return nil, nil
+}
+
+// insertConflictsUniqueConstraint reports precisely the conflict classes that
+// ON CONFLICT DO NOTHING may suppress: a PRIMARY KEY/UNIQUE column or an
+// explicitly-created unique index. NOT NULL, type and FOREIGN KEY failures
+// intentionally remain ordinary errors and are validated afterwards.
+func insertConflictsUniqueConstraint(t *storage.Table, row []any) bool {
+	for colIdx, col := range t.Cols {
+		if colIdx >= len(row) || isNull(row[colIdx]) {
+			continue
+		}
+		if (col.Constraint == storage.PrimaryKey || col.Constraint == storage.Unique) && constraintValueExists(t, colIdx, row[colIdx], -1) {
+			return true
+		}
+	}
+	return t.CheckSecondaryIndexConstraints(row, -1) != nil
+}
+
+// validateInsertNonUniqueConstraints checks errors that ON CONFLICT cannot
+// suppress before looking for a duplicate key. The normal full validator still
+// runs for rows that will be inserted, preserving its established error order.
+func validateInsertNonUniqueConstraints(env ExecEnv, t *storage.Table, row []any, constrainedCols []int, fks *fkTargetCache) error {
+	for _, colIdx := range constrainedCols {
+		col := t.Cols[colIdx]
+		if colIdx >= len(row) {
+			return fmt.Errorf("row missing constrained column %q", col.Name)
+		}
+		if col.NotNull && isNull(row[colIdx]) {
+			return fmt.Errorf("NOT NULL column %q cannot be NULL", col.Name)
+		}
+		switch col.Constraint {
+		case storage.PrimaryKey:
+			if isNull(row[colIdx]) {
+				return fmt.Errorf("PRIMARY KEY column %q cannot be NULL", col.Name)
+			}
+		case storage.ForeignKey:
+			if err := validateOneRowConstraint(env, t, row, -1, colIdx, fks); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // tryFastPathAppend opportunistically hands the rows this INSERT statement

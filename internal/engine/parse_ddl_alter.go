@@ -44,37 +44,52 @@ func (p *Parser) parseAlter() (Statement, error) {
 		return nil, p.errf("expected table name")
 	}
 
-	if err := p.expectKeyword("ADD"); err != nil {
-		return nil, err
-	}
-
-	// Optional COLUMN keyword
-	if p.cur.Typ == tKeyword && p.cur.Val == "COLUMN" {
+	switch p.cur.Val {
+	case "ADD":
 		p.next()
-	}
+		// Optional COLUMN keyword
+		if p.cur.Typ == tKeyword && p.cur.Val == "COLUMN" {
+			p.next()
+		}
 
-	// Parse column definition
-	colName := p.parseIdentLike()
-	if colName == "" {
-		return nil, p.errf("expected column name")
-	}
+		// Parse column definition
+		colName := p.parseIdentLike()
+		if colName == "" {
+			return nil, p.errf("expected column name")
+		}
 
-	colType, err := p.parseColumnType()
-	if err != nil {
-		return nil, p.errf("unknown column type")
-	}
+		colType, err := p.parseColumnType()
+		if err != nil {
+			return nil, p.errf("unknown column type")
+		}
 
-	col := storage.Column{
-		Name:         colName,
-		Type:         colType.typ,
-		DeclaredType: colType.declared,
-		Affinity:     colType.affinity,
+		col := storage.Column{
+			Name:         colName,
+			Type:         colType.typ,
+			DeclaredType: colType.declared,
+			Affinity:     colType.affinity,
+		}
+		return &AlterTable{Table: tableName, AddColumn: &col}, nil
+	case "RENAME":
+		p.next()
+		if err := p.expectKeyword("COLUMN"); err != nil {
+			return nil, err
+		}
+		from := p.parseIdentLike()
+		if from == "" {
+			return nil, p.errf("expected existing column name")
+		}
+		if err := p.expectKeyword("TO"); err != nil {
+			return nil, err
+		}
+		to := p.parseIdentLike()
+		if to == "" {
+			return nil, p.errf("expected new column name")
+		}
+		return &AlterTable{Table: tableName, RenameColumnFrom: from, RenameColumnTo: to}, nil
+	default:
+		return nil, p.errf("expected ADD or RENAME after table name")
 	}
-
-	return &AlterTable{
-		Table:     tableName,
-		AddColumn: &col,
-	}, nil
 }
 
 func (p *Parser) parseAlterView() (Statement, error) {
