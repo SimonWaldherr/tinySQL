@@ -598,8 +598,48 @@ func buildRawFilterFuncCall(colIndex map[string]int, ex *FuncCall) func([]any) (
 	switch ex.Name {
 	case "CONTAINS_ALL", "CONTAINS_ANY":
 		return buildRawFilterContains(colIndex, ex)
+	case "FTS_MATCH":
+		return buildRawFilterFTSMatch(colIndex, ex)
 	}
 	return nil
+}
+
+// buildRawFilterFTSMatch specializes the overwhelmingly common simple search
+// shape `FTS_MATCH(text_column, 'term OR term')`. The general FTS evaluator
+// needs a token slice and frequency map because it also supports phrases,
+// prefixes and arbitrary boolean trees. A disjunction of literal terms needs
+// neither: it can stop while scanning the text at the first matching token.
+// More expressive queries deliberately retain the general evaluator.
+func buildRawFilterFTSMatch(colIndex map[string]int, ex *FuncCall) func([]any) (bool, error) {
+	if len(ex.Args) != 2 {
+		return nil
+	}
+	ref, ok := ex.Args[0].(*VarRef)
+	if !ok {
+		return nil
+	}
+	col, ok := colIndex[strings.ToLower(ref.Name)]
+	if !ok {
+		return nil
+	}
+	query, ok := ex.Args[1].(*Literal)
+	if !ok {
+		return nil
+	}
+	queryText, ok := query.Val.(string)
+	if !ok {
+		return nil
+	}
+	terms, ok := ftsLiteralORTerms(parseCachedFTSQuery(queryText))
+	if !ok {
+		return nil
+	}
+	return func(raw []any) (bool, error) {
+		if col >= len(raw) || raw[col] == nil {
+			return false, nil
+		}
+		return ftsAnyLiteralTermMatch(ftsValueToString(raw[col]), terms), nil
+	}
 }
 
 // buildRawFilterContains compiles CONTAINS_ALL/CONTAINS_ANY with literal

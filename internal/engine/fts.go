@@ -696,6 +696,81 @@ func ftsMatchNode(node *ftsQueryNode, freq map[string]int, tokens []string) bool
 	return false
 }
 
+// ftsLiteralORTerms returns the positive leaf terms of a query made solely of
+// TERM nodes joined with OR. That narrow form is common in type-ahead search
+// and can be evaluated without constructing the token-frequency map required
+// by the full FTS query language.
+func ftsLiteralORTerms(node *ftsQueryNode) ([]string, bool) {
+	if node == nil {
+		return nil, false
+	}
+	switch node.op {
+	case "TERM":
+		return []string{node.term}, true
+	case "OR":
+		left, ok := ftsLiteralORTerms(node.left)
+		if !ok {
+			return nil, false
+		}
+		right, ok := ftsLiteralORTerms(node.right)
+		if !ok {
+			return nil, false
+		}
+		return append(left, right...), true
+	default:
+		return nil, false
+	}
+}
+
+// ftsAnyLiteralTermMatch scans the same ASCII-token language as ftsTokenize,
+// but never allocates a token slice or frequency map. The scanner is used only
+// for literal OR queries, where seeing one matching token decides the result.
+// Non-ASCII bytes are delimiters, exactly as ftsTokenize treats non-ASCII
+// runes. Uppercase tokens take the small fallback allocation needed to fold
+// them; typical indexed prose is already lowercase after normalization.
+func ftsAnyLiteralTermMatch(text string, terms []string) bool {
+	for start := 0; start < len(text); {
+		for start < len(text) && !ftsASCIITokenByte(text[start]) {
+			start++
+		}
+		end := start
+		hasUpper := false
+		for end < len(text) && ftsASCIITokenByte(text[end]) {
+			hasUpper = hasUpper || (text[end] >= 'A' && text[end] <= 'Z')
+			end++
+		}
+		if start == end {
+			continue
+		}
+		token := text[start:end]
+		if hasUpper {
+			buf := make([]byte, len(token))
+			for i := range token {
+				c := token[i]
+				if c >= 'A' && c <= 'Z' {
+					c += 'a' - 'A'
+				}
+				buf[i] = c
+			}
+			token = string(buf)
+		}
+		if !ftsStopWords[token] && len(token) > 1 {
+			token = ftsStem(token)
+			for _, term := range terms {
+				if token == term {
+					return true
+				}
+			}
+		}
+		start = end
+	}
+	return false
+}
+
+func ftsASCIITokenByte(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+}
+
 // ftsPhraseMatch checks whether tokens contains phrase as a consecutive subsequence.
 func ftsPhraseMatch(phrase, tokens []string) bool {
 	if len(phrase) > len(tokens) {

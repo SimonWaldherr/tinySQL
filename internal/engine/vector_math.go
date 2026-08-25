@@ -132,16 +132,23 @@ func vectorCosineUnrolled(a, b []float64) (dot, normA2, normB2 float64) {
 // vector_math_arm64.go already applies to vectorL1Kernel — hand-derived SIMD
 // bit patterns that can't be validated on real hardware risk silently
 // corrupting results instead of failing to build — the deliberate choice
-// here is to ship only a portable, well-tested, 4-way-unrolled Go
-// implementation on every architecture (amd64 included), and dispatch it the
-// same way the other metrics dispatch their kernels so a future contributor
-// can drop in a real kernel later without touching call sites.
+// here is to ship a portable scalar Go implementation on every architecture
+// (amd64 included), leaving a real SIMD kernel as a future improvement.
 func vectorHammingDistance(a, b []float64) int {
 	n := len(a)
 	if len(b) < n {
 		n = len(b)
 	}
-	return vectorHammingUnrolled(a[:n], b[:n])
+	// This compact loop consistently outperforms the manually unrolled variant
+	// on current Go toolchains: the separate accumulators add dependency chains
+	// without enabling a useful SIMD reduction for this comparison-heavy work.
+	count := 0
+	for i := 0; i < n; i++ {
+		if (a[i] > 0) != (b[i] > 0) {
+			count++
+		}
+	}
+	return count
 }
 
 func vectorHammingUnrolled(a, b []float64) int {

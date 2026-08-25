@@ -23,6 +23,7 @@ package engine
 
 import (
 	"math/big"
+	"strings"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -47,6 +48,9 @@ func executeSimpleJoinAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, boo
 	rightByKey, err := plan.join.rightRowsByKey()
 	if err != nil {
 		return nil, true, err
+	}
+	if simpleJoinAggregateCountStarOnly(plan) {
+		return executeSimpleJoinCountStarFastPath(env, plan, rightByKey)
 	}
 
 	groups := make(map[string]*simpleAggregateState)
@@ -102,6 +106,101 @@ func executeSimpleJoinAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, boo
 	}
 
 	return simpleAggregateResultSet(plan.projs, plan.outputCols, order), true, nil
+}
+
+// simpleJoinAggregateCountStarOnly identifies the particularly common
+// `SELECT group_col, COUNT(*) ... GROUP BY group_col` shape. A regular
+// simpleAggregateState is deliberately general (it can hold decimal SUM/AVG
+// and MIN/MAX state), but needs five backing slices for each group. COUNT(*)
+// needs only a group value and an integer, so keeping that state compact makes
+// high-cardinality join/group queries substantially lighter on the allocator.
+func simpleJoinAggregateCountStarOnly(plan *simpleJoinAggregatePlan) bool {
+	if len(plan.projs) != 2 {
+		return false
+	}
+	groupCols, countStars := 0, 0
+	for _, proj := range plan.projs {
+		switch proj.kind {
+		case aggGroupCol:
+			groupCols++
+		case aggCount:
+			if proj.arg != nil {
+				return false
+			}
+			countStars++
+		default:
+			return false
+		}
+	}
+	return groupCols == 1 && countStars == 1
+}
+
+type simpleJoinCountState struct {
+	groupValue any
+	count      int
+}
+
+func executeSimpleJoinCountStarFastPath(env ExecEnv, plan *simpleJoinAggregatePlan, rightByKey map[any][][]any) (*ResultSet, bool, error) {
+	// Keep the compact states in one contiguous slice. The map only needs an
+	// index, which avoids one heap object for every distinct group.
+	groups := make(map[string]int)
+	order := make([]simpleJoinCountState, 0)
+	keyBuf := make([]byte, 0, 32)
+	for i, left := range plan.join.left.Rows {
+		if i&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, true, err
+			}
+		}
+		if plan.join.leftFilter != nil {
+			match, err := plan.join.leftFilter(left)
+			if err != nil {
+				return nil, true, err
+			}
+			if !match {
+				continue
+			}
+		}
+		leftKey := left[plan.join.leftKey]
+		if leftKey == nil {
+			continue
+		}
+		for _, right := range rightByKey[comparableKeyPart(leftKey)] {
+			match, err := evalJoinRawWhere(plan.join, left, right)
+			if err != nil {
+				return nil, true, err
+			}
+			if !match {
+				continue
+			}
+			groupValue := left[plan.groupCol]
+			if plan.groupSide == 1 {
+				groupValue = right[plan.groupCol]
+			}
+			keyBuf = writeSingleGroupKey(keyBuf[:0], groupValue)
+			stateIndex, exists := groups[string(keyBuf)]
+			if !exists {
+				stateIndex = len(order)
+				groups[string(keyBuf)] = stateIndex
+				order = append(order, simpleJoinCountState{groupValue: groupValue})
+			}
+			order[stateIndex].count++
+		}
+	}
+
+	rows := make([]Row, 0, len(order))
+	for _, state := range order {
+		row := make(Row, len(plan.projs))
+		for _, proj := range plan.projs {
+			if proj.kind == aggGroupCol {
+				row[strings.ToLower(proj.name)] = state.groupValue
+			} else {
+				row[strings.ToLower(proj.name)] = state.count
+			}
+		}
+		rows = append(rows, row)
+	}
+	return &ResultSet{Cols: plan.outputCols, Rows: rows}, true, nil
 }
 
 // accumulateSimpleJoinAggregateState mirrors accumulateSimpleAggregateState

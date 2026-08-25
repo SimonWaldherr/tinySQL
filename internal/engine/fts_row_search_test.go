@@ -96,6 +96,47 @@ func TestFTSSearchExplicitColumnsStillWork(t *testing.T) {
 	expectInt(t, rs.Rows[0]["id"], 1, "id")
 }
 
+func TestRawFTSMatchLiteralORFilter(t *testing.T) {
+	filter := buildRawFilterFTSMatch(map[string]int{"body": 0}, &FuncCall{
+		Name: "FTS_MATCH",
+		Args: []Expr{
+			&VarRef{Name: "body", Lower: "body"},
+			&Literal{Val: "widget OR database"},
+		},
+	})
+	if filter == nil {
+		t.Fatal("expected a raw literal-OR FTS filter")
+	}
+	for _, tc := range []struct {
+		text string
+		want bool
+	}{
+		{"A WIDGET catalogue", true}, // uppercase folding
+		{"database systems", true},   // ordinary term
+		{"the and of", false},        // stop words do not become matches
+		{"gadget catalogue", false},
+	} {
+		got, err := filter([]any{tc.text})
+		if err != nil {
+			t.Fatalf("filter(%q): %v", tc.text, err)
+		}
+		if got != tc.want {
+			t.Errorf("filter(%q) = %v, want %v", tc.text, got, tc.want)
+		}
+	}
+
+	andFilter := buildRawFilterFTSMatch(map[string]int{"body": 0}, &FuncCall{
+		Name: "FTS_MATCH",
+		Args: []Expr{
+			&VarRef{Name: "body", Lower: "body"},
+			&Literal{Val: "widget AND database"},
+		},
+	})
+	if andFilter != nil {
+		t.Fatal("AND query must retain the full FTS evaluator")
+	}
+}
+
 func TestFTSSearchCacheInvalidatesOnMutation(t *testing.T) {
 	db := storage.NewDB()
 	ctx := context.Background()
