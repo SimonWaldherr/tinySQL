@@ -1444,14 +1444,14 @@ func getFTSDocCache(tenant string, table *storage.Table, cols []int) ftsDocCache
 		if sb.Len() == 0 {
 			continue
 		}
-		tokens := ftsTokenize(sb.String())
-		if len(tokens) == 0 {
-			continue
-		}
-
 		tokenStart := int32(len(docTokenIDs))
 		touched = touched[:0]
-		for _, t := range tokens {
+		tokenCount := 0
+		// Build the cache directly from the streaming tokenizer. ftsTokenize
+		// materializes both a normalized document copy and a []string from
+		// strings.Fields; on a RAG corpus those transient objects dominated
+		// cold-cache memory even though every token is consumed exactly once.
+		ftsForEachToken(sb.String(), func(t string) bool {
 			id, ok := termIDs[t]
 			if !ok {
 				id = int32(len(termIDs))
@@ -1464,6 +1464,11 @@ func getFTSDocCache(tenant string, table *storage.Table, cols []int) ftsDocCache
 			}
 			counts[id]++
 			docTokenIDs = append(docTokenIDs, id)
+			tokenCount++
+			return true
+		})
+		if tokenCount == 0 {
+			continue
 		}
 
 		// Each document's terms are stored as one ascending run so a frequency
@@ -1480,11 +1485,11 @@ func getFTSDocCache(tenant string, table *storage.Table, cols []int) ftsDocCache
 			termStart:  termStart,
 			termCount:  int32(len(touched)),
 			tokenStart: tokenStart,
-			tokenCount: int32(len(tokens)),
-			docLen:     float64(len(tokens)),
+			tokenCount: int32(tokenCount),
+			docLen:     float64(tokenCount),
 			valid:      true,
 		}
-		totalLen += float64(len(tokens))
+		totalLen += float64(tokenCount)
 		numDocs++
 		// The arenas' final size is unknown until every row is tokenized, so
 		// append would grow them by repeated doubling — for a large corpus that
@@ -1872,7 +1877,9 @@ func (f *FTSSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 
 	rows := make([]Row, 0, len(results))
 	for rank, sr := range results {
-		r := make(Row)
+		// FTS_SEARCH feeds every hybrid RAG query. Pre-sizing the full hit row
+		// avoids growing its map repeatedly for wide chunk schemas.
+		r := make(Row, len(table.Cols)+2)
 		for ci, c := range table.Cols {
 			if ci < len(table.Rows[sr.rowIdx]) {
 				r[c.Name] = table.Rows[sr.rowIdx][ci]

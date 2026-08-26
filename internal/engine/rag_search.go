@@ -263,16 +263,22 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 // scores each column it is handed, so naming one twice would double-count its
 // term frequencies against the rest.
 func ragSearchTextColumns(opts *ragSearchOptions) []string {
-	seen := make(map[string]bool, len(opts.TextColumns)+1)
 	out := make([]string, 0, len(opts.TextColumns)+1)
-	for _, col := range append([]string{opts.TextColumn}, opts.TextColumns...) {
+	appendColumn := func(col string) {
 		col = strings.TrimSpace(col)
-		lc := strings.ToLower(col)
-		if col == "" || seen[lc] {
-			continue
+		if col == "" {
+			return
 		}
-		seen[lc] = true
+		for _, existing := range out {
+			if strings.EqualFold(existing, col) {
+				return
+			}
+		}
 		out = append(out, col)
+	}
+	appendColumn(opts.TextColumn)
+	for _, col := range opts.TextColumns {
+		appendColumn(col)
 	}
 	return out
 }
@@ -310,6 +316,27 @@ func ragSearchBaseCols(cols []string, trailing int) []string {
 // values straight out of storage.Table.Rows with no type coercion, so the
 // same underlying row produces an identical key from either pass.
 func ragSearchKey(r Row, keyCols []string) string {
+	// A single scalar primary key is overwhelmingly common. Returning its
+	// formatted value directly skips the Builder backing allocation and copy
+	// for every vector and FTS candidate entering fusion.
+	if len(keyCols) == 1 {
+		v, _ := ragValue(r, keyCols[0])
+		switch t := v.(type) {
+		case string:
+			return t
+		case int:
+			return strconv.Itoa(t)
+		case int64:
+			return strconv.FormatInt(t, 10)
+		case bool:
+			if t {
+				return "true"
+			}
+			return "false"
+		default:
+			return fmt.Sprint(v)
+		}
+	}
 	var b strings.Builder
 	for i, col := range keyCols {
 		if i > 0 {
@@ -388,8 +415,9 @@ func (s ragOrderByScoreAsc) Swap(i, j int) { s.order[i], s.order[j] = s.order[j]
 // placeholder value, to test whether a row was retrieved by a given pass.
 // _rrf_score/_rrf_rank are always present on every output row.
 func ragSearchFuse(vecResult, ftsResult *ResultSet, keyCols []string, rrfK float64) *ResultSet {
-	fused := make(map[string]*ragFusedRow)
-	order := make([]string, 0)
+	candidateCap := len(vecResult.Rows) + len(ftsResult.Rows)
+	fused := make(map[string]*ragFusedRow, candidateCap)
+	order := make([]string, 0, candidateCap)
 
 	// r[c.Name] (VEC_SEARCH/FTS_SEARCH's own row-building convention) is not
 	// guaranteed lower-cased, so every lookup below goes through ragValue
@@ -472,7 +500,7 @@ func ragSearchFuse(vecResult, ftsResult *ResultSet, keyCols []string, rrfK float
 	// reproduces the exact order sort.SliceStable did, without symMerge.
 	sort.Sort(ragOrderByScoreAsc{fused: fused, order: order})
 
-	baseColSet := make(map[string]bool)
+	baseColSet := make(map[string]bool, len(vecBase)+len(ftsBase))
 	baseCols := make([]string, 0, len(vecBase)+len(ftsBase))
 	for _, c := range vecBase {
 		lc := strings.ToLower(c)

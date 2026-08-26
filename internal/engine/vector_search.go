@@ -381,7 +381,10 @@ func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeN
 func buildVecColumnCache(table *storage.Table, colIdx int, includeNorms bool) vecSearchColumnCacheEntry {
 	n := len(table.Rows)
 	valid := make([]bool, n)
-	raw := make([][]float64, n) // scratch: each row's vecRowValue() result, pre-copy
+	// Use the final slice-header array as first-pass scratch, then replace each
+	// entry with its packed destination in pass two. A separate [][]float64
+	// scratch array cost 24 bytes per corpus row during every cold RAG build.
+	vectors := make([][]float64, n)
 	total := 0
 
 	for i, r := range table.Rows {
@@ -393,12 +396,11 @@ func buildVecColumnCache(table *storage.Table, colIdx int, includeNorms bool) ve
 			continue
 		}
 		valid[i] = true
-		raw[i] = vec
+		vectors[i] = vec
 		total += len(vec)
 	}
 
 	data := make([]float64, total)
-	vectors := make([][]float64, n)
 	var norms []float64
 	if includeNorms {
 		norms = make([]float64, n)
@@ -408,7 +410,7 @@ func buildVecColumnCache(table *storage.Table, colIdx int, includeNorms bool) ve
 		if !valid[i] {
 			continue // vectors[i] stays nil (zero value) — identical to before
 		}
-		vec := raw[i]
+		vec := vectors[i]
 		dst := data[cursor : cursor+len(vec) : cursor+len(vec)] // cap==len: append reallocates, never corrupts row i+1
 		copy(dst, vec)
 		vectors[i] = dst
@@ -713,7 +715,9 @@ func (f *VecSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 			continue
 		}
 		rank++
-		r := make(Row)
+		// The complete output width is known. Reserving it avoids repeated map
+		// growth while copying wide RAG source rows into every top-k hit.
+		r := make(Row, len(table.Cols)+3)
 		for ci, c := range table.Cols {
 			if ci < len(table.Rows[sr.rowIdx]) {
 				r[c.Name] = table.Rows[sr.rowIdx][ci]
