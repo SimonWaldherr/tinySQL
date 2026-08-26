@@ -729,6 +729,22 @@ func ftsLiteralORTerms(node *ftsQueryNode) ([]string, bool) {
 // runes. Uppercase tokens take the small fallback allocation needed to fold
 // them; typical indexed prose is already lowercase after normalization.
 func ftsAnyLiteralTermMatch(text string, terms []string) bool {
+	found := false
+	ftsForEachToken(text, func(token string) bool {
+		for _, term := range terms {
+			if token == term {
+				found = true
+				return false
+			}
+		}
+		return true
+	})
+	return found
+}
+
+// ftsForEachToken is the allocation-free streaming sibling of ftsTokenize.
+// visit returns false to stop scanning early.
+func ftsForEachToken(text string, visit func(string) bool) {
 	for start := 0; start < len(text); {
 		for start < len(text) && !ftsASCIITokenByte(text[start]) {
 			start++
@@ -756,19 +772,45 @@ func ftsAnyLiteralTermMatch(text string, terms []string) bool {
 		}
 		if !ftsStopWords[token] && len(token) > 1 {
 			token = ftsStem(token)
-			for _, term := range terms {
-				if token == term {
-					return true
-				}
+			if !visit(token) {
+				return
 			}
 		}
 		start = end
 	}
-	return false
 }
 
 func ftsASCIITokenByte(c byte) bool {
 	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+}
+
+// ftsLiteralTermsRank evaluates the TERM/OR subset of FTS_RANK in one text
+// pass, without a document-wide token slice or frequency map. counts is
+// caller-owned scratch because the compiled ORDER BY scorer is private to one
+// execution and can safely reuse it for every row.
+func ftsLiteralTermsRank(text string, terms []string, counts []int) float64 {
+	clear(counts)
+	ftsForEachToken(text, func(token string) bool {
+		for i, term := range terms {
+			if token == term {
+				counts[i]++
+			}
+		}
+		return true
+	})
+	maxFrequency := 0
+	for _, frequency := range counts {
+		if frequency > maxFrequency {
+			maxFrequency = frequency
+		}
+	}
+	if maxFrequency == 0 {
+		return 0
+	}
+	tf := float64(maxFrequency)
+	// ftsScoreNode with normDocLen=1 and no IDF: the length-normalization
+	// denominator reduces to tf+k1 because (1-b)+b == 1.
+	return (tf * (bm25K1 + 1)) / (tf + bm25K1)
 }
 
 // ftsPhraseMatch checks whether tokens contains phrase as a consecutive subsequence.

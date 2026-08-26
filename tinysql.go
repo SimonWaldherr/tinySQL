@@ -109,6 +109,10 @@ type Row = engine.Row
 // Returned by SELECT queries and available for inspection.
 type ResultSet = engine.ResultSet
 
+// ResultStream exposes query rows incrementally. Call Next and Row in a loop,
+// check Err afterward, and call Close when abandoning the stream early.
+type ResultStream = engine.ResultStream
+
 // VectorCacheConfig configures the optional process-wide VEC_SEARCH result
 // cache and its opt-in analytics ring buffer.
 type VectorCacheConfig = engine.VectorCacheConfig
@@ -787,6 +791,14 @@ func Execute(ctx context.Context, db *DB, tenant string, stmt Statement) (*Resul
 	return engine.Execute(ctx, db, tenant, stmt)
 }
 
+// ExecuteStream starts a parsed statement and returns as soon as its result
+// columns are known. Simple scans yield rows while execution continues;
+// blocking operations such as ORDER BY, GROUP BY and DISTINCT preserve their
+// semantics and begin yielding after materialization.
+func ExecuteStream(ctx context.Context, db *DB, tenant string, stmt Statement) (*ResultStream, error) {
+	return engine.ExecuteStream(ctx, db, tenant, stmt)
+}
+
 // ExecSQL parses and executes exactly one SQL statement. It is the concise
 // public entry point for dynamic SQL, scripts with one statement per call, and
 // small embedded applications. For repeated SQL, prefer Compile or database/sql
@@ -799,6 +811,16 @@ func ExecSQL(ctx context.Context, db *DB, tenant, sql string) (*ResultSet, error
 		return nil, err
 	}
 	return Execute(ctx, db, tenant, stmt)
+}
+
+// ExecSQLStream parses one SQL statement and exposes its result rows
+// incrementally. Call Close if iteration stops before Next returns false.
+func ExecSQLStream(ctx context.Context, db *DB, tenant, sql string) (*ResultStream, error) {
+	stmt, err := ParseSQL(sql)
+	if err != nil {
+		return nil, err
+	}
+	return ExecuteStream(ctx, db, tenant, stmt)
 }
 
 // WithUser returns a context carrying the acting username for RBAC
@@ -847,6 +869,12 @@ func ParsePermission(s string) (Permission, error) {
 // Returns ResultSet for SELECT queries, nil for DDL/DML statements.
 func ExecuteCompiled(ctx context.Context, db *DB, tenant string, compiled *CompiledQuery) (*ResultSet, error) {
 	return compiled.Execute(ctx, db, tenant)
+}
+
+// ExecuteCompiledStream executes a pre-compiled query and exposes rows
+// incrementally where the query shape permits it.
+func ExecuteCompiledStream(ctx context.Context, db *DB, tenant string, compiled *CompiledQuery) (*ResultStream, error) {
+	return compiled.Stream(ctx, db, tenant)
 }
 
 // SQLJobExecutor executes scheduled job SQL against a tinySQL database tenant.

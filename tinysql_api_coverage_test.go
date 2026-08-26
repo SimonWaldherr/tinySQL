@@ -63,6 +63,45 @@ func TestPublicExecSQL(t *testing.T) {
 	}
 }
 
+func TestPublicStreamingSQL(t *testing.T) {
+	db := tsql.NewDB()
+	ctx := context.Background()
+	if _, err := tsql.ExecSQL(ctx, db, "default", `CREATE TABLE stream_api (id INTEGER, name TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tsql.ExecSQL(ctx, db, "default", `INSERT INTO stream_api VALUES (1, 'Ada'), (2, 'Grace')`); err != nil {
+		t.Fatal(err)
+	}
+
+	stream, err := tsql.ExecSQLStream(ctx, db, "default", `SELECT id, name FROM stream_api`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	var names []string
+	for stream.Next() {
+		names = append(names, stream.Row()["name"].(string))
+	}
+	if err := stream.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(names, ","); got != "Ada,Grace" {
+		t.Fatalf("streamed names = %q", got)
+	}
+
+	compiled := tsql.NewQueryCache(4).MustCompile(`SELECT name FROM stream_api`)
+	compiledStream, err := tsql.ExecuteCompiledStream(ctx, db, "default", compiled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !compiledStream.Next() || compiledStream.Row()["name"] != "Ada" {
+		t.Fatalf("compiled stream first row = %#v, err=%v", compiledStream.Row(), compiledStream.Err())
+	}
+	if err := compiledStream.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPublicReaderWriterPersistence(t *testing.T) {
 	db := tsql.NewDB()
 	if _, err := tsql.ExecSQL(context.Background(), db, "default", `CREATE TABLE snapshots (id INTEGER)`); err != nil {

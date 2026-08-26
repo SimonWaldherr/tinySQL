@@ -5,6 +5,7 @@ package engine
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 
@@ -214,6 +215,168 @@ func executeSimpleSelectFloatOrderedTopN(env ExecEnv, plan *simpleSelectPlan, so
 	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, nil
 }
 
+type rawFloatScorer func([]any) (float64, error)
+
+// simpleFloatOrderScorer compiles numeric full-text/vector scoring expressions
+// used by ORDER BY ... LIMIT into an unboxed float64 evaluator. The generic
+// expression path returns `any`, which makes every candidate score escape to
+// the heap even though the bounded top-N heap only needs a number.
+func simpleFloatOrderScorer(plan *simpleSelectPlan) (rawFloatScorer, bool) {
+	if plan == nil || plan.limit == nil || len(plan.orderExprs) != 1 {
+		return nil, false
+	}
+	call, ok := plan.orderExprs[0].(*FuncCall)
+	if !ok || len(call.Args) < 2 {
+		return nil, false
+	}
+	ref, ok := call.Args[0].(*VarRef)
+	if !ok {
+		return nil, false
+	}
+	col, ok := plan.colIndex[strings.ToLower(ref.Name)]
+	if !ok {
+		return nil, false
+	}
+
+	switch call.Name {
+	case "FTS_RANK", "BM25":
+		query, ok := call.Args[1].(*Literal)
+		if !ok {
+			return nil, false
+		}
+		queryText, ok := query.Val.(string)
+		if !ok {
+			return nil, false
+		}
+		node := parseCachedFTSQuery(queryText)
+		terms, supported := ftsLiteralORTerms(node)
+		if !supported {
+			return nil, false
+		}
+		counts := make([]int, len(terms))
+		return func(raw []any) (float64, error) {
+			if col >= len(raw) || raw[col] == nil {
+				return 0, nil
+			}
+			return ftsLiteralTermsRank(ftsValueToString(raw[col]), terms, counts), nil
+		}, true
+
+	case "VEC_DOT", "VEC_COSINE_SIMILARITY", "VEC_COSINE_DISTANCE",
+		"VEC_L2_DISTANCE", "VEC_MANHATTAN_DISTANCE", "VEC_HAMMING_DISTANCE":
+		query, ok := call.Args[1].(*Literal)
+		if !ok {
+			return nil, false
+		}
+		queryVec, ok := query.Val.([]float64)
+		if !ok {
+			return nil, false
+		}
+		name := call.Name
+		var queryPositive []bool
+		if name == "VEC_HAMMING_DISTANCE" {
+			queryPositive = make([]bool, len(queryVec))
+			for i, value := range queryVec {
+				queryPositive[i] = value > 0
+			}
+		}
+		return func(raw []any) (float64, error) {
+			if col >= len(raw) {
+				return 0, fmt.Errorf("column %q is out of range", ref.Name)
+			}
+			vec, err := vecFromValue(raw[col])
+			if err != nil {
+				return 0, fmt.Errorf("%s arg1: %w", name, err)
+			}
+			if len(vec) != len(queryVec) {
+				return 0, fmt.Errorf("%s: dimension mismatch %d vs %d", name, len(vec), len(queryVec))
+			}
+			switch name {
+			case "VEC_DOT":
+				return vectorDot(vec, queryVec), nil
+			case "VEC_COSINE_SIMILARITY", "VEC_COSINE_DISTANCE":
+				sim, err := cosineSimilarity(vec, queryVec)
+				if err != nil {
+					return 0, fmt.Errorf("%s: %w", name, err)
+				}
+				if name == "VEC_COSINE_DISTANCE" {
+					return 1 - sim, nil
+				}
+				return sim, nil
+			case "VEC_L2_DISTANCE":
+				return math.Sqrt(vectorL2Squared(vec, queryVec)), nil
+			case "VEC_MANHATTAN_DISTANCE":
+				return vectorL1Distance(vec, queryVec), nil
+			default:
+				count := 0
+				for i, positive := range queryPositive {
+					if (vec[i] > 0) != positive {
+						count++
+					}
+				}
+				return float64(count), nil
+			}
+		}, true
+	}
+	return nil, false
+}
+
+func executeSimpleSelectFloatScoredTopN(env ExecEnv, plan *simpleSelectPlan, sourceRows [][]any, rowCount, keepCount int, score rawFloatScorer) (*ResultSet, error) {
+	topRows := floatOrderedRawRowHeap{
+		desc:  plan.orderBy[0].Desc,
+		items: make([]floatOrderedRawRow, 0, simpleSelectInitialCap(plan)),
+	}
+	for i := 0; i < rowCount; i++ {
+		rowID := i
+		if plan.rowIDs != nil {
+			rowID = plan.rowIDs[i]
+		}
+		if rowID < 0 || rowID >= len(sourceRows) {
+			return nil, fmt.Errorf("index %q returned invalid row id %d", plan.indexName, rowID)
+		}
+		raw := sourceRows[rowID]
+		if i&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, err
+			}
+		}
+		match, err := evalRawWhere(plan, raw)
+		if err != nil {
+			return nil, err
+		}
+		if !match {
+			continue
+		}
+		key, err := score(raw)
+		if err != nil {
+			return nil, err
+		}
+		topRows.pushBounded(floatOrderedRawRow{raw: raw, key: key}, keepCount)
+	}
+
+	rows := topRows.items
+	sort.Stable(floatOrderedRawRowsAsc{desc: topRows.desc, items: rows})
+	start := 0
+	if plan.offset != nil && *plan.offset > 0 {
+		start = *plan.offset
+	}
+	if start > len(rows) {
+		return &ResultSet{Cols: plan.outputCols, Rows: []Row{}}, nil
+	}
+	rows = rows[start:]
+	if *plan.limit < len(rows) {
+		rows = rows[:*plan.limit]
+	}
+	outRows := make([]Row, 0, len(rows))
+	for _, item := range rows {
+		out, err := projectRawRow(plan, item.raw)
+		if err != nil {
+			return nil, err
+		}
+		outRows = append(outRows, out)
+	}
+	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, nil
+}
+
 type floatOrderedRawRowHeap struct {
 	desc  bool
 	items []floatOrderedRawRow
@@ -325,6 +488,10 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 		if keepCount > rowCount {
 			keepCount = rowCount
 		}
+	}
+	if scorer, ok := simpleFloatOrderScorer(plan); ok && keepCount > 0 {
+		rs, err := executeSimpleSelectFloatScoredTopN(env, plan, sourceRows, rowCount, keepCount, scorer)
+		return rs, true, err
 	}
 	if column, ok := simpleFloatOrderColumn(plan); ok {
 		// Verify storage values before entering the unboxed path. SQL INSERT

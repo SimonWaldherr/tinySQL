@@ -49,6 +49,13 @@ func toVec(env ExecEnv, expr Expr, row Row) ([]float64, error) {
 	if err != nil {
 		return nil, err
 	}
+	return vecFromValue(v)
+}
+
+// vecFromValue is toVec after expression evaluation. Raw execution paths use
+// it to preserve the public conversion semantics without wrapping an already
+// available stored value back into a synthetic Literal expression.
+func vecFromValue(v any) ([]float64, error) {
 	switch x := v.(type) {
 	case []float64:
 		return x, nil

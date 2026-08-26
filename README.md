@@ -82,6 +82,27 @@ func main() {
 }
 ```
 
+For large scans, `ExecSQLStream` exposes rows while the query is still
+running instead of materializing the complete result first:
+
+```go
+stream, err := tinysql.ExecSQLStream(ctx, db, "default",
+	`SELECT id, name FROM users WHERE active = true`)
+if err != nil { panic(err) }
+defer stream.Close() // important when iteration stops early
+
+for stream.Next() {
+	row := stream.Row()
+	fmt.Println(row["id"], row["name"])
+}
+if err := stream.Err(); err != nil { panic(err) }
+```
+
+Simple table scans, filters, projections, index seeks, and `LIMIT`/`OFFSET`
+stream incrementally. Operations that require the complete input—such as
+`ORDER BY`, `GROUP BY`, `DISTINCT`, joins, and set operations—preserve exact
+SQL semantics and start yielding after their result has been materialized.
+
 For applications that already use `database/sql`, use
 [`github.com/SimonWaldherr/tinySQL/driver`](./driver).
 

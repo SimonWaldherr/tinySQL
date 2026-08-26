@@ -137,6 +137,33 @@ func TestRawFTSMatchLiteralORFilter(t *testing.T) {
 	}
 }
 
+func TestLiteralORRankFastPathMatchesGeneralEvaluator(t *testing.T) {
+	const query = "widget OR database OR systems"
+	terms, ok := ftsLiteralORTerms(parseCachedFTSQuery(query))
+	if !ok {
+		t.Fatal("expected literal OR terms")
+	}
+	counts := make([]int, len(terms))
+	for _, text := range []string{
+		"",
+		"unrelated words",
+		"WIDGET widget catalogue",
+		"database systems database database",
+	} {
+		fast := ftsLiteralTermsRank(text, terms, counts)
+		general, err := evalFTSRank(ExecEnv{}, &FuncCall{Args: []Expr{
+			&Literal{Val: text},
+			&Literal{Val: query},
+		}}, Row{})
+		if err != nil {
+			t.Fatalf("general FTS_RANK(%q): %v", text, err)
+		}
+		if math.Abs(fast-general.(float64)) > 1e-12 {
+			t.Errorf("FTS_RANK(%q): fast=%v general=%v", text, fast, general)
+		}
+	}
+}
+
 func TestFTSSearchCacheInvalidatesOnMutation(t *testing.T) {
 	db := storage.NewDB()
 	ctx := context.Background()
