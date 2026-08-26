@@ -110,8 +110,9 @@ func (db *DB) Sync() error {
 		dc, hasDirtyTracker := db.backend.(dirtyTracker)
 
 		type entry struct {
-			tenant string
-			table  *Table
+			tenant        string
+			table         *Table
+			ftsGeneration int
 		}
 		var toSave []entry
 		seen := make(map[string]bool) // tenant\x00lower(table name)
@@ -120,10 +121,11 @@ func (db *DB) Sync() error {
 		for tn, tdb := range db.tenants {
 			for _, t := range tdb.tables {
 				seen[tn+"\x00"+strings.ToLower(t.Name)] = true
-				if hasDirtyTracker && !dc.IsDirty(tn, t.Name, t.Version) {
+				generation, ftsDirty := t.FTSIndexesPersistenceState()
+				if hasDirtyTracker && !dc.IsDirty(tn, t.Name, t.Version) && !ftsDirty {
 					continue
 				}
-				toSave = append(toSave, entry{tn, t})
+				toSave = append(toSave, entry{tenant: tn, table: t, ftsGeneration: generation})
 			}
 		}
 		db.mu.RUnlock()
@@ -138,10 +140,11 @@ func (db *DB) Sync() error {
 					continue
 				}
 				seen[key] = true
-				if hasDirtyTracker && !dc.IsDirty(ref.Tenant, ref.Table.Name, ref.Table.Version) {
+				generation, ftsDirty := ref.Table.FTSIndexesPersistenceState()
+				if hasDirtyTracker && !dc.IsDirty(ref.Tenant, ref.Table.Name, ref.Table.Version) && !ftsDirty {
 					continue
 				}
-				toSave = append(toSave, entry{ref.Tenant, ref.Table})
+				toSave = append(toSave, entry{tenant: ref.Tenant, table: ref.Table, ftsGeneration: generation})
 			}
 		}
 
@@ -149,6 +152,7 @@ func (db *DB) Sync() error {
 			if err := db.backend.SaveTable(e.tenant, e.table); err != nil {
 				return db.markError(err)
 			}
+			e.table.MarkFTSIndexesPersisted(e.ftsGeneration)
 		}
 	}
 
@@ -286,7 +290,12 @@ func (db *DB) SyncTable(tenant string, t *Table) error {
 	if db.backend == nil {
 		return nil
 	}
-	return db.backend.SaveTable(tenant, t)
+	generation, _ := t.FTSIndexesPersistenceState()
+	if err := db.backend.SaveTable(tenant, t); err != nil {
+		return err
+	}
+	t.MarkFTSIndexesPersisted(generation)
+	return nil
 }
 
 // BackendStats returns statistics from the storage backend. Returns a

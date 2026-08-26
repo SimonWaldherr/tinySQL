@@ -280,12 +280,12 @@ func ftsScanRange(ctx context.Context, cache ftsDocCacheEntry, node *ftsQueryNod
 			}
 		}
 		doc := cache.docs[ri]
-		if !doc.valid {
+		if !doc.Valid {
 			continue
 		}
-		normDocLen := doc.docLen
+		normDocLen := doc.DocLen
 		if cache.avgDocLen > 0 {
-			normDocLen = doc.docLen / cache.avgDocLen
+			normDocLen = doc.DocLen / cache.avgDocLen
 		}
 		if node == nil {
 			// A nil query tree previously bypassed the match check and scored

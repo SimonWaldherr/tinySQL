@@ -647,26 +647,30 @@ func (f *VecSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 	if err != nil {
 		return nil, err
 	}
+	table, scoredRowsOrdered, err := vecSearchCandidates(ctx, env, a)
+	if err != nil {
+		return nil, err
+	}
+	return materializeVecCandidates(table, scoredRowsOrdered, a.metric), nil
+}
 
+// vecSearchCandidates executes only the ranking phase. Keeping row IDs and
+// distances compact lets RAG_SEARCH fuse candidate sets before copying any
+// source columns; the public VEC_SEARCH function materializes them afterward.
+func vecSearchCandidates(ctx context.Context, env ExecEnv, a vecSearchArgs) (*storage.Table, []vecScoredRow, error) {
 	tenant := env.tenant
 	if tenant == "" {
 		tenant = "default"
 	}
 	table, err := env.db.Get(tenant, a.tableName)
 	if err != nil {
-		return nil, fmt.Errorf("VEC_SEARCH: table %q not found: %w", a.tableName, err)
+		return nil, nil, fmt.Errorf("VEC_SEARCH: table %q not found: %w", a.tableName, err)
 	}
 
 	vecColIdx, err := table.ColIndex(a.colName)
 	if err != nil {
-		return nil, fmt.Errorf("VEC_SEARCH: %w", err)
+		return nil, nil, fmt.Errorf("VEC_SEARCH: %w", err)
 	}
-
-	resultCols := make([]string, 0, len(table.Cols)+2)
-	for _, c := range table.Cols {
-		resultCols = append(resultCols, c.Name)
-	}
-	resultCols = append(resultCols, "_vec_distance", "_vec_similarity", "_vec_rank")
 
 	queryLen := len(a.queryVec)
 	var queryNorm float64
@@ -697,14 +701,22 @@ func (f *VecSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 		distFn := buildVecDistanceFunc(a.metric, a.queryVec, queryNorm, cache)
 		scoredRowsOrdered, err = vecSearchTopKWithIndex(searchCtx, tenant, table, vecColIdx, a, queryLen, queryNorm, cache, distFn)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if cacheEnabled {
 			putVecQueryCache(key, scoredRowsOrdered)
 		}
 	}
 	recordVecQuery(VectorQueryEvent{At: time.Now(), Table: table.Name, Column: a.colName, Metric: a.metric, Index: a.indexMode, K: a.k, CacheHit: cacheHit, Duration: time.Since(started)})
+	return table, scoredRowsOrdered, nil
+}
 
+func materializeVecCandidates(table *storage.Table, scoredRowsOrdered []vecScoredRow, metric string) *ResultSet {
+	resultCols := make([]string, 0, len(table.Cols)+3)
+	for _, c := range table.Cols {
+		resultCols = append(resultCols, c.Name)
+	}
+	resultCols = append(resultCols, "_vec_distance", "_vec_similarity", "_vec_rank")
 	resultRows := make([]Row, 0, len(scoredRowsOrdered))
 	rank := 0
 	for _, sr := range scoredRowsOrdered {
@@ -724,7 +736,7 @@ func (f *VecSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 			}
 		}
 		r["_vec_distance"] = sr.distance
-		r["_vec_similarity"] = vecSimilarityFromDistance(a.metric, sr.distance)
+		r["_vec_similarity"] = vecSimilarityFromDistance(metric, sr.distance)
 		r["_vec_rank"] = rank
 		resultRows = append(resultRows, r)
 	}
@@ -732,7 +744,7 @@ func (f *VecSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 	return &ResultSet{
 		Cols: resultCols,
 		Rows: resultRows,
-	}, nil
+	}
 }
 
 // vecSimilarityFromDistance converts a VEC_SEARCH distance (lower = closer)

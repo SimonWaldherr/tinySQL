@@ -19,9 +19,21 @@ type Table struct {
 	// lower-case SQL index name. Unlike catalog metadata these entries are
 	// used by the executor and persisted with table snapshots.
 	Indexes map[string]*SecondaryIndex
-	IsTemp  bool
-	colPos  map[string]int
-	Version int
+	// FTSIndexes contains persisted, executor-built full-text indexes keyed by
+	// the searched column positions (for example "1,2"). They are derived
+	// from Rows, but unlike the process-local hot cache they survive database
+	// reopen. Version and StructVersion let the executor either reuse an index,
+	// extend it for append-only INSERTs, or rebuild it after UPDATE/DELETE/DDL.
+	FTSIndexes map[string]*FTSIndex
+	// ftsGeneration changes when a lazy FTS build changes persisted metadata;
+	// ftsPersistedGeneration records the generation most recently flushed.
+	// This is deliberately separate from Version: a SELECT may build an index
+	// and must become durable without pretending the table's SQL data changed.
+	ftsGeneration          int
+	ftsPersistedGeneration int
+	IsTemp                 bool
+	colPos                 map[string]int
+	Version                int
 	// Stats is populated by ANALYZE and persisted with the table. DML marks it
 	// stale rather than trying to estimate distinct values incrementally.
 	Stats *TableStats
@@ -82,6 +94,35 @@ type Table struct {
 	derived   any
 }
 
+// FTSDocument is the compact per-row directory for a persisted FTS index.
+// The offsets address the index's contiguous term/frequency/token arenas.
+type FTSDocument struct {
+	TermStart  int32
+	TermCount  int32
+	TokenStart int32
+	TokenCount int32
+	DocLen     float64
+	Valid      bool
+}
+
+// FTSIndex is the backend-neutral persisted representation of the BM25
+// document index used by FTS_SEARCH. Format allows future encoding changes.
+type FTSIndex struct {
+	Format        int
+	Version       int
+	StructVersion int
+	BuiltRows     int
+	Docs          []FTSDocument
+	AvgDocLen     float64
+	TotalDocLen   float64
+	Postings      map[string][]int32
+	NumDocs       int
+	TermIDs       map[string]int32
+	DocTermIDs    []int32
+	DocTermCounts []int32
+	DocTokenIDs   []int32
+}
+
 // DerivedCloner is implemented by derived state (see the field above) that
 // knows how to produce an independent copy of itself. cloneTable checks for
 // it via a type assertion so storage never has to know the concrete type
@@ -119,6 +160,40 @@ func (t *Table) Derived() any { return t.derived }
 // SetDerived stores executor state on this table; nil discards it. The caller
 // must hold DerivedLock.
 func (t *Table) SetDerived(v any) { t.derived = v }
+
+// MarkFTSIndexesChanged records a persist-relevant FTS metadata change. The
+// caller must hold DerivedLock, matching direct access to FTSIndexes.
+func (t *Table) MarkFTSIndexesChanged() { t.ftsGeneration++ }
+
+// FTSIndexesPersistenceState atomically returns the current FTS generation
+// and whether it has been flushed to the storage backend.
+func (t *Table) FTSIndexesPersistenceState() (generation int, dirty bool) {
+	t.DerivedLock()
+	generation = t.ftsGeneration
+	dirty = generation != t.ftsPersistedGeneration
+	t.DerivedUnlock()
+	return generation, dirty
+}
+
+// MarkFTSIndexesPersisted marks generation durable unless a newer FTS build
+// completed while the backend was saving the older snapshot.
+func (t *Table) MarkFTSIndexesPersisted(generation int) {
+	t.DerivedLock()
+	if generation > t.ftsPersistedGeneration && generation <= t.ftsGeneration {
+		t.ftsPersistedGeneration = generation
+	}
+	t.DerivedUnlock()
+}
+
+// snapshotFTSIndexes takes a backend-safe deep copy. FTS indexes may be built
+// by concurrent SELECTs, so persistence cannot read their maps and arenas
+// without the per-table derived lock.
+func (t *Table) snapshotFTSIndexes() map[string]*FTSIndex {
+	t.DerivedLock()
+	indexes := cloneFTSIndexes(t.FTSIndexes)
+	t.DerivedUnlock()
+	return indexes
+}
 
 // dropDerived discards this table's executor state without the caller having
 // to take the lock itself. Every storage-side path that replaces rows behind
@@ -169,7 +244,7 @@ func NewTable(name string, cols []Column, isTemp bool) *Table {
 	for i, c := range cols {
 		pos[strings.ToLower(c.Name)] = i
 	}
-	return &Table{Name: name, Cols: cols, colPos: pos, IsTemp: isTemp, dirtyFrom: -1, Indexes: make(map[string]*SecondaryIndex)}
+	return &Table{Name: name, Cols: cols, colPos: pos, IsTemp: isTemp, dirtyFrom: -1, Indexes: make(map[string]*SecondaryIndex), FTSIndexes: make(map[string]*FTSIndex)}
 }
 
 // Analyze computes exact cardinality, null and simple range summaries for the

@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -169,6 +170,12 @@ func (b *PagedIndexBackend) LoadTable(tenant, name string) (*Table, error) {
 	t := NewTable(td.Name, pagerColumnsToStorage(td.Columns), td.IsTemp)
 	t.Rows = td.Rows
 	t.Version = td.Version
+	t.structVersion = td.StructVersion
+	if len(td.FTSIndexes) > 0 {
+		if err := json.Unmarshal(td.FTSIndexes, &t.FTSIndexes); err != nil {
+			return nil, fmt.Errorf("decode paged FTS indexes for %s.%s: %w", tenant, name, err)
+		}
+	}
 	for _, index := range td.Indexes {
 		if err := t.CreateSecondaryIndex(index.Name, index.Columns, index.Unique); err != nil {
 			return nil, fmt.Errorf("rebuild paged index %s: %w", index.Name, err)
@@ -197,13 +204,19 @@ func (b *PagedIndexBackend) saveToPager(tenant string, t *Table) error {
 	if b.IsReadOnly() {
 		return ErrReadOnlyStorage
 	}
+	ftsIndexes, err := json.Marshal(t.snapshotFTSIndexes())
+	if err != nil {
+		return fmt.Errorf("encode paged FTS indexes for %s.%s: %w", tenant, t.Name, err)
+	}
 	td := &pager.TableData{
-		Name:    t.Name,
-		Columns: storageColumnsToPager(t.Cols),
-		Rows:    t.Rows,
-		IsTemp:  t.IsTemp,
-		Version: t.Version,
-		Indexes: make([]pager.IndexInfo, 0, len(t.Indexes)),
+		Name:          t.Name,
+		Columns:       storageColumnsToPager(t.Cols),
+		Rows:          t.Rows,
+		IsTemp:        t.IsTemp,
+		Version:       t.Version,
+		StructVersion: t.structVersion,
+		FTSIndexes:    ftsIndexes,
+		Indexes:       make([]pager.IndexInfo, 0, len(t.Indexes)),
 	}
 	for _, index := range t.Indexes {
 		// This Entries slice becomes the physical B+Tree index pages the
@@ -397,6 +410,10 @@ func (b *PagedIndexBackend) IndexMetadata(tenant, name string) (*Table, error) {
 	}
 	t := NewTable(entry.Table, pagerCatalogColumnsToStorage(entry.Columns), false)
 	t.Version = entry.Version
+	t.structVersion = entry.StructVersion
+	if len(entry.FTSIndexes) > 0 {
+		_ = json.Unmarshal(entry.FTSIndexes, &t.FTSIndexes)
+	}
 	for _, index := range entry.Indexes {
 		t.Indexes[strings.ToLower(index.Name)] = &SecondaryIndex{
 			Name:    index.Name,

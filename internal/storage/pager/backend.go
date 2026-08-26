@@ -148,12 +148,14 @@ type ColumnInfo struct {
 // TableData is the pager-level representation of a table. Higher layers
 // convert between TableData and storage.Table.
 type TableData struct {
-	Name    string
-	Columns []ColumnInfo
-	Rows    [][]any
-	Indexes []IndexInfo
-	IsTemp  bool
-	Version int
+	Name          string
+	Columns       []ColumnInfo
+	Rows          [][]any
+	Indexes       []IndexInfo
+	IsTemp        bool
+	Version       int
+	StructVersion int
+	FTSIndexes    []byte
 }
 
 // LoadTable retrieves all rows of a table from its B+Tree.
@@ -187,11 +189,13 @@ func (pb *PageBackend) LoadTable(tenant, name string) (*TableData, error) {
 	}
 
 	return &TableData{
-		Name:    entry.Table,
-		Columns: catalogToColumns(entry.Columns),
-		Rows:    rows,
-		Indexes: cloneIndexInfos(entry.Indexes),
-		Version: entry.Version,
+		Name:          entry.Table,
+		Columns:       catalogToColumns(entry.Columns),
+		Rows:          rows,
+		Indexes:       cloneIndexInfos(entry.Indexes),
+		Version:       entry.Version,
+		StructVersion: entry.StructVersion,
+		FTSIndexes:    append([]byte(nil), entry.FTSIndexes...),
 	}, nil
 }
 
@@ -306,13 +310,15 @@ func (pb *PageBackend) SaveTable(tenant string, td *TableData) error {
 		version = existingEntry.Version + 1
 	}
 	catEntry := CatalogEntry{
-		Tenant:     tenant,
-		Table:      td.Name,
-		RootPageID: bt.Root(),
-		Columns:    columnsToCatalog(td.Columns),
-		Indexes:    indexes,
-		RowCount:   int64(len(td.Rows)),
-		Version:    version,
+		Tenant:        tenant,
+		Table:         td.Name,
+		RootPageID:    bt.Root(),
+		Columns:       columnsToCatalog(td.Columns),
+		Indexes:       indexes,
+		RowCount:      int64(len(td.Rows)),
+		Version:       version,
+		StructVersion: td.StructVersion,
+		FTSIndexes:    append([]byte(nil), td.FTSIndexes...),
 	}
 	if err := pb.catalog.PutEntry(txID, catEntry); err != nil {
 		_ = pb.pager.AbortTx(txID)

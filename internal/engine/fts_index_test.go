@@ -56,16 +56,16 @@ func ftsReferenceTopK(table *storage.Table, cols []int, cache ftsDocCacheEntry, 
 	idf := ftsIDFLookup(cache)
 	heapRows := make(ftsScoredHeap, 0, k)
 	for ri, doc := range cache.docs {
-		if !doc.valid {
+		if !doc.Valid {
 			continue
 		}
 		freq, tokens := ftsDocStrings(table, cols, ri)
 		if node != nil && !ftsMatchNode(node, freq, tokens) {
 			continue
 		}
-		normDocLen := doc.docLen
+		normDocLen := doc.DocLen
 		if cache.avgDocLen > 0 {
-			normDocLen = doc.docLen / cache.avgDocLen
+			normDocLen = doc.DocLen / cache.avgDocLen
 		}
 		ftsPushTopK(&heapRows, ri, ftsScoreNode(node, freq, normDocLen, idf), k)
 	}
@@ -327,7 +327,7 @@ func TestFTSCandidatesAreSuperset(t *testing.T) {
 		}
 		missing := 0
 		for ri, doc := range cache.docs {
-			if !doc.valid {
+			if !doc.Valid {
 				continue
 			}
 			freq, tokens := ftsDocStrings(table, []int{textIdx}, ri)
@@ -379,12 +379,12 @@ func TestFTSExpandedScoringMatchesPatternScoring(t *testing.T) {
 
 			compared := 0
 			for ri, doc := range cache.docs {
-				if !doc.valid {
+				if !doc.Valid {
 					continue
 				}
-				normDocLen := doc.docLen
+				normDocLen := doc.DocLen
 				if cache.avgDocLen > 0 {
-					normDocLen = doc.docLen / cache.avgDocLen
+					normDocLen = doc.DocLen / cache.avgDocLen
 				}
 				freq, tokens := ftsDocStrings(table, []int{textIdx}, ri)
 				wantMatch := ftsMatchNode(original, freq, tokens)
@@ -584,7 +584,7 @@ func TestFTSPostingsMatchDocumentFrequency(t *testing.T) {
 		}
 		fromText, fromRuns := 0, 0
 		for ri, doc := range cache.docs {
-			if !doc.valid {
+			if !doc.Valid {
 				continue
 			}
 			freq, _ := ftsDocStrings(table, []int{bodyIdx}, ri)

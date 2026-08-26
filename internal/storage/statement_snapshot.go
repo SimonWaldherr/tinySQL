@@ -560,9 +560,13 @@ func restoreTable(dst, saved *Table) {
 	dst.Cols = copy.Cols
 	dst.Rows = copy.Rows
 	dst.Indexes = copy.Indexes
+	dst.FTSIndexes = copy.FTSIndexes
+	dst.ftsGeneration = copy.ftsGeneration
+	dst.ftsPersistedGeneration = copy.ftsPersistedGeneration
 	dst.IsTemp = copy.IsTemp
 	dst.colPos = copy.colPos
 	dst.Version = copy.Version
+	dst.structVersion = copy.structVersion
 	dst.Stats = copy.Stats
 	dst.dirtyFrom = copy.dirtyFrom
 	dst.dirtyRows = copy.dirtyRows

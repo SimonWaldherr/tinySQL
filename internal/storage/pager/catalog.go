@@ -21,13 +21,15 @@ import (
 
 // CatalogEntry is the value stored in the system catalog B+Tree.
 type CatalogEntry struct {
-	Tenant     string          `json:"tenant"`
-	Table      string          `json:"table"`
-	RootPageID PageID          `json:"root_page_id"`
-	Columns    []CatalogColumn `json:"columns"`
-	Indexes    []IndexInfo     `json:"indexes,omitempty"`
-	RowCount   int64           `json:"row_count"`
-	Version    int             `json:"version"`
+	Tenant        string          `json:"tenant"`
+	Table         string          `json:"table"`
+	RootPageID    PageID          `json:"root_page_id"`
+	Columns       []CatalogColumn `json:"columns"`
+	Indexes       []IndexInfo     `json:"indexes,omitempty"`
+	RowCount      int64           `json:"row_count"`
+	Version       int             `json:"version"`
+	StructVersion int             `json:"struct_version,omitempty"`
+	FTSIndexes    []byte          `json:"fts_indexes,omitempty"`
 }
 
 // IndexInfo identifies one persistent secondary-index B+Tree. Entries are

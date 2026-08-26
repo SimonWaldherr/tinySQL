@@ -27,6 +27,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 // ragSearchOptions is the optional 5th-argument JSON payload for RAG_SEARCH.
@@ -132,24 +134,21 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 	textColumns := ragSearchTextColumns(&opts)
 	hybrid := len(textColumns) > 0 && opts.TextQuery != ""
 
-	// ---- Vector pass arguments (built up front: no dependency on either
-	// pass's result) ----------------------------------------------------
-	vecArgs := []Expr{
-		&Literal{Val: vecArgsParsed.tableName},
-		&Literal{Val: vecArgsParsed.colName},
-		&Literal{Val: vecArgsParsed.queryVec},
-		&Literal{Val: candidateK},
-		&Literal{Val: metric},
-		&Literal{Val: index},
-	}
+	searchArgs := vecArgsParsed
+	searchArgs.k = candidateK
+	searchArgs.metric = metric
+	searchArgs.indexMode = index
 
 	var result *ResultSet
 	if !hybrid {
-		vecResult, err := (&VecSearchTableFunc{}).Execute(ctx, vecArgs, env, row)
+		table, candidates, err := vecSearchCandidates(ctx, env, searchArgs)
 		if err != nil {
 			return nil, fmt.Errorf("RAG_SEARCH: vector pass: %w", err)
 		}
-		result = ragSearchTruncate(vecResult, k)
+		if len(candidates) > k {
+			candidates = candidates[:k]
+		}
+		result = materializeVecCandidates(table, candidates, metric)
 	} else {
 		if len(opts.KeyColumns) == 0 {
 			return nil, fmt.Errorf("RAG_SEARCH: key_columns is required for hybrid text+vector search")
@@ -164,13 +163,21 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 			ftsQuery = ftsAutoOrExpand(ftsQuery)
 		}
 
-		ftsArgs := []Expr{
-			&Literal{Val: vecArgsParsed.tableName},
-			&Literal{Val: ftsQuery},
-			&Literal{Val: candidateK},
+		tenant := env.tenant
+		if tenant == "" {
+			tenant = "default"
 		}
+		table, err := env.db.Get(tenant, vecArgsParsed.tableName)
+		if err != nil {
+			return nil, fmt.Errorf("RAG_SEARCH: table %q not found: %w", vecArgsParsed.tableName, err)
+		}
+		searchCols := make([]int, 0, len(textColumns))
 		for _, col := range textColumns {
-			ftsArgs = append(ftsArgs, &Literal{Val: col})
+			idx, err := table.ColIndex(col)
+			if err != nil {
+				return nil, fmt.Errorf("RAG_SEARCH: text column %q: %w", col, err)
+			}
+			searchCols = append(searchCols, idx)
 		}
 
 		// The vector pass and the FTS pass are independent reads with no
@@ -202,18 +209,20 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 		// therefore cannot run concurrently with the read-locked SELECT that
 		// reaches this function.
 		var (
-			wg                   sync.WaitGroup
-			vecResult, ftsResult *ResultSet
-			vecErr, ftsErr       error
+			wg             sync.WaitGroup
+			vecTable       *storage.Table
+			vecCandidates  []vecScoredRow
+			ftsCandidates  []ftsScored
+			vecErr, ftsErr error
 		)
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			vecResult, vecErr = (&VecSearchTableFunc{}).Execute(ctx, vecArgs, env, row)
+			vecTable, vecCandidates, vecErr = vecSearchCandidates(ctx, env, searchArgs)
 		}()
 		go func() {
 			defer wg.Done()
-			ftsResult, ftsErr = (&FTSSearchTableFunc{}).Execute(ctx, ftsArgs, env, row)
+			ftsCandidates, ftsErr = ftsSearchCandidates(ctx, tenant, table, ftsQuery, candidateK, searchCols)
 		}()
 		wg.Wait()
 
@@ -226,13 +235,15 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 		if ftsErr != nil {
 			return nil, fmt.Errorf("RAG_SEARCH: text pass: %w", ftsErr)
 		}
+		if vecTable != table {
+			return nil, fmt.Errorf("RAG_SEARCH: source table changed during retrieval")
+		}
 
 		rrfK := opts.RRFK
 		if rrfK <= 0 {
 			rrfK = ragSearchDefaultRRFK
 		}
-		fused := ragSearchFuse(vecResult, ftsResult, opts.KeyColumns, rrfK)
-		result = ragSearchTruncate(fused, k)
+		result = ragFuseCandidates(table, vecCandidates, ftsCandidates, metric, rrfK, k)
 	}
 
 	// ---- Optional neighbor-context expansion --------------------------
@@ -382,6 +393,101 @@ type ragFusedRow struct {
 	ftsRank  int // 0 = not present in the FTS candidate set
 	order    int // first-seen order, used as a deterministic sort tie-break
 	rrfScore float64
+}
+
+// ragNativeCandidate is the compact common currency of hybrid retrieval.
+// Both search branches address the same immutable table snapshot, so the
+// physical row index is a lossless identity and avoids materializing rows or
+// formatting composite keys before reciprocal-rank fusion.
+type ragNativeCandidate struct {
+	rowIdx   int
+	vecRank  int
+	ftsRank  int
+	distance float64
+	ftsScore float64
+	order    int
+	rrfScore float64
+}
+
+type ragNativeCandidates []*ragNativeCandidate
+
+func (s ragNativeCandidates) Len() int { return len(s) }
+func (s ragNativeCandidates) Less(i, j int) bool {
+	if s[i].rrfScore != s[j].rrfScore {
+		return s[i].rrfScore > s[j].rrfScore
+	}
+	return s[i].order < s[j].order
+}
+func (s ragNativeCandidates) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+
+func ragFuseCandidates(table *storage.Table, vecRows []vecScoredRow, ftsRows []ftsScored, metric string, rrfK float64, k int) *ResultSet {
+	byRow := make(map[int]*ragNativeCandidate, len(vecRows)+len(ftsRows))
+	ordered := make(ragNativeCandidates, 0, len(vecRows)+len(ftsRows))
+	for rank, candidate := range vecRows {
+		if candidate.rowIdx < 0 || candidate.rowIdx >= len(table.Rows) {
+			continue
+		}
+		entry := &ragNativeCandidate{
+			rowIdx: candidate.rowIdx, vecRank: rank + 1,
+			distance: candidate.distance, order: len(ordered),
+		}
+		byRow[candidate.rowIdx] = entry
+		ordered = append(ordered, entry)
+	}
+	for rank, candidate := range ftsRows {
+		if candidate.rowIdx < 0 || candidate.rowIdx >= len(table.Rows) {
+			continue
+		}
+		entry := byRow[candidate.rowIdx]
+		if entry == nil {
+			entry = &ragNativeCandidate{rowIdx: candidate.rowIdx, order: len(ordered)}
+			byRow[candidate.rowIdx] = entry
+			ordered = append(ordered, entry)
+		}
+		entry.ftsRank = rank + 1
+		entry.ftsScore = candidate.score
+	}
+	for _, candidate := range ordered {
+		if candidate.vecRank > 0 {
+			candidate.rrfScore += 1.0 / (rrfK + float64(candidate.vecRank))
+		}
+		if candidate.ftsRank > 0 {
+			candidate.rrfScore += 1.0 / (rrfK + float64(candidate.ftsRank))
+		}
+	}
+	sort.Sort(ordered)
+	if k < len(ordered) {
+		ordered = ordered[:k]
+	}
+
+	cols := make([]string, 0, len(table.Cols)+7)
+	for _, column := range table.Cols {
+		cols = append(cols, column.Name)
+	}
+	cols = append(cols, "_vec_rank", "_vec_distance", "_vec_similarity", "_fts_rank", "_fts_score", "_rrf_score", "_rrf_rank")
+	rows := make([]Row, 0, len(ordered))
+	for rank, candidate := range ordered {
+		source := table.Rows[candidate.rowIdx]
+		row := make(Row, len(cols))
+		for columnIndex, column := range table.Cols {
+			if columnIndex < len(source) {
+				row[strings.ToLower(column.Name)] = source[columnIndex]
+			}
+		}
+		if candidate.vecRank > 0 {
+			row["_vec_rank"] = candidate.vecRank
+			row["_vec_distance"] = candidate.distance
+			row["_vec_similarity"] = vecSimilarityFromDistance(metric, candidate.distance)
+		}
+		if candidate.ftsRank > 0 {
+			row["_fts_rank"] = candidate.ftsRank
+			row["_fts_score"] = candidate.ftsScore
+		}
+		row["_rrf_score"] = candidate.rrfScore
+		row["_rrf_rank"] = rank + 1
+		rows = append(rows, row)
+	}
+	return &ResultSet{Cols: cols, Rows: rows}
 }
 
 // ragOrderByScoreAsc sorts a []string of fused-row keys by descending RRF

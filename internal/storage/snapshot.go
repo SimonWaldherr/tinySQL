@@ -66,6 +66,7 @@ func (db *DB) SnapshotForTx() (base *DB, shadow *DB) {
 func cloneTableMeta(t *Table) *Table {
 	nt := NewTable(t.Name, t.Cols, t.IsTemp)
 	nt.Version = t.Version
+	nt.structVersion = t.structVersion
 	return nt
 }
 
@@ -74,6 +75,7 @@ func cloneTable(t *Table) *Table {
 	copy(cols, t.Cols)
 	nt := NewTable(t.Name, cols, t.IsTemp)
 	nt.Version = t.Version
+	nt.structVersion = t.structVersion
 	nt.Indexes = cloneSecondaryIndexes(t.Indexes)
 	nt.Stats = cloneTableStats(t.Stats)
 	nt.dirtyFrom = t.dirtyFrom
@@ -84,10 +86,42 @@ func cloneTable(t *Table) *Table {
 	// of t.Rows at this instant, so cloneable derived state (the constraint-
 	// index cache, today) describing those rows is equally valid for nt.
 	// Everything else is dropped, unchanged from before this existed.
+	t.DerivedLock()
+	nt.FTSIndexes = cloneFTSIndexes(t.FTSIndexes)
+	nt.ftsGeneration = t.ftsGeneration
+	nt.ftsPersistedGeneration = t.ftsPersistedGeneration
 	if cloner, ok := t.derived.(DerivedCloner); ok {
 		nt.derived = cloner.CloneDerived()
 	}
+	t.DerivedUnlock()
 	return nt
+}
+
+func cloneFTSIndexes(src map[string]*FTSIndex) map[string]*FTSIndex {
+	if len(src) == 0 {
+		return make(map[string]*FTSIndex)
+	}
+	out := make(map[string]*FTSIndex, len(src))
+	for key, index := range src {
+		if index == nil {
+			continue
+		}
+		clone := *index
+		clone.Docs = append([]FTSDocument(nil), index.Docs...)
+		clone.DocTermIDs = append([]int32(nil), index.DocTermIDs...)
+		clone.DocTermCounts = append([]int32(nil), index.DocTermCounts...)
+		clone.DocTokenIDs = append([]int32(nil), index.DocTokenIDs...)
+		clone.Postings = make(map[string][]int32, len(index.Postings))
+		for term, rows := range index.Postings {
+			clone.Postings[term] = append([]int32(nil), rows...)
+		}
+		clone.TermIDs = make(map[string]int32, len(index.TermIDs))
+		for term, id := range index.TermIDs {
+			clone.TermIDs[term] = id
+		}
+		out[key] = &clone
+	}
+	return out
 }
 
 // cloneRows copies all row headers into a single backing array. A statement

@@ -35,18 +35,22 @@ func tableToDiskRangeIndexed(tn string, t *Table, from, to int, includeIndexes b
 		to = len(t.Rows)
 	}
 	var indexes map[string]*SecondaryIndex
+	var ftsIndexes map[string]*FTSIndex
 	if includeIndexes {
 		indexes = materializeSecondaryIndexesForEncode(t.Indexes)
+		ftsIndexes = t.snapshotFTSIndexes()
 	}
 	dt := diskTable{
-		Tenant:  tn,
-		Name:    t.Name,
-		IsTemp:  t.IsTemp,
-		Version: t.Version,
-		Cols:    make([]diskColumn, len(t.Cols)),
-		Rows:    make([][]any, to-from),
-		Indexes: indexes,
-		Stats:   cloneTableStats(t.Stats),
+		Tenant:        tn,
+		Name:          t.Name,
+		IsTemp:        t.IsTemp,
+		Version:       t.Version,
+		StructVersion: t.structVersion,
+		Cols:          make([]diskColumn, len(t.Cols)),
+		Rows:          make([][]any, to-from),
+		Indexes:       indexes,
+		FTSIndexes:    ftsIndexes,
+		Stats:         cloneTableStats(t.Stats),
 	}
 	for i, c := range t.Cols {
 		dt.Cols[i] = diskColumn(c)
@@ -172,7 +176,9 @@ func diskToTable(dt diskTable) *Table {
 	}
 	t := NewTable(dt.Name, cols, dt.IsTemp)
 	t.Version = dt.Version
+	t.structVersion = dt.StructVersion
 	t.Indexes = cloneSecondaryIndexes(dt.Indexes)
+	t.FTSIndexes = cloneFTSIndexes(dt.FTSIndexes)
 	t.Stats = cloneTableStats(dt.Stats)
 	t.Rows = make([][]any, len(dt.Rows))
 	for ri, r := range dt.Rows {

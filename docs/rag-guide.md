@@ -18,7 +18,9 @@ This guide describes the recommended production path. The short version is:
 
 See also the [Storage & Persistence Guide](./storage-guide.md), the
 [Developer Integration Guide](./developer-integration.md), and the executable
-[`cmd/ragdemo`](../cmd/ragdemo/main.go).
+[`cmd/ragdemo`](../cmd/ragdemo/main.go). Planned retrieval improvements and
+their acceptance criteria are tracked in the
+[RAG optimization roadmap](./rag-optimization-roadmap.md).
 
 ## 1. Recommended architecture
 

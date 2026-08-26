@@ -1177,14 +1177,7 @@ func evalContainsScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 //     ascending by term ID so a term's frequency is a binary search.
 //   - tokenStart/tokenCount index entry.docTokenIDs, in document order, which is
 //     what phrase matching needs.
-type ftsCachedDoc struct {
-	termStart  int32
-	termCount  int32
-	tokenStart int32
-	tokenCount int32
-	docLen     float64
-	valid      bool
-}
+type ftsCachedDoc = storage.FTSDocument
 
 type ftsDocCacheKey struct {
 	tenant string
@@ -1238,7 +1231,7 @@ func (e ftsDocCacheEntry) docFreq(term string) int { return len(e.postings[term]
 // search over contiguous int32s — a few cache-resident comparisons, against the
 // pointer-chasing map probe it replaces.
 func (e ftsDocCacheEntry) termFrequency(doc ftsCachedDoc, id int32) int {
-	lo, hi := doc.termStart, doc.termStart+doc.termCount
+	lo, hi := doc.TermStart, doc.TermStart+doc.TermCount
 	for lo < hi {
 		mid := (lo + hi) / 2
 		switch v := e.docTermIDs[mid]; {
@@ -1255,7 +1248,7 @@ func (e ftsDocCacheEntry) termFrequency(doc ftsCachedDoc, id int32) int {
 
 // docTokens returns doc's token ids in document order.
 func (e ftsDocCacheEntry) docTokens(doc ftsCachedDoc) []int32 {
-	return e.docTokenIDs[doc.tokenStart : doc.tokenStart+doc.tokenCount]
+	return e.docTokenIDs[doc.TokenStart : doc.TokenStart+doc.TokenCount]
 }
 
 // ftsDocCacheMaxEntries bounds the tokenized-document cache the same way the
@@ -1367,6 +1360,131 @@ func ftsValueToString(v any) string {
 	return valueText(v)
 }
 
+const ftsPersistentFormat = 1
+
+func ftsPersistentUsable(index *storage.FTSIndex, table *storage.Table) bool {
+	if index == nil || index.Format != ftsPersistentFormat || index.StructVersion != table.StructVersion() ||
+		index.BuiltRows < 0 || index.BuiltRows > len(table.Rows) || len(index.Docs) != index.BuiltRows ||
+		len(index.DocTermIDs) != len(index.DocTermCounts) ||
+		(index.NumDocs > 0 && (index.Postings == nil || index.TermIDs == nil)) {
+		return false
+	}
+	for _, doc := range index.Docs {
+		if doc.TermStart < 0 || doc.TermCount < 0 || int64(doc.TermStart)+int64(doc.TermCount) > int64(len(index.DocTermIDs)) ||
+			doc.TokenStart < 0 || doc.TokenCount < 0 || int64(doc.TokenStart)+int64(doc.TokenCount) > int64(len(index.DocTokenIDs)) {
+			return false
+		}
+	}
+	for _, id := range index.TermIDs {
+		if id < 0 || int(id) >= len(index.TermIDs) {
+			return false
+		}
+	}
+	return true
+}
+
+func ftsCacheFromPersistent(table *storage.Table, index *storage.FTSIndex) ftsDocCacheEntry {
+	return ftsDocCacheEntry{
+		table: table, version: table.Version, docs: index.Docs,
+		avgDocLen: index.AvgDocLen, postings: index.Postings, numDocs: index.NumDocs,
+		termIDs: index.TermIDs, docTermIDs: index.DocTermIDs,
+		docTermCounts: index.DocTermCounts, docTokenIDs: index.DocTokenIDs,
+	}
+}
+
+// ftsExtendPersistent tokenizes only rows not yet covered by index. Callers
+// use a fresh index after structural changes and reuse the existing one after
+// append-only INSERTs, turning an O(table) rebuild into O(new rows).
+func ftsExtendPersistent(table *storage.Table, cols []int, index *storage.FTSIndex) {
+	start := index.BuiltRows
+	if index.Postings == nil {
+		index.Postings = make(map[string][]int32)
+	}
+	if index.TermIDs == nil {
+		index.TermIDs = make(map[string]int32)
+	}
+	if len(index.Docs) < len(table.Rows) {
+		index.Docs = append(index.Docs, make([]storage.FTSDocument, len(table.Rows)-len(index.Docs))...)
+	}
+	termNames := make([]string, len(index.TermIDs))
+	for term, id := range index.TermIDs {
+		termNames[id] = term
+	}
+	counts := make([]int32, len(index.TermIDs))
+	var touched []int32
+	var sb strings.Builder
+	for ri := start; ri < len(table.Rows); ri++ {
+		r := table.Rows[ri]
+		sb.Reset()
+		for _, ci := range cols {
+			if ci < len(r) && r[ci] != nil {
+				if sb.Len() > 0 {
+					sb.WriteByte(' ')
+				}
+				ftsWriteValue(&sb, r[ci])
+			}
+		}
+		if sb.Len() == 0 {
+			continue
+		}
+		tokenStart := int32(len(index.DocTokenIDs))
+		touched = touched[:0]
+		tokenCount := 0
+		ftsForEachToken(sb.String(), func(term string) bool {
+			id, ok := index.TermIDs[term]
+			if !ok {
+				id = int32(len(index.TermIDs))
+				index.TermIDs[term] = id
+				termNames = append(termNames, term)
+				counts = append(counts, 0)
+			}
+			if counts[id] == 0 {
+				touched = append(touched, id)
+			}
+			counts[id]++
+			index.DocTokenIDs = append(index.DocTokenIDs, id)
+			tokenCount++
+			return true
+		})
+		if tokenCount == 0 {
+			continue
+		}
+		sort.Slice(touched, func(i, j int) bool { return touched[i] < touched[j] })
+		termStart := int32(len(index.DocTermIDs))
+		for _, id := range touched {
+			index.DocTermIDs = append(index.DocTermIDs, id)
+			index.DocTermCounts = append(index.DocTermCounts, counts[id])
+			counts[id] = 0
+		}
+		index.Docs[ri] = storage.FTSDocument{
+			TermStart: termStart, TermCount: int32(len(touched)),
+			TokenStart: tokenStart, TokenCount: int32(tokenCount),
+			DocLen: float64(tokenCount), Valid: true,
+		}
+		index.TotalDocLen += float64(tokenCount)
+		index.NumDocs++
+		if index.NumDocs == ftsArenaEstimateAfter {
+			perDoc := len(index.DocTokenIDs)/index.NumDocs + 1
+			rows := len(table.Rows)
+			index.DocTokenIDs = ftsReserve(index.DocTokenIDs, perDoc*rows*5/4)
+			termsPerDoc := len(index.DocTermIDs)/index.NumDocs + 1
+			index.DocTermIDs = ftsReserve(index.DocTermIDs, termsPerDoc*rows*5/4)
+			index.DocTermCounts = ftsReserve(index.DocTermCounts, termsPerDoc*rows*5/4)
+		}
+		for _, id := range touched {
+			term := termNames[id]
+			index.Postings[term] = append(index.Postings[term], int32(ri))
+		}
+	}
+	if index.NumDocs > 0 {
+		index.AvgDocLen = index.TotalDocLen / float64(index.NumDocs)
+	}
+	index.Format = ftsPersistentFormat
+	index.Version = table.Version
+	index.StructVersion = table.StructVersion()
+	index.BuiltRows = len(table.Rows)
+}
+
 // getFTSDocCache returns the tokenized documents (plus corpus-wide BM25
 // stats) for the given column set, (re)building them if the table has
 // changed since the last call.
@@ -1418,118 +1536,26 @@ func getFTSDocCache(tenant string, table *storage.Table, cols []int) ftsDocCache
 		ftsDocCacheBuildHook()
 	}
 
-	docs := make([]ftsCachedDoc, len(table.Rows))
-	postings := make(map[string][]int32)
-	termIDs := make(map[string]int32)
-	var termNames []string // id -> term, for building the string-keyed postings map
-	var docTermIDs, docTermCounts, docTokenIDs []int32
-	var totalLen float64
-	var numDocs int
-	var sb strings.Builder
-	// counts is reused across documents to tally one document's term
-	// frequencies. It is indexed by term id and cleared only for the ids this
-	// document touched, so it stays O(document) per row rather than O(corpus).
-	var counts []int32
-	var touched []int32
-	for ri, r := range table.Rows {
-		sb.Reset()
-		for _, ci := range cols {
-			if ci < len(r) && r[ci] != nil {
-				if sb.Len() > 0 {
-					sb.WriteByte(' ')
-				}
-				ftsWriteValue(&sb, r[ci])
-			}
-		}
-		if sb.Len() == 0 {
-			continue
-		}
-		tokenStart := int32(len(docTokenIDs))
-		touched = touched[:0]
-		tokenCount := 0
-		// Build the cache directly from the streaming tokenizer. ftsTokenize
-		// materializes both a normalized document copy and a []string from
-		// strings.Fields; on a RAG corpus those transient objects dominated
-		// cold-cache memory even though every token is consumed exactly once.
-		ftsForEachToken(sb.String(), func(t string) bool {
-			id, ok := termIDs[t]
-			if !ok {
-				id = int32(len(termIDs))
-				termIDs[t] = id
-				termNames = append(termNames, t)
-				counts = append(counts, 0)
-			}
-			if counts[id] == 0 {
-				touched = append(touched, id)
-			}
-			counts[id]++
-			docTokenIDs = append(docTokenIDs, id)
-			tokenCount++
-			return true
-		})
-		if tokenCount == 0 {
-			continue
-		}
-
-		// Each document's terms are stored as one ascending run so a frequency
-		// lookup is a binary search (see ftsDocCacheEntry.termFrequency).
-		sort.Slice(touched, func(i, j int) bool { return touched[i] < touched[j] })
-		termStart := int32(len(docTermIDs))
-		for _, id := range touched {
-			docTermIDs = append(docTermIDs, id)
-			docTermCounts = append(docTermCounts, counts[id])
-			counts[id] = 0 // reset for the next document
-		}
-
-		docs[ri] = ftsCachedDoc{
-			termStart:  termStart,
-			termCount:  int32(len(touched)),
-			tokenStart: tokenStart,
-			tokenCount: int32(tokenCount),
-			docLen:     float64(tokenCount),
-			valid:      true,
-		}
-		totalLen += float64(tokenCount)
-		numDocs++
-		// The arenas' final size is unknown until every row is tokenized, so
-		// append would grow them by repeated doubling — for a large corpus that
-		// churns roughly as many bytes again as it keeps. Once enough documents
-		// have been seen to average their length, reserve the whole estimate in
-		// one step. Overshooting slightly is preferable to several more copies of
-		// a multi-megabyte arena; a corpus that exceeds the estimate simply falls
-		// back to appending.
-		if numDocs == ftsArenaEstimateAfter {
-			perDoc := len(docTokenIDs)/numDocs + 1
-			rows := len(table.Rows)
-			docTokenIDs = ftsReserve(docTokenIDs, perDoc*rows*5/4)
-			termsPerDoc := len(docTermIDs)/numDocs + 1
-			docTermIDs = ftsReserve(docTermIDs, termsPerDoc*rows*5/4)
-			docTermCounts = ftsReserve(docTermCounts, termsPerDoc*rows*5/4)
-		}
-		// Rows are visited in ascending index order and each distinct term of a
-		// document is appended once, so every postings list is ascending and
-		// duplicate-free — the precondition the union/intersection helpers in
-		// fts_index.go rely on. touched is already deduplicated, so this needs no
-		// second pass over the tokens.
-		for _, id := range touched {
-			term := termNames[id]
-			postings[term] = append(postings[term], int32(ri))
-		}
+	table.DerivedLock()
+	index := table.FTSIndexes[key.cols]
+	changed := false
+	if !ftsPersistentUsable(index, table) {
+		index = &storage.FTSIndex{}
+		changed = true
 	}
-
-	var avgDocLen float64
-	if numDocs > 0 {
-		avgDocLen = totalLen / float64(numDocs)
+	if changed || index.Version != table.Version || index.BuiltRows != len(table.Rows) {
+		ftsExtendPersistent(table, cols, index)
+		changed = true
 	}
-
-	entry := ftsDocCacheEntry{
-		table: table, version: table.Version, docs: docs,
-		avgDocLen: avgDocLen, postings: postings, numDocs: numDocs,
-		termIDs:       termIDs,
-		docTermIDs:    docTermIDs,
-		docTermCounts: docTermCounts,
-		docTokenIDs:   docTokenIDs,
+	if table.FTSIndexes == nil {
+		table.FTSIndexes = make(map[string]*storage.FTSIndex)
 	}
+	table.FTSIndexes[key.cols] = index
+	if changed {
+		table.MarkFTSIndexesChanged()
+	}
+	table.DerivedUnlock()
+	entry := ftsCacheFromPersistent(table, index)
 	ftsDocCacheMu.Lock()
 	if _, exists := ftsDocCache[key]; !exists {
 		evictOverCap(ftsDocCache, ftsDocCacheMaxEntries)
@@ -1834,14 +1860,23 @@ func (f *FTSSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 			searchCols = append(searchCols, i)
 		}
 	}
+	results, err := ftsSearchCandidates(ctx, tenant, table, query, k, searchCols)
+	if err != nil {
+		return nil, err
+	}
+	return materializeFTSCandidates(table, results), nil
+}
 
+// ftsSearchCandidates performs lexical matching and BM25 ranking without
+// copying source rows. RAG_SEARCH consumes this compact form directly; the
+// public FTS_SEARCH table function materializes the same result afterward.
+func ftsSearchCandidates(ctx context.Context, tenant string, table *storage.Table, query string, k int, searchCols []int) ([]ftsScored, error) {
 	node := parseCachedFTSQuery(query)
 	if node == nil {
 		// Empty or all-stopword query matches nothing. Without this guard every
 		// valid document scores 0 (ftsScoreNode(nil,...) == 0) and k arbitrary
 		// rows would be injected into the caller's RAG context window.
-		resultCols := append(colNames(table.Cols), "_fts_score", "_fts_rank")
-		return &ResultSet{Cols: resultCols, Rows: []Row{}}, nil
+		return nil, nil
 	}
 	cache := getFTSDocCache(tenant, table, searchCols)
 	idf := ftsIDFLookup(cache)
@@ -1868,7 +1903,10 @@ func (f *FTSSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 	if err != nil {
 		return nil, fmt.Errorf("FTS_SEARCH: %w", err)
 	}
+	return results, nil
+}
 
+func materializeFTSCandidates(table *storage.Table, results []ftsScored) *ResultSet {
 	resultCols := make([]string, 0, len(table.Cols)+2)
 	for _, c := range table.Cols {
 		resultCols = append(resultCols, c.Name)
@@ -1890,7 +1928,7 @@ func (f *FTSSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 		rows = append(rows, r)
 	}
 
-	return &ResultSet{Cols: resultCols, Rows: rows}, nil
+	return &ResultSet{Cols: resultCols, Rows: rows}
 }
 
 func init() {

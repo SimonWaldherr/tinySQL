@@ -30,14 +30,16 @@ type diskColumn struct {
 }
 
 type diskTable struct {
-	Tenant  string
-	Name    string
-	Cols    []diskColumn
-	Rows    [][]any // JSON columns stored as strings
-	IsTemp  bool
-	Version int
-	Indexes map[string]*SecondaryIndex
-	Stats   *TableStats
+	Tenant        string
+	Name          string
+	Cols          []diskColumn
+	Rows          [][]any // JSON columns stored as strings
+	IsTemp        bool
+	Version       int
+	StructVersion int
+	Indexes       map[string]*SecondaryIndex
+	FTSIndexes    map[string]*FTSIndex
+	Stats         *TableStats
 }
 
 type diskCatalog struct {
