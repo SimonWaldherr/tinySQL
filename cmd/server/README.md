@@ -3,8 +3,8 @@
 Part of [TinySQL](../../README.md). See the root guide for the engine feature
 set and [tinysqld](../tinysqld/README.md) for the durable DBMS profile.
 
-Serves a tinySQL database over HTTP (JSON REST) and gRPC (JSON codec), with
-optional bearer-token auth, TLS, size/timeout limits, trusted proxies, and
+Serves a tinySQL database over HTTP (JSON/NDJSON REST) and gRPC (JSON codec),
+with optional bearer-token auth, TLS, size/timeout limits, trusted proxies, and
 peer-to-peer federation for read fan-out.
 
 ```bash
@@ -89,6 +89,8 @@ send the same token as gRPC `authorization` metadata.
 - `POST /api/query` — SELECT with rows; `{"tenant","sql","timeout_ms"}` in
   (`timeout_ms` overrides `-request-timeout`), `{"columns","rows","elapsed_ms"}`
   out.
+- `POST /api/query/stream` — local query as an NDJSON result stream; accepts
+  the same `{"tenant","sql","timeout_ms"}` body as `/api/query`.
 - `POST /api/federated/query` — fan out a read to all peers and merge results;
   accepts `timeout_ms` and `peer_timeout_ms` overrides.
 - `GET /api/status` — version, uptime, tenant list.
@@ -96,6 +98,52 @@ send the same token as gRPC `authorization` metadata.
 - `GET /metrics` — Prometheus-compatible metrics (auth-protected).
 - `GET /healthz`, `GET /readyz` — probes, `200 OK` when healthy; never
   auth-protected.
+
+### Streaming queries
+
+`POST /api/query/stream` is the preferred tool-facing API for large result
+sets and for time-to-first-row-sensitive queries. It returns
+`application/x-ndjson`, flushes each record, and uses the normal bearer-token,
+request-timeout, execution-slot, `-max-response-rows`, and
+`-max-response-bytes` policies.
+
+```bash
+curl -N -X POST http://127.0.0.1:8080/api/query/stream \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer my-secret-token' \
+  --data '{"tenant":"main","sql":"SELECT id, name FROM users"}'
+```
+
+Each line is one JSON object. A successful stream sends one `header`, zero or
+more `row` records, then one `end` record:
+
+```json
+{"type":"header","sql":"SELECT id, name FROM users","columns":["id","name"]}
+{"type":"row","row":{"id":1,"name":"Ada"}}
+{"type":"end","count":1,"duration":"421µs"}
+```
+
+If a response limit is reached, `end.truncated` is `true` and the server
+cancels the producer promptly. A malformed request, authentication failure, or query failure
+before the header is a normal JSON HTTP error with its HTTP status. If an
+execution error occurs after records have begun, HTTP remains `200 OK` and the
+final record is `{"type":"error","error":"..."}`. Consumers should process
+records incrementally and treat `error` as terminal.
+
+`QueryStream` is the matching gRPC server-streaming RPC at
+`/tinysql.TinySQL/QueryStream`. It uses the server's existing JSON codec: send
+one `queryRequest` (`tenant`, `sql`, optional `timeout_ms`) and receive the
+same `header`/`row`/`end`/`error` record shapes. A terminal `error` record is
+followed by a non-OK gRPC status; startup/validation errors return only that
+status. Clients canceling the gRPC context or closing the HTTP response stop
+the engine stream and release its execution slot promptly.
+
+Simple single-table scans, filters, index seeks, projections, `LIMIT`, and
+`OFFSET` can deliver rows while the scan is still running. Query shapes that
+need the full input first—such as `ORDER BY`, aggregates, `DISTINCT`, joins,
+and set operations—retain exact semantics and begin streaming only after their
+result has been materialized. The streaming endpoints are local only;
+federated queries remain materialized at `/api/federated/query`.
 
 ## Load testing
 

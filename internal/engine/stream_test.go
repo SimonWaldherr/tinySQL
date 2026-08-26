@@ -45,6 +45,30 @@ func BenchmarkExecuteStreamFirstRow(b *testing.B) {
 	}
 }
 
+func BenchmarkExecuteStreamAllRows(b *testing.B) {
+	db := streamTestDB(b, 20000)
+	stmt := mustParse(`SELECT id FROM stream_rows`)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		stream, err := ExecuteStream(context.Background(), db, "default", stmt)
+		if err != nil {
+			b.Fatal(err)
+		}
+		rows := 0
+		for stream.Next() {
+			_ = stream.Row()
+			rows++
+		}
+		if err := stream.Err(); err != nil {
+			b.Fatal(err)
+		}
+		if rows != 20000 {
+			b.Fatalf("rows = %d, want 20000", rows)
+		}
+	}
+}
+
 func BenchmarkExecuteMaterializedFirstRow(b *testing.B) {
 	db := streamTestDB(b, 20000)
 	stmt := mustParse(`SELECT id FROM stream_rows`)
@@ -174,5 +198,36 @@ func TestExecuteStreamBlockingShapePreservesOrdering(t *testing.T) {
 	}
 	if len(ids) != 2 || ids[0] != 3 || ids[1] != 2 {
 		t.Fatalf("ordered ids = %v, want [3 2]", ids)
+	}
+}
+
+func TestExecuteStreamWithOptionsReportsProgress(t *testing.T) {
+	db := streamTestDB(t, 3)
+	stream, err := ExecuteStreamWithOptions(context.Background(), db, "default", mustParse(`SELECT id FROM stream_rows`), StreamOptions{Buffer: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stream.Stats(); got.BufferCapacity != 0 || got.Materialized || got.Complete || got.StartedAt.IsZero() {
+		t.Fatalf("initial stats = %#v", got)
+	}
+	for stream.Next() {
+	}
+	if err := stream.Err(); err != nil {
+		t.Fatal(err)
+	}
+	got := stream.Stats()
+	if !got.Complete || got.CompletedAt.IsZero() || got.FirstRowAt.IsZero() {
+		t.Fatalf("completed stats = %#v", got)
+	}
+	if got.RowsScanned != 3 || got.RowsProduced != 3 {
+		t.Fatalf("stream progress = scanned %d, produced %d; want 3, 3", got.RowsScanned, got.RowsProduced)
+	}
+}
+
+func TestExecuteStreamWithOptionsRejectsNegativeBuffer(t *testing.T) {
+	db := streamTestDB(t, 1)
+	_, err := ExecuteStreamWithOptions(context.Background(), db, "default", mustParse(`SELECT id FROM stream_rows`), StreamOptions{Buffer: -1})
+	if err == nil {
+		t.Fatal("expected negative buffer to fail")
 	}
 }

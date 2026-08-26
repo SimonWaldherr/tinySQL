@@ -5,8 +5,8 @@ list: [cmd/README.md](../cmd/README.md).
 
 | Command | Purpose |
 |---|---|
-| `cmd/tinysql` | SQLite-like CLI |
-| `cmd/repl` | Interactive SQL REPL |
+| `cmd/tinysql` | SQLite-like CLI, including `tinysql shell` / `tinysql repl` |
+| `cmd/repl` | Legacy standalone interactive SQL REPL |
 | `cmd/server` | HTTP JSON API and gRPC server |
 | `cmd/tinysqld` | Lightweight admin/health daemon |
 | `cmd/sqltools` | Format, validate, explain, and REPL helpers |

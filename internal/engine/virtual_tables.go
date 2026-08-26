@@ -40,6 +40,11 @@ import (
 // startTime records when the process started so sys.status can report uptime.
 var startTime = time.Now()
 
+// BuildVersion can be set with -ldflags -X at release build time. Keep the
+// default suitable for local development; Version below falls back to Go's
+// module metadata when a consuming application has not injected it.
+var BuildVersion = "dev"
+
 // resolveSysTable returns the rows for a given sys.<name> virtual table.
 // It returns nil, nil when the name is not recognized so the caller can fall
 // back to the default "unknown catalog/sys table" error.
@@ -863,13 +868,30 @@ func constraintStr(c storage.ConstraintType) string {
 	}
 }
 
-// Version returns the tinySQL version string. It attempts to read the
-// module version from debug.ReadBuildInfo and falls back to "dev".
+// Version returns the tinySQL module version from build metadata and falls
+// back to "dev". When tinySQL is embedded in another executable, the main
+// module is the application rather than tinySQL, so look through dependencies
+// instead of accidentally reporting the host application's version.
 func Version() string {
-	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
-		return bi.Main.Version
+	const modulePath = "github.com/SimonWaldherr/tinySQL"
+	if usableBuildVersion(BuildVersion) && BuildVersion != "dev" {
+		return BuildVersion
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		if bi.Main.Path == modulePath && usableBuildVersion(bi.Main.Version) {
+			return bi.Main.Version
+		}
+		for _, dep := range bi.Deps {
+			if dep != nil && dep.Path == modulePath && usableBuildVersion(dep.Version) {
+				return dep.Version
+			}
+		}
 	}
 	return "dev"
+}
+
+func usableBuildVersion(version string) bool {
+	return version != "" && version != "(devel)"
 }
 
 // ─────────────────────────── sys.triggers ────────────────────────────────────

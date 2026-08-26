@@ -113,6 +113,29 @@ type ResultSet = engine.ResultSet
 // check Err afterward, and call Close when abandoning the stream early.
 type ResultStream = engine.ResultStream
 
+// StreamOptions controls ResultStream buffering and backpressure. It is
+// intentionally additive: ExecuteStream keeps its existing default buffer;
+// callers that need strict or larger buffering can use the *WithOptions
+// variants.
+type StreamOptions = engine.StreamOptions
+
+// StreamStats is a point-in-time snapshot of a running or completed stream.
+type StreamStats = engine.StreamStats
+
+// DefaultStreamBuffer is the producer buffer used by ExecuteStream and its
+// convenience wrappers. Use StreamOptions with a *WithOptions function to
+// select a different capacity.
+const DefaultStreamBuffer = engine.DefaultResultStreamBuffer
+
+// APIVersion is the compatibility contract for tinySQL's root Go package.
+// Additive APIs retain this value; an incompatible public API change requires
+// a new major module version and a new value.
+const APIVersion = 1
+
+// Version returns the module version embedded by Go's build metadata, or
+// "dev" when the binary/package was built outside a tagged module version.
+func Version() string { return engine.Version() }
+
 // VectorCacheConfig configures the optional process-wide VEC_SEARCH result
 // cache and its opt-in analytics ring buffer.
 type VectorCacheConfig = engine.VectorCacheConfig
@@ -799,6 +822,13 @@ func ExecuteStream(ctx context.Context, db *DB, tenant string, stmt Statement) (
 	return engine.ExecuteStream(ctx, db, tenant, stmt)
 }
 
+// ExecuteStreamWithOptions starts a parsed statement with explicit stream
+// backpressure settings. A zero Buffer is valid and provides strict
+// producer/consumer handoff.
+func ExecuteStreamWithOptions(ctx context.Context, db *DB, tenant string, stmt Statement, opts StreamOptions) (*ResultStream, error) {
+	return engine.ExecuteStreamWithOptions(ctx, db, tenant, stmt, opts)
+}
+
 // ExecSQL parses and executes exactly one SQL statement. It is the concise
 // public entry point for dynamic SQL, scripts with one statement per call, and
 // small embedded applications. For repeated SQL, prefer Compile or database/sql
@@ -821,6 +851,16 @@ func ExecSQLStream(ctx context.Context, db *DB, tenant, sql string) (*ResultStre
 		return nil, err
 	}
 	return ExecuteStream(ctx, db, tenant, stmt)
+}
+
+// ExecSQLStreamWithOptions parses one SQL statement and starts it with
+// explicit stream backpressure settings.
+func ExecSQLStreamWithOptions(ctx context.Context, db *DB, tenant, sql string, opts StreamOptions) (*ResultStream, error) {
+	stmt, err := ParseSQL(sql)
+	if err != nil {
+		return nil, err
+	}
+	return ExecuteStreamWithOptions(ctx, db, tenant, stmt, opts)
 }
 
 // WithUser returns a context carrying the acting username for RBAC
@@ -868,13 +908,28 @@ func ParsePermission(s string) (Permission, error) {
 //
 // Returns ResultSet for SELECT queries, nil for DDL/DML statements.
 func ExecuteCompiled(ctx context.Context, db *DB, tenant string, compiled *CompiledQuery) (*ResultSet, error) {
+	if compiled == nil {
+		return nil, fmt.Errorf("cannot execute a nil compiled query")
+	}
 	return compiled.Execute(ctx, db, tenant)
 }
 
 // ExecuteCompiledStream executes a pre-compiled query and exposes rows
 // incrementally where the query shape permits it.
 func ExecuteCompiledStream(ctx context.Context, db *DB, tenant string, compiled *CompiledQuery) (*ResultStream, error) {
+	if compiled == nil {
+		return nil, fmt.Errorf("cannot stream a nil compiled query")
+	}
 	return compiled.Stream(ctx, db, tenant)
+}
+
+// ExecuteCompiledStreamWithOptions executes a pre-compiled query with
+// explicit stream backpressure settings.
+func ExecuteCompiledStreamWithOptions(ctx context.Context, db *DB, tenant string, compiled *CompiledQuery, opts StreamOptions) (*ResultStream, error) {
+	if compiled == nil {
+		return nil, fmt.Errorf("cannot stream a nil compiled query")
+	}
+	return compiled.StreamWithOptions(ctx, db, tenant, opts)
 }
 
 // SQLJobExecutor executes scheduled job SQL against a tinySQL database tenant.

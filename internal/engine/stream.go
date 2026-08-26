@@ -5,14 +5,47 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
-const resultStreamBuffer = 64
+// DefaultResultStreamBuffer is the number of produced rows that can wait for
+// a consumer when callers use ExecuteStream. It keeps the convenient API
+// responsive without letting an abandoned or slow consumer retain an
+// unbounded result in memory.
+const DefaultResultStreamBuffer = 64
 
 var errResultStreamClosed = errors.New("result stream closed")
+
+// StreamOptions controls the producer/consumer boundary of a ResultStream.
+//
+// Buffer is the maximum number of produced rows waiting for a consumer. Zero
+// is intentionally valid and provides strict backpressure: a producer waits
+// for every call to Next. ExecuteStream uses DefaultResultStreamBuffer; use
+// ExecuteStreamWithOptions to select zero or another capacity explicitly.
+type StreamOptions struct {
+	Buffer int
+}
+
+// StreamStats is a point-in-time, concurrency-safe snapshot of a query
+// stream. RowsScanned is populated for direct simple-scan streams (while a
+// stream is running it may trail by up to 63 candidates to avoid adding an
+// atomic operation to every hot-loop iteration); a materialized query cannot
+// in general expose the executor's intermediate candidate count and reports
+// zero for that field. RowsProduced is the number of result rows accepted by
+// the stream's producer.
+type StreamStats struct {
+	StartedAt      time.Time
+	FirstRowAt     time.Time
+	CompletedAt    time.Time
+	RowsScanned    uint64
+	RowsProduced   uint64
+	BufferCapacity int
+	Materialized   bool
+	Complete       bool
+}
 
 // ResultStream incrementally exposes query rows. Next blocks until another row
 // is available, the query finishes, or its context is cancelled. Row is valid
@@ -31,9 +64,18 @@ type ResultStream struct {
 	rows   chan Row
 	done   chan struct{}
 
-	mu          sync.RWMutex
+	errMu       sync.RWMutex
 	current     Row
 	producerErr error
+
+	startedAt      time.Time
+	firstRowAt     atomic.Int64
+	completedAt    atomic.Int64
+	rowsScanned    atomic.Uint64
+	rowsProduced   atomic.Uint64
+	materialized   atomic.Bool
+	bufferCapacity int
+	complete       atomic.Bool
 }
 
 // Columns returns the result columns in display order.
@@ -56,9 +98,7 @@ func (s *ResultStream) Next() bool {
 		<-s.done
 		return false
 	}
-	s.mu.Lock()
 	s.current = row
-	s.mu.Unlock()
 	return true
 }
 
@@ -67,10 +107,7 @@ func (s *ResultStream) Row() Row {
 	if s == nil {
 		return nil
 	}
-	s.mu.RLock()
-	row := s.current
-	s.mu.RUnlock()
-	return row
+	return s.current
 }
 
 // Err reports the terminal producer or context error. Closing a stream
@@ -79,13 +116,46 @@ func (s *ResultStream) Err() error {
 	if s == nil {
 		return nil
 	}
-	s.mu.RLock()
+	s.errMu.RLock()
 	err := s.producerErr
-	s.mu.RUnlock()
+	s.errMu.RUnlock()
 	if errors.Is(err, errResultStreamClosed) {
 		return nil
 	}
 	return err
+}
+
+// Done is closed after the producer has stopped and no longer accesses the
+// statement or database. Consumers can use it to release resources that only
+// need to outlive production rather than buffered-row consumption.
+func (s *ResultStream) Done() <-chan struct{} {
+	if s == nil {
+		return nil
+	}
+	return s.done
+}
+
+// Stats returns a snapshot of stream progress. It is safe to call while Next
+// is blocked or while another goroutine is producing rows.
+func (s *ResultStream) Stats() StreamStats {
+	if s == nil {
+		return StreamStats{}
+	}
+	stats := StreamStats{
+		StartedAt:      s.startedAt,
+		RowsScanned:    s.rowsScanned.Load(),
+		RowsProduced:   s.rowsProduced.Load(),
+		BufferCapacity: s.bufferCapacity,
+		Materialized:   s.materialized.Load(),
+		Complete:       s.complete.Load(),
+	}
+	if ns := s.firstRowAt.Load(); ns != 0 {
+		stats.FirstRowAt = time.Unix(0, ns)
+	}
+	if ns := s.completedAt.Load(); ns != 0 {
+		stats.CompletedAt = time.Unix(0, ns)
+	}
+	return stats
 }
 
 // Close stops production and waits until any held database read lock has been
@@ -100,11 +170,21 @@ func (s *ResultStream) Close() error {
 }
 
 func (s *ResultStream) finish(err error) {
-	s.mu.Lock()
+	s.errMu.Lock()
 	s.producerErr = err
-	s.mu.Unlock()
+	s.errMu.Unlock()
+	s.completedAt.Store(time.Now().UnixNano())
+	s.complete.Store(true)
 	close(s.rows)
 	close(s.done)
+}
+
+func (s *ResultStream) noteProduced() {
+	// There is exactly one producer. Use the increment result to identify the
+	// first row instead of reading the clock and attempting a CAS for every row.
+	if s.rowsProduced.Add(1) == 1 {
+		s.firstRowAt.Store(time.Now().UnixNano())
+	}
 }
 
 type resultStreamHeader struct {
@@ -116,6 +196,13 @@ type resultStreamHeader struct {
 // are known. See ResultStream for which SELECT shapes produce rows before the
 // full query has completed.
 func ExecuteStream(ctx context.Context, db *storage.DB, tenant string, stmt Statement) (*ResultStream, error) {
+	return ExecuteStreamWithOptions(ctx, db, tenant, stmt, StreamOptions{Buffer: DefaultResultStreamBuffer})
+}
+
+// ExecuteStreamWithOptions starts a statement with explicit producer/consumer
+// backpressure settings. It otherwise has the same semantics as
+// ExecuteStream.
+func ExecuteStreamWithOptions(ctx context.Context, db *storage.DB, tenant string, stmt Statement, opts StreamOptions) (*ResultStream, error) {
 	if db == nil {
 		return nil, fmt.Errorf("cannot stream with a nil database")
 	}
@@ -125,12 +212,17 @@ func ExecuteStream(ctx context.Context, db *storage.DB, tenant string, stmt Stat
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if opts.Buffer < 0 {
+		return nil, fmt.Errorf("stream buffer must not be negative: %d", opts.Buffer)
+	}
 	streamCtx, cancel := context.WithCancelCause(ctx)
 	stream := &ResultStream{
-		ctx:    streamCtx,
-		cancel: cancel,
-		rows:   make(chan Row, resultStreamBuffer),
-		done:   make(chan struct{}),
+		ctx:            streamCtx,
+		cancel:         cancel,
+		rows:           make(chan Row, opts.Buffer),
+		done:           make(chan struct{}),
+		startedAt:      time.Now(),
+		bufferCapacity: opts.Buffer,
 	}
 	header := make(chan resultStreamHeader, 1)
 	go produceResultStream(stream, header, db, tenant, stmt)
@@ -211,6 +303,7 @@ func produceResultStream(stream *ResultStream, header chan<- resultStreamHeader,
 	// Blocking/global query shapes preserve their existing implementation and
 	// stream the materialized result afterward. This keeps ORDER BY, aggregates,
 	// DISTINCT, joins, CTEs and DML semantics unchanged.
+	stream.materialized.Store(true)
 	var rs *ResultSet
 	rs, err = Execute(stream.ctx, db, tenant, stmt)
 	if err != nil {
@@ -225,7 +318,7 @@ func produceResultStream(stream *ResultStream, header chan<- resultStreamHeader,
 	}
 	headerSent = true
 	for _, row := range rs.Rows {
-		if !sendResultStreamRow(stream.ctx, stream.rows, row) {
+		if !sendResultStreamRow(stream.ctx, stream, row) {
 			err = context.Cause(stream.ctx)
 			return
 		}
@@ -255,7 +348,22 @@ func streamSimpleSelectPlan(stream *ResultStream, plan *simpleSelectPlan) error 
 	}
 
 	matched, emitted := 0, 0
+	var scanned uint64
+	defer func() {
+		// Publish the unbatched tail so completed stream statistics are exact.
+		if remainder := scanned & 63; remainder != 0 {
+			stream.rowsScanned.Add(remainder)
+		}
+	}()
 	for i := 0; i < rowCount; i++ {
+		scanned++
+		// Hot scans only touch shared state every 64 candidates. Stats observed
+		// during a query are therefore at most 63 rows behind, while completed
+		// stats remain exact without putting an atomic operation in the inner
+		// loop for every candidate.
+		if scanned&63 == 0 {
+			stream.rowsScanned.Add(64)
+		}
 		rowID := i
 		if plan.rowIDs != nil {
 			rowID = plan.rowIDs[i]
@@ -288,7 +396,7 @@ func streamSimpleSelectPlan(stream *ResultStream, plan *simpleSelectPlan) error 
 		if err != nil {
 			return err
 		}
-		if !sendResultStreamRow(stream.ctx, stream.rows, out) {
+		if !sendResultStreamRow(stream.ctx, stream, out) {
 			return context.Cause(stream.ctx)
 		}
 		emitted++
@@ -308,9 +416,10 @@ func sendResultStreamHeader(ctx context.Context, dst chan<- resultStreamHeader, 
 	}
 }
 
-func sendResultStreamRow(ctx context.Context, dst chan<- Row, row Row) bool {
+func sendResultStreamRow(ctx context.Context, stream *ResultStream, row Row) bool {
 	select {
-	case dst <- row:
+	case stream.rows <- row:
+		stream.noteProduced()
 		return true
 	case <-ctx.Done():
 		return false

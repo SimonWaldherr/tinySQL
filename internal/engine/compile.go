@@ -119,6 +119,15 @@ func (cq *CompiledQuery) Stream(ctx context.Context, db *storage.DB, tenant stri
 	return ExecuteStream(ctx, db, tenant, cq.Statement)
 }
 
+// StreamWithOptions executes a compiled query with explicit stream
+// producer/consumer settings.
+func (cq *CompiledQuery) StreamWithOptions(ctx context.Context, db *storage.DB, tenant string, opts StreamOptions) (*ResultStream, error) {
+	if cq == nil {
+		return nil, fmt.Errorf("cannot stream a nil compiled query")
+	}
+	return ExecuteStreamWithOptions(ctx, db, tenant, cq.Statement, opts)
+}
+
 // MustCompile is like Compile but panics on error (similar to regexp.MustCompile).
 func (qc *QueryCache) MustCompile(sql string) *CompiledQuery {
 	cq, err := qc.Compile(sql)

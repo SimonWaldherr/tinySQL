@@ -6,6 +6,8 @@ import (
 	"database/sql/driver"
 	"io"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/engine"
@@ -13,29 +15,94 @@ import (
 )
 
 type rows struct {
-	rs        *engine.ResultSet
-	cachedRS  *engine.ResultSet
-	lowerCols []string
-	i         int
+	rs         *engine.ResultSet
+	stream     *engine.ResultStream
+	streamCols []string
+	cachedRS   *engine.ResultSet
+	lowerCols  []string
+	i          int
+
+	// onClose owns resources that must outlive a streamed result: the
+	// server's reader slot/RLock and, for a prepared SELECT, its borrowed AST.
+	// It is intentionally run only after ResultStream.Close has waited for its
+	// producer, so neither the database nor a pooled prepared execution can be
+	// reused while the producer still references it.
+	onClose   func()
+	closeOnce sync.Once
+	closeErr  error
+	closed    atomic.Bool
 }
 
-func (r *rows) Columns() []string { return r.rs.Cols }
+func (r *rows) Columns() []string {
+	if r.stream != nil {
+		return r.streamCols
+	}
+	return r.rs.Cols
+}
 
-func (r *rows) Close() error { return nil }
+func (r *rows) Close() error {
+	r.closed.Store(true)
+	r.closeOnce.Do(func() {
+		if r.stream != nil {
+			r.closeErr = r.stream.Close()
+		}
+		if r.onClose != nil {
+			r.onClose()
+		}
+	})
+	return r.closeErr
+}
 
 func (r *rows) Next(dest []driver.Value) error {
-	if r.i >= len(r.rs.Rows) {
+	if r.closed.Load() {
+		if err := r.Close(); err != nil {
+			return err
+		}
 		return io.EOF
 	}
-	if r.cachedRS != r.rs || len(r.lowerCols) != len(r.rs.Cols) {
-		r.lowerCols = make([]string, len(r.rs.Cols))
-		for i, c := range r.rs.Cols {
+
+	if r.stream != nil {
+		if !r.stream.Next() {
+			err := r.stream.Err()
+			if closeErr := r.Close(); err == nil {
+				err = closeErr
+			}
+			if err != nil {
+				return err
+			}
+			return io.EOF
+		}
+		if r.closed.Load() {
+			if err := r.Close(); err != nil {
+				return err
+			}
+			return io.EOF
+		}
+		return r.copyRow(r.stream.Row(), r.streamCols, dest)
+	}
+
+	if r.i >= len(r.rs.Rows) {
+		if err := r.Close(); err != nil {
+			return err
+		}
+		return io.EOF
+	}
+	if err := r.copyRow(r.rs.Rows[r.i], r.rs.Cols, dest); err != nil {
+		return err
+	}
+	r.i++
+	return nil
+}
+
+func (r *rows) copyRow(row engine.Row, cols []string, dest []driver.Value) error {
+	if r.cachedRS != r.rs || len(r.lowerCols) != len(cols) {
+		r.lowerCols = make([]string, len(cols))
+		for i, c := range cols {
 			r.lowerCols[i] = strings.ToLower(c)
 		}
 		r.cachedRS = r.rs
 	}
-	row := r.rs.Rows[r.i]
-	for i := range r.rs.Cols {
+	for i := range cols {
 		v := row[r.lowerCols[i]]
 		switch vv := v.(type) {
 		case nil:
@@ -63,7 +130,6 @@ func (r *rows) Next(dest []driver.Value) error {
 			dest[i] = string(b)
 		}
 	}
-	r.i++
 	return nil
 }
 

@@ -6,6 +6,9 @@ on:
       - 'v*'
   workflow_dispatch: {}
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build for ${{ matrix.goos }}-${{ matrix.arch }}
@@ -29,6 +32,14 @@ jobs:
           - runner: macos-latest
             goos: darwin
             ext: dylib
+            arch: arm64
+          - runner: ubuntu-latest
+            goos: windows
+            ext: dll
+            arch: amd64
+          - runner: ubuntu-latest
+            goos: windows
+            ext: dll
             arch: arm64
 
     steps:
@@ -66,17 +77,26 @@ jobs:
           # Build CLI binary (cmd/tinysql)
           echo "Building CLI: tinysql for $GOOS-$GOARCH"
           # Disable cgo for cross-compiling the pure-Go CLI to avoid needing cross-toolchain.
-          CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -o $PKGDIR/tinysql-$GOOS-$GOARCH ./cmd/tinysql
+          binary=$PKGDIR/tinysql-$GOOS-$GOARCH
+          if [ "$GOOS" = windows ]; then binary="$binary.exe"; fi
+          CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build \
+            -trimpath -ldflags "-s -w -X main.Version=${GITHUB_REF_NAME:-dev} -X github.com/SimonWaldherr/tinySQL/internal/engine.BuildVersion=${GITHUB_REF_NAME:-dev}" \
+            -o "$binary" ./cmd/tinysql
 
           # Build C shared library (bindings/python provides c-shared target)
-          # c-shared requires a native C toolchain; skip when target arch != runner arch.
+          # c-shared requires a native C toolchain; skip when target OS or
+          # architecture differs from the runner. The CLI above remains fully
+          # cross-compiled and is the supported artifact on every matrix row.
           runner_arch=$(uname -m)
+          runner_goos=$(uname -s | tr '[:upper:]' '[:lower:]')
           native_ok=false
-          if [ "$runner_arch" = "x86_64" ] && [ "$GOARCH" = "amd64" ]; then native_ok=true; fi
-          if [ "$runner_arch" = "aarch64" ] && [ "$GOARCH" = "arm64" ]; then native_ok=true; fi
+          if [ "$runner_goos" = "$GOOS" ] && [ "$runner_arch" = "x86_64" ] && [ "$GOARCH" = "amd64" ]; then native_ok=true; fi
+          if [ "$runner_goos" = "$GOOS" ] && [ "$runner_arch" = "aarch64" ] && [ "$GOARCH" = "arm64" ]; then native_ok=true; fi
           if [ "$native_ok" = true ]; then
             echo "Building c-shared library"
-            CGO_ENABLED=1 GOOS=$GOOS GOARCH=$GOARCH go build -buildmode=c-shared -o $PKGDIR/libtinysql.$EXT ./bindings/python || true
+            CGO_ENABLED=1 GOOS=$GOOS GOARCH=$GOARCH go build -buildmode=c-shared \
+              -ldflags "-X github.com/SimonWaldherr/tinySQL/internal/engine.BuildVersion=${GITHUB_REF_NAME:-dev}" \
+              -o $PKGDIR/libtinysql.$EXT ./bindings/python || true
           else
             echo "Skipping c-shared build for $GOOS-$GOARCH on runner $runner_arch (no cross C toolchain)"
           fi
@@ -108,3 +128,31 @@ jobs:
         with:
           name: checksums-${{ matrix.goos }}-${{ matrix.arch }}-${{ github.ref_name }}
           path: artifacts/*.sha256
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    # A workflow_dispatch run validates artifacts but never publishes one.
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: tinysql-*
+          merge-multiple: true
+          path: dist
+
+      - name: Generate combined checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          find . -maxdepth 1 -type f -name '*.tar.gz' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS

@@ -475,6 +475,7 @@ process-local result cache and anonymous shape/timing analytics. See the
 | Guide | Use it for |
 | --- | --- |
 | [Developer integration](./docs/developer-integration.md) | Go, `database/sql`, and browser embedding |
+| [Go API stability](./docs/api-stability.md) | Compatibility guarantees, streaming, and upgrades |
 | [CLI guide](./docs/cli-guide.md) | REPL, servers, and file-query tools |
 | [Storage guide](./docs/storage-guide.md) | Backends, DSNs, read-only mode, large tilesets |
 | [RAG guide](./docs/rag-guide.md) | Vector, hybrid retrieval, reranking, and context |

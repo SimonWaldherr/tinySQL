@@ -40,6 +40,9 @@ make build-all
 | `cd odbc && make linux` | Build the c-shared ODBC driver from its nested Go module. |
 | `make coverage` | Run tests and open an HTML coverage report. |
 | `make bench` | Benchmarks with allocation output. |
+| `make bench-stream` | Repeated time-to-first-row measurements for engine, `database/sql`, CLI, and server (plus the materialized engine baseline). |
+| `make bench-stream-guard` | CI-safe first-row allocation/latency budget; limits are configurable with `STREAM_FIRST_ROW_MAX_B` and `STREAM_FIRST_ROW_MAX_NS`. |
+| `make release-check` | Cross-compile the published CLI targets (Linux, macOS, Windows; amd64/arm64) into a temporary directory. |
 | `make fmt` / `make fmt-check` | Format Go files / check formatting without modifying. |
 | `make vet` | `go vet ./...`. |
 | `make lint` | `golangci-lint`; must be installed locally. |
@@ -78,6 +81,14 @@ make test GO_TEST_FLAGS="-run TestGeo -count=1"
 make update-gh-pages GH_PAGES_COMMIT_MESSAGE="Update playground"
 make update-gh-pages GH_PAGES_WORKTREE=/tmp/tinysql-gh-pages
 ```
+
+## Releases
+
+Push a signed `vX.Y.Z` tag after the normal verification suite. The release
+workflow cross-builds the `tinysql` CLI for Linux, macOS, and Windows, embeds
+the tag in `tinysql --version`, publishes GitHub release archives, and attaches
+a combined `SHA256SUMS` file. A manually dispatched release workflow builds
+artifacts for inspection but does not publish a release.
 
 ## Further reading
 

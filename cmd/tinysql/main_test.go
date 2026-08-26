@@ -3,11 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,7 +32,30 @@ func TestBuildTinysql(t *testing.T) {
 		_ = os.Remove(out)
 		t.Fatalf("go build failed: %v\n%s", err, string(outp))
 	}
+	for _, arg := range []string{"-version", "--version", "version"} {
+		version, err := exec.Command(out, arg).Output()
+		if err != nil {
+			_ = os.Remove(out)
+			t.Fatalf("tinysql %s failed: %v", arg, err)
+		}
+		if got, want := string(version), "tinySQL "+versionString()+"\n"; got != want {
+			_ = os.Remove(out)
+			t.Fatalf("tinysql %s = %q, want %q", arg, got, want)
+		}
+	}
 	_ = os.Remove(out)
+}
+
+func TestShellAndReplSubcommandsRouteToMainCLI(t *testing.T) {
+	for _, name := range []string{"shell", "repl"} {
+		handled, err := tryUtilityCommand(name, []string{"-batch"})
+		if !handled {
+			t.Fatalf("%s was not handled as an integrated shell command", name)
+		}
+		if err == nil || !strings.Contains(err.Error(), "batch mode requested") {
+			t.Fatalf("%s returned %v, want batch-mode error from runCLI", name, err)
+		}
+	}
 }
 
 func setupTestDB(t *testing.T) *tsql.DB {
@@ -237,6 +264,285 @@ func TestExecute_MultiStatement(t *testing.T) {
 	}
 	if rs == nil || len(rs.Rows) == 0 {
 		t.Fatal("expected a row")
+	}
+}
+
+func TestExecuteStreamsCSVAndJSONLines(t *testing.T) {
+	db := setupTestDB(t)
+
+	t.Run("csv", func(t *testing.T) {
+		cfg := &Config{Tenant: "default", Mode: ModeCSV, Header: true}
+		var out bytes.Buffer
+		if _, err := execute(context.Background(), db, cfg, "SELECT id, name FROM users", &out); err != nil {
+			t.Fatalf("execute CSV: %v", err)
+		}
+		if got, want := out.String(), "id,name\n1,Alice\n2,Bob\n"; got != want {
+			t.Fatalf("CSV output = %q, want %q", got, want)
+		}
+	})
+
+	for _, mode := range []OutputMode{ModeJSONL, ModeNDJSON} {
+		t.Run(string(mode), func(t *testing.T) {
+			cfg := &Config{Tenant: "default", Mode: mode}
+			var out bytes.Buffer
+			if _, err := execute(context.Background(), db, cfg, "SELECT id, name FROM users", &out); err != nil {
+				t.Fatalf("execute %s: %v", mode, err)
+			}
+			lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+			if len(lines) != 2 {
+				t.Fatalf("%s output has %d lines, want 2: %q", mode, len(lines), out.String())
+			}
+			var first map[string]any
+			if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
+				t.Fatalf("first JSON line: %v", err)
+			}
+			if first["name"] != "Alice" {
+				t.Fatalf("first JSON line = %#v, want Alice", first)
+			}
+		})
+	}
+
+	t.Run("json-array", func(t *testing.T) {
+		cfg := &Config{Tenant: "default", Mode: ModeJSON}
+		var out bytes.Buffer
+		if _, err := execute(context.Background(), db, cfg, "SELECT id, name FROM users", &out); err != nil {
+			t.Fatalf("execute JSON: %v", err)
+		}
+		var rows []map[string]any
+		if err := json.Unmarshal(out.Bytes(), &rows); err != nil {
+			t.Fatalf("streamed JSON is invalid: %v\n%s", err, out.String())
+		}
+		if len(rows) != 2 || rows[1]["name"] != "Bob" {
+			t.Fatalf("JSON rows = %#v", rows)
+		}
+	})
+}
+
+// blockingFirstWrite proves that CSV output is reached while the stream still
+// owns the database read lock: a writer blocked on the first result prevents a
+// concurrent mutation from taking the write lock. A materialized CLI path
+// would release that lock before it begins writing output.
+type blockingFirstWrite struct {
+	bytes.Buffer
+	first       chan struct{}
+	release     chan struct{}
+	once        sync.Once
+	releaseOnce sync.Once
+}
+
+func newBlockingFirstWrite() *blockingFirstWrite {
+	return &blockingFirstWrite{first: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (w *blockingFirstWrite) Write(p []byte) (int, error) {
+	w.once.Do(func() {
+		close(w.first)
+		<-w.release
+	})
+	return w.Buffer.Write(p)
+}
+
+func (w *blockingFirstWrite) unblock() {
+	w.releaseOnce.Do(func() { close(w.release) })
+}
+
+func TestExecuteCSVStreamsFirstRowBeforeQueryCompletes(t *testing.T) {
+	db := tsql.NewDB()
+	ctx := context.Background()
+	for _, sql := range []string{
+		"CREATE TABLE stream_probe (id INT)",
+	} {
+		stmt, err := tsql.ParseSQL(sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tsql.Execute(ctx, db, "default", stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 256; i++ {
+		stmt, err := tsql.ParseSQL(fmt.Sprintf("INSERT INTO stream_probe VALUES (%d)", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tsql.Execute(ctx, db, "default", stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	w := newBlockingFirstWrite()
+	defer w.unblock()
+	execDone := make(chan error, 1)
+	go func() {
+		_, err := execute(context.Background(), db, &Config{Tenant: "default", Mode: ModeCSV, Header: false}, "SELECT id FROM stream_probe", w)
+		execDone <- err
+	}()
+	select {
+	case <-w.first:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first CSV result was not written")
+	}
+
+	mutationDone := make(chan error, 1)
+	go func() {
+		stmt, err := tsql.ParseSQL("INSERT INTO stream_probe VALUES (999)")
+		if err == nil {
+			_, err = tsql.Execute(context.Background(), db, "default", stmt)
+		}
+		mutationDone <- err
+	}()
+	select {
+	case err := <-mutationDone:
+		t.Fatalf("mutation completed before streamed writer was released: %v", err)
+	case <-time.After(75 * time.Millisecond):
+		// Expected: ExecuteStream retains the read lock while it feeds rows.
+	}
+
+	w.unblock()
+	if err := <-execDone; err != nil {
+		t.Fatalf("streamed execute: %v", err)
+	}
+	select {
+	case err := <-mutationDone:
+		if err != nil {
+			t.Fatalf("mutation after stream: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mutation remained blocked after streamed output completed")
+	}
+}
+
+type cancelAfterFirstWrite struct {
+	bytes.Buffer
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (w *cancelAfterFirstWrite) Write(p []byte) (int, error) {
+	n, err := w.Buffer.Write(p)
+	w.once.Do(w.cancel)
+	return n, err
+}
+
+var errBenchmarkFirstWrite = errors.New("stop after first emitted row")
+
+type stopAfterFirstWrite struct{}
+
+func (stopAfterFirstWrite) Write([]byte) (int, error) { return 0, errBenchmarkFirstWrite }
+
+// BenchmarkCLIStreamFirstRow measures parse, planning, stream startup and
+// the first list-mode write through the CLI's actual execution path. List mode
+// has no header, so the failed write occurs only when the first result row is
+// ready; execute closes the producer before returning the sentinel error.
+func BenchmarkCLIStreamFirstRow(b *testing.B) {
+	db := tsql.NewDB()
+	ctx := context.Background()
+	if _, err := tsql.Execute(ctx, db, "default", tsql.MustParseSQL("CREATE TABLE cli_bench_rows (id INT)")); err != nil {
+		b.Fatal(err)
+	}
+	table, err := db.Get("default", "cli_bench_rows")
+	if err != nil {
+		b.Fatal(err)
+	}
+	table.Rows = make([][]any, 20000)
+	for i := range table.Rows {
+		table.Rows[i] = []any{i}
+	}
+	table.Version++
+	cfg := &Config{Tenant: "default", Mode: ModeList}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := execute(ctx, db, cfg, "SELECT id FROM cli_bench_rows", stopAfterFirstWrite{})
+		if !errors.Is(err, errBenchmarkFirstWrite) {
+			b.Fatalf("execute = %v, want first-write sentinel", err)
+		}
+	}
+}
+
+func TestExecuteStreamingHonorsContextCancellation(t *testing.T) {
+	db := tsql.NewDB()
+	ctx := context.Background()
+	for _, sql := range []string{"CREATE TABLE cancel_probe (id INT)"} {
+		stmt, err := tsql.ParseSQL(sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tsql.Execute(ctx, db, "default", stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 512; i++ {
+		stmt, err := tsql.ParseSQL(fmt.Sprintf("INSERT INTO cancel_probe VALUES (%d)", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tsql.Execute(ctx, db, "default", stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	queryCtx, cancel := context.WithCancel(context.Background())
+	w := &cancelAfterFirstWrite{cancel: cancel}
+	_, err := execute(queryCtx, db, &Config{Tenant: "default", Mode: ModeJSONL}, "SELECT id FROM cancel_probe", w)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("streamed execute error = %v, want context.Canceled", err)
+	}
+
+	writeCtx, writeCancel := context.WithTimeout(context.Background(), time.Second)
+	defer writeCancel()
+	stmt, err := tsql.ParseSQL("INSERT INTO cancel_probe VALUES (999)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tsql.Execute(writeCtx, db, "default", stmt); err != nil {
+		t.Fatalf("stream cancellation did not release database lock: %v", err)
+	}
+}
+
+func TestStorageFlagsAndOpenDatabase(t *testing.T) {
+	fs := flag.NewFlagSet("storage", flag.ContinueOnError)
+	flags := addStorageFlags(fs)
+	if err := fs.Parse([]string{"-storage", "hybrid", "-memory-limit", "2MiB", "-read-only", "-wal-sync", "normal", "-sync-on-mutate", "-compress"}); err != nil {
+		t.Fatal(err)
+	}
+	opts, err := flags.options()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.Mode != "hybrid" || opts.MemoryLimit != 2<<20 || !opts.ReadOnly || opts.WALSync != tsql.WALSyncNormal || !opts.SyncOnMutate || !opts.CompressFiles {
+		t.Fatalf("storage options = %#v", opts)
+	}
+
+	dir := filepath.Join(t.TempDir(), "disk-db")
+	db, savePath, err := openDatabaseWithOptions(dir, cliStorageOptions{Mode: "disk", WALSync: tsql.WALSyncFull})
+	if err != nil {
+		t.Fatalf("open disk backend: %v", err)
+	}
+	if savePath != "" {
+		t.Fatalf("disk backend save path = %q, want managed storage", savePath)
+	}
+	if got := db.StorageMode(); got != tsql.ModeDisk {
+		t.Fatalf("storage mode = %s, want disk", got)
+	}
+	stmt, err := tsql.ParseSQL("CREATE TABLE persisted (id INT)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tsql.Execute(context.Background(), db, "default", stmt); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close disk backend: %v", err)
+	}
+
+	reopened, _, err := openDatabaseWithOptions(dir, cliStorageOptions{Mode: "disk", WALSync: tsql.WALSyncFull, ReadOnly: true})
+	if err != nil {
+		t.Fatalf("reopen disk backend read-only: %v", err)
+	}
+	defer reopened.Close()
+	if !reopened.TableExists("default", "persisted") {
+		t.Fatal("persisted table missing after reopening disk backend")
 	}
 }
 

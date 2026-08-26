@@ -156,6 +156,26 @@ type queryResponse struct {
 	Truncated bool             `json:"truncated,omitempty"`
 }
 
+// queryStreamResponse is one record in the query streaming protocol shared
+// by HTTP NDJSON and gRPC QueryStream. Type is always one of "header",
+// "row", "end", or "error". A successful stream sends exactly one header,
+// zero or more rows, then one end. If execution fails after the header has
+// been delivered, it sends an error record and terminates instead.
+//
+// Keeping the wire type explicit rather than inferring it from optional fields
+// makes an empty result, an empty row, and an execution error unambiguous for
+// clients using either transport.
+type queryStreamResponse struct {
+	Type      string         `json:"type"`
+	SQL       string         `json:"sql,omitempty"`
+	Columns   []string       `json:"columns,omitempty"`
+	Row       map[string]any `json:"row,omitempty"`
+	Count     int            `json:"count,omitempty"`
+	Truncated bool           `json:"truncated,omitempty"`
+	Duration  string         `json:"duration,omitempty"`
+	Error     string         `json:"error,omitempty"`
+}
+
 // bootstrapRequest/bootstrapResponse and getChangesSinceRequest/
 // getChangesSinceResponse are the primary-side RPC types for one-way WAL
 // replication (see server.Bootstrap and server.GetChangesSince). Tenant is
@@ -242,6 +262,11 @@ func registerTinySQLServer(s *grpc.Server, srv TinySQLServer) {
 			{
 				StreamName:    "GetChanges",
 				Handler:       _TinySQL_GetChanges_Handler,
+				ServerStreams: true,
+			},
+			{
+				StreamName:    "QueryStream",
+				Handler:       _TinySQL_QueryStream_Handler,
 				ServerStreams: true,
 			},
 		},
@@ -412,6 +437,95 @@ func _TinySQL_GetChanges_Handler(srv any, stream grpc.ServerStream) (err error) 
 		}
 		backoff = replicaNextBackoff(backoff)
 	}
+}
+
+// _TinySQL_QueryStream_Handler is the server-streaming equivalent of Query.
+// It receives one queryRequest, then emits a header, rows, and a terminal
+// record through the JSON gRPC codec. Stream RPCs do not pass through the
+// unary interceptor, so this handler owns authentication, timeout handling,
+// panic recovery, and metrics explicitly.
+func _TinySQL_QueryStream_Handler(srv any, stream grpc.ServerStream) (err error) {
+	s, ok := srv.(*server)
+	if !ok {
+		return status.Error(codes.Internal, "unexpected server type")
+	}
+
+	start := time.Now()
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("panic in gRPC stream /tinysql.TinySQL/QueryStream: %v", rec)
+			err = status.Error(codes.Internal, "internal server error")
+		}
+		code := status.Code(err)
+		if s.metrics != nil {
+			s.metrics.Observe("grpc", "/tinysql.TinySQL/QueryStream", "SERVER_STREAM", int(code), time.Since(start))
+		}
+		if s.verbose {
+			log.Printf("grpc method=/tinysql.TinySQL/QueryStream status=%s duration=%s", code.String(), time.Since(start))
+		}
+		if code != codes.OK {
+			errMsg := ""
+			if err != nil {
+				errMsg = truncateForLog(err.Error(), maxLogErrorLen)
+			}
+			log.Printf("grpc FAILED method=/tinysql.TinySQL/QueryStream status=%s error=%q", code.String(), errMsg)
+		}
+	}()
+
+	if err := s.authorizeGRPCStream(stream.Context()); err != nil {
+		return err
+	}
+
+	var req queryRequest
+	if err := stream.RecvMsg(&req); err != nil {
+		return err
+	}
+
+	query, err := s.openQueryStream(stream.Context(), &req)
+	if err != nil {
+		return queryStreamGRPCError(err)
+	}
+	defer query.Close()
+
+	if err := stream.SendMsg(&queryStreamResponse{
+		Type:    "header",
+		SQL:     query.sql,
+		Columns: query.stream.Columns(),
+	}); err != nil {
+		return err
+	}
+
+	count, truncated, consumeErr := consumeQueryStream(query.stream, s.maxResponseRows, s.maxResponseBytes, func(row map[string]any) error {
+		return stream.SendMsg(&queryStreamResponse{Type: "row", Row: row})
+	})
+	if consumeErr != nil {
+		// A gRPC status still closes the RPC with a non-OK code, while the
+		// in-band record lets clients that already received rows retain the
+		// precise execution message without having to discard those rows.
+		if sendErr := stream.SendMsg(&queryStreamResponse{
+			Type:     "error",
+			SQL:      query.sql,
+			Count:    count,
+			Duration: time.Since(query.started).String(),
+			Error:    consumeErr.Error(),
+		}); sendErr != nil {
+			return sendErr
+		}
+		return queryStreamGRPCError(consumeErr)
+	}
+	if truncated {
+		// Do not keep scanning while a slow client is receiving the terminal
+		// cap record. Close waits until the engine has released its read lock.
+		query.Close()
+	}
+
+	return stream.SendMsg(&queryStreamResponse{
+		Type:      "end",
+		SQL:       query.sql,
+		Count:     count,
+		Truncated: truncated,
+		Duration:  time.Since(query.started).String(),
+	})
 }
 
 // server state
@@ -652,6 +766,13 @@ func (s *statusRecorder) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
+// Unwrap lets http.ResponseController reach optional capabilities such as
+// Flush through the metrics recorder. Without it, an NDJSON endpoint wrapped
+// by instrumentHTTP would silently lose its incremental delivery behavior.
+func (s *statusRecorder) Unwrap() http.ResponseWriter {
+	return s.ResponseWriter
+}
+
 func parseIP(raw string) net.IP {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -852,6 +973,185 @@ func (s *server) Query(ctx context.Context, req *queryRequest) (*queryResponse, 
 	}, nil
 }
 
+// queryStreamSession keeps the request context and execution slot alive for
+// exactly as long as a streamed query can still produce rows. In particular,
+// callers must Close it when they stop early because the engine may otherwise
+// still hold a read lock while blocked on backpressure.
+type queryStreamSession struct {
+	sql     string
+	stream  *engine.ResultStream
+	cancel  context.CancelFunc
+	release func()
+	started time.Time
+
+	closeOnce sync.Once
+}
+
+func (q *queryStreamSession) Close() {
+	if q == nil {
+		return
+	}
+	q.closeOnce.Do(func() {
+		// Close the engine stream before cancelling its parent context. An
+		// explicit ResultStream.Close is intentionally not reported as an
+		// execution error and, importantly, waits for its database read lock
+		// to be released before the server execution slot is returned.
+		if q.stream != nil {
+			_ = q.stream.Close()
+		}
+		if q.release != nil {
+			q.release()
+		}
+		if q.cancel != nil {
+			q.cancel()
+		}
+	})
+}
+
+// openQueryStream validates and starts a query without materializing all
+// rows. It deliberately owns the same request deadline, cache, and execution
+// semaphore policy as Query; the returned session transfers ownership of all
+// three resources to the caller.
+func (s *server) openQueryStream(ctx context.Context, req *queryRequest) (*queryStreamSession, error) {
+	if req == nil {
+		return nil, fmt.Errorf("query request is required")
+	}
+	started := time.Now()
+	tenant := s.tenantOrDefault(req.Tenant)
+	sqlText, err := s.normalizeSQL(req.SQL)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel, err := s.withRequestTimeoutOverride(ctx, req.TimeoutMS)
+	if err != nil {
+		return nil, err
+	}
+
+	compiled, err := s.cache.Compile(sqlText)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
+	release, err := s.acquireExecSlot(ctx)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
+	stream, err := compiled.Stream(ctx, s.db, tenant)
+	if err != nil {
+		release()
+		cancel()
+		return nil, err
+	}
+
+	return &queryStreamSession{
+		sql:     sqlText,
+		stream:  stream,
+		cancel:  cancel,
+		release: release,
+		started: started,
+	}, nil
+}
+
+// streamedResponseLimiter applies the existing response caps incrementally.
+// The extra Next call made after a row cap is reached establishes whether
+// there really was another row, so an exactly-at-the-limit result is not
+// reported as truncated.
+type streamedResponseLimiter struct {
+	maxRows  int
+	maxBytes int64
+	count    int
+	bytes    int64
+}
+
+func (l *streamedResponseLimiter) allow(row map[string]any) (bool, error) {
+	if l.maxRows > 0 && l.count >= l.maxRows {
+		return false, nil
+	}
+	if l.maxBytes > 0 {
+		encoded, err := json.Marshal(row)
+		if err != nil {
+			return false, fmt.Errorf("encode streamed row for response limit: %w", err)
+		}
+		// Match truncateRows' approximate JSON-row accounting: row bytes plus
+		// one separator/newline byte.
+		if l.bytes+int64(len(encoded))+1 > l.maxBytes {
+			return false, nil
+		}
+		l.bytes += int64(len(encoded)) + 1
+	}
+	l.count++
+	return true, nil
+}
+
+// consumeQueryStream drives an engine ResultStream until EOF, an output cap,
+// or an output error. The callback is synchronous by design: network writes
+// naturally provide backpressure all the way to the engine's bounded result
+// channel instead of queueing an unbounded response in the server.
+func consumeQueryStream(stream *engine.ResultStream, maxRows int, maxBytes int64, emit func(map[string]any) error) (count int, truncated bool, err error) {
+	if stream == nil {
+		return 0, false, fmt.Errorf("query stream is nil")
+	}
+	limiter := streamedResponseLimiter{maxRows: maxRows, maxBytes: maxBytes}
+	for stream.Next() {
+		row := stream.Row()
+		allowed, limitErr := limiter.allow(row)
+		if limitErr != nil {
+			return limiter.count, false, limitErr
+		}
+		if !allowed {
+			return limiter.count, true, nil
+		}
+		if err := emit(row); err != nil {
+			return limiter.count - 1, false, err
+		}
+	}
+	return limiter.count, false, stream.Err()
+}
+
+func (s *server) authorizeGRPCStream(ctx context.Context) error {
+	if s.authToken == "" {
+		return nil
+	}
+	token := ""
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if vals := md.Get("authorization"); len(vals) > 0 {
+			token = bearerToken(vals[0])
+		}
+	}
+	if !s.isAuthorized(token) {
+		return status.Error(codes.Unauthenticated, "unauthorized")
+	}
+	return nil
+}
+
+// queryStreamGRPCError turns an error that happened while starting or
+// executing a query into a stable gRPC status. Message-send failures are
+// returned by the handler unchanged, since grpc-go already has their precise
+// transport status.
+func queryStreamGRPCError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if _, ok := status.FromError(err); ok {
+		return err
+	}
+	switch {
+	case errors.Is(err, context.Canceled):
+		return status.Error(codes.Canceled, err.Error())
+	case errors.Is(err, context.DeadlineExceeded):
+		return status.Error(codes.DeadlineExceeded, err.Error())
+	default:
+		// SQL parsing, planning, and evaluation errors are user-visible query
+		// errors in the unary API too, so classify them as InvalidArgument
+		// rather than turning a bad statement into an opaque server failure.
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+}
+
 // errNoAdvancedWAL is returned (wrapped in a gRPC FailedPrecondition status)
 // by Bootstrap and GetChangesSince when the database has no AdvancedWAL
 // attached -- i.e. it is not running with a DSN mode=advanced_wal -- so
@@ -1015,6 +1315,106 @@ func (s *server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleQueryStream returns the same query data as handleQuery, but as
+// newline-delimited JSON records. Header validation and compilation failures
+// are regular JSON HTTP errors before the response begins. Once a header or
+// row has been sent, a later execution error is emitted as a final NDJSON
+// {"type":"error"} record because HTTP can no longer change its status code.
+func (s *server) handleQueryStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeErrorJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req queryRequest
+	if err := decodeJSONBody(w, r, s.maxBodyBytes, &req); err != nil {
+		writeErrorJSON(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+
+	query, err := s.openQueryStream(r.Context(), &req)
+	if err != nil {
+		writeErrorJSON(w, queryStreamHTTPStatus(err), err.Error())
+		return
+	}
+	defer query.Close()
+
+	// Explicitly disable intermediary buffering where the common reverse
+	// proxies support it. The actual correctness mechanism is the synchronous
+	// Encode+Flush below, which keeps network backpressure attached to the
+	// bounded engine ResultStream channel.
+	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	encoder := json.NewEncoder(w)
+	writeEvent := func(event *queryStreamResponse) error {
+		if err := encoder.Encode(event); err != nil {
+			return err
+		}
+		return flushStreamingResponse(w)
+	}
+
+	if err := writeEvent(&queryStreamResponse{
+		Type:    "header",
+		SQL:     query.sql,
+		Columns: query.stream.Columns(),
+	}); err != nil {
+		return
+	}
+
+	count, truncated, consumeErr := consumeQueryStream(query.stream, s.maxResponseRows, s.maxResponseBytes, func(row map[string]any) error {
+		return writeEvent(&queryStreamResponse{Type: "row", Row: row})
+	})
+	if consumeErr != nil {
+		// The peer may have gone away; in that case Encode/Flush simply fails
+		// and returning lets the deferred Close cancel the producer promptly.
+		_ = writeEvent(&queryStreamResponse{
+			Type:     "error",
+			SQL:      query.sql,
+			Count:    count,
+			Duration: time.Since(query.started).String(),
+			Error:    consumeErr.Error(),
+		})
+		return
+	}
+	if truncated {
+		// Stop scanning before sending the terminal record so an early client
+		// response cap releases both the DB read lock and the execution slot.
+		query.Close()
+	}
+	_ = writeEvent(&queryStreamResponse{
+		Type:      "end",
+		SQL:       query.sql,
+		Count:     count,
+		Truncated: truncated,
+		Duration:  time.Since(query.started).String(),
+	})
+}
+
+func queryStreamHTTPStatus(err error) int {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return http.StatusRequestTimeout
+	default:
+		return http.StatusBadRequest
+	}
+}
+
+// flushStreamingResponse asks net/http to flush this record immediately. A
+// ResponseController follows middleware Unwrap methods, so it also works
+// through statusRecorder. Some small test/custom ResponseWriters intentionally
+// do not support flushing; they remain correct (just not incrementally
+// visible), hence ErrNotSupported is not a request failure.
+func flushStreamingResponse(w http.ResponseWriter) error {
+	err := http.NewResponseController(w).Flush()
+	if errors.Is(err, http.ErrNotSupported) {
+		return nil
+	}
+	return err
 }
 
 func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -1886,6 +2286,7 @@ func startHTTPServer(srv *server, db *storage.DB, httpAddr string, minTLSVersion
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/exec", srv.instrumentHTTP("/api/exec", srv.withAuth(srv.handleExec)))
 	mux.HandleFunc("/api/query", srv.instrumentHTTP("/api/query", srv.withAuth(srv.handleQuery)))
+	mux.HandleFunc("/api/query/stream", srv.instrumentHTTP("/api/query/stream", srv.withAuth(srv.handleQueryStream)))
 	mux.HandleFunc("/api/status", srv.instrumentHTTP("/api/status", srv.withAuth(srv.handleStatus)))
 	mux.HandleFunc("/api/cluster/status", srv.instrumentHTTP("/api/cluster/status", srv.withAuth(srv.handleClusterStatus)))
 	mux.HandleFunc("/api/federated/query", srv.instrumentHTTP("/api/federated/query", srv.withAuth(srv.handleFederatedQuery)))

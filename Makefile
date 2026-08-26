@@ -8,7 +8,7 @@ SHELL := /usr/bin/env bash
 .PHONY: build-gh-pages-demo check-gh-pages-demo update-gh-pages push-gh-pages
 .PHONY: test-all test-unit test-integration test-jsonv2 test-ci coverage build-check wasm-check tinygo-wasm ci verify verify-ci
 .PHONY: test-query-files test-query-files-wasm test-fsql
-.PHONY: run-wasm-browser run-wasm-node-demo deps deps-all update-deps tidy tidy-all modules-verify bench bench-engine bench-hotpaths script-lint docker-build info
+.PHONY: run-wasm-browser run-wasm-node-demo deps deps-all update-deps tidy tidy-all modules-verify bench bench-engine bench-hotpaths bench-stream bench-stream-guard release-check script-lint docker-build info
 .DEFAULT_GOAL := help
 
 # Variables
@@ -17,11 +17,16 @@ GOFLAGS :=
 BINARY_DIR := bin
 CMD_DIR := cmd
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
-LDFLAGS := -ldflags "-X main.Version=$(VERSION)"
+LDFLAGS := -ldflags "-X main.Version=$(VERSION) -X github.com/SimonWaldherr/tinySQL/internal/engine.BuildVersion=$(VERSION)"
 GO_BUILD_FLAGS := $(GOFLAGS) $(LDFLAGS)
 GO_TEST_FLAGS ?= -v
 COVERPROFILE ?= coverage.out
 BENCH_COUNT ?= 3
+# The stream guard is deliberately generous on time for shared CI runners but
+# strict on allocation: a first result must not allocate a full 20k-row result
+# set before it can be observed. Override only with measured platform evidence.
+STREAM_FIRST_ROW_MAX_NS ?= 50000000
+STREAM_FIRST_ROW_MAX_B ?= 262144
 WASM_BROWSER_SCRIPT := ./$(CMD_DIR)/wasm_browser/build.sh
 WASM_NODE_SCRIPT := ./$(CMD_DIR)/wasm_node/build.sh
 TINYGO_IMAGE ?= tinygo/tinygo:0.41.1
@@ -336,6 +341,43 @@ bench-hotpaths:
 	$(GO) test -run=none -bench='^(BenchmarkOrderByWithLimit|BenchmarkInsertIntoLargePKTable|BenchmarkUpdateByPrimaryKey|BenchmarkDeleteByPrimaryKey|BenchmarkTriggerBatchInsert)$$' -benchmem -count=$(BENCH_COUNT) ./internal/engine
 	$(GO) test -run=none -bench='^BenchmarkExecute_Insert$$' -benchmem -count=$(BENCH_COUNT) .
 
+## bench-stream: Measure direct and materialized time-to-first-row paths
+bench-stream:
+	@echo "$(GREEN)Running streaming time-to-first-row benchmarks ($(BENCH_COUNT)x)...$(NC)"
+	$(GO) test -run='^$$' -bench='^Benchmark(Execute(Stream|Materialized)FirstRow|DriverStreamFirstRow|CLIStreamFirstRow)$$' -benchmem -count=$(BENCH_COUNT) ./internal/engine ./internal/driver ./cmd/tinysql
+	cd ./$(CMD_DIR)/server && $(GO) test -run='^$$' -bench='^BenchmarkServerStreamFirstRow$$' -benchmem -count=$(BENCH_COUNT) .
+
+## bench-stream-guard: Enforce bounded allocation and latency before first streamed row
+bench-stream-guard:
+	@set -eu; \
+	result="$$(mktemp)"; \
+	trap 'rm -f "$$result"' EXIT; \
+	$(GO) test -run='^$$' -bench='^BenchmarkExecuteStreamFirstRow$$' -benchmem -benchtime=1x ./internal/engine >"$$result"; \
+	cat "$$result"; \
+	ns="$$(awk '/^BenchmarkExecuteStreamFirstRow/ { for (i = 1; i <= NF; i++) if ($$i == "ns\/op") { print $$(i-1); exit } }' "$$result")"; \
+	bytes="$$(awk '/^BenchmarkExecuteStreamFirstRow/ { for (i = 1; i <= NF; i++) if ($$i == "B\/op") { print $$(i-1); exit } }' "$$result")"; \
+	test -n "$$ns" && test -n "$$bytes"; \
+	if [ "$$ns" -gt "$(STREAM_FIRST_ROW_MAX_NS)" ]; then \
+		echo "$(RED)stream first row took $$ns ns/op (budget $(STREAM_FIRST_ROW_MAX_NS))$(NC)"; exit 1; \
+	fi; \
+	if [ "$$bytes" -gt "$(STREAM_FIRST_ROW_MAX_B)" ]; then \
+		echo "$(RED)stream first row allocated $$bytes B/op (budget $(STREAM_FIRST_ROW_MAX_B))$(NC)"; exit 1; \
+	fi; \
+	echo "$(GREEN)✓ Streaming first-row budgets met: $$ns ns/op, $$bytes B/op$(NC)"
+
+## release-check: Cross-compile every published CLI target without keeping artifacts
+release-check:
+	@set -eu; \
+	tmpdir="$$(mktemp -d)"; \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do \
+		goos="$${target%/*}"; goarch="$${target#*/}"; ext=""; \
+		if [ "$$goos" = windows ]; then ext=.exe; fi; \
+		echo "$(GREEN)→ tinysql $$goos/$$goarch$(NC)"; \
+		CGO_ENABLED=0 GOOS="$$goos" GOARCH="$$goarch" $(GO) build -trimpath $(LDFLAGS) -o "$$tmpdir/tinysql-$$goos-$$goarch$$ext" ./$(CMD_DIR)/tinysql; \
+	done; \
+	echo "$(GREEN)✓ All release CLI targets compile$(NC)"
+
 ## lint: Run linter (golangci-lint)
 lint:
 	@echo "$(GREEN)Running linter...$(NC)"
@@ -423,7 +465,7 @@ verify-ci: fmt-check vet build-check test-all
 	@echo "$(GREEN)✓ CI verification passed$(NC)"
 
 ## ci: Run the complete standard-Go CI matrix
-ci: fmt-check modules-verify build-check wasm-check vet test-ci
+ci: fmt-check modules-verify build-check wasm-check vet test-ci bench-stream-guard
 	@echo "$(GREEN)✓ Standard-Go CI verification passed$(NC)"
 
 ## clean: Remove build artifacts

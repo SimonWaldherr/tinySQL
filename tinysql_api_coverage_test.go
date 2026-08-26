@@ -100,6 +100,22 @@ func TestPublicStreamingSQL(t *testing.T) {
 	if err := compiledStream.Close(); err != nil {
 		t.Fatal(err)
 	}
+
+	strict, err := tsql.ExecSQLStreamWithOptions(ctx, db, "default", `SELECT id FROM stream_api`, tsql.StreamOptions{Buffer: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for strict.Next() {
+	}
+	if err := strict.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if got := strict.Stats(); got.BufferCapacity != 0 || got.RowsProduced != 2 || !got.Complete {
+		t.Fatalf("strict stream stats = %#v", got)
+	}
+	if tsql.APIVersion != 1 || tsql.Version() == "" {
+		t.Fatalf("unexpected public package version: api=%d version=%q", tsql.APIVersion, tsql.Version())
+	}
 }
 
 func TestPublicReaderWriterPersistence(t *testing.T) {
@@ -244,6 +260,12 @@ func TestPublicAPICompiledExecutionAndJobScheduler(t *testing.T) {
 		}()
 		_ = tsql.MustCompile(cache, "CREATE TABLE")
 	}()
+	if _, err := tsql.ExecuteCompiled(ctx, db, "default", nil); err == nil {
+		t.Fatal("expected nil compiled execution to fail")
+	}
+	if _, err := tsql.ExecuteCompiledStream(ctx, db, "default", nil); err == nil {
+		t.Fatal("expected nil compiled stream to fail")
+	}
 
 	exec := tsql.NewSQLJobExecutor(db, "")
 	if exec.Tenant != "default" {

@@ -76,11 +76,16 @@ func (c *conn) queryPreparedAdHoc(ctx context.Context, pq *preparedQuery, args [
 		pq.release(exec)
 		return nil, false, nil
 	}
-	defer pq.release(exec)
 	for i, arg := range args {
 		exec.params[i].Val = driverValueLiteral(arg.Value)
 	}
-	rows, err := c.queryStatement(ctx, exec.statement)
+	// queryStatementWithCleanup takes ownership of the borrowed execution and
+	// returns it only once the result stream has stopped. Releasing here would
+	// race a later QueryContext binding against the producer's WHERE/projection
+	// evaluation.
+	rows, err := c.queryStatementWithCleanup(ctx, exec.statement, func() {
+		pq.release(exec)
+	})
 	return rows, true, err
 }
 

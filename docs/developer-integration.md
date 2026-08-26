@@ -113,6 +113,12 @@ Key points:
   primitives. For multiple statements, split the SQL text yourself or reuse the
   helpers from the WASM tool.
 
+For large result sets, use `ExecSQLStream` and always close a stream when
+stopping early. `StreamOptions{Buffer: 0}` provides strict backpressure, and
+`stream.Stats()` exposes progress without racing the consumer. See the
+[API stability guide](./api-stability.md) for the compatibility and streaming
+contract.
+
 #### Using `database/sql`
 
 If your code already expects a `database/sql` handle,
@@ -196,6 +202,25 @@ Use the DSN for tinySQL-specific options, `database/sql` for pool parameters
 (`MaxOpenConns`, `MaxIdleConns`, `ConnMaxLifetime`, `ConnMaxIdleTime`), and
 `context.WithTimeout(...)` with `ExecContext`/`QueryContext`/`PingContext` per
 query.
+
+`QueryContext` now streams ordinary `SELECT` results through `sql.Rows`; do
+not call `rows.Close` late when you only need a prefix, because it is the
+signal that releases the query's producer, reader slot, and prepared-statement
+binding. `ORDER BY`, grouping, joins, and other global query shapes preserve
+their exact semantics by materializing before their first row.
+
+```go
+rows, err := db.QueryContext(ctx, `SELECT id, name FROM users WHERE active = ?`, true)
+if err != nil { panic(err) }
+defer rows.Close()
+for rows.Next() {
+    var id int
+    var name string
+    if err := rows.Scan(&id, &name); err != nil { panic(err) }
+    fmt.Println(id, name)
+}
+if err := rows.Err(); err != nil { panic(err) }
+```
 
 #### Transactions and concurrent writes
 

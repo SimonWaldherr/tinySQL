@@ -4,6 +4,7 @@ package driver
 import (
 	"context"
 	"database/sql/driver"
+	"sync"
 	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/engine"
@@ -65,17 +66,57 @@ func statementReturnsRows(st engine.Statement) bool {
 // deliberately shared by normal and prepared queries so locking, snapshots,
 // and database/sql row ownership remain identical.
 func (c *conn) queryStatement(ctx context.Context, st engine.Statement) (driver.Rows, error) {
+	return c.queryStatementWithCleanup(ctx, st, nil)
+}
+
+// queryStatementWithCleanup starts a read-shaped statement and transfers
+// ownership of both the server reader reservation and cleanup to the returned
+// rows. The cleanup is primarily used by prepared statements: ExecuteStream
+// keeps evaluating the borrowed AST after QueryContext returns, so releasing
+// it before Rows reaches EOF or Close would let another execution overwrite
+// bound literals while the producer is still scanning.
+//
+// onClose is always consumed by this function: immediately on a start error,
+// or later by rows.Close after the stream producer has stopped.
+func (c *conn) queryStatementWithCleanup(ctx context.Context, st engine.Statement, onClose func()) (driver.Rows, error) {
 	if err := c.srv.acquireReader(ctx); err != nil {
+		if onClose != nil {
+			onClose()
+		}
 		return nil, err
 	}
-	defer c.srv.releaseReader()
 	c.srv.mu.RLock()
-	defer c.srv.mu.RUnlock()
-	rs, err := engine.Execute(ctx, c.currentDB(), c.tenant, st)
+	stream, err := engine.ExecuteStream(ctx, c.currentDB(), c.tenant, st)
 	if err != nil {
+		c.srv.mu.RUnlock()
+		c.srv.releaseReader()
+		if onClose != nil {
+			onClose()
+		}
 		return nil, err
 	}
-	return &rows{rs: rs}, nil
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			c.srv.mu.RUnlock()
+			c.srv.releaseReader()
+			if onClose != nil {
+				onClose()
+			}
+		})
+	}
+	// Buffered rows no longer refer to the database or the prepared statement.
+	// Release their ownership as soon as production completes; Close retains
+	// the same release path for a producer blocked by backpressure.
+	go func() {
+		<-stream.Done()
+		release()
+	}()
+	return &rows{
+		stream:     stream,
+		streamCols: stream.Columns(),
+		onClose:    release,
+	}, nil
 }
 
 // NamedValueChecker

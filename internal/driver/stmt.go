@@ -23,9 +23,10 @@ type stmt struct {
 
 // preparedQuery is an immutable prepared-statement template. Each execution
 // borrows an exclusive AST plus literal slots from pool, which avoids both
-// reparsing on warm workers and the former statement-wide mutex. A pooled AST
-// never escapes queryStatement: engine.Execute has materialized its ResultSet
-// before the execution state is returned to the pool.
+// reparsing on warm workers and the former statement-wide mutex. A streamed
+// SELECT keeps its borrowed AST until the returned driver.Rows reaches EOF or
+// Close, because engine.ExecuteStream can still dereference bound literals
+// after QueryContext has returned.
 type preparedQuery struct {
 	markerSQL string
 	markers   []string
@@ -92,11 +93,34 @@ func (s *stmt) queryPrepared(ctx context.Context, args []driver.NamedValue) (dri
 	if err != nil {
 		return nil, err
 	}
-	defer s.prepared.release(exec)
 	for i, arg := range args {
 		exec.params[i].Val = driverValueLiteral(arg.Value)
 	}
-	return s.c.queryStatement(ctx, exec.statement)
+
+	// SELECTs can be consumed incrementally. Ownership of exec transfers to
+	// the rows object, which releases it only after its stream has stopped.
+	if !isWriteStatement(exec.statement) {
+		return s.c.queryStatementWithCleanup(ctx, exec.statement, func() {
+			s.prepared.release(exec)
+		})
+	}
+
+	// Keep DML (including RETURNING) on its established writer/durability path.
+	// The resulting rows are deliberately materialized: a write must complete
+	// atomically and be persisted before database/sql observes any RETURNING
+	// row.
+	defer s.prepared.release(exec)
+	if statementReturnsRows(exec.statement) {
+		rs, err := s.c.executeWriteStatement(ctx, exec.statement)
+		if err != nil {
+			return nil, err
+		}
+		return &rows{rs: rs}, nil
+	}
+	if _, err := s.c.execStatement(ctx, exec.statement); err != nil {
+		return nil, err
+	}
+	return emptyRows{}, nil
 }
 
 // execPrepared runs a prepared INSERT/UPDATE/DELETE straight off its pooled
@@ -183,8 +207,9 @@ func (p *preparedQuery) newExecution() (*preparedExecution, error) {
 	if err != nil {
 		return nil, err
 	}
-	// SELECT reuses its ResultSet-producing path unchanged (queryPrepared).
-	// INSERT/UPDATE/DELETE are read-only over their own AST during execution
+	// SELECT borrows an AST until its rows stream is closed; DML remains fully
+	// materialized before release. INSERT/UPDATE/DELETE are read-only over
+	// their own AST during execution
 	// (executeInsert/executeUpdate/executeDelete only ever read s.Rows/
 	// s.Sets/s.Where to evaluate values and rebind via evalExpr; nothing
 	// mutates the statement node itself), so the same acquire/rebind-
