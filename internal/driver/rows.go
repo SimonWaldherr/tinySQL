@@ -105,18 +105,13 @@ func (r *rows) copyRow(row engine.Row, cols []string, dest []driver.Value) error
 	for i := range cols {
 		v := row[r.lowerCols[i]]
 		switch vv := v.(type) {
-		case nil:
-			dest[i] = nil
+		case nil, int64, float64, bool, string:
+			// These values already have a database/sql-supported dynamic type.
+			// Preserve the existing interface box: assigning the type-switch
+			// variable would box numeric values again and allocate per cell.
+			dest[i] = v
 		case int:
 			dest[i] = int64(vv)
-		case int64:
-			dest[i] = vv
-		case float64:
-			dest[i] = vv
-		case bool:
-			dest[i] = vv
-		case string:
-			dest[i] = vv
 		case time.Time:
 			// RFC3339Nano to match the bind path (CheckNamedValue), so sub-second
 			// precision survives a bind -> store -> scan round trip.

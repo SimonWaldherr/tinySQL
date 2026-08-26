@@ -18,7 +18,9 @@ import (
 
 // Parser holds the lexer and current/peek tokens for recursive-descent parsing.
 type Parser struct {
-	lx   *lexer
+	// Keep the lexer in the parser allocation. A parser owns exactly one lexer,
+	// so a separate heap object only adds allocation and pointer chasing.
+	lx   lexer
 	cur  token
 	peek token
 	// depth tracks combined expression/subquery recursion nesting. Without
@@ -52,7 +54,7 @@ func (p *Parser) exitRecursion() {
 
 // NewParser creates a new SQL parser for the provided input string.
 func NewParser(sql string) *Parser {
-	p := &Parser{lx: newLexer(sql)}
+	p := &Parser{lx: lexer{s: sql}}
 	p.cur = p.lx.nextToken()
 	p.peek = p.lx.nextToken()
 	return p

@@ -99,9 +99,9 @@ func (p *Parser) startsTableLevelConstraint() bool {
 // re-growing it later.) The extra tokenization happens solely for items whose
 // first word is CONSTRAINT.
 func (p *Parser) tokenAfterPeek() token {
-	saved := *p.lx
+	saved := p.lx
 	tok := p.lx.nextToken()
-	*p.lx = saved
+	p.lx = saved
 	return tok
 }
 

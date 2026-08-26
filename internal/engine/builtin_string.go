@@ -341,11 +341,26 @@ func evalLength(env ExecEnv, args []Expr, row Row) (any, error) {
 // split a multi-byte character into invalid UTF-8.
 func stringRunes(str string) []rune { return []rune(str) }
 
+func stringIsASCII(str string) bool {
+	for i := 0; i < len(str); i++ {
+		if str[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
 func stringPrefix(str string, length int) string {
-	runes := stringRunes(str)
 	if length <= 0 {
 		return ""
 	}
+	if stringIsASCII(str) {
+		if length >= len(str) {
+			return str
+		}
+		return str[:length]
+	}
+	runes := stringRunes(str)
 	if length >= len(runes) {
 		return str
 	}
@@ -385,21 +400,27 @@ func evalSubstring(env ExecEnv, args []Expr, row Row) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("SUBSTRING start position must be an integer")
 	}
-	runes := stringRunes(str)
+	ascii := stringIsASCII(str)
+	var runes []rune
+	charLen := len(str)
+	if !ascii {
+		runes = stringRunes(str)
+		charLen = len(runes)
+	}
 	// SQL positions start at one. Negative positions count from the end;
 	// zero remains a forgiving alias for the first character.
 	switch {
 	case start > 0:
 		start--
 	case start < 0:
-		start += len(runes)
+		start += charLen
 	default:
 		start = 0
 	}
 	if start < 0 {
 		start = 0
 	}
-	if start >= len(runes) {
+	if start >= charLen {
 		return "", nil
 	}
 
@@ -425,12 +446,18 @@ func evalSubstring(env ExecEnv, args []Expr, row Row) (any, error) {
 			return "", nil
 		}
 		end := start + length
-		if end > len(runes) {
-			end = len(runes)
+		if end > charLen {
+			end = charLen
+		}
+		if ascii {
+			return str[start:end], nil
 		}
 		return string(runes[start:end]), nil
 	}
 
+	if ascii {
+		return str[start:], nil
+	}
 	return string(runes[start:]), nil
 }
 
@@ -467,6 +494,15 @@ func evalLeft(env ExecEnv, args []Expr, row Row) (any, error) {
 
 	if length < 0 {
 		return "", nil
+	}
+	if stringIsASCII(str) {
+		if length >= len(str) {
+			if _, ok := val.(string); ok {
+				return val, nil
+			}
+			return str, nil
+		}
+		return str[:length], nil
 	}
 	if length >= utf8.RuneCountInString(str) {
 		if _, ok := val.(string); ok {
@@ -510,6 +546,15 @@ func evalRight(env ExecEnv, args []Expr, row Row) (any, error) {
 
 	if length < 0 {
 		return "", nil
+	}
+	if stringIsASCII(str) {
+		if length >= len(str) {
+			if _, ok := val.(string); ok {
+				return val, nil
+			}
+			return str, nil
+		}
+		return str[len(str)-length:], nil
 	}
 	runes := stringRunes(str)
 	if length >= len(runes) {
