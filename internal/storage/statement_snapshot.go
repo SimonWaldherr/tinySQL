@@ -204,8 +204,8 @@ type appendOnlyTableState struct {
 }
 
 // rowUpdateTableState stores only the rows a point UPDATE may replace plus the
-// table metadata changed by every successful UPDATE. The caller guarantees
-// that the statement cannot mutate a secondary index.
+// table metadata changed by every successful UPDATE. Secondary indexes are
+// restored row-locally from these pre-update rows.
 type rowUpdateTableState struct {
 	table          *Table
 	rowIDs         []int
@@ -306,9 +306,9 @@ func (db *DB) SnapshotForAppendOnlyTableStatement(tenant, name string) (*Stateme
 
 // SnapshotForRowUpdateStatement captures a lightweight rollback point for an
 // UPDATE whose candidate row IDs are already known through a PRIMARY KEY or
-// UNIQUE constraint seek. Callers must use a table/full snapshot when triggers,
-// foreign-key actions, or an assignment to a secondary-indexed column can
-// mutate state beyond these rows.
+// UNIQUE constraint seek. Callers must use a table/full snapshot when triggers
+// or foreign-key actions can mutate state beyond these rows. Secondary-index
+// entries for the bounded rows are restored directly on rollback.
 func (db *DB) SnapshotForRowUpdateStatement(tenant, name string, rowIDs []int) (*StatementSnapshot, error) {
 	if db == nil {
 		return nil, nil
@@ -329,7 +329,9 @@ func (db *DB) SnapshotForRowUpdateStatement(tenant, name string, rowIDs []int) (
 		rowUpdate: &rowUpdateTableState{
 			table:          table,
 			rowIDs:         append([]int(nil), rowIDs...),
-			rows:           cloneRows(rows),
+			// UPDATE replaces row slices instead of mutating their cells in place,
+			// so these original headers are an immutable rollback image.
+			rows:           rows,
 			version:        table.Version,
 			stats:          cloneTableStats(table.Stats),
 			dirtyFrom:      table.dirtyFrom,
@@ -506,7 +508,11 @@ func restoreRowUpdateTable(state *rowUpdateTableState) {
 	}
 	table := state.table
 	table.dropDerived()
+	indexNames := table.SortedIndexNames()
 	for i, rowID := range state.rowIDs {
+		if len(indexNames) > 0 {
+			_ = table.UpdateSecondaryIndexRow(rowID, table.Rows[rowID], state.rows[i], indexNames)
+		}
 		table.Rows[rowID] = state.rows[i]
 	}
 	table.Version = state.version

@@ -168,6 +168,11 @@ type dmlPlan struct {
 	colIndex    map[string]int
 	rowIDs      []int
 	rowIDsFound bool
+	// updateSets resolves and sorts UPDATE assignments once. The same compact
+	// list feeds snapshot selection, the simple fast path and the general path.
+	updateSets       []simpleUpdateSet
+	updateSetsKnown  bool
+	updateIndexNames []string
 }
 
 func (p *dmlPlan) hasTriggers() bool { return len(p.before) > 0 || len(p.after) > 0 }
@@ -260,6 +265,13 @@ func newDMLPlan(out *dmlPlan, db *storage.DB, tenant string, stmt Statement) *dm
 		return plan
 	}
 	plan.table = table
+	if update, ok := stmt.(*Update); ok {
+		if sets, setErr := resolveUpdateSets(table, update.Sets); setErr == nil {
+			plan.updateSets = sets
+			plan.updateSetsKnown = true
+			plan.updateIndexNames = secondaryIndexNamesForUpdate(table, sets)
+		}
+	}
 	if plan.hasTriggers() {
 		// Every consumer of colIndex/rowIDs below is disabled by a trigger.
 		return plan
@@ -323,8 +335,8 @@ func appendOnlySnapshotTarget(plan *dmlPlan) (string, bool) {
 
 // rowUpdateSnapshotTarget identifies a point UPDATE whose constraint-index
 // candidate set bounds every row the statement can replace. The compact
-// snapshot is safe only when no trigger/FK can write elsewhere and none of the
-// assigned columns belongs to a secondary index.
+// snapshot is safe when no trigger/FK can write elsewhere; storage restores
+// secondary-index entries for those bounded rows as part of rollback.
 func rowUpdateSnapshotTarget(plan *dmlPlan) (string, []int, bool) {
 	if plan == nil {
 		return "", nil, false
@@ -333,35 +345,13 @@ func rowUpdateSnapshotTarget(plan *dmlPlan) (string, []int, bool) {
 	if !ok || plan.tenantFK || plan.hasTriggers() {
 		return "", nil, false
 	}
-	if plan.table == nil || updateTouchesSecondaryIndex(plan.table, s) {
+	if plan.table == nil {
 		return "", nil, false
 	}
 	if !plan.rowIDsFound {
 		return "", nil, false
 	}
 	return s.Table, plan.rowIDs, true
-}
-
-func updateTouchesSecondaryIndex(table *storage.Table, s *Update) bool {
-	if table == nil || len(table.Indexes) == 0 {
-		return false
-	}
-	updated := make(map[int]struct{}, len(s.Sets))
-	for name := range s.Sets {
-		if col, err := table.ColIndex(name); err == nil {
-			updated[col] = struct{}{}
-		}
-	}
-	for _, index := range table.Indexes {
-		for _, name := range index.Columns {
-			if col, err := table.ColIndex(name); err == nil {
-				if _, ok := updated[col]; ok {
-					return true
-				}
-			}
-		}
-	}
-	return false
 }
 
 // rowDeleteSnapshotTarget identifies a single-row DELETE whose rollback can

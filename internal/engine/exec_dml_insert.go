@@ -79,7 +79,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 	// should be checked against. See fkTargetCache.
 	var fks *fkTargetCache
 	if !hasBefore && !hasAfter {
-		fks = newFKTargetCache()
+		fks = &fkTargetCache{}
 	}
 	// The index set cannot change mid-statement, so its sorted name list is
 	// computed once here instead of being rebuilt and re-sorted on every row.
@@ -92,6 +92,8 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 	// of the schema; computed once here instead of validateRowConstraintsWith
 	// visiting every column of the table (constrained or not) on every row.
 	constrainedCols := constrainedColumnIndices(t.Cols)
+	var constraintScratch [8]*constraintIndexEntry
+	insertConstraints := prepareInsertConstraintCache(t, constrainedCols, !hasBefore && !hasAfter, constraintScratch[:])
 	wal, err := beginWALAuto(env, s.Table)
 	if err != nil {
 		return nil, err
@@ -120,11 +122,11 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 			if err := validateInsertNonUniqueConstraints(env, t, row, constrainedCols, fks); err != nil {
 				return nil, err
 			}
-			if insertConflictsUniqueConstraint(t, row) {
+			if insertConflictsUniqueConstraint(t, row, insertConstraints) {
 				continue
 			}
 		}
-		if err := validateRowConstraintsWith(env, t, row, -1, constrainedCols, fks); err != nil {
+		if err := validateRowConstraintsWith(env, t, row, -1, constrainedCols, fks, insertConstraints); err != nil {
 			return nil, err
 		}
 		if err := t.CheckSecondaryIndexConstraints(row, -1); err != nil {
@@ -140,6 +142,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 			}
 		}
 		t.Rows = append(t.Rows, row)
+		insertConstraints.noteAppended(len(t.Rows)-1, row, len(t.Rows))
 		if err := t.InsertSecondaryIndexRow(len(t.Rows)-1, row, indexNames); err != nil {
 			return nil, err
 		}
@@ -200,7 +203,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	// should be checked against. See fkTargetCache.
 	var fks *fkTargetCache
 	if !hasBefore && !hasAfter {
-		fks = newFKTargetCache()
+		fks = &fkTargetCache{}
 	}
 	// The index set cannot change mid-statement, so its sorted name list is
 	// computed once here instead of being rebuilt and re-sorted on every row.
@@ -212,6 +215,8 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	// See executeInsertAllColumns: both are pure functions of the schema,
 	// computed once per statement instead of per row.
 	constrainedCols := constrainedColumnIndices(t.Cols)
+	var constraintScratch [8]*constraintIndexEntry
+	insertConstraints := prepareInsertConstraintCache(t, constrainedCols, !hasBefore && !hasAfter, constraintScratch[:])
 	hasDefaults := tableHasDefaults(t.Cols)
 	wal, err := beginWALAuto(env, s.Table)
 	if err != nil {
@@ -246,11 +251,11 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			if err := validateInsertNonUniqueConstraints(env, t, row, constrainedCols, fks); err != nil {
 				return nil, err
 			}
-			if insertConflictsUniqueConstraint(t, row) {
+			if insertConflictsUniqueConstraint(t, row, insertConstraints) {
 				continue
 			}
 		}
-		if err := validateRowConstraintsWith(env, t, row, -1, constrainedCols, fks); err != nil {
+		if err := validateRowConstraintsWith(env, t, row, -1, constrainedCols, fks, insertConstraints); err != nil {
 			return nil, err
 		}
 		if err := t.CheckSecondaryIndexConstraints(row, -1); err != nil {
@@ -266,6 +271,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			}
 		}
 		t.Rows = append(t.Rows, row)
+		insertConstraints.noteAppended(len(t.Rows)-1, row, len(t.Rows))
 		if err := t.InsertSecondaryIndexRow(len(t.Rows)-1, row, indexNames); err != nil {
 			return nil, err
 		}
@@ -302,12 +308,12 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 // ON CONFLICT DO NOTHING may suppress: a PRIMARY KEY/UNIQUE column or an
 // explicitly-created unique index. NOT NULL, type and FOREIGN KEY failures
 // intentionally remain ordinary errors and are validated afterwards.
-func insertConflictsUniqueConstraint(t *storage.Table, row []any) bool {
+func insertConflictsUniqueConstraint(t *storage.Table, row []any, cached *insertConstraintCache) bool {
 	for colIdx, col := range t.Cols {
 		if colIdx >= len(row) || isNull(row[colIdx]) {
 			continue
 		}
-		if (col.Constraint == storage.PrimaryKey || col.Constraint == storage.Unique) && constraintValueExists(t, colIdx, row[colIdx], -1) {
+		if (col.Constraint == storage.PrimaryKey || col.Constraint == storage.Unique) && constraintValueExistsCached(t, colIdx, row[colIdx], -1, cached) {
 			return true
 		}
 	}
@@ -447,7 +453,7 @@ func applyColumnDefaults(row []any, cols []storage.Column) error {
 //     columns in that order, matching the original range over t.Cols, so
 //     when more than one changed column is in violation the same one wins.
 func validateRowConstraints(env ExecEnv, t *storage.Table, row []any, excludeRow int, changedCols []int) error {
-	return validateRowConstraintsWith(env, t, row, excludeRow, changedCols, nil)
+	return validateRowConstraintsWith(env, t, row, excludeRow, changedCols, nil, nil)
 }
 
 // fkTarget is one resolved FOREIGN KEY reference: the parent table and the
@@ -455,6 +461,7 @@ func validateRowConstraints(env ExecEnv, t *storage.Table, row []any, excludeRow
 type fkTarget struct {
 	table  *storage.Table
 	colIdx int
+	index  *constraintIndexEntry
 	err    error
 }
 
@@ -475,14 +482,10 @@ type fkTargetCache struct {
 	targets map[*storage.ForeignKeyRef]fkTarget
 }
 
-func newFKTargetCache() *fkTargetCache {
-	return &fkTargetCache{targets: make(map[*storage.ForeignKeyRef]fkTarget, 1)}
-}
-
 // resolve returns the parent table and referenced column index for ref,
 // consulting the cache when one is supplied.
 func (c *fkTargetCache) resolve(env ExecEnv, col storage.Column) fkTarget {
-	if c != nil {
+	if c != nil && c.targets != nil {
 		if hit, ok := c.targets[col.ForeignKey]; ok {
 			return hit
 		}
@@ -495,24 +498,28 @@ func (c *fkTargetCache) resolve(env ExecEnv, col storage.Column) fkTarget {
 		out.err = fmt.Errorf("FOREIGN KEY column %q references missing column %q.%q", col.Name, col.ForeignKey.Table, col.ForeignKey.Column)
 	} else {
 		out.table, out.colIdx = refTable, refIdx
+		out.index = getConstraintIndex(refTable, refIdx)
 	}
 	if c != nil {
+		if c.targets == nil {
+			c.targets = make(map[*storage.ForeignKeyRef]fkTarget, 1)
+		}
 		c.targets[col.ForeignKey] = out
 	}
 	return out
 }
 
-func validateRowConstraintsWith(env ExecEnv, t *storage.Table, row []any, excludeRow int, changedCols []int, fks *fkTargetCache) error {
+func validateRowConstraintsWith(env ExecEnv, t *storage.Table, row []any, excludeRow int, changedCols []int, fks *fkTargetCache, cached *insertConstraintCache) error {
 	if changedCols == nil {
 		for colIdx := range t.Cols {
-			if err := validateOneRowConstraint(env, t, row, excludeRow, colIdx, fks); err != nil {
+			if err := validateOneRowConstraint(env, t, row, excludeRow, colIdx, fks, cached); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 	for _, colIdx := range changedCols {
-		if err := validateOneRowConstraint(env, t, row, excludeRow, colIdx, fks); err != nil {
+		if err := validateOneRowConstraint(env, t, row, excludeRow, colIdx, fks, cached); err != nil {
 			return err
 		}
 	}
@@ -522,7 +529,7 @@ func validateRowConstraintsWith(env ExecEnv, t *storage.Table, row []any, exclud
 // validateOneRowConstraint is validateRowConstraints's per-column body,
 // factored out so the "check everything" (INSERT) and "check only the
 // changed columns" (UPDATE) loops share identical logic and error text.
-func validateOneRowConstraint(env ExecEnv, t *storage.Table, row []any, excludeRow int, colIdx int, fks *fkTargetCache) error {
+func validateOneRowConstraint(env ExecEnv, t *storage.Table, row []any, excludeRow int, colIdx int, fks *fkTargetCache, cached *insertConstraintCache) error {
 	col := t.Cols[colIdx]
 	if colIdx >= len(row) {
 		return fmt.Errorf("row missing constrained column %q", col.Name)
@@ -539,14 +546,14 @@ func validateOneRowConstraint(env ExecEnv, t *storage.Table, row []any, excludeR
 		if isNull(val) {
 			return fmt.Errorf("PRIMARY KEY column %q cannot be NULL", col.Name)
 		}
-		if constraintValueExists(t, colIdx, val, excludeRow) {
+		if constraintValueExistsCached(t, colIdx, val, excludeRow, cached) {
 			return fmt.Errorf("duplicate PRIMARY KEY value for column %q", col.Name)
 		}
 	case storage.Unique:
 		if isNull(val) {
 			return nil
 		}
-		if constraintValueExists(t, colIdx, val, excludeRow) {
+		if constraintValueExistsCached(t, colIdx, val, excludeRow, cached) {
 			return fmt.Errorf("duplicate UNIQUE value for column %q", col.Name)
 		}
 	case storage.ForeignKey:
@@ -561,7 +568,7 @@ func validateOneRowConstraint(env ExecEnv, t *storage.Table, row []any, excludeR
 			return target.err
 		}
 		refTable, refIdx := target.table, target.colIdx
-		if !constraintValueExists(refTable, refIdx, val, -1) {
+		if !constraintIndexValueExists(target.index, val, -1) {
 			return fmt.Errorf("FOREIGN KEY violation on column %q: value %v not found in %s.%s", col.Name, val, col.ForeignKey.Table, col.ForeignKey.Column)
 		}
 	}

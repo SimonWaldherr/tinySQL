@@ -26,15 +26,12 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 	if err := checkForeignKeysBeforeUpdate(env, t, s); err != nil {
 		return nil, err
 	}
-	setIdx := map[int]Expr{}
-	for name, ex := range s.Sets {
-		i, err := t.ColIndex(name)
-		if err != nil {
-			return nil, err
-		}
-		setIdx[i] = ex
+	sets, err := plannedUpdateSets(env.planFor(s), t, s.Sets)
+	if err != nil {
+		return nil, err
 	}
 	n := 0
+	mutated := 0
 	returningRows := make([]Row, 0)
 	tablePrefix := strings.ToLower(s.Table) + "."
 	keys := newTableRowKeys(t.Cols, tablePrefix)
@@ -45,12 +42,13 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 	// The index set cannot change mid-statement, so its sorted name list is
 	// computed once here instead of being rebuilt and re-sorted twice per row
 	// (once for the before key, once for the after key).
-	indexNames := rawIndexNames(t)
-	sort.Strings(indexNames)
+	indexNames := plannedUpdateIndexNames(env.planFor(s), t, sets)
 	wal, err := beginWALAuto(env, s.Table)
 	if err != nil {
 		return nil, err
 	}
+	values := make([]any, len(sets))
+	changedCols := make([]int, 0, len(sets))
 	for ri, r := range t.Rows {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
@@ -74,7 +72,6 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 					return nil, err
 				}
 			}
-			nextRow := append([]any(nil), t.Rows[ri]...)
 			// changedCols scopes constraint validation below to columns whose
 			// value this statement actually altered on this row: an untouched
 			// column's existing value was already valid before this UPDATE
@@ -83,27 +80,39 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 			// against the referenced table) is redundant. Sorted ascending
 			// so that when more than one changed column is in violation, the
 			// same one wins as when every column was checked in t.Cols order.
-			changedCols := make([]int, 0, len(setIdx))
-			for i, ex := range setIdx {
-				v, err := evalExpr(env, ex, row)
+			changedCols = changedCols[:0]
+			for i, set := range sets {
+				v, err := evalExpr(env, set.expr, row)
 				if err != nil {
 					return nil, err
 				}
-				cv, err := coerceColumnValue(v, t.Cols[i])
+				cv, err := coerceColumnValue(v, t.Cols[set.col])
 				if err != nil {
 					return nil, err
 				}
-				if !rawEqual(t.Rows[ri][i], cv) {
-					changedCols = append(changedCols, i)
+				values[i] = cv
+				if !rawEqual(t.Rows[ri][set.col], cv) {
+					changedCols = append(changedCols, set.col)
 				}
-				nextRow[i] = cv
 			}
-			sort.Ints(changedCols)
+			// Assignments are sorted by column, so changedCols is already in
+			// schema order. A triggerless no-op still counts as a matched UPDATE,
+			// but need not validate, rewrite indexes, dirty the row or enter WAL.
+			if len(changedCols) == 0 && !hasBefore && !hasAfter {
+				n++
+				continue
+			}
+			nextRow := append([]any(nil), t.Rows[ri]...)
+			for i, set := range sets {
+				nextRow[set.col] = values[i]
+			}
 			if err := validateRowConstraints(env, t, nextRow, ri, changedCols); err != nil {
 				return nil, err
 			}
-			if err := t.CheckSecondaryIndexConstraints(nextRow, ri); err != nil {
-				return nil, err
+			if len(indexNames) > 0 {
+				if err := t.CheckSecondaryIndexConstraints(nextRow, ri); err != nil {
+					return nil, err
+				}
 			}
 			patchConstraintIndexRow(t, ri, t.Rows[ri], nextRow)
 			before := r
@@ -112,8 +121,10 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 			// table. Triggers below may write here too; anything that adds or
 			// removes rows invalidates the list through MarkDirtyFrom.
 			t.MarkRowUpdated(ri)
-			if err := t.UpdateSecondaryIndexRow(ri, before, nextRow, indexNames); err != nil {
-				return nil, err
+			if len(indexNames) > 0 {
+				if err := t.UpdateSecondaryIndexRow(ri, before, nextRow, indexNames); err != nil {
+					return nil, err
+				}
 			}
 			if err := wal.logUpdate(env, ri, before, nextRow, t.Cols); err != nil {
 				return nil, err
@@ -131,6 +142,7 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 				returningRows = append(returningRows, newRow)
 			}
 			n++
+			mutated++
 		}
 	}
 	if err := wal.commit(); err != nil {
@@ -141,7 +153,7 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 	// table had changed, so an UPDATE whose WHERE matched nothing wrote a
 	// full-table WAL record and fsynced it — and invalidated every cache that
 	// keys on Version — for a statement that did nothing.
-	if n > 0 {
+	if mutated > 0 {
 		t.Version++
 		t.InvalidateStats()
 		// The per-row MarkRowUpdated calls above already marked the table
@@ -174,6 +186,63 @@ func rawIndexNames(t *storage.Table) []string {
 	return names
 }
 
+func resolveUpdateSets(table *storage.Table, assignments map[string]Expr) ([]simpleUpdateSet, error) {
+	sets := make([]simpleUpdateSet, 0, len(assignments))
+	for name, expr := range assignments {
+		col, err := table.ColIndex(name)
+		if err != nil {
+			return nil, err
+		}
+		sets = append(sets, simpleUpdateSet{col: col, expr: expr})
+	}
+	sort.Slice(sets, func(i, j int) bool { return sets[i].col < sets[j].col })
+	return sets, nil
+}
+
+func secondaryIndexNamesForUpdate(table *storage.Table, sets []simpleUpdateSet) []string {
+	if len(table.Indexes) == 0 || len(sets) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(table.Indexes))
+	for name, index := range table.Indexes {
+		touches := false
+		for _, column := range index.Columns {
+			col, err := table.ColIndex(column)
+			if err != nil {
+				continue
+			}
+			for _, set := range sets {
+				if set.col == col {
+					touches = true
+					break
+				}
+			}
+			if touches {
+				break
+			}
+		}
+		if touches {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+func plannedUpdateSets(plan *dmlPlan, table *storage.Table, assignments map[string]Expr) ([]simpleUpdateSet, error) {
+	if plan != nil && plan.updateSetsKnown {
+		return plan.updateSets, nil
+	}
+	return resolveUpdateSets(table, assignments)
+}
+
+func plannedUpdateIndexNames(plan *dmlPlan, table *storage.Table, sets []simpleUpdateSet) []string {
+	if plan != nil && plan.updateSetsKnown {
+		return plan.updateIndexNames
+	}
+	return secondaryIndexNamesForUpdate(table, sets)
+}
+
 type simpleUpdatePlan struct {
 	table    *storage.Table
 	colIndex map[string]int
@@ -198,12 +267,13 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 
 	rawPlan := &simpleSelectPlan{table: plan.table, colIndex: plan.colIndex, where: plan.where, filter: buildRawFilter(plan.colIndex, plan.where)}
 	updated := 0
+	mutated := 0
 	values := make([]any, len(plan.sets))
+	changedCols := make([]int, 0, len(plan.sets))
 	// The index set cannot change mid-statement, so its sorted name list is
 	// computed once here instead of being rebuilt and re-sorted twice per row
 	// (once for the before key, once for the after key).
-	indexNames := rawIndexNames(plan.table)
-	sort.Strings(indexNames)
+	indexNames := plannedUpdateIndexNames(env.planFor(s), plan.table, plan.sets)
 	wal, err := beginWALAuto(env, s.Table)
 	if err != nil {
 		return nil, true, err
@@ -247,34 +317,44 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 			}
 			values[i] = cv
 		}
-		nextRow := append([]any(nil), raw...)
 		// See the identical comment in executeUpdate: only columns whose
 		// value this row's SET clauses actually changed need re-validating.
-		changedCols := make([]int, 0, len(plan.sets))
+		changedCols = changedCols[:0]
 		for i, set := range plan.sets {
 			if !rawEqual(raw[set.col], values[i]) {
 				changedCols = append(changedCols, set.col)
 			}
+		}
+		if len(changedCols) == 0 {
+			updated++
+			continue
+		}
+		nextRow := append([]any(nil), raw...)
+		for i, set := range plan.sets {
 			nextRow[set.col] = values[i]
 		}
-		sort.Ints(changedCols)
 		if err := validateRowConstraints(env, plan.table, nextRow, ri, changedCols); err != nil {
 			return nil, true, err
 		}
-		if err := plan.table.CheckSecondaryIndexConstraints(nextRow, ri); err != nil {
-			return nil, true, err
+		if len(indexNames) > 0 {
+			if err := plan.table.CheckSecondaryIndexConstraints(nextRow, ri); err != nil {
+				return nil, true, err
+			}
 		}
 		patchConstraintIndexRow(plan.table, ri, plan.table.Rows[ri], nextRow)
 		before := raw
 		plan.table.Rows[ri] = nextRow
 		plan.table.MarkRowUpdated(ri)
-		if err := plan.table.UpdateSecondaryIndexRow(ri, before, nextRow, indexNames); err != nil {
-			return nil, true, err
+		if len(indexNames) > 0 {
+			if err := plan.table.UpdateSecondaryIndexRow(ri, before, nextRow, indexNames); err != nil {
+				return nil, true, err
+			}
 		}
 		if err := wal.logUpdate(env, ri, before, nextRow, plan.table.Cols); err != nil {
 			return nil, true, err
 		}
 		updated++
+		mutated++
 	}
 	if err := wal.commit(); err != nil {
 		return nil, true, err
@@ -282,7 +362,7 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 
 	// See executeUpdate: a statement that matched no row has not changed the
 	// table, and saying otherwise costs a full-table WAL record.
-	if updated > 0 {
+	if mutated > 0 {
 		plan.table.Version++
 		plan.table.InvalidateStats()
 		markDependentMaterializedViewsStale(env, s.Table)
@@ -314,16 +394,14 @@ func buildSimpleUpdatePlan(env ExecEnv, s *Update) (*simpleUpdatePlan, bool, err
 	if colIndex == nil {
 		colIndex = simpleColumnIndex(table, s.Table)
 	}
-	sets := make([]simpleUpdateSet, 0, len(s.Sets))
-	for name, expr := range s.Sets {
-		if !isSimpleRawExpr(expr) {
+	sets, err := plannedUpdateSets(stmtPlan, table, s.Sets)
+	if err != nil {
+		return nil, true, err
+	}
+	for _, set := range sets {
+		if !isSimpleRawExpr(set.expr) {
 			return nil, false, nil
 		}
-		col, err := table.ColIndex(name)
-		if err != nil {
-			return nil, true, err
-		}
-		sets = append(sets, simpleUpdateSet{col: col, expr: expr})
 	}
 	var rowIDs []int
 	if candidates, found := planConstraintRows(stmtPlan, func() ([]int, bool) {
