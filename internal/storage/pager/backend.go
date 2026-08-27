@@ -3,6 +3,7 @@
 package pager
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"path/filepath"
@@ -156,6 +157,7 @@ type TableData struct {
 	Version       int
 	StructVersion int
 	FTSIndexes    []byte
+	VectorIndexes []byte
 }
 
 // LoadTable retrieves all rows of a table from its B+Tree.
@@ -196,6 +198,7 @@ func (pb *PageBackend) LoadTable(tenant, name string) (*TableData, error) {
 		Version:       entry.Version,
 		StructVersion: entry.StructVersion,
 		FTSIndexes:    append([]byte(nil), entry.FTSIndexes...),
+		VectorIndexes: append([]byte(nil), entry.VectorIndexes...),
 	}, nil
 }
 
@@ -237,6 +240,63 @@ func (pb *PageBackend) ScanTableRows(tenant, name string, fn func(row []any) boo
 		return fmt.Errorf("scan table %s/%s: %w", tenant, name, err)
 	}
 	return nil
+}
+
+// ScanTableRowsBatch decodes at most limit rows after afterKey and releases
+// the backend read lock before returning them to the caller. It is the cursor
+// building block for slow network result streams: unlike ScanTableRows, a
+// blocked consumer can never retain pb.mu's read side while it waits.
+//
+// nextKey is the final returned table key. When done is false, pass it as
+// afterKey to continue. A full final batch can conservatively report done
+// false; one cheap empty follow-up call then establishes EOF without risking a
+// missed last row.
+func (pb *PageBackend) ScanTableRowsBatch(tenant, name string, afterKey []byte, limit int) (rows [][]any, nextKey []byte, done bool, err error) {
+	if limit <= 0 {
+		return nil, nil, false, fmt.Errorf("scan table batch limit must be positive")
+	}
+	pb.mu.RLock()
+	defer pb.mu.RUnlock()
+
+	entry, err := pb.catalog.GetEntry(tenant, name)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if entry == nil {
+		return nil, nil, false, fmt.Errorf("scan rows: no such table %s/%s", tenant, name)
+	}
+
+	start := RowKey(0)
+	if len(afterKey) > 0 {
+		start = afterKey
+	}
+	rows = make([][]any, 0, limit)
+	bt := NewBTree(pb.pager, entry.RootPageID)
+	var decodeErr error
+	full := false
+	err = bt.scanRange(start, nil, func(key, value []byte, owned bool) bool {
+		if len(afterKey) > 0 && bytes.Compare(key, afterKey) <= 0 {
+			return true
+		}
+		row, decodeErr := unmarshalRow(value, !owned)
+		if decodeErr != nil {
+			return false
+		}
+		rows = append(rows, row)
+		nextKey = append(nextKey[:0], key...)
+		if len(rows) == limit {
+			full = true
+			return false
+		}
+		return true
+	})
+	if decodeErr != nil {
+		return nil, nil, false, fmt.Errorf("scan table %s/%s: %w", tenant, name, decodeErr)
+	}
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("scan table %s/%s: %w", tenant, name, err)
+	}
+	return rows, nextKey, !full, nil
 }
 
 // SaveTable persists all rows of a table into a B+Tree.
@@ -319,6 +379,7 @@ func (pb *PageBackend) SaveTable(tenant string, td *TableData) error {
 		Version:       version,
 		StructVersion: td.StructVersion,
 		FTSIndexes:    append([]byte(nil), td.FTSIndexes...),
+		VectorIndexes: append([]byte(nil), td.VectorIndexes...),
 	}
 	if err := pb.catalog.PutEntry(txID, catEntry); err != nil {
 		_ = pb.pager.AbortTx(txID)
@@ -675,6 +736,96 @@ func (pb *PageBackend) ScanIndexRowsRange(tenant, table, indexName string, start
 		return scanErr
 	}
 	return err
+}
+
+// ScanIndexRowsRangeBatch decodes at most limit table rows from an ordered
+// secondary-index interval. It resumes at (resumeKey, skipAtResumeKey), where
+// the skip count is necessary because one index key can point to many rows.
+// Like ScanTableRowsBatch, it never invokes user code while pb.mu is held.
+//
+// A full batch may conservatively leave done false even at EOF. Calling it
+// once more with the returned cursor establishes EOF without dropping rows.
+func (pb *PageBackend) ScanIndexRowsRangeBatch(tenant, table, indexName string, startKey, endKey, resumeKey []byte, skipAtResumeKey, limit int) (rows [][]any, nextKey []byte, nextSkip int, done bool, err error) {
+	if limit <= 0 {
+		return nil, nil, 0, false, fmt.Errorf("scan index batch limit must be positive")
+	}
+	if skipAtResumeKey < 0 {
+		return nil, nil, 0, false, fmt.Errorf("scan index batch resume skip must not be negative")
+	}
+	pb.mu.RLock()
+	defer pb.mu.RUnlock()
+
+	entry, err := pb.catalog.GetEntry(tenant, table)
+	if err != nil {
+		return nil, nil, 0, false, err
+	}
+	if entry == nil {
+		return nil, nil, 0, false, fmt.Errorf("scan index rows: no such table %s/%s", tenant, table)
+	}
+	var index *IndexInfo
+	for i := range entry.Indexes {
+		if strings.EqualFold(entry.Indexes[i].Name, indexName) {
+			index = &entry.Indexes[i]
+			break
+		}
+	}
+	if index == nil || index.RootPageID == InvalidPageID {
+		return nil, nil, 0, false, fmt.Errorf("range index %s is missing", indexName)
+	}
+
+	start := startKey
+	resuming := len(resumeKey) > 0
+	if resuming {
+		start = resumeKey
+	}
+	rows = make([][]any, 0, limit)
+	indexTree := NewBTree(pb.pager, index.RootPageID)
+	tableTree := NewBTree(pb.pager, entry.RootPageID)
+	var scanErr error
+	full := false
+	err = indexTree.ScanRange(start, endKey, func(key, value []byte) bool {
+		ids, decodeErr := unmarshalRowIDs(value)
+		if decodeErr != nil {
+			scanErr = decodeErr
+			return false
+		}
+		rowStart := 0
+		if resuming && bytes.Equal(key, resumeKey) {
+			rowStart = skipAtResumeKey
+		}
+		for rowPos := rowStart; rowPos < len(ids); rowPos++ {
+			id := ids[rowPos]
+			var row []any
+			found, getErr := tableTree.getValue(RowKey(id), func(encoded []byte, owned bool) error {
+				var err error
+				row, err = unmarshalRow(encoded, !owned)
+				return err
+			})
+			if getErr != nil {
+				scanErr = getErr
+				return false
+			}
+			if !found {
+				scanErr = fmt.Errorf("index %s refers to missing row %d", indexName, id)
+				return false
+			}
+			rows = append(rows, row)
+			if len(rows) == limit {
+				nextKey = append(nextKey[:0], key...)
+				nextSkip = rowPos + 1
+				full = true
+				return false
+			}
+		}
+		return true
+	})
+	if scanErr != nil {
+		return nil, nil, 0, false, scanErr
+	}
+	if err != nil {
+		return nil, nil, 0, false, err
+	}
+	return rows, nextKey, nextSkip, !full, nil
 }
 
 func (pb *PageBackend) lookupIndexRowsLocked(tableRoot, indexRoot PageID, indexName string, key []byte) ([][]any, bool, error) {

@@ -1288,6 +1288,7 @@ func purgeFTSCachesFor(tenant, table string) {
 		}
 	}
 	ftsDocCacheMu.Unlock()
+	purgeFTSPreparedQueryCachesFor(tenant, table)
 }
 
 func ftsColsCacheKey(cols []int) string {
@@ -1871,26 +1872,14 @@ func (f *FTSSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 // copying source rows. RAG_SEARCH consumes this compact form directly; the
 // public FTS_SEARCH table function materializes the same result afterward.
 func ftsSearchCandidates(ctx context.Context, tenant string, table *storage.Table, query string, k int, searchCols []int) ([]ftsScored, error) {
-	node := parseCachedFTSQuery(query)
+	cache := getFTSDocCache(tenant, table, searchCols)
+	node, candidates := prepareFTSQuery(tenant, table, searchCols, query, cache)
 	if node == nil {
 		// Empty or all-stopword query matches nothing. Without this guard every
 		// valid document scores 0 (ftsScoreNode(nil,...) == 0) and k arbitrary
 		// rows would be injected into the caller's RAG context window.
 		return nil, nil
 	}
-	cache := getFTSDocCache(tenant, table, searchCols)
-	idf := ftsIDFLookup(cache)
-
-	// Resolve PREFIX/WILDCARD atoms against the corpus dictionary once, then
-	// derive the rows that could possibly match. Both come from the postings
-	// index built with the document cache; see fts_index.go for why restricting
-	// the candidate set cannot change the result.
-	node = ftsExpandQuery(node, cache.postings)
-	candidates := ftsQueryCandidates(node, cache.postings, len(cache.docs))
-	// Resolve every term's IDF once for the whole query rather than once per
-	// scored document (see ftsBindIDF). Candidate derivation above still uses
-	// the unbound tree; binding only rewrites scoring weights.
-	node = ftsBindIDF(node, idf, cache.termIDs)
 
 	// Bounded top-k selection (O(m log k) for m candidate docs) instead of
 	// collecting every match into a slice and sorting the whole thing
@@ -1899,7 +1888,7 @@ func ftsSearchCandidates(ctx context.Context, tenant string, table *storage.Tabl
 	// docs are ever retained. ftsScanTopK additionally splits the scan across
 	// workers once there are enough documents to be worth it.
 	restricted := !candidates.unrestricted && ftsCandidateScanIsCheaper(candidates.rows, len(cache.docs))
-	results, err := ftsScanTopK(ctx, cache, node, idf, candidates.rows, restricted, k)
+	results, err := ftsScanTopK(ctx, cache, node, nil, candidates.rows, restricted, k)
 	if err != nil {
 		return nil, fmt.Errorf("FTS_SEARCH: %w", err)
 	}

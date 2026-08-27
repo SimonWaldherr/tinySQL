@@ -109,12 +109,10 @@ func benchmarkVecHNSWIncrementalInsert(b *testing.B, preexisting int) {
 		vec := vecHNSWGrowthVector(id, dims)
 		table.Rows = append(table.Rows, []any{id, vec})
 		table.Version++
-
-		cache.vectors = append(cache.vectors, vec)
-		cache.valid = append(cache.valid, true)
-		if cache.normsReady {
-			cache.norms = append(cache.norms, vectorL2Norm(vec))
-		}
+		// Fetch through the production cache path so this benchmark includes
+		// the append-only delta extension rather than manually maintaining an
+		// obsolete flat cache representation.
+		cache = getVecColumnCache("default", table, colIdx, metricNeedsNorms(metric))
 
 		if _, err := getVecHNSWIndex(ctx, "default", table, colIdx, metric, dims, cache); err != nil {
 			b.Fatal(err)

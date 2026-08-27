@@ -41,6 +41,12 @@ func executeAlterTable(env ExecEnv, s *AlterTable) (*ResultSet, error) {
 		env.db.Catalog().RenameIndexColumnForTenant(env.tenant, s.Table, s.RenameColumnFrom, s.RenameColumnTo)
 		invalidateConstraintIndexes(t)
 		for _, child := range env.db.ListTables(env.tenant) {
+			if env.db.DetachPinnedTableForWrite(env.tenant, child.Name) {
+				child, err = env.db.Get(env.tenant, child.Name)
+				if err != nil {
+					return nil, err
+				}
+			}
 			updated := false
 			for colIdx := range child.Cols {
 				ref := child.Cols[colIdx].ForeignKey

@@ -163,18 +163,17 @@ func TestReadCommittedSinceReturnsErrReplicaTooFarBehindAfterCheckpoint(t *testi
 		t.Fatalf("ReadCommittedSince(sinceLSN=%d) after checkpoint = %v, want ErrReplicaTooFarBehind", uint64(insLSN)-1, err)
 	}
 
-	// A caller whose sinceLSN is exactly the last real committed LSN before
-	// the checkpoint (wal.GetCommittedLSN(), captured by the checkpoint as
-	// checkpointDataWatermark) is not missing anything and must not trip
-	// the error -- even though this is numerically less than
-	// wal.checkpointWatermark itself (the checkpoint marker's own LSN, one
-	// past the last real commit). A fresh Bootstrap taken right after this
-	// checkpoint would report exactly this LSN as its watermark (see
-	// SnapshotWithWatermark, which reads committedLSN, not
-	// checkpointWatermark), so getting this boundary right is what keeps a
-	// freshly re-bootstrapped, fully-caught-up replica from immediately
-	// tripping ErrReplicaTooFarBehind on its very next poll and spinning in
-	// an unbounded re-bootstrap loop against an otherwise idle primary.
+	// ReadCommittedSince returns the final row-operation LSN as its resume
+	// token, not the invisible COMMIT marker. A replica that successfully
+	// applied that response is caught up and must remain eligible after the
+	// primary checkpoints; using the later marker as checkpointDataWatermark
+	// here would turn this into a false ErrReplicaTooFarBehind.
+	if _, _, err := ReadCommittedSince(wal, uint64(insLSN)); err != nil {
+		t.Fatalf("ReadCommittedSince(sinceLSN=last operation) after checkpoint: %v", err)
+	}
+
+	// A Bootstrap returns the COMMIT marker as a high-but-safe resume value in
+	// the normal row-change case, which must remain accepted as well.
 	committedBeforeCheckpoint := wal.GetCommittedLSN()
 	if committedBeforeCheckpoint != insLSN+1 {
 		t.Fatalf("wal.GetCommittedLSN() = %d, want %d (the commit's own LSN)", committedBeforeCheckpoint, insLSN+1)

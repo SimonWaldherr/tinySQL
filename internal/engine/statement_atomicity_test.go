@@ -128,8 +128,7 @@ func TestPrimaryKeyUpdateUsesBoundedRowsWhenSecondaryIndexIsUntouched(t *testing
 	}
 
 	indexedUpdate := mustParse(`UPDATE users SET bucket = 99 WHERE id = 2`).(*Update)
-	if tableName, rowIDs, ok := rowUpdateSnapshotTarget(newDMLPlan(&dmlPlan{}, db, "default", indexedUpdate));
-		!ok || tableName != "users" || len(rowIDs) != 1 || rowIDs[0] != 1 {
+	if tableName, rowIDs, ok := rowUpdateSnapshotTarget(newDMLPlan(&dmlPlan{}, db, "default", indexedUpdate)); !ok || tableName != "users" || len(rowIDs) != 1 || rowIDs[0] != 1 {
 		t.Fatalf("indexed bounded update target = %q, %#v, %v; want users, [1], true", tableName, rowIDs, ok)
 	}
 }

@@ -53,6 +53,7 @@ type sqliteMetaRow struct {
 	Indexes       map[string]*SecondaryIndex
 	Stats         *TableStats
 	FTSIndexes    map[string]*FTSIndex
+	VectorIndexes map[string]*VectorIndex
 	StructVersion int
 	DataTable     string
 }
@@ -89,6 +90,7 @@ func NewSQLiteBackend(path string) (*SQLiteBackend, error) {
 		indexes_json TEXT,
 		stats_json TEXT,
 		fts_indexes_json TEXT,
+		vector_indexes_json TEXT,
 		struct_version INTEGER NOT NULL DEFAULT 0,
 		data_table TEXT NOT NULL UNIQUE,
 		PRIMARY KEY (tenant, name)
@@ -99,7 +101,7 @@ func NewSQLiteBackend(path string) (*SQLiteBackend, error) {
 	}
 	// Existing SQLite databases predate the persisted FTS metadata. SQLite has
 	// no ADD COLUMN IF NOT EXISTS, so inspect the schema before migrating.
-	var hasFTSIndexes, hasStructVersion bool
+	var hasFTSIndexes, hasVectorIndexes, hasStructVersion bool
 	rows, err := db.Query(`PRAGMA table_info("__tinysql_meta")`)
 	if err != nil {
 		_ = db.Close()
@@ -117,6 +119,8 @@ func NewSQLiteBackend(path string) (*SQLiteBackend, error) {
 		switch name {
 		case "fts_indexes_json":
 			hasFTSIndexes = true
+		case "vector_indexes_json":
+			hasVectorIndexes = true
 		case "struct_version":
 			hasStructVersion = true
 		}
@@ -126,6 +130,12 @@ func NewSQLiteBackend(path string) (*SQLiteBackend, error) {
 		if _, err := db.Exec(`ALTER TABLE "__tinysql_meta" ADD COLUMN fts_indexes_json TEXT`); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("open sqlite db: add FTS metadata: %w", err)
+		}
+	}
+	if !hasVectorIndexes {
+		if _, err := db.Exec(`ALTER TABLE "__tinysql_meta" ADD COLUMN vector_indexes_json TEXT`); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("open sqlite db: add vector index metadata: %w", err)
 		}
 	}
 	if !hasStructVersion {
@@ -155,18 +165,18 @@ func quoteIdent(name string) string {
 
 func (b *SQLiteBackend) loadMeta(tenant, name string) (*sqliteMetaRow, error) {
 	row := b.db.QueryRow(
-		`SELECT is_temp, version, struct_version, cols_json, indexes_json, stats_json, fts_indexes_json, data_table FROM "__tinysql_meta" WHERE tenant = ? AND name = ?`,
+		`SELECT is_temp, version, struct_version, cols_json, indexes_json, stats_json, fts_indexes_json, vector_indexes_json, data_table FROM "__tinysql_meta" WHERE tenant = ? AND name = ?`,
 		tenant, name,
 	)
 	var (
-		isTemp                                 int
-		version                                int
-		colsJSON                               string
-		indexesJSON, statsJSON, ftsIndexesJSON sql.NullString
-		structVersion                          int
-		dataTable                              string
+		isTemp                                                    int
+		version                                                   int
+		colsJSON                                                  string
+		indexesJSON, statsJSON, ftsIndexesJSON, vectorIndexesJSON sql.NullString
+		structVersion                                             int
+		dataTable                                                 string
 	)
-	if err := row.Scan(&isTemp, &version, &structVersion, &colsJSON, &indexesJSON, &statsJSON, &ftsIndexesJSON, &dataTable); err != nil {
+	if err := row.Scan(&isTemp, &version, &structVersion, &colsJSON, &indexesJSON, &statsJSON, &ftsIndexesJSON, &vectorIndexesJSON, &dataTable); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -189,6 +199,11 @@ func (b *SQLiteBackend) loadMeta(tenant, name string) (*sqliteMetaRow, error) {
 	if ftsIndexesJSON.Valid && ftsIndexesJSON.String != "" {
 		if err := json.Unmarshal([]byte(ftsIndexesJSON.String), &meta.FTSIndexes); err != nil {
 			return nil, fmt.Errorf("decode FTS index metadata for %s.%s: %w", tenant, name, err)
+		}
+	}
+	if vectorIndexesJSON.Valid && vectorIndexesJSON.String != "" {
+		if err := json.Unmarshal([]byte(vectorIndexesJSON.String), &meta.VectorIndexes); err != nil {
+			return nil, fmt.Errorf("decode vector index metadata for %s.%s: %w", tenant, name, err)
 		}
 	}
 	return meta, nil
@@ -246,6 +261,7 @@ func (b *SQLiteBackend) LoadTable(tenant, name string) (*Table, error) {
 	t.structVersion = meta.StructVersion
 	t.Indexes = cloneSecondaryIndexes(meta.Indexes)
 	t.FTSIndexes = cloneFTSIndexes(meta.FTSIndexes)
+	t.VectorIndexes = cloneVectorIndexes(meta.VectorIndexes)
 	t.Stats = cloneTableStats(meta.Stats)
 
 	rows, err := b.db.Query(fmt.Sprintf(`SELECT * FROM %s ORDER BY "__seq"`, quoteIdent(meta.DataTable)))
@@ -324,6 +340,10 @@ func (b *SQLiteBackend) SaveTable(tenant string, t *Table) error {
 	if err != nil {
 		return fmt.Errorf("save table %s.%s: encode FTS indexes: %w", tenant, t.Name, err)
 	}
+	vectorIndexesJSON, err := json.Marshal(t.snapshotVectorIndexes())
+	if err != nil {
+		return fmt.Errorf("save table %s.%s: encode vector indexes: %w", tenant, t.Name, err)
+	}
 
 	tx, err := b.db.Begin()
 	if err != nil {
@@ -395,8 +415,8 @@ func (b *SQLiteBackend) SaveTable(tenant string, t *Table) error {
 	}
 
 	_, err = tx.Exec(
-		`INSERT INTO "__tinysql_meta" (tenant, name, is_temp, version, struct_version, cols_json, indexes_json, stats_json, fts_indexes_json, data_table)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO "__tinysql_meta" (tenant, name, is_temp, version, struct_version, cols_json, indexes_json, stats_json, fts_indexes_json, vector_indexes_json, data_table)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(tenant, name) DO UPDATE SET
 		   is_temp = excluded.is_temp,
 		   version = excluded.version,
@@ -405,8 +425,9 @@ func (b *SQLiteBackend) SaveTable(tenant string, t *Table) error {
 		   indexes_json = excluded.indexes_json,
 		   stats_json = excluded.stats_json,
 		   fts_indexes_json = excluded.fts_indexes_json,
+		   vector_indexes_json = excluded.vector_indexes_json,
 		   data_table = excluded.data_table`,
-		tenant, t.Name, t.IsTemp, t.Version, t.structVersion, string(colsJSON), string(indexesJSON), string(statsJSON), string(ftsIndexesJSON), dataTable,
+		tenant, t.Name, t.IsTemp, t.Version, t.structVersion, string(colsJSON), string(indexesJSON), string(statsJSON), string(ftsIndexesJSON), string(vectorIndexesJSON), dataTable,
 	)
 	if err != nil {
 		return fmt.Errorf("save table %s.%s: update meta: %w", tenant, t.Name, err)

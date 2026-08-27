@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -23,6 +24,11 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 	} else {
 		db.LockContentForWrite()
 		defer db.UnlockContentForWrite()
+		// A direct ResultStream pins only its source table, not contentMu for
+		// the lifetime of a slow client. Detach a pinned target before WAL/DML
+		// planning records table pointers so this statement mutates a private
+		// copy while the stream retains its stable source.
+		detachStreamSnapshotsForWrite(db, tenant, stmt)
 	}
 
 	// walBefore is the pre-image WALManager logging diffs against. It is taken
@@ -92,6 +98,45 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 	if err == nil {
 		err = maybeLogToWALManager(db, walBefore)
 	}
+	// The driver opens an ambient AdvancedWAL transaction before every write in
+	// an explicit SQL transaction. That makes statementWAL.started true even
+	// for pure DDL, despite no row record having been written. Classify the
+	// statement itself here rather than inferring it from that transaction
+	// state, otherwise CREATE TABLE inside BEGIN...COMMIT never asks the live
+	// database for its post-commit durability checkpoint.
+	if err == nil && !isReadOnlyStatement(stmt) && !isAtomicDML(stmt) {
+		// AdvancedWAL has row-level records for DML, but pure DDL/catalog
+		// statements have no row operation to grow its normal checkpoint
+		// counters. On a live DB, write the snapshot synchronously while this
+		// statement still owns contentMu, so "statement succeeded" has no
+		// crash window before CREATE/DROP/ALTER, views, triggers, jobs or RBAC
+		// metadata becomes durable. A transaction shadow must never touch the
+		// shared WAL checkpoint request: its uncommitted state is private, so it
+		// records a shadow-local fact for the driver to publish only after a
+		// successful COMMIT instead. That distinction keeps a ROLLBACK from
+		// needlessly invalidating otherwise healthy replica feed positions.
+		if wal := db.StatementAdvancedWAL(); wal != nil {
+			if db.IsShadow() {
+				db.MarkAdvancedWALMetadataDirty()
+			} else {
+				// Mark this as metadata work before the synchronous checkpoint.
+				// The checkpoint stores its marker as the replication boundary,
+				// because no row-level WAL record can teach an existing replica
+				// about this DDL/catalog mutation.
+				wal.RequestCheckpoint()
+				if checkpointErr := wal.CheckpointWhileContentLocked(db); checkpointErr != nil {
+					if errors.Is(checkpointErr, storage.ErrAdvancedWALCheckpointActiveTransactions) {
+						// An embedding application may use an ambient transaction on
+						// the live DB directly. Do not snapshot its uncommitted state;
+						// its terminal event will wake the scheduler instead.
+						wal.RequestCheckpoint()
+					} else {
+						err = checkpointErr
+					}
+				}
+			}
+		}
+	}
 	return rs, err
 }
 
@@ -116,6 +161,7 @@ func purgeCachesAfterRollback(db *storage.DB, snapshot *storage.StatementSnapsho
 				purgeVectorCachesFor(rollbackTenant, table.Name)
 				purgeGeoGridCachesFor(rollbackTenant, table.Name)
 				purgeVecQueryCacheFor(rollbackTenant, table.Name)
+				purgeRAGPreFilterCachesFor(table.Name)
 			}
 		}
 		return
@@ -127,6 +173,7 @@ func purgeCachesAfterRollback(db *storage.DB, snapshot *storage.StatementSnapsho
 		purgeVectorCachesFor(ref.Tenant, ref.Table)
 		purgeGeoGridCachesFor(ref.Tenant, ref.Table)
 		purgeVecQueryCacheFor(ref.Tenant, ref.Table)
+		purgeRAGPreFilterCachesFor(ref.Table)
 	}
 }
 

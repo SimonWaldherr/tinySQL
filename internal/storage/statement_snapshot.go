@@ -327,8 +327,8 @@ func (db *DB) SnapshotForRowUpdateStatement(tenant, name string, rowIDs []int) (
 	return &StatementSnapshot{
 		tenant: tenant,
 		rowUpdate: &rowUpdateTableState{
-			table:          table,
-			rowIDs:         append([]int(nil), rowIDs...),
+			table:  table,
+			rowIDs: append([]int(nil), rowIDs...),
 			// UPDATE replaces row slices instead of mutating their cells in place,
 			// so these original headers are an immutable rollback image.
 			rows:           rows,
@@ -393,18 +393,59 @@ func (db *DB) RestoreStatementSnapshot(snapshot *StatementSnapshot) {
 
 	db.mu.Lock()
 	if snapshot.appendOnly != nil {
-		restoreAppendOnlyTable(snapshot.appendOnly)
+		state := snapshot.appendOnly
+		if db.IsTablePinnedForStream(state.table) {
+			// A stream can still read state.table after a statement detached it
+			// through copy-on-write. Restore into a fresh copy instead of
+			// truncating that stream's immutable source in place.
+			restored := cloneTable(state.table)
+			copyState := *state
+			copyState.table = restored
+			restoreAppendOnlyTable(&copyState)
+			db.getTenant(snapshot.tenant).tables[strings.ToLower(restored.Name)] = restored
+		} else {
+			restoreAppendOnlyTable(state)
+		}
 	} else if snapshot.rowUpdate != nil {
-		restoreRowUpdateTable(snapshot.rowUpdate)
+		state := snapshot.rowUpdate
+		if db.IsTablePinnedForStream(state.table) {
+			restored := cloneTable(state.table)
+			copyState := *state
+			copyState.table = restored
+			copyState.rows = cloneRows(state.rows)
+			restoreRowUpdateTable(&copyState)
+			db.getTenant(snapshot.tenant).tables[strings.ToLower(restored.Name)] = restored
+		} else {
+			restoreRowUpdateTable(state)
+		}
 	} else if snapshot.rowDelete != nil {
-		restoreRowDeleteTable(snapshot.rowDelete)
+		state := snapshot.rowDelete
+		if db.IsTablePinnedForStream(state.table) {
+			restored := cloneTable(state.table)
+			copyState := *state
+			copyState.table = restored
+			if state.row != nil {
+				copyState.row = cloneRows([][]any{state.row})[0]
+			}
+			restoreRowDeleteTable(&copyState)
+			db.getTenant(snapshot.tenant).tables[strings.ToLower(restored.Name)] = restored
+		} else {
+			restoreRowDeleteTable(state)
+		}
 	} else if snapshot.full {
 		restored := make(map[string]*tenantDB, len(snapshot.tables))
 		for tenant, tables := range snapshot.tables {
 			tenantDB := &tenantDB{tables: make(map[string]*Table, len(tables))}
 			for name, saved := range tables {
-				restoreStatementTable(saved)
-				tenantDB.tables[name] = saved.table
+				if db.IsTablePinnedForStream(saved.table) {
+					// saved.table is an active stream source. saved.state is an
+					// independent pre-image, so install a fresh copy and leave the
+					// pinned table byte-for-byte untouched.
+					tenantDB.tables[name] = cloneTable(saved.state)
+				} else {
+					restoreStatementTable(saved)
+					tenantDB.tables[name] = saved.table
+				}
 			}
 			restored[tenant] = tenantDB
 		}
@@ -413,8 +454,12 @@ func (db *DB) RestoreStatementSnapshot(snapshot *StatementSnapshot) {
 		for tenant, tables := range snapshot.tables {
 			tenantDB := db.getTenant(tenant)
 			for name, saved := range tables {
-				restoreStatementTable(saved)
-				tenantDB.tables[name] = saved.table
+				if db.IsTablePinnedForStream(saved.table) {
+					tenantDB.tables[name] = cloneTable(saved.state)
+				} else {
+					restoreStatementTable(saved)
+					tenantDB.tables[name] = saved.table
+				}
 			}
 		}
 	}
@@ -569,6 +614,9 @@ func restoreTable(dst, saved *Table) {
 	dst.FTSIndexes = copy.FTSIndexes
 	dst.ftsGeneration = copy.ftsGeneration
 	dst.ftsPersistedGeneration = copy.ftsPersistedGeneration
+	dst.VectorIndexes = copy.VectorIndexes
+	dst.vectorGeneration = copy.vectorGeneration
+	dst.vectorPersistedGeneration = copy.vectorPersistedGeneration
 	dst.IsTemp = copy.IsTemp
 	dst.colPos = copy.colPos
 	dst.Version = copy.Version

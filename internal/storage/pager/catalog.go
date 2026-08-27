@@ -30,6 +30,7 @@ type CatalogEntry struct {
 	Version       int             `json:"version"`
 	StructVersion int             `json:"struct_version,omitempty"`
 	FTSIndexes    []byte          `json:"fts_indexes,omitempty"`
+	VectorIndexes []byte          `json:"vector_indexes,omitempty"`
 }
 
 // IndexInfo identifies one persistent secondary-index B+Tree. Entries are

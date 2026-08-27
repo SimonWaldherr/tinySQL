@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -89,7 +88,8 @@ func (f *HybridSearchTableFunc) Execute(ctx context.Context, args []Expr, env Ex
 				return nil, fmt.Errorf("%s: options must be a JSON string, got %T", f.Name(), value)
 			}
 			if strings.TrimSpace(raw) != "" {
-				if err := json.Unmarshal([]byte(raw), &opts); err != nil {
+				opts, err = ragParseSearchOptions(raw)
+				if err != nil {
 					return nil, fmt.Errorf("%s: invalid options JSON: %w", f.Name(), err)
 				}
 			}

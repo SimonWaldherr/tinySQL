@@ -216,13 +216,17 @@ Use a transaction for each document or ingestion batch. Do not append directly
 to `storage.Table.Rows`: ordinary `INSERT`/`UPDATE`/`DELETE` maintains type
 coercion, table versions, indexes, rollback state, and cache invalidation.
 
-### Validate the loaded vectors
+### Warm the retrieval paths
 
-Warm the selected vector path and inspect its diagnostics:
+Warm the selected vector path and the exact lexical column set used by serving
+queries before admitting traffic:
 
 ```sql
 SELECT *
 FROM VEC_WARM('rag_chunks', 'embedding', 'cosine', 'flat');
+
+SELECT *
+FROM FTS_WARM('rag_chunks', 'search_text');
 ```
 
 For a clean active corpus:
@@ -231,6 +235,12 @@ For a clean active corpus:
 - `distinct_dims` should be `1`;
 - `excluded_rows` should be `0`;
 - `embedding_model` should have one active value.
+
+`FTS_WARM` returns the resolved columns plus document, term, posting, token,
+and average-length statistics. It creates the same persistent/runtime FTS
+cache entry that `FTS_SEARCH` and `HYBRID_SEARCH` use, so preserve the column
+order from the serving query. For example, a hybrid query over `heading` and
+`search_text` should warm `FTS_WARM('rag_chunks', 'heading', 'search_text')`.
 
 Never mix old and new embedding dimensions in the active corpus. Build a new
 snapshot/table, evaluate it, and switch readers after the rebuild instead of
@@ -472,15 +482,86 @@ An outer `WHERE` on `HYBRID_SEARCH` filters after candidate retrieval. That is
 acceptable for presentation filters, but it can reduce recall because filtered
 rows already consumed candidate slots.
 
-For a hard security boundary:
+For a retrieval-time ACL or metadata boundary, put an explicit `pre_filter`
+inside the `options_json` of `RAG_SEARCH` or `HYBRID_SEARCH`. It is applied
+before vector candidates, FTS candidates, RRF fusion, and neighbor-context
+expansion:
 
-- use TinySQL's tenant namespace or separate databases/snapshots per tenant;
-- never depend on post-filtering to prevent cross-tenant retrieval;
-- include only documents the current principal may read in the searchable
-  corpus.
+```sql
+SELECT chunk_id, doc_id, chunk_text, _rrf_rank
+FROM HYBRID_SEARCH(
+    'rag_chunks', 'embedding', 'search_text', ?, ?, 8,
+    '{
+      "candidate_k": 32,
+      "pre_filter": {
+        "id_column": "chunk_id",
+        "allowed_row_ids": ["chunk-100", "chunk-104", "chunk-130"],
+        "equals": {
+          "tenant_id": "acme",
+          "visibility": "published"
+        }
+      }
+    }'
+);
+```
 
-For selective metadata filters inside one authorized corpus, either maintain
-separate purpose-built tables or use a custom filtered scalar-vector query:
+`allowed_row_ids` contains stable application IDs, not storage row offsets. If
+`id_column` is omitted, TinySQL uses a single-column primary key. `equals` is
+an AND of metadata equalities; it can be combined with `allowed_row_ids` and
+is intersected with it. A secondary index whose leading columns match the
+equality metadata is used when safe; otherwise TinySQL falls back to an exact
+scan of the authorized subset. This makes the API safe for typed and
+SQLite-affinity-compatible columns instead of risking false-negative index
+lookups.
+
+For standalone retrieval, use the intentionally explicit functions below. The
+separate names prevent their security boundary from being confused with a
+post-retrieval `WHERE`:
+
+```sql
+SELECT *
+FROM VEC_SEARCH_FILTERED(
+    'rag_chunks', 'embedding', ?, 20,
+    '{"pre_filter":{"equals":{"tenant_id":"acme"}}}'
+);
+
+SELECT *
+FROM FTS_SEARCH_FILTERED(
+    'rag_chunks', 'timeout OR retry', 20,
+    '{"pre_filter":{"equals":{"tenant_id":"acme"}}}',
+    'search_text'
+);
+```
+
+Go package users can generate the same options payload without hand-building
+JSON. `RAGPreFilterJSON` rejects an empty boundary, while an explicit empty
+`AllowedRowIDs` slice is preserved as a deny-all ACL:
+
+```go
+options, err := tinysql.RAGPreFilterJSON(tinysql.RAGPreFilter{
+	Equals: map[string]any{"tenant_id": "acme"},
+})
+// Bind options as the final options_json argument of HYBRID_SEARCH,
+// RAG_SEARCH, VEC_SEARCH_FILTERED, or FTS_SEARCH_FILTERED.
+```
+
+Filtered vector ranking is exact over the allowed row set, even if the
+options request `ivf` or `hnsw`: filtering a global approximate frontier after
+candidate selection could silently miss the true nearest allowed result. FTS
+intersects the allowed row IDs with its postings-derived candidate set before
+BM25 scoring and derives BM25 document frequency/length normalization from the
+same authorized set. That prevents `_fts_score` and RRF rank from depending on
+forbidden documents, but scores are intentionally comparable only for searches
+with the same pre-filter (not across different tenants or ACLs). Context
+expansion is restricted to the same set, so an allowed hit cannot pull an
+adjacent forbidden chunk into the final output.
+
+Use TinySQL's tenant namespace or separate databases/snapshots as the first
+isolation layer. `pre_filter` then provides a per-principal/document boundary
+within that tenant. Never use an outer `WHERE` as the only authorization check.
+
+For an ad-hoc custom score that is not representable as equality metadata, use
+a normal filtered scalar-vector query:
 
 ```sql
 SELECT chunk_id, doc_id, chunk_text,
@@ -492,9 +573,7 @@ LIMIT 24;
 ```
 
 This scans the filtered rows rather than using `VEC_SEARCH`'s optimized top-k
-path. Benchmark the trade-off. For complex filtered hybrid retrieval, retrieve
-generously from both branches and fuse in application code, while applying
-authorization before any evidence reaches the generator.
+path. Benchmark the trade-off.
 
 ## 8. Build a grounded prompt
 
@@ -658,7 +737,7 @@ serving-oriented deployments, prefer:
 1. bulk load or rebuild a snapshot;
 2. validate and evaluate it;
 3. reopen it read-only;
-4. call `VEC_WARM` during startup;
+4. call `VEC_WARM` and `FTS_WARM` during startup for every serving column set;
 5. admit traffic only after warm-up succeeds.
 
 The warmed native vector column is also held in a contiguous cache, so budget
@@ -695,7 +774,7 @@ query execution and index warm-up.
 | many duplicate hits | chunks/overlap are too large | reduce overlap and use context expansion |
 | correct chunk is just outside top-k | candidate window too small | increase `candidate_k` and reevaluate |
 | low-looking `_rrf_score` | RRF scores are reciprocal ranks | sort by `_rrf_rank`; do not treat score as probability |
-| first query is slow | lazy vector/FTS index build | run `VEC_WARM`, and issue one throwaway `FTS_SEARCH`/`HYBRID_SEARCH` per searched column set, before admitting traffic |
+| first query is slow | lazy vector/FTS index build | run `VEC_WARM` and `FTS_WARM` for the exact searched column set before admitting traffic |
 | lexical search is slow on every query | query terms appear in most chunks, so no candidate restriction is possible | check term selectivity; a corpus-wide term always costs a full BM25 pass |
 | ANN loses relevant hits | approximate recall loss | compare with `flat`, then retune or stay exact |
 | answer ignores correct evidence | prompt/context problem | reduce context, improve source labels and grounding rules |
@@ -733,7 +812,11 @@ Always pass explicit text columns. With no column list, `FTS_SEARCH` searches
 every column, including vectors and metadata.
 
 `FTS_SEARCH` builds a term-postings index alongside its tokenized-document
-cache, per searched column set, invalidated by the table version. Queries whose
+cache, per searched column set, invalidated by the table version. Repeated
+queries also reuse their corpus-bound wildcard expansion, candidate set, and
+BM25 term weights until that version changes. A filtered request rebinds only
+the small prepared query tree to its authorized BM25 statistics, so its scores
+remain ACL-local. Queries whose
 terms are selective — exact identifiers, error codes, product names, the cases
 the lexical branch exists for — only score the documents that can match, and
 wildcards resolve against the corpus term dictionary once per query instead of
@@ -742,9 +825,13 @@ cannot be narrowed, so it still costs a full BM25 pass; that is a property of th
 query, not a tuning knob. See [BENCHMARKS.md](../BENCHMARKS.md) for measured
 figures.
 
-Both caches are built lazily on first search. There is no `VEC_WARM` equivalent
-for the lexical side, so a serving deployment should issue one throwaway query
-per searched column set during startup, alongside `VEC_WARM`.
+Both caches are built lazily on first search. Use `FTS_WARM` during startup for
+each exact searched column set, alongside `VEC_WARM`, to move that work out of
+the first user request:
+
+```sql
+SELECT * FROM FTS_WARM('rag_chunks', 'search_text');
+```
 
 ### Explicit hybrid RRF
 

@@ -3,6 +3,7 @@ package tinysql_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -45,6 +46,56 @@ func TestPublicSQLStateHelpers(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), tsql.SQLStateSyntaxError) {
 		t.Fatalf("expected SQLSTATE in error text, got %q", err.Error())
+	}
+}
+
+func TestPublicRAGPreFilterJSON(t *testing.T) {
+	options, err := tsql.RAGPreFilterJSON(tsql.RAGPreFilter{
+		IDColumn:      "chunk_id",
+		AllowedRowIDs: []any{"chunk-7", 42},
+		Equals:        map[string]any{"tenant_id": "acme", "visibility": "published"},
+	})
+	if err != nil {
+		t.Fatalf("RAGPreFilterJSON: %v", err)
+	}
+
+	var payload struct {
+		PreFilter struct {
+			IDColumn      string         `json:"id_column"`
+			AllowedRowIDs []any          `json:"allowed_row_ids"`
+			Equals        map[string]any `json:"equals"`
+		} `json:"pre_filter"`
+	}
+	if err := json.Unmarshal([]byte(options), &payload); err != nil {
+		t.Fatalf("decode generated options: %v", err)
+	}
+	if payload.PreFilter.IDColumn != "chunk_id" || len(payload.PreFilter.AllowedRowIDs) != 2 || payload.PreFilter.AllowedRowIDs[0] != "chunk-7" || payload.PreFilter.Equals["tenant_id"] != "acme" {
+		t.Fatalf("unexpected pre-filter options: %#v", payload.PreFilter)
+	}
+
+	// An explicit empty list is the useful deny-all ACL form; it must not be
+	// mistaken for an absent filter and omitted by JSON encoding.
+	denyAll, err := tsql.RAGPreFilterJSON(tsql.RAGPreFilter{AllowedRowIDs: []any{}})
+	if err != nil {
+		t.Fatalf("encode deny-all ACL: %v", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(denyAll), &raw); err != nil {
+		t.Fatalf("decode deny-all options: %v", err)
+	}
+	var filter map[string]json.RawMessage
+	if err := json.Unmarshal(raw["pre_filter"], &filter); err != nil {
+		t.Fatalf("decode deny-all filter: %v", err)
+	}
+	if got := string(filter["allowed_row_ids"]); got != "[]" {
+		t.Fatalf("deny-all allowed_row_ids = %s, want []", got)
+	}
+
+	if _, err := tsql.RAGPreFilterJSON(tsql.RAGPreFilter{}); err == nil {
+		t.Fatal("expected empty RAG pre-filter to be rejected")
+	}
+	if _, err := tsql.RAGPreFilterJSON(tsql.RAGPreFilter{IDColumn: "chunk_id", Equals: map[string]any{"tenant_id": "acme"}}); err == nil {
+		t.Fatal("expected IDColumn without AllowedRowIDs to be rejected")
 	}
 }
 

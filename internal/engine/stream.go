@@ -249,6 +249,7 @@ func produceResultStream(stream *ResultStream, header chan<- resultStreamHeader,
 		headerSent bool
 		locked     bool
 		audit      bool
+		releasePin func()
 	)
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -256,6 +257,9 @@ func produceResultStream(stream *ResultStream, header chan<- resultStreamHeader,
 		}
 		if locked {
 			db.UnlockContentForRead()
+		}
+		if releasePin != nil {
+			releasePin()
 		}
 		if audit {
 			recordAudit(stream.ctx, db, tenant, stmt, err)
@@ -280,20 +284,33 @@ func produceResultStream(stream *ResultStream, header chan<- resultStreamHeader,
 			now:           time.Now(),
 			subqueryCache: newSubqueryResultCache(),
 		}
-		plan, handled, planErr := buildSimpleSelectPlan(env, selectStmt)
+		plan, handled, planErr := buildStreamingSimpleSelectPlan(env, selectStmt)
 		if planErr != nil {
 			err = planErr
 			audit = true
 			return
 		}
 		if handled && len(plan.orderBy) == 0 {
+			// A normal in-memory/direct-backend table is pinned by identity.
+			// Future writes copy that one table before mutation, letting the
+			// slow consumer outlive contentMu's global read lock without racing
+			// row-slice changes. Paged read-only sources use a cursor and do not
+			// need a table pin (see streamPagedSimpleSelectPlan).
+			if plan.pagedSource != nil {
+				db.UnlockContentForRead()
+				locked = false
+			} else if release, snapshotted := db.PinTableForStream(plan.table); snapshotted {
+				releasePin = release
+				db.UnlockContentForRead()
+				locked = false
+			}
 			audit = true
 			if !sendResultStreamHeader(stream.ctx, header, resultStreamHeader{cols: plan.outputCols}) {
 				err = context.Cause(stream.ctx)
 				return
 			}
 			headerSent = true
-			err = streamSimpleSelectPlan(stream, plan)
+			err = streamSimpleSelectPlan(stream, plan, db)
 			return
 		}
 		db.UnlockContentForRead()
@@ -329,7 +346,10 @@ func streamableSimpleSelect(s *Select) bool {
 	return s != nil && len(s.OrderBy) == 0 && simpleSelectEligible(s)
 }
 
-func streamSimpleSelectPlan(stream *ResultStream, plan *simpleSelectPlan) error {
+func streamSimpleSelectPlan(stream *ResultStream, plan *simpleSelectPlan, db *storage.DB) error {
+	if plan.pagedSource != nil {
+		return streamPagedSimpleSelectPlan(stream, plan, db)
+	}
 	rows := simplePlanRows(plan)
 	rowCount := len(rows)
 	if plan.rowIDs != nil {
@@ -402,6 +422,99 @@ func streamSimpleSelectPlan(stream *ResultStream, plan *simpleSelectPlan) error 
 		emitted++
 		if limit >= 0 && emitted >= limit {
 			return nil
+		}
+	}
+	return nil
+}
+
+// pagedResultStreamBatchRows bounds decoded source rows while a paged stream
+// is waiting on its consumer. The pager lock is released before projection or
+// channel sends, so this controls only transient decode memory rather than a
+// second producer/consumer queue.
+const pagedResultStreamBatchRows = 32
+
+func streamPagedSimpleSelectPlan(stream *ResultStream, plan *simpleSelectPlan, db *storage.DB) error {
+	if db == nil || plan == nil || plan.pagedSource == nil {
+		return fmt.Errorf("paged stream source is unavailable")
+	}
+	source := plan.pagedSource
+	var (
+		cursor *storage.PagedRowCursor
+		ok     bool
+		err    error
+	)
+	if source.indexName == "" {
+		cursor, ok, err = db.OpenPagedTableCursor(source.tenant, source.table)
+	} else {
+		cursor, ok, err = db.OpenPagedIndexRangeCursor(source.tenant, source.table, source.indexName, source.startKey, source.endKey)
+	}
+	if err != nil {
+		return err
+	}
+	if !ok || cursor == nil {
+		return fmt.Errorf("paged stream source is unavailable")
+	}
+
+	offset := 0
+	if plan.offset != nil && *plan.offset > 0 {
+		offset = *plan.offset
+	}
+	limit := -1
+	if plan.limit != nil {
+		limit = *plan.limit
+	}
+	if limit == 0 {
+		return nil
+	}
+
+	matched, emitted := 0, 0
+	var scanned uint64
+	defer func() {
+		if remainder := scanned & 63; remainder != 0 {
+			stream.rowsScanned.Add(remainder)
+		}
+	}()
+	for !cursor.Done() {
+		if err := checkCtx(stream.ctx); err != nil {
+			return context.Cause(stream.ctx)
+		}
+		batch, err := cursor.NextBatch(pagedResultStreamBatchRows)
+		if err != nil {
+			return err
+		}
+		for _, raw := range batch {
+			scanned++
+			if scanned&63 == 0 {
+				stream.rowsScanned.Add(64)
+				if err := checkCtx(stream.ctx); err != nil {
+					return context.Cause(stream.ctx)
+				}
+			}
+			match := plan.filterFullyCovered
+			if !match {
+				match, err = evalRawWhere(plan, raw)
+				if err != nil {
+					return err
+				}
+			}
+			if !match {
+				continue
+			}
+			if matched < offset {
+				matched++
+				continue
+			}
+			out, err := projectRawRow(plan, raw)
+			if err != nil {
+				return err
+			}
+			if !sendResultStreamRow(stream.ctx, stream, out) {
+				return context.Cause(stream.ctx)
+			}
+			emitted++
+			if limit >= 0 && emitted >= limit {
+				return nil
+			}
 		}
 	}
 	return nil

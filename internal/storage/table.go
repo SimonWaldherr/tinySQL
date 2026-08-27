@@ -25,15 +25,23 @@ type Table struct {
 	// reopen. Version and StructVersion let the executor either reuse an index,
 	// extend it for append-only INSERTs, or rebuild it after UPDATE/DELETE/DDL.
 	FTSIndexes map[string]*FTSIndex
+	// VectorIndexes contains persisted ANN structures keyed by the executor's
+	// stable index key (kind, column position and metric).  Like FTSIndexes,
+	// these are derived from Rows but deliberately live with the table so a
+	// reopened database can use a validated graph rather than rebuilding it on
+	// its first vector query.
+	VectorIndexes map[string]*VectorIndex
 	// ftsGeneration changes when a lazy FTS build changes persisted metadata;
 	// ftsPersistedGeneration records the generation most recently flushed.
 	// This is deliberately separate from Version: a SELECT may build an index
 	// and must become durable without pretending the table's SQL data changed.
-	ftsGeneration          int
-	ftsPersistedGeneration int
-	IsTemp                 bool
-	colPos                 map[string]int
-	Version                int
+	ftsGeneration             int
+	ftsPersistedGeneration    int
+	vectorGeneration          int
+	vectorPersistedGeneration int
+	IsTemp                    bool
+	colPos                    map[string]int
+	Version                   int
 	// Stats is populated by ANALYZE and persisted with the table. DML marks it
 	// stale rather than trying to estimate distinct values incrementally.
 	Stats *TableStats
@@ -123,6 +131,29 @@ type FTSIndex struct {
 	DocTokenIDs   []int32
 }
 
+// VectorIndex is the backend-neutral persisted representation of an ANN
+// index.  The current format stores HNSW topology; the Kind field makes the
+// envelope forward-compatible with additional vector index families without
+// coupling storage to the execution engine's runtime types.
+//
+// Row positions are physical table row positions.  StructVersion and
+// BuiltRows distinguish append-only growth (which can extend a graph) from a
+// mutation of an existing row (which must rebuild it).
+type VectorIndex struct {
+	Format        int
+	Kind          string
+	Column        int
+	Metric        string
+	Version       int
+	StructVersion int
+	BuiltRows     int
+	Dims          int
+	Entry         int
+	MaxLevel      int
+	Levels        []int
+	Neighbors     [][][]int
+}
+
 // DerivedCloner is implemented by derived state (see the field above) that
 // knows how to produce an independent copy of itself. cloneTable checks for
 // it via a type assertion so storage never has to know the concrete type
@@ -165,6 +196,10 @@ func (t *Table) SetDerived(v any) { t.derived = v }
 // caller must hold DerivedLock, matching direct access to FTSIndexes.
 func (t *Table) MarkFTSIndexesChanged() { t.ftsGeneration++ }
 
+// MarkVectorIndexesChanged records a persist-relevant ANN metadata change.
+// The caller must hold DerivedLock, matching direct access to VectorIndexes.
+func (t *Table) MarkVectorIndexesChanged() { t.vectorGeneration++ }
+
 // FTSIndexesPersistenceState atomically returns the current FTS generation
 // and whether it has been flushed to the storage backend.
 func (t *Table) FTSIndexesPersistenceState() (generation int, dirty bool) {
@@ -185,12 +220,42 @@ func (t *Table) MarkFTSIndexesPersisted(generation int) {
 	t.DerivedUnlock()
 }
 
+// VectorIndexesPersistenceState atomically returns the current ANN generation
+// and whether it has crossed a persistence boundary.
+func (t *Table) VectorIndexesPersistenceState() (generation int, dirty bool) {
+	t.DerivedLock()
+	generation = t.vectorGeneration
+	dirty = generation != t.vectorPersistedGeneration
+	t.DerivedUnlock()
+	return generation, dirty
+}
+
+// MarkVectorIndexesPersisted marks ANN metadata durable unless a newer build
+// completed while the backend was saving an older snapshot.
+func (t *Table) MarkVectorIndexesPersisted(generation int) {
+	t.DerivedLock()
+	if generation > t.vectorPersistedGeneration && generation <= t.vectorGeneration {
+		t.vectorPersistedGeneration = generation
+	}
+	t.DerivedUnlock()
+}
+
 // snapshotFTSIndexes takes a backend-safe deep copy. FTS indexes may be built
 // by concurrent SELECTs, so persistence cannot read their maps and arenas
 // without the per-table derived lock.
 func (t *Table) snapshotFTSIndexes() map[string]*FTSIndex {
 	t.DerivedLock()
 	indexes := cloneFTSIndexes(t.FTSIndexes)
+	t.DerivedUnlock()
+	return indexes
+}
+
+// snapshotVectorIndexes takes a backend-safe deep copy.  ANN graphs are built
+// or append-extended by concurrent reads, so persistence must not retain their
+// mutable slices after it releases the table's derived-state lock.
+func (t *Table) snapshotVectorIndexes() map[string]*VectorIndex {
+	t.DerivedLock()
+	indexes := cloneVectorIndexes(t.VectorIndexes)
 	t.DerivedUnlock()
 	return indexes
 }
@@ -244,7 +309,7 @@ func NewTable(name string, cols []Column, isTemp bool) *Table {
 	for i, c := range cols {
 		pos[strings.ToLower(c.Name)] = i
 	}
-	return &Table{Name: name, Cols: cols, colPos: pos, IsTemp: isTemp, dirtyFrom: -1, Indexes: make(map[string]*SecondaryIndex), FTSIndexes: make(map[string]*FTSIndex)}
+	return &Table{Name: name, Cols: cols, colPos: pos, IsTemp: isTemp, dirtyFrom: -1, Indexes: make(map[string]*SecondaryIndex), FTSIndexes: make(map[string]*FTSIndex), VectorIndexes: make(map[string]*VectorIndex)}
 }
 
 // Analyze computes exact cardinality, null and simple range summaries for the

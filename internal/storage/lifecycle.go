@@ -110,9 +110,10 @@ func (db *DB) Sync() error {
 		dc, hasDirtyTracker := db.backend.(dirtyTracker)
 
 		type entry struct {
-			tenant        string
-			table         *Table
-			ftsGeneration int
+			tenant           string
+			table            *Table
+			ftsGeneration    int
+			vectorGeneration int
 		}
 		var toSave []entry
 		seen := make(map[string]bool) // tenant\x00lower(table name)
@@ -121,11 +122,12 @@ func (db *DB) Sync() error {
 		for tn, tdb := range db.tenants {
 			for _, t := range tdb.tables {
 				seen[tn+"\x00"+strings.ToLower(t.Name)] = true
-				generation, ftsDirty := t.FTSIndexesPersistenceState()
-				if hasDirtyTracker && !dc.IsDirty(tn, t.Name, t.Version) && !ftsDirty {
+				ftsGeneration, ftsDirty := t.FTSIndexesPersistenceState()
+				vectorGeneration, vectorDirty := t.VectorIndexesPersistenceState()
+				if hasDirtyTracker && !dc.IsDirty(tn, t.Name, t.Version) && !ftsDirty && !vectorDirty {
 					continue
 				}
-				toSave = append(toSave, entry{tenant: tn, table: t, ftsGeneration: generation})
+				toSave = append(toSave, entry{tenant: tn, table: t, ftsGeneration: ftsGeneration, vectorGeneration: vectorGeneration})
 			}
 		}
 		db.mu.RUnlock()
@@ -140,11 +142,12 @@ func (db *DB) Sync() error {
 					continue
 				}
 				seen[key] = true
-				generation, ftsDirty := ref.Table.FTSIndexesPersistenceState()
-				if hasDirtyTracker && !dc.IsDirty(ref.Tenant, ref.Table.Name, ref.Table.Version) && !ftsDirty {
+				ftsGeneration, ftsDirty := ref.Table.FTSIndexesPersistenceState()
+				vectorGeneration, vectorDirty := ref.Table.VectorIndexesPersistenceState()
+				if hasDirtyTracker && !dc.IsDirty(ref.Tenant, ref.Table.Name, ref.Table.Version) && !ftsDirty && !vectorDirty {
 					continue
 				}
-				toSave = append(toSave, entry{tenant: ref.Tenant, table: ref.Table, ftsGeneration: generation})
+				toSave = append(toSave, entry{tenant: ref.Tenant, table: ref.Table, ftsGeneration: ftsGeneration, vectorGeneration: vectorGeneration})
 			}
 		}
 
@@ -153,6 +156,7 @@ func (db *DB) Sync() error {
 				return db.markError(err)
 			}
 			e.table.MarkFTSIndexesPersisted(e.ftsGeneration)
+			e.table.MarkVectorIndexesPersisted(e.vectorGeneration)
 		}
 	}
 
@@ -189,6 +193,23 @@ func (db *DB) Close() error {
 	var firstErr error
 
 	db.StopJobScheduler()
+	// Stop and join the AdvancedWAL checkpoint worker before closing any
+	// storage resources. The worker may be in SaveToFile/rotation at this
+	// point; letting Close race it could leave a live goroutine with a closed
+	// WAL descriptor or a half-observed final checkpoint.
+	db.stopAdvancedWALCheckpointScheduler()
+	// A schema/catalog-only AdvancedWAL statement requests a checkpoint rather
+	// than producing a row log record. If Close follows it immediately, the
+	// asynchronous worker may not have had a scheduling turn yet; flush that
+	// pending snapshot synchronously before closing the WAL so CREATE/DROP/etc.
+	// is never acknowledged and then lost merely because the process exited
+	// quickly. Row-backed work is safe in the WAL either way, but checkpointing
+	// it here also leaves a compact clean shutdown artifact.
+	if wal := db.AdvancedWAL(); wal != nil && wal.checkpointWorkPending() {
+		if err := wal.Checkpoint(db); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
 
 	// Sync dirty tables to backend.
 	if err := db.Sync(); err != nil && firstErr == nil {
@@ -290,11 +311,13 @@ func (db *DB) SyncTable(tenant string, t *Table) error {
 	if db.backend == nil {
 		return nil
 	}
-	generation, _ := t.FTSIndexesPersistenceState()
+	ftsGeneration, _ := t.FTSIndexesPersistenceState()
+	vectorGeneration, _ := t.VectorIndexesPersistenceState()
 	if err := db.backend.SaveTable(tenant, t); err != nil {
 		return err
 	}
-	t.MarkFTSIndexesPersisted(generation)
+	t.MarkFTSIndexesPersisted(ftsGeneration)
+	t.MarkVectorIndexesPersisted(vectorGeneration)
 	return nil
 }
 

@@ -162,6 +162,10 @@ func runReplicaBootstrap(ctx context.Context, primaryAddr, tenant string, opts r
 	if err != nil {
 		return nil, 0, 0, fmt.Errorf("decode snapshot from primary %s: %w", primaryAddr, err)
 	}
+	if err := storage.InitializeReplicaState(db, resp.Epoch, resp.WatermarkLSN); err != nil {
+		_ = db.Close()
+		return nil, 0, 0, fmt.Errorf("initialize replica bootstrap state from primary %s: %w", primaryAddr, err)
+	}
 	return db, resp.WatermarkLSN, resp.Epoch, nil
 }
 
@@ -197,7 +201,7 @@ func pollChangesSinceOnce(ctx context.Context, conn *grpc.ClientConn, tenant str
 		return 0, sinceLSN, errReplicaNeedsRebootstrap
 	}
 
-	applied, err = applyChangesResponse(db, &resp)
+	applied, err = applyChangesResponse(db, expectedEpoch, &resp)
 	if err != nil {
 		return 0, sinceLSN, err
 	}
@@ -206,27 +210,35 @@ func pollChangesSinceOnce(ctx context.Context, conn *grpc.ClientConn, tenant str
 }
 
 // applyChangesResponse gob-decodes resp.RecordsGob (if any) into WAL
-// records and applies each in order via storage.ApplyWALRecord, returning
-// how many were applied. Shared by pollChangesSinceOnce (unary
+// records and applies the full response via storage.ApplyReplicaWALRecords,
+// returning how many new records were applied. The storage batch is atomic
+// with respect to readers and idempotent for a retried response, rather than
+// exposing a committed multi-row change one record at a time. Shared by pollChangesSinceOnce (unary
 // GetChangesSince transport) and recvChangesOnce (streaming GetChanges
 // transport) so both decode and apply a getChangesSinceResponse
 // identically -- the two transports differ only in how this response
 // reaches the replica, not in what is done with it once it has.
-func applyChangesResponse(db *storage.DB, resp *getChangesSinceResponse) (applied int, err error) {
+func applyChangesResponse(db *storage.DB, expectedEpoch uint64, resp *getChangesSinceResponse) (applied int, err error) {
+	if resp == nil {
+		return 0, fmt.Errorf("nil changes response")
+	}
 	var records []storage.WALRecord
 	if len(resp.RecordsGob) > 0 {
 		if err := gob.NewDecoder(bytes.NewReader(resp.RecordsGob)).Decode(&records); err != nil {
 			return 0, fmt.Errorf("decode WAL records: %w", err)
 		}
 	}
-
-	for i := range records {
-		if _, err := storage.ApplyWALRecord(db, &records[i]); err != nil {
-			return 0, fmt.Errorf("apply WAL record lsn=%d: %w", records[i].LSN, err)
-		}
+	if resp.Epoch != expectedEpoch {
+		return 0, errReplicaNeedsRebootstrap
 	}
-
-	return len(records), nil
+	applied, err = storage.ApplyReplicaWALRecords(db, expectedEpoch, records)
+	if err != nil {
+		if errors.Is(err, storage.ErrReplicaEpochMismatch) {
+			return 0, errReplicaNeedsRebootstrap
+		}
+		return 0, fmt.Errorf("apply WAL changes: %w", err)
+	}
+	return applied, nil
 }
 
 // runReplicaPollLoop repeatedly calls GetChangesSince against the primary
@@ -341,7 +353,7 @@ func recvChangesOnce(stream grpc.ClientStream, expectedEpoch uint64, db *storage
 		return 0, 0, errReplicaNeedsRebootstrap
 	}
 
-	applied, err = applyChangesResponse(db, &resp)
+	applied, err = applyChangesResponse(db, expectedEpoch, &resp)
 	if err != nil {
 		return 0, 0, err
 	}

@@ -222,6 +222,7 @@ type simpleSelectPlan struct {
 	// It is never retained in a cached plan, so decoded BLOBs remain bounded
 	// to the request that loaded them.
 	rows            [][]any
+	pagedSource     *pagedSimpleSelectSource
 	scanType        string
 	indexName       string
 	indexPredicates []string

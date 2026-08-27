@@ -335,7 +335,7 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 	// to be sorted or clustered by insertion order.
 	idx.centroids = make([][]float64, nlist)
 	for i := range idx.centroids {
-		src := cache.vectors[rows[(i*len(rows))/nlist]]
+		src := cache.vector(rows[(i*len(rows))/nlist])
 		idx.centroids[i] = append([]float64(nil), src...)
 	}
 	assignments := make([]int, len(rows))
@@ -356,11 +356,11 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 					return nil, err
 				}
 			}
-			c := nearestCentroid(metric, cache.vectors[rowIdx], rowNormFor(metric, cache, rowIdx), idx.centroids, idx.centroidNorms)
+			c := nearestCentroid(metric, cache.vector(rowIdx), rowNormFor(metric, cache, rowIdx), idx.centroids, idx.centroidNorms)
 			assignments[i] = c
 			counts[c]++
 			base := c * dims
-			vectorAccumulateUnrolled(sums[base:base+dims], cache.vectors[rowIdx])
+			vectorAccumulateUnrolled(sums[base:base+dims], cache.vector(rowIdx))
 		}
 		for c := range idx.centroids {
 			// A centroid can end up with zero assigned rows this iteration
@@ -449,6 +449,23 @@ func getVecHNSWIndex(ctx context.Context, tenant string, table *storage.Table, c
 			continue
 		}
 
+		// A runtime cache miss after reopening no longer has to mean a graph
+		// rebuild.  Hydrate the validated, table-persisted HNSW topology first;
+		// an append-only table can then extend it by just the new rows below.
+		if idx == nil || idx.table != table {
+			idx = loadPersistentVecHNSWIndex(table, colIdx, metric, dims, cache)
+			if idx != nil {
+				if _, exists := vecHNSWCache[key]; !exists {
+					evictOverCap(vecHNSWCache, vecIndexCacheMaxEntries)
+				}
+				vecHNSWCache[key] = idx
+				if idx.version == table.Version {
+					vecHNSWCacheMu.Unlock()
+					return idx, nil
+				}
+			}
+		}
+
 		// A cached graph that is stale only because rows were appended since
 		// it was built or last extended (no UPDATE, DELETE, or schema change
 		// happened in between — see canExtendVecHNSWIndex) can grow in place
@@ -468,6 +485,9 @@ func getVecHNSWIndex(ctx context.Context, tenant string, table *storage.Table, c
 				idx.structVersion = table.StructVersion()
 			}
 			idx.mu.Unlock()
+			if err == nil {
+				persistVecHNSWIndex(table, colIdx, metric, idx)
+			}
 
 			vecHNSWCacheMu.Lock()
 			delete(vecHNSWBuilds, key)
@@ -484,6 +504,9 @@ func getVecHNSWIndex(ctx context.Context, tenant string, table *storage.Table, c
 		vecHNSWCacheMu.Unlock()
 
 		newIdx, err := buildVecHNSWIndex(ctx, table, metric, dims, cache)
+		if err == nil {
+			persistVecHNSWIndex(table, colIdx, metric, newIdx)
+		}
 
 		vecHNSWCacheMu.Lock()
 		delete(vecHNSWBuilds, key)
@@ -526,17 +549,17 @@ func buildVecHNSWIndex(ctx context.Context, table *storage.Table, metric string,
 		dims:          dims,
 		entry:         -1,
 		maxLevel:      -1,
-		levels:        make([]int, len(cache.vectors)),
-		neighbors:     make([][][]int, len(cache.vectors)),
+		levels:        make([]int, cache.rowCount()),
+		neighbors:     make([][][]int, cache.rowCount()),
 	}
 
-	visited := make([]bool, len(cache.vectors))
+	visited := make([]bool, cache.rowCount())
 	// The build loop is strictly sequential (single goroutine inserting one
 	// row at a time), so a single scratch instance can be reused across all
 	// insertions instead of round-tripping through the pool per row.
 	scratch := acquireHNSWScratch()
 	defer releaseHNSWScratch(scratch)
-	for rowIdx := range cache.vectors {
+	for rowIdx := 0; rowIdx < cache.rowCount(); rowIdx++ {
 		if rowIdx&1023 == 0 {
 			if err := checkCtx(ctx); err != nil {
 				return nil, err
@@ -578,7 +601,7 @@ func buildVecHNSWIndex(ctx context.Context, table *storage.Table, metric string,
 // incremental extend from that point, rather than paying for a full rebuild.
 func extendVecHNSWIndex(ctx context.Context, idx *vecHNSWIndex, cache vecSearchColumnCacheEntry) error {
 	oldRows := len(idx.levels)
-	newRows := len(cache.vectors)
+	newRows := cache.rowCount()
 	if newRows <= oldRows {
 		return nil
 	}
@@ -631,7 +654,7 @@ func (idx *vecHNSWIndex) insertHNSWNode(rowIdx int, cache vecSearchColumnCacheEn
 	}
 
 	current := idx.entry
-	query := cache.vectors[rowIdx]
+	query := cache.vector(rowIdx)
 	queryNorm := rowNormFor(idx.metric, cache, rowIdx)
 	for layer := idx.maxLevel; layer > level; layer-- {
 		best := idx.searchLayer(query, queryNorm, current, 1, layer, cache, visited, scratch)
@@ -670,7 +693,7 @@ func (idx *vecHNSWIndex) search(ctx context.Context, query []float64, queryNorm 
 		return nil, nil
 	}
 	current := idx.entry
-	visited := acquireVisited(len(cache.vectors))
+	visited := acquireVisited(cache.rowCount())
 	defer releaseVisited(visited)
 	scratch := acquireHNSWScratch()
 	defer releaseHNSWScratch(scratch)
@@ -704,8 +727,8 @@ func (idx *vecHNSWIndex) searchLayer(query []float64, queryNorm float64, entry i
 	if !ok {
 		return nil
 	}
-	if len(visited) < len(cache.vectors) {
-		visited = make([]bool, len(cache.vectors))
+	if len(visited) < cache.rowCount() {
+		visited = make([]bool, cache.rowCount())
 	}
 	touched := scratch.touched[:0]
 	markVisited := func(rowIdx int) bool {
@@ -771,7 +794,7 @@ func (idx *vecHNSWIndex) pruneHNSWNeighbors(rowIdx, layer int, cache vecSearchCo
 	if len(nbs) <= vecHNSWM {
 		return
 	}
-	query := cache.vectors[rowIdx]
+	query := cache.vector(rowIdx)
 	queryNorm := rowNormFor(idx.metric, cache, rowIdx)
 
 	// addHNSWLink calls this on essentially every link insertion during the
@@ -821,8 +844,8 @@ func (idx *vecHNSWIndex) neighborLayer(rowIdx, layer int) []int {
 }
 
 func validVectorRows(cache vecSearchColumnCacheEntry, dims int) []int {
-	rows := make([]int, 0, len(cache.vectors))
-	for i := range cache.vectors {
+	rows := make([]int, 0, cache.rowCount())
+	for i := 0; i < cache.rowCount(); i++ {
 		if validCacheRow(cache, i, dims) {
 			rows = append(rows, i)
 		}
@@ -831,14 +854,14 @@ func validVectorRows(cache vecSearchColumnCacheEntry, dims int) []int {
 }
 
 func validCacheRow(cache vecSearchColumnCacheEntry, rowIdx int, dims int) bool {
-	return rowIdx >= 0 && rowIdx < len(cache.valid) && cache.valid[rowIdx] && len(cache.vectors[rowIdx]) == dims
+	return rowIdx >= 0 && rowIdx < cache.rowCount() && cache.validAt(rowIdx) && len(cache.vector(rowIdx)) == dims
 }
 
 func rowNorm(cache vecSearchColumnCacheEntry, rowIdx int) float64 {
-	if rowIdx >= 0 && rowIdx < len(cache.norms) {
-		return cache.norms[rowIdx]
+	if rowIdx >= 0 && rowIdx < cache.rowCount() && cache.normsReady {
+		return cache.normAt(rowIdx)
 	}
-	return vectorL2Norm(cache.vectors[rowIdx])
+	return vectorL2Norm(cache.vector(rowIdx))
 }
 
 // metricNeedsNorms reports whether the metric consumes vector norms.
@@ -861,10 +884,10 @@ func rowNormFor(metric string, cache vecSearchColumnCacheEntry, rowIdx int) floa
 // directly to a caller without first passing through
 // vecSearchTopKWithIndex's finalize step.
 func rowDistance(metric string, query []float64, queryNorm float64, cache vecSearchColumnCacheEntry, rowIdx int) (float64, bool) {
-	if rowIdx < 0 || rowIdx >= len(cache.vectors) || !cache.valid[rowIdx] {
+	if rowIdx < 0 || rowIdx >= cache.rowCount() || !cache.validAt(rowIdx) {
 		return 0, false
 	}
-	return vectorRankingDistance(metric, cache.vectors[rowIdx], query, rowNormFor(metric, cache, rowIdx), queryNorm)
+	return vectorRankingDistance(metric, cache.vector(rowIdx), query, rowNormFor(metric, cache, rowIdx), queryNorm)
 }
 
 func centroidNorms(centroids [][]float64) []float64 {

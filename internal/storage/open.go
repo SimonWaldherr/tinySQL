@@ -416,3 +416,65 @@ func ReadCheckpointEpoch(filename string) (uint64, error) {
 	}
 	return epoch, nil
 }
+
+// ReadCheckpointDataWatermark returns the feed-resume boundary a checkpoint
+// snapshot contains. AdvancedWAL writes it after the recovery marker and epoch
+// (see AdvancedWAL.Checkpoint). For ordinary row work this is the highest
+// committed INSERT/UPDATE/DELETE LSN, deliberately separate from the later
+// checkpoint marker because feed clients resume at operation LSNs. For a
+// metadata-only checkpoint it is the marker itself, forcing an older replica
+// to bootstrap rather than miss unrepresentable DDL/catalog state. Older
+// checkpoints have no fourth trailing field and return zero; OpenAdvancedWAL
+// then falls back conservatively to the marker.
+func ReadCheckpointDataWatermark(filename string) (uint64, error) {
+	watermark, _, err := readCheckpointDataWatermark(filename)
+	return watermark, err
+}
+
+// readCheckpointDataWatermark is ReadCheckpointDataWatermark's internal form
+// that distinguishes a legitimate zero (an empty database checkpoint) from a
+// legacy checkpoint that simply has no trailing field. OpenAdvancedWAL needs
+// that distinction to decide whether its conservative marker fallback is
+// necessary; the exported read API retains the compact (uint64, error) shape.
+func readCheckpointDataWatermark(filename string) (uint64, bool, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	defer func() { _ = f.Close() }()
+
+	var r io.Reader = bufio.NewReader(f)
+	if strings.HasSuffix(strings.ToLower(filename), ".gz") {
+		gr, gzErr := gzip.NewReader(r)
+		if gzErr != nil {
+			return 0, false, gzErr
+		}
+		defer func() { _ = gr.Close() }()
+		r = gr
+	}
+	dec := gob.NewDecoder(r)
+	var dump []diskTable
+	if err := dec.Decode(&dump); err != nil {
+		return 0, false, nil
+	}
+	var dc diskCatalog
+	if err := dec.Decode(&dc); err != nil {
+		return 0, false, nil
+	}
+	var marker uint64
+	if err := dec.Decode(&marker); err != nil {
+		return 0, false, nil
+	}
+	var epoch uint64
+	if err := dec.Decode(&epoch); err != nil {
+		return 0, false, nil
+	}
+	var dataWatermark uint64
+	if err := dec.Decode(&dataWatermark); err != nil {
+		return 0, false, nil
+	}
+	return dataWatermark, true, nil
+}

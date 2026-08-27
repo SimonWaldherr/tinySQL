@@ -788,14 +788,15 @@ func TestVecSearchTopKWorkerPanicRecovered(t *testing.T) {
 	const numRows = vecSearchParallelMinRows
 	const dims = 4
 
-	cache := vecSearchColumnCacheEntry{
+	segment := vecColumnSegment{
 		vectors: make([][]float64, numRows),
 		valid:   make([]bool, numRows),
 	}
-	for i := range cache.vectors {
-		cache.vectors[i] = []float64{1, 0, 0, 0}
-		cache.valid[i] = true
+	for i := range segment.vectors {
+		segment.vectors[i] = []float64{1, 0, 0, 0}
+		segment.valid[i] = true
 	}
+	cache := vecSearchColumnCacheEntry{rows: numRows, segments: []vecColumnSegment{segment}}
 	panicRow := numRows - 1 // falls in the last worker's chunk
 	distFn := func(_ []float64, rowIdx int) (float64, bool) {
 		if rowIdx == panicRow {

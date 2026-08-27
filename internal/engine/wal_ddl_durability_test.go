@@ -13,8 +13,10 @@ package engine
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -95,6 +97,45 @@ func TestWALCreateTableIsDurableViaEngineExecute(t *testing.T) {
 	}
 	if len(table.Cols) != 2 {
 		t.Errorf("recovered table has %d columns, want 2", len(table.Cols))
+	}
+}
+
+// TestAdvancedWALDDLCheckpointsBeforeStatementReturns covers the gap row-level
+// WAL records cannot express: a schema-only statement has no
+// INSERT/UPDATE/DELETE operation to advance AdvancedWAL's normal checkpoint
+// counters. The engine must synchronously persist the CREATE before reporting
+// success, rather than merely enqueueing a later scheduler checkpoint.
+func TestAdvancedWALDDLCheckpointsBeforeStatementReturns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "advanced-ddl.wal")
+	cfg := storage.DefaultStorageConfig(storage.ModeAdvancedWAL)
+	cfg.Path = path
+	cfg.CheckpointEvery = 1 << 30
+	cfg.CheckpointInterval = time.Hour
+	db, err := storage.OpenDB(cfg)
+	if err != nil {
+		t.Fatalf("open advanced WAL DB: %v", err)
+	}
+	execWAL(t, db, "public", `CREATE TABLE only_schema (id INT, label TEXT)`)
+
+	checkpointPath := path + ".checkpoint"
+	if info, statErr := os.Stat(checkpointPath); statErr != nil || info.Size() == 0 {
+		t.Fatalf("schema-only AdvancedWAL statement returned before checkpoint %q existed: info=%v err=%v", checkpointPath, info, statErr)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close advanced WAL DB: %v", err)
+	}
+
+	reopened, err := storage.OpenDB(cfg)
+	if err != nil {
+		t.Fatalf("reopen advanced WAL DB: %v", err)
+	}
+	defer reopened.Close()
+	table, err := reopened.Get("public", "only_schema")
+	if err != nil {
+		t.Fatalf("schema-only CREATE was not durable: %v", err)
+	}
+	if len(table.Cols) != 2 {
+		t.Fatalf("reopened schema has %d columns, want 2", len(table.Cols))
 	}
 }
 

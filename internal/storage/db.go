@@ -84,11 +84,37 @@ type DB struct {
 	// closes the race with a single, easy-to-audit choke point.
 	contentMu sync.RWMutex
 
+	// streamSnapshotMu protects streamSnapshots. A direct ResultStream pins its
+	// source table here after planning; a later writer can then copy that one
+	// table before mutating it instead of making the slow consumer retain
+	// contentMu's global read side for its whole lifetime.
+	streamSnapshotMu sync.Mutex
+	streamSnapshots  map[*Table]uint32
+
 	// MVCC coordinator
 	mvcc *MVCCManager
 
 	// Advanced WAL (optional - replaces basic WAL when enabled)
 	advancedWAL *AdvancedWAL
+
+	// advancedCheckpointStop/Done own the lightweight AdvancedWAL checkpoint
+	// scheduler installed by OpenDB(ModeAdvancedWAL). It is intentionally
+	// separate from the SQL job scheduler: checkpointing is storage hygiene,
+	// not user work, and must keep running even when no job executor exists.
+	// The fields are protected by advancedCheckpointMu so Close can stop the
+	// goroutine before it closes the WAL file underneath it.
+	advancedCheckpointMu   sync.Mutex
+	advancedCheckpointStop chan struct{}
+	advancedCheckpointDone chan struct{}
+
+	// replicaEpoch and replicaAppliedLSN are the in-memory receiver-side
+	// idempotency watermark for a WAL replication feed. They are protected by
+	// contentMu along with the rows they describe: a batch of committed records
+	// and its watermark become visible to readers together, never one without
+	// the other. Replica processes bootstrap on restart today, so this state is
+	// deliberately runtime-only rather than another persisted catalog format.
+	replicaEpoch      uint64
+	replicaAppliedLSN uint64
 
 	// Optional tamper-evident audit log; see AttachAuditLog.
 	auditLog *AuditLog
@@ -136,6 +162,13 @@ type DB struct {
 	// becomes one AdvancedWAL transaction, committed or aborted as a unit.
 	// Zero means "no ambient transaction: each statement is its own".
 	ambientWALTx atomic.Uint64
+
+	// advancedWALMetadataDirty belongs only to an uncommitted transaction
+	// shadow. DDL/catalog work has no row-level AdvancedWAL record, but its
+	// checkpoint request must not be published to the shared live WAL until
+	// the driver has actually committed this shadow. Keeping it local prevents
+	// a ROLLBACK from unnecessarily forcing healthy replicas to re-bootstrap.
+	advancedWALMetadataDirty atomic.Bool
 }
 
 // BeginAmbientWALTx opens one AdvancedWAL transaction that every subsequent
@@ -206,6 +239,24 @@ func (db *DB) AbortAmbientWALTx() error {
 	}
 	_, err := wal.LogAbort(txID)
 	return err
+}
+
+// MarkAdvancedWALMetadataDirty records that an uncommitted shadow made a
+// schema/catalog mutation with no row-level AdvancedWAL representation. The
+// SQL driver consumes this fact only after it has published the shadow at a
+// successful COMMIT; a discarded shadow therefore never schedules a live
+// checkpoint or invalidates replica feed state.
+func (db *DB) MarkAdvancedWALMetadataDirty() {
+	if db != nil && db.IsShadow() {
+		db.advancedWALMetadataDirty.Store(true)
+	}
+}
+
+// AdvancedWALMetadataDirty reports whether this transaction shadow needs a
+// post-COMMIT metadata checkpoint. It is intentionally read-only: a failed
+// durability tail may be retried while the driver still owns the shadow.
+func (db *DB) AdvancedWALMetadataDirty() bool {
+	return db != nil && db.IsShadow() && db.advancedWALMetadataDirty.Load()
 }
 
 // copyRuntimeState copies everything that is not tenant/table data onto out:
@@ -403,9 +454,18 @@ func (db *DB) attachWAL(wal *WALManager) {
 
 // AttachAdvancedWAL attaches an advanced WAL to the database.
 func (db *DB) AttachAdvancedWAL(wal *AdvancedWAL) {
+	if db == nil {
+		return
+	}
+	// A replacement must stop the old worker first: otherwise it could
+	// checkpoint its previous WAL against this DB after the caller has
+	// switched to a new one. OpenDB attaches only once, while this also makes
+	// the public attach API safe for package users that rotate WAL files.
+	db.stopAdvancedWALCheckpointScheduler()
 	db.mu.Lock()
 	db.advancedWAL = wal
 	db.mu.Unlock()
+	db.startAdvancedWALCheckpointScheduler(wal)
 }
 
 // AdvancedWAL returns the configured advanced WAL manager (may be nil).

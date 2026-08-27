@@ -13,8 +13,8 @@ import (
 // undiscoverable over MCP again.
 func TestFunctionsCatalogListsRAGSurface(t *testing.T) {
 	mustContain := []string{
-		"VEC_SEARCH", "VEC_TOP_K", "VEC_WARM",
-		"FTS_SEARCH", "FTS_MATCH", "FTS_RANK",
+		"VEC_SEARCH", "VEC_TOP_K", "VEC_SEARCH_FILTERED", "VEC_WARM",
+		"FTS_WARM", "FTS_SEARCH", "FTS_SEARCH_FILTERED", "FTS_MATCH", "FTS_RANK",
 		"RAG_CONTEXT", "RAG_CONTEXT_FROM", "RAG_SEARCH",
 		"RECENCY_SCORE", "RAG_HYBRID_SCORE", "RAG_RANK_SCORE",
 		"_vec_similarity", "_vec_distance", "_vec_rank",

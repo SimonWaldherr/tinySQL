@@ -21,45 +21,59 @@ at three consecutive stages of one hybrid query:
 3. **Row-ID-native hybrid fusion.** `RAG_SEARCH` fuses the two candidate lists
    directly by physical row ID. It no longer creates two wide intermediate
    result tables or reconstructs identity from projected values before RRF.
+4. **Serving warm-up and query planning.** `FTS_WARM` eagerly prepares the
+   same persistent/runtime lexical entry as `FTS_SEARCH`; repeated lexical
+   queries reuse their immutable wildcard expansion, candidate set, and BM25
+   weights while the source-table version is unchanged. A filtered query
+   rebinds only the small prepared tree to its ACL-local BM25 statistics. This
+   keeps cold-index work and recurring query preparation off the
+   latency-critical RAG path.
 
 The public result schemas and SQL APIs remain unchanged.
 
+### Implemented: filtered retrieval before ranking
+
+`RAG_SEARCH` and `HYBRID_SEARCH` accept an explicit `pre_filter` options
+object. It supports stable `allowed_row_ids` (using `id_column`, or a
+single-column primary key by default) and an AND of `equals` metadata values.
+`VEC_SEARCH_FILTERED` and `FTS_SEARCH_FILTERED` expose the same object for
+standalone retrieval without overloading the legacy positional APIs.
+
+The resolved sorted row-ID set is shared by vector and lexical branches. FTS
+intersects it with postings before scoring and calculates BM25 document
+frequency/length statistics within that same authorized subset; vector search
+ranks that exact allowed subset before candidates enter RRF. This is strict ACL
+isolation, so filtered BM25/RRF scores are intentionally comparable only within
+the same pre-filter. Matching secondary-index prefixes are used for equality
+filters, with a correctness-preserving scan fallback.
+Neighbor expansion uses the same set, so it cannot expose an otherwise
+forbidden adjacent chunk. ACL, candidate-slot, context-boundary, stable-ID, and
+tenant-namespace regression tests cover the contract.
+
+Current limitation: range predicates and a filter-aware ANN frontier are not
+yet exposed. Filtered vector retrieval deliberately uses exact ranking until an
+ANN structure can guarantee recall inside an allowed subset.
+
 ## Remaining work
-
-### Phase 1 — filtered retrieval before ranking
-
-Push equality/range filters and authorization predicates into `VEC_SEARCH`,
-`FTS_SEARCH`, and the composed RAG functions. Start with predicates backed by a
-secondary index and represent the allowed row IDs as a sorted set or bitmap
-shared by both branches.
-
-Deliverables:
-
-- an options/API shape for pre-filters that cannot be confused with an outer
-  post-retrieval `WHERE`;
-- intersection of FTS postings and vector candidates with the allowed row set;
-- tenant/ACL tests proving unauthorized rows never consume candidate slots;
-- filtered and unfiltered recall/latency benchmarks.
-
-Acceptance criterion: selective filters reduce examined candidates and do not
-change results relative to an exact search over the same authorized subset.
 
 ### Phase 2 — persistent vector indexes and compact encodings
 
-Persist HNSW topology and its build metadata beside the vector column cache,
-then extend it for append-only ingestion using the same `StructVersion`
-contract as FTS. Add optional float32 and scalar-quantized storage while
-retaining an exact float64 path for baselines and final rescoring.
+The HNSW baseline is implemented. `VEC_WARM(..., 'hnsw')` persists a versioned
+graph alongside the table; the next process validates and hydrates that graph
+instead of rebuilding it. Pure appends extend the vector-column cache and HNSW
+topology only for new rows. An update, delete, schema change, incompatible
+format, or incomplete/corrupt topology takes the safe full-rebuild path.
 
-Deliverables:
+Remaining deliverables:
 
-- versioned on-disk HNSW format with corruption and compatibility checks;
-- append journal or copy-on-write update path;
-- optional quantized candidate search followed by exact top-N rescoring;
+- optional persistent IVF, float32, and scalar-quantized candidate indexes;
+- exact top-N rescoring after a compact/quantized candidate pass;
+- configurable graph/delta compaction and disk-memory budgets;
 - recall@k, build time, reopen time, disk size, and resident-memory benchmarks.
 
-Acceptance criterion: reopening does not rebuild HNSW, append cost scales with
-new vectors, and each compact mode has a documented recall/memory envelope.
+Acceptance criterion: reopening does not rebuild a compatible HNSW graph,
+append cost scales with new vectors, and each compact mode has a documented
+recall/memory envelope.
 
 ### Phase 3 — tokenizer and document-format profiles
 

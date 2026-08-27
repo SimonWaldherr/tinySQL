@@ -60,6 +60,22 @@ func (c *conn) commitTx() error {
 			return err
 		}
 	}
+	// A shadow transaction can contain pure DDL/catalog work that AdvancedWAL
+	// has no row operation to encode. The engine records that only on the
+	// private shadow; publish the checkpoint request after commitTxApply has
+	// made the shadow live, never when a later ROLLBACK discards it. This closes
+	// the crash window where CREATE TABLE followed by an immediate process exit
+	// could otherwise be lost despite a successful transaction commit.
+	if advanced := oldDB.AdvancedWAL(); advanced != nil {
+		if newDB.AdvancedWALMetadataDirty() {
+			advanced.RequestCheckpoint()
+		}
+		if advanced.CheckpointRequested() {
+			if err := advanced.Checkpoint(oldDB); err != nil {
+				return err
+			}
+		}
+	}
 	// The transaction is applied in memory at this point, so clear its state
 	// either way — but do not report a successful COMMIT if the durable write
 	// failed. An application that got "commit ok" and then lost the rows on

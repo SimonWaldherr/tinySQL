@@ -21,7 +21,6 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -46,6 +45,10 @@ type ragSearchOptions struct {
 	ExpandAfter      int      `json:"expand_after"`
 	DocIDColumn      string   `json:"doc_id_column"`
 	ChunkIndexColumn string   `json:"chunk_index_column"`
+	// PreFilter is deliberately distinct from an outer SQL WHERE: it limits
+	// the source row set before vector/FTS candidate selection and RRF fusion.
+	// See rag_prefilter.go for its stable-ID/equality contract.
+	PreFilter *ragPreFilterOptions `json:"pre_filter"`
 }
 
 const ragSearchDefaultRRFK = 60.0
@@ -90,7 +93,8 @@ func (f *RAGSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 				return nil, fmt.Errorf("RAG_SEARCH: options must be a JSON string, got %T", optVal)
 			}
 			if strings.TrimSpace(optStr) != "" {
-				if err := json.Unmarshal([]byte(optStr), &opts); err != nil {
+				opts, err = ragParseSearchOptions(optStr)
+				if err != nil {
 					return nil, fmt.Errorf("RAG_SEARCH: invalid options JSON: %w", err)
 				}
 			}
@@ -139,9 +143,42 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 	searchArgs.metric = metric
 	searchArgs.indexMode = index
 
-	var result *ResultSet
+	tenant := env.tenant
+	if tenant == "" {
+		tenant = "default"
+	}
+	var (
+		preFilterTable *storage.Table
+		rowFilter      *ragRowFilter
+	)
+	if opts.PreFilter != nil {
+		var err error
+		preFilterTable, _, err = ragGetSourceTable(env, vecArgsParsed.tableName)
+		if err != nil {
+			return nil, fmt.Errorf("RAG_SEARCH: table %q not found: %w", vecArgsParsed.tableName, err)
+		}
+		rowFilter, err = ragBuildRowFilter(preFilterTable, opts.PreFilter)
+		if err != nil {
+			return nil, fmt.Errorf("RAG_SEARCH: %w", err)
+		}
+	}
+
+	var (
+		result      *ResultSet
+		sourceTable *storage.Table
+	)
 	if !hybrid {
-		table, candidates, err := vecSearchCandidates(ctx, env, searchArgs)
+		var (
+			table      *storage.Table
+			candidates []vecScoredRow
+			err        error
+		)
+		if rowFilter == nil {
+			table, candidates, err = vecSearchCandidates(ctx, env, searchArgs)
+		} else {
+			table = preFilterTable
+			candidates, err = ragVecSearchCandidatesFiltered(ctx, env, searchArgs, table, rowFilter)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("RAG_SEARCH: vector pass: %w", err)
 		}
@@ -149,6 +186,7 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 			candidates = candidates[:k]
 		}
 		result = materializeVecCandidates(table, candidates, metric)
+		sourceTable = table
 	} else {
 		if len(opts.KeyColumns) == 0 {
 			return nil, fmt.Errorf("RAG_SEARCH: key_columns is required for hybrid text+vector search")
@@ -163,13 +201,13 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 			ftsQuery = ftsAutoOrExpand(ftsQuery)
 		}
 
-		tenant := env.tenant
-		if tenant == "" {
-			tenant = "default"
-		}
-		table, err := env.db.Get(tenant, vecArgsParsed.tableName)
-		if err != nil {
-			return nil, fmt.Errorf("RAG_SEARCH: table %q not found: %w", vecArgsParsed.tableName, err)
+		table := preFilterTable
+		if table == nil {
+			var err error
+			table, _, err = ragGetSourceTable(env, vecArgsParsed.tableName)
+			if err != nil {
+				return nil, fmt.Errorf("RAG_SEARCH: table %q not found: %w", vecArgsParsed.tableName, err)
+			}
 		}
 		searchCols := make([]int, 0, len(textColumns))
 		for _, col := range textColumns {
@@ -218,11 +256,16 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			vecTable, vecCandidates, vecErr = vecSearchCandidates(ctx, env, searchArgs)
+			if rowFilter == nil {
+				vecTable, vecCandidates, vecErr = vecSearchCandidates(ctx, env, searchArgs)
+				return
+			}
+			vecTable = table
+			vecCandidates, vecErr = ragVecSearchCandidatesFiltered(ctx, env, searchArgs, table, rowFilter)
 		}()
 		go func() {
 			defer wg.Done()
-			ftsCandidates, ftsErr = ftsSearchCandidates(ctx, tenant, table, ftsQuery, candidateK, searchCols)
+			ftsCandidates, ftsErr = ragFTSSearchCandidatesFiltered(ctx, tenant, table, ftsQuery, candidateK, searchCols, rowFilter)
 		}()
 		wg.Wait()
 
@@ -244,6 +287,7 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 			rrfK = ragSearchDefaultRRFK
 		}
 		result = ragFuseCandidates(table, vecCandidates, ftsCandidates, metric, rrfK, k)
+		sourceTable = table
 	}
 
 	// ---- Optional neighbor-context expansion --------------------------
@@ -251,10 +295,18 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 		if opts.DocIDColumn == "" || opts.ChunkIndexColumn == "" {
 			return nil, fmt.Errorf("RAG_SEARCH: doc_id_column and chunk_index_column are required when expand_before/expand_after is set")
 		}
-		source, err := ragLoadSource(env, vecArgsParsed.tableName)
-		if err != nil {
-			return nil, fmt.Errorf("RAG_SEARCH: %w", err)
+		if sourceTable == nil {
+			return nil, fmt.Errorf("RAG_SEARCH: source table was not resolved")
 		}
+		// This must be the exact physical table that supplied vector/FTS
+		// candidates. In particular, do not route through ragLoadSource here:
+		// a same-named CTE may shadow that name, but its row IDs do not belong to
+		// the resolved pre-filter and could otherwise bypass the ACL boundary.
+		source := ragSourceFromTable(tenant, sourceTable)
+		// Context expansion is part of retrieval output, not an exempt display
+		// phase. Reapply the pre-filter to the source so an authorized hit can
+		// never pull an adjacent unauthorized chunk into the final context.
+		source = ragFilterSource(source, rowFilter)
 		// hits is built directly from the fused/vector-only ResultSet already
 		// computed above rather than via ragLoadSource: RAG_SEARCH's hits are
 		// an in-memory result the caller never registered as a table or CTE.
@@ -409,6 +461,9 @@ type ragNativeCandidate struct {
 	rrfScore float64
 }
 
+// Keep the sort order as pointers, but allocate all candidates in one compact
+// backing array per retrieval. This retains cheap pointer swaps in sort.Sort
+// while avoiding one heap allocation per vector/FTS candidate.
 type ragNativeCandidates []*ragNativeCandidate
 
 func (s ragNativeCandidates) Len() int { return len(s) }
@@ -421,16 +476,24 @@ func (s ragNativeCandidates) Less(i, j int) bool {
 func (s ragNativeCandidates) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
 
 func ragFuseCandidates(table *storage.Table, vecRows []vecScoredRow, ftsRows []ftsScored, metric string, rrfK float64, k int) *ResultSet {
-	byRow := make(map[int]*ragNativeCandidate, len(vecRows)+len(ftsRows))
-	ordered := make(ragNativeCandidates, 0, len(vecRows)+len(ftsRows))
+	// The two retrieval branches operate on the same immutable table snapshot,
+	// so a physical row index is a complete identity. Candidate count can never
+	// exceed the total input length, including any duplicate or invalid input
+	// row IDs, so this capacity also guarantees that pointers into candidates
+	// remain stable through all appends below.
+	candidateCap := len(vecRows) + len(ftsRows)
+	byRow := make(map[int]*ragNativeCandidate, candidateCap)
+	candidates := make([]ragNativeCandidate, 0, candidateCap)
+	ordered := make(ragNativeCandidates, 0, candidateCap)
 	for rank, candidate := range vecRows {
 		if candidate.rowIdx < 0 || candidate.rowIdx >= len(table.Rows) {
 			continue
 		}
-		entry := &ragNativeCandidate{
+		candidates = append(candidates, ragNativeCandidate{
 			rowIdx: candidate.rowIdx, vecRank: rank + 1,
 			distance: candidate.distance, order: len(ordered),
-		}
+		})
+		entry := &candidates[len(candidates)-1]
 		byRow[candidate.rowIdx] = entry
 		ordered = append(ordered, entry)
 	}
@@ -440,7 +503,8 @@ func ragFuseCandidates(table *storage.Table, vecRows []vecScoredRow, ftsRows []f
 		}
 		entry := byRow[candidate.rowIdx]
 		if entry == nil {
-			entry = &ragNativeCandidate{rowIdx: candidate.rowIdx, order: len(ordered)}
+			candidates = append(candidates, ragNativeCandidate{rowIdx: candidate.rowIdx, order: len(ordered)})
+			entry = &candidates[len(candidates)-1]
 			byRow[candidate.rowIdx] = entry
 			ordered = append(ordered, entry)
 		}

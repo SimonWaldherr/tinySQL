@@ -139,12 +139,12 @@ func (f *VecWarmTableFunc) Execute(ctx context.Context, args []Expr, env ExecEnv
 // coexist in the same column during a migration.
 func warmVectorStructures(ctx context.Context, tenant string, table *storage.Table, colIdx int, metric, indexMode string) (rowCount, vectorCount, dims, distinctDims, excludedRows int, err error) {
 	cache := getVecColumnCache(tenant, table, colIdx, metricNeedsNorms(metric))
-	rowCount = len(cache.vectors)
+	rowCount = cache.rowCount()
 	lenCounts := make(map[int]int)
-	for i := range cache.vectors {
-		if cache.valid[i] {
+	for i := 0; i < cache.rowCount(); i++ {
+		if cache.validAt(i) {
 			vectorCount++
-			l := len(cache.vectors[i])
+			l := len(cache.vector(i))
 			lenCounts[l]++
 			if dims == 0 {
 				dims = l

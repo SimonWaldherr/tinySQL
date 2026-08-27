@@ -90,6 +90,9 @@ func cloneTable(t *Table) *Table {
 	nt.FTSIndexes = cloneFTSIndexes(t.FTSIndexes)
 	nt.ftsGeneration = t.ftsGeneration
 	nt.ftsPersistedGeneration = t.ftsPersistedGeneration
+	nt.VectorIndexes = cloneVectorIndexes(t.VectorIndexes)
+	nt.vectorGeneration = t.vectorGeneration
+	nt.vectorPersistedGeneration = t.vectorPersistedGeneration
 	if cloner, ok := t.derived.(DerivedCloner); ok {
 		nt.derived = cloner.CloneDerived()
 	}
@@ -118,6 +121,33 @@ func cloneFTSIndexes(src map[string]*FTSIndex) map[string]*FTSIndex {
 		clone.TermIDs = make(map[string]int32, len(index.TermIDs))
 		for term, id := range index.TermIDs {
 			clone.TermIDs[term] = id
+		}
+		out[key] = &clone
+	}
+	return out
+}
+
+// cloneVectorIndexes returns a deep copy suitable for a transaction snapshot
+// or a persistence boundary.  ANN neighbor lists are mutable while an
+// append-only graph is being extended, so sharing even an inner []int would
+// let the live table and a snapshot corrupt one another.
+func cloneVectorIndexes(src map[string]*VectorIndex) map[string]*VectorIndex {
+	if len(src) == 0 {
+		return make(map[string]*VectorIndex)
+	}
+	out := make(map[string]*VectorIndex, len(src))
+	for key, index := range src {
+		if index == nil {
+			continue
+		}
+		clone := *index
+		clone.Levels = append([]int(nil), index.Levels...)
+		clone.Neighbors = make([][][]int, len(index.Neighbors))
+		for row, layers := range index.Neighbors {
+			clone.Neighbors[row] = make([][]int, len(layers))
+			for layer, neighbors := range layers {
+				clone.Neighbors[row][layer] = append([]int(nil), neighbors...)
+			}
 		}
 		out[key] = &clone
 	}

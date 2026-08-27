@@ -142,6 +142,18 @@ func fkOnUpdateCheckColumn(env ExecEnv, t *storage.Table, parentColIdx int, chan
 // CASCADE, or SET NULL) for the given set of parent-value changes against
 // ref's child table/column.
 func applyOneForeignKeyReference(env ExecEnv, ref fkReference, changes map[any]fkChange) error {
+	// Referential actions mutate the child directly instead of dispatching a
+	// nested SQL UPDATE/DELETE. Move that child to its writer-private copy
+	// first when a ResultStream is still reading the old table instance.
+	if ref.action == storage.Cascade || ref.action == storage.SetNull {
+		if env.db.DetachPinnedTableForWrite(env.tenant, ref.childTable.Name) {
+			child, err := env.db.Get(env.tenant, ref.childTable.Name)
+			if err != nil {
+				return err
+			}
+			ref.childTable = child
+		}
+	}
 	var leave func()
 	if ref.action == storage.Cascade || ref.action == storage.SetNull {
 		var err error

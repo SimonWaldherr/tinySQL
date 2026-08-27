@@ -235,6 +235,32 @@ func BenchmarkRAGHybridSearchWithExpansion(b *testing.B) {
 		ORDER BY _context_rank`, -1)
 }
 
+// BenchmarkRAGHybridSearchPreFilterSelective measures a realistic per-tenant
+// or document-type restriction before retrieval. The corpus has four evenly
+// distributed document types, so the pre-filter leaves one quarter of the
+// vector rows and gives FTS a bounded row-ID set to intersect with postings.
+//
+// Keep this beside BenchmarkRAGHybridSearch: their comparison is the
+// reproducible latency/allocations regression signal for the pre-filter path.
+func BenchmarkRAGHybridSearchPreFilterSelective(b *testing.B) {
+	db := ragBenchCorpus(b)
+	table, err := db.Get("default", "rag_chunks")
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := table.CreateSecondaryIndex("idx_rag_chunks_document_type", []string{"document_type"}, false); err != nil {
+		b.Fatal(err)
+	}
+	qv := ragBenchQueryVector(b)
+	runRAGBench(b, db, `
+		SELECT chunk_id, doc_id, chunk_text, _rrf_rank
+		FROM HYBRID_SEARCH('rag_chunks', 'embedding', 'search_text',
+			'term7 term23 term180 needle42', '`+qv+`', 6,
+			'{"candidate_k":24,"rrf_k":60,"metric":"cosine","index":"flat",
+			  "pre_filter":{"equals":{"document_type":"guide"}}}')
+		ORDER BY _rrf_rank`, 6)
+}
+
 // BenchmarkRAGVecSearchBranch and BenchmarkRAGFTSSearchBranch measure the two
 // halves of the hybrid query in isolation. Their sum bounds what
 // BenchmarkRAGHybridSearch could cost if the two passes ran concurrently

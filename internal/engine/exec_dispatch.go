@@ -15,6 +15,12 @@ func execStmt(env ExecEnv, stmt Statement) (*ResultSet, error) {
 			return nil, err
 		}
 	}
+	if !isReadOnlyStatement(stmt) {
+		// Nested trigger/procedure statements reuse their caller's content
+		// write lock and therefore bypass executeStatement. Keep their table
+		// mutations on the copy-on-write side of any active stream snapshot.
+		detachStreamSnapshotsForWrite(env.db, env.tenant, stmt)
+	}
 	switch s := stmt.(type) {
 	case *Explain:
 		return executeExplain(env, s)

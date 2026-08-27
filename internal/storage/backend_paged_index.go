@@ -176,6 +176,11 @@ func (b *PagedIndexBackend) LoadTable(tenant, name string) (*Table, error) {
 			return nil, fmt.Errorf("decode paged FTS indexes for %s.%s: %w", tenant, name, err)
 		}
 	}
+	if len(td.VectorIndexes) > 0 {
+		if err := json.Unmarshal(td.VectorIndexes, &t.VectorIndexes); err != nil {
+			return nil, fmt.Errorf("decode paged vector indexes for %s.%s: %w", tenant, name, err)
+		}
+	}
 	for _, index := range td.Indexes {
 		if err := t.CreateSecondaryIndex(index.Name, index.Columns, index.Unique); err != nil {
 			return nil, fmt.Errorf("rebuild paged index %s: %w", index.Name, err)
@@ -208,6 +213,10 @@ func (b *PagedIndexBackend) saveToPager(tenant string, t *Table) error {
 	if err != nil {
 		return fmt.Errorf("encode paged FTS indexes for %s.%s: %w", tenant, t.Name, err)
 	}
+	vectorIndexes, err := json.Marshal(t.snapshotVectorIndexes())
+	if err != nil {
+		return fmt.Errorf("encode paged vector indexes for %s.%s: %w", tenant, t.Name, err)
+	}
 	td := &pager.TableData{
 		Name:          t.Name,
 		Columns:       storageColumnsToPager(t.Cols),
@@ -216,6 +225,7 @@ func (b *PagedIndexBackend) saveToPager(tenant string, t *Table) error {
 		Version:       t.Version,
 		StructVersion: t.structVersion,
 		FTSIndexes:    ftsIndexes,
+		VectorIndexes: vectorIndexes,
 		Indexes:       make([]pager.IndexInfo, 0, len(t.Indexes)),
 	}
 	for _, index := range t.Indexes {
@@ -413,6 +423,9 @@ func (b *PagedIndexBackend) IndexMetadata(tenant, name string) (*Table, error) {
 	t.structVersion = entry.StructVersion
 	if len(entry.FTSIndexes) > 0 {
 		_ = json.Unmarshal(entry.FTSIndexes, &t.FTSIndexes)
+	}
+	if len(entry.VectorIndexes) > 0 {
+		_ = json.Unmarshal(entry.VectorIndexes, &t.VectorIndexes)
 	}
 	for _, index := range entry.Indexes {
 		t.Indexes[strings.ToLower(index.Name)] = &SecondaryIndex{

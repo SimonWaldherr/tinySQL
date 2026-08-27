@@ -39,6 +39,7 @@ type diskTable struct {
 	StructVersion int
 	Indexes       map[string]*SecondaryIndex
 	FTSIndexes    map[string]*FTSIndex
+	VectorIndexes map[string]*VectorIndex
 	Stats         *TableStats
 }
 

@@ -147,6 +147,7 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 func resetSimplePlanAccess(plan *simpleSelectPlan, rows int) {
 	plan.rowIDs = nil
 	plan.rows = nil
+	plan.pagedSource = nil
 	plan.scanType = "TABLE SCAN"
 	plan.indexName = ""
 	plan.indexPredicates = nil

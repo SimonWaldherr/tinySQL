@@ -28,9 +28,25 @@ VEC_SEARCH(table, column, query_vector, k [, metric [, index]])
 VEC_TOP_K(table, column, query_vector, k [, metric])
     Alias for VEC_SEARCH.
 
+VEC_SEARCH_FILTERED(table, column, query_vector, k, options_json)
+    Exact vector k-NN restricted BEFORE ranking by options_json.pre_filter.
+    pre_filter accepts either stable allowed_row_ids (with optional id_column;
+    a single-column primary key is the default) and/or equals metadata:
+      {"pre_filter":{"id_column":"chunk_id","allowed_row_ids":["c1"],
+                       "equals":{"tenant_id":"acme"}}}
+    The restrictions are intersected. A matching secondary-index prefix is
+    used when available; filtered searches intentionally use exact ranking so
+    an approximate global ANN frontier cannot omit an allowed nearest row.
+
 VEC_WARM(table, column [, metric [, index]])
     Eagerly builds the vector column cache and, if requested, the IVF/HNSW
     index, so the first real query after a bulk load doesn't pay the cost.
+
+FTS_WARM(table [, column1, column2, ...])
+    Eagerly builds the exact FTS_SEARCH document/postings cache for the given
+    ordered column set, so the first lexical or hybrid RAG query does not pay
+    the corpus build. Returns cache statistics including valid_docs, terms,
+    postings, tokens, and average document length.
 
 FTS_SEARCH(table, query, k [, column1, column2, ...])
     BM25 full-text search (IDF-weighted, corpus-length normalized).
@@ -42,6 +58,13 @@ FTS_SEARCH(table, query, k [, column1, column2, ...])
     Returns every column of ` + "`table`" + ` plus _fts_score and _fts_rank (1-based).
     Example:
       SELECT * FROM FTS_SEARCH('chunks', 'timeout OR retry', 10, 'chunk_text')
+
+FTS_SEARCH_FILTERED(table, query, k, options_json [, column1, column2, ...])
+    BM25 search restricted BEFORE scoring by the same explicit
+    options_json.pre_filter object as VEC_SEARCH_FILTERED. Allowed rows are
+    intersected with FTS postings, and BM25 statistics are computed from that
+    allowed set, so forbidden rows neither take slots nor influence scores.
+    Scores are comparable only within the same pre_filter boundary.
 
 RAG_CONTEXT(table, doc_id_col, chunk_index_col, doc_id, chunk_index, before [, after])
     Expands one known chunk into its neighboring chunks within the same
@@ -78,6 +101,11 @@ RAG_SEARCH(table, vector_column, query_vector, k [, options_json])
       expand_after         }  set either to enable RAG_CONTEXT_FROM-style
       doc_id_column,       }  neighbor-chunk expansion of the final hit set
       chunk_index_column   }  (doc_id_column/chunk_index_column required)
+      pre_filter           an explicit before-ranking ACL/metadata boundary:
+                           {"id_column":"chunk_id", "allowed_row_ids":[...],
+                            "equals":{"tenant_id":"acme"}}. Unlike an
+                           outer WHERE, this applies to vector, FTS, RRF, and
+                           neighbor-context expansion.
     Returns every column of ` + "`table`" + ` plus whichever of _vec_distance/
     _vec_similarity/_vec_rank, _fts_score/_fts_rank, _rrf_score/_rrf_rank,
     or _hit_rank/_context_offset/_context_hits/_context_rank apply to the

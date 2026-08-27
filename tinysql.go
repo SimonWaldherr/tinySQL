@@ -66,6 +66,7 @@ package tinysql
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -159,6 +160,67 @@ func VectorCacheAnalytics() VectorCacheStats { return engine.VectorCacheAnalytic
 // DefaultVectorCacheConfig returns bounded cache/analytics defaults with both
 // optional features disabled until explicitly enabled by the caller.
 func DefaultVectorCacheConfig() VectorCacheConfig { return engine.DefaultVectorCacheConfig() }
+
+// RAGPreFilter is the public before-ranking authorization/metadata boundary
+// for RAG_SEARCH, HYBRID_SEARCH, VEC_SEARCH_FILTERED, and
+// FTS_SEARCH_FILTERED. It deliberately represents stable application IDs,
+// never mutable physical table-row offsets.
+//
+// Set IDColumn when AllowedRowIDs refers to a column other than a single-column
+// PRIMARY KEY. Equals is an AND of exact metadata values (for example tenant,
+// visibility, or document type); it is intersected with AllowedRowIDs when
+// both are present. See RAGPreFilterJSON for the SQL options payload.
+type RAGPreFilter struct {
+	IDColumn      string         `json:"id_column,omitempty"`
+	AllowedRowIDs []any          `json:"allowed_row_ids"`
+	Equals        map[string]any `json:"equals"`
+}
+
+// RAGPreFilterJSON encodes filter as the explicit {"pre_filter": ...} JSON
+// options object accepted by TinySQL's filtered retrieval functions. It is
+// useful for database/sql callers that bind the options JSON as one parameter:
+//
+//	options, err := tinysql.RAGPreFilterJSON(tinysql.RAGPreFilter{
+//		Equals: map[string]any{"tenant_id": "acme"},
+//	})
+//	rows, err := db.QueryContext(ctx, `SELECT * FROM HYBRID_SEARCH(?, ?, ?, ?, ?, ?, ?)`,
+//		"chunks", "embedding", "search_text", query, vector, 8, options)
+//
+// Unlike an outer WHERE, this boundary is applied before vector/FTS candidate
+// selection, reciprocal-rank fusion, and neighbor-context expansion.
+func RAGPreFilterJSON(filter RAGPreFilter) (string, error) {
+	if filter.AllowedRowIDs == nil && len(filter.Equals) == 0 {
+		return "", fmt.Errorf("RAG pre-filter requires AllowedRowIDs or at least one Equals value")
+	}
+	if filter.AllowedRowIDs == nil && strings.TrimSpace(filter.IDColumn) != "" {
+		return "", fmt.Errorf("RAG pre-filter IDColumn requires AllowedRowIDs")
+	}
+
+	// A pointer to the slice preserves the important distinction between a nil
+	// AllowedRowIDs (not supplied) and []any{} (an explicit deny-all ACL), while
+	// omitting unrelated null fields from the generated SQL options object.
+	type encodedFilter struct {
+		IDColumn      string         `json:"id_column,omitempty"`
+		AllowedRowIDs *[]any         `json:"allowed_row_ids,omitempty"`
+		Equals        map[string]any `json:"equals,omitempty"`
+	}
+	var allowedRowIDs *[]any
+	if filter.AllowedRowIDs != nil {
+		allowedRowIDs = &filter.AllowedRowIDs
+	}
+	value := struct {
+		PreFilter encodedFilter `json:"pre_filter"`
+	}{PreFilter: encodedFilter{
+		IDColumn:      filter.IDColumn,
+		AllowedRowIDs: allowedRowIDs,
+		Equals:        filter.Equals,
+	}}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return "", fmt.Errorf("encode RAG pre-filter: %w", err)
+	}
+	return string(raw), nil
+}
 
 // ProcedureContext is passed to in-memory stored procedures registered with
 // RegisterStoredProcedure. It can execute nested SQL within the same CALL.

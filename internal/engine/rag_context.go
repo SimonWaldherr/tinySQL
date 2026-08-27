@@ -498,14 +498,23 @@ func ragLoadSource(env ExecEnv, name string) (ragSource, error) {
 	if err != nil {
 		return ragSource{}, fmt.Errorf("RAG source %q not found: %w", name, err)
 	}
+	return ragSourceFromTable(tenant, table), nil
+}
 
+// ragSourceFromTable builds the direct physical-table source used by a
+// retrieval that already resolved its table through DB.Get. RAG_SEARCH uses
+// this rather than ragLoadSource for its optional context phase: a CTE with
+// the same name can shadow a table in ragLoadSource, but it was never the
+// source that VEC_SEARCH/FTS_SEARCH ranked and its row IDs cannot safely be
+// combined with a pre_filter resolved against the real table.
+func ragSourceFromTable(tenant string, table *storage.Table) ragSource {
 	cols := colNames(table.Cols)
 	columnIdx := make(map[string]int, len(table.Cols))
 	for i, col := range table.Cols {
 		columnIdx[strings.ToLower(col.Name)] = i
 	}
 	return ragSource{cols: cols, rawRows: table.Rows, columnIdx: columnIdx, tableSource: true,
-		tenant: tenant, table: table}, nil
+		tenant: tenant, table: table}
 }
 
 func (source ragSource) len() int {
@@ -547,6 +556,37 @@ func ragFindContextRows(source ragSource, docCol, chunkCol string, docID any, ce
 	minChunk := centerChunk - before
 	maxChunk := centerChunk + after
 	matches := make([]ragContextRow, 0, before+after+1)
+
+	// RAG_CONTEXT normally receives a named table. Resolve its two column
+	// positions once, then read raw row cells directly: source.value lowercases
+	// and hashes both column names on every row, which turns a small neighbor
+	// lookup into tens of thousands of string/map operations on a large corpus.
+	// The CTE/in-memory path below retains source.value because its Row maps do
+	// not have stable physical column positions.
+	if source.tableSource {
+		docIdx, docOK := source.columnIdx[strings.ToLower(docCol)]
+		chunkIdx, chunkOK := source.columnIdx[strings.ToLower(chunkCol)]
+		if !docOK || !chunkOK {
+			return matches
+		}
+		for rowIndex, raw := range source.rawRows {
+			if docIdx >= len(raw) || chunkIdx >= len(raw) {
+				continue
+			}
+			docVal := raw[docIdx]
+			if !rawEqual(docVal, docID) {
+				continue
+			}
+			chunkIndex, err := toInt(raw[chunkIdx])
+			if err != nil || chunkIndex < minChunk || chunkIndex > maxChunk {
+				continue
+			}
+			matches = append(matches, ragContextRow{sourceRow: rowIndex, docID: docVal, chunkIndex: chunkIndex})
+		}
+		sortRagContextRows(matches)
+		return matches
+	}
+
 	for rowIndex := 0; rowIndex < source.len(); rowIndex++ {
 		docVal, ok := source.value(rowIndex, docCol)
 		if !ok || !rawEqual(docVal, docID) {

@@ -13,8 +13,10 @@ package driver
 
 import (
 	"database/sql"
+	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func advancedWALDSN(t *testing.T, name string) string {
@@ -153,5 +155,78 @@ func TestAdvancedWALExplicitTransactionCommitPersistsAllStatements(t *testing.T)
 	}
 	if val != "a2" {
 		t.Fatalf("committed UPDATE lost across restart: got val=%q, want %q", val, "a2")
+	}
+}
+
+// TestAdvancedWALExplicitTransactionSchemaOnlyCommitCheckpointsLiveDB pins the
+// shadow-transaction case for the DDL durability barrier. A CREATE TABLE has
+// no row-level AdvancedWAL record, so it cannot wait for the normal row-count
+// checkpoint trigger; COMMIT must publish a checkpoint of the live DB before
+// it returns, not merely enqueue one for a later scheduler turn.
+func TestAdvancedWALExplicitTransactionSchemaOnlyCommitCheckpointsLiveDB(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "advwal_schema_only")
+	dsn := "file:" + path + "?tenant=default&mode=advancedwal"
+	db, err := sql.Open("tinysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := tx.Exec(`CREATE TABLE schema_only (id INT, label TEXT)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if info, err := os.Stat(path + ".checkpoint"); err != nil || info.Size() == 0 {
+		t.Fatalf("schema-only COMMIT returned before a live checkpoint existed: info=%v err=%v", info, err)
+	}
+}
+
+// TestAdvancedWALRolledBackSchemaDoesNotCheckpointLiveDB makes the other half
+// of the shadow-DDL durability contract explicit. A shadow has to remember
+// that committed DDL needs a live checkpoint, but publishing that fact to the
+// shared WAL while the transaction is still reversible would force replicas
+// to re-bootstrap after an otherwise harmless ROLLBACK.
+func TestAdvancedWALRolledBackSchemaDoesNotCheckpointLiveDB(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "advwal_schema_rollback")
+	dsn := "file:" + path + "?tenant=default&mode=advancedwal"
+	db, err := sql.Open("tinysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := os.Stat(path + ".checkpoint"); !os.IsNotExist(err) {
+		t.Fatalf("fresh advanced-WAL database unexpectedly has checkpoint: %v", err)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := tx.Exec(`CREATE TABLE rolled_back_schema (id INT)`); err != nil {
+		t.Fatalf("create table in transaction: %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	// Give the scheduler more than one prompt wake-up opportunity. With the
+	// old shared RequestCheckpoint call, the rollback's abort wake-up raced the
+	// scheduler into writing a snapshot; the shadow-local flag leaves no work
+	// that reaches ShouldCheckpoint at all.
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if info, err := os.Stat(path + ".checkpoint"); err == nil {
+			t.Fatalf("rolled-back schema change triggered a live checkpoint: size=%d", info.Size())
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("stat checkpoint after rollback: %v", err)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

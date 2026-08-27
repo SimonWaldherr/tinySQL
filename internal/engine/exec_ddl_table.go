@@ -74,6 +74,7 @@ func executeDropTable(env ExecEnv, s *DropTable) (*ResultSet, error) {
 		purgeVecQueryCacheFor(tenant, t.Name)
 		purgeFTSCachesFor(tenant, t.Name)
 		purgeRAGContextCachesFor(tenant, t.Name)
+		purgeRAGPreFilterCachesFor(t.Name)
 		purgeNumericProfilesFor(t.Name)
 		env.db.Catalog().DeleteIndexesForTenantTable(env.tenant, s.Name)
 	}

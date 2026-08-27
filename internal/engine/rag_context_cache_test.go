@@ -206,3 +206,34 @@ func TestRAGContextIndexSeparatesColumnPairsAndTenants(t *testing.T) {
 		t.Errorf("tenant 'other' returned chunk_index %v, want 42", v)
 	}
 }
+
+// TestRAGContextDirectTableScanSemantics pins the raw-row fast path used by
+// single-hit RAG_CONTEXT. It must retain the generic path's cross-numeric
+// document equality, stable ordering for duplicate chunk positions, and
+// tolerance of short/malformed rows.
+func TestRAGContextDirectTableScanSemantics(t *testing.T) {
+	source := ragSource{
+		cols:        []string{"doc_id", "chunk_index"},
+		rawRows:     [][]any{{7, 2}, {int64(7), 1}, {float64(7), 1}, {7, "bad"}, {8, 1}, {7}},
+		columnIdx:   map[string]int{"doc_id": 0, "chunk_index": 1},
+		tableSource: true,
+	}
+
+	matches := ragFindContextRows(source, "doc_id", "chunk_index", int64(7), 1, 0, 1)
+	if len(matches) != 3 {
+		t.Fatalf("matches = %#v, want 3 rows", matches)
+	}
+	// The two chunk_index=1 entries preserve their input order, as the previous
+	// stable generic sorting path did; chunk 2 follows them.
+	for i, want := range []struct {
+		row, chunk int
+	}{{1, 1}, {2, 1}, {0, 2}} {
+		if matches[i].sourceRow != want.row || matches[i].chunkIndex != want.chunk {
+			t.Errorf("match %d = row %d/chunk %d, want row %d/chunk %d", i, matches[i].sourceRow, matches[i].chunkIndex, want.row, want.chunk)
+		}
+	}
+
+	if got := ragFindContextRows(source, "missing", "chunk_index", 7, 1, 1, 1); len(got) != 0 {
+		t.Fatalf("missing doc column returned %#v, want no rows", got)
+	}
+}

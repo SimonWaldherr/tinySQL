@@ -124,6 +124,12 @@ type AdvancedWAL struct {
 	// Buffered writer
 	writer *bufio.Writer
 
+	// bufferSize is retained so a checkpoint can reopen the WAL with the same
+	// buffering policy it was configured with. Reverting to bufio's small
+	// default after the first checkpoint silently made sustained write traffic
+	// slower than a freshly opened database.
+	bufferSize int
+
 	// GOB encoder
 	encoder *gob.Encoder
 
@@ -137,6 +143,11 @@ type AdvancedWAL struct {
 	syncMode           WALSyncMode
 	lastCheckpoint     time.Time
 	recordsSinceCP     uint64
+	// checkpointRequested covers durable catalog/DDL mutations, which have no
+	// row-level AdvancedWAL record to increment recordsSinceCP. The engine
+	// requests a checkpoint after a successful such statement so a CREATE
+	// TABLE/VIEW/trigger is not lost merely because no later DML arrives.
+	checkpointRequested bool
 
 	// Active transactions (for recovery)
 	activeTxs map[TxID]*WALTxState
@@ -146,6 +157,16 @@ type AdvancedWAL struct {
 
 	// Flushed LSN (written to disk)
 	flushedLSN LSN
+
+	// committedDataLSN is the largest INSERT/UPDATE/DELETE record belonging
+	// to a transaction that has reached COMMIT, or a retained metadata
+	// checkpoint boundary. Feed consumers resume at operation LSNs, not at the
+	// invisible BEGIN/COMMIT markers, so a checkpoint must retain this
+	// separately from committedLSN (the COMMIT marker's LSN). A metadata marker
+	// becomes a floor until a newer real operation supersedes it; otherwise a
+	// later abort-only/manual checkpoint could accidentally reopen an older
+	// replica's stale schema. See checkpointDataWatermark below.
+	committedDataLSN LSN
 
 	// LSN up to which the last checkpoint's saved snapshot already reflects
 	// every operation (loaded from the checkpoint file at open time, and
@@ -157,35 +178,23 @@ type AdvancedWAL struct {
 	// silently duplicating every row written since the previous checkpoint.
 	checkpointWatermark LSN
 
-	// checkpointDataWatermark is the highest LSN of any real, committed
-	// operation that a checkpoint has captured -- committedLSN at the exact
-	// moment Checkpoint ran, captured before that call's checkpoint-marker
-	// record consumes its own (necessarily later) LSN. It exists
-	// specifically for ReadCommittedSince's ErrReplicaTooFarBehind check
-	// (wal_feed.go), which must not reuse checkpointWatermark directly: the
-	// marker record's LSN is always at least one past the last real commit
-	// (checkpointWatermark == committedLSN+1 in the common case, more if
-	// other non-data LSNs were consumed around the same moment), so a
-	// replica's sinceLSN -- always a real operation's LSN, from a previous
-	// Bootstrap or ReadCommittedSince call, never a marker's -- can
-	// legitimately equal committedLSN while still being numerically less
-	// than checkpointWatermark. Comparing against checkpointWatermark there
-	// would reject a replica that is not actually missing anything, and
-	// would do so on every poll after every checkpoint that isn't
-	// immediately followed by a new write -- not a rare boundary case but a
-	// standing risk of spinning in an unbounded re-bootstrap loop against an
-	// otherwise idle primary.
+	// checkpointDataWatermark is the feed-resume boundary of the last saved
+	// snapshot. For normal row work it is committedDataLSN, the highest real
+	// operation LSN the snapshot contains. This exact distinction matters:
+	// ReadCommittedSince returns operation LSNs as its resume token, whereas
+	// committedLSN is the later COMMIT-marker LSN. Saving the marker here would
+	// falsely tell a caught-up replica to re-bootstrap after every checkpoint.
 	//
-	// Initialized from checkpointWatermark itself at open time (the only
-	// information available before this process has run a checkpoint of
-	// its own) and refined to the precise value on every subsequent
-	// Checkpoint call. It is deliberately never persisted: a fresh process
-	// falling back to the coarser checkpointWatermark right after it
-	// restarts, before its own first checkpoint, keeps that narrow window
-	// exactly as conservative as this field not existing at all --
-	// unlike letting it reset to zero across a restart would, which would
-	// silently defeat the whole check for any replica whose sinceLSN
-	// predates a checkpoint from a previous run.
+	// A metadata-only checkpoint is intentionally different. DDL/catalog
+	// changes currently have no row-level feed record, so its checkpoint stores
+	// its marker LSN here to force any replica that did not bootstrap from that
+	// snapshot to re-bootstrap rather than silently missing schema state.
+	// SnapshotWithWatermark returns at least this boundary, so a replica
+	// bootstrapped after that checkpoint remains eligible for incremental work.
+	//
+	// Persisted alongside checkpointWatermark and restored at open time.
+	// Legacy checkpoints that lack this trailing value conservatively fall back
+	// to checkpointWatermark.
 	checkpointDataWatermark LSN
 
 	// loggedTables tracks, for this AdvancedWAL instance's lifetime, every
@@ -221,6 +230,14 @@ type AdvancedWAL struct {
 	// records incrementally against the new incarnation's unrelated
 	// history -- it must re-bootstrap from scratch instead.
 	epoch uint64
+
+	// checkpointNotify is a coalescing, non-blocking wake-up for the DB-owned
+	// automatic checkpoint scheduler. A successful commit (or an abort that
+	// closes the last active transaction) sends at most one pending signal; the
+	// scheduler still rechecks ShouldCheckpoint under w.mu before doing I/O.
+	// Keeping this channel owned by the WAL lets direct API users and SQL
+	// statements trigger exactly the same scheduler without a polling delay.
+	checkpointNotify chan struct{}
 
 	closed bool
 }
@@ -276,6 +293,13 @@ type AdvancedWALConfig struct {
 	SyncMode WALSyncMode
 }
 
+// ErrAdvancedWALCheckpointActiveTransactions means a checkpoint was requested
+// while a transaction is still open. Saving a snapshot in that state can make
+// an uncommitted in-memory mutation indistinguishable from committed state on
+// recovery, so callers must commit or abort first. The automatic scheduler
+// treats this as "try again later" rather than an operational failure.
+var ErrAdvancedWALCheckpointActiveTransactions = errors.New("advanced WAL checkpoint requires all transactions to be committed or aborted")
+
 // OpenAdvancedWAL creates or opens a WAL with full ACID semantics.
 func OpenAdvancedWAL(config AdvancedWALConfig) (*AdvancedWAL, error) {
 	if config.Path == "" {
@@ -324,6 +348,7 @@ func OpenAdvancedWAL(config AdvancedWALConfig) (*AdvancedWAL, error) {
 	writer := bufio.NewWriterSize(cw, config.BufferSize)
 
 	var checkpointWatermark LSN
+	var checkpointDataWatermark LSN
 	var epoch uint64
 	if config.CheckpointPath != "" {
 		w, err := ReadCheckpointWatermark(config.CheckpointPath)
@@ -332,6 +357,20 @@ func OpenAdvancedWAL(config AdvancedWALConfig) (*AdvancedWAL, error) {
 			return nil, fmt.Errorf("read checkpoint watermark: %w", err)
 		}
 		checkpointWatermark = LSN(w)
+
+		dataWatermark, hasDataWatermark, err := readCheckpointDataWatermark(config.CheckpointPath)
+		if err != nil {
+			_ = file.Close()
+			return nil, fmt.Errorf("read checkpoint data watermark: %w", err)
+		}
+		checkpointDataWatermark = LSN(dataWatermark)
+		if !hasDataWatermark && checkpointWatermark != 0 {
+			// A pre-data-watermark checkpoint cannot tell us its final real
+			// commit. Its marker is a conservative resume point: it may be
+			// one LSN later than the final commit, but it can never make a
+			// replica ask for already-truncated history.
+			checkpointDataWatermark = checkpointWatermark
+		}
 
 		e, err := ReadCheckpointEpoch(config.CheckpointPath)
 		if err != nil {
@@ -347,6 +386,16 @@ func OpenAdvancedWAL(config AdvancedWALConfig) (*AdvancedWAL, error) {
 		// next time Checkpoint runs.
 		epoch = newWALEpoch()
 	}
+	// The checkpoint marker is written while w.mu is held, immediately after
+	// every pre-checkpoint record. Its predecessor is therefore a safe
+	// Bootstrap resume value after a restart even though the exact last COMMIT
+	// marker is not separately serialized. SnapshotWithWatermark also takes the
+	// maximum with checkpointDataWatermark for a metadata-only checkpoint,
+	// whose required boundary is the marker itself.
+	recoveredCommittedLSN := checkpointDataWatermark
+	if checkpointWatermark > 0 {
+		recoveredCommittedLSN = checkpointWatermark - 1
+	}
 
 	wal := &AdvancedWAL{
 		path:                    config.Path,
@@ -354,6 +403,7 @@ func OpenAdvancedWAL(config AdvancedWALConfig) (*AdvancedWAL, error) {
 		file:                    file,
 		bytes:                   cw,
 		writer:                  writer,
+		bufferSize:              config.BufferSize,
 		checkpointEvery:         config.CheckpointEvery,
 		checkpointInterval:      config.CheckpointInterval,
 		checkpointMaxBytes:      normalizeCheckpointMaxBytes(config.CheckpointMaxBytes),
@@ -362,8 +412,12 @@ func OpenAdvancedWAL(config AdvancedWALConfig) (*AdvancedWAL, error) {
 		activeTxs:               make(map[TxID]*WALTxState),
 		nextLSN:                 checkpointWatermark + 1,
 		checkpointWatermark:     checkpointWatermark,
-		checkpointDataWatermark: checkpointWatermark,
+		checkpointDataWatermark: checkpointDataWatermark,
+		committedLSN:            recoveredCommittedLSN,
+		flushedLSN:              recoveredCommittedLSN,
+		committedDataLSN:        checkpointDataWatermark,
 		epoch:                   epoch,
+		checkpointNotify:        make(chan struct{}, 1),
 	}
 
 	wal.encoder = gob.NewEncoder(writer)
@@ -376,6 +430,56 @@ func OpenAdvancedWAL(config AdvancedWALConfig) (*AdvancedWAL, error) {
 // = one WAL transaction, autocommitted). Safe for concurrent use.
 func (w *AdvancedWAL) NewAutoTxID() TxID {
 	return TxID(w.autoTxID.Add(1))
+}
+
+// notifyCheckpointScheduler wakes the optional DB-owned checkpoint scheduler
+// without making commit latency depend on snapshot I/O. It must be called with
+// w.mu held or after the caller has otherwise established that w is still
+// live; a closed/nil channel is harmlessly ignored.
+func (w *AdvancedWAL) notifyCheckpointScheduler() {
+	if w == nil || w.checkpointNotify == nil || w.closed {
+		return
+	}
+	select {
+	case w.checkpointNotify <- struct{}{}:
+	default:
+		// A wake-up is already pending. The scheduler rechecks all thresholds,
+		// so retaining more than one signal carries no extra information.
+	}
+}
+
+// checkpointWorkPending reports whether the scheduler has something durable
+// to compact. It intentionally treats a recovered non-empty WAL as work even
+// when recordsSinceCP starts at zero after process restart, while avoiding
+// pointless empty snapshots every CheckpointInterval on an idle database.
+func (w *AdvancedWAL) checkpointWorkPending() bool {
+	if w == nil {
+		return false
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return !w.closed && len(w.activeTxs) == 0 &&
+		(w.checkpointRequested || w.recordsSinceCP > 0 || (w.bytes != nil && w.bytes.n > 0))
+}
+
+// RequestCheckpoint asks the DB-owned scheduler to persist a successful
+// metadata/DDL mutation that has no row-level AdvancedWAL record of its own.
+// It is non-blocking with respect to snapshot I/O: a checkpoint runs in the
+// background after the caller's statement has released DB's content write
+// lock. Calling it for an already-logged mutation is harmless, but the engine
+// limits it to operations that did not open a statement WAL transaction so
+// the configured row/byte thresholds remain meaningful for ordinary DML.
+func (w *AdvancedWAL) RequestCheckpoint() {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed || w.checkpointPath == "" {
+		return
+	}
+	w.checkpointRequested = true
+	w.notifyCheckpointScheduler()
 }
 
 // LogBegin logs the start of a transaction.
@@ -588,11 +692,19 @@ func (w *AdvancedWAL) LogCommit(txID TxID) (LSN, error) {
 
 	if txState, exists := w.activeTxs[txID]; exists {
 		txState.Status = TxStatusCommitted
+		if n := len(txState.Operations); n > 0 {
+			// A feed exposes only row-operation records, never this COMMIT
+			// marker. Preserve their actual high-water mark for checkpoint
+			// compaction so a replica that resumed at the final operation is
+			// not spuriously considered behind.
+			w.committedDataLSN = txState.Operations[n-1]
+		}
 		delete(w.activeTxs, txID)
 	}
 
 	w.committedLSN = lsn
 	w.flushedLSN = lsn
+	w.notifyCheckpointScheduler()
 
 	return lsn, nil
 }
@@ -621,26 +733,78 @@ func (w *AdvancedWAL) LogAbort(txID TxID) (LSN, error) {
 		txState.Status = TxStatusAborted
 		delete(w.activeTxs, txID)
 	}
+	// An aborted transaction can be the last active one that kept the
+	// scheduler from checkpointing earlier committed work. Wake it so a
+	// long-lived explicit transaction does not unnecessarily pin WAL growth
+	// until the next periodic tick.
+	w.notifyCheckpointScheduler()
 
 	return lsn, nil
 }
 
 // Checkpoint creates a consistent snapshot and truncates the WAL.
+//
+// The lock order is deliberately DB content lock first, WAL lock second. SQL
+// mutations already hold the content write lock while they append and commit
+// their WAL records, so this makes the three values a replica/recovery cares
+// about -- table bytes, snapshot watermark, and WAL history -- one atomic
+// cut. In particular, a checkpoint can no longer serialize a row that has
+// been mutated in memory but whose WAL record has not been appended yet.
+//
+// Callers must not invoke Checkpoint while manually holding DB's content lock;
+// the public method owns that lock so it can be safely used by the automatic
+// scheduler and ordinary administrative callers without lock-order inversions.
 func (w *AdvancedWAL) Checkpoint(db *DB) error {
+	if w == nil || db == nil {
+		return nil
+	}
+	db.LockContentForRead()
+	defer db.UnlockContentForRead()
+	return w.checkpointWithContentReadLock(db)
+}
+
+// CheckpointWhileContentLocked is Checkpoint's variant for the one narrow
+// case where a caller already owns db's content read or write lock. It exists
+// so a successful schema/catalog statement can make its snapshot durable
+// before returning without attempting to recursively acquire sync.RWMutex.
+// Callers that do not already hold that lock must use Checkpoint instead.
+func (w *AdvancedWAL) CheckpointWhileContentLocked(db *DB) error {
+	if w == nil || db == nil {
+		return nil
+	}
+	return w.checkpointWithContentReadLock(db)
+}
+
+// checkpointWithContentReadLock performs Checkpoint's WAL/file work after the
+// caller has already acquired db's content read or write lock. Keeping this
+// small helper private prevents arbitrary callers from accidentally bypassing
+// the atomic snapshot/WAL barrier while still making the lock ownership clear
+// to this package's scheduler implementation and tests.
+func (w *AdvancedWAL) checkpointWithContentReadLock(db *DB) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
 		return fmt.Errorf("advanced WAL is closed")
 	}
-
 	if w.checkpointPath == "" {
 		return nil
 	}
+	if len(w.activeTxs) != 0 {
+		return ErrAdvancedWALCheckpointActiveTransactions
+	}
 
-	// Log checkpoint marker
+	// Capture the feed's real row-operation boundary before the marker consumes
+	// its own later LSN. A normal replica resumes at an INSERT/UPDATE/DELETE
+	// record, not at COMMIT, so persisting committedLSN here would falsely
+	// reject a caught-up replica after compaction. Metadata-only changes have
+	// no feed record; their explicit request below instead turns this marker
+	// into a mandatory re-bootstrap boundary.
+	dataWatermark := w.committedDataLSN
+	metadataCheckpoint := w.checkpointRequested
+
+	// Log checkpoint marker.
 	lsn := w.nextLSN
 	w.nextLSN++
-
 	record := &WALRecord{
 		LSN:       lsn,
 		TxID:      0,
@@ -648,63 +812,82 @@ func (w *AdvancedWAL) Checkpoint(db *DB) error {
 		Timestamp: time.Now(),
 	}
 	record.Checksum = w.calculateChecksum(record)
-
 	if err := w.writeRecord(record); err != nil {
 		return err
 	}
+	if metadataCheckpoint {
+		// No incremental row record can reconstruct this schema/catalog change.
+		// A caller below this marker must fetch this very snapshot instead of
+		// being answered with an empty-but-stale feed.
+		dataWatermark = lsn
+	}
 
-	// Flush before checkpoint
+	// Durably place the marker before publishing the snapshot. A crash after
+	// SaveToFile but before truncation is safe because the marker is persisted
+	// in the snapshot and Recover will skip all records at or below it.
 	if err := w.flush(); err != nil {
 		return err
 	}
 
-	// Save database snapshot together with the LSN watermark up to which it
-	// already reflects every operation (this checkpoint marker's own LSN —
-	// everything before it was already applied to db directly by the live
-	// engine, not via replay, since AdvancedWAL only logs alongside that
-	// mutation). If a crash lands between this save and the WAL truncation
-	// below, Recover uses the watermark to skip re-applying records this
-	// snapshot already contains, instead of silently duplicating them.
-	//
-	// w.epoch rides along as a second extra value (see ReadCheckpointEpoch,
-	// which decodes it back out in that same order) so a replication feed
-	// reading this checkpoint later can tell this WAL's identity apart from
-	// any other incarnation that might come to occupy the same path (see
-	// AdvancedWAL.epoch's doc comment).
-	if err := SaveToFile(db, w.checkpointPath, uint64(lsn), w.epoch); err != nil {
+	// Save the table/catalog snapshot, marker recovery watermark, WAL epoch,
+	// and exact feed-resume boundary in one rename. The trailing boundary was
+	// added after the first checkpoint format; readers retain a conservative
+	// fallback for earlier snapshots.
+	if err := SaveToFile(db, w.checkpointPath, uint64(lsn), w.epoch, uint64(dataWatermark)); err != nil {
 		return fmt.Errorf("checkpoint save: %w", err)
 	}
+	// From this point a restart will load the new snapshot even if WAL rotation
+	// below fails. Publish the same boundary in-memory before touching the
+	// descriptor so ReadCommittedSince cannot hand an already-checkpointed
+	// range to a replica during that recoverable failure window.
+	w.checkpointWatermark = lsn
+	w.checkpointDataWatermark = dataWatermark
+	// Preserve a metadata invalidation boundary across later abort-only or
+	// administrative checkpoints. A new committed row operation necessarily
+	// has a larger LSN and replaces this floor in LogCommit.
+	w.committedDataLSN = dataWatermark
 
-	// Truncate WAL
-	if err := w.file.Close(); err != nil {
-		return err
+	// Reopen with O_TRUNC rather than truncating a path after dropping the
+	// only live descriptor. If reopening fails, best-effort restoration of an
+	// append descriptor leaves the old WAL readable (and its snapshot marker
+	// makes recovery idempotent) instead of leaving a half-live manager whose
+	// next write silently targets a closed file.
+	oldFile := w.file
+	if oldFile != nil {
+		if err := oldFile.Close(); err != nil {
+			return fmt.Errorf("checkpoint close WAL: %w", err)
+		}
 	}
-
-	if err := os.Truncate(w.path, 0); err != nil {
-		return err
-	}
-
-	file, err := os.OpenFile(w.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	file, err := os.OpenFile(w.path, os.O_CREATE|os.O_RDWR|os.O_APPEND|os.O_TRUNC, 0o644)
 	if err != nil {
-		return err
+		if restored, restoreErr := os.OpenFile(w.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644); restoreErr == nil {
+			w.file = restored
+			w.bytes = &countingWriter{w: restored}
+			if fi, statErr := restored.Stat(); statErr == nil {
+				w.bytes.n = fi.Size()
+			}
+			w.writer = bufio.NewWriterSize(w.bytes, w.bufferSize)
+			w.encoder = gob.NewEncoder(w.writer)
+		} else {
+			// There is no writable descriptor left. Fail closed rather than
+			// retaining the buffered writer that still points at oldFile, which
+			// was closed above and would turn a later apparent LogCommit into an
+			// opaque write-after-close error.
+			w.closed = true
+			w.file = nil
+			w.bytes = nil
+			w.writer = nil
+			w.encoder = nil
+		}
+		return fmt.Errorf("checkpoint reopen/truncate WAL: %w", err)
 	}
-
 	w.file = file
 	w.bytes = &countingWriter{w: file}
-	w.writer = bufio.NewWriter(w.bytes)
+	w.writer = bufio.NewWriterSize(w.bytes, w.bufferSize)
 	w.encoder = gob.NewEncoder(w.writer)
 	w.recordsSinceCP = 0
+	w.checkpointRequested = false
 	w.lastCheckpoint = time.Now()
-	w.checkpointWatermark = lsn
-	// Refines checkpointDataWatermark to the precise value for this
-	// process's lifetime -- committedLSN is unchanged by everything above
-	// (only nextLSN/checkpointWatermark move), so this is exactly "the
-	// highest real, committed LSN this checkpoint's snapshot captured," not
-	// the checkpoint marker's own (necessarily later) LSN. See
-	// checkpointDataWatermark's doc comment for why ReadCommittedSince
-	// (wal_feed.go) needs this distinction to avoid rejecting a replica
-	// that is not actually missing anything.
-	w.checkpointDataWatermark = w.committedLSN
 	// nextLSN is deliberately NOT reset here: LSN is documented as globally
 	// unique and monotonically increasing for the database's lifetime (see
 	// the LSN doc comment and GetNextLSN/GetCommittedLSN/GetFlushedLSN,
@@ -722,6 +905,9 @@ func (w *AdvancedWAL) Checkpoint(db *DB) error {
 func (w *AdvancedWAL) ShouldCheckpoint() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.checkpointRequested {
+		return true
+	}
 
 	if w.recordsSinceCP >= w.checkpointEvery {
 		return true
@@ -736,6 +922,20 @@ func (w *AdvancedWAL) ShouldCheckpoint() bool {
 	}
 
 	return false
+}
+
+// CheckpointRequested reports whether a metadata-only mutation asked for an
+// immediate checkpoint that has not yet completed. The SQL driver consumes it
+// after it has atomically published a shadow transaction's local DDL/catalog
+// mutation to the live database; a rollback never gets to set this shared
+// request.
+func (w *AdvancedWAL) CheckpointRequested() bool {
+	if w == nil {
+		return false
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return !w.closed && w.checkpointRequested
 }
 
 // Recover replays the WAL to restore database state after a crash.
@@ -778,6 +978,8 @@ func (w *AdvancedWAL) Recover(db *DB) (int, error) {
 	// same watermark check would wrongly treat genuinely new records as
 	// already-checkpointed.
 	maxLSN := w.checkpointWatermark
+	maxCommittedLSN := w.committedLSN
+	maxCommittedDataLSN := w.committedDataLSN
 
 	for {
 		var record WALRecord
@@ -822,6 +1024,9 @@ func (w *AdvancedWAL) Recover(db *DB) (int, error) {
 
 		case WALOpCommit:
 			committed[record.TxID] = true
+			if record.LSN > maxCommittedLSN {
+				maxCommittedLSN = record.LSN
+			}
 			// Apply all operations for this transaction
 			if ops, exists := pending[record.TxID]; exists {
 				for _, op := range ops {
@@ -831,6 +1036,9 @@ func (w *AdvancedWAL) Recover(db *DB) (int, error) {
 					}
 					if table != nil {
 						touchedTables[table] = struct{}{}
+					}
+					if op.LSN > maxCommittedDataLSN {
+						maxCommittedDataLSN = op.LSN
 					}
 					recovered++
 				}
@@ -862,7 +1070,19 @@ func (w *AdvancedWAL) Recover(db *DB) (int, error) {
 		table.MarkDirtyFrom(-1)
 	}
 
-	// Update next LSN
+	// Restore the watermarks that Bootstrap and the automatic checkpoint
+	// scheduler need after a process restart. Before this, Recover advanced
+	// nextLSN but left committedLSN at zero, so a post-restart Bootstrap could
+	// advertise a watermark older than the snapshot/WAL state it returned.
+	// Only successfully replayed, committed operations count toward the next
+	// row-operation checkpoint threshold; aborted/pending records must never
+	// cause an otherwise idle recovered database to checkpoint prematurely.
+	w.committedLSN = maxCommittedLSN
+	w.flushedLSN = maxCommittedLSN
+	w.committedDataLSN = maxCommittedDataLSN
+	w.recordsSinceCP = uint64(recovered)
+
+	// Update next LSN.
 	w.nextLSN = maxLSN + 1
 
 	return recovered, nil

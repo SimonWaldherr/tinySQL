@@ -318,10 +318,10 @@ func TestExecuteStreamsCSVAndJSONLines(t *testing.T) {
 	})
 }
 
-// blockingFirstWrite proves that CSV output is reached while the stream still
-// owns the database read lock: a writer blocked on the first result prevents a
-// concurrent mutation from taking the write lock. A materialized CLI path
-// would release that lock before it begins writing output.
+// blockingFirstWrite proves that CSV output reaches its first record while the
+// direct ResultStream is still live. Its source table is pinned by identity,
+// so a concurrent writer may finish through copy-on-write without changing the
+// rows the slow CSV writer will subsequently receive.
 type blockingFirstWrite struct {
 	bytes.Buffer
 	first       chan struct{}
@@ -393,22 +393,25 @@ func TestExecuteCSVStreamsFirstRowBeforeQueryCompletes(t *testing.T) {
 	}()
 	select {
 	case err := <-mutationDone:
-		t.Fatalf("mutation completed before streamed writer was released: %v", err)
-	case <-time.After(75 * time.Millisecond):
-		// Expected: ExecuteStream retains the read lock while it feeds rows.
+		if err != nil {
+			t.Fatalf("mutation while streamed writer is blocked: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mutation remained blocked behind a slow streamed CSV writer")
 	}
 
 	w.unblock()
 	if err := <-execDone; err != nil {
 		t.Fatalf("streamed execute: %v", err)
 	}
-	select {
-	case err := <-mutationDone:
-		if err != nil {
-			t.Fatalf("mutation after stream: %v", err)
+	rows := strings.Split(strings.TrimSpace(w.String()), "\n")
+	if len(rows) != 256 {
+		t.Fatalf("CSV rows = %d, want original snapshot of 256", len(rows))
+	}
+	for _, row := range rows {
+		if row == "999" {
+			t.Fatalf("CSV stream included concurrent row: %q", w.String())
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("mutation remained blocked after streamed output completed")
 	}
 }
 
