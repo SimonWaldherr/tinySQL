@@ -38,6 +38,13 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 	beforeTriggers, afterTriggers := planTriggers(env.planFor(s), env, s.Table, storage.TriggerUpdate)
 	hasBefore := len(beforeTriggers) > 0
 	hasAfter := len(afterTriggers) > 0
+	var beforeRunner, afterRunner *triggerListRunner
+	if hasBefore {
+		beforeRunner = &triggerListRunner{triggers: beforeTriggers}
+	}
+	if hasAfter {
+		afterRunner = &triggerListRunner{triggers: afterTriggers}
+	}
 	needsNewRow := hasAfter || len(s.Returning) > 0
 	// The index set cannot change mid-statement, so its sorted name list is
 	// computed once here instead of being rebuilt and re-sorted twice per row
@@ -68,7 +75,7 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 			// map from the same data.
 			oldRow := row
 			if hasBefore {
-				if err := fireTriggerList(env, beforeTriggers, row, oldRow); err != nil {
+				if err := beforeRunner.fire(env, row, oldRow); err != nil {
 					return nil, err
 				}
 			}
@@ -134,7 +141,7 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 				newRow = buildTableRow(keys, t.Rows[ri])
 			}
 			if hasAfter {
-				if err := fireTriggerList(env, afterTriggers, newRow, oldRow); err != nil {
+				if err := afterRunner.fire(env, newRow, oldRow); err != nil {
 					return nil, err
 				}
 			}
@@ -195,7 +202,9 @@ func resolveUpdateSets(table *storage.Table, assignments map[string]Expr) ([]sim
 		}
 		sets = append(sets, simpleUpdateSet{col: col, expr: expr})
 	}
-	sort.Slice(sets, func(i, j int) bool { return sets[i].col < sets[j].col })
+	if len(sets) > 1 {
+		sort.Slice(sets, func(i, j int) bool { return sets[i].col < sets[j].col })
+	}
 	return sets, nil
 }
 
@@ -225,7 +234,9 @@ func secondaryIndexNamesForUpdate(table *storage.Table, sets []simpleUpdateSet) 
 			names = append(names, name)
 		}
 	}
-	sort.Strings(names)
+	if len(names) > 1 {
+		sort.Strings(names)
+	}
 	return names
 }
 

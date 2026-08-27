@@ -27,6 +27,13 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 		return nil, err
 	}
 	beforeDelTriggers, afterDelTriggers := planTriggers(stmtPlan, env, s.Table, storage.TriggerDelete)
+	var beforeDelRunner, afterDelRunner *triggerListRunner
+	if len(beforeDelTriggers) > 0 {
+		beforeDelRunner = &triggerListRunner{triggers: beforeDelTriggers}
+	}
+	if len(afterDelTriggers) > 0 {
+		afterDelRunner = &triggerListRunner{triggers: afterDelTriggers}
+	}
 	hasTriggers := len(beforeDelTriggers) > 0 || len(afterDelTriggers) > 0
 	if !hasTriggers && len(s.Returning) == 0 && isSimpleRawPredicate(s.Where) {
 		// newDMLPlan already resolved both of these while choosing this
@@ -170,7 +177,7 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 			kept = append(kept, r)
 		} else {
 			if hasBeforeDel {
-				if err := fireTriggerList(env, beforeDelTriggers, nil, row); err != nil {
+				if err := beforeDelRunner.fire(env, nil, row); err != nil {
 					return nil, err
 				}
 			}
@@ -178,7 +185,7 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 				return nil, err
 			}
 			if hasAfterDel {
-				if err := fireTriggerList(env, afterDelTriggers, nil, row); err != nil {
+				if err := afterDelRunner.fire(env, nil, row); err != nil {
 					return nil, err
 				}
 			}

@@ -114,16 +114,66 @@ func fireTriggers(env ExecEnv, table string, timing string, event string, newRow
 // definitions cannot change while the outer statement holds the write lock,
 // so reusing this list prevents catalog scans and slice allocations per row.
 func fireTriggerList(env ExecEnv, triggers []*storage.CatalogTrigger, newRow Row, oldRow Row) error {
-	if len(triggers) == 0 {
+	runner := triggerListRunner{triggers: triggers}
+	return runner.fire(env, newRow, oldRow)
+}
+
+type preparedTrigger struct {
+	trigger *storage.CatalogTrigger
+	when    Expr
+	stmts   []Statement
+}
+
+// triggerListRunner resolves cached WHEN/body programs on the first affected
+// row and reuses them for the rest of the statement. This preserves the old
+// behavior that an invalid trigger is not parsed when zero rows match, while
+// removing two cache locks per trigger from every subsequent row.
+type triggerListRunner struct {
+	triggers []*storage.CatalogTrigger
+	programs []preparedTrigger
+	inline   [2]preparedTrigger
+}
+
+func (r *triggerListRunner) prepare() error {
+	programs := r.inline[:0]
+	if len(r.triggers) <= cap(programs) {
+		programs = programs[:len(r.triggers)]
+	} else {
+		programs = make([]preparedTrigger, len(r.triggers))
+	}
+	for i, trigger := range r.triggers {
+		programs[i].trigger = trigger
+		if strings.TrimSpace(trigger.WhenExpr) != "" {
+			when, err := triggerWhenExpr(trigger.Name, trigger.WhenExpr)
+			if err != nil {
+				return fmt.Errorf("trigger %q: %w", trigger.Name, err)
+			}
+			programs[i].when = when
+		}
+		stmts, err := triggerBodyStatements(trigger)
+		if err != nil {
+			return fmt.Errorf("trigger %q: %w", trigger.Name, err)
+		}
+		programs[i].stmts = stmts
+	}
+	r.programs = programs
+	return nil
+}
+
+func (r *triggerListRunner) fire(env ExecEnv, newRow Row, oldRow Row) error {
+	if len(r.triggers) == 0 {
 		return nil
 	}
-
-	// One binding for the whole list: every trigger fired for this row sees
-	// the same NEW/OLD rows, and executeTrigger only ever reads through it.
-	binding := &triggerRowBinding{newRow: newRow, oldRow: oldRow}
-	for _, trig := range triggers {
-		if err := executeTrigger(env, trig, binding); err != nil {
-			return fmt.Errorf("trigger %q: %w", trig.Name, err)
+	if r.programs == nil {
+		if err := r.prepare(); err != nil {
+			return err
+		}
+	}
+	binding := triggerRowBinding{newRow: newRow, oldRow: oldRow}
+	for i := range r.programs {
+		program := &r.programs[i]
+		if err := executePreparedTrigger(env, program, &binding); err != nil {
+			return fmt.Errorf("trigger %q: %w", program.trigger.Name, err)
 		}
 	}
 	return nil
@@ -182,7 +232,7 @@ func triggerRowSuggestionRow(tb *triggerRowBinding) Row {
 
 // executeTrigger runs a single trigger's body in an enriched environment that
 // exposes NEW.<col> and OLD.<col> pseudo-columns.
-func executeTrigger(env ExecEnv, trig *storage.CatalogTrigger, binding *triggerRowBinding) error {
+func executePreparedTrigger(env ExecEnv, program *preparedTrigger, binding *triggerRowBinding) error {
 	if env.triggerDepth >= maxTriggerDepth {
 		return fmt.Errorf("maximum trigger nesting depth (%d) exceeded", maxTriggerDepth)
 	}
@@ -196,12 +246,8 @@ func executeTrigger(env ExecEnv, trig *storage.CatalogTrigger, binding *triggerR
 	// WHEN's row argument routes it through that same fallback).
 	env.triggerRow = binding
 
-	if trig.WhenExpr != "" && strings.TrimSpace(trig.WhenExpr) != "" {
-		whenExpr, err := triggerWhenExpr(trig.Name, trig.WhenExpr)
-		if err != nil {
-			return err
-		}
-		ok, err := evalExpr(env, whenExpr, nil)
+	if program.when != nil {
+		ok, err := evalExpr(env, program.when, nil)
 		if err != nil {
 			return err
 		}
@@ -210,12 +256,7 @@ func executeTrigger(env ExecEnv, trig *storage.CatalogTrigger, binding *triggerR
 		}
 	}
 
-	stmts, err := triggerBodyStatements(trig)
-	if err != nil {
-		return err
-	}
-
-	for _, stmt := range stmts {
+	for _, stmt := range program.stmts {
 		// execStmt, not Execute: trigger bodies run inside the INSERT/UPDATE/
 		// DELETE that fired them, already inside Execute's write lock on the
 		// same goroutine — re-acquiring it here would deadlock (sync.RWMutex

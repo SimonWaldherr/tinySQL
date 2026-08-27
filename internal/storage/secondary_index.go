@@ -178,7 +178,8 @@ func (t *Table) CheckSecondaryIndexConstraints(row []any, skipRow int) error {
 		if !idx.Unique {
 			continue
 		}
-		key, err := t.indexKey(idx.Columns, row)
+		var scratch [128]byte
+		key, err := t.indexKeyInto(scratch[:0], idx.Columns, row)
 		if err != nil {
 			return fmt.Errorf("index %q: %w", idx.Name, err)
 		}
@@ -204,7 +205,8 @@ func (t *Table) RebuildSecondaryIndexes() error {
 	for _, idx := range t.Indexes {
 		fast := NewSkipList()
 		for rowID, row := range t.Rows {
-			key, err := t.indexKey(idx.Columns, row)
+			var scratch [128]byte
+			key, err := t.indexKeyInto(scratch[:0], idx.Columns, row)
 			if err != nil {
 				return fmt.Errorf("index %q row %d: %w", idx.Name, rowID, err)
 			}
@@ -233,12 +235,14 @@ func (t *Table) RebuildSecondaryIndexes() error {
 // changes mid-statement, instead of paying a rebuild-from-map-plus-sort on
 // every single row of a multi-row INSERT.
 func (t *Table) InsertSecondaryIndexRow(rowID int, row []any, names []string) error {
-	updates, err := t.indexRowKeys(row, names)
-	if err != nil {
-		return err
-	}
-	for _, update := range updates {
-		update.index.hydrate().Insert(update.key, rowID)
+	for _, name := range names {
+		index := t.Indexes[name]
+		var scratch [128]byte
+		key, err := t.indexKeyInto(scratch[:0], index.Columns, row)
+		if err != nil {
+			return fmt.Errorf("index %q: %w", index.Name, err)
+		}
+		index.hydrate().Insert(key, rowID)
 	}
 	return nil
 }
@@ -253,21 +257,23 @@ func (t *Table) InsertSecondaryIndexRow(rowID int, row []any, names []string) er
 // before key, once for the after key -- even though the index set is
 // identical for both and does not change mid-statement.
 func (t *Table) UpdateSecondaryIndexRow(rowID int, before, after []any, names []string) error {
-	beforeKeys, err := t.indexRowKeys(before, names)
-	if err != nil {
-		return err
-	}
-	afterKeys, err := t.indexRowKeys(after, names)
-	if err != nil {
-		return err
-	}
-	for i, before := range beforeKeys {
-		after := afterKeys[i]
-		if bytes.Equal(before.key, after.key) {
+	for _, name := range names {
+		index := t.Indexes[name]
+		var beforeScratch, afterScratch [128]byte
+		beforeKey, err := t.indexKeyInto(beforeScratch[:0], index.Columns, before)
+		if err != nil {
+			return fmt.Errorf("index %q: %w", index.Name, err)
+		}
+		afterKey, err := t.indexKeyInto(afterScratch[:0], index.Columns, after)
+		if err != nil {
+			return fmt.Errorf("index %q: %w", index.Name, err)
+		}
+		if bytes.Equal(beforeKey, afterKey) {
 			continue
 		}
-		before.index.hydrate().Remove(before.key, rowID)
-		after.index.hydrate().Insert(after.key, rowID)
+		fast := index.hydrate()
+		fast.Remove(beforeKey, rowID)
+		fast.Insert(afterKey, rowID)
 	}
 	return nil
 }
@@ -478,10 +484,13 @@ func (idx *SecondaryIndex) lookup(key []byte) []int {
 }
 
 func (t *Table) indexKey(columns []string, row []any) ([]byte, error) {
+	return t.indexKeyInto(nil, columns, row)
+}
+
+func (t *Table) indexKeyInto(key []byte, columns []string, row []any) ([]byte, error) {
 	if len(row) < len(columns) {
 		return nil, fmt.Errorf("row has %d values for %d index columns", len(row), len(columns))
 	}
-	key := make([]byte, 0, len(columns)*12)
 	for _, column := range columns {
 		pos, err := t.ColIndex(column)
 		if err != nil {

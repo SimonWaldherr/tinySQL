@@ -93,3 +93,36 @@ func TestCatalogJobHistory(t *testing.T) {
 		t.Fatalf("unexpected history row: %#v", runs[0])
 	}
 }
+
+func TestCatalogTriggerEventIndexTracksReplaceAndDrop(t *testing.T) {
+	cm := NewCatalogManager()
+	first := &CatalogTrigger{Name: "sync", Table: "items", Timing: TriggerBefore, Event: TriggerInsert}
+	if err := cm.RegisterTrigger(first); err != nil {
+		t.Fatal(err)
+	}
+	before, after := cm.GetTriggersForEvent("ITEMS", TriggerInsert)
+	if len(before) != 1 || before[0] != first || len(after) != 0 {
+		t.Fatalf("initial trigger event index = before %#v, after %#v", before, after)
+	}
+
+	replacement := &CatalogTrigger{Name: "sync", Table: "archive", Timing: TriggerAfter, Event: TriggerUpdate}
+	if err := cm.RegisterTrigger(replacement); err != nil {
+		t.Fatal(err)
+	}
+	before, after = cm.GetTriggersForEvent("items", TriggerInsert)
+	if len(before) != 0 || len(after) != 0 {
+		t.Fatalf("replaced trigger remained under old event: before %#v, after %#v", before, after)
+	}
+	before, after = cm.GetTriggersForEvent("archive", TriggerUpdate)
+	if len(before) != 0 || len(after) != 1 || after[0] != replacement {
+		t.Fatalf("replacement event index = before %#v, after %#v", before, after)
+	}
+
+	if err := cm.DropTrigger("sync"); err != nil {
+		t.Fatal(err)
+	}
+	before, after = cm.GetTriggersForEvent("archive", TriggerUpdate)
+	if len(before) != 0 || len(after) != 0 {
+		t.Fatalf("dropped trigger remained indexed: before %#v, after %#v", before, after)
+	}
+}

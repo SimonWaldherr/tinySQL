@@ -70,6 +70,26 @@ func TestConstraintIndexCatchesIntraBatchDuplicate(t *testing.T) {
 	expectInt(t, rs.Rows[0]["n"], 0, "row count after rejected batch")
 }
 
+// TestSelfReferencingBatchInsertSeesEarlierRows covers a multi-row INSERT into
+// a table that references one of its own non-key columns. The first inserted
+// row is a valid parent for the second, so the FK lookup must include rows
+// appended earlier by the same statement.
+func TestSelfReferencingBatchInsertSeesEarlierRows(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+	execConstraintSQL(t, ctx, db, "CREATE TABLE nodes (id INT PRIMARY KEY, code TEXT, parent_code TEXT REFERENCES nodes(code))")
+	execConstraintSQL(t, ctx, db, "INSERT INTO nodes VALUES (1, 'base', NULL)")
+
+	// The first row resolves `base`; the second must then see `root`, appended
+	// earlier in this statement, even though `code` is not a key column.
+	execConstraintSQL(t, ctx, db, "INSERT INTO nodes VALUES (2, 'root', 'base'), (3, 'child', 'root')")
+
+	rs := queryConstraintSQL(t, ctx, db, "SELECT id FROM nodes WHERE parent_code = 'root'")
+	if len(rs.Rows) != 1 || expectAsInt(t, rs.Rows[0]["id"]) != 3 {
+		t.Fatalf("self-referencing batch insert = %#v, want child id 3", rs.Rows)
+	}
+}
+
 // TestConstraintIndexUpdateThenReinsert guards patchConstraintIndexRow:
 // after UPDATE moves a UNIQUE value off of one row, that value must be
 // immediately reusable (the cached index shouldn't still think the old row

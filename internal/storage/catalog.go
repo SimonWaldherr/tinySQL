@@ -64,23 +64,34 @@ type CatalogManager struct {
 	// changes were silently dropped at COMMIT, since only tables were
 	// merged. Every write goes through lockWrite/unlockWrite (or the RBAC
 	// pair), so a newly added mutator cannot forget to bump it.
-	revision     atomic.Uint64
-	tables       map[string]*CatalogTable
-	columns      map[string][]CatalogColumn
-	views        map[string]*CatalogView
-	mviews       map[string]*CatalogMaterializedView
-	dependencies map[string][]CatalogDependency
-	indexes      map[string]*CatalogIndex
-	funcs        map[string]*CatalogFunction
-	jobs         map[string]*CatalogJob
-	jobRuns      []*CatalogJobHistory
-	nextRun      int64
-	triggers     map[string]*CatalogTrigger // keyed by trigger name
-	rbac         *rbacState                 // users/roles/grants; see rbac.go
+	revision      atomic.Uint64
+	tables        map[string]*CatalogTable
+	columns       map[string][]CatalogColumn
+	views         map[string]*CatalogView
+	mviews        map[string]*CatalogMaterializedView
+	dependencies  map[string][]CatalogDependency
+	indexes       map[string]*CatalogIndex
+	funcs         map[string]*CatalogFunction
+	jobs          map[string]*CatalogJob
+	jobRuns       []*CatalogJobHistory
+	nextRun       int64
+	triggers      map[string]*CatalogTrigger // keyed by trigger name
+	triggerEvents map[triggerEventKey]triggerEventLists
+	rbac          *rbacState // users/roles/grants; see rbac.go
 	// pending is the statement rollback point waiting to be materialized. It
 	// is what makes a StatementSnapshot's catalog half copy-on-write; see
 	// catalogRollback in statement_snapshot.go.
 	pending atomic.Pointer[catalogRollback]
+}
+
+type triggerEventKey struct {
+	table string
+	event TriggerEvent
+}
+
+type triggerEventLists struct {
+	before []*CatalogTrigger
+	after  []*CatalogTrigger
 }
 
 // lockWrite takes the catalog's write lock. Always pair it with unlockWrite:
@@ -153,18 +164,19 @@ func (c *CatalogManager) setRevision(v uint64) {
 // NewCatalogManager allocates and returns an initialized CatalogManager.
 func NewCatalogManager() *CatalogManager {
 	return &CatalogManager{
-		tables:       make(map[string]*CatalogTable),
-		columns:      make(map[string][]CatalogColumn),
-		views:        make(map[string]*CatalogView),
-		mviews:       make(map[string]*CatalogMaterializedView),
-		dependencies: make(map[string][]CatalogDependency),
-		indexes:      make(map[string]*CatalogIndex),
-		funcs:        make(map[string]*CatalogFunction),
-		jobs:         make(map[string]*CatalogJob),
-		jobRuns:      make([]*CatalogJobHistory, 0),
-		nextRun:      1,
-		triggers:     make(map[string]*CatalogTrigger),
-		rbac:         newRBACState(),
+		tables:        make(map[string]*CatalogTable),
+		columns:       make(map[string][]CatalogColumn),
+		views:         make(map[string]*CatalogView),
+		mviews:        make(map[string]*CatalogMaterializedView),
+		dependencies:  make(map[string][]CatalogDependency),
+		indexes:       make(map[string]*CatalogIndex),
+		funcs:         make(map[string]*CatalogFunction),
+		jobs:          make(map[string]*CatalogJob),
+		jobRuns:       make([]*CatalogJobHistory, 0),
+		nextRun:       1,
+		triggers:      make(map[string]*CatalogTrigger),
+		triggerEvents: make(map[triggerEventKey]triggerEventLists),
+		rbac:          newRBACState(),
 	}
 }
 
@@ -1031,7 +1043,11 @@ func (c *CatalogManager) RegisterTrigger(t *CatalogTrigger) error {
 	if t.CreatedAt.IsZero() {
 		t.CreatedAt = time.Now()
 	}
+	if old := c.triggers[t.Name]; old != nil {
+		c.removeTriggerEventLocked(old)
+	}
 	c.triggers[t.Name] = t
+	c.addTriggerEventLocked(t)
 	return nil
 }
 
@@ -1040,9 +1056,11 @@ func (c *CatalogManager) RegisterTrigger(t *CatalogTrigger) error {
 func (c *CatalogManager) DropTrigger(name string) error {
 	c.lockWrite()
 	defer c.unlockWrite()
-	if _, ok := c.triggers[name]; !ok {
+	trigger, ok := c.triggers[name]
+	if !ok {
 		return fmt.Errorf("trigger %q not found", name)
 	}
+	c.removeTriggerEventLocked(trigger)
 	delete(c.triggers, name)
 	return nil
 }
@@ -1051,15 +1069,14 @@ func (c *CatalogManager) DropTrigger(name string) error {
 func (c *CatalogManager) GetTriggers(table string, timing TriggerTiming, event TriggerEvent) []*CatalogTrigger {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	var out []*CatalogTrigger
-	for _, t := range c.triggers {
-		if strings.EqualFold(t.Table, table) &&
-			t.Timing == timing &&
-			t.Event == event {
-			out = append(out, t)
-		}
+	lists := c.triggerEvents[triggerEventKey{table: strings.ToLower(table), event: event}]
+	if timing == TriggerBefore {
+		return lists.before
 	}
-	return out
+	if timing == TriggerAfter {
+		return lists.after
+	}
+	return nil
 }
 
 // GetTriggersForEvent returns the BEFORE and AFTER row-trigger lists for one
@@ -1069,18 +1086,40 @@ func (c *CatalogManager) GetTriggers(table string, timing TriggerTiming, event T
 func (c *CatalogManager) GetTriggersForEvent(table string, event TriggerEvent) (before, after []*CatalogTrigger) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	for _, t := range c.triggers {
-		if !strings.EqualFold(t.Table, table) || t.Event != event {
-			continue
-		}
-		switch t.Timing {
-		case TriggerBefore:
-			before = append(before, t)
-		case TriggerAfter:
-			after = append(after, t)
-		}
+	lists := c.triggerEvents[triggerEventKey{table: strings.ToLower(table), event: event}]
+	return lists.before, lists.after
+}
+
+func (c *CatalogManager) addTriggerEventLocked(trigger *CatalogTrigger) {
+	key := triggerEventKey{table: strings.ToLower(trigger.Table), event: trigger.Event}
+	lists := c.triggerEvents[key]
+	if trigger.Timing == TriggerBefore {
+		lists.before = append(append([]*CatalogTrigger(nil), lists.before...), trigger)
+	} else if trigger.Timing == TriggerAfter {
+		lists.after = append(append([]*CatalogTrigger(nil), lists.after...), trigger)
 	}
-	return before, after
+	c.triggerEvents[key] = lists
+}
+
+func (c *CatalogManager) removeTriggerEventLocked(trigger *CatalogTrigger) {
+	key := triggerEventKey{table: strings.ToLower(trigger.Table), event: trigger.Event}
+	lists := c.triggerEvents[key]
+	remove := func(in []*CatalogTrigger) []*CatalogTrigger {
+		out := make([]*CatalogTrigger, 0, len(in))
+		for _, candidate := range in {
+			if candidate.Name != trigger.Name {
+				out = append(out, candidate)
+			}
+		}
+		return out
+	}
+	lists.before = remove(lists.before)
+	lists.after = remove(lists.after)
+	if len(lists.before) == 0 && len(lists.after) == 0 {
+		delete(c.triggerEvents, key)
+	} else {
+		c.triggerEvents[key] = lists
+	}
 }
 
 // ListTriggers returns all registered trigger definitions.

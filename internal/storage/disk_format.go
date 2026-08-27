@@ -370,6 +370,7 @@ func diskToCatalog(dc diskCatalog) *CatalogManager {
 		}
 		cp := *t
 		c.triggers[cp.Name] = &cp
+		c.addTriggerEventLocked(&cp)
 	}
 	c.rbac = diskToRBAC(dc.RBAC)
 	return c

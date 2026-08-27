@@ -59,6 +59,13 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 	beforeTriggers, afterTriggers := planTriggers(env.planFor(s), env, s.Table, storage.TriggerInsert)
 	hasBefore := len(beforeTriggers) > 0
 	hasAfter := len(afterTriggers) > 0
+	var beforeRunner, afterRunner *triggerListRunner
+	if hasBefore {
+		beforeRunner = &triggerListRunner{triggers: beforeTriggers}
+	}
+	if hasAfter {
+		afterRunner = &triggerListRunner{triggers: afterTriggers}
+	}
 	// buildTableRow allocates a map(2*len(cols)); resolve both timing lists
 	// once before the row loop and skip that map entirely when neither triggers
 	// nor RETURNING needs it.
@@ -92,8 +99,6 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 	// of the schema; computed once here instead of validateRowConstraintsWith
 	// visiting every column of the table (constrained or not) on every row.
 	constrainedCols := constrainedColumnIndices(t.Cols)
-	var constraintScratch [8]*constraintIndexEntry
-	insertConstraints := prepareInsertConstraintCache(t, constrainedCols, !hasBefore && !hasAfter, constraintScratch[:])
 	wal, err := beginWALAuto(env, s.Table)
 	if err != nil {
 		return nil, err
@@ -122,11 +127,11 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 			if err := validateInsertNonUniqueConstraints(env, t, row, constrainedCols, fks); err != nil {
 				return nil, err
 			}
-			if insertConflictsUniqueConstraint(t, row, insertConstraints) {
+			if insertConflictsUniqueConstraint(t, row) {
 				continue
 			}
 		}
-		if err := validateRowConstraintsWith(env, t, row, -1, constrainedCols, fks, insertConstraints); err != nil {
+		if err := validateRowConstraintsWith(env, t, row, -1, constrainedCols, fks); err != nil {
 			return nil, err
 		}
 		if err := t.CheckSecondaryIndexConstraints(row, -1); err != nil {
@@ -137,12 +142,11 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 			newRow = buildTableRow(keys, row)
 		}
 		if hasBefore {
-			if err := fireTriggerList(env, beforeTriggers, newRow, nil); err != nil {
+			if err := beforeRunner.fire(env, newRow, nil); err != nil {
 				return nil, err
 			}
 		}
 		t.Rows = append(t.Rows, row)
-		insertConstraints.noteAppended(len(t.Rows)-1, row, len(t.Rows))
 		if err := t.InsertSecondaryIndexRow(len(t.Rows)-1, row, indexNames); err != nil {
 			return nil, err
 		}
@@ -150,7 +154,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 			return nil, err
 		}
 		if hasAfter {
-			if err := fireTriggerList(env, afterTriggers, newRow, nil); err != nil {
+			if err := afterRunner.fire(env, newRow, nil); err != nil {
 				return nil, err
 			}
 		}
@@ -187,6 +191,13 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	beforeTriggers, afterTriggers := planTriggers(env.planFor(s), env, s.Table, storage.TriggerInsert)
 	hasBefore := len(beforeTriggers) > 0
 	hasAfter := len(afterTriggers) > 0
+	var beforeRunner, afterRunner *triggerListRunner
+	if hasBefore {
+		beforeRunner = &triggerListRunner{triggers: beforeTriggers}
+	}
+	if hasAfter {
+		afterRunner = &triggerListRunner{triggers: afterTriggers}
+	}
 	needsRow := hasBefore || hasAfter || len(s.Returning) > 0
 	// See executeInsertAllColumns: neither is read unless a trigger or a
 	// RETURNING clause asks for the row map.
@@ -215,8 +226,6 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	// See executeInsertAllColumns: both are pure functions of the schema,
 	// computed once per statement instead of per row.
 	constrainedCols := constrainedColumnIndices(t.Cols)
-	var constraintScratch [8]*constraintIndexEntry
-	insertConstraints := prepareInsertConstraintCache(t, constrainedCols, !hasBefore && !hasAfter, constraintScratch[:])
 	hasDefaults := tableHasDefaults(t.Cols)
 	wal, err := beginWALAuto(env, s.Table)
 	if err != nil {
@@ -251,11 +260,11 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			if err := validateInsertNonUniqueConstraints(env, t, row, constrainedCols, fks); err != nil {
 				return nil, err
 			}
-			if insertConflictsUniqueConstraint(t, row, insertConstraints) {
+			if insertConflictsUniqueConstraint(t, row) {
 				continue
 			}
 		}
-		if err := validateRowConstraintsWith(env, t, row, -1, constrainedCols, fks, insertConstraints); err != nil {
+		if err := validateRowConstraintsWith(env, t, row, -1, constrainedCols, fks); err != nil {
 			return nil, err
 		}
 		if err := t.CheckSecondaryIndexConstraints(row, -1); err != nil {
@@ -266,12 +275,11 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			newRow = buildTableRow(keys, row)
 		}
 		if hasBefore {
-			if err := fireTriggerList(env, beforeTriggers, newRow, nil); err != nil {
+			if err := beforeRunner.fire(env, newRow, nil); err != nil {
 				return nil, err
 			}
 		}
 		t.Rows = append(t.Rows, row)
-		insertConstraints.noteAppended(len(t.Rows)-1, row, len(t.Rows))
 		if err := t.InsertSecondaryIndexRow(len(t.Rows)-1, row, indexNames); err != nil {
 			return nil, err
 		}
@@ -279,7 +287,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			return nil, err
 		}
 		if hasAfter {
-			if err := fireTriggerList(env, afterTriggers, newRow, nil); err != nil {
+			if err := afterRunner.fire(env, newRow, nil); err != nil {
 				return nil, err
 			}
 		}
@@ -308,12 +316,12 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 // ON CONFLICT DO NOTHING may suppress: a PRIMARY KEY/UNIQUE column or an
 // explicitly-created unique index. NOT NULL, type and FOREIGN KEY failures
 // intentionally remain ordinary errors and are validated afterwards.
-func insertConflictsUniqueConstraint(t *storage.Table, row []any, cached *insertConstraintCache) bool {
+func insertConflictsUniqueConstraint(t *storage.Table, row []any) bool {
 	for colIdx, col := range t.Cols {
 		if colIdx >= len(row) || isNull(row[colIdx]) {
 			continue
 		}
-		if (col.Constraint == storage.PrimaryKey || col.Constraint == storage.Unique) && constraintValueExistsCached(t, colIdx, row[colIdx], -1, cached) {
+		if (col.Constraint == storage.PrimaryKey || col.Constraint == storage.Unique) && constraintValueExists(t, colIdx, row[colIdx], -1) {
 			return true
 		}
 	}
@@ -453,7 +461,7 @@ func applyColumnDefaults(row []any, cols []storage.Column) error {
 //     columns in that order, matching the original range over t.Cols, so
 //     when more than one changed column is in violation the same one wins.
 func validateRowConstraints(env ExecEnv, t *storage.Table, row []any, excludeRow int, changedCols []int) error {
-	return validateRowConstraintsWith(env, t, row, excludeRow, changedCols, nil, nil)
+	return validateRowConstraintsWith(env, t, row, excludeRow, changedCols, nil)
 }
 
 // fkTarget is one resolved FOREIGN KEY reference: the parent table and the
@@ -509,17 +517,17 @@ func (c *fkTargetCache) resolve(env ExecEnv, col storage.Column) fkTarget {
 	return out
 }
 
-func validateRowConstraintsWith(env ExecEnv, t *storage.Table, row []any, excludeRow int, changedCols []int, fks *fkTargetCache, cached *insertConstraintCache) error {
+func validateRowConstraintsWith(env ExecEnv, t *storage.Table, row []any, excludeRow int, changedCols []int, fks *fkTargetCache) error {
 	if changedCols == nil {
 		for colIdx := range t.Cols {
-			if err := validateOneRowConstraint(env, t, row, excludeRow, colIdx, fks, cached); err != nil {
+			if err := validateOneRowConstraint(env, t, row, excludeRow, colIdx, fks); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 	for _, colIdx := range changedCols {
-		if err := validateOneRowConstraint(env, t, row, excludeRow, colIdx, fks, cached); err != nil {
+		if err := validateOneRowConstraint(env, t, row, excludeRow, colIdx, fks); err != nil {
 			return err
 		}
 	}
@@ -529,7 +537,7 @@ func validateRowConstraintsWith(env ExecEnv, t *storage.Table, row []any, exclud
 // validateOneRowConstraint is validateRowConstraints's per-column body,
 // factored out so the "check everything" (INSERT) and "check only the
 // changed columns" (UPDATE) loops share identical logic and error text.
-func validateOneRowConstraint(env ExecEnv, t *storage.Table, row []any, excludeRow int, colIdx int, fks *fkTargetCache, cached *insertConstraintCache) error {
+func validateOneRowConstraint(env ExecEnv, t *storage.Table, row []any, excludeRow int, colIdx int, fks *fkTargetCache) error {
 	col := t.Cols[colIdx]
 	if colIdx >= len(row) {
 		return fmt.Errorf("row missing constrained column %q", col.Name)
@@ -546,14 +554,14 @@ func validateOneRowConstraint(env ExecEnv, t *storage.Table, row []any, excludeR
 		if isNull(val) {
 			return fmt.Errorf("PRIMARY KEY column %q cannot be NULL", col.Name)
 		}
-		if constraintValueExistsCached(t, colIdx, val, excludeRow, cached) {
+		if constraintValueExists(t, colIdx, val, excludeRow) {
 			return fmt.Errorf("duplicate PRIMARY KEY value for column %q", col.Name)
 		}
 	case storage.Unique:
 		if isNull(val) {
 			return nil
 		}
-		if constraintValueExistsCached(t, colIdx, val, excludeRow, cached) {
+		if constraintValueExists(t, colIdx, val, excludeRow) {
 			return fmt.Errorf("duplicate UNIQUE value for column %q", col.Name)
 		}
 	case storage.ForeignKey:
@@ -567,8 +575,15 @@ func validateOneRowConstraint(env ExecEnv, t *storage.Table, row []any, excludeR
 		if target.err != nil {
 			return target.err
 		}
-		refTable, refIdx := target.table, target.colIdx
-		if !constraintIndexValueExists(target.index, val, -1) {
+		index := target.index
+		// A self-referencing multi-row INSERT grows the target table while this
+		// statement runs, so refresh its cached derived index for every row. An
+		// external parent cannot change under Execute's write lock, and can keep
+		// using the entry resolved once above for the whole statement.
+		if target.table == t {
+			index = getConstraintIndex(t, target.colIdx)
+		}
+		if !constraintIndexValueExists(index, val, -1) {
 			return fmt.Errorf("FOREIGN KEY violation on column %q: value %v not found in %s.%s", col.Name, val, col.ForeignKey.Table, col.ForeignKey.Column)
 		}
 	}
@@ -611,6 +626,15 @@ type constraintIndexSet struct {
 type constraintIndexEntry struct {
 	rowCount int // rows already reflected in `rows`, i.e. t.Rows[:rowCount]
 	rows     map[any][]int
+}
+
+func constraintIndexValueExists(index *constraintIndexEntry, val any, excludeRow int) bool {
+	for _, rowIdx := range index.rows[comparableKeyPart(val)] {
+		if rowIdx != excludeRow {
+			return true
+		}
+	}
+	return false
 }
 
 // CloneDerived implements storage.DerivedCloner, so a per-transaction table
@@ -798,10 +822,5 @@ func removeConstraintIndexBucketEntry(e *constraintIndexEntry, val any, rowIdx i
 
 func constraintValueExists(t *storage.Table, colIdx int, val any, excludeRow int) bool {
 	idx := getConstraintIndex(t, colIdx)
-	for _, rowIdx := range idx.rows[comparableKeyPart(val)] {
-		if rowIdx != excludeRow {
-			return true
-		}
-	}
-	return false
+	return constraintIndexValueExists(idx, val, excludeRow)
 }
