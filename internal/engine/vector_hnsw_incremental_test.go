@@ -229,9 +229,8 @@ func TestVecHNSWExtendFallsBackToFullRebuildAfterUpdateOrDelete(t *testing.T) {
 		t.Fatalf("expected the extended graph to cover 55 rows, got %d", len(idxAfterAppends.levels))
 	}
 
-	// UPDATE an existing row's vector. This must be reflected in the next
-	// warmed index — an incremental extend would not touch existing rows'
-	// content and would silently keep serving the pre-update vector.
+	// UPDATE retains graph topology while the vector cache supplies a fresh
+	// row override to traversal and scoring.
 	execSQL(t, db, `UPDATE mix_docs SET embedding = '[9.0, 9.0, 9.0]' WHERE id = 10`)
 	if table.StructVersion() == structBeforeUpdate {
 		t.Fatalf("UPDATE must advance StructVersion (was %d, still %d)", structBeforeUpdate, table.StructVersion())
@@ -240,23 +239,25 @@ func TestVecHNSWExtendFallsBackToFullRebuildAfterUpdateOrDelete(t *testing.T) {
 	vecHNSWCacheMu.RLock()
 	idxAfterUpdate := vecHNSWCache[key]
 	vecHNSWCacheMu.RUnlock()
-	if idxAfterUpdate == idxAfterAppends {
-		t.Fatal("expected the UPDATE to force a full rebuild into a NEW *vecHNSWIndex object, not extend the old one in place")
+	if idxAfterUpdate != idxAfterAppends {
+		t.Fatal("expected the UPDATE to retain HNSW topology and refresh row data in place")
 	}
 	if len(idxAfterUpdate.levels) != 55 {
-		t.Fatalf("expected the rebuilt graph to still cover 55 rows, got %d", len(idxAfterUpdate.levels))
+		t.Fatalf("expected the refreshed graph to still cover 55 rows, got %d", len(idxAfterUpdate.levels))
+	}
+	if len(idxAfterUpdate.deltaRows) != 1 || idxAfterUpdate.deltaRows[0] != 10 {
+		t.Fatalf("expected exact ANN delta [10], got %v", idxAfterUpdate.deltaRows)
 	}
 
 	// A search for the updated vector must find row 10 as an exact match,
-	// proving the rebuild actually picked up the new embedding rather than
-	// silently keeping the graph biased toward the pre-update value.
+	// proving the update overlay is used rather than stale vector data.
 	rs := execSQL(t, db, `SELECT id FROM VEC_SEARCH('mix_docs', 'embedding', '[9.0, 9.0, 9.0]', 1, 'cosine', 'hnsw')`)
 	if len(rs.Rows) != 1 || rs.Rows[0]["id"] != int64(10) && rs.Rows[0]["id"] != 10 {
 		t.Fatalf("expected row 10 as the nearest match after UPDATE, got %#v", rs.Rows)
 	}
 
 	// More pure appends after the UPDATE: eligible again, extends in place
-	// starting from the rebuilt graph.
+	// starting from the delta-refreshed graph.
 	for i := 55; i < 70; i++ {
 		insertRow(i)
 	}

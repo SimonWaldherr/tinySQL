@@ -49,7 +49,7 @@ func TestVecColumnCacheExtendsAppendOnlyWithoutCopyingBaseData(t *testing.T) {
 	expectInt(t, rs.Rows[0]["id"], 3, "append-only cache search result")
 }
 
-func TestVecColumnCacheRebuildsAfterStructuralMutation(t *testing.T) {
+func TestVecColumnCacheRefreshesUpdateWithRowOverride(t *testing.T) {
 	db := storage.NewDB()
 	execSQL(t, db, `CREATE TABLE docs (id INT PRIMARY KEY, embedding VECTOR)`)
 	execSQL(t, db, `INSERT INTO docs VALUES (1, '[1,0]'), (2, '[0,1]')`)
@@ -68,13 +68,67 @@ func TestVecColumnCacheRebuildsAfterStructuralMutation(t *testing.T) {
 	execSQL(t, db, `UPDATE docs SET embedding = '[0,0]' WHERE id = 1`)
 	rebuilt := getVecColumnCache("default", table, col, true)
 	if len(rebuilt.segments) != 1 {
-		t.Fatalf("structural mutation must rebuild one compact segment, got %d", len(rebuilt.segments))
+		t.Fatalf("update refresh must retain the compact base segment, got %d", len(rebuilt.segments))
 	}
-	if &rebuilt.segments[0].data[0] == baseData {
-		t.Fatal("structural mutation reused stale vector data")
+	if &rebuilt.segments[0].data[0] != baseData {
+		t.Fatal("update refresh copied the immutable base segment")
+	}
+	if _, ok := rebuilt.overrides[0]; !ok {
+		t.Fatal("update refresh did not create a row override")
 	}
 	if got := rebuilt.vector(0); len(got) != 2 || got[0] != 0 || got[1] != 0 {
-		t.Fatalf("rebuilt vector = %v, want [0 0]", got)
+		t.Fatalf("refreshed vector = %v, want [0 0]", got)
+	}
+}
+
+func TestVecColumnCacheComputesNormForExistingUpdateOverride(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE docs (id INT PRIMARY KEY, embedding VECTOR)`)
+	execSQL(t, db, `INSERT INTO docs VALUES (1, '[1,0]')`)
+	table, err := db.Get("default", "docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	col, err := table.ColIndex("embedding")
+	if err != nil {
+		t.Fatal(err)
+	}
+	purgeVectorCachesFor("default", "docs")
+	_ = getVecColumnCache("default", table, col, false)
+	execSQL(t, db, `UPDATE docs SET embedding = '[3,4]' WHERE id = 1`)
+	updated := getVecColumnCache("default", table, col, false)
+	if updated.normsReady {
+		t.Fatal("flat update cache unexpectedly precomputed norms")
+	}
+	cosine := getVecColumnCache("default", table, col, true)
+	if got := cosine.normAt(0); got != 5 {
+		t.Fatalf("override norm = %v, want 5", got)
+	}
+}
+
+func TestVecColumnCacheCompactsDenseUpdateOverrides(t *testing.T) {
+	table := storage.NewTable("dense_updates", []storage.Column{{Name: "embedding", Type: storage.VectorType}}, false)
+	table.Rows = make([][]any, 64)
+	for row := range table.Rows {
+		table.Rows[row] = []any{[]float64{float64(row), 0}}
+	}
+	table.Version = 1
+	purgeVectorCachesFor("dense-update-test", table.Name)
+	base := getVecColumnCache("dense-update-test", table, 0, false)
+	for row := 0; row < 33; row++ {
+		table.Rows[row] = []any{[]float64{float64(row), 1}}
+		table.Version++
+		table.MarkRowUpdated(row)
+	}
+	compacted := getVecColumnCache("dense-update-test", table, 0, false)
+	if len(compacted.overrides) != 0 {
+		t.Fatalf("dense update cache retained %d overrides after compaction", len(compacted.overrides))
+	}
+	if &compacted.segments[0].data[0] == &base.segments[0].data[0] {
+		t.Fatal("dense update compaction did not rebuild the packed base segment")
+	}
+	if got := compacted.vector(0); len(got) != 2 || got[1] != 1 {
+		t.Fatalf("compacted updated vector = %v, want [0 1]", got)
 	}
 }
 

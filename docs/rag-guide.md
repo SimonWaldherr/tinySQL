@@ -749,6 +749,15 @@ SELECT *
 FROM VEC_WARM('rag_chunks', 'embedding', 'cosine', 'ivf');
 ```
 
+Embedding updates do not force a full column-cache or HNSW-topology rebuild:
+TinySQL keeps immutable vector segments and applies per-row overrides. ANN
+search also scores a bounded update-delta exactly and merges it into Top-K, so
+a vector moved far away from its old graph neighborhood remains discoverable.
+When that delta grows beyond the compaction threshold, TinySQL rebuilds the
+topology once and clears it.
+Deletes and schema changes still rebuild safely, because physical row positions
+may change; this is intentional rather than serving a graph with shifted IDs.
+
 Writes invalidate vector and FTS caches/indexes through the table version. For
 serving-oriented deployments, prefer:
 

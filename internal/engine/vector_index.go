@@ -65,6 +65,11 @@ type vecHNSWIndex struct {
 	maxLevel      int
 	levels        []int
 	neighbors     [][][]int
+	// deltaRows are UPDATE-only vectors whose old graph placement may no
+	// longer make them reachable with good recall. Search scores this bounded
+	// set exactly and merges it into the ANN top-k. A full rebuild clears it.
+	deltaRows []int
+	deltaSet  map[int]struct{}
 	// mu guards every field above against extendVecHNSWIndex mutating an
 	// already-published graph (see getVecHNSWIndex) while a concurrent
 	// search() call is reading it. A freshly built graph (buildVecHNSWIndex)
@@ -473,7 +478,8 @@ func getVecHNSWIndex(ctx context.Context, tenant string, table *storage.Table, c
 		// the incremental-append/full-rebuild-on-anything-else split already
 		// used for constraintIndexes (exec_dml_insert.go): appends are cheap
 		// to absorb, everything else re-derives the whole structure.
-		if canExtendVecHNSWIndex(idx, table, dims) {
+		updatedRows, canRefresh := vecHNSWRefreshRows(idx, table, dims)
+		if canExtendVecHNSWIndex(idx, table, dims) || canRefresh {
 			call := &vecIndexBuildCall{done: make(chan struct{})}
 			vecHNSWBuilds[key] = call
 			vecHNSWCacheMu.Unlock()
@@ -481,11 +487,18 @@ func getVecHNSWIndex(ctx context.Context, tenant string, table *storage.Table, c
 			idx.mu.Lock()
 			err := extendVecHNSWIndex(ctx, idx, cache)
 			if err == nil {
+				if canRefresh {
+					idx.addDeltaRows(updatedRows)
+				}
 				idx.version = table.Version
 				idx.structVersion = table.StructVersion()
 			}
+			hasDeltas := len(idx.deltaRows) != 0
 			idx.mu.Unlock()
-			if err == nil {
+			// A delta graph is correct at runtime because search merges deltaRows
+			// exactly. Persisting only its stale topology would lose that merge
+			// after reopen, so persistence resumes after the next compact rebuild.
+			if err == nil && !hasDeltas {
 				persistVecHNSWIndex(table, colIdx, metric, idx)
 			}
 
@@ -538,6 +551,54 @@ func canExtendVecHNSWIndex(idx *vecHNSWIndex, table *storage.Table, dims int) bo
 		idx.dims == dims &&
 		idx.structVersion == table.StructVersion() &&
 		len(idx.levels) <= len(table.Rows)
+}
+
+// vecHNSWRefreshRows admits bounded UPDATE-only deltas. The graph topology stays
+// intact while search reads the vector-column cache's row overrides, so the
+// changed embeddings are immediately visible without rebuilding every edge.
+// This is still ANN (topology may be less ideal after many moves); DELETE and
+// schema changes are rejected by UpdatedRowsSince because row positions shift.
+func vecHNSWRefreshRows(idx *vecHNSWIndex, table *storage.Table, dims int) ([]int, bool) {
+	if idx == nil || idx.table != table || idx.dims != dims || len(idx.levels) > len(table.Rows) {
+		return nil, false
+	}
+	rows, ok := table.UpdatedRowsSince(idx.structVersion)
+	if !ok || len(rows) == 0 {
+		return nil, false
+	}
+	unique := len(idx.deltaRows)
+	for _, row := range rows {
+		if _, exists := idx.deltaSet[row]; !exists {
+			unique++
+		}
+	}
+	limit := len(table.Rows) / 8
+	if limit < 32 {
+		limit = 32
+	}
+	if limit > 1024 {
+		limit = 1024
+	}
+	if unique > limit {
+		return nil, false
+	}
+	return rows, true
+}
+
+func (idx *vecHNSWIndex) addDeltaRows(rows []int) {
+	if len(rows) == 0 {
+		return
+	}
+	if idx.deltaSet == nil {
+		idx.deltaSet = make(map[int]struct{}, len(rows))
+	}
+	for _, row := range rows {
+		if _, exists := idx.deltaSet[row]; exists {
+			continue
+		}
+		idx.deltaSet[row] = struct{}{}
+		idx.deltaRows = append(idx.deltaRows, row)
+	}
 }
 
 func buildVecHNSWIndex(ctx context.Context, table *storage.Table, metric string, dims int, cache vecSearchColumnCacheEntry) (*vecHNSWIndex, error) {
@@ -709,8 +770,24 @@ func (idx *vecHNSWIndex) search(ctx context.Context, query []float64, queryNorm 
 	efSearch := chooseHNSWEfSearch(k)
 	candidates := idx.searchLayer(query, queryNorm, current, efSearch, 0, cache, visited, scratch)
 	resultHeap := &vecScoredHeap{}
+	var seen map[int]struct{}
+	if len(idx.deltaRows) != 0 {
+		seen = make(map[int]struct{}, len(candidates))
+	}
 	for _, sr := range candidates {
 		pushTopK(resultHeap, sr.rowIdx, sr.distance, k)
+		if seen != nil {
+			seen[sr.rowIdx] = struct{}{}
+		}
+	}
+	for _, rowIdx := range idx.deltaRows {
+		if _, duplicate := seen[rowIdx]; duplicate {
+			continue
+		}
+		distance, ok := rowDistance(idx.metric, query, queryNorm, cache, rowIdx)
+		if ok {
+			pushTopK(resultHeap, rowIdx, distance, k)
+		}
 	}
 	if resultHeap.Len() < k {
 		distFn := buildVecDistanceFunc(idx.metric, query, queryNorm, cache)

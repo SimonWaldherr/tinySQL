@@ -243,7 +243,16 @@ type vecSearchColumnCacheEntry struct {
 	structVersion int
 	rows          int
 	segments      []vecColumnSegment
-	normsReady    bool
+	// overrides hold UPDATE-only row deltas. They keep large immutable base
+	// segments reusable instead of recopying an entire embedding column.
+	overrides  map[int]vecColumnOverride
+	normsReady bool
+}
+
+type vecColumnOverride struct {
+	vector []float64
+	norm   float64
+	valid  bool
 }
 
 func (c vecSearchColumnCacheEntry) rowCount() int { return c.rows }
@@ -272,6 +281,9 @@ func (c vecSearchColumnCacheEntry) segmentFor(row int) *vecColumnSegment {
 }
 
 func (c vecSearchColumnCacheEntry) vector(row int) []float64 {
+	if override, ok := c.overrides[row]; ok {
+		return override.vector
+	}
 	segment := c.segmentFor(row)
 	if segment == nil {
 		return nil
@@ -280,11 +292,17 @@ func (c vecSearchColumnCacheEntry) vector(row int) []float64 {
 }
 
 func (c vecSearchColumnCacheEntry) validAt(row int) bool {
+	if override, ok := c.overrides[row]; ok {
+		return override.valid
+	}
 	segment := c.segmentFor(row)
 	return segment != nil && segment.valid[row-segment.start]
 }
 
 func (c vecSearchColumnCacheEntry) normAt(row int) float64 {
+	if override, ok := c.overrides[row]; ok {
+		return override.norm
+	}
 	segment := c.segmentFor(row)
 	if segment == nil || !c.normsReady || len(segment.norms) == 0 {
 		return vectorL2Norm(c.vector(row))
@@ -383,6 +401,7 @@ func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeN
 		// its segments safely without doing a speculative full rebuild first.
 		cached, canExtend := vecSearchColumnCache[key]
 		canExtend = canExtend && canExtendVecColumnCache(cached, table)
+		updatedRows, canRefresh := table.UpdatedRowsSince(cached.structVersion)
 		call := &vecColumnBuildCall{done: make(chan struct{})}
 		vecSearchColumnBuilds[key] = call
 		vecSearchColumnCacheMu.Unlock()
@@ -392,6 +411,8 @@ func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeN
 			// A stale entry can be safely extended only when structural changes
 			// did not occur and the table grew by appending rows.
 			entry = extendVecColumnCache(cached, table, colIdx, includeNorms)
+		} else if canRefresh && cached.table == table && cached.rows <= len(table.Rows) {
+			entry = refreshVecColumnCache(cached, table, colIdx, includeNorms, updatedRows)
 		} else {
 			entry = buildVecColumnCache(table, colIdx, includeNorms)
 		}
@@ -405,6 +426,48 @@ func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeN
 		vecSearchColumnCacheMu.Unlock()
 		return entry
 	}
+}
+
+func refreshVecColumnCache(cached vecSearchColumnCacheEntry, table *storage.Table, colIdx int, includeNorms bool, rows []int) vecSearchColumnCacheEntry {
+	entry := extendVecColumnCache(cached, table, colIdx, includeNorms)
+	entry.overrides = make(map[int]vecColumnOverride, len(cached.overrides)+len(rows))
+	for row, value := range cached.overrides {
+		if (includeNorms || cached.normsReady) && value.valid {
+			value.norm = vectorL2Norm(value.vector)
+		}
+		entry.overrides[row] = value
+	}
+	for _, row := range rows {
+		if row < 0 || row >= len(table.Rows) {
+			continue
+		}
+		value := vecColumnOverride{}
+		if colIdx < len(table.Rows[row]) && table.Rows[row][colIdx] != nil {
+			if vector, ok := vecRowValue(table.Rows[row][colIdx]); ok {
+				value.vector = append([]float64(nil), vector...)
+				value.valid = true
+				if includeNorms || cached.normsReady {
+					value.norm = vectorL2Norm(value.vector)
+				}
+			}
+		}
+		entry.overrides[row] = value
+	}
+	if vecColumnOverridesNeedCompaction(entry) {
+		return buildVecColumnCache(table, colIdx, includeNorms || cached.normsReady)
+	}
+	return entry
+}
+
+func vecColumnOverridesNeedCompaction(entry vecSearchColumnCacheEntry) bool {
+	limit := entry.rows / 8
+	if limit < 32 {
+		limit = 32
+	}
+	if limit > 1024 {
+		limit = 1024
+	}
+	return len(entry.overrides) > limit
 }
 
 // buildVecColumnCache extracts one table column into a cache entry backed by
@@ -506,12 +569,23 @@ func extendVecColumnCache(cached vecSearchColumnCacheEntry, table *storage.Table
 		segments = append(segments, buildVecColumnSegment(table.Rows[cached.rows:], colIdx, includeNorms || cached.normsReady, cached.rows))
 	}
 	segments = mergeVecColumnSegments(segments, includeNorms || cached.normsReady)
+	overrides := cached.overrides
+	if len(overrides) != 0 {
+		overrides = make(map[int]vecColumnOverride, len(cached.overrides))
+		for row, value := range cached.overrides {
+			if (includeNorms || cached.normsReady) && value.valid {
+				value.norm = vectorL2Norm(value.vector)
+			}
+			overrides[row] = value
+		}
+	}
 	return vecSearchColumnCacheEntry{
 		table:         table,
 		version:       table.Version,
 		structVersion: table.StructVersion(),
 		rows:          len(table.Rows),
 		segments:      segments,
+		overrides:     overrides,
 		normsReady:    includeNorms || cached.normsReady,
 	}
 }
