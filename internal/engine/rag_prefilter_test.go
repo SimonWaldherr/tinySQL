@@ -142,6 +142,42 @@ func TestRetrievalPreFilterRunsBeforeVectorFTSAndRRF(t *testing.T) {
 	}
 }
 
+func TestFilteredHNSWBuildsTenantLocalGraph(t *testing.T) {
+	const rows = vecSearchParallelMinRows
+	table := storage.NewTable("tenant_ann", []storage.Column{{Name: "tenant", Type: storage.TextType}, {Name: "embedding", Type: storage.VectorType}}, false)
+	table.Rows = make([][]any, rows*2)
+	allowed := make([]int, rows)
+	for i := 0; i < rows; i++ {
+		table.Rows[i] = []any{"acme", []float64{float64(i), 0}}
+		allowed[i] = i
+		table.Rows[rows+i] = []any{"blocked", []float64{float64(i), 1000}}
+	}
+	table.Version = 1
+	filter := &ragRowFilter{rows: allowed}
+	args := vecSearchArgs{tableName: table.Name, colName: "embedding", queryVec: []float64{0, 0}, k: 3, metric: "l2", indexMode: vecIndexHNSW}
+	got, err := ragVecSearchCandidatesFiltered(context.Background(), ExecEnv{ctx: context.Background(), tenant: "acme"}, args, table, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 || got[0].rowIdx != 0 {
+		t.Fatalf("filtered HNSW results = %#v, want nearest allowed rows", got)
+	}
+	for _, row := range got {
+		if row.rowIdx < 0 || row.rowIdx >= rows {
+			t.Fatalf("tenant-local graph returned forbidden physical row %d", row.rowIdx)
+		}
+	}
+	cache := getVecColumnCache("acme", table, 1, false)
+	first, err := getRAGFilteredANNIndex(context.Background(), "acme", table, 1, "l2", 2, filter, cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := getRAGFilteredANNIndex(context.Background(), "acme", table, 1, "l2", 2, filter, cache)
+	if err != nil || first != second {
+		t.Fatalf("tenant-local graph cache was not reused: first=%p second=%p err=%v", first, second, err)
+	}
+}
+
 func TestRetrievalPreFilterAllowedStableIDsAndValidation(t *testing.T) {
 	db := storage.NewDB()
 	execSQL(t, db, `CREATE TABLE id_chunks (chunk_id TEXT PRIMARY KEY, body TEXT, embedding VECTOR)`)

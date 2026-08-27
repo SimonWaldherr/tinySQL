@@ -342,6 +342,7 @@ func purgeVectorCachesFor(tenant, table string) {
 		}
 	}
 	vecHNSWCacheMu.Unlock()
+	purgeRAGFilteredANNCachesFor(tenant, table)
 }
 
 // evictOverCap removes arbitrary entries until the map is below the cap,

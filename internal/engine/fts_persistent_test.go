@@ -7,7 +7,7 @@ import (
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
-func TestFTSPersistentIndexExtendsAppendOnlyAndRebuildsAfterUpdate(t *testing.T) {
+func TestFTSPersistentIndexExtendsAppendOnlyAndRefreshesUpdatedRows(t *testing.T) {
 	table := storage.NewTable("fts_persistent_incremental", []storage.Column{{Name: "body", Type: storage.TextType}}, false)
 	table.Rows = [][]any{{"alpha beta"}, {"beta gamma"}}
 	table.Version = 1
@@ -37,8 +37,8 @@ func TestFTSPersistentIndexExtendsAppendOnlyAndRebuildsAfterUpdate(t *testing.T)
 	table.Version++
 	table.MarkRowUpdated(0)
 	third := getFTSDocCache("fts-persistent-test", table, []int{0})
-	if table.FTSIndexes["0"] == index {
-		t.Fatal("in-place update reused an append-only persistent index")
+	if table.FTSIndexes["0"] != index {
+		t.Fatal("in-place update replaced the persistent index instead of applying a row delta")
 	}
 	if third.docFreq("alpha") != 0 || third.docFreq("epsilon") != 1 {
 		t.Fatalf("rebuilt index retained stale terms: alpha=%d epsilon=%d", third.docFreq("alpha"), third.docFreq("epsilon"))

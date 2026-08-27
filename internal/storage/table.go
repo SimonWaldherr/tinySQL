@@ -70,6 +70,13 @@ type Table struct {
 	// happened since I was built" from "something else happened" without
 	// paying for a full rebuild on every append.
 	structVersion int
+	// rowUpdateLog records the physical rows changed by UPDATE-only structural
+	// versions. It is deliberately separate from dirtyRows: WAL checkpoints
+	// reset dirtyRows, whereas derived search indexes may be queried much later.
+	// A DELETE, reorder or schema mutation clears the log and raises its base,
+	// because physical row positions can no longer be translated safely.
+	rowUpdateLog  []rowUpdateDelta
+	rowUpdateBase int
 	// derived is a slot for executor-owned state that is a pure function of
 	// this table's contents and can always be rebuilt from them: today, the
 	// constraint-value index that turns PRIMARY KEY and UNIQUE enforcement
@@ -102,6 +109,11 @@ type Table struct {
 	derived   any
 }
 
+type rowUpdateDelta struct {
+	structVersion int
+	row           int
+}
+
 // FTSDocument is the compact per-row directory for a persisted FTS index.
 // The offsets address the index's contiguous term/frequency/token arenas.
 type FTSDocument struct {
@@ -129,6 +141,11 @@ type FTSIndex struct {
 	DocTermIDs    []int32
 	DocTermCounts []int32
 	DocTokenIDs   []int32
+	// Stale* count arena entries superseded by UPDATE-only maintenance. They
+	// let the executor compact before a long update-heavy workload retains an
+	// unbounded trail of obsolete document terms/tokens.
+	StaleTerms  int
+	StaleTokens int
 }
 
 // VectorIndex is the backend-neutral persisted representation of an ANN
@@ -468,7 +485,7 @@ func (t *Table) MarkDirtyFrom(idx int) {
 	t.dirtyRowsState = dirtyRowsUnknown
 	if idx < 0 {
 		t.dirtyFrom = -1
-		t.noteStructuralChange()
+		t.noteStructuralInvalidation()
 		return
 	}
 	if t.dirtyFrom < 0 {
@@ -496,7 +513,7 @@ func (t *Table) MarkDirtyFrom(idx int) {
 // carries this list, so an unbounded one makes repeated UPDATEs quadratic.
 func (t *Table) MarkRowUpdated(idx int) {
 	t.dirtyFrom = -1
-	t.noteStructuralChange()
+	t.noteRowUpdated(idx)
 	if t.dirtyRowsState == dirtyRowsUnknown || idx < 0 {
 		return
 	}
@@ -533,7 +550,26 @@ func (t *Table) MarkRowUpdated(idx int) {
 // applyOperation in wal_advanced.go and the update-rows delta branch in
 // wal_manager.go.
 func (t *Table) noteStructuralChange() {
+	t.noteStructuralInvalidation()
+}
+
+func (t *Table) noteStructuralInvalidation() {
 	t.structVersion++
+	t.rowUpdateLog = nil
+	t.rowUpdateBase = t.structVersion
+}
+
+func (t *Table) noteRowUpdated(row int) {
+	t.structVersion++
+	// Keep the history bounded even for a long-lived in-memory database. A
+	// cache older than the retained tail simply performs one safe rebuild.
+	const maxRowUpdateDeltas = 4096
+	if len(t.rowUpdateLog) >= maxRowUpdateDeltas {
+		t.rowUpdateLog = nil
+		t.rowUpdateBase = t.structVersion
+		return
+	}
+	t.rowUpdateLog = append(t.rowUpdateLog, rowUpdateDelta{structVersion: t.structVersion, row: row})
 }
 
 // StructVersion returns the current structural-change counter. See
@@ -541,6 +577,37 @@ func (t *Table) noteStructuralChange() {
 // proves no row indexed at the earlier observation has since changed
 // content or been removed — the table may only have grown by appending.
 func (t *Table) StructVersion() int { return t.structVersion }
+
+// UpdatedRowsSince returns the rows changed exclusively by UPDATEs since a
+// prior structural version. ok is false when a DELETE, reorder, schema change,
+// or an evicted delta history occurred, in which case index users must rebuild.
+func (t *Table) UpdatedRowsSince(version int) (rows []int, ok bool) {
+	if version == t.structVersion {
+		return nil, true
+	}
+	if version < t.rowUpdateBase || len(t.rowUpdateLog) == 0 {
+		return nil, false
+	}
+	want := version + 1
+	seen := make(map[int]struct{}, len(t.rowUpdateLog))
+	for _, delta := range t.rowUpdateLog {
+		if delta.structVersion < want {
+			continue
+		}
+		if delta.structVersion != want {
+			return nil, false
+		}
+		want++
+		if _, duplicate := seen[delta.row]; !duplicate {
+			seen[delta.row] = struct{}{}
+			rows = append(rows, delta.row)
+		}
+	}
+	if want != t.structVersion+1 {
+		return nil, false
+	}
+	return rows, true
+}
 
 // DirtyFrom returns the first dirty row index, or -1 if non-append-only.
 func (t *Table) DirtyFrom() int { return t.dirtyFrom }

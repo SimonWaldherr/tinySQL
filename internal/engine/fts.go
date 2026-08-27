@@ -1364,7 +1364,7 @@ func ftsValueToString(v any) string {
 const ftsPersistentFormat = 1
 
 func ftsPersistentUsable(index *storage.FTSIndex, table *storage.Table) bool {
-	if index == nil || index.Format != ftsPersistentFormat || index.StructVersion != table.StructVersion() ||
+	if index == nil || index.Format != ftsPersistentFormat ||
 		index.BuiltRows < 0 || index.BuiltRows > len(table.Rows) || len(index.Docs) != index.BuiltRows ||
 		len(index.DocTermIDs) != len(index.DocTermCounts) ||
 		(index.NumDocs > 0 && (index.Postings == nil || index.TermIDs == nil)) {
@@ -1382,6 +1382,120 @@ func ftsPersistentUsable(index *storage.FTSIndex, table *storage.Table) bool {
 		}
 	}
 	return true
+}
+
+func ftsRemovePosting(rows []int32, row int32) []int32 {
+	i := sort.Search(len(rows), func(i int) bool { return rows[i] >= row })
+	if i >= len(rows) || rows[i] != row {
+		return rows
+	}
+	copy(rows[i:], rows[i+1:])
+	return rows[:len(rows)-1]
+}
+
+func ftsInsertPosting(rows []int32, row int32) []int32 {
+	i := sort.Search(len(rows), func(i int) bool { return rows[i] >= row })
+	if i < len(rows) && rows[i] == row {
+		return rows
+	}
+	rows = append(rows, 0)
+	copy(rows[i+1:], rows[i:])
+	rows[i] = row
+	return rows
+}
+
+// ftsRefreshUpdatedRows applies UPDATE-only changes directly to a persistent
+// index. Document arenas are append-only, but obsolete runs are unlinked from
+// postings and counted for later compaction. DELETE and schema changes cannot
+// use this path because their physical row positions may have shifted.
+func ftsRefreshUpdatedRows(table *storage.Table, cols []int, index *storage.FTSIndex, rows []int) {
+	termNames := make([]string, len(index.TermIDs))
+	for term, id := range index.TermIDs {
+		if id >= 0 && int(id) < len(termNames) {
+			termNames[id] = term
+		}
+	}
+	var sb strings.Builder
+	for _, ri := range rows {
+		if ri < 0 || ri >= len(table.Rows) || ri >= len(index.Docs) {
+			continue
+		}
+		old := index.Docs[ri]
+		if old.Valid {
+			for _, id := range index.DocTermIDs[old.TermStart : old.TermStart+old.TermCount] {
+				if id >= 0 && int(id) < len(termNames) {
+					term := termNames[id]
+					index.Postings[term] = ftsRemovePosting(index.Postings[term], int32(ri))
+				}
+			}
+			index.TotalDocLen -= old.DocLen
+			index.NumDocs--
+			index.StaleTerms += int(old.TermCount)
+			index.StaleTokens += int(old.TokenCount)
+		}
+		index.Docs[ri] = storage.FTSDocument{}
+
+		r := table.Rows[ri]
+		sb.Reset()
+		for _, ci := range cols {
+			if ci < len(r) && r[ci] != nil {
+				if sb.Len() > 0 {
+					sb.WriteByte(' ')
+				}
+				ftsWriteValue(&sb, r[ci])
+			}
+		}
+		if sb.Len() == 0 {
+			continue
+		}
+		counts := make(map[int32]int32)
+		tokenStart := int32(len(index.DocTokenIDs))
+		ftsForEachToken(sb.String(), func(term string) bool {
+			id, ok := index.TermIDs[term]
+			if !ok {
+				id = int32(len(index.TermIDs))
+				index.TermIDs[term] = id
+				termNames = append(termNames, term)
+			}
+			counts[id]++
+			index.DocTokenIDs = append(index.DocTokenIDs, id)
+			return true
+		})
+		if len(counts) == 0 {
+			continue
+		}
+		ids := make([]int32, 0, len(counts))
+		for id := range counts {
+			ids = append(ids, id)
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		termStart := int32(len(index.DocTermIDs))
+		for _, id := range ids {
+			index.DocTermIDs = append(index.DocTermIDs, id)
+			index.DocTermCounts = append(index.DocTermCounts, counts[id])
+			term := termNames[id]
+			index.Postings[term] = ftsInsertPosting(index.Postings[term], int32(ri))
+		}
+		tokenCount := len(index.DocTokenIDs) - int(tokenStart)
+		index.Docs[ri] = storage.FTSDocument{TermStart: termStart, TermCount: int32(len(ids)), TokenStart: tokenStart, TokenCount: int32(tokenCount), DocLen: float64(tokenCount), Valid: true}
+		index.TotalDocLen += float64(tokenCount)
+		index.NumDocs++
+	}
+	if index.NumDocs > 0 {
+		index.AvgDocLen = index.TotalDocLen / float64(index.NumDocs)
+	} else {
+		index.AvgDocLen = 0
+	}
+	index.Version = table.Version
+	index.StructVersion = table.StructVersion()
+}
+
+func ftsPersistentNeedsCompaction(index *storage.FTSIndex) bool {
+	// A tiny index is cheaper to keep dense than to rebuild repeatedly during
+	// a handful of edits. Once enough obsolete arena data has accumulated, the
+	// 25% threshold bounds memory for update-heavy long-lived corpora.
+	return (index.StaleTokens >= 1024 && index.StaleTokens*4 > len(index.DocTokenIDs)) ||
+		(index.StaleTerms >= 512 && index.StaleTerms*4 > len(index.DocTermIDs))
 }
 
 func ftsCacheFromPersistent(table *storage.Table, index *storage.FTSIndex) ftsDocCacheEntry {
@@ -1543,6 +1657,19 @@ func getFTSDocCache(tenant string, table *storage.Table, cols []int) ftsDocCache
 	if !ftsPersistentUsable(index, table) {
 		index = &storage.FTSIndex{}
 		changed = true
+	}
+	if !changed && index.StructVersion != table.StructVersion() {
+		rows, ok := table.UpdatedRowsSince(index.StructVersion)
+		if !ok {
+			index = &storage.FTSIndex{}
+			changed = true
+		} else {
+			ftsRefreshUpdatedRows(table, cols, index, rows)
+			changed = true
+			if ftsPersistentNeedsCompaction(index) {
+				index = &storage.FTSIndex{}
+			}
+		}
 	}
 	if changed || index.Version != table.Version || index.BuiltRows != len(table.Rows) {
 		ftsExtendPersistent(table, cols, index)

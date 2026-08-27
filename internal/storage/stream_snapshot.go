@@ -73,9 +73,37 @@ func (db *DB) DetachPinnedTableForWrite(tenant, name string) bool {
 		return false
 	}
 
-	// cloneTable deep-copies rows, mutable cells and secondary indexes. This is
-	// copy-on-write: the scan pays no O(table) startup cost, and an unrelated
-	// write does not copy any streamed table at all.
+	// DML only needs an independent row-header segment. Existing cells stay
+	// shared with the immutable stream; writers replace changed row slices,
+	// so they cannot mutate a streamed row through that sharing.
+	tenantDB.tables[key] = cloneTableForStreamDML(table)
+	return true
+}
+
+// DetachPinnedTableForSchemaWrite is the schema-mutation companion to
+// DetachPinnedTableForWrite. ALTER TABLE can edit existing row cells in place
+// while widening or shrinking them, so it deliberately retains a deep clone.
+func (db *DB) DetachPinnedTableForSchemaWrite(tenant, name string) bool {
+	if db == nil || name == "" || db.backendTablesEvictable() {
+		return false
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	tenantDB := db.getTenantRO(tenant)
+	if tenantDB == nil {
+		return false
+	}
+	key := canonicalTableName(name)
+	table := tenantDB.tables[key]
+	if table == nil {
+		return false
+	}
+	db.streamSnapshotMu.Lock()
+	pinned := db.streamSnapshots[table] != 0
+	db.streamSnapshotMu.Unlock()
+	if !pinned {
+		return false
+	}
 	tenantDB.tables[key] = cloneTable(table)
 	return true
 }

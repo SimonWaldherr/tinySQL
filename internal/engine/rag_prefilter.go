@@ -531,13 +531,9 @@ func ragIntersectRowIDs(left, right []int) []int {
 	return out
 }
 
-// ragVecSearchCandidatesFiltered ranks only rows selected by pre_filter. It
-// intentionally uses the exact flat path even when an approximate global ANN
-// mode was requested: filtering an IVF list or a global HNSW frontier after
-// candidate selection can miss the true nearest allowed row. Exact ranking over
-// the selected set makes ACL isolation and recall deterministic; a future
-// filter-aware ANN index can replace this implementation without changing the
-// public pre_filter contract.
+// ragVecSearchCandidatesFiltered ranks only rows selected by pre_filter. Flat
+// remains exact; an explicit HNSW mode builds an isolated graph for the filter
+// instead of filtering a global ANN frontier afterwards.
 func ragVecSearchCandidatesFiltered(ctx context.Context, env ExecEnv, a vecSearchArgs, table *storage.Table, filter *ragRowFilter) ([]vecScoredRow, error) {
 	if filter == nil {
 		_, rows, err := vecSearchCandidates(ctx, env, a)
@@ -565,10 +561,24 @@ func ragVecSearchCandidatesFiltered(ctx context.Context, env ExecEnv, a vecSearc
 	}
 	cache := getVecColumnCache(tenant, table, vecColIdx, a.metric == "cosine")
 	distFn := buildVecDistanceFunc(a.metric, a.queryVec, queryNorm, cache)
+	if a.indexMode == vecIndexHNSW && len(filter.rows) >= vecSearchParallelMinRows {
+		idx, err := getRAGFilteredANNIndex(searchCtx, tenant, table, vecColIdx, a.metric, len(a.queryVec), filter, cache)
+		if err != nil {
+			return nil, err
+		}
+		rows, err := idx.searchFiltered(searchCtx, a.queryVec, queryNorm, a.k, cache, filter)
+		if err != nil {
+			return nil, err
+		}
+		finalizeVecScoredRows(a.metric, rows)
+		recordVecQuery(VectorQueryEvent{At: time.Now(), Table: table.Name, Column: a.colName, Metric: a.metric, Index: "filter-hnsw", K: a.k, Duration: time.Since(started)})
+		return rows, nil
+	}
 	rows, err := ragVecTopKAllowed(searchCtx, filter.rows, len(a.queryVec), a.k, cache, distFn)
 	if err != nil {
 		return nil, err
 	}
+	finalizeVecScoredRows(a.metric, rows)
 	recordVecQuery(VectorQueryEvent{At: time.Now(), Table: table.Name, Column: a.colName, Metric: a.metric, Index: "flat", K: a.k, Duration: time.Since(started)})
 	return rows, nil
 }

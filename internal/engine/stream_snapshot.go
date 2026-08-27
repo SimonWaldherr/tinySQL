@@ -26,7 +26,7 @@ func detachStreamSnapshotsForWrite(db *storage.DB, tenant string, stmt Statement
 	case *Delete:
 		db.DetachPinnedTableForWrite(tenant, s.Table)
 	case *AlterTable:
-		db.DetachPinnedTableForWrite(tenant, s.Table)
+		db.DetachPinnedTableForSchemaWrite(tenant, s.Table)
 	case *CreateIndex:
 		db.DetachPinnedTableForWrite(tenant, s.Table)
 	case *DropIndex:

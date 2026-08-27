@@ -533,6 +533,24 @@ FROM FTS_SEARCH_FILTERED(
 );
 ```
 
+Filtered vector search is exact by default. For a large, stable tenant or ACL
+slice, add top-level `"index":"hnsw"` to the options. TinySQL then builds a
+bounded, process-local HNSW graph containing only that filter's rows; it never
+searches a global ANN graph and filters its candidates afterwards. This keeps
+the authorization boundary intact while accepting the usual ANN recall tradeoff:
+
+```sql
+SELECT *
+FROM VEC_SEARCH_FILTERED(
+    'rag_chunks', 'embedding', ?, 20,
+    '{"index":"hnsw","pre_filter":{"equals":{"tenant_id":"acme"}}}'
+);
+```
+
+The local graph is invalidated with the source table and is not persisted, so
+use it for repeatedly queried, high-cardinality scopes rather than one-off ACL
+expressions.
+
 Go package users can generate the same options payload without hand-building
 JSON. `RAGPreFilterJSON` rejects an empty boundary, while an explicit empty
 `AllowedRowIDs` slice is preserved as a deny-all ACL:

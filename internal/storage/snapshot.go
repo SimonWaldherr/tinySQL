@@ -67,32 +67,53 @@ func cloneTableMeta(t *Table) *Table {
 	nt := NewTable(t.Name, t.Cols, t.IsTemp)
 	nt.Version = t.Version
 	nt.structVersion = t.structVersion
+	nt.rowUpdateBase = t.rowUpdateBase
+	nt.rowUpdateLog = append([]rowUpdateDelta(nil), t.rowUpdateLog...)
 	return nt
 }
 
 func cloneTable(t *Table) *Table {
+	return cloneTableWithRows(t, cloneRows(t.Rows), true)
+}
+
+// cloneTableForStreamDML makes a private writer view for a table currently
+// being read by a ResultStream. DML replaces row slices, removes them from a
+// new outer slice, or appends new ones; it never writes through an existing
+// row's cells. Copying only the row headers is therefore sufficient to keep
+// the stream immutable and avoids cloning every JSON/vector/blob cell on a
+// same-table write. Schema changes still use cloneTable above.
+func cloneTableForStreamDML(t *Table) *Table {
+	rows := make([][]any, len(t.Rows))
+	copy(rows, t.Rows)
+	return cloneTableWithRows(t, rows, false)
+}
+
+func cloneTableWithRows(t *Table, rows [][]any, copySearchIndexes bool) *Table {
 	cols := make([]Column, len(t.Cols))
 	copy(cols, t.Cols)
 	nt := NewTable(t.Name, cols, t.IsTemp)
 	nt.Version = t.Version
 	nt.structVersion = t.structVersion
+	nt.rowUpdateBase = t.rowUpdateBase
+	nt.rowUpdateLog = append([]rowUpdateDelta(nil), t.rowUpdateLog...)
 	nt.Indexes = cloneSecondaryIndexes(t.Indexes)
 	nt.Stats = cloneTableStats(t.Stats)
 	nt.dirtyFrom = t.dirtyFrom
 	nt.dirtyRows = append([]int(nil), t.dirtyRows...)
 	nt.dirtyRowsState = t.dirtyRowsState
-	nt.Rows = cloneRows(t.Rows)
-	// See DerivedCloner's doc comment: nt.Rows above is a byte-identical copy
-	// of t.Rows at this instant, so cloneable derived state (the constraint-
-	// index cache, today) describing those rows is equally valid for nt.
-	// Everything else is dropped, unchanged from before this existed.
+	nt.Rows = rows
+	// See DerivedCloner's doc comment: the row sequence is byte-identical at
+	// clone time, even for a header-only stream-DML clone, so cloneable derived
+	// state (the constraint-index cache, today) remains valid for the clone.
 	t.DerivedLock()
-	nt.FTSIndexes = cloneFTSIndexes(t.FTSIndexes)
-	nt.ftsGeneration = t.ftsGeneration
-	nt.ftsPersistedGeneration = t.ftsPersistedGeneration
-	nt.VectorIndexes = cloneVectorIndexes(t.VectorIndexes)
-	nt.vectorGeneration = t.vectorGeneration
-	nt.vectorPersistedGeneration = t.vectorPersistedGeneration
+	if copySearchIndexes {
+		nt.FTSIndexes = cloneFTSIndexes(t.FTSIndexes)
+		nt.ftsGeneration = t.ftsGeneration
+		nt.ftsPersistedGeneration = t.ftsPersistedGeneration
+		nt.VectorIndexes = cloneVectorIndexes(t.VectorIndexes)
+		nt.vectorGeneration = t.vectorGeneration
+		nt.vectorPersistedGeneration = t.vectorPersistedGeneration
+	}
 	if cloner, ok := t.derived.(DerivedCloner); ok {
 		nt.derived = cloner.CloneDerived()
 	}
