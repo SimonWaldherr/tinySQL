@@ -37,6 +37,7 @@ import (
 	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/engine/search"
+	"github.com/SimonWaldherr/tinySQL/internal/engine/sqlval"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
@@ -433,13 +434,10 @@ func purgeVectorCachesFor(tenant, table string) {
 // evictOverCap removes arbitrary entries until the map is below the cap,
 // making room for one more. Go's random map iteration order makes this a
 // cheap pseudo-random eviction policy.
+// evictOverCap forwards to sqlval.EvictOverCap; see the forwarder note on
+// valueText (coerce.go) for why the implementation lives outside this package.
 func evictOverCap[K comparable, V any](m map[K]V, maxEntries int) {
-	for k := range m {
-		if len(m) < maxEntries {
-			return
-		}
-		delete(m, k)
-	}
+	sqlval.EvictOverCap(m, maxEntries)
 }
 
 func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeNorms bool) vecSearchColumnCacheEntry {

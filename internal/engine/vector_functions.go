@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/engine/search"
+	"github.com/SimonWaldherr/tinySQL/internal/engine/sqlval"
 )
 
 // ---------------------------------------------------------------------------
@@ -543,18 +544,9 @@ func evalVecSlice(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	return out, nil
 }
 
-func toInt(v any) (int, error) {
-	switch x := v.(type) {
-	case int:
-		return x, nil
-	case int64:
-		return int(x), nil
-	case float64:
-		return int(x), nil
-	default:
-		return 0, fmt.Errorf("expected integer, got %T", v)
-	}
-}
+// toInt forwards to sqlval.ToInt; see the forwarder note on valueText
+// (coerce.go) for why the implementation lives outside this package.
+func toInt(v any) (int, error) { return sqlval.ToInt(v) }
 
 // evalRecencyScore calculates an exponential decay score in [0,1].
 //

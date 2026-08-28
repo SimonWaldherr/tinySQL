@@ -3,66 +3,20 @@
 package engine
 
 import (
-	"bytes"
 	"fmt"
 	"strings"
 	"sync"
+
+	"github.com/SimonWaldherr/tinySQL/internal/engine/sqlval"
 )
 
 // rawEqual performs a type-aware equality check between two interface values
 // without going through the generic compare() function.  It covers the value
 // types that tinySQL stores in table rows (int, int64, float64, string, bool,
 // and []byte BLOBs).
-func rawEqual(a, b any) bool {
-	if a == nil {
-		return b == nil
-	}
-	if b == nil {
-		return false
-	}
-	switch av := a.(type) {
-	case int:
-		switch bv := b.(type) {
-		case int:
-			return av == bv
-		case int64:
-			return int64(av) == bv
-		case float64:
-			return float64(av) == bv
-		}
-	case int64:
-		switch bv := b.(type) {
-		case int:
-			return av == int64(bv)
-		case int64:
-			return av == bv
-		case float64:
-			return float64(av) == bv
-		}
-	case float64:
-		switch bv := b.(type) {
-		case int:
-			return av == float64(bv)
-		case int64:
-			return av == float64(bv)
-		case float64:
-			return av == bv
-		}
-	case string:
-		if bv, ok := b.(string); ok {
-			return av == bv
-		}
-	case bool:
-		if bv, ok := b.(bool); ok {
-			return av == bv
-		}
-	case []byte:
-		if bv, ok := b.([]byte); ok {
-			return bytes.Equal(av, bv)
-		}
-	}
-	return false
-}
+// rawEqual forwards to sqlval.RawEqual; see the forwarder note on valueText
+// (coerce.go) for why the implementation lives outside this package.
+func rawEqual(a, b any) bool { return sqlval.RawEqual(a, b) }
 
 func projectRawRow(plan *simpleSelectPlan, raw []any) (Row, error) {
 	out := make(Row, plan.rowMapCap)

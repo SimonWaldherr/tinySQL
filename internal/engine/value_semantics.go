@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/SimonWaldherr/tinySQL/internal/engine/sqlval"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
@@ -403,14 +404,6 @@ func compareForOrder(a, b any, desc bool) int {
 	return c
 }
 
-func checkCtx(ctx context.Context) error {
-	if ctx == nil {
-		return nil
-	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-		return nil
-	}
-}
+// checkCtx forwards to sqlval.CheckCtx; see the forwarder note on valueText
+// (coerce.go) for why the implementation lives outside this package.
+func checkCtx(ctx context.Context) error { return sqlval.CheckCtx(ctx) }
