@@ -81,6 +81,9 @@ var vecQueryCacheState = struct {
 	misses    uint64
 	evictions uint64
 	events    []VectorQueryEvent
+	// lastPrune debounces pruneVecQueryCacheLocked's O(entries+events) sweep —
+	// see its doc comment.
+	lastPrune time.Time
 	// cacheEnabled and analyticsEnabled mirror cfg.ResultCacheEntries>0 &&
 	// cfg.ResultCacheTTL>0, and cfg.Analytics, respectively. They exist purely
 	// as a lock-free fast path for the VEC_SEARCH hot path (every single
@@ -137,7 +140,7 @@ func VectorCacheAnalytics() VectorCacheStats {
 	vecQueryCacheState.Lock()
 	defer vecQueryCacheState.Unlock()
 	now := time.Now()
-	pruneVecQueryCacheLocked(now)
+	pruneVecQueryCacheForce(now)
 	stats := VectorCacheStats{Enabled: vecQueryCacheState.cfg.ResultCacheEntries > 0 && vecQueryCacheState.cfg.ResultCacheTTL > 0, Entries: len(vecQueryCacheState.entries), Hits: vecQueryCacheState.hits, Misses: vecQueryCacheState.misses, Evictions: vecQueryCacheState.evictions}
 	stats.ApproxBytes = int64(len(vecQueryCacheState.entries) * 128)
 	for _, entry := range vecQueryCacheState.entries {
@@ -253,7 +256,35 @@ func recordVecQuery(event VectorQueryEvent) {
 	}
 }
 
+// vecQueryCachePruneInterval debounces pruneVecQueryCacheLocked's sweep.
+// putVecQueryCache and recordVecQuery both call it, and vector_search.go
+// calls both in sequence for essentially every cache-miss VEC_SEARCH
+// invocation (a put immediately followed by a record) — without debouncing,
+// every miss paid for the same O(entries+events) scan twice back-to-back,
+// microseconds apart, with nothing new to prune the second time. Bounding it
+// to run at most this often turns that into "at most once per interval"
+// regardless of query volume. getVecQueryCache's own per-key TTL check (its
+// sole correctness contract: never return an expired entry) does not go
+// through this function at all, so debouncing the bulk sweep cannot let a
+// stale entry be served — it only delays when already-expired entries are
+// bulk-collected from the map and old analytics events are trimmed.
+const vecQueryCachePruneInterval = 250 * time.Millisecond
+
 func pruneVecQueryCacheLocked(now time.Time) {
+	if !now.After(vecQueryCacheState.lastPrune.Add(vecQueryCachePruneInterval)) {
+		return
+	}
+	vecQueryCacheState.lastPrune = now
+	pruneVecQueryCacheForce(now)
+}
+
+// pruneVecQueryCacheForce runs the sweep unconditionally, bypassing the
+// debounce in pruneVecQueryCacheLocked. Used by VectorCacheAnalytics, an
+// explicit "what's the state right now" query rather than a hot per-search
+// path, where a caller reasonably expects the returned Entries/RecentQueries
+// to reflect the current TTL/window rather than a snapshot up to
+// vecQueryCachePruneInterval stale.
+func pruneVecQueryCacheForce(now time.Time) {
 	for k, v := range vecQueryCacheState.entries {
 		if !now.Before(v.expires) {
 			delete(vecQueryCacheState.entries, k)

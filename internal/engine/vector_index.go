@@ -5,6 +5,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -149,6 +150,12 @@ var (
 	// startup takes max(build_i) instead of sum(build_i) — while concurrent
 	// requests for the SAME key still coalesce onto a single build.
 	vecIVFBuilds = make(map[vecIndexCacheKey]*vecIndexBuildCall)
+	// vecIVFCacheSnapshot mirrors vecIVFCache for lock-free reads, the same
+	// way vecSearchColumnCacheSnapshot mirrors the column cache
+	// (vector_search.go) — every *vecIVFIndex is fully built before it is
+	// ever published (no in-place extend exists for IVF, unlike HNSW), so a
+	// snapshot read without vecIVFCacheMu is always safe.
+	vecIVFCacheSnapshot atomic.Pointer[map[vecIndexCacheKey]*vecIVFIndex]
 
 	vecHNSWCacheMu sync.RWMutex
 	vecHNSWCache   = make(map[vecIndexCacheKey]*vecHNSWIndex)
@@ -159,6 +166,27 @@ var (
 	// on large tables do not allocate len(rows) bytes per call.
 	vecVisitedPool sync.Pool
 )
+
+func init() {
+	empty := make(map[vecIndexCacheKey]*vecIVFIndex)
+	vecIVFCacheSnapshot.Store(&empty)
+}
+
+// publishVecIVFCacheSnapshotLocked refreshes the lock-free snapshot from the
+// authoritative vecIVFCache. Callers must already hold vecIVFCacheMu and
+// must call this immediately after every mutation (insert or delete —
+// including purgeVectorCachesFor's deletes), so a lock-free reader never
+// observes a snapshot older than what the mutex-protected map already
+// reflects. Mirrors publishVecSearchColumnCacheSnapshotLocked
+// (vector_search.go); capped at vecIndexCacheMaxEntries, so the copy is
+// cheap relative to the k-means build that triggered it.
+func publishVecIVFCacheSnapshotLocked() {
+	snap := make(map[vecIndexCacheKey]*vecIVFIndex, len(vecIVFCache))
+	for k, v := range vecIVFCache {
+		snap[k] = v
+	}
+	vecIVFCacheSnapshot.Store(&snap)
+}
 
 // vecHNSWScratch holds the reusable candidate/result heaps and visited-touch
 // list for one HNSW traversal (one search() call, or the whole sequential
@@ -243,11 +271,12 @@ func vecSearchTopKWithIndex(
 	cache vecSearchColumnCacheEntry,
 	distFn vecDistanceFunc,
 ) ([]vecScoredRow, error) {
+	needNorm := vecDistanceFuncNeedsNorm(args.metric)
 	var rows []vecScoredRow
 	var err error
 	switch args.indexMode {
 	case vecIndexFlat:
-		rows, err = vecSearchTopK(ctx, table.Rows, queryLen, args.k, cache, distFn)
+		rows, err = vecSearchTopK(ctx, table.Rows, queryLen, args.k, cache, distFn, needNorm)
 	case vecIndexIVF:
 		var idx *vecIVFIndex
 		idx, err = getVecIVFIndex(ctx, tenant, table, colIdx, args.metric, queryLen, cache)
@@ -261,7 +290,7 @@ func vecSearchTopKWithIndex(
 			rows, err = idx.search(ctx, args.queryVec, queryNorm, args.k, cache)
 		}
 	default:
-		rows, err = vecSearchTopK(ctx, table.Rows, queryLen, args.k, cache, distFn)
+		rows, err = vecSearchTopK(ctx, table.Rows, queryLen, args.k, cache, distFn, needNorm)
 	}
 	if err != nil {
 		return nil, err
@@ -287,6 +316,13 @@ func finalizeVecScoredRows(metric string, rows []vecScoredRow) {
 
 func getVecIVFIndex(ctx context.Context, tenant string, table *storage.Table, colIdx int, metric string, dims int, cache vecSearchColumnCacheEntry) (*vecIVFIndex, error) {
 	key := vecIndexCacheKey{tenant: tenant, table: table.Name, colIdx: colIdx, metric: metric}
+
+	// Lock-free fast path — see publishVecIVFCacheSnapshotLocked.
+	if snap := vecIVFCacheSnapshot.Load(); snap != nil {
+		if idx := (*snap)[key]; idx != nil && idx.table == table && idx.version == table.Version && idx.dims == dims {
+			return idx, nil
+		}
+	}
 
 	for {
 		vecIVFCacheMu.RLock()
@@ -319,6 +355,7 @@ func getVecIVFIndex(ctx context.Context, tenant string, table *storage.Table, co
 				evictOverCap(vecIVFCache, vecIndexCacheMaxEntries)
 			}
 			vecIVFCache[key] = idx
+			publishVecIVFCacheSnapshotLocked()
 		}
 		close(call.done)
 		vecIVFCacheMu.Unlock()
@@ -436,15 +473,15 @@ func getVecHNSWIndex(ctx context.Context, tenant string, table *storage.Table, c
 
 	for {
 		vecHNSWCacheMu.RLock()
-		if idx := vecHNSWCache[key]; idx != nil && idx.table == table && idx.version == table.Version && idx.dims == dims {
-			vecHNSWCacheMu.RUnlock()
+		idx := vecHNSWCache[key]
+		vecHNSWCacheMu.RUnlock()
+		if idx != nil && idx.table == table && idx.dims == dims && idx.versionMatches(table.Version) {
 			return idx, nil
 		}
-		vecHNSWCacheMu.RUnlock()
 
 		vecHNSWCacheMu.Lock()
-		idx := vecHNSWCache[key]
-		if idx != nil && idx.table == table && idx.version == table.Version && idx.dims == dims {
+		idx = vecHNSWCache[key]
+		if idx != nil && idx.table == table && idx.dims == dims && idx.versionMatches(table.Version) {
 			vecHNSWCacheMu.Unlock()
 			return idx, nil
 		}
@@ -535,6 +572,22 @@ func getVecHNSWIndex(ctx context.Context, tenant string, table *storage.Table, c
 	}
 }
 
+// versionMatches reports whether idx.version equals v, under idx.mu.
+//
+// idx.version is written by getVecHNSWIndex's extend path (idx.version =
+// table.Version) under idx.mu.Lock() only — vecHNSWCacheMu is deliberately
+// released before that write starts, so a slow extend doesn't stall lookups
+// for other cache keys. A caller that instead read idx.version guarded only
+// by vecHNSWCacheMu (as this and the two functions below used to) raced with
+// that write: two different mutexes protecting the same memory is not
+// synchronization. See canExtendVecHNSWIndex/vecHNSWRefreshRows for the same
+// fix applied to idx.structVersion/idx.levels/idx.deltaRows/idx.deltaSet.
+func (idx *vecHNSWIndex) versionMatches(v int) bool {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.version == v
+}
+
 // canExtendVecHNSWIndex reports whether idx can grow in place to cover
 // table's current rows instead of being rebuilt from scratch. This is safe
 // exactly when table.StructVersion() has not moved since idx was last built
@@ -545,12 +598,19 @@ func getVecHNSWIndex(ctx context.Context, tenant string, table *storage.Table, c
 // a second, independent guard against the same conclusion reached unsafely
 // (e.g. a table rolled back to fewer rows than idx has already indexed,
 // which would otherwise still show an unchanged StructVersion).
+//
+// idx.structVersion/idx.levels are read under idx.mu: extendVecHNSWIndex
+// appends to idx.levels and bumps idx.structVersion under idx.mu.Lock() only
+// (see versionMatches), so reading them under vecHNSWCacheMu alone — as this
+// used to — is a data race whenever this runs concurrently with an extend of
+// the same *vecHNSWIndex for a different cache key's lookup.
 func canExtendVecHNSWIndex(idx *vecHNSWIndex, table *storage.Table, dims int) bool {
-	return idx != nil &&
-		idx.table == table &&
-		idx.dims == dims &&
-		idx.structVersion == table.StructVersion() &&
-		len(idx.levels) <= len(table.Rows)
+	if idx == nil || idx.table != table || idx.dims != dims {
+		return false
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.structVersion == table.StructVersion() && len(idx.levels) <= len(table.Rows)
 }
 
 // vecHNSWRefreshRows admits bounded UPDATE-only deltas. The graph topology stays
@@ -558,14 +618,29 @@ func canExtendVecHNSWIndex(idx *vecHNSWIndex, table *storage.Table, dims int) bo
 // changed embeddings are immediately visible without rebuilding every edge.
 // This is still ANN (topology may be less ideal after many moves); DELETE and
 // schema changes are rejected by UpdatedRowsSince because row positions shift.
+//
+// Every read of idx's mutable fields below holds idx.mu (see versionMatches
+// for why): table.UpdatedRowsSince between the two RLock sections touches
+// only table, never idx, so it is safe to run without idx.mu held.
 func vecHNSWRefreshRows(idx *vecHNSWIndex, table *storage.Table, dims int) ([]int, bool) {
-	if idx == nil || idx.table != table || idx.dims != dims || len(idx.levels) > len(table.Rows) {
+	if idx == nil || idx.table != table || idx.dims != dims {
 		return nil, false
 	}
-	rows, ok := table.UpdatedRowsSince(idx.structVersion)
+	idx.mu.RLock()
+	levelsFit := len(idx.levels) <= len(table.Rows)
+	structVersion := idx.structVersion
+	idx.mu.RUnlock()
+	if !levelsFit {
+		return nil, false
+	}
+
+	rows, ok := table.UpdatedRowsSince(structVersion)
 	if !ok || len(rows) == 0 {
 		return nil, false
 	}
+
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
 	unique := len(idx.deltaRows)
 	for _, row := range rows {
 		if _, exists := idx.deltaSet[row]; !exists {
@@ -790,8 +865,8 @@ func (idx *vecHNSWIndex) search(ctx context.Context, query []float64, queryNorm 
 		}
 	}
 	if resultHeap.Len() < k {
-		distFn := buildVecDistanceFunc(idx.metric, query, queryNorm, cache)
-		return vecSearchTopK(ctx, idx.table.Rows, idx.dims, k, cache, distFn)
+		distFn := buildVecDistanceFunc(idx.metric, query, queryNorm)
+		return vecSearchTopK(ctx, idx.table.Rows, idx.dims, k, cache, distFn, vecDistanceFuncNeedsNorm(idx.metric))
 	}
 	return topKFromHeap(resultHeap, k), nil
 }

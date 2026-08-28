@@ -2,6 +2,7 @@ package engine
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -34,7 +35,42 @@ type ftsPreparedQueryCacheEntry struct {
 var (
 	ftsPreparedQueryCacheMu sync.RWMutex
 	ftsPreparedQueryCache   = make(map[ftsPreparedQueryCacheKey]ftsPreparedQueryCacheEntry)
+	// ftsPreparedQueryCacheSnapshot mirrors the map above for lock-free reads,
+	// the same way vecSearchColumnCacheSnapshot does for the vector column cache
+	// (vector_search.go).
+	//
+	// Every FTS_SEARCH — and so every hybrid RAG_SEARCH, which runs an FTS pass
+	// on each question — reads this cache once, and the warm hit is by far the
+	// common case. Taking an RWMutex read lock for it means all concurrent
+	// retrievals contend on one shared reader counter's cache line, which is
+	// exactly the cost that shows up on a many-core server and not on a
+	// single-threaded benchmark.
+	//
+	// Freshness is unaffected: it was never the mutex that made a cached plan
+	// valid, but the table-pointer and Version comparison against the entry
+	// itself, which the lock-free path performs identically. Entries are
+	// immutable once published (see the type's doc comment).
+	ftsPreparedQueryCacheSnapshot atomic.Pointer[map[ftsPreparedQueryCacheKey]ftsPreparedQueryCacheEntry]
 )
+
+func init() {
+	empty := make(map[ftsPreparedQueryCacheKey]ftsPreparedQueryCacheEntry)
+	ftsPreparedQueryCacheSnapshot.Store(&empty)
+}
+
+// publishFTSPreparedQueryCacheSnapshotLocked refreshes the lock-free snapshot
+// from the authoritative map. Callers must hold ftsPreparedQueryCacheMu and
+// must call this after every mutation — insert and delete alike, since a purge
+// that skipped it would leave lock-free readers serving plans for a dropped
+// table. Bounded by ftsPreparedQueryCacheMaxEntries, so the copy is cheap next
+// to the wildcard expansion and IDF binding that produced the new entry.
+func publishFTSPreparedQueryCacheSnapshotLocked() {
+	snap := make(map[ftsPreparedQueryCacheKey]ftsPreparedQueryCacheEntry, len(ftsPreparedQueryCache))
+	for k, v := range ftsPreparedQueryCache {
+		snap[k] = v
+	}
+	ftsPreparedQueryCacheSnapshot.Store(&snap)
+}
 
 // prepareFTSQuery returns a corpus-bound, immutable query tree and the rows
 // it may match. cache must be the current document cache for table/cols.
@@ -44,11 +80,11 @@ func prepareFTSQuery(tenant string, table *storage.Table, cols []int, query stri
 		query: query,
 	}
 
-	ftsPreparedQueryCacheMu.RLock()
-	entry, ok := ftsPreparedQueryCache[key]
-	ftsPreparedQueryCacheMu.RUnlock()
-	if ok && entry.table == table && entry.version == table.Version {
-		return entry.node, entry.candidates
+	// Lock-free fast path — see publishFTSPreparedQueryCacheSnapshotLocked.
+	if snap := ftsPreparedQueryCacheSnapshot.Load(); snap != nil {
+		if entry, ok := (*snap)[key]; ok && entry.table == table && entry.version == table.Version {
+			return entry.node, entry.candidates
+		}
 	}
 
 	node := parseCachedFTSQuery(query)
@@ -77,6 +113,7 @@ func prepareFTSQuery(tenant string, table *storage.Table, cols []int, query stri
 		evictOverCap(ftsPreparedQueryCache, ftsPreparedQueryCacheMaxEntries)
 	}
 	ftsPreparedQueryCache[key] = computed
+	publishFTSPreparedQueryCacheSnapshotLocked()
 	ftsPreparedQueryCacheMu.Unlock()
 	return node, candidates
 }
@@ -95,5 +132,6 @@ func purgeFTSPreparedQueryCachesFor(tenant, table string) {
 			delete(ftsPreparedQueryCache, key)
 		}
 	}
+	publishFTSPreparedQueryCacheSnapshotLocked()
 	ftsPreparedQueryCacheMu.Unlock()
 }

@@ -560,7 +560,7 @@ func ragVecSearchCandidatesFiltered(ctx context.Context, env ExecEnv, a vecSearc
 		tenant = "default"
 	}
 	cache := getVecColumnCache(tenant, table, vecColIdx, a.metric == "cosine")
-	distFn := buildVecDistanceFunc(a.metric, a.queryVec, queryNorm, cache)
+	distFn := buildVecDistanceFunc(a.metric, a.queryVec, queryNorm)
 	if a.indexMode == vecIndexHNSW && len(filter.rows) >= vecSearchParallelMinRows {
 		idx, err := getRAGFilteredANNIndex(searchCtx, tenant, table, vecColIdx, a.metric, len(a.queryVec), filter, cache)
 		if err != nil {
@@ -574,7 +574,7 @@ func ragVecSearchCandidatesFiltered(ctx context.Context, env ExecEnv, a vecSearc
 		recordVecQuery(VectorQueryEvent{At: time.Now(), Table: table.Name, Column: a.colName, Metric: a.metric, Index: "filter-hnsw", K: a.k, Duration: time.Since(started)})
 		return rows, nil
 	}
-	rows, err := ragVecTopKAllowed(searchCtx, filter.rows, len(a.queryVec), a.k, cache, distFn)
+	rows, err := ragVecTopKAllowed(searchCtx, filter.rows, len(a.queryVec), a.k, cache, distFn, vecDistanceFuncNeedsNorm(a.metric))
 	if err != nil {
 		return nil, err
 	}
@@ -583,10 +583,10 @@ func ragVecSearchCandidatesFiltered(ctx context.Context, env ExecEnv, a vecSearc
 	return rows, nil
 }
 
-func ragVecTopKAllowed(ctx context.Context, allowed []int, queryLen, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc) ([]vecScoredRow, error) {
+func ragVecTopKAllowed(ctx context.Context, allowed []int, queryLen, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc, needNorm bool) ([]vecScoredRow, error) {
 	workers := vecSearchWorkerCount(len(allowed), queryLen)
 	if workers == 1 {
-		h, err := ragVecTopKAllowedRange(ctx, allowed, 0, len(allowed), queryLen, k, cache, distFn)
+		h, err := ragVecTopKAllowedRange(ctx, allowed, 0, len(allowed), queryLen, k, cache, distFn, needNorm)
 		if err != nil {
 			return nil, err
 		}
@@ -609,7 +609,7 @@ func ragVecTopKAllowed(ctx context.Context, allowed []int, queryLen, k int, cach
 		wg.Add(1)
 		go func(worker, start, end int) {
 			defer wg.Done()
-			h, err := ragVecTopKAllowedRange(ctx, allowed, start, end, queryLen, k, cache, distFn)
+			h, err := ragVecTopKAllowedRange(ctx, allowed, start, end, queryLen, k, cache, distFn, needNorm)
 			results[worker] = workerResult{heapRows: h, err: err}
 		}(worker, start, end)
 	}
@@ -627,7 +627,7 @@ func ragVecTopKAllowed(ctx context.Context, allowed []int, queryLen, k int, cach
 	return topKFromHeap(merged, k), nil
 }
 
-func ragVecTopKAllowedRange(ctx context.Context, allowed []int, start, end, queryLen, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc) (vecScoredHeap, error) {
+func ragVecTopKAllowedRange(ctx context.Context, allowed []int, start, end, queryLen, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc, needNorm bool) (vecScoredHeap, error) {
 	heapRows := make(vecScoredHeap, 0, k)
 	for i := start; i < end; i++ {
 		if i&1023 == 0 {
@@ -636,14 +636,14 @@ func ragVecTopKAllowedRange(ctx context.Context, allowed []int, start, end, quer
 			}
 		}
 		rowID := allowed[i]
-		if rowID < 0 || rowID >= cache.rowCount() || !cache.validAt(rowID) {
+		if rowID < 0 || rowID >= cache.rowCount() {
 			continue
 		}
-		vec := cache.vector(rowID)
-		if len(vec) != queryLen {
+		vec, norm, valid := cache.resolveRow(rowID, needNorm)
+		if !valid || len(vec) != queryLen {
 			continue
 		}
-		distance, ok := distFn(vec, rowID)
+		distance, ok := distFn(vec, norm)
 		if ok {
 			pushTopK(&heapRows, rowID, distance, k)
 		}
@@ -667,7 +667,12 @@ func ragFTSSearchCandidatesFiltered(ctx context.Context, tenant string, table *s
 	if node == nil {
 		return nil, nil
 	}
-	rows := ragCachedFTSFilterCandidates(table, searchCols, query, candidates, filter)
+	// Computed once and threaded into both cache lookups below rather than
+	// each recomputing ftsColsCacheKey(searchCols) independently: same input,
+	// same result, and both run on every filtered FTS call including cache
+	// hits.
+	colsKey := ftsColsCacheKey(searchCols)
+	rows := ragCachedFTSFilterCandidates(table, colsKey, query, candidates, filter)
 	if len(rows) == 0 {
 		return nil, nil
 	}
@@ -675,7 +680,7 @@ func ragFTSSearchCandidatesFiltered(ctx context.Context, tenant string, table *s
 	// Derive them from the authorized set too: using corpus-wide IDF after a
 	// row filter would both make ranks depend on forbidden rows and expose a
 	// small aggregate side channel through the public _fts_score values.
-	filteredCache, idf := ragFilteredFTSStatistics(table, searchCols, cache, filter)
+	filteredCache, idf := ragFilteredFTSStatistics(table, colsKey, cache, filter)
 	node = ftsBindIDF(node, idf, filteredCache.termIDs)
 	results, err := ftsScanTopK(ctx, filteredCache, node, nil, rows, true, k)
 	if err != nil {
@@ -726,9 +731,9 @@ var (
 	ragFilteredFTSStatsCache   = make(map[ragFilteredFTSStatsCacheKey]ragFilteredFTSStats)
 )
 
-func ragCachedFTSFilterCandidates(table *storage.Table, searchCols []int, query string, candidates ftsCandidates, filter *ragRowFilter) []int32 {
+func ragCachedFTSFilterCandidates(table *storage.Table, colsKey string, query string, candidates ftsCandidates, filter *ragRowFilter) []int32 {
 	key := ragFilteredFTSCandidateCacheKey{
-		table: table, version: table.Version, cols: ftsColsCacheKey(searchCols), query: query, filter: filter,
+		table: table, version: table.Version, cols: colsKey, query: query, filter: filter,
 	}
 	ragFilteredFTSCandidateCacheMu.RLock()
 	cached, ok := ragFilteredFTSCandidateCache[key]
@@ -781,9 +786,9 @@ func ragIntersectFTSCandidates(candidates ftsCandidates, allowed []int) []int32 
 // normalization and IDF function are confined to filter. This intentionally
 // keeps the shared term dictionary/postings arena corpus-wide for fast query
 // parsing, but no unauthorized document contributes to an observable score.
-func ragFilteredFTSStatistics(table *storage.Table, searchCols []int, cache ftsDocCacheEntry, filter *ragRowFilter) (ftsDocCacheEntry, ftsIDFFunc) {
+func ragFilteredFTSStatistics(table *storage.Table, colsKey string, cache ftsDocCacheEntry, filter *ragRowFilter) (ftsDocCacheEntry, ftsIDFFunc) {
 	key := ragFilteredFTSStatsCacheKey{
-		table: table, version: table.Version, cols: ftsColsCacheKey(searchCols), filter: filter,
+		table: table, version: table.Version, cols: colsKey, filter: filter,
 	}
 	ragFilteredFTSStatsCacheMu.RLock()
 	stats, ok := ragFilteredFTSStatsCache[key]

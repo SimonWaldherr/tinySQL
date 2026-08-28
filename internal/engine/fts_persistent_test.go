@@ -88,10 +88,12 @@ func TestFTSCacheHydratesFromPersistentIndex(t *testing.T) {
 		t.Fatal("FTS search did not create a persistent index")
 	}
 
+	// Goes through the helper rather than deleting from ftsDocCache directly:
+	// getFTSDocCache serves warm hits from a lock-free snapshot, so a raw map
+	// delete would leave that snapshot still holding the entry and the
+	// rehydration this test exists to exercise would be skipped entirely.
 	key := ftsDocCacheKey{tenant: "fts-hydrate-test", table: table.Name, cols: "0"}
-	ftsDocCacheMu.Lock()
-	delete(ftsDocCache, key)
-	ftsDocCacheMu.Unlock()
+	deleteFTSDocCacheEntry(key)
 
 	hydrated := getFTSDocCache("fts-hydrate-test", table, []int{0})
 	if hydrated.docFreq("alpha") != 1 || hydrated.docFreq("beta") != 1 {

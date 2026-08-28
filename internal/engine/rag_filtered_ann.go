@@ -134,8 +134,8 @@ func (idx *vecHNSWIndex) searchFiltered(ctx context.Context, query []float64, qu
 		pushTopK(result, sr.rowIdx, sr.distance, k)
 	}
 	if result.Len() < k {
-		distFn := buildVecDistanceFunc(idx.metric, query, queryNorm, cache)
-		return ragVecTopKAllowed(ctx, allowed.rows, len(query), k, cache, distFn)
+		distFn := buildVecDistanceFunc(idx.metric, query, queryNorm)
+		return ragVecTopKAllowed(ctx, allowed.rows, len(query), k, cache, distFn, vecDistanceFuncNeedsNorm(idx.metric))
 	}
 	return topKFromHeap(result, k), nil
 }

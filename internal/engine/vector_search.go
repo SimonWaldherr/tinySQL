@@ -33,6 +33,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -310,6 +311,38 @@ func (c vecSearchColumnCacheEntry) normAt(row int) float64 {
 	return segment.norms[row-segment.start]
 }
 
+// resolveRow resolves row's validity, vector, and (when needNorm is set) its
+// norm with a single override/segment lookup. validAt/vector/normAt each
+// redo the same overrides-map probe and segmentFor binary search
+// independently, so a caller that needs all three for the same row — the
+// flat-scan hot loops in vecSearchTopKRange/ragVecTopKAllowedRange — used to
+// pay for that lookup three times per row, plus a fourth time inside the
+// cosine distFn closure (which used to call cache.validAt/cache.normAt
+// itself). needNorm lets a non-cosine caller skip norm resolution entirely,
+// since its distance function never reads the value.
+func (c vecSearchColumnCacheEntry) resolveRow(row int, needNorm bool) (vec []float64, norm float64, valid bool) {
+	if override, ok := c.overrides[row]; ok {
+		if !needNorm {
+			return override.vector, 0, override.valid
+		}
+		return override.vector, override.norm, override.valid
+	}
+	segment := c.segmentFor(row)
+	if segment == nil {
+		return nil, 0, false
+	}
+	idx := row - segment.start
+	valid = segment.valid[idx]
+	vec = segment.vectors[idx]
+	if !needNorm || !valid {
+		return vec, 0, valid
+	}
+	if !c.normsReady || len(segment.norms) == 0 {
+		return vec, vectorL2Norm(vec), valid
+	}
+	return vec, segment.norms[idx], valid
+}
+
 type vecColumnBuildCall struct{ done chan struct{} }
 
 // vecColumnCacheMaxEntries bounds the column cache. Entries are keyed by
@@ -329,7 +362,38 @@ var (
 	// vector column. Without it, a RAG request burst can make every caller
 	// scan and normalize the whole column before any one cache entry wins.
 	vecSearchColumnBuilds = make(map[vecSearchColumnCacheKey]*vecColumnBuildCall)
+	// vecSearchColumnCacheSnapshot mirrors vecSearchColumnCache for lock-free
+	// reads — see publishVecSearchColumnCacheSnapshotLocked. A warm column
+	// cache hit is the overwhelmingly common case on every single
+	// VEC_SEARCH/RAG_SEARCH call, and used to pay an RLock/RUnlock pair on
+	// vecSearchColumnCacheMu just for that (the same rationale
+	// compileCachedLikeMatcher documents in like_cache.go for a per-row
+	// cache; this one is per-query rather than per-row, but every concurrent
+	// VEC_SEARCH/RAG_SEARCH call still contends on the same single mutex).
+	vecSearchColumnCacheSnapshot atomic.Pointer[map[vecSearchColumnCacheKey]vecSearchColumnCacheEntry]
 )
+
+func init() {
+	empty := make(map[vecSearchColumnCacheKey]vecSearchColumnCacheEntry)
+	vecSearchColumnCacheSnapshot.Store(&empty)
+}
+
+// publishVecSearchColumnCacheSnapshotLocked refreshes the lock-free snapshot
+// from the authoritative vecSearchColumnCache. Callers must already hold
+// vecSearchColumnCacheMu and must call this immediately after every mutation
+// of vecSearchColumnCache (insert or delete), so a lock-free reader can never
+// observe a snapshot older than what the mutex-protected map already
+// reflects — in particular, purgeVectorCachesFor's deletes must republish
+// too, or a lock-free reader could keep returning an already-dropped table's
+// entry forever. The map is capped at vecColumnCacheMaxEntries, so a full
+// copy here is cheap relative to the cache-miss rebuild that triggered it.
+func publishVecSearchColumnCacheSnapshotLocked() {
+	snap := make(map[vecSearchColumnCacheKey]vecSearchColumnCacheEntry, len(vecSearchColumnCache))
+	for k, v := range vecSearchColumnCache {
+		snap[k] = v
+	}
+	vecSearchColumnCacheSnapshot.Store(&snap)
+}
 
 // purgeVectorCachesFor eagerly drops all cached vector-search structures
 // (column cache, IVF and HNSW indexes) for one table, called from
@@ -343,6 +407,7 @@ func purgeVectorCachesFor(tenant, table string) {
 			delete(vecSearchColumnCache, k)
 		}
 	}
+	publishVecSearchColumnCacheSnapshotLocked()
 	vecSearchColumnCacheMu.Unlock()
 
 	vecIVFCacheMu.Lock()
@@ -351,6 +416,7 @@ func purgeVectorCachesFor(tenant, table string) {
 			delete(vecIVFCache, k)
 		}
 	}
+	publishVecIVFCacheSnapshotLocked()
 	vecIVFCacheMu.Unlock()
 
 	vecHNSWCacheMu.Lock()
@@ -377,6 +443,17 @@ func evictOverCap[K comparable, V any](m map[K]V, maxEntries int) {
 
 func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeNorms bool) vecSearchColumnCacheEntry {
 	key := vecSearchColumnCacheKey{tenant: tenant, table: table.Name, colIdx: colIdx}
+
+	// Lock-free fast path: entries are immutable once published (verified:
+	// buildVecColumnCache/extendVecColumnCache/mergeVecColumnSegments always
+	// allocate fresh segments/overrides rather than mutating a published
+	// entry in place), so a snapshot read without vecSearchColumnCacheMu is
+	// always safe — see publishVecSearchColumnCacheSnapshotLocked.
+	if snap := vecSearchColumnCacheSnapshot.Load(); snap != nil {
+		if cached, ok := (*snap)[key]; ok && cached.table == table && cached.version == table.Version && (!includeNorms || cached.normsReady) {
+			return cached
+		}
+	}
 
 	for {
 		vecSearchColumnCacheMu.RLock()
@@ -421,6 +498,7 @@ func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeN
 			evictOverCap(vecSearchColumnCache, vecColumnCacheMaxEntries)
 		}
 		vecSearchColumnCache[key] = entry
+		publishVecSearchColumnCacheSnapshotLocked()
 		delete(vecSearchColumnBuilds, key)
 		close(call.done)
 		vecSearchColumnCacheMu.Unlock()
@@ -688,34 +766,41 @@ func topKFromHeap(heapRows *vecScoredHeap, k int) []vecScoredRow {
 	return rows
 }
 
-type vecDistanceFunc func(vec []float64, rowIdx int) (float64, bool)
+// vecDistanceFunc computes a candidate row's ranking distance from the query
+// vector, given the row's already-resolved vector and (for metrics that need
+// one) its precomputed norm. Every caller resolves both through resolveRow
+// exactly once per row before invoking this, instead of this closure
+// re-resolving validity/norm itself as it used to for the cosine metric.
+type vecDistanceFunc func(vec []float64, norm float64) (float64, bool)
 
-func buildVecDistanceFunc(metric string, query []float64, queryNorm float64, cache vecSearchColumnCacheEntry) vecDistanceFunc {
+// vecDistanceFuncNeedsNorm reports whether metric's distance function reads
+// its norm argument, so a caller knows whether resolveRow needs to bother
+// resolving a row's norm at all.
+func vecDistanceFuncNeedsNorm(metric string) bool { return metric == "cosine" }
+
+func buildVecDistanceFunc(metric string, query []float64, queryNorm float64) vecDistanceFunc {
 	switch metric {
 	case "cosine":
 		if queryNorm == 0 {
-			return func([]float64, int) (float64, bool) { return 0, false }
+			return func([]float64, float64) (float64, bool) { return 0, false }
 		}
-		return func(vec []float64, rowIdx int) (float64, bool) {
-			if !cache.validAt(rowIdx) {
-				return 0, false
-			}
-			return vecCheckedDistance(metric, vec, query, cache.normAt(rowIdx), queryNorm)
+		return func(vec []float64, norm float64) (float64, bool) {
+			return vecCheckedDistance(metric, vec, query, norm, queryNorm)
 		}
 	case "l2":
-		return func(vec []float64, _ int) (float64, bool) {
+		return func(vec []float64, _ float64) (float64, bool) {
 			return vecCheckedDistance(metric, vec, query, 0, 0)
 		}
 	case "manhattan":
-		return func(vec []float64, _ int) (float64, bool) {
+		return func(vec []float64, _ float64) (float64, bool) {
 			return vecCheckedDistance(metric, vec, query, 0, 0)
 		}
 	case "dot":
-		return func(vec []float64, _ int) (float64, bool) {
+		return func(vec []float64, _ float64) (float64, bool) {
 			return vecCheckedDistance(metric, vec, query, 0, 0)
 		}
 	default:
-		return func([]float64, int) (float64, bool) { return 0, false }
+		return func([]float64, float64) (float64, bool) { return 0, false }
 	}
 }
 
@@ -757,10 +842,10 @@ func vecSearchWorkerCount(rows, dims int) int {
 	return workers
 }
 
-func vecSearchTopK(ctx context.Context, rows [][]any, queryLen int, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc) ([]vecScoredRow, error) {
+func vecSearchTopK(ctx context.Context, rows [][]any, queryLen int, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc, needNorm bool) ([]vecScoredRow, error) {
 	workers := vecSearchWorkerCount(len(rows), queryLen)
 	if workers == 1 {
-		h, err := vecSearchTopKRange(ctx, rows, 0, len(rows), queryLen, k, cache, distFn)
+		h, err := vecSearchTopKRange(ctx, rows, 0, len(rows), queryLen, k, cache, distFn, needNorm)
 		if err != nil {
 			return nil, err
 		}
@@ -797,7 +882,7 @@ func vecSearchTopK(ctx context.Context, rows [][]any, queryLen int, k int, cache
 					results[worker].err = fmt.Errorf("VEC_SEARCH: worker panic: %v", r)
 				}
 			}()
-			h, err := vecSearchTopKRange(ctx, rows, start, end, queryLen, k, cache, distFn)
+			h, err := vecSearchTopKRange(ctx, rows, start, end, queryLen, k, cache, distFn, needNorm)
 			results[worker] = workerResult{heapRows: h, err: err}
 		}(worker, start, end)
 	}
@@ -816,7 +901,7 @@ func vecSearchTopK(ctx context.Context, rows [][]any, queryLen int, k int, cache
 	return topKFromHeap(merged, k), nil
 }
 
-func vecSearchTopKRange(ctx context.Context, rows [][]any, start, end, queryLen, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc) (vecScoredHeap, error) {
+func vecSearchTopKRange(ctx context.Context, rows [][]any, start, end, queryLen, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc, needNorm bool) (vecScoredHeap, error) {
 	scoredRows := &vecScoredHeap{}
 
 	for i := start; i < end; i++ {
@@ -825,14 +910,11 @@ func vecSearchTopKRange(ctx context.Context, rows [][]any, start, end, queryLen,
 				return nil, err
 			}
 		}
-		if !cache.validAt(i) {
+		vec, norm, valid := cache.resolveRow(i, needNorm)
+		if !valid || len(vec) != queryLen {
 			continue
 		}
-		vec := cache.vector(i)
-		if len(vec) != queryLen {
-			continue
-		}
-		dist, ok := distFn(vec, i)
+		dist, ok := distFn(vec, norm)
 		if !ok {
 			continue
 		}
@@ -917,7 +999,7 @@ func vecSearchCandidates(ctx context.Context, env ExecEnv, a vecSearchArgs) (*st
 	}
 	if !cacheHit {
 		cache := getVecColumnCache(tenant, table, vecColIdx, a.metric == "cosine")
-		distFn := buildVecDistanceFunc(a.metric, a.queryVec, queryNorm, cache)
+		distFn := buildVecDistanceFunc(a.metric, a.queryVec, queryNorm)
 		scoredRowsOrdered, err = vecSearchTopKWithIndex(searchCtx, tenant, table, vecColIdx, a, queryLen, queryNorm, cache, distFn)
 		if err != nil {
 			return nil, nil, err

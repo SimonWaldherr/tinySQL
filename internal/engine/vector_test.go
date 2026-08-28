@@ -796,17 +796,21 @@ func TestVecSearchTopKWorkerPanicRecovered(t *testing.T) {
 		segment.vectors[i] = []float64{1, 0, 0, 0}
 		segment.valid[i] = true
 	}
-	cache := vecSearchColumnCacheEntry{rows: numRows, segments: []vecColumnSegment{segment}}
 	panicRow := numRows - 1 // falls in the last worker's chunk
-	distFn := func(_ []float64, rowIdx int) (float64, bool) {
-		if rowIdx == panicRow {
+	// distFn no longer receives a row index (see vecDistanceFunc/resolveRow),
+	// so the panic trigger is encoded in the vector itself: panicRow's vector
+	// is the only one with a negative first component.
+	segment.vectors[panicRow] = []float64{-1, 0, 0, 0}
+	cache := vecSearchColumnCacheEntry{rows: numRows, segments: []vecColumnSegment{segment}}
+	distFn := func(vec []float64, _ float64) (float64, bool) {
+		if vec[0] < 0 {
 			panic("synthetic distance panic for test")
 		}
-		return float64(rowIdx), true
+		return vec[0], true
 	}
 
 	fakeRows := make([][]any, numRows)
-	_, err := vecSearchTopK(context.Background(), fakeRows, dims, 5, cache, distFn)
+	_, err := vecSearchTopK(context.Background(), fakeRows, dims, 5, cache, distFn, false)
 	if err == nil {
 		t.Fatal("expected the worker panic to surface as an error; a nil error here means it either crashed the process or was silently swallowed")
 	}

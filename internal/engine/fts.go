@@ -47,6 +47,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -63,39 +64,110 @@ var ftsStopWords = map[string]bool{
 // ─────────────────────────── Tokenizer ───────────────────────────────────────
 
 // ftsTokenize splits text into lowercase tokens, removing stop words.
+//
+// The scan itself is delegated to ftsForEachToken, whose byte-wise delimiter
+// rule is equivalent to the rune-wise one this used to implement inline (both
+// treat every byte/rune outside [a-zA-Z0-9] as a delimiter, and every byte of a
+// multi-byte rune is >= 0x80 and therefore a delimiter either way) — see that
+// function's doc comment, which already records the equivalence.
+//
+// What that buys: the previous implementation unconditionally built a
+// punctuation-stripped, case-folded copy of the entire text through a
+// strings.Builder before it could call strings.Fields, so every row of a scalar
+// FTS_MATCH/FTS_RANK paid one full-length allocation plus a rune-decoding pass
+// over its text. ftsForEachToken yields tokens as substrings of its input and
+// allocates nothing, except that it folds case per token — so text containing
+// uppercase is lowercased once, up front, in a single byte-wise pass. Text that
+// is already lowercase (the normal case for a normalized corpus) now allocates
+// only the returned token slice.
 func ftsTokenize(text string) []string {
-	// Replace punctuation with spaces, lowercasing letters in the same pass
-	// instead of a second strings.ToLower over the whole result: only
-	// a-z/A-Z/0-9 ever survive this loop, so ToLower could only ever affect
-	// the A-Z case, which is folded in directly here.
-	var sb strings.Builder
-	sb.Grow(len(text))
-	for _, r := range text {
-		switch {
-		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
-			sb.WriteRune(r)
-		case r >= 'A' && r <= 'Z':
-			sb.WriteRune(r + ('a' - 'A'))
-		default:
-			sb.WriteRune(' ')
-		}
+	scan := text
+	if ftsHasASCIIUpper(text) {
+		scan = ftsToASCIILower(text)
 	}
-	raw := strings.Fields(sb.String())
-	out := raw[:0]
-	for _, w := range raw {
-		if !ftsStopWords[w] && len(w) > 1 {
-			out = append(out, ftsStem(w))
-		}
-	}
+	// Estimated from an average token-plus-delimiter width; append still grows
+	// the slice if a text runs shorter-worded than that. Six bytes per token is
+	// deliberately close to real English prose (a ~5-letter word plus its
+	// delimiter, before stop words are dropped) rather than generous: this slice
+	// is 16 bytes per element, so a loose estimate costs more memory than the
+	// whole-text copy this function no longer makes.
+	out := make([]string, 0, len(text)/6+8)
+	ftsForEachToken(scan, func(token string) bool {
+		out = append(out, token)
+		return true
+	})
 	return out
 }
 
-// ftsStem applies simple suffix-stripping stemming.
-func ftsStem(w string) string {
-	for _, suffix := range []string{"ing", "tion", "ed", "ly", "er", "est", "s"} {
-		if len(w) > len(suffix)+3 && strings.HasSuffix(w, suffix) {
-			return w[:len(w)-len(suffix)]
+// ftsHasASCIIUpper reports whether s contains an ASCII uppercase letter, i.e.
+// whether ftsToASCIILower would change anything.
+func ftsHasASCIIUpper(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			return true
 		}
+	}
+	return false
+}
+
+// ftsToASCIILower lowercases the ASCII letters in s, leaving every other byte
+// (including all bytes of multi-byte UTF-8 runes, which are >= 0x80) untouched.
+//
+// This deliberately matches what the FTS tokenizer has always done — the
+// original inline loop folded only 'A'-'Z', and ftsForEachToken folds only
+// 'A'-'Z' — rather than what strings.ToLower would do, so it must not be
+// reused anywhere a Unicode-aware fold is expected.
+func ftsToASCIILower(s string) string {
+	var sb strings.Builder
+	sb.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		sb.WriteByte(c)
+	}
+	return sb.String()
+}
+
+// ftsStem applies simple suffix-stripping stemming.
+//
+// The seven recognized suffixes each end in a distinct byte ("ing"→g,
+// "tion"→n, "ed"→d, "ly"→y, "er"→r, "est"→t, "s"→s), so switching on the
+// word's last byte narrows the check to exactly one candidate instead of
+// running up to seven strings.HasSuffix calls. Because the candidates are
+// mutually exclusive, dropping the original loop's first-match-wins ordering
+// cannot change which suffix is stripped. The shortest strippable form is
+// len(suffix)+4 bytes (5, for "s"), so anything shorter exits immediately.
+//
+// This runs once per token of every indexed document and once per token of
+// every row a scalar FTS_MATCH/FTS_RANK touches, which makes it one of the
+// hottest functions in the whole FTS path.
+func ftsStem(w string) string {
+	if len(w) < 5 {
+		return w
+	}
+	var suffix string
+	switch w[len(w)-1] {
+	case 'g':
+		suffix = "ing"
+	case 'n':
+		suffix = "tion"
+	case 'd':
+		suffix = "ed"
+	case 'y':
+		suffix = "ly"
+	case 'r':
+		suffix = "er"
+	case 't':
+		suffix = "est"
+	case 's':
+		suffix = "s"
+	default:
+		return w
+	}
+	if len(w) > len(suffix)+3 && strings.HasSuffix(w, suffix) {
+		return w[:len(w)-len(suffix)]
 	}
 	return w
 }
@@ -350,6 +422,23 @@ type ftsQueryNode struct {
 	// means the term is absent from the corpus.
 	termID   int32   // TERM
 	termIDNs []int32 // PHRASE / EXPANDED, parallel to phrase
+
+	// orTerms caches this tree's ftsLiteralORTerms decomposition, filled once by
+	// ftsParseQuery on the root it is about to return. orTermsComputed records
+	// that the decomposition was attempted, so a false orTermsOK on a parse-time
+	// root means "definitively not a literal OR tree" rather than "unknown".
+	//
+	// The scalar FTS_MATCH/FTS_RANK path tests this per row. Walking the tree
+	// there instead would allocate a fresh term slice on every row (each OR
+	// level appends its two sides into a new array), which would cancel out much
+	// of what the allocation-free scan it selects is worth.
+	//
+	// Filled before the node is published to the query cache, so this never
+	// mutates a shared tree — the invariant ftsBindIDF's doc comment relies on.
+	// Read-only afterward: callers must never append to the returned slice.
+	orTermsComputed bool
+	orTermsOK       bool
+	orTerms         []string
 }
 
 type ftsWildcardAtom struct {
@@ -379,6 +468,13 @@ func ftsParseQuery(query string) *ftsQueryNode {
 		return nil
 	}
 	node, _ := ftsParseOr(tokens, 0)
+	if node != nil {
+		// Decompose once here, while the tree is still private to this call, so
+		// the per-row scalar path can consult it without allocating. See
+		// ftsQueryNode.orTerms.
+		node.orTerms, node.orTermsOK = ftsLiteralORTerms(node)
+		node.orTermsComputed = true
+	}
 	return node
 }
 
@@ -722,6 +818,21 @@ func ftsLiteralORTerms(node *ftsQueryNode) ([]string, bool) {
 	}
 }
 
+// ftsRootLiteralORTerms returns the literal-OR decomposition precomputed by
+// ftsParseQuery for a tree root, without re-walking (and re-allocating) it.
+//
+// Only valid for a root obtained from ftsParseQuery/parseCachedFTSQuery: a node
+// synthesized elsewhere (ftsExpandQuery, ftsBindIDF) has no decomposition
+// recorded, and reports false here rather than being silently treated as "not
+// an OR tree". Callers must treat the returned slice as read-only — it is
+// shared by every caller holding the same cached tree.
+func ftsRootLiteralORTerms(node *ftsQueryNode) ([]string, bool) {
+	if node == nil || !node.orTermsComputed {
+		return nil, false
+	}
+	return node.orTerms, node.orTermsOK
+}
+
 // ftsAnyLiteralTermMatch scans the same ASCII-token language as ftsTokenize,
 // but never allocates a token slice or frequency map. The scanner is used only
 // for literal OR queries, where seeing one matching token decides the result.
@@ -790,7 +901,18 @@ func ftsASCIITokenByte(c byte) bool {
 // execution and can safely reuse it for every row.
 func ftsLiteralTermsRank(text string, terms []string, counts []int) float64 {
 	clear(counts)
-	ftsForEachToken(text, func(token string) bool {
+	// Unlike ftsAnyLiteralTermMatch, which stops at the first hit, this must
+	// visit every token to find the maximum term frequency. ftsForEachToken
+	// folds case per token, so over a full pass it allocates one small string
+	// for every capitalized word in the document — measured at 84 allocations
+	// for a single paragraph of ordinary mixed-case prose. Folding the whole
+	// text once up front collapses that to one allocation (and none at all for
+	// an already-lowercase corpus), the same trade ftsTokenize makes.
+	scan := text
+	if ftsHasASCIIUpper(text) {
+		scan = ftsToASCIILower(text)
+	}
+	ftsForEachToken(scan, func(token string) bool {
 		for i, term := range terms {
 			if token == term {
 				counts[i]++
@@ -999,15 +1121,29 @@ func evalFTSMatch(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	text := ftsValueToString(textVal)
 	query := ftsValueToString(queryVal)
 
+	// Parse before touching the text. The parse is cached, and a query that
+	// yields no tree matches nothing, so tokenizing first meant every row of a
+	// scan paid for a token slice and frequency map that were then thrown away.
+	node := parseCachedFTSQuery(query)
+	if node == nil {
+		return false, nil
+	}
+	// A tree of TERMs joined only by OR — the shape ftsAutoOrExpand produces for
+	// every natural-language RAG question — matches iff any token equals any
+	// term, which ftsAnyLiteralTermMatch decides in one allocation-free pass.
+	// ftsMatchNode would reach the identical verdict (TERM is freq[term] > 0, OR
+	// is left||right) after building a token slice and a frequency map for the
+	// whole text. exec_raw_filter.go already takes this path for a literal WHERE
+	// FTS_MATCH it owns; doing it here covers every other position the function
+	// can appear in — a SELECT list, a CASE, a WHERE over a join result.
+	if terms, ok := ftsRootLiteralORTerms(node); ok {
+		return ftsAnyLiteralTermMatch(text, terms), nil
+	}
+
 	tokens := ftsTokenize(text)
 	freq := make(map[string]int, len(tokens))
 	for _, t := range tokens {
 		freq[t]++
-	}
-
-	node := parseCachedFTSQuery(query)
-	if node == nil {
-		return false, nil
 	}
 	return ftsMatchNode(node, freq, tokens), nil
 }
@@ -1031,6 +1167,22 @@ func evalFTSRank(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	text := ftsValueToString(textVal)
 	query := ftsValueToString(queryVal)
 
+	// Parsed first for the same reason as in evalFTSMatch: the parse is cached,
+	// and an unparseable query scores 0 regardless of the text.
+	node := parseCachedFTSQuery(query)
+	if node == nil {
+		return 0.0, nil
+	}
+	// ftsLiteralTermsRank reproduces ftsScoreNode's arithmetic for a TERM/OR
+	// tree exactly — OR takes the maximum of its branches, and the per-term
+	// score is monotonic in term frequency, so the tree's score is the score of
+	// the most frequent term — in one pass, with no token slice and no
+	// frequency map. A text with no tokens leaves every count at 0 and yields
+	// 0, matching the early return the slow path takes below.
+	if terms, ok := ftsRootLiteralORTerms(node); ok {
+		return ftsLiteralTermsRank(text, terms, make([]int, len(terms))), nil
+	}
+
 	tokens := ftsTokenize(text)
 	if len(tokens) == 0 {
 		return 0.0, nil
@@ -1039,11 +1191,6 @@ func evalFTSRank(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	freq := make(map[string]int, len(tokens))
 	for _, t := range tokens {
 		freq[t]++
-	}
-
-	node := parseCachedFTSQuery(query)
-	if node == nil {
-		return 0.0, nil
 	}
 	// Use normalized doc length of 1.0 (standalone, no corpus avgdl to
 	// normalize against) and no IDF weighting (no corpus to compute it from).
@@ -1262,6 +1409,16 @@ type ftsDocCacheBuildCall struct{ done chan struct{} }
 var (
 	ftsDocCacheMu sync.RWMutex
 	ftsDocCache   = make(map[ftsDocCacheKey]ftsDocCacheEntry)
+	// ftsDocCacheSnapshot mirrors ftsDocCache for lock-free reads, mirroring
+	// ftsPreparedQueryCacheSnapshot (fts_query_plan_cache.go) and
+	// vecSearchColumnCacheSnapshot (vector_search.go). Together with the prepared
+	// query plan cache this removes both of the RWMutex reads every hybrid RAG
+	// question used to take before any actual retrieval work began.
+	//
+	// As with those caches, the mutex was never what made a cached entry valid —
+	// the table-pointer and Version comparison against the entry is, and the
+	// lock-free path performs it identically. Only the map lookup changes.
+	ftsDocCacheSnapshot atomic.Pointer[map[ftsDocCacheKey]ftsDocCacheEntry]
 	// ftsDocCacheBuilds coalesces concurrent cold reads for the same
 	// tokenized document set. Without it, a request burst can make every
 	// caller tokenize the whole corpus before one cache entry wins.
@@ -1287,8 +1444,39 @@ func purgeFTSCachesFor(tenant, table string) {
 			delete(ftsDocCache, k)
 		}
 	}
+	publishFTSDocCacheSnapshotLocked()
 	ftsDocCacheMu.Unlock()
 	purgeFTSPreparedQueryCachesFor(tenant, table)
+}
+
+func init() {
+	empty := make(map[ftsDocCacheKey]ftsDocCacheEntry)
+	ftsDocCacheSnapshot.Store(&empty)
+}
+
+// publishFTSDocCacheSnapshotLocked refreshes the lock-free snapshot from the
+// authoritative ftsDocCache. Callers must hold ftsDocCacheMu and must call this
+// after every mutation, insert and delete alike — a delete that skipped it
+// would leave the lock-free fast path serving a purged table's tokenized
+// corpus. Bounded by ftsDocCacheMaxEntries, so the copy is negligible next to
+// the corpus tokenization that produced the entry.
+func publishFTSDocCacheSnapshotLocked() {
+	snap := make(map[ftsDocCacheKey]ftsDocCacheEntry, len(ftsDocCache))
+	for k, v := range ftsDocCache {
+		snap[k] = v
+	}
+	ftsDocCacheSnapshot.Store(&snap)
+}
+
+// deleteFTSDocCacheEntry removes one tokenized-document cache entry, keeping
+// the lock-free snapshot in step. Tests use it to force the next FTS_SEARCH to
+// rebuild or rehydrate; deleting straight out of the map would leave the
+// snapshot still serving the entry, so the rebuild under test would never run.
+func deleteFTSDocCacheEntry(key ftsDocCacheKey) {
+	ftsDocCacheMu.Lock()
+	delete(ftsDocCache, key)
+	publishFTSDocCacheSnapshotLocked()
+	ftsDocCacheMu.Unlock()
 }
 
 func ftsColsCacheKey(cols []int) string {
@@ -1606,6 +1794,16 @@ func ftsExtendPersistent(table *storage.Table, cols []int, index *storage.FTSInd
 func getFTSDocCache(tenant string, table *storage.Table, cols []int) ftsDocCacheEntry {
 	key := ftsDocCacheKey{tenant: tenant, table: table.Name, cols: ftsColsCacheKey(cols)}
 
+	// Lock-free fast path for the warm, unchanged corpus — the common case on
+	// every repeated question. A miss (or a stale entry) falls through to the
+	// locked path below, whose build-coalescing and persistent-index logic is
+	// untouched. See publishFTSDocCacheSnapshotLocked.
+	if snap := ftsDocCacheSnapshot.Load(); snap != nil {
+		if e, ok := (*snap)[key]; ok && e.table == table && e.version == table.Version {
+			return e
+		}
+	}
+
 	var call *ftsDocCacheBuildCall
 	for {
 		ftsDocCacheMu.RLock()
@@ -1689,6 +1887,7 @@ func getFTSDocCache(tenant string, table *storage.Table, cols []int) ftsDocCache
 		evictOverCap(ftsDocCache, ftsDocCacheMaxEntries)
 	}
 	ftsDocCache[key] = entry
+	publishFTSDocCacheSnapshotLocked()
 	delete(ftsDocCacheBuilds, key)
 	close(call.done)
 	published = true
