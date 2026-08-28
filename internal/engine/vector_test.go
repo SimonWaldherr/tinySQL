@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SimonWaldherr/tinySQL/internal/engine/search"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
@@ -195,8 +196,8 @@ func TestVecDotLargeVectorKernel(t *testing.T) {
 		b[i] = math.Cos(float64(i) * 0.07)
 		want += a[i] * b[i]
 	}
-	expectFloat(t, vectorDot(a, b), want, 1e-9, "large vector dot kernel")
-	if vectorMathBackend == "" {
+	expectFloat(t, search.VectorDot(a, b), want, 1e-9, "large vector dot kernel")
+	if search.VectorMathBackend == "" {
 		t.Fatal("vector math backend must be named")
 	}
 }
@@ -211,10 +212,10 @@ func TestVecL2SquaredLargeVectorKernel(t *testing.T) {
 		d := a[i] - b[i]
 		want += d * d
 	}
-	expectFloat(t, vectorL2Squared(a, b), want, 1e-9, "large vector l2 kernel")
+	expectFloat(t, search.VectorL2Squared(a, b), want, 1e-9, "large vector l2 kernel")
 }
 
-// TestVecL1LargeVectorKernel exercises vectorL1Distance above the SIMD
+// TestVecL1LargeVectorKernel exercises search.VectorL1Distance above the SIMD
 // threshold (128 elements) so it actually dispatches to vectorL1Kernel
 // (SSE2 on amd64) rather than the portable unrolled fallback, checked
 // against a plain, unoptimized reference sum computed independently here.
@@ -227,7 +228,7 @@ func TestVecL1LargeVectorKernel(t *testing.T) {
 		b[i] = math.Cos(float64(i)*0.05) * 0.5
 		want += math.Abs(a[i] - b[i])
 	}
-	expectFloat(t, vectorL1Distance(a, b), want, 1e-9, "large vector l1 kernel")
+	expectFloat(t, search.VectorL1Distance(a, b), want, 1e-9, "large vector l1 kernel")
 }
 
 // TestVecL1KernelMatchesUnrolledAcrossSizes checks the SIMD kernel and the
@@ -242,8 +243,8 @@ func TestVecL1KernelMatchesUnrolledAcrossSizes(t *testing.T) {
 			a[i] = math.Sin(float64(i)*0.31) * 2.0
 			b[i] = math.Cos(float64(i)*0.19) * 1.5
 		}
-		got := vectorL1Distance(a, b)
-		want := vectorL1Unrolled(a, b)
+		got := search.VectorL1Distance(a, b)
+		want := search.VectorL1Unrolled(a, b)
 		if math.Abs(got-want) > 1e-9 {
 			t.Errorf("n=%d: kernel=%v unrolled=%v (diff %v)", n, got, want, got-want)
 		}
@@ -263,13 +264,13 @@ func TestVecDotKernelMatchesUnrolledAcrossSizes(t *testing.T) {
 			a[i] = math.Sin(float64(i)*0.23) * 1.5
 			b[i] = math.Cos(float64(i)*0.29) * 0.8
 		}
-		got := vectorDot(a, b)
-		want := vectorDotUnrolled(a, b)
+		got := search.VectorDot(a, b)
+		want := search.VectorDotUnrolled(a, b)
 		if math.Abs(got-want) > 1e-9 {
 			t.Errorf("dot n=%d: kernel=%v unrolled=%v (diff %v)", n, got, want, got-want)
 		}
-		got = vectorL2Squared(a, b)
-		want = vectorL2SquaredUnrolled(a, b)
+		got = search.VectorL2Squared(a, b)
+		want = search.VectorL2SquaredUnrolled(a, b)
 		if math.Abs(got-want) > 1e-9 {
 			t.Errorf("l2 n=%d: kernel=%v unrolled=%v (diff %v)", n, got, want, got-want)
 		}
@@ -287,8 +288,8 @@ func TestVecCosineKernelMatchesUnrolledAcrossSizes(t *testing.T) {
 			a[i] = math.Sin(float64(i)*0.37) * 1.2
 			b[i] = math.Cos(float64(i)*0.41) * 0.9
 		}
-		gd, gna, gnb := vectorCosineParts(a, b)
-		wd, wna, wnb := vectorCosineUnrolled(a, b)
+		gd, gna, gnb := search.VectorCosineParts(a, b)
+		wd, wna, wnb := search.VectorCosineUnrolled(a, b)
 		if math.Abs(gd-wd) > 1e-9 || math.Abs(gna-wna) > 1e-9 || math.Abs(gnb-wnb) > 1e-9 {
 			t.Errorf("cosine n=%d: kernel=(%v,%v,%v) unrolled=(%v,%v,%v)", n, gd, gna, gnb, wd, wna, wnb)
 		}

@@ -36,6 +36,8 @@ import (
 	"math/rand"
 	"strings"
 	"time"
+
+	"github.com/SimonWaldherr/tinySQL/internal/engine/search"
 )
 
 // ---------------------------------------------------------------------------
@@ -335,7 +337,7 @@ func evalVecDot(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if len(a) != len(b) {
 		return nil, fmt.Errorf("VEC_DOT: dimension mismatch %d vs %d", len(a), len(b))
 	}
-	return vectorDot(a, b), nil
+	return search.VectorDot(a, b), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -365,7 +367,7 @@ func cosineSimilarity(a, b []float64) (float64, error) {
 	if len(a) != len(b) {
 		return 0, fmt.Errorf("dimension mismatch %d vs %d", len(a), len(b))
 	}
-	dot, normA2, normB2 := vectorCosineParts(a, b)
+	dot, normA2, normB2 := search.VectorCosineParts(a, b)
 	denom := math.Sqrt(normA2) * math.Sqrt(normB2)
 	if denom == 0 {
 		return 0, fmt.Errorf("zero-length vector")
@@ -415,7 +417,7 @@ func evalVecL2Distance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if len(a) != len(b) {
 		return nil, fmt.Errorf("VEC_L2_DISTANCE: dimension mismatch %d vs %d", len(a), len(b))
 	}
-	return math.Sqrt(vectorL2Squared(a, b)), nil
+	return math.Sqrt(search.VectorL2Squared(a, b)), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -437,7 +439,7 @@ func evalVecManhattanDistance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if len(a) != len(b) {
 		return nil, fmt.Errorf("VEC_MANHATTAN_DISTANCE: dimension mismatch %d vs %d", len(a), len(b))
 	}
-	return vectorL1Distance(a, b), nil
+	return search.VectorL1Distance(a, b), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -487,12 +489,12 @@ func evalVecDistance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		}
 		return 1.0 - sim, nil
 	case "l2", "euclidean":
-		return math.Sqrt(vectorL2Squared(a, b)), nil
+		return math.Sqrt(search.VectorL2Squared(a, b)), nil
 	case "manhattan", "l1":
-		return vectorL1Distance(a, b), nil
+		return search.VectorL1Distance(a, b), nil
 	case "dot", "inner_product":
 		// For distance: lower = more similar, so negate dot product
-		return -vectorDot(a, b), nil
+		return -search.VectorDot(a, b), nil
 	default:
 		return nil, fmt.Errorf("VEC_DISTANCE: unknown metric %q (supported: cosine, l2, manhattan, dot)", metric)
 	}
@@ -859,7 +861,7 @@ func evalVecQuantize(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	out := make([]float64, len(vec))
 	// Quantize: normalize to [0,1], scale to levels, round, scale back. Each
 	// element is independent (no cross-element state), so this is a clean
-	// 4-way unroll (same style as vectorL1Unrolled in vector_math.go) unlike
+	// 4-way unroll (same style as search.VectorL1Unrolled in vector_math.go) unlike
 	// the min/max search above, whose running-min/running-max tracking is a
 	// data-dependent reduction that doesn't unroll cleanly.
 	i := 0
@@ -1069,7 +1071,7 @@ func evalVecBinaryQuantize(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	}
 	out := make([]float64, len(vec))
 	// Each element maps independently to 0/1, so this is a clean 4-way
-	// unroll (same style as vectorL1Unrolled in vector_math.go).
+	// unroll (same style as search.VectorL1Unrolled in vector_math.go).
 	i := 0
 	for ; i+3 < len(vec); i += 4 {
 		if vec[i] > 0 {
@@ -1116,7 +1118,7 @@ func evalVecHammingDistance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if len(a) != len(b) {
 		return nil, fmt.Errorf("VEC_HAMMING_DISTANCE: dimension mismatch %d vs %d", len(a), len(b))
 	}
-	return vectorHammingDistance(a, b), nil
+	return search.VectorHammingDistance(a, b), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1142,7 +1144,7 @@ func evalVecCentroid(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	dim := len(vecs[0])
 	out := make([]float64, dim)
 	for _, v := range vecs {
-		vectorAccumulateUnrolled(out, v)
+		search.VectorAccumulateUnrolled(out, v)
 	}
 	n := float64(len(vecs))
 	for i := range out {

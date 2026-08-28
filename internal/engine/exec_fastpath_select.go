@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/SimonWaldherr/tinySQL/internal/engine/search"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
@@ -292,7 +293,7 @@ func simpleFloatOrderScorer(plan *simpleSelectPlan) (rawFloatScorer, bool) {
 			}
 			switch name {
 			case "VEC_DOT":
-				return vectorDot(vec, queryVec), nil
+				return search.VectorDot(vec, queryVec), nil
 			case "VEC_COSINE_SIMILARITY", "VEC_COSINE_DISTANCE":
 				sim, err := cosineSimilarity(vec, queryVec)
 				if err != nil {
@@ -303,9 +304,9 @@ func simpleFloatOrderScorer(plan *simpleSelectPlan) (rawFloatScorer, bool) {
 				}
 				return sim, nil
 			case "VEC_L2_DISTANCE":
-				return math.Sqrt(vectorL2Squared(vec, queryVec)), nil
+				return math.Sqrt(search.VectorL2Squared(vec, queryVec)), nil
 			case "VEC_MANHATTAN_DISTANCE":
-				return vectorL1Distance(vec, queryVec), nil
+				return search.VectorL1Distance(vec, queryVec), nil
 			default:
 				count := 0
 				for i, positive := range queryPositive {

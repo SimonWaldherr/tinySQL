@@ -36,6 +36,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/SimonWaldherr/tinySQL/internal/engine/search"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
@@ -720,7 +721,7 @@ func mergeTwoVecColumnSegments(left, right vecColumnSegment, normsReady bool) ve
 }
 
 func vectorL2Norm(v []float64) float64 {
-	return math.Sqrt(vectorDot(v, v))
+	return math.Sqrt(search.VectorDot(v, v))
 }
 
 func pushTopK(heapRows *vecScoredHeap, rowIdx int, distance float64, k int) {
@@ -804,20 +805,20 @@ func buildVecDistanceFunc(metric string, query []float64, queryNorm float64) vec
 	}
 }
 
-// vecCheckedDistance wraps vectorRankingDistance with a NaN guard. A NaN or
+// vecCheckedDistance wraps search.VectorRankingDistance with a NaN guard. A NaN or
 // Inf-derived-NaN vector component (e.g. dividing by a zero-ish norm that
 // underflowed, or a NaN stored via a non-SQL insertion path) can produce a
-// NaN distance even though vectorDistance's own "ok" contract only rejects
+// NaN distance even though search.VectorDistance's own "ok" contract only rejects
 // dimension mismatches and zero-norm vectors. Treat a NaN result the same as
 // any other invalid-row case (ok=false) so it is excluded from top-k
 // consideration instead of poisoning the heap (see pushTopK).
 //
-// Returns a ranking-only distance (see vectorRankingDistance) — every caller
+// Returns a ranking-only distance (see search.VectorRankingDistance) — every caller
 // of buildVecDistanceFunc's returned closure funnels into
 // vecSearchTopKWithIndex, which finalizes the small top-k result once
 // instead of every candidate paying for it during the scan.
 func vecCheckedDistance(metric string, a, b []float64, normA, normB float64) (float64, bool) {
-	dist, ok := vectorRankingDistance(metric, a, b, normA, normB)
+	dist, ok := search.VectorRankingDistance(metric, a, b, normA, normB)
 	if !ok || math.IsNaN(dist) {
 		return 0, false
 	}
@@ -1093,7 +1094,7 @@ func computeDistance(a, b []float64, metric string) (float64, error) {
 		normA = vectorL2Norm(a)
 		normB = vectorL2Norm(b)
 	}
-	dist, ok := vectorDistance(normalized, a, b, normA, normB)
+	dist, ok := search.VectorDistance(normalized, a, b, normA, normB)
 	if !ok {
 		if normalized == "cosine" && len(a) == len(b) && (normA == 0 || normB == 0) {
 			return 0, fmt.Errorf("zero-length vector")

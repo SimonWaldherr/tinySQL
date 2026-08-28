@@ -1,4 +1,4 @@
-package engine
+package search
 
 import (
 	"math/rand"
@@ -6,7 +6,7 @@ import (
 )
 
 // naiveHamming is the trivial (non-unrolled) reference implementation of
-// Hamming distance, used to cross-check vectorHammingUnrolled.
+// Hamming distance, used to cross-check VectorHammingUnrolled.
 func naiveHamming(a, b []float64) int {
 	n := len(a)
 	if len(b) < n {
@@ -24,7 +24,7 @@ func naiveHamming(a, b []float64) int {
 }
 
 // naiveAccumulate is the trivial (non-unrolled) reference implementation of
-// element-wise accumulation, used to cross-check vectorAccumulateUnrolled.
+// element-wise accumulation, used to cross-check VectorAccumulateUnrolled.
 func naiveAccumulate(dst, src []float64) {
 	for i := range dst {
 		dst[i] += src[i]
@@ -47,15 +47,15 @@ func TestVecHammingUnrolledMatchesNaive(t *testing.T) {
 			for name, ab := range cases {
 				a, b := ab[0], ab[1]
 				want := naiveHamming(a, b)
-				got := vectorHammingUnrolled(a, b)
+				got := VectorHammingUnrolled(a, b)
 				if got != want {
-					t.Errorf("case %s size %d: vectorHammingUnrolled=%d naiveHamming=%d", name, n, got, want)
+					t.Errorf("case %s size %d: VectorHammingUnrolled=%d naiveHamming=%d", name, n, got, want)
 				}
-				// vectorHammingDistance also clamps to min length; verify the
+				// VectorHammingDistance also clamps to min length; verify the
 				// public entry point too.
-				gotPublic := vectorHammingDistance(a, b)
+				gotPublic := VectorHammingDistance(a, b)
 				if gotPublic != want {
-					t.Errorf("case %s size %d: vectorHammingDistance=%d want=%d", name, n, gotPublic, want)
+					t.Errorf("case %s size %d: VectorHammingDistance=%d want=%d", name, n, gotPublic, want)
 				}
 			}
 		})
@@ -66,7 +66,7 @@ func TestVecHammingUnrolledMismatchedLengths(t *testing.T) {
 	a := pattern(10, 1)
 	b := pattern(6, 1)
 	want := naiveHamming(a, b)
-	got := vectorHammingDistance(a, b)
+	got := VectorHammingDistance(a, b)
 	if got != want {
 		t.Errorf("mismatched lengths: got=%d want=%d", got, want)
 	}
@@ -89,7 +89,7 @@ func TestVecCentroidAccumulateMatchesNaive(t *testing.T) {
 				copy(dstGot, dstWant)
 
 				naiveAccumulate(dstWant, src)
-				vectorAccumulateUnrolled(dstGot, src)
+				VectorAccumulateUnrolled(dstGot, src)
 
 				for i := range dstWant {
 					if dstGot[i] != dstWant[i] {

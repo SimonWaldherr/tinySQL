@@ -1,6 +1,6 @@
 //go:build amd64
 
-package engine
+package search
 
 // x86cpuid and x86xgetbv are implemented in vector_math_amd64.s. They exist
 // so AVX2/FMA detection needs no external dependency (golang.org/x/sys/cpu
@@ -45,7 +45,7 @@ func detectAVX2FMA() bool {
 // perfectly predicted and effectively free.
 var vectorUseAVX2 = detectAVX2FMA()
 
-var vectorMathBackend = func() string {
+var VectorMathBackend = func() string {
 	if vectorUseAVX2 {
 		return "amd64-avx2-fma"
 	}

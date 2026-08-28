@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/SimonWaldherr/tinySQL/internal/engine/search"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
@@ -256,7 +257,7 @@ func normalizeVecIndexMode(mode string) string {
 
 // vecSearchTopKWithIndex is the single choke point every index mode's
 // search funnels through before a result ever reaches a caller. Internally,
-// flat/IVF/HNSW all rank candidates using vectorRankingDistance (skipping
+// flat/IVF/HNSW all rank candidates using search.VectorRankingDistance (skipping
 // l2's sqrt until it's actually needed); finalizeVecScoredRows converts the
 // (at most k) surviving rows back to real distances exactly once here,
 // rather than every candidate the scan/traversal considered paying for it.
@@ -300,9 +301,9 @@ func vecSearchTopKWithIndex(
 }
 
 // finalizeVecScoredRows converts every row's ranking-only distance (see
-// vectorRankingDistance) into the real distance vectorDistance would have
+// search.VectorRankingDistance) into the real distance search.VectorDistance would have
 // returned, in place. Cheap to call unconditionally: for every metric
-// except l2 vectorFinalizeDistance is already a no-op, and rows is bounded
+// except l2 search.VectorFinalizeDistance is already a no-op, and rows is bounded
 // to k (or fewer) entries regardless of how many candidates the scan or
 // graph traversal that produced it considered.
 func finalizeVecScoredRows(metric string, rows []vecScoredRow) {
@@ -310,7 +311,7 @@ func finalizeVecScoredRows(metric string, rows []vecScoredRow) {
 		return
 	}
 	for i := range rows {
-		rows[i].distance = vectorFinalizeDistance(metric, rows[i].distance)
+		rows[i].distance = search.VectorFinalizeDistance(metric, rows[i].distance)
 	}
 }
 
@@ -402,7 +403,7 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 			assignments[i] = c
 			counts[c]++
 			base := c * dims
-			vectorAccumulateUnrolled(sums[base:base+dims], cache.vector(rowIdx))
+			search.VectorAccumulateUnrolled(sums[base:base+dims], cache.vector(rowIdx))
 		}
 		for c := range idx.centroids {
 			// A centroid can end up with zero assigned rows this iteration
@@ -442,7 +443,7 @@ func (idx *vecIVFIndex) search(ctx context.Context, query []float64, queryNorm f
 		// Selecting which centroids to probe, not a value ever exposed to a
 		// caller — ranking-only distance is enough (see rowDistance below
 		// for the row-level equivalent).
-		dist, ok := vectorRankingDistance(idx.metric, c, query, idx.centroidNorms[i], queryNorm)
+		dist, ok := search.VectorRankingDistance(idx.metric, c, query, idx.centroidNorms[i], queryNorm)
 		if !ok {
 			continue
 		}
@@ -1031,7 +1032,7 @@ func rowNormFor(metric string, cache vecSearchColumnCacheEntry, rowIdx int) floa
 	return rowNorm(cache, rowIdx)
 }
 
-// rowDistance returns a ranking-only distance (see vectorRankingDistance):
+// rowDistance returns a ranking-only distance (see search.VectorRankingDistance):
 // every call site is internal graph/list traversal, never a value exposed
 // directly to a caller without first passing through
 // vecSearchTopKWithIndex's finalize step.
@@ -1039,7 +1040,7 @@ func rowDistance(metric string, query []float64, queryNorm float64, cache vecSea
 	if rowIdx < 0 || rowIdx >= cache.rowCount() || !cache.validAt(rowIdx) {
 		return 0, false
 	}
-	return vectorRankingDistance(metric, cache.vector(rowIdx), query, rowNormFor(metric, cache, rowIdx), queryNorm)
+	return search.VectorRankingDistance(metric, cache.vector(rowIdx), query, rowNormFor(metric, cache, rowIdx), queryNorm)
 }
 
 func centroidNorms(centroids [][]float64) []float64 {
@@ -1053,7 +1054,7 @@ func centroidNorms(centroids [][]float64) []float64 {
 // centroidNormsFor is centroidNorms gated by metricNeedsNorms: idx.centroidNorms
 // is indexed unconditionally by nearestCentroid/search (idx.centroidNorms[i]),
 // so it must always have one entry per centroid, but only cosine ever reads
-// the values — l2/manhattan/dot ignore normA/normB entirely (vectorDistance).
+// the values — l2/manhattan/dot ignore normA/normB entirely (search.VectorDistance).
 // Returning a zero-filled slice of the same length for those metrics skips
 // vectorL2Norm's sqrt per centroid per k-means iteration for no behavior
 // change, mirroring rowNormFor's same gating for per-row norms.
@@ -1065,12 +1066,12 @@ func centroidNormsFor(metric string, centroids [][]float64) []float64 {
 }
 
 // nearestCentroid only ever returns an index, never the distance itself, so
-// it uses the cheaper ranking-only distance (see vectorRankingDistance).
+// it uses the cheaper ranking-only distance (see search.VectorRankingDistance).
 func nearestCentroid(metric string, vec []float64, vecNorm float64, centroids [][]float64, norms []float64) int {
 	best := 0
 	bestDist := math.MaxFloat64
 	for i, c := range centroids {
-		dist, ok := vectorRankingDistance(metric, c, vec, norms[i], vecNorm)
+		dist, ok := search.VectorRankingDistance(metric, c, vec, norms[i], vecNorm)
 		if !ok {
 			continue
 		}

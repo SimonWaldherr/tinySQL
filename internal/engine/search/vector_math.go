@@ -1,8 +1,8 @@
-package engine
+package search
 
 import "math"
 
-func vectorDot(a, b []float64) float64 {
+func VectorDot(a, b []float64) float64 {
 	n := len(a)
 	if len(b) < n {
 		n = len(b)
@@ -10,7 +10,7 @@ func vectorDot(a, b []float64) float64 {
 	return vectorDotKernel(a[:n], b[:n])
 }
 
-func vectorDotUnrolled(a, b []float64) float64 {
+func VectorDotUnrolled(a, b []float64) float64 {
 	var s0, s1, s2, s3 float64
 	i := 0
 	for ; i+3 < len(a); i += 4 {
@@ -26,7 +26,7 @@ func vectorDotUnrolled(a, b []float64) float64 {
 	return sum
 }
 
-func vectorL2Squared(a, b []float64) float64 {
+func VectorL2Squared(a, b []float64) float64 {
 	n := len(a)
 	if len(b) < n {
 		n = len(b)
@@ -34,7 +34,7 @@ func vectorL2Squared(a, b []float64) float64 {
 	return vectorL2SquaredKernel(a[:n], b[:n])
 }
 
-func vectorL2SquaredUnrolled(a, b []float64) float64 {
+func VectorL2SquaredUnrolled(a, b []float64) float64 {
 	var s0, s1, s2, s3 float64
 	i := 0
 	for ; i+3 < len(a); i += 4 {
@@ -55,11 +55,11 @@ func vectorL2SquaredUnrolled(a, b []float64) float64 {
 	return sum
 }
 
-// vectorL1Distance computes the Manhattan (L1) distance, dispatching to a
+// VectorL1Distance computes the Manhattan (L1) distance, dispatching to a
 // SIMD kernel where one exists (see vectorL1Kernel in the per-arch files) —
-// mirroring how vectorDot/vectorL2Squared dispatch. Previously this metric
+// mirroring how VectorDot/VectorL2Squared dispatch. Previously this metric
 // had no SIMD path at all, unlike Dot and L2Squared.
-func vectorL1Distance(a, b []float64) float64 {
+func VectorL1Distance(a, b []float64) float64 {
 	n := len(a)
 	if len(b) < n {
 		n = len(b)
@@ -67,7 +67,7 @@ func vectorL1Distance(a, b []float64) float64 {
 	return vectorL1Kernel(a[:n], b[:n])
 }
 
-func vectorL1Unrolled(a, b []float64) float64 {
+func VectorL1Unrolled(a, b []float64) float64 {
 	var s0, s1, s2, s3 float64
 	i := 0
 	for ; i+3 < len(a); i += 4 {
@@ -83,13 +83,13 @@ func vectorL1Unrolled(a, b []float64) float64 {
 	return sum
 }
 
-// vectorCosineParts computes dot(a,b), dot(a,a) and dot(b,b) in a single
+// VectorCosineParts computes dot(a,b), dot(a,a) and dot(b,b) in a single
 // pass over both vectors, dispatching to a fused SIMD kernel where one
 // exists. Cosine similarity needs all three quantities; when no cached norm
 // is available (the scalar VEC_COSINE_SIMILARITY path), one fused pass costs
 // the same memory traffic as a plain dot product instead of three separate
 // loops.
-func vectorCosineParts(a, b []float64) (dot, normA2, normB2 float64) {
+func VectorCosineParts(a, b []float64) (dot, normA2, normB2 float64) {
 	n := len(a)
 	if len(b) < n {
 		n = len(b)
@@ -97,7 +97,7 @@ func vectorCosineParts(a, b []float64) (dot, normA2, normB2 float64) {
 	return vectorCosineKernel(a[:n], b[:n])
 }
 
-func vectorCosineUnrolled(a, b []float64) (dot, normA2, normB2 float64) {
+func VectorCosineUnrolled(a, b []float64) (dot, normA2, normB2 float64) {
 	var d0, d1, n0, n1, m0, m1 float64
 	i := 0
 	for ; i+1 < len(a); i += 2 {
@@ -119,7 +119,7 @@ func vectorCosineUnrolled(a, b []float64) (dot, normA2, normB2 float64) {
 	return d0 + d1, n0 + n1, m0 + m1
 }
 
-// vectorHammingDistance counts the positions where the (a[i] > 0) sign bit
+// VectorHammingDistance counts the positions where the (a[i] > 0) sign bit
 // of a differs from that of b, clamped to the shorter of the two lengths.
 //
 // Unlike Dot/L2Squared/L1/Cosine above, this is a comparison-and-count
@@ -134,7 +134,7 @@ func vectorCosineUnrolled(a, b []float64) (dot, normA2, normB2 float64) {
 // corrupting results instead of failing to build — the deliberate choice
 // here is to ship a portable scalar Go implementation on every architecture
 // (amd64 included), leaving a real SIMD kernel as a future improvement.
-func vectorHammingDistance(a, b []float64) int {
+func VectorHammingDistance(a, b []float64) int {
 	n := len(a)
 	if len(b) < n {
 		n = len(b)
@@ -151,7 +151,7 @@ func vectorHammingDistance(a, b []float64) int {
 	return count
 }
 
-func vectorHammingUnrolled(a, b []float64) int {
+func VectorHammingUnrolled(a, b []float64) int {
 	var c0, c1, c2, c3 int
 	i := 0
 	for ; i+3 < len(a); i += 4 {
@@ -177,12 +177,12 @@ func vectorHammingUnrolled(a, b []float64) int {
 	return count
 }
 
-// vectorAccumulateUnrolled adds src into dst elementwise, in place. Used by
+// VectorAccumulateUnrolled adds src into dst elementwise, in place. Used by
 // VEC_CENTROID's running sum. This is an accumulation, not a pairwise
 // reduction, so it doesn't fit the existing dot/L2/L1/cosine kernel shape —
 // a portable unrolled loop only, no new SIMD assembly (same reasoning as
-// vectorHammingUnrolled above: unconfirmed hot path, not worth new asm risk).
-func vectorAccumulateUnrolled(dst, src []float64) {
+// VectorHammingUnrolled above: unconfirmed hot path, not worth new asm risk).
+func VectorAccumulateUnrolled(dst, src []float64) {
 	i := 0
 	for ; i+3 < len(dst); i += 4 {
 		dst[i] += src[i]
@@ -195,7 +195,7 @@ func vectorAccumulateUnrolled(dst, src []float64) {
 	}
 }
 
-func vectorDistance(metric string, a, b []float64, normA, normB float64) (float64, bool) {
+func VectorDistance(metric string, a, b []float64, normA, normB float64) (float64, bool) {
 	if len(a) != len(b) {
 		return 0, false
 	}
@@ -204,19 +204,19 @@ func vectorDistance(metric string, a, b []float64, normA, normB float64) (float6
 		if normA == 0 || normB == 0 {
 			return 0, false
 		}
-		return 1.0 - vectorDot(a, b)/(normA*normB), true
+		return 1.0 - VectorDot(a, b)/(normA*normB), true
 	case "l2":
-		return math.Sqrt(vectorL2Squared(a, b)), true
+		return math.Sqrt(VectorL2Squared(a, b)), true
 	case "manhattan":
-		return vectorL1Distance(a, b), true
+		return VectorL1Distance(a, b), true
 	case "dot":
-		return -vectorDot(a, b), true
+		return -VectorDot(a, b), true
 	default:
 		return 0, false
 	}
 }
 
-// vectorRankingDistance is vectorDistance for every purpose except deciding
+// VectorRankingDistance is VectorDistance for every purpose except deciding
 // which rows rank best: for "l2" it skips the sqrt and returns the squared
 // distance instead. Since sqrt is monotonic over non-negative reals, ranking
 // by squared distance produces the identical ordering (and therefore
@@ -225,26 +225,26 @@ func vectorDistance(metric string, a, b []float64, normA, normB float64) (float6
 // on every candidate a flat scan, IVF list, or HNSW graph traversal
 // considers. Every other metric already avoids unnecessary sqrt calls
 // (cosine needs none at all; manhattan/dot don't involve one), so this is
-// identical to vectorDistance for them.
+// identical to VectorDistance for them.
 //
-// Callers must run the result through vectorFinalizeDistance exactly once,
+// Callers must run the result through VectorFinalizeDistance exactly once,
 // at the point a value crosses from "internal ranking" to "exposed to the
 // caller" (e.g. VEC_SEARCH's _vec_distance column) — see
 // vecSearchTopKWithIndex, the single choke point every index mode's search
 // funnels through, for where that happens today.
-func vectorRankingDistance(metric string, a, b []float64, normA, normB float64) (float64, bool) {
+func VectorRankingDistance(metric string, a, b []float64, normA, normB float64) (float64, bool) {
 	if metric == "l2" {
 		if len(a) != len(b) {
 			return 0, false
 		}
-		return vectorL2Squared(a, b), true
+		return VectorL2Squared(a, b), true
 	}
-	return vectorDistance(metric, a, b, normA, normB)
+	return VectorDistance(metric, a, b, normA, normB)
 }
 
-// vectorFinalizeDistance converts a vectorRankingDistance value back into the
-// real distance vectorDistance would have returned for the same inputs.
-func vectorFinalizeDistance(metric string, rankingDistance float64) float64 {
+// VectorFinalizeDistance converts a VectorRankingDistance value back into the
+// real distance VectorDistance would have returned for the same inputs.
+func VectorFinalizeDistance(metric string, rankingDistance float64) float64 {
 	if metric == "l2" {
 		return math.Sqrt(rankingDistance)
 	}

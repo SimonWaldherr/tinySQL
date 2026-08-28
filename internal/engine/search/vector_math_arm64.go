@@ -1,8 +1,8 @@
 //go:build arm64
 
-package engine
+package search
 
-const vectorMathBackend = "arm64-neon"
+const VectorMathBackend = "arm64-neon"
 
 //go:noescape
 func vectorDotNEON(a, b []float64) float64
@@ -12,14 +12,14 @@ func vectorL2SquaredNEON(a, b []float64) float64
 
 func vectorDotKernel(a, b []float64) float64 {
 	if len(a) < 128 {
-		return vectorDotUnrolled(a, b)
+		return VectorDotUnrolled(a, b)
 	}
 	return vectorDotNEON(a, b)
 }
 
 func vectorL2SquaredKernel(a, b []float64) float64 {
 	if len(a) < 128 {
-		return vectorL2SquaredUnrolled(a, b)
+		return VectorL2SquaredUnrolled(a, b)
 	}
 	return vectorL2SquaredNEON(a, b)
 }
@@ -31,7 +31,7 @@ func vectorL2SquaredKernel(a, b []float64) float64 {
 // inputs use the portable fused loop.
 func vectorCosineKernel(a, b []float64) (dot, normA2, normB2 float64) {
 	if len(a) < 128 {
-		return vectorCosineUnrolled(a, b)
+		return VectorCosineUnrolled(a, b)
 	}
 	return vectorDotNEON(a, b), vectorDotNEON(a, a), vectorDotNEON(b, b)
 }
@@ -41,9 +41,9 @@ func vectorCosineKernel(a, b []float64) (dot, normA2, normB2 float64) {
 // being able to run it on real ARM64 hardware to confirm correctness, and a
 // wrong bit pattern here would silently corrupt distance results rather
 // than fail to build. The portable unrolled path is still 4-way unrolled
-// (see vectorL1Unrolled) and auto-vectorizes reasonably well under the Go
+// (see VectorL1Unrolled) and auto-vectorizes reasonably well under the Go
 // compiler; a real NEON kernel is a good follow-up for whoever can validate
 // it on actual ARM64 hardware.
 func vectorL1Kernel(a, b []float64) float64 {
-	return vectorL1Unrolled(a, b)
+	return VectorL1Unrolled(a, b)
 }
