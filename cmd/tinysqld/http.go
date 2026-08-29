@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -45,6 +46,10 @@ type daemon struct {
 	// turns repeat tile fetches into a parse-free plan reuse instead of a fresh
 	// ParseSQL on every HTTP request. See executeTileSQL.
 	tileQueryCache *tinysql.QueryCache
+	// Versioned metadata results keep ordinary tile GETs from materializing
+	// the same tiny metadata table on every request.
+	tileMetadataMu sync.RWMutex
+	tileMetadata   map[tileMetadataCacheKey]tileMetadataCacheEntry
 }
 
 type sqlRequest struct {
@@ -106,6 +111,7 @@ func newDaemon(inst *tinysql.Instance, cfg daemonConfig) *daemon {
 		tiles:          cfg.Tiles,
 		startedAt:      time.Now(),
 		tileQueryCache: tinysql.NewQueryCache(4096),
+		tileMetadata:   make(map[tileMetadataCacheKey]tileMetadataCacheEntry),
 	}
 	d.ready.Store(true)
 	return d

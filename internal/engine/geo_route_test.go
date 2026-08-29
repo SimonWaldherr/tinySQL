@@ -104,6 +104,92 @@ func TestRouteSameStartAndEnd(t *testing.T) {
 	}
 }
 
+func setupAStarRouteTables(t *testing.T, db *storage.DB) {
+	t.Helper()
+	execSQL(t, db, `CREATE TABLE roads_geo (edge_id TEXT, source TEXT, target TEXT, cost FLOAT64)`)
+	execSQL(t, db, `INSERT INTO roads_geo VALUES
+		('ab','A','B',120000),
+		('bc','B','C',120000),
+		('ac','A','C',300000)`)
+	execSQL(t, db, `CREATE TABLE roads_geo_nodes (node_id TEXT, lat FLOAT64, lon FLOAT64)`)
+	execSQL(t, db, `INSERT INTO roads_geo_nodes VALUES
+		('A',0,0), ('B',0,1), ('C',0,2)`)
+	t.Cleanup(func() {
+		purgeRouteGraphCachesFor("default", "roads_geo")
+		purgeRouteCoordinateCachesFor("default", "roads_geo_nodes")
+	})
+}
+
+func TestRouteAirDistanceByNodeID(t *testing.T) {
+	db := storage.NewDB()
+	setupAStarRouteTables(t, db)
+
+	got := execScalar(t, db, `SELECT ROUTE_AIR_DISTANCE(
+		'roads_geo_nodes','node_id','lat','lon','A','C') AS v`)
+	distance, ok := got.(float64)
+	if !ok || distance < 222000 || distance > 223000 {
+		t.Fatalf("ROUTE_AIR_DISTANCE A->C = %v, want about 222.4 km", got)
+	}
+}
+
+func TestRouteDistanceAStarMatchesDijkstra(t *testing.T) {
+	db := storage.NewDB()
+	setupAStarRouteTables(t, db)
+
+	query := `SELECT ROUTE_DISTANCE_ASTAR(
+		'roads_geo','source','target','cost',
+		'roads_geo_nodes','node_id','lat','lon',
+		'A','C',1) AS v`
+	if got := execScalar(t, db, query); got != float64(240000) {
+		t.Fatalf("ROUTE_DISTANCE_ASTAR A->C = %v, want 240000", got)
+	}
+	if got := execScalar(t, db, `SELECT ROUTE_DISTANCE(
+		'roads_geo','source','target','cost','A','C') AS v`); got != float64(240000) {
+		t.Fatalf("ROUTE_DISTANCE A->C = %v, want 240000", got)
+	}
+}
+
+func TestRouteShortestPathAStarReportsAirDistance(t *testing.T) {
+	db := storage.NewDB()
+	setupAStarRouteTables(t, db)
+
+	rs := execSQL(t, db, `SELECT * FROM ROUTE_SHORTEST_PATH_ASTAR(
+		'roads_geo','source','target','cost',
+		'roads_geo_nodes','node_id','lat','lon',
+		'A','C',1)`)
+	if len(rs.Rows) != 3 {
+		t.Fatalf("A* path rows = %d, want A/B/C: %#v", len(rs.Rows), rs.Rows)
+	}
+	if rs.Rows[1]["node_id"] != "B" || rs.Rows[2]["total_cost"] != float64(240000) {
+		t.Fatalf("A* path = %#v, want A/B/C at cost 240000", rs.Rows)
+	}
+	if got, ok := rs.Rows[2]["air_distance_to_goal_m"].(float64); !ok || got != 0 {
+		t.Fatalf("goal air distance = %v, want 0", rs.Rows[2]["air_distance_to_goal_m"])
+	}
+}
+
+func TestRouteAStarRejectsInadmissibleScale(t *testing.T) {
+	db := storage.NewDB()
+	setupAStarRouteTables(t, db)
+	execExpectError(t, db, `SELECT ROUTE_DISTANCE_ASTAR(
+		'roads_geo','source','target','cost',
+		'roads_geo_nodes','node_id','lat','lon',
+		'A','C',2) AS v`)
+}
+
+func TestRouteAStarCoordinateCacheInvalidates(t *testing.T) {
+	db := storage.NewDB()
+	setupAStarRouteTables(t, db)
+	query := `SELECT ROUTE_AIR_DISTANCE(
+		'roads_geo_nodes','node_id','lat','lon','A','C') AS v`
+	before := execScalar(t, db, query).(float64)
+	execSQL(t, db, `UPDATE roads_geo_nodes SET lon = 3 WHERE node_id = 'C'`)
+	after := execScalar(t, db, query).(float64)
+	if after <= before*1.4 {
+		t.Fatalf("coordinate cache stayed stale: before=%v after=%v", before, after)
+	}
+}
+
 func TestRouteGraphCacheReuseInvalidationAndDropPurge(t *testing.T) {
 	db := storage.NewDB()
 	setupRouteEdges(t, db)
@@ -243,6 +329,21 @@ func BenchmarkRouteDistanceGraphCache(b *testing.B) {
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			if _, err := Execute(ctx, db, "default", stmt); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("warm_long", func(b *testing.B) {
+		longStmt := mustParse(`SELECT ROUTE_DISTANCE(
+			'bench_routes','source','target','cost',0,20000) AS distance`)
+		if _, err := Execute(ctx, db, "default", longStmt); err != nil {
+			b.Fatal(err)
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := Execute(ctx, db, "default", longStmt); err != nil {
 				b.Fatal(err)
 			}
 		}

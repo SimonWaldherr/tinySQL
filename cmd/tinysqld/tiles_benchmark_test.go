@@ -8,6 +8,8 @@ package main
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
@@ -28,10 +30,57 @@ func newBenchTileDaemon(b *testing.B) *daemon {
 	if err := inst.DB.Put("default", tiles); err != nil {
 		b.Fatal(err)
 	}
+	metadata := storage.NewTable("world_metadata", []storage.Column{
+		{Name: "name", Type: storage.TextType},
+		{Name: "value", Type: storage.TextType},
+	}, false)
+	metadata.Rows = [][]any{{"format", "pbf"}, {"name", "World"}}
+	metadata.Version++
+	if err := inst.DB.Put("default", metadata); err != nil {
+		b.Fatal(err)
+	}
 	return newDaemon(inst, daemonConfig{DefaultTenant: "default", Tiles: true})
 }
 
 const benchTileLookupSQL = "SELECT tile_data FROM world WHERE zoom_level = 1 AND tile_column = 0 AND tile_row = 1 LIMIT 1"
+
+func BenchmarkTileHandlerWarm(b *testing.B) {
+	d := newBenchTileDaemon(b)
+	h := d.routes()
+	warm := httptest.NewRecorder()
+	h.ServeHTTP(warm, httptest.NewRequest(http.MethodGet, "/tiles/world/1/0/0.pbf", nil))
+	if warm.Code != http.StatusOK {
+		b.Fatal("warm tile request failed")
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/tiles/world/1/0/0.pbf", nil))
+		if rec.Code != http.StatusOK {
+			b.Fatal(rec.Code)
+		}
+	}
+}
+
+func BenchmarkTileHandlerMetadataInvalidated(b *testing.B) {
+	d := newBenchTileDaemon(b)
+	h := d.routes()
+	metadata, err := d.inst.DB.Get("default", "world_metadata")
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		metadata.Version++
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/tiles/world/1/0/0.pbf", nil))
+		if rec.Code != http.StatusOK {
+			b.Fatal(rec.Code)
+		}
+	}
+}
 
 // BenchmarkTileLookupUncached measures the tile lookup the way the
 // tile-serving path used to run it: parsed fresh with tinysql.ParseSQL on

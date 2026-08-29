@@ -417,15 +417,18 @@ CSV edge list into ordinary tables — `<table>_nodes` (`node_id`, `lat`,
 `geometry`, `properties`) for edges — recognizing the common
 `source`/`from`/`source_id` and `target`/`to`/`target_id` column aliases.
 
-Two SQL functions run Dijkstra's algorithm directly over any such edge
-table — or any table at all with a source column, a target column, and a
-non-negative numeric weight column, whether or not it came from
+The routing SQL functions run Dijkstra or coordinate-guided A* directly over
+any such edge table — or any table at all with a source column, a target
+column, and a non-negative numeric weight column, whether or not it came from
 `ImportRoutingGraph`:
 
 | Task | Function |
 | --- | --- |
 | Full shortest path as rows (one per node visited) | `ROUTE_SHORTEST_PATH(table, source_col, target_col, weight_col, start_id, end_id[, direction])` |
 | Just the total cost (or `NULL` if unreachable) | `ROUTE_DISTANCE(table, source_col, target_col, weight_col, start_id, end_id[, direction])` |
+| A*-guided total cost | `ROUTE_DISTANCE_ASTAR(edge_table, source_col, target_col, weight_col, node_table, node_id_col, lat_col, lon_col, start_id, end_id, min_cost_per_metre[, direction])` |
+| A*-guided path, including remaining air distance | `ROUTE_SHORTEST_PATH_ASTAR(edge_table, source_col, target_col, weight_col, node_table, node_id_col, lat_col, lon_col, start_id, end_id, min_cost_per_metre[, direction])` |
+| Air-line distance in metres | `ROUTE_AIR_DISTANCE(node_table, node_id_col, lat_col, lon_col, start_id, end_id)` |
 
 ```sql
 CREATE TABLE roads (edge_id TEXT, source TEXT, target TEXT, cost FLOAT64);
@@ -440,6 +443,18 @@ SELECT * FROM ROUTE_SHORTEST_PATH('roads', 'source', 'target', 'cost', 'A', 'C')
 
 SELECT ROUTE_DISTANCE('roads', 'source', 'target', 'cost', 'A', 'C') AS meters;
 ```
+
+The A* heuristic is the great-circle distance multiplied by
+`min_cost_per_metre`. It must be a real lower bound for the selected edge
+cost (for duration in milliseconds and a 130 km/h maximum speed, for example,
+use at most `3600 / 130`, about `27.69` ms/m). tinySQL verifies the supplied
+factor against every graph edge before using it, so an overestimating
+heuristic errors instead of returning a non-optimal route. A factor of `0`
+is always valid and deliberately falls back to Dijkstra while keeping the A*
+interface. Coordinate tables and graph-to-coordinate bindings are versioned,
+bounded, and shared across concurrent requests just like the graph cache.
+`ROUTE_SHORTEST_PATH_ASTAR` adds `air_distance_to_goal_m` to each returned
+step, which is useful for progress and detour-factor displays.
 
 `direction` is `'directed'` (the default — travel only `source` → `target`)
 or `'undirected'` (travel either way along every edge). A node id may be

@@ -25,7 +25,7 @@ package engine
 import (
 	"context"
 	"fmt"
-	"strconv"
+	"math"
 	"strings"
 	"sync"
 
@@ -34,33 +34,36 @@ import (
 
 func getRouteFunctions() map[string]funcHandler {
 	return map[string]funcHandler{
-		"ROUTE_DISTANCE": evalRouteDistance,
+		"ROUTE_DISTANCE":       evalRouteDistance,
+		"ROUTE_DISTANCE_ASTAR": evalRouteDistanceAStar,
+		"ROUTE_AIR_DISTANCE":   evalRouteAirDistance,
 	}
-}
-
-// routeGraphEdge is one directed adjacency-list entry: travel to node index
-// `to` costs `weight`, and doing so uses the edge table's row `rowIdx` (kept
-// so a reconstructed path can report which edge -- and its edge_id/geometry
-// columns, if the table has them -- was actually taken).
-type routeGraphEdge struct {
-	to     int
-	weight float64
-	rowIdx int
 }
 
 type routeGraph struct {
 	table      *storage.Table
-	nodeIndex  map[string]int
+	nodeIndex  routeNodeIndex
 	nodeValues []any
-	// offsets/edges use the same compact CSR shape as Karte.Bayern's routing
-	// graph: outgoing edges for node n are edges[offsets[n]:offsets[n+1]].
-	// Compared with [][]routeGraphEdge this is one contiguous allocation, has
-	// better traversal locality and avoids one allocation per non-leaf node.
-	offsets []int
-	edges   []routeGraphEdge
+	// The graph is a structure-of-arrays CSR. Outgoing edge indices for node n
+	// are offsets[n]:offsets[n+1]. Separating destination, weight and source-row
+	// data lets cost-only searches avoid reading row indices and reduces a
+	// 64-bit route edge from the former 24-byte struct to 16 bytes of arrays.
+	offsets []uint32
+	to      []uint32
+	weights []float64
+	rowIdx  []uint32
+	// The graph itself is version-scoped, so cached distance answers become
+	// unreachable automatically when a table mutation replaces this graph.
+	distances routeDistanceCache
+	// Coordinate bindings are built only for explicit A* calls. The key is a
+	// version-scoped coordinate index pointer, so a node-table write naturally
+	// creates a new binding without touching ordinary Dijkstra searches.
+	coordinateMu       sync.Mutex
+	coordinateBindings map[*routeCoordinates]*routeGraphCoordinates
 }
 
 const routeGraphCacheMaxEntries = 64
+const routeGraphCoordinateBindingsMaxEntries = 8
 
 type routeGraphCacheKey struct {
 	tenant                          string
@@ -165,32 +168,81 @@ func purgeRouteGraphCachesFor(tenant, table string) {
 		}
 	}
 	routeGraphCacheState.Unlock()
+	purgeRouteCoordinateCachesFor(tenant, table)
 }
 
-// routeNodeKey canonicalizes a node id value into a comparable string key.
-// Numeric ids are reformatted through geoFloat so that, e.g., an int64(5)
-// source column and a float64(5) target column (a common mismatch when one
-// side comes from a literal and the other from a stored column) collapse to
-// the same node rather than silently becoming two different graph nodes.
-func routeNodeKey(v any) (string, error) {
+// routeNodeID is the allocation-free canonical form used by the graph index.
+// A type tag keeps text "5" distinct from numeric 5. Numeric values use their
+// IEEE representation after geoFloat normalization, so int64(5) and
+// float64(5) still identify the same node without formatting strings per edge.
+type routeNodeID struct {
+	kind   uint8
+	number uint64
+	text   string
+}
+
+// Separate maps keep numeric keys at eight bytes instead of making every map
+// bucket carry the larger tagged string-capable routeNodeID struct.
+type routeNodeIndex struct {
+	numbers  map[uint64]int
+	texts    map[string]int
+	capacity int
+}
+
+func newRouteNodeIndex(capacity int) routeNodeIndex {
+	return routeNodeIndex{capacity: capacity}
+}
+
+func (idx *routeNodeIndex) get(key routeNodeID) (int, bool) {
+	if key.kind == 1 {
+		value, ok := idx.texts[key.text]
+		return value, ok
+	}
+	value, ok := idx.numbers[key.number]
+	return value, ok
+}
+
+func (idx *routeNodeIndex) put(key routeNodeID, value int) {
+	if key.kind == 1 {
+		if idx.texts == nil {
+			idx.texts = make(map[string]int, idx.capacity)
+		}
+		idx.texts[key.text] = value
+		return
+	}
+	if idx.numbers == nil {
+		idx.numbers = make(map[uint64]int, idx.capacity)
+	}
+	idx.numbers[key.number] = value
+}
+
+func routeNodeKey(v any) (routeNodeID, error) {
 	if v == nil {
-		return "", fmt.Errorf("node id must not be NULL")
+		return routeNodeID{}, fmt.Errorf("node id must not be NULL")
 	}
 	if s, ok := v.(string); ok {
-		return "s:" + s, nil
+		return routeNodeID{kind: 1, text: s}, nil
 	}
 	if f, err := geoFloat(v); err == nil {
-		return "n:" + strconv.FormatFloat(f, 'g', -1, 64), nil
+		bits := math.Float64bits(f)
+		if math.IsNaN(f) {
+			// FormatFloat previously canonicalized every NaN as the same key.
+			bits = math.Float64bits(math.NaN())
+		}
+		return routeNodeID{kind: 2, number: bits}, nil
 	}
-	return "", fmt.Errorf("unsupported node id type %T", v)
+	return routeNodeID{}, fmt.Errorf("unsupported node id type %T", v)
 }
 
-// buildRouteGraph scans every row of table once, building an adjacency list
+// buildRouteGraph scans the table twice, building an adjacency list
 // keyed by a dense integer node index (nodeValues[i] holds that node's
 // original id value, in whichever type it was first seen as, for reporting
 // back in results). direction "undirected" adds both directions of travel
 // for each edge row; "directed" (the default) adds only source->target.
 func buildRouteGraph(ctx context.Context, table *storage.Table, sourceCol, targetCol, weightCol, direction string) (*routeGraph, error) {
+	if uint64(len(table.Rows)) > uint64(math.MaxUint32) {
+		return nil, fmt.Errorf("routing table has %d rows; maximum supported is %d", len(table.Rows), uint64(math.MaxUint32))
+	}
 	srcIdx, err := table.ColIndex(sourceCol)
 	if err != nil {
 		return nil, fmt.Errorf("source column: %w", err)
@@ -204,30 +256,34 @@ func buildRouteGraph(ctx context.Context, table *storage.Table, sourceCol, targe
 		return nil, fmt.Errorf("weight column: %w", err)
 	}
 
-	g := &routeGraph{table: table, nodeIndex: make(map[string]int)}
+	g := &routeGraph{table: table, nodeIndex: newRouteNodeIndex(len(table.Rows) + 1)}
+	degreeCap := len(table.Rows)
+	if degreeCap <= int(^uint(0)>>1)/2 {
+		degreeCap *= 2
+	}
+	degrees := make([]uint32, 0, degreeCap)
 	nodeIdxFor := func(v any) (int, error) {
 		key, err := routeNodeKey(v)
 		if err != nil {
 			return 0, err
 		}
-		if idx, ok := g.nodeIndex[key]; ok {
+		if idx, ok := g.nodeIndex.get(key); ok {
 			return idx, nil
 		}
 		idx := len(g.nodeValues)
-		g.nodeIndex[key] = idx
+		if uint64(idx) >= uint64(math.MaxUint32) {
+			return 0, fmt.Errorf("routing graph has more than %d nodes", uint64(math.MaxUint32))
+		}
+		g.nodeIndex.put(key, idx)
 		g.nodeValues = append(g.nodeValues, v)
+		degrees = append(degrees, 0)
 		return idx, nil
 	}
-	type buildEdge struct {
-		from int
-		routeGraphEdge
-	}
-	edgeCap := len(table.Rows)
-	if direction == "undirected" && edgeCap <= int(^uint(0)>>1)/2 {
-		edgeCap *= 2
-	}
-	flat := make([]buildEdge, 0, edgeCap)
-
+	var edgeCount uint64
+	// First pass validates rows, interns node IDs and counts CSR degrees. A
+	// former one-pass builder retained a 32-byte temporary record per directed
+	// edge alongside the final edge array. Numeric node interning is cheap now,
+	// so a second table pass saves that large peak allocation.
 	for rowIdx, r := range table.Rows {
 		if rowIdx&1023 == 0 {
 			if err := checkCtx(ctx); err != nil {
@@ -256,24 +312,57 @@ func buildRouteGraph(ctx context.Context, table *storage.Table, sourceCol, targe
 		if err != nil {
 			return nil, fmt.Errorf("row %d: target id: %w", rowIdx, err)
 		}
-		flat = append(flat, buildEdge{from: srcNode, routeGraphEdge: routeGraphEdge{to: tgtNode, weight: weight, rowIdx: rowIdx}})
+		degrees[srcNode]++
+		edgeCount++
 		if direction == "undirected" {
-			flat = append(flat, buildEdge{from: tgtNode, routeGraphEdge: routeGraphEdge{to: srcNode, weight: weight, rowIdx: rowIdx}})
+			degrees[tgtNode]++
+			edgeCount++
 		}
 	}
+	if edgeCount > uint64(math.MaxUint32) {
+		return nil, fmt.Errorf("routing graph has %d directed edges; maximum supported is %d", edgeCount, uint64(math.MaxUint32))
+	}
 
-	g.offsets = make([]int, len(g.nodeValues)+1)
-	for _, edge := range flat {
-		g.offsets[edge.from+1]++
+	g.offsets = make([]uint32, len(g.nodeValues)+1)
+	for node, degree := range degrees {
+		g.offsets[node+1] = degree
 	}
 	for node := 1; node < len(g.offsets); node++ {
 		g.offsets[node] += g.offsets[node-1]
 	}
-	g.edges = make([]routeGraphEdge, len(flat))
-	cursors := append([]int(nil), g.offsets[:len(g.nodeValues)]...)
-	for _, edge := range flat {
-		g.edges[cursors[edge.from]] = edge.routeGraphEdge
-		cursors[edge.from]++
+	g.to = make([]uint32, int(edgeCount))
+	g.weights = make([]float64, int(edgeCount))
+	g.rowIdx = make([]uint32, int(edgeCount))
+	cursors := append([]uint32(nil), g.offsets[:len(g.nodeValues)]...)
+	for rowIdx, r := range table.Rows {
+		if rowIdx&1023 == 0 {
+			if err := checkCtx(ctx); err != nil {
+				return nil, err
+			}
+		}
+		if srcIdx >= len(r) || tgtIdx >= len(r) || wIdx >= len(r) || r[srcIdx] == nil || r[tgtIdx] == nil || r[wIdx] == nil {
+			continue
+		}
+		sourceKey, sourceErr := routeNodeKey(r[srcIdx])
+		targetKey, targetErr := routeNodeKey(r[tgtIdx])
+		srcNode, sourceOK := g.nodeIndex.get(sourceKey)
+		tgtNode, targetOK := g.nodeIndex.get(targetKey)
+		weight, weightErr := geoFloat(r[wIdx])
+		if sourceErr != nil || targetErr != nil || !sourceOK || !targetOK || weightErr != nil || weight < 0 || weight != weight {
+			return nil, fmt.Errorf("row %d changed while routing graph was built", rowIdx)
+		}
+		edge := cursors[srcNode]
+		g.to[edge] = uint32(tgtNode)
+		g.weights[edge] = weight
+		g.rowIdx[edge] = uint32(rowIdx)
+		cursors[srcNode]++
+		if direction == "undirected" {
+			edge = cursors[tgtNode]
+			g.to[edge] = uint32(srcNode)
+			g.weights[edge] = weight
+			g.rowIdx[edge] = uint32(rowIdx)
+			cursors[tgtNode]++
+		}
 	}
 	return g, nil
 }
@@ -303,58 +392,55 @@ type routeHeapEntry struct {
 type routeHeap []routeHeapEntry
 
 func (h routeHeap) Len() int { return len(h) }
-func (h routeHeap) Less(i, j int) bool {
-	if h[i].cost == h[j].cost {
-		return h[i].node < h[j].node
+func routeHeapEntryLess(a, b routeHeapEntry) bool {
+	if a.cost == b.cost {
+		return a.node < b.node
 	}
-	return h[i].cost < h[j].cost
+	return a.cost < b.cost
 }
-func (h routeHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 
 func routeHeapPush(h *routeHeap, v routeHeapEntry) {
 	*h = append(*h, v)
-	routeHeapUp(*h, len(*h)-1)
+	a := *h
+	hole := len(a) - 1
+	for hole > 0 {
+		parent := (hole - 1) / 2
+		if !routeHeapEntryLess(v, a[parent]) {
+			break
+		}
+		a[hole] = a[parent]
+		hole = parent
+	}
+	a[hole] = v
 }
 
 func routeHeapPop(h *routeHeap) routeHeapEntry {
-	old := *h
-	n := len(old) - 1
-	old.Swap(0, n)
-	routeHeapDown(old[:n], 0)
-	v := old[n]
-	*h = old[:n]
-	return v
-}
-
-func routeHeapUp(h routeHeap, j int) {
-	for {
-		i := (j - 1) / 2
-		if i == j || !h.Less(j, i) {
-			break
+	a := *h
+	root := a[0]
+	lastIndex := len(a) - 1
+	last := a[lastIndex]
+	a = a[:lastIndex]
+	if len(a) != 0 {
+		hole := 0
+		for {
+			left := 2*hole + 1
+			if left >= len(a) {
+				break
+			}
+			child := left
+			if right := left + 1; right < len(a) && routeHeapEntryLess(a[right], a[left]) {
+				child = right
+			}
+			if !routeHeapEntryLess(a[child], last) {
+				break
+			}
+			a[hole] = a[child]
+			hole = child
 		}
-		h.Swap(i, j)
-		j = i
+		a[hole] = last
 	}
-}
-
-func routeHeapDown(h routeHeap, i0 int) {
-	n := len(h)
-	i := i0
-	for {
-		j1 := 2*i + 1
-		if j1 >= n || j1 < 0 {
-			break
-		}
-		j := j1
-		if j2 := j1 + 1; j2 < n && h.Less(j2, j1) {
-			j = j2
-		}
-		if !h.Less(j, i) {
-			break
-		}
-		h.Swap(i, j)
-		i = j
-	}
+	*h = a
+	return root
 }
 
 // routeStep is one node in a reconstructed shortest path: the node index,
@@ -379,20 +465,97 @@ type routeSearchScratch struct {
 	heap               routeHeap
 }
 
-var routeSearchScratchPool = sync.Pool{New: func() any { return &routeSearchScratch{} }}
+const routeScratchHotMaxBytes = 64 << 20
 
-func acquireRouteSearchScratch(nodes int) *routeSearchScratch {
-	scratch := routeSearchScratchPool.Get().(*routeSearchScratch)
+var routeSearchScratchPool = sync.Pool{New: func() any { return &routeSearchScratch{} }}
+var routeSearchScratchHot struct {
+	sync.Mutex
+	scratch *routeSearchScratch
+}
+
+const routeDistanceCacheMaxEntries = 4096
+
+type routeDistanceCacheKey struct {
+	start int
+	end   int
+}
+
+type routeDistanceCacheValue struct {
+	distance float64
+	found    bool
+}
+
+// routeDistanceCache uses bounded FIFO replacement. Repeated map requests
+// often ask for the same origin/destination pair, and a cached unreachable
+// answer is just as useful as a cached distance.
+type routeDistanceCache struct {
+	sync.RWMutex
+	entries map[routeDistanceCacheKey]routeDistanceCacheValue
+	order   []routeDistanceCacheKey
+	next    int
+}
+
+func (c *routeDistanceCache) load(key routeDistanceCacheKey) (routeDistanceCacheValue, bool) {
+	c.RLock()
+	value, ok := c.entries[key]
+	c.RUnlock()
+	return value, ok
+}
+
+func (c *routeDistanceCache) store(key routeDistanceCacheKey, value routeDistanceCacheValue) {
+	c.Lock()
+	defer c.Unlock()
+	if c.entries == nil {
+		// Most graphs see a small hot set. Grow on demand instead of charging
+		// every cold graph for all 4096 possible cache slots up front.
+		c.entries = make(map[routeDistanceCacheKey]routeDistanceCacheValue)
+	}
+	if _, exists := c.entries[key]; exists {
+		c.entries[key] = value
+		return
+	}
+	if len(c.order) < routeDistanceCacheMaxEntries {
+		c.order = append(c.order, key)
+	} else {
+		delete(c.entries, c.order[c.next])
+		c.order[c.next] = key
+		c.next++
+		if c.next == len(c.order) {
+			c.next = 0
+		}
+	}
+	c.entries[key] = value
+}
+
+func acquireRouteSearchScratch(nodes int, needParents bool) *routeSearchScratch {
+	routeSearchScratchHot.Lock()
+	scratch := routeSearchScratchHot.scratch
+	routeSearchScratchHot.scratch = nil
+	routeSearchScratchHot.Unlock()
+	if scratch == nil {
+		scratch = routeSearchScratchPool.Get().(*routeSearchScratch)
+	}
 	if cap(scratch.dist) < nodes {
 		scratch.dist = make([]float64, nodes)
-		scratch.prevNode = make([]int, nodes)
-		scratch.prevEdge = make([]int, nodes)
 		scratch.generation = make([]uint32, nodes)
 	} else {
 		scratch.dist = scratch.dist[:nodes]
-		scratch.prevNode = scratch.prevNode[:nodes]
-		scratch.prevEdge = scratch.prevEdge[:nodes]
 		scratch.generation = scratch.generation[:nodes]
+	}
+	if needParents {
+		if cap(scratch.prevNode) < nodes {
+			scratch.prevNode = make([]int, nodes)
+		} else {
+			scratch.prevNode = scratch.prevNode[:nodes]
+		}
+		if cap(scratch.prevEdge) < nodes {
+			scratch.prevEdge = make([]int, nodes)
+		} else {
+			scratch.prevEdge = scratch.prevEdge[:nodes]
+		}
+	} else {
+		scratch.prevNode = scratch.prevNode[:0]
+		scratch.prevEdge = scratch.prevEdge[:0]
 	}
 	scratch.heap = scratch.heap[:0]
 	scratch.mark++
@@ -405,7 +568,28 @@ func acquireRouteSearchScratch(nodes int) *routeSearchScratch {
 
 func releaseRouteSearchScratch(scratch *routeSearchScratch) {
 	scratch.heap = scratch.heap[:0]
+	if routeSearchScratchBytes(scratch) <= routeScratchHotMaxBytes {
+		routeSearchScratchHot.Lock()
+		if routeSearchScratchHot.scratch == nil || routeSearchScratchBytes(scratch) > routeSearchScratchBytes(routeSearchScratchHot.scratch) {
+			pooled := routeSearchScratchHot.scratch
+			routeSearchScratchHot.scratch = scratch
+			routeSearchScratchHot.Unlock()
+			if pooled != nil {
+				routeSearchScratchPool.Put(pooled)
+			}
+			return
+		}
+		routeSearchScratchHot.Unlock()
+	}
 	routeSearchScratchPool.Put(scratch)
+}
+
+func routeSearchScratchBytes(scratch *routeSearchScratch) int {
+	if scratch == nil {
+		return 0
+	}
+	return cap(scratch.dist)*8 + cap(scratch.prevNode)*8 + cap(scratch.prevEdge)*8 +
+		cap(scratch.generation)*4 + cap(scratch.heap)*16
 }
 
 func (scratch *routeSearchScratch) distance(node int, inf float64) float64 {
@@ -435,18 +619,25 @@ func dijkstraShortestPath(g *routeGraph, start, end int) (path []routeStep, foun
 // queries: without a requested path there is no reason to write parents or
 // allocate and reverse thousands of route steps.
 func dijkstraShortestDistance(g *routeGraph, start, end int) (distance float64, found bool) {
+	key := routeDistanceCacheKey{start: start, end: end}
+	if cached, ok := g.distances.load(key); ok {
+		return cached.distance, cached.found
+	}
 	_, distance, found = dijkstraSearch(g, start, end, false)
+	g.distances.store(key, routeDistanceCacheValue{distance: distance, found: found})
 	return distance, found
 }
 
 func dijkstraSearch(g *routeGraph, start, end int, wantPath bool) (path []routeStep, distance float64, found bool) {
 	n := len(g.nodeValues)
 	const inf = 1e308 // effectively +Inf but still comparable/subtractable without producing NaN
-	scratch := acquireRouteSearchScratch(n)
+	scratch := acquireRouteSearchScratch(n, wantPath)
 	defer releaseRouteSearchScratch(scratch)
 	dist, prevNode, prevEdge := scratch.dist, scratch.prevNode, scratch.prevEdge
 	scratch.setDistance(start, 0)
-	prevNode[start], prevEdge[start] = -1, -1
+	if wantPath {
+		prevNode[start], prevEdge[start] = -1, -1
+	}
 
 	scratch.heap = append(scratch.heap, routeHeapEntry{node: start, cost: 0})
 	reached := false
@@ -459,15 +650,16 @@ func dijkstraSearch(g *routeGraph, start, end int, wantPath bool) (path []routeS
 			reached = true
 			break
 		}
-		for _, e := range g.edges[g.offsets[cur.node]:g.offsets[cur.node+1]] {
-			nd := dist[cur.node] + e.weight
-			if nd < scratch.distance(e.to, inf) {
-				scratch.setDistance(e.to, nd)
+		for edge := g.offsets[cur.node]; edge < g.offsets[cur.node+1]; edge++ {
+			to := int(g.to[edge])
+			nd := dist[cur.node] + g.weights[edge]
+			if nd < scratch.distance(to, inf) {
+				scratch.setDistance(to, nd)
 				if wantPath {
-					prevNode[e.to] = cur.node
-					prevEdge[e.to] = e.rowIdx
+					prevNode[to] = cur.node
+					prevEdge[to] = int(g.rowIdx[edge])
 				}
-				routeHeapPush(&scratch.heap, routeHeapEntry{node: e.to, cost: nd})
+				routeHeapPush(&scratch.heap, routeHeapEntry{node: to, cost: nd})
 			}
 		}
 	}
@@ -479,18 +671,22 @@ func dijkstraSearch(g *routeGraph, start, end int, wantPath bool) (path []routeS
 	if !wantPath {
 		return nil, distance, true
 	}
+	return reconstructRoutePath(scratch, start, end), distance, true
+}
+
+func reconstructRoutePath(scratch *routeSearchScratch, start, end int) []routeStep {
 	var rev []routeStep
-	for at := end; at != -1; at = prevNode[at] {
-		rev = append(rev, routeStep{node: at, viaRowIdx: prevEdge[at], cumulative: dist[at]})
+	for at := end; at != -1; at = scratch.prevNode[at] {
+		rev = append(rev, routeStep{node: at, viaRowIdx: scratch.prevEdge[at], cumulative: scratch.dist[at]})
 		if at == start {
 			break
 		}
 	}
-	path = make([]routeStep, len(rev))
+	path := make([]routeStep, len(rev))
 	for i, s := range rev {
 		path[len(rev)-1-i] = s
 	}
-	return path, distance, true
+	return path
 }
 
 // routeArgError names which positional argument failed, matching this
@@ -503,9 +699,10 @@ func routeArgError(name string, idx int, err error) error {
 // evalRouteGraphArgs evaluates the shared argument prefix both
 // ROUTE_SHORTEST_PATH and ROUTE_DISTANCE take:
 // (table, source_col, target_col, weight_col, start_id, end_id [, direction]).
-func evalRouteGraphArgs(env ExecEnv, name string, args []Expr, row Row) (table *storage.Table, sourceCol, targetCol, weightCol string, startKey, endKey string, direction string, err error) {
+func evalRouteGraphArgs(env ExecEnv, name string, args []Expr, row Row) (table *storage.Table, sourceCol, targetCol, weightCol string, startKey, endKey routeNodeID, direction string, err error) {
 	if len(args) < 6 || len(args) > 7 {
-		return nil, "", "", "", "", "", "", fmt.Errorf("%s requires (table, source_col, target_col, weight_col, start_id, end_id [, direction]), got %d arguments", name, len(args))
+		err = fmt.Errorf("%s requires (table, source_col, target_col, weight_col, start_id, end_id [, direction]), got %d arguments", name, len(args))
+		return
 	}
 	strArg := func(idx int) (string, error) {
 		v, evErr := evalExpr(env, args[idx], row)
@@ -608,11 +805,11 @@ func (f *RouteShortestPathTableFunc) Execute(ctx context.Context, args []Expr, e
 	if err != nil {
 		return nil, fmt.Errorf("ROUTE_SHORTEST_PATH: %w", err)
 	}
-	startIdx, ok := g.nodeIndex[startKey]
+	startIdx, ok := g.nodeIndex.get(startKey)
 	if !ok {
 		return nil, fmt.Errorf("ROUTE_SHORTEST_PATH: start id not found among %q/%q values", sourceCol, targetCol)
 	}
-	endIdx, ok := g.nodeIndex[endKey]
+	endIdx, ok := g.nodeIndex.get(endKey)
 	if !ok {
 		return nil, fmt.Errorf("ROUTE_SHORTEST_PATH: end id not found among %q/%q values", sourceCol, targetCol)
 	}
@@ -685,11 +882,11 @@ func evalRouteDistance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", ex.Name, err)
 	}
-	startIdx, ok := g.nodeIndex[startKey]
+	startIdx, ok := g.nodeIndex.get(startKey)
 	if !ok {
 		return nil, fmt.Errorf("%s: start id not found among %q/%q values", ex.Name, sourceCol, targetCol)
 	}
-	endIdx, ok := g.nodeIndex[endKey]
+	endIdx, ok := g.nodeIndex.get(endKey)
 	if !ok {
 		return nil, fmt.Errorf("%s: end id not found among %q/%q values", ex.Name, sourceCol, targetCol)
 	}

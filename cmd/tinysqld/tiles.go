@@ -28,6 +28,7 @@ import (
 	"strings"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 // tileFormat describes how one tile payload should be sent.
@@ -202,10 +203,49 @@ func (d *daemon) tileQueryContext(r *http.Request) (context.Context, context.Can
 // neither can carry SQL syntax.
 func tileScalar(n int) string { return strconv.Itoa(n) }
 
+const tileMetadataCacheMaxEntries = 128
+
+type tileMetadataCacheKey struct {
+	tenant string
+	name   string
+}
+
+type tileMetadataCacheEntry struct {
+	table   *storage.Table
+	version int
+	values  map[string]string
+}
+
+func tileMetadataTableVersion(db *tinysql.DB, tenant, table string) (*storage.Table, int, error) {
+	db.LockContentForRead()
+	defer db.UnlockContentForRead()
+	metadataTable, err := db.Get(tenant, table)
+	if err != nil {
+		return nil, 0, err
+	}
+	return metadataTable, metadataTable.Version, nil
+}
+
 // tilesetMetadata reads a tileset's metadata rows into a map. A missing metadata
 // table is not an error: a tiles table alone is still servable, just without a
 // declared format.
 func (d *daemon) tilesetMetadata(ctx context.Context, tenant, name string) map[string]string {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil
+		}
+	}
+	metadataTable, metadataVersion, err := tileMetadataTableVersion(d.inst.DB, tenant, name+"_metadata")
+	if err != nil {
+		return nil
+	}
+	key := tileMetadataCacheKey{tenant: tenant, name: name}
+	d.tileMetadataMu.RLock()
+	cached, ok := d.tileMetadata[key]
+	d.tileMetadataMu.RUnlock()
+	if ok && cached.table == metadataTable && cached.version == metadataVersion {
+		return cached.values
+	}
 	rs, err := d.executeTileSQL(ctx, tenant, fmt.Sprintf("SELECT name, value FROM %s_metadata", name))
 	if err != nil || rs == nil {
 		return nil
@@ -224,6 +264,20 @@ func (d *daemon) tilesetMetadata(ctx context.Context, tenant, name string) map[s
 		}
 		out[k] = fmt.Sprintf("%v", v)
 	}
+	currentTable, currentVersion, currentErr := tileMetadataTableVersion(d.inst.DB, tenant, name+"_metadata")
+	if currentErr != nil || currentTable != metadataTable || currentVersion != metadataVersion {
+		return out
+	}
+	d.tileMetadataMu.Lock()
+	_, replacing := d.tileMetadata[key]
+	if !replacing && len(d.tileMetadata) >= tileMetadataCacheMaxEntries {
+		for oldKey := range d.tileMetadata {
+			delete(d.tileMetadata, oldKey)
+			break
+		}
+	}
+	d.tileMetadata[key] = tileMetadataCacheEntry{table: metadataTable, version: metadataVersion, values: out}
+	d.tileMetadataMu.Unlock()
 	return out
 }
 

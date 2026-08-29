@@ -8,6 +8,7 @@ package main
 // correct, so it is checked explicitly rather than inferred from a round trip.
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -333,6 +334,29 @@ func TestTileMetadataEndpoint(t *testing.T) {
 	plain := newTileDaemon(t, false)
 	if rec := getTile(t, plain, "/tiles/world/metadata"); rec.Code != http.StatusNotFound {
 		t.Errorf("missing metadata: status %d, want 404", rec.Code)
+	}
+}
+
+func TestTilesetMetadataCacheInvalidatesOnTableVersion(t *testing.T) {
+	inst := &tinysql.Instance{DB: storage.NewDB()}
+	meta := storage.NewTable("world_metadata", []storage.Column{
+		{Name: "name", Type: storage.TextType},
+		{Name: "value", Type: storage.TextType},
+	}, false)
+	meta.Rows = [][]any{{"format", "png"}}
+	meta.Version++
+	if err := inst.DB.Put("default", meta); err != nil {
+		t.Fatal(err)
+	}
+	d := newDaemon(inst, daemonConfig{DefaultTenant: "default", Tiles: true})
+	ctx := context.Background()
+	if got := d.tilesetMetadata(ctx, "default", "world")["format"]; got != "png" {
+		t.Fatalf("first metadata format = %q", got)
+	}
+	meta.Rows[0][1] = "pbf"
+	meta.Version++
+	if got := d.tilesetMetadata(ctx, "default", "world")["format"]; got != "pbf" {
+		t.Fatalf("metadata after version change = %q", got)
 	}
 }
 
