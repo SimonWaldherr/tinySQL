@@ -1049,7 +1049,13 @@ func materializeVecCandidates(table *storage.Table, scoredRowsOrdered []vecScore
 		r := make(Row, len(table.Cols)+3)
 		for ci, c := range table.Cols {
 			if ci < len(table.Rows[sr.rowIdx]) {
-				r[c.Name] = table.Rows[sr.rowIdx][ci]
+				// Lower-cased to match ragFuseCandidates and ragCopyOutputRow.
+				// ragValue looks up the lower-cased key first and only then
+				// falls back to an EqualFold scan over every key, so writing
+				// the schema's own casing here put every lookup against an
+				// upper-case schema on the slow path -- and made a vector-only
+				// RAG_SEARCH hand back differently-keyed rows than a hybrid one.
+				r[strings.ToLower(c.Name)] = table.Rows[sr.rowIdx][ci]
 			}
 		}
 		r["_vec_distance"] = sr.distance
