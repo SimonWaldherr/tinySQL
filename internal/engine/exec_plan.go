@@ -654,7 +654,11 @@ func isCatalogViewSource(env ExecEnv, name string) bool {
 }
 
 func simpleSelectEligible(s *Select) bool {
-	if s.Distinct || len(s.DistinctOn) > 0 || len(s.CTEs) > 0 || len(s.Joins) > 0 ||
+	// Plain DISTINCT is handled by executeSimpleSelectDistinctFastPath, which
+	// dedupes on projected values before materializing a Row map. DISTINCT ON
+	// keeps its general-path implementation: its "first row per key" result
+	// depends on ORDER BY, which the raw distinct path deliberately declines.
+	if len(s.DistinctOn) > 0 || len(s.CTEs) > 0 || len(s.Joins) > 0 ||
 		len(s.GroupBy) > 0 || s.Having != nil || s.Union != nil || s.Pivot != nil ||
 		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil {
 		return false

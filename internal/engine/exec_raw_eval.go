@@ -40,6 +40,85 @@ func projectRawRow(plan *simpleSelectPlan, raw []any) (Row, error) {
 	return out, nil
 }
 
+// projectRawValues computes the projected value of every select-list item into
+// vals (which must have len(plan.projs) entries), without building a Row map.
+//
+// It is projectRawRow split at the point the map is populated, so the DISTINCT
+// fast path can hash a candidate row's output values and drop a duplicate
+// before paying for the map. The two must stay in agreement about what a
+// projection evaluates to; TestDistinctFastPathMatchesGeneralPath pins that
+// behaviorally by comparing both paths' results.
+func projectRawValues(plan *simpleSelectPlan, raw []any, vals []any) error {
+	for i, p := range plan.projs {
+		if p.colIdx >= 0 {
+			// Direct column reference: skip type switch, map lookup, and ToLower.
+			vals[i] = raw[p.colIdx]
+			continue
+		}
+		v, err := evalRawExpr(plan, raw, p.expr)
+		if err != nil {
+			return err
+		}
+		vals[i] = v
+	}
+	return nil
+}
+
+// rowFromProjectedValues materializes the Row map for already-computed
+// projection values, populating the same primary and alternate keys
+// projectRawRow does.
+func rowFromProjectedValues(plan *simpleSelectPlan, vals []any) Row {
+	out := make(Row, plan.rowMapCap)
+	for i, p := range plan.projs {
+		out[p.key] = vals[i]
+		if p.altKey != "" {
+			out[p.altKey] = vals[i]
+		}
+	}
+	return out
+}
+
+// appendDistinctKey appends the DISTINCT dedup key for one row's projected
+// values, byte-for-byte identical to the key distinctRows (row_helpers.go)
+// builds from the materialized Row map.
+//
+// That identity is what makes the fast path safe, and it holds because output
+// column i is projection i: distinctRows looks up r[lower(outputCols[i])], and
+// projectRawRow writes projection i's value at exactly that key. The one shape
+// where the correspondence breaks — two projections sharing an output name, so
+// the map holds only the last one's value under that key — is rejected up front
+// by distinctProjectionsSafe.
+func appendDistinctKey(buf []byte, vals []any) []byte {
+	for i, v := range vals {
+		if i > 0 {
+			buf = append(buf, '|')
+		}
+		buf = writeFmtKeyPart(buf, v)
+	}
+	return buf
+}
+
+// distinctProjectionsSafe reports whether every projection writes a distinct
+// Row map key, which is the precondition appendDistinctKey relies on.
+//
+// `SELECT DISTINCT a AS x, b AS x` collapses to a single "x" entry in the Row
+// map, so the general path's key repeats b's value twice while a
+// values-based key would use a's value and then b's — a real divergence, not a
+// hypothetical one. Such a query falls back to the general path.
+func distinctProjectionsSafe(projs []simpleProjection) bool {
+	if len(projs) < 2 {
+		return true
+	}
+	seen := make(map[string]struct{}, len(projs))
+	for _, p := range projs {
+		if _, dup := seen[p.key]; dup {
+			return false
+		}
+		seen[p.key] = struct{}{}
+	}
+	return true
+}
+
 func evalRawExpr(plan *simpleSelectPlan, raw []any, e Expr) (any, error) {
 	switch ex := e.(type) {
 	case *Literal:

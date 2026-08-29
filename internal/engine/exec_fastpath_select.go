@@ -18,6 +18,19 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 	if !ok || err != nil {
 		return nil, ok, err
 	}
+	if s.Distinct {
+		// DISTINCT combined with ORDER BY keeps the general path: the ordered
+		// fast path sorts raw source rows and projects afterwards, whereas
+		// DISTINCT has to collapse duplicates on the *projected* values first,
+		// and the two cannot simply be composed in that order.
+		//
+		// A select list that maps two projections onto one output name is
+		// likewise handed back (see distinctProjectionsSafe).
+		if len(plan.orderBy) > 0 || !distinctProjectionsSafe(plan.projs) {
+			return nil, false, nil
+		}
+		return executeSimpleSelectDistinctFastPath(env, plan)
+	}
 	if len(plan.orderBy) > 0 {
 		return executeSimpleSelectOrderedFastPath(env, plan)
 	}
@@ -84,6 +97,107 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 // so this shortcut is deliberately restricted to a scan with no WHERE clause
 // and no index RowID set. In the common pagination shape this avoids building
 // and then discarding one Row map for every skipped row.
+// executeSimpleSelectDistinctFastPath runs SELECT DISTINCT without an ORDER BY
+// directly over raw rows.
+//
+// DISTINCT previously disqualified the raw fast path outright
+// (simpleSelectEligible), so the general path materialized a Row map for every
+// *source* row and only then collapsed duplicates in distinctRows. For the
+// shape DISTINCT is normally written for — few distinct values over many rows,
+// e.g. SELECT DISTINCT status FROM events — that is one map allocation per
+// scanned row to produce a handful of output rows. Hashing the projected values
+// first means a map is built only for a row that actually survives, so the
+// allocation count follows the size of the *result* rather than the table.
+//
+// The dedup key is byte-identical to distinctRows' (see appendDistinctKey), and
+// first-occurrence-wins ordering is preserved, so the returned rows match the
+// general path exactly.
+//
+// LIMIT/OFFSET are applied here against distinct rows, because a fast path
+// returns straight to executeSelect's caller and the general tail never runs.
+// Counting distinct rows (not scanned rows) is what makes that correct, and it
+// also lets a LIMIT stop the scan as soon as enough distinct rows exist.
+func executeSimpleSelectDistinctFastPath(env ExecEnv, plan *simpleSelectPlan) (*ResultSet, bool, error) {
+	if plan.limit != nil && *plan.limit == 0 {
+		return &ResultSet{Cols: plan.outputCols, Rows: []Row{}}, true, nil
+	}
+
+	rows := simplePlanRows(plan)
+	rowCount := len(rows)
+	if plan.rowIDs != nil {
+		rowCount = len(plan.rowIDs)
+	}
+
+	offset := 0
+	if plan.offset != nil && *plan.offset > 0 {
+		offset = *plan.offset
+	}
+	stopAfter := -1
+	if plan.limit != nil {
+		stopAfter = offset + *plan.limit
+	}
+
+	seen := make(map[string]struct{})
+	vals := make([]any, len(plan.projs))
+	// key is reused across rows; seen[string(key)] is a zero-allocation lookup,
+	// so a string is only materialized for a genuinely new row — the same
+	// trick distinctRows uses.
+	key := make([]byte, 0, 64)
+	var outRows []Row
+	distinctCount := 0
+
+	for i := 0; i < rowCount; i++ {
+		rowID := i
+		if plan.rowIDs != nil {
+			rowID = plan.rowIDs[i]
+		}
+		if rowID < 0 || rowID >= len(rows) {
+			return nil, true, fmt.Errorf("index %q returned invalid row id %d", plan.indexName, rowID)
+		}
+		if i&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, true, err
+			}
+		}
+		raw := rows[rowID]
+
+		match := plan.filterFullyCovered
+		if !match {
+			var err error
+			match, err = evalRawWhere(plan, raw)
+			if err != nil {
+				return nil, true, err
+			}
+		}
+		if !match {
+			continue
+		}
+
+		if err := projectRawValues(plan, raw, vals); err != nil {
+			return nil, true, err
+		}
+		key = appendDistinctKey(key[:0], vals)
+		if _, dup := seen[string(key)]; dup {
+			continue
+		}
+		seen[string(key)] = struct{}{}
+
+		distinctCount++
+		if distinctCount <= offset {
+			continue
+		}
+		outRows = append(outRows, rowFromProjectedValues(plan, vals))
+		if stopAfter >= 0 && distinctCount >= stopAfter {
+			break
+		}
+	}
+
+	if outRows == nil {
+		outRows = []Row{}
+	}
+	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, true, nil
+}
+
 func executeSimpleSelectUnfilteredFastPath(env ExecEnv, plan *simpleSelectPlan) (*ResultSet, bool, error) {
 	rows := simplePlanRows(plan)
 	// The generic scan checks the context on its first source row, even when
