@@ -15,6 +15,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -116,6 +117,79 @@ func TestCheckpointCrashBeforeTruncationDoesNotDuplicateRows(t *testing.T) {
 		if n != 1 {
 			t.Errorf("id %d appears %d times after recovery, want once", id, n)
 		}
+	}
+}
+
+// TestSaveToFileRefusesToBypassLiveWALWatermark covers the same duplication
+// outcome as TestCheckpointCrashBeforeTruncationDoesNotDuplicateRows above,
+// reached a different way: not a crash inside WALManager.Checkpoint, but a
+// caller reaching for the generic, public SaveToFile (or the tinysql REPL's
+// ".save FILE") and pointing it at the live database's own checkpoint file
+// instead of going through Checkpoint.
+//
+// That call succeeds (no watermark, WAL untouched) and every row it wrote
+// duplicates on the very next ordinary, non-crash restart — SaveToFile must
+// refuse it instead.
+func TestSaveToFileRefusesToBypassLiveWALWatermark(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "ckpt")
+
+	db := openWALDB(t, base)
+	seedRows(t, db, "default", "accounts", 0, 10)
+	if err := db.WAL().Checkpoint(db); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	seedRows(t, db, "default", "accounts", 10, 20)
+
+	err := SaveToFile(db, base)
+	if !errors.Is(err, ErrSaveToFileWouldBypassWALWatermark) {
+		t.Fatalf("SaveToFile(db, base) error = %v, want ErrSaveToFileWouldBypassWALWatermark", err)
+	}
+
+	// A relative/absolute or (on Windows) differently-cased spelling of the
+	// same path must be caught too — samePath, not a literal string compare.
+	rel, relErr := filepath.Rel(".", base)
+	if relErr == nil {
+		if err := SaveToFile(db, rel); !errors.Is(err, ErrSaveToFileWouldBypassWALWatermark) {
+			t.Errorf("SaveToFile with a relative spelling of the same path: err = %v, want the same rejection", err)
+		}
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// The rejection must not have perturbed the checkpoint file: a normal
+	// reopen still sees exactly the checkpointed rows via the WAL replay path,
+	// not a corrupted or half-written snapshot.
+	recovered := openWALDB(t, base)
+	defer recovered.Close()
+	if got := rowCount(t, recovered, "default", "accounts"); got != 20 {
+		t.Errorf("rows after reopen = %d, want 20 (rejecting the bad SaveToFile must not have damaged the checkpoint)", got)
+	}
+}
+
+// TestSaveToFileStillWorksElsewhereForALiveWALDatabase makes sure the guard
+// is scoped to the live checkpoint path specifically: an export/backup save to
+// any other filename -- the normal, safe use of the public API -- must keep
+// working exactly as before.
+func TestSaveToFileStillWorksElsewhereForALiveWALDatabase(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "ckpt")
+	backup := filepath.Join(t.TempDir(), "backup.gob")
+
+	db := openWALDB(t, base)
+	defer db.Close()
+	seedRows(t, db, "default", "accounts", 0, 5)
+
+	if err := SaveToFile(db, backup); err != nil {
+		t.Fatalf("SaveToFile to an unrelated path should succeed: %v", err)
+	}
+	loaded, err := LoadFromFile(backup)
+	if err != nil {
+		t.Fatalf("load the backup: %v", err)
+	}
+	defer loaded.Close()
+	if got := rowCount(t, loaded, "default", "accounts"); got != 5 {
+		t.Errorf("backup has %d rows, want 5", got)
 	}
 }
 

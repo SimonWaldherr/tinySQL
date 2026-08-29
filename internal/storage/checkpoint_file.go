@@ -10,11 +10,18 @@ import (
 	"compress/gzip"
 	"encoding/gob"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
+
+// ErrSaveToFileWouldBypassWALWatermark is returned by SaveToFile when
+// filename is the checkpoint path of a WALManager or AdvancedWAL currently
+// attached to db and the call carries no watermark (see rejectLiveWALPath).
+var ErrSaveToFileWouldBypassWALWatermark = errors.New("tinysql: SaveToFile would overwrite a live WAL-mode database's own checkpoint file without a watermark; use WALManager.Checkpoint/AdvancedWAL.Checkpoint (or DB.Close) instead")
 
 // SaveToFile writes a snapshot of the database to a file. If the filename
 // ends with .gz, the snapshot is gzip-compressed to reduce size.
@@ -32,6 +39,16 @@ import (
 // leave the two inconsistent after a crash. Existing callers that pass no
 // extra values are unaffected; the file format is unchanged for them.
 func SaveToFile(db *DB, filename string, extra ...any) error {
+	// Checked (and must be checked) before this function's own db.mu.RLock
+	// below: db.WAL()/db.AdvancedWAL() take that same RLock themselves, and a
+	// second RLock from the same call stack while a writer is queued in
+	// between is a real Go RWMutex deadlock, not just a style preference.
+	if len(extra) == 0 {
+		if err := rejectLiveWALCheckpointPath(db, filename); err != nil {
+			return err
+		}
+	}
+
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
@@ -252,4 +269,54 @@ func SaveToBytes(db *DB, extra ...any) ([]byte, error) {
 // to LoadFromReader unchanged.
 func LoadFromBytes(b []byte, extra ...any) (*DB, error) {
 	return LoadFromReader(bytes.NewReader(b), extra...)
+}
+
+// rejectLiveWALCheckpointPath refuses a zero-extra SaveToFile call whose
+// filename is the checkpoint path of a WALManager or AdvancedWAL currently
+// attached to db.
+//
+// Both WALManager.Checkpoint (wal_manager.go) and AdvancedWAL.Checkpoint
+// (wal_advanced.go) call SaveToFile at exactly that path, but always with at
+// least one extra value: their watermark, which a later open reads back via
+// ReadCheckpointWatermark/readCheckpointDataWatermark to skip WAL records the
+// snapshot already contains. A caller that reaches this same path directly
+// through the public SaveToFile/SaveToFile-backed API (the exported
+// tinysql.SaveToFile, or the tinysql REPL's ".save FILE") writes a snapshot
+// with no watermark and leaves the live WAL file untouched -- no crash
+// required, since a perfectly clean restart after such a save replays every
+// WAL record already covered by the snapshot a second time and duplicates
+// every row committed since the last real checkpoint. The zero-extra
+// condition is what distinguishes that external call from Checkpoint's own,
+// internal one.
+func rejectLiveWALCheckpointPath(db *DB, filename string) error {
+	if filename == "" {
+		return nil
+	}
+	if wal := db.WAL(); wal != nil && samePath(filename, wal.checkpointPath) {
+		return fmt.Errorf("%w: %q", ErrSaveToFileWouldBypassWALWatermark, filename)
+	}
+	if aw := db.AdvancedWAL(); aw != nil && samePath(filename, aw.checkpointPath) {
+		return fmt.Errorf("%w: %q", ErrSaveToFileWouldBypassWALWatermark, filename)
+	}
+	return nil
+}
+
+// samePath reports whether a and b name the same file, without resolving
+// symlinks: good enough to catch the direct "same path string, maybe
+// relative vs. absolute, maybe different case on Windows" case this guards
+// against, without the cost or platform variance of a device+inode stat.
+func samePath(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	absA, errA := filepath.Abs(a)
+	absB, errB := filepath.Abs(b)
+	if errA != nil || errB != nil {
+		absA, absB = a, b
+	}
+	absA, absB = filepath.Clean(absA), filepath.Clean(absB)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(absA, absB)
+	}
+	return absA == absB
 }
