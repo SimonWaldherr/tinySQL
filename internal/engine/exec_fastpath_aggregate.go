@@ -1,6 +1,19 @@
 // Fast path for grouped aggregation: accumulate COUNT/SUM/AVG/MIN/MAX directly
 // off stored rows in a single scan, instead of buffering each group's rows and
 // re-scanning them once per aggregate expression.
+//
+// This also covers the ungrouped case (no GROUP BY at all, e.g. "SELECT
+// COUNT(*) FROM t" or "SELECT SUM(x), AVG(y) FROM t WHERE ..."), which used to
+// be excluded here and fall all the way back to the general path: resolveFromClause
+// materializes a dual-key Row map for every row of the table via rowsFromTable
+// before aggregation even begins, for a query shape that is arguably the most
+// common one in SQL. The accumulator machinery below already treats "zero
+// group-by columns" as one implicit group (see executeSimpleMultiGroupAggregate),
+// so the only genuinely new piece is synthesizing that one group's output row
+// when no input row matched — a whole-table aggregate must still return exactly
+// one row over zero matching rows (COUNT(*) = 0, SUM/AVG/MIN/MAX = NULL),
+// whereas a real "GROUP BY x" correctly returns zero rows in that case. See the
+// identical contract and its rationale in processAggregateQuery (exec_group.go).
 package engine
 
 import (
@@ -163,6 +176,15 @@ func executeSimpleMultiGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, ra
 		if err := accumulateSimpleAggregateState(env, rawPlan, raw, state, plan.projs); err != nil {
 			return nil, true, err
 		}
+	}
+	// A whole-table aggregate (no GROUP BY) always produces exactly one row,
+	// even over zero matching input rows: see the package doc comment and
+	// processAggregateQuery's identical synthesis (exec_group.go). A real
+	// "GROUP BY x" correctly produces zero rows here instead, which is why
+	// this is conditioned on zero group-by columns specifically, not just an
+	// empty result.
+	if len(plan.groupCols) == 0 && len(order) == 0 {
+		order = append(order, newSimpleAggregateState(nil, len(plan.projs)))
 	}
 	rs, err := finalizeSimpleAggregateResultSet(env, plan, order)
 	return rs, true, err
@@ -568,9 +590,16 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 }
 
 func simpleAggregateEligibleSelect(s *Select) bool {
+	// len(s.GroupBy) > 0 admits a normal GROUP BY query; anyAggInSelect admits
+	// the ungrouped whole-table aggregate case ("SELECT COUNT(*) FROM t", no
+	// GROUP BY at all). buildSimpleAggregatePlan still requires hasAgg==true
+	// regardless of which of these let a query through, so this is purely a
+	// cheap pre-filter to skip attempting to build a plan for an ordinary
+	// non-aggregate SELECT.
 	if !(!s.Distinct && len(s.DistinctOn) <= 0 && len(s.CTEs) <= 0 && len(s.Joins) <= 0 &&
 		s.Union == nil &&
-		s.From.Table != "" && s.From.Subquery == nil && s.From.TableFunc == nil && len(s.GroupBy) > 0 &&
+		s.From.Table != "" && s.From.Subquery == nil && s.From.TableFunc == nil &&
+		(len(s.GroupBy) > 0 || anyAggInSelect(s.Projs)) &&
 		s.Pivot == nil && !isSQLiteSchemaTable(s.From.Table)) {
 		return false
 	}
