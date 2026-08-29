@@ -77,6 +77,21 @@ func main() {
 	}
 }
 
+// parseCLIFlags parses args and reports whether the caller should return.
+//
+// -h and --help are requests, not failures: the flag package has already
+// written the usage text by the time it returns ErrHelp, so propagating that
+// error would append "Error: flag: help requested" and exit 1.
+func parseCLIFlags(fs *flag.FlagSet, args []string) (done bool, err error) {
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return true, nil
+		}
+		return true, err
+	}
+	return false, nil
+}
+
 func exitIfErr(err error) {
 	if err == nil {
 		return
@@ -97,7 +112,16 @@ func runCLI(args []string) (runErr error) {
 	}
 	fs := flag.NewFlagSet("tinysql", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage: tinysql [OPTIONS] [DATABASE] [SQL]\n")
+		fmt.Fprintf(fs.Output(), "Usage: tinysql [OPTIONS] [DATABASE] [SQL]\n\n")
+		fmt.Fprintf(fs.Output(), "Subcommands:\n"+
+			"  shell, repl <database>        Interactive shell (same flags as above)\n"+
+			"  tables [flags] <database>     List tables\n"+
+			"  schema [flags] <database>     Print the schema\n"+
+			"  query [flags] <db> <sql...>   Run one query\n"+
+			"  insert <db> <table> <json...> Insert JSON rows\n"+
+			"  version                       Print version and exit\n"+
+			"  help                          Show this help\n\n")
+		fmt.Fprintf(fs.Output(), "Options:\n")
 		fs.PrintDefaults()
 	}
 
@@ -114,7 +138,7 @@ func runCLI(args []string) (runErr error) {
 	)
 	storageFlags := addStorageFlags(fs)
 
-	if err := fs.Parse(args); err != nil {
+	if done, err := parseCLIFlags(fs, args); done {
 		return err
 	}
 	if *version {
@@ -1458,6 +1482,11 @@ func tryUtilityCommand(name string, args []string) (bool, error) {
 	switch name {
 	case "version":
 		return true, printVersion(os.Stdout)
+	case "help":
+		// Without this, "help" falls through to runCLI and is taken as the
+		// database path, which creates a file named "help" in the working
+		// directory and opens an interactive shell on it.
+		return true, runCLI([]string{"-h"})
 	case "shell", "repl":
 		// Keep cmd/repl as a compatible standalone binary, but make the main
 		// tool the natural entry point for interactive use too. Passing the
@@ -1482,7 +1511,7 @@ func runTablesUtil(args []string) error {
 	tenant := fs.String("tenant", "default", "Tenant")
 	jsonOut := fs.Bool("json", false, "Emit JSON")
 	storageFlags := addStorageFlags(fs)
-	if err := fs.Parse(args); err != nil {
+	if done, err := parseCLIFlags(fs, args); done {
 		return err
 	}
 	if fs.NArg() != 1 {
@@ -1519,7 +1548,7 @@ func runSchemaUtil(args []string) error {
 	fs := flag.NewFlagSet("schema", flag.ContinueOnError)
 	tenant := fs.String("tenant", "default", "Tenant")
 	storageFlags := addStorageFlags(fs)
-	if err := fs.Parse(args); err != nil {
+	if done, err := parseCLIFlags(fs, args); done {
 		return err
 	}
 	if fs.NArg() != 1 {
@@ -1543,7 +1572,7 @@ func runQueryUtil(args []string) (runErr error) {
 	mode := fs.String("mode", "table", "Output mode")
 	headers := fs.Bool("header", true, "Include column headers")
 	storageFlags := addStorageFlags(fs)
-	if err := fs.Parse(args); err != nil {
+	if done, err := parseCLIFlags(fs, args); done {
 		return err
 	}
 	if fs.NArg() < 2 {
@@ -1591,7 +1620,7 @@ func runInsertUtil(args []string) (runErr error) {
 	fs := flag.NewFlagSet("insert", flag.ContinueOnError)
 	tenant := fs.String("tenant", "default", "Tenant")
 	storageFlags := addStorageFlags(fs)
-	if err := fs.Parse(args); err != nil {
+	if done, err := parseCLIFlags(fs, args); done {
 		return err
 	}
 	if fs.NArg() < 3 {

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -25,25 +26,28 @@ func TestBuildTinysql(t *testing.T) {
 	// bound is here to catch a hung toolchain, not to police build speed.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	out := filepath.Join(os.TempDir(), "tiny_tinysql_bin")
+	// Windows will not execute a file without an executable extension, and a
+	// fixed name under os.TempDir() collides when two runs overlap. t.TempDir
+	// is per-test and is cleaned up for us.
+	name := "tiny_tinysql_bin"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	out := filepath.Join(t.TempDir(), name)
 	cmd := exec.CommandContext(ctx, "go", "build", "-o", out, ".")
 	cmd.Env = os.Environ()
 	if outp, err := cmd.CombinedOutput(); err != nil {
-		_ = os.Remove(out)
 		t.Fatalf("go build failed: %v\n%s", err, string(outp))
 	}
 	for _, arg := range []string{"-version", "--version", "version"} {
 		version, err := exec.Command(out, arg).Output()
 		if err != nil {
-			_ = os.Remove(out)
 			t.Fatalf("tinysql %s failed: %v", arg, err)
 		}
 		if got, want := string(version), "tinySQL "+versionString()+"\n"; got != want {
-			_ = os.Remove(out)
 			t.Fatalf("tinysql %s = %q, want %q", arg, got, want)
 		}
 	}
-	_ = os.Remove(out)
 }
 
 func TestShellAndReplSubcommandsRouteToMainCLI(t *testing.T) {
