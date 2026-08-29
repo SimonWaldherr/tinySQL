@@ -37,6 +37,11 @@ type apiResponse struct {
 	Error    string           `json:"error,omitempty"`
 	Tables   []tableInfo      `json:"tables,omitempty"`
 	Conns    []connectionInfo `json:"connections,omitempty"`
+	// Skipped/SkipReasons report source rows an import could not land. A
+	// caller over HTTP never sees the stderr warning, so a partial import
+	// would otherwise look identical to a complete one.
+	Skipped     int      `json:"skipped,omitempty"`
+	SkipReasons []string `json:"skipReasons,omitempty"`
 }
 
 type tableInfo struct {
@@ -427,17 +432,27 @@ func (s *webState) handleImportDB(w http.ResponseWriter, r *http.Request) {
 	}
 
 	start := time.Now()
-	count, err := importFromExternal(s.db, s.ctx, s.tenant, extDB, query, tableName, false)
+	stats, err := importFromExternal(s.db, s.ctx, s.tenant, extDB, query, tableName)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, apiResponse{Error: fmt.Sprintf("import failed: %v", err)})
 		return
 	}
 
+	// An HTTP caller cannot see the stderr warning, so the count and the
+	// reason travel in the response instead. Without them a partial import was
+	// indistinguishable from a complete one.
+	message := fmt.Sprintf("Imported %d rows into '%s'", stats.Imported, tableName)
+	if stats.Skipped > 0 {
+		message = fmt.Sprintf("Imported %d of %d source rows into '%s'; %d could not be imported",
+			stats.Imported, stats.Imported+stats.Skipped, tableName, stats.Skipped)
+	}
 	writeJSON(w, http.StatusOK, apiResponse{
-		Success:  true,
-		RowCount: count,
-		Duration: time.Since(start).String(),
-		Message:  fmt.Sprintf("Imported %d rows into '%s'", count, tableName),
+		Success:     true,
+		RowCount:    stats.Imported,
+		Skipped:     stats.Skipped,
+		SkipReasons: stats.Errors,
+		Duration:    time.Since(start).String(),
+		Message:     message,
 	})
 }
 

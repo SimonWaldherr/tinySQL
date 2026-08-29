@@ -147,12 +147,12 @@ func upsertRowsIntoTinySQL(ctx context.Context, db *tinysql.DB, tenant, table st
 
 		// UPDATE affected nothing: the row doesn't exist yet. INSERT is the
 		// only write for it — never both, to avoid double-writing.
-		insertSQL := buildInsert(table, colNames, row.Columns)
-		insertStmt, perr := tinysql.ParseSQL(insertSQL)
-		if perr != nil {
-			return upserted, fmt.Errorf("parse insert for table %s: %w", table, perr)
-		}
-		if _, eerr := tinysql.Execute(ctx, db, tenant, insertStmt); eerr != nil {
+		//
+		// Built as an AST rather than SQL text for the same reason
+		// importFromExternal does: rendering a value into SQL cannot represent
+		// everything a source database holds, and a non-finite float used to
+		// fail here with `unknown column "Inf"`.
+		if _, eerr := tinysql.Execute(ctx, db, tenant, buildInsertStmt(table, colNames, row.Columns)); eerr != nil {
 			return upserted, fmt.Errorf("execute insert for table %s: %w", table, eerr)
 		}
 		upserted++

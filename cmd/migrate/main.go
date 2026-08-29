@@ -287,12 +287,13 @@ func runImportDB(args []string) error {
 	tenant := "default"
 
 	start := time.Now()
-	count, err := importFromExternal(db, ctx, tenant, extDB, *sourceQuery, *table, *verbose)
+	stats, err := importFromExternal(db, ctx, tenant, extDB, *sourceQuery, *table)
 	if err != nil {
 		return err
 	}
+	reportImportSkips(os.Stderr, stats, *table)
 	if *verbose {
-		fmt.Fprintf(os.Stderr, "✓ Imported %d rows into table '%s' in %v\n", count, *table, time.Since(start))
+		fmt.Fprintf(os.Stderr, "✓ Imported %d rows into table '%s' in %v\n", stats.Imported, *table, time.Since(start))
 	}
 
 	var runErr error
@@ -839,12 +840,13 @@ func handleImportDB(db *tinysql.DB, ctx context.Context, tenant, input string) {
 	}
 
 	start := time.Now()
-	count, err := importFromExternal(db, ctx, tenant, extDB, query, tableName, false)
+	stats, err := importFromExternal(db, ctx, tenant, extDB, query, tableName)
 	if err != nil {
 		fmt.Printf("✗ Error: %v\n", err)
 		return
 	}
-	fmt.Printf("✓ Imported %d rows from %s into table '%s' (%v)\n", count, connName, tableName, time.Since(start))
+	reportImportSkips(os.Stdout, stats, tableName)
+	fmt.Printf("✓ Imported %d rows from %s into table '%s' (%v)\n", stats.Imported, connName, tableName, time.Since(start))
 }
 
 func handleExport(db *tinysql.DB, ctx context.Context, tenant, input string) {
@@ -1114,37 +1116,83 @@ func importFileToTinySQL(db *tinysql.DB, ctx context.Context, tenant, filename, 
 	return nil
 }
 
-func importFromExternal(db *tinysql.DB, ctx context.Context, tenant string, extDB *sql.DB, query, tableName string, verbose bool) (int, error) {
+// importMaxSkippedRows bounds how many source rows may fail before the import
+// gives up, mirroring FuzzyImportCSV's MaxSkippedRows (internal/importer). A
+// handful of unreadable rows in a large table is worth reporting and carrying
+// on from; a source where everything fails is a broken import, not a lossy one.
+const importMaxSkippedRows = 100
+
+// importErrorSample bounds how many per-row messages importStats keeps. The
+// count stays exact; only the sample is truncated.
+const importErrorSample = 5
+
+// importStats accounts for every source row importFromExternal saw. Skipped
+// used to be invisible: each failure was logged only under -verbose and then
+// dropped, so a partial import was indistinguishable from a complete one.
+type importStats struct {
+	Imported int
+	Skipped  int
+	Errors   []string
+}
+
+func (s *importStats) note(rowNum int, stage string, err error) {
+	s.Skipped++
+	if len(s.Errors) < importErrorSample {
+		s.Errors = append(s.Errors, fmt.Sprintf("source row %d (%s): %v", rowNum, stage, err))
+	}
+}
+
+// reportImportSkips writes a warning whenever rows were dropped. It is
+// deliberately never gated on -verbose: dropped rows are data loss, not
+// progress chatter.
+func reportImportSkips(w io.Writer, stats importStats, tableName string) {
+	if stats.Skipped == 0 {
+		return
+	}
+	fmt.Fprintf(w, "⚠ %d of %d source rows were NOT imported into '%s'\n",
+		stats.Skipped, stats.Imported+stats.Skipped, tableName)
+	for _, e := range stats.Errors {
+		fmt.Fprintf(w, "    %s\n", e)
+	}
+	if stats.Skipped > len(stats.Errors) {
+		fmt.Fprintf(w, "    ... and %d more\n", stats.Skipped-len(stats.Errors))
+	}
+}
+
+func importFromExternal(db *tinysql.DB, ctx context.Context, tenant string, extDB *sql.DB, query, tableName string) (importStats, error) {
+	var stats importStats
+
 	rows, err := extDB.QueryContext(ctx, query)
 	if err != nil {
-		return 0, fmt.Errorf("external query failed: %v", err)
+		return stats, fmt.Errorf("external query failed: %v", err)
 	}
 	defer rows.Close()
 
 	cols, err := rows.Columns()
 	if err != nil {
-		return 0, fmt.Errorf("failed to get columns: %v", err)
+		return stats, fmt.Errorf("failed to get columns: %v", err)
 	}
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
-		return 0, fmt.Errorf("failed to get column types: %v", err)
+		return stats, fmt.Errorf("failed to get column types: %v", err)
 	}
 
 	// Build CREATE TABLE statement
 	createSQL := buildCreateTable(tableName, cols, colTypes)
 	createStmt, err := tinysql.ParseSQL(createSQL)
 	if err != nil {
-		return 0, fmt.Errorf("failed to parse CREATE TABLE: %v", err)
+		return stats, fmt.Errorf("failed to parse CREATE TABLE: %v", err)
 	}
 
 	if _, err := tinysql.Execute(ctx, db, tenant, createStmt); err != nil {
-		return 0, fmt.Errorf("failed to create table: %v", err)
+		return stats, fmt.Errorf("failed to create table: %v", err)
 	}
 
 	// Insert rows
-	count := 0
+	rowNum := 0
 	for rows.Next() {
+		rowNum++
 		values := make([]any, len(cols))
 		valuePtrs := make([]any, len(cols))
 		for i := range values {
@@ -1152,31 +1200,21 @@ func importFromExternal(db *tinysql.DB, ctx context.Context, tenant string, extD
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
-			if verbose {
-				fmt.Fprintf(os.Stderr, "  ⚠ Skipping row: %v\n", err)
-			}
+			stats.note(rowNum, "scan", err)
+		} else if _, err := tinysql.Execute(ctx, db, tenant, buildInsertStmt(tableName, cols, values)); err != nil {
+			stats.note(rowNum, "insert", err)
+		} else {
+			stats.Imported++
 			continue
 		}
 
-		insertSQL := buildInsert(tableName, cols, values)
-		insertStmt, err := tinysql.ParseSQL(insertSQL)
-		if err != nil {
-			if verbose {
-				fmt.Fprintf(os.Stderr, "  ⚠ Skipping row (parse): %v\n", err)
-			}
-			continue
+		if stats.Skipped > importMaxSkippedRows {
+			return stats, fmt.Errorf("import into %s aborted: more than %d source rows could not be imported (last: %s)",
+				tableName, importMaxSkippedRows, stats.Errors[len(stats.Errors)-1])
 		}
-
-		if _, err := tinysql.Execute(ctx, db, tenant, insertStmt); err != nil {
-			if verbose {
-				fmt.Fprintf(os.Stderr, "  ⚠ Skipping row (insert): %v\n", err)
-			}
-			continue
-		}
-		count++
 	}
 
-	return count, rows.Err()
+	return stats, rows.Err()
 }
 
 func exportToExternal(extDB *sql.DB, driver string, result *tinysql.ResultSet, targetTable string, createTable bool) (int, error) {
@@ -1301,30 +1339,29 @@ func buildCreateTable(tableName string, cols []string, colTypes []*sql.ColumnTyp
 	return sb.String()
 }
 
-func buildInsert(tableName string, cols []string, values []any) string {
-	var sb strings.Builder
-	sb.WriteString("INSERT INTO ")
-	sb.WriteString(tableName)
-	sb.WriteString(" (")
-
+// buildInsertStmt builds the INSERT for a row landing in tinySQL directly as
+// an AST, rather than rendering SQL text for the parser to read back.
+//
+// The text path could not represent every value a source database yields:
+// formatValue renders a non-finite float as the bare token NaN/+Inf/-Inf,
+// which the parser reads as a column reference, so those rows failed with
+// `unknown column "Inf"`. PostgreSQL's double precision and SQLite's REAL both
+// store those values happily. Passing the value through as a literal also
+// removes the interpolation of source data into SQL text entirely.
+//
+// This replaces the buildInsert/ParseSQL/Execute trio both the full and the
+// incremental import used. exportToExternal, which writes to someone else's
+// driver, already binds its values as placeholders rather than rendering them.
+func buildInsertStmt(tableName string, cols []string, values []any) tinysql.Statement {
+	names := make([]string, len(cols))
 	for i, col := range cols {
-		if i > 0 {
-			sb.WriteString(", ")
-		}
-		sb.WriteString(sanitizeColumnName(col))
+		names[i] = sanitizeColumnName(col)
 	}
-
-	sb.WriteString(") VALUES (")
-
-	for i, val := range values {
-		if i > 0 {
-			sb.WriteString(", ")
-		}
-		sb.WriteString(formatValue(val))
+	literals := make([]tinysql.ExprBuilder, len(values))
+	for i, v := range values {
+		literals[i] = tinysql.Val(v)
 	}
-
-	sb.WriteString(")")
-	return sb.String()
+	return tinysql.InsertInto(tableName).Columns(names...).Values(literals...).Build()
 }
 
 func buildExternalCreateTable(driver, tableName string, cols []string) string {
