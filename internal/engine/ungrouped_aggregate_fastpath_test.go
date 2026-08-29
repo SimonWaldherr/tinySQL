@@ -44,7 +44,7 @@ func firstRow(t *testing.T, rs *ResultSet) Row {
 
 func TestUngroupedAggregateBasic(t *testing.T) {
 	db := ungroupedAggDB(t)
-	rs := execSQL(t, db,`SELECT COUNT(*) AS n, COUNT(val) AS nv, SUM(val) AS s, AVG(val) AS a, MIN(val) AS mn, MAX(val) AS mx FROM u`)
+	rs := execSQL(t, db, `SELECT COUNT(*) AS n, COUNT(val) AS nv, SUM(val) AS s, AVG(val) AS a, MIN(val) AS mn, MAX(val) AS mx FROM u`)
 	r := firstRow(t, rs)
 
 	n, _ := ragValue(r, "n")
@@ -83,7 +83,7 @@ func TestUngroupedAggregateEmptyInput(t *testing.T) {
 		`SELECT COUNT(*) AS n, SUM(val) AS s, AVG(val) AS a, MIN(val) AS mn, MAX(val) AS mx FROM u WHERE id > 100000`,
 	} {
 		db := ungroupedAggDB(t)
-		rs := execSQL(t, db,sql)
+		rs := execSQL(t, db, sql)
 		r := firstRow(t, rs)
 		n, _ := ragValue(r, "n")
 		if got, _ := toInt(n); got != 0 {
@@ -100,7 +100,7 @@ func TestUngroupedAggregateEmptyInput(t *testing.T) {
 	// An entirely empty table takes the same path.
 	db := storage.NewDB()
 	execSQL(t, db, `CREATE TABLE empty_u (id INT, val FLOAT)`)
-	rs := execSQL(t, db,`SELECT COUNT(*) AS n, SUM(val) AS s FROM empty_u`)
+	rs := execSQL(t, db, `SELECT COUNT(*) AS n, SUM(val) AS s FROM empty_u`)
 	r := firstRow(t, rs)
 	if n, _ := ragValue(r, "n"); fmt.Sprintf("%v", n) != "0" {
 		t.Errorf("COUNT(*) over an empty table = %v, want 0", n)
@@ -115,12 +115,12 @@ func TestUngroupedAggregateEmptyInput(t *testing.T) {
 // must return zero rows, not one row with a value that fails the predicate.
 func TestUngroupedAggregateHavingFiltersEmptyGroup(t *testing.T) {
 	db := ungroupedAggDB(t)
-	rs := execSQL(t, db,`SELECT COUNT(*) AS n FROM u WHERE id > 100000 HAVING COUNT(*) > 0`)
+	rs := execSQL(t, db, `SELECT COUNT(*) AS n FROM u WHERE id > 100000 HAVING COUNT(*) > 0`)
 	if len(rs.Rows) != 0 {
 		t.Errorf("HAVING COUNT(*) > 0 over zero matching rows returned %d rows, want 0: %v", len(rs.Rows), rs.Rows)
 	}
 
-	rs = execSQL(t, db,`SELECT COUNT(*) AS n FROM u HAVING COUNT(*) > 0`)
+	rs = execSQL(t, db, `SELECT COUNT(*) AS n FROM u HAVING COUNT(*) > 0`)
 	r := firstRow(t, rs)
 	if n, _ := ragValue(r, "n"); fmt.Sprintf("%v", n) != "38" {
 		t.Errorf("COUNT(*) = %v, want 38", n)
@@ -135,7 +135,7 @@ func TestUngroupedAggregateHavingFiltersEmptyGroup(t *testing.T) {
 func TestUngroupedAggregateMatchesGeneralPath(t *testing.T) {
 	db := ungroupedAggDB(t)
 	render := func(sql string) Row {
-		rs := execSQL(t, db,sql)
+		rs := execSQL(t, db, sql)
 		return firstRow(t, rs)
 	}
 	fast := render(`SELECT COUNT(*) AS n, SUM(val) AS s, AVG(val) AS a, MIN(val) AS mn, MAX(val) AS mx FROM u`)
@@ -155,7 +155,7 @@ func TestUngroupedAggregateMatchesGeneralPath(t *testing.T) {
 // not silently misrouted.
 func TestUngroupedAggregateDoesNotClaimPlainSelect(t *testing.T) {
 	db := ungroupedAggDB(t)
-	rs := execSQL(t, db,`SELECT id, val FROM u WHERE grp = 'g0'`)
+	rs := execSQL(t, db, `SELECT id, val FROM u WHERE grp = 'g0'`)
 	if len(rs.Rows) == 0 {
 		t.Fatal("expected matching rows for grp = 'g0'")
 	}
