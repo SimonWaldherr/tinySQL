@@ -615,7 +615,7 @@ func ragVecTopKAllowed(ctx context.Context, allowed []int, queryLen, k int, cach
 	}
 	wg.Wait()
 
-	merged := &vecScoredHeap{}
+	merged := newScoredHeap(k, -1)
 	for i := range results {
 		if results[i].err != nil {
 			return nil, results[i].err

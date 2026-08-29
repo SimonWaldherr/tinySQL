@@ -381,7 +381,6 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 		src := cache.vector(rows[(i*len(rows))/nlist])
 		idx.centroids[i] = append([]float64(nil), src...)
 	}
-	assignments := make([]int, len(rows))
 	// Reuse the accumulation buffers across k-means iterations instead of
 	// reallocating nlist*dims floats per pass.
 	sums := make([]float64, nlist*dims)
@@ -400,7 +399,6 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 				}
 			}
 			c := nearestCentroid(metric, cache.vector(rowIdx), rowNormFor(metric, cache, rowIdx), idx.centroids, idx.centroidNorms)
-			assignments[i] = c
 			counts[c]++
 			base := c * dims
 			search.VectorAccumulateUnrolled(sums[base:base+dims], cache.vector(rowIdx))
@@ -426,8 +424,18 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 
 	idx.centroidNorms = centroidNorms(idx.centroids)
 	idx.lists = make([][]int, nlist)
+	// Assign against the final centroids. The loop above assigns at the top of
+	// each iteration and moves the centroids at the bottom, so its last
+	// assignment predates the last move: building the lists from it would file
+	// rows under a centroid that is no longer their nearest, and search probing
+	// the correct centroid would then miss them.
 	for i, rowIdx := range rows {
-		c := assignments[i]
+		if i&1023 == 0 {
+			if err := checkCtx(ctx); err != nil {
+				return nil, err
+			}
+		}
+		c := nearestCentroid(metric, cache.vector(rowIdx), rowNormFor(metric, cache, rowIdx), idx.centroids, idx.centroidNorms)
 		idx.lists[c] = append(idx.lists[c], rowIdx)
 	}
 	return idx, nil
@@ -438,7 +446,13 @@ func (idx *vecIVFIndex) search(ctx context.Context, query []float64, queryNorm f
 		return nil, nil
 	}
 	probes := chooseIVFNProbe(len(idx.centroids), k)
-	centroidHeap := &vecScoredHeap{}
+	// Rank every centroid, not just the first `probes`. The probe budget is a
+	// recall/latency trade, but it must not cap the result *count*: if the
+	// probed lists between them hold fewer than k rows, the scan continues
+	// down the ranking. Without that, VEC_SEARCH with an ivf index silently
+	// returned fewer rows than asked for -- 7 of 10 on a 10-row table -- while
+	// flat and hnsw returned k.
+	centroidHeap := newScoredHeap(len(idx.centroids), -1)
 	for i, c := range idx.centroids {
 		// Selecting which centroids to probe, not a value ever exposed to a
 		// caller — ranking-only distance is enough (see rowDistance below
@@ -447,12 +461,16 @@ func (idx *vecIVFIndex) search(ctx context.Context, query []float64, queryNorm f
 		if !ok {
 			continue
 		}
-		pushTopK(centroidHeap, i, dist, probes)
+		pushTopK(centroidHeap, i, dist, len(idx.centroids))
 	}
-	bestCentroids := topKFromHeap(centroidHeap, probes)
+	rankedCentroids := topKFromHeap(centroidHeap, len(idx.centroids))
 
-	resultHeap := &vecScoredHeap{}
-	for _, c := range bestCentroids {
+	resultHeap := newScoredHeap(k, -1)
+	for probed, c := range rankedCentroids {
+		// Past the probe budget, keep going only while short of k.
+		if probed >= probes && resultHeap.Len() >= k {
+			break
+		}
 		list := idx.lists[c.rowIdx]
 		for i, rowIdx := range list {
 			if i&1023 == 0 {
@@ -845,7 +863,7 @@ func (idx *vecHNSWIndex) search(ctx context.Context, query []float64, queryNorm 
 	}
 	efSearch := chooseHNSWEfSearch(k)
 	candidates := idx.searchLayer(query, queryNorm, current, efSearch, 0, cache, visited, scratch)
-	resultHeap := &vecScoredHeap{}
+	resultHeap := newScoredHeap(k, len(candidates)+len(idx.deltaRows))
 	var seen map[int]struct{}
 	if len(idx.deltaRows) != 0 {
 		seen = make(map[int]struct{}, len(candidates))

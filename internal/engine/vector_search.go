@@ -751,6 +751,23 @@ func vecScoredRowLess(a, b vecScoredRow) bool {
 	return a.distance < b.distance
 }
 
+// newScoredHeap returns a top-k heap with room for k rows already reserved.
+// pushTopK caps the heap at k, so that is its final size; growing into it from
+// nil made the append chain one of the larger allocation sites in vector
+// search. capHint bounds the reservation when the caller knows it cannot
+// produce k rows -- a scan range shorter than k, say -- so a large k over a
+// small table does not over-reserve.
+func newScoredHeap(k, capHint int) *vecScoredHeap {
+	if capHint >= 0 && capHint < k {
+		k = capHint
+	}
+	if k < 0 {
+		k = 0
+	}
+	h := make(vecScoredHeap, 0, k)
+	return &h
+}
+
 func topKFromHeap(heapRows *vecScoredHeap, k int) []vecScoredRow {
 	if k > heapRows.Len() {
 		k = heapRows.Len()
@@ -887,7 +904,7 @@ func vecSearchTopK(ctx context.Context, rows [][]any, queryLen int, k int, cache
 	}
 	wg.Wait()
 
-	merged := &vecScoredHeap{}
+	merged := newScoredHeap(k, -1)
 	for i := range results {
 		if results[i].err != nil {
 			return nil, results[i].err
@@ -901,7 +918,7 @@ func vecSearchTopK(ctx context.Context, rows [][]any, queryLen int, k int, cache
 }
 
 func vecSearchTopKRange(ctx context.Context, rows [][]any, start, end, queryLen, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc, needNorm bool) (vecScoredHeap, error) {
-	scoredRows := &vecScoredHeap{}
+	scoredRows := newScoredHeap(k, end-start)
 
 	for i := start; i < end; i++ {
 		if i&1023 == 0 {

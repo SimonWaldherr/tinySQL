@@ -129,7 +129,7 @@ func (idx *vecHNSWIndex) searchFiltered(ctx context.Context, query []float64, qu
 		}
 	}
 	candidates := idx.searchLayer(query, queryNorm, current, chooseHNSWEfSearch(k), 0, cache, visited, scratch)
-	result := &vecScoredHeap{}
+	result := newScoredHeap(k, len(candidates))
 	for _, sr := range candidates {
 		pushTopK(result, sr.rowIdx, sr.distance, k)
 	}
