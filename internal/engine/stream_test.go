@@ -231,3 +231,28 @@ func TestExecuteStreamWithOptionsRejectsNegativeBuffer(t *testing.T) {
 		t.Fatal("expected negative buffer to fail")
 	}
 }
+
+// TestExecuteStreamDistinctDedupes pins the DISTINCT gate on the streaming
+// path. simpleSelectEligible admits DISTINCT so that the materialized fast path
+// can claim it, but streamSimpleSelectPlan emits rows as it scans and cannot
+// dedupe; a shared predicate once let DISTINCT stream every duplicate through
+// database/sql.
+func TestExecuteStreamDistinctDedupes(t *testing.T) {
+	db := streamTestDB(t, 10)
+	stream, err := ExecuteStream(context.Background(), db, "default", mustParse(
+		`SELECT DISTINCT name FROM stream_rows`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	var names []any
+	for stream.Next() {
+		names = append(names, stream.Row()["name"])
+	}
+	if err := stream.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 1 || names[0] != "row" {
+		t.Fatalf("streamed DISTINCT name = %v, want [row]", names)
+	}
+}

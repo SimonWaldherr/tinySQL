@@ -342,8 +342,13 @@ func produceResultStream(stream *ResultStream, header chan<- resultStreamHeader,
 	}
 }
 
+// streamableSimpleSelect additionally excludes DISTINCT, which
+// simpleSelectEligible permits for executeSimpleSelectFastPath's sake. That
+// path dedupes on projected values; streamSimpleSelectPlan emits every match as
+// it is scanned and has nowhere to hold the seen-set, so a streamed DISTINCT
+// would return duplicates. It takes the materialized route instead.
 func streamableSimpleSelect(s *Select) bool {
-	return s != nil && len(s.OrderBy) == 0 && simpleSelectEligible(s)
+	return s != nil && !s.Distinct && len(s.OrderBy) == 0 && simpleSelectEligible(s)
 }
 
 func streamSimpleSelectPlan(stream *ResultStream, plan *simpleSelectPlan, db *storage.DB) error {
