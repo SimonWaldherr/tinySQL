@@ -638,3 +638,72 @@ func TestExporterSupportsFormat(t *testing.T) {
 		}
 	}
 }
+
+// Beautify must never change what a statement means. The old implementation
+// collapsed all whitespace before tokenizing, which destroyed the newline that
+// ends a "--" comment (so the rest of the statement became comment text) and
+// rewrote the interiors of string literals.
+//
+// TestBeautify_Comments only asserted the comment text was still present,
+// which stayed true while the FROM clause was being swallowed by it, so the
+// checks here are what the output actually has to satisfy: it still parses,
+// and every literal survives byte for byte.
+func TestBeautify_PreservesMeaning(t *testing.T) {
+	b := NewSQLBeautifier(DefaultBeautifyOptions())
+
+	cases := []struct {
+		name     string
+		sql      string
+		mustHave []string
+	}{
+		{"trailing line comment", "SELECT 1 -- note\nFROM t", []string{"-- note"}},
+		{"comment mid statement", "SELECT a, -- pick a\n b\nFROM t WHERE x = 1", []string{"-- pick a"}},
+		{"doubled quote escape", "SELECT * FROM t WHERE s = 'it''s'", []string{"'it''s'"}},
+		{"runs of spaces in a literal", "SELECT * FROM t WHERE name = 'a    b'", []string{"'a    b'"}},
+		{"crlf line endings", "SELECT 1\r\nFROM t", nil},
+		{"block comment", "SELECT a, /* mid */ b FROM t", []string{"/* mid */"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := b.Beautify(tc.sql)
+			if res := ValidateSQL(got); !res.Valid {
+				t.Fatalf("beautified output does not parse: %s\n--- output ---\n%s", res.Error, got)
+			}
+			for _, want := range tc.mustHave {
+				if !strings.Contains(got, want) {
+					t.Errorf("output lost %q:\n%s", want, got)
+				}
+			}
+			if strings.ContainsRune(got, '\r') {
+				t.Errorf("a carriage return leaked into the output: %q", got)
+			}
+		})
+	}
+}
+
+// NormalizeSQL is the comparison key DiffSQL and caching use. Comments carry
+// no meaning, so two statements differing only in a comment must normalize
+// alike -- and a "--" comment must not swallow the tokens joined after it,
+// since the join separates with a space and a line comment needs a newline.
+func TestNormalizeSQL_IgnoresComments(t *testing.T) {
+	a := NormalizeSQL("SELECT 1 -- first\nFROM t", false)
+	b := NormalizeSQL("SELECT 1 -- second\nFROM t", false)
+	if a != b {
+		t.Errorf("comments changed the canonical form:\n  %q\n  %q", a, b)
+	}
+	if !strings.Contains(a, "FROM") {
+		t.Errorf("the comment swallowed the FROM clause: %q", a)
+	}
+	if strings.Contains(a, "--") {
+		t.Errorf("comments should be dropped from the canonical form: %q", a)
+	}
+}
+
+// The canonical form must not rewrite literal contents either.
+func TestNormalizeSQL_PreservesLiteralInteriors(t *testing.T) {
+	got := NormalizeSQL("SELECT * FROM t WHERE name = 'a    b'", false)
+	if !strings.Contains(got, "'a    b'") {
+		t.Errorf("literal interior was rewritten: %q", got)
+	}
+}

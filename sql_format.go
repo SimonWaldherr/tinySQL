@@ -31,6 +31,11 @@ func BeautifySQL(sql string) string {
 		if strings.HasPrefix(token, "--") || strings.HasPrefix(token, "/*") {
 			newline()
 			out.WriteString(token)
+			// newline() is a no-op while atLineStart is set, so without
+			// clearing it the closing newline never fired and the next token
+			// was appended straight onto the comment: "-- noteFROM t" put the
+			// FROM clause inside a line comment.
+			atLineStart = false
 			newline()
 			continue
 		}

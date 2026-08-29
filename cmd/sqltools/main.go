@@ -51,8 +51,12 @@ func NewSQLBeautifier(opts BeautifyOptions) *SQLBeautifier {
 }
 
 // Beautify formats a SQL statement.
+//
+// It tokenizes the raw text. Collapsing whitespace first, as this used to,
+// destroyed the newline that terminates a "--" comment -- so the rest of the
+// statement became comment text -- and rewrote the interior of string
+// literals, silently changing what the query matched.
 func (b *SQLBeautifier) Beautify(sql string) string {
-	sql = normalizeWhitespace(sql)
 	tokens := tokenizeSQL(sql)
 	if b.opts.Uppercase {
 		tokens = uppercaseKeywords(tokens)
@@ -90,19 +94,22 @@ var allKeywords = map[string]bool{
 	"COALESCE": true, "NULLIF": true, "CAST": true,
 }
 
-func normalizeWhitespace(s string) string {
-	re := regexp.MustCompile(`\s+`)
-	return strings.TrimSpace(re.ReplaceAllString(s, " "))
-}
-
 type sqlToken struct {
 	typ   string
 	value string
 }
 
+// isSQLSpace reports whether c separates tokens. \r is included: without it a
+// CRLF file's carriage returns fell through to the symbol branch and were
+// emitted verbatim into the formatted output. The collapse pass that used to
+// run before tokenizing hid that.
+func isSQLSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'
+}
+
 // skipWhitespace skips whitespace characters
 func skipWhitespace(sql string, i int) int {
-	for i < len(sql) && (sql[i] == ' ' || sql[i] == '\t' || sql[i] == '\n') {
+	for i < len(sql) && isSQLSpace(sql[i]) {
 		i++
 	}
 	return i
@@ -132,9 +139,20 @@ func tokenizeMultiLineComment(sql string, i int) (sqlToken, int) {
 // tokenizeString tokenizes a string literal ('...')
 func tokenizeString(sql string, i int) (sqlToken, int) {
 	j := i + 1
-	for j < len(sql) && sql[j] != '\'' {
+	for j < len(sql) {
 		if sql[j] == '\\' && j+1 < len(sql) {
-			j++
+			j += 2
+			continue
+		}
+		if sql[j] == '\'' {
+			// SQL escapes a quote by doubling it, so '' inside a literal is
+			// content, not the end. Stopping at the first one split 'it''s'
+			// into two tokens and the formatter then wrote 'it' 's'.
+			if j+1 < len(sql) && sql[j+1] == '\'' {
+				j += 2
+				continue
+			}
+			break
 		}
 		j++
 	}
@@ -171,7 +189,7 @@ func tokenizeSQL(sql string) []sqlToken {
 	i := 0
 	for i < len(sql) {
 		// Skip whitespace
-		if sql[i] == ' ' || sql[i] == '\t' || sql[i] == '\n' {
+		if isSQLSpace(sql[i]) {
 			i = skipWhitespace(sql, i)
 			continue
 		}
@@ -293,7 +311,14 @@ func (b *SQLBeautifier) formatTokens(tokens []sqlToken) string {
 
 		if i+1 < len(tokens) {
 			next := tokens[i+1]
-			if tok.value != "(" && next.value != ")" && next.value != "," && tok.value != "." && next.value != "." {
+			switch {
+			case tok.typ == "comment" && strings.HasPrefix(tok.value, "--"):
+				// A line comment runs to end of line, so whatever follows must
+				// start on the next one. Separating with a space put the rest
+				// of the statement inside the comment.
+				sb.WriteString("\n")
+				newLine = true
+			case tok.value != "(" && next.value != ")" && next.value != "," && tok.value != "." && next.value != ".":
 				sb.WriteString(" ")
 			}
 		}
@@ -1100,14 +1125,25 @@ func PrintLintResult(result LintResult) {
 // ============================================================================
 
 // NormalizeSQL converts a SQL statement to a canonical form for comparison/caching.
-// It uppercases keywords, normalizes whitespace, and optionally replaces literals
+// It uppercases keywords, drops comments, and optionally replaces literals
 // with placeholders.
+//
+// Comments are dropped rather than kept: this is a comparison key, and two
+// statements that differ only in a comment are the same statement. Keeping
+// them also meant a "--" comment could swallow the tokens joined after it,
+// since the join uses a single space and a line comment needs a newline to
+// end. The result is a single-space join of the surviving tokens, so no
+// separate whitespace collapse is needed -- the one that used to run here
+// rewrote the interior of string literals.
 func NormalizeSQL(sqlStr string, replaceLiterals bool) string {
 	tokens := tokenizeSQL(sqlStr)
 	tokens = uppercaseKeywords(tokens)
 
 	var parts []string
 	for _, tok := range tokens {
+		if tok.typ == "comment" {
+			continue
+		}
 		if replaceLiterals {
 			if tok.typ == "string" || tok.typ == "number" {
 				parts = append(parts, "?")
@@ -1116,8 +1152,7 @@ func NormalizeSQL(sqlStr string, replaceLiterals bool) string {
 		}
 		parts = append(parts, tok.value)
 	}
-	result := normalizeWhitespace(strings.TrimSpace(strings.Join(parts, " ")))
-	return result
+	return strings.TrimSpace(strings.Join(parts, " "))
 }
 
 // ============================================================================
