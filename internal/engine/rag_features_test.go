@@ -1216,7 +1216,7 @@ func TestRAGSearchHybridConcurrentDeterministic(t *testing.T) {
 
 	// SELECT * (not an explicit column list): RAG_SEARCH deliberately omits
 	// _vec_rank/_fts_rank/etc. from a row absent from that pass's candidate
-	// set (see the "Absent-column convention" comment on ragSearchFuse) --
+	// set (see the "Absent-column convention" comment on ragFuseCandidates) --
 	// projecting one of those columns by name would error for such a row.
 	// _rrf_rank/_rrf_score are always present on every row, so ORDER BY
 	// _rrf_rank is safe regardless.

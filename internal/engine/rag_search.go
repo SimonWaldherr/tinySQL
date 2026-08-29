@@ -23,7 +23,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -346,107 +345,6 @@ func ragSearchTextColumns(opts *ragSearchOptions) []string {
 	return out
 }
 
-// ragSearchTruncate returns rs re-sliced to at most k rows, preserving
-// existing order (both VEC_SEARCH's output and the RRF-fused output are
-// already sorted best-first before this is called). Never mutates rs.Rows'
-// backing array in a way visible to the caller — a fresh ResultSet is
-// returned so the original candidateK-sized result is left untouched.
-func ragSearchTruncate(rs *ResultSet, k int) *ResultSet {
-	if rs == nil {
-		return &ResultSet{Cols: nil, Rows: nil}
-	}
-	if k >= len(rs.Rows) {
-		return rs
-	}
-	return &ResultSet{Cols: rs.Cols, Rows: rs.Rows[:k]}
-}
-
-// ragSearchBaseCols strips a table-valued function's trailing score/rank
-// columns off the end of cols, given how many trailing columns it appended
-// (VEC_SEARCH appends 3: _vec_distance/_vec_similarity/_vec_rank; FTS_SEARCH
-// appends 2: _fts_score/_fts_rank — see their Execute implementations).
-func ragSearchBaseCols(cols []string, trailing int) []string {
-	if len(cols) < trailing {
-		return cols
-	}
-	return cols[:len(cols)-trailing]
-}
-
-// ragSearchKey builds a composite identity key for a row by concatenating
-// its keyCols values (via fmt.Sprintf("%v", ...), joined by a separator that
-// cannot appear in a normal column value's default formatting). Rows from
-// VEC_SEARCH and FTS_SEARCH on the same source table copy their key column
-// values straight out of storage.Table.Rows with no type coercion, so the
-// same underlying row produces an identical key from either pass.
-func ragSearchKey(r Row, keyCols []string) string {
-	// A single scalar primary key is overwhelmingly common. Returning its
-	// formatted value directly skips the Builder backing allocation and copy
-	// for every vector and FTS candidate entering fusion.
-	if len(keyCols) == 1 {
-		v, _ := ragValue(r, keyCols[0])
-		switch t := v.(type) {
-		case string:
-			return t
-		case int:
-			return strconv.Itoa(t)
-		case int64:
-			return strconv.FormatInt(t, 10)
-		case bool:
-			if t {
-				return "true"
-			}
-			return "false"
-		default:
-			return fmt.Sprint(v)
-		}
-	}
-	var b strings.Builder
-	for i, col := range keyCols {
-		if i > 0 {
-			b.WriteByte('\x1f')
-		}
-		v, _ := ragValue(r, col)
-		ragWriteKeyValue(&b, v)
-	}
-	return b.String()
-}
-
-// ragWriteKeyValue mirrors ftsWriteValue's fast-path/fallback split (see
-// fts.go): a type switch over the scalar kinds that make up real key-column
-// values (row IDs, chunk indexes, doc IDs) avoids fmt.Fprintf's reflection
-// overhead per key column per candidate row during fusion. float64
-// deliberately stays on the %v fallback, same as ftsWriteValue, since its
-// shortest-round-trip formatting needs care to reproduce exactly via
-// strconv.
-func ragWriteKeyValue(b *strings.Builder, v any) {
-	switch t := v.(type) {
-	case string:
-		b.WriteString(t)
-	case int:
-		b.WriteString(strconv.Itoa(t))
-	case int64:
-		b.WriteString(strconv.FormatInt(t, 10))
-	case bool:
-		if t {
-			b.WriteString("true")
-		} else {
-			b.WriteString("false")
-		}
-	default:
-		fmt.Fprintf(b, "%v", v)
-	}
-}
-
-// ragFusedRow tracks one candidate row's merged data plus its RRF inputs
-// while fusing the vector and text candidate sets.
-type ragFusedRow struct {
-	row      Row
-	vecRank  int // 0 = not present in the vector candidate set
-	ftsRank  int // 0 = not present in the FTS candidate set
-	order    int // first-seen order, used as a deterministic sort tie-break
-	rrfScore float64
-}
-
 // ragNativeCandidate is the compact common currency of hybrid retrieval.
 // Both search branches address the same immutable table snapshot, so the
 // physical row index is a lossless identity and avoids materializing rows or
@@ -475,6 +373,18 @@ func (s ragNativeCandidates) Less(i, j int) bool {
 }
 func (s ragNativeCandidates) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
 
+// ragFuseCandidates reciprocal-rank-fuses the vector and text candidate sets
+// into one ResultSet. Both branches address the same immutable table snapshot,
+// so candidates are matched on physical row index rather than a formatted
+// composite key.
+//
+// Absent-column convention: a row present in only one of the two candidate
+// sets carries only that pass's rank/score columns in its output Row — an
+// FTS-only hit has no "_vec_rank"/"_vec_distance"/"_vec_similarity" keys at
+// all, rather than a zero or NULL sentinel for them. Callers should test key
+// presence (as ragValue/ragHitRank already do) rather than compare against a
+// placeholder to tell whether a row was retrieved by a given pass.
+// _rrf_score/_rrf_rank are always present on every output row.
 func ragFuseCandidates(table *storage.Table, vecRows []vecScoredRow, ftsRows []ftsScored, metric string, rrfK float64, k int) *ResultSet {
 	// The two retrieval branches operate on the same immutable table snapshot,
 	// so a physical row index is a complete identity. Candidate count can never
@@ -551,151 +461,6 @@ func ragFuseCandidates(table *storage.Table, vecRows []vecScoredRow, ftsRows []f
 		row["_rrf_rank"] = rank + 1
 		rows = append(rows, row)
 	}
-	return &ResultSet{Cols: cols, Rows: rows}
-}
-
-// ragOrderByScoreAsc sorts a []string of fused-row keys by descending RRF
-// score, falling back to each row's unique insertion order. A concrete Swap
-// (a single string-header assignment) replaces reflect.Swapper's generic,
-// pointer-aware swap.
-type ragOrderByScoreAsc struct {
-	fused map[string]*ragFusedRow
-	order []string
-}
-
-func (s ragOrderByScoreAsc) Len() int { return len(s.order) }
-func (s ragOrderByScoreAsc) Less(i, j int) bool {
-	a, b := s.fused[s.order[i]], s.fused[s.order[j]]
-	if a.rrfScore != b.rrfScore {
-		return a.rrfScore > b.rrfScore
-	}
-	return a.order < b.order
-}
-func (s ragOrderByScoreAsc) Swap(i, j int) { s.order[i], s.order[j] = s.order[j], s.order[i] }
-
-// ragSearchFuse reciprocal-rank-fuses vecResult and ftsResult into one
-// ResultSet, matching rows across the two sets by concatenating their
-// keyCols values into a composite key.
-//
-// Absent-column convention: a row present in only one of the two input sets
-// carries only that pass's rank/score columns in its output Row — e.g. an
-// FTS-only hit has no "_vec_rank"/"_vec_distance"/"_vec_similarity" keys at
-// all (not a zero or NULL sentinel value for them). Callers should check key
-// presence (as ragValue/ragHitRank already do), not compare against a
-// placeholder value, to test whether a row was retrieved by a given pass.
-// _rrf_score/_rrf_rank are always present on every output row.
-func ragSearchFuse(vecResult, ftsResult *ResultSet, keyCols []string, rrfK float64) *ResultSet {
-	candidateCap := len(vecResult.Rows) + len(ftsResult.Rows)
-	fused := make(map[string]*ragFusedRow, candidateCap)
-	order := make([]string, 0, candidateCap)
-
-	// r[c.Name] (VEC_SEARCH/FTS_SEARCH's own row-building convention) is not
-	// guaranteed lower-cased, so every lookup below goes through ragValue
-	// (case-insensitive by column name) rather than direct map indexing;
-	// every value copied into fr.row is written back under a canonical
-	// lower-cased key, matching ragCopyOutputRow's convention elsewhere in
-	// the RAG code so downstream ragValue/ragExpandContextFrom calls hit the
-	// fast lower-cased-key path instead of always falling back to a scan.
-	vecBase := ragSearchBaseCols(vecResult.Cols, 3)
-	for _, r := range vecResult.Rows {
-		vecRankVal, _ := ragValue(r, "_vec_rank")
-		vecRank, _ := toInt(vecRankVal)
-		key := ragSearchKey(r, keyCols)
-		fr, ok := fused[key]
-		if !ok {
-			fr = &ragFusedRow{row: make(Row, len(r)+7), order: len(order)}
-			for _, c := range vecBase {
-				if v, ok := ragValue(r, c); ok {
-					fr.row[strings.ToLower(c)] = v
-				}
-			}
-			fused[key] = fr
-			order = append(order, key)
-		}
-		fr.vecRank = vecRank
-		if v, ok := ragValue(r, "_vec_rank"); ok {
-			fr.row["_vec_rank"] = v
-		}
-		if v, ok := ragValue(r, "_vec_distance"); ok {
-			fr.row["_vec_distance"] = v
-		}
-		if v, ok := ragValue(r, "_vec_similarity"); ok {
-			fr.row["_vec_similarity"] = v
-		}
-	}
-
-	ftsBase := ragSearchBaseCols(ftsResult.Cols, 2)
-	for _, r := range ftsResult.Rows {
-		ftsRankVal, _ := ragValue(r, "_fts_rank")
-		ftsRank, _ := toInt(ftsRankVal)
-		key := ragSearchKey(r, keyCols)
-		fr, ok := fused[key]
-		if !ok {
-			fr = &ragFusedRow{row: make(Row, len(r)+7), order: len(order)}
-			for _, c := range ftsBase {
-				if v, ok := ragValue(r, c); ok {
-					fr.row[strings.ToLower(c)] = v
-				}
-			}
-			fused[key] = fr
-			order = append(order, key)
-		}
-		fr.ftsRank = ftsRank
-		if v, ok := ragValue(r, "_fts_score"); ok {
-			fr.row["_fts_score"] = v
-		}
-		if v, ok := ragValue(r, "_fts_rank"); ok {
-			fr.row["_fts_rank"] = v
-		}
-	}
-
-	for _, key := range order {
-		fr := fused[key]
-		var score float64
-		if fr.vecRank > 0 {
-			score += 1.0 / (rrfK + float64(fr.vecRank))
-		}
-		if fr.ftsRank > 0 {
-			score += 1.0 / (rrfK + float64(fr.ftsRank))
-		}
-		fr.rrfScore = score
-	}
-
-	// A concrete sort.Interface with a direct Swap avoids reflect.Swapper's
-	// generic path, which sort.Slice/SliceStable fall back to for any element
-	// type containing a pointer — a plain string included, per the same
-	// rationale documented on orderedRawRowsAsc (exec_fastpath_select.go).
-	// fr.order is a unique insertion sequence number (see ragFusedRow), so the
-	// comparator is already a strict total order and sort.Sort (pdqsort)
-	// reproduces the exact order sort.SliceStable did, without symMerge.
-	sort.Sort(ragOrderByScoreAsc{fused: fused, order: order})
-
-	baseColSet := make(map[string]bool, len(vecBase)+len(ftsBase))
-	baseCols := make([]string, 0, len(vecBase)+len(ftsBase))
-	for _, c := range vecBase {
-		lc := strings.ToLower(c)
-		if !baseColSet[lc] {
-			baseColSet[lc] = true
-			baseCols = append(baseCols, c)
-		}
-	}
-	for _, c := range ftsBase {
-		lc := strings.ToLower(c)
-		if !baseColSet[lc] {
-			baseColSet[lc] = true
-			baseCols = append(baseCols, c)
-		}
-	}
-	cols := append(append([]string{}, baseCols...), "_vec_rank", "_vec_distance", "_vec_similarity", "_fts_rank", "_fts_score", "_rrf_score", "_rrf_rank")
-
-	rows := make([]Row, 0, len(order))
-	for rank, key := range order {
-		fr := fused[key]
-		fr.row["_rrf_score"] = fr.rrfScore
-		fr.row["_rrf_rank"] = rank + 1
-		rows = append(rows, fr.row)
-	}
-
 	return &ResultSet{Cols: cols, Rows: rows}
 }
 
