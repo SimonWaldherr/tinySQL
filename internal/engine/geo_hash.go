@@ -12,6 +12,7 @@
 package engine
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"strings"
@@ -201,7 +202,15 @@ func evalGeoHashBBox(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", ex.Name, err)
 	}
-	return []float64{minLon, minLat, maxLon, maxLat}, nil
+	// Marshalled rather than returned as a []float64, matching TILE_BBOX,
+	// GEO_BBOX and ST_BBOX. A raw Go slice reaches a client as Go's default
+	// "[1 2 3]" formatting, which is not JSON and which nothing downstream can
+	// parse -- the WASM bridge renders any non-scalar with %v.
+	out, err := json.Marshal([]float64{minLon, minLat, maxLon, maxLat})
+	if err != nil {
+		return nil, err
+	}
+	return string(out), nil
 }
 
 // evalGeoHashNeighbors returns the 8 geohash cells surrounding hash (and
@@ -225,7 +234,7 @@ func evalGeoHashNeighbors(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	lonSpan, latSpan := maxLon-minLon, maxLat-minLat
 	centerLon, centerLat := (minLon+maxLon)/2, (minLat+maxLat)/2
 
-	out := make([]any, 0, 9)
+	cells := make([]string, 0, 9)
 	for _, dLat := range []int{1, 0, -1} {
 		for _, dLon := range []int{-1, 0, 1} {
 			lon := clampLonWrap(centerLon + float64(dLon)*lonSpan)
@@ -240,10 +249,15 @@ func evalGeoHashNeighbors(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 			if err != nil {
 				return nil, fmt.Errorf("%s: %w", ex.Name, err)
 			}
-			out = append(out, h)
+			cells = append(cells, h)
 		}
 	}
-	return out, nil
+	// A JSON array string, as in evalGeoHashBBox above.
+	out, err := json.Marshal(cells)
+	if err != nil {
+		return nil, err
+	}
+	return string(out), nil
 }
 
 // clampLonWrap wraps a longitude nudged past +/-180 back into range, since a

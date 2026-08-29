@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"encoding/json"
 	"math"
 	"testing"
 
@@ -48,9 +49,17 @@ func TestGeoHashBBoxContainsPoint(t *testing.T) {
 	db := storage.NewDB()
 	hash := execScalarString(t, db, `SELECT GEO_GEOHASH_ENCODE(ST_MAKEPOINT(13.4,52.5), 8) AS v`)
 	rs := execSQL(t, db, `SELECT GEO_GEOHASH_BBOX('`+hash+`') AS v`)
-	bbox, ok := rs.Rows[0]["v"].([]float64)
+	// A JSON array string, as TILE_BBOX/GEO_BBOX/ST_BBOX also return.
+	raw, ok := rs.Rows[0]["v"].(string)
 	if !ok {
-		t.Fatalf("GEO_GEOHASH_BBOX: expected []float64, got %T", rs.Rows[0]["v"])
+		t.Fatalf("GEO_GEOHASH_BBOX: expected a JSON string, got %T", rs.Rows[0]["v"])
+	}
+	var bbox []float64
+	if err := json.Unmarshal([]byte(raw), &bbox); err != nil {
+		t.Fatalf("GEO_GEOHASH_BBOX returned %q, which is not a JSON array: %v", raw, err)
+	}
+	if len(bbox) != 4 {
+		t.Fatalf("expected 4 bounds, got %d: %v", len(bbox), bbox)
 	}
 	if !(bbox[0] <= 13.4 && 13.4 <= bbox[2] && bbox[1] <= 52.5 && 52.5 <= bbox[3]) {
 		t.Errorf("bbox %v does not contain the encoded point", bbox)
@@ -60,9 +69,13 @@ func TestGeoHashBBoxContainsPoint(t *testing.T) {
 func TestGeoHashNeighborsIncludesSelf(t *testing.T) {
 	db := storage.NewDB()
 	rs := execSQL(t, db, `SELECT GEO_GEOHASH_NEIGHBORS('u33dc') AS v`)
-	neighbors, ok := rs.Rows[0]["v"].([]any)
+	raw, ok := rs.Rows[0]["v"].(string)
 	if !ok {
-		t.Fatalf("GEO_GEOHASH_NEIGHBORS: expected []any, got %T", rs.Rows[0]["v"])
+		t.Fatalf("GEO_GEOHASH_NEIGHBORS: expected a JSON string, got %T", rs.Rows[0]["v"])
+	}
+	var neighbors []string
+	if err := json.Unmarshal([]byte(raw), &neighbors); err != nil {
+		t.Fatalf("GEO_GEOHASH_NEIGHBORS returned %q, which is not a JSON array: %v", raw, err)
 	}
 	if len(neighbors) != 9 {
 		t.Fatalf("expected 9 cells (self + 8 neighbors), got %d", len(neighbors))
