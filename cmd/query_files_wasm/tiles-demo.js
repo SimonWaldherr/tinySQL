@@ -11,6 +11,7 @@ const seenSQL = new Set();
 const stats = { rendered: 0, repeats: 0, totalMs: 0, queries: 0 };
 let wasmReady = false;
 let map, boundsLayer, tileLayer;
+let geohashLayers = []; // the clicked cell plus its 8 neighbours
 let settlementMarkers = new Map(); // name -> L.CircleMarker
 let selectedSettlements = []; // up to 2 settlement names, in click order
 let routeLayer = null, midpointMarker = null;
@@ -803,15 +804,26 @@ function onMapClick(e, forceExplore) {
         return;
     }
 
+    // ST_TRANSFORM and the geohash ride along with the tile lookup: a tile
+    // grid is Web Mercator, so 3857 is the projection the z/x/y above are
+    // already in, and the geohash is the same point as a locality string.
     const detailRes = runSQL(
         'SELECT TILE_QUADKEY(' + zxy.z + ', ' + zxy.x + ', ' + zxy.y + ') AS quadkey, ' +
-            'TILE_BBOX(' + zxy.z + ', ' + zxy.x + ', ' + zxy.y + ') AS bbox',
+            'TILE_BBOX(' + zxy.z + ', ' + zxy.x + ', ' + zxy.y + ') AS bbox, ' +
+            'ST_TRANSFORM(ST_MAKEPOINT(' + lng + ', ' + lat + '), 3857) AS mercator, ' +
+            'GEO_GEOHASH_ENCODE(ST_MAKEPOINT(' + lng + ', ' + lat + '), ' + geohashPrecisionForZoom(z) + ') AS geohash',
         { kind: 'point' }
     );
 
-    let quadkey = '?', bbox = null;
+    let quadkey = '?', bbox = null, mercator = null, geohash = null;
     if (detailRes && detailRes.success && detailRes.rows && detailRes.rows.length) {
         quadkey = detailRes.rows[0].quadkey;
+        geohash = detailRes.rows[0].geohash;
+        try {
+            mercator = JSON.parse(detailRes.rows[0].mercator).coordinates;
+        } catch (err) {
+            mercator = null;
+        }
         try {
             bbox = JSON.parse(detailRes.rows[0].bbox);
         } catch (err) {
@@ -823,7 +835,9 @@ function onMapClick(e, forceExplore) {
         'z/x/y      ' + zxy.z + ' / ' + zxy.x + ' / ' + zxy.y + '\n' +
         'tile_row   ' + zxy.tile_row + '  (TMS, for a direct tiles-table lookup)\n' +
         'quadkey    ' + quadkey +
-        (bbox ? '\nbbox       [' + bbox.map((n) => n.toFixed(3)).join(', ') + ']' : '');
+        (bbox ? '\nbbox       [' + bbox.map((n) => n.toFixed(3)).join(', ') + ']' : '') +
+        (mercator ? '\nmercator   ' + mercator.map((n) => Math.round(n)).join(', ') + '  (ST_TRANSFORM to 3857)' : '') +
+        (geohash ? '\ngeohash    ' + geohash + '  (GEO_GEOHASH_ENCODE)' : '');
 
     if (bbox) {
         if (boundsLayer) map.removeLayer(boundsLayer);
@@ -833,7 +847,71 @@ function onMapClick(e, forceExplore) {
         ).addTo(map);
     }
 
+    if (geohash) showGeohashCells(geohash);
     findNearestSettlement(lng, lat);
+}
+
+// geohashPrecisionForZoom picks a precision whose cell is about an eighth of
+// the current tile, so the 3x3 neighbourhood covers a readable part of the
+// view at any zoom.
+//
+// Each extra geohash character divides the longitude span by 4 or by 8,
+// alternating, which averages a bit over 2.5 zoom levels per character:
+//   precision  1      2       3      4       5       6
+//   lon span   45   11.25   1.406  0.352  0.0439  0.0110
+// while a tile spans 360 / 2^zoom.
+function geohashPrecisionForZoom(zoom) {
+    return Math.min(9, Math.max(1, Math.round(zoom / 2.5) + 1));
+}
+
+// showGeohashCells draws the clicked point's geohash cell and the eight cells
+// around it. GEO_GEOHASH_NEIGHBORS returns all nine in row-major order with the
+// cell itself at index 4, and GEO_GEOHASH_BBOX turns each one into
+// [minLon, minLat, maxLon, maxLat].
+function showGeohashCells(geohash) {
+    // Clear first: leaving the previous click's cells on the map if this one
+    // fails would attribute them to the new point.
+    clearGeohashCells();
+    const res = runSQL(
+        "SELECT GEO_GEOHASH_NEIGHBORS(" + quoteSQL(geohash) + ") AS cells",
+        { kind: 'geo' }
+    );
+    if (!res || !res.success || !res.rows || !res.rows.length) return;
+    let cells;
+    try {
+        cells = JSON.parse(res.rows[0].cells);
+    } catch (err) {
+        return;
+    }
+    if (!Array.isArray(cells) || !cells.length) return;
+
+    const bboxRes = runSQL(
+        'SELECT ' + cells.map((c, i) => 'GEO_GEOHASH_BBOX(' + quoteSQL(c) + ') AS c' + i).join(', '),
+        { kind: 'geo' }
+    );
+    if (!bboxRes || !bboxRes.success || !bboxRes.rows || !bboxRes.rows.length) return;
+
+    cells.forEach((cell, i) => {
+        let b;
+        try {
+            b = JSON.parse(bboxRes.rows[0]['c' + i]);
+        } catch (err) {
+            return;
+        }
+        if (!Array.isArray(b) || b.length < 4) return;
+        const isCentre = cell === geohash;
+        geohashLayers.push(L.rectangle(
+            [[b[1], b[0]], [b[3], b[2]]],
+            isCentre
+                ? { color: '#e2b714', weight: 2, fillColor: '#e2b714', fillOpacity: 0.22 }
+                : { color: '#e2b714', weight: 1, dashArray: '3 3', fillOpacity: 0.04 }
+        ).bindTooltip(cell, { direction: 'center' }).addTo(map));
+    });
+}
+
+function clearGeohashCells() {
+    geohashLayers.forEach((layer) => map.removeLayer(layer));
+    geohashLayers = [];
 }
 
 // findNearestSettlement runs GEO_DISTANCE against every row (there is no
