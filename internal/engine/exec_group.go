@@ -642,6 +642,9 @@ func processNonAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []
 	outRows := make([]Row, 0, len(filtered))
 	outCols := make([]string, 0, len(s.Projs))
 	colSet := make(map[string]struct{}, len(s.Projs))
+	// Reused across rows to order each star's newly discovered columns; see
+	// the star branch below.
+	var starCols []string
 	type directSelectProjection struct {
 		name string
 		key  string
@@ -744,6 +747,14 @@ func processNonAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []
 					// two joined tables sharing a column name produced a
 					// different, non-deterministic answer for that bare
 					// column on every single run of the identical query.
+					// The same randomization applies to the *column list*,
+					// which the value comment above does not cover: appending
+					// to outCols inside this range published map order as the
+					// query's column order, so SELECT * over a join returned
+					// its columns in a different order on each run of the
+					// identical query. Discovered names are collected here and
+					// ordered before they reach outCols.
+					starCols := starCols[:0]
 					for col, v := range r {
 						putVal(out, col, v)
 						if strings.Contains(col, ".") {
@@ -754,15 +765,17 @@ func processNonAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []
 							}
 							if _, seen := colSet[base]; !seen {
 								colSet[base] = struct{}{}
-								outCols = append(outCols, base)
+								starCols = append(starCols, base)
 							}
 						} else {
 							if _, seen := colSet[col]; !seen {
 								colSet[col] = struct{}{}
-								outCols = append(outCols, col)
+								starCols = append(starCols, col)
 							}
 						}
 					}
+					sort.Strings(starCols)
+					outCols = append(outCols, starCols...)
 					continue
 				}
 				val, err := evalExpr(env, it.Expr, r)
