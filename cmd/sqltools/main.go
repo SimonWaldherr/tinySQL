@@ -450,6 +450,9 @@ func (qh *QueryHistory) Last(n int) []QueryHistoryEntry {
 	if n > len(qh.entries) {
 		n = len(qh.entries)
 	}
+	if n < 0 {
+		n = 0
+	}
 	start := len(qh.entries) - n
 	result := make([]QueryHistoryEntry, n)
 	copy(result, qh.entries[start:])
@@ -654,6 +657,17 @@ type Exporter struct {
 // NewExporter creates an exporter for the given format.
 func NewExporter(format ExportFormat) *Exporter {
 	return &Exporter{format: format}
+}
+
+// SupportsFormat reports whether Export can write this exporter's format. It
+// lets a caller reject a bad format before opening (and truncating) the target.
+func (e *Exporter) SupportsFormat() bool {
+	switch e.format {
+	case FormatCSV, FormatJSON, FormatNDJSON, FormatSQL:
+		return true
+	default:
+		return false
+	}
 }
 
 // Export writes result set to writer.
@@ -1428,6 +1442,14 @@ func runToolsREPL(tenant string) {
 				continue
 			}
 
+			// DDL and other non-row statements return a nil result set, not an
+			// empty one.
+			if rs == nil {
+				history.Add(sql, duration, 0, nil)
+				fmt.Printf("OK (%v)\n", duration)
+				continue
+			}
+
 			history.Add(sql, duration, len(rs.Rows), nil)
 
 			if len(rs.Rows) > 0 {
@@ -1622,13 +1644,26 @@ func toolsHandleExport(parts []string, db *tsql.DB, tenant string) {
 		fmt.Println("Query error:", err)
 		return
 	}
+	if rs == nil {
+		fmt.Println("Export error: statement produced no result set")
+		return
+	}
+	// Both checks precede os.Create: it truncates, so an unknown format or a
+	// row-less statement would otherwise destroy the target file before the
+	// export could reject it.
+	format := ExportFormat(strings.ToLower(parts[1]))
+	exp := NewExporter(format)
+	if !exp.SupportsFormat() {
+		fmt.Printf("Export error: unknown format %q (want csv, json, ndjson or sql)\n", parts[1])
+		return
+	}
 	f, err := os.Create(parts[2])
 	if err != nil {
 		fmt.Println("Create export:", err)
 		return
 	}
 	defer f.Close()
-	if err := NewExporter(ExportFormat(strings.ToLower(parts[1]))).Export(rs, "result", f); err != nil {
+	if err := exp.Export(rs, "result", f); err != nil {
 		fmt.Println("Export error:", err)
 		return
 	}

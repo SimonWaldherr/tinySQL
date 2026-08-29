@@ -608,3 +608,33 @@ func TestExporterNDJSON(t *testing.T) {
 		t.Fatalf("expected two NDJSON records, got %q", buf.String())
 	}
 }
+
+// A negative count reached make() directly and panicked. ".history -5" is the
+// reachable spelling: the REPL parses the argument with Sscanf, which accepts
+// a leading minus.
+func TestQueryHistory_LastRejectsNegative(t *testing.T) {
+	h := NewQueryHistory(10)
+	h.Add("SELECT 1", time.Millisecond, 1, nil)
+	if got := h.Last(-5); len(got) != 0 {
+		t.Errorf("Last(-5) = %d entries, want 0", len(got))
+	}
+	if got := h.Last(0); len(got) != 0 {
+		t.Errorf("Last(0) = %d entries, want 0", len(got))
+	}
+}
+
+// .export opens the target with os.Create, which truncates. An unknown format
+// has to be rejected before that happens, or naming an existing file with a
+// typo'd format destroys it.
+func TestExporterSupportsFormat(t *testing.T) {
+	for _, f := range []ExportFormat{FormatCSV, FormatJSON, FormatNDJSON, FormatSQL} {
+		if !NewExporter(f).SupportsFormat() {
+			t.Errorf("format %q reported unsupported", f)
+		}
+	}
+	for _, f := range []ExportFormat{"xml", "", "CSV "} {
+		if NewExporter(f).SupportsFormat() {
+			t.Errorf("format %q reported supported", f)
+		}
+	}
+}
