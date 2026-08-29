@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strconv"
 	"strings"
 )
 
@@ -579,7 +580,14 @@ func (p *Parser) parseOrderByClause(sel *Select) error {
 		}
 		for {
 			var col string
-			if (p.cur.Typ == tIdent || p.cur.Typ == tKeyword) && p.peek.Typ == tSymbol && p.peek.Val == "(" {
+			switch {
+			case p.cur.Typ == tNumber:
+				var err error
+				col, err = p.parseOrderByOrdinal(sel)
+				if err != nil {
+					return err
+				}
+			case (p.cur.Typ == tIdent || p.cur.Typ == tKeyword) && p.peek.Typ == tSymbol && p.peek.Val == "(":
 				expr, err := p.parseExpr()
 				if err != nil {
 					return err
@@ -589,7 +597,7 @@ func (p *Parser) parseOrderByClause(sel *Select) error {
 				if !ok {
 					return p.errf("ORDER BY expression must appear in the SELECT list or have an alias")
 				}
-			} else {
+			default:
 				col = p.parseIdentLike()
 				if col == "" {
 					return p.errf("ORDER BY expects column")
@@ -620,15 +628,52 @@ func orderByProjectionName(sel *Select, expr Expr) (string, bool) {
 		if item.Star || !reflect.DeepEqual(item.Expr, expr) {
 			continue
 		}
-		if item.Alias != "" {
-			return item.Alias, true
-		}
-		if ref, ok := item.Expr.(*VarRef); ok {
-			return ref.Name, true
-		}
-		return fmt.Sprintf("col_%d", i), true
+		return projectionOutputName(item, i), true
 	}
 	return "", false
+}
+
+// projectionOutputName is the column name a SELECT item contributes to the
+// result set. Sorting resolves an OrderItem by name, so ORDER BY has to agree
+// with projection on this rule exactly.
+func projectionOutputName(item SelectItem, i int) string {
+	if item.Alias != "" {
+		return item.Alias
+	}
+	if ref, ok := item.Expr.(*VarRef); ok {
+		return ref.Name
+	}
+	return fmt.Sprintf("col_%d", i)
+}
+
+// parseOrderByOrdinal resolves the SQL positional form, ORDER BY 2, to the name
+// of the second SELECT item. The ordinal is 1-based and addresses the output
+// column list, not the source table.
+//
+// A star anywhere at or before the ordinal makes the mapping unresolvable here:
+// the parser does not know a table's width, so it cannot tell which output
+// column "2" is once * has expanded. Those queries are rejected rather than
+// silently sorted by the wrong column.
+func (p *Parser) parseOrderByOrdinal(sel *Select) (string, error) {
+	tok := p.cur
+	f, err := strconv.ParseFloat(tok.Val, 64)
+	if err != nil {
+		return "", p.errf("ORDER BY position %q is not a number", tok.Val)
+	}
+	if f != math.Trunc(f) {
+		return "", p.errf("ORDER BY position must be a whole number, got %s", tok.Val)
+	}
+	n := int(f)
+	if n < 1 || n > len(sel.Projs) {
+		return "", p.errf("ORDER BY position %d is out of range, the SELECT list has %d columns", n, len(sel.Projs))
+	}
+	for i := 0; i < n; i++ {
+		if sel.Projs[i].Star {
+			return "", p.errf("ORDER BY position %d cannot be resolved through *, name the column instead", n)
+		}
+	}
+	p.next()
+	return projectionOutputName(sel.Projs[n-1], n-1), nil
 }
 
 func (p *Parser) parseLimitOffset(sel *Select) error {
