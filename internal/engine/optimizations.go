@@ -35,12 +35,77 @@ func (h *HashJoinOptimizer) ProcessOptimizedJoin(leftRows, rightRows []Row, cond
 
 	// Try to extract equi-join condition
 	joinCond := h.extractJoinCondition(condition)
-	if joinCond != nil && joinCond.IsEquiJoin {
+	if joinCond != nil && joinCond.IsEquiJoin &&
+		orientJoinCondition(joinCond, leftRows, rightRows) {
 		return h.processHashJoin(leftRows, rightRows, joinCond, joinType)
 	}
 
 	// Fall back to nested loop for complex conditions
 	return h.processNestedLoopJoin(leftRows, rightRows, condition, joinType)
+}
+
+// orientJoinCondition makes JoinCondition.LeftColumn name a column of leftRows
+// and RightColumn a column of rightRows, swapping them when the ON clause was
+// written with the right-hand table first.
+//
+// extractJoinCondition reads the two column names straight off the syntactic
+// operands of `=`, so `ON b.id = a.id` recorded LeftColumn="b.id" — a column of
+// the RIGHT relation. processHashJoin then looked that name up in left rows,
+// getJoinKey found nothing and returned nil, and every row was dropped: an
+// inner join over reversed-but-equivalent SQL silently returned zero rows
+// instead of the full result. It only showed above the row count that engages
+// this optimizer at all; below it the nested-loop path evaluates the predicate
+// through the general evaluator, which resolves qualified names correctly.
+//
+// Returning false means the sides could not be told apart — an unqualified name
+// that exists in neither sample row, say — and the caller must use the
+// nested-loop path, which is slower but resolves names correctly. Guessing an
+// orientation would risk reintroducing exactly the silent-wrong-answer bug this
+// exists to prevent.
+//
+// An empty relation needs no orientation: an inner join yields nothing either
+// way, and a LEFT JOIN with no right rows takes processHashJoin's empty-build
+// branch, which emits every left row unmatched.
+func orientJoinCondition(cond *JoinCondition, leftRows, rightRows []Row) bool {
+	if len(leftRows) == 0 || len(rightRows) == 0 {
+		return true
+	}
+	sampleLeft, sampleRight := leftRows[0], rightRows[0]
+	lowerLeft := strings.ToLower(cond.LeftColumn)
+	lowerRight := strings.ToLower(cond.RightColumn)
+
+	// As written wins ties: an unqualified name present on both sides keeps the
+	// operand order the query used, matching the previous behavior for that
+	// (already ambiguous) shape.
+	if joinColumnResolves(sampleLeft, cond.LeftColumn, lowerLeft) &&
+		joinColumnResolves(sampleRight, cond.RightColumn, lowerRight) {
+		return true
+	}
+	if joinColumnResolves(sampleLeft, cond.RightColumn, lowerRight) &&
+		joinColumnResolves(sampleRight, cond.LeftColumn, lowerLeft) {
+		cond.LeftColumn, cond.RightColumn = cond.RightColumn, cond.LeftColumn
+		return true
+	}
+	return false
+}
+
+// joinColumnResolves reports whether column names a value in row, using exactly
+// the lookup sequence getJoinKey uses, so orientation cannot disagree with the
+// key extraction it is orienting for.
+func joinColumnResolves(row Row, column, lowerColumn string) bool {
+	if _, ok := row[lowerColumn]; ok {
+		return true
+	}
+	if _, ok := row[column]; ok {
+		return true
+	}
+	suffix := "." + lowerColumn
+	for key := range row {
+		if strings.HasSuffix(strings.ToLower(key), suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 // extractJoinCondition tries to extract a simple equi-join condition
