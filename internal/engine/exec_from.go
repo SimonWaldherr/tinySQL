@@ -39,19 +39,55 @@ func resolveSubquery(env ExecEnv, s *Select) ([]Row, error) {
 	if err != nil {
 		return nil, err
 	}
-	leftRows := make([]Row, len(subResult.Rows))
-	for i, row := range subResult.Rows {
-		leftRows[i] = make(Row)
+	return aliasRows(subResult.Rows, s.From.Alias), nil
+}
+
+// derivedKeys are the output map keys a source key contributes: the key itself
+// lower-cased, and the same prefixed with the FROM alias.
+type derivedKeys struct {
+	plain     string
+	qualified string
+}
+
+// aliasRows re-keys rows for the outer select: every key lower-cased, and
+// additionally alias-qualified when the FROM item has an alias.
+//
+// Both derived keys depend only on the source key and the alias, so they are
+// computed once per distinct key rather than once per cell. That matters most
+// for table functions -- the parser defaults a table function's alias to the
+// function name, so the qualified branch always runs, and building
+// alias+"."+key per cell dominated the allocation profile of every VEC_SEARCH,
+// RAG_SEARCH, HYBRID_SEARCH and FTS_SEARCH query.
+func aliasRows(rows []Row, alias string) []Row {
+	out := make([]Row, len(rows))
+	qualify := alias != ""
+	width := 1
+	if qualify {
+		width = 2
+	}
+	// strings.ToLower maps rune-wise, so lowering the alias and the key
+	// separately gives the same string as lowering the concatenation.
+	lowerAlias := strings.ToLower(alias)
+	keys := make(map[string]derivedKeys)
+	for i, row := range rows {
+		dst := make(Row, len(row)*width)
 		for k, v := range row {
-			// Immer unqualifiziert (für Outer-Select), lower-case
-			leftRows[i][strings.ToLower(k)] = v
-			// Zusätzlich mit Alias-Präfix, falls Alias gesetzt
-			if s.From.Alias != "" {
-				leftRows[i][strings.ToLower(s.From.Alias+"."+k)] = v
+			dk, ok := keys[k]
+			if !ok {
+				dk.plain = strings.ToLower(k)
+				if qualify {
+					dk.qualified = lowerAlias + "." + dk.plain
+				}
+				keys[k] = dk
+			}
+			dst[dk.plain] = v
+			if qualify {
+				dst[dk.qualified] = v
 			}
 		}
+		out[i] = dst
 	}
-	return leftRows, nil
+	return out
 }
 
 // resolveTableFunc handles FROM table-valued function
@@ -70,18 +106,7 @@ func resolveTableFunc(env ExecEnv, s *Select) ([]Row, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Convert ResultSet to rows with alias handling
-	leftRows := make([]Row, len(rs.Rows))
-	for i, row := range rs.Rows {
-		leftRows[i] = make(Row)
-		for k, v := range row {
-			leftRows[i][strings.ToLower(k)] = v
-			if s.From.Alias != "" {
-				leftRows[i][strings.ToLower(s.From.Alias+"."+k)] = v
-			}
-		}
-	}
-	return leftRows, nil
+	return aliasRows(rs.Rows, s.From.Alias), nil
 }
 
 // resolveTableSource handles CTE, catalog, sys, or regular table resolution
