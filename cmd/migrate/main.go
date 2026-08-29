@@ -941,7 +941,9 @@ func handleCopy(db *tinysql.DB, ctx context.Context, tenant, input string) {
 	// COPY SELECT ... INTO <conn>.<table>
 	upper := strings.ToUpper(input)
 	intoIdx := strings.LastIndex(upper, " INTO ")
-	if intoIdx == -1 {
+	// An INTO before index 5 means there is no query between "COPY " and it,
+	// as in "COPY INTO x.y" where INTO starts at 4 and input[5:4] would panic.
+	if intoIdx < 5 {
 		fmt.Println("✗ Usage: COPY SELECT ... INTO <conn>.<table>")
 		return
 	}

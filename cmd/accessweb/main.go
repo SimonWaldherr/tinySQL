@@ -4,12 +4,16 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	"errors"
 	"flag"
 	"fmt"
 	"html/template"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
 	tsqldriver "github.com/SimonWaldherr/tinySQL/driver"
@@ -17,6 +21,10 @@ import (
 
 //go:embed templates static
 var webFS embed.FS
+
+// defaultTenant is the tenant the driver's embedding path uses. See the check
+// in main for why it cannot be varied.
+const defaultTenant = "default"
 
 func main() {
 	addr := flag.String("addr", ":8080", "HTTP listen address")
@@ -30,24 +38,18 @@ func main() {
 		log.Fatalf("open database: %v", err)
 	}
 
-	// Autosave on clean shutdown when using a file.
-	if *dbFile != "" && *dbFile != ":memory:" {
-		defer func() {
-			if saveErr := tinysql.SaveToFile(nativeDB, *dbFile); saveErr != nil {
-				log.Printf("autosave: %v", saveErr)
-			}
-		}()
+	// The driver shares an existing database only through the empty DSN, which
+	// pins the tenant to "default". A named DSN such as mem://?tenant=x builds
+	// its own storage, so the handlers wrote to one database while the file was
+	// loaded from and saved to another.
+	if *tenant != defaultTenant {
+		log.Fatalf("-tenant must be %q: the embedded driver connection shares the saved database only on the default tenant", defaultTenant)
 	}
 
-	// Register the native DB instance with the database/sql driver so that
-	// sql.Open("tinysql", ...) shares the same underlying storage.
-	tsqldriver.SetDefaultDB(nativeDB)
-
-	sqlDB, err := sql.Open("tinysql", "mem://?tenant="+*tenant)
+	sqlDB, err := tsqldriver.OpenWithDB(nativeDB)
 	if err != nil {
-		log.Fatalf("sql.Open: %v", err)
+		log.Fatalf("open sql handle: %v", err)
 	}
-	defer sqlDB.Close()
 	sqlDB.SetMaxOpenConns(8)
 	sqlDB.SetMaxIdleConns(4)
 
@@ -66,9 +68,70 @@ func main() {
 	app.registerRoutes(mux)
 	mux.Handle("GET /static/", http.FileServer(http.FS(webFS)))
 
-	handler := securityHeaders(mux)
+	srv := &http.Server{
+		Addr:              *addr,
+		Handler:           securityHeaders(mux),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	log.Printf("AccessWeb listening on %s  (db: %s, tenant: %s)", *addr, dbLabel(*dbFile), *tenant)
-	log.Fatal(http.ListenAndServe(*addr, handler))
+	if err := serveUntilSignal(ctx, srv, sqlDB, nativeDB, *dbFile); err != nil {
+		log.Fatalf("serve: %v", err)
+	}
+}
+
+// serveUntilSignal runs srv until ctx is cancelled, then drains connections and
+// writes the database back to dbFile.
+//
+// The save has to happen here rather than in a defer in main: the database is
+// held in memory for the lifetime of the process, and the previous
+// log.Fatal(ListenAndServe(...)) exited through os.Exit, which runs no defers.
+// Every edit made through the web UI was discarded on shutdown.
+func serveUntilSignal(ctx context.Context, srv *http.Server, sqlDB *sql.DB, nativeDB *tinysql.DB, dbFile string) error {
+	errCh := make(chan error, 1)
+	go func() {
+		serveErr := srv.ListenAndServe()
+		if errors.Is(serveErr, http.ErrServerClosed) {
+			serveErr = nil
+		}
+		errCh <- serveErr
+	}()
+
+	var serveErr error
+	select {
+	case serveErr = <-errCh:
+	case <-ctx.Done():
+		log.Println("shutting down")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("shutdown: %v", err)
+		}
+		serveErr = <-errCh
+	}
+
+	if err := sqlDB.Close(); err != nil {
+		log.Printf("close pool: %v", err)
+	}
+	if dbFile != "" && dbFile != ":memory:" {
+		if saveErr := tinysql.SaveToFile(nativeDB, dbFile); saveErr != nil {
+			log.Printf("autosave: %v", saveErr)
+		} else {
+			log.Printf("saved database to %s", dbFile)
+		}
+	}
+	// Close after the save: it stops the WAL checkpoint worker and releases the
+	// descriptors that back the database.
+	if err := nativeDB.Close(); err != nil {
+		log.Printf("close database: %v", err)
+	}
+	return serveErr
 }
 
 // openNativeDB loads a file-backed DB or creates a new in-memory one.

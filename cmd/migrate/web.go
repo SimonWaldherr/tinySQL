@@ -182,8 +182,10 @@ func (s *webState) handleQuery(w http.ResponseWriter, r *http.Request) {
 func (s *webState) handleCopyQuery(w http.ResponseWriter, sql string) {
 	upper := strings.ToUpper(sql)
 	intoIdx := strings.LastIndex(upper, " INTO ")
-	if intoIdx == -1 {
-		writeJSON(w, http.StatusBadRequest, apiResponse{Error: "COPY requires INTO clause"})
+	// Below index 5 there is no query between "COPY " and INTO, and sql[5:intoIdx]
+	// would panic -- reachable from POST /api/query with "COPY INTO x.y".
+	if intoIdx < 5 {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Error: "COPY requires a query before INTO: COPY SELECT ... INTO <conn>.<table>"})
 		return
 	}
 
