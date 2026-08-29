@@ -535,6 +535,12 @@ func evalVecSlice(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if start < 0 || start >= len(vec) {
 		return nil, fmt.Errorf("VEC_SLICE: start %d out of bounds (dim=%d)", start, len(vec))
 	}
+	// A negative length made end < start, which panicked in make() and reached
+	// the caller as an opaque "internal error" from the statement-level
+	// recover rather than as a validation message.
+	if length < 0 {
+		return nil, fmt.Errorf("VEC_SLICE: length %d must not be negative", length)
+	}
 	end := start + length
 	if end > len(vec) {
 		end = len(vec)

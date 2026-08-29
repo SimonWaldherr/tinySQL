@@ -483,6 +483,36 @@ func TestVecSlice(t *testing.T) {
 	}
 }
 
+// start was bounds-checked but length was not, so a negative length made
+// end < start and panicked in make(). The statement-level recover turned that
+// into an opaque "internal error" instead of a validation message.
+func TestVecSliceRejectsNegativeLength(t *testing.T) {
+	db := storage.NewDB()
+	for _, q := range []string{
+		`SELECT VEC_SLICE(VEC_FROM_JSON('[1,2,3,4]'), 0, -1) AS v`,
+		`SELECT VEC_SLICE(VEC_FROM_JSON('[1,2,3,4]'), 2, -3) AS v`,
+	} {
+		_, err := Execute(context.Background(), db, "default", mustParse(q))
+		if err == nil {
+			t.Errorf("%s: expected an error, got none", q)
+			continue
+		}
+		if !strings.Contains(err.Error(), "must not be negative") {
+			t.Errorf("%s: error %q does not name the negative length", q, err)
+		}
+	}
+}
+
+// A length past the end still clamps rather than erroring.
+func TestVecSliceClampsOverlongLength(t *testing.T) {
+	db := storage.NewDB()
+	rs := execSQL(t, db, `SELECT VEC_SLICE(VEC_FROM_JSON('[1,2,3,4]'), 1, 99) AS v`)
+	vec := rs.Rows[0]["v"].([]float64)
+	if len(vec) != 3 {
+		t.Errorf("VEC_SLICE clamped to %v, want 3 elements", vec)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // VEC_CONCAT
 // ---------------------------------------------------------------------------
