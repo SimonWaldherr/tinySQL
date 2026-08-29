@@ -15,12 +15,16 @@ import (
 //go:embed templates/*.html static/*
 var webFS embed.FS
 
+// builtinAdminPassword is the seeded demo credential. It is the only password
+// the login page is ever allowed to display; see the hint check in main.
+const builtinAdminPassword = "admin123"
+
 // main starts the Formigo HTTP server.
 func main() {
 	addr := flag.String("addr", ":8080", "HTTP listen address")
 	dsn := flag.String("dsn", "file:formigo.db?autosave=1", "tinySQL DSN (file:path.db or mem://) or sqlserver:// DSN")
 	adminUser := flag.String("admin-user", envDefault("FORMIGO_ADMIN_USER", "admin"), "initial admin username")
-	adminPassword := flag.String("admin-password", envDefault("FORMIGO_ADMIN_PASSWORD", "admin123"), "initial admin password")
+	adminPassword := flag.String("admin-password", envDefault("FORMIGO_ADMIN_PASSWORD", builtinAdminPassword), "initial admin password")
 	cookieSecure := flag.Bool("secure-cookie", envDefault("FORMIGO_SECURE_COOKIE", "false") == "true", "mark session cookies as Secure")
 	flag.Parse()
 
@@ -50,10 +54,16 @@ func main() {
 	auth := NewAuthService(store, *cookieSecure)
 	app := NewApp(store, auth, tpl, *adminUser, *adminPassword)
 
-	// Check if the default admin password is still active.
-	if u, err := store.FindUserByUsername(ctx, *adminUser); err == nil {
-		if CheckPassword(u.PasswordHash, *adminPassword) {
-			app.adminHintActive.Store(true)
+	// The hint publishes the password into the unauthenticated login page, so
+	// it may only ever describe the built-in demo credential. Operators are
+	// told to set -admin-password / FORMIGO_ADMIN_PASSWORD; matching against
+	// whatever they supplied would hand that secret to every visitor of
+	// /login.
+	if *adminPassword == builtinAdminPassword {
+		if u, err := store.FindUserByUsername(ctx, *adminUser); err == nil {
+			if CheckPassword(u.PasswordHash, *adminPassword) {
+				app.adminHintActive.Store(true)
+			}
 		}
 	}
 

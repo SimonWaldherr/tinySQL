@@ -321,9 +321,15 @@ func (a *App) render(w http.ResponseWriter, r *http.Request, name string, data m
 	rc := CurrentRequestContext(r)
 	data["CurrentUser"] = rc.User
 	data["CSRFToken"] = rc.CSRFToken
-	data["AdminHintActive"] = a.adminHintActive.Load()
-	data["DefaultAdminUser"] = a.defaultAdminUser
-	data["DefaultAdminPass"] = a.defaultAdminPass
+	// Only expose the demo credentials while the hint is actually active. This
+	// data map reaches every template, the unauthenticated login page
+	// included, so the password should not be sitting in it otherwise.
+	hintActive := a.adminHintActive.Load()
+	data["AdminHintActive"] = hintActive
+	if hintActive {
+		data["DefaultAdminUser"] = a.defaultAdminUser
+		data["DefaultAdminPass"] = a.defaultAdminPass
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := a.tpl.ExecuteTemplate(w, name, data); err != nil {
 		http.Error(w, "template error", http.StatusInternalServerError)
