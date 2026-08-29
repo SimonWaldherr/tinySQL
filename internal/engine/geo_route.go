@@ -9,13 +9,11 @@
 // and column names passed as string arguments, not identifiers the parser
 // resolves) rather than adding graph traversal to the query planner, which
 // only ever recognizes per-row predicates -- see spatial_index.go's doc
-// comment for the same reasoning GEO_SEARCH already gives. Unlike
-// GEO_SEARCH, the edge list is scanned and its adjacency structure rebuilt
-// on every call rather than cached: a persistent, version-invalidated graph
-// cache (mirroring geoGridCache/vecIndexCache) would be the natural
-// follow-up if repeated queries against the same large graph show up as a
-// bottleneck, but building it up front would be premature for a first
-// implementation with no evidence that scan cost dominates.
+// comment for the same reasoning GEO_SEARCH already gives. Like GEO_SEARCH,
+// the derived adjacency structure is cached by tenant, table version, column
+// set and direction. Repeated routes therefore pay only the shortest-path
+// search, while writes invalidate through Table.Version and DROP/rollback
+// purge the derived graph eagerly.
 //
 // Only non-negative edge weights are accepted (Dijkstra's own precondition);
 // a graph with negative weights needs Bellman-Ford, which is out of scope
@@ -29,6 +27,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -53,7 +52,119 @@ type routeGraph struct {
 	table      *storage.Table
 	nodeIndex  map[string]int
 	nodeValues []any
-	adjacency  [][]routeGraphEdge
+	// offsets/edges use the same compact CSR shape as Karte.Bayern's routing
+	// graph: outgoing edges for node n are edges[offsets[n]:offsets[n+1]].
+	// Compared with [][]routeGraphEdge this is one contiguous allocation, has
+	// better traversal locality and avoids one allocation per non-leaf node.
+	offsets []int
+	edges   []routeGraphEdge
+}
+
+const routeGraphCacheMaxEntries = 64
+
+type routeGraphCacheKey struct {
+	tenant                          string
+	table                           string
+	sourceCol, targetCol, weightCol string
+	direction                       string
+}
+
+type routeGraphCacheEntry struct {
+	table   *storage.Table
+	version int
+	graph   *routeGraph
+}
+
+type routeGraphBuildCall struct {
+	done  chan struct{}
+	graph *routeGraph
+	err   error
+}
+
+var routeGraphCacheState = struct {
+	sync.RWMutex
+	entries map[routeGraphCacheKey]routeGraphCacheEntry
+	builds  map[routeGraphCacheKey]*routeGraphBuildCall
+}{
+	entries: make(map[routeGraphCacheKey]routeGraphCacheEntry),
+	builds:  make(map[routeGraphCacheKey]*routeGraphBuildCall),
+}
+
+func routeGraphKey(tenant string, table *storage.Table, sourceCol, targetCol, weightCol, direction string) routeGraphCacheKey {
+	return routeGraphCacheKey{
+		tenant: tenant, table: strings.ToLower(table.Name),
+		sourceCol: strings.ToLower(sourceCol), targetCol: strings.ToLower(targetCol),
+		weightCol: strings.ToLower(weightCol), direction: direction,
+	}
+}
+
+// getRouteGraph returns an immutable adjacency graph for the current table
+// version and coalesces concurrent cold builds for the same routing shape.
+func getRouteGraph(ctx context.Context, tenant string, table *storage.Table, sourceCol, targetCol, weightCol, direction string) (*routeGraph, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	key := routeGraphKey(tenant, table, sourceCol, targetCol, weightCol, direction)
+
+	routeGraphCacheState.RLock()
+	entry, ok := routeGraphCacheState.entries[key]
+	routeGraphCacheState.RUnlock()
+	if ok && entry.table == table && entry.version == table.Version {
+		return entry.graph, nil
+	}
+
+	routeGraphCacheState.Lock()
+	entry, ok = routeGraphCacheState.entries[key]
+	if ok && entry.table == table && entry.version == table.Version {
+		routeGraphCacheState.Unlock()
+		return entry.graph, nil
+	}
+	if call := routeGraphCacheState.builds[key]; call != nil {
+		routeGraphCacheState.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-call.done:
+			// A canceled first caller must not make every healthy waiter fail.
+			// Retry so one of them becomes the next builder under its own context.
+			if call.err != nil && ctx.Err() == nil {
+				return getRouteGraph(ctx, tenant, table, sourceCol, targetCol, weightCol, direction)
+			}
+			return call.graph, call.err
+		}
+	}
+	call := &routeGraphBuildCall{done: make(chan struct{})}
+	routeGraphCacheState.builds[key] = call
+	routeGraphCacheState.Unlock()
+
+	version := table.Version
+	call.graph, call.err = buildRouteGraph(ctx, table, sourceCol, targetCol, weightCol, direction)
+
+	routeGraphCacheState.Lock()
+	delete(routeGraphCacheState.builds, key)
+	if call.err == nil && table.Version == version {
+		if _, exists := routeGraphCacheState.entries[key]; !exists {
+			evictOverCap(routeGraphCacheState.entries, routeGraphCacheMaxEntries)
+		}
+		routeGraphCacheState.entries[key] = routeGraphCacheEntry{table: table, version: version, graph: call.graph}
+	}
+	close(call.done)
+	routeGraphCacheState.Unlock()
+	return call.graph, call.err
+}
+
+func purgeRouteGraphCachesFor(tenant, table string) {
+	if tenant == "" {
+		tenant = "default"
+	}
+	table = strings.ToLower(table)
+	routeGraphCacheState.Lock()
+	for key := range routeGraphCacheState.entries {
+		if key.tenant == tenant && key.table == table {
+			delete(routeGraphCacheState.entries, key)
+		}
+	}
+	routeGraphCacheState.Unlock()
 }
 
 // routeNodeKey canonicalizes a node id value into a comparable string key.
@@ -79,7 +190,7 @@ func routeNodeKey(v any) (string, error) {
 // original id value, in whichever type it was first seen as, for reporting
 // back in results). direction "undirected" adds both directions of travel
 // for each edge row; "directed" (the default) adds only source->target.
-func buildRouteGraph(table *storage.Table, sourceCol, targetCol, weightCol, direction string) (*routeGraph, error) {
+func buildRouteGraph(ctx context.Context, table *storage.Table, sourceCol, targetCol, weightCol, direction string) (*routeGraph, error) {
 	srcIdx, err := table.ColIndex(sourceCol)
 	if err != nil {
 		return nil, fmt.Errorf("source column: %w", err)
@@ -105,11 +216,24 @@ func buildRouteGraph(table *storage.Table, sourceCol, targetCol, weightCol, dire
 		idx := len(g.nodeValues)
 		g.nodeIndex[key] = idx
 		g.nodeValues = append(g.nodeValues, v)
-		g.adjacency = append(g.adjacency, nil)
 		return idx, nil
 	}
+	type buildEdge struct {
+		from int
+		routeGraphEdge
+	}
+	edgeCap := len(table.Rows)
+	if direction == "undirected" && edgeCap <= int(^uint(0)>>1)/2 {
+		edgeCap *= 2
+	}
+	flat := make([]buildEdge, 0, edgeCap)
 
 	for rowIdx, r := range table.Rows {
+		if rowIdx&1023 == 0 {
+			if err := checkCtx(ctx); err != nil {
+				return nil, err
+			}
+		}
 		if srcIdx >= len(r) || tgtIdx >= len(r) || wIdx >= len(r) {
 			continue
 		}
@@ -132,10 +256,24 @@ func buildRouteGraph(table *storage.Table, sourceCol, targetCol, weightCol, dire
 		if err != nil {
 			return nil, fmt.Errorf("row %d: target id: %w", rowIdx, err)
 		}
-		g.adjacency[srcNode] = append(g.adjacency[srcNode], routeGraphEdge{to: tgtNode, weight: weight, rowIdx: rowIdx})
+		flat = append(flat, buildEdge{from: srcNode, routeGraphEdge: routeGraphEdge{to: tgtNode, weight: weight, rowIdx: rowIdx}})
 		if direction == "undirected" {
-			g.adjacency[tgtNode] = append(g.adjacency[tgtNode], routeGraphEdge{to: srcNode, weight: weight, rowIdx: rowIdx})
+			flat = append(flat, buildEdge{from: tgtNode, routeGraphEdge: routeGraphEdge{to: srcNode, weight: weight, rowIdx: rowIdx}})
 		}
+	}
+
+	g.offsets = make([]int, len(g.nodeValues)+1)
+	for _, edge := range flat {
+		g.offsets[edge.from+1]++
+	}
+	for node := 1; node < len(g.offsets); node++ {
+		g.offsets[node] += g.offsets[node-1]
+	}
+	g.edges = make([]routeGraphEdge, len(flat))
+	cursors := append([]int(nil), g.offsets[:len(g.nodeValues)]...)
+	for _, edge := range flat {
+		g.edges[cursors[edge.from]] = edge.routeGraphEdge
+		cursors[edge.from]++
 	}
 	return g, nil
 }
@@ -228,51 +366,118 @@ type routeStep struct {
 	cumulative float64
 }
 
+// routeSearchScratch owns Dijkstra's O(nodes) working memory. The graph is
+// immutable and shared, but distances/predecessors/visited state are private to
+// one query. Pooling these arrays avoids allocating several full-graph slices
+// for every warm route; generation marks make reset O(1), as in Karte.Bayern's
+// routing scratch implementation.
+type routeSearchScratch struct {
+	dist               []float64
+	prevNode, prevEdge []int
+	generation         []uint32
+	mark               uint32
+	heap               routeHeap
+}
+
+var routeSearchScratchPool = sync.Pool{New: func() any { return &routeSearchScratch{} }}
+
+func acquireRouteSearchScratch(nodes int) *routeSearchScratch {
+	scratch := routeSearchScratchPool.Get().(*routeSearchScratch)
+	if cap(scratch.dist) < nodes {
+		scratch.dist = make([]float64, nodes)
+		scratch.prevNode = make([]int, nodes)
+		scratch.prevEdge = make([]int, nodes)
+		scratch.generation = make([]uint32, nodes)
+	} else {
+		scratch.dist = scratch.dist[:nodes]
+		scratch.prevNode = scratch.prevNode[:nodes]
+		scratch.prevEdge = scratch.prevEdge[:nodes]
+		scratch.generation = scratch.generation[:nodes]
+	}
+	scratch.heap = scratch.heap[:0]
+	scratch.mark++
+	if scratch.mark == 0 {
+		clear(scratch.generation)
+		scratch.mark = 1
+	}
+	return scratch
+}
+
+func releaseRouteSearchScratch(scratch *routeSearchScratch) {
+	scratch.heap = scratch.heap[:0]
+	routeSearchScratchPool.Put(scratch)
+}
+
+func (scratch *routeSearchScratch) distance(node int, inf float64) float64 {
+	if scratch.generation[node] != scratch.mark {
+		return inf
+	}
+	return scratch.dist[node]
+}
+
+func (scratch *routeSearchScratch) setDistance(node int, distance float64) {
+	scratch.generation[node] = scratch.mark
+	scratch.dist[node] = distance
+}
+
 // dijkstraShortestPath returns the shortest path from start to end as a
 // sequence of steps (including both endpoints), or found=false if end is
 // unreachable from start. Search stops as soon as end is popped off the
 // heap (its shortest distance is then final), the standard early-exit that
 // avoids exploring the rest of the graph once the answer is known.
 func dijkstraShortestPath(g *routeGraph, start, end int) (path []routeStep, found bool) {
+	path, _, found = dijkstraSearch(g, start, end, true)
+	return path, found
+}
+
+// dijkstraShortestDistance is the cost-only counterpart used by
+// ROUTE_DISTANCE. Karte.Bayern uses the same separation for matrix/cost
+// queries: without a requested path there is no reason to write parents or
+// allocate and reverse thousands of route steps.
+func dijkstraShortestDistance(g *routeGraph, start, end int) (distance float64, found bool) {
+	_, distance, found = dijkstraSearch(g, start, end, false)
+	return distance, found
+}
+
+func dijkstraSearch(g *routeGraph, start, end int, wantPath bool) (path []routeStep, distance float64, found bool) {
 	n := len(g.nodeValues)
 	const inf = 1e308 // effectively +Inf but still comparable/subtractable without producing NaN
-	dist := make([]float64, n)
-	prevNode := make([]int, n)
-	prevEdge := make([]int, n)
-	visited := make([]bool, n)
-	for i := range dist {
-		dist[i] = inf
-		prevNode[i] = -1
-		prevEdge[i] = -1
-	}
-	dist[start] = 0
+	scratch := acquireRouteSearchScratch(n)
+	defer releaseRouteSearchScratch(scratch)
+	dist, prevNode, prevEdge := scratch.dist, scratch.prevNode, scratch.prevEdge
+	scratch.setDistance(start, 0)
+	prevNode[start], prevEdge[start] = -1, -1
 
-	h := routeHeap{{node: start, cost: 0}}
-	for len(h) > 0 {
-		cur := routeHeapPop(&h)
-		if visited[cur.node] {
+	scratch.heap = append(scratch.heap, routeHeapEntry{node: start, cost: 0})
+	reached := false
+	for len(scratch.heap) > 0 {
+		cur := routeHeapPop(&scratch.heap)
+		if cur.cost != scratch.distance(cur.node, inf) {
 			continue
 		}
-		visited[cur.node] = true
 		if cur.node == end {
+			reached = true
 			break
 		}
-		for _, e := range g.adjacency[cur.node] {
-			if visited[e.to] {
-				continue
-			}
+		for _, e := range g.edges[g.offsets[cur.node]:g.offsets[cur.node+1]] {
 			nd := dist[cur.node] + e.weight
-			if nd < dist[e.to] {
-				dist[e.to] = nd
-				prevNode[e.to] = cur.node
-				prevEdge[e.to] = e.rowIdx
-				routeHeapPush(&h, routeHeapEntry{node: e.to, cost: nd})
+			if nd < scratch.distance(e.to, inf) {
+				scratch.setDistance(e.to, nd)
+				if wantPath {
+					prevNode[e.to] = cur.node
+					prevEdge[e.to] = e.rowIdx
+				}
+				routeHeapPush(&scratch.heap, routeHeapEntry{node: e.to, cost: nd})
 			}
 		}
 	}
 
-	if !visited[end] {
-		return nil, false
+	if !reached {
+		return nil, 0, false
+	}
+	distance = dist[end]
+	if !wantPath {
+		return nil, distance, true
 	}
 	var rev []routeStep
 	for at := end; at != -1; at = prevNode[at] {
@@ -285,7 +490,7 @@ func dijkstraShortestPath(g *routeGraph, start, end int) (path []routeStep, foun
 	for i, s := range rev {
 		path[len(rev)-1-i] = s
 	}
-	return path, true
+	return path, distance, true
 }
 
 // routeArgError names which positional argument failed, matching this
@@ -392,7 +597,14 @@ func (f *RouteShortestPathTableFunc) Execute(ctx context.Context, args []Expr, e
 	if err != nil {
 		return nil, err
 	}
-	g, err := buildRouteGraph(table, sourceCol, targetCol, weightCol, direction)
+	tenant := env.tenant
+	if tenant == "" {
+		tenant = "default"
+	}
+	if ctx == nil {
+		ctx = env.ctx
+	}
+	g, err := getRouteGraph(ctx, tenant, table, sourceCol, targetCol, weightCol, direction)
 	if err != nil {
 		return nil, fmt.Errorf("ROUTE_SHORTEST_PATH: %w", err)
 	}
@@ -465,7 +677,11 @@ func evalRouteDistance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	g, err := buildRouteGraph(table, sourceCol, targetCol, weightCol, direction)
+	tenant := env.tenant
+	if tenant == "" {
+		tenant = "default"
+	}
+	g, err := getRouteGraph(env.ctx, tenant, table, sourceCol, targetCol, weightCol, direction)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", ex.Name, err)
 	}
@@ -477,9 +693,9 @@ func evalRouteDistance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("%s: end id not found among %q/%q values", ex.Name, sourceCol, targetCol)
 	}
-	path, found := dijkstraShortestPath(g, startIdx, endIdx)
+	distance, found := dijkstraShortestDistance(g, startIdx, endIdx)
 	if !found {
 		return nil, nil
 	}
-	return path[len(path)-1].cumulative, nil
+	return distance, nil
 }

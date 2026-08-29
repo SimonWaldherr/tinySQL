@@ -452,10 +452,11 @@ wrong answer; a graph that genuinely needs negative weights needs
 Bellman-Ford, which is out of scope. If the edge table has an `edge_id` and/
 or `geometry` column, `ROUTE_SHORTEST_PATH` reports the edge actually taken
 and its geometry alongside each step; both are `NULL` if the table does not
-have those columns. Like `GEO_SEARCH`, the graph is rebuilt from the table on
-every call rather than cached — correct and simple first, with a persistent
-graph index as the natural follow-up if repeated queries against the same
-large graph turn out to need it.
+have those columns. Like `GEO_SEARCH`, routing builds its derived structure
+lazily. The bounded process-wide graph cache is keyed by tenant, table,
+source/target/weight columns, and direction; writes invalidate it through the
+table version, while rollback and `DROP TABLE` purge it eagerly. Concurrent
+first requests for the same graph share one build.
 
 ## Map tiles and MBTiles
 

@@ -126,16 +126,18 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 	}
 
 	k := vecArgsParsed.k
-	candidateK := opts.CandidateK
-	if candidateK <= 0 {
-		candidateK = k * 4
-	}
-	if candidateK < k {
-		candidateK = k
-	}
-
 	textColumns := ragSearchTextColumns(&opts)
 	hybrid := len(textColumns) > 0 && opts.TextQuery != ""
+	candidateK := k
+	if hybrid {
+		candidateK = opts.CandidateK
+		if candidateK <= 0 {
+			candidateK = k * 4
+		}
+		if candidateK < k {
+			candidateK = k
+		}
+	}
 
 	searchArgs := vecArgsParsed
 	searchArgs.k = candidateK

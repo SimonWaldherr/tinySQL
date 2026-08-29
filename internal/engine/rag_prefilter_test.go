@@ -100,6 +100,27 @@ func TestRetrievalPreFilterRunsBeforeVectorFTSAndRRF(t *testing.T) {
 		}
 	}
 
+	// The immutable, cached row filter is also a stable identity for the
+	// authorization-local neighbor topology. Repeated filtered expansions must
+	// therefore populate the context cache instead of scanning and sorting the
+	// entire allowed corpus on every request.
+	table, err := db.Get("default", "acl_chunks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hasFilteredContextIndex := false
+	ragContextIndexCacheMu.RLock()
+	for key, entry := range ragContextIndexCache {
+		if entry.table == table && key.filter != nil {
+			hasFilteredContextIndex = true
+			break
+		}
+	}
+	ragContextIndexCacheMu.RUnlock()
+	if !hasFilteredContextIndex {
+		t.Fatal("filtered context expansion did not publish a reusable neighbor index")
+	}
+
 	// The retrieval table is a physical table, so a same-named CTE must not
 	// replace it only for context expansion. Such a substitution would give the
 	// context phase row IDs unrelated to the resolved ACL filter.

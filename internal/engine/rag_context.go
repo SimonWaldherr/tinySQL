@@ -27,6 +27,11 @@ type ragContextIndexCacheKey struct {
 	table    string
 	docCol   string // lower-cased
 	chunkCol string // lower-cased
+	// filter is nil for ordinary table sources. Pre-filtered RAG_SEARCH
+	// expansion uses the immutable, version-scoped row filter as part of the
+	// identity so repeated requests can share an authorization-local neighbor
+	// index without ever sharing it with another ACL slice.
+	filter *ragRowFilter
 }
 
 type ragContextIndexCacheEntry struct {
@@ -73,6 +78,7 @@ func getRAGContextIndex(source ragSource, docCol, chunkCol string) ragContextInd
 		table:    source.table.Name,
 		docCol:   strings.ToLower(docCol),
 		chunkCol: strings.ToLower(chunkCol),
+		filter:   source.rowFilter,
 	}
 
 	ragContextIndexCacheMu.RLock()
@@ -367,6 +373,11 @@ type ragSource struct {
 	// identity to cache under.
 	tenant string
 	table  *storage.Table
+	// rowFilter retains physical row identities for authorization-restricted
+	// table sources. That lets context rows address rawRows directly and makes
+	// the filtered neighbor index cacheable without copying and renumbering a
+	// compact rawRows slice on every query.
+	rowFilter *ragRowFilter
 }
 
 type ragContextRow struct {
@@ -620,13 +631,17 @@ func ragBuildContextIndex(source ragSource, docCol, chunkCol string) ragContextI
 			// Same outcome as the generic loop below, which would skip every row.
 			return contexts
 		}
-		for rowIndex, raw := range source.rawRows {
+		appendRow := func(rowIndex int) {
+			if rowIndex < 0 || rowIndex >= len(source.rawRows) {
+				return
+			}
+			raw := source.rawRows[rowIndex]
 			if docIdx >= len(raw) || chunkIdx >= len(raw) {
-				continue
+				return
 			}
 			chunkIndex, err := toInt(raw[chunkIdx])
 			if err != nil {
-				continue
+				return
 			}
 			docVal := raw[docIdx]
 			key := ragContextDocumentKey(docVal)
@@ -635,6 +650,15 @@ func ragBuildContextIndex(source ragSource, docCol, chunkCol string) ragContextI
 				docID:      docVal,
 				chunkIndex: chunkIndex,
 			})
+		}
+		if source.rowFilter == nil {
+			for rowIndex := range source.rawRows {
+				appendRow(rowIndex)
+			}
+		} else {
+			for _, rowIndex := range source.rowFilter.rows {
+				appendRow(rowIndex)
+			}
 		}
 		ragSortContextIndex(contexts)
 		return contexts

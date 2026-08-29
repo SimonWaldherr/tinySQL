@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"math"
 	"testing"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -102,5 +103,46 @@ func TestGeoSearchRejectsUnknownMode(t *testing.T) {
 	if _, err := Execute(context.Background(), db, "default", mustParse(
 		`SELECT id FROM GEO_SEARCH('points', 'geom', 'nonsense', 0, 0, 1, 1)`)); err == nil {
 		t.Errorf("GEO_SEARCH with an unknown mode succeeded, want an error")
+	}
+}
+
+func TestGeoSearchBroadBBoxOnZeroExtentCorpus(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE colocated_points (id INT, geom GEOMETRY)`)
+	for id := 1; id <= 4; id++ {
+		execSQL(t, db, fmt.Sprintf(`INSERT INTO colocated_points VALUES (%d,
+			'{"type":"Point","coordinates":[13.405,52.52]}')`, id))
+	}
+
+	// A zero-extent corpus uses the grid's minimum 1e-6-degree cell size. The
+	// world-sized query must clamp to the occupied extent instead of iterating
+	// hundreds of millions of empty cells along each axis.
+	got := geoSearchIDSet(t, db, `SELECT id FROM GEO_SEARCH(
+		'colocated_points', 'geom', 'bbox', -180, -90, 180, 90)`)
+	if len(got) != 4 {
+		t.Fatalf("broad bbox returned %v, want all four colocated points", got)
+	}
+}
+
+func TestGeoSearchRejectsNonFiniteQueryBeforeIndexBuild(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE finite_geo (id INT, geom GEOMETRY)`)
+	execSQL(t, db, `INSERT INTO finite_geo VALUES (1,
+		'{"type":"Point","coordinates":[0,0]}')`)
+
+	args := []Expr{
+		&Literal{Val: "finite_geo"}, &Literal{Val: "geom"}, &Literal{Val: "bbox"},
+		&Literal{Val: math.NaN()}, &Literal{Val: 0}, &Literal{Val: 1}, &Literal{Val: 1},
+	}
+	_, err := (&GeoSearchTableFunc{}).Execute(context.Background(), args,
+		ExecEnv{ctx: context.Background(), db: db, tenant: "default"}, nil)
+	if err == nil {
+		t.Fatal("GEO_SEARCH accepted a non-finite bbox coordinate")
+	}
+	geoGridCacheMu.RLock()
+	_, built := geoGridCache[geoIndexCacheKey{tenant: "default", table: "finite_geo", colIdx: 1}]
+	geoGridCacheMu.RUnlock()
+	if built {
+		t.Fatal("GEO_SEARCH built a grid before rejecting a non-finite bbox coordinate")
 	}
 }

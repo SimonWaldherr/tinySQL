@@ -899,17 +899,12 @@ func ragFilterSource(source ragSource, filter *ragRowFilter) ragSource {
 	if filter == nil || !source.tableSource {
 		return source
 	}
-	rawRows := make([][]any, 0, len(filter.rows))
-	for _, rowID := range filter.rows {
-		if rowID >= 0 && rowID < len(source.rawRows) {
-			rawRows = append(rawRows, source.rawRows[rowID])
-		}
-	}
-	// A filtered source has a filter-specific neighborhood topology, so do not
-	// reuse the full-table context-index cache. table=nil intentionally selects
-	// ragBuildContextIndex's uncached path while retaining direct raw-cell reads.
-	source.rawRows = rawRows
-	source.table = nil
+	// Keep the original physical rows and carry the immutable authorization set
+	// alongside them. Building a compact copy forced both row renumbering and a
+	// full neighbor-index rebuild for every request.
+	// getRAGContextIndex includes the filter identity in its key, so different
+	// ACL slices remain isolated while repeated queries reuse their own index.
+	source.rowFilter = filter
 	return source
 }
 

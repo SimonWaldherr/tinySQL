@@ -91,16 +91,7 @@ func (f *GeoSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 		return nil, fmt.Errorf("GEO_SEARCH: %w", err)
 	}
 
-	searchCtx := ctx
-	if searchCtx == nil {
-		searchCtx = env.ctx
-	}
-	idx, err := getGeoGridIndex(searchCtx, tenant, table, colIdx)
-	if err != nil {
-		return nil, fmt.Errorf("GEO_SEARCH: %w", err)
-	}
-
-	var candidates []int32
+	var selectCandidates func(*geoGridIndex) []int32
 	var residual func(p geoPoint) bool
 	switch mode {
 	case "bbox":
@@ -123,7 +114,12 @@ func (f *GeoSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 		if err != nil {
 			return nil, err
 		}
-		candidates = idx.candidatesBBox(minLon, minLat, maxLon, maxLat)
+		if !geoSearchFinite(minLon, minLat, maxLon, maxLat) {
+			return nil, fmt.Errorf("GEO_SEARCH: bbox coordinates must be finite numbers")
+		}
+		selectCandidates = func(idx *geoGridIndex) []int32 {
+			return idx.candidatesBBox(minLon, minLat, maxLon, maxLat)
+		}
 		residual = func(p geoPoint) bool { return geoPointWithinBBox(p, minLon, minLat, maxLon, maxLat) }
 	case "radius":
 		if len(args) != 6 {
@@ -144,13 +140,30 @@ func (f *GeoSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 		if radiusMeters <= 0 || math.IsNaN(radiusMeters) || math.IsInf(radiusMeters, 0) {
 			return nil, fmt.Errorf("GEO_SEARCH: radius must be a finite positive number of meters")
 		}
-		candidates = idx.candidatesRadius(centerLon, centerLat, radiusMeters)
+		if !geoSearchFinite(centerLon, centerLat) {
+			return nil, fmt.Errorf("GEO_SEARCH: radius center must contain finite coordinates")
+		}
+		selectCandidates = func(idx *geoGridIndex) []int32 {
+			return idx.candidatesRadius(centerLon, centerLat, radiusMeters)
+		}
 		residual = func(p geoPoint) bool {
 			return haversineMeters(centerLat, centerLon, p.Lat, p.Lon) <= radiusMeters
 		}
 	default:
 		return nil, fmt.Errorf("GEO_SEARCH: unknown mode %q (supported: bbox, radius)", modeStr)
 	}
+
+	// Parse and validate the complete query before paying a possible cold grid
+	// build. Invalid user input should be cheap even for a large geometry table.
+	searchCtx := ctx
+	if searchCtx == nil {
+		searchCtx = env.ctx
+	}
+	idx, err := getGeoGridIndex(searchCtx, tenant, table, colIdx)
+	if err != nil {
+		return nil, fmt.Errorf("GEO_SEARCH: %w", err)
+	}
+	candidates := selectCandidates(idx)
 
 	var matched []int32
 	for _, rowIdx := range candidates {
@@ -184,6 +197,15 @@ func (f *GeoSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 		resultRows = append(resultRows, r)
 	}
 	return &ResultSet{Cols: resultCols, Rows: resultRows}, nil
+}
+
+func geoSearchFinite(values ...float64) bool {
+	for _, value := range values {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return false
+		}
+	}
+	return true
 }
 
 func init() {

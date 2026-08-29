@@ -1,6 +1,9 @@
 package engine
 
 import (
+	"context"
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -99,4 +102,161 @@ func TestRouteSameStartAndEnd(t *testing.T) {
 	if f, ok := dist.(float64); !ok || f != 0 {
 		t.Errorf("distance from a node to itself should be 0, got %v", dist)
 	}
+}
+
+func TestRouteGraphCacheReuseInvalidationAndDropPurge(t *testing.T) {
+	db := storage.NewDB()
+	setupRouteEdges(t, db)
+	table, err := db.Get("default", "edges")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := routeGraphKey("default", table, "source", "target", "cost", "directed")
+	t.Cleanup(func() { purgeRouteGraphCachesFor("default", "edges") })
+
+	query := `SELECT ROUTE_DISTANCE('edges','source','target','cost','A','D') AS v`
+	if got := execScalar(t, db, query); got != float64(4) {
+		t.Fatalf("first route distance = %v, want 4", got)
+	}
+	routeGraphCacheState.RLock()
+	first, ok := routeGraphCacheState.entries[key]
+	routeGraphCacheState.RUnlock()
+	if !ok || first.graph == nil || first.version != table.Version {
+		t.Fatalf("first route did not populate a current cache entry: %#v", first)
+	}
+
+	if got := execScalar(t, db, query); got != float64(4) {
+		t.Fatalf("cached route distance = %v, want 4", got)
+	}
+	routeGraphCacheState.RLock()
+	second := routeGraphCacheState.entries[key]
+	routeGraphCacheState.RUnlock()
+	if second.graph != first.graph {
+		t.Fatal("unchanged route table rebuilt its cached adjacency graph")
+	}
+
+	execSQL(t, db, `INSERT INTO edges VALUES ('fast','A','D',0.5)`)
+	if got := execScalar(t, db, query); got != float64(0.5) {
+		t.Fatalf("route after INSERT = %v, want new direct cost 0.5", got)
+	}
+	routeGraphCacheState.RLock()
+	updated := routeGraphCacheState.entries[key]
+	routeGraphCacheState.RUnlock()
+	if updated.graph == first.graph || updated.version != table.Version {
+		t.Fatalf("INSERT did not replace the stale graph: old=%p new=%p version=%d table=%d",
+			first.graph, updated.graph, updated.version, table.Version)
+	}
+
+	execSQL(t, db, `DROP TABLE edges`)
+	routeGraphCacheState.RLock()
+	_, remains := routeGraphCacheState.entries[key]
+	routeGraphCacheState.RUnlock()
+	if remains {
+		t.Fatal("DROP TABLE left the routing graph cached")
+	}
+}
+
+func TestRouteGraphCacheConcurrentColdBuild(t *testing.T) {
+	db := storage.NewDB()
+	setupRouteEdges(t, db)
+	purgeRouteGraphCachesFor("default", "edges")
+	t.Cleanup(func() { purgeRouteGraphCachesFor("default", "edges") })
+	stmt := mustParse(`SELECT ROUTE_DISTANCE(
+		'edges','source','target','cost','A','D') AS distance`)
+
+	const callers = 24
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rs, err := Execute(context.Background(), db, "default", stmt)
+			if err == nil && (len(rs.Rows) != 1 || rs.Rows[0]["distance"] != float64(4)) {
+				err = fmt.Errorf("route result = %#v, want distance 4", rs)
+			}
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	table, err := db.Get("default", "edges")
+	if err != nil {
+		t.Fatal(err)
+	}
+	routeGraphCacheState.RLock()
+	entries := 0
+	for _, entry := range routeGraphCacheState.entries {
+		if entry.table == table {
+			entries++
+		}
+	}
+	builds := len(routeGraphCacheState.builds)
+	routeGraphCacheState.RUnlock()
+	if entries != 1 || builds != 0 {
+		t.Fatalf("route cache after concurrent build: entries=%d builds=%d, want 1/0", entries, builds)
+	}
+}
+
+func benchmarkRouteDB(b *testing.B, edges int) *storage.DB {
+	b.Helper()
+	db := storage.NewDB()
+	table := storage.NewTable("bench_routes", []storage.Column{
+		{Name: "source", Type: storage.IntType},
+		{Name: "target", Type: storage.IntType},
+		{Name: "cost", Type: storage.Float64Type},
+	}, false)
+	table.Rows = make([][]any, edges)
+	for i := 0; i < edges; i++ {
+		table.Rows[i] = []any{i, i + 1, float64(1)}
+	}
+	table.Version++
+	if err := db.Put("default", table); err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { purgeRouteGraphCachesFor("default", table.Name) })
+	return db
+}
+
+func BenchmarkRouteDistanceGraphCache(b *testing.B) {
+	const edges = 20000
+	db := benchmarkRouteDB(b, edges)
+	table, err := db.Get("default", "bench_routes")
+	if err != nil {
+		b.Fatal(err)
+	}
+	stmt := mustParse(`SELECT ROUTE_DISTANCE(
+		'bench_routes','source','target','cost',0,16) AS distance`)
+	ctx := context.Background()
+
+	b.Run("warm", func(b *testing.B) {
+		if _, err := Execute(ctx, db, "default", stmt); err != nil {
+			b.Fatal(err)
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := Execute(ctx, db, "default", stmt); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("cold", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			b.StopTimer()
+			table.Version++
+			b.StartTimer()
+			if _, err := Execute(ctx, db, "default", stmt); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }

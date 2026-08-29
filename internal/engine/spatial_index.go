@@ -62,10 +62,15 @@ type geoGridIndex struct {
 	version     int
 	cellSizeLon float64
 	cellSizeLat float64
-	cells       map[geoCellID][]int32
-	overflow    []int32
-	centroids   []geoPoint
-	valid       []bool
+	// bounds is the union geometry extent used to build the grid. Intersecting
+	// a query with it before converting to cell coordinates prevents a broad
+	// query from walking millions of cells that the sparse grid cannot contain
+	// (especially for a zero-extent point corpus at the minimum cell size).
+	bounds    geoEditBBox
+	cells     map[geoCellID][]int32
+	overflow  []int32
+	centroids []geoPoint
+	valid     []bool
 }
 
 var (
@@ -189,6 +194,7 @@ func buildGeoGridIndex(ctx context.Context, table *storage.Table, colIdx int) (*
 	}
 
 	idx.cells = make(map[geoCellID][]int32)
+	idx.bounds = union
 	idx.cellSizeLon, idx.cellSizeLat = geoGridMinCellSizeDegrees, geoGridMinCellSizeDegrees
 	if validCount == 0 {
 		return idx, nil
@@ -248,6 +254,16 @@ func (idx *geoGridIndex) candidatesBBox(minLon, minLat, maxLon, maxLat float64) 
 	if minLat > maxLat {
 		minLat, maxLat = maxLat, minLat
 	}
+	if !idx.bounds.Set || maxLon < idx.bounds.MinX || minLon > idx.bounds.MaxX ||
+		maxLat < idx.bounds.MinY || minLat > idx.bounds.MaxY {
+		return nil
+	}
+	// The result cannot change outside the indexed data extent. Clamping here
+	// also keeps extreme-but-finite inputs away from int32 conversion overflow.
+	minLon = math.Max(minLon, idx.bounds.MinX)
+	maxLon = math.Min(maxLon, idx.bounds.MaxX)
+	minLat = math.Max(minLat, idx.bounds.MinY)
+	maxLat = math.Min(maxLat, idx.bounds.MaxY)
 	minCX := int32(math.Floor(minLon / idx.cellSizeLon))
 	maxCX := int32(math.Floor(maxLon / idx.cellSizeLon))
 	minCY := int32(math.Floor(minLat / idx.cellSizeLat))

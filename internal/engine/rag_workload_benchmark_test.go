@@ -261,6 +261,43 @@ func BenchmarkRAGHybridSearchPreFilterSelective(b *testing.B) {
 		ORDER BY _rrf_rank`, 6)
 }
 
+// BenchmarkRAGHybridSearchPreFilterWithExpansion guards the authorization-
+// local context-index cache. The row filter is stable across iterations, so
+// the first warm-up builds its neighbor topology and timed requests should not
+// rescan/sort the 5k allowed chunks merely to expand the final hits.
+func BenchmarkRAGHybridSearchPreFilterWithExpansion(b *testing.B) {
+	db := ragBenchCorpus(b)
+	table, err := db.Get("default", "rag_chunks")
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := table.CreateSecondaryIndex("idx_rag_chunks_document_type", []string{"document_type"}, false); err != nil {
+		b.Fatal(err)
+	}
+	qv := ragBenchQueryVector(b)
+	runRAGBench(b, db, `
+		SELECT chunk_id, doc_id, chunk_index, chunk_text, _context_rank
+		FROM HYBRID_SEARCH('rag_chunks', 'embedding', 'search_text',
+			'term7 term23 term180 needle42', '`+qv+`', 6,
+			'{"candidate_k":24,"rrf_k":60,"metric":"cosine","index":"flat",
+			  "pre_filter":{"equals":{"document_type":"guide"}},
+			  "expand_before":1,"expand_after":1,
+			  "doc_id_column":"doc_id","chunk_index_column":"chunk_index"}')
+		ORDER BY _context_rank`, -1)
+}
+
+// BenchmarkRAGVectorOnly guards against candidate over-fetch in the composed
+// retriever. With no lexical list to fuse, RAG_SEARCH should rank exactly k
+// vectors rather than its hybrid default of 4*k.
+func BenchmarkRAGVectorOnly(b *testing.B) {
+	db := ragBenchCorpus(b)
+	qv := ragBenchQueryVector(b)
+	runRAGBench(b, db, `
+		SELECT chunk_id, _vec_rank
+		FROM RAG_SEARCH('rag_chunks', 'embedding', '`+qv+`', 6,
+			'{"metric":"cosine","index":"flat"}')`, 6)
+}
+
 // BenchmarkRAGVecSearchBranch and BenchmarkRAGFTSSearchBranch measure the two
 // halves of the hybrid query in isolation. Their sum bounds what
 // BenchmarkRAGHybridSearch could cost if the two passes ran concurrently

@@ -770,6 +770,8 @@ func TestRAGContextFromMergesOverlappingHitProvenance(t *testing.T) {
 // come back in descending-similarity order and carry VEC_SEARCH's own
 // trailing columns.
 func TestRAGSearchVectorOnly(t *testing.T) {
+	ConfigureVectorCache(VectorCacheConfig{Analytics: true, AnalyticsWindow: time.Minute, AnalyticsMaxEvents: 8})
+	t.Cleanup(func() { ConfigureVectorCache(VectorCacheConfig{}) })
 	db := storage.NewDB()
 	ctx := context.Background()
 
@@ -809,6 +811,19 @@ func TestRAGSearchVectorOnly(t *testing.T) {
 	`)
 	if len(rsMetric.Rows) != 2 || rsMetric.Rows[0]["id"] != 1 || rsMetric.Rows[1]["id"] != 4 {
 		t.Fatalf("RAG_SEARCH with metric-only options: expected ids [1,4], got %v/%v (%d rows)", rsMetric.Rows[0]["id"], rsMetric.Rows[1]["id"], len(rsMetric.Rows))
+	}
+
+	// Candidate over-fetch is useful only when two retrieval lists still need
+	// fusion. In vector-only mode every candidate beyond k was discarded before
+	// materialization, so the underlying search must request exactly k.
+	stats := VectorCacheAnalytics()
+	if len(stats.RecentQueries) != 2 {
+		t.Fatalf("RAG_SEARCH vector analytics events = %d, want 2", len(stats.RecentQueries))
+	}
+	for _, event := range stats.RecentQueries {
+		if event.K != 2 {
+			t.Fatalf("RAG_SEARCH vector-only requested %d candidates, want final k=2", event.K)
+		}
 	}
 }
 
