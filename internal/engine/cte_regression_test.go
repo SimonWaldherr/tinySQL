@@ -50,6 +50,40 @@ func TestCTECanAppearOnRightSideOfJoin(t *testing.T) {
 	}
 }
 
+func TestCTESimpleScanAppliesWhereProjectionOffsetAndLimit(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE items (id INT, label TEXT)`)
+	execSQL(t, db, `INSERT INTO items VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')`)
+
+	rs := execSQL(t, db, `
+		WITH c AS (SELECT id, label FROM items)
+		SELECT label AS name FROM c WHERE id >= 2 LIMIT 2 OFFSET 1`)
+	if len(rs.Rows) != 2 || rs.Cols[0] != "name" {
+		t.Fatalf("CTE page = cols %#v rows %#v", rs.Cols, rs.Rows)
+	}
+	if rs.Rows[0]["name"] != "c" || rs.Rows[1]["name"] != "d" {
+		t.Fatalf("CTE page rows = %#v", rs.Rows)
+	}
+}
+
+func TestCTESimpleScanFallsBackForQualifiedReferences(t *testing.T) {
+	db := storage.NewDB()
+	rs := execSQL(t, db, `WITH c AS (SELECT 1 AS n) SELECT q.n FROM c AS q WHERE q.n = 1`)
+	if len(rs.Rows) != 1 {
+		t.Fatalf("qualified CTE rows = %#v", rs.Rows)
+	}
+	expectInt(t, rs.Rows[0]["q.n"], 1, "qualified CTE value")
+}
+
+func TestCTESimpleScanKeepsGeneralDuplicateAliasSemantics(t *testing.T) {
+	db := storage.NewDB()
+	rs := execSQL(t, db, `WITH c AS (SELECT 1 AS a, 2 AS b) SELECT a AS x, b AS x FROM c`)
+	if len(rs.Cols) != 1 || rs.Cols[0] != "x" || len(rs.Rows) != 1 {
+		t.Fatalf("duplicate alias result = cols %#v rows %#v", rs.Cols, rs.Rows)
+	}
+	expectInt(t, rs.Rows[0]["x"], 2, "duplicate alias last value")
+}
+
 func TestCTEColumnAliasCountMustMatchResult(t *testing.T) {
 	db := storage.NewDB()
 	stmt, err := NewParser(`WITH c(x, y) AS (SELECT 1 AS n) SELECT x FROM c`).ParseStatement()

@@ -16,6 +16,25 @@ func BenchmarkCTESingleReference(b *testing.B) {
 		SELECT grp, n, a FROM grouped ORDER BY grp`)
 }
 
+// BenchmarkCTEFilteredProjection isolates the common CTE consumer shape. It
+// should scan the immutable materialized rows directly instead of rebuilding
+// qualified row maps before applying WHERE and projecting a narrow result.
+func BenchmarkCTEFilteredProjection(b *testing.B) {
+	db := setupPerfTable(b, 20000)
+	runBench(b, db, `
+		WITH c AS (SELECT id, grp, val FROM t)
+		SELECT id, grp FROM c WHERE id >= 10000 AND id < 10100`)
+}
+
+// BenchmarkCTEFilteredLimit verifies that LIMIT is pushed into the fused CTE
+// scan, so projection stops once the requested page has been produced.
+func BenchmarkCTEFilteredLimit(b *testing.B) {
+	db := setupPerfTable(b, 20000)
+	runBench(b, db, `
+		WITH c AS (SELECT id, grp, val FROM t)
+		SELECT id, grp FROM c WHERE id >= 10000 LIMIT 20`)
+}
+
 // BenchmarkCTEReferencedTwice self-joins the same CTE against itself. Most
 // of its cost is the join itself, not the CTE — but if a non-recursive CTE
 // were re-evaluated per reference instead of materialized once, this would

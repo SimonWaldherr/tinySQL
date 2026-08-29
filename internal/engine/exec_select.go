@@ -19,7 +19,8 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 	// the execution environment, so bypass them whenever FROM/JOIN references
 	// an active CTE; otherwise recursive and chained CTEs are treated as
 	// missing physical tables.
-	if !selectReferencesCTE(cteEnv, s) {
+	referencesCTE := selectReferencesCTE(cteEnv, s)
+	if !referencesCTE {
 		// Tried before the plain join and plain aggregate fast paths: both of
 		// those deliberately reject any query that has both a JOIN and a
 		// GROUP BY (see their eligibility checks), so this is the only fast
@@ -38,6 +39,8 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 		if rs, ok, err := executeSimpleSelectFastPath(cteEnv, s); ok || err != nil {
 			return rs, err
 		}
+	} else if rs, ok, err := executeSimpleCTESelectFastPath(cteEnv, s); ok || err != nil {
+		return rs, err
 	}
 
 	// ORDER BY/LIMIT/OFFSET after a set operation belong to the whole compound
@@ -143,6 +146,156 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 		resultRows = applyOffsetLimit(s, resultRows)
 	}
 	return &ResultSet{Cols: resultCols, Rows: resultRows}, nil
+}
+
+// executeSimpleCTESelectFastPath fuses a single materialized-CTE scan with a
+// simple WHERE, direct-column projection, OFFSET and LIMIT. The general path
+// first copies every CTE row to add source qualifiers, then allocates a second
+// slice for WHERE and finally projects the survivors. Bare column references
+// need none of those qualified copies, so they can read the immutable CTE
+// ResultSet directly. Qualified references deliberately fall back to the
+// general path, which retains the full CTE-name/alias lookup semantics.
+func executeSimpleCTESelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error) {
+	if s == nil || len(s.Joins) > 0 || len(s.GroupBy) > 0 || s.Having != nil ||
+		s.Union != nil || s.Pivot != nil || s.Distinct || len(s.OrderBy) > 0 ||
+		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil ||
+		anyAggInSelect(s.Projs) || anyWindowInSelect(s.Projs) {
+		return nil, false, nil
+	}
+	cteResult, ok := env.ctes[strings.ToLower(s.From.Table)]
+	if !ok || cteResult == nil {
+		return nil, false, nil
+	}
+	// Reject expression/star projections before allocating a candidate plan.
+	// Recursive CTE members commonly project expressions and execute hundreds
+	// of times, so even two speculative slices here become measurable churn.
+	for _, item := range s.Projs {
+		ref, direct := item.Expr.(*VarRef)
+		if item.Star || !direct {
+			return nil, false, nil
+		}
+		name := ref.Lower
+		if name == "" {
+			name = strings.ToLower(ref.Name)
+		}
+		if name == "" || strings.Contains(name, ".") {
+			return nil, false, nil
+		}
+	}
+
+	type projection struct {
+		source string
+		name   string
+		key    string
+	}
+	projections := make([]projection, 0, len(s.Projs))
+	outputCols := make([]string, 0, len(s.Projs))
+	for i, item := range s.Projs {
+		ref := item.Expr.(*VarRef)
+		source := ref.Lower
+		if source == "" {
+			source = strings.ToLower(ref.Name)
+		}
+		name := projName(item, i)
+		projections = append(projections, projection{source: source, name: name, key: strings.ToLower(name)})
+		seen := false
+		for _, existing := range outputCols {
+			if existing == name {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			outputCols = append(outputCols, name)
+		}
+	}
+
+	filter := buildRowWhereFilter(s.Where)
+	if s.Where != nil && (filter == nil || exprHasQualifiedVarRef(s.Where)) {
+		return nil, false, nil
+	}
+	offset := 0
+	if s.Offset != nil && *s.Offset > 0 {
+		offset = *s.Offset
+	}
+	limit := -1
+	if s.Limit != nil {
+		limit = *s.Limit
+	}
+	if limit == 0 {
+		// The general CTE path still evaluates WHERE for LIMIT 0 and can report
+		// expression/type errors. Keep that observable behavior for this edge
+		// case instead of returning before the predicate is evaluated.
+		return nil, false, nil
+	}
+	capacity := len(cteResult.Rows) - offset
+	if capacity < 0 {
+		capacity = 0
+	}
+	if limit >= 0 && limit < capacity {
+		capacity = limit
+	} else if filter != nil {
+		capacity /= 2
+	}
+	outRows := make([]Row, 0, capacity)
+	matched := 0
+	for i, row := range cteResult.Rows {
+		if i&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, true, err
+			}
+		}
+		if filter != nil {
+			tri, err := filter(row)
+			if err != nil {
+				return nil, true, err
+			}
+			if tri != tvTrue {
+				continue
+			}
+		}
+		if matched < offset {
+			matched++
+			continue
+		}
+		out := make(Row, len(projections))
+		for _, p := range projections {
+			value, exists := row[p.source]
+			if !exists {
+				return nil, true, unknownColumnErr(p.name, columnSuggestionFromRow(p.name, row))
+			}
+			out[p.key] = value
+		}
+		outRows = append(outRows, out)
+		matched++
+		if limit >= 0 && len(outRows) >= limit {
+			break
+		}
+	}
+	return &ResultSet{Cols: outputCols, Rows: outRows}, true, nil
+}
+
+func exprHasQualifiedVarRef(expr Expr) bool {
+	switch ex := expr.(type) {
+	case nil:
+		return false
+	case *VarRef:
+		name := ex.Lower
+		if name == "" {
+			name = ex.Name
+		}
+		return strings.Contains(name, ".")
+	case *Literal:
+		return false
+	case *Unary:
+		return exprHasQualifiedVarRef(ex.Expr)
+	case *Binary:
+		return exprHasQualifiedVarRef(ex.Left) || exprHasQualifiedVarRef(ex.Right)
+	case *IsNull:
+		return exprHasQualifiedVarRef(ex.Expr)
+	default:
+		return true
+	}
 }
 
 // resolveCompoundOrderBy maps every trailing ORDER BY alias to the canonical
