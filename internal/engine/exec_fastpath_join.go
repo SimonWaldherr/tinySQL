@@ -141,9 +141,21 @@ func buildSimpleJoinPlan(env ExecEnv, s *Select) (*simpleJoinPlan, bool, error) 
 		return nil, false, nil
 	}
 
-	projs, outputCols, ok := buildSimpleJoinProjections(s.Projs, leftIndex, rightIndex)
-	if !ok {
-		return nil, false, nil
+	var projs []simpleProjection
+	var outputCols []string
+	if len(s.Projs) == 1 && s.Projs[0].Star && s.Projs[0].Alias == "" {
+		// SELECT * across the join: expand to one raw-column projection per
+		// column of each side rather than handing the whole query to the
+		// general Row-map path. Same treatment single-table SELECT * already
+		// gets in loadSimpleSelectPlanTemplate.
+		projs, outputCols = buildSimpleJoinStarProjections(
+			left, right, aliasOr(s.From), aliasOr(s.Joins[0].Right))
+	} else {
+		var projOk bool
+		projs, outputCols, projOk = buildSimpleJoinProjections(s.Projs, leftIndex, rightIndex)
+		if !projOk {
+			return nil, false, nil
+		}
 	}
 	if !simpleJoinExprResolvable(s.Where, leftIndex, rightIndex) {
 		return nil, false, nil
@@ -159,6 +171,7 @@ func buildSimpleJoinPlan(env ExecEnv, s *Select) (*simpleJoinPlan, bool, error) 
 		where:      s.Where,
 		projs:      projs,
 		outputCols: outputCols,
+		rowMapCap:  simpleProjectionMapCap(projs),
 	}
 	plan.leftFilter, plan.rightFilter, plan.where = buildSimpleJoinFilters(s.Where, leftIndex, rightIndex)
 	if cacheable {
@@ -513,28 +526,38 @@ func evalJoinRawWhere(plan *simpleJoinPlan, left, right []any) (bool, error) {
 }
 
 func projectJoinRawRow(plan *simpleJoinPlan, left, right []any) (Row, error) {
-	out := make(Row, len(plan.projs))
+	out := make(Row, plan.rowMapCap)
 	for _, p := range plan.projs {
+		var v any
 		if p.colIdx >= 0 {
 			// Direct column reference: read from pre-resolved side and index.
 			switch p.side {
 			case 0:
-				out[p.key] = left[p.colIdx]
+				v = left[p.colIdx]
 			case 1:
-				out[p.key] = right[p.colIdx]
+				v = right[p.colIdx]
 			default:
-				v, err := evalJoinRawExpr(plan, left, right, p.expr)
+				var err error
+				v, err = evalJoinRawExpr(plan, left, right, p.expr)
 				if err != nil {
 					return nil, err
 				}
-				out[p.key] = v
 			}
 		} else {
-			v, err := evalJoinRawExpr(plan, left, right, p.expr)
+			var err error
+			v, err = evalJoinRawExpr(plan, left, right, p.expr)
 			if err != nil {
 				return nil, err
 			}
-			out[p.key] = v
+		}
+		out[p.key] = v
+		// Only SELECT * projections carry an alternate key; for an explicit
+		// select list altKey is empty and this is a no-op. Writing the primary
+		// key first and letting a later projection overwrite it reproduces
+		// mergeRows' right-wins collision behavior (see
+		// buildSimpleJoinStarProjections).
+		if p.altKey != "" {
+			out[p.altKey] = v
 		}
 	}
 	return out, nil

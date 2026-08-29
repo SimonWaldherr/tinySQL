@@ -277,6 +277,9 @@ type simpleJoinPlan struct {
 	rightFilter func([]any) (bool, error)
 	projs       []simpleProjection
 	outputCols  []string
+	// rowMapCap sizes the output Row map, counting the qualified alternate
+	// keys that SELECT * projections carry in addition to their primary key.
+	rowMapCap int
 	// rightLookup is an immutable hash index of the right input for the most
 	// recently observed table version. It avoids rebuilding the same index for
 	// every execution of a prepared read query; a write to the right table

@@ -67,6 +67,62 @@ func buildSimpleSelectStarProjections(table *storage.Table, alias string) ([]sim
 	return projs, outputCols
 }
 
+// buildSimpleJoinStarProjections expands SELECT * across a two-table inner
+// join into one direct-column-reference projection per column, left table
+// first, mirroring what buildSimpleSelectStarProjections does for a single
+// table.
+//
+// Star previously disqualified the join fast path outright
+// (buildSimpleJoinProjections rejects it), so `SELECT * FROM a JOIN b` — about
+// the most ordinary join there is — fell back to the general path, which
+// materializes BOTH inputs as dual-key Row maps via rowsFromTable and then
+// allocates another merged map per output row.
+//
+// Two details of the general path's output are reproduced exactly here:
+//
+//   - Output columns are the unqualified names, de-duplicated on first
+//     occurrence. Two tables that share a column name contribute it once, so
+//     `a(id, av) JOIN b(id, bv)` yields [id av bv], not [id av id bv].
+//   - Every column is reachable under both its unqualified and its qualified
+//     name, and where the unqualified names collide the RIGHT table's value
+//     wins. That falls out of projection order: projectJoinRawRow writes left
+//     projections first and the right one overwrites the shared key, which is
+//     precisely what mergeRows(l, r) does when the general path merges the two
+//     row maps.
+func buildSimpleJoinStarProjections(left, right *storage.Table, leftAlias, rightAlias string) ([]simpleProjection, []string) {
+	total := len(left.Cols) + len(right.Cols)
+	projs := make([]simpleProjection, 0, total)
+	outputCols := make([]string, 0, total)
+	seen := make(map[string]bool, total)
+
+	appendSide := func(t *storage.Table, alias string, side int) {
+		lowerAlias := strings.ToLower(alias)
+		for i, c := range t.Cols {
+			lower := strings.ToLower(c.Name)
+			qualified := lowerAlias + "." + lower
+			projs = append(projs, simpleProjection{
+				name:   c.Name,
+				key:    lower,
+				altKey: qualified,
+				side:   side,
+				colIdx: i,
+				// Qualified so the reference is unambiguous if it is ever
+				// evaluated; on this path colIdx is always >= 0, so
+				// projectJoinRawRow reads the column directly and never
+				// consults expr.
+				expr: &VarRef{Name: alias + "." + c.Name, Lower: qualified},
+			})
+			if !seen[lower] {
+				seen[lower] = true
+				outputCols = append(outputCols, c.Name)
+			}
+		}
+	}
+	appendSide(left, leftAlias, 0)
+	appendSide(right, rightAlias, 1)
+	return projs, outputCols
+}
+
 func buildSimpleSelectProjection(it SelectItem, idx int, colIndex map[string]int) (simpleProjection, bool) {
 	if it.Star || !isSimpleRawExpr(it.Expr) {
 		return simpleProjection{}, false
