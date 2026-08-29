@@ -35,6 +35,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/encoding"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
@@ -2357,6 +2358,15 @@ func startGRPCServer(srv *server, db *storage.DB, grpcAddr string, minTLSVersion
 		grpc.MaxRecvMsgSize(*flagGRPCMaxRecv),
 		grpc.MaxSendMsgSize(*flagGRPCMaxSend),
 		grpc.UnaryInterceptor(srv.grpcUnaryInterceptor()),
+		// A replica's GetChanges stream is long-lived and carries no deadline,
+		// so it pings to detect a primary that has gone silent. grpc-go's
+		// default MinTime is 5 minutes and answers anything faster with
+		// GOAWAY "too_many_pings"; permit the interval dialPeerGRPC actually
+		// uses. PermitWithoutStream keeps that true between reconnects.
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             replicaKeepaliveInterval,
+			PermitWithoutStream: true,
+		}),
 	}
 	grpcTLSCfg, err := loadServerTLSConfig(*flagGRPCTLSCert, *flagGRPCTLSKey, minTLSVersion)
 	if err != nil {

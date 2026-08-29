@@ -941,3 +941,81 @@ func TestReplicaLoopRebootstrapsOnEpochMismatchAfterPrimaryReset(t *testing.T) {
 		})
 	}
 }
+
+// GetChanges is a long-lived server-streaming RPC, but openChangesStream built
+// its context with replicaCallContext, which applies opts.CallTimeout. On a
+// stream that deadline bounds the whole stream rather than one round trip, so
+// the stream was guaranteed to die with DeadlineExceeded after CallTimeout
+// (10s by default in production) and reconnect as if the network had blipped.
+//
+// A short CallTimeout here makes that failure fast: the stream must still be
+// readable well after it would have expired.
+func TestChangesStreamOutlivesTheCallTimeout(t *testing.T) {
+	srv, db := newAdvancedWALTestServer(t)
+	ctx := context.Background()
+	mustExecOK(t, srv, ctx, "CREATE TABLE t (id INT)")
+
+	addr := startTestGRPCServer(t, srv, db)
+	const callTimeout = 150 * time.Millisecond
+	opts := replicaOptions{MaxRecvMsgSize: defaultMaxGRPCMsgBytes, CallTimeout: callTimeout}
+
+	replicaDB, watermark, epoch, err := runReplicaBootstrap(ctx, addr, "default", opts)
+	if err != nil {
+		t.Fatalf("runReplicaBootstrap: %v", err)
+	}
+	defer func() { _ = replicaDB.Close() }()
+
+	conn, err := dialPeerGRPC(addr, opts.MaxRecvMsgSize, opts.TransportCreds)
+	if err != nil {
+		t.Fatalf("dialPeerGRPC: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	stream, cancel, err := openChangesStream(ctx, conn, "default", watermark, opts)
+	if err != nil {
+		t.Fatalf("openChangesStream: %v", err)
+	}
+	defer cancel()
+
+	// Well past the deadline the stream used to inherit.
+	time.Sleep(4 * callTimeout)
+
+	mustExecOK(t, srv, ctx, "INSERT INTO t VALUES (1)")
+
+	// The primary pushes an empty batch whenever it has nothing new, so read
+	// on until the insert's records arrive. The point of the test is that no
+	// read ever fails with DeadlineExceeded.
+	deadline := time.Now().Add(10 * time.Second)
+	total := 0
+	for total == 0 && time.Now().Before(deadline) {
+		applied, _, err := recvChangesOnce(stream, epoch, replicaDB)
+		if err != nil {
+			t.Fatalf("stream died %v after opening, having outlived %d call timeouts of %v: %v",
+				time.Since(deadline.Add(-10*time.Second)), 4, callTimeout, err)
+		}
+		total += applied
+	}
+	if total == 0 {
+		t.Fatal("stream delivered no records after the insert")
+	}
+}
+
+// A unary RPC must keep its per-call deadline; only the stream opts out.
+func TestReplicaCallContextKeepsUnaryDeadline(t *testing.T) {
+	unary, cancelUnary := replicaCallContext(context.Background(), replicaOptions{CallTimeout: time.Second})
+	defer cancelUnary()
+	if _, ok := unary.Deadline(); !ok {
+		t.Error("a unary call context lost its deadline")
+	}
+
+	streamed, cancelStream := replicaCallContext(context.Background(), replicaOptions{CallTimeout: 0})
+	defer cancelStream()
+	if deadline, ok := streamed.Deadline(); ok {
+		t.Errorf("a stream call context must carry no deadline, got %v", deadline)
+	}
+	// Still cancellable, so deferring the cancel really does release it.
+	cancelStream()
+	if streamed.Err() == nil {
+		t.Error("cancelling a stream call context did not cancel it")
+	}
+}

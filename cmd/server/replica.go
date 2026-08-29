@@ -27,6 +27,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
@@ -74,6 +75,19 @@ const (
 	// a poll returns any records.
 	replicaMinPollBackoff = 25 * time.Millisecond
 	replicaMaxPollBackoff = 1 * time.Second
+
+	// replicaKeepaliveInterval/replicaKeepaliveTimeout give the transport a
+	// liveness check for the deadline-free GetChanges stream: without one, a
+	// primary that stops answering without closing the connection would leave
+	// the replica waiting indefinitely.
+	//
+	// 30s is below grpc-go's default server-side MinTime of 5 minutes, so the
+	// primary must opt in or it answers the pings with GOAWAY
+	// "too_many_pings". startGRPCServer does opt in, with the matching
+	// MinTime. A replica pointed at a primary older than that change should
+	// be run with these raised above 5 minutes.
+	replicaKeepaliveInterval = 30 * time.Second
+	replicaKeepaliveTimeout  = 10 * time.Second
 )
 
 // replicaOptions bundles the client-connection parameters
@@ -110,18 +124,34 @@ func dialPeerGRPC(addr string, maxRecvMsg int, transportCreds credentials.Transp
 			grpc.ForceCodec(jsonCodec{}),
 			grpc.MaxCallRecvMsgSize(maxRecvMsg),
 		),
+		// The GetChanges stream carries no per-call deadline (see
+		// openChangesStream), so the transport is what has to notice a primary
+		// that stops answering without closing the connection. Without this a
+		// black-holed primary would leave the replica waiting forever instead
+		// of reconnecting.
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                replicaKeepaliveInterval,
+			Timeout:             replicaKeepaliveTimeout,
+			PermitWithoutStream: true,
+		}),
 	}
 	return grpc.NewClient(addr, dialOptions...)
 }
 
 // replicaCallContext derives a per-call context from ctx, applying opts's
 // call timeout (if any) and bearer-token auth metadata (if any) -- the same
-// two things grpcQuery (main.go) applies to a federation peer call. The
-// returned cancel is always safe to defer, even when it is a no-op.
+// two things grpcQuery (main.go) applies to a federation peer call.
+//
+// A CallTimeout of zero opts out of the deadline while still returning a real
+// cancel, which is what a streaming RPC needs: on a stream the context
+// deadline bounds the whole stream, not one round trip. The returned cancel is
+// always a real one, so deferring it always releases the context.
 func replicaCallContext(ctx context.Context, opts replicaOptions) (context.Context, context.CancelFunc) {
-	cancel := func() {}
+	var cancel context.CancelFunc
 	if opts.CallTimeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, opts.CallTimeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
 	}
 	if opts.AuthToken != "" {
 		ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+opts.AuthToken)
@@ -306,16 +336,26 @@ func runReplicaPollLoop(ctx context.Context, db *storage.DB, primaryAddr, tenant
 // of GetChangesSince -- see _TinySQL_GetChanges_Handler in main.go) against
 // conn and sends the initial request (Tenant, SinceLSN) the handler expects
 // as the very first message on the stream. It uses the same
-// jsonCodec-forced dial (conn is expected to come from dialPeerGRPC) and
-// the same per-call timeout/auth-metadata handling (replicaCallContext) as
-// every other RPC in this file.
+// jsonCodec-forced dial (conn is expected to come from dialPeerGRPC) and the
+// same auth-metadata handling (replicaCallContext) as every other RPC in this
+// file.
+//
+// It deliberately does NOT take the per-call timeout. On a unary RPC that
+// deadline bounds one round trip; on a stream it bounds the stream's entire
+// lifetime, so GetChanges -- which is meant to stay open and is served by a
+// handler that loops until the client goes away -- was torn down after
+// CallTimeout (10s by default) every single time, and reconnected as if the
+// network had blipped. Liveness comes from the transport keepalive configured
+// in dialPeerGRPC instead.
 //
 // The caller drives the stream onward via recvChangesOnce and is
 // responsible for calling the returned cancel func once done with it
 // (typically deferred) to release the per-call context; conn itself is
 // owned by the caller and is not touched here.
 func openChangesStream(ctx context.Context, conn *grpc.ClientConn, tenant string, sinceLSN uint64, opts replicaOptions) (grpc.ClientStream, context.CancelFunc, error) {
-	callCtx, cancel := replicaCallContext(ctx, opts)
+	streamOpts := opts
+	streamOpts.CallTimeout = 0
+	callCtx, cancel := replicaCallContext(ctx, streamOpts)
 
 	desc := &grpc.StreamDesc{StreamName: "GetChanges", ServerStreams: true}
 	stream, err := conn.NewStream(callCtx, desc, "/tinysql.TinySQL/GetChanges")
@@ -368,18 +408,23 @@ func recvChangesOnce(stream grpc.ClientStream, expectedEpoch uint64, db *storage
 // error terminates it. It returns the last LSN it successfully advanced to,
 // so runReplicaStreamLoop can open a fresh stream resuming from exactly
 // there rather than from sinceLSN again.
-func streamChangesOnce(ctx context.Context, conn *grpc.ClientConn, tenant string, sinceLSN, expectedEpoch uint64, db *storage.DB, opts replicaOptions) (resumeLSN uint64, err error) {
+// applied counts the records this stream managed to apply before it ended.
+// runReplicaStreamLoop uses it the way runReplicaPollLoop uses a poll's record
+// count: as the signal that the primary is healthy and the backoff should
+// reset.
+func streamChangesOnce(ctx context.Context, conn *grpc.ClientConn, tenant string, sinceLSN, expectedEpoch uint64, db *storage.DB, opts replicaOptions) (resumeLSN uint64, applied int, err error) {
 	stream, cancel, err := openChangesStream(ctx, conn, tenant, sinceLSN, opts)
 	if err != nil {
-		return sinceLSN, err
+		return sinceLSN, 0, err
 	}
 	defer cancel()
 
 	resumeLSN = sinceLSN
 	for {
-		_, next, err := recvChangesOnce(stream, expectedEpoch, db)
+		n, next, err := recvChangesOnce(stream, expectedEpoch, db)
+		applied += n
 		if err != nil {
-			return resumeLSN, err
+			return resumeLSN, applied, err
 		}
 		resumeLSN = next
 	}
@@ -401,7 +446,10 @@ func streamChangesOnce(ctx context.Context, conn *grpc.ClientConn, tenant string
 // schedule runReplicaPollLoop uses for a failed poll, by opening a fresh
 // stream (a fresh streamChangesOnce call) resuming from the last
 // successfully applied LSN, rather than aborting the loop -- only ctx being
-// done, or errReplicaNeedsRebootstrap, ends it.
+// done, or errReplicaNeedsRebootstrap, ends it. As in the poll loop, the
+// backoff resets as soon as a stream delivers records: without that it only
+// ever grew, so after a handful of reconnects every later one cost the full
+// replicaMaxPollBackoff for the life of the process.
 func runReplicaStreamLoop(ctx context.Context, db *storage.DB, primaryAddr, tenant string, fromLSN, fromEpoch uint64, opts replicaOptions) error {
 	conn, err := dialPeerGRPC(primaryAddr, opts.MaxRecvMsgSize, opts.TransportCreds)
 	if err != nil {
@@ -417,8 +465,17 @@ func runReplicaStreamLoop(ctx context.Context, db *storage.DB, primaryAddr, tena
 			return err
 		}
 
-		resumeLSN, streamErr := streamChangesOnce(ctx, conn, tenant, sinceLSN, fromEpoch, db, opts)
+		resumeLSN, applied, streamErr := streamChangesOnce(ctx, conn, tenant, sinceLSN, fromEpoch, db, opts)
 		sinceLSN = resumeLSN
+
+		// A stream that delivered records proves the primary is serving, so
+		// the next reconnect should be prompt rather than inheriting a backoff
+		// grown during an earlier outage. This is the same rule
+		// runReplicaPollLoop applies to a poll that returned records, which is
+		// what lets the two transports pace alike as documented above.
+		if applied > 0 {
+			backoff = replicaMinPollBackoff
+		}
 
 		if streamErr == nil {
 			// streamChangesOnce's own loop only returns a nil error if it
