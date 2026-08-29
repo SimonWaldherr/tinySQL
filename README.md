@@ -23,6 +23,7 @@ database server.
 - [What it can do](#what-it-can-do)
 - [Using SQL from Go](#using-sql-from-go)
 - [GIS and GeoJSON](#gis-and-geojson)
+- [Routing graphs and shortest paths](#routing-graphs-and-shortest-paths)
 - [Map tiles and MBTiles](#map-tiles-and-mbtiles)
 - [Imports, exports, and optional build tags](#imports-exports-and-optional-build-tags)
 - [Storage, transactions, and operations](#storage-transactions-and-operations)
@@ -139,10 +140,15 @@ For applications that already use `database/sql`, use
   (dissolve/clip), and inspection functions, plus a spatial search index and
   choropleth classification (equal-interval, natural breaks, quantile) for
   location-based BI dashboards.
+- WKT/EWKT and WKB/EWKB parsing and rendering, geohash encode/decode, and
+  Web Mercator reprojection for interop with other GIS tools.
 - GeoJSON and TopoJSON export from query results (`-mode geojson|topojson`),
   the format Power BI Shape Maps and most mapping tools prefer.
-- Web Mercator tile addressing, MBTiles import/export, in-place tile access,
-  and an optional XYZ tile endpoint.
+- Dijkstra shortest-path queries (`ROUTE_SHORTEST_PATH`/`ROUTE_DISTANCE`)
+  directly over an edge table, directed or undirected.
+- Web Mercator tile addressing, MBTiles import/export, in-place tile access
+  (as tables or directly from SQL with `MBTILES_TILE`/`MBTILES_TILES`), and
+  an optional XYZ tile endpoint.
 
 See [FUNCTIONS.sql](./FUNCTIONS.sql) and
 [example_showcase.sql](./example_showcase.sql) for the broader SQL reference.
@@ -257,14 +263,30 @@ vertex count. `GEO_CONVEX_HULL` computes the hull in plain lon/lat space
 
 `GEO_INTERSECTS`/`GEO_DISJOINT` cover point/line/polygon in any combination,
 respecting polygon holes (a shape nested inside another polygon's hole is
-disjoint from it). There is no `ST_TOUCHES`/`ST_CROSSES`/`ST_OVERLAPS`:
-rigorously distinguishing boundary-only contact from interior overlap needs a
-full DE-9IM computation, which is out of scope — a naive attempt would be
-silently wrong on exactly the shared-edge/hole cases real GIS data hits
-constantly. `GEO_EQUALS` is scoped to coordinate/shape equality (matching
-after any rotation, reversal, or `Polygon`-vs-single-part-`MultiPolygon`
-wrapping), not full OGC point-set equality — two polygons covering the same
-area with different vertexization are not detected as equal.
+disjoint from it). `GEO_EQUALS` is scoped to coordinate/shape equality
+(matching after any rotation, reversal, or `Polygon`-vs-single-part-
+`MultiPolygon` wrapping), not full OGC point-set equality — two polygons
+covering the same area with different vertexization are not detected as
+equal.
+
+| Task | Function | PostGIS-style alias |
+| --- | --- | --- |
+| Boundary-only contact (no interior overlap) | `GEO_TOUCHES` | `ST_TOUCHES` |
+| Every point of B is in-or-on A | `GEO_COVERS` | `ST_COVERS` |
+| Every point of A is in-or-on B | `GEO_COVEREDBY` | `ST_COVEREDBY` |
+| Polygon boundary length (sum of all rings) | `GEO_PERIMETER` | `ST_PERIMETER` |
+
+`ST_TOUCHES`/`ST_COVERS`/`ST_COVEREDBY` are a documented approximation rather
+than a full DE-9IM computation: exact for point/line arguments, and for
+polygon arguments checked via each ring's vertices and edge midpoints rather
+than a general polygon-arrangement algorithm. This is correct for the
+adjacency and containment shapes real GIS data hits constantly (shared
+edges, nested holes, one polygon fully inside another) but can in principle
+miss a pathological case — a straight edge that dips into and back out of
+the other polygon's interior between two vertices that are themselves
+outside that interior, without crossing any edge along the way. `ST_CROSSES`/
+`ST_OVERLAPS` and full topological equality remain out of scope for the same
+reason `GEO_EQUALS` is scoped the way it is above.
 
 `GEO_CLIP` uses Sutherland-Hodgman polygon clipping, which is only guaranteed
 correct against a convex boundary; it validates convexity by default and
@@ -302,6 +324,39 @@ explicit, indexed alternative.
 The [interactive map demo](https://simonwaldherr.github.io/tinySQL/tiles-demo.html)
 can edit built-in or uploaded GeoJSON locally, display source and result, tune
 parameters, check validity, and download the result.
+
+### Interop: WKT, WKB, geohash, and reprojection
+
+| Task | Function | PostGIS-style alias |
+| --- | --- | --- |
+| Parse WKT/EWKT text | `GEO_FROM_WKT(text[, srid])` | `ST_GEOMFROMTEXT`, `ST_GEOMFROMEWKT` |
+| Typed WKT constructors (error on a type mismatch) | — | `ST_POINTFROMTEXT`, `ST_LINEFROMTEXT`, `ST_POLYGONFROMTEXT` |
+| Render as WKT / EWKT | `GEO_AS_WKT`, `GEO_AS_EWKT` | `ST_ASTEXT`, `ST_ASEWKT` |
+| Parse/render WKB (BLOB or hex text) | `GEO_FROM_WKB`, `GEO_AS_WKB` | `ST_GEOMFROMWKB`, `ST_ASBINARY` |
+| Parse/render EWKB (adds an SRID header) | `GEO_FROM_WKB`, `GEO_AS_EWKB` | `ST_GEOMFROMEWKB`, `ST_ASEWKB` |
+| Canonicalize/validate a GeoJSON value | `GEO_FROM_GEOJSON` | `ST_GEOMFROMGEOJSON` |
+| Render GeoJSON, optionally rounded | `GEO_AS_GEOJSON(geometry[, max_decimal_digits])` | `ST_ASGEOJSON` |
+| Encode/decode a geohash | `GEO_GEOHASH_ENCODE(point[, precision])`, `GEO_GEOHASH_DECODE` | `ST_GEOHASH` |
+| Geohash cell bounds / surrounding cells | `GEO_GEOHASH_BBOX`, `GEO_GEOHASH_NEIGHBORS` | — |
+| Reproject to/from Web Mercator | `GEO_TRANSFORM(geometry, srid)` | `ST_TRANSFORM` |
+
+WKT/WKB parsing accepts POINT/LINESTRING/POLYGON/MULTIPOINT/
+MULTILINESTRING/MULTIPOLYGON/GEOMETRYCOLLECTION, both 2D and `Z`-tagged 3D
+forms, `EMPTY`, and an optional EWKT `SRID=...;`/EWKB SRID header — but only
+for SRID 4326 (or 0/absent, treated as 4326): tinySQL's geo layer is WGS84
+lon/lat throughout, so any other SRID is rejected with a pointer to
+`ST_TRANSFORM` rather than silently mislabeled. An OGC `M` (measure)
+ordinate is accepted on input and dropped, since a GeoJSON position has
+nowhere to put it. `ST_TRANSFORM` itself only supports SRID 4326 (WGS84) and
+3857 (Web Mercator, the projection this project's own `TILE_*` functions
+already use) — a general reprojection engine needs a datum-shift parameter
+database this project has no appetite for vendoring.
+
+```sql
+SELECT ST_ASTEXT(ST_GEOMFROMTEXT('POLYGON((13.3 52.4,13.5 52.4,13.5 52.6,13.3 52.6,13.3 52.4))')) AS wkt,
+       ST_GEOHASH(ST_MAKEPOINT(13.405, 52.520), 8) AS geohash,
+       ST_TRANSFORM(ST_MAKEPOINT(13.405, 52.520), 3857) AS web_mercator;
+```
 
 ### Region operations, spatial search, and choropleth classification
 
@@ -353,6 +408,55 @@ classes²) per partition (computed once, not per row) — fine for realistic
 choropleth partition sizes (municipalities, postal codes, districts), not
 tuned for tens of thousands of rows.
 
+## Routing graphs and shortest paths
+
+`importer.ImportRoutingGraph` loads a routing graph from JSON, NDJSON, or a
+CSV edge list into ordinary tables — `<table>_nodes` (`node_id`, `lat`,
+`lon`, `geometry`, `properties`) when the source has nodes, and `<table>`
+(`edge_id`, `source`, `target`, `cost`, `distance`, `duration`, `mode`,
+`geometry`, `properties`) for edges — recognizing the common
+`source`/`from`/`source_id` and `target`/`to`/`target_id` column aliases.
+
+Two SQL functions run Dijkstra's algorithm directly over any such edge
+table — or any table at all with a source column, a target column, and a
+non-negative numeric weight column, whether or not it came from
+`ImportRoutingGraph`:
+
+| Task | Function |
+| --- | --- |
+| Full shortest path as rows (one per node visited) | `ROUTE_SHORTEST_PATH(table, source_col, target_col, weight_col, start_id, end_id[, direction])` |
+| Just the total cost (or `NULL` if unreachable) | `ROUTE_DISTANCE(table, source_col, target_col, weight_col, start_id, end_id[, direction])` |
+
+```sql
+CREATE TABLE roads (edge_id TEXT, source TEXT, target TEXT, cost FLOAT64);
+INSERT INTO roads VALUES ('e1','A','B',1), ('e2','B','C',2), ('e3','A','C',10);
+
+SELECT * FROM ROUTE_SHORTEST_PATH('roads', 'source', 'target', 'cost', 'A', 'C');
+-- seq | node_id | edge_id | leg_cost | total_cost | geometry
+--   0 | A       | NULL    | NULL     | 0          | NULL
+--   1 | B       | e1      | 1        | 1          | NULL
+--   2 | C       | e2      | 2        | 3          | NULL
+-- (the direct A->C edge costs 10 and is correctly passed over)
+
+SELECT ROUTE_DISTANCE('roads', 'source', 'target', 'cost', 'A', 'C') AS meters;
+```
+
+`direction` is `'directed'` (the default — travel only `source` → `target`)
+or `'undirected'` (travel either way along every edge). A node id may be
+text or numeric; `ROUTE_SHORTEST_PATH`/`ROUTE_DISTANCE` error if `start_id`
+or `end_id` does not appear as any row's `source`/`target` value (a likely
+typo), but return an empty result / `NULL` respectively for a real,
+unreachable destination. Edge weights must be non-negative — Dijkstra's own
+precondition — a negative weight errors rather than silently producing a
+wrong answer; a graph that genuinely needs negative weights needs
+Bellman-Ford, which is out of scope. If the edge table has an `edge_id` and/
+or `geometry` column, `ROUTE_SHORTEST_PATH` reports the edge actually taken
+and its geometry alongside each step; both are `NULL` if the table does not
+have those columns. Like `GEO_SEARCH`, the graph is rebuilt from the table on
+every call rather than cached — correct and simple first, with a persistent
+graph index as the natural follow-up if repeated queries against the same
+large graph turn out to need it.
+
 ## Map tiles and MBTiles
 
 For multi-gigabyte, read-mostly datasets, see
@@ -390,6 +494,35 @@ importer.ImportMBTiles(ctx, db, "default", "tiles", "city.mbtiles",
 importer.ExportMBTiles(ctx, db, "default", "out.mbtiles",
 	&importer.ExportMBTilesOptions{TileRowIsTMS: true})
 ```
+
+For reading an `.mbtiles` file's tiles or metadata directly from a query —
+no separate Go-side import/open call first — three SQL functions read the
+source SQLite file in place, gated by the same `sqliteimport` build tag
+(calling any of them in a build without the tag returns a clear "requires
+the sqliteimport build tag" error rather than "unknown function"):
+
+| Task | Function |
+| --- | --- |
+| One tile's raw bytes by XYZ z/x/y (indexed point lookup) | `MBTILES_TILE(file_path, z, x, y)` |
+| All tiles (optionally restricted to a zoom range) as rows | `MBTILES_TILES(file_path[, min_zoom, max_zoom])` |
+| The tileset's `name`/`value` metadata rows | `MBTILES_METADATA(file_path)` |
+
+```sql
+SELECT MBTILES_TILE('city.mbtiles', 14, TILE_X(13.405, 14), TILE_FLIP_Y(TILE_Y(52.520, 14), 14)) AS tile_data;
+
+SELECT zoom_level, tile_column, tile_row, tile_size, tile_sha256
+FROM MBTILES_TILES('city.mbtiles', 0, 8);
+
+SELECT * FROM MBTILES_METADATA('city.mbtiles');
+```
+
+`MBTILES_TILE` returns `NULL` (not an error) for a tile the tileset does not
+cover — a sparse tileset not covering a given tile is normal. `MBTILES_TILES`
+without a zoom range is bounded to 200,000 tiles and errors, rather than
+silently truncating, past that — narrow the range for a large tileset.
+Neither persists anything into the database; each call re-reads the source
+file, the same "correct first, cache later if it matters" trade-off
+`ROUTE_SHORTEST_PATH` below makes for its own edge table.
 
 For HTTP delivery, run `tinysqld -tiles`:
 

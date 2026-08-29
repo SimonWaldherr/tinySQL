@@ -73,6 +73,27 @@ func getAllFunctions() map[string]funcHandler {
 		for k, v := range getGeoClipFunctions() {
 			m[k] = v
 		}
+		for k, v := range getGeoWKTFunctions() {
+			m[k] = v
+		}
+		for k, v := range getGeoWKBFunctions() {
+			m[k] = v
+		}
+		for k, v := range getGeoHashFunctions() {
+			m[k] = v
+		}
+		for k, v := range getGeoTransformFunctions() {
+			m[k] = v
+		}
+		for k, v := range getGeoExtraRelateFunctions() {
+			m[k] = v
+		}
+		for k, v := range getRouteFunctions() {
+			m[k] = v
+		}
+		for k, v := range getMBTilesFunctions() {
+			m[k] = v
+		}
 		for k, v := range getTileFunctions() {
 			m[k] = v
 		}

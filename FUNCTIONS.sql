@@ -1476,7 +1476,77 @@ SELECT district, buildings,
 FROM geo_kpi_demo ORDER BY buildings;
 
 DROP TABLE geo_kpi_demo;
+
+-- ST_TOUCHES: boundary-only contact -- true, but ST_INTERSECTS would also be
+-- true (they share the whole x=1 edge), while ST_COVERS/ST_COVEREDBY test
+-- "every point of one is in-or-on the other" instead of boundary contact.
+SELECT ST_TOUCHES(
+  '{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}',
+  '{"type":"Polygon","coordinates":[[[1,0],[2,0],[2,1],[1,1],[1,0]]]}'
+) AS shares_edge_only;
+
+SELECT ST_COVERS(
+  '{"type":"Polygon","coordinates":[[[-4,-4],[4,-4],[4,4],[-4,4],[-4,-4]]]}',
+  '{"type":"Polygon","coordinates":[[[-1,-1],[1,-1],[1,1],[-1,1],[-1,-1]]]}'
+) AS big_square_covers_small_one;
+
+-- GEO_PERIMETER / ST_PERIMETER: sum of every ring's great-circle length
+-- (exterior and holes alike), the boundary counterpart to GEO_POLYGON_AREA.
+SELECT ST_PERIMETER('{"type":"Polygon","coordinates":[[[0,0],[0,1],[1,1],[1,0],[0,0]]]}') AS meters;
+
+-- WKT/EWKT interop: ST_GEOMFROMTEXT parses Well-Known Text (including an
+-- "SRID=4326;" EWKT prefix -- any other SRID errors, pointing at
+-- ST_TRANSFORM) into the same GeoJSON every other function here works with;
+-- ST_ASTEXT/ST_ASEWKT render it back out.
+SELECT ST_ASTEXT(ST_GEOMFROMTEXT('POLYGON((13.3 52.4,13.5 52.4,13.5 52.6,13.3 52.6,13.3 52.4))')) AS wkt;
+SELECT ST_ASEWKT(ST_MAKEPOINT(13.405, 52.520)) AS ewkt;
+
+-- WKB/EWKB interop: the binary sibling of WKT, as a BLOB or hex text.
+SELECT ST_ASTEXT(ST_GEOMFROMWKB(ST_ASBINARY(ST_MAKEPOINT(13.405, 52.520)))) AS round_tripped;
+
+-- GEO_AS_GEOJSON / ST_ASGEOJSON: canonicalize (and optionally round) a
+-- GeoJSON value's coordinates.
+SELECT ST_ASGEOJSON(ST_MAKEPOINT(13.4049823, 52.5200066), 3) AS rounded_geojson;
+
+-- Geohash: encode a point to a base-32 locality key, decode it back to a
+-- point, inspect its cell bounds, or list the 8 surrounding cells (plus
+-- itself, at index 4).
+SELECT GEO_GEOHASH_ENCODE(ST_MAKEPOINT(13.405, 52.520), 8) AS geohash;
+SELECT ST_ASTEXT(GEO_GEOHASH_DECODE('u33dc0cp')) AS decoded_point;
+SELECT GEO_GEOHASH_BBOX('u33dc0cp') AS cell_bounds;
+SELECT GEO_GEOHASH_NEIGHBORS('u33dc0cp') AS surrounding_cells;
+
+-- ST_TRANSFORM: reproject between WGS84 (4326) and Web Mercator (3857) --
+-- the one other SRID this project's own TILE_* functions use. No other
+-- SRID is supported (see the WKT/EWKT note above).
+SELECT ST_TRANSFORM(ST_MAKEPOINT(13.405, 52.520), 3857) AS web_mercator;
+
 DROP TABLE geo_demo;
+
+-- ============================================================
+-- ROUTING GRAPHS AND SHORTEST PATHS
+-- ============================================================
+
+-- ROUTE_SHORTEST_PATH / ROUTE_DISTANCE run Dijkstra's algorithm directly
+-- over any edge table with a source column, a target column, and a
+-- non-negative numeric weight column -- exactly the shape
+-- importer.ImportRoutingGraph produces, but not limited to it.
+CREATE TABLE routing_demo (edge_id TEXT, source TEXT, target TEXT, cost FLOAT64);
+INSERT INTO routing_demo VALUES ('e1', 'A', 'B', 1);
+INSERT INTO routing_demo VALUES ('e2', 'B', 'C', 2);
+INSERT INTO routing_demo VALUES ('e3', 'A', 'C', 10);
+
+-- ROUTE_SHORTEST_PATH: one row per node on the cheapest path (here A->B->C,
+-- total cost 3, correctly passing over the direct but pricier A->C edge).
+SELECT * FROM ROUTE_SHORTEST_PATH('routing_demo', 'source', 'target', 'cost', 'A', 'C');
+
+-- ROUTE_DISTANCE: just the total cost, or NULL if unreachable.
+SELECT ROUTE_DISTANCE('routing_demo', 'source', 'target', 'cost', 'A', 'C') AS total_cost;
+
+-- Optional 'directed' (default, source->target only) / 'undirected' mode.
+SELECT ROUTE_DISTANCE('routing_demo', 'source', 'target', 'cost', 'C', 'A', 'undirected') AS reverse_cost;
+
+DROP TABLE routing_demo;
 
 -- ============================================================
 -- TILE FUNCTIONS
@@ -1527,6 +1597,18 @@ WHERE zoom_level = 14
   AND tile_column = TILE_X(13.405, 14)
   AND tile_row = TILE_FLIP_Y(TILE_Y(52.520, 14), 14);
 DROP TABLE tile_lookup_demo;
+
+-- MBTILES_TILE / MBTILES_TILES / MBTILES_METADATA: read an existing
+-- .mbtiles file's tiles or metadata directly from SQL, without a separate
+-- import/open step first. Requires the sqliteimport build tag (a build
+-- without it still has these functions, but they return a clear
+-- "requires the sqliteimport build tag" error instead of "unknown
+-- function"). Illustrative -- these need a real .mbtiles file on disk, so
+-- they are not run as part of this reference file.
+--
+-- SELECT MBTILES_TILE('city.mbtiles', 14, TILE_X(13.405, 14), TILE_FLIP_Y(TILE_Y(52.520, 14), 14)) AS tile_data;
+-- SELECT zoom_level, tile_column, tile_row, tile_size, tile_sha256 FROM MBTILES_TILES('city.mbtiles', 0, 8);
+-- SELECT * FROM MBTILES_METADATA('city.mbtiles');
 
 -- ============================================================
 -- END OF EXAMPLES

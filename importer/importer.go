@@ -179,3 +179,12 @@ func ExportMBTiles(ctx context.Context, db *tinysql.DB, tenant, filePath string,
 func OpenMBTiles(ctx context.Context, db *tinysql.DB, tenant, filePath string, opts *OpenMBTilesOptions) (*OpenMBTilesResult, error) {
 	return ii.OpenMBTiles(ctx, db, tenant, filePath, opts)
 }
+
+// LookupMBTilesTile reads one tile's raw bytes directly from filePath's own
+// SQLite storage -- an indexed point query, not a zoom-range scan -- given
+// z/x/y in the ordinary XYZ/Slippy-map convention. found is false with a nil
+// error when the tileset does not cover that tile. Requires the sqliteimport
+// build tag.
+func LookupMBTilesTile(ctx context.Context, filePath string, z, x, y int) (data []byte, found bool, err error) {
+	return ii.LookupMBTilesTile(ctx, filePath, z, x, y)
+}
