@@ -1,4 +1,4 @@
-# Using TinySQL from the Command Line
+# Using tinySQL from the Command Line
 
 `cmd/` holds tools and demos built on the same engine as the Go library. Full
 list: [cmd/README.md](../cmd/README.md).
@@ -15,7 +15,7 @@ list: [cmd/README.md](../cmd/README.md).
 | `cmd/fsql` | Query filesystem metadata and file contents with SQL |
 | `cmd/studio` | Desktop GUI |
 | `cmd/wasm_browser` | Browser WebAssembly build |
-| `cmd/tinysql-mcp-server` | Serves a TinySQL database over MCP for LLM agents |
+| `cmd/tinysql-mcp-server` | Serves a tinySQL database over MCP for LLM agents |
 
 Build with `make build` (main CLI) or `make build-all` (CLI + common demos);
 see the [Development Guide](./development-guide.md).
@@ -47,5 +47,5 @@ make update-gh-pages
 make push-gh-pages
 ```
 
-To embed TinySQL as WASM in your own frontend instead of using the demo, see
+To embed tinySQL as WASM in your own frontend instead of using the demo, see
 the [Developer Integration Guide](./developer-integration.md).

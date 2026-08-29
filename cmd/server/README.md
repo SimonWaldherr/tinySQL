@@ -1,6 +1,6 @@
 # tinySQL HTTP / gRPC server (`server`)
 
-Part of [TinySQL](../../README.md). See the root guide for the engine feature
+Part of [tinySQL](../../README.md). See the root guide for the engine feature
 set and [tinysqld](../tinysqld/README.md) for the durable DBMS profile.
 
 Serves a tinySQL database over HTTP (JSON/NDJSON REST) and gRPC (JSON codec),
@@ -131,7 +131,7 @@ final record is `{"type":"error","error":"..."}`. Consumers should process
 records incrementally and treat `error` as terminal.
 
 `QueryStream` is the matching gRPC server-streaming RPC at
-`/tinysql.TinySQL/QueryStream`. It uses the server's existing JSON codec: send
+`/tinysql.tinySQL/QueryStream`. It uses the server's existing JSON codec: send
 one `queryRequest` (`tenant`, `sql`, optional `timeout_ms`) and receive the
 same `header`/`row`/`end`/`error` record shapes. A terminal `error` record is
 followed by a non-OK gRPC status; startup/validation errors return only that

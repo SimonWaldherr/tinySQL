@@ -1,6 +1,6 @@
 # RAG optimization roadmap
 
-This roadmap separates the retrieval hot path already implemented in TinySQL
+This roadmap separates the retrieval hot path already implemented in tinySQL
 from the next improvements. Priorities assume an embedded RAG workload with
 frequent reads, append-heavy ingestion, stable chunk IDs, and corpora large
 enough that repeated full scans are visible.

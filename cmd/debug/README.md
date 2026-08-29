@@ -1,6 +1,6 @@
 # tinySQL SQL Diagnostic Tool (`debug`)
 
-Part of [TinySQL](../../README.md). See the root guide for supported SQL,
+Part of [tinySQL](../../README.md). See the root guide for supported SQL,
 functions, and known limits.
 
 Parses and executes SQL against a fresh in-memory tinySQL database, reporting

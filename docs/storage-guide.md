@@ -1,6 +1,6 @@
 # Storage & Persistence Guide
 
-TinySQL separates the SQL engine from how data is persisted. All storage modes
+tinySQL separates the SQL engine from how data is persisted. All storage modes
 share the same engine and `*DB`/`database/sql` API, so switching modes changes
 only the `StorageConfig`/DSN, never application code.
 

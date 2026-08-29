@@ -1,7 +1,7 @@
 # import-validate
 
 Lokale Webanwendung für sichere CSV-Imports: Vorschau, Feldregeln,
-Fehlerliste und erst danach ein expliziter Schreibvorgang in eine TinySQL-
+Fehlerliste und erst danach ein expliziter Schreibvorgang in eine tinySQL-
 Tabelle.
 
 ## Start

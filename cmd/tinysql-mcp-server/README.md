@@ -1,6 +1,6 @@
 # tinysql-mcp-server
 
-Part of [TinySQL](../../README.md). Review the root limitations and this
+Part of [tinySQL](../../README.md). Review the root limitations and this
 command's security model before attaching it to an agent host.
 
 An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server for

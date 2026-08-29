@@ -1,6 +1,6 @@
 # tinySQL Page Server (`tinysqlpage`)
 
-Part of [TinySQL](../../README.md). See the root guide for supported SQL and
+Part of [tinySQL](../../README.md). See the root guide for supported SQL and
 the [command index](../README.md) for other serving options.
 
 An HTTP server that renders SQL-driven web pages. Each URL path maps to a `.sql`

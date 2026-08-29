@@ -1,6 +1,6 @@
-# Building a RAG system with TinySQL
+# Building a RAG system with tinySQL
 
-TinySQL provides the retrieval layer of an in-process RAG system: native vector
+tinySQL provides the retrieval layer of an in-process RAG system: native vector
 storage, SIMD-accelerated nearest-neighbor search, BM25 full-text search,
 reciprocal-rank fusion, neighboring-chunk expansion, and persistence. It does
 not include an embedding or generation model. The application chooses those
@@ -33,7 +33,7 @@ documents
    └─ batch-embed enriched chunk text
           │
           ▼
-   TinySQL rag_chunks
+   tinySQL rag_chunks
    ├─ original text and citation metadata
    ├─ normalized lexical search text
    └─ VECTOR embedding
@@ -49,7 +49,7 @@ query ── FTS ───┼─ HYBRID_SEARCH ─ RRF ─ context expansion
 ```
 
 The vector branch recovers paraphrases and conceptual matches. The BM25 branch
-recovers exact names, identifiers, error codes, and rare terms. TinySQL fuses
+recovers exact names, identifiers, error codes, and rare terms. tinySQL fuses
 their ranks with RRF rather than adding raw vector and BM25 scores, whose scales
 are unrelated.
 
@@ -65,7 +65,7 @@ These values are starting points, not universal truths:
 | candidates per branch (`candidate_k`) | `4 × k` | gives RRF room to improve recall |
 | RRF constant (`rrf_k`) | `60` | stable default; keep fixed until evaluation justifies a change |
 | context expansion | one chunk before and after | repairs boundary cuts after retrieval |
-| metric | `cosine` | expected by TinySQL's RAG scoring helpers |
+| metric | `cosine` | expected by tinySQL's RAG scoring helpers |
 | vector index | `flat` | exact baseline; switch only after corpus-specific benchmarks |
 | result cache | off | most natural-language query vectors are unique |
 
@@ -110,7 +110,7 @@ ON rag_chunks(doc_id, chunk_index);
 ```
 
 Use a deterministic `chunk_id`, for example a hash of document version,
-heading, and chunk index. TinySQL can then use the primary key automatically to
+heading, and chunk index. tinySQL can then use the primary key automatically to
 match vector and full-text candidates in `HYBRID_SEARCH`.
 
 Keep `chunk_index` monotonic within each document. Neighbor expansion sorts by
@@ -128,7 +128,7 @@ Section: Database / Timeouts
 database timeout request deadline context cancellation
 ```
 
-TinySQL's current FTS tokenizer is deliberately lightweight: it lowercases
+tinySQL's current FTS tokenizer is deliberately lightweight: it lowercases
 ASCII letters and numbers, removes stop words, and applies simple
 English-oriented stemming. For German or other multilingual corpora, normalize
 lexical text consistently before insertion and querying where appropriate
@@ -154,7 +154,7 @@ This avoids blending unrelated neighboring sections. It also reduces the need
 for large overlap because `RAG_CONTEXT_FROM` and `HYBRID_SEARCH` can add
 neighboring chunks after a relevant chunk is found.
 
-TinySQL provides a simple size-based helper:
+tinySQL provides a simple size-based helper:
 
 ```sql
 SELECT chunk_index, chunk_text, start_pos, end_pos
@@ -248,7 +248,7 @@ migrating a live vector column row by row.
 
 `VEC_TO_BYTES`/`VEC_FROM_BYTES` provide compact float32 interchange. The
 current SQL representation is hexadecimal text, so it is not smaller than a
-native `VECTOR` when stored in a TinySQL table.
+native `VECTOR` when stored in a tinySQL table.
 
 ## 5. The recommended query: `HYBRID_SEARCH`
 
@@ -391,7 +391,7 @@ FROM HYBRID_SEARCH(
 );
 ```
 
-TinySQL's FTS grammar supports terms, quoted phrases, `AND`, `OR`, `NOT`, and
+tinySQL's FTS grammar supports terms, quoted phrases, `AND`, `OR`, `NOT`, and
 token wildcards. Parenthesized grouping is not currently part of the FTS
 grammar; express the intended order explicitly or issue separate queries.
 
@@ -422,7 +422,7 @@ Dense vectors and BM25 fail differently:
 - RRF uses rank positions, rewarding results that are strong in either branch
   and especially results found by both.
 
-TinySQL uses:
+tinySQL uses:
 
 ```text
 rrf_score = Σ 1 / (rrf_k + rank)
@@ -506,10 +506,10 @@ FROM HYBRID_SEARCH(
 ```
 
 `allowed_row_ids` contains stable application IDs, not storage row offsets. If
-`id_column` is omitted, TinySQL uses a single-column primary key. `equals` is
+`id_column` is omitted, tinySQL uses a single-column primary key. `equals` is
 an AND of metadata equalities; it can be combined with `allowed_row_ids` and
 is intersected with it. A secondary index whose leading columns match the
-equality metadata is used when safe; otherwise TinySQL falls back to an exact
+equality metadata is used when safe; otherwise tinySQL falls back to an exact
 scan of the authorized subset. This makes the API safe for typed and
 SQLite-affinity-compatible columns instead of risking false-negative index
 lookups.
@@ -534,7 +534,7 @@ FROM FTS_SEARCH_FILTERED(
 ```
 
 Filtered vector search is exact by default. For a large, stable tenant or ACL
-slice, add top-level `"index":"hnsw"` to the options. TinySQL then builds a
+slice, add top-level `"index":"hnsw"` to the options. tinySQL then builds a
 bounded, process-local HNSW graph containing only that filter's rows; it never
 searches a global ANN graph and filters its candidates afterwards. This keeps
 the authorization boundary intact while accepting the usual ANN recall tradeoff:
@@ -574,7 +574,7 @@ with the same pre-filter (not across different tenants or ACLs). Context
 expansion is restricted to the same set, so an allowed hit cannot pull an
 adjacent forbidden chunk into the final output.
 
-Use TinySQL's tenant namespace or separate databases/snapshots as the first
+Use tinySQL's tenant namespace or separate databases/snapshots as the first
 isolation layer. `pre_filter` then provides a per-principal/document boundary
 within that tenant. Never use an outer `WHERE` as the only authorization check.
 
@@ -737,7 +737,7 @@ an ANN build. Then benchmark the real corpus and concurrency:
 | `ivf` | repeated queries need lower latency and measured recall remains acceptable | approximate; build and probe behavior depend on corpus |
 | `hnsw` | large, mostly static corpus where benchmarks show a win | approximate; highest build cost and additional memory |
 
-Do not assume HNSW is automatically fastest. TinySQL's repository benchmarks
+Do not assume HNSW is automatically fastest. tinySQL's repository benchmarks
 show IVF winning at the current 12k-row/64-dimension fixture, while HNSW has a
 much higher build cost. ANN crossovers depend on row count, dimensions,
 hardware, and query distribution.
@@ -750,10 +750,10 @@ FROM VEC_WARM('rag_chunks', 'embedding', 'cosine', 'ivf');
 ```
 
 Embedding updates do not force a full column-cache or HNSW-topology rebuild:
-TinySQL keeps immutable vector segments and applies per-row overrides. ANN
+tinySQL keeps immutable vector segments and applies per-row overrides. ANN
 search also scores a bounded update-delta exactly and merges it into Top-K, so
 a vector moved far away from its old graph neighborhood remains discoverable.
-When that delta grows beyond the compaction threshold, TinySQL rebuilds the
+When that delta grows beyond the compaction threshold, tinySQL rebuilds the
 topology once and clears it.
 Deletes and schema changes still rebuild safely, because physical row positions
 may change; this is intentional rather than serving a graph with shifted IDs.
@@ -785,7 +785,7 @@ tsql.ConfigureVectorCache(cfg)
 stats := tsql.VectorCacheAnalytics()
 ```
 
-Use request contexts with deadlines. TinySQL propagates cancellation through
+Use request contexts with deadlines. tinySQL propagates cancellation through
 query execution and index warm-up.
 
 ## 12. Troubleshooting checklist
@@ -910,5 +910,5 @@ Position and relevance still matter; see
 [Lost in the Middle: How Language Models Use Long
 Contexts](https://arxiv.org/abs/2307.03172).
 
-TinySQL-specific performance claims and reproducible commands live in
+tinySQL-specific performance claims and reproducible commands live in
 [BENCHMARKS.md](../BENCHMARKS.md).

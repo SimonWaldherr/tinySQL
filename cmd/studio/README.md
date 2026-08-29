@@ -1,6 +1,6 @@
 # tinySQL Studio (`studio`)
 
-Part of [TinySQL](../../README.md). See the root guide for engine capabilities,
+Part of [tinySQL](../../README.md). See the root guide for engine capabilities,
 imports, persistence, and limitations.
 
 A native desktop GUI for tinySQL built with [Wails](https://wails.io/): write

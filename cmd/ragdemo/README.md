@@ -1,11 +1,11 @@
 # Local LM Studio RAG evaluation
 
-Part of [TinySQL](../../README.md). See the root guide and
+Part of [tinySQL](../../README.md). See the root guide and
 [RAG guide](../../docs/rag-guide.md) for the engine-side retrieval features.
 
 Makes retrieval quality inspectable instead of judging only the final LLM
 answer. Chunks the repository Markdown docs, gets embeddings from an
-OpenAI-compatible LM Studio server, stores them in TinySQL, and reports the
+OpenAI-compatible LM Studio server, stores them in tinySQL, and reports the
 retrieved chunks, cosine similarities, vector/BM25 ranks, Hit@k, and MRR.
 
 Retrieval itself is a single `RAG_SEARCH` call. Hybrid mode hands the engine a

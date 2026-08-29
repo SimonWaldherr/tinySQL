@@ -28,7 +28,7 @@ void        TinySQLFree(char* ptr);
 persist and restore the database. `TinySQLReset` wipes the in-memory state so
 one process can serve multiple tests.
 
-`TinySQLFree` must be called on every pointer returned by the `TinySQL*`
+`TinySQLFree` must be called on every pointer returned by the `tinySQL*`
 functions (all except `TinySQLReset`) or you leak memory.
 
 Payloads are UTF-8 RFC 8259 JSON. Future error objects can carry SQLSTATE
@@ -40,9 +40,9 @@ classification from the public tinySQL API; see the
 [example.py](./example.py) contains the `ctypes` wrapper:
 
 ```python
-from example import TinySQL
+from example import tinySQL
 
-db = TinySQL()
+db = tinySQL()
 print(db.version())
 db.execute("CREATE TABLE users (id INT, name TEXT);")
 db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');")

@@ -1,6 +1,6 @@
 # tinySQL WASM Browser (`wasm_browser`)
 
-Part of [TinySQL](../../README.md). For the full local-first browser app and
+Part of [tinySQL](../../README.md). For the full local-first browser app and
 GIS editor, see [`query_files_wasm`](../query_files_wasm/README.md).
 
 Compiles tinySQL to WebAssembly and serves it with a browser UI. The SQL engine

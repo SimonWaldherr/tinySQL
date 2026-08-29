@@ -1,15 +1,15 @@
-# TinySQL Developer Integration Guide
+# tinySQL Developer Integration Guide
 
-How to embed TinySQL in three setups:
+How to embed tinySQL in three setups:
 
 1. Native Go applications
 2. Browser/WASM applications
-3. Custom web frontends talking to a WASM-backed TinySQL runtime
+3. Custom web frontends talking to a WASM-backed tinySQL runtime
 
 Sources: `example_test.go`, `import_example_test.go`, `cmd/demo`, `cmd/ragdemo`,
 `cmd/query_files_wasm`, `cmd/wasm_browser`, `example_showcase.sql`.
 
-> **Vector search & RAG:** TinySQL is also a retrieval backend (vector k-NN,
+> **Vector search & RAG:** tinySQL is also a retrieval backend (vector k-NN,
 > BM25 full-text, hybrid retrieval, RAG context expansion). For AI/RAG use,
 > start with the [RAG / AI usage guide](./rag-guide.md) and `cmd/ragdemo`.
 
@@ -22,8 +22,8 @@ Three integration levels:
 - **Directly in Go**: import `github.com/SimonWaldherr/tinySQL` and call the
   parser, execution, and import helpers.
 - **Through `database/sql`**: import the public package
-  `github.com/SimonWaldherr/tinySQL/driver` and open TinySQL through a DSN.
-- **In the browser via WASM**: `cmd/query_files_wasm` runs TinySQL as a
+  `github.com/SimonWaldherr/tinySQL/driver` and open tinySQL through a DSN.
+- **In the browser via WASM**: `cmd/query_files_wasm` runs tinySQL as a
   WebAssembly module driven from JavaScript.
 
 Example files, each covering a different level:
@@ -32,13 +32,13 @@ Example files, each covering a different level:
 - `import_example_test.go` — CSV, JSON, file, and auto-detection imports
 - `cmd/demo/main.go` — the `database/sql` integration
 - `cmd/query_files_wasm/main.go` and `app.js` — browser integration
-- `example_showcase.sql` — the SQL surface TinySQL supports
+- `example_showcase.sql` — the SQL surface tinySQL supports
 
-### 2. Integrating TinySQL into Go projects
+### 2. Integrating tinySQL into Go projects
 
 #### Formatting and minifying SQL text
 
-TinySQL can format SQL without a database instance — useful for editors, logs,
+tinySQL can format SQL without a database instance — useful for editors, logs,
 review tools, and cache keys. No parser roundtrip is involved: literals, quoted
 identifiers, and comments stay unchanged.
 
@@ -248,7 +248,7 @@ no `internal/...` imports. For custom table-valued functions use
 
 #### Importing files
 
-Use the import helpers to load CSV, JSON, or XML into TinySQL.
+Use the import helpers to load CSV, JSON, or XML into tinySQL.
 `import_example_test.go` is the reference.
 
 ```go
@@ -269,14 +269,14 @@ Recommended options:
 - `TypeInference: true` for automatic column typing.
 - `HeaderMode: "present"` when the input definitely has a header row.
 
-### 3. Integrating TinySQL into WASM projects
+### 3. Integrating tinySQL into WASM projects
 
 `cmd/query_files_wasm` demonstrates the full pattern:
 
 1. Compile Go with `GOOS=js GOARCH=wasm`.
 2. Ship `wasm_exec.js` with the page.
 3. Load the WASM module from a small HTML/JS app.
-4. Expose TinySQL functions on `window`.
+4. Expose tinySQL functions on `window`.
 
 ```bash
 cd cmd/query_files_wasm
@@ -355,7 +355,7 @@ The `Load Demo + Large Tables` button is a good example for larger datasets:
 seed the demo tables first, then run a query combining joins, grouping, and
 aggregation.
 
-### 4. Integrating TinySQL into custom web frontends
+### 4. Integrating tinySQL into custom web frontends
 
 For a React, Vue, Svelte, or vanilla JS frontend:
 
@@ -427,7 +427,7 @@ tables, and JSON expressions and updates.
 
 For Go-only apps prefer the direct package API or the `database/sql` driver. For
 browser apps follow the `cmd/query_files_wasm` pattern: compile to WASM, expose
-a small JS API, let the frontend own UI state while TinySQL owns data and query
+a small JS API, let the frontend own UI state while tinySQL owns data and query
 execution.
 
 ## Deutsch
@@ -437,12 +437,12 @@ Codebeispiele; dieser Abschnitt fasst dieselben Fakten zusammen.
 
 ### 1. Ueberblick
 
-TinySQL kann auf drei Ebenen integriert werden:
+tinySQL kann auf drei Ebenen integriert werden:
 
 - **Direkt in Go**: Paket `github.com/SimonWaldherr/tinySQL`, Parser,
   Ausfuehrung und Importfunktionen direkt aufrufen.
 - **Ueber `database/sql`**: oeffentliches Paket
-  `github.com/SimonWaldherr/tinySQL/driver` importieren und TinySQL per DSN
+  `github.com/SimonWaldherr/tinySQL/driver` importieren und tinySQL per DSN
   ansprechen.
 - **Im Browser via WASM**: `cmd/query_files_wasm` laeuft als WebAssembly-Modul
   und wird aus JavaScript gesteuert.

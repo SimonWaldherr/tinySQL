@@ -14,7 +14,7 @@ go run ./cmd/worklog -addr 127.0.0.1:8094
 | Option | Standard | Bedeutung |
 | --- | --- | --- |
 | `-addr` | `:8094` | HTTP-Adresse; für lokale Nutzung `127.0.0.1:8094` verwenden |
-| `-dsn` | `file:worklog.db?autosave=1` | Persistente TinySQL-Datenbank |
+| `-dsn` | `file:worklog.db?autosave=1` | Persistente tinySQL-Datenbank |
 | `-timeout` | `10h` | Dauer ohne neue Buchung bis zum automatischen Ausstempeln |
 | `-sweep` | `5m` | Intervall, in dem überfällige Status geprüft werden |
 | `-timezone` | `Europe/Berlin` | IANA-Zeitzone für Tagesberichte |

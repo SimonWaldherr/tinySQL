@@ -1,8 +1,8 @@
 # docsearch
 
-Durchsuchbare, lokale Dokumentablage mit TinySQL-Volltextsuche und Browser-
+Durchsuchbare, lokale Dokumentablage mit tinySQL-Volltextsuche und Browser-
 Oberfläche. Der Quellordner bleibt ausschließlich lesbar; nur der Suchindex
-wird in TinySQL gespeichert.
+wird in tinySQL gespeichert.
 
 ## Start
 

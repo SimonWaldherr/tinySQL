@@ -1,6 +1,6 @@
 # tinySQL DBMS daemon (`tinysqld`)
 
-Part of [TinySQL](../../README.md). See the root storage and map-tile sections
+Part of [tinySQL](../../README.md). See the root storage and map-tile sections
 before deploying this durable server profile.
 
 The enterprise DBMS entry point, separate from `cmd/server` so the older
@@ -62,7 +62,7 @@ Unauthenticated:
 - `GET /readyz` — readiness plus health; `503` while not ready or unhealthy.
 
 Authenticated when `-auth` is set, via `Authorization: Bearer <token>` or
-`X-TinySQL-Auth: <token>`:
+`X-tinySQL-Auth: <token>`:
 
 - `GET /api/status` — runtime status, backend stats, DB health.
 - `GET /api/analytics/vector` — vector-cache analytics (requires `-analytics`).

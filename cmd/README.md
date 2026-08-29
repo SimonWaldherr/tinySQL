@@ -1,6 +1,6 @@
-# TinySQL commands
+# tinySQL commands
 
-This directory contains runnable TinySQL applications, demos, servers, and
+This directory contains runnable tinySQL applications, demos, servers, and
 WebAssembly builds. For engine capabilities, GIS, storage modes, imports, and
 limitations, start with the [root README](../README.md).
 
@@ -26,7 +26,7 @@ limitations, start with the [root README](../README.md).
 | Durable DBMS daemon and tile server | [`tinysqld`](./tinysqld/README.md) | Health, jobs, storage, optional tiles |
 | Browser database manager | [`accessweb`](./accessweb/README.md) | Datasheets, CRUD, SQL, export |
 | SQL-driven HTML pages | [`tinysqlpage`](./tinysqlpage/README.md) | Render pages from `.sql` definitions |
-| Form application | [`formigo`](./formigo/README.md) | TinySQL or SQL Server backend |
+| Form application | [`formigo`](./formigo/README.md) | tinySQL or SQL Server backend |
 | Desktop SQL application | [`studio`](./studio/README.md) | Wails desktop app |
 | MCP server for AI hosts | [`tinysql-mcp-server`](./tinysql-mcp-server/README.md) | stdio Model Context Protocol server |
 
@@ -61,12 +61,12 @@ them to a network.
 | --- | --- | --- |
 | Full local-first SQL playground | [`query_files_wasm`](./query_files_wasm/README.md) | GitHub Pages app and GIS map editor |
 | Minimal browser WASM UI | [`wasm_browser`](./wasm_browser/README.md) | `./build.sh --serve` |
-| Run TinySQL from Node.js WASM | [`wasm_node`](./wasm_node/README.md) | `./build.sh --run` |
+| Run tinySQL from Node.js WASM | [`wasm_node`](./wasm_node/README.md) | `./build.sh --run` |
 
 The focused [map demo](https://simonwaldherr.github.io/tinySQL/tiles-demo.html)
 is built by `query_files_wasm` and its data generator in
 [`mbtilesdemo`](./mbtilesdemo). It runs tile lookups and GeoJSON edits through
-the same in-browser TinySQL engine.
+the same in-browser tinySQL engine.
 
 ## Build conventions
 

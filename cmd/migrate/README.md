@@ -1,6 +1,6 @@
 # tinySQL Data Migration Tool
 
-Part of [TinySQL](../../README.md). See the root guide for supported import
+Part of [tinySQL](../../README.md). See the root guide for supported import
 formats, export behavior, and optional build tags.
 
 CLI for data pipelines. Moves data between CSV/TSV/JSON/YAML/XML files,

@@ -1,6 +1,6 @@
 # Geofence service
 
-Lokaler Geofencing-Dienst mit TinySQL, GeoJSON-Polygonen und einer kleinen
+Lokaler Geofencing-Dienst mit tinySQL, GeoJSON-Polygonen und einer kleinen
 Browser-Oberfläche. Fahrzeuge, Zonen, Positionshistorie und Eintritts- bzw.
 Austrittsereignisse werden dauerhaft gespeichert.
 
@@ -14,7 +14,7 @@ go run ./cmd/geofence-service -addr 127.0.0.1:8091
 | Option | Standard | Bedeutung |
 | --- | --- | --- |
 | `-addr` | `:8091` | HTTP-Adresse; für eine reine lokale Nutzung `127.0.0.1:8091` verwenden |
-| `-dsn` | `file:geofence.db?autosave=1` | TinySQL-Datenbank; `mem://` hält Daten nur bis zum Beenden |
+| `-dsn` | `file:geofence.db?autosave=1` | tinySQL-Datenbank; `mem://` hält Daten nur bis zum Beenden |
 
 Beim ersten Start legt die Anwendung Beispiel-Fahrzeuge und -Zonen an. Neue
 Fahrzeuge und GeoJSON-Polygone können im Browser oder über die API angelegt

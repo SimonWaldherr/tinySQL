@@ -1,10 +1,10 @@
-# TinySQL
+# tinySQL
 
 [![CI](https://github.com/SimonWaldherr/tinySQL/actions/workflows/ci.yml/badge.svg)](https://github.com/SimonWaldherr/tinySQL/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/SimonWaldherr/tinySQL.svg)](https://pkg.go.dev/github.com/SimonWaldherr/tinySQL)
 [![DOI](https://zenodo.org/badge/1065449861.svg)](https://doi.org/10.5281/zenodo.17216339)
 
-TinySQL is an embeddable SQL database engine written in Go. It is designed for
+tinySQL is an embeddable SQL database engine written in Go. It is designed for
 learning database internals, local tools, tests, browser/WASM applications, and
 single-process services that need a capable SQL layer without operating a
 database server.
@@ -13,7 +13,7 @@ database server.
 [interactive map demo](https://simonwaldherr.github.io/tinySQL/tiles-demo.html)
 · [video](https://youtu.be/W28-aBk3BL0)
 
-> TinySQL is not a drop-in replacement for PostgreSQL, MySQL, or a clustered
+> tinySQL is not a drop-in replacement for PostgreSQL, MySQL, or a clustered
 > production database. Review the [limitations](#limitations) before using it
 > for critical workloads.
 
@@ -200,7 +200,7 @@ if err := tx.Commit(); err != nil { panic(err) }
 
 ## GIS and GeoJSON
 
-TinySQL stores geometry as ordinary GeoJSON, either in a `TEXT`/`JSON` column
+tinySQL stores geometry as ordinary GeoJSON, either in a `TEXT`/`JSON` column
 or in the dedicated `GEOMETRY` column type, which validates on write (a bare
 number or a `Feature`/`FeatureCollection` is rejected — a `GEOMETRY` column
 holds a Geometry) and canonicalizes to stable, byte-identical text. Most
@@ -424,7 +424,7 @@ go build -tags=sqliteimport,shapefile ./...
 
 Without a tag, the corresponding import API remains available and returns a
 feature-disabled error. The tags are not needed to serve a tileset already
-loaded into TinySQL.
+loaded into tinySQL.
 
 The `exporter` package writes result sets as CSV, TSV, JSON, NDJSON, XML, GOB,
 SQL, Excel (XLSX), GeoJSON, or TopoJSON. It preserves binary values with
@@ -520,6 +520,6 @@ cd cmd/query_files_wasm
   `ST_TOUCHES`/`ST_CROSSES`/`ST_OVERLAPS` (which need a full DE-9IM
   computation) are not implemented.
 
-TinySQL is primarily an educational and embeddable SQL engine. It aims to make
+tinySQL is primarily an educational and embeddable SQL engine. It aims to make
 the parser, planner, executor, storage backends, and practical extensions easy
 to inspect, test, and adapt.

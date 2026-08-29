@@ -1,6 +1,6 @@
 # tinySQL WASM Node.js (`wasm_node`)
 
-Part of [TinySQL](../../README.md). See the [command index](../README.md) for
+Part of [tinySQL](../../README.md). See the [command index](../README.md) for
 browser and server variants.
 
 Compiles tinySQL to WebAssembly for Node.js. `wasm_runner.js` bootstraps the

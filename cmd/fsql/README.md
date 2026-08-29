@@ -1,6 +1,6 @@
 # fsql — Filesystem Query Language
 
-Part of [TinySQL](../../README.md). See the root guide for SQL capabilities and
+Part of [tinySQL](../../README.md). See the root guide for SQL capabilities and
 the [command index](../README.md) for adjacent tools.
 
 Query the filesystem with SQL. `fsql` exposes file metadata, text file lines,

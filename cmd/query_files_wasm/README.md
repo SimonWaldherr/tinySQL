@@ -1,6 +1,6 @@
 # query_files_wasm
 
-Part of [TinySQL](../../README.md). The root guide covers the current GIS
+Part of [tinySQL](../../README.md). The root guide covers the current GIS
 functions; this guide covers the browser build and local-first UI.
 
 Browser-based tinySQL playground (Go WASM plus static HTML/JS UI). This command
