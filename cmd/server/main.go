@@ -944,14 +944,20 @@ func (s *server) Query(ctx context.Context, req *queryRequest) (*queryResponse, 
 		return &queryResponse{SQL: sqlText, Error: err.Error(), Duration: time.Since(start).String()}, nil
 	}
 
-	var cols []string
-	var rows []map[string]any
-	if rs != nil && len(rs.Rows) > 0 {
-		for c := range rs.Rows[0] {
-			cols = append(cols, c)
-		}
-		sort.Strings(cols)
-
+	// Columns come from the engine's own list. They used to be reconstructed
+	// from the first row's map keys and sorted alphabetically, which threw
+	// away both the select list's order and its capitalisation: SELECT b, a
+	// reported ["a","b"], and SELECT x AS Who reported "who".
+	//
+	// The row maps are passed through as the engine built them rather than
+	// projected down to Cols. A star join carries qualified keys (users.id)
+	// that Cols does not list, and for a self-join those are the only way to
+	// tell the two operands apart -- projecting to Cols would collapse
+	// SELECT * FROM t a CROSS JOIN t b to one operand's values.
+	cols := []string{}
+	rows := []map[string]any{}
+	if rs != nil {
+		cols = append(cols, rs.Cols...)
 		rows = make([]map[string]any, 0, len(rs.Rows))
 		for _, r := range rs.Rows {
 			m := make(map[string]any, len(r))

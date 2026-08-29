@@ -514,3 +514,98 @@ func TestInstrumentHTTPAlwaysLogsFailures(t *testing.T) {
 		t.Fatalf("expected no failure log for a 200 response, got: %q", buf.String())
 	}
 }
+
+// newColumnTestServer is a server with one two-column table populated.
+func newColumnTestServer(t *testing.T) (*server, context.Context) {
+	t.Helper()
+	db := storage.NewDB()
+	t.Cleanup(func() { db.Close() })
+	s := &server{db: db, cache: engine.NewQueryCache(10), defaultT: "default"}
+	ctx := context.Background()
+	for _, sql := range []string{
+		"CREATE TABLE users (id INT, name TEXT)",
+		"INSERT INTO users VALUES (1, 'Ada')",
+		"INSERT INTO users VALUES (2, 'Grace')",
+	} {
+		if _, err := s.Exec(ctx, &execRequest{Tenant: "default", SQL: sql}); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	return s, ctx
+}
+
+// The response used to rebuild its column list from the first row's map keys
+// and sort it alphabetically, so the select list's order and capitalisation
+// were both lost. Nothing in this package covered the column shape, which is
+// why it went unnoticed.
+func TestQueryReportsEngineColumns(t *testing.T) {
+	s, ctx := newColumnTestServer(t)
+
+	for _, tc := range []struct {
+		sql  string
+		want []string
+	}{
+		// Select-list order, not alphabetical order.
+		{"SELECT name, id FROM users", []string{"name", "id"}},
+		{"SELECT id, name FROM users", []string{"id", "name"}},
+		// An alias keeps the capitalisation the caller wrote.
+		{"SELECT name AS Who FROM users", []string{"Who"}},
+	} {
+		resp, err := s.Query(ctx, &queryRequest{Tenant: "default", SQL: tc.sql})
+		if err != nil {
+			t.Fatalf("%s: %v", tc.sql, err)
+		}
+		if strings.Join(resp.Columns, ",") != strings.Join(tc.want, ",") {
+			t.Errorf("%s\n  columns = %v\n  want      %v", tc.sql, resp.Columns, tc.want)
+		}
+	}
+}
+
+// An empty result must still describe its columns, and must marshal as [] so a
+// client can iterate without a nil check. Both were null before.
+func TestQueryEmptyResultHasColumnsAndEmptyRows(t *testing.T) {
+	s, ctx := newColumnTestServer(t)
+
+	resp, err := s.Query(ctx, &queryRequest{Tenant: "default", SQL: "SELECT id FROM users WHERE id > 99"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Columns) != 1 || resp.Columns[0] != "id" {
+		t.Errorf("columns = %v, want [id]", resp.Columns)
+	}
+	if resp.Rows == nil {
+		t.Error("rows is nil; it must marshal as [] rather than null")
+	}
+	encoded, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"columns":["id"]`, `"rows":[]`} {
+		if !strings.Contains(string(encoded), want) {
+			t.Errorf("response JSON missing %s: %s", want, encoded)
+		}
+	}
+}
+
+// A star join carries qualified keys the engine's Cols does not list. They are
+// the only way to tell a self-join's two operands apart, so the rows must be
+// forwarded as the engine built them rather than projected down to Cols.
+func TestQueryKeepsQualifiedKeysForSelfJoin(t *testing.T) {
+	s, ctx := newColumnTestServer(t)
+
+	resp, err := s.Query(ctx, &queryRequest{
+		Tenant: "default",
+		SQL:    "SELECT * FROM users u1 CROSS JOIN users u2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Rows) == 0 {
+		t.Fatal("cross join returned no rows")
+	}
+	for _, key := range []string{"u1.id", "u1.name", "u2.id", "u2.name"} {
+		if _, ok := resp.Rows[0][key]; !ok {
+			t.Errorf("row is missing qualified key %q: %v", key, resp.Rows[0])
+		}
+	}
+}
