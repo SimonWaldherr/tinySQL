@@ -362,7 +362,26 @@
       "DROP TABLE geo_region_demo;",
       "CREATE TABLE geo_kpi_demo (district TEXT, buildings INT);\nINSERT INTO geo_kpi_demo VALUES ('a', 5);\nINSERT INTO geo_kpi_demo VALUES ('b', 12);\nINSERT INTO geo_kpi_demo VALUES ('c', 48);\nINSERT INTO geo_kpi_demo VALUES ('d', 51);\nINSERT INTO geo_kpi_demo VALUES ('e', 95);",
       "SELECT district, buildings,\n       EQUAL_INTERVAL(3) OVER (ORDER BY buildings) AS equal_interval_class,\n       NATURAL_BREAKS(3) OVER (ORDER BY buildings) AS natural_breaks_class,\n       NTILE(3) OVER (ORDER BY buildings) AS quantile_class\nFROM geo_kpi_demo ORDER BY buildings;",
-      "DROP TABLE geo_kpi_demo;\nDROP TABLE geo_demo;"
+      "DROP TABLE geo_kpi_demo;",
+      "SELECT ST_TOUCHES(\n  '{\"type\":\"Polygon\",\"coordinates\":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}',\n  '{\"type\":\"Polygon\",\"coordinates\":[[[1,0],[2,0],[2,1],[1,1],[1,0]]]}'\n) AS shares_edge_only;",
+      "SELECT ST_COVERS(\n  '{\"type\":\"Polygon\",\"coordinates\":[[[-4,-4],[4,-4],[4,4],[-4,4],[-4,-4]]]}',\n  '{\"type\":\"Polygon\",\"coordinates\":[[[-1,-1],[1,-1],[1,1],[-1,1],[-1,-1]]]}'\n) AS big_square_covers_small_one;",
+      "SELECT ST_PERIMETER('{\"type\":\"Polygon\",\"coordinates\":[[[0,0],[0,1],[1,1],[1,0],[0,0]]]}') AS meters;",
+      "SELECT ST_ASTEXT(ST_GEOMFROMTEXT('POLYGON((13.3 52.4,13.5 52.4,13.5 52.6,13.3 52.6,13.3 52.4))')) AS wkt;\nSELECT ST_ASEWKT(ST_MAKEPOINT(13.405, 52.520)) AS ewkt;",
+      "SELECT ST_ASTEXT(ST_GEOMFROMWKB(ST_ASBINARY(ST_MAKEPOINT(13.405, 52.520)))) AS round_tripped;",
+      "SELECT ST_ASGEOJSON(ST_MAKEPOINT(13.4049823, 52.5200066), 3) AS rounded_geojson;",
+      "SELECT GEO_GEOHASH_ENCODE(ST_MAKEPOINT(13.405, 52.520), 8) AS geohash;\nSELECT ST_ASTEXT(GEO_GEOHASH_DECODE('u33dc0cp')) AS decoded_point;\nSELECT GEO_GEOHASH_BBOX('u33dc0cp') AS cell_bounds;\nSELECT GEO_GEOHASH_NEIGHBORS('u33dc0cp') AS surrounding_cells;",
+      "SELECT ST_TRANSFORM(ST_MAKEPOINT(13.405, 52.520), 3857) AS web_mercator;",
+      "DROP TABLE geo_demo;"
+    ]
+  },
+  {
+    "section": "ROUTING GRAPHS AND SHORTEST PATHS",
+    "examples": [
+      "CREATE TABLE routing_demo (edge_id TEXT, source TEXT, target TEXT, cost FLOAT64);\nINSERT INTO routing_demo VALUES ('e1', 'A', 'B', 1);\nINSERT INTO routing_demo VALUES ('e2', 'B', 'C', 2);\nINSERT INTO routing_demo VALUES ('e3', 'A', 'C', 10);",
+      "SELECT * FROM ROUTE_SHORTEST_PATH('routing_demo', 'source', 'target', 'cost', 'A', 'C');",
+      "SELECT ROUTE_DISTANCE('routing_demo', 'source', 'target', 'cost', 'A', 'C') AS total_cost;",
+      "SELECT ROUTE_DISTANCE('routing_demo', 'source', 'target', 'cost', 'C', 'A', 'undirected') AS reverse_cost;",
+      "DROP TABLE routing_demo;"
     ]
   },
   {
