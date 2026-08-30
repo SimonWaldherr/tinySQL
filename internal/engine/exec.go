@@ -97,6 +97,12 @@ func getAllFunctions() map[string]funcHandler {
 		for k, v := range getTileFunctions() {
 			m[k] = v
 		}
+		for k, v := range getCRSFunctions() {
+			m[k] = v
+		}
+		for k, v := range getGeoPackageFunctions() {
+			m[k] = v
+		}
 		allFunctions = m
 		allFuncTable = make([]funcHandler, 0, len(m))
 		allFuncIndex = make(map[string]int32, len(m))
@@ -232,6 +238,25 @@ type ExecEnv struct {
 	// immediately afterwards does not repeat it. See dmlPlan; nil means
 	// "nothing precomputed", which every consumer handles.
 	dml *dmlPlan
+	// procedureOverride is the storedProcedure executeStatement already
+	// resolved for the exact top-level *CallProcedure this env was built for,
+	// so execStmt/executeCallProcedure reuse that one lookup instead of each
+	// independently re-reading the live, hot-swappable procedure registry --
+	// which could otherwise observe a concurrent RegisterStoredProcedureWithOptions
+	// mid-statement and dispatch under a lock/rollback decision that no longer
+	// matches the handler actually invoked. Always nil before it reaches a
+	// nested statement (ProcedureContext.Execute strips it): it is only valid
+	// for the exact statement it was resolved for, never for whatever a
+	// procedure handler executes next.
+	procedureOverride *storedProcedure
+	// rollbackArmed is true once an ancestor statement in this call chain
+	// already holds an active rollback snapshot (see ProcedureContext.Execute).
+	// db.SnapshotForStatement's catalog half installs at most one rollback
+	// point at a time -- see armCatalogRollback -- so a nested statement must
+	// never arm a second one while an outer one is still active: doing so
+	// would silently steal catalog-mutation capture away from the outer
+	// snapshot instead of adding coverage.
+	rollbackArmed bool
 }
 
 // planFor returns the precomputed plan for stmt, or nil when this environment

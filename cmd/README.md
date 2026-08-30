@@ -4,6 +4,9 @@ This directory contains runnable tinySQL applications, demos, servers, and
 WebAssembly builds. For engine capabilities, GIS, storage modes, imports, and
 limitations, start with the [root README](../README.md).
 
+Supported geospatial formats and CRS profiles are summarized in the
+[geospatial standards guide](../docs/geospatial-standards.md).
+
 ## Choose a command
 
 | Goal | Command | Start here |
@@ -15,7 +18,7 @@ limitations, start with the [root README](../README.md).
 | Diagnose SQL against a fresh database | [`debug`](./debug/README.md) | `go run ./cmd/debug` |
 | Query files directly with SQL | [`query_files`](./query_files/README.md) | `go run ./cmd/query_files` |
 | Query filesystem metadata and content | [`fsql`](./fsql/README.md) | build from `cmd/fsql` |
-| Move data between files and databases | [`migrate`](./migrate/README.md) | build from `cmd/migrate` |
+| Move data between files and databases | [`migrate`](./migrate/README.md) | Structured and geospatial standard formats; build from `cmd/migrate` |
 
 ## Servers and applications
 
@@ -82,8 +85,8 @@ build workflows; follow their command README. Optional file importers use build
 tags:
 
 ```bash
-go build -tags=sqliteimport ./...
-go build -tags=shapefile ./...
+go build -tags=sqliteimport ./... # SQLite, OGC GeoPackage, and MBTiles
+go build -tags=shapefile ./...    # ESRI Shapefile and Shapefile ZIP
 go build -tags=sqliteimport,shapefile ./...
 ```
 

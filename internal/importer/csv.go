@@ -125,6 +125,20 @@ type ImportOptions struct {
 	// workbook (ImportXLSX). Empty selects the workbook's first sheet in
 	// declared order. Ignored by every other importer.
 	XLSXSheet string
+
+	// GeoPackageLayer selects one OGC GeoPackage feature table by its exact
+	// gpkg_contents.table_name. Empty selects the only feature layer; a
+	// multi-layer package requires an explicit choice so data is never silently
+	// omitted. Ignored by every other importer.
+	GeoPackageLayer string
+
+	// GeoPackageGeometryMode controls GeoPackageBinary geometry handling:
+	// "auto" (default) decodes EPSG:4326 to GeoJSON and preserves every other
+	// CRS as the original GeoPackage BLOB; "geojson" requires EPSG:4326;
+	// "wkb" strips the GeoPackage header but preserves native coordinates as
+	// OGC WKB; "gpkg"/"native" preserves the complete standard BLOB. No mode
+	// silently relabels projected coordinates as RFC 7946 longitude/latitude.
+	GeoPackageGeometryMode string
 }
 
 // ImportResult returns metadata about the import operation.

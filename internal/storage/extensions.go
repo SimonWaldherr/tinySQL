@@ -7,11 +7,15 @@ import (
 	"time"
 )
 
-// ExtensionCapability is a declared resource category an extension may need.
-// Declarations are metadata only for now; callers can use them to review an
-// extension before activation. Enforcement is intentionally left to a future
-// capability policy rather than pretending that in-process Go code is
-// sandboxed.
+// ExtensionCapability is a self-reported, unverified resource category an
+// extension declares it may need. tinySQL never checks it against what the
+// extension's code actually does, and never will: a statically linked Go
+// extension runs as ordinary code in the same process with the same
+// privileges as the rest of the application, so there is no boundary to
+// enforce a capability against. Declarations exist purely so a caller can
+// review what an extension claims to need -- via ExtensionInfo.Capabilities
+// or sys.extensions -- before calling DB.Use, the same way you would read a
+// new dependency's imports before adding it.
 type ExtensionCapability string
 
 const (
@@ -41,6 +45,10 @@ type ExtensionInfo struct {
 // Register may register metadata, functions, table functions, storage helpers,
 // or other supported public extension points on db. Returning an error leaves
 // the extension absent from DB.Extensions and sys.extensions.
+//
+// Register runs with the full privileges of the host process, unsandboxed,
+// exactly like any other imported Go package's init-time code: DB.Use is not
+// a permission boundary, so only activate extensions whose source you trust.
 type Extension interface {
 	ExtensionInfo() ExtensionInfo
 	Register(db *DB) error

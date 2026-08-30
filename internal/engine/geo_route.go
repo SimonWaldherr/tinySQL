@@ -103,57 +103,67 @@ func routeGraphKey(tenant string, table *storage.Table, sourceCol, targetCol, we
 
 // getRouteGraph returns an immutable adjacency graph for the current table
 // version and coalesces concurrent cold builds for the same routing shape.
-func getRouteGraph(ctx context.Context, tenant string, table *storage.Table, sourceCol, targetCol, weightCol, direction string) (*routeGraph, error) {
+// getRouteGraph returns the cached (or freshly built) route graph, plus
+// whether this specific call observed a cache hit -- true whenever it did not
+// pay the build cost itself, including waiting for another goroutine's
+// in-flight build. ROUTE_WARM reports this directly instead of separately
+// peeking the cache before calling in, which could observe a different
+// answer than what this call actually experienced under concurrent access.
+func getRouteGraph(ctx context.Context, tenant string, table *storage.Table, sourceCol, targetCol, weightCol, direction string) (*routeGraph, bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	key := routeGraphKey(tenant, table, sourceCol, targetCol, weightCol, direction)
 
-	routeGraphCacheState.RLock()
-	entry, ok := routeGraphCacheState.entries[key]
-	routeGraphCacheState.RUnlock()
-	if ok && entry.table == table && entry.version == table.Version {
-		return entry.graph, nil
-	}
+	for {
+		routeGraphCacheState.RLock()
+		entry, ok := routeGraphCacheState.entries[key]
+		routeGraphCacheState.RUnlock()
+		if ok && entry.table == table && entry.version == table.Version {
+			return entry.graph, true, nil
+		}
 
-	routeGraphCacheState.Lock()
-	entry, ok = routeGraphCacheState.entries[key]
-	if ok && entry.table == table && entry.version == table.Version {
-		routeGraphCacheState.Unlock()
-		return entry.graph, nil
-	}
-	if call := routeGraphCacheState.builds[key]; call != nil {
-		routeGraphCacheState.Unlock()
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-call.done:
-			// A canceled first caller must not make every healthy waiter fail.
-			// Retry so one of them becomes the next builder under its own context.
-			if call.err != nil && ctx.Err() == nil {
-				return getRouteGraph(ctx, tenant, table, sourceCol, targetCol, weightCol, direction)
+		routeGraphCacheState.Lock()
+		entry, ok = routeGraphCacheState.entries[key]
+		if ok && entry.table == table && entry.version == table.Version {
+			routeGraphCacheState.Unlock()
+			return entry.graph, true, nil
+		}
+		if call := routeGraphCacheState.builds[key]; call != nil {
+			routeGraphCacheState.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, false, ctx.Err()
+			case <-call.done:
+				// A canceled first caller must not make every healthy waiter fail.
+				// Loop so one of them becomes the next builder under its own
+				// context, instead of recursing: a persistently failing build
+				// would otherwise grow one stack frame per concurrent waiter.
+				if call.err != nil && ctx.Err() == nil {
+					continue
+				}
+				return call.graph, true, call.err
 			}
-			return call.graph, call.err
 		}
-	}
-	call := &routeGraphBuildCall{done: make(chan struct{})}
-	routeGraphCacheState.builds[key] = call
-	routeGraphCacheState.Unlock()
+		call := &routeGraphBuildCall{done: make(chan struct{})}
+		routeGraphCacheState.builds[key] = call
+		routeGraphCacheState.Unlock()
 
-	version := table.Version
-	call.graph, call.err = buildRouteGraph(ctx, table, sourceCol, targetCol, weightCol, direction)
+		version := table.Version
+		call.graph, call.err = buildRouteGraph(ctx, table, sourceCol, targetCol, weightCol, direction)
 
-	routeGraphCacheState.Lock()
-	delete(routeGraphCacheState.builds, key)
-	if call.err == nil && table.Version == version {
-		if _, exists := routeGraphCacheState.entries[key]; !exists {
-			evictOverCap(routeGraphCacheState.entries, routeGraphCacheMaxEntries)
+		routeGraphCacheState.Lock()
+		delete(routeGraphCacheState.builds, key)
+		if call.err == nil && table.Version == version {
+			if _, exists := routeGraphCacheState.entries[key]; !exists {
+				evictOverCap(routeGraphCacheState.entries, routeGraphCacheMaxEntries)
+			}
+			routeGraphCacheState.entries[key] = routeGraphCacheEntry{table: table, version: version, graph: call.graph}
 		}
-		routeGraphCacheState.entries[key] = routeGraphCacheEntry{table: table, version: version, graph: call.graph}
+		close(call.done)
+		routeGraphCacheState.Unlock()
+		return call.graph, false, call.err
 	}
-	close(call.done)
-	routeGraphCacheState.Unlock()
-	return call.graph, call.err
 }
 
 func purgeRouteGraphCachesFor(tenant, table string) {
@@ -806,7 +816,7 @@ func (f *RouteShortestPathTableFunc) Execute(ctx context.Context, args []Expr, e
 	if ctx == nil {
 		ctx = env.ctx
 	}
-	g, err := getRouteGraph(ctx, tenant, table, sourceCol, targetCol, weightCol, direction)
+	g, _, err := getRouteGraph(ctx, tenant, table, sourceCol, targetCol, weightCol, direction)
 	if err != nil {
 		return nil, fmt.Errorf("ROUTE_SHORTEST_PATH: %w", err)
 	}
@@ -883,7 +893,7 @@ func evalRouteDistance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if tenant == "" {
 		tenant = "default"
 	}
-	g, err := getRouteGraph(env.ctx, tenant, table, sourceCol, targetCol, weightCol, direction)
+	g, _, err := getRouteGraph(env.ctx, tenant, table, sourceCol, targetCol, weightCol, direction)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", ex.Name, err)
 	}

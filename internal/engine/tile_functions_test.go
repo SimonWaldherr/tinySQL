@@ -370,6 +370,15 @@ func TestOGCTileHelpers(t *testing.T) {
 	if got := tileEval(t, "WMS_BBOX(11, 48, 12, 49, 'EPSG:4326', '1.1.1')"); got != "11,48,12,49" {
 		t.Fatalf("WMS 1.1.1 bbox = %v", got)
 	}
+	if got := tileEval(t, "WMS_BBOX(4000000, 2000000, 5000000, 3000000, 'EPSG:3035')"); got != "2000000,4000000,3000000,5000000" {
+		t.Fatalf("WMS INSPIRE EPSG:3035 axis order = %v", got)
+	}
+	if got := tileEval(t, "WMS_BBOX(1, 2, 3, 4, 'EPSG:999999', '1.3.0', 'north,east')"); got != "2,1,4,3" {
+		t.Fatalf("WMS explicit axis order = %v", got)
+	}
+	if got := tileEval(t, "WMS_BBOX(1, 2, 3, 4, 'EPSG:999999', '1.1.1', 'yx')"); got != "1,2,3,4" {
+		t.Fatalf("WMS 1.1 explicit axis order must remain xy = %v", got)
+	}
 
 	raw := tileEval(t, "TILE_BBOX_3857(0, 0, 0)").(string)
 	var bbox []float64
@@ -380,6 +389,55 @@ func TestOGCTileHelpers(t *testing.T) {
 	if math.Abs(bbox[0]+extent) > 1e-6 || math.Abs(bbox[1]+extent) > 1e-6 ||
 		math.Abs(bbox[2]-extent) > 1e-6 || math.Abs(bbox[3]-extent) > 1e-6 {
 		t.Fatalf("zoom-0 projected bbox = %v, want world extent +/- %v", bbox, extent)
+	}
+}
+
+func TestOGCTileMatrixHelpers(t *testing.T) {
+	// A generic top-left matrix in metres: each 256px tile spans 2560 m.
+	raw := tileEval(t, "TILE_MATRIX_BBOX(100000, 500000, 10, 256, 256, 2, 3)").(string)
+	var bbox []float64
+	if err := json.Unmarshal([]byte(raw), &bbox); err != nil {
+		t.Fatal(err)
+	}
+	want := []float64{105120, 489760, 107680, 492320}
+	for i := range want {
+		if bbox[i] != want[i] {
+			t.Fatalf("topLeft bbox = %v, want %v", bbox, want)
+		}
+	}
+
+	bottom := tileEval(t, "WMTS_TILE_BBOX(100000, 200000, 10, 256, 256, 2, 3, 'bottomLeft')").(string)
+	if err := json.Unmarshal([]byte(bottom), &bbox); err != nil {
+		t.Fatal(err)
+	}
+	want = []float64{105120, 207680, 107680, 210240}
+	for i := range want {
+		if bbox[i] != want[i] {
+			t.Fatalf("bottomLeft bbox = %v, want %v", bbox, want)
+		}
+	}
+
+	position := tileEval(t, "TILE_MATRIX_POSITION(105121, 492319, 100000, 500000, 10, 256, 256)").(string)
+	var index struct {
+		Col int `json:"tile_col"`
+		Row int `json:"tile_row"`
+	}
+	if err := json.Unmarshal([]byte(position), &index); err != nil {
+		t.Fatal(err)
+	}
+	if index.Col != 2 || index.Row != 3 {
+		t.Fatalf("matrix position = %#v, want col 2 row 3", index)
+	}
+
+	for _, sql := range []string{
+		"TILE_MATRIX_BBOX(0, 0, 0, 256, 256, 0, 0)",
+		"TILE_MATRIX_BBOX(0, 0, 1, 256, 256, -1, 0)",
+		"TILE_MATRIX_BBOX(0, 0, 1, 256, 256, 0, 0, 'centre')",
+		"TILE_MATRIX_POSITION(-1, 1, 0, 0, 1, 256, 256)",
+	} {
+		if err := tileEvalErr(t, sql); err == nil {
+			t.Errorf("%s should fail", sql)
+		}
 	}
 }
 

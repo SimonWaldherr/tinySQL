@@ -16,6 +16,12 @@ type ImportOptions = ii.ImportOptions
 // ImportResult contains metadata about an import operation.
 type ImportResult = ii.ImportResult
 
+// GeoPackageInfo describes an OGC GeoPackage and its vector feature layers.
+type GeoPackageInfo = ii.GeoPackageInfo
+
+// GeoPackageLayer describes one standards-discovered GeoPackage feature table.
+type GeoPackageLayer = ii.GeoPackageLayer
+
 // FuzzyImportOptions extends ImportOptions with tolerant parsing behavior.
 type FuzzyImportOptions = ii.FuzzyImportOptions
 
@@ -79,6 +85,21 @@ func ImportShapefileZip(ctx context.Context, db *tinysql.DB, tenant, tableName s
 // ImportOSM imports OSM XML (.osm or .osm.xml) from src.
 func ImportOSM(ctx context.Context, db *tinysql.DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
 	return ii.ImportOSM(ctx, db, tenant, tableName, src, opts)
+}
+
+// InspectGeoPackage lists OGC GeoPackage feature layers without importing rows.
+func InspectGeoPackage(ctx context.Context, filePath string) (*GeoPackageInfo, error) {
+	return ii.InspectGeoPackage(ctx, filePath)
+}
+
+// ImportGeoPackage imports one OGC GeoPackage feature layer from a path.
+func ImportGeoPackage(ctx context.Context, db *tinysql.DB, tenant, tableName, filePath string, opts *ImportOptions) (*ImportResult, error) {
+	return ii.ImportGeoPackage(ctx, db, tenant, tableName, filePath, opts)
+}
+
+// ImportGeoPackageReader imports one OGC GeoPackage feature layer from a stream.
+func ImportGeoPackageReader(ctx context.Context, db *tinysql.DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
+	return ii.ImportGeoPackageReader(ctx, db, tenant, tableName, src, opts)
 }
 
 // ImportMBTiles imports tiles from an MBTiles SQLite database path.

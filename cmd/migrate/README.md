@@ -3,7 +3,7 @@
 Part of [tinySQL](../../README.md). See the root guide for supported import
 formats, export behavior, and optional build tags.
 
-CLI for data pipelines. Moves data between CSV/TSV/JSON/YAML/XML files,
+CLI for data pipelines. Moves structured and geospatial standard formats,
 tinySQL, and external databases (MySQL/MariaDB, PostgreSQL, SQLite, MS SQL
 Server), using tinySQL as an in-memory hub: data can be queried, joined,
 filtered, and aggregated with SQL before it is routed to any output target.
@@ -17,6 +17,9 @@ make build-migrate
 # or
 cd cmd/migrate && go build -o ../../bin/migrate .
 
+# Adds local SQLite, OGC GeoPackage, and MBTiles file support.
+cd cmd/migrate && go build -tags=sqliteimport -o ../../bin/migrate .
+
 cd cmd/migrate && go test ./...
 ```
 
@@ -26,7 +29,7 @@ cd cmd/migrate && go test ./...
 |---------|-------------|
 | `web` | Start the web interface |
 | `interactive` (alias `repl`) | Start the REPL |
-| `import-file` | Import a CSV/TSV/JSON/YAML/XML file into tinySQL |
+| `import-file` | Import a structured or geospatial standard file into tinySQL |
 | `import-db` | Import from an external database into tinySQL |
 | `export-file` | Export tinySQL data to a CSV/JSON file |
 | `export-db` | Export tinySQL data to an external database |
@@ -80,7 +83,7 @@ migrate import-file -file users.yaml -table users
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-file` | Path to CSV/TSV/JSON/YAML/XML file (or positional arg) | Required |
+| `-file` | Path to a supported structured/geospatial file (or positional arg) | Required |
 | `-table` | Target table name | Filename without extension |
 | `-query` | SQL query to run after import | |
 | `-output` | Output file for query results | stdout |
@@ -241,6 +244,20 @@ Without a scheme prefix, common patterns are auto-detected:
 | JSON | `.json`, `.jsonl`, `.ndjson` | Array of objects, line-delimited JSON, nested structures |
 | YAML | `.yaml`, `.yml` | Sequence of mappings or a single mapping |
 | XML | `.xml` | Simple row-based XML; attributes or child elements become columns |
+| GeoJSON / TopoJSON | `.geojson`, `.topojson` | RFC 7946-style geometry or shared-arc topology |
+| KML / OSM XML | `.kml`, `.osm` | Portable exchange formats; OSM PBF is not yet supported |
+| OGC GeoPackage | `.gpkg`, `.gpkx`, `.geopackage` | Feature layers; requires `sqliteimport` |
+| MBTiles | `.mbtiles` | Standard tile container; requires `sqliteimport` |
+| ESRI Shapefile | `.shp`, `.zip` | Requires the optional `shapefile` build tag |
+| Routing graph | `.rg`, `.routinggraph`, `.graph.json` | Node/edge graph interchange |
+
+GeoPackage import reads the standard `gpkg_contents`,
+`gpkg_geometry_columns`, and `gpkg_spatial_ref_sys` catalog tables. A package
+with multiple feature layers must be imported through the public Go API with
+an explicit `GeoPackageLayer`; the CLI will not silently choose a layer.
+Projected coordinates remain in their native GeoPackageBinary representation
+unless an explicit safe conversion is requested. See the
+[geospatial standards guide](../../docs/geospatial-standards.md).
 
 Fuzzy import (`-fuzzy`, default on) applies to CSV and JSON and recovers from
 inconsistent column counts, unmatched quotes, numbers with thousand

@@ -368,6 +368,8 @@
       "SELECT ST_PERIMETER('{\"type\":\"Polygon\",\"coordinates\":[[[0,0],[0,1],[1,1],[1,0],[0,0]]]}') AS meters;",
       "SELECT ST_ASTEXT(ST_GEOMFROMTEXT('POLYGON((13.3 52.4,13.5 52.4,13.5 52.6,13.3 52.6,13.3 52.4))')) AS wkt;\nSELECT ST_ASEWKT(ST_MAKEPOINT(13.405, 52.520)) AS ewkt;",
       "SELECT ST_ASTEXT(ST_GEOMFROMWKB(ST_ASBINARY(ST_MAKEPOINT(13.405, 52.520)))) AS round_tripped;",
+      "SELECT GPKG_SRID(BLOB_FROM_HEX('47500001e6100000010100000000000000000027400000000000204840')) AS srid,\n       GPKG_HEADER(BLOB_FROM_HEX('47500001e6100000010100000000000000000027400000000000204840')) AS header,\n       ST_ASTEXT(GEO_FROM_GPKG(BLOB_FROM_HEX('47500001e6100000010100000000000000000027400000000000204840'))) AS point;",
+      "SELECT CRS_NORMALIZE('urn:ogc:def:crs:EPSG::25832') AS canonical_crs,\n       CRS_URI('EPSG:3035') AS definition_uri,\n       CRS_AXIS_ORDER('http://www.opengis.net/def/crs/EPSG/0/3035') AS axis_order,\n       CRS_INFO('EPSG:10732') AS german_dref91_profile;",
       "SELECT ST_ASGEOJSON(ST_MAKEPOINT(13.4049823, 52.5200066), 3) AS rounded_geojson;",
       "SELECT GEO_GEOHASH_ENCODE(ST_MAKEPOINT(13.405, 52.520), 8) AS geohash;\nSELECT ST_ASTEXT(GEO_GEOHASH_DECODE('u33dc0cp')) AS decoded_point;\nSELECT GEO_GEOHASH_BBOX('u33dc0cp') AS cell_bounds;\nSELECT GEO_GEOHASH_NEIGHBORS('u33dc0cp') AS surrounding_cells;",
       "SELECT ST_TRANSFORM(ST_MAKEPOINT(13.405, 52.520), 3857) AS web_mercator;",
@@ -396,6 +398,8 @@
       "SELECT TILE_PARENT(14, TILE_X(13.405, 14), TILE_Y(52.520, 14)) AS parent;",
       "SELECT TILE_COUNT(10) AS tiles_at_zoom_10;",
       "SELECT TILE_CONTAINS(14, TILE_X(13.405, 14), TILE_Y(52.520, 14), 13.405, 52.520) AS covers_point;",
+      "SELECT TILE_MATRIX_BBOX(100000, 500000, 10, 256, 256, 2, 3, 'topLeft') AS native_crs_bbox,\n       TILE_MATRIX_POSITION(105121, 492319, 100000, 500000, 10, 256, 256, 'topLeft') AS tile_index;",
+      "SELECT WMS_BBOX(4000000, 2000000, 5000000, 3000000, 'EPSG:3035', '1.3.0') AS inspire_laea_bbox,\n       WMS_BBOX(1, 2, 3, 4, 'EPSG:999999', '1.3.0', 'yx') AS explicit_private_crs_bbox;",
       "CREATE TABLE tile_lookup_demo (zoom_level INT, tile_column INT, tile_row INT, tile_data BLOB);\nINSERT INTO tile_lookup_demo VALUES\n    (14, TILE_X(13.405, 14), TILE_FLIP_Y(TILE_Y(52.520, 14), 14), BLOB_FROM_HEX('00'));\nSELECT tile_data FROM tile_lookup_demo\nWHERE zoom_level = 14\n  AND tile_column = TILE_X(13.405, 14)\n  AND tile_row = TILE_FLIP_Y(TILE_Y(52.520, 14), 14);\nDROP TABLE tile_lookup_demo;"
     ]
   }

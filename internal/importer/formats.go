@@ -22,7 +22,8 @@ import (
 
 // ImportFile detects the file format and imports it into a tinySQL table.
 // Supports: CSV, TSV, JSON, XML and common map data formats
-// (GeoJSON, KML, Shapefile, OSM XML, MBTiles, routing graph JSON/CSV/NDJSON).
+// (GeoJSON, KML, Shapefile, OSM XML, GeoPackage, MBTiles, routing graph
+// JSON/CSV/NDJSON).
 //
 // Parameters:
 //   - ctx: Context for cancellation
@@ -70,6 +71,9 @@ func ImportFile(
 		// MBTiles is a SQLite database; the importer needs random access to the
 		// file path rather than a stream.
 		return ImportMBTiles(ctx, db, tenant, tableName, filePath, opts)
+	case ".gpkg", ".gpkx", ".geopackage":
+		// GeoPackage is a standard SQLite container and needs random access.
+		return ImportGeoPackage(ctx, db, tenant, tableName, filePath, opts)
 	case ".pbf":
 		return nil, fmt.Errorf("OSM PBF import is not supported yet; convert %s to .osm XML first", filepath.Base(filePath))
 	}

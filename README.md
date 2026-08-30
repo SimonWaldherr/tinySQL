@@ -183,7 +183,7 @@ playground registers the same reusable demo set.
 ### Data and maps
 
 - CSV, TSV, JSON/NDJSON, XML, YAML, Excel, GeoJSON, TopoJSON, KML, OSM XML,
-  routing graphs, Shapefiles, and MBTiles import paths.
+  routing graphs, Shapefiles, OGC GeoPackage, and MBTiles import paths.
 - GeoJSON measurement, containment, relationship, editing, cleanup, region
   (dissolve/clip), and inspection functions, plus a spatial search index and
   choropleth classification (equal-interval, natural breaks, quantile) for
@@ -253,6 +253,17 @@ if err := tx.Commit(); err != nil { panic(err) }
 `SAVEPOINT` and nested transactions are not implemented.
 
 ## GIS and GeoJSON
+
+### Geospatial interoperability
+
+tinySQL supports OGC GeoPackage/GeoPackageBinary, OGC and ISO SQL/MM WKB,
+GeoJSON, EPSG and OGC CRS identifiers, WMS axis rules, OGC TileMatrix math,
+MBTiles, KML, and OSM XML. Common INSPIRE, AdV/BKG, and Bavarian CRS profiles
+are included in the CRS helpers.
+
+The detailed format matrix, implementation limits, and planned additions such
+as GML 3.2, WFS/OGC API, XPlanGML, NAS, GeoDCAT-AP, and COG are documented in
+[`docs/geospatial-standards.md`](./docs/geospatial-standards.md).
 
 tinySQL stores geometry as ordinary GeoJSON, either in a `TEXT`/`JSON` column
 or in the dedicated `GEOMETRY` column type, which validates on write (a bare
@@ -382,15 +393,20 @@ parameters, check validity, and download the result.
 | Render as WKT / EWKT | `GEO_AS_WKT`, `GEO_AS_EWKT` | `ST_ASTEXT`, `ST_ASEWKT` |
 | Parse/render WKB (BLOB or hex text) | `GEO_FROM_WKB`, `GEO_AS_WKB` | `ST_GEOMFROMWKB`, `ST_ASBINARY` |
 | Parse/render EWKB (adds an SRID header) | `GEO_FROM_WKB`, `GEO_AS_EWKB` | `ST_GEOMFROMEWKB`, `ST_ASEWKB` |
+| Inspect an OGC GeoPackageBinary BLOB | `GPKG_SRID`, `GPKG_BBOX`, `GPKG_HEADER`, `GPKG_IS_EMPTY` | — |
+| Extract WKB / decode WGS84 GeoPackageBinary | `GPKG_AS_WKB`, `GEO_FROM_GPKG` | `ST_GEOMFROMGPKG` |
 | Canonicalize/validate a GeoJSON value | `GEO_FROM_GEOJSON` | `ST_GEOMFROMGEOJSON` |
 | Render GeoJSON, optionally rounded | `GEO_AS_GEOJSON(geometry[, max_decimal_digits])` | `ST_ASGEOJSON` |
 | Encode/decode a geohash | `GEO_GEOHASH_ENCODE(point[, precision])`, `GEO_GEOHASH_DECODE` | `ST_GEOHASH` |
 | Geohash cell bounds / surrounding cells | `GEO_GEOHASH_BBOX`, `GEO_GEOHASH_NEIGHBORS` | — |
 | Reproject to/from Web Mercator | `GEO_TRANSFORM(geometry, srid)` | `ST_TRANSFORM` |
+| Normalize an EPSG/OGC CRS identifier | `CRS_NORMALIZE`, `CRS_URI`, `CRS_INFO` | — |
+| Inspect normative CRS axis order | `CRS_AXIS_ORDER` | — |
 
 WKT/WKB parsing accepts POINT/LINESTRING/POLYGON/MULTIPOINT/
 MULTILINESTRING/MULTIPOLYGON/GEOMETRYCOLLECTION, both 2D and `Z`-tagged 3D
-forms, `EMPTY`, and an optional EWKT `SRID=...;`/EWKB SRID header — but only
+forms, ISO SQL/MM and EWKB `Z`/`M`/`ZM` encodings, `EMPTY`, and an optional
+EWKT `SRID=...;`/EWKB SRID header — but only
 for SRID 4326 (or 0/absent, treated as 4326): tinySQL's geo layer is WGS84
 lon/lat throughout, so any other SRID is rejected with a pointer to
 `ST_TRANSFORM` rather than silently mislabeled. An OGC `M` (measure)
@@ -404,6 +420,9 @@ database this project has no appetite for vendoring.
 SELECT ST_ASTEXT(ST_GEOMFROMTEXT('POLYGON((13.3 52.4,13.5 52.4,13.5 52.6,13.3 52.6,13.3 52.4))')) AS wkt,
        ST_GEOHASH(ST_MAKEPOINT(13.405, 52.520), 8) AS geohash,
        ST_TRANSFORM(ST_MAKEPOINT(13.405, 52.520), 3857) AS web_mercator;
+
+SELECT CRS_NORMALIZE('urn:ogc:def:crs:EPSG::25832') AS crs,
+       CRS_AXIS_ORDER('http://www.opengis.net/def/crs/EPSG/0/3035') AS axes;
 ```
 
 ### Region operations, spatial search, and choropleth classification
@@ -578,13 +597,18 @@ WHERE zoom_level = 14
 Other tile helpers include `TILE_ZXY`, `TILE_BBOX`, `TILE_BBOX_3857`,
 `TILE_LON`, `TILE_LAT`, `TILE_QUADKEY`, `TILE_FROM_QUADKEY`, `TILE_PARENT`,
 `TILE_CONTAINS`, and `TILE_COUNT`. OGC/WMTS helpers expose projected
-meters-per-pixel and scale denominators, while `WMS_BBOX` handles the WMS 1.3
-axis-order trap for EPSG:4326/4258:
+meters-per-pixel and scale denominators. `TILE_MATRIX_BBOX` and
+`TILE_MATRIX_POSITION` work from the origin, cell size, tile dimensions and
+corner declared by an OGC TileMatrix, including non-Web-Mercator CRSs.
+`WMS_BBOX` applies WMS 1.3 CRS axis order for common OGC, INSPIRE,
+ETRS89, AdV and DHDN identifiers; an explicit final `xy`/`yx` argument covers
+other registered or private CRSs:
 
 ```sql
 SELECT TILE_RESOLUTION(14) AS meters_per_pixel,
        WMTS_SCALE_DENOMINATOR(14) AS scale_denominator,
-       WMS_BBOX(11, 48, 12, 49, 'EPSG:4326', '1.3.0') AS wms_bbox;
+       WMS_BBOX(11, 48, 12, 49, 'EPSG:4326', '1.3.0') AS wms_bbox,
+       TILE_MATRIX_BBOX(100000, 500000, 10, 256, 256, 2, 3, 'topLeft') AS native_crs_tile;
 
 -- Minimal XYZ/TMS set for prefetching a DTK/DOP viewport. The optional final
 -- argument is a hard materialization limit for offline/cache jobs.
@@ -600,7 +624,26 @@ Add an index before serving a regular tiles table:
 CREATE INDEX tile_index ON tiles (zoom_level, tile_column, tile_row);
 ```
 
-MBTiles import/export uses the optional `sqliteimport` build tag:
+GeoPackage and MBTiles access use the optional `sqliteimport` build tag.
+GeoPackage layer discovery reads the normative `gpkg_contents`,
+`gpkg_geometry_columns`, and `gpkg_spatial_ref_sys` catalogs:
+
+```go
+info, err := importer.InspectGeoPackage(ctx, "features.gpkg")
+result, err := importer.ImportGeoPackage(ctx, db, "default", "features",
+	"features.gpkg", &importer.ImportOptions{
+		CreateTable: true,
+		GeoPackageLayer: info.Layers[0].TableName,
+	})
+```
+
+`GeoPackageGeometryMode: "auto"` converts only EPSG:4326 feature geometry to
+GeoJSON. Geometry in EPSG:25832, EPSG:3035, DHDN or another projected/native
+CRS remains an intact GeoPackageBinary BLOB; use `"wkb"` to strip only its
+container header. This deliberately prevents metres from being silently
+treated as RFC 7946 longitude/latitude.
+
+MBTiles import/export uses the same build profile:
 
 ```go
 importer.ImportMBTiles(ctx, db, "default", "tiles", "city.mbtiles",
@@ -658,7 +701,7 @@ The core engine has no SQLite or Shapefile runtime dependency. Enable those
 read/write paths only in builds that need them:
 
 ```bash
-# SQLite files and MBTiles via pure-Go modernc SQLite (also required for
+# SQLite files, OGC GeoPackage, and MBTiles via pure-Go modernc SQLite (also required for
 # ModeSQLite — a real .sqlite file as tinySQL's native storage; see the
 # storage guide)
 go build -tags=sqliteimport ./...
@@ -673,6 +716,9 @@ go build -tags=sqliteimport,shapefile ./...
 Without a tag, the corresponding import API remains available and returns a
 feature-disabled error. The tags are not needed to serve a tileset already
 loaded into tinySQL.
+
+The interoperability policy and standards/profile matrix are documented in
+[`docs/geospatial-standards.md`](./docs/geospatial-standards.md).
 
 The `exporter` package writes result sets as CSV, TSV, JSON, NDJSON, XML, GOB,
 SQL, Excel (XLSX), GeoJSON, or TopoJSON. It preserves binary values with

@@ -15,7 +15,7 @@ func execStmt(env ExecEnv, stmt Statement) (*ResultSet, error) {
 			return nil, err
 		}
 	}
-	if !isReadOnlyStatement(stmt) {
+	if !isReadOnlyStatementWithProc(stmt, env.procedureOverride) {
 		// Nested trigger/procedure statements reuse their caller's content
 		// write lock and therefore bypass executeStatement. Keep their table
 		// mutations on the copy-on-write side of any active stream snapshot.
@@ -95,16 +95,30 @@ func execStmt(env ExecEnv, stmt Statement) (*ResultSet, error) {
 }
 
 func isReadOnlyStatement(stmt Statement) bool {
+	return isReadOnlyStatementWithProc(stmt, nil)
+}
+
+// isReadOnlyStatementWithProc is isReadOnlyStatement, but for a *CallProcedure
+// it uses resolved (when non-nil) instead of its own lookupStoredProcedure
+// call. executeStatement resolves the procedure once, up front, and passes
+// that single snapshot down so this decision, the rollback decision (see
+// needsStatementRollbackWithProc), and the actual dispatch in
+// executeCallProcedure all agree even if another goroutine calls
+// RegisterStoredProcedureWithOptions on the same name mid-statement.
+func isReadOnlyStatementWithProc(stmt Statement, resolved *storedProcedure) bool {
 	switch s := stmt.(type) {
 	case *Select, *Pragma:
 		return true
 	case *CallProcedure:
+		if resolved != nil {
+			return resolved.options.ReadOnly
+		}
 		procedure, ok := lookupStoredProcedure(s.Name)
 		return ok && procedure.options.ReadOnly
 	case *Explain:
 		// Plain EXPLAIN only inspects the statement. EXPLAIN ANALYZE executes
 		// it, so it must use the inner statement's lock classification.
-		return !s.Analyze || isReadOnlyStatement(s.Statement)
+		return !s.Analyze || isReadOnlyStatementWithProc(s.Statement, resolved)
 	default:
 		return false
 	}

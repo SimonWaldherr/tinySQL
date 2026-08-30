@@ -25,6 +25,11 @@ type ragVectorWarmResult struct {
 	err                                                     error
 }
 
+type ragFTSWarmResult struct {
+	entry ftsDocCacheEntry
+	err   error
+}
+
 func (f *RAGWarmTableFunc) Execute(ctx context.Context, args []Expr, env ExecEnv, row Row) (*ResultSet, error) {
 	if err := f.ValidateArgs(args); err != nil {
 		return nil, err
@@ -102,22 +107,53 @@ func (f *RAGWarmTableFunc) Execute(ctx context.Context, args []Expr, env ExecEnv
 
 	started := time.Now()
 	vectorDone := make(chan ragVectorWarmResult, 1)
-	ftsDone := make(chan ftsDocCacheEntry, 1)
+	ftsDone := make(chan ragFTSWarmResult, 1)
 	go func() {
+		defer func() {
+			// warmVectorStructures runs on its own goroutine, outside the
+			// recover() that protects the calling goroutine in
+			// executeStatement/execStmt -- without this, a panic here (e.g. on
+			// malformed vector data) would take down the whole process instead
+			// of failing this one RAG_WARM call.
+			if r := recover(); r != nil {
+				vectorDone <- ragVectorWarmResult{err: fmt.Errorf("panicked: %v", r)}
+			}
+		}()
 		rowCount, vectorCount, dims, distinctDims, excludedRows, warmErr := warmVectorStructures(ctx, tenant, table, vectorIndex, metric, indexMode)
 		vectorDone <- ragVectorWarmResult{rowCount, vectorCount, dims, distinctDims, excludedRows, warmErr}
 	}()
 	go func() {
-		ftsDone <- getFTSDocCache(tenant, table, []int{textIndex})
+		defer func() {
+			if r := recover(); r != nil {
+				ftsDone <- ragFTSWarmResult{err: fmt.Errorf("panicked: %v", r)}
+			}
+		}()
+		ftsDone <- ragFTSWarmResult{entry: getFTSDocCache(tenant, table, []int{textIndex})}
 	}()
-	vector := <-vectorDone
-	fts := <-ftsDone
+
+	// getFTSDocCache takes no context and warmVectorStructures's own ctx checks
+	// are best-effort, so a canceled/timed-out caller cannot make either
+	// goroutine stop early -- but the select below still lets this call return
+	// promptly instead of blocking until both finish regardless of ctx.
+	var vector ragVectorWarmResult
+	select {
+	case vector = <-vectorDone:
+	case <-ctx.Done():
+		return nil, fmt.Errorf("%s: %w", f.Name(), ctx.Err())
+	}
 	if vector.err != nil {
 		return nil, fmt.Errorf("%s vector warm: %w", f.Name(), vector.err)
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("%s: %w", f.Name(), err)
+	var ftsResult ragFTSWarmResult
+	select {
+	case ftsResult = <-ftsDone:
+	case <-ctx.Done():
+		return nil, fmt.Errorf("%s: %w", f.Name(), ctx.Err())
 	}
+	if ftsResult.err != nil {
+		return nil, fmt.Errorf("%s fts warm: %w", f.Name(), ftsResult.err)
+	}
+	fts := ftsResult.entry
 	postingCount := 0
 	for _, postings := range fts.postings {
 		postingCount += len(postings)

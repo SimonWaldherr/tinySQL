@@ -533,8 +533,19 @@ type StorageBackend = storage.StorageBackend
 type BackendStats = storage.BackendStats
 
 // ExtensionCapability describes a resource category a statically linked Go
-// extension declares it may need. Declarations are visible through
-// sys.extensions; capability enforcement is not implemented yet.
+// extension declares it may need (filesystem, network, write, secrets).
+//
+// A declaration is self-reported, unverified metadata: tinySQL never checks
+// it against what the extension's code actually does, and never will,
+// because a statically linked Go extension already runs as ordinary code in
+// the same process with the same privileges as the rest of the application —
+// there is no language-level sandbox boundary between it and the host to
+// enforce a capability against. Declarations exist so an operator can read
+// sys.extensions (or ExtensionInfo.Capabilities) and review what an
+// extension claims to need before calling db.Use, the same way you would
+// read a new dependency's imports before adding it — not as an access
+// control mechanism. Treat activating an extension exactly like adding any
+// other trusted Go dependency: only activate code you trust.
 type ExtensionCapability = storage.ExtensionCapability
 
 const (
@@ -545,6 +556,8 @@ const (
 )
 
 // ExtensionInfo describes a Go extension active for one DB instance.
+// Capabilities is the extension's own self-reported declaration -- see
+// ExtensionCapability -- not a verified or enforced permission set.
 type ExtensionInfo = storage.ExtensionInfo
 
 // Extension is implemented by statically linked Go extension packages. Import
@@ -552,6 +565,10 @@ type ExtensionInfo = storage.ExtensionInfo
 // db.Use(extension). Dynamic Go shared-object plugins are intentionally not
 // supported because they are not portable across tinySQL's Go, TinyGo, and
 // WebAssembly targets.
+//
+// Register runs with the full privileges of the host process, unsandboxed,
+// exactly like any other imported Go package's init-time code: db.Use is not
+// a permission boundary, so only activate extensions whose source you trust.
 type Extension = storage.Extension
 
 // ============================================================================
@@ -1292,6 +1309,12 @@ type ImportOptions = importer.ImportOptions
 // Contains metadata about the import operation.
 type ImportResult = importer.ImportResult
 
+// GeoPackageInfo describes an OGC GeoPackage and its vector feature layers.
+type GeoPackageInfo = importer.GeoPackageInfo
+
+// GeoPackageLayer describes one standards-discovered GeoPackage feature table.
+type GeoPackageLayer = importer.GeoPackageLayer
+
 // ImportFile imports a structured data file into a table.
 // The format is auto-detected from the file extension or content.
 //
@@ -1304,7 +1327,7 @@ type ImportResult = importer.ImportResult
 //   - GeoJSON (.geojson), KML (.kml), Shapefile (.shp)
 //   - Shapefile ZIP archives (.zip)
 //   - OSM XML (.osm, .osm.xml)
-//   - MBTiles (.mbtiles)
+//   - OGC GeoPackage (.gpkg, .gpkx) and MBTiles (.mbtiles)
 //   - Routing graph (.rg, .routinggraph)
 //   - Compressed (.gz) - Transparent gzip decompression
 //
@@ -1413,6 +1436,27 @@ func ImportShapefileZip(ctx context.Context, db *DB, tenant, tableName string, s
 // ImportOSM imports OSM XML (.osm or .osm.xml) from a reader.
 func ImportOSM(ctx context.Context, db *DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
 	return importer.ImportOSM(ctx, db, tenant, tableName, src, opts)
+}
+
+// InspectGeoPackage lists vector feature layers through the standard
+// gpkg_contents/gpkg_geometry_columns catalog. It requires -tags=sqliteimport.
+func InspectGeoPackage(ctx context.Context, filePath string) (*GeoPackageInfo, error) {
+	return importer.InspectGeoPackage(ctx, filePath)
+}
+
+// ImportGeoPackage imports one OGC GeoPackage feature layer. It requires
+// -tags=sqliteimport. Use ImportOptions.GeoPackageLayer for multi-layer files;
+// projected geometry remains in its native binary CRS unless explicitly
+// reprojected before requesting GeoJSON.
+func ImportGeoPackage(ctx context.Context, db *DB, tenant, tableName, filePath string, opts *ImportOptions) (*ImportResult, error) {
+	return importer.ImportGeoPackage(ctx, db, tenant, tableName, filePath, opts)
+}
+
+// ImportGeoPackageReader imports one OGC GeoPackage feature layer from a
+// reader by spooling it to a temporary random-access file. It requires
+// -tags=sqliteimport.
+func ImportGeoPackageReader(ctx context.Context, db *DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
+	return importer.ImportGeoPackageReader(ctx, db, tenant, tableName, src, opts)
 }
 
 // ImportMBTiles imports tiles from an MBTiles SQLite database path. It requires

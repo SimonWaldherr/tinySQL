@@ -18,7 +18,23 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 		recordAudit(ctx, db, tenant, stmt, err)
 		return nil, err
 	}
-	if isReadOnlyStatement(stmt) {
+
+	// A CALL's procedure is resolved once here rather than separately by
+	// every classification below (and again by executeCallProcedure): the
+	// registry is live and RegisterStoredProcedureWithOptions can replace a
+	// procedure's options at any moment, so independent lookups could
+	// disagree with each other mid-statement -- e.g. the lock choice below
+	// sees ReadOnly:true from an about-to-be-replaced registration while
+	// dispatch later sees the replacement's ReadOnly:false and runs a
+	// mutating handler under only a shared read lock.
+	var procedure *storedProcedure
+	if call, ok := statementCallProcedure(stmt); ok {
+		if proc, ok := lookupStoredProcedure(call.Name); ok {
+			procedure = &proc
+		}
+	}
+
+	if isReadOnlyStatementWithProc(stmt, procedure) {
 		db.LockContentForRead()
 		defer db.UnlockContentForRead()
 	} else {
@@ -36,7 +52,7 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 	// TABLE are logged too — a schema change that never reaches the log is
 	// replayed onto a database that no longer has the table.
 	var walBefore *storage.DB
-	if !isReadOnlyStatement(stmt) && db.StatementWAL() != nil {
+	if !isReadOnlyStatementWithProc(stmt, procedure) && db.StatementWAL() != nil {
 		walBefore = db.MetaSnapshot()
 	}
 
@@ -45,7 +61,7 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 
 	var snapshot *storage.StatementSnapshot
 	switch {
-	case needsStatementRollback(stmt):
+	case needsStatementRollbackWithProc(stmt, procedure):
 		var snapshotErr error
 		if table, rowIDs, ok := rowUpdateSnapshotTarget(plan); ok {
 			snapshot, snapshotErr = db.SnapshotForRowUpdateStatement(tenant, table, rowIDs)
@@ -91,7 +107,7 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 	}()
 
 	statementWAL := newStatementWAL(db)
-	rs, err = execStmt(ExecEnv{ctx: ctx, tenant: tenant, db: db, statementWAL: statementWAL, now: time.Now(), subqueryCache: newSubqueryResultCache(), dml: plan}, stmt)
+	rs, err = execStmt(ExecEnv{ctx: ctx, tenant: tenant, db: db, statementWAL: statementWAL, now: time.Now(), subqueryCache: newSubqueryResultCache(), dml: plan, procedureOverride: procedure, rollbackArmed: snapshot != nil}, stmt)
 	if err == nil {
 		err = statementWAL.commit()
 	}
@@ -104,7 +120,7 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 	// statement itself here rather than inferring it from that transaction
 	// state, otherwise CREATE TABLE inside BEGIN...COMMIT never asks the live
 	// database for its post-commit durability checkpoint.
-	if err == nil && !isReadOnlyStatement(stmt) && !isAtomicDML(stmt) {
+	if err == nil && !isReadOnlyStatementWithProc(stmt, procedure) && !isAtomicDML(stmt) {
 		// AdvancedWAL has row-level records for DML, but pure DDL/catalog
 		// statements have no row operation to grow its normal checkpoint
 		// counters. On a live DB, write the snapshot synchronously while this
@@ -466,15 +482,26 @@ func isAtomicDML(stmt Statement) bool {
 // also used to decide AdvancedWAL metadata checkpointing: an atomic procedure
 // may execute DDL as well as row changes and must not be mistaken for pure DML.
 func needsStatementRollback(stmt Statement) bool {
+	return needsStatementRollbackWithProc(stmt, nil)
+}
+
+// needsStatementRollbackWithProc is needsStatementRollback, but for a
+// *CallProcedure it uses resolved (when non-nil) instead of its own
+// lookupStoredProcedure call. See isReadOnlyStatementWithProc for why: one
+// resolution per statement, shared by every classification decision.
+func needsStatementRollbackWithProc(stmt Statement, resolved *storedProcedure) bool {
 	if isAtomicDML(stmt) {
 		return true
 	}
 	switch s := stmt.(type) {
 	case *CallProcedure:
+		if resolved != nil {
+			return resolved.options.Atomic
+		}
 		procedure, ok := lookupStoredProcedure(s.Name)
 		return ok && procedure.options.Atomic
 	case *Explain:
-		return s.Analyze && needsStatementRollback(s.Statement)
+		return s.Analyze && needsStatementRollbackWithProc(s.Statement, resolved)
 	default:
 		return false
 	}

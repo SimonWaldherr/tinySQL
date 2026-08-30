@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -63,7 +64,30 @@ func (pc ProcedureContext) Execute(stmt Statement) (*ResultSet, error) {
 	if err := checkPermission(pc.env.ctx, pc.env.db, stmt); err != nil {
 		return nil, err
 	}
-	return execStmt(pc.env, stmt)
+	// A nested CALL to an Atomic:true procedure needs its own rollback point:
+	// execStmt alone never takes one, so without this an atomic procedure
+	// composed inside a non-atomic (or plain) caller would silently keep its
+	// partial writes on error, contradicting StoredProcedureOptions.Atomic's
+	// promise. Skipped when an ancestor statement already armed a snapshot
+	// (pc.env.rollbackArmed) -- see ExecEnv.rollbackArmed: arming a second one
+	// here would steal catalog-mutation capture away from that ancestor's
+	// snapshot instead of adding coverage, since only one can be armed at a
+	// time.
+	call, isCall := stmt.(*CallProcedure)
+	if pc.env.rollbackArmed || !isCall || !needsStatementRollback(call) {
+		return execStmt(pc.env, stmt)
+	}
+	db := pc.env.db
+	snapshot := db.SnapshotForStatement()
+	nestedEnv := pc.env
+	nestedEnv.rollbackArmed = true
+	rs, err := execStmt(nestedEnv, stmt)
+	if err != nil {
+		db.RestoreStatementSnapshot(snapshot)
+		purgeCachesAfterRollback(db, snapshot)
+	}
+	db.ReleaseStatementSnapshot(snapshot)
+	return rs, err
 }
 
 // StoredProcedureFunc is the Go handler signature for in-memory stored
@@ -221,6 +245,22 @@ func lookupStoredProcedure(name string) (storedProcedure, bool) {
 	return proc, ok
 }
 
+// statementCallProcedure returns the *CallProcedure a statement will dispatch
+// to, unwrapping EXPLAIN ANALYZE the same way isReadOnlyStatementWithProc and
+// needsStatementRollbackWithProc do, so executeStatement resolves exactly the
+// procedure those two functions will classify.
+func statementCallProcedure(stmt Statement) (*CallProcedure, bool) {
+	switch s := stmt.(type) {
+	case *CallProcedure:
+		return s, true
+	case *Explain:
+		if s.Analyze {
+			return statementCallProcedure(s.Statement)
+		}
+	}
+	return nil, false
+}
+
 func publishProcedureRegistryLocked() {
 	snapshot := make(map[string]storedProcedure, len(procedureRegistry.items))
 	for name, procedure := range procedureRegistry.items {
@@ -289,9 +329,20 @@ func canonicalProcedureName(name string) string {
 }
 
 func executeCallProcedure(env ExecEnv, s *CallProcedure) (rs *ResultSet, err error) {
-	proc, ok := lookupStoredProcedure(s.Name)
-	if !ok {
-		return nil, fmt.Errorf("unknown stored procedure: %s", s.Name)
+	// env.procedureOverride, when set, is the exact resolution executeStatement
+	// already made for this statement (see ExecEnv.procedureOverride) -- reuse
+	// it instead of looking the name up again against the live registry, which
+	// closes the race window a concurrent RegisterStoredProcedureWithOptions
+	// could otherwise open between classification and dispatch.
+	var proc storedProcedure
+	if env.procedureOverride != nil {
+		proc = *env.procedureOverride
+	} else {
+		var ok bool
+		proc, ok = lookupStoredProcedure(s.Name)
+		if !ok {
+			return nil, fmt.Errorf("unknown stored procedure: %s", s.Name)
+		}
 	}
 	if proc.validateArgs && (len(s.Args) < proc.minArgs || len(s.Args) > proc.maxArgs) {
 		return nil, procedureArityError(proc, len(s.Args))
@@ -322,7 +373,12 @@ func executeCallProcedure(env ExecEnv, s *CallProcedure) (rs *ResultSet, err err
 			proc.stats.errors.Add(1)
 		}
 	}()
-	rs, err = proc.fn(ProcedureContext{env: env, readOnly: proc.options.ReadOnly}, args)
+	// procedureOverride was resolved for this exact CallProcedure statement;
+	// it must not leak into whatever statement the handler executes next via
+	// ProcedureContext.Execute, which resolves each nested CALL fresh.
+	nestedEnv := env
+	nestedEnv.procedureOverride = nil
+	rs, err = proc.fn(ProcedureContext{env: nestedEnv, readOnly: proc.options.ReadOnly}, args)
 	if err == nil && rs == nil {
 		rs = &ResultSet{}
 	}
@@ -344,7 +400,11 @@ func bindProcedureSQL(sql string, args []any) (string, error) {
 	literals := make([]string, len(args))
 	totalLiteralBytes := 0
 	for i, arg := range args {
-		literals[i] = procedureSQLLiteral(arg)
+		literal, err := procedureSQLLiteral(arg)
+		if err != nil {
+			return "", fmt.Errorf("stored procedure SQL argument %d: %w", i+1, err)
+		}
+		literals[i] = literal
 		totalLiteralBytes += len(literals[i])
 	}
 	var out strings.Builder
@@ -370,6 +430,34 @@ func bindProcedureSQL(sql string, args []any) (string, error) {
 			}
 			continue
 		}
+		// Comments must be skipped exactly like the SQL lexer's skipWS
+		// (lexer.go), or a '?' written inside one (e.g. a trailing "-- is this
+		// indexed?") is miscounted as a real placeholder.
+		if ch == '-' && i+1 < len(sql) && sql[i+1] == '-' {
+			out.WriteByte(ch)
+			out.WriteByte(sql[i+1])
+			i++
+			for i+1 < len(sql) && sql[i+1] != '\n' {
+				i++
+				out.WriteByte(sql[i])
+			}
+			continue
+		}
+		if ch == '/' && i+1 < len(sql) && sql[i+1] == '*' {
+			out.WriteByte(ch)
+			out.WriteByte(sql[i+1])
+			i++
+			for i+1 < len(sql) {
+				i++
+				out.WriteByte(sql[i])
+				if sql[i] == '*' && i+1 < len(sql) && sql[i+1] == '/' {
+					i++
+					out.WriteByte(sql[i])
+					break
+				}
+			}
+			continue
+		}
 		if ch != '?' {
 			out.WriteByte(ch)
 			continue
@@ -386,50 +474,62 @@ func bindProcedureSQL(sql string, args []any) (string, error) {
 	return out.String(), nil
 }
 
-func procedureSQLLiteral(value any) string {
+func procedureSQLLiteral(value any) (string, error) {
 	switch v := value.(type) {
 	case nil:
-		return "NULL"
+		return "NULL", nil
 	case int:
-		return strconv.Itoa(v)
+		return strconv.Itoa(v), nil
 	case int8:
-		return strconv.FormatInt(int64(v), 10)
+		return strconv.FormatInt(int64(v), 10), nil
 	case int16:
-		return strconv.FormatInt(int64(v), 10)
+		return strconv.FormatInt(int64(v), 10), nil
 	case int32:
-		return strconv.FormatInt(int64(v), 10)
+		return strconv.FormatInt(int64(v), 10), nil
 	case int64:
-		return strconv.FormatInt(v, 10)
+		return strconv.FormatInt(v, 10), nil
 	case uint:
-		return strconv.FormatUint(uint64(v), 10)
+		return strconv.FormatUint(uint64(v), 10), nil
 	case uint8:
-		return strconv.FormatUint(uint64(v), 10)
+		return strconv.FormatUint(uint64(v), 10), nil
 	case uint16:
-		return strconv.FormatUint(uint64(v), 10)
+		return strconv.FormatUint(uint64(v), 10), nil
 	case uint32:
-		return strconv.FormatUint(uint64(v), 10)
+		return strconv.FormatUint(uint64(v), 10), nil
 	case uint64:
-		return strconv.FormatUint(v, 10)
+		return strconv.FormatUint(v, 10), nil
 	case float32:
-		return strconv.FormatFloat(float64(v), 'f', -1, 32)
+		// tinySQL's grammar has no NaN/Infinity literal syntax: FormatFloat
+		// would render one as the bare word NaN/+Inf/-Inf, which the SQL
+		// parser reads back as an identifier (a column reference), not a
+		// number -- silently changing what the statement means instead of
+		// producing an error, exactly what ExecuteSQLArgs promises callers
+		// they are safe from.
+		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+			return "", fmt.Errorf("float32 value %v has no SQL literal representation", v)
+		}
+		return strconv.FormatFloat(float64(v), 'f', -1, 32), nil
 	case float64:
-		return strconv.FormatFloat(v, 'f', -1, 64)
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return "", fmt.Errorf("float64 value %v has no SQL literal representation", v)
+		}
+		return strconv.FormatFloat(v, 'f', -1, 64), nil
 	case bool:
 		if v {
-			return "TRUE"
+			return "TRUE", nil
 		}
-		return "FALSE"
+		return "FALSE", nil
 	case string:
-		return "'" + strings.ReplaceAll(v, "'", "''") + "'"
+		return "'" + strings.ReplaceAll(v, "'", "''") + "'", nil
 	case []byte:
-		return "X'" + hex.EncodeToString(v) + "'"
+		return "X'" + hex.EncodeToString(v) + "'", nil
 	case time.Time:
-		return "'" + v.Format(time.RFC3339Nano) + "'"
+		return "'" + v.Format(time.RFC3339Nano) + "'", nil
 	default:
 		encoded, err := json.Marshal(v)
 		if err != nil {
-			return "'" + strings.ReplaceAll(fmt.Sprint(v), "'", "''") + "'"
+			return "'" + strings.ReplaceAll(fmt.Sprint(v), "'", "''") + "'", nil
 		}
-		return "'" + strings.ReplaceAll(string(encoded), "'", "''") + "'"
+		return "'" + strings.ReplaceAll(string(encoded), "'", "''") + "'", nil
 	}
 }

@@ -334,6 +334,55 @@ func TestRouteWarmBuildsAndReusesGraph(t *testing.T) {
 	}
 }
 
+func TestRouteWarmConcurrentCacheHitIsConsistent(t *testing.T) {
+	// Regression test: ROUTE_WARM used to compute cache_hit from a peek taken
+	// before calling getRouteGraph, so under concurrent cold-cache calls a
+	// waiter that reused another goroutine's in-flight build (near-zero
+	// elapsed_ms) could still report cache_hit:false from its earlier, now
+	// stale peek -- a self-contradictory result. getRouteGraph now reports
+	// hit/miss itself, so exactly one of N concurrent cold-cache callers
+	// should ever see cache_hit:false: the one that actually built the graph.
+	db := storage.NewDB()
+	setupRouteEdges(t, db)
+	purgeRouteGraphCachesFor("default", "edges")
+
+	const callers = 16
+	type result struct {
+		hit bool
+		err error
+	}
+	results := make(chan result, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rs, err := Execute(context.Background(), db, "default", mustParse(`SELECT * FROM ROUTE_WARM('edges','source','target','cost')`))
+			if err != nil {
+				results <- result{err: err}
+				return
+			}
+			hit, _ := rs.Rows[0]["cache_hit"].(bool)
+			results <- result{hit: hit}
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	missCount := 0
+	for r := range results {
+		if r.err != nil {
+			t.Fatalf("ROUTE_WARM call failed: %v", r.err)
+		}
+		if !r.hit {
+			missCount++
+		}
+	}
+	if missCount != 1 {
+		t.Fatalf("got %d cache_hit:false results among %d concurrent ROUTE_WARM calls, want exactly 1", missCount, callers)
+	}
+}
+
 func TestRouteGraphCacheReuseInvalidationAndDropPurge(t *testing.T) {
 	db := storage.NewDB()
 	setupRouteEdges(t, db)
@@ -513,7 +562,7 @@ func BenchmarkRouteOneToManyCore(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	graph, err := getRouteGraph(context.Background(), "default", table, "source", "target", "cost", "directed")
+	graph, _, err := getRouteGraph(context.Background(), "default", table, "source", "target", "cost", "directed")
 	if err != nil {
 		b.Fatal(err)
 	}

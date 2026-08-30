@@ -4,12 +4,11 @@
 // typically arrives as a BLOB (e.g. a value read out of another database's
 // geometry column, or produced by a client library's ST_AsBinary).
 //
-// Only the standard, uncompressed OGC WKB encoding is implemented: 1 byte
-// byte-order marker, 4-byte little/big-endian geometry type code (optionally
-// OR'd with the EWKB 0x80000000 Z-flag and 0x20000000 SRID-flag bits), an
-// optional EWKB SRID, then coordinates. This covers what every mainstream
-// spatial database (PostGIS, SpatiaLite, SQL Server) emits; the ISO SQL/MM
-// variant's differently-numbered Z/M/ZM type codes are not handled.
+// The standard uncompressed OGC WKB encoding is implemented: 1 byte byte-
+// order marker, a 4-byte geometry type, then coordinates. Both EWKB Z/M/SRID
+// flag bits and the ISO SQL/MM +1000/+2000/+3000 Z/M/ZM type codes are
+// accepted. M is consumed and dropped because GeoJSON has no measure ordinate;
+// Z is preserved.
 package engine
 
 import (
@@ -17,6 +16,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+
+	"github.com/SimonWaldherr/tinySQL/internal/geoencoding"
 )
 
 func getGeoWKBFunctions() map[string]funcHandler {
@@ -45,254 +46,39 @@ const (
 	wkbGeometryCollection wkbGeometryType = 7
 )
 
-// EWKB's high-bit flags on the 4-byte type field (PostGIS's extension over
-// plain OGC WKB, not to be confused with the ISO SQL/MM +1000/+2000/+3000
-// numbering, which this reader does not need to special-case since it masks
-// down to the low byte before switching).
+// EWKB's high-bit flags are also used by the writer below. Decoding lives in
+// internal/geoencoding so GeoPackage and other standards-based importers share
+// exactly the same bounded parser as the SQL functions.
 const (
 	ewkbZFlag    uint32 = 0x80000000
-	ewkbMFlag    uint32 = 0x40000000
 	ewkbSRIDFlag uint32 = 0x20000000
-	wkbTypeMask  uint32 = 0x000000ff
 )
 
-type wkbReader struct {
-	data []byte
-	pos  int
-	ord  binary.ByteOrder
-}
-
-func (r *wkbReader) errorf(format string, args ...any) error {
-	return fmt.Errorf("WKB: %s (at byte %d)", fmt.Sprintf(format, args...), r.pos)
-}
-
-func (r *wkbReader) byte() (byte, error) {
-	if r.pos >= len(r.data) {
-		return 0, r.errorf("unexpected end of input")
-	}
-	b := r.data[r.pos]
-	r.pos++
-	return b, nil
-}
-
-func (r *wkbReader) uint32() (uint32, error) {
-	if r.pos+4 > len(r.data) {
-		return 0, r.errorf("unexpected end of input")
-	}
-	v := r.ord.Uint32(r.data[r.pos:])
-	r.pos += 4
-	return v, nil
-}
-
-func (r *wkbReader) float64() (float64, error) {
-	if r.pos+8 > len(r.data) {
-		return 0, r.errorf("unexpected end of input")
-	}
-	bits := r.ord.Uint64(r.data[r.pos:])
-	r.pos += 8
-	f := math.Float64frombits(bits)
-	if math.IsNaN(f) || math.IsInf(f, 0) {
-		return 0, r.errorf("non-finite coordinate")
-	}
-	return f, nil
-}
-
 // geoWKBMaxNesting mirrors geoWKTMaxNesting: bounds GeometryCollection
-// recursion against a hostile or corrupt input.
+// recursion in the writer. The shared decoder enforces the same bound.
 const geoWKBMaxNesting = 32
 
 // parseWKB decodes name's argument bytes as WKB or EWKB into a GeoJSON
 // geometry object.
 func parseWKB(name string, data []byte) (map[string]any, error) {
-	if len(data) > geoWKTMaxInputBytes {
-		return nil, fmt.Errorf("%s: WKB input is %d bytes, exceeding the %d byte limit", name, len(data), geoWKTMaxInputBytes)
-	}
-	r := &wkbReader{data: data}
-	obj, err := r.readGeometry(0)
+	decoded, err := geoencoding.DecodeWKB(data)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s: %w", name, err)
 	}
-	if r.pos != len(r.data) {
-		return nil, r.errorf("%d trailing byte(s) after geometry", len(r.data)-r.pos)
+	for _, srid := range decoded.SRIDs {
+		if err := geoRequireWGS84SRID(name, int64(srid)); err != nil {
+			return nil, err
+		}
 	}
-	return obj, nil
+	return decoded.Geometry, nil
 }
 
-func (r *wkbReader) readGeometry(depth int) (map[string]any, error) {
-	if depth > geoWKBMaxNesting {
-		return nil, r.errorf("GeometryCollection nested more than %d deep", geoWKBMaxNesting)
-	}
-	order, err := r.byte()
-	if err != nil {
-		return nil, err
-	}
-	switch order {
-	case 0:
-		r.ord = binary.BigEndian
-	case 1:
-		r.ord = binary.LittleEndian
-	default:
-		return nil, r.errorf("invalid byte order marker 0x%02x", order)
-	}
-
-	rawType, err := r.uint32()
-	if err != nil {
-		return nil, err
-	}
-	hasZ := rawType&ewkbZFlag != 0
-	hasSRID := rawType&ewkbSRIDFlag != 0
-	geomType := wkbGeometryType(rawType & wkbTypeMask)
-	// The ISO SQL/MM numbering (Point=1001/2001/3001 for Z/M/ZM instead of a
-	// flag bit) is folded down the same way: 1000s and 100s digits both
-	// encode a Z/M/ZM variant of the low three digits' base type.
-	if geomType > 100 {
-		hasZ = hasZ || (uint32(geomType)/1000) >= 1
-		geomType = wkbGeometryType(uint32(geomType) % 1000)
-	}
-
-	if hasSRID {
-		srid, err := r.uint32()
-		if err != nil {
-			return nil, err
-		}
-		if err := geoRequireWGS84SRID("WKB", int64(srid)); err != nil {
-			return nil, err
-		}
-	}
-
-	switch geomType {
-	case wkbPoint:
-		pos, err := r.readPosition(hasZ)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"type": "Point", "coordinates": pos}, nil
-	case wkbLineString:
-		coords, err := r.readPositionList(hasZ)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"type": "LineString", "coordinates": coords}, nil
-	case wkbPolygon:
-		coords, err := r.readPositionListList(hasZ)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"type": "Polygon", "coordinates": coords}, nil
-	case wkbMultiPoint:
-		return r.readWKBCollectionAsCoords("MultiPoint", depth, hasZ, func(child map[string]any) (any, error) {
-			if t, _ := child["type"].(string); t != "Point" {
-				return nil, r.errorf("MultiPoint member must be a Point, got %s", t)
-			}
-			return child["coordinates"], nil
-		})
-	case wkbMultiLineString:
-		return r.readWKBCollectionAsCoords("MultiLineString", depth, hasZ, func(child map[string]any) (any, error) {
-			if t, _ := child["type"].(string); t != "LineString" {
-				return nil, r.errorf("MultiLineString member must be a LineString, got %s", t)
-			}
-			return child["coordinates"], nil
-		})
-	case wkbMultiPolygon:
-		return r.readWKBCollectionAsCoords("MultiPolygon", depth, hasZ, func(child map[string]any) (any, error) {
-			if t, _ := child["type"].(string); t != "Polygon" {
-				return nil, r.errorf("MultiPolygon member must be a Polygon, got %s", t)
-			}
-			return child["coordinates"], nil
-		})
-	case wkbGeometryCollection:
-		count, err := r.uint32()
-		if err != nil {
-			return nil, err
-		}
-		geoms := make([]any, 0, count)
-		for i := uint32(0); i < count; i++ {
-			child, err := r.readGeometry(depth + 1)
-			if err != nil {
-				return nil, err
-			}
-			geoms = append(geoms, child)
-		}
-		return map[string]any{"type": "GeometryCollection", "geometries": geoms}, nil
-	default:
-		return nil, r.errorf("unsupported WKB geometry type code %d", geomType)
-	}
-}
-
-// readWKBCollectionAsCoords reads a Multi* geometry, which WKB encodes as a
-// count followed by that many full sub-geometries (each with its own byte
-// order and type header), and re-projects each parsed child down to just
-// its coordinates via extract -- the shape a GeoJSON Multi* needs.
-func (r *wkbReader) readWKBCollectionAsCoords(name string, depth int, _ bool, extract func(map[string]any) (any, error)) (map[string]any, error) {
-	count, err := r.uint32()
-	if err != nil {
-		return nil, err
-	}
-	coords := make([]any, 0, count)
-	for i := uint32(0); i < count; i++ {
-		child, err := r.readGeometry(depth + 1)
-		if err != nil {
-			return nil, err
-		}
-		c, err := extract(child)
-		if err != nil {
-			return nil, err
-		}
-		coords = append(coords, c)
-	}
-	return map[string]any{"type": name, "coordinates": coords}, nil
-}
-
-func (r *wkbReader) readPosition(hasZ bool) ([]any, error) {
-	x, err := r.float64()
-	if err != nil {
-		return nil, err
-	}
-	y, err := r.float64()
-	if err != nil {
-		return nil, err
-	}
-	pos := []any{x, y}
-	if hasZ {
-		z, err := r.float64()
-		if err != nil {
-			return nil, err
-		}
-		pos = append(pos, z)
-	}
-	return pos, nil
-}
-
-func (r *wkbReader) readPositionList(hasZ bool) ([]any, error) {
-	count, err := r.uint32()
-	if err != nil {
-		return nil, err
-	}
-	out := make([]any, 0, count)
-	for i := uint32(0); i < count; i++ {
-		pos, err := r.readPosition(hasZ)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, pos)
-	}
-	return out, nil
-}
-
-func (r *wkbReader) readPositionListList(hasZ bool) ([]any, error) {
-	count, err := r.uint32()
-	if err != nil {
-		return nil, err
-	}
-	out := make([]any, 0, count)
-	for i := uint32(0); i < count; i++ {
-		ring, err := r.readPositionList(hasZ)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, ring)
-	}
-	return out, nil
+// DecodeWKBGeometry exposes the standard WKB decoder to sibling internal
+// packages such as the service-independent GeoPackage importer. Callers are
+// responsible for CRS handling before treating the resulting coordinates as
+// RFC 7946 longitude/latitude.
+func DecodeWKBGeometry(data []byte) (map[string]any, error) {
+	return parseWKB("WKB", data)
 }
 
 // ---------------------------------------------------------------------------
@@ -544,7 +330,7 @@ func evalGeoFromWKB(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	}
 	obj, err := parseWKB(ex.Name, data)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", ex.Name, err)
+		return nil, err
 	}
 	body, err := json.Marshal(obj)
 	if err != nil {

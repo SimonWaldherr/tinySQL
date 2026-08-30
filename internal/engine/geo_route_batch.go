@@ -89,7 +89,7 @@ func routeReachable(ctx context.Context, g *routeGraph, start int, maxCost float
 	defer releaseRouteSearchScratch(scratch)
 	scratch.setDistance(start, 0)
 	routeHeapPush(&scratch.heap, routeHeapEntry{node: start, cost: 0})
-	result := make([]routeReachableNode, 0, minInt(len(g.nodeValues), reachableCapacityHint(limit)))
+	result := make([]routeReachableNode, 0, min(len(g.nodeValues), reachableCapacityHint(limit)))
 	for len(scratch.heap) > 0 {
 		current := routeHeapPop(&scratch.heap)
 		if current.cost != scratch.distance(current.node, inf) {
@@ -125,13 +125,6 @@ func reachableCapacityHint(limit int) int {
 		return limit
 	}
 	return 256
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 func evalRouteString(env ExecEnv, name string, args []Expr, row Row, index int) (string, error) {
@@ -185,7 +178,7 @@ func prepareRouteBatchGraph(ctx context.Context, env ExecEnv, name string, args 
 	if ctx == nil {
 		ctx = env.ctx
 	}
-	graph, err := getRouteGraph(ctx, tenant, table, sourceCol, targetCol, weightCol, direction)
+	graph, _, err := getRouteGraph(ctx, tenant, table, sourceCol, targetCol, weightCol, direction)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", name, err)
 	}

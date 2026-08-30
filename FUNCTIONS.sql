@@ -1504,6 +1504,23 @@ SELECT ST_ASEWKT(ST_MAKEPOINT(13.405, 52.520)) AS ewkt;
 -- WKB/EWKB interop: the binary sibling of WKT, as a BLOB or hex text.
 SELECT ST_ASTEXT(ST_GEOMFROMWKB(ST_ASBINARY(ST_MAKEPOINT(13.405, 52.520)))) AS round_tripped;
 
+-- OGC GeoPackageBinary interop works on any BLOB, independent of its source.
+-- Inspect/extract operations preserve every CRS. Conversion to GeoJSON is
+-- deliberately limited to WGS84 so projected metres are never relabelled as
+-- longitude/latitude. This sample is a little-endian EPSG:4326 Point without
+-- an optional envelope.
+SELECT GPKG_SRID(BLOB_FROM_HEX('47500001e6100000010100000000000000000027400000000000204840')) AS srid,
+       GPKG_HEADER(BLOB_FROM_HEX('47500001e6100000010100000000000000000027400000000000204840')) AS header,
+       ST_ASTEXT(GEO_FROM_GPKG(BLOB_FROM_HEX('47500001e6100000010100000000000000000027400000000000204840'))) AS point;
+
+-- CRS identifiers normalize across human EPSG labels, OGC URNs, and OGC
+-- definition URIs. Axis order follows the CRS definition (important for WMS
+-- 1.3 and the INSPIRE north/east variants).
+SELECT CRS_NORMALIZE('urn:ogc:def:crs:EPSG::25832') AS canonical_crs,
+       CRS_URI('EPSG:3035') AS definition_uri,
+       CRS_AXIS_ORDER('http://www.opengis.net/def/crs/EPSG/0/3035') AS axis_order,
+       CRS_INFO('EPSG:10732') AS german_dref91_profile;
+
 -- GEO_AS_GEOJSON / ST_ASGEOJSON: canonicalize (and optionally round) a
 -- GeoJSON value's coordinates.
 SELECT ST_ASGEOJSON(ST_MAKEPOINT(13.4049823, 52.5200066), 3) AS rounded_geojson;
@@ -1586,6 +1603,19 @@ SELECT TILE_COUNT(10) AS tiles_at_zoom_10;
 -- TILE_CONTAINS: whether a tile covers a point (edges belong to the tile on
 -- their north/west sides, matching TILE_X/TILE_Y's own assignment)
 SELECT TILE_CONTAINS(14, TILE_X(13.405, 14), TILE_Y(52.520, 14), 13.405, 52.520) AS covers_point;
+
+-- TILE_MATRIX_BBOX / WMTS_TILE_BBOX: address any OGC TileMatrix from its
+-- declared origin, cell size, tile dimensions, column and row. Coordinates
+-- remain in that TileMatrixSet's CRS; no provider or WebMercator preset is
+-- involved. TILE_MATRIX_POSITION performs the inverse lookup.
+SELECT TILE_MATRIX_BBOX(100000, 500000, 10, 256, 256, 2, 3, 'topLeft') AS native_crs_bbox,
+       TILE_MATRIX_POSITION(105121, 492319, 100000, 500000, 10, 256, 256, 'topLeft') AS tile_index;
+
+-- WMS_BBOX accepts EPSG labels as well as OGC CRS URIs/URNs. WMS 1.3 applies
+-- the registered CRS axis order; the optional final xy/yx argument makes an
+-- unregistered/private CRS explicit.
+SELECT WMS_BBOX(4000000, 2000000, 5000000, 3000000, 'EPSG:3035', '1.3.0') AS inspire_laea_bbox,
+       WMS_BBOX(1, 2, 3, 4, 'EPSG:999999', '1.3.0', 'yx') AS explicit_private_crs_bbox;
 
 -- A tiles table lookup, converting the client's XYZ row to the MBTiles TMS
 -- row stored on disk:

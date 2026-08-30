@@ -3,7 +3,10 @@ package engine
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -155,6 +158,175 @@ func TestAtomicStoredProcedureRollsBackNestedStatements(t *testing.T) {
 	if _, err := db.Get("default", "proc_atomic_created"); err == nil {
 		t.Fatal("atomic procedure retained a table created before its failure")
 	}
+}
+
+func TestBindProcedureSQLSkipsComments(t *testing.T) {
+	cases := []struct {
+		name string
+		sql  string
+		args []any
+		want string
+	}{
+		{
+			name: "line comment with question mark",
+			sql:  "SELECT * FROM t WHERE id = ? -- filter: is this indexed?\n",
+			args: []any{1},
+			want: "SELECT * FROM t WHERE id = 1 -- filter: is this indexed?\n",
+		},
+		{
+			name: "line comment with question mark, no trailing newline",
+			sql:  "SELECT ? -- trailing note?",
+			args: []any{1},
+			want: "SELECT 1 -- trailing note?",
+		},
+		{
+			name: "block comment with question mark",
+			sql:  "SELECT ? /* is this right? */ FROM t",
+			args: []any{1},
+			want: "SELECT 1 /* is this right? */ FROM t",
+		},
+		{
+			name: "unterminated block comment",
+			sql:  "SELECT ? /* trailing? note",
+			args: []any{1},
+			want: "SELECT 1 /* trailing? note",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := bindProcedureSQL(tc.sql, tc.args)
+			if err != nil {
+				t.Fatalf("bindProcedureSQL(%q): %v", tc.sql, err)
+			}
+			if got != tc.want {
+				t.Fatalf("bindProcedureSQL(%q) = %q, want %q", tc.sql, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestProcedureSQLLiteralRejectsNonFiniteFloats(t *testing.T) {
+	for _, v := range []any{math.NaN(), math.Inf(1), math.Inf(-1), float32(math.NaN())} {
+		if _, err := procedureSQLLiteral(v); err == nil {
+			t.Fatalf("procedureSQLLiteral(%v): expected an error, got none", v)
+		}
+	}
+	if _, err := bindProcedureSQL("SELECT ?", []any{math.NaN()}); err == nil {
+		t.Fatal("bindProcedureSQL with a NaN argument: expected an error, got none")
+	}
+}
+
+func TestNestedAtomicStoredProcedureRollsBack(t *testing.T) {
+	inner := "proc_nested_atomic_inner_test"
+	outer := "proc_nested_atomic_outer_test"
+	UnregisterStoredProcedure(inner)
+	UnregisterStoredProcedure(outer)
+	t.Cleanup(func() {
+		UnregisterStoredProcedure(inner)
+		UnregisterStoredProcedure(outer)
+	})
+	if err := RegisterStoredProcedureWithOptions(inner, StoredProcedureOptions{
+		Atomic: true,
+	}, func(ctx ProcedureContext, args []any) (*ResultSet, error) {
+		if _, err := ctx.ExecuteSQL(`CREATE TABLE proc_nested_atomic_created (id INT)`); err != nil {
+			return nil, err
+		}
+		if _, err := ctx.ExecuteSQL(`INSERT INTO proc_nested_atomic_rows VALUES (1)`); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("inner handler always fails")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Plain (non-atomic) outer procedure that composes the atomic inner one.
+	// Its own CALL is not classified for rollback, so before the fix nothing
+	// protected the inner procedure's writes even though it declared Atomic.
+	if err := RegisterStoredProcedure(outer, func(ctx ProcedureContext, args []any) (*ResultSet, error) {
+		_, err := ctx.ExecuteSQL(`CALL proc_nested_atomic_inner_test()`)
+		return nil, err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	db := storage.NewDB()
+	if _, err := Execute(context.Background(), db, "default", mustParse(`CREATE TABLE proc_nested_atomic_rows (id INT)`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Execute(context.Background(), db, "default", mustParse(`CALL proc_nested_atomic_outer_test()`)); err == nil {
+		t.Fatal("outer procedure unexpectedly succeeded")
+	}
+	rs, err := Execute(context.Background(), db, "default", mustParse(`SELECT COUNT(*) AS n FROM proc_nested_atomic_rows`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rs.Rows[0]["n"] != 0 {
+		t.Fatalf("nested atomic procedure retained a partial write: %#v", rs.Rows)
+	}
+	if _, err := db.Get("default", "proc_nested_atomic_created"); err == nil {
+		t.Fatal("nested atomic procedure retained a table created before its failure")
+	}
+}
+
+func TestCallProcedureRegistryHotSwapIsRaceFree(t *testing.T) {
+	// Regression test for a TOCTOU race: the content-lock choice (isReadOnlyStatement),
+	// the rollback-snapshot choice (needsStatementRollback) and the actual
+	// dispatch (executeCallProcedure) used to each call lookupStoredProcedure
+	// independently against the live registry. RegisterStoredProcedureWithOptions
+	// is a documented, supported hot-swap, so a concurrent re-registration
+	// between those independent lookups could let a statement locked as
+	// read-only dispatch to a since-swapped mutating handler -- a data race on
+	// the table it mutates, only visible under -race. Run with -race.
+	name := "proc_hotswap_race_test"
+	UnregisterStoredProcedure(name)
+	t.Cleanup(func() { UnregisterStoredProcedure(name) })
+
+	db := storage.NewDB()
+	if _, err := Execute(context.Background(), db, "default", mustParse(`CREATE TABLE proc_hotswap_rows (id INT)`)); err != nil {
+		t.Fatal(err)
+	}
+
+	readOnlyFn := func(ctx ProcedureContext, args []any) (*ResultSet, error) {
+		return ctx.ExecuteSQL(`SELECT COUNT(*) AS n FROM proc_hotswap_rows`)
+	}
+	writeFn := func(ctx ProcedureContext, args []any) (*ResultSet, error) {
+		return ctx.ExecuteSQL(`INSERT INTO proc_hotswap_rows VALUES (1)`)
+	}
+	if err := RegisterStoredProcedureWithOptions(name, StoredProcedureOptions{ReadOnly: true}, readOnlyFn); err != nil {
+		t.Fatal(err)
+	}
+
+	var done atomic.Bool
+	var hotswap sync.WaitGroup
+	hotswap.Add(1)
+	go func() {
+		defer hotswap.Done()
+		readOnly := true
+		for !done.Load() {
+			readOnly = !readOnly
+			fn := writeFn
+			if readOnly {
+				fn = readOnlyFn
+			}
+			_ = RegisterStoredProcedureWithOptions(name, StoredProcedureOptions{ReadOnly: readOnly}, fn)
+		}
+	}()
+
+	var callers sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		callers.Add(1)
+		go func() {
+			defer callers.Done()
+			for j := 0; j < 200; j++ {
+				// Either outcome (success, or a rejection of a mutating call
+				// under a read-only classification) is acceptable; only a
+				// data race or panic is a failure here.
+				_, _ = Execute(context.Background(), db, "default", mustParse(`CALL proc_hotswap_race_test()`))
+			}
+		}()
+	}
+	callers.Wait()
+	done.Store(true)
+	hotswap.Wait()
 }
 
 func TestReadOnlyStoredProceduresExecuteConcurrently(t *testing.T) {

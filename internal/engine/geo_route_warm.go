@@ -58,16 +58,17 @@ func (f *RouteWarmTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 	if err != nil {
 		return nil, fmt.Errorf("%s: table %q not found: %w", f.Name(), tableName, err)
 	}
-	key := routeGraphKey(tenant, table, sourceCol, targetCol, weightCol, direction)
-	routeGraphCacheState.RLock()
-	entry, cacheHit := routeGraphCacheState.entries[key]
-	cacheHit = cacheHit && entry.table == table && entry.version == table.Version
-	routeGraphCacheState.RUnlock()
 	if ctx == nil {
 		ctx = env.ctx
 	}
 	started := time.Now()
-	graph, err := getRouteGraph(ctx, tenant, table, sourceCol, targetCol, weightCol, direction)
+	// cacheHit comes from getRouteGraph itself rather than a separate peek
+	// taken before this call: under concurrent ROUTE_WARM calls, a peek could
+	// observe a miss right before another goroutine's build completes, then
+	// have this call's own getRouteGraph hit that fresh entry -- reporting
+	// cache_hit:false alongside a near-zero elapsed_ms, which contradicts
+	// itself.
+	graph, cacheHit, err := getRouteGraph(ctx, tenant, table, sourceCol, targetCol, weightCol, direction)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", f.Name(), err)
 	}

@@ -50,6 +50,12 @@ internally. It sends the appropriate content type/encoding from tileset
 metadata, ETags, and `Cache-Control` headers. Keep it disabled unless needed;
 put an authenticating proxy in front when a tileset must not be public.
 
+SQL clients can calculate TileMatrix positions, WMS bounding boxes, and CRS
+axis order with `TILE_MATRIX_BBOX`, `TILE_MATRIX_POSITION`, `WMS_BBOX`, and
+the CRS identifier functions. See the
+[geospatial standards guide](../../docs/geospatial-standards.md) for supported
+profiles and coordinate conventions.
+
 For a tileset larger than memory, use `-storage paged_index` for the published
 tile artifact. See the [root MBTiles guide](../../README.md#map-tiles-and-mbtiles)
 for the table shape, import/export, and indexing workflow.

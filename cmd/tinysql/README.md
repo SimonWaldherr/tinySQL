@@ -10,6 +10,9 @@ SQLite-style CLI for tinySQL: REPL, inline SQL, piped scripts,
 
 ```bash
 go build -o tinysql ./cmd/tinysql
+
+# Adds local SQLite, OGC GeoPackage, and MBTiles file support.
+go build -tags=sqliteimport -o tinysql ./cmd/tinysql
 ```
 
 ## Usage
@@ -90,7 +93,7 @@ running, Ctrl+C cancels that query and returns to the prompt.
 | `.read FILENAME` | Execute SQL in FILENAME |
 | `.save FILENAME` | Write in-memory database to FILENAME |
 | `.dump [TABLE...]` | Dump tables as INSERT statements |
-| `.import FILE [TABLE]` | Import a file into a table (CSV, TSV, JSON, GeoJSON, TopoJSON, KML, OSM XML, ...) |
+| `.import FILE [TABLE]` | Import a file into a table (CSV, JSON, GeoJSON, TopoJSON, KML, OSM XML, GeoPackage, MBTiles, ...) |
 | `.count [TABLE...]` | Show row counts |
 | `.stats` | Database statistics |
 
@@ -115,3 +118,23 @@ cat setup.sql | ./tinysql mydb.dat
 ./tinysql -output report.txt -mode json mydb.dat "SELECT * FROM sales"
 ./tinysql -mode jsonl -storage hybrid -memory-limit 256MiB data/ "SELECT * FROM sales"
 ```
+
+## Geospatial interoperability
+
+CRS identifiers, WMS bounding boxes, and TileMatrix coordinates can be
+calculated directly in SQL:
+
+```sql
+SELECT CRS_NORMALIZE('urn:ogc:def:crs:EPSG::25832'),
+       CRS_AXIS_ORDER('http://www.opengis.net/def/crs/EPSG/0/3035');
+
+SELECT WMS_BBOX(11, 48, 12, 49, 'EPSG:4326', '1.3.0'),
+       TILE_MATRIX_BBOX(100000, 500000, 10, 256, 256, 2, 3, 'topLeft');
+```
+
+`.import features.gpkg features` imports a single-layer OGC GeoPackage in a
+`sqliteimport` build. Use the public Go importer when a package has multiple
+feature layers and select one with `GeoPackageLayer`. Projected geometry is
+kept as GeoPackageBinary by default instead of being mislabeled as GeoJSON.
+See the [standards guide](../../docs/geospatial-standards.md) for supported
+profiles and format boundaries.

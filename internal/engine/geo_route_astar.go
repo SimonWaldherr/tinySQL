@@ -306,46 +306,35 @@ func evalRouteAStarArgs(env ExecEnv, name string, args []Expr, row Row) (table *
 		err = fmt.Errorf("%s requires (edge_table, source_col, target_col, weight_col, node_table, node_id_col, lat_col, lon_col, start_id, end_id, min_cost_per_metre [, direction]), got %d arguments", name, len(args))
 		return
 	}
-	stringAt := func(index int) (string, error) {
-		value, evalErr := evalExpr(env, args[index], row)
-		if evalErr != nil {
-			return "", evalErr
-		}
-		text, ok := value.(string)
-		if !ok {
-			return "", routeArgError(name, index, fmt.Errorf("expected a string, got %T", value))
-		}
-		return text, nil
-	}
-	edgeTableName, err := stringAt(0)
+	edgeTableName, err := evalRouteString(env, name, args, row, 0)
 	if err != nil {
 		return
 	}
-	sourceCol, err = stringAt(1)
+	sourceCol, err = evalRouteString(env, name, args, row, 1)
 	if err != nil {
 		return
 	}
-	targetCol, err = stringAt(2)
+	targetCol, err = evalRouteString(env, name, args, row, 2)
 	if err != nil {
 		return
 	}
-	weightCol, err = stringAt(3)
+	weightCol, err = evalRouteString(env, name, args, row, 3)
 	if err != nil {
 		return
 	}
-	nodeTableName, err := stringAt(4)
+	nodeTableName, err := evalRouteString(env, name, args, row, 4)
 	if err != nil {
 		return
 	}
-	nodeIDCol, err := stringAt(5)
+	nodeIDCol, err := evalRouteString(env, name, args, row, 5)
 	if err != nil {
 		return
 	}
-	latCol, err := stringAt(6)
+	latCol, err := evalRouteString(env, name, args, row, 6)
 	if err != nil {
 		return
 	}
-	lonCol, err := stringAt(7)
+	lonCol, err := evalRouteString(env, name, args, row, 7)
 	if err != nil {
 		return
 	}
@@ -381,7 +370,7 @@ func evalRouteAStarArgs(env ExecEnv, name string, args []Expr, row Row) (table *
 	}
 	direction = "directed"
 	if len(args) == 12 {
-		raw, directionErr := stringAt(11)
+		raw, directionErr := evalRouteString(env, name, args, row, 11)
 		if directionErr != nil {
 			err = directionErr
 			return
@@ -418,7 +407,7 @@ func prepareAStar(env ExecEnv, name string, args []Expr, row Row) (*routeGraph, 
 	if tenant == "" {
 		tenant = "default"
 	}
-	graph, err := getRouteGraph(env.ctx, tenant, table, sourceCol, targetCol, weightCol, direction)
+	graph, _, err := getRouteGraph(env.ctx, tenant, table, sourceCol, targetCol, weightCol, direction)
 	if err != nil {
 		return nil, nil, nil, 0, 0, 0, fmt.Errorf("%s: %w", name, err)
 	}
@@ -464,30 +453,19 @@ func evalRouteAirDistance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if len(ex.Args) != 6 {
 		return nil, fmt.Errorf("%s requires (node_table, node_id_col, lat_col, lon_col, start_id, end_id), got %d arguments", ex.Name, len(ex.Args))
 	}
-	stringAt := func(index int) (string, error) {
-		value, err := evalExpr(env, ex.Args[index], row)
-		if err != nil {
-			return "", err
-		}
-		text, ok := value.(string)
-		if !ok {
-			return "", routeArgError(ex.Name, index, fmt.Errorf("expected a string, got %T", value))
-		}
-		return text, nil
-	}
-	tableName, err := stringAt(0)
+	tableName, err := evalRouteString(env, ex.Name, ex.Args, row, 0)
 	if err != nil {
 		return nil, err
 	}
-	idCol, err := stringAt(1)
+	idCol, err := evalRouteString(env, ex.Name, ex.Args, row, 1)
 	if err != nil {
 		return nil, err
 	}
-	latCol, err := stringAt(2)
+	latCol, err := evalRouteString(env, ex.Name, ex.Args, row, 2)
 	if err != nil {
 		return nil, err
 	}
-	lonCol, err := stringAt(3)
+	lonCol, err := evalRouteString(env, ex.Name, ex.Args, row, 3)
 	if err != nil {
 		return nil, err
 	}

@@ -50,6 +50,9 @@ func getTileFunctions() map[string]funcHandler {
 		"WMTS_SCALE_DENOMINATOR": evalWMTSScaleDenominator,
 		"TILE_SCALE_DENOMINATOR": evalWMTSScaleDenominator,
 		"WMS_BBOX":               evalWMSBBox,
+		"TILE_MATRIX_BBOX":       evalTileMatrixBBox,
+		"WMTS_TILE_BBOX":         evalTileMatrixBBox,
+		"TILE_MATRIX_POSITION":   evalTileMatrixPosition,
 		"TILE_QUADKEY":           evalTileQuadkey,
 		"TILE_FROM_QUADKEY":      evalTileFromQuadkey,
 		"TILE_PARENT":            evalTileParent,
@@ -373,12 +376,14 @@ func evalWMTSScaleDenominator(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	return resolution.(float64) / wmtsStandardPixelMeters, nil
 }
 
-// WMS_BBOX(minX,minY,maxX,maxY,crs [,version]) formats a WMS BBOX parameter.
-// Inputs always use GIS x/y order. WMS 1.3 swaps EPSG:4326 and EPSG:4258 to
-// their declared latitude/longitude axis order; CRS:84 and projected CRSs
-// retain x/y. The default version is 1.3.0.
+// WMS_BBOX(minX,minY,maxX,maxY,crs [,version [,axis_order]]) formats a WMS
+// BBOX parameter. Inputs always use GIS x/y order. WMS 1.3 uses the declared
+// CRS axis order; the built-in CRS registry covers common OGC, INSPIRE, AdV,
+// ETRS89 and DHDN identifiers. An explicit axis_order (xy or yx, with common
+// descriptive spellings accepted) handles every other CRS without a service-
+// specific code path. WMS 1.1 retains x/y. The default version is 1.3.0.
 func evalWMSBBox(env ExecEnv, ex *FuncCall, row Row) (any, error) {
-	if err := requireArgs(ex.Name, ex, 5, 6); err != nil {
+	if err := requireArgs(ex.Name, ex, 5, 7); err != nil {
 		return nil, err
 	}
 	coords := [4]float64{}
@@ -401,7 +406,7 @@ func evalWMSBBox(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return nil, fmt.Errorf("%s: crs must be a non-empty string", ex.Name)
 	}
 	version := "1.3.0"
-	if len(ex.Args) == 6 {
+	if len(ex.Args) >= 6 {
 		versionValue, err := evalExpr(env, ex.Args[5], row)
 		if err != nil {
 			return nil, err
@@ -411,14 +416,157 @@ func evalWMSBBox(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 			return nil, fmt.Errorf("%s: version must be a non-empty string", ex.Name)
 		}
 	}
-	normalizedCRS := strings.ToUpper(strings.TrimSpace(crs))
-	axisLatLon := normalizedCRS == "EPSG:4326" || normalizedCRS == "EPSG:4258" ||
-		strings.HasSuffix(normalizedCRS, ":EPSG::4326") || strings.HasSuffix(normalizedCRS, "/EPSG/0/4326") ||
-		strings.HasSuffix(normalizedCRS, ":EPSG::4258") || strings.HasSuffix(normalizedCRS, "/EPSG/0/4258")
-	if strings.HasPrefix(strings.TrimSpace(version), "1.3") && axisLatLon {
+	swap := false
+	if len(ex.Args) == 7 {
+		axisValue, err := evalExpr(env, ex.Args[6], row)
+		if err != nil {
+			return nil, err
+		}
+		axis, ok := axisValue.(string)
+		if !ok || strings.TrimSpace(axis) == "" {
+			return nil, fmt.Errorf("%s: axis_order must be a non-empty string", ex.Name)
+		}
+		swap, err = parseExplicitAxisOrder(axis)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", ex.Name, err)
+		}
+	} else if id, err := parseCRSIdentifier(crs); err == nil {
+		swap, _ = crsNeedsYX(id)
+	}
+	if strings.HasPrefix(strings.TrimSpace(version), "1.3") && swap {
 		coords = [4]float64{coords[1], coords[0], coords[3], coords[2]}
 	}
 	return fmt.Sprintf("%.15g,%.15g,%.15g,%.15g", coords[0], coords[1], coords[2], coords[3]), nil
+}
+
+// TILE_MATRIX_BBOX(origin_x,origin_y,cell_size,tile_width,tile_height,
+// tile_col,tile_row [,corner]) returns a tile extent for an arbitrary OGC
+// TileMatrix. corner is topLeft (the default) or bottomLeft. Coordinates and
+// cell_size stay in the TileMatrixSet CRS, so this supports national and
+// European projected grids as well as WebMercatorQuad.
+func evalTileMatrixBBox(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if err := requireArgs(ex.Name, ex, 7, 8); err != nil {
+		return nil, err
+	}
+	values := [5]float64{}
+	for i := range values {
+		v, err := evalGeoFloatArg(env, ex, row, i)
+		if err != nil {
+			return nil, err
+		}
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return nil, fmt.Errorf("%s: matrix parameters must be finite", ex.Name)
+		}
+		values[i] = v
+	}
+	if values[2] <= 0 || values[3] <= 0 || values[4] <= 0 {
+		return nil, fmt.Errorf("%s: cell_size, tile_width, and tile_height must be positive", ex.Name)
+	}
+	col, err := tileNonNegativeIndexArg(env, ex, row, 5, "tile_col")
+	if err != nil {
+		return nil, err
+	}
+	rowIndex, err := tileNonNegativeIndexArg(env, ex, row, 6, "tile_row")
+	if err != nil {
+		return nil, err
+	}
+	corner, err := tileMatrixCornerArg(env, ex, row, 7)
+	if err != nil {
+		return nil, err
+	}
+	originX, originY, cellSize := values[0], values[1], values[2]
+	spanX, spanY := values[3]*cellSize, values[4]*cellSize
+	minX := originX + float64(col)*spanX
+	var minY, maxY float64
+	if corner == "topleft" {
+		maxY = originY - float64(rowIndex)*spanY
+		minY = maxY - spanY
+	} else {
+		minY = originY + float64(rowIndex)*spanY
+		maxY = minY + spanY
+	}
+	body, err := json.Marshal([]float64{minX, minY, minX + spanX, maxY})
+	if err != nil {
+		return nil, err
+	}
+	return string(body), nil
+}
+
+// TILE_MATRIX_POSITION(x,y,origin_x,origin_y,cell_size,tile_width,
+// tile_height [,corner]) returns {"tile_col":...,"tile_row":...} for an
+// arbitrary OGC TileMatrix.
+func evalTileMatrixPosition(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if err := requireArgs(ex.Name, ex, 7, 8); err != nil {
+		return nil, err
+	}
+	values := [7]float64{}
+	for i := range values {
+		v, err := evalGeoFloatArg(env, ex, row, i)
+		if err != nil {
+			return nil, err
+		}
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return nil, fmt.Errorf("%s: coordinates and matrix parameters must be finite", ex.Name)
+		}
+		values[i] = v
+	}
+	if values[4] <= 0 || values[5] <= 0 || values[6] <= 0 {
+		return nil, fmt.Errorf("%s: cell_size, tile_width, and tile_height must be positive", ex.Name)
+	}
+	corner, err := tileMatrixCornerArg(env, ex, row, 7)
+	if err != nil {
+		return nil, err
+	}
+	spanX, spanY := values[5]*values[4], values[6]*values[4]
+	col := int64(math.Floor((values[0] - values[2]) / spanX))
+	var matrixRow int64
+	if corner == "topleft" {
+		matrixRow = int64(math.Floor((values[3] - values[1]) / spanY))
+	} else {
+		matrixRow = int64(math.Floor((values[1] - values[3]) / spanY))
+	}
+	if col < 0 || matrixRow < 0 {
+		return nil, fmt.Errorf("%s: coordinate lies before the TileMatrix origin", ex.Name)
+	}
+	body, err := json.Marshal(map[string]int64{"tile_col": col, "tile_row": matrixRow})
+	if err != nil {
+		return nil, err
+	}
+	return string(body), nil
+}
+
+func tileNonNegativeIndexArg(env ExecEnv, ex *FuncCall, row Row, idx int, name string) (int, error) {
+	v, err := evalExpr(env, ex.Args[idx], row)
+	if err != nil {
+		return 0, err
+	}
+	n, err := toInt(v)
+	if err != nil || n < 0 {
+		if err == nil {
+			err = fmt.Errorf("must not be negative")
+		}
+		return 0, fmt.Errorf("%s %s: %w", ex.Name, name, err)
+	}
+	return n, nil
+}
+
+func tileMatrixCornerArg(env ExecEnv, ex *FuncCall, row Row, idx int) (string, error) {
+	if len(ex.Args) <= idx {
+		return "topleft", nil
+	}
+	v, err := evalExpr(env, ex.Args[idx], row)
+	if err != nil {
+		return "", err
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("%s: corner must be topLeft or bottomLeft", ex.Name)
+	}
+	normalized := strings.ToLower(strings.NewReplacer("_", "", "-", "", " ", "").Replace(strings.TrimSpace(s)))
+	if normalized != "topleft" && normalized != "bottomleft" {
+		return "", fmt.Errorf("%s: corner must be topLeft or bottomLeft", ex.Name)
+	}
+	return normalized, nil
 }
 
 // TILE_QUADKEY(zoom, x, y) returns the Bing Maps quadkey for an XYZ tile: one

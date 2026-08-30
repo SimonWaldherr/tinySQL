@@ -124,6 +124,8 @@ update-gh-pages` picks up regenerated files the same way it does `app.js`.
   RAG context expansion, joins/reporting
 - geodata examples: point extraction, distance matrices, radius filters,
   bounding boxes, zone membership, routing graph nodes, route edges,
+  EPSG/OGC CRS normalization, WMS 1.3 axis ordering, OGC TileMatrix
+  bounds/positions, and GeoPackageBinary inspection,
   `GEO_DISSOLVE`/`GEO_CENTROID_AGG` region aggregates, indexed `GEO_SEARCH`
   bbox lookups, `GEO_INTERSECTS`/`GEO_DISJOINT`/`GEO_CLIP` geometry relations
   and clipping, `GEO_CONVEX_HULL`/`GEO_ENVELOPE`/`GEO_LINE_INTERPOLATE`
@@ -149,6 +151,12 @@ update-gh-pages` picks up regenerated files the same way it does `app.js`.
   `CALL demo_find_functions('RAG%')`,
   `CALL demo_log_event('browser', 'demo')`, and
   `CALL demo_release_features()`
+
+Path-based OGC GeoPackage and MBTiles imports require the native
+`sqliteimport` build and are therefore not part of the WASM upload path; their
+SQL-level binary inspection helpers remain available. The profile matrix is
+documented in the
+[geospatial standards guide](../../docs/geospatial-standards.md).
 
 ## Keyboard shortcuts
 

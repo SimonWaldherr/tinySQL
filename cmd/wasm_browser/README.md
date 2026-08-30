@@ -40,6 +40,12 @@ cd web && python3 -m http.server 8080
 - SQL editor state, selected demo query, and the database snapshot are restored
   from `localStorage`
 - Export results as CSV or JSON
+- CRS, WMS axis-order, OGC TileMatrix, WKB/EWKB, and
+  GeoPackageBinary SQL functions from the generated function reference
+
+The browser build excludes the path-based `sqliteimport` GeoPackage/MBTiles
+reader. See the [geospatial standards guide](../../docs/geospatial-standards.md)
+for supported formats and CRS profiles.
 
 ## JavaScript API
 

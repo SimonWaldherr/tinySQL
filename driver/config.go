@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 // OpenConfig describes connection, DSN and database/sql settings for OpenWithConfig.
@@ -269,9 +271,12 @@ func validateOpenConfig(c OpenConfig, mode string) error {
 	}
 	storageMode := strings.ToLower(strings.TrimSpace(c.StorageMode))
 	if storageMode != "" {
-		switch storageMode {
-		case "memory", "mem", "ram", "wal", "disk", "index", "hybrid", "advanced_wal", "advancedwal", "json", "paged_index", "pagedindex", "page_index", "sqlite":
-		default:
+		// Delegate to the same alias table internal/driver's DSN layer uses at
+		// Open time (storage.ParseStorageMode), rather than a second,
+		// separately-maintained copy: a mode this switch accepted or rejected
+		// used to be able to drift from what the DSN's mode= option actually
+		// resolves once the connection opens.
+		if _, err := storage.ParseStorageMode(storageMode); err != nil {
 			return fmt.Errorf("tinysql: unsupported StorageMode %q", c.StorageMode)
 		}
 		if mode != "file" && storageMode != "memory" && storageMode != "mem" && storageMode != "ram" {
