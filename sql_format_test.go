@@ -49,3 +49,32 @@ func TestBeautifySQLSeparatesBlockComments(t *testing.T) {
 		t.Errorf("beautified output does not parse: %v\n%s", err, got)
 	}
 }
+
+func BenchmarkBeautifySQL(b *testing.B) {
+	sql := "SELECT id, name, email FROM users WHERE active = true AND age > 25 ORDER BY name"
+	for i := 0; i < b.N; i++ {
+		_ = BeautifySQL(sql)
+	}
+}
+
+func BenchmarkMinifySQL(b *testing.B) {
+	sql := "SELECT  id  ,  name  FROM  users  WHERE  active  =  true"
+	for i := 0; i < b.N; i++ {
+		_ = MinifySQL(sql)
+	}
+}
+
+func BenchmarkBeautifySQLComplex(b *testing.B) {
+	sql := `SELECT u.id, u.name, d.dept_name, p.project_name
+		FROM users u
+		JOIN departments d ON u.dept_id = d.id
+		LEFT JOIN projects p ON u.id = p.user_id
+		WHERE u.active = true AND d.status = 'active'
+		GROUP BY u.id, u.name, d.dept_name, p.project_name
+		HAVING COUNT(*) > 1
+		ORDER BY u.name
+		LIMIT 100`
+	for i := 0; i < b.N; i++ {
+		_ = BeautifySQL(sql)
+	}
+}

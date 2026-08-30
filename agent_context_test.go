@@ -68,3 +68,20 @@ func TestDefaultAgentContextConfig(t *testing.T) {
 		t.Fatalf("expected positive defaults, got %+v", cfg)
 	}
 }
+
+func BenchmarkBuildAgentContext(b *testing.B) {
+	ctx := context.Background()
+	for i := 0; i < b.N; i++ {
+		db := NewDB()
+		for _, sql := range []string{
+			"CREATE TABLE departments (id INT PRIMARY KEY, name TEXT)",
+			"CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, dept_id INT)",
+			"INSERT INTO departments VALUES (1, 'Engineering'), (2, 'Sales'), (3, 'HR')",
+			"INSERT INTO employees VALUES (1, 'Ada', 1), (2, 'Grace', 1), (3, 'Alan', 2)",
+		} {
+			stmt, _ := ParseSQL(sql)
+			Execute(ctx, db, "default", stmt)
+		}
+		_, _ = BuildAgentContext(ctx, db, "default", DefaultAgentContextConfig())
+	}
+}

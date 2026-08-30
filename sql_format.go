@@ -28,13 +28,9 @@ func BeautifySQL(sql string) string {
 		if sqlFormatClause[upper] {
 			newline()
 		}
-		if strings.HasPrefix(token, "--") || strings.HasPrefix(token, "/*") {
+		if len(token) >= 2 && ((token[0] == '-' && token[1] == '-') || (token[0] == '/' && token[1] == '*')) {
 			newline()
 			out.WriteString(token)
-			// newline() is a no-op while atLineStart is set, so without
-			// clearing it the closing newline never fired and the next token
-			// was appended straight onto the comment: "-- noteFROM t" put the
-			// FROM clause inside a line comment.
 			atLineStart = false
 			newline()
 			continue
@@ -94,23 +90,24 @@ var sqlFormatClause = map[string]bool{
 }
 
 func sqlFormatTokens(sql string) []string {
-	var tokens []string
+	tokens := make([]string, 0, 32)
 	for i := 0; i < len(sql); {
-		if strings.ContainsRune(" \t\r\n", rune(sql[i])) {
+		c := sql[i]
+		if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
 			i++
 			continue
 		}
 		start := i
-		if i+1 < len(sql) && sql[i:i+2] == "--" {
+		if i+1 < len(sql) && sql[i] == '-' && sql[i+1] == '-' {
 			for i < len(sql) && sql[i] != '\n' {
 				i++
 			}
 			tokens = append(tokens, sql[start:i])
 			continue
 		}
-		if i+1 < len(sql) && sql[i:i+2] == "/*" {
+		if i+1 < len(sql) && sql[i] == '/' && sql[i+1] == '*' {
 			i += 2
-			for i+1 < len(sql) && sql[i:i+2] != "*/" {
+			for i+1 < len(sql) && (sql[i] != '*' || sql[i+1] != '/') {
 				i++
 			}
 			if i+1 < len(sql) {
@@ -119,8 +116,9 @@ func sqlFormatTokens(sql string) []string {
 			tokens = append(tokens, sql[start:i])
 			continue
 		}
-		if sql[i] == '\'' || sql[i] == '"' || sql[i] == '`' {
-			quote := sql[i]
+		c = sql[i]
+		if c == '\'' || c == '"' || c == '`' {
+			quote := c
 			i++
 			for i < len(sql) {
 				if sql[i] == quote {
@@ -136,7 +134,7 @@ func sqlFormatTokens(sql string) []string {
 			tokens = append(tokens, sql[start:i])
 			continue
 		}
-		if sql[i] == '[' {
+		if c == '[' {
 			i++
 			for i < len(sql) && sql[i] != ']' {
 				i++
@@ -147,35 +145,52 @@ func sqlFormatTokens(sql string) []string {
 			tokens = append(tokens, sql[start:i])
 			continue
 		}
-		if isSQLWord(sql[i]) {
+		if isSQLWord(c) {
 			for i < len(sql) && isSQLWord(sql[i]) {
 				i++
 			}
 			tokens = append(tokens, sql[start:i])
 			continue
 		}
-		if i+1 < len(sql) && strings.Contains("<>!=|&", string(sql[i])) && strings.Contains("=<>|&", string(sql[i+1])) {
-			i += 2
-		} else {
-			i++
+		if i+1 < len(sql) {
+			c1, c2 := sql[i], sql[i+1]
+			if (c1 == '<' || c1 == '>' || c1 == '!' || c1 == '=' || c1 == '|' || c1 == '&') &&
+				(c2 == '=' || c2 == '<' || c2 == '>' || c2 == '|' || c2 == '&') {
+				i += 2
+				continue
+			}
 		}
+		i++
 		tokens = append(tokens, sql[start:i])
 	}
 	return tokens
 }
 
+var sqlWordTable [256]bool
+
+func init() {
+	for i := 0; i < 256; i++ {
+		b := byte(i)
+		sqlWordTable[i] = b == '_' || b == '$' || b == '.' ||
+			(b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+	}
+}
+
 func isSQLWord(b byte) bool {
-	return b == '_' || b == '$' || b == '.' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9'
+	return sqlWordTable[b]
 }
 func needsSQLSeparator(left, right string) bool {
 	if len(left) == 0 || len(right) == 0 {
 		return false
 	}
-	if strings.HasPrefix(left, "--") || strings.HasPrefix(left, "/*") || strings.HasPrefix(right, "--") || strings.HasPrefix(right, "/*") {
+	if (len(left) >= 2 && ((left[0] == '-' && left[1] == '-') || (left[0] == '/' && left[1] == '*'))) ||
+		(len(right) >= 2 && ((right[0] == '-' && right[1] == '-') || (right[0] == '/' && right[1] == '*'))) {
 		return true
 	}
-	leftWord, rightWord := isSQLWord(left[len(left)-1]), isSQLWord(right[0])
-	leftQuote := left[len(left)-1] == '\'' || left[len(left)-1] == '"' || left[len(left)-1] == '`' || left[len(left)-1] == ']'
+	ln := len(left) - 1
+	leftWord := isSQLWord(left[ln])
+	leftQuote := left[ln] == '\'' || left[ln] == '"' || left[ln] == '`' || left[ln] == ']'
+	rightWord := isSQLWord(right[0])
 	rightQuote := right[0] == '\'' || right[0] == '"' || right[0] == '`' || right[0] == '['
 	return (leftWord && rightWord) || (leftWord && rightQuote) || (leftQuote && rightWord)
 }

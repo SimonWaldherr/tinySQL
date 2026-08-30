@@ -55,7 +55,7 @@ func TestClassificationMethodsDisagree(t *testing.T) {
 	if eiClasses[2] {
 		t.Errorf("EQUAL_INTERVAL unexpectedly used the empty middle bin (class 2); classes seen: %v", eiClasses)
 	}
-	if !(nbClasses[1] && nbClasses[2] && nbClasses[3]) {
+	if !nbClasses[1] || !nbClasses[2] || !nbClasses[3] {
 		t.Errorf("NATURAL_BREAKS should use all 3 classes (no forced-empty class by construction); classes seen: %v", nbClasses)
 	}
 

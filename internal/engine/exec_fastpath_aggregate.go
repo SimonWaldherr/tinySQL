@@ -596,11 +596,11 @@ func simpleAggregateEligibleSelect(s *Select) bool {
 	// regardless of which of these let a query through, so this is purely a
 	// cheap pre-filter to skip attempting to build a plan for an ordinary
 	// non-aggregate SELECT.
-	if !(!s.Distinct && len(s.DistinctOn) <= 0 && len(s.CTEs) <= 0 && len(s.Joins) <= 0 &&
-		s.Union == nil &&
-		s.From.Table != "" && s.From.Subquery == nil && s.From.TableFunc == nil &&
-		(len(s.GroupBy) > 0 || anyAggInSelect(s.Projs)) &&
-		s.Pivot == nil && !isSQLiteSchemaTable(s.From.Table)) {
+	if s.Distinct || len(s.DistinctOn) > 0 || len(s.CTEs) > 0 || len(s.Joins) > 0 ||
+		s.Union != nil ||
+		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil ||
+		(len(s.GroupBy) == 0 && !anyAggInSelect(s.Projs)) ||
+		s.Pivot != nil || isSQLiteSchemaTable(s.From.Table) {
 		return false
 	}
 	return !isCatalogOrSysTableRef(s.From.Table)

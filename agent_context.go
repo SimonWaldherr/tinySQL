@@ -139,7 +139,8 @@ func BuildAgentContext(ctx context.Context, db *DB, tenant string, cfg AgentCont
 	builder.writeOneLineSection("triggers", cfg.MaxTriggers, func() ([]Row, error) {
 		return fetchRows(ctx, db, tenant, "SELECT name, table, timing, event FROM sys.triggers ORDER BY name")
 	}, func(row Row) string {
-		return fmt.Sprintf("%s on %s %s %s", rowString(row, "name"), rowString(row, "table"), rowString(row, "timing"), rowString(row, "event"))
+		name, table, timing, event := rowString(row, "name"), rowString(row, "table"), rowString(row, "timing"), rowString(row, "event")
+		return fmt.Sprintf("%s on %s %s %s", name, table, timing, event)
 	})
 	builder.writeOneLineSection("jobs", cfg.MaxJobs, func() ([]Row, error) {
 		return fetchRows(ctx, db, tenant, "SELECT name, schedule_type, enabled FROM catalog.jobs ORDER BY name")
@@ -148,11 +149,11 @@ func BuildAgentContext(ctx context.Context, db *DB, tenant string, cfg AgentCont
 		if rowBool(row, "enabled") {
 			state = "enabled"
 		}
-		schedule := rowString(row, "schedule_type")
+		name, schedule := rowString(row, "name"), rowString(row, "schedule_type")
 		if schedule == "" {
-			return fmt.Sprintf("%s[%s]", rowString(row, "name"), state)
+			return fmt.Sprintf("%s[%s]", name, state)
 		}
-		return fmt.Sprintf("%s[%s,%s]", rowString(row, "name"), schedule, state)
+		return fmt.Sprintf("%s[%s,%s]", name, schedule, state)
 	})
 	builder.writeOneLineSection("connections", cfg.MaxConnections, func() ([]Row, error) {
 		return fetchRows(ctx, db, tenant, "SELECT tenant, table_count, total_rows FROM sys.connections ORDER BY tenant")
@@ -386,7 +387,8 @@ func (b *agentContextBuilder) writeKeyValueSection(name string, limit int, fetch
 	}
 	parts := make([]string, 0, limit)
 	for i := 0; i < limit; i++ {
-		parts = append(parts, fmt.Sprintf("%s=%s", rowString(rows[i], "key"), rowString(rows[i], "value")))
+		key, val := rowString(rows[i], "key"), rowString(rows[i], "value")
+		parts = append(parts, fmt.Sprintf("%s=%s", key, val))
 	}
 	line := fmt.Sprintf("%s(%d/%d): %s", name, len(parts), len(rows), strings.Join(parts, ", "))
 	if len(parts) < len(rows) {
@@ -404,7 +406,7 @@ func rowString(row Row, name string) string {
 	if !ok || v == nil {
 		return ""
 	}
-	return fmt.Sprintf("%v", v)
+	return fmt.Sprint(v)
 }
 
 func rowBool(row Row, name string) bool {
@@ -415,7 +417,7 @@ func rowBool(row Row, name string) bool {
 	if b, ok := v.(bool); ok {
 		return b
 	}
-	return strings.EqualFold(fmt.Sprintf("%v", v), "true")
+	return strings.EqualFold(fmt.Sprint(v), "true")
 }
 
 func valueOrUnknown(values map[string]string, key string) string {
