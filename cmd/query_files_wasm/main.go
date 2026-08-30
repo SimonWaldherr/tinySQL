@@ -19,6 +19,7 @@ import (
 	"unicode"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
+	proceduredemo "github.com/SimonWaldherr/tinySQL/demos/procedures"
 )
 
 const (
@@ -63,24 +64,8 @@ func main() {
 }
 
 func registerDemoStoredProcedures() {
-	if err := tinysql.RegisterStoredProcedure("demo_table_summary", func(ctx tinysql.ProcedureContext, args []any) (*tinysql.ResultSet, error) {
-		return ctx.ExecuteSQL("SELECT name, columns, rows FROM sys.tables ORDER BY name")
-	}); err != nil {
-		println("Failed to register demo_table_summary:", err.Error())
-	}
-
-	if err := tinysql.RegisterStoredProcedure("demo_release_features", func(ctx tinysql.ProcedureContext, args []any) (*tinysql.ResultSet, error) {
-		return ctx.ExecuteSQL(`
-			SELECT 'Geo imports' AS area, 'GeoJSON, KML, OSM XML, routing graph, Shapefile ZIP, MBTiles' AS feature, 'partly direct in browser; binary formats in Go/CLI/server' AS wasm_status
-			UNION ALL SELECT 'Spatial SQL', 'ST_MakePoint, ST_X, ST_Y, ST_DISTANCE, ST_DWITHIN, ST_WITHIN_BBOX', 'direct'
-			UNION ALL SELECT 'Search/RAG', 'HYBRID_SEARCH, wildcard FTS, VEC_SEARCH, RAG_SEARCH, RAG_CONTEXT', 'direct'
-			UNION ALL SELECT 'Analytics SQL', 'CTEs, views, materialized views, PIVOT, window functions, RETURNING, EXPLAIN', 'direct'
-			UNION ALL SELECT 'Introspection', 'sys.tables, sys.columns, sys.functions, sys.objects, sys.dependencies, PRAGMA compatibility', 'direct'
-			UNION ALL SELECT 'Operations', 'RBAC, audit logs, WAL/storage, tinysqld, MCP server, tinyORM', 'core/server-side; showcased as metadata and SQL recipes'
-			ORDER BY area
-		`)
-	}); err != nil {
-		println("Failed to register demo_release_features:", err.Error())
+	if err := proceduredemo.Register(); err != nil {
+		println("Failed to register stored procedure demos:", err.Error())
 	}
 }
 

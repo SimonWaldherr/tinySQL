@@ -168,7 +168,27 @@ cfg.Tenant = "default"
 cfg.BusyTimeout = 500 * time.Millisecond
 
 db, err := tsqldriver.OpenWithConfig(context.Background(), cfg)
+
+// Or start from a workload-specific persistent profile:
+navCfg  := tsqldriver.OfflineNavigationOpenConfig("./nav-artifact")
+ragCfg  := tsqldriver.RAGOpenConfig("./rag-artifact")
+toolCfg := tsqldriver.EmbeddedToolOpenConfig("./tool.db")
 ```
+
+The navigation profile opens an existing index artifact read-only with a
+bounded cache. The RAG profile uses bounded hybrid storage and keeps pooled
+connections stable so warmed retrieval structures remain hot. The embedded
+tool profile uses row-level WAL recovery, one serialized writer, concurrent
+readers, regular fsync, and bounded checkpoints. Override the returned config
+when the device memory or durability policy differs from these starting
+points.
+
+For a Go tool migrating from MySQL, keep using `?` placeholders and explicit
+transactions through `database/sql`. Reuse prepared statements for hot loops
+and batch writes inside one transaction. tinySQL does not implement the MySQL
+wire protocol, server users/replication, `AUTO_INCREMENT`, or every MySQL
+dialect extension; it is a replacement for the embedded persistence role, not
+an invisible server swap.
 
 DSN patterns from the repo:
 
@@ -182,7 +202,7 @@ silent default): `tenant`, `autosave`, `pool_readers` (aliases `read_pool`,
 `reader_pool`), `pool_writers` (aliases `write_pool`, `writer_pool`),
 `busy_timeout` (alias `busytimeout`), `mode`, `max_memory_bytes`, `read_only`,
 `sync_on_mutate`, `compress_files`, `checkpoint_every`, `checkpoint_interval`,
-`checkpoint_max_bytes`, `wal_sync`. Booleans accept `1/true/yes/on` and
+`checkpoint_max_bytes`, `wal_sync`, `persist_debounce_ms`. Booleans accept `1/true/yes/on` and
 `0/false/no/off`. `wal_sync` accepts `full` (the default, strongest available
 flush) or `normal` (ordinary fsync on every WAL commit). On macOS, `normal`
 matches SQLite `synchronous=FULL` without SQLite's separate `fullfsync=ON`;

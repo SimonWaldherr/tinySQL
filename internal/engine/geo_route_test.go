@@ -190,6 +190,150 @@ func TestRouteAStarCoordinateCacheInvalidates(t *testing.T) {
 	}
 }
 
+func TestRouteDistanceMatrixUsesCartesianInputOrder(t *testing.T) {
+	db := storage.NewDB()
+	setupRouteEdges(t, db)
+
+	rs := execSQL(t, db, `SELECT * FROM ROUTE_DISTANCE_MATRIX(
+		'edges','source','target','cost','["A","B"]','["C","D"]')`)
+	if len(rs.Rows) != 4 {
+		t.Fatalf("matrix rows = %d, want 4: %#v", len(rs.Rows), rs.Rows)
+	}
+	wantSources := []any{"A", "A", "B", "B"}
+	wantTargets := []any{"C", "D", "C", "D"}
+	wantCosts := []any{float64(3), float64(4), float64(2), float64(3)}
+	for index, result := range rs.Rows {
+		if result["source_id"] != wantSources[index] || result["target_id"] != wantTargets[index] || result["total_cost"] != wantCosts[index] || result["reachable"] != true {
+			t.Errorf("matrix row %d = %#v, want %v -> %v at %v", index, result, wantSources[index], wantTargets[index], wantCosts[index])
+		}
+	}
+}
+
+func TestRouteDistanceMatrixReportsUnreachablePairs(t *testing.T) {
+	db := storage.NewDB()
+	setupRouteEdges(t, db)
+	execSQL(t, db, `INSERT INTO edges VALUES ('xy','X','Y',1)`)
+
+	rs := execSQL(t, db, `SELECT * FROM ROUTE_DISTANCE_MATRIX(
+		'edges','source','target','cost','["A"]','["D","Y"]')`)
+	if len(rs.Rows) != 2 || rs.Rows[0]["total_cost"] != float64(4) || rs.Rows[1]["total_cost"] != nil || rs.Rows[1]["reachable"] != false {
+		t.Fatalf("matrix reachability = %#v, want A->D=4 and A->Y unreachable", rs.Rows)
+	}
+}
+
+func TestRouteReachableHonorsCostAndLimit(t *testing.T) {
+	db := storage.NewDB()
+	setupRouteEdges(t, db)
+
+	rs := execSQL(t, db, `SELECT * FROM ROUTE_REACHABLE(
+		'edges','source','target','cost','A',3)`)
+	if len(rs.Rows) != 3 {
+		t.Fatalf("reachable rows = %d, want A/B/C: %#v", len(rs.Rows), rs.Rows)
+	}
+	wantNodes := []any{"A", "B", "C"}
+	wantCosts := []any{float64(0), float64(1), float64(3)}
+	for index, result := range rs.Rows {
+		if result["rank"] != index+1 || result["node_id"] != wantNodes[index] || result["total_cost"] != wantCosts[index] {
+			t.Errorf("reachable row %d = %#v", index, result)
+		}
+	}
+
+	limited := execSQL(t, db, `SELECT * FROM ROUTE_REACHABLE(
+		'edges','source','target','cost','A',100,'directed',2)`)
+	if len(limited.Rows) != 2 || limited.Rows[1]["node_id"] != "B" {
+		t.Fatalf("limited reachable = %#v, want A/B", limited.Rows)
+	}
+}
+
+func TestRouteBatchNumericNodeIDs(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE numeric_edges (source INT, target INT, cost FLOAT64)`)
+	execSQL(t, db, `INSERT INTO numeric_edges VALUES (1,2,1), (2,3,1)`)
+	rs := execSQL(t, db, `SELECT * FROM ROUTE_DISTANCE_MATRIX(
+		'numeric_edges','source','target','cost','[1]','[2,3]')`)
+	if len(rs.Rows) != 2 {
+		t.Fatalf("numeric matrix rows = %#v", rs.Rows)
+	}
+	firstTarget, _ := geoFloat(rs.Rows[0]["target_id"])
+	if firstTarget != 2 || rs.Rows[1]["total_cost"] != float64(2) {
+		t.Fatalf("numeric matrix = %#v", rs.Rows)
+	}
+}
+
+func TestRouteBatchRejectsInvalidBoundsAndLists(t *testing.T) {
+	db := storage.NewDB()
+	setupRouteEdges(t, db)
+	execExpectError(t, db, `SELECT * FROM ROUTE_DISTANCE_MATRIX(
+		'edges','source','target','cost','null','["C"]')`)
+	execExpectError(t, db, `SELECT * FROM ROUTE_REACHABLE(
+		'edges','source','target','cost','A',-1)`)
+	execExpectError(t, db, `SELECT * FROM ROUTE_REACHABLE(
+		'edges','source','target','cost','A',10,'directed',1.5)`)
+}
+
+func TestRouteColdBuildPreservesStableEdgeOrder(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE ordered_edges (edge_id TEXT, source TEXT, target TEXT, cost FLOAT64)`)
+	execSQL(t, db, `INSERT INTO ordered_edges VALUES
+		('b1','B','X',1), ('a1','A','X',1), ('c1','C','X',1), ('a2','A','Y',1), ('b2','B','Y',1), ('a3','A','Z',1)`)
+	table, err := db.Get("default", "ordered_edges")
+	if err != nil {
+		t.Fatal(err)
+	}
+	graph, err := buildRouteGraph(context.Background(), table, "source", "target", "cost", "directed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	aNode, ok := graph.nodeIndex.get(routeNodeID{kind: 1, text: "A"})
+	if !ok {
+		t.Fatal("A missing from graph")
+	}
+	got := graph.rowIdx[graph.offsets[aNode]:graph.offsets[aNode+1]]
+	want := []uint32{1, 3, 5}
+	if len(got) != len(want) {
+		t.Fatalf("A edge rows = %v, want %v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("A edge rows = %v, want stable %v", got, want)
+		}
+	}
+	undirected, err := buildRouteGraph(context.Background(), table, "source", "target", "cost", "undirected")
+	if err != nil {
+		t.Fatal(err)
+	}
+	xNode, ok := undirected.nodeIndex.get(routeNodeID{kind: 1, text: "X"})
+	if !ok {
+		t.Fatal("X missing from undirected graph")
+	}
+	gotReverse := undirected.rowIdx[undirected.offsets[xNode]:undirected.offsets[xNode+1]]
+	wantReverse := []uint32{0, 1, 2}
+	if len(gotReverse) != len(wantReverse) {
+		t.Fatalf("X reverse edge rows = %v, want %v", gotReverse, wantReverse)
+	}
+	for index := range wantReverse {
+		if gotReverse[index] != wantReverse[index] {
+			t.Fatalf("X reverse edge rows = %v, want stable %v", gotReverse, wantReverse)
+		}
+	}
+}
+
+func TestRouteWarmBuildsAndReusesGraph(t *testing.T) {
+	db := storage.NewDB()
+	setupRouteEdges(t, db)
+	purgeRouteGraphCachesFor("default", "edges")
+
+	query := `SELECT * FROM ROUTE_WARM('edges','source','target','cost')`
+	first := execSQL(t, db, query)
+	if len(first.Rows) != 1 || first.Rows[0]["cache_hit"] != false || first.Rows[0]["node_count"] != 4 || first.Rows[0]["edge_count"] != 4 {
+		t.Fatalf("first ROUTE_WARM = %#v", first.Rows)
+	}
+	second := execSQL(t, db, query)
+	if len(second.Rows) != 1 || second.Rows[0]["cache_hit"] != true {
+		t.Fatalf("second ROUTE_WARM = %#v", second.Rows)
+	}
+}
+
 func TestRouteGraphCacheReuseInvalidationAndDropPurge(t *testing.T) {
 	db := storage.NewDB()
 	setupRouteEdges(t, db)
@@ -357,6 +501,46 @@ func BenchmarkRouteDistanceGraphCache(b *testing.B) {
 			b.StartTimer()
 			if _, err := Execute(ctx, db, "default", stmt); err != nil {
 				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func BenchmarkRouteOneToManyCore(b *testing.B) {
+	const edges = 5000
+	db := benchmarkRouteDB(b, edges)
+	table, err := db.Get("default", "bench_routes")
+	if err != nil {
+		b.Fatal(err)
+	}
+	graph, err := getRouteGraph(context.Background(), "default", table, "source", "target", "cost", "directed")
+	if err != nil {
+		b.Fatal(err)
+	}
+	targets := make([]int, 32)
+	for index := range targets {
+		targets[index] = edges - len(targets) + index + 1
+	}
+
+	b.Run("shared_search", func(b *testing.B) {
+		b.ReportAllocs()
+		for iteration := 0; iteration < b.N; iteration++ {
+			b.StopTimer()
+			graph.distances = routeDistanceCache{}
+			b.StartTimer()
+			if _, err := routeTargetDistances(context.Background(), graph, 0, targets); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("repeated_searches", func(b *testing.B) {
+		b.ReportAllocs()
+		for iteration := 0; iteration < b.N; iteration++ {
+			for _, target := range targets {
+				if _, _, found := dijkstraSearch(graph, 0, target, false); !found {
+					b.Fatal("target unexpectedly unreachable")
+				}
 			}
 		}
 	})

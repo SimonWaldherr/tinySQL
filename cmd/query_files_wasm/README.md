@@ -142,7 +142,12 @@ update-gh-pages` picks up regenerated files the same way it does `app.js`.
   `NATURAL_BREAKS` choropleth classification window functions
 - developer UX examples: `BLOB_FROM_HEX`/`BLOB_FROM_BASE64` constructing
   storable blobs, read back with `BLOB_HEX`/`BLOB_LENGTH`
-- in-memory stored procedure demos via `CALL demo_table_summary()` and
+- reusable stored procedure demos with metadata, safe arguments, read-only
+  scheduling, atomic writes, and runtime statistics:
+  `CALL demo_table_summary()`, `CALL demo_runtime_status()`,
+  `CALL demo_geo_distance(52.52, 13.405, 48.1372, 11.5755)`,
+  `CALL demo_find_functions('RAG%')`,
+  `CALL demo_log_event('browser', 'demo')`, and
   `CALL demo_release_features()`
 
 ## Keyboard shortcuts

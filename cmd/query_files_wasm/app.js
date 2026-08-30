@@ -844,6 +844,14 @@ const SHAREABLE_DEMOS = {
         autoRun: true,
         query: `-- Shareable SQL feature demo: views, materialized views, RETURNING\nDROP MATERIALIZED VIEW IF EXISTS demo_revenue_mv;\nDROP VIEW IF EXISTS demo_paid_orders;\nCREATE VIEW demo_paid_orders AS\nSELECT customer_name, region, product, quantity * unit_price AS revenue\nFROM sales\nWHERE status = 'Delivered';\nCREATE MATERIALIZED VIEW demo_revenue_mv AS\nSELECT region, SUM(revenue) AS revenue\nFROM demo_paid_orders\nGROUP BY region\nWITH DATA;\nINSERT INTO sales VALUES (1011, 'Acme Corp', 'Widget D', 10, 120.00, '2024-03-01', 'North', 'Delivered') RETURNING order_id, customer_name, quantity * unit_price AS returned_total;\nREFRESH MATERIALIZED VIEW demo_revenue_mv;\nSELECT region, revenue\nFROM demo_revenue_mv\nORDER BY revenue DESC`
     },
+    procedures: {
+        title: 'Stored procedures',
+        description: 'Typed arguments, safe nested SQL, read-only concurrency, atomic writes, runtime statistics, and reusable Go/WASM registrations.',
+        icon: '⚙️',
+        tables: [],
+        autoRun: true,
+        query: `-- Berlin to Munich: a read-only procedure can run concurrently\nCALL demo_geo_distance(52.5200, 13.4050, 48.1372, 11.5755)`
+    },
     catalog: {
         title: 'sys catalog introspection',
         description: 'Inspect loaded tables, registered SQL functions, stored procedures, and runtime status from SQL.',

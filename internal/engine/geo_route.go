@@ -234,8 +234,8 @@ func routeNodeKey(v any) (routeNodeID, error) {
 	return routeNodeID{}, fmt.Errorf("unsupported node id type %T", v)
 }
 
-// buildRouteGraph scans the table twice, building an adjacency list
-// keyed by a dense integer node index (nodeValues[i] holds that node's
+// buildRouteGraph scans the table once, building an adjacency list keyed by a
+// dense integer node index (nodeValues[i] holds that node's
 // original id value, in whichever type it was first seen as, for reporting
 // back in results). direction "undirected" adds both directions of travel
 // for each edge row; "directed" (the default) adds only source->target.
@@ -256,12 +256,22 @@ func buildRouteGraph(ctx context.Context, table *storage.Table, sourceCol, targe
 		return nil, fmt.Errorf("weight column: %w", err)
 	}
 
-	g := &routeGraph{table: table, nodeIndex: newRouteNodeIndex(len(table.Rows) + 1)}
-	degreeCap := len(table.Rows)
-	if degreeCap <= int(^uint(0)>>1)/2 {
-		degreeCap *= 2
+	nodeCapacity := len(table.Rows)
+	if nodeCapacity <= int(^uint(0)>>1)-2 {
+		nodeCapacity += 2
 	}
-	degrees := make([]uint32, 0, degreeCap)
+	edgeCapacity := len(table.Rows)
+	if direction == "undirected" && edgeCapacity <= int(^uint(0)>>1)/2 {
+		edgeCapacity *= 2
+	}
+	g := &routeGraph{
+		table: table, nodeIndex: newRouteNodeIndex(nodeCapacity),
+		nodeValues: make([]any, 0, nodeCapacity), offsets: make([]uint32, 0, nodeCapacity+1),
+		to: make([]uint32, 0, edgeCapacity), weights: make([]float64, 0, edgeCapacity), rowIdx: make([]uint32, 0, edgeCapacity),
+	}
+	// First this stores each edge's source. It is later overwritten with the
+	// stable CSR destination position and becomes the in-place permutation.
+	sourceOrPosition := make([]uint32, 0, edgeCapacity)
 	nodeIdxFor := func(v any) (int, error) {
 		key, err := routeNodeKey(v)
 		if err != nil {
@@ -276,14 +286,25 @@ func buildRouteGraph(ctx context.Context, table *storage.Table, sourceCol, targe
 		}
 		g.nodeIndex.put(key, idx)
 		g.nodeValues = append(g.nodeValues, v)
-		degrees = append(degrees, 0)
+		g.offsets = append(g.offsets, 0)
 		return idx, nil
 	}
-	var edgeCount uint64
-	// First pass validates rows, interns node IDs and counts CSR degrees. A
-	// former one-pass builder retained a 32-byte temporary record per directed
-	// edge alongside the final edge array. Numeric node interning is cheap now,
-	// so a second table pass saves that large peak allocation.
+	appendEdge := func(source, target, row int, weight float64) error {
+		if uint64(len(sourceOrPosition)) >= uint64(math.MaxUint32) {
+			return fmt.Errorf("routing graph has more than %d directed edges", uint64(math.MaxUint32))
+		}
+		if g.offsets[source] == math.MaxUint32 {
+			return fmt.Errorf("routing node has more than %d outgoing edges", uint64(math.MaxUint32))
+		}
+		g.offsets[source]++
+		sourceOrPosition = append(sourceOrPosition, uint32(source))
+		g.to = append(g.to, uint32(target))
+		g.weights = append(g.weights, weight)
+		g.rowIdx = append(g.rowIdx, uint32(row))
+		return nil
+	}
+	// Validate and decode every row exactly once. The payload arrays are already
+	// final; only one uint32 source position per directed edge is temporary.
 	for rowIdx, r := range table.Rows {
 		if rowIdx&1023 == 0 {
 			if err := checkCtx(ctx); err != nil {
@@ -312,56 +333,40 @@ func buildRouteGraph(ctx context.Context, table *storage.Table, sourceCol, targe
 		if err != nil {
 			return nil, fmt.Errorf("row %d: target id: %w", rowIdx, err)
 		}
-		degrees[srcNode]++
-		edgeCount++
-		if direction == "undirected" {
-			degrees[tgtNode]++
-			edgeCount++
+		if err := appendEdge(srcNode, tgtNode, rowIdx, weight); err != nil {
+			return nil, err
 		}
-	}
-	if edgeCount > uint64(math.MaxUint32) {
-		return nil, fmt.Errorf("routing graph has %d directed edges; maximum supported is %d", edgeCount, uint64(math.MaxUint32))
-	}
-
-	g.offsets = make([]uint32, len(g.nodeValues)+1)
-	for node, degree := range degrees {
-		g.offsets[node+1] = degree
-	}
-	for node := 1; node < len(g.offsets); node++ {
-		g.offsets[node] += g.offsets[node-1]
-	}
-	g.to = make([]uint32, int(edgeCount))
-	g.weights = make([]float64, int(edgeCount))
-	g.rowIdx = make([]uint32, int(edgeCount))
-	cursors := append([]uint32(nil), g.offsets[:len(g.nodeValues)]...)
-	for rowIdx, r := range table.Rows {
-		if rowIdx&1023 == 0 {
-			if err := checkCtx(ctx); err != nil {
+		if direction == "undirected" {
+			if err := appendEdge(tgtNode, srcNode, rowIdx, weight); err != nil {
 				return nil, err
 			}
 		}
-		if srcIdx >= len(r) || tgtIdx >= len(r) || wIdx >= len(r) || r[srcIdx] == nil || r[tgtIdx] == nil || r[wIdx] == nil {
-			continue
-		}
-		sourceKey, sourceErr := routeNodeKey(r[srcIdx])
-		targetKey, targetErr := routeNodeKey(r[tgtIdx])
-		srcNode, sourceOK := g.nodeIndex.get(sourceKey)
-		tgtNode, targetOK := g.nodeIndex.get(targetKey)
-		weight, weightErr := geoFloat(r[wIdx])
-		if sourceErr != nil || targetErr != nil || !sourceOK || !targetOK || weightErr != nil || weight < 0 || weight != weight {
-			return nil, fmt.Errorf("row %d changed while routing graph was built", rowIdx)
-		}
-		edge := cursors[srcNode]
-		g.to[edge] = uint32(tgtNode)
-		g.weights[edge] = weight
-		g.rowIdx[edge] = uint32(rowIdx)
-		cursors[srcNode]++
-		if direction == "undirected" {
-			edge = cursors[tgtNode]
-			g.to[edge] = uint32(srcNode)
-			g.weights[edge] = weight
-			g.rowIdx[edge] = uint32(rowIdx)
-			cursors[tgtNode]++
+	}
+
+	// Turn degrees into offsets in the same backing array, then assign stable
+	// bucket positions in input order. This preserves equal-cost tie behavior.
+	g.offsets = append(g.offsets, uint32(len(sourceOrPosition)))
+	var prefix uint32
+	for node := 0; node < len(g.nodeValues); node++ {
+		degree := g.offsets[node]
+		g.offsets[node] = prefix
+		prefix += degree
+	}
+	g.offsets[len(g.nodeValues)] = prefix
+	cursors := append([]uint32(nil), g.offsets[:len(g.nodeValues)]...)
+	for edge, source := range sourceOrPosition {
+		sourceOrPosition[edge] = cursors[source]
+		cursors[source]++
+	}
+	// Apply the position permutation to all structure-of-arrays payloads in
+	// place, avoiding a second graph-sized edge allocation.
+	for edge := range sourceOrPosition {
+		for int(sourceOrPosition[edge]) != edge {
+			destination := int(sourceOrPosition[edge])
+			g.to[edge], g.to[destination] = g.to[destination], g.to[edge]
+			g.weights[edge], g.weights[destination] = g.weights[destination], g.weights[edge]
+			g.rowIdx[edge], g.rowIdx[destination] = g.rowIdx[destination], g.rowIdx[edge]
+			sourceOrPosition[edge], sourceOrPosition[destination] = sourceOrPosition[destination], sourceOrPosition[edge]
 		}
 	}
 	return g, nil

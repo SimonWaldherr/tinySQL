@@ -635,7 +635,11 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 		}
 	}
 
-	rows := make([]orderedRawRow, 0, simpleSelectInitialCap(plan))
+	// A bounded top-N query stores candidates in topRows. Do not also allocate
+	// the full-sort slice: LIMIT queries are common in database/sql callers and
+	// the duplicate initial backing array survived for the whole execution even
+	// though no item was ever appended to it.
+	var rows []orderedRawRow
 	// keyArena backs the per-row keys slices of multi-column orders in a few
 	// large chunks. Freshly packed keys sort measurably faster than reads
 	// scattered across per-row allocations or the raw rows themselves, and
@@ -648,6 +652,8 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 			plan:  plan,
 			items: make([]orderedRawRow, 0, simpleSelectInitialCap(plan)),
 		}
+	} else {
+		rows = make([]orderedRawRow, 0, simpleSelectInitialCap(plan))
 	}
 	for i := 0; i < rowCount; i++ {
 		rowID := i

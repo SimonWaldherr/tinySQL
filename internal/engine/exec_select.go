@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -393,7 +394,14 @@ type simpleSelectPlan struct {
 // cache lives on the AST, so its lifetime is bounded by the existing parsed
 // statement cache or database/sql prepared statement.
 type simpleSelectPlanCache struct {
-	mu       sync.Mutex
+	// entry is immutable after publication, so warm executions need only one
+	// atomic load. mu is the singleflight boundary for cold construction and
+	// schema replacement; it is never taken by a valid cache hit.
+	mu    sync.Mutex
+	entry atomic.Pointer[simpleSelectPlanCacheEntry]
+}
+
+type simpleSelectPlanCacheEntry struct {
 	table    *storage.Table
 	colCount int
 	plan     *simpleSelectPlan

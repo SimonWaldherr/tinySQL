@@ -45,7 +45,7 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 
 	var snapshot *storage.StatementSnapshot
 	switch {
-	case isAtomicDML(stmt):
+	case needsStatementRollback(stmt):
 		var snapshotErr error
 		if table, rowIDs, ok := rowUpdateSnapshotTarget(plan); ok {
 			snapshot, snapshotErr = db.SnapshotForRowUpdateStatement(tenant, table, rowIDs)
@@ -456,6 +456,25 @@ func isAtomicDML(stmt Statement) bool {
 		// EXPLAIN ANALYZE executes its inner statement in the outer statement
 		// lifecycle, so it needs the same rollback guarantee as direct DML.
 		return s.Analyze && isAtomicDML(s.Statement)
+	default:
+		return false
+	}
+}
+
+// needsStatementRollback includes ordinary atomic DML plus option-declared
+// stored procedures. It stays separate from isAtomicDML because the latter is
+// also used to decide AdvancedWAL metadata checkpointing: an atomic procedure
+// may execute DDL as well as row changes and must not be mistaken for pure DML.
+func needsStatementRollback(stmt Statement) bool {
+	if isAtomicDML(stmt) {
+		return true
+	}
+	switch s := stmt.(type) {
+	case *CallProcedure:
+		procedure, ok := lookupStoredProcedure(s.Name)
+		return ok && procedure.options.Atomic
+	case *Explain:
+		return s.Analyze && needsStatementRollback(s.Statement)
 	default:
 		return false
 	}

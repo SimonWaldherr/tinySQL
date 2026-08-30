@@ -107,6 +107,24 @@ SQL semantics and start yielding after their result has been materialized.
 For applications that already use `database/sql`, use
 [`github.com/SimonWaldherr/tinySQL/driver`](./driver).
 
+The public driver includes workload profiles that expose the underlying
+bounded-storage, WAL, checkpoint and pool settings without hand-written DSNs:
+
+```go
+navCfg  := driver.OfflineNavigationOpenConfig("./nav-artifact") // index, bounded, read-only
+ragCfg  := driver.RAGOpenConfig("./rag-artifact")               // hybrid retrieval working set
+toolCfg := driver.EmbeddedToolOpenConfig("./tool.db")           // ACID WAL for database/sql
+
+db, err := driver.OpenWithConfig(ctx, toolCfg)
+```
+
+For an offline navigator, call `ROUTE_WARM` before accepting route requests.
+For a hybrid RAG service, `RAG_WARM(table, text_col, vector_col[, metric
+[, index]])` builds its lexical and vector serving structures concurrently.
+The embedded-tool profile is intended for replacing a networked SQL dependency
+inside one Go process; tinySQL remains deliberately smaller than MySQL and is
+not wire-protocol or full-dialect compatible.
+
 ## What it can do
 
 ### SQL engine
@@ -131,6 +149,36 @@ For applications that already use `database/sql`, use
 - CLI, HTTP server, file-query tools, and health/lifecycle hooks.
 - Optional audit logging, RBAC, and encryption at rest for supported table-file
   backends.
+
+### Stored procedures
+
+Stored procedures are process-local Go handlers invoked with `CALL`. The
+option-based API adds catalog metadata, positional argument validation,
+parallel read-only execution and optional statement-level rollback for
+multi-step writes. `ExecuteSQLArgs` binds nested SQL values safely:
+
+```go
+err := tinysql.RegisterStoredProcedureWithOptions("find_docs",
+    tinysql.StoredProcedureOptions{
+        Description: "Find matching documents",
+        ReadOnly: true,
+        Parameters: []tinysql.StoredProcedureParameter{
+            {Name: "pattern", Required: true},
+        },
+    },
+    func(ctx tinysql.ProcedureContext, args []any) (*tinysql.ResultSet, error) {
+        return ctx.ExecuteSQLArgs(
+            "SELECT id, title FROM docs WHERE title LIKE ? ORDER BY title",
+            args[0],
+        )
+    })
+```
+
+Use `Atomic: true` for a mutating procedure whose nested statements must all
+roll back when its handler returns an error. `sys.procedures` exposes argument
+metadata, `read_only`, `atomic`, call/error counts and average runtime. The
+native examples are in [`cmd/procedure_demo`](./cmd/procedure_demo); the WASM
+playground registers the same reusable demo set.
 
 ### Data and maps
 
@@ -429,6 +477,9 @@ column, and a non-negative numeric weight column, whether or not it came from
 | A*-guided total cost | `ROUTE_DISTANCE_ASTAR(edge_table, source_col, target_col, weight_col, node_table, node_id_col, lat_col, lon_col, start_id, end_id, min_cost_per_metre[, direction])` |
 | A*-guided path, including remaining air distance | `ROUTE_SHORTEST_PATH_ASTAR(edge_table, source_col, target_col, weight_col, node_table, node_id_col, lat_col, lon_col, start_id, end_id, min_cost_per_metre[, direction])` |
 | Air-line distance in metres | `ROUTE_AIR_DISTANCE(node_table, node_id_col, lat_col, lon_col, start_id, end_id)` |
+| Many-to-many cost matrix | `ROUTE_DISTANCE_MATRIX(table, source_col, target_col, weight_col, source_ids_json, target_ids_json[, direction])` |
+| Reachable nodes / service area | `ROUTE_REACHABLE(table, source_col, target_col, weight_col, start_id, max_cost[, direction[, limit]])` |
+| Prebuild a routing graph | `ROUTE_WARM(table, source_col, target_col, weight_col[, direction])` |
 
 ```sql
 CREATE TABLE roads (edge_id TEXT, source TEXT, target TEXT, cost FLOAT64);
@@ -455,6 +506,32 @@ interface. Coordinate tables and graph-to-coordinate bindings are versioned,
 bounded, and shared across concurrent requests just like the graph cache.
 `ROUTE_SHORTEST_PATH_ASTAR` adds `air_distance_to_goal_m` to each returned
 step, which is useful for progress and detour-factor displays.
+
+For dispatching, distance tables and other batch workloads,
+`ROUTE_DISTANCE_MATRIX` forms the Cartesian product of its two JSON node-id
+arrays. It groups equal sources, consumes cached pairs first, and resolves all
+remaining targets for a source in one early-terminating Dijkstra run:
+
+```sql
+SELECT * FROM ROUTE_DISTANCE_MATRIX(
+  'roads', 'source', 'target', 'cost', '["A","B"]', '["C","D"]');
+
+SELECT * FROM ROUTE_REACHABLE(
+  'roads', 'source', 'target', 'cost', 'A', 900000, 'directed', 1000);
+```
+
+`ROUTE_REACHABLE` returns nodes in increasing shortest-cost order, including
+the start node at cost zero. `max_cost` makes it suitable for travel-time
+service areas and isochrone input; the optional `limit` bounds both search and
+result materialization for nearest-by-travel-cost queries.
+
+After an import or bulk update, `ROUTE_WARM` can build the versioned CSR graph
+before serving traffic. It returns node/edge counts, whether the graph was
+already cached, and elapsed time:
+
+```sql
+SELECT * FROM ROUTE_WARM('roads', 'source', 'target', 'duration', 'directed');
+```
 
 `direction` is `'directed'` (the default — travel only `source` → `target`)
 or `'undirected'` (travel either way along every edge). A node id may be

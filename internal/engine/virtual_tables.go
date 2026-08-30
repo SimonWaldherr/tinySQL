@@ -554,10 +554,46 @@ func sysProceduresRows() []Row {
 		putVal(r, "name", proc.Name)
 		putVal(r, "language", "GO")
 		putVal(r, "storage", "MEMORY")
+		putVal(r, "description", proc.Description)
+		putVal(r, "parameters", procedureParameterNames(proc.Parameters))
+		putVal(r, "min_args", proc.MinArgs)
+		if proc.MaxArgs < 0 {
+			putVal(r, "max_args", nil)
+		} else {
+			putVal(r, "max_args", proc.MaxArgs)
+		}
+		putVal(r, "read_only", proc.ReadOnly)
+		putVal(r, "atomic", proc.Atomic)
+		putVal(r, "calls", proc.Calls)
+		putVal(r, "errors", proc.Errors)
+		if proc.LastCalledAt.IsZero() {
+			putVal(r, "last_called_at", nil)
+		} else {
+			putVal(r, "last_called_at", proc.LastCalledAt)
+		}
+		if proc.Calls == 0 {
+			putVal(r, "avg_runtime_ms", nil)
+		} else {
+			putVal(r, "avg_runtime_ms", float64(proc.TotalRuntime)/float64(time.Millisecond)/float64(proc.Calls))
+		}
 		putVal(r, "registered_at", proc.RegisteredAt)
 		rows = append(rows, r)
 	}
 	return rows
+}
+
+func procedureParameterNames(parameters []StoredProcedureParameter) string {
+	if len(parameters) == 0 {
+		return ""
+	}
+	names := make([]string, len(parameters))
+	for i, parameter := range parameters {
+		names[i] = parameter.Name
+		if !parameter.Required {
+			names[i] += "?"
+		}
+	}
+	return strings.Join(names, ",")
 }
 
 // ─────────────────────────── sys.statistics ─────────────────────────────

@@ -161,10 +161,13 @@ func loadSimpleSelectPlanTemplate(table *storage.Table, s *Select, reusableSchem
 	cache := s.simplePlanCache
 	cacheable := cache != nil && simplePlanCacheSafe(s.Where)
 	if cacheable {
+		if entry := cache.entry.Load(); simpleSelectPlanCacheEntryMatches(entry, table, reusableSchema) {
+			return entry.plan, true, nil
+		}
 		cache.mu.Lock()
 		defer cache.mu.Unlock()
-		if cache.plan != nil && cache.colCount == len(table.Cols) && (cache.table == table || (reusableSchema && sameSimplePlanSchema(cache.table, table))) {
-			return cache.plan, true, nil
+		if entry := cache.entry.Load(); simpleSelectPlanCacheEntryMatches(entry, table, reusableSchema) {
+			return entry.plan, true, nil
 		}
 	}
 
@@ -213,11 +216,18 @@ func loadSimpleSelectPlanTemplate(table *storage.Table, s *Select, reusableSchem
 		estimatedRows: len(table.Rows),
 	}
 	if cacheable {
-		cache.table = table
-		cache.colCount = len(table.Cols)
-		cache.plan = plan
+		cache.entry.Store(&simpleSelectPlanCacheEntry{
+			table:    table,
+			colCount: len(table.Cols),
+			plan:     plan,
+		})
 	}
 	return plan, true, nil
+}
+
+func simpleSelectPlanCacheEntryMatches(entry *simpleSelectPlanCacheEntry, table *storage.Table, reusableSchema bool) bool {
+	return entry != nil && entry.plan != nil && entry.colCount == len(table.Cols) &&
+		(entry.table == table || (reusableSchema && sameSimplePlanSchema(entry.table, table)))
 }
 
 // sameSimplePlanSchema is intentionally narrower than a general table

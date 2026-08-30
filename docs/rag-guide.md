@@ -229,6 +229,18 @@ SELECT *
 FROM FTS_WARM('rag_chunks', 'search_text');
 ```
 
+When one table supplies both branches, warm them concurrently with one call:
+
+```sql
+SELECT * FROM RAG_WARM(
+  'rag_chunks', 'search_text', 'embedding', 'cosine', 'flat'
+);
+```
+
+`RAG_WARM` reports both vector dimensionality and lexical document/term/posting
+counts. It uses the same versioned caches as `VEC_WARM` and `FTS_WARM`, so a
+corpus mutation invalidates both and the next warm call rebuilds current data.
+
 For a clean active corpus:
 
 - `vector_count` should equal the number of searchable chunks;
@@ -764,7 +776,7 @@ serving-oriented deployments, prefer:
 1. bulk load or rebuild a snapshot;
 2. validate and evaluate it;
 3. reopen it read-only;
-4. call `VEC_WARM` and `FTS_WARM` during startup for every serving column set;
+4. call `RAG_WARM` (or the separate `VEC_WARM` and `FTS_WARM`) during startup for every serving column set;
 5. admit traffic only after warm-up succeeds.
 
 The warmed native vector column is also held in a contiguous cache, so budget
@@ -801,7 +813,7 @@ query execution and index warm-up.
 | many duplicate hits | chunks/overlap are too large | reduce overlap and use context expansion |
 | correct chunk is just outside top-k | candidate window too small | increase `candidate_k` and reevaluate |
 | low-looking `_rrf_score` | RRF scores are reciprocal ranks | sort by `_rrf_rank`; do not treat score as probability |
-| first query is slow | lazy vector/FTS index build | run `VEC_WARM` and `FTS_WARM` for the exact searched column set before admitting traffic |
+| first query is slow | lazy vector/FTS index build | run `RAG_WARM` for the exact searched columns before admitting traffic |
 | lexical search is slow on every query | query terms appear in most chunks, so no candidate restriction is possible | check term selectivity; a corpus-wide term always costs a full BM25 pass |
 | ANN loses relevant hits | approximate recall loss | compare with `flat`, then retune or stay exact |
 | answer ignores correct evidence | prompt/context problem | reduce context, improve source labels and grounding rules |

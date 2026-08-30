@@ -105,6 +105,66 @@ func TestDriverStreamCloseReleasesProducerAndLocks(t *testing.T) {
 	}
 }
 
+func TestDriverSlowStreamAllowsConcurrentWriteAndKeepsSnapshot(t *testing.T) {
+	db := openStreamingDriverDB(t, 256)
+	rows, err := db.QueryContext(context.Background(), `SELECT id FROM stream_rows`)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		t.Fatalf("first row: %v", rows.Err())
+	}
+	var first int
+	if err := rows.Scan(&first); err != nil {
+		t.Fatalf("scan first row: %v", err)
+	}
+	if first != 0 {
+		t.Fatalf("first id = %d, want 0", first)
+	}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := db.ExecContext(context.Background(), `INSERT INTO stream_rows VALUES (256, 'concurrent')`)
+		writeDone <- err
+	}()
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("concurrent write: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("slow database/sql stream blocked a concurrent writer")
+	}
+
+	count := 1
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scan row %d: %v", count, err)
+		}
+		if id != count {
+			t.Fatalf("snapshot row %d has id %d", count, id)
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("finish snapshot: %v", err)
+	}
+	if count != 256 {
+		t.Fatalf("stream saw %d rows, want original snapshot of 256", count)
+	}
+
+	var total int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM stream_rows`).Scan(&total); err != nil {
+		t.Fatalf("post-write count: %v", err)
+	}
+	if total != 257 {
+		t.Fatalf("post-write count = %d, want 257", total)
+	}
+}
+
 func TestDriverStreamContextCancellationReleasesProducerAndLocks(t *testing.T) {
 	db := openStreamingDriverDB(t, 256)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -166,6 +226,47 @@ func TestDriverStreamNormalOutput(t *testing.T) {
 	}
 	if count != 128 {
 		t.Fatalf("row count = %d, want 128", count)
+	}
+}
+
+func TestDriverBlockingSelectSkipsResultStream(t *testing.T) {
+	srv := newServer(storage.NewDB(), cfg{tenant: "default"})
+	c := &conn{srv: srv, tenant: "default"}
+	if _, err := c.execSQL(context.Background(), `CREATE TABLE blocking_rows (id INT)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := c.execSQL(context.Background(), `INSERT INTO blocking_rows VALUES (2), (1), (3)`); err != nil {
+		t.Fatalf("seed rows: %v", err)
+	}
+
+	stmt, err := parseSQLCached(`SELECT id FROM blocking_rows ORDER BY id LIMIT 2`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	rawRows, err := c.queryStatement(context.Background(), stmt)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rawRows.Close()
+	result, ok := rawRows.(*rows)
+	if !ok {
+		t.Fatalf("rows type = %T, want *rows", rawRows)
+	}
+	if result.stream != nil {
+		t.Fatal("blocking ORDER BY query used a redundant ResultStream")
+	}
+
+	dest := make([]stdDriver.Value, 1)
+	for i, want := range []int64{1, 2} {
+		if err := rawRows.Next(dest); err != nil {
+			t.Fatalf("row %d: %v", i, err)
+		}
+		if got := dest[0]; got != want {
+			t.Fatalf("row %d = %v, want %d", i, got, want)
+		}
+	}
+	if err := rawRows.Next(dest); !errors.Is(err, io.EOF) {
+		t.Fatalf("final Next = %v, want EOF", err)
 	}
 }
 

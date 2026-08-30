@@ -98,6 +98,9 @@ func isReadOnlyStatement(stmt Statement) bool {
 	switch s := stmt.(type) {
 	case *Select, *Pragma:
 		return true
+	case *CallProcedure:
+		procedure, ok := lookupStoredProcedure(s.Name)
+		return ok && procedure.options.ReadOnly
 	case *Explain:
 		// Plain EXPLAIN only inspects the statement. EXPLAIN ANALYZE executes
 		// it, so it must use the inner statement's lock classification.
@@ -105,6 +108,13 @@ func isReadOnlyStatement(stmt Statement) bool {
 	default:
 		return false
 	}
+}
+
+// IsReadOnlyStatement reports the engine's current lock classification. CALL
+// statements use their registered StoredProcedureOptions; unknown procedures
+// remain conservatively mutating until execution reports the lookup error.
+func IsReadOnlyStatement(stmt Statement) bool {
+	return isReadOnlyStatement(stmt)
 }
 
 func rejectIfMutating(stmt Statement) error {

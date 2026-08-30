@@ -351,6 +351,22 @@ func streamableSimpleSelect(s *Select) bool {
 	return s != nil && !s.Distinct && len(s.OrderBy) == 0 && simpleSelectEligible(s)
 }
 
+// MayStreamIncrementally reports whether stmt has a shape for which
+// ExecuteStream may produce rows directly from the source scan. It is a
+// deliberately conservative syntactic test: a true result can still fall
+// back to materialization when the runtime source is a view or another source
+// the simple plan cannot handle, while false guarantees that ExecuteStream
+// would only add a goroutine and channel around an already materialized
+// ResultSet.
+//
+// The database/sql adapter uses this distinction to keep genuine large-result
+// streaming while returning blocking shapes such as ORDER BY, GROUP BY,
+// DISTINCT, joins, CTEs and EXPLAIN synchronously.
+func MayStreamIncrementally(stmt Statement) bool {
+	s, ok := stmt.(*Select)
+	return ok && streamableSimpleSelect(s)
+}
+
 func streamSimpleSelectPlan(stream *ResultStream, plan *simpleSelectPlan, db *storage.DB) error {
 	if plan.pagedSource != nil {
 		return streamPagedSimpleSelectPlan(stream, plan, db)

@@ -201,6 +201,18 @@ func TestPublicStoredProcedureHelpers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RegisterStoredProcedure failed: %v", err)
 	}
+	err = tsql.RegisterStoredProcedureWithOptions(procName, tsql.StoredProcedureOptions{
+		Description: "public echo procedure",
+		ReadOnly:    true,
+		Parameters: []tsql.StoredProcedureParameter{
+			{Name: "value", Required: true},
+		},
+	}, func(ctx tsql.ProcedureContext, args []any) (*tsql.ResultSet, error) {
+		return ctx.ExecuteSQLArgs(`SELECT ? AS value, ? AS tenant`, args[0], ctx.Tenant())
+	})
+	if err != nil {
+		t.Fatalf("RegisterStoredProcedureWithOptions failed: %v", err)
+	}
 	if len(tsql.ListStoredProcedures()) == 0 {
 		t.Fatal("expected registered procedure to be listed")
 	}

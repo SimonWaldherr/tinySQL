@@ -493,15 +493,11 @@ func affectedRows(rs *engine.ResultSet, countCell string) int64 {
 }
 
 // isWriteStatement identifies statements that need the writer slot and the
-// durability path. SELECT, EXPLAIN, and PRAGMA are the only guaranteed reads;
-// conservatively scheduling all other statements as writes keeps DDL, catalog
-// actions, jobs, and RBAC from bypassing the writer gate.
+// durability path. The engine also recognizes option-declared read-only stored
+// procedures; unknown and legacy CALLs remain conservatively mutating so DDL,
+// catalog actions, jobs, RBAC and procedure writes cannot bypass persistence.
 func isWriteStatement(st engine.Statement) bool {
-	switch st.(type) {
-	case *engine.Select, *engine.Explain, *engine.Pragma:
-		return false
-	}
-	return true
+	return !engine.IsReadOnlyStatement(st)
 }
 
 // executeWriteStatement executes a write using the one canonical locking,

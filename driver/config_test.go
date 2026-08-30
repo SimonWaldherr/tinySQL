@@ -121,3 +121,97 @@ func TestOpenWithConfig(t *testing.T) {
 		t.Fatalf("expected Alice, got %q", got)
 	}
 }
+
+func TestWorkloadProfilesExposeStorageAndPoolTuning(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  OpenConfig
+		want map[string]string
+	}{
+		{
+			name: "offline_navigation", cfg: OfflineNavigationOpenConfig("./nav-artifact"),
+			want: map[string]string{"mode": "index", "max_memory_bytes": "268435456", "read_only": "1", "pool_readers": "4"},
+		},
+		{
+			name: "rag", cfg: RAGOpenConfig("./rag-artifact"),
+			want: map[string]string{"mode": "hybrid", "max_memory_bytes": "536870912", "sync_on_mutate": "1", "compress_files": "1", "pool_readers": "8"},
+		},
+		{
+			name: "embedded_tool", cfg: EmbeddedToolOpenConfig("./tool.db"),
+			want: map[string]string{"mode": "advanced_wal", "wal_sync": "normal", "checkpoint_every": "1000", "checkpoint_interval": "5m0s", "checkpoint_max_bytes": "67108864"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dsn, err := test.cfg.DSN()
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, rawQuery := splitPublicTestDSN(dsn)
+			query, err := url.ParseQuery(rawQuery)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for key, want := range test.want {
+				if got := query.Get(key); got != want {
+					t.Errorf("%s = %q, want %q in %s", key, got, want, dsn)
+				}
+			}
+		})
+	}
+}
+
+func TestOpenConfigAdvancedOptionsValidation(t *testing.T) {
+	tests := []OpenConfig{
+		{Mode: "mem", StorageMode: "hybrid"},
+		{Mode: "file", FilePath: "x", StorageMode: "unknown"},
+		{Mode: "file", FilePath: "x", StorageMode: "wal", ReadOnly: true},
+		{Mode: "file", FilePath: "x", MaxMemoryBytes: -1},
+		{Mode: "file", FilePath: "x", CheckpointMaxBytes: -2},
+		{Mode: "file", FilePath: "x", WALSync: "unsafe"},
+		{Mode: "file", FilePath: "x", PersistDebounce: time.Microsecond},
+	}
+	for _, cfg := range tests {
+		if _, err := cfg.DSN(); err == nil {
+			t.Errorf("DSN(%+v) succeeded, want validation error", cfg)
+		}
+	}
+}
+
+func TestEmbeddedToolProfilePersistsAcrossReopen(t *testing.T) {
+	ctx := context.Background()
+	cfg := EmbeddedToolOpenConfig(filepath.Join(t.TempDir(), "tool.db"))
+	db, err := OpenWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `CREATE TABLE settings (name TEXT PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO settings VALUES (?, ?)`, "theme", "offline"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = OpenWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var value string
+	if err := db.QueryRowContext(ctx, `SELECT value FROM settings WHERE name = ?`, "theme").Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	if value != "offline" {
+		t.Fatalf("persisted value = %q", value)
+	}
+}
+
+func splitPublicTestDSN(dsn string) (string, string) {
+	if index := strings.IndexByte(dsn, '?'); index >= 0 {
+		return dsn[:index], dsn[index+1:]
+	}
+	return dsn, ""
+}

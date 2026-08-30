@@ -22,8 +22,9 @@ type rows struct {
 	lowerCols  []string
 	i          int
 
-	// onClose owns resources that must outlive a streamed result: the
-	// server's reader slot/RLock and, for a prepared SELECT, its borrowed AST.
+	// onClose owns resources that must outlive a streamed result: the server's
+	// reader slot and, for a prepared SELECT, its borrowed AST. The server
+	// RLock is released once ExecuteStream establishes its storage snapshot.
 	// It is intentionally run only after ResultStream.Close has waited for its
 	// producer, so neither the database nor a pooled prepared execution can be
 	// reused while the producer still references it.
@@ -96,9 +97,21 @@ func (r *rows) Next(dest []driver.Value) error {
 
 func (r *rows) copyRow(row engine.Row, cols []string, dest []driver.Value) error {
 	if r.cachedRS != r.rs || len(r.lowerCols) != len(cols) {
-		r.lowerCols = make([]string, len(cols))
+		// Parser-produced output names are overwhelmingly already lowercase.
+		// Reuse Cols itself in that common case and allocate a separate key slice
+		// only after encountering a name that actually needs case folding.
+		r.lowerCols = cols
+		copied := false
 		for i, c := range cols {
-			r.lowerCols[i] = strings.ToLower(c)
+			lower := strings.ToLower(c)
+			if lower == c {
+				continue
+			}
+			if !copied {
+				r.lowerCols = append([]string(nil), cols...)
+				copied = true
+			}
+			r.lowerCols[i] = lower
 		}
 		r.cachedRS = r.rs
 	}

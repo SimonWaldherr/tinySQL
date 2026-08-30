@@ -230,6 +230,13 @@ type ProcedureContext = engine.ProcedureContext
 // procedures invoked with CALL name(...).
 type StoredProcedureFunc = engine.StoredProcedureFunc
 
+// StoredProcedureParameter describes one positional CALL argument.
+type StoredProcedureParameter = engine.StoredProcedureParameter
+
+// StoredProcedureOptions controls procedure metadata, argument validation,
+// read concurrency and atomic rollback.
+type StoredProcedureOptions = engine.StoredProcedureOptions
+
 // StoredProcedureInfo describes one registered in-memory stored procedure.
 type StoredProcedureInfo = engine.StoredProcedureInfo
 
@@ -1557,6 +1564,12 @@ func RegisterExternalTableFunc(fn ExternalTableFunc) {
 // Registrations are not persisted in database snapshots.
 func RegisterStoredProcedure(name string, fn StoredProcedureFunc) error {
 	return engine.RegisterStoredProcedure(name, fn)
+}
+
+// RegisterStoredProcedureWithOptions registers a process-local procedure with
+// argument metadata, read-only scheduling and optional atomic rollback.
+func RegisterStoredProcedureWithOptions(name string, options StoredProcedureOptions, fn StoredProcedureFunc) error {
+	return engine.RegisterStoredProcedureWithOptions(name, options, fn)
 }
 
 // UnregisterStoredProcedure removes a process-local stored procedure.
