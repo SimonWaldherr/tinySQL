@@ -506,12 +506,16 @@ func ragRowsForAllowedIDs(table *storage.Table, column string, pos int, values [
 	// for mixed SQLite-affinity numeric columns where a type-tagged seek could
 	// otherwise miss a numerically equal value.
 	rows := make([]int, 0, len(values))
+	if pos < 0 {
+		return rows, nil
+	}
 	for rowID, row := range table.Rows {
 		if pos >= len(row) {
 			continue
 		}
+		cell := row[pos]
 		for _, value := range values {
-			if ragFilterValuesEqual(row[pos], value) {
+			if ragFilterValuesEqual(cell, value) {
 				rows = append(rows, rowID)
 				break
 			}
@@ -626,21 +630,22 @@ func ragNormalizeRowIDs(total int, rows []int) []int {
 	if len(rows) == 0 {
 		return nil
 	}
-	out := make([]int, 0, len(rows))
+	// Use a map for O(1) dedup, then extract and sort unique keys
+	seen := make(map[int]struct{}, len(rows))
 	for _, rowID := range rows {
 		if rowID >= 0 && rowID < total {
-			out = append(out, rowID)
+			seen[rowID] = struct{}{}
 		}
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	out := make([]int, 0, len(seen))
+	for rowID := range seen {
+		out = append(out, rowID)
 	}
 	sort.Ints(out)
-	write := 0
-	for _, rowID := range out {
-		if write == 0 || out[write-1] != rowID {
-			out[write] = rowID
-			write++
-		}
-	}
-	return out[:write]
+	return out
 }
 
 func ragIntersectRowIDs(left, right []int) []int {
@@ -715,8 +720,9 @@ func ragVecSearchCandidatesFiltered(ctx context.Context, env ExecEnv, a vecSearc
 
 func ragVecTopKAllowed(ctx context.Context, allowed []int, queryLen, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc, needNorm bool) ([]vecScoredRow, error) {
 	workers := vecSearchWorkerCount(len(allowed), queryLen)
+	rowCount := cache.rowCount()
 	if workers == 1 {
-		h, err := ragVecTopKAllowedRange(ctx, allowed, 0, len(allowed), queryLen, k, cache, distFn, needNorm)
+		h, err := ragVecTopKAllowedRange(ctx, allowed, 0, len(allowed), queryLen, k, cache, distFn, needNorm, rowCount)
 		if err != nil {
 			return nil, err
 		}
@@ -737,11 +743,11 @@ func ragVecTopKAllowed(ctx context.Context, allowed []int, queryLen, k int, cach
 			continue
 		}
 		wg.Add(1)
-		go func(worker, start, end int) {
+		go func(worker, start, end, rc int) {
 			defer wg.Done()
-			h, err := ragVecTopKAllowedRange(ctx, allowed, start, end, queryLen, k, cache, distFn, needNorm)
+			h, err := ragVecTopKAllowedRange(ctx, allowed, start, end, queryLen, k, cache, distFn, needNorm, rc)
 			results[worker] = workerResult{heapRows: h, err: err}
-		}(worker, start, end)
+		}(worker, start, end, rowCount)
 	}
 	wg.Wait()
 
@@ -757,7 +763,7 @@ func ragVecTopKAllowed(ctx context.Context, allowed []int, queryLen, k int, cach
 	return topKFromHeap(merged, k), nil
 }
 
-func ragVecTopKAllowedRange(ctx context.Context, allowed []int, start, end, queryLen, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc, needNorm bool) (vecScoredHeap, error) {
+func ragVecTopKAllowedRange(ctx context.Context, allowed []int, start, end, queryLen, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc, needNorm bool, rowCount int) (vecScoredHeap, error) {
 	heapRows := make(vecScoredHeap, 0, k)
 	for i := start; i < end; i++ {
 		if i&1023 == 0 {
@@ -766,7 +772,7 @@ func ragVecTopKAllowedRange(ctx context.Context, allowed []int, start, end, quer
 			}
 		}
 		rowID := allowed[i]
-		if rowID < 0 || rowID >= cache.rowCount() {
+		if rowID < 0 || rowID >= rowCount {
 			continue
 		}
 		vec, norm, valid := cache.resolveRow(rowID, needNorm)
@@ -894,17 +900,19 @@ func ragIntersectFTSCandidates(candidates ftsCandidates, allowed []int) []int32 
 		}
 		return out
 	}
-	rows := make([]int32, 0, min(len(candidates.rows), len(allowed)))
+	cand := candidates.rows
+	rows := make([]int32, 0, min(len(cand), len(allowed)))
 	i, j := 0, 0
-	for i < len(candidates.rows) && j < len(allowed) {
-		candidate := int(candidates.rows[i])
+	for i < len(cand) && j < len(allowed) {
+		candidate := int(cand[i])
+		allow := allowed[j]
 		switch {
-		case candidate < allowed[j]:
+		case candidate < allow:
 			i++
-		case candidate > allowed[j]:
+		case candidate > allow:
 			j++
 		default:
-			rows = append(rows, candidates.rows[i])
+			rows = append(rows, cand[i])
 			i++
 			j++
 		}

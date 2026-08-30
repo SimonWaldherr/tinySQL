@@ -115,7 +115,8 @@ func (idx *vecHNSWIndex) searchFiltered(ctx context.Context, query []float64, qu
 		return nil, nil
 	}
 	current := idx.entry
-	visited := acquireVisited(cache.rowCount())
+	rowCount := cache.rowCount()
+	visited := acquireVisited(rowCount)
 	defer releaseVisited(visited)
 	scratch := acquireHNSWScratch()
 	defer releaseHNSWScratch(scratch)
