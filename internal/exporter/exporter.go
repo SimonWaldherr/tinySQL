@@ -188,10 +188,11 @@ func ExportCSV(w io.Writer, rs *engine.ResultSet, opts Options) error {
 			return err
 		}
 	}
+	keys := resultColumnKeys(rs.Cols)
+	row := make([]string, len(rs.Cols))
 	for _, r := range rs.Rows {
-		row := make([]string, len(rs.Cols))
-		for i, c := range rs.Cols {
-			row[i] = valueToString(r[strings.ToLower(c)], opts.BinaryEncoding)
+		for i, key := range keys {
+			row[i] = valueToString(r[key], opts.BinaryEncoding)
 		}
 		if err := csvw.Write(row); err != nil {
 			return err
@@ -204,9 +205,21 @@ func ExportCSV(w io.Writer, rs *engine.ResultSet, opts Options) error {
 // jsonRowMap converts one ResultSet row into a map keyed by display column
 // name, applying jsonValue's BLOB envelope handling per Options.
 func jsonRowMap(r engine.Row, cols []string, opts Options) map[string]any {
+	return jsonRowMapWithKeys(r, cols, resultColumnKeys(cols), opts)
+}
+
+func resultColumnKeys(cols []string) []string {
+	keys := make([]string, len(cols))
+	for i, col := range cols {
+		keys[i] = strings.ToLower(col)
+	}
+	return keys
+}
+
+func jsonRowMapWithKeys(r engine.Row, cols, keys []string, opts Options) map[string]any {
 	m := make(map[string]any, len(cols))
-	for _, c := range cols {
-		m[c] = jsonValue(r[strings.ToLower(c)], opts)
+	for i, c := range cols {
+		m[c] = jsonValue(r[keys[i]], opts)
 	}
 	return m
 }
@@ -221,8 +234,9 @@ func ExportJSON(w io.Writer, rs *engine.ResultSet, opts Options) error {
 	if _, err := io.WriteString(w, "["); err != nil {
 		return err
 	}
+	keys := resultColumnKeys(rs.Cols)
 	for i, r := range rs.Rows {
-		m := jsonRowMap(r, rs.Cols, opts)
+		m := jsonRowMapWithKeys(r, rs.Cols, keys, opts)
 		var b []byte
 		var err error
 		if opts.PrettyJSON {
@@ -261,8 +275,9 @@ func ExportJSON(w io.Writer, rs *engine.ResultSet, opts Options) error {
 // large exports. Each line is independently valid JSON.
 func ExportNDJSON(w io.Writer, rs *engine.ResultSet, opts Options) error {
 	enc := json.NewEncoder(w)
+	keys := resultColumnKeys(rs.Cols)
 	for _, r := range rs.Rows {
-		m := jsonRowMap(r, rs.Cols, opts)
+		m := jsonRowMapWithKeys(r, rs.Cols, keys, opts)
 		if err := enc.Encode(m); err != nil {
 			return err
 		}

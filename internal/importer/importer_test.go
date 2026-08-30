@@ -474,6 +474,46 @@ func TestImportJSON_NDJSON(t *testing.T) {
 	}
 }
 
+func TestImportJSONStrictTypesSkipsWholeInvalidRow(t *testing.T) {
+	db := storage.NewDB()
+	input := `[{"id":"1","name":"valid"},{"id":"not-an-int","name":"invalid"},{"id":"3","name":"valid-too"}]`
+	opts := &ImportOptions{
+		CreateTable:   true,
+		TypeInference: true,
+		StrictTypes:   true,
+		SampleRecords: 1,
+		BatchSize:     1,
+	}
+
+	result, err := ImportJSON(context.Background(), db, "default", "strict_json", strings.NewReader(input), opts)
+	if err != nil {
+		t.Fatalf("ImportJSON: %v", err)
+	}
+	if result.RowsInserted != 2 || result.RowsSkipped != 1 {
+		t.Fatalf("inserted/skipped = %d/%d, want 2/1", result.RowsInserted, result.RowsSkipped)
+	}
+	table, err := db.Get("default", "strict_json")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if len(table.Rows) != 2 {
+		t.Fatalf("rows = %d, want 2", len(table.Rows))
+	}
+	nameColumn := -1
+	for i, column := range table.Cols {
+		if column.Name == "name" {
+			nameColumn = i
+			break
+		}
+	}
+	if nameColumn < 0 {
+		t.Fatal("name column not found")
+	}
+	if got := table.Rows[1][nameColumn]; got != "valid-too" {
+		t.Fatalf("second inserted name = %v, want valid-too", got)
+	}
+}
+
 func TestImportJSONRejectsOversizedInput(t *testing.T) {
 	db := storage.NewDB()
 	_, err := ImportJSON(context.Background(), db, "default", "limited",

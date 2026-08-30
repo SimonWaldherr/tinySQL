@@ -298,12 +298,7 @@ func runImportDBIncremental(cfg importDBIncrementalConfig) error {
 	runErr := runIncrementalImport(ctx, db, tenant, extDB, driver, cfg)
 
 	if cfg.dbFile != "" {
-		saveErr := tinysql.SaveToFile(db, cfg.dbFile)
-		// Mirror runImportDB's full-mode -db-file handling: release the WAL
-		// file handle LoadFromFile attaches once the snapshot is written.
-		if closeErr := db.Close(); closeErr != nil && saveErr == nil {
-			saveErr = closeErr
-		}
+		saveErr := checkpointAndClose(db, cfg.dbFile)
 		if saveErr != nil && runErr == nil {
 			runErr = fmt.Errorf("failed to save db file %s: %v", cfg.dbFile, saveErr)
 		}

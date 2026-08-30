@@ -492,6 +492,22 @@ func convertGeoPackageGeometry(value any, layer GeoPackageLayer, mode string) (a
 	if int64(geometry.SRID) != layer.SRID {
 		return nil, fmt.Errorf("geometry SRID %d does not match gpkg_geometry_columns SRID %d", geometry.SRID, layer.SRID)
 	}
+	var decoded geoencoding.WKBResult
+	if !geometry.Empty && !geometry.Extended {
+		decoded, err = geoencoding.DecodeWKB(geometry.WKB)
+		if err != nil {
+			return nil, err
+		}
+		// Requirement 19 embeds OGC WKB. EWKB SRID flags are not part of that
+		// encoding and could contradict the authoritative GeoPackage header.
+		if len(decoded.SRIDs) != 0 {
+			return nil, fmt.Errorf("GeoPackage geometry contains an EWKB SRID; use standard OGC WKB and the GeoPackage header SRS")
+		}
+		actualType, _ := decoded.Geometry["type"].(string)
+		if !geoPackageGeometryTypeMatches(layer.GeometryType, actualType) {
+			return nil, fmt.Errorf("geometry type %s does not match gpkg_geometry_columns type %s", actualType, layer.GeometryType)
+		}
+	}
 	switch mode {
 	case "gpkg":
 		return append([]byte(nil), body...), nil
@@ -501,9 +517,8 @@ func convertGeoPackageGeometry(value any, layer GeoPackageLayer, mode string) (a
 		if geometry.Empty {
 			return nil, nil
 		}
-		decoded, err := geoencoding.DecodeWKB(geometry.WKB)
-		if err != nil {
-			return nil, err
+		if geometry.Extended {
+			return nil, fmt.Errorf("extended GeoPackage geometry cannot be converted to GeoJSON")
 		}
 		encoded, err := json.Marshal(decoded.Geometry)
 		if err != nil {
@@ -512,6 +527,36 @@ func convertGeoPackageGeometry(value any, layer GeoPackageLayer, mode string) (a
 		return json.RawMessage(encoded), nil
 	default:
 		return nil, fmt.Errorf("unsupported internal geometry mode %q", mode)
+	}
+}
+
+func geoPackageGeometryTypeMatches(declared, actual string) bool {
+	declared = strings.ToUpper(strings.TrimSpace(declared))
+	actual = strings.ToUpper(strings.TrimSpace(actual))
+	if declared == "GEOMETRY" {
+		return actual != ""
+	}
+	if declared == actual {
+		return true
+	}
+	// GeoPackage's geometry hierarchy permits these core WKB types in the
+	// corresponding abstract SQL/MM-compatible catalog types.
+	switch declared {
+	case "CURVE":
+		return actual == "LINESTRING"
+	case "SURFACE":
+		return actual == "POLYGON"
+	case "CURVEPOLYGON":
+		return actual == "POLYGON"
+	case "GEOMETRYCOLLECTION":
+		return actual == "GEOMETRYCOLLECTION" || actual == "MULTIPOINT" ||
+			actual == "MULTILINESTRING" || actual == "MULTIPOLYGON"
+	case "MULTICURVE":
+		return actual == "MULTILINESTRING"
+	case "MULTISURFACE":
+		return actual == "MULTIPOLYGON"
+	default:
+		return false
 	}
 }
 

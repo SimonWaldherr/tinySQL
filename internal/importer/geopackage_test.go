@@ -203,6 +203,79 @@ func TestImportGeoPackageRequiresLayerChoice(t *testing.T) {
 	}
 }
 
+func TestImportGeoPackageRejectsEWKBSRID(t *testing.T) {
+	ctx := context.Background()
+	path := createGeoPackageFixture(t, gpkgFixtureLayer{name: "places", srid: 4326, x: 11.5, y: 48.25})
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := fixtureGeoPackageEWKBPoint(4326, 3857, 11.5, 48.25)
+	if _, err := db.Exec(`UPDATE places SET geom = ?`, body); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result, err := ImportGeoPackage(ctx, storage.NewDB(), "default", "places", path, &ImportOptions{CreateTable: true})
+	if err != nil || result.RowsInserted != 0 || result.RowsSkipped != 1 || len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "EWKB SRID") {
+		t.Fatalf("tolerant EWKB SRID result = %#v, error = %v", result, err)
+	}
+	_, err = ImportGeoPackage(ctx, storage.NewDB(), "default", "places_strict", path, &ImportOptions{CreateTable: true, StrictTypes: true})
+	if err == nil || !strings.Contains(err.Error(), "EWKB SRID") {
+		t.Fatalf("EWKB SRID import error = %v", err)
+	}
+}
+
+func TestImportGeoPackageRejectsCatalogGeometryTypeMismatch(t *testing.T) {
+	ctx := context.Background()
+	path := createGeoPackageFixture(t, gpkgFixtureLayer{name: "places", srid: 4326, x: 11.5, y: 48.25})
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE gpkg_geometry_columns SET geometry_type_name = 'LINESTRING' WHERE table_name = 'places'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result, err := ImportGeoPackage(ctx, storage.NewDB(), "default", "places", path, &ImportOptions{CreateTable: true})
+	if err != nil || result.RowsInserted != 0 || result.RowsSkipped != 1 || len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "does not match") {
+		t.Fatalf("tolerant type mismatch result = %#v, error = %v", result, err)
+	}
+	_, err = ImportGeoPackage(ctx, storage.NewDB(), "default", "places_strict", path, &ImportOptions{CreateTable: true, StrictTypes: true})
+	if err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("geometry type mismatch error = %v", err)
+	}
+}
+
+func TestGeoPackageGeometryTypeAssignability(t *testing.T) {
+	tests := []struct {
+		declared string
+		actual   string
+		want     bool
+	}{
+		{"GEOMETRY", "Point", true},
+		{"POINT", "Point", true},
+		{"CURVE", "LineString", true},
+		{"SURFACE", "Polygon", true},
+		{"CURVEPOLYGON", "Polygon", true},
+		{"GEOMETRYCOLLECTION", "MultiPoint", true},
+		{"GEOMETRYCOLLECTION", "MultiLineString", true},
+		{"GEOMETRYCOLLECTION", "MultiPolygon", true},
+		{"MULTICURVE", "MultiLineString", true},
+		{"MULTISURFACE", "MultiPolygon", true},
+		{"POINT", "LineString", false},
+		{"GEOMETRYCOLLECTION", "Point", false},
+	}
+	for _, tc := range tests {
+		if got := geoPackageGeometryTypeMatches(tc.declared, tc.actual); got != tc.want {
+			t.Errorf("geoPackageGeometryTypeMatches(%q, %q) = %v, want %v", tc.declared, tc.actual, got, tc.want)
+		}
+	}
+}
+
 func TestImportGeoPackageReaderAndFileDetection(t *testing.T) {
 	ctx := context.Background()
 	path := createGeoPackageFixture(t, gpkgFixtureLayer{name: "places", srid: 4326, x: 11.5, y: 48.25})
@@ -271,4 +344,19 @@ func TestInspectGeoPackageAcceptsLegacyStandardIDs(t *testing.T) {
 			t.Fatalf("legacy id 0x%x version = %q, want %q", tc.id, info.Version, tc.version)
 		}
 	}
+}
+
+func fixtureGeoPackageEWKBPoint(headerSRID, embeddedSRID int32, x, y float64) []byte {
+	body := make([]byte, 40+25)
+	copy(body, []byte{'G', 'P', 0, 0x03})
+	binary.LittleEndian.PutUint32(body[4:], uint32(headerSRID))
+	for i, value := range []float64{x, x, y, y} {
+		binary.LittleEndian.PutUint64(body[8+i*8:], math.Float64bits(value))
+	}
+	body[40] = 1
+	binary.LittleEndian.PutUint32(body[41:], uint32(1)|0x20000000)
+	binary.LittleEndian.PutUint32(body[45:], uint32(embeddedSRID))
+	binary.LittleEndian.PutUint64(body[49:], math.Float64bits(x))
+	binary.LittleEndian.PutUint64(body[57:], math.Float64bits(y))
+	return body
 }

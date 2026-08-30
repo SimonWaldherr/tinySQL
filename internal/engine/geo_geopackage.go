@@ -103,8 +103,12 @@ func evalGeoFromGPKG(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := geoRequireWGS84SRID(ex.Name, int64(geometry.SRID)); err != nil {
-		return nil, err
+	// Unlike an absent EWKT/EWKB SRID, a GeoPackage header always carries an
+	// explicit SRS identifier. GeoPackage reserves 0 for an undefined
+	// geographic CRS and -1 for an undefined Cartesian CRS; neither may be
+	// interpreted as RFC 7946 WGS84 longitude/latitude.
+	if geometry.SRID != geoWGS84SRID {
+		return nil, fmt.Errorf("%s: GeoPackage SRS %d is not EPSG:4326; reproject explicitly before GeoJSON conversion", ex.Name, geometry.SRID)
 	}
 	if geometry.Empty {
 		return nil, nil

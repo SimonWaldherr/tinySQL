@@ -59,3 +59,39 @@ func TestParseGeometryRejectsMalformedHeaders(t *testing.T) {
 		}
 	}
 }
+
+func TestParseGeometryRejectsEnvelopeOnEmptyGeometry(t *testing.T) {
+	data := make([]byte, 8+32)
+	copy(data, []byte{'G', 'P', 0, 0x13}) // little endian, empty, XY envelope
+	binary.LittleEndian.PutUint32(data[4:], uint32(4326))
+	if _, err := ParseGeometry(data); err == nil {
+		t.Fatal("empty GeoPackageBinary geometry with an envelope should fail")
+	}
+}
+
+func TestParseGeometryValidatesEveryEnvelopeOrdinate(t *testing.T) {
+	tests := []struct {
+		name   string
+		flags  byte
+		values []float64
+	}{
+		{"non-finite Z", 0x05, []float64{0, 1, 0, 1, math.NaN(), 2}},
+		{"inverted Z", 0x05, []float64{0, 1, 0, 1, 3, 2}},
+		{"non-finite M", 0x07, []float64{0, 1, 0, 1, 0, math.Inf(1)}},
+		{"inverted M in XYZM", 0x09, []float64{0, 1, 0, 1, 0, 2, 4, 3}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			data := make([]byte, 8+len(tc.values)*8)
+			copy(data, []byte{'G', 'P', 0, tc.flags})
+			binary.LittleEndian.PutUint32(data[4:], uint32(4326))
+			for i, value := range tc.values {
+				binary.LittleEndian.PutUint64(data[8+i*8:], math.Float64bits(value))
+			}
+			data = append(data, 1) // non-empty payload; header validation runs first
+			if _, err := ParseGeometry(data); err == nil {
+				t.Fatalf("ParseGeometry accepted invalid envelope %v", tc.values)
+			}
+		})
+	}
+}

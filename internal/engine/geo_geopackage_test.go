@@ -59,6 +59,17 @@ func TestGeoPackageDoesNotRelabelProjectedCoordinates(t *testing.T) {
 	}
 }
 
+func TestGeoPackageDoesNotRelabelUndefinedGeographicSRS(t *testing.T) {
+	body := gpkgPointBlob(t, 0, 11.5, 48.25)
+	hex := fmt.Sprintf("%x", body)
+	if err := tileEvalErr(t, "GEO_FROM_GPKG(BLOB_FROM_HEX('"+hex+"'))"); err == nil {
+		t.Fatal("GEO_FROM_GPKG should reject GeoPackage SRS 0 because it is undefined, not EPSG:4326")
+	}
+	if got := tileEval(t, "GPKG_SRID(BLOB_FROM_HEX('"+hex+"'))"); got != int64(0) {
+		t.Fatalf("undefined GPKG_SRID = %v", got)
+	}
+}
+
 func TestGeoWKBISODimensions(t *testing.T) {
 	// ISO SQL/MM Point ZM type 3001. The M value is consumed but GeoJSON has
 	// nowhere to store it; Z remains the third coordinate.

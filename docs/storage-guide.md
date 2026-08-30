@@ -132,6 +132,20 @@ not lose data), and only move to `Hybrid`/`Index`/`PagedIndex` once you've
 actually measured that the dataset doesn't fit in memory — most applications
 never need to.
 
+### Online snapshots and backups
+
+`SaveToFile`, `SaveToWriter`, and `SaveToBytes` capture tables and catalog as
+one detached image. The database read lock is held only while copying that
+image; GOB encoding, optional gzip compression, filesystem flushes, and a slow
+`io.Writer` run after the lock is released. `SaveToFile` writes a unique
+temporary sibling, fsyncs it, renames it over the destination, and syncs the
+directory, so concurrent backup calls cannot share a partial temporary file.
+
+For a database with an attached WAL, checkpoint through the WAL manager (or
+`DB.Close`) when writing its own checkpoint path. This records the replay
+watermark together with the snapshot. `SaveToFile` remains suitable for a
+separate backup destination.
+
 ### Reference table
 
 | Mode | String | RAM usage | Crash durability | Best for | Main tradeoff |

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -192,6 +193,62 @@ func TestSaveSyncStateIsAtomic(t *testing.T) {
 	}
 	if len(got.Keys) != 2 {
 		t.Fatalf("expected state from second save to win, got Keys=%v", got.Keys)
+	}
+}
+
+func TestSaveSyncStateConcurrentWritersLeaveValidFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	states := []*TableSyncState{
+		{Keys: []string{"a"}, UpdatedAt: time.Now().UTC()},
+		{Keys: []string{"b", "c"}, UpdatedAt: time.Now().UTC()},
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, len(states))
+	for _, state := range states {
+		wg.Add(1)
+		go func(state *TableSyncState) {
+			defer wg.Done()
+			errs <- saveSyncState(path, state)
+		}(state)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("saveSyncState: %v", err)
+		}
+	}
+
+	got, err := loadSyncState(path)
+	if err != nil {
+		t.Fatalf("loadSyncState: %v", err)
+	}
+	if len(got.Keys) != 1 && len(got.Keys) != 2 {
+		t.Fatalf("concurrent result is not either complete state: %+v", got)
+	}
+	matchesFirst := len(got.Keys) == 1 && got.Keys[0] == "a"
+	matchesSecond := len(got.Keys) == 2 && got.Keys[0] == "b" && got.Keys[1] == "c"
+	if !matchesFirst && !matchesSecond {
+		t.Fatalf("concurrent result mixed states: %+v", got)
+	}
+	leftovers, err := filepath.Glob(filepath.Join(dir, "state.json.tmp*"))
+	if err != nil {
+		t.Fatalf("Glob: %v", err)
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("temporary files left behind: %v", leftovers)
+	}
+}
+
+func TestLoadSyncStateRejectsTrailingJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, []byte(`{"keys":[]} {"keys":["unexpected"]}`), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, err := loadSyncState(path); err == nil {
+		t.Fatal("loadSyncState accepted a second JSON value")
 	}
 }
 

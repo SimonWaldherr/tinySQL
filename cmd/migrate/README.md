@@ -153,6 +153,13 @@ migrate export-db -dsn "mysql://user:pass@tcp(localhost:3306)/mydb" \
 Rows are appended to the target table; existing rows are not removed. Verify
 the target name before running against a production database.
 
+Incremental database sync stores its key, watermark, and row-hash state as a
+streamed JSON file. State replacement uses a unique sibling temporary file,
+flushes file and directory metadata, and renames atomically; overlapping sync
+runs therefore leave either complete state file, never a mixture or a partial
+write. Missing state still starts a full first sync, while malformed or
+concatenated state is rejected instead of being applied partially.
+
 ### pipeline
 
 ```bash

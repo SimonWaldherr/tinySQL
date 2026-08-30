@@ -60,7 +60,12 @@ accuracy metadata are not approximated invisibly.
 Use `InspectGeoPackage` before importing a multi-layer file. The selected
 layer's standard catalog metadata is written to `<target>_metadata`, including
 source layer, geometry type, SRS definition, bounds, timestamp and encoding
-mode.
+mode. SRS identifiers `0` and `-1` retain their GeoPackage meaning as
+undefined geographic and Cartesian systems; neither is interpreted as WGS84.
+For standard GeoPackageBinary rows, the importer rejects EWKB SRID flags and
+checks that the decoded geometry is assignable to the catalog geometry type.
+In tolerant mode such rows are reported and skipped; `StrictTypes: true`
+aborts immediately.
 
 ## Priorities for further interoperability
 

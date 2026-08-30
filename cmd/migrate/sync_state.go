@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -129,15 +133,24 @@ func defaultStateFilePath(sourceID, targetID, table string, keyCols []string) st
 // loadSyncState reads the sync state at path. A missing file is not an
 // error: it returns a zero-value state, representing "no prior sync".
 func loadSyncState(path string) (*TableSyncState, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return &TableSyncState{}, nil
 		}
 		return nil, fmt.Errorf("read sync state %s: %w", path, err)
 	}
+	defer func() { _ = f.Close() }()
+	dec := json.NewDecoder(bufio.NewReader(f))
 	var state TableSyncState
-	if err := json.Unmarshal(data, &state); err != nil {
+	if err := dec.Decode(&state); err != nil {
+		return nil, fmt.Errorf("parse sync state %s: %w", path, err)
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = fmt.Errorf("unexpected trailing JSON value")
+		}
 		return nil, fmt.Errorf("parse sync state %s: %w", path, err)
 	}
 	return &state, nil
@@ -152,17 +165,53 @@ func saveSyncState(path string, state *TableSyncState) error {
 		return fmt.Errorf("create sync state dir %s: %w", dir, err)
 	}
 
-	data, err := json.MarshalIndent(state, "", "  ")
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp*")
 	if err != nil {
-		return fmt.Errorf("marshal sync state: %w", err)
+		return fmt.Errorf("create sync state tmp file in %s: %w", dir, err)
 	}
-
-	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
-		return fmt.Errorf("write sync state tmp file %s: %w", tmpPath, err)
+	tmpPath := f.Name()
+	fail := func(err error) error {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := f.Chmod(0o644); err != nil {
+		return fail(fmt.Errorf("set sync state permissions: %w", err))
+	}
+	bw := bufio.NewWriter(f)
+	enc := json.NewEncoder(bw)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(state); err != nil {
+		return fail(fmt.Errorf("encode sync state: %w", err))
+	}
+	if err := bw.Flush(); err != nil {
+		return fail(fmt.Errorf("flush sync state: %w", err))
+	}
+	if err := f.Sync(); err != nil {
+		return fail(fmt.Errorf("sync state file: %w", err))
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close sync state tmp file: %w", err)
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("rename sync state tmp file %s to %s: %w", tmpPath, path, err)
+	}
+	return syncStateDir(dir)
+}
+
+func syncStateDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open sync state dir %s: %w", dir, err)
+	}
+	defer func() { _ = d.Close() }()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("sync state dir %s: %w", dir, err)
 	}
 	return nil
 }
@@ -224,11 +273,14 @@ const keyPartSeparator = "\x1f"
 // computeRowKey joins the canonicalized forms of keyVals into a single
 // stable row-key string usable as a map key.
 func computeRowKey(keyVals []any) string {
-	parts := make([]string, len(keyVals))
+	var key strings.Builder
 	for i, v := range keyVals {
-		parts[i] = canonicalKeyPart(v)
+		if i > 0 {
+			key.WriteString(keyPartSeparator)
+		}
+		key.WriteString(canonicalKeyPart(v))
 	}
-	return strings.Join(parts, keyPartSeparator)
+	return key.String()
 }
 
 // rowContentHash computes a SHA-256 hex digest over the canonicalized

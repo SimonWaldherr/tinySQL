@@ -60,6 +60,9 @@ func TestCRSAxisOrderGermanAndEuropeanProfiles(t *testing.T) {
 func TestCRSIdentifierValidation(t *testing.T) {
 	for _, sql := range []string{
 		"CRS_NORMALIZE('')",
+		"CRS_NORMALIZE(0)",
+		"CRS_NORMALIZE('0')",
+		"CRS_NORMALIZE('EPSG:0')",
 		"CRS_NORMALIZE('BAYERN:UTM32')",
 		"CRS_NORMALIZE(25832.5)",
 		"CRS_NORMALIZE(NULL)",

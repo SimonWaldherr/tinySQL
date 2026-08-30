@@ -44,6 +44,7 @@ func ParseGeometry(data []byte) (Geometry, error) {
 		return Geometry{}, fmt.Errorf("GeoPackageBinary: reserved flag bits must be zero")
 	}
 	envelopeCode := int((flags >> 1) & 0x07)
+	empty := flags&0x10 != 0
 	envelopeDoubles := 0
 	switch envelopeCode {
 	case 0:
@@ -56,6 +57,9 @@ func ParseGeometry(data []byte) (Geometry, error) {
 	default:
 		return Geometry{}, fmt.Errorf("GeoPackageBinary: invalid envelope indicator %d", envelopeCode)
 	}
+	if empty && envelopeCode != 0 {
+		return Geometry{}, fmt.Errorf("GeoPackageBinary: empty geometry must not contain an envelope")
+	}
 	headerLen := fixedHeaderSize + envelopeDoubles*8
 	if len(data) < headerLen {
 		return Geometry{}, fmt.Errorf("GeoPackageBinary: truncated %d-byte header (input is %d bytes)", headerLen, len(data))
@@ -67,7 +71,7 @@ func ParseGeometry(data []byte) (Geometry, error) {
 	}
 	g := Geometry{
 		Version: version, SRID: int32(order.Uint32(data[4:8])),
-		Empty: flags&0x10 != 0, Extended: flags&0x20 != 0,
+		Empty: empty, Extended: flags&0x20 != 0,
 		HeaderLen: headerLen,
 	}
 	if envelopeDoubles > 0 {
@@ -76,14 +80,15 @@ func ParseGeometry(data []byte) (Geometry, error) {
 			bits := order.Uint64(data[fixedHeaderSize+i*8:])
 			g.Envelope[i] = math.Float64frombits(bits)
 		}
-		if finiteEnvelope(g.Envelope[:4]) {
-			if g.Envelope[0] > g.Envelope[1] || g.Envelope[2] > g.Envelope[3] {
-				return Geometry{}, fmt.Errorf("GeoPackageBinary: envelope minima exceed maxima")
-			}
-			g.BBox = []float64{g.Envelope[0], g.Envelope[2], g.Envelope[1], g.Envelope[3]}
-		} else if !g.Empty {
-			return Geometry{}, fmt.Errorf("GeoPackageBinary: non-empty geometry has a non-finite XY envelope")
+		if !finiteEnvelope(g.Envelope) {
+			return Geometry{}, fmt.Errorf("GeoPackageBinary: non-empty geometry has a non-finite envelope")
 		}
+		for i := 0; i < len(g.Envelope); i += 2 {
+			if g.Envelope[i] > g.Envelope[i+1] {
+				return Geometry{}, fmt.Errorf("GeoPackageBinary: envelope minimum exceeds maximum for ordinate pair %d", i/2+1)
+			}
+		}
+		g.BBox = []float64{g.Envelope[0], g.Envelope[2], g.Envelope[1], g.Envelope[3]}
 	}
 	g.WKB = data[headerLen:]
 	if !g.Empty && len(g.WKB) == 0 {

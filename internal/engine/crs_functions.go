@@ -94,7 +94,7 @@ func parseCRSIdentifier(value any) (crsIdentifier, error) {
 			URI: "http://www.opengis.net/def/crs/OGC/1.3/CRS84",
 		}, nil
 	}
-	if n, err := strconv.ParseUint(raw, 10, 31); err == nil {
+	if n, err := strconv.ParseUint(raw, 10, 31); err == nil && n > 0 {
 		return epsgCRS(strconv.FormatUint(n, 10)), nil
 	}
 

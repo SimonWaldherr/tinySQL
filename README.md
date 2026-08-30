@@ -641,7 +641,10 @@ result, err := importer.ImportGeoPackage(ctx, db, "default", "features",
 GeoJSON. Geometry in EPSG:25832, EPSG:3035, DHDN or another projected/native
 CRS remains an intact GeoPackageBinary BLOB; use `"wkb"` to strip only its
 container header. This deliberately prevents metres from being silently
-treated as RFC 7946 longitude/latitude.
+treated as RFC 7946 longitude/latitude. GeoPackage SRS identifiers `0` and
+`-1` remain undefined and are never treated as WGS84. Standard-WKB payloads
+are checked against the header SRS and catalog geometry type; tolerant imports
+skip invalid rows, while `StrictTypes: true` aborts the import.
 
 MBTiles import/export uses the same build profile:
 
@@ -726,6 +729,14 @@ self-identifying encodings and can emit a table manifest with schema, row
 count, and a typed-row SHA-256 fingerprint. See
 [`ExampleExportJSON`](./exporter/example_test.go).
 
+CSV input is sampled only for type inference and then inserted in bounded
+batches. JSON imports likewise bound their inference copy and use the same
+batch path, including direct appends to paged-index storage. CSV, JSON, and
+NDJSON exports write incrementally and keep only one output row in working
+memory. Tune `ImportOptions.BatchSize` for the destination: larger batches
+favor bulk throughput, while smaller batches reduce peak memory and
+cancellation latency.
+
 `ExportGeoJSON`/`ExportTopoJSON` turn a query result's geometry column (named
 explicitly, or auto-detected when exactly one candidate exists) plus every
 other selected column into a GeoJSON `FeatureCollection` or TopoJSON
@@ -759,6 +770,10 @@ Use `OpenDB` with a `StorageConfig` for persistent storage. Health checks,
 read-only operation, audit logging, and lifecycle helpers are available for
 embedded services. Encryption at rest covers table files in supported disk
 backends; see the [storage guide](./docs/storage-guide.md) for exact scope.
+Whole-database backups copy a consistent in-memory image under the database
+read lock, then release that lock before encoding, compression, filesystem
+sync, or network output. A slow backup target therefore does not hold up
+concurrent writers for the duration of the transfer.
 
 For high-repeat vector searches, `ConfigureVectorCache` can enable a bounded,
 process-local result cache and anonymous shape/timing analytics. See the

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -323,62 +324,10 @@ func sanitizeTableName(name string) string {
 //   - JSON Lines format: {"id": 1, "name": "Alice"}\n{"id": 2, "name": "Bob"}
 //   - Single object: {"id": 1, "name": "Alice"} (creates single-row table)
 //
-// decodeJSONArray decodes a JSON array from a reader
-//
-//nolint:gocyclo // JSON import supports arrays, objects, and error recovery in one routine.
-func decodeJSONArray(br *bufio.Reader, result *ImportResult) ([]map[string]any, error) {
-	records := []map[string]any{}
-	dec := json.NewDecoder(br)
-	// consume '['
-	tok, err := dec.Token()
-	if err != nil {
-		return nil, fmt.Errorf("read JSON array token: %w", err)
-	}
-	if delim, ok := tok.(json.Delim); !ok || delim != '[' {
-		return nil, fmt.Errorf("expected JSON array")
-	}
-	for dec.More() {
-		var rec map[string]any
-		if err := dec.Decode(&rec); err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("decode record: %v", err))
-			continue
-		}
-		records = append(records, rec)
-	}
-	return records, nil
-}
-
-// decodeNDJSON decodes newline-delimited JSON from a reader
-func decodeNDJSON(br *bufio.Reader, result *ImportResult, maxRecordBytes int) ([]map[string]any, error) {
-	records := []map[string]any{}
-	scanner := bufio.NewScanner(br)
-	if maxRecordBytes > 0 {
-		initialBuffer := maxRecordBytes
-		if initialBuffer > 64*1024 {
-			initialBuffer = 64 * 1024
-		}
-		scanner.Buffer(make([]byte, initialBuffer), maxRecordBytes)
-	}
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var rec map[string]any
-		if err := json.Unmarshal([]byte(line), &rec); err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("decode record: %v", err))
-			continue
-		}
-		records = append(records, rec)
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scan NDJSON: %w", err)
-	}
-	return records, nil
-}
-
-// extractJSONRecords extracts records from JSON input (array or NDJSON)
-func extractJSONRecords(src io.Reader, result *ImportResult, maxRecordBytes int) ([]map[string]any, error) {
+// streamJSONRecords returns a pull-based decoder for JSON arrays, single
+// objects and NDJSON. ImportJSON can therefore retain only its inference
+// sample and current insert batch instead of materializing the whole input.
+func streamJSONRecords(src io.Reader, result *ImportResult, maxRecordBytes int) (func() (map[string]any, error), error) {
 	br := bufio.NewReader(src)
 	peek, err := br.Peek(512)
 	if err != nil && err != io.EOF {
@@ -387,10 +336,60 @@ func extractJSONRecords(src io.Reader, result *ImportResult, maxRecordBytes int)
 	trimmed := strings.TrimSpace(string(peek))
 
 	if strings.HasPrefix(trimmed, "[") {
-		return decodeJSONArray(br, result)
+		dec := json.NewDecoder(br)
+		tok, err := dec.Token()
+		if err != nil {
+			return nil, fmt.Errorf("read JSON array token: %w", err)
+		}
+		if delim, ok := tok.(json.Delim); !ok || delim != '[' {
+			return nil, fmt.Errorf("expected JSON array")
+		}
+		closed := false
+		return func() (map[string]any, error) {
+			if closed {
+				return nil, io.EOF
+			}
+			if !dec.More() {
+				if _, err := dec.Token(); err != nil {
+					return nil, fmt.Errorf("close JSON array: %w", err)
+				}
+				closed = true
+				return nil, io.EOF
+			}
+			var rec map[string]any
+			if err := dec.Decode(&rec); err != nil {
+				return nil, fmt.Errorf("decode JSON record: %w", err)
+			}
+			return rec, nil
+		}, nil
 	}
 	if strings.HasPrefix(trimmed, "{") {
-		return decodeNDJSON(br, result, maxRecordBytes)
+		scanner := bufio.NewScanner(br)
+		if maxRecordBytes > 0 {
+			initialBuffer := maxRecordBytes
+			if initialBuffer > 64*1024 {
+				initialBuffer = 64 * 1024
+			}
+			scanner.Buffer(make([]byte, initialBuffer), maxRecordBytes)
+		}
+		return func() (map[string]any, error) {
+			for scanner.Scan() {
+				line := strings.TrimSpace(scanner.Text())
+				if line == "" {
+					continue
+				}
+				var rec map[string]any
+				if err := json.Unmarshal([]byte(line), &rec); err != nil {
+					result.Errors = append(result.Errors, fmt.Sprintf("decode record: %v", err))
+					continue
+				}
+				return rec, nil
+			}
+			if err := scanner.Err(); err != nil {
+				return nil, fmt.Errorf("scan NDJSON: %w", err)
+			}
+			return nil, io.EOF
+		}, nil
 	}
 	return nil, fmt.Errorf("unsupported JSON format")
 }
@@ -430,71 +429,121 @@ func ImportJSON(
 		Errors:   make([]string, 0),
 	}
 
-	// Extract records from JSON
-	records, err := extractJSONRecords(src, result, opts.MaxRecordBytes)
+	nextRecord, err := streamJSONRecords(src, result, opts.MaxRecordBytes)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(records) == 0 {
+	// Buffer only the bounded inference sample. These records are inserted
+	// before pulling the rest of the stream.
+	sampleRecords := make([]map[string]any, 0, opts.SampleRecords)
+	for len(sampleRecords) < opts.SampleRecords {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		rec, err := nextRecord()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		sampleRecords = append(sampleRecords, rec)
+	}
+	if len(sampleRecords) == 0 {
 		return nil, fmt.Errorf("no records found in JSON")
 	}
 
 	// Extract column names from first record
-	colNames := make([]string, 0, len(records[0]))
-	for key := range records[0] {
+	colNames := make([]string, 0, len(sampleRecords[0]))
+	for key := range sampleRecords[0] {
 		colNames = append(colNames, key)
 	}
 	sanitizeColumnNames(colNames)
 	result.ColumnNames = colNames
 
-	// Build sample data for type inference
-	sampleData := buildJSONSampleData(records, colNames)
+	sampleData := buildJSONSampleData(sampleRecords, colNames)
 
 	// Infer types
 	colTypes := inferOrDefaultColumnTypes(sampleData, len(colNames), opts)
 	result.ColumnTypes = colTypes
 
-	// Create table
-	if opts.CreateTable {
-		if err := createTable(ctx, db, tenant, tableName, colNames, colTypes); err != nil {
-			return nil, err
+	// Convert and insert in bounded batches. This shares the fast append path
+	// used by the geodata importers and keeps paged-index destinations from
+	// materializing the entire table in memory.
+	batch := make([][]any, 0, opts.BatchSize)
+	batchOpts := *opts
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
 		}
-	}
-
-	// Truncate if requested
-	if opts.Truncate {
-		if err := truncateTable(ctx, db, tenant, tableName); err != nil {
-			return nil, err
+		if err := insertTypedRows(ctx, db, tenant, tableName, colNames, colTypes, batch, &batchOpts, result); err != nil {
+			return err
 		}
+		batch = batch[:0]
+		batchOpts.CreateTable = false
+		batchOpts.Truncate = false
+		return nil
 	}
-
-	// Insert data
-	tbl, err := db.Get(tenant, tableName)
-	if err != nil {
-		return nil, fmt.Errorf("get table: %w", err)
-	}
-
-	for i, rec := range records {
+	recordNumber := 0
+	convertAndQueue := func(rec map[string]any) error {
+		recordNumber++
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return err
 		}
 		row := make([]any, len(colNames))
+		valid := true
 		for j, col := range colNames {
 			if val, ok := rec[col]; ok {
 				converted, err := convertValue(fmt.Sprintf("%v", val), colTypes[j],
 					opts.DateTimeFormats, opts.NullLiterals)
 				if err != nil && opts.StrictTypes {
 					result.Errors = append(result.Errors,
-						fmt.Sprintf("row %d, col %s: %v", i+1, col, err))
+						fmt.Sprintf("row %d, col %s: %v", recordNumber, col, err))
 					result.RowsSkipped++
-					continue
+					valid = false
+					break
 				}
 				row[j] = converted
 			}
 		}
-		tbl.Rows = append(tbl.Rows, row)
-		result.RowsInserted++
+		if !valid {
+			return nil
+		}
+		batch = append(batch, row)
+		if len(batch) == opts.BatchSize {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, rec := range sampleRecords {
+		if err := convertAndQueue(rec); err != nil {
+			return nil, err
+		}
+	}
+	for {
+		rec, err := nextRecord()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if err := convertAndQueue(rec); err != nil {
+			return nil, err
+		}
+	}
+	if err := flush(); err != nil {
+		return nil, err
+	}
+	// Preserve CreateTable/Truncate semantics even when strict conversion
+	// rejected every record before the first batch was flushed.
+	if batchOpts.CreateTable || batchOpts.Truncate {
+		if err := insertTypedRows(ctx, db, tenant, tableName, colNames, colTypes, nil, &batchOpts, result); err != nil {
+			return nil, err
+		}
 	}
 
 	return result, nil

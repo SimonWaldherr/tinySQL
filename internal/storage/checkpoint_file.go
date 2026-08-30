@@ -49,24 +49,10 @@ func SaveToFile(db *DB, filename string, extra ...any) error {
 		}
 	}
 
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-
-	// Pre-allocate dump slice with estimated capacity
-	var totalTables int
-	for _, tdb := range db.tenants {
-		totalTables += len(tdb.tables)
-	}
-	dump := make([]diskTable, 0, totalTables)
-	for tn, tdb := range db.tenants {
-		for _, t := range tdb.tables {
-			dump = append(dump, tableToDisk(tn, t))
-		}
-	}
-
 	if err := os.MkdirAll(filepath.Dir(filename), 0o755); err != nil && !errors.Is(err, os.ErrExist) {
 		return err
 	}
+	dump, catalog := snapshotForCheckpoint(db)
 	// A unique temporary name, not a fixed "<filename>.tmp". Two saves of the
 	// same database can overlap — driver autosave on one connection while
 	// another checkpoints, or two goroutines calling Sync — and a shared
@@ -95,7 +81,7 @@ func SaveToFile(db *DB, filename string, extra ...any) error {
 	if err := enc.Encode(dump); err != nil {
 		return fail(err)
 	}
-	if err := enc.Encode(catalogToDisk(db.Catalog())); err != nil {
+	if err := enc.Encode(catalog); err != nil {
 		return fail(err)
 	}
 	for _, v := range extra {
@@ -185,9 +171,30 @@ func LoadFromFile(filename string) (*DB, error) {
 // pass no extra values are unaffected; the encoded format for them is
 // unchanged.
 func SaveToWriter(db *DB, w io.Writer, extra ...any) error {
+	dump, catalog := snapshotForCheckpoint(db)
+	bw := bufio.NewWriter(w)
+	enc := gob.NewEncoder(bw)
+	if err := enc.Encode(dump); err != nil {
+		return err
+	}
+	if err := enc.Encode(catalog); err != nil {
+		return err
+	}
+	for _, v := range extra {
+		if err := enc.Encode(v); err != nil {
+			return err
+		}
+	}
+	return bw.Flush()
+}
+
+// snapshotForCheckpoint copies the complete serializable state while holding
+// the database read lock. Encoding, compression and file I/O then operate on
+// that detached image, so a slow backup destination does not stall writers.
+func snapshotForCheckpoint(db *DB) ([]diskTable, diskCatalog) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	// Pre-allocate dump slice with estimated capacity
+
 	var totalTables int
 	for _, tdb := range db.tenants {
 		totalTables += len(tdb.tables)
@@ -198,20 +205,7 @@ func SaveToWriter(db *DB, w io.Writer, extra ...any) error {
 			dump = append(dump, tableToDisk(tn, t))
 		}
 	}
-	bw := bufio.NewWriter(w)
-	enc := gob.NewEncoder(bw)
-	if err := enc.Encode(dump); err != nil {
-		return err
-	}
-	if err := enc.Encode(catalogToDisk(db.Catalog())); err != nil {
-		return err
-	}
-	for _, v := range extra {
-		if err := enc.Encode(v); err != nil {
-			return err
-		}
-	}
-	return bw.Flush()
+	return dump, catalogToDisk(db.Catalog())
 }
 
 // LoadFromReader loads a database snapshot from an arbitrary reader.

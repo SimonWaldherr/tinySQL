@@ -302,19 +302,31 @@ func runImportDB(args []string) error {
 	}
 
 	if *dbFile != "" {
-		saveErr := tinysql.SaveToFile(db, *dbFile)
-		// Loading via tinysql.LoadFromFile attaches a WAL manager (an open
-		// file handle) to db; release it now that the snapshot has been
-		// written, rather than leaking it until process exit.
-		if closeErr := db.Close(); closeErr != nil && saveErr == nil {
-			saveErr = closeErr
-		}
+		saveErr := checkpointAndClose(db, *dbFile)
 		if saveErr != nil && runErr == nil {
 			runErr = fmt.Errorf("failed to save db file %s: %v", *dbFile, saveErr)
 		}
 	}
 
 	return runErr
+}
+
+// checkpointAndClose persists db through its attached WAL when present so the
+// snapshot and replay watermark advance atomically. Fresh in-memory databases
+// have no WAL and use the regular atomic snapshot path.
+func checkpointAndClose(db *tinysql.DB, path string) error {
+	var saveErr error
+	if wal := db.AdvancedWAL(); wal != nil {
+		saveErr = wal.Checkpoint(db)
+	} else if wal := db.WAL(); wal != nil {
+		saveErr = wal.Checkpoint(db)
+	} else {
+		saveErr = tinysql.SaveToFile(db, path)
+	}
+	if closeErr := db.Close(); closeErr != nil && saveErr == nil {
+		saveErr = closeErr
+	}
+	return saveErr
 }
 
 // ============================================================================
