@@ -36,6 +36,9 @@ The public result schemas and SQL APIs remain unchanged.
 `RAG_SEARCH` and `HYBRID_SEARCH` accept an explicit `pre_filter` options
 object. It supports stable `allowed_row_ids` (using `id_column`, or a
 single-column primary key by default) and an AND of `equals` metadata values.
+It also supports an indexed WGS84 `spatial` bbox or centroid-radius boundary
+for georeferenced corpora; all supplied restrictions are intersected before
+ranking.
 `VEC_SEARCH_FILTERED` and `FTS_SEARCH_FILTERED` expose the same object for
 standalone retrieval without overloading the legacy positional APIs.
 
@@ -50,9 +53,9 @@ Neighbor expansion uses the same set, so it cannot expose an otherwise
 forbidden adjacent chunk. ACL, candidate-slot, context-boundary, stable-ID, and
 tenant-namespace regression tests cover the contract.
 
-Current limitation: range predicates and a filter-aware ANN frontier are not
-yet exposed. Filtered vector retrieval deliberately uses exact ranking until an
-ANN structure can guarantee recall inside an allowed subset.
+Current limitation: ordinary scalar range predicates are not yet exposed.
+Filtered HNSW is process-local and built from the already-authorized row set,
+so it never filters a global ANN frontier after candidate selection.
 
 ## Remaining work
 

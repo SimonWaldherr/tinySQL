@@ -54,6 +54,10 @@ func TestPublicRAGPreFilterJSON(t *testing.T) {
 		IDColumn:      "chunk_id",
 		AllowedRowIDs: []any{"chunk-7", 42},
 		Equals:        map[string]any{"tenant_id": "acme", "visibility": "published"},
+		Spatial: &tsql.RAGSpatialFilter{
+			GeometryColumn: "geom",
+			BBox:           []float64{11, 48, 12, 49},
+		},
 	})
 	if err != nil {
 		t.Fatalf("RAGPreFilterJSON: %v", err)
@@ -61,15 +65,16 @@ func TestPublicRAGPreFilterJSON(t *testing.T) {
 
 	var payload struct {
 		PreFilter struct {
-			IDColumn      string         `json:"id_column"`
-			AllowedRowIDs []any          `json:"allowed_row_ids"`
-			Equals        map[string]any `json:"equals"`
+			IDColumn      string                 `json:"id_column"`
+			AllowedRowIDs []any                  `json:"allowed_row_ids"`
+			Equals        map[string]any         `json:"equals"`
+			Spatial       *tsql.RAGSpatialFilter `json:"spatial"`
 		} `json:"pre_filter"`
 	}
 	if err := json.Unmarshal([]byte(options), &payload); err != nil {
 		t.Fatalf("decode generated options: %v", err)
 	}
-	if payload.PreFilter.IDColumn != "chunk_id" || len(payload.PreFilter.AllowedRowIDs) != 2 || payload.PreFilter.AllowedRowIDs[0] != "chunk-7" || payload.PreFilter.Equals["tenant_id"] != "acme" {
+	if payload.PreFilter.IDColumn != "chunk_id" || len(payload.PreFilter.AllowedRowIDs) != 2 || payload.PreFilter.AllowedRowIDs[0] != "chunk-7" || payload.PreFilter.Equals["tenant_id"] != "acme" || payload.PreFilter.Spatial == nil || payload.PreFilter.Spatial.GeometryColumn != "geom" {
 		t.Fatalf("unexpected pre-filter options: %#v", payload.PreFilter)
 	}
 
@@ -96,6 +101,9 @@ func TestPublicRAGPreFilterJSON(t *testing.T) {
 	}
 	if _, err := tsql.RAGPreFilterJSON(tsql.RAGPreFilter{IDColumn: "chunk_id", Equals: map[string]any{"tenant_id": "acme"}}); err == nil {
 		t.Fatal("expected IDColumn without AllowedRowIDs to be rejected")
+	}
+	if _, err := tsql.RAGPreFilterJSON(tsql.RAGPreFilter{Spatial: &tsql.RAGSpatialFilter{GeometryColumn: "geom", BBox: []float64{1, 2}}}); err == nil {
+		t.Fatal("expected invalid spatial BBox to be rejected")
 	}
 }
 

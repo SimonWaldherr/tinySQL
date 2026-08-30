@@ -406,6 +406,71 @@ func TestRetrievalPreFilterCachesPurgeOnDrop(t *testing.T) {
 	}
 }
 
+func TestRetrievalSpatialPreFilterRunsBeforeRanking(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE geo_chunks (
+		id TEXT PRIMARY KEY, layer TEXT, body TEXT, geom GEOMETRY, embedding VECTOR
+	)`)
+	execSQL(t, db, `INSERT INTO geo_chunks VALUES
+		('munich-dop', 'dop', 'Munich aerial image', '{"type":"Point","coordinates":[11.575,48.137]}', '[1.0,0.0]'),
+		('nuremberg-dtk', 'dtk', 'Nuremberg topographic map', '{"type":"Point","coordinates":[11.077,49.454]}', '[0.8,0.2]'),
+		('bavaria-dtk', 'dtk', 'Bavaria map sheet', '{"type":"Polygon","coordinates":[[[9,47],[13,47],[13,51],[9,51],[9,47]]]}', '[0.9,0.1]')`)
+
+	// Munich is the globally closest vector. A Nuremberg viewport plus layer
+	// equality must eliminate it before it can consume a candidate slot. The
+	// statewide polygon is retained by extent intersection even though its
+	// centroid is outside the narrow viewport.
+	rs := execSQL(t, db, `SELECT id FROM RAG_SEARCH(
+		'geo_chunks', 'embedding', VEC_FROM_JSON('[1.0,0.0]'), 5,
+		'{"pre_filter":{"equals":{"layer":"dtk"},"spatial":{"geometry_column":"geom","bbox":[11.0,49.4,11.2,49.5]}}}'
+	)`)
+	got := make(map[string]bool, len(rs.Rows))
+	for _, result := range rs.Rows {
+		got[result["id"].(string)] = true
+	}
+	if len(got) != 2 || !got["nuremberg-dtk"] || !got["bavaria-dtk"] || got["munich-dop"] {
+		t.Fatalf("spatial bbox pre-filter returned %v", got)
+	}
+
+	radius := execSQL(t, db, `SELECT id FROM VEC_SEARCH_FILTERED(
+		'geo_chunks', 'embedding', VEC_FROM_JSON('[1.0,0.0]'), 5,
+		'{"pre_filter":{"spatial":{"geometry_column":"geom","center":[11.575,48.137],"radius_meters":30000}}}'
+	)`)
+	if len(radius.Rows) != 1 || radius.Rows[0]["id"] != "munich-dop" {
+		t.Fatalf("spatial radius pre-filter returned %#v, want Munich only", radius.Rows)
+	}
+
+	execSQL(t, db, `INSERT INTO geo_chunks VALUES
+		('dateline-east', 'dtk', 'east of date line', '{"type":"Point","coordinates":[175,10]}', '[0.7,0.3]'),
+		('dateline-west', 'dtk', 'west of date line', '{"type":"Point","coordinates":[-175,10]}', '[0.6,0.4]')`)
+	crossing := execSQL(t, db, `SELECT id FROM VEC_SEARCH_FILTERED(
+		'geo_chunks', 'embedding', VEC_FROM_JSON('[1.0,0.0]'), 5,
+		'{"pre_filter":{"spatial":{"geometry_column":"geom","bbox":[170,0,-170,20]}}}'
+	)`)
+	if len(crossing.Rows) != 2 {
+		t.Fatalf("antimeridian spatial pre-filter returned %#v, want two rows", crossing.Rows)
+	}
+}
+
+func TestRetrievalSpatialPreFilterValidationIsColdCheap(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE bad_geo_filter (id TEXT PRIMARY KEY, geom GEOMETRY, embedding VECTOR)`)
+	execSQL(t, db, `INSERT INTO bad_geo_filter VALUES ('x', '{"type":"Point","coordinates":[0,0]}', '[1,0]')`)
+	_, err := Execute(context.Background(), db, "default", mustParse(`SELECT * FROM VEC_SEARCH_FILTERED(
+		'bad_geo_filter', 'embedding', VEC_FROM_JSON('[1,0]'), 1,
+		'{"pre_filter":{"spatial":{"geometry_column":"geom","bbox":[0,1]}}}'
+	)`))
+	if err == nil {
+		t.Fatal("invalid spatial bbox succeeded")
+	}
+	geoGridCacheMu.RLock()
+	_, built := geoGridCache[geoIndexCacheKey{tenant: "default", table: "bad_geo_filter", colIdx: 1}]
+	geoGridCacheMu.RUnlock()
+	if built {
+		t.Fatal("invalid spatial pre-filter built the geo grid before validation")
+	}
+}
+
 func execRAGPrefilterTenant(t *testing.T, db *storage.DB, tenant, sql string) *ResultSet {
 	t.Helper()
 	rs, err := Execute(context.Background(), db, tenant, mustParse(sql))

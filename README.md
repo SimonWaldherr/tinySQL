@@ -417,7 +417,8 @@ raw geometry into location-based KPIs and dashboards:
 | Same operation, aggregate-style names | `GEO_UNION_AGG`, `ST_UNION` |
 | Bounding box across a group | `GEO_BBOX_AGG(geometry)` |
 | (Optionally weighted) centroid across a group | `GEO_CENTROID_AGG(geometry[, weight])` |
-| Indexed bbox/radius search over a table | `GEO_SEARCH(table, geom_col, 'bbox'\|'radius', ...)` |
+| Indexed centroid bbox/radius search over a table | `GEO_SEARCH(table, geom_col, 'bbox'\|'radius', ...)` |
+| Indexed GIS viewport/geometry-extent overlap | `GEO_SEARCH(table, geom_col, 'bbox_intersects', west, south, east, north)` |
 | Equal-interval choropleth classification | `EQUAL_INTERVAL(n) OVER (ORDER BY kpi)` |
 | Natural-breaks (Jenks) choropleth classification | `NATURAL_BREAKS(n) OVER (ORDER BY kpi)` |
 | Quantile choropleth classification | `NTILE(n) OVER (ORDER BY kpi)` (already existed) |
@@ -444,11 +445,15 @@ combines with `GEO_CENTROID`'s own area/length weighting, so
 `GEO_CENTROID_AGG(geom, population)` is a population-weighted centroid of
 already-area-weighted per-row centroids.
 
-`GEO_SEARCH` builds a lazy, per-table grid index (invalidated automatically
-on writes) and is exact for Point columns; for polygon/line columns it
-indexes by centroid, so a large shape whose edge — not its centroid — clips
-into the query window is a false negative there. `ST_INTERSECTS` (above)
-remains the exact, unindexed way to test shape overlap directly.
+`GEO_SEARCH` builds a lazy, per-table grid index (invalidated automatically on
+writes). `bbox` and `radius` select by geometry centroid and are exact for
+Point columns. Use `bbox_intersects` for GIS viewports: it retains a line or
+polygon whenever its stored extent overlaps the viewport, then lets an outer
+`ST_INTERSECTS` perform an exact shape test when bbox overlap alone is too
+broad. The grid stores parsed centroids and extents once, so repeated DTK/DOP
+layer requests do not reparse every GeoJSON value. In `bbox_intersects`, a
+WGS84 bbox with `west > east` crosses the antimeridian; radius search handles
+the same wrap automatically.
 
 Quantile classification (`NTILE`) already existed; `EQUAL_INTERVAL` and
 `NATURAL_BREAKS` are new. `NATURAL_BREAKS`'s Jenks optimization is O(rows ×
@@ -570,9 +575,26 @@ WHERE zoom_level = 14
   AND tile_row = TILE_FLIP_Y(TILE_Y(52.520, 14), 14);
 ```
 
-Other tile helpers include `TILE_ZXY`, `TILE_BBOX`, `TILE_LON`, `TILE_LAT`,
-`TILE_QUADKEY`, `TILE_FROM_QUADKEY`, `TILE_PARENT`, `TILE_CONTAINS`, and
-`TILE_COUNT`. Add an index before serving a regular tiles table:
+Other tile helpers include `TILE_ZXY`, `TILE_BBOX`, `TILE_BBOX_3857`,
+`TILE_LON`, `TILE_LAT`, `TILE_QUADKEY`, `TILE_FROM_QUADKEY`, `TILE_PARENT`,
+`TILE_CONTAINS`, and `TILE_COUNT`. OGC/WMTS helpers expose projected
+meters-per-pixel and scale denominators, while `WMS_BBOX` handles the WMS 1.3
+axis-order trap for EPSG:4326/4258:
+
+```sql
+SELECT TILE_RESOLUTION(14) AS meters_per_pixel,
+       WMTS_SCALE_DENOMINATOR(14) AS scale_denominator,
+       WMS_BBOX(11, 48, 12, 49, 'EPSG:4326', '1.3.0') AS wms_bbox;
+
+-- Minimal XYZ/TMS set for prefetching a DTK/DOP viewport. The optional final
+-- argument is a hard materialization limit for offline/cache jobs.
+SELECT z, x, y, tile_row, bbox_3857, resolution, quadkey
+FROM TILE_COVER(11.0, 48.0, 12.0, 49.0, 14, 50000);
+```
+
+`TILE_COVER` supports antimeridian-crossing bounds (`west > east`) and fails
+instead of silently truncating when the requested cover exceeds `max_tiles`.
+Add an index before serving a regular tiles table:
 
 ```sql
 CREATE INDEX tile_index ON tiles (zoom_level, tile_column, tile_row);

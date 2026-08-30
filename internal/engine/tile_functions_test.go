@@ -347,6 +347,63 @@ func TestTileCount(t *testing.T) {
 	}
 }
 
+func TestOGCTileHelpers(t *testing.T) {
+	resolution, ok := tileEval(t, "TILE_RESOLUTION(0)").(float64)
+	if !ok || math.Abs(resolution-156543.03392804097) > 1e-6 {
+		t.Fatalf("zoom-0 resolution = %v", resolution)
+	}
+	resolution512 := tileEval(t, "WMTS_RESOLUTION(0, 512)").(float64)
+	if math.Abs(resolution512-resolution/2) > 1e-9 {
+		t.Fatalf("512px resolution = %v, want %v", resolution512, resolution/2)
+	}
+	scale := tileEval(t, "WMTS_SCALE_DENOMINATOR(0)").(float64)
+	if math.Abs(scale-resolution/wmtsStandardPixelMeters) > 1e-6 {
+		t.Fatalf("WMTS scale denominator = %v", scale)
+	}
+
+	if got := tileEval(t, "WMS_BBOX(11, 48, 12, 49, 'EPSG:4326', '1.3.0')"); got != "48,11,49,12" {
+		t.Fatalf("WMS 1.3 EPSG:4326 bbox = %v", got)
+	}
+	if got := tileEval(t, "WMS_BBOX(11, 48, 12, 49, 'CRS:84', '1.3.0')"); got != "11,48,12,49" {
+		t.Fatalf("WMS CRS:84 bbox = %v", got)
+	}
+	if got := tileEval(t, "WMS_BBOX(11, 48, 12, 49, 'EPSG:4326', '1.1.1')"); got != "11,48,12,49" {
+		t.Fatalf("WMS 1.1.1 bbox = %v", got)
+	}
+
+	raw := tileEval(t, "TILE_BBOX_3857(0, 0, 0)").(string)
+	var bbox []float64
+	if err := json.Unmarshal([]byte(raw), &bbox); err != nil || len(bbox) != 4 {
+		t.Fatalf("TILE_BBOX_3857 = %q: %v", raw, err)
+	}
+	extent := math.Pi * tileWebMercatorRadiusMeters
+	if math.Abs(bbox[0]+extent) > 1e-6 || math.Abs(bbox[1]+extent) > 1e-6 ||
+		math.Abs(bbox[2]-extent) > 1e-6 || math.Abs(bbox[3]-extent) > 1e-6 {
+		t.Fatalf("zoom-0 projected bbox = %v, want world extent +/- %v", bbox, extent)
+	}
+}
+
+func TestTileCoverViewportAndAntimeridian(t *testing.T) {
+	db := storage.NewDB()
+	quarter := execSQL(t, db, `SELECT z, x, y, tile_row, quadkey
+		FROM TILE_COVER(-180, 0, 0, 85, 1)`)
+	if len(quarter.Rows) != 1 || quarter.Rows[0]["x"] != 0 || quarter.Rows[0]["y"] != 0 || quarter.Rows[0]["tile_row"] != 1 {
+		t.Fatalf("north-west quarter cover = %#v", quarter.Rows)
+	}
+	acrossDateLine := execSQL(t, db, `SELECT x FROM TILE_COVER(170, -10, -170, 10, 2)`)
+	xs := make(map[int]bool)
+	for _, result := range acrossDateLine.Rows {
+		xs[result["x"].(int)] = true
+	}
+	if len(xs) != 2 || !xs[0] || !xs[3] {
+		t.Fatalf("antimeridian cover columns = %v, want 0 and 3", xs)
+	}
+	if _, err := Execute(context.Background(), db, "default", mustParse(
+		`SELECT * FROM TILE_COVER(-180, -85, 180, 85, 10, 10)`)); err == nil {
+		t.Fatal("TILE_COVER ignored max_tiles")
+	}
+}
+
 // TestTileArgumentValidation checks out-of-range inputs are rejected rather than
 // silently producing a wrong tile.
 func TestTileArgumentValidation(t *testing.T) {

@@ -158,7 +158,7 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 		if err != nil {
 			return nil, fmt.Errorf("RAG_SEARCH: table %q not found: %w", vecArgsParsed.tableName, err)
 		}
-		rowFilter, err = ragBuildRowFilter(preFilterTable, opts.PreFilter)
+		rowFilter, err = ragBuildRowFilterContext(ctx, tenant, preFilterTable, opts.PreFilter)
 		if err != nil {
 			return nil, fmt.Errorf("RAG_SEARCH: %w", err)
 		}

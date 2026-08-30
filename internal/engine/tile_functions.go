@@ -36,20 +36,49 @@ const tileMaxLat = 85.05112877980659
 
 func getTileFunctions() map[string]funcHandler {
 	return map[string]funcHandler{
-		"TILE_X":            evalTileX,
-		"TILE_Y":            evalTileY,
-		"TILE_ZXY":          evalTileZXY,
-		"TILE_FLIP_Y":       evalTileFlipY,
-		"TILE_ROW_TMS":      evalTileFlipY, // alias: XYZ y -> MBTiles tile_row
-		"TILE_LON":          evalTileLon,
-		"TILE_LAT":          evalTileLat,
-		"TILE_BBOX":         evalTileBBox,
-		"TILE_QUADKEY":      evalTileQuadkey,
-		"TILE_FROM_QUADKEY": evalTileFromQuadkey,
-		"TILE_PARENT":       evalTileParent,
-		"TILE_COUNT":        evalTileCount,
-		"TILE_CONTAINS":     evalTileContains,
+		"TILE_X":                 evalTileX,
+		"TILE_Y":                 evalTileY,
+		"TILE_ZXY":               evalTileZXY,
+		"TILE_FLIP_Y":            evalTileFlipY,
+		"TILE_ROW_TMS":           evalTileFlipY, // alias: XYZ y -> MBTiles tile_row
+		"TILE_LON":               evalTileLon,
+		"TILE_LAT":               evalTileLat,
+		"TILE_BBOX":              evalTileBBox,
+		"TILE_BBOX_3857":         evalTileBBox3857,
+		"TILE_RESOLUTION":        evalTileResolution,
+		"WMTS_RESOLUTION":        evalTileResolution,
+		"WMTS_SCALE_DENOMINATOR": evalWMTSScaleDenominator,
+		"TILE_SCALE_DENOMINATOR": evalWMTSScaleDenominator,
+		"WMS_BBOX":               evalWMSBBox,
+		"TILE_QUADKEY":           evalTileQuadkey,
+		"TILE_FROM_QUADKEY":      evalTileFromQuadkey,
+		"TILE_PARENT":            evalTileParent,
+		"TILE_COUNT":             evalTileCount,
+		"TILE_CONTAINS":          evalTileContains,
 	}
+}
+
+const (
+	// WMTS WebMercatorQuad uses the EPSG:3857 sphere radius and the OGC
+	// standard pixel size of 0.28 mm for ScaleDenominator.
+	tileWebMercatorRadiusMeters = 6378137.0
+	wmtsStandardPixelMeters     = 0.00028
+	tileDefaultPixelSize        = 256
+)
+
+func tilePixelSizeArg(env ExecEnv, ex *FuncCall, row Row, idx int) (int, error) {
+	value, err := evalExpr(env, ex.Args[idx], row)
+	if err != nil {
+		return 0, err
+	}
+	size, err := toInt(value)
+	if err != nil || size <= 0 || size > 16384 {
+		if err == nil {
+			err = fmt.Errorf("must be in range 1..16384")
+		}
+		return 0, fmt.Errorf("%s tile_size: %w", ex.Name, err)
+	}
+	return size, nil
 }
 
 // tileZoomArg reads a zoom level and validates its range.
@@ -282,6 +311,116 @@ func evalTileBBox(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	return string(out), nil
 }
 
+// TILE_BBOX_3857(zoom,x,y) returns the XYZ tile extent in projected Web
+// Mercator meters. WMS/WMTS clients can use it directly as an EPSG:3857 BBOX
+// without a per-corner ST_TRANSFORM round trip.
+func evalTileBBox3857(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if err := requireArgs(ex.Name, ex, 3, 3); err != nil {
+		return nil, err
+	}
+	zoom, err := tileZoomArg(env, ex, row, 0)
+	if err != nil {
+		return nil, err
+	}
+	x, err := tileIndexArg(env, ex, row, 1, zoom, "x")
+	if err != nil {
+		return nil, err
+	}
+	y, err := tileIndexArg(env, ex, row, 2, zoom, "y")
+	if err != nil {
+		return nil, err
+	}
+	extent := math.Pi * tileWebMercatorRadiusMeters
+	span := (2 * extent) / math.Ldexp(1, zoom)
+	minX := -extent + float64(x)*span
+	maxY := extent - float64(y)*span
+	out, err := json.Marshal([]float64{minX, maxY - span, minX + span, maxY})
+	if err != nil {
+		return nil, err
+	}
+	return string(out), nil
+}
+
+// TILE_RESOLUTION(zoom [,tile_size]) returns projected meters per pixel for
+// the standard WebMercatorQuad matrix. It applies equally to raster DTK/DOP
+// tiles and vector tiles; 256 pixels is used when tile_size is omitted.
+func evalTileResolution(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if err := requireArgs(ex.Name, ex, 1, 2); err != nil {
+		return nil, err
+	}
+	zoom, err := tileZoomArg(env, ex, row, 0)
+	if err != nil {
+		return nil, err
+	}
+	tileSize := tileDefaultPixelSize
+	if len(ex.Args) == 2 {
+		tileSize, err = tilePixelSizeArg(env, ex, row, 1)
+		if err != nil {
+			return nil, err
+		}
+	}
+	worldMeters := 2 * math.Pi * tileWebMercatorRadiusMeters
+	return worldMeters / (float64(tileSize) * math.Ldexp(1, zoom)), nil
+}
+
+// WMTS_SCALE_DENOMINATOR(zoom [,tile_size]) returns the OGC WMTS
+// ScaleDenominator, defined using the standard 0.28 mm pixel size.
+func evalWMTSScaleDenominator(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	resolution, err := evalTileResolution(env, ex, row)
+	if err != nil {
+		return nil, err
+	}
+	return resolution.(float64) / wmtsStandardPixelMeters, nil
+}
+
+// WMS_BBOX(minX,minY,maxX,maxY,crs [,version]) formats a WMS BBOX parameter.
+// Inputs always use GIS x/y order. WMS 1.3 swaps EPSG:4326 and EPSG:4258 to
+// their declared latitude/longitude axis order; CRS:84 and projected CRSs
+// retain x/y. The default version is 1.3.0.
+func evalWMSBBox(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if err := requireArgs(ex.Name, ex, 5, 6); err != nil {
+		return nil, err
+	}
+	coords := [4]float64{}
+	for i := range coords {
+		value, err := evalGeoFloatArg(env, ex, row, i)
+		if err != nil {
+			return nil, err
+		}
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return nil, fmt.Errorf("%s: bbox coordinates must be finite", ex.Name)
+		}
+		coords[i] = value
+	}
+	crsValue, err := evalExpr(env, ex.Args[4], row)
+	if err != nil {
+		return nil, err
+	}
+	crs, ok := crsValue.(string)
+	if !ok || strings.TrimSpace(crs) == "" {
+		return nil, fmt.Errorf("%s: crs must be a non-empty string", ex.Name)
+	}
+	version := "1.3.0"
+	if len(ex.Args) == 6 {
+		versionValue, err := evalExpr(env, ex.Args[5], row)
+		if err != nil {
+			return nil, err
+		}
+		version, ok = versionValue.(string)
+		if !ok || strings.TrimSpace(version) == "" {
+			return nil, fmt.Errorf("%s: version must be a non-empty string", ex.Name)
+		}
+	}
+	normalizedCRS := strings.ToUpper(strings.TrimSpace(crs))
+	axisLatLon := normalizedCRS == "EPSG:4326" || normalizedCRS == "EPSG:4258" ||
+		strings.HasSuffix(normalizedCRS, ":EPSG::4326") || strings.HasSuffix(normalizedCRS, "/EPSG/0/4326") ||
+		strings.HasSuffix(normalizedCRS, ":EPSG::4258") || strings.HasSuffix(normalizedCRS, "/EPSG/0/4258")
+	if strings.HasPrefix(strings.TrimSpace(version), "1.3") && axisLatLon {
+		coords = [4]float64{coords[1], coords[0], coords[3], coords[2]}
+	}
+	return fmt.Sprintf("%.15g,%.15g,%.15g,%.15g", coords[0], coords[1], coords[2], coords[3]), nil
+}
+
 // TILE_QUADKEY(zoom, x, y) returns the Bing Maps quadkey for an XYZ tile: one
 // base-4 digit per zoom level, each encoding the quadrant descended into.
 func evalTileQuadkey(env ExecEnv, ex *FuncCall, row Row) (any, error) {
@@ -300,6 +439,10 @@ func evalTileQuadkey(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	return tileQuadkeyFor(zoom, x, y), nil
+}
+
+func tileQuadkeyFor(zoom, x, y int) string {
 	var sb strings.Builder
 	sb.Grow(zoom)
 	for i := zoom; i > 0; i-- {
@@ -313,7 +456,7 @@ func evalTileQuadkey(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		}
 		sb.WriteByte(digit)
 	}
-	return sb.String(), nil
+	return sb.String()
 }
 
 // TILE_FROM_QUADKEY(quadkey) reverses TILE_QUADKEY, returning JSON

@@ -40,6 +40,21 @@ type ragPreFilterOptions struct {
 	IDColumn      string         `json:"id_column"`
 	AllowedRowIDs []any          `json:"allowed_row_ids"`
 	Equals        map[string]any `json:"equals"`
+	// Spatial restricts retrieval to a WGS84 viewport or radius before vector
+	// and lexical ranking. This is useful for georeferenced documents, DTK/DOP
+	// catalog entries, POIs, incidents, and other location-aware RAG corpora.
+	Spatial *ragSpatialFilterOptions `json:"spatial"`
+}
+
+// ragSpatialFilterOptions accepts exactly one of bbox or center+radius_meters.
+// bbox is [west,south,east,north]; radius centers are [longitude,latitude].
+// Bbox mode matches every geometry whose extent intersects the viewport,
+// whereas radius mode uses the geometry centroid and a great-circle distance.
+type ragSpatialFilterOptions struct {
+	GeometryColumn string    `json:"geometry_column"`
+	BBox           []float64 `json:"bbox"`
+	Center         []float64 `json:"center"`
+	RadiusMeters   float64   `json:"radius_meters"`
 }
 
 // ragRowFilter is an immutable, sorted physical-row set shared by the vector
@@ -131,16 +146,23 @@ func ragGetSourceTable(env ExecEnv, tableName string) (*storage.Table, string, e
 // nil means no restriction; an allocated filter with zero rows means the
 // caller explicitly authorized no rows and must return no hits.
 func ragBuildRowFilter(table *storage.Table, opts *ragPreFilterOptions) (*ragRowFilter, error) {
+	return ragBuildRowFilterContext(context.Background(), "default", table, opts)
+}
+
+// ragBuildRowFilterContext is the serving-path form. It reuses the tenant's
+// lazy spatial grid and allows cancellation while a concurrent cold build is
+// in progress; the wrapper above keeps focused unit tests source-compatible.
+func ragBuildRowFilterContext(ctx context.Context, tenant string, table *storage.Table, opts *ragPreFilterOptions) (*ragRowFilter, error) {
 	if opts == nil {
 		return nil, nil
 	}
-	if opts.AllowedRowIDs == nil && len(opts.Equals) == 0 {
+	if opts.AllowedRowIDs == nil && len(opts.Equals) == 0 && opts.Spatial == nil {
 		// Treating an empty object as an unrestricted search would be an
 		// especially dangerous foot-gun for the dedicated *_FILTERED APIs:
 		// callers could believe they installed an ACL boundary while returning
 		// every row. An explicit empty allowed_row_ids array is still valid and
 		// deliberately means deny all.
-		return nil, fmt.Errorf("pre_filter requires allowed_row_ids or at least one equals predicate")
+		return nil, fmt.Errorf("pre_filter requires allowed_row_ids, an equals predicate, or a spatial filter")
 	}
 	if opts.AllowedRowIDs == nil && strings.TrimSpace(opts.IDColumn) != "" {
 		return nil, fmt.Errorf("pre_filter.id_column requires allowed_row_ids")
@@ -156,6 +178,7 @@ func ragBuildRowFilter(table *storage.Table, opts *ragPreFilterOptions) (*ragRow
 	}
 
 	var selected []int
+	hasSelection := false
 	if opts.AllowedRowIDs != nil {
 		column, pos, err := ragAllowedIDColumn(table, opts.IDColumn)
 		if err != nil {
@@ -177,6 +200,7 @@ func ragBuildRowFilter(table *storage.Table, opts *ragPreFilterOptions) (*ragRow
 			return nil, err
 		}
 		selected = ragNormalizeRowIDs(len(table.Rows), rows)
+		hasSelection = true
 	}
 
 	predicates, err := ragNormalizeEqualityPredicates(table, opts.Equals)
@@ -188,11 +212,25 @@ func ragBuildRowFilter(table *storage.Table, opts *ragPreFilterOptions) (*ragRow
 		if err != nil {
 			return nil, err
 		}
-		if opts.AllowedRowIDs == nil {
+		if !hasSelection {
 			selected = rows
 		} else {
 			selected = ragIntersectRowIDs(selected, rows)
 		}
+		hasSelection = true
+	}
+
+	if opts.Spatial != nil {
+		rows, err := ragRowsForSpatialFilter(ctx, tenant, table, opts.Spatial)
+		if err != nil {
+			return nil, err
+		}
+		if !hasSelection {
+			selected = rows
+		} else {
+			selected = ragIntersectRowIDs(selected, rows)
+		}
+		hasSelection = true
 	}
 
 	filter := &ragRowFilter{rows: selected}
@@ -209,6 +247,98 @@ func ragBuildRowFilter(table *storage.Table, opts *ragPreFilterOptions) (*ragRow
 		ragRowFilterCacheMu.Unlock()
 	}
 	return filter, nil
+}
+
+func ragRowsForSpatialFilter(ctx context.Context, tenant string, table *storage.Table, opts *ragSpatialFilterOptions) ([]int, error) {
+	if opts == nil {
+		return nil, nil
+	}
+	column := strings.TrimSpace(opts.GeometryColumn)
+	if column == "" {
+		return nil, fmt.Errorf("pre_filter.spatial.geometry_column must be a non-empty string")
+	}
+	colIdx, err := table.ColIndex(column)
+	if err != nil {
+		return nil, fmt.Errorf("pre_filter.spatial.geometry_column %q: %w", column, err)
+	}
+	bboxMode := opts.BBox != nil
+	radiusMode := opts.Center != nil || opts.RadiusMeters != 0
+	if bboxMode == radiusMode {
+		return nil, fmt.Errorf("pre_filter.spatial requires exactly one of bbox or center with radius_meters")
+	}
+	var west, south, east, north, lon, lat float64
+	crossesAntimeridian := false
+	if bboxMode {
+		if len(opts.BBox) != 4 || !geoSearchFinite(opts.BBox...) {
+			return nil, fmt.Errorf("pre_filter.spatial.bbox must contain four finite numbers [west,south,east,north]")
+		}
+		west, south, east, north = opts.BBox[0], opts.BBox[1], opts.BBox[2], opts.BBox[3]
+		if west < -180 || west > 180 || east < -180 || east > 180 || south < -90 || north > 90 || south > north {
+			return nil, fmt.Errorf("pre_filter.spatial.bbox requires -180 <= west/east <= 180 and -90 <= south <= north <= 90")
+		}
+		crossesAntimeridian = west > east
+	} else {
+		if len(opts.Center) != 2 || !geoSearchFinite(opts.Center...) {
+			return nil, fmt.Errorf("pre_filter.spatial.center must contain two finite numbers [longitude,latitude]")
+		}
+		if opts.RadiusMeters <= 0 || math.IsNaN(opts.RadiusMeters) || math.IsInf(opts.RadiusMeters, 0) {
+			return nil, fmt.Errorf("pre_filter.spatial.radius_meters must be a finite positive number")
+		}
+		lon, lat = opts.Center[0], opts.Center[1]
+		if lon < -180 || lon > 180 || lat < -90 || lat > 90 {
+			return nil, fmt.Errorf("pre_filter.spatial.center requires longitude in -180..180 and latitude in -90..90")
+		}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if tenant == "" {
+		tenant = "default"
+	}
+	idx, err := getGeoGridIndex(ctx, tenant, table, colIdx)
+	if err != nil {
+		return nil, fmt.Errorf("pre_filter.spatial: %w", err)
+	}
+
+	var candidates []int32
+	var matches func(int32) bool
+	if bboxMode {
+		if crossesAntimeridian {
+			candidates = append(idx.candidatesBBox(west, south, 180, north), idx.candidatesBBox(-180, south, east, north)...)
+		} else {
+			candidates = idx.candidatesBBox(west, south, east, north)
+		}
+		matches = func(rowIdx int32) bool {
+			if rowIdx < 0 || int(rowIdx) >= len(idx.bboxes) || !idx.valid[rowIdx] {
+				return false
+			}
+			box := idx.bboxes[rowIdx]
+			if !box.Set || box.MaxY < south || box.MinY > north {
+				return false
+			}
+			if crossesAntimeridian {
+				return box.MaxX >= west || box.MinX <= east
+			}
+			return box.MaxX >= west && box.MinX <= east
+		}
+	} else {
+		candidates = idx.candidatesRadius(lon, lat, opts.RadiusMeters)
+		matches = func(rowIdx int32) bool {
+			if rowIdx < 0 || int(rowIdx) >= len(idx.centroids) || !idx.valid[rowIdx] {
+				return false
+			}
+			point := idx.centroids[rowIdx]
+			return haversineMeters(lat, lon, point.Lat, point.Lon) <= opts.RadiusMeters
+		}
+	}
+
+	rows := make([]int, 0, len(candidates))
+	for _, rowIdx := range candidates {
+		if matches(rowIdx) {
+			rows = append(rows, int(rowIdx))
+		}
+	}
+	return ragNormalizeRowIDs(len(table.Rows), rows), nil
 }
 
 func ragRowFilterCacheKeyFor(table *storage.Table, opts *ragPreFilterOptions) (ragRowFilterCacheKey, bool) {
@@ -952,11 +1082,11 @@ func (f *VecSearchFilteredTableFunc) Execute(ctx context.Context, args []Expr, e
 			return nil, fmt.Errorf("%s: unknown index %q", f.Name(), opts.Index)
 		}
 	}
-	table, _, err := ragGetSourceTable(env, a.tableName)
+	table, tenant, err := ragGetSourceTable(env, a.tableName)
 	if err != nil {
 		return nil, fmt.Errorf("%s: table %q not found: %w", f.Name(), a.tableName, err)
 	}
-	filter, err := ragBuildRowFilter(table, opts.PreFilter)
+	filter, err := ragBuildRowFilterContext(ctx, tenant, table, opts.PreFilter)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", f.Name(), err)
 	}
@@ -1017,7 +1147,7 @@ func (f *FTSSearchFilteredTableFunc) Execute(ctx context.Context, args []Expr, e
 		return nil, fmt.Errorf("%s: table %q not found: %w", f.Name(), tableName, err)
 	}
 	searchCols := ragFTSColumns(table, env, args[4:], row)
-	filter, err := ragBuildRowFilter(table, opts.PreFilter)
+	filter, err := ragBuildRowFilterContext(ctx, tenant, table, opts.PreFilter)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", f.Name(), err)
 	}

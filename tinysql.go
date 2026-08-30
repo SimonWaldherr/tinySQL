@@ -69,6 +69,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 
 	"github.com/SimonWaldherr/tinySQL/internal/engine"
@@ -171,9 +172,21 @@ func DefaultVectorCacheConfig() VectorCacheConfig { return engine.DefaultVectorC
 // visibility, or document type); it is intersected with AllowedRowIDs when
 // both are present. See RAGPreFilterJSON for the SQL options payload.
 type RAGPreFilter struct {
-	IDColumn      string         `json:"id_column,omitempty"`
-	AllowedRowIDs []any          `json:"allowed_row_ids"`
-	Equals        map[string]any `json:"equals"`
+	IDColumn      string            `json:"id_column,omitempty"`
+	AllowedRowIDs []any             `json:"allowed_row_ids"`
+	Equals        map[string]any    `json:"equals"`
+	Spatial       *RAGSpatialFilter `json:"spatial,omitempty"`
+}
+
+// RAGSpatialFilter limits retrieval to georeferenced rows before ranking.
+// Set GeometryColumn and exactly one of BBox or Center+RadiusMeters. Coordinates
+// are WGS84 x/y: BBox is [west,south,east,north], Center is [lon,lat]. BBox
+// matches geometry extents; radius measures from geometry centroids.
+type RAGSpatialFilter struct {
+	GeometryColumn string    `json:"geometry_column"`
+	BBox           []float64 `json:"bbox,omitempty"`
+	Center         []float64 `json:"center,omitempty"`
+	RadiusMeters   float64   `json:"radius_meters,omitempty"`
 }
 
 // RAGPreFilterJSON encodes filter as the explicit {"pre_filter": ...} JSON
@@ -189,20 +202,51 @@ type RAGPreFilter struct {
 // Unlike an outer WHERE, this boundary is applied before vector/FTS candidate
 // selection, reciprocal-rank fusion, and neighbor-context expansion.
 func RAGPreFilterJSON(filter RAGPreFilter) (string, error) {
-	if filter.AllowedRowIDs == nil && len(filter.Equals) == 0 {
-		return "", fmt.Errorf("RAG pre-filter requires AllowedRowIDs or at least one Equals value")
+	if filter.AllowedRowIDs == nil && len(filter.Equals) == 0 && filter.Spatial == nil {
+		return "", fmt.Errorf("RAG pre-filter requires AllowedRowIDs, at least one Equals value, or Spatial")
 	}
 	if filter.AllowedRowIDs == nil && strings.TrimSpace(filter.IDColumn) != "" {
 		return "", fmt.Errorf("RAG pre-filter IDColumn requires AllowedRowIDs")
+	}
+	if spatial := filter.Spatial; spatial != nil {
+		if strings.TrimSpace(spatial.GeometryColumn) == "" {
+			return "", fmt.Errorf("RAG spatial pre-filter requires GeometryColumn")
+		}
+		bboxMode := spatial.BBox != nil
+		radiusMode := spatial.Center != nil || spatial.RadiusMeters != 0
+		if bboxMode == radiusMode {
+			return "", fmt.Errorf("RAG spatial pre-filter requires exactly one of BBox or Center with RadiusMeters")
+		}
+		finite := func(values []float64) bool {
+			for _, value := range values {
+				if math.IsNaN(value) || math.IsInf(value, 0) {
+					return false
+				}
+			}
+			return true
+		}
+		if bboxMode && (len(spatial.BBox) != 4 || !finite(spatial.BBox)) {
+			return "", fmt.Errorf("RAG spatial pre-filter BBox must contain four finite values")
+		}
+		if bboxMode && (spatial.BBox[0] < -180 || spatial.BBox[0] > 180 || spatial.BBox[2] < -180 || spatial.BBox[2] > 180 || spatial.BBox[1] < -90 || spatial.BBox[3] > 90 || spatial.BBox[1] > spatial.BBox[3]) {
+			return "", fmt.Errorf("RAG spatial pre-filter BBox requires WGS84 west/east and ordered south/north bounds")
+		}
+		if radiusMode && (len(spatial.Center) != 2 || !finite(spatial.Center) || spatial.RadiusMeters <= 0 || math.IsNaN(spatial.RadiusMeters) || math.IsInf(spatial.RadiusMeters, 0)) {
+			return "", fmt.Errorf("RAG spatial pre-filter requires a finite two-value Center and positive finite RadiusMeters")
+		}
+		if radiusMode && (spatial.Center[0] < -180 || spatial.Center[0] > 180 || spatial.Center[1] < -90 || spatial.Center[1] > 90) {
+			return "", fmt.Errorf("RAG spatial pre-filter Center requires WGS84 longitude/latitude")
+		}
 	}
 
 	// A pointer to the slice preserves the important distinction between a nil
 	// AllowedRowIDs (not supplied) and []any{} (an explicit deny-all ACL), while
 	// omitting unrelated null fields from the generated SQL options object.
 	type encodedFilter struct {
-		IDColumn      string         `json:"id_column,omitempty"`
-		AllowedRowIDs *[]any         `json:"allowed_row_ids,omitempty"`
-		Equals        map[string]any `json:"equals,omitempty"`
+		IDColumn      string            `json:"id_column,omitempty"`
+		AllowedRowIDs *[]any            `json:"allowed_row_ids,omitempty"`
+		Equals        map[string]any    `json:"equals,omitempty"`
+		Spatial       *RAGSpatialFilter `json:"spatial,omitempty"`
 	}
 	var allowedRowIDs *[]any
 	if filter.AllowedRowIDs != nil {
@@ -214,6 +258,7 @@ func RAGPreFilterJSON(filter RAGPreFilter) (string, error) {
 		IDColumn:      filter.IDColumn,
 		AllowedRowIDs: allowedRowIDs,
 		Equals:        filter.Equals,
+		Spatial:       filter.Spatial,
 	}}
 	raw, err := json.Marshal(value)
 	if err != nil {

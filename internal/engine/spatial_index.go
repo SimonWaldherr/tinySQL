@@ -70,7 +70,11 @@ type geoGridIndex struct {
 	cells     map[geoCellID][]int32
 	overflow  []int32
 	centroids []geoPoint
-	valid     []bool
+	// bboxes retains the already-computed per-row extent. GIS/RAG viewport
+	// filters can therefore perform an exact bbox residual check without
+	// reparsing GeoJSON after the grid has narrowed the candidate set.
+	bboxes []geoEditBBox
+	valid  []bool
 }
 
 var (
@@ -99,6 +103,9 @@ func purgeGeoGridCachesFor(tenant, table string) {
 }
 
 func getGeoGridIndex(ctx context.Context, tenant string, table *storage.Table, colIdx int) (*geoGridIndex, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	key := geoIndexCacheKey{tenant: tenant, table: table.Name, colIdx: colIdx}
 
 	for {
@@ -116,7 +123,11 @@ func getGeoGridIndex(ctx context.Context, tenant string, table *storage.Table, c
 		}
 		if call := geoGridBuilds[key]; call != nil {
 			geoGridCacheMu.Unlock()
-			<-call.done
+			select {
+			case <-call.done:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 			continue
 		}
 		call := &vecIndexBuildCall{done: make(chan struct{})}
@@ -149,7 +160,7 @@ func buildGeoGridIndex(ctx context.Context, table *storage.Table, colIdx int) (*
 	n := len(table.Rows)
 	idx.valid = make([]bool, n)
 	idx.centroids = make([]geoPoint, n)
-	bboxes := make([]geoEditBBox, n)
+	idx.bboxes = make([]geoEditBBox, n)
 	union := geoEditBBox{}
 	validCount := 0
 
@@ -187,7 +198,7 @@ func buildGeoGridIndex(ctx context.Context, table *storage.Table, colIdx int) (*
 
 		idx.valid[i] = true
 		idx.centroids[i] = geoPoint{Lon: cx, Lat: cy}
-		bboxes[i] = bbox
+		idx.bboxes[i] = bbox
 		union.add(geoEditPoint{X: bbox.MinX, Y: bbox.MinY})
 		union.add(geoEditPoint{X: bbox.MaxX, Y: bbox.MaxY})
 		validCount++
@@ -224,7 +235,7 @@ func buildGeoGridIndex(ctx context.Context, table *storage.Table, colIdx int) (*
 		if !idx.valid[i] {
 			continue
 		}
-		bbox := bboxes[i]
+		bbox := idx.bboxes[i]
 		minCX := int32(math.Floor(bbox.MinX / cellSizeLon))
 		maxCX := int32(math.Floor(bbox.MaxX / cellSizeLon))
 		minCY := int32(math.Floor(bbox.MinY / cellSizeLat))
@@ -302,5 +313,41 @@ func (idx *geoGridIndex) candidatesRadius(centerLon, centerLat, radiusMeters flo
 		cosLat = 0.01 // clamp near the poles so padLon doesn't blow up
 	}
 	padLon := radiusMeters / (metersPerDegreeLat * math.Abs(cosLat))
-	return idx.candidatesBBox(centerLon-padLon, centerLat-padLat, centerLon+padLon, centerLat+padLat)
+	minLon, maxLon := centerLon-padLon, centerLon+padLon
+	minLat, maxLat := centerLat-padLat, centerLat+padLat
+	if padLon >= 180 {
+		return idx.candidatesBBox(-180, minLat, 180, maxLat)
+	}
+	if minLon < -180 {
+		return geoMergeCandidateRows(
+			idx.candidatesBBox(-180, minLat, maxLon, maxLat),
+			idx.candidatesBBox(minLon+360, minLat, 180, maxLat),
+		)
+	}
+	if maxLon > 180 {
+		return geoMergeCandidateRows(
+			idx.candidatesBBox(minLon, minLat, 180, maxLat),
+			idx.candidatesBBox(-180, minLat, maxLon-360, maxLat),
+		)
+	}
+	return idx.candidatesBBox(minLon, minLat, maxLon, maxLat)
+}
+
+func geoMergeCandidateRows(groups ...[]int32) []int32 {
+	total := 0
+	for _, group := range groups {
+		total += len(group)
+	}
+	out := make([]int32, 0, total)
+	seen := make(map[int32]struct{}, total)
+	for _, group := range groups {
+		for _, rowIdx := range group {
+			if _, exists := seen[rowIdx]; exists {
+				continue
+			}
+			seen[rowIdx] = struct{}{}
+			out = append(out, rowIdx)
+		}
+	}
+	return out
 }

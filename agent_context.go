@@ -159,7 +159,7 @@ func BuildAgentContext(ctx context.Context, db *DB, tenant string, cfg AgentCont
 	}, func(row Row) string {
 		return fmt.Sprintf("%s[tables=%s,rows=%s]", rowString(row, "tenant"), rowString(row, "table_count"), rowString(row, "total_rows"))
 	})
-	builder.writeLine("features: selects; inserts; updates; deletes; joins; group by; having; order by; limit; subqueries; ctes; window functions; views; indexes(metadata); full-text search; triggers; jobs; vector search; json; yaml; url; hash; bitmap; geometry; decimal; money; multi-tenancy; mvcc+wal; sys.* and catalog.* introspection")
+	builder.writeLine("features: selects; inserts; updates; deletes; joins; group by; having; order by; limit; subqueries; ctes; window functions; views; indexes(metadata); full-text search; hybrid/spatial RAG; triggers; jobs; vector search; geometry/GIS; WMS/WMTS tile cover; json; yaml; url; hash; bitmap; decimal; money; multi-tenancy; mvcc+wal; sys.* and catalog.* introspection")
 	builder.writeLine("gaps: foreign key enforcement; check constraints; returning; upsert; savepoints; attach/detach; partial indexes; vacuum; sqlite_master")
 
 	return builder.String(), nil

@@ -96,6 +96,52 @@ func TestGeoSearchRadiusMode(t *testing.T) {
 	}
 }
 
+func TestGeoSearchRadiusCrossesAntimeridian(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE points (id INT, geom GEOMETRY)`)
+	execSQL(t, db, geoSearchPoint(1, 179, 0))
+	execSQL(t, db, geoSearchPoint(2, -179, 0))
+	execSQL(t, db, geoSearchPoint(3, 160, 0))
+	got := geoSearchIDSet(t, db, `SELECT id FROM GEO_SEARCH('points', 'geom', 'radius', 179, 0, 300000)`)
+	if len(got) != 2 || !got[1] || !got[2] {
+		t.Fatalf("dateline radius returned %v, want ids 1 and 2", got)
+	}
+}
+
+func TestGeoSearchBBoxIntersectsUsesGeometryExtent(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE features (id INT, geom GEOMETRY)`)
+	execSQL(t, db, `INSERT INTO features VALUES
+		(1, '{"type":"Polygon","coordinates":[[[0,0],[10,0],[10,10],[0,10],[0,0]]]}'),
+		(2, '{"type":"Point","coordinates":[20,20]}')`)
+
+	// The polygon centroid (5,5) is outside this viewport, but its actual
+	// extent intersects it. The GIS-specific mode must retain the feature.
+	got := geoSearchIDSet(t, db, `SELECT id FROM GEO_SEARCH(
+		'features', 'geom', 'bbox_intersects', 9.5, 9.5, 10.5, 10.5)`)
+	if len(got) != 1 || !got[1] {
+		t.Fatalf("bbox_intersects returned %v, want polygon id=1", got)
+	}
+	legacy := geoSearchIDSet(t, db, `SELECT id FROM GEO_SEARCH(
+		'features', 'geom', 'bbox', 9.5, 9.5, 10.5, 10.5)`)
+	if legacy[1] {
+		t.Fatalf("legacy centroid bbox unexpectedly matched polygon: %v", legacy)
+	}
+}
+
+func TestGeoSearchBBoxIntersectsCrossesAntimeridian(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE points (id INT, geom GEOMETRY)`)
+	execSQL(t, db, geoSearchPoint(1, 175, 10))
+	execSQL(t, db, geoSearchPoint(2, -175, 10))
+	execSQL(t, db, geoSearchPoint(3, 0, 10))
+	got := geoSearchIDSet(t, db, `SELECT id FROM GEO_SEARCH(
+		'points', 'geom', 'bbox_intersects', 170, 0, -170, 20)`)
+	if len(got) != 2 || !got[1] || !got[2] {
+		t.Fatalf("antimeridian bbox_intersects returned %v, want ids 1 and 2", got)
+	}
+}
+
 func TestGeoSearchRejectsUnknownMode(t *testing.T) {
 	db := storage.NewDB()
 	execSQL(t, db, `CREATE TABLE points (id INT, geom GEOMETRY)`)

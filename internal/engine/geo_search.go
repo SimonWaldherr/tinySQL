@@ -18,10 +18,10 @@ import (
 // (spatial_index.go), so it is exact for Point columns -- the dominant BI
 // case (store locations, sensor readouts, event feeds) -- but for
 // polygon/line columns it answers "is this shape's bounding area within the
-// query window," which can miss a large polygon whose edge, not its
-// interior, clips into the window. True shape-overlap search belongs to
-// ST_INTERSECTS (geo_relate.go) run as an ordinary per-row filter, not
-// something this index computes internally.
+// query window." Use bbox_intersects for GIS layers whose polygon/line extent
+// must overlap the viewport; bbox retains the legacy centroid-within behavior.
+// True shape-overlap search belongs to ST_INTERSECTS (geo_relate.go) run as an
+// ordinary per-row filter after bbox_intersects has narrowed the candidates.
 type GeoSearchTableFunc struct{}
 
 func (f *GeoSearchTableFunc) Name() string { return "GEO_SEARCH" }
@@ -92,9 +92,9 @@ func (f *GeoSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 	}
 
 	var selectCandidates func(*geoGridIndex) []int32
-	var residual func(p geoPoint) bool
+	var residual func(idx *geoGridIndex, rowIdx int32) bool
 	switch mode {
-	case "bbox":
+	case "bbox", "bbox_intersects":
 		if len(args) != 7 {
 			return nil, fmt.Errorf("GEO_SEARCH bbox mode requires (table, geom_col, 'bbox', minLon, minLat, maxLon, maxLat)")
 		}
@@ -117,10 +117,41 @@ func (f *GeoSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 		if !geoSearchFinite(minLon, minLat, maxLon, maxLat) {
 			return nil, fmt.Errorf("GEO_SEARCH: bbox coordinates must be finite numbers")
 		}
-		selectCandidates = func(idx *geoGridIndex) []int32 {
-			return idx.candidatesBBox(minLon, minLat, maxLon, maxLat)
+		if mode == "bbox_intersects" && (minLon < -180 || minLon > 180 || maxLon < -180 || maxLon > 180 || minLat < -90 || minLat > 90 || maxLat < -90 || maxLat > 90) {
+			return nil, fmt.Errorf("GEO_SEARCH: bbox_intersects requires WGS84 longitude/latitude bounds")
 		}
-		residual = func(p geoPoint) bool { return geoPointWithinBBox(p, minLon, minLat, maxLon, maxLat) }
+		if mode == "bbox" {
+			selectCandidates = func(idx *geoGridIndex) []int32 {
+				return idx.candidatesBBox(minLon, minLat, maxLon, maxLat)
+			}
+			residual = func(idx *geoGridIndex, rowIdx int32) bool {
+				return geoPointWithinBBox(idx.centroids[rowIdx], minLon, minLat, maxLon, maxLat)
+			}
+		} else {
+			if minLat > maxLat {
+				minLat, maxLat = maxLat, minLat
+			}
+			crossesAntimeridian := minLon > maxLon
+			selectCandidates = func(idx *geoGridIndex) []int32 {
+				if crossesAntimeridian {
+					return geoMergeCandidateRows(
+						idx.candidatesBBox(minLon, minLat, 180, maxLat),
+						idx.candidatesBBox(-180, minLat, maxLon, maxLat),
+					)
+				}
+				return idx.candidatesBBox(minLon, minLat, maxLon, maxLat)
+			}
+			residual = func(idx *geoGridIndex, rowIdx int32) bool {
+				box := idx.bboxes[rowIdx]
+				if !box.Set || box.MaxY < minLat || box.MinY > maxLat {
+					return false
+				}
+				if crossesAntimeridian {
+					return box.MaxX >= minLon || box.MinX <= maxLon
+				}
+				return box.MaxX >= minLon && box.MinX <= maxLon
+			}
+		}
 	case "radius":
 		if len(args) != 6 {
 			return nil, fmt.Errorf("GEO_SEARCH radius mode requires (table, geom_col, 'radius', centerLon, centerLat, radiusMeters)")
@@ -146,11 +177,12 @@ func (f *GeoSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 		selectCandidates = func(idx *geoGridIndex) []int32 {
 			return idx.candidatesRadius(centerLon, centerLat, radiusMeters)
 		}
-		residual = func(p geoPoint) bool {
+		residual = func(idx *geoGridIndex, rowIdx int32) bool {
+			p := idx.centroids[rowIdx]
 			return haversineMeters(centerLat, centerLon, p.Lat, p.Lon) <= radiusMeters
 		}
 	default:
-		return nil, fmt.Errorf("GEO_SEARCH: unknown mode %q (supported: bbox, radius)", modeStr)
+		return nil, fmt.Errorf("GEO_SEARCH: unknown mode %q (supported: bbox, bbox_intersects, radius)", modeStr)
 	}
 
 	// Parse and validate the complete query before paying a possible cold grid
@@ -170,7 +202,7 @@ func (f *GeoSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 		if rowIdx < 0 || int(rowIdx) >= len(idx.valid) || !idx.valid[rowIdx] {
 			continue
 		}
-		if residual(idx.centroids[rowIdx]) {
+		if residual(idx, rowIdx) {
 			matched = append(matched, rowIdx)
 		}
 	}

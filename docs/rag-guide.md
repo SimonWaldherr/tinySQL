@@ -526,6 +526,38 @@ scan of the authorized subset. This makes the API safe for typed and
 SQLite-affinity-compatible columns instead of risking false-negative index
 lookups.
 
+Georeferenced corpora can add a `spatial` boundary to the same pre-filter. It
+is intersected with IDs and equality metadata before either retriever ranks a
+candidate. Bbox mode uses WGS84 `[west,south,east,north]` and matches geometry
+extents, making it suitable for DTK/DOP sheets, parcels, administrative areas,
+WMS layers, and other features larger than a point:
+
+```sql
+SELECT chunk_id, source_uri, chunk_text, _rrf_rank
+FROM HYBRID_SEARCH(
+    'geo_chunks', 'embedding', 'search_text', ?, ?, 8,
+    '{
+      "candidate_k": 32,
+      "pre_filter": {
+        "equals": {"layer": "dtk", "visibility": "published"},
+        "spatial": {
+          "geometry_column": "footprint",
+          "bbox": [11.0, 48.0, 12.0, 49.0]
+        }
+      }
+    }'
+);
+```
+
+As with `TILE_COVER`, a bbox with `west > east` crosses the antimeridian.
+
+For POIs, observations, incidents, or nearby-document retrieval, replace
+`bbox` with `"center":[longitude,latitude]` and a positive
+`"radius_meters"`. Radius mode measures from each geometry centroid. The
+lazy, versioned spatial grid is shared with `GEO_SEARCH`, coalesces concurrent
+cold builds, and caches the final combined row set by table version and filter
+JSON. Invalid spatial input is rejected before a cold grid build.
+
 For standalone retrieval, use the intentionally explicit functions below. The
 separate names prevent their security boundary from being confused with a
 post-retrieval `WHERE`:
@@ -570,15 +602,19 @@ JSON. `RAGPreFilterJSON` rejects an empty boundary, while an explicit empty
 ```go
 options, err := tinysql.RAGPreFilterJSON(tinysql.RAGPreFilter{
 	Equals: map[string]any{"tenant_id": "acme"},
+	Spatial: &tinysql.RAGSpatialFilter{
+		GeometryColumn: "footprint",
+		BBox: []float64{11.0, 48.0, 12.0, 49.0},
+	},
 })
 // Bind options as the final options_json argument of HYBRID_SEARCH,
 // RAG_SEARCH, VEC_SEARCH_FILTERED, or FTS_SEARCH_FILTERED.
 ```
 
-Filtered vector ranking is exact over the allowed row set, even if the
-options request `ivf` or `hnsw`: filtering a global approximate frontier after
-candidate selection could silently miss the true nearest allowed result. FTS
-intersects the allowed row IDs with its postings-derived candidate set before
+Flat filtered vector ranking is exact over the allowed row set. Explicit HNSW
+is approximate, but its graph contains only allowed rows; no global frontier
+is filtered after candidate selection. FTS intersects the allowed row IDs with
+its postings-derived candidate set before
 BM25 scoring and derives BM25 document frequency/length normalization from the
 same authorized set. That prevents `_fts_score` and RRF rank from depending on
 forbidden documents, but scores are intentionally comparable only for searches
