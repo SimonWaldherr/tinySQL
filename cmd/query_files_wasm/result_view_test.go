@@ -50,3 +50,20 @@ func TestBuildResultPageClampsBoundsAndKeepsNullLast(t *testing.T) {
 		t.Fatalf("sorted rows = %#v", page.Rows)
 	}
 }
+
+func TestResultPagerReusesViewAndInvalidatesOnSortChange(t *testing.T) {
+	result := &tinysql.ResultSet{
+		Cols: []string{"id", "title"},
+		Rows: []tinysql.Row{{"id": 3, "title": "vector"}, {"id": 1, "title": "vector"}, {"id": 2, "title": "other"}},
+	}
+	var pager resultPager
+	first := pager.page(result, 0, 1, "vector", "id", "asc")
+	second := pager.page(result, 1, 1, "vector", "id", "asc")
+	if first.Rows[0]["id"] != 1 || second.Rows[0]["id"] != 3 {
+		t.Fatalf("cached pages = %#v / %#v", first.Rows, second.Rows)
+	}
+	descending := pager.page(result, 0, 1, "vector", "id", "desc")
+	if descending.Rows[0]["id"] != 3 {
+		t.Fatalf("sort change did not invalidate cached index: %#v", descending.Rows)
+	}
+}

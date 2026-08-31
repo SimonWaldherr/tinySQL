@@ -18,15 +18,22 @@ const SQL_KEYWORDS = [
     'PIVOT', 'RETURNING', 'EXPLAIN', 'PRAGMA',
     'ST_MAKEPOINT', 'ST_POINT', 'ST_X', 'ST_Y', 'ST_DISTANCE', 'ST_DWITHIN', 'ST_WITHIN_BBOX',
     'ST_SIMPLIFY', 'ST_BBOX', 'ST_CENTROID', 'ST_AFFINE', 'ST_SMOOTH', 'ST_REMOVE_HOLES', 'ST_CLEAN', 'ST_SNAPTOGRID', 'ST_ISVALID',
-    'ST_AZIMUTH', 'ST_PROJECT', 'ST_MIDPOINT', 'ST_WITHIN', 'ST_CONTAINS', 'ST_AREA', 'ST_LENGTH',
+    'ST_AZIMUTH', 'ST_PROJECT', 'ST_MIDPOINT', 'ST_WITHIN', 'ST_CONTAINS', 'ST_COVERS', 'ST_COVEREDBY',
+    'ST_TOUCHES', 'ST_AREA', 'ST_LENGTH', 'ST_PERIMETER', 'ST_GEOMFROMTEXT', 'ST_GEOMFROMEWKT',
+    'ST_GEOMFROMWKB', 'ST_ASTEXT', 'ST_ASEWKT', 'ST_ASBINARY', 'ST_ASGEOJSON', 'ST_TRANSFORM',
     'GEO_POINT', 'GEO_DISTANCE', 'GEO_WITHIN_BBOX', 'GEO_SIMPLIFY', 'GEO_BBOX', 'GEO_CENTROID',
     'GEO_AFFINE', 'GEO_SMOOTH', 'GEO_DROP_HOLES', 'GEO_CLEAN', 'GEO_SNAP', 'GEO_IS_VALID', 'GEO_BEARING', 'GEO_DESTINATION', 'GEO_MIDPOINT',
     'GEO_WITHIN_POLYGON', 'GEO_POLYGON_AREA', 'GEO_LENGTH', 'FTS_MATCH', 'FTS_RANK', 'FTS_SEARCH',
     'FTS_SNIPPET', 'BM25', 'CONTAINS_ALL', 'CONTAINS_ANY', 'CONTAINS_SCORE',
     'VEC_FROM_JSON', 'VEC_SEARCH', 'VEC_COSINE_SIMILARITY', 'VEC_BINARY_QUANTIZE',
     'VEC_HAMMING_DISTANCE', 'VEC_CENTROID', 'VEC_DISTANCE', 'HYBRID_SEARCH', 'VEC_HYBRID_SEARCH',
-    'RAG_CONTEXT', 'RAG_CONTEXT_FROM', 'RAG_SEARCH', 'RAG_HYBRID_SCORE', 'RAG_RANK_SCORE',
-    'RECENCY_SCORE', 'HASH', 'URL_PARSE', 'YAML_GET', 'CALL', 'ANALYZE', 'ROUND'
+    'RAG_CONTEXT', 'RAG_CONTEXT_FROM', 'RAG_SEARCH', 'RAG_WARM', 'RAG_HYBRID_SCORE', 'RAG_RANK_SCORE',
+    'VEC_SEARCH_FILTERED', 'FTS_SEARCH_FILTERED', 'ROUTE_SHORTEST_PATH', 'ROUTE_DISTANCE', 'ROUTE_WARM',
+    'GEO_GEOHASH_ENCODE', 'GEO_GEOHASH_DECODE', 'GEO_GEOHASH_BBOX', 'GEO_GEOHASH_NEIGHBORS',
+    'GPKG_SRID', 'GPKG_HEADER', 'GPKG_BBOX', 'GPKG_AS_WKB', 'GEO_FROM_GPKG',
+    'CRS_NORMALIZE', 'CRS_URI', 'CRS_AXIS_ORDER', 'CRS_INFO', 'WMS_BBOX',
+    'TILE_MATRIX_BBOX', 'TILE_MATRIX_POSITION', 'RECENCY_SCORE', 'HASH', 'URL_PARSE', 'YAML_GET',
+    'CALL', 'ANALYZE', 'ROUND'
 ];
 // Safe references to WASM-exported functions (set after init)
 let wasmApi = {
@@ -41,6 +48,8 @@ let wasmApi = {
     getTableSchema: null,
     exportDatabase: null,
     importDatabase: null,
+    getRuntimeStatus: null,
+    setRuntimeIdentity: null,
 };
 
 // Client-side pending tables (used when WASM not ready)
@@ -65,8 +74,26 @@ let resultViewState = {
 };
 let editorSaveTimer = null;
 let snapshotSaveTimer = null;
+let snapshotIdleHandle = null;
+let snapshotDirty = false;
 let applyingHashDemo = false;
 let lastAppliedHash = '';
+let runtimeRefreshTimer = null;
+let runtimePanelOpen = false;
+
+function getRuntimeSessionId() {
+    const key = 'tinysql_runtime_session_v1';
+    try {
+        let value = sessionStorage.getItem(key);
+        if (!value) {
+            value = globalThis.crypto?.randomUUID?.() || `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+            sessionStorage.setItem(key, value);
+        }
+        return value;
+    } catch (_) {
+        return `session-${Date.now()}`;
+    }
+}
 
 function escapeRegex(text) {
     return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -227,6 +254,7 @@ function restoreEditorState() {
 }
 
 function saveDatabaseSnapshotNow() {
+    snapshotDirty = false;
     if (!wasmReady || typeof wasmApi.exportDatabase !== 'function') {
         return false;
     }
@@ -250,8 +278,23 @@ function saveDatabaseSnapshotNow() {
 }
 
 function scheduleDatabaseSnapshotSave(delay = 250) {
+    snapshotDirty = true;
     window.clearTimeout(snapshotSaveTimer);
-    snapshotSaveTimer = window.setTimeout(saveDatabaseSnapshotNow, delay);
+    if (snapshotIdleHandle !== null && typeof window.cancelIdleCallback === 'function') {
+        window.cancelIdleCallback(snapshotIdleHandle);
+        snapshotIdleHandle = null;
+    }
+    snapshotSaveTimer = window.setTimeout(() => {
+        const save = () => {
+            snapshotIdleHandle = null;
+            if (snapshotDirty) saveDatabaseSnapshotNow();
+        };
+        if (typeof window.requestIdleCallback === 'function') {
+            snapshotIdleHandle = window.requestIdleCallback(save, { timeout: 2000 });
+        } else {
+            save();
+        }
+    }, delay);
 }
 
 function restoreDatabaseSnapshot() {
@@ -327,6 +370,12 @@ async function initWasm() {
         wasmApi.getTableSchema = window.getTableSchema;
         wasmApi.exportDatabase = window.exportDatabase;
         wasmApi.importDatabase = window.importDatabase;
+        wasmApi.getRuntimeStatus = window.getRuntimeStatus;
+        wasmApi.setRuntimeIdentity = window.setRuntimeIdentity;
+
+        if (typeof wasmApi.setRuntimeIdentity === 'function') {
+            wasmApi.setRuntimeIdentity('local-browser', getRuntimeSessionId());
+        }
 
         console.log("Available WASM functions:", Object.fromEntries(
             Object.entries(wasmApi).map(([k,v]) => [k, typeof v])
@@ -336,6 +385,8 @@ async function initWasm() {
         statusIndicator?.classList.remove('loading', 'failed');
         statusIndicator?.classList.add('ready');
         document.getElementById('executeBtn').disabled = false;
+        refreshRuntimeStatus();
+        scheduleRuntimeStatusRefresh();
         const hashDemoPayload = decodeDemoHash();
         if (!hashDemoPayload) {
             restoreDatabaseSnapshot();
@@ -713,11 +764,11 @@ INSERT INTO ai_docs VALUES
     (4, 'Hybrid Retrieval', 'ai', 'Hybrid retrieval combines full text ranking with vector similarity for RAG applications.', '[0.8, 0.2, 0.0]')`;
 
 const DEMO_RAG_CHUNKS = [
-    { doc_id: 'tinySQL', chunk_index: 0, chunk_text: 'tinySQL added browser-ready file analytics, query history, snapshots, and shareable URL hash demos.', quality: 0.78, created_at: '2026-07-08 10:00:00', embedding: '[0.9, 0.2, 0.0]' },
-    { doc_id: 'tinySQL', chunk_index: 1, chunk_text: 'Geodata imports now cover GeoJSON, KML ExtendedData and MultiGeometry, OSM XML, routing graph NDJSON, Shapefile ZIP, and MBTiles metadata.', quality: 0.94, created_at: '2026-07-08 11:00:00', embedding: '[1.0, 0.1, 0.1]' },
-    { doc_id: 'tinySQL', chunk_index: 2, chunk_text: 'RAG helpers combine FTS snippets, vector search, context expansion, recency scoring, and quality-weighted hybrid ranking.', quality: 0.96, created_at: '2026-07-08 12:00:00', embedding: '[0.8, 0.6, 0.1]' },
-    { doc_id: 'tinySQL', chunk_index: 3, chunk_text: 'SQL analytics gained CTE views, materialized views, PIVOT, RETURNING, EXPLAIN, SQLite-compatible PRAGMA metadata, and richer sys catalog tables.', quality: 0.91, created_at: '2026-07-08 13:00:00', embedding: '[0.4, 0.9, 0.2]' },
-    { doc_id: 'ops', chunk_index: 0, chunk_text: 'Operational work added RBAC, audit logging, storage and WAL improvements, tinysqld HTTP APIs, MCP server tools, and tinyORM examples.', quality: 0.86, created_at: '2026-07-08 14:00:00', embedding: '[0.2, 0.4, 1.0]' }
+    { doc_id: 'tinySQL', chunk_index: 0, tenant_id: 'public', chunk_text: 'tinySQL added browser-ready file analytics, query history, snapshots, and shareable URL hash demos.', quality: 0.78, created_at: '2026-08-24 10:00:00', geometry: '{"type":"Point","coordinates":[13.405,52.52]}', embedding: '[0.9, 0.2, 0.0]' },
+    { doc_id: 'tinySQL', chunk_index: 1, tenant_id: 'public', chunk_text: 'Geodata imports now cover WKT, WKB, GeoPackageBinary, geohashes, reprojection, OGC TileMatrix and WMS axis ordering.', quality: 0.94, created_at: '2026-08-29 11:00:00', geometry: '{"type":"Point","coordinates":[11.5755,48.1372]}', embedding: '[1.0, 0.1, 0.1]' },
+    { doc_id: 'tinySQL', chunk_index: 2, tenant_id: 'public', chunk_text: 'RAG helpers combine filtered vector search, spatial authorization, context expansion, warm indexes, and hybrid ranking.', quality: 0.96, created_at: '2026-08-30 12:00:00', geometry: '{"type":"Point","coordinates":[13.405,52.52]}', embedding: '[0.8, 0.6, 0.1]' },
+    { doc_id: 'tinySQL', chunk_index: 3, tenant_id: 'private', chunk_text: 'Private roadmap notes cover streaming execution, vector update deltas, replication, and storage internals.', quality: 0.91, created_at: '2026-08-30 13:00:00', geometry: '{"type":"Point","coordinates":[8.6821,50.1109]}', embedding: '[0.4, 0.9, 0.2]' },
+    { doc_id: 'ops', chunk_index: 0, tenant_id: 'private', chunk_text: 'Operational work added route graph warm-up, stored procedure scheduling, replica streaming, and WAL improvements.', quality: 0.86, created_at: '2026-08-30 14:00:00', geometry: '{"type":"Point","coordinates":[9.9937,53.5511]}', embedding: '[0.2, 0.4, 1.0]' }
 ];
 
 const DEMO_RAG_CHUNKS_SQL = `DROP TABLE IF EXISTS rag_chunks;
@@ -725,19 +776,29 @@ CREATE TABLE rag_chunks (
     chunk_id INT PRIMARY KEY,
     doc_id TEXT,
     chunk_index INT,
+    tenant_id TEXT,
     chunk_text TEXT,
     quality FLOAT,
     created_at TEXT,
+    geometry GEOMETRY,
     embedding VECTOR
 );
 INSERT INTO rag_chunks VALUES
-    (1, 'tinySQL', 0, 'tinySQL added browser-ready file analytics, query history, snapshots, and shareable URL hash demos.', 0.78, '2026-07-08 10:00:00', '[0.9, 0.2, 0.0]'),
-    (2, 'tinySQL', 1, 'Geodata imports now cover GeoJSON, KML ExtendedData and MultiGeometry, OSM XML, routing graph NDJSON, Shapefile ZIP, and MBTiles metadata.', 0.94, '2026-07-08 11:00:00', '[1.0, 0.1, 0.1]'),
-    (3, 'tinySQL', 2, 'RAG helpers combine FTS snippets, vector search, context expansion, recency scoring, and quality-weighted hybrid ranking.', 0.96, '2026-07-08 12:00:00', '[0.8, 0.6, 0.1]'),
-    (4, 'tinySQL', 3, 'SQL analytics gained CTE views, materialized views, PIVOT, RETURNING, EXPLAIN, SQLite-compatible PRAGMA metadata, and richer sys catalog tables.', 0.91, '2026-07-08 13:00:00', '[0.4, 0.9, 0.2]'),
-    (5, 'ops', 0, 'Operational work added RBAC, audit logging, storage and WAL improvements, tinysqld HTTP APIs, MCP server tools, and tinyORM examples.', 0.86, '2026-07-08 14:00:00', '[0.2, 0.4, 1.0]')`;
+    (1, 'tinySQL', 0, 'public', 'tinySQL added browser-ready file analytics, query history, snapshots, and shareable URL hash demos.', 0.78, '2026-08-24 10:00:00', '{"type":"Point","coordinates":[13.405,52.52]}', '[0.9, 0.2, 0.0]'),
+    (2, 'tinySQL', 1, 'public', 'Geodata imports now cover WKT, WKB, GeoPackageBinary, geohashes, reprojection, OGC TileMatrix and WMS axis ordering.', 0.94, '2026-08-29 11:00:00', '{"type":"Point","coordinates":[11.5755,48.1372]}', '[1.0, 0.1, 0.1]'),
+    (3, 'tinySQL', 2, 'public', 'RAG helpers combine filtered vector search, spatial authorization, context expansion, warm indexes, and hybrid ranking.', 0.96, '2026-08-30 12:00:00', '{"type":"Point","coordinates":[13.405,52.52]}', '[0.8, 0.6, 0.1]'),
+    (4, 'tinySQL', 3, 'private', 'Private roadmap notes cover streaming execution, vector update deltas, replication, and storage internals.', 0.91, '2026-08-30 13:00:00', '{"type":"Point","coordinates":[8.6821,50.1109]}', '[0.4, 0.9, 0.2]'),
+    (5, 'ops', 0, 'private', 'Operational work added route graph warm-up, stored procedure scheduling, replica streaming, and WAL improvements.', 0.86, '2026-08-30 14:00:00', '{"type":"Point","coordinates":[9.9937,53.5511]}', '[0.2, 0.4, 1.0]')`;
 
 const DEMO_RELEASE_FEATURES = [
+    { area: 'Search/RAG', feature: 'Authorization and metadata pre-filters for RAG_SEARCH, HYBRID_SEARCH, VEC_SEARCH_FILTERED and FTS_SEARCH_FILTERED, including spatial bbox/radius filters', added: '2026-08-27 to 2026-08-30', browser_demo: 'Direct tenant + spatial pre-filter recipe over rag_chunks; filtering happens before ranking and context expansion' },
+    { area: 'Search/RAG', feature: 'RAG_WARM builds the exact vector and lexical retrieval paths before the first user query', added: '2026-08-30', browser_demo: 'Direct RAG_WARM recipe reporting vector dimensions and FTS cache statistics' },
+    { area: 'Routing', feature: 'ROUTE_WARM, A* shortest paths, distance matrices, reachable service areas, and faster versioned graph caches', added: '2026-08-27 to 2026-08-30', browser_demo: 'ROUTE_WARM + ROUTE_SHORTEST_PATH recipe over the imported routes_rg graph' },
+    { area: 'Geodata', feature: 'WKT/EWKT and WKB/EWKB conversion, GeoPackageBinary inspection, geohashes, Web Mercator reprojection, ST_TOUCHES/ST_COVERS/ST_PERIMETER', added: '2026-08-29 to 2026-08-30', browser_demo: 'Direct OGC geometry interoperability recipe; path-based GeoPackage import remains native-only' },
+    { area: 'Geodata', feature: 'CRS normalization, WMS 1.3 axis ordering, generic OGC TileMatrix bounds/positions, and TILE_COVER viewport enumeration', added: '2026-08-30', browser_demo: 'Direct CRS/WMS/TileMatrix recipe in the Geo query group' },
+    { area: 'Execution', feature: 'Incremental ResultStream APIs and optimized streaming scans with configurable backpressure', added: '2026-08-26 to 2026-08-27', browser_demo: 'Go API feature; this table UI retains full results in WASM for paging, filtering, sorting and complete exports' },
+    { area: 'Performance', feature: 'Compiled-query, RAG, vector-update, routing, import/export and storage fast paths added through late August', added: '2026-08-12 to 2026-08-31', browser_demo: 'Used transparently; result view indexes now persist across page changes and snapshots are deferred to browser idle time' },
+    { area: 'Networking', feature: 'Protocol Buffers and gRPC service support in cmd/server', added: '2026-08-31', browser_demo: 'Server-only; not linked into the local WASM playground' },
     { area: 'Performance', feature: 'RAG/FTS arena-backed document cache, parallel BM25 scan, subquery result cache, secondary-index skiplists, and ORDER BY/window-function sorts that avoid reflect.Swapper', added: '2026-07-26 to 2026-08-11', browser_demo: 'Invisible speed-up under existing SQL; nothing new to run' },
     { area: 'Security/Ops', feature: 'cmd/migrate incremental external-database sync and cmd/server replica mode', added: '2026-08-08', browser_demo: 'Go/CLI-only; server-side examples in cmd/migrate and cmd/server, not reachable from the browser build' },
     { area: 'Geodata', feature: 'MBTiles disk-backed tile serving (tinysqld -tiles HTTP endpoint, paged-index tile storage, direct tile-artifact import)', added: '2026-08-01 to 2026-08-06', browser_demo: 'Go/CLI/server-side; documented in browser feature matrix' },
@@ -803,6 +864,14 @@ const SHAREABLE_DEMOS = {
         tables: ['rag_chunks'],
         autoRun: true,
         query: `-- New: RAG_SEARCH composes vector + text retrieval + context expansion\nSELECT doc_id, chunk_index, chunk_text, _hit_rank, _context_offset, _context_rank\nFROM RAG_SEARCH('rag_chunks', 'embedding', VEC_FROM_JSON('[0.8, 0.6, 0.1]'), 2, '{\n    "text_column": "chunk_text",\n    "text_query": "vector search RAG",\n    "key_columns": ["doc_id", "chunk_index"],\n    "expand_before": 1,\n    "expand_after": 1,\n    "doc_id_column": "doc_id",\n    "chunk_index_column": "chunk_index"\n}')\nORDER BY _context_rank`
+    },
+    spatialrag: {
+        title: 'Filtered spatial RAG',
+        description: 'Tenant and radius constraints are enforced before vector ranking, so forbidden or distant rows never enter the candidate set.',
+        icon: '🛡️',
+        tables: ['rag_chunks'],
+        autoRun: true,
+        query: `-- Authorization + location are applied before ranking\nSELECT chunk_id, doc_id, tenant_id, chunk_text, _vec_rank, _vec_distance\nFROM VEC_SEARCH_FILTERED(\n    'rag_chunks', 'embedding', VEC_FROM_JSON('[0.8,0.6,0.1]'), 5,\n    '{"pre_filter":{"equals":{"tenant_id":"public"},"spatial":{"geometry_column":"geometry","center":[13.405,52.52],"radius_meters":600000}}}'\n)\nORDER BY _vec_rank`
     },
     contains: {
         title: 'Literal multi-term search',
@@ -998,7 +1067,7 @@ function renderIntroPage() {
     if (!resultsContainer || decodeDemoHash()) {
         return;
     }
-    const starterDemoIDs = ['analytics', 'geo', 'rag'];
+    const starterDemoIDs = ['analytics', 'geo', 'rag', 'spatialrag'];
     const cards = starterDemoIDs.map((id) => [id, SHAREABLE_DEMOS[id]]).map(([id, demo]) => `
         <div class="intro-card">
             <h3>${demo.icon} ${escapeHtml(demo.title)}</h3>
@@ -1056,6 +1125,115 @@ function toggleUtilityMenu() {
     const isOpening = menu.classList.contains('hidden');
     menu.classList.toggle('hidden', !isOpening);
     trigger.setAttribute('aria-expanded', String(isOpening));
+}
+
+function toggleRuntimePanel(force) {
+    const panel = document.getElementById('runtimePanel');
+    const button = document.getElementById('runtimeStatusButton');
+    if (!panel) return;
+    runtimePanelOpen = typeof force === 'boolean' ? force : panel.classList.contains('hidden');
+    panel.classList.toggle('hidden', !runtimePanelOpen);
+    panel.setAttribute('aria-hidden', runtimePanelOpen ? 'false' : 'true');
+    button?.setAttribute('aria-expanded', runtimePanelOpen ? 'true' : 'false');
+    if (runtimePanelOpen) refreshRuntimeStatus();
+    scheduleRuntimeStatusRefresh();
+}
+
+function scheduleRuntimeStatusRefresh() {
+    window.clearTimeout(runtimeRefreshTimer);
+    runtimeRefreshTimer = window.setTimeout(() => {
+        refreshRuntimeStatus();
+        scheduleRuntimeStatusRefresh();
+    }, runtimePanelOpen ? 1000 : 5000);
+}
+
+function formatRuntimeBytes(value) {
+    const bytes = Number(value) || 0;
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function formatRuntimeDuration(seconds) {
+    const total = Math.max(0, Number(seconds) || 0);
+    if (total < 60) return `${Math.floor(total)}s`;
+    if (total < 3600) return `${Math.floor(total / 60)}m ${Math.floor(total % 60)}s`;
+    return `${Math.floor(total / 3600)}h ${Math.floor((total % 3600) / 60)}m`;
+}
+
+function setRuntimeActivityHint(active) {
+    const button = document.getElementById('runtimeStatusButton');
+    const activeElement = document.getElementById('runtimeActiveCompact');
+    if (activeElement) activeElement.textContent = `${active} active`;
+    const activeMetric = document.getElementById('runtimeActiveValue');
+    const loadMetric = document.getElementById('runtimeLoadValue');
+    if (activeMetric) activeMetric.textContent = String(active);
+    if (loadMetric) loadMetric.textContent = active > 0 ? 'Busy' : 'Idle';
+    button?.classList.toggle('busy', active > 0);
+}
+
+function refreshRuntimeStatus() {
+    if (!wasmReady || typeof wasmApi.getRuntimeStatus !== 'function') return;
+    try {
+        const status = wasmApi.getRuntimeStatus();
+        if (status?.success) renderRuntimeStatus(status);
+    } catch (error) {
+        console.warn('Runtime status unavailable:', error);
+    }
+}
+
+function renderRuntimeStatus(status) {
+    const requests = status.requests || {};
+    const performance = status.performance || {};
+    const memory = status.memory || {};
+    const database = status.database || {};
+    const identity = status.identity || {};
+    const active = Number(requests.active) || 0;
+    setRuntimeActivityHint(active);
+    const compactMemory = document.getElementById('runtimeMemoryCompact');
+    if (compactMemory) compactMemory.textContent = formatRuntimeBytes(memory.heapAllocBytes);
+
+    const values = {
+        runtimeLoadValue: active > 0 ? 'Busy' : 'Idle',
+        runtimeActiveValue: String(active),
+        runtimeTotalValue: String(Number(requests.total) || 0),
+        runtimeFailedValue: String(Number(requests.failed) || 0),
+        runtimeThroughputValue: `${Number(requests.completedLastMinute) || 0}/min`,
+        runtimePeakValue: String(Number(requests.peakActive) || 0),
+        runtimeHeapValue: formatRuntimeBytes(memory.heapAllocBytes),
+        runtimeHeapSystemValue: formatRuntimeBytes(memory.heapSystemBytes),
+        runtimeTablesValue: String(Number(database.tables) || 0),
+        runtimeRowsValue: String(Number(database.rows) || 0),
+        runtimeCacheValue: `${Number(database.queryCacheEntries) || 0}/${Number(database.queryCacheCapacity) || 0}`,
+        runtimeUptimeValue: formatRuntimeDuration(status.uptimeSeconds),
+        runtimeUserValue: String(identity.userId || 'local-browser'),
+        runtimeTenantValue: String(identity.tenant || 'default'),
+        runtimeSessionValue: String(identity.sessionId || '—'),
+        runtimeDistinctUsersValue: String(Number(identity.distinctUsers) || 0),
+        runtimeAverageValue: `${(Number(performance.averageDurationMs) || 0).toFixed(2)} ms`,
+        runtimeLastValue: `${(Number(performance.lastDurationMs) || 0).toFixed(2)} ms`,
+        runtimeBusyShareValue: `${(Number(performance.busyPercentSinceStart) || 0).toFixed(1)}%`,
+    };
+    for (const [id, value] of Object.entries(values)) {
+        const element = document.getElementById(id);
+        if (element) element.textContent = value;
+    }
+
+    const kindBody = document.getElementById('runtimeKindRows');
+    if (kindBody) {
+        const kinds = Object.entries(requests.byKind || {}).sort(([left], [right]) => left.localeCompare(right));
+        kindBody.innerHTML = kinds.length ? kinds.map(([kind, counters]) => `
+            <tr><td>${escapeHtml(kind)}</td><td>${Number(counters.active) || 0}</td><td>${Number(counters.total) || 0}</td><td>${Number(counters.failed) || 0}</td><td>${Number(counters.timedOut) || 0}</td></tr>
+        `).join('') : '<tr><td colspan="5">No requests yet</td></tr>';
+    }
+
+    const userBody = document.getElementById('runtimeUserRows');
+    if (userBody) {
+        const users = Array.isArray(status.users) ? status.users : [];
+        userBody.innerHTML = users.length ? users.map((user) => `
+            <tr><td>${escapeHtml(user.userId)}</td><td>${Number(user.sessions) || 0}</td><td>${Number(user.activeRequests) || 0}</td><td>${Number(user.totalRequests) || 0}</td><td>${Number(user.failedRequests) || 0}</td></tr>
+        `).join('') : '<tr><td colspan="5">No users observed</td></tr>';
+    }
 }
 
 function toggleDemoQueries() {
@@ -1384,6 +1562,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (event.key === 'Escape') {
             closeUtilityMenu();
             closeResultsExportMenu();
+            toggleRuntimePanel(false);
         }
     });
     
@@ -1471,7 +1650,8 @@ function inferDemoQueryGroup(text) {
     }
     if (label.includes('geo') || label.includes('bbox') || label.includes('node') ||
         label.includes('route') || label.includes('distance') || label.includes('radius') ||
-        label.includes('zone') || label.includes('munich')) {
+        label.includes('zone') || label.includes('munich') || label.includes('crs') ||
+        label.includes('wms') || label.includes('tilematrix') || label.includes('ogc')) {
         return 'geo';
     }
     if (label.includes('fts') || label.includes('vector') || label.includes('hybrid') ||
@@ -2521,6 +2701,8 @@ async function onExecuteClick() {
     setOpenVanillaGridEnabled(false);
     
     updateStatus('Executing query…');
+    setRuntimeActivityHint(1);
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 
     try {
         if (typeof wasmApi.executeQuery !== 'function') {
@@ -2591,6 +2773,7 @@ async function onExecuteClick() {
         if (resultsContainer) {
             resultsContainer.setAttribute('aria-busy', 'false');
         }
+        refreshRuntimeStatus();
     }
 }
 

@@ -398,6 +398,74 @@
         .status-indicator.failed { background: #d9534f; }
         .status-indicator.loading { background: #f0ad4e; }
 
+        .runtime-status-button {
+            align-items: center;
+            background: transparent !important;
+            border: 1px solid #4b4b50 !important;
+            color: #aaa !important;
+            display: flex;
+            gap: 5px;
+            padding: 5px 8px !important;
+        }
+
+        .runtime-status-button.busy {
+            border-color: #f0ad4e !important;
+            color: #f6c86b !important;
+        }
+
+        .runtime-panel {
+            background: #202124;
+            border: 1px solid #4b4b50;
+            border-radius: 7px;
+            box-shadow: 0 18px 44px rgba(0, 0, 0, 0.48);
+            color: #d4d4d4;
+            max-height: calc(100vh - 74px);
+            overflow-y: auto;
+            padding: 14px;
+            position: fixed;
+            right: 14px;
+            top: 58px;
+            width: min(620px, calc(100vw - 28px));
+            z-index: 1100;
+        }
+
+        .runtime-panel-header {
+            align-items: center;
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 12px;
+        }
+
+        .runtime-panel-header h2 { color: #fff; font-size: 15px; }
+        .runtime-panel-header button { background: transparent; border: 0; color: #aaa; cursor: pointer; font-size: 18px; }
+
+        .runtime-metrics {
+            display: grid;
+            gap: 8px;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+        }
+
+        .runtime-metric {
+            background: #292a2d;
+            border: 1px solid #3e3e42;
+            border-radius: 5px;
+            min-width: 0;
+            padding: 9px;
+        }
+
+        .runtime-metric span { color: #888; display: block; font-size: 10px; margin-bottom: 4px; text-transform: uppercase; }
+        .runtime-metric strong { color: #f1f5f9; display: block; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .runtime-panel h3 { color: #ccc; font-size: 12px; margin: 15px 0 7px; }
+        .runtime-table { border-collapse: collapse; font-size: 11px; width: 100%; }
+        .runtime-table th, .runtime-table td { border-bottom: 1px solid #343438; padding: 6px; text-align: right; }
+        .runtime-table th:first-child, .runtime-table td:first-child { text-align: left; }
+        .runtime-note { color: #888; font-size: 11px; line-height: 1.45; margin-top: 12px; }
+
+        @media (max-width: 700px) {
+            .runtime-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            #runtimeMemoryCompact, .runtime-compact-separator { display: none; }
+        }
+
         .table-badge {
             display: inline-block;
             margin-left: 8px;
@@ -1925,8 +1993,58 @@
         <div class="status studio-only">
             <div class="status-indicator loading"></div>
             <span id="statusText" role="status" aria-live="polite" aria-atomic="true">Loading local engine…</span>
+            <button id="runtimeStatusButton" class="runtime-status-button" type="button" onclick="toggleRuntimePanel()" aria-expanded="false" aria-controls="runtimePanel" title="Open runtime monitoring">
+                <span id="runtimeActiveCompact">0 active</span>
+                <span class="runtime-compact-separator">·</span>
+                <span id="runtimeMemoryCompact">0 B</span>
+            </button>
         </div>
     </div>
+
+    <section id="runtimePanel" class="runtime-panel hidden" aria-hidden="true" aria-labelledby="runtimePanelTitle">
+        <div class="runtime-panel-header">
+            <h2 id="runtimePanelTitle">Runtime monitoring</h2>
+            <button type="button" onclick="toggleRuntimePanel(false)" aria-label="Close runtime monitoring">×</button>
+        </div>
+        <div class="runtime-metrics">
+            <div class="runtime-metric"><span>Engine</span><strong id="runtimeLoadValue">Idle</strong></div>
+            <div class="runtime-metric"><span>Active requests</span><strong id="runtimeActiveValue">0</strong></div>
+            <div class="runtime-metric"><span>Total requests</span><strong id="runtimeTotalValue">0</strong></div>
+            <div class="runtime-metric"><span>Failed</span><strong id="runtimeFailedValue">0</strong></div>
+            <div class="runtime-metric"><span>Throughput</span><strong id="runtimeThroughputValue">0/min</strong></div>
+            <div class="runtime-metric"><span>Peak concurrency</span><strong id="runtimePeakValue">0</strong></div>
+            <div class="runtime-metric"><span>Heap allocated</span><strong id="runtimeHeapValue">0 B</strong></div>
+            <div class="runtime-metric"><span>Heap reserved</span><strong id="runtimeHeapSystemValue">0 B</strong></div>
+            <div class="runtime-metric"><span>Tables</span><strong id="runtimeTablesValue">0</strong></div>
+            <div class="runtime-metric"><span>Rows</span><strong id="runtimeRowsValue">0</strong></div>
+            <div class="runtime-metric"><span>Query cache</span><strong id="runtimeCacheValue">0/0</strong></div>
+            <div class="runtime-metric"><span>Uptime</span><strong id="runtimeUptimeValue">0s</strong></div>
+            <div class="runtime-metric"><span>Average request</span><strong id="runtimeAverageValue">0 ms</strong></div>
+            <div class="runtime-metric"><span>Last request</span><strong id="runtimeLastValue">0 ms</strong></div>
+            <div class="runtime-metric"><span>Busy since start</span><strong id="runtimeBusyShareValue">0%</strong></div>
+            <div class="runtime-metric"><span>Observed users</span><strong id="runtimeDistinctUsersValue">0</strong></div>
+        </div>
+
+        <h3>Requests by operation</h3>
+        <table class="runtime-table">
+            <thead><tr><th>Operation</th><th>Active</th><th>Total</th><th>Failed</th><th>Timeout</th></tr></thead>
+            <tbody id="runtimeKindRows"><tr><td colspan="5">No requests yet</td></tr></tbody>
+        </table>
+
+        <h3>Users and sessions</h3>
+        <table class="runtime-table">
+            <thead><tr><th>User</th><th>Sessions</th><th>Active</th><th>Total</th><th>Failed</th></tr></thead>
+            <tbody id="runtimeUserRows"><tr><td colspan="5">No users observed</td></tr></tbody>
+        </table>
+
+        <div class="runtime-metrics" style="margin-top:12px">
+            <div class="runtime-metric"><span>User</span><strong id="runtimeUserValue">local-browser</strong></div>
+            <div class="runtime-metric"><span>Tenant</span><strong id="runtimeTenantValue">default</strong></div>
+            <div class="runtime-metric"><span>Session</span><strong id="runtimeSessionValue">—</strong></div>
+            <div class="runtime-metric"><span>Mode</span><strong>Local</strong></div>
+        </div>
+        <p class="runtime-note">This browser build has one local database instance per tab. User and session counters describe this instance; a future multi-user host can use the same status schema with authenticated identities. “Busy” is measured request activity, not an invented CPU percentage.</p>
+    </section>
 
     <main id="landingPage" class="landing-page">
         <div class="landing-shell">
@@ -2080,6 +2198,18 @@
                 <div class="example-query" onclick="setQuery('-- Hubs within 450 km of Munich\nSELECT name, city,\n       ROUND(ST_DISTANCE(geometry, ST_MakePoint(11.5755, 48.1372)) / 1000, 1) AS km_from_munich\nFROM places_geo\nWHERE ST_DWITHIN(geometry, ST_MakePoint(11.5755, 48.1372), 450000)\nORDER BY km_from_munich')">
                     🎯 Munich Radius
                 </div>
+                <div class="example-query" data-requires="routes_rg" onclick="setQuery('-- New: prebuild the versioned route graph, then find the cheapest path\nSELECT * FROM ROUTE_WARM(\'routes_rg\', \'source\', \'target\', \'distance\', \'undirected\');\nSELECT seq, node_id, edge_id, leg_cost, total_cost\nFROM ROUTE_SHORTEST_PATH(\'routes_rg\', \'source\', \'target\', \'distance\', \'hamburg\', \'vienna\', \'undirected\')\nORDER BY seq')">
+                    ⚡ ROUTE_WARM &amp; Shortest Path
+                </div>
+                <div class="example-query" onclick="setQuery('-- New: WKT/WKB, geohash, reprojection, predicates, and perimeter\nSELECT ST_ASTEXT(ST_GEOMFROMTEXT(\'POINT(13.405 52.52)\')) AS wkt_round_trip,\n       ST_ASTEXT(ST_GEOMFROMWKB(ST_ASBINARY(ST_MAKEPOINT(13.405, 52.52)))) AS wkb_round_trip,\n       GEO_GEOHASH_ENCODE(ST_MAKEPOINT(13.405, 52.52), 8) AS geohash,\n       ST_TRANSFORM(ST_MAKEPOINT(13.405, 52.52), 3857) AS web_mercator,\n       ST_TOUCHES(\'{&quot;type&quot;:&quot;Polygon&quot;,&quot;coordinates&quot;:[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}\', \'{&quot;type&quot;:&quot;Polygon&quot;,&quot;coordinates&quot;:[[[1,0],[2,0],[2,1],[1,1],[1,0]]]}\') AS touches,\n       ST_PERIMETER(\'{&quot;type&quot;:&quot;Polygon&quot;,&quot;coordinates&quot;:[[[0,0],[0,1],[1,1],[1,0],[0,0]]]}\') AS perimeter_m')">
+                    🌐 OGC Geometry Interop
+                </div>
+                <div class="example-query" onclick="setQuery('-- New: inspect a WGS84 GeoPackageBinary value entirely in SQL\nSELECT GPKG_SRID(BLOB_FROM_HEX(\'47500001e6100000010100000000000000000027400000000000204840\')) AS srid,\n       GPKG_HEADER(BLOB_FROM_HEX(\'47500001e6100000010100000000000000000027400000000000204840\')) AS header,\n       ST_ASTEXT(GEO_FROM_GPKG(BLOB_FROM_HEX(\'47500001e6100000010100000000000000000027400000000000204840\'))) AS point')">
+                    📦 GeoPackageBinary
+                </div>
+                <div class="example-query" onclick="setQuery('-- New: normalize CRS identifiers, apply WMS 1.3 axis order, and address a generic OGC TileMatrix\nSELECT CRS_NORMALIZE(\'urn:ogc:def:crs:EPSG::25832\') AS canonical_crs,\n       CRS_AXIS_ORDER(\'EPSG:4326\') AS axis_order,\n       WMS_BBOX(11, 48, 12, 49, \'EPSG:4326\', \'1.3.0\') AS wms_130_bbox,\n       TILE_MATRIX_BBOX(100000, 500000, 10, 256, 256, 2, 3, \'topLeft\') AS tile_bbox,\n       TILE_MATRIX_POSITION(105121, 492319, 100000, 500000, 10, 256, 256, \'topLeft\') AS tile_position')">
+                    🧭 CRS, WMS &amp; TileMatrix
+                </div>
                 <div class="example-query" onclick="setQuery('-- New: GEO_DISSOLVE merges touching regions, GEO_CENTROID_AGG weights by population\nCREATE TABLE geo_region_demo (region TEXT, footprint GEOMETRY, population FLOAT);\nINSERT INTO geo_region_demo VALUES (\'north\', \'{&quot;type&quot;:&quot;Polygon&quot;,&quot;coordinates&quot;:[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}\', 100);\nINSERT INTO geo_region_demo VALUES (\'north\', \'{&quot;type&quot;:&quot;Polygon&quot;,&quot;coordinates&quot;:[[[1,0],[2,0],[2,1],[1,1],[1,0]]]}\', 300);\nINSERT INTO geo_region_demo VALUES (\'south\', \'{&quot;type&quot;:&quot;Polygon&quot;,&quot;coordinates&quot;:[[[10,10],[11,10],[11,11],[10,11],[10,10]]]}\', 50);\nSELECT region, GEO_DISSOLVE(footprint) AS boundary, GEO_CENTROID_AGG(footprint, population) AS weighted_centroid\nFROM geo_region_demo GROUP BY region ORDER BY region')">
                     🧩 GEO_DISSOLVE Regions
                 </div>
@@ -2121,6 +2251,12 @@
                 </div>
                 <div class="example-query" onclick="setQuery('-- New: RAG_SEARCH combines vector, text, and neighboring context\nSELECT doc_id, chunk_index, chunk_text, _hit_rank, _context_offset\nFROM RAG_SEARCH(\'rag_chunks\', \'embedding\', VEC_FROM_JSON(\'[0.8,0.6,0.1]\'), 2, \'{&quot;text_column&quot;:&quot;chunk_text&quot;,&quot;text_query&quot;:&quot;vector search RAG&quot;,&quot;key_columns&quot;:[&quot;doc_id&quot;,&quot;chunk_index&quot;],&quot;expand_before&quot;:1,&quot;expand_after&quot;:1,&quot;doc_id_column&quot;:&quot;doc_id&quot;,&quot;chunk_index_column&quot;:&quot;chunk_index&quot;}\')\nORDER BY _context_rank')">
                     🧠 RAG_SEARCH
+                </div>
+                <div class="example-query" data-requires="rag_chunks" onclick="setQuery('-- New: warm the exact vector + text paths used by serving queries\nSELECT * FROM RAG_WARM(\'rag_chunks\', \'chunk_text\', \'embedding\', \'cosine\', \'flat\')')">
+                    🔥 RAG_WARM
+                </div>
+                <div class="example-query" data-requires="rag_chunks" onclick="setQuery('-- New: tenant and Berlin-radius constraints apply before vector ranking\nSELECT chunk_id, doc_id, tenant_id, chunk_text, _vec_rank, _vec_distance\nFROM VEC_SEARCH_FILTERED(\n    \'rag_chunks\', \'embedding\', VEC_FROM_JSON(\'[0.8,0.6,0.1]\'), 5,\n    \'{&quot;pre_filter&quot;:{&quot;equals&quot;:{&quot;tenant_id&quot;:&quot;public&quot;},&quot;spatial&quot;:{&quot;geometry_column&quot;:&quot;geometry&quot;,&quot;center&quot;:[13.405,52.52],&quot;radius_meters&quot;:600000}}}\'\n)\nORDER BY _vec_rank')">
+                    🛡️ Filtered Spatial RAG
                 </div>
                 <div class="example-query" onclick="setQuery('-- New: literal multi-term search and ranking\nSELECT title, CONTAINS_SCORE(content, \'vector\', \'search\', \'retrieval\') AS matched_terms\nFROM ai_docs\nWHERE CONTAINS_ANY(content, \'vector\', \'retrieval\')\nORDER BY matched_terms DESC')">
                     🔎 CONTAINS Search

@@ -22,11 +22,11 @@ func executeRecentFeatureSQL(t *testing.T, db *tinysql.DB, sql string) *tinysql.
 
 func TestRecentEngineFeaturesAreAvailableToTheWASMModule(t *testing.T) {
 	db := tinysql.NewDB()
-	executeRecentFeatureSQL(t, db, `CREATE TABLE docs (chunk_id INT PRIMARY KEY, doc_id TEXT, chunk_index INT, chunk_text TEXT, embedding VECTOR)`)
+	executeRecentFeatureSQL(t, db, `CREATE TABLE docs (chunk_id INT PRIMARY KEY, doc_id TEXT, chunk_index INT, tenant_id TEXT, chunk_text TEXT, geometry GEOMETRY, embedding VECTOR)`)
 	executeRecentFeatureSQL(t, db, `INSERT INTO docs VALUES
-		(1, 'guide', 0, 'Vector search retrieves semantically related chunks.', '[1.0, 0.0, 0.0]'),
-		(2, 'guide', 1, 'RAG search can add neighboring context chunks.', '[0.8, 0.2, 0.0]'),
-		(3, 'other', 0, 'Geodata uses routes and coordinates.', '[0.0, 0.0, 1.0]')`)
+		(1, 'guide', 0, 'public', 'Vector search retrieves semantically related chunks.', '{"type":"Point","coordinates":[13.405,52.52]}', '[1.0, 0.0, 0.0]'),
+		(2, 'guide', 1, 'public', 'RAG search can add neighboring context chunks.', '{"type":"Point","coordinates":[11.5755,48.1372]}', '[0.8, 0.2, 0.0]'),
+		(3, 'other', 0, 'private', 'Geodata uses routes and coordinates.', '{"type":"Point","coordinates":[0,0]}', '[0.0, 0.0, 1.0]')`)
 
 	contains := executeRecentFeatureSQL(t, db, `SELECT CONTAINS_ALL(chunk_text, 'vector', 'search') AS all_terms,
 		CONTAINS_ANY(chunk_text, 'routes', 'search') AS any_term,
@@ -66,6 +66,25 @@ func TestRecentEngineFeaturesAreAvailableToTheWASMModule(t *testing.T) {
 		ORDER BY _rrf_rank`)
 	if len(hybrid.Rows) == 0 || hybrid.Rows[0]["_rrf_rank"] == nil {
 		t.Fatalf("HYBRID_SEARCH result = %#v", hybrid)
+	}
+
+	warm := executeRecentFeatureSQL(t, db, `SELECT * FROM RAG_WARM('docs', 'chunk_text', 'embedding', 'cosine', 'flat')`)
+	if len(warm.Rows) != 1 || warm.Rows[0]["vector_count"] == nil || warm.Rows[0]["fts_terms"] == nil {
+		t.Fatalf("RAG_WARM result = %#v", warm)
+	}
+
+	filtered := executeRecentFeatureSQL(t, db, `SELECT chunk_id, tenant_id, _vec_rank
+		FROM VEC_SEARCH_FILTERED(
+			'docs', 'embedding', VEC_FROM_JSON('[1.0,0.0,0.0]'), 5,
+			'{"pre_filter":{"equals":{"tenant_id":"public"},"spatial":{"geometry_column":"geometry","center":[13.405,52.52],"radius_meters":600000}}}'
+		) ORDER BY _vec_rank`)
+	if len(filtered.Rows) != 2 {
+		t.Fatalf("filtered spatial vector search returned %#v, want the two public nearby rows", filtered.Rows)
+	}
+	for _, row := range filtered.Rows {
+		if row["tenant_id"] != "public" {
+			t.Fatalf("filtered spatial vector search leaked row %#v", row)
+		}
 	}
 
 	executeRecentFeatureSQL(t, db, `ANALYZE docs`)
@@ -161,5 +180,30 @@ func TestRecentGeoFeaturesAreAvailableToTheWASMModule(t *testing.T) {
 	path := executeRecentFeatureSQL(t, db, `SELECT * FROM ROUTE_SHORTEST_PATH('route_edges', 'source', 'target', 'cost', 'A', 'C')`)
 	if len(path.Rows) != 3 {
 		t.Fatalf("ROUTE_SHORTEST_PATH A->C returned %d rows, want 3 (A, B, C): %#v", len(path.Rows), path.Rows)
+	}
+	warm := executeRecentFeatureSQL(t, db, `SELECT * FROM ROUTE_WARM('route_edges', 'source', 'target', 'cost')`)
+	if len(warm.Rows) != 1 || warm.Rows[0]["node_count"] == nil || warm.Rows[0]["edge_count"] == nil {
+		t.Fatalf("ROUTE_WARM result = %#v", warm)
+	}
+
+	standards := executeRecentFeatureSQL(t, db, `SELECT
+		CRS_NORMALIZE('urn:ogc:def:crs:EPSG::25832') AS crs,
+		WMS_BBOX(11, 48, 12, 49, 'EPSG:4326', '1.3.0') AS wms_bbox,
+		TILE_MATRIX_BBOX(100000, 500000, 10, 256, 256, 2, 3, 'topLeft') AS tile_bbox,
+		TILE_MATRIX_POSITION(105121, 492319, 100000, 500000, 10, 256, 256, 'topLeft') AS tile_position`)
+	if len(standards.Rows) != 1 {
+		t.Fatalf("OGC standards helpers returned %#v", standards.Rows)
+	}
+	for _, col := range []string{"crs", "wms_bbox", "tile_bbox", "tile_position"} {
+		if standards.Rows[0][col] == nil {
+			t.Errorf("%s is NULL", col)
+		}
+	}
+
+	gpkg := executeRecentFeatureSQL(t, db, `SELECT
+		GPKG_SRID(BLOB_FROM_HEX('47500001e6100000010100000000000000000027400000000000204840')) AS srid,
+		ST_ASTEXT(GEO_FROM_GPKG(BLOB_FROM_HEX('47500001e6100000010100000000000000000027400000000000204840'))) AS point`)
+	if len(gpkg.Rows) != 1 || gpkg.Rows[0]["srid"] != int64(4326) || gpkg.Rows[0]["point"] == nil {
+		t.Fatalf("GeoPackageBinary result = %#v", gpkg)
 	}
 }

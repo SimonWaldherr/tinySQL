@@ -34,10 +34,12 @@ var (
 	db         *tinysql.DB
 	tenant     = defaultTenant
 	queryCache *tinysql.QueryCache
+	telemetry  = newRuntimeMonitor()
 
 	// lastResult caches the most recent query result for client-side export.
-	lastResult     *tinysql.ResultSet
-	lastQueryDurMs float64
+	lastResult      *tinysql.ResultSet
+	lastQueryDurMs  float64
+	lastResultPager resultPager
 )
 
 func main() {
@@ -58,6 +60,8 @@ func main() {
 	js.Global().Set("getTableSchema", js.FuncOf(getTableSchema))
 	js.Global().Set("exportDatabase", js.FuncOf(exportDatabase))
 	js.Global().Set("importDatabase", js.FuncOf(importDatabase))
+	js.Global().Set("getRuntimeStatus", js.FuncOf(getRuntimeStatus))
+	js.Global().Set("setRuntimeIdentity", js.FuncOf(setRuntimeIdentity))
 
 	println("TinySQL Query Files WASM initialized!")
 	<-c
@@ -71,6 +75,39 @@ func registerDemoStoredProcedures() {
 
 func jsErr(msg string) map[string]interface{} {
 	return map[string]interface{}{"success": false, "error": msg}
+}
+
+func trackRuntimeRequest(kind string, fn func() interface{}) (response interface{}) {
+	request := telemetry.begin(kind)
+	defer func() {
+		success := false
+		timedOut := false
+		if payload, ok := response.(map[string]interface{}); ok {
+			success, _ = payload["success"].(bool)
+			if message, ok := payload["error"].(string); ok {
+				timedOut = strings.Contains(strings.ToLower(message), "timeout") || strings.Contains(strings.ToLower(message), "deadline exceeded")
+			}
+		}
+		telemetry.finish(request, success, timedOut)
+	}()
+	return fn()
+}
+
+func getRuntimeStatus(this js.Value, args []js.Value) interface{} {
+	return telemetry.snapshot(db, tenant, queryCache)
+}
+
+func setRuntimeIdentity(this js.Value, args []js.Value) interface{} {
+	userID := "local-browser"
+	sessionID := ""
+	if len(args) > 0 {
+		userID = args[0].String()
+	}
+	if len(args) > 1 {
+		sessionID = args[1].String()
+	}
+	telemetry.setIdentity(userID, sessionID)
+	return map[string]interface{}{"success": true, "userId": userID, "sessionId": sessionID, "mode": "local-single-user"}
 }
 
 func normalizeSQLInput(raw string) (string, error) {
@@ -139,7 +176,7 @@ func successResultPayload(result *tinysql.ResultSet, statementsRun int) map[stri
 		return payload
 	}
 
-	page := buildResultPage(result, 0, defaultResultPageSize, "", "", "asc")
+	page := lastResultPager.page(result, 0, defaultResultPageSize, "", "", "asc")
 	payload := map[string]interface{}{
 		"success":      true,
 		"columns":      stringsToInterfaces(result.Cols),
@@ -186,7 +223,7 @@ func getResultPage(this js.Value, args []js.Value) interface{} {
 		sortDirection = args[4].String()
 	}
 
-	page := buildResultPage(lastResult, offset, limit, filterText, sortColumn, sortDirection)
+	page := lastResultPager.page(lastResult, offset, limit, filterText, sortColumn, sortDirection)
 	return map[string]interface{}{
 		"success":      true,
 		"columns":      stringsToInterfaces(lastResult.Cols),
@@ -200,6 +237,10 @@ func getResultPage(this js.Value, args []js.Value) interface{} {
 
 // importFile imports a file (CSV, JSON, XML) into the database.
 func importFile(this js.Value, args []js.Value) interface{} {
+	return trackRuntimeRequest("import", func() interface{} { return importFileRequest(this, args) })
+}
+
+func importFileRequest(this js.Value, args []js.Value) interface{} {
 	if len(args) < 3 {
 		return jsErr("Usage: importFile(fileName, fileContent, tableName)")
 	}
@@ -308,6 +349,7 @@ func importFile(this js.Value, args []js.Value) interface{} {
 
 	// DDL/DML changed; clear cached last result only.
 	lastResult = nil
+	lastResultPager.reset()
 
 	return map[string]interface{}{
 		"success":      true,
@@ -323,6 +365,10 @@ func importFile(this js.Value, args []js.Value) interface{} {
 
 // executeQuery executes a single SQL query and returns results.
 func executeQuery(this js.Value, args []js.Value) interface{} {
+	return trackRuntimeRequest("query", func() interface{} { return executeQueryRequest(this, args) })
+}
+
+func executeQueryRequest(this js.Value, args []js.Value) interface{} {
 	if len(args) < 1 {
 		return jsErr("Usage: executeQuery(sqlQuery)")
 	}
@@ -346,6 +392,10 @@ func executeQuery(this js.Value, args []js.Value) interface{} {
 // executeMulti runs multiple semicolon-separated SQL statements and returns
 // the result of the last SELECT (or an aggregate summary).
 func executeMulti(this js.Value, args []js.Value) interface{} {
+	return trackRuntimeRequest("query", func() interface{} { return executeMultiRequest(this, args) })
+}
+
+func executeMultiRequest(this js.Value, args []js.Value) interface{} {
 	if len(args) < 1 {
 		return jsErr("Usage: executeMulti(sql)")
 	}
@@ -364,6 +414,7 @@ func executeMulti(this js.Value, args []js.Value) interface{} {
 	// Do not leave a previous query exportable when this batch fails part-way
 	// through. Earlier statements may still have mutated the local database.
 	lastResult = nil
+	lastResultPager.reset()
 	var lastRS *tinysql.ResultSet
 	for i, stmtRaw := range stmts {
 		stmtSQL, err := normalizeSQLInput(stmtRaw)
@@ -386,9 +437,14 @@ func executeMulti(this js.Value, args []js.Value) interface{} {
 
 // clearDatabase clears all tables from the database.
 func clearDatabase(this js.Value, args []js.Value) interface{} {
+	return trackRuntimeRequest("database", func() interface{} { return clearDatabaseRequest(this, args) })
+}
+
+func clearDatabaseRequest(this js.Value, args []js.Value) interface{} {
 	db = tinysql.NewDB()
 	queryCache = tinysql.NewQueryCache(queryCacheSize)
 	lastResult = nil
+	lastResultPager.reset()
 	return map[string]interface{}{
 		"success": true,
 		"message": "Database cleared",
@@ -397,6 +453,10 @@ func clearDatabase(this js.Value, args []js.Value) interface{} {
 
 // exportDatabase serializes the current database as a base64 GOB snapshot.
 func exportDatabase(this js.Value, args []js.Value) interface{} {
+	return trackRuntimeRequest("snapshot", func() interface{} { return exportDatabaseRequest(this, args) })
+}
+
+func exportDatabaseRequest(this js.Value, args []js.Value) interface{} {
 	data, err := tinysql.SaveToBytes(db)
 	if err != nil {
 		return jsErr("export failed: " + err.Error())
@@ -411,6 +471,10 @@ func exportDatabase(this js.Value, args []js.Value) interface{} {
 
 // importDatabase replaces the current database from a base64 GOB snapshot.
 func importDatabase(this js.Value, args []js.Value) interface{} {
+	return trackRuntimeRequest("snapshot", func() interface{} { return importDatabaseRequest(this, args) })
+}
+
+func importDatabaseRequest(this js.Value, args []js.Value) interface{} {
 	if len(args) < 1 {
 		return jsErr("Usage: importDatabase(snapshot)")
 	}
@@ -429,6 +493,7 @@ func importDatabase(this js.Value, args []js.Value) interface{} {
 	db = loaded
 	queryCache = tinysql.NewQueryCache(queryCacheSize)
 	lastResult = nil
+	lastResultPager.reset()
 	return map[string]interface{}{
 		"success":   true,
 		"message":   "Database imported",
@@ -438,6 +503,10 @@ func importDatabase(this js.Value, args []js.Value) interface{} {
 
 // dropTable removes a user table from the database.
 func dropTable(this js.Value, args []js.Value) interface{} {
+	return trackRuntimeRequest("database", func() interface{} { return dropTableRequest(this, args) })
+}
+
+func dropTableRequest(this js.Value, args []js.Value) interface{} {
 	if len(args) < 1 {
 		return jsErr("Usage: dropTable(tableName)")
 	}
@@ -453,6 +522,7 @@ func dropTable(this js.Value, args []js.Value) interface{} {
 		return jsErr("drop failed: " + err.Error())
 	}
 	lastResult = nil
+	lastResultPager.reset()
 	return map[string]interface{}{
 		"success": true,
 		"message": "Table dropped",
@@ -560,6 +630,10 @@ func getTableSchema(this js.Value, args []js.Value) interface{} {
 // exportResults exports the last query result in the requested format.
 // format: csv, json, xml
 func exportResults(this js.Value, args []js.Value) interface{} {
+	return trackRuntimeRequest("export", func() interface{} { return exportResultsRequest(this, args) })
+}
+
+func exportResultsRequest(this js.Value, args []js.Value) interface{} {
 	if len(args) < 1 {
 		return jsErr("Usage: exportResults(format)")
 	}

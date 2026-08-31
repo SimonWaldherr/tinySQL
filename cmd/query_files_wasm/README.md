@@ -117,6 +117,9 @@ update-gh-pages` picks up regenerated files the same way it does `app.js`.
   `.routinggraph`, `.graph.json`, ...)
 - single- and multi-statement SQL execution, schema inspection, table removal
 - query history, editor state, and database snapshot in local storage
+- live runtime monitoring for active/total/failed/timed-out requests, request
+  throughput and latency, peak concurrency, real Busy/Idle time, Go heap usage,
+  table/row counts, query-cache occupancy, and per-user/session counters
 - WASM-side result paging, filtering, and sorting, so large result sets stay in
   Go memory instead of being copied wholesale into JavaScript; table copy,
   VanillaGrid pivot view, and exports as CSV, TSV, Markdown, JSON, and XML
@@ -132,11 +135,21 @@ update-gh-pages` picks up regenerated files the same way it does `app.js`.
   construction, `GEO_BUFFER` service-area circles, and
   `GEO_BEARING`/`GEO_MIDPOINT`/`GEO_DESTINATION`/`GEO_WITHIN_POLYGON`/
   `GEO_POLYGON_AREA`/`GEO_LENGTH` measurement
+- late-August OGC interoperability examples: WKT/EWKT and WKB/EWKB round
+  trips, GeoPackageBinary inspection, geohash cells, `ST_TRANSFORM`,
+  `ST_TOUCHES`/`ST_COVERS`/`ST_PERIMETER`, CRS normalization, WMS 1.3 axis
+  ordering, and generic OGC TileMatrix bounds/positions
 - search examples: `FTS_SEARCH`, `FTS_RANK`, `FTS_SNIPPET`, `BM25`,
   `VEC_SEARCH`, `VEC_COSINE_SIMILARITY`, `HYBRID_SEARCH`,
   `RAG_CONTEXT_FROM`, `RAG_SEARCH`,
   `CONTAINS_ALL`/`CONTAINS_ANY`/`CONTAINS_SCORE`, plus `?`/`_`
   single-character and `*`/`%` multi-character FTS wildcards
+- pre-ranking tenant/ACL and spatial filtering through
+  `VEC_SEARCH_FILTERED`, plus `RAG_WARM` cache preparation; the sample RAG
+  corpus includes public/private rows and WGS84 geometry so the boundary is
+  visible in the result
+- route graph preparation and execution with `ROUTE_WARM`,
+  `ROUTE_SHORTEST_PATH`, and `ROUTE_DISTANCE`
 - recent vector/planning examples: `VEC_HAMMING_DISTANCE`, `VEC_CENTROID`,
   `ANALYZE`, and `sys.statistics`
 - analytics examples: `PIVOT`, `RETURNING`, `EXPLAIN`, SQLite-compatible
@@ -212,6 +225,8 @@ editor to the encoded query, and runs it when `autoRun` is true.
 - `exportDatabase()`
 - `importDatabase(snapshot)`
 - `exportResults(format)`
+- `getRuntimeStatus()`
+- `setRuntimeIdentity(userId, sessionId)`
 
 `executeMulti` recognizes statement separators only outside SQL strings, quoted
 identifiers, and line/block comments, so scripts can safely contain semicolons
@@ -220,6 +235,19 @@ in those constructs.
 Query execution returns only the first result page plus `totalRows`. Use
 `getResultPage` for subsequent pages and WASM-side filtering/sorting.
 `exportResults` still exports the complete unfiltered result.
+The result view reuses its filtered/sorted row index across page changes, and
+local snapshot writes are coalesced and deferred to browser idle time to avoid
+interrupting query and table interaction.
+
+`getRuntimeStatus` returns one consistent JSON snapshot of request, operation,
+database, cache, memory, user, and session metrics. The browser app assigns a
+stable session ID for the tab and identifies itself as `local-browser`; a host
+embedding the WASM module can provide its authenticated user and session with
+`setRuntimeIdentity`. The standalone browser build still has one local database
+instance per tab, so its observed-user count is normally one. The schema is
+already multi-user-capable, but cross-user aggregation belongs in a shared host
+or worker/service layer rather than pretending separate browser tabs share a
+runtime.
 
 ## Recommended RAG workflow
 

@@ -22,23 +22,51 @@ type resultPage struct {
 	Limit        int
 }
 
+// resultPager retains the expensive filter/sort index while the user moves
+// through pages of the same result view. Only the small visible row slice is
+// rebuilt for each page request.
+type resultPager struct {
+	result        *tinysql.ResultSet
+	filterText    string
+	sortColumn    string
+	sortDirection string
+	rowIndexes    []int
+}
+
+func (pager *resultPager) reset() {
+	pager.result = nil
+	pager.rowIndexes = nil
+}
+
+func (pager *resultPager) page(result *tinysql.ResultSet, offset, limit int, filterText, sortColumn, sortDirection string) resultPage {
+	normalizedFilter := strings.ToLower(strings.TrimSpace(filterText))
+	normalizedDirection := "asc"
+	if strings.EqualFold(sortDirection, "desc") {
+		normalizedDirection = "desc"
+	}
+	if pager.result != result || pager.filterText != normalizedFilter || pager.sortColumn != sortColumn || pager.sortDirection != normalizedDirection {
+		pager.result = result
+		pager.filterText = normalizedFilter
+		pager.sortColumn = sortColumn
+		pager.sortDirection = normalizedDirection
+		pager.rowIndexes = buildResultRowIndexes(result, normalizedFilter, sortColumn, normalizedDirection)
+	}
+	return sliceResultPage(result, pager.rowIndexes, offset, limit)
+}
+
 // buildResultPage keeps large query results inside Go/WASM and only moves the
 // visible slice across the relatively expensive syscall/js boundary.
 func buildResultPage(result *tinysql.ResultSet, offset, limit int, filterText, sortColumn, sortDirection string) resultPage {
-	if limit <= 0 {
-		limit = defaultResultPageSize
-	}
-	if limit > maxResultPageSize {
-		limit = maxResultPageSize
-	}
-	if offset < 0 {
-		offset = 0
-	}
+	filterNeedle := strings.ToLower(strings.TrimSpace(filterText))
+	rowIndexes := buildResultRowIndexes(result, filterNeedle, sortColumn, sortDirection)
+	return sliceResultPage(result, rowIndexes, offset, limit)
+}
+
+func buildResultRowIndexes(result *tinysql.ResultSet, filterNeedle, sortColumn, sortDirection string) []int {
 	if result == nil {
-		return resultPage{Rows: []tinysql.Row{}, Limit: limit}
+		return nil
 	}
 
-	filterNeedle := strings.ToLower(strings.TrimSpace(filterText))
 	rowIndexes := make([]int, 0, len(result.Rows))
 	for index, row := range result.Rows {
 		if filterNeedle == "" || resultRowContains(row, result.Cols, filterNeedle) {
@@ -57,6 +85,22 @@ func buildResultPage(result *tinysql.ResultSet, offset, limit int, filterText, s
 			}
 			return comparison < 0
 		})
+	}
+	return rowIndexes
+}
+
+func sliceResultPage(result *tinysql.ResultSet, rowIndexes []int, offset, limit int) resultPage {
+	if limit <= 0 {
+		limit = defaultResultPageSize
+	}
+	if limit > maxResultPageSize {
+		limit = maxResultPageSize
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if result == nil {
+		return resultPage{Rows: []tinysql.Row{}, Limit: limit}
 	}
 
 	filteredRows := len(rowIndexes)
