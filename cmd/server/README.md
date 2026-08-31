@@ -3,9 +3,10 @@
 Part of [tinySQL](../../README.md). See the root guide for the engine feature
 set and [tinysqld](../tinysqld/README.md) for the durable DBMS profile.
 
-Serves a tinySQL database over HTTP (JSON/NDJSON REST) and gRPC (JSON codec),
-with optional bearer-token auth, TLS, size/timeout limits, trusted proxies, and
-peer-to-peer federation for read fan-out.
+Serves a tinySQL database over HTTP (JSON/NDJSON REST) and gRPC (Protocol
+Buffers, with the earlier JSON codec retained), with optional bearer-token
+auth, TLS, size/timeout limits, trusted proxies, and peer-to-peer federation
+for read fan-out.
 
 ```bash
 cd cmd/server && go build -o server .
@@ -131,12 +132,16 @@ final record is `{"type":"error","error":"..."}`. Consumers should process
 records incrementally and treat `error` as terminal.
 
 `QueryStream` is the matching gRPC server-streaming RPC at
-`/tinysql.tinySQL/QueryStream`. It uses the server's existing JSON codec: send
-one `queryRequest` (`tenant`, `sql`, optional `timeout_ms`) and receive the
-same `header`/`row`/`end`/`error` record shapes. A terminal `error` record is
-followed by a non-OK gRPC status; startup/validation errors return only that
-status. Clients canceling the gRPC context or closing the HTTP response stop
-the engine stream and release its execution slot promptly.
+`/tinysql.TinySQL/QueryStream`. Its schema is
+[`tinysql.proto`](./tinysql.proto). Query rows are individual JSON byte fields
+inside the protobuf message because SQL cells are dynamically typed; snapshot
+and WAL payloads remain raw bytes, avoiding JSON/Base64 expansion. Existing
+clients can continue selecting the `json` content subtype. Internal federation
+and replication use protobuf by default. Go clients can import the generated
+[`protocol`](./protocol) package. A terminal `error` record is followed by a
+non-OK gRPC status; startup/validation errors return only that status. Clients
+canceling the gRPC context or closing the HTTP response stop the engine stream
+and release its execution slot promptly.
 
 Simple single-table scans, filters, index seeks, projections, `LIMIT`, and
 `OFFSET` can deliver rows while the scan is still running. Query shapes that

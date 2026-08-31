@@ -729,6 +729,14 @@ self-identifying encodings and can emit a table manifest with schema, row
 count, and a typed-row SHA-256 fingerprint. See
 [`ExampleExportJSON`](./exporter/example_test.go).
 
+GOB export reuses canonical result-row maps when no display-key rewrite is
+needed, while XML is emitted one row at a time instead of materializing a
+second result-sized document. Whole-database GOB snapshots and the basic WAL
+use 64 KiB buffered streams to reduce small writes without changing their
+on-disk format. The HTTP/gRPC server also provides the protobuf schema in
+[`cmd/server/tinysql.proto`](./cmd/server/tinysql.proto); internal federation
+and replication carry binary GOB payloads directly in protobuf byte fields.
+
 CSV input is sampled only for type inference and then inserted in bounded
 batches. JSON imports likewise bound their inference copy and use the same
 batch path, including direct appends to paged-index storage. CSV, JSON, and

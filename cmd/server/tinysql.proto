@@ -1,0 +1,75 @@
+syntax = "proto3";
+
+package tinysql;
+
+option go_package = "github.com/SimonWaldherr/tinySQL/cmd/server/protocol;serverpb";
+
+service TinySQL {
+  rpc Exec(ExecRequest) returns (ExecResponse);
+  rpc Query(QueryRequest) returns (QueryResponse);
+  rpc QueryStream(QueryRequest) returns (stream QueryStreamResponse);
+  rpc Bootstrap(BootstrapRequest) returns (BootstrapResponse);
+  rpc GetChangesSince(GetChangesSinceRequest) returns (GetChangesSinceResponse);
+  rpc GetChanges(GetChangesSinceRequest) returns (stream GetChangesSinceResponse);
+}
+
+message ExecRequest {
+  string tenant = 1;
+  string sql = 2;
+  int64 timeout_ms = 3;
+}
+
+message ExecResponse {
+  bool success = 1;
+  string error = 2;
+  int64 rows_affected = 3;
+  int64 last_insert_id = 4;
+  string duration = 5;
+}
+
+message QueryRequest {
+  string tenant = 1;
+  string sql = 2;
+  int64 timeout_ms = 3;
+  int64 peer_timeout_ms = 4;
+}
+
+message QueryResponse {
+  string sql = 1;
+  repeated string columns = 2;
+  repeated bytes rows_json = 3;
+  string error = 4;
+  string duration = 5;
+  int64 count = 6;
+  bool truncated = 7;
+}
+
+message QueryStreamResponse {
+  string type = 1;
+  string sql = 2;
+  repeated string columns = 3;
+  bytes row_json = 4;
+  int64 count = 5;
+  bool truncated = 6;
+  string duration = 7;
+  string error = 8;
+}
+
+message BootstrapRequest { string tenant = 1; }
+
+message BootstrapResponse {
+  bytes snapshot_gob = 1;
+  uint64 watermark_lsn = 2;
+  uint64 epoch = 3;
+}
+
+message GetChangesSinceRequest {
+  string tenant = 1;
+  uint64 since_lsn = 2;
+}
+
+message GetChangesSinceResponse {
+  bytes records_gob = 1;
+  uint64 resume_lsn = 2;
+  uint64 epoch = 3;
+}

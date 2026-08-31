@@ -127,34 +127,34 @@ var (
 
 // HTTP types
 type execRequest struct {
-	Tenant    string `json:"tenant"`
-	SQL       string `json:"sql"`
-	TimeoutMS int64  `json:"timeout_ms,omitempty"`
+	Tenant    string `json:"tenant" protobuf:"1"`
+	SQL       string `json:"sql" protobuf:"2"`
+	TimeoutMS int64  `json:"timeout_ms,omitempty" protobuf:"3"`
 }
 
 type execResponse struct {
-	Success      bool   `json:"success"`
-	Error        string `json:"error,omitempty"`
-	RowsAffected int64  `json:"rows_affected,omitempty"`
-	LastInsertID int64  `json:"last_insert_id,omitempty"`
-	Duration     string `json:"duration"`
+	Success      bool   `json:"success" protobuf:"1"`
+	Error        string `json:"error,omitempty" protobuf:"2"`
+	RowsAffected int64  `json:"rows_affected,omitempty" protobuf:"3"`
+	LastInsertID int64  `json:"last_insert_id,omitempty" protobuf:"4"`
+	Duration     string `json:"duration" protobuf:"5"`
 }
 
 type queryRequest struct {
-	Tenant        string `json:"tenant"`
-	SQL           string `json:"sql"`
-	TimeoutMS     int64  `json:"timeout_ms,omitempty"`
-	PeerTimeoutMS int64  `json:"peer_timeout_ms,omitempty"`
+	Tenant        string `json:"tenant" protobuf:"1"`
+	SQL           string `json:"sql" protobuf:"2"`
+	TimeoutMS     int64  `json:"timeout_ms,omitempty" protobuf:"3"`
+	PeerTimeoutMS int64  `json:"peer_timeout_ms,omitempty" protobuf:"4"`
 }
 
 type queryResponse struct {
-	SQL       string           `json:"sql"`
-	Columns   []string         `json:"columns"`
-	Rows      []map[string]any `json:"rows"`
-	Error     string           `json:"error,omitempty"`
-	Duration  string           `json:"duration"`
-	Count     int              `json:"count"`
-	Truncated bool             `json:"truncated,omitempty"`
+	SQL       string           `json:"sql" protobuf:"1"`
+	Columns   []string         `json:"columns" protobuf:"2"`
+	Rows      []map[string]any `json:"rows" protobuf:"3"`
+	Error     string           `json:"error,omitempty" protobuf:"4"`
+	Duration  string           `json:"duration" protobuf:"5"`
+	Count     int              `json:"count" protobuf:"6"`
+	Truncated bool             `json:"truncated,omitempty" protobuf:"7"`
 }
 
 // queryStreamResponse is one record in the query streaming protocol shared
@@ -167,14 +167,14 @@ type queryResponse struct {
 // makes an empty result, an empty row, and an execution error unambiguous for
 // clients using either transport.
 type queryStreamResponse struct {
-	Type      string         `json:"type"`
-	SQL       string         `json:"sql,omitempty"`
-	Columns   []string       `json:"columns,omitempty"`
-	Row       map[string]any `json:"row,omitempty"`
-	Count     int            `json:"count,omitempty"`
-	Truncated bool           `json:"truncated,omitempty"`
-	Duration  string         `json:"duration,omitempty"`
-	Error     string         `json:"error,omitempty"`
+	Type      string         `json:"type" protobuf:"1"`
+	SQL       string         `json:"sql,omitempty" protobuf:"2"`
+	Columns   []string       `json:"columns,omitempty" protobuf:"3"`
+	Row       map[string]any `json:"row,omitempty" protobuf:"4"`
+	Count     int            `json:"count,omitempty" protobuf:"5"`
+	Truncated bool           `json:"truncated,omitempty" protobuf:"6"`
+	Duration  string         `json:"duration,omitempty" protobuf:"7"`
+	Error     string         `json:"error,omitempty" protobuf:"8"`
 }
 
 // bootstrapRequest/bootstrapResponse and getChangesSinceRequest/
@@ -187,21 +187,21 @@ type queryStreamResponse struct {
 // tenant) today.
 //
 // SnapshotGob and RecordsGob are gob-encoded payloads carried as opaque
-// bytes inside a JSON envelope (the gRPC call itself still uses the
-// existing jsonCodec). Running WALRecord payloads through jsonCodec
-// directly would lose concrete Go types held in BeforeImage/AfterImage
+// protobuf byte fields (or Base64 strings for legacy JSON-codec clients).
+// Running WALRecord payloads through a JSON object representation directly
+// would lose concrete Go types held in BeforeImage/AfterImage
 // (int64, *big.Rat, uuid.UUID, time.Time, ...) via the json.Unmarshal-into-
 // "any" round trip -- fine for display-only Query responses, unsafe for
 // replicated row data that must be applied byte-for-byte equivalent on the
 // replica. gob preserves those concrete types, and the WAL file already
 // gob-encodes WALRecord, so no new type registration is needed.
 type bootstrapRequest struct {
-	Tenant string `json:"tenant"`
+	Tenant string `json:"tenant" protobuf:"1"`
 }
 
 type bootstrapResponse struct {
-	SnapshotGob  []byte `json:"snapshot_gob"`
-	WatermarkLSN uint64 `json:"watermark_lsn"`
+	SnapshotGob  []byte `json:"snapshot_gob" protobuf:"1"`
+	WatermarkLSN uint64 `json:"watermark_lsn" protobuf:"2"`
 
 	// Epoch identifies the primary's current WAL/checkpoint incarnation
 	// (see storage.AdvancedWAL.Epoch's doc comment). A replica remembers it
@@ -209,17 +209,17 @@ type bootstrapResponse struct {
 	// mismatch means the primary's WAL/checkpoint files were wiped or
 	// restored from backup since this bootstrap, and incremental polling
 	// can no longer be trusted -- a fresh Bootstrap is required.
-	Epoch uint64 `json:"epoch"`
+	Epoch uint64 `json:"epoch" protobuf:"3"`
 }
 
 type getChangesSinceRequest struct {
-	Tenant   string `json:"tenant"`
-	SinceLSN uint64 `json:"since_lsn"`
+	Tenant   string `json:"tenant" protobuf:"1"`
+	SinceLSN uint64 `json:"since_lsn" protobuf:"2"`
 }
 
 type getChangesSinceResponse struct {
-	RecordsGob []byte `json:"records_gob"`
-	ResumeLSN  uint64 `json:"resume_lsn"`
+	RecordsGob []byte `json:"records_gob" protobuf:"1"`
+	ResumeLSN  uint64 `json:"resume_lsn" protobuf:"2"`
 
 	// Epoch mirrors bootstrapResponse.Epoch, repeated on every poll rather
 	// than left implicit from Bootstrap. This is deliberate, not just
@@ -231,10 +231,10 @@ type getChangesSinceResponse struct {
 	// that case, since the reset primary's checkpoint watermark starts back
 	// at 0. Only comparing Epoch on every single poll response, not just at
 	// Bootstrap, catches that silent case.
-	Epoch uint64 `json:"epoch"`
+	Epoch uint64 `json:"epoch" protobuf:"3"`
 }
 
-// gRPC JSON codec
+// gRPC JSON compatibility codec. Protobuf is the default for internal calls.
 type jsonCodec struct{}
 
 func (jsonCodec) Name() string                       { return "json" }
@@ -1555,7 +1555,7 @@ func sameColumns(a, b []string) bool {
 	return equalStringSlices(aa, bb)
 }
 
-// Federated query: query all peers via gRPC JSON codec and merge rows (concat)
+// Federated query: query all peers via gRPC protobuf and merge rows (concat)
 func (s *server) handleFederatedQuery(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeErrorJSON(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -1694,7 +1694,7 @@ func writeErrorJSON(w http.ResponseWriter, statusCode int, message string) {
 	writeJSON(w, statusCode, map[string]any{"error": message})
 }
 
-// gRPC JSON client helper
+// gRPC protobuf client helper
 func grpcQuery(ctx context.Context, addr string, req *queryRequest, authToken string, timeout time.Duration, maxRecvMsg int, transportCreds credentials.TransportCredentials) (*queryResponse, error) {
 	if strings.TrimSpace(addr) == "" {
 		return nil, fmt.Errorf("empty peer address")
@@ -1707,7 +1707,7 @@ func grpcQuery(ctx context.Context, addr string, req *queryRequest, authToken st
 	dialOptions := []grpc.DialOption{
 		grpc.WithTransportCredentials(transportCreds),
 		grpc.WithDefaultCallOptions(
-			grpc.ForceCodec(jsonCodec{}),
+			grpc.ForceCodec(protobufCodec{}),
 			grpc.MaxCallRecvMsgSize(maxRecvMsg),
 		),
 	}
@@ -2147,6 +2147,7 @@ func run() error {
 
 	srv := newServer(db, tenant, *flagAuth, parsePeerList(*flagPeers), trustedProxies, peerDialCreds)
 	encoding.RegisterCodec(jsonCodec{})
+	encoding.RegisterCodec(protobufCodec{})
 
 	errChan := make(chan error, 2)
 

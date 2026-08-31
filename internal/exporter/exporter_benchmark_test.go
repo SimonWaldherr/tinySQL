@@ -10,7 +10,7 @@ import (
 
 func benchmarkResultSet(rows int) *engine.ResultSet {
 	rs := &engine.ResultSet{
-		Cols: []string{"ID", "Name", "Active", "Score"},
+		Cols: []string{"id", "name", "active", "score"},
 		Rows: make([]engine.Row, rows),
 	}
 	for i := range rs.Rows {
@@ -33,6 +33,8 @@ func BenchmarkStreamingExports(b *testing.B) {
 		{name: "csv", fn: ExportCSV},
 		{name: "json", fn: ExportJSON},
 		{name: "ndjson", fn: ExportNDJSON},
+		{name: "xml", fn: func(w io.Writer, rs *engine.ResultSet, _ Options) error { return ExportXML(w, rs) }},
+		{name: "gob", fn: func(w io.Writer, rs *engine.ResultSet, _ Options) error { return ExportGOB(w, rs) }},
 	}
 	for _, benchmark := range benchmarks {
 		b.Run(benchmark.name, func(b *testing.B) {

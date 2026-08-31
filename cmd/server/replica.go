@@ -63,8 +63,8 @@ var flagReplicaOf = flag.String("replica-of", "", "gRPC address of a primary tin
 // GetChangesSince RPC instead (runReplicaPollLoop, stages 1-5's original
 // transport). Both apply the exact same replication semantics -- this
 // flag only changes how records get from the primary to the replica, kept
-// selectable in case gRPC streaming proves awkward against this server's
-// hand-rolled JSON codec in some environment.
+// selectable when a proxy or deployment environment handles long-lived gRPC
+// streams less reliably than unary calls.
 var flagReplicaTransport = flag.String("replica-transport", "stream", `Transport -replica-of uses to fetch WAL changes from the primary: "stream" (default, gRPC server-streaming) or "poll" (unary polling, kept as a fallback)`)
 
 const (
@@ -105,7 +105,7 @@ type replicaOptions struct {
 }
 
 // dialPeerGRPC opens a client connection to a tinySQL gRPC server (primary
-// or peer) using the same JSON-codec-forced dial pattern grpcQuery (main.go)
+// or peer) using the same protobuf-codec-forced dial pattern grpcQuery (main.go)
 // uses for federation peer calls, factored out here so both
 // runReplicaBootstrap and runReplicaPollLoop share one dial path. The
 // gRPC-level codec only wraps the outer request/response envelope --
@@ -121,7 +121,7 @@ func dialPeerGRPC(addr string, maxRecvMsg int, transportCreds credentials.Transp
 	dialOptions := []grpc.DialOption{
 		grpc.WithTransportCredentials(transportCreds),
 		grpc.WithDefaultCallOptions(
-			grpc.ForceCodec(jsonCodec{}),
+			grpc.ForceCodec(protobufCodec{}),
 			grpc.MaxCallRecvMsgSize(maxRecvMsg),
 		),
 		// The GetChanges stream carries no per-call deadline (see
@@ -336,7 +336,7 @@ func runReplicaPollLoop(ctx context.Context, db *storage.DB, primaryAddr, tenant
 // of GetChangesSince -- see _TinySQL_GetChanges_Handler in main.go) against
 // conn and sends the initial request (Tenant, SinceLSN) the handler expects
 // as the very first message on the stream. It uses the same
-// jsonCodec-forced dial (conn is expected to come from dialPeerGRPC) and the
+// protobuf-codec-forced dial (conn is expected to come from dialPeerGRPC) and the
 // same auth-metadata handling (replicaCallContext) as every other RPC in this
 // file.
 //

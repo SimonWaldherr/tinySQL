@@ -23,6 +23,10 @@ import (
 // attached to db and the call carries no watermark (see rejectLiveWALPath).
 var ErrSaveToFileWouldBypassWALWatermark = errors.New("tinysql: SaveToFile would overwrite a live WAL-mode database's own checkpoint file without a watermark; use WALManager.Checkpoint/AdvancedWAL.Checkpoint (or DB.Close) instead")
 
+// serializationBufferSize amortizes writes for GOB snapshots and WAL records
+// without making the transient buffer significant next to table data.
+const serializationBufferSize = 64 << 10
+
 // SaveToFile writes a snapshot of the database to a file. If the filename
 // ends with .gz, the snapshot is gzip-compressed to reduce size.
 //
@@ -69,7 +73,7 @@ func SaveToFile(db *DB, filename string, extra ...any) error {
 		return err
 	}
 
-	bw := bufio.NewWriter(f)
+	bw := bufio.NewWriterSize(f, serializationBufferSize)
 	var w io.Writer = bw
 	// Enable gzip compression based on file extension.
 	var gz *gzip.Writer
@@ -124,7 +128,7 @@ func LoadFromFile(filename string) (*DB, error) {
 	}
 	defer func() { _ = f.Close() }()
 	var dump []diskTable
-	var r io.Reader = bufio.NewReader(f)
+	var r io.Reader = bufio.NewReaderSize(f, serializationBufferSize)
 	if strings.HasSuffix(strings.ToLower(filename), ".gz") {
 		gr, gzErr := gzip.NewReader(r)
 		if gzErr != nil {
@@ -172,7 +176,7 @@ func LoadFromFile(filename string) (*DB, error) {
 // unchanged.
 func SaveToWriter(db *DB, w io.Writer, extra ...any) error {
 	dump, catalog := snapshotForCheckpoint(db)
-	bw := bufio.NewWriter(w)
+	bw := bufio.NewWriterSize(w, serializationBufferSize)
 	enc := gob.NewEncoder(bw)
 	if err := enc.Encode(dump); err != nil {
 		return err
@@ -220,7 +224,7 @@ func snapshotForCheckpoint(db *DB) ([]diskTable, diskCatalog) {
 // ReadCheckpointWatermark's "predates this field: nothing to fill in"
 // behavior rather than erroring.
 func LoadFromReader(r io.Reader, extra ...any) (*DB, error) {
-	dec := gob.NewDecoder(bufio.NewReader(r))
+	dec := gob.NewDecoder(bufio.NewReaderSize(r, serializationBufferSize))
 	var dump []diskTable
 	if err := dec.Decode(&dump); err != nil {
 		if errors.Is(err, io.EOF) {

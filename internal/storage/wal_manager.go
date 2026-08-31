@@ -122,7 +122,7 @@ func OpenWAL(db *DB, cfg WALConfig) (*WALManager, error) {
 		return nil, err
 	}
 	cw := &countingWriter{w: f, n: size}
-	writer := bufio.NewWriter(cw)
+	writer := bufio.NewWriterSize(cw, serializationBufferSize)
 	wm := &WALManager{
 		path:                walPath,
 		checkpointWatermark: watermark,
@@ -267,7 +267,7 @@ func (w *WALManager) Checkpoint(db *DB) error {
 	}
 	w.file = f
 	w.bytes = &countingWriter{w: f}
-	w.writer = bufio.NewWriter(w.bytes)
+	w.writer = bufio.NewWriterSize(w.bytes, serializationBufferSize)
 	w.encoder = gob.NewEncoder(w.writer)
 	// Seq deliberately keeps counting from where it was: see checkpointWatermark.
 	w.checkpointWatermark = watermark

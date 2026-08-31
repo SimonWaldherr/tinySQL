@@ -486,24 +486,25 @@ type xmlRow struct {
 	Fields []xmlField `xml:",any"`
 }
 
-type xmlRows struct {
-	XMLName xml.Name `xml:"rows"`
-	Rows    []xmlRow `xml:"row"`
-}
-
 // ExportXML writes ResultSet as simple XML: <rows><row><col>value</col>...</row>...</rows>
 func ExportXML(w io.Writer, rs *engine.ResultSet) error {
-	xr := xmlRows{XMLName: xml.Name{Local: "rows"}, Rows: make([]xmlRow, 0, len(rs.Rows))}
-	for _, r := range rs.Rows {
-		xrRow := xmlRow{Fields: make([]xmlField, 0, len(rs.Cols))}
-		for _, c := range rs.Cols {
-			xrRow.Fields = append(xrRow.Fields, xmlField{XMLName: xml.Name{Local: c}, Value: valueToString(r[strings.ToLower(c)], "base64")})
-		}
-		xr.Rows = append(xr.Rows, xrRow)
-	}
 	enc := xml.NewEncoder(w)
 	enc.Indent("", "  ")
-	if err := enc.Encode(xr); err != nil {
+	root := xml.StartElement{Name: xml.Name{Local: "rows"}}
+	if err := enc.EncodeToken(root); err != nil {
+		return err
+	}
+	keys := resultColumnKeys(rs.Cols)
+	for _, r := range rs.Rows {
+		xrRow := xmlRow{Fields: make([]xmlField, 0, len(rs.Cols))}
+		for i, c := range rs.Cols {
+			xrRow.Fields = append(xrRow.Fields, xmlField{XMLName: xml.Name{Local: c}, Value: valueToString(r[keys[i]], "base64")})
+		}
+		if err := enc.EncodeElement(xrRow, xml.StartElement{Name: xml.Name{Local: "row"}}); err != nil {
+			return err
+		}
+	}
+	if err := enc.EncodeToken(root.End()); err != nil {
 		return err
 	}
 	return enc.Flush()
@@ -521,6 +522,14 @@ func ExportGOB(w io.Writer, rs *engine.ResultSet) error {
 		Rows: make([]map[string]any, len(rs.Rows)),
 	}
 	for i, r := range rs.Rows {
+		// ResultSet rows normally already contain exactly the lower-case display
+		// columns. Reuse that map directly; GOB only reads it during this call.
+		// Aliased/qualified projections retain the compatibility path below,
+		// which rewrites keys to their display spelling and filters extras.
+		if gobRowMatchesColumns(r, rs.Cols) {
+			wrapper.Rows[i] = map[string]any(r)
+			continue
+		}
 		m := make(map[string]any, len(rs.Cols))
 		for _, c := range rs.Cols {
 			m[c] = r[strings.ToLower(c)]
@@ -528,4 +537,19 @@ func ExportGOB(w io.Writer, rs *engine.ResultSet) error {
 		wrapper.Rows[i] = m
 	}
 	return enc.Encode(wrapper)
+}
+
+func gobRowMatchesColumns(row engine.Row, cols []string) bool {
+	if len(row) != len(cols) {
+		return false
+	}
+	for _, col := range cols {
+		if col != strings.ToLower(col) {
+			return false
+		}
+		if _, ok := row[col]; !ok {
+			return false
+		}
+	}
+	return true
 }

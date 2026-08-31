@@ -35,11 +35,12 @@ func newAdvancedWALTestServer(t *testing.T) (*server, *storage.DB) {
 
 // startTestGRPCServer spins up a real primary gRPC server on an
 // OS-assigned loopback port via the production startGRPCServer helper,
-// registers the jsonCodec (normally done once in run()), and returns the
+// registers the transport codecs (normally done once in run()), and returns the
 // address it actually bound to plus a stop func.
 func startTestGRPCServer(t *testing.T, srv *server, db *storage.DB) string {
 	t.Helper()
 	encoding.RegisterCodec(jsonCodec{})
+	encoding.RegisterCodec(protobufCodec{})
 
 	errChan := make(chan error, 1)
 	grpcSrv, addr, err := startGRPCServer(srv, db, "127.0.0.1:0", tls.VersionTLS12, errChan)
