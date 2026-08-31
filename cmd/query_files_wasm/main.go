@@ -25,8 +25,12 @@ import (
 const (
 	defaultTenant        = "default"
 	defaultQueryTimeout  = 30 * time.Second
+	defaultMultiTimeout  = 60 * time.Second
 	defaultImportTimeout = 60 * time.Second
 	maxSQLBytes          = 256 * 1024
+	maxMultiStatements   = 50
+	maxImportBytes       = 64 * 1024 * 1024
+	maxSnapshotBytes     = 256 * 1024 * 1024
 	queryCacheSize       = 256
 )
 
@@ -51,6 +55,8 @@ func main() {
 
 	js.Global().Set("importFile", js.FuncOf(importFile))
 	js.Global().Set("executeQuery", js.FuncOf(executeQuery))
+	js.Global().Set("executeQueryStream", js.FuncOf(executeQueryStream))
+	js.Global().Set("cancelQueryStream", js.FuncOf(cancelQueryStream))
 	js.Global().Set("executeMulti", js.FuncOf(executeMulti))
 	js.Global().Set("getResultPage", js.FuncOf(getResultPage))
 	js.Global().Set("clearDatabase", js.FuncOf(clearDatabase))
@@ -59,7 +65,10 @@ func main() {
 	js.Global().Set("exportResults", js.FuncOf(exportResults))
 	js.Global().Set("getTableSchema", js.FuncOf(getTableSchema))
 	js.Global().Set("exportDatabase", js.FuncOf(exportDatabase))
+	js.Global().Set("exportDatabaseBytes", js.FuncOf(exportDatabaseBytes))
 	js.Global().Set("importDatabase", js.FuncOf(importDatabase))
+	js.Global().Set("importDatabaseBytes", js.FuncOf(importDatabaseBytes))
+	js.Global().Set("validateDatabaseBytes", js.FuncOf(validateDatabaseBytes))
 	js.Global().Set("getRuntimeStatus", js.FuncOf(getRuntimeStatus))
 	js.Global().Set("setRuntimeIdentity", js.FuncOf(setRuntimeIdentity))
 
@@ -124,6 +133,19 @@ func normalizeSQLInput(raw string) (string, error) {
 func executeSQLText(sqlText string) (*tinysql.ResultSet, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultQueryTimeout)
 	defer cancel()
+	result, err := executeSQLTextWithContext(ctx, sqlText)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return nil, fmt.Errorf("Query timeout after %s", defaultQueryTimeout)
+	}
+	return result, err
+}
+
+// executeSQLTextWithContext shares the compiled-query path while letting a
+// caller own cancellation and a larger operation-wide deadline.
+func executeSQLTextWithContext(ctx context.Context, sqlText string) (*tinysql.ResultSet, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	compiled, err := queryCache.Compile(sqlText)
 	if err != nil {
@@ -132,8 +154,8 @@ func executeSQLText(sqlText string) (*tinysql.ResultSet, error) {
 
 	result, err := tinysql.ExecuteCompiled(ctx, db, tenant, compiled)
 	if err != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return nil, fmt.Errorf("Query timeout after %s", defaultQueryTimeout)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
 		return nil, fmt.Errorf("Execute error: %w", err)
 	}
@@ -143,23 +165,30 @@ func executeSQLText(sqlText string) (*tinysql.ResultSet, error) {
 func resultRowsToJS(columns []string, rows []tinysql.Row) []interface{} {
 	safeRows := make([]interface{}, 0, len(rows))
 	for _, row := range rows {
-		outRow := make(map[string]interface{}, len(columns))
-		for _, col := range columns {
-			val, ok := tinysql.GetVal(row, col)
-			if !ok || val == nil {
-				outRow[col] = nil
-				continue
-			}
-			switch v := val.(type) {
-			case string, int, int32, int64, float32, float64, bool:
-				outRow[col] = v
-			default:
-				outRow[col] = fmt.Sprintf("%v", v)
-			}
-		}
-		safeRows = append(safeRows, outRow)
+		safeRows = append(safeRows, resultRowToJS(columns, row))
 	}
 	return safeRows
+}
+
+// resultRowToJS normalizes a result row to values that can cross the
+// syscall/js boundary predictably. Streaming queries reuse it both for their
+// preview payload and for byte-limit accounting.
+func resultRowToJS(columns []string, row tinysql.Row) map[string]interface{} {
+	outRow := make(map[string]interface{}, len(columns))
+	for _, col := range columns {
+		val, ok := tinysql.GetVal(row, col)
+		if !ok || val == nil {
+			outRow[col] = nil
+			continue
+		}
+		switch v := val.(type) {
+		case string, int, int32, int64, float32, float64, bool:
+			outRow[col] = v
+		default:
+			outRow[col] = fmt.Sprintf("%v", v)
+		}
+	}
+	return outRow
 }
 
 func successResultPayload(result *tinysql.ResultSet, statementsRun int) map[string]interface{} {
@@ -248,6 +277,9 @@ func importFileRequest(this js.Value, args []js.Value) interface{} {
 	fileName := strings.TrimSpace(args[0].String())
 	fileContent := args[1].String()
 	tableName := strings.TrimSpace(args[2].String())
+	if len(fileContent) > maxImportBytes {
+		return jsErr(fmt.Sprintf("Import exceeds max size (%d MiB)", maxImportBytes/(1024*1024)))
+	}
 	if tableName == "" {
 		tableName = "table"
 	}
@@ -268,6 +300,7 @@ func importFileRequest(this js.Value, args []js.Value) interface{} {
 			HeaderMode:    "auto",
 			TypeInference: true,
 			TableName:     tableName,
+			MaxInputBytes: maxImportBytes,
 		},
 		SkipInvalidRows:    true,
 		TrimWhitespace:     true,
@@ -409,8 +442,13 @@ func executeMultiRequest(this js.Value, args []js.Value) interface{} {
 	if len(stmts) == 0 {
 		return jsErr("No SQL statements found")
 	}
+	if len(stmts) > maxMultiStatements {
+		return jsErr(fmt.Sprintf("SQL batch exceeds statement limit (%d)", maxMultiStatements))
+	}
 
 	start := time.Now()
+	batchCtx, cancelBatch := context.WithTimeout(context.Background(), defaultMultiTimeout)
+	defer cancelBatch()
 	// Do not leave a previous query exportable when this batch fails part-way
 	// through. Earlier statements may still have mutated the local database.
 	lastResult = nil
@@ -421,8 +459,16 @@ func executeMultiRequest(this js.Value, args []js.Value) interface{} {
 		if err != nil {
 			return jsErr(fmt.Sprintf("Statement %d: %v", i+1, err))
 		}
-		rs, err := executeSQLText(stmtSQL)
+		statementCtx, cancelStatement := context.WithTimeout(batchCtx, defaultQueryTimeout)
+		rs, err := executeSQLTextWithContext(statementCtx, stmtSQL)
+		cancelStatement()
 		if err != nil {
+			if errors.Is(batchCtx.Err(), context.DeadlineExceeded) {
+				return jsErr(fmt.Sprintf("Batch query timeout after %s", defaultMultiTimeout))
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				return jsErr(fmt.Sprintf("Statement %d timeout after %s", i+1, defaultQueryTimeout))
+			}
 			return jsErr(fmt.Sprintf("Statement %d: %v", i+1, err))
 		}
 		if rs != nil {
@@ -431,8 +477,14 @@ func executeMultiRequest(this js.Value, args []js.Value) interface{} {
 	}
 
 	lastQueryDurMs = float64(time.Since(start).Microseconds()) / 1000.0
-	lastResult = lastRS
-	return successResultPayload(lastRS, len(stmts))
+	limitedResult, limitInfo, err := limitResultForBrowser(lastRS)
+	if err != nil {
+		return jsErr("Result preview failed: " + err.Error())
+	}
+	lastResult = limitedResult
+	payload := successResultPayload(limitedResult, len(stmts))
+	applyResultLimitPayload(payload, limitInfo)
+	return payload
 }
 
 // clearDatabase clears all tables from the database.
@@ -452,6 +504,8 @@ func clearDatabaseRequest(this js.Value, args []js.Value) interface{} {
 }
 
 // exportDatabase serializes the current database as a base64 GOB snapshot.
+// It remains available for backwards-compatible URLs and older browser
+// clients. The workspace UI uses exportDatabaseBytes to avoid Base64 overhead.
 func exportDatabase(this js.Value, args []js.Value) interface{} {
 	return trackRuntimeRequest("snapshot", func() interface{} { return exportDatabaseRequest(this, args) })
 }
@@ -469,6 +523,27 @@ func exportDatabaseRequest(this js.Value, args []js.Value) interface{} {
 	}
 }
 
+// exportDatabaseBytes serializes the current database to a Uint8Array. The
+// worker transfers that ArrayBuffer to the UI, avoiding the 33% Base64 size
+// expansion and one full text conversion on every autosave.
+func exportDatabaseBytes(this js.Value, args []js.Value) interface{} {
+	return trackRuntimeRequest("snapshot", func() interface{} { return exportDatabaseBytesRequest(this, args) })
+}
+
+func exportDatabaseBytesRequest(this js.Value, args []js.Value) interface{} {
+	data, err := tinysql.SaveToBytes(db)
+	if err != nil {
+		return jsErr("export failed: " + err.Error())
+	}
+	return map[string]interface{}{
+		"success":    true,
+		"data":       bytesToJSUint8Array(data),
+		"sizeBytes":  len(data),
+		"format":     "tinysql-gob",
+		"exportedAt": time.Now().UTC().Format(time.RFC3339),
+	}
+}
+
 // importDatabase replaces the current database from a base64 GOB snapshot.
 func importDatabase(this js.Value, args []js.Value) interface{} {
 	return trackRuntimeRequest("snapshot", func() interface{} { return importDatabaseRequest(this, args) })
@@ -482,9 +557,15 @@ func importDatabaseRequest(this js.Value, args []js.Value) interface{} {
 	if encoded == "" {
 		return jsErr("snapshot must not be empty")
 	}
+	if len(encoded) > base64.StdEncoding.EncodedLen(maxSnapshotBytes) {
+		return jsErr(fmt.Sprintf("snapshot exceeds max size (%d bytes)", maxSnapshotBytes))
+	}
 	data, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
 		return jsErr("invalid base64 snapshot: " + err.Error())
+	}
+	if len(data) > maxSnapshotBytes {
+		return jsErr(fmt.Sprintf("snapshot exceeds max size (%d bytes)", maxSnapshotBytes))
 	}
 	loaded, err := tinysql.LoadFromBytes(data)
 	if err != nil {
@@ -499,6 +580,100 @@ func importDatabaseRequest(this js.Value, args []js.Value) interface{} {
 		"message":   "Database imported",
 		"sizeBytes": len(data),
 	}
+}
+
+// importDatabaseBytes restores a database from a Uint8Array (or ArrayBuffer).
+// It is the binary counterpart of importDatabase and is used by the modern
+// workspace layer. Keeping the text variant above means older share/demo code
+// keeps working unchanged.
+func importDatabaseBytes(this js.Value, args []js.Value) interface{} {
+	return trackRuntimeRequest("snapshot", func() interface{} { return importDatabaseBytesRequest(this, args) })
+}
+
+func importDatabaseBytesRequest(this js.Value, args []js.Value) interface{} {
+	if len(args) < 1 {
+		return jsErr("Usage: importDatabaseBytes(snapshot)")
+	}
+	data, err := jsSnapshotBytes(args[0])
+	if err != nil {
+		return jsErr(err.Error())
+	}
+	loaded, err := tinysql.LoadFromBytes(data)
+	if err != nil {
+		return jsErr("import failed: " + err.Error())
+	}
+	db = loaded
+	queryCache = tinysql.NewQueryCache(queryCacheSize)
+	lastResult = nil
+	lastResultPager.reset()
+	return map[string]interface{}{
+		"success":   true,
+		"message":   "Database imported",
+		"sizeBytes": len(data),
+	}
+}
+
+// validateDatabaseBytes checks that a binary snapshot can be loaded without
+// replacing the live database. Workspace recovery uses this before selecting
+// a generation, so a corrupt candidate cannot mutate the currently open
+// workspace simply because it was being probed.
+func validateDatabaseBytes(this js.Value, args []js.Value) interface{} {
+	return trackRuntimeRequest("snapshot-validation", func() interface{} {
+		if len(args) < 1 {
+			return jsErr("Usage: validateDatabaseBytes(snapshot)")
+		}
+		data, err := jsSnapshotBytes(args[0])
+		if err != nil {
+			return jsErr(err.Error())
+		}
+		loaded, err := tinysql.LoadFromBytes(data)
+		if err != nil {
+			return jsErr("snapshot validation failed: " + err.Error())
+		}
+		_ = loaded.Close()
+		return map[string]interface{}{
+			"success":   true,
+			"message":   "Database snapshot is valid",
+			"sizeBytes": len(data),
+		}
+	})
+}
+
+func bytesToJSUint8Array(data []byte) js.Value {
+	output := js.Global().Get("Uint8Array").New(len(data))
+	js.CopyBytesToJS(output, data)
+	return output
+}
+
+func jsSnapshotBytes(input js.Value) ([]byte, error) {
+	if input.IsUndefined() || input.IsNull() {
+		return nil, fmt.Errorf("snapshot must not be empty")
+	}
+
+	uint8Array := js.Global().Get("Uint8Array")
+	arrayBuffer := js.Global().Get("ArrayBuffer")
+	if !uint8Array.Truthy() {
+		return nil, fmt.Errorf("this runtime cannot read binary snapshots")
+	}
+	value := input
+	if arrayBuffer.Truthy() && input.InstanceOf(arrayBuffer) {
+		value = uint8Array.New(input)
+	}
+	if !value.InstanceOf(uint8Array) {
+		return nil, fmt.Errorf("snapshot must be an ArrayBuffer or Uint8Array")
+	}
+	length := value.Length()
+	if length == 0 {
+		return nil, fmt.Errorf("snapshot must not be empty")
+	}
+	if length > maxSnapshotBytes {
+		return nil, fmt.Errorf("snapshot exceeds max size (%d bytes)", maxSnapshotBytes)
+	}
+	data := make([]byte, length)
+	if copied := js.CopyBytesToGo(data, value); copied != length {
+		return nil, fmt.Errorf("could not read binary snapshot")
+	}
+	return data, nil
 }
 
 // dropTable removes a user table from the database.

@@ -38,7 +38,7 @@ QUERY_FILES_WASM_SCRIPT := $(QUERY_FILES_WASM_DIR)/build.sh
 GH_PAGES_BRANCH ?= gh-pages
 GH_PAGES_WORKTREE ?= .gh-pages-worktree
 GH_PAGES_COMMIT_MESSAGE ?= Update gh-pages demo
-GH_PAGES_DEMO_FILES := index.html app.js query_files.wasm query_files.wasm.gz wasm_exec.js tiles-demo.html tiles-demo.js tiles-demo-data.js demo.mbtiles tiles-demo-bavaria.html tiles-demo-bavaria.js
+GH_PAGES_DEMO_FILES := index.html app.js wasm-client.js wasm-worker.js workspace-storage.js query_files.wasm query_files.wasm.gz wasm_exec.js tiles-demo.html tiles-demo.js tiles-demo-data.js demo.mbtiles tiles-demo-bavaria.html tiles-demo-bavaria.js
 GO_MOD_FILES := $(shell git ls-files -- 'go.mod' ':(glob)**/go.mod' | LC_ALL=C sort)
 
 # Color output
@@ -189,6 +189,9 @@ check-gh-pages-demo:
 	@if command -v gzip >/dev/null 2>&1; then gzip -t "$(QUERY_FILES_WASM_DIR)/query_files.wasm.gz"; fi
 	@if command -v node >/dev/null 2>&1; then \
 		node --check "$(QUERY_FILES_WASM_DIR)/app.js"; \
+		node --check "$(QUERY_FILES_WASM_DIR)/wasm-client.js"; \
+		node --check "$(QUERY_FILES_WASM_DIR)/wasm-worker.js"; \
+		node --check "$(QUERY_FILES_WASM_DIR)/workspace-storage.js"; \
 		node --check "$(QUERY_FILES_WASM_DIR)/tiles-demo.js"; \
 		node --check "$(QUERY_FILES_WASM_DIR)/tiles-demo-data.js"; \
 	else echo "$(YELLOW)node not installed; skipping JavaScript syntax check$(NC)"; fi

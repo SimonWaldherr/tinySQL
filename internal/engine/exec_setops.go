@@ -2,10 +2,16 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
 )
+
+// setOperationContextBatchRows bounds the amount of pointer copying a compound
+// SELECT can do without observing a cancelled request. It matches the cadence
+// used by the set-operation materializers below.
+const setOperationContextBatchRows = 64
 
 func processUnionClauses(env ExecEnv, union *UnionClause, leftRows []Row, leftCols []string, orderAliases map[string]string) ([]Row, []string, error) {
 	resultRows := leftRows
@@ -31,33 +37,69 @@ func processUnionClauses(env ExecEnv, union *UnionClause, leftRows []Row, leftCo
 		// right-hand row before appending it or comparing set membership.  Without
 		// this, e.g. `SELECT 1 AS a UNION SELECT 1 AS b` compared `a` to a
 		// missing key on the right and returned an incorrect NULL-valued row.
-		rightRows := alignSetOperationRows(rightResult.Rows, rightResult.Cols, resultCols)
+		rightRows, err := alignSetOperationRowsWithContext(env.ctx, rightResult.Rows, rightResult.Cols, resultCols)
+		if err != nil {
+			return nil, nil, err
+		}
 		addCompoundOrderAliases(orderAliases, rightResult.Cols, resultCols)
 
 		// Process the union based on type
 		switch current.Type {
 		case UnionAll:
 			// UNION ALL: Just append all rows
-			resultRows = append(resultRows, rightRows...)
+			resultRows, err = appendRowsWithContext(env.ctx, resultRows, rightRows)
+			if err != nil {
+				return nil, nil, err
+			}
 
 		case UnionDistinct:
 			// UNION: Append and then remove duplicates
-			resultRows = append(resultRows, rightRows...)
-			resultRows = distinctSetOperationRows(resultRows, resultCols)
+			resultRows, err = appendRowsWithContext(env.ctx, resultRows, rightRows)
+			if err != nil {
+				return nil, nil, err
+			}
+			resultRows, err = distinctSetOperationRowsWithContext(env.ctx, resultRows, resultCols)
+			if err != nil {
+				return nil, nil, err
+			}
 
 		case Except:
 			// EXCEPT: Remove rows that exist in the right result
-			resultRows = exceptRows(resultRows, rightRows, resultCols)
+			resultRows, err = exceptRowsWithContext(env.ctx, resultRows, rightRows, resultCols)
+			if err != nil {
+				return nil, nil, err
+			}
 
 		case Intersect:
 			// INTERSECT: Keep only rows that exist in both results
-			resultRows = intersectRows(resultRows, rightRows, resultCols)
+			resultRows, err = intersectRowsWithContext(env.ctx, resultRows, rightRows, resultCols)
+			if err != nil {
+				return nil, nil, err
+			}
 		}
 
 		current = current.Next
 	}
 
 	return resultRows, resultCols, nil
+}
+
+// appendRowsWithContext combines compound-select terms in small batches.
+// A single append of a very large right-hand term can copy millions of row
+// pointers before the engine gets another chance to observe cancellation.
+// The row maps themselves are not copied.
+func appendRowsWithContext(ctx context.Context, dst, src []Row) ([]Row, error) {
+	for start := 0; start < len(src); start += setOperationContextBatchRows {
+		if err := checkCtx(ctx); err != nil {
+			return nil, err
+		}
+		end := start + setOperationContextBatchRows
+		if end > len(src) {
+			end = len(src)
+		}
+		dst = append(dst, src[start:end]...)
+	}
+	return dst, nil
 }
 
 // addCompoundOrderAliases records aliases from every SELECT term so a trailing
@@ -81,12 +123,26 @@ func addCompoundOrderAliases(aliases map[string]string, sourceCols, targetCols [
 // no-op when the names already match keeps the common same-alias path free of
 // extra row-map allocations.
 func alignSetOperationRows(rows []Row, sourceCols, targetCols []string) []Row {
+	aligned, _ := alignSetOperationRowsWithContext(context.Background(), rows, sourceCols, targetCols)
+	return aligned
+}
+
+// alignSetOperationRowsWithContext is the execution-path counterpart of
+// alignSetOperationRows. Compound SELECT terms can contain millions of rows;
+// checking every small batch lets a request deadline stop the otherwise pure
+// in-memory remapping work before it allocates another complete result slice.
+func alignSetOperationRowsWithContext(ctx context.Context, rows []Row, sourceCols, targetCols []string) ([]Row, error) {
 	if sameSetOperationColumns(sourceCols, targetCols) {
-		return rows
+		return rows, nil
 	}
 
 	aligned := make([]Row, len(rows))
 	for rowIdx, row := range rows {
+		if rowIdx&(setOperationContextBatchRows-1) == 0 {
+			if err := checkCtx(ctx); err != nil {
+				return nil, err
+			}
+		}
 		out := make(Row, len(targetCols))
 		for colIdx, sourceCol := range sourceCols {
 			value, _ := getVal(row, sourceCol)
@@ -94,7 +150,7 @@ func alignSetOperationRows(rows []Row, sourceCols, targetCols []string) []Row {
 		}
 		aligned[rowIdx] = out
 	}
-	return aligned
+	return aligned, nil
 }
 
 func sameSetOperationColumns(left, right []string) bool {
@@ -110,11 +166,21 @@ func sameSetOperationColumns(left, right []string) bool {
 }
 
 func exceptRows(leftRows, rightRows []Row, cols []string) []Row {
+	result, _ := exceptRowsWithContext(context.Background(), leftRows, rightRows, cols)
+	return result
+}
+
+func exceptRowsWithContext(ctx context.Context, leftRows, rightRows []Row, cols []string) ([]Row, error) {
 	columnKeys := setOperationColumnKeys(cols)
 	// Create a set of right rows for fast lookup
 	rightSet := make(map[string]struct{}, len(rightRows))
 	buf := make([]byte, 0, 64)
-	for _, r := range rightRows {
+	for i, r := range rightRows {
+		if i&(setOperationContextBatchRows-1) == 0 {
+			if err := checkCtx(ctx); err != nil {
+				return nil, err
+			}
+		}
 		buf = appendSetOperationSignature(buf[:0], r, columnKeys)
 		rightSet[string(buf)] = struct{}{}
 	}
@@ -123,7 +189,12 @@ func exceptRows(leftRows, rightRows []Row, cols []string) []Row {
 	// and collapse duplicate left-hand rows.
 	result := make([]Row, 0, len(leftRows))
 	seen := make(map[string]struct{}, len(leftRows))
-	for _, l := range leftRows {
+	for i, l := range leftRows {
+		if i&(setOperationContextBatchRows-1) == 0 {
+			if err := checkCtx(ctx); err != nil {
+				return nil, err
+			}
+		}
 		buf = appendSetOperationSignature(buf[:0], l, columnKeys)
 		if _, found := rightSet[string(buf)]; found {
 			continue
@@ -134,15 +205,25 @@ func exceptRows(leftRows, rightRows []Row, cols []string) []Row {
 		seen[string(buf)] = struct{}{}
 		result = append(result, l)
 	}
-	return result
+	return result, nil
 }
 
 func intersectRows(leftRows, rightRows []Row, cols []string) []Row {
+	result, _ := intersectRowsWithContext(context.Background(), leftRows, rightRows, cols)
+	return result
+}
+
+func intersectRowsWithContext(ctx context.Context, leftRows, rightRows []Row, cols []string) ([]Row, error) {
 	columnKeys := setOperationColumnKeys(cols)
 	// Create a set of right rows for fast lookup
 	rightSet := make(map[string]struct{}, len(rightRows))
 	buf := make([]byte, 0, 64)
-	for _, r := range rightRows {
+	for i, r := range rightRows {
+		if i&(setOperationContextBatchRows-1) == 0 {
+			if err := checkCtx(ctx); err != nil {
+				return nil, err
+			}
+		}
 		buf = appendSetOperationSignature(buf[:0], r, columnKeys)
 		rightSet[string(buf)] = struct{}{}
 	}
@@ -150,7 +231,12 @@ func intersectRows(leftRows, rightRows []Row, cols []string) []Row {
 	// Keep only left rows that are also in the right set
 	result := make([]Row, 0, len(leftRows))
 	seen := make(map[string]struct{}, len(leftRows))
-	for _, l := range leftRows {
+	for i, l := range leftRows {
+		if i&(setOperationContextBatchRows-1) == 0 {
+			if err := checkCtx(ctx); err != nil {
+				return nil, err
+			}
+		}
 		buf = appendSetOperationSignature(buf[:0], l, columnKeys)
 		if _, found := rightSet[string(buf)]; !found {
 			continue
@@ -161,7 +247,7 @@ func intersectRows(leftRows, rightRows []Row, cols []string) []Row {
 		seen[string(buf)] = struct{}{}
 		result = append(result, l)
 	}
-	return result
+	return result, nil
 }
 
 // distinctSetOperationRows implements UNION's duplicate elimination. It is
@@ -169,11 +255,21 @@ func intersectRows(leftRows, rightRows []Row, cols []string) []Row {
 // SQLite's numeric equality, so INTEGER 1 and REAL 1.0 represent the same set
 // member even though their Go representations differ.
 func distinctSetOperationRows(rows []Row, cols []string) []Row {
+	result, _ := distinctSetOperationRowsWithContext(context.Background(), rows, cols)
+	return result
+}
+
+func distinctSetOperationRowsWithContext(ctx context.Context, rows []Row, cols []string) ([]Row, error) {
 	columnKeys := setOperationColumnKeys(cols)
 	seen := make(map[string]struct{}, len(rows)/2)
 	result := make([]Row, 0, len(rows))
 	buf := make([]byte, 0, 64)
-	for _, row := range rows {
+	for i, row := range rows {
+		if i&(setOperationContextBatchRows-1) == 0 {
+			if err := checkCtx(ctx); err != nil {
+				return nil, err
+			}
+		}
 		buf = appendSetOperationSignature(buf[:0], row, columnKeys)
 		if _, found := seen[string(buf)]; found {
 			continue
@@ -181,7 +277,7 @@ func distinctSetOperationRows(rows []Row, cols []string) []Row {
 		seen[string(buf)] = struct{}{}
 		result = append(result, row)
 	}
-	return result
+	return result, nil
 }
 
 func setOperationColumnKeys(cols []string) []string {

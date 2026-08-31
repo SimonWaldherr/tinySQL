@@ -8,9 +8,9 @@ builds the static app published on GitHub Pages:
 
 https://simonwaldherr.github.io/tinySQL/
 
-The playground is local-first: the database runs in the browser, demo data can be
-encoded into shareable URL hashes, and imported data stays in local storage
-snapshots unless exported.
+The playground is local-first: the database runs in a dedicated browser worker,
+demo data can be encoded into shareable URL hashes, and imported data stays in
+versioned local workspaces unless exported.
 
 ## Build
 
@@ -24,6 +24,8 @@ Artifacts:
 - `query_files.wasm`
 - `query_files.wasm.gz` (if `gzip` is available)
 - `wasm_exec.js`
+- `wasm-worker.js` and `wasm-client.js` (the worker RPC runtime)
+- `workspace-storage.js` (IndexedDB workspaces and recovery generations)
 
 Modern browsers load `query_files.wasm.gz` with streaming decompression. The
 loader falls back to the uncompressed `.wasm` asset on older browsers or servers
@@ -116,13 +118,26 @@ update-gh-pages` picks up regenerated files the same way it does `app.js`.
   `.xls`), GeoJSON, KML, OSM XML, and routing graph data (`.rg`,
   `.routinggraph`, `.graph.json`, ...)
 - single- and multi-statement SQL execution, schema inspection, table removal
-- query history, editor state, and database snapshot in local storage
+- query history and editor state in local storage; database snapshots in named,
+  versioned workspaces with three retained recovery generations, size,
+  modification time, and a one-time verified migration from the former
+  `localStorage` snapshot. IndexedDB owns metadata and small payloads; on
+  supported browsers, new raw binary snapshots at or above 8 MiB live in OPFS.
+  Newer builds transfer snapshot bytes directly between WASM Worker, UI, and
+  storage instead of Base64-encoding every autosave or restore
+- a Worker-owned Go/WASM database and serialized Promise RPC, so imports,
+  queries, result paging, exports, snapshots, and monitoring do not block the
+  UI thread
+- a `ResultStream`-backed path for single statements: rows arrive in bounded
+  batches, the visible preview is capped at 10,000 rows / 16 MiB, and its
+  Cancel button cancels the Go context between batches
 - live runtime monitoring for active/total/failed/timed-out requests, request
   throughput and latency, peak concurrency, real Busy/Idle time, Go heap usage,
   table/row counts, query-cache occupancy, and per-user/session counters
 - WASM-side result paging, filtering, and sorting, so large result sets stay in
   Go memory instead of being copied wholesale into JavaScript; table copy,
-  VanillaGrid pivot view, and exports as CSV, TSV, Markdown, JSON, and XML
+  a pivot-and-chart view (via VanillaGrid/D3), and file downloads as CSV, TSV,
+  XLSX, JSON, XML, HTML, and Markdown
 - intro page with guided recipes: file analytics, geodata, FTS/vector search,
   RAG context expansion, joins/reporting
 - geodata examples: point extraction, distance matrices, radius filters,
@@ -214,30 +229,86 @@ editor to the encoded query, and runs it when `autoRun` is true.
 
 ## JS/WASM API
 
+The query studio does not expose the Go API on `window`: it owns the runtime in
+`wasm-worker.js` and calls it asynchronously through `TinySQLWasmClient`.
+
+```js
+const engine = new TinySQLWasmClient();
+await engine.init();
+const result = await engine.executeQuery('SELECT 1 AS ready');
+```
+
+The client offers the methods below as Promise-returning functions. For queued
+work it also accepts `engine.call(method, args, { signal })`; an `AbortSignal`
+removes work that has not started yet. `executeQueryStream` additionally
+forwards an active abort straight to a Go `Context`: its timer-scheduled
+`ResultStream` batches yield back to the worker between chunks, so direct scans
+can be cancelled while they are running. Blocking query shapes (for example
+joins, `ORDER BY`, aggregates, `DISTINCT`, and CTEs) still materialize inside
+the engine before their first row and may only acknowledge cancellation once
+that phase yields; the normal timeout remains their guardrail.
+
 - `importFile(fileName, fileContent, tableName)`
 - `executeQuery(sql)`
+- `executeQueryStream(sql, { signal })`
 - `executeMulti(sql)`
 - `getResultPage(offset, limit, filterText, sortColumn, sortDirection)`
 - `listTables()`
 - `getTableSchema(tableName)`
 - `dropTable(tableName)`
 - `clearDatabase()`
-- `exportDatabase()`
-- `importDatabase(snapshot)`
+- `exportDatabase()` / `importDatabase(snapshot)` (legacy Base64-compatible)
+- `exportDatabaseBytes()` / `importDatabaseBytes(snapshot)` (binary
+  `Uint8Array`/`ArrayBuffer` workspace path)
+- `validateDatabaseBytes(snapshot)` (loads a candidate in isolation without
+  replacing the active database)
 - `exportResults(format)`
 - `getRuntimeStatus()`
 - `setRuntimeIdentity(userId, sessionId)`
 
 `executeMulti` recognizes statement separators only outside SQL strings, quoted
 identifiers, and line/block comments, so scripts can safely contain semicolons
-in those constructs.
+in those constructs. A script is limited to 50 statements, 30 seconds per
+statement, and a 60-second total budget. Its final materialized result is
+retained only up to the same 10,000-row / 16-MiB preview cap; a capped result
+is marked preview-only and cannot be exported as if complete.
 
-Query execution returns only the first result page plus `totalRows`. Use
+`executeQueryStream` is selected by the browser UI for one statement (a
+trailing semicolon is fine). It emits live row chunks and keeps a complete
+bounded result available to the existing pager and exporter. If the 10,000-row
+or 16-MiB cap is reached, the result becomes an explicitly marked prefix and
+full-result export is disabled; use `LIMIT` or refine the query instead.
+
+The materialized query path returns only the first result page plus `totalRows`. Use
 `getResultPage` for subsequent pages and WASM-side filtering/sorting.
-`exportResults` still exports the complete unfiltered result.
+`exportResults` still exports the complete unfiltered result unless the UI
+explicitly marks it as a bounded preview.
+XLSX and HTML downloads intentionally represent the currently visible result
+page, matching the pivot-and-chart view; use CSV, JSON, or XML for a complete
+unfiltered WASM-side export.
 The result view reuses its filtered/sorted row index across page changes, and
-local snapshot writes are coalesced and deferred to browser idle time to avoid
-interrupting query and table interaction.
+workspace snapshot writes are coalesced and deferred to browser idle time.
+`workspace-storage.js` uses IndexedDB as its portable binary backend, retains
+the newest three immutable generations, and validates versions during recovery.
+The modern validation pass is isolated from the active database; only the
+selected valid generation is then imported. Binary snapshot ArrayBuffers move
+between the worker and UI using transferable ownership, so autosave and restore
+avoid Base64 expansion and its extra full-size text copies. `exportDatabase()`
+and `importDatabase()` remain for compatibility with older demo assets and
+shared snapshot code.
+For raw binary snapshots of at least 8 MiB, supported browsers additionally
+store the immutable payload in OPFS; IndexedDB still owns the generation
+metadata and current pointer. The OPFS file is written and closed before that
+pointer transaction, so an interrupted save can at most leave an unreachable
+file, never replace the last recoverable generation. Small snapshots, legacy
+records, and OPFS errors continue to use IndexedDB. Retention removes an OPFS
+file only after its IndexedDB generation was committed as obsolete.
+
+Browser file imports are capped at 64 MiB before the file is read, and the Go
+importer enforces the same input budget. This bounds the local demo's most
+expensive import path; binary snapshot imports are additionally capped at
+256 MiB before their Go buffer is allocated. These are input limits, not a hard
+total-heap limit for the in-memory database.
 
 `getRuntimeStatus` returns one consistent JSON snapshot of request, operation,
 database, cache, memory, user, and session metrics. The browser app assigns a

@@ -151,6 +151,41 @@
         .topbar .topbar-secondary:hover,
         .topbar .tools-trigger:hover { background: #3e3e42; }
 
+        .workspace-control {
+            align-items: center;
+            display: flex;
+            gap: 5px;
+            min-width: 0;
+        }
+
+        .workspace-control label {
+            color: #8d98a8;
+            font-size: 11px;
+            white-space: nowrap;
+        }
+
+        .workspace-control select {
+            background: #252526;
+            border: 1px solid #4b4b50;
+            border-radius: 4px;
+            color: #d4d4d4;
+            font-size: 12px;
+            height: 32px;
+            max-width: 180px;
+            min-width: 0;
+            padding: 0 7px;
+        }
+
+        .workspace-control button {
+            background: transparent;
+            border: 1px solid #4b4b50;
+            color: #d4d4d4;
+            min-height: 32px;
+            padding: 4px 9px;
+        }
+
+        .workspace-control button:hover { background: #3e3e42; }
+
         .topbar-menu { position: relative; }
 
         .utility-menu {
@@ -360,6 +395,7 @@
         }
 
         .topbar button:focus-visible,
+        .workspace-control select:focus-visible,
         .sidebar-header button:focus-visible,
         .editor-toolbar button:focus-visible,
         .results-actions button:focus-visible,
@@ -461,8 +497,70 @@
         .runtime-table th:first-child, .runtime-table td:first-child { text-align: left; }
         .runtime-note { color: #888; font-size: 11px; line-height: 1.45; margin-top: 12px; }
 
+        .workspace-panel {
+            background: #202124;
+            border: 1px solid #4b4b50;
+            border-radius: 7px;
+            box-shadow: 0 18px 44px rgba(0, 0, 0, 0.48);
+            color: #d4d4d4;
+            padding: 14px;
+            position: fixed;
+            right: 14px;
+            top: 58px;
+            width: min(370px, calc(100vw - 28px));
+            z-index: 1100;
+        }
+
+        .workspace-panel-header {
+            align-items: center;
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 12px;
+        }
+
+        .workspace-panel-header h2 { color: #fff; font-size: 15px; }
+        .workspace-panel-header button { background: transparent; border: 0; color: #aaa; cursor: pointer; font-size: 18px; }
+        .workspace-create { display: flex; gap: 7px; margin-bottom: 12px; }
+        .workspace-create input {
+            background: #292a2d;
+            border: 1px solid #4b4b50;
+            border-radius: 4px;
+            color: #f1f5f9;
+            flex: 1;
+            min-width: 0;
+            padding: 7px 8px;
+        }
+        .workspace-create button, .workspace-item button {
+            background: #0e639c;
+            border: 0;
+            border-radius: 4px;
+            color: #fff;
+            cursor: pointer;
+            font-size: 12px;
+            padding: 7px 9px;
+        }
+        .workspace-create button:hover, .workspace-item button:hover { background: #1177bb; }
+        .workspace-item button:disabled { background: #3b3c40; color: #aaa; cursor: default; }
+        .workspace-list { border-top: 1px solid #343438; max-height: 320px; overflow-y: auto; }
+        .workspace-item {
+            align-items: center;
+            border-bottom: 1px solid #343438;
+            display: flex;
+            gap: 10px;
+            justify-content: space-between;
+            padding: 10px 0;
+        }
+        .workspace-item.active strong { color: #9cdcfe; }
+        .workspace-item-copy { min-width: 0; }
+        .workspace-item strong, .workspace-item span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .workspace-item strong { color: #f1f5f9; font-size: 13px; }
+        .workspace-item span, .workspace-empty, .workspace-note { color: #888; font-size: 11px; margin-top: 3px; }
+        .workspace-note { line-height: 1.45; margin: 12px 0 0; }
+
         @media (max-width: 700px) {
             .runtime-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .workspace-control label { display: none; }
+            .workspace-control select { max-width: 130px; }
             #runtimeMemoryCompact, .runtime-compact-separator { display: none; }
         }
 
@@ -733,6 +831,25 @@
 
         .editor-toolbar .btn-secondary {
             background: #3e3e42;
+        }
+
+        .editor-toolbar .btn-cancel {
+            background: #a1260d;
+        }
+
+        .editor-toolbar .btn-cancel:hover {
+            background: #c83c22;
+        }
+
+        .result-preview-notice {
+            color: #f0b429;
+        }
+
+        .result-preview-badge {
+            align-self: center;
+            color: #f0b429;
+            font-size: 12px;
+            white-space: nowrap;
         }
 
         .editor-toolbar .btn-secondary:hover {
@@ -1972,12 +2089,20 @@
         <button id="launchStudio" class="landing-launch" onclick="openStudio()">Open browser studio</button>
         <button class="studio-only" onclick="showUploadDialog()" aria-label="Upload a data file">Add data</button>
         <button class="topbar-secondary studio-only" onclick="loadShareableDemo('analytics')" aria-label="Load sample data">Try a sample</button>
+        <div class="workspace-control studio-only">
+            <label for="workspaceSelect">Workspace</label>
+            <select id="workspaceSelect" onchange="switchWorkspace(this.value)" aria-label="Select workspace" disabled>
+                <option>Loading workspaces…</option>
+            </select>
+            <button id="createWorkspaceButton" type="button" onclick="createWorkspacePrompt()" aria-label="Create workspace" title="Create workspace">+</button>
+        </div>
         <div class="spacer"></div>
         <div class="topbar-menu studio-only">
             <button id="toolsTrigger" class="tools-trigger" onclick="toggleUtilityMenu()" aria-label="Open utility menu" aria-expanded="false" aria-controls="utilityMenu">Tools</button>
             <div id="utilityMenu" class="utility-menu hidden" role="menu">
                 <button role="menuitem" onclick="importClipboardData(); closeUtilityMenu()">Paste from clipboard</button>
                 <button role="menuitem" onclick="toggleHistory(); closeUtilityMenu()">Query history</button>
+                <button role="menuitem" onclick="createWorkspacePrompt(); closeUtilityMenu()">New workspace</button>
                 <button role="menuitem" onclick="window.open('https://github.com/SimonWaldherr/tinySQL#sql-formatting', '_blank', 'noopener'); closeUtilityMenu()">Go API documentation</button>
                 <div class="utility-menu-separator" role="separator"></div>
                 <div class="utility-menu-shortcuts" role="group" aria-label="Keyboard shortcuts">
@@ -2044,6 +2169,19 @@
             <div class="runtime-metric"><span>Mode</span><strong>Local</strong></div>
         </div>
         <p class="runtime-note">This browser build has one local database instance per tab. User and session counters describe this instance; a future multi-user host can use the same status schema with authenticated identities. “Busy” is measured request activity, not an invented CPU percentage.</p>
+    </section>
+
+    <section id="workspacePanel" class="workspace-panel hidden" aria-hidden="true" aria-labelledby="workspacePanelTitle">
+        <div class="workspace-panel-header">
+            <h2 id="workspacePanelTitle">Local workspaces</h2>
+            <button type="button" onclick="closeWorkspacePanel()" aria-label="Close workspace manager">×</button>
+        </div>
+        <div class="workspace-create">
+            <input id="workspaceNameInput" type="text" maxlength="256" placeholder="New workspace name" aria-label="New workspace name">
+            <button id="workspaceCreateButton" type="button" onclick="createWorkspaceFromPanel()">Create</button>
+        </div>
+        <div id="workspaceList" class="workspace-list" aria-live="polite"></div>
+        <p class="workspace-note">Snapshots use versioned IndexedDB generations. The last three versions are retained for recovery; large binary snapshots use OPFS when the browser supports it, while IndexedDB keeps their metadata and recovery pointers. Clearing this site’s browser data removes every workspace.</p>
     </section>
 
     <main id="landingPage" class="landing-page">
@@ -2295,6 +2433,9 @@
                     <button id="executeBtn" onclick="onExecuteClick()" disabled aria-label="Execute SQL query">
                         ▶ Execute
                     </button>
+                    <button id="cancelQueryBtn" class="btn-secondary btn-cancel" onclick="cancelActiveQuery()" hidden disabled aria-label="Cancel running SQL query">
+                        ■ Cancel
+                    </button>
                     <button class="btn-secondary" onclick="clearQuery()" aria-label="Clear query editor">Clear</button>
                     <button class="btn-secondary" onclick="formatQuery()" aria-label="Format SQL query">Format</button>
                     <button class="btn-secondary" onclick="copyQueryToClipboard()" aria-label="Copy SQL query">Copy SQL</button>
@@ -2325,8 +2466,8 @@ Example: SELECT * FROM my_table LIMIT 100;" aria-describedby="editorHelp" aria-e
                 <div id="vanillaGridSection" class="vanillagrid-section hidden">
                     <div class="vanillagrid-header">
                         <div class="vanillagrid-header-info">
-                            <h3>Pivot Grid</h3>
-                            <span class="vg-hint">Use the pivot toolbar to render d3 charts</span>
+                            <h3>Pivot &amp; Charts</h3>
+                            <span class="vg-hint">Pivot the current result page, then use the D3 chart controls in the toolbar</span>
                         </div>
                         <div class="vg-header-actions">
                             <button onclick="autoPivot()">Auto Pivot</button>
@@ -2338,8 +2479,6 @@ Example: SELECT * FROM my_table LIMIT 100;" aria-describedby="editorHelp" aria-e
             </div>
         </div>
     </div>
-    <!-- WASM Support -->
-    <script src="wasm_exec.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
     <script src="https://simonwaldherr.github.io/vanillagrid.js/vanillagrid.js"></script>
     <script src="https://simonwaldherr.github.io/vanillagrid.js/vg-pivot-d3.js"></script>
@@ -2517,6 +2656,8 @@ Example: SELECT * FROM my_table LIMIT 100;" aria-describedby="editorHelp" aria-e
             }
         };
     </script>
+    <script src="workspace-storage.js"></script>
+    <script src="wasm-client.js"></script>
     <script src="app.js"></script>
 </body>
 </html>
