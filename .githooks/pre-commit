@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Keep the check index-only: a hook must never stage unrelated unstaged edits.
+set -euo pipefail
+
+go_files=()
+while IFS= read -r -d '' file; do
+    go_files+=("$file")
+done < <(git diff --cached --name-only --diff-filter=ACMR -z -- '*.go')
+
+if [[ ${#go_files[@]} -eq 0 ]]; then
+    exit 0
+fi
+
+unformatted=()
+for file in "${go_files[@]}"; do
+    if ! diff_output="$(git show ":$file" | gofmt -d)"; then
+        echo "pre-commit: could not format staged Go file: $file" >&2
+        exit 1
+    fi
+    if [[ -n "$diff_output" ]]; then
+        unformatted+=("$file")
+    fi
+done
+
+if [[ ${#unformatted[@]} -gt 0 ]]; then
+    echo "pre-commit: staged Go files are not gofmt-formatted:" >&2
+    printf '  %s\n' "${unformatted[@]}" >&2
+    echo "Run 'make fmt', stage the changes, and retry the commit." >&2
+    exit 1
+fi

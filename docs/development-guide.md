@@ -44,6 +44,7 @@ make build-all
 | `make bench-stream-guard` | CI-safe first-row allocation/latency budget; limits are configurable with `STREAM_FIRST_ROW_MAX_B` and `STREAM_FIRST_ROW_MAX_NS`. |
 | `make release-check` | Cross-compile the published CLI targets (Linux, macOS, Windows; amd64/arm64) into a temporary directory. |
 | `make fmt` / `make fmt-check` | Format Go files / check formatting without modifying. |
+| `make hooks-install` | Enable the repository-managed pre-commit checks for this clone. |
 | `make vet` | `go vet ./...`. |
 | `make lint` | `golangci-lint`; must be installed locally. |
 | `make verify` | Mutating local check: fmt, vet, lint, tests. Runs `make fmt`, so it may rewrite tracked Go files. |
@@ -56,6 +57,14 @@ make build-all
 artifact. Run `make build-wasm-browser` or `make build-wasm-node` separately
 when changing those targets. Push `main` separately after committing source
 changes.
+
+## Git hooks
+
+Run `make hooks-install` once after cloning. The versioned pre-commit hook
+checks the **staged** Go files with `gofmt` before Git creates a commit. It
+never stages or overwrites unstaged work; when it reports a file, run
+`make fmt`, review and stage the result, then retry the commit. CI keeps the
+same `make fmt-check` gate as a backstop.
 
 ### Nested module dependencies
 

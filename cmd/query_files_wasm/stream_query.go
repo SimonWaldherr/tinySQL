@@ -329,7 +329,7 @@ func (op *streamQueryOperation) finish(payload map[string]interface{}, success, 
 	activeStreamQueries.Unlock()
 	telemetry.finish(op.request, success, timedOut)
 	op.emit("complete", map[string]interface{}{
-		"success": success,
+		"success":   success,
 		"truncated": op.truncated,
 	})
 	op.resolve.Invoke(streamJSValue(payload))

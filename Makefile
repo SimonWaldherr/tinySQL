@@ -1,7 +1,7 @@
 SHELL := /usr/bin/env bash
 .SHELLFLAGS := -eu -o pipefail -c
 
-.PHONY: help build test clean install lint fmt fmt-check vet run-repl run-server run-demo
+.PHONY: help build test clean install lint fmt fmt-check hooks-install vet run-repl run-server run-demo
 .PHONY: build-all build-repl build-server build-demo build-cli build-debug build-catalog
 .PHONY: build-wasm-browser build-wasm-node build-studio build-tinysqlpage build-migrate
 .PHONY: build-query-files build-query-files-wasm build-fsql run-query-files-demo
@@ -422,6 +422,11 @@ fmt-check:
 		exit 1; \
 	fi; \
 	echo "$(GREEN)✓ Go formatting is clean$(NC)"
+
+## hooks-install: Enable the repository-managed pre-commit checks for this clone
+hooks-install:
+	@git config core.hooksPath .githooks
+	@echo "$(GREEN)✓ Repository hooks enabled ($(CURDIR)/.githooks)$(NC)"
 
 ## vet: Run go vet
 vet:
