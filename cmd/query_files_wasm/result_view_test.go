@@ -3,6 +3,7 @@
 package main
 
 import (
+	"reflect"
 	"testing"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
@@ -65,5 +66,45 @@ func TestResultPagerReusesViewAndInvalidatesOnSortChange(t *testing.T) {
 	descending := pager.page(result, 0, 1, "vector", "id", "desc")
 	if descending.Rows[0]["id"] != 3 {
 		t.Fatalf("sort change did not invalidate cached index: %#v", descending.Rows)
+	}
+}
+
+func TestBuildResultRowIndexesSortsMixedValuesWithCachedKeys(t *testing.T) {
+	result := &tinysql.ResultSet{
+		Cols: []string{"value"},
+		Rows: []tinysql.Row{
+			{"value": "20"},
+			{"value": 3},
+			{"value": "apple"},
+			{"value": nil},
+			{"value": "10"},
+		},
+	}
+
+	got := buildResultRowIndexes(result, "", "value", "asc")
+	// Numeric values keep numeric order; a non-numeric value follows the same
+	// string fallback semantics as compareResultViewValues, and NULL stays last.
+	want := []int{1, 4, 0, 2, 3}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("sorted indexes = %v, want %v", got, want)
+	}
+}
+
+func TestCompareResultViewSortValues(t *testing.T) {
+	tests := []struct {
+		left, right any
+		want        int
+	}{
+		{left: 2, right: "10", want: -1},
+		{left: "20", right: 3, want: 1},
+		{left: "apple", right: 3, want: 1},
+		{left: nil, right: 3, want: 1},
+		{left: "2.5", right: 2, want: 1},
+	}
+	for _, test := range tests {
+		got := compareResultViewSortValues(newResultViewSortValue(test.left), newResultViewSortValue(test.right))
+		if got != test.want {
+			t.Fatalf("comparison(%v, %v) = %d, want %d", test.left, test.right, got, test.want)
+		}
 	}
 }

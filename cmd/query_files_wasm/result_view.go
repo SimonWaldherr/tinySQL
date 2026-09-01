@@ -76,10 +76,16 @@ func buildResultRowIndexes(result *tinysql.ResultSet, filterNeedle, sortColumn, 
 
 	if sortColumn != "" && resultHasColumn(result, sortColumn) {
 		descending := strings.EqualFold(sortDirection, "desc")
+		// sort.Slice calls its comparison function O(n log n) times. Convert a
+		// value to its numeric/text comparison representation once per row rather
+		// than repeatedly parsing and stringifying it in WASM for every compare.
+		sortValues := make([]resultViewSortValue, len(result.Rows))
+		for index, row := range result.Rows {
+			value, _ := tinysql.GetVal(row, sortColumn)
+			sortValues[index] = newResultViewSortValue(value)
+		}
 		sort.SliceStable(rowIndexes, func(i, j int) bool {
-			left, _ := tinysql.GetVal(result.Rows[rowIndexes[i]], sortColumn)
-			right, _ := tinysql.GetVal(result.Rows[rowIndexes[j]], sortColumn)
-			comparison := compareResultViewValues(left, right)
+			comparison := compareResultViewSortValues(sortValues[rowIndexes[i]], sortValues[rowIndexes[j]])
 			if descending {
 				return comparison > 0
 			}
@@ -87,6 +93,48 @@ func buildResultRowIndexes(result *tinysql.ResultSet, filterNeedle, sortColumn, 
 		})
 	}
 	return rowIndexes
+}
+
+type resultViewSortValue struct {
+	isNil    bool
+	isNumber bool
+	number   float64
+	text     string
+}
+
+func newResultViewSortValue(value any) resultViewSortValue {
+	if value == nil {
+		return resultViewSortValue{isNil: true}
+	}
+	number, isNumber := resultViewNumber(value)
+	return resultViewSortValue{
+		isNumber: isNumber,
+		number:   number,
+		text:     strings.ToLower(fmt.Sprint(value)),
+	}
+}
+
+func compareResultViewSortValues(left, right resultViewSortValue) int {
+	if left.isNil && right.isNil {
+		return 0
+	}
+	if left.isNil {
+		return 1
+	}
+	if right.isNil {
+		return -1
+	}
+	if left.isNumber && right.isNumber {
+		switch {
+		case left.number < right.number:
+			return -1
+		case left.number > right.number:
+			return 1
+		default:
+			return 0
+		}
+	}
+	return strings.Compare(left.text, right.text)
 }
 
 func sliceResultPage(result *tinysql.ResultSet, rowIndexes []int, offset, limit int) resultPage {
@@ -145,28 +193,7 @@ func resultHasColumn(result *tinysql.ResultSet, column string) bool {
 }
 
 func compareResultViewValues(left, right any) int {
-	if left == nil && right == nil {
-		return 0
-	}
-	if left == nil {
-		return 1
-	}
-	if right == nil {
-		return -1
-	}
-	if leftNumber, ok := resultViewNumber(left); ok {
-		if rightNumber, ok := resultViewNumber(right); ok {
-			switch {
-			case leftNumber < rightNumber:
-				return -1
-			case leftNumber > rightNumber:
-				return 1
-			default:
-				return 0
-			}
-		}
-	}
-	return strings.Compare(strings.ToLower(fmt.Sprint(left)), strings.ToLower(fmt.Sprint(right)))
+	return compareResultViewSortValues(newResultViewSortValue(left), newResultViewSortValue(right))
 }
 
 func resultViewNumber(value any) (float64, bool) {

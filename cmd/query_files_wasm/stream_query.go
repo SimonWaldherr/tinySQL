@@ -149,7 +149,10 @@ func (op *streamQueryOperation) run(_ js.Value, _ []js.Value) interface{} {
 	}
 
 	deadline := time.Now().Add(streamPumpBudget)
-	batch := make([]tinysql.Row, 0, streamPumpRows)
+	// A batch crosses the syscall/js boundary once. Keep the already-normalized
+	// row object here so byte accounting does not normalize every row a second
+	// time immediately before emitting it to JavaScript.
+	batch := make([]interface{}, 0, streamPumpRows)
 	for rowCount := 0; rowCount < streamPumpRows; rowCount++ {
 		if err := op.ctx.Err(); err != nil {
 			_ = op.stream.Close()
@@ -167,7 +170,7 @@ func (op *streamQueryOperation) run(_ js.Value, _ []js.Value) interface{} {
 		}
 
 		row := op.stream.Row()
-		rowBytes, err := streamRowBytes(op.columns, row)
+		jsRow, rowBytes, err := streamJSRow(op.columns, row)
 		if err != nil {
 			_ = op.stream.Close()
 			op.finishError(fmt.Errorf("encode streamed row: %w", err))
@@ -186,10 +189,13 @@ func (op *streamQueryOperation) run(_ js.Value, _ []js.Value) interface{} {
 			return nil
 		}
 		op.rows = append(op.rows, row)
-		batch = append(batch, row)
+		batch = append(batch, jsRow)
 		op.resultB += rowBytes
 
-		if time.Now().After(deadline) {
+		// Reading the clock for every row is surprisingly expensive in Go/WASM.
+		// Bound a pump to a small overshoot while preserving responsiveness for
+		// cancellation and for slow JavaScript consumers.
+		if rowCount%32 == 31 && time.Now().After(deadline) {
 			break
 		}
 	}
@@ -225,14 +231,22 @@ func (op *streamQueryOperation) start() error {
 	return nil
 }
 
-func streamRowBytes(columns []string, row tinysql.Row) (int64, error) {
-	encoded, err := json.Marshal(resultRowToJS(columns, row))
+func streamJSRow(columns []string, row tinysql.Row) (map[string]interface{}, int64, error) {
+	jsRow := resultRowToJS(columns, row)
+	encoded, err := json.Marshal(jsRow)
 	if err != nil {
-		return 0, err
+		return nil, 0, err
 	}
 	// Include one JSON separator/newline byte, matching the server's streaming
 	// response limiter closely enough to make the browser budget predictable.
-	return int64(len(encoded)) + 1, nil
+	return jsRow, int64(len(encoded)) + 1, nil
+}
+
+// streamRowBytes is also used by the materialized multi-statement safeguard.
+// Streaming calls streamJSRow directly so that conversion is not duplicated.
+func streamRowBytes(columns []string, row tinysql.Row) (int64, error) {
+	_, bytes, err := streamJSRow(columns, row)
+	return bytes, err
 }
 
 func (op *streamQueryOperation) finishTruncated(reason string) {
@@ -245,13 +259,13 @@ func (op *streamQueryOperation) finishTruncated(reason string) {
 	op.finishSuccess()
 }
 
-func (op *streamQueryOperation) emitChunk(rows []tinysql.Row) {
+func (op *streamQueryOperation) emitChunk(rows []interface{}) {
 	if len(rows) == 0 {
 		return
 	}
 	op.emit("chunk", map[string]interface{}{
 		"columns": stringsToInterfaces(op.columns),
-		"rows":    resultRowsToJS(op.columns, rows),
+		"rows":    rows,
 	})
 }
 
