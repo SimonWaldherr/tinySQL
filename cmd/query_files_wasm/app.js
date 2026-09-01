@@ -1916,6 +1916,146 @@ function toggleResultsExportMenu() {
     trigger.setAttribute('aria-expanded', String(isOpening));
 }
 
+let generatedCodeState = null;
+const PYTHON_GENERATOR_RESERVED = new Set(['and', 'as', 'assert', 'async', 'await', 'break', 'class', 'continue', 'def', 'del', 'elif', 'else', 'except', 'False', 'finally', 'for', 'from', 'global', 'if', 'import', 'in', 'is', 'lambda', 'None', 'nonlocal', 'not', 'or', 'pass', 'raise', 'return', 'True', 'try', 'while', 'with', 'yield']);
+
+function closeCodeGeneratorMenu() {
+    const menu = document.getElementById('codeGeneratorMenu');
+    const trigger = document.getElementById('codeGeneratorTrigger');
+    menu?.classList.add('hidden');
+    trigger?.setAttribute('aria-expanded', 'false');
+}
+
+function toggleCodeGeneratorMenu() {
+    const menu = document.getElementById('codeGeneratorMenu');
+    const trigger = document.getElementById('codeGeneratorTrigger');
+    if (!menu || !trigger) return;
+    const isOpening = menu.classList.contains('hidden');
+    closeResultsExportMenu();
+    menu.classList.toggle('hidden', !isOpening);
+    trigger.setAttribute('aria-expanded', String(isOpening));
+}
+
+function generatedIdentifier(column, style, fallbackIndex) {
+    const parts = String(column || '').replace(/[^\p{L}\p{N}]+/gu, ' ').trim().split(/\s+/u).filter(Boolean);
+    const normalized = parts.map((part) => part.toLocaleLowerCase());
+    let name = style === 'pascal'
+        ? normalized.map((part) => part.charAt(0).toLocaleUpperCase() + part.slice(1)).join('')
+        : normalized.join('_');
+    if (!name || !/^[A-Za-z_]/u.test(name)) name = `field_${fallbackIndex + 1}`;
+    if (style === 'snake' && PYTHON_GENERATOR_RESERVED.has(name)) name = `${name}_`;
+    return name;
+}
+
+function uniqueGeneratedIdentifiers(columns, style) {
+    const used = new Map();
+    return columns.map((column, index) => {
+        const base = generatedIdentifier(column, style, index);
+        const seen = used.get(base) || 0;
+        used.set(base, seen + 1);
+        return seen ? `${base}_${seen + 1}` : base;
+    });
+}
+
+function inferGeneratedType(rows, column) {
+    const values = rows.map((row) => row?.[column]);
+    const hasNull = values.some((value) => value === null || value === undefined);
+    const kinds = new Set();
+    for (const value of values) {
+        if (value === null || value === undefined) continue;
+        if (typeof value === 'number') kinds.add(Number.isInteger(value) ? 'integer' : 'number');
+        else if (typeof value === 'boolean') kinds.add('boolean');
+        else if (typeof value === 'string') kinds.add('string');
+        else kinds.add('unknown');
+    }
+    if (kinds.size === 0) kinds.add('unknown');
+    if (kinds.has('integer') && kinds.has('number')) {
+        kinds.delete('integer');
+        kinds.add('number');
+    }
+    return { kinds: [...kinds], hasNull };
+}
+
+function generatedType(info, language) {
+    const kind = info.kinds.length === 1 ? info.kinds[0] : 'unknown';
+    const types = {
+        go: { integer: 'int64', number: 'float64', boolean: 'bool', string: 'string', unknown: 'any' },
+        typescript: { integer: 'number', number: 'number', boolean: 'boolean', string: 'string', unknown: 'unknown' },
+        python: { integer: 'int', number: 'float', boolean: 'bool', string: 'str', unknown: 'Any' },
+        sql: { integer: 'BIGINT', number: 'DOUBLE PRECISION', boolean: 'BOOLEAN', string: 'TEXT', unknown: 'TEXT' },
+    };
+    const type = types[language]?.[kind] || types[language]?.unknown || 'unknown';
+    if (language === 'typescript' && info.hasNull) return `${type} | null`;
+    if (language === 'python' && info.hasNull) return `Optional[${type}]`;
+    return type;
+}
+
+function generateResultCode(language, visible = getVisibleResults()) {
+    if (!visible?.columns?.length || !Array.isArray(visible.rows)) return null;
+    const columns = visible.columns;
+    const rows = visible.rows;
+    const types = columns.map((column) => inferGeneratedType(rows, column));
+    const title = 'QueryResult';
+    if (language === 'go') {
+        const fields = uniqueGeneratedIdentifiers(columns, 'pascal');
+        return { extension: 'go', label: 'Go struct', code: `// Generated from the current tinySQL result page.\ntype ${title} struct {\n${columns.map((column, index) => `\t${fields[index]} ${generatedType(types[index], 'go')} \`json:${JSON.stringify(column)}\``).join('\n')}\n}\n` };
+    }
+    if (language === 'typescript') {
+        return { extension: 'ts', label: 'TypeScript interface', code: `// Generated from the current tinySQL result page.\nexport interface ${title} {\n${columns.map((column, index) => `  ${JSON.stringify(column)}: ${generatedType(types[index], 'typescript')};`).join('\n')}\n}\n` };
+    }
+    if (language === 'python') {
+        const fields = uniqueGeneratedIdentifiers(columns, 'snake');
+        const needsOptional = types.some((type) => type.hasNull);
+        const needsAny = types.some((type) => type.kinds.length !== 1 || type.kinds[0] === 'unknown');
+        const imports = ['from dataclasses import dataclass'];
+        if (needsOptional || needsAny) imports.push(`from typing import ${[needsAny ? 'Any' : '', needsOptional ? 'Optional' : ''].filter(Boolean).join(', ')}`);
+        return { extension: 'py', label: 'Python dataclass', code: `${imports.join('\n')}\n\n# Generated from the current tinySQL result page.\n@dataclass\nclass ${title}:\n${columns.map((column, index) => `    ${fields[index]}: ${generatedType(types[index], 'python')}  # ${String(column).replace(/[\r\n]+/gu, ' ')}`).join('\n')}\n` };
+    }
+    if (language === 'sql') {
+        return { extension: 'sql', label: 'SQL CREATE TABLE', code: `-- Generated from the current tinySQL result page.\nCREATE TABLE query_result (\n${columns.map((column, index) => `  ${quoteSqlIdentifier(column)} ${generatedType(types[index], 'sql')}${types[index].hasNull ? '' : ' NOT NULL'}${index === columns.length - 1 ? '' : ','}`).join('\n')}\n);\n` };
+    }
+    return null;
+}
+
+function showGeneratedCode(language) {
+    const generated = generateResultCode(language);
+    if (!generated) {
+        showToast('Run a query with rows before generating code.', 'info');
+        return;
+    }
+    generatedCodeState = generated;
+    closeCodeGeneratorMenu();
+    let panel = document.getElementById('codeGeneratorPanel');
+    if (!panel) {
+        panel = document.createElement('section');
+        panel.id = 'codeGeneratorPanel';
+        panel.className = 'code-generator-panel';
+        document.getElementById('resultsContainer')?.prepend(panel);
+    }
+    panel.innerHTML = `<div class="code-generator-header"><div><strong>${escapeHtml(generated.label)}</strong><span>Inferred from ${getVisibleResults().rows.length} visible row(s)</span></div><div><button type="button" onclick="copyGeneratedCode()">Copy</button><button type="button" onclick="downloadGeneratedCode()">Download .${escapeHtml(generated.extension)}</button><button type="button" onclick="closeGeneratedCode()" aria-label="Close generated code">✕</button></div></div><pre><code>${escapeHtml(generated.code)}</code></pre>`;
+    panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function closeGeneratedCode() {
+    generatedCodeState = null;
+    document.getElementById('codeGeneratorPanel')?.remove();
+}
+
+async function copyGeneratedCode() {
+    if (!generatedCodeState) return;
+    try {
+        await copyTextToClipboard(generatedCodeState.code);
+        showToast('Generated code copied', 'success');
+    } catch (error) {
+        showToast(`Could not copy generated code: ${error.message || error}`, 'error');
+    }
+}
+
+function downloadGeneratedCode() {
+    if (!generatedCodeState) return;
+    downloadFile(generatedCodeState.code, `query_result.${generatedCodeState.extension}`, 'text/plain;charset=utf-8');
+}
+
 const DEMO_TABLES = {
     sales: {
         name: 'sales',
@@ -3628,6 +3768,15 @@ async function renderResults(data) {
             <div class="results-actions">
                 <button onclick="copyResultsToClipboard()">Copy Results</button>
                 <button id="openVanillaGridBtn" onclick="openInVanillaGrid()" disabled title="Pivot the current result page and use the included D3 chart controls">Pivot &amp; Charts</button>
+                <div class="results-export">
+                    <button id="codeGeneratorTrigger" onclick="toggleCodeGeneratorMenu()" aria-expanded="false" aria-controls="codeGeneratorMenu">Generate Code</button>
+                    <div id="codeGeneratorMenu" class="results-export-menu hidden" role="menu" aria-label="Generate code from result">
+                        <button role="menuitem" onclick="showGeneratedCode('go')">Go struct</button>
+                        <button role="menuitem" onclick="showGeneratedCode('typescript')">TypeScript interface</button>
+                        <button role="menuitem" onclick="showGeneratedCode('python')">Python dataclass</button>
+                        <button role="menuitem" onclick="showGeneratedCode('sql')">SQL CREATE TABLE</button>
+                    </div>
+                </div>
                 ${exportActions}
             </div>
         </div>

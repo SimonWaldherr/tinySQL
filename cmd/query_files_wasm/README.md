@@ -138,6 +138,9 @@ update-gh-pages` picks up regenerated files the same way it does `app.js`.
   Go memory instead of being copied wholesale into JavaScript; table copy,
   a pivot-and-chart view (via VanillaGrid/D3), and file downloads as CSV, TSV,
   XLSX, JSON, XML, HTML, and Markdown
+- a result code generator for Go structs, TypeScript interfaces, Python
+  dataclasses, and SQL `CREATE TABLE` statements; inferred types are based on
+  the visible result page and generated snippets can be copied or downloaded
 - intro page with guided recipes: file analytics, geodata, FTS/vector search,
   RAG context expansion, joins/reporting
 - geodata examples: point extraction, distance matrices, radius filters,

@@ -1126,6 +1126,55 @@
             background: transparent;
         }
 
+        .code-generator-panel {
+            margin: 0 0 12px;
+            border: 1px solid #4b4b50;
+            border-radius: 7px;
+            background: #1e1e1e;
+            overflow: hidden;
+        }
+
+        .code-generator-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 10px 12px;
+            border-bottom: 1px solid #3e3e42;
+        }
+
+        .code-generator-header > div {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .code-generator-header span {
+            color: #999;
+            font-size: 12px;
+        }
+
+        .code-generator-header button {
+            background: #3e3e42;
+            border: 0;
+            border-radius: 4px;
+            color: #ddd;
+            cursor: pointer;
+            padding: 5px 8px;
+        }
+
+        .code-generator-header button:hover { background: #505050; }
+
+        .code-generator-panel pre {
+            margin: 0;
+            max-height: 320px;
+            overflow: auto;
+            padding: 12px;
+            color: #d4d4d4;
+            font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        }
+
         .results-actions button:disabled {
             background: #3e3e42;
             color: #666;
