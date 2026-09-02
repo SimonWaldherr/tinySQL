@@ -38,7 +38,7 @@ Datenbank nach dem Laden bzw. Anlegen gegen weitere Änderungen.
 | `-rebuild` | `false` | Vorhandenen Snapshot durch Beispieldaten ersetzen |
 | `-read-only` | `true` | Schreibzugriffe nach dem Laden bzw. Erzeugen ablehnen |
 | `-web` | `false` | Browser-Explorer statt CLI-Ausgabe starten |
-| `-addr` | `:8086` | HTTP-Adresse im Webmodus |
+| `-addr` | `127.0.0.1:8086` | HTTP-Adresse im Webmodus; `:8086` für Zugriff von anderen Rechnern |
 
 ## Browser-API und Datenschutz
 

@@ -13,7 +13,7 @@ go run ./cmd/geofence-service -addr 127.0.0.1:8091
 
 | Option | Standard | Bedeutung |
 | --- | --- | --- |
-| `-addr` | `:8091` | HTTP-Adresse; für eine reine lokale Nutzung `127.0.0.1:8091` verwenden |
+| `-addr` | `127.0.0.1:8091` | HTTP-Adresse; `:8091` für Zugriff von anderen Rechnern |
 | `-dsn` | `file:geofence.db?autosave=1` | tinySQL-Datenbank; `mem://` hält Daten nur bis zum Beenden |
 
 Beim ersten Start legt die Anwendung Beispiel-Fahrzeuge und -Zonen an. Neue

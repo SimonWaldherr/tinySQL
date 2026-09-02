@@ -1,1 +1,113 @@
-:root{font-family:system-ui,sans-serif;color:#172633;background:#f4f7f9}*{box-sizing:border-box}body{margin:0}header{padding:1rem max(1rem,calc((100vw - 1160px)/2));background:#203d35;color:#fff;display:flex;justify-content:space-between;align-items:center;gap:1rem}header strong{font-size:1.2rem}header span{display:block;color:#c9dfd6;font-size:.84rem}header a{color:#fff}main{max-width:1160px;margin:1.2rem auto;padding:0 1rem;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}.panel{background:#fff;border:1px solid #dce5e8;border-radius:.75rem;padding:1rem}.wide{grid-column:1/-1}.controls{display:grid;grid-template-columns:1fr 1fr;gap:.8rem}.controls p{grid-column:1/-1;margin:0;min-height:1.2rem}label{display:grid;gap:.3rem;font-size:.88rem;font-weight:650}input,select,button{font:inherit;padding:.55rem;border:1px solid #aabdc1;border-radius:.4rem}.buttons{grid-column:1/-1;display:flex;gap:.5rem;flex-wrap:wrap}button{color:#fff;background:#24755b;border-color:#24755b;cursor:pointer}.buttons button[data-work="false"]{background:#4d5f72;border-color:#4d5f72}.buttons button:last-child{background:#9b3f32;border-color:#9b3f32}.status-card{font-size:1.25rem;padding:1rem;border-radius:.5rem;background:#e6f5ee}.status-card small{display:block;font-size:.82rem;color:#446154;margin-top:.3rem}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:.9rem}th,td{text-align:left;padding:.55rem;border-bottom:1px solid #e3ebed}.team{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.7rem}.team article{border:1px solid #d9e5e3;border-radius:.5rem;padding:.75rem}.team strong,.team small{display:block}.team .off{color:#667785}.critical-panel{border-color:#f2c4bd}.critical{border-left:4px solid #c43c2e;padding:.7rem;margin:.5rem 0;background:#fff6f4}.critical button{margin-top:.5rem;background:#7a3027}.inline{display:flex;gap:.5rem}.inline input{flex:1}.admin form{display:grid;gap:.5rem}.critical-panel:has(.empty){display:none}@media(max-width:750px){main{grid-template-columns:1fr}.wide{grid-column:auto}.controls{grid-template-columns:1fr}header{padding:1rem}}
+/* Theme and app-specific rules. The shared base lives in /static/base.css. */
+
+:root {
+    --app-width: 1160px;
+    --brand: #203d35;
+    --brand-muted: #c9dfd6;
+    --accent: #24755b;
+}
+
+main {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 1rem;
+}
+
+.controls {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.8rem;
+}
+
+.controls p {
+    grid-column: 1 / -1;
+    margin: 0;
+    min-height: 1.2rem;
+}
+
+.buttons {
+    grid-column: 1 / -1;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+
+.buttons button[data-work="false"] {
+    background: #4d5f72;
+    border-color: #4d5f72;
+}
+
+.buttons button:last-child {
+    background: #9b3f32;
+    border-color: #9b3f32;
+}
+
+.status-card {
+    padding: 1rem;
+    border-radius: 0.5rem;
+    background: color-mix(in srgb, var(--accent) 14%, var(--surface));
+    font-size: 1.25rem;
+}
+
+.status-card small {
+    display: block;
+    margin-top: 0.3rem;
+    color: var(--text-muted);
+    font-size: 0.82rem;
+}
+
+.team {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 0.7rem;
+}
+
+.team article {
+    padding: 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 0.5rem;
+}
+
+.team strong,
+.team small {
+    display: block;
+}
+
+.team .off {
+    color: var(--text-muted);
+}
+
+.critical-panel {
+    border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+}
+
+/* The panel is only meaningful while it lists something. */
+.critical-panel:has(.empty) {
+    display: none;
+}
+
+.critical {
+    margin: 0.5rem 0;
+    padding: 0.7rem;
+    border-left: 4px solid var(--danger);
+    background: color-mix(in srgb, var(--danger) 10%, var(--surface));
+}
+
+.critical button {
+    margin-top: 0.5rem;
+    background: var(--danger-bg);
+    border-color: var(--danger-bg);
+    color: #fff;
+}
+
+.admin form {
+    display: grid;
+    gap: 0.5rem;
+}
+
+@media (max-width: 720px) {
+    main,
+    .controls {
+        grid-template-columns: 1fr;
+    }
+}

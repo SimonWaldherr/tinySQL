@@ -48,6 +48,7 @@
         .landing-mode .main { display: none; }
         .studio-mode .landing-page { display: none; }
         .landing-mode .studio-only { display: none !important; }
+        .studio-mode .landing-only { display: none !important; }
 
         .hidden {
             display: none !important;
@@ -665,14 +666,14 @@
         .sidebar-toggle {
             display: none;
             position: fixed;
-            left: 8px;
-            bottom: 8px;
+            left: 12px;
+            bottom: 12px;
             z-index: 1000;
             background: #0e639c;
             border: none;
             color: #fff;
-            width: 36px;
-            height: 36px;
+            width: 44px;
+            height: 44px;
             border-radius: 50%;
             font-size: 18px;
             cursor: pointer;
@@ -904,6 +905,11 @@
             color: transparent;
             caret-color: #d4d4d4;
             resize: vertical;
+            /* Grow with the query instead of scrolling a fixed box. Engines
+               without field-sizing keep the manual resize handle, and dragging
+               that handle still wins here because it sets an inline height. */
+            field-sizing: content;
+            max-height: 45vh;
         }
 
         #queryEditor::placeholder {
@@ -1054,7 +1060,19 @@
             border-radius: 4px;
             padding: 6px 8px;
             font-size: 12px;
-            min-width: 150px;
+            flex: 1 1 auto;
+            min-width: 0;
+        }
+
+        .results-toolbar select {
+            min-width: 110px;
+        }
+
+        /* The free-text filter is the control people reach for first, so it
+           takes the leftover width instead of every control staying 150px. */
+        .results-toolbar .results-filter {
+            flex: 1 1 240px;
+            min-width: 200px;
         }
 
         .results-toolbar input:focus,
@@ -1081,6 +1099,7 @@
             display: flex;
             align-items: center;
             justify-content: flex-end;
+            flex-wrap: wrap;
             gap: 10px;
             margin-top: 12px;
             color: #999;
@@ -1139,8 +1158,10 @@
             width: 100%;
             border-collapse: collapse;
             background: #252526;
-            border-radius: 4px;
-            overflow: hidden;
+            /* No overflow/border-radius here. Any overflow other than
+               `visible` makes the table its own scroll container, which
+               silently disables the sticky <th> below. Clipping and the
+               rounded corners live on .result-table-wrap instead. */
         }
 
         .result-table th {
@@ -1151,6 +1172,9 @@
             font-weight: 600;
             font-size: 13px;
             border-bottom: 2px solid #3e3e42;
+            /* border-collapse drops the bottom border of a sticky cell while
+               it is pinned, so draw the same line as an inset shadow too. */
+            box-shadow: inset 0 -2px 0 #3e3e42;
             position: sticky;
             top: 0;
             z-index: 10;
@@ -1233,10 +1257,13 @@
             cursor: help;
         }
 
-        .result-table td.truncated-cell:hover {
+        /* Wrap inside the existing column width. Dropping the max-width here
+           re-lays out every other column, so the table jumps sideways under
+           the pointer. */
+        .result-table td.truncated-cell:hover,
+        .result-table td.truncated-cell:focus-visible {
             white-space: normal;
-            word-break: break-all;
-            max-width: none;
+            word-break: break-word;
         }
 
         .result-table tr.selected-row {
@@ -1969,7 +1996,10 @@
             }
 
             .results-area {
-                padding: 10px;
+                /* Extra bottom padding so the last rows and the pagination
+                   bar can be scrolled out from under the floating sidebar
+                   button. */
+                padding: 10px 10px 64px;
             }
 
             .results-header {
@@ -1982,8 +2012,15 @@
                 justify-content: flex-start;
             }
 
-            .results-actions button {
+            /* Download sits inside a .results-export wrapper, so the flex
+               children are a mix of buttons and divs. Sizing only the buttons
+               left the wrapper at its intrinsic width and the row ragged. */
+            .results-actions > * {
                 flex: 1 1 calc(50% - 8px);
+            }
+
+            .results-export button {
+                width: 100%;
             }
 
             .results-toolbar {
@@ -1996,6 +2033,23 @@
             .results-toolbar select,
             .results-toolbar button {
                 width: 100%;
+            }
+
+            /* Put the caption above its control. Side by side, captions such
+               as "Rows per page" wrap onto two lines and leave the column
+               ragged. */
+            .results-toolbar label {
+                align-items: stretch;
+                flex-direction: column;
+                gap: 4px;
+            }
+
+            .results-toolbar .results-filter {
+                min-width: 0;
+            }
+
+            .result-pagination {
+                justify-content: center;
             }
 
             .result-table-wrap {
@@ -2019,6 +2073,40 @@
             .demo-filter button {
                 min-height: 40px;
                 padding: 8px 10px;
+            }
+        }
+
+        /* Touch input. The compact 28-30px controls above are comfortable with
+           a mouse but well under what a fingertip can hit reliably. */
+        @media (pointer: coarse) {
+            .results-toolbar input,
+            .results-toolbar select,
+            .results-toolbar button,
+            .results-actions button,
+            .result-pagination button,
+            .editor-toolbar button,
+            .empty-state-action,
+            .demo-filter button {
+                min-height: 44px;
+            }
+
+            .results-toolbar input,
+            .results-toolbar select {
+                padding: 10px 8px;
+            }
+
+            .results-toolbar button,
+            .results-actions button,
+            .result-pagination button {
+                padding: 10px 14px;
+            }
+
+            .table-item,
+            .virtual-table-item,
+            .example-query,
+            .history-item,
+            .utility-menu button {
+                min-height: 44px;
             }
         }
 
@@ -2082,11 +2170,12 @@
     </style>
 </head>
 <body class="landing-mode">
-    <a class="skip-link" href="#launchStudio">Skip to query studio</a>
+    <a class="skip-link landing-only" href="#launchStudio">Skip to query studio</a>
+    <a class="skip-link studio-only" href="#queryEditor">Skip to the SQL editor</a>
     <!-- Top Bar -->
     <div class="topbar">
         <a class="brand-link" href="#top" onclick="showLanding(); return false;">tinySQL <span class="topbar-tag">browser lab</span></a>
-        <button id="launchStudio" class="landing-launch" onclick="openStudio()">Open browser studio</button>
+        <button id="launchStudio" class="landing-launch landing-only" onclick="openStudio()">Open browser studio</button>
         <button class="studio-only" onclick="showUploadDialog()" aria-label="Upload a data file">Add data</button>
         <button class="topbar-secondary studio-only" onclick="loadShareableDemo('analytics')" aria-label="Load sample data">Try a sample</button>
         <div class="workspace-control studio-only">

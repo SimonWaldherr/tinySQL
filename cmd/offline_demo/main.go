@@ -16,6 +16,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+
+	"github.com/SimonWaldherr/tinySQL/cmd/internal/webapp"
 	"os"
 	"strings"
 	"time"
@@ -50,7 +52,7 @@ func main() {
 	flag.BoolVar(&cfg.rebuild, "rebuild", false, "Ignore an existing snapshot and rebuild the sample dataset")
 	flag.BoolVar(&cfg.readOnly, "read-only", true, "Reject writes after loading or creating the dataset")
 	flag.BoolVar(&cfg.web, "web", false, "Serve the local POI explorer in a browser")
-	flag.StringVar(&cfg.addr, "addr", ":8086", "HTTP listen address when -web is set")
+	flag.StringVar(&cfg.addr, "addr", "127.0.0.1:8086", "HTTP listen address when -web is set; use :8086 to accept connections from other machines")
 	flag.Parse()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -91,6 +93,15 @@ func serveWeb(ctx context.Context, cfg config) error {
 		return err
 	}
 	a := &offlineApp{db: db, source: source, readOnly: db.IsReadOnly(), tpl: tpl}
+	log.Printf("offline POI explorer listening on %s (%s, read-only=%t)", cfg.addr, source, db.IsReadOnly())
+	return http.ListenAndServe(cfg.addr, a.handler())
+}
+
+// handler assembles the complete HTTP stack: the application routes, the
+// stylesheet shared with the other cmd/ applications, this application's own
+// static files and the security headers. serveWeb and the tests both go
+// through it, so a test always exercises exactly what the binary serves.
+func (a *offlineApp) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", a.index)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -98,9 +109,9 @@ func serveWeb(ctx context.Context, cfg config) error {
 	})
 	mux.HandleFunc("GET /api/status", a.status)
 	mux.HandleFunc("GET /api/search", a.search)
+	webapp.MountShared(mux)
 	mux.Handle("GET /static/", http.FileServer(http.FS(webAssets)))
-	log.Printf("offline POI explorer listening on %s (%s, read-only=%t)", cfg.addr, source, db.IsReadOnly())
-	return http.ListenAndServe(cfg.addr, offlineSecurityHeaders(mux))
+	return offlineSecurityHeaders(mux)
 }
 
 func run(ctx context.Context, cfg config, out io.Writer) error {

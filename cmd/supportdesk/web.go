@@ -59,10 +59,7 @@ func serveSupportDesk(ctx context.Context, addr, dsn string) error {
 		_ = db.Close()
 		return err
 	}
-	mux := http.NewServeMux()
-	a.routes(mux)
-	mux.Handle("GET /static/", http.FileServer(http.FS(supportAssets)))
-	return http.ListenAndServe(addr, webapp.SecurityHeaders(mux))
+	return http.ListenAndServe(addr, a.handler())
 }
 
 func (a *supportDeskApp) bootstrap(ctx context.Context) error {
@@ -275,4 +272,16 @@ func supportDecodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 		return fmt.Errorf("invalid JSON")
 	}
 	return nil
+}
+
+// handler assembles the complete HTTP stack: the application routes, the
+// stylesheet shared with the other cmd/ applications, this application's own
+// static files and the security headers. main and the tests both go through
+// it, so a test always exercises exactly what the binary serves.
+func (a *supportDeskApp) handler() http.Handler {
+	mux := http.NewServeMux()
+	a.routes(mux)
+	webapp.MountShared(mux)
+	mux.Handle("GET /static/", http.FileServer(http.FS(supportAssets)))
+	return webapp.SecurityHeaders(mux)
 }

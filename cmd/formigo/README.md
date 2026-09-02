@@ -16,7 +16,7 @@ submission), `editor` (form creation, answer viewing, submission), `viewer`
 go mod tidy && go build -o formigo .
 
 # tinySQL file-backed (default DSN), in-memory, SQL Server
-./formigo -addr :8080 -dsn "file:formigo.db?autosave=1"
+./formigo -dsn "file:formigo.db?autosave=1"
 ./formigo -dsn "mem://"
 ./formigo -dsn "sqlserver://user:password@localhost:1433?database=formigo&encrypt=disable"
 ```
@@ -24,6 +24,10 @@ go mod tidy && go build -o formigo .
 `sqlserver://` or `server=` in the DSN selects the SQL Server dialect, anything
 else tinySQL. The first run creates the admin user; `-secure-cookie` marks
 session cookies `Secure` for HTTPS.
+
+Formigo listens on `127.0.0.1:8080` by default. Pass `-addr :8080` to accept
+connections from other machines — do that only behind TLS, and change the
+admin password first.
 
 | Flag | Env | Default |
 |---|---|---|

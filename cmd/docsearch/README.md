@@ -14,7 +14,7 @@ go run ./cmd/docsearch -docs ./docs -addr 127.0.0.1:8092
 | Option | Standard | Bedeutung |
 | --- | --- | --- |
 | `-docs` | `.` | Verzeichnis, dessen Dateien indexiert werden |
-| `-addr` | `:8092` | HTTP-Adresse; für lokale Nutzung `127.0.0.1:8092` verwenden |
+| `-addr` | `127.0.0.1:8092` | HTTP-Adresse; `:8092` für Zugriff von anderen Rechnern |
 | `-dsn` | `file:docsearch.db?autosave=1` | Speicherort des persistenten Suchindexes |
 
 Beim ersten Start wird ein leerer Index aufgebaut. Danach bleibt der Index

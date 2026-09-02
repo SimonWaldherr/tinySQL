@@ -25,7 +25,7 @@ Neustart hinweg erhalten.
 | --- | --- | --- |
 | `-query` | `password` | Suchbegriff für den Konsolenmodus |
 | `-web` | `false` | Browser-Oberfläche starten |
-| `-addr` | `:8087` | HTTP-Adresse im Webmodus |
+| `-addr` | `127.0.0.1:8087` | HTTP-Adresse im Webmodus; `:8087` für Zugriff von anderen Rechnern |
 | `-dsn` | `file:supportdesk.db?autosave=1` | Datenbank im Webmodus |
 
 ## Web-Funktionen und API

@@ -2439,24 +2439,31 @@ function setupEditorSyntaxHighlighting() {
         new ResizeObserver(refresh).observe(editor);
     }
 
-    // Update line/column counter on cursor changes
-    const updateLineCount = () => {
-        const counter = document.getElementById('editorLineCount');
-        if (!counter) return;
-        const pos = editor.selectionStart ?? 0;
-        const textBefore = editor.value.slice(0, pos);
-        const line = textBefore.split('\n').length;
-        const col = pos - textBefore.lastIndexOf('\n');
-        const totalLines = editor.value.split('\n').length;
-        counter.textContent = `Ln ${line}, Col ${col} \u2022 ${totalLines} line${totalLines !== 1 ? 's' : ''}`;
-    };
-    editor.addEventListener('input', updateLineCount);
-    editor.addEventListener('click', updateLineCount);
-    editor.addEventListener('keyup', updateLineCount);
-    editor.addEventListener('focus', updateLineCount);
-    updateLineCount();
+    // Update line/column counter on cursor changes. Typing is covered by
+    // refresh() below, which drives the counter through syncEditorHighlight().
+    editor.addEventListener('click', updateEditorLineCount);
+    editor.addEventListener('keyup', updateEditorLineCount);
+    editor.addEventListener('focus', updateEditorLineCount);
 
     refresh();
+}
+
+// Lives outside setupEditorSyntaxHighlighting so syncEditorHighlight() can
+// drive it too. Every path that replaces the editor content programmatically
+// (demos, history, table shortcuts, Format, workspace restore) already calls
+// that, and used to leave the counter stuck on the previous query.
+function updateEditorLineCount() {
+    const editor = document.getElementById('queryEditor');
+    const counter = document.getElementById('editorLineCount');
+    if (!editor || !counter) {
+        return;
+    }
+    const pos = editor.selectionStart ?? 0;
+    const textBefore = editor.value.slice(0, pos);
+    const line = textBefore.split('\n').length;
+    const col = pos - textBefore.lastIndexOf('\n');
+    const totalLines = editor.value.split('\n').length;
+    counter.textContent = `Ln ${line}, Col ${col} \u2022 ${totalLines} line${totalLines !== 1 ? 's' : ''}`;
 }
 
 function syncEditorHighlight() {
@@ -2469,6 +2476,7 @@ function syncEditorHighlight() {
     highlight.innerHTML = renderSqlHighlight(editor.value);
     highlight.scrollTop = editor.scrollTop;
     highlight.scrollLeft = editor.scrollLeft;
+    updateEditorLineCount();
 }
 
 function renderSqlHighlight(text) {
@@ -3632,7 +3640,7 @@ async function renderResults(data) {
             </div>
         </div>
         <div class="results-toolbar">
-            <label>
+            <label class="results-filter">
                 Filter
                 <input id="resultFilterInput" type="search" value="${escapeHtml(resultViewState.filterText)}" placeholder="Search rows..." oninput="scheduleResultFilterUpdate()">
             </label>

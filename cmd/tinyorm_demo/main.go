@@ -28,7 +28,7 @@ func main() {
 	format := flag.String("format", "text", "Output format: text or json")
 	includeInactive := flag.Bool("include-inactive", false, "Include inactive places in the country result")
 	web := flag.Bool("web", false, "Serve the persistent places directory in a browser")
-	addr := flag.String("addr", ":8088", "HTTP listen address when -web is set")
+	addr := flag.String("addr", "127.0.0.1:8088", "HTTP listen address when -web is set; use :8088 to accept connections from other machines")
 	snapshot := flag.String("snapshot", "places.snapshot", "Snapshot path when -web is set (empty for in-memory)")
 	flag.Parse()
 	if *web {

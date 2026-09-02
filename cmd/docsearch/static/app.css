@@ -1,1 +1,109 @@
-:root{font-family:system-ui,sans-serif;color:#192838;background:#f4f7fa}*{box-sizing:border-box}body{margin:0}header{display:flex;justify-content:space-between;gap:1rem;align-items:center;background:#143a52;color:white;padding:1rem max(1rem,calc((100vw - 1100px)/2))}header span{display:block;color:#c7d9e8;font-size:.85rem}button{background:#137a70;color:#fff;border:0;border-radius:.4rem;padding:.65rem .85rem;font:inherit;cursor:pointer}main{max-width:1100px;margin:1.2rem auto;padding:0 1rem}.search{background:#fff;padding:1rem;border:1px solid #dce5ec;border-radius:.75rem}.search form{display:flex;gap:.5rem}.search input{min-width:0;flex:1;padding:.7rem;border:1px solid #a9bbc8;border-radius:.4rem;font:inherit}.hint{color:#596d7e;font-size:.85rem}.results{display:grid;grid-template-columns:42% 1fr;gap:1rem;margin-top:1rem}.results aside,.results article{background:#fff;border:1px solid #dce5ec;border-radius:.75rem;padding:1rem;min-width:0}h1{font-size:1.05rem;margin:0 0 .8rem}.result{display:block;width:100%;text-align:left;background:transparent;color:inherit;border:0;border-bottom:1px solid #e7edf2;border-radius:0;padding:.8rem 0;cursor:pointer}.result strong,.result small,.result span{display:block}.result small{color:#527084;margin:.2rem 0}.result span{font-size:.86rem;color:#5c6770}.result:hover,.result.active{background:#eef8f7}article h2{margin-top:0}article .path{color:#527084;font-family:ui-monospace,monospace;font-size:.85rem}article pre{white-space:pre-wrap;word-break:break-word;line-height:1.5}.empty{color:#657888}@media(max-width:720px){header{padding:1rem}.results{grid-template-columns:1fr}.results aside{max-height:none}}
+/* Theme and app-specific rules. The shared base lives in /static/base.css. */
+
+:root {
+    --app-width: 1100px;
+    --brand: #143a52;
+    --brand-muted: #c7d9e8;
+    --accent: #137a70;
+}
+
+.search form {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.search input {
+    flex: 1;
+}
+
+.results {
+    display: grid;
+    grid-template-columns: 42% 1fr;
+    gap: 1rem;
+    margin-top: 1rem;
+}
+
+.results aside,
+.results article {
+    min-width: 0;
+    padding: 1rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+}
+
+/* Result rows are buttons so they stay keyboard reachable; strip the button
+   chrome without losing the shared focus ring. */
+.result {
+    display: block;
+    width: 100%;
+    padding: 0.8rem 0;
+    background: transparent;
+    border: 0;
+    border-bottom: 1px solid var(--border);
+    border-radius: 0;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.result strong,
+.result small,
+.result span {
+    display: block;
+}
+
+.result small {
+    margin: 0.2rem 0;
+    color: var(--text-muted);
+}
+
+.result span {
+    color: var(--text-muted);
+    font-size: 0.86rem;
+}
+
+.result:hover,
+.result.active {
+    background: color-mix(in srgb, var(--accent) 12%, var(--surface));
+}
+
+article h2 {
+    margin-top: 0;
+}
+
+article .path {
+    color: var(--text-muted);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.85rem;
+}
+
+article pre {
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+@media (max-width: 720px) {
+    .results {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* The list holds every indexed document, so give it its own scroll area.
+   Without this the page grows to tens of thousands of pixels and the preview
+   pane scrolls out of reach. */
+.results aside,
+.results article {
+    max-height: calc(100vh - 15rem);
+    min-height: 240px;
+    overflow-y: auto;
+}
+
+@media (max-width: 720px) {
+    .results aside,
+    .results article {
+        max-height: 60vh;
+    }
+}

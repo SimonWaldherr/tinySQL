@@ -26,7 +26,7 @@ go build -o tinysqlpage ./cmd/tinysqlpage
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-addr` | HTTP listen address | `:8080` |
+| `-addr` | HTTP listen address; pass `:8080` to accept connections from other machines | `127.0.0.1:8080` |
 | `-pages` | Directory containing `.sql` page definitions | `cmd/tinysqlpage/pages` |
 | `-seed` | SQL file executed at startup to populate demo data | `cmd/tinysqlpage/sample_data.sql` |
 | `-css` | Custom CSS file (replaces the built-in dark theme) | — |

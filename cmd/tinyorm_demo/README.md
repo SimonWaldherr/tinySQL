@@ -27,7 +27,7 @@ und speichert jede Anlage oder Löschung sofort wieder in diesem Snapshot.
 | `-format` | `text` | CLI-Ausgabe als `text` oder `json` |
 | `-include-inactive` | `false` | Auch inaktive Orte in der CLI-Auswahl anzeigen |
 | `-web` | `false` | Persistentes Ortsverzeichnis im Browser starten |
-| `-addr` | `:8088` | HTTP-Adresse im Webmodus |
+| `-addr` | `127.0.0.1:8088` | HTTP-Adresse im Webmodus; `:8088` für Zugriff von anderen Rechnern |
 | `-snapshot` | `places.snapshot` | Snapshot im Webmodus; leer für nur temporäre Daten |
 
 ## Web-Funktionen und API

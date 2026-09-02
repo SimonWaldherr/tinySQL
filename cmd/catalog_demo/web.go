@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+
+	"github.com/SimonWaldherr/tinySQL/cmd/internal/webapp"
 	"sort"
 	"strings"
 	"sync"
@@ -57,10 +59,7 @@ func serveCatalogDashboard(addr string) error {
 		return err
 	}
 	defer a.db.StopJobScheduler()
-	mux := http.NewServeMux()
-	a.routes(mux)
-	mux.Handle("GET /static/", http.FileServer(http.FS(catalogAssets)))
-	return http.ListenAndServe(addr, catalogSecurityHeaders(mux))
+	return http.ListenAndServe(addr, a.handler())
 }
 
 func newCatalogWebApp(ctx context.Context) (*catalogWebApp, error) {
@@ -210,4 +209,16 @@ func catalogSecurityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		next.ServeHTTP(w, r)
 	})
+}
+
+// handler assembles the complete HTTP stack: the application routes, the
+// stylesheet shared with the other cmd/ applications, this application's own
+// static files and the security headers. main and the tests both go through
+// it, so a test always exercises exactly what the binary serves.
+func (a *catalogWebApp) handler() http.Handler {
+	mux := http.NewServeMux()
+	a.routes(mux)
+	webapp.MountShared(mux)
+	mux.Handle("GET /static/", http.FileServer(http.FS(catalogAssets)))
+	return catalogSecurityHeaders(mux)
 }

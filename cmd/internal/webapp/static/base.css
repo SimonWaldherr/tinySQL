@@ -1,0 +1,366 @@
+/*
+ * Shared look and feel for the small server-rendered demos in cmd/.
+ *
+ * Every one of them used to carry a near-identical copy of this file, which
+ * meant a fix for one (dark mode, focus rings, touch target sizes) never
+ * reached the others. The apps now link this stylesheet first and keep only
+ * their own theme variables and app-specific rules in /static/app.css.
+ *
+ * To re-theme an app, override the custom properties below in its app.css:
+ *
+ *   :root {
+ *     --app-width: 1100px;
+ *     --brand: #143a52;
+ *     --brand-muted: #c7d9e8;
+ *     --accent: #137a70;
+ *   }
+ */
+
+:root {
+    color-scheme: light dark;
+
+    /* Theme knobs. Individual apps override these. */
+    --app-width: 1100px;
+    --brand: #1f3a5f;
+    --brand-fg: #ffffff;
+    --brand-muted: #cbd8e8;
+    --accent: #1d6a5a;
+    --accent-fg: #ffffff;
+
+    /* Surfaces. Redefined for dark mode further down. */
+    --bg: #f4f7fa;
+    --surface: #ffffff;
+    --surface-sunken: #eef2f6;
+    --border: #dbe3ec;
+    --border-strong: #aebdca;
+    --text: #172633;
+    --text-muted: #5a6b7c;
+
+    /* --danger is a text colour and has to stay legible on --surface;
+       --danger-bg is a fill that carries white text. They diverge in dark
+       mode, where a readable red is far too light to sit under white. */
+    --danger: #b42318;
+    --danger-bg: #b42318;
+    --success: #087443;
+    --warning: #b54708;
+
+    --radius: 0.75rem;
+    --radius-sm: 0.4rem;
+    --control-padding: 0.55rem 0.65rem;
+    --shadow: 0 1px 3px rgb(0 0 0 / 0.06);
+
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #12171d;
+        --surface: #1a2029;
+        --surface-sunken: #141a21;
+        --border: #2b343f;
+        --border-strong: #3d4956;
+        --text: #e4e9ef;
+        --text-muted: #9aa8b7;
+
+        --danger: #ff8a7a;
+        --danger-bg: #a12f21;
+        --success: #4ec98a;
+        --warning: #f0b050;
+
+        --shadow: 0 1px 3px rgb(0 0 0 / 0.4);
+    }
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+}
+
+/* ── Header ─────────────────────────────────────────────────────────────── */
+
+header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 1rem max(1rem, calc((100vw - var(--app-width)) / 2));
+    background: var(--brand);
+    color: var(--brand-fg);
+}
+
+header strong {
+    font-size: 1.2rem;
+}
+
+header span {
+    display: block;
+    color: var(--brand-muted);
+    font-size: 0.86rem;
+}
+
+header a {
+    color: var(--brand-fg);
+}
+
+/* ── Layout ─────────────────────────────────────────────────────────────── */
+
+main {
+    max-width: var(--app-width);
+    margin: 1.2rem auto;
+    padding: 0 1rem;
+}
+
+.panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 1rem;
+}
+
+/* Two unequal columns that collapse to one on narrow screens. */
+.layout {
+    display: grid;
+    grid-template-columns: 1.2fr 0.8fr;
+    gap: 1rem;
+    margin-top: 1rem;
+}
+
+.two {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.7rem;
+}
+
+.wide {
+    grid-column: 1 / -1;
+}
+
+.inline {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.inline input {
+    flex: 1;
+    min-width: 0;
+}
+
+h1,
+h2 {
+    margin: 0.1rem 0 0.8rem;
+    font-size: 1.1rem;
+}
+
+/* ── Forms ──────────────────────────────────────────────────────────────── */
+
+label {
+    display: grid;
+    gap: 0.3rem;
+    margin: 0.5rem 0;
+    font-size: 0.9rem;
+    font-weight: 600;
+}
+
+input,
+select,
+textarea,
+button {
+    font: inherit;
+    padding: var(--control-padding);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    background: var(--surface);
+    color: var(--text);
+}
+
+input,
+select,
+textarea {
+    min-width: 0;
+}
+
+textarea {
+    resize: vertical;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.8rem;
+}
+
+/* A label wrapping a checkbox or radio is one row, not a stacked field: the
+   grid default above stretches the box across the full column. */
+label:has(> input[type="checkbox"]),
+label:has(> input[type="radio"]) {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-weight: 500;
+}
+
+input[type="checkbox"],
+input[type="radio"] {
+    flex: 0 0 auto;
+    width: 1.15rem;
+    height: 1.15rem;
+    padding: 0;
+    accent-color: var(--accent);
+}
+
+button {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-fg);
+    cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+    filter: brightness(1.1);
+}
+
+button:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+}
+
+button.secondary {
+    background: var(--surface-sunken);
+    border-color: var(--border-strong);
+    color: var(--text);
+}
+
+button.danger {
+    background: var(--danger-bg);
+    border-color: var(--danger-bg);
+    color: #fff;
+}
+
+/* One consistent focus ring. Several of the apps previously stripped the
+   default outline through `border: 0` without putting anything back. */
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+form {
+    display: grid;
+    gap: 0.6rem;
+}
+
+/* ── Tables ─────────────────────────────────────────────────────────────── */
+
+.table-wrap {
+    overflow-x: auto;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+}
+
+th,
+td {
+    padding: 0.55rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+}
+
+th {
+    color: var(--text-muted);
+    font-size: 0.78rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+/* ── Small pieces ───────────────────────────────────────────────────────── */
+
+.hint {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+}
+
+.empty {
+    color: var(--text-muted);
+}
+
+.error,
+.bad {
+    color: var(--danger);
+    font-weight: 600;
+}
+
+.ok,
+.good {
+    color: var(--success);
+    font-weight: 600;
+}
+
+.chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+
+.chips span {
+    padding: 0.35rem 0.65rem;
+    border-radius: 999px;
+    background: var(--surface-sunken);
+    color: var(--text-muted);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.82rem;
+}
+
+code {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+/* ── Responsive ─────────────────────────────────────────────────────────── */
+
+@media (max-width: 720px) {
+    header {
+        padding: 1rem;
+    }
+
+    .layout,
+    .two {
+        grid-template-columns: 1fr;
+    }
+
+    .wide {
+        grid-column: auto;
+    }
+}
+
+/* Fingers need a bigger target than the ~35px these controls default to.
+   Checkboxes and radios keep their intrinsic size; their label is the target. */
+@media (pointer: coarse) {
+    input:not([type="checkbox"]):not([type="radio"]),
+    select,
+    textarea,
+    button {
+        min-height: 44px;
+    }
+
+    label:has(> input[type="checkbox"]),
+    label:has(> input[type="radio"]) {
+        min-height: 44px;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }
+}

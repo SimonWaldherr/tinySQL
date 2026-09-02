@@ -21,7 +21,7 @@ const builtinAdminPassword = "admin123"
 
 // main starts the Formigo HTTP server.
 func main() {
-	addr := flag.String("addr", ":8080", "HTTP listen address")
+	addr := flag.String("addr", "127.0.0.1:8080", "HTTP listen address; use :8080 to accept connections from other machines")
 	dsn := flag.String("dsn", "file:formigo.db?autosave=1", "tinySQL DSN (file:path.db or mem://) or sqlserver:// DSN")
 	adminUser := flag.String("admin-user", envDefault("FORMIGO_ADMIN_USER", "admin"), "initial admin username")
 	adminPassword := flag.String("admin-password", envDefault("FORMIGO_ADMIN_PASSWORD", builtinAdminPassword), "initial admin password")
@@ -67,13 +67,8 @@ func main() {
 		}
 	}
 
-	mux := http.NewServeMux()
-	app.RegisterRoutes(mux)
-	mux.Handle("GET /static/", http.FileServer(http.FS(webFS)))
-
-	handler := securityHeaders(auth.Middleware(mux))
 	log.Printf("Formigo listening on %s", *addr)
-	log.Fatal(http.ListenAndServe(*addr, handler))
+	log.Fatal(http.ListenAndServe(*addr, app.handler(auth)))
 }
 
 // parseTemplates parses embedded HTML templates and template functions.
@@ -137,4 +132,15 @@ func envDefault(key, fallback string) string {
 		return fallback
 	}
 	return v
+}
+
+// handler assembles the complete HTTP stack: the application routes, the
+// embedded static files, the session middleware and the security headers.
+// main and the tests both go through it, so a test always exercises exactly
+// what the binary serves.
+func (a *App) handler(auth *AuthService) http.Handler {
+	mux := http.NewServeMux()
+	a.RegisterRoutes(mux)
+	mux.Handle("GET /static/", http.FileServer(http.FS(webFS)))
+	return securityHeaders(auth.Middleware(mux))
 }

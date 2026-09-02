@@ -30,7 +30,7 @@ func main() {
 	defaultPages := filepath.Join("cmd", "tinysqlpage", "pages")
 	defaultSeed := filepath.Join("cmd", "tinysqlpage", "sample_data.sql")
 
-	addr := flag.String("addr", ":8080", "HTTP listen address")
+	addr := flag.String("addr", "127.0.0.1:8080", "HTTP listen address; use :8080 to accept connections from other machines")
 	pagesDir := flag.String("pages", defaultPages, "Directory that holds SQL page definitions")
 	seedFile := flag.String("seed", defaultSeed, "SQL file executed at startup to seed demo data")
 	cssFile := flag.String("css", "", "Path to custom CSS file")

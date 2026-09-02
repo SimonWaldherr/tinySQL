@@ -1,1 +1,41 @@
-:root{font-family:system-ui,sans-serif;color:#172633;background:#f4f7f9}*{box-sizing:border-box}body{margin:0}header{padding:1rem max(1rem,calc((100vw - 1100px)/2));background:#5d345f;color:white}header strong{font-size:1.2rem}header span{display:block;color:#f0d9ee;font-size:.86rem}main{max-width:1100px;margin:1.2rem auto;padding:0 1rem}.panel{background:#fff;border:1px solid #e3dce4;border-radius:.75rem;padding:1rem}.layout{display:grid;grid-template-columns:1.2fr .8fr;gap:1rem;margin-top:1rem}form{display:grid;gap:.6rem}#search{display:flex}#search input{flex:1}label{display:grid;gap:.3rem;font-size:.9rem;font-weight:650}input,select,button{font:inherit;padding:.6rem;border:1px solid #bcaebe;border-radius:.4rem}button{background:#8a3a78;color:#fff;border-color:#8a3a78;cursor:pointer}h1,h2{font-size:1.1rem;margin:.1rem 0 .8rem}.article{border-bottom:1px solid #eee5ef;padding:.8rem 0}.article strong,.article small{display:block}.article small{color:#775b78;margin-bottom:.3rem}.article p{margin:.25rem 0;color:#43525c;line-height:1.45}.ticket{padding:.7rem 0;border-bottom:1px solid #eee5ef}.ticket strong,.ticket small{display:block}.ticket small{color:#526774}@media(max-width:700px){.layout{grid-template-columns:1fr}header{padding:1rem}}
+/* Theme and app-specific rules. The shared base lives in /static/base.css. */
+
+:root {
+    --app-width: 1100px;
+    --brand: #5d345f;
+    --brand-muted: #f0d9ee;
+    --accent: #8a3a78;
+}
+
+#search {
+    display: flex;
+}
+
+#search input {
+    flex: 1;
+}
+
+.article,
+.ticket {
+    padding: 0.8rem 0;
+    border-bottom: 1px solid var(--border);
+}
+
+.article strong,
+.article small,
+.ticket strong,
+.ticket small {
+    display: block;
+}
+
+.article small,
+.ticket small {
+    margin-bottom: 0.3rem;
+    color: var(--text-muted);
+}
+
+.article p {
+    margin: 0.25rem 0;
+    color: var(--text-muted);
+    line-height: 1.45;
+}

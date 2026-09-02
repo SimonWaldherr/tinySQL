@@ -75,7 +75,7 @@ type vehicleInput struct {
 }
 
 func main() {
-	addr := flag.String("addr", ":8091", "HTTP listen address")
+	addr := flag.String("addr", "127.0.0.1:8091", "HTTP listen address; use :8091 to accept connections from other machines")
 	dsn := flag.String("dsn", "file:geofence.db?autosave=1", "TinySQL DSN")
 	flag.Parse()
 
@@ -96,11 +96,8 @@ func main() {
 		log.Fatalf("prepare database: %v", err)
 	}
 
-	mux := http.NewServeMux()
-	a.routes(mux)
-	mux.Handle("GET /static/", http.FileServer(http.FS(assets)))
 	log.Printf("geofence-service listening on %s", *addr)
-	log.Fatal(http.ListenAndServe(*addr, webapp.SecurityHeaders(mux)))
+	log.Fatal(http.ListenAndServe(*addr, a.handler()))
 }
 
 func (a *app) bootstrap(ctx context.Context) error {
@@ -426,4 +423,16 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 func sortedEvents(in []event) []event {
 	sort.Slice(in, func(i, j int) bool { return in[i].ID < in[j].ID })
 	return in
+}
+
+// handler assembles the complete HTTP stack: the application routes, the
+// stylesheet shared with the other cmd/ applications, this application's own
+// static files and the security headers. main and the tests both go through
+// it, so a test always exercises exactly what the binary serves.
+func (a *app) handler() http.Handler {
+	mux := http.NewServeMux()
+	a.routes(mux)
+	webapp.MountShared(mux)
+	mux.Handle("GET /static/", http.FileServer(http.FS(assets)))
+	return webapp.SecurityHeaders(mux)
 }

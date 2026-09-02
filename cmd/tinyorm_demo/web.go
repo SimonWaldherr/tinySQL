@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+
+	"github.com/SimonWaldherr/tinySQL/cmd/internal/webapp"
 	"os"
 	"sort"
 	"strconv"
@@ -42,10 +44,7 @@ func servePlaces(ctx context.Context, addr, snapshot string) error {
 	if err != nil {
 		return err
 	}
-	mux := http.NewServeMux()
-	a.routes(mux)
-	mux.Handle("GET /static/", http.FileServer(http.FS(placeAssets)))
-	return http.ListenAndServe(addr, placeSecurityHeaders(mux))
+	return http.ListenAndServe(addr, a.handler())
 }
 
 func newPlaceApp(ctx context.Context, snapshot string) (*placeApp, error) {
@@ -239,4 +238,16 @@ func placeSecurityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		next.ServeHTTP(w, r)
 	})
+}
+
+// handler assembles the complete HTTP stack: the application routes, the
+// stylesheet shared with the other cmd/ applications, this application's own
+// static files and the security headers. main and the tests both go through
+// it, so a test always exercises exactly what the binary serves.
+func (a *placeApp) handler() http.Handler {
+	mux := http.NewServeMux()
+	a.routes(mux)
+	webapp.MountShared(mux)
+	mux.Handle("GET /static/", http.FileServer(http.FS(placeAssets)))
+	return placeSecurityHeaders(mux)
 }

@@ -111,7 +111,7 @@ type resolveInput struct {
 }
 
 func main() {
-	addr := flag.String("addr", ":8094", "HTTP listen address")
+	addr := flag.String("addr", "127.0.0.1:8094", "HTTP listen address; use :8094 to accept connections from other machines")
 	dsn := flag.String("dsn", "file:worklog.db?autosave=1", "TinySQL DSN")
 	timeout := flag.Duration("timeout", 10*time.Hour, "Automatic checkout after this period without a status change")
 	sweep := flag.Duration("sweep", 5*time.Minute, "How often to check for overdue active status")
@@ -143,11 +143,8 @@ func main() {
 		log.Fatalf("initial timeout check: %v", err)
 	}
 	go a.timeoutLoop(context.Background(), *sweep)
-	mux := http.NewServeMux()
-	a.routes(mux)
-	mux.Handle("GET /static/", http.FileServer(http.FS(assets)))
 	log.Printf("worklog listening on %s (timeout: %s, timezone: %s)", *addr, *timeout, *tz)
-	log.Fatal(http.ListenAndServe(*addr, webapp.SecurityHeaders(mux)))
+	log.Fatal(http.ListenAndServe(*addr, a.handler()))
 }
 
 func (a *app) bootstrap(ctx context.Context) error {
@@ -661,4 +658,16 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 		return errors.New("invalid JSON")
 	}
 	return nil
+}
+
+// handler assembles the complete HTTP stack: the application routes, the
+// stylesheet shared with the other cmd/ applications, this application's own
+// static files and the security headers. main and the tests both go through
+// it, so a test always exercises exactly what the binary serves.
+func (a *app) handler() http.Handler {
+	mux := http.NewServeMux()
+	a.routes(mux)
+	webapp.MountShared(mux)
+	mux.Handle("GET /static/", http.FileServer(http.FS(assets)))
+	return webapp.SecurityHeaders(mux)
 }

@@ -60,7 +60,7 @@ func formatFirstRow(rs *tinysql.ResultSet) string {
 
 func main() {
 	web := flag.Bool("web", false, "Serve a scheduler dashboard in a browser")
-	addr := flag.String("addr", ":8089", "HTTP listen address when -web is set")
+	addr := flag.String("addr", "127.0.0.1:8089", "HTTP listen address when -web is set; use :8089 to accept connections from other machines")
 	flag.Parse()
 	if *web {
 		if err := serveCatalogDashboard(*addr); err != nil {

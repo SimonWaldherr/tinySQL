@@ -13,7 +13,7 @@ go run ./cmd/import-validate -addr 127.0.0.1:8093
 
 | Option | Standard | Bedeutung |
 | --- | --- | --- |
-| `-addr` | `:8093` | HTTP-Adresse; für lokale Nutzung `127.0.0.1:8093` verwenden |
+| `-addr` | `127.0.0.1:8093` | HTTP-Adresse; `:8093` für Zugriff von anderen Rechnern |
 | `-dsn` | `file:import-validate.db?autosave=1` | Datenbank für Importhistorie und Zieltabellen |
 
 ## Ablauf

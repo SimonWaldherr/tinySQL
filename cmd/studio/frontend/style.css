@@ -654,3 +654,94 @@ body.light-theme .modal-content {
 body.light-theme .modal-body h3 {
     color: var(--accent-color);
 }
+
+/* ── Responsive ──────────────────────────────────────────────────────────
+   The layout above is fixed-width throughout: a 280px explorer, a 300px
+   results panel and a menu bar that simply overflows. On a laptop in a split
+   window, and on any tablet, that left no usable editor. These rules keep the
+   same structure but let it reflow. */
+
+/* The menu bar is the first thing to overflow, so let it scroll sideways
+   instead of pushing the layout wider than the window. */
+.menu-bar {
+    overflow-x: auto;
+    scrollbar-width: thin;
+}
+
+.menu-group {
+    flex-shrink: 0;
+}
+
+@media (max-width: 1100px) {
+    .object-explorer {
+        width: 220px;
+    }
+}
+
+@media (max-width: 860px) {
+    /* Stack explorer above the editor rather than competing for width. */
+    .main-layout {
+        flex-direction: column;
+    }
+
+    .object-explorer {
+        width: 100%;
+        max-height: 34vh;
+        border-right: none;
+        border-bottom: 1px solid #3e3e42;
+    }
+
+    .editor-results-container {
+        min-height: 0;
+    }
+
+    .results-panel {
+        height: 240px;
+    }
+
+    .menu-btn,
+    .results-tab,
+    .tab {
+        padding: 10px 14px;
+    }
+}
+
+/* 100vh is the wrong unit on mobile browsers with retracting toolbars: the
+   status bar ends up under the address bar. */
+@supports (height: 100dvh) {
+    body,
+    .studio-container {
+        height: 100dvh;
+    }
+}
+
+@media (pointer: coarse) {
+    .menu-btn,
+    .refresh-btn,
+    .results-tab,
+    .tab,
+    .tree-item,
+    .tree-node-header,
+    .context-menu-item {
+        min-height: 44px;
+        display: flex;
+        align-items: center;
+    }
+}
+
+/* The stylesheet removes no outlines, but the dark palette makes the default
+   ring almost invisible. */
+:where(button, input, select, textarea, [tabindex]):focus-visible {
+    outline: 2px solid #9cdcfe;
+    outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+    }
+}

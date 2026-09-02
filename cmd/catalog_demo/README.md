@@ -40,7 +40,7 @@ auch manuell anstoßen.
 | Option | Standard | Bedeutung |
 | --- | --- | --- |
 | `-web` | `false` | Browser-Dashboard statt der endlichen Konsolen-Demo starten |
-| `-addr` | `:8089` | HTTP-Adresse im Webmodus |
+| `-addr` | `127.0.0.1:8089` | HTTP-Adresse im Webmodus; `:8089` für Zugriff von anderen Rechnern |
 
 Der Browsermodus verwendet einen frischen In-memory-Datensatz. Tabellen,
 Schedulerstatus und die bis zu 30 zuletzt angezeigten Läufe gehen beim Neustart

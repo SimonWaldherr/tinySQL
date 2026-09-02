@@ -47,7 +47,7 @@ type document struct {
 }
 
 func main() {
-	addr := flag.String("addr", ":8092", "HTTP listen address")
+	addr := flag.String("addr", "127.0.0.1:8092", "HTTP listen address; use :8092 to accept connections from other machines")
 	dsn := flag.String("dsn", "file:docsearch.db?autosave=1", "TinySQL DSN")
 	root := flag.String("docs", ".", "Directory to index (read-only)")
 	flag.Parse()
@@ -72,11 +72,8 @@ func main() {
 		log.Fatalf("prepare index: %v", err)
 	}
 
-	mux := http.NewServeMux()
-	a.routes(mux)
-	mux.Handle("GET /static/", http.FileServer(http.FS(assets)))
 	log.Printf("docsearch listening on %s (documents: %s)", *addr, absRoot)
-	log.Fatal(http.ListenAndServe(*addr, webapp.SecurityHeaders(mux)))
+	log.Fatal(http.ListenAndServe(*addr, a.handler()))
 }
 
 func (a *app) bootstrap(ctx context.Context) error {
@@ -358,4 +355,16 @@ func snippet(content, query string) string {
 		result += "…"
 	}
 	return result
+}
+
+// handler assembles the complete HTTP stack: the application routes, the
+// stylesheet shared with the other cmd/ applications, this application's own
+// static files and the security headers. main and the tests both go through
+// it, so a test always exercises exactly what the binary serves.
+func (a *app) handler() http.Handler {
+	mux := http.NewServeMux()
+	a.routes(mux)
+	webapp.MountShared(mux)
+	mux.Handle("GET /static/", http.FileServer(http.FS(assets)))
+	return webapp.SecurityHeaders(mux)
 }

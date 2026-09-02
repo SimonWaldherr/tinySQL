@@ -27,7 +27,7 @@ var webFS embed.FS
 const defaultTenant = "default"
 
 func main() {
-	addr := flag.String("addr", ":8080", "HTTP listen address")
+	addr := flag.String("addr", "127.0.0.1:8080", "HTTP listen address; use :8080 to accept connections from other machines")
 	dbFile := flag.String("db", "accessweb.db", "Database file path (empty or :memory: for in-memory)")
 	tenant := flag.String("tenant", "default", "Tenant / schema name")
 	flag.Parse()
@@ -64,13 +64,9 @@ func main() {
 
 	app := newApp(nativeDB, sqlDB, *tenant, tpl)
 
-	mux := http.NewServeMux()
-	app.registerRoutes(mux)
-	mux.Handle("GET /static/", http.FileServer(http.FS(webFS)))
-
 	srv := &http.Server{
 		Addr:              *addr,
-		Handler:           securityHeaders(mux),
+		Handler:           app.handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,
@@ -200,4 +196,14 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		next.ServeHTTP(w, r)
 	})
+}
+
+// handler assembles the complete HTTP stack: the application routes, the
+// embedded static files and the security headers. main and the tests both go
+// through it, so a test always exercises exactly what the binary serves.
+func (a *App) handler() http.Handler {
+	mux := http.NewServeMux()
+	a.registerRoutes(mux)
+	mux.Handle("GET /static/", http.FileServer(http.FS(webFS)))
+	return securityHeaders(mux)
 }

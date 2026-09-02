@@ -26,7 +26,7 @@ Then open http://localhost:8080.
 
 | Flag | Default | Description |
 |---|---|---|
-| `-addr` | `:8080` | HTTP listen address |
+| `-addr` | `127.0.0.1:8080` | HTTP listen address; pass `:8080` to accept connections from other machines |
 | `-db` | `accessweb.db` | `.gob` database file; `:memory:` or empty for in-memory |
 | `-tenant` | `default` | Tenant namespace within the database |
 
