@@ -3,9 +3,14 @@ let wasmReady = false;
 let currentTables = [];
 let currentResults = null;
 const HISTORY_KEY = 'tinysql_query_history_v1';
+// Kept only to migrate the old synchronous localStorage snapshot once.
 const DB_SNAPSHOT_KEY = 'tinysql_query_files_db_snapshot_v1';
 const EDITOR_STATE_KEY = 'tinysql_query_files_editor_v1';
+const ACTIVE_WORKSPACE_KEY = 'tinysql_query_files_active_workspace_v1';
+const DEFAULT_WORKSPACE_ID = 'default';
+const DEFAULT_WORKSPACE_NAME = 'My workspace';
 const DEFAULT_RESULT_PAGE_SIZE = 100;
+const MAX_IMPORT_BYTES = 64 * 1024 * 1024;
 const RESULT_PAGE_SIZES = [50, 100, 250, 500];
 const DEMO_HASH_PREFIX = 'demo=';
 const SQL_KEYWORDS = [
@@ -18,20 +23,28 @@ const SQL_KEYWORDS = [
     'PIVOT', 'RETURNING', 'EXPLAIN', 'PRAGMA',
     'ST_MAKEPOINT', 'ST_POINT', 'ST_X', 'ST_Y', 'ST_DISTANCE', 'ST_DWITHIN', 'ST_WITHIN_BBOX',
     'ST_SIMPLIFY', 'ST_BBOX', 'ST_CENTROID', 'ST_AFFINE', 'ST_SMOOTH', 'ST_REMOVE_HOLES', 'ST_CLEAN', 'ST_SNAPTOGRID', 'ST_ISVALID',
-    'ST_AZIMUTH', 'ST_PROJECT', 'ST_MIDPOINT', 'ST_WITHIN', 'ST_CONTAINS', 'ST_AREA', 'ST_LENGTH',
+    'ST_AZIMUTH', 'ST_PROJECT', 'ST_MIDPOINT', 'ST_WITHIN', 'ST_CONTAINS', 'ST_COVERS', 'ST_COVEREDBY',
+    'ST_TOUCHES', 'ST_AREA', 'ST_LENGTH', 'ST_PERIMETER', 'ST_GEOMFROMTEXT', 'ST_GEOMFROMEWKT',
+    'ST_GEOMFROMWKB', 'ST_ASTEXT', 'ST_ASEWKT', 'ST_ASBINARY', 'ST_ASGEOJSON', 'ST_TRANSFORM',
     'GEO_POINT', 'GEO_DISTANCE', 'GEO_WITHIN_BBOX', 'GEO_SIMPLIFY', 'GEO_BBOX', 'GEO_CENTROID',
     'GEO_AFFINE', 'GEO_SMOOTH', 'GEO_DROP_HOLES', 'GEO_CLEAN', 'GEO_SNAP', 'GEO_IS_VALID', 'GEO_BEARING', 'GEO_DESTINATION', 'GEO_MIDPOINT',
     'GEO_WITHIN_POLYGON', 'GEO_POLYGON_AREA', 'GEO_LENGTH', 'FTS_MATCH', 'FTS_RANK', 'FTS_SEARCH',
     'FTS_SNIPPET', 'BM25', 'CONTAINS_ALL', 'CONTAINS_ANY', 'CONTAINS_SCORE',
     'VEC_FROM_JSON', 'VEC_SEARCH', 'VEC_COSINE_SIMILARITY', 'VEC_BINARY_QUANTIZE',
     'VEC_HAMMING_DISTANCE', 'VEC_CENTROID', 'VEC_DISTANCE', 'HYBRID_SEARCH', 'VEC_HYBRID_SEARCH',
-    'RAG_CONTEXT', 'RAG_CONTEXT_FROM', 'RAG_SEARCH', 'RAG_HYBRID_SCORE', 'RAG_RANK_SCORE',
-    'RECENCY_SCORE', 'HASH', 'URL_PARSE', 'YAML_GET', 'CALL', 'ANALYZE', 'ROUND'
+    'RAG_CONTEXT', 'RAG_CONTEXT_FROM', 'RAG_SEARCH', 'RAG_WARM', 'RAG_HYBRID_SCORE', 'RAG_RANK_SCORE',
+    'VEC_SEARCH_FILTERED', 'FTS_SEARCH_FILTERED', 'ROUTE_SHORTEST_PATH', 'ROUTE_DISTANCE', 'ROUTE_WARM',
+    'GEO_GEOHASH_ENCODE', 'GEO_GEOHASH_DECODE', 'GEO_GEOHASH_BBOX', 'GEO_GEOHASH_NEIGHBORS',
+    'GPKG_SRID', 'GPKG_HEADER', 'GPKG_BBOX', 'GPKG_AS_WKB', 'GEO_FROM_GPKG',
+    'CRS_NORMALIZE', 'CRS_URI', 'CRS_AXIS_ORDER', 'CRS_INFO', 'WMS_BBOX',
+    'TILE_MATRIX_BBOX', 'TILE_MATRIX_POSITION', 'RECENCY_SCORE', 'HASH', 'URL_PARSE', 'YAML_GET',
+    'CALL', 'ANALYZE', 'ROUND'
 ];
 // Safe references to WASM-exported functions (set after init)
 let wasmApi = {
     importFile: null,
     executeQuery: null,
+    executeQueryStream: null,
     executeMulti: null,
     getResultPage: null,
     clearDatabase: null,
@@ -40,8 +53,30 @@ let wasmApi = {
     exportResults: null,
     getTableSchema: null,
     exportDatabase: null,
+    exportDatabaseBytes: null,
     importDatabase: null,
+    importDatabaseBytes: null,
+    validateDatabaseBytes: null,
+    getRuntimeStatus: null,
+    setRuntimeIdentity: null,
 };
+let wasmEngine = null;
+let workspaceStore = null;
+let activeWorkspaceId = DEFAULT_WORKSPACE_ID;
+let activeWorkspaceName = DEFAULT_WORKSPACE_NAME;
+let legacySnapshotMigrationPending = false;
+let legacySnapshotMigrationWorkspaceId = null;
+let workspaceTransition = null;
+let workspaceEpoch = 0;
+let queryExecutionInFlight = false;
+let activeQueryAbortController = null;
+let activeQueryStreamProgress = null;
+let streamPreviewRenderTimer = null;
+const activeWorkerRequests = new Map();
+const workspaceChangingMethods = new Set([
+    'importFile', 'executeQuery', 'executeQueryStream', 'executeMulti', 'clearDatabase', 'dropTable',
+    'importDatabase', 'importDatabaseBytes',
+]);
 
 // Client-side pending tables (used when WASM not ready)
 const pendingClientTables = {};
@@ -65,8 +100,28 @@ let resultViewState = {
 };
 let editorSaveTimer = null;
 let snapshotSaveTimer = null;
+let snapshotIdleHandle = null;
+let snapshotDirty = false;
+let snapshotRevision = 0;
 let applyingHashDemo = false;
 let lastAppliedHash = '';
+let runtimeRefreshTimer = null;
+let runtimePanelOpen = false;
+let runtimeStatusRequest = null;
+
+function getRuntimeSessionId() {
+    const key = 'tinysql_runtime_session_v1';
+    try {
+        let value = sessionStorage.getItem(key);
+        if (!value) {
+            value = globalThis.crypto?.randomUUID?.() || `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+            sessionStorage.setItem(key, value);
+        }
+        return value;
+    } catch (_) {
+        return `session-${Date.now()}`;
+    }
+}
 
 function escapeRegex(text) {
     return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -170,41 +225,6 @@ function decodeDemoHash(hash = window.location.hash) {
     }
 }
 
-async function instantiateWasm(go) {
-    const wasmURL = 'query_files.wasm';
-    // GitHub Pages serves the pre-compressed companion as a normal .gz file.
-    // Modern browsers can stream-decompress it into the compiler, avoiding a
-    // large network transfer while retaining streaming compilation.
-    if (typeof DecompressionStream !== 'undefined') {
-        try {
-            const compressed = await fetch(`${wasmURL}.gz`);
-            if (!compressed.ok || !compressed.body) {
-                throw new Error(`compressed WASM unavailable (${compressed.status})`);
-            }
-            const stream = compressed.body.pipeThrough(new DecompressionStream('gzip'));
-            return await WebAssembly.instantiateStreaming(
-                new Response(stream, { headers: { 'Content-Type': 'application/wasm' } }),
-                go.importObject
-            );
-        } catch (error) {
-            console.info('Compressed WASM unavailable, using standard loader:', error);
-        }
-    }
-    if (WebAssembly.instantiateStreaming) {
-        try {
-            return await WebAssembly.instantiateStreaming(fetch(wasmURL), go.importObject);
-        } catch (error) {
-            console.warn('instantiateStreaming failed, falling back to ArrayBuffer:', error);
-        }
-    }
-    const response = await fetch(wasmURL);
-    if (!response.ok) {
-        throw new Error(`WASM request failed (${response.status})`);
-    }
-    const bytes = await response.arrayBuffer();
-    return WebAssembly.instantiate(bytes, go.importObject);
-}
-
 function saveEditorState() {
     const editor = document.getElementById('queryEditor');
     if (editor) {
@@ -226,23 +246,300 @@ function restoreEditorState() {
     }
 }
 
-function saveDatabaseSnapshotNow() {
-    if (!wasmReady || typeof wasmApi.exportDatabase !== 'function') {
+function base64ToSnapshotBytes(encoded) {
+    const binary = atob(String(encoded || ''));
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+        bytes[index] = binary.charCodeAt(index);
+    }
+    return bytes.buffer;
+}
+
+async function snapshotBytesToBase64(snapshot) {
+    if (typeof snapshot === 'string') return snapshot;
+    let buffer = snapshot;
+    if (typeof Blob !== 'undefined' && snapshot instanceof Blob) {
+        buffer = await snapshot.arrayBuffer();
+    }
+    const bytes = buffer instanceof ArrayBuffer
+        ? new Uint8Array(buffer)
+        : ArrayBuffer.isView(buffer)
+            ? new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)
+            : null;
+    if (!bytes) throw new Error('Workspace snapshot has an unsupported binary format.');
+
+    // Avoid spreading a large import into one call stack frame.
+    const parts = [];
+    for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+        parts.push(String.fromCharCode(...bytes.subarray(offset, offset + 0x8000)));
+    }
+    return btoa(parts.join(''));
+}
+
+function isBinarySnapshot(snapshot) {
+    return (typeof ArrayBuffer !== 'undefined' && snapshot instanceof ArrayBuffer)
+        || (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(snapshot))
+        || (typeof Blob !== 'undefined' && snapshot instanceof Blob);
+}
+
+async function exportWorkspaceSnapshot() {
+    if (typeof wasmApi.exportDatabaseBytes === 'function') {
+        const result = await wasmApi.exportDatabaseBytes();
+        if (!result?.success) {
+            throw new Error(result?.error || 'Could not export the binary workspace snapshot.');
+        }
+        if (!isBinarySnapshot(result.data)) {
+            throw new Error('The local engine returned an invalid binary workspace snapshot.');
+        }
+        return { result, snapshot: result.data, format: result.format || 'tinysql-gob' };
+    }
+
+    // Old cached WASM bundles do not expose the binary API. Preserve their
+    // workspaces by decoding the legacy Base64 response before IndexedDB sees
+    // it; a subsequent modern build will restore it through the raw API.
+    const result = await wasmApi.exportDatabase();
+    if (!result?.success || typeof result.data !== 'string') {
+        throw new Error(result?.error || 'Could not export the workspace snapshot.');
+    }
+    return { result, snapshot: base64ToSnapshotBytes(result.data), format: 'tinysql-gob' };
+}
+
+async function importWorkspaceSnapshot(snapshot) {
+    if (typeof wasmApi.importDatabaseBytes === 'function' && isBinarySnapshot(snapshot)) {
+        return wasmApi.importDatabaseBytes(snapshot);
+    }
+    if (typeof wasmApi.importDatabase !== 'function') {
+        throw new Error('The local engine does not support workspace restore.');
+    }
+    return wasmApi.importDatabase(await snapshotBytesToBase64(snapshot));
+}
+
+async function validateWorkspaceSnapshot(snapshot) {
+    if (typeof wasmApi.validateDatabaseBytes === 'function' && isBinarySnapshot(snapshot)) {
+        return wasmApi.validateDatabaseBytes(snapshot);
+    }
+    // Compatibility fallback for an old cached WASM bundle. Modern builds
+    // never mutate the active database while probing a recovery candidate.
+    // Keep the candidate bytes intact: the selected generation must be
+    // imported once more after recovery has chosen it.
+    if (typeof wasmApi.importDatabase === 'function') {
+        return wasmApi.importDatabase(await snapshotBytesToBase64(snapshot));
+    }
+    return importWorkspaceSnapshot(snapshot);
+}
+
+function getLegacySnapshot() {
+    const raw = storageGet(DB_SNAPSHOT_KEY);
+    if (!raw) return null;
+    try {
+        const payload = JSON.parse(raw);
+        if (payload && typeof payload.data === 'string') return payload.data;
+    } catch (_) {
+        // Legacy releases wrote the raw base64 snapshot without an envelope.
+    }
+    return raw;
+}
+
+function completeLegacySnapshotMigration(workspaceId, restored) {
+    if (!legacySnapshotMigrationPending || workspaceId !== legacySnapshotMigrationWorkspaceId || !restored?.snapshot) {
+        return;
+    }
+    storageRemove(DB_SNAPSHOT_KEY);
+    legacySnapshotMigrationPending = false;
+    legacySnapshotMigrationWorkspaceId = null;
+}
+
+function isWorkspaceTransitioning() {
+    return workspaceTransition !== null;
+}
+
+function hasActiveWorkspaceDataOperation() {
+    return [...activeWorkerRequests.values()].some((method) => workspaceChangingMethods.has(method));
+}
+
+function setWorkspaceControlsBusy(busy) {
+    document.body.classList.toggle('workspace-transitioning', busy);
+    const selector = document.getElementById('workspaceSelect');
+    if (selector) selector.disabled = busy || !workspaceStore;
+    const panel = document.getElementById('workspacePanel');
+    panel?.setAttribute('aria-busy', busy ? 'true' : 'false');
+    for (const control of document.querySelectorAll(
+        '#createWorkspaceButton, #workspaceCreateButton, #workspaceNameInput, [data-workspace-action="open"]'
+    )) {
+        control.disabled = busy;
+    }
+}
+
+function runWorkspaceTransition(task) {
+    if (workspaceTransition) {
+        showToast('A workspace change is already in progress.', 'info');
+        return Promise.resolve(false);
+    }
+    if (queryExecutionInFlight) {
+        showToast('Wait for the current query to finish before changing workspaces.', 'info');
+        return Promise.resolve(false);
+    }
+    if (hasActiveWorkspaceDataOperation()) {
+        showToast('Wait for the current data operation to finish before changing workspaces.', 'info');
+        return Promise.resolve(false);
+    }
+    const transition = Promise.resolve().then(async () => {
+        setWorkspaceControlsBusy(true);
+        try {
+            return await task();
+        } finally {
+            setWorkspaceControlsBusy(false);
+        }
+    });
+    workspaceTransition = transition;
+    return transition.finally(() => {
+        if (workspaceTransition === transition) workspaceTransition = null;
+    });
+}
+
+function requireStableWorkspace(action = 'continue') {
+    if (!isWorkspaceTransitioning()) return true;
+    showToast(`Please wait for the workspace change to finish before you ${action}.`, 'info');
+    return false;
+}
+
+function resetWorkspaceResultView({ showIntro = false } = {}) {
+    currentResults = null;
+    resultViewState = {
+        filterText: '',
+        sortColumn: '',
+        sortDirection: 'asc',
+        page: 1,
+        pageSize: DEFAULT_RESULT_PAGE_SIZE,
+    };
+    const resultsContainer = document.getElementById('resultsContainer');
+    if (resultsContainer) {
+        resultsContainer.setAttribute('aria-busy', 'false');
+        resultsContainer.innerHTML = `
+            <div class="empty-state">
+                <div class="empty-state-icon">⚡</div>
+                <div class="empty-state-title">Ready to Query</div>
+                <div class="empty-state-text">Upload a file and run a SQL query</div>
+            </div>
+        `;
+    }
+    document.getElementById('schemaPanel')?.classList.add('hidden');
+    window.clearVanillaGrid?.();
+    setOpenVanillaGridEnabled(false);
+    if (showIntro) renderIntroPage();
+}
+
+async function initializeWorkspaceStorage() {
+    if (workspaceStore) return true;
+    const Storage = globalThis.TinySQLWorkspaceStorage?.WorkspaceStorage;
+    if (typeof Storage !== 'function') {
+        console.warn('Workspace storage module is unavailable.');
         return false;
     }
     try {
-        const result = wasmApi.exportDatabase();
-        if (!result || !result.success || typeof result.data !== 'string') {
-            console.warn('Database snapshot export failed:', result?.error || result);
-            return false;
+        workspaceStore = new Storage({ maxGenerations: 3, preferOPFS: true });
+        await workspaceStore.open();
+        let defaultWorkspace = null;
+        try {
+            defaultWorkspace = await workspaceStore.getWorkspace(DEFAULT_WORKSPACE_ID);
+        } catch (error) {
+            if (error?.code !== 'WORKSPACE_NOT_FOUND') throw error;
         }
-        const payload = {
-            version: 1,
-            savedAt: new Date().toISOString(),
-            sizeBytes: result.sizeBytes || 0,
-            data: result.data,
-        };
-        return storageSet(DB_SNAPSHOT_KEY, JSON.stringify(payload));
+        if (!defaultWorkspace) {
+            const legacySnapshot = getLegacySnapshot();
+            if (legacySnapshot) {
+                try {
+                    defaultWorkspace = await workspaceStore.importLegacySnapshot(base64ToSnapshotBytes(legacySnapshot), {
+                        id: DEFAULT_WORKSPACE_ID,
+                        name: DEFAULT_WORKSPACE_NAME,
+                        format: 'tinysql-gob',
+                        metadata: { migratedAt: new Date().toISOString() },
+                    });
+                    legacySnapshotMigrationPending = true;
+                    legacySnapshotMigrationWorkspaceId = DEFAULT_WORKSPACE_ID;
+                } catch (error) {
+                    // Keep the legacy value untouched: a future release or a
+                    // manual recovery may still be able to read it. A broken
+                    // legacy value must not disable every new workspace.
+                    console.warn('Legacy workspace migration was skipped:', error);
+                    showToast('Could not migrate an older local snapshot. It was kept unchanged.', 'info');
+                }
+            }
+            if (!defaultWorkspace) {
+                try {
+                    defaultWorkspace = await workspaceStore.createWorkspace({
+                        id: DEFAULT_WORKSPACE_ID,
+                        name: DEFAULT_WORKSPACE_NAME,
+                        format: 'tinysql-gob',
+                    });
+                } catch (error) {
+                    // Another tab can create the initial workspace between
+                    // our lookup and create request.
+                    if (error?.code !== 'WORKSPACE_EXISTS') throw error;
+                    defaultWorkspace = await workspaceStore.getWorkspace(DEFAULT_WORKSPACE_ID);
+                }
+            }
+        }
+        let workspace = defaultWorkspace;
+        const rememberedID = storageGet(ACTIVE_WORKSPACE_KEY);
+        if (rememberedID && rememberedID !== defaultWorkspace.id) {
+            try {
+                workspace = await workspaceStore.getWorkspace(rememberedID);
+            } catch (error) {
+                if (error?.code !== 'WORKSPACE_NOT_FOUND') throw error;
+                storageRemove(ACTIVE_WORKSPACE_KEY);
+            }
+        }
+        activeWorkspaceId = workspace.id;
+        activeWorkspaceName = workspace.name;
+        storageSet(ACTIVE_WORKSPACE_KEY, activeWorkspaceId);
+        await refreshWorkspaceSelector();
+        return true;
+    } catch (error) {
+        workspaceStore = null;
+        console.warn('IndexedDB workspace storage is unavailable:', error);
+        updateStatus('Local workspace storage unavailable');
+        return false;
+    }
+}
+
+async function saveDatabaseSnapshotNow() {
+    if (!wasmReady || (
+        typeof wasmApi.exportDatabaseBytes !== 'function'
+        && typeof wasmApi.exportDatabase !== 'function'
+    ) || !workspaceStore) {
+        return false;
+    }
+    const revisionAtStart = snapshotRevision;
+    const workspaceIdAtStart = activeWorkspaceId;
+    const workspaceNameAtStart = activeWorkspaceName;
+    const editor = document.getElementById('queryEditor');
+    const metadataAtStart = {
+        lastQuery: editor?.value || '',
+        tableCount: currentTables.length,
+        savedAt: new Date().toISOString(),
+    };
+    try {
+        const exported = await exportWorkspaceSnapshot();
+        const workspace = await workspaceStore.saveWorkspace(
+            workspaceIdAtStart,
+            exported.snapshot,
+            {
+                keepGenerations: 3,
+                format: exported.format,
+                metadata: metadataAtStart,
+            }
+        );
+        // The snapshot is deliberately committed to the workspace that was
+        // active when export started. A concurrent transition must never put
+        // an old database generation into the newly active workspace.
+        if (activeWorkspaceId === workspaceIdAtStart) {
+            activeWorkspaceName = workspace.name || workspaceNameAtStart;
+            snapshotDirty = snapshotRevision !== revisionAtStart;
+            await refreshWorkspaceSelector();
+            if (snapshotDirty) scheduleDatabaseSnapshotSave(0);
+        }
+        return true;
     } catch (error) {
         console.warn('Database snapshot export failed:', error);
         return false;
@@ -250,41 +547,244 @@ function saveDatabaseSnapshotNow() {
 }
 
 function scheduleDatabaseSnapshotSave(delay = 250) {
+    snapshotDirty = true;
+    snapshotRevision += 1;
     window.clearTimeout(snapshotSaveTimer);
-    snapshotSaveTimer = window.setTimeout(saveDatabaseSnapshotNow, delay);
+    if (snapshotIdleHandle !== null && typeof window.cancelIdleCallback === 'function') {
+        window.cancelIdleCallback(snapshotIdleHandle);
+        snapshotIdleHandle = null;
+    }
+    snapshotSaveTimer = window.setTimeout(() => {
+        const save = () => {
+            snapshotIdleHandle = null;
+            if (snapshotDirty) {
+                saveDatabaseSnapshotNow().catch((error) => console.warn('Autosave failed:', error));
+            }
+        };
+        if (typeof window.requestIdleCallback === 'function') {
+            snapshotIdleHandle = window.requestIdleCallback(save, { timeout: 2000 });
+        } else {
+            save();
+        }
+    }, delay);
 }
 
-function restoreDatabaseSnapshot() {
-    if (typeof wasmApi.importDatabase !== 'function') {
-        return false;
-    }
-    const raw = storageGet(DB_SNAPSHOT_KEY);
-    if (!raw) {
-        return false;
-    }
+async function restoreDatabaseSnapshot() {
+    if ((typeof wasmApi.importDatabase !== 'function' && typeof wasmApi.importDatabaseBytes !== 'function') || !workspaceStore) return false;
     try {
-        let snapshot = raw;
-        try {
-            const payload = JSON.parse(raw);
-            if (payload && typeof payload.data === 'string') {
-                snapshot = payload.data;
-            }
-        } catch (_) {
-            // Backward-compatible path for raw base64 snapshots.
+        const restored = await workspaceStore.recoverWorkspace(activeWorkspaceId, {
+            validate: async (snapshot) => {
+                const result = await validateWorkspaceSnapshot(snapshot);
+                return Boolean(result?.success);
+            },
+        });
+        if (!restored.snapshot) return false;
+        const imported = await importWorkspaceSnapshot(restored.snapshot);
+        if (!imported?.success) {
+            throw new Error(imported?.error || 'The validated workspace snapshot could not be restored.');
         }
-        const result = wasmApi.importDatabase(snapshot);
-        if (!result || !result.success) {
-            storageRemove(DB_SNAPSHOT_KEY);
-            updateStatus(`Saved database could not be restored: ${result?.error || 'unknown error'}`);
-            return false;
+        if (restored.recovered) {
+            showToast('Recovered the most recent valid workspace version.', 'info');
         }
-        updateStatus('Restored local database snapshot');
+        // Validation and the subsequent selected-generation import both
+        // succeeded, so only now is it safe to remove the old localStorage
+        // copy.
+        completeLegacySnapshotMigration(activeWorkspaceId, restored);
+        updateStatus(`Restored workspace: ${activeWorkspaceName}`);
         return true;
     } catch (error) {
-        storageRemove(DB_SNAPSHOT_KEY);
-        updateStatus(`Saved database could not be restored: ${error.message}`);
+        console.warn('Workspace restore failed:', error);
+        updateStatus(`Saved workspace could not be restored: ${error.message}`);
         return false;
     }
+}
+
+async function refreshWorkspaceSelector() {
+    if (!workspaceStore) return [];
+    const workspaces = await workspaceStore.listWorkspaces();
+    const selector = document.getElementById('workspaceSelect');
+    if (selector) {
+        selector.innerHTML = workspaces.map((workspace) => {
+            const selected = workspace.id === activeWorkspaceId ? ' selected' : '';
+            const detail = `${formatRuntimeBytes(workspace.sizeBytes)} · ${new Date(workspace.updatedAt).toLocaleString()}`;
+            return `<option value="${escapeHtml(workspace.id)}"${selected} title="${escapeHtml(detail)}">${escapeHtml(workspace.name)}</option>`;
+        }).join('');
+        selector.disabled = isWorkspaceTransitioning() || workspaces.length === 0;
+    }
+    renderWorkspacePanel(workspaces);
+    return workspaces;
+}
+
+let workspacePanelDelegationReady = false;
+function setupWorkspacePanelDelegation() {
+    if (workspacePanelDelegationReady) return;
+    const list = document.getElementById('workspaceList');
+    if (!list) return;
+    workspacePanelDelegationReady = true;
+    list.addEventListener('click', (event) => {
+        const button = event.target.closest('[data-workspace-action="open"]');
+        const item = button?.closest('[data-workspace-id]');
+        if (!item) return;
+        switchWorkspace(item.dataset.workspaceId).then((switched) => {
+            if (switched) closeWorkspacePanel();
+        }).catch((error) => {
+            console.error('Could not open workspace:', error);
+            showToast(`Could not open workspace: ${error.message}`, 'error');
+        });
+    });
+}
+
+function renderWorkspacePanel(workspaces = []) {
+    const list = document.getElementById('workspaceList');
+    if (!list) return;
+    setupWorkspacePanelDelegation();
+    const transitionActive = isWorkspaceTransitioning();
+    list.innerHTML = workspaces.length ? workspaces.map((workspace) => {
+        const active = workspace.id === activeWorkspaceId ? ' active' : '';
+        const updatedAt = new Date(workspace.updatedAt).toLocaleString();
+        return `
+            <div class="workspace-item${active}" data-workspace-id="${escapeHtml(workspace.id)}">
+                <div class="workspace-item-copy">
+                    <strong>${escapeHtml(workspace.name)}</strong>
+                    <span>${formatRuntimeBytes(workspace.sizeBytes)} · ${escapeHtml(updatedAt)}</span>
+                </div>
+                <button type="button" data-workspace-action="open"${active || transitionActive ? ' disabled' : ''}>${active ? 'Current' : 'Open'}</button>
+            </div>`;
+    }).join('') : '<p class="workspace-empty">No workspaces yet.</p>';
+}
+
+async function openWorkspacePanel() {
+    if (isWorkspaceTransitioning()) return;
+    const panel = document.getElementById('workspacePanel');
+    if (!panel) return;
+    try {
+        await refreshWorkspaceSelector();
+    } catch (error) {
+        showToast(`Could not list workspaces: ${error.message}`, 'error');
+        return;
+    }
+    panel.classList.remove('hidden');
+    panel.setAttribute('aria-hidden', 'false');
+    document.getElementById('workspaceNameInput')?.focus();
+}
+
+function closeWorkspacePanel() {
+    const panel = document.getElementById('workspacePanel');
+    if (!panel) return;
+    panel.classList.add('hidden');
+    panel.setAttribute('aria-hidden', 'true');
+}
+
+async function switchWorkspace(workspaceId) {
+    const nextId = String(workspaceId || '');
+    if (!workspaceStore || !nextId || nextId === activeWorkspaceId) return false;
+    const switched = await runWorkspaceTransition(async () => {
+        try {
+            const saved = await saveDatabaseSnapshotNow();
+            if (!saved) {
+                showToast('The current workspace could not be saved. It remains open.', 'error');
+                return false;
+            }
+            const workspace = await workspaceStore.getWorkspace(nextId);
+            updateStatus(`Opening workspace: ${workspace.name}…`);
+            const restored = await workspaceStore.recoverWorkspace(nextId, {
+                validate: async (snapshot) => {
+                    const result = await validateWorkspaceSnapshot(snapshot);
+                    return Boolean(result?.success);
+                },
+            });
+            if (!restored.snapshot) {
+                const cleared = await wasmApi.clearDatabase();
+                if (!cleared?.success) throw new Error(cleared?.error || 'Could not prepare an empty workspace.');
+            } else {
+                const imported = await importWorkspaceSnapshot(restored.snapshot);
+                if (!imported?.success) {
+                    throw new Error(imported?.error || 'The validated workspace snapshot could not be restored.');
+                }
+            }
+            activeWorkspaceId = workspace.id;
+            activeWorkspaceName = workspace.name;
+            workspaceEpoch += 1;
+            storageSet(ACTIVE_WORKSPACE_KEY, activeWorkspaceId);
+            completeLegacySnapshotMigration(activeWorkspaceId, restored);
+            currentTables = [];
+            resetWorkspaceResultView({ showIntro: !restored.snapshot });
+            const editor = document.getElementById('queryEditor');
+            if (editor) {
+                editor.value = typeof workspace.metadata?.lastQuery === 'string' ? workspace.metadata.lastQuery : '';
+                syncEditorHighlight();
+                saveEditorState();
+            }
+            await loadTables();
+            await refreshWorkspaceSelector();
+            updateStatus(`Opened workspace: ${workspace.name}`);
+            return true;
+        } catch (error) {
+            console.error('Could not switch workspace:', error);
+            showToast(`Could not open workspace: ${error.message}`, 'error');
+            await refreshWorkspaceSelector();
+            return false;
+        }
+    });
+    if (!switched) {
+        try {
+            await refreshWorkspaceSelector();
+        } catch (error) {
+            console.warn('Could not reset the workspace selector:', error);
+        }
+    }
+    return switched;
+}
+
+async function createWorkspacePrompt() {
+    await openWorkspacePanel();
+}
+
+async function createWorkspaceFromPanel() {
+    if (!workspaceStore || !wasmReady) {
+        showToast('Workspaces are still initializing.', 'info');
+        return;
+    }
+    const nameInput = document.getElementById('workspaceNameInput');
+    const trimmedName = nameInput?.value.trim() || '';
+    if (!trimmedName) {
+        showToast('A workspace needs a name.', 'error');
+        return;
+    }
+    return runWorkspaceTransition(async () => {
+        try {
+            const saved = await saveDatabaseSnapshotNow();
+            if (!saved) {
+                showToast('The current workspace could not be saved. No new workspace was created.', 'error');
+                return false;
+            }
+            const workspace = await workspaceStore.createWorkspace({ name: trimmedName, format: 'tinysql-gob' });
+            const cleared = await wasmApi.clearDatabase();
+            if (!cleared?.success) throw new Error(cleared?.error || 'Could not create an empty workspace.');
+            activeWorkspaceId = workspace.id;
+            activeWorkspaceName = workspace.name;
+            workspaceEpoch += 1;
+            storageSet(ACTIVE_WORKSPACE_KEY, activeWorkspaceId);
+            currentTables = [];
+            resetWorkspaceResultView({ showIntro: true });
+            const editor = document.getElementById('queryEditor');
+            if (editor) {
+                editor.value = '';
+                syncEditorHighlight();
+                saveEditorState();
+            }
+            renderTables();
+            await refreshWorkspaceSelector();
+            if (nameInput) nameInput.value = '';
+            closeWorkspacePanel();
+            updateStatus(`Created workspace: ${workspace.name}`);
+            return true;
+        } catch (error) {
+            console.error('Could not create workspace:', error);
+            showToast(`Could not create workspace: ${error.message}`, 'error');
+            return false;
+        }
+    });
 }
 
 function sqlMayMutate(sql) {
@@ -300,33 +800,231 @@ function sqlMayMutate(sql) {
     });
 }
 
+// The legacy path is still the compatible choice for real SQL scripts. A
+// trailing semicolon alone must not opt a single large SELECT out of the
+// bounded ResultStream path, though, so count statement separators outside
+// strings and comments instead of using query.includes(';').
+function hasMultipleSQLStatements(sql) {
+    const input = String(sql || '');
+    let statements = 0;
+    let hasContent = false;
+    let quote = '';
+    let lineComment = false;
+    let blockComment = false;
+
+    for (let index = 0; index < input.length; index += 1) {
+        const char = input[index];
+        const next = input[index + 1];
+
+        if (lineComment) {
+            if (char === '\n') lineComment = false;
+            continue;
+        }
+        if (blockComment) {
+            if (char === '*' && next === '/') {
+                blockComment = false;
+                index += 1;
+            }
+            continue;
+        }
+        if (quote) {
+            hasContent = true;
+            if (char === quote) {
+                // SQL escapes quote characters by doubling them.
+                if (next === quote) {
+                    index += 1;
+                } else {
+                    quote = '';
+                }
+            }
+            continue;
+        }
+        if (char === '-' && next === '-') {
+            lineComment = true;
+            index += 1;
+            continue;
+        }
+        if (char === '/' && next === '*') {
+            blockComment = true;
+            index += 1;
+            continue;
+        }
+        if (char === "'" || char === '"' || char === '`') {
+            quote = char;
+            hasContent = true;
+            continue;
+        }
+        if (char === ';') {
+            if (hasContent) {
+                statements += 1;
+                if (statements > 1) return true;
+            }
+            hasContent = false;
+            continue;
+        }
+        if (!/\s/.test(char)) hasContent = true;
+    }
+    return statements > 0 && hasContent;
+}
+
+function setQueryCancellationState(active, cancelling = false) {
+    const cancelButton = document.getElementById('cancelQueryBtn');
+    if (!cancelButton) return;
+    cancelButton.hidden = !active;
+    cancelButton.disabled = !active || cancelling;
+    cancelButton.textContent = cancelling ? 'Cancelling…' : '■ Cancel';
+}
+
+function cancelActiveQuery() {
+    if (!queryExecutionInFlight || !activeQueryAbortController) return;
+    setQueryCancellationState(true, true);
+    activeQueryAbortController.abort();
+    updateStatus('Cancelling streamed query…');
+}
+
+function scheduleStreamingPreviewRender() {
+    if (streamPreviewRenderTimer) return;
+    streamPreviewRenderTimer = setTimeout(() => {
+        streamPreviewRenderTimer = null;
+        if (!queryExecutionInFlight || !currentResults?.streamingInProgress) return;
+        void renderResults(currentResults).catch((error) => {
+            console.warn('Could not render streamed preview:', error);
+        });
+    }, 120);
+}
+
+function handleQueryStreamEvent(message) {
+    if (!queryExecutionInFlight || !message?.event) return;
+    const event = message.event;
+    activeQueryStreamProgress = event;
+    const phase = event.phase || 'progress';
+    if (phase === 'cancelling') {
+        updateStatus('Cancelling streamed query…');
+        return;
+    }
+
+    if (phase === 'started') {
+        const columns = Array.isArray(event.columns) ? event.columns.map((column) => String(column)) : [];
+        currentResults = {
+            columns,
+            rows: [],
+            rowCount: 0,
+            filteredRowCount: 0,
+            pageOffset: 0,
+            serverPaged: false,
+            pageKey: '',
+            duration: 'Streaming…',
+            streamed: true,
+            previewOnly: true,
+            streamingInProgress: true,
+            truncated: false,
+            rowsScanned: 0,
+            rowsProduced: 0,
+            resultBytes: 0,
+            materialized: Boolean(event.materialized),
+        };
+        const resultsContainer = document.getElementById('resultsContainer');
+        if (resultsContainer) {
+            resultsContainer.innerHTML = `
+                <div class="empty-state">
+                    <div class="empty-state-icon">⏳</div>
+                    <div class="empty-state-title">Streaming result</div>
+                    <div class="empty-state-text">Rows will appear as they are scanned.</div>
+                </div>
+            `;
+        }
+    }
+
+    if (phase === 'chunk' && currentResults?.streamingInProgress) {
+        const rows = Array.isArray(event.rows) ? event.rows : [];
+        if (rows.length) currentResults.rows.push(...rows);
+        currentResults.rowCount = currentResults.rows.length;
+        currentResults.filteredRowCount = currentResults.rows.length;
+        currentResults.duration = `${Number(event.elapsedMs || 0).toFixed(1)} ms • streaming`;
+        scheduleStreamingPreviewRender();
+    }
+
+    if (phase !== 'started' && phase !== 'progress' && phase !== 'chunk') return;
+
+    const retained = Number(event.rowsRetained) || 0;
+    const scanned = Number(event.rowsScanned) || 0;
+    const produced = Number(event.rowsProduced) || 0;
+    if (currentResults?.streamingInProgress) {
+        currentResults.rowsScanned = scanned;
+        currentResults.rowsProduced = produced;
+        currentResults.resultBytes = Number(event.resultBytes) || 0;
+        currentResults.materialized = Boolean(event.materialized);
+    }
+    const detail = event.materialized
+        ? 'materializing result'
+        : 'streaming result';
+    const progress = scanned > 0
+        ? `${retained.toLocaleString()} kept • ${scanned.toLocaleString()} scanned`
+        : `${Math.max(retained, produced).toLocaleString()} rows`;
+    updateStatus(`Query ${detail}: ${progress}`);
+
+    const executeButton = document.getElementById('executeBtn');
+    if (executeButton) {
+        executeButton.textContent = `${event.materialized ? '⏳ Materializing' : '⏳ Streaming'}…`;
+    }
+}
+
 // Initialize WASM
 async function initWasm() {
     const statusIndicator = document.querySelector('.status-indicator');
     statusIndicator?.classList.remove('ready', 'failed');
     statusIndicator?.classList.add('loading');
     updateStatus('Loading local engine…');
-    const go = new Go();
-    
+
     try {
-        const result = await instantiateWasm(go);
-        
-        go.run(result.instance || result);
+        await initializeWorkspaceStorage();
+        if (typeof globalThis.TinySQLWasmClient !== 'function') {
+            throw new Error('WASM worker client did not load.');
+        }
+        wasmEngine = new globalThis.TinySQLWasmClient({
+            workerUrl: 'wasm-worker.js',
+            wasmUrl: 'query_files.wasm',
+            wasmExecUrl: 'wasm_exec.js',
+            preferCompressed: true,
+        });
+        wasmEngine.on('progress', (progress) => {
+            if (progress.phase === 'queued' || progress.phase === 'started') {
+                activeWorkerRequests.set(progress.requestId, progress.method);
+            }
+            if (progress.phase === 'completed' || progress.phase === 'failed' || progress.phase === 'cancelled') {
+                activeWorkerRequests.delete(progress.requestId);
+            }
+            setRuntimeActivityHint(activeWorkerRequests.size);
+        });
+        wasmEngine.on('status', (status) => {
+            if (status?.success) renderRuntimeStatus(status);
+        });
+        wasmEngine.on('stream', (message) => {
+            handleQueryStreamEvent(message);
+        });
+        wasmEngine.on('error', (error) => {
+            if (!wasmReady) return;
+            wasmReady = false;
+            activeWorkerRequests.clear();
+            setRuntimeActivityHint(0);
+            document.getElementById('executeBtn').disabled = true;
+            statusIndicator?.classList.remove('loading', 'ready');
+            statusIndicator?.classList.add('failed');
+            updateStatus('Local engine stopped unexpectedly');
+            showToast(`The local engine stopped: ${error.message || error}`, 'error');
+        });
+        await wasmEngine.init();
+        for (const method of Object.keys(wasmApi)) {
+            if (wasmEngine.supports(method) && typeof wasmEngine[method] === 'function') {
+                wasmApi[method] = wasmEngine[method].bind(wasmEngine);
+            }
+        }
         wasmReady = true;
-        console.log("WASM initialized successfully");
-        
-        // Capture WASM API references safely
-        wasmApi.importFile = window.importFile;
-        wasmApi.executeQuery = window.executeQuery;
-        wasmApi.executeMulti = window.executeMulti;
-        wasmApi.getResultPage = window.getResultPage;
-        wasmApi.clearDatabase = window.clearDatabase;
-        wasmApi.dropTable = window.dropTable;
-        wasmApi.listTables = window.listTables;
-        wasmApi.exportResults = window.exportResults;
-        wasmApi.getTableSchema = window.getTableSchema;
-        wasmApi.exportDatabase = window.exportDatabase;
-        wasmApi.importDatabase = window.importDatabase;
+        console.log('WASM worker initialized successfully');
+
+        if (typeof wasmApi.setRuntimeIdentity === 'function') {
+            await wasmApi.setRuntimeIdentity('local-browser', getRuntimeSessionId());
+        }
 
         console.log("Available WASM functions:", Object.fromEntries(
             Object.entries(wasmApi).map(([k,v]) => [k, typeof v])
@@ -336,9 +1034,11 @@ async function initWasm() {
         statusIndicator?.classList.remove('loading', 'failed');
         statusIndicator?.classList.add('ready');
         document.getElementById('executeBtn').disabled = false;
+        await refreshRuntimeStatus();
+        scheduleRuntimeStatusRefresh();
         const hashDemoPayload = decodeDemoHash();
         if (!hashDemoPayload) {
-            restoreDatabaseSnapshot();
+            await restoreDatabaseSnapshot();
         }
         // If any tables were registered client-side before WASM was ready,
         // import them now into the WASM-backed database so queries will work.
@@ -347,7 +1047,7 @@ async function initWasm() {
             for (const [tableName, rows] of Object.entries(pendingClientTables)) {
                 try {
                     const jsonContent = JSON.stringify(rows);
-                    const result = wasmApi.importFile(`${tableName}.json`, jsonContent, tableName);
+                    const result = await wasmApi.importFile(`${tableName}.json`, jsonContent, tableName);
                     console.log(`Imported pending table ${tableName} to WASM:`, result);
                     // If successful, ensure table is present in currentTables
                     if (result && result.success) {
@@ -369,7 +1069,7 @@ async function initWasm() {
             for (const k of Object.keys(pendingClientTables)) delete pendingClientTables[k];
             scheduleDatabaseSnapshotSave();
         }
-        loadTables();
+        await loadTables();
         if (hashDemoPayload) {
             await applyHashDemoPayload(hashDemoPayload);
             lastAppliedHash = window.location.hash || '';
@@ -713,11 +1413,11 @@ INSERT INTO ai_docs VALUES
     (4, 'Hybrid Retrieval', 'ai', 'Hybrid retrieval combines full text ranking with vector similarity for RAG applications.', '[0.8, 0.2, 0.0]')`;
 
 const DEMO_RAG_CHUNKS = [
-    { doc_id: 'tinySQL', chunk_index: 0, chunk_text: 'tinySQL added browser-ready file analytics, query history, snapshots, and shareable URL hash demos.', quality: 0.78, created_at: '2026-07-08 10:00:00', embedding: '[0.9, 0.2, 0.0]' },
-    { doc_id: 'tinySQL', chunk_index: 1, chunk_text: 'Geodata imports now cover GeoJSON, KML ExtendedData and MultiGeometry, OSM XML, routing graph NDJSON, Shapefile ZIP, and MBTiles metadata.', quality: 0.94, created_at: '2026-07-08 11:00:00', embedding: '[1.0, 0.1, 0.1]' },
-    { doc_id: 'tinySQL', chunk_index: 2, chunk_text: 'RAG helpers combine FTS snippets, vector search, context expansion, recency scoring, and quality-weighted hybrid ranking.', quality: 0.96, created_at: '2026-07-08 12:00:00', embedding: '[0.8, 0.6, 0.1]' },
-    { doc_id: 'tinySQL', chunk_index: 3, chunk_text: 'SQL analytics gained CTE views, materialized views, PIVOT, RETURNING, EXPLAIN, SQLite-compatible PRAGMA metadata, and richer sys catalog tables.', quality: 0.91, created_at: '2026-07-08 13:00:00', embedding: '[0.4, 0.9, 0.2]' },
-    { doc_id: 'ops', chunk_index: 0, chunk_text: 'Operational work added RBAC, audit logging, storage and WAL improvements, tinysqld HTTP APIs, MCP server tools, and tinyORM examples.', quality: 0.86, created_at: '2026-07-08 14:00:00', embedding: '[0.2, 0.4, 1.0]' }
+    { doc_id: 'tinySQL', chunk_index: 0, tenant_id: 'public', chunk_text: 'tinySQL added browser-ready file analytics, query history, snapshots, and shareable URL hash demos.', quality: 0.78, created_at: '2026-08-24 10:00:00', geometry: '{"type":"Point","coordinates":[13.405,52.52]}', embedding: '[0.9, 0.2, 0.0]' },
+    { doc_id: 'tinySQL', chunk_index: 1, tenant_id: 'public', chunk_text: 'Geodata imports now cover WKT, WKB, GeoPackageBinary, geohashes, reprojection, OGC TileMatrix and WMS axis ordering.', quality: 0.94, created_at: '2026-08-29 11:00:00', geometry: '{"type":"Point","coordinates":[11.5755,48.1372]}', embedding: '[1.0, 0.1, 0.1]' },
+    { doc_id: 'tinySQL', chunk_index: 2, tenant_id: 'public', chunk_text: 'RAG helpers combine filtered vector search, spatial authorization, context expansion, warm indexes, and hybrid ranking.', quality: 0.96, created_at: '2026-08-30 12:00:00', geometry: '{"type":"Point","coordinates":[13.405,52.52]}', embedding: '[0.8, 0.6, 0.1]' },
+    { doc_id: 'tinySQL', chunk_index: 3, tenant_id: 'private', chunk_text: 'Private roadmap notes cover streaming execution, vector update deltas, replication, and storage internals.', quality: 0.91, created_at: '2026-08-30 13:00:00', geometry: '{"type":"Point","coordinates":[8.6821,50.1109]}', embedding: '[0.4, 0.9, 0.2]' },
+    { doc_id: 'ops', chunk_index: 0, tenant_id: 'private', chunk_text: 'Operational work added route graph warm-up, stored procedure scheduling, replica streaming, and WAL improvements.', quality: 0.86, created_at: '2026-08-30 14:00:00', geometry: '{"type":"Point","coordinates":[9.9937,53.5511]}', embedding: '[0.2, 0.4, 1.0]' }
 ];
 
 const DEMO_RAG_CHUNKS_SQL = `DROP TABLE IF EXISTS rag_chunks;
@@ -725,19 +1425,29 @@ CREATE TABLE rag_chunks (
     chunk_id INT PRIMARY KEY,
     doc_id TEXT,
     chunk_index INT,
+    tenant_id TEXT,
     chunk_text TEXT,
     quality FLOAT,
     created_at TEXT,
+    geometry GEOMETRY,
     embedding VECTOR
 );
 INSERT INTO rag_chunks VALUES
-    (1, 'tinySQL', 0, 'tinySQL added browser-ready file analytics, query history, snapshots, and shareable URL hash demos.', 0.78, '2026-07-08 10:00:00', '[0.9, 0.2, 0.0]'),
-    (2, 'tinySQL', 1, 'Geodata imports now cover GeoJSON, KML ExtendedData and MultiGeometry, OSM XML, routing graph NDJSON, Shapefile ZIP, and MBTiles metadata.', 0.94, '2026-07-08 11:00:00', '[1.0, 0.1, 0.1]'),
-    (3, 'tinySQL', 2, 'RAG helpers combine FTS snippets, vector search, context expansion, recency scoring, and quality-weighted hybrid ranking.', 0.96, '2026-07-08 12:00:00', '[0.8, 0.6, 0.1]'),
-    (4, 'tinySQL', 3, 'SQL analytics gained CTE views, materialized views, PIVOT, RETURNING, EXPLAIN, SQLite-compatible PRAGMA metadata, and richer sys catalog tables.', 0.91, '2026-07-08 13:00:00', '[0.4, 0.9, 0.2]'),
-    (5, 'ops', 0, 'Operational work added RBAC, audit logging, storage and WAL improvements, tinysqld HTTP APIs, MCP server tools, and tinyORM examples.', 0.86, '2026-07-08 14:00:00', '[0.2, 0.4, 1.0]')`;
+    (1, 'tinySQL', 0, 'public', 'tinySQL added browser-ready file analytics, query history, snapshots, and shareable URL hash demos.', 0.78, '2026-08-24 10:00:00', '{"type":"Point","coordinates":[13.405,52.52]}', '[0.9, 0.2, 0.0]'),
+    (2, 'tinySQL', 1, 'public', 'Geodata imports now cover WKT, WKB, GeoPackageBinary, geohashes, reprojection, OGC TileMatrix and WMS axis ordering.', 0.94, '2026-08-29 11:00:00', '{"type":"Point","coordinates":[11.5755,48.1372]}', '[1.0, 0.1, 0.1]'),
+    (3, 'tinySQL', 2, 'public', 'RAG helpers combine filtered vector search, spatial authorization, context expansion, warm indexes, and hybrid ranking.', 0.96, '2026-08-30 12:00:00', '{"type":"Point","coordinates":[13.405,52.52]}', '[0.8, 0.6, 0.1]'),
+    (4, 'tinySQL', 3, 'private', 'Private roadmap notes cover streaming execution, vector update deltas, replication, and storage internals.', 0.91, '2026-08-30 13:00:00', '{"type":"Point","coordinates":[8.6821,50.1109]}', '[0.4, 0.9, 0.2]'),
+    (5, 'ops', 0, 'private', 'Operational work added route graph warm-up, stored procedure scheduling, replica streaming, and WAL improvements.', 0.86, '2026-08-30 14:00:00', '{"type":"Point","coordinates":[9.9937,53.5511]}', '[0.2, 0.4, 1.0]')`;
 
 const DEMO_RELEASE_FEATURES = [
+    { area: 'Search/RAG', feature: 'Authorization and metadata pre-filters for RAG_SEARCH, HYBRID_SEARCH, VEC_SEARCH_FILTERED and FTS_SEARCH_FILTERED, including spatial bbox/radius filters', added: '2026-08-27 to 2026-08-30', browser_demo: 'Direct tenant + spatial pre-filter recipe over rag_chunks; filtering happens before ranking and context expansion' },
+    { area: 'Search/RAG', feature: 'RAG_WARM builds the exact vector and lexical retrieval paths before the first user query', added: '2026-08-30', browser_demo: 'Direct RAG_WARM recipe reporting vector dimensions and FTS cache statistics' },
+    { area: 'Routing', feature: 'ROUTE_WARM, A* shortest paths, distance matrices, reachable service areas, and faster versioned graph caches', added: '2026-08-27 to 2026-08-30', browser_demo: 'ROUTE_WARM + ROUTE_SHORTEST_PATH recipe over the imported routes_rg graph' },
+    { area: 'Geodata', feature: 'WKT/EWKT and WKB/EWKB conversion, GeoPackageBinary inspection, geohashes, Web Mercator reprojection, ST_TOUCHES/ST_COVERS/ST_PERIMETER', added: '2026-08-29 to 2026-08-30', browser_demo: 'Direct OGC geometry interoperability recipe; path-based GeoPackage import remains native-only' },
+    { area: 'Geodata', feature: 'CRS normalization, WMS 1.3 axis ordering, generic OGC TileMatrix bounds/positions, and TILE_COVER viewport enumeration', added: '2026-08-30', browser_demo: 'Direct CRS/WMS/TileMatrix recipe in the Geo query group' },
+    { area: 'Execution', feature: 'Incremental ResultStream APIs and optimized streaming scans with configurable backpressure', added: '2026-08-26 to 2026-08-27', browser_demo: 'Single-statement browser queries use bounded row chunks with live progress and cancellation; scripts retain the materialized paging/export path' },
+    { area: 'Performance', feature: 'Compiled-query, RAG, vector-update, routing, import/export and storage fast paths added through late August', added: '2026-08-12 to 2026-08-31', browser_demo: 'Used transparently; result view indexes now persist across page changes and snapshots are deferred to browser idle time' },
+    { area: 'Networking', feature: 'Protocol Buffers and gRPC service support in cmd/server', added: '2026-08-31', browser_demo: 'Server-only; not linked into the local WASM playground' },
     { area: 'Performance', feature: 'RAG/FTS arena-backed document cache, parallel BM25 scan, subquery result cache, secondary-index skiplists, and ORDER BY/window-function sorts that avoid reflect.Swapper', added: '2026-07-26 to 2026-08-11', browser_demo: 'Invisible speed-up under existing SQL; nothing new to run' },
     { area: 'Security/Ops', feature: 'cmd/migrate incremental external-database sync and cmd/server replica mode', added: '2026-08-08', browser_demo: 'Go/CLI-only; server-side examples in cmd/migrate and cmd/server, not reachable from the browser build' },
     { area: 'Geodata', feature: 'MBTiles disk-backed tile serving (tinysqld -tiles HTTP endpoint, paged-index tile storage, direct tile-artifact import)', added: '2026-08-01 to 2026-08-06', browser_demo: 'Go/CLI/server-side; documented in browser feature matrix' },
@@ -804,6 +1514,14 @@ const SHAREABLE_DEMOS = {
         autoRun: true,
         query: `-- New: RAG_SEARCH composes vector + text retrieval + context expansion\nSELECT doc_id, chunk_index, chunk_text, _hit_rank, _context_offset, _context_rank\nFROM RAG_SEARCH('rag_chunks', 'embedding', VEC_FROM_JSON('[0.8, 0.6, 0.1]'), 2, '{\n    "text_column": "chunk_text",\n    "text_query": "vector search RAG",\n    "key_columns": ["doc_id", "chunk_index"],\n    "expand_before": 1,\n    "expand_after": 1,\n    "doc_id_column": "doc_id",\n    "chunk_index_column": "chunk_index"\n}')\nORDER BY _context_rank`
     },
+    spatialrag: {
+        title: 'Filtered spatial RAG',
+        description: 'Tenant and radius constraints are enforced before vector ranking, so forbidden or distant rows never enter the candidate set.',
+        icon: '🛡️',
+        tables: ['rag_chunks'],
+        autoRun: true,
+        query: `-- Authorization + location are applied before ranking\nSELECT chunk_id, doc_id, tenant_id, chunk_text, _vec_rank, _vec_distance\nFROM VEC_SEARCH_FILTERED(\n    'rag_chunks', 'embedding', VEC_FROM_JSON('[0.8,0.6,0.1]'), 5,\n    '{"pre_filter":{"equals":{"tenant_id":"public"},"spatial":{"geometry_column":"geometry","center":[13.405,52.52],"radius_meters":600000}}}'\n)\nORDER BY _vec_rank`
+    },
     contains: {
         title: 'Literal multi-term search',
         description: 'New: case-insensitive CONTAINS_ALL, CONTAINS_ANY, and CONTAINS_SCORE for straightforward text filtering and ranking.',
@@ -843,6 +1561,14 @@ const SHAREABLE_DEMOS = {
         tables: ['sales'],
         autoRun: true,
         query: `-- Shareable SQL feature demo: views, materialized views, RETURNING\nDROP MATERIALIZED VIEW IF EXISTS demo_revenue_mv;\nDROP VIEW IF EXISTS demo_paid_orders;\nCREATE VIEW demo_paid_orders AS\nSELECT customer_name, region, product, quantity * unit_price AS revenue\nFROM sales\nWHERE status = 'Delivered';\nCREATE MATERIALIZED VIEW demo_revenue_mv AS\nSELECT region, SUM(revenue) AS revenue\nFROM demo_paid_orders\nGROUP BY region\nWITH DATA;\nINSERT INTO sales VALUES (1011, 'Acme Corp', 'Widget D', 10, 120.00, '2024-03-01', 'North', 'Delivered') RETURNING order_id, customer_name, quantity * unit_price AS returned_total;\nREFRESH MATERIALIZED VIEW demo_revenue_mv;\nSELECT region, revenue\nFROM demo_revenue_mv\nORDER BY revenue DESC`
+    },
+    procedures: {
+        title: 'Stored procedures',
+        description: 'Typed arguments, safe nested SQL, read-only concurrency, atomic writes, runtime statistics, and reusable Go/WASM registrations.',
+        icon: '⚙️',
+        tables: [],
+        autoRun: true,
+        query: `-- Berlin to Munich: a read-only procedure can run concurrently\nCALL demo_geo_distance(52.5200, 13.4050, 48.1372, 11.5755)`
     },
     catalog: {
         title: 'sys catalog introspection',
@@ -990,7 +1716,7 @@ function renderIntroPage() {
     if (!resultsContainer || decodeDemoHash()) {
         return;
     }
-    const starterDemoIDs = ['analytics', 'geo', 'rag'];
+    const starterDemoIDs = ['analytics', 'geo', 'rag', 'spatialrag'];
     const cards = starterDemoIDs.map((id) => [id, SHAREABLE_DEMOS[id]]).map(([id, demo]) => `
         <div class="intro-card">
             <h3>${demo.icon} ${escapeHtml(demo.title)}</h3>
@@ -1050,6 +1776,121 @@ function toggleUtilityMenu() {
     trigger.setAttribute('aria-expanded', String(isOpening));
 }
 
+function toggleRuntimePanel(force) {
+    const panel = document.getElementById('runtimePanel');
+    const button = document.getElementById('runtimeStatusButton');
+    if (!panel) return;
+    runtimePanelOpen = typeof force === 'boolean' ? force : panel.classList.contains('hidden');
+    panel.classList.toggle('hidden', !runtimePanelOpen);
+    panel.setAttribute('aria-hidden', runtimePanelOpen ? 'false' : 'true');
+    button?.setAttribute('aria-expanded', runtimePanelOpen ? 'true' : 'false');
+    if (runtimePanelOpen) refreshRuntimeStatus();
+    scheduleRuntimeStatusRefresh();
+}
+
+function scheduleRuntimeStatusRefresh() {
+    window.clearTimeout(runtimeRefreshTimer);
+    runtimeRefreshTimer = window.setTimeout(async () => {
+        await refreshRuntimeStatus();
+        scheduleRuntimeStatusRefresh();
+    }, runtimePanelOpen ? 1000 : 5000);
+}
+
+function formatRuntimeBytes(value) {
+    const bytes = Number(value) || 0;
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function formatRuntimeDuration(seconds) {
+    const total = Math.max(0, Number(seconds) || 0);
+    if (total < 60) return `${Math.floor(total)}s`;
+    if (total < 3600) return `${Math.floor(total / 60)}m ${Math.floor(total % 60)}s`;
+    return `${Math.floor(total / 3600)}h ${Math.floor((total % 3600) / 60)}m`;
+}
+
+function setRuntimeActivityHint(active) {
+    const button = document.getElementById('runtimeStatusButton');
+    const activeElement = document.getElementById('runtimeActiveCompact');
+    if (activeElement) activeElement.textContent = `${active} active`;
+    const activeMetric = document.getElementById('runtimeActiveValue');
+    const loadMetric = document.getElementById('runtimeLoadValue');
+    if (activeMetric) activeMetric.textContent = String(active);
+    if (loadMetric) loadMetric.textContent = active > 0 ? 'Busy' : 'Idle';
+    button?.classList.toggle('busy', active > 0);
+}
+
+async function refreshRuntimeStatus() {
+    if (!wasmReady || typeof wasmApi.getRuntimeStatus !== 'function') return;
+    if (runtimeStatusRequest) return runtimeStatusRequest;
+    runtimeStatusRequest = (async () => {
+        try {
+            const status = await wasmApi.getRuntimeStatus();
+            if (status?.success) renderRuntimeStatus(status);
+        } catch (error) {
+            console.warn('Runtime status unavailable:', error);
+        } finally {
+            runtimeStatusRequest = null;
+        }
+    })();
+    return runtimeStatusRequest;
+}
+
+function renderRuntimeStatus(status) {
+    const requests = status.requests || {};
+    const performance = status.performance || {};
+    const memory = status.memory || {};
+    const database = status.database || {};
+    const identity = status.identity || {};
+    const active = Math.max(Number(requests.active) || 0, activeWorkerRequests.size);
+    setRuntimeActivityHint(active);
+    const compactMemory = document.getElementById('runtimeMemoryCompact');
+    if (compactMemory) compactMemory.textContent = formatRuntimeBytes(memory.heapAllocBytes);
+
+    const values = {
+        runtimeLoadValue: active > 0 ? 'Busy' : 'Idle',
+        runtimeActiveValue: String(active),
+        runtimeTotalValue: String(Number(requests.total) || 0),
+        runtimeFailedValue: String(Number(requests.failed) || 0),
+        runtimeThroughputValue: `${Number(requests.completedLastMinute) || 0}/min`,
+        runtimePeakValue: String(Number(requests.peakActive) || 0),
+        runtimeHeapValue: formatRuntimeBytes(memory.heapAllocBytes),
+        runtimeHeapSystemValue: formatRuntimeBytes(memory.heapSystemBytes),
+        runtimeTablesValue: String(Number(database.tables) || 0),
+        runtimeRowsValue: String(Number(database.rows) || 0),
+        runtimeCacheValue: `${Number(database.queryCacheEntries) || 0}/${Number(database.queryCacheCapacity) || 0}`,
+        runtimeUptimeValue: formatRuntimeDuration(status.uptimeSeconds),
+        runtimeUserValue: String(identity.userId || 'local-browser'),
+        runtimeTenantValue: String(identity.tenant || 'default'),
+        runtimeSessionValue: String(identity.sessionId || '—'),
+        runtimeDistinctUsersValue: String(Number(identity.distinctUsers) || 0),
+        runtimeAverageValue: `${(Number(performance.averageDurationMs) || 0).toFixed(2)} ms`,
+        runtimeLastValue: `${(Number(performance.lastDurationMs) || 0).toFixed(2)} ms`,
+        runtimeBusyShareValue: `${(Number(performance.busyPercentSinceStart) || 0).toFixed(1)}%`,
+    };
+    for (const [id, value] of Object.entries(values)) {
+        const element = document.getElementById(id);
+        if (element) element.textContent = value;
+    }
+
+    const kindBody = document.getElementById('runtimeKindRows');
+    if (kindBody) {
+        const kinds = Object.entries(requests.byKind || {}).sort(([left], [right]) => left.localeCompare(right));
+        kindBody.innerHTML = kinds.length ? kinds.map(([kind, counters]) => `
+            <tr><td>${escapeHtml(kind)}</td><td>${Number(counters.active) || 0}</td><td>${Number(counters.total) || 0}</td><td>${Number(counters.failed) || 0}</td><td>${Number(counters.timedOut) || 0}</td></tr>
+        `).join('') : '<tr><td colspan="5">No requests yet</td></tr>';
+    }
+
+    const userBody = document.getElementById('runtimeUserRows');
+    if (userBody) {
+        const users = Array.isArray(status.users) ? status.users : [];
+        userBody.innerHTML = users.length ? users.map((user) => `
+            <tr><td>${escapeHtml(user.userId)}</td><td>${Number(user.sessions) || 0}</td><td>${Number(user.activeRequests) || 0}</td><td>${Number(user.totalRequests) || 0}</td><td>${Number(user.failedRequests) || 0}</td></tr>
+        `).join('') : '<tr><td colspan="5">No users observed</td></tr>';
+    }
+}
+
 function toggleDemoQueries() {
     const content = document.getElementById('demoQueryContent');
     const trigger = document.getElementById('demoQueriesToggle');
@@ -1073,6 +1914,146 @@ function toggleResultsExportMenu() {
     const isOpening = menu.classList.contains('hidden');
     menu.classList.toggle('hidden', !isOpening);
     trigger.setAttribute('aria-expanded', String(isOpening));
+}
+
+let generatedCodeState = null;
+const PYTHON_GENERATOR_RESERVED = new Set(['and', 'as', 'assert', 'async', 'await', 'break', 'class', 'continue', 'def', 'del', 'elif', 'else', 'except', 'False', 'finally', 'for', 'from', 'global', 'if', 'import', 'in', 'is', 'lambda', 'None', 'nonlocal', 'not', 'or', 'pass', 'raise', 'return', 'True', 'try', 'while', 'with', 'yield']);
+
+function closeCodeGeneratorMenu() {
+    const menu = document.getElementById('codeGeneratorMenu');
+    const trigger = document.getElementById('codeGeneratorTrigger');
+    menu?.classList.add('hidden');
+    trigger?.setAttribute('aria-expanded', 'false');
+}
+
+function toggleCodeGeneratorMenu() {
+    const menu = document.getElementById('codeGeneratorMenu');
+    const trigger = document.getElementById('codeGeneratorTrigger');
+    if (!menu || !trigger) return;
+    const isOpening = menu.classList.contains('hidden');
+    closeResultsExportMenu();
+    menu.classList.toggle('hidden', !isOpening);
+    trigger.setAttribute('aria-expanded', String(isOpening));
+}
+
+function generatedIdentifier(column, style, fallbackIndex) {
+    const parts = String(column || '').replace(/[^\p{L}\p{N}]+/gu, ' ').trim().split(/\s+/u).filter(Boolean);
+    const normalized = parts.map((part) => part.toLocaleLowerCase());
+    let name = style === 'pascal'
+        ? normalized.map((part) => part.charAt(0).toLocaleUpperCase() + part.slice(1)).join('')
+        : normalized.join('_');
+    if (!name || !/^[A-Za-z_]/u.test(name)) name = `field_${fallbackIndex + 1}`;
+    if (style === 'snake' && PYTHON_GENERATOR_RESERVED.has(name)) name = `${name}_`;
+    return name;
+}
+
+function uniqueGeneratedIdentifiers(columns, style) {
+    const used = new Map();
+    return columns.map((column, index) => {
+        const base = generatedIdentifier(column, style, index);
+        const seen = used.get(base) || 0;
+        used.set(base, seen + 1);
+        return seen ? `${base}_${seen + 1}` : base;
+    });
+}
+
+function inferGeneratedType(rows, column) {
+    const values = rows.map((row) => row?.[column]);
+    const hasNull = values.some((value) => value === null || value === undefined);
+    const kinds = new Set();
+    for (const value of values) {
+        if (value === null || value === undefined) continue;
+        if (typeof value === 'number') kinds.add(Number.isInteger(value) ? 'integer' : 'number');
+        else if (typeof value === 'boolean') kinds.add('boolean');
+        else if (typeof value === 'string') kinds.add('string');
+        else kinds.add('unknown');
+    }
+    if (kinds.size === 0) kinds.add('unknown');
+    if (kinds.has('integer') && kinds.has('number')) {
+        kinds.delete('integer');
+        kinds.add('number');
+    }
+    return { kinds: [...kinds], hasNull };
+}
+
+function generatedType(info, language) {
+    const kind = info.kinds.length === 1 ? info.kinds[0] : 'unknown';
+    const types = {
+        go: { integer: 'int64', number: 'float64', boolean: 'bool', string: 'string', unknown: 'any' },
+        typescript: { integer: 'number', number: 'number', boolean: 'boolean', string: 'string', unknown: 'unknown' },
+        python: { integer: 'int', number: 'float', boolean: 'bool', string: 'str', unknown: 'Any' },
+        sql: { integer: 'BIGINT', number: 'DOUBLE PRECISION', boolean: 'BOOLEAN', string: 'TEXT', unknown: 'TEXT' },
+    };
+    const type = types[language]?.[kind] || types[language]?.unknown || 'unknown';
+    if (language === 'typescript' && info.hasNull) return `${type} | null`;
+    if (language === 'python' && info.hasNull) return `Optional[${type}]`;
+    return type;
+}
+
+function generateResultCode(language, visible = getVisibleResults()) {
+    if (!visible?.columns?.length || !Array.isArray(visible.rows)) return null;
+    const columns = visible.columns;
+    const rows = visible.rows;
+    const types = columns.map((column) => inferGeneratedType(rows, column));
+    const title = 'QueryResult';
+    if (language === 'go') {
+        const fields = uniqueGeneratedIdentifiers(columns, 'pascal');
+        return { extension: 'go', label: 'Go struct', code: `// Generated from the current tinySQL result page.\ntype ${title} struct {\n${columns.map((column, index) => `\t${fields[index]} ${generatedType(types[index], 'go')} \`json:${JSON.stringify(column)}\``).join('\n')}\n}\n` };
+    }
+    if (language === 'typescript') {
+        return { extension: 'ts', label: 'TypeScript interface', code: `// Generated from the current tinySQL result page.\nexport interface ${title} {\n${columns.map((column, index) => `  ${JSON.stringify(column)}: ${generatedType(types[index], 'typescript')};`).join('\n')}\n}\n` };
+    }
+    if (language === 'python') {
+        const fields = uniqueGeneratedIdentifiers(columns, 'snake');
+        const needsOptional = types.some((type) => type.hasNull);
+        const needsAny = types.some((type) => type.kinds.length !== 1 || type.kinds[0] === 'unknown');
+        const imports = ['from dataclasses import dataclass'];
+        if (needsOptional || needsAny) imports.push(`from typing import ${[needsAny ? 'Any' : '', needsOptional ? 'Optional' : ''].filter(Boolean).join(', ')}`);
+        return { extension: 'py', label: 'Python dataclass', code: `${imports.join('\n')}\n\n# Generated from the current tinySQL result page.\n@dataclass\nclass ${title}:\n${columns.map((column, index) => `    ${fields[index]}: ${generatedType(types[index], 'python')}  # ${String(column).replace(/[\r\n]+/gu, ' ')}`).join('\n')}\n` };
+    }
+    if (language === 'sql') {
+        return { extension: 'sql', label: 'SQL CREATE TABLE', code: `-- Generated from the current tinySQL result page.\nCREATE TABLE query_result (\n${columns.map((column, index) => `  ${quoteSqlIdentifier(column)} ${generatedType(types[index], 'sql')}${types[index].hasNull ? '' : ' NOT NULL'}${index === columns.length - 1 ? '' : ','}`).join('\n')}\n);\n` };
+    }
+    return null;
+}
+
+function showGeneratedCode(language) {
+    const generated = generateResultCode(language);
+    if (!generated) {
+        showToast('Run a query with rows before generating code.', 'info');
+        return;
+    }
+    generatedCodeState = generated;
+    closeCodeGeneratorMenu();
+    let panel = document.getElementById('codeGeneratorPanel');
+    if (!panel) {
+        panel = document.createElement('section');
+        panel.id = 'codeGeneratorPanel';
+        panel.className = 'code-generator-panel';
+        document.getElementById('resultsContainer')?.prepend(panel);
+    }
+    panel.innerHTML = `<div class="code-generator-header"><div><strong>${escapeHtml(generated.label)}</strong><span>Inferred from ${getVisibleResults().rows.length} visible row(s)</span></div><div><button type="button" onclick="copyGeneratedCode()">Copy</button><button type="button" onclick="downloadGeneratedCode()">Download .${escapeHtml(generated.extension)}</button><button type="button" onclick="closeGeneratedCode()" aria-label="Close generated code">✕</button></div></div><pre><code>${escapeHtml(generated.code)}</code></pre>`;
+    panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function closeGeneratedCode() {
+    generatedCodeState = null;
+    document.getElementById('codeGeneratorPanel')?.remove();
+}
+
+async function copyGeneratedCode() {
+    if (!generatedCodeState) return;
+    try {
+        await copyTextToClipboard(generatedCodeState.code);
+        showToast('Generated code copied', 'success');
+    } catch (error) {
+        showToast(`Could not copy generated code: ${error.message || error}`, 'error');
+    }
+}
+
+function downloadGeneratedCode() {
+    if (!generatedCodeState) return;
+    downloadFile(generatedCodeState.code, `query_result.${generatedCodeState.extension}`, 'text/plain;charset=utf-8');
 }
 
 const DEMO_TABLES = {
@@ -1159,6 +2140,7 @@ const DEMO_TABLES = {
 
 // Load demo table
 async function loadDemoTable(tableName) {
+    if (!requireStableWorkspace('load demo data')) return;
     if (!DEMO_TABLES[tableName]) {
         alert(`Demo table "${tableName}" not found`);
         return;
@@ -1176,11 +2158,11 @@ async function loadDemoTable(tableName) {
         if (wasmReady && typeof wasmApi.importFile === 'function') {
             try {
                 const result = demo.setupSQL && typeof wasmApi.executeMulti === 'function'
-                    ? wasmApi.executeMulti(demo.setupSQL)
-                    : wasmApi.importFile(fileName, fileContent, tableName);
+                    ? await wasmApi.executeMulti(demo.setupSQL)
+                    : await wasmApi.importFile(fileName, fileContent, tableName);
                 if (result && result.success) {
                     const schema = demo.setupSQL && typeof wasmApi.getTableSchema === 'function'
-                        ? wasmApi.getTableSchema(tableName)
+                        ? await wasmApi.getTableSchema(tableName)
                         : null;
                     const tableInfo = {
                         name: tableName,
@@ -1197,7 +2179,7 @@ async function loadDemoTable(tableName) {
                     }
                     renderTables();
                     if (isRoutingGraphFile(fileName)) {
-                        loadTables();
+                        await loadTables();
                     }
                     updateStatus(`Demo table "${tableName}" loaded: ${tableInfo.rowCount} rows`);
                     if (Object.prototype.hasOwnProperty.call(DEMO_TABLES, tableName)) {
@@ -1240,13 +2222,13 @@ async function importDemoPayloadTable(table) {
     }
     const fileName = table.fileName || `${table.name}.json`;
     const result = typeof table.setupSQL === 'string' && table.setupSQL.trim() && typeof wasmApi.executeMulti === 'function'
-        ? wasmApi.executeMulti(table.setupSQL)
-        : wasmApi.importFile(fileName, table.content, table.name);
+        ? await wasmApi.executeMulti(table.setupSQL)
+        : await wasmApi.importFile(fileName, table.content, table.name);
     if (!result || !result.success) {
         throw new Error(result?.error || `Import failed for ${table.name}`);
     }
     const schema = typeof wasmApi.getTableSchema === 'function'
-        ? wasmApi.getTableSchema(table.name)
+        ? await wasmApi.getTableSchema(table.name)
         : null;
     return {
         name: table.name,
@@ -1261,15 +2243,17 @@ async function applyHashDemoPayload(payload) {
     if (!payload || applyingHashDemo || !wasmReady || typeof wasmApi.importFile !== 'function') {
         return false;
     }
+    if (!requireStableWorkspace('load shared demo data')) return false;
     openStudio({ focusEditor: false });
     applyingHashDemo = true;
     try {
         updateStatus(`Loading shared demo: ${payload.title || payload.id || 'tinySQL'}...`);
         if (typeof wasmApi.clearDatabase === 'function') {
-            wasmApi.clearDatabase();
+            const cleared = await wasmApi.clearDatabase();
+            if (!cleared?.success) throw new Error(cleared?.error || 'Could not clear the current workspace.');
         }
         currentTables = [];
-        currentResults = null;
+        resetWorkspaceResultView();
         for (const key of Object.keys(pendingClientTables)) {
             delete pendingClientTables[key];
         }
@@ -1278,7 +2262,7 @@ async function applyHashDemoPayload(payload) {
             const tableInfo = await importDemoPayloadTable(table);
             currentTables.push(tableInfo);
             if (isRoutingGraphFile(table.fileName)) {
-                loadTables();
+                await loadTables();
             }
         }
 
@@ -1376,6 +2360,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (event.key === 'Escape') {
             closeUtilityMenu();
             closeResultsExportMenu();
+            toggleRuntimePanel(false);
         }
     });
     
@@ -1463,7 +2448,8 @@ function inferDemoQueryGroup(text) {
     }
     if (label.includes('geo') || label.includes('bbox') || label.includes('node') ||
         label.includes('route') || label.includes('distance') || label.includes('radius') ||
-        label.includes('zone') || label.includes('munich')) {
+        label.includes('zone') || label.includes('munich') || label.includes('crs') ||
+        label.includes('wms') || label.includes('tilematrix') || label.includes('ogc')) {
         return 'geo';
     }
     if (label.includes('fts') || label.includes('vector') || label.includes('hybrid') ||
@@ -1593,24 +2579,31 @@ function setupEditorSyntaxHighlighting() {
         new ResizeObserver(refresh).observe(editor);
     }
 
-    // Update line/column counter on cursor changes
-    const updateLineCount = () => {
-        const counter = document.getElementById('editorLineCount');
-        if (!counter) return;
-        const pos = editor.selectionStart ?? 0;
-        const textBefore = editor.value.slice(0, pos);
-        const line = textBefore.split('\n').length;
-        const col = pos - textBefore.lastIndexOf('\n');
-        const totalLines = editor.value.split('\n').length;
-        counter.textContent = `Ln ${line}, Col ${col} \u2022 ${totalLines} line${totalLines !== 1 ? 's' : ''}`;
-    };
-    editor.addEventListener('input', updateLineCount);
-    editor.addEventListener('click', updateLineCount);
-    editor.addEventListener('keyup', updateLineCount);
-    editor.addEventListener('focus', updateLineCount);
-    updateLineCount();
+    // Update line/column counter on cursor changes. Typing is covered by
+    // refresh() below, which drives the counter through syncEditorHighlight().
+    editor.addEventListener('click', updateEditorLineCount);
+    editor.addEventListener('keyup', updateEditorLineCount);
+    editor.addEventListener('focus', updateEditorLineCount);
 
     refresh();
+}
+
+// Lives outside setupEditorSyntaxHighlighting so syncEditorHighlight() can
+// drive it too. Every path that replaces the editor content programmatically
+// (demos, history, table shortcuts, Format, workspace restore) already calls
+// that, and used to leave the counter stuck on the previous query.
+function updateEditorLineCount() {
+    const editor = document.getElementById('queryEditor');
+    const counter = document.getElementById('editorLineCount');
+    if (!editor || !counter) {
+        return;
+    }
+    const pos = editor.selectionStart ?? 0;
+    const textBefore = editor.value.slice(0, pos);
+    const line = textBefore.split('\n').length;
+    const col = pos - textBefore.lastIndexOf('\n');
+    const totalLines = editor.value.split('\n').length;
+    counter.textContent = `Ln ${line}, Col ${col} \u2022 ${totalLines} line${totalLines !== 1 ? 's' : ''}`;
 }
 
 function syncEditorHighlight() {
@@ -1623,6 +2616,7 @@ function syncEditorHighlight() {
     highlight.innerHTML = renderSqlHighlight(editor.value);
     highlight.scrollTop = editor.scrollTop;
     highlight.scrollLeft = editor.scrollLeft;
+    updateEditorLineCount();
 }
 
 function renderSqlHighlight(text) {
@@ -1894,6 +2888,7 @@ async function handleFileUpload(event) {
 
 // Handle multiple files
 async function handleFiles(files) {
+    if (!requireStableWorkspace('import files')) return;
     if (!wasmReady) {
         alert('Please wait for WASM to initialize...');
         return;
@@ -1935,6 +2930,15 @@ function readFile(file, method) {
 // Import a single file. Awaiting file reads keeps multi-file imports ordered
 // and avoids racing status/table updates.
 async function importSingleFile(file) {
+    const workspaceAtStart = activeWorkspaceId;
+    const epochAtStart = workspaceEpoch;
+    if (Number(file?.size) > MAX_IMPORT_BYTES) {
+        const maxMiB = Math.round(MAX_IMPORT_BYTES / (1024 * 1024));
+        const actualMiB = (Number(file.size) / (1024 * 1024)).toFixed(1);
+        showToast(`${file.name} is ${actualMiB} MiB; browser imports are limited to ${maxMiB} MiB.`, 'error');
+        updateStatus('Import rejected: file is too large');
+        return false;
+    }
     const fileName = file.name.toLowerCase();
     if (fileName.endsWith('.xlsx') || fileName.endsWith('.xls')) {
         return importExcelFile(file);
@@ -1942,6 +2946,9 @@ async function importSingleFile(file) {
 
     try {
         const content = await readFile(file, 'readAsText');
+        if (workspaceAtStart !== activeWorkspaceId || epochAtStart !== workspaceEpoch || !requireStableWorkspace('import files')) {
+            return false;
+        }
         const tableName = sanitizeTableName(file.name);
         updateStatus(`Importing ${file.name}...`);
 
@@ -1949,7 +2956,7 @@ async function importSingleFile(file) {
             throw new Error('WASM importFile function not available. Make sure WASM is initialized.');
         }
 
-        const result = wasmApi.importFile(file.name, content, tableName);
+        const result = await wasmApi.importFile(file.name, content, tableName);
         if (!result || typeof result !== 'object') {
             throw new Error('WASM importFile returned an invalid result');
         }
@@ -1971,7 +2978,7 @@ async function importSingleFile(file) {
 
         renderTables();
         if (isRoutingGraphFile(file.name)) {
-            loadTables();
+            await loadTables();
         }
 
         let message = `Imported ${result.rowsImported} rows into "${tableName}"`;
@@ -2002,6 +3009,8 @@ async function importSingleFile(file) {
 
 // Import Excel file using SheetJS
 async function importExcelFile(file) {
+    const workspaceAtStart = activeWorkspaceId;
+    const epochAtStart = workspaceEpoch;
     if (typeof XLSX === 'undefined') {
         showToast('Excel support is unavailable right now. Try CSV or JSON, or refresh the page.', 'error');
         updateStatus('Excel support unavailable');
@@ -2012,10 +3021,16 @@ async function importExcelFile(file) {
 
     try {
         const data = new Uint8Array(await readFile(file, 'readAsArrayBuffer'));
+        if (workspaceAtStart !== activeWorkspaceId || epochAtStart !== workspaceEpoch || !requireStableWorkspace('import files')) {
+            return false;
+        }
         const workbook = XLSX.read(data, { type: 'array' });
         let importedSheets = 0;
 
         for (const sheetName of workbook.SheetNames) {
+            if (workspaceAtStart !== activeWorkspaceId || epochAtStart !== workspaceEpoch || !requireStableWorkspace('import files')) {
+                return false;
+            }
             const worksheet = workbook.Sheets[sheetName];
             const jsonData = XLSX.utils.sheet_to_json(worksheet);
             if (jsonData.length === 0) {
@@ -2024,7 +3039,7 @@ async function importExcelFile(file) {
 
             const tableName = sanitizeTableName(sheetName);
             updateStatus(`Importing sheet: ${sheetName}...`);
-            const result = wasmApi.importFile(`${sheetName}.json`, JSON.stringify(jsonData), tableName);
+            const result = await wasmApi.importFile(`${sheetName}.json`, JSON.stringify(jsonData), tableName);
             if (!result?.success) {
                 console.error(`Failed to import sheet "${sheetName}":`, result?.error || 'unknown error');
                 continue;
@@ -2219,9 +3234,15 @@ function setupTableListDelegation() {
                 return;
             }
             if (actionEl.dataset.action === 'remove-table') {
-                removeTable(name);
+                removeTable(name).catch((error) => {
+                    console.error('Could not remove table:', error);
+                    showToast(`Could not remove table: ${error.message}`, 'error');
+                });
             } else if (actionEl.dataset.action === 'show-table-info') {
-                showTableInfo(name);
+                showTableInfo(name).catch((error) => {
+                    console.error('Could not inspect table:', error);
+                    showToast(`Could not inspect table: ${error.message}`, 'error');
+                });
             }
             return;
         }
@@ -2250,12 +3271,12 @@ function toggleVirtualTables() {
 }
 
 // Show schema / info panel for a table (real or virtual)
-function showTableInfo(tableName) {
+async function showTableInfo(tableName) {
     if (typeof wasmApi.getTableSchema !== 'function') {
         alert('Schema inspection requires WASM to be ready');
         return;
     }
-    const info = wasmApi.getTableSchema(tableName);
+    const info = await wasmApi.getTableSchema(tableName);
     if (!info || !info.success) {
         alert(info?.error || 'Could not load schema');
         return;
@@ -2310,14 +3331,15 @@ function closeSchemaPanel() {
 }
 
 // Remove table
-function removeTable(tableName) {
+async function removeTable(tableName) {
+    if (!requireStableWorkspace('remove a table')) return;
     if (!confirm(`Remove table "${tableName}"? This cannot be undone.`)) {
         return;
     }
     const isPending = Object.prototype.hasOwnProperty.call(pendingClientTables, tableName);
 
     if (!isPending && wasmReady && typeof wasmApi.dropTable === 'function') {
-        const result = wasmApi.dropTable(tableName);
+        const result = await wasmApi.dropTable(tableName);
         if (!result || !result.success) {
             alert(`Failed to drop table "${tableName}": ${result?.error || 'Unknown error'}`);
             return;
@@ -2401,46 +3423,31 @@ function clearQuery() {
     editor.focus();
 }
 
-function clearAllTables() {
+async function clearAllTables() {
+    if (!requireStableWorkspace('clear tables')) return;
     if (!confirm('This will remove all imported tables. Continue?')) {
         return;
     }
-    if (typeof wasmApi.clearDatabase === 'function') {
-        const result = wasmApi.clearDatabase();
-        if (!result || !result.success) {
-            alert(`Failed to clear database: ${result?.error || 'Unknown error'}`);
-            return;
+    try {
+        if (typeof wasmApi.clearDatabase === 'function') {
+            const result = await wasmApi.clearDatabase();
+            if (!result || !result.success) {
+                alert(`Failed to clear database: ${result?.error || 'Unknown error'}`);
+                return;
+            }
         }
+        for (const key of Object.keys(pendingClientTables)) {
+            delete pendingClientTables[key];
+        }
+        currentTables = [];
+        resetWorkspaceResultView({ showIntro: true });
+        renderTables();
+        scheduleDatabaseSnapshotSave(0);
+        updateStatus('Database cleared');
+    } catch (error) {
+        console.error('Could not clear the database:', error);
+        showToast(`Could not clear the database: ${error.message || error}`, 'error');
     }
-    for (const key of Object.keys(pendingClientTables)) {
-        delete pendingClientTables[key];
-    }
-    currentTables = [];
-    currentResults = null;
-    resultViewState = {
-        filterText: '',
-        sortColumn: '',
-        sortDirection: 'asc',
-        page: 1,
-        pageSize: DEFAULT_RESULT_PAGE_SIZE,
-    };
-    renderTables();
-    const resultsContainer = document.getElementById('resultsContainer');
-    if (resultsContainer) {
-        resultsContainer.innerHTML = `
-            <div class="empty-state">
-                <div class="empty-state-icon">⚡</div>
-                <div class="empty-state-title">Ready to Query</div>
-                <div class="empty-state-text">
-                    Upload a file and run a SQL query
-                </div>
-            </div>
-        `;
-    }
-    window.clearVanillaGrid?.();
-    storageRemove(DB_SNAPSHOT_KEY);
-    renderIntroPage();
-    updateStatus('Database cleared');
 }
 
 // Format query (basic)
@@ -2488,6 +3495,11 @@ function formatQuery() {
 
 // Execute query (UI handler)
 async function onExecuteClick() {
+    if (queryExecutionInFlight) {
+        showToast('A query is already running.', 'info');
+        return;
+    }
+    if (!requireStableWorkspace('run a query')) return;
     const editor = document.getElementById('queryEditor');
     const selectedQuery = editor.value.slice(editor.selectionStart, editor.selectionEnd).trim();
     const query = selectedQuery || editor.value.trim();
@@ -2502,27 +3514,45 @@ async function onExecuteClick() {
         return;
     }
 
+    queryExecutionInFlight = true;
+    activeQueryStreamProgress = null;
+    if (streamPreviewRenderTimer) {
+        clearTimeout(streamPreviewRenderTimer);
+        streamPreviewRenderTimer = null;
+    }
     const executeBtn = document.getElementById('executeBtn');
     const resultsContainer = document.getElementById('resultsContainer');
-    
+    const useStreamingQuery = !hasMultipleSQLStatements(query) &&
+        typeof wasmApi.executeQueryStream === 'function';
+    activeQueryAbortController = useStreamingQuery ? new AbortController() : null;
+
     executeBtn.disabled = true;
     executeBtn.innerHTML = '<span class="spinner"></span> Running…';
+    setQueryCancellationState(useStreamingQuery);
     if (resultsContainer) {
         resultsContainer.setAttribute('aria-busy', 'true');
     }
     setOpenVanillaGridEnabled(false);
     
     updateStatus('Executing query…');
+    setRuntimeActivityHint(1);
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 
     try {
-        if (typeof wasmApi.executeQuery !== 'function') {
+        if (!useStreamingQuery && typeof wasmApi.executeQuery !== 'function') {
             throw new Error('WASM executeQuery function not available');
         }
 
         const startTime = performance.now();
-        // Use executeMulti if available and query contains semicolons
-        const hasMulti = query.includes(';') && typeof wasmApi.executeMulti === 'function';
-        const result = hasMulti ? wasmApi.executeMulti(query) : wasmApi.executeQuery(query);
+        // A single statement (including one with a trailing semicolon) uses
+        // the bounded ResultStream preview. Scripts keep the established
+        // materialized semantics until multi-statement streaming is added.
+        const hasMulti = hasMultipleSQLStatements(query) && typeof wasmApi.executeMulti === 'function';
+        const result = useStreamingQuery
+            ? await wasmApi.executeQueryStream(query, { signal: activeQueryAbortController.signal })
+            : hasMulti
+                ? await wasmApi.executeMulti(query)
+                : await wasmApi.executeQuery(query);
         const wallMs = performance.now() - startTime;
         const duration = result?.durationMs != null
             ? result.durationMs.toFixed(2) + ' ms'
@@ -2547,15 +3577,28 @@ async function onExecuteClick() {
                 serverPaged: Boolean(result.serverPaged && typeof wasmApi.getResultPage === 'function'),
                 pageKey: `1|${DEFAULT_RESULT_PAGE_SIZE}|||asc`,
                 duration: duration,
+                streamed: Boolean(result.streamed),
+                previewOnly: Boolean(result.previewOnly),
+                truncated: Boolean(result.truncated),
+                truncationReason: result.truncationReason ? String(result.truncationReason) : '',
+                resultLimitRows: Number(result.resultLimitRows) || 0,
+                resultLimitBytes: Number(result.resultLimitBytes) || 0,
+                rowsScanned: Number(result.rowsScanned) || 0,
+                rowsProduced: Number(result.rowsProduced) || 0,
+                resultBytes: Number(result.resultBytes) || 0,
+                materialized: Boolean(result.materialized),
             };
-            renderResults(currentResults);
+            await renderResults(currentResults);
             pushHistory(query, duration, currentResults.rowCount);
             saveEditorState();
             if (sqlMayMutate(query)) {
-                loadTables();
+                await loadTables();
                 scheduleDatabaseSnapshotSave();
             }
-            updateStatus(`Query completed: ${currentResults.rowCount} rows in ${duration}${result.statementsRun > 1 ? ` (${result.statementsRun} statements)` : ''}`);
+            const resultCount = currentResults.truncated
+                ? `${currentResults.rowCount.toLocaleString()}+ preview rows`
+                : `${currentResults.rowCount.toLocaleString()} rows`;
+            updateStatus(`Query completed: ${resultCount} in ${duration}${result.statementsRun > 1 ? ` (${result.statementsRun} statements)` : ''}`);
         } else {
             const errMsg = result && result.error ? result.error : 'Unknown error';
             resultsContainer.innerHTML = `
@@ -2569,25 +3612,42 @@ async function onExecuteClick() {
             pushHistory(query, '0 ms', 'err');
         }
     } catch (error) {
-        resultsContainer.innerHTML = `
+        const cancelled = error?.name === 'AbortError';
+        currentResults = null;
+        resultsContainer.innerHTML = cancelled ? `
+            <div class="empty-state">
+                <div class="empty-state-icon">■</div>
+                <div class="empty-state-title">Query cancelled</div>
+                <div class="empty-state-text">No partial result was retained. Refine the query or run it again.</div>
+            </div>
+        ` : `
             <div class="error-message">
                 <strong>Error:</strong> ${escapeHtml(error.message)}
             </div>
         `;
         window.clearVanillaGrid?.();
         setOpenVanillaGridEnabled(false);
-        updateStatus('Query failed');
+        updateStatus(cancelled ? 'Query cancelled' : 'Query failed');
     } finally {
+        queryExecutionInFlight = false;
+        activeQueryAbortController = null;
+        activeQueryStreamProgress = null;
+        if (streamPreviewRenderTimer) {
+            clearTimeout(streamPreviewRenderTimer);
+            streamPreviewRenderTimer = null;
+        }
         executeBtn.disabled = false;
         executeBtn.innerHTML = '▶ Execute';
+        setQueryCancellationState(false);
         if (resultsContainer) {
             resultsContainer.setAttribute('aria-busy', 'false');
         }
+        await refreshRuntimeStatus();
     }
 }
 
 // Render query results
-function renderResults(data) {
+async function renderResults(data) {
     const resultsContainer = document.getElementById('resultsContainer');
     if (!resultsContainer || !data || !Array.isArray(data.rows) || !Array.isArray(data.columns) || data.rowCount === 0) {
         if (resultsContainer) {
@@ -2612,14 +3672,30 @@ function renderResults(data) {
         : DEFAULT_RESULT_PAGE_SIZE;
     const pageKey = `${resultViewState.page}|${pageSize}|${resultViewState.filterText}|${resultViewState.sortColumn}|${resultViewState.sortDirection}`;
     if (data.serverPaged && data.pageKey !== pageKey) {
+        const requestedPageKey = pageKey;
         const pageOffset = (Math.max(1, resultViewState.page) - 1) * pageSize;
-        const pageResult = wasmApi.getResultPage(
-            pageOffset,
-            pageSize,
-            resultViewState.filterText,
-            resultViewState.sortColumn,
-            resultViewState.sortDirection
-        );
+        let pageResult;
+        try {
+            pageResult = await wasmApi.getResultPage(
+                pageOffset,
+                pageSize,
+                resultViewState.filterText,
+                resultViewState.sortColumn,
+                resultViewState.sortDirection
+            );
+        } catch (error) {
+            if (data !== currentResults || isWorkspaceTransitioning()) return;
+            resultsContainer.innerHTML = `
+                <div class="error-message">
+                    <strong>Result paging failed:</strong> ${escapeHtml(error.message || error)}
+                </div>
+            `;
+            return;
+        }
+        const latestPageKey = `${resultViewState.page}|${resultViewState.pageSize}|${resultViewState.filterText}|${resultViewState.sortColumn}|${resultViewState.sortDirection}`;
+        if (data !== currentResults || latestPageKey !== requestedPageKey) {
+            return;
+        }
         if (!pageResult || !pageResult.success) {
             resultsContainer.innerHTML = `
                 <div class="error-message">
@@ -2646,6 +3722,27 @@ function renderResults(data) {
     const renderedRows = data.serverPaged ? displayedRows : displayedRows.slice(rowStart, rowStart + pageSize);
     const renderIsPaginated = filteredRows > pageSize;
     const rowEnd = rowStart + renderedRows.length;
+    const previewProgress = data.materialized ? 'rows materialized' : 'rows scanned';
+    const previewNotice = data.previewOnly
+        ? `<br><span class="result-preview-notice">${data.truncated
+            ? `Bounded preview: stopped at the ${escapeHtml(data.truncationReason || 'result')} cap (${Number(data.rowsScanned || 0).toLocaleString()} ${previewProgress}). Add LIMIT or refine the query for a complete export.`
+            : `Streamed preview: ${Number(data.rowsScanned || 0).toLocaleString()} ${previewProgress}. Full-result export is intentionally unavailable in this mode.`
+        }</span>`
+        : '';
+    const exportActions = data.previewOnly
+        ? '<span class="result-preview-badge" title="Use a LIMIT or refine the query before exporting a complete result">Preview only</span>'
+        : `<div class="results-export">
+                <button id="resultsExportTrigger" onclick="toggleResultsExportMenu()" aria-expanded="false" aria-controls="resultsExportMenu">Download</button>
+                <div id="resultsExportMenu" class="results-export-menu hidden" role="menu" aria-label="Download result as a file">
+                    <button role="menuitem" onclick="doExport('csv'); closeResultsExportMenu()">CSV</button>
+                    <button role="menuitem" onclick="doExport('tsv'); closeResultsExportMenu()">TSV</button>
+                    <button role="menuitem" onclick="doExport('xlsx'); closeResultsExportMenu()">Excel (.xlsx, page)</button>
+                    <button role="menuitem" onclick="doExport('json'); closeResultsExportMenu()">JSON</button>
+                    <button role="menuitem" onclick="doExport('xml'); closeResultsExportMenu()">XML</button>
+                    <button role="menuitem" onclick="doExport('html'); closeResultsExportMenu()">HTML table (page)</button>
+                    <button role="menuitem" onclick="doExport('md'); closeResultsExportMenu()">Markdown</button>
+                </div>
+            </div>`;
 
     if (!visible || filteredRows === 0) {
         window.clearVanillaGrid?.();
@@ -2674,24 +3771,25 @@ function renderResults(data) {
                 <strong>${displayedColumns.length}</strong> columns •
                 ${data.duration}
                 ${renderIsPaginated ? `<br><span>Showing rows ${rowStart + 1}–${rowEnd}. Filtering and sorting run in WASM; copy and grid use this page.</span>` : ''}
+                ${previewNotice}
             </div>
             <div class="results-actions">
                 <button onclick="copyResultsToClipboard()">Copy Results</button>
-                <button id="openVanillaGridBtn" onclick="openInVanillaGrid()" disabled>Open in VanillaGrid</button>
+                <button id="openVanillaGridBtn" onclick="openInVanillaGrid()" disabled title="Pivot the current result page and use the included D3 chart controls">Pivot &amp; Charts</button>
                 <div class="results-export">
-                    <button id="resultsExportTrigger" onclick="toggleResultsExportMenu()" aria-expanded="false" aria-controls="resultsExportMenu">Export</button>
-                    <div id="resultsExportMenu" class="results-export-menu hidden" role="menu" aria-label="Export result">
-                        <button role="menuitem" onclick="doExport('csv'); closeResultsExportMenu()">CSV</button>
-                        <button role="menuitem" onclick="doExport('tsv'); closeResultsExportMenu()">TSV</button>
-                        <button role="menuitem" onclick="doExport('md'); closeResultsExportMenu()">Markdown</button>
-                        <button role="menuitem" onclick="doExport('json'); closeResultsExportMenu()">JSON</button>
-                        <button role="menuitem" onclick="doExport('xml'); closeResultsExportMenu()">XML</button>
+                    <button id="codeGeneratorTrigger" onclick="toggleCodeGeneratorMenu()" aria-expanded="false" aria-controls="codeGeneratorMenu">Generate Code</button>
+                    <div id="codeGeneratorMenu" class="results-export-menu hidden" role="menu" aria-label="Generate code from result">
+                        <button role="menuitem" onclick="showGeneratedCode('go')">Go struct</button>
+                        <button role="menuitem" onclick="showGeneratedCode('typescript')">TypeScript interface</button>
+                        <button role="menuitem" onclick="showGeneratedCode('python')">Python dataclass</button>
+                        <button role="menuitem" onclick="showGeneratedCode('sql')">SQL CREATE TABLE</button>
                     </div>
                 </div>
+                ${exportActions}
             </div>
         </div>
         <div class="results-toolbar">
-            <label>
+            <label class="results-filter">
                 Filter
                 <input id="resultFilterInput" type="search" value="${escapeHtml(resultViewState.filterText)}" placeholder="Search rows..." oninput="scheduleResultFilterUpdate()">
             </label>
@@ -2827,14 +3925,18 @@ function formatGeoJSONCell(value) {
 
 // Show upload dialog
 function showUploadDialog() {
+    if (!requireStableWorkspace('import files')) return;
     document.getElementById('fileInput').click();
 }
 
 // Load tables (for refresh button)
-function loadTables() {
+async function loadTables() {
+    const workspaceAtStart = activeWorkspaceId;
+    const epochAtStart = workspaceEpoch;
     if (typeof wasmApi.listTables === 'function') {
         try {
-            const info = wasmApi.listTables();
+            const info = await wasmApi.listTables();
+            if (workspaceAtStart !== activeWorkspaceId || epochAtStart !== workspaceEpoch) return;
             if (info && Array.isArray(info.tables)) {
                 // Separate user tables from virtual tables
                 const userTbls = info.tables.filter(t => t.kind !== 'virtual');
@@ -3008,10 +4110,15 @@ function scheduleResultFilterUpdate() {
     // Debounced so filtering the (potentially 5-10k row) results table
     // doesn't rebuild the whole grid on every keystroke.
     window.clearTimeout(resultFilterTimer);
-    resultFilterTimer = window.setTimeout(updateResultViewState, 200);
+    resultFilterTimer = window.setTimeout(() => {
+        updateResultViewState().catch((error) => {
+            console.error('Could not update the result view:', error);
+            updateStatus(`Could not update the result view: ${error.message || error}`);
+        });
+    }, 200);
 }
 
-function updateResultViewState() {
+async function updateResultViewState() {
     const filterInput = document.getElementById('resultFilterInput');
     const sortSelect = document.getElementById('resultSortColumn');
     const sortDirection = document.getElementById('resultSortDirection');
@@ -3032,7 +4139,7 @@ function updateResultViewState() {
     resultViewState.sortDirection = sortDirectionValue;
 
     if (currentResults) {
-        renderResults(currentResults);
+        await renderResults(currentResults);
         if (keepFilterFocus) {
             const refreshedFilter = document.getElementById('resultFilterInput');
             if (refreshedFilter) {
@@ -3045,17 +4152,17 @@ function updateResultViewState() {
     }
 }
 
-function clearResultViewFilters() {
+async function clearResultViewFilters() {
     resultViewState.filterText = '';
     resultViewState.sortColumn = '';
     resultViewState.sortDirection = 'asc';
     resultViewState.page = 1;
     if (currentResults) {
-        renderResults(currentResults);
+        await renderResults(currentResults);
     }
 }
 
-function sortResultsBy(column) {
+async function sortResultsBy(column) {
     if (!currentResults || !Array.isArray(currentResults.columns) || !currentResults.columns.includes(column)) {
         return;
     }
@@ -3069,10 +4176,10 @@ function sortResultsBy(column) {
 
     resultViewState.page = 1;
 
-    renderResults(currentResults);
+    await renderResults(currentResults);
 }
 
-function updateResultPageSize() {
+async function updateResultPageSize() {
     const pageSize = Number(document.getElementById('resultPageSize')?.value);
     if (!RESULT_PAGE_SIZES.includes(pageSize)) {
         return;
@@ -3080,11 +4187,11 @@ function updateResultPageSize() {
     resultViewState.pageSize = pageSize;
     resultViewState.page = 1;
     if (currentResults) {
-        renderResults(currentResults);
+        await renderResults(currentResults);
     }
 }
 
-function changeResultPage(delta) {
+async function changeResultPage(delta) {
     if (!currentResults || !Number.isInteger(delta)) {
         return;
     }
@@ -3092,7 +4199,7 @@ function changeResultPage(delta) {
     const resultCount = currentResults.serverPaged ? currentResults.filteredRowCount : visible.rows.length;
     const totalPages = Math.max(1, Math.ceil(resultCount / resultViewState.pageSize));
     resultViewState.page = Math.min(Math.max(1, resultViewState.page + delta), totalPages);
-    renderResults(currentResults);
+    await renderResults(currentResults);
 }
 
 function getSortIndicator(column) {
@@ -3103,17 +4210,24 @@ function getSortIndicator(column) {
 }
 
 // Unified export dispatcher – tries WASM-side first, falls back to client-side
-function doExport(format) {
+async function doExport(format) {
+    if (currentResults?.previewOnly) {
+        alert('This result is a bounded stream preview. Add a LIMIT or refine the query before exporting a complete result.');
+        return;
+    }
     const visible = getVisibleResults();
     if (!visible || !visible.rows || visible.rows.length === 0) {
         alert('No results to export');
         return;
     }
     const viewIsRaw = !resultViewState.filterText.trim() && !resultViewState.sortColumn;
-    // Try WASM-side exporter
-    if (viewIsRaw && typeof wasmApi.exportResults === 'function') {
+    // XLSX and HTML are deliberately assembled in the UI: XLSX is binary and
+    // the HTML export follows the currently visible column order. The text
+    // formats can stay in WASM for an unfiltered complete result.
+    const clientOnlyFormat = format === 'xlsx' || format === 'html';
+    if (!clientOnlyFormat && viewIsRaw && typeof wasmApi.exportResults === 'function') {
         try {
-            const res = wasmApi.exportResults(format);
+            const res = await wasmApi.exportResults(format);
             if (res && res.success && res.data) {
                 const mimeType = (typeof res.mimeType === 'string' && res.mimeType) ||
                     (typeof res.mime === 'string' && res.mime) ||
@@ -3127,9 +4241,11 @@ function doExport(format) {
     // Client-side fallback
     if (format === 'csv') exportCSV(visible);
     else if (format === 'tsv') exportTSV(visible);
+    else if (format === 'xlsx') exportXLSX(visible);
     else if (format === 'md') exportMarkdown(visible);
     else if (format === 'json') exportJSON(visible);
     else if (format === 'xml') exportXML(visible);
+    else if (format === 'html') exportHTML(visible);
     else alert('Unsupported export format: ' + format);
 }
 
@@ -3181,6 +4297,40 @@ function exportTSV(visible = getVisibleResults()) {
     downloadFile(lines.join('\n'), 'query_results.tsv', 'text/tab-separated-values');
 }
 
+// Export an actual workbook instead of a CSV file with a misleading .xlsx
+// suffix. Spreadsheet formulas from imported data are stored as text so a
+// download cannot unexpectedly execute them when opened.
+function exportXLSX(visible = getVisibleResults()) {
+    if (!visible || !visible.rows || visible.rows.length === 0) {
+        alert('No results to export');
+        return;
+    }
+    if (!window.XLSX?.utils) {
+        showToast('Excel export is unavailable because the spreadsheet library did not load.', 'error');
+        return;
+    }
+
+    const safeCell = (value) => {
+        if (value === null || value === undefined) return '';
+        if (typeof value === 'number' || typeof value === 'boolean') return value;
+        const text = String(value);
+        return /^[=+\-@]/.test(text) ? `'${text}` : text;
+    };
+    const sheetRows = [visible.columns.slice()];
+    for (const row of visible.rows) {
+        sheetRows.push(visible.columns.map((column) => safeCell(row[column])));
+    }
+    const sheet = window.XLSX.utils.aoa_to_sheet(sheetRows);
+    sheet['!cols'] = visible.columns.map((column, index) => {
+        const values = sheetRows.slice(0, 1000).map((row) => String(row[index] ?? ''));
+        return { wch: Math.min(48, Math.max(10, String(column).length + 2, ...values.map((value) => value.length + 2))) };
+    });
+    const workbook = window.XLSX.utils.book_new();
+    window.XLSX.utils.book_append_sheet(workbook, sheet, 'Query results');
+    const bytes = window.XLSX.write(workbook, { bookType: 'xlsx', type: 'array' });
+    downloadFile(bytes, 'query_results.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+}
+
 function exportMarkdown(visible = getVisibleResults()) {
     if (!visible || !visible.rows || visible.rows.length === 0) {
         alert('No results to export');
@@ -3223,6 +4373,22 @@ function exportXML(visible = getVisibleResults()) {
     });
     xml += '</results>\n';
     downloadFile(xml, 'query_results.xml', 'application/xml');
+}
+
+function exportHTML(visible = getVisibleResults()) {
+    if (!visible || !visible.rows || visible.rows.length === 0) {
+        alert('No results to export');
+        return;
+    }
+    const header = visible.columns.map((column) => `<th>${escapeHtml(column)}</th>`).join('');
+    const body = visible.rows.map((row) => `<tr>${visible.columns.map((column) => (
+        `<td>${escapeHtml(row[column] == null ? '' : String(row[column]))}</td>`
+    )).join('')}</tr>`).join('\n');
+    const html = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>tinySQL query results</title>
+<style>body{font-family:system-ui,sans-serif;margin:2rem}table{border-collapse:collapse;width:100%}th,td{border:1px solid #bbb;padding:.45rem;text-align:left;vertical-align:top}th{background:#f3f4f6}</style>
+</head><body><h1>Query results</h1><table><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table></body></html>`;
+    downloadFile(html, 'query_results.html', 'text/html;charset=utf-8');
 }
 
 // Download file helper
@@ -3320,6 +4486,7 @@ function detectClipboardImportFormat(text) {
 }
 
 async function importClipboardData() {
+    if (!requireStableWorkspace('import clipboard data')) return;
     let text = '';
     try {
         if (navigator.clipboard && typeof navigator.clipboard.readText === 'function') {
@@ -3346,28 +4513,35 @@ async function importClipboardData() {
     const tableName = sanitizeTableName(tableNameInput) || defaultTableName;
     const ext = format === 'json' ? '.json' : format === 'jsonl' ? '.jsonl' : format === 'tsv' ? '.tsv' : '.csv';
 
+    if (!requireStableWorkspace('import clipboard data')) return;
     if (!wasmReady || typeof wasmApi.importFile !== 'function') {
         alert('WASM import is not ready yet');
         return;
     }
 
-    updateStatus(`Importing clipboard data into ${tableName}...`);
-    const result = wasmApi.importFile(`${tableName}${ext}`, text, tableName);
-    if (result && result.success) {
-        loadTables();
-        const editor = document.getElementById('queryEditor');
-        if (editor && !editor.value.trim()) {
-            editor.value = `SELECT * FROM ${quoteSqlIdentifier(tableName)} LIMIT 10`;
-            syncEditorHighlight();
-            saveEditorState();
+    try {
+        updateStatus(`Importing clipboard data into ${tableName}...`);
+        const result = await wasmApi.importFile(`${tableName}${ext}`, text, tableName);
+        if (result && result.success) {
+            await loadTables();
+            const editor = document.getElementById('queryEditor');
+            if (editor && !editor.value.trim()) {
+                editor.value = `SELECT * FROM ${quoteSqlIdentifier(tableName)} LIMIT 10`;
+                syncEditorHighlight();
+                saveEditorState();
+            }
+            scheduleDatabaseSnapshotSave();
+            updateStatus(`Imported clipboard data into "${tableName}" (${result.rowsImported} rows)`);
+            return;
         }
-        scheduleDatabaseSnapshotSave();
-        updateStatus(`Imported clipboard data into "${tableName}" (${result.rowsImported} rows)`);
-        return;
-    }
 
-    alert(`Clipboard import failed: ${result?.error || 'Unknown error'}`);
-    updateStatus('Clipboard import failed');
+        alert(`Clipboard import failed: ${result?.error || 'Unknown error'}`);
+        updateStatus('Clipboard import failed');
+    } catch (error) {
+        console.error('Clipboard import failed:', error);
+        updateStatus('Clipboard import failed');
+        showToast(`Clipboard import failed: ${error.message || error}`, 'error');
+    }
 }
 
 // Escape HTML – static map avoids creating DOM nodes on every call

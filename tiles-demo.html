@@ -292,6 +292,7 @@
             <div class="panel">
                 <h2>Explore a point</h2>
                 <p>Click anywhere on the map. This runs <code class="mono">TILE_ZXY</code>, <code class="mono">TILE_QUADKEY</code> and <code class="mono">TILE_BBOX</code> for that point at the current zoom and outlines the tile they land on. Right-click for more options.</p>
+                <p>The same click also reprojects the point with <code class="mono">ST_TRANSFORM(…, 3857)</code> — the Web Mercator metres a tile grid is actually addressed in — and encodes it with <code class="mono">GEO_GEOHASH_ENCODE</code>. <code class="mono">GEO_GEOHASH_NEIGHBORS</code> then returns that cell plus the eight around it and <code class="mono">GEO_GEOHASH_BBOX</code> turns each into bounds, drawn in amber with the clicked cell filled.</p>
                 <div id="pointResult" class="mono">click the map…</div>
             </div>
 

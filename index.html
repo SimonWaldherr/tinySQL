@@ -48,6 +48,7 @@
         .landing-mode .main { display: none; }
         .studio-mode .landing-page { display: none; }
         .landing-mode .studio-only { display: none !important; }
+        .studio-mode .landing-only { display: none !important; }
 
         .hidden {
             display: none !important;
@@ -150,6 +151,41 @@
 
         .topbar .topbar-secondary:hover,
         .topbar .tools-trigger:hover { background: #3e3e42; }
+
+        .workspace-control {
+            align-items: center;
+            display: flex;
+            gap: 5px;
+            min-width: 0;
+        }
+
+        .workspace-control label {
+            color: #8d98a8;
+            font-size: 11px;
+            white-space: nowrap;
+        }
+
+        .workspace-control select {
+            background: #252526;
+            border: 1px solid #4b4b50;
+            border-radius: 4px;
+            color: #d4d4d4;
+            font-size: 12px;
+            height: 32px;
+            max-width: 180px;
+            min-width: 0;
+            padding: 0 7px;
+        }
+
+        .workspace-control button {
+            background: transparent;
+            border: 1px solid #4b4b50;
+            color: #d4d4d4;
+            min-height: 32px;
+            padding: 4px 9px;
+        }
+
+        .workspace-control button:hover { background: #3e3e42; }
 
         .topbar-menu { position: relative; }
 
@@ -360,6 +396,7 @@
         }
 
         .topbar button:focus-visible,
+        .workspace-control select:focus-visible,
         .sidebar-header button:focus-visible,
         .editor-toolbar button:focus-visible,
         .results-actions button:focus-visible,
@@ -397,6 +434,136 @@
         .status-indicator.ready { background: #0f0; }
         .status-indicator.failed { background: #d9534f; }
         .status-indicator.loading { background: #f0ad4e; }
+
+        .runtime-status-button {
+            align-items: center;
+            background: transparent !important;
+            border: 1px solid #4b4b50 !important;
+            color: #aaa !important;
+            display: flex;
+            gap: 5px;
+            padding: 5px 8px !important;
+        }
+
+        .runtime-status-button.busy {
+            border-color: #f0ad4e !important;
+            color: #f6c86b !important;
+        }
+
+        .runtime-panel {
+            background: #202124;
+            border: 1px solid #4b4b50;
+            border-radius: 7px;
+            box-shadow: 0 18px 44px rgba(0, 0, 0, 0.48);
+            color: #d4d4d4;
+            max-height: calc(100vh - 74px);
+            overflow-y: auto;
+            padding: 14px;
+            position: fixed;
+            right: 14px;
+            top: 58px;
+            width: min(620px, calc(100vw - 28px));
+            z-index: 1100;
+        }
+
+        .runtime-panel-header {
+            align-items: center;
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 12px;
+        }
+
+        .runtime-panel-header h2 { color: #fff; font-size: 15px; }
+        .runtime-panel-header button { background: transparent; border: 0; color: #aaa; cursor: pointer; font-size: 18px; }
+
+        .runtime-metrics {
+            display: grid;
+            gap: 8px;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+        }
+
+        .runtime-metric {
+            background: #292a2d;
+            border: 1px solid #3e3e42;
+            border-radius: 5px;
+            min-width: 0;
+            padding: 9px;
+        }
+
+        .runtime-metric span { color: #888; display: block; font-size: 10px; margin-bottom: 4px; text-transform: uppercase; }
+        .runtime-metric strong { color: #f1f5f9; display: block; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .runtime-panel h3 { color: #ccc; font-size: 12px; margin: 15px 0 7px; }
+        .runtime-table { border-collapse: collapse; font-size: 11px; width: 100%; }
+        .runtime-table th, .runtime-table td { border-bottom: 1px solid #343438; padding: 6px; text-align: right; }
+        .runtime-table th:first-child, .runtime-table td:first-child { text-align: left; }
+        .runtime-note { color: #888; font-size: 11px; line-height: 1.45; margin-top: 12px; }
+
+        .workspace-panel {
+            background: #202124;
+            border: 1px solid #4b4b50;
+            border-radius: 7px;
+            box-shadow: 0 18px 44px rgba(0, 0, 0, 0.48);
+            color: #d4d4d4;
+            padding: 14px;
+            position: fixed;
+            right: 14px;
+            top: 58px;
+            width: min(370px, calc(100vw - 28px));
+            z-index: 1100;
+        }
+
+        .workspace-panel-header {
+            align-items: center;
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 12px;
+        }
+
+        .workspace-panel-header h2 { color: #fff; font-size: 15px; }
+        .workspace-panel-header button { background: transparent; border: 0; color: #aaa; cursor: pointer; font-size: 18px; }
+        .workspace-create { display: flex; gap: 7px; margin-bottom: 12px; }
+        .workspace-create input {
+            background: #292a2d;
+            border: 1px solid #4b4b50;
+            border-radius: 4px;
+            color: #f1f5f9;
+            flex: 1;
+            min-width: 0;
+            padding: 7px 8px;
+        }
+        .workspace-create button, .workspace-item button {
+            background: #0e639c;
+            border: 0;
+            border-radius: 4px;
+            color: #fff;
+            cursor: pointer;
+            font-size: 12px;
+            padding: 7px 9px;
+        }
+        .workspace-create button:hover, .workspace-item button:hover { background: #1177bb; }
+        .workspace-item button:disabled { background: #3b3c40; color: #aaa; cursor: default; }
+        .workspace-list { border-top: 1px solid #343438; max-height: 320px; overflow-y: auto; }
+        .workspace-item {
+            align-items: center;
+            border-bottom: 1px solid #343438;
+            display: flex;
+            gap: 10px;
+            justify-content: space-between;
+            padding: 10px 0;
+        }
+        .workspace-item.active strong { color: #9cdcfe; }
+        .workspace-item-copy { min-width: 0; }
+        .workspace-item strong, .workspace-item span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .workspace-item strong { color: #f1f5f9; font-size: 13px; }
+        .workspace-item span, .workspace-empty, .workspace-note { color: #888; font-size: 11px; margin-top: 3px; }
+        .workspace-note { line-height: 1.45; margin: 12px 0 0; }
+
+        @media (max-width: 700px) {
+            .runtime-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .workspace-control label { display: none; }
+            .workspace-control select { max-width: 130px; }
+            #runtimeMemoryCompact, .runtime-compact-separator { display: none; }
+        }
 
         .table-badge {
             display: inline-block;
@@ -499,14 +666,14 @@
         .sidebar-toggle {
             display: none;
             position: fixed;
-            left: 8px;
-            bottom: 8px;
+            left: 12px;
+            bottom: 12px;
             z-index: 1000;
             background: #0e639c;
             border: none;
             color: #fff;
-            width: 36px;
-            height: 36px;
+            width: 44px;
+            height: 44px;
             border-radius: 50%;
             font-size: 18px;
             cursor: pointer;
@@ -667,6 +834,25 @@
             background: #3e3e42;
         }
 
+        .editor-toolbar .btn-cancel {
+            background: #a1260d;
+        }
+
+        .editor-toolbar .btn-cancel:hover {
+            background: #c83c22;
+        }
+
+        .result-preview-notice {
+            color: #f0b429;
+        }
+
+        .result-preview-badge {
+            align-self: center;
+            color: #f0b429;
+            font-size: 12px;
+            white-space: nowrap;
+        }
+
         .editor-toolbar .btn-secondary:hover {
             background: #505050;
         }
@@ -719,6 +905,11 @@
             color: transparent;
             caret-color: #d4d4d4;
             resize: vertical;
+            /* Grow with the query instead of scrolling a fixed box. Engines
+               without field-sizing keep the manual resize handle, and dragging
+               that handle still wins here because it sets an inline height. */
+            field-sizing: content;
+            max-height: 45vh;
         }
 
         #queryEditor::placeholder {
@@ -869,7 +1060,19 @@
             border-radius: 4px;
             padding: 6px 8px;
             font-size: 12px;
-            min-width: 150px;
+            flex: 1 1 auto;
+            min-width: 0;
+        }
+
+        .results-toolbar select {
+            min-width: 110px;
+        }
+
+        /* The free-text filter is the control people reach for first, so it
+           takes the leftover width instead of every control staying 150px. */
+        .results-toolbar .results-filter {
+            flex: 1 1 240px;
+            min-width: 200px;
         }
 
         .results-toolbar input:focus,
@@ -896,6 +1099,7 @@
             display: flex;
             align-items: center;
             justify-content: flex-end;
+            flex-wrap: wrap;
             gap: 10px;
             margin-top: 12px;
             color: #999;
@@ -941,6 +1145,55 @@
             background: transparent;
         }
 
+        .code-generator-panel {
+            margin: 0 0 12px;
+            border: 1px solid #4b4b50;
+            border-radius: 7px;
+            background: #1e1e1e;
+            overflow: hidden;
+        }
+
+        .code-generator-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 10px 12px;
+            border-bottom: 1px solid #3e3e42;
+        }
+
+        .code-generator-header > div {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .code-generator-header span {
+            color: #999;
+            font-size: 12px;
+        }
+
+        .code-generator-header button {
+            background: #3e3e42;
+            border: 0;
+            border-radius: 4px;
+            color: #ddd;
+            cursor: pointer;
+            padding: 5px 8px;
+        }
+
+        .code-generator-header button:hover { background: #505050; }
+
+        .code-generator-panel pre {
+            margin: 0;
+            max-height: 320px;
+            overflow: auto;
+            padding: 12px;
+            color: #d4d4d4;
+            font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        }
+
         .results-actions button:disabled {
             background: #3e3e42;
             color: #666;
@@ -954,8 +1207,10 @@
             width: 100%;
             border-collapse: collapse;
             background: #252526;
-            border-radius: 4px;
-            overflow: hidden;
+            /* No overflow/border-radius here. Any overflow other than
+               `visible` makes the table its own scroll container, which
+               silently disables the sticky <th> below. Clipping and the
+               rounded corners live on .result-table-wrap instead. */
         }
 
         .result-table th {
@@ -966,6 +1221,9 @@
             font-weight: 600;
             font-size: 13px;
             border-bottom: 2px solid #3e3e42;
+            /* border-collapse drops the bottom border of a sticky cell while
+               it is pinned, so draw the same line as an inset shadow too. */
+            box-shadow: inset 0 -2px 0 #3e3e42;
             position: sticky;
             top: 0;
             z-index: 10;
@@ -1048,10 +1306,13 @@
             cursor: help;
         }
 
-        .result-table td.truncated-cell:hover {
+        /* Wrap inside the existing column width. Dropping the max-width here
+           re-lays out every other column, so the table jumps sideways under
+           the pointer. */
+        .result-table td.truncated-cell:hover,
+        .result-table td.truncated-cell:focus-visible {
             white-space: normal;
-            word-break: break-all;
-            max-width: none;
+            word-break: break-word;
         }
 
         .result-table tr.selected-row {
@@ -1784,7 +2045,10 @@
             }
 
             .results-area {
-                padding: 10px;
+                /* Extra bottom padding so the last rows and the pagination
+                   bar can be scrolled out from under the floating sidebar
+                   button. */
+                padding: 10px 10px 64px;
             }
 
             .results-header {
@@ -1797,8 +2061,15 @@
                 justify-content: flex-start;
             }
 
-            .results-actions button {
+            /* Download sits inside a .results-export wrapper, so the flex
+               children are a mix of buttons and divs. Sizing only the buttons
+               left the wrapper at its intrinsic width and the row ragged. */
+            .results-actions > * {
                 flex: 1 1 calc(50% - 8px);
+            }
+
+            .results-export button {
+                width: 100%;
             }
 
             .results-toolbar {
@@ -1811,6 +2082,23 @@
             .results-toolbar select,
             .results-toolbar button {
                 width: 100%;
+            }
+
+            /* Put the caption above its control. Side by side, captions such
+               as "Rows per page" wrap onto two lines and leave the column
+               ragged. */
+            .results-toolbar label {
+                align-items: stretch;
+                flex-direction: column;
+                gap: 4px;
+            }
+
+            .results-toolbar .results-filter {
+                min-width: 0;
+            }
+
+            .result-pagination {
+                justify-content: center;
             }
 
             .result-table-wrap {
@@ -1834,6 +2122,40 @@
             .demo-filter button {
                 min-height: 40px;
                 padding: 8px 10px;
+            }
+        }
+
+        /* Touch input. The compact 28-30px controls above are comfortable with
+           a mouse but well under what a fingertip can hit reliably. */
+        @media (pointer: coarse) {
+            .results-toolbar input,
+            .results-toolbar select,
+            .results-toolbar button,
+            .results-actions button,
+            .result-pagination button,
+            .editor-toolbar button,
+            .empty-state-action,
+            .demo-filter button {
+                min-height: 44px;
+            }
+
+            .results-toolbar input,
+            .results-toolbar select {
+                padding: 10px 8px;
+            }
+
+            .results-toolbar button,
+            .results-actions button,
+            .result-pagination button {
+                padding: 10px 14px;
+            }
+
+            .table-item,
+            .virtual-table-item,
+            .example-query,
+            .history-item,
+            .utility-menu button {
+                min-height: 44px;
             }
         }
 
@@ -1897,19 +2219,28 @@
     </style>
 </head>
 <body class="landing-mode">
-    <a class="skip-link" href="#launchStudio">Skip to query studio</a>
+    <a class="skip-link landing-only" href="#launchStudio">Skip to query studio</a>
+    <a class="skip-link studio-only" href="#queryEditor">Skip to the SQL editor</a>
     <!-- Top Bar -->
     <div class="topbar">
         <a class="brand-link" href="#top" onclick="showLanding(); return false;">tinySQL <span class="topbar-tag">browser lab</span></a>
-        <button id="launchStudio" class="landing-launch" onclick="openStudio()">Open browser studio</button>
+        <button id="launchStudio" class="landing-launch landing-only" onclick="openStudio()">Open browser studio</button>
         <button class="studio-only" onclick="showUploadDialog()" aria-label="Upload a data file">Add data</button>
         <button class="topbar-secondary studio-only" onclick="loadShareableDemo('analytics')" aria-label="Load sample data">Try a sample</button>
+        <div class="workspace-control studio-only">
+            <label for="workspaceSelect">Workspace</label>
+            <select id="workspaceSelect" onchange="switchWorkspace(this.value)" aria-label="Select workspace" disabled>
+                <option>Loading workspaces…</option>
+            </select>
+            <button id="createWorkspaceButton" type="button" onclick="createWorkspacePrompt()" aria-label="Create workspace" title="Create workspace">+</button>
+        </div>
         <div class="spacer"></div>
         <div class="topbar-menu studio-only">
             <button id="toolsTrigger" class="tools-trigger" onclick="toggleUtilityMenu()" aria-label="Open utility menu" aria-expanded="false" aria-controls="utilityMenu">Tools</button>
             <div id="utilityMenu" class="utility-menu hidden" role="menu">
                 <button role="menuitem" onclick="importClipboardData(); closeUtilityMenu()">Paste from clipboard</button>
                 <button role="menuitem" onclick="toggleHistory(); closeUtilityMenu()">Query history</button>
+                <button role="menuitem" onclick="createWorkspacePrompt(); closeUtilityMenu()">New workspace</button>
                 <button role="menuitem" onclick="window.open('https://github.com/SimonWaldherr/tinySQL#sql-formatting', '_blank', 'noopener'); closeUtilityMenu()">Go API documentation</button>
                 <div class="utility-menu-separator" role="separator"></div>
                 <div class="utility-menu-shortcuts" role="group" aria-label="Keyboard shortcuts">
@@ -1925,8 +2256,71 @@
         <div class="status studio-only">
             <div class="status-indicator loading"></div>
             <span id="statusText" role="status" aria-live="polite" aria-atomic="true">Loading local engine…</span>
+            <button id="runtimeStatusButton" class="runtime-status-button" type="button" onclick="toggleRuntimePanel()" aria-expanded="false" aria-controls="runtimePanel" title="Open runtime monitoring">
+                <span id="runtimeActiveCompact">0 active</span>
+                <span class="runtime-compact-separator">·</span>
+                <span id="runtimeMemoryCompact">0 B</span>
+            </button>
         </div>
     </div>
+
+    <section id="runtimePanel" class="runtime-panel hidden" aria-hidden="true" aria-labelledby="runtimePanelTitle">
+        <div class="runtime-panel-header">
+            <h2 id="runtimePanelTitle">Runtime monitoring</h2>
+            <button type="button" onclick="toggleRuntimePanel(false)" aria-label="Close runtime monitoring">×</button>
+        </div>
+        <div class="runtime-metrics">
+            <div class="runtime-metric"><span>Engine</span><strong id="runtimeLoadValue">Idle</strong></div>
+            <div class="runtime-metric"><span>Active requests</span><strong id="runtimeActiveValue">0</strong></div>
+            <div class="runtime-metric"><span>Total requests</span><strong id="runtimeTotalValue">0</strong></div>
+            <div class="runtime-metric"><span>Failed</span><strong id="runtimeFailedValue">0</strong></div>
+            <div class="runtime-metric"><span>Throughput</span><strong id="runtimeThroughputValue">0/min</strong></div>
+            <div class="runtime-metric"><span>Peak concurrency</span><strong id="runtimePeakValue">0</strong></div>
+            <div class="runtime-metric"><span>Heap allocated</span><strong id="runtimeHeapValue">0 B</strong></div>
+            <div class="runtime-metric"><span>Heap reserved</span><strong id="runtimeHeapSystemValue">0 B</strong></div>
+            <div class="runtime-metric"><span>Tables</span><strong id="runtimeTablesValue">0</strong></div>
+            <div class="runtime-metric"><span>Rows</span><strong id="runtimeRowsValue">0</strong></div>
+            <div class="runtime-metric"><span>Query cache</span><strong id="runtimeCacheValue">0/0</strong></div>
+            <div class="runtime-metric"><span>Uptime</span><strong id="runtimeUptimeValue">0s</strong></div>
+            <div class="runtime-metric"><span>Average request</span><strong id="runtimeAverageValue">0 ms</strong></div>
+            <div class="runtime-metric"><span>Last request</span><strong id="runtimeLastValue">0 ms</strong></div>
+            <div class="runtime-metric"><span>Busy since start</span><strong id="runtimeBusyShareValue">0%</strong></div>
+            <div class="runtime-metric"><span>Observed users</span><strong id="runtimeDistinctUsersValue">0</strong></div>
+        </div>
+
+        <h3>Requests by operation</h3>
+        <table class="runtime-table">
+            <thead><tr><th>Operation</th><th>Active</th><th>Total</th><th>Failed</th><th>Timeout</th></tr></thead>
+            <tbody id="runtimeKindRows"><tr><td colspan="5">No requests yet</td></tr></tbody>
+        </table>
+
+        <h3>Users and sessions</h3>
+        <table class="runtime-table">
+            <thead><tr><th>User</th><th>Sessions</th><th>Active</th><th>Total</th><th>Failed</th></tr></thead>
+            <tbody id="runtimeUserRows"><tr><td colspan="5">No users observed</td></tr></tbody>
+        </table>
+
+        <div class="runtime-metrics" style="margin-top:12px">
+            <div class="runtime-metric"><span>User</span><strong id="runtimeUserValue">local-browser</strong></div>
+            <div class="runtime-metric"><span>Tenant</span><strong id="runtimeTenantValue">default</strong></div>
+            <div class="runtime-metric"><span>Session</span><strong id="runtimeSessionValue">—</strong></div>
+            <div class="runtime-metric"><span>Mode</span><strong>Local</strong></div>
+        </div>
+        <p class="runtime-note">This browser build has one local database instance per tab. User and session counters describe this instance; a future multi-user host can use the same status schema with authenticated identities. “Busy” is measured request activity, not an invented CPU percentage.</p>
+    </section>
+
+    <section id="workspacePanel" class="workspace-panel hidden" aria-hidden="true" aria-labelledby="workspacePanelTitle">
+        <div class="workspace-panel-header">
+            <h2 id="workspacePanelTitle">Local workspaces</h2>
+            <button type="button" onclick="closeWorkspacePanel()" aria-label="Close workspace manager">×</button>
+        </div>
+        <div class="workspace-create">
+            <input id="workspaceNameInput" type="text" maxlength="256" placeholder="New workspace name" aria-label="New workspace name">
+            <button id="workspaceCreateButton" type="button" onclick="createWorkspaceFromPanel()">Create</button>
+        </div>
+        <div id="workspaceList" class="workspace-list" aria-live="polite"></div>
+        <p class="workspace-note">Snapshots use versioned IndexedDB generations. The last three versions are retained for recovery; large binary snapshots use OPFS when the browser supports it, while IndexedDB keeps their metadata and recovery pointers. Clearing this site’s browser data removes every workspace.</p>
+    </section>
 
     <main id="landingPage" class="landing-page">
         <div class="landing-shell">
@@ -2080,6 +2474,18 @@
                 <div class="example-query" onclick="setQuery('-- Hubs within 450 km of Munich\nSELECT name, city,\n       ROUND(ST_DISTANCE(geometry, ST_MakePoint(11.5755, 48.1372)) / 1000, 1) AS km_from_munich\nFROM places_geo\nWHERE ST_DWITHIN(geometry, ST_MakePoint(11.5755, 48.1372), 450000)\nORDER BY km_from_munich')">
                     🎯 Munich Radius
                 </div>
+                <div class="example-query" data-requires="routes_rg" onclick="setQuery('-- New: prebuild the versioned route graph, then find the cheapest path\nSELECT * FROM ROUTE_WARM(\'routes_rg\', \'source\', \'target\', \'distance\', \'undirected\');\nSELECT seq, node_id, edge_id, leg_cost, total_cost\nFROM ROUTE_SHORTEST_PATH(\'routes_rg\', \'source\', \'target\', \'distance\', \'hamburg\', \'vienna\', \'undirected\')\nORDER BY seq')">
+                    ⚡ ROUTE_WARM &amp; Shortest Path
+                </div>
+                <div class="example-query" onclick="setQuery('-- New: WKT/WKB, geohash, reprojection, predicates, and perimeter\nSELECT ST_ASTEXT(ST_GEOMFROMTEXT(\'POINT(13.405 52.52)\')) AS wkt_round_trip,\n       ST_ASTEXT(ST_GEOMFROMWKB(ST_ASBINARY(ST_MAKEPOINT(13.405, 52.52)))) AS wkb_round_trip,\n       GEO_GEOHASH_ENCODE(ST_MAKEPOINT(13.405, 52.52), 8) AS geohash,\n       ST_TRANSFORM(ST_MAKEPOINT(13.405, 52.52), 3857) AS web_mercator,\n       ST_TOUCHES(\'{&quot;type&quot;:&quot;Polygon&quot;,&quot;coordinates&quot;:[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}\', \'{&quot;type&quot;:&quot;Polygon&quot;,&quot;coordinates&quot;:[[[1,0],[2,0],[2,1],[1,1],[1,0]]]}\') AS touches,\n       ST_PERIMETER(\'{&quot;type&quot;:&quot;Polygon&quot;,&quot;coordinates&quot;:[[[0,0],[0,1],[1,1],[1,0],[0,0]]]}\') AS perimeter_m')">
+                    🌐 OGC Geometry Interop
+                </div>
+                <div class="example-query" onclick="setQuery('-- New: inspect a WGS84 GeoPackageBinary value entirely in SQL\nSELECT GPKG_SRID(BLOB_FROM_HEX(\'47500001e6100000010100000000000000000027400000000000204840\')) AS srid,\n       GPKG_HEADER(BLOB_FROM_HEX(\'47500001e6100000010100000000000000000027400000000000204840\')) AS header,\n       ST_ASTEXT(GEO_FROM_GPKG(BLOB_FROM_HEX(\'47500001e6100000010100000000000000000027400000000000204840\'))) AS point')">
+                    📦 GeoPackageBinary
+                </div>
+                <div class="example-query" onclick="setQuery('-- New: normalize CRS identifiers, apply WMS 1.3 axis order, and address a generic OGC TileMatrix\nSELECT CRS_NORMALIZE(\'urn:ogc:def:crs:EPSG::25832\') AS canonical_crs,\n       CRS_AXIS_ORDER(\'EPSG:4326\') AS axis_order,\n       WMS_BBOX(11, 48, 12, 49, \'EPSG:4326\', \'1.3.0\') AS wms_130_bbox,\n       TILE_MATRIX_BBOX(100000, 500000, 10, 256, 256, 2, 3, \'topLeft\') AS tile_bbox,\n       TILE_MATRIX_POSITION(105121, 492319, 100000, 500000, 10, 256, 256, \'topLeft\') AS tile_position')">
+                    🧭 CRS, WMS &amp; TileMatrix
+                </div>
                 <div class="example-query" onclick="setQuery('-- New: GEO_DISSOLVE merges touching regions, GEO_CENTROID_AGG weights by population\nCREATE TABLE geo_region_demo (region TEXT, footprint GEOMETRY, population FLOAT);\nINSERT INTO geo_region_demo VALUES (\'north\', \'{&quot;type&quot;:&quot;Polygon&quot;,&quot;coordinates&quot;:[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}\', 100);\nINSERT INTO geo_region_demo VALUES (\'north\', \'{&quot;type&quot;:&quot;Polygon&quot;,&quot;coordinates&quot;:[[[1,0],[2,0],[2,1],[1,1],[1,0]]]}\', 300);\nINSERT INTO geo_region_demo VALUES (\'south\', \'{&quot;type&quot;:&quot;Polygon&quot;,&quot;coordinates&quot;:[[[10,10],[11,10],[11,11],[10,11],[10,10]]]}\', 50);\nSELECT region, GEO_DISSOLVE(footprint) AS boundary, GEO_CENTROID_AGG(footprint, population) AS weighted_centroid\nFROM geo_region_demo GROUP BY region ORDER BY region')">
                     🧩 GEO_DISSOLVE Regions
                 </div>
@@ -2122,6 +2528,12 @@
                 <div class="example-query" onclick="setQuery('-- New: RAG_SEARCH combines vector, text, and neighboring context\nSELECT doc_id, chunk_index, chunk_text, _hit_rank, _context_offset\nFROM RAG_SEARCH(\'rag_chunks\', \'embedding\', VEC_FROM_JSON(\'[0.8,0.6,0.1]\'), 2, \'{&quot;text_column&quot;:&quot;chunk_text&quot;,&quot;text_query&quot;:&quot;vector search RAG&quot;,&quot;key_columns&quot;:[&quot;doc_id&quot;,&quot;chunk_index&quot;],&quot;expand_before&quot;:1,&quot;expand_after&quot;:1,&quot;doc_id_column&quot;:&quot;doc_id&quot;,&quot;chunk_index_column&quot;:&quot;chunk_index&quot;}\')\nORDER BY _context_rank')">
                     🧠 RAG_SEARCH
                 </div>
+                <div class="example-query" data-requires="rag_chunks" onclick="setQuery('-- New: warm the exact vector + text paths used by serving queries\nSELECT * FROM RAG_WARM(\'rag_chunks\', \'chunk_text\', \'embedding\', \'cosine\', \'flat\')')">
+                    🔥 RAG_WARM
+                </div>
+                <div class="example-query" data-requires="rag_chunks" onclick="setQuery('-- New: tenant and Berlin-radius constraints apply before vector ranking\nSELECT chunk_id, doc_id, tenant_id, chunk_text, _vec_rank, _vec_distance\nFROM VEC_SEARCH_FILTERED(\n    \'rag_chunks\', \'embedding\', VEC_FROM_JSON(\'[0.8,0.6,0.1]\'), 5,\n    \'{&quot;pre_filter&quot;:{&quot;equals&quot;:{&quot;tenant_id&quot;:&quot;public&quot;},&quot;spatial&quot;:{&quot;geometry_column&quot;:&quot;geometry&quot;,&quot;center&quot;:[13.405,52.52],&quot;radius_meters&quot;:600000}}}\'\n)\nORDER BY _vec_rank')">
+                    🛡️ Filtered Spatial RAG
+                </div>
                 <div class="example-query" onclick="setQuery('-- New: literal multi-term search and ranking\nSELECT title, CONTAINS_SCORE(content, \'vector\', \'search\', \'retrieval\') AS matched_terms\nFROM ai_docs\nWHERE CONTAINS_ANY(content, \'vector\', \'retrieval\')\nORDER BY matched_terms DESC')">
                     🔎 CONTAINS Search
                 </div>
@@ -2159,6 +2571,9 @@
                     <button id="executeBtn" onclick="onExecuteClick()" disabled aria-label="Execute SQL query">
                         ▶ Execute
                     </button>
+                    <button id="cancelQueryBtn" class="btn-secondary btn-cancel" onclick="cancelActiveQuery()" hidden disabled aria-label="Cancel running SQL query">
+                        ■ Cancel
+                    </button>
                     <button class="btn-secondary" onclick="clearQuery()" aria-label="Clear query editor">Clear</button>
                     <button class="btn-secondary" onclick="formatQuery()" aria-label="Format SQL query">Format</button>
                     <button class="btn-secondary" onclick="copyQueryToClipboard()" aria-label="Copy SQL query">Copy SQL</button>
@@ -2189,8 +2604,8 @@ Example: SELECT * FROM my_table LIMIT 100;" aria-describedby="editorHelp" aria-e
                 <div id="vanillaGridSection" class="vanillagrid-section hidden">
                     <div class="vanillagrid-header">
                         <div class="vanillagrid-header-info">
-                            <h3>Pivot Grid</h3>
-                            <span class="vg-hint">Use the pivot toolbar to render d3 charts</span>
+                            <h3>Pivot &amp; Charts</h3>
+                            <span class="vg-hint">Pivot the current result page, then use the D3 chart controls in the toolbar</span>
                         </div>
                         <div class="vg-header-actions">
                             <button onclick="autoPivot()">Auto Pivot</button>
@@ -2202,8 +2617,6 @@ Example: SELECT * FROM my_table LIMIT 100;" aria-describedby="editorHelp" aria-e
             </div>
         </div>
     </div>
-    <!-- WASM Support -->
-    <script src="wasm_exec.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
     <script src="https://simonwaldherr.github.io/vanillagrid.js/vanillagrid.js"></script>
     <script src="https://simonwaldherr.github.io/vanillagrid.js/vg-pivot-d3.js"></script>
@@ -2381,6 +2794,8 @@ Example: SELECT * FROM my_table LIMIT 100;" aria-describedby="editorHelp" aria-e
             }
         };
     </script>
+    <script src="workspace-storage.js"></script>
+    <script src="wasm-client.js"></script>
     <script src="app.js"></script>
 </body>
 </html>
