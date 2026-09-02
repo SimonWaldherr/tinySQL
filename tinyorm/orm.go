@@ -70,6 +70,12 @@ func (db *DB) AutoMigrate(ctx context.Context, models ...any) error {
 			if f.unique {
 				col += " UNIQUE"
 			}
+			if f.notNull && !f.pk {
+				col += " NOT NULL"
+			}
+			if f.defaultSQL != "" {
+				col += " DEFAULT " + f.defaultSQL
+			}
 			parts = append(parts, col)
 		}
 		if len(parts) == 0 {
@@ -98,6 +104,42 @@ func (db *DB) Insert(ctx context.Context, model any) error {
 	sql := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", quoteIdent(meta.table), strings.Join(cols, ", "), strings.Join(vals, ", "))
 	_, err = db.execSQL(ctx, sql)
 	return err
+}
+
+// Create is an ORM-style alias for Insert.
+func (db *DB) Create(ctx context.Context, model any) error {
+	return db.Insert(ctx, model)
+}
+
+// Save updates every mapped, non-primary-key field using the model's primary
+// key. A primary key is required so Save never accidentally updates a table.
+func (db *DB) Save(ctx context.Context, model any) error {
+	meta, value, err := modelValue(model)
+	if err != nil {
+		return err
+	}
+	pk := meta.primaryField()
+	if pk == nil {
+		return fmt.Errorf("tinyorm: model %s has no primary key field", meta.typ.Name())
+	}
+	assignments := make([]string, 0, len(meta.fields)-1)
+	for _, f := range meta.fields {
+		if f.pk {
+			continue
+		}
+		assignments = append(assignments, quoteIdent(f.column)+" = "+sqlLiteral(fieldValue(value, f)))
+	}
+	if len(assignments) == 0 {
+		return fmt.Errorf("tinyorm: model %s has no fields to save", meta.typ.Name())
+	}
+	sql := fmt.Sprintf("UPDATE %s SET %s WHERE %s = %s", quoteIdent(meta.table), strings.Join(assignments, ", "), quoteIdent(pk.column), sqlLiteral(fieldValue(value, *pk)))
+	_, err = db.execSQL(ctx, sql)
+	return err
+}
+
+// Update is an ORM-style alias for Save.
+func (db *DB) Update(ctx context.Context, model any) error {
+	return db.Save(ctx, model)
 }
 
 // FindByPK loads one row by primary key into dest, which must be a pointer to a struct.
@@ -160,6 +202,28 @@ func (db *DB) Select(ctx context.Context, dest any, where string, params any) er
 	return nil
 }
 
+// First loads the first row matching where into dest. The where argument may
+// be empty or a SQL fragment without the WHERE keyword.
+func (db *DB) First(ctx context.Context, dest any, where string, params any) error {
+	meta, err := describeModel(dest)
+	if err != nil {
+		return err
+	}
+	sql := fmt.Sprintf("SELECT %s FROM %s", meta.selectList(), quoteIdent(meta.table))
+	if strings.TrimSpace(where) != "" {
+		sql += " WHERE " + where
+	}
+	sql += " LIMIT 1"
+	rs, err := db.Exec(ctx, sql, params)
+	if err != nil {
+		return err
+	}
+	if len(rs.Rows) == 0 {
+		return ErrNotFound
+	}
+	return scanStruct(dest, rs.Rows[0], meta)
+}
+
 // DeleteByPK deletes one row by primary key.
 func (db *DB) DeleteByPK(ctx context.Context, model any, pk any) error {
 	meta, err := describeModel(model)
@@ -209,6 +273,8 @@ type fieldMeta struct {
 	sqlType     string
 	pk          bool
 	unique      bool
+	notNull     bool
+	defaultSQL  string
 }
 
 // modelMetaCache keeps the reflection-derived, immutable mapping for each
@@ -263,22 +329,27 @@ func describeType(t reflect.Type) (modelMeta, error) {
 		if sf.PkgPath != "" {
 			continue
 		}
-		tag := sf.Tag.Get("db")
-		if tag == "-" {
+		name, opts := parseFieldTag(sf)
+		if opts.skip {
 			continue
 		}
-		name, opts := parseDBTag(tag)
 		if name == "" {
 			name = snakeCase(sf.Name)
+		}
+		sqlType := sqlTypeFor(sf.Type)
+		if opts.sqlType != "" {
+			sqlType = opts.sqlType
 		}
 		field := fieldMeta{
 			index:       i,
 			name:        sf.Name,
 			column:      name,
 			lowerColumn: strings.ToLower(name),
-			sqlType:     sqlTypeFor(sf.Type),
-			pk:          opts["pk"] || opts["primary"] || opts["primarykey"],
-			unique:      opts["unique"],
+			sqlType:     sqlType,
+			pk:          opts.primary,
+			unique:      opts.unique,
+			notNull:     opts.notNull,
+			defaultSQL:  opts.defaultSQL,
 		}
 		if field.pk && meta.primary == -1 {
 			meta.primary = len(meta.fields)
@@ -324,17 +395,168 @@ func tableNameFor(t reflect.Type) string {
 	return snakeCase(t.Name())
 }
 
-func parseDBTag(tag string) (string, map[string]bool) {
-	opts := make(map[string]bool)
+type tagOptions struct {
+	skip       bool
+	primary    bool
+	unique     bool
+	notNull    bool
+	sqlType    string
+	defaultSQL string
+}
+
+// parseFieldTag accepts the compact db tag used by tinyorm/sqlx and the common
+// GORM, Bun, go-pg, and XORM spellings. db takes precedence when more than one
+// tag is present.
+//
+// Examples:
+//
+//	ID    int    `db:"id,pk"`
+//	Email string `db:"email,unique,notnull"`
+//	State string `gorm:"column:state;not null;default:'active';type:VARCHAR(16)"`
+func parseFieldTag(sf reflect.StructField) (string, tagOptions) {
+	if tag, ok := sf.Tag.Lookup("db"); ok {
+		return parseDBTag(tag)
+	}
+	if tag, ok := sf.Tag.Lookup("tinyorm"); ok {
+		return parseDBTag(tag)
+	}
+	if tag, ok := sf.Tag.Lookup("gorm"); ok {
+		return parseGORMTag(tag)
+	}
+	if tag, ok := sf.Tag.Lookup("bun"); ok {
+		return parseDBTag(tag)
+	}
+	if tag, ok := sf.Tag.Lookup("pg"); ok {
+		return parseDBTag(tag)
+	}
+	if tag, ok := sf.Tag.Lookup("xorm"); ok {
+		return parseXORMTag(tag)
+	}
+	return "", tagOptions{}
+}
+
+func parseDBTag(tag string) (string, tagOptions) {
+	if strings.TrimSpace(tag) == "-" {
+		return "", tagOptions{skip: true}
+	}
 	parts := strings.Split(tag, ",")
 	name := strings.TrimSpace(parts[0])
+	var opts tagOptions
 	for _, part := range parts[1:] {
-		part = strings.ToLower(strings.TrimSpace(part))
-		if part != "" {
-			opts[part] = true
-		}
+		applyTagOption(&opts, part)
 	}
 	return name, opts
+}
+
+func parseGORMTag(tag string) (string, tagOptions) {
+	var name string
+	var opts tagOptions
+	for _, part := range strings.Split(tag, ";") {
+		part = strings.TrimSpace(part)
+		lower := strings.ToLower(part)
+		if strings.HasPrefix(lower, "column:") {
+			name = strings.TrimSpace(part[len("column:"):])
+			continue
+		}
+		applyTagOption(&opts, part)
+	}
+	return name, opts
+}
+
+// parseXORMTag handles XORM's space-separated modifiers and quoted column
+// name, such as xorm:"pk 'user_id' notnull". Unsupported XORM modifiers are
+// deliberately ignored; they do not change the table shape tinyorm owns.
+func parseXORMTag(tag string) (string, tagOptions) {
+	tokens := strings.Fields(tag)
+	var name string
+	var opts tagOptions
+	for i := 0; i < len(tokens); i++ {
+		token := tokens[i]
+		if len(token) >= 2 && ((token[0] == '\'' && token[len(token)-1] == '\'') || (token[0] == '"' && token[len(token)-1] == '"')) {
+			name = token[1 : len(token)-1]
+			continue
+		}
+		if strings.EqualFold(token, "default") && i+1 < len(tokens) {
+			i++
+			opts.defaultSQL = defaultTagSQL(tokens[i])
+			continue
+		}
+		if isXORMType(token) {
+			opts.sqlType = token
+			continue
+		}
+		applyTagOption(&opts, token)
+	}
+	return name, opts
+}
+
+func isXORMType(token string) bool {
+	lower := strings.ToLower(token)
+	for _, prefix := range []string{
+		"int", "integer", "bigint", "smallint", "tinyint", "float", "double",
+		"decimal", "numeric", "bool", "char", "varchar", "text", "blob",
+		"date", "time", "timestamp", "json",
+	} {
+		if lower == prefix || strings.HasPrefix(lower, prefix+"(") {
+			return true
+		}
+	}
+	return false
+}
+
+func applyTagOption(opts *tagOptions, option string) {
+	option = strings.TrimSpace(option)
+	lower := strings.ToLower(option)
+	switch lower {
+	case "pk", "primary", "primarykey", "primary_key":
+		opts.primary = true
+	case "unique", "uniqueindex":
+		opts.unique = true
+	case "notnull", "not_null", "not null":
+		opts.notNull = true
+	case "-":
+		opts.skip = true
+	default:
+		if key, value, ok := strings.Cut(option, "="); ok {
+			switch strings.ToLower(strings.TrimSpace(key)) {
+			case "type":
+				opts.sqlType = strings.TrimSpace(value)
+			case "default":
+				opts.defaultSQL = defaultTagSQL(value)
+			}
+			return
+		}
+		if key, value, ok := strings.Cut(option, ":"); ok {
+			switch strings.ToLower(strings.TrimSpace(key)) {
+			case "type":
+				opts.sqlType = strings.TrimSpace(value)
+			case "default":
+				opts.defaultSQL = defaultTagSQL(value)
+			}
+		}
+	}
+}
+
+// defaultTagSQL turns unquoted tag defaults into SQL literals. Quoted values,
+// numbers, booleans, and NULL are retained so model definitions can be read
+// naturally without hand-writing SQL for common cases.
+func defaultTagSQL(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "''"
+	}
+	lower := strings.ToLower(value)
+	if lower == "null" || lower == "true" || lower == "false" {
+		return lower
+	}
+	if _, err := strconv.ParseFloat(value, 64); err == nil {
+		return value
+	}
+	if (strings.HasPrefix(value, "'") && strings.HasSuffix(value, "'")) ||
+		(strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`)) {
+		return value
+	}
+	return sqlLiteral(value)
 }
 
 func sqlTypeFor(t reflect.Type) string {
@@ -664,7 +886,10 @@ func namedFieldsFor(t reflect.Type) []namedFieldMeta {
 		if sf.PkgPath != "" {
 			continue
 		}
-		name, _ := parseDBTag(sf.Tag.Get("db"))
+		name, opts := parseFieldTag(sf)
+		if opts.skip {
+			continue
+		}
 		if name == "" {
 			name = snakeCase(sf.Name)
 		}

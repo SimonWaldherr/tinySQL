@@ -22,6 +22,17 @@ type testUser struct {
 
 func (testUser) TableName() string { return "users" }
 
+// taggedUser intentionally uses GORM-style Go struct tags. tinyorm supports
+// these alongside its compact db tags so models can stay declarative.
+type taggedUser struct {
+	ID     int    `gorm:"column:id;primaryKey"`
+	Email  string `gorm:"column:email;unique;not null;type:VARCHAR(120)"`
+	State  string `gorm:"column:state;default:'active'"`
+	Hidden string `gorm:"-"`
+}
+
+func (taggedUser) TableName() string { return "tagged_users" }
+
 func TestAutoMigrateInsertFindSelectDelete(t *testing.T) {
 	ctx := context.Background()
 	orm := New(tinysql.NewDB(), "default")
@@ -155,5 +166,93 @@ func TestColumns(t *testing.T) {
 	want := "active,age,id,name,score"
 	if got != want {
 		t.Fatalf("columns = %s, want %s", got, want)
+	}
+}
+
+func TestGORMStyleTagsDefaultsAndSave(t *testing.T) {
+	ctx := context.Background()
+	orm := New(tinysql.NewDB(), "")
+	if err := orm.AutoMigrate(ctx, taggedUser{}); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
+	}
+
+	// Omit state deliberately: its default comes from the Go struct tag and
+	// is applied by the generated table schema.
+	if _, err := orm.Exec(ctx, "INSERT INTO tagged_users (id, email) VALUES (:id, :email)", map[string]any{
+		"id": 1, "email": "ada@example.test",
+	}); err != nil {
+		t.Fatalf("insert with default: %v", err)
+	}
+
+	var got taggedUser
+	if err := orm.First(ctx, &got, "email = :email", struct {
+		Email string `gorm:"column:email"`
+	}{Email: "ada@example.test"}); err != nil {
+		t.Fatalf("First: %v", err)
+	}
+	if got.State != "active" || got.Hidden != "" {
+		t.Fatalf("scanned tagged row = %#v", got)
+	}
+	got.State = "disabled"
+	if err := orm.Save(ctx, &got); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	var byPK taggedUser
+	if err := orm.FindByPK(ctx, &byPK, 1); err != nil {
+		t.Fatalf("FindByPK after Save: %v", err)
+	}
+	if byPK.State != "disabled" {
+		t.Fatalf("saved state = %q, want disabled", byPK.State)
+	}
+}
+
+func TestOtherORMTagStyles(t *testing.T) {
+	tests := []struct {
+		name  string
+		model any
+		want  fieldMeta
+	}{
+		{
+			name: "bun",
+			model: struct {
+				ID    int    `bun:"id,pk"`
+				State string `bun:"state,notnull,default:'queued'"`
+			}{},
+			want: fieldMeta{column: "state", notNull: true, defaultSQL: "'queued'", sqlType: "TEXT"},
+		},
+		{
+			name: "go-pg",
+			model: struct {
+				ID    int    `pg:"id,pk"`
+				Email string `pg:"email,unique"`
+			}{},
+			want: fieldMeta{column: "email", unique: true, sqlType: "TEXT"},
+		},
+		{
+			name: "xorm",
+			model: struct {
+				ID   int    `xorm:"pk 'user_id'"`
+				Name string `xorm:"varchar(120) notnull 'display_name'"`
+			}{},
+			want: fieldMeta{column: "display_name", notNull: true, sqlType: "varchar(120)"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			meta, err := describeModel(tt.model)
+			if err != nil {
+				t.Fatalf("describeModel: %v", err)
+			}
+			var got *fieldMeta
+			for i := range meta.fields {
+				if meta.fields[i].column == tt.want.column {
+					got = &meta.fields[i]
+					break
+				}
+			}
+			if got == nil || got.unique != tt.want.unique || got.notNull != tt.want.notNull || got.defaultSQL != tt.want.defaultSQL || got.sqlType != tt.want.sqlType {
+				t.Fatalf("mapped field = %#v, want %#v", got, tt.want)
+			}
+		})
 	}
 }
