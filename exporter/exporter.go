@@ -4,10 +4,7 @@ package exporter
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"io"
-	"strings"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
 	ie "github.com/SimonWaldherr/tinySQL/internal/exporter"
@@ -42,52 +39,7 @@ func ExportJSON(w io.Writer, rs *tinysql.ResultSet, opts Options) error {
 // identifier is quoted before parsing, so names from application input cannot
 // change the query structure.
 func ExportTableJSON(ctx context.Context, w io.Writer, db *tinysql.DB, tenant, tableName string, opts Options) error {
-	if db == nil {
-		return fmt.Errorf("exporter: nil DB")
-	}
-	if strings.TrimSpace(tableName) == "" {
-		return fmt.Errorf("exporter: empty table name")
-	}
-	sql := `SELECT * FROM "` + strings.ReplaceAll(tableName, `"`, `""`) + `"`
-	stmt, err := tinysql.ParseSQL(sql)
-	if err != nil {
-		return err
-	}
-	rs, err := tinysql.Execute(ctx, db, tenant, stmt)
-	if err != nil {
-		return err
-	}
-	if err := decodeTableJSONColumns(db, tenant, tableName, rs); err != nil {
-		return err
-	}
-	return ie.ExportJSON(w, rs, opts)
-}
-
-func decodeTableJSONColumns(db *tinysql.DB, tenant, tableName string, rs *tinysql.ResultSet) error {
-	table, err := db.Get(tenant, tableName)
-	if err != nil {
-		return err
-	}
-	for _, column := range table.Cols {
-		if column.Type != tinysql.JsonType {
-			continue
-		}
-		key := strings.ToLower(column.Name)
-		for _, row := range rs.Rows {
-			text, ok := row[key].(string)
-			if !ok {
-				continue
-			}
-			var decoded any
-			decoder := json.NewDecoder(strings.NewReader(text))
-			decoder.UseNumber()
-			if err := decoder.Decode(&decoded); err != nil {
-				return fmt.Errorf("exporter: decode JSON column %q: %w", column.Name, err)
-			}
-			row[key] = decoded
-		}
-	}
-	return nil
+	return tinysql.ExportTableJSON(ctx, w, db, tenant, tableName, opts)
 }
 
 // ExportNDJSON streams one JSON object per ResultSet row to w.
