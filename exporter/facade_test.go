@@ -109,3 +109,55 @@ func TestPublicExportTableManifest(t *testing.T) {
 		t.Fatalf("manifest = %#v", manifest)
 	}
 }
+
+func TestPublicExportTableJSON(t *testing.T) {
+	db := tinysql.NewDB()
+	ctx := context.Background()
+	for _, sql := range []string{
+		"CREATE TABLE exportable (id INT, name TEXT)",
+		"INSERT INTO exportable VALUES (1, 'Ada')",
+	} {
+		stmt, err := tinysql.ParseSQL(sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tinysql.Execute(ctx, db, "default", stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var out bytes.Buffer
+	if err := exporter.ExportTableJSON(ctx, &out, db, "default", "exportable", exporter.Options{}); err != nil {
+		t.Fatalf("ExportTableJSON: %v", err)
+	}
+	if !strings.Contains(out.String(), `"Ada"`) {
+		t.Fatalf("JSON = %s", out.String())
+	}
+}
+
+func TestPublicExportTableJSONRestoresJSON(t *testing.T) {
+	db := tinysql.NewDB()
+	ctx := context.Background()
+	for _, sql := range []string{
+		`CREATE TABLE payloads (meta JSON)`,
+		`INSERT INTO payloads VALUES ('{"enabled":true}')`,
+	} {
+		stmt, err := tinysql.ParseSQL(sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tinysql.Execute(ctx, db, "default", stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var out bytes.Buffer
+	if err := exporter.ExportTableJSON(ctx, &out, db, "default", "payloads", exporter.Options{}); err != nil {
+		t.Fatal(err)
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(out.Bytes(), &rows); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := rows[0]["meta"].(map[string]any); !ok {
+		t.Fatalf("meta = %#v, want object", rows[0]["meta"])
+	}
+}

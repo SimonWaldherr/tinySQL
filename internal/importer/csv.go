@@ -51,6 +51,10 @@ import (
 
 // ImportOptions configures the importer behavior. All fields are optional.
 type ImportOptions struct {
+	// PrimaryKey marks this imported column as the table's primary key when a
+	// new table is created. It is ignored when CreateTable is false.
+	PrimaryKey string
+
 	// MaxInputBytes rejects input that exceeds this size. Zero leaves the source
 	// unbounded, which preserves the historic library behavior. Set this for
 	// network and user-supplied input. For gzip CSV, the limit applies after

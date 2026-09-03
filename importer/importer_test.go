@@ -41,3 +41,31 @@ func TestMapImportWrappers(t *testing.T) {
 	var _ = ImportShapefileZip
 	var _ = ImportMBTilesReader
 }
+
+func TestImportJSONNestedValuesAndPrimaryKey(t *testing.T) {
+	ctx := context.Background()
+	db := tinysql.NewDB()
+	res, err := ImportJSON(ctx, db, "default", "events", strings.NewReader(`[
+		{"id": 1, "meta": {"source":"api"}, "tags": ["new","hot"]}
+	]`), &ImportOptions{CreateTable: true, PrimaryKey: "id"})
+	if err != nil {
+		t.Fatalf("ImportJSON: %v", err)
+	}
+	if res.RowsInserted != 1 || len(res.ColumnTypes) != 3 {
+		t.Fatalf("result = %#v", res)
+	}
+	for i, column := range res.ColumnNames {
+		if column == "meta" || column == "tags" {
+			if res.ColumnTypes[i] != tinysql.JsonType {
+				t.Fatalf("%s type = %v, want JSON", column, res.ColumnTypes[i])
+			}
+		}
+	}
+	stmt, err := tinysql.ParseSQL(`INSERT INTO events (id) VALUES (1)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tinysql.Execute(ctx, db, "default", stmt); err == nil {
+		t.Fatal("duplicate primary key insert succeeded")
+	}
+}

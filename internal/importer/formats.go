@@ -401,12 +401,33 @@ func buildJSONSampleData(records []map[string]any, colNames []string) [][]string
 		row := make([]string, len(colNames))
 		for i, col := range colNames {
 			if val, ok := rec[col]; ok && val != nil {
-				row[i] = fmt.Sprintf("%v", val)
+				row[i] = jsonImportValue(val)
 			}
 		}
 		sampleData = append(sampleData, row)
 	}
 	return sampleData
+}
+
+func jsonImportValue(val any) string {
+	switch val.(type) {
+	case map[string]any, []any:
+		body, err := json.Marshal(val)
+		if err == nil {
+			return string(body)
+		}
+	}
+	return fmt.Sprintf("%v", val)
+}
+
+func jsonCompositeColumn(records []map[string]any, column string) bool {
+	for _, record := range records {
+		switch record[column].(type) {
+		case map[string]any, []any:
+			return true
+		}
+	}
+	return false
 }
 
 // ImportJSON imports JSON records from src into tableName for tenant.
@@ -466,6 +487,11 @@ func ImportJSON(
 
 	// Infer types
 	colTypes := inferOrDefaultColumnTypes(sampleData, len(colNames), opts)
+	for i, col := range colNames {
+		if jsonCompositeColumn(sampleRecords, col) {
+			colTypes[i] = storage.JsonType
+		}
+	}
 	result.ColumnTypes = colTypes
 
 	// Convert and insert in bounded batches. This shares the fast append path
@@ -495,7 +521,7 @@ func ImportJSON(
 		valid := true
 		for j, col := range colNames {
 			if val, ok := rec[col]; ok {
-				converted, err := convertValue(fmt.Sprintf("%v", val), colTypes[j],
+				converted, err := convertValue(jsonImportValue(val), colTypes[j],
 					opts.DateTimeFormats, opts.NullLiterals)
 				if err != nil && opts.StrictTypes {
 					result.Errors = append(result.Errors,
@@ -503,6 +529,15 @@ func ImportJSON(
 					result.RowsSkipped++
 					valid = false
 					break
+				}
+				// SQL integer literals are represented as int by the engine, while
+				// the generic importer uses int64. Keep an imported integer primary
+				// key in the engine's native representation so later SQL writes
+				// compare it as the same key.
+				if strings.EqualFold(col, opts.PrimaryKey) {
+					if n, ok := converted.(int64); ok && int64(int(n)) == n {
+						converted = int(n)
+					}
 				}
 				row[j] = converted
 			}

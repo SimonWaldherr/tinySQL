@@ -5,6 +5,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -15,13 +16,25 @@ import (
 
 // createTable creates a new table in the database with the specified columns and types.
 func createTable(ctx context.Context, db *storage.DB, tenant, tableName string, colNames []string, colTypes []storage.ColType) error {
+	return createTableWithPrimaryKey(ctx, db, tenant, tableName, colNames, colTypes, "")
+}
+
+func createTableWithPrimaryKey(ctx context.Context, db *storage.DB, tenant, tableName string, colNames []string, colTypes []storage.ColType, primaryKey string) error {
 	// Build table structure
 	cols := make([]storage.Column, len(colNames))
+	foundPrimaryKey := primaryKey == ""
 	for i, name := range colNames {
 		cols[i] = storage.Column{
 			Name: name,
 			Type: colTypes[i],
 		}
+		if strings.EqualFold(name, primaryKey) {
+			cols[i].Constraint = storage.PrimaryKey
+			foundPrimaryKey = true
+		}
+	}
+	if !foundPrimaryKey {
+		return fmt.Errorf("primary key column %q is not present in import", primaryKey)
 	}
 
 	// Build through storage.NewTable rather than a struct literal: it populates

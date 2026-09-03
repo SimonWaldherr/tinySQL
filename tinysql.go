@@ -73,6 +73,7 @@ import (
 	"strings"
 
 	"github.com/SimonWaldherr/tinySQL/internal/engine"
+	internalexporter "github.com/SimonWaldherr/tinySQL/internal/exporter"
 	"github.com/SimonWaldherr/tinySQL/internal/importer"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 	"github.com/SimonWaldherr/tinySQL/standards"
@@ -1308,6 +1309,66 @@ type ImportOptions = importer.ImportOptions
 // ImportResult re-exports importer.ImportResult for convenience.
 // Contains metadata about the import operation.
 type ImportResult = importer.ImportResult
+
+// ExportOptions configures JSON table export.
+type ExportOptions = internalexporter.Options
+
+// ExportTableJSON writes all rows from tableName as a JSON array. The table
+// name is quoted before parsing and never concatenated as executable SQL.
+func ExportTableJSON(ctx context.Context, w io.Writer, db *DB, tenant, tableName string, opts ExportOptions) error {
+	if db == nil {
+		return fmt.Errorf("tinysql: nil DB")
+	}
+	if strings.TrimSpace(tableName) == "" {
+		return fmt.Errorf("tinysql: empty table name")
+	}
+	stmt, err := ParseSQL(`SELECT * FROM "` + strings.ReplaceAll(tableName, `"`, `""`) + `"`)
+	if err != nil {
+		return err
+	}
+	rs, err := Execute(ctx, db, tenant, stmt)
+	if err != nil {
+		return err
+	}
+	if err := decodeJSONTableColumns(db, tenant, tableName, rs); err != nil {
+		return err
+	}
+	return internalexporter.ExportJSON(w, rs, opts)
+}
+
+// decodeJSONTableColumns restores imported JSON text to native JSON values for
+// the table-export API. Query-level ExportJSON remains representation-neutral.
+func decodeJSONTableColumns(db *DB, tenant, tableName string, rs *ResultSet) error {
+	table, err := db.Get(tenant, tableName)
+	if err != nil {
+		return err
+	}
+	for _, column := range table.Cols {
+		if column.Type != storage.JsonType {
+			continue
+		}
+		key := strings.ToLower(column.Name)
+		for _, row := range rs.Rows {
+			var source []byte
+			switch value := row[key].(type) {
+			case string:
+				source = []byte(value)
+			case []byte:
+				source = value
+			default:
+				continue
+			}
+			var decoded any
+			decoder := json.NewDecoder(strings.NewReader(string(source)))
+			decoder.UseNumber()
+			if err := decoder.Decode(&decoded); err != nil {
+				return fmt.Errorf("tinysql: decode JSON column %q: %w", column.Name, err)
+			}
+			row[key] = decoded
+		}
+	}
+	return nil
+}
 
 // GeoPackageInfo describes an OGC GeoPackage and its vector feature layers.
 type GeoPackageInfo = importer.GeoPackageInfo

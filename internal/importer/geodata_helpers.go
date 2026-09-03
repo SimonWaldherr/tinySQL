@@ -49,7 +49,7 @@ func insertTypedRows(
 	// destination is a ModePagedIndex table larger than memory (Get then
 	// costs a real disk scan).
 	if opts.CreateTable {
-		if err := createTable(ctx, db, tenant, tableName, colNames, colTypes); err != nil {
+		if err := createTableWithPrimaryKey(ctx, db, tenant, tableName, colNames, colTypes, opts.PrimaryKey); err != nil {
 			return err
 		}
 	}

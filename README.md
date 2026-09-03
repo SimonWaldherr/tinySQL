@@ -745,6 +745,18 @@ memory. Tune `ImportOptions.BatchSize` for the destination: larger batches
 favor bulk throughput, while smaller batches reduce peak memory and
 cancellation latency.
 
+For JSON APIs, `ImportJSON` accepts both JSON arrays and NDJSON. It infers
+primitive columns, preserves nested objects and arrays as `JSON` columns, and
+can declare an imported identifier as the table primary key:
+
+```go
+result, err := tinysql.ImportJSON(ctx, db, "default", "events", input,
+	&tinysql.ImportOptions{CreateTable: true, PrimaryKey: "id"})
+```
+
+Use `tinysql.ExportTableJSON(ctx, w, db, "default", "events", opts)` to
+write a complete table as a JSON array without manually issuing `SELECT *`.
+
 `ExportGeoJSON`/`ExportTopoJSON` turn a query result's geometry column (named
 explicitly, or auto-detected when exactly one candidate exists) plus every
 other selected column into a GeoJSON `FeatureCollection` or TopoJSON
