@@ -558,7 +558,7 @@ func buildRawFilterRegexp(colIndex map[string]int, ex *RegexpExpr) func([]any) (
 		return nil
 	}
 	pat, isLit := ex.Pattern.(*Literal)
-	if !isLit {
+	if !isLit || pat.Parameter {
 		return nil
 	}
 	pattern, isStr := pat.Val.(string)
@@ -596,12 +596,50 @@ func buildRawFilterRegexp(colIndex map[string]int, ex *RegexpExpr) func([]any) (
 // evalFuncCall-based path) for any function it doesn't recognize.
 func buildRawFilterFuncCall(colIndex map[string]int, ex *FuncCall) func([]any) (bool, error) {
 	switch ex.Name {
+	case "REGEXP_MATCH":
+		return buildRawFilterRegexpMatch(colIndex, ex)
 	case "CONTAINS_ALL", "CONTAINS_ANY":
 		return buildRawFilterContains(colIndex, ex)
 	case "FTS_MATCH":
 		return buildRawFilterFTSMatch(colIndex, ex)
 	}
 	return nil
+}
+
+// buildRawFilterRegexpMatch binds constant patterns once per filter instead
+// of dispatching the function and looking up the pattern for every row.
+// Parameters and invalid patterns retain generic evaluation, including its
+// lazy error behavior for NULL inputs.
+func buildRawFilterRegexpMatch(colIndex map[string]int, ex *FuncCall) func([]any) (bool, error) {
+	if len(ex.Args) != 2 {
+		return nil
+	}
+	ref, ok := ex.Args[0].(*VarRef)
+	if !ok {
+		return nil
+	}
+	col, ok := colIndex[strings.ToLower(ref.Name)]
+	if !ok {
+		return nil
+	}
+	literal, ok := ex.Args[1].(*Literal)
+	if !ok || literal.Parameter {
+		return nil
+	}
+	pattern, ok := literal.Val.(string)
+	if !ok {
+		return nil
+	}
+	re, err := compileCachedRegexp(pattern)
+	if err != nil {
+		return nil
+	}
+	return func(raw []any) (bool, error) {
+		if raw[col] == nil {
+			return false, nil
+		}
+		return re.MatchString(valueText(raw[col])), nil
+	}
 }
 
 // buildRawFilterFTSMatch specializes the overwhelmingly common simple search
