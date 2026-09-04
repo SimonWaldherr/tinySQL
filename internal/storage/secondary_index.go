@@ -150,11 +150,14 @@ func (t *Table) CreateSecondaryIndex(name string, columns []string, unique bool)
 			return err
 		}
 	}
-	t.Indexes[key] = &SecondaryIndex{Name: name, Columns: append([]string(nil), columns...), Unique: unique}
-	if err := t.RebuildSecondaryIndexes(); err != nil {
-		delete(t.Indexes, key)
+	idx := &SecondaryIndex{Name: name, Columns: append([]string(nil), columns...), Unique: unique}
+	fast, err := t.buildSecondaryIndex(idx)
+	if err != nil {
 		return err
 	}
+	idx.fast = fast
+	// Publish only the successfully built index; existing indexes are untouched.
+	t.Indexes[key] = idx
 	return nil
 }
 
@@ -203,19 +206,9 @@ func (t *Table) CheckSecondaryIndexConstraints(row []any, skipRow int) error {
 // index is actually persisted.
 func (t *Table) RebuildSecondaryIndexes() error {
 	for _, idx := range t.Indexes {
-		fast := NewSkipList()
-		for rowID, row := range t.Rows {
-			var scratch [128]byte
-			key, err := t.indexKeyInto(scratch[:0], idx.Columns, row)
-			if err != nil {
-				return fmt.Errorf("index %q row %d: %w", idx.Name, rowID, err)
-			}
-			if idx.Unique {
-				if _, found := fast.Get(key); found {
-					return fmt.Errorf("unique index %q: duplicate key", idx.Name)
-				}
-			}
-			fast.Insert(key, rowID)
+		fast, err := t.buildSecondaryIndex(idx)
+		if err != nil {
+			return err
 		}
 		idx.mu.Lock()
 		idx.fast = fast
@@ -662,4 +655,37 @@ func materializeSecondaryIndexesForEncode(in map[string]*SecondaryIndex) map[str
 		out[key] = &SecondaryIndex{Name: idx.Name, Columns: append([]string(nil), idx.Columns...), Unique: idx.Unique, Entries: entries}
 	}
 	return out
+}
+
+// Resolve column positions once for a bulk build rather than once per row.
+func (t *Table) buildSecondaryIndex(idx *SecondaryIndex) (*SkipList, error) {
+	positions := make([]int, len(idx.Columns))
+	for i, column := range idx.Columns {
+		pos, err := t.ColIndex(column)
+		if err != nil {
+			return nil, fmt.Errorf("index %q: %w", idx.Name, err)
+		}
+		positions[i] = pos
+	}
+	fast := NewSkipList()
+	for rowID, row := range t.Rows {
+		if len(row) < len(positions) {
+			return nil, fmt.Errorf("index %q row %d: row has %d values for %d index columns", idx.Name, rowID, len(row), len(positions))
+		}
+		var scratch [128]byte
+		key := scratch[:0]
+		for i, pos := range positions {
+			if pos >= len(row) {
+				return nil, fmt.Errorf("index %q row %d: row lacks indexed column %q", idx.Name, rowID, idx.Columns[i])
+			}
+			key = appendCanonicalIndexValue(key, row[pos])
+		}
+		if idx.Unique {
+			if _, found := fast.Get(key); found {
+				return nil, fmt.Errorf("unique index %q: duplicate key", idx.Name)
+			}
+		}
+		fast.Insert(key, rowID)
+	}
+	return fast, nil
 }

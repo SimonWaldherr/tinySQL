@@ -103,6 +103,9 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 	if err != nil {
 		return nil, err
 	}
+	// Trigger bindings are consumed synchronously. RETURNING needs separate
+	// owned maps, while trigger-only rows can reuse one statement-local map.
+	var triggerRow Row
 	inserted := 0
 	for _, vals := range rows {
 		if len(vals) != expected {
@@ -139,7 +142,15 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 		}
 		var newRow Row
 		if needsRow {
-			newRow = buildTableRow(keys, row)
+			if len(s.Returning) > 0 {
+				newRow = buildTableRow(keys, row)
+			} else {
+				if triggerRow == nil {
+					triggerRow = make(Row, len(keys.key)*2)
+				}
+				fillTableRow(triggerRow, keys, row)
+				newRow = triggerRow
+			}
 		}
 		if hasBefore {
 			if err := beforeRunner.fire(env, newRow, nil); err != nil {
@@ -231,6 +242,9 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	if err != nil {
 		return nil, err
 	}
+	// Trigger bindings are consumed synchronously. RETURNING needs separate
+	// owned maps, while trigger-only rows can reuse one statement-local map.
+	var triggerRow Row
 	inserted := 0
 	for _, vals := range rows {
 		if len(vals) != len(s.Cols) {
@@ -272,7 +286,15 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 		}
 		var newRow Row
 		if needsRow {
-			newRow = buildTableRow(keys, row)
+			if len(s.Returning) > 0 {
+				newRow = buildTableRow(keys, row)
+			} else {
+				if triggerRow == nil {
+					triggerRow = make(Row, len(keys.key)*2)
+				}
+				fillTableRow(triggerRow, keys, row)
+				newRow = triggerRow
+			}
 		}
 		if hasBefore {
 			if err := beforeRunner.fire(env, newRow, nil); err != nil {

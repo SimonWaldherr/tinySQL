@@ -340,12 +340,18 @@ func newTableRowKeys(cols []storage.Column, tablePrefix string) tableRowKeys {
 
 func buildTableRow(keys tableRowKeys, values []any) Row {
 	row := make(Row, len(keys.key)*2)
+	fillTableRow(row, keys, values)
+	return row
+}
+
+// fillTableRow writes the complete fixed-schema binding. Callers may reuse it
+// only when no result row is retained after synchronous trigger execution.
+func fillTableRow(row Row, keys tableRowKeys, values []any) {
 	for i, key := range keys.key {
 		val := values[i]
 		row[key] = val
 		row[keys.prefix[i]] = val
 	}
-	return row
 }
 
 func markDependentMaterializedViewsStale(env ExecEnv, tableName string) {
