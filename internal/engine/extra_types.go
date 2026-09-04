@@ -107,15 +107,99 @@ func evalURLParse(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("URL_PARSE: %w", err)
 	}
-	obj := map[string]any{
-		"scheme":   u.Scheme,
-		"host":     u.Host,
-		"path":     u.Path,
-		"query":    u.RawQuery,
-		"fragment": u.Fragment,
+	// A fixed struct avoids a map allocation and keeps the JSON representation
+	// deterministic. Field order remains the historical encoding/json map-key
+	// order for callers that fingerprint the returned text.
+	obj := struct {
+		Fragment string `json:"fragment"`
+		Host     string `json:"host"`
+		Path     string `json:"path"`
+		Query    string `json:"query"`
+		Scheme   string `json:"scheme"`
+	}{
+		Fragment: u.Fragment,
+		Host:     u.Host,
+		Path:     u.Path,
+		Query:    u.RawQuery,
+		Scheme:   u.Scheme,
 	}
 	b, _ := json.Marshal(obj)
 	return string(b), nil
+}
+
+// evalURLQueryGet returns the first decoded query value for key.
+func evalURLQueryGet(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) != 2 {
+		return nil, fmt.Errorf("URL_QUERY_GET expects 2 arguments: (url, key)")
+	}
+	raw, err := evalExpr(env, ex.Args[0], row)
+	if err != nil || raw == nil {
+		return nil, err
+	}
+	key, err := evalExpr(env, ex.Args[1], row)
+	if err != nil || key == nil {
+		return nil, err
+	}
+	u, err := url.Parse(valueText(raw))
+	if err != nil {
+		return nil, fmt.Errorf("URL_QUERY_GET: %w", err)
+	}
+	values, ok := u.Query()[valueText(key)]
+	if !ok || len(values) == 0 {
+		return nil, nil
+	}
+	return values[0], nil
+}
+
+// evalURLResolve resolves a relative reference against an absolute or relative
+// base URL using RFC 3986 semantics implemented by net/url.
+func evalURLResolve(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) != 2 {
+		return nil, fmt.Errorf("URL_RESOLVE expects 2 arguments: (base, reference)")
+	}
+	baseValue, err := evalExpr(env, ex.Args[0], row)
+	if err != nil || baseValue == nil {
+		return nil, err
+	}
+	referenceValue, err := evalExpr(env, ex.Args[1], row)
+	if err != nil || referenceValue == nil {
+		return nil, err
+	}
+	base, err := url.Parse(valueText(baseValue))
+	if err != nil {
+		return nil, fmt.Errorf("URL_RESOLVE base: %w", err)
+	}
+	reference, err := url.Parse(valueText(referenceValue))
+	if err != nil {
+		return nil, fmt.Errorf("URL_RESOLVE reference: %w", err)
+	}
+	return base.ResolveReference(reference).String(), nil
+}
+
+func evalURLPathEncode(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) != 1 {
+		return nil, fmt.Errorf("URL_PATH_ENCODE expects 1 argument")
+	}
+	value, err := evalExpr(env, ex.Args[0], row)
+	if err != nil || value == nil {
+		return nil, err
+	}
+	return url.PathEscape(valueText(value)), nil
+}
+
+func evalURLPathDecode(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) != 1 {
+		return nil, fmt.Errorf("URL_PATH_DECODE expects 1 argument")
+	}
+	value, err := evalExpr(env, ex.Args[0], row)
+	if err != nil || value == nil {
+		return nil, err
+	}
+	decoded, err := url.PathUnescape(valueText(value))
+	if err != nil {
+		return nil, fmt.Errorf("URL_PATH_DECODE: %w", err)
+	}
+	return decoded, nil
 }
 
 // evalURLEncode percent-encodes a string using standard URL query encoding.
@@ -691,7 +775,7 @@ func evalBlobEqual(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 
 // ─────────────────────────── Registration ────────────────────────────────────
 
-// getExtraTypeFunctions returns the function map for YAML/URL/HASH/BITMAP/BLOB helpers.
+// getExtraTypeFunctions returns YAML, URL, HTML, hash, bitmap, and BLOB helpers.
 func getExtraTypeFunctions() map[string]funcHandler {
 	return map[string]funcHandler{
 		"YAML_PARSE":       evalYAMLParse,
@@ -699,6 +783,12 @@ func getExtraTypeFunctions() map[string]funcHandler {
 		"URL_PARSE":        evalURLParse,
 		"URL_ENCODE":       evalURLEncode,
 		"URL_DECODE":       evalURLDecode,
+		"URL_QUERY_GET":    evalURLQueryGet,
+		"URL_RESOLVE":      evalURLResolve,
+		"URL_PATH_ENCODE":  evalURLPathEncode,
+		"URL_PATH_DECODE":  evalURLPathDecode,
+		"HTML_ESCAPE":      evalHTMLEscape,
+		"HTML_TEMPLATE":    evalHTMLTemplate,
 		"HASH":             evalHashFunc,
 		"BITMAP_NEW":       evalBitmapNew,
 		"BITMAP_SET":       evalBitmapSet,

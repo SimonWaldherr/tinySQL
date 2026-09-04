@@ -21,6 +21,7 @@ database server.
 
 - [Quick start](#quick-start)
 - [What it can do](#what-it-can-do)
+- [Web, URL, and HTML helpers](#web-url-and-html-helpers)
 - [Using SQL from Go](#using-sql-from-go)
 - [GIS and GeoJSON](#gis-and-geojson)
 - [Routing graphs and shortest paths](#routing-graphs-and-shortest-paths)
@@ -179,6 +180,28 @@ roll back when its handler returns an error. `sys.procedures` exposes argument
 metadata, `read_only`, `atomic`, call/error counts and average runtime. The
 native examples are in [`cmd/procedure_demo`](./cmd/procedure_demo); the WASM
 playground registers the same reusable demo set.
+
+### Web, URL, and HTML helpers
+
+Web-oriented SQL can parse and resolve URLs, read query parameters, encode
+query values or path segments, escape HTML, and render contextual-safe Go
+templates from JSON data:
+
+```sql
+SELECT URL_QUERY_GET('https://example.org/search?q=geo+data', 'q');
+SELECT URL_RESOLVE('https://example.org/a/b/', '../tiles/12/2200/1400.pbf');
+SELECT URL_PATH_ENCODE('tiles/Altstadt Nord');
+SELECT HTML_ESCAPE('<strong>untrusted</strong>');
+SELECT HTML_TEMPLATE('<a href="{{.url}}">{{.label}}</a>',
+                     '{"url":"/map","label":"Map & data"}');
+```
+
+`URL_PARSE` returns the URL components as JSON. `URL_ENCODE`/`URL_DECODE`
+operate on query values, while `URL_PATH_ENCODE`/`URL_PATH_DECODE` operate on
+one path segment. `HTML_TEMPLATE` caches up to 128 compiled templates and uses
+`html/template` contextual escaping. `HTTP(url)` reuses pooled HTTP
+connections, follows query cancellation and limits a successful response to
+8 MiB.
 
 ### Data and maps
 

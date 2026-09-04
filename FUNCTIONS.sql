@@ -806,6 +806,20 @@ SELECT n, a AS fib_value FROM fib ORDER BY n;
 -- ============================================================
 -- IO AND TRANSFORM FUNCTIONS (safe runnable examples enabled)
 
+-- URL helpers: parse components, query values, references, and path segments
+SELECT URL_PARSE('https://example.org/a%20b?q=geo+data#result') as url_components;
+SELECT URL_QUERY_GET('https://example.org/search?q=geo+data', 'q') as query_value;
+SELECT URL_RESOLVE('https://example.org/a/b/', '../tiles/12/2200/1400.pbf') as resolved_url;
+SELECT URL_ENCODE('key=value & more') as encoded_query_value;
+SELECT URL_DECODE('key%3Dvalue+%26+more') as decoded_query_value;
+SELECT URL_PATH_ENCODE('tiles/Altstadt Nord') as encoded_path_segment;
+SELECT URL_PATH_DECODE('tiles%2FAltstadt%20Nord') as decoded_path_segment;
+
+-- Context-aware HTML rendering with JSON template data
+SELECT HTML_ESCAPE('<strong>untrusted</strong>') as escaped_html;
+SELECT HTML_TEMPLATE('<a href="{{.url}}">{{.label}}</a>',
+                     '{"url":"/map","label":"Map & data"}') as rendered_html;
+
 -- GZIP/GUNZIP: Compression functions (safe examples)
 SELECT LENGTH(GZIP('tinySQL gzip test string')) as gzip_compressed_length;
 SELECT GUNZIP(GZIP('roundtrip test')) as gunzip_roundtrip;
@@ -816,7 +830,7 @@ SELECT BASE64_DECODE(BASE64_ENCODE('hello world')) as base64_decoded_roundtrip;
 
 SELECT FILE('./data/data.json') as file_content;
 
--- HTTP: Fetch HTTP GET response (30 second timeout)
+-- HTTP: Fetch an HTTP GET response (30 second timeout, 8 MiB response limit)
 SELECT HTTP('https://jsonplaceholder.typicode.com/todos/1') as http_response;
 
 -- Combined example: Read and decompress a gzipped file

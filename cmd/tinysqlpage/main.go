@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/text/cases"
@@ -92,12 +93,22 @@ func main() {
 // `component` column into HTML components which are rendered into the
 // template.
 type pageHandler struct {
-	db       *tsql.DB
-	tenant   string
-	pagesDir string
-	timeout  time.Duration
-	css      string
-	tpl      string
+	db               *tsql.DB
+	tenant           string
+	pagesDir         string
+	timeout          time.Duration
+	css              string
+	tpl              string
+	templateOnce     sync.Once
+	compiledTemplate *template.Template
+	templateErr      error
+}
+
+type pageData struct {
+	Title  string
+	Styles template.CSS
+	Nav    template.HTML
+	Body   template.HTML
 }
 
 func (h *pageHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -472,30 +483,13 @@ func (h *pageHandler) renderShell(title string, comps []component, currentPage s
 
 	navHTML := h.buildNavHTML(currentPage)
 
-	// Prepare template text. Support legacy {{TITLE}} placeholders by mapping
-	tplText := h.tpl
-	if tplText == "" {
-		tplText = defaultTemplate
-	} else {
-		// Convert legacy uppercase placeholders to Go template fields
-		tplText = strings.ReplaceAll(tplText, "{{TITLE}}", "{{.Title}}")
-		tplText = strings.ReplaceAll(tplText, "{{STYLES}}", "{{.Styles}}")
-		tplText = strings.ReplaceAll(tplText, "{{NAV}}", "{{.Nav}}")
-		tplText = strings.ReplaceAll(tplText, "{{BODY}}", "{{.Body}}")
-	}
-
-	// Execute html/template with structured PageData
-	type PageData struct {
-		Title  string
-		Styles template.CSS
-		Nav    template.HTML
-		Body   template.HTML
-	}
-
-	tmpl, err := template.New("page").Parse(tplText)
+	// The handler configuration is immutable after startup. Parse and normalize
+	// its shell once, then execute the concurrency-safe compiled template for
+	// every request.
+	tmpl, err := h.shellTemplate()
 	if err == nil {
 		var buf bytes.Buffer
-		data := PageData{
+		data := pageData{
 			Title:  title,
 			Styles: template.CSS(styles),
 			Nav:    template.HTML(navHTML),
@@ -524,6 +518,24 @@ func (h *pageHandler) renderShell(title string, comps []component, currentPage s
 <main class="container">%s</main>
 </body>
 </html>`, html.EscapeString(title), styles, navHTML, body.String())
+}
+
+func (h *pageHandler) shellTemplate() (*template.Template, error) {
+	h.templateOnce.Do(func() {
+		tplText := h.tpl
+		if tplText == "" {
+			tplText = defaultTemplate
+		} else {
+			tplText = strings.NewReplacer(
+				"{{TITLE}}", "{{.Title}}",
+				"{{STYLES}}", "{{.Styles}}",
+				"{{NAV}}", "{{.Nav}}",
+				"{{BODY}}", "{{.Body}}",
+			).Replace(tplText)
+		}
+		h.compiledTemplate, h.templateErr = template.New("page").Parse(tplText)
+	})
+	return h.compiledTemplate, h.templateErr
 }
 
 // buildNavHTML constructs a small HTML fragment with links for every

@@ -53,3 +53,18 @@ func TestBuildNavHTML(t *testing.T) {
 		t.Fatalf("hidden page leaked into nav: %s", nav)
 	}
 }
+
+func TestShellTemplateIsCompiledOnce(t *testing.T) {
+	h := &pageHandler{tpl: `<html><title>{{TITLE}}</title><body>{{BODY}}</body></html>`}
+	first, err := h.shellTemplate()
+	if err != nil {
+		t.Fatalf("shellTemplate: %v", err)
+	}
+	second, err := h.shellTemplate()
+	if err != nil {
+		t.Fatalf("second shellTemplate: %v", err)
+	}
+	if first != second {
+		t.Fatal("shell template was parsed more than once")
+	}
+}

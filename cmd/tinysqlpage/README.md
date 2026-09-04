@@ -43,6 +43,8 @@ go build -o tinysqlpage ./cmd/tinysqlpage
 
 Each request uses the caller's context and the configured timeout, so a
 cancelled client connection or a slow query does not keep rendering work alive.
+The page shell is parsed once on first use and the compiled, concurrency-safe
+template is reused for subsequent requests.
 
 Navigation links are auto-generated from the `.sql` files in the pages
 directory. Labels, ordering and page title come from SQL comment front-matter.

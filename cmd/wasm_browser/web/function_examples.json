@@ -208,6 +208,8 @@
   {
     "section": "IO AND TRANSFORM FUNCTIONS (safe runnable examples enabled)",
     "examples": [
+      "SELECT URL_PARSE('https://example.org/a%20b?q=geo+data#result') as url_components;\nSELECT URL_QUERY_GET('https://example.org/search?q=geo+data', 'q') as query_value;\nSELECT URL_RESOLVE('https://example.org/a/b/', '../tiles/12/2200/1400.pbf') as resolved_url;\nSELECT URL_ENCODE('key=value \u0026 more') as encoded_query_value;\nSELECT URL_DECODE('key%3Dvalue+%26+more') as decoded_query_value;\nSELECT URL_PATH_ENCODE('tiles/Altstadt Nord') as encoded_path_segment;\nSELECT URL_PATH_DECODE('tiles%2FAltstadt%20Nord') as decoded_path_segment;",
+      "SELECT HTML_ESCAPE('\u003cstrong\u003euntrusted\u003c/strong\u003e') as escaped_html;\nSELECT HTML_TEMPLATE('\u003ca href=\"{{.url}}\"\u003e{{.label}}\u003c/a\u003e',\n                     '{\"url\":\"/map\",\"label\":\"Map \u0026 data\"}') as rendered_html;",
       "SELECT LENGTH(GZIP('tinySQL gzip test string')) as gzip_compressed_length;\nSELECT GUNZIP(GZIP('roundtrip test')) as gunzip_roundtrip;",
       "SELECT BASE64_ENCODE('hello world') as base64_encoded_example;\nSELECT BASE64_DECODE(BASE64_ENCODE('hello world')) as base64_decoded_roundtrip;",
       "SELECT FILE('./data/data.json') as file_content;",

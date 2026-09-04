@@ -92,6 +92,8 @@ in-memory storage. Features needing an OS or HTTP runtime fail with a clear
 SQL/API error rather than breaking the build:
 
 - `HTTP()` is unavailable on TinyGo WASM and bare-metal targets.
+- `HTML_ESCAPE()` and `HTML_TEMPLATE()` are unavailable on TinyGo WASM and
+  bare-metal targets.
 - MBTiles import is unavailable on TinyGo WASM and bare-metal targets; it
   depends on an embedded SQLite reader.
 - `sys.memory` keeps its regular shape; runtime metrics TinyGo cannot expose
