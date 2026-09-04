@@ -65,6 +65,7 @@
 package tinysql
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -1359,7 +1360,7 @@ func decodeJSONTableColumns(db *DB, tenant, tableName string, rs *ResultSet) err
 				continue
 			}
 			var decoded any
-			decoder := json.NewDecoder(strings.NewReader(string(source)))
+			decoder := json.NewDecoder(bytes.NewReader(source))
 			decoder.UseNumber()
 			if err := decoder.Decode(&decoded); err != nil {
 				return fmt.Errorf("tinysql: decode JSON column %q: %w", column.Name, err)

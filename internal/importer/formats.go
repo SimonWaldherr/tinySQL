@@ -493,6 +493,13 @@ func ImportJSON(
 		}
 	}
 	result.ColumnTypes = colTypes
+	primaryKeyColumn := -1
+	for i, col := range colNames {
+		if strings.EqualFold(col, opts.PrimaryKey) {
+			primaryKeyColumn = i
+			break
+		}
+	}
 
 	// Convert and insert in bounded batches. This shares the fast append path
 	// used by the geodata importers and keeps paged-index destinations from
@@ -534,7 +541,7 @@ func ImportJSON(
 				// the generic importer uses int64. Keep an imported integer primary
 				// key in the engine's native representation so later SQL writes
 				// compare it as the same key.
-				if strings.EqualFold(col, opts.PrimaryKey) {
+				if j == primaryKeyColumn {
 					if n, ok := converted.(int64); ok && int64(int(n)) == n {
 						converted = int(n)
 					}
