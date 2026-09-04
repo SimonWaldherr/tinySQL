@@ -47,3 +47,20 @@ default of 900 characters with 250 characters overlap reached 100% Hit@5,
 66.7% Hit@1, and 0.792 MRR across the built-in English/German questions. Those
 figures predate the switch to engine-side RRF fusion; rerun the suite to
 measure the current pipeline.
+
+## Startup and timing
+
+Chunk insertion uses SQL batches of at most 128 rows. Evaluation questions are
+embedded in batches controlled by `-batch-size` (one request for the default six
+questions), then each question gets its own fresh `RAG_SEARCH`. No embedding or
+answer cache is added. Embedding response indices are validated before attaching
+vectors to inputs, including responses returned out of order.
+
+The demo prints corpus embedding time, database load time, evaluation query
+embedding time and each retrieval time separately. First-query index preparation
+is included in retrieval timing; these numbers are not a controlled benchmark.
+Ctrl-C cancels the active request and database work. The complete LM Studio demo
+still needs a running embedding model; the Go tests use local fixtures.
+
+See [posting-based RAG retrieval](../../docs/rag-postings-performance.md) for
+engine-side exact top-k improvements and reproducible benchmark results.

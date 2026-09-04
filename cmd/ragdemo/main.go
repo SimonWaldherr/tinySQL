@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -61,7 +62,9 @@ var evalCases = []evalCase{
 
 func main() {
 	cfg := parseFlags()
-	if err := run(context.Background(), cfg); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	if err := run(ctx, cfg); err != nil {
 		fmt.Fprintln(os.Stderr, "ragdemo:", err)
 		os.Exit(1)
 	}
@@ -79,7 +82,7 @@ func parseFlags() config {
 	flag.IntVar(&c.topK, "top-k", 5, "number of final retrieval hits")
 	flag.IntVar(&c.candidateK, "candidate-k", 15, "number of candidates per retriever")
 	flag.IntVar(&c.batchSize, "batch-size", 16, "texts per embedding request")
-	flag.BoolVar(&c.hybrid, "hybrid", true, "rerank semantic candidates with a conservative BM25 bonus")
+	flag.BoolVar(&c.hybrid, "hybrid", true, "fuse vector and BM25 results using reciprocal-rank fusion")
 	flag.BoolVar(&c.generate, "generate", false, "generate an answer for -query using the chat model")
 	flag.BoolVar(&c.verbose, "verbose", false, "print all evaluation hits, not only failures")
 	flag.Parse()
@@ -133,10 +136,12 @@ func run(ctx context.Context, cfg config) error {
 	}
 	fmt.Fprintf(os.Stderr, "\rembedding chunks: %d/%d in %s\n", len(chunks), len(chunks), time.Since(started).Round(time.Millisecond))
 
-	db, err := buildDB(chunks)
+	started = time.Now()
+	db, err := buildDBContext(ctx, chunks)
 	if err != nil {
 		return err
 	}
+	fmt.Fprintf(os.Stderr, "database load: %s (batched inserts)\n", time.Since(started).Round(time.Millisecond))
 	corpus := make(map[string]chunk, len(chunks))
 	for _, c := range chunks {
 		corpus[key(c.DocID, c.Index)] = c
@@ -280,7 +285,10 @@ func embeddingText(c chunk) string {
 // only happens to work because every row lands before the first query, and
 // is not a pattern to copy against a table that queries run against.)
 func buildDB(chunks []chunk) (*tsql.DB, error) {
-	ctx := context.Background()
+	return buildDBContext(context.Background(), chunks)
+}
+
+func buildDBContext(ctx context.Context, chunks []chunk) (*tsql.DB, error) {
 	db := tsql.NewDB()
 	stmt, err := tsql.ParseSQL(`CREATE TABLE rag_chunks (doc_id TEXT, chunk_index INT, heading TEXT, chunk_text TEXT, embedding VECTOR)`)
 	if err != nil {
@@ -289,21 +297,31 @@ func buildDB(chunks []chunk) (*tsql.DB, error) {
 	if _, err = tsql.Execute(ctx, db, "default", stmt); err != nil {
 		return nil, err
 	}
-	for _, c := range chunks {
-		embJSON, err := json.Marshal(c.Embedding)
-		if err != nil {
-			return nil, fmt.Errorf("marshal embedding for %s#%d: %w", c.DocID, c.Index, err)
+	// Bounded batches reduce parser/executor setup without direct storage mutation.
+	for start := 0; start < len(chunks); start += 128 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		insertSQL := fmt.Sprintf(
-			`INSERT INTO rag_chunks VALUES ('%s', %d, '%s', '%s', VEC_FROM_JSON('%s'))`,
-			sqlQuote(c.DocID), c.Index, sqlQuote(c.Heading), sqlQuote(c.Text), embJSON,
-		)
-		insertStmt, err := tsql.ParseSQL(insertSQL)
-		if err != nil {
-			return nil, fmt.Errorf("parse insert for %s#%d: %w", c.DocID, c.Index, err)
+		end := min(start+128, len(chunks))
+		var sql strings.Builder
+		sql.WriteString("INSERT INTO rag_chunks VALUES ")
+		for i := start; i < end; i++ {
+			c := chunks[i]
+			emb, err := json.Marshal(c.Embedding)
+			if err != nil {
+				return nil, fmt.Errorf("marshal embedding for %s#%d: %w", c.DocID, c.Index, err)
+			}
+			if i > start {
+				sql.WriteByte(',')
+			}
+			fmt.Fprintf(&sql, "('%s', %d, '%s', '%s', VEC_FROM_JSON('%s'))", sqlQuote(c.DocID), c.Index, sqlQuote(c.Heading), sqlQuote(c.Text), emb)
 		}
-		if _, err := tsql.Execute(ctx, db, "default", insertStmt); err != nil {
-			return nil, fmt.Errorf("insert %s#%d: %w", c.DocID, c.Index, err)
+		stmt, err := tsql.ParseSQL(sql.String())
+		if err != nil {
+			return nil, err
+		}
+		if _, err = tsql.Execute(ctx, db, "default", stmt); err != nil {
+			return nil, fmt.Errorf("insert chunks %d-%d: %w", start+1, end, err)
 		}
 	}
 	return db, nil
@@ -349,7 +367,11 @@ func retrieve(ctx context.Context, client *lmClient, db *tsql.DB, corpus map[str
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
 	}
-	sql, err := retrieveSQL(cfg, vectors[0], query)
+	return retrieveVector(ctx, db, corpus, cfg, query, vectors[0])
+}
+
+func retrieveVector(ctx context.Context, db *tsql.DB, corpus map[string]chunk, cfg config, query string, vector []float64) ([]hit, error) {
+	sql, err := retrieveSQL(cfg, vector, query)
 	if err != nil {
 		return nil, err
 	}
@@ -399,11 +421,27 @@ func retrieve(ctx context.Context, client *lmClient, db *tsql.DB, corpus map[str
 
 func evaluate(ctx context.Context, client *lmClient, db *tsql.DB, corpus map[string]chunk, cfg config) error {
 	hitsAt1, hitsAtK, reciprocalRank := 0, 0, 0.0
-	for _, tc := range evalCases {
-		hits, err := retrieve(ctx, client, db, corpus, cfg, tc.Query)
+	queries := make([]string, len(evalCases))
+	for i, tc := range evalCases {
+		queries[i] = tc.Query
+	}
+	var vectors [][]float64
+	started := time.Now()
+	for start := 0; start < len(queries); start += max(1, cfg.batchSize) {
+		batch, err := client.embed(ctx, cfg.embeddingModel, queries[start:min(start+max(1, cfg.batchSize), len(queries))])
+		if err != nil {
+			return err
+		}
+		vectors = append(vectors, batch...)
+	}
+	fmt.Fprintf(os.Stderr, "query embeddings: %s\n", time.Since(started).Round(time.Millisecond))
+	for i, tc := range evalCases {
+		started = time.Now()
+		hits, err := retrieveVector(ctx, db, corpus, cfg, tc.Query, vectors[i])
 		if err != nil {
 			return fmt.Errorf("evaluation %q: %w", tc.Name, err)
 		}
+		fmt.Fprintf(os.Stderr, "retrieval %s: %s\n", tc.Name, time.Since(started).Round(time.Microsecond))
 		rank := relevantRank(hits, tc)
 		if rank == 1 {
 			hitsAt1++
@@ -534,10 +572,15 @@ func (c *lmClient) embed(ctx context.Context, model string, input []string) ([][
 	if len(response.Data) != len(input) {
 		return nil, fmt.Errorf("LM Studio returned %d embeddings for %d inputs", len(response.Data), len(input))
 	}
-	sort.Slice(response.Data, func(i, j int) bool { return response.Data[i].Index < response.Data[j].Index })
 	out := make([][]float64, len(response.Data))
-	for i := range response.Data {
-		out[i] = response.Data[i].Embedding
+	for _, item := range response.Data {
+		if item.Index < 0 || item.Index >= len(out) || out[item.Index] != nil {
+			return nil, fmt.Errorf("invalid or duplicate embedding index %d", item.Index)
+		}
+		if len(item.Embedding) == 0 {
+			return nil, fmt.Errorf("empty embedding at index %d", item.Index)
+		}
+		out[item.Index] = item.Embedding
 	}
 	return out, nil
 }

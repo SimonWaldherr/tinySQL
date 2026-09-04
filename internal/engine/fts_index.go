@@ -29,6 +29,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"math"
 	"runtime"
 	"sort"
 	"strings"
@@ -74,6 +75,11 @@ func ftsScanWorkerCount(docs int) int {
 // on which documents were scanned, never on how they were divided up or in which
 // order workers finished.
 func ftsScanTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQueryNode, idf ftsIDFFunc, rows []int32, restricted bool, k int) ([]ftsScored, error) {
+	// OR scores are maxima, so the union of each term's top-k contains the
+	// exact global top-k. Restricted scans retain the authorization-aware path.
+	if !restricted && k > 0 && node != nil && node.op == "OR" && len(node.termIDNs) > 0 {
+		return ftsDisjunctionTopK(ctx, cache, node, k)
+	}
 	total := len(cache.docs)
 	if restricted {
 		total = len(rows)
@@ -121,12 +127,14 @@ func ftsScanTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQueryNode
 	}
 	wg.Wait()
 
-	merged := &ftsScoredHeap{}
+	mergedRows := make(ftsScoredHeap, 0, k)
+	merged := &mergedRows
 	for i := range results {
 		if results[i].err != nil {
 			return nil, results[i].err
 		}
-		for _, sr := range ftsTopKFromHeap(&results[i].heapRows, k) {
+		// Merge the local winners directly; only the final heap needs sorting.
+		for _, sr := range results[i].heapRows {
 			ftsPushTopK(merged, sr.rowIdx, sr.score, k)
 		}
 	}
@@ -153,13 +161,20 @@ func ftsScanTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQueryNode
 // matches, since its score is the maximum of the two — exactly what
 // ftsScoreNode already did.
 func ftsEvalNode(cache ftsDocCacheEntry, doc ftsCachedDoc, node *ftsQueryNode, normDocLen float64) (bool, float64) {
+	// The normalization is document-local, not query-node-local. Pass the
+	// immutable cache by pointer through recursion instead of copying its
+	// slices and maps for every node of every matching document.
+	lengthNorm := bm25K1 * (1 - bm25B + bm25B*normDocLen)
+	return ftsEvalNodeNormalized(&cache, doc, node, lengthNorm)
+}
+
+func ftsEvalNodeNormalized(cache *ftsDocCacheEntry, doc ftsCachedDoc, node *ftsQueryNode, lengthNorm float64) (bool, float64) {
 	if node == nil {
 		return false, 0
 	}
 	// Mirrors ftsScoreNode's arithmetic exactly, including the order of
 	// operations: float multiplication is not associative, so scaling by IDF
 	// after the division is load-bearing for bit-identical scores.
-	lengthNorm := bm25K1 * (1 - bm25B + bm25B*normDocLen)
 	score := func(weight float64, f int) float64 {
 		tf := float64(f)
 		if tf == 0 {
@@ -203,26 +218,41 @@ func ftsEvalNode(cache ftsDocCacheEntry, doc ftsCachedDoc, node *ftsQueryNode, n
 		return true, sum * phraseMatchBonus
 
 	case "AND":
-		leftMatched, leftScore := ftsEvalNode(cache, doc, node.left, normDocLen)
+		leftMatched, leftScore := ftsEvalNodeNormalized(cache, doc, node.left, lengthNorm)
 		if !leftMatched {
 			return false, 0
 		}
-		rightMatched, rightScore := ftsEvalNode(cache, doc, node.right, normDocLen)
+		rightMatched, rightScore := ftsEvalNodeNormalized(cache, doc, node.right, lengthNorm)
 		if !rightMatched {
 			return false, 0
 		}
 		return true, leftScore + rightScore
 
 	case "OR":
-		leftMatched, leftScore := ftsEvalNode(cache, doc, node.left, normDocLen)
-		rightMatched, rightScore := ftsEvalNode(cache, doc, node.right, normDocLen)
+		if len(node.termIDNs) > 0 {
+			// Literal disjunctions are the default hybrid text query. Evaluate
+			// their bound leaves directly, retaining OR's maximum-score rule.
+			matched, best := false, 0.0
+			for i, id := range node.termIDNs {
+				f := cache.termFrequency(doc, id)
+				if f > 0 {
+					matched = true
+					if value := score(node.termIDFs[i], f); value > best {
+						best = value
+					}
+				}
+			}
+			return matched, best
+		}
+		leftMatched, leftScore := ftsEvalNodeNormalized(cache, doc, node.left, lengthNorm)
+		rightMatched, rightScore := ftsEvalNodeNormalized(cache, doc, node.right, lengthNorm)
 		if leftScore > rightScore {
 			return leftMatched || rightMatched, leftScore
 		}
 		return leftMatched || rightMatched, rightScore
 
 	case "NOT":
-		matched, _ := ftsEvalNode(cache, doc, node.operand, normDocLen)
+		matched, _ := ftsEvalNodeNormalized(cache, doc, node.operand, lengthNorm)
 		return !matched, 0
 
 	default:
@@ -409,9 +439,19 @@ func ftsBindIDF(node *ftsQueryNode, idf ftsIDFFunc, termIDs map[string]int32) *f
 		return &ftsQueryNode{op: node.op, phrase: node.phrase,
 			idfBound: true, termIDFs: weights, termIDNs: ids}
 	case "AND", "OR":
-		return &ftsQueryNode{op: node.op,
+		bound := &ftsQueryNode{op: node.op,
 			left:  ftsBindIDF(node.left, idf, termIDs),
 			right: ftsBindIDF(node.right, idf, termIDs)}
+		if node.op == "OR" {
+			if terms, ok := ftsLiteralORTerms(node); ok {
+				bound.termIDNs = make([]int32, len(terms))
+				bound.termIDFs = make([]float64, len(terms))
+				for i, term := range terms {
+					bound.termIDNs[i], bound.termIDFs[i] = lookup(term), idf(term)
+				}
+			}
+		}
+		return bound
 	case "NOT":
 		return &ftsQueryNode{op: "NOT", operand: ftsBindIDF(node.operand, idf, termIDs)}
 	default:
@@ -704,4 +744,75 @@ func ftsCandidateScanIsCheaper(rows []int32, numRows int) bool {
 		return false
 	}
 	return len(rows)*2 < numRows
+}
+
+// ftsDisjunctionTopK reads postings instead of probing every query term in
+// every document. Any omitted document has at least k better documents for
+// the term supplying its maximum score, and thus cannot enter the OR top-k.
+func ftsDisjunctionTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQueryNode, k int) ([]ftsScored, error) {
+	terms, _ := ftsLiteralORTerms(node)
+	order := make([]int, len(terms))
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(i, j int) bool { return node.termIDFs[order[i]] > node.termIDFs[order[j]] })
+	winners := make(map[int]float64)
+	merged := make(ftsScoredHeap, 0, k)
+	// BM25's frequency factor is bounded by k1+1. Round the bound upward
+	// through each floating-point operation; strict comparison preserves ties.
+	factor := bm25K1 + 1
+	for i := 0; i < 3; i++ {
+		factor = math.Nextafter(factor, math.Inf(1))
+	}
+	for _, i := range order {
+		term := terms[i]
+		upper := math.Nextafter(factor*node.termIDFs[i], math.Inf(1))
+		if len(merged) == k && upper < merged[0].score {
+			break
+		}
+		if err := checkCtx(ctx); err != nil {
+			return nil, err
+		}
+		leaf := &ftsQueryNode{op: "TERM", termID: node.termIDNs[i], termIDF: node.termIDFs[i]}
+		local := make(ftsScoredHeap, 0, min(k, len(cache.postings[term])))
+		for pi, row := range cache.postings[term] {
+			if pi&1023 == 0 {
+				if err := checkCtx(ctx); err != nil {
+					return nil, err
+				}
+			}
+			ri := int(row)
+			doc := cache.docs[ri]
+			if !doc.Valid {
+				continue
+			}
+			norm := doc.DocLen
+			if cache.avgDocLen > 0 {
+				norm /= cache.avgDocLen
+			}
+			// Share the evaluator's floating-point rounding boundaries (including
+			// architecture-specific fused arithmetic) with the document-scan path.
+			matched, score := ftsEvalNode(cache, doc, leaf, norm)
+			if !matched {
+				continue
+			}
+			ftsPushTopK(&local, ri, score, k)
+		}
+		for _, hit := range local {
+			if old, ok := winners[hit.rowIdx]; !ok || hit.score > old {
+				winners[hit.rowIdx] = hit.score
+			}
+		}
+
+		merged = merged[:0]
+		for row, score := range winners {
+			ftsPushTopK(&merged, row, score, k)
+		}
+		// Retain only the global winners before processing the next term.
+		clear(winners)
+		for _, hit := range merged {
+			winners[hit.rowIdx] = hit.score
+		}
+	}
+	return ftsTopKFromHeap(&merged, k), nil
 }

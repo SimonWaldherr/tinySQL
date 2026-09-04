@@ -2,6 +2,8 @@ package engine
 
 import (
 	"math"
+	"math/rand"
+	"sort"
 	"testing"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -76,6 +78,7 @@ func BenchmarkRAGFuseCandidates(b *testing.B) {
 	}{
 		{name: "candidate_k_24_return_6", candidates: 24, k: 6},
 		{name: "candidate_k_256_return_24", candidates: 256, k: 24},
+		{name: "candidate_k_4096_return_24", candidates: 4096, k: 24},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			table := benchmarkRAGFuseTable(tc.candidates * 2)
@@ -110,4 +113,31 @@ func benchmarkRAGFuseTable(rows int) *storage.Table {
 		table.Rows[i] = []any{"chunk", "doc", "text", float64(i)}
 	}
 	return table
+}
+
+func TestRAGTopCandidatesMatchesFullSort(t *testing.T) {
+	rng := rand.New(rand.NewSource(42))
+	for _, n := range []int{0, 1, 8, 100, 4096} {
+		original := make(ragNativeCandidates, n)
+		for i := range original {
+			// Many equal scores exercise deterministic tie ordering.
+			original[i] = &ragNativeCandidate{rowIdx: i, order: i, rrfScore: float64(rng.Intn(10))}
+		}
+		rng.Shuffle(n, func(i, j int) { original.Swap(i, j) })
+		expected := append(ragNativeCandidates(nil), original...)
+		sort.Sort(expected)
+		for _, k := range []int{0, 1, 3, 24, n, n + 1} {
+			input := append(ragNativeCandidates(nil), original...)
+			got := ragTopCandidates(input, k)
+			wantLen := min(k, n)
+			if len(got) != wantLen {
+				t.Fatalf("n=%d k=%d: got %d rows", n, k, len(got))
+			}
+			for i := range got {
+				if got[i] != expected[i] {
+					t.Fatalf("n=%d k=%d rank=%d: got %+v want %+v", n, k, i, got[i], expected[i])
+				}
+			}
+		}
+	}
 }

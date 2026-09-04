@@ -756,7 +756,7 @@ func ragVecTopKAllowed(ctx context.Context, allowed []int, queryLen, k int, cach
 		if results[i].err != nil {
 			return nil, results[i].err
 		}
-		for _, row := range topKFromHeap(&results[i].heapRows, k) {
+		for _, row := range results[i].heapRows {
 			pushTopK(merged, row.rowIdx, row.distance, k)
 		}
 	}

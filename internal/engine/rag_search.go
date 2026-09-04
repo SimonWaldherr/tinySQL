@@ -375,6 +375,46 @@ func (s ragNativeCandidates) Less(i, j int) bool {
 }
 func (s ragNativeCandidates) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
 
+// ragTopCandidates selects the best k in place using a worst-first heap.
+// Only the winners are sorted: O(n log k + k log k), instead of O(n log n)
+// for wide candidate pools. The original order remains the score tie-breaker.
+func ragTopCandidates(candidates ragNativeCandidates, k int) ragNativeCandidates {
+	if k <= 0 {
+		return candidates[:0]
+	}
+	if k < len(candidates) {
+		winners := candidates[:k]
+		siftDown := func(root int) {
+			for {
+				child := root*2 + 1
+				if child >= k {
+					return
+				}
+				if child+1 < k && winners.Less(child, child+1) {
+					child++
+				}
+				if !winners.Less(root, child) {
+					return
+				}
+				winners.Swap(root, child)
+				root = child
+			}
+		}
+		for i := k/2 - 1; i >= 0; i-- {
+			siftDown(i)
+		}
+		for i := k; i < len(candidates); i++ {
+			if candidates.Less(i, 0) {
+				winners[0] = candidates[i]
+				siftDown(0)
+			}
+		}
+		candidates = winners
+	}
+	sort.Sort(candidates)
+	return candidates
+}
+
 // ragFuseCandidates reciprocal-rank-fuses the vector and text candidate sets
 // into one ResultSet. Both branches address the same immutable table snapshot,
 // so candidates are matched on physical row index rather than a formatted
@@ -431,10 +471,7 @@ func ragFuseCandidates(table *storage.Table, vecRows []vecScoredRow, ftsRows []f
 			candidate.rrfScore += 1.0 / (rrfK + float64(candidate.ftsRank))
 		}
 	}
-	sort.Sort(ordered)
-	if k < len(ordered) {
-		ordered = ordered[:k]
-	}
+	ordered = ragTopCandidates(ordered, k)
 
 	cols := make([]string, 0, len(table.Cols)+7)
 	for _, column := range table.Cols {

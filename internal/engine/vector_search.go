@@ -909,8 +909,8 @@ func vecSearchTopK(ctx context.Context, rows [][]any, queryLen int, k int, cache
 		if results[i].err != nil {
 			return nil, results[i].err
 		}
-		localRows := topKFromHeap(&results[i].heapRows, k)
-		for _, sr := range localRows {
+		// Heap entries are already the local top-k; merging needs no local sort.
+		for _, sr := range results[i].heapRows {
 			pushTopK(merged, sr.rowIdx, sr.distance, k)
 		}
 	}

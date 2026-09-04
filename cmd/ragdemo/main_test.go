@@ -2,6 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -197,5 +201,95 @@ func TestRetrieveSQLEscapesQuotesInQuery(t *testing.T) {
 	}
 	if _, err := tsql.ParseSQL(sql); err != nil {
 		t.Fatalf("SQL with quoted query does not parse: %v\n%s", err, sql)
+	}
+}
+
+func TestBuildDBBatchBoundaryAndCancellation(t *testing.T) {
+	chunks := make([]chunk, 257)
+	for i := range chunks {
+		chunks[i] = chunk{DocID: "quote's.md", Index: i, Heading: "H", Text: "body", Embedding: []float64{1, 0}}
+	}
+	db, err := buildDBContext(t.Context(), chunks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	table, err := db.Get("default", "rag_chunks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(table.Rows) != len(chunks) {
+		t.Fatalf("got %d rows", len(table.Rows))
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := buildDBContext(ctx, chunks); err == nil {
+		t.Fatal("ignored cancellation")
+	}
+}
+
+type embeddingTransport func(*http.Request) (*http.Response, error)
+
+func (f embeddingTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+func TestEmbeddingResponseIndices(t *testing.T) {
+	for _, tc := range []struct {
+		body  string
+		valid bool
+	}{
+		{`{"data":[{"index":1,"embedding":[0,1]},{"index":0,"embedding":[1,0]}]}`, true},
+		{`{"data":[{"index":0,"embedding":[1,0]},{"index":0,"embedding":[0,1]}]}`, false},
+		{`{"data":[{"index":0,"embedding":[1,0]},{"index":2,"embedding":[0,1]}]}`, false},
+	} {
+		client := &lmClient{baseURL: "http://local.invalid", http: &http.Client{Transport: embeddingTransport(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(tc.body)), Header: make(http.Header)}, nil
+		})}}
+		vectors, err := client.embed(t.Context(), "test", []string{"a", "b"})
+		if (err == nil) != tc.valid {
+			t.Fatalf("valid=%v err=%v", tc.valid, err)
+		}
+		if tc.valid && (vectors[0][0] != 1 || vectors[1][1] != 1) {
+			t.Fatal("embedding order differs from input order")
+		}
+	}
+}
+
+func TestEvaluationBatchesQueries(t *testing.T) {
+	chunks := make([]chunk, len(evalCases))
+	corpus := map[string]chunk{}
+	for i, tc := range evalCases {
+		chunks[i] = chunk{DocID: tc.DocSuffix, Index: i, Text: tc.Marker, Embedding: []float64{1, 0}}
+		corpus[key(tc.DocSuffix, i)] = chunks[i]
+	}
+	db, err := buildDB(chunks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	client := &lmClient{baseURL: "http://local.invalid", http: &http.Client{Transport: embeddingTransport(func(req *http.Request) (*http.Response, error) {
+		calls++
+		var input struct {
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(req.Body).Decode(&input); err != nil {
+			t.Fatal(err)
+		}
+		if len(input.Input) > 2 {
+			t.Fatal("batch size exceeded")
+		}
+		var body strings.Builder
+		body.WriteString(`{"data":[`)
+		for i := range input.Input {
+			if i > 0 {
+				body.WriteByte(',')
+			}
+			fmt.Fprintf(&body, `{"index":%d,"embedding":[1,0]}`, i)
+		}
+		body.WriteString(`]}`)
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body.String())), Header: make(http.Header)}, nil
+	})}}
+	if err := evaluate(t.Context(), client, db, corpus, config{batchSize: 2, topK: len(chunks), candidateK: len(chunks)}); err != nil {
+		t.Fatal(err)
+	}
+	if calls != (len(evalCases)+1)/2 {
+		t.Fatalf("got %d embedding requests", calls)
 	}
 }
