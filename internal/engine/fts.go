@@ -1353,8 +1353,10 @@ type ftsDocCacheEntry struct {
 	// from it so documents that cannot match are never scored, and wildcards are
 	// resolved against its key set once per query instead of against every token
 	// of every document. See fts_index.go.
-	postings map[string][]int32
-	numDocs  int
+	postings      map[string][]int32
+	postingCounts map[string][]int32
+	postingBlocks map[string][]storage.FTSPostingBlock
+	numDocs       int
 
 	// termIDs assigns each corpus term a dense integer id. Query terms are
 	// resolved through it once per query (ftsBindIDF), after which every
@@ -1549,7 +1551,7 @@ func ftsValueToString(v any) string {
 	return valueText(v)
 }
 
-const ftsPersistentFormat = 1
+const ftsPersistentFormat = 2
 
 func ftsPersistentUsable(index *storage.FTSIndex, table *storage.Table) bool {
 	if index == nil || index.Format != ftsPersistentFormat ||
@@ -1557,6 +1559,11 @@ func ftsPersistentUsable(index *storage.FTSIndex, table *storage.Table) bool {
 		len(index.DocTermIDs) != len(index.DocTermCounts) ||
 		(index.NumDocs > 0 && (index.Postings == nil || index.TermIDs == nil)) {
 		return false
+	}
+	for term, rows := range index.Postings {
+		if len(index.PostingCounts[term]) != len(rows) || len(index.PostingBlocks[term]) != (len(rows)+storage.FTSPostingBlockSize-1)/storage.FTSPostingBlockSize {
+			return false
+		}
 	}
 	for _, doc := range index.Docs {
 		if doc.TermStart < 0 || doc.TermCount < 0 || int64(doc.TermStart)+int64(doc.TermCount) > int64(len(index.DocTermIDs)) ||
@@ -1572,26 +1579,6 @@ func ftsPersistentUsable(index *storage.FTSIndex, table *storage.Table) bool {
 	return true
 }
 
-func ftsRemovePosting(rows []int32, row int32) []int32 {
-	i := sort.Search(len(rows), func(i int) bool { return rows[i] >= row })
-	if i >= len(rows) || rows[i] != row {
-		return rows
-	}
-	copy(rows[i:], rows[i+1:])
-	return rows[:len(rows)-1]
-}
-
-func ftsInsertPosting(rows []int32, row int32) []int32 {
-	i := sort.Search(len(rows), func(i int) bool { return rows[i] >= row })
-	if i < len(rows) && rows[i] == row {
-		return rows
-	}
-	rows = append(rows, 0)
-	copy(rows[i+1:], rows[i:])
-	rows[i] = row
-	return rows
-}
-
 // ftsRefreshUpdatedRows applies UPDATE-only changes directly to a persistent
 // index. Document arenas are append-only, but obsolete runs are unlinked from
 // postings and counted for later compaction. DELETE and schema changes cannot
@@ -1603,6 +1590,7 @@ func ftsRefreshUpdatedRows(table *storage.Table, cols []int, index *storage.FTSI
 			termNames[id] = term
 		}
 	}
+	changedTerms := make(map[string]bool)
 	var sb strings.Builder
 	for _, ri := range rows {
 		if ri < 0 || ri >= len(table.Rows) || ri >= len(index.Docs) {
@@ -1613,7 +1601,8 @@ func ftsRefreshUpdatedRows(table *storage.Table, cols []int, index *storage.FTSI
 			for _, id := range index.DocTermIDs[old.TermStart : old.TermStart+old.TermCount] {
 				if id >= 0 && int(id) < len(termNames) {
 					term := termNames[id]
-					index.Postings[term] = ftsRemovePosting(index.Postings[term], int32(ri))
+					changedTerms[term] = true
+					index.Postings[term], index.PostingCounts[term] = ftsRemoveCountedPosting(index.Postings[term], index.PostingCounts[term], int32(ri))
 				}
 			}
 			index.TotalDocLen -= old.DocLen
@@ -1662,7 +1651,8 @@ func ftsRefreshUpdatedRows(table *storage.Table, cols []int, index *storage.FTSI
 			index.DocTermIDs = append(index.DocTermIDs, id)
 			index.DocTermCounts = append(index.DocTermCounts, counts[id])
 			term := termNames[id]
-			index.Postings[term] = ftsInsertPosting(index.Postings[term], int32(ri))
+			changedTerms[term] = true
+			index.Postings[term], index.PostingCounts[term] = ftsInsertCountedPosting(index.Postings[term], index.PostingCounts[term], int32(ri), counts[id])
 		}
 		tokenCount := len(index.DocTokenIDs) - int(tokenStart)
 		index.Docs[ri] = storage.FTSDocument{TermStart: termStart, TermCount: int32(len(ids)), TokenStart: tokenStart, TokenCount: int32(tokenCount), DocLen: float64(tokenCount), Valid: true}
@@ -1673,6 +1663,9 @@ func ftsRefreshUpdatedRows(table *storage.Table, cols []int, index *storage.FTSI
 		index.AvgDocLen = index.TotalDocLen / float64(index.NumDocs)
 	} else {
 		index.AvgDocLen = 0
+	}
+	for term := range changedTerms {
+		ftsRebuildPostingBlocks(index, term, 0)
 	}
 	index.Version = table.Version
 	index.StructVersion = table.StructVersion()
@@ -1689,7 +1682,7 @@ func ftsPersistentNeedsCompaction(index *storage.FTSIndex) bool {
 func ftsCacheFromPersistent(table *storage.Table, index *storage.FTSIndex) ftsDocCacheEntry {
 	return ftsDocCacheEntry{
 		table: table, version: table.Version, docs: index.Docs,
-		avgDocLen: index.AvgDocLen, postings: index.Postings, numDocs: index.NumDocs,
+		avgDocLen: index.AvgDocLen, postings: index.Postings, postingCounts: index.PostingCounts, postingBlocks: index.PostingBlocks, numDocs: index.NumDocs,
 		termIDs: index.TermIDs, docTermIDs: index.DocTermIDs,
 		docTermCounts: index.DocTermCounts, docTokenIDs: index.DocTokenIDs,
 	}
@@ -1700,6 +1693,13 @@ func ftsCacheFromPersistent(table *storage.Table, index *storage.FTSIndex) ftsDo
 // append-only INSERTs, turning an O(table) rebuild into O(new rows).
 func ftsExtendPersistent(table *storage.Table, cols []int, index *storage.FTSIndex) {
 	start := index.BuiltRows
+	changedTerms := make(map[string]int)
+	if index.PostingBlocks == nil {
+		index.PostingBlocks = make(map[string][]storage.FTSPostingBlock)
+	}
+	if index.PostingCounts == nil {
+		index.PostingCounts = make(map[string][]int32)
+	}
 	if index.Postings == nil {
 		index.Postings = make(map[string][]int32)
 	}
@@ -1757,6 +1757,10 @@ func ftsExtendPersistent(table *storage.Table, cols []int, index *storage.FTSInd
 		for _, id := range touched {
 			index.DocTermIDs = append(index.DocTermIDs, id)
 			index.DocTermCounts = append(index.DocTermCounts, counts[id])
+			if _, seen := changedTerms[termNames[id]]; !seen {
+				changedTerms[termNames[id]] = len(index.Postings[termNames[id]])
+			}
+			index.PostingCounts[termNames[id]] = append(index.PostingCounts[termNames[id]], counts[id])
 			counts[id] = 0
 		}
 		index.Docs[ri] = storage.FTSDocument{
@@ -1781,6 +1785,9 @@ func ftsExtendPersistent(table *storage.Table, cols []int, index *storage.FTSInd
 	}
 	if index.NumDocs > 0 {
 		index.AvgDocLen = index.TotalDocLen / float64(index.NumDocs)
+	}
+	for term, start := range changedTerms {
+		ftsRebuildPostingBlocks(index, term, start)
 	}
 	index.Format = ftsPersistentFormat
 	index.Version = table.Version
@@ -2259,4 +2266,54 @@ func colNames(cols []storage.Column) []string {
 		names[i] = c.Name
 	}
 	return names
+}
+
+func ftsRemoveCountedPosting(rows, counts []int32, row int32) ([]int32, []int32) {
+	i := sort.Search(len(rows), func(i int) bool { return rows[i] >= row })
+	if i == len(rows) || rows[i] != row {
+		return rows, counts
+	}
+	copy(rows[i:], rows[i+1:])
+	copy(counts[i:], counts[i+1:])
+	return rows[:len(rows)-1], counts[:len(counts)-1]
+}
+func ftsInsertCountedPosting(rows, counts []int32, row, count int32) ([]int32, []int32) {
+	i := sort.Search(len(rows), func(i int) bool { return rows[i] >= row })
+	if i < len(rows) && rows[i] == row {
+		counts[i] = count
+		return rows, counts
+	}
+	rows = append(rows, 0)
+	counts = append(counts, 0)
+	copy(rows[i+1:], rows[i:])
+	copy(counts[i+1:], counts[i:])
+	rows[i] = row
+	counts[i] = count
+	return rows, counts
+}
+
+// Only a partial final block and appended blocks need rebuilding on INSERT.
+// UPDATE can shift posting offsets, so affected terms rebuild from block zero.
+func ftsRebuildPostingBlocks(index *storage.FTSIndex, term string, start int) {
+	rows := index.Postings[term]
+	counts := index.PostingCounts[term]
+	size := storage.FTSPostingBlockSize
+	n := (len(rows) + size - 1) / size
+	blocks := index.PostingBlocks[term]
+	if cap(blocks) < n {
+		next := make([]storage.FTSPostingBlock, n)
+		copy(next, blocks)
+		blocks = next
+	} else {
+		blocks = blocks[:n]
+	}
+	for b := start / size; b < n; b++ {
+		block := storage.FTSPostingBlock{MinDocLen: math.Inf(1)}
+		for i := b * size; i < min((b+1)*size, len(rows)); i++ {
+			block.MaxFrequency = max(block.MaxFrequency, counts[i])
+			block.MinDocLen = math.Min(block.MinDocLen, index.Docs[rows[i]].DocLen)
+		}
+		blocks[b] = block
+	}
+	index.PostingBlocks[term] = blocks
 }

@@ -29,6 +29,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 	"math"
 	"runtime"
 	"sort"
@@ -77,7 +78,7 @@ func ftsScanWorkerCount(docs int) int {
 func ftsScanTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQueryNode, idf ftsIDFFunc, rows []int32, restricted bool, k int) ([]ftsScored, error) {
 	// OR scores are maxima, so the union of each term's top-k contains the
 	// exact global top-k. Restricted scans retain the authorization-aware path.
-	if !restricted && k > 0 && node != nil && node.op == "OR" && len(node.termIDNs) > 0 {
+	if !restricted && k > 0 && node != nil && ((node.op == "OR" && len(node.termIDNs) > 0) || (node.op == "TERM" && node.idfBound)) {
 		return ftsDisjunctionTopK(ctx, cache, node, k)
 	}
 	total := len(cache.docs)
@@ -164,7 +165,7 @@ func ftsEvalNode(cache ftsDocCacheEntry, doc ftsCachedDoc, node *ftsQueryNode, n
 	// The normalization is document-local, not query-node-local. Pass the
 	// immutable cache by pointer through recursion instead of copying its
 	// slices and maps for every node of every matching document.
-	lengthNorm := bm25K1 * (1 - bm25B + bm25B*normDocLen)
+	lengthNorm := ftsLengthNorm(normDocLen)
 	return ftsEvalNodeNormalized(&cache, doc, node, lengthNorm)
 }
 
@@ -750,6 +751,12 @@ func ftsCandidateScanIsCheaper(rows []int32, numRows int) bool {
 // every document. Any omitted document has at least k better documents for
 // the term supplying its maximum score, and thus cannot enter the OR top-k.
 func ftsDisjunctionTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQueryNode, k int) ([]ftsScored, error) {
+	if node.op == "TERM" {
+		copy := *node
+		copy.termIDNs = []int32{node.termID}
+		copy.termIDFs = []float64{node.termIDF}
+		node = &copy
+	}
 	terms, _ := ftsLiteralORTerms(node)
 	order := make([]int, len(terms))
 	for i := range order {
@@ -773,9 +780,32 @@ func ftsDisjunctionTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQu
 		if err := checkCtx(ctx); err != nil {
 			return nil, err
 		}
-		leaf := &ftsQueryNode{op: "TERM", termID: node.termIDNs[i], termIDF: node.termIDFs[i]}
+		frequencies := cache.postingCounts[term]
+		blocks := cache.postingBlocks[term]
+		postings := cache.postings[term]
 		local := make(ftsScoredHeap, 0, min(k, len(cache.postings[term])))
-		for pi, row := range cache.postings[term] {
+		for pi := 0; pi < len(postings); pi++ {
+			if pi%storage.FTSPostingBlockSize == 0 && len(local) == k && pi/storage.FTSPostingBlockSize < len(blocks) {
+				block := blocks[pi/storage.FTSPostingBlockSize]
+				norm := block.MinDocLen
+				if cache.avgDocLen > 0 {
+					norm /= cache.avgDocLen
+				}
+				tf := float64(block.MaxFrequency)
+				bound := ((tf * (bm25K1 + 1)) / (tf + ftsLengthNorm(norm))) * node.termIDFs[i]
+				// Outward rounding keeps pruning conservative at floating-point ties.
+				for n := 0; n < 8; n++ {
+					bound = math.Nextafter(bound, math.Inf(1))
+				}
+				if bound < local[0].score {
+					if err := checkCtx(ctx); err != nil {
+						return nil, err
+					}
+					pi += storage.FTSPostingBlockSize - 1
+					continue
+				}
+			}
+			row := postings[pi]
 			if pi&1023 == 0 {
 				if err := checkCtx(ctx); err != nil {
 					return nil, err
@@ -790,12 +820,20 @@ func ftsDisjunctionTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQu
 			if cache.avgDocLen > 0 {
 				norm /= cache.avgDocLen
 			}
-			// Share the evaluator's floating-point rounding boundaries (including
-			// architecture-specific fused arithmetic) with the document-scan path.
-			matched, score := ftsEvalNode(cache, doc, leaf, norm)
-			if !matched {
+			// Frequencies are position-aligned with postings. The fallback supports
+			// manually constructed runtime entries without the persisted field.
+			frequency := 0
+			if len(frequencies) == len(postings) {
+				frequency = int(frequencies[pi])
+			} else {
+				frequency = cache.termFrequency(doc, node.termIDNs[i])
+			}
+			if frequency <= 0 {
 				continue
 			}
+			tf := float64(frequency)
+			lengthNorm := ftsLengthNorm(norm)
+			score := ((tf * (bm25K1 + 1)) / (tf + lengthNorm)) * node.termIDFs[i]
 			ftsPushTopK(&local, ri, score, k)
 		}
 		for _, hit := range local {
@@ -815,4 +853,11 @@ func ftsDisjunctionTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQu
 		}
 	}
 	return ftsTopKFromHeap(&merged, k), nil
+}
+
+// Keep a common rounding boundary for document and posting-oriented scoring.
+//
+//go:noinline
+func ftsLengthNorm(normalizedLength float64) float64 {
+	return bm25K1 * (1 - bm25B + bm25B*normalizedLength)
 }

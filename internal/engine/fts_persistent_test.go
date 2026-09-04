@@ -75,6 +75,7 @@ func TestFTSLazyBuildIsPersistedByClose(t *testing.T) {
 	if index == nil || index.BuiltRows != 1 || index.Postings["alpha"][0] != 0 {
 		t.Fatalf("lazy FTS build was not persisted by Close: %#v", index)
 	}
+	checkPostingMetadata(t, ftsCacheFromPersistent(loaded, index))
 }
 
 func TestFTSCacheHydratesFromPersistentIndex(t *testing.T) {

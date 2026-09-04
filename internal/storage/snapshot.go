@@ -135,6 +135,14 @@ func cloneFTSIndexes(src map[string]*FTSIndex) map[string]*FTSIndex {
 		clone.DocTermIDs = append([]int32(nil), index.DocTermIDs...)
 		clone.DocTermCounts = append([]int32(nil), index.DocTermCounts...)
 		clone.DocTokenIDs = append([]int32(nil), index.DocTokenIDs...)
+		clone.PostingBlocks = make(map[string][]FTSPostingBlock, len(index.PostingBlocks))
+		for term, blocks := range index.PostingBlocks {
+			clone.PostingBlocks[term] = append([]FTSPostingBlock(nil), blocks...)
+		}
+		clone.PostingCounts = make(map[string][]int32, len(index.PostingCounts))
+		for term, counts := range index.PostingCounts {
+			clone.PostingCounts[term] = append([]int32(nil), counts...)
+		}
 		clone.Postings = make(map[string][]int32, len(index.Postings))
 		for term, rows := range index.Postings {
 			clone.Postings[term] = append([]int32(nil), rows...)

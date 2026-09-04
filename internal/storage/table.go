@@ -125,6 +125,15 @@ type FTSDocument struct {
 	Valid      bool
 }
 
+// FTSPostingBlockSize is the interval used by the format-2 score bounds.
+const FTSPostingBlockSize = 128
+
+// FTSPostingBlock stores score-independent bounds for a posting interval.
+type FTSPostingBlock struct {
+	MaxFrequency int32
+	MinDocLen    float64
+}
+
 // FTSIndex is the backend-neutral persisted representation of the BM25
 // document index used by FTS_SEARCH. Format allows future encoding changes.
 type FTSIndex struct {
@@ -136,6 +145,9 @@ type FTSIndex struct {
 	AvgDocLen     float64
 	TotalDocLen   float64
 	Postings      map[string][]int32
+	// PostingCounts is position-aligned with Postings for each term (format 2).
+	PostingCounts map[string][]int32
+	PostingBlocks map[string][]FTSPostingBlock
 	NumDocs       int
 	TermIDs       map[string]int32
 	DocTermIDs    []int32
