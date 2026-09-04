@@ -4,10 +4,14 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 )
+
+// ErrTableNotFound identifies an absent table without masking backend errors.
+var ErrTableNotFound = errors.New("no such table")
 
 // getTenant returns the tenantDB for the given tenant name, creating it
 // if necessary. Callers must hold db.mu (at least read-locked when only
@@ -87,9 +91,9 @@ func (db *DB) Get(tn, name string) (*Table, error) {
 // an AI feature — it only fires on the already-slow not-found path.
 func (db *DB) noSuchTableError(tn, name string) error {
 	if suggestion := suggestSimilar(name, db.candidateTableNames(tn)); suggestion != "" {
-		return fmt.Errorf("no such table %q (tenant %q) - did you mean %q?", name, tn, suggestion)
+		return fmt.Errorf("%w %q (tenant %q) - did you mean %q?", ErrTableNotFound, name, tn, suggestion)
 	}
-	return fmt.Errorf("no such table %q (tenant %q)", name, tn)
+	return fmt.Errorf("%w %q (tenant %q)", ErrTableNotFound, name, tn)
 }
 
 // candidateTableNames lists table names known for the tenant, both resident

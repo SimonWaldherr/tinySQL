@@ -386,7 +386,7 @@ func sqliteSchemaRows(env ExecEnv) []Row {
 	rows := make([]Row, 0, tableCount+len(views)+len(materializedViews)+len(triggers))
 	for i := range tenants {
 		for _, t := range tablesByTenant[i] {
-			if strings.HasPrefix(strings.ToLower(t.Name), "__mv_") {
+			if strings.EqualFold(t.Name, delayedInsertTable) || strings.HasPrefix(strings.ToLower(t.Name), "__mv_") {
 				continue
 			}
 			schema, name := splitObjectName(t.Name)

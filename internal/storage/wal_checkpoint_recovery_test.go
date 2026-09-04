@@ -316,7 +316,13 @@ func TestTornWALTailIsTruncatedExactly(t *testing.T) {
 		t.Fatalf("append tail: %v", err)
 	}
 
-	first, err := OpenDB(StorageConfig{Mode: ModeWAL, Path: base})
+	// Inspect replay itself: OpenDB now checkpoints the recovered state
+	// and starts a fresh Gob stream before accepting further writes.
+	first := NewDB()
+	_, _, _, wasTruncated, err := replayWAL(first, walPath, 0)
+	if !wasTruncated {
+		t.Fatal("replay did not report the torn tail")
+	}
 	if err != nil {
 		t.Fatalf("first open after damage: %v", err)
 	}

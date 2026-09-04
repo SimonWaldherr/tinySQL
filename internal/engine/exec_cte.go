@@ -78,13 +78,23 @@ func applyCTEColumnAliases(cte *CTE, rs *ResultSet) (*ResultSet, error) {
 		return nil, fmt.Errorf("CTE %s declares %d column aliases for %d result columns", cte.Name, len(cte.Columns), len(rs.Cols))
 	}
 	cols := append([]string(nil), cte.Columns...)
+	// Bind source/output keys once, rather than allocating qualified names
+	// and normalizing the same column names for every row.
+	sources := make([]string, len(cols))
+	targets := make([]string, len(cols))
+	qualified := make([]string, len(cols))
+	for i := range cols {
+		sources[i] = strings.ToLower(rs.Cols[i])
+		targets[i] = strings.ToLower(cols[i])
+		qualified[i] = strings.ToLower(cte.Name + "." + cols[i])
+	}
 	rows := make([]Row, len(rs.Rows))
 	for rowIdx, row := range rs.Rows {
 		out := make(Row, len(cols)*2)
-		for i, source := range rs.Cols {
-			value, _ := getVal(row, source)
-			putVal(out, cols[i], value)
-			putVal(out, cte.Name+"."+cols[i], value)
+		for i, source := range sources {
+			value := row[source]
+			out[targets[i]] = value
+			out[qualified[i]] = value
 		}
 		rows[rowIdx] = out
 	}
@@ -100,22 +110,26 @@ func alignRecursiveCTERows(accRs *ResultSet, nextRs *ResultSet, cteName string) 
 		return nextRs.Rows
 	}
 
-	alignedRows := make([]Row, 0, len(nextRs.Rows))
-	for _, r := range nextRs.Rows {
-		nr := make(Row)
-		for i := range accRs.Cols {
-			src := nextRs.Cols[i]
-			var val any
-			if v, ok := r[strings.ToLower(src)]; ok {
-				val = v
-			} else if v, ok := r[src]; ok {
-				val = v
+	sources := make([]string, len(accRs.Cols))
+	targets := make([]string, len(accRs.Cols))
+	qualified := make([]string, len(accRs.Cols))
+	for i, col := range accRs.Cols {
+		sources[i] = strings.ToLower(nextRs.Cols[i])
+		targets[i] = strings.ToLower(col)
+		qualified[i] = strings.ToLower(cteName + "." + targets[i])
+	}
+	alignedRows := make([]Row, len(nextRs.Rows))
+	for rowIdx, r := range nextRs.Rows {
+		nr := make(Row, len(targets)*2)
+		for i, source := range sources {
+			val, ok := r[source]
+			if !ok {
+				val = r[nextRs.Cols[i]]
 			}
-			tgt := strings.ToLower(accRs.Cols[i])
-			putVal(nr, tgt, val)
-			putVal(nr, cteName+"."+tgt, val)
+			nr[targets[i]] = val
+			nr[qualified[i]] = val
 		}
-		alignedRows = append(alignedRows, nr)
+		alignedRows[rowIdx] = nr
 	}
 	return alignedRows
 }

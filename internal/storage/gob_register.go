@@ -4,6 +4,7 @@ package storage
 
 import (
 	"math/big"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -18,6 +19,8 @@ func init() {
 	safeGobRegister([]float64{})
 	safeGobRegister([]byte{})
 	safeGobRegister([]any{})
+	safeGobRegister(time.Time{})
+	safeGobRegister(map[string]any{})
 	safeGobRegister(big.Rat{})
 	safeGobRegister(&big.Rat{})
 	safeGobRegister(uuid.UUID{})

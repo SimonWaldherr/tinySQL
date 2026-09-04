@@ -147,6 +147,16 @@ func OpenWAL(db *DB, cfg WALConfig) (*WALManager, error) {
 		},
 	}
 	wm.encoder = gob.NewEncoder(writer)
+	// A newly constructed gob encoder cannot append to an existing stream:
+	// it repeats type definitions, and the next recovery treats them as a
+	// corrupt tail. Persist recovered state with its sequence watermark and
+	// start a fresh stream before accepting writes after a reopen.
+	if size > 0 {
+		if err := wm.Checkpoint(db); err != nil {
+			_ = wm.Close()
+			return nil, err
+		}
+	}
 	return wm, nil
 }
 

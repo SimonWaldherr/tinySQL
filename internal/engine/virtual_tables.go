@@ -119,6 +119,9 @@ func sysTablesRows(env ExecEnv) []Row {
 	var rows []Row
 	for _, tn := range env.db.ListTenants() {
 		for _, t := range env.db.ListTables(tn) {
+			if strings.EqualFold(t.Name, delayedInsertTable) {
+				continue
+			}
 			schema, name := splitObjectName(t.Name)
 			r := make(Row)
 			putVal(r, "tenant", tn)
@@ -154,6 +157,9 @@ func tableStatusRows(env ExecEnv) []Row {
 	rows := make([]Row, 0)
 	for _, tn := range env.db.ListTenants() {
 		for _, t := range env.db.ListTables(tn) {
+			if strings.EqualFold(t.Name, delayedInsertTable) {
+				continue
+			}
 			if strings.HasPrefix(strings.ToLower(t.Name), "__mv_") {
 				continue
 			}
@@ -377,6 +383,9 @@ func sysColumnsRows(env ExecEnv) []Row {
 	var rows []Row
 	for _, tn := range env.db.ListTenants() {
 		for _, t := range env.db.ListTables(tn) {
+			if strings.EqualFold(t.Name, delayedInsertTable) {
+				continue
+			}
 			schema, tableName := splitObjectName(t.Name)
 			for i, c := range t.Cols {
 				r := make(Row)
@@ -409,6 +418,9 @@ func sysConstraintsRows(env ExecEnv) []Row {
 	var rows []Row
 	for _, tn := range env.db.ListTenants() {
 		for _, t := range env.db.ListTables(tn) {
+			if strings.EqualFold(t.Name, delayedInsertTable) {
+				continue
+			}
 			schema, tableName := splitObjectName(t.Name)
 			for _, c := range t.Cols {
 				if c.Constraint == storage.NoConstraint {
