@@ -27,9 +27,9 @@ func BenchmarkEvalLikeCaseInsensitive(b *testing.B) {
 }
 
 // BenchmarkEvalLikeWildcardBacktracking exercises a pattern with an interior
-// wildcard that compileLikeStringMatcher's shape detection can't shortcut
-// (falls back to matchLikePattern) — isolates the caching win alone, without
-// the exact/prefix/suffix/substring fast paths also contributing.
+// wildcard that previously fell back to matchLikePattern. Keep the benchmark
+// name for before/after comparisons; the compiled matcher now searches its
+// literal segments directly, in addition to reusing the compiled pattern.
 func BenchmarkEvalLikeWildcardBacktracking(b *testing.B) {
 	env := ExecEnv{}
 	row := Row{}

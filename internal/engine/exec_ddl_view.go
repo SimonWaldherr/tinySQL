@@ -347,22 +347,7 @@ func refreshMaterializedView(env ExecEnv, name string) (err error) {
 		return fmt.Errorf("materialized view %q query produced no result set", name)
 	}
 
-	cols := make([]storage.Column, len(rs.Cols))
-	for i, c := range rs.Cols {
-		colType := storage.TextType
-		if len(rs.Rows) > 0 {
-			colType = inferType(rs.Rows[0][strings.ToLower(c)])
-		}
-		cols[i] = storage.Column{Name: c, Type: colType}
-	}
-	cache := storage.NewTable(mv.CacheTableName, cols, false)
-	for _, r := range rs.Rows {
-		row := make([]any, len(cols))
-		for i, c := range cols {
-			row[i] = r[strings.ToLower(c.Name)]
-		}
-		cache.Rows = append(cache.Rows, row)
-	}
+	cache := materializeViewResult(mv.CacheTableName, rs)
 	rowCount = int64(len(cache.Rows))
 	// Replace, not Drop-then-Put: those are two separate lock acquisitions,
 	// so a concurrent SELECT calling ensureMaterializedViewCache's own
@@ -373,4 +358,39 @@ func refreshMaterializedView(env ExecEnv, name string) (err error) {
 	// surfacing that error to the SELECT instead of silently serving the
 	// (still valid) existing cache. Replace closes that window.
 	return env.db.Replace(env.tenant, cache)
+}
+
+// materializeViewResult prepares keys once and groups row storage into bounded
+// blocks. Full slice expressions keep appending to one row from overwriting
+// the next row. Blocks belong exclusively to this new snapshot.
+func materializeViewResult(name string, rs *ResultSet) *storage.Table {
+	cols := make([]storage.Column, len(rs.Cols))
+	keys := make([]string, len(rs.Cols))
+	for i, c := range rs.Cols {
+		keys[i] = strings.ToLower(c)
+		colType := storage.TextType
+		if len(rs.Rows) > 0 {
+			colType = inferType(rs.Rows[0][keys[i]])
+		}
+		cols[i] = storage.Column{Name: c, Type: colType}
+	}
+	table := storage.NewTable(name, cols, false)
+	table.Rows = make([][]any, len(rs.Rows))
+	blockRows := 4096
+	if len(cols) > 0 {
+		blockRows = max(1, 4096/len(cols))
+	}
+	for start := 0; start < len(rs.Rows); start += blockRows {
+		count := min(blockRows, len(rs.Rows)-start)
+		cells := make([]any, count*len(cols))
+		for j := 0; j < count; j++ {
+			offset := j * len(cols)
+			row := cells[offset : offset+len(cols) : offset+len(cols)]
+			for c, key := range keys {
+				row[c] = rs.Rows[start+j][key]
+			}
+			table.Rows[start+j] = row
+		}
+	}
+	return table
 }

@@ -42,7 +42,7 @@ func rowToTextLikeMatcher(e Expr) (func(string) bool, bool) {
 		return nil, false
 	}
 	lit, ok := like.Pattern.(*Literal)
-	if !ok {
+	if !ok || lit.Parameter {
 		return nil, false
 	}
 	pattern, ok := lit.Val.(string)
@@ -54,40 +54,6 @@ func rowToTextLikeMatcher(e Expr) (func(string) bool, bool) {
 		return func(s string) bool { return !match(s) }, true
 	}
 	return match, true
-}
-
-// compileLikeStringMatcher compiles a literal LIKE/ILIKE pattern (% and _
-// wildcards, no ESCAPE/GLOB) into the cheapest possible func(string) bool,
-// mirroring the shape-detection buildCompiledLikeFilter/buildCompiledILikeFilter
-// use for column LIKE — exact/prefix/suffix/substring patterns skip the
-// general backtracking matcher entirely.
-func compileLikeStringMatcher(pattern string, caseInsensitive bool) func(string) bool {
-	pat := pattern
-	if caseInsensitive {
-		pat = strings.ToLower(pattern)
-	}
-	norm := func(s string) string {
-		if caseInsensitive {
-			return strings.ToLower(s)
-		}
-		return s
-	}
-	switch {
-	case !strings.ContainsAny(pat, "%_"):
-		return func(s string) bool { return norm(s) == pat }
-	case strings.HasSuffix(pat, "%") && !strings.ContainsAny(pat[:len(pat)-1], "%_"):
-		prefix := pat[:len(pat)-1]
-		return func(s string) bool { return strings.HasPrefix(norm(s), prefix) }
-	case strings.HasPrefix(pat, "%") && !strings.ContainsAny(pat[1:], "%_"):
-		suffix := pat[1:]
-		return func(s string) bool { return strings.HasSuffix(norm(s), suffix) }
-	case strings.HasPrefix(pat, "%") && strings.HasSuffix(pat, "%") &&
-		len(pat) >= 2 && !strings.ContainsAny(pat[1:len(pat)-1], "%_"):
-		mid := pat[1 : len(pat)-1]
-		return func(s string) bool { return strings.Contains(norm(s), mid) }
-	default:
-		return func(s string) bool { return matchLikePattern(norm(s), pat, '\\') }
-	}
 }
 
 // buildRawRowToTextAndFilter detects 2+ `ROW_TO_TEXT() LIKE 'term'` conjuncts
@@ -529,7 +495,7 @@ func buildRawFilterLike(colIndex map[string]int, ex *LikeExpr) func([]any) (bool
 		return nil
 	}
 	pat, isLit := ex.Pattern.(*Literal)
-	if !isLit {
+	if !isLit || pat.Parameter {
 		return nil
 	}
 	pattern, isStr := pat.Val.(string)
@@ -1072,97 +1038,28 @@ func numericFast(v any) (float64, bool) {
 //   - '%suffix'     →  strings.HasSuffix(s, "suffix")
 //   - '%middle%'    →  strings.Contains(s, "middle")
 //
-// Patterns containing '_' wildcards or multiple '%' anchors fall back to the
-// general matchLikePattern function.
+// Multiple '%' anchors use ordered literal searches. '_' and escaped patterns
+// retain the general Unicode matcher.
 func buildCompiledLikeFilter(colIdx int, pattern string, negate bool) func([]any) (bool, error) {
-	matchFn := func(match func(string) bool) func([]any) (bool, error) {
-		if negate {
-			return func(raw []any) (bool, error) {
-				s, ok := raw[colIdx].(string)
-				if !ok {
-					return false, nil
-				}
-				return !match(s), nil
-			}
-		}
-		return func(raw []any) (bool, error) {
-			s, ok := raw[colIdx].(string)
-			if !ok {
-				return false, nil
-			}
-			return match(s), nil
-		}
-	}
-
-	// No wildcards → exact match.
-	if !strings.ContainsAny(pattern, "%_") {
-		return matchFn(func(s string) bool { return s == pattern })
-	}
-
-	// prefix% – no other wildcards.
-	if strings.HasSuffix(pattern, "%") && !strings.ContainsAny(pattern[:len(pattern)-1], "%_") {
-		prefix := pattern[:len(pattern)-1]
-		return matchFn(func(s string) bool { return strings.HasPrefix(s, prefix) })
-	}
-
-	// %suffix – no other wildcards.
-	if strings.HasPrefix(pattern, "%") && !strings.ContainsAny(pattern[1:], "%_") {
-		suffix := pattern[1:]
-		return matchFn(func(s string) bool { return strings.HasSuffix(s, suffix) })
-	}
-
-	// %middle% – no other wildcards.
-	if strings.HasPrefix(pattern, "%") && strings.HasSuffix(pattern, "%") &&
-		len(pattern) >= 2 && !strings.ContainsAny(pattern[1:len(pattern)-1], "%_") {
-		middle := pattern[1 : len(pattern)-1]
-		return matchFn(func(s string) bool { return strings.Contains(s, middle) })
-	}
-
-	// Fall back to the general matcher.
-	return matchFn(func(s string) bool { return matchLikePattern(s, pattern, '\\') })
+	return buildCompiledTextLikeFilter(colIdx, pattern, false, negate)
 }
 
-// buildCompiledILikeFilter compiles an ILIKE / NOT ILIKE pattern into a closure.
-// It pre-lowercases the pattern and lowercases each column value at match time,
-// without any per-row heap allocations.
 func buildCompiledILikeFilter(colIdx int, pattern string, negate bool) func([]any) (bool, error) {
-	// Pre-lowercase the pattern once.
-	lowerPat := strings.ToLower(pattern)
+	return buildCompiledTextLikeFilter(colIdx, pattern, true, negate)
+}
 
-	// Pick the cheapest sub-matcher based on the lowercased pattern shape.
-	var match func(string) bool
-	switch {
-	case !strings.ContainsAny(lowerPat, "%_"):
-		match = func(s string) bool { return strings.ToLower(s) == lowerPat }
-	case strings.HasSuffix(lowerPat, "%") && !strings.ContainsAny(lowerPat[:len(lowerPat)-1], "%_"):
-		prefix := lowerPat[:len(lowerPat)-1]
-		match = func(s string) bool { return strings.HasPrefix(strings.ToLower(s), prefix) }
-	case strings.HasPrefix(lowerPat, "%") && !strings.ContainsAny(lowerPat[1:], "%_"):
-		suffix := lowerPat[1:]
-		match = func(s string) bool { return strings.HasSuffix(strings.ToLower(s), suffix) }
-	case strings.HasPrefix(lowerPat, "%") && strings.HasSuffix(lowerPat, "%") &&
-		len(lowerPat) >= 2 && !strings.ContainsAny(lowerPat[1:len(lowerPat)-1], "%_"):
-		mid := lowerPat[1 : len(lowerPat)-1]
-		match = func(s string) bool { return strings.Contains(strings.ToLower(s), mid) }
-	default:
-		match = func(s string) bool { return matchLikePattern(strings.ToLower(s), lowerPat, '\\') }
-	}
-
-	if negate {
-		return func(raw []any) (bool, error) {
-			s, ok := raw[colIdx].(string)
-			if !ok {
-				return false, nil
-			}
-			return !match(s), nil
-		}
-	}
+// Share matching and SQL value conversion with the general LIKE evaluator.
+func buildCompiledTextLikeFilter(colIdx int, pattern string, insensitive, negate bool) func([]any) (bool, error) {
+	match := compileLikeStringMatcher(pattern, insensitive)
 	return func(raw []any) (bool, error) {
-		s, ok := raw[colIdx].(string)
-		if !ok {
+		if raw[colIdx] == nil {
 			return false, nil
 		}
-		return match(s), nil
+		matched := match(valueText(raw[colIdx]))
+		if negate {
+			matched = !matched
+		}
+		return matched, nil
 	}
 }
 

@@ -581,18 +581,25 @@ func rowsFromResultSet(rs *ResultSet, alias string) []Row {
 	if rs == nil {
 		return nil
 	}
+	keys := make([]string, len(rs.Cols))
+	qualified := make([]string, len(rs.Cols))
+	for i, c := range rs.Cols {
+		keys[i] = strings.ToLower(c)
+		if alias != "" {
+			qualified[i] = strings.ToLower(alias + "." + c)
+		}
+	}
 	rows := make([]Row, len(rs.Rows))
 	for i, r := range rs.Rows {
 		out := make(Row, len(rs.Cols)*2)
-		for _, c := range rs.Cols {
-			key := strings.ToLower(c)
+		for j, key := range keys {
 			val, ok := getValLower(r, key)
 			if !ok {
 				continue
 			}
-			putVal(out, c, val)
+			out[key] = val
 			if alias != "" {
-				putVal(out, alias+"."+c, val)
+				out[qualified[j]] = val
 			}
 		}
 		rows[i] = out
