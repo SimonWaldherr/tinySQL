@@ -474,6 +474,7 @@ type routeStep struct {
 // routing scratch implementation.
 type routeSearchScratch struct {
 	dist               []float64
+	heuristic          []float64 // lazily allocated by A*, valid for this search generation
 	prevNode, prevEdge []int
 	generation         []uint32
 	mark               uint32
@@ -603,7 +604,7 @@ func routeSearchScratchBytes(scratch *routeSearchScratch) int {
 	if scratch == nil {
 		return 0
 	}
-	return cap(scratch.dist)*8 + cap(scratch.prevNode)*8 + cap(scratch.prevEdge)*8 +
+	return cap(scratch.dist)*8 + cap(scratch.heuristic)*8 + cap(scratch.prevNode)*8 + cap(scratch.prevEdge)*8 +
 		cap(scratch.generation)*4 + cap(scratch.heap)*16
 }
 
@@ -697,11 +698,12 @@ func reconstructRoutePath(scratch *routeSearchScratch, start, end int) []routeSt
 			break
 		}
 	}
-	path := make([]routeStep, len(rev))
-	for i, s := range rev {
-		path[len(rev)-1-i] = s
+	// The reverse walk already owns its backing slice. Reverse it in place
+	// instead of allocating a second complete path for every route response.
+	for left, right := 0, len(rev)-1; left < right; left, right = left+1, right-1 {
+		rev[left], rev[right] = rev[right], rev[left]
 	}
-	return path
+	return rev
 }
 
 // routeArgError names which positional argument failed, matching this

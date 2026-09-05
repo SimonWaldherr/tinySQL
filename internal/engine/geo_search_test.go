@@ -192,3 +192,38 @@ func TestGeoSearchRejectsNonFiniteQueryBeforeIndexBuild(t *testing.T) {
 		t.Fatal("GEO_SEARCH built a grid before rejecting a non-finite bbox coordinate")
 	}
 }
+
+// A one-point corpus makes an under-sized candidate bbox observable: a
+// coarse cell containing unrelated points cannot accidentally hide the miss.
+func TestGeoSearchRadiusSphericalBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name                                 string
+		lon, lat, pointLon, pointLat, radius float64
+	}{
+		{"equatorial_boundary", 0, 0, 0, 0.00899, 1000},
+		{"north_pole", 0, 89.999, 180, 89.999, 300},
+		{"south_pole", 0, -89.999, 180, -89.999, 300},
+		{"wide_high_latitude", 0, 60, 60, 70, 3000000},
+		{"dateline_east", 179.999, 0, -179.999, 0, 300},
+		{"dateline_west", -179.999, 0, 179.999, 0, 300},
+		{"whole_globe", 0, 0, 180, 0, 21000000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if distance := haversineMeters(tc.lat, tc.lon, tc.pointLat, tc.pointLon); distance > tc.radius {
+				t.Fatalf("invalid fixture: distance=%v radius=%v", distance, tc.radius)
+			}
+			db := storage.NewDB()
+			execSQL(t, db, `CREATE TABLE points (id INT, geom GEOMETRY, embedding VECTOR)`)
+			execSQL(t, db, fmt.Sprintf(`INSERT INTO points VALUES (1, '{"type":"Point","coordinates":[%v,%v]}', '[1,0]')`, tc.pointLon, tc.pointLat))
+			geo := geoSearchIDSet(t, db, fmt.Sprintf(`SELECT id FROM GEO_SEARCH('points','geom','radius',%v,%v,%v)`, tc.lon, tc.lat, tc.radius))
+			if !geo[1] {
+				t.Fatal("GEO_SEARCH excluded a point within the radius")
+			}
+			rag := execSQL(t, db, fmt.Sprintf(`SELECT id FROM RAG_SEARCH('points','embedding','[1,0]',1,
+    '{"pre_filter":{"spatial":{"geometry_column":"geom","center":[%v,%v],"radius_meters":%v}}}')`, tc.lon, tc.lat, tc.radius))
+			if len(rag.Rows) != 1 || rag.Rows[0]["id"] != 1 {
+				t.Fatalf("RAG_SEARCH excluded a point within the radius: %#v", rag.Rows)
+			}
+		})
+	}
+}

@@ -20,7 +20,10 @@ at three consecutive stages of one hybrid query:
    for every branch candidate.
 3. **Row-ID-native hybrid fusion.** `RAG_SEARCH` fuses the two candidate lists
    directly by physical row ID. It no longer creates two wide intermediate
-   result tables or reconstructs identity from projected values before RRF.
+   result tables or reconstructs identity from projected values before RRF. A
+   bounded top-k heap selects winners before sorting, preserving exact RRF
+   scores and deterministic tie order while reducing ranking work for wide
+   candidate pools.
 4. **Serving warm-up and query planning.** `FTS_WARM` eagerly prepares the
    same persistent/runtime lexical entry as `FTS_SEARCH`; repeated lexical
    queries reuse their immutable wildcard expansion, candidate set, and BM25
@@ -154,3 +157,6 @@ independently. Phase 4 should reuse their finalized persisted formats. Add the
 evaluation harness from Phase 5 early, and gate each later optimization on its
 quality and latency results. Observability should land alongside each phase,
 with the consolidated public diagnostics completed in Phase 6.
+
+See [retrieval performance](retrieval-performance.md) for the current RAG/GIS
+search-path optimizations, measured tradeoffs, and reproduction commands.

@@ -266,15 +266,23 @@ func aStarSearch(g *routeGraph, coords *routeGraphCoordinates, start, end int, s
 	const inf = 1e308
 	scratch := acquireRouteSearchScratch(len(g.nodeValues), wantPath)
 	defer releaseRouteSearchScratch(scratch)
+	if cap(scratch.heuristic) < len(g.nodeValues) {
+		scratch.heuristic = make([]float64, len(g.nodeValues))
+	} else {
+		scratch.heuristic = scratch.heuristic[:len(g.nodeValues)]
+	}
+	// A node's goal and scale are fixed during one query. Memoize its
+	// haversine estimate on first discovery, including for stale heap entries.
+	scratch.heuristic[start] = coords.heuristic(start, end, scale)
 	scratch.setDistance(start, 0)
 	if wantPath {
 		scratch.prevNode[start], scratch.prevEdge[start] = -1, -1
 	}
-	routeHeapPush(&scratch.heap, routeHeapEntry{node: start, cost: coords.heuristic(start, end, scale)})
+	routeHeapPush(&scratch.heap, routeHeapEntry{node: start, cost: scratch.heuristic[start]})
 	for len(scratch.heap) > 0 {
 		current := routeHeapPop(&scratch.heap)
 		currentDistance := scratch.distance(current.node, inf)
-		if current.cost != currentDistance+coords.heuristic(current.node, end, scale) {
+		if current.cost != currentDistance+scratch.heuristic[current.node] {
 			continue
 		}
 		if current.node == end {
@@ -290,12 +298,15 @@ func aStarSearch(g *routeGraph, coords *routeGraphCoordinates, start, end int, s
 			if candidate >= scratch.distance(to, inf) {
 				continue
 			}
+			if scratch.generation[to] != scratch.mark {
+				scratch.heuristic[to] = coords.heuristic(to, end, scale)
+			}
 			scratch.setDistance(to, candidate)
 			if wantPath {
 				scratch.prevNode[to] = current.node
 				scratch.prevEdge[to] = int(g.rowIdx[edge])
 			}
-			routeHeapPush(&scratch.heap, routeHeapEntry{node: to, cost: candidate + coords.heuristic(to, end, scale)})
+			routeHeapPush(&scratch.heap, routeHeapEntry{node: to, cost: candidate + scratch.heuristic[to]})
 		}
 	}
 	return nil, 0, false

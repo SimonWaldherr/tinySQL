@@ -40,6 +40,7 @@ Supported geospatial formats and CRS profiles are summarized in the
 | Inspect catalog and scheduled jobs | [`catalog_demo`](./catalog_demo/README.md) | Console demo or browser dashboard for tables, views, functions, and jobs |
 | Search a support knowledge base | [`supportdesk`](./supportdesk/README.md) | Console demo or persistent browser help desk with FTS and tickets |
 | Explore a read-only POI snapshot | [`offline_demo`](./offline_demo/README.md) | CLI snapshot search or browser explorer; no map tiles required |
+| Try OSM snapping, profiles and turn restrictions | [`routingdemo`](./routingdemo/README.md) | `go run ./cmd/routingdemo`; no external data needed |
 | Evaluate local RAG retrieval | [`ragdemo`](./ragdemo/README.md) | Requires a local embedding server |
 | Explore tinyORM | [`tinyorm_demo`](./tinyorm_demo/README.md) | CLI demo or persistent places directory with migrations and named parameters |
 

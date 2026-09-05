@@ -553,8 +553,10 @@ As with `TILE_COVER`, a bbox with `west > east` crosses the antimeridian.
 
 For POIs, observations, incidents, or nearby-document retrieval, replace
 `bbox` with `"center":[longitude,latitude]` and a positive
-`"radius_meters"`. Radius mode measures from each geometry centroid. The
-lazy, versioned spatial grid is shared with `GEO_SEARCH`, coalesces concurrent
+`"radius_meters"`. Radius mode measures from each geometry centroid. Candidate
+bounds use the same spherical Earth model as the final distance check,
+including circles that cross the date line or reach either pole. The lazy,
+versioned spatial grid is shared with `GEO_SEARCH`, coalesces concurrent
 cold builds, and caches the final combined row set by table version and filter
 JSON. Invalid spatial input is rejected before a cold grid build.
 

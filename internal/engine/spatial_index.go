@@ -20,6 +20,7 @@ package engine
 import (
 	"context"
 	"math"
+	"math/bits"
 	"sync"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -73,8 +74,9 @@ type geoGridIndex struct {
 	// bboxes retains the already-computed per-row extent. GIS/RAG viewport
 	// filters can therefore perform an exact bbox residual check without
 	// reparsing GeoJSON after the grid has narrowed the candidate set.
-	bboxes []geoEditBBox
-	valid  []bool
+	bboxes      []geoEditBBox
+	valid       []bool
+	uniqueCells bool // no row occurs in multiple cells; overflow rows are disjoint
 }
 
 var (
@@ -156,7 +158,7 @@ func getGeoGridIndex(ctx context.Context, tenant string, table *storage.Table, c
 // the resulting row count and union bbox, then a second pass buckets each
 // row into every cell its own bbox touches.
 func buildGeoGridIndex(ctx context.Context, table *storage.Table, colIdx int) (*geoGridIndex, error) {
-	idx := &geoGridIndex{table: table, version: table.Version}
+	idx := &geoGridIndex{table: table, version: table.Version, uniqueCells: true}
 	n := len(table.Rows)
 	idx.valid = make([]bool, n)
 	idx.centroids = make([]geoPoint, n)
@@ -245,6 +247,9 @@ func buildGeoGridIndex(ctx context.Context, table *storage.Table, colIdx int) (*
 			idx.overflow = append(idx.overflow, int32(i))
 			continue
 		}
+		if cellCount > 1 {
+			idx.uniqueCells = false
+		}
 		for cx := minCX; cx <= maxCX; cx++ {
 			for cy := minCY; cy <= maxCY; cy++ {
 				cell := geoCellID{X: cx, Y: cy}
@@ -269,6 +274,17 @@ func (idx *geoGridIndex) candidatesBBox(minLon, minLat, maxLon, maxLat float64) 
 		maxLat < idx.bounds.MinY || minLat > idx.bounds.MaxY {
 		return nil
 	}
+	// A query covering the complete extent needs no cell traversal or
+	// deduplication. Row order is already deterministic in this path.
+	if minLon <= idx.bounds.MinX && maxLon >= idx.bounds.MaxX && minLat <= idx.bounds.MinY && maxLat >= idx.bounds.MaxY {
+		out := make([]int32, 0, len(idx.valid))
+		for row, valid := range idx.valid {
+			if valid {
+				out = append(out, int32(row))
+			}
+		}
+		return out
+	}
 	// The result cannot change outside the indexed data extent. Clamping here
 	// also keeps extreme-but-finite inputs away from int32 conversion overflow.
 	minLon = math.Max(minLon, idx.bounds.MinX)
@@ -280,44 +296,81 @@ func (idx *geoGridIndex) candidatesBBox(minLon, minLat, maxLon, maxLat float64) 
 	minCY := int32(math.Floor(minLat / idx.cellSizeLat))
 	maxCY := int32(math.Floor(maxLat / idx.cellSizeLat))
 
-	seen := make(map[int32]bool)
+	// Point layers have no duplicates. Dense polygon queries use a compact
+	// bitmap; selective queries keep a sparse set so a tiny viewport does not
+	// allocate scratch memory proportional to a very large source table.
+	cellCount := (int64(maxCX) - int64(minCX) + 1) * (int64(maxCY) - int64(minCY) + 1)
+	useBitmap := !idx.uniqueCells && cellCount >= int64(len(idx.cells))/64
+	var bitmap []uint64
+	var seen map[int32]bool
+	if useBitmap {
+		bitmap = make([]uint64, (len(idx.valid)+63)/64)
+	} else if !idx.uniqueCells {
+		seen = make(map[int32]bool)
+	}
 	var out []int32
-	add := func(rowIdx int32) {
-		if !seen[rowIdx] {
-			seen[rowIdx] = true
-			out = append(out, rowIdx)
+	addRows := func(rows []int32) {
+		if idx.uniqueCells {
+			out = append(out, rows...)
+		} else if useBitmap {
+			for _, row := range rows {
+				bitmap[row/64] |= uint64(1) << (uint(row) % 64)
+			}
+		} else {
+			for _, row := range rows {
+				if !seen[row] {
+					seen[row] = true
+					out = append(out, row)
+				}
+			}
 		}
 	}
-	for _, rowIdx := range idx.overflow {
-		add(rowIdx)
-	}
+	addRows(idx.overflow)
 	for cx := minCX; cx <= maxCX; cx++ {
 		for cy := minCY; cy <= maxCY; cy++ {
-			for _, rowIdx := range idx.cells[geoCellID{X: cx, Y: cy}] {
-				add(rowIdx)
+			addRows(idx.cells[geoCellID{X: cx, Y: cy}])
+		}
+	}
+	if useBitmap {
+		count := 0
+		for _, word := range bitmap {
+			count += bits.OnesCount64(word)
+		}
+		out = make([]int32, 0, count)
+		for i, word := range bitmap {
+			for word != 0 {
+				out = append(out, int32(i*64+bits.TrailingZeros64(word)))
+				word &= word - 1
 			}
 		}
 	}
 	return out
 }
 
-// candidatesRadius converts a radius in meters to a conservative degree
-// padding around the center (documented limitation: this only ever
-// over-includes, matching plan_range_index.go's own "range is a superset
-// filter" philosophy) and delegates to candidatesBBox.
+// candidatesRadius bounds a spherical cap using the same Earth radius as
+// haversineMeters. A linear meters-per-degree approximation can under-include
+// boundary points, and any cap touching a pole must cover all longitudes.
 func (idx *geoGridIndex) candidatesRadius(centerLon, centerLat, radiusMeters float64) []int32 {
-	const metersPerDegreeLat = 111320.0
-	padLat := radiusMeters / metersPerDegreeLat
-	cosLat := math.Cos(centerLat * math.Pi / 180)
-	if math.Abs(cosLat) < 0.01 {
-		cosLat = 0.01 // clamp near the poles so padLon doesn't blow up
+	// GEO_SEARCH historically accepts any finite center. Outside WGS84, keep
+	// the candidate pass conservative and let the existing distance test decide.
+	if centerLon < -180 || centerLon > 180 || centerLat < -90 || centerLat > 90 {
+		return idx.candidatesBBox(-math.MaxFloat64, -math.MaxFloat64, math.MaxFloat64, math.MaxFloat64)
 	}
-	padLon := radiusMeters / (metersPerDegreeLat * math.Abs(cosLat))
-	minLon, maxLon := centerLon-padLon, centerLon+padLon
-	minLat, maxLat := centerLat-padLat, centerLat+padLat
-	if padLon >= 180 {
+	// Round the bounds outward so floating-point error cannot exclude a point
+	// accepted by the residual haversine comparison at the circle boundary.
+	angle := radiusMeters/geoEarthRadiusMeters + 1e-12
+	if angle >= math.Pi {
+		return idx.candidatesBBox(-180, -90, 180, 90)
+	}
+	padLat := angle * 180 / math.Pi
+	minLat := math.Max(-90, centerLat-padLat)
+	maxLat := math.Min(90, centerLat+padLat)
+	if minLat <= -90 || maxLat >= 90 {
 		return idx.candidatesBBox(-180, minLat, 180, maxLat)
 	}
+	padLon := math.Asin(math.Min(1, math.Sin(angle)/math.Cos(centerLat*math.Pi/180))) * 180 / math.Pi
+	minLon, maxLon := centerLon-padLon, centerLon+padLon
+
 	if minLon < -180 {
 		return geoMergeCandidateRows(
 			idx.candidatesBBox(-180, minLat, maxLon, maxLat),

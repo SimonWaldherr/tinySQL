@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -197,7 +197,8 @@ func (f *GeoSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 	}
 	candidates := selectCandidates(idx)
 
-	var matched []int32
+	// Candidates are query-local; compact matches into the same allocation.
+	matched := candidates[:0]
 	for _, rowIdx := range candidates {
 		if rowIdx < 0 || int(rowIdx) >= len(idx.valid) || !idx.valid[rowIdx] {
 			continue
@@ -206,7 +207,7 @@ func (f *GeoSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 			matched = append(matched, rowIdx)
 		}
 	}
-	sort.Slice(matched, func(i, j int) bool { return matched[i] < matched[j] })
+	slices.Sort(matched)
 
 	resultCols := make([]string, 0, len(table.Cols)+1)
 	for _, c := range table.Cols {
@@ -219,7 +220,7 @@ func (f *GeoSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 		if int(rowIdx) >= len(table.Rows) {
 			continue
 		}
-		r := make(Row)
+		r := make(Row, len(resultCols))
 		for ci, c := range table.Cols {
 			if ci < len(table.Rows[rowIdx]) {
 				r[c.Name] = table.Rows[rowIdx][ci]

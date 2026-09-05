@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6" generator="tinySQL synthetic routing demo">
+  <node id="1" lat="48" lon="10.999"/>
+  <node id="2" lat="48" lon="11"/>
+  <node id="3" lat="48" lon="11.001"/>
+  <node id="4" lat="48.001" lon="11"/>
+  <node id="5" lat="48.001" lon="11.001"/>
+  <way id="10"><nd ref="1"/><nd ref="2"/><tag k="highway" v="residential"/></way>
+  <way id="20"><nd ref="2"/><nd ref="3"/><tag k="highway" v="residential"/></way>
+  <way id="30"><nd ref="2"/><nd ref="4"/><tag k="highway" v="residential"/></way>
+  <way id="40"><nd ref="4"/><nd ref="5"/><nd ref="3"/><tag k="highway" v="residential"/></way>
+  <relation id="100">
+    <member type="way" ref="10" role="from"/>
+    <member type="node" ref="2" role="via"/>
+    <member type="way" ref="20" role="to"/>
+    <tag k="type" v="restriction"/>
+    <tag k="restriction" v="no_straight_on"/>
+    <tag k="except" v="bicycle"/>
+  </relation>
+</osm>
