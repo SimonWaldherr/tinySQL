@@ -3,6 +3,7 @@ package engine
 import (
 	"math"
 	"math/rand"
+	"reflect"
 	"sort"
 	"testing"
 
@@ -60,6 +61,29 @@ func TestRAGFuseCandidatesNativeRows(t *testing.T) {
 	}
 	if _, ok := got.Rows[2]["_vec_rank"]; ok {
 		t.Errorf("FTS-only row unexpectedly has _vec_rank: %#v", got.Rows[2])
+	}
+}
+
+func TestRAGFuseCandidatesSmallWindowMatchesMapPath(t *testing.T) {
+	table := benchmarkRAGFuseTable(96)
+	vecRows := make([]vecScoredRow, 24)
+	ftsRows := make([]ftsScored, 24)
+	for i := range vecRows {
+		vecRows[i] = vecScoredRow{rowIdx: i, distance: float64(i) / 100}
+		ftsRows[i] = ftsScored{rowIdx: 12 + i, score: float64(100 - i)}
+	}
+	got := ragFuseCandidates(table, vecRows, ftsRows, "cosine", 60, 6)
+
+	// Invalid candidates are skipped after their rank is assigned. Appending
+	// them forces the wide-window map path without changing any valid rank or
+	// output row, giving the small linear probe a direct behavioral oracle.
+	wideFTS := append([]ftsScored(nil), ftsRows...)
+	for i := 0; i < ragFusionLinearCandidateLimit; i++ {
+		wideFTS = append(wideFTS, ftsScored{rowIdx: -1})
+	}
+	want := ragFuseCandidates(table, vecRows, wideFTS, "cosine", 60, 6)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("small fusion = %#v, map fusion = %#v", got, want)
 	}
 }
 

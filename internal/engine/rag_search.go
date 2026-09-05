@@ -52,6 +52,11 @@ type ragSearchOptions struct {
 
 const ragSearchDefaultRRFK = 60.0
 
+// The default hybrid window is 4*k per branch (normally 24+24 candidates).
+// A small linear probe is cheaper than allocating and hashing a map at that
+// size. Wider recall-oriented windows retain the map path below.
+const ragFusionLinearCandidateLimit = 64
+
 // RAGSearchTableFunc implements the RAG_SEARCH table-valued function.
 type RAGSearchTableFunc struct{}
 
@@ -434,7 +439,10 @@ func ragFuseCandidates(table *storage.Table, vecRows []vecScoredRow, ftsRows []f
 	// row IDs, so this capacity also guarantees that pointers into candidates
 	// remain stable through all appends below.
 	candidateCap := len(vecRows) + len(ftsRows)
-	byRow := make(map[int]*ragNativeCandidate, candidateCap)
+	var byRow map[int]*ragNativeCandidate
+	if candidateCap > ragFusionLinearCandidateLimit {
+		byRow = make(map[int]*ragNativeCandidate, candidateCap)
+	}
 	candidates := make([]ragNativeCandidate, 0, candidateCap)
 	ordered := make(ragNativeCandidates, 0, candidateCap)
 	for rank, candidate := range vecRows {
@@ -446,18 +454,34 @@ func ragFuseCandidates(table *storage.Table, vecRows []vecScoredRow, ftsRows []f
 			distance: candidate.distance, order: len(ordered),
 		})
 		entry := &candidates[len(candidates)-1]
-		byRow[candidate.rowIdx] = entry
+		if byRow != nil {
+			byRow[candidate.rowIdx] = entry
+		}
 		ordered = append(ordered, entry)
 	}
 	for rank, candidate := range ftsRows {
 		if candidate.rowIdx < 0 || candidate.rowIdx >= len(table.Rows) {
 			continue
 		}
-		entry := byRow[candidate.rowIdx]
+		var entry *ragNativeCandidate
+		if byRow != nil {
+			entry = byRow[candidate.rowIdx]
+		} else {
+			// Preserve the map path's duplicate behavior: its last vector entry
+			// wins, so probe in reverse order.
+			for i := len(candidates) - 1; i >= 0; i-- {
+				if candidates[i].rowIdx == candidate.rowIdx {
+					entry = &candidates[i]
+					break
+				}
+			}
+		}
 		if entry == nil {
 			candidates = append(candidates, ragNativeCandidate{rowIdx: candidate.rowIdx, order: len(ordered)})
 			entry = &candidates[len(candidates)-1]
-			byRow[candidate.rowIdx] = entry
+			if byRow != nil {
+				byRow[candidate.rowIdx] = entry
+			}
 			ordered = append(ordered, entry)
 		}
 		entry.ftsRank = rank + 1

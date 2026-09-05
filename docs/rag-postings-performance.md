@@ -178,3 +178,24 @@ the deployed CPU's AVX2/FMA support and should be measured on that host.
 GOOS=linux GOARCH=amd64 go test -c ./internal/engine
 GOOS=linux GOARCH=amd64 go test -c ./internal/engine/search
 ```
+
+## Small-window RRF fusion
+
+The default hybrid search retrieves `4 × k` candidates per branch, typically
+24 vector and 24 lexical rows. At that size, matching physical row IDs with a
+short reverse linear probe is cheaper than allocating and hashing a map. The
+probe preserves duplicate handling: the latest vector candidate wins, as it
+does in the map implementation. Candidate pools above 64 entries retain the
+existing hash-map algorithm.
+
+On Apple M2 Max, three 500 ms runs of the default 24-candidates-per-branch
+fusion measured a 2.816 µs median versus 3.211 µs before (12% lower), with
+7,560 rather than 8,752 bytes and 54 rather than 57 allocations. The 256- and
+4,096-candidate benchmarks remained within run variance because they use the
+unchanged map path. End-to-end hybrid requests also allocate three fewer
+objects and about 1.2 KiB less per request in this workload.
+
+```sh
+go test ./internal/engine -run '^$' \
+  -bench '^BenchmarkRAGFuseCandidates$' -benchmem -benchtime=500ms -count=3
+```
