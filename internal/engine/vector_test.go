@@ -804,6 +804,25 @@ func TestVecSearchNaNRowExcluded(t *testing.T) {
 	expectFloat(t, rs.Rows[1]["_vec_distance"], 1.0, 1e-9, "orthogonal row distance")
 }
 
+func TestVecCosineRankingDistanceMatchesGenericPath(t *testing.T) {
+	query := []float64{1, 2, 3}
+	queryNorm := vectorL2Norm(query)
+	for _, vector := range [][]float64{
+		{1, 2, 3},
+		{3, 2, 1},
+		{0, 0, 0},
+		{math.NaN(), 0, 0},
+		{1, 2},
+	} {
+		norm := vectorL2Norm(vector)
+		gotDistance, gotOK := vecCosineRankingDistance(vector, query, norm, queryNorm)
+		wantDistance, wantOK := vecCheckedDistance("cosine", vector, query, norm, queryNorm)
+		if gotOK != wantOK || (gotOK && gotDistance != wantDistance) {
+			t.Fatalf("vector=%v: direct=(%v,%t), generic=(%v,%t)", vector, gotDistance, gotOK, wantDistance, wantOK)
+		}
+	}
+}
+
 // TestVecSearchTopKWorkerPanicRecovered is a regression test for crash
 // safety: vecSearchTopK fans out to parallel workers once a table has
 // vecSearchParallelMinRows+ rows, and none of those goroutines had a

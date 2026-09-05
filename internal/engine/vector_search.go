@@ -822,7 +822,7 @@ func buildVecDistanceFunc(metric string, query []float64, queryNorm float64) vec
 			return func([]float64, float64) (float64, bool) { return 0, false }
 		}
 		return func(vec []float64, norm float64) (float64, bool) {
-			return vecCheckedDistance(metric, vec, query, norm, queryNorm)
+			return vecCosineRankingDistance(vec, query, norm, queryNorm)
 		}
 	case "l2":
 		return func(vec []float64, _ float64) (float64, bool) {
@@ -839,6 +839,25 @@ func buildVecDistanceFunc(metric string, query []float64, queryNorm float64) vec
 	default:
 		return func([]float64, float64) (float64, bool) { return 0, false }
 	}
+}
+
+// vecCosineRankingDistance is the cosine branch of vecCheckedDistance without
+// its per-row metric dispatch. Cosine is RAG_SEARCH's default and every flat
+// candidate otherwise passes through VectorRankingDistance and VectorDistance
+// just to select this same formula. Keeping the length and NaN checks here
+// preserves the generic path's exclusion semantics for malformed vectors.
+//
+// This matters especially on Linux/amd64: AVX2/FMA makes the dot product fast
+// enough that the generic function/switch chain becomes measurable overhead.
+func vecCosineRankingDistance(vec, query []float64, norm, queryNorm float64) (float64, bool) {
+	if len(vec) != len(query) || norm == 0 || queryNorm == 0 {
+		return 0, false
+	}
+	distance := 1.0 - search.VectorDot(vec, query)/(norm*queryNorm)
+	if math.IsNaN(distance) {
+		return 0, false
+	}
+	return distance, true
 }
 
 // vecCheckedDistance wraps search.VectorRankingDistance with a NaN guard. A NaN or

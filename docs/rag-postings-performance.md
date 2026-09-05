@@ -159,3 +159,22 @@ selection, FTS, fusion, SQL execution, and materialization.
 go test ./internal/engine/search -run '^TestVectorDotNEONMatchesUnrolled$' \
   -bench '^BenchmarkVectorDotNEONBySize$' -benchmem -benchtime=500ms -count=3
 ```
+
+## Linux/amd64 cosine dispatch
+
+Linux/amd64 already selects AVX2/FMA for suitable processors. The RAG-default
+cosine path now bypasses the generic metric dispatcher after vector search has
+selected cosine, while retaining its dimension, zero-norm, and NaN exclusion
+checks. This removes two function calls and metric switches for every scanned
+candidate, on top of the existing SIMD dot-product kernel.
+
+On the local ARM64 control run, a 96-dimensional candidate took 26.91 ns in
+the direct path versus 29.91 ns through generic dispatch (three 500 ms runs;
+both allocate zero bytes). The Linux/amd64 engine and vector-math test binaries
+are cross-compiled as ELF during verification. Actual Linux latency depends on
+the deployed CPU's AVX2/FMA support and should be measured on that host.
+
+```sh
+GOOS=linux GOARCH=amd64 go test -c ./internal/engine
+GOOS=linux GOARCH=amd64 go test -c ./internal/engine/search
+```

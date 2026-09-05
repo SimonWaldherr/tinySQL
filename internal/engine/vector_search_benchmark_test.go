@@ -851,3 +851,37 @@ func BenchmarkOrderByHammingDistanceLimit(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkVecCosineRankingDistance96 isolates the per-candidate overhead that
+// remains after the architecture-specific dot-product kernel. RAG's default
+// cosine path calls this once per vector in an exact scan; compare the direct
+// branch with the generic metric dispatcher side by side.
+func BenchmarkVecCosineRankingDistance96(b *testing.B) {
+	query := make([]float64, 96)
+	vector := make([]float64, 96)
+	for i := range query {
+		query[i] = math.Sin(float64(i) * 0.13)
+		vector[i] = math.Cos(float64(i) * 0.19)
+	}
+	queryNorm := vectorL2Norm(query)
+	vectorNorm := vectorL2Norm(vector)
+
+	b.Run("direct", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, ok := vecCosineRankingDistance(vector, query, vectorNorm, queryNorm); !ok {
+				b.Fatal("expected a valid cosine distance")
+			}
+		}
+	})
+	b.Run("generic", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, ok := vecCheckedDistance("cosine", vector, query, vectorNorm, queryNorm); !ok {
+				b.Fatal("expected a valid cosine distance")
+			}
+		}
+	})
+}
