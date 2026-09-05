@@ -217,6 +217,13 @@ func evalRawFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, erro
 	if ex.Name == "ROW_TO_TEXT" {
 		return evalRawRowToText(plan, raw, ex)
 	}
+	if len(ex.Args) == 1 && (ex.Name == "UPPER" || ex.Name == "LOWER") {
+		val, err := evalRawExpr(plan, raw, ex.Args[0])
+		if err != nil {
+			return nil, err
+		}
+		return caseStringValue(val, ex.Name == "UPPER"), nil
+	}
 	sc := rawCallScratchPool.Get().(*rawCallScratch)
 	defer rawCallScratchPool.Put(sc)
 	if cap(sc.args) < len(ex.Args) {
@@ -453,10 +460,15 @@ func evalRawIn(plan *simpleSelectPlan, raw []any, ex *InExpr) (any, error) {
 		// SQL equality, where NULL never equals NULL).
 		return nil, nil
 	}
+	hasNull := false
 	for _, valExpr := range ex.Values {
 		listVal, err := evalRawExpr(plan, raw, valExpr)
 		if err != nil {
 			return nil, err
+		}
+		if listVal == nil {
+			hasNull = true
+			continue
 		}
 		if rawEqual(val, listVal) {
 			if ex.Negate {
@@ -464,6 +476,9 @@ func evalRawIn(plan *simpleSelectPlan, raw []any, ex *InExpr) (any, error) {
 			}
 			return true, nil
 		}
+	}
+	if hasNull {
+		return nil, nil
 	}
 	if ex.Negate {
 		return true, nil

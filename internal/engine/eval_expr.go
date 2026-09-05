@@ -71,6 +71,28 @@ func evalBetween(env ExecEnv, ex *BetweenExpr, row Row) (any, error) {
 // betweenResult combines the boundary comparisons exactly like the desugared
 // forms: BETWEEN → (v >= lo AND v <= hi), NOT BETWEEN → (v < lo OR v > hi).
 func betweenResult(v, lo, hi any, negate bool) (any, error) {
+	// Common homogeneous values need neither coercion nor tri-state dispatch.
+	switch x := v.(type) {
+	case int:
+		l, lok := lo.(int)
+		h, hok := hi.(int)
+		if lok && hok {
+			return (x >= l && x <= h) != negate, nil
+		}
+	case int64:
+		l, lok := lo.(int64)
+		h, hok := hi.(int64)
+		if lok && hok {
+			return (x >= l && x <= h) != negate, nil
+		}
+	case float64:
+		l, lok := lo.(float64)
+		h, hok := hi.(float64)
+		if lok && hok && !math.IsNaN(x) && !math.IsNaN(l) && !math.IsNaN(h) {
+			return (x >= l && x <= h) != negate, nil
+		}
+	}
+
 	if negate {
 		lt, err := evalComparisonBinary("<", v, lo)
 		if err != nil {
@@ -147,12 +169,17 @@ func evalIn(env ExecEnv, ex *InExpr, row Row) (any, error) {
 	}
 
 	// Check against each value in the list
+	hasNull := false
 	for _, valExpr := range ex.Values {
 		listVal, err := evalExpr(env, valExpr, row)
 		if err != nil {
 			return nil, err
 		}
 
+		if listVal == nil {
+			hasNull = true
+			continue
+		}
 		// Compare values
 		cmp, err := compare(val, listVal)
 		if err == nil && cmp == 0 {
@@ -165,6 +192,9 @@ func evalIn(env ExecEnv, ex *InExpr, row Row) (any, error) {
 	}
 
 	// No match found
+	if hasNull {
+		return nil, nil
+	}
 	if ex.Negate {
 		return true, nil
 	}

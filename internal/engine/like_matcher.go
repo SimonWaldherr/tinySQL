@@ -7,7 +7,8 @@ import (
 
 // compileLikeStringMatcher binds the pattern once. Literal runs separated by
 // % use string search instead of restarting the rune matcher at every position.
-// Escape sequences and _ retain the Unicode-aware general matcher.
+// Fixed-width _ patterns decode only their wildcard positions. Escape sequences
+// and combinations of _ with % retain the Unicode-aware general matcher.
 func compileLikeStringMatcher(pattern string, insensitive bool) func(string) bool {
 	pat := pattern
 	if insensitive {
@@ -15,6 +16,23 @@ func compileLikeStringMatcher(pattern string, insensitive bool) func(string) boo
 	}
 	var match func(string) bool
 	switch {
+	case strings.Contains(pat, "_") && !strings.ContainsAny(pat, "%\\") && utf8.ValidString(pat) && !strings.ContainsRune(pat, utf8.RuneError):
+		parts := strings.Split(pat, "_")
+		match = func(s string) bool {
+			for _, part := range parts[:len(parts)-1] {
+				if !strings.HasPrefix(s, part) {
+					return false
+				}
+				s = s[len(part):]
+				if len(s) == 0 {
+					return false
+				}
+				_, width := utf8.DecodeRuneInString(s)
+				s = s[width:]
+			}
+			return s == parts[len(parts)-1]
+		}
+
 	case strings.ContainsAny(pat, "_\\") || !utf8.ValidString(pat) || strings.ContainsRune(pat, utf8.RuneError):
 		// RuneError can also match invalid input bytes in the general rune matcher;
 		// byte-based literal search cannot express that equivalence.

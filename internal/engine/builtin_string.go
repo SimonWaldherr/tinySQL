@@ -257,20 +257,7 @@ func evalUpper(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, err
 	}
 
-	if val == nil {
-		return nil, nil
-	}
-
-	str := valueText(val)
-
-	upper := strings.ToUpper(str)
-	// ToUpper returns str itself when no rune changes; reuse the argument's
-	// interface box in that case (== short-circuits on identical backing
-	// pointers before comparing bytes).
-	if _, ok := val.(string); ok && upper == str {
-		return val, nil
-	}
-	return upper, nil
+	return caseStringValue(val, true), nil
 }
 
 func evalLower(env ExecEnv, args []Expr, row Row) (any, error) {
@@ -283,18 +270,71 @@ func evalLower(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, err
 	}
 
+	return caseStringValue(val, false), nil
+}
+
+// caseStringValue preserves the argument box when conversion changes nothing.
+func caseStringValue(val any, upper bool) any {
 	if val == nil {
-		return nil, nil
+		return nil
 	}
-
 	str := valueText(val)
-
-	lower := strings.ToLower(str)
-	// Same no-change box reuse as evalUpper.
-	if _, ok := val.(string); ok && lower == str {
-		return val, nil
+	var converted string
+	if upper {
+		converted = strings.ToUpper(str)
+	} else {
+		converted = strings.ToLower(str)
 	}
-	return lower, nil
+	if _, ok := val.(string); ok && converted == str {
+		return val
+	}
+	return converted
+}
+
+// stringEdge only decodes the requested edge, rather than allocating every rune.
+// Partial invalid UTF-8 retains the normalization of the former []rune path.
+func stringEdge(val any, str string, n int, right bool) any {
+	if n <= 0 {
+		return ""
+	}
+	boundary := 0
+	if right {
+		boundary = len(str)
+	}
+	invalid := false
+	for i := 0; i < n; i++ {
+		if (!right && boundary == len(str)) || (right && boundary == 0) {
+			break
+		}
+		var r rune
+		var width int
+		if right {
+			r, width = utf8.DecodeLastRuneInString(str[:boundary])
+			boundary -= width
+		} else {
+			r, width = utf8.DecodeRuneInString(str[boundary:])
+			boundary += width
+		}
+		invalid = invalid || (r == utf8.RuneError && width == 1)
+	}
+	if (!right && boundary == len(str)) || (right && boundary == 0) {
+		if _, ok := val.(string); ok {
+			return val
+		}
+		return str
+	}
+	part := str[:boundary]
+	if right {
+		part = str[boundary:]
+	}
+	if invalid {
+		return string([]rune(part))
+	}
+	// A tiny projected value should not retain a large source string.
+	if len(str) > 4096 && len(part) < len(str)/4 {
+		return strings.Clone(part)
+	}
+	return part
 }
 
 func evalConcat(env ExecEnv, args []Expr, row Row) (any, error) {
@@ -492,25 +532,7 @@ func evalLeft(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, fmt.Errorf("LEFT length must be an integer")
 	}
 
-	if length < 0 {
-		return "", nil
-	}
-	if stringIsASCII(str) {
-		if length >= len(str) {
-			if _, ok := val.(string); ok {
-				return val, nil
-			}
-			return str, nil
-		}
-		return str[:length], nil
-	}
-	if length >= utf8.RuneCountInString(str) {
-		if _, ok := val.(string); ok {
-			return val, nil
-		}
-		return str, nil
-	}
-	return stringPrefix(str, length), nil
+	return stringEdge(val, str, length, false), nil
 }
 
 func evalRight(env ExecEnv, args []Expr, row Row) (any, error) {
@@ -544,26 +566,7 @@ func evalRight(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, fmt.Errorf("RIGHT length must be an integer")
 	}
 
-	if length < 0 {
-		return "", nil
-	}
-	if stringIsASCII(str) {
-		if length >= len(str) {
-			if _, ok := val.(string); ok {
-				return val, nil
-			}
-			return str, nil
-		}
-		return str[len(str)-length:], nil
-	}
-	runes := stringRunes(str)
-	if length >= len(runes) {
-		if _, ok := val.(string); ok {
-			return val, nil
-		}
-		return str, nil
-	}
-	return string(runes[len(runes)-length:]), nil
+	return stringEdge(val, str, length, true), nil
 }
 
 func evalReplace(env ExecEnv, args []Expr, row Row) (any, error) {

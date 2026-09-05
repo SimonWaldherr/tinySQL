@@ -726,10 +726,18 @@ func evalJoinRawIn(plan *simpleJoinPlan, left, right []any, ex *InExpr) (any, er
 	if err != nil {
 		return nil, err
 	}
+	if val == nil {
+		return nil, nil
+	}
+	hasNull := false
 	for _, valExpr := range ex.Values {
 		listVal, err := evalJoinRawExpr(plan, left, right, valExpr)
 		if err != nil {
 			return nil, err
+		}
+		if listVal == nil {
+			hasNull = true
+			continue
 		}
 		if rawEqual(val, listVal) {
 			if ex.Negate {
@@ -737,6 +745,9 @@ func evalJoinRawIn(plan *simpleJoinPlan, left, right []any, ex *InExpr) (any, er
 			}
 			return true, nil
 		}
+	}
+	if hasNull {
+		return nil, nil
 	}
 	if ex.Negate {
 		return true, nil
