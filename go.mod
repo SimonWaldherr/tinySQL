@@ -7,8 +7,8 @@ toolchain go1.26.6
 require (
 	github.com/google/uuid v1.6.0
 	github.com/jonas-p/go-shp v0.1.1
-	golang.org/x/crypto v0.55.0
-	modernc.org/sqlite v1.56.0
+	golang.org/x/crypto v0.56.0
+	modernc.org/sqlite v1.58.0
 )
 
 require (
@@ -16,9 +16,9 @@ require (
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
-	modernc.org/libc v1.75.3 // indirect
+	modernc.org/libc v1.75.7 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
-	modernc.org/memory v1.12.0 // indirect
+	modernc.org/memory v1.12.1 // indirect
 )
 
 require (

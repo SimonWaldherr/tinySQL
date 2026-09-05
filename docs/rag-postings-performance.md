@@ -202,19 +202,20 @@ go test ./internal/engine -run '^$' \
 
 ## Context expansion without intermediate result rows
 
-`RAG_SEARCH` with `expand_before` or `expand_after` now carries selected hit
-row IDs, document IDs, chunk indexes, and their final rank straight into the
-neighbor-expansion phase. Previously it formatted the entire vector or RRF
-result — including every source column and retrieval diagnostic — only to read
-those three values and discard the formatted rows. The compact hand-off applies
-to both vector-only and hybrid retrieval, preserves rank and stale-row handling,
-and is independent of the vector, FTS, or context-index caches.
+`RAG_SEARCH` with `expand_before` or `expand_after` now carries selected
+physical hit-row IDs straight into neighbor expansion. Expansion reads document
+ID and chunk index from those source rows directly, instead of formatting an
+entire vector or RRF result — including every source column and retrieval
+diagnostic — only to read those values and discard the formatted rows. The
+compact hand-off applies to vector-only and hybrid retrieval, preserves rank
+and stale-row handling, and is independent of the vector, FTS, or
+context-index caches.
 
 On the same Apple M2 Max workload, the warmed 20,000-row hybrid benchmark with
-one preceding and one following chunk measured a 234 µs median with 66.8 KiB
-and 353 allocations per request (three 500 ms runs). Its cold-start behavior
-also benefits because no intermediate result rows are materialized while the
-context index is built.
+one preceding and one following chunk measured a 212 µs median with 64.7 KiB
+and 341 allocations per request (three 500 ms runs). Its cold-start behavior
+also benefits because neither intermediate result rows nor private hit maps are
+materialized while the context index is built.
 
 ```sh
 go test ./internal/engine -run '^$' \

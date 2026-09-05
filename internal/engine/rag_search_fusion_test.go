@@ -113,7 +113,7 @@ func TestRAGContextHitSourceMatchesMaterializedHits(t *testing.T) {
 	t.Run("vector", func(t *testing.T) {
 		materialized := materializeVecCandidates(table, vecRows, "cosine")
 		legacy := ragSource{cols: materialized.Cols, rows: materialized.Rows}
-		compact := ragContextHitSource(table, ragRankedRowsFromVec(vecRows), "DOC_ID", "CHUNK_INDEX", "_vec_rank")
+		compact := ragContextHitSource(table, ragRowIndexesFromVec(vecRows), "DOC_ID", "CHUNK_INDEX")
 		want := ragExpandContextFrom(source, legacy, "DOC_ID", "CHUNK_INDEX", "DOC_ID", "CHUNK_INDEX", 1, 0)
 		got := ragExpandContextFrom(source, compact, "DOC_ID", "CHUNK_INDEX", "DOC_ID", "CHUNK_INDEX", 1, 0)
 		if !reflect.DeepEqual(got, want) {
@@ -125,7 +125,7 @@ func TestRAGContextHitSourceMatchesMaterializedHits(t *testing.T) {
 		materialized := ragFuseCandidates(table, vecRows, ftsRows, "cosine", 60, 3)
 		legacy := ragSource{cols: materialized.Cols, rows: materialized.Rows}
 		fused := ragFuseNativeCandidates(table, vecRows, ftsRows, 60, 3)
-		compact := ragContextHitSource(table, ragRankedRowsFromFused(fused), "DOC_ID", "CHUNK_INDEX", "_rrf_rank")
+		compact := ragContextHitSource(table, ragRowIndexesFromFused(fused), "DOC_ID", "CHUNK_INDEX")
 		want := ragExpandContextFrom(source, legacy, "DOC_ID", "CHUNK_INDEX", "DOC_ID", "CHUNK_INDEX", 1, 0)
 		got := ragExpandContextFrom(source, compact, "DOC_ID", "CHUNK_INDEX", "DOC_ID", "CHUNK_INDEX", 1, 0)
 		if !reflect.DeepEqual(got, want) {

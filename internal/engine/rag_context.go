@@ -291,29 +291,8 @@ func ragExpandContextFrom(source, hits ragSource, docCol, chunkCol, hitDocCol, h
 	contexts := getRAGContextIndex(source, docCol, chunkCol)
 	cols := append(append([]string{}, source.cols...), "_hit_rank", "_context_offset", "_context_rank", "_context_hits")
 	candidates := make(map[ragContextKey]*ragContextCandidate)
-	for hitIdx := 0; hitIdx < hits.len(); hitIdx++ {
-		hit := hits.outputRow(hitIdx)
-		docID, ok := ragValue(hit, hitDocCol)
-		if !ok {
-			// Column presence is validated up front by the caller (see
-			// RAGContextFromTableFunc.Execute) against every current caller's
-			// hit set; a row that still lacks it (e.g. a sparse in-memory
-			// fused result set built directly by RAG_SEARCH) is skipped rather
-			// than aborting the whole expansion, since this helper has no
-			// error return.
-			continue
-		}
-		chunkVal, ok := ragValue(hit, hitChunkCol)
-		if !ok {
-			continue
-		}
-		centerChunk, err := toInt(chunkVal)
-		if err != nil {
-			continue
-		}
-
+	addHit := func(docID any, centerChunk, hitRank, hitIdx int) {
 		matches := contexts.find(docID, centerChunk, before, after)
-		hitRank := ragHitRank(hit, hitIdx+1)
 		for _, m := range matches {
 			key := ragContextIdentity(m.docID, m.chunkIndex)
 			offset := m.chunkIndex - centerChunk
@@ -333,6 +312,47 @@ func ragExpandContextFrom(source, hits ragSource, docCol, chunkCol, hitDocCol, h
 				hitIndex: hitIdx,
 				hitCount: 1,
 			}
+		}
+	}
+	if compact := hits.compactHits; compact != nil {
+		// RAG_SEARCH produces physical source-row IDs. Read the two values
+		// context expansion needs directly from those rows rather than first
+		// formatting a ResultSet Row and hashing its column names. This is
+		// intentionally cache-independent and also avoids a Row map per hit.
+		if compact.docIndex >= 0 && compact.chunkIndex >= 0 {
+			for hitIdx, rowIndex := range compact.rowIndexes {
+				raw := compact.table.Rows[rowIndex]
+				if compact.docIndex >= len(raw) || compact.chunkIndex >= len(raw) {
+					continue
+				}
+				centerChunk, err := toInt(raw[compact.chunkIndex])
+				if err != nil {
+					continue
+				}
+				addHit(raw[compact.docIndex], centerChunk, hitIdx+1, hitIdx)
+			}
+		}
+	} else {
+		for hitIdx := 0; hitIdx < hits.len(); hitIdx++ {
+			hit := hits.outputRow(hitIdx)
+			docID, ok := ragValue(hit, hitDocCol)
+			if !ok {
+				// Column presence is validated up front by the caller (see
+				// RAGContextFromTableFunc.Execute) against every current caller's
+				// hit set; a row that still lacks it is skipped rather than
+				// aborting the whole expansion, since this helper has no error
+				// return.
+				continue
+			}
+			chunkVal, ok := ragValue(hit, hitChunkCol)
+			if !ok {
+				continue
+			}
+			centerChunk, err := toInt(chunkVal)
+			if err != nil {
+				continue
+			}
+			addHit(docID, centerChunk, ragHitRank(hit, hitIdx+1), hitIdx)
 		}
 	}
 
@@ -362,16 +382,12 @@ func ragExpandContextFrom(source, hits ragSource, docCol, chunkCol, hitDocCol, h
 }
 
 type ragSource struct {
-	cols []string
-	rows []Row // CTE result rows
-	// immutableRows lets a trusted internal producer hand the context helper
-	// a compact hit set without outputRow copying every map again. RAG_SEARCH
-	// owns these maps and ragExpandContextFrom only reads them; public CTE and
-	// table-function inputs retain the defensive copy below.
-	immutableRows bool
-	rawRows       [][]any
-	columnIdx     map[string]int
-	tableSource   bool
+	cols        []string
+	rows        []Row // CTE result rows
+	rawRows     [][]any
+	columnIdx   map[string]int
+	tableSource bool
+	compactHits *ragCompactHits
 	// tenant and table identify a named-table source so its neighbor-chunk
 	// index can be cached and invalidated by table.Version. Both are zero for
 	// CTE and in-memory sources, which are per-query values with no stable
@@ -383,6 +399,16 @@ type ragSource struct {
 	// the filtered neighbor index cacheable without copying and renumbering a
 	// compact rawRows slice on every query.
 	rowFilter *ragRowFilter
+}
+
+// ragCompactHits is RAG_SEARCH's private hand-off into neighbor expansion.
+// It stores selected physical rows, so no ResultSet Row maps are needed merely
+// to recover doc ID, chunk index, and final retrieval order.
+type ragCompactHits struct {
+	table      *storage.Table
+	rowIndexes []int
+	docIndex   int
+	chunkIndex int
 }
 
 type ragContextRow struct {
@@ -534,6 +560,9 @@ func ragSourceFromTable(tenant string, table *storage.Table) ragSource {
 }
 
 func (source ragSource) len() int {
+	if source.compactHits != nil {
+		return len(source.compactHits.rowIndexes)
+	}
 	if source.tableSource {
 		return len(source.rawRows)
 	}
@@ -553,9 +582,6 @@ func (source ragSource) value(rowIndex int, col string) (any, bool) {
 
 func (source ragSource) outputRow(rowIndex int) Row {
 	if !source.tableSource {
-		if source.immutableRows {
-			return source.rows[rowIndex]
-		}
 		return ragCopyOutputRow(source.cols, source.rows[rowIndex])
 	}
 	out := make(Row, len(source.cols)+3)

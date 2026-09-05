@@ -197,7 +197,7 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 			// Context expansion consumes only a hit's document, chunk and
 			// rank. Keeping this compact avoids building and immediately
 			// discarding one full, map-backed vector result row per hit.
-			contextHits = ragContextHitSource(table, ragRankedRowsFromVec(candidates), opts.DocIDColumn, opts.ChunkIndexColumn, "_vec_rank")
+			contextHits = ragContextHitSource(table, ragRowIndexesFromVec(candidates), opts.DocIDColumn, opts.ChunkIndexColumn)
 		} else {
 			result = materializeVecCandidates(table, candidates, metric)
 		}
@@ -307,7 +307,7 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 			// identity and final RRF rank, not its display row or partial
 			// vector/FTS diagnostics. Defer materialization until the actual
 			// context rows are known.
-			contextHits = ragContextHitSource(table, ragRankedRowsFromFused(fused), opts.DocIDColumn, opts.ChunkIndexColumn, "_rrf_rank")
+			contextHits = ragContextHitSource(table, ragRowIndexesFromFused(fused), opts.DocIDColumn, opts.ChunkIndexColumn)
 		} else {
 			result = materializeRAGFusedCandidates(table, fused, metric)
 		}
@@ -552,36 +552,27 @@ func ragFuseCandidates(table *storage.Table, vecRows []vecScoredRow, ftsRows []f
 	return materializeRAGFusedCandidates(table, ragFuseNativeCandidates(table, vecRows, ftsRows, rrfK, k), metric)
 }
 
-// ragRankedRow is a selected physical source row. It is intentionally smaller
-// than a ResultSet Row: neighbor expansion needs only a document ID, chunk
-// index, and final output rank, which ragContextHitSource assigns after
-// discarding any stale row IDs.
-type ragRankedRow struct {
-	rowIdx int
-}
-
-func ragRankedRowsFromVec(candidates []vecScoredRow) []ragRankedRow {
-	rows := make([]ragRankedRow, 0, len(candidates))
+func ragRowIndexesFromVec(candidates []vecScoredRow) []int {
+	rows := make([]int, 0, len(candidates))
 	for _, candidate := range candidates {
-		rows = append(rows, ragRankedRow{rowIdx: candidate.rowIdx})
+		rows = append(rows, candidate.rowIdx)
 	}
 	return rows
 }
 
-func ragRankedRowsFromFused(candidates ragNativeCandidates) []ragRankedRow {
-	rows := make([]ragRankedRow, 0, len(candidates))
+func ragRowIndexesFromFused(candidates ragNativeCandidates) []int {
+	rows := make([]int, 0, len(candidates))
 	for _, candidate := range candidates {
-		rows = append(rows, ragRankedRow{rowIdx: candidate.rowIdx})
+		rows = append(rows, candidate.rowIdx)
 	}
 	return rows
 }
 
-// ragContextHitSource builds the private, immutable hit set consumed by
+// ragContextHitSource builds the physical-row hand-off consumed by
 // ragExpandContextFrom. A normal vector/RRF result copies every source column
 // and adds diagnostic fields, but a context-expanding query returns source
 // context rows instead of those intermediate display rows.
-func ragContextHitSource(table *storage.Table, ranked []ragRankedRow, docColumn, chunkColumn, rankColumn string) ragSource {
-	cols := []string{docColumn, chunkColumn, rankColumn}
+func ragContextHitSource(table *storage.Table, rowIndexes []int, docColumn, chunkColumn string) ragSource {
 	// Table.ColIndex uses storage's schema lookup map, which is populated by
 	// CREATE TABLE. Resolve directly here as well so this internal helper stays
 	// correct for table snapshots assembled by embedders and unit tests.
@@ -595,31 +586,23 @@ func ragContextHitSource(table *storage.Table, ranked []ragRankedRow, docColumn,
 	}
 	docIdx, docOK := columnIndex(docColumn)
 	chunkIdx, chunkOK := columnIndex(chunkColumn)
-	docKey := strings.ToLower(docColumn)
-	chunkKey := strings.ToLower(chunkColumn)
-	rankKey := strings.ToLower(rankColumn)
-	rows := make([]Row, 0, len(ranked))
-	for _, hit := range ranked {
+	valid := make([]int, 0, len(rowIndexes))
+	for _, rowIndex := range rowIndexes {
 		// Match the stale-candidate defense in materializeVecCandidates and
 		// ragFuseNativeCandidates. The latter normally guarantees this, but
 		// retaining it here makes the compact helper safe for both branches.
-		if hit.rowIdx < 0 || hit.rowIdx >= len(table.Rows) {
+		if rowIndex < 0 || rowIndex >= len(table.Rows) {
 			continue
 		}
-		raw := table.Rows[hit.rowIdx]
-		row := make(Row, 3)
-		if docOK && docIdx < len(raw) {
-			row[docKey] = raw[docIdx]
-		}
-		if chunkOK && chunkIdx < len(raw) {
-			row[chunkKey] = raw[chunkIdx]
-		}
-		// Invalid row IDs above are skipped, just as the regular
-		// materializers skip them, so rank the remaining visible hit rows.
-		row[rankKey] = len(rows) + 1
-		rows = append(rows, row)
+		valid = append(valid, rowIndex)
 	}
-	return ragSource{cols: cols, rows: rows, immutableRows: true}
+	if !docOK {
+		docIdx = -1
+	}
+	if !chunkOK {
+		chunkIdx = -1
+	}
+	return ragSource{compactHits: &ragCompactHits{table: table, rowIndexes: valid, docIndex: docIdx, chunkIndex: chunkIdx}}
 }
 
 func init() {
