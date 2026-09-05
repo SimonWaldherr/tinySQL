@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-func (p *Parser) parseSelectWithCTE() (*Select, error) {
+func (p *Parser) parseWithClause() ([]CTE, error) {
 	var ctes []CTE
 
 	// Parse WITH clause if present
@@ -65,7 +65,7 @@ func (p *Parser) parseSelectWithCTE() (*Select, error) {
 			}
 
 			// Parse the SELECT statement for this CTE
-			cteSelect, err := p.parseSelect()
+			cteSelect, err := p.parseSelectWithCTE()
 			if err != nil {
 				return nil, err
 			}
@@ -90,15 +90,47 @@ func (p *Parser) parseSelectWithCTE() (*Select, error) {
 		}
 	}
 
-	// Parse the main SELECT statement
+	return ctes, nil
+}
+
+func (p *Parser) parseSelectWithCTE() (*Select, error) {
+	ctes, err := p.parseWithClause()
+	if err != nil {
+		return nil, err
+	}
 	sel, err := p.parseSelect()
 	if err != nil {
 		return nil, err
 	}
-
-	// Attach CTEs to the main SELECT
 	sel.CTEs = ctes
+	return sel, nil
+}
 
+// A leading WITH can supply an INSERT's SELECT source. Keep the resulting
+// AST an ordinary Insert so authorization, rollback, bindings and WAL reuse
+// the same execution paths as INSERT ... WITH ... SELECT.
+func (p *Parser) parseWithStatement() (Statement, error) {
+	ctes, err := p.parseWithClause()
+	if err != nil {
+		return nil, err
+	}
+	if p.cur.Val == "INSERT" {
+		stmt, err := p.parseInsert()
+		if err != nil {
+			return nil, err
+		}
+		insert := stmt.(*Insert)
+		if insert.Select == nil {
+			return nil, p.errf("WITH before INSERT requires a SELECT source")
+		}
+		insert.Select.CTEs = append(ctes, insert.Select.CTEs...)
+		return insert, nil
+	}
+	sel, err := p.parseSelect()
+	if err != nil {
+		return nil, err
+	}
+	sel.CTEs = ctes
 	return sel, nil
 }
 

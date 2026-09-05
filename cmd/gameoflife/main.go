@@ -49,8 +49,8 @@ func createBoard(ctx context.Context, db *tinysql.DB, width, height int, live ma
  UNION ALL SELECT -1, 0 UNION ALL SELECT 1, 0
  UNION ALL SELECT -1, 1 UNION ALL SELECT 0, 1 UNION ALL SELECT 1, 1
  ), contributions AS (
- SELECT MOD(c.x + o.dx + %d, %d) AS nx,
-        MOD(c.y + o.dy + %d, %d) AS ny, c.alive AS alive
+ SELECT (c.x + o.dx + %d) %% %d AS nx,
+        (c.y + o.dy + %d) %% %d AS ny, c.alive AS alive
  FROM cells c CROSS JOIN offsets o
  ) SELECT nx AS x, ny AS y, SUM(alive) AS neighbor_count
  FROM contributions GROUP BY nx, ny`, width, width, height, height))
@@ -58,11 +58,10 @@ func createBoard(ctx context.Context, db *tinysql.DB, width, height int, live ma
 		return err
 	}
 	_, err = query(ctx, db, `CREATE VIEW next_generation AS
- WITH neighbors AS (SELECT * FROM neighbor_counts)
  SELECT c.x AS x, c.y AS y,
  CASE WHEN nc.neighbor_count = 3 OR (c.alive = 1 AND nc.neighbor_count = 2)
  THEN 1 ELSE 0 END AS alive
- FROM cells c LEFT JOIN neighbors nc ON c.x = nc.x AND c.y = nc.y`)
+ FROM cells c LEFT JOIN neighbor_counts nc ON c.x = nc.x AND c.y = nc.y`)
 	return err
 }
 

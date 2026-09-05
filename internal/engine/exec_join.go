@@ -70,12 +70,28 @@ func processJoins(env ExecEnv, joins []JoinClause, cur []Row) ([]Row, error) {
 			}
 			rightTable = &storage.Table{Name: j.Right.Alias, Cols: cols}
 		} else {
-			rt, err := env.db.Get(env.tenant, j.Right.Table)
-			if err != nil {
-				return nil, err
+			schema, name := splitObjectName(j.Right.Table)
+			if mv, ok := env.db.Catalog().GetMaterializedView(schema, name); ok {
+				rightTable, err = ensureMaterializedViewCache(env, j.Right.Table, mv)
+				if err != nil {
+					return nil, err
+				}
+				rightRows, _ = rowsFromTable(rightTable, aliasOr(j.Right))
+			} else if rs, found, viewErr := resolveViewResult(env, j.Right); found || viewErr != nil {
+				if viewErr != nil {
+					return nil, viewErr
+				}
+				rightRows = rowsFromResultSet(rs, aliasOr(j.Right))
+				rightTable = resultSetTable(aliasOr(j.Right), rs.Cols)
+			} else {
+				rt, err := env.db.Get(env.tenant, j.Right.Table)
+				if err != nil {
+					return nil, err
+				}
+
+				rightRows, _ = rowsFromTable(rt, aliasOr(j.Right))
+				rightTable = rt
 			}
-			rightRows, _ = rowsFromTable(rt, aliasOr(j.Right))
-			rightTable = rt
 		}
 
 		switch j.Type {

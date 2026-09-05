@@ -415,7 +415,7 @@ func isComparisonOp(op string) bool {
 
 func isArithmeticOp(op string) bool {
 	switch op {
-	case "+", "-", "*", "/":
+	case "+", "-", "*", "/", "%":
 		return true
 	default:
 		return false

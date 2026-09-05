@@ -61,8 +61,10 @@ func (p *Parser) parseStatement() (Statement, error) {
 		return p.parseGrantOrRevoke(true)
 	case "REVOKE":
 		return p.parseGrantOrRevoke(false)
-	case "SELECT", "WITH":
+	case "SELECT":
 		return p.parseSelectWithCTE()
+	case "WITH":
+		return p.parseWithStatement()
 	default:
 		return p.parseBareTableSelect()
 	}

@@ -6,6 +6,7 @@ package engine
 import (
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"strings"
 	"unicode/utf8"
@@ -534,7 +535,7 @@ func evalBinary(env ExecEnv, ex *Binary, row Row) (any, error) {
 	}
 
 	switch ex.Op {
-	case "+", "-", "*", "/":
+	case "+", "-", "*", "/", "%":
 		return evalArithmeticBinary(ex.Op, lv, rv)
 	case "||":
 		return evalConcatOperator(lv, rv), nil
@@ -612,6 +613,13 @@ func evalArithmeticBinary(op string, lv, rv any) (any, error) {
 				return new(big.Rat).Sub(a, b), nil
 			case "*":
 				return new(big.Rat).Mul(a, b), nil
+			case "%":
+				if b.Sign() == 0 {
+					return nil, errors.New("division by zero")
+				}
+				quotient := new(big.Rat).Quo(a, b)
+				integer := new(big.Int).Quo(quotient.Num(), quotient.Denom())
+				return new(big.Rat).Sub(a, new(big.Rat).Mul(new(big.Rat).SetInt(integer), b)), nil
 			case "/":
 				if b.Sign() == 0 {
 					return nil, errors.New("division by zero")
@@ -634,6 +642,11 @@ func evalArithmeticBinary(op string, lv, rv any) (any, error) {
 		return lf - rf, nil
 	case "*":
 		return lf * rf, nil
+	case "%":
+		if rf == 0 {
+			return nil, errors.New("division by zero")
+		}
+		return math.Mod(lf, rf), nil
 	case "/":
 		if rf == 0 {
 			return nil, errors.New("division by zero")

@@ -543,7 +543,15 @@ func ensureMaterializedViewCache(env ExecEnv, sourceName string, mv *storage.Cat
 }
 
 func resolveViewSource(env ExecEnv, s *Select) ([]Row, bool, error) {
-	schema, name := splitObjectName(s.From.Table)
+	rs, found, err := resolveViewResult(env, s.From)
+	if !found || err != nil {
+		return nil, found, err
+	}
+	return rowsFromResultSet(rs, aliasOr(s.From)), true, nil
+}
+
+func resolveViewResult(env ExecEnv, source FromItem) (*ResultSet, bool, error) {
+	schema, name := splitObjectName(source.Table)
 	view, ok := env.db.Catalog().GetView(schema, name)
 	if !ok {
 		return nil, false, nil
@@ -566,7 +574,7 @@ func resolveViewSource(env ExecEnv, s *Select) ([]Row, bool, error) {
 	if err != nil {
 		return nil, true, err
 	}
-	return rowsFromResultSet(rs, aliasOr(s.From)), true, nil
+	return rs, true, nil
 }
 
 func rowsFromResultSet(rs *ResultSet, alias string) []Row {

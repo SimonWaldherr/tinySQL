@@ -851,9 +851,12 @@ cd cmd/query_files_wasm
 
 ## Limitations
 
+See [SQL feature gaps and recent additions](docs/sql-feature-gaps.md) for the
+current SQL-focused inventory and runnable examples.
+
 - Single-process only: no built-in replication, clustering, sharding,
   distributed transactions, or failover.
-- No composite primary/foreign keys, `CHECK`, `UPSERT`/`ON CONFLICT`,
+- No composite primary/foreign keys, `CHECK`, `ON CONFLICT DO UPDATE` (target-less `ON CONFLICT DO NOTHING` is supported),
   `SAVEPOINT`, `ATTACH`/`DETACH`, `VACUUM`, partial indexes, generated
   columns, or persistent ANN vector index files.
 - Secondary indexes optimize equality/prefix seeks and numeric ranges; text

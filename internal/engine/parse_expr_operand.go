@@ -41,7 +41,7 @@ func (p *Parser) parseMulDiv() (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	for p.cur.Typ == tSymbol && (p.cur.Val == "*" || p.cur.Val == "/") {
+	for p.cur.Typ == tSymbol && (p.cur.Val == "*" || p.cur.Val == "/" || p.cur.Val == "%") {
 		op := p.cur.Val
 		p.next()
 		r, err := p.parseUnary()
