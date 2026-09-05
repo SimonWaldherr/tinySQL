@@ -362,11 +362,16 @@ func ragExpandContextFrom(source, hits ragSource, docCol, chunkCol, hitDocCol, h
 }
 
 type ragSource struct {
-	cols        []string
-	rows        []Row // CTE result rows
-	rawRows     [][]any
-	columnIdx   map[string]int
-	tableSource bool
+	cols []string
+	rows []Row // CTE result rows
+	// immutableRows lets a trusted internal producer hand the context helper
+	// a compact hit set without outputRow copying every map again. RAG_SEARCH
+	// owns these maps and ragExpandContextFrom only reads them; public CTE and
+	// table-function inputs retain the defensive copy below.
+	immutableRows bool
+	rawRows       [][]any
+	columnIdx     map[string]int
+	tableSource   bool
 	// tenant and table identify a named-table source so its neighbor-chunk
 	// index can be cached and invalidated by table.Version. Both are zero for
 	// CTE and in-memory sources, which are per-query values with no stable
@@ -548,6 +553,9 @@ func (source ragSource) value(rowIndex int, col string) (any, bool) {
 
 func (source ragSource) outputRow(rowIndex int) Row {
 	if !source.tableSource {
+		if source.immutableRows {
+			return source.rows[rowIndex]
+		}
 		return ragCopyOutputRow(source.cols, source.rows[rowIndex])
 	}
 	out := make(Row, len(source.cols)+3)

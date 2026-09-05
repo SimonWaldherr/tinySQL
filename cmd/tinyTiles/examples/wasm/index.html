@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>tinyTiles offline sync demo</title>
+    <style>
+      :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, sans-serif; }
+      body { max-width: 56rem; margin: 2rem auto; padding: 0 1rem; }
+      fieldset { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .75rem; margin: 1rem 0; }
+      label { display: grid; gap: .25rem; font-size: .9rem; }
+      input { min-width: 0; padding: .45rem; }
+      button { padding: .55rem .9rem; margin-right: .5rem; }
+      pre { overflow: auto; padding: 1rem; border-radius: .4rem; background: color-mix(in srgb, CanvasText 8%, Canvas); }
+      .wide { grid-column: span 4; }
+      @media (max-width: 42rem) { fieldset { grid-template-columns: repeat(2, minmax(0, 1fr)); } .wide { grid-column: span 2; } }
+    </style>
+  </head>
+  <body>
+    <h1>tinyTiles offline sync</h1>
+    <p>This demo stores a bounded TMS tile range in browser IndexedDB. It uses a revisioned sync manifest, so an interrupted update never replaces the currently active offline revision.</p>
+
+    <fieldset>
+      <legend>Cache and server</legend>
+      <label class="wide">IndexedDB name<input id="cache-name" value="tinytiles-demo"></label>
+      <label class="wide">Manifest URL<input id="manifest-url" value="http://localhost:8080/sync/manifest.json"></label>
+      <label class="wide">Dataset (optional check)<input id="dataset" value="demo"></label>
+    </fieldset>
+
+    <fieldset>
+      <legend>Offline TMS range · up to 1,024 tiles</legend>
+      <label>Zoom<input id="z" type="number" min="0" max="30" value="8"></label>
+      <label>X min<input id="xmin" type="number" min="0" value="137"></label>
+      <label>X max<input id="xmax" type="number" min="0" value="137"></label>
+      <label>Y min<input id="ymin" type="number" min="0" value="167"></label>
+      <label>Y max<input id="ymax" type="number" min="0" value="167"></label>
+      <label>Workers<input id="concurrency" type="number" min="1" max="32" value="4"></label>
+    </fieldset>
+
+    <p>
+      <button id="open" disabled>Open cache</button>
+      <button id="close" disabled>Close cache</button>
+      <button id="sync" disabled>Sync range</button>
+      <button id="get" disabled>Read first tile</button>
+    </p>
+    <pre id="status" aria-live="polite">Loading WebAssembly…</pre>
+
+    <script src="wasm_exec.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

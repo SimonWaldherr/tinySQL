@@ -193,12 +193,31 @@ func evalTrimCommon(env ExecEnv, name string, side trimSide, args []Expr, row Ro
 
 	var trimmed string
 	if cutset == "" {
-		// Default: Unicode-aware whitespace trimming.
+		// Default: Unicode-aware whitespace trimming. strings.TrimSpace
+		// already has its own inlined ASCII fast path in the standard
+		// library, so the TRIM (both-sides) case goes straight there
+		// unchanged. TrimLeftFunc/TrimRightFunc do not have an equivalent:
+		// they decode each rune and make an indirect call through the
+		// predicate argument (unicode.IsSpace) even for a plain-ASCII
+		// string, where every whitespace rune unicode.IsSpace would report
+		// is already one of the six bytes asciiIsSpace checks directly.
+		// LTRIM/RTRIM run on every row of a scan, so skip the indirect
+		// per-rune calls whenever the whole string is ASCII (checked once
+		// via stringIsASCII, the same fast-path pattern stringPrefix/LENGTH
+		// already use) and fall back to the general Unicode path otherwise.
 		switch side {
 		case trimLeft:
-			trimmed = strings.TrimLeftFunc(str, unicode.IsSpace)
+			if stringIsASCII(str) {
+				trimmed = asciiTrimLeftSpace(str)
+			} else {
+				trimmed = strings.TrimLeftFunc(str, unicode.IsSpace)
+			}
 		case trimRight:
-			trimmed = strings.TrimRightFunc(str, unicode.IsSpace)
+			if stringIsASCII(str) {
+				trimmed = asciiTrimRightSpace(str)
+			} else {
+				trimmed = strings.TrimRightFunc(str, unicode.IsSpace)
+			}
 		default:
 			trimmed = strings.TrimSpace(str)
 		}
@@ -219,6 +238,40 @@ func evalTrimCommon(env ExecEnv, name string, side trimSide, args []Expr, row Ro
 		return val, nil
 	}
 	return trimmed, nil
+}
+
+// asciiIsSpace matches unicode.IsSpace's verdict for every rune a
+// stringIsASCII string can actually decode to: unicode.IsSpace treats two
+// extra Latin-1 codepoints (NEL 0x85, NBSP 0xA0) as space, but neither is
+// representable as a single ASCII byte (both are >= 0x80), so they can never
+// appear in a string stringIsASCII has already confirmed is all single-byte
+// runes -- making this exactly equivalent to unicode.IsSpace there.
+func asciiIsSpace(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\v', '\f', '\r':
+		return true
+	}
+	return false
+}
+
+// asciiTrimLeftSpace/asciiTrimRightSpace are strings.TrimLeftFunc(str,
+// unicode.IsSpace)/TrimRightFunc(str, unicode.IsSpace) for a string already
+// known to be pure ASCII: a direct byte scan instead of decoding each rune
+// and making an indirect call through the predicate for every one of them.
+func asciiTrimLeftSpace(str string) string {
+	i := 0
+	for i < len(str) && asciiIsSpace(str[i]) {
+		i++
+	}
+	return str[i:]
+}
+
+func asciiTrimRightSpace(str string) string {
+	i := len(str)
+	for i > 0 && asciiIsSpace(str[i-1]) {
+		i--
+	}
+	return str[:i]
 }
 
 func evalLTrim(env ExecEnv, args []Expr, row Row) (any, error) {
@@ -373,7 +426,12 @@ func evalLength(env ExecEnv, args []Expr, row Row) (any, error) {
 
 	str := valueText(val)
 
-	return utf8.RuneCountInString(str), nil
+	// stringCharCount takes the same ASCII fast path stringPrefix/LPAD/RPAD
+	// use: LENGTH/CHAR_LENGTH runs on every row of a scan, and
+	// utf8.RuneCountInString unconditionally walks the whole string even
+	// though len(str) already gives the exact same answer for plain ASCII
+	// text (the overwhelmingly common case).
+	return stringCharCount(str), nil
 }
 
 // stringRunes returns str as characters rather than UTF-8 bytes. SQL string

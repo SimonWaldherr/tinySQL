@@ -1,0 +1,13 @@
+# Go build output
+bin/
+*.test
+*.out
+.DS_Store
+dist/
+coverage.out
+
+# Local map datasets and published artifacts
+*.mbtiles
+*.pbf
+*.ttiles/
+*.tinytiles/

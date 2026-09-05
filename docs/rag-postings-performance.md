@@ -199,3 +199,25 @@ objects and about 1.2 KiB less per request in this workload.
 go test ./internal/engine -run '^$' \
   -bench '^BenchmarkRAGFuseCandidates$' -benchmem -benchtime=500ms -count=3
 ```
+
+## Context expansion without intermediate result rows
+
+`RAG_SEARCH` with `expand_before` or `expand_after` now carries selected hit
+row IDs, document IDs, chunk indexes, and their final rank straight into the
+neighbor-expansion phase. Previously it formatted the entire vector or RRF
+result — including every source column and retrieval diagnostic — only to read
+those three values and discard the formatted rows. The compact hand-off applies
+to both vector-only and hybrid retrieval, preserves rank and stale-row handling,
+and is independent of the vector, FTS, or context-index caches.
+
+On the same Apple M2 Max workload, the warmed 20,000-row hybrid benchmark with
+one preceding and one following chunk measured a 234 µs median with 66.8 KiB
+and 353 allocations per request (three 500 ms runs). Its cold-start behavior
+also benefits because no intermediate result rows are materialized while the
+context index is built.
+
+```sh
+go test ./internal/engine -run '^$' \
+  -bench '^BenchmarkRAGHybridSearchWithExpansion$' -benchmem \
+  -benchtime=500ms -count=3
+```

@@ -40,6 +40,70 @@ func projectRawRow(plan *simpleSelectPlan, raw []any) (Row, error) {
 	return out, nil
 }
 
+// rawRowPool recycles the Row maps produced by projectRawRowPooled, used only
+// by the streaming producer path (streamSimpleSelectPlan /
+// streamPagedSimpleSelectPlan in stream.go), never by the materializing fast
+// paths in exec_fastpath_select.go.
+//
+// A profile of simple single-column projections (SELECT expr FROM t) found
+// this map allocation as the single largest allocation source in the whole
+// query path -- around 99% of allocated objects for a scan of otherwise
+// nearly-free scalar functions, dwarfing the cost of the functions
+// themselves. Pooling is safe specifically here because ResultStream.Row's
+// own doc comment already establishes the invariant this relies on: "Row is
+// valid until the next call to Next." database/sql's driver (the only
+// current caller of ReleaseRow) reads every value it needs out of a row via
+// copyRow before its next call to stream.Next(), so by the time it calls
+// ReleaseRow the map is not referenced anywhere else -- not by the stream
+// (Next overwrites its one `current` field before producing another row),
+// not by the channel (the row has already been received off it), and not by
+// the driver itself (copyRow copies values out, never the map). A consumer
+// that never calls ReleaseRow (a caller using ExecuteStream directly, e.g.
+// cmd/server or cmd/tinysql) simply forgoes the reuse; sync.Pool.Get/Put are
+// safe under concurrent use from the producer and consumer goroutines, and
+// Put accepts a map regardless of which path allocated it.
+var rawRowPool = sync.Pool{
+	New: func() any { return make(Row) },
+}
+
+// projectRawRowPooled is projectRawRow, but drawing its output map from
+// rawRowPool instead of allocating a fresh one every row. See rawRowPool's
+// doc comment for the safety argument and ReleaseRow for the release side.
+func projectRawRowPooled(plan *simpleSelectPlan, raw []any) (Row, error) {
+	out := rawRowPool.Get().(Row)
+	for _, p := range plan.projs {
+		var v any
+		if p.colIdx >= 0 {
+			v = raw[p.colIdx]
+		} else {
+			var err error
+			v, err = evalRawExpr(plan, raw, p.expr)
+			if err != nil {
+				clear(out)
+				rawRowPool.Put(out)
+				return nil, err
+			}
+		}
+		out[p.key] = v
+		if p.altKey != "" {
+			out[p.altKey] = v
+		}
+	}
+	return out, nil
+}
+
+// releasePooledRow returns row to rawRowPool for reuse. Callers must not use
+// row again afterward. Safe to call with a row that did not come from the
+// pool (e.g. because pooling was not in effect for this stream): sync.Pool
+// does not care about an object's provenance.
+func releasePooledRow(row Row) {
+	if row == nil {
+		return
+	}
+	clear(row)
+	rawRowPool.Put(row)
+}
+
 // projectRawValues computes the projected value of every select-list item into
 // vals (which must have len(plan.projs) entries), without building a Row map.
 //

@@ -79,7 +79,13 @@ func (r *rows) Next(dest []driver.Value) error {
 			}
 			return io.EOF
 		}
-		return r.copyRow(r.stream.Row(), r.streamCols, dest)
+		row := r.stream.Row()
+		err := r.copyRow(row, r.streamCols, dest)
+		// copyRow has already read every value it needs out of row into dest;
+		// nothing else can still reference this specific map (see
+		// ResultStream.ReleaseRow's doc comment), so hand it back for reuse.
+		r.stream.ReleaseRow(row)
+		return err
 	}
 
 	if r.i >= len(r.rs.Rows) {

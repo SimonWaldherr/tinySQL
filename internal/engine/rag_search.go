@@ -172,7 +172,9 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 	var (
 		result      *ResultSet
 		sourceTable *storage.Table
+		contextHits ragSource
 	)
+	contextExpansion := opts.ExpandBefore > 0 || opts.ExpandAfter > 0
 	if !hybrid {
 		var (
 			table      *storage.Table
@@ -191,7 +193,14 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 		if len(candidates) > k {
 			candidates = candidates[:k]
 		}
-		result = materializeVecCandidates(table, candidates, metric)
+		if contextExpansion {
+			// Context expansion consumes only a hit's document, chunk and
+			// rank. Keeping this compact avoids building and immediately
+			// discarding one full, map-backed vector result row per hit.
+			contextHits = ragContextHitSource(table, ragRankedRowsFromVec(candidates), opts.DocIDColumn, opts.ChunkIndexColumn, "_vec_rank")
+		} else {
+			result = materializeVecCandidates(table, candidates, metric)
+		}
 		sourceTable = table
 	} else {
 		if len(opts.KeyColumns) == 0 {
@@ -292,12 +301,21 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 		if rrfK <= 0 {
 			rrfK = ragSearchDefaultRRFK
 		}
-		result = ragFuseCandidates(table, vecCandidates, ftsCandidates, metric, rrfK, k)
+		fused := ragFuseNativeCandidates(table, vecCandidates, ftsCandidates, rrfK, k)
+		if contextExpansion {
+			// As in the vector-only path, expansion needs the physical hit
+			// identity and final RRF rank, not its display row or partial
+			// vector/FTS diagnostics. Defer materialization until the actual
+			// context rows are known.
+			contextHits = ragContextHitSource(table, ragRankedRowsFromFused(fused), opts.DocIDColumn, opts.ChunkIndexColumn, "_rrf_rank")
+		} else {
+			result = materializeRAGFusedCandidates(table, fused, metric)
+		}
 		sourceTable = table
 	}
 
 	// ---- Optional neighbor-context expansion --------------------------
-	if opts.ExpandBefore > 0 || opts.ExpandAfter > 0 {
+	if contextExpansion {
 		if opts.DocIDColumn == "" || opts.ChunkIndexColumn == "" {
 			return nil, fmt.Errorf("RAG_SEARCH: doc_id_column and chunk_index_column are required when expand_before/expand_after is set")
 		}
@@ -313,14 +331,10 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 		// phase. Reapply the pre-filter to the source so an authorized hit can
 		// never pull an adjacent unauthorized chunk into the final context.
 		source = ragFilterSource(source, rowFilter)
-		// hits is built directly from the fused/vector-only ResultSet already
-		// computed above rather than via ragLoadSource: RAG_SEARCH's hits are
-		// an in-memory result the caller never registered as a table or CTE.
-		// A directly-constructed, non-table ragSource only needs cols/rows
-		// populated (see ragSource.value/outputRow/len) — exactly what
-		// ragLoadSource itself builds for a CTE hit set.
-		hits := ragSource{cols: result.Cols, rows: result.Rows}
-		result = ragExpandContextFrom(source, hits, opts.DocIDColumn, opts.ChunkIndexColumn, opts.DocIDColumn, opts.ChunkIndexColumn, opts.ExpandBefore, opts.ExpandAfter)
+		// contextHits is a compact in-memory source created from the final
+		// vector or RRF candidates. It carries precisely the columns consumed
+		// by ragExpandContextFrom and never appears as a user-visible table.
+		result = ragExpandContextFrom(source, contextHits, opts.DocIDColumn, opts.ChunkIndexColumn, opts.DocIDColumn, opts.ChunkIndexColumn, opts.ExpandBefore, opts.ExpandAfter)
 	}
 
 	return result, nil
@@ -432,7 +446,7 @@ func ragTopCandidates(candidates ragNativeCandidates, k int) ragNativeCandidates
 // presence (as ragValue/ragHitRank already do) rather than compare against a
 // placeholder to tell whether a row was retrieved by a given pass.
 // _rrf_score/_rrf_rank are always present on every output row.
-func ragFuseCandidates(table *storage.Table, vecRows []vecScoredRow, ftsRows []ftsScored, metric string, rrfK float64, k int) *ResultSet {
+func ragFuseNativeCandidates(table *storage.Table, vecRows []vecScoredRow, ftsRows []ftsScored, rrfK float64, k int) ragNativeCandidates {
 	// The two retrieval branches operate on the same immutable table snapshot,
 	// so a physical row index is a complete identity. Candidate count can never
 	// exceed the total input length, including any duplicate or invalid input
@@ -496,6 +510,13 @@ func ragFuseCandidates(table *storage.Table, vecRows []vecScoredRow, ftsRows []f
 		}
 	}
 	ordered = ragTopCandidates(ordered, k)
+	return ordered
+}
+
+// materializeRAGFusedCandidates formats selected native candidates into the
+// public hybrid-search row shape. It is deliberately separate from fusion so
+// a context-expanding RAG_SEARCH can use the compact candidates directly.
+func materializeRAGFusedCandidates(table *storage.Table, ordered ragNativeCandidates, metric string) *ResultSet {
 
 	cols := make([]string, 0, len(table.Cols)+7)
 	for _, column := range table.Cols {
@@ -525,6 +546,80 @@ func ragFuseCandidates(table *storage.Table, vecRows []vecScoredRow, ftsRows []f
 		rows = append(rows, row)
 	}
 	return &ResultSet{Cols: cols, Rows: rows}
+}
+
+func ragFuseCandidates(table *storage.Table, vecRows []vecScoredRow, ftsRows []ftsScored, metric string, rrfK float64, k int) *ResultSet {
+	return materializeRAGFusedCandidates(table, ragFuseNativeCandidates(table, vecRows, ftsRows, rrfK, k), metric)
+}
+
+// ragRankedRow is a selected physical source row. It is intentionally smaller
+// than a ResultSet Row: neighbor expansion needs only a document ID, chunk
+// index, and final output rank, which ragContextHitSource assigns after
+// discarding any stale row IDs.
+type ragRankedRow struct {
+	rowIdx int
+}
+
+func ragRankedRowsFromVec(candidates []vecScoredRow) []ragRankedRow {
+	rows := make([]ragRankedRow, 0, len(candidates))
+	for _, candidate := range candidates {
+		rows = append(rows, ragRankedRow{rowIdx: candidate.rowIdx})
+	}
+	return rows
+}
+
+func ragRankedRowsFromFused(candidates ragNativeCandidates) []ragRankedRow {
+	rows := make([]ragRankedRow, 0, len(candidates))
+	for _, candidate := range candidates {
+		rows = append(rows, ragRankedRow{rowIdx: candidate.rowIdx})
+	}
+	return rows
+}
+
+// ragContextHitSource builds the private, immutable hit set consumed by
+// ragExpandContextFrom. A normal vector/RRF result copies every source column
+// and adds diagnostic fields, but a context-expanding query returns source
+// context rows instead of those intermediate display rows.
+func ragContextHitSource(table *storage.Table, ranked []ragRankedRow, docColumn, chunkColumn, rankColumn string) ragSource {
+	cols := []string{docColumn, chunkColumn, rankColumn}
+	// Table.ColIndex uses storage's schema lookup map, which is populated by
+	// CREATE TABLE. Resolve directly here as well so this internal helper stays
+	// correct for table snapshots assembled by embedders and unit tests.
+	columnIndex := func(name string) (int, bool) {
+		for i, column := range table.Cols {
+			if strings.EqualFold(column.Name, name) {
+				return i, true
+			}
+		}
+		return 0, false
+	}
+	docIdx, docOK := columnIndex(docColumn)
+	chunkIdx, chunkOK := columnIndex(chunkColumn)
+	docKey := strings.ToLower(docColumn)
+	chunkKey := strings.ToLower(chunkColumn)
+	rankKey := strings.ToLower(rankColumn)
+	rows := make([]Row, 0, len(ranked))
+	for _, hit := range ranked {
+		// Match the stale-candidate defense in materializeVecCandidates and
+		// ragFuseNativeCandidates. The latter normally guarantees this, but
+		// retaining it here makes the compact helper safe for both branches.
+		if hit.rowIdx < 0 || hit.rowIdx >= len(table.Rows) {
+			continue
+		}
+		raw := table.Rows[hit.rowIdx]
+		row := make(Row, 3)
+		if docOK && docIdx < len(raw) {
+			row[docKey] = raw[docIdx]
+		}
+		if chunkOK && chunkIdx < len(raw) {
+			row[chunkKey] = raw[chunkIdx]
+		}
+		// Invalid row IDs above are skipped, just as the regular
+		// materializers skip them, so rank the remaining visible hit rows.
+		row[rankKey] = len(rows) + 1
+		rows = append(rows, row)
+	}
+	return ragSource{cols: cols, rows: rows, immutableRows: true}
 }
 
 func init() {

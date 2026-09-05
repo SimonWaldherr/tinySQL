@@ -110,6 +110,20 @@ func (s *ResultStream) Row() Row {
 	return s.current
 }
 
+// ReleaseRow returns row -- which must be the value most recently returned by
+// Row, and which the caller must not use again after this call -- to the
+// producer's row pool for reuse. It is always safe to call (a no-op if
+// pooling isn't in effect for this stream's plan shape; see rawRowPool's doc
+// comment in exec_raw_eval.go), but only useful for a caller that, like
+// database/sql's driver, is finished with a row's values before it calls
+// Next again.
+func (s *ResultStream) ReleaseRow(row Row) {
+	if s == nil {
+		return
+	}
+	releasePooledRow(row)
+}
+
 // Err reports the terminal producer or context error. Closing a stream
 // explicitly is not an error.
 func (s *ResultStream) Err() error {
@@ -433,7 +447,7 @@ func streamSimpleSelectPlan(stream *ResultStream, plan *simpleSelectPlan, db *st
 			matched++
 			continue
 		}
-		out, err := projectRawRow(plan, raw)
+		out, err := projectRawRowPooled(plan, raw)
 		if err != nil {
 			return err
 		}
@@ -525,7 +539,7 @@ func streamPagedSimpleSelectPlan(stream *ResultStream, plan *simpleSelectPlan, d
 				matched++
 				continue
 			}
-			out, err := projectRawRow(plan, raw)
+			out, err := projectRawRowPooled(plan, raw)
 			if err != nil {
 				return err
 			}

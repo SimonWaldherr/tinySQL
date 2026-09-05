@@ -87,6 +87,53 @@ func TestRAGFuseCandidatesSmallWindowMatchesMapPath(t *testing.T) {
 	}
 }
 
+// TestRAGContextHitSourceMatchesMaterializedHits keeps the compact
+// context-expansion input behaviorally identical to the prior path, which
+// first formatted full vector/RRF result rows and then used them only to read
+// doc_id, chunk_index, and rank.
+func TestRAGContextHitSourceMatchesMaterializedHits(t *testing.T) {
+	table := &storage.Table{
+		Cols: []storage.Column{
+			{Name: "DOC_ID", Type: storage.TextType},
+			{Name: "CHUNK_INDEX", Type: storage.IntType},
+			{Name: "chunk_text", Type: storage.TextType},
+			{Name: "embedding", Type: storage.VectorType},
+		},
+		Rows: [][]any{
+			{"a", 0, "opening", []float64{0, 1}},
+			{"a", 1, "middle", []float64{0.7, 0.3}},
+			{"a", 2, "answer", []float64{1, 0}},
+			{"b", 0, "other", []float64{0, 1}},
+		},
+	}
+	source := ragSourceFromTable("default", table)
+	vecRows := []vecScoredRow{{rowIdx: 2, distance: 0.1}, {rowIdx: 1, distance: 0.2}, {rowIdx: -1, distance: 0.3}}
+	ftsRows := []ftsScored{{rowIdx: 1, score: 4}, {rowIdx: 3, score: 3}}
+
+	t.Run("vector", func(t *testing.T) {
+		materialized := materializeVecCandidates(table, vecRows, "cosine")
+		legacy := ragSource{cols: materialized.Cols, rows: materialized.Rows}
+		compact := ragContextHitSource(table, ragRankedRowsFromVec(vecRows), "DOC_ID", "CHUNK_INDEX", "_vec_rank")
+		want := ragExpandContextFrom(source, legacy, "DOC_ID", "CHUNK_INDEX", "DOC_ID", "CHUNK_INDEX", 1, 0)
+		got := ragExpandContextFrom(source, compact, "DOC_ID", "CHUNK_INDEX", "DOC_ID", "CHUNK_INDEX", 1, 0)
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("compact vector expansion = %#v, materialized expansion = %#v", got, want)
+		}
+	})
+
+	t.Run("hybrid", func(t *testing.T) {
+		materialized := ragFuseCandidates(table, vecRows, ftsRows, "cosine", 60, 3)
+		legacy := ragSource{cols: materialized.Cols, rows: materialized.Rows}
+		fused := ragFuseNativeCandidates(table, vecRows, ftsRows, 60, 3)
+		compact := ragContextHitSource(table, ragRankedRowsFromFused(fused), "DOC_ID", "CHUNK_INDEX", "_rrf_rank")
+		want := ragExpandContextFrom(source, legacy, "DOC_ID", "CHUNK_INDEX", "DOC_ID", "CHUNK_INDEX", 1, 0)
+		got := ragExpandContextFrom(source, compact, "DOC_ID", "CHUNK_INDEX", "DOC_ID", "CHUNK_INDEX", 1, 0)
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("compact hybrid expansion = %#v, materialized expansion = %#v", got, want)
+		}
+	})
+}
+
 var ragFuseBenchmarkSink *ResultSet
 
 // BenchmarkRAGFuseCandidates isolates reciprocal-rank fusion after the two
