@@ -142,3 +142,20 @@ go test ./internal/engine -run '^$' \
 
 Regression coverage compares contiguous and general scans for full and
 pre-filtered row sets, including invalid and dimension-mismatched vectors.
+
+## ARM64 compact embeddings
+
+On ARM64, cosine retrieval uses a dot product for every candidate. The NEON
+kernel is now selected from 32 dimensions instead of 128, covering compact
+64- and 96-dimensional embedding models. An ARM64-specific equivalence test
+checks empty, short, unaligned, and long vectors against the portable loop.
+
+Across three 500 ms Apple M2 Max runs, a 96-dimensional dot product measured
+38.31 ns with NEON versus 79.04 ns for the portable unrolled loop (median).
+This is a kernel microbenchmark; complete RAG latency also includes candidate
+selection, FTS, fusion, SQL execution, and materialization.
+
+```sh
+go test ./internal/engine/search -run '^TestVectorDotNEONMatchesUnrolled$' \
+  -bench '^BenchmarkVectorDotNEONBySize$' -benchmem -benchtime=500ms -count=3
+```

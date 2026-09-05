@@ -11,7 +11,11 @@ func vectorDotNEON(a, b []float64) float64
 func vectorL2SquaredNEON(a, b []float64) float64
 
 func vectorDotKernel(a, b []float64) float64 {
-	if len(a) < 128 {
+	// The NEON setup is already amortized for the 64- and 96-dimensional
+	// embeddings commonly used by compact RAG models.  Benchmarks on M2 show
+	// the assembly kernel winning from 32 elements onward; shorter vectors keep
+	// the Go loop, whose call overhead is lower at that size.
+	if len(a) < 32 {
 		return VectorDotUnrolled(a, b)
 	}
 	return vectorDotNEON(a, b)
