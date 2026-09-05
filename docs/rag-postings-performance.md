@@ -112,3 +112,33 @@ go test ./internal/engine -run '^$' \
 These benchmarks exclude index construction. Index-build/update latency, index
 size on disk and production concurrency percentiles remain separate measurement
 work; no improvements for those metrics are claimed here.
+
+## Direct vector-column scans
+
+The exact flat vector pass now recognizes the usual immutable column layout: a
+single packed segment without UPDATE overrides. It addresses vector, validity,
+and norm data by row offset directly. This avoids an overrides-map probe and a
+binary segment lookup for every candidate. Append-only columns with multiple
+segments and tables with UPDATE overrides stay on the existing general resolver,
+so their behavior and invalidation rules are unchanged. The same direct layout
+is used for the physical row IDs selected by RAG `pre_filter`.
+
+This is not a result or answer cache: every request still computes distances,
+top-k selection, lexical ranking, and RRF fusion. It only removes redundant
+metadata lookups during an exact scan.
+
+On Apple M2 Max, Go 1.27.1, three 500 ms runs over 20,000 warm 96-dimensional
+embeddings, direct scanning had a 1.188 ms median versus 1.324 ms through the
+general segment resolver, a 10% reduction. Both variants allocate 384 bytes in
+one allocation per scan. The benchmark isolates vector ranking; end-to-end RAG
+latency also includes SQL execution, concurrent FTS retrieval, fusion, and
+result materialization.
+
+```sh
+go test ./internal/engine -run '^$' \
+  -bench '^BenchmarkVecSearchContiguousCacheScan$' -benchmem \
+  -benchtime=500ms -count=3
+```
+
+Regression coverage compares contiguous and general scans for full and
+pre-filtered row sets, including invalid and dimension-mismatched vectors.

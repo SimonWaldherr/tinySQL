@@ -3,10 +3,103 @@ package engine
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
+
+func TestVecSearchContiguousCacheScanMatchesGeneralPath(t *testing.T) {
+	table := storage.NewTable("contiguous_scan", []storage.Column{{Name: "embedding", Type: storage.VectorType}}, false)
+	table.Rows = [][]any{
+		{[]float64{1, 0, 0}},
+		{[]float64{0.8, 0.2, 0}},
+		{[]float64{0, 1, 0}},
+		{[]float64{0, 0, 1}},
+		{[]float64{1, 1}}, // a mismatched dimension is deliberately skipped
+		{nil},
+	}
+	table.Version = 1
+	cache := buildVecColumnCache(table, 0, true)
+	query := []float64{1, 0, 0}
+	dist := buildVecDistanceFunc("cosine", query, vectorL2Norm(query))
+
+	fast, err := vecSearchTopKRange(context.Background(), table.Rows, 0, len(table.Rows), len(query), 4, cache, dist, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A harmless empty tail forces the normal segment lookup without changing
+	// which physical rows the cache represents.
+	generic := cache
+	generic.segments = append([]vecColumnSegment(nil), cache.segments...)
+	generic.segments = append(generic.segments, vecColumnSegment{start: cache.rows})
+	want, err := vecSearchTopKRange(context.Background(), table.Rows, 0, len(table.Rows), len(query), 4, generic, dist, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(fast, want) {
+		t.Fatalf("contiguous scan = %#v, general scan = %#v", fast, want)
+	}
+
+	allowed := []int{0, 2, 3, 4, 5}
+	fastAllowed, err := ragVecTopKAllowedRange(context.Background(), allowed, 0, len(allowed), len(query), 4, cache, dist, true, cache.rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantAllowed, err := ragVecTopKAllowedRange(context.Background(), allowed, 0, len(allowed), len(query), 4, generic, dist, true, generic.rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(fastAllowed, wantAllowed) {
+		t.Fatalf("contiguous filtered scan = %#v, general scan = %#v", fastAllowed, wantAllowed)
+	}
+}
+
+func BenchmarkVecSearchContiguousCacheScan(b *testing.B) {
+	const rows, dims = 20000, 96
+	table := storage.NewTable("contiguous_scan_bench", []storage.Column{{Name: "embedding", Type: storage.VectorType}}, false)
+	table.Rows = make([][]any, rows)
+	for row := range table.Rows {
+		vector := make([]float64, dims)
+		for dimension := range vector {
+			vector[dimension] = float64((row+dimension)%17) / 17
+		}
+		table.Rows[row] = []any{vector}
+	}
+	table.Version = 1
+	cache := buildVecColumnCache(table, 0, true)
+	query := make([]float64, dims)
+	for dimension := range query {
+		query[dimension] = float64(dimension%11) / 11
+	}
+	dist := buildVecDistanceFunc("cosine", query, vectorL2Norm(query))
+
+	b.Run("direct", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			results, err := vecSearchTopKRange(context.Background(), table.Rows, 0, rows, dims, 24, cache, dist, true)
+			if err != nil || len(results) != 24 {
+				b.Fatalf("results=%d err=%v", len(results), err)
+			}
+		}
+	})
+
+	// The empty tail preserves all row values but selects the general resolver.
+	general := cache
+	general.segments = append([]vecColumnSegment(nil), cache.segments...)
+	general.segments = append(general.segments, vecColumnSegment{start: cache.rows})
+	b.Run("segment_lookup", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			results, err := vecSearchTopKRange(context.Background(), table.Rows, 0, rows, dims, 24, general, dist, true)
+			if err != nil || len(results) != 24 {
+				b.Fatalf("results=%d err=%v", len(results), err)
+			}
+		}
+	})
+}
 
 func TestVecColumnCacheExtendsAppendOnlyWithoutCopyingBaseData(t *testing.T) {
 	db := storage.NewDB()

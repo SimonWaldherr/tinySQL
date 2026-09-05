@@ -765,6 +765,37 @@ func ragVecTopKAllowed(ctx context.Context, allowed []int, queryLen, k int, cach
 
 func ragVecTopKAllowedRange(ctx context.Context, allowed []int, start, end, queryLen, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc, needNorm bool, rowCount int) (vecScoredHeap, error) {
 	heapRows := make(vecScoredHeap, 0, k)
+	if segment, ok := cache.contiguousSegment(); ok {
+		for i := start; i < end; i++ {
+			if i&1023 == 0 {
+				if err := checkCtx(ctx); err != nil {
+					return nil, err
+				}
+			}
+			rowID := allowed[i]
+			if rowID < 0 || rowID >= rowCount || !segment.valid[rowID] {
+				continue
+			}
+			vec := segment.vectors[rowID]
+			if len(vec) != queryLen {
+				continue
+			}
+			var norm float64
+			if needNorm {
+				if cache.normsReady {
+					norm = segment.norms[rowID]
+				} else {
+					norm = vectorL2Norm(vec)
+				}
+			}
+			distance, ok := distFn(vec, norm)
+			if ok {
+				pushTopK(&heapRows, rowID, distance, k)
+			}
+		}
+		return heapRows, nil
+	}
+
 	for i := start; i < end; i++ {
 		if i&1023 == 0 {
 			if err := checkCtx(ctx); err != nil {

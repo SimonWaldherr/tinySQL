@@ -345,6 +345,27 @@ func (c vecSearchColumnCacheEntry) resolveRow(row int, needNorm bool) (vec []flo
 	return vec, segment.norms[idx], valid
 }
 
+// contiguousSegment returns the direct row-to-vector layout used by a fresh
+// cache build.  The common read-only RAG corpus has exactly this shape: one
+// segment spanning every row and no UPDATE overrides.  A flat vector scan can
+// then index its row directly, avoiding an overrides-map lookup and a binary
+// segment lookup for every embedding.  Appended and updated tables retain the
+// general resolveRow path below, so this is purely a faster representation of
+// the same immutable cache contents.
+func (c vecSearchColumnCacheEntry) contiguousSegment() (vecColumnSegment, bool) {
+	if len(c.overrides) != 0 || len(c.segments) != 1 {
+		return vecColumnSegment{}, false
+	}
+	segment := c.segments[0]
+	if segment.start != 0 || len(segment.vectors) != c.rows || len(segment.valid) != c.rows {
+		return vecColumnSegment{}, false
+	}
+	if c.normsReady && len(segment.norms) != c.rows {
+		return vecColumnSegment{}, false
+	}
+	return segment, true
+}
+
 type vecColumnBuildCall struct{ done chan struct{} }
 
 // vecColumnCacheMaxEntries bounds the column cache. Entries are keyed by
@@ -919,6 +940,36 @@ func vecSearchTopK(ctx context.Context, rows [][]any, queryLen int, k int, cache
 
 func vecSearchTopKRange(ctx context.Context, rows [][]any, start, end, queryLen, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc, needNorm bool) (vecScoredHeap, error) {
 	scoredRows := newScoredHeap(k, end-start)
+	if segment, ok := cache.contiguousSegment(); ok {
+		for i := start; i < end; i++ {
+			if i&1023 == 0 {
+				if err := checkCtx(ctx); err != nil {
+					return nil, err
+				}
+			}
+			if !segment.valid[i] {
+				continue
+			}
+			vec := segment.vectors[i]
+			if len(vec) != queryLen {
+				continue
+			}
+			var norm float64
+			if needNorm {
+				if cache.normsReady {
+					norm = segment.norms[i]
+				} else {
+					norm = vectorL2Norm(vec)
+				}
+			}
+			dist, ok := distFn(vec, norm)
+			if !ok {
+				continue
+			}
+			pushTopK(scoredRows, i, dist, k)
+		}
+		return *scoredRows, nil
+	}
 
 	for i := start; i < end; i++ {
 		if i&1023 == 0 {
