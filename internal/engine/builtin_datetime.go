@@ -407,6 +407,26 @@ func evalSecond(env ExecEnv, args []Expr, row Row) (any, error) {
 }
 
 // parseDateTime tries to parse a value as a time.Time
+// parseDateTimeFallbackFormats is a package-level var so parseDateTime's slow
+// path doesn't allocate a fresh 6-element []string on every call it needs
+// (previously every call, since the fast path below did not exist yet).
+var parseDateTimeFallbackFormats = []string{
+	time.RFC3339,
+	"2006-01-02 15:04:05",
+	"2006-01-02T15:04:05",
+	"2006-01-02",
+	"01/02/2006",
+	"02-Jan-2006",
+}
+
+// parseDateTime backs YEAR/MONTH/DAY/HOUR/MINUTE/SECOND/DATEDIFF/OVERLAPS and
+// (via parseSQLiteTimeValue) DATE/TIME/DATETIME/JULIANDAY/UNIXEPOCH/STRFTIME
+// — one of the hottest per-row calls in the engine for any query touching a
+// date column. It used to go straight to the six-layout time.Parse loop
+// below on every call; parseTimeValue (used by DATEDIFF's own direct callers
+// and documented there as "a top-3 CPU cost" before this fast path existed)
+// already carries parseTimeFixedDigits for exactly this reason, so this is
+// the same fast path applied here instead of only in that one sibling.
 func parseDateTime(val any) (time.Time, error) {
 	if val == nil {
 		return time.Time{}, fmt.Errorf("cannot parse nil as datetime")
@@ -415,15 +435,10 @@ func parseDateTime(val any) (time.Time, error) {
 		return t, nil
 	}
 	str := valueText(val)
-	formats := []string{
-		time.RFC3339,
-		"2006-01-02 15:04:05",
-		"2006-01-02T15:04:05",
-		"2006-01-02",
-		"01/02/2006",
-		"02-Jan-2006",
+	if t, ok := parseTimeFixedDigits(str); ok {
+		return t, nil
 	}
-	for _, f := range formats {
+	for _, f := range parseDateTimeFallbackFormats {
 		if t, err := time.Parse(f, str); err == nil {
 			return t, nil
 		}
@@ -431,26 +446,38 @@ func parseDateTime(val any) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("cannot parse '%s' as datetime", str)
 }
 
+// strftimeStaticReplacer covers the SQLite strftime codes whose Go
+// equivalents don't depend on the value of t, so a single package-level
+// *strings.Replacer can be reused across every call instead of building a
+// fresh map (and doing a ReplaceAll pass per entry) each time.
+var strftimeStaticReplacer = strings.NewReplacer(
+	"%Y", "2006",
+	"%m", "01",
+	"%d", "02",
+	"%H", "15",
+	"%M", "04",
+	"%S", "05",
+	"%%", "%",
+)
+
 // strftimeFormat converts SQLite-style strftime format to Go time
 func strftimeFormat(t time.Time, format string) string {
-	// Map SQLite strftime codes to Go format
-	replacements := map[string]string{
-		"%Y": "2006",
-		"%m": "01",
-		"%d": "02",
-		"%H": "15",
-		"%M": "04",
-		"%S": "05",
-		"%j": fmt.Sprintf("%03d", t.YearDay()),
-		"%W": fmt.Sprintf("%02d", (t.YearDay()-int(t.Weekday())+7)/7),
-		"%w": fmt.Sprintf("%d", t.Weekday()),
-		"%s": fmt.Sprintf("%d", t.Unix()),
-		"%%": "%",
-	}
 	result := format
-	for code, goFmt := range replacements {
-		result = strings.ReplaceAll(result, code, goFmt)
+	// %j/%W/%w/%s need a value computed from t, so only pay for that
+	// (and the ReplaceAll scan) when the format string actually uses them.
+	if strings.Contains(result, "%j") {
+		result = strings.ReplaceAll(result, "%j", fmt.Sprintf("%03d", t.YearDay()))
 	}
+	if strings.Contains(result, "%W") {
+		result = strings.ReplaceAll(result, "%W", fmt.Sprintf("%02d", (t.YearDay()-int(t.Weekday())+7)/7))
+	}
+	if strings.Contains(result, "%w") {
+		result = strings.ReplaceAll(result, "%w", strconv.Itoa(int(t.Weekday())))
+	}
+	if strings.Contains(result, "%s") {
+		result = strings.ReplaceAll(result, "%s", strconv.FormatInt(t.Unix(), 10))
+	}
+	result = strftimeStaticReplacer.Replace(result)
 	return t.Format(result)
 }
 

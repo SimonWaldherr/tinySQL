@@ -699,25 +699,33 @@ func (bt *BTree) scanRange(startKey, endKey []byte, fn func(key, value []byte, o
 		sc := bp.slotCount()
 
 		for i := 0; i < sc; i++ {
-			entry := bp.GetLeafEntry(i)
-			if bytes.Compare(entry.Key, startKey) < 0 {
+			// leafKeyAt/leafValueAt are the same zero-copy page views Get/
+			// getValue already use for point lookups: GetLeafEntry
+			// unconditionally deep-copies the whole record (see
+			// unmarshalLeafRecord), which every scanRange caller here either
+			// discards after this call or explicitly copies itself
+			// (unmarshalRow's copyBytes path, or an explicit append/string
+			// conversion) -- so that copy was pure waste on top of the one a
+			// caller that actually needs to retain the data already makes.
+			// Safe because the page stays pinned for this whole per-leaf
+			// loop, matching the "owned" contract already documented above.
+			key := bp.leafKeyAt(i)
+			if bytes.Compare(key, startKey) < 0 {
 				continue
 			}
-			if endKey != nil && bytes.Compare(entry.Key, endKey) > 0 {
+			if endKey != nil && bytes.Compare(key, endKey) > 0 {
 				bt.pager.UnpinPage(leafID)
 				return nil
 			}
-			var val []byte
-			if entry.Overflow {
-				val, err = bt.readOverflow(entry.OverflowPageID, entry.TotalSize)
+			val, overflow, overflowPageID, totalSize := bp.leafValueAt(i)
+			if overflow {
+				val, err = bt.readOverflow(overflowPageID, totalSize)
 				if err != nil {
 					bt.pager.UnpinPage(leafID)
 					return err
 				}
-			} else {
-				val = entry.Value
 			}
-			if !fn(entry.Key, val, entry.Overflow) {
+			if !fn(key, val, overflow) {
 				bt.pager.UnpinPage(leafID)
 				return nil
 			}

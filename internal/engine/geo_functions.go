@@ -103,6 +103,17 @@ func evalGeoPoint(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	return geoPointJSON(lon, lat, z)
 }
 
+// geoJSONPoint mirrors the map[string]any{"type": "Point", "coordinates": ...}
+// shape geoPointJSON used to marshal, field order matching the alphabetically
+// sorted map-key order encoding/json produced ("coordinates" before "type")
+// so the wire format is unchanged. A typed struct lets json.Marshal skip the
+// map allocation and per-value interface reflection, which matters here
+// since GEO_POINT/GEO_MIDPOINT/GEO_DESTINATION run per row.
+type geoJSONPoint struct {
+	Coordinates []float64 `json:"coordinates"`
+	Type        string    `json:"type"`
+}
+
 // geoPointJSON encodes a GeoJSON Point, the wire format every geo function
 // that returns a point (GEO_POINT itself, GEO_MIDPOINT, GEO_DESTINATION) uses
 // so its result can round-trip straight back through GEO_LON/GEO_LAT/
@@ -112,7 +123,7 @@ func geoPointJSON(lon, lat float64, z *float64) (any, error) {
 	if z != nil {
 		coords = append(coords, *z)
 	}
-	body, err := json.Marshal(map[string]any{"type": "Point", "coordinates": coords})
+	body, err := json.Marshal(geoJSONPoint{Coordinates: coords, Type: "Point"})
 	if err != nil {
 		return nil, err
 	}
@@ -140,32 +151,41 @@ func evalGeoLat(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 // calling convention GEO_DISTANCE established and GEO_BEARING/GEO_MIDPOINT
 // reuse, so a caller can pass whichever form already has the data in it.
 func evalGeoTwoPointsArgs(env ExecEnv, ex *FuncCall, row Row) (lat1, lon1, lat2, lon2 float64, err error) {
-	switch len(ex.Args) {
+	return evalGeoTwoPointsArgsNamed(env, ex.Name, ex.Args, row)
+}
+
+// evalGeoTwoPointsArgsNamed is the (name, args) form of evalGeoTwoPointsArgs,
+// letting callers that only need a sub-slice of an existing FuncCall's Args
+// (e.g. evalGeoDWithin stripping its trailing "meters" argument) reuse this
+// logic without heap-allocating a synthetic *FuncCall per call — this runs
+// per scanned row for WHERE-clause predicates like GEO_DWITHIN.
+func evalGeoTwoPointsArgsNamed(env ExecEnv, name string, args []Expr, row Row) (lat1, lon1, lat2, lon2 float64, err error) {
+	switch len(args) {
 	case 2:
 		var a, b geoPoint
-		if a, err = evalGeoPointArg(env, ex, row, 0); err != nil {
+		if a, err = evalGeoPointArgNamed(env, name, args, row, 0); err != nil {
 			return 0, 0, 0, 0, err
 		}
-		if b, err = evalGeoPointArg(env, ex, row, 1); err != nil {
+		if b, err = evalGeoPointArgNamed(env, name, args, row, 1); err != nil {
 			return 0, 0, 0, 0, err
 		}
 		return a.Lat, a.Lon, b.Lat, b.Lon, nil
 	case 4:
-		if lat1, err = evalGeoFloatArg(env, ex, row, 0); err != nil {
+		if lat1, err = evalGeoFloatArgNamed(env, name, args, row, 0); err != nil {
 			return 0, 0, 0, 0, err
 		}
-		if lon1, err = evalGeoFloatArg(env, ex, row, 1); err != nil {
+		if lon1, err = evalGeoFloatArgNamed(env, name, args, row, 1); err != nil {
 			return 0, 0, 0, 0, err
 		}
-		if lat2, err = evalGeoFloatArg(env, ex, row, 2); err != nil {
+		if lat2, err = evalGeoFloatArgNamed(env, name, args, row, 2); err != nil {
 			return 0, 0, 0, 0, err
 		}
-		if lon2, err = evalGeoFloatArg(env, ex, row, 3); err != nil {
+		if lon2, err = evalGeoFloatArgNamed(env, name, args, row, 3); err != nil {
 			return 0, 0, 0, 0, err
 		}
 		return lat1, lon1, lat2, lon2, nil
 	default:
-		return 0, 0, 0, 0, fmt.Errorf("%s expects 2 GeoJSON points or 4 coordinates: (lat1, lon1, lat2, lon2)", ex.Name)
+		return 0, 0, 0, 0, fmt.Errorf("%s expects 2 GeoJSON points or 4 coordinates: (lat1, lon1, lat2, lon2)", name)
 	}
 }
 
@@ -179,26 +199,21 @@ func evalGeoDistance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 
 func evalGeoDWithin(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	switch len(ex.Args) {
-	case 3:
-		dist, err := evalGeoDistance(env, &FuncCall{Name: ex.Name, Args: ex.Args[:2]}, row)
+	case 3, 5:
+		// GEO_DWITHIN is a WHERE-clause radius predicate, so this runs per
+		// scanned row: use the *Named helper on a sub-slice of ex.Args
+		// directly instead of allocating a synthetic *FuncCall just to strip
+		// the trailing "meters" argument.
+		pointArgs := ex.Args[:len(ex.Args)-1]
+		lat1, lon1, lat2, lon2, err := evalGeoTwoPointsArgsNamed(env, ex.Name, pointArgs, row)
 		if err != nil {
 			return nil, err
 		}
-		maxMeters, err := evalGeoFloatArg(env, ex, row, 2)
+		maxMeters, err := evalGeoFloatArg(env, ex, row, len(ex.Args)-1)
 		if err != nil {
 			return nil, err
 		}
-		return dist.(float64) <= maxMeters, nil
-	case 5:
-		dist, err := evalGeoDistance(env, &FuncCall{Name: ex.Name, Args: ex.Args[:4]}, row)
-		if err != nil {
-			return nil, err
-		}
-		maxMeters, err := evalGeoFloatArg(env, ex, row, 4)
-		if err != nil {
-			return nil, err
-		}
-		return dist.(float64) <= maxMeters, nil
+		return haversineMeters(lat1, lon1, lat2, lon2) <= maxMeters, nil
 	default:
 		return nil, fmt.Errorf("%s expects (point, point, meters) or (lat1, lon1, lat2, lon2, meters)", ex.Name)
 	}
@@ -575,25 +590,33 @@ func evalGeoLength(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 }
 
 func evalGeoFloatArg(env ExecEnv, ex *FuncCall, row Row, idx int) (float64, error) {
-	v, err := evalExpr(env, ex.Args[idx], row)
+	return evalGeoFloatArgNamed(env, ex.Name, ex.Args, row, idx)
+}
+
+func evalGeoFloatArgNamed(env ExecEnv, name string, args []Expr, row Row, idx int) (float64, error) {
+	v, err := evalExpr(env, args[idx], row)
 	if err != nil {
 		return 0, err
 	}
 	f, err := geoFloat(v)
 	if err != nil {
-		return 0, fmt.Errorf("%s arg%d: %w", ex.Name, idx+1, err)
+		return 0, fmt.Errorf("%s arg%d: %w", name, idx+1, err)
 	}
 	return f, nil
 }
 
 func evalGeoPointArg(env ExecEnv, ex *FuncCall, row Row, idx int) (geoPoint, error) {
-	v, err := evalExpr(env, ex.Args[idx], row)
+	return evalGeoPointArgNamed(env, ex.Name, ex.Args, row, idx)
+}
+
+func evalGeoPointArgNamed(env ExecEnv, name string, args []Expr, row Row, idx int) (geoPoint, error) {
+	v, err := evalExpr(env, args[idx], row)
 	if err != nil {
 		return geoPoint{}, err
 	}
 	p, err := geoPointFromValue(v)
 	if err != nil {
-		return geoPoint{}, fmt.Errorf("%s arg%d: %w", ex.Name, idx+1, err)
+		return geoPoint{}, fmt.Errorf("%s arg%d: %w", name, idx+1, err)
 	}
 	return p, nil
 }

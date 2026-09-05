@@ -38,6 +38,12 @@ type PageBufferPool struct {
 	mu       sync.Mutex
 	maxPages int
 	pages    map[PageID]*PageFrame
+	// dirty mirrors the subset of pages that currently have dirty == true, so
+	// Checkpoint (and anything else that needs the dirty set) doesn't have to
+	// scan every resident frame -- an append-heavy workload calls Checkpoint
+	// once per AppendRows batch (see backend.go), and that scan previously
+	// cost O(MaxCachePages) even when only a handful of frames were dirty.
+	dirty map[PageID]*PageFrame
 	// loads coordinates a cold read of one page. It is intentionally scoped to
 	// a PageID, so unrelated cold pages still issue I/O in parallel while a
 	// stampede for one tile/index page performs exactly one physical read.
@@ -69,6 +75,7 @@ func newPageBufferPool(maxPages int) *PageBufferPool {
 	pool := &PageBufferPool{
 		maxPages:  maxPages,
 		pages:     make(map[PageID]*PageFrame, maxPages),
+		dirty:     make(map[PageID]*PageFrame),
 		loads:     make(map[PageID]*pageLoad),
 		transient: make(map[PageID]int),
 	}
@@ -143,6 +150,22 @@ func (bp *PageBufferPool) remove(id PageID) {
 	}
 	bp.unlink(f)
 	delete(bp.pages, id)
+	delete(bp.dirty, id)
+}
+
+// markDirty flags f as dirty and records it in the incremental dirty set.
+func (bp *PageBufferPool) markDirty(f *PageFrame) {
+	f.dirty = true
+	bp.dirty[f.id] = f
+}
+
+// clearDirty flags the frame at id as clean and drops it from the
+// incremental dirty set. No-op if id isn't currently dirty.
+func (bp *PageBufferPool) clearDirty(id PageID) {
+	if f, ok := bp.dirty[id]; ok {
+		f.dirty = false
+		delete(bp.dirty, id)
+	}
 }
 
 // evictOne removes the least-recently-used clean, unpinned page.
@@ -164,13 +187,15 @@ func (bp *PageBufferPool) evictOne() bool {
 	return false
 }
 
-// dirtyPages returns all dirty page frames.
+// dirtyPages returns all dirty page frames, from the incrementally
+// maintained set rather than scanning every resident frame.
 func (bp *PageBufferPool) dirtyPages() []*PageFrame {
-	var out []*PageFrame
-	for _, f := range bp.pages {
-		if f.dirty {
-			out = append(out, f)
-		}
+	if len(bp.dirty) == 0 {
+		return nil
+	}
+	out := make([]*PageFrame, 0, len(bp.dirty))
+	for _, f := range bp.dirty {
+		out = append(out, f)
 	}
 	return out
 }
@@ -569,7 +594,7 @@ func (p *Pager) WritePage(txID TxID, id PageID, buf []byte) error {
 	if !aliased {
 		copy(f.buf, buf)
 	}
-	f.dirty = true
+	p.pool.markDirty(f)
 	f.lsn = lsn
 	p.pool.mu.Unlock()
 
@@ -697,7 +722,7 @@ func (p *Pager) Checkpoint() error {
 			p.pool.mu.Unlock()
 			return fmt.Errorf("checkpoint flush page %d: %w", f.id, err)
 		}
-		f.dirty = false
+		p.pool.clearDirty(f.id)
 	}
 	p.pool.mu.Unlock()
 

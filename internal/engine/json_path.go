@@ -10,20 +10,26 @@ type pathPart struct {
 	idx int
 }
 
+// parseJSONPath splits a "a.b[2].c"-style path into its segments. Segment
+// text is sliced directly out of s (start:i) instead of the previous
+// `cur += string(s[i])` accumulator, which reallocated and copied the whole
+// segment-so-far on every character -- quadratic in segment length, and pure
+// waste next to a slice expression that costs nothing.
 func parseJSONPath(s string) []pathPart {
 	var out []pathPart
-	cur := ""
-	for i := 0; i < len(s); i++ {
+	start := 0
+	i := 0
+	for i < len(s) {
 		switch s[i] {
 		case '.':
-			if cur != "" {
-				out = append(out, pathPart{key: cur, idx: -1})
-				cur = ""
+			if i > start {
+				out = append(out, pathPart{key: s[start:i], idx: -1})
 			}
+			i++
+			start = i
 		case '[':
-			if cur != "" {
-				out = append(out, pathPart{key: cur, idx: -1})
-				cur = ""
+			if i > start {
+				out = append(out, pathPart{key: s[start:i], idx: -1})
 			}
 			j := i + 1
 			for j < len(s) && s[j] != ']' {
@@ -32,14 +38,20 @@ func parseJSONPath(s string) []pathPart {
 			if j <= len(s)-1 {
 				n, _ := strconv.Atoi(s[i+1 : j])
 				out = append(out, pathPart{idx: n})
-				i = j
+				i = j + 1
+			} else {
+				// No closing ']': the original accumulator flushed cur (empty
+				// here) and left the stray '[' out of every key, resuming
+				// from the next character -- so drop it here too.
+				i++
 			}
+			start = i
 		default:
-			cur += string(s[i])
+			i++
 		}
 	}
-	if cur != "" {
-		out = append(out, pathPart{key: cur, idx: -1})
+	if i > start {
+		out = append(out, pathPart{key: s[start:], idx: -1})
 	}
 	return out
 }

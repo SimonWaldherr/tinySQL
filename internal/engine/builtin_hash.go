@@ -9,9 +9,22 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"strings"
 )
+
+// soundexMapping is a package-level table so SOUNDEX doesn't allocate and
+// populate a fresh 20-entry map on every single call -- this runs per row of
+// a scan, and the mapping is a fixed constant, never mutated after init.
+var soundexMapping = [256]byte{
+	'B': '1', 'F': '1', 'P': '1', 'V': '1',
+	'C': '2', 'G': '2', 'J': '2', 'K': '2', 'Q': '2', 'S': '2', 'X': '2', 'Z': '2',
+	'D': '3', 'T': '3',
+	'L': '4',
+	'M': '5', 'N': '5',
+	'R': '6',
+}
 
 func evalSoundex(env ExecEnv, args []Expr, row Row) (any, error) {
 	if len(args) != 1 {
@@ -27,23 +40,21 @@ func evalSoundex(env ExecEnv, args []Expr, row Row) (any, error) {
 	}
 	// Soundex algorithm
 	result := []byte{s[0]}
-	mapping := map[byte]byte{
-		'B': '1', 'F': '1', 'P': '1', 'V': '1',
-		'C': '2', 'G': '2', 'J': '2', 'K': '2', 'Q': '2', 'S': '2', 'X': '2', 'Z': '2',
-		'D': '3', 'T': '3',
-		'L': '4',
-		'M': '5', 'N': '5',
-		'R': '6',
-	}
-	lastCode := mapping[s[0]]
+	lastCode := soundexMapping[s[0]]
 	for i := 1; i < len(s) && len(result) < 4; i++ {
 		c := s[i]
-		if code, ok := mapping[c]; ok && code != lastCode {
+		if code := soundexMapping[c]; code != 0 && code != lastCode {
 			result = append(result, code)
 			lastCode = code
 		} else if c == 'A' || c == 'E' || c == 'I' || c == 'O' || c == 'U' || c == 'H' || c == 'W' || c == 'Y' {
 			lastCode = 0
 		}
+		// Anything else (a mapped-but-repeated consonant, or a character with
+		// no soundex code at all -- e.g. a digit or punctuation) leaves
+		// lastCode untouched, matching the original map-based lookup's
+		// `code, ok := mapping[c]; ok && code != lastCode` gate exactly: a
+		// zero value from the array here (soundexMapping[c] for a byte with
+		// no entry) must not be mistaken for a real "code 0" reset.
 	}
 	for len(result) < 4 {
 		result = append(result, '0')
@@ -99,14 +110,14 @@ func evalUnhex(env ExecEnv, args []Expr, row Row) (any, error) {
 	if len(s)%2 != 0 {
 		s = "0" + s
 	}
-	result := make([]byte, len(s)/2)
-	for i := 0; i < len(s); i += 2 {
-		var b byte
-		_, err := fmt.Sscanf(s[i:i+2], "%02X", &b)
-		if err != nil {
-			return nil, fmt.Errorf("UNHEX: invalid hex string")
-		}
-		result[i/2] = b
+	// fmt.Sscanf(s[i:i+2], "%02X", &b) per byte pair used to drive this: each
+	// call re-parses the "%02X" format string and goes through reflection to
+	// set b, which dominates UNHEX's cost far more than the actual decode
+	// work. encoding/hex accepts the same upper/lower-case hex digits in one
+	// allocation-bounded pass.
+	result, err := hex.DecodeString(s)
+	if err != nil {
+		return nil, fmt.Errorf("UNHEX: invalid hex string")
 	}
 	return string(result), nil
 }

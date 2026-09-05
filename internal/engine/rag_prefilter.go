@@ -509,6 +509,112 @@ func ragRowsForAllowedIDs(table *storage.Table, column string, pos int, values [
 	if pos < 0 {
 		return rows, nil
 	}
+
+	// DECIMAL/MONEY columns compare via exact big.Rat arithmetic
+	// (compareBigRat). The bucketed fast path below hashes numbers through
+	// float64, which can't replicate that exactly, so keep those columns on
+	// the O(rows * values) scan that calls ragFilterValuesEqual/compare
+	// directly -- pre_filter.allowed_row_ids is rarely keyed by a decimal
+	// column, so this doesn't cost the common integer/string ID case.
+	if pos < len(table.Cols) {
+		switch table.Cols[pos].Type {
+		case storage.DecimalType, storage.MoneyType:
+			return ragRowsForAllowedIDsScan(table, pos, values, rows), nil
+		}
+	}
+
+	// Fast path: pre_filter.allowed_row_ids batches are typically large ID
+	// lists (thousands of chunk IDs) checked against an unindexed table, and
+	// the linear per-row scan over values below was O(rows * values). Bucket
+	// values by the same cross-type equality classes compare()/
+	// ragFilterValuesEqual use -- numbers only match numbers regardless of
+	// int/int64/float64 mix, strings only match strings -- so each row does
+	// an O(1) map lookup instead. Anything else (bool, []byte, time.Time,
+	// *big.Rat, ...) is rare here and stays on the exact per-row check
+	// against just that residual subset of values.
+	//
+	// int/int64 values get an *exact* int64-keyed set: compareInt/
+	// compareInt64 compare two integers exactly (via int64), so IDs beyond
+	// float64's 2^53 exact-integer range (e.g. 9007199254740993) must not be
+	// bucketed through a lossy float64 key, or a distinct adjacent ID would
+	// collide with it. floatSet holds only genuinely float64-typed values,
+	// used both for a float64 cell's exact check and as the (deliberately
+	// lossy, matching compareInt/compareInt64's own numeric() fallback)
+	// cross-check for an int/int64 cell against a float64 value. intAsFloat
+	// mirrors compareFloat's numeric() conversion of an int/int64 value, used
+	// only when the cell itself is float64 -- keeping it out of floatSet
+	// avoids exactSet's precision guarantee leaking a false match into the
+	// int/int64 cell path above.
+	exactIntSet := make(map[int64]struct{}, len(values))
+	floatSet := make(map[float64]struct{}, len(values))
+	var intAsFloat map[float64]struct{}
+	stringSet := make(map[string]struct{}, len(values))
+	var residual []any
+	for _, v := range values {
+		switch x := v.(type) {
+		case int:
+			exactIntSet[int64(x)] = struct{}{}
+		case int64:
+			exactIntSet[int64(x)] = struct{}{}
+		case float64:
+			floatSet[x] = struct{}{}
+		case string:
+			stringSet[x] = struct{}{}
+		default:
+			residual = append(residual, v)
+		}
+	}
+	if len(exactIntSet) > 0 {
+		intAsFloat = make(map[float64]struct{}, len(exactIntSet))
+		for v := range exactIntSet {
+			intAsFloat[float64(v)] = struct{}{}
+		}
+	}
+
+	for rowID, row := range table.Rows {
+		if pos >= len(row) {
+			continue
+		}
+		cell := row[pos]
+		matched := false
+		switch c := cell.(type) {
+		case int:
+			_, matched = exactIntSet[int64(c)]
+			if !matched {
+				_, matched = floatSet[float64(c)]
+			}
+		case int64:
+			_, matched = exactIntSet[c]
+			if !matched {
+				_, matched = floatSet[float64(c)]
+			}
+		case float64:
+			_, matched = floatSet[c]
+			if !matched {
+				_, matched = intAsFloat[c]
+			}
+		case string:
+			_, matched = stringSet[c]
+		}
+		if !matched {
+			for _, value := range residual {
+				if ragFilterValuesEqual(cell, value) {
+					matched = true
+					break
+				}
+			}
+		}
+		if matched {
+			rows = append(rows, rowID)
+		}
+	}
+	return rows, nil
+}
+
+// ragRowsForAllowedIDsScan is the exact O(rows * values) fallback: every cell
+// checked against every allowed value via ragFilterValuesEqual/compare, with
+// no assumptions about which types are cross-comparable.
+func ragRowsForAllowedIDsScan(table *storage.Table, pos int, values []any, rows []int) []int {
 	for rowID, row := range table.Rows {
 		if pos >= len(row) {
 			continue
@@ -521,7 +627,7 @@ func ragRowsForAllowedIDs(table *storage.Table, column string, pos int, values [
 			}
 		}
 	}
-	return rows, nil
+	return rows
 }
 
 func ragRowsForEqualities(table *storage.Table, predicates []ragEqualityPredicate) ([]int, error) {

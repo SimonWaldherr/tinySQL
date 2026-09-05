@@ -1081,8 +1081,13 @@ func vecSearchCandidates(ctx context.Context, env ExecEnv, a vecSearchArgs) (*st
 
 func materializeVecCandidates(table *storage.Table, scoredRowsOrdered []vecScoredRow, metric string) *ResultSet {
 	resultCols := make([]string, 0, len(table.Cols)+3)
-	for _, c := range table.Cols {
+	// Lower-cased once per column up front: table.Cols is loop-invariant
+	// across every scored row below, so ToLower-ing it per (row, column) pair
+	// redid the same string conversion len(scoredRowsOrdered) times over.
+	lowerCols := make([]string, len(table.Cols))
+	for i, c := range table.Cols {
 		resultCols = append(resultCols, c.Name)
+		lowerCols[i] = strings.ToLower(c.Name)
 	}
 	resultCols = append(resultCols, "_vec_distance", "_vec_similarity", "_vec_rank")
 	resultRows := make([]Row, 0, len(scoredRowsOrdered))
@@ -1098,7 +1103,7 @@ func materializeVecCandidates(table *storage.Table, scoredRowsOrdered []vecScore
 		// The complete output width is known. Reserving it avoids repeated map
 		// growth while copying wide RAG source rows into every top-k hit.
 		r := make(Row, len(table.Cols)+3)
-		for ci, c := range table.Cols {
+		for ci := range table.Cols {
 			if ci < len(table.Rows[sr.rowIdx]) {
 				// Lower-cased to match ragFuseCandidates and ragCopyOutputRow.
 				// ragValue looks up the lower-cased key first and only then
@@ -1106,7 +1111,7 @@ func materializeVecCandidates(table *storage.Table, scoredRowsOrdered []vecScore
 				// the schema's own casing here put every lookup against an
 				// upper-case schema on the slow path -- and made a vector-only
 				// RAG_SEARCH hand back differently-keyed rows than a hybrid one.
-				r[strings.ToLower(c.Name)] = table.Rows[sr.rowIdx][ci]
+				r[lowerCols[ci]] = table.Rows[sr.rowIdx][ci]
 			}
 		}
 		r["_vec_distance"] = sr.distance

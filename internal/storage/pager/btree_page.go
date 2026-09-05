@@ -207,9 +207,16 @@ func (bp *BTreePage) insertRecordAt(pos int, data []byte) error {
 
 	sc := bp.slotCount()
 	bp.setSlotCount(sc + 1)
-	// Shift slots [pos..sc) right by one.
-	for i := sc; i > pos; i-- {
-		bp.setSlotEntry(i, bp.getSlotEntry(i-1))
+	// Shift slots [pos..sc) right by one via a single bulk copy over the
+	// slot-directory bytes -- copy() is memmove-safe for overlapping ranges,
+	// so this replaces sc-pos per-slot decode/encode calls with one
+	// contiguous move. freeSpace() above already reserves room for the
+	// extra slot this shift grows into.
+	if n := sc - pos; n > 0 {
+		src := btreeSlotDirOff + pos*slotEntrySize
+		dst := src + slotEntrySize
+		nb := n * slotEntrySize
+		copy(bp.buf[dst:dst+nb], bp.buf[src:src+nb])
 	}
 	bp.setSlotEntry(pos, SlotEntry{Offset: uint16(newEnd), Length: uint16(needed)})
 	return nil
@@ -411,10 +418,14 @@ func (bp *BTreePage) DeleteLeafEntry(pos int) error {
 	if pos < 0 || pos >= bp.slotCount() {
 		return fmt.Errorf("delete: slot %d out of range", pos)
 	}
-	// Shift slots left.
+	// Shift slots [pos+1..sc) left by one, same bulk-copy approach as
+	// insertRecordAt's right-shift.
 	sc := bp.slotCount()
-	for i := pos; i < sc-1; i++ {
-		bp.setSlotEntry(i, bp.getSlotEntry(i+1))
+	if n := sc - 1 - pos; n > 0 {
+		dst := btreeSlotDirOff + pos*slotEntrySize
+		src := dst + slotEntrySize
+		nb := n * slotEntrySize
+		copy(bp.buf[dst:dst+nb], bp.buf[src:src+nb])
 	}
 	bp.setSlotEntry(sc-1, SlotEntry{})
 	bp.setSlotCount(sc - 1)

@@ -390,6 +390,17 @@ func stringIsASCII(str string) bool {
 	return true
 }
 
+// stringCharCount returns the character count of str without materializing
+// a []rune, taking the same ASCII fast path stringPrefix already uses so
+// callers that only need a count (not the runes themselves) can avoid the
+// allocation stringRunes(str) would otherwise force.
+func stringCharCount(str string) int {
+	if stringIsASCII(str) {
+		return len(str)
+	}
+	return utf8.RuneCountInString(str)
+}
+
 func stringPrefix(str string, length int) string {
 	if length <= 0 {
 		return ""
@@ -747,14 +758,14 @@ func evalLpad(env ExecEnv, args []Expr, row Row) (any, error) {
 		pad = valueText(padVal)
 	}
 
-	strRunes := stringRunes(str)
-	if len(strRunes) >= length {
-		return string(strRunes[:length]), nil
+	count := stringCharCount(str)
+	if count >= length {
+		return stringPrefix(str, length), nil
 	}
 	if pad == "" {
 		return str, nil
 	}
-	needed := length - len(strRunes)
+	needed := length - count
 	padding := stringPrefix(strings.Repeat(pad, (needed/utf8.RuneCountInString(pad))+1), needed)
 	return padding + str, nil
 }
@@ -800,14 +811,14 @@ func evalRpad(env ExecEnv, args []Expr, row Row) (any, error) {
 		pad = valueText(padVal)
 	}
 
-	strRunes := stringRunes(str)
-	if len(strRunes) >= length {
-		return string(strRunes[:length]), nil
+	count := stringCharCount(str)
+	if count >= length {
+		return stringPrefix(str, length), nil
 	}
 	if pad == "" {
 		return str, nil
 	}
-	needed := length - len(strRunes)
+	needed := length - count
 	padding := stringPrefix(strings.Repeat(pad, (needed/utf8.RuneCountInString(pad))+1), needed)
 	return str + padding, nil
 }
@@ -912,6 +923,39 @@ func evalInitcap(env ExecEnv, args []Expr, row Row) (any, error) {
 	return strings.Join(words, " "), nil
 }
 
+// splitPartAt returns the 0-indexed idx-th field of s split on delim,
+// without materializing every field the way strings.Split(s, delim) would --
+// SPLIT_PART only ever needs the one field at idx, and a long delimited
+// string (e.g. many CSV-style fields) otherwise pays for a []string entry
+// per field just to throw away all but one. ok is false when idx is
+// negative or past the last field, matching strings.Split's out-of-range
+// behavior. The empty-delimiter case is rare enough here to just defer to
+// strings.Split's own per-rune splitting semantics.
+func splitPartAt(s, delim string, idx int) (string, bool) {
+	if idx < 0 {
+		return "", false
+	}
+	if delim == "" {
+		parts := strings.Split(s, delim)
+		if idx >= len(parts) {
+			return "", false
+		}
+		return parts[idx], true
+	}
+	start := 0
+	for i := 0; i < idx; i++ {
+		pos := strings.Index(s[start:], delim)
+		if pos < 0 {
+			return "", false
+		}
+		start += pos + len(delim)
+	}
+	if end := strings.Index(s[start:], delim); end >= 0 {
+		return s[start : start+end], true
+	}
+	return s[start:], true
+}
+
 func evalSplitPart(env ExecEnv, args []Expr, row Row) (any, error) {
 	if len(args) != 3 {
 		return nil, fmt.Errorf("SPLIT_PART expects 3 arguments: (string, delimiter, part)")
@@ -937,12 +981,12 @@ func evalSplitPart(env ExecEnv, args []Expr, row Row) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("SPLIT_PART: part must be numeric")
 	}
-	parts := strings.Split(s, delim)
 	idx := int(part) - 1 // 1-indexed
-	if idx < 0 || idx >= len(parts) {
+	result, ok := splitPartAt(s, delim, idx)
+	if !ok {
 		return "", nil
 	}
-	return parts[idx], nil
+	return result, nil
 }
 
 func evalQuote(env ExecEnv, args []Expr, row Row) (any, error) {

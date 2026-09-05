@@ -258,25 +258,17 @@ func evalFTSSnippet(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return nil, err
 	}
 
-	// Build highlight set from the parsed boolean query tree.
+	// Build highlight set from the parsed boolean query tree. Both the tree
+	// (parseCachedFTSQuery) and the derived term set/wildcard-prefix list
+	// (ftsCachedSnippetTermSet) are cached keyed by the query string, since
+	// it's virtually always the same constant literal across every row of a
+	// scan -- see fts_snippet_cache.go. querySet/wildcardPrefixes are shared,
+	// read-only from here on.
 	queryStr := ftsValueToString(queryVal)
 	node := parseCachedFTSQuery(queryStr)
-	querySet := ftsQueryTerms(node)
-	// Also add simple tokenized terms for backward compatibility.
-	for _, q := range ftsTokenize(queryStr) {
-		querySet[q] = true
-	}
-
-	// Wildcard prefixes ("prefix*" entries in querySet) are precomputed once
-	// here rather than re-scanned from isHighlighted on every single word:
-	// the query has a handful of terms but potentially many words to check,
-	// so this turns an O(words × queryTerms) scan into O(words + queryTerms).
-	var wildcardPrefixes []string
-	for tok := range querySet {
-		if strings.HasSuffix(tok, "*") {
-			wildcardPrefixes = append(wildcardPrefixes, strings.TrimSuffix(tok, "*"))
-		}
-	}
+	set := ftsCachedSnippetTermSet(queryStr, node)
+	querySet := set.terms
+	wildcardPrefixes := set.wildcardPrefixes
 
 	// isHighlighted checks if a word matches any positive query atom.
 	isHighlighted := func(w string) bool {
