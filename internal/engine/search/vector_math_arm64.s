@@ -164,24 +164,24 @@ TEXT ·vectorL1NEON(SB), NOSPLIT, $0-56
 l1_loop:
 	VLD1.P 16(R0), [V1.B16]
 	VLD1.P 16(R2), [V2.B16]
-	VFSUB V2.D2, V1.D2, V7.D2
-	VFABS V7.D2, V7.D2
-	VFADD V7.D2, V3.D2, V3.D2
+	WORD $0x4ee2d427 // fsub v7.2d, v1.2d, v2.2d
+	WORD $0x4ee0f8e7 // fabs v7.2d, v7.2d
+	WORD $0x4e67d463 // fadd v3.2d, v3.2d, v7.2d
 	VLD1.P 16(R0), [V1.B16]
 	VLD1.P 16(R2), [V2.B16]
-	VFSUB V2.D2, V1.D2, V7.D2
-	VFABS V7.D2, V7.D2
-	VFADD V7.D2, V4.D2, V4.D2
+	WORD $0x4ee2d427 // fsub v7.2d, v1.2d, v2.2d
+	WORD $0x4ee0f8e7 // fabs v7.2d, v7.2d
+	WORD $0x4e67d484 // fadd v4.2d, v4.2d, v7.2d
 	VLD1.P 16(R0), [V1.B16]
 	VLD1.P 16(R2), [V2.B16]
-	VFSUB V2.D2, V1.D2, V7.D2
-	VFABS V7.D2, V7.D2
-	VFADD V7.D2, V5.D2, V5.D2
+	WORD $0x4ee2d427 // fsub v7.2d, v1.2d, v2.2d
+	WORD $0x4ee0f8e7 // fabs v7.2d, v7.2d
+	WORD $0x4e67d4a5 // fadd v5.2d, v5.2d, v7.2d
 	VLD1.P 16(R0), [V1.B16]
 	VLD1.P 16(R2), [V2.B16]
-	VFSUB V2.D2, V1.D2, V7.D2
-	VFABS V7.D2, V7.D2
-	VFADD V7.D2, V6.D2, V6.D2
+	WORD $0x4ee2d427 // fsub v7.2d, v1.2d, v2.2d
+	WORD $0x4ee0f8e7 // fabs v7.2d, v7.2d
+	WORD $0x4e67d4c6 // fadd v6.2d, v6.2d, v7.2d
 	SUB $8, R1
 	CMP $8, R1
 	BGE l1_loop
@@ -239,19 +239,19 @@ TEXT ·vectorAccumulateNEON(SB), NOSPLIT, $0-48
 accumulate_loop:
 	VLD1.P 16(R3), [V1.B16]
 	VLD1.P 16(R2), [V2.B16]
-	VFADD V2.D2, V1.D2, V1.D2
+	WORD $0x4e62d421 // fadd v1.2d, v1.2d, v2.2d
 	VST1.P [V1.B16], 16(R0)
 	VLD1.P 16(R3), [V1.B16]
 	VLD1.P 16(R2), [V2.B16]
-	VFADD V2.D2, V1.D2, V1.D2
+	WORD $0x4e62d421 // fadd v1.2d, v1.2d, v2.2d
 	VST1.P [V1.B16], 16(R0)
 	VLD1.P 16(R3), [V1.B16]
 	VLD1.P 16(R2), [V2.B16]
-	VFADD V2.D2, V1.D2, V1.D2
+	WORD $0x4e62d421 // fadd v1.2d, v1.2d, v2.2d
 	VST1.P [V1.B16], 16(R0)
 	VLD1.P 16(R3), [V1.B16]
 	VLD1.P 16(R2), [V2.B16]
-	VFADD V2.D2, V1.D2, V1.D2
+	WORD $0x4e62d421 // fadd v1.2d, v1.2d, v2.2d
 	VST1.P [V1.B16], 16(R0)
 	SUB $8, R1
 	CMP $8, R1
