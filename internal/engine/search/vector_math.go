@@ -177,11 +177,21 @@ func VectorHammingUnrolled(a, b []float64) int {
 	return count
 }
 
-// VectorAccumulateUnrolled adds src into dst elementwise, in place. Used by
-// VEC_CENTROID's running sum. This is an accumulation, not a pairwise
-// reduction, so it doesn't fit the existing dot/L2/L1/cosine kernel shape —
-// a portable unrolled loop only, no new SIMD assembly (same reasoning as
-// VectorHammingUnrolled above: unconfirmed hot path, not worth new asm risk).
+// VectorAccumulate adds src into dst elementwise, in place. It is used both by
+// VEC_CENTROID and by IVF k-means training, so architecture-specific kernels
+// can use vector loads, adds, and stores when that pays for their call cost.
+// A short src falls back to the Go loop so it retains its normal bounds-check
+// panic rather than reaching the assembly kernel with an invalid slice.
+func VectorAccumulate(dst, src []float64) {
+	if len(src) < len(dst) {
+		VectorAccumulateUnrolled(dst, src)
+		return
+	}
+	vectorAccumulateKernel(dst, src)
+}
+
+// VectorAccumulateUnrolled is the portable four-way implementation behind the
+// architecture-specific VectorAccumulate dispatch.
 func VectorAccumulateUnrolled(dst, src []float64) {
 	i := 0
 	for ; i+3 < len(dst); i += 4 {

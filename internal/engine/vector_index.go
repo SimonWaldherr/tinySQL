@@ -401,7 +401,7 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 			c := nearestCentroid(metric, cache.vector(rowIdx), rowNormFor(metric, cache, rowIdx), idx.centroids, idx.centroidNorms)
 			counts[c]++
 			base := c * dims
-			search.VectorAccumulateUnrolled(sums[base:base+dims], cache.vector(rowIdx))
+			search.VectorAccumulate(sums[base:base+dims], cache.vector(rowIdx))
 		}
 		for c := range idx.centroids {
 			// A centroid can end up with zero assigned rows this iteration

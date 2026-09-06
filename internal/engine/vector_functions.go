@@ -1142,7 +1142,7 @@ func evalVecCentroid(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	dim := len(vecs[0])
 	out := make([]float64, dim)
 	for _, v := range vecs {
-		search.VectorAccumulateUnrolled(out, v)
+		search.VectorAccumulate(out, v)
 	}
 	n := float64(len(vecs))
 	for i := range out {

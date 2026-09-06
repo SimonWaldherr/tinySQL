@@ -41,16 +41,26 @@ func detectAVX2FMA() bool {
 
 // vectorUseAVX2 gates dispatch to the AVX2+FMA kernels. Both features are
 // required together: the kernels use VFMADD231PD (FMA3) on YMM registers.
-// Detected once at startup via CPUID; the branch in each kernel wrapper is
-// perfectly predicted and effectively free.
-var vectorUseAVX2 = detectAVX2FMA()
+// init probes the actual server once via CPUID/XGETBV; the branch in each
+// kernel wrapper is then perfectly predicted and effectively free.
+var vectorUseAVX2 bool
 
-var VectorMathBackend = func() string {
-	if vectorUseAVX2 {
+// VectorMathBackend names the implementation selected during package init.
+// It is useful for diagnostics and confirms whether a host accepted the
+// optional AVX2/FMA path or remains on baseline SSE2.
+var VectorMathBackend string
+
+func init() {
+	vectorUseAVX2 = detectAVX2FMA()
+	VectorMathBackend = vectorAMD64Backend(vectorUseAVX2)
+}
+
+func vectorAMD64Backend(useAVX2 bool) string {
+	if useAVX2 {
 		return "amd64-avx2-fma"
 	}
 	return "amd64-sse2"
-}()
+}
 
 //go:noescape
 func vectorDotSSE2(a, b []float64) float64
@@ -110,4 +120,11 @@ func vectorCosineKernel(a, b []float64) (dot, normA2, normB2 float64) {
 		return vectorCosineAVX2(a, b)
 	}
 	return vectorCosineSSE2(a, b)
+}
+
+// Accumulation is normally an IVF-training operation rather than a per-row
+// query kernel. Keep its portable loop on amd64 until an end-to-end training
+// profile demonstrates that a separate SIMD call amortizes its setup cost.
+func vectorAccumulateKernel(dst, src []float64) {
+	VectorAccumulateUnrolled(dst, src)
 }

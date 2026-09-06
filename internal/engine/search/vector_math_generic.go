@@ -19,3 +19,7 @@ func vectorL1Kernel(a, b []float64) float64 {
 func vectorCosineKernel(a, b []float64) (dot, normA2, normB2 float64) {
 	return VectorCosineUnrolled(a, b)
 }
+
+func vectorAccumulateKernel(dst, src []float64) {
+	VectorAccumulateUnrolled(dst, src)
+}

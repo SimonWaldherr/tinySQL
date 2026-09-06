@@ -179,6 +179,65 @@ GOOS=linux GOARCH=amd64 go test -c ./internal/engine
 GOOS=linux GOARCH=amd64 go test -c ./internal/engine/search
 ```
 
+## Server capability selection
+
+The vector backend is selected once during package initialization, before any
+query executes. On amd64, tinySQL combines CPUID with XGETBV so AVX2/FMA is
+used only when the processor *and* operating system enable YMM state; all
+other amd64 hosts use the SSE2 kernels. On ARM64, it reads the operating
+system's ASIMD/NEON feature flag and falls back to the portable unrolled
+kernels if it is unavailable.
+
+`search.VectorMathBackend` exposes the chosen path for diagnostics:
+`amd64-avx2-fma`, `amd64-sse2`, `arm64-neon`, `arm64-portable`, or
+`portable-unrolled`. This avoids speculative instructions: deliberately
+executing an unsupported SIMD instruction merely to test it could terminate a
+process with `SIGILL`, so the OS feature interface is the safe server probe.
+
+## ARM64 fused cosine parts
+
+`VEC_COSINE_SIMILARITY` needs a dot product plus both squared norms when its
+inputs have no cached norm. The ARM64 path now computes all three in one NEON
+pass, loading each vector cache line once. It retains the portable unrolled
+path for vectors shorter than 32 dimensions and an exact scalar tail for odd
+lengths.
+
+On Apple M2 Max, three 500 ms runs measured 19.67 ns for a 96-dimensional
+fused kernel versus 44.80 ns for the portable loop; at 768 dimensions it took
+118.9 ns versus 430.2 ns. Both paths allocate zero bytes. This improves scalar
+cosine functions; RAG scans that already cache vector norms continue using the
+separate SIMD dot-product path.
+
+```sh
+go test ./internal/engine/search -run '^$' \
+  -bench '^BenchmarkVectorCosineNEONBySize$' -benchmem \
+  -benchtime=500ms -count=3
+```
+
+## ARM64 Manhattan distance and centroid accumulation
+
+The ARM64 backend now also uses NEON for Manhattan distance: a four-way
+subtract, absolute-value, and add pipeline is selected from 32 dimensions and
+retains an exact scalar tail. This covers direct `VEC_MANHATTAN_DISTANCE`
+calls and vector searches configured with the `manhattan` metric.
+
+The same threshold applies to in-place vector accumulation. `VEC_CENTROID`
+and IVF k-means training now dispatch through this kernel, which loads the
+current centroid and source vector in NEON lanes, adds them, and writes the
+result back without allocating.
+
+On Apple M2 Max, three 500 ms runs measured 114.7 ns for 768-dimensional L1
+distance versus 302.8 ns for the portable loop. For 768-dimensional centroid
+accumulation, the kernel took 118.6 ns versus 267.7 ns. Both improvements are
+available without any cache dependency and both benchmark paths allocate zero
+bytes.
+
+```sh
+go test ./internal/engine/search -run '^$' \
+  -bench '^(BenchmarkVectorL1NEONBySize|BenchmarkVectorAccumulateNEONBySize)$' \
+  -benchmem -benchtime=500ms -count=3
+```
+
 ## Small-window RRF fusion
 
 The default hybrid search retrieves `4 × k` candidates per branch, typically
