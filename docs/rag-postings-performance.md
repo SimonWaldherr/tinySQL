@@ -281,3 +281,72 @@ go test ./internal/engine -run '^$' \
   -bench '^BenchmarkRAGHybridSearchWithExpansion$' -benchmem \
   -benchtime=500ms -count=3
 ```
+
+### Context-window bounds and native ARM64 regression coverage
+
+Context expansion now saturates chunk-window endpoints at the platform's integer
+limits. Previously, a large `before` or `after` could wrap an endpoint and make
+the indexed lookup panic with an inverted slice range. Both the direct scan and
+the indexed expansion use the same bounds. The direct scan also limits its initial
+result allocation to the source row count instead of the requested window width.
+
+`TestRAGContextExtremeWindows` covers both integer boundaries through raw-table
+and Row-map sources, using both lookup paths. `TestRAGContextWideWindowSQL`
+checks the public `RAG_CONTEXT` and `RAG_CONTEXT_FROM` calls and their offsets.
+On an Apple M2 Max (Darwin ARM64, Go 1.27.1), the three-row
+`BenchmarkRAGContextWideWindow` fixture allocates 120 B in 2 allocations for both
+window widths 2 and 1,000,000. These are allocation measurements for a small
+fixture, not corpus-wide retrieval latency claims.
+
+Reproduce with:
+
+```sh
+go test ./internal/engine -run 'TestRAGContext.*Window' \
+  -bench '^BenchmarkRAGContextWideWindow$' -benchmem
+```
+
+CI now executes the search package's kernel tests as well as engine integration
+tests on AMD64 and native Darwin ARM64. The ARM64 job also builds the release CLI;
+NEON L2 regression coverage includes empty inputs and lengths on either side of
+vector-loop and dispatch boundaries.
+
+### Reusing warm context indexes and bounded string windows
+
+A single `RAG_CONTEXT` lookup now reuses an existing neighbor index prepared by
+`RAG_SEARCH` expansion or `RAG_CONTEXT_FROM`. It checks the same table identity,
+version, columns, tenant, and filter key as multi-hit expansion. A cold lookup
+still scans directly and does not build an index; a stale entry also falls back
+to that scan. Empty hit sets return their empty result schema without building
+an unused neighbor index. Multi-hit expansion stores candidates in a contiguous
+buffer, with an initial estimate capped at 256 candidates, instead of allocating
+one object per candidate. Deduplication and provenance ranking remain unchanged.
+
+`SUBSTRING` now locates UTF-8 boundaries only as far as the requested window.
+Negative positions still require a character count, while positive positions
+avoid counting or decoding the unused suffix. Malformed UTF-8 retains the
+previous rune-conversion semantics. Tiny outputs are copied when necessary to
+avoid retaining a large source string. Lengths are bounded by the available
+suffix, also avoiding integer overflow for very large requested lengths.
+
+Local measurements: Apple M2 Max, Darwin ARM64, Go 1.27.1; medians of three
+200 ms runs. Baseline includes the preceding context-window bounds fix.
+
+| Benchmark | Before | After | Allocations before → after |
+| --- | ---: | ---: | ---: |
+| Single context lookup, warmed index, 12,000 rows | 63.37 µs | 6.58 µs | 79 → 77 |
+| Context expansion from vector top-k | 218.38 µs | 213.66 µs | 1,060 → 1,003 |
+| Hybrid retrieval with expansion | 215.24 µs | 210.97 µs | 341 → 325 |
+| Four-character SUBSTRING, 60 KB ASCII source | 17.57 µs | 45.99 ns | 1 → 2 |
+| Four-character SUBSTRING, 90 KB Unicode source | 141.53 µs | 66.63 ns | 3 → 2 |
+
+The modest end-to-end expansion timing differences need longer runs to establish
+statistical significance; the allocation reductions are consistent. The large
+SUBSTRING gains concern short windows near the beginning of long strings, not
+arbitrary substring workloads. ASCII now allocates 20 B instead of 16 B to avoid
+retaining its 60 KB input; the Unicode fixture drops from 122,912 B to 32 B.
+
+```sh
+go test ./internal/engine -run '^$' \
+  -bench 'Benchmark(RAGContextSingleWarmIndex|RAGContextSingle|RAGContextFromTopK|RAGHybridSearchWithExpansion|SubstringShortWindow)$' \
+  -benchmem -benchtime=200ms -count=3
+```

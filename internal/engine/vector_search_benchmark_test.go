@@ -885,3 +885,25 @@ func BenchmarkVecCosineRankingDistance96(b *testing.B) {
 		}
 	})
 }
+
+// A hybrid request warms the neighbor index before a subsequent single-hit lookup.
+func BenchmarkRAGContextSingleWarmIndex(b *testing.B) {
+	db := makeRAGChunkBenchmarkTable(12000, 64)
+	table, err := db.Get("default", "rag_chunks")
+	if err != nil {
+		b.Fatal(err)
+	}
+	getRAGContextIndex(ragSourceFromTable("default", table), "doc_id", "chunk_index")
+	stmt := mustParse(`SELECT doc_id, chunk_index, chunk_text, _context_offset FROM RAG_CONTEXT('rag_chunks', 'doc_id', 'chunk_index', 'doc-500', 6, 2, 2) ORDER BY _context_rank`)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rs, err := Execute(context.Background(), db, "default", stmt)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(rs.Rows) != 5 {
+			b.Fatal(len(rs.Rows))
+		}
+	}
+}

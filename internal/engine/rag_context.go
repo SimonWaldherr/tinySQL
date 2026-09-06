@@ -73,19 +73,9 @@ func getRAGContextIndex(source ragSource, docCol, chunkCol string) ragContextInd
 	if !source.tableSource || source.table == nil {
 		return ragBuildContextIndex(source, docCol, chunkCol)
 	}
-	key := ragContextIndexCacheKey{
-		tenant:   source.tenant,
-		table:    source.table.Name,
-		docCol:   strings.ToLower(docCol),
-		chunkCol: strings.ToLower(chunkCol),
-		filter:   source.rowFilter,
-	}
-
-	ragContextIndexCacheMu.RLock()
-	entry, ok := ragContextIndexCache[key]
-	ragContextIndexCacheMu.RUnlock()
-	if ok && entry.table == source.table && entry.version == source.table.Version {
-		return entry.index
+	key := ragContextCacheKey(source, docCol, chunkCol)
+	if index, ok := cachedRAGContextIndex(source, key); ok {
+		return index
 	}
 
 	index := ragBuildContextIndex(source, docCol, chunkCol)
@@ -101,6 +91,26 @@ func getRAGContextIndex(source ragSource, docCol, chunkCol string) ragContextInd
 	}
 	ragContextIndexCacheMu.Unlock()
 	return index
+}
+
+func ragContextCacheKey(source ragSource, docCol, chunkCol string) ragContextIndexCacheKey {
+	return ragContextIndexCacheKey{
+		tenant:   source.tenant,
+		table:    source.table.Name,
+		docCol:   strings.ToLower(docCol),
+		chunkCol: strings.ToLower(chunkCol),
+		filter:   source.rowFilter,
+	}
+}
+
+func cachedRAGContextIndex(source ragSource, key ragContextIndexCacheKey) (ragContextIndex, bool) {
+	ragContextIndexCacheMu.RLock()
+	entry, ok := ragContextIndexCache[key]
+	ragContextIndexCacheMu.RUnlock()
+	if ok && entry.table == source.table && entry.version == source.table.Version {
+		return entry.index, true
+	}
+	return ragContextIndex{}, false
 }
 
 // RAG_CONTEXT loads neighboring chunks for a single retrieved chunk.
@@ -169,9 +179,8 @@ func (f *RAGContextTableFunc) Execute(ctx context.Context, args []Expr, env Exec
 		return nil, err
 	}
 
-	// A single known chunk is cheaper to resolve with one direct scan. The
-	// document index is reserved for RAG_CONTEXT_FROM, where it is reused by
-	// many retrieval hits.
+	// Reuse a warm neighbor index when available; a cold single-hit lookup
+	// retains the direct scan instead of paying to build the whole index.
 	matches := ragFindContextRows(source, docCol, chunkCol, docID, centerChunk, before, after)
 	cols := append(append([]string{}, source.cols...), "_context_offset", "_context_rank")
 	out := make([]Row, 0, len(matches))
@@ -288,15 +297,29 @@ func (f *RAGContextFromTableFunc) Execute(ctx context.Context, args []Expr, env 
 // exact same expansion logic against an in-memory fused result set instead of
 // a named table/CTE.
 func ragExpandContextFrom(source, hits ragSource, docCol, chunkCol, hitDocCol, hitChunkCol string, before, after int) *ResultSet {
-	contexts := getRAGContextIndex(source, docCol, chunkCol)
 	cols := append(append([]string{}, source.cols...), "_hit_rank", "_context_offset", "_context_rank", "_context_hits")
-	candidates := make(map[ragContextKey]*ragContextCandidate)
+	if hits.len() == 0 {
+		return &ResultSet{Cols: cols, Rows: []Row{}}
+	}
+	contexts := getRAGContextIndex(source, docCol, chunkCol)
+	// Store candidates together; the map holds stable indexes across slice growth.
+	candidates := make(map[ragContextKey]int)
+	// Bound the estimate so a huge requested window cannot force a huge
+	// allocation before we know how many neighboring chunks actually exist.
+	width := 1 + min(before, 255)
+	width += min(after, 256-width)
+	capacity := 256
+	if hits.len() <= capacity/width {
+		capacity = hits.len() * width
+	}
+	ordered := make([]ragContextCandidate, 0, min(capacity, source.len()))
 	addHit := func(docID any, centerChunk, hitRank, hitIdx int) {
 		matches := contexts.find(docID, centerChunk, before, after)
 		for _, m := range matches {
 			key := ragContextIdentity(m.docID, m.chunkIndex)
 			offset := m.chunkIndex - centerChunk
-			if existing, ok := candidates[key]; ok {
+			if index, ok := candidates[key]; ok {
+				existing := &ordered[index]
 				existing.hitCount++
 				if ragBetterContextProvenance(hitRank, offset, hitIdx, existing) {
 					existing.hitRank = hitRank
@@ -305,13 +328,14 @@ func ragExpandContextFrom(source, hits ragSource, docCol, chunkCol, hitDocCol, h
 				}
 				continue
 			}
-			candidates[key] = &ragContextCandidate{
+			candidates[key] = len(ordered)
+			ordered = append(ordered, ragContextCandidate{
 				context:  m,
 				hitRank:  hitRank,
 				offset:   offset,
 				hitIndex: hitIdx,
 				hitCount: 1,
-			}
+			})
 		}
 	}
 	if compact := hits.compactHits; compact != nil {
@@ -356,17 +380,6 @@ func ragExpandContextFrom(source, hits ragSource, docCol, chunkCol, hitDocCol, h
 		}
 	}
 
-	ordered := make([]*ragContextCandidate, 0, len(candidates))
-	for _, candidate := range candidates {
-		ordered = append(ordered, candidate)
-	}
-	// sort.Slice already runs the same unstable pdqsort as sort.Sort; the win
-	// here is only in the Swap. sort.Slice builds its Swap via reflect.Swapper,
-	// which falls back to a generic, pointer-aware swap for any element type
-	// containing a pointer — *ragContextCandidate is one word but still a
-	// pointer (same rationale as orderedRawRowsAsc in
-	// exec_fastpath_select.go). A concrete sort.Interface's Swap is a direct
-	// two-word assignment instead.
 	sort.Sort(ragContextCandidatesAsc(ordered))
 
 	out := make([]Row, 0, len(ordered))
@@ -447,10 +460,8 @@ type ragContextCandidate struct {
 	hitCount int
 }
 
-// ragContextCandidatesAsc gives []*ragContextCandidate a concrete Swap; see
-// its use in ragExpandContextFrom for why reflect.Swapper needs sidestepping
-// here.
-type ragContextCandidatesAsc []*ragContextCandidate
+// ragContextCandidatesAsc sorts the contiguous candidate buffer in place.
+type ragContextCandidatesAsc []ragContextCandidate
 
 func (s ragContextCandidatesAsc) Len() int { return len(s) }
 func (s ragContextCandidatesAsc) Less(i, j int) bool {
@@ -598,9 +609,21 @@ func (source ragSource) outputRow(rowIndex int) Row {
 }
 
 func ragFindContextRows(source ragSource, docCol, chunkCol string, docID any, centerChunk, before, after int) []ragContextRow {
-	minChunk := centerChunk - before
-	maxChunk := centerChunk + after
-	matches := make([]ragContextRow, 0, before+after+1)
+	// Reuse an index warmed by hybrid/multi-hit retrieval, while retaining
+	// the cheaper direct scan for a one-off lookup against a cold table.
+	if source.tableSource && source.table != nil {
+		if index, ok := cachedRAGContextIndex(source, ragContextCacheKey(source, docCol, chunkCol)); ok {
+			return index.find(docID, centerChunk, before, after)
+		}
+	}
+	minChunk, maxChunk := ragContextBounds(centerChunk, before, after)
+	// Reserve at most the source size, without overflowing for wide windows.
+	capacity := min(source.len(), before)
+	capacity += min(source.len()-capacity, after)
+	if capacity < source.len() {
+		capacity++
+	}
+	matches := make([]ragContextRow, 0, capacity)
 
 	// RAG_CONTEXT normally receives a named table. Resolve its two column
 	// positions once, then read raw row cells directly: source.value lowercases
@@ -731,13 +754,27 @@ func ragSortContextIndex(contexts ragContextIndex) {
 	}
 }
 
+// ragContextBounds saturates a validated non-negative window at the integer
+// limits. Wrapping would invert the range and can panic in the indexed lookup.
+func ragContextBounds(center, before, after int) (lower, upper int) {
+	const maxInt = int(^uint(0) >> 1)
+	const minInt = -maxInt - 1
+	lower, upper = minInt, maxInt
+	if center >= minInt+before {
+		lower = center - before
+	}
+	if center <= maxInt-after {
+		upper = center + after
+	}
+	return lower, upper
+}
+
 func (idx ragContextIndex) find(docID any, centerChunk, before, after int) []ragContextRow {
 	chunks := idx.byDocument[ragContextDocumentKey(docID)]
 	if len(chunks) == 0 {
 		return nil
 	}
-	minChunk := centerChunk - before
-	maxChunk := centerChunk + after
+	minChunk, maxChunk := ragContextBounds(centerChunk, before, after)
 	start := sort.Search(len(chunks), func(i int) bool { return chunks[i].chunkIndex >= minChunk })
 	end := sort.Search(len(chunks), func(i int) bool { return chunks[i].chunkIndex > maxChunk })
 	matches := chunks[start:end]

@@ -133,7 +133,7 @@ jobs:
           uname -m
 
       - name: Run engine tests with amd64 SIMD
-        run: go test ./internal/engine -count=1 -v
+        run: go test ./internal/engine/search ./internal/engine -count=1 -v
 
       - name: Run vector SIMD benchmarks
         run: |
@@ -157,6 +157,32 @@ jobs:
         with:
           name: vector-amd64-bench
           path: vector-amd64-bench.txt
+
+  vector-simd-arm64:
+    name: Vector SIMD (darwin/arm64)
+    runs-on: macos-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Verify native ARM64 runner
+        run: |
+          test "$(go env GOOS)" = "darwin"
+          test "$(go env GOARCH)" = "arm64"
+          test "$(uname -m)" = "arm64"
+
+      - name: Test NEON kernels and retrieval integration
+        run: go test ./internal/engine/search ./internal/engine -count=1
+
+      - name: Build Darwin ARM64 release CLI
+        env:
+          CGO_ENABLED: 0
+        run: go build -trimpath -o "$RUNNER_TEMP/tinysql-darwin-arm64" ./cmd/tinysql
 
   vulncheck:
     runs-on: ubuntu-latest

@@ -186,3 +186,13 @@ func TestVectorCosineNEONMatchesUnrolled(t *testing.T) {
 		}
 	}
 }
+
+func TestVectorL2SquaredNEONMatchesUnrolled(t *testing.T) {
+	for _, dims := range []int{0, 1, 7, 8, 31, 32, 63, 64, 96, 127, 128, 129, 768, 769} {
+		a, b := makeVectorMathBenchmarkInputs(dims)
+		got, want := vectorL2SquaredNEON(a, b), VectorL2SquaredUnrolled(a, b)
+		if math.IsNaN(got) || math.Abs(got-want) > 1e-12*math.Max(1, math.Abs(want)) {
+			t.Fatalf("dims=%d: NEON=%g, unrolled=%g", dims, got, want)
+		}
+	}
+}

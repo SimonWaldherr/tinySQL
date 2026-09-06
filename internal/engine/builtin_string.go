@@ -509,29 +509,22 @@ func evalSubstring(env ExecEnv, args []Expr, row Row) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("SUBSTRING start position must be an integer")
 	}
-	ascii := stringIsASCII(str)
-	var runes []rune
-	charLen := len(str)
-	if !ascii {
-		runes = stringRunes(str)
-		charLen = len(runes)
-	}
-	// SQL positions start at one. Negative positions count from the end;
-	// zero remains a forgiving alias for the first character.
+	// Positive positions only need the prefix leading up to the requested
+	// window. Negative positions additionally need the total character count.
 	switch {
 	case start > 0:
 		start--
 	case start < 0:
-		start += charLen
-	default:
-		start = 0
+		start += utf8.RuneCountInString(str)
 	}
 	if start < 0 {
 		start = 0
 	}
-	if start >= charLen {
+	startByte := substringByteOffset(str, start)
+	if startByte == len(str) {
 		return "", nil
 	}
+	endByte := len(str)
 
 	// Get length if provided
 	if len(args) == 3 {
@@ -554,20 +547,31 @@ func evalSubstring(env ExecEnv, args []Expr, row Row) (any, error) {
 		if length <= 0 {
 			return "", nil
 		}
-		end := start + length
-		if end > charLen {
-			end = charLen
-		}
-		if ascii {
-			return str[start:end], nil
-		}
-		return string(runes[start:end]), nil
+		endByte = startByte + substringByteOffset(str[startByte:], length)
 	}
 
-	if ascii {
-		return str[start:], nil
+	part := str[startByte:endByte]
+	if !utf8.ValidString(part) {
+		// Preserve the original []rune conversion's handling of malformed UTF-8.
+		return string([]rune(part)), nil
 	}
-	return string(runes[start:]), nil
+	if len(str) > 4096 && len(part) < len(str)/4 {
+		part = strings.Clone(part)
+	}
+	return part, nil
+}
+
+// substringByteOffset locates a character boundary without scanning the suffix.
+func substringByteOffset(str string, count int) int {
+	pos := 0
+	for ; count > 0 && pos < len(str); count-- {
+		width := 1
+		if str[pos] >= utf8.RuneSelf {
+			_, width = utf8.DecodeRuneInString(str[pos:])
+		}
+		pos += width
+	}
+	return pos
 }
 
 func evalLeft(env ExecEnv, args []Expr, row Row) (any, error) {

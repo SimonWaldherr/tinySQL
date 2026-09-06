@@ -237,3 +237,37 @@ func TestRAGContextDirectTableScanSemantics(t *testing.T) {
 		t.Fatalf("missing doc column returned %#v, want no rows", got)
 	}
 }
+
+func TestRAGContextSingleReusesOnlyValidIndex(t *testing.T) {
+	db, ctx := ragCacheSetup(t)
+	table, err := db.Get("default", "chunks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := ragSourceFromTable("default", table)
+	getRAGContextIndex(source, "doc_id", "chunk_index")
+	if got := contextChunkIndices(t, db, ctx, "doc-1", 1, 1, 1); fmtInts(got) != "[0 1 2]" {
+		t.Fatal(got)
+	}
+	mustExec(t, db, ctx, `UPDATE chunks SET chunk_index = 99 WHERE doc_id = 'doc-1' AND chunk_index = 2`)
+	if got := contextChunkIndices(t, db, ctx, "doc-1", 1, 1, 1); fmtInts(got) != "[0 1]" {
+		t.Fatal(got)
+	}
+}
+
+func TestRAGContextEmptyHitsDoNotWarmIndex(t *testing.T) {
+	db, _ := ragCacheSetup(t)
+	table, err := db.Get("default", "chunks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := ragSourceFromTable("default", table)
+	purgeRAGContextCachesFor("default", "chunks")
+	result := ragExpandContextFrom(source, ragSource{}, "doc_id", "chunk_index", "doc_id", "chunk_index", 1, 1)
+	if len(result.Rows) != 0 || len(result.Cols) != len(source.cols)+4 {
+		t.Fatal(result)
+	}
+	if _, ok := cachedRAGContextIndex(source, ragContextCacheKey(source, "doc_id", "chunk_index")); ok {
+		t.Fatal("empty retrieval built an index")
+	}
+}
