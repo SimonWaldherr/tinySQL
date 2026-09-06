@@ -350,3 +350,69 @@ go test ./internal/engine -run '^$' \
   -bench 'Benchmark(RAGContextSingleWarmIndex|RAGContextSingle|RAGContextFromTopK|RAGHybridSearchWithExpansion|SubstringShortWindow)$' \
   -benchmem -benchtime=200ms -count=3
 ```
+
+### Streamed FTS index ingestion
+
+Persistent FTS build, append, and update maintenance now tokenize indexed columns
+individually in column order. Previously they first copied each document's values
+into a space-separated string. Streaming preserves the same token sequence,
+including phrases crossing column boundaries, while avoiding that temporary
+string. Integer term IDs use the standard library's generic `slices.Sort` rather
+than reflective `sort.Slice`. No index format or query API changes are needed.
+
+`TestFTSColumnStreamingMatchesJoinedText` compares token sequences and complete
+persistent indexes against the old concatenation behavior, including reordered
+and repeated columns, missing cells, NULLs, empty strings, numbers, mixed case,
+and malformed UTF-8.
+
+Apple M2 Max, Darwin ARM64, Go 1.27.1; medians of three 300 ms runs, 1,000
+documents. Baseline is commit `b7e4c44` with the same benchmark fixture:
+
+| Indexed columns | Time before → after | Allocated bytes before → after | Allocations before → after |
+| --- | ---: | ---: | ---: |
+| 1 | 2.551 → 2.458 ms | 2,040,619 → 1,536,617 | 6,330 → 3,330 |
+| 3 | 6.276 → 5.823 ms | 5,698,609 → 2,250,597 | 8,334 → 3,334 |
+
+These measurements describe initial index construction; they do not claim a
+matching speedup for warmed retrieval or measure resident memory.
+
+```sh
+go test ./internal/engine -run '^TestFTSColumnStreamingMatchesJoinedText$' \
+  -bench '^BenchmarkFTSPersistentBuild$' -benchmem -benchtime=300ms -count=3
+```
+
+### Batch-local posting maintenance
+
+Append indexing now updates posting rows and frequencies in the same pass over
+the sorted term IDs. The last physical row in a posting list identifies whether
+that term has already occurred in the current append batch, eliminating a
+repeated `changedTerms` lookup without adding a vocabulary-sized scratch buffer.
+The first changed posting position is still retained for incremental block-bound
+recomputation. Batch UPDATE reuses its frequency map with `clear` and reslices its
+term-ID buffer between documents; this scratch space remains local to the call.
+
+`TestFTSAppendBatchesMatchFullBuild` compares the complete incremental index with
+a fresh build at 0, 1, 127, 128, 129, 255, 256, and 300 rows.
+`TestFTSBatchUpdateScratchIsolation` checks token streams and posting metadata for
+mixed updates, new terms, empty/NULL/stop-word-only documents, and invalid row IDs.
+
+Further local measurements on the same Apple M2 Max / Go 1.27.1 environment,
+medians of three 300 ms runs, compared with the streamed-ingestion implementation
+immediately above:
+
+| Operation | Before | After |
+| --- | ---: | ---: |
+| Build, 1,000 documents, one column | 2.441 ms | 2.414 ms |
+| Build, 1,000 documents, three columns | 5.844 ms | 5.739 ms |
+| Batch refresh, 1,000 documents | 3.368 ms | 3.093 ms |
+
+The additional build-time differences are small relative to run-to-run variation;
+no material allocation change was measured in these fixtures. The batch-refresh
+fixture excludes initial index construction and rewrites existing documents to
+isolate refresh overhead. These results do not imply a warmed-query speedup.
+
+```sh
+go test ./internal/engine -run '^$' \
+  -bench '^BenchmarkFTSPersistent(Build|BatchUpdate)$' \
+  -benchmem -benchtime=300ms -count=3
+```

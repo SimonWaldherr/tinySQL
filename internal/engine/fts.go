@@ -43,6 +43,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1543,6 +1544,21 @@ func ftsValueToString(v any) string {
 	return valueText(v)
 }
 
+// ftsVisitRowTokens streams columns in their indexed order. Tokenizing each
+// separately is equivalent to joining them with a space, including phrase
+// positions, and avoids allocating a combined document string.
+func ftsVisitRowTokens(row []any, cols []int, visit func(string)) {
+	for _, ci := range cols {
+		if ci >= len(row) || row[ci] == nil {
+			continue
+		}
+		ftsForEachToken(valueText(row[ci]), func(term string) bool {
+			visit(term)
+			return true
+		})
+	}
+}
+
 const ftsPersistentFormat = 2
 
 func ftsPersistentUsable(index *storage.FTSIndex, table *storage.Table) bool {
@@ -1583,7 +1599,10 @@ func ftsRefreshUpdatedRows(table *storage.Table, cols []int, index *storage.FTSI
 		}
 	}
 	changedTerms := make(map[string]bool)
-	var sb strings.Builder
+	// Reuse per-document scratch space across the batch without retaining it
+	// in the persistent index or sharing mutable buffers between queries.
+	counts := make(map[int32]int32)
+	var ids []int32
 	for _, ri := range rows {
 		if ri < 0 || ri >= len(table.Rows) || ri >= len(index.Docs) {
 			continue
@@ -1604,22 +1623,9 @@ func ftsRefreshUpdatedRows(table *storage.Table, cols []int, index *storage.FTSI
 		}
 		index.Docs[ri] = storage.FTSDocument{}
 
-		r := table.Rows[ri]
-		sb.Reset()
-		for _, ci := range cols {
-			if ci < len(r) && r[ci] != nil {
-				if sb.Len() > 0 {
-					sb.WriteByte(' ')
-				}
-				ftsWriteValue(&sb, r[ci])
-			}
-		}
-		if sb.Len() == 0 {
-			continue
-		}
-		counts := make(map[int32]int32)
+		clear(counts)
 		tokenStart := int32(len(index.DocTokenIDs))
-		ftsForEachToken(sb.String(), func(term string) bool {
+		ftsVisitRowTokens(table.Rows[ri], cols, func(term string) {
 			id, ok := index.TermIDs[term]
 			if !ok {
 				id = int32(len(index.TermIDs))
@@ -1628,16 +1634,15 @@ func ftsRefreshUpdatedRows(table *storage.Table, cols []int, index *storage.FTSI
 			}
 			counts[id]++
 			index.DocTokenIDs = append(index.DocTokenIDs, id)
-			return true
 		})
 		if len(counts) == 0 {
 			continue
 		}
-		ids := make([]int32, 0, len(counts))
+		ids = ids[:0]
 		for id := range counts {
 			ids = append(ids, id)
 		}
-		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		slices.Sort(ids)
 		termStart := int32(len(index.DocTermIDs))
 		for _, id := range ids {
 			index.DocTermIDs = append(index.DocTermIDs, id)
@@ -1707,25 +1712,11 @@ func ftsExtendPersistent(table *storage.Table, cols []int, index *storage.FTSInd
 	}
 	counts := make([]int32, len(index.TermIDs))
 	var touched []int32
-	var sb strings.Builder
 	for ri := start; ri < len(table.Rows); ri++ {
-		r := table.Rows[ri]
-		sb.Reset()
-		for _, ci := range cols {
-			if ci < len(r) && r[ci] != nil {
-				if sb.Len() > 0 {
-					sb.WriteByte(' ')
-				}
-				ftsWriteValue(&sb, r[ci])
-			}
-		}
-		if sb.Len() == 0 {
-			continue
-		}
 		tokenStart := int32(len(index.DocTokenIDs))
 		touched = touched[:0]
 		tokenCount := 0
-		ftsForEachToken(sb.String(), func(term string) bool {
+		ftsVisitRowTokens(table.Rows[ri], cols, func(term string) {
 			id, ok := index.TermIDs[term]
 			if !ok {
 				id = int32(len(index.TermIDs))
@@ -1739,20 +1730,24 @@ func ftsExtendPersistent(table *storage.Table, cols []int, index *storage.FTSInd
 			counts[id]++
 			index.DocTokenIDs = append(index.DocTokenIDs, id)
 			tokenCount++
-			return true
 		})
 		if tokenCount == 0 {
 			continue
 		}
-		sort.Slice(touched, func(i, j int) bool { return touched[i] < touched[j] })
+		slices.Sort(touched)
 		termStart := int32(len(index.DocTermIDs))
 		for _, id := range touched {
 			index.DocTermIDs = append(index.DocTermIDs, id)
 			index.DocTermCounts = append(index.DocTermCounts, counts[id])
-			if _, seen := changedTerms[termNames[id]]; !seen {
-				changedTerms[termNames[id]] = len(index.Postings[termNames[id]])
+			term := termNames[id]
+			postings := index.Postings[term]
+			// Rows are appended in physical order. A tail before this batch
+			// means this is the term's first occurrence in the extension.
+			if len(postings) == 0 || int(postings[len(postings)-1]) < start {
+				changedTerms[term] = len(postings)
 			}
-			index.PostingCounts[termNames[id]] = append(index.PostingCounts[termNames[id]], counts[id])
+			index.Postings[term] = append(postings, int32(ri))
+			index.PostingCounts[term] = append(index.PostingCounts[term], counts[id])
 			counts[id] = 0
 		}
 		index.Docs[ri] = storage.FTSDocument{
@@ -1769,10 +1764,6 @@ func ftsExtendPersistent(table *storage.Table, cols []int, index *storage.FTSInd
 			termsPerDoc := len(index.DocTermIDs)/index.NumDocs + 1
 			index.DocTermIDs = ftsReserve(index.DocTermIDs, termsPerDoc*rows*5/4)
 			index.DocTermCounts = ftsReserve(index.DocTermCounts, termsPerDoc*rows*5/4)
-		}
-		for _, id := range touched {
-			term := termNames[id]
-			index.Postings[term] = append(index.Postings[term], int32(ri))
 		}
 	}
 	if index.NumDocs > 0 {
