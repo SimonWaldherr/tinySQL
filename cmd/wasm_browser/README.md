@@ -90,3 +90,43 @@ node wasm_benchmark.js web/tinySQL.wasm 10000
 
 The output reports elapsed time, throughput, and microseconds per query or
 update as JSON. Pass another WASM file as the first argument to compare builds.
+
+### Result transfer
+
+Browser and Node builds share an adaptive result bridge: responses with at least
+32 rows of JSON-compatible primitive values are serialized once and converted
+into native JavaScript objects with `JSON.parse`. Smaller responses use direct
+`syscall/js` conversion. The public response remains an object in both cases.
+Special numeric values, float32, malformed UTF-8 and nil inner rows retain the
+direct conversion path to preserve their existing semantics. `elapsed_ms` retains
+its historical nanosecond units.
+
+On an Apple M2 Max with Go 1.27.1 and Node 26.8.1, three alternating runs of 2,000
+queries each gave these median wall-clock times (including result transfer):
+
+| Query | Before | After |
+| --- | ---: | ---: |
+| Constant, one row | 41.74 µs | 42.14 µs |
+| Filtered scan, 20 rows | 132.85 µs | 133.45 µs |
+| Full result, 200 rows / 600 cells | 935.10 µs | 517.19 µs |
+
+The large-result fixture takes about 45% less time; small-result differences are
+within the observed measurement variation. The stripped Go WASM grew by 3,366
+bytes (about 1,232 bytes with gzip). These measurements use Node's V8 runtime;
+other browsers, result sizes and data types may have different tradeoffs.
+
+To use the runtime support file matching a different Go toolchain:
+
+```sh
+WASM_EXEC_JS="$(go env GOROOT)/lib/wasm/wasm_exec.js" \
+  node wasm_benchmark.js /path/to/tinySQL.wasm 2000
+```
+
+The benchmark verifies all 200 result rows and an empty result before timing.
+Bridge edge-case tests execute inside WASM:
+
+```sh
+# Run from the repository root.
+GOOS=js GOARCH=wasm go test \
+  -exec="$(go env GOROOT)/lib/wasm/go_js_wasm_exec" ./internal/wasmbridge
+```

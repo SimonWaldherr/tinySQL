@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 
 const fs = require('fs');
+const assert = require('node:assert/strict');
 const path = require('path');
 const { performance } = require('perf_hooks');
 
-require('./web/wasm_exec.js');
+require(process.env.WASM_EXEC_JS || './web/wasm_exec.js');
 
 const wasmPath = path.resolve(process.argv[2] || './web/tinySQL.wasm');
 const iterations = Number.parseInt(process.argv[3] || '1000', 10);
@@ -14,10 +15,8 @@ if (!Number.isInteger(iterations) || iterations < 1) {
 }
 
 function parse(response) {
-  // tinySQL's WASM API now returns native JS objects/arrays directly (via
-  // syscall/js.ValueOf) instead of JSON strings, so no JSON.parse round trip
-  // is needed here any more. Kept as a passthrough so this benchmark still
-  // works unmodified against older tinySQL.wasm builds that returned strings.
+  // Both bridge paths return native objects. Accept strings as well so the
+  // benchmark can still compare older builds of the API.
   return typeof response === 'string' ? JSON.parse(response) : response;
 }
 
@@ -100,6 +99,13 @@ async function main() {
     );
   }
 
+  // Validate cell values as well as row counts before measuring transfer speed.
+  const full = assertSuccess(db.query('SELECT id, name, active FROM users ORDER BY id'), 'verify full result');
+  assert.deepEqual(full.columns, ['id', 'name', 'active']);
+  assert.deepEqual(full.rows, Array.from({ length: 200 }, (_, id) => [id, `user_${id}`, id % 2 === 0]));
+  const empty = assertSuccess(db.query('SELECT id FROM users WHERE id = -1'), 'verify empty result');
+  assert.deepEqual(empty.rows, []);
+
   console.log(JSON.stringify({
     wasm: wasmPath,
     results: [
@@ -109,6 +115,7 @@ async function main() {
         'filtered-scan',
         'SELECT id, name FROM users WHERE active = true ORDER BY id LIMIT 20',
       ),
+      benchmarkQuery(db, 'full-result', 'SELECT id, name, active FROM users ORDER BY id'),
       benchmarkExec(db, 'primary-key-update', 'UPDATE users SET name = \'updated\' WHERE id = 100'),
       benchmarkExec(db, 'primary-key-delete', 'DELETE FROM users WHERE id = 101'),
     ],

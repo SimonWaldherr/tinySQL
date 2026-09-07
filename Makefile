@@ -129,7 +129,7 @@ build-wasm-node:
 ## wasm-check: Compile every WebAssembly target without leaving build artifacts behind
 wasm-check:
 	@echo "$(GREEN)Checking WebAssembly targets...$(NC)"
-	@tmpdir="$$(mktemp -d)"; \
+	@set -eu; tmpdir="$$(mktemp -d "$${TMPDIR:-/tmp}/tinysql-wasm.XXXXXX")"; \
 	trap 'rm -rf "$$tmpdir"' EXIT; \
 	GOOS=js GOARCH=wasm $(GO) build -trimpath -o "$$tmpdir/tinysql-browser.wasm" ./$(CMD_DIR)/wasm_browser; \
 	GOOS=js GOARCH=wasm $(GO) build -trimpath -o "$$tmpdir/tinysql-node.wasm" ./$(CMD_DIR)/wasm_node; \

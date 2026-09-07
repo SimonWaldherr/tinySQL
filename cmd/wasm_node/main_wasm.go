@@ -12,6 +12,7 @@ import (
 
 	tsql "github.com/SimonWaldherr/tinySQL"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
+	"github.com/SimonWaldherr/tinySQL/internal/wasmbridge"
 )
 
 const wasmQueryCacheSize = 256
@@ -48,25 +49,11 @@ func apiResult(success bool, errMsg, message string) map[string]any {
 	return m
 }
 
-// queryResultMap builds the QueryResult response shape as a plain
-// map[string]any. columns/rows are passed through stringsToAny/rowsToAny so a
-// nil slice still round-trips as JS null (matching what json.Marshal produced
-// for a nil []string/[][]any with no `omitempty`), while a non-nil-but-empty
-// slice round-trips as an empty JS array. elapsedNs mirrors the previous
-// `Elapsed time.Duration` field: time.Duration has no MarshalJSON/MarshalText,
-// so it always serialized as a plain nanosecond count under the (mislabeled)
-// "elapsed_ms" key -- preserved here bit-for-bit rather than "fixed".
-func queryResultMap(columns []string, rows [][]any, errMsg string, count int, elapsedNs int64) map[string]any {
-	m := map[string]any{
-		"columns":    stringsToAny(columns),
-		"rows":       rowsToAny(rows),
-		"count":      count,
-		"elapsed_ms": elapsedNs,
-	}
-	if errMsg != "" {
-		m["error"] = errMsg
-	}
-	return m
+// queryResultMap retains the public response shape and uses the shared WASM
+// bridge to batch larger result transfers. elapsed_ms remains nanoseconds for
+// compatibility with the existing JavaScript API.
+func queryResultMap(columns []string, rows [][]any, errMsg string, count int, elapsedNs int64) any {
+	return wasmbridge.QueryResult(columns, rows, errMsg, count, elapsedNs)
 }
 
 // stringsToAny converts a []string to []any for js.ValueOf, preserving nil.
@@ -83,22 +70,6 @@ func stringsToAny(ss []string) any {
 	out := make([]any, len(ss))
 	for i, s := range ss {
 		out[i] = s
-	}
-	return out
-}
-
-// rowsToAny converts a [][]any to []any for js.ValueOf, preserving nil (see
-// stringsToAny for why the return type must be `any` rather than `[]any`).
-// Each inner []any is already js.ValueOf-safe (see convertValue) and needs
-// no further conversion -- only the outer container's type needs to become
-// the literal []any that js.ValueOf recognizes.
-func rowsToAny(rows [][]any) any {
-	if rows == nil {
-		return nil
-	}
-	out := make([]any, len(rows))
-	for i, r := range rows {
-		out[i] = r
 	}
 	return out
 }
