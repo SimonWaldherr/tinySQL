@@ -239,11 +239,11 @@ func OpenWithConfig(ctx context.Context, cfg OpenConfig) (*sql.DB, error) {
 		ctx = context.Background()
 	}
 	pingCtx := ctx
-	cancel := func() {}
 	if cfg.PingTimeout > 0 {
+		var cancel context.CancelFunc
 		pingCtx, cancel = context.WithTimeout(ctx, cfg.PingTimeout)
+		defer cancel()
 	}
-	defer cancel()
 	if err := db.PingContext(pingCtx); err != nil {
 		_ = db.Close()
 		return nil, err

@@ -119,18 +119,21 @@ func (s *server) releaseWriter() {
 
 //nolint:gocyclo // Connection throttling must cover timeout, context, and immediate acquisition paths.
 func (s *server) acquire(ctx context.Context, pool chan struct{}) error {
-	if pool == nil {
-		if ctx != nil {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-			}
-		}
-		return nil
-	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	// A ready slot must not win select against an already canceled context.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if pool == nil {
+		return nil
+	}
+	// The uncontended path needs neither a timer nor deadline bookkeeping.
+	select {
+	case pool <- struct{}{}:
+		return nil
+	default:
 	}
 	if s.busyTimeout <= 0 {
 		select {
@@ -140,39 +143,28 @@ func (s *server) acquire(ctx context.Context, pool chan struct{}) error {
 			return ctx.Err()
 		}
 	}
-	timeout := s.busyTimeout
-	if deadline, ok := ctx.Deadline(); ok {
-		remain := time.Until(deadline)
-		if remain <= 0 {
+	// Let the context own its deadline. A second timer for that deadline can
+	// race with ctx.Done and incorrectly report a busy timeout.
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= s.busyTimeout {
+		select {
+		case pool <- struct{}{}:
+			return nil
+		case <-ctx.Done():
 			return ctx.Err()
 		}
-		if remain < timeout {
-			timeout = remain
-		}
 	}
-	select {
-	case pool <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-	timer := time.NewTimer(timeout)
-	defer func() {
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-	}()
+	timer := time.NewTimer(s.busyTimeout)
+	defer timer.Stop()
 	select {
 	case pool <- struct{}{}:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-timer.C:
-		return fmt.Errorf("tinysql: busy timeout after %s", timeout)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return fmt.Errorf("tinysql: busy timeout after %s", s.busyTimeout)
 	}
 }
 

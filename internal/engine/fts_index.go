@@ -113,7 +113,7 @@ func ftsScanTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQueryNode
 			continue
 		}
 		wg.Add(1)
-		go func(worker, start, end int) {
+		run := func() {
 			defer wg.Done()
 			// Contain a panic as an ordinary worker error rather than letting it
 			// crash the process, matching vecSearchTopK's behavior.
@@ -124,7 +124,13 @@ func ftsScanTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQueryNode
 			}()
 			h, err := ftsScanRange(ctx, cache, node, idf, rows, restricted, start, end, k)
 			results[worker] = workerResult{heapRows: h, err: err}
-		}(worker, start, end)
+		}
+		// Use the caller as one worker instead of parking it for the whole scan.
+		if worker == workers-1 {
+			run()
+		} else {
+			go run()
+		}
 	}
 	wg.Wait()
 

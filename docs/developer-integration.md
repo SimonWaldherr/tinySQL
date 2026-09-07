@@ -264,6 +264,9 @@ for rows.Next() {
 if err := rows.Err(); err != nil { panic(err) }
 ```
 
+For allocation measurements, connection-admission behavior, and retrieval worker
+changes, see [Driver and engine performance](./driver-engine-performance.md).
+
 #### Transactions and concurrent writes
 
 `BeginTx` takes a snapshot. Changes to different tables can commit in parallel;

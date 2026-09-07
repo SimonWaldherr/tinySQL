@@ -10,7 +10,9 @@ import (
 // This test is deliberately in driver_test: it proves an external module can
 // embed the public tinySQL DB without naming an internal/storage type.
 func TestOpenWithPublicTinySQLDB(t *testing.T) {
-	db, err := driver.OpenWithDB(tinysql.NewDB())
+	native := tinysql.NewDB()
+	defer native.Close()
+	db, err := driver.OpenWithDB(native)
 	if err != nil {
 		t.Fatalf("OpenWithDB: %v", err)
 	}

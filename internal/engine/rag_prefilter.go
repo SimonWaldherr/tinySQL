@@ -545,10 +545,22 @@ func ragRowsForAllowedIDs(table *storage.Table, column string, pos int, values [
 	// only when the cell itself is float64 -- keeping it out of floatSet
 	// avoids exactSet's precision guarantee leaking a false match into the
 	// int/int64 cell path above.
-	exactIntSet := make(map[int64]struct{}, len(values))
-	floatSet := make(map[float64]struct{}, len(values))
+	// Reserve each bucket for its own values, not the entire mixed list.
+	var ints, floats, stringsCount int
+	for _, v := range values {
+		switch v.(type) {
+		case int, int64:
+			ints++
+		case float64:
+			floats++
+		case string:
+			stringsCount++
+		}
+	}
+	exactIntSet := make(map[int64]struct{}, ints)
+	floatSet := make(map[float64]struct{}, floats)
 	var intAsFloat map[float64]struct{}
-	stringSet := make(map[string]struct{}, len(values))
+	stringSet := make(map[string]struct{}, stringsCount)
 	var residual []any
 	for _, v := range values {
 		switch x := v.(type) {
@@ -562,12 +574,6 @@ func ragRowsForAllowedIDs(table *storage.Table, column string, pos int, values [
 			stringSet[x] = struct{}{}
 		default:
 			residual = append(residual, v)
-		}
-	}
-	if len(exactIntSet) > 0 {
-		intAsFloat = make(map[float64]struct{}, len(exactIntSet))
-		for v := range exactIntSet {
-			intAsFloat[float64(v)] = struct{}{}
 		}
 	}
 
@@ -591,6 +597,13 @@ func ragRowsForAllowedIDs(table *storage.Table, column string, pos int, values [
 		case float64:
 			_, matched = floatSet[c]
 			if !matched {
+				// Integer-only tables never need this lossy cross-type mirror.
+				if intAsFloat == nil && len(exactIntSet) > 0 {
+					intAsFloat = make(map[float64]struct{}, len(exactIntSet))
+					for v := range exactIntSet {
+						intAsFloat[float64(v)] = struct{}{}
+					}
+				}
 				_, matched = intAsFloat[c]
 			}
 		case string:
@@ -736,6 +749,22 @@ func ragNormalizeRowIDs(total int, rows []int) []int {
 	if len(rows) == 0 {
 		return nil
 	}
+	// Scans already emit sorted row IDs. Filter and deduplicate into a new
+	// slice so callers keep ownership of their input, without a hash table.
+	if sort.IntsAreSorted(rows) {
+		start := sort.SearchInts(rows, 0)
+		end := sort.SearchInts(rows, total)
+		if start >= end {
+			return nil
+		}
+		out := make([]int, 0, end-start)
+		for _, rowID := range rows[start:end] {
+			if len(out) == 0 || out[len(out)-1] != rowID {
+				out = append(out, rowID)
+			}
+		}
+		return out
+	}
 	// Use a map for O(1) dedup, then extract and sort unique keys
 	seen := make(map[int]struct{}, len(rows))
 	for _, rowID := range rows {
@@ -849,11 +878,17 @@ func ragVecTopKAllowed(ctx context.Context, allowed []int, queryLen, k int, cach
 			continue
 		}
 		wg.Add(1)
-		go func(worker, start, end, rc int) {
+		run := func() {
 			defer wg.Done()
-			h, err := ragVecTopKAllowedRange(ctx, allowed, start, end, queryLen, k, cache, distFn, needNorm, rc)
+			h, err := ragVecTopKAllowedRange(ctx, allowed, start, end, queryLen, k, cache, distFn, needNorm, rowCount)
 			results[worker] = workerResult{heapRows: h, err: err}
-		}(worker, start, end, rowCount)
+		}
+		// Use the caller as one worker instead of parking it for the whole scan.
+		if worker == workers-1 {
+			run()
+		} else {
+			go run()
+		}
 	}
 	wg.Wait()
 

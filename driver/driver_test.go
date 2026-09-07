@@ -21,6 +21,7 @@ func TestOpenInMemory(t *testing.T) {
 	// Also verify OpenWithDB accepts a public tinySQL DB without an external
 	// application importing the internal/storage implementation package.
 	sdb := tinysql.NewDB()
+	defer sdb.Close()
 	sqlDB, err := OpenWithDB(sdb)
 	if err != nil {
 		t.Fatalf("OpenWithDB error: %v", err)

@@ -1,5 +1,9 @@
 # Retrieval performance
 
+For subsequent pool, binding, RAG filter, and top-k allocation improvements, see
+[Driver and engine performance](driver-engine-performance.md). The measurements
+below describe the earlier search-path changes.
+
 ## Search-path changes
 
 - RAG's lexical branch evaluates bound, literal OR queries as a flat list of

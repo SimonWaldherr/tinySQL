@@ -12,12 +12,17 @@ import (
 
 // Placeholder Binding (einfach/sicher)
 func bindPlaceholders(sqlStr string, args []driver.NamedValue) (string, error) {
+	// SQL without parameters needs no builder or copy. Potential placeholders
+	// still go through validation, including when no arguments were supplied.
+	if len(args) == 0 && !strings.ContainsAny(sqlStr, "?$:") {
+		return sqlStr, nil
+	}
 	// Precompute literal strings for all args to avoid repeated formatting.
 	lits := make([]string, len(args))
+	used := make([]bool, len(args))
 	for i := range args {
 		lits[i] = sqlLiteral(args[i].Value)
 	}
-	used := make([]bool, len(lits))
 
 	litLen := 0
 	for _, lit := range lits {

@@ -835,6 +835,7 @@ process-local result cache and anonymous shape/timing analytics. See the
 | [Architecture](./docs/architecture.md) | Parser, executor, storage, and invariants |
 | [Development guide](./docs/development-guide.md) | Tests, Make targets, and releasing demos |
 | [Benchmarks](./BENCHMARKS.md) | Reproducible performance measurements |
+| [Driver and engine performance](./docs/driver-engine-performance.md) | Allocation improvements, pool behavior, and local measurements |
 
 Run the full test suite:
 

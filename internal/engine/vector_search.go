@@ -796,6 +796,17 @@ func topKFromHeap(heapRows *vecScoredHeap, k int) []vecScoredRow {
 	if k <= 0 {
 		return nil
 	}
+	if k == heapRows.Len() {
+		// Pop already moves each worst entry to the end of the backing slice.
+		// Draining the whole heap therefore sorts that storage best-first.
+		rows := []vecScoredRow(*heapRows)
+		for heapRows.Len() > 0 {
+			vecScoredHeapPop(heapRows)
+		}
+		// Transfer ownership: a later push must not overwrite returned rows.
+		*heapRows = nil
+		return rows
+	}
 	rows := make([]vecScoredRow, k)
 	for i := k - 1; i >= 0; i-- {
 		rows[i] = vecScoredHeapPop(heapRows)
@@ -926,7 +937,7 @@ func vecSearchTopK(ctx context.Context, rows [][]any, queryLen int, k int, cache
 			continue
 		}
 		wg.Add(1)
-		go func(worker, start, end int) {
+		run := func() {
 			defer wg.Done()
 			// A panic in one worker (e.g. a future edge case in a distance
 			// function) must not take down the whole process: recover here and
@@ -940,7 +951,13 @@ func vecSearchTopK(ctx context.Context, rows [][]any, queryLen int, k int, cache
 			}()
 			h, err := vecSearchTopKRange(ctx, rows, start, end, queryLen, k, cache, distFn, needNorm)
 			results[worker] = workerResult{heapRows: h, err: err}
-		}(worker, start, end)
+		}
+		// Use the caller as one worker instead of parking it for the whole scan.
+		if worker == workers-1 {
+			run()
+		} else {
+			go run()
+		}
 	}
 	wg.Wait()
 

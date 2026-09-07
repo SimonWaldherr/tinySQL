@@ -22,7 +22,6 @@ package driver
 
 import (
 	"database/sql"
-	"encoding/gob"
 	"errors"
 	"net/url"
 	"time"
@@ -30,7 +29,7 @@ import (
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
-// init registers the "tinysql" driver and pre-registers common GOB types.
+// The driver registration enables blank-import integration with database/sql.
 // This enables database/sql.Open("tinysql", dsn) to work out of the box.
 // Supported DSNs:
 //   - mem://?tenant=default&pool_readers=4&busy_timeout=250ms
@@ -48,8 +47,7 @@ var ErrTransactionConflict = errors.New("tinysql: transaction conflict")
 
 func init() {
 	sql.Register("tinysql", defaultDrv)
-	gob.Register(map[string]any{})
-	gob.Register([]any{})
+	// Storage owns GOB type registration, including map[string]any and []any.
 }
 
 // SetDefaultDB allows external code to provide a storage.DB instance that will
@@ -59,19 +57,13 @@ func SetDefaultDB(db *storage.DB) {
 	if db == nil {
 		return
 	}
-	// Create a default cfg with sane defaults
-	c := cfg{
-		tenant:      "default",
-		maxReaders:  4,
-		maxWriters:  1,
-		busyTimeout: 250 * time.Millisecond,
-	}
+	srv := newEmbeddedServer(db)
 	// Pre-create server using provided DB so subsequent Open() calls reuse it.
 	// Note: This allows embedding consumers to control the underlying DB
 	// instance (for example tests or WASM hosts) while still using the
 	// database/sql API.
 	defaultDrv.mu.Lock()
-	defaultDrv.srv = newServer(db, c)
+	defaultDrv.srv = srv
 	defaultDrv.mu.Unlock()
 }
 
@@ -108,16 +100,20 @@ func OpenWithDB(db *storage.DB) (*sql.DB, error) {
 	if db.IsClosed() {
 		return nil, errors.New("tinysql: OpenWithDB requires an open database")
 	}
-	c := cfg{
+	d := &drv{srv: newEmbeddedServer(db)}
+	// The empty-DSN configuration is fixed; no string parsing is needed.
+	return sql.OpenDB(&connector{
+		driver: d,
+		cfg:    cfg{defaultDSN: true, tenant: "default"},
+	}), nil
+}
+
+// newEmbeddedServer keeps the legacy and isolated embedding defaults aligned.
+func newEmbeddedServer(db *storage.DB) *server {
+	return newServer(db, cfg{
 		tenant:      "default",
 		maxReaders:  4,
 		maxWriters:  1,
 		busyTimeout: 250 * time.Millisecond,
-	}
-	d := &drv{srv: newServer(db, c)}
-	connector, err := d.OpenConnector("")
-	if err != nil {
-		return nil, err
-	}
-	return sql.OpenDB(connector), nil
+	})
 }

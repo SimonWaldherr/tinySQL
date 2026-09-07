@@ -2079,6 +2079,17 @@ func ftsTopKFromHeap(h *ftsScoredHeap, k int) []ftsScored {
 	if k <= 0 {
 		return nil
 	}
+	if k == h.Len() {
+		// Pop already moves each worst entry to the end of the backing slice.
+		// Draining the whole heap therefore sorts that storage best-first.
+		rows := []ftsScored(*h)
+		for h.Len() > 0 {
+			ftsScoredHeapPop(h)
+		}
+		// Transfer ownership: a later push must not overwrite returned rows.
+		*h = nil
+		return rows
+	}
 	rows := make([]ftsScored, k)
 	for i := k - 1; i >= 0; i-- {
 		rows[i] = ftsScoredHeapPop(h)
