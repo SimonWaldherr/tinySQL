@@ -14,8 +14,9 @@ import (
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
-// drv is the globally registered database/sql Driver. srv is intentionally
-// reserved for the legacy empty-DSN embedding API (SetDefaultDB). It is not a
+// drv implements the database/sql Driver. srv is reserved for embedding:
+// SetDefaultDB sets it on the registered driver, while OpenWithDB creates a
+// private driver whose server never changes. It is not a
 // cache for arbitrary DSNs: sharing it for mem:// or file: caused independent
 // sql.Open calls to see the wrong database and, before Connector support,
 // opening a physical connection could construct another full storage.DB.
@@ -114,7 +115,7 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 }
 
 func (c *connector) openServer() (*server, error) {
-	// Preserve SetDefaultDB/OpenWithDB for the one historical empty-DSN path,
+	// Use the driver's supplied server for the empty-DSN embedding path,
 	// but never let it leak into named in-memory or file DSNs.
 	if c.cfg.defaultDSN {
 		c.driver.mu.RLock()

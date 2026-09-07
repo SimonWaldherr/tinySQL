@@ -218,6 +218,28 @@ Helpers in the public driver package:
 - `driver.OpenFile("/path/to/db.dat")` for file-backed tools
 - `driver.OpenWithDB(db)` to wrap an existing `*tinysql.DB`
 
+For embedding in plugins, test fixtures, or multiple tool instances,
+`OpenWithDB` binds each SQL pool to the supplied database. Opening another pool
+does not redirect existing or future connections to a different database.
+The native database remains caller-owned: close the SQL pool first, then the
+native database. Nil and already closed databases return an error.
+
+```go
+native := tinysql.NewDB()
+defer native.Close()
+db, err := tsqldriver.OpenWithDB(native)
+if err != nil { panic(err) }
+defer db.Close()
+// Native API calls and queries through db now use the same database.
+```
+
+Migration note: `OpenWithDB` no longer sets the process-wide default database.
+Code that intentionally needs subsequent `sql.Open("tinysql", "")` calls to
+use a global database must explicitly call `driver.SetDefaultDB(native)`.
+Prefer passing the returned `*sql.DB` to each component for isolated embedding.
+`OpenInMemory(tenant)` accepts literal tenant names, including `&`, `+`, and
+Unicode; callers should not URL-encode the name themselves.
+
 Use the DSN for tinySQL-specific options, `database/sql` for pool parameters
 (`MaxOpenConns`, `MaxIdleConns`, `ConnMaxLifetime`, `ConnMaxIdleTime`), and
 `context.WithTimeout(...)` with `ExecContext`/`QueryContext`/`PingContext` per
@@ -481,6 +503,11 @@ tinySQL kann auf drei Ebenen integriert werden:
 - Transaktionen: `BeginTx` arbeitet auf einem Snapshot; Commit-Konflikte mit
   `errors.Is(err, driver.ErrTransactionConflict)` erkennen und die fachliche
   Operation wiederholen.
+- `OpenWithDB` bindet jeden SQL-Pool fest an die uebergebene Datenbank und
+  veraendert keinen globalen Standard mehr. Zuerst den SQL-Pool, danach die
+  native Datenbank schliessen. Fuer bewusst globales Verhalten weiterhin
+  explizit `SetDefaultDB` aufrufen. `OpenInMemory` uebernimmt Mandantennamen
+  mit Sonderzeichen ohne manuelles URL-Encoding.
 - Eigene tabellenwertige Funktionen ueber
   `tinysql.RegisterExternalTableFunc(...)` registrieren, nicht gegen
   `internal/engine` entwickeln.

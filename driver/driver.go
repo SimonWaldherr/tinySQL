@@ -21,14 +21,12 @@ func Open(dsn string) (*sql.DB, error) { return sql.Open(DriverName, dsn) }
 // by constructing a `file:` DSN for `sql.Open`.
 func OpenFile(path string) (*sql.DB, error) { return Open("file:" + path) }
 
-// OpenWithDB registers the provided public tinySQL database as the driver's
-// default DB and returns a *sql.DB connected to it. This is useful for
-// embedding or tests without exposing an internal/storage type in the public
-// driver contract.
+// OpenWithDB returns a SQL pool bound to the provided public tinySQL database.
+// It does not change the global default database. All pooled connections use
+// db, including connections opened later. The caller retains ownership of db:
+// close the SQL pool before closing db. A nil or closed db is rejected.
 func OpenWithDB(db *tinysql.DB) (*sql.DB, error) {
-	// Register provided DB instance for subsequent Open("") calls.
-	SetDefaultDB(db)
-	return Open("")
+	return id.OpenWithDB(db)
 }
 
 // OpenInMemory returns a database/sql handle backed by an in-memory tinySQL

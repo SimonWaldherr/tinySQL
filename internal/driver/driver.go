@@ -24,6 +24,7 @@ import (
 	"database/sql"
 	"encoding/gob"
 	"errors"
+	"net/url"
 	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -93,7 +94,30 @@ func CurrentDefaultDB() *storage.DB {
 func OpenInMemory(tenant string) (*sql.DB, error) {
 	dsn := "mem://"
 	if tenant != "" {
-		dsn += "?tenant=" + tenant
+		dsn += "?tenant=" + url.QueryEscape(tenant)
 	}
 	return sql.Open("tinysql", dsn)
+}
+
+// OpenWithDB binds a SQL pool to a caller-owned database without changing the
+// registered driver's default. Closing the pool does not close db.
+func OpenWithDB(db *storage.DB) (*sql.DB, error) {
+	if db == nil {
+		return nil, errors.New("tinysql: OpenWithDB requires a non-nil database")
+	}
+	if db.IsClosed() {
+		return nil, errors.New("tinysql: OpenWithDB requires an open database")
+	}
+	c := cfg{
+		tenant:      "default",
+		maxReaders:  4,
+		maxWriters:  1,
+		busyTimeout: 250 * time.Millisecond,
+	}
+	d := &drv{srv: newServer(db, c)}
+	connector, err := d.OpenConnector("")
+	if err != nil {
+		return nil, err
+	}
+	return sql.OpenDB(connector), nil
 }
