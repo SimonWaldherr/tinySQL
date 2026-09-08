@@ -758,10 +758,11 @@ func ftsCandidateScanIsCheaper(rows []int32, numRows int) bool {
 // the term supplying its maximum score, and thus cannot enter the OR top-k.
 func ftsDisjunctionTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQueryNode, k int) ([]ftsScored, error) {
 	if node.op == "TERM" {
-		copy := *node
-		copy.termIDNs = []int32{node.termID}
-		copy.termIDFs = []float64{node.termIDF}
-		node = &copy
+		h := make(ftsScoredHeap, 0, min(k, len(cache.postings[node.term])))
+		if err := ftsTermPostingTopK(ctx, &cache, node.term, node.termID, node.termIDF, k, &h); err != nil {
+			return nil, err
+		}
+		return ftsTopKFromHeap(&h, k), nil
 	}
 	terms, _ := ftsLiteralORTerms(node)
 	order := make([]int, len(terms))
@@ -786,61 +787,9 @@ func ftsDisjunctionTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQu
 		if err := checkCtx(ctx); err != nil {
 			return nil, err
 		}
-		frequencies := cache.postingCounts[term]
-		blocks := cache.postingBlocks[term]
-		postings := cache.postings[term]
 		local := make(ftsScoredHeap, 0, min(k, len(cache.postings[term])))
-		for pi := 0; pi < len(postings); pi++ {
-			if pi%storage.FTSPostingBlockSize == 0 && len(local) == k && pi/storage.FTSPostingBlockSize < len(blocks) {
-				block := blocks[pi/storage.FTSPostingBlockSize]
-				norm := block.MinDocLen
-				if cache.avgDocLen > 0 {
-					norm /= cache.avgDocLen
-				}
-				tf := float64(block.MaxFrequency)
-				bound := ((tf * (bm25K1 + 1)) / (tf + ftsLengthNorm(norm))) * node.termIDFs[i]
-				// Outward rounding keeps pruning conservative at floating-point ties.
-				for n := 0; n < 8; n++ {
-					bound = math.Nextafter(bound, math.Inf(1))
-				}
-				if bound < local[0].score {
-					if err := checkCtx(ctx); err != nil {
-						return nil, err
-					}
-					pi += storage.FTSPostingBlockSize - 1
-					continue
-				}
-			}
-			row := postings[pi]
-			if pi&1023 == 0 {
-				if err := checkCtx(ctx); err != nil {
-					return nil, err
-				}
-			}
-			ri := int(row)
-			doc := cache.docs[ri]
-			if !doc.Valid {
-				continue
-			}
-			norm := doc.DocLen
-			if cache.avgDocLen > 0 {
-				norm /= cache.avgDocLen
-			}
-			// Frequencies are position-aligned with postings. The fallback supports
-			// manually constructed runtime entries without the persisted field.
-			frequency := 0
-			if len(frequencies) == len(postings) {
-				frequency = int(frequencies[pi])
-			} else {
-				frequency = cache.termFrequency(doc, node.termIDNs[i])
-			}
-			if frequency <= 0 {
-				continue
-			}
-			tf := float64(frequency)
-			lengthNorm := ftsLengthNorm(norm)
-			score := ((tf * (bm25K1 + 1)) / (tf + lengthNorm)) * node.termIDFs[i]
-			ftsPushTopK(&local, ri, score, k)
+		if err := ftsTermPostingTopK(ctx, &cache, term, node.termIDNs[i], node.termIDFs[i], k, &local); err != nil {
+			return nil, err
 		}
 		for _, hit := range local {
 			if old, ok := winners[hit.rowIdx]; !ok || hit.score > old {
@@ -859,6 +808,70 @@ func ftsDisjunctionTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQu
 		}
 	}
 	return ftsTopKFromHeap(&merged, k), nil
+}
+
+// ftsTermPostingTopK scores one term with the same conservative block bounds
+// as OR retrieval. Single-term queries need no union map or second heap.
+func ftsTermPostingTopK(ctx context.Context, cache *ftsDocCacheEntry, term string, termID int32, idf float64, k int, local *ftsScoredHeap) error {
+	if err := checkCtx(ctx); err != nil {
+		return err
+	}
+	frequencies := cache.postingCounts[term]
+	blocks := cache.postingBlocks[term]
+	postings := cache.postings[term]
+	for pi := 0; pi < len(postings); pi++ {
+		if pi%storage.FTSPostingBlockSize == 0 && len(*local) == k && pi/storage.FTSPostingBlockSize < len(blocks) {
+			block := blocks[pi/storage.FTSPostingBlockSize]
+			norm := block.MinDocLen
+			if cache.avgDocLen > 0 {
+				norm /= cache.avgDocLen
+			}
+			tf := float64(block.MaxFrequency)
+			bound := ((tf * (bm25K1 + 1)) / (tf + ftsLengthNorm(norm))) * idf
+			// Outward rounding keeps pruning conservative at floating-point ties.
+			for n := 0; n < 8; n++ {
+				bound = math.Nextafter(bound, math.Inf(1))
+			}
+			if bound < (*local)[0].score {
+				if err := checkCtx(ctx); err != nil {
+					return err
+				}
+				pi += storage.FTSPostingBlockSize - 1
+				continue
+			}
+		}
+		row := postings[pi]
+		if pi&1023 == 0 {
+			if err := checkCtx(ctx); err != nil {
+				return err
+			}
+		}
+		ri := int(row)
+		doc := cache.docs[ri]
+		if !doc.Valid {
+			continue
+		}
+		norm := doc.DocLen
+		if cache.avgDocLen > 0 {
+			norm /= cache.avgDocLen
+		}
+		// Frequencies are position-aligned with postings. The fallback supports
+		// manually constructed runtime entries without the persisted field.
+		frequency := 0
+		if len(frequencies) == len(postings) {
+			frequency = int(frequencies[pi])
+		} else {
+			frequency = cache.termFrequency(doc, termID)
+		}
+		if frequency <= 0 {
+			continue
+		}
+		tf := float64(frequency)
+		lengthNorm := ftsLengthNorm(norm)
+		score := ((tf * (bm25K1 + 1)) / (tf + lengthNorm)) * idf
+		ftsPushTopK(local, ri, score, k)
+	}
+	return nil
 }
 
 // Keep a common rounding boundary for document and posting-oriented scoring.

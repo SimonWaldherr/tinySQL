@@ -179,12 +179,16 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		}
 
 		// Otherwise treat the keyword as a variable/column reference
-		name := p.cur.Val
-		p.next()
+		name, err := p.parseQualifiedColumnName()
+		if err != nil {
+			return nil, err
+		}
 		return newVarRef(name), nil
 	case tIdent:
-		name := p.cur.Val
-		p.next()
+		name, err := p.parseQualifiedColumnName()
+		if err != nil {
+			return nil, err
+		}
 		// Check if it's a function call
 		if p.cur.Typ == tSymbol && p.cur.Val == "(" {
 			// This is a function call with an identifier
@@ -254,4 +258,22 @@ func (p *Parser) parseCaseExpr() (Expr, error) {
 	}
 	p.next()
 	return &CaseExpr{Operand: operand, Whens: whens, Else: elseExpr}, nil
+}
+
+// Quoted components are separate lexer tokens ("table"."column"), unlike
+// bare dotted identifiers. Consume both forms consistently in expressions.
+func (p *Parser) parseQualifiedColumnName() (string, error) {
+	name := p.parseIdentLike()
+	if name == "" {
+		return "", p.errf("expected column name")
+	}
+	for p.cur.Typ == tSymbol && p.cur.Val == "." {
+		p.next()
+		part := p.parseIdentLike()
+		if part == "" {
+			return "", p.errf("expected column name after '.'")
+		}
+		name += "." + part
+	}
+	return name, nil
 }

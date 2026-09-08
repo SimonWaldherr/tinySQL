@@ -15,6 +15,11 @@ import (
 )
 
 func (c *conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
 	// database/sql routes db.Exec/tx.Exec straight here whenever the driver
 	// implements driver.ExecerContext (conn does) -- an explicit db.Prepare
 	// is never involved, so stmt.go's prepared/pooled AST reuse never
@@ -24,12 +29,10 @@ func (c *conn) ExecContext(ctx context.Context, query string, args []driver.Name
 	// gives that same shape the same benefit: skip bindPlaceholders' text
 	// render (which hex-encodes every []byte argument into a SQL literal)
 	// and the full lex/parse pass that would otherwise follow, per call.
-	if pq, _ := execPreparedFor(query); pq != nil && len(args) == len(pq.markers) {
+	if pq, _ := execPreparedFor(query); pq != nil && len(args) == pq.inputCount {
 		if exec, err := pq.acquire(); err == nil {
 			defer pq.release(exec)
-			for i, arg := range args {
-				exec.params[i].Val = driverValueLiteral(arg.Value)
-			}
+			pq.bind(exec, args)
 			return c.execStatement(ctx, exec.statement)
 		}
 	}
@@ -41,6 +44,11 @@ func (c *conn) ExecContext(ctx context.Context, query string, args []driver.Name
 }
 
 func (c *conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
 	// Mirrors ExecContext above for db.Query/tx.Query, but only takes the
 	// cached-AST path for a plain SELECT: querySQL's text path additionally
 	// knows how to run a DML statement with a RETURNING clause under the
@@ -51,7 +59,7 @@ func (c *conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 	// ExecContext call reusing the same text) is simply not reused here;
 	// queryPreparedAdHoc reports ok=false and this falls back to the
 	// existing text path.
-	if pq, _ := execPreparedFor(query); pq != nil && len(args) == len(pq.markers) {
+	if pq, _ := execPreparedFor(query); pq != nil && len(args) == pq.inputCount {
 		if rows, ok, err := c.queryPreparedAdHoc(ctx, pq, args); ok {
 			return rows, err
 		}
@@ -76,9 +84,7 @@ func (c *conn) queryPreparedAdHoc(ctx context.Context, pq *preparedQuery, args [
 		pq.release(exec)
 		return nil, false, nil
 	}
-	for i, arg := range args {
-		exec.params[i].Val = driverValueLiteral(arg.Value)
-	}
+	pq.bind(exec, args)
 	// queryStatementWithCleanup takes ownership of the borrowed execution and
 	// returns it only once the result stream has stopped. Releasing here would
 	// race a later QueryContext binding against the producer's WHERE/projection
@@ -118,8 +124,7 @@ const (
 
 // execPreparedFor returns a cached preparedQuery for sqlStr, building and
 // caching one on a cold miss. It returns a nil *preparedQuery -- never an
-// error worth surfacing -- when sqlStr is too long to cache, uses numbered
-// ($1/:1) rather than positional (?) placeholders, has no placeholders at
+// error worth surfacing -- when sqlStr is too long to cache, uses unsupported/mixed parameter forms, has no placeholders at
 // all, or is not a SELECT/INSERT/UPDATE/DELETE: callers fall back to the
 // text-binding path unchanged in every such case, which remains the sole
 // source of truth for a genuine syntax error (buildPreparedQuery's own
@@ -219,6 +224,18 @@ const (
 )
 
 func parseSQLCached(sqlStr string) (engine.Statement, error) {
+	return parseSQLCachedContext(context.Background(), sqlStr)
+}
+
+// Cache waiters can abandon a cold parse without canceling the shared leader.
+// Parsing itself is synchronous; the parser does not yet accept a context.
+func parseSQLCachedContext(ctx context.Context, sqlStr string) (engine.Statement, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	cacheable := len(sqlStr) <= parsedStmtCacheMaxSQLLen && parseCacheCandidate(sqlStr)
 	if !cacheable {
 		return engine.NewParser(sqlStr).ParseStatement()
@@ -241,7 +258,14 @@ func parseSQLCached(sqlStr string) (engine.Statement, error) {
 	}
 	if call := parsedStmtInFlight[sqlStr]; call != nil {
 		parsedStmtMu.Unlock()
-		<-call.done
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-call.done:
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if call.err != nil {
 			return nil, call.err
 		}
@@ -321,7 +345,7 @@ func (c *conn) execSQL(ctx context.Context, sqlStr string) (driver.Result, error
 			return res, err
 		}
 	}
-	st, err := parseSQLCached(sqlStr)
+	st, err := parseSQLCachedContext(ctx, sqlStr)
 	if err != nil {
 		return nil, err
 	}

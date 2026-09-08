@@ -275,65 +275,74 @@ func TestDriverBlockingSelectSkipsResultStream(t *testing.T) {
 // to the pool at QueryContext return, the second binding could turn the first
 // stream's remaining rows from even to odd IDs.
 func TestPreparedSelectStreamRetainsBoundExecution(t *testing.T) {
-	srv := newServer(storage.NewDB(), cfg{tenant: "default"})
-	c := &conn{srv: srv, tenant: "default"}
-	if _, err := c.execSQL(context.Background(), `CREATE TABLE prepared_stream (id INT, bucket TEXT)`); err != nil {
-		t.Fatalf("create table: %v", err)
-	}
-	table, err := srv.db.Get("default", "prepared_stream")
-	if err != nil {
-		t.Fatalf("get table: %v", err)
-	}
-	table.Rows = make([][]any, 512)
-	for i := range table.Rows {
-		bucket := "right"
-		if i%2 == 0 {
-			bucket = "left"
-		}
-		table.Rows[i] = []any{i, bucket}
-	}
-	table.Version++
+	for _, query := range []string{
+		"SELECT id FROM prepared_stream WHERE bucket = ?",
+		"SELECT id FROM prepared_stream WHERE bucket = $1 OR bucket = $1",
+	} {
+		t.Run(query, func(t *testing.T) {
 
-	rawStmt, err := c.Prepare(`SELECT id FROM prepared_stream WHERE bucket = ?`)
-	if err != nil {
-		t.Fatalf("prepare: %v", err)
-	}
-	prepared := rawStmt.(*stmt)
-	first, err := prepared.QueryContext(context.Background(), []stdDriver.NamedValue{{Ordinal: 1, Value: "left"}})
-	if err != nil {
-		t.Fatalf("first query: %v", err)
-	}
-	defer first.Close()
-	if streamed, ok := first.(*rows); !ok || streamed.stream == nil {
-		t.Fatalf("prepared SELECT did not return streamed rows: %T", first)
-	}
-	second, err := prepared.QueryContext(context.Background(), []stdDriver.NamedValue{{Ordinal: 1, Value: "right"}})
-	if err != nil {
-		t.Fatalf("second query: %v", err)
-	}
-	defer second.Close()
+			srv := newServer(storage.NewDB(), cfg{tenant: "default"})
+			c := &conn{srv: srv, tenant: "default"}
+			if _, err := c.execSQL(context.Background(), `CREATE TABLE prepared_stream (id INT, bucket TEXT)`); err != nil {
+				t.Fatalf("create table: %v", err)
+			}
+			table, err := srv.db.Get("default", "prepared_stream")
+			if err != nil {
+				t.Fatalf("get table: %v", err)
+			}
+			table.Rows = make([][]any, 512)
+			for i := range table.Rows {
+				bucket := "right"
+				if i%2 == 0 {
+					bucket = "left"
+				}
+				table.Rows[i] = []any{i, bucket}
+			}
+			table.Version++
 
-	dest := make([]stdDriver.Value, 1)
-	count := 0
-	for {
-		err := first.Next(dest)
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			t.Fatalf("first Next: %v", err)
-		}
-		id, ok := dest[0].(int64)
-		if !ok {
-			t.Fatalf("id type = %T, want int64", dest[0])
-		}
-		if id%2 != 0 {
-			t.Fatalf("first stream changed binding at row %d: id = %d, want even", count, id)
-		}
-		count++
-	}
-	if count != 256 {
-		t.Fatalf("first stream rows = %d, want 256", count)
+			rawStmt, err := c.Prepare(query)
+			if err != nil {
+				t.Fatalf("prepare: %v", err)
+			}
+			prepared := rawStmt.(*stmt)
+			first, err := prepared.QueryContext(context.Background(), []stdDriver.NamedValue{{Ordinal: 1, Value: "left"}})
+			if err != nil {
+				t.Fatalf("first query: %v", err)
+			}
+			defer first.Close()
+			if streamed, ok := first.(*rows); !ok || streamed.stream == nil {
+				t.Fatalf("prepared SELECT did not return streamed rows: %T", first)
+			}
+			second, err := prepared.QueryContext(context.Background(), []stdDriver.NamedValue{{Ordinal: 1, Value: "right"}})
+			if err != nil {
+				t.Fatalf("second query: %v", err)
+			}
+			defer second.Close()
+
+			dest := make([]stdDriver.Value, 1)
+			count := 0
+			for {
+				err := first.Next(dest)
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				if err != nil {
+					t.Fatalf("first Next: %v", err)
+				}
+				id, ok := dest[0].(int64)
+				if !ok {
+					t.Fatalf("id type = %T, want int64", dest[0])
+				}
+				if id%2 != 0 {
+					t.Fatalf("first stream changed binding at row %d: id = %d, want even", count, id)
+				}
+				count++
+			}
+			if count != 256 {
+				t.Fatalf("first stream rows = %d, want 256", count)
+			}
+
+		})
 	}
 }
 

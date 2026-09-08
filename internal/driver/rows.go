@@ -4,7 +4,9 @@ package driver
 
 import (
 	"database/sql/driver"
+	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -124,23 +126,22 @@ func (r *rows) copyRow(row engine.Row, cols []string, dest []driver.Value) error
 	for i := range cols {
 		v := row[r.lowerCols[i]]
 		switch vv := v.(type) {
-		case nil, int64, float64, bool, string:
+		case nil, int64, float64, bool, string, time.Time:
 			// These values already have a database/sql-supported dynamic type.
 			// Preserve the existing interface box: assigning the type-switch
 			// variable would box numeric values again and allocate per cell.
 			dest[i] = v
 		case int:
 			dest[i] = int64(vv)
-		case time.Time:
-			// RFC3339Nano to match the bind path (CheckNamedValue), so sub-second
-			// precision survives a bind -> store -> scan round trip.
-			dest[i] = vv.Format(time.RFC3339Nano)
 		case []byte:
 			// database/sql callers may retain Scan destinations; return an owned
 			// slice just as the standard drivers do for binary columns.
 			dest[i] = append([]byte(nil), vv...)
 		default:
-			b, _ := storage.JSONMarshal(vv)
+			b, err := storage.JSONMarshal(vv)
+			if err != nil {
+				return fmt.Errorf("tinysql: encode column %q: %w", cols[i], err)
+			}
 			dest[i] = string(b)
 		}
 	}
@@ -152,7 +153,12 @@ func (r *rows) ColumnTypeDatabaseTypeName(i int) string { return "TEXT" }
 
 func (r *rows) ColumnTypeNullable(i int) (bool, bool) { return true, true }
 
-func (r *rows) ColumnTypeScanType(i int) any { return "interface{}" }
+func (r *rows) ColumnTypeScanType(i int) reflect.Type { return reflect.TypeFor[any]() }
+
+var (
+	_ driver.RowsColumnTypeScanType = (*rows)(nil)
+	_ driver.RowsColumnTypeScanType = emptyRows{}
+)
 
 type emptyRows struct{}
 
@@ -166,4 +172,4 @@ func (emptyRows) ColumnTypeDatabaseTypeName(int) string { return "TEXT" }
 
 func (emptyRows) ColumnTypeNullable(int) (bool, bool) { return true, true }
 
-func (emptyRows) ColumnTypeScanType(int) any { return "interface{}" }
+func (emptyRows) ColumnTypeScanType(int) reflect.Type { return reflect.TypeFor[any]() }

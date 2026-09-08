@@ -975,35 +975,30 @@ func ragFTSSearchCandidatesFiltered(ctx context.Context, tenant string, table *s
 	if node == nil {
 		return nil, nil
 	}
-	// Computed once and threaded into both cache lookups below rather than
-	// each recomputing ftsColsCacheKey(searchCols) independently: same input,
-	// same result, and both run on every filtered FTS call including cache
-	// hits.
 	colsKey := ftsColsCacheKey(searchCols)
-	rows := ragCachedFTSFilterCandidates(table, colsKey, query, candidates, filter)
-	if len(rows) == 0 {
+	prepared := ragPrepareFilteredFTSQuery(table, colsKey, query, cache, node, candidates, filter)
+	if len(prepared.rows) == 0 {
 		return nil, nil
 	}
-	// BM25's document frequency and average document length are ranking inputs.
-	// Derive them from the authorized set too: using corpus-wide IDF after a
-	// row filter would both make ranks depend on forbidden rows and expose a
-	// small aggregate side channel through the public _fts_score values.
-	filteredCache, idf := ragFilteredFTSStatistics(table, colsKey, cache, filter)
-	node = ftsBindIDF(node, idf, filteredCache.termIDs)
-	results, err := ftsScanTopK(ctx, filteredCache, node, nil, rows, true, k)
+	// Only the immutable token/postings arena is shared with the full corpus.
+	// Ranking uses the cached plan's authorized N, average length, and IDF.
+	cache.numDocs = prepared.stats.numDocs
+	cache.avgDocLen = prepared.stats.avgDocLen
+	results, err := ftsScanTopK(ctx, cache, prepared.node, nil, prepared.rows, true, k)
 	if err != nil {
 		return nil, fmt.Errorf("FTS_SEARCH: %w", err)
 	}
 	return results, nil
 }
 
-// A prepared FTS query already caches its wildcard expansion and postings
-// candidate list. Cache the final intersection with a stable authorization set
-// as well; otherwise a selective tenant filter still allocates an int32 list on
-// every repeated question even though neither the query nor permissions moved.
-const ragFilteredFTSCandidateCacheMaxEntries = 256
+// Cache the authorization-specific query plan alongside its candidate rows.
+// Repeated queries then reuse the bound BM25 weights instead of intersecting
+// each term's postings with the same filter and copying the query tree again.
+// Plans are immutable and scoped to the table version, column set, query text,
+// and resolved filter identity. Scores never inherit another filter's corpus.
+const ragFilteredFTSQueryCacheMaxEntries = 256
 
-type ragFilteredFTSCandidateCacheKey struct {
+type ragFilteredFTSQueryCacheKey struct {
 	table   *storage.Table
 	version int
 	cols    string
@@ -1011,9 +1006,15 @@ type ragFilteredFTSCandidateCacheKey struct {
 	filter  *ragRowFilter
 }
 
+type ragFilteredFTSQuery struct {
+	rows  []int32
+	node  *ftsQueryNode
+	stats ragFilteredFTSStats
+}
+
 var (
-	ragFilteredFTSCandidateCacheMu sync.RWMutex
-	ragFilteredFTSCandidateCache   = make(map[ragFilteredFTSCandidateCacheKey][]int32)
+	ragFilteredFTSQueryCacheMu sync.RWMutex
+	ragFilteredFTSQueryCache   = make(map[ragFilteredFTSQueryCacheKey]ragFilteredFTSQuery)
 )
 
 // BM25 statistics are independent of the textual query, so cache the
@@ -1039,29 +1040,34 @@ var (
 	ragFilteredFTSStatsCache   = make(map[ragFilteredFTSStatsCacheKey]ragFilteredFTSStats)
 )
 
-func ragCachedFTSFilterCandidates(table *storage.Table, colsKey string, query string, candidates ftsCandidates, filter *ragRowFilter) []int32 {
-	key := ragFilteredFTSCandidateCacheKey{
+func ragPrepareFilteredFTSQuery(table *storage.Table, colsKey string, query string, cache ftsDocCacheEntry, node *ftsQueryNode, candidates ftsCandidates, filter *ragRowFilter) ragFilteredFTSQuery {
+	key := ragFilteredFTSQueryCacheKey{
 		table: table, version: table.Version, cols: colsKey, query: query, filter: filter,
 	}
-	ragFilteredFTSCandidateCacheMu.RLock()
-	cached, ok := ragFilteredFTSCandidateCache[key]
-	ragFilteredFTSCandidateCacheMu.RUnlock()
+	ragFilteredFTSQueryCacheMu.RLock()
+	cached, ok := ragFilteredFTSQueryCache[key]
+	ragFilteredFTSQueryCacheMu.RUnlock()
 	if ok {
 		return cached
 	}
 
-	rows := ragIntersectFTSCandidates(candidates, filter.rows)
-	ragFilteredFTSCandidateCacheMu.Lock()
-	if cached, ok := ragFilteredFTSCandidateCache[key]; ok {
-		ragFilteredFTSCandidateCacheMu.Unlock()
+	prepared := ragFilteredFTSQuery{rows: ragIntersectFTSCandidates(candidates, filter.rows)}
+	if len(prepared.rows) > 0 {
+		filteredCache, idf := ragFilteredFTSStatistics(table, colsKey, cache, filter)
+		prepared.node = ftsBindIDF(node, idf, filteredCache.termIDs)
+		prepared.stats = ragFilteredFTSStats{numDocs: filteredCache.numDocs, avgDocLen: filteredCache.avgDocLen}
+	}
+	ragFilteredFTSQueryCacheMu.Lock()
+	if cached, ok := ragFilteredFTSQueryCache[key]; ok {
+		ragFilteredFTSQueryCacheMu.Unlock()
 		return cached
 	}
-	if len(ragFilteredFTSCandidateCache) >= ragFilteredFTSCandidateCacheMaxEntries {
-		evictOverCap(ragFilteredFTSCandidateCache, ragFilteredFTSCandidateCacheMaxEntries)
+	if len(ragFilteredFTSQueryCache) >= ragFilteredFTSQueryCacheMaxEntries {
+		evictOverCap(ragFilteredFTSQueryCache, ragFilteredFTSQueryCacheMaxEntries)
 	}
-	ragFilteredFTSCandidateCache[key] = rows
-	ragFilteredFTSCandidateCacheMu.Unlock()
-	return rows
+	ragFilteredFTSQueryCache[key] = prepared
+	ragFilteredFTSQueryCacheMu.Unlock()
+	return prepared
 }
 
 func ragIntersectFTSCandidates(candidates ftsCandidates, allowed []int) []int32 {
@@ -1134,9 +1140,9 @@ func ragFilteredFTSStatistics(table *storage.Table, colsKey string, cache ftsDoc
 		return filteredCache, nil
 	}
 
-	// ftsBindIDF asks once per term in the prepared tree. Memoize the
-	// two-pointer postings/filter intersection in this per-query closure so
-	// repeated terms in compound queries cost no additional work.
+	// On a plan-cache miss, ftsBindIDF may request the same term more than
+	// once. Memoize its postings/filter intersection during construction;
+	// subsequent queries reuse the immutable bound tree in the plan cache.
 	weights := make(map[string]float64)
 	return filteredCache, func(term string) float64 {
 		if weight, ok := weights[term]; ok {
@@ -1185,13 +1191,13 @@ func purgeRAGPreFilterCachesFor(table string) {
 	}
 	ragRowFilterCacheMu.Unlock()
 
-	ragFilteredFTSCandidateCacheMu.Lock()
-	for key := range ragFilteredFTSCandidateCache {
+	ragFilteredFTSQueryCacheMu.Lock()
+	for key := range ragFilteredFTSQueryCache {
 		if key.table != nil && strings.EqualFold(key.table.Name, table) {
-			delete(ragFilteredFTSCandidateCache, key)
+			delete(ragFilteredFTSQueryCache, key)
 		}
 	}
-	ragFilteredFTSCandidateCacheMu.Unlock()
+	ragFilteredFTSQueryCacheMu.Unlock()
 
 	ragFilteredFTSStatsCacheMu.Lock()
 	for key := range ragFilteredFTSStatsCache {

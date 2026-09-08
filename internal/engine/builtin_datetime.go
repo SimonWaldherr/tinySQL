@@ -77,7 +77,8 @@ func evalDateDiff(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 }
 
 // parseTimeFixedDigits parses the fixed-width layouts "2006-01-02 15:04:05",
-// "2006-01-02T15:04:05" and "2006-01-02" directly, without going through
+// "2006-01-02T15:04:05" and "2006-01-02", including fractional seconds
+// and RFC3339 UTC timestamps, directly without going through
 // time.Parse's layout interpreter. Timestamp columns in analytical/RAG
 // queries (RECENCY_SCORE, RAG_HYBRID_SCORE, date functions) are parsed once
 // per row, and time.Parse's generality made it a top-3 CPU cost in such
@@ -87,6 +88,39 @@ func evalDateDiff(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 // time.Parse reports an error — so callers fall back to the general path
 // and error behavior is unchanged.
 func parseTimeFixedDigits(s string) (time.Time, bool) {
+	// SQL timestamps may include a fractional second. Validate every digit,
+	// truncating beyond nanoseconds just like time.Parse. Restrict the optional
+	// Z suffix to RFC3339's T separator; SQL space-separated timestamps with Z
+	// were not accepted by the fallback layouts.
+	var nanos int
+	if len(s) > 19 {
+		end := len(s)
+		// Numeric zones use time.Parse's optimized RFC3339 implementation.
+		if end >= 25 && (s[end-6] == '+' || s[end-6] == '-') {
+			return time.Time{}, false
+		}
+		if s[end-1] == 'Z' {
+			if s[10] != 'T' {
+				return time.Time{}, false
+			}
+			end--
+		}
+		if end > 19 {
+			if (s[19] != '.' && s[19] != ',') || end == 20 {
+				return time.Time{}, false
+			}
+			scale := 100000000
+			for i := 20; i < end; i++ {
+				digit := s[i] - '0'
+				if digit > 9 {
+					return time.Time{}, false
+				}
+				nanos += int(digit) * scale
+				scale /= 10
+			}
+		}
+		s = s[:19]
+	}
 	digit2 := func(i int) (int, bool) {
 		c0, c1 := s[i]-'0', s[i+1]-'0'
 		if c0 > 9 || c1 > 9 {
@@ -124,7 +158,7 @@ func parseTimeFixedDigits(s string) (time.Time, bool) {
 	if m < 1 || m > 12 || d < 1 || d > 31 {
 		return time.Time{}, false
 	}
-	t := time.Date(y, time.Month(m), d, hh, mm, ss, 0, time.UTC)
+	t := time.Date(y, time.Month(m), d, hh, mm, ss, nanos, time.UTC)
 	// Reject dates time.Date normalized (e.g. Feb 31 → Mar 3) to keep
 	// time.Parse's out-of-range error semantics via the fallback path.
 	if t.Day() != d {

@@ -28,9 +28,11 @@ type stmt struct {
 // Close, because engine.ExecuteStream can still dereference bound literals
 // after QueryContext has returned.
 type preparedQuery struct {
-	markerSQL string
-	markers   []string
-	pool      sync.Pool
+	markerSQL  string
+	markers    []string
+	argOrder   []int // occurrence -> zero-based argument; nil for positional templates
+	inputCount int
+	pool       sync.Pool
 }
 
 // preparedExecution is intentionally owned by exactly one goroutine between
@@ -45,7 +47,14 @@ type preparedExecution struct {
 
 func (s *stmt) Close() error { return nil }
 
-func (s *stmt) NumInput() int { return -1 }
+// Validated templates know their argument count independently of repeated
+// occurrences. Unsupported statement forms retain the binder's validation.
+func (s *stmt) NumInput() int {
+	if s.prepared != nil {
+		return s.prepared.inputCount
+	}
+	return -1
+}
 
 func (s *stmt) Exec(args []driver.Value) (driver.Result, error) {
 	n := make([]driver.NamedValue, len(args))
@@ -64,6 +73,11 @@ func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
 }
 
 func (s *stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
 	if s.prepared != nil {
 		return s.execPrepared(ctx, args)
 	}
@@ -75,6 +89,11 @@ func (s *stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (drive
 }
 
 func (s *stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
 	if s.prepared != nil {
 		return s.queryPrepared(ctx, args)
 	}
@@ -86,16 +105,14 @@ func (s *stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driv
 }
 
 func (s *stmt) queryPrepared(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
-	if len(args) != len(s.prepared.markers) {
-		return nil, fmt.Errorf("tinysql: expected %d placeholder arguments, got %d", len(s.prepared.markers), len(args))
+	if len(args) != s.prepared.inputCount {
+		return nil, fmt.Errorf("tinysql: expected %d placeholder arguments, got %d", s.prepared.inputCount, len(args))
 	}
 	exec, err := s.prepared.acquire()
 	if err != nil {
 		return nil, err
 	}
-	for i, arg := range args {
-		exec.params[i].Val = driverValueLiteral(arg.Value)
-	}
+	s.prepared.bind(exec, args)
 
 	// SELECTs can be consumed incrementally. Ownership of exec transfers to
 	// the rows object, which releases it only after its stream has stopped.
@@ -130,17 +147,15 @@ func (s *stmt) queryPrepared(ctx context.Context, args []driver.NamedValue) (dri
 // have the parser immediately decode that hex back into bytes) and the full
 // lex/parse pass that a text-based Exec always pays.
 func (s *stmt) execPrepared(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
-	if len(args) != len(s.prepared.markers) {
-		return nil, fmt.Errorf("tinysql: expected %d placeholder arguments, got %d", len(s.prepared.markers), len(args))
+	if len(args) != s.prepared.inputCount {
+		return nil, fmt.Errorf("tinysql: expected %d placeholder arguments, got %d", s.prepared.inputCount, len(args))
 	}
 	exec, err := s.prepared.acquire()
 	if err != nil {
 		return nil, err
 	}
 	defer s.prepared.release(exec)
-	for i, arg := range args {
-		exec.params[i].Val = driverValueLiteral(arg.Value)
-	}
+	s.prepared.bind(exec, args)
 	return s.c.execStatement(ctx, exec.statement)
 }
 
@@ -163,12 +178,20 @@ func driverValueLiteral(v any) any {
 
 const preparedMarkerPrefix = "__tinysql_prepared_param_"
 
-// buildPreparedQuery recognizes positional placeholders outside SQL strings
-// and validates the marker form once. Numbered placeholders deliberately keep
-// the text fallback: their repeated/reordered binding needs a separate ordinal
-// map.
+// buildPreparedQuery compiles positional or numbered parameters into exclusive
+// literal slots. Repeated numbered arguments have distinct AST occurrences.
 func buildPreparedQuery(sqlText string) (*preparedQuery, error) {
+	// User text must not collide with the private literal-slot markers.
+	if strings.Contains(sqlText, preparedMarkerPrefix) {
+		return nil, nil
+	}
 	markerSQL, count, ok := markerSQLForPositionalParams(sqlText)
+	var argOrder []int
+	inputCount := count
+	if !ok {
+		markerSQL, argOrder, inputCount, ok = markerSQLForNumberedParams(sqlText)
+		count = len(argOrder)
+	}
 	if !ok || count == 0 {
 		return nil, nil
 	}
@@ -176,7 +199,7 @@ func buildPreparedQuery(sqlText string) (*preparedQuery, error) {
 	for i := range markers {
 		markers[i] = preparedMarkerPrefix + strconv.Itoa(i) + "__"
 	}
-	prepared := &preparedQuery{markerSQL: markerSQL, markers: markers}
+	prepared := &preparedQuery{markerSQL: markerSQL, markers: markers, argOrder: argOrder, inputCount: inputCount}
 	// Parse and validate once at Prepare time. Seeding the pool gives the
 	// common single-goroutine path the original no-reparse behavior; additional
 	// workers create isolated executions only when needed.
@@ -186,6 +209,18 @@ func buildPreparedQuery(sqlText string) (*preparedQuery, error) {
 	}
 	prepared.pool.Put(exec)
 	return prepared, nil
+}
+
+func (p *preparedQuery) bind(exec *preparedExecution, args []driver.NamedValue) {
+	if p.argOrder == nil {
+		for i, arg := range args {
+			exec.params[i].Val = driverValueLiteral(arg.Value)
+		}
+		return
+	}
+	for i, ordinal := range p.argOrder {
+		exec.params[i].Val = driverValueLiteral(args[ordinal].Value)
+	}
 }
 
 func (p *preparedQuery) acquire() (*preparedExecution, error) {

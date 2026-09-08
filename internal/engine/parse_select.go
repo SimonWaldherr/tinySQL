@@ -630,9 +630,10 @@ func (p *Parser) parseOrderByClause(sel *Select) error {
 					return p.errf("ORDER BY expression must appear in the SELECT list or have an alias")
 				}
 			default:
-				col = p.parseIdentLike()
-				if col == "" {
-					return p.errf("ORDER BY expects column")
+				var err error
+				col, err = p.parseQualifiedColumnName()
+				if err != nil {
+					return err
 				}
 			}
 			desc := false

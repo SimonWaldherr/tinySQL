@@ -162,3 +162,109 @@ func TestFTSBatchUpdateScratchIsolation(t *testing.T) {
 		}
 	}
 }
+
+// Bulk and single-row construction must produce the same persisted format,
+// including term-ID assignment, phrase positions, counts, and block bounds.
+func TestFTSDensePostingBuildMatchesRowwiseExtension(t *testing.T) {
+	for _, n := range []int{63, 64, 65, 300} {
+		t.Run(fmt.Sprintf("rows=%d", n), func(t *testing.T) {
+			bulkTable := storage.NewTable("fts_dense_compare", nil, false)
+			for i := 0; i < n; i++ {
+				row := []any{fmt.Sprintf("alpha %s café 漢字 unique%d", strings.Repeat("beta ", i%5), i%41), i % 7}
+				if i%19 == 0 {
+					row = []any{nil, "the and or"}
+				}
+				if i%23 == 0 {
+					row = nil
+				}
+				bulkTable.Rows = append(bulkTable.Rows, row)
+			}
+			cols := []int{0, 1, 0} // Duplicate columns must still count twice.
+			bulkTable.Version = n
+			bulk := &storage.FTSIndex{}
+			ftsExtendPersistent(bulkTable, cols, bulk)
+			rowwiseTable := storage.NewTable(bulkTable.Name, nil, false)
+			rowwise := &storage.FTSIndex{}
+			for _, row := range bulkTable.Rows {
+				rowwiseTable.Rows = append(rowwiseTable.Rows, row)
+				rowwiseTable.Version++
+				ftsExtendPersistent(rowwiseTable, cols, rowwise)
+			}
+			if !reflect.DeepEqual(bulk, rowwise) {
+				t.Fatal("bulk index differs from rowwise index")
+			}
+			// Leave empty old postings and introduce a new term before a large append.
+			for _, table := range []*storage.Table{bulkTable, rowwiseTable} {
+				table.Rows[1] = []any{"replacement replacement", nil}
+				table.Version++
+				table.MarkRowUpdated(1)
+			}
+			ftsRefreshUpdatedRows(bulkTable, cols, bulk, []int{1})
+			ftsRefreshUpdatedRows(rowwiseTable, cols, rowwise, []int{1})
+			for i := 0; i < 130; i++ {
+				row := []any{fmt.Sprintf("replacement alpha appended%d", i%3), nil}
+				bulkTable.Rows = append(bulkTable.Rows, row)
+				bulkTable.Version++
+				rowwiseTable.Rows = append(rowwiseTable.Rows, row)
+				rowwiseTable.Version++
+				ftsExtendPersistent(rowwiseTable, cols, rowwise)
+			}
+			ftsExtendPersistent(bulkTable, cols, bulk)
+			if !reflect.DeepEqual(bulk, rowwise) {
+				t.Fatal("bulk append after update differs from rowwise extension")
+			}
+			checkPostingMetadata(t, ftsCacheFromPersistent(bulkTable, bulk))
+		})
+	}
+}
+
+func BenchmarkFTSSingleRowAppend(b *testing.B) {
+	table := storage.NewTable("fts_single_append", nil, false)
+	for i := 0; i < 1000; i++ {
+		table.Rows = append(table.Rows, []any{fmt.Sprintf("alpha beta word%d", i)})
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		table.Rows = table.Rows[:1000]
+		index := &storage.FTSIndex{}
+		ftsExtendPersistent(table, []int{0}, index)
+		table.Rows = append(table.Rows, []any{"alpha beta newword"})
+		table.Version++
+		b.StartTimer()
+		ftsExtendPersistent(table, []int{0}, index)
+		if index.BuiltRows != 1001 {
+			b.Fatal(index.BuiltRows)
+		}
+	}
+}
+
+func TestFTSPackedPostingTermAppendIsolation(t *testing.T) {
+	table := storage.NewTable("fts_packed_append", nil, false)
+	for range 128 {
+		table.Rows = append(table.Rows, []any{"alpha alpha beta gamma"})
+	}
+	index := &storage.FTSIndex{}
+	ftsExtendPersistent(table, []int{0}, index)
+	betaRows := index.Postings["beta"]
+	betaCounts := index.PostingCounts["beta"]
+	wantRows := slices.Clone(betaRows)
+	wantCounts := slices.Clone(betaCounts)
+	// Only alpha grows. Its extra row/count must not overwrite the following
+	// term in the shared arena, including references held before the append.
+	table.Rows = append(table.Rows, []any{"alpha alpha alpha"})
+	table.Version++
+	ftsExtendPersistent(table, []int{0}, index)
+	if !slices.Equal(betaRows, wantRows) || !slices.Equal(betaCounts, wantCounts) {
+		t.Fatal("growing alpha overwrote beta's backing storage")
+	}
+	if !slices.Equal(index.Postings["beta"], wantRows) || !slices.Equal(index.PostingCounts["beta"], wantCounts) {
+		t.Fatal("growing alpha changed beta's postings")
+	}
+	rebuilt := &storage.FTSIndex{}
+	ftsExtendPersistent(table, []int{0}, rebuilt)
+	if !reflect.DeepEqual(index, rebuilt) {
+		t.Fatal("incremental packed index differs from rebuild")
+	}
+	checkPostingMetadata(t, ftsCacheFromPersistent(table, index))
+}

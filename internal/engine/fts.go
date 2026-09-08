@@ -6,7 +6,7 @@
 //     table with FTS indexing enabled.
 //   - FTS_SEARCH builds a tokenized-document cache and an inverted index (term
 //     postings) lazily per searched column set, invalidated by table.Version —
-//     so writes need no index maintenance, and the next search rebuilds.
+//     append and update deltas are applied lazily; structural changes rebuild.
 //   - FTS_MATCH(text, query) – boolean match check with phrase/boolean query support
 //   - FTS_RANK(text, query)  – BM25-like relevance score
 //   - FTS_SNIPPET(text, query [, before, after, ellipsis, max_tokens]) – highlighted snippet
@@ -1685,11 +1685,30 @@ func ftsCacheFromPersistent(table *storage.Table, index *storage.FTSIndex) ftsDo
 	}
 }
 
+// ftsPostingBatch collects one term's appended rows before publishing them
+// to the persisted string-keyed maps. start == -1 means the term was untouched.
+// The scratch lists borrow existing posting storage; the derived-table lock
+// held by getFTSDocCache serializes extension and publication.
+type ftsPostingBatch struct {
+	rows   []int32
+	counts []int32
+	start  int
+}
+
+// Large cold builds reuse dense term IDs for posting accumulation. Small
+// extensions keep the map path to avoid vocabulary-sized posting scratch.
+const ftsDensePostingMinRows = 64
+
 // ftsExtendPersistent tokenizes only rows not yet covered by index. Callers
 // use a fresh index after structural changes and reuse the existing one after
 // append-only INSERTs, turning an O(table) rebuild into O(new rows).
 func ftsExtendPersistent(table *storage.Table, cols []int, index *storage.FTSIndex) {
 	start := index.BuiltRows
+	if start == len(table.Rows) && index.Format == ftsPersistentFormat {
+		index.Version = table.Version
+		index.StructVersion = table.StructVersion()
+		return
+	}
 	changedTerms := make(map[string]int)
 	if index.PostingBlocks == nil {
 		index.PostingBlocks = make(map[string][]storage.FTSPostingBlock)
@@ -1710,6 +1729,18 @@ func ftsExtendPersistent(table *storage.Table, cols []int, index *storage.FTSInd
 	for term, id := range index.TermIDs {
 		termNames[id] = term
 	}
+	bulk := len(table.Rows)-start >= ftsDensePostingMinRows
+	// A fresh large index can allocate postings exactly after counting them.
+	// Existing indexes retain the append path and its incremental ownership.
+	packed := bulk && start == 0 && len(index.TermIDs) == 0
+	var postingSizes []int
+	var batches []ftsPostingBatch
+	if bulk && !packed {
+		batches = make([]ftsPostingBatch, len(index.TermIDs))
+		for i := range batches {
+			batches[i].start = -1
+		}
+	}
 	counts := make([]int32, len(index.TermIDs))
 	var touched []int32
 	for ri := start; ri < len(table.Rows); ri++ {
@@ -1723,6 +1754,11 @@ func ftsExtendPersistent(table *storage.Table, cols []int, index *storage.FTSInd
 				index.TermIDs[term] = id
 				termNames = append(termNames, term)
 				counts = append(counts, 0)
+				if packed {
+					postingSizes = append(postingSizes, 0)
+				} else if bulk {
+					batches = append(batches, ftsPostingBatch{start: -1})
+				}
 			}
 			if counts[id] == 0 {
 				touched = append(touched, id)
@@ -1740,14 +1776,27 @@ func ftsExtendPersistent(table *storage.Table, cols []int, index *storage.FTSInd
 			index.DocTermIDs = append(index.DocTermIDs, id)
 			index.DocTermCounts = append(index.DocTermCounts, counts[id])
 			term := termNames[id]
-			postings := index.Postings[term]
-			// Rows are appended in physical order. A tail before this batch
-			// means this is the term's first occurrence in the extension.
-			if len(postings) == 0 || int(postings[len(postings)-1]) < start {
-				changedTerms[term] = len(postings)
+			if packed {
+				postingSizes[id]++
+			} else if bulk {
+				batch := &batches[id]
+				if batch.start < 0 {
+					batch.rows = index.Postings[term]
+					batch.counts = index.PostingCounts[term]
+					batch.start = len(batch.rows)
+				}
+				batch.rows = append(batch.rows, int32(ri))
+				batch.counts = append(batch.counts, counts[id])
+			} else {
+				postings := index.Postings[term]
+				// Rows are appended in physical order. A tail before this batch
+				// means this is the term's first occurrence in the extension.
+				if len(postings) == 0 || int(postings[len(postings)-1]) < start {
+					changedTerms[term] = len(postings)
+				}
+				index.Postings[term] = append(postings, int32(ri))
+				index.PostingCounts[term] = append(index.PostingCounts[term], counts[id])
 			}
-			index.Postings[term] = append(postings, int32(ri))
-			index.PostingCounts[term] = append(index.PostingCounts[term], counts[id])
 			counts[id] = 0
 		}
 		index.Docs[ri] = storage.FTSDocument{
@@ -1769,13 +1818,61 @@ func ftsExtendPersistent(table *storage.Table, cols []int, index *storage.FTSInd
 	if index.NumDocs > 0 {
 		index.AvgDocLen = index.TotalDocLen / float64(index.NumDocs)
 	}
-	for term, start := range changedTerms {
-		ftsRebuildPostingBlocks(index, term, start)
+	if packed {
+		ftsBuildPackedPostings(index, termNames, postingSizes)
+	} else if bulk {
+		for id, batch := range batches {
+			if batch.start < 0 {
+				continue
+			}
+			term := termNames[id]
+			index.Postings[term] = batch.rows
+			index.PostingCounts[term] = batch.counts
+			ftsRebuildPostingBlocks(index, term, batch.start)
+		}
+	} else {
+		for term, start := range changedTerms {
+			ftsRebuildPostingBlocks(index, term, start)
+		}
 	}
 	index.Format = ftsPersistentFormat
 	index.Version = table.Version
 	index.StructVersion = table.StructVersion()
 	index.BuiltRows = len(table.Rows)
+}
+
+// ftsBuildPackedPostings transposes fresh document runs into exact-sized
+// posting storage. Two contiguous arenas replace repeated growth of every
+// term's row/count slice. Full slice expressions isolate later term appends.
+func ftsBuildPackedPostings(index *storage.FTSIndex, terms []string, sizes []int) {
+	rows := make([]int32, len(index.DocTermIDs))
+	counts := make([]int32, len(index.DocTermCounts))
+	type postingWriter struct {
+		rows, counts []int32
+		next         int
+	}
+	byTerm := make([]postingWriter, len(terms))
+	offset := 0
+	for id, size := range sizes {
+		end := offset + size
+		byTerm[id].rows = rows[offset:end:end]
+		byTerm[id].counts = counts[offset:end:end]
+		offset = end
+	}
+	for ri, doc := range index.Docs {
+		for pos := doc.TermStart; pos < doc.TermStart+doc.TermCount; pos++ {
+			id := index.DocTermIDs[pos]
+			term := &byTerm[id]
+			term.rows[term.next] = int32(ri)
+			term.counts[term.next] = index.DocTermCounts[pos]
+			term.next++
+		}
+	}
+	for id, term := range terms {
+		index.Postings[term] = byTerm[id].rows
+		index.PostingCounts[term] = byTerm[id].counts
+		ftsRebuildPostingBlocks(index, term, 0)
+	}
 }
 
 // getFTSDocCache returns the tokenized documents (plus corpus-wide BM25

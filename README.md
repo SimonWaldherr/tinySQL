@@ -827,6 +827,7 @@ process-local result cache and anonymous shape/timing analytics. See the
 | Guide | Use it for |
 | --- | --- |
 | [Developer integration](./docs/developer-integration.md) | Go, `database/sql`, and browser embedding |
+| [Go SQL package compatibility](./docs/database-sql-compatibility.md) | Tested sqlx, Squirrel, GORM workflows and limits |
 | [Go API stability](./docs/api-stability.md) | Compatibility guarantees, streaming, and upgrades |
 | [CLI guide](./docs/cli-guide.md) | REPL, servers, and file-query tools |
 | [Storage guide](./docs/storage-guide.md) | Backends, DSNs, read-only mode, large tilesets |
@@ -836,6 +837,7 @@ process-local result cache and anonymous shape/timing analytics. See the
 | [Development guide](./docs/development-guide.md) | Tests, Make targets, and releasing demos |
 | [Benchmarks](./BENCHMARKS.md) | Reproducible performance measurements |
 | [Driver and engine performance](./docs/driver-engine-performance.md) | Allocation improvements, pool behavior, and local measurements |
+| [Go database engineering practices](./docs/go-database-practices.md) | Primary-source research, applied fixes, and validation |
 
 Run the full test suite:
 

@@ -385,11 +385,11 @@ func TestRetrievalPreFilterCachesPurgeOnDrop(t *testing.T) {
 			rowFilter = rowFilter || key.table == table
 		}
 		ragRowFilterCacheMu.RUnlock()
-		ragFilteredFTSCandidateCacheMu.RLock()
-		for key := range ragFilteredFTSCandidateCache {
+		ragFilteredFTSQueryCacheMu.RLock()
+		for key := range ragFilteredFTSQueryCache {
 			candidates = candidates || key.table == table
 		}
-		ragFilteredFTSCandidateCacheMu.RUnlock()
+		ragFilteredFTSQueryCacheMu.RUnlock()
 		ragFilteredFTSStatsCacheMu.RLock()
 		for key := range ragFilteredFTSStatsCache {
 			stats = stats || key.table == table

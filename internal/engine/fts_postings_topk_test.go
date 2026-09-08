@@ -26,7 +26,11 @@ func TestFTSPostingTopKMatchesDocumentScan(t *testing.T) {
 	cache := getFTSDocCache("default", table, []int{0})
 	idf := ftsIDFLookup(cache)
 	for trial := 0; trial < 70; trial++ {
-		terms := make([]string, 2+rng.Intn(10))
+		termCount := 2 + rng.Intn(10)
+		if trial%3 == 0 {
+			termCount = 1
+		}
+		terms := make([]string, termCount)
 		for i := range terms {
 			terms[i] = fmt.Sprintf("term%d", rng.Intn(40))
 		}
@@ -62,8 +66,10 @@ func TestFTSPostingTopKMatchesDocumentScan(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	bound := ftsBindIDF(ftsParseQuery("term1 OR term2"), idf, cache.termIDs)
-	if _, err := ftsScanTopK(ctx, cache, bound, idf, nil, false, 3); err == nil {
-		t.Fatal("ignored cancellation")
+	for _, query := range []string{"term1", "term1 OR term2", "absent"} {
+		bound := ftsBindIDF(ftsParseQuery(query), idf, cache.termIDs)
+		if _, err := ftsScanTopK(ctx, cache, bound, idf, nil, false, 3); err == nil {
+			t.Fatalf("%q ignored cancellation", query)
+		}
 	}
 }

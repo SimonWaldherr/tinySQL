@@ -45,11 +45,27 @@ type conn struct {
 	wrote bool
 }
 
+var _ driver.ConnPrepareContext = (*conn)(nil)
+
 func (c *conn) Prepare(query string) (driver.Stmt, error) {
+	return c.PrepareContext(context.Background(), query)
+}
+
+func (c *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
 	// database/sql may call Prepare for arbitrary SQL. Failing to build the
 	// optional prepared-AST fast path must not change its historical behavior:
 	// QueryContext will use the text-binding fallback below.
 	prepared, _ := buildPreparedQuery(query)
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
 	return &stmt{c: c, sql: query, prepared: prepared}, nil
 }
 
@@ -104,6 +120,11 @@ func (c *conn) discardOpenTx() {
 }
 
 func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
 	if c.inTx {
 		return nil, fmt.Errorf("tinysql: transaction already active")
 	}

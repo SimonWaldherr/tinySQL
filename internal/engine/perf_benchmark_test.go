@@ -419,9 +419,8 @@ func BenchmarkDeleteMatchesNothing(b *testing.B) {
 	}
 }
 
-// BenchmarkFTSSearchColdEachTime forces a cache rebuild every iteration by
-// bumping the table version, isolating the tokenization cost the cache
-// otherwise amortizes.
+// BenchmarkFTSSearchColdEachTime discards both runtime caches and the
+// persistent FTS index so every iteration includes corpus tokenization.
 func BenchmarkFTSSearchColdEachTime(b *testing.B) {
 	db := setupFTSPerfTable(b, 10000)
 	table, _ := db.Get("default", "docs")
@@ -430,7 +429,9 @@ func BenchmarkFTSSearchColdEachTime(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		table.Version++
+		b.StopTimer()
+		resetColdFTSBenchmark(table)
+		b.StartTimer()
 		if _, err := Execute(ctx, db, "default", stmt); err != nil {
 			b.Fatal(err)
 		}

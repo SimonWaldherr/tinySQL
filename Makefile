@@ -7,7 +7,7 @@ SHELL := /usr/bin/env bash
 .PHONY: build-query-files build-query-files-wasm build-fsql run-query-files-demo
 .PHONY: build-gh-pages-demo check-gh-pages-demo update-gh-pages push-gh-pages
 .PHONY: test-all test-unit test-integration test-jsonv2 test-ci coverage build-check wasm-check tinygo-wasm ci verify verify-ci
-.PHONY: test-query-files test-query-files-wasm test-fsql
+.PHONY: test-query-files test-query-files-wasm test-fsql test-gorm test-sqlpackages test-sql-compat
 .PHONY: run-wasm-browser run-wasm-node-demo deps deps-all update-deps tidy tidy-all modules-verify bench bench-engine bench-hotpaths bench-stream bench-stream-guard release-check script-lint docker-build info
 .DEFAULT_GOAL := help
 
@@ -287,6 +287,7 @@ test-unit:
 
 ## test-integration: Run integration tests
 test-integration:
+	$(MAKE) --no-print-directory test-sql-compat
 	@echo "$(GREEN)Running integration tests...$(NC)"
 	$(GO) test $(GO_TEST_FLAGS) -run Integration ./...
 
@@ -299,14 +300,27 @@ test-jsonv2:
 test-ci:
 	@echo "$(GREEN)Running CI test matrix...$(NC)"
 	$(GO) test ./... -count=1
+	$(MAKE) --no-print-directory test-sql-compat GO_TEST_FLAGS=-count=1
 	$(MAKE) --no-print-directory test-query-files GO_TEST_FLAGS=-count=1
 	$(MAKE) --no-print-directory test-query-files-wasm GO_TEST_FLAGS=-count=1
 	GOEXPERIMENT=jsonv2 $(GO) test ./internal/storage ./internal/engine -count=1
 	$(GO) test ./... -race -count=1
+	$(MAKE) --no-print-directory test-sql-compat GO_TEST_FLAGS='-race -count=1'
 	$(MAKE) --no-print-directory test-query-files GO_TEST_FLAGS='-race -count=1'
 	$(MAKE) --no-print-directory test-query-files-wasm GO_TEST_FLAGS='-race -count=1'
 	$(GO) test -coverprofile=$(COVERPROFILE) ./...
 	$(GO) tool cover -func=$(COVERPROFILE)
+
+## test-sql-compat: Test GORM, sqlx and Squirrel against tinySQL
+test-sql-compat: test-gorm test-sqlpackages
+
+## test-sqlpackages: Test sqlx and Squirrel against tinySQL
+test-sqlpackages:
+	cd tests/sqlpackages && $(GO) test $(GO_TEST_FLAGS) ./...
+
+## test-gorm: Test the GORM PostgreSQL dialect against tinySQL (no server)
+test-gorm:
+	cd tests/gorm && $(GO) test $(GO_TEST_FLAGS) ./...
 
 ## test-query-files: Run tests for cmd/query_files module
 test-query-files:

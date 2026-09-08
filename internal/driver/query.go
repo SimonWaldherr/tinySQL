@@ -4,6 +4,8 @@ package driver
 import (
 	"context"
 	"database/sql/driver"
+	"fmt"
+	"reflect"
 	"sync"
 	"time"
 
@@ -22,7 +24,7 @@ func (c *conn) querySQL(ctx context.Context, sqlStr string) (driver.Rows, error)
 	// Queries return a driver.Rows. Some write statements are row-producing
 	// too (DML ... RETURNING), so keep their normal writer/persistence path
 	// while forwarding the engine's ResultSet instead of discarding it.
-	st, err := parseSQLCached(sqlStr)
+	st, err := parseSQLCachedContext(ctx, sqlStr)
 	if err != nil {
 		return nil, err
 	}
@@ -147,19 +149,58 @@ func (c *conn) queryStatementWithCleanup(ctx context.Context, st engine.Statemen
 	}, nil
 }
 
-// NamedValueChecker
+// CheckNamedValue preserves tinySQL's vector/JSON extensions while honoring
+// database/sql's Valuer, pointer and scalar-alias conversion contracts.
 func (c *conn) CheckNamedValue(nv *driver.NamedValue) error {
-	// Normalize common Go types into database/sql primitive types.
-	switch v := nv.Value.(type) {
-	case time.Time:
-		nv.Value = v.UTC().Format(time.RFC3339Nano)
-	case []byte:
-		// Keep BLOB parameters as bytes. bindPlaceholders emits a SQL X'...'
-		// literal and the parser recreates []byte without a text/base64 round
-		// trip.
-		nv.Value = append([]byte(nil), v...)
-	case int:
-		nv.Value = int64(v)
+	if nv.Name != "" {
+		return fmt.Errorf("tinysql: named parameters are not supported; use ?, $1 or :1 placeholders")
 	}
+	value, err := normalizeDriverArgument(nv.Value)
+	if err != nil {
+		return err
+	}
+	nv.Value = value
 	return nil
+}
+
+func normalizeDriverArgument(value any) (any, error) {
+	switch v := value.(type) {
+	case nil, int64, float64, bool, string:
+		return v, nil
+	case int:
+		return int64(v), nil
+	case time.Time:
+		return v.UTC().Format(time.RFC3339Nano), nil
+	case []byte:
+		return append([]byte(nil), v...), nil
+	}
+	// Use the standard converter for Valuer, including its nil-pointer
+	// handling and validation of the returned driver.Value. Never swallow
+	// these errors in the native JSON/vector extension fallback below.
+	if _, ok := value.(driver.Valuer); ok {
+		converted, err := driver.DefaultParameterConverter.ConvertValue(value)
+		if err != nil {
+			return nil, err
+		}
+		return normalizeDriverArgument(converted)
+	}
+	rv := reflect.ValueOf(value)
+	switch rv.Kind() {
+	case reflect.Pointer:
+		if rv.IsNil() {
+			return nil, nil
+		}
+		return normalizeDriverArgument(rv.Elem().Interface())
+	case reflect.Map, reflect.Array, reflect.Struct:
+		return value, nil
+	case reflect.Slice:
+		if rv.Type().Elem().Kind() != reflect.Uint8 {
+			return value, nil
+		}
+	}
+	converted, err := driver.DefaultParameterConverter.ConvertValue(value)
+	if err != nil {
+		return nil, err
+	}
+	return normalizeDriverArgument(converted)
 }

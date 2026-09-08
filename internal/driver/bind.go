@@ -130,20 +130,52 @@ func sqlLiteral(v any) string {
 		}
 		return "FALSE"
 	case string:
-		// escape single quotes by doubling them
-		s := strings.ReplaceAll(x, "'", "''")
-		return "'" + s + "'"
+		return quoteSQLString(x)
 	case []byte:
-		return "X'" + hex.EncodeToString(x) + "'"
+		var out strings.Builder
+		out.Grow(3 + hex.EncodedLen(len(x)))
+		out.WriteString("X'")
+		// Encode bounded chunks on the stack, avoiding a full-sized hex
+		// intermediate while retaining encoding/hex's tight conversion loop.
+		var chunk [512]byte
+		for len(x) > 0 {
+			n := min(len(x), len(chunk)/2)
+			hex.Encode(chunk[:], x[:n])
+			out.Write(chunk[:2*n])
+			x = x[n:]
+		}
+		out.WriteByte('\'')
+		return out.String()
 	default:
 		// Fallback: attempt JSON marshal (handles slices/maps)
 		b, err := json.Marshal(x)
 		if err != nil {
 			// On marshal error, fall back to fmt.Sprintf representation
-			s := strings.ReplaceAll(fmt.Sprintf("%v", x), "'", "''")
-			return "'" + s + "'"
+			return quoteSQLString(fmt.Sprintf("%v", x))
 		}
-		s := strings.ReplaceAll(string(b), "'", "''")
+		return quoteSQLString(string(b))
+	}
+}
+
+// quoteSQLString allocates the final literal once, including doubled quotes.
+func quoteSQLString(s string) string {
+	quotes := strings.Count(s, "'")
+	if quotes == 0 {
 		return "'" + s + "'"
 	}
+	var out strings.Builder
+	out.Grow(len(s) + quotes + 2)
+	out.WriteByte('\'')
+	for {
+		i := strings.IndexByte(s, '\'')
+		if i < 0 {
+			break
+		}
+		out.WriteString(s[:i+1])
+		out.WriteByte('\'')
+		s = s[i+1:]
+	}
+	out.WriteString(s)
+	out.WriteByte('\'')
+	return out.String()
 }

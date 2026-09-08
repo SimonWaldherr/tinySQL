@@ -10,12 +10,9 @@ package engine
 // terms users actually search for (identifiers, error codes, product names)
 // appear in a tiny fraction of them.
 //
-// That distinction is the whole point here: FTS_SEARCH currently scores every
-// cached document on every query, so a query for a term present in 3 chunks out
-// of 20000 costs the same as a query for a term present in all of them. These
-// benchmarks make that cost visible and give the hybrid retrieval path
-// (HYBRID_SEARCH, the retriever docs/rag-guide.md recommends by default) an
-// end-to-end baseline, which it previously had none of.
+// These fixtures cover selective and broad retrieval, warm serving, and cold
+// construction. Cold benchmarks explicitly discard runtime retrieval caches;
+// FTS rebuild measurements also discard the persistent derived index.
 
 import (
 	"context"
@@ -298,10 +295,9 @@ func BenchmarkRAGVectorOnly(b *testing.B) {
 			'{"metric":"cosine","index":"flat"}')`, 6)
 }
 
-// BenchmarkRAGVecSearchBranch and BenchmarkRAGFTSSearchBranch measure the two
-// halves of the hybrid query in isolation. Their sum bounds what
-// BenchmarkRAGHybridSearch could cost if the two passes ran concurrently
-// instead of one after the other, which is how RAG_SEARCH runs them today.
+// BenchmarkRAGVecSearchBranch and BenchmarkRAGFTSSearchBranch measure each
+// half of the hybrid query in isolation. RAG_SEARCH overlaps both passes, so
+// their sum is not the end-to-end hybrid serving latency.
 func BenchmarkRAGVecSearchBranch(b *testing.B) {
 	db := ragBenchCorpus(b)
 	qv := ragBenchQueryVector(b)
@@ -322,8 +318,8 @@ func BenchmarkRAGFTSSearchBranch(b *testing.B) {
 
 // BenchmarkRAGFTSSelectiveTerm queries a term present in exactly 3 of 20000
 // chunks — the exact-identifier lookup hybrid retrieval exists to support.
-// Every document in the corpus is still tokenized, matched and scored to
-// produce those 3 rows.
+// The warm query uses the postings index; initial tokenization is measured
+// separately by BenchmarkRAGFTSColdCache.
 func BenchmarkRAGFTSSelectiveTerm(b *testing.B) {
 	db := ragBenchCorpus(b)
 	runRAGBench(b, db, `
@@ -332,10 +328,8 @@ func BenchmarkRAGFTSSelectiveTerm(b *testing.B) {
 }
 
 // BenchmarkRAGFTSCommonTerm queries the head of the Zipf distribution, which
-// appears in most chunks. This is the honest worst case: the match set really
-// is most of the corpus, so no candidate-restriction strategy can avoid the
-// work, and it is the control against which a selective-query speedup must be
-// judged.
+// appears in most chunks. This broad posting list is the control for selective
+// queries; conservative block bounds may still avoid scoring some documents.
 func BenchmarkRAGFTSCommonTerm(b *testing.B) {
 	db := ragBenchCorpus(b)
 	runRAGBench(b, db, `
@@ -363,12 +357,12 @@ func BenchmarkRAGFTSPhrase(b *testing.B) {
 
 // ─────────────────────────── cold-start cost ───────────────────────────────
 
-// BenchmarkRAGFTSColdCache measures building the tokenized-document cache from
-// scratch, by bumping table.Version each iteration to force invalidation. This
-// is the latency spike the first query after startup (or after any write) pays,
-// and there is no FTS equivalent of VEC_WARM to pay it before admitting traffic.
+// BenchmarkRAGFTSColdCache measures a first query with no FTS index. Clearing
+// only the table version is insufficient: persistent indexes survive that and
+// make later iterations rehydrate rather than tokenize the corpus.
 func BenchmarkRAGFTSColdCache(b *testing.B) {
 	db := ragBenchCorpus(b)
+	b.Cleanup(func() { _ = db.Close() })
 	table, err := db.Get("default", "rag_chunks")
 	if err != nil {
 		b.Fatal(err)
@@ -381,7 +375,7 @@ func BenchmarkRAGFTSColdCache(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
-		table.Version++ // invalidate: next query rebuilds the whole doc cache
+		resetColdFTSBenchmark(table)
 		b.StartTimer()
 		if _, err := Execute(ctx, db, "default", stmt); err != nil {
 			b.Fatal(err)
@@ -389,10 +383,11 @@ func BenchmarkRAGFTSColdCache(b *testing.B) {
 	}
 }
 
-// BenchmarkRAGVecColdCache is the vector-side equivalent, for comparison: how
-// much a write costs the vector branch versus the lexical branch.
+// BenchmarkRAGVecColdCache rebuilds the vector cache from source data. A
+// version bump alone would allow reuse of unchanged contiguous segments.
 func BenchmarkRAGVecColdCache(b *testing.B) {
 	db := ragBenchCorpus(b)
+	b.Cleanup(func() { _ = db.Close() })
 	table, err := db.Get("default", "rag_chunks")
 	if err != nil {
 		b.Fatal(err)
@@ -406,7 +401,8 @@ func BenchmarkRAGVecColdCache(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
-		table.Version++
+		purgeVectorCachesFor("default", table.Name)
+		purgeVecQueryCacheFor("default", table.Name)
 		b.StartTimer()
 		if _, err := Execute(ctx, db, "default", stmt); err != nil {
 			b.Fatal(err)

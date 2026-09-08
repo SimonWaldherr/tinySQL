@@ -672,7 +672,7 @@ func TestRowsNext(t *testing.T) {
 	if nullable, ok := r.ColumnTypeNullable(0); !nullable || !ok {
 		t.Fatalf("expected nullable=true")
 	}
-	if scan := r.ColumnTypeScanType(0); scan != "interface{}" {
+	if scan := r.ColumnTypeScanType(0); scan != reflect.TypeFor[any]() {
 		t.Fatalf("unexpected scan type: %v", scan)
 	}
 }
