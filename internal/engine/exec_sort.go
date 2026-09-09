@@ -26,8 +26,11 @@ func applySortOrder(orderBy []OrderItem, outRows []Row) []Row {
 		lcOrdCols[idx] = strings.ToLower(oi.Col)
 	}
 	items := make([]orderedValueRow, len(outRows))
+	keyArena := make([]any, 0, len(outRows)*len(orderBy))
 	for i, row := range outRows {
-		items[i] = buildOrderByValues(row, lcOrdCols)
+		var keys []any
+		keyArena, keys = reserveKeySlots(keyArena, len(orderBy))
+		items[i] = buildOrderByValues(row, lcOrdCols, keys)
 		items[i].idx = i
 	}
 	sort.Sort(orderedValueRowsAsc{orderBy: orderBy, items: items})
@@ -111,18 +114,23 @@ func orderedValueRowHeapDown(h orderedValueRowHeap, i0 int) {
 	}
 }
 
-func (h *orderedValueRowHeap) pushBounded(item orderedValueRow, keepCount int) {
+// Return only discarded keys: retained heap entries must never alias the
+// next candidate's writable scratch space.
+func (h *orderedValueRowHeap) pushBounded(item orderedValueRow, keepCount int) []any {
 	if keepCount <= 0 {
-		return
+		return item.keys
 	}
 	if len(h.items) < keepCount {
 		orderedValueRowHeapPush(h, item)
-		return
+		return nil
 	}
 	if compareOrderedValueRows(h.orderBy, h.items[0], item) > 0 {
+		reusable := h.items[0].keys
 		h.items[0] = item
 		orderedValueRowHeapDown(*h, 0)
+		return reusable
 	}
+	return item.keys
 }
 
 // orderedValueRowsAsc adapts a []orderedValueRow slice to sort.Interface with
@@ -157,8 +165,7 @@ func compareOrderedValueRows(orderBy []OrderItem, a, b orderedValueRow) int {
 	return 0
 }
 
-func buildOrderByValues(row Row, lcOrdCols []string) orderedValueRow {
-	keys := make([]any, len(lcOrdCols))
+func buildOrderByValues(row Row, lcOrdCols []string, keys []any) orderedValueRow {
 	for i, col := range lcOrdCols {
 		keys[i] = row[col]
 	}
@@ -308,21 +315,30 @@ func applySortOrderWithLimit(orderBy []OrderItem, outRows []Row, limit, offset *
 		return []Row{}
 	}
 
-	items := make([]orderedValueRow, 0, min(cap(outRows), keepCount))
+	var items []orderedValueRow
+	var keyArena, reusableKeys []any
 	var topRows orderedValueRowHeap
 	useTopN := limit != nil && keepCount > 0 && keepCount < len(outRows)
 	if useTopN {
+		keyArena = make([]any, 0, min(keepCount+1, rawKeyArenaChunkRows)*len(orderBy))
 		topRows = orderedValueRowHeap{
 			orderBy: orderBy,
 			items:   make([]orderedValueRow, 0, min(cap(outRows), keepCount)),
 		}
+	} else {
+		items = make([]orderedValueRow, 0, min(cap(outRows), keepCount))
+		keyArena = make([]any, 0, len(outRows)*len(orderBy))
 	}
 
 	for i, row := range outRows {
-		item := buildOrderByValues(row, lcOrdCols)
+		keys := reusableKeys
+		if keys == nil {
+			keyArena, keys = reserveKeySlots(keyArena, len(orderBy))
+		}
+		item := buildOrderByValues(row, lcOrdCols, keys)
 		item.idx = i
 		if useTopN {
-			topRows.pushBounded(item, keepCount)
+			reusableKeys = topRows.pushBounded(item, keepCount)
 		} else {
 			items = append(items, item)
 		}
@@ -363,7 +379,7 @@ func applySortOrderWithLimitSingle(orderBy OrderItem, outRows []Row, limit, offs
 		return []Row{}
 	}
 
-	items := make([]orderedValueRowSingle, 0, min(cap(outRows), keepCount))
+	var items []orderedValueRowSingle
 	useTopN := limit != nil && keepCount > 0 && keepCount < len(outRows)
 	var topRows orderedValueRowSingleHeap
 	if useTopN {
@@ -371,6 +387,8 @@ func applySortOrderWithLimitSingle(orderBy OrderItem, outRows []Row, limit, offs
 			desc:  orderBy.Desc,
 			items: make([]orderedValueRowSingle, 0, min(cap(outRows), keepCount)),
 		}
+	} else {
+		items = make([]orderedValueRowSingle, 0, min(cap(outRows), keepCount))
 	}
 
 	for i, row := range outRows {

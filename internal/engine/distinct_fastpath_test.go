@@ -15,9 +15,8 @@ import (
 // entirely and the general path materialized a map per *source* row.
 //
 // These tests pin the new path against the general one. The comparison is
-// possible because DISTINCT combined with ORDER BY deliberately declines the
-// fast path, so the identical logical query can be executed both ways and the
-// results compared as sets.
+// forced through a FROM subquery for the general path, so the identical
+// logical query can be executed both ways and the results compared as sets.
 
 func setupDistinctTable(t *testing.T) *storage.DB {
 	t.Helper()
@@ -51,7 +50,7 @@ func rowsAsKeys(rs *ResultSet) []string {
 }
 
 // TestDistinctFastPathMatchesGeneralPath runs each query twice — once without
-// ORDER BY (raw fast path) and once with (general path) — and requires the two
+// ORDER BY (raw fast path) and once through a subquery — and requires the two
 // to agree as sets.
 func TestDistinctFastPathMatchesGeneralPath(t *testing.T) {
 	db := setupDistinctTable(t)
@@ -80,7 +79,8 @@ func TestDistinctFastPathMatchesGeneralPath(t *testing.T) {
 
 	for _, c := range cases {
 		fastKeys := rowsAsKeys(execSQL(t, db, c.fast))
-		genKeys := rowsAsKeys(execSQL(t, db, c.general))
+		general := strings.Replace(c.general, "FROM d", "FROM (SELECT * FROM d) AS d", 1)
+		genKeys := rowsAsKeys(execSQL(t, db, general))
 		sortedFast := append([]string(nil), fastKeys...)
 		sortedGen := append([]string(nil), genKeys...)
 		sort.Strings(sortedFast)

@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -722,9 +723,13 @@ func TestFTSParallelScanMatchesSerialScan(t *testing.T) {
 	idf := ftsIDFLookup(cache)
 	ctx := context.Background()
 
-	if got := ftsScanWorkerCount(len(cache.docs)); got < 2 {
-		t.Fatalf("fixture of %d docs should scan in parallel, worker count = %d",
-			len(cache.docs), got)
+	workers, procs := ftsScanWorkerCount(len(cache.docs)), runtime.GOMAXPROCS(0)
+	if procs == 1 {
+		if workers != 1 {
+			t.Fatalf("GOMAXPROCS=1 must scan serially, workers=%d", workers)
+		}
+	} else if workers < 2 || workers > procs {
+		t.Fatalf("fixture of %d docs should use 2..%d workers, got %d", len(cache.docs), procs, workers)
 	}
 	if got := ftsScanWorkerCount(ftsScanParallelMinDocs - 1); got != 1 {
 		t.Errorf("below the threshold the scan should be serial, worker count = %d", got)

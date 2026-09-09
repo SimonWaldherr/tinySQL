@@ -52,10 +52,13 @@ const (
 )
 
 type simpleAggregateProjection struct {
-	name       string
-	kind       aggKind
-	arg        Expr // nil for the group-by column and for COUNT(*)
-	groupIndex int  // only used by aggGroupCol
+	name string
+	kind aggKind
+	arg  Expr // nil for the group-by column and for COUNT(*)
+	// argColumn is the resolved raw column index plus one, or zero when the
+	// argument needs evaluation. It belongs to this table-bound plan only.
+	argColumn  int
+	groupIndex int // only used by aggGroupCol
 }
 
 // simpleAggregateState accumulates one group's aggregates directly (SUM as a
@@ -200,6 +203,17 @@ func newSimpleAggregateState(groupValues []any, projections int) *simpleAggregat
 	}
 }
 
+func evalSimpleAggregateArg(rawPlan *simpleSelectPlan, raw []any, proj simpleAggregateProjection) (any, error) {
+	if proj.argColumn > 0 {
+		col := proj.argColumn - 1
+		if col >= len(raw) {
+			return nil, fmt.Errorf("column %q is out of range", proj.arg.(*VarRef).Name)
+		}
+		return raw[col], nil
+	}
+	return evalRawExpr(rawPlan, raw, proj.arg)
+}
+
 func accumulateSimpleAggregateState(env ExecEnv, rawPlan *simpleSelectPlan, raw []any, state *simpleAggregateState, projs []simpleAggregateProjection) error {
 	for i, proj := range projs {
 		switch proj.kind {
@@ -210,7 +224,7 @@ func accumulateSimpleAggregateState(env ExecEnv, rawPlan *simpleSelectPlan, raw 
 				state.counts[i]++
 				continue
 			}
-			v, err := evalRawExpr(rawPlan, raw, proj.arg)
+			v, err := evalSimpleAggregateArg(rawPlan, raw, proj)
 			if err != nil {
 				return err
 			}
@@ -218,7 +232,7 @@ func accumulateSimpleAggregateState(env ExecEnv, rawPlan *simpleSelectPlan, raw 
 				state.counts[i]++
 			}
 		case aggSum, aggAvg:
-			v, err := evalRawExpr(rawPlan, raw, proj.arg)
+			v, err := evalSimpleAggregateArg(rawPlan, raw, proj)
 			if err != nil {
 				return err
 			}
@@ -250,7 +264,7 @@ func accumulateSimpleAggregateState(env ExecEnv, rawPlan *simpleSelectPlan, raw 
 				state.counts[i]++
 			}
 		case aggMin, aggMax:
-			v, err := evalRawExpr(rawPlan, raw, proj.arg)
+			v, err := evalSimpleAggregateArg(rawPlan, raw, proj)
 			if err != nil {
 				return err
 			}
@@ -570,6 +584,20 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 	}
 	if !eligible || !hasAgg {
 		return nil, false, nil
+	}
+	// Resolve ordinary SUM/AVG/MIN/MAX/COUNT column arguments once, avoiding
+	// a name lookup for every aggregate of every source row. Unknown names
+	// and expressions retain the evaluator's existing error/lazy semantics.
+	for i := range projs {
+		if ref, ok := projs[i].arg.(*VarRef); ok {
+			key := ref.Lower
+			if key == "" {
+				key = strings.ToLower(ref.Name)
+			}
+			if col, found := colIndex[key]; found && col >= 0 {
+				projs[i].argColumn = col + 1
+			}
+		}
 	}
 	plan := &simpleAggregatePlan{
 		table:      table,

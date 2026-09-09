@@ -137,9 +137,10 @@ func BenchmarkSaveTable(b *testing.B) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Benchmark: LoadTable (cold – table only exists on backend)
+// Benchmark: LoadTable (disk decode or warm Hybrid/Index cache)
 // ───────────────────────────────────────────────────────────────────────────
 
+// SaveTable warms caching backends; disk reads do not purge the OS page cache.
 func BenchmarkLoadTable(b *testing.B) {
 	rowCounts := []int{10, 100, 1000, 10_000}
 

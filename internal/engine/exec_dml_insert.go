@@ -44,12 +44,30 @@ func executeInsert(env ExecEnv, s *Insert) (*ResultSet, error) {
 // remain shared with VALUES inserts.
 func insertRowsFromResultSet(rs *ResultSet) [][]Expr {
 	rows := make([][]Expr, len(rs.Rows))
-	for rowIdx, resultRow := range rs.Rows {
-		row := make([]Expr, len(rs.Cols))
-		for colIdx, column := range rs.Cols {
-			row[colIdx] = &Literal{Val: resultRow[strings.ToLower(column)]}
+	if len(rows) == 0 {
+		return rows
+	}
+	columns := make([]string, len(rs.Cols))
+	for i, column := range rs.Cols {
+		columns[i] = strings.ToLower(column)
+	}
+	// These blocks live only for this INSERT. Give each cell its own Literal
+	// and cap each row slice so appending cannot overwrite the next row.
+	for start := 0; start < len(rows); {
+		count := min(64, len(rows)-start)
+		width := len(columns)
+		expressions := make([]Expr, count*width)
+		literals := make([]Literal, count*width)
+		for i := 0; i < count; i++ {
+			base := i * width
+			row := expressions[base : base+width : base+width]
+			for j, column := range columns {
+				literals[base+j].Val = rs.Rows[start+i][column]
+				row[j] = &literals[base+j]
+			}
+			rows[start+i] = row
 		}
-		rows[rowIdx] = row
+		start += count
 	}
 	return rows
 }
@@ -107,6 +125,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 	// owned maps, while trigger-only rows can reuse one statement-local map.
 	var triggerRow Row
 	inserted := 0
+	arena := dmlRowArena{rowsPerBlock: min(len(rows), 64)}
 	for _, vals := range rows {
 		if len(vals) != expected {
 			return nil, fmt.Errorf("INSERT expects %d values", expected)
@@ -114,7 +133,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
 		}
-		row := make([]any, expected)
+		row := arena.row(expected)
 		for i, e := range vals {
 			v, err := evalExpr(env, e, tmp)
 			if err != nil {
@@ -246,6 +265,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	// owned maps, while trigger-only rows can reuse one statement-local map.
 	var triggerRow Row
 	inserted := 0
+	arena := dmlRowArena{rowsPerBlock: min(len(rows), 64)}
 	for _, vals := range rows {
 		if len(vals) != len(s.Cols) {
 			return nil, fmt.Errorf("INSERT column/value mismatch")
@@ -253,7 +273,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
 		}
-		row := make([]any, len(t.Cols))
+		row := arena.row(len(t.Cols))
 		if hasDefaults {
 			if err := applyColumnDefaults(row, t.Cols); err != nil {
 				return nil, err

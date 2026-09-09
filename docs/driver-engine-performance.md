@@ -91,3 +91,35 @@ go test -race ./internal/driver ./internal/engine \
 See also the [integration guide](developer-integration.md) for embedding and
 ownership, and [retrieval performance](retrieval-performance.md) for earlier
 end-to-end workloads.
+
+## Bounded sorting and aggregate column resolution (2026-09-08)
+
+Multi-column `ORDER BY … LIMIT` reuses discarded key storage, full materialized
+and window sorts pack keys, and direct aggregate arguments resolve column
+positions once. See [measurements and ownership details](order-aggregate-performance.md).
+
+## Window functions, DISTINCT and deep OFFSET (2026-09-08)
+
+Direct text window partitions use one input scan per shared shape; ordered
+DISTINCT deduplicates before materialization; filtered pagination evaluates
+skipped projections without allocating discarded maps. See
+[measurements, eligibility and regression coverage](window-distinct-limit-performance.md).
+
+## GOMAXPROCS 1/36 and storage modes (2026-09-08)
+
+Disk/JSON I/O buffers and gzip compression state are reused; Hybrid/Index cache
+hits avoid redundant LRU work. A SQL/reopen matrix covers Memory, Disk, Hybrid,
+Index, JSON and Paged Index at both scheduler settings. See
+[measurements, hardware limits and reproduction](cpu-storage-mode-performance.md).
+
+## Query generation (2026-09-08)
+
+Builder literals stream into one output buffer; INSERT, UPDATE and DELETE reserve
+capacity before rendering. The measured 100-row INSERT needs one allocation
+instead of 413. See [benchmarks and compatibility coverage](query-generation-performance.md).
+
+## INSERT and UPDATE (2026-09-09)
+
+Batch row storage and INSERT SELECT adaptation use blocks to reduce allocation
+counts. Whole-table UPDATE benefits while point UPDATE retains its allocation
+profile. See [measurements, ownership and retention tradeoffs](insert-update-performance.md).

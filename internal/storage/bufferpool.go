@@ -181,7 +181,6 @@ type LRUQueue struct {
 type LRUNode struct {
 	key        string // "tenant:table"
 	table      *CachedTable
-	accessTime time.Time
 	prev, next *LRUNode
 }
 
@@ -617,9 +616,8 @@ func (lru *LRUQueue) Add(key string, table *CachedTable) {
 
 	// Create new node
 	node := &LRUNode{
-		key:        key,
-		table:      table,
-		accessTime: time.Now(),
+		key:   key,
+		table: table,
 	}
 
 	// Add to front
@@ -634,7 +632,12 @@ func (lru *LRUQueue) Access(key string, table *CachedTable) {
 	defer lru.mu.Unlock()
 
 	if node, exists := lru.nodes[key]; exists {
-		node.accessTime = time.Now()
+		// Repeated hits on the most recent table need no list mutation.
+		// LastAccess is already maintained on CachedTable; the queue needs
+		// only relative order, not a second wall-clock sample per hit.
+		if node == lru.head {
+			return
+		}
 		lru.remove(node)
 		lru.addFront(node)
 	}

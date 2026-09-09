@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"bufio"
 	"bytes"
 	"compress/gzip"
 	"encoding/gob"
@@ -557,11 +556,13 @@ func (b *DiskBackend) writeTableFile(path, tenant string, t *Table) (int64, erro
 		return b.finishTableFileWrite(tmp, path)
 	}
 
-	bw := bufio.NewWriterSize(f, 64*1024)
+	bw := borrowDiskWriter(f)
+	defer releaseDiskWriter(bw)
 	var w io.Writer = bw
 	var gz *gzip.Writer
 	if b.gzip {
-		gz = gzip.NewWriter(bw)
+		gz = borrowDiskGzipWriter(bw)
+		defer releaseDiskGzipWriter(gz)
 		w = gz
 	}
 
@@ -615,7 +616,8 @@ func (b *DiskBackend) encodeTableInto(w io.Writer, dt diskTable) error {
 	var gz *gzip.Writer
 	target := w
 	if b.gzip {
-		gz = gzip.NewWriter(w)
+		gz = borrowDiskGzipWriter(w)
+		defer releaseDiskGzipWriter(gz)
 		target = gz
 	}
 	enc := b.newEncoder(target)
@@ -691,7 +693,9 @@ func (b *DiskBackend) readTableFile(path string) (*Table, error) {
 			return nil, err
 		}
 		closers = append(closers, f)
-		r = bufio.NewReaderSize(f, 64*1024)
+		reader := borrowDiskReader(f)
+		defer releaseDiskReader(reader)
+		r = reader
 	}
 
 	if strings.HasSuffix(strings.ToLower(path), ".gz") {

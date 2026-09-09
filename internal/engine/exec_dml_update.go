@@ -294,6 +294,12 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 	if indexed {
 		candidateCount = len(plan.rowIDs)
 	}
+	arena := dmlRowArena{rowsPerBlock: 1}
+	if plan.where == nil {
+		// Only pack whole-table updates: a selective predicate must not
+		// reserve a block of rows for an isolated point update.
+		arena.rowsPerBlock = min(candidateCount, 64)
+	}
 	for candidate := 0; candidate < candidateCount; candidate++ {
 		ri := candidate
 		if indexed {
@@ -340,7 +346,8 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 			updated++
 			continue
 		}
-		nextRow := append([]any(nil), raw...)
+		nextRow := arena.row(len(raw))
+		copy(nextRow, raw)
 		for i, set := range plan.sets {
 			nextRow[set.col] = values[i]
 		}

@@ -25,3 +25,15 @@ func BenchmarkBuilderToSQLNested(b *testing.B) {
 		benchmarkBuilderSQL = ToSQL(stmt)
 	}
 }
+
+func BenchmarkBuilderInsertBatch(b *testing.B) {
+	builder := InsertInto("events").Columns("id", "label", "payload")
+	for i := 0; i < 100; i++ {
+		builder.Values(Val(i+1000), Val("O'Reilly's event"), Val([]byte{0, 1, 2, 255}))
+	}
+	stmt := builder.Build()
+	b.ReportAllocs()
+	for b.Loop() {
+		benchmarkBuilderSQL = ToSQL(stmt)
+	}
+}

@@ -293,6 +293,12 @@ func evalWindowFunction(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return nil, fmt.Errorf("window function context not available")
 	}
 
+	// Unordered ROW_NUMBER uses source position directly, including duplicate
+	// rows; no partition rows or reverse-position map are needed.
+	if ex.Name == "ROW_NUMBER" && len(ex.Over.PartitionBy) == 0 && len(ex.Over.OrderBy) == 0 && env.windowIndex >= 0 && env.windowIndex < len(allRows) {
+		return env.windowIndex + 1, nil
+	}
+
 	// Partition + sort the window's rows, and locate the current row within
 	// that partition. See windowPartitionCache: this is memoized per distinct
 	// PARTITION BY key so a query with N output rows across P partitions does
@@ -478,6 +484,10 @@ type windowPartitionShape struct {
 	partitionBy []Expr
 	orderBy     []OrderItem
 	shareable   bool
+	// Direct text partitions use one scan for the whole shape. Other value
+	// types retain compare-based partitioning (including mixed numeric types).
+	indexChecked bool
+	textGroups   map[string][]int
 }
 
 type windowPartitionEntry struct {
@@ -522,7 +532,21 @@ func resolveWindowPartition(env ExecEnv, ex *FuncCall, allRows []Row, row Row) (
 	key := windowPartitionCacheKey{shape: shape, partition: formatWindowPartitionKey(env, shape.partitionBy, row)}
 	entry, ok := cache.entries[key]
 	if !ok {
-		entry = buildWindowPartition(env, ex, allRows, row)
+		shape.indexTextPartitions(env, allRows)
+		if shape.textGroups != nil {
+			value, err := evalExpr(env, shape.partitionBy[0], row)
+			if text, valid := value.(string); err == nil && valid {
+				indices := shape.textGroups[text]
+				rows := make([]Row, len(indices))
+				for i, index := range indices {
+					rows[i] = allRows[index]
+				}
+				entry = finishWindowPartition(rows, indices, shape.orderBy)
+			}
+		}
+		if entry == nil {
+			entry = buildWindowPartition(env, ex, allRows, row)
+		}
 		cache.entries[key] = entry
 	}
 
@@ -562,6 +586,32 @@ func (cache *windowPartitionCache) shapeFor(ex *FuncCall) *windowPartitionShape 
 	cache.shapes = append(cache.shapes, shape)
 	cache.shapeByFunc[ex] = shape
 	return shape
+}
+
+// indexTextPartitions is intentionally conservative: strings have exactly
+// the same equivalence under map lookup and compare. NULL, numeric, composite
+// and computed partition keys retain the established evaluator path.
+func (shape *windowPartitionShape) indexTextPartitions(env ExecEnv, rows []Row) {
+	if shape.indexChecked {
+		return
+	}
+	shape.indexChecked = true
+	if len(shape.partitionBy) != 1 {
+		return
+	}
+	if _, ok := shape.partitionBy[0].(*VarRef); !ok {
+		return
+	}
+	groups := make(map[string][]int)
+	for i, row := range rows {
+		value, err := evalExpr(env, shape.partitionBy[0], row)
+		text, ok := value.(string)
+		if err != nil || !ok {
+			return
+		}
+		groups[text] = append(groups[text], i)
+	}
+	shape.textGroups = groups
 }
 
 func windowPartitionShapesEqual(left, right *windowPartitionShape) bool {
@@ -711,8 +761,12 @@ func buildWindowPartition(env ExecEnv, ex *FuncCall, allRows []Row, currentRow R
 		}
 	}
 
-	if len(ex.Over.OrderBy) > 0 {
-		rows, origIdx = sortRowsIndexed(rows, origIdx, ex.Over.OrderBy)
+	return finishWindowPartition(rows, origIdx, ex.Over.OrderBy)
+}
+
+func finishWindowPartition(rows []Row, origIdx []int, orderBy []OrderItem) *windowPartitionEntry {
+	if len(orderBy) > 0 {
+		rows, origIdx = sortRowsIndexed(rows, origIdx, orderBy)
 	}
 
 	posByOrigIdx := make(map[int]int, len(origIdx))
@@ -802,8 +856,10 @@ func sortRowsIndexed(rows []Row, origIdx []int, orderBy []OrderItem) ([]Row, []i
 		lcOrdCols[i] = strings.ToLower(oi.Col)
 	}
 	items := make([]orderedValueRow, len(sorted))
+	keys := make([]any, len(sorted)*len(orderBy))
 	for i, r := range sorted {
-		items[i] = buildOrderByValues(r, lcOrdCols)
+		start, end := i*len(orderBy), (i+1)*len(orderBy)
+		items[i] = buildOrderByValues(r, lcOrdCols, keys[start:end:end])
 	}
 
 	perm := make([]int, len(sorted))
@@ -868,8 +924,10 @@ func sortRows(rows []Row, orderBy []OrderItem) []Row {
 		lcOrdCols[i] = strings.ToLower(oi.Col)
 	}
 	items := make([]orderedValueRow, len(sorted))
+	keys := make([]any, len(sorted)*len(orderBy))
 	for i, row := range sorted {
-		items[i] = buildOrderByValues(row, lcOrdCols)
+		start, end := i*len(orderBy), (i+1)*len(orderBy)
+		items[i] = buildOrderByValues(row, lcOrdCols, keys[start:end:end])
 		items[i].idx = i
 	}
 	sort.Sort(orderedValueRowsAsc{orderBy: orderBy, items: items})

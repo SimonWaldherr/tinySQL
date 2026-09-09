@@ -1058,11 +1058,27 @@ func buildLimitOffsetClauses(sb *strings.Builder, limit *int, offset *int) {
 
 func insertToSQL(i *engine.Insert) string {
 	var sb strings.Builder
+	size := len("INSERT INTO  () VALUES ") + len(i.Table)
+	for _, col := range i.Cols {
+		size += len(col) + 2
+	}
+	for _, row := range i.Rows {
+		size += 4
+		for _, value := range row {
+			size += estimateExprSQLSize(value) + 2
+		}
+	}
+	sb.Grow(size)
 	sb.WriteString("INSERT INTO ")
 	sb.WriteString(i.Table)
 	if len(i.Cols) > 0 {
 		sb.WriteString(" (")
-		sb.WriteString(strings.Join(i.Cols, ", "))
+		for n, col := range i.Cols {
+			if n > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(col)
+		}
 		sb.WriteString(")")
 	}
 	sb.WriteString(" VALUES ")
@@ -1084,14 +1100,17 @@ func insertToSQL(i *engine.Insert) string {
 
 func updateToSQL(u *engine.Update) string {
 	var sb strings.Builder
+	size := len("UPDATE  SET  WHERE ") + len(u.Table) + estimateExprSQLSize(u.Where)
+	cols := make([]string, 0, len(u.Sets))
+	for col, value := range u.Sets {
+		cols = append(cols, col)
+		size += len(col) + 5 + estimateExprSQLSize(value)
+	}
+	sort.Strings(cols)
+	sb.Grow(size)
 	sb.WriteString("UPDATE ")
 	sb.WriteString(u.Table)
 	sb.WriteString(" SET ")
-	cols := make([]string, 0, len(u.Sets))
-	for col := range u.Sets {
-		cols = append(cols, col)
-	}
-	sort.Strings(cols)
 	for i, col := range cols {
 		if i > 0 {
 			sb.WriteString(", ")
@@ -1109,6 +1128,7 @@ func updateToSQL(u *engine.Update) string {
 
 func deleteToSQL(d *engine.Delete) string {
 	var sb strings.Builder
+	sb.Grow(len("DELETE FROM  WHERE ") + len(d.Table) + estimateExprSQLSize(d.Where))
 	sb.WriteString("DELETE FROM ")
 	sb.WriteString(d.Table)
 	if d.Where != nil {
@@ -1145,30 +1165,66 @@ func createTableToSQL(c *engine.CreateTable) string {
 // this, string/blob/time literals in ToSQL output were unquoted and unescaped
 // (e.g. WHERE name = O'Brien), i.e. syntactically invalid SQL.
 func literalToSQL(v any) string {
+	var sb strings.Builder
+	writeLiteralSQL(&sb, v)
+	return sb.String()
+}
+
+// Write literals into the statement buffer, avoiding temporary quoted,
+// hexadecimal and numeric strings for every cell of a batch INSERT.
+func writeLiteralSQL(sb *strings.Builder, v any) {
+	var scratch [64]byte
 	switch x := v.(type) {
 	case nil:
-		return "NULL"
+		sb.WriteString("NULL")
 	case string:
-		return "'" + strings.ReplaceAll(x, "'", "''") + "'"
+		sb.WriteByte('\'')
+		for {
+			pos := strings.IndexByte(x, '\'')
+			if pos < 0 {
+				sb.WriteString(x)
+				break
+			}
+			sb.WriteString(x[:pos+1])
+			sb.WriteByte('\'')
+			x = x[pos+1:]
+		}
+		sb.WriteByte('\'')
 	case []byte:
-		return "X'" + hex.EncodeToString(x) + "'"
+		sb.WriteString("X'")
+		var encoded [512]byte
+		for len(x) > 0 {
+			n := min(len(x), len(encoded)/2)
+			hex.Encode(encoded[:2*n], x[:n])
+			sb.Write(encoded[:2*n])
+			x = x[n:]
+		}
+		sb.WriteByte('\'')
 	case time.Time:
-		return "'" + x.Format(time.RFC3339Nano) + "'"
+		sb.WriteByte('\'')
+		sb.Write(x.AppendFormat(scratch[:0], time.RFC3339Nano))
+		sb.WriteByte('\'')
 	case bool:
 		if x {
-			return "TRUE"
+			sb.WriteString("TRUE")
+		} else {
+			sb.WriteString("FALSE")
 		}
-		return "FALSE"
 	case float32:
-		return strconv.FormatFloat(float64(x), 'f', -1, 32)
+		sb.Write(strconv.AppendFloat(scratch[:0], float64(x), 'f', -1, 32))
 	case float64:
-		return strconv.FormatFloat(x, 'f', -1, 64)
+		sb.Write(strconv.AppendFloat(scratch[:0], x, 'f', -1, 64))
 	case int:
-		return strconv.Itoa(x)
+		if x >= 0 && x < 100 {
+			// strconv reuses its immutable small-integer strings.
+			sb.WriteString(strconv.Itoa(x))
+		} else {
+			sb.Write(strconv.AppendInt(scratch[:0], int64(x), 10))
+		}
 	case int64:
-		return strconv.FormatInt(x, 10)
+		sb.Write(strconv.AppendInt(scratch[:0], x, 10))
 	default:
-		return fmt.Sprintf("%v", v)
+		sb.WriteString(fmt.Sprintf("%v", v))
 	}
 }
 
@@ -1187,7 +1243,7 @@ func writeExprSQL(sb *strings.Builder, e engine.Expr) {
 	}
 	switch ex := e.(type) {
 	case *engine.Literal:
-		sb.WriteString(literalToSQL(ex.Val))
+		writeLiteralSQL(sb, ex.Val)
 	case *engine.VarRef:
 		sb.WriteString(ex.Name)
 	case *engine.Binary:

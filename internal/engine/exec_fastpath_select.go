@@ -19,14 +19,9 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 		return nil, ok, err
 	}
 	if s.Distinct {
-		// DISTINCT combined with ORDER BY keeps the general path: the ordered
-		// fast path sorts raw source rows and projects afterwards, whereas
-		// DISTINCT has to collapse duplicates on the *projected* values first,
-		// and the two cannot simply be composed in that order.
-		//
-		// A select list that maps two projections onto one output name is
-		// likewise handed back (see distinctProjectionsSafe).
-		if len(plan.orderBy) > 0 || !distinctProjectionsSafe(plan.projs) {
+		// Ordered DISTINCT may sort only projected keys after deduplication.
+		// Non-projected ordering and colliding output names retain the general path.
+		if !distinctProjectionsSafe(plan.projs) || !distinctOrderProjected(plan) {
 			return nil, false, nil
 		}
 		return executeSimpleSelectDistinctFastPath(env, plan)
@@ -38,7 +33,20 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 		return executeSimpleSelectUnfilteredFastPath(env, plan)
 	}
 
-	outRows := make([]Row, 0, simpleSelectInitialCap(plan))
+	initialCap := simpleSelectInitialCap(plan)
+	if plan.limit != nil && *plan.limit >= 0 {
+		initialCap = min(initialCap, *plan.limit)
+	}
+	outRows := make([]Row, 0, initialCap)
+	offset := 0
+	if plan.offset != nil && *plan.offset > 0 {
+		offset = *plan.offset
+	}
+	var skippedValues []any
+	if offset > 0 {
+		skippedValues = make([]any, len(plan.projs))
+	}
+	matched := 0
 	stopAfter := -1
 	if plan.limit != nil {
 		stopAfter = *plan.limit
@@ -78,27 +86,49 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 		if !match {
 			continue
 		}
-		out, err := projectRawRow(plan, raw)
-		if err != nil {
-			return nil, true, err
+		if matched < offset {
+			// Preserve expression errors and evaluation on skipped matches.
+			if err := projectRawValues(plan, raw, skippedValues); err != nil {
+				return nil, true, err
+			}
+		} else {
+			out, err := projectRawRow(plan, raw)
+			if err != nil {
+				return nil, true, err
+			}
+			outRows = append(outRows, out)
 		}
-		outRows = append(outRows, out)
-		if stopAfter >= 0 && len(outRows) >= stopAfter {
+		matched++
+		if stopAfter >= 0 && matched >= stopAfter {
 			break
 		}
 	}
 
-	outRows = applyOffsetLimit(&Select{Limit: plan.limit, Offset: plan.offset}, outRows)
+	outRows = applyOffsetLimit(&Select{Limit: plan.limit}, outRows)
 	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, true, nil
 }
 
-// executeSimpleSelectUnfilteredFastPath applies LIMIT/OFFSET before row
-// projection for an unfiltered table scan. SQL applies OFFSET after filtering,
-// so this shortcut is deliberately restricted to a scan with no WHERE clause
-// and no index RowID set. In the common pagination shape this avoids building
-// and then discarding one Row map for every skipped row.
-// executeSimpleSelectDistinctFastPath runs SELECT DISTINCT without an ORDER BY
-// directly over raw rows.
+// distinctOrderProjected ensures materialized distinct rows contain every
+// ORDER BY key. Expressions already resolved to a SELECT alias qualify too.
+func distinctOrderProjected(plan *simpleSelectPlan) bool {
+	for _, order := range plan.orderBy {
+		key := strings.ToLower(order.Col)
+		found := false
+		for _, proj := range plan.projs {
+			if proj.key == key {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// executeSimpleSelectDistinctFastPath deduplicates projected raw values before
+// materializing results. Eligible ORDER BY keys sort only the distinct rows.
 //
 // DISTINCT previously disqualified the raw fast path outright
 // (simpleSelectEligible), so the general path materialized a Row map for every
@@ -116,7 +146,7 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 // LIMIT/OFFSET are applied here against distinct rows, because a fast path
 // returns straight to executeSelect's caller and the general tail never runs.
 // Counting distinct rows (not scanned rows) is what makes that correct, and it
-// also lets a LIMIT stop the scan as soon as enough distinct rows exist.
+// also lets an unordered LIMIT stop once enough distinct rows exist.
 func executeSimpleSelectDistinctFastPath(env ExecEnv, plan *simpleSelectPlan) (*ResultSet, bool, error) {
 	if plan.limit != nil && *plan.limit == 0 {
 		return &ResultSet{Cols: plan.outputCols, Rows: []Row{}}, true, nil
@@ -133,11 +163,12 @@ func executeSimpleSelectDistinctFastPath(env ExecEnv, plan *simpleSelectPlan) (*
 		offset = *plan.offset
 	}
 	stopAfter := -1
-	if plan.limit != nil {
+	if plan.limit != nil && len(plan.orderBy) == 0 {
 		stopAfter = offset + *plan.limit
 	}
 
 	seen := make(map[string]struct{})
+	var seenText map[string]struct{}
 	vals := make([]any, len(plan.projs))
 	// key is reused across rows; seen[string(key)] is a zero-allocation lookup,
 	// so a string is only materialized for a genuinely new row — the same
@@ -176,14 +207,32 @@ func executeSimpleSelectDistinctFastPath(env ExecEnv, plan *simpleSelectPlan) (*
 		if err := projectRawValues(plan, raw, vals); err != nil {
 			return nil, true, err
 		}
-		key = appendDistinctKey(key[:0], vals)
-		if _, dup := seen[string(key)]; dup {
-			continue
+		// A single text column can use its immutable value as the key, avoiding
+		// formatting and copying. Keep a separate set so arbitrary text cannot
+		// collide with the framed representation of a non-text value.
+		var text string
+		var isText bool
+		if len(vals) == 1 {
+			text, isText = vals[0].(string)
 		}
-		seen[string(key)] = struct{}{}
+		if isText {
+			if _, dup := seenText[text]; dup {
+				continue
+			}
+			if seenText == nil {
+				seenText = make(map[string]struct{})
+			}
+			seenText[text] = struct{}{}
+		} else {
+			key = appendDistinctKey(key[:0], vals)
+			if _, dup := seen[string(key)]; dup {
+				continue
+			}
+			seen[string(key)] = struct{}{}
+		}
 
 		distinctCount++
-		if distinctCount <= offset {
+		if len(plan.orderBy) == 0 && distinctCount <= offset {
 			continue
 		}
 		outRows = append(outRows, rowFromProjectedValues(plan, vals))
@@ -192,12 +241,21 @@ func executeSimpleSelectDistinctFastPath(env ExecEnv, plan *simpleSelectPlan) (*
 		}
 	}
 
+	if len(plan.orderBy) > 0 {
+		outRows = applySortOrderWithLimit(plan.orderBy, outRows, plan.limit, plan.offset)
+		outRows = applyOffsetLimit(&Select{Limit: plan.limit, Offset: plan.offset}, outRows)
+	}
 	if outRows == nil {
 		outRows = []Row{}
 	}
 	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, true, nil
 }
 
+// executeSimpleSelectUnfilteredFastPath applies LIMIT/OFFSET before row
+// projection for an unfiltered table scan. SQL applies OFFSET after filtering,
+// so this shortcut is deliberately restricted to a scan with no WHERE clause
+// and no index RowID set. In the common pagination shape this avoids building
+// and then discarding one Row map for every skipped row.
 func executeSimpleSelectUnfilteredFastPath(env ExecEnv, plan *simpleSelectPlan) (*ResultSet, bool, error) {
 	rows := simplePlanRows(plan)
 	// The generic scan checks the context on its first source row, even when
@@ -644,10 +702,13 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 	// large chunks. Freshly packed keys sort measurably faster than reads
 	// scattered across per-row allocations or the raw rows themselves, and
 	// the chunks cost a handful of allocations instead of one per row.
-	var keyArena []any
+	var keyArena, reusableKeys []any
 	var topRows orderedRawRowHeap
 	useTopN := keepCount > 0
 	if useTopN {
+		if len(plan.orderBy) > 1 {
+			keyArena = make([]any, 0, min(keepCount+1, rawKeyArenaChunkRows)*len(plan.orderBy))
+		}
 		topRows = orderedRawRowHeap{
 			plan:  plan,
 			items: make([]orderedRawRow, 0, simpleSelectInitialCap(plan)),
@@ -693,8 +754,10 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 			if len(plan.orderCols) == 1 {
 				item = orderedRawRow{raw: raw, key: raw[plan.orderCols[0]]}
 			} else {
-				var keys []any
-				keyArena, keys = reserveKeySlots(keyArena, len(plan.orderCols))
+				keys := reusableKeys
+				if keys == nil {
+					keyArena, keys = reserveKeySlots(keyArena, len(plan.orderCols))
+				}
 				for i, col := range plan.orderCols {
 					keys[i] = raw[col]
 				}
@@ -707,8 +770,10 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 			}
 			item = orderedRawRow{raw: raw, key: key}
 		default:
-			var keys []any
-			keyArena, keys = reserveKeySlots(keyArena, len(plan.orderExprs))
+			keys := reusableKeys
+			if keys == nil {
+				keyArena, keys = reserveKeySlots(keyArena, len(plan.orderExprs))
+			}
 			for i, expr := range plan.orderExprs {
 				v, err := evalRawExpr(plan, raw, expr)
 				if err != nil {
@@ -719,7 +784,7 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 			item = orderedRawRow{raw: raw, keys: keys}
 		}
 		if useTopN {
-			topRows.pushBounded(item, keepCount)
+			reusableKeys = topRows.pushBounded(item, keepCount)
 		} else {
 			rows = append(rows, item)
 		}
@@ -863,18 +928,23 @@ func orderedRawRowHeapDown(h orderedRawRowHeap, i0 int) {
 	}
 }
 
-func (h *orderedRawRowHeap) pushBounded(item orderedRawRow, keepCount int) {
+// pushBounded returns keys no longer referenced by the heap. The caller may
+// overwrite them for its next candidate, bounding key storage by LIMIT+OFFSET.
+func (h *orderedRawRowHeap) pushBounded(item orderedRawRow, keepCount int) []any {
 	if keepCount <= 0 {
-		return
+		return item.keys
 	}
 	if len(h.items) < keepCount {
 		orderedRawRowHeapPush(h, item)
-		return
+		return nil
 	}
 	if compareOrderedRawRows(h.plan, h.items[0], item) > 0 {
+		reusable := h.items[0].keys
 		h.items[0] = item
 		orderedRawRowHeapDown(*h, 0)
+		return reusable
 	}
+	return item.keys
 }
 
 func compareOrderedRawRows(plan *simpleSelectPlan, a, b orderedRawRow) int {
