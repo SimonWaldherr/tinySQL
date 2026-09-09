@@ -6,6 +6,7 @@ package engine
 import (
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 
@@ -36,6 +37,12 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 	initialCap := simpleSelectInitialCap(plan)
 	if plan.limit != nil && *plan.limit >= 0 {
 		initialCap = min(initialCap, *plan.limit)
+	}
+	capacityHint := initialCap
+	// LIMIT bounds output but does not predict how many rows pass WHERE.
+	// Start with a small result buffer for scans with a residual predicate.
+	if plan.where != nil && !plan.filterFullyCovered {
+		initialCap = min(initialCap, 64)
 	}
 	outRows := make([]Row, 0, initialCap)
 	offset := 0
@@ -97,6 +104,13 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 				return nil, true, err
 			}
 			outRows = append(outRows, out)
+			// At least half of the first 128 candidates matched: use the
+			// original bounded estimate once, avoiding repeated growth on
+			// dense scans while sparse scans keep their small buffer.
+			if len(outRows) == 64 && i < 128 && capacityHint > 64 {
+				outRows = slices.Grow(outRows, capacityHint-len(outRows))
+			}
+
 		}
 		matched++
 		if stopAfter >= 0 && matched >= stopAfter {

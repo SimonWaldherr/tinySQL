@@ -94,12 +94,13 @@ func TestDMLPackedRowsRemainIndependent(t *testing.T) {
 			}
 			values = append(values, "(0, 'duplicate')")
 			executeIndexSQL(t, db, "DELETE FROM packed")
+			executeIndexSQL(t, db, "INSERT INTO packed VALUES (-1, 'preserved')")
 			if _, err := Execute(t.Context(), db, "default", mustParse("INSERT INTO packed"+columns+" VALUES "+strings.Join(values, ","))); err == nil {
 				t.Fatal("expected duplicate key")
 			}
 			got = executeIndexSQL(t, db, "SELECT * FROM packed")
-			if len(got.Rows) != 0 {
-				t.Fatal("partial insert survived rollback")
+			if len(got.Rows) != 1 || got.Rows[0]["id"] != -1 || got.Rows[0]["label"] != "preserved" {
+				t.Fatalf("rollback did not preserve original row: %v", got.Rows)
 			}
 			executeIndexSQL(t, db, "INSERT INTO packed VALUES (64, 'retry')")
 		})

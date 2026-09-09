@@ -123,3 +123,9 @@ instead of 413. See [benchmarks and compatibility coverage](query-generation-per
 Batch row storage and INSERT SELECT adaptation use blocks to reduce allocation
 counts. Whole-table UPDATE benefits while point UPDATE retains its allocation
 profile. See [measurements, ownership and retention tradeoffs](insert-update-performance.md).
+
+## CTE projections and indexed SELECT (2026-09-09)
+
+Qualified direct CTE projections avoid copying every source row to add qualifier
+keys. Indexed SELECTs size output capacity using index candidates. See
+[benchmarks, eligibility and regression coverage](cte-select-performance.md).

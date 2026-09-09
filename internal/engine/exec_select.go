@@ -152,10 +152,10 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 // executeSimpleCTESelectFastPath fuses a single materialized-CTE scan with a
 // simple WHERE, direct-column projection, OFFSET and LIMIT. The general path
 // first copies every CTE row to add source qualifiers, then allocates a second
-// slice for WHERE and finally projects the survivors. Bare column references
-// need none of those qualified copies, so they can read the immutable CTE
-// ResultSet directly. Qualified references deliberately fall back to the
-// general path, which retains the full CTE-name/alias lookup semantics.
+// slice for WHERE and finally projects the survivors. Bare references and
+// unambiguous CTE-name/alias-qualified projections can read the immutable
+// ResultSet directly. Qualified predicates and dotted output names retain
+// the general path and its full lookup semantics.
 func executeSimpleCTESelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error) {
 	if s == nil || len(s.Joins) > 0 || len(s.GroupBy) > 0 || s.Having != nil ||
 		s.Union != nil || s.Pivot != nil || s.Distinct || len(s.OrderBy) > 0 ||
@@ -166,6 +166,32 @@ func executeSimpleCTESelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 	cteResult, ok := env.ctes[strings.ToLower(s.From.Table)]
 	if !ok || cteResult == nil {
 		return nil, false, nil
+	}
+	// Resolve source qualifiers once instead of constructing qualified maps
+	// for every materialized row. Dotted output column names retain the
+	// generic lookup rules, where qualified and literal dotted keys can collide.
+	resolveSource := func(name string) (string, bool) {
+		if name == "" {
+			return "", false
+		}
+		qualifier, column, qualified := strings.Cut(name, ".")
+		if !qualified {
+			return name, true
+		}
+		if qualifier != strings.ToLower(s.From.Table) &&
+			(s.From.Alias == "" || qualifier != strings.ToLower(s.From.Alias)) {
+			return "", false
+		}
+		found := false
+		for _, col := range cteResult.Cols {
+			if strings.Contains(col, ".") {
+				return "", false
+			}
+			if strings.ToLower(col) == column {
+				found = true
+			}
+		}
+		return column, found
 	}
 	// Reject expression/star projections before allocating a candidate plan.
 	// Recursive CTE members commonly project expressions and execute hundreds
@@ -179,7 +205,7 @@ func executeSimpleCTESelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 		if name == "" {
 			name = strings.ToLower(ref.Name)
 		}
-		if name == "" || strings.Contains(name, ".") {
+		if _, valid := resolveSource(name); !valid {
 			return nil, false, nil
 		}
 	}
@@ -197,6 +223,7 @@ func executeSimpleCTESelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 		if source == "" {
 			source = strings.ToLower(ref.Name)
 		}
+		source, _ = resolveSource(source)
 		name := projName(item, i)
 		projections = append(projections, projection{source: source, name: name, key: strings.ToLower(name)})
 		seen := false

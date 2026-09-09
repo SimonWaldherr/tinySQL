@@ -6,6 +6,7 @@ package engine
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -125,6 +126,12 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 	// owned maps, while trigger-only rows can reuse one statement-local map.
 	var triggerRow Row
 	inserted := 0
+	// Reserve row headers once when every input row will be appended on
+	// success. Triggers can mutate the table, and DO NOTHING may skip most
+	// inputs, so those paths retain incremental growth.
+	if !hasBefore && !hasAfter && !s.OnConflictDoNothing && len(rows) > 1 {
+		t.Rows = slices.Grow(t.Rows, len(rows))
+	}
 	arena := dmlRowArena{rowsPerBlock: min(len(rows), 64)}
 	for _, vals := range rows {
 		if len(vals) != expected {
@@ -265,6 +272,12 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	// owned maps, while trigger-only rows can reuse one statement-local map.
 	var triggerRow Row
 	inserted := 0
+	// Reserve row headers once when every input row will be appended on
+	// success. Triggers can mutate the table, and DO NOTHING may skip most
+	// inputs, so those paths retain incremental growth.
+	if !hasBefore && !hasAfter && !s.OnConflictDoNothing && len(rows) > 1 {
+		t.Rows = slices.Grow(t.Rows, len(rows))
+	}
 	arena := dmlRowArena{rowsPerBlock: min(len(rows), 64)}
 	for _, vals := range rows {
 		if len(vals) != len(s.Cols) {

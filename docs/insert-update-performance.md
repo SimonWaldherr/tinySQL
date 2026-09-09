@@ -55,3 +55,25 @@ INSERT SELECT, preserve old row slices across UPDATE, exercise append isolation,
 and verify statement rollback and primary-key lookup. Existing INSERT, UPDATE,
 constraint, trigger and WAL tests cover the shared mutation paths. The 36 setting
 oversubscribes this 12-core host; it is not a measurement on 36 physical cores.
+
+## Follow-up: reserve batch row headers (2026-09-09)
+
+After commit `7b4b9e7`, INSERT without triggers or ON CONFLICT reserves space for
+all incoming row headers once, instead of repeatedly growing and copying the
+outer row slice. Single-row inserts retain the existing growth behavior.
+Constraint validation and statement rollback still apply; the rollback regression
+now checks that an existing row survives a failed 131-row batch as well.
+
+Three fresh 300 ms samples on the same host, comparing against that commit:
+
+| 1,000-row INSERT | Before reservation | After reservation |
+|---|---:|---:|
+| Time | 59.6–63.1 µs | 58.7–60.6 µs |
+| Allocated bytes/op | 112,640 | 77,848 |
+| Allocations/op | 1,033 | 1,023 |
+
+This reduces allocated bytes by approximately 31%. The timing ranges overlap;
+these samples do not establish a substantial latency improvement. Capacity is
+reserved before row validation, so a failing large batch can allocate header
+space before reporting its error. Conflict-skipping inserts are excluded to
+avoid reserving for rows that may never be inserted.

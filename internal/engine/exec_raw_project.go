@@ -265,21 +265,25 @@ func rawRowTextColumns(colIndex map[string]int) []int {
 }
 
 func simpleSelectInitialCap(plan *simpleSelectPlan) int {
-	rows := simplePlanRows(plan)
+	rowCount := len(simplePlanRows(plan))
+	// Index candidates bound the result size even when LIMIT is much larger.
+	if plan.rowIDs != nil {
+		rowCount = len(plan.rowIDs)
+	}
 	if plan.limit != nil {
 		capHint := *plan.limit
 		if plan.offset != nil {
 			capHint += *plan.offset
 		}
-		if capHint > 0 && capHint < len(rows) {
+		if capHint > 0 && capHint < rowCount {
 			return capHint
 		}
 	}
-	if plan.where == nil && len(rows) > 0 {
-		return len(rows)
+	if plan.where == nil && rowCount > 0 {
+		return rowCount
 	}
-	if len(rows) < 64 {
-		return len(rows)
+	if rowCount < 64 {
+		return rowCount
 	}
 	return 64
 }
