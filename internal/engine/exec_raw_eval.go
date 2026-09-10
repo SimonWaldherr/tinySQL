@@ -224,9 +224,44 @@ func evalRawExpr(plan *simpleSelectPlan, raw []any, e Expr) (any, error) {
 		return evalRawBetween(plan, raw, ex)
 	case *FuncCall:
 		return evalRawFuncCall(plan, raw, ex)
+	case *CaseExpr:
+		return evalRawCase(plan, raw, ex)
 	default:
 		return nil, fmt.Errorf("unsupported fast-path expression %T", e)
 	}
+}
+
+// evalRawCase evaluates the operand once and only the first matching branch.
+// Keep the generic evaluator's comparison, NULL and error behavior intact.
+func evalRawCase(plan *simpleSelectPlan, raw []any, ex *CaseExpr) (any, error) {
+	var target any
+	if ex.Operand != nil {
+		var err error
+		target, err = evalRawExpr(plan, raw, ex.Operand)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, branch := range ex.Whens {
+		value, err := evalRawExpr(plan, raw, branch.When)
+		if err != nil {
+			return nil, err
+		}
+		matched := false
+		if ex.Operand != nil {
+			cmp, err := compare(target, value)
+			matched = err == nil && cmp == 0
+		} else {
+			matched = toTri(value) == tvTrue
+		}
+		if matched {
+			return evalRawExpr(plan, raw, branch.Then)
+		}
+	}
+	if ex.Else != nil {
+		return evalRawExpr(plan, raw, ex.Else)
+	}
+	return nil, nil
 }
 
 // evalRawBetween evaluates BETWEEN in the raw fast path with a single

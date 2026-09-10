@@ -13,6 +13,10 @@ import (
 )
 
 func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, error) {
+	// Trigger pseudo-columns require the general evaluator's ambient bindings.
+	if env.triggerRow != nil {
+		return nil, false, nil
+	}
 	if !simpleSelectEligible(s) {
 		return nil, false, nil
 	}
@@ -323,6 +327,16 @@ func simplePlanCacheSafeComparisonSide(expr Expr) bool {
 
 func exprContainsBoundParameter(expr Expr) bool {
 	switch ex := expr.(type) {
+	case *CaseExpr:
+		if exprContainsBoundParameter(ex.Operand) || exprContainsBoundParameter(ex.Else) {
+			return true
+		}
+		for _, branch := range ex.Whens {
+			if exprContainsBoundParameter(branch.When) || exprContainsBoundParameter(branch.Then) {
+				return true
+			}
+		}
+		return false
 	case nil:
 		return false
 	case *Literal:

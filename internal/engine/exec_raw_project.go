@@ -294,6 +294,16 @@ func simplePlanRows(plan *simpleSelectPlan) [][]any {
 
 func isSimpleRawExpr(e Expr) bool {
 	switch ex := e.(type) {
+	case *CaseExpr:
+		if !isSimpleRawExpr(ex.Operand) || !isSimpleRawExpr(ex.Else) {
+			return false
+		}
+		for _, branch := range ex.Whens {
+			if !isSimpleRawExpr(branch.When) || !isSimpleRawExpr(branch.Then) {
+				return false
+			}
+		}
+		return true
 	case nil:
 		return true
 	case *Literal, *VarRef:
@@ -359,6 +369,16 @@ var rowAwareFuncNames = map[string]bool{
 // through the node kinds evalRawExpr supports, calls a row-aware function.
 func exprHasRowAwareFuncCall(e Expr) bool {
 	switch ex := e.(type) {
+	case *CaseExpr:
+		if exprHasRowAwareFuncCall(ex.Operand) || exprHasRowAwareFuncCall(ex.Else) {
+			return true
+		}
+		for _, branch := range ex.Whens {
+			if exprHasRowAwareFuncCall(branch.When) || exprHasRowAwareFuncCall(branch.Then) {
+				return true
+			}
+		}
+		return false
 	case nil, *VarRef, *Literal:
 		return false
 	case *Unary:

@@ -30,6 +30,7 @@ type simpleAggregatePlan struct {
 	groupCols  []int
 	where      Expr
 	having     Expr
+	havingEval simpleHavingEval
 	orderBy    []OrderItem
 	limit      *int
 	offset     *int
@@ -342,11 +343,11 @@ func finalizeSimpleAggregateResultSet(env ExecEnv, plan *simpleAggregatePlan, or
 					return nil, err
 				}
 			}
-			match, err := evalSimpleAggregateHaving(env, plan, state, plan.having)
+			value, err := plan.havingEval(state)
 			if err != nil {
 				return nil, err
 			}
-			if match {
+			if toTri(value) == tvTrue {
 				kept = append(kept, state)
 			}
 		}
@@ -412,113 +413,6 @@ func simpleAggregateProjectionValue(state *simpleAggregateState, proj simpleAggr
 	return nil
 }
 
-// simpleAggregateHavingSupported limits the HAVING fast path to expressions
-// whose values are available from the aggregate state. Queries outside this
-// subset continue through the general aggregate evaluator unchanged.
-func simpleAggregateHavingSupported(plan *simpleAggregatePlan, e Expr) bool {
-	switch ex := e.(type) {
-	case *Literal:
-		return true
-	case *VarRef:
-		_, ok := simpleAggregateGroupValue(plan, nil, ex)
-		return ok
-	case *FuncCall:
-		_, ok := simpleAggregateProjectionForFunc(plan, ex)
-		return ok
-	case *Unary:
-		return (ex.Op == "+" || ex.Op == "-" || ex.Op == "NOT") && simpleAggregateHavingSupported(plan, ex.Expr)
-	case *Binary:
-		return (ex.Op == "AND" || ex.Op == "OR" || isComparisonOp(ex.Op) || isArithmeticOp(ex.Op)) &&
-			simpleAggregateHavingSupported(plan, ex.Left) && simpleAggregateHavingSupported(plan, ex.Right)
-	case *IsNull:
-		return simpleAggregateHavingSupported(plan, ex.Expr)
-	default:
-		return false
-	}
-}
-
-// evalSimpleAggregateHaving first binds grouped-column and aggregate values
-// from state into literals, then delegates the SQL operators to evalExpr. The
-// latter keeps NULL and three-valued-logic behavior identical to the general
-// aggregate path without materializing source rows as Row maps.
-func evalSimpleAggregateHaving(env ExecEnv, plan *simpleAggregatePlan, state *simpleAggregateState, e Expr) (bool, error) {
-	bound, ok, err := bindSimpleAggregateHaving(plan, state, e)
-	if err != nil {
-		return false, err
-	}
-	if !ok {
-		return false, fmt.Errorf("unsupported HAVING expression in simple aggregate plan")
-	}
-	v, err := evalExpr(env, bound, Row{})
-	if err != nil {
-		return false, err
-	}
-	return toTri(v) == tvTrue, nil
-}
-
-func bindSimpleAggregateHaving(plan *simpleAggregatePlan, state *simpleAggregateState, e Expr) (Expr, bool, error) {
-	switch ex := e.(type) {
-	case *Literal:
-		return ex, true, nil
-	case *VarRef:
-		value, ok := simpleAggregateGroupValue(plan, state, ex)
-		if !ok {
-			return nil, false, nil
-		}
-		return &Literal{Val: value}, true, nil
-	case *FuncCall:
-		idx, ok := simpleAggregateProjectionForFunc(plan, ex)
-		if !ok {
-			return nil, false, nil
-		}
-		return &Literal{Val: simpleAggregateProjectionValue(state, plan.projs[idx], idx)}, true, nil
-	case *Unary:
-		inner, ok, err := bindSimpleAggregateHaving(plan, state, ex.Expr)
-		if err != nil || !ok {
-			return nil, ok, err
-		}
-		return &Unary{Op: ex.Op, Expr: inner}, true, nil
-	case *Binary:
-		left, ok, err := bindSimpleAggregateHaving(plan, state, ex.Left)
-		if err != nil || !ok {
-			return nil, ok, err
-		}
-		right, ok, err := bindSimpleAggregateHaving(plan, state, ex.Right)
-		if err != nil || !ok {
-			return nil, ok, err
-		}
-		return &Binary{Op: ex.Op, Left: left, Right: right}, true, nil
-	case *IsNull:
-		inner, ok, err := bindSimpleAggregateHaving(plan, state, ex.Expr)
-		if err != nil || !ok {
-			return nil, ok, err
-		}
-		return &IsNull{Expr: inner, Negate: ex.Negate}, true, nil
-	default:
-		return nil, false, nil
-	}
-}
-
-func simpleAggregateGroupValue(plan *simpleAggregatePlan, state *simpleAggregateState, ref *VarRef) (any, bool) {
-	name := ref.Lower
-	if name == "" {
-		name = strings.ToLower(ref.Name)
-	}
-	col, ok := plan.colIndex[name]
-	if !ok {
-		return nil, false
-	}
-	for i, groupCol := range plan.groupCols {
-		if groupCol == col {
-			if state == nil {
-				return nil, true
-			}
-			return state.groupValues[i], true
-		}
-	}
-	return nil, false
-}
-
 func simpleAggregateProjectionForFunc(plan *simpleAggregatePlan, fc *FuncCall) (int, bool) {
 	if fc == nil || fc.Distinct || fc.Over != nil {
 		return 0, false
@@ -560,14 +454,34 @@ func simpleAggregateProjectionForFunc(plan *simpleAggregatePlan, fc *FuncCall) (
 	return 0, false
 }
 
-// simpleAggregateArgumentsEqual deliberately accepts only the direct column
-// and literal expressions that dominate HAVING clauses. More complex
-// aggregate arguments safely use the established general path.
+// simpleAggregateArgumentsEqual matches pure expression trees only. Function
+// calls may be volatile and continue through the general aggregate path.
 func simpleAggregateArgumentsEqual(left, right Expr) bool {
 	if left == nil || right == nil {
 		return left == nil && right == nil
 	}
 	switch l := left.(type) {
+	case *Unary:
+		r, ok := right.(*Unary)
+		return ok && l.Op == r.Op && simpleAggregateArgumentsEqual(l.Expr, r.Expr)
+	case *Binary:
+		r, ok := right.(*Binary)
+		return ok && l.Op == r.Op && simpleAggregateArgumentsEqual(l.Left, r.Left) && simpleAggregateArgumentsEqual(l.Right, r.Right)
+	case *IsNull:
+		r, ok := right.(*IsNull)
+		return ok && l.Negate == r.Negate && simpleAggregateArgumentsEqual(l.Expr, r.Expr)
+	case *CaseExpr:
+		r, ok := right.(*CaseExpr)
+		if !ok || len(l.Whens) != len(r.Whens) || !simpleAggregateArgumentsEqual(l.Operand, r.Operand) || !simpleAggregateArgumentsEqual(l.Else, r.Else) {
+			return false
+		}
+		for i, branch := range l.Whens {
+			if !simpleAggregateArgumentsEqual(branch.When, r.Whens[i].When) || !simpleAggregateArgumentsEqual(branch.Then, r.Whens[i].Then) {
+				return false
+			}
+		}
+		return true
+
 	case *VarRef:
 		r, ok := right.(*VarRef)
 		return ok && strings.EqualFold(l.Name, r.Name)
@@ -580,6 +494,10 @@ func simpleAggregateArgumentsEqual(left, right Expr) bool {
 }
 
 func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, bool, error) {
+	// Trigger pseudo-columns require the general evaluator's ambient bindings.
+	if env.triggerRow != nil {
+		return nil, false, nil
+	}
 	if !simpleAggregateEligibleSelect(s) {
 		return nil, false, nil
 	}
@@ -652,8 +570,11 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 		projs:      projs,
 		outputCols: outputCols,
 	}
-	if plan.having != nil && !simpleAggregateHavingSupported(plan, plan.having) {
-		return nil, false, nil
+	if plan.having != nil {
+		plan.havingEval = compileSimpleHaving(plan, plan.having)
+		if plan.havingEval == nil {
+			return nil, false, nil
+		}
 	}
 	return plan, true, nil
 }

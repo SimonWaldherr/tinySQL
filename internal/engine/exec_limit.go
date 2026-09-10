@@ -46,6 +46,19 @@ func simpleLimitZeroPlan(env ExecEnv, plan *simpleSelectPlan) (*simpleSelectPlan
 func validateRawColumnRefs(cols map[string]int, e Expr) error {
 	var children []Expr
 	switch ex := e.(type) {
+	case *CaseExpr:
+		if err := validateRawColumnRefs(cols, ex.Operand); err != nil {
+			return err
+		}
+		for _, branch := range ex.Whens {
+			if err := validateRawColumnRefs(cols, branch.When); err != nil {
+				return err
+			}
+			if err := validateRawColumnRefs(cols, branch.Then); err != nil {
+				return err
+			}
+		}
+		return validateRawColumnRefs(cols, ex.Else)
 	case *VarRef:
 		key := ex.Lower
 		if key == "" {

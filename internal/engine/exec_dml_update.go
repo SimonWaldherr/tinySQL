@@ -389,6 +389,9 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 }
 
 func buildSimpleUpdatePlan(env ExecEnv, s *Update) (*simpleUpdatePlan, bool, error) {
+	if env.triggerRow != nil {
+		return nil, false, nil
+	}
 	stmtPlan := env.planFor(s)
 	before, after := planTriggers(stmtPlan, env, s.Table, storage.TriggerUpdate)
 	if len(before) > 0 || len(after) > 0 {

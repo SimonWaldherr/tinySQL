@@ -35,7 +35,7 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 		afterDelRunner = &triggerListRunner{triggers: afterDelTriggers}
 	}
 	hasTriggers := len(beforeDelTriggers) > 0 || len(afterDelTriggers) > 0
-	if !hasTriggers && len(s.Returning) == 0 && isSimpleRawPredicate(s.Where) {
+	if env.triggerRow == nil && !hasTriggers && len(s.Returning) == 0 && isSimpleRawPredicate(s.Where) {
 		// newDMLPlan already resolved both of these while choosing this
 		// statement's rollback snapshot shape; see planConstraintRows.
 		colIndex := planColumnIndex(stmtPlan)
@@ -104,7 +104,7 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	}
 
 	// Fast path: no triggers and a simple predicate – skip the full Row map allocation.
-	if !hasTriggers && len(s.Returning) == 0 && isSimpleRawPredicate(s.Where) {
+	if env.triggerRow == nil && !hasTriggers && len(s.Returning) == 0 && isSimpleRawPredicate(s.Where) {
 		colIndex := simpleColumnIndex(t, s.Table)
 		rawPlan := &simpleSelectPlan{table: t, colIndex: colIndex, where: s.Where, filter: buildRawFilter(colIndex, s.Where)}
 		kept := make([][]any, 0, len(t.Rows))

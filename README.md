@@ -117,6 +117,14 @@ error when `value` is present. `ISNULL(value)` is a one-argument boolean test;
 use `IFNULL(value, fallback)` to substitute a value. `NULLIF(a, b)` preserves
 the type of `a` when the two values differ.
 
+Simple and searched `CASE` expressions run directly in raw scans, streams,
+filters, and aggregate arguments. Only the selected result branch is evaluated;
+an omitted `ELSE` returns NULL. Supported `HAVING` expressions bind grouped
+columns and projected aggregates once per query and filter aggregate states
+before output rows are materialized. This includes conditional totals such as
+`SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END)` used in both SELECT and
+HAVING. More complex expressions retain the general execution path.
+
 For applications that already use `database/sql`, use
 [`github.com/SimonWaldherr/tinySQL/driver`](./driver).
 
