@@ -139,6 +139,27 @@ passes and chooses the first element encountered when frequencies tie. Supply
 an explicit record path to extract XML in one pass. Malformed XML returns an
 error instead of a partial result.
 
+Use `TEXT_TO_COLUMNS(text, delimiter)` to split one text into a single row
+with columns named `column1`, `column2`, and so on. Use aliases to name the
+fields, and `COLUMNS_TO_TEXT(delimiter, value, ...)` to join selected columns:
+
+```sql
+SELECT column1 AS name, column2 AS city, column3 AS age
+FROM TEXT_TO_COLUMNS('Anna;Berlin;42', ';');
+
+SELECT COLUMNS_TO_TEXT(';', column1, column2, column3) AS text
+FROM TEXT_TO_COLUMNS('Anna;Berlin;42', ';');
+```
+
+Splitting preserves empty fields, supports multi-character delimiters, and
+returns text values without type inference. An empty delimiter splits Unicode
+characters. A NULL text or delimiter produces no rows. `COLUMNS_TO_TEXT` is an
+alias for `CONCAT_WS`: NULL values are skipped, empty strings are retained, and
+a NULL delimiter produces NULL. Use `COALESCE(column, '')` to retain a position
+for a nullable column. Neither function interprets or adds CSV quoting; use
+`TABLE_FROM_CSV` for quoted CSV input. To extract only one field, use the
+existing `SPLIT_PART(text, delimiter, position)` with positions starting at 1.
+
 For applications that already use `database/sql`, use
 [`github.com/SimonWaldherr/tinySQL/driver`](./driver).
 
