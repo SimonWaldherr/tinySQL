@@ -105,6 +105,11 @@ stream incrementally. Operations that require the complete input—such as
 `ORDER BY`, `GROUP BY`, `DISTINCT`, joins, and set operations—preserve exact
 SQL semantics and start yielding after their result has been materialized.
 
+For simple physical-table queries, `SELECT ... LIMIT 0` resolves the output
+schema without evaluating row expressions or collecting index candidates.
+Paged Index storage can answer these schema queries without loading data rows.
+Column validation and context cancellation still apply.
+
 For applications that already use `database/sql`, use
 [`github.com/SimonWaldherr/tinySQL/driver`](./driver).
 

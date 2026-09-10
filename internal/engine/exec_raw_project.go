@@ -271,10 +271,7 @@ func simpleSelectInitialCap(plan *simpleSelectPlan) int {
 		rowCount = len(plan.rowIDs)
 	}
 	if plan.limit != nil {
-		capHint := *plan.limit
-		if plan.offset != nil {
-			capHint += *plan.offset
-		}
+		capHint := boundedLimitRows(plan.limit, plan.offset, rowCount)
 		if capHint > 0 && capHint < rowCount {
 			return capHint
 		}

@@ -7,13 +7,17 @@ use ordered literal searches instead of rune-by-rune wildcard backtracking.
 The anchored suffix is reserved before searching intermediate parts, preventing
 separate literal segments from overlapping.
 
-Patterns containing `_`, backslash escapes, invalid UTF-8 or a literal replacement
-character retain the general Unicode matcher. This also fixes the previous
-shortcut interpreting an escaped `%` as a wildcard or ignoring escaped backslashes.
+Escaped literals such as `log\_%` and `%\%%` use the same string-search paths.
+Fixed-width `_` patterns decode their wildcard positions; patterns mixing `_`
+with `%`, invalid UTF-8 or a literal replacement character retain the general
+Unicode matcher. Escaped `%` and `_` match literally, including when searching
+between wildcards, and a trailing backslash remains literal.
 Raw LIKE filters now stringify non-NULL values like the general evaluator, rather
 than silently rejecting every non-string value. Bound pattern parameters stay
-dynamic. ILIKE retains its existing lowercase semantics; lowercasing text may
-allocate. Explicit ESCAPE and GLOB matching keep their existing implementation.
+dynamic. ILIKE retains its existing Unicode lowercase semantics. Exact and
+prefix patterns compare only the required code points without allocating a
+lowercase copy of the source text; other shapes may still allocate. Explicit
+ESCAPE and GLOB matching keep their existing implementation.
 
 Materialized-view refresh now binds column lookup keys once and fills rows in
 blocks of roughly 4,096 cells, instead of separately allocating each row and

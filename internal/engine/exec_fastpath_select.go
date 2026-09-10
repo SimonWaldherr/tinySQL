@@ -27,6 +27,9 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 		}
 		return executeSimpleSelectDistinctFastPath(env, plan)
 	}
+	if plan.limit != nil && *plan.limit == 0 {
+		return &ResultSet{Cols: plan.outputCols, Rows: []Row{}}, true, nil
+	}
 	if len(plan.orderBy) > 0 {
 		return executeSimpleSelectOrderedFastPath(env, plan)
 	}
@@ -54,13 +57,6 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 		skippedValues = make([]any, len(plan.projs))
 	}
 	matched := 0
-	stopAfter := -1
-	if plan.limit != nil {
-		stopAfter = *plan.limit
-		if plan.offset != nil {
-			stopAfter += *plan.offset
-		}
-	}
 
 	rows := simplePlanRows(plan)
 	rowCount := len(rows)
@@ -113,12 +109,11 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 
 		}
 		matched++
-		if stopAfter >= 0 && matched >= stopAfter {
+		if plan.limit != nil && len(outRows) >= *plan.limit {
 			break
 		}
 	}
 
-	outRows = applyOffsetLimit(&Select{Limit: plan.limit}, outRows)
 	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, true, nil
 }
 
@@ -175,10 +170,6 @@ func executeSimpleSelectDistinctFastPath(env ExecEnv, plan *simpleSelectPlan) (*
 	offset := 0
 	if plan.offset != nil && *plan.offset > 0 {
 		offset = *plan.offset
-	}
-	stopAfter := -1
-	if plan.limit != nil && len(plan.orderBy) == 0 {
-		stopAfter = offset + *plan.limit
 	}
 
 	seen := make(map[string]struct{})
@@ -250,7 +241,7 @@ func executeSimpleSelectDistinctFastPath(env ExecEnv, plan *simpleSelectPlan) (*
 			continue
 		}
 		outRows = append(outRows, rowFromProjectedValues(plan, vals))
-		if stopAfter >= 0 && distinctCount >= stopAfter {
+		if plan.limit != nil && len(plan.orderBy) == 0 && len(outRows) >= *plan.limit {
 			break
 		}
 	}
@@ -668,13 +659,7 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 
 	keepCount := -1
 	if plan.limit != nil {
-		keepCount = *plan.limit
-		if plan.offset != nil {
-			keepCount += *plan.offset
-		}
-		if keepCount > rowCount {
-			keepCount = rowCount
-		}
+		keepCount = boundedLimitRows(plan.limit, plan.offset, rowCount)
 	}
 	if scorer, ok := simpleFloatOrderScorer(plan); ok && keepCount > 0 {
 		rs, err := executeSimpleSelectFloatScoredTopN(env, plan, sourceRows, rowCount, keepCount, scorer)

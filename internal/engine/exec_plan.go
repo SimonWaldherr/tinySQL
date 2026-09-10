@@ -25,6 +25,15 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 	if metadata, paged, metaErr := env.db.PagedIndexMetadata(env.tenant, s.From.Table); metaErr != nil {
 		return nil, true, metaErr
 	} else if paged {
+		if s.Limit != nil && *s.Limit == 0 {
+			template, ok, err := loadSimpleSelectPlanTemplate(metadata, s, true)
+			if !ok || err != nil {
+				return nil, ok, err
+			}
+			plan := *template
+			plan.table = metadata
+			return simpleLimitZeroPlan(env, &plan)
+		}
 		colIndex := simpleColumnIndex(metadata, aliasOr(s.From))
 		if idx, values, predicates, residual := selectSecondaryIndex(metadata, colIndex, s.Where); idx != nil && len(values) == len(idx.Columns) {
 			rows, exists, seekErr := env.db.PagedIndexRows(env.tenant, s.From.Table, idx.Name, values)
@@ -72,6 +81,9 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 		return nil, ok, err
 	}
 	plan := *template
+	if s.Limit != nil && *s.Limit == 0 {
+		return simpleLimitZeroPlan(env, &plan)
+	}
 	resetSimplePlanAccess(&plan, len(table.Rows))
 	if err := selectSimplePlanIndexRows(&plan, s.Where); err != nil {
 		return nil, true, err

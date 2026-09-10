@@ -301,16 +301,7 @@ func applySortOrderWithLimit(orderBy []OrderItem, outRows []Row, limit, offset *
 		lcOrdCols[idx] = strings.ToLower(oi.Col)
 	}
 
-	keepCount := len(outRows)
-	if limit != nil {
-		keepCount = *limit
-		if offset != nil {
-			keepCount += *offset
-		}
-		if keepCount > len(outRows) {
-			keepCount = len(outRows)
-		}
-	}
+	keepCount := boundedLimitRows(limit, offset, len(outRows))
 	if keepCount <= 0 {
 		return []Row{}
 	}
@@ -365,16 +356,7 @@ func applySortOrderWithLimitSingle(orderBy OrderItem, outRows []Row, limit, offs
 	}
 
 	lcOrdCol := strings.ToLower(orderBy.Col)
-	keepCount := len(outRows)
-	if limit != nil {
-		keepCount = *limit
-		if offset != nil {
-			keepCount += *offset
-		}
-		if keepCount > len(outRows) {
-			keepCount = len(outRows)
-		}
-	}
+	keepCount := boundedLimitRows(limit, offset, len(outRows))
 	if keepCount <= 0 {
 		return []Row{}
 	}

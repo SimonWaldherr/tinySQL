@@ -12,7 +12,7 @@ import (
 
 func TestCompiledLikeMatchesRuneReference(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
-	alphabet := []string{"a", "b", "A", "%", "_", "\\", "é", "Ω", "�", "\xff"}
+	alphabet := []string{"a", "b", "A", "%", "_", "\\", "é", "Ω", "K", "İ", "Σ", "ς", "�", "\xff", "\x00", "\n"}
 	randomText := func(maxLen int) string {
 		var b strings.Builder
 		for n := rng.Intn(maxLen + 1); n > 0; n-- {
