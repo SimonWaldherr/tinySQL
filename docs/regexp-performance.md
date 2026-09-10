@@ -32,6 +32,8 @@ go test ./internal/engine -run 'TestRegexp'
 go test ./internal/engine -run '^$' -bench '^BenchmarkRegexpMatchFilter$' -benchmem -count=3 -benchtime=700ms
 go test ./internal/engine -run '^$' -bench 'BenchmarkRegexp(MatchFunction|Row)Scan$' -benchmem -count=3 -benchtime=500ms
 go test ./internal/engine -run '^$' -bench '^BenchmarkRegexpLikeSubstr$' -benchmem -count=3 -benchtime=500ms
+go test ./internal/engine -run '^TestTextSearchAlternativeFilters$'
+go test ./internal/engine -run '^$' -bench '^BenchmarkTextSearchAlternatives$' -benchmem -count=3 -benchtime=300ms
 ```
 
 The isolated benchmark compares the generic and bound filters on the same
@@ -49,6 +51,21 @@ check that the predicates select the same rows, including Unicode and newline
 cases. SUBSTR is an extraction function: these comparisons include its argument
 evaluation, substring construction and comparison, rather than measuring only
 the byte comparison. Negative positions currently count source characters too.
+
+Additional comparisons cover `CONTAINS`, `STARTS_WITH`, `ENDS_WITH`, `INSTR`,
+`POSITION`, `LOCATE`, `LEFT`, `RIGHT` and `GLOB`. Each group uses equivalent
+positive WHERE predicates over TEXT/NULL values and verifies identical counts
+before timing. `CONTAINS_ANY`/`CONTAINS_ALL` ignore case, so their comparison uses
+ILIKE OR/AND expressions. Plain CONTAINS, STARTS_WITH and ENDS_WITH are
+case-sensitive literal searches: percent signs and underscores need no escaping.
+
+These equivalences do not extend to every expression context. In particular,
+CONTAINS/STARTS_WITH/ENDS_WITH return false for NULL arguments, whereas LIKE
+returns SQL UNKNOWN; negation can therefore select different rows. GLOB uses
+`*` and `?` as wildcards. FTS_MATCH tokenizes, stems and removes stop words and
+supports word/phrase/boolean queries, so it is not a literal substring substitute
+and is not included in the equivalent-filter timings. LEVENSHTEIN measures edit
+distance and is useful for typo tolerance rather than wildcard matching.
 
 On Apple M2 Max, darwin/arm64, Go 1.27.1, the isolated benchmark's three-run
 medians were 334.4 ns/op (generic) and 151.2 ns/op (bound), approximately 55%
