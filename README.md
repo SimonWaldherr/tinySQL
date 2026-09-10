@@ -110,6 +110,13 @@ schema without evaluating row expressions or collecting index candidates.
 Paged Index storage can answer these schema queries without loading data rows.
 Column validation and context cancellation still apply.
 
+`COALESCE`, `IFNULL` and `NVL` stop at the first non-NULL argument; `IF` and
+`IIF` evaluate only the selected branch, including in raw scans and streams.
+Unused fallbacks such as `COALESCE(value, 1 / 0)` therefore do not raise an
+error when `value` is present. `ISNULL(value)` is a one-argument boolean test;
+use `IFNULL(value, fallback)` to substitute a value. `NULLIF(a, b)` preserves
+the type of `a` when the two values differ.
+
 For applications that already use `database/sql`, use
 [`github.com/SimonWaldherr/tinySQL/driver`](./driver).
 

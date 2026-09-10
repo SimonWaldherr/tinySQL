@@ -37,6 +37,12 @@ func evalNullif(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	return nullifValues(lv, rv)
+}
+
+// Keep generic and raw NULLIF comparison/coercion semantics identical, and
+// return the original left value and type when the operands differ.
+func nullifValues(lv, rv any) (any, error) {
 	if lv == nil {
 		return nil, nil
 	}
@@ -893,24 +899,26 @@ func evalIf(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Check if condition is truthy
-	isTrue := false
-	switch v := cond.(type) {
-	case bool:
-		isTrue = v
-	case int:
-		isTrue = v != 0
-	case float64:
-		isTrue = v != 0
-	case string:
-		isTrue = v != "" && v != "0" && strings.ToLower(v) != "false"
-	default:
-		isTrue = cond != nil
-	}
-	if isTrue {
+	if ifConditionTrue(cond) {
 		return evalExpr(env, args[1], row)
 	}
 	return evalExpr(env, args[2], row)
+}
+
+// IF has its own established coercions; share them with the raw evaluator.
+func ifConditionTrue(cond any) bool {
+	switch v := cond.(type) {
+	case bool:
+		return v
+	case int:
+		return v != 0
+	case float64:
+		return v != 0
+	case string:
+		return v != "" && v != "0" && strings.ToLower(v) != "false"
+	default:
+		return cond != nil
+	}
 }
 
 func evalSpace(env ExecEnv, args []Expr, row Row) (any, error) {

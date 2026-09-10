@@ -281,6 +281,58 @@ func evalRawFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, erro
 	if ex.Name == "ROW_TO_TEXT" {
 		return evalRawRowToText(plan, raw, ex)
 	}
+	// Conditional/NULL functions consume expressions lazily. Sending them
+	// through the argument-wrapper pool below evaluates discarded branches
+	// and can raise errors that their ordinary handlers would never reach.
+	switch ex.Name {
+	case "COALESCE", "IFNULL", "NVL":
+		for _, arg := range ex.Args {
+			v, err := evalRawExpr(plan, raw, arg)
+			if err != nil {
+				return nil, err
+			}
+			if v != nil {
+				return v, nil
+			}
+		}
+		return nil, nil
+	case "ISNULL":
+		if len(ex.Args) != 1 {
+			return nil, fmt.Errorf("ISNULL expects 1 argument")
+		}
+		v, err := evalRawExpr(plan, raw, ex.Args[0])
+		if err != nil {
+			return nil, err
+		}
+		return v == nil, nil
+	case "NULLIF":
+		if len(ex.Args) != 2 {
+			return nil, fmt.Errorf("NULLIF expects 2 args")
+		}
+		left, err := evalRawExpr(plan, raw, ex.Args[0])
+		if err != nil {
+			return nil, err
+		}
+		// Preserve NULLIF's existing left-to-right evaluation of both operands.
+		right, err := evalRawExpr(plan, raw, ex.Args[1])
+		if err != nil {
+			return nil, err
+		}
+		return nullifValues(left, right)
+	case "IF", "IIF":
+		if len(ex.Args) != 3 {
+			return nil, fmt.Errorf("IF expects 3 arguments: (condition, true_value, false_value)")
+		}
+		cond, err := evalRawExpr(plan, raw, ex.Args[0])
+		if err != nil {
+			return nil, err
+		}
+		branch := 2
+		if ifConditionTrue(cond) {
+			branch = 1
+		}
+		return evalRawExpr(plan, raw, ex.Args[branch])
+	}
 	if len(ex.Args) == 1 && (ex.Name == "UPPER" || ex.Name == "LOWER") {
 		val, err := evalRawExpr(plan, raw, ex.Args[0])
 		if err != nil {

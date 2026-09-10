@@ -174,6 +174,13 @@ func buildRawFilterUnary(colIndex map[string]int, ex *Unary) func([]any) (bool, 
 	if ex.Op != "NOT" {
 		return nil
 	}
+	// ISNULL always returns a boolean, so its negation can safely share the
+	// direct IS NOT NULL column check without collapsing SQL UNKNOWN.
+	if call, ok := ex.Expr.(*FuncCall); ok && call.Name == "ISNULL" && call.Over == nil && len(call.Args) == 1 {
+		if filter := buildRawFilterIsNull(colIndex, &IsNull{Expr: call.Args[0], Negate: true}); filter != nil {
+			return filter
+		}
+	}
 	// NOT must implement three-valued logic: NOT(unknown) stays unknown
 	// (row excluded), not "not false" = true. The specialized
 	// comparison/LIKE/IN filters compile to a plain bool that intentionally
@@ -557,6 +564,11 @@ func buildRawFilterRegexp(colIndex map[string]int, ex *RegexpExpr) func([]any) (
 // evalFuncCall-based path) for any function it doesn't recognize.
 func buildRawFilterFuncCall(colIndex map[string]int, ex *FuncCall) func([]any) (bool, error) {
 	switch ex.Name {
+	case "ISNULL":
+		if ex.Over == nil && len(ex.Args) == 1 {
+			return buildRawFilterIsNull(colIndex, &IsNull{Expr: ex.Args[0]})
+		}
+		return nil
 	case "REGEXP_MATCH":
 		return buildRawFilterRegexpMatch(colIndex, ex)
 	case "CONTAINS_ALL", "CONTAINS_ANY":
