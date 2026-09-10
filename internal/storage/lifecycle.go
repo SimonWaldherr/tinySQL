@@ -189,6 +189,7 @@ func (db *DB) Close() error {
 	if !shouldClose {
 		return nil
 	}
+	db.closeChangeWatchers()
 
 	var firstErr error
 

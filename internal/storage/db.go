@@ -61,6 +61,11 @@ type DBHealth struct {
 // It optionally delegates storage to a StorageBackend for disk-based or
 // hybrid persistence strategies.
 type DB struct {
+	watchMu     sync.Mutex
+	watchers    map[chan struct{}]struct{}
+	watchClosed bool
+	watchCount  atomic.Int64
+
 	mu      sync.RWMutex
 	tenants map[string]*tenantDB
 	wal     *WALManager
@@ -444,6 +449,7 @@ func (db *DB) LockContentForWrite() {
 // UnlockContentForWrite releases a lock taken by LockContentForWrite.
 func (db *DB) UnlockContentForWrite() {
 	db.contentMu.Unlock()
+	db.notifyChanges()
 }
 
 func (db *DB) attachWAL(wal *WALManager) {

@@ -5,6 +5,7 @@ package storage
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -578,8 +579,7 @@ func (t *Table) noteRowUpdated(row int) {
 	const maxRowUpdateDeltas = 4096
 	if len(t.rowUpdateLog) >= maxRowUpdateDeltas {
 		t.rowUpdateLog = nil
-		t.rowUpdateBase = t.structVersion
-		return
+		t.rowUpdateBase = t.structVersion - 1
 	}
 	t.rowUpdateLog = append(t.rowUpdateLog, rowUpdateDelta{structVersion: t.structVersion, row: row})
 }
@@ -601,8 +601,9 @@ func (t *Table) UpdatedRowsSince(version int) (rows []int, ok bool) {
 		return nil, false
 	}
 	want := version + 1
-	seen := make(map[int]struct{}, len(t.rowUpdateLog))
-	for _, delta := range t.rowUpdateLog {
+	start := sort.Search(len(t.rowUpdateLog), func(i int) bool { return t.rowUpdateLog[i].structVersion >= want })
+	seen := make(map[int]struct{}, len(t.rowUpdateLog)-start)
+	for _, delta := range t.rowUpdateLog[start:] {
 		if delta.structVersion < want {
 			continue
 		}
