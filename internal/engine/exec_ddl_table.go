@@ -16,8 +16,11 @@ func executeCreateTable(env ExecEnv, s *CreateTable) (*ResultSet, error) {
 			return nil, nil
 		}
 	}
-	if s.VirtualTable && s.Using == "fts" {
-		return executeCreateFTSTable(env, s)
+	if s.VirtualTable {
+		if s.Using == "fts" {
+			return executeCreateFTSTable(env, s)
+		}
+		return executeCreateSpecializedTable(env, s)
 	}
 	if s.AsSelect == nil {
 		return nil, env.db.Put(env.tenant, storage.NewTable(s.Name, s.Cols, s.IsTemp))

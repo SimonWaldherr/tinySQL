@@ -42,3 +42,29 @@ func normalizeForJSON(v any) any {
 func JSONMarshal(v any) ([]byte, error) {
 	return json.Marshal(normalizeForJSON(v))
 }
+
+// normalizeJSONNumbers preserves the usual float64 representation outside
+// schema-directed integer cells when a table decoder uses UseNumber.
+func normalizeJSONNumbers(v any) (any, error) {
+	switch x := v.(type) {
+	case json.Number:
+		return x.Float64()
+	case []any:
+		for i := range x {
+			value, err := normalizeJSONNumbers(x[i])
+			if err != nil {
+				return nil, err
+			}
+			x[i] = value
+		}
+	case map[string]any:
+		for k, old := range x {
+			value, err := normalizeJSONNumbers(old)
+			if err != nil {
+				return nil, err
+			}
+			x[k] = value
+		}
+	}
+	return v, nil
+}

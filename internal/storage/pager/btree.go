@@ -861,16 +861,20 @@ func (bt *BTree) readOverflow(headID PageID, totalSize uint32) ([]byte, error) {
 // a non-adjacent successor simply returns to the ordinary pager path.
 func (bt *BTree) readContiguousOverflowTail(pid PageID, targetSize int, result *[]byte) (PageID, error) {
 	capacity := OverflowCapacity(bt.pager.pageSize)
+	// One query-local buffer serves every batch. No global pool retains large
+	// buffers after a cold BLOB read, and concurrent readers never share it.
+	var scratch []byte
 	for pid != InvalidPageID && len(*result) < targetSize {
 		remainingPages := (targetSize - len(*result) + capacity - 1) / capacity
 		batchPages := min(remainingPages, overflowReadBatchPages)
-		buf, err := bt.pager.readContiguousPagesRaw(pid, batchPages)
+		buf, err := bt.pager.readContiguousPagesRaw(pid, batchPages, scratch)
 		if err != nil {
 			// The physical read can reach EOF when a logically valid chain
 			// jumps elsewhere. Revert to the established one-page path, which
 			// remains the correctness fallback for every non-contiguous case.
 			return pid, nil
 		}
+		scratch = buf
 		batchStart := pid
 		for index := 0; index < batchPages; index++ {
 			pageID := PageID(uint64(batchStart) + uint64(index))

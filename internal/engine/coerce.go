@@ -82,6 +82,32 @@ func coerceColumnValue(v any, col storage.Column) (any, error) {
 	if v == nil {
 		return nil, nil
 	}
+	if col.StrictJSON {
+		var data []byte
+		switch value := v.(type) {
+		case string:
+			data = []byte(value)
+		case []byte:
+			data = value
+		default:
+			var err error
+			data, err = json.Marshal(value)
+			if err != nil {
+				return nil, fmt.Errorf("invalid JSON document: %w", err)
+			}
+		}
+		var decoded any
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			return nil, fmt.Errorf("invalid JSON document: %w", err)
+		}
+		switch decoded.(type) {
+		case map[string]any, []any:
+			return decoded, nil
+		default:
+			return nil, fmt.Errorf("JSON document must be an object or array")
+		}
+	}
+
 	switch col.Affinity {
 	case storage.AffinityInteger:
 		return coerceSQLiteInteger(v)

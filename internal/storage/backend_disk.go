@@ -3,6 +3,7 @@ package storage
 import (
 	"bytes"
 	"compress/gzip"
+	"encoding/base64"
 	"encoding/gob"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"reflect"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -709,8 +711,43 @@ func (b *DiskBackend) readTableFile(path string) (*Table, error) {
 
 	var dt diskTable
 	if b.format == diskFormatJSON {
-		if err := json.NewDecoder(r).Decode(&dt); err != nil {
+		decoder := json.NewDecoder(r)
+		decoder.UseNumber()
+		if err := decoder.Decode(&dt); err != nil {
 			return nil, err
+		}
+
+		// encoding/json represents []byte as base64 strings inside interface
+		// cells. Restore native BLOBs using schema information, while leaving
+		// SQLite-affinity columns (which may store literal strings) alone.
+		for _, row := range dt.Rows {
+			for i, col := range dt.Cols {
+				if i < len(row) {
+					if number, ok := row[i].(json.Number); ok && col.Type == IntType && col.Affinity == AffinityDefault {
+						value, err := strconv.Atoi(string(number))
+						if err != nil {
+							return nil, fmt.Errorf("decode INT column %q: %w", col.Name, err)
+						}
+						row[i] = value
+					} else {
+						value, err := normalizeJSONNumbers(row[i])
+						if err != nil {
+							return nil, fmt.Errorf("decode column %q: %w", col.Name, err)
+						}
+						row[i] = value
+					}
+				}
+				if i >= len(row) || col.Type != BlobType || col.Affinity != AffinityDefault {
+					continue
+				}
+				if encoded, ok := row[i].(string); ok {
+					decoded, err := base64.StdEncoding.DecodeString(encoded)
+					if err != nil {
+						return nil, fmt.Errorf("decode BLOB column %q: %w", col.Name, err)
+					}
+					row[i] = decoded
+				}
+			}
 		}
 	} else {
 		if err := gob.NewDecoder(r).Decode(&dt); err != nil {

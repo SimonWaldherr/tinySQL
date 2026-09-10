@@ -20,6 +20,7 @@ type diskColumn struct {
 	Name         string
 	Type         ColType
 	DeclaredType string
+	StrictJSON   bool
 	Affinity     SQLiteAffinity
 	NotNull      bool
 	HasDefault   bool

@@ -536,6 +536,20 @@ func (db *DB) PagedIndexMetadata(tenant, table string) (*Table, bool, error) {
 	if !ok {
 		return nil, false, nil
 	}
+	// A compatibility table may contain SQL mutations not yet flushed to
+	// pager roots. Use that authoritative table instead of stale disk rows.
+	db.mu.RLock()
+	var cached *Table
+	if td := db.getTenantRO(tenant); td != nil {
+		cached = td.tables[strings.ToLower(table)]
+	}
+	db.mu.RUnlock()
+	if cached != nil {
+		return nil, false, nil
+	}
+	if _, found := backend.pool.Get(strings.ToLower(tenant), strings.ToLower(table)); found {
+		return nil, false, nil
+	}
 	t, err := backend.IndexMetadata(tenant, table)
 	if err != nil {
 		return nil, false, err

@@ -105,6 +105,8 @@ func columnsToCatalog(cols []ColumnInfo) []CatalogColumn {
 	for i, c := range cols {
 		cc := CatalogColumn{
 			Name:       c.Name,
+			NotNull:    c.NotNull,
+			StrictJSON: c.StrictJSON,
 			Type:       c.Type,
 			Constraint: c.Constraint,
 			PtrTable:   c.PointerTable,
@@ -123,6 +125,8 @@ func catalogToColumns(cats []CatalogColumn) []ColumnInfo {
 	for i, cc := range cats {
 		out[i] = ColumnInfo{
 			Name:         cc.Name,
+			NotNull:      cc.NotNull,
+			StrictJSON:   cc.StrictJSON,
 			Type:         cc.Type,
 			Constraint:   cc.Constraint,
 			FKTable:      cc.FKTable,
@@ -142,6 +146,8 @@ type ColumnInfo struct {
 	FKTable      string
 	FKColumn     string
 	PointerTable string
+	NotNull      bool
+	StrictJSON   bool
 }
 
 // ── Table I/O ─────────────────────────────────────────────────────────────

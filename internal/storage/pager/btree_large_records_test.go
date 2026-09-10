@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"testing"
 )
@@ -196,7 +197,7 @@ func TestBTreeColdContiguousOverflowLeavesTailUncached(t *testing.T) {
 	}
 	key := []byte("large-contiguous-value")
 	capacity := OverflowCapacity(DefaultPageSize)
-	value := make([]byte, capacity*40+137)
+	value := make([]byte, capacity*140+137)
 	for index := range value {
 		value[index] = byte(index * 31)
 	}
@@ -223,7 +224,15 @@ func TestBTreeColdContiguousOverflowLeavesTailUncached(t *testing.T) {
 	}
 	defer reader.Close()
 	readTree := NewBTree(reader, root)
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
 	got, found, err := readTree.Get(key)
+	runtime.ReadMemStats(&after)
+	// A query owns the output plus one bounded batch buffer, not another
+	// output-sized sum of scratch allocations across all overflow batches.
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > uint64(len(value)*3/2+65536) {
+		t.Fatalf("cold overflow allocated %d bytes for %d-byte value", allocated, len(value))
+	}
 	if err != nil || !found {
 		t.Fatalf("cold get: found=%v err=%v", found, err)
 	}

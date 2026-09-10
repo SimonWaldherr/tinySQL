@@ -52,6 +52,8 @@ type IndexEntry struct {
 
 // CatalogColumn describes a column in the system catalog.
 type CatalogColumn struct {
+	NotNull    bool   `json:"not_null,omitempty"`
+	StrictJSON bool   `json:"strict_json,omitempty"`
 	Name       string `json:"name"`
 	Type       int    `json:"type"`       // ColType as int
 	Constraint int    `json:"constraint"` // ConstraintType as int

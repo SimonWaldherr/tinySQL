@@ -294,6 +294,9 @@ type Column struct {
 	// or DOUBLE PRECISION). It is intentionally metadata; the physical value
 	// representation remains ColType plus SQLiteAffinity.
 	DeclaredType string
+	// StrictJSON requires a JSON object or array and stores an owned decoded value.
+	// Used by the document table profile; ordinary JSON columns retain their semantics.
+	StrictJSON bool
 	// Affinity is populated for SQLite-style declarations. AffinityDefault
 	// means this column was declared using a native tinySQL type.
 	Affinity SQLiteAffinity

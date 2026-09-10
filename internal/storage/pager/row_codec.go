@@ -2,6 +2,7 @@ package pager
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"math"
 )
@@ -48,6 +49,7 @@ const (
 	tagVecF64     byte = 0x06
 	tagLongString byte = 0x07
 	tagLongBytes  byte = 0x08
+	tagJSON       byte = 0x09
 )
 
 // MaxValueBytes is the defensive decoder bound for one variable-length row
@@ -122,6 +124,17 @@ func MarshalRow(row []any, buf []byte) []byte {
 				binary.LittleEndian.PutUint64(e[:], math.Float64bits(f))
 				buf = append(buf, e[:]...)
 			}
+		case map[string]any, []any:
+			data, err := json.Marshal(val)
+			if err != nil {
+				buf = appendTaggedString(buf, fmt.Sprint(val))
+				continue
+			}
+			buf = append(buf, tagJSON)
+			var size [4]byte
+			binary.LittleEndian.PutUint32(size[:], uint32(len(data)))
+			buf = append(buf, size[:]...)
+			buf = append(buf, data...)
 		default:
 			// Fallback: store as string representation.
 			buf = appendTaggedString(buf, fmt.Sprint(val))
@@ -235,7 +248,7 @@ func unmarshalRow(data []byte, copyBytes bool) ([]any, error) {
 				off += 8
 			}
 			row[i] = vec
-		case tagLongString:
+		case tagLongString, tagJSON:
 			if off+4 > len(data) {
 				return nil, fmt.Errorf("truncated long string len at column %d", i)
 			}
@@ -244,7 +257,13 @@ func unmarshalRow(data []byte, copyBytes bool) ([]any, error) {
 			if slen < 0 || slen > MaxValueBytes || off+slen > len(data) {
 				return nil, fmt.Errorf("truncated long string data at column %d", i)
 			}
-			row[i] = string(data[off : off+slen])
+			if tag == tagJSON {
+				if err := json.Unmarshal(data[off:off+slen], &row[i]); err != nil {
+					return nil, fmt.Errorf("invalid JSON at column %d: %w", i, err)
+				}
+			} else {
+				row[i] = string(data[off : off+slen])
+			}
 			off += slen
 		case tagLongBytes:
 			if off+4 > len(data) {
@@ -355,7 +374,7 @@ func unmarshalRowBytesColumn(data []byte, column int, copyBytes bool) ([]byte, e
 				return nil, fmt.Errorf("truncated vector data at column %d", i)
 			}
 			off += length * 8
-		case tagLongString, tagLongBytes:
+		case tagLongString, tagLongBytes, tagJSON:
 			if off+4 > len(data) {
 				return nil, fmt.Errorf("truncated long value len at column %d", i)
 			}
@@ -467,7 +486,7 @@ func unmarshalRowColumn(data []byte, column int, copyBytes bool) (any, error) {
 				return vector, nil
 			}
 			off += n * 8
-		case tagLongString, tagLongBytes:
+		case tagLongString, tagLongBytes, tagJSON:
 			if off+4 > len(data) {
 				return nil, fmt.Errorf("truncated long value len at column %d", i)
 			}
@@ -479,6 +498,13 @@ func unmarshalRowColumn(data []byte, column int, copyBytes bool) (any, error) {
 			payload := data[off : off+length]
 			off += length
 			if want {
+				if tag == tagJSON {
+					var value any
+					if err := json.Unmarshal(payload, &value); err != nil {
+						return nil, err
+					}
+					return value, nil
+				}
 				if tag == tagLongString {
 					return string(payload), nil
 				}

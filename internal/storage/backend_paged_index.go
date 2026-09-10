@@ -557,6 +557,8 @@ func storageColumnsToPager(cols []Column) []pager.ColumnInfo {
 	for i, col := range cols {
 		out[i] = pager.ColumnInfo{
 			Name:         col.Name,
+			NotNull:      col.NotNull,
+			StrictJSON:   col.StrictJSON,
 			Type:         int(col.Type),
 			Constraint:   int(col.Constraint),
 			PointerTable: col.PointerTable,
@@ -574,6 +576,8 @@ func pagerColumnsToStorage(cols []pager.ColumnInfo) []Column {
 	for i, col := range cols {
 		out[i] = Column{
 			Name:         col.Name,
+			NotNull:      col.NotNull,
+			StrictJSON:   col.StrictJSON,
 			Type:         ColType(col.Type),
 			Constraint:   ConstraintType(col.Constraint),
 			PointerTable: col.PointerTable,
@@ -590,6 +594,8 @@ func pagerCatalogColumnsToStorage(cols []pager.CatalogColumn) []Column {
 	for i, col := range cols {
 		out[i] = Column{
 			Name:         col.Name,
+			NotNull:      col.NotNull,
+			StrictJSON:   col.StrictJSON,
 			Type:         ColType(col.Type),
 			Constraint:   ConstraintType(col.Constraint),
 			PointerTable: col.PtrTable,

@@ -22,30 +22,15 @@ type IndexEntry struct {
 // alongside table rows so GOB snapshots, disk and hybrid backends preserve the
 // index itself, not merely CREATE INDEX catalog metadata.
 //
-// Entries is the GOB/JSON wire format and nothing else: it is the byte-
-// identical, backward-compatible on-disk shape older saved databases already
-// use. fast is the live, runtime-only backing structure -- a skip list (see
-// skiplist.go) that gives every insert/lookup/delete/range-scan O(log n)
-// expected-case cost instead of Entries' O(n) sorted-slice insert. Being
-// unexported, fast is automatically skipped by gob, so this costs zero wire
-// format changes.
+// Entries is the sorted, backward-compatible GOB/JSON representation. Before
+// the runtime skip list (fast) exists, point lookups binary-search Entries.
+// Mutations and range access hydrate fast lazily. Once fast exists, Entries
+// may be stale and only materialize may refresh it at a persistence boundary.
+// The cold-read optimization adds no file-format change.
 //
-// Entries is therefore no longer kept in sync on every mutation -- doing so
-// would defeat the whole point of adding fast. It is only ever refreshed by
-// materialize, called immediately before this index crosses a persistence
-// boundary (GOB/JSON encode, or the paged-index backend's B+Tree writer).
-// Between one materialize and the next, Entries can be arbitrarily stale;
-// nothing except a persistence boundary is allowed to read it directly.
-//
-// mu guards exactly two operations, hydrate and materialize, which are the
-// only things introduced by fast that mutate a SecondaryIndex from what used
-// to be a read-only path: DB.Get and ordinary query execution take only
-// DB.mu's read lock (see db.go), so multiple SELECTs -- and multiple
-// concurrent checkpoints -- against the same index can run genuinely in
-// parallel. Every other operation (Insert/Remove/Get/Range on an
-// already-hydrated fast) takes no lock at all, matching this package's
-// existing convention that table mutations are already serialized by the
-// caller holding DB's write lock for the whole statement.
+// mu protects hydration, materialization and choosing the authoritative point
+// lookup representation. Table mutations still require the caller's DB content
+// write lock; concurrent readers hold its read lock.
 type SecondaryIndex struct {
 	Name    string
 	Columns []string
@@ -56,13 +41,8 @@ type SecondaryIndex struct {
 	fast *SkipList
 }
 
-// hydrate lazily builds fast from Entries the first time this index is
-// touched (read or written) since being loaded, freshly rebuilt, or
-// constructed. Every insert/lookup/delete/range-scan entry point calls this
-// first instead of requiring every construction/load call site to remember
-// to populate fast explicitly -- a nil check here is more robust against a
-// missed call site than mandatory explicit hydration everywhere a
-// *SecondaryIndex might come from.
+// hydrate builds the mutable/range-access structure from persisted Entries.
+// Point reads use lookup instead and avoid hydration while fast is nil.
 func (idx *SecondaryIndex) hydrate() *SkipList {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -472,7 +452,21 @@ func (t *Table) LookupSecondaryIndexPoint(idx *SecondaryIndex, values []any) ([]
 }
 
 func (idx *SecondaryIndex) lookup(key []byte) []int {
-	rowIDs, _ := idx.hydrate().Get(key)
+	idx.mu.Lock()
+	fast := idx.fast
+	if fast == nil {
+		// The persisted representation is already sorted. A cold point read
+		// needs only binary search, not an O(n) skip-list reconstruction.
+		i := sort.Search(len(idx.Entries), func(i int) bool { return bytes.Compare(idx.Entries[i].Key, key) >= 0 })
+		var rows []int
+		if i < len(idx.Entries) && bytes.Equal(idx.Entries[i].Key, key) {
+			rows = idx.Entries[i].RowIDs
+		}
+		idx.mu.Unlock()
+		return rows
+	}
+	idx.mu.Unlock()
+	rowIDs, _ := fast.Get(key)
 	return rowIDs
 }
 

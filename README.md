@@ -881,3 +881,18 @@ current SQL-focused inventory and runnable examples.
 tinySQL is primarily an educational and embeddable SQL engine. It aims to make
 the parser, planner, executor, storage backends, and practical extensions easy
 to inspect, test, and adapt.
+
+### Specialized table profiles
+
+Use `CREATE VIRTUAL TABLE cache USING keyvalue`, `USING document`, or
+`USING timeseries` for SQL-compatible schemas with key lookup or time-range
+indexes. The Go API is `CreateSpecializedTable`. See
+[specialized tables](docs/specialized-tables.md) for examples, storage compatibility
+and measured performance.
+
+### Reactive SELECTs and cold point reads
+
+`SubscribeSQL(ctx, db, tenant, query)` delivers an initial SELECT result and
+subsequent multiset deltas. Single-table filters and projections support
+incremental INSERT/UPDATE processing. Persisted point indexes also avoid runtime
+index reconstruction on first access. See [behavior, limits and measurements](docs/cold-start-reactive.md).

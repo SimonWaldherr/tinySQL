@@ -59,27 +59,9 @@ func tableToDiskRangeIndexed(tn string, t *Table, from, to int, includeIndexes b
 		dt.Cols[i] = diskColumn(c)
 	}
 	for i := from; i < to; i++ {
-		r := t.Rows[i]
-		row := make([]any, len(r))
-		for j, v := range r {
-			if v == nil {
-				row[j] = nil
-				continue
-			}
-			if t.Cols[j].Type == JsonType {
-				switch vv := v.(type) {
-				case string:
-					row[j] = vv
-				default:
-					b, _ := JSONMarshal(v)
-					row[j] = string(b)
-				}
-			} else {
-				row[j] = v
-			}
-		}
-		dt.Rows[i-from] = row
+		dt.Rows[i-from] = diskRowFromTable(t, t.Rows[i])
 	}
+
 	return dt
 }
 
@@ -130,6 +112,11 @@ func diskRowFromTable(t *Table, r []any) []any {
 			continue
 		}
 		if j < len(t.Cols) && t.Cols[j].Type == JsonType {
+			if t.Cols[j].StrictJSON {
+				b, _ := JSONMarshal(v)
+				row[j] = string(b)
+				continue
+			}
 			switch vv := v.(type) {
 			case string:
 				row[j] = vv

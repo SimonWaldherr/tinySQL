@@ -394,8 +394,9 @@ func (p *Pager) readPageRaw(id PageID) ([]byte, error) {
 // only for a cold, immutable BLOB tail, where the first normal page lookup has
 // already established cache affinity for a later warm lookup. The caller must
 // verify each page it actually consumes, because a linked chain can stop
-// before the end of the physical run.
-func (p *Pager) readContiguousPagesRaw(first PageID, count int) ([]byte, error) {
+// before the end of the physical run. scratch is caller-owned and can be reused
+// after consuming the returned bytes; the pager never retains it.
+func (p *Pager) readContiguousPagesRaw(first PageID, count int, scratch []byte) ([]byte, error) {
 	if count < 1 {
 		return nil, fmt.Errorf("contiguous page count must be positive")
 	}
@@ -409,7 +410,13 @@ func (p *Pager) readContiguousPagesRaw(first PageID, count int) ([]byte, error) 
 	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	buf := make([]byte, count*p.pageSize)
+	size := count * p.pageSize
+	buf := scratch
+	if cap(buf) < size {
+		buf = make([]byte, size)
+	} else {
+		buf = buf[:size]
+	}
 	off := int64(first) * int64(p.pageSize)
 	p.cacheMisses.Add(int64(count))
 	p.pageReads.Add(int64(count))
@@ -815,6 +822,7 @@ func (p *Pager) CacheStats() PagerCacheStats {
 		transientFrames += count
 	}
 	maxPages := p.pool.maxPages
+	transientPages := len(p.pool.transient)
 	p.pool.mu.Unlock()
 	return PagerCacheStats{
 		PageReads:       p.pageReads.Load(),
@@ -822,7 +830,7 @@ func (p *Pager) CacheStats() PagerCacheStats {
 		CacheMisses:     p.cacheMisses.Load(),
 		CachedPages:     cached,
 		PinnedPages:     pinned,
-		TransientPages:  len(p.pool.transient),
+		TransientPages:  transientPages,
 		TransientFrames: transientFrames,
 		MaxPages:        maxPages,
 	}
