@@ -193,3 +193,20 @@ This is a boundary-test microbenchmark, not an end-to-end spatial SQL speedup.
 `BenchmarkDisjointRingBoundaries` reproduces the case. Randomized differential
 tests compare the optimized predicate with the original orientation test, and
 existing GIS relation tests cover crossings, containment, holes, and boundaries.
+
+### Sparse spatial search windows
+
+`GEO_SEARCH` bounding-box and radius queries now choose between direct grid-cell
+lookups for small windows and scanning occupied cells for broad windows. The
+same candidate path serves spatial RAG prefilters. This avoids probing large
+empty rectangles in clustered datasets. Overflow geometries, deduplication,
+exact residual predicates, and GEO_SEARCH's final row ordering are preserved.
+The switch occurs when a window covers more than four times the occupied cell
+count, allowing for map iteration overhead.
+
+`BenchmarkSparseGridCandidates` isolates candidate selection in a synthetic
+128-by-128 grid with 128 occupied diagonal cells and one overflow row. On Apple
+M2 Max, broad-window selection fell from 105–107 microseconds to about 1.38
+microseconds; a small window remained around 64 nanoseconds. Allocation counts
+are unchanged. These timings exclude index construction, exact distance checks,
+and SQL result materialization; they are not whole-query speedups.

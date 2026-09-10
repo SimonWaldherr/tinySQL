@@ -326,9 +326,21 @@ func (idx *geoGridIndex) candidatesBBox(minLon, minLat, maxLon, maxLat float64) 
 		}
 	}
 	addRows(idx.overflow)
-	for cx := minCX; cx <= maxCX; cx++ {
-		for cy := minCY; cy <= maxCY; cy++ {
-			addRows(idx.cells[geoCellID{X: cx, Y: cy}])
+	// Broad windows over clustered data can cover many empty cells. Scan the
+	// occupied keys when that is cheaper than probing the entire rectangle.
+	// Keep direct lookup for selective windows; the exact residual and final
+	// row ordering remain the caller's responsibility on both paths.
+	if cellCount > int64(len(idx.cells))*4 {
+		for cell, rows := range idx.cells {
+			if cell.X >= minCX && cell.X <= maxCX && cell.Y >= minCY && cell.Y <= maxCY {
+				addRows(rows)
+			}
+		}
+	} else {
+		for cx := minCX; cx <= maxCX; cx++ {
+			for cy := minCY; cy <= maxCY; cy++ {
+				addRows(idx.cells[geoCellID{X: cx, Y: cy}])
+			}
 		}
 	}
 	if useBitmap {
