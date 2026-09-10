@@ -2,12 +2,14 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/robfig/cron/v3"
 )
 
@@ -16,44 +18,50 @@ import (
 
 // Scheduler manages scheduled job execution
 type Scheduler struct {
-	db          *DB
-	catalog     *CatalogManager
-	cron        *cron.Cron
-	mu          sync.RWMutex
-	running     map[string]*jobExecution // Track currently running jobs
-	cronEntries map[string]cron.EntryID
-	stopCh      chan struct{}
-	started     bool
-	wg          sync.WaitGroup
-	executor    JobExecutor // Interface for executing SQL
+	totalQueueWait, lastStartDelay, maxStartDelay time.Duration
+	db                                            *DB
+	catalog                                       *CatalogManager
+	cron                                          *cron.Cron
+	mu                                            sync.RWMutex
+	running                                       map[string]*jobExecution // Track currently running jobs
+	cronEntries                                   map[string]cron.EntryID
+	stopCh                                        chan struct{}
+	started                                       bool
+	wg                                            sync.WaitGroup
+	executor                                      JobExecutor // Interface for executing SQL
 
-	// sem bounds how many jobs execute their SQL concurrently. Per-job
-	// NoOverlap only dedups repeat runs of the *same* job; nothing else
-	// stopped many different enabled INTERVAL/CRON jobs whose schedules
-	// happened to coincide from all firing at once, each spawning a
-	// goroutine that immediately contends for DB's write lock. A job beyond
-	// the limit queues on this channel (a plain semaphore, acquired in
-	// executeJob's goroutine) instead of piling on immediately. Sized in
-	// NewScheduler; see SetMaxConcurrentJobs to change it.
-	sem chan struct{}
+	lifeMu                         sync.Mutex
+	active                         map[int64]*jobTask
+	queue                          []*jobTask
+	workers, maxWorkers, maxQueued int
+	stopped                        bool
+	instanceID                     string
+	rejected, retried, completed   uint64
 }
 
-// defaultMaxConcurrentJobs is the default width of Scheduler.sem.
 const defaultMaxConcurrentJobs = 8
 
-// SetMaxConcurrentJobs changes how many jobs may execute their SQL at once.
-// Replaces the semaphore outright, so it only affects jobs that acquire a
-// slot after this call -- safe to call before Start, or while running
-// (jobs already holding a slot on the old channel still release it there,
-// which is harmless since nothing reads that channel anymore). n <= 0 is
-// ignored.
+// SetMaxConcurrentJobs adjusts the worker limit. Existing executions finish
+// normally when the limit is lowered; newly queued work obeys the new limit.
 func (s *Scheduler) SetMaxConcurrentJobs(n int) {
 	if n <= 0 {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.sem = make(chan struct{}, n)
+	s.maxWorkers = n
+	s.launchQueuedLocked()
+}
+
+// SetMaxQueuedJobs bounds waiting jobs. Existing queued work is retained when
+// lowering the limit; new work is rejected until there is room. Zero disables waiting.
+func (s *Scheduler) SetMaxQueuedJobs(n int) {
+	if n < 0 {
+		return
+	}
+	s.mu.Lock()
+	s.maxQueued = n
+	s.mu.Unlock()
 }
 
 // JobExecutor interface allows the scheduler to execute SQL without circular dependencies
@@ -78,12 +86,15 @@ func NewScheduler(db *DB, executor JobExecutor) *Scheduler {
 		cronEntries: make(map[string]cron.EntryID),
 		stopCh:      make(chan struct{}),
 		executor:    executor,
-		sem:         make(chan struct{}, defaultMaxConcurrentJobs),
+		active:      make(map[int64]*jobTask),
+		maxWorkers:  defaultMaxConcurrentJobs, maxQueued: 256, instanceID: uuid.NewString(),
 	}
 }
 
 // Start begins the scheduler loop
 func (s *Scheduler) Start() error {
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -93,6 +104,11 @@ func (s *Scheduler) Start() error {
 	if s.stopCh == nil {
 		s.stopCh = make(chan struct{})
 	}
+
+	if s.stopped && s.workers > 0 {
+		return errors.New("scheduler is still stopping")
+	}
+	s.stopped = false
 
 	// Register all enabled jobs
 	jobs := s.catalog.ListEnabledJobs()
@@ -121,58 +137,34 @@ func (s *Scheduler) Start() error {
 
 // Stop halts the scheduler and cancels all running jobs
 func (s *Scheduler) Stop() {
-	wasStarted, stopCh := func() (bool, chan struct{}) {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		if !s.started {
-			return false, nil
-		}
-		s.started = false
-		ch := s.stopCh
-		s.stopCh = nil
-		return true, ch
-	}()
-	if !wasStarted {
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
 		return
 	}
-	if stopCh != nil {
-		close(stopCh)
+	s.stopped = true
+	s.started = false
+	if s.stopCh != nil {
+		close(s.stopCh)
+		s.stopCh = nil
 	}
-
-	// Stop cron
-	ctx := s.cron.Stop()
-	<-ctx.Done()
-
-	s.mu.RLock()
-	running := make(map[string]*jobExecution, len(s.running))
-	for name, exec := range s.running {
-		running[name] = exec
+	for _, task := range s.active {
+		task.exec.cancelFn()
 	}
-	s.mu.RUnlock()
-
-	// Cancel all running jobs
-	for name, exec := range running {
-		log.Printf("Canceling running job %q", name)
-		exec.cancelFn()
-	}
-
-	// s.wg.Wait() has no timeout of its own: a job that ignores context
-	// cancellation (e.g. blocked on I/O the job's SQL doesn't check ctx
-	// inside) would hang here forever, and since Stop is called from
-	// DB.Close, that means a stuck job could hang the whole shutdown path
-	// indefinitely. Bound the wait so shutdown always completes.
-	waitDone := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(waitDone)
-	}()
+	// Retain queued jobs for workers to record cancellation without executing SQL.
+	s.mu.Unlock()
+	<-s.cron.Stop().Done()
+	done := make(chan struct{})
+	go func() { s.wg.Wait(); close(done) }()
+	timer := time.NewTimer(schedulerShutdownTimeout)
+	defer timer.Stop()
 	select {
-	case <-waitDone:
-	case <-time.After(schedulerShutdownTimeout):
-		log.Printf("job scheduler: %d job(s) did not finish within %s of Stop being called; continuing shutdown anyway", len(running), schedulerShutdownTimeout)
+	case <-done:
+	case <-timer.C:
+		log.Print("job scheduler shutdown timed out")
 	}
-
-	log.Println("Job scheduler stopped")
 }
 
 // schedulerShutdownTimeout bounds how long Stop waits for already-running
@@ -187,14 +179,15 @@ func (s *Scheduler) scheduleJob(job *CatalogJob) error {
 	case "CRON":
 		return s.scheduleCronJob(job)
 	case "INTERVAL":
-		// Handled by interval scheduler
 		s.calculateNextRun(job)
+		s.catalog.setJobNextRun(job.Name, job.NextRunAt)
 		return nil
 	case "ONCE":
 		// Handled by interval scheduler
 		if job.RunAt != nil {
 			job.NextRunAt = job.RunAt
 		}
+		s.catalog.setJobNextRun(job.Name, job.NextRunAt)
 		return nil
 	default:
 		return fmt.Errorf("unknown schedule type: %s", job.ScheduleType)
@@ -213,6 +206,7 @@ func (s *Scheduler) scheduleCronJob(job *CatalogJob) error {
 	}
 	nextRun := schedule.Next(time.Now())
 	job.NextRunAt = &nextRun
+	s.catalog.setJobNextRun(job.Name, job.NextRunAt)
 	// Register the already parsed schedule, including its timezone. AddFunc
 	// would parse again using the scheduler's default location (UTC).
 	s.cronEntries[job.Name] = s.cron.Schedule(schedule, cron.FuncJob(func() {
@@ -280,7 +274,14 @@ func (s *Scheduler) checkIntervalJobs(now time.Time) {
 		}
 
 		if now.After(*job.NextRunAt) || now.Equal(*job.NextRunAt) {
-			s.executeJob(job)
+			if _, err := s.SubmitJob(job); err != nil {
+				continue
+			}
+
+			if job.ScheduleType == "INTERVAL" {
+				s.calculateNextRun(job)
+				s.catalog.setJobNextRun(job.Name, job.NextRunAt)
+			}
 
 			// For ONCE jobs, disable after execution
 			if job.ScheduleType == "ONCE" {
@@ -293,133 +294,10 @@ func (s *Scheduler) checkIntervalJobs(now time.Time) {
 	}
 }
 
-// executeJob runs a job's SQL with proper concurrency control
+// executeJob is the fire-and-forget scheduler entry point. Overload is visible
+// in Stats and history; SubmitJob exposes the rejection directly to callers.
 func (s *Scheduler) executeJob(job *CatalogJob) {
-	// Create execution context with timeout
-	timeout := time.Duration(job.MaxRuntimeMs) * time.Millisecond
-	if timeout == 0 {
-		timeout = 5 * time.Minute // Default 5 minutes
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	exec := &jobExecution{
-		startTime: time.Now(),
-		cancelFn:  cancel,
-	}
-
-	// Check no_overlap flag and register as running atomically under one lock.
-	skip := func() bool {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		if job.NoOverlap {
-			if _, isRunning := s.running[job.Name]; isRunning {
-				return true
-			}
-		}
-		s.running[job.Name] = exec
-		s.wg.Add(1)
-		return false
-	}()
-
-	if skip {
-		cancel()
-		log.Printf("Job %q already running, skipping (no_overlap=true)", job.Name)
-		now := time.Now()
-		_ = s.catalog.AddJobHistory(&CatalogJobHistory{
-			JobName:    job.Name,
-			StartedAt:  now,
-			FinishedAt: now,
-			Status:     "SKIPPED",
-		})
-		return
-	}
-
-	// Execute job in goroutine
-	go func() {
-		defer s.wg.Done()
-		status := "SUCCEEDED"
-		errMsg := ""
-		defer func() {
-			ctxErr := ctx.Err()
-			cancel()
-			s.mu.Lock()
-			delete(s.running, job.Name)
-			s.mu.Unlock()
-
-			// Update last_run_at and calculate next_run_at
-			lastRun := exec.startTime
-			s.calculateNextRun(job)
-			if err := s.catalog.UpdateJobRuntimePtr(job.Name, lastRun, job.NextRunAt); err != nil {
-				log.Printf("Failed to update job runtime for %q: %v", job.Name, err)
-			}
-			finishedAt := time.Now()
-			if ctxErr != nil && status == "SUCCEEDED" {
-				status = "CANCELED"
-				errMsg = ctxErr.Error()
-			}
-			if err := s.catalog.AddJobHistory(&CatalogJobHistory{
-				JobName:      job.Name,
-				StartedAt:    exec.startTime,
-				FinishedAt:   finishedAt,
-				DurationMs:   finishedAt.Sub(exec.startTime).Milliseconds(),
-				Status:       status,
-				ErrorMessage: errMsg,
-			}); err != nil {
-				log.Printf("Failed to add job history for %q: %v", job.Name, err)
-			}
-		}()
-
-		// Recover from a panic inside job execution (e.g. a parser bug
-		// triggered by the job's own stored SQL text) so one bad job can't
-		// take down the whole process; mirrors executeStatement's
-		// panic-to-error conversion in internal/engine/exec_statement.go,
-		// but records the panic as a FAILED job run instead of returning it
-		// as an error to a caller.
-		defer func() {
-			if r := recover(); r != nil {
-				status = "FAILED"
-				errMsg = fmt.Sprintf("panic executing job: %v", r)
-				log.Printf("Job %q panicked: %v", job.Name, r)
-			}
-		}()
-
-		// Wait for a concurrency slot, honoring the job's own timeout/
-		// Stop-triggered cancellation instead of blocking forever on it. A
-		// job that never gets a slot returns here with status still
-		// "SUCCEEDED"; the history defer above already converts that to
-		// "CANCELED" whenever ctx.Err() != nil, so no separate handling is
-		// needed for "canceled while queued" vs. "canceled while running".
-		//
-		// Read s.sem once into a local so this goroutine's acquire and its
-		// deferred release always target the same channel even if
-		// SetMaxConcurrentJobs swaps s.sem while this job is queued or
-		// running.
-		s.mu.RLock()
-		sem := s.sem
-		s.mu.RUnlock()
-		select {
-		case sem <- struct{}{}:
-			defer func() { <-sem }()
-		case <-ctx.Done():
-			return
-		}
-
-		log.Printf("Executing job %q", job.Name)
-
-		// Execute SQL through executor interface
-		if s.executor != nil {
-			if _, err := s.executor.ExecuteSQL(ctx, job.SQLText); err != nil {
-				status = "FAILED"
-				errMsg = err.Error()
-				log.Printf("Job %q failed: %v", job.Name, err)
-			} else {
-				log.Printf("Job %q completed successfully", job.Name)
-			}
-		} else {
-			status = "SKIPPED"
-			errMsg = "no executor configured"
-			log.Printf("Job %q skipped (no executor configured)", job.Name)
-		}
-	}()
+	_, _ = s.SubmitJob(job)
 }
 
 // calculateNextRun computes the next execution time based on schedule type
@@ -492,7 +370,8 @@ func (s *Scheduler) UpsertJob(job *CatalogJob) error {
 	if !job.Enabled {
 		return nil
 	}
-	return s.scheduleJob(job)
+	copy := cloneScheduledJob(job)
+	return s.scheduleJob(&copy)
 }
 
 // RemoveJob unregisters a job and stops its execution
@@ -502,10 +381,13 @@ func (s *Scheduler) RemoveJob(name string) error {
 
 	s.unscheduleJobLocked(name)
 
-	// Cancel if running
+	for _, task := range s.active {
+		if task.job.Name == name {
+			task.exec.cancelFn()
+		}
+	}
 	if exec, ok := s.running[name]; ok {
 		exec.cancelFn()
-		delete(s.running, name)
 	}
 
 	return s.catalog.DeleteJob(name)

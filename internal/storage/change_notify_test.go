@@ -42,3 +42,43 @@ func TestChangeListenerLifecycle(t *testing.T) {
 		t.Fatal("closed DB accepted listener")
 	}
 }
+
+func TestScopedChangeWatchRoutingAndCoalescing(t *testing.T) {
+	db := NewDB()
+	defer db.Close()
+	a, err := db.WatchTableChanges([]TableRef{{Tenant: "one", Table: "items"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := db.WatchTableChanges([]TableRef{{Tenant: "two", Table: "items"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	for i := 0; i < 2; i++ {
+		db.LockContentForWrite()
+		db.UnlockContentForWriteTables([]TableRef{{Tenant: "one", Table: "ITEMS"}})
+	}
+	if got := a.Stats(); got.Notifications != 2 || got.Coalesced != 1 {
+		t.Fatal(got)
+	}
+	if got := b.Stats(); got.Notifications != 0 {
+		t.Fatal(got)
+	}
+	<-a.C
+	a.SetTables([]TableRef{{Tenant: "two", Table: "items"}})
+	db.LockContentForWrite()
+	db.UnlockContentForWriteTables([]TableRef{{Tenant: "one", Table: "items"}})
+	if got := a.Stats(); got.Notifications != 2 {
+		t.Fatal(got)
+	}
+	db.LockContentForWrite()
+	db.UnlockContentForWrite()
+	if got := a.Stats(); got.Broadcasts != 1 || got.Notifications != 3 {
+		t.Fatal(got)
+	}
+	if got := b.Stats(); got.Broadcasts != 1 || got.Notifications != 1 {
+		t.Fatal(got)
+	}
+}

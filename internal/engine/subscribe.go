@@ -8,6 +8,7 @@ import (
 	"slices"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -30,11 +31,14 @@ type QueryChange struct {
 // QuerySubscription owns one worker and a one-element output queue. Close or
 // cancel the context when done. Errors terminate Changes and are available in Err.
 type QuerySubscription struct {
-	Changes <-chan QueryChange
-	cancel  context.CancelFunc
-	done    chan struct{}
-	mu      sync.Mutex
-	err     error
+	Changes   <-chan QueryChange
+	cancel    context.CancelFunc
+	done      chan struct{}
+	mu        sync.Mutex
+	err       error
+	state     *querySubscriptionState
+	delivered atomic.Uint64
+	sendNanos atomic.Int64
 }
 
 func (s *QuerySubscription) Close()     { s.cancel(); <-s.done }
@@ -45,6 +49,21 @@ func (s *QuerySubscription) Err() error { s.mu.Lock(); defer s.mu.Unlock(); retu
 // incrementally; other queries are re-executed on database change notifications.
 // ORDER BY affects LIMIT/OFFSET membership, but deltas have no ordering contract.
 func SubscribeSQL(ctx context.Context, db *storage.DB, tenant, query string) (*QuerySubscription, error) {
+	return SubscribeSQLWithOptions(ctx, db, tenant, query, SubscriptionOptions{})
+}
+
+// SubscriptionOptions bounds retained/published results, not executor working
+// memory. Zero leaves a limit disabled. Bytes count JSON-encoded row payloads.
+type SubscriptionOptions struct {
+	MaxResultRows  int
+	MaxResultBytes int64
+}
+
+func SubscribeSQLWithOptions(ctx context.Context, db *storage.DB, tenant, query string, opts SubscriptionOptions) (*QuerySubscription, error) {
+	if opts.MaxResultRows < 0 || opts.MaxResultBytes < 0 {
+		return nil, fmt.Errorf("subscription limits must not be negative")
+	}
+
 	if db == nil {
 		return nil, fmt.Errorf("database is required")
 	}
@@ -56,12 +75,13 @@ func SubscribeSQL(ctx context.Context, db *storage.DB, tenant, query string) (*Q
 	if !ok {
 		return nil, fmt.Errorf("subscription requires a SELECT")
 	}
-	wake, unregister, err := db.WatchChanges()
+	watch, err := db.WatchTableChanges(nil)
 	if err != nil {
 		return nil, err
 	}
+	wake, unregister := watch.C, watch.Close
 	ctx, cancel := context.WithCancel(ctx)
-	state := &querySubscriptionState{db: db, tenant: tenant, query: sel, rows: make(map[int]Row)}
+	state := &querySubscriptionState{db: db, tenant: tenant, query: sel, rows: make(map[int]Row), watch: watch, options: opts}
 	initial, err := state.refresh(ctx)
 	if err != nil {
 		unregister()
@@ -70,7 +90,7 @@ func SubscribeSQL(ctx context.Context, db *storage.DB, tenant, query string) (*Q
 	}
 	output := make(chan QueryChange, 1)
 	output <- *initial
-	sub := &QuerySubscription{Changes: output, cancel: cancel, done: make(chan struct{})}
+	sub := &QuerySubscription{Changes: output, cancel: cancel, done: make(chan struct{}), state: state}
 	go func() {
 		defer close(sub.done)
 		defer close(output)
@@ -99,10 +119,13 @@ func SubscribeSQL(ctx context.Context, db *storage.DB, tenant, query string) (*Q
 			if change == nil {
 				continue
 			}
+			sendStart := time.Now()
 		send:
 			for {
 				select {
 				case output <- *change:
+					sub.delivered.Add(1)
+					sub.sendNanos.Add(time.Since(sendStart).Nanoseconds())
 					break send
 				case <-ctx.Done():
 					return
@@ -156,9 +179,29 @@ type querySubscriptionState struct {
 	full                       bool
 	fullInitialized            bool
 	snapshot                   []Row
+	watch                      *storage.ChangeWatch
+	options                    SubscriptionOptions
+	scopeInitialized           bool
+	scopeGeneration            uint64
+	refreshes                  atomic.Uint64
+	fullRefreshes              atomic.Uint64
+	refreshNanos               atomic.Int64
 }
 
 func (s *querySubscriptionState) refresh(ctx context.Context) (result *QueryChange, err error) {
+	start := time.Now()
+	s.refreshes.Add(1)
+	defer func() { s.refreshNanos.Add(time.Since(start).Nanoseconds()) }()
+	defer func() {
+		if err == nil {
+			err = s.checkBudget()
+		}
+		if err != nil {
+			result = nil
+			s.rows = nil
+			s.snapshot = nil
+		}
+	}()
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			result = nil
@@ -172,6 +215,14 @@ func (s *querySubscriptionState) refresh(ctx context.Context) (result *QueryChan
 	}
 	if err := checkPermission(ctx, s.db, s.query); err != nil {
 		return nil, err
+	}
+	if s.watch != nil {
+		generation := s.watch.Stats().Broadcasts
+		if !s.scopeInitialized || generation != s.scopeGeneration {
+			s.watch.SetTables(subscriptionTableDependencies(s.db, s.tenant, s.query))
+			s.scopeInitialized = true
+			s.scopeGeneration = generation
+		}
 	}
 	if s.full || !subscriptionIncrementalEligible(s.query) {
 		s.full = true

@@ -284,6 +284,8 @@ type CatalogFunction struct {
 // scheduling options (CRON, interval, or single-run) and execution
 // metadata for bookkeeping and scheduling decisions.
 type CatalogJob struct {
+	MaxAttempts  int   // Total attempts per run; zero means one.
+	RetryDelayMs int64 // Initial retry delay; zero means 100 ms.
 	Name         string
 	SQLText      string
 	ScheduleType string     // 'CRON', 'INTERVAL', 'ONCE'
@@ -303,13 +305,18 @@ type CatalogJob struct {
 
 // CatalogJobHistory records one completed, failed, skipped, or canceled job run.
 type CatalogJobHistory struct {
-	RunID        int64
-	JobName      string
-	StartedAt    time.Time
-	FinishedAt   time.Time
-	DurationMs   int64
-	Status       string // 'SUCCEEDED', 'FAILED', 'SKIPPED', 'CANCELED'
-	ErrorMessage string
+	IdempotencyKey string
+	Attempts       int
+	QueuedAt       time.Time
+	QueueWaitMs    int64
+	StartDelayMs   int64
+	RunID          int64
+	JobName        string
+	StartedAt      time.Time
+	FinishedAt     time.Time
+	DurationMs     int64
+	Status         string // 'SUCCEEDED', 'FAILED', 'SKIPPED', 'CANCELED', 'REJECTED'
+	ErrorMessage   string
 }
 
 // ==================== Catalog Operations ====================
@@ -856,7 +863,8 @@ func (c *CatalogManager) RegisterJob(job *CatalogJob) error {
 		job.CreatedAt = time.Now()
 	}
 
-	c.jobs[job.Name] = job
+	copy := cloneScheduledJob(job)
+	c.jobs[job.Name] = &copy
 	return nil
 }
 
@@ -869,7 +877,8 @@ func (c *CatalogManager) GetJob(name string) (*CatalogJob, error) {
 	if !ok {
 		return nil, fmt.Errorf("job %q not found", name)
 	}
-	return job, nil
+	copy := cloneScheduledJob(job)
+	return &copy, nil
 }
 
 // ListJobs returns a slice containing all registered jobs.
@@ -879,7 +888,8 @@ func (c *CatalogManager) ListJobs() []*CatalogJob {
 
 	jobs := make([]*CatalogJob, 0, len(c.jobs))
 	for _, job := range c.jobs {
-		jobs = append(jobs, job)
+		copy := cloneScheduledJob(job)
+		jobs = append(jobs, &copy)
 	}
 	return jobs
 }
@@ -892,7 +902,8 @@ func (c *CatalogManager) ListEnabledJobs() []*CatalogJob {
 	jobs := make([]*CatalogJob, 0)
 	for _, job := range c.jobs {
 		if job.Enabled {
-			jobs = append(jobs, job)
+			copy := cloneScheduledJob(job)
+			jobs = append(jobs, &copy)
 		}
 	}
 	return jobs
@@ -917,7 +928,12 @@ func (c *CatalogManager) UpdateJobRuntimePtr(name string, lastRun time.Time, nex
 	}
 
 	job.LastRunAt = &lastRun
-	job.NextRunAt = nextRun
+	if nextRun == nil {
+		job.NextRunAt = nil
+	} else {
+		copy := *nextRun
+		job.NextRunAt = &copy
+	}
 	job.UpdatedAt = time.Now()
 	return nil
 }
@@ -934,6 +950,15 @@ func (c *CatalogManager) DeleteJob(name string) error {
 
 	delete(c.jobs, name)
 	return nil
+}
+
+// ReserveJobRunID allocates a run identifier before execution starts.
+func (c *CatalogManager) ReserveJobRunID() int64 {
+	c.lockWrite()
+	defer c.unlockWrite()
+	id := c.nextRun
+	c.nextRun++
+	return id
 }
 
 // AddJobHistory appends a job execution history row and assigns a run id.

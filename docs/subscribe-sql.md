@@ -47,8 +47,9 @@ Simple physical-table filters and direct projections retain the incremental
 INSERT/UPDATE path. Deletions and expired update history require a full scan.
 `ScannedRows` counts evaluated candidate rows on this path.
 
-Other SELECTs run through the general executor on each coalesced database change
-notification. This includes changes to other tables or tenants. Their complete
+Other SELECTs run through the general executor on each relevant coalesced change
+notification. Known base-table dependencies are routed by tenant and table.
+Unclassified writes and dynamic query dependencies retain global notifications. Their complete
 results are compared as multisets; unchanged rows produce no event, and duplicate
 rows retain their multiplicity. This is full recomputation, not incremental
 aggregate or join maintenance. `ScannedRows` is **-1** on this path because the
@@ -71,3 +72,7 @@ block writers, and multiple commits can coalesce into one result change. A
 subscription observes committed state, not every intermediate event, and is not
 an audit log. Rollbacks do not publish uncommitted results. Cancel the context,
 call `Close()`, or close the database to stop the worker.
+
+See [asynchronous runtime](async-runtime.md) for result size limits, pressure
+metrics, bounded jobs, and the separate transactional event log with replay and
+acknowledgements.

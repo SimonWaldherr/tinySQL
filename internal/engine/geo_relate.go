@@ -138,6 +138,10 @@ func pointOnSegment(p, a, b geoPoint) bool {
 // exact (no epsilon), matching this file's existing exact-float-equality
 // convention (see geo_simplify.go's sameSimplifyCoordinate).
 func segmentsIntersect(p1, p2, p3, p4 geoPoint) bool {
+	// Disjoint axis-aligned bounds cannot intersect, including at endpoints.
+	if max(p1.Lon, p2.Lon) < min(p3.Lon, p4.Lon) || max(p3.Lon, p4.Lon) < min(p1.Lon, p2.Lon) || max(p1.Lat, p2.Lat) < min(p3.Lat, p4.Lat) || max(p3.Lat, p4.Lat) < min(p1.Lat, p2.Lat) {
+		return false
+	}
 	d1 := orientation(p3, p4, p1)
 	d2 := orientation(p3, p4, p2)
 	d3 := orientation(p1, p2, p3)
@@ -291,12 +295,8 @@ func geoLinesIntersectLines(aObj, bObj map[string]any) (bool, error) {
 	}
 	for _, la := range aLines {
 		for _, lb := range bLines {
-			for i := 0; i+1 < len(la); i++ {
-				for j := 0; j+1 < len(lb); j++ {
-					if segmentsIntersect(la[i], la[i+1], lb[j], lb[j+1]) {
-						return true, nil
-					}
-				}
+			if geoPathsIntersect(la, lb) {
+				return true, nil
 			}
 		}
 	}
@@ -320,29 +320,14 @@ func geoLinesIntersectPolygons(aObj, bObj map[string]any) (bool, error) {
 		return false, err
 	}
 	for _, ls := range lines {
-		crossed := false
-		for i := 0; i+1 < len(ls) && !crossed; i++ {
-			for _, poly := range mp.Polygons {
-				for _, ring := range poly.Rings {
-					for k := 0; k+1 < len(ring); k++ {
-						if segmentsIntersect(ls[i], ls[i+1], ring[k], ring[k+1]) {
-							crossed = true
-							break
-						}
-					}
-					if crossed {
-						break
-					}
-				}
-				if crossed {
-					break
+		for _, poly := range mp.Polygons {
+			for _, ring := range poly.Rings {
+				if geoPathsIntersect(ls, ring) {
+					return true, nil
 				}
 			}
 		}
-		if crossed {
-			return true, nil
-		}
-		if pointInMultiPolygon(ls[0], mp) {
+		if len(ls) > 0 && pointInMultiPolygon(ls[0], mp) {
 			return true, nil
 		}
 	}
@@ -404,15 +389,41 @@ func polygonsShareBoundary(pa, pb geoPolygon) bool {
 	return false
 }
 
-func ringsShareBoundary(ra, rb geoRing) bool {
-	for i := 0; i+1 < len(ra); i++ {
-		for j := 0; j+1 < len(rb); j++ {
-			if segmentsIntersect(ra[i], ra[i+1], rb[j], rb[j+1]) {
+func ringsShareBoundary(ra, rb geoRing) bool { return geoPathsIntersect(ra, rb) }
+
+// geoPathsIntersect rejects disjoint paths in O(n+m) before the exact segment
+// tests. NaN/Inf coordinates disable the bounds shortcut; the existing exact
+// predicate remains authoritative. These relations use planar coordinates.
+func geoPathsIntersect(a, b []geoPoint) bool {
+	if len(a) < 2 || len(b) < 2 {
+		return false
+	}
+	aMinX, aMinY, aMaxX, aMaxY := geoPathBounds(a)
+	bMinX, bMinY, bMaxX, bMaxY := geoPathBounds(b)
+	if aMaxX < bMinX || bMaxX < aMinX || aMaxY < bMinY || bMaxY < aMinY {
+		return false
+	}
+	for i := 0; i+1 < len(a); i++ {
+		for j := 0; j+1 < len(b); j++ {
+			if segmentsIntersect(a[i], a[i+1], b[j], b[j+1]) {
 				return true
 			}
 		}
 	}
 	return false
+}
+func geoPathBounds(path []geoPoint) (minX, minY, maxX, maxY float64) {
+	minX, minY, maxX, maxY = path[0].Lon, path[0].Lat, path[0].Lon, path[0].Lat
+	for _, p := range path {
+		if math.IsNaN(p.Lon) || math.IsNaN(p.Lat) || math.IsInf(p.Lon, 0) || math.IsInf(p.Lat, 0) {
+			return math.Inf(-1), math.Inf(-1), math.Inf(1), math.Inf(1)
+		}
+		minX = min(minX, p.Lon)
+		minY = min(minY, p.Lat)
+		maxX = max(maxX, p.Lon)
+		maxY = max(maxY, p.Lat)
+	}
+	return
 }
 
 // ── ST_INTERSECTS / ST_DISJOINT ──────────────────────────────────────────

@@ -37,14 +37,17 @@ type StreamOptions struct {
 // zero for that field. RowsProduced is the number of result rows accepted by
 // the stream's producer.
 type StreamStats struct {
-	StartedAt      time.Time
-	FirstRowAt     time.Time
-	CompletedAt    time.Time
-	RowsScanned    uint64
-	RowsProduced   uint64
-	BufferCapacity int
-	Materialized   bool
-	Complete       bool
+	BufferOccupancy int
+	BlockedSends    uint64
+	SendWait        time.Duration
+	StartedAt       time.Time
+	FirstRowAt      time.Time
+	CompletedAt     time.Time
+	RowsScanned     uint64
+	RowsProduced    uint64
+	BufferCapacity  int
+	Materialized    bool
+	Complete        bool
 }
 
 // ResultStream incrementally exposes query rows. Next blocks until another row
@@ -73,6 +76,8 @@ type ResultStream struct {
 	completedAt    atomic.Int64
 	rowsScanned    atomic.Uint64
 	rowsProduced   atomic.Uint64
+	blockedSends   atomic.Uint64
+	sendWait       atomic.Int64
 	materialized   atomic.Bool
 	bufferCapacity int
 	complete       atomic.Bool
@@ -157,12 +162,15 @@ func (s *ResultStream) Stats() StreamStats {
 		return StreamStats{}
 	}
 	stats := StreamStats{
-		StartedAt:      s.startedAt,
-		RowsScanned:    s.rowsScanned.Load(),
-		RowsProduced:   s.rowsProduced.Load(),
-		BufferCapacity: s.bufferCapacity,
-		Materialized:   s.materialized.Load(),
-		Complete:       s.complete.Load(),
+		StartedAt:       s.startedAt,
+		BufferOccupancy: len(s.rows),
+		BlockedSends:    s.blockedSends.Load(),
+		SendWait:        time.Duration(s.sendWait.Load()),
+		RowsScanned:     s.rowsScanned.Load(),
+		RowsProduced:    s.rowsProduced.Load(),
+		BufferCapacity:  s.bufferCapacity,
+		Materialized:    s.materialized.Load(),
+		Complete:        s.complete.Load(),
 	}
 	if ns := s.firstRowAt.Load(); ns != 0 {
 		stats.FirstRowAt = time.Unix(0, ns)
@@ -581,6 +589,9 @@ func sendResultStreamRow(ctx context.Context, stream *ResultStream, row Row) boo
 		return true
 	default:
 	}
+	stream.blockedSends.Add(1)
+	start := time.Now()
+	defer func() { stream.sendWait.Add(time.Since(start).Nanoseconds()) }()
 	select {
 	case stream.rows <- row:
 		stream.noteProduced()

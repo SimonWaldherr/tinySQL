@@ -49,3 +49,17 @@ func BenchmarkSortGeoPoints(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkDisjointRingBoundaries(b *testing.B) {
+	a, boundary := make(geoRing, 1001), make(geoRing, 1001)
+	for i := range a {
+		a[i] = geoPoint{Lon: float64(i % 1000), Lat: float64(i % 2)}
+		boundary[i] = geoPoint{Lon: float64(i % 1000), Lat: 100 + float64(i%2)}
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		if ringsShareBoundary(a, boundary) {
+			b.Fatal("disjoint rings intersect")
+		}
+	}
+}

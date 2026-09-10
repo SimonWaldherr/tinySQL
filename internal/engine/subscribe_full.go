@@ -11,9 +11,13 @@ import (
 // refreshFull runs under the caller's content read lock. Calling Execute here
 // would acquire the same lock again and deadlock when a writer is waiting.
 func (s *querySubscriptionState) refreshFull(ctx context.Context) (*QueryChange, error) {
+	s.fullRefreshes.Add(1)
 	rs, err := executeSelect(ExecEnv{ctx: ctx, db: s.db, tenant: s.tenant, now: time.Now(), subqueryCache: newSubqueryResultCache()}, s.query)
 	if err != nil {
 		return nil, err
+	}
+	if s.options.MaxResultRows > 0 && len(rs.Rows) > s.options.MaxResultRows {
+		return nil, fmt.Errorf("subscription result exceeds row limit %d", s.options.MaxResultRows)
 	}
 	initial := !s.fullInitialized
 	if !initial && !slices.Equal(s.cols, rs.Cols) {

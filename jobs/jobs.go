@@ -24,6 +24,8 @@ type Config struct {
 	CatchUp      bool
 	NoOverlap    bool
 	MaxRuntimeMs int64
+	MaxAttempts  int
+	RetryDelayMs int64
 }
 
 // Build validates cfg and returns a CatalogJob.
@@ -44,6 +46,9 @@ func Build(cfg Config) (*tinysql.CatalogJob, error) {
 	if maxRuntimeMs <= 0 {
 		maxRuntimeMs = defaultMaxRuntimeMs
 	}
+	if cfg.MaxAttempts < 0 || cfg.MaxAttempts > 100 || cfg.RetryDelayMs < 0 {
+		return nil, fmt.Errorf("invalid retry options")
+	}
 	now := time.Now()
 	job := &tinysql.CatalogJob{
 		Name:         name,
@@ -56,8 +61,9 @@ func Build(cfg Config) (*tinysql.CatalogJob, error) {
 		CatchUp:      cfg.CatchUp,
 		NoOverlap:    cfg.NoOverlap,
 		MaxRuntimeMs: maxRuntimeMs,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		MaxAttempts:  cfg.MaxAttempts, RetryDelayMs: cfg.RetryDelayMs,
+		CreatedAt: now,
+		UpdatedAt: now,
 	}
 	switch scheduleType {
 	case "INTERVAL":

@@ -62,7 +62,9 @@ type DBHealth struct {
 // hybrid persistence strategies.
 type DB struct {
 	watchMu     sync.Mutex
-	watchers    map[chan struct{}]struct{}
+	watchers    map[chan struct{}]*ChangeWatch
+	watchTables map[TableRef]map[chan struct{}]struct{}
+	watchGlobal map[chan struct{}]struct{}
 	watchClosed bool
 	watchCount  atomic.Int64
 

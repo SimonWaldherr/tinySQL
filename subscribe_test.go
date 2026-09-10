@@ -240,3 +240,86 @@ func TestSubscriptionGroupedView(t *testing.T) {
 		t.Fatal("drop view did not stop subscription")
 	}
 }
+
+func TestSubscriptionRoutesTableChangesAndViewReplacement(t *testing.T) {
+	db := sql.NewDB()
+	defer db.Close()
+	execSubscriptionSQL(t, db, `CREATE TABLE a (id INT)`)
+	execSubscriptionSQL(t, db, `CREATE TABLE b (id INT)`)
+	execSubscriptionSQL(t, db, `INSERT INTO a VALUES (1)`)
+	execSubscriptionSQL(t, db, `INSERT INTO b VALUES (10)`)
+	execSubscriptionSQL(t, db, `CREATE VIEW selected AS SELECT SUM(id) AS total FROM a`)
+	sub, err := sql.SubscribeSQL(t.Context(), db, "default", `SELECT * FROM selected`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	nextChange(t, sub)
+	before := sub.Stats()
+	execSubscriptionSQL(t, db, `INSERT INTO b VALUES (20)`)
+	if got := sub.Stats(); got.Notifications != before.Notifications {
+		t.Fatalf("unrelated table woke view: %+v", got)
+	}
+	pool, err := driver.OpenWithDB(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	tx, err := pool.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.ExecContext(t.Context(), `DROP VIEW selected`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.ExecContext(t.Context(), `CREATE VIEW selected AS SELECT SUM(id) AS total FROM b`); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	change := nextChange(t, sub)
+	if len(change.Added) != 1 || fmt.Sprint(change.Added[0]["total"]) != "30" {
+		t.Fatal(change)
+	}
+	before = sub.Stats()
+	execSubscriptionSQL(t, db, `INSERT INTO a VALUES (2)`)
+	if got := sub.Stats(); got.Notifications != before.Notifications {
+		t.Fatalf("old view dependency retained: %+v", got)
+	}
+	execSubscriptionSQL(t, db, `INSERT INTO b VALUES (5)`)
+	change = nextChange(t, sub)
+	if len(change.Added) != 1 || fmt.Sprint(change.Added[0]["total"]) != "35" {
+		t.Fatal(change)
+	}
+}
+
+func TestSubscriptionResultLimits(t *testing.T) {
+	db := sql.NewDB()
+	defer db.Close()
+	execSubscriptionSQL(t, db, `CREATE TABLE a (id INT, payload TEXT)`)
+	execSubscriptionSQL(t, db, `INSERT INTO a VALUES (1, 'abcdefghijklmnopqrstuvwxyz')`)
+	if sub, err := sql.SubscribeSQLWithOptions(t.Context(), db, "default", `SELECT payload FROM a`, sql.SubscriptionOptions{MaxResultBytes: 8}); err == nil {
+		sub.Close()
+		t.Fatal("accepted oversized result")
+	}
+	sub, err := sql.SubscribeSQLWithOptions(t.Context(), db, "default", `SELECT id FROM a`, sql.SubscriptionOptions{MaxResultRows: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	nextChange(t, sub)
+	execSubscriptionSQL(t, db, `INSERT INTO a VALUES (2, 'x')`)
+	select {
+	case _, ok := <-sub.Changes:
+		if ok || sub.Err() == nil {
+			t.Fatal("missing result-limit error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("oversized subscription did not stop")
+	}
+	if sub, err := sql.SubscribeSQLWithOptions(t.Context(), db, "default", `SELECT id + 1 AS next_id FROM a`, sql.SubscriptionOptions{MaxResultRows: 1}); err == nil {
+		sub.Close()
+		t.Fatal("accepted oversized general SELECT")
+	}
+}

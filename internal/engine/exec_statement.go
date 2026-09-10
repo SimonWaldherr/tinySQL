@@ -14,6 +14,7 @@ import (
 // finalization. Keeping it separate from execStmt lets statement handlers
 // focus exclusively on their SQL semantics.
 func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt Statement) (rs *ResultSet, err error) {
+	var notifyTables []storage.TableRef
 	if err := checkPermission(ctx, db, stmt); err != nil {
 		recordAudit(ctx, db, tenant, stmt, err)
 		return nil, err
@@ -39,7 +40,7 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 		defer db.UnlockContentForRead()
 	} else {
 		db.LockContentForWrite()
-		defer db.UnlockContentForWrite()
+		defer func() { db.UnlockContentForWriteTables(notifyTables) }()
 		// A direct ResultStream pins only its source table, not contentMu for
 		// the lifetime of a slow client. Detach a pinned target before WAL/DML
 		// planning records table pointers so this statement mutates a private
@@ -85,6 +86,11 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 		// recovery will not reconstruct. DDL is rare enough that the full
 		// snapshot is the right trade here.
 		snapshot = db.SnapshotForStatement()
+	}
+	if snapshot != nil && db.HasChangeWatchers() {
+		if refs, scoped := snapshot.RestoredTables(); scoped {
+			notifyTables = refs
+		}
 	}
 	// Runs after the rollback defer below (defers unwind last-in-first-out), so
 	// the snapshot is only disarmed once it can no longer be needed. Without
