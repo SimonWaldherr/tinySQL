@@ -499,11 +499,11 @@ func evalRawRegexp(plan *simpleSelectPlan, raw []any, ex *RegexpExpr) (any, erro
 	if ex.SimilarTo {
 		pattern = similarToRegexp(pattern)
 	}
-	re, err := compileCachedRegexp(pattern)
+	match, err := compileCachedRegexpMatcher(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("REGEXP: invalid pattern %q: %v", pattern, err)
 	}
-	matched := re.MatchString(str)
+	matched := match(str)
 	if ex.Negate {
 		return !matched, nil
 	}

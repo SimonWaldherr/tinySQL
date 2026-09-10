@@ -355,12 +355,12 @@ func evalRegexpMatch(env ExecEnv, args []Expr, row Row) (any, error) {
 	str := valueText(strVal)
 	pattern := valueText(patternVal)
 
-	re, err := compileCachedRegexp(pattern)
+	match, err := compileCachedRegexpMatcher(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("REGEXP_MATCH: %v", err)
 	}
 
-	return re.MatchString(str), nil
+	return match(str), nil
 }
 
 // evalRegexpExtractFunc extracts the first match of a regex pattern

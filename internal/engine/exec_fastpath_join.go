@@ -710,11 +710,11 @@ func evalJoinRawRegexp(plan *simpleJoinPlan, left, right []any, ex *RegexpExpr) 
 	if ex.SimilarTo {
 		pat = similarToRegexp(pat)
 	}
-	re, err := compileCachedRegexp(pat)
+	match, err := compileCachedRegexpMatcher(pat)
 	if err != nil {
 		return nil, fmt.Errorf("REGEXP: invalid pattern %q: %v", pat, err)
 	}
-	matched := re.MatchString(str)
+	matched := match(str)
 	if ex.Negate {
 		return !matched, nil
 	}

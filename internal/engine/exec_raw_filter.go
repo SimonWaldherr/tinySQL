@@ -534,13 +534,8 @@ func buildRawFilterRegexp(colIndex map[string]int, ex *RegexpExpr) func([]any) (
 	if ex.SimilarTo {
 		pattern = similarToRegexp(pattern)
 	}
-	// compileCachedRegexp, not regexp.Compile directly: every other
-	// regex-evaluating path in the engine (eval_expr.go, exec_fastpath_join.go,
-	// exec_raw_eval.go, extended_functions.go) already goes through the shared
-	// bounded cache in regex_cache.go so a previously-seen pattern is not
-	// recompiled from scratch on every query; this was the one site that
-	// bypassed it.
-	re, err := compileCachedRegexp(pattern)
+	// Bind the shared boolean matcher once; parameters remain dynamic.
+	match, err := compileCachedRegexpMatcher(pattern)
 	if err != nil {
 		return nil
 	}
@@ -549,7 +544,7 @@ func buildRawFilterRegexp(colIndex map[string]int, ex *RegexpExpr) func([]any) (
 		if raw[colIdx] == nil {
 			return false, nil
 		}
-		matched := re.MatchString(valueText(raw[colIdx]))
+		matched := match(valueText(raw[colIdx]))
 		if negate {
 			return !matched, nil
 		}
@@ -596,7 +591,7 @@ func buildRawFilterRegexpMatch(colIndex map[string]int, ex *FuncCall) func([]any
 	if !ok {
 		return nil
 	}
-	re, err := compileCachedRegexp(pattern)
+	match, err := compileCachedRegexpMatcher(pattern)
 	if err != nil {
 		return nil
 	}
@@ -604,7 +599,7 @@ func buildRawFilterRegexpMatch(colIndex map[string]int, ex *FuncCall) func([]any
 		if raw[col] == nil {
 			return false, nil
 		}
-		return re.MatchString(valueText(raw[col])), nil
+		return match(valueText(raw[col])), nil
 	}
 }
 
