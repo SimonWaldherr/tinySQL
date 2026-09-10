@@ -173,6 +173,7 @@ func executeSimpleSelectDistinctFastPath(env ExecEnv, plan *simpleSelectPlan) (*
 	}
 
 	seen := make(map[string]struct{})
+	var seenScalar map[any]struct{}
 	var seenText map[string]struct{}
 	vals := make([]any, len(plan.projs))
 	// key is reused across rows; seen[string(key)] is a zero-allocation lookup,
@@ -212,13 +213,12 @@ func executeSimpleSelectDistinctFastPath(env ExecEnv, plan *simpleSelectPlan) (*
 		if err := projectRawValues(plan, raw, vals); err != nil {
 			return nil, true, err
 		}
-		// A single text column can use its immutable value as the key, avoiding
-		// formatting and copying. Keep a separate set so arbitrary text cannot
-		// collide with the framed representation of a non-text value.
+		var scalar any
+		var scalarOK, isText bool
 		var text string
-		var isText bool
 		if len(vals) == 1 {
 			text, isText = vals[0].(string)
+			scalar, scalarOK = scalarDistinctKey(vals[0])
 		}
 		if isText {
 			if _, dup := seenText[text]; dup {
@@ -228,6 +228,14 @@ func executeSimpleSelectDistinctFastPath(env ExecEnv, plan *simpleSelectPlan) (*
 				seenText = make(map[string]struct{})
 			}
 			seenText[text] = struct{}{}
+		} else if scalarOK {
+			if _, dup := seenScalar[scalar]; dup {
+				continue
+			}
+			if seenScalar == nil {
+				seenScalar = make(map[any]struct{})
+			}
+			seenScalar[scalar] = struct{}{}
 		} else {
 			key = appendDistinctKey(key[:0], vals)
 			if _, dup := seen[string(key)]; dup {

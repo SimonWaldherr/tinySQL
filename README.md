@@ -125,6 +125,13 @@ before output rows are materialized. This includes conditional totals such as
 `SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END)` used in both SELECT and
 HAVING. More complex expressions retain the general execution path.
 
+`SELECT DISTINCT` uses direct keys for single integer, boolean, and text
+values, preserving first-occurrence order when no `ORDER BY` is specified.
+`COUNT(DISTINCT expression)` can accumulate unique non-NULL values directly
+during raw table scans, including grouped queries and matching projected
+aggregates in `HAVING`. Each group and each distinct aggregate has its own
+set; empty input returns zero for an ungrouped distinct count.
+
 For applications that already use `database/sql`, use
 [`github.com/SimonWaldherr/tinySQL/driver`](./driver).
 

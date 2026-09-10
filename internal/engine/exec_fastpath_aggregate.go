@@ -46,6 +46,7 @@ type aggKind byte
 const (
 	aggGroupCol aggKind = iota
 	aggCount
+	aggCountDistinct
 	aggSum
 	aggAvg
 	aggMin
@@ -78,6 +79,7 @@ type simpleAggregateState struct {
 	useRat      []bool
 	minmax      []any
 	haveMinMax  []bool
+	distinct    []distinctCountSet
 }
 
 func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error) {
@@ -273,6 +275,20 @@ func accumulateSimpleAggregateState(env ExecEnv, rawPlan *simpleSelectPlan, raw 
 			if v != nil {
 				state.counts[i]++
 			}
+		case aggCountDistinct:
+			v, err := evalSimpleAggregateArg(rawPlan, raw, proj)
+			if err != nil {
+				return err
+			}
+			if v == nil {
+				continue
+			}
+			if state.distinct == nil {
+				state.distinct = make([]distinctCountSet, len(projs))
+			}
+			if state.distinct[i].add(v) {
+				state.counts[i]++
+			}
 		case aggSum, aggAvg:
 			v, err := evalSimpleAggregateArg(rawPlan, raw, proj)
 			if err != nil {
@@ -383,7 +399,7 @@ func simpleAggregateProjectionValue(state *simpleAggregateState, proj simpleAggr
 	switch proj.kind {
 	case aggGroupCol:
 		return state.groupValues[proj.groupIndex]
-	case aggCount:
+	case aggCount, aggCountDistinct:
 		return state.counts[i]
 	case aggSum:
 		// Match evalAggregateSumAvg: SUM over no non-NULL input values is
@@ -414,13 +430,16 @@ func simpleAggregateProjectionValue(state *simpleAggregateState, proj simpleAggr
 }
 
 func simpleAggregateProjectionForFunc(plan *simpleAggregatePlan, fc *FuncCall) (int, bool) {
-	if fc == nil || fc.Distinct || fc.Over != nil {
+	if fc == nil || fc.Over != nil || (fc.Distinct && (fc.Name != "COUNT" || fc.Star)) {
 		return 0, false
 	}
 	var kind aggKind
 	switch fc.Name {
 	case "COUNT":
 		kind = aggCount
+		if fc.Distinct {
+			kind = aggCountDistinct
+		}
 		if fc.Star {
 			if len(fc.Args) != 0 {
 				return 0, false
@@ -647,7 +666,7 @@ func buildSimpleAggregateProjection(it SelectItem, idx int, colIndex map[string]
 	}
 
 	fc, ok := it.Expr.(*FuncCall)
-	if !ok || fc.Distinct || fc.Over != nil {
+	if !ok || fc.Over != nil || (fc.Distinct && (fc.Name != "COUNT" || fc.Star)) {
 		return simpleAggregateProjection{}, "", false, false, nil
 	}
 
@@ -658,7 +677,11 @@ func buildSimpleAggregateProjection(it SelectItem, idx int, colIndex map[string]
 		if len(fc.Args) != 1 || !isSimpleRawExpr(fc.Args[0]) {
 			return simpleAggregateProjection{}, "", false, false, nil
 		}
-		return simpleAggregateProjection{name: name, kind: aggCount, arg: fc.Args[0]}, name, true, true, nil
+		kind := aggCount
+		if fc.Distinct {
+			kind = aggCountDistinct
+		}
+		return simpleAggregateProjection{name: name, kind: kind, arg: fc.Args[0]}, name, true, true, nil
 	}
 
 	if kind, ok := simpleAggFuncKinds[fc.Name]; ok {
