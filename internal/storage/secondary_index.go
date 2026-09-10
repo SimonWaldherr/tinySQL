@@ -23,12 +23,12 @@ type IndexEntry struct {
 // index itself, not merely CREATE INDEX catalog metadata.
 //
 // Entries is the sorted, backward-compatible GOB/JSON representation. Before
-// the runtime skip list (fast) exists, point lookups binary-search Entries.
-// Mutations and range access hydrate fast lazily. Once fast exists, Entries
+// the runtime skip list (fast) exists, reads binary-search Entries.
+// Mutations hydrate fast lazily. Once fast exists, Entries
 // may be stale and only materialize may refresh it at a persistence boundary.
 // The cold-read optimization adds no file-format change.
 //
-// mu protects hydration, materialization and choosing the authoritative point
+// mu protects hydration, materialization and choosing the authoritative
 // lookup representation. Table mutations still require the caller's DB content
 // write lock; concurrent readers hold its read lock.
 type SecondaryIndex struct {
@@ -37,12 +37,12 @@ type SecondaryIndex struct {
 	Unique  bool
 	Entries []IndexEntry
 
-	mu   sync.Mutex
+	mu   sync.RWMutex
 	fast *SkipList
 }
 
-// hydrate builds the mutable/range-access structure from persisted Entries.
-// Point reads use lookup instead and avoid hydration while fast is nil.
+// hydrate builds the mutable structure from persisted Entries.
+// Reads avoid hydration while fast is nil.
 func (idx *SecondaryIndex) hydrate() *SkipList {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -99,17 +99,38 @@ func (idx *SecondaryIndex) clone() *SecondaryIndex {
 	return out
 }
 
-// Len reports the number of distinct composite keys this index currently
-// holds, hydrating from Entries first if nothing has touched it yet since it
-// was loaded. It exists for introspection and tests that want the
-// materialized key count without reaching into Entries directly -- which,
-// unlike before, is not kept in sync on every mutation and so cannot be
-// trusted outside a persistence boundary.
+// Len reports the authoritative distinct-key count without rebuilding the index.
 func (idx *SecondaryIndex) Len() int {
 	if idx == nil {
 		return 0
 	}
-	return idx.hydrate().Len()
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if idx.fast == nil {
+		return len(idx.Entries)
+	}
+	return idx.fast.Len()
+}
+
+// visitRange seeks into the authoritative representation. The cold path keeps
+// the representation stable for the callback; callbacks must not mutate or
+// re-enter the index. Callers still hold the DB content lock, as with lookup.
+func (idx *SecondaryIndex) visitRange(start []byte, visit func([]byte, []int) bool) {
+	idx.mu.RLock()
+	fast := idx.fast
+	if fast != nil {
+		idx.mu.RUnlock()
+		fast.Range(start, visit)
+		return
+	}
+	defer idx.mu.RUnlock()
+	pos := sort.Search(len(idx.Entries), func(i int) bool { return bytes.Compare(idx.Entries[i].Key, start) >= 0 })
+	for ; pos < len(idx.Entries); pos++ {
+		entry := idx.Entries[pos]
+		if !visit(entry.Key, entry.RowIDs) {
+			return
+		}
+	}
 }
 
 // CreateSecondaryIndex builds an index over both existing and future table
@@ -409,7 +430,7 @@ func (t *Table) FindSecondaryIndex(columns []string) *SecondaryIndex {
 	return nil
 }
 
-// LookupSecondaryIndexPrefix performs a skip-list seek to the first key >=
+// LookupSecondaryIndexPrefix seeks to the first key >=
 // the prefix, followed by a compact prefix walk. Returned row IDs are sorted
 // in table order to preserve the observable order of a scan when a query has
 // no ORDER BY clause.
@@ -420,7 +441,7 @@ func (t *Table) LookupSecondaryIndexPrefix(idx *SecondaryIndex, values []any) ([
 	var scratch [128]byte
 	key := canonicalIndexKeyInto(scratch[:0], values)
 	var out []int
-	idx.hydrate().Range(key, func(entryKey []byte, rowIDs []int) bool {
+	idx.visitRange(key, func(entryKey []byte, rowIDs []int) bool {
 		if !bytes.HasPrefix(entryKey, key) {
 			return false
 		}
@@ -452,7 +473,7 @@ func (t *Table) LookupSecondaryIndexPoint(idx *SecondaryIndex, values []any) ([]
 }
 
 func (idx *SecondaryIndex) lookup(key []byte) []int {
-	idx.mu.Lock()
+	idx.mu.RLock()
 	fast := idx.fast
 	if fast == nil {
 		// The persisted representation is already sorted. A cold point read
@@ -462,10 +483,10 @@ func (idx *SecondaryIndex) lookup(key []byte) []int {
 		if i < len(idx.Entries) && bytes.Equal(idx.Entries[i].Key, key) {
 			rows = idx.Entries[i].RowIDs
 		}
-		idx.mu.Unlock()
+		idx.mu.RUnlock()
 		return rows
 	}
-	idx.mu.Unlock()
+	idx.mu.RUnlock()
 	rowIDs, _ := fast.Get(key)
 	return rowIDs
 }

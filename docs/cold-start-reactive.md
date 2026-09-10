@@ -3,8 +3,9 @@
 ## First access after reopening
 
 A persisted secondary index already contains sorted keys and row positions.
-Point lookups now binary-search those entries directly until a mutation or range
-access requires the runtime skip list. This removes its O(n) reconstruction
+Point, prefix and numeric range lookups now binary-search those entries directly
+until a mutation requires the runtime skip list. Range queries then walk only
+the matching sorted entries. This removes its O(n) reconstruction
 from the first point SELECT without changing the index format. Both positive
 and negative lookups use this path; concurrent readers do not initialize a
 second mutable index. Existing indexes benefit automatically.
@@ -16,8 +17,9 @@ For example: `CREATE UNIQUE INDEX cache_key ON cache(key)`.
 Paged Index can use that index to locate the requested row without decoding the
 entire table. A resident compatibility table takes precedence over disk roots:
 SQL UPDATEs that have not yet been flushed must remain visible to readers.
-This optimization targets point reads; prefix/range access can still hydrate a
-runtime index, and the classic Disk backend still loads whole table files.
+This optimization also covers prefix and numeric range access to persisted
+secondary-index entries. The classic Disk backend still loads whole table files;
+it does not become page-oriented through this optimization.
 
 Apple M2 Max, Go 1.27.1, 20,000 keys, GOMAXPROCS=12, one 100 ms sample:
 

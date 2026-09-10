@@ -104,7 +104,7 @@ func (t *Table) LookupSecondaryIndexRange(idx *SecondaryIndex, prefix []any, lo,
 	out := make([]int, 0, 16)
 	var rangeErr error
 	i := 0
-	idx.hydrate().Range(seek, func(key []byte, rowIDs []int) bool {
+	idx.visitRange(seek, func(key []byte, rowIDs []int) bool {
 		if !bytes.HasPrefix(key, prefixKey) {
 			return false // left the equality prefix; entries are sorted, so nothing follows
 		}
