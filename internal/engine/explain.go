@@ -96,7 +96,14 @@ func explainSelect(env ExecEnv, rows *[]Row, sel *Select, prefix string) {
 		explainSelect(env, rows, cte.Select, "cte ")
 	}
 	if sel.From.Table != "" || sel.From.Subquery != nil || sel.From.TableFunc != nil {
-		if plan, ok, err := buildSimpleSelectPlan(env, sel); err == nil && ok {
+		plan, ok, err := buildSimpleSelectPlan(env, sel)
+		if err == nil && !ok {
+			if aggregate, supported, aggErr := buildSimpleAggregatePlan(env, sel); aggErr == nil && supported {
+				plan, err = buildSimpleAggregateSourcePlan(aggregate)
+				ok = err == nil
+			}
+		}
+		if err == nil && ok {
 			detail := fmt.Sprintf("table=%s scan=%s estimated_rows=%d", sel.From.Table, plan.scanType, plan.estimatedRows)
 			if plan.indexName != "" {
 				detail += fmt.Sprintf(" index=%s predicates=%s residual_filter=%t covering_index=%t", plan.indexName, strings.Join(plan.indexPredicates, ", "), plan.residualFilter, plan.coveringIndex)

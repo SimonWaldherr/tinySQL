@@ -85,11 +85,28 @@ func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 		return nil, ok, err
 	}
 
-	rawPlan := &simpleSelectPlan{table: plan.table, colIndex: plan.colIndex, where: plan.where, filter: buildRawFilter(plan.colIndex, plan.where)}
+	rawPlan, err := buildSimpleAggregateSourcePlan(plan)
+	if err != nil {
+		return nil, true, err
+	}
+
 	if len(plan.groupCols) == 1 {
 		return executeSimpleSingleGroupAggregate(env, plan, rawPlan)
 	}
 	return executeSimpleMultiGroupAggregate(env, plan, rawPlan)
+}
+
+// buildSimpleAggregateSourcePlan is also used by EXPLAIN, so reported
+// candidate access matches execution without running the aggregate itself.
+func buildSimpleAggregateSourcePlan(plan *simpleAggregatePlan) (*simpleSelectPlan, error) {
+	rawPlan := &simpleSelectPlan{table: plan.table, colIndex: plan.colIndex, where: plan.where, filter: buildRawFilter(plan.colIndex, plan.where)}
+	resetSimplePlanAccess(rawPlan, len(plan.table.Rows))
+	if err := selectSimplePlanIndexRows(rawPlan, plan.where); err != nil {
+		return nil, err
+	}
+	// Aggregation still consumes stored rows after the candidate seek.
+	rawPlan.coveringIndex = false
+	return rawPlan, nil
 }
 
 func executeSimpleSingleGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, rawPlan *simpleSelectPlan) (*ResultSet, bool, error) {
@@ -103,7 +120,19 @@ func executeSimpleSingleGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, r
 	order := make([]*simpleAggregateState, 0)
 	groupCol := plan.groupCols[0]
 	keyBuf := make([]byte, 0, 32)
-	for i, raw := range plan.table.Rows {
+	rowCount := len(plan.table.Rows)
+	if rawPlan.rowIDs != nil {
+		rowCount = len(rawPlan.rowIDs)
+	}
+	for i := 0; i < rowCount; i++ {
+		rowID := i
+		if rawPlan.rowIDs != nil {
+			rowID = rawPlan.rowIDs[i]
+		}
+		if rowID < 0 || rowID >= len(plan.table.Rows) {
+			return nil, true, fmt.Errorf("index %q returned invalid row id %d", rawPlan.indexName, rowID)
+		}
+		raw := plan.table.Rows[rowID]
 		// Check context cancellation every 64 rows to reduce channel-select overhead.
 		if i&63 == 0 {
 			if err := checkCtx(env.ctx); err != nil {
@@ -144,7 +173,19 @@ func executeSimpleMultiGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, ra
 	// lookup below and only the first row of each group pays for a real
 	// string allocation.
 	keyBuf := make([]byte, 0, 64)
-	for rowIdx, raw := range plan.table.Rows {
+	rowCount := len(plan.table.Rows)
+	if rawPlan.rowIDs != nil {
+		rowCount = len(rawPlan.rowIDs)
+	}
+	for rowIdx := 0; rowIdx < rowCount; rowIdx++ {
+		rowID := rowIdx
+		if rawPlan.rowIDs != nil {
+			rowID = rawPlan.rowIDs[rowIdx]
+		}
+		if rowID < 0 || rowID >= len(plan.table.Rows) {
+			return nil, true, fmt.Errorf("index %q returned invalid row id %d", rawPlan.indexName, rowID)
+		}
+		raw := plan.table.Rows[rowID]
 		if rowIdx&63 == 0 {
 			if err := checkCtx(env.ctx); err != nil {
 				return nil, true, err

@@ -73,8 +73,19 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 	}
 	plan := *template
 	resetSimplePlanAccess(&plan, len(table.Rows))
-	idx, values, predicates, residual := selectSecondaryIndex(table, plan.colIndex, s.Where)
-	rangePlan, haveRange := selectRangeIndex(table, plan.colIndex, s.Where)
+	if err := selectSimplePlanIndexRows(&plan, s.Where); err != nil {
+		return nil, true, err
+	}
+	return &plan, true, nil
+}
+
+// selectSimplePlanIndexRows shares candidate selection between projections
+// and aggregates. Residual predicates are still evaluated against every
+// candidate, and sorted row IDs preserve scan-order accumulation semantics.
+func selectSimplePlanIndexRows(plan *simpleSelectPlan, where Expr) error {
+	table := plan.table
+	idx, values, predicates, residual := selectSecondaryIndex(table, plan.colIndex, where)
+	rangePlan, haveRange := selectRangeIndex(table, plan.colIndex, where)
 	// A range plan is preferred only when it matches at least as many equality
 	// columns as the equality-only plan would. Then it is the same key prefix plus
 	// one bounded column, so it is strictly narrower. When the equality plan
@@ -96,7 +107,7 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 			rowIDs, seekErr = table.LookupSecondaryIndexPrefix(idx, values)
 		}
 		if seekErr != nil {
-			return nil, true, seekErr
+			return seekErr
 		}
 		plan.rowIDs = rowIDs
 		plan.scanType = "INDEX " + seekKind(len(values), len(idx.Columns))
@@ -113,7 +124,7 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 		rowIDs, seekErr := table.LookupSecondaryIndexRange(rangePlan.index, rangePlan.prefix, rangePlan.lo, rangePlan.hi)
 		if seekErr != nil {
 			if !errors.Is(seekErr, storage.ErrIndexRangeUnsupported) {
-				return nil, true, seekErr
+				return seekErr
 			}
 			// The index cannot order this range after all; leave the plan as the
 			// table scan resetSimplePlanAccess already set up.
@@ -126,7 +137,7 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 			plan.coveringIndex = projectionsCoveredByIndex(plan.projs, rangePlan.index, table)
 			plan.estimatedRows = len(rowIDs)
 		}
-	} else if rowIDs, column, residual, ok := selectConstraintIndex(table, plan.colIndex, s.Where); ok {
+	} else if rowIDs, column, residual, ok := selectConstraintIndex(table, plan.colIndex, where); ok {
 		// PRIMARY KEY and UNIQUE enforcement already maintains this hash index
 		// incrementally for DML. Reusing it here avoids a full table scan for
 		// the common key lookup shape without adding another persistent index.
@@ -138,7 +149,12 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 		plan.filterFullyCovered = !residual
 		plan.estimatedRows = len(rowIDs)
 	}
-	return &plan, true, nil
+	// nil denotes an unrestricted scan; a successful empty seek must remain
+	// an empty candidate set, including for an ungrouped COUNT/SUM.
+	if plan.scanType != "TABLE SCAN" && plan.rowIDs == nil {
+		plan.rowIDs = []int{}
+	}
+	return nil
 }
 
 // resetSimplePlanAccess clears value-dependent state retained by a cached
