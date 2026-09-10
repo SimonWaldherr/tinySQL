@@ -149,6 +149,18 @@ func selectSimplePlanIndexRows(plan *simpleSelectPlan, where Expr) error {
 		plan.filterFullyCovered = !residual
 		plan.estimatedRows = len(rowIDs)
 	}
+	if plan.scanType == "TABLE SCAN" {
+		rowIDs, used, err := selectIndexChoices(table, plan.colIndex, where)
+		if err != nil {
+			return err
+		}
+		if used {
+			plan.rowIDs = rowIDs
+			plan.scanType = "INDEX MULTI SEEK"
+			plan.residualFilter = true
+			plan.estimatedRows = len(rowIDs)
+		}
+	}
 	// nil denotes an unrestricted scan; a successful empty seek must remain
 	// an empty candidate set, including for an ungrouped COUNT/SUM.
 	if plan.scanType != "TABLE SCAN" && plan.rowIDs == nil {
