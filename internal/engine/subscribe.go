@@ -22,7 +22,8 @@ type QueryChange struct {
 	Added   []Row
 	Removed []Row
 	// ScannedRows counts candidates evaluated for this change, useful for
-	// observing incremental versus fallback execution.
+	// observing incremental versus fallback execution. It is -1 when the
+	// general SELECT executor does not expose a candidate count.
 	ScannedRows int
 }
 
@@ -39,9 +40,10 @@ type QuerySubscription struct {
 func (s *QuerySubscription) Close()     { s.cancel(); <-s.done }
 func (s *QuerySubscription) Err() error { s.mu.Lock(); defer s.mu.Unlock(); return s.err }
 
-// SubscribeSQL supports deterministic single-table SELECTs with direct columns
-// or *, and simple WHERE expressions. ORDER BY, paging, joins and aggregates
-// are rejected rather than silently providing different semantics.
+// SubscribeSQL delivers result deltas for SELECTs, including views, joins,
+// aggregates, CTEs and set operations. Simple physical-table queries update
+// incrementally; other queries are re-executed on database change notifications.
+// ORDER BY affects LIMIT/OFFSET membership, but deltas have no ordering contract.
 func SubscribeSQL(ctx context.Context, db *storage.DB, tenant, query string) (*QuerySubscription, error) {
 	if db == nil {
 		return nil, fmt.Errorf("database is required")
@@ -51,13 +53,8 @@ func SubscribeSQL(ctx context.Context, db *storage.DB, tenant, query string) (*Q
 		return nil, err
 	}
 	sel, ok := stmt.(*Select)
-	if !ok || !simpleSelectEligible(sel) || sel.Distinct || len(sel.OrderBy) > 0 || sel.Limit != nil || sel.Offset != nil || !subscriptionPredicate(sel.Where) {
-		return nil, fmt.Errorf("subscription requires a single-table SELECT without ordering, paging, aggregation or joins")
-	}
-	for _, p := range sel.Projs {
-		if _, ok := p.Expr.(*VarRef); !p.Star && !ok {
-			return nil, fmt.Errorf("subscription projections must be columns or *")
-		}
+	if !ok {
+		return nil, fmt.Errorf("subscription requires a SELECT")
 	}
 	wake, unregister, err := db.WatchChanges()
 	if err != nil {
@@ -121,6 +118,18 @@ func SubscribeSQL(ctx context.Context, db *storage.DB, tenant, query string) (*Q
 	return sub, nil
 }
 
+func subscriptionIncrementalEligible(sel *Select) bool {
+	if !simpleSelectEligible(sel) || sel.Distinct || len(sel.OrderBy) > 0 || sel.Limit != nil || sel.Offset != nil || !subscriptionPredicate(sel.Where) {
+		return false
+	}
+	for _, p := range sel.Projs {
+		if _, ok := p.Expr.(*VarRef); !p.Star && !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func subscriptionPredicate(e Expr) bool {
 	switch ex := e.(type) {
 	case nil, *Literal, *VarRef:
@@ -144,6 +153,9 @@ type querySubscriptionState struct {
 	version, structural, count int
 	cols                       []string
 	rows                       map[int]Row
+	full                       bool
+	fullInitialized            bool
+	snapshot                   []Row
 }
 
 func (s *querySubscriptionState) refresh(ctx context.Context) (result *QueryChange, err error) {
@@ -161,8 +173,17 @@ func (s *querySubscriptionState) refresh(ctx context.Context) (result *QueryChan
 	if err := checkPermission(ctx, s.db, s.query); err != nil {
 		return nil, err
 	}
+	if s.full || !subscriptionIncrementalEligible(s.query) {
+		s.full = true
+		return s.refreshFull(ctx)
+	}
 	table, err := s.db.Get(s.tenant, s.query.From.Table)
 	if err != nil {
+		if s.table == nil {
+			// Views and other non-physical sources are resolved by the executor.
+			s.full = true
+			return s.refreshFull(ctx)
+		}
 		return nil, err
 	}
 	initial := s.table == nil

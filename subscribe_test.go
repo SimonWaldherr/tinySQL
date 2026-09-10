@@ -149,7 +149,7 @@ func TestSubscriptionRejectsUnsupportedQueries(t *testing.T) {
 	db := sql.NewDB()
 	defer db.Close()
 	execSubscriptionSQL(t, db, `CREATE TABLE items (id INT)`)
-	for _, query := range []string{`SELECT COUNT(*) FROM items`, `SELECT id FROM items LIMIT 1`, `SELECT id FROM items ORDER BY id`, `SELECT NOW() FROM items`, `DELETE FROM items`} {
+	for _, query := range []string{`DELETE FROM items`, `UPDATE items SET id = 1`, `CREATE TABLE other (id INT)`} {
 		if s, err := sql.SubscribeSQL(t.Context(), db, "default", query); err == nil {
 			s.Close()
 			t.Fatalf("accepted %s", query)
@@ -203,5 +203,40 @@ func TestSubscriptionCloseWithUnreadResults(t *testing.T) {
 		case <-timeout:
 			t.Fatal("close blocked by unread result")
 		}
+	}
+}
+
+func TestSubscriptionGroupedView(t *testing.T) {
+	db := sql.NewDB()
+	defer db.Close()
+	execSubscriptionSQL(t, db, `CREATE TABLE sales (category TEXT, amount INT)`)
+	execSubscriptionSQL(t, db, `CREATE VIEW totals AS SELECT category, SUM(amount) AS total FROM sales GROUP BY category`)
+	sub, err := sql.SubscribeSQL(t.Context(), db, "default", `SELECT * FROM totals`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	initial := nextChange(t, sub)
+	if !initial.Initial || len(initial.Added) != 0 {
+		t.Fatal(initial)
+	}
+	execSubscriptionSQL(t, db, `INSERT INTO sales VALUES ('books', 10), ('books', 20)`)
+	added := nextChange(t, sub)
+	if len(added.Added) != 1 || len(added.Removed) != 0 {
+		t.Fatal(added)
+	}
+	execSubscriptionSQL(t, db, `UPDATE sales SET amount = 15 WHERE amount = 10`)
+	updated := nextChange(t, sub)
+	if len(updated.Added) != 1 || len(updated.Removed) != 1 || fmt.Sprint(updated.Added[0]["total"]) != "35" {
+		t.Fatal(updated)
+	}
+	execSubscriptionSQL(t, db, `DROP VIEW totals`)
+	select {
+	case _, ok := <-sub.Changes:
+		if ok || sub.Err() == nil {
+			t.Fatal("missing dropped-view error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("drop view did not stop subscription")
 	}
 }

@@ -639,6 +639,10 @@ func accumulateSimpleAggregateStateFromRow(r Row, state *simpleAggregateState, p
 }
 
 func processNonAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []string, error) {
+	if len(filtered) == 0 && s.Pivot == nil {
+		cols, err := emptyProjectionColumns(env, s)
+		return []Row{}, cols, err
+	}
 	outRows := make([]Row, 0, len(filtered))
 	outCols := make([]string, 0, len(s.Projs))
 	colSet := make(map[string]struct{}, len(s.Projs))
