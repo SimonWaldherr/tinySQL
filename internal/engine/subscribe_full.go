@@ -37,6 +37,9 @@ func (s *querySubscriptionState) refreshFull(ctx context.Context) (*QueryChange,
 	}
 	matched := make([]bool, len(s.snapshot))
 	next := make([]Row, 0, len(rs.Rows))
+	// Reuse one borrowed projection for comparisons; retained and emitted rows
+	// are separately cloned below. Every visible key is overwritten each time.
+	row := make(Row, len(keys))
 	for i, raw := range rs.Rows {
 		if i&63 == 0 {
 			if err := checkCtx(ctx); err != nil {
@@ -45,7 +48,6 @@ func (s *querySubscriptionState) refreshFull(ctx context.Context) (*QueryChange,
 		}
 		// Executor rows can carry hidden ORDER BY fields. Only the visible result
 		// columns participate in subscription output and equality.
-		row := make(Row, len(keys))
 		for _, key := range keys {
 			row[key] = raw[key]
 		}

@@ -256,3 +256,34 @@ func TestExecuteStreamDistinctDedupes(t *testing.T) {
 		t.Fatalf("streamed DISTINCT name = %v, want [row]", names)
 	}
 }
+
+func TestSendResultStreamRowCanceledBuffer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	stream := &ResultStream{rows: make(chan Row, 1)}
+	if sendResultStreamRow(ctx, stream, Row{"id": 1}) {
+		t.Fatal("accepted a row after cancellation")
+	}
+	if len(stream.rows) != 0 || stream.Stats().RowsProduced != 0 {
+		t.Fatal("canceled send changed stream")
+	}
+}
+
+func TestExecuteStreamEOFReleasesCurrentRow(t *testing.T) {
+	db := streamTestDB(t, 1)
+	defer db.Close()
+	stream, err := ExecuteStream(t.Context(), db, "default", mustParse("SELECT id FROM stream_rows"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	if !stream.Next() || stream.Row() == nil {
+		t.Fatal("missing row")
+	}
+	if stream.Next() || stream.Err() != nil {
+		t.Fatalf("EOF: %v", stream.Err())
+	}
+	if stream.Row() != nil {
+		t.Fatal("completed stream retains current row")
+	}
+}

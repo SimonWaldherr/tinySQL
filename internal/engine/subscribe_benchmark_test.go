@@ -41,3 +41,18 @@ func BenchmarkSubscriptionPointUpdate(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkSubscriptionGeneralUnchanged(b *testing.B) {
+	db := streamTestDB(b, 20000)
+	defer db.Close()
+	state := &querySubscriptionState{db: db, tenant: "default", query: mustParse("SELECT id + 1 AS next_id FROM stream_rows").(*Select)}
+	if _, err := state.refresh(b.Context()); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		if delta, err := state.refresh(b.Context()); err != nil || delta != nil {
+			b.Fatalf("delta: %v, %v", delta, err)
+		}
+	}
+}

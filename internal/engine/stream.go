@@ -95,6 +95,7 @@ func (s *ResultStream) Next() bool {
 	}
 	row, ok := <-s.rows
 	if !ok {
+		s.current = nil
 		<-s.done
 		return false
 	}
@@ -452,6 +453,7 @@ func streamSimpleSelectPlan(stream *ResultStream, plan *simpleSelectPlan, db *st
 			return err
 		}
 		if !sendResultStreamRow(stream.ctx, stream, out) {
+			releasePooledRow(out)
 			return context.Cause(stream.ctx)
 		}
 		emitted++
@@ -544,6 +546,7 @@ func streamPagedSimpleSelectPlan(stream *ResultStream, plan *simpleSelectPlan, d
 				return err
 			}
 			if !sendResultStreamRow(stream.ctx, stream, out) {
+				releasePooledRow(out)
 				return context.Cause(stream.ctx)
 			}
 			emitted++
@@ -565,6 +568,19 @@ func sendResultStreamHeader(ctx context.Context, dst chan<- resultStreamHeader, 
 }
 
 func sendResultStreamRow(ctx context.Context, stream *ResultStream, row Row) bool {
+	// Most sends fit in the buffer. Avoid the blocking two-channel select on
+	// that path, while checking cancellation before accepting another row.
+	select {
+	case <-ctx.Done():
+		return false
+	default:
+	}
+	select {
+	case stream.rows <- row:
+		stream.noteProduced()
+		return true
+	default:
+	}
 	select {
 	case stream.rows <- row:
 		stream.noteProduced()

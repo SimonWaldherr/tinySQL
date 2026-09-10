@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -206,37 +207,39 @@ func (s *Scheduler) scheduleCronJob(job *CatalogJob) error {
 		return fmt.Errorf("CRON expression empty for job %q", job.Name)
 	}
 
-	// Parse timezone
-	loc := time.UTC
-	if job.Timezone != "" {
-		var err error
-		loc, err = time.LoadLocation(job.Timezone)
-		if err != nil {
-			log.Printf("Invalid timezone %q for job %q, using UTC", job.Timezone, job.Name)
-			loc = time.UTC
-		}
-	}
-
-	// Create a wrapped scheduler with location
-	parser := cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
-	schedule, err := parser.Parse(job.CronExpr)
+	schedule, err := parseJobCronSchedule(job)
 	if err != nil {
-		return fmt.Errorf("invalid CRON expression %q: %w", job.CronExpr, err)
+		return err
 	}
-
-	// Calculate next run
-	nextRun := schedule.Next(time.Now().In(loc))
+	nextRun := schedule.Next(time.Now())
 	job.NextRunAt = &nextRun
-
-	// Register with cron
-	id, err := s.cron.AddFunc(job.CronExpr, func() {
+	// Register the already parsed schedule, including its timezone. AddFunc
+	// would parse again using the scheduler's default location (UTC).
+	s.cronEntries[job.Name] = s.cron.Schedule(schedule, cron.FuncJob(func() {
 		s.executeJob(job)
-	})
-	if err == nil {
-		s.cronEntries[job.Name] = id
-	}
+	}))
+	return nil
+}
 
-	return err
+func parseJobCronSchedule(job *CatalogJob) (cron.Schedule, error) {
+	parser := cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
+	expr := strings.TrimSpace(job.CronExpr)
+	schedule, err := parser.Parse(expr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid CRON expression %q: %w", job.CronExpr, err)
+	}
+	if spec, ok := schedule.(*cron.SpecSchedule); ok && !strings.HasPrefix(expr, "TZ=") && !strings.HasPrefix(expr, "CRON_TZ=") {
+		loc := time.UTC
+		if job.Timezone != "" {
+			loc, err = time.LoadLocation(job.Timezone)
+			if err != nil {
+				log.Printf("Invalid timezone %q for job %q, using UTC", job.Timezone, job.Name)
+				loc = time.UTC
+			}
+		}
+		spec.Location = loc
+	}
+	return schedule, nil
 }
 
 func (s *Scheduler) unscheduleJobLocked(name string) {
@@ -425,7 +428,7 @@ func (s *Scheduler) calculateNextRun(job *CatalogJob) {
 
 	switch job.ScheduleType {
 	case "INTERVAL":
-		if job.IntervalMs <= 0 {
+		if job.IntervalMs <= 0 || job.IntervalMs > int64((1<<63-1)/time.Millisecond) {
 			log.Printf("Invalid interval for job %q", job.Name)
 			return
 		}
@@ -438,10 +441,7 @@ func (s *Scheduler) calculateNextRun(job *CatalogJob) {
 			job.NextRunAt = &nextRun
 		} else if job.CatchUp {
 			// Catch up missed runs
-			nextRun := job.LastRunAt.Add(interval)
-			for nextRun.Before(now) {
-				nextRun = nextRun.Add(interval)
-			}
+			nextRun := nextIntervalRun(*job.LastRunAt, now, interval)
 			job.NextRunAt = &nextRun
 		} else {
 			// Schedule from now
@@ -450,25 +450,29 @@ func (s *Scheduler) calculateNextRun(job *CatalogJob) {
 		}
 
 	case "CRON":
-		// CRON scheduling handled by cron library
-		// This is called after execution to log next run
-		if job.CronExpr != "" {
-			parser := cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
-			if schedule, err := parser.Parse(job.CronExpr); err == nil {
-				loc := time.UTC
-				if job.Timezone != "" {
-					if l, err := time.LoadLocation(job.Timezone); err == nil {
-						loc = l
-					}
-				}
-				nextRun := schedule.Next(now.In(loc))
-				job.NextRunAt = &nextRun
-			}
+		if schedule, err := parseJobCronSchedule(job); err == nil {
+			nextRun := schedule.Next(now)
+			job.NextRunAt = &nextRun
 		}
 
 	case "ONCE":
 		// Already set during registration
 	}
+}
+
+// nextIntervalRun skips missed ticks arithmetically while preserving the
+// original cadence and inclusive deadline. This takes at most two steps for
+// spans within time.Duration's range, with additional steps for longer spans.
+func nextIntervalRun(last, now time.Time, interval time.Duration) time.Time {
+	next := last.Add(interval)
+	for next.Before(now) {
+		steps := now.Sub(next) / interval
+		if steps == 0 {
+			steps = 1
+		}
+		next = next.Add(steps * interval)
+	}
+	return next
 }
 
 // AddJob registers a new job and schedules it immediately if enabled
