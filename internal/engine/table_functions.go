@@ -2,11 +2,13 @@ package engine
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 
@@ -276,6 +278,29 @@ func (f *CSVTableFunc) Execute(ctx context.Context, args []Expr, env ExecEnv, ro
 
 // ==================== Helper functions (to be implemented) ====================
 
+// Decoded objects are owned by this result. Reuse their map when keys already
+// have the required casing; no stored/native JSON value is passed here.
+func jsonTableRow(value any) Row {
+	if object, ok := value.(map[string]any); ok {
+		lower := true
+		for key := range object {
+			if strings.ToLower(key) != key {
+				lower = false
+				break
+			}
+		}
+		if lower {
+			return Row(object)
+		}
+		row := make(Row, len(object))
+		for key, value := range object {
+			row[strings.ToLower(key)] = value
+		}
+		return row
+	}
+	return Row{"value": value}
+}
+
 func parseJSONToTable(jsonStr string, spec string) (*ResultSet, error) {
 	// Try to unmarshal JSON. Accept either a single object or an array of objects.
 	var anyv any
@@ -289,14 +314,11 @@ func parseJSONToTable(jsonStr string, spec string) (*ResultSet, error) {
 		colsSet := map[string]struct{}{}
 		rows := make([]Row, 0, len(v))
 		for _, item := range v {
-			switch it := item.(type) {
-			case map[string]any:
-				for k := range it {
-					colsSet[strings.ToLower(k)] = struct{}{}
-				}
-			default:
-				colsSet["value"] = struct{}{}
+			r := jsonTableRow(item)
+			for k := range r {
+				colsSet[k] = struct{}{}
 			}
+			rows = append(rows, r)
 		}
 		cols := make([]string, 0, len(colsSet))
 		for c := range colsSet {
@@ -304,18 +326,6 @@ func parseJSONToTable(jsonStr string, spec string) (*ResultSet, error) {
 		}
 		sort.Strings(cols)
 
-		for _, item := range v {
-			r := make(Row)
-			switch it := item.(type) {
-			case map[string]any:
-				for k, val := range it {
-					r[strings.ToLower(k)] = val
-				}
-			default:
-				r["value"] = it
-			}
-			rows = append(rows, r)
-		}
 		return &ResultSet{Cols: cols, Rows: rows}, nil
 	case map[string]any:
 		// Single object -> treat as single-row table with object keys
@@ -324,10 +334,7 @@ func parseJSONToTable(jsonStr string, spec string) (*ResultSet, error) {
 			cols = append(cols, strings.ToLower(k))
 		}
 		sort.Strings(cols)
-		r := make(Row)
-		for k, val := range v {
-			r[strings.ToLower(k)] = val
-		}
+		r := jsonTableRow(v)
 		return &ResultSet{Cols: cols, Rows: []Row{r}}, nil
 	default:
 		// Primitive -> single-column table
@@ -340,28 +347,19 @@ func parseJSONLinesToTable(jsonlStr string) (*ResultSet, error) {
 	colsSet := map[string]struct{}{}
 	rows := []Row{}
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
 			continue
 		}
 		var anyv any
-		if err := json.Unmarshal([]byte(line), &anyv); err != nil {
+		if err := json.Unmarshal(line, &anyv); err != nil {
 			return nil, fmt.Errorf("parse JSONL line: %v", err)
 		}
-		switch it := anyv.(type) {
-		case map[string]any:
-			for k := range it {
-				colsSet[strings.ToLower(k)] = struct{}{}
-			}
-			r := make(Row)
-			for k, val := range it {
-				r[strings.ToLower(k)] = val
-			}
-			rows = append(rows, r)
-		default:
-			colsSet["value"] = struct{}{}
-			rows = append(rows, Row{"value": it})
+		r := jsonTableRow(anyv)
+		for k := range r {
+			colsSet[k] = struct{}{}
 		}
+		rows = append(rows, r)
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
@@ -451,7 +449,7 @@ func parseXMLElement(dec *xml.Decoder, startElem xml.StartElement, colsSet map[s
 	for depth > 0 {
 		nt, err := dec.Token()
 		if err != nil {
-			break
+			return nil, fmt.Errorf("parse XML element %s: %w", startElem.Name.Local, err)
 		}
 		switch tt := nt.(type) {
 		case xml.StartElement:
@@ -467,7 +465,7 @@ func parseXMLElement(dec *xml.Decoder, startElem xml.StartElement, colsSet map[s
 			depth++
 		case xml.CharData:
 			if curElem != "" {
-				buf.WriteString(string(tt))
+				buf.Write(tt)
 			}
 		case xml.EndElement:
 			if curElem != "" && strings.EqualFold(tt.Name.Local, curElem) {
@@ -484,28 +482,33 @@ func parseXMLElement(dec *xml.Decoder, startElem xml.StartElement, colsSet map[s
 }
 
 // findMostFrequentXMLElement finds the most frequent element in XML
-func findMostFrequentXMLElement(xmlStr string) string {
+func findMostFrequentXMLElement(xmlStr string) (string, error) {
 	dec := xml.NewDecoder(strings.NewReader(xmlStr))
 	counts := map[string]int{}
+	var order []string
 	for {
 		tok, err := dec.Token()
-		if err != nil {
+		if err == io.EOF {
 			break
 		}
+		if err != nil {
+			return "", fmt.Errorf("parse XML: %w", err)
+		}
 		if se, ok := tok.(xml.StartElement); ok {
+			if counts[se.Name.Local] == 0 {
+				order = append(order, se.Name.Local)
+			}
 			counts[se.Name.Local]++
 		}
 	}
-	// pick most frequent element (excluding the document root)
-	best := ""
-	bestCount := 0
-	for k, v := range counts {
-		if v > bestCount {
-			best = k
-			bestCount = v
+	best, bestCount := "", 0
+	// Resolve equal frequencies by first appearance, rather than map iteration.
+	for _, name := range order {
+		if counts[name] > bestCount {
+			best, bestCount = name, counts[name]
 		}
 	}
-	return best
+	return best, nil
 }
 
 func parseXMLToTable(xmlStr string, recordName string) (*ResultSet, error) {
@@ -517,6 +520,17 @@ func parseXMLToTable(xmlStr string, recordName string) (*ResultSet, error) {
 		pathSegments = strings.Split(path, "/")
 	}
 
+	if len(pathSegments) == 0 {
+		best, err := findMostFrequentXMLElement(xmlStr)
+		if err != nil {
+			return nil, err
+		}
+		if best == "" {
+			return &ResultSet{Cols: []string{}, Rows: []Row{}}, nil
+		}
+		pathSegments = []string{best}
+	}
+
 	dec := xml.NewDecoder(strings.NewReader(xmlStr))
 	stack := []string{}
 	colsSet := map[string]struct{}{}
@@ -524,8 +538,11 @@ func parseXMLToTable(xmlStr string, recordName string) (*ResultSet, error) {
 
 	for {
 		tok, err := dec.Token()
-		if err != nil {
+		if err == io.EOF {
 			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("parse XML: %w", err)
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:
@@ -533,7 +550,10 @@ func parseXMLToTable(xmlStr string, recordName string) (*ResultSet, error) {
 			// check if current stack matches pathSegments
 			if matchXMLPath(stack, pathSegments) {
 				// Parse this element
-				r, _ := parseXMLElement(dec, t, colsSet)
+				r, err := parseXMLElement(dec, t, colsSet)
+				if err != nil {
+					return nil, err
+				}
 				rows = append(rows, r)
 				// pop the element we matched from stack
 				if len(stack) > 0 {
@@ -544,15 +564,6 @@ func parseXMLToTable(xmlStr string, recordName string) (*ResultSet, error) {
 			if len(stack) > 0 {
 				stack = stack[:len(stack)-1]
 			}
-		}
-	}
-
-	// If no explicit path was given, attempt to guess a repeating child under root
-	if len(pathSegments) == 0 && len(rows) == 0 {
-		best := findMostFrequentXMLElement(xmlStr)
-		if best != "" {
-			// re-run extraction for best
-			return parseXMLToTable(xmlStr, best)
 		}
 	}
 

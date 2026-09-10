@@ -132,6 +132,13 @@ during raw table scans, including grouped queries and matching projected
 aggregates in `HAVING`. Each group and each distinct aggregate has its own
 set; empty input returns zero for an ungrouped distinct count.
 
+JSON path access reuses a bounded cache of parsed paths; document values are
+never cached. JSON/JSONL table conversion reuses freshly decoded objects when
+their keys are already lowercase. Automatic XML record detection uses two
+passes and chooses the first element encountered when frequencies tie. Supply
+an explicit record path to extract XML in one pass. Malformed XML returns an
+error instead of a partial result.
+
 For applications that already use `database/sql`, use
 [`github.com/SimonWaldherr/tinySQL/driver`](./driver).
 

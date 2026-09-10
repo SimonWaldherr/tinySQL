@@ -3,7 +3,44 @@ package engine
 
 import (
 	"strconv"
+	"strings"
+	"sync"
 )
+
+// Cache only path syntax, never document values. Both entry count and retained
+// path length are bounded; callers treat compiled segments as immutable.
+const jsonPathCacheEntries = 256
+const jsonPathCacheMaxBytes = 4096
+
+var jsonPathCache = struct {
+	sync.RWMutex
+	paths map[string][]pathPart
+}{paths: make(map[string][]pathPart)}
+
+func cachedJSONPath(path string) []pathPart {
+	if len(path) > jsonPathCacheMaxBytes {
+		return parseJSONPath(path)
+	}
+	jsonPathCache.RLock()
+	parts, ok := jsonPathCache.paths[path]
+	jsonPathCache.RUnlock()
+	if ok {
+		return parts
+	}
+	// A substring may otherwise retain a much larger input document.
+	path = strings.Clone(path)
+	parts = parseJSONPath(path)
+	jsonPathCache.Lock()
+	defer jsonPathCache.Unlock()
+	if existing, ok := jsonPathCache.paths[path]; ok {
+		return existing
+	}
+	if len(jsonPathCache.paths) >= jsonPathCacheEntries {
+		clear(jsonPathCache.paths)
+	}
+	jsonPathCache.paths[path] = parts
+	return parts
+}
 
 type pathPart struct {
 	key string
@@ -78,7 +115,7 @@ func jsonGet(v any, path string) any {
 	if v == nil || path == "" {
 		return nil
 	}
-	parts := parseJSONPath(path)
+	parts := cachedJSONPath(path)
 	cur := v
 	for _, p := range parts {
 		switch c := cur.(type) {
@@ -103,7 +140,7 @@ func jsonSet(v any, path string, value any) any {
 		return value
 	}
 
-	parts := parseJSONPath(path)
+	parts := cachedJSONPath(path)
 	if len(parts) == 0 {
 		return value
 	}
