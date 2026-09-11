@@ -140,7 +140,7 @@ func (s *webState) handleQuery(w http.ResponseWriter, r *http.Request) {
 	// Handle COPY ... INTO syntax
 	upper := strings.ToUpper(sql)
 	if strings.HasPrefix(upper, "COPY ") && strings.Contains(upper, " INTO ") {
-		s.handleCopyQuery(w, sql)
+		s.handleCopyQuery(r.Context(), w, sql)
 		return
 	}
 
@@ -184,7 +184,7 @@ func (s *webState) handleQuery(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *webState) handleCopyQuery(w http.ResponseWriter, sql string) {
+func (s *webState) handleCopyQuery(ctx context.Context, w http.ResponseWriter, sql string) {
 	upper := strings.ToUpper(sql)
 	intoIdx := strings.LastIndex(upper, " INTO ")
 	// Below index 5 there is no query between "COPY " and INTO, and sql[5:intoIdx]
@@ -219,7 +219,7 @@ func (s *webState) handleCopyQuery(w http.ResponseWriter, sql string) {
 	}
 
 	start := time.Now()
-	result, err := tinysql.Execute(s.ctx, s.db, s.tenant, stmt)
+	result, err := tinysql.Execute(ctx, s.db, s.tenant, stmt)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, apiResponse{Error: fmt.Sprintf("execute error: %v", err)})
 		return
@@ -230,7 +230,7 @@ func (s *webState) handleCopyQuery(w http.ResponseWriter, sql string) {
 		return
 	}
 
-	count, err := exportToExternal(extDB, driver, result, targetTable, true)
+	count, err := exportToExternalContext(ctx, extDB, driver, result, targetTable, true)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, apiResponse{Error: fmt.Sprintf("export error: %v", err)})
 		return

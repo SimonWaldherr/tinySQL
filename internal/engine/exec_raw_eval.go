@@ -299,6 +299,18 @@ type rawCallScratch struct {
 	lits []Literal
 }
 
+// Release references even on argument/handler errors. Oversized one-off calls
+// must not leave large wrapper buffers or document values in the pool.
+func (sc *rawCallScratch) reset() {
+	sc.call = FuncCall{}
+	clear(sc.args)
+	clear(sc.lits)
+	if cap(sc.args) > 256 {
+		sc.args = nil
+		sc.lits = nil
+	}
+}
+
 var rawCallScratchPool = sync.Pool{
 	New: func() any { return new(rawCallScratch) },
 }
@@ -320,6 +332,66 @@ func evalRawFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, erro
 	// through the argument-wrapper pool below evaluates discarded branches
 	// and can raise errors that their ordinary handlers would never reach.
 	switch ex.Name {
+	case "TRIM", "LTRIM", "RTRIM":
+		if len(ex.Args) < 1 || len(ex.Args) > 2 {
+			return nil, fmt.Errorf("%s expects 1 or 2 arguments", ex.Name)
+		}
+		value, err := evalRawExpr(plan, raw, ex.Args[0])
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		str := valueText(value)
+		cutset := ""
+		if len(ex.Args) == 2 {
+			cut, err := evalRawExpr(plan, raw, ex.Args[1])
+			if err != nil {
+				return nil, err
+			}
+			if cut == nil {
+				return nil, nil
+			}
+			var ok bool
+			cutset, ok = cut.(string)
+			if !ok {
+				return nil, fmt.Errorf("%s cutset must be a string", ex.Name)
+			}
+		}
+		side := trimBoth
+		if ex.Name == "LTRIM" {
+			side = trimLeft
+		} else if ex.Name == "RTRIM" {
+			side = trimRight
+		}
+		return trimStringValue(value, str, cutset, side)
+	case "JSON_GET", "JSON_EXTRACT":
+		if len(ex.Args) != 2 {
+			return nil, fmt.Errorf("%s expects (json, path)", ex.Name)
+		}
+		doc, err := evalRawExpr(plan, raw, ex.Args[0])
+		if err != nil {
+			return nil, err
+		}
+		value, err := evalRawExpr(plan, raw, ex.Args[1])
+		if err != nil {
+			return nil, err
+		}
+		path, _ := value.(string)
+		return jsonGet(doc, path), nil
+	case "CONCAT_WS", "COLUMNS_TO_TEXT":
+		if len(ex.Args) < 2 {
+			return nil, fmt.Errorf("CONCAT_WS expects at least 2 arguments")
+		}
+		sep, err := evalRawExpr(plan, raw, ex.Args[0])
+		if err != nil {
+			return nil, err
+		}
+		if sep == nil {
+			return nil, nil
+		}
+		return joinTextValues(valueText(sep), len(ex.Args)-1, func(i int) (any, error) { return evalRawExpr(plan, raw, ex.Args[i+1]) })
 	case "COALESCE", "IFNULL", "NVL":
 		for _, arg := range ex.Args {
 			v, err := evalRawExpr(plan, raw, arg)
@@ -376,7 +448,7 @@ func evalRawFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, erro
 		return caseStringValue(val, ex.Name == "UPPER"), nil
 	}
 	sc := rawCallScratchPool.Get().(*rawCallScratch)
-	defer rawCallScratchPool.Put(sc)
+	defer func() { sc.reset(); rawCallScratchPool.Put(sc) }()
 	if cap(sc.args) < len(ex.Args) {
 		sc.args = make([]Expr, len(ex.Args))
 		sc.lits = make([]Literal, len(ex.Args))

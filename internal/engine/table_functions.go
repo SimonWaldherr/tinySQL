@@ -344,6 +344,8 @@ func parseJSONToTable(jsonStr string, spec string) (*ResultSet, error) {
 
 func parseJSONLinesToTable(jsonlStr string) (*ResultSet, error) {
 	scanner := bufio.NewScanner(strings.NewReader(jsonlStr))
+	// The source is already resident; allow a full input-sized JSON record.
+	scanner.Buffer(make([]byte, 4096), max(bufio.MaxScanTokenSize, len(jsonlStr)+1))
 	colsSet := map[string]struct{}{}
 	rows := []Row{}
 	for scanner.Scan() {

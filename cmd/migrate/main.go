@@ -509,7 +509,7 @@ func runExportDB(args []string) error {
 	}
 
 	start := time.Now()
-	count, err := exportToExternal(extDB, driver, result, *target, *createTable)
+	count, err := exportToExternalContext(ctx, extDB, driver, result, *target, *createTable)
 	if err != nil {
 		return err
 	}
@@ -913,7 +913,7 @@ func handleExport(db *tinysql.DB, ctx context.Context, tenant, input string) {
 	}
 
 	start := time.Now()
-	count, err := exportToExternal(extDB, driver, result, targetTable, true)
+	count, err := exportToExternalContext(ctx, extDB, driver, result, targetTable, true)
 	if err != nil {
 		fmt.Printf("✗ Export error: %v\n", err)
 		return
@@ -1000,7 +1000,7 @@ func handleCopy(db *tinysql.DB, ctx context.Context, tenant, input string) {
 	}
 
 	start := time.Now()
-	count, err := exportToExternal(extDB, driver, result, targetTable, true)
+	count, err := exportToExternalContext(ctx, extDB, driver, result, targetTable, true)
 	if err != nil {
 		fmt.Printf("✗ Export error: %v\n", err)
 		return
@@ -1259,9 +1259,19 @@ func importFromExternal(db *tinysql.DB, ctx context.Context, tenant string, extD
 }
 
 func exportToExternal(extDB *sql.DB, driver string, result *tinysql.ResultSet, targetTable string, createTable bool) (int, error) {
+	return exportToExternalContext(context.Background(), extDB, driver, result, targetTable, createTable)
+}
+
+func exportToExternalContext(ctx context.Context, extDB *sql.DB, driver string, result *tinysql.ResultSet, targetTable string, createTable bool) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if createTable {
 		createSQL := buildExternalCreateTable(driver, targetTable, result.Cols)
-		if _, err := extDB.Exec(createSQL); err != nil {
+		if _, err := extDB.ExecContext(ctx, createSQL); err != nil {
+			if ctx.Err() != nil {
+				return 0, ctx.Err()
+			}
 			// Table might already exist; log but continue with insert
 			fmt.Fprintf(os.Stderr, "Note: CREATE TABLE skipped (%v)\n", err)
 		}
@@ -1283,28 +1293,33 @@ func exportToExternal(extDB *sql.DB, driver string, result *tinysql.ResultSet, t
 		strings.Join(quotedCols, ", "),
 		strings.Join(placeholders, ", "))
 
-	tx, err := extDB.Begin()
+	tx, err := extDB.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, fmt.Errorf("failed to begin transaction: %v", err)
 	}
 
-	stmt, err := tx.Prepare(insertSQL)
+	defer tx.Rollback()
+	stmt, err := tx.PrepareContext(ctx, insertSQL)
 	if err != nil {
 		tx.Rollback()
 		return 0, fmt.Errorf("failed to prepare insert: %v", err)
 	}
 	defer stmt.Close()
 
+	keys := make([]string, len(result.Cols))
+	for i, col := range result.Cols {
+		keys[i] = strings.ToLower(col)
+	}
+	values := make([]any, len(keys))
 	count := 0
 	for _, row := range result.Rows {
-		values := make([]any, len(result.Cols))
-		for i, col := range result.Cols {
-			values[i] = row[strings.ToLower(col)]
+		for i, key := range keys {
+			values[i] = row[key]
 		}
 
-		if _, err := stmt.Exec(values...); err != nil {
+		if _, err := stmt.ExecContext(ctx, values...); err != nil {
 			tx.Rollback()
-			return count, fmt.Errorf("insert failed at row %d: %v", count+1, err)
+			return 0, fmt.Errorf("insert failed at row %d (transaction rolled back): %w", count+1, err)
 		}
 		count++
 	}

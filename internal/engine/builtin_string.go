@@ -94,7 +94,7 @@ func evalJSONExtended(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 			return nil, err
 		}
 		ps, _ := pv.(string)
-		return jsonSet(jv, ps, val), nil
+		return jsonSet(cloneJSONUpdatePath(jv, cachedJSONPath(ps)), ps, val), nil
 
 	case "JSON_EXTRACT":
 		// Alias for JSON_GET
@@ -197,6 +197,10 @@ func evalTrimCommon(env ExecEnv, name string, side trimSide, args []Expr, row Ro
 		}
 	}
 
+	return trimStringValue(val, str, cutset, side)
+}
+
+func trimStringValue(val any, str, cutset string, side trimSide) (any, error) {
 	var trimmed string
 	if cutset == "" {
 		// Default: Unicode-aware whitespace trimming. strings.TrimSpace
@@ -1086,18 +1090,42 @@ func evalConcatWs(env ExecEnv, args []Expr, row Row) (any, error) {
 	if sepVal == nil {
 		return nil, nil
 	}
-	sep := valueText(sepVal)
-	var parts []string
-	for _, arg := range args[1:] {
-		v, err := evalExpr(env, arg, row)
+	return joinTextValues(valueText(sepVal), len(args)-1, func(i int) (any, error) { return evalExpr(env, args[i+1], row) })
+}
+
+// Avoid a temporary field slice. Keep the first value unchanged until a
+// second non-NULL field requires joining; empty fields still occupy positions.
+func joinTextValues(sep string, n int, value func(int) (any, error)) (any, error) {
+	var first string
+	count := 0
+	var out strings.Builder
+	for i := 0; i < n; i++ {
+		v, err := value(i)
 		if err != nil {
 			return nil, err
 		}
-		if v != nil {
-			parts = append(parts, valueText(v))
+		if v == nil {
+			continue
 		}
+		text := valueText(v)
+		switch count {
+		case 0:
+			first = text
+		case 1:
+			out.Grow(len(first) + len(sep) + len(text))
+			out.WriteString(first)
+			out.WriteString(sep)
+			out.WriteString(text)
+		default:
+			out.WriteString(sep)
+			out.WriteString(text)
+		}
+		count++
 	}
-	return strings.Join(parts, sep), nil
+	if count < 2 {
+		return first, nil
+	}
+	return out.String(), nil
 }
 
 func evalPosition(env ExecEnv, args []Expr, row Row) (any, error) {

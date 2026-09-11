@@ -149,6 +149,11 @@ migrate export-file -files users.csv,orders.csv \
 
 ### export-db
 
+Exports reuse column mappings and parameter buffers and pass cancellation to
+the target driver's transaction, preparation, and INSERT calls. Web COPY
+requests also stop when the request is canceled. If an INSERT fails, the
+transaction is rolled back and the exported-row count is zero.
+
 ```bash
 migrate export-db -dsn "sqlite://output.db" -files users.csv \
   -table users -target users_backup

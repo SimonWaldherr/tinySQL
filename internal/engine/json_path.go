@@ -2,6 +2,8 @@
 package engine
 
 import (
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -241,4 +243,39 @@ func jsonSet(v any, path string, value any) any {
 	}
 
 	return v
+}
+
+// Clone only containers that JSON_SET may mutate. Unchanged branches can be
+// shared because each subsequent SQL update clones its own path again.
+func cloneJSONUpdatePath(v any, parts []pathPart) any {
+	if len(parts) == 0 {
+		return v
+	}
+	p := parts[0]
+	switch c := v.(type) {
+	case map[string]any:
+		if p.idx >= 0 {
+			return v
+		}
+		out := maps.Clone(c)
+		if out == nil {
+			out = make(map[string]any)
+		}
+		if len(parts) > 1 {
+			out[p.key] = cloneJSONUpdatePath(c[p.key], parts[1:])
+		}
+		return out
+	case []any:
+		idx, ok := arrayIndex(p)
+		if !ok {
+			return v
+		}
+		out := slices.Clone(c)
+		if len(parts) > 1 && idx < len(c) {
+			out[idx] = cloneJSONUpdatePath(c[idx], parts[1:])
+		}
+		return out
+	default:
+		return v
+	}
 }

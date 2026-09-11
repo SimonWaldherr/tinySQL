@@ -139,6 +139,13 @@ passes and chooses the first element encountered when frequencies tie. Supply
 an explicit record path to extract XML in one pass. Malformed XML returns an
 error instead of a partial result.
 
+SQL `JSON_SET` copies the containers along the updated path, so using it in a
+SELECT does not mutate the stored document. Persist a change with
+`UPDATE ... SET document = JSON_SET(document, path, value)`.
+JSONL table input supports individual records larger than 64 KiB, up to the
+supplied input size. Scalar-call scratch buffers release argument references
+after each call, including when evaluation fails.
+
 Use `TEXT_TO_COLUMNS(text, delimiter)` to split one text into a single row
 with columns named `column1`, `column2`, and so on. Use aliases to name the
 fields, and `COLUMNS_TO_TEXT(delimiter, value, ...)` to join selected columns:
