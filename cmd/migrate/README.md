@@ -93,6 +93,24 @@ migrate import-file -file users.yaml -table users
 
 ### import-db
 
+Full database imports stream source rows through `database/sql` and issue
+multi-row INSERTs with up to 256 rows or approximately 1 MiB of staged values.
+A larger individual row is processed alone. This bounds the staging buffer,
+not the memory occupied by the target database. Scan destinations and column
+mappings are reused across rows.
+
+Failed INSERT batches are rolled back and retried row by row in source order;
+skipped rows retain their source row numbers in the error report. Imports can
+therefore be partial, as before. Cancellation stops processing and the reported
+count includes only rows already committed to tinySQL.
+
+DECIMAL/NUMERIC/MONEY metadata maps to exact decimal values; BLOB/BINARY/BYTEA
+metadata maps to binary data. Text returned as byte slices is decoded as text.
+Precision already lost by a source query or driver cannot be reconstructed.
+Columns whose names collide after normalization must be given distinct aliases
+in the source query. These changes use the existing drivers and standard Go
+packages; no additional module dependencies are required.
+
 ```bash
 migrate import-db -dsn "postgres://user:pass@localhost/mydb?sslmode=disable" \
   -source-table users -table users

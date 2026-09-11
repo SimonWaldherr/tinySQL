@@ -1190,42 +1190,71 @@ func importFromExternal(db *tinysql.DB, ctx context.Context, tenant string, extD
 		return stats, fmt.Errorf("failed to get column types: %v", err)
 	}
 
-	// Build CREATE TABLE statement
-	createSQL := buildCreateTable(tableName, cols, colTypes)
-	createStmt, err := tinysql.ParseSQL(createSQL)
+	names, kinds, err := externalImportColumns(cols, colTypes)
 	if err != nil {
-		return stats, fmt.Errorf("failed to parse CREATE TABLE: %v", err)
+		return stats, err
 	}
-
-	if _, err := tinysql.Execute(ctx, db, tenant, createStmt); err != nil {
-		return stats, fmt.Errorf("failed to create table: %v", err)
+	builder := tinysql.NewTableBuilder(tableName)
+	for i, name := range names {
+		builder.Column(name, externalTinyType(kinds[i]))
 	}
-
-	// Insert rows
+	if _, err := tinysql.Execute(ctx, db, tenant, builder.Build()); err != nil {
+		return stats, fmt.Errorf("failed to create table: %w", err)
+	}
+	values := make([]any, len(cols))
+	valuePtrs := make([]any, len(cols))
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+	batch := make([]externalImportRow, 0, externalImportBatchRows)
+	batchBytes := 0
+	flush := func() error {
+		err := insertExternalBatch(ctx, db, tenant, tableName, names, batch, &stats)
+		clear(batch)
+		batch = batch[:0]
+		batchBytes = 0
+		return err
+	}
 	rowNum := 0
 	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
 		rowNum++
-		values := make([]any, len(cols))
-		valuePtrs := make([]any, len(cols))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-
 		if err := rows.Scan(valuePtrs...); err != nil {
+			if flushErr := flush(); flushErr != nil {
+				return stats, flushErr
+			}
 			stats.note(rowNum, "scan", err)
-		} else if _, err := tinysql.Execute(ctx, db, tenant, buildInsertStmt(tableName, cols, values)); err != nil {
-			stats.note(rowNum, "insert", err)
 		} else {
-			stats.Imported++
-			continue
+			owned, size, err := normalizeExternalRow(values, kinds)
+			if err != nil {
+				if flushErr := flush(); flushErr != nil {
+					return stats, flushErr
+				}
+				stats.note(rowNum, "convert", err)
+			} else {
+				if len(batch) > 0 && size > externalImportBatchBytes-batchBytes {
+					if err := flush(); err != nil {
+						return stats, err
+					}
+				}
+				batch = append(batch, externalImportRow{values: owned, number: rowNum})
+				batchBytes += size
+				if len(batch) >= externalImportBatchRows || batchBytes >= externalImportBatchBytes {
+					if err := flush(); err != nil {
+						return stats, err
+					}
+				}
+			}
 		}
-
-		if stats.Skipped > importMaxSkippedRows {
-			return stats, fmt.Errorf("import into %s aborted: more than %d source rows could not be imported (last: %s)",
-				tableName, importMaxSkippedRows, stats.Errors[len(stats.Errors)-1])
+		if err := externalImportSkipError(stats, tableName); err != nil {
+			return stats, err
 		}
 	}
-
+	if err := flush(); err != nil {
+		return stats, err
+	}
 	return stats, rows.Err()
 }
 
@@ -1553,10 +1582,12 @@ func mapExternalType(ct *sql.ColumnType) string {
 	switch {
 	case strings.Contains(typeName, "INT"):
 		return "INT"
-	case strings.Contains(typeName, "FLOAT") || strings.Contains(typeName, "DOUBLE") ||
-		strings.Contains(typeName, "REAL") || strings.Contains(typeName, "NUMERIC") ||
-		strings.Contains(typeName, "DECIMAL"):
+	case strings.Contains(typeName, "DECIMAL") || strings.Contains(typeName, "NUMERIC") || strings.Contains(typeName, "MONEY"):
+		return "DECIMAL"
+	case strings.Contains(typeName, "FLOAT") || strings.Contains(typeName, "DOUBLE") || strings.Contains(typeName, "REAL"):
 		return "FLOAT"
+	case strings.Contains(typeName, "BLOB") || strings.Contains(typeName, "BINARY") || typeName == "BYTEA" || typeName == "IMAGE":
+		return "BLOB"
 	case strings.Contains(typeName, "BOOL"):
 		return "BOOL"
 	case strings.Contains(typeName, "TIME") || strings.Contains(typeName, "DATE"):

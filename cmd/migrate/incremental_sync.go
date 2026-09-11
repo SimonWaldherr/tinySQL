@@ -187,16 +187,24 @@ func fetchExternalRows(ctx context.Context, extDB *sql.DB, query string, args ..
 		return nil, nil, nil, fmt.Errorf("failed to get column types: %w", err)
 	}
 
+	values := make([]any, len(cols))
+	ptrs := make([]any, len(cols))
+	_, kinds, err := externalImportColumns(cols, colTypes)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	for i := range values {
+		ptrs[i] = &values[i]
+	}
 	for rows.Next() {
-		values := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range values {
-			ptrs[i] = &values[i]
-		}
 		if err := rows.Scan(ptrs...); err != nil {
 			return nil, nil, nil, fmt.Errorf("scan row: %w", err)
 		}
-		rowsOut = append(rowsOut, values)
+		owned, _, err := normalizeExternalRow(values, kinds)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		rowsOut = append(rowsOut, owned)
 	}
 	return cols, colTypes, rowsOut, rows.Err()
 }
