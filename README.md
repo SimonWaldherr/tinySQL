@@ -110,6 +110,28 @@ schema without evaluating row expressions or collecting index candidates.
 Paged Index storage can answer these schema queries without loading data rows.
 Column validation and context cancellation still apply.
 
+For compact materialized results, `ExecSQLColumnar` (or `ExecuteColumnar` for a
+parsed SELECT) returns `Values[column][row]`, `Cols`, and `RowCount`:
+
+```go
+result, err := tinysql.ExecSQLColumnar(ctx, db, "default",
+	`SELECT id, name FROM users WHERE active = true`)
+if err != nil { panic(err) }
+for row := 0; row < result.RowCount; row++ {
+	fmt.Println(result.Values[0][row], result.Values[1][row])
+}
+```
+
+Simple unordered scans project directly into column slices, avoiding a map per
+result row. Other SELECTs retain the existing executor and transpose the final
+result; non-SELECT statements are rejected. Results are fully materialized and
+NULL cells are `nil`. The existing `Row` API is unchanged.
+
+Large direct-column `SUM`/`AVG` queries, optionally with `COUNT`, filters and
+grouping, can use bounded typed batches. `EXPLAIN` reports `BATCH AGGREGATE`
+when eligible. See [columnar execution and measurements](docs/columnar-execution.md)
+for the supported shapes, scalar fallbacks, and before/after benchmarks.
+
 `COALESCE`, `IFNULL` and `NVL` stop at the first non-NULL argument; `IF` and
 `IIF` evaluate only the selected branch, including in raw scans and streams.
 Unused fallbacks such as `COALESCE(value, 1 / 0)` therefore do not raise an

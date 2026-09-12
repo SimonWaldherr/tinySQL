@@ -93,6 +93,10 @@ func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 		return nil, true, err
 	}
 
+	if cols, ops, ok := buildAggregateBatch(plan, rawPlan); ok {
+		return executeAggregateBatches(env, plan, rawPlan, cols, ops)
+	}
+
 	if len(plan.groupCols) == 1 {
 		return executeSimpleSingleGroupAggregate(env, plan, rawPlan)
 	}

@@ -1,0 +1,384 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/all/maps    	      13	  25902897 ns/op	45089368 B/op	  262149 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/all/columns 	     100	   3729975 ns/op	 4194984 B/op	       8 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/half/maps    	      44	  15662685 ns/op	24796376 B/op	  131096 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/half/columns 	     100	   6951165 ns/op	11079080 B/op	      46 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/sparse/maps    	     217	   1748753 ns/op	  470408 B/op	    2632 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/sparse/columns 	     254	   1417486 ns/op	  118184 B/op	      18 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/aggregate_fallback/maps    	      81	   3846183 ns/op	   20080 B/op	     251 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/aggregate_fallback/columns 	      87	   3582814 ns/op	   20736 B/op	     256 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/all/columns 	     100	   3895037 ns/op	 4194984 B/op	       8 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/all/maps    	      13	  25184724 ns/op	45089368 B/op	  262149 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/half/columns 	     100	   6283445 ns/op	11079080 B/op	      46 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/half/maps    	      44	  14795613 ns/op	24796376 B/op	  131096 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/sparse/columns 	     266	   1315785 ns/op	  118184 B/op	      18 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/sparse/maps    	     254	   1525033 ns/op	  470408 B/op	    2632 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/aggregate_fallback/columns 	      97	   3564404 ns/op	   20736 B/op	     256 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/aggregate_fallback/maps    	      99	   3574647 ns/op	   20080 B/op	     251 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/all/maps    	      13	  25930218 ns/op	45089368 B/op	  262149 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/all/columns 	     100	   3738281 ns/op	 4194984 B/op	       8 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/half/maps    	      43	  15690995 ns/op	24796376 B/op	  131096 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/half/columns 	     100	   6237000 ns/op	11079080 B/op	      46 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/sparse/maps    	     255	   1524512 ns/op	  470408 B/op	    2632 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/sparse/columns 	     282	   1284351 ns/op	  118184 B/op	      18 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/aggregate_fallback/maps    	      96	   3579832 ns/op	   20080 B/op	     251 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/aggregate_fallback/columns 	      97	   3570143 ns/op	   20736 B/op	     256 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/all/columns 	     100	   3899638 ns/op	 4194984 B/op	       8 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/all/maps    	      13	  25345593 ns/op	45089368 B/op	  262149 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/half/columns 	     100	   6126498 ns/op	11079080 B/op	      46 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/half/maps    	      45	  14627794 ns/op	24796376 B/op	  131096 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/sparse/columns 	     283	   1273891 ns/op	  118184 B/op	      18 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/sparse/maps    	     256	   1515209 ns/op	  470408 B/op	    2632 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/aggregate_fallback/columns 	      96	   3587271 ns/op	   20736 B/op	     256 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/aggregate_fallback/maps    	      97	   3562002 ns/op	   20080 B/op	     251 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/all/maps    	      13	  25756673 ns/op	45089369 B/op	  262149 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/all/columns 	     100	   3679778 ns/op	 4194984 B/op	       8 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/half/maps    	      45	  14687974 ns/op	24796376 B/op	  131096 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/half/columns 	     100	   6261500 ns/op	11079080 B/op	      46 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/sparse/maps    	     249	   1530068 ns/op	  470408 B/op	    2632 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/sparse/columns 	     284	   1275974 ns/op	  118184 B/op	      18 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/aggregate_fallback/maps    	      98	   3555533 ns/op	   20080 B/op	     251 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/aggregate_fallback/columns 	      98	   3585755 ns/op	   20736 B/op	     256 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/all/columns 	     100	   3702839 ns/op	 4194984 B/op	       8 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/all/maps    	      13	  26471510 ns/op	45089369 B/op	  262149 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/half/columns 	     100	   6310383 ns/op	11079080 B/op	      46 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/half/maps    	      45	  14898386 ns/op	24796376 B/op	  131096 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/sparse/columns 	     278	   1290376 ns/op	  118184 B/op	      18 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/sparse/maps    	     247	   1544391 ns/op	  470408 B/op	    2632 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/aggregate_fallback/columns 	      98	   3571240 ns/op	   20736 B/op	     256 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/aggregate_fallback/maps    	      96	   3568027 ns/op	   20080 B/op	     251 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/all/maps    	      14	  25277979 ns/op	45089369 B/op	  262149 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/all/columns 	     100	   3692402 ns/op	 4194984 B/op	       8 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/half/maps    	      45	  14985403 ns/op	24796376 B/op	  131096 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/half/columns 	     100	   6256365 ns/op	11079080 B/op	      46 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/sparse/maps    	     253	   1516715 ns/op	  470408 B/op	    2632 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/sparse/columns 	     280	   1274861 ns/op	  118184 B/op	      18 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/aggregate_fallback/maps    	      97	   3560445 ns/op	   20080 B/op	     251 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/aggregate_fallback/columns 	      94	   3568790 ns/op	   20736 B/op	     256 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/all/columns 	     100	   3678478 ns/op	 4194984 B/op	       8 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/all/maps    	      13	  26352397 ns/op	45089368 B/op	  262149 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/half/columns 	     100	   6273695 ns/op	11079080 B/op	      46 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/half/maps    	      43	  14989706 ns/op	24796376 B/op	  131096 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/sparse/columns 	     282	   1276484 ns/op	  118184 B/op	      18 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/sparse/maps    	     254	   1567497 ns/op	  470408 B/op	    2632 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/aggregate_fallback/columns 	      88	   3915216 ns/op	   20736 B/op	     256 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnarOutput/aggregate_fallback/maps    	      80	   3899638 ns/op	   20080 B/op	     251 allocs/op
+PASS

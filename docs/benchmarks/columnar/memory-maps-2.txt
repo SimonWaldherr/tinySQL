@@ -1,0 +1,22 @@
+=== RUN   TestColumnarMemory
+format=maps fixture_heap=72629336 alloc_delta=45095896 retained_delta=45089232 heap_after_query=117725232
+--- PASS: TestColumnarMemory (0.09s)
+PASS
+        0.10 real         0.08 user         0.00 sys
+           144293888  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+                9113  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   3  signals received
+                   0  voluntary context switches
+                  96  involuntary context switches
+          1610631494  instructions retired
+           332734178  cycles elapsed
+           133923464  peak memory footprint

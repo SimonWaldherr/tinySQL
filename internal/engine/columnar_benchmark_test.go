@@ -1,0 +1,95 @@
+package engine
+
+import (
+	"fmt"
+	"testing"
+
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
+)
+
+// columnarFixture deliberately uses the existing row store. Measurements include
+// any conversion performed by execution, not a pre-built column cache. Padding
+// is shared immutable text; width measures row layout, not unique text payloads.
+func columnarFixture(tb testing.TB, n, width int) *storage.DB {
+	tb.Helper()
+	db := storage.NewDB()
+	tb.Cleanup(func() { _ = db.Close() })
+	cols := []storage.Column{
+		{Name: "id", Type: storage.IntType},
+		{Name: "grp", Type: storage.IntType},
+		{Name: "amount", Type: storage.Float64Type},
+		{Name: "quantity", Type: storage.IntType},
+	}
+	for len(cols) < width {
+		cols = append(cols, storage.Column{Name: fmt.Sprintf("padding%d", len(cols)), Type: storage.TextType})
+	}
+	table := storage.NewTable("batch_facts", cols, false)
+	table.Rows = make([][]any, n)
+	for i := range table.Rows {
+		row := make([]any, width)
+		row[0], row[1], row[2], row[3] = i, i%16, float64(i%1000)/8, i%17
+		if i%19 == 0 {
+			row[2] = nil
+		}
+		for j := 4; j < width; j++ {
+			row[j] = "shared padding payload"
+		}
+		table.Rows[i] = row
+	}
+	if err := db.Put("default", table); err != nil {
+		tb.Fatal(err)
+	}
+	return db
+}
+
+func BenchmarkColumnar(b *testing.B) {
+	for _, width := range []int{4, 32} {
+		b.Run(fmt.Sprintf("width%d", width), func(b *testing.B) {
+			db := columnarFixture(b, 131072, width)
+			for _, q := range []struct{ name, sql string }{
+				{"sum", `SELECT SUM(amount) AS total FROM batch_facts`},
+				{"sum_avg_count", `SELECT SUM(amount),AVG(amount),COUNT(amount),SUM(quantity),COUNT(*) FROM batch_facts`},
+				{"filter50", `SELECT SUM(amount),AVG(amount),COUNT(*) FROM batch_facts WHERE id>=65536`},
+				{"filter1", `SELECT SUM(amount),AVG(amount),COUNT(*) FROM batch_facts WHERE id>=129761`},
+				{"filter0", `SELECT SUM(amount),COUNT(*) FROM batch_facts WHERE id<0`},
+				{"group16", `SELECT grp,SUM(amount),AVG(amount),COUNT(*) FROM batch_facts GROUP BY grp`},
+				{"group_many", `SELECT id,SUM(amount),COUNT(*) FROM batch_facts GROUP BY id`},
+				{"minmax_control", `SELECT MIN(amount),MAX(amount) FROM batch_facts`},
+				{"select_sparse_control", `SELECT id,amount FROM batch_facts WHERE id>=129761`},
+				{"select_dense_control", `SELECT id,amount FROM batch_facts WHERE id>=65536`},
+			} {
+				b.Run(q.name, func(b *testing.B) { runColumnarBenchmark(b, db, q.sql) })
+			}
+		})
+	}
+	for _, n := range []int{0, 128, 2048} {
+		b.Run(fmt.Sprintf("small%d", n), func(b *testing.B) {
+			db := columnarFixture(b, n, 4)
+			runColumnarBenchmark(b, db, `SELECT SUM(amount),AVG(amount),COUNT(*) FROM batch_facts WHERE id>=64`)
+		})
+	}
+	b.Run("index_point_control", func(b *testing.B) {
+		db := columnarFixture(b, 131072, 4)
+		if _, err := Execute(b.Context(), db, "default", mustParse(`CREATE INDEX batch_id ON batch_facts(id)`)); err != nil {
+			b.Fatal(err)
+		}
+		runColumnarBenchmark(b, db, `SELECT SUM(amount),COUNT(*) FROM batch_facts WHERE id=10000`)
+	})
+}
+
+func runColumnarBenchmark(b *testing.B, db *storage.DB, sql string) {
+	b.Helper()
+	stmt := mustParse(sql)
+	// Warm statement/index caches equally on both revisions. Dataset generation,
+	// SQL parsing and this warmup are excluded from the timed region.
+	if _, err := Execute(b.Context(), db, "default", stmt); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		rs, err := Execute(b.Context(), db, "default", stmt)
+		if err != nil || rs == nil {
+			b.Fatalf("execute: %v", err)
+		}
+	}
+}

@@ -1,0 +1,23 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnar/width4/sum_avg_count         	     151	   1585666 ns/op	   43752 B/op	      41 allocs/op
+BenchmarkColumnar/width4/sum_avg_count         	     148	   1594875 ns/op	   43752 B/op	      41 allocs/op
+BenchmarkColumnar/width4/sum_avg_count         	     152	   1548700 ns/op	   43752 B/op	      41 allocs/op
+BenchmarkColumnar/width4/filter1               	     427	    559771 ns/op	   20896 B/op	      37 allocs/op
+BenchmarkColumnar/width4/filter1               	     427	    561005 ns/op	   20896 B/op	      37 allocs/op
+BenchmarkColumnar/width4/filter1               	     429	    557864 ns/op	   20896 B/op	      37 allocs/op
+BenchmarkColumnar/width4/group16               	      70	   3432911 ns/op	   33328 B/op	     229 allocs/op
+BenchmarkColumnar/width4/group16               	      67	   3422399 ns/op	   33328 B/op	     229 allocs/op
+BenchmarkColumnar/width4/group16               	      70	   3409986 ns/op	   33328 B/op	     229 allocs/op
+BenchmarkColumnar/width32/sum_avg_count        	     100	   2047277 ns/op	   48136 B/op	      97 allocs/op
+BenchmarkColumnar/width32/sum_avg_count        	     100	   2059214 ns/op	   48136 B/op	      97 allocs/op
+BenchmarkColumnar/width32/sum_avg_count        	     100	   2033737 ns/op	   48136 B/op	      97 allocs/op
+BenchmarkColumnar/width32/filter1              	     169	   1376436 ns/op	   25280 B/op	      93 allocs/op
+BenchmarkColumnar/width32/filter1              	     180	   1328087 ns/op	   25280 B/op	      93 allocs/op
+BenchmarkColumnar/width32/filter1              	     180	   1327006 ns/op	   25280 B/op	      93 allocs/op
+BenchmarkColumnar/width32/group16              	      60	   3955631 ns/op	   37712 B/op	     285 allocs/op
+BenchmarkColumnar/width32/group16              	      58	   3962213 ns/op	   37712 B/op	     285 allocs/op
+BenchmarkColumnar/width32/group16              	      57	   3969274 ns/op	   37712 B/op	     285 allocs/op
+PASS

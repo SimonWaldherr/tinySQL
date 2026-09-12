@@ -1,0 +1,16 @@
+{
+  "utc": "2026-09-12T21:06:59.658584+00:00",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "go": "go version go1.27.1 darwin/arm64",
+  "baseline_commit": "7f5bf487157fedab77f313595b8a1e1e5cf10796",
+  "GOMAXPROCS": 1,
+  "GOGC": 100,
+  "benchtime": "300ms",
+  "paired_rounds": 8,
+  "batch_size": 256,
+  "binary_sha256": {
+    "before": "0fb3639b22b9d5d0d6100ef9e41849262c6f972f1b17c87015b5f119c21583ef",
+    "after": "2c99ab9ed2ac3c6fed4e741dacaa5eeee232b70c9589c8b9390db4804d4a9adc"
+  },
+  "harness_sha256": "819e68471de5186236e9d56860ef917b0dee190d64a8e54e685414930a15885d"
+}

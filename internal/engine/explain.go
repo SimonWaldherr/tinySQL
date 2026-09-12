@@ -96,11 +96,13 @@ func explainSelect(env ExecEnv, rows *[]Row, sel *Select, prefix string) {
 		explainSelect(env, rows, cte.Select, "cte ")
 	}
 	if sel.From.Table != "" || sel.From.Subquery != nil || sel.From.TableFunc != nil {
+		batchAggregate := false
 		plan, ok, err := buildSimpleSelectPlan(env, sel)
 		if err == nil && !ok {
 			if aggregate, supported, aggErr := buildSimpleAggregatePlan(env, sel); aggErr == nil && supported {
 				plan, err = buildSimpleAggregateSourcePlan(aggregate)
 				ok = err == nil
+				batchAggregate = ok && aggregateBatchEligible(aggregate, plan)
 			}
 		}
 		if err == nil && ok {
@@ -109,6 +111,9 @@ func explainSelect(env ExecEnv, rows *[]Row, sel *Select, prefix string) {
 				detail += fmt.Sprintf(" index=%s predicates=%s residual_filter=%t covering_index=%t", plan.indexName, strings.Join(plan.indexPredicates, ", "), plan.residualFilter, plan.coveringIndex)
 			}
 			addExplainStep(rows, plan.scanType, detail)
+			if batchAggregate {
+				addExplainStep(rows, "BATCH AGGREGATE", fmt.Sprintf("batch_size=%d runtime_scalar_fallback=true", aggregateBatchSize))
+			}
 		} else {
 			explainFrom(env, rows, "SCAN", sel.From, prefix)
 		}

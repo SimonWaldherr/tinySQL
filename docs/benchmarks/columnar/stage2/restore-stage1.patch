@@ -1,0 +1,111 @@
+--- a/internal/engine/columnar.go
++++ b/internal/engine/columnar.go
+@@ -96,0 +97 @@
++	values := make([]any, len(plan.projs))
+@@ -111,4 +111,0 @@
+-	var skippedValues []any
+-	if offset > 0 {
+-		skippedValues = make([]any, len(plan.projs))
+-	}
+@@ -128 +125 @@
+-		match := plan.where == nil || plan.filterFullyCovered
++		match := plan.filterFullyCovered
+@@ -137,0 +135,3 @@
++		if err := projectRawValues(plan, rows[id], values); err != nil {
++			return true, err
++		}
+@@ -139,3 +138,0 @@
+-			if err := projectRawValues(plan, rows[id], skippedValues); err != nil {
+-				return true, err
+-			}
+@@ -145,15 +142,2 @@
+-		// Explicit geometric growth avoids repeatedly copying large interface
+-		// arrays under append's more conservative growth rule. Bound the target
+-		// by remaining candidates and LIMIT; a sparse tail cannot produce more
+-		// rows than remain in the source. All columns always have equal length.
+-		if len(out.Values) > 0 && len(out.Values[0]) == cap(out.Values[0]) {
+-			additional := min(max(out.RowCount, 64), n-i)
+-			if plan.limit != nil {
+-				additional = min(additional, *plan.limit-out.RowCount)
+-			}
+-			for c := range out.Values {
+-				out.Values[c] = slices.Grow(out.Values[c], additional)
+-			}
+-		}
+-		if err := appendColumnarRow(plan, rows[id], out); err != nil {
+-			return true, err
++		for c, v := range values {
++			out.Values[c] = append(out.Values[c], v)
+@@ -173,20 +156,0 @@
+-
+-// Evaluate projections in the same order as projectRawValues/projectRawRow,
+-// but write directly into the caller-owned columns without a scratch value
+-// slice and a second pass. A partial row on error is never returned to callers.
+-func appendColumnarRow(plan *simpleSelectPlan, raw []any, out *ColumnarResultSet) error {
+-	for c, p := range plan.projs {
+-		var v any
+-		if p.colIdx >= 0 {
+-			v = raw[p.colIdx]
+-		} else {
+-			var err error
+-			v, err = evalRawExpr(plan, raw, p.expr)
+-			if err != nil {
+-				return err
+-			}
+-		}
+-		out.Values[c] = append(out.Values[c], v)
+-	}
+-	return nil
+-}
+--- a/internal/engine/exec_aggregate_batch.go
++++ b/internal/engine/exec_aggregate_batch.go
+@@ -22 +21,0 @@
+-	copyFrom   int // canonical projection + 1; zero means accumulate this op
+@@ -96,17 +94,0 @@
+-	// Numeric SUM/AVG/COUNT of the same column have identical sample counts,
+-	// and SUM/AVG have identical running sums. Accumulate one representative
+-	// while batches remain numeric. COUNT(*) duplicates can share too.
+-	for i, op := range ops {
+-		for _, candidate := range ops {
+-			if candidate.column != op.column {
+-				continue
+-			}
+-			if op.column >= 0 && cols[op.column].numeric && candidate.kind == aggCount {
+-				continue // a count cannot supply the sum needed by SUM/AVG
+-			}
+-			if candidate.projection != op.projection {
+-				ops[i].copyFrom = candidate.projection + 1
+-			}
+-			break
+-		}
+-	}
+@@ -164,6 +145,0 @@
+-			if scalar {
+-				// Materialize shared states before the first scalar row. COUNT(x)
+-				// and SUM(x) can diverge on nonnumeric values, and decimal promotion
+-				// must see each aggregate's complete preceding numeric history.
+-				copyAggregateBatchStates(order, ops)
+-			}
+@@ -211,3 +186,0 @@
+-			if op.copyFrom != 0 {
+-				continue
+-			}
+@@ -221,3 +193,0 @@
+-	if !scalar {
+-		copyAggregateBatchStates(order, ops)
+-	}
+@@ -226,14 +195,0 @@
+-}
+-
+-func copyAggregateBatchStates(states []*simpleAggregateState, ops []aggregateBatchOp) {
+-	for _, op := range ops {
+-		if op.copyFrom == 0 {
+-			continue
+-		}
+-		for _, state := range states {
+-			state.counts[op.projection] = state.counts[op.copyFrom-1]
+-			if op.kind != aggCount {
+-				state.sumFloat[op.projection] = state.sumFloat[op.copyFrom-1]
+-			}
+-		}
+-	}

@@ -14,6 +14,12 @@ import (
 // finalization. Keeping it separate from execStmt lets statement handlers
 // focus exclusively on their SQL semantics.
 func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt Statement) (rs *ResultSet, err error) {
+	return executeStatementWithColumns(ctx, db, tenant, stmt, nil)
+}
+
+// columns affects only the outermost result. Nested SELECTs keep Row maps, and
+// both public result formats share authorization, locks, recovery and auditing.
+func executeStatementWithColumns(ctx context.Context, db *storage.DB, tenant string, stmt Statement, columns *ColumnarResultSet) (rs *ResultSet, err error) {
 	var notifyTables []storage.TableRef
 	if err := checkPermission(ctx, db, stmt); err != nil {
 		recordAudit(ctx, db, tenant, stmt, err)
@@ -113,7 +119,17 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 	}()
 
 	statementWAL := newStatementWAL(db)
-	rs, err = execStmt(ExecEnv{ctx: ctx, tenant: tenant, db: db, statementWAL: statementWAL, now: time.Now(), subqueryCache: newSubqueryResultCache(), dml: plan, procedureOverride: procedure, rollbackArmed: snapshot != nil}, stmt)
+	env := ExecEnv{ctx: ctx, tenant: tenant, db: db, statementWAL: statementWAL, now: time.Now(), subqueryCache: newSubqueryResultCache(), dml: plan, procedureOverride: procedure, rollbackArmed: snapshot != nil}
+	var columnarHandled bool
+	if columns != nil {
+		columnarHandled, err = executeSimpleColumnarSelect(env, stmt.(*Select), columns)
+	}
+	if !columnarHandled && err == nil {
+		rs, err = execStmt(env, stmt)
+		if err == nil && columns != nil {
+			*columns = columnarFromRows(rs)
+		}
+	}
 	if err == nil {
 		err = statementWAL.commit()
 	}

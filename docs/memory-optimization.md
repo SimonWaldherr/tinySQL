@@ -39,7 +39,7 @@ Result (8 tables × 500 rows):
 See `internal/storage/db.go` (`SnapshotForTx`, `cloneTableMeta`) and
 `internal/driver/driver.go` (`BeginTx`, `commitTx`).
 
-## Open item 1 — result rows as `map[string]any`
+## Result rows: optional column output landed; map API remains available
 
 Results are `[]Row` with `type Row = map[string]any`. Each row is a separate
 map holding every projected column and, for `SELECT *` / joins, both the
@@ -64,21 +64,17 @@ A Go map carries a header plus at least one 8-slot bucket regardless of column
 count, so a 2-column row costs ~350 B — mostly overhead. Mostly transient
 churn, but large result sets also inflate peak RSS while held.
 
-**1a. Columnar / slice-backed rows** (biggest win, biggest change). Store
-values positionally in a `[]any` (or typed column vector) with one shared
-`map[string]int` name→index per result set. Removes ~1 map allocation per row;
-per-row cost drops to one `len(cols)`-sized slice.
+**1a. Optional column output is implemented.** `ExecuteColumnar` and
+`ExecSQLColumnar` return a `ColumnarResultSet` with `Cols`, `Values[column][row]`
+and `RowCount`. Simple unordered scans project directly into column slices.
+The public `Row`/`ResultSet` API stays unchanged. Complex SELECTs transpose the
+ordinary executor's result, so their intermediate allocations are unchanged.
 
-`type Row = map[string]any` is public (`tsql.Row`, `GetVal`, callers doing
-`row["col"]` / `range row`), so changing it is breaking. Keep the map API and
-add a parallel one:
-
-- `type ResultSet2 struct { Cols []string; ColIndex map[string]int; Rows [][]any }`
-  behind an opt-in call (e.g. `ExecuteColumnar` / `Rows.Columnar()`), leaving
-  `Row`/`ResultSet` untouched; or
-- make `Row` an interface with `Get(name) any` plus index access, backed
-  internally by a slice implementation — requires auditing internal `row[...]`
-  index/range sites in `internal/engine`.
+These output columns hold `any` values. The separate numeric aggregate batch
+path uses typed `float64` buffers and validity bitmaps internally. Neither
+feature changes the row-oriented disk format or duplicates tables in a cache.
+See [columnar execution](columnar-execution.md) for fresh measurements and
+reproduction commands; the profiles above describe the original map API.
 
 **1b. Drop the duplicate qualified key on final projection.** For `SELECT *` /
 joins each row stores both `col` and `alias.col`
@@ -89,14 +85,12 @@ rely on `GetVal(row, "orders.id")` for `SELECT *`. Qualified keys must stay on
 intermediate rows (joins/subqueries) and be dropped only on the outermost
 projection, which needs extra plumbing to know "this is the final result".
 
-**1c. Pool the row maps.** Not viable as-is: result rows escape to the caller
-with unbounded lifetime, so they cannot go back to a `sync.Pool`. Only
-workable with 1a, where the caller consumes a columnar set that can be recycled
-after iteration.
+**1c. Pool materialized results.** Result rows and column slices escape to the
+caller with unbounded lifetime, so neither materialized API returns them to a
+`sync.Pool`. Recycling would require an explicit ownership/release contract.
 
-Recommendation: 1a as an additive columnar API for large-result read paths
-(exports, scans, RAG retrieval), map form staying the default. 1b only pays off
-if 1a is deferred.
+Use the optional column API for compact materialized exports and scans. Use
+the stream API when the complete result must not remain resident in memory.
 
 ## Open item 2 — per-row copy in the UPDATE fast path
 

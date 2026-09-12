@@ -113,6 +113,9 @@ type Row = engine.Row
 // Returned by SELECT queries and available for inspection.
 type ResultSet = engine.ResultSet
 
+// ColumnarResultSet holds positional result columns without a map per row.
+type ColumnarResultSet = engine.ColumnarResultSet
+
 // ResultStream exposes query rows incrementally. Call Next and Row in a loop,
 // check Err afterward, and call Close when abandoning the stream early.
 type ResultStream = engine.ResultStream
@@ -945,6 +948,21 @@ func MustCompile(cache *QueryCache, sql string) *CompiledQuery {
 // The tenant parameter is required. Use "default" for single-tenant applications.
 func Execute(ctx context.Context, db *DB, tenant string, stmt Statement) (*ResultSet, error) {
 	return engine.Execute(ctx, db, tenant, stmt)
+}
+
+// ExecuteColumnar executes a SELECT into Values[column][row]. Simple scans
+// avoid Row maps; complex SELECTs transpose the ordinary executor's result.
+func ExecuteColumnar(ctx context.Context, db *DB, tenant string, stmt Statement) (*ColumnarResultSet, error) {
+	return engine.ExecuteColumnar(ctx, db, tenant, stmt)
+}
+
+// ExecSQLColumnar parses and executes one SELECT with compact column results.
+func ExecSQLColumnar(ctx context.Context, db *DB, tenant, sql string) (*ColumnarResultSet, error) {
+	stmt, err := ParseSQL(sql)
+	if err != nil {
+		return nil, err
+	}
+	return ExecuteColumnar(ctx, db, tenant, stmt)
 }
 
 // ExecuteStream starts a parsed statement and returns as soon as its result
