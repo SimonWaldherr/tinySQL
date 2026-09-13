@@ -105,6 +105,15 @@ type ConstraintType = storage.ConstraintType
 type ColumnStats = storage.ColumnStats
 type TableStats = storage.TableStats
 
+// IndexAdvisor observes explicitly routed queries and optionally creates indexes.
+type IndexAdvisor = engine.IndexAdvisor
+type IndexAdvisorOptions = engine.IndexAdvisorOptions
+type IndexRecommendation = engine.IndexRecommendation
+
+func NewIndexAdvisor(db *DB, options IndexAdvisorOptions) (*IndexAdvisor, error) {
+	return engine.NewIndexAdvisor(db, options)
+}
+
 // Row represents a single result row mapped by column name (case-insensitive).
 // Keys include both qualified (table.column) and unqualified (column) names.
 type Row = engine.Row

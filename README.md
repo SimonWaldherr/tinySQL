@@ -108,6 +108,11 @@ SQL semantics and start yielding after their result has been materialized.
 For simple physical-table queries, `SELECT ... LIMIT 0` resolves the output
 schema without evaluating row expressions or collecting index candidates.
 Paged Index storage can answer these schema queries without loading data rows.
+
+For recurring equality filters, the opt-in [IndexAdvisor](docs/automatic-indexes.md)
+can recommend indexes or create them automatically with configurable limits.
+Automatic creation is disabled by default; route queries through the advisor
+to collect usage without changing the ordinary execution path.
 Column validation and context cancellation still apply.
 
 For compact materialized results, `ExecSQLColumnar` (or `ExecuteColumnar` for a

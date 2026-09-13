@@ -86,6 +86,19 @@ func executeDropTable(env ExecEnv, s *DropTable) (*ResultSet, error) {
 }
 
 func executeCreateIndex(env ExecEnv, s *CreateIndex) (*ResultSet, error) {
+	if s.advisor != nil {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, err
+		}
+		status, _, _, reason := indexAdvisorCheck(env.db, &s.advisor.recommendation, s.advisor.options)
+		if status == "covered" {
+			s.advisor.covered = true
+			return nil, nil
+		}
+		if status != "ready" {
+			return nil, fmt.Errorf("index advisor: %s: %s", status, reason)
+		}
+	}
 	schema, name := splitObjectName(s.Name)
 	if _, exists := env.db.Catalog().GetIndexForTenant(env.tenant, schema, name); exists {
 		if s.IfNotExists {

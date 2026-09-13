@@ -170,6 +170,7 @@ type CreateIndex struct {
 	Columns     []string
 	Unique      bool
 	IfNotExists bool
+	advisor     *indexAdvisorBuildGuard // opt-in advisor validation under the DDL lock
 }
 
 // DropIndex represents a DROP INDEX statement.
