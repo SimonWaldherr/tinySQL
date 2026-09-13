@@ -132,6 +132,7 @@ type triggerListRunner struct {
 	triggers []*storage.CatalogTrigger
 	programs []preparedTrigger
 	inline   [2]preparedTrigger
+	binding  triggerRowBinding
 }
 
 func (r *triggerListRunner) prepare() error {
@@ -169,10 +170,12 @@ func (r *triggerListRunner) fire(env ExecEnv, newRow Row, oldRow Row) error {
 			return err
 		}
 	}
-	binding := triggerRowBinding{newRow: newRow, oldRow: oldRow}
+	// Execution is synchronous and nested DML owns a separate runner. Reuse
+	// this statement-local binding rather than escaping a new object per row.
+	r.binding = triggerRowBinding{newRow: newRow, oldRow: oldRow}
 	for i := range r.programs {
 		program := &r.programs[i]
-		if err := executePreparedTrigger(env, program, &binding); err != nil {
+		if err := executePreparedTrigger(env, program, &r.binding); err != nil {
 			return fmt.Errorf("trigger %q: %w", program.trigger.Name, err)
 		}
 	}

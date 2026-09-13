@@ -79,7 +79,7 @@ func ftsScanTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQueryNode
 	// OR scores are maxima, so the union of each term's top-k contains the
 	// exact global top-k. Restricted scans retain the authorization-aware path.
 	if !restricted && k > 0 && node != nil && ((node.op == "OR" && len(node.termIDNs) > 0) || (node.op == "TERM" && node.idfBound)) {
-		return ftsDisjunctionTopK(ctx, cache, node, k)
+		return ftsDisjunctionTopK(ctx, cache, node, k, nil)
 	}
 	total := len(cache.docs)
 	if restricted {
@@ -756,10 +756,10 @@ func ftsCandidateScanIsCheaper(rows []int32, numRows int) bool {
 // ftsDisjunctionTopK reads postings instead of probing every query term in
 // every document. Any omitted document has at least k better documents for
 // the term supplying its maximum score, and thus cannot enter the OR top-k.
-func ftsDisjunctionTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQueryNode, k int) ([]ftsScored, error) {
+func ftsDisjunctionTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQueryNode, k int, allowed []int32) ([]ftsScored, error) {
 	if node.op == "TERM" {
 		h := make(ftsScoredHeap, 0, min(k, len(cache.postings[node.term])))
-		if err := ftsTermPostingTopK(ctx, &cache, node.term, node.termID, node.termIDF, k, &h); err != nil {
+		if err := ftsTermPostingTopK(ctx, &cache, node.term, node.termID, node.termIDF, k, &h, allowed); err != nil {
 			return nil, err
 		}
 		return ftsTopKFromHeap(&h, k), nil
@@ -788,7 +788,7 @@ func ftsDisjunctionTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQu
 			return nil, err
 		}
 		local := make(ftsScoredHeap, 0, min(k, len(cache.postings[term])))
-		if err := ftsTermPostingTopK(ctx, &cache, term, node.termIDNs[i], node.termIDFs[i], k, &local); err != nil {
+		if err := ftsTermPostingTopK(ctx, &cache, term, node.termIDNs[i], node.termIDFs[i], k, &local, allowed); err != nil {
 			return nil, err
 		}
 		for _, hit := range local {
@@ -812,7 +812,10 @@ func ftsDisjunctionTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQu
 
 // ftsTermPostingTopK scores one term with the same conservative block bounds
 // as OR retrieval. Single-term queries need no union map or second heap.
-func ftsTermPostingTopK(ctx context.Context, cache *ftsDocCacheEntry, term string, termID int32, idf float64, k int, local *ftsScoredHeap) error {
+func ftsTermPostingTopK(ctx context.Context, cache *ftsDocCacheEntry, term string, termID int32, idf float64, k int, local *ftsScoredHeap, allowed []int32) error {
+	if allowed != nil {
+		return ftsFilteredTermPostingTopK(ctx, cache, term, termID, idf, k, local, allowed)
+	}
 	if err := checkCtx(ctx); err != nil {
 		return err
 	}
@@ -820,6 +823,94 @@ func ftsTermPostingTopK(ctx context.Context, cache *ftsDocCacheEntry, term strin
 	blocks := cache.postingBlocks[term]
 	postings := cache.postings[term]
 	for pi := 0; pi < len(postings); pi++ {
+		if pi%storage.FTSPostingBlockSize == 0 && len(*local) == k && pi/storage.FTSPostingBlockSize < len(blocks) {
+			block := blocks[pi/storage.FTSPostingBlockSize]
+			norm := block.MinDocLen
+			if cache.avgDocLen > 0 {
+				norm /= cache.avgDocLen
+			}
+			tf := float64(block.MaxFrequency)
+			bound := ((tf * (bm25K1 + 1)) / (tf + ftsLengthNorm(norm))) * idf
+			// Outward rounding keeps pruning conservative at floating-point ties.
+			for n := 0; n < 8; n++ {
+				bound = math.Nextafter(bound, math.Inf(1))
+			}
+			if bound < (*local)[0].score {
+				if err := checkCtx(ctx); err != nil {
+					return err
+				}
+				pi += storage.FTSPostingBlockSize - 1
+				continue
+			}
+		}
+		row := postings[pi]
+		if pi&1023 == 0 {
+			if err := checkCtx(ctx); err != nil {
+				return err
+			}
+		}
+		ri := int(row)
+		doc := cache.docs[ri]
+		if !doc.Valid {
+			continue
+		}
+		norm := doc.DocLen
+		if cache.avgDocLen > 0 {
+			norm /= cache.avgDocLen
+		}
+		// Frequencies are position-aligned with postings. The fallback supports
+		// manually constructed runtime entries without the persisted field.
+		frequency := 0
+		if len(frequencies) == len(postings) {
+			frequency = int(frequencies[pi])
+		} else {
+			frequency = cache.termFrequency(doc, termID)
+		}
+		if frequency <= 0 {
+			continue
+		}
+		tf := float64(frequency)
+		lengthNorm := ftsLengthNorm(norm)
+		score := ((tf * (bm25K1 + 1)) / (tf + lengthNorm)) * idf
+		ftsPushTopK(local, ri, score, k)
+	}
+	return nil
+}
+
+// Keep the restricted loop separate so ordinary unfiltered scoring pays no
+// per-posting authorization branch. Both loops use the same BM25 arithmetic.
+func ftsFilteredTermPostingTopK(ctx context.Context, cache *ftsDocCacheEntry, term string, termID int32, idf float64, k int, local *ftsScoredHeap, allowed []int32) error {
+	if err := checkCtx(ctx); err != nil {
+		return err
+	}
+	frequencies := cache.postingCounts[term]
+	blocks := cache.postingBlocks[term]
+	postings := cache.postings[term]
+	allowedPos := 0
+	for pi := 0; pi < len(postings); pi++ {
+		// Authorization is applied before local top-k selection. Both lists are
+		// immutable, sorted physical row IDs. A nil list means unrestricted.
+		if allowed != nil {
+			if pi&1023 == 0 {
+				if err := checkCtx(ctx); err != nil {
+					return err
+				}
+			}
+			for allowedPos < len(allowed) && allowed[allowedPos] < postings[pi] {
+				allowedPos++
+			}
+			if allowedPos == len(allowed) {
+				break
+			}
+			if postings[pi] < allowed[allowedPos] {
+				// Large gaps (e.g. a handful of allowed IDs) should not scan the corpus.
+				if int64(allowed[allowedPos])-int64(postings[pi]) > 64 {
+					target := allowed[allowedPos]
+					pi += sort.Search(len(postings)-pi, func(i int) bool { return postings[pi+i] >= target }) - 1
+				}
+				continue
+			}
+		}
 		if pi%storage.FTSPostingBlockSize == 0 && len(*local) == k && pi/storage.FTSPostingBlockSize < len(blocks) {
 			block := blocks[pi/storage.FTSPostingBlockSize]
 			norm := block.MinDocLen

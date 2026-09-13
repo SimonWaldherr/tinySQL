@@ -1243,33 +1243,24 @@ var (
 // field — including the before/after row images, which the legacy checksum
 // did not cover, so image corruption previously went undetected.
 func (w *AdvancedWAL) calculateChecksum(record *WALRecord) uint32 {
-	h := crc32.New(walCRCTable)
-	var b [8]byte
-	writeU64 := func(v uint64) {
-		binary.LittleEndian.PutUint64(b[:], v)
-		_, _ = h.Write(b[:])
-	}
-	writeU64(uint64(record.LSN))
-	writeU64(uint64(record.TxID))
-	_, _ = h.Write([]byte{byte(record.OpType)})
-	_, _ = io.WriteString(h, record.Tenant)
-	_, _ = h.Write([]byte{0})
-	_, _ = io.WriteString(h, record.Table)
-	_, _ = h.Write([]byte{0})
-	writeU64(uint64(record.RowID))
-	writeU64(uint64(record.Timestamp.UnixNano()))
-	// scratch is reused across every value/column below instead of each
-	// hashWALValue call declaring its own local buffer: a buffer whose slice
-	// is handed to h.Write (an interface method) escapes to the heap, so one
-	// shared, heap-allocated-once buffer beats one fresh escape per value.
-	var scratch [40]byte
-	hashWALImage(h, record.BeforeImage, &scratch)
-	hashWALImage(h, record.AfterImage, &scratch)
-	// One buffer + one Write per column instead of five separate calls
-	// (three of them single-byte literals, one a dynamic-string conversion):
-	// each separate call to h.Write on the interface is a distinct potential
-	// heap escape, whereas building "c<name>;<type>;" once in scratch and
-	// writing it in a single call amortizes to the one shared allocation.
+	h := &walChecksumWriter{}
+	// The fixed fields and names form one contiguous CRC fragment. Ordinary
+	// identifiers fit in the shared scratch; oversized names grow without truncation.
+	var scratch [64]byte
+	b := binary.LittleEndian.AppendUint64(scratch[:0], uint64(record.LSN))
+	b = binary.LittleEndian.AppendUint64(b, uint64(record.TxID))
+	b = append(b, byte(record.OpType))
+	b = append(b, record.Tenant...)
+	b = append(b, 0)
+	b = append(b, record.Table...)
+	b = append(b, 0)
+	b = binary.LittleEndian.AppendUint64(b, uint64(record.RowID))
+	b = binary.LittleEndian.AppendUint64(b, uint64(record.Timestamp.UnixNano()))
+	_, _ = h.Write(b)
+	// Header, row scalars and descriptors share one query-local allocation.
+	valueScratch := (*[40]byte)(scratch[:40])
+	hashWALImage(h, record.BeforeImage, valueScratch)
+	hashWALImage(h, record.AfterImage, valueScratch)
 	for _, c := range record.Columns {
 		b := append(scratch[:0], 'c')
 		b = append(b, c.Name...)
@@ -1278,7 +1269,22 @@ func (w *AdvancedWAL) calculateChecksum(record *WALRecord) uint32 {
 		b = append(b, ';')
 		_, _ = h.Write(b)
 	}
-	return h.Sum32()
+	return h.crc
+}
+
+// Unlike hash/crc32's digest, this writer accepts strings without a temporary
+// byte-slice allocation. Update consumes the bytes synchronously and retains
+// none of them. The checksum stream and durable format remain unchanged.
+type walChecksumWriter struct{ crc uint32 }
+
+func (h *walChecksumWriter) Write(p []byte) (int, error) {
+	h.crc = crc32.Update(h.crc, walCRCTable, p)
+	return len(p), nil
+}
+
+func (h *walChecksumWriter) WriteString(s string) (int, error) {
+	h.crc = crc32.Update(h.crc, walCRCTable, []byte(s))
+	return len(s), nil
 }
 
 // hashWALImage writes a canonical byte representation of a row image.

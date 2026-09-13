@@ -984,7 +984,16 @@ func ragFTSSearchCandidatesFiltered(ctx context.Context, tenant string, table *s
 	// Ranking uses the cached plan's authorized N, average length, and IDF.
 	cache.numDocs = prepared.stats.numDocs
 	cache.avgDocLen = prepared.stats.avgDocLen
-	results, err := ftsScanTopK(ctx, cache, prepared.node, nil, prepared.rows, true, k)
+	var results []ftsScored
+	var err error
+	if len(prepared.rows) >= 256 && k > 0 && prepared.node != nil && ((prepared.node.op == "OR" && len(prepared.node.termIDNs) > 0) || (prepared.node.op == "TERM" && prepared.node.idfBound)) {
+		// Tiny candidate sets are cheaper to scan than to intersect and merge.
+		// These rows are sorted and unique. Score authorized postings directly,
+		// using the same ACL-local IDFs and average length as the scan fallback.
+		results, err = ftsDisjunctionTopK(ctx, cache, prepared.node, k, prepared.rows)
+	} else {
+		results, err = ftsScanTopK(ctx, cache, prepared.node, nil, prepared.rows, true, k)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("FTS_SEARCH: %w", err)
 	}

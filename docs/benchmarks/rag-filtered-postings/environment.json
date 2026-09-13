@@ -1,0 +1,26 @@
+{
+  "utc": "2026-09-13T08:14:59.996866+00:00",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "go": "go version go1.27.1 darwin/arm64",
+  "baseline": "1ae111c84628ec6e15cc3b66054a8d80ac21ff8f plus prior-optimizations.patch",
+  "GOMAXPROCS": 1,
+  "GOGC": 100,
+  "benchtime": "300ms",
+  "paired_rounds": 8,
+  "binary_sha256": {
+    "before": "5735e811ab684cc3107a1a25de8fe21935f0fc461355e84e937cfad1e9f24ec7",
+    "after": "b5e3fe6eeb2429c5fa9982d851aa2a9adee39be1bc877da5a27e2d5b0c4733e2"
+  },
+  "source_sha256": {
+    "internal/engine/fts_index.go": "e224a28fe2a1e67e5aee24547ac500c2c99a33266c53be22a79d80321b30b841",
+    "internal/engine/rag_prefilter.go": "3cc79156dcf6e9ba57a6febf29c798a023ca5299de20eae4a603da620df0db2d",
+    "internal/engine/rag_workload_benchmark_test.go": "08027dafbfa3b9ac3564c6ef862aee283e8fb4d19bda94f327644afd7536eda8",
+    "internal/engine/rag_fts_plan_test.go": "22cec9fc81d750c7427bd31e21940b2ca069506383de6e544bca4c559052e1be",
+    "internal/engine/rag_posting_intersection_benchmark_test.go": "048b409d52f0c93922c06defe819c859190cfe48fe8775d6c27e7aee7133ac62",
+    "internal/engine/triggers.go": "6f24de0e749db6d562d567f0c0b75f2101d4da1c87722b8d30e4de4f26f6c36f",
+    "internal/engine/exec_cte.go": "d732ebc43315bbf625893e3f4426183558ca9997183a08cb5bb7dd36f6813f41",
+    "internal/storage/secondary_index_range.go": "8f9a9aaa663fa5e82ee0488c836759d4ce213d304f9714270ecd06c22287c232",
+    "internal/storage/wal_advanced.go": "fa348aab0089b7083d37a3ca7c974cd364a4f7cab311ced6bc1a5a1b8eacc01d"
+  },
+  "prior_patch_sha256": "bab0ab7a1d89ce5952e54155d03edf5b47e9ecfb76014d68c13320b343b78d4b"
+}

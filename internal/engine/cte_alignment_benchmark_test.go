@@ -29,3 +29,18 @@ func TestRecursiveCTEAlignmentPreservesAliases(t *testing.T) {
 		t.Fatal("source rows mutated")
 	}
 }
+
+func TestRecursiveCTEAlignmentReuseOwnsRowsAndSchema(t *testing.T) {
+	cols := []string{"X"}
+	a := newRecursiveCTEAlignment([]string{"Result"}, cols, "Series")
+	cols[0] = "changed"
+	first := a.align([]Row{{"X": 1}})
+	second := a.align([]Row{{"x": nil, "X": 99}})
+	if first[0]["result"] != 1 || first[0]["series.result"] != 1 || second[0]["result"] != nil {
+		t.Fatalf("stale frontier or lost NULL: %v / %v", first, second)
+	}
+	second[0]["result"] = 10
+	if first[0]["result"] != 1 {
+		t.Fatal("frontiers share output maps")
+	}
+}

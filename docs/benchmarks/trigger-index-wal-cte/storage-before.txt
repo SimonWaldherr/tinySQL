@@ -1,0 +1,112 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/storage
+cpu: Apple M2 Max
+BenchmarkRangeSeekScratch/warmfalse/rows1 	 1628044	       221.4 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmfalse/rows10         	 1000000	       338.8 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmfalse/rows1000       	   19125	     18654 ns/op	   25176 B/op	      15 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows1           	 1278301	       282.2 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows10          	 1000000	       400.0 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows1000        	   16734	     21415 ns/op	   25176 B/op	      15 allocs/op
+BenchmarkAdvancedWALCalculateChecksum              	 1000000	       328.4 ns/op	     112 B/op	       8 allocs/op
+BenchmarkAdvancedWALCalculateChecksumBlob          	   64188	      5801 ns/op	     112 B/op	       8 allocs/op
+BenchmarkAdvancedWALLogInsert                      	      84	   4255769 ns/op	    1206 B/op	      35 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/storage
+cpu: Apple M2 Max
+BenchmarkRangeSeekScratch/warmfalse/rows1 	 1526425	       234.8 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmfalse/rows10         	 1000000	       342.6 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmfalse/rows1000       	   19216	     18639 ns/op	   25176 B/op	      15 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows1           	 1000000	       315.2 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows10          	  945615	       427.9 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows1000        	   15820	     22535 ns/op	   25176 B/op	      15 allocs/op
+BenchmarkAdvancedWALCalculateChecksum              	 1000000	       320.1 ns/op	     112 B/op	       8 allocs/op
+BenchmarkAdvancedWALCalculateChecksumBlob          	   67899	      5832 ns/op	     112 B/op	       8 allocs/op
+BenchmarkAdvancedWALLogInsert                      	      80	   4353582 ns/op	    1208 B/op	      35 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/storage
+cpu: Apple M2 Max
+BenchmarkRangeSeekScratch/warmfalse/rows1 	 1628257	       221.0 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmfalse/rows10         	 1000000	       338.5 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmfalse/rows1000       	   19280	     18650 ns/op	   25176 B/op	      15 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows1           	 1000000	       305.6 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows10          	  966583	       410.7 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows1000        	   16706	     21665 ns/op	   25176 B/op	      15 allocs/op
+BenchmarkAdvancedWALCalculateChecksum              	 1000000	       319.9 ns/op	     112 B/op	       8 allocs/op
+BenchmarkAdvancedWALCalculateChecksumBlob          	   67957	      5672 ns/op	     112 B/op	       8 allocs/op
+BenchmarkAdvancedWALLogInsert                      	      80	   4298074 ns/op	    1208 B/op	      35 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/storage
+cpu: Apple M2 Max
+BenchmarkRangeSeekScratch/warmfalse/rows1 	 1532583	       231.0 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmfalse/rows10         	 1000000	       336.0 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmfalse/rows1000       	   19239	     18727 ns/op	   25176 B/op	      15 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows1           	 1000000	       309.8 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows10          	 1000000	       407.4 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows1000        	   16978	     21428 ns/op	   25176 B/op	      15 allocs/op
+BenchmarkAdvancedWALCalculateChecksum              	 1000000	       321.3 ns/op	     112 B/op	       8 allocs/op
+BenchmarkAdvancedWALCalculateChecksumBlob          	   67152	      5764 ns/op	     112 B/op	       8 allocs/op
+BenchmarkAdvancedWALLogInsert                      	      80	   4314904 ns/op	    1208 B/op	      35 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/storage
+cpu: Apple M2 Max
+BenchmarkRangeSeekScratch/warmfalse/rows1 	 1625575	       221.2 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmfalse/rows10         	 1000000	       340.0 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmfalse/rows1000       	   19251	     18683 ns/op	   25176 B/op	      15 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows1           	 1000000	       303.5 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows10          	 1000000	       406.8 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows1000        	   16533	     21675 ns/op	   25176 B/op	      15 allocs/op
+BenchmarkAdvancedWALCalculateChecksum              	 1000000	       321.2 ns/op	     112 B/op	       8 allocs/op
+BenchmarkAdvancedWALCalculateChecksumBlob          	   67846	      5707 ns/op	     112 B/op	       8 allocs/op
+BenchmarkAdvancedWALLogInsert                      	      81	   4304324 ns/op	    1207 B/op	      35 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/storage
+cpu: Apple M2 Max
+BenchmarkRangeSeekScratch/warmfalse/rows1 	 1522778	       231.4 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmfalse/rows10         	 1000000	       340.7 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmfalse/rows1000       	   19252	     18755 ns/op	   25176 B/op	      15 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows1           	 1000000	       304.5 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows10          	 1000000	       399.0 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows1000        	   16512	     21642 ns/op	   25176 B/op	      15 allocs/op
+BenchmarkAdvancedWALCalculateChecksum              	 1000000	       321.3 ns/op	     112 B/op	       8 allocs/op
+BenchmarkAdvancedWALCalculateChecksumBlob          	   67866	      5720 ns/op	     112 B/op	       8 allocs/op
+BenchmarkAdvancedWALLogInsert                      	      73	   4924927 ns/op	    1211 B/op	      35 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/storage
+cpu: Apple M2 Max
+BenchmarkRangeSeekScratch/warmfalse/rows1 	 1613404	       222.7 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmfalse/rows10         	 1000000	       344.5 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmfalse/rows1000       	   19272	     18692 ns/op	   25176 B/op	      15 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows1           	 1000000	       341.8 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows10          	  910556	       453.6 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows1000        	   14928	     23856 ns/op	   25176 B/op	      15 allocs/op
+BenchmarkAdvancedWALCalculateChecksum              	 1000000	       338.4 ns/op	     112 B/op	       8 allocs/op
+BenchmarkAdvancedWALCalculateChecksumBlob          	   66886	      6086 ns/op	     112 B/op	       8 allocs/op
+BenchmarkAdvancedWALLogInsert                      	      76	   4492833 ns/op	    1210 B/op	      35 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/storage
+cpu: Apple M2 Max
+BenchmarkRangeSeekScratch/warmfalse/rows1 	 1542693	       229.1 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmfalse/rows10         	 1000000	       342.1 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmfalse/rows1000       	   19419	     18655 ns/op	   25176 B/op	      15 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows1           	 1235436	       289.9 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows10          	 1000000	       403.5 ns/op	     216 B/op	       8 allocs/op
+BenchmarkRangeSeekScratch/warmtrue/rows1000        	   16531	     21636 ns/op	   25176 B/op	      15 allocs/op
+BenchmarkAdvancedWALCalculateChecksum              	 1000000	       320.0 ns/op	     112 B/op	       8 allocs/op
+BenchmarkAdvancedWALCalculateChecksumBlob          	   67747	      5738 ns/op	     112 B/op	       8 allocs/op
+BenchmarkAdvancedWALLogInsert                      	      76	   4669654 ns/op	    1210 B/op	      35 allocs/op
+PASS

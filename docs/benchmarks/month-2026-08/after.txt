@@ -1,0 +1,232 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnar/width4/sum     	     421	    855640 ns/op	    4456 B/op	      31 allocs/op
+BenchmarkColumnar/width4/sum_avg_count         	     289	   1224561 ns/op	    7688 B/op	      41 allocs/op
+BenchmarkColumnar/width4/filter50              	     448	    777548 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/width4/filter1               	     651	    551836 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/width4/filter0               	     657	    545803 ns/op	    4608 B/op	      33 allocs/op
+BenchmarkColumnar/width4/group16               	     100	   3207483 ns/op	   17232 B/op	     229 allocs/op
+BenchmarkColumnar/width4/group_many            	       5	  72934292 ns/op	107652795 B/op	 1304797 allocs/op
+BenchmarkColumnar/width4/minmax_control        	      96	   3692353 ns/op	    2216 B/op	      30 allocs/op
+BenchmarkColumnar/width4/select_sparse_control 	     440	    808963 ns/op	  470408 B/op	    2632 allocs/op
+BenchmarkColumnar/width4/select_dense_control  	      30	  11836786 ns/op	24796376 B/op	  131096 allocs/op
+BenchmarkColumnar/width32/sum                  	     264	   1365531 ns/op	    8840 B/op	      87 allocs/op
+BenchmarkColumnar/width32/sum_avg_count        	     205	   1752517 ns/op	   12072 B/op	      97 allocs/op
+BenchmarkColumnar/width32/filter50             	     237	   1516252 ns/op	    9168 B/op	      93 allocs/op
+BenchmarkColumnar/width32/filter1              	     271	   1323298 ns/op	    9168 B/op	      93 allocs/op
+BenchmarkColumnar/width32/filter0              	     272	   1316002 ns/op	    8992 B/op	      89 allocs/op
+BenchmarkColumnar/width32/group16              	      96	   3703781 ns/op	   21616 B/op	     285 allocs/op
+BenchmarkColumnar/width32/group_many           	       4	  76060990 ns/op	107657074 B/op	 1304851 allocs/op
+BenchmarkColumnar/width32/minmax_control       	      90	   3863047 ns/op	    6600 B/op	      86 allocs/op
+BenchmarkColumnar/width32/select_sparse_control         	     255	   1522061 ns/op	  470408 B/op	    2632 allocs/op
+BenchmarkColumnar/width32/select_dense_control          	      55	  14847278 ns/op	24796376 B/op	  131096 allocs/op
+BenchmarkColumnar/small0                                	  202782	      1884 ns/op	    2365 B/op	      33 allocs/op
+BenchmarkColumnar/small128                              	   92960	      3924 ns/op	    2376 B/op	      34 allocs/op
+BenchmarkColumnar/small2048                             	   20228	     17667 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/index_point_control                   	  118995	      2990 ns/op	    2376 B/op	      38 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnar/width4/sum     	     439	    822580 ns/op	    4456 B/op	      31 allocs/op
+BenchmarkColumnar/width4/sum_avg_count         	     297	   1195438 ns/op	    7688 B/op	      41 allocs/op
+BenchmarkColumnar/width4/filter50              	     469	    787859 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/width4/filter1               	     642	    558519 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/width4/filter0               	     662	    544845 ns/op	    4608 B/op	      33 allocs/op
+BenchmarkColumnar/width4/group16               	     100	   3199438 ns/op	   17232 B/op	     229 allocs/op
+BenchmarkColumnar/width4/group_many            	       5	  74830667 ns/op	107652833 B/op	 1304797 allocs/op
+BenchmarkColumnar/width4/minmax_control        	      97	   3706025 ns/op	    2216 B/op	      30 allocs/op
+BenchmarkColumnar/width4/select_sparse_control 	     423	    824114 ns/op	  470408 B/op	    2632 allocs/op
+BenchmarkColumnar/width4/select_dense_control  	      30	  12149854 ns/op	24796376 B/op	  131096 allocs/op
+BenchmarkColumnar/width32/sum                  	     265	   1360522 ns/op	    8840 B/op	      87 allocs/op
+BenchmarkColumnar/width32/sum_avg_count        	     206	   1735596 ns/op	   12072 B/op	      97 allocs/op
+BenchmarkColumnar/width32/filter50             	     238	   1499784 ns/op	    9168 B/op	      93 allocs/op
+BenchmarkColumnar/width32/filter1              	     273	   1312518 ns/op	    9168 B/op	      93 allocs/op
+BenchmarkColumnar/width32/filter0              	     272	   1313970 ns/op	    8992 B/op	      89 allocs/op
+BenchmarkColumnar/width32/group16              	      97	   3695633 ns/op	   21616 B/op	     285 allocs/op
+BenchmarkColumnar/width32/group_many           	       4	  75448844 ns/op	107657066 B/op	 1304851 allocs/op
+BenchmarkColumnar/width32/minmax_control       	      90	   3851321 ns/op	    6600 B/op	      86 allocs/op
+BenchmarkColumnar/width32/select_sparse_control         	     254	   1519562 ns/op	  470408 B/op	    2632 allocs/op
+BenchmarkColumnar/width32/select_dense_control          	      55	  15079667 ns/op	24796376 B/op	  131096 allocs/op
+BenchmarkColumnar/small0                                	  199005	      1820 ns/op	    2365 B/op	      33 allocs/op
+BenchmarkColumnar/small128                              	   95101	      3760 ns/op	    2376 B/op	      34 allocs/op
+BenchmarkColumnar/small2048                             	   20004	     18054 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/index_point_control                   	  112180	      2916 ns/op	    2376 B/op	      38 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnar/width4/sum     	     438	    824209 ns/op	    4456 B/op	      31 allocs/op
+BenchmarkColumnar/width4/sum_avg_count         	     297	   1204313 ns/op	    7688 B/op	      41 allocs/op
+BenchmarkColumnar/width4/filter50              	     466	    768403 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/width4/filter1               	     646	    550668 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/width4/filter0               	     661	    544868 ns/op	    4608 B/op	      33 allocs/op
+BenchmarkColumnar/width4/group16               	     100	   3233032 ns/op	   17232 B/op	     229 allocs/op
+BenchmarkColumnar/width4/group_many            	       5	  73022450 ns/op	107652833 B/op	 1304797 allocs/op
+BenchmarkColumnar/width4/minmax_control        	      99	   3654019 ns/op	    2216 B/op	      30 allocs/op
+BenchmarkColumnar/width4/select_sparse_control 	     436	    815818 ns/op	  470408 B/op	    2632 allocs/op
+BenchmarkColumnar/width4/select_dense_control  	      28	  12311241 ns/op	24796376 B/op	  131096 allocs/op
+BenchmarkColumnar/width32/sum                  	     249	   1426738 ns/op	    8840 B/op	      87 allocs/op
+BenchmarkColumnar/width32/sum_avg_count        	     193	   1800318 ns/op	   12072 B/op	      97 allocs/op
+BenchmarkColumnar/width32/filter50             	     237	   1507276 ns/op	    9168 B/op	      93 allocs/op
+BenchmarkColumnar/width32/filter1              	     272	   1314635 ns/op	    9168 B/op	      93 allocs/op
+BenchmarkColumnar/width32/filter0              	     274	   1309602 ns/op	    8992 B/op	      89 allocs/op
+BenchmarkColumnar/width32/group16              	      93	   3759170 ns/op	   21616 B/op	     285 allocs/op
+BenchmarkColumnar/width32/group_many           	       4	  79033416 ns/op	107657070 B/op	 1304851 allocs/op
+BenchmarkColumnar/width32/minmax_control       	      82	   3860784 ns/op	    6600 B/op	      86 allocs/op
+BenchmarkColumnar/width32/select_sparse_control         	     256	   1515383 ns/op	  470408 B/op	    2632 allocs/op
+BenchmarkColumnar/width32/select_dense_control          	      55	  14551061 ns/op	24796376 B/op	  131096 allocs/op
+BenchmarkColumnar/small0                                	  204246	      1775 ns/op	    2365 B/op	      33 allocs/op
+BenchmarkColumnar/small128                              	   96080	      3728 ns/op	    2376 B/op	      34 allocs/op
+BenchmarkColumnar/small2048                             	   20296	     17707 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/index_point_control                   	  107834	      2945 ns/op	    2376 B/op	      38 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnar/width4/sum     	     439	    820759 ns/op	    4456 B/op	      31 allocs/op
+BenchmarkColumnar/width4/sum_avg_count         	     297	   1215392 ns/op	    7688 B/op	      41 allocs/op
+BenchmarkColumnar/width4/filter50              	     466	    770210 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/width4/filter1               	     651	    551542 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/width4/filter0               	     652	    549240 ns/op	    4608 B/op	      33 allocs/op
+BenchmarkColumnar/width4/group16               	     100	   3214168 ns/op	   17232 B/op	     229 allocs/op
+BenchmarkColumnar/width4/group_many            	       5	  71813625 ns/op	107652830 B/op	 1304797 allocs/op
+BenchmarkColumnar/width4/minmax_control        	      99	   3661505 ns/op	    2216 B/op	      30 allocs/op
+BenchmarkColumnar/width4/select_sparse_control 	     434	    817833 ns/op	  470408 B/op	    2632 allocs/op
+BenchmarkColumnar/width4/select_dense_control  	      28	  12257408 ns/op	24796376 B/op	  131096 allocs/op
+BenchmarkColumnar/width32/sum                  	     262	   1364361 ns/op	    8840 B/op	      87 allocs/op
+BenchmarkColumnar/width32/sum_avg_count        	     206	   1742865 ns/op	   12072 B/op	      97 allocs/op
+BenchmarkColumnar/width32/filter50             	     238	   1508343 ns/op	    9168 B/op	      93 allocs/op
+BenchmarkColumnar/width32/filter1              	     270	   1319673 ns/op	    9168 B/op	      93 allocs/op
+BenchmarkColumnar/width32/filter0              	     274	   1315587 ns/op	    8992 B/op	      89 allocs/op
+BenchmarkColumnar/width32/group16              	      93	   3731379 ns/op	   21616 B/op	     285 allocs/op
+BenchmarkColumnar/width32/group_many           	       5	  75605083 ns/op	107657086 B/op	 1304851 allocs/op
+BenchmarkColumnar/width32/minmax_control       	      88	   3845729 ns/op	    6600 B/op	      86 allocs/op
+BenchmarkColumnar/width32/select_sparse_control         	     255	   1527247 ns/op	  470408 B/op	    2632 allocs/op
+BenchmarkColumnar/width32/select_dense_control          	      55	  15049047 ns/op	24796376 B/op	  131096 allocs/op
+BenchmarkColumnar/small0                                	  206494	      1772 ns/op	    2365 B/op	      33 allocs/op
+BenchmarkColumnar/small128                              	   96828	      3723 ns/op	    2376 B/op	      34 allocs/op
+BenchmarkColumnar/small2048                             	   20316	     17709 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/index_point_control                   	  113084	      2931 ns/op	    2376 B/op	      38 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnar/width4/sum     	     436	    823980 ns/op	    4456 B/op	      31 allocs/op
+BenchmarkColumnar/width4/sum_avg_count         	     297	   1206765 ns/op	    7688 B/op	      41 allocs/op
+BenchmarkColumnar/width4/filter50              	     466	    770153 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/width4/filter1               	     651	    551856 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/width4/filter0               	     656	    558972 ns/op	    4608 B/op	      33 allocs/op
+BenchmarkColumnar/width4/group16               	     100	   3300596 ns/op	   17232 B/op	     229 allocs/op
+BenchmarkColumnar/width4/group_many            	       5	  67048867 ns/op	107652833 B/op	 1304797 allocs/op
+BenchmarkColumnar/width4/minmax_control        	      97	   3668784 ns/op	    2216 B/op	      30 allocs/op
+BenchmarkColumnar/width4/select_sparse_control 	     438	    812080 ns/op	  470408 B/op	    2632 allocs/op
+BenchmarkColumnar/width4/select_dense_control  	      26	  11967930 ns/op	24796376 B/op	  131096 allocs/op
+BenchmarkColumnar/width32/sum                  	     264	   1355859 ns/op	    8840 B/op	      87 allocs/op
+BenchmarkColumnar/width32/sum_avg_count        	     195	   1867610 ns/op	   12072 B/op	      97 allocs/op
+BenchmarkColumnar/width32/filter50             	     228	   1573262 ns/op	    9168 B/op	      93 allocs/op
+BenchmarkColumnar/width32/filter1              	     276	   1306827 ns/op	    9168 B/op	      93 allocs/op
+BenchmarkColumnar/width32/filter0              	     276	   1297938 ns/op	    8992 B/op	      89 allocs/op
+BenchmarkColumnar/width32/group16              	      97	   3747143 ns/op	   21616 B/op	     285 allocs/op
+BenchmarkColumnar/width32/group_many           	       5	  75349900 ns/op	107657083 B/op	 1304851 allocs/op
+BenchmarkColumnar/width32/minmax_control       	      91	   4298422 ns/op	    6600 B/op	      86 allocs/op
+BenchmarkColumnar/width32/select_sparse_control         	     213	   2153352 ns/op	  470408 B/op	    2632 allocs/op
+BenchmarkColumnar/width32/select_dense_control          	      28	  17111156 ns/op	24796376 B/op	  131096 allocs/op
+BenchmarkColumnar/small0                                	  201290	      1898 ns/op	    2365 B/op	      33 allocs/op
+BenchmarkColumnar/small128                              	   92494	      3901 ns/op	    2376 B/op	      34 allocs/op
+BenchmarkColumnar/small2048                             	   19998	     18123 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/index_point_control                   	  119516	      3088 ns/op	    2376 B/op	      38 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnar/width4/sum     	     416	    847284 ns/op	    4456 B/op	      31 allocs/op
+BenchmarkColumnar/width4/sum_avg_count         	     283	   1284216 ns/op	    7688 B/op	      41 allocs/op
+BenchmarkColumnar/width4/filter50              	     435	    801996 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/width4/filter1               	     619	    573173 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/width4/filter0               	     639	    548879 ns/op	    4608 B/op	      33 allocs/op
+BenchmarkColumnar/width4/group16               	     100	   3257558 ns/op	   17232 B/op	     229 allocs/op
+BenchmarkColumnar/width4/group_many            	       5	  71998350 ns/op	107652795 B/op	 1304797 allocs/op
+BenchmarkColumnar/width4/minmax_control        	      96	   3683628 ns/op	    2216 B/op	      30 allocs/op
+BenchmarkColumnar/width4/select_sparse_control 	     438	    815097 ns/op	  470408 B/op	    2632 allocs/op
+BenchmarkColumnar/width4/select_dense_control  	      30	  11997961 ns/op	24796376 B/op	  131096 allocs/op
+BenchmarkColumnar/width32/sum                  	     265	   1351876 ns/op	    8840 B/op	      87 allocs/op
+BenchmarkColumnar/width32/sum_avg_count        	     204	   1747365 ns/op	   12072 B/op	      97 allocs/op
+BenchmarkColumnar/width32/filter50             	     237	   1506713 ns/op	    9168 B/op	      93 allocs/op
+BenchmarkColumnar/width32/filter1              	     273	   1310406 ns/op	    9168 B/op	      93 allocs/op
+BenchmarkColumnar/width32/filter0              	     276	   1305125 ns/op	    8992 B/op	      89 allocs/op
+BenchmarkColumnar/width32/group16              	      97	   3753806 ns/op	   21616 B/op	     285 allocs/op
+BenchmarkColumnar/width32/group_many           	       5	  75835150 ns/op	107657075 B/op	 1304851 allocs/op
+BenchmarkColumnar/width32/minmax_control       	      90	   3824236 ns/op	    6600 B/op	      86 allocs/op
+BenchmarkColumnar/width32/select_sparse_control         	     252	   1539398 ns/op	  470408 B/op	    2632 allocs/op
+BenchmarkColumnar/width32/select_dense_control          	      55	  14995263 ns/op	24796376 B/op	  131096 allocs/op
+BenchmarkColumnar/small0                                	  190335	      1793 ns/op	    2365 B/op	      33 allocs/op
+BenchmarkColumnar/small128                              	   98199	      3713 ns/op	    2376 B/op	      34 allocs/op
+BenchmarkColumnar/small2048                             	   20454	     17627 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/index_point_control                   	  101808	      3027 ns/op	    2376 B/op	      38 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnar/width4/sum     	     427	    855099 ns/op	    4456 B/op	      31 allocs/op
+BenchmarkColumnar/width4/sum_avg_count         	     290	   1226530 ns/op	    7688 B/op	      41 allocs/op
+BenchmarkColumnar/width4/filter50              	     469	    766518 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/width4/filter1               	     654	    549219 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/width4/filter0               	     663	    543763 ns/op	    4608 B/op	      33 allocs/op
+BenchmarkColumnar/width4/group16               	     100	   3224685 ns/op	   17232 B/op	     229 allocs/op
+BenchmarkColumnar/width4/group_many            	       5	  70053350 ns/op	107652798 B/op	 1304797 allocs/op
+BenchmarkColumnar/width4/minmax_control        	      97	   3669070 ns/op	    2216 B/op	      30 allocs/op
+BenchmarkColumnar/width4/select_sparse_control 	     429	    826201 ns/op	  470408 B/op	    2632 allocs/op
+BenchmarkColumnar/width4/select_dense_control  	      27	  12479904 ns/op	24796376 B/op	  131096 allocs/op
+BenchmarkColumnar/width32/sum                  	     261	   1362164 ns/op	    8840 B/op	      87 allocs/op
+BenchmarkColumnar/width32/sum_avg_count        	     202	   1764887 ns/op	   12072 B/op	      97 allocs/op
+BenchmarkColumnar/width32/filter50             	     240	   1498074 ns/op	    9168 B/op	      93 allocs/op
+BenchmarkColumnar/width32/filter1              	     274	   1308998 ns/op	    9168 B/op	      93 allocs/op
+BenchmarkColumnar/width32/filter0              	     277	   1308880 ns/op	    8992 B/op	      89 allocs/op
+BenchmarkColumnar/width32/group16              	      90	   3775011 ns/op	   21616 B/op	     285 allocs/op
+BenchmarkColumnar/width32/group_many           	       4	  76940938 ns/op	107657070 B/op	 1304851 allocs/op
+BenchmarkColumnar/width32/minmax_control       	      88	   3899231 ns/op	    6600 B/op	      86 allocs/op
+BenchmarkColumnar/width32/select_sparse_control         	     256	   1518453 ns/op	  470408 B/op	    2632 allocs/op
+BenchmarkColumnar/width32/select_dense_control          	      55	  14993725 ns/op	24796376 B/op	  131096 allocs/op
+BenchmarkColumnar/small0                                	  192276	      1792 ns/op	    2365 B/op	      33 allocs/op
+BenchmarkColumnar/small128                              	   96824	      3733 ns/op	    2376 B/op	      34 allocs/op
+BenchmarkColumnar/small2048                             	   20298	     17697 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/index_point_control                   	  109609	      2951 ns/op	    2376 B/op	      38 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnar/width4/sum     	     417	    834880 ns/op	    4456 B/op	      31 allocs/op
+BenchmarkColumnar/width4/sum_avg_count         	     296	   1212447 ns/op	    7688 B/op	      41 allocs/op
+BenchmarkColumnar/width4/filter50              	     466	    780878 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/width4/filter1               	     658	    547903 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/width4/filter0               	     660	    545205 ns/op	    4608 B/op	      33 allocs/op
+BenchmarkColumnar/width4/group16               	     100	   3208316 ns/op	   17232 B/op	     229 allocs/op
+BenchmarkColumnar/width4/group_many            	       5	  69735383 ns/op	107652830 B/op	 1304797 allocs/op
+BenchmarkColumnar/width4/minmax_control        	      97	   3675553 ns/op	    2216 B/op	      30 allocs/op
+BenchmarkColumnar/width4/select_sparse_control 	     426	    824138 ns/op	  470408 B/op	    2632 allocs/op
+BenchmarkColumnar/width4/select_dense_control  	      28	  12037814 ns/op	24796376 B/op	  131096 allocs/op
+BenchmarkColumnar/width32/sum                  	     264	   1366707 ns/op	    8840 B/op	      87 allocs/op
+BenchmarkColumnar/width32/sum_avg_count        	     204	   1761357 ns/op	   12072 B/op	      97 allocs/op
+BenchmarkColumnar/width32/filter50             	     238	   1560868 ns/op	    9168 B/op	      93 allocs/op
+BenchmarkColumnar/width32/filter1              	     265	   1449946 ns/op	    9168 B/op	      93 allocs/op
+BenchmarkColumnar/width32/filter0              	     258	   1374287 ns/op	    8992 B/op	      89 allocs/op
+BenchmarkColumnar/width32/group16              	      94	   3756410 ns/op	   21616 B/op	     285 allocs/op
+BenchmarkColumnar/width32/group_many           	       4	  78552802 ns/op	107657070 B/op	 1304851 allocs/op
+BenchmarkColumnar/width32/minmax_control       	      90	   3856312 ns/op	    6600 B/op	      86 allocs/op
+BenchmarkColumnar/width32/select_sparse_control         	     258	   1523648 ns/op	  470408 B/op	    2632 allocs/op
+BenchmarkColumnar/width32/select_dense_control          	      54	  14908184 ns/op	24796376 B/op	  131096 allocs/op
+BenchmarkColumnar/small0                                	  203406	      1792 ns/op	    2365 B/op	      33 allocs/op
+BenchmarkColumnar/small128                              	   97146	      3711 ns/op	    2376 B/op	      34 allocs/op
+BenchmarkColumnar/small2048                             	   20428	     17622 ns/op	    4784 B/op	      37 allocs/op
+BenchmarkColumnar/index_point_control                   	  108410	      2985 ns/op	    2376 B/op	      38 allocs/op
+PASS

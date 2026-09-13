@@ -5,6 +5,7 @@ package engine
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -110,24 +111,41 @@ func alignRecursiveCTERows(accRs *ResultSet, nextRs *ResultSet, cteName string) 
 		return nextRs.Rows
 	}
 
-	sources := make([]string, len(accRs.Cols))
-	targets := make([]string, len(accRs.Cols))
-	qualified := make([]string, len(accRs.Cols))
-	for i, col := range accRs.Cols {
-		sources[i] = strings.ToLower(nextRs.Cols[i])
-		targets[i] = strings.ToLower(col)
-		qualified[i] = strings.ToLower(cteName + "." + targets[i])
+	return newRecursiveCTEAlignment(accRs.Cols, nextRs.Cols, cteName).align(nextRs.Rows)
+}
+
+// Each recursive frontier uses the same output schema in the common case.
+// Keep its positional mapping local to this execution, never in the shared AST.
+type recursiveCTEAlignment struct {
+	columns, sources, targets, qualified []string
+}
+
+func newRecursiveCTEAlignment(anchor, next []string, cteName string) *recursiveCTEAlignment {
+	a := &recursiveCTEAlignment{
+		columns:   slices.Clone(next),
+		sources:   make([]string, len(anchor)),
+		targets:   make([]string, len(anchor)),
+		qualified: make([]string, len(anchor)),
 	}
-	alignedRows := make([]Row, len(nextRs.Rows))
-	for rowIdx, r := range nextRs.Rows {
-		nr := make(Row, len(targets)*2)
-		for i, source := range sources {
+	for i, col := range anchor {
+		a.sources[i] = strings.ToLower(next[i])
+		a.targets[i] = strings.ToLower(col)
+		a.qualified[i] = strings.ToLower(cteName + "." + col)
+	}
+	return a
+}
+
+func (a *recursiveCTEAlignment) align(rows []Row) []Row {
+	alignedRows := make([]Row, len(rows))
+	for rowIdx, r := range rows {
+		nr := make(Row, len(a.targets)*2)
+		for i, source := range a.sources {
 			val, ok := r[source]
 			if !ok {
-				val = r[nextRs.Cols[i]]
+				val = r[a.columns[i]]
 			}
-			nr[targets[i]] = val
-			nr[qualified[i]] = val
+			nr[a.targets[i]] = val
+			nr[a.qualified[i]] = val
 		}
 		alignedRows[rowIdx] = nr
 	}
@@ -205,12 +223,14 @@ func evalRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
 		frontier = nil
 	}
 
+	var alignment *recursiveCTEAlignment
+	cteKey := strings.ToLower(cte.Name)
 	iterLimit := 1024
 	for iter := 0; iter < iterLimit && len(frontier) > 0; iter++ {
 		// SQL recursive evaluation feeds each iteration only the rows produced
 		// by the previous iteration (the working table), not all accumulated
 		// rows. This is essential for UNION ALL semantics and termination.
-		env.ctes[strings.ToLower(cte.Name)] = &ResultSet{Cols: accRs.Cols, Rows: frontier}
+		env.ctes[cteKey] = &ResultSet{Cols: accRs.Cols, Rows: frontier}
 
 		nextRs, err := executeSelect(env, recursiveSel)
 		if err != nil {
@@ -223,7 +243,10 @@ func evalRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
 		if len(nextRs.Cols) != len(accRs.Cols) {
 			return nil, fmt.Errorf("recursive CTE %s has %d columns in anchor and %d in recursive term", cte.Name, len(accRs.Cols), len(nextRs.Cols))
 		}
-		alignedRows := alignRecursiveCTERows(accRs, nextRs, cte.Name)
+		if alignment == nil || !slices.Equal(alignment.columns, nextRs.Cols) {
+			alignment = newRecursiveCTEAlignment(accRs.Cols, nextRs.Cols, cte.Name)
+		}
+		alignedRows := alignment.align(nextRs.Rows)
 		if union.Type == UnionAll {
 			if maxRows >= 0 {
 				remaining := maxRows - len(accRows)

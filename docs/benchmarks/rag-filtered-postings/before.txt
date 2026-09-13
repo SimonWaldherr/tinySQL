@@ -1,0 +1,168 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkRAGFTSFilteredBranch                  	     722	    510570 ns/op	   59120 B/op	     323 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride1/term0         	     787	    457740 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride1/term7_OR_term23_OR_term180_OR_needle42         	     193	   1859964 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride4/term0                                          	    2905	    123308 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride4/term7_OR_term23_OR_term180_OR_needle42         	     769	    469189 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride100/term0                                        	   80864	      4379 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride100/term7_OR_term23_OR_term180_OR_needle42       	   39242	      8850 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride10000/term0                                      	 1000000	       363.7 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride10000/term7_OR_term23_OR_term180_OR_needle42     	  871011	       401.9 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGHybridSearch                                                                      	     646	    553449 ns/op	   41240 B/op	     184 allocs/op
+BenchmarkRAGHybridSearchPreFilterSelective                                                    	     531	    685417 ns/op	   40624 B/op	     184 allocs/op
+BenchmarkRAGHybridSearchPreFilterWithExpansion                                                	     531	    687142 ns/op	   31240 B/op	     183 allocs/op
+BenchmarkRAGVectorOnly                                                                        	     656	    556097 ns/op	   21440 B/op	     129 allocs/op
+BenchmarkRAGFTSSelectiveTerm                                                                  	   79563	      4723 ns/op	    8952 B/op	      62 allocs/op
+BenchmarkRAGFTSCommonTerm                                                                     	    9168	     38789 ns/op	   24856 B/op	     139 allocs/op
+BenchmarkRAGFTSPhrase                                                                         	     128	   2793298 ns/op	   24856 B/op	     139 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkRAGFTSFilteredBranch                  	     728	    509406 ns/op	   59120 B/op	     323 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride1/term0         	     784	    456388 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride1/term7_OR_term23_OR_term180_OR_needle42         	     192	   1868276 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride4/term0                                          	    2866	    124722 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride4/term7_OR_term23_OR_term180_OR_needle42         	     766	    466507 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride100/term0                                        	   81914	      4316 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride100/term7_OR_term23_OR_term180_OR_needle42       	   39848	      8768 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride10000/term0                                      	 1000000	       361.2 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride10000/term7_OR_term23_OR_term180_OR_needle42     	  940080	       391.3 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGHybridSearch                                                                      	     651	    549172 ns/op	   41240 B/op	     184 allocs/op
+BenchmarkRAGHybridSearchPreFilterSelective                                                    	     522	    692718 ns/op	   40624 B/op	     184 allocs/op
+BenchmarkRAGHybridSearchPreFilterWithExpansion                                                	     453	    677352 ns/op	   31240 B/op	     183 allocs/op
+BenchmarkRAGVectorOnly                                                                        	     688	    519978 ns/op	   21440 B/op	     129 allocs/op
+BenchmarkRAGFTSSelectiveTerm                                                                  	   79324	      5750 ns/op	    8952 B/op	      62 allocs/op
+BenchmarkRAGFTSCommonTerm                                                                     	    9004	     38969 ns/op	   24856 B/op	     139 allocs/op
+BenchmarkRAGFTSPhrase                                                                         	     128	   2837588 ns/op	   24856 B/op	     139 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkRAGFTSFilteredBranch                  	     720	    515774 ns/op	   59120 B/op	     323 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride1/term0         	     788	    456710 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride1/term7_OR_term23_OR_term180_OR_needle42         	     193	   1861043 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride4/term0                                          	    2905	    123706 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride4/term7_OR_term23_OR_term180_OR_needle42         	     760	    470615 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride100/term0                                        	   79640	      4356 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride100/term7_OR_term23_OR_term180_OR_needle42       	   39175	      9038 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride10000/term0                                      	 1000000	       373.2 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride10000/term7_OR_term23_OR_term180_OR_needle42     	  923224	       397.7 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGHybridSearch                                                                      	     655	    549134 ns/op	   41240 B/op	     184 allocs/op
+BenchmarkRAGHybridSearchPreFilterSelective                                                    	     536	    674287 ns/op	   40624 B/op	     184 allocs/op
+BenchmarkRAGHybridSearchPreFilterWithExpansion                                                	     528	    670141 ns/op	   31240 B/op	     183 allocs/op
+BenchmarkRAGVectorOnly                                                                        	     687	    520361 ns/op	   21440 B/op	     129 allocs/op
+BenchmarkRAGFTSSelectiveTerm                                                                  	   78488	      5807 ns/op	    8952 B/op	      62 allocs/op
+BenchmarkRAGFTSCommonTerm                                                                     	    9144	     39072 ns/op	   24856 B/op	     139 allocs/op
+BenchmarkRAGFTSPhrase                                                                         	     128	   2936003 ns/op	   24856 B/op	     139 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkRAGFTSFilteredBranch                  	     726	    526526 ns/op	   59120 B/op	     323 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride1/term0         	     757	    472356 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride1/term7_OR_term23_OR_term180_OR_needle42         	     188	   1929437 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride4/term0                                          	    2686	    130399 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride4/term7_OR_term23_OR_term180_OR_needle42         	     735	    498384 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride100/term0                                        	   77646	      4496 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride100/term7_OR_term23_OR_term180_OR_needle42       	   39292	      8864 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride10000/term0                                      	  984199	       354.7 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride10000/term7_OR_term23_OR_term180_OR_needle42     	  913096	       386.3 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGHybridSearch                                                                      	     614	    582888 ns/op	   41240 B/op	     184 allocs/op
+BenchmarkRAGHybridSearchPreFilterSelective                                                    	     448	    695963 ns/op	   40624 B/op	     184 allocs/op
+BenchmarkRAGHybridSearchPreFilterWithExpansion                                                	     456	   1697672 ns/op	   31240 B/op	     183 allocs/op
+BenchmarkRAGVectorOnly                                                                        	     600	    594940 ns/op	   21440 B/op	     129 allocs/op
+BenchmarkRAGFTSSelectiveTerm                                                                  	   72616	      4821 ns/op	    8952 B/op	      62 allocs/op
+BenchmarkRAGFTSCommonTerm                                                                     	    8696	     41334 ns/op	   24856 B/op	     139 allocs/op
+BenchmarkRAGFTSPhrase                                                                         	     122	   2939881 ns/op	   24856 B/op	     139 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkRAGFTSFilteredBranch                  	     676	    544793 ns/op	   59120 B/op	     323 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride1/term0         	     717	    479053 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride1/term7_OR_term23_OR_term180_OR_needle42         	     190	   1874955 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride4/term0                                          	    2755	    127019 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride4/term7_OR_term23_OR_term180_OR_needle42         	     753	    470354 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride100/term0                                        	   79093	      4432 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride100/term7_OR_term23_OR_term180_OR_needle42       	   36313	      9362 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride10000/term0                                      	  939916	       351.8 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride10000/term7_OR_term23_OR_term180_OR_needle42     	  867451	       391.7 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGHybridSearch                                                                      	     636	    561220 ns/op	   41240 B/op	     184 allocs/op
+BenchmarkRAGHybridSearchPreFilterSelective                                                    	     519	    694499 ns/op	   40624 B/op	     184 allocs/op
+BenchmarkRAGHybridSearchPreFilterWithExpansion                                                	     512	    715049 ns/op	   31240 B/op	     183 allocs/op
+BenchmarkRAGVectorOnly                                                                        	     679	    547933 ns/op	   21440 B/op	     129 allocs/op
+BenchmarkRAGFTSSelectiveTerm                                                                  	   73204	      4820 ns/op	    8952 B/op	      62 allocs/op
+BenchmarkRAGFTSCommonTerm                                                                     	    8512	     39815 ns/op	   24856 B/op	     139 allocs/op
+BenchmarkRAGFTSPhrase                                                                         	     127	   2806190 ns/op	   24856 B/op	     139 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkRAGFTSFilteredBranch                  	     702	    522513 ns/op	   59120 B/op	     323 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride1/term0         	     760	    469869 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride1/term7_OR_term23_OR_term180_OR_needle42         	     190	   1874482 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride4/term0                                          	    2773	    127911 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride4/term7_OR_term23_OR_term180_OR_needle42         	     748	    475949 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride100/term0                                        	   80272	      4454 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride100/term7_OR_term23_OR_term180_OR_needle42       	   37180	      9129 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride10000/term0                                      	  983304	       367.8 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride10000/term7_OR_term23_OR_term180_OR_needle42     	  888430	       397.9 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGHybridSearch                                                                      	     631	    565925 ns/op	   41240 B/op	     184 allocs/op
+BenchmarkRAGHybridSearchPreFilterSelective                                                    	     457	    695463 ns/op	   40624 B/op	     184 allocs/op
+BenchmarkRAGHybridSearchPreFilterWithExpansion                                                	     512	    689534 ns/op	   31240 B/op	     183 allocs/op
+BenchmarkRAGVectorOnly                                                                        	     667	    539866 ns/op	   21440 B/op	     129 allocs/op
+BenchmarkRAGFTSSelectiveTerm                                                                  	   78216	      5828 ns/op	    8952 B/op	      62 allocs/op
+BenchmarkRAGFTSCommonTerm                                                                     	    8938	     40155 ns/op	   24856 B/op	     139 allocs/op
+BenchmarkRAGFTSPhrase                                                                         	     128	   2868688 ns/op	   24856 B/op	     139 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkRAGFTSFilteredBranch                  	     715	    519392 ns/op	   59120 B/op	     323 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride1/term0         	     769	    467340 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride1/term7_OR_term23_OR_term180_OR_needle42         	     190	   1878778 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride4/term0                                          	    2809	    126469 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride4/term7_OR_term23_OR_term180_OR_needle42         	     746	    475215 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride100/term0                                        	   79190	      4495 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride100/term7_OR_term23_OR_term180_OR_needle42       	   38614	      9026 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride10000/term0                                      	  977906	       359.2 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride10000/term7_OR_term23_OR_term180_OR_needle42     	  888852	       392.2 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGHybridSearch                                                                      	     638	    568068 ns/op	   41240 B/op	     184 allocs/op
+BenchmarkRAGHybridSearchPreFilterSelective                                                    	     524	    732620 ns/op	   40624 B/op	     184 allocs/op
+BenchmarkRAGHybridSearchPreFilterWithExpansion                                                	     472	    690159 ns/op	   31240 B/op	     183 allocs/op
+BenchmarkRAGVectorOnly                                                                        	     655	    541029 ns/op	   21440 B/op	     129 allocs/op
+BenchmarkRAGFTSSelectiveTerm                                                                  	   78944	      5753 ns/op	    8952 B/op	      62 allocs/op
+BenchmarkRAGFTSCommonTerm                                                                     	    9085	     39915 ns/op	   24856 B/op	     139 allocs/op
+BenchmarkRAGFTSPhrase                                                                         	     127	   2938739 ns/op	   24856 B/op	     139 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkRAGFTSFilteredBranch                  	     714	    517742 ns/op	   59120 B/op	     323 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride1/term0         	     772	    492956 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride1/term7_OR_term23_OR_term180_OR_needle42         	     190	   1877741 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride4/term0                                          	    2827	    127051 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride4/term7_OR_term23_OR_term180_OR_needle42         	     744	    476487 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride100/term0                                        	   74170	      4571 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride100/term7_OR_term23_OR_term180_OR_needle42       	   37878	      9109 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride10000/term0                                      	  966615	       364.8 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGFilteredPostingSelectivity/stride10000/term7_OR_term23_OR_term180_OR_needle42     	  912392	       393.9 ns/op	     568 B/op	       5 allocs/op
+BenchmarkRAGHybridSearch                                                                      	     637	    566460 ns/op	   41240 B/op	     184 allocs/op
+BenchmarkRAGHybridSearchPreFilterSelective                                                    	     522	    681707 ns/op	   40624 B/op	     184 allocs/op
+BenchmarkRAGHybridSearchPreFilterWithExpansion                                                	     513	    687031 ns/op	   31240 B/op	     183 allocs/op
+BenchmarkRAGVectorOnly                                                                        	     674	    534223 ns/op	   21440 B/op	     129 allocs/op
+BenchmarkRAGFTSSelectiveTerm                                                                  	   75746	      5649 ns/op	    8952 B/op	      62 allocs/op
+BenchmarkRAGFTSCommonTerm                                                                     	    9108	     40274 ns/op	   24856 B/op	     139 allocs/op
+BenchmarkRAGFTSPhrase                                                                         	     126	   2804122 ns/op	   24856 B/op	     139 allocs/op
+PASS

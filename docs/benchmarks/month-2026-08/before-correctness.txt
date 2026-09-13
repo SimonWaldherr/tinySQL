@@ -1,0 +1,53 @@
+RESULT BenchmarkColumnar/width4/sum 4ba4804803cbb8a2433713e3a28b59d37341fdc339dc3942f5973171c60e27c9
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/tinySQL/internal/engine
+cpu: Apple M2 Max
+BenchmarkColumnar/width4/sum     	       1	  38244167 ns/op	55858232 B/op	  262448 allocs/op
+RESULT BenchmarkColumnar/width4/sum_avg_count e9d1179ed62ed6d287501a0b3734218c2dd3c48bfa38dd359caf2c62d4b75493
+BenchmarkColumnar/width4/sum_avg_count         	       1	  41042208 ns/op	55858624 B/op	  262461 allocs/op
+RESULT BenchmarkColumnar/width4/filter50 e6b81e8354854a319b8aa1b323b8c72526681d472f07291d1ac9106408c6a236
+BenchmarkColumnar/width4/filter50              	       1	  29705292 ns/op	50924088 B/op	  262324 allocs/op
+RESULT BenchmarkColumnar/width4/filter1 ba2fea53ba1ebd27e97254d6027ec2a9fff19c226304efbadc78d8b97f9e5ed5
+BenchmarkColumnar/width4/filter1               	       1	  33123333 ns/op	45687392 B/op	  262184 allocs/op
+RESULT BenchmarkColumnar/width4/filter0 41fd96a6dc46f432f97e119e016b50e273ee174c79bc34ed201e6d1e2ebbc970
+BenchmarkColumnar/width4/filter0               	       1	  30606792 ns/op	45613928 B/op	  262165 allocs/op
+RESULT BenchmarkColumnar/width4/group16 815abdb49b1f3d9a1a3343d5451808d58b2ed4dc4513c9600951dacfd28b8de8
+BenchmarkColumnar/width4/group16               	       1	   6030291 ns/op	   14288 B/op	     229 allocs/op
+RESULT BenchmarkColumnar/width4/group_many d9c706159b6247c0a3369bb8152f944b950fab5bd987090927e2f0f9586833bd
+BenchmarkColumnar/width4/group_many            	       1	  82895208 ns/op	105552784 B/op	 1304794 allocs/op
+RESULT BenchmarkColumnar/width4/minmax_control d7a84e9992339089022addbb1b02bc898054577a553b04152c0053817bbc98d2
+BenchmarkColumnar/width4/minmax_control        	       1	  39956125 ns/op	55858320 B/op	  262450 allocs/op
+RESULT BenchmarkColumnar/width4/select_sparse_control d3fecf2ba43b6d4fedecc920b60c6329f92e1881aa2da7d6bce148ebadf12dee
+BenchmarkColumnar/width4/select_sparse_control 	       1	    645125 ns/op	  470256 B/op	    2633 allocs/op
+RESULT BenchmarkColumnar/width4/select_dense_control 27da24ad622c32cca7da36985a119d8915e0d30bdd633f33b972f8665ccd691c
+BenchmarkColumnar/width4/select_dense_control  	       1	   6291625 ns/op	24796224 B/op	  131097 allocs/op
+RESULT BenchmarkColumnar/width32/sum 4ba4804803cbb8a2433713e3a28b59d37341fdc339dc3942f5973171c60e27c9
+BenchmarkColumnar/width32/sum                  	       1	 315475250 ns/op	660890432 B/op	  524623 allocs/op
+RESULT BenchmarkColumnar/width32/sum_avg_count e9d1179ed62ed6d287501a0b3734218c2dd3c48bfa38dd359caf2c62d4b75493
+BenchmarkColumnar/width32/sum_avg_count        	       1	 327488083 ns/op	660891016 B/op	  524638 allocs/op
+RESULT BenchmarkColumnar/width32/filter50 e6b81e8354854a319b8aa1b323b8c72526681d472f07291d1ac9106408c6a236
+BenchmarkColumnar/width32/filter50             	       1	 317779208 ns/op	655956288 B/op	  524499 allocs/op
+RESULT BenchmarkColumnar/width32/filter1 ba2fea53ba1ebd27e97254d6027ec2a9fff19c226304efbadc78d8b97f9e5ed5
+BenchmarkColumnar/width32/filter1              	       1	 229606959 ns/op	650719728 B/op	  524361 allocs/op
+RESULT BenchmarkColumnar/width32/filter0 41fd96a6dc46f432f97e119e016b50e273ee174c79bc34ed201e6d1e2ebbc970
+BenchmarkColumnar/width32/filter0              	       1	 271565708 ns/op	650646456 B/op	  524344 allocs/op
+RESULT BenchmarkColumnar/width32/group16 815abdb49b1f3d9a1a3343d5451808d58b2ed4dc4513c9600951dacfd28b8de8
+BenchmarkColumnar/width32/group16              	       1	   6249833 ns/op	   20496 B/op	     285 allocs/op
+RESULT BenchmarkColumnar/width32/group_many d9c706159b6247c0a3369bb8152f944b950fab5bd987090927e2f0f9586833bd
+BenchmarkColumnar/width32/group_many           	       1	  79080250 ns/op	105558992 B/op	 1304850 allocs/op
+RESULT BenchmarkColumnar/width32/minmax_control d7a84e9992339089022addbb1b02bc898054577a553b04152c0053817bbc98d2
+BenchmarkColumnar/width32/minmax_control       	       1	 297296125 ns/op	660890712 B/op	  524627 allocs/op
+RESULT BenchmarkColumnar/width32/select_sparse_control d3fecf2ba43b6d4fedecc920b60c6329f92e1881aa2da7d6bce148ebadf12dee
+BenchmarkColumnar/width32/select_sparse_control         	       1	   1653292 ns/op	  470256 B/op	    2633 allocs/op
+RESULT BenchmarkColumnar/width32/select_dense_control 27da24ad622c32cca7da36985a119d8915e0d30bdd633f33b972f8665ccd691c
+BenchmarkColumnar/width32/select_dense_control          	       1	  29490416 ns/op	24796224 B/op	  131097 allocs/op
+RESULT BenchmarkColumnar/small0 9df13cd3eb3b26259386c8314bf36c2fcc7a37ced36e5a7b6d87c51df1e99c4d
+BenchmarkColumnar/small0                                	       1	      5167 ns/op	     952 B/op	      21 allocs/op
+RESULT BenchmarkColumnar/small128 96680108246acad42680c17de04b3bb9529794dee4e9b2cfbd93ff1cbe236317
+BenchmarkColumnar/small128                              	       1	     29084 ns/op	   49248 B/op	     290 allocs/op
+RESULT BenchmarkColumnar/small2048 7e26095d94b4ae990875413d385ff11d3238cee98c4b60b925ba3b3960ebe149
+BenchmarkColumnar/small2048                             	       1	    403833 ns/op	  875144 B/op	    4141 allocs/op
+RESULT BenchmarkColumnar/index_point_control a59686a3a94cec73bda6cdfcf29e01c64d8a8d5239156ceff9c76d49dced43e3
+BenchmarkColumnar/index_point_control                   	       1	  20343292 ns/op	45613968 B/op	  262166 allocs/op
+PASS

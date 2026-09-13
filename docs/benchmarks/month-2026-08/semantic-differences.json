@@ -1,0 +1,32 @@
+{
+  "BenchmarkColumnar/width4/filter0": {
+    "column": "col_0",
+    "changed_rows": 1,
+    "before": 0,
+    "after": null
+  },
+  "BenchmarkColumnar/width32/filter0": {
+    "column": "col_0",
+    "changed_rows": 1,
+    "before": 0,
+    "after": null
+  },
+  "BenchmarkColumnar/small0": {
+    "column": "col_0",
+    "changed_rows": 1,
+    "before": 0,
+    "after": null
+  },
+  "BenchmarkColumnar/width4/group_many": {
+    "column": "col_1",
+    "changed_rows": 6899,
+    "before": 0,
+    "after": null
+  },
+  "BenchmarkColumnar/width32/group_many": {
+    "column": "col_1",
+    "changed_rows": 6899,
+    "before": 0,
+    "after": null
+  }
+}

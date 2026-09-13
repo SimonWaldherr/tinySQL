@@ -73,19 +73,21 @@ func (t *Table) LookupSecondaryIndexRange(idx *SecondaryIndex, prefix []any, lo,
 		return nil, fmt.Errorf("range seek needs at least one bound")
 	}
 
-	prefixKey := CanonicalIndexKey(prefix)
+	var prefixScratch [128]byte
+	prefixKey := canonicalIndexKeyInto(prefixScratch[:0], prefix)
 
 	// Encode the bounds as single components so they can be compared against the
 	// range component of each entry's key.
 	var loEnc, hiEnc []byte
+	var loScratch, hiScratch [numericComponentLen]byte
 	if !lo.Absent {
-		loEnc = appendCanonicalIndexValue(nil, lo.Value)
+		loEnc = appendCanonicalIndexValue(loScratch[:0], lo.Value)
 		if len(loEnc) != numericComponentLen {
 			return nil, fmt.Errorf("%w: lower bound %T is not numeric", ErrIndexRangeUnsupported, lo.Value)
 		}
 	}
 	if !hi.Absent {
-		hiEnc = appendCanonicalIndexValue(nil, hi.Value)
+		hiEnc = appendCanonicalIndexValue(hiScratch[:0], hi.Value)
 		if len(hiEnc) != numericComponentLen {
 			return nil, fmt.Errorf("%w: upper bound %T is not numeric", ErrIndexRangeUnsupported, hi.Value)
 		}
@@ -95,7 +97,8 @@ func (t *Table) LookupSecondaryIndexRange(idx *SecondaryIndex, prefix []any, lo,
 	// Seeking to prefix||loEnc is correct even though entries may carry further
 	// components: any key sharing the prefix whose range component is below the
 	// bound sorts before it.
-	seek := append(append([]byte(nil), prefixKey...), loEnc...)
+	var seekScratch [128 + numericComponentLen]byte
+	seek := append(append(seekScratch[:0], prefixKey...), loEnc...)
 
 	// A small starting capacity cuts the append-driven reallocation chain
 	// (0->1->2->4->...) that would otherwise run on every range seek: most
@@ -167,5 +170,6 @@ func loHiTag(loEnc, hiEnc []byte) byte {
 // values cannot: their framing puts a length ahead of the payload, so byte order
 // is not value order.
 func IndexRangeComponentEncodable(v any) bool {
-	return len(appendCanonicalIndexValue(nil, v)) == numericComponentLen
+	var scratch [numericComponentLen]byte
+	return len(appendCanonicalIndexValue(scratch[:0], v)) == numericComponentLen
 }
