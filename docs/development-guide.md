@@ -103,4 +103,5 @@ artifacts for inspection but does not publish a release.
 
 - [Repository structure](./repository-structure.md)
 - [Developer integration](./developer-integration.md)
-- [Benchmarks](../BENCHMARKS.md)
+- Run `make bench` for local regression measurements; compare results only with
+  the same workload, machine state, and storage configuration.

@@ -14,7 +14,8 @@ package benchmarks
 // structure for true 2-D search; it is not what this measures.
 //
 // "SQLite" here is modernc.org/sqlite, the pure-Go port -- not the C
-// implementation. See the note at the top of BENCHMARKS.md.
+// implementation. Measure a C-backed SQLite comparison separately when that
+// is the production alternative.
 
 import (
 	"database/sql"

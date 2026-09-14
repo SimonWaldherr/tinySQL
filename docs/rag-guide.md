@@ -819,8 +819,8 @@ serving-oriented deployments, prefer:
 
 The warmed native vector column is also held in a contiguous cache, so budget
 roughly another copy of the vector data in memory. See
-[BENCHMARKS.md](../BENCHMARKS.md) for measured fixtures rather than treating
-any row-count threshold as universal.
+the local RAG benchmarks for the current implementation, but do not treat a
+row-count threshold as universal: corpus shape and vector dimensions dominate.
 
 The optional vector result cache helps only when identical query vectors repeat.
 Natural-language questions are often unique, so leave it disabled until
@@ -899,8 +899,8 @@ the lexical branch exists for — only score the documents that can match, and
 wildcards resolve against the corpus term dictionary once per query instead of
 against every token of every document. A term that appears in most of the corpus
 cannot be narrowed, so it still costs a full BM25 pass; that is a property of the
-query, not a tuning knob. See [BENCHMARKS.md](../BENCHMARKS.md) for measured
-figures.
+query, not a tuning knob. Measure representative selective and common-term
+queries before changing candidate sizes or cache policy.
 
 Both caches are built lazily on first search. Use `FTS_WARM` during startup for
 each exact searched column set, alongside `VEC_WARM`, to move that work out of
@@ -960,5 +960,5 @@ Position and relevance still matter; see
 [Lost in the Middle: How Language Models Use Long
 Contexts](https://arxiv.org/abs/2307.03172).
 
-tinySQL-specific performance claims and reproducible commands live in
-[BENCHMARKS.md](../BENCHMARKS.md).
+Run the relevant Go benchmarks alongside a representative retrieval evaluation;
+latency alone is not a relevance or authorization result.

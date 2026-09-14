@@ -241,7 +241,7 @@ tsql.Execute(context.Background(), serveDB, "default", warmStmt)
 
 `ReadOnly` rejects `INSERT`, `UPDATE`, `DELETE`, and DDL. `SELECT`, `EXPLAIN`,
 and `PRAGMA` still run. This pairs with
-[RAG serving](./rag-guide.md#6-serving-and-performance-notes): `VEC_WARM`
+[RAG serving](./rag-guide.md#4-embedding-and-ingestion): `VEC_WARM`
 prebuilds ANN indexes at startup instead of on the first query.
 
 For `disk`, `json`, `index`, and `hybrid`, a read-only open requires an existing
@@ -304,13 +304,10 @@ eviction enabled, as `ModeHybrid`/`ModeIndex` always have it, the full
 
 ### Serving MBTiles
 
-For a tileset that fits in memory, tinySQL serves tiles at the same speed as
-SQLite. The per-request query is a point lookup on
-`(zoom_level, tile_column, tile_row)`; with a composite index on those columns it
-is an index seek, measured at parity with SQLite's `:memory:` and roughly 4-5x
-faster than a SQLite file — see
-[BENCHMARKS.md](../BENCHMARKS.md#mbtiles-tile-serving-tinysql-vs-sqlite). Create
-the index explicitly; a declared `PRIMARY KEY` does not create one:
+For a tileset that fits in memory, the per-request query is a point lookup on
+`(zoom_level, tile_column, tile_row)`. With a composite index on those columns
+it is an index seek. Create the index explicitly; a declared `PRIMARY KEY` does
+not create one:
 
 ```sql
 CREATE INDEX tile_index ON tiles (zoom_level, tile_column, tile_row);
@@ -329,9 +326,7 @@ whole table the way the `ModeIndex`/`ModeHybrid` GOB codec does:
 tinysqld -data /srv/tiles -storage paged_index -tiles
 ```
 
-Measured on a 65,536-tile fixture with an 800-byte payload and a 32 MiB page
-budget, a warm tile lookup is in the same range as a SQLite file — see
-[BENCHMARKS.md](../BENCHMARKS.md). Two caveats worth knowing before relying on it:
+Two caveats matter before relying on this path:
 
 - Each page-cache **miss** allocates a fresh page buffer, so a working set far
   larger than `max_memory_bytes` allocates ~11 KB per lookup. Size the page
@@ -394,7 +389,5 @@ insert cycles checked for leaked overflow pages, and multi-level internal-split
 invariants) and `internal/engine/paged_index_mbtiles_regression_test.go` (the
 same failure reproduced and fixed at the SQL/engine layer, including a real
 `UPDATE`/`DELETE`/`INSERT` sequence against overflow-sized BLOBs and a
-durable close + read-only reopen). Read-path performance for the MBTiles
-`map`→`tile_id`→`images` access shape, including size-class-isolated,
-concurrent-reader and open/reopen benchmarks, lives in
-[BENCHMARKS.md](../BENCHMARKS.md#mbtiles-import-a-tileset-larger-than-memory).
+durable close + read-only reopen). Measure the MBTiles `map`→`tile_id`→`images`
+access shape with the target tile sizes, reader count, and page-cache budget.

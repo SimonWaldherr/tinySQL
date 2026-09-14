@@ -57,9 +57,8 @@ Type SQL ending with `;` to execute. Dot-commands:
 | `.read FILE` | Execute SQL from a file |
 | `.clear` | Clear the screen |
 
-`.help` also advertises `.output FORMAT` and `.timer on|off`, but neither is
-implemented — they fall through and are treated as SQL. Set the format with
-`-format` instead.
+Choose the output format with `-format`. The built-in help currently lists
+`.output` and `.timer`, but those commands are not available.
 
 ## Example session
 

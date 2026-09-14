@@ -87,10 +87,9 @@ or single-reader tinyTiles p95 exceeds twice SQLite p95. Re-run at least five
 times on an idle machine and retain all raw outputs instead of selecting the
 fastest run.
 
-The latest checked local DACH record is
-[benchmark-results-2026-08-05.md](benchmark-results-2026-08-05.md). It is a
-capacity/canary record, not a promise that another filesystem or CPU will
-produce identical timings.
+Keep the complete result record with the local fixture. It supports a specific
+capacity or canary decision and does not predict timings on another filesystem
+or CPU.
 
 ## Full evaluation record
 

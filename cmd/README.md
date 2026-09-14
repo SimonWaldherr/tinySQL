@@ -53,18 +53,11 @@ Supported geospatial formats and CRS profiles are summarized in the
 | Validate CSV before importing it | [`import-validate`](./import-validate/README.md) | Rules, error history, and explicit commit (`:8093`) |
 | Record work and break time | [`worklog`](./worklog/README.md) | Timeout checkout, reports, and CSV export (`:8094`) |
 
-The application-specific browser modes in the two sections above expose small
-JSON APIs for local integrations. They intentionally do not implement login,
-authorization, or TLS, so they **listen on `127.0.0.1` by default**. Pass
-`-addr :<port>` to accept connections from other machines — and put
-authentication and TLS in front of them before you do.
-
-Everything in the two sections above is a single-user local application. It is
-useful, but it is not a product: there is no login, no per-user data, no backup
-command, and no packaging beyond `go build`. Treat the *Reference and local
-applications* table as worked examples you can run, and the *Practical local
-applications* table as tools that solve a real task for one person on one
-machine.
+The local browser applications expose small JSON APIs but do not implement
+login, authorization, or TLS. They bind to `127.0.0.1` by default; if you pass
+`-addr :<port>`, put authentication and TLS in front of them before accepting
+remote traffic. They are single-user tools and worked examples, not packaged
+multi-user products.
 
 ## Browser and WebAssembly
 

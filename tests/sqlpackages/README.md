@@ -15,5 +15,6 @@ make test-sqlpackages
 
 Both suites are included in `make test-integration` and the normal/race parts of
 `make test-ci`. Root `go test ./...` does not traverse these nested modules.
-See the [compatibility matrix](../../docs/database-sql-compatibility.md) for
-versions, tested operations, configuration and limitations.
+For `database/sql` setup, see the
+[developer integration guide](../../docs/developer-integration.md). The test
+sources are the exact record of package versions and supported operations.

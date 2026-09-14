@@ -84,19 +84,13 @@ see [tinySQL integration API](tinysql-api.md).
 
 ## Offline cache operations
 
-- Give each dataset a stable `dataset` identifier and each immutable build a
-  new `revision`.
-- Fetch the manifest with revalidation; cache tiles by revision indefinitely.
-- Do not reuse a revision after changing any tile, media type or raw encoding.
-- Start without `PrunePrevious` during rollouts. Enable it only after the new
-  cache has been observed working and disk pressure warrants cleanup.
-- Treat a `PruneError` as cleanup debt, not a failed update: the new manifest
-  is already atomically active.
-- Set `HTTPFetcher.MaxTileSize` and `FileStore.SetMaxTileSize` according to
-  the largest expected tile, not an unbounded user input.
-
-Native FileStore cache files are an implementation detail. Move the cache as a
-whole or resynchronize it; do not edit filenames or tile record bytes.
+The [offline synchronization protocol](offline-sync.md) is the canonical wire
+and client-update contract. Operationally: keep `dataset` stable, mint a new
+immutable `revision` for every change to tile bytes, media type, or raw encoding,
+and set fetch/store size limits from the largest expected tile. Start rollouts
+without `PrunePrevious`; a `PruneError` is cleanup debt after an already-active
+revision, not a failed update. FileStore records are internal: move the whole
+cache or resynchronize it, never edit its names or bytes.
 
 ## Recovery checklist
 

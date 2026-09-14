@@ -19,6 +19,9 @@ go build ./cmd/tinysqld
 ./tinysqld -data ./tinysqld-data -storage disk -tenant default -http 127.0.0.1:8088
 ```
 
+Keep the default loopback binding for local use. If the API is reachable from
+other machines, configure `-auth` and terminate TLS before exposing it.
+
 ## Flags
 
 | Flag | Default | Description |
@@ -62,8 +65,8 @@ the CRS identifier functions. See the
 profiles and coordinate conventions.
 
 For a tileset larger than memory, use `-storage paged_index` for the published
-tile artifact. See the [root MBTiles guide](../../README.md#map-tiles-and-mbtiles)
-for the table shape, import/export, and indexing workflow.
+tile artifact. See the [storage guide](../../docs/storage-guide.md) for
+persistence and indexing workflow.
 
 ## HTTP API
 

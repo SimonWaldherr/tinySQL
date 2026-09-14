@@ -21,18 +21,34 @@ go mod tidy && go build -o formigo .
 ./formigo -dsn "sqlserver://user:password@localhost:1433?database=formigo&encrypt=disable"
 ```
 
-`sqlserver://` or `server=` in the DSN selects the SQL Server dialect, anything
-else tinySQL. The first run creates the admin user; `-secure-cookie` marks
-session cookies `Secure` for HTTPS.
+`sqlserver://` or `server=` in the DSN selects the SQL Server dialect; other
+DSNs use tinySQL. The first run creates the administrator. Later changes to
+the credential flags or environment do not replace an existing password.
 
-Formigo listens on `127.0.0.1:8080` by default. Pass `-addr :8080` to accept
-connections from other machines — do that only behind TLS, and change the
-admin password first.
+> **Warning:** The default configuration is a local demo only. On first
+> bootstrap, Formigo logs the initial administrator password; when the bundled
+> demo password is used, the login page also displays it. Do not bind that
+> configuration to a public or shared network.
+
+For any non-local deployment, set a non-default
+`FORMIGO_ADMIN_PASSWORD` before the first start, terminate HTTPS in front of
+the application, and enable secure cookies:
+
+```bash
+FORMIGO_ADMIN_USER=formigo-admin \
+FORMIGO_ADMIN_PASSWORD='a-long-unique-secret' \
+FORMIGO_SECURE_COOKIE=true \
+./formigo -addr 127.0.0.1:8080 -secure-cookie
+```
+
+Keep Formigo bound to loopback and let the HTTPS proxy control public access.
+The application itself serves HTTP; `-secure-cookie` only instructs browsers to
+send session cookies over HTTPS.
 
 | Flag | Env | Default |
 |---|---|---|
 | `-admin-user` | `FORMIGO_ADMIN_USER` | `admin` |
-| `-admin-password` | `FORMIGO_ADMIN_PASSWORD` | `admin123` |
+| `-admin-password` | `FORMIGO_ADMIN_PASSWORD` | unsafe demo credential |
 | `-secure-cookie` | `FORMIGO_SECURE_COOKIE` | `false` |
 
 ## API

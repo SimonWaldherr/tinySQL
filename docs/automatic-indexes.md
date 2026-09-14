@@ -126,11 +126,9 @@ must be amortized by later queries; indexed query latency alone is insufficient
 for deciding whether automatic creation is worthwhile.
 
 The following measurements describe the initial implementation at `666ab08`.
-The [observation-overhead follow-up](index-advisor-overhead.md) documents the
-subsequent reduction in recurring allocations with unchanged public behavior.
-The [index-benefit follow-up](index-benefit.md) separately measures actual
-read gains across selectivities, index build costs, UPDATE overhead and a query
-shape that does not use the index, alongside faster posting-list insertion.
+Treat them as a workload-specific baseline; reproduce `BenchmarkIndexAdvisor`
+and `BenchmarkIndexAdvisorBuild` on the intended data and hardware before using
+them to set a production policy.
 
 Local measurement: Apple M2 Max, Go 1.27.1 darwin/arm64, GOMAXPROCS=1,
 GOGC=100. Eight 300 ms rounds alternate case order, with no concurrent builds
@@ -152,13 +150,11 @@ amortization calculation or guarantee that every created index pays off.
 The indexed query figure includes the advisor's bookkeeping. Neither build
 allocations nor query allocations measure retained index size.
 
-Raw samples, hashes, environment and paired bootstrap intervals are in
-[benchmarks/index-advisor](benchmarks/index-advisor). Reproduce with:
+Reproduce the focused checks with:
 
 ```sh
-GOCACHE=/tmp/tinysql-columnar-go-cache go test ./internal/engine -run '^$' -c -o /tmp/tinysql-index-advisor.test
-python3 -B docs/benchmarks/index-advisor/run.py /tmp/tinysql-index-advisor.test /tmp/index-advisor-results
-python3 -B docs/benchmarks/index-advisor/compare.py /tmp/index-advisor-results/raw.txt
+go test ./internal/engine -run '^$' \
+  -bench '^(BenchmarkIndexAdvisor|BenchmarkIndexAdvisorBuild)$' -benchmem
 ```
 
 Validation passed: `go test ./...`, `go vet ./...`, and

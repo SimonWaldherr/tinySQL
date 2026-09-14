@@ -382,7 +382,8 @@ survive a crash. Compare equivalent flush tiers: `wal_sync=normal` performs an
 ordinary fsync per commit and corresponds to SQLite `synchronous=FULL` without
 `fullfsync`; the default `wal_sync=full` uses the strongest available OS flush
 (including `F_FULLFSYNC` on macOS) and must be compared with SQLite
-`fullfsync=ON`. [BENCHMARKS.md](../BENCHMARKS.md) contains both tiers.
+`fullfsync=ON`. Measure both tiers on the deployed filesystem; they are separate
+durability choices, not interchangeable performance modes.
 
 ## Where a change belongs
 

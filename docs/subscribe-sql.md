@@ -24,6 +24,17 @@ for change := range sub.Changes {
 return sub.Err()
 ```
 
+Use `SubscribeSQLWithOptions` when a retained result needs an explicit cap:
+
+```go
+sub, err := tinysql.SubscribeSQLWithOptions(ctx, db, "default", query,
+    tinysql.SubscriptionOptions{MaxResultRows: 10_000, MaxResultBytes: 8 << 20})
+```
+
+Both limits default to disabled. An oversized result closes the subscription
+before publication. `MaxResultBytes` counts JSON-encoded row payloads, so it
+caps retained output rather than every allocation made while executing a query.
+
 ## Supported queries
 
 Subscriptions accept SELECT statements supported by the SQL executor, including:
@@ -73,6 +84,10 @@ subscription observes committed state, not every intermediate event, and is not
 an audit log. Rollbacks do not publish uncommitted results. Cancel the context,
 call `Close()`, or close the database to stop the worker.
 
-See [asynchronous runtime](async-runtime.md) for result size limits, pressure
-metrics, bounded jobs, and the separate transactional event log with replay and
-acknowledgements.
+`sub.Stats()` reports refreshes, full refreshes, delivered changes,
+notifications, coalescing, cumulative refresh time, and delivery wait time.
+Counters reset when the process restarts. `ResultStream.Stats()` additionally
+reports buffer occupancy and blocking-send wait time.
+
+See [asynchronous runtime](async-runtime.md) for bounded jobs and the separate
+transactional event log with replay and acknowledgements.

@@ -184,7 +184,8 @@ was not.
 `ModeWAL` is the mode to compare against SQLite: an acknowledged write survives
 a crash. Its default `wal_sync=full` selects the strongest available OS flush;
 `wal_sync=normal` selects ordinary fsync but still flushes every commit. See
-[BENCHMARKS.md](../BENCHMARKS.md) for tier-matched SQLite comparisons.
+the [storage guide](storage-guide.md) for mode selection, and compare equivalent
+flush tiers on the target filesystem before making latency claims.
 
 ## Where to look
 

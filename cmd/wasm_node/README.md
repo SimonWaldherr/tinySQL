@@ -59,6 +59,4 @@ for `global.tinySQL`. The runner is a CLI helper, not a CommonJS module.
 The Node build shares the browser build's adaptive result-transfer bridge.
 Large primitive result sets use a single JSON transfer internally; callers still
 receive native JavaScript objects. Small responses and values requiring special
-conversion retain the direct path. See the [browser benchmarks and edge-case
-tests](../wasm_browser/README.md#result-transfer) for measurements and reproduction
-commands. The browser benchmark can also run against the Node WASM artifact.
+conversion retain the direct path.

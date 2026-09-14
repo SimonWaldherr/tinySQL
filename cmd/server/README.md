@@ -20,6 +20,10 @@ cd cmd/server && go build -o server .
          -peers "node2:9090,node3:9090"
 ```
 
+An externally reachable server needs `-auth` and TLS. Without `-auth`, the SQL
+APIs are open; health and readiness probes remain intentionally unauthenticated
+even when authentication is enabled.
+
 ## Flags
 
 ### Core

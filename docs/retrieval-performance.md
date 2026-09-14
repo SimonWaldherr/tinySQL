@@ -1,8 +1,20 @@
 # Retrieval performance
 
-For subsequent pool, binding, RAG filter, and top-k allocation improvements, see
-[Driver and engine performance](driver-engine-performance.md). The measurements
-below describe the earlier search-path changes.
+This page is the entry point for warm search-path measurements. Read the
+[RAG guide](rag-guide.md) for retrieval design, not benchmark tuning. Focused
+records keep their own baseline and therefore must not be combined into one
+speedup claim:
+
+- [exact RAG postings](rag-postings-performance.md) covers lexical top-k,
+  vector kernels, fusion, context expansion, and FTS ingestion;
+- [filtered RAG postings](rag-filtered-postings-performance.md) covers strict
+  authorization filters;
+- [geospatial performance](geospatial-performance.md) covers predicate and
+  grid-window shortcuts; and
+- [driver and engine performance](driver-engine-performance.md) covers shared
+  pool, binding, and allocation work.
+
+The measurements below describe the earlier common search-path changes.
 
 ## Search-path changes
 

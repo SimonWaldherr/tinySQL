@@ -66,25 +66,6 @@ Bye.
 ## Sample data
 
 Seeding creates `users`, `orders`, `order_audit`, `sales`, `articles`, and
-`docs`.
-
-**`users`** (id INT, name TEXT, email TEXT, active BOOL)
-
-| id | name  | email             | active |
-|----|-------|-------------------|--------|
-| 1  | Alice | alice@example.com | true   |
-| 2  | Bob   | NULL              | true   |
-| 3  | Carol | carol@example.com | NULL   |
-
-**`orders`** (id INT, user_id INT, amount FLOAT, status TEXT, meta JSON)
-
-| id  | user_id | amount | status   |
-|-----|---------|--------|----------|
-| 101 | 1       | 100.5  | PAID     |
-| 102 | 1       | 75.0   | PAID     |
-| 103 | 2       | 200.0  | PAID     |
-| 104 | 2       | 20.0   | CANCELED |
-
-`order_audit` records inserted order IDs through an `AFTER INSERT` trigger;
-`sales`, `articles`, and `docs` power the PIVOT/window, full-text, and vector
-search steps of the feature tour.
+`docs`. The users and orders tables drive ordinary query examples;
+`order_audit` records inserted orders through an AFTER INSERT trigger, and the
+remaining tables drive PIVOT/window, full-text, and vector-search steps.

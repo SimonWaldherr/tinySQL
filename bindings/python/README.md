@@ -28,12 +28,12 @@ void        TinySQLFree(char* ptr);
 persist and restore the database. `TinySQLReset` wipes the in-memory state so
 one process can serve multiple tests.
 
-`TinySQLFree` must be called on every pointer returned by the `tinySQL*`
-functions (all except `TinySQLReset`) or you leak memory.
+Every C function that returns `char*` allocates its result. Call `TinySQLFree`
+on pointers from `TinySQLVersion`, `TinySQLExec`, `TinySQLSave`, and
+`TinySQLLoad`. `TinySQLReset` returns no buffer.
 
-Payloads are UTF-8 RFC 8259 JSON. Future error objects can carry SQLSTATE
-classification from the public tinySQL API; see the
-[`standards`](../../standards/) package for the shared standards map.
+Payloads are UTF-8 RFC 8259 JSON. Errors use the same JSON shape with
+`status: error` and an `error` message.
 
 ## Python usage
 

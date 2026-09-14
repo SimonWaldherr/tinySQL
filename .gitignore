@@ -79,6 +79,12 @@ formigo.db.wal
 /.gomodcache
 benchmarks/cpu.out
 benchmarks/mem.out
+# Local benchmark captures and comparison reports are reproducible evidence,
+# not repository documentation. Keep them available for local optimization work
+# without accidentally adding them to commits.
+/BENCHMARKS.md
+/docs/benchmarks/
+/cmd/tinyTiles/docs/benchmark-results-*.md
 demo.mbtiles
 /mbtilesdemo
 /mbtilesregion

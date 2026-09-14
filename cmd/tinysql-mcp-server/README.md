@@ -1,170 +1,104 @@
 # tinysql-mcp-server
 
-Part of [tinySQL](../../README.md). Review the root limitations and this
-command's security model before attaching it to an agent host.
+An [MCP](https://modelcontextprotocol.io/) server for tinySQL over stdio. An
+MCP host can query and modify a tinySQL database, inspect its schema, run RAG
+retrieval, and keep an in-memory insight memo.
 
-An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server for
-the [tinySQL](https://github.com/SimonWaldherr/tinySQL) embedded database.
+It uses tinySQL directly rather than wrapping SQLite. Review the
+[root limitations](../../README.md#limitations) before relying on it for a
+production workload.
 
-It lets any MCP-capable host (Claude Desktop, VS Code Copilot, Cursor, ...) run
-`SELECT` queries and mutating SQL, inspect schema and tenant metadata, record
-analytical observations, and run a guided demo — over stdio.
-
-The design was functionally inspired by the archived
-[SQLite MCP server](https://github.com/modelcontextprotocol/servers-archived/tree/main/src/sqlite),
-but it is not a wrapper around SQLite. It uses tinySQL natively via the official
-Go MCP SDK v1.6.1, reads schema from `sys.tables` / `sys.columns` / `sys.views`
-instead of `sqlite_master`, and adds multi-tenancy (tenant parameter) and an
-agent-context profile.
-
-> tinySQL is a lightweight, educational engine. It is not a drop-in replacement
-> for PostgreSQL, MySQL, or SQLite. Evaluate it accordingly before using it in
-> production workloads.
-
-## Build
+## Build and run
 
 ```bash
-# From the tinySQL repository root:
 go build ./cmd/tinysql-mcp-server
+
+# ephemeral database
+./tinysql-mcp-server --dsn "mem://?tenant=default"
+
+# persistent database
+./tinysql-mcp-server --db-path ./data/tinysql.db --tenant default --autosave
 ```
 
-## Usage
+A supplied --dsn overrides --db-path.
 
-```bash
-# In-memory (ephemeral)
-tinysql-mcp-server --dsn "mem://?tenant=default"
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| --dsn | empty | Full mem:// or file: tinySQL DSN |
+| --db-path | empty | File-backed database shorthand |
+| --tenant | default | Tenant namespace |
+| --autosave | false | Save a file-backed database automatically |
+| --readonly | false | Disable write_query and create_table |
+| --max-rows | 1000 | Maximum rows returned to the MCP client; 0 removes the cap |
+| --query-timeout | 30s | Execution deadline; 0 removes it |
+| --log-level | info | debug, info, warn, or error |
 
-# File-backed (persistent)
-tinysql-mcp-server --dsn "file:./data/tinysql.db?tenant=default&autosave=1"
+## Configure a host
 
-# --db-path shorthand
-tinysql-mcp-server --db-path ./data/tinysql.db --tenant default --autosave
-```
-
-If both `--dsn` and `--db-path` are given, `--dsn` wins and `--db-path` is
-ignored (a warning is logged).
-
-### Flags
-
-| Flag | Default | Description |
-|---|---|---|
-| `--dsn` | `""` | Full tinySQL DSN (`mem://` or `file:path?...`). Takes precedence over `--db-path`. |
-| `--db-path` | `""` | Shorthand for a file-backed database path. |
-| `--tenant` | `"default"` | Tenant namespace (derived from DSN if omitted). |
-| `--autosave` | `false` | Enable auto-save for file-backed databases. |
-| `--readonly` | `false` | Block all mutating tools (`write_query`, `create_table`). |
-| `--max-rows` | `1000` | Maximum rows returned by `read_query` (0 = unlimited). |
-| `--query-timeout` | `30s` | Per-query timeout (0 = no timeout). |
-| `--log-level` | `"info"` | Log verbosity: `debug`, `info`, `warn`, `error`. |
-
-## MCP host configuration
-
-Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json`
-on macOS, equivalent path elsewhere):
+Use the built binary as a stdio command. For example, Claude Desktop uses an
+MCP configuration like:
 
 ```json
 {
   "mcpServers": {
     "tinysql": {
       "command": "/absolute/path/to/tinysql-mcp-server",
-      "args": [
-        "--dsn",
-        "file:/absolute/path/to/tinysql.db?tenant=default&autosave=1"
-      ]
+      "args": ["--db-path", "/absolute/path/to/tinysql.db", "--autosave"]
     }
   }
 }
 ```
 
-See [`examples/mcp_config.json`](examples/mcp_config.json) for a complete
-example including an in-memory variant.
+See [examples/mcp_config.json](examples/mcp_config.json) for the complete
+in-memory configuration. VS Code uses the same command and arguments in
+.vscode/mcp.json with type set to stdio.
 
-VS Code (`.vscode/mcp.json`):
+## MCP surface
 
-```json
-{
-  "servers": {
-    "tinysql": {
-      "type": "stdio",
-      "command": "${workspaceFolder}/tinysql-mcp-server",
-      "args": ["--dsn", "mem://?tenant=default"]
-    }
-  }
-}
-```
+| Tool | Purpose |
+| --- | --- |
+| read_query | Read-only SELECT or CTE, including FTS, vector, and RAG functions |
+| write_query | INSERT, UPDATE, or DELETE |
+| create_table | CREATE TABLE only |
+| list_tables / describe_table / sample_table | Schema and bounded table inspection |
+| rag_search | Vector retrieval with optional BM25 fusion and chunk expansion |
+| append_insight | Add a note to the in-memory insight memo |
+| agent_context | Compact schema and feature profile |
 
-## Tools
+| Resource or prompt | Purpose |
+| --- | --- |
+| memo://insights | Live Markdown insight memo |
+| tinysql://schema | Schema, views, and tenant as JSON |
+| tinysql://agent-context | Compact text schema profile |
+| tinysql://functions | Vector, FTS, and RAG function signatures |
+| tinysql-demo | Guided analysis prompt; requires a topic |
 
-| Tool | Description |
-|---|---|
-| `read_query` | Read-only `SELECT` (or CTE). Mutating statements are rejected. Vector/FTS/RAG functions are usable here. |
-| `write_query` | `INSERT`, `UPDATE`, `DELETE`. Blocked in `--readonly` mode. |
-| `create_table` | `CREATE TABLE` only; other DDL is rejected. Blocked in `--readonly` mode. |
-| `list_tables` | List tables of the active tenant via `sys.tables`. |
-| `describe_table` | Column metadata for a table via `sys.columns`. |
-| `append_insight` | Append an observation to the in-memory insight memo. |
-| `agent_context` | Compact, prompt-ready database profile (tables, columns, views, features). |
-| `sample_table` | First N rows of a table (identifier-quoted to prevent injection). |
-| `rag_search` | Composed RAG retrieval: `VEC_SEARCH` k-NN, optional BM25 hybrid fusion via reciprocal rank fusion, optional neighbor-chunk context expansion. |
+## Operate it safely
 
-## Resources
+- Treat the MCP host and every connected agent as a database client. Use
+  --readonly unless writes are required, and keep database filesystem
+  permissions narrow.
+- Keep both --max-rows and --query-timeout bounded. The row limit truncates
+  client-visible output; it does not limit engine work.
+- Each SQL input must contain one statement. A semicolon inside a SQL string
+  can be rejected by the conservative statement guard.
+- The current startup log can include a short DSN prefix. Avoid credentialed
+  DSNs in --dsn until that behavior is changed; use --db-path when possible
+  and do not expose process logs.
+- MCP protocol traffic uses stdout and logs use stderr. Do not add other output
+  to stdout.
 
-| URI | MIME type | Description |
-|---|---|---|
-| `memo://insights` | `text/markdown` | Live insight memo updated by `append_insight`. |
-| `tinysql://schema` | `application/json` | Current schema (tables, columns, views, tenant). |
-| `tinysql://agent-context` | `text/plain` | Compact agent profile derived from `sys.*` metadata. |
-| `tinysql://functions` | `text/plain` | Signatures of the vector, full-text, and RAG functions, including the `options_json` shape for `rag_search`. |
+The server classifies SQL before execution, rejects multi-statement input, and
+quotes validated table identifiers for table-inspection tools. Its CTE
+classifier is deliberately conservative, so unusual nested CTEs can be
+rejected. Agent context uses sys tables through database/sql; that is suitable
+for schema inspection but does not expose the direct-engine helper.
 
-## Prompts
-
-| Prompt | Arguments | Description |
-|---|---|---|
-| `tinysql-demo` | `topic` (required) | Guides a host through a full tinySQL analysis workflow for the topic. |
-
-## Security model
-
-- Statement classification: all SQL is classified before execution by a
-  conservative keyword-based classifier that strips comments and normalises
-  whitespace, so comment injection (e.g. `/* SELECT */ DELETE FROM t`) does not
-  hide the leading keyword.
-- Multi-statement rejection: input containing a semicolon before the trailing
-  position is rejected to prevent statement smuggling.
-- Read-only mode: `--readonly` blocks mutating tools at the application layer;
-  `write_query` and `create_table` check the flag independently.
-- Identifier validation: `describe_table` and `sample_table` validate the table
-  name against `^[a-zA-Z_][a-zA-Z0-9_]*$` and double-quote it before
-  interpolation.
-- Bounds: `--query-timeout 5s` bounds every execution, `--max-rows 1000` caps
-  result sets.
-- Logging: DSN query parameters are never logged. Logs go to stderr; MCP
-  communication uses stdout exclusively.
-- No `internal/*` imports: only the public API
-  (`github.com/SimonWaldherr/tinySQL` and
-  `github.com/SimonWaldherr/tinySQL/driver`).
-
-## Known limitations
-
-- `BuildAgentContext` is unavailable via `database/sql`, so `agent_context` and
-  `tinysql://agent-context` use a SQL fallback over `sys.tables`, `sys.columns`,
-  and `sys.views`. Functionally equivalent for schema inspection.
-- tinySQL's `database/sql` driver may not return a meaningful `RowsAffected`.
-  When unavailable, `write_query` returns a truthful explanatory field instead
-  of inventing a number.
-- The CTE classifier is heuristic; deeply nested or atypical CTE structures may
-  be classified as `kindUnknown` and rejected.
-- The multi-statement heuristic scans for semicolons without parsing string
-  literals, so a query with a literal semicolon inside a string value may be
-  incorrectly rejected. Parameterised queries are not yet exposed via MCP
-  tools.
-- With `file:` DSNs, autosave is governed by the tinySQL internal driver: use
-  `--autosave` or `autosave=1` in the DSN.
-
-## Tests
+## Test
 
 ```bash
 cd cmd/tinysql-mcp-server
 go test ./...
 ```
 
-Tests run against an in-memory database and need no external services.
+The tests use an in-memory database and no external service.

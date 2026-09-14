@@ -22,6 +22,11 @@ go build -o tinysqlpage ./cmd/tinysqlpage
   -seed  ./cmd/tinysqlpage/sample_data.sql
 ```
 
+The server has no built-in authentication. Keep it on the default loopback
+address for local use, or put authentication and HTTPS in front of it before
+serving pages remotely. Treat page definitions, templates, CSS, and seed SQL as
+trusted deployment input.
+
 ## Flags
 
 | Flag | Description | Default |

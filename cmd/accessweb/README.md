@@ -20,7 +20,12 @@ go run . -db mydata.db
 go run . -addr :9090
 ```
 
-Then open http://localhost:8080.
+Then open the selected address: `http://localhost:8080` by default, or
+`http://localhost:9090` for the last example.
+
+> **Local-use tool:** AccessWeb accepts arbitrary SQL and has no authentication
+> or TLS. Keep its default loopback binding, or place authentication and HTTPS
+> in front of it before accepting remote traffic.
 
 ## Flags
 
