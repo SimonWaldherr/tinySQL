@@ -87,6 +87,9 @@ func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 	if !ok || err != nil {
 		return nil, ok, err
 	}
+	if rs, used, err := executeConstraintMaximum(env, plan); used || err != nil {
+		return rs, used, err
+	}
 
 	rawPlan, err := buildSimpleAggregateSourcePlan(plan)
 	if err != nil {
@@ -101,6 +104,67 @@ func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 		return executeSimpleSingleGroupAggregate(env, plan, rawPlan)
 	}
 	return executeSimpleMultiGroupAggregate(env, plan, rawPlan)
+}
+
+// The applications allocate IDs using SELECT MAX(id), then add one. Reuse
+// an already-built constraint cache on append-heavy integer keys, without
+// building an entire hash map just to answer a cold aggregate query.
+func executeConstraintMaximum(env ExecEnv, plan *simpleAggregatePlan) (*ResultSet, bool, error) {
+	if plan.where != nil || plan.having != nil || len(plan.groupCols) != 0 || len(plan.projs) != 1 {
+		return nil, false, nil
+	}
+	proj := plan.projs[0]
+	if proj.kind != aggMax || proj.argColumn == 0 {
+		return nil, false, nil
+	}
+	col := proj.argColumn - 1
+	constraint := plan.table.Cols[col].Constraint
+	if constraint != storage.PrimaryKey && constraint != storage.Unique {
+		return nil, false, nil
+	}
+	value, used, err := cachedConstraintMaximum(env, plan.table, col)
+	if !used || err != nil {
+		return nil, used, err
+	}
+	state := newSimpleAggregateState(nil, 1)
+	state.minmax[0], state.haveMinMax[0] = value, value != nil
+	rs, err := finalizeSimpleAggregateResultSet(env, plan, []*simpleAggregateState{state})
+	return rs, true, err
+}
+
+func cachedConstraintMaximum(env ExecEnv, table *storage.Table, col int) (any, bool, error) {
+	if err := checkCtx(env.ctx); err != nil {
+		return nil, true, err
+	}
+	table.DerivedLock()
+	defer table.DerivedUnlock()
+	set := constraintIndexSetOf(table, false)
+	if set == nil {
+		return nil, false, nil
+	}
+	entry := set.cols[col]
+	if entry == nil || entry.rowCount > len(table.Rows) {
+		return nil, false, nil
+	}
+	extendConstraintIndex(table, col, entry)
+	if entry.nonIntegerRows != 0 {
+		return nil, false, nil
+	}
+	if !entry.maxKnown {
+		entry.maxKnown, entry.maxValue = true, nil
+		for i, row := range table.Rows {
+			if i&255 == 0 {
+				if err := checkCtx(env.ctx); err != nil {
+					entry.maxKnown, entry.maxValue = false, nil
+					return nil, true, err
+				}
+			}
+			if col < len(row) {
+				entry.observeMaximum(row[col], i)
+			}
+		}
+	}
+	return entry.maxValue, true, nil
 }
 
 // buildSimpleAggregateSourcePlan is also used by EXPLAIN, so reported

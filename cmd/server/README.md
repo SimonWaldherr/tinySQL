@@ -6,7 +6,10 @@ set and [tinysqld](../tinysqld/README.md) for the durable DBMS profile.
 Serves a tinySQL database over HTTP (JSON/NDJSON REST) and gRPC (Protocol
 Buffers, with the earlier JSON codec retained), with optional bearer-token
 auth, TLS, size/timeout limits, trusted proxies, and peer-to-peer federation
-for read fan-out.
+for read fan-out. `-replica-of` serves an asynchronously replicated read-only
+database over the same HTTP/gRPC APIs. See the
+[cluster guide](../../docs/cluster.md) for a primary plus two replicas behind
+HAProxy, including a runnable Docker Compose deployment.
 
 ```bash
 cd cmd/server && go build -o server .
@@ -33,6 +36,21 @@ cd cmd/server && go build -o server .
 | `-vector-cache-entries` | `0` | `VEC_SEARCH` result-cache entries (0 disables the cache) |
 | `-vector-cache-ttl` | `30s` | `VEC_SEARCH` result-cache TTL once entries are enabled |
 | `-v` | `false` | Verbose logging |
+
+### Replication and load balancing
+
+| Flag | Default | Description |
+|---|---|---|
+| `-replica-of` | — | Primary gRPC address; serve a read-only in-memory replica of an `advanced_wal` primary (`-dsn` is unused) |
+| `-replica-transport` | `stream` | WAL transport: `stream` or `poll` |
+| `-replica-ready-timeout` | `5s` | Withdraw readiness after this time without an applied feed response; must exceed the 1s heartbeat interval |
+
+Replicas retry bootstrap on startup failure, re-bootstrap after missing WAL or
+schema/epoch changes, and reject mutations through every SQL endpoint. A fresh
+feed response is required before serving reads. Auth, TLS, limits, and graceful
+shutdown use the same flags as the standalone server. Do not combine
+`-replica-of` with `-peers`: federation over identical replicas duplicates rows.
+There is no automatic primary election or promotion.
 
 ### TLS
 
@@ -79,7 +97,8 @@ cd cmd/server && go build -o server .
 
 ## Authentication
 
-When `-auth` is set, every endpoint except `/healthz` and `/readyz` requires the
+When `-auth` is set, every endpoint except `/healthz`, `/readyz`, `/readyz/read`,
+and `/readyz/write` requires the
 token in the `Authorization` header — including `/metrics`. Federated peer calls
 send the same token as gRPC `authorization` metadata.
 
@@ -99,6 +118,13 @@ send the same token as gRPC `authorization` metadata.
 - `GET /metrics` — Prometheus-compatible metrics (auth-protected).
 - `GET /healthz`, `GET /readyz` — probes, `200 OK` when healthy; never
   auth-protected.
+- `GET /readyz/read`, `GET /readyz/write` — load-balancer probes; replicas
+  return 503 for writes and while bootstrap or replication freshness is missing.
+
+`/api/status` includes `read_only` and, on a replica, `replication` with the
+source, transport, WAL epoch, resume LSN, last response time, and last error.
+See the [cluster guide](../../docs/cluster.md) for asynchronous read semantics,
+primary routing, message-size limits, and operational recovery.
 
 ### Streaming queries
 

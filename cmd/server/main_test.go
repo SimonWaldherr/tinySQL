@@ -427,6 +427,7 @@ func TestQueryTruncatesRows(t *testing.T) {
 		defaultT:        "default",
 		maxResponseRows: 2,
 	}
+	s.ready.Store(true)
 
 	ctx := context.Background()
 	if _, err := s.Exec(ctx, &execRequest{Tenant: "default", SQL: "CREATE TABLE t (id INT)"}); err != nil {
@@ -521,6 +522,7 @@ func newColumnTestServer(t *testing.T) (*server, context.Context) {
 	db := storage.NewDB()
 	t.Cleanup(func() { db.Close() })
 	s := &server{db: db, cache: engine.NewQueryCache(10), defaultT: "default"}
+	s.ready.Store(true)
 	ctx := context.Background()
 	for _, sql := range []string{
 		"CREATE TABLE users (id INT, name TEXT)",

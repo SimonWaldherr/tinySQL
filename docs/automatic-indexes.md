@@ -125,6 +125,13 @@ DROP INDEX are excluded. It does not include durable WAL flushing. Build cost
 must be amortized by later queries; indexed query latency alone is insufficient
 for deciding whether automatic creation is worthwhile.
 
+The following measurements describe the initial implementation at `666ab08`.
+The [observation-overhead follow-up](index-advisor-overhead.md) documents the
+subsequent reduction in recurring allocations with unchanged public behavior.
+The [index-benefit follow-up](index-benefit.md) separately measures actual
+read gains across selectivities, index build costs, UPDATE overhead and a query
+shape that does not use the index, alongside faster posting-list insertion.
+
 Local measurement: Apple M2 Max, Go 1.27.1 darwin/arm64, GOMAXPROCS=1,
 GOGC=100. Eight 300 ms rounds alternate case order, with no concurrent builds
 or tests. Medians:

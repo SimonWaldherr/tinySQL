@@ -388,7 +388,7 @@ func selectSecondaryIndex(table *storage.Table, colIndex map[string]int, where E
 		return nil, nil, nil, false
 	}
 	equalities := make(map[int]any)
-	totalTerms := collectEqualityTerms(where, colIndex, equalities)
+	totalTerms := collectSecondaryEqualityTerms(where, table, colIndex, equalities)
 	var chosen *storage.SecondaryIndex
 	var values []any
 	var predicates []string
@@ -411,6 +411,7 @@ func selectSecondaryIndex(table *storage.Table, colIndex map[string]int, where E
 			if !ok {
 				break
 			}
+			value = secondaryIndexEqualityKey(table, pos, value)
 			// SQL's current int/float comparison semantics intentionally allow
 			// values such as 1 and 1.0 to compare equal, while the durable
 			// secondary-index encoding keeps their types distinct. A numeric seek
@@ -453,7 +454,7 @@ func selectConstraintIndex(table *storage.Table, colIndex map[string]int, where 
 		return nil, "", false, false
 	}
 	equalities := make(map[int]any)
-	totalTerms := collectEqualityTerms(where, colIndex, equalities)
+	totalTerms := collectConstraintEqualityTerms(where, table, colIndex, equalities, false)
 	for colIdx, value := range equalities {
 		if colIdx < 0 || colIdx >= len(table.Cols) {
 			continue
@@ -471,6 +472,58 @@ func selectConstraintIndex(table *storage.Table, colIndex map[string]int, where 
 		return rows, column.Name, totalTerms != 1, true
 	}
 	return nil, "", false, false
+}
+
+// collectConstraintEqualityTerms extends literal equality to signed integral
+// operands only when the maintained key cache proves integer/NULL storage.
+// Cold DELETE deliberately keeps its existing scan strategy instead of building
+// a full key map solely for a deletion. No table-version profile scan is needed.
+func collectConstraintEqualityTerms(expr Expr, table *storage.Table, colIndex map[string]int, out map[int]any, warmOnly bool) int {
+	b, ok := expr.(*Binary)
+	if !ok {
+		return 0
+	}
+	if b.Op == "AND" {
+		return collectConstraintEqualityTerms(b.Left, table, colIndex, out, warmOnly) + collectConstraintEqualityTerms(b.Right, table, colIndex, out, warmOnly)
+	}
+	if count := collectEqualityTerms(expr, colIndex, out); count != 0 {
+		return count
+	}
+	if b.Op != "=" {
+		return 0
+	}
+	ref, ok := b.Left.(*VarRef)
+	operand := b.Right
+	if !ok {
+		ref, ok = b.Right.(*VarRef)
+		operand = b.Left
+	}
+	if !ok {
+		return 0
+	}
+	value, ok := signedNumericLiteral(operand)
+	if !ok || !(value > -0x1p53 && value < 0x1p53) || math.Trunc(value) != value {
+		return 0
+	}
+	pos, found := colIndex[ref.Lower]
+	if !found || pos < 0 || pos >= len(table.Cols) {
+		return 0
+	}
+	constraint := table.Cols[pos].Constraint
+	if constraint != storage.PrimaryKey && constraint != storage.Unique {
+		return 0
+	}
+	var index *constraintIndexEntry
+	if warmOnly {
+		index = currentConstraintIndex(table, pos)
+	} else {
+		index = getConstraintIndex(table, pos)
+	}
+	if index == nil || index.nonIntegerRows != 0 {
+		return 0
+	}
+	out[pos] = int64(value)
+	return 1
 }
 
 // lookupConstraintIndexRows returns every bucket that rawEqual could consider
@@ -683,6 +736,64 @@ func collectEqualityTerms(expr Expr, colIndex map[string]int, out map[int]any) i
 		}
 	}
 	return 0
+}
+
+// signedNumericLiteral preserves unary evaluation's float64 result. In
+// particular, negating a large integer must not silently become exact int64
+// arithmetic. Bound operands are read afresh by index selection each execution.
+func signedNumericLiteral(expr Expr) (float64, bool) {
+	u, ok := expr.(*Unary)
+	if !ok || (u.Op != "+" && u.Op != "-") {
+		return 0, false
+	}
+	lit, ok := u.Expr.(*Literal)
+	if !ok {
+		return 0, false
+	}
+	v, ok := numeric(lit.Val)
+	if u.Op == "-" {
+		v = -v
+	}
+	return v, ok
+}
+
+// collectSecondaryEqualityTerms adds signed numeric operands only for loaded
+// integer/NULL columns. Other representations keep the generic comparison path:
+// it can differ from literal filters for decimals, NaN and incomparable values.
+func collectSecondaryEqualityTerms(expr Expr, table *storage.Table, colIndex map[string]int, out map[int]any) int {
+	b, ok := expr.(*Binary)
+	if !ok {
+		return 0
+	}
+	if b.Op == "AND" {
+		return collectSecondaryEqualityTerms(b.Left, table, colIndex, out) + collectSecondaryEqualityTerms(b.Right, table, colIndex, out)
+	}
+	if count := collectEqualityTerms(expr, colIndex, out); count != 0 {
+		return count
+	}
+	if b.Op != "=" || len(table.Rows) == 0 {
+		return 0
+	}
+	ref, ok := b.Left.(*VarRef)
+	operand := b.Right
+	if !ok {
+		ref, ok = b.Right.(*VarRef)
+		operand = b.Left
+	}
+	if !ok {
+		return 0
+	}
+	value, ok := signedNumericLiteral(operand)
+	// Distinct integers can round to the same float at and beyond these bounds.
+	if !ok || !(value > -0x1p53 && value < 0x1p53) || math.Trunc(value) != value {
+		return 0
+	}
+	pos, found := colIndex[ref.Lower]
+	if !found || !numericColumnIsIntegerOrNull(table, pos) {
+		return 0
+	}
+	out[pos] = int64(value)
+	return 1
 }
 
 func projectionsCoveredByIndex(projs []simpleProjection, idx *storage.SecondaryIndex, table *storage.Table) bool {

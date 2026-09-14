@@ -289,7 +289,7 @@ func selectDeleteConstraintRows(table *storage.Table, colIndex map[string]int, w
 		return nil, "", false, false
 	}
 	equalities := make(map[int]any)
-	totalTerms := collectEqualityTerms(where, colIndex, equalities)
+	totalTerms := collectConstraintEqualityTerms(where, table, colIndex, equalities, true)
 	for colIdx, value := range equalities {
 		if colIdx < 0 || colIdx >= len(table.Cols) {
 			continue

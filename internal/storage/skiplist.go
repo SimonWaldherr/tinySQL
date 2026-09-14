@@ -100,6 +100,12 @@ func (s *SkipList) Len() int {
 // no-op, so re-inserting a duplicate (as an already-checked unique index
 // might via a caller retry) does not create a second copy.
 func insertRowIDSorted(rowIDs []int, rowID int) []int {
+	// Bulk builds and ordinary INSERT assign increasing row IDs. Appending
+	// avoids a binary search for every posting of a frequent key. UPDATE can
+	// move an older row into this key, so retain sorted insertion below.
+	if len(rowIDs) == 0 || rowID > rowIDs[len(rowIDs)-1] {
+		return append(rowIDs, rowID)
+	}
 	pos := sort.SearchInts(rowIDs, rowID)
 	if pos < len(rowIDs) && rowIDs[pos] == rowID {
 		return rowIDs

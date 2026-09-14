@@ -16,6 +16,7 @@ import (
 	"io"
 	"math"
 	"math/big"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -207,7 +208,19 @@ func ragBuildRowFilterContext(ctx context.Context, tenant string, table *storage
 	if err != nil {
 		return nil, err
 	}
-	if len(predicates) > 0 {
+	if len(predicates) > 0 && hasSelection && len(selected) <= len(table.Rows)/16 {
+		// A selective ACL already owns a sorted, private row slice. Apply
+		// metadata predicates directly to it, avoiding a corpus-wide scan or
+		// a second index result plus intersection. Validate predicates above
+		// even when the ACL is empty.
+		rows := selected[:0]
+		for _, rowID := range selected {
+			if ragRowMatchesEqualities(table.Rows[rowID], predicates) {
+				rows = append(rows, rowID)
+			}
+		}
+		selected = rows
+	} else if len(predicates) > 0 {
 		rows, err := ragRowsForEqualities(table, predicates)
 		if err != nil {
 			return nil, err
@@ -338,7 +351,14 @@ func ragRowsForSpatialFilter(ctx context.Context, tenant string, table *storage.
 			rows = append(rows, int(rowIdx))
 		}
 	}
-	return ragNormalizeRowIDs(len(table.Rows), rows), nil
+	// These rows are newly allocated and bounds-checked above. Normalize in
+	// place instead of hashing and copying an already query-local candidate set.
+	// Dateline windows may contribute a geometry from both halves.
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	slices.Sort(rows)
+	return slices.Compact(rows), nil
 }
 
 func ragRowFilterCacheKeyFor(table *storage.Table, opts *ragPreFilterOptions) (ragRowFilterCacheKey, bool) {
@@ -656,10 +676,15 @@ func ragRowsForEqualities(table *storage.Table, predicates []ragEqualityPredicat
 			return nil, fmt.Errorf("pre_filter.equals index %q: %w", idx.Name, err)
 		}
 	} else {
-		candidates = make([]int, len(table.Rows))
-		for i := range candidates {
-			candidates[i] = i
+		// Scan source rows directly instead of allocating an identity vector
+		// of every physical row before applying the same residual predicates.
+		rows := make([]int, 0, len(table.Rows))
+		for rowID, row := range table.Rows {
+			if ragRowMatchesEqualities(row, predicates) {
+				rows = append(rows, rowID)
+			}
 		}
+		return rows, nil
 	}
 
 	// Even an exact index prefix only covers its leading columns. Checking every
@@ -765,22 +790,19 @@ func ragNormalizeRowIDs(total int, rows []int) []int {
 		}
 		return out
 	}
-	// Use a map for O(1) dedup, then extract and sort unique keys
-	seen := make(map[int]struct{}, len(rows))
+	// Keep ownership separate from cached index runs. Sorting a private
+	// copy permits in-place deduplication without a second hash structure.
+	out := make([]int, 0, len(rows))
 	for _, rowID := range rows {
 		if rowID >= 0 && rowID < total {
-			seen[rowID] = struct{}{}
+			out = append(out, rowID)
 		}
 	}
-	if len(seen) == 0 {
+	if len(out) == 0 {
 		return nil
 	}
-	out := make([]int, 0, len(seen))
-	for rowID := range seen {
-		out = append(out, rowID)
-	}
-	sort.Ints(out)
-	return out
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 func ragIntersectRowIDs(left, right []int) []int {
@@ -1088,6 +1110,16 @@ func ragIntersectFTSCandidates(candidates ftsCandidates, allowed []int) []int32 
 		return out
 	}
 	cand := candidates.rows
+	if len(cand) > 0 && len(allowed) > 0 {
+		if len(cand)/len(allowed) >= 16 {
+			out, _ := retrievalIntersectSparse(allowed, cand, make([]int32, 0, len(allowed)))
+			return out
+		}
+		if len(allowed)/len(cand) >= 16 {
+			out, _ := retrievalIntersectSparse(cand, allowed, make([]int32, 0, len(cand)))
+			return out
+		}
+	}
 	rows := make([]int32, 0, min(len(cand), len(allowed)))
 	i, j := 0, 0
 	for i < len(cand) && j < len(allowed) {
@@ -1169,6 +1201,16 @@ func ragFilteredFTSStatistics(table *storage.Table, colsKey string, cache ftsDoc
 }
 
 func ragFilteredFTSDocFrequency(postings []int32, allowed []int) int {
+	if len(postings) > 0 && len(allowed) > 0 {
+		if len(postings)/len(allowed) >= 16 {
+			_, count := retrievalIntersectSparse(allowed, postings, nil)
+			return count
+		}
+		if len(allowed)/len(postings) >= 16 {
+			_, count := retrievalIntersectSparse(postings, allowed, nil)
+			return count
+		}
+	}
 	count := 0
 	i, j := 0, 0
 	for i < len(postings) && j < len(allowed) {

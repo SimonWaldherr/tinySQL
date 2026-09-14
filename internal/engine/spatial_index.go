@@ -21,6 +21,8 @@ import (
 	"context"
 	"math"
 	"math/bits"
+	"slices"
+	"sort"
 	"sync"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -58,7 +60,20 @@ type geoIndexCacheKey struct {
 	colIdx int
 }
 
+// Columns retain the immutable grid in coordinate order for rectangle seeks.
+// The hash grid still handles tiny windows without binary-search overhead.
+type geoGridColumn struct {
+	x     int32
+	cells []geoGridColumnCell
+}
+
+type geoGridColumnCell struct {
+	y    int32
+	rows []int32
+}
+
 type geoGridIndex struct {
+	columns     []geoGridColumn
 	table       *storage.Table
 	version     int
 	cellSizeLon float64
@@ -257,7 +272,31 @@ func buildGeoGridIndex(ctx context.Context, table *storage.Table, colIdx int) (*
 			}
 		}
 	}
+	idx.buildColumns()
 	return idx, nil
+}
+
+func (idx *geoGridIndex) buildColumns() {
+	keys := make([]geoCellID, 0, len(idx.cells))
+	for key := range idx.cells {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].X != keys[j].X {
+			return keys[i].X < keys[j].X
+		}
+		return keys[i].Y < keys[j].Y
+	})
+	cells := make([]geoGridColumnCell, len(keys))
+	for start := 0; start < len(keys); {
+		end := start
+		for end < len(keys) && keys[end].X == keys[start].X {
+			cells[end] = geoGridColumnCell{y: keys[end].Y, rows: idx.cells[keys[end]]}
+			end++
+		}
+		idx.columns = append(idx.columns, geoGridColumn{x: keys[start].X, cells: cells[start:end]})
+		start = end
+	}
 }
 
 // candidatesBBox returns every row (deduplicated) whose cell range overlaps
@@ -330,7 +369,35 @@ func (idx *geoGridIndex) candidatesBBox(minLon, minLat, maxLon, maxLat float64) 
 	// occupied keys when that is cheaper than probing the entire rectangle.
 	// Keep direct lookup for selective windows; the exact residual and final
 	// row ordering remain the caller's responsibility on both paths.
-	if cellCount > int64(len(idx.cells))*4 {
+	if len(idx.columns) > 0 && cellCount > 16 {
+		start := sort.Search(len(idx.columns), func(i int) bool { return idx.columns[i].x >= minCX })
+		// Keep the usual grid dimensions on the stack. Counting first lets point
+		// layers allocate their result once; polygon layers retain deduplication.
+		var scratch [64][]geoGridColumnCell
+		spans := scratch[:0]
+		total := len(idx.overflow)
+		for c := start; c < len(idx.columns) && idx.columns[c].x <= maxCX; c++ {
+			cells := idx.columns[c].cells
+			lo := sort.Search(len(cells), func(i int) bool { return cells[i].y >= minCY })
+			hi := lo
+			for hi < len(cells) && cells[hi].y <= maxCY {
+				total += len(cells[hi].rows)
+				hi++
+			}
+			if hi > lo {
+				spans = append(spans, cells[lo:hi])
+			}
+		}
+		if idx.uniqueCells {
+			out = make([]int32, 0, total)
+			out = append(out, idx.overflow...)
+		}
+		for _, span := range spans {
+			for _, cell := range span {
+				addRows(cell.rows)
+			}
+		}
+	} else if cellCount > int64(len(idx.cells))*4 {
 		for cell, rows := range idx.cells {
 			if cell.X >= minCX && cell.X <= maxCX && cell.Y >= minCY && cell.Y <= maxCY {
 				addRows(rows)
@@ -398,20 +465,64 @@ func (idx *geoGridIndex) candidatesRadius(centerLon, centerLat, radiusMeters flo
 	return idx.candidatesBBox(minLon, minLat, maxLon, maxLat)
 }
 
+// geoMergeCandidateRows returns a private, deduplicated union. Candidate order
+// is internal: GEO_SEARCH and spatial RAG sort their final matches by row ID.
 func geoMergeCandidateRows(groups ...[]int32) []int32 {
 	total := 0
 	for _, group := range groups {
 		total += len(group)
 	}
+	if total <= 128 {
+		out := make([]int32, 0, total)
+		for _, group := range groups {
+			out = append(out, group...)
+		}
+		slices.Sort(out)
+		return slices.Compact(out)
+	}
+
+	minRow, maxRow := int32(math.MaxInt32), int32(math.MinInt32)
+	for _, group := range groups {
+		for _, row := range group {
+			minRow = min(minRow, row)
+			maxRow = max(maxRow, row)
+		}
+	}
+	span := int64(maxRow) - int64(minRow) + 1
+	if span <= int64(total)*16 {
+		// Bound scratch space by the candidates, not the source table size.
+		// Dense unions avoid hashing each row and sorting a large result.
+		bitmap := make([]uint64, (span+63)/64)
+		for _, group := range groups {
+			for _, row := range group {
+				offset := int64(row) - int64(minRow)
+				bitmap[offset/64] |= uint64(1) << (uint(offset) % 64)
+			}
+		}
+		count := 0
+		for _, word := range bitmap {
+			count += bits.OnesCount64(word)
+		}
+		out := make([]int32, 0, count)
+		for i, word := range bitmap {
+			for word != 0 {
+				out = append(out, int32(int64(minRow)+int64(i)*64+int64(bits.TrailingZeros64(word))))
+				word &= word - 1
+			}
+		}
+		return out
+	}
+
+	// Widely scattered IDs retain a sparse set rather than a bitmap whose
+	// size could grow with the whole table for just a handful of matches.
 	out := make([]int32, 0, total)
 	seen := make(map[int32]struct{}, total)
 	for _, group := range groups {
-		for _, rowIdx := range group {
-			if _, exists := seen[rowIdx]; exists {
-				continue
+		for _, row := range group {
+			if _, exists := seen[row]; !exists {
+				seen[row] = struct{}{}
+				out = append(out, row)
 			}
-			seen[rowIdx] = struct{}{}
-			out = append(out, rowIdx)
 		}
 	}
 	return out

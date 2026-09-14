@@ -408,10 +408,10 @@ func _TinySQL_GetChanges_Handler(srv any, stream grpc.ServerStream) (err error) 
 	// learn its epoch no longer matches -- unlike the unary GetChangesSince
 	// transport, which returns Epoch on every single call regardless of
 	// whether anything is new. Once the first message (or any epoch
-	// change) has been sent, an ordinary empty poll goes back to being
-	// silent, matching the streaming design's "push only when there is
-	// something worth pushing" intent.
+	// change) has been sent, empty polls send at most one heartbeat per
+	// second so serving replicas can expire readiness on a silent connection.
 	lastSentEpoch := uint64(0)
+	lastSent := time.Time{}
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -423,17 +423,19 @@ func _TinySQL_GetChanges_Handler(srv any, stream grpc.ServerStream) (err error) 
 			return err
 		}
 
-		if n > 0 || resp.Epoch != lastSentEpoch {
+		if n > 0 || resp.Epoch != lastSentEpoch || time.Since(lastSent) >= replicaHeartbeatInterval {
 			if err := stream.SendMsg(resp); err != nil {
 				return err
 			}
 			sinceLSN = resp.ResumeLSN
 			lastSentEpoch = resp.Epoch
+			lastSent = time.Now()
 			backoff = replicaMinPollBackoff
 			continue
 		}
 
-		if !replicaSleep(ctx, backoff) {
+		wait := min(backoff, time.Until(lastSent.Add(replicaHeartbeatInterval)))
+		if !replicaSleep(ctx, wait) {
 			return ctx.Err()
 		}
 		backoff = replicaNextBackoff(backoff)
@@ -531,7 +533,11 @@ func _TinySQL_QueryStream_Handler(srv any, stream grpc.ServerStream) (err error)
 
 // server state
 type server struct {
+	// dbMu pins a database generation until a request (including a stream)
+	// finishes, so re-bootstrap never closes a database still being read.
+	dbMu             sync.RWMutex
 	db               *storage.DB
+	replica          *replicaHealth
 	cache            *engine.QueryCache
 	peers            []string
 	defaultT         string
@@ -574,7 +580,11 @@ func newServer(db *storage.DB, defaultTenant, authToken string, peers []string, 
 		execSem:          newExecSemaphore(*flagMaxConcurrentQueries),
 	}
 	s.ready.Store(true)
-	s.metrics.SetBackendStatsSource(db.BackendStats)
+	s.metrics.SetBackendStatsSource(func() storage.BackendStats {
+		s.dbMu.RLock()
+		defer s.dbMu.RUnlock()
+		return s.db.BackendStats()
+	})
 	s.metrics.SetVectorCacheMetricsEnabled(s.analytics)
 	return s
 }
@@ -883,6 +893,9 @@ func truncateForLog(s string, max int) string {
 
 // TinySQLServer implementation
 func (s *server) Exec(ctx context.Context, req *execRequest) (*execResponse, error) {
+	if !s.isReady() {
+		return &execResponse{Error: errServerNotReady.Error()}, errServerNotReady
+	}
 	start := time.Now()
 	tenant := s.tenantOrDefault(req.Tenant)
 	sqlText, err := s.normalizeSQL(req.SQL)
@@ -908,6 +921,12 @@ func (s *server) Exec(ctx context.Context, req *execRequest) (*execResponse, err
 	}
 	defer release()
 
+	unlock, err := s.acquireDatabase()
+	if err != nil {
+		return &execResponse{Error: err.Error()}, err
+	}
+	defer unlock()
+
 	_, err = engine.Execute(ctx, s.db, tenant, stmt)
 	if err != nil {
 		return &execResponse{Success: false, Error: err.Error(), Duration: time.Since(start).String()}, nil
@@ -916,6 +935,9 @@ func (s *server) Exec(ctx context.Context, req *execRequest) (*execResponse, err
 }
 
 func (s *server) Query(ctx context.Context, req *queryRequest) (*queryResponse, error) {
+	if !s.isReady() {
+		return &queryResponse{Error: errServerNotReady.Error()}, errServerNotReady
+	}
 	start := time.Now()
 	tenant := s.tenantOrDefault(req.Tenant)
 	sqlText, err := s.normalizeSQL(req.SQL)
@@ -929,16 +951,22 @@ func (s *server) Query(ctx context.Context, req *queryRequest) (*queryResponse, 
 	}
 	defer cancel()
 
-	compiled, err := s.cache.Compile(sqlText)
-	if err != nil {
-		return &queryResponse{SQL: sqlText, Error: err.Error(), Duration: time.Since(start).String()}, nil
-	}
-
 	release, err := s.acquireExecSlot(ctx)
 	if err != nil {
 		return &queryResponse{SQL: sqlText, Error: err.Error(), Duration: time.Since(start).String()}, nil
 	}
 	defer release()
+
+	unlock, err := s.acquireDatabase()
+	if err != nil {
+		return &queryResponse{Error: err.Error()}, err
+	}
+	defer unlock()
+
+	compiled, err := s.cache.Compile(sqlText)
+	if err != nil {
+		return &queryResponse{SQL: sqlText, Error: err.Error(), Duration: time.Since(start).String()}, nil
+	}
 
 	rs, err := compiled.Execute(ctx, s.db, tenant)
 	if err != nil {
@@ -989,6 +1017,7 @@ type queryStreamSession struct {
 	stream  *engine.ResultStream
 	cancel  context.CancelFunc
 	release func()
+	unlock  func()
 	started time.Time
 
 	closeOnce sync.Once
@@ -1009,6 +1038,9 @@ func (q *queryStreamSession) Close() {
 		if q.release != nil {
 			q.release()
 		}
+		if q.unlock != nil {
+			q.unlock()
+		}
 		if q.cancel != nil {
 			q.cancel()
 		}
@@ -1020,6 +1052,9 @@ func (q *queryStreamSession) Close() {
 // semaphore policy as Query; the returned session transfers ownership of all
 // three resources to the caller.
 func (s *server) openQueryStream(ctx context.Context, req *queryRequest) (*queryStreamSession, error) {
+	if !s.isReady() {
+		return nil, errServerNotReady
+	}
 	if req == nil {
 		return nil, fmt.Errorf("query request is required")
 	}
@@ -1035,14 +1070,28 @@ func (s *server) openQueryStream(ctx context.Context, req *queryRequest) (*query
 		return nil, err
 	}
 
-	compiled, err := s.cache.Compile(sqlText)
+	release, err := s.acquireExecSlot(ctx)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 
-	release, err := s.acquireExecSlot(ctx)
+	unlock, err := s.acquireDatabase()
 	if err != nil {
+		release()
+		cancel()
+		return nil, err
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			unlock()
+		}
+	}()
+
+	compiled, err := s.cache.Compile(sqlText)
+	if err != nil {
+		release()
 		cancel()
 		return nil, err
 	}
@@ -1054,11 +1103,13 @@ func (s *server) openQueryStream(ctx context.Context, req *queryRequest) (*query
 		return nil, err
 	}
 
+	transferred = true
 	return &queryStreamSession{
 		sql:     sqlText,
 		stream:  stream,
 		cancel:  cancel,
 		release: release,
+		unlock:  unlock,
 		started: started,
 	}, nil
 }
@@ -1174,6 +1225,11 @@ var errNoAdvancedWAL = errors.New("database is not running with an advanced WAL 
 // decode via storage.LoadFromBytes and then resume from via
 // GetChangesSince(sinceLSN=watermark).
 func (s *server) Bootstrap(ctx context.Context, req *bootstrapRequest) (*bootstrapResponse, error) {
+	unlock, err := s.acquireDatabase()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	wal := s.db.AdvancedWAL()
 	if wal == nil {
 		return nil, status.Error(codes.FailedPrecondition, errNoAdvancedWAL.Error())
@@ -1213,6 +1269,11 @@ func (s *server) GetChangesSince(ctx context.Context, req *getChangesSinceReques
 // is anything new to push right now) doesn't have to gob-decode
 // RecordsGob just to find out.
 func (s *server) computeChangesSince(sinceLSN uint64) (resp *getChangesSinceResponse, recordCount int, err error) {
+	unlock, err := s.acquireDatabase()
+	if err != nil {
+		return nil, 0, err
+	}
+	defer unlock()
 	wal := s.db.AdvancedWAL()
 	if wal == nil {
 		return nil, 0, status.Error(codes.FailedPrecondition, errNoAdvancedWAL.Error())
@@ -1296,7 +1357,11 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, _ := s.Exec(r.Context(), &req)
+	resp, err := s.Exec(r.Context(), &req)
+	if err != nil {
+		writeErrorJSON(w, queryStreamHTTPStatus(err), err.Error())
+		return
+	}
 	if !resp.Success {
 		writeJSON(w, http.StatusBadRequest, resp)
 		return
@@ -1316,7 +1381,11 @@ func (s *server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, _ := s.Query(r.Context(), &req)
+	resp, err := s.Query(r.Context(), &req)
+	if err != nil {
+		writeErrorJSON(w, queryStreamHTTPStatus(err), err.Error())
+		return
+	}
 	if resp.Error != "" {
 		writeJSON(w, http.StatusBadRequest, resp)
 		return
@@ -1404,6 +1473,8 @@ func (s *server) handleQueryStream(w http.ResponseWriter, r *http.Request) {
 
 func queryStreamHTTPStatus(err error) int {
 	switch {
+	case status.Code(err) == codes.Unavailable:
+		return http.StatusServiceUnavailable
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		return http.StatusRequestTimeout
 	default:
@@ -1428,8 +1499,14 @@ func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func (s *server) handleReady(w http.ResponseWriter, _ *http.Request) {
-	if !s.ready.Load() {
+func (s *server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if !s.isReady() {
+		writeErrorJSON(w, http.StatusServiceUnavailable, "server not ready")
+		return
+	}
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	if !s.isReady() || !s.db.HealthCheck().OK || (r.URL.Path == "/readyz/write" && s.db.IsReadOnly()) {
 		writeErrorJSON(w, http.StatusServiceUnavailable, "server not ready")
 		return
 	}
@@ -1442,11 +1519,14 @@ func (s *server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *server) handleStatus(w http.ResponseWriter, _ *http.Request) {
-	stats := s.db.BackendStats()
 	reqTotals := s.metrics.TotalRequestsByProtocol()
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	stats := s.db.BackendStats()
 	resp := map[string]any{
 		"ok":              true,
-		"ready":           s.ready.Load(),
+		"ready":           s.isReady(),
+		"read_only":       s.db.IsReadOnly(),
 		"time":            time.Now().Format(time.RFC3339),
 		"uptime":          time.Since(s.startedAt).String(),
 		"tenant":          s.defaultT,
@@ -1469,6 +1549,9 @@ func (s *server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 			"load_count":         stats.LoadCount,
 			"eviction_count":     stats.EvictionCount,
 		},
+	}
+	if s.replica != nil {
+		resp["replication"] = s.replica.snapshot()
 	}
 	// Vector-cache analytics are opt-in (matches cmd/tinysqld's -analytics
 	// flag): VectorCacheAnalytics() walks runtime.ReadMemStats, so it's only
@@ -2134,6 +2217,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	defer func() { _ = db.Close() }()
 
 	tenant := resolveRunTenant(dsnTenant)
 
@@ -2158,6 +2242,7 @@ func run() error {
 
 	grpcSrv, _, err := startGRPCServer(srv, db, grpcAddr, minTLSVersion, errChan)
 	if err != nil {
+		_ = shutdownRunServers(httpSrv, nil, nil)
 		return err
 	}
 
@@ -2287,10 +2372,7 @@ func buildRunPeerDialCreds(minTLSVersion uint16) (credentials.TransportCredentia
 	)
 }
 
-func startHTTPServer(srv *server, db *storage.DB, httpAddr string, minTLSVersion uint16, errChan chan<- error) (*http.Server, error) {
-	if httpAddr == "" {
-		return nil, nil
-	}
+func (srv *server) httpHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/exec", srv.instrumentHTTP("/api/exec", srv.withAuth(srv.handleExec)))
 	mux.HandleFunc("/api/query", srv.instrumentHTTP("/api/query", srv.withAuth(srv.handleQuery)))
@@ -2301,17 +2383,24 @@ func startHTTPServer(srv *server, db *storage.DB, httpAddr string, minTLSVersion
 	mux.HandleFunc("/metrics", srv.instrumentHTTP("/metrics", srv.withAuth(srv.handleMetrics)))
 	mux.HandleFunc("/healthz", srv.instrumentHTTP("/healthz", srv.handleHealth))
 	mux.HandleFunc("/readyz", srv.instrumentHTTP("/readyz", srv.handleReady))
+	mux.HandleFunc("/readyz/read", srv.instrumentHTTP("/readyz/read", srv.handleReady))
+	mux.HandleFunc("/readyz/write", srv.instrumentHTTP("/readyz/write", srv.handleReady))
+	return srv.recoverMiddleware(mux)
+}
 
+func startHTTPServer(srv *server, db *storage.DB, httpAddr string, minTLSVersion uint16, errChan chan<- error) (*http.Server, error) {
+	if httpAddr == "" {
+		return nil, nil
+	}
 	httpTLSCfg, err := loadServerTLSConfig(*flagHTTPTLSCert, *flagHTTPTLSKey, minTLSVersion)
 	if err != nil {
 		srv.ready.Store(false)
-		_ = db.Close()
 		return nil, err
 	}
 
 	httpSrv := &http.Server{
 		Addr:              httpAddr,
-		Handler:           srv.recoverMiddleware(mux),
+		Handler:           srv.httpHandler(),
 		ReadTimeout:       *flagReadTimeout,
 		ReadHeaderTimeout: *flagReadHeaderTimeout,
 		WriteTimeout:      *flagWriteTimeout,
@@ -2351,7 +2440,6 @@ func startGRPCServer(srv *server, db *storage.DB, grpcAddr string, minTLSVersion
 	lis, err := net.Listen("tcp", grpcAddr)
 	if err != nil {
 		srv.ready.Store(false)
-		_ = db.Close()
 		return nil, "", fmt.Errorf("grpc listen: %w", err)
 	}
 
@@ -2373,7 +2461,6 @@ func startGRPCServer(srv *server, db *storage.DB, grpcAddr string, minTLSVersion
 	if err != nil {
 		srv.ready.Store(false)
 		_ = lis.Close()
-		_ = db.Close()
 		return nil, "", err
 	}
 	if grpcTLSCfg != nil {
@@ -2420,7 +2507,10 @@ func shutdownRunServers(httpSrv *http.Server, grpcSrv *grpc.Server, db *storage.
 
 	var shutdownErr error
 	if httpSrv != nil {
-		if err := httpSrv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+			// Cancel streams still holding a database generation after the
+			// graceful deadline before closing that database.
+			_ = httpSrv.Close()
 			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("http shutdown: %w", err))
 		}
 	}
@@ -2436,8 +2526,10 @@ func shutdownRunServers(httpSrv *http.Server, grpcSrv *grpc.Server, db *storage.
 			grpcSrv.Stop()
 		}
 	}
-	if err := db.Close(); err != nil {
-		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("close db: %w", err))
+	if db != nil {
+		if err := db.Close(); err != nil {
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("close db: %w", err))
+		}
 	}
 	return shutdownErr
 }

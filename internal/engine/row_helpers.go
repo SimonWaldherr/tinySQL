@@ -166,19 +166,11 @@ func fmtKeyPart(v any) string {
 }
 
 func comparableKeyPart(v any) any {
-	switch x := v.(type) {
-	case nil:
-		return nil
-	case int:
-		return x
-	case int64:
-		return x
-	case float64:
-		return x
-	case bool:
-		return x
-	case string:
-		return x
+	switch v.(type) {
+	case nil, int, int64, float64, bool, string:
+		// Keep the existing interface box. Extracting and reboxing a scalar
+		// allocates on hot constraint/hash lookups for strings and large IDs.
+		return v
 	default:
 		return fmtKeyPart(v)
 	}

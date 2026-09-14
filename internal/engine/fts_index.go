@@ -670,6 +670,14 @@ func ftsIntersect(a, b []int32) []int32 {
 	if len(a) == 0 || len(b) == 0 {
 		return nil
 	}
+	if len(a)/len(b) >= 16 {
+		out, _ := retrievalIntersectSparse(b, a, make([]int32, 0, len(b)))
+		return out
+	}
+	if len(b)/len(a) >= 16 {
+		out, _ := retrievalIntersectSparse(a, b, make([]int32, 0, len(a)))
+		return out
+	}
 	// Iterate the shorter list's span; the two-pointer walk is O(len(a)+len(b))
 	// either way, but the output cannot exceed the shorter input.
 	shorter := len(a)

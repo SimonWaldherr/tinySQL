@@ -37,7 +37,13 @@ type IndexAdvisor struct {
 	mu         sync.Mutex
 	db         *storage.DB
 	options    IndexAdvisorOptions
-	candidates map[string]*IndexRecommendation
+	candidates map[indexAdvisorKey]*IndexRecommendation
+}
+
+// The pattern itself is the hot lookup key. The public name is derived only
+// when a candidate is first admitted, rather than hashed/formatted per query.
+type indexAdvisorKey struct {
+	tenant, table, column string
 }
 
 // NewIndexAdvisor creates a DB-scoped observer. Only queries executed through
@@ -61,7 +67,7 @@ func NewIndexAdvisor(db *storage.DB, options IndexAdvisorOptions) (*IndexAdvisor
 	if options.MaxTableRows < options.MinTableRows {
 		return nil, fmt.Errorf("index advisor max rows is below min rows")
 	}
-	return &IndexAdvisor{db: db, options: options, candidates: make(map[string]*IndexRecommendation)}, nil
+	return &IndexAdvisor{db: db, options: options, candidates: make(map[indexAdvisorKey]*IndexRecommendation)}, nil
 }
 
 // SetAutoCreate changes the opt-in mode. Enabling it does not immediately build
@@ -100,7 +106,8 @@ func (a *IndexAdvisor) Execute(ctx context.Context, tenant string, stmt Statemen
 		return rs, err
 	}
 	elapsed := time.Since(start)
-	columns, table := indexAdvisorColumns(stmt)
+	var columnScratch [4]string
+	columns, table := indexAdvisorColumns(stmt, columnScratch[:0])
 	if len(columns) == 0 {
 		return rs, nil
 	}
@@ -111,14 +118,14 @@ func (a *IndexAdvisor) Execute(ctx context.Context, tenant string, stmt Statemen
 	defer a.mu.Unlock()
 	built := false
 	for _, column := range columns {
-		digest := sha256.Sum256([]byte(table + "\x00" + column))
-		name := fmt.Sprintf("auto_idx_%x", digest[:12])
-		key := tenant + "\x00" + name
+		key := indexAdvisorKey{tenant: tenant, table: table, column: column}
 		r := a.candidates[key]
 		if r == nil {
 			if len(a.candidates) >= a.options.MaxCandidates {
 				continue
 			}
+			digest := sha256.Sum256([]byte(table + "\x00" + column))
+			name := fmt.Sprintf("auto_idx_%x", digest[:12])
 			r = &IndexRecommendation{Tenant: tenant, Table: table, Column: column, Name: name, Status: "collecting"}
 			a.candidates[key] = r
 		}
@@ -161,7 +168,15 @@ func (a *IndexAdvisor) Apply(ctx context.Context, tenant, name string) error {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	r := a.candidates[tenant+"\x00"+name]
+	// Explicit application is rare and candidate count is bounded. Searching
+	// names here avoids a second lookup map and recurring composite strings.
+	var r *IndexRecommendation
+	for key, candidate := range a.candidates {
+		if key.tenant == tenant && candidate.Name == name {
+			r = candidate
+			break
+		}
+	}
 	if r == nil {
 		return fmt.Errorf("unknown index recommendation %q", name)
 	}
@@ -244,7 +259,7 @@ func indexAdvisorCheck(db *storage.DB, r *IndexRecommendation, o IndexAdvisorOpt
 	return "ready", n, len(distinct), ""
 }
 
-func indexAdvisorColumns(stmt Statement) ([]string, string) {
+func indexAdvisorColumns(stmt Statement, scratch []string) ([]string, string) {
 	s, ok := stmt.(*Select)
 	if !ok || s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil || len(s.Joins) > 0 || len(s.CTEs) > 0 || s.Union != nil {
 		return nil, ""
@@ -285,7 +300,7 @@ func indexAdvisorColumns(stmt Statement) ([]string, string) {
 		columns[col] = struct{}{}
 	}
 	visit(s.Where)
-	out := make([]string, 0, len(columns))
+	out := scratch[:0]
 	for col := range columns {
 		out = append(out, col)
 	}

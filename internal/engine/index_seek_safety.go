@@ -22,16 +22,32 @@ package engine
 // integer literal against a float-free column is then decided without touching a
 // row.
 //
-// Only that case is fast-pathed. A float literal still takes the original scan,
+// Integral float equality keys can also use the integer encoding when the
+// loaded column contains only integers/NULL and the value is strictly inside
+// (-2^53, 2^53). All other float literals still take the original scan,
 // because float equality has edge cases the column-level summary cannot settle:
 // -0.0 and 0.0 compare equal but encode differently, so "the column contains
 // floats" is not enough to prove a float seek sound.
 
 import (
+	"math"
 	"sync"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
+
+// secondaryIndexEqualityKey changes only the seek encoding, never the WHERE
+// operand. An integral float strictly inside (-2^53, 2^53) can equal exactly
+// one integer. When the loaded column has no float encodings, seeking that
+// integer key is therefore complete, including for -0. Mixed columns retain
+// the exact safety check. Schema-only paged metadata cannot prove this property.
+func secondaryIndexEqualityKey(table *storage.Table, colPos int, value any) any {
+	if v, ok := value.(float64); ok && v > -0x1p53 && v < 0x1p53 && math.Trunc(v) == v &&
+		len(table.Rows) > 0 && numericColumnIsIntegerOrNull(table, colPos) {
+		return int64(v)
+	}
+	return value
+}
 
 // numericColumnProfile records, per column, which numeric encodings appear.
 //
@@ -45,6 +61,7 @@ type numericColumnProfile struct {
 	version  int
 	hasFloat []bool
 	hasInt   []bool
+	hasOther []bool
 }
 
 // numericProfileMaxEntries bounds the cache. Each entry pins its *storage.Table,
@@ -105,6 +122,7 @@ func numericColumnIsAllFloat(table *storage.Table, colPos int) bool {
 func buildNumericColumnProfile(table *storage.Table) numericColumnProfile {
 	hasFloat := make([]bool, len(table.Cols))
 	hasInt := make([]bool, len(table.Cols))
+	hasOther := make([]bool, len(table.Cols))
 	settled := 0 // columns where both kinds are known present: nothing left to learn
 	for _, row := range table.Rows {
 		for i := 0; i < len(row) && i < len(hasFloat); i++ {
@@ -119,6 +137,9 @@ func buildNumericColumnProfile(table *storage.Table) numericColumnProfile {
 						settled++
 					}
 				}
+			case nil:
+			default:
+				hasOther[i] = true
 			case int, int64:
 				if !hasInt[i] {
 					hasInt[i] = true
@@ -132,7 +153,7 @@ func buildNumericColumnProfile(table *storage.Table) numericColumnProfile {
 			break
 		}
 	}
-	return numericColumnProfile{table: table, version: table.Version, hasFloat: hasFloat, hasInt: hasInt}
+	return numericColumnProfile{table: table, version: table.Version, hasFloat: hasFloat, hasInt: hasInt, hasOther: hasOther}
 }
 
 // purgeNumericProfilesFor drops cached column profiles for one table, called from
@@ -152,4 +173,12 @@ func isIntegerSQLValue(v any) bool {
 	default:
 		return false
 	}
+}
+
+// numericColumnIsIntegerOrNull is stricter than absence of floats: a decimal or
+// a nonnumeric value must retain the original evaluator's result/error behavior.
+func numericColumnIsIntegerOrNull(table *storage.Table, colPos int) bool {
+	entry := numericColumnProfileFor(table)
+	return colPos >= 0 && colPos < len(entry.hasFloat) && colPos < len(entry.hasOther) &&
+		!entry.hasFloat[colPos] && !entry.hasOther[colPos]
 }

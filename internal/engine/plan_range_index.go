@@ -88,6 +88,11 @@ func collectRangeTerms(expr Expr, colIndex map[string]int, out map[int]*rangeTer
 		collectRangeTerms(b.Right, colIndex, out)
 		return
 	}
+	// An equality is not a range bound. Recording an empty term for it would
+	// run prefix seek-safety checks (possibly full scans) for a point-only query.
+	if b.Op != "<" && b.Op != "<=" && b.Op != ">" && b.Op != ">=" {
+		return
+	}
 
 	// Normalize `literal op column` into `column op' literal` by mirroring the
 	// operator, so both spellings are recognized.

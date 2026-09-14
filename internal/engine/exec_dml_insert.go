@@ -6,6 +6,7 @@ package engine
 
 import (
 	"fmt"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -681,6 +682,44 @@ type constraintIndexSet struct {
 type constraintIndexEntry struct {
 	rowCount int // rows already reflected in `rows`, i.e. t.Rows[:rowCount]
 	rows     map[any][]int
+	// Maintained with the cache, not table.Version: signed point updates must
+	// not rescan the entire column after every write to prove seek safety.
+	nonIntegerRows int
+	maxValue       any // first table-order integer maximum, preserving int/int64
+	maxRow         int
+	maxKnown       bool
+}
+
+func (e *constraintIndexEntry) observeMaximum(value any, row int) {
+	if !e.maxKnown {
+		return
+	}
+	v, ok := constraintInteger(value)
+	if !ok {
+		return
+	}
+	old, have := constraintInteger(e.maxValue)
+	if !have || v > old || (v == old && row < e.maxRow) {
+		e.maxValue, e.maxRow = value, row
+	}
+}
+
+func constraintInteger(value any) (int64, bool) {
+	switch v := value.(type) {
+	case int:
+		return int64(v), true
+	case int64:
+		return v, true
+	default:
+		return 0, false
+	}
+}
+
+func constraintNonInteger(value any) int {
+	if value == nil || isIntegerSQLValue(value) {
+		return 0
+	}
+	return 1
 }
 
 func constraintIndexValueExists(index *constraintIndexEntry, val any, excludeRow int) bool {
@@ -713,7 +752,7 @@ func (set *constraintIndexSet) CloneDerived() any {
 		for k, ids := range entry.rows {
 			rows[k] = append([]int(nil), ids...)
 		}
-		cloned.cols[colIdx] = &constraintIndexEntry{rowCount: entry.rowCount, rows: rows}
+		cloned.cols[colIdx] = &constraintIndexEntry{rowCount: entry.rowCount, rows: rows, nonIntegerRows: entry.nonIntegerRows, maxValue: entry.maxValue, maxRow: entry.maxRow, maxKnown: entry.maxKnown}
 	}
 	return cloned
 }
@@ -739,9 +778,15 @@ func getConstraintIndex(t *storage.Table, colIdx int) *constraintIndexEntry {
 		// First use for this column, or the table shrank (DELETE already
 		// invalidates explicitly; this is a defensive fallback in case some
 		// row-removing path doesn't).
-		e = &constraintIndexEntry{rows: make(map[any][]int, len(t.Rows))}
+		e = &constraintIndexEntry{rows: make(map[any][]int, len(t.Rows)), maxKnown: true}
 		set.cols[colIdx] = e
 	}
+	extendConstraintIndex(t, colIdx, e)
+	return e
+}
+
+// Caller holds the table's derived-state lock.
+func extendConstraintIndex(t *storage.Table, colIdx int, e *constraintIndexEntry) {
 	for i := e.rowCount; i < len(t.Rows); i++ {
 		r := t.Rows[i]
 		if colIdx >= len(r) || r[colIdx] == nil {
@@ -749,9 +794,10 @@ func getConstraintIndex(t *storage.Table, colIdx int) *constraintIndexEntry {
 		}
 		k := comparableKeyPart(r[colIdx])
 		e.rows[k] = append(e.rows[k], i)
+		e.nonIntegerRows += constraintNonInteger(r[colIdx])
+		e.observeMaximum(r[colIdx], i)
 	}
 	e.rowCount = len(t.Rows)
-	return e
 }
 
 // currentConstraintIndex returns an already complete cache entry without
@@ -796,22 +842,21 @@ func patchConstraintIndexRow(t *storage.Table, rowIdx int, oldRow, newRow []any)
 		return
 	}
 	for colIdx, e := range set.cols {
-		if colIdx >= len(oldRow) || colIdx >= len(newRow) {
+		if rowIdx >= e.rowCount || colIdx >= len(oldRow) || colIdx >= len(newRow) {
 			continue
 		}
 		oldVal, newVal := oldRow[colIdx], newRow[colIdx]
-		if rawEqual(oldVal, newVal) {
+		// SQL-equal numbers can have different Go map keys (int/int64/float64).
+		if rawEqual(oldVal, newVal) && reflect.TypeOf(oldVal) == reflect.TypeOf(newVal) {
 			continue
 		}
+		e.nonIntegerRows += constraintNonInteger(newVal) - constraintNonInteger(oldVal)
+		if e.maxValue != nil && e.maxRow == rowIdx {
+			e.maxKnown, e.maxValue = false, nil
+		}
+		e.observeMaximum(newVal, rowIdx)
 		if oldVal != nil {
-			ok := comparableKeyPart(oldVal)
-			bucket := e.rows[ok]
-			for i, ri := range bucket {
-				if ri == rowIdx {
-					e.rows[ok] = append(bucket[:i], bucket[i+1:]...)
-					break
-				}
-			}
+			removeConstraintIndexBucketEntry(e, oldVal, rowIdx)
 		}
 		if newVal != nil {
 			nk := comparableKeyPart(newVal)
@@ -846,9 +891,18 @@ func patchConstraintIndexSwapRemove(t *storage.Table, deleteRowID int, deletedRo
 			delete(set.cols, colIdx)
 			continue
 		}
+		if e.maxValue != nil && e.maxRow == deleteRowID {
+			e.maxKnown, e.maxValue = false, nil
+		} else if e.maxKnown && deleteRowID != lastRowID && colIdx < len(lastRow) {
+			if e.maxRow == lastRowID {
+				e.maxRow = deleteRowID
+			}
+			e.observeMaximum(lastRow[colIdx], deleteRowID)
+		}
 		if colIdx < len(deletedRow) {
 			if oldVal := deletedRow[colIdx]; oldVal != nil {
 				removeConstraintIndexBucketEntry(e, oldVal, deleteRowID)
+				e.nonIntegerRows -= constraintNonInteger(oldVal)
 			}
 		}
 		if deleteRowID != lastRowID && colIdx < len(lastRow) {
@@ -869,7 +923,11 @@ func removeConstraintIndexBucketEntry(e *constraintIndexEntry, val any, rowIdx i
 	bucket := e.rows[k]
 	for i, ri := range bucket {
 		if ri == rowIdx {
-			e.rows[k] = append(bucket[:i], bucket[i+1:]...)
+			if len(bucket) == 1 {
+				delete(e.rows, k)
+			} else {
+				e.rows[k] = append(bucket[:i], bucket[i+1:]...)
+			}
 			break
 		}
 	}

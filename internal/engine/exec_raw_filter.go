@@ -370,6 +370,11 @@ func buildRawComparisonFilter(colIndex map[string]int, ex *Binary) func([]any) (
 				return buildColLiteralFilter(colIdx, ex.Op, lit.Val)
 			}
 		}
+		if value, ok := signedNumericLiteral(ex.Right); ok && !exprContainsBoundParameter(ex.Right) {
+			if colIdx, found := colIndex[strings.ToLower(ref.Name)]; found {
+				return buildSignedComparisonFilter(colIdx, ex.Op, value, false)
+			}
+		}
 	}
 	if lit, ok := ex.Left.(*Literal); ok {
 		if ref, ok := ex.Right.(*VarRef); ok {
@@ -378,6 +383,13 @@ func buildRawComparisonFilter(colIndex map[string]int, ex *Binary) func([]any) (
 					return buildBoundLiteralFilter(colIdx, reverseComparisonOp(ex.Op), lit)
 				}
 				return buildColLiteralFilter(colIdx, reverseComparisonOp(ex.Op), lit.Val)
+			}
+		}
+	}
+	if ref, ok := ex.Right.(*VarRef); ok {
+		if value, ok := signedNumericLiteral(ex.Left); ok && !exprContainsBoundParameter(ex.Left) {
+			if colIdx, found := colIndex[strings.ToLower(ref.Name)]; found {
+				return buildSignedComparisonFilter(colIdx, ex.Op, value, true)
 			}
 		}
 	}
@@ -391,6 +403,19 @@ func buildRawComparisonFilter(colIndex map[string]int, ex *Binary) func([]any) (
 		}
 	}
 	return nil
+}
+
+// Fold only unary evaluation. Use the original comparison routine and operand
+// order to preserve NULL, NaN, decimal and incomparable-type behavior.
+func buildSignedComparisonFilter(colIdx int, op string, value any, constantLeft bool) func([]any) (bool, error) {
+	return func(raw []any) (bool, error) {
+		left, right := raw[colIdx], value
+		if constantLeft {
+			left, right = right, left
+		}
+		result, err := evalComparisonBinary(op, left, right)
+		return toTri(result) == tvTrue, err
+	}
 }
 
 // orderedCompareOp applies op to an already-typed ordered pair, shared by

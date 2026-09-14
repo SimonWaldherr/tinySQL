@@ -7,7 +7,7 @@ SHELL := /usr/bin/env bash
 .PHONY: build-query-files build-query-files-wasm build-fsql run-query-files-demo
 .PHONY: build-gh-pages-demo check-gh-pages-demo update-gh-pages push-gh-pages
 .PHONY: test-all test-unit test-integration test-jsonv2 test-ci coverage build-check wasm-check tinygo-wasm ci verify verify-ci
-.PHONY: test-query-files test-query-files-wasm test-fsql test-gorm test-sqlpackages test-sql-compat
+.PHONY: test-query-files test-query-files-wasm test-fsql test-gorm test-sqlpackages test-sql-compat test-server
 .PHONY: run-wasm-browser run-wasm-node-demo deps deps-all update-deps tidy tidy-all modules-verify bench bench-engine bench-hotpaths bench-stream bench-stream-guard release-check script-lint docker-build info
 .DEFAULT_GOAL := help
 
@@ -279,6 +279,7 @@ test-all:
 	$(GO) test $(GO_TEST_FLAGS) -race -coverprofile=$(COVERPROFILE) ./...
 	$(MAKE) test-query-files
 	$(MAKE) test-query-files-wasm
+	$(MAKE) test-server GO_TEST_FLAGS='$(GO_TEST_FLAGS) -race'
 
 ## test-unit: Run unit tests only
 test-unit:
@@ -303,11 +304,13 @@ test-ci:
 	$(MAKE) --no-print-directory test-sql-compat GO_TEST_FLAGS=-count=1
 	$(MAKE) --no-print-directory test-query-files GO_TEST_FLAGS=-count=1
 	$(MAKE) --no-print-directory test-query-files-wasm GO_TEST_FLAGS=-count=1
+	$(MAKE) --no-print-directory test-server GO_TEST_FLAGS=-count=1
 	GOEXPERIMENT=jsonv2 $(GO) test ./internal/storage ./internal/engine -count=1
 	$(GO) test ./... -race -count=1
 	$(MAKE) --no-print-directory test-sql-compat GO_TEST_FLAGS='-race -count=1'
 	$(MAKE) --no-print-directory test-query-files GO_TEST_FLAGS='-race -count=1'
 	$(MAKE) --no-print-directory test-query-files-wasm GO_TEST_FLAGS='-race -count=1'
+	$(MAKE) --no-print-directory test-server GO_TEST_FLAGS='-race -count=1'
 	$(GO) test -coverprofile=$(COVERPROFILE) ./...
 	$(GO) tool cover -func=$(COVERPROFILE)
 
@@ -321,6 +324,10 @@ test-sqlpackages:
 ## test-gorm: Test the GORM PostgreSQL dialect against tinySQL (no server)
 test-gorm:
 	cd tests/gorm && $(GO) test $(GO_TEST_FLAGS) ./...
+
+## test-server: Run HTTP/gRPC server and cluster tests in the nested module
+test-server:
+	cd $(CMD_DIR)/server && $(GO) test $(GO_TEST_FLAGS) ./...
 
 ## test-query-files: Run tests for cmd/query_files module
 test-query-files:

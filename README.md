@@ -907,6 +907,12 @@ read lock, then release that lock before encoding, compression, filesystem
 sync, or network output. A slow backup target therefore does not hold up
 concurrent writers for the duration of the transfer.
 
+For a server cluster, `cmd/server` supports one durable `advanced_wal` primary
+and read-only HTTP/gRPC replicas. The [cluster guide](./docs/cluster.md) includes
+Docker Compose with two replicas and HAProxy, readiness checks, and routing for
+read-after-write consistency. Replication is asynchronous; automatic primary
+failover and multi-primary writes are not supported.
+
 For high-repeat vector searches, `ConfigureVectorCache` can enable a bounded,
 process-local result cache and anonymous shape/timing analytics. See the
 [RAG guide](./docs/rag-guide.md) before combining vector metrics and reranking.
@@ -920,6 +926,7 @@ process-local result cache and anonymous shape/timing analytics. See the
 | [Go API stability](./docs/api-stability.md) | Compatibility guarantees, streaming, and upgrades |
 | [CLI guide](./docs/cli-guide.md) | REPL, servers, and file-query tools |
 | [Storage guide](./docs/storage-guide.md) | Backends, DSNs, read-only mode, large tilesets |
+| [Cluster guide](./docs/cluster.md) | Primary/replica servers, load balancing, Docker Compose, and recovery |
 | [RAG guide](./docs/rag-guide.md) | Vector, hybrid retrieval, reranking, and context |
 | [TinyGo guide](./docs/tinygo-guide.md) | TinyGo, embedded targets, and WASM |
 | [Architecture](./docs/architecture.md) | Parser, executor, storage, and invariants |
@@ -946,8 +953,9 @@ cd cmd/query_files_wasm
 See [SQL feature gaps and recent additions](docs/sql-feature-gaps.md) for the
 current SQL-focused inventory and runnable examples.
 
-- Single-process only: no built-in replication, clustering, sharding,
-  distributed transactions, or failover.
+- The embedded engine is single-process. `cmd/server` offers asynchronous
+  primary/replica clusters and load-balanced reads; there is no sharding,
+  multi-primary writing, distributed transaction protocol, or automatic failover.
 - No composite primary/foreign keys, `CHECK`, `ON CONFLICT DO UPDATE` (target-less `ON CONFLICT DO NOTHING` is supported),
   `SAVEPOINT`, `ATTACH`/`DETACH`, `VACUUM`, partial indexes, generated
   columns, or persistent ANN vector index files.

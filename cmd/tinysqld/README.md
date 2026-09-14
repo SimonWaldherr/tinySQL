@@ -9,6 +9,10 @@ profile, requires durable storage, starts the job scheduler through that
 profile, exposes a minimal HTTP DBMS API for DB health, storage, scheduler, WAL
 and recovery state, and shuts down gracefully on a signal.
 
+For a live primary/replica cluster, use the HTTP/gRPC
+[`cmd/server` deployment](../../docs/cluster.md). Multiple `tinysqld -read-only`
+processes can also serve copies of an immutable artifact behind a load balancer.
+
 ```bash
 go build ./cmd/tinysqld
 
@@ -24,6 +28,7 @@ go build ./cmd/tinysqld
 | `-tenant` | `default` | Default tenant |
 | `-http` | `127.0.0.1:8088` | HTTP listen address; empty disables HTTP |
 | `-auth` | — | Optional bearer token for API endpoints |
+| `-read-only` | `false` | Reject mutations; suitable for serving immutable artifact copies behind a load balancer (unsupported with WAL modes) |
 | `-request-timeout` | `30s` | Maximum SQL request duration |
 | `-http-read-timeout` | `10s` | HTTP read timeout |
 | `-http-write-timeout` | `30s` | HTTP write timeout |

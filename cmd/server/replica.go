@@ -16,17 +16,17 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"os/signal"
 	"strings"
-	"syscall"
 	"time"
 
+	"github.com/SimonWaldherr/tinySQL/internal/engine"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -54,7 +54,9 @@ var errReplicaNeedsRebootstrap = errors.New("replica must re-bootstrap: primary 
 // flagReplicaOf selects the replica-side CLI mode. Empty (the default)
 // means normal primary/standalone mode, unchanged. When set, run() hands
 // off to runReplica instead of starting the usual HTTP/gRPC serve loop.
-var flagReplicaOf = flag.String("replica-of", "", "gRPC address of a primary tinySQL server to replicate from (the primary must be running with a DSN mode=advanced_wal); when set, this process bootstraps an in-memory copy of the primary and continuously polls for and applies new committed WAL records instead of serving as a normal primary/standalone server")
+var flagReplicaOf = flag.String("replica-of", "", "gRPC address of an advanced_wal primary; serve a read-only in-memory replica over HTTP/gRPC")
+
+var flagReplicaReadyTimeout = flag.Duration("replica-ready-timeout", 5*time.Second, "Withdraw replica readiness when no successfully applied feed response arrives within this duration")
 
 // flagReplicaTransport selects which transport -replica-of uses to fetch
 // WAL changes from the primary after bootstrapping: "stream" (the
@@ -68,6 +70,7 @@ var flagReplicaOf = flag.String("replica-of", "", "gRPC address of a primary tin
 var flagReplicaTransport = flag.String("replica-transport", "stream", `Transport -replica-of uses to fetch WAL changes from the primary: "stream" (default, gRPC server-streaming) or "poll" (unary polling, kept as a fallback)`)
 
 const (
+	replicaHeartbeatInterval = time.Second
 	// replicaMinPollBackoff/replicaMaxPollBackoff bound runReplicaPollLoop's
 	// backoff: it starts at replicaMinPollBackoff when a poll returns zero
 	// records, doubles on every further empty/failed poll up to
@@ -102,6 +105,15 @@ type replicaOptions struct {
 	CallTimeout    time.Duration
 	MaxRecvMsgSize int
 	TransportCreds credentials.TransportCredentials
+	// Observe is called serially after each applied response or transport /
+	// apply failure. Empty responses are heartbeats, including on idle primaries.
+	Observe func(resumeLSN, epoch uint64, err error)
+}
+
+func (o replicaOptions) observe(lsn, epoch uint64, err error) {
+	if o.Observe != nil {
+		o.Observe(lsn, epoch, err)
+	}
 }
 
 // dialPeerGRPC opens a client connection to a tinySQL gRPC server (primary
@@ -308,6 +320,7 @@ func runReplicaPollLoop(ctx context.Context, db *storage.DB, primaryAddr, tenant
 		}
 
 		applied, resumeLSN, pollErr := pollChangesSinceOnce(ctx, conn, tenant, sinceLSN, fromEpoch, db, opts)
+		opts.observe(resumeLSN, fromEpoch, pollErr)
 		if pollErr != nil {
 			if errors.Is(pollErr, errReplicaNeedsRebootstrap) {
 				return errReplicaNeedsRebootstrap
@@ -415,6 +428,7 @@ func recvChangesOnce(stream grpc.ClientStream, expectedEpoch uint64, db *storage
 func streamChangesOnce(ctx context.Context, conn *grpc.ClientConn, tenant string, sinceLSN, expectedEpoch uint64, db *storage.DB, opts replicaOptions) (resumeLSN uint64, applied int, err error) {
 	stream, cancel, err := openChangesStream(ctx, conn, tenant, sinceLSN, opts)
 	if err != nil {
+		opts.observe(sinceLSN, expectedEpoch, err)
 		return sinceLSN, 0, err
 	}
 	defer cancel()
@@ -422,6 +436,7 @@ func streamChangesOnce(ctx context.Context, conn *grpc.ClientConn, tenant string
 	resumeLSN = sinceLSN
 	for {
 		n, next, err := recvChangesOnce(stream, expectedEpoch, db)
+		opts.observe(next, expectedEpoch, err)
 		applied += n
 		if err != nil {
 			return resumeLSN, applied, err
@@ -533,8 +548,8 @@ func runReplicaLoop(ctx context.Context, primaryAddr, tenant string, opts replic
 //
 // onBootstrap, if non-nil, is called with the freshly bootstrapped DB every
 // time this (re-)bootstraps, before it starts applying changes --
-// runReplica passes nil; tests use it to observe (and deterministically
-// sequence around) each bootstrap, including any rebootstrap.
+// tests use it to observe (and deterministically sequence around) each
+// bootstrap. The serving runtime uses serveReplicaLoop to manage live readers.
 //
 // It returns whichever in-memory *storage.DB the most recent bootstrap
 // produced -- still valid and current even when ctx ending is what stopped
@@ -601,56 +616,71 @@ func replicaSleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// runReplica implements the replica-side CLI mode selected by -replica-of:
-// bootstrap a snapshot from the primary at replicaOf, then poll for and
-// apply committed WAL changes until the process receives SIGINT/SIGTERM. It
-// reuses -auth and the -peer-tls* flags for the replica-to-primary
-// connection, the same way federation peer calls (grpcQuery) do.
-//
-// The replica's database lives entirely in memory for v1: it has no WAL of
-// its own and is never durable across restarts. Restarting the process
-// simply re-bootstraps from the primary rather than resuming from local
-// state -- replica-side durability and serving the replicated data back out
-// over HTTP/gRPC are both explicitly out of scope for this stage.
+// runReplica starts the ordinary HTTP/gRPC listeners against a read-only
+// database and refreshes that database from a single primary in the background.
 func runReplica(replicaOf string) error {
-	tenant := strings.TrimSpace(*flagTenant)
-	if tenant == "" {
-		tenant = "default"
+	httpAddr, grpcAddr, minTLSVersion, trustedProxies, err := parseRunConfig()
+	if err != nil {
+		return err
 	}
-
+	if *flagReplicaReadyTimeout <= replicaHeartbeatInterval {
+		return fmt.Errorf("-replica-ready-timeout must be greater than %s", replicaHeartbeatInterval)
+	}
+	if len(parsePeerList(*flagPeers)) != 0 {
+		return fmt.Errorf("-peers cannot be combined with -replica-of: federation would duplicate replicated rows")
+	}
 	changesLoop, err := replicaChangesLoopFor(*flagReplicaTransport)
 	if err != nil {
-		return err
-	}
-
-	minTLSVersion, err := parseTLSMinVersion(*flagTLSMinVersion)
-	if err != nil {
-		return err
-	}
-	if err := validateRunPeerTLSFlags(); err != nil {
 		return err
 	}
 	peerDialCreds, err := buildRunPeerDialCreds(minTLSVersion)
 	if err != nil {
 		return err
 	}
+	engine.ConfigureVectorCache(engine.VectorCacheConfig{
+		ResultCacheEntries: *flagVectorCacheEntries,
+		ResultCacheTTL:     *flagVectorCacheTTL,
+		Analytics:          *flagAnalytics,
+	})
+	db := storage.NewDB()
+	db.SetReadOnly(true)
+	srv := newServer(db, resolveRunTenant("default"), *flagAuth, nil, trustedProxies, peerDialCreds)
+	srv.replica = &replicaHealth{primary: replicaOf, transport: strings.ToLower(strings.TrimSpace(*flagReplicaTransport)), timeout: *flagReplicaReadyTimeout}
+	defer func() {
+		srv.dbMu.Lock()
+		defer srv.dbMu.Unlock()
+		_ = srv.db.Close()
+	}()
+	encoding.RegisterCodec(jsonCodec{})
+	encoding.RegisterCodec(protobufCodec{})
+	warnIfUnauthenticatedAndExposed(*flagAuth, httpAddr, grpcAddr)
 
+	errChan := make(chan error, 2)
+	httpSrv, err := startHTTPServer(srv, db, httpAddr, minTLSVersion, errChan)
+	if err != nil {
+		return err
+	}
+	grpcSrv, _, err := startGRPCServer(srv, db, grpcAddr, minTLSVersion, errChan)
+	if err != nil {
+		_ = shutdownRunServers(httpSrv, nil, nil)
+		return err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
 	opts := replicaOptions{
-		AuthToken:      strings.TrimSpace(*flagAuth),
-		CallTimeout:    *flagPeerTimeout,
-		MaxRecvMsgSize: *flagGRPCMaxRecv,
-		TransportCreds: peerDialCreds,
+		AuthToken: strings.TrimSpace(*flagAuth), CallTimeout: *flagPeerTimeout,
+		MaxRecvMsgSize: *flagGRPCMaxRecv, TransportCreds: peerDialCreds,
+		Observe: srv.replica.observe,
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	db, err := runReplicaLoopWithTransport(ctx, replicaOf, tenant, opts, nil, changesLoop)
-	if db != nil {
-		defer func() { _ = db.Close() }()
-	}
-	if err != nil && !errors.Is(err, context.Canceled) {
-		return fmt.Errorf("replica loop: %w", err)
-	}
-	return nil
+	go func() {
+		defer close(done)
+		srv.serveReplicaLoop(ctx, replicaOf, opts, changesLoop)
+	}()
+	runErr := waitForServerStop(errChan)
+	srv.ready.Store(false)
+	cancel()
+	shutdownErr := shutdownRunServers(httpSrv, grpcSrv, nil)
+	<-done
+	return errors.Join(runErr, shutdownErr)
 }
