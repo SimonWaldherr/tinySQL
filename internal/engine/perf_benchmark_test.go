@@ -1,6 +1,6 @@
 // Benchmarks covering execution-engine hotspots: single- and multi-column
-// GROUP BY raw paths, ORDER BY at scale, JOIN at both the nested-loop and
-// hash-join thresholds, plain table scans (Row map allocation cost), row-wide
+// GROUP BY raw paths, ORDER BY at scale, JOIN at small and large input sizes,
+// plain table scans (Row map allocation cost), row-wide
 // LIKE/REGEXP scans, and FTS_SEARCH repeated-query behavior (which exercises
 // the document cache).
 package engine
@@ -133,16 +133,16 @@ func setupJoinTables(b *testing.B, leftRows, rightRows int) *storage.DB {
 	return db
 }
 
-// BenchmarkJoinNestedLoopBelowThreshold sizes both sides just under the
-// 500-row hash-join cutover (internal/engine/exec.go processInnerJoin), so
-// this benchmark specifically measures the nested-loop + mergeRows path.
+// BenchmarkJoinNestedLoopBelowThreshold retains its historical name, but this
+// query now uses the raw equi-join fast path. BenchmarkSmallGeneralJoin covers
+// the general executor's nested-loop path below the 500-row cutover.
 func BenchmarkJoinNestedLoopBelowThreshold(b *testing.B) {
 	db := setupJoinTables(b, 400, 400)
 	runBench(b, db, `SELECT l.id, l.val, r.extra FROM l JOIN r ON l.id = r.id`)
 }
 
-// BenchmarkJoinHashJoinAboveThreshold exceeds the cutover on both sides,
-// exercising HashJoinOptimizer.processHashJoin instead of the nested loop.
+// BenchmarkJoinHashJoinAboveThreshold measures the raw equi-join fast path on
+// larger inputs; its historical name predates that path.
 func BenchmarkJoinHashJoinAboveThreshold(b *testing.B) {
 	db := setupJoinTables(b, 5000, 5000)
 	runBench(b, db, `SELECT l.id, l.val, r.extra FROM l JOIN r ON l.id = r.id`)

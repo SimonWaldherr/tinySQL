@@ -87,6 +87,9 @@ func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 	if !ok || err != nil {
 		return nil, ok, err
 	}
+	if rs, used, err := executeUnfilteredCountStar(env, plan); used || err != nil {
+		return rs, used, err
+	}
 	if rs, used, err := executeConstraintMaximum(env, plan); used || err != nil {
 		return rs, used, err
 	}
@@ -104,6 +107,31 @@ func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 		return executeSimpleSingleGroupAggregate(env, plan, rawPlan)
 	}
 	return executeSimpleMultiGroupAggregate(env, plan, rawPlan)
+}
+
+// A physical table's rows already contain exactly the visible records. Pure
+// COUNT(*) projections without filtering or grouping can use that cardinality
+// directly, including on an empty table, instead of scanning every record.
+// Read the current slice length on every execution so prepared queries also
+// observe inserts and deletes. The normal finalizer retains HAVING and paging.
+func executeUnfilteredCountStar(env ExecEnv, plan *simpleAggregatePlan) (*ResultSet, bool, error) {
+	if plan.where != nil || len(plan.groupCols) != 0 {
+		return nil, false, nil
+	}
+	for _, proj := range plan.projs {
+		if proj.kind != aggCount || proj.arg != nil {
+			return nil, false, nil
+		}
+	}
+	if err := checkCtx(env.ctx); err != nil {
+		return nil, true, err
+	}
+	state := newSimpleAggregateState(nil, len(plan.projs))
+	for i := range state.counts {
+		state.counts[i] = len(plan.table.Rows)
+	}
+	rs, err := finalizeSimpleAggregateResultSet(env, plan, []*simpleAggregateState{state})
+	return rs, true, err
 }
 
 // The applications allocate IDs using SELECT MAX(id), then add one. Reuse

@@ -145,6 +145,7 @@ func processInnerJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) 
 	}
 
 	// Fall back to original nested loop for small datasets
+	equality := compileJoinEquality(onCondition)
 	joined := make([]Row, 0, len(leftRows)*len(rightRows)/4) // Estimate result size
 	for i, l := range leftRows {
 		// Check context cancellation every 64 rows to reduce channel-select overhead.
@@ -154,16 +155,11 @@ func processInnerJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) 
 			}
 		}
 		for _, r := range rightRows {
-			m := mergeRows(l, r)
-			ok := true
-			if onCondition != nil {
-				val, err := evalExpr(env, onCondition, m)
-				if err != nil {
-					return nil, err
-				}
-				ok = (toTri(val) == tvTrue)
+			m, err := mergeMatchingJoinRows(env, l, r, onCondition, equality)
+			if err != nil {
+				return nil, err
 			}
-			if ok {
+			if m != nil {
 				joined = append(joined, m)
 				if int64(len(joined)) > maxJoinRows {
 					return nil, fmt.Errorf("join exceeded row limit %d", maxJoinRows)
@@ -191,6 +187,7 @@ func processLeftJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr, r
 	}
 
 	// Fall back to original nested loop for small datasets
+	equality := compileJoinEquality(onCondition)
 	joined := make([]Row, 0, len(leftRows)) // At least one row per left row
 	for i, l := range leftRows {
 		// Check context cancellation every 64 rows to reduce channel-select overhead.
@@ -201,16 +198,11 @@ func processLeftJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr, r
 		}
 		matched := false
 		for _, r := range rightRows {
-			m := mergeRows(l, r)
-			ok := true
-			if onCondition != nil {
-				val, err := evalExpr(env, onCondition, m)
-				if err != nil {
-					return nil, err
-				}
-				ok = (toTri(val) == tvTrue)
+			m, err := mergeMatchingJoinRows(env, l, r, onCondition, equality)
+			if err != nil {
+				return nil, err
 			}
-			if ok {
+			if m != nil {
 				joined = append(joined, m)
 				matched = true
 			}
@@ -222,6 +214,74 @@ func processLeftJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr, r
 		}
 	}
 	return joined, nil
+}
+
+// joinEquality resolves a simple column equality before allocating a merged
+// row. Small joins still visit every pair, but allocate only matching rows.
+type joinEquality struct {
+	leftColumn  string
+	rightColumn string
+}
+
+func compileJoinEquality(condition Expr) *joinEquality {
+	binary, ok := condition.(*Binary)
+	if !ok || binary.Op != "=" {
+		return nil
+	}
+	left, leftOK := binary.Left.(*VarRef)
+	right, rightOK := binary.Right.(*VarRef)
+	if !leftOK || !rightOK {
+		return nil
+	}
+	leftColumn, rightColumn := left.Lower, right.Lower
+	if leftColumn == "" {
+		leftColumn = strings.ToLower(left.Name)
+	}
+	if rightColumn == "" {
+		rightColumn = strings.ToLower(right.Name)
+	}
+	return &joinEquality{leftColumn: leftColumn, rightColumn: rightColumn}
+}
+
+// mergedJoinValue mirrors mergeRows followed by getValLower: the right row
+// wins even when its value is NULL. The operands need not belong to different
+// tables, and unqualified references retain the normal merged-row precedence.
+func mergedJoinValue(left, right Row, column string) (any, bool) {
+	if value, ok := right[column]; ok {
+		return value, true
+	}
+	value, ok := left[column]
+	return value, ok
+}
+
+func mergeMatchingJoinRows(env ExecEnv, left, right Row, condition Expr, equality *joinEquality) (Row, error) {
+	if equality != nil {
+		leftValue, leftOK := mergedJoinValue(left, right, equality.leftColumn)
+		rightValue, rightOK := mergedJoinValue(left, right, equality.rightColumn)
+		if leftOK && rightOK {
+			value, err := evalComparisonBinary("=", leftValue, rightValue)
+			if err != nil {
+				return nil, err
+			}
+			if toTri(value) != tvTrue {
+				return nil, nil
+			}
+			return mergeRows(left, right), nil
+		}
+		// Missing keys must use the evaluator for trigger-row resolution and
+		// its original unknown-column errors, including column suggestions.
+	}
+	merged := mergeRows(left, right)
+	if condition != nil {
+		value, err := evalExpr(env, condition, merged)
+		if err != nil {
+			return nil, err
+		}
+		if toTri(value) != tvTrue {
+			return nil, nil
+		}
+	}
+	return merged, nil
 }
 
 func processRightJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) ([]Row, error) {

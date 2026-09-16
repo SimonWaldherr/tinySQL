@@ -187,11 +187,29 @@ func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []str
 	// groups maps a composite key to a *[]Row rather than []Row directly so
 	// appending a row to an EXISTING group never needs to write the map again
 	// (see below) — only inserting a brand-new group does.
-	groups := make(map[string]*[]Row, len(filtered)/2) // Estimate group count
-	orderKeys := make([]string, 0, len(filtered)/2)
-	outRows := make([]Row, 0, len(filtered)/2)
+	groupCapacity := len(filtered) / 2
+	if len(s.GroupBy) == 0 {
+		groupCapacity = 1
+	}
+	groups := make(map[string]*[]Row, groupCapacity)
+	orderKeys := make([]string, 0, groupCapacity)
+	outRows := make([]Row, 0, groupCapacity)
 	outCols := make([]string, 0, len(s.Projs))
 	colSet := make(map[string]struct{}, len(s.Projs))
+
+	groupInput := filtered
+	if len(s.GroupBy) == 0 {
+		if err := checkCtx(env.ctx); err != nil {
+			return nil, nil, err
+		}
+		// An ungrouped aggregate has exactly one group, including for empty
+		// input. Aggregate evaluators only read this slice, so use the input
+		// directly instead of copying every row into a new group buffer.
+		rows := filtered
+		groups[""] = &rows
+		orderKeys = append(orderKeys, "")
+		groupInput = nil
+	}
 
 	// keyBuf is reused across rows via keyBuf[:0] (retaining its backing
 	// array) rather than resetting a *strings.Builder to nil every row — see
@@ -203,7 +221,7 @@ func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []str
 	// workloads have far fewer distinct groups than rows, so this turns
 	// per-row key-string allocation into per-distinct-group allocation.
 	keyBuf := make([]byte, 0, 64)
-	for i, r := range filtered {
+	for i, r := range groupInput {
 		// Check context cancellation every 64 rows to reduce channel-select overhead.
 		if i&63 == 0 {
 			if err := checkCtx(env.ctx); err != nil {
@@ -230,17 +248,6 @@ func processAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []str
 			groups[ks] = grp
 		}
 		*grp = append(*grp, r)
-	}
-
-	// A whole-table aggregate (no GROUP BY) always produces exactly one row,
-	// even over zero matching input rows — "SELECT COUNT(*) FROM t" on an
-	// empty (or fully filtered-out) table must return one row with count 0,
-	// not zero rows. Only synthesize that implicit empty group when there's
-	// no GROUP BY at all; a real "GROUP BY x" correctly produces zero rows
-	// when there's no data to group.
-	if len(s.GroupBy) == 0 && len(orderKeys) == 0 {
-		orderKeys = append(orderKeys, "")
-		groups[""] = nil
 	}
 
 	for _, k := range orderKeys {
@@ -389,19 +396,18 @@ func processAggregateQueryFastPath(env ExecEnv, s *Select, filtered []Row) ([]Ro
 		return nil, nil, false, nil
 	}
 
-	groupCapacity := len(filtered) / 2
-	if groupCapacity < 1 {
-		groupCapacity = 1
+	var groups map[string]*simpleAggregateState
+	if len(groupKeys) > 0 {
+		groups = make(map[string]*simpleAggregateState, len(filtered)/2)
 	}
-	groups := make(map[string]*simpleAggregateState, groupCapacity)
 	order := make([]*simpleAggregateState, 0)
 	keyBuf := make([]byte, 0, 64)
 	groupValues := make([]any, len(groupKeys))
 
-	if len(s.GroupBy) == 0 {
-		state := newSimpleAggregateState(nil, len(s.Projs))
-		groups[""] = state
-		order = append(order, state)
+	var ungrouped *simpleAggregateState
+	if len(groupKeys) == 0 {
+		ungrouped = newSimpleAggregateState(nil, len(s.Projs))
+		order = append(order, ungrouped)
 	}
 
 	for rowIdx, r := range filtered {
@@ -424,17 +430,18 @@ func processAggregateQueryFastPath(env ExecEnv, s *Select, filtered []Row) ([]Ro
 				}
 				keyBuf = writeFmtKeyPart(keyBuf, v)
 			}
-			key := string(keyBuf)
-			st, ok := groups[key]
+			// Lookup without copying the scratch buffer; only a new group
+			// needs to own its key after the buffer is reused for the next row.
+			st, ok := groups[string(keyBuf)]
 			if !ok {
 				values := append(make([]any, 0, len(groupValues)), groupValues...)
 				st = newSimpleAggregateState(values, len(s.Projs))
-				groups[key] = st
+				groups[string(keyBuf)] = st
 				order = append(order, st)
 			}
 			state = st
 		} else {
-			state = groups[""]
+			state = ungrouped
 		}
 
 		if err := accumulateSimpleAggregateStateFromRow(r, state, projs, args); err != nil {
