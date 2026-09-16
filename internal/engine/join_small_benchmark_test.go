@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// ORDER BY and LEFT JOIN deliberately bypass the raw-row inner-join fast
+// ORDER BY and outer joins deliberately bypass the raw-row inner-join fast
 // path, so these benchmarks measure the general nested-loop join executor.
 func BenchmarkSmallGeneralJoin(b *testing.B) {
 	for _, query := range []struct {
@@ -14,6 +14,8 @@ func BenchmarkSmallGeneralJoin(b *testing.B) {
 	}{
 		{"InnerOrdered", `SELECT l.id, l.val, r.extra FROM l JOIN r ON l.id = r.id ORDER BY l.id`},
 		{"Left", `SELECT l.id, l.val, r.extra FROM l LEFT JOIN r ON l.id = r.id`},
+		{"Right", `SELECT l.id, l.val, r.extra FROM l RIGHT JOIN r ON l.id = r.id`},
+		{"Full", `SELECT l.id, l.val, r.extra FROM l FULL OUTER JOIN r ON l.id = r.id`},
 	} {
 		b.Run(query.name, func(b *testing.B) {
 			for _, rows := range []int{10, 100, 400} {

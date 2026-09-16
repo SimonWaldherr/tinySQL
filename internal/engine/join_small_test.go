@@ -56,13 +56,20 @@ func TestSmallJoinEqualityMatchesGeneralEvaluation(t *testing.T) {
 			// expression evaluator while preserving its values and errors.
 			general := &Binary{Op: "AND", Left: condition, Right: &Literal{Val: true}}
 			env := ExecEnv{ctx: context.Background(), triggerRow: tc.binding}
-			for _, kind := range []string{"inner", "left"} {
+			for _, kind := range []string{"inner", "left", "right", "full"} {
 				t.Run(kind, func(t *testing.T) {
 					run := func(on Expr) ([]Row, error) {
-						if kind == "inner" {
+						rightTable := &storage.Table{Cols: []storage.Column{{Name: "id"}, {Name: "label"}}}
+						switch kind {
+						case "inner":
 							return processInnerJoin(env, tc.left, tc.right, on)
+						case "right":
+							return processRightJoin(env, tc.left, tc.right, on)
+						case "full":
+							return processFullOuterJoin(env, tc.left, tc.right, on, "r", rightTable)
+						default:
+							return processLeftJoin(env, tc.left, tc.right, on, "r", rightTable)
 						}
-						return processLeftJoin(env, tc.left, tc.right, on, "r", &storage.Table{Cols: []storage.Column{{Name: "id"}, {Name: "label"}}})
 					}
 					want, wantErr := run(general)
 					got, gotErr := run(condition)
@@ -96,6 +103,8 @@ func TestSmallGeneralJoinSQLPreservesDuplicatesAndNulls(t *testing.T) {
 	}{
 		{"JOIN", []Row{{"ll": "l1", "rr": "r1"}, {"ll": "l1", "rr": "r2"}}},
 		{"LEFT JOIN", []Row{{"ll": "l1", "rr": "r1"}, {"ll": "l1", "rr": "r2"}, {"ll": "l2", "rr": nil}, {"ll": "ln", "rr": nil}}},
+		{"RIGHT JOIN", []Row{{"ll": "l1", "rr": "r1"}, {"ll": "l1", "rr": "r2"}, {"ll": nil, "rr": "rn"}}},
+		{"FULL OUTER JOIN", []Row{{"ll": "l1", "rr": "r1"}, {"ll": "l1", "rr": "r2"}, {"ll": "l2", "rr": nil}, {"ll": "ln", "rr": nil}, {"ll": nil, "rr": "rn"}}},
 	} {
 		t.Run(tc.join, func(t *testing.T) {
 			rs := execSQL(t, db, "SELECT l.label AS ll, r.label AS rr FROM l "+tc.join+" r ON r.id = l.id ORDER BY ll, rr")

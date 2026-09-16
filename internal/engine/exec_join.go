@@ -217,7 +217,7 @@ func processLeftJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr, r
 }
 
 // joinEquality resolves a simple column equality before allocating a merged
-// row. Small joins still visit every pair, but allocate only matching rows.
+// row. Nested-loop joins still visit every pair, but allocate only matching rows.
 type joinEquality struct {
 	leftColumn  string
 	rightColumn string
@@ -285,6 +285,7 @@ func mergeMatchingJoinRows(env ExecEnv, left, right Row, condition Expr, equalit
 }
 
 func processRightJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) ([]Row, error) {
+	equality := compileJoinEquality(onCondition)
 	joined := make([]Row, 0, len(rightRows)) // At least one row per right row
 	var leftKeys []string
 	if len(leftRows) > 0 {
@@ -299,16 +300,11 @@ func processRightJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) 
 		}
 		matched := false
 		for _, l := range leftRows {
-			m := mergeRows(l, r)
-			ok := true
-			if onCondition != nil {
-				val, err := evalExpr(env, onCondition, m)
-				if err != nil {
-					return nil, err
-				}
-				ok = (toTri(val) == tvTrue)
+			m, err := mergeMatchingJoinRows(env, l, r, onCondition, equality)
+			if err != nil {
+				return nil, err
 			}
-			if ok {
+			if m != nil {
 				joined = append(joined, m)
 				matched = true
 			}
@@ -331,6 +327,7 @@ func processRightJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) 
 // — a query that looked like a two-table join silently ran as a one-table
 // scan with no error.
 func processFullOuterJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr, rightAlias string, rightTable *storage.Table) ([]Row, error) {
+	equality := compileJoinEquality(onCondition)
 	matchedRight := make([]bool, len(rightRows))
 	joined := make([]Row, 0, len(leftRows)+len(rightRows))
 
@@ -348,16 +345,11 @@ func processFullOuterJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Ex
 		}
 		matchedAny := false
 		for ri, r := range rightRows {
-			m := mergeRows(l, r)
-			ok := true
-			if onCondition != nil {
-				val, err := evalExpr(env, onCondition, m)
-				if err != nil {
-					return nil, err
-				}
-				ok = (toTri(val) == tvTrue)
+			m, err := mergeMatchingJoinRows(env, l, r, onCondition, equality)
+			if err != nil {
+				return nil, err
 			}
-			if ok {
+			if m != nil {
 				joined = append(joined, m)
 				matchedAny = true
 				matchedRight[ri] = true
