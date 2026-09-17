@@ -38,6 +38,7 @@ const SQL_KEYWORDS = [
     'GPKG_SRID', 'GPKG_HEADER', 'GPKG_BBOX', 'GPKG_AS_WKB', 'GEO_FROM_GPKG',
     'CRS_NORMALIZE', 'CRS_URI', 'CRS_AXIS_ORDER', 'CRS_INFO', 'WMS_BBOX',
     'TILE_MATRIX_BBOX', 'TILE_MATRIX_POSITION', 'RECENCY_SCORE', 'HASH', 'URL_PARSE', 'YAML_GET',
+    'TEXT_TO_COLUMNS', 'COLUMNS_TO_TEXT',
     'CALL', 'ANALYZE', 'ROUND'
 ];
 // Safe references to WASM-exported functions (set after init)
@@ -1440,6 +1441,10 @@ INSERT INTO rag_chunks VALUES
     (5, 'ops', 0, 'private', 'Operational work added route graph warm-up, stored procedure scheduling, replica streaming, and WAL improvements.', 0.86, '2026-08-30 14:00:00', '{"type":"Point","coordinates":[9.9937,53.5511]}', '[0.2, 0.4, 1.0]')`;
 
 const DEMO_RELEASE_FEATURES = [
+    { area: 'Developer UX', feature: 'TEXT_TO_COLUMNS splits delimited input into queryable fields; COLUMNS_TO_TEXT joins values while retaining empty fields and NULL semantics', added: '2026-09-16', browser_demo: 'Direct “Text columns” recipe: split a pasted semicolon-delimited record, rename its fields, and assemble a normalized display value' },
+    { area: 'Performance', feature: 'ColumnarResultSet and ExecuteColumnar provide compact positional SELECT results; large eligible SUM/AVG scans use typed aggregate batches', added: '2026-09-13', browser_demo: 'The playground keeps its bounded streaming/paged result transport; its large-table aggregate and scan recipes benefit from the optimized engine paths transparently' },
+    { area: 'Query planning', feature: 'Opt-in IndexAdvisor observes explicitly routed repeated equality filters and produces bounded, explicit index recommendations', added: '2026-09-13', browser_demo: 'Go API-only by design: the local playground does not silently observe a workload or create indexes; see docs/automatic-indexes.md for the explicit host policy' },
+    { area: 'Performance', feature: 'Faster row counts, small joins, materialized aggregates, and rejected-row handling for RIGHT/FULL joins', added: '2026-09-16', browser_demo: 'Used transparently by the joins, reporting, and materialized-view recipes' },
     { area: 'Search/RAG', feature: 'Authorization and metadata pre-filters for RAG_SEARCH, HYBRID_SEARCH, VEC_SEARCH_FILTERED and FTS_SEARCH_FILTERED, including spatial bbox/radius filters', added: '2026-08-27 to 2026-08-30', browser_demo: 'Direct tenant + spatial pre-filter recipe over rag_chunks; filtering happens before ranking and context expansion' },
     { area: 'Search/RAG', feature: 'RAG_WARM builds the exact vector and lexical retrieval paths before the first user query', added: '2026-08-30', browser_demo: 'Direct RAG_WARM recipe reporting vector dimensions and FTS cache statistics' },
     { area: 'Routing', feature: 'ROUTE_WARM, A* shortest paths, distance matrices, reachable service areas, and faster versioned graph caches', added: '2026-08-27 to 2026-08-30', browser_demo: 'ROUTE_WARM + ROUTE_SHORTEST_PATH recipe over the imported routes_rg graph' },
@@ -1455,7 +1460,7 @@ const DEMO_RELEASE_FEATURES = [
     { area: 'Geodata', feature: 'GEO_DISSOLVE/GEO_UNION_AGG/ST_UNION, GEO_BBOX_AGG, GEO_CENTROID_AGG region aggregates and GEO_SEARCH indexed bbox/radius table search', added: '2026-08-04', browser_demo: 'Direct scalar/aggregate SQL and table function ("GEO_DISSOLVE Regions" and "GEO_SEARCH Bbox" recipes)' },
     { area: 'Geodata', feature: 'GEO_CLIP polygon clipping and GEO_INTERSECTS/GEO_DISJOINT/GEO_EQUALS geometry relations', added: '2026-08-04', browser_demo: 'Direct SQL ("GEO_CLIP & Relations" recipe)' },
     { area: 'Geodata', feature: 'EQUAL_INTERVAL / NATURAL_BREAKS choropleth classification window functions', added: '2026-08-04', browser_demo: 'Direct window functions ("Choropleth Classes" recipe); also demoed on the standalone tiles-demo-bavaria.html choropleth panel' },
-    { area: 'Developer UX', feature: 'TopoJSON and XLSX import/export (internal/importer, internal/exporter)', added: '2026-08-04', browser_demo: 'Go API-only; the browser demo\'s .xlsx upload uses a client-side JS library instead, and there is no export option for either format' },
+    { area: 'Developer UX', feature: 'TopoJSON and XLSX import/export (internal/importer, internal/exporter)', added: '2026-08-04', browser_demo: 'The browser imports .xlsx through its client-side parser and exports result tables as .xlsx; Go APIs additionally cover native importer/exporter workflows' },
     { area: 'Geodata', feature: 'GEO_BUFFER, GEO_CONVEX_HULL, GEO_ENVELOPE, GEO_LINE_INTERPOLATE geometry construction', added: '2026-08-03', browser_demo: 'Direct SQL ("GEO_BUFFER Circle" and "GEO_CONVEX_HULL & Envelope" recipes); GEO_BUFFER also powers the tiles-demo-bavaria.html choropleth panel' },
     { area: 'Geodata', feature: 'GEO_CLEAN, GEO_SNAP/ST_SNAPTOGRID, GEO_IS_VALID geometry quality checks', added: '2026-08-03', browser_demo: 'Direct ST_CLEAN/ST_SNAPTOGRID/ST_ISVALID recipes on the tiles-demo.html Mapshaper-style editing panel' },
     { area: 'Geodata', feature: 'GEO_BBOX/GEO_CENTROID/GEO_AFFINE/GEO_SMOOTH/GEO_DROP_HOLES editing and GEO_SIMPLIFY simplification', added: '2026-08-03', browser_demo: 'Direct ST_BBOX/ST_CENTROID/ST_AFFINE/ST_SMOOTH/ST_REMOVE_HOLES/ST_SIMPLIFY recipes on the tiles-demo.html Mapshaper-style editing panel' },
@@ -1489,6 +1494,14 @@ const SHAREABLE_DEMOS = {
         tables: ['release_features'],
         autoRun: true,
         query: `-- Last two months: feature areas and what this WASM demo can show\nSELECT area, feature, browser_demo\nFROM release_features\nORDER BY area, feature`
+    },
+    textcolumns: {
+        title: 'Text columns',
+        description: 'Turn a pasted delimiter-separated record into SQL columns, transform it, and assemble a stable output string.',
+        icon: '↔️',
+        tables: [],
+        autoRun: true,
+        query: `-- Split a pasted record into fields, then turn selected fields back into text\nSELECT column1 AS customer,\n       column2 AS city,\n       column3 AS plan,\n       COLUMNS_TO_TEXT(' · ', column1, column2, column3) AS normalized\nFROM TEXT_TO_COLUMNS('Ada Lovelace;Berlin;pro', ';')`
     },
     geo: {
         title: 'Geodata lab',
@@ -1716,7 +1729,7 @@ function renderIntroPage() {
     if (!resultsContainer || decodeDemoHash()) {
         return;
     }
-    const starterDemoIDs = ['analytics', 'geo', 'rag', 'spatialrag'];
+    const starterDemoIDs = ['analytics', 'textcolumns', 'geo', 'rag', 'spatialrag'];
     const cards = starterDemoIDs.map((id) => [id, SHAREABLE_DEMOS[id]]).map(([id, demo]) => `
         <div class="intro-card">
             <h3>${demo.icon} ${escapeHtml(demo.title)}</h3>
@@ -2443,7 +2456,8 @@ function inferDemoQueryGroup(text) {
     const label = String(text || '').toLowerCase();
     if (label.includes('recent') || label.includes('release') || label.includes('catalog') ||
         label.includes('pragma') || label.includes('explain') || label.includes('pivot') ||
-        label.includes('returning') || label.includes('view') || label.includes('analyze')) {
+        label.includes('returning') || label.includes('view') || label.includes('analyze') ||
+        label.includes('text columns') || label.includes('delimiter')) {
         return 'recent';
     }
     if (label.includes('geo') || label.includes('bbox') || label.includes('node') ||

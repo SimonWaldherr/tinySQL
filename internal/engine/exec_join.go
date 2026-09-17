@@ -144,9 +144,17 @@ func processInnerJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) 
 		return optimizer.ProcessOptimizedJoin(leftRows, rightRows, onCondition, OptimizedJoinTypeInner)
 	}
 
-	// Fall back to original nested loop for small datasets
+	// Preserve nested-loop ordering; eligible equalities visit only indexed matches.
 	equality := compileJoinEquality(onCondition)
-	joined := make([]Row, 0, len(leftRows)*len(rightRows)/4) // Estimate result size
+	lookup, err := buildJoinCandidateLookup(env, equality, leftRows, rightRows)
+	if err != nil {
+		return nil, err
+	}
+	capacity := len(leftRows) * len(rightRows) / 4
+	if lookup != nil {
+		capacity = len(leftRows)
+	}
+	joined := make([]Row, 0, capacity)
 	for i, l := range leftRows {
 		// Check context cancellation every 64 rows to reduce channel-select overhead.
 		if i&63 == 0 {
@@ -154,7 +162,13 @@ func processInnerJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) 
 				return nil, err
 			}
 		}
-		for _, r := range rightRows {
+		candidates, count := lookup.candidates(i, len(rightRows))
+		for j := 0; j < count; j++ {
+			ri := j
+			if candidates != nil {
+				ri = candidates[j]
+			}
+			r := rightRows[ri]
 			m, err := mergeMatchingJoinRows(env, l, r, onCondition, equality)
 			if err != nil {
 				return nil, err
@@ -186,8 +200,12 @@ func processLeftJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr, r
 		return result, nil
 	}
 
-	// Fall back to original nested loop for small datasets
+	// Preserve nested-loop ordering; eligible equalities visit only indexed matches.
 	equality := compileJoinEquality(onCondition)
+	lookup, err := buildJoinCandidateLookup(env, equality, leftRows, rightRows)
+	if err != nil {
+		return nil, err
+	}
 	joined := make([]Row, 0, len(leftRows)) // At least one row per left row
 	for i, l := range leftRows {
 		// Check context cancellation every 64 rows to reduce channel-select overhead.
@@ -197,7 +215,13 @@ func processLeftJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr, r
 			}
 		}
 		matched := false
-		for _, r := range rightRows {
+		candidates, count := lookup.candidates(i, len(rightRows))
+		for j := 0; j < count; j++ {
+			ri := j
+			if candidates != nil {
+				ri = candidates[j]
+			}
+			r := rightRows[ri]
 			m, err := mergeMatchingJoinRows(env, l, r, onCondition, equality)
 			if err != nil {
 				return nil, err
@@ -216,8 +240,8 @@ func processLeftJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr, r
 	return joined, nil
 }
 
-// joinEquality resolves a simple column equality before allocating a merged
-// row. Nested-loop joins still visit every pair, but allocate only matching rows.
+// joinEquality resolves a simple column equality for candidate lookup and for
+// testing fallback pairs before allocating a merged row.
 type joinEquality struct {
 	leftColumn  string
 	rightColumn string
@@ -286,6 +310,10 @@ func mergeMatchingJoinRows(env ExecEnv, left, right Row, condition Expr, equalit
 
 func processRightJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) ([]Row, error) {
 	equality := compileJoinEquality(onCondition)
+	lookup, err := buildJoinCandidateLookup(env, equality, rightRows, leftRows)
+	if err != nil {
+		return nil, err
+	}
 	joined := make([]Row, 0, len(rightRows)) // At least one row per right row
 	var leftKeys []string
 	if len(leftRows) > 0 {
@@ -299,7 +327,13 @@ func processRightJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) 
 			}
 		}
 		matched := false
-		for _, l := range leftRows {
+		candidates, count := lookup.candidates(i, len(leftRows))
+		for j := 0; j < count; j++ {
+			ri := j
+			if candidates != nil {
+				ri = candidates[j]
+			}
+			l := leftRows[ri]
 			m, err := mergeMatchingJoinRows(env, l, r, onCondition, equality)
 			if err != nil {
 				return nil, err
@@ -328,6 +362,10 @@ func processRightJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) 
 // scan with no error.
 func processFullOuterJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr, rightAlias string, rightTable *storage.Table) ([]Row, error) {
 	equality := compileJoinEquality(onCondition)
+	lookup, err := buildJoinCandidateLookup(env, equality, leftRows, rightRows)
+	if err != nil {
+		return nil, err
+	}
 	matchedRight := make([]bool, len(rightRows))
 	joined := make([]Row, 0, len(leftRows)+len(rightRows))
 
@@ -344,7 +382,13 @@ func processFullOuterJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Ex
 			}
 		}
 		matchedAny := false
-		for ri, r := range rightRows {
+		candidates, count := lookup.candidates(i, len(rightRows))
+		for j := 0; j < count; j++ {
+			ri := j
+			if candidates != nil {
+				ri = candidates[j]
+			}
+			r := rightRows[ri]
 			m, err := mergeMatchingJoinRows(env, l, r, onCondition, equality)
 			if err != nil {
 				return nil, err

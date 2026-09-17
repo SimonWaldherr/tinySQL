@@ -42,8 +42,10 @@ dirty one.
   browser OPFS used for larger supported snapshots;
 - pages, filters, sorts, copies, and exports results as CSV, TSV, XLSX, JSON,
   XML, HTML, and Markdown;
+- generates reusable Go, JavaScript, Python, and cURL query snippets from the
+  current statement and result schema;
 - includes GIS, routing, full-text, vector, hybrid-search, RAG, analytics,
-  stored-procedure, and SQL-planning examples.
+  stored-procedure, SQL-planning, and text-to-columns examples.
 
 Single-statement queries stream result batches when possible. The displayed
 preview is limited to 10,000 rows or 16 MiB and is clearly marked as a prefix;
@@ -54,6 +56,22 @@ before producing their first row.
 Browser imports are limited to 64 MiB; snapshot imports are limited to 256 MiB.
 Those limits protect the most expensive local paths, not the total memory used
 by an in-memory database.
+
+## Recent engine features in the demo
+
+The **Text columns** starter recipe demonstrates `TEXT_TO_COLUMNS(text,
+delimiter)` as a table function and `COLUMNS_TO_TEXT(delimiter, ...)` for
+reassembling values. This makes pasted delimited values queryable without a
+temporary import file. Empty fields remain empty and a NULL delimiter returns
+NULL.
+
+Recent columnar result and batched aggregate paths are used internally where a
+query shape qualifies; the browser keeps its streaming/paged transport so it
+does not materialize a second full copy of results. `IndexAdvisor` deliberately
+remains a Go-host integration: it is opt-in, never observes ordinary queries,
+and only creates an index when its host explicitly applies a recommendation.
+See [columnar execution](../../docs/columnar-execution.md) and [automatic
+indexes](../../docs/automatic-indexes.md) for the public APIs and guardrails.
 
 Path-based GeoPackage and MBTiles import need a native sqliteimport build and
 are therefore unavailable in this browser app. SQL-level binary inspection

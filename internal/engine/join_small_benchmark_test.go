@@ -6,7 +6,7 @@ import (
 )
 
 // ORDER BY and outer joins deliberately bypass the raw-row inner-join fast
-// path, so these benchmarks measure the general nested-loop join executor.
+// path, so these benchmarks measure the general executor and its candidate lookup.
 func BenchmarkSmallGeneralJoin(b *testing.B) {
 	for _, query := range []struct {
 		name string
