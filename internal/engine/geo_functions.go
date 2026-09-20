@@ -1207,13 +1207,29 @@ func geoFloat(v any) (float64, error) {
 }
 
 func haversineMeters(lat1, lon1, lat2, lon2 float64) float64 {
-	lat1Rad := lat1 * math.Pi / 180
+	return haversineMetersFromOrigin(lat1, math.Cos(lat1*math.Pi/180), lon1, lat2, lon2)
+}
+
+// haversineMetersFromOrigin is haversineMeters with cos(lat1) already
+// computed by the caller. A radius-mode GEO_SEARCH/spatial pre-filter
+// residual check calls haversineMeters once per candidate row against the
+// same fixed query center, so lat1/lon1 (and therefore cos(lat1Rad)) are
+// loop-invariant — this lets that caller compute the trig call once per
+// query instead of once per candidate.
+//
+// dLat/dLon are deliberately kept as the exact original (lat2-lat1)*k /
+// (lon2-lon1)*k expressions rather than reusing a precomputed lat1Rad —
+// float subtraction-then-scale and scale-then-subtract can differ by up to
+// 1 ULP through reassociation, and haversineMeters' output must stay
+// bit-for-bit identical for every existing caller. Only cos(lat1Rad), a
+// pure function of lat1 alone with no reassociation risk, is hoisted.
+func haversineMetersFromOrigin(lat1, cosLat1, lon1, lat2, lon2 float64) float64 {
 	lat2Rad := lat2 * math.Pi / 180
 	dLat := (lat2 - lat1) * math.Pi / 180
 	dLon := (lon2 - lon1) * math.Pi / 180
 	sinLat := math.Sin(dLat / 2)
 	sinLon := math.Sin(dLon / 2)
-	a := sinLat*sinLat + math.Cos(lat1Rad)*math.Cos(lat2Rad)*sinLon*sinLon
+	a := sinLat*sinLat + cosLat1*math.Cos(lat2Rad)*sinLon*sinLon
 	if a > 1 {
 		a = 1
 	}

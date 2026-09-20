@@ -140,17 +140,32 @@ func (f *HybridSearchTableFunc) Execute(ctx context.Context, args []Expr, env Ex
 	for _, column := range result.Cols {
 		resultColumns[strings.ToLower(column)] = true
 	}
+	// Which of the score columns are present in this result set at all is
+	// invariant across every row below — only per-row presence in resultRow
+	// varies — so it is decided once here instead of re-testing
+	// resultColumns for all 7 fixed names on every row.
+	present := make([]string, 0, len(hybridScoreColumns))
+	for _, column := range hybridScoreColumns {
+		if resultColumns[column] {
+			present = append(present, column)
+		}
+	}
 	for _, resultRow := range result.Rows {
-		for _, column := range []string{
-			"_vec_rank", "_vec_distance", "_vec_similarity",
-			"_fts_rank", "_fts_score", "_rrf_rank", "_rrf_score",
-		} {
-			if _, ok := resultRow[column]; !ok && resultColumns[column] {
+		for _, column := range present {
+			if _, ok := resultRow[column]; !ok {
 				resultRow[column] = nil
 			}
 		}
 	}
 	return result, nil
+}
+
+// hybridScoreColumns are the diagnostic score columns HYBRID_SEARCH backfills
+// with NULL when a row was absent from one candidate list (see the comment
+// above) — a candidate list won't materialize any of its own score columns.
+var hybridScoreColumns = []string{
+	"_vec_rank", "_vec_distance", "_vec_similarity",
+	"_fts_rank", "_fts_score", "_rrf_rank", "_rrf_score",
 }
 
 func hybridStringArg(env ExecEnv, expr Expr, row Row, function, argument string) (string, error) {

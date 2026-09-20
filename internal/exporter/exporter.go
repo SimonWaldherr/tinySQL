@@ -468,6 +468,12 @@ func valueToSQLLiteral(v any) string {
 	switch t := v.(type) {
 	case string:
 		return "'" + strings.ReplaceAll(t, "'", "''") + "'"
+	case json.RawMessage:
+		// GEOMETRY/JSON columns (e.g. from GeoJSON/TopoJSON/GeoPackage/OSM
+		// import) carry their value as json.RawMessage, a distinct named
+		// []byte type that a type switch's `case []byte` does not match.
+		// Treat it as text, not as an opaque blob.
+		return "'" + strings.ReplaceAll(string(t), "'", "''") + "'"
 	case time.Time:
 		return "'" + t.Format(time.RFC3339) + "'"
 	case []byte:

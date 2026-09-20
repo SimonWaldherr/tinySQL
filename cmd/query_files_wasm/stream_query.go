@@ -149,9 +149,10 @@ func (op *streamQueryOperation) run(_ js.Value, _ []js.Value) interface{} {
 	}
 
 	deadline := time.Now().Add(streamPumpBudget)
-	// A batch crosses the syscall/js boundary once. Keep the already-normalized
-	// row object here so byte accounting does not normalize every row a second
-	// time immediately before emitting it to JavaScript.
+	// A batch crosses the syscall/js boundary once. batch holds each row's
+	// already-encoded JSON (see streamJSRow) so byte accounting does not
+	// normalize or re-encode a row a second time immediately before emitting
+	// it to JavaScript.
 	batch := make([]interface{}, 0, streamPumpRows)
 	for rowCount := 0; rowCount < streamPumpRows; rowCount++ {
 		if err := op.ctx.Err(); err != nil {
@@ -231,15 +232,24 @@ func (op *streamQueryOperation) start() error {
 	return nil
 }
 
-func streamJSRow(columns []string, row tinysql.Row) (map[string]interface{}, int64, error) {
+func streamJSRow(columns []string, row tinysql.Row) (json.RawMessage, int64, error) {
 	jsRow := resultRowToJS(columns, row)
 	encoded, err := json.Marshal(jsRow)
 	if err != nil {
 		return nil, 0, err
 	}
+	// Returning the already-encoded bytes (rather than the map streamJSValue
+	// would otherwise re-walk and re-encode from scratch inside emitChunk's
+	// batch) means every streamed row is fully JSON-marshaled once, not
+	// twice. json.RawMessage implements json.Marshaler by copying its bytes
+	// back out verbatim, so the outer Marshal in streamJSValue compacts
+	// already-escaped bytes instead of re-encoding the row's fields —
+	// byte-for-byte identical output, since both passes use the same
+	// escapeHTML-on encoding/json defaults.
+	//
 	// Include one JSON separator/newline byte, matching the server's streaming
 	// response limiter closely enough to make the browser budget predictable.
-	return jsRow, int64(len(encoded)) + 1, nil
+	return json.RawMessage(encoded), int64(len(encoded)) + 1, nil
 }
 
 // streamRowBytes is also used by the materialized multi-statement safeguard.

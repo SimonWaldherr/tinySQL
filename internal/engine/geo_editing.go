@@ -128,27 +128,61 @@ func collectGeoBBox(object map[string]any, bbox *geoEditBBox) error {
 		}
 		return nil
 	case "point", "multipoint", "linestring", "multilinestring", "polygon", "multipolygon":
-		return walkGeoCoordinateValue(object["coordinates"], func(position simplifyCoordinate) {
-			bbox.add(geoEditPoint{X: position[0], Y: position[1]})
+		return walkGeoCoordinateXY(object["coordinates"], func(x, y float64) {
+			bbox.add(geoEditPoint{X: x, Y: y})
 		})
 	default:
 		return fmt.Errorf("unsupported or missing GeoJSON geometry type %q", typ)
 	}
 }
 
-func walkGeoCoordinateValue(value any, visit func(simplifyCoordinate)) error {
+// parseGeoPositionXY is simplifyGeoPosition specialized to the (X, Y) pair a
+// bbox or centroid walk actually needs, avoiding the []float64 allocation
+// simplifyGeoPosition makes to hold every ordinate (X, Y, and any Z/M
+// present) when only the first two are ever read here. Validates every
+// ordinate present, not just the first two, so a malformed higher ordinate
+// (e.g. a non-finite Z) is still rejected exactly as simplifyGeoPosition
+// would reject it — error behavior for malformed geometries is unchanged.
+func parseGeoPositionXY(positions []any) (x, y float64, err error) {
+	if len(positions) < 2 {
+		return 0, 0, fmt.Errorf("position must contain at least longitude and latitude")
+	}
+	for i, value := range positions {
+		coordinate, ferr := geoFloat(value)
+		if ferr != nil || math.IsNaN(coordinate) || math.IsInf(coordinate, 0) {
+			if ferr == nil {
+				ferr = fmt.Errorf("must be finite")
+			}
+			return 0, 0, fmt.Errorf("coordinate %d: %w", i, ferr)
+		}
+		if i == 0 {
+			x = coordinate
+		} else if i == 1 {
+			y = coordinate
+		}
+	}
+	return x, y, nil
+}
+
+// walkGeoCoordinateXY is the allocation-free sibling of the former
+// walkGeoCoordinateValue, for the two callers (collectGeoBBox,
+// addGeoCentroidPositions) that only ever read a position's first two
+// ordinates. Same detection logic — try parsing this array as a position;
+// on failure, recurse into its children — as the value it replaced, just
+// without allocating a []float64 per leaf position.
+func walkGeoCoordinateXY(value any, visit func(x, y float64)) error {
 	positions, ok := value.([]any)
 	if !ok {
 		return fmt.Errorf("coordinates must be an array")
 	}
 	if len(positions) >= 2 {
-		if position, err := simplifyGeoPosition(positions); err == nil {
-			visit(position)
+		if x, y, err := parseGeoPositionXY(positions); err == nil {
+			visit(x, y)
 			return nil
 		}
 	}
 	for i, child := range positions {
-		if err := walkGeoCoordinateValue(child, visit); err != nil {
+		if err := walkGeoCoordinateXY(child, visit); err != nil {
 			return fmt.Errorf("coordinate group %d: %w", i, err)
 		}
 	}
@@ -156,10 +190,21 @@ func walkGeoCoordinateValue(value any, visit func(simplifyCoordinate)) error {
 }
 
 type geoCentroidAccumulator struct {
-	X        float64
-	Y        float64
-	Weight   float64
-	Fallback []geoEditPoint
+	X, Y, Weight float64
+	// FallbackSumX/Y and FallbackCount replace what was previously a
+	// []geoEditPoint slice retaining every visited point. The only thing
+	// ever done with that slice was "sum every X, sum every Y, divide by
+	// count" for a fully degenerate geometry (total weight stays exactly
+	// zero — every line has zero length, every polygon ring has zero net
+	// area). An O(1) running sum computes the identical result: every write
+	// below replaces what was an append in arrival order with an addition
+	// in that same order, so the two are the same left-to-right chain of
+	// floating-point sums, bit for bit — without retaining a point per
+	// vertex of a non-degenerate geometry, which is the overwhelming common
+	// case (any Point/MultiPoint, or any line/polygon with nonzero
+	// length/area).
+	FallbackSumX, FallbackSumY float64
+	FallbackCount              int
 }
 
 func (a *geoCentroidAccumulator) add(point geoEditPoint, weight float64) {
@@ -168,7 +213,9 @@ func (a *geoCentroidAccumulator) add(point geoEditPoint, weight float64) {
 		a.Y += point.Y * weight
 		a.Weight += weight
 	}
-	a.Fallback = append(a.Fallback, point)
+	a.FallbackSumX += point.X
+	a.FallbackSumY += point.Y
+	a.FallbackCount++
 }
 
 func evalGeoCentroid(env ExecEnv, ex *FuncCall, row Row) (any, error) {
@@ -201,14 +248,12 @@ func geoCentroidFromValue(name string, value any) (any, error) {
 		return nil, fmt.Errorf("%s: %w", name, err)
 	}
 	if acc.Weight == 0 {
-		if len(acc.Fallback) == 0 {
+		if acc.FallbackCount == 0 {
 			return nil, fmt.Errorf("%s: geometry has no coordinates", name)
 		}
-		for _, point := range acc.Fallback {
-			acc.X += point.X
-			acc.Y += point.Y
-		}
-		acc.Weight = float64(len(acc.Fallback))
+		acc.X += acc.FallbackSumX
+		acc.Y += acc.FallbackSumY
+		acc.Weight = float64(acc.FallbackCount)
 	}
 	return geoPointJSON(acc.X/acc.Weight, acc.Y/acc.Weight, nil)
 }
@@ -291,8 +336,8 @@ func collectGeoCentroid(object map[string]any, acc *geoCentroidAccumulator) erro
 }
 
 func addGeoCentroidPositions(value any, acc *geoCentroidAccumulator, weight float64) error {
-	return walkGeoCoordinateValue(value, func(position simplifyCoordinate) {
-		acc.add(geoEditPoint{X: position[0], Y: position[1]}, weight)
+	return walkGeoCoordinateXY(value, func(x, y float64) {
+		acc.add(geoEditPoint{X: x, Y: y}, weight)
 	})
 }
 
@@ -310,7 +355,9 @@ func addGeoCentroidLine(value any, acc *geoCentroidAccumulator, closed bool) err
 		acc.add(geoEditPoint{X: (a[0] + b[0]) / 2, Y: (a[1] + b[1]) / 2}, length)
 	}
 	for _, position := range positions {
-		acc.Fallback = append(acc.Fallback, geoEditPoint{X: position[0], Y: position[1]})
+		acc.FallbackSumX += position[0]
+		acc.FallbackSumY += position[1]
+		acc.FallbackCount++
 	}
 	return nil
 }
@@ -329,7 +376,9 @@ func addGeoCentroidPolygon(value any, acc *geoCentroidAccumulator) error {
 	}
 	outerArea, outerCentroid := geoEditRingCentroid(outer)
 	for _, position := range outer {
-		acc.Fallback = append(acc.Fallback, geoEditPoint{X: position[0], Y: position[1]})
+		acc.FallbackSumX += position[0]
+		acc.FallbackSumY += position[1]
+		acc.FallbackCount++
 	}
 	netArea := outerArea
 	weightedX := outerCentroid.X * outerArea
@@ -344,7 +393,9 @@ func addGeoCentroidPolygon(value any, acc *geoCentroidAccumulator) error {
 		weightedX -= centroid.X * area
 		weightedY -= centroid.Y * area
 		for _, position := range hole {
-			acc.Fallback = append(acc.Fallback, geoEditPoint{X: position[0], Y: position[1]})
+			acc.FallbackSumX += position[0]
+			acc.FallbackSumY += position[1]
+			acc.FallbackCount++
 		}
 	}
 	if netArea > 1e-15 {

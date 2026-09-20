@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/rand"
 	"testing"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -225,6 +226,45 @@ func TestGeoDistanceCoordinates(t *testing.T) {
 	}
 	if math.Abs(dist-504000) > 3000 {
 		t.Fatalf("Berlin-Munich distance = %v, want about 504km", dist)
+	}
+}
+
+// TestHaversineMetersFromOriginMatchesHaversineMeters pins
+// haversineMetersFromOrigin (a radius-mode GEO_SEARCH/spatial pre-filter
+// residual check's hoisted-cos(lat1) variant of haversineMeters) against the
+// original for a wide range of coordinate pairs, including poles, the
+// antimeridian, identical points, and a large randomized sweep. Must agree
+// bit-for-bit: a wrong hoist could silently shift the radius boundary by a
+// few meters at scale, or reorder near-tied GEO_SEARCH results.
+func TestHaversineMetersFromOriginMatchesHaversineMeters(t *testing.T) {
+	check := func(lat1, lon1, lat2, lon2 float64) {
+		t.Helper()
+		want := haversineMeters(lat1, lon1, lat2, lon2)
+		got := haversineMetersFromOrigin(lat1, math.Cos(lat1*math.Pi/180), lon1, lat2, lon2)
+		if math.Float64bits(got) != math.Float64bits(want) {
+			t.Errorf("lat1=%v lon1=%v lat2=%v lon2=%v: got %v (%#x), want %v (%#x)",
+				lat1, lon1, lat2, lon2, got, math.Float64bits(got), want, math.Float64bits(want))
+		}
+	}
+	fixed := []struct{ lat1, lon1, lat2, lon2 float64 }{
+		{0, 0, 0, 0},
+		{52.5200, 13.4050, 48.1372, 11.5755}, // Berlin-Munich
+		{90, 0, -90, 0},                      // pole to pole
+		{89.9999, 0, 89.9999, 180},           // near north pole, opposite longitudes
+		{0, 179.9999, 0, -179.9999},          // across the antimeridian
+		{-33.8688, 151.2093, 40.7128, -74.0060},
+		{45, 45, 45, 45}, // identical points
+	}
+	for _, c := range fixed {
+		check(c.lat1, c.lon1, c.lat2, c.lon2)
+	}
+	rng := rand.New(rand.NewSource(1))
+	for i := 0; i < 100000; i++ {
+		lat1 := rng.Float64()*180 - 90
+		lon1 := rng.Float64()*360 - 180
+		lat2 := rng.Float64()*180 - 90
+		lon2 := rng.Float64()*360 - 180
+		check(lat1, lon1, lat2, lon2)
 	}
 }
 

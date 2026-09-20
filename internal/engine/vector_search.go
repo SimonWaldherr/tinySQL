@@ -528,12 +528,23 @@ func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeN
 
 func refreshVecColumnCache(cached vecSearchColumnCacheEntry, table *storage.Table, colIdx int, includeNorms bool, rows []int) vecSearchColumnCacheEntry {
 	entry := extendVecColumnCache(cached, table, colIdx, includeNorms)
-	entry.overrides = make(map[int]vecColumnOverride, len(cached.overrides)+len(rows))
-	for row, value := range cached.overrides {
-		if (includeNorms || cached.normsReady) && value.valid {
-			value.norm = vectorL2Norm(value.vector)
-		}
-		entry.overrides[row] = value
+	// entry.overrides (just built above) already carries every existing
+	// override with a correct norm under the same includeNorms/normsReady
+	// gate this function's own new-row loop below uses — re-deriving a
+	// second, separate map from cached.overrides here duplicated that same
+	// vectorL2Norm recompute a second time in one call.
+	//
+	// entry.overrides is safe to grow in place whenever cached.overrides was
+	// non-empty: extendVecColumnCache always allocates a fresh, exclusively-
+	// owned map in that case (never returns cached.overrides itself), and
+	// entry is still a local value here, unpublished to any cache any
+	// concurrent reader could observe. Only when cached.overrides was empty
+	// does extendVecColumnCache pass that same (possibly shared, possibly
+	// nil) map straight through — a fresh map is needed there instead of
+	// risking a mutation a reader still holding the old cached entry could
+	// see.
+	if len(cached.overrides) == 0 {
+		entry.overrides = make(map[int]vecColumnOverride, len(rows))
 	}
 	for _, row := range rows {
 		if row < 0 || row >= len(table.Rows) {
@@ -671,7 +682,14 @@ func extendVecColumnCache(cached vecSearchColumnCacheEntry, table *storage.Table
 	if len(overrides) != 0 {
 		overrides = make(map[int]vecColumnOverride, len(cached.overrides))
 		for row, value := range cached.overrides {
-			if (includeNorms || cached.normsReady) && value.valid {
+			// Mirrors the segment-norm gate above exactly: once
+			// cached.normsReady is true, every existing override already
+			// carries a correct norm (this same gate, or refreshVecColumnCache's
+			// identical one at override-creation time, computed it), so
+			// recomputing here on every extend — forever, for any table that
+			// has ever mixed cosine search with an UPDATE — was pure waste. Only
+			// a normsReady transition (false -> true) needs it, same as segments.
+			if includeNorms && !cached.normsReady && value.valid {
 				value.norm = vectorL2Norm(value.vector)
 			}
 			overrides[row] = value
@@ -1086,7 +1104,16 @@ func vecSearchCandidates(ctx context.Context, env ExecEnv, a vecSearchArgs) (*st
 	if searchCtx == nil {
 		searchCtx = env.ctx
 	}
-	started := time.Now()
+	// Only capture a start time when analytics is actually enabled: it is off
+	// by default, and every VectorQueryEvent field below built from it
+	// (At, Duration) was previously computed and then discarded inside
+	// recordVecQuery's own disabled fast path — two clock reads per
+	// VEC_SEARCH call for nothing. See vecAnalyticsEnabled.
+	analyticsOn := vecAnalyticsEnabled()
+	var started time.Time
+	if analyticsOn {
+		started = time.Now()
+	}
 	// Only hash the query vector (SHA-256 over every element) when the opt-in
 	// result cache is actually enabled; it is off by default, so the common
 	// path skips the hash entirely.
@@ -1111,7 +1138,9 @@ func vecSearchCandidates(ctx context.Context, env ExecEnv, a vecSearchArgs) (*st
 			putVecQueryCache(key, scoredRowsOrdered)
 		}
 	}
-	recordVecQuery(VectorQueryEvent{At: time.Now(), Table: table.Name, Column: a.colName, Metric: a.metric, Index: a.indexMode, K: a.k, CacheHit: cacheHit, Duration: time.Since(started)})
+	if analyticsOn {
+		recordVecQuery(VectorQueryEvent{At: time.Now(), Table: table.Name, Column: a.colName, Metric: a.metric, Index: a.indexMode, K: a.k, CacheHit: cacheHit, Duration: time.Since(started)})
+	}
 	return table, scoredRowsOrdered, nil
 }
 

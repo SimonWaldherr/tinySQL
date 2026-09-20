@@ -1,4 +1,4 @@
-//go:build !tinygo.wasm && !baremetal
+//go:build !tinygo.wasm && !baremetal && !no_http
 
 package engine
 
@@ -25,7 +25,10 @@ var sqlHTTPClient = func() *http.Client {
 	return &http.Client{Timeout: 30 * time.Second, Transport: transport}
 }()
 
-// evalHTTPFunc fetches content from a URL on full Go runtimes.
+// evalHTTPFunc fetches content from a URL on full Go runtimes. Opt out of
+// this file (and its net/http/crypto/tls/crypto/x509 dependency, which is a
+// meaningful share of a WASM build's size) with -tags no_http; see
+// io_functions_http_disabled.go for the stub that takes over in that case.
 func evalHTTPFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if len(ex.Args) != 1 {
 		return nil, fmt.Errorf("http() expects 1 argument: url")

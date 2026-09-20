@@ -64,9 +64,36 @@ type ragSpatialFilterOptions struct {
 // with postings lists.
 type ragRowFilter struct {
 	rows []int
+
+	// rows32Once/rows32 lazily memoize rows as []int32, for
+	// ragIntersectFTSCandidates' unrestricted case, which otherwise copied
+	// this same, already-immutable content into a fresh []int32 on every
+	// call. *ragRowFilter is cached and shared across many requests from one
+	// principal (ragRowFilterCache below), so this memoizes once per filter
+	// object, not once per query — content is always exactly int32(r) for
+	// each r in rows, in rows' own order, so it is safe for every caller to
+	// share the same computed slice. sync.Once is the standard safe-
+	// publication pattern for lazy state shared across goroutines: it is not
+	// a cache keyed by re-derived data (no hashing, no marshaling), just one
+	// memoized field on the one object that already *is* the authorized set.
+	rows32Once sync.Once
+	rows32     []int32
 }
 
 func (f *ragRowFilter) empty() bool { return f != nil && len(f.rows) == 0 }
+
+// int32Rows returns rows as []int32, computed once and reused across every
+// caller sharing this filter.
+func (f *ragRowFilter) int32Rows() []int32 {
+	f.rows32Once.Do(func() {
+		out := make([]int32, len(f.rows))
+		for i, r := range f.rows {
+			out[i] = int32(r)
+		}
+		f.rows32 = out
+	})
+	return f.rows32
+}
 
 // The resolved authorization subset is commonly stable across many requests
 // from one principal. Cache the immutable row-ID set by table version and a
@@ -336,12 +363,16 @@ func ragRowsForSpatialFilter(ctx context.Context, tenant string, table *storage.
 		}
 	} else {
 		candidates = idx.candidatesRadius(lon, lat, opts.RadiusMeters)
+		// cos(lat) is loop-invariant across every candidate this filter
+		// re-verifies, so it is computed once here instead of once per
+		// candidate inside haversineMeters — see haversineMetersFromOrigin.
+		cosLat := math.Cos(lat * math.Pi / 180)
 		matches = func(rowIdx int32) bool {
 			if rowIdx < 0 || int(rowIdx) >= len(idx.centroids) || !idx.valid[rowIdx] {
 				return false
 			}
 			point := idx.centroids[rowIdx]
-			return haversineMeters(lat, lon, point.Lat, point.Lon) <= opts.RadiusMeters
+			return haversineMetersFromOrigin(lat, cosLat, lon, point.Lat, point.Lon) <= opts.RadiusMeters
 		}
 	}
 
@@ -1082,7 +1113,18 @@ func ragPrepareFilteredFTSQuery(table *storage.Table, colsKey string, query stri
 		return cached
 	}
 
-	prepared := ragFilteredFTSQuery{rows: ragIntersectFTSCandidates(candidates, filter.rows)}
+	var rows []int32
+	if candidates.unrestricted {
+		// filter is the authorized set itself, already resolved once and
+		// cached (ragRowFilterCache) for reuse across many requests from one
+		// principal — filter.int32Rows() reuses its own memoized []int32
+		// view instead of ragIntersectFTSCandidates copying the identical
+		// content again on every call that lands here.
+		rows = filter.int32Rows()
+	} else {
+		rows = ragIntersectFTSCandidates(candidates, filter.rows)
+	}
+	prepared := ragFilteredFTSQuery{rows: rows}
 	if len(prepared.rows) > 0 {
 		filteredCache, idf := ragFilteredFTSStatistics(table, colsKey, cache, filter)
 		prepared.node = ftsBindIDF(node, idf, filteredCache.termIDs)

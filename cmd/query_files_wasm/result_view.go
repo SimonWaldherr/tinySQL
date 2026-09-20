@@ -176,7 +176,22 @@ func sliceResultPage(result *tinysql.ResultSet, rowIndexes []int, offset, limit 
 func resultRowContains(row tinysql.Row, columns []string, needle string) bool {
 	for _, column := range columns {
 		value, ok := tinysql.GetVal(row, column)
-		if ok && value != nil && strings.Contains(strings.ToLower(fmt.Sprint(value)), needle) {
+		if !ok || value == nil {
+			continue
+		}
+		// The filter scans every visible cell of every row (debounced in the
+		// UI precisely because it's expensive), and text columns are the
+		// common case. fmt.Sprint's default formatting of a bare string is
+		// the string itself unchanged, so bypassing its reflection-based
+		// dispatch for the already-a-string case is byte-for-byte identical
+		// to what it would have produced, just without the interface-type
+		// switch and formatter machinery. Other types still go through
+		// fmt.Sprint, unchanged.
+		text, isString := value.(string)
+		if !isString {
+			text = fmt.Sprint(value)
+		}
+		if strings.Contains(strings.ToLower(text), needle) {
 			return true
 		}
 	}

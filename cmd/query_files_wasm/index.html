@@ -642,6 +642,51 @@
             background: #4b4b4f;
         }
 
+        /* Maps vanillagrid.js's theme variables onto this app's own dark
+           editor palette (see the base styles above: #1e1e1e/#252526
+           backgrounds, #3e3e42 borders, #d4d4d4 text, #0e639c/#1177bb
+           accent) instead of the library's built-in vg-theme-dark, which
+           uses a different blue-black hue and would sit next to the app
+           chrome as a visibly separate color scheme rather than blend in. */
+        .vg-theme-tinysql {
+            --vg-bg: #1e1e1e;
+            --vg-fg: #d4d4d4;
+            --vg-muted: #9ca7b8;
+            --vg-border: #3e3e42;
+            --vg-accent: #1177bb;
+            --vg-accent-weak: rgba(17, 119, 187, 0.25);
+            --vg-hover: #2d2d30;
+            --vg-shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 4px 12px rgba(0, 0, 0, 0.35);
+            --vg-chip-bg: #2d2d30;
+            --vg-surface-1: #252526;
+            --vg-surface-2: #2d2d30;
+            --vg-surface-group: #1e1e1e;
+        }
+
+        /* vanillagrid.js's plain .vg-btn rule (the "Hide Controls" and
+           Settings buttons above the pivot builder, among others) is a
+           hardcoded light-mode gradient — background: linear-gradient(#fff,
+           #fafafa) — with no var()-driven or dark-theme override anywhere in
+           the library's CSS. Only .vg-pivot-actions .vg-btn (Refresh Pivot /
+           Clear All / Export Data) and buttons with their own !important
+           rule (Exit Pivot Mode) escape it. Combined with color: var(--vg-fg)
+           resolving to near-white in every dark theme, that's white text on
+           a white button: readable in no theme this app offers. Override the
+           base rule here, driven by the same vg-* variables the rest of the
+           grid already uses, so it tracks whichever theme (ours or one a
+           user picks from Settings) is actually active instead of hardcoding
+           one scheme.
+           This file's own <style> block is parsed after the vanillagrid.css/
+           vg-pivot-d3.css <link> tags (see <head> above), so a same-specificity
+           .vg-btn rule here wins the cascade without needing !important. */
+        .vg-btn {
+            background: var(--vg-bg);
+            color: var(--vg-fg);
+        }
+        .vg-btn:active {
+            background: var(--vg-hover);
+        }
+
         /* Main Layout */
         .main {
             flex: 1;
@@ -2367,9 +2412,9 @@
                 <label class="upload-btn" for="fileInput">
                     📤 Drop files here or browse
                 </label>
-                <input type="file" id="fileInput" accept=".csv,.tsv,.txt,.json,.jsonl,.ndjson,.yaml,.yml,.xml,.geojson,.kml,.osm,.rg,.routinggraph,.routing-graph,.routing_graph,.xlsx,.xls" multiple onchange="handleFileUpload(event)" aria-describedby="uploadHelp">
+                <input type="file" id="fileInput" accept=".csv,.tsv,.txt,.json,.jsonl,.ndjson,.yaml,.yml,.xml,.geojson,.topojson,.kml,.osm,.rg,.routinggraph,.routing-graph,.routing_graph,.xlsx,.xls,.zip,.shp" multiple onchange="handleFileUpload(event)" aria-describedby="uploadHelp">
                 <div id="uploadHelp" style="font-size: 11px; color: #888; margin-top: 8px; padding: 0 4px;">
-                    Supports: CSV, TSV, TXT, JSON, JSONL/NDJSON, YAML, XML, GeoJSON, KML, OSM XML, routing graph
+                    Supports: CSV, TSV, TXT, JSON, JSONL/NDJSON, YAML, XML, Excel, GeoJSON, TopoJSON, Shapefile (.zip), KML, OSM XML, routing graph
                 </div>
             </div>
             <div class="table-list" id="tableList">
@@ -2618,30 +2663,49 @@ Example: SELECT * FROM my_table LIMIT 100;" aria-describedby="editorHelp" aria-e
         </div>
     </div>
     <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/shpjs@6.2.0/dist/shp.min.js"></script>
     <script src="https://simonwaldherr.github.io/vanillagrid.js/vanillagrid.js"></script>
     <script src="https://simonwaldherr.github.io/vanillagrid.js/vg-pivot-d3.js"></script>
     <script>
     let vanillaGridInstance = null;
     let vanillaGridPivotConfig = null;
-        const prefersDarkScheme = window.matchMedia('(prefers-color-scheme: dark)');
 
-        function updateVanillaGridTheme() {
-            const mountNode = document.getElementById('vanillaGrid');
-            if (!mountNode) {
-                return;
-            }
-            mountNode.classList.add('vg-compact');
-            mountNode.classList.remove('vg-theme-dark', 'vg-theme-light');
-            mountNode.classList.add(prefersDarkScheme.matches ? 'vg-theme-dark' : 'vg-theme-light');
-        }
-
-        if (prefersDarkScheme.addEventListener) {
-            prefersDarkScheme.addEventListener('change', updateVanillaGridTheme);
-        } else if (prefersDarkScheme.addListener) {
-            prefersDarkScheme.addListener(updateVanillaGridTheme);
-        }
-
-        updateVanillaGridTheme();
+        // vanillagrid.js owns its theme class itself: its constructor builds
+        // an inner `.vg-container` root and, on every render, recomputes that
+        // element's `vg-theme-*`/`vg-theme-dark-base` classes from its own
+        // internal styleState (initialised from a persisted user choice, the
+        // `theme` constructor option, or a hardcoded 'light' default — see
+        // vanillagrid.js's _initStyleState/_applyStyleState). Toggling a class
+        // on our own #vanillaGrid mount node from the outside, as this used
+        // to do based on prefers-color-scheme, only affects plain CSS-variable
+        // inheritance: it doesn't touch `.vg-container` itself, and a good
+        // few of the grid's dark-mode rules are gated on `.vg-theme-dark-base`
+        // being present there specifically (the data table and filter/settings
+        // controls among them) rather than being pure var() lookups. So the
+        // pivot header would follow our class (inherited vars) while the
+        // actual data grid stayed on the library's own default light theme.
+        //
+        // This app has exactly one look — the dark editor theme above, with
+        // no light-mode toggle anywhere — so the fix is to tell the grid
+        // itself, through its own theming API, to default to a dark theme
+        // that matches: register `tinysql` (backed by the CSS variables in
+        // .vg-theme-tinysql, near the other vanillagrid-section rules) as an
+        // additional theme choice, marked `dark: true` so the library adds
+        // vg-theme-dark-base itself, and select it as the initial theme.
+        // Registering it alongside (not instead of) the built-ins keeps the
+        // grid's own Settings panel free to offer the others too, and a user
+        // who has explicitly picked a theme there before keeps that choice —
+        // vanillagrid.js persists it and prefers that over our initial pick.
+        const VANILLA_GRID_THEMES = [
+            { value: 'light', label: 'Light', dark: false },
+            { value: 'dark-blue', label: 'Dark Blue', dark: true },
+            { value: 'dark-grey', label: 'Dark Grey', dark: true },
+            { value: 'midnight', label: 'Midnight Violet', dark: true },
+            { value: 'forest', label: 'Forest Night', dark: true },
+            { value: 'ocean', label: 'Ocean Breeze', dark: false },
+            { value: 'sand', label: 'Sand Dune', dark: false },
+            { value: 'tinysql', label: 'tinySQL', dark: true },
+        ];
 
         window.renderVanillaGrid = function (result) {
             const section = document.getElementById('vanillaGridSection');
@@ -2694,7 +2758,6 @@ Example: SELECT * FROM my_table LIMIT 100;" aria-describedby="editorHelp" aria-e
             }
 
             mountNode.innerHTML = '';
-            updateVanillaGridTheme();
 
             const pivotConfig = {
                 rows: pivotRows,
@@ -2721,7 +2784,10 @@ Example: SELECT * FROM my_table LIMIT 100;" aria-describedby="editorHelp" aria-e
                 resizableColumns: true,
                 keyboardNavigation: true,
                 contextMenu: true,
-                pivot: true
+                pivot: true,
+                theme: 'tinysql',
+                density: 'compact',
+                styleControls: { themes: VANILLA_GRID_THEMES }
             });
 
             window.vanillaGridInstance = vanillaGridInstance;

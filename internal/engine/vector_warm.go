@@ -142,9 +142,13 @@ func warmVectorStructures(ctx context.Context, tenant string, table *storage.Tab
 	rowCount = cache.rowCount()
 	lenCounts := make(map[int]int)
 	for i := 0; i < cache.rowCount(); i++ {
-		if cache.validAt(i) {
+		// resolveRow resolves validity and the vector in one overrides/segment
+		// lookup instead of validAt+vector's two independent ones — this loop
+		// never reads a norm, so needNorm is false. See resolveRow's doc
+		// comment for why that matters on a per-row scan like this one.
+		if vec, _, valid := cache.resolveRow(i, false); valid {
 			vectorCount++
-			l := len(cache.vector(i))
+			l := len(vec)
 			lenCounts[l]++
 			if dims == 0 {
 				dims = l

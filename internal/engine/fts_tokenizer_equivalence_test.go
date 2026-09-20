@@ -17,7 +17,9 @@ import (
 //     and now delegates its scan to ftsForEachToken.
 //   - evalFTSMatch/evalFTSRank now route TERM/OR-only queries through
 //     ftsAnyLiteralTermMatch/ftsLiteralTermsRank instead of building a token
-//     slice and frequency map per row.
+//     slice and frequency map per row, and TERM/AND-only queries (including
+//     the default implicit-AND parse of any plain multi-word query) through
+//     the equivalent ftsAllLiteralTermMatch/ftsLiteralANDTermsRank.
 //
 // The references below are verbatim copies of the previous implementations, so
 // any behavioral drift fails these tests rather than silently changing which
@@ -295,6 +297,133 @@ func TestFTSRootLiteralORTermsOnlyForParsedRoots(t *testing.T) {
 	}
 	// The cached tree is shared; the decomposition must be stable across reads.
 	again, _ := ftsRootLiteralORTerms(parseCachedFTSQuery("alpha OR beta"))
+	if fmt.Sprint(again) != fmt.Sprint(terms) {
+		t.Errorf("decomposition changed between reads: %q then %q", terms, again)
+	}
+}
+
+// ftsLiteralANDQueries are queries whose parse tree is TERM/AND-only
+// (including a bare implicit AND — ftsParseAnd's default for any plain
+// multi-word query) and so take the AND fast path, plus queries that must
+// NOT be treated as such. Includes duplicate-term and longer chained
+// queries specifically to exercise ftsAllLiteralTermMatch/
+// ftsLiteralANDTermsRank's handling of a term asked about more than once,
+// and the left-to-right summation order ftsQueryNode.andTerms documents.
+func ftsLiteralANDQueries() []string {
+	return []string{
+		"alpha",
+		"alpha beta",
+		"alpha AND beta",
+		"alpha beta gamma",
+		"alpha AND beta AND gamma",
+		"alpha beta gamma delta epsilon",
+		"alpha AND alpha",
+		"alpha alpha beta",
+		"running AND creation",
+		"the AND alpha", // stop-word term never matches a token
+		"zzznotpresent AND alpha",
+		"zzznotpresent",
+		// Not literal-AND: these must fall through to the map-based path.
+		"alpha OR beta",
+		"alpha OR beta OR gamma",
+		"NOT alpha",
+		"alpha AND NOT beta",
+		`"alpha beta"`,
+		"alpha*",
+		"al?ha",
+		"alpha AND beta*",
+	}
+}
+
+// TestFTSLiteralANDFastPathMatchesNodeEval pins the FTS_MATCH AND fast path
+// against the map-based ftsMatchNode oracle it bypasses, for every
+// text/query pair. See TestFTSLiteralORFastPathMatchesNodeEval for the OR
+// counterpart this mirrors.
+func TestFTSLiteralANDFastPathMatchesNodeEval(t *testing.T) {
+	for _, query := range ftsLiteralANDQueries() {
+		node := parseCachedFTSQuery(query)
+		if node == nil {
+			continue
+		}
+		terms, isLiteralAND := ftsRootLiteralANDTerms(node)
+		for _, text := range ftsTokenizeCorpus() {
+			tokens := ftsTokenize(text)
+			freq := make(map[string]int, len(tokens))
+			for _, tok := range tokens {
+				freq[tok]++
+			}
+			want := ftsMatchNode(node, freq, tokens)
+			if !isLiteralAND {
+				continue
+			}
+			if got := ftsAllLiteralTermMatch(text, terms); got != want {
+				t.Errorf("query %q text %q: fast path = %v, ftsMatchNode = %v (terms %q)",
+					query, text, got, want, terms)
+			}
+		}
+	}
+}
+
+// TestFTSLiteralANDRankMatchesScoreNode pins the FTS_RANK AND fast path
+// against the map-based ftsScoreNode oracle it bypasses. Scores must agree
+// bit-for-bit: FTS_RANK feeds ORDER BY, so even a last-bit difference could
+// reorder results. Unlike the OR case (order-insensitive, since OR takes a
+// max), this also pins the exact left-to-right summation order
+// ftsQueryNode.andTerms documents — a wrong term order would surface here as
+// a bit mismatch on the multi-term queries in ftsLiteralANDQueries, not just
+// a wrong total.
+func TestFTSLiteralANDRankMatchesScoreNode(t *testing.T) {
+	for _, query := range ftsLiteralANDQueries() {
+		node := parseCachedFTSQuery(query)
+		if node == nil {
+			continue
+		}
+		terms, isLiteralAND := ftsRootLiteralANDTerms(node)
+		if !isLiteralAND {
+			continue
+		}
+		for _, text := range ftsTokenizeCorpus() {
+			tokens := ftsTokenize(text)
+			freq := make(map[string]int, len(tokens))
+			for _, tok := range tokens {
+				freq[tok]++
+			}
+			var want float64
+			if len(tokens) > 0 {
+				want = ftsScoreNode(node, freq, 1.0, nil)
+			}
+			got := ftsLiteralANDTermsRank(text, terms, make([]int, len(terms)))
+			if math.Float64bits(got) != math.Float64bits(want) {
+				t.Errorf("query %q text %q: fast path score = %v (%#x), ftsScoreNode = %v (%#x)",
+					query, text, got, math.Float64bits(got), want, math.Float64bits(want))
+			}
+		}
+	}
+}
+
+// TestFTSRootLiteralANDTermsOnlyForParsedRoots documents that the
+// precomputed decomposition is reported only for trees produced by
+// ftsParseQuery — a node synthesized by ftsExpandQuery/ftsBindIDF must
+// report false rather than being mistaken for "not an AND tree" in a way
+// that could skip a real check.
+func TestFTSRootLiteralANDTermsOnlyForParsedRoots(t *testing.T) {
+	if _, ok := ftsRootLiteralANDTerms(nil); ok {
+		t.Error("nil node must not report a decomposition")
+	}
+	synthesized := &ftsQueryNode{op: "TERM", term: "alpha"}
+	if _, ok := ftsRootLiteralANDTerms(synthesized); ok {
+		t.Error("a node built outside ftsParseQuery must not report a decomposition")
+	}
+	parsed := parseCachedFTSQuery("alpha beta")
+	terms, ok := ftsRootLiteralANDTerms(parsed)
+	if !ok {
+		t.Fatal("a parsed TERM/AND root must report its decomposition")
+	}
+	if fmt.Sprint(terms) != "[alpha beta]" {
+		t.Errorf("decomposition = %q, want [alpha beta]", terms)
+	}
+	// The cached tree is shared; the decomposition must be stable across reads.
+	again, _ := ftsRootLiteralANDTerms(parseCachedFTSQuery("alpha beta"))
 	if fmt.Sprint(again) != fmt.Sprint(terms) {
 		t.Errorf("decomposition changed between reads: %q then %q", terms, again)
 	}

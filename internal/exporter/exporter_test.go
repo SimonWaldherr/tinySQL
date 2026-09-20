@@ -127,13 +127,14 @@ func TestExportNDJSON(t *testing.T) {
 
 func TestExportSQL(t *testing.T) {
 	rs := &engine.ResultSet{
-		Cols: []string{"id", "name", "created_at", "payload"},
+		Cols: []string{"id", "name", "created_at", "payload", "geom"},
 		Rows: []engine.Row{
 			{
 				"id":         1,
 				"name":       "O'Hara",
 				"created_at": time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC),
 				"payload":    []byte("a'b"),
+				"geom":       json.RawMessage(`{"type":"Point","coordinates":[1,2]}`),
 			},
 			{"id": 2, "name": nil},
 		},
@@ -143,7 +144,7 @@ func TestExportSQL(t *testing.T) {
 		t.Fatalf("ExportSQL failed: %v", err)
 	}
 	out := buf.String()
-	if !bytes.Contains(buf.Bytes(), []byte("INSERT INTO people (id, name, created_at, payload) VALUES (1, 'O''Hara', '2020-01-02T03:04:05Z', X'612762');")) {
+	if !bytes.Contains(buf.Bytes(), []byte(`INSERT INTO people (id, name, created_at, payload, geom) VALUES (1, 'O''Hara', '2020-01-02T03:04:05Z', X'612762', '{"type":"Point","coordinates":[1,2]}');`)) {
 		t.Fatalf("SQL missing escaped row: %s", out)
 	}
 	if !bytes.Contains(buf.Bytes(), []byte("VALUES (2, NULL")) {

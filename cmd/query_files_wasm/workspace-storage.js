@@ -374,7 +374,15 @@
         if (record.snapshotEncoding === 'base64') {
             return arrayBufferToBase64(record.snapshot);
         }
-        return copySnapshot(record.snapshot);
+        // record was just produced by IndexedDB's own get(), which always
+        // deserializes (structured clone) a fresh value with no backing-store
+        // aliasing to what's stored -- nothing else in the process holds or
+        // will ever hold a reference to this exact object. The defensive
+        // copy the write path needs (prepareSnapshotForStorage, below,
+        // protects a caller-supplied buffer it does not own) is not needed
+        // here. This module runs on the main thread only (see app.js) and
+        // never hands this value across a postMessage transfer list itself.
+        return record.snapshot;
     }
 
     function snapshotStorageFields(stagedSnapshot) {
@@ -882,12 +890,27 @@
                 if (!valid) continue;
 
                 const recovered = record.generation !== workspace.currentGeneration;
+                // loadWorkspace(id, {generation: record.generation}) would
+                // re-fetch and re-derive exactly what this loop already has
+                // in hand: the workspace record (getWorkspace already
+                // returned it, public-shaped, above; restoreGeneration
+                // returns its own fresh copy when it runs), the generation
+                // record (record itself -- generations are immutable once
+                // written, so it cannot have changed since the read a few
+                // lines up), and the snapshot bytes (snapshot itself,
+                // already read and validated by _snapshotForRead above).
+                // Reusing them instead removes a full extra IndexedDB
+                // workspace-record read, generation-record read, and
+                // snapshot deserialization from the success path of every
+                // app startup and workspace switch.
+                let publicWorkspace = workspace;
                 if (recovered || record.generation !== workspace.lastKnownGoodGeneration) {
-                    await this.restoreGeneration(id, record.generation);
+                    publicWorkspace = await this.restoreGeneration(id, record.generation);
                 }
-                const loaded = await this.loadWorkspace(id, { generation: record.generation });
                 return {
-                    ...loaded,
+                    workspace: publicWorkspace,
+                    generation: toPublicGeneration(record),
+                    snapshot,
                     recovered,
                     attemptedGenerations,
                 };

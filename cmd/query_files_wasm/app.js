@@ -2,6 +2,7 @@
 let wasmReady = false;
 let currentTables = [];
 let currentResults = null;
+let liveJobWatchTimer = null;
 const HISTORY_KEY = 'tinysql_query_history_v1';
 // Kept only to migrate the old synchronous localStorage snapshot once.
 const DB_SNAPSHOT_KEY = 'tinysql_query_files_db_snapshot_v1';
@@ -1173,6 +1174,7 @@ function generateLargeLogisticsData(salesRows) {
     const warehouses = ['New York', 'Chicago', 'Dallas', 'Seattle', 'Rotterdam'];
     const serviceLevels = ['Standard', 'Priority', 'Two-Day', 'Economy'];
     const statuses = ['Delivered', 'Delivered', 'Delivered', 'In Transit', 'Processing', 'Delayed'];
+    const originRegions = ['North', 'South', 'East', 'West', 'Central'];
 
     return salesRows.map((sale, index) => {
         const dispatchDelay = randomInt(random, 0, 3);
@@ -1190,7 +1192,7 @@ function generateLargeLogisticsData(salesRows) {
             warehouse: pickValue(warehouses, random),
             carrier: pickValue(carriers, random),
             service_level: pickValue(serviceLevels, random),
-            origin_region: pickValue(['North', 'South', 'East', 'West', 'Central'], random),
+            origin_region: pickValue(originRegions, random),
             destination_region: sale.region,
             weight_kg: randomNumber(random, 5, 380, 1),
             distance_km: randomInt(random, 120, 5200),
@@ -1575,6 +1577,22 @@ const SHAREABLE_DEMOS = {
         autoRun: true,
         query: `-- Shareable SQL feature demo: views, materialized views, RETURNING\nDROP MATERIALIZED VIEW IF EXISTS demo_revenue_mv;\nDROP VIEW IF EXISTS demo_paid_orders;\nCREATE VIEW demo_paid_orders AS\nSELECT customer_name, region, product, quantity * unit_price AS revenue\nFROM sales\nWHERE status = 'Delivered';\nCREATE MATERIALIZED VIEW demo_revenue_mv AS\nSELECT region, SUM(revenue) AS revenue\nFROM demo_paid_orders\nGROUP BY region\nWITH DATA;\nINSERT INTO sales VALUES (1011, 'Acme Corp', 'Widget D', 10, 120.00, '2024-03-01', 'North', 'Delivered') RETURNING order_id, customer_name, quantity * unit_price AS returned_total;\nREFRESH MATERIALIZED VIEW demo_revenue_mv;\nSELECT region, revenue\nFROM demo_revenue_mv\nORDER BY revenue DESC`
     },
+    specializedtables: {
+        title: 'Specialized table types',
+        description: 'keyvalue, document, and timeseries are ordinary SQL tables with a purpose-built schema and index — select just one block below and run it to see that profile alone.',
+        icon: '🗃️',
+        tables: [],
+        autoRun: true,
+        query: `-- Shareable specialized-tables demo: keyvalue, document, and timeseries\n-- profiles are ordinary physical SQL tables (persistence, constraints, and\n-- indexes included) reached through CREATE VIRTUAL TABLE ... USING <module>.\n\n-- keyvalue: a persisted unique point index (key TEXT PK, value BLOB)\nCREATE VIRTUAL TABLE session_cache USING keyvalue;\nINSERT INTO session_cache VALUES ('user:42:token', X'61626331323334'), ('user:42:theme', X'6461726b');\nUPDATE session_cache SET value = X'6e6f636f6c6f72' WHERE key = 'user:42:theme';\n\n-- timeseries: a composite (series, time) index for range scans\nCREATE VIRTUAL TABLE cpu_metrics USING timeseries;\nINSERT INTO cpu_metrics VALUES\n    ('server-1', 1000, 0.22), ('server-1', 1010, 0.31), ('server-1', 1020, 0.58),\n    ('server-2', 1000, 0.12), ('server-2', 1010, 0.19), ('server-2', 1020, 0.27);\n\n-- document: JSON validated on INSERT/UPDATE, queried with JSON_GET\nCREATE VIRTUAL TABLE user_profiles USING document;\nINSERT INTO user_profiles VALUES\n    ('user:42', '{"name":"Ada Lovelace","plan":"pro","tags":["admin","beta"]}'),\n    ('user:43', '{"name":"Grace Hopper","plan":"free","tags":["beta"]}'),\n    ('user:44', '{"name":"Katherine Johnson","plan":"pro","tags":["beta","trial"]}');\n\nSELECT id, JSON_GET(document, 'name') AS name, JSON_GET(document, 'plan') AS plan\nFROM user_profiles\nWHERE JSON_GET(document, 'plan') = 'pro'\nORDER BY name`
+    },
+    jobs: {
+        title: 'Live job scheduler',
+        description: 'CREATE JOB really runs on a timer inside the browser — watch rows land in job_log every second with no Run button clicks.',
+        icon: '⏱️',
+        tables: [],
+        autoRun: true,
+        query: `-- Shareable scheduler demo: CREATE JOB runs on a real interval, in-browser\nCREATE TABLE job_log (id INT PRIMARY KEY, ts TIMESTAMP, note TEXT);\nCREATE JOB heartbeat SCHEDULE INTERVAL 1000 AS\n    INSERT INTO job_log (id, ts, note) VALUES (RANDOM(), NOW(), 'tick');\nSELECT id, ts, note FROM job_log ORDER BY ts DESC LIMIT 20`
+    },
     procedures: {
         title: 'Stored procedures',
         description: 'Typed arguments, safe nested SQL, read-only concurrency, atomic writes, runtime statistics, and reusable Go/WASM registrations.',
@@ -1729,7 +1747,7 @@ function renderIntroPage() {
     if (!resultsContainer || decodeDemoHash()) {
         return;
     }
-    const starterDemoIDs = ['analytics', 'textcolumns', 'geo', 'rag', 'spatialrag'];
+    const starterDemoIDs = ['analytics', 'textcolumns', 'geo', 'rag', 'spatialrag', 'jobs', 'specializedtables'];
     const cards = starterDemoIDs.map((id) => [id, SHAREABLE_DEMOS[id]]).map(([id, demo]) => `
         <div class="intro-card">
             <h3>${demo.icon} ${escapeHtml(demo.title)}</h3>
@@ -2290,6 +2308,11 @@ async function applyHashDemoPayload(payload) {
         if (payload.autoRun && payload.query) {
             await onExecuteClick();
         }
+        if (payload.id === 'jobs') {
+            startLiveJobWatch();
+        } else {
+            stopLiveJobWatch();
+        }
         return true;
     } catch (error) {
         updateStatus('Shared demo failed');
@@ -2583,9 +2606,18 @@ function setupEditorSyntaxHighlighting() {
     }
 
     const refresh = () => syncEditorHighlight();
+    // A scroll event changes neither editor.value nor selectionStart, so the
+    // full refresh() (re-tokenize + escapeHtml the whole query + innerHTML
+    // write + line/column recount) was pure wasted work on every scroll
+    // tick — only the highlight overlay's own scroll position needs to
+    // track the editor's.
+    const syncScrollPosition = () => {
+        highlight.scrollTop = editor.scrollTop;
+        highlight.scrollLeft = editor.scrollLeft;
+    };
     editor.addEventListener('input', refresh);
     editor.addEventListener('input', scheduleEditorStateSave);
-    editor.addEventListener('scroll', refresh);
+    editor.addEventListener('scroll', syncScrollPosition);
     editor.addEventListener('keyup', refresh);
 
     // Sync highlighting when editor is resized (e.g. drag handle)
@@ -2957,6 +2989,9 @@ async function importSingleFile(file) {
     if (fileName.endsWith('.xlsx') || fileName.endsWith('.xls')) {
         return importExcelFile(file);
     }
+    if (fileName.endsWith('.zip') || fileName.endsWith('.shp')) {
+        return importShapefileFile(file);
+    }
 
     try {
         const content = await readFile(file, 'readAsText');
@@ -3083,6 +3118,81 @@ async function importExcelFile(file) {
     } catch (err) {
         alert(`Failed to parse Excel file: ${err.message}`);
         updateStatus('Excel import failed');
+        return false;
+    }
+}
+
+// Import an ESRI Shapefile (.zip containing .shp/.dbf/.shx, or a bare .shp
+// with geometry only) using shpjs, then hand the resulting GeoJSON to the
+// same tinySQL GeoJSON importer (ImportGeoJSON) every .geojson upload uses.
+// tinySQL's own ImportShapefileZip cannot run in this build: it shells out
+// to a real temp file (os.CreateTemp), and Go's js/wasm target has no
+// filesystem ("not implemented on js") -- so, like Excel, the file format
+// is parsed client-side and only the resulting rows cross into the engine.
+async function importShapefileFile(file) {
+    const workspaceAtStart = activeWorkspaceId;
+    const epochAtStart = workspaceEpoch;
+    if (typeof shp !== 'function') {
+        showToast('Shapefile support is unavailable right now. Try GeoJSON, or refresh the page.', 'error');
+        updateStatus('Shapefile support unavailable');
+        return false;
+    }
+
+    updateStatus(`Reading shapefile: ${file.name}...`);
+
+    try {
+        const data = await readFile(file, 'readAsArrayBuffer');
+        if (workspaceAtStart !== activeWorkspaceId || epochAtStart !== workspaceEpoch || !requireStableWorkspace('import files')) {
+            return false;
+        }
+        // shp() resolves to one FeatureCollection for a single-layer ZIP (or
+        // a bare .shp), or an array of them for a multi-layer ZIP; each
+        // carries a .fileName shpjs derived from the source .shp's own name.
+        const parsed = await shp(data);
+        const collections = Array.isArray(parsed) ? parsed : [parsed];
+        let importedLayers = 0;
+
+        for (let i = 0; i < collections.length; i++) {
+            if (workspaceAtStart !== activeWorkspaceId || epochAtStart !== workspaceEpoch || !requireStableWorkspace('import files')) {
+                return false;
+            }
+            const collection = collections[i];
+            if (!collection || !Array.isArray(collection.features) || collection.features.length === 0) {
+                continue;
+            }
+            const layerName = collection.fileName || (collections.length > 1 ? `layer_${i + 1}` : file.name);
+            const tableName = sanitizeTableName(layerName);
+            updateStatus(`Importing layer: ${layerName}...`);
+            const result = await wasmApi.importFile(`${layerName}.geojson`, JSON.stringify(collection), tableName);
+            if (!result?.success) {
+                console.error(`Failed to import shapefile layer "${layerName}":`, result?.error || 'unknown error');
+                continue;
+            }
+
+            const tableInfo = {
+                name: tableName,
+                rowCount: result.rowsImported,
+                columns: Array.isArray(result.columns) ? result.columns.map(c => String(c)) : []
+            };
+            const existingIndex = currentTables.findIndex(t => t.name === tableName);
+            if (existingIndex >= 0) currentTables[existingIndex] = tableInfo;
+            else currentTables.push(tableInfo);
+            importedLayers += 1;
+        }
+
+        renderTables();
+        updateStatus(`Shapefile imported: ${importedLayers} layer(s)`);
+        const executeBtn = document.getElementById('executeBtn');
+        if (executeBtn) executeBtn.disabled = false;
+        if (importedLayers > 0 && currentTables.length > 0) {
+            const firstTable = currentTables[currentTables.length - importedLayers].name;
+            setQuery(`SELECT * FROM ${quoteSqlIdentifier(firstTable)} LIMIT 10`);
+        }
+        scheduleDatabaseSnapshotSave();
+        return importedLayers > 0;
+    } catch (err) {
+        alert(`Failed to parse shapefile: ${err.message}`);
+        updateStatus('Shapefile import failed');
         return false;
     }
 }
@@ -3514,6 +3624,7 @@ async function onExecuteClick() {
         return;
     }
     if (!requireStableWorkspace('run a query')) return;
+    stopLiveJobWatch();
     const editor = document.getElementById('queryEditor');
     const selectedQuery = editor.value.slice(editor.selectionStart, editor.selectionEnd).trim();
     const query = selectedQuery || editor.value.trim();
@@ -3661,6 +3772,73 @@ async function onExecuteClick() {
 }
 
 // Render query results
+const LIVE_JOB_WATCH_QUERY = 'SELECT id, ts, note FROM job_log ORDER BY ts DESC LIMIT 20';
+const LIVE_JOB_WATCH_INTERVAL_MS = 1500;
+
+function stopLiveJobWatch() {
+    if (liveJobWatchTimer) {
+        clearInterval(liveJobWatchTimer);
+        liveJobWatchTimer = null;
+    }
+    document.getElementById('liveJobWatchBadge')?.remove();
+}
+
+function renderLiveJobWatchBadge() {
+    const resultsContainer = document.getElementById('resultsContainer');
+    if (!resultsContainer) return;
+    document.getElementById('liveJobWatchBadge')?.remove();
+    const badge = document.createElement('div');
+    badge.id = 'liveJobWatchBadge';
+    badge.style.cssText = 'display:flex;align-items:center;gap:8px;padding:8px 12px;margin-bottom:10px;border-radius:6px;background:#fdecea;border:1px solid #f5b7ae;font-size:13px;color:#7a1f12;';
+    badge.innerHTML = '<span style="animation:tinysqlLivePulse 1.4s ease-in-out infinite;">\u{1F534}</span> ' +
+        '<span>Live — <code>CREATE JOB heartbeat</code> is ticking every second inside this tab.</span>' +
+        '<button type="button" id="liveJobWatchStopBtn" style="margin-left:auto;">Stop watching</button>';
+    resultsContainer.prepend(badge);
+    document.getElementById('liveJobWatchStopBtn')?.addEventListener('click', stopLiveJobWatch);
+    if (!document.getElementById('tinysqlLivePulseStyle')) {
+        const style = document.createElement('style');
+        style.id = 'tinysqlLivePulseStyle';
+        style.textContent = '@keyframes tinysqlLivePulse{0%,100%{opacity:1;}50%{opacity:.25;}}';
+        document.head.appendChild(style);
+    }
+}
+
+function startLiveJobWatch() {
+    stopLiveJobWatch();
+    if (typeof wasmApi.executeQuery !== 'function') return;
+
+    renderLiveJobWatchBadge();
+    liveJobWatchTimer = setInterval(async () => {
+        if (queryExecutionInFlight || !wasmReady) return;
+        let result;
+        try {
+            result = await wasmApi.executeQuery(LIVE_JOB_WATCH_QUERY);
+        } catch (_) {
+            return;
+        }
+        if (!result || !result.success) return;
+        resultViewState = {
+            filterText: '',
+            sortColumn: '',
+            sortDirection: 'asc',
+            page: 1,
+            pageSize: DEFAULT_RESULT_PAGE_SIZE,
+        };
+        currentResults = {
+            columns: Array.isArray(result.columns) ? result.columns.map(String) : [],
+            rows: Array.isArray(result.rows) ? result.rows : [],
+            rowCount: Number.isFinite(Number(result.totalRows)) ? Number(result.totalRows) : result.rows.length,
+            filteredRowCount: Number.isFinite(Number(result.filteredRows)) ? Number(result.filteredRows) : result.rows.length,
+            pageOffset: 0,
+            serverPaged: false,
+            pageKey: '1|' + DEFAULT_RESULT_PAGE_SIZE + '||asc',
+            duration: result.durationMs != null ? result.durationMs.toFixed(2) + ' ms' : '',
+        };
+        await renderResults(currentResults);
+        renderLiveJobWatchBadge();
+    }, LIVE_JOB_WATCH_INTERVAL_MS);
+}
+
 async function renderResults(data) {
     const resultsContainer = document.getElementById('resultsContainer');
     if (!resultsContainer || !data || !Array.isArray(data.rows) || !Array.isArray(data.columns) || data.rowCount === 0) {
@@ -3752,9 +3930,13 @@ async function renderResults(data) {
                     <button role="menuitem" onclick="doExport('tsv'); closeResultsExportMenu()">TSV</button>
                     <button role="menuitem" onclick="doExport('xlsx'); closeResultsExportMenu()">Excel (.xlsx, page)</button>
                     <button role="menuitem" onclick="doExport('json'); closeResultsExportMenu()">JSON</button>
+                    <button role="menuitem" onclick="doExport('ndjson'); closeResultsExportMenu()" title="Newline-delimited JSON, one row per line">NDJSON</button>
                     <button role="menuitem" onclick="doExport('xml'); closeResultsExportMenu()">XML</button>
                     <button role="menuitem" onclick="doExport('html'); closeResultsExportMenu()">HTML table (page)</button>
                     <button role="menuitem" onclick="doExport('md'); closeResultsExportMenu()">Markdown</button>
+                    <button role="menuitem" onclick="doExport('sql'); closeResultsExportMenu()" title="INSERT statements, engine-rendered SQL literals">SQL (INSERT)</button>
+                    <button role="menuitem" onclick="doExport('geojson'); closeResultsExportMenu()" title="Needs a GEOMETRY column">GeoJSON</button>
+                    <button role="menuitem" onclick="doExport('topojson'); closeResultsExportMenu()" title="Needs a GEOMETRY column">TopoJSON</button>
                 </div>
             </div>`;
 
@@ -4051,7 +4233,12 @@ function openInVanillaGrid() {
         showToast('Pivot Grid is unavailable. The table view and exports still work.', 'error');
         return;
     }
-    window.renderVanillaGrid?.(visible);
+    // getVisibleResults() may return source.rows itself, not a copy, when no
+    // filter/sort is active (see its own comment). The pivot grid is a
+    // third-party library with its own sortable/filterable column UI, whose
+    // internals this file does not control; hand it an array it cannot
+    // alias back into currentResults.rows even if it sorts in place.
+    window.renderVanillaGrid?.({ ...visible, rows: visible.rows.slice() });
 }
 
 function getVisibleResults(source = currentResults) {
@@ -4068,8 +4255,18 @@ function getVisibleResults(source = currentResults) {
         };
     }
 
-    let rows = source.rows.slice();
     const filterText = resultViewState.filterText.trim().toLowerCase();
+    const sortActive = resultViewState.sortColumn && source.columns.includes(resultViewState.sortColumn);
+    // Filtering/sorting build their own new array (filter()/sort() already
+    // do not touch source.rows), so the defensive slice() is only needed
+    // when returning source.rows unchanged — otherwise every streaming
+    // re-render (every 120ms while a query streams) and every pagination
+    // click copied the entire result set only to read it back unmodified.
+    // Callers only ever read the returned rows/columns arrays (pagination's
+    // own .slice(), the export/copy/code-generator functions, and
+    // openInVanillaGrid, which takes its own defensive copy before handing
+    // rows to the third-party pivot grid library — see its call site).
+    let rows = filterText || sortActive ? source.rows.slice() : source.rows;
     if (filterText) {
         rows = rows.filter((row) => source.columns.some((column) => {
             const value = row[column];
@@ -4080,7 +4277,7 @@ function getVisibleResults(source = currentResults) {
         }));
     }
 
-    if (resultViewState.sortColumn && source.columns.includes(resultViewState.sortColumn)) {
+    if (sortActive) {
         const column = resultViewState.sortColumn;
         const direction = resultViewState.sortDirection === 'desc' ? -1 : 1;
         rows.sort((leftRow, rightRow) => direction * compareResultValues(leftRow[column], rightRow[column]));
@@ -4093,6 +4290,12 @@ function getVisibleResults(source = currentResults) {
         duration: source.duration,
     };
 }
+
+// Shared across every comparison: the options never vary, and constructing
+// the Intl.Collator a localeCompare(locale, options) call implies internally
+// is the expensive part of the comparison, repeated O(n log n) times by
+// Array.prototype.sort otherwise.
+const resultValueCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
 
 function compareResultValues(leftValue, rightValue) {
     if (leftValue === rightValue) {
@@ -4116,7 +4319,7 @@ function compareResultValues(leftValue, rightValue) {
 
     const leftText = String(leftValue);
     const rightText = String(rightValue);
-    return leftText.localeCompare(rightText, undefined, { numeric: true, sensitivity: 'base' });
+    return resultValueCollator.compare(leftText, rightText);
 }
 
 let resultFilterTimer = null;
@@ -4223,6 +4426,14 @@ function getSortIndicator(column) {
     return resultViewState.sortDirection === 'asc' ? '▲' : '▼';
 }
 
+// Formats with no client-side fallback: they only make sense as a genuine
+// engine-backed export (SQL INSERT statements via tinySQL's own SQL literal
+// rendering, GeoJSON/TopoJSON needing a real GEOMETRY column and the
+// engine's geometry-to-JSON encoder, NDJSON needing the same row encoding
+// JSON export uses). They always go through wasmApi.exportResults and need
+// the complete, unfiltered/unsorted result the Go side holds.
+const WASM_ONLY_EXPORT_FORMATS = new Set(['ndjson', 'sql', 'geojson', 'topojson']);
+
 // Unified export dispatcher – tries WASM-side first, falls back to client-side
 async function doExport(format) {
     if (currentResults?.previewOnly) {
@@ -4235,6 +4446,10 @@ async function doExport(format) {
         return;
     }
     const viewIsRaw = !resultViewState.filterText.trim() && !resultViewState.sortColumn;
+    if (WASM_ONLY_EXPORT_FORMATS.has(format) && !viewIsRaw) {
+        alert('This export format runs entirely in the SQL engine and needs the complete, unfiltered result. Reset the filter/sort first.');
+        return;
+    }
     // XLSX and HTML are deliberately assembled in the UI: XLSX is binary and
     // the HTML export follows the currently visible column order. The text
     // formats can stay in WASM for an unfiltered complete result.
@@ -4250,7 +4465,17 @@ async function doExport(format) {
                 downloadFile(res.data, `query_results.${ext}`, mimeType);
                 return;
             }
-        } catch (_) { /* fall through */ }
+            if (WASM_ONLY_EXPORT_FORMATS.has(format)) {
+                alert(`Export failed: ${res?.error || 'unknown error'}`);
+                return;
+            }
+        } catch (error) {
+            if (WASM_ONLY_EXPORT_FORMATS.has(format)) {
+                alert(`Export failed: ${error?.message || error}`);
+                return;
+            }
+            /* fall through to a client-side fallback for the other formats */
+        }
     }
     // Client-side fallback
     if (format === 'csv') exportCSV(visible);
@@ -4584,11 +4809,32 @@ function toXmlTag(name) {
 }
 
 // ----- Query History -----
+// The panel starts hidden and many sessions never open it; rendering the
+// full list (escapeHtml x3 per entry, up to MAX_HISTORY, plus an innerHTML
+// write) after every single executed query was wasted work whenever nobody
+// is looking at it. Deferred renders are marked dirty and caught up the
+// moment the panel opens, so it is never shown stale.
+let historyRenderDirty = false;
+
+function isHistoryPanelVisible() {
+    const panel = document.getElementById('historyPanel');
+    return !!panel && !panel.classList.contains('hidden');
+}
+
+function renderHistoryIfVisible() {
+    if (isHistoryPanelVisible()) {
+        renderHistory();
+        historyRenderDirty = false;
+    } else {
+        historyRenderDirty = true;
+    }
+}
+
 function pushHistory(sql, duration, rows) {
     queryHistory.unshift({ sql, duration, rows, ts: Date.now() });
     if (queryHistory.length > MAX_HISTORY) queryHistory.length = MAX_HISTORY;
     try { localStorage.setItem(HISTORY_KEY, JSON.stringify(queryHistory)); } catch (_) {}
-    renderHistory();
+    renderHistoryIfVisible();
 }
 
 function clearHistory() {
@@ -4598,7 +4844,7 @@ function clearHistory() {
         localStorage.removeItem('tinySQL_history');
         localStorage.removeItem('tsql_history');
     } catch (_) {}
-    renderHistory();
+    renderHistoryIfVisible();
 }
 
 function renderHistory() {
@@ -4633,7 +4879,12 @@ function timeAgo(ts) {
 
 function toggleHistory() {
     const panel = document.getElementById('historyPanel');
-    if (panel) panel.classList.toggle('hidden');
+    if (!panel) return;
+    panel.classList.toggle('hidden');
+    if (!panel.classList.contains('hidden') && historyRenderDirty) {
+        renderHistory();
+        historyRenderDirty = false;
+    }
 }
 
 // Keyboard shortcuts

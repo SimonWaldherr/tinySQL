@@ -60,6 +60,13 @@ type routeGraph struct {
 	// creates a new binding without touching ordinary Dijkstra searches.
 	coordinateMu       sync.Mutex
 	coordinateBindings map[*routeCoordinates]*routeGraphCoordinates
+	// edgeIDIdx/geomIdx resolve the table's optional "edge_id"/"geometry"
+	// columns once per graph build/version instead of once per
+	// ROUTE_SHORTEST_PATH call — the answer depends only on the table's
+	// schema, which this cache entry is already scoped to (see
+	// getRouteGraph's entry.version == table.Version gate).
+	edgeIDIdx, geomIdx int
+	hasEdgeID, hasGeom bool
 }
 
 const routeGraphCacheMaxEntries = 64
@@ -378,6 +385,12 @@ func buildRouteGraph(ctx context.Context, table *storage.Table, sourceCol, targe
 			g.rowIdx[edge], g.rowIdx[destination] = g.rowIdx[destination], g.rowIdx[edge]
 			sourceOrPosition[edge], sourceOrPosition[destination] = sourceOrPosition[destination], sourceOrPosition[edge]
 		}
+	}
+	if i, err := table.ColIndex("edge_id"); err == nil {
+		g.edgeIDIdx, g.hasEdgeID = i, true
+	}
+	if i, err := table.ColIndex("geometry"); err == nil {
+		g.geomIdx, g.hasGeom = i, true
 	}
 	return g, nil
 }
@@ -831,25 +844,15 @@ func (f *RouteShortestPathTableFunc) Execute(ctx context.Context, args []Expr, e
 		return nil, fmt.Errorf("ROUTE_SHORTEST_PATH: end id not found among %q/%q values", sourceCol, targetCol)
 	}
 
-	resultCols := []string{"seq", "node_id", "edge_id", "leg_cost", "total_cost", "geometry"}
-	edgeIDIdx, hasEdgeID := -1, false
-	if i, err := table.ColIndex("edge_id"); err == nil {
-		edgeIDIdx, hasEdgeID = i, true
-	}
-	geomIdx, hasGeom := -1, false
-	if i, err := table.ColIndex("geometry"); err == nil {
-		geomIdx, hasGeom = i, true
-	}
-
 	path, found := dijkstraShortestPath(g, startIdx, endIdx)
 	if !found {
-		return &ResultSet{Cols: resultCols, Rows: nil}, nil
+		return &ResultSet{Cols: routeShortestPathCols, Rows: nil}, nil
 	}
 
 	rows := make([]Row, 0, len(path))
 	prevCost := 0.0
 	for seq, step := range path {
-		r := make(Row, len(resultCols))
+		r := make(Row, len(routeShortestPathCols))
 		r["seq"] = seq
 		r["node_id"] = g.nodeValues[step.node]
 		r["total_cost"] = step.cumulative
@@ -859,13 +862,13 @@ func (f *RouteShortestPathTableFunc) Execute(ctx context.Context, args []Expr, e
 			r["geometry"] = nil
 		} else {
 			r["leg_cost"] = step.cumulative - prevCost
-			if hasEdgeID && edgeIDIdx < len(table.Rows[step.viaRowIdx]) {
-				r["edge_id"] = table.Rows[step.viaRowIdx][edgeIDIdx]
+			if g.hasEdgeID && g.edgeIDIdx < len(table.Rows[step.viaRowIdx]) {
+				r["edge_id"] = table.Rows[step.viaRowIdx][g.edgeIDIdx]
 			} else {
 				r["edge_id"] = nil
 			}
-			if hasGeom && geomIdx < len(table.Rows[step.viaRowIdx]) {
-				r["geometry"] = table.Rows[step.viaRowIdx][geomIdx]
+			if g.hasGeom && g.geomIdx < len(table.Rows[step.viaRowIdx]) {
+				r["geometry"] = table.Rows[step.viaRowIdx][g.geomIdx]
 			} else {
 				r["geometry"] = nil
 			}
@@ -873,8 +876,13 @@ func (f *RouteShortestPathTableFunc) Execute(ctx context.Context, args []Expr, e
 		prevCost = step.cumulative
 		rows = append(rows, r)
 	}
-	return &ResultSet{Cols: resultCols, Rows: rows}, nil
+	return &ResultSet{Cols: routeShortestPathCols, Rows: rows}, nil
 }
+
+// routeShortestPathCols is ROUTE_SHORTEST_PATH's fixed result column list.
+// It never varies per call, so it is allocated once instead of on every
+// Execute call.
+var routeShortestPathCols = []string{"seq", "node_id", "edge_id", "leg_cost", "total_cost", "geometry"}
 
 func init() {
 	RegisterTableFunc(&RouteShortestPathTableFunc{})

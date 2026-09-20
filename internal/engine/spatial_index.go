@@ -202,13 +202,11 @@ func buildGeoGridIndex(ctx context.Context, table *storage.Table, colIdx int) (*
 		var cx, cy float64
 		if err := collectGeoCentroid(object, &acc); err == nil && acc.Weight != 0 {
 			cx, cy = acc.X/acc.Weight, acc.Y/acc.Weight
-		} else if len(acc.Fallback) > 0 {
-			for _, p := range acc.Fallback {
-				cx += p.X
-				cy += p.Y
-			}
-			cx /= float64(len(acc.Fallback))
-			cy /= float64(len(acc.Fallback))
+		} else if acc.FallbackCount > 0 {
+			cx += acc.FallbackSumX
+			cy += acc.FallbackSumY
+			cx /= float64(acc.FallbackCount)
+			cy /= float64(acc.FallbackCount)
 		} else {
 			continue
 		}

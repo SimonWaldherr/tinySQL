@@ -177,9 +177,14 @@ func (f *GeoSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 		selectCandidates = func(idx *geoGridIndex) []int32 {
 			return idx.candidatesRadius(centerLon, centerLat, radiusMeters)
 		}
+		// cos(centerLat) is loop-invariant across every candidate this
+		// residual check re-verifies, so it is computed once here instead
+		// of once per candidate inside haversineMeters — see
+		// haversineMetersFromOrigin.
+		cosCenterLat := math.Cos(centerLat * math.Pi / 180)
 		residual = func(idx *geoGridIndex, rowIdx int32) bool {
 			p := idx.centroids[rowIdx]
-			return haversineMeters(centerLat, centerLon, p.Lat, p.Lon) <= radiusMeters
+			return haversineMetersFromOrigin(centerLat, cosCenterLat, centerLon, p.Lat, p.Lon) <= radiusMeters
 		}
 	default:
 		return nil, fmt.Errorf("GEO_SEARCH: unknown mode %q (supported: bbox, bbox_intersects, radius)", modeStr)

@@ -1505,6 +1505,12 @@ func ImportGeoJSON(ctx context.Context, db *DB, tenant, tableName string, src io
 	return importer.ImportGeoJSON(ctx, db, tenant, tableName, src, opts)
 }
 
+// ImportTopoJSON imports a TopoJSON Topology from a reader, resolving arc
+// references into GeoJSON-equivalent geometry per object.
+func ImportTopoJSON(ctx context.Context, db *DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
+	return importer.ImportTopoJSON(ctx, db, tenant, tableName, src, opts)
+}
+
 // ImportKML imports KML Placemark data from a reader.
 func ImportKML(ctx context.Context, db *DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
 	return importer.ImportKML(ctx, db, tenant, tableName, src, opts)

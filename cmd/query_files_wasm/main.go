@@ -20,6 +20,7 @@ import (
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
 	proceduredemo "github.com/SimonWaldherr/tinySQL/demos/procedures"
+	"github.com/SimonWaldherr/tinySQL/exporter"
 )
 
 const (
@@ -52,6 +53,7 @@ func main() {
 	db = tinysql.NewDB()
 	queryCache = tinysql.NewQueryCache(queryCacheSize)
 	registerDemoStoredProcedures()
+	startJobScheduler()
 
 	js.Global().Set("importFile", js.FuncOf(importFile))
 	js.Global().Set("executeQuery", js.FuncOf(executeQuery))
@@ -79,6 +81,15 @@ func main() {
 func registerDemoStoredProcedures() {
 	if err := proceduredemo.Register(); err != nil {
 		println("Failed to register stored procedure demos:", err.Error())
+	}
+}
+
+// startJobScheduler (re)starts CREATE JOB execution against the current db.
+// Without a running scheduler, scheduled jobs stay registered in the catalog
+// but never fire; call this after every reassignment of the package-level db.
+func startJobScheduler() {
+	if err := tinysql.StartJobScheduler(db, tenant); err != nil {
+		println("Failed to start job scheduler:", err.Error())
 	}
 }
 
@@ -333,6 +344,8 @@ func importFileRequest(this js.Value, args []js.Value) interface{} {
 		impResult, err = tinysql.ImportYAML(ctx, db, tenant, tableName, reader, opts.ImportOptions)
 	case ext == ".geojson":
 		impResult, err = tinysql.ImportGeoJSON(ctx, db, tenant, tableName, reader, opts.ImportOptions)
+	case ext == ".topojson":
+		impResult, err = tinysql.ImportTopoJSON(ctx, db, tenant, tableName, reader, opts.ImportOptions)
 	case ext == ".kml":
 		impResult, err = tinysql.ImportKML(ctx, db, tenant, tableName, reader, opts.ImportOptions)
 	case ext == ".osm" || strings.HasSuffix(lowerName, ".osm.xml"):
@@ -347,7 +360,7 @@ func importFileRequest(this js.Value, args []js.Value) interface{} {
 		jsonBytes, _ := json.Marshal(xmlRows)
 		impResult, err = tinysql.FuzzyImportJSON(ctx, db, tenant, tableName, strings.NewReader(string(jsonBytes)), opts)
 	default:
-		return jsErr("Unsupported file format: " + ext + ". Supported: .csv, .tsv, .txt, .json, .jsonl, .ndjson, .yaml, .xml, .geojson, .kml, .osm, .rg")
+		return jsErr("Unsupported file format: " + ext + ". Supported: .csv, .tsv, .txt, .json, .jsonl, .ndjson, .yaml, .xml, .geojson, .topojson, .kml, .osm, .rg")
 	}
 
 	if err != nil {
@@ -493,8 +506,10 @@ func clearDatabase(this js.Value, args []js.Value) interface{} {
 }
 
 func clearDatabaseRequest(this js.Value, args []js.Value) interface{} {
+	tinysql.StopJobScheduler(db)
 	db = tinysql.NewDB()
 	queryCache = tinysql.NewQueryCache(queryCacheSize)
+	startJobScheduler()
 	lastResult = nil
 	lastResultPager.reset()
 	return map[string]interface{}{
@@ -571,8 +586,10 @@ func importDatabaseRequest(this js.Value, args []js.Value) interface{} {
 	if err != nil {
 		return jsErr("import failed: " + err.Error())
 	}
+	tinysql.StopJobScheduler(db)
 	db = loaded
 	queryCache = tinysql.NewQueryCache(queryCacheSize)
+	startJobScheduler()
 	lastResult = nil
 	lastResultPager.reset()
 	return map[string]interface{}{
@@ -602,8 +619,10 @@ func importDatabaseBytesRequest(this js.Value, args []js.Value) interface{} {
 	if err != nil {
 		return jsErr("import failed: " + err.Error())
 	}
+	tinysql.StopJobScheduler(db)
 	db = loaded
 	queryCache = tinysql.NewQueryCache(queryCacheSize)
+	startJobScheduler()
 	lastResult = nil
 	lastResultPager.reset()
 	return map[string]interface{}{
@@ -868,8 +887,33 @@ func exportResultsRequest(this js.Value, args []js.Value) interface{} {
 			buf.WriteString("  </row>\n")
 		}
 		buf.WriteString("</rows>\n")
+	case "tsv":
+		mimeType, ext = "text/tab-separated-values", "tsv"
+		if err := exporter.ExportTSV(&buf, lastResult, exporter.Options{}); err != nil {
+			return jsErr("TSV export failed: " + err.Error())
+		}
+	case "ndjson":
+		mimeType, ext = "application/x-ndjson", "ndjson"
+		if err := exporter.ExportNDJSON(&buf, lastResult, exporter.Options{}); err != nil {
+			return jsErr("NDJSON export failed: " + err.Error())
+		}
+	case "sql":
+		mimeType, ext = "application/sql", "sql"
+		if err := exporter.ExportSQL(&buf, lastResult, "query_results"); err != nil {
+			return jsErr("SQL export failed: " + err.Error())
+		}
+	case "geojson":
+		mimeType, ext = "application/geo+json", "geojson"
+		if err := exporter.ExportGeoJSON(&buf, lastResult, "", exporter.Options{}); err != nil {
+			return jsErr("GeoJSON export failed: " + err.Error() + " (does the result include a GEOMETRY column?)")
+		}
+	case "topojson":
+		mimeType, ext = "application/json", "topojson"
+		if err := exporter.ExportTopoJSON(&buf, lastResult, "", "", exporter.Options{}); err != nil {
+			return jsErr("TopoJSON export failed: " + err.Error() + " (does the result include a GEOMETRY column?)")
+		}
 	default:
-		return jsErr("Unknown format: " + format + ". Use csv, json or xml.")
+		return jsErr("Unknown format: " + format + ". Use csv, tsv, json, ndjson, sql, xml, geojson or topojson.")
 	}
 
 	return map[string]interface{}{

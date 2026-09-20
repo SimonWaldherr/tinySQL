@@ -132,6 +132,61 @@ func BenchmarkFTSScalarRankLiteralOR(b *testing.B) {
 	})
 }
 
+// BenchmarkFTSScalarMatchLiteralAND is BenchmarkFTSScalarMatchLiteralOR for
+// the AND fast path — ftsParseAnd's default parse for any plain multi-word
+// query, so at least as common as the OR shape.
+func BenchmarkFTSScalarMatchLiteralAND(b *testing.B) {
+	node := parseCachedFTSQuery("vector relevance")
+	terms, ok := ftsRootLiteralANDTerms(node)
+	if !ok {
+		b.Fatal("expected a literal-AND decomposition for the benchmark query")
+	}
+	b.Run("fastpath", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			sinkBool = ftsAllLiteralTermMatch(benchFTSProse, terms)
+		}
+	})
+	b.Run("mappath", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			tokens := ftsTokenize(benchFTSProse)
+			freq := make(map[string]int, len(tokens))
+			for _, t := range tokens {
+				freq[t]++
+			}
+			sinkBool = ftsMatchNode(node, freq, tokens)
+		}
+	})
+}
+
+// BenchmarkFTSScalarRankLiteralAND is BenchmarkFTSScalarMatchLiteralAND for
+// the scoring path evalFTSRank takes.
+func BenchmarkFTSScalarRankLiteralAND(b *testing.B) {
+	node := parseCachedFTSQuery("vector relevance")
+	terms, ok := ftsRootLiteralANDTerms(node)
+	if !ok {
+		b.Fatal("expected a literal-AND decomposition for the benchmark query")
+	}
+	b.Run("fastpath", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			sinkFloat = ftsLiteralANDTermsRank(benchFTSProse, terms, make([]int, len(terms)))
+		}
+	})
+	b.Run("mappath", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			tokens := ftsTokenize(benchFTSProse)
+			freq := make(map[string]int, len(tokens))
+			for _, t := range tokens {
+				freq[t]++
+			}
+			sinkFloat = ftsScoreNode(node, freq, 1.0, nil)
+		}
+	})
+}
+
 // Package-level sinks keep the compiler from eliminating the benchmarked work.
 var (
 	sinkString string

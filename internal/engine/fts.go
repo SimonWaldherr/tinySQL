@@ -433,6 +433,24 @@ type ftsQueryNode struct {
 	orTermsOK       bool
 	orTerms         []string
 
+	// andTerms is orTerms' AND-tree counterpart: the positive leaf terms of a
+	// query made solely of TERM nodes joined with AND (including a bare
+	// implicit AND, e.g. "cat dog" — ftsParseAnd's default parse for any
+	// plain multi-word query, and therefore the single most common shape
+	// FTS_MATCH/FTS_RANK see in practice). Computed the same way and at the
+	// same time as orTerms, so the scalar path can consult it without
+	// allocating. ftsParseAnd always builds a strictly left-associated AND
+	// chain (this grammar has no parentheses to produce any other shape —
+	// see ftsLexQuery), and ftsLiteralANDTerms's recursion visits left before
+	// right at every level, so andTerms is always in the query's left-to-right
+	// term order. That matters beyond convenience: ftsScoreNode's "AND" case
+	// sums left+right recursively, and floating-point addition is not
+	// associative, so a rank fast path must reproduce that exact left-to-right
+	// fold, not just the same set of terms in any order.
+	andTermsComputed bool
+	andTermsOK       bool
+	andTerms         []string
+
 	// orTermsBound caches the literal-OR term list ftsBindIDF already computed
 	// (to build termIDNs/termIDFs below) on the synthesized OR node it
 	// returns. ftsDisjunctionTopK reads this directly instead of re-deriving
@@ -477,6 +495,9 @@ func ftsParseQuery(query string) *ftsQueryNode {
 		// ftsQueryNode.orTerms.
 		node.orTerms, node.orTermsOK = ftsLiteralORTerms(node)
 		node.orTermsComputed = true
+		// See ftsQueryNode.andTerms.
+		node.andTerms, node.andTermsOK = ftsLiteralANDTerms(node)
+		node.andTermsComputed = true
 	}
 	return node
 }
@@ -836,6 +857,44 @@ func ftsRootLiteralORTerms(node *ftsQueryNode) ([]string, bool) {
 	return node.orTerms, node.orTermsOK
 }
 
+// ftsLiteralANDTerms is ftsLiteralORTerms' AND-tree counterpart: the positive
+// leaf terms of a query made solely of TERM nodes joined with AND. This is
+// the shape ftsParseAnd produces for any plain multi-word query (implicit
+// AND is the default), so it is at least as common as the literal-OR shape
+// above. The returned order is always the query's left-to-right term order —
+// see ftsQueryNode.andTerms for why that matters to a rank fast path.
+func ftsLiteralANDTerms(node *ftsQueryNode) ([]string, bool) {
+	if node == nil {
+		return nil, false
+	}
+	switch node.op {
+	case "TERM":
+		return []string{node.term}, true
+	case "AND":
+		left, ok := ftsLiteralANDTerms(node.left)
+		if !ok {
+			return nil, false
+		}
+		right, ok := ftsLiteralANDTerms(node.right)
+		if !ok {
+			return nil, false
+		}
+		return append(left, right...), true
+	default:
+		return nil, false
+	}
+}
+
+// ftsRootLiteralANDTerms is ftsRootLiteralORTerms' AND-tree counterpart —
+// same precomputed-at-parse-time contract, same "unbound node has no
+// decomposition" rule, same read-only-slice requirement.
+func ftsRootLiteralANDTerms(node *ftsQueryNode) ([]string, bool) {
+	if node == nil || !node.andTermsComputed {
+		return nil, false
+	}
+	return node.andTerms, node.andTermsOK
+}
+
 // ftsAnyLiteralTermMatch scans the same ASCII-token language as ftsTokenize,
 // but never allocates a token slice or frequency map. The scanner is used only
 // for literal OR queries, where seeing one matching token decides the result.
@@ -854,6 +913,32 @@ func ftsAnyLiteralTermMatch(text string, terms []string) bool {
 		return true
 	})
 	return found
+}
+
+// ftsAllLiteralTermMatch is ftsAnyLiteralTermMatch's AND counterpart: true
+// only once every term in terms has been seen at least once. Reproduces
+// ftsMatchNode's AND case (freq[term] > 0 for every leaf, ANDed) exactly —
+// a duplicate term in terms (an unusual but legal query like "cat AND cat")
+// is satisfied by the same single token occurrence that satisfies every
+// other occurrence of that term, matching freq[term] > 0's own indifference
+// to how many times a term is asked about. Stops scanning as soon as every
+// term is accounted for, same early-exit spirit as the OR version.
+func ftsAllLiteralTermMatch(text string, terms []string) bool {
+	if len(terms) == 0 {
+		return true
+	}
+	seen := make([]bool, len(terms))
+	remaining := len(terms)
+	ftsForEachToken(text, func(token string) bool {
+		for i, term := range terms {
+			if !seen[i] && token == term {
+				seen[i] = true
+				remaining--
+			}
+		}
+		return remaining > 0
+	})
+	return remaining == 0
 }
 
 // ftsForEachToken is the allocation-free streaming sibling of ftsTokenize.
@@ -936,6 +1021,45 @@ func ftsLiteralTermsRank(text string, terms []string, counts []int) float64 {
 	// ftsScoreNode with normDocLen=1 and no IDF: the length-normalization
 	// denominator reduces to tf+k1 because (1-b)+b == 1.
 	return (tf * (bm25K1 + 1)) / (tf + bm25K1)
+}
+
+// ftsLiteralANDTermsRank is ftsLiteralTermsRank's AND-tree counterpart.
+// Unlike OR (which takes the max of its branches, so only the single winning
+// term's score is ever computed), ftsScoreNode's AND case sums every branch:
+// summing this function's per-term scores in terms' order reproduces that
+// sum exactly, because terms is always in left-to-right query order and
+// ftsParseAnd always builds a strictly left-associated AND chain (see
+// ftsQueryNode.andTerms) — the same left-to-right fold ftsScoreNode's
+// recursion performs, bit for bit, not just the same value up to reordering.
+// A duplicate term contributes its own term score once per occurrence in
+// terms, matching ftsScoreNode's literal per-leaf summation for a query like
+// "cat AND cat".
+func ftsLiteralANDTermsRank(text string, terms []string, counts []int) float64 {
+	clear(counts)
+	// Same whole-text fold as ftsLiteralTermsRank and for the same reason:
+	// this pass cannot stop early (every term's frequency is needed), so
+	// per-token case folding would allocate repeatedly across the document.
+	scan := text
+	if ftsHasASCIIUpper(text) {
+		scan = ftsToASCIILower(text)
+	}
+	ftsForEachToken(scan, func(token string) bool {
+		for i, term := range terms {
+			if token == term {
+				counts[i]++
+			}
+		}
+		return true
+	})
+	var sum float64
+	for _, frequency := range counts {
+		if frequency == 0 {
+			continue
+		}
+		tf := float64(frequency)
+		sum += (tf * (bm25K1 + 1)) / (tf + bm25K1)
+	}
+	return sum
 }
 
 // ftsPhraseMatch checks whether tokens contains phrase as a consecutive subsequence.
@@ -1142,6 +1266,15 @@ func evalFTSMatch(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if terms, ok := ftsRootLiteralORTerms(node); ok {
 		return ftsAnyLiteralTermMatch(text, terms), nil
 	}
+	// A tree of TERMs joined only by AND — the default parse for any plain
+	// multi-word query ("cat dog" is implicit AND, per ftsParseAnd) and
+	// therefore at least as common as the OR shape above. ftsMatchNode would
+	// reach the identical verdict (every leaf's freq[term] > 0, ANDed) after
+	// building the same token slice and frequency map; ftsAllLiteralTermMatch
+	// decides it in one allocation-free pass instead.
+	if terms, ok := ftsRootLiteralANDTerms(node); ok {
+		return ftsAllLiteralTermMatch(text, terms), nil
+	}
 
 	tokens := ftsTokenize(text)
 	freq := make(map[string]int, len(tokens))
@@ -1185,15 +1318,33 @@ func evalFTSRank(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if terms, ok := ftsRootLiteralORTerms(node); ok {
 		return ftsLiteralTermsRank(text, terms, make([]int, len(terms))), nil
 	}
-
-	tokens := ftsTokenize(text)
-	if len(tokens) == 0 {
-		return 0.0, nil
+	// See evalFTSMatch: the AND shape is at least as common as OR, and
+	// ftsLiteralANDTermsRank reproduces ftsScoreNode's AND-sum exactly (see
+	// its own doc comment for why term order and left-to-right summation
+	// both matter here, unlike the order-insensitive OR/max case above).
+	if terms, ok := ftsRootLiteralANDTerms(node); ok {
+		return ftsLiteralANDTermsRank(text, terms, make([]int, len(terms))), nil
 	}
 
-	freq := make(map[string]int, len(tokens))
-	for _, t := range tokens {
-		freq[t]++
+	// ftsScoreNode (unlike ftsMatchNode) never reads the ordered token slice —
+	// its PHRASE case scores by freq alone, with no adjacency check — so
+	// building one here via ftsTokenize only to discard it after populating
+	// freq wasted a whole-text allocation on every non-literal-OR/AND query
+	// (mixed AND/OR, PHRASE, PREFIX, WILDCARD, NOT). ftsForEachToken is the
+	// same allocation-free scan ftsLiteralTermsRank already uses, folding the
+	// whole text once up front for the same reason given there: this pass
+	// can't stop early, so per-token folding would allocate repeatedly.
+	scan := text
+	if ftsHasASCIIUpper(text) {
+		scan = ftsToASCIILower(text)
+	}
+	freq := make(map[string]int, 8)
+	ftsForEachToken(scan, func(token string) bool {
+		freq[token]++
+		return true
+	})
+	if len(freq) == 0 {
+		return 0.0, nil
 	}
 	// Use normalized doc length of 1.0 (standalone, no corpus avgdl to
 	// normalize against) and no IDF weighting (no corpus to compute it from).

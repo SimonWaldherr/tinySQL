@@ -23,7 +23,9 @@ func TestBuildQueryFilesWasm(t *testing.T) {
 	out := filepath.Join(os.TempDir(), "tiny_query_files_wasm_bin")
 	defer os.Remove(out)
 
-	cmd := exec.CommandContext(ctx, "go", "build", "-trimpath", "-o", out, ".")
+	// -tags no_http matches build.sh: keep this test representative of the
+	// actual shipped build, not a larger binary nobody ships.
+	cmd := exec.CommandContext(ctx, "go", "build", "-tags", "no_http", "-trimpath", "-o", out, ".")
 	cmd.Env = append(os.Environ(), "GOOS=js", "GOARCH=wasm")
 	if outp, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("go build (GOOS=js GOARCH=wasm) failed: %v\n%s", err, string(outp))

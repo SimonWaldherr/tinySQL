@@ -165,6 +165,15 @@ func vecQueryCacheEnabled() bool {
 	return vecQueryCacheState.cacheEnabled.Load()
 }
 
+// vecAnalyticsEnabled is vecQueryCacheEnabled's counterpart for the
+// analytics feature: a lock-free atomic read a caller can check before doing
+// any work whose only purpose is building a VectorQueryEvent, so a disabled
+// (the default) analytics feature costs nothing on the VEC_SEARCH hot path —
+// not even a discarded time.Now() call.
+func vecAnalyticsEnabled() bool {
+	return vecQueryCacheState.analyticsEnabled.Load()
+}
+
 func vecQueryKey(tenant string, tableName, colName string, version int, a vecSearchArgs) vecQueryCacheKey {
 	h := sha256.New()
 	var bits [8]byte

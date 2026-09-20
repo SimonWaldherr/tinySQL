@@ -22,8 +22,10 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"testing"
 
+	"github.com/SimonWaldherr/tinySQL/internal/importer"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
@@ -253,6 +255,82 @@ func TestBlobFunctionsAcceptHexStringsStill(t *testing.T) {
 	if h != "deadbeef" {
 		t.Errorf("BLOB_HEX('deadbeef') = %v, want 'deadbeef'", h)
 	}
+}
+
+// TestLengthOnBlobReturnsByteCount pins a fix: LENGTH (and its CHAR_LENGTH
+// alias) used to run every value through valueText before counting
+// characters. valueText has no fast case for []byte and falls back to
+// fmt.Sprintf("%v", v), whose form for a plain byte slice is the decimal
+// byte list (e.g. "[110 111 99]") — LENGTH was reporting the character count
+// of that debug string, not the blob's actual size. A 7-byte value reported
+// as 28. LENGTH must special-case []byte and return len(b) directly.
+func TestLengthOnBlobReturnsByteCount(t *testing.T) {
+	db, ctx := blobColumnDB(t)
+	// "nocolor": 7 bytes. Its fmt debug form ("[110 111 ... 114]") is 28
+	// characters long, which is the exact wrong value the bug returned.
+	if _, err := Execute(ctx, db, "default", mustParse(
+		`INSERT INTO files VALUES (1, X'6e6f636f6c6f72', 'label')`)); err != nil {
+		t.Fatal(err)
+	}
+	rs, err := Execute(ctx, db, "default", mustParse(
+		`SELECT LENGTH(data) AS n, CHAR_LENGTH(data) AS cn FROM files WHERE id = 1`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, _ := ragValue(rs.Rows[0], "n")
+	expectInt(t, n, 7, "LENGTH(BLOB)")
+	cn, _ := ragValue(rs.Rows[0], "cn")
+	expectInt(t, cn, 7, "CHAR_LENGTH(BLOB)")
+}
+
+// TestLengthOnTextStillCountsCharacters guards the non-BLOB path the fix must
+// leave alone: LENGTH on ordinary text keeps counting characters (not bytes),
+// so a multi-byte UTF-8 string is unaffected by the []byte special case.
+func TestLengthOnTextStillCountsCharacters(t *testing.T) {
+	db, ctx := blobColumnDB(t)
+	if _, err := Execute(ctx, db, "default", mustParse(
+		`INSERT INTO files VALUES (1, X'00', 'héllo')`)); err != nil {
+		t.Fatal(err)
+	}
+	rs, err := Execute(ctx, db, "default", mustParse(
+		`SELECT LENGTH(label) AS n FROM files WHERE id = 1`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, _ := ragValue(rs.Rows[0], "n")
+	// 5 characters; "é" is 2 UTF-8 bytes, so a byte count would wrongly give 6.
+	expectInt(t, n, 5, "LENGTH(TEXT)")
+}
+
+// TestLengthOnGeometryColumnCountsJSONText documents behaviour the LENGTH fix
+// must not change. A GEOMETRY column populated through an importer (unlike a
+// plain INSERT, which stores a Go string) holds its value as json.RawMessage
+// — a named byte-slice type distinct from plain []byte — and renders as its
+// JSON text rather than a debug byte list. LENGTH must keep treating that as
+// text (character count of the JSON), not reinterpret it as a blob's byte
+// count now that plain []byte is special-cased.
+func TestLengthOnGeometryColumnCountsJSONText(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+	geojson := `{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[1,2]}}]}`
+	if _, err := importer.ImportGeoJSON(ctx, db, "default", "places", strings.NewReader(geojson), &importer.ImportOptions{TypeInference: true}); err != nil {
+		t.Fatal(err)
+	}
+	rs, err := Execute(ctx, db, "default", mustParse(`SELECT geometry, LENGTH(geometry) AS n FROM places`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	geom, ok := ragValue(rs.Rows[0], "geometry")
+	if !ok {
+		t.Fatal("geometry column missing from result")
+	}
+	if _, ok := geom.([]byte); ok {
+		t.Fatalf("geometry stored as plain []byte (%v); test assumes json.RawMessage to cover that type distinctly from BLOB", geom)
+	}
+	// Canonical form serializes keys alphabetically: {"coordinates":[1,2],"type":"Point"}
+	want := len(`{"coordinates":[1,2],"type":"Point"}`)
+	n, _ := ragValue(rs.Rows[0], "n")
+	expectInt(t, n, want, "LENGTH(GEOMETRY)")
 }
 
 // TestBlobSubstrDoesNotAliasSource checks the returned slice owns its bytes.

@@ -137,7 +137,12 @@ if ! $SKIP_BUILD; then
     # ── compile ──────────────────────────────────────────────────────────────
     echo "📦 Compiling Go → WASM (stripping debug info)…"
     # shellcheck disable=SC2086
-    GOOS=js GOARCH=wasm go build ${GOFLAGS:-} -trimpath -buildvcs=false -ldflags "-s -w" -o "$WASM_OUT" .
+    # no_http drops the SQL HTTP() builtin and its net/http/crypto/tls
+    # dependency graph: this demo's own UI never calls it, and it is the
+    # single largest avoidable slice of the compiled binary (~20% smaller
+    # raw and gzipped). Scoped to this build only -- see
+    # internal/engine/io_functions_http_disabled.go.
+    GOOS=js GOARCH=wasm go build ${GOFLAGS:-} -tags no_http -trimpath -buildvcs=false -ldflags "-s -w" -o "$WASM_OUT" .
     RAW_SIZE=$(filesize "$WASM_OUT")
     echo "   Compiled in $(elapsed $T0)  –  raw size: $(human "$RAW_SIZE")"
 
