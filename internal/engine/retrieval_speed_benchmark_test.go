@@ -52,6 +52,38 @@ func BenchmarkGeoGridCandidates(b *testing.B) {
 	}
 }
 
+// BenchmarkGeoGridOverflowCandidates measures candidatesBBox when every row is
+// an overflow row (a geometry whose own bbox spans more cells than
+// geoGridMaxCellsPerGeometry allows, e.g. one huge polygon sharing a table
+// with many small ones -- see buildGeoGridIndex). Each row's bbox is scattered
+// across the full extent, so a small local query window can only possibly
+// overlap a handful of them; the rest were previously added as candidates
+// unconditionally on every query regardless of locality.
+func BenchmarkGeoGridOverflowCandidates(b *testing.B) {
+	const numOverflow = 5000
+	idx := &geoGridIndex{
+		uniqueCells: true,
+		cells:       map[geoCellID][]int32{},
+		bounds:      geoEditBBox{MinX: -180, MinY: -90, MaxX: 180, MaxY: 90, Set: true},
+		cellSizeLon: 1, cellSizeLat: 1,
+		valid:     make([]bool, numOverflow),
+		bboxes:    make([]geoEditBBox, numOverflow),
+		centroids: make([]geoPoint, numOverflow),
+	}
+	for i := 0; i < numOverflow; i++ {
+		lon := -180 + float64(i%360)
+		lat := -90 + float64(i%180)
+		idx.valid[i] = true
+		idx.bboxes[i] = geoEditBBox{MinX: lon, MinY: lat, MaxX: lon + 0.5, MaxY: lat + 0.5, Set: true}
+		idx.centroids[i] = geoPoint{Lon: lon + 0.25, Lat: lat + 0.25}
+		idx.overflow = append(idx.overflow, int32(i))
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		geoCandidateBenchmarkSink = idx.candidatesBBox(0, 0, 1, 1)
+	}
+}
+
 func BenchmarkGeoSearchWarm(b *testing.B) {
 	db := storage.NewDB()
 	if err := db.Put("default", geoSpeedTable(b, false)); err != nil {

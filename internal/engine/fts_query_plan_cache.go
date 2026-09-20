@@ -75,8 +75,16 @@ func publishFTSPreparedQueryCacheSnapshotLocked() {
 // prepareFTSQuery returns a corpus-bound, immutable query tree and the rows
 // it may match. cache must be the current document cache for table/cols.
 func prepareFTSQuery(tenant string, table *storage.Table, cols []int, query string, cache ftsDocCacheEntry) (*ftsQueryNode, ftsCandidates) {
+	return prepareFTSQueryKeyed(tenant, table, ftsColsCacheKey(cols), query, cache)
+}
+
+// prepareFTSQueryKeyed is prepareFTSQuery with colsKey already computed by
+// the caller — see getFTSDocCacheKeyed's doc comment for why callers on the
+// hot retrieval path thread one computed key through both caches instead of
+// recomputing it here from cols.
+func prepareFTSQueryKeyed(tenant string, table *storage.Table, colsKey string, query string, cache ftsDocCacheEntry) (*ftsQueryNode, ftsCandidates) {
 	key := ftsPreparedQueryCacheKey{
-		doc:   ftsDocCacheKey{tenant: tenant, table: table.Name, cols: ftsColsCacheKey(cols)},
+		doc:   ftsDocCacheKey{tenant: tenant, table: table.Name, cols: colsKey},
 		query: query,
 	}
 

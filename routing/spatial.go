@@ -3,7 +3,7 @@ package routing
 import (
 	"context"
 	"math"
-	"sort"
+	"slices"
 )
 
 type bvhNode struct {
@@ -47,12 +47,24 @@ func (r *Router) buildSpatial() {
 			}
 		}
 		order := r.spatialOrder[start:end]
-		sort.Slice(order, func(i, j int) bool {
-			a, b := center(order[i]), center(order[j])
-			if a == b {
-				return order[i] < order[j]
+		// slices.SortFunc dispatches through generics instead of sort.Slice's
+		// reflection-based Swapper, which allocated on every recursive build
+		// call regardless of slice size. Same algorithm, same center-value/
+		// segment-ID tie-break comparator, purely a like-for-like API swap.
+		slices.SortFunc(order, func(x, y int) int {
+			a, b := center(x), center(y)
+			switch {
+			case a < b:
+				return -1
+			case a > b:
+				return 1
+			case x < y:
+				return -1
+			case x > y:
+				return 1
+			default:
+				return 0
 			}
-			return a < b
 		})
 		mid := (start + end) / 2
 		left, right := build(start, mid), build(mid, end)

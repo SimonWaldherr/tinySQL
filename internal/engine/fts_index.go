@@ -456,6 +456,7 @@ func ftsBindIDF(node *ftsQueryNode, idf ftsIDFFunc, termIDs map[string]int32) *f
 				for i, term := range terms {
 					bound.termIDNs[i], bound.termIDFs[i] = lookup(term), idf(term)
 				}
+				bound.orTermsBound = terms
 			}
 		}
 		return bound
@@ -772,7 +773,13 @@ func ftsDisjunctionTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQu
 		}
 		return ftsTopKFromHeap(&h, k), nil
 	}
-	terms, _ := ftsLiteralORTerms(node)
+	// node was produced by ftsBindIDF's OR branch (both callers of this
+	// function guard on len(node.termIDNs) > 0, which only that branch sets),
+	// so its literal-OR term list is already cached on orTermsBound. Reading
+	// it directly avoids re-walking the query tree — allocating a fresh
+	// slice at every OR level — for a list ftsBindIDF already computed once
+	// to build termIDNs/termIDFs above.
+	terms := node.orTermsBound
 	order := make([]int, len(terms))
 	for i := range order {
 		order[i] = i
@@ -780,6 +787,9 @@ func ftsDisjunctionTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQu
 	sort.Slice(order, func(i, j int) bool { return node.termIDFs[order[i]] > node.termIDFs[order[j]] })
 	winners := make(map[int]float64)
 	merged := make(ftsScoredHeap, 0, k)
+	// Reused across the term loop below (reset to length 0, capacity
+	// retained) instead of allocating a fresh top-k heap for every OR term.
+	var local ftsScoredHeap
 	// BM25's frequency factor is bounded by k1+1. Round the bound upward
 	// through each floating-point operation; strict comparison preserves ties.
 	factor := bm25K1 + 1
@@ -795,7 +805,7 @@ func ftsDisjunctionTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQu
 		if err := checkCtx(ctx); err != nil {
 			return nil, err
 		}
-		local := make(ftsScoredHeap, 0, min(k, len(cache.postings[term])))
+		local = local[:0]
 		if err := ftsTermPostingTopK(ctx, &cache, term, node.termIDNs[i], node.termIDFs[i], k, &local, allowed); err != nil {
 			return nil, err
 		}

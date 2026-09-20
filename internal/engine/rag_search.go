@@ -519,17 +519,23 @@ func ragFuseNativeCandidates(table *storage.Table, vecRows []vecScoredRow, ftsRo
 func materializeRAGFusedCandidates(table *storage.Table, ordered ragNativeCandidates, metric string) *ResultSet {
 
 	cols := make([]string, 0, len(table.Cols)+7)
-	for _, column := range table.Cols {
+	// Lower-cased once per column up front: table.Cols is loop-invariant
+	// across every fused row below, so ToLower-ing it per (row, column) pair
+	// redid the same string conversion len(ordered) times over. Mirrors
+	// materializeVecCandidates' identical hoist.
+	lowerCols := make([]string, len(table.Cols))
+	for i, column := range table.Cols {
 		cols = append(cols, column.Name)
+		lowerCols[i] = strings.ToLower(column.Name)
 	}
 	cols = append(cols, "_vec_rank", "_vec_distance", "_vec_similarity", "_fts_rank", "_fts_score", "_rrf_score", "_rrf_rank")
 	rows := make([]Row, 0, len(ordered))
 	for rank, candidate := range ordered {
 		source := table.Rows[candidate.rowIdx]
 		row := make(Row, len(cols))
-		for columnIndex, column := range table.Cols {
+		for columnIndex := range table.Cols {
 			if columnIndex < len(source) {
-				row[strings.ToLower(column.Name)] = source[columnIndex]
+				row[lowerCols[columnIndex]] = source[columnIndex]
 			}
 		}
 		if candidate.vecRank > 0 {

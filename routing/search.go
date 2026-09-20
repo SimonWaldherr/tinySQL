@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sync"
 )
 
 func validRadius(radius float64) error {
@@ -69,8 +70,60 @@ type partial struct {
 	cost, meters float64
 }
 
-// Route computes a fastest legal route, including partial first/last segments.
-// No prior answer, snapping result, or query scratch buffer is reused.
+// routeScratch holds one search's dense/sparse state tables, frontier heap,
+// and visited-record list. Two of these — dense and heuristics — are sized by
+// the whole graph's node count, not by how much of it a search actually
+// reaches, so on a large graph every Route call paid for two full-graph
+// allocations before this pool existed. acquireRouteScratch resets every
+// field before handing it back, so a request can never observe another
+// request's data — only the backing memory is reused, never any part of a
+// previous answer.
+type routeScratch struct {
+	records    []record
+	dense      []int
+	sparse     map[stateKey]int
+	heuristics []float64
+	heap       queue
+}
+
+var routeScratchPool = sync.Pool{
+	New: func() any { return new(routeScratch) },
+}
+
+// acquireRouteScratch returns a routeScratch sized for a graph of n nodes,
+// with every field reset to the same empty/zero state a fresh set of make()
+// calls would produce.
+func acquireRouteScratch(n int) *routeScratch {
+	s := routeScratchPool.Get().(*routeScratch)
+	if cap(s.dense) < n {
+		s.dense = make([]int, n)
+		s.heuristics = make([]float64, n)
+	} else {
+		s.dense = s.dense[:n]
+		s.heuristics = s.heuristics[:n]
+		clear(s.dense)
+		clear(s.heuristics)
+	}
+	if s.sparse == nil {
+		s.sparse = make(map[stateKey]int)
+	} else {
+		clear(s.sparse)
+	}
+	s.records = s.records[:0]
+	s.heap = s.heap[:0]
+	return s
+}
+
+func releaseRouteScratch(s *routeScratch) {
+	routeScratchPool.Put(s)
+}
+
+// Route computes a fastest legal route, including partial first/last
+// segments. No prior answer or snapping result is reused. Search-state
+// scratch memory (the dense/sparse state tables, frontier heap, and
+// visited-record list) is pooled across calls and fully reset before each
+// one — see routeScratch — so only that backing memory is ever reused, never
+// any part of a previous request's data.
 func (r *Router) Route(ctx context.Context, req Request) (Result, error) {
 	return r.route(ctx, req, true)
 }
@@ -112,11 +165,21 @@ func (r *Router) route(ctx context.Context, req Request, astar bool) (Result, er
 			bestMeters = math.Abs(delta) * startSeg.meters
 		}
 	}
-	records := make([]record, 0, min(len(r.nodes), 1024))
-	dense := make([]int, len(r.nodes))
-	sparse := make(map[stateKey]int)
-	heuristics := make([]float64, len(r.nodes))
-	heap := make(queue, 0, 256)
+	scratch := acquireRouteScratch(len(r.nodes))
+	records := scratch.records
+	dense := scratch.dense
+	sparse := scratch.sparse
+	heuristics := scratch.heuristics
+	heap := scratch.heap
+	defer func() {
+		// records/heap grow by append/push during the search below; write the
+		// (possibly reallocated, larger-capacity) slice headers back onto
+		// scratch so the next acquire from this pool inherits that capacity
+		// instead of only ever reusing the pool's initial small allocation.
+		scratch.records = records[:0]
+		scratch.heap = heap[:0]
+		releaseRouteScratch(scratch)
+	}()
 	goalXYZ := vector(to.Point)
 	heuristic := func(node int) float64 {
 		if !astar {

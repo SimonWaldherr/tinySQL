@@ -992,12 +992,12 @@ func ragFTSSearchCandidatesFiltered(ctx context.Context, tenant string, table *s
 	if filter.empty() {
 		return nil, nil
 	}
-	cache := getFTSDocCache(tenant, table, searchCols)
-	node, candidates := prepareFTSQuery(tenant, table, searchCols, query, cache)
+	colsKey := ftsColsCacheKey(searchCols)
+	cache := getFTSDocCacheKeyed(tenant, table, colsKey, searchCols)
+	node, candidates := prepareFTSQueryKeyed(tenant, table, colsKey, query, cache)
 	if node == nil {
 		return nil, nil
 	}
-	colsKey := ftsColsCacheKey(searchCols)
 	prepared := ragPrepareFilteredFTSQuery(table, colsKey, query, cache, node, candidates, filter)
 	if len(prepared.rows) == 0 {
 		return nil, nil

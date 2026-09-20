@@ -395,7 +395,13 @@ func ragExpandContextFrom(source, hits ragSource, docCol, chunkCol, hitDocCol, h
 }
 
 type ragSource struct {
-	cols        []string
+	cols []string
+	// lowerCols is cols lower-cased once at construction, for the tableSource
+	// path only (see ragSourceFromTable). outputRow is called once per
+	// emitted context/hit row, and cols is loop-invariant across all of
+	// them, so ToLower-ing it per (row, column) pair there redid the same
+	// string conversion for every context row returned.
+	lowerCols   []string
 	rows        []Row // CTE result rows
 	rawRows     [][]any
 	columnIdx   map[string]int
@@ -563,10 +569,13 @@ func ragLoadSource(env ExecEnv, name string) (ragSource, error) {
 func ragSourceFromTable(tenant string, table *storage.Table) ragSource {
 	cols := colNames(table.Cols)
 	columnIdx := make(map[string]int, len(table.Cols))
+	lowerCols := make([]string, len(table.Cols))
 	for i, col := range table.Cols {
-		columnIdx[strings.ToLower(col.Name)] = i
+		lower := strings.ToLower(col.Name)
+		columnIdx[lower] = i
+		lowerCols[i] = lower
 	}
-	return ragSource{cols: cols, rawRows: table.Rows, columnIdx: columnIdx, tableSource: true,
+	return ragSource{cols: cols, lowerCols: lowerCols, rawRows: table.Rows, columnIdx: columnIdx, tableSource: true,
 		tenant: tenant, table: table}
 }
 
@@ -597,8 +606,7 @@ func (source ragSource) outputRow(rowIndex int) Row {
 	}
 	out := make(Row, len(source.cols)+3)
 	raw := source.rawRows[rowIndex]
-	for i, col := range source.cols {
-		key := strings.ToLower(col)
+	for i, key := range source.lowerCols {
 		if i < len(raw) {
 			out[key] = raw[i]
 		} else {

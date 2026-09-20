@@ -15,6 +15,15 @@ type ruleNode struct {
 type automaton struct {
 	nodes []ruleNode
 	limit int
+	// rootNext is nodes[0].next flattened into a dense array indexed by edge
+	// ID, built once by finish(). step() walks up to the root state for the
+	// overwhelming majority of edges examined during a search — the common
+	// case is no active restriction history at all — so this one lookup
+	// dominated automaton.step with a hashmap probe per edge visited; array
+	// indexing replaces it for exactly that lookup. Every other state's
+	// transitions stay on the map, since restriction states reached mid-route
+	// are rare and each map is small.
+	rootNext []int
 }
 
 func (a *automaton) prefix(edges []int) (int, error) {
@@ -88,6 +97,19 @@ func (a *automaton) finish() {
 			queue = append(queue, child)
 		}
 	}
+	if len(a.nodes[0].next) == 0 {
+		return
+	}
+	maxEdge := 0
+	for edge := range a.nodes[0].next {
+		if edge > maxEdge {
+			maxEdge = edge
+		}
+	}
+	a.rootNext = make([]int, maxEdge+1)
+	for edge, next := range a.nodes[0].next {
+		a.rootNext[edge] = next
+	}
 }
 
 // step carries the relevant restriction history through the search state.
@@ -107,7 +129,14 @@ func (a *automaton) step(state, edge int) (int, bool) {
 		}
 		at = a.nodes[at].fail
 	}
-	next := a.nodes[at].next[edge]
+	var next int
+	if at == 0 {
+		if edge >= 0 && edge < len(a.rootNext) {
+			next = a.rootNext[edge]
+		}
+	} else {
+		next = a.nodes[at].next[edge]
+	}
 	for at := next; at != 0; at = a.nodes[at].fail {
 		if a.nodes[at].banned {
 			return 0, false

@@ -432,6 +432,16 @@ type ftsQueryNode struct {
 	orTermsComputed bool
 	orTermsOK       bool
 	orTerms         []string
+
+	// orTermsBound caches the literal-OR term list ftsBindIDF already computed
+	// (to build termIDNs/termIDFs below) on the synthesized OR node it
+	// returns. ftsDisjunctionTopK reads this directly instead of re-deriving
+	// the identical list via ftsLiteralORTerms's allocating tree recursion on
+	// every disjunctive top-k query. Kept separate from orTerms/orTermsComputed
+	// above (parse-time only, see ftsRootLiteralORTerms) so that function's
+	// "a node synthesized elsewhere has no decomposition" contract for every
+	// other caller stays exactly as documented.
+	orTermsBound []string
 }
 
 type ftsWildcardAtom struct {
@@ -1879,7 +1889,17 @@ func ftsBuildPackedPostings(index *storage.FTSIndex, terms []string, sizes []int
 // stats) for the given column set, (re)building them if the table has
 // changed since the last call.
 func getFTSDocCache(tenant string, table *storage.Table, cols []int) ftsDocCacheEntry {
-	key := ftsDocCacheKey{tenant: tenant, table: table.Name, cols: ftsColsCacheKey(cols)}
+	return getFTSDocCacheKeyed(tenant, table, ftsColsCacheKey(cols), cols)
+}
+
+// getFTSDocCacheKeyed is getFTSDocCache with colsKey already computed by the
+// caller. ftsSearchCandidates and ragFTSSearchCandidatesFiltered need the
+// same (tenant, table, cols) cache-key identity here, in prepareFTSQuery's
+// plan cache, and (filtered path only) in the filtered-query cache — so
+// computing ftsColsCacheKey once and threading it through avoids rebuilding
+// the identical key string two or three times per retrieval.
+func getFTSDocCacheKeyed(tenant string, table *storage.Table, colsKey string, cols []int) ftsDocCacheEntry {
+	key := ftsDocCacheKey{tenant: tenant, table: table.Name, cols: colsKey}
 
 	// Lock-free fast path for the warm, unchanged corpus — the common case on
 	// every repeated question. A miss (or a stale entry) falls through to the
@@ -2296,8 +2316,9 @@ func (f *FTSSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 // copying source rows. RAG_SEARCH consumes this compact form directly; the
 // public FTS_SEARCH table function materializes the same result afterward.
 func ftsSearchCandidates(ctx context.Context, tenant string, table *storage.Table, query string, k int, searchCols []int) ([]ftsScored, error) {
-	cache := getFTSDocCache(tenant, table, searchCols)
-	node, candidates := prepareFTSQuery(tenant, table, searchCols, query, cache)
+	colsKey := ftsColsCacheKey(searchCols)
+	cache := getFTSDocCacheKeyed(tenant, table, colsKey, searchCols)
+	node, candidates := prepareFTSQueryKeyed(tenant, table, colsKey, query, cache)
 	if node == nil {
 		// Empty or all-stopword query matches nothing. Without this guard every
 		// valid document scores 0 (ftsScoreNode(nil,...) == 0) and k arbitrary

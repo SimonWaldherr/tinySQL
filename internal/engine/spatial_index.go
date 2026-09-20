@@ -364,7 +364,34 @@ func (idx *geoGridIndex) candidatesBBox(minLon, minLat, maxLon, maxLat float64) 
 			}
 		}
 	}
-	addRows(idx.overflow)
+	// Overflow rows sit outside cell-based indexing entirely, so every query
+	// used to add all of them as candidates unconditionally, even ones whose
+	// own stored bbox (already computed once at build time) cannot possibly
+	// overlap this query window. Rejecting those here first is a pure
+	// narrowing of an already-superset candidate list — using the same
+	// rectangle test the final exact residual check performs anyway — so it
+	// cannot drop a true match, only skip overflow rows the residual check
+	// would have rejected regardless. Computed once and reused below, where
+	// the sparse-column path re-bases out's capacity around the overflow set.
+	var overflowHits []int32
+	if len(idx.overflow) > 0 {
+		overflowHits = idx.overflow[:0:0]
+		for _, row := range idx.overflow {
+			// A row without a recorded bbox (out of range for a hand-built or
+			// otherwise partial index) cannot be narrowed safely, so it stays
+			// a candidate — the same fail-open rule !b.Set already applies to
+			// a recorded-but-empty bbox below.
+			if int(row) < 0 || int(row) >= len(idx.bboxes) {
+				overflowHits = append(overflowHits, row)
+				continue
+			}
+			b := idx.bboxes[row]
+			if !b.Set || (b.MaxX >= minLon && b.MinX <= maxLon && b.MaxY >= minLat && b.MinY <= maxLat) {
+				overflowHits = append(overflowHits, row)
+			}
+		}
+		addRows(overflowHits)
+	}
 	// Broad windows over clustered data can cover many empty cells. Scan the
 	// occupied keys when that is cheaper than probing the entire rectangle.
 	// Keep direct lookup for selective windows; the exact residual and final
@@ -375,7 +402,7 @@ func (idx *geoGridIndex) candidatesBBox(minLon, minLat, maxLon, maxLat float64) 
 		// layers allocate their result once; polygon layers retain deduplication.
 		var scratch [64][]geoGridColumnCell
 		spans := scratch[:0]
-		total := len(idx.overflow)
+		total := len(overflowHits)
 		for c := start; c < len(idx.columns) && idx.columns[c].x <= maxCX; c++ {
 			cells := idx.columns[c].cells
 			lo := sort.Search(len(cells), func(i int) bool { return cells[i].y >= minCY })
@@ -390,7 +417,7 @@ func (idx *geoGridIndex) candidatesBBox(minLon, minLat, maxLon, maxLat float64) 
 		}
 		if idx.uniqueCells {
 			out = make([]int32, 0, total)
-			out = append(out, idx.overflow...)
+			out = append(out, overflowHits...)
 		}
 		for _, span := range spans {
 			for _, cell := range span {

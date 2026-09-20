@@ -203,6 +203,12 @@ type vecHNSWScratch struct {
 	candidates vecMinScoredHeap
 	results    vecScoredHeap
 	touched    []int
+	// pruneScored backs pruneHNSWNeighbors' per-neighbor distance scoring.
+	// addHNSWLink calls it on essentially every link insertion during the
+	// sequential build loop, so reusing this buffer (reset to length 0,
+	// capacity retained — bounded by vecHNSWM+1) avoids one small allocation
+	// per insertion, same rationale as candidates/results/touched above.
+	pruneScored []vecScoredRow
 }
 
 var vecHNSWScratchPool = sync.Pool{
@@ -385,6 +391,11 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 	// reallocating nlist*dims floats per pass.
 	sums := make([]float64, nlist*dims)
 	counts := make([]int, nlist)
+	// Resolved once: metric is fixed for the whole build, and resolveRow lets
+	// each row below pay for one overrides/segment lookup instead of the two
+	// (cache.vector, then rowNormFor->cache.normAt) that nearestCentroid's
+	// separate vector/norm arguments used to require.
+	needNorm := metricNeedsNorms(metric)
 	for iter := 0; iter < vecIVFKMeansIters; iter++ {
 		if err := checkCtx(ctx); err != nil {
 			return nil, err
@@ -398,10 +409,11 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 					return nil, err
 				}
 			}
-			c := nearestCentroid(metric, cache.vector(rowIdx), rowNormFor(metric, cache, rowIdx), idx.centroids, idx.centroidNorms)
+			vec, norm, _ := cache.resolveRow(rowIdx, needNorm)
+			c := nearestCentroid(metric, vec, norm, idx.centroids, idx.centroidNorms)
 			counts[c]++
 			base := c * dims
-			search.VectorAccumulate(sums[base:base+dims], cache.vector(rowIdx))
+			search.VectorAccumulate(sums[base:base+dims], vec)
 		}
 		for c := range idx.centroids {
 			// A centroid can end up with zero assigned rows this iteration
@@ -435,7 +447,8 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 				return nil, err
 			}
 		}
-		c := nearestCentroid(metric, cache.vector(rowIdx), rowNormFor(metric, cache, rowIdx), idx.centroids, idx.centroidNorms)
+		vec, norm, _ := cache.resolveRow(rowIdx, needNorm)
+		c := nearestCentroid(metric, vec, norm, idx.centroids, idx.centroidNorms)
 		idx.lists[c] = append(idx.lists[c], rowIdx)
 	}
 	return idx, nil
@@ -825,7 +838,7 @@ func (idx *vecHNSWIndex) insertHNSWNode(rowIdx int, cache vecSearchColumnCacheEn
 		candidates := idx.searchLayer(query, queryNorm, current, vecHNSWEfConstruction, layer, cache, visited, scratch)
 		selected := selectHNSWNeighbors(candidates, vecHNSWM)
 		for _, nb := range selected {
-			idx.addHNSWLink(rowIdx, nb.rowIdx, layer, cache)
+			idx.addHNSWLink(rowIdx, nb.rowIdx, layer, cache, scratch)
 		}
 		if len(selected) > 0 {
 			current = selected[0].rowIdx
@@ -946,21 +959,21 @@ func (idx *vecHNSWIndex) searchLayer(query []float64, queryNorm float64, entry i
 	return topKFromHeap(results, ef)
 }
 
-func (idx *vecHNSWIndex) addHNSWLink(a, b, layer int, cache vecSearchColumnCacheEntry) {
+func (idx *vecHNSWIndex) addHNSWLink(a, b, layer int, cache vecSearchColumnCacheEntry, scratch *vecHNSWScratch) {
 	if a == b || !idx.hasLayer(a, layer) || !idx.hasLayer(b, layer) {
 		return
 	}
 	if !containsInt(idx.neighbors[a][layer], b) {
 		idx.neighbors[a][layer] = append(idx.neighbors[a][layer], b)
-		idx.pruneHNSWNeighbors(a, layer, cache)
+		idx.pruneHNSWNeighbors(a, layer, cache, scratch)
 	}
 	if !containsInt(idx.neighbors[b][layer], a) {
 		idx.neighbors[b][layer] = append(idx.neighbors[b][layer], a)
-		idx.pruneHNSWNeighbors(b, layer, cache)
+		idx.pruneHNSWNeighbors(b, layer, cache, scratch)
 	}
 }
 
-func (idx *vecHNSWIndex) pruneHNSWNeighbors(rowIdx, layer int, cache vecSearchColumnCacheEntry) {
+func (idx *vecHNSWIndex) pruneHNSWNeighbors(rowIdx, layer int, cache vecSearchColumnCacheEntry, scratch *vecHNSWScratch) {
 	nbs := idx.neighbors[rowIdx][layer]
 	if len(nbs) <= vecHNSWM {
 		return
@@ -980,7 +993,22 @@ func (idx *vecHNSWIndex) pruneHNSWNeighbors(rowIdx, layer int, cache vecSearchCo
 	// reproduces the exact ordering the old comparator computed, so which
 	// neighbors survive pruning — and therefore search results — is
 	// unchanged.
-	scored := make([]vecScoredRow, len(nbs))
+	//
+	// scored reuses scratch.pruneScored's backing array across calls (reset
+	// to length 0, capacity retained) instead of allocating fresh on nearly
+	// every link insertion during build; a nil scratch (only possible from a
+	// caller outside the pooled build/search paths) falls back to a local
+	// slice.
+	var scored []vecScoredRow
+	if scratch != nil {
+		scored = scratch.pruneScored[:0]
+		if cap(scored) < len(nbs) {
+			scored = make([]vecScoredRow, 0, len(nbs))
+		}
+		scored = scored[:len(nbs)]
+	} else {
+		scored = make([]vecScoredRow, len(nbs))
+	}
 	for i, nb := range nbs {
 		dist, ok := rowDistance(idx.metric, query, queryNorm, cache, nb)
 		if !ok {
@@ -999,6 +1027,9 @@ func (idx *vecHNSWIndex) pruneHNSWNeighbors(rowIdx, layer int, cache vecSearchCo
 	}
 	for i, sr := range scored {
 		nbs[i] = sr.rowIdx
+	}
+	if scratch != nil {
+		scratch.pruneScored = scored
 	}
 	idx.neighbors[rowIdx][layer] = nbs[:vecHNSWM]
 }
@@ -1054,11 +1085,16 @@ func rowNormFor(metric string, cache vecSearchColumnCacheEntry, rowIdx int) floa
 // every call site is internal graph/list traversal, never a value exposed
 // directly to a caller without first passing through
 // vecSearchTopKWithIndex's finalize step.
+//
+// It resolves the row through resolveRow instead of validAt+vector+normAt so
+// HNSW's searchLayer (called once per neighbor edge visited) and IVF's list
+// scan pay for one overrides/segment lookup per candidate instead of three.
 func rowDistance(metric string, query []float64, queryNorm float64, cache vecSearchColumnCacheEntry, rowIdx int) (float64, bool) {
-	if rowIdx < 0 || rowIdx >= cache.rowCount() || !cache.validAt(rowIdx) {
+	vec, norm, valid := cache.resolveRow(rowIdx, metricNeedsNorms(metric))
+	if !valid {
 		return 0, false
 	}
-	return search.VectorRankingDistance(metric, cache.vector(rowIdx), query, rowNormFor(metric, cache, rowIdx), queryNorm)
+	return search.VectorRankingDistance(metric, vec, query, norm, queryNorm)
 }
 
 func centroidNorms(centroids [][]float64) []float64 {
