@@ -23,6 +23,7 @@ package sqlval
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 )
@@ -31,8 +32,16 @@ import (
 // entering fmt for the types SQL values actually take. Scalar functions coerce
 // arguments to text with this on every call of every row; fmt's reflection walk
 // — and, for strings, its needless copy — dominated their profiles. Types
-// without a fast case (e.g. []byte, whose %v form is the decimal byte list)
-// fall back to fmt to keep output byte-identical.
+// without a fast case (e.g. plain []byte, whose %v form is the decimal byte
+// list) fall back to fmt to keep output byte-identical.
+//
+// json.RawMessage gets its own case rather than falling to fmt: whether fmt's
+// %v renders a named byte-slice type as its decimal byte list or as text is
+// not stable across Go versions (observed: go1.26.6 gives the former,
+// go1.27.1 the latter, for the exact same json.RawMessage value), and
+// GEOMETRY/JSON columns store their value as json.RawMessage. Converting it
+// directly to a string is also what "render the JSON text" actually means,
+// so this is a correctness fix as well as a fast path.
 func ValueText(v any) string {
 	switch s := v.(type) {
 	case string:
@@ -49,6 +58,8 @@ func ValueText(v any) string {
 			return "true"
 		}
 		return "false"
+	case json.RawMessage:
+		return string(s)
 	default:
 		return fmt.Sprintf("%v", v)
 	}
