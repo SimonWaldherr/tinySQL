@@ -515,6 +515,9 @@ func evalSubqueryExpr(env ExecEnv, ex *SubqueryExpr) (any, error) {
 }
 
 func evalUnary(env ExecEnv, ex *Unary, row Row) (any, error) {
+	if ex.folded != nil && !unaryOperandIsParameter(ex) {
+		return ex.folded, nil
+	}
 	v, err := evalExpr(env, ex.Expr, row)
 	if err != nil {
 		return nil, err

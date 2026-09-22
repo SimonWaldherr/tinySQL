@@ -18,8 +18,14 @@ const (
 
 	vecIVFKMeansIters = 3
 
-	vecHNSWM              = 12
-	vecHNSWEfConstruction = 48
+	// vecHNSWM is the number of links each inserted node selects, and the
+	// degree cap on layers >= 1; layer 0 allows vecHNSWM0 (see
+	// hnswMaxNeighbors). Together with vecHNSWEfConstruction and
+	// vecHNSWEfSearchMin these match pgvector's HNSW defaults.
+	vecHNSWM              = 16
+	vecHNSWM0             = 2 * vecHNSWM
+	vecHNSWEfConstruction = 64
+	vecHNSWEfSearchMin    = 40
 	vecHNSWMaxLevel       = 8
 
 	// vecIndexCacheMaxEntries bounds the IVF and HNSW caches — see the
@@ -162,10 +168,6 @@ var (
 	vecHNSWCache   = make(map[vecIndexCacheKey]*vecHNSWIndex)
 	// vecHNSWBuilds is vecIVFBuilds' counterpart for the HNSW cache.
 	vecHNSWBuilds = make(map[vecIndexCacheKey]*vecIndexBuildCall)
-
-	// vecVisitedPool recycles the per-search visited bitmaps so HNSW queries
-	// on large tables do not allocate len(rows) bytes per call.
-	vecVisitedPool sync.Pool
 )
 
 func init() {
@@ -189,26 +191,26 @@ func publishVecIVFCacheSnapshotLocked() {
 	vecIVFCacheSnapshot.Store(&snap)
 }
 
-// vecHNSWScratch holds the reusable candidate/result heaps and visited-touch
-// list for one HNSW traversal (one search() call, or the whole sequential
-// build loop). searchLayer runs once per graph layer visited during a
-// traversal, and previously allocated a fresh pair of heaps plus a touched-
-// node slice on every one of those calls — for a 12k-row build that added up
-// to tens of thousands of small allocations and made container/heap's
-// interface-dispatched Push/Pop the dominant CPU cost. Reusing the backing
-// arrays (reset to length 0, capacity retained) across calls, and across
-// pooled instances between queries, converges to zero steady-state
-// allocations for the traversal's own bookkeeping.
+// vecHNSWScratch holds the reusable candidate/result heaps for one HNSW
+// traversal (one search() call, or the whole sequential build loop).
+// searchLayer runs once per graph layer visited during a traversal and
+// insertHNSWNode prunes neighbor lists on nearly every insertion, so reusing
+// the backing arrays (reset to length 0, capacity retained) across calls,
+// and across pooled instances between queries, converges to zero
+// steady-state allocations for the traversal's own bookkeeping.
+//
+// results is also what searchLayer returns: the slice stays owned by the
+// scratch and is only valid until the next searchLayer call on it.
 type vecHNSWScratch struct {
 	candidates vecMinScoredHeap
 	results    vecScoredHeap
-	touched    []int
-	// pruneScored backs pruneHNSWNeighbors' per-neighbor distance scoring.
-	// addHNSWLink calls it on essentially every link insertion during the
-	// sequential build loop, so reusing this buffer (reset to length 0,
-	// capacity retained — bounded by vecHNSWM+1) avoids one small allocation
-	// per insertion, same rationale as candidates/results/touched above.
-	pruneScored []vecScoredRow
+	// selected backs insertHNSWNode's neighbor selection for the node being
+	// inserted; pruneScored/pruneSelected back the reverse-link pruning that
+	// runs while that selection is still being iterated, so they must stay
+	// separate buffers.
+	selected      []vecScoredRow
+	pruneScored   []vecScoredRow
+	pruneSelected []vecScoredRow
 }
 
 var vecHNSWScratchPool = sync.Pool{
@@ -223,29 +225,64 @@ func releaseHNSWScratch(s *vecHNSWScratch) {
 	vecHNSWScratchPool.Put(s)
 }
 
-func acquireVisited(n int) []bool {
-	if v, ok := vecVisitedPool.Get().([]bool); ok && cap(v) >= n {
-		v = v[:n]
-		clear(v)
-		return v
-	}
-	// Grow with slack (like append's own doubling growth) rather than
-	// exactly n: a caller whose required size creeps up by a little on
-	// every call — e.g. extendVecHNSWIndex, called once per single-row
-	// INSERT, with n following the table's row count up by one each time —
-	// would otherwise force a fresh allocation on every single call despite
-	// the pool existing, since the previous release's capacity is always
-	// exactly one short of what the next acquire needs. The extra
-	// capacity is never visible to callers (every acquireVisited caller
-	// only ever sees the v[:n] returned here), so this is purely an
-	// internal amortization, not a behavior change.
-	return make([]bool, n, n+n/2+64)
+// vecVisitedSet marks the rows one HNSW layer traversal has already scored.
+// A row counts as visited when its mark equals the current epoch, so starting
+// the next traversal is a single increment instead of clearing (or tracking
+// and un-marking) every touched row. That matters most for large tables: a
+// cleared []bool cost one memclr of len(rows) bytes per query even though a
+// search touches only a few hundred rows.
+type vecVisitedSet struct {
+	marks []uint32
+	epoch uint32
 }
 
-func releaseVisited(v []bool) {
-	if cap(v) > 0 {
-		vecVisitedPool.Put(v[:0]) //nolint:staticcheck // slice header, not pointer
+var vecVisitedPool = sync.Pool{
+	New: func() any { return new(vecVisitedSet) },
+}
+
+func acquireVisited(n int) *vecVisitedSet {
+	v := vecVisitedPool.Get().(*vecVisitedSet)
+	v.ensure(n)
+	return v
+}
+
+func releaseVisited(v *vecVisitedSet) {
+	vecVisitedPool.Put(v)
+}
+
+// ensure makes rows [0, n) addressable. Growing within capacity is safe
+// without clearing: marks beyond the old length were written in earlier
+// epochs, and epochs only increase. Allocation grows with slack (like
+// append's own doubling) because extendVecHNSWIndex, called once per
+// single-row INSERT, asks for one more row on every call.
+func (v *vecVisitedSet) ensure(n int) {
+	if n <= len(v.marks) {
+		return
 	}
+	if n <= cap(v.marks) {
+		v.marks = v.marks[:n]
+		return
+	}
+	v.marks = make([]uint32, n, n+n/2+64)
+	v.epoch = 0
+}
+
+// reset starts a new traversal in which every row reads as unvisited.
+func (v *vecVisitedSet) reset() {
+	v.epoch++
+	if v.epoch == 0 {
+		clear(v.marks[:cap(v.marks)])
+		v.epoch = 1
+	}
+}
+
+// visit marks row and reports whether it was unvisited in this traversal.
+func (v *vecVisitedSet) visit(row int) bool {
+	if uint(row) >= uint(len(v.marks)) || v.marks[row] == v.epoch {
+		return false
+	}
+	v.marks[row] = v.epoch
+	return true
 }
 
 func normalizeVecIndexMode(mode string) string {
@@ -721,7 +758,8 @@ func buildVecHNSWIndex(ctx context.Context, table *storage.Table, metric string,
 		neighbors:     make([][][]int, cache.rowCount()),
 	}
 
-	visited := make([]bool, cache.rowCount())
+	visited := acquireVisited(cache.rowCount())
+	defer releaseVisited(visited)
 	// The build loop is strictly sequential (single goroutine inserting one
 	// row at a time), so a single scratch instance can be reused across all
 	// insertions instead of round-tripping through the pool per row.
@@ -811,43 +849,151 @@ func extendVecHNSWIndex(ctx context.Context, idx *vecHNSWIndex, cache vecSearchC
 // this), and that rows below rowIdx are already fully inserted. Shared by
 // both, so a from-scratch build and an incremental extend grow the exact
 // same graph structure via the exact same logic.
-func (idx *vecHNSWIndex) insertHNSWNode(rowIdx int, cache vecSearchColumnCacheEntry, visited []bool, scratch *vecHNSWScratch) {
+//
+// This is Algorithm 1 of Malkov & Yashunin's HNSW paper: greedy descent to
+// the node's own top layer, then an efConstruction-wide beam search per
+// layer whose result is thinned by the neighbor-selection heuristic
+// (selectHNSWNeighbors) before the node is linked in both directions.
+func (idx *vecHNSWIndex) insertHNSWNode(rowIdx int, cache vecSearchColumnCacheEntry, visited *vecVisitedSet, scratch *vecHNSWScratch) {
 	level := hnswLevel(rowIdx)
 	idx.levels[rowIdx] = level
 	idx.neighbors[rowIdx] = make([][]int, level+1)
+	rows := newVecRowResolver(&cache, metricNeedsNorms(idx.metric))
+	query, queryNorm, ok := rows.resolve(rowIdx)
+	if !ok || (rows.needNorm && queryNorm == 0) {
+		// A zero vector has no cosine distance to anything. Linking it would
+		// only add dead edges, and making it the entry point would leave
+		// every later insert and search unable to score its starting node.
+		return
+	}
 	if idx.entry < 0 {
 		idx.entry = rowIdx
 		idx.maxLevel = level
 		return
 	}
-
+	scorer := newVecHNSWScorer(idx.metric, query, queryNorm, rows)
 	current := idx.entry
-	query := cache.vector(rowIdx)
-	queryNorm := rowNormFor(idx.metric, cache, rowIdx)
+	currentDist, ok := scorer.distance(current)
+	if !ok {
+		return
+	}
 	for layer := idx.maxLevel; layer > level; layer-- {
-		best := idx.searchLayer(query, queryNorm, current, 1, layer, cache, visited, scratch)
-		if len(best) > 0 {
-			current = best[0].rowIdx
+		current, currentDist = idx.greedyClosest(&scorer, current, currentDist, layer)
+	}
+	for layer := min(level, idx.maxLevel); layer >= 0; layer-- {
+		candidates := idx.searchLayer(&scorer, current, currentDist, vecHNSWEfConstruction, layer, visited, scratch)
+		if len(candidates) == 0 {
+			continue
 		}
-	}
-	upper := level
-	if idx.maxLevel < upper {
-		upper = idx.maxLevel
-	}
-	for layer := upper; layer >= 0; layer-- {
-		candidates := idx.searchLayer(query, queryNorm, current, vecHNSWEfConstruction, layer, cache, visited, scratch)
-		selected := selectHNSWNeighbors(candidates, vecHNSWM)
+		current, currentDist = candidates[0].rowIdx, candidates[0].distance
+		selected := selectHNSWNeighbors(&scorer, candidates, vecHNSWM, &scratch.selected)
+		// Reserve room for the reverse links later inserts add, so filling
+		// a list up to its cap never reallocates it.
+		links := make([]int, len(selected), hnswMaxNeighbors(layer)+1)
+		for i, nb := range selected {
+			links[i] = nb.rowIdx
+		}
+		idx.neighbors[rowIdx][layer] = links
 		for _, nb := range selected {
-			idx.addHNSWLink(rowIdx, nb.rowIdx, layer, cache, scratch)
-		}
-		if len(selected) > 0 {
-			current = selected[0].rowIdx
+			idx.addHNSWReverseLink(&scorer, nb.rowIdx, rowIdx, nb.distance, layer, scratch)
 		}
 	}
 	if level > idx.maxLevel {
 		idx.entry = rowIdx
 		idx.maxLevel = level
 	}
+}
+
+// addHNSWReverseLink links from -> to on layer, where dist is their distance
+// (every supported metric is symmetric, so the inserting node's distance to
+// from is reused). A list already at its cap is re-thinned with the same
+// heuristic that selected it, over its current members plus the new one.
+func (idx *vecHNSWIndex) addHNSWReverseLink(s *vecHNSWScorer, from, to int, dist float64, layer int, scratch *vecHNSWScratch) {
+	if from == to || !idx.hasLayer(from, layer) {
+		return
+	}
+	nbs := idx.neighbors[from][layer]
+	maxNeighbors := hnswMaxNeighbors(layer)
+	if len(nbs) < maxNeighbors {
+		idx.neighbors[from][layer] = append(nbs, to)
+		return
+	}
+	fromVec, fromNorm, ok := s.rows.resolve(from)
+	if !ok {
+		return
+	}
+	scored := append(scratch.pruneScored[:0], vecScoredRow{rowIdx: to, distance: dist})
+	for _, nb := range nbs {
+		d, ok := s.distanceBetween(fromVec, fromNorm, nb)
+		if !ok {
+			d = math.Inf(1)
+		}
+		scored = append(scored, vecScoredRow{rowIdx: nb, distance: d})
+	}
+	// At most maxNeighbors+1 rows: insertion sort beats sort.Slice here.
+	for i := 1; i < len(scored); i++ {
+		v := scored[i]
+		j := i - 1
+		for j >= 0 && vecScoredRowLess(v, scored[j]) {
+			scored[j+1] = scored[j]
+			j--
+		}
+		scored[j+1] = v
+	}
+	scratch.pruneScored = scored
+	selected := selectHNSWNeighbors(s, scored, maxNeighbors, &scratch.pruneSelected)
+	nbs = nbs[:0]
+	for _, sr := range selected {
+		nbs = append(nbs, sr.rowIdx)
+	}
+	idx.neighbors[from][layer] = nbs
+}
+
+// selectHNSWNeighbors is the neighbor-selection heuristic of the HNSW paper
+// (Algorithm 4, as used by hnswlib and Faiss). candidates must be sorted
+// nearest first. A candidate is kept only if it is closer to the base node
+// than to every neighbor already kept, so a dense cluster contributes a few
+// representatives instead of all limit slots. Keeping the plain nearest
+// limit rows instead leaves clustered data as islands without edges between
+// them, where search cannot leave the cluster it entered.
+func selectHNSWNeighbors(s *vecHNSWScorer, candidates []vecScoredRow, limit int, buf *[]vecScoredRow) []vecScoredRow {
+	if len(candidates) <= limit {
+		return candidates
+	}
+	selected := (*buf)[:0]
+	// Each accepted neighbor is compared with every later candidate. Keep its
+	// resolved vector here instead of resolving the same row on every pair.
+	var vectorBuf [vecHNSWM0][]float64
+	var normBuf [vecHNSWM0]float64
+	vectors, norms := vectorBuf[:0], normBuf[:0]
+	if limit > len(vectorBuf) {
+		vectors = make([][]float64, 0, limit)
+		norms = make([]float64, 0, limit)
+	}
+	for _, c := range candidates {
+		if len(selected) >= limit {
+			break
+		}
+		vec, norm, ok := s.rows.resolve(c.rowIdx)
+		if !ok {
+			continue
+		}
+		keep := true
+		for i := range selected {
+			d, ok := vecRankingDistanceKind(s.kind, vectors[i], vec, norms[i], norm)
+			if ok && d < c.distance {
+				keep = false
+				break
+			}
+		}
+		if keep {
+			selected = append(selected, c)
+			vectors = append(vectors, vec)
+			norms = append(norms, norm)
+		}
+	}
+	*buf = selected
+	return selected
 }
 
 func (idx *vecHNSWIndex) search(ctx context.Context, query []float64, queryNorm float64, k int, cache vecSearchColumnCacheEntry) ([]vecScoredRow, error) {
@@ -860,22 +1006,19 @@ func (idx *vecHNSWIndex) search(ctx context.Context, query []float64, queryNorm 
 	if idx.entry < 0 {
 		return nil, nil
 	}
-	current := idx.entry
 	visited := acquireVisited(cache.rowCount())
 	defer releaseVisited(visited)
 	scratch := acquireHNSWScratch()
 	defer releaseHNSWScratch(scratch)
-	for layer := idx.maxLevel; layer > 0; layer-- {
-		if err := checkCtx(ctx); err != nil {
-			return nil, err
-		}
-		best := idx.searchLayer(query, queryNorm, current, 1, layer, cache, visited, scratch)
-		if len(best) > 0 {
-			current = best[0].rowIdx
-		}
+	scorer := newVecHNSWScorer(idx.metric, query, queryNorm, newVecRowResolver(&cache, metricNeedsNorms(idx.metric)))
+	candidates, err := idx.searchCandidates(ctx, &scorer, chooseHNSWEfSearch(k), visited, scratch)
+	if err != nil {
+		return nil, err
 	}
-	efSearch := chooseHNSWEfSearch(k)
-	candidates := idx.searchLayer(query, queryNorm, current, efSearch, 0, cache, visited, scratch)
+	if len(idx.deltaRows) == 0 && len(candidates) >= k {
+		// candidates is sorted nearest first and owned by scratch.
+		return append([]vecScoredRow(nil), candidates[:k]...), nil
+	}
 	resultHeap := newScoredHeap(k, len(candidates)+len(idx.deltaRows))
 	var seen map[int]struct{}
 	if len(idx.deltaRows) != 0 {
@@ -891,7 +1034,7 @@ func (idx *vecHNSWIndex) search(ctx context.Context, query []float64, queryNorm 
 		if _, duplicate := seen[rowIdx]; duplicate {
 			continue
 		}
-		distance, ok := rowDistance(idx.metric, query, queryNorm, cache, rowIdx)
+		distance, ok := scorer.distance(rowIdx)
 		if ok {
 			pushTopK(resultHeap, rowIdx, distance, k)
 		}
@@ -903,135 +1046,95 @@ func (idx *vecHNSWIndex) search(ctx context.Context, query []float64, queryNorm 
 	return topKFromHeap(resultHeap, k), nil
 }
 
-func (idx *vecHNSWIndex) searchLayer(query []float64, queryNorm float64, entry int, ef int, layer int, cache vecSearchColumnCacheEntry, visited []bool, scratch *vecHNSWScratch) []vecScoredRow {
+// searchCandidates descends greedily from the entry point to layer 1 and
+// returns layer 0's ef nearest rows, sorted nearest first and owned by
+// scratch. Shared by search and searchFiltered.
+func (idx *vecHNSWIndex) searchCandidates(ctx context.Context, s *vecHNSWScorer, ef int, visited *vecVisitedSet, scratch *vecHNSWScratch) ([]vecScoredRow, error) {
+	current := idx.entry
+	currentDist, ok := s.distance(current)
+	if !ok {
+		return nil, nil
+	}
+	for layer := idx.maxLevel; layer > 0; layer-- {
+		if err := checkCtx(ctx); err != nil {
+			return nil, err
+		}
+		current, currentDist = idx.greedyClosest(s, current, currentDist, layer)
+	}
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
+	}
+	return idx.searchLayer(s, current, currentDist, ef, 0, visited, scratch), nil
+}
+
+// greedyClosest walks layer from current to the nearest node reachable by
+// strictly improving moves. This is searchLayer with ef == 1, minus the
+// heaps and the visited set: distance strictly decreases on every move, so
+// the walk cannot cycle.
+func (idx *vecHNSWIndex) greedyClosest(s *vecHNSWScorer, current int, currentDist float64, layer int) (int, float64) {
+	for changed := true; changed; {
+		changed = false
+		for _, nb := range idx.neighborLayer(current, layer) {
+			d, ok := s.distance(nb)
+			if ok && vecScoredRowLess(vecScoredRow{rowIdx: nb, distance: d}, vecScoredRow{rowIdx: current, distance: currentDist}) {
+				current, currentDist, changed = nb, d, true
+			}
+		}
+	}
+	return current, currentDist
+}
+
+// searchLayer is the HNSW beam search (Algorithm 2): it returns the ef
+// nearest rows found on layer from entry, sorted nearest first. The slice is
+// scratch.results and is only valid until the next call with scratch.
+func (idx *vecHNSWIndex) searchLayer(s *vecHNSWScorer, entry int, entryDist float64, ef int, layer int, visited *vecVisitedSet, scratch *vecHNSWScratch) []vecScoredRow {
 	if entry < 0 || ef <= 0 || !idx.hasLayer(entry, layer) {
 		return nil
 	}
-	dist, ok := rowDistance(idx.metric, query, queryNorm, cache, entry)
-	if !ok {
-		return nil
-	}
-	if len(visited) < cache.rowCount() {
-		visited = make([]bool, cache.rowCount())
-	}
-	touched := scratch.touched[:0]
-	markVisited := func(rowIdx int) bool {
-		if rowIdx < 0 || rowIdx >= len(visited) || visited[rowIdx] {
-			return false
-		}
-		visited[rowIdx] = true
-		touched = append(touched, rowIdx)
-		return true
-	}
-	markVisited(entry)
-	defer func() {
-		for _, rowIdx := range touched {
-			visited[rowIdx] = false
-		}
-		scratch.touched = touched[:0]
-	}()
-	scratch.candidates = scratch.candidates[:0]
-	scratch.results = scratch.results[:0]
-	candidates := &scratch.candidates
-	results := &scratch.results
-	vecMinHeapPush(candidates, vecScoredRow{rowIdx: entry, distance: dist})
-	pushTopK(results, entry, dist, ef)
-
-	for candidates.Len() > 0 {
-		nearest := vecMinHeapPop(candidates)
-		if results.Len() >= ef && !vecScoredRowLess(nearest, (*results)[0]) {
+	visited.ensure(len(idx.neighbors))
+	visited.reset()
+	visited.visit(entry)
+	candidates := scratch.candidates[:0]
+	results := scratch.results[:0]
+	start := vecScoredRow{rowIdx: entry, distance: entryDist}
+	vecMinHeapPush(&candidates, start)
+	vecScoredHeapPush(&results, start)
+	for len(candidates) > 0 {
+		nearest := vecMinHeapPop(&candidates)
+		// Stop once the closest unexpanded candidate is farther than the
+		// worst result. A candidate that *is* the worst result must still be
+		// expanded: with ef == 1 the start node is both, and stopping on it
+		// would never move off the entry point.
+		if len(results) >= ef && vecScoredRowLess(results[0], nearest) {
 			break
 		}
 		for _, nb := range idx.neighborLayer(nearest.rowIdx, layer) {
-			if !markVisited(nb) {
+			if !visited.visit(nb) {
 				continue
 			}
-			dist, ok := rowDistance(idx.metric, query, queryNorm, cache, nb)
+			d, ok := s.distance(nb)
 			if !ok {
 				continue
 			}
-			if results.Len() < ef || vecScoredRowLess(vecScoredRow{rowIdx: nb, distance: dist}, (*results)[0]) {
-				vecMinHeapPush(candidates, vecScoredRow{rowIdx: nb, distance: dist})
-				pushTopK(results, nb, dist, ef)
+			cand := vecScoredRow{rowIdx: nb, distance: d}
+			if len(results) < ef {
+				vecMinHeapPush(&candidates, cand)
+				vecScoredHeapPush(&results, cand)
+			} else if vecScoredRowLess(cand, results[0]) {
+				vecMinHeapPush(&candidates, cand)
+				results[0] = cand
+				vecScoredHeapDown(results, 0)
 			}
 		}
 	}
-	return topKFromHeap(results, ef)
-}
-
-func (idx *vecHNSWIndex) addHNSWLink(a, b, layer int, cache vecSearchColumnCacheEntry, scratch *vecHNSWScratch) {
-	if a == b || !idx.hasLayer(a, layer) || !idx.hasLayer(b, layer) {
-		return
+	// Heap-sort in place: each step moves the current worst to the end.
+	for n := len(results) - 1; n > 0; n-- {
+		results[0], results[n] = results[n], results[0]
+		vecScoredHeapDown(results[:n], 0)
 	}
-	if !containsInt(idx.neighbors[a][layer], b) {
-		idx.neighbors[a][layer] = append(idx.neighbors[a][layer], b)
-		idx.pruneHNSWNeighbors(a, layer, cache, scratch)
-	}
-	if !containsInt(idx.neighbors[b][layer], a) {
-		idx.neighbors[b][layer] = append(idx.neighbors[b][layer], a)
-		idx.pruneHNSWNeighbors(b, layer, cache, scratch)
-	}
-}
-
-func (idx *vecHNSWIndex) pruneHNSWNeighbors(rowIdx, layer int, cache vecSearchColumnCacheEntry, scratch *vecHNSWScratch) {
-	nbs := idx.neighbors[rowIdx][layer]
-	if len(nbs) <= vecHNSWM {
-		return
-	}
-	query := cache.vector(rowIdx)
-	queryNorm := rowNormFor(idx.metric, cache, rowIdx)
-
-	// addHNSWLink calls this on essentially every link insertion during the
-	// sequential build loop, so this was the dominant cost of HNSW index
-	// construction: a sort.Slice comparator recomputed rowDistance twice per
-	// comparison (once for each side), on top of sort.Slice's own
-	// reflection-based Swapper overhead. Precompute each neighbor's distance
-	// once into a concrete vecScoredRow slice, then insertion-sort it in
-	// place — nbs is bounded to vecHNSWM+1 elements here, so insertion sort
-	// is both fast and avoids sort.Slice's overhead entirely.
-	// vecScoredRowLess (distance ascending, ties broken by rowIdx ascending)
-	// reproduces the exact ordering the old comparator computed, so which
-	// neighbors survive pruning — and therefore search results — is
-	// unchanged.
-	//
-	// scored reuses scratch.pruneScored's backing array across calls (reset
-	// to length 0, capacity retained) instead of allocating fresh on nearly
-	// every link insertion during build; a nil scratch (only possible from a
-	// caller outside the pooled build/search paths) falls back to a local
-	// slice.
-	var scored []vecScoredRow
-	if scratch != nil {
-		scored = scratch.pruneScored[:0]
-		if cap(scored) < len(nbs) {
-			scored = make([]vecScoredRow, 0, len(nbs))
-		}
-		scored = scored[:len(nbs)]
-	} else {
-		scored = make([]vecScoredRow, len(nbs))
-	}
-	for i, nb := range nbs {
-		dist, ok := rowDistance(idx.metric, query, queryNorm, cache, nb)
-		if !ok {
-			dist = math.Inf(1)
-		}
-		scored[i] = vecScoredRow{rowIdx: nb, distance: dist}
-	}
-	for i := 1; i < len(scored); i++ {
-		v := scored[i]
-		j := i - 1
-		for j >= 0 && vecScoredRowLess(v, scored[j]) {
-			scored[j+1] = scored[j]
-			j--
-		}
-		scored[j+1] = v
-	}
-	for i, sr := range scored {
-		nbs[i] = sr.rowIdx
-	}
-	if scratch != nil {
-		scratch.pruneScored = scored
-	}
-	idx.neighbors[rowIdx][layer] = nbs[:vecHNSWM]
+	scratch.candidates = candidates
+	scratch.results = results
+	return results
 }
 
 func (idx *vecHNSWIndex) hasLayer(rowIdx, layer int) bool {
@@ -1043,6 +1146,138 @@ func (idx *vecHNSWIndex) neighborLayer(rowIdx, layer int) []int {
 		return nil
 	}
 	return idx.neighbors[rowIdx][layer]
+}
+
+// hnswMaxNeighbors is the degree cap per layer. Layer 0 holds every node and
+// carries the final beam search, so it gets twice the links of the sparse
+// upper layers, as in the HNSW paper and hnswlib.
+func hnswMaxNeighbors(layer int) int {
+	if layer == 0 {
+		return vecHNSWM0
+	}
+	return vecHNSWM
+}
+
+// vecRowResolver is cache.resolveRow with a direct path for the common
+// read-only corpus: one contiguous segment and no UPDATE overrides (see
+// contiguousSegment). Graph traversal resolves one row per edge it follows,
+// so skipping the overrides-map probe and the segment binary search there
+// is measurable.
+type vecRowResolver struct {
+	cache    *vecSearchColumnCacheEntry
+	seg      *vecColumnSegment
+	needNorm bool
+}
+
+func newVecRowResolver(cache *vecSearchColumnCacheEntry, needNorm bool) vecRowResolver {
+	r := vecRowResolver{cache: cache, needNorm: needNorm}
+	if len(cache.overrides) == 0 && len(cache.segments) == 1 {
+		seg := &cache.segments[0]
+		if seg.start == 0 && len(seg.vectors) == cache.rows && len(seg.valid) == cache.rows &&
+			(!cache.normsReady || len(seg.norms) == cache.rows) {
+			r.seg = seg
+		}
+	}
+	return r
+}
+
+func (r *vecRowResolver) resolve(row int) (vec []float64, norm float64, valid bool) {
+	seg := r.seg
+	if seg == nil {
+		return r.cache.resolveRow(row, r.needNorm)
+	}
+	if uint(row) >= uint(len(seg.vectors)) || !seg.valid[row] {
+		return nil, 0, false
+	}
+	vec = seg.vectors[row]
+	if !r.needNorm {
+		return vec, 0, true
+	}
+	if r.cache.normsReady {
+		return vec, seg.norms[row], true
+	}
+	return vec, vectorL2Norm(vec), true
+}
+
+const (
+	vecMetricUnknown = iota
+	vecMetricCosine
+	vecMetricL2
+	vecMetricManhattan
+	vecMetricDot
+)
+
+func vecMetricKind(metric string) int {
+	switch metric {
+	case "cosine":
+		return vecMetricCosine
+	case "l2":
+		return vecMetricL2
+	case "manhattan":
+		return vecMetricManhattan
+	case "dot":
+		return vecMetricDot
+	default:
+		return vecMetricUnknown
+	}
+}
+
+// vecHNSWScorer computes ranking distances (search.VectorRankingDistance,
+// argument order included, so values are bit-identical to the flat scan's)
+// from one query to graph rows, with the metric resolved once instead of per
+// edge. A NaN distance counts as unscorable, as it does in pushTopK.
+type vecHNSWScorer struct {
+	rows      vecRowResolver
+	kind      int
+	query     []float64
+	queryNorm float64
+}
+
+func newVecHNSWScorer(metric string, query []float64, queryNorm float64, rows vecRowResolver) vecHNSWScorer {
+	return vecHNSWScorer{rows: rows, kind: vecMetricKind(metric), query: query, queryNorm: queryNorm}
+}
+
+func (s *vecHNSWScorer) distance(row int) (float64, bool) {
+	vec, norm, ok := s.rows.resolve(row)
+	if !ok {
+		return 0, false
+	}
+	return vecRankingDistanceKind(s.kind, vec, s.query, norm, s.queryNorm)
+}
+
+// distanceBetween scores row against another row's already-resolved vector.
+func (s *vecHNSWScorer) distanceBetween(vec []float64, norm float64, row int) (float64, bool) {
+	other, otherNorm, ok := s.rows.resolve(row)
+	if !ok {
+		return 0, false
+	}
+	return vecRankingDistanceKind(s.kind, other, vec, otherNorm, norm)
+}
+
+func vecRankingDistanceKind(kind int, a, b []float64, normA, normB float64) (float64, bool) {
+	if len(a) != len(b) {
+		return 0, false
+	}
+	var d float64
+	switch kind {
+	case vecMetricCosine:
+		if normA == 0 || normB == 0 {
+			return 0, false
+		}
+		d = 1.0 - search.VectorDot(a, b)/(normA*normB)
+	case vecMetricL2:
+		d = search.VectorL2Squared(a, b)
+	case vecMetricManhattan:
+		d = search.VectorL1Distance(a, b)
+	case vecMetricDot:
+		d = -search.VectorDot(a, b)
+	default:
+		return 0, false
+	}
+	if d != d {
+		return 0, false
+	}
+	return d, true
 }
 
 func validVectorRows(cache vecSearchColumnCacheEntry, dims int) []int {
@@ -1178,40 +1413,15 @@ func hnswLevel(rowIdx int) int {
 }
 
 // chooseHNSWEfSearch picks the graph-search beam width (ef) for a
-// requested top-k. Below a floor of 16 it widens the beam so tiny k still
-// gets a reasonable exploration budget; from 16 up it tracks k directly
-// (ef == k), same as it always has for k in that range.
+// requested top-k: k itself, but at least vecHNSWEfSearchMin so small k
+// still gets a useful exploration budget (a floor of 16 lost measurable
+// recall at k=10 on clustered corpora, for little latency saved).
 //
-// It used to also clamp ef to a ceiling of 64, which meant any k > 64 got
-// an ef strictly less than k. Since searchLayer's result set is bounded to
-// at most ef entries (see searchLayer below), that made
-// resultHeap.Len() < k in search() unconditionally true whenever k > 64,
-// so every such call fell through to vecSearchTopK's full flat scan —
-// paying for the graph traversal *and* the fallback, with the index
-// providing no benefit at all for k > 64 (e.g. top-100/200 reranking
-// queries). Dropping the ceiling and extending the existing ef == k
-// relationship past 64 lets the graph search return k results directly
-// for arbitrarily large k, exactly as it already did for k in [16, 64].
+// There is deliberately no ceiling. searchLayer returns at most ef rows, so
+// an ef below k would leave search() short of k results on every call and
+// send it to the full flat-scan fallback — paying for the graph traversal
+// *and* the scan, with the index providing no benefit for top-100/200
+// reranking queries.
 func chooseHNSWEfSearch(k int) int {
-	ef := k
-	if ef < 16 {
-		ef = 16
-	}
-	return ef
-}
-
-func selectHNSWNeighbors(candidates []vecScoredRow, limit int) []vecScoredRow {
-	if len(candidates) <= limit {
-		return candidates
-	}
-	return candidates[:limit]
-}
-
-func containsInt(values []int, needle int) bool {
-	for _, v := range values {
-		if v == needle {
-			return true
-		}
-	}
-	return false
+	return max(k, vecHNSWEfSearchMin)
 }

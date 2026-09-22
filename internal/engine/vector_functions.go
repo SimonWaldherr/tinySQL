@@ -96,6 +96,127 @@ func requireArgs(name string, ex *FuncCall, min, max int) error {
 	return nil
 }
 
+// funcArgs yields a function call's argument values: evaluated lazily through
+// evalExpr for the generic evaluator, or taken from values the raw executor
+// already computed (see evalRawVectorFunc). Handlers written against it share
+// one implementation, and therefore one set of error messages, between both
+// paths.
+//
+// The generic evaluator's env and row sit behind their own pointer on
+// purpose: escape analysis does not tell struct fields apart, so with env
+// inline (it flows to the heap through evalExpr) the raw path's stack buffer
+// behind vals would be heap-allocated on every row as well.
+type funcArgs struct {
+	ex    *FuncCall
+	vals  []any
+	scope *funcEvalScope
+}
+
+type funcEvalScope struct {
+	env ExecEnv
+	row Row
+}
+
+func newFuncArgs(env ExecEnv, ex *FuncCall, row Row) *funcArgs {
+	return &funcArgs{ex: ex, scope: &funcEvalScope{env: env, row: row}}
+}
+
+func (a *funcArgs) value(i int) (any, error) {
+	if a.scope == nil {
+		return a.vals[i], nil
+	}
+	return evalExpr(a.scope.env, a.ex.Args[i], a.scope.row)
+}
+
+// now is envNow for the call's environment. The raw executor runs without
+// one, exactly as its generic fallback calls handlers with ExecEnv{}.
+func (a *funcArgs) now() time.Time {
+	if a.scope == nil {
+		return envNow(ExecEnv{})
+	}
+	return envNow(a.scope.env)
+}
+
+// vector is toVec over argument i.
+func (a *funcArgs) vector(i int) ([]float64, error) {
+	v, err := a.value(i)
+	if err != nil {
+		return nil, err
+	}
+	return vecFromValue(v)
+}
+
+// vectorPair evaluates a two-vector function's arguments with its usual
+// "NAME argN: ..." errors.
+func (a *funcArgs) vectorPair(name string) ([]float64, []float64, error) {
+	x, err := a.vector(0)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s arg1: %w", name, err)
+	}
+	y, err := a.vector(1)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s arg2: %w", name, err)
+	}
+	return x, y, nil
+}
+
+// evalRawVectorFunc evaluates the vector distance and RAG scoring functions
+// for the raw fast path directly on their argument values. The generic raw
+// path wraps every argument in a pooled Literal and rebuilds the call for
+// each row; these functions run once per candidate row in RAG ranking
+// queries, where that wrapper cost more than a 64-dimension cosine itself.
+// Arguments are evaluated in order before the handler runs, exactly as the
+// generic raw path does, so results and errors are unchanged.
+func evalRawVectorFunc(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, bool, error) {
+	switch ex.Name {
+	case "VEC_DOT", "VEC_COSINE_SIMILARITY", "VEC_COSINE_DISTANCE", "VEC_L2_DISTANCE",
+		"VEC_MANHATTAN_DISTANCE", "VEC_DISTANCE", "VEC_HAMMING_DISTANCE",
+		"RECENCY_SCORE", "RAG_HYBRID_SCORE", "RAG_RANK_SCORE":
+	default:
+		return nil, false, nil
+	}
+	var buf [8]any
+	vals := buf[:0]
+	if len(ex.Args) > len(buf) {
+		vals = make([]any, 0, len(ex.Args))
+	}
+	for _, arg := range ex.Args {
+		v, err := evalRawExpr(plan, raw, arg)
+		if err != nil {
+			return nil, true, err
+		}
+		vals = append(vals, v)
+	}
+	// Direct calls, not a func-value table: an indirect call would make args
+	// (and the stack buffer behind vals) escape to the heap on every row.
+	args := funcArgs{ex: ex, vals: vals}
+	var v any
+	var err error
+	switch ex.Name {
+	case "VEC_DOT":
+		v, err = vecDotArgs(&args)
+	case "VEC_COSINE_SIMILARITY":
+		v, err = vecCosineSimilarityArgs(&args)
+	case "VEC_COSINE_DISTANCE":
+		v, err = vecCosineDistanceArgs(&args)
+	case "VEC_L2_DISTANCE":
+		v, err = vecL2DistanceArgs(&args)
+	case "VEC_MANHATTAN_DISTANCE":
+		v, err = vecManhattanDistanceArgs(&args)
+	case "VEC_DISTANCE":
+		v, err = vecDistanceArgs(&args)
+	case "VEC_HAMMING_DISTANCE":
+		v, err = vecHammingDistanceArgs(&args)
+	case "RECENCY_SCORE":
+		v, err = recencyScoreArgs(&args)
+	case "RAG_HYBRID_SCORE":
+		v, err = ragHybridScoreArgs(&args)
+	case "RAG_RANK_SCORE":
+		v, err = ragRankScoreArgs(&args)
+	}
+	return v, true, err
+}
+
 // ---------------------------------------------------------------------------
 // VEC_FROM_JSON – parse JSON array → vector
 // ---------------------------------------------------------------------------
@@ -324,16 +445,16 @@ func toFloat64(v any) (float64, error) {
 // ---------------------------------------------------------------------------
 
 func evalVecDot(env ExecEnv, ex *FuncCall, row Row) (any, error) {
-	if err := requireArgs("VEC_DOT", ex, 2, 2); err != nil {
+	return vecDotArgs(newFuncArgs(env, ex, row))
+}
+
+func vecDotArgs(args *funcArgs) (any, error) {
+	if err := requireArgs("VEC_DOT", args.ex, 2, 2); err != nil {
 		return nil, err
 	}
-	a, err := toVec(env, ex.Args[0], row)
+	a, b, err := args.vectorPair("VEC_DOT")
 	if err != nil {
-		return nil, fmt.Errorf("VEC_DOT arg1: %w", err)
-	}
-	b, err := toVec(env, ex.Args[1], row)
-	if err != nil {
-		return nil, fmt.Errorf("VEC_DOT arg2: %w", err)
+		return nil, err
 	}
 	if len(a) != len(b) {
 		return nil, fmt.Errorf("VEC_DOT: dimension mismatch %d vs %d", len(a), len(b))
@@ -346,16 +467,16 @@ func evalVecDot(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 // ---------------------------------------------------------------------------
 
 func evalVecCosineSimilarity(env ExecEnv, ex *FuncCall, row Row) (any, error) {
-	if err := requireArgs("VEC_COSINE_SIMILARITY", ex, 2, 2); err != nil {
+	return vecCosineSimilarityArgs(newFuncArgs(env, ex, row))
+}
+
+func vecCosineSimilarityArgs(args *funcArgs) (any, error) {
+	if err := requireArgs("VEC_COSINE_SIMILARITY", args.ex, 2, 2); err != nil {
 		return nil, err
 	}
-	a, err := toVec(env, ex.Args[0], row)
+	a, b, err := args.vectorPair("VEC_COSINE_SIMILARITY")
 	if err != nil {
-		return nil, fmt.Errorf("VEC_COSINE_SIMILARITY arg1: %w", err)
-	}
-	b, err := toVec(env, ex.Args[1], row)
-	if err != nil {
-		return nil, fmt.Errorf("VEC_COSINE_SIMILARITY arg2: %w", err)
+		return nil, err
 	}
 	sim, err := cosineSimilarity(a, b)
 	if err != nil {
@@ -381,16 +502,16 @@ func cosineSimilarity(a, b []float64) (float64, error) {
 // ---------------------------------------------------------------------------
 
 func evalVecCosineDistance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
-	if err := requireArgs("VEC_COSINE_DISTANCE", ex, 2, 2); err != nil {
+	return vecCosineDistanceArgs(newFuncArgs(env, ex, row))
+}
+
+func vecCosineDistanceArgs(args *funcArgs) (any, error) {
+	if err := requireArgs("VEC_COSINE_DISTANCE", args.ex, 2, 2); err != nil {
 		return nil, err
 	}
-	a, err := toVec(env, ex.Args[0], row)
+	a, b, err := args.vectorPair("VEC_COSINE_DISTANCE")
 	if err != nil {
-		return nil, fmt.Errorf("VEC_COSINE_DISTANCE arg1: %w", err)
-	}
-	b, err := toVec(env, ex.Args[1], row)
-	if err != nil {
-		return nil, fmt.Errorf("VEC_COSINE_DISTANCE arg2: %w", err)
+		return nil, err
 	}
 	sim, err := cosineSimilarity(a, b)
 	if err != nil {
@@ -404,16 +525,16 @@ func evalVecCosineDistance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 // ---------------------------------------------------------------------------
 
 func evalVecL2Distance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
-	if err := requireArgs("VEC_L2_DISTANCE", ex, 2, 2); err != nil {
+	return vecL2DistanceArgs(newFuncArgs(env, ex, row))
+}
+
+func vecL2DistanceArgs(args *funcArgs) (any, error) {
+	if err := requireArgs("VEC_L2_DISTANCE", args.ex, 2, 2); err != nil {
 		return nil, err
 	}
-	a, err := toVec(env, ex.Args[0], row)
+	a, b, err := args.vectorPair("VEC_L2_DISTANCE")
 	if err != nil {
-		return nil, fmt.Errorf("VEC_L2_DISTANCE arg1: %w", err)
-	}
-	b, err := toVec(env, ex.Args[1], row)
-	if err != nil {
-		return nil, fmt.Errorf("VEC_L2_DISTANCE arg2: %w", err)
+		return nil, err
 	}
 	if len(a) != len(b) {
 		return nil, fmt.Errorf("VEC_L2_DISTANCE: dimension mismatch %d vs %d", len(a), len(b))
@@ -426,16 +547,16 @@ func evalVecL2Distance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 // ---------------------------------------------------------------------------
 
 func evalVecManhattanDistance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
-	if err := requireArgs("VEC_MANHATTAN_DISTANCE", ex, 2, 2); err != nil {
+	return vecManhattanDistanceArgs(newFuncArgs(env, ex, row))
+}
+
+func vecManhattanDistanceArgs(args *funcArgs) (any, error) {
+	if err := requireArgs("VEC_MANHATTAN_DISTANCE", args.ex, 2, 2); err != nil {
 		return nil, err
 	}
-	a, err := toVec(env, ex.Args[0], row)
+	a, b, err := args.vectorPair("VEC_MANHATTAN_DISTANCE")
 	if err != nil {
-		return nil, fmt.Errorf("VEC_MANHATTAN_DISTANCE arg1: %w", err)
-	}
-	b, err := toVec(env, ex.Args[1], row)
-	if err != nil {
-		return nil, fmt.Errorf("VEC_MANHATTAN_DISTANCE arg2: %w", err)
+		return nil, err
 	}
 	if len(a) != len(b) {
 		return nil, fmt.Errorf("VEC_MANHATTAN_DISTANCE: dimension mismatch %d vs %d", len(a), len(b))
@@ -453,21 +574,21 @@ func evalVecManhattanDistance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 // ---------------------------------------------------------------------------
 
 func evalVecDistance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
-	if err := requireArgs("VEC_DISTANCE", ex, 2, 3); err != nil {
+	return vecDistanceArgs(newFuncArgs(env, ex, row))
+}
+
+func vecDistanceArgs(args *funcArgs) (any, error) {
+	if err := requireArgs("VEC_DISTANCE", args.ex, 2, 3); err != nil {
 		return nil, err
 	}
-	a, err := toVec(env, ex.Args[0], row)
+	a, b, err := args.vectorPair("VEC_DISTANCE")
 	if err != nil {
-		return nil, fmt.Errorf("VEC_DISTANCE arg1: %w", err)
-	}
-	b, err := toVec(env, ex.Args[1], row)
-	if err != nil {
-		return nil, fmt.Errorf("VEC_DISTANCE arg2: %w", err)
+		return nil, err
 	}
 
 	metric := "cosine"
-	if len(ex.Args) == 3 {
-		mv, err := evalExpr(env, ex.Args[2], row)
+	if len(args.ex.Args) == 3 {
+		mv, err := args.value(2)
 		if err != nil {
 			return nil, fmt.Errorf("VEC_DISTANCE metric: %w", err)
 		}
@@ -564,11 +685,16 @@ func toInt(v any) (int, error) { return sqlval.ToInt(v) }
 //   - half_life_days: positive numeric half-life in days
 //   - optional now: optional override timestamp for deterministic evaluation
 func evalRecencyScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return recencyScoreArgs(newFuncArgs(env, ex, row))
+}
+
+func recencyScoreArgs(args *funcArgs) (any, error) {
+	ex := args.ex
 	if err := requireArgs("RECENCY_SCORE", ex, 2, 3); err != nil {
 		return nil, err
 	}
 
-	tsVal, err := evalExpr(env, ex.Args[0], row)
+	tsVal, err := args.value(0)
 	if err != nil {
 		return nil, fmt.Errorf("RECENCY_SCORE ts: %w", err)
 	}
@@ -577,7 +703,7 @@ func evalRecencyScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return nil, fmt.Errorf("RECENCY_SCORE ts: %w", err)
 	}
 
-	halfLifeVal, err := evalExpr(env, ex.Args[1], row)
+	halfLifeVal, err := args.value(1)
 	if err != nil {
 		return nil, fmt.Errorf("RECENCY_SCORE half_life_days: %w", err)
 	}
@@ -589,9 +715,9 @@ func evalRecencyScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return nil, fmt.Errorf("RECENCY_SCORE half_life_days must be > 0, got %v", halfLifeDays)
 	}
 
-	now := envNow(env)
+	var now time.Time
 	if len(ex.Args) == 3 {
-		nowVal, err := evalExpr(env, ex.Args[2], row)
+		nowVal, err := args.value(2)
 		if err != nil {
 			return nil, fmt.Errorf("RECENCY_SCORE now: %w", err)
 		}
@@ -600,6 +726,10 @@ func evalRecencyScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 			return nil, fmt.Errorf("RECENCY_SCORE now: %w", err)
 		}
 		now = nowParsed
+	} else {
+		// Read the clock only when no explicit `now` was given: per row,
+		// time.Now() cost more than the decay formula itself.
+		now = args.now()
 	}
 
 	return recencyScore(ts, now, halfLifeDays), nil
@@ -611,11 +741,16 @@ func evalRecencyScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 // similarity_norm is computed as (similarity + 1) / 2 and clamped to [0,1],
 // useful for cosine similarity values in [-1, 1].
 func evalRAGHybridScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return ragHybridScoreArgs(newFuncArgs(env, ex, row))
+}
+
+func ragHybridScoreArgs(args *funcArgs) (any, error) {
+	ex := args.ex
 	if err := requireArgs("RAG_HYBRID_SCORE", ex, 3, 5); err != nil {
 		return nil, err
 	}
 
-	simRaw, err := evalExpr(env, ex.Args[0], row)
+	simRaw, err := args.value(0)
 	if err != nil {
 		return nil, fmt.Errorf("RAG_HYBRID_SCORE similarity: %w", err)
 	}
@@ -625,7 +760,7 @@ func evalRAGHybridScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	}
 	simNorm := clamp01((sim + 1.0) / 2.0)
 
-	tsVal, err := evalExpr(env, ex.Args[1], row)
+	tsVal, err := args.value(1)
 	if err != nil {
 		return nil, fmt.Errorf("RAG_HYBRID_SCORE ts: %w", err)
 	}
@@ -634,7 +769,7 @@ func evalRAGHybridScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return nil, fmt.Errorf("RAG_HYBRID_SCORE ts: %w", err)
 	}
 
-	halfLifeVal, err := evalExpr(env, ex.Args[2], row)
+	halfLifeVal, err := args.value(2)
 	if err != nil {
 		return nil, fmt.Errorf("RAG_HYBRID_SCORE half_life_days: %w", err)
 	}
@@ -648,7 +783,7 @@ func evalRAGHybridScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 
 	simWeight := 0.7
 	if len(ex.Args) >= 4 {
-		wVal, err := evalExpr(env, ex.Args[3], row)
+		wVal, err := args.value(3)
 		if err != nil {
 			return nil, fmt.Errorf("RAG_HYBRID_SCORE sim_weight: %w", err)
 		}
@@ -661,9 +796,9 @@ func evalRAGHybridScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		}
 	}
 
-	now := envNow(env)
+	var now time.Time
 	if len(ex.Args) >= 5 {
-		nowVal, err := evalExpr(env, ex.Args[4], row)
+		nowVal, err := args.value(4)
 		if err != nil {
 			return nil, fmt.Errorf("RAG_HYBRID_SCORE now: %w", err)
 		}
@@ -672,6 +807,8 @@ func evalRAGHybridScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 			return nil, fmt.Errorf("RAG_HYBRID_SCORE now: %w", err)
 		}
 		now = nowParsed
+	} else {
+		now = args.now()
 	}
 
 	return simWeight*simNorm + (1.0-simWeight)*recencyScore(ts, now, halfLifeDays), nil
@@ -681,11 +818,16 @@ func evalRAGHybridScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 // quality score. Weights are normalized by their sum, so callers can use either
 // fractions (0.65, 0.25, 0.10) or simple proportions (65, 25, 10).
 func evalRAGRankScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return ragRankScoreArgs(newFuncArgs(env, ex, row))
+}
+
+func ragRankScoreArgs(args *funcArgs) (any, error) {
+	ex := args.ex
 	if err := requireArgs("RAG_RANK_SCORE", ex, 4, 8); err != nil {
 		return nil, err
 	}
 
-	simRaw, err := evalExpr(env, ex.Args[0], row)
+	simRaw, err := args.value(0)
 	if err != nil {
 		return nil, fmt.Errorf("RAG_RANK_SCORE similarity: %w", err)
 	}
@@ -694,7 +836,7 @@ func evalRAGRankScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return nil, fmt.Errorf("RAG_RANK_SCORE similarity: %w", err)
 	}
 
-	tsVal, err := evalExpr(env, ex.Args[1], row)
+	tsVal, err := args.value(1)
 	if err != nil {
 		return nil, fmt.Errorf("RAG_RANK_SCORE ts: %w", err)
 	}
@@ -703,7 +845,7 @@ func evalRAGRankScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return nil, fmt.Errorf("RAG_RANK_SCORE ts: %w", err)
 	}
 
-	halfLifeVal, err := evalExpr(env, ex.Args[2], row)
+	halfLifeVal, err := args.value(2)
 	if err != nil {
 		return nil, fmt.Errorf("RAG_RANK_SCORE half_life_days: %w", err)
 	}
@@ -715,7 +857,7 @@ func evalRAGRankScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return nil, fmt.Errorf("RAG_RANK_SCORE half_life_days must be > 0, got %v", halfLifeDays)
 	}
 
-	qualityVal, err := evalExpr(env, ex.Args[3], row)
+	qualityVal, err := args.value(3)
 	if err != nil {
 		return nil, fmt.Errorf("RAG_RANK_SCORE quality: %w", err)
 	}
@@ -724,9 +866,9 @@ func evalRAGRankScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return nil, fmt.Errorf("RAG_RANK_SCORE quality: %w", err)
 	}
 
-	weights := []float64{0.65, 0.25, 0.10}
+	weights := [3]float64{0.65, 0.25, 0.10}
 	for i := 4; i < len(ex.Args) && i < 7; i++ {
-		weightVal, err := evalExpr(env, ex.Args[i], row)
+		weightVal, err := args.value(i)
 		if err != nil {
 			return nil, fmt.Errorf("RAG_RANK_SCORE weight %d: %w", i-3, err)
 		}
@@ -739,9 +881,9 @@ func evalRAGRankScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		}
 	}
 
-	now := envNow(env)
+	var now time.Time
 	if len(ex.Args) == 8 {
-		nowVal, err := evalExpr(env, ex.Args[7], row)
+		nowVal, err := args.value(7)
 		if err != nil {
 			return nil, fmt.Errorf("RAG_RANK_SCORE now: %w", err)
 		}
@@ -750,6 +892,8 @@ func evalRAGRankScore(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 			return nil, fmt.Errorf("RAG_RANK_SCORE now: %w", err)
 		}
 		now = nowParsed
+	} else {
+		now = args.now()
 	}
 
 	totalWeight := weights[0] + weights[1] + weights[2]
@@ -1102,16 +1246,16 @@ func evalVecBinaryQuantize(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 // ---------------------------------------------------------------------------
 
 func evalVecHammingDistance(env ExecEnv, ex *FuncCall, row Row) (any, error) {
-	if err := requireArgs("VEC_HAMMING_DISTANCE", ex, 2, 2); err != nil {
+	return vecHammingDistanceArgs(newFuncArgs(env, ex, row))
+}
+
+func vecHammingDistanceArgs(args *funcArgs) (any, error) {
+	if err := requireArgs("VEC_HAMMING_DISTANCE", args.ex, 2, 2); err != nil {
 		return nil, err
 	}
-	a, err := toVec(env, ex.Args[0], row)
+	a, b, err := args.vectorPair("VEC_HAMMING_DISTANCE")
 	if err != nil {
-		return nil, fmt.Errorf("VEC_HAMMING_DISTANCE arg1: %w", err)
-	}
-	b, err := toVec(env, ex.Args[1], row)
-	if err != nil {
-		return nil, fmt.Errorf("VEC_HAMMING_DISTANCE arg2: %w", err)
+		return nil, err
 	}
 	if len(a) != len(b) {
 		return nil, fmt.Errorf("VEC_HAMMING_DISTANCE: dimension mismatch %d vs %d", len(a), len(b))

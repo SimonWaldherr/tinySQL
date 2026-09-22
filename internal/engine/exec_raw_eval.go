@@ -440,6 +440,9 @@ func evalRawFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, erro
 		}
 		return evalRawExpr(plan, raw, ex.Args[branch])
 	}
+	if v, ok, err := evalRawVectorFunc(plan, raw, ex); ok {
+		return v, err
+	}
 	if len(ex.Args) == 1 && (ex.Name == "UPPER" || ex.Name == "LOWER") {
 		val, err := evalRawExpr(plan, raw, ex.Args[0])
 		if err != nil {
@@ -509,6 +512,9 @@ func rawRowToText(cols []int, raw []any) string {
 }
 
 func evalRawUnary(plan *simpleSelectPlan, raw []any, ex *Unary) (any, error) {
+	if ex.folded != nil && !unaryOperandIsParameter(ex) {
+		return ex.folded, nil
+	}
 	v, err := evalRawExpr(plan, raw, ex.Expr)
 	if err != nil {
 		return nil, err

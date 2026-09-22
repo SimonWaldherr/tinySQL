@@ -114,22 +114,15 @@ func (idx *vecHNSWIndex) searchFiltered(ctx context.Context, query []float64, qu
 	if idx.entry < 0 || k <= 0 {
 		return nil, nil
 	}
-	current := idx.entry
-	rowCount := cache.rowCount()
-	visited := acquireVisited(rowCount)
+	visited := acquireVisited(cache.rowCount())
 	defer releaseVisited(visited)
 	scratch := acquireHNSWScratch()
 	defer releaseHNSWScratch(scratch)
-	for layer := idx.maxLevel; layer > 0; layer-- {
-		if err := checkCtx(ctx); err != nil {
-			return nil, err
-		}
-		best := idx.searchLayer(query, queryNorm, current, 1, layer, cache, visited, scratch)
-		if len(best) > 0 {
-			current = best[0].rowIdx
-		}
+	scorer := newVecHNSWScorer(idx.metric, query, queryNorm, newVecRowResolver(&cache, metricNeedsNorms(idx.metric)))
+	candidates, err := idx.searchCandidates(ctx, &scorer, chooseHNSWEfSearch(k), visited, scratch)
+	if err != nil {
+		return nil, err
 	}
-	candidates := idx.searchLayer(query, queryNorm, current, chooseHNSWEfSearch(k), 0, cache, visited, scratch)
 	result := newScoredHeap(k, len(candidates))
 	for _, sr := range candidates {
 		pushTopK(result, sr.rowIdx, sr.distance, k)

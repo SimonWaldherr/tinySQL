@@ -26,6 +26,12 @@ type (
 	Unary struct {
 		Op   string
 		Expr Expr
+		// folded is the value of a sign operator applied directly to an int or
+		// float literal (`-1.0`), computed once by the parser so a per-row
+		// predicate such as `score > -1.0` does not box a fresh float64 on
+		// every evaluation. nil for other operands. Evaluation bypasses it
+		// if a caller later turns the literal into a bound parameter.
+		folded any
 	}
 	// Binary represents binary operators (+,-,*,/, comparisons, AND/OR).
 	Binary struct {

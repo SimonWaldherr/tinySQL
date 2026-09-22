@@ -29,7 +29,7 @@ func BenchmarkVectorDotNEONBySize(b *testing.B) {
 }
 
 func TestVectorDotNEONMatchesUnrolled(t *testing.T) {
-	for _, dims := range []int{0, 1, 7, 8, 31, 32, 64, 96, 127, 128, 768} {
+	for _, dims := range []int{0, 1, 7, 8, 15, 16, 17, 24, 25, 31, 32, 64, 96, 127, 128, 768} {
 		a, vecB := makeVectorMathBenchmarkInputs(dims)
 		got, want := vectorDotNEON(a, vecB), VectorDotUnrolled(a, vecB)
 		if math.Abs(got-want) > 1e-12*math.Max(1, math.Abs(want)) {
@@ -110,7 +110,7 @@ func BenchmarkVectorL1NEONBySize(b *testing.B) {
 }
 
 func TestVectorL1NEONMatchesUnrolled(t *testing.T) {
-	for _, dims := range []int{0, 1, 7, 8, 31, 32, 63, 64, 96, 127, 128, 768} {
+	for _, dims := range []int{0, 1, 7, 8, 15, 16, 17, 24, 25, 31, 32, 63, 64, 96, 127, 128, 768} {
 		a, vecB := makeVectorMathBenchmarkInputs(dims)
 		got, want := vectorL1NEON(a, vecB), VectorL1Unrolled(a, vecB)
 		if math.Abs(got-want) > 1e-12*math.Max(1, math.Abs(want)) {
@@ -153,7 +153,7 @@ func BenchmarkVectorAccumulateNEONBySize(b *testing.B) {
 }
 
 func TestVectorAccumulateNEONMatchesUnrolled(t *testing.T) {
-	for _, dims := range []int{0, 1, 7, 8, 31, 32, 63, 64, 96, 127, 128, 768} {
+	for _, dims := range []int{0, 1, 7, 8, 15, 16, 17, 24, 25, 31, 32, 63, 64, 96, 127, 128, 768} {
 		src, seed := makeVectorMathBenchmarkInputs(dims)
 		got := append([]float64(nil), seed...)
 		want := append([]float64(nil), seed...)
@@ -168,7 +168,7 @@ func TestVectorAccumulateNEONMatchesUnrolled(t *testing.T) {
 }
 
 func TestVectorCosineNEONMatchesUnrolled(t *testing.T) {
-	for _, dims := range []int{0, 1, 7, 8, 31, 32, 63, 64, 96, 127, 128, 768} {
+	for _, dims := range []int{0, 1, 7, 8, 15, 16, 17, 24, 25, 31, 32, 63, 64, 96, 127, 128, 768} {
 		a, vecB := makeVectorMathBenchmarkInputs(dims)
 		gotDot, gotNormA2, gotNormB2 := vectorCosineNEON(a, vecB)
 		wantDot, wantNormA2, wantNormB2 := VectorCosineUnrolled(a, vecB)
@@ -188,7 +188,7 @@ func TestVectorCosineNEONMatchesUnrolled(t *testing.T) {
 }
 
 func TestVectorL2SquaredNEONMatchesUnrolled(t *testing.T) {
-	for _, dims := range []int{0, 1, 7, 8, 31, 32, 63, 64, 96, 127, 128, 129, 768, 769} {
+	for _, dims := range []int{0, 1, 7, 8, 15, 16, 17, 24, 25, 31, 32, 63, 64, 96, 127, 128, 129, 768, 769} {
 		a, b := makeVectorMathBenchmarkInputs(dims)
 		got, want := vectorL2SquaredNEON(a, b), VectorL2SquaredUnrolled(a, b)
 		if math.IsNaN(got) || math.Abs(got-want) > 1e-12*math.Max(1, math.Abs(want)) {

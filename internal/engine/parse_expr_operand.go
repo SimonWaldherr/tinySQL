@@ -64,7 +64,7 @@ func (p *Parser) parseUnary() (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &Unary{Op: op, Expr: e}, nil
+		return newSignUnary(op, e), nil
 	}
 	if p.cur.Typ == tKeyword && p.cur.Val == "NOT" {
 		p.next()
@@ -75,6 +75,33 @@ func (p *Parser) parseUnary() (Expr, error) {
 		return &Unary{Op: "NOT", Expr: e}, nil
 	}
 	return p.parsePrimary()
+}
+
+// newSignUnary builds a unary +/- node, precomputing its value when the
+// operand is a plain numeric literal (see Unary.folded). Both evaluators
+// return float64 for int, int64 and float64 operands, so the folded value is
+// exactly what evaluation would produce. Prepared-statement markers are
+// string literals at parse time and are therefore never folded. A caller
+// that subsequently marks a numeric literal as a parameter bypasses this
+// cached value at evaluation time.
+func newSignUnary(op string, e Expr) *Unary {
+	u := &Unary{Op: op, Expr: e}
+	if lit, ok := e.(*Literal); ok && !lit.Parameter {
+		if f, ok := numeric(lit.Val); ok {
+			if op == "-" {
+				f = -f
+			}
+			u.folded = f
+		}
+	}
+	return u
+}
+
+// Callers may mark a parsed literal as a parameter and change its value
+// between executions. In that case the parse-time result is no longer valid.
+func unaryOperandIsParameter(u *Unary) bool {
+	lit, ok := u.Expr.(*Literal)
+	return ok && lit.Parameter
 }
 
 // numberLiteralIsFloat reports whether a tNumber token's text can only parse

@@ -10,7 +10,11 @@ import (
 // storage.Table.VectorIndexes.  It is deliberately independent from the
 // runtime graph type: old or corrupt topology is rejected and rebuilt rather
 // than ever being interpreted optimistically.
-const vecPersistentFormat = 1
+//
+// Format 2 marks graphs built with the neighbor-selection heuristic and the
+// doubled layer-0 degree. Format 1 graphs were built by a traversal that never
+// left the entry point on its upper layers, so they are rebuilt, not reused.
+const vecPersistentFormat = 2
 
 // vecPersistentHNSWHydrateHook is test-only instrumentation.  It stays nil
 // in production and lets the reopen regression test prove it used persisted
@@ -106,8 +110,8 @@ func usablePersistentVecHNSW(index *storage.VectorIndex, table *storage.Table, c
 		if len(layers) > index.Levels[row]+1 {
 			return false
 		}
-		for _, neighbors := range layers {
-			if len(neighbors) > vecHNSWM {
+		for layer, neighbors := range layers {
+			if len(neighbors) > hnswMaxNeighbors(layer) {
 				return false
 			}
 			for _, neighbor := range neighbors {
