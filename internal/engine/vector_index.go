@@ -429,9 +429,8 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 	sums := make([]float64, nlist*dims)
 	counts := make([]int, nlist)
 	// Resolved once: metric is fixed for the whole build, and resolveRow lets
-	// each row below pay for one overrides/segment lookup instead of the two
-	// (cache.vector, then rowNormFor->cache.normAt) that nearestCentroid's
-	// separate vector/norm arguments used to require.
+	// each row below pay for one overrides/segment lookup instead of separate
+	// cache.vector and cache.normAt lookups.
 	needNorm := metricNeedsNorms(metric)
 	for iter := 0; iter < vecIVFKMeansIters; iter++ {
 		if err := checkCtx(ctx); err != nil {
@@ -505,8 +504,8 @@ func (idx *vecIVFIndex) search(ctx context.Context, query []float64, queryNorm f
 	centroidHeap := newScoredHeap(len(idx.centroids), -1)
 	for i, c := range idx.centroids {
 		// Selecting which centroids to probe, not a value ever exposed to a
-		// caller — ranking-only distance is enough (see rowDistance below
-		// for the row-level equivalent).
+		// caller — ranking-only distance is enough (vecRowScorer uses the same
+		// for rows).
 		dist, ok := search.VectorRankingDistance(idx.metric, c, query, idx.centroidNorms[i], queryNorm)
 		if !ok {
 			continue
@@ -515,6 +514,7 @@ func (idx *vecIVFIndex) search(ctx context.Context, query []float64, queryNorm f
 	}
 	rankedCentroids := topKFromHeap(centroidHeap, len(idx.centroids))
 
+	scorer := newVecRowScorer(idx.metric, query, queryNorm, newVecRowResolver(&cache, metricNeedsNorms(idx.metric)))
 	resultHeap := newScoredHeap(k, -1)
 	for probed, c := range rankedCentroids {
 		// Past the probe budget, keep going only while short of k.
@@ -528,7 +528,7 @@ func (idx *vecIVFIndex) search(ctx context.Context, query []float64, queryNorm f
 					return nil, err
 				}
 			}
-			dist, ok := rowDistance(idx.metric, query, queryNorm, cache, rowIdx)
+			dist, ok := scorer.distance(rowIdx)
 			if ok {
 				pushTopK(resultHeap, rowIdx, dist, k)
 			}
@@ -871,7 +871,7 @@ func (idx *vecHNSWIndex) insertHNSWNode(rowIdx int, cache vecSearchColumnCacheEn
 		idx.maxLevel = level
 		return
 	}
-	scorer := newVecHNSWScorer(idx.metric, query, queryNorm, rows)
+	scorer := newVecRowScorer(idx.metric, query, queryNorm, rows)
 	current := idx.entry
 	currentDist, ok := scorer.distance(current)
 	if !ok {
@@ -908,7 +908,7 @@ func (idx *vecHNSWIndex) insertHNSWNode(rowIdx int, cache vecSearchColumnCacheEn
 // (every supported metric is symmetric, so the inserting node's distance to
 // from is reused). A list already at its cap is re-thinned with the same
 // heuristic that selected it, over its current members plus the new one.
-func (idx *vecHNSWIndex) addHNSWReverseLink(s *vecHNSWScorer, from, to int, dist float64, layer int, scratch *vecHNSWScratch) {
+func (idx *vecHNSWIndex) addHNSWReverseLink(s *vecRowScorer, from, to int, dist float64, layer int, scratch *vecHNSWScratch) {
 	if from == to || !idx.hasLayer(from, layer) {
 		return
 	}
@@ -956,7 +956,7 @@ func (idx *vecHNSWIndex) addHNSWReverseLink(s *vecHNSWScorer, from, to int, dist
 // representatives instead of all limit slots. Keeping the plain nearest
 // limit rows instead leaves clustered data as islands without edges between
 // them, where search cannot leave the cluster it entered.
-func selectHNSWNeighbors(s *vecHNSWScorer, candidates []vecScoredRow, limit int, buf *[]vecScoredRow) []vecScoredRow {
+func selectHNSWNeighbors(s *vecRowScorer, candidates []vecScoredRow, limit int, buf *[]vecScoredRow) []vecScoredRow {
 	if len(candidates) <= limit {
 		return candidates
 	}
@@ -1010,7 +1010,7 @@ func (idx *vecHNSWIndex) search(ctx context.Context, query []float64, queryNorm 
 	defer releaseVisited(visited)
 	scratch := acquireHNSWScratch()
 	defer releaseHNSWScratch(scratch)
-	scorer := newVecHNSWScorer(idx.metric, query, queryNorm, newVecRowResolver(&cache, metricNeedsNorms(idx.metric)))
+	scorer := newVecRowScorer(idx.metric, query, queryNorm, newVecRowResolver(&cache, metricNeedsNorms(idx.metric)))
 	candidates, err := idx.searchCandidates(ctx, &scorer, chooseHNSWEfSearch(k), visited, scratch)
 	if err != nil {
 		return nil, err
@@ -1049,7 +1049,7 @@ func (idx *vecHNSWIndex) search(ctx context.Context, query []float64, queryNorm 
 // searchCandidates descends greedily from the entry point to layer 1 and
 // returns layer 0's ef nearest rows, sorted nearest first and owned by
 // scratch. Shared by search and searchFiltered.
-func (idx *vecHNSWIndex) searchCandidates(ctx context.Context, s *vecHNSWScorer, ef int, visited *vecVisitedSet, scratch *vecHNSWScratch) ([]vecScoredRow, error) {
+func (idx *vecHNSWIndex) searchCandidates(ctx context.Context, s *vecRowScorer, ef int, visited *vecVisitedSet, scratch *vecHNSWScratch) ([]vecScoredRow, error) {
 	current := idx.entry
 	currentDist, ok := s.distance(current)
 	if !ok {
@@ -1071,7 +1071,7 @@ func (idx *vecHNSWIndex) searchCandidates(ctx context.Context, s *vecHNSWScorer,
 // strictly improving moves. This is searchLayer with ef == 1, minus the
 // heaps and the visited set: distance strictly decreases on every move, so
 // the walk cannot cycle.
-func (idx *vecHNSWIndex) greedyClosest(s *vecHNSWScorer, current int, currentDist float64, layer int) (int, float64) {
+func (idx *vecHNSWIndex) greedyClosest(s *vecRowScorer, current int, currentDist float64, layer int) (int, float64) {
 	for changed := true; changed; {
 		changed = false
 		for _, nb := range idx.neighborLayer(current, layer) {
@@ -1087,7 +1087,7 @@ func (idx *vecHNSWIndex) greedyClosest(s *vecHNSWScorer, current int, currentDis
 // searchLayer is the HNSW beam search (Algorithm 2): it returns the ef
 // nearest rows found on layer from entry, sorted nearest first. The slice is
 // scratch.results and is only valid until the next call with scratch.
-func (idx *vecHNSWIndex) searchLayer(s *vecHNSWScorer, entry int, entryDist float64, ef int, layer int, visited *vecVisitedSet, scratch *vecHNSWScratch) []vecScoredRow {
+func (idx *vecHNSWIndex) searchLayer(s *vecRowScorer, entry int, entryDist float64, ef int, layer int, visited *vecVisitedSet, scratch *vecHNSWScratch) []vecScoredRow {
 	if entry < 0 || ef <= 0 || !idx.hasLayer(entry, layer) {
 		return nil
 	}
@@ -1222,22 +1222,23 @@ func vecMetricKind(metric string) int {
 	}
 }
 
-// vecHNSWScorer computes ranking distances (search.VectorRankingDistance,
+// vecRowScorer computes ranking distances (search.VectorRankingDistance,
 // argument order included, so values are bit-identical to the flat scan's)
-// from one query to graph rows, with the metric resolved once instead of per
-// edge. A NaN distance counts as unscorable, as it does in pushTopK.
-type vecHNSWScorer struct {
+// from one query to cached rows, for HNSW traversal and IVF list scans, with
+// the metric resolved once instead of per row. A NaN distance counts as
+// unscorable, as it does in pushTopK.
+type vecRowScorer struct {
 	rows      vecRowResolver
 	kind      int
 	query     []float64
 	queryNorm float64
 }
 
-func newVecHNSWScorer(metric string, query []float64, queryNorm float64, rows vecRowResolver) vecHNSWScorer {
-	return vecHNSWScorer{rows: rows, kind: vecMetricKind(metric), query: query, queryNorm: queryNorm}
+func newVecRowScorer(metric string, query []float64, queryNorm float64, rows vecRowResolver) vecRowScorer {
+	return vecRowScorer{rows: rows, kind: vecMetricKind(metric), query: query, queryNorm: queryNorm}
 }
 
-func (s *vecHNSWScorer) distance(row int) (float64, bool) {
+func (s *vecRowScorer) distance(row int) (float64, bool) {
 	vec, norm, ok := s.rows.resolve(row)
 	if !ok {
 		return 0, false
@@ -1246,7 +1247,7 @@ func (s *vecHNSWScorer) distance(row int) (float64, bool) {
 }
 
 // distanceBetween scores row against another row's already-resolved vector.
-func (s *vecHNSWScorer) distanceBetween(vec []float64, norm float64, row int) (float64, bool) {
+func (s *vecRowScorer) distanceBetween(vec []float64, norm float64, row int) (float64, bool) {
 	other, otherNorm, ok := s.rows.resolve(row)
 	if !ok {
 		return 0, false
@@ -1294,42 +1295,11 @@ func validCacheRow(cache vecSearchColumnCacheEntry, rowIdx int, dims int) bool {
 	return rowIdx >= 0 && rowIdx < cache.rowCount() && cache.validAt(rowIdx) && len(cache.vector(rowIdx)) == dims
 }
 
-func rowNorm(cache vecSearchColumnCacheEntry, rowIdx int) float64 {
-	if rowIdx >= 0 && rowIdx < cache.rowCount() && cache.normsReady {
-		return cache.normAt(rowIdx)
-	}
-	return vectorL2Norm(cache.vector(rowIdx))
-}
-
 // metricNeedsNorms reports whether the metric consumes vector norms.
 // Only cosine does; computing norms for l2/manhattan/dot would double the
 // per-row work in index build and search paths.
 func metricNeedsNorms(metric string) bool {
 	return metric == "cosine"
-}
-
-// rowNormFor returns the cached/computed norm only when the metric needs it.
-func rowNormFor(metric string, cache vecSearchColumnCacheEntry, rowIdx int) float64 {
-	if !metricNeedsNorms(metric) {
-		return 0
-	}
-	return rowNorm(cache, rowIdx)
-}
-
-// rowDistance returns a ranking-only distance (see search.VectorRankingDistance):
-// every call site is internal graph/list traversal, never a value exposed
-// directly to a caller without first passing through
-// vecSearchTopKWithIndex's finalize step.
-//
-// It resolves the row through resolveRow instead of validAt+vector+normAt so
-// HNSW's searchLayer (called once per neighbor edge visited) and IVF's list
-// scan pay for one overrides/segment lookup per candidate instead of three.
-func rowDistance(metric string, query []float64, queryNorm float64, cache vecSearchColumnCacheEntry, rowIdx int) (float64, bool) {
-	vec, norm, valid := cache.resolveRow(rowIdx, metricNeedsNorms(metric))
-	if !valid {
-		return 0, false
-	}
-	return search.VectorRankingDistance(metric, vec, query, norm, queryNorm)
 }
 
 func centroidNorms(centroids [][]float64) []float64 {
@@ -1346,7 +1316,7 @@ func centroidNorms(centroids [][]float64) []float64 {
 // the values — l2/manhattan/dot ignore normA/normB entirely (search.VectorDistance).
 // Returning a zero-filled slice of the same length for those metrics skips
 // vectorL2Norm's sqrt per centroid per k-means iteration for no behavior
-// change, mirroring rowNormFor's same gating for per-row norms.
+// change, mirroring vecRowResolver's same gating for per-row norms.
 func centroidNormsFor(metric string, centroids [][]float64) []float64 {
 	if !metricNeedsNorms(metric) {
 		return make([]float64, len(centroids))

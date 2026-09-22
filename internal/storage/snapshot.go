@@ -170,14 +170,7 @@ func cloneVectorIndexes(src map[string]*VectorIndex) map[string]*VectorIndex {
 			continue
 		}
 		clone := *index
-		clone.Levels = append([]int(nil), index.Levels...)
-		clone.Neighbors = make([][][]int, len(index.Neighbors))
-		for row, layers := range index.Neighbors {
-			clone.Neighbors[row] = make([][]int, len(layers))
-			for layer, neighbors := range layers {
-				clone.Neighbors[row][layer] = append([]int(nil), neighbors...)
-			}
-		}
+		clone.Levels, clone.Neighbors = CloneVectorTopology(index.Levels, index.Neighbors)
 		out[key] = &clone
 	}
 	return out
@@ -308,4 +301,42 @@ func (db *DB) MetaSnapshot() *DB {
 		}
 	}
 	return out
+}
+
+// CloneVectorTopology deep-copies an ANN graph's per-row levels and neighbor
+// lists. Every statement snapshot of a table clones its persisted graphs, and
+// the executor copies a graph each time it persists or reloads one, so the
+// copy packs all neighbor lists into one backing array and all per-row layer
+// headers into another instead of allocating each list separately: three
+// allocations instead of one per row and layer. Each list is capped at its own
+// length, so an append to one copy reallocates rather than writing into its
+// neighbor's storage, and nothing is shared with the source. Empty lists stay
+// nil, as the per-list copies produced them.
+func CloneVectorTopology(levels []int, neighbors [][][]int) ([]int, [][][]int) {
+	outLevels := append([]int(nil), levels...)
+	layerCount, linkCount := 0, 0
+	for _, layers := range neighbors {
+		layerCount += len(layers)
+		for _, links := range layers {
+			linkCount += len(links)
+		}
+	}
+	outNeighbors := make([][][]int, len(neighbors))
+	layerArena := make([][]int, layerCount)
+	linkArena := make([]int, linkCount)
+	for row, layers := range neighbors {
+		rowLayers := layerArena[:len(layers):len(layers)]
+		layerArena = layerArena[len(layers):]
+		for layer, links := range layers {
+			if len(links) == 0 {
+				continue
+			}
+			dst := linkArena[:len(links):len(links)]
+			linkArena = linkArena[len(links):]
+			copy(dst, links)
+			rowLayers[layer] = dst
+		}
+		outNeighbors[row] = rowLayers
+	}
+	return outLevels, outNeighbors
 }

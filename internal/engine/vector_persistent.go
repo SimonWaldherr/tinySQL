@@ -126,14 +126,7 @@ func usablePersistentVecHNSW(index *storage.VectorIndex, table *storage.Table, c
 
 func clonePersistentVecIndex(index *storage.VectorIndex) *storage.VectorIndex {
 	clone := *index
-	clone.Levels = append([]int(nil), index.Levels...)
-	clone.Neighbors = make([][][]int, len(index.Neighbors))
-	for row, layers := range index.Neighbors {
-		clone.Neighbors[row] = make([][]int, len(layers))
-		for layer, neighbors := range layers {
-			clone.Neighbors[row][layer] = append([]int(nil), neighbors...)
-		}
-	}
+	clone.Levels, clone.Neighbors = storage.CloneVectorTopology(index.Levels, index.Neighbors)
 	return &clone
 }
 
@@ -156,15 +149,8 @@ func persistVecHNSWIndex(table *storage.Table, colIdx int, metric string, idx *v
 		Dims:          idx.dims,
 		Entry:         idx.entry,
 		MaxLevel:      idx.maxLevel,
-		Levels:        append([]int(nil), idx.levels...),
-		Neighbors:     make([][][]int, len(idx.neighbors)),
 	}
-	for row, layers := range idx.neighbors {
-		persisted.Neighbors[row] = make([][]int, len(layers))
-		for layer, neighbors := range layers {
-			persisted.Neighbors[row][layer] = append([]int(nil), neighbors...)
-		}
-	}
+	persisted.Levels, persisted.Neighbors = storage.CloneVectorTopology(idx.levels, idx.neighbors)
 	idx.mu.RUnlock()
 
 	table.DerivedLock()

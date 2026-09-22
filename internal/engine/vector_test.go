@@ -917,15 +917,11 @@ func TestVecSearchWithANNIndexModes(t *testing.T) {
 }
 
 // TestVecSearchHNSWNeighborPruningStable pins the exact ordered top-10 row
-// IDs an HNSW search returns for a fixed dataset/query. pruneHNSWNeighbors
-// was rewritten to precompute each neighbor's distance once into a
-// vecScoredRow slice and insertion-sort it, instead of sort.Slice with a
-// comparator that recomputed rowDistance on every comparison — a
-// performance-only change. The dataset here (2000 rows x 16 dims) is large
-// enough, relative to vecHNSWM, that pruneHNSWNeighbors runs on essentially
-// every insertion, so an unchanged result set here confirms the rewritten
-// sort preserves the exact nearest-M-by-distance, tie-broken-by-rowIdx
-// ordering the original comparator produced.
+// IDs an HNSW search returns for a fixed dataset/query. The dataset (2000
+// rows x 16 dims) is large enough, relative to vecHNSWM, that neighbor lists
+// are re-thinned by selectHNSWNeighbors throughout the build. The pinned IDs
+// are the exact answer: the test also checks them against a flat scan, so a
+// graph change that loses recall here fails instead of re-pinning.
 func TestVecSearchHNSWNeighborPruningStable(t *testing.T) {
 	db := storage.NewDB()
 	table := storage.NewTable("hnsw_prune_docs", []storage.Column{
@@ -966,11 +962,15 @@ func TestVecSearchHNSWNeighborPruningStable(t *testing.T) {
 		got[i] = id
 	}
 
-	// Captured from the pre-optimization pruneHNSWNeighbors implementation
-	// (sort.Slice with a recomputing comparator) and re-verified unchanged
-	// after the insertion-sort rewrite.
 	want := []int{777, 778, 776, 779, 775, 780, 774, 1317, 1316, 1318}
+	flat := execSQL(t, db, fmt.Sprintf(`
+		SELECT id
+		FROM VEC_SEARCH('hnsw_prune_docs', 'embedding', VEC_FROM_JSON('%s'), 10, 'cosine', 'flat')
+	`, mustVecJSON(t, query)))
 	for i := range want {
+		if flat.Rows[i]["id"] != want[i] {
+			t.Fatalf("exact top-10 changed at position %d: got %v, want %v", i, flat.Rows, want)
+		}
 		if got[i] != want[i] {
 			t.Fatalf("HNSW top-10 changed at position %d: got %v, want %v", i, got, want)
 		}

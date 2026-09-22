@@ -1894,6 +1894,16 @@ func ftsExtendPersistent(table *storage.Table, cols []int, index *storage.FTSInd
 	// A fresh large index can allocate postings exactly after counting them.
 	// Existing indexes retain the append path and its incremental ownership.
 	packed := bulk && start == 0 && len(index.TermIDs) == 0
+	if packed {
+		if workers := ftsBuildWorkerCount(len(table.Rows)); workers > 1 {
+			ftsBuildFreshParallel(table, cols, index, workers)
+			index.Format = ftsPersistentFormat
+			index.Version = table.Version
+			index.StructVersion = table.StructVersion()
+			index.BuiltRows = len(table.Rows)
+			return
+		}
+	}
 	var postingSizes []int
 	var batches []ftsPostingBatch
 	if bulk && !packed {

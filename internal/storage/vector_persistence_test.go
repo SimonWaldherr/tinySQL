@@ -33,3 +33,22 @@ func TestVectorIndexSurvivesDiskAndSnapshotRoundTrips(t *testing.T) {
 		})
 	}
 }
+
+func TestCloneVectorTopologyIsIndependent(t *testing.T) {
+	levels := []int{1, 0, 0}
+	neighbors := [][][]int{{{1, 2}, {2}}, {{0}}, {{}}, {}}
+	gotLevels, got := CloneVectorTopology(levels, neighbors)
+	if len(gotLevels) != 3 || len(got) != 4 || len(got[0]) != 2 || len(got[3]) != 0 || got[3] == nil {
+		t.Fatalf("clone shape = %v %v", gotLevels, got)
+	}
+	if got[2][0] != nil {
+		t.Fatalf("empty neighbor list cloned as %#v, want nil", got[2][0])
+	}
+	// Appending to one list must not overwrite the next list in the arena.
+	got[0][0] = append(got[0][0], 9)
+	got[1][0][0] = 7
+	gotLevels[0] = 5
+	if got[0][1][0] != 2 || neighbors[1][0][0] != 0 || levels[0] != 1 || len(neighbors[0][0]) != 2 {
+		t.Fatalf("clone aliases storage: clone=%v source=%v", got, neighbors)
+	}
+}
