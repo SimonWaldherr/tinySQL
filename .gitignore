@@ -90,3 +90,9 @@ demo.mbtiles
 /mbtilesregion
 /tiles.test
 /odbc/odbc
+
+# Apple / Swift build products
+/bindings/apple/build/
+/bindings/swift/CTinySQL.xcframework/
+/bindings/swift/.build/
+/bindings/swift/.swiftpm/

@@ -1,0 +1,4 @@
+module CTinySQL {
+    header "CTinySQL.h"
+    export *
+}

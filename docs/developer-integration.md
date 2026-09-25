@@ -11,6 +11,7 @@ the [storage guide](storage-guide.md); for retrieval applications, start with th
 | Go application | `tinysql.NewDB`, `ParseSQL`, `Execute` | You need direct control of the database and statements. |
 | Existing SQL-oriented Go application | `github.com/SimonWaldherr/tinySQL/driver` | The application already uses `database/sql`. |
 | Browser application | `cmd/query_files_wasm` | Data and queries should run locally in WebAssembly. |
+| Swift / Xcode application | [Swift package](../bindings/swift/README.md) | Embed the engine in macOS or iOS/iPadOS with actor isolation, bound parameters and snapshot persistence. |
 
 Reference implementations live in `example_test.go`, `import_example_test.go`,
 `cmd/demo`, `cmd/ragdemo`, `cmd/query_files_wasm`, `cmd/wasm_browser`, and

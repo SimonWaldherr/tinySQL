@@ -559,3 +559,17 @@ info:
 	@echo "  Go version: $(shell $(GO) version)"
 	@echo "  Binary directory: $(BINARY_DIR)"
 	@echo "  Command directory: $(CMD_DIR)"
+
+.PHONY: build-apple build-apple-macos test-swift
+## build-apple: Build Swift XCFramework for macOS, iOS and iOS Simulator (requires Xcode)
+build-apple:
+	./bindings/apple/build-xcframework.sh
+
+## build-apple-macos: Build a macOS-only Swift XCFramework for local development
+build-apple-macos:
+	./bindings/apple/build-xcframework.sh macos
+
+## test-swift: Build the macOS bridge and run native Swift integration tests
+test-swift: build-apple-macos
+	$(GO) test -race ./bindings/apple
+	swift test --package-path bindings/swift

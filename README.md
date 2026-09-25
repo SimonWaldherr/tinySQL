@@ -73,6 +73,7 @@ builder, see [developer integration](docs/developer-integration.md) and the
 | Query files or migrate data | [query_files](cmd/query_files/README.md), [fsql](cmd/fsql/README.md), or [migrate](cmd/migrate/README.md) |
 | Embed a local SQL service | [server](cmd/server/README.md) or [tinysqld](cmd/tinysqld/README.md) |
 | Build a browser app | [query_files_wasm](cmd/query_files_wasm/README.md), [wasm_browser](cmd/wasm_browser/README.md), or [wasm_node](cmd/wasm_node/README.md) |
+| Embed in a Swift / Xcode app | [Swift package and Apple XCFramework](bindings/swift/README.md) for macOS, iOS and iPadOS |
 | Use AI tooling or local RAG | [tinysql-mcp-server](cmd/tinysql-mcp-server/README.md) and the [RAG guide](docs/rag-guide.md) |
 | Browse every runnable program | [command index](cmd/README.md) |
 
