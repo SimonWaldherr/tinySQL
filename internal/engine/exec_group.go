@@ -4,11 +4,8 @@ package engine
 
 import (
 	"fmt"
-	"math/big"
 	"sort"
 	"strings"
-
-	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 func processGroupByHaving(env ExecEnv, s *Select, filtered []Row) ([]Row, []string, error) {
@@ -596,30 +593,7 @@ func accumulateSimpleAggregateStateFromRow(r Row, state *simpleAggregateState, p
 			if v == nil {
 				continue
 			}
-			if f, ok := numeric(v); ok {
-				if state.useRat != nil && state.useRat[i] {
-					state.sumRat[i].Add(state.sumRat[i], new(big.Rat).SetFloat64(f))
-				} else {
-					state.sumFloat[i] += f
-				}
-				state.counts[i]++
-				continue
-			}
-			if rv, ok := storage.DecimalFromAny(v); ok {
-				if state.useRat == nil {
-					state.useRat = make([]bool, len(projs))
-					state.sumRat = make([]*big.Rat, len(projs))
-				}
-				if !state.useRat[i] {
-					state.sumRat[i] = new(big.Rat)
-					if state.counts[i] > 0 {
-						state.sumRat[i].SetFloat64(state.sumFloat[i])
-					}
-					state.useRat[i] = true
-				}
-				state.sumRat[i].Add(state.sumRat[i], new(big.Rat).Set(rv))
-				state.counts[i]++
-			}
+			state.addSum(i, v, len(projs))
 		case aggMin, aggMax:
 			v, err := aggregateProjectionArgValue(r, args[i])
 			if err != nil {

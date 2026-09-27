@@ -64,7 +64,7 @@ type simpleAggregateProjection struct {
 }
 
 // simpleAggregateState accumulates one group's aggregates directly (SUM as a
-// running float/rational, MIN/MAX as a running best value) instead of
+// running integer/float/rational, MIN/MAX as a running best value) instead of
 // buffering every matching row and re-scanning it once per aggregate
 // expression, which is what the general (non-fast-path) GROUP BY evaluator
 // does. sumRat/useRat mirror evalAggregateSumAvg's float->big.Rat promotion
@@ -74,7 +74,7 @@ type simpleAggregateProjection struct {
 type simpleAggregateState struct {
 	groupValues []any
 	counts      []int // COUNT result, or non-null sample count for SUM/AVG
-	sumFloat    []float64
+	sums        []sumAccumulator
 	sumRat      []*big.Rat
 	useRat      []bool
 	minmax      []any
@@ -337,10 +337,42 @@ func newSimpleAggregateState(groupValues []any, projections int) *simpleAggregat
 	return &simpleAggregateState{
 		groupValues: groupValues,
 		counts:      make([]int, projections),
-		sumFloat:    make([]float64, projections),
+		sums:        make([]sumAccumulator, projections),
 		minmax:      make([]any, projections),
 		haveMinMax:  make([]bool, projections),
 	}
+}
+
+// addSum accumulates one non-NULL SUM/AVG input for projection i. Integers
+// stay exact (see sumAccumulator); a DECIMAL/MONEY value promotes the
+// projection to an exact rational, mirroring evalAggregateSumAvg. Values of
+// other types are ignored, as before.
+func (state *simpleAggregateState) addSum(i int, v any, projections int) {
+	if state.useRat != nil && state.useRat[i] {
+		if r, ok := ratFromNumeric(v); ok {
+			state.sumRat[i].Add(state.sumRat[i], r)
+			state.counts[i]++
+			return
+		}
+	} else if state.sums[i].add(v) {
+		state.counts[i]++
+		return
+	}
+	rv, ok := storage.DecimalFromAny(v)
+	if !ok {
+		return
+	}
+	if state.useRat == nil {
+		state.useRat = make([]bool, projections)
+		state.sumRat = make([]*big.Rat, projections)
+	}
+	if !state.useRat[i] {
+		// Migrate the exact integer/float total accumulated so far.
+		state.sumRat[i] = state.sums[i].rat()
+		state.useRat[i] = true
+	}
+	state.sumRat[i].Add(state.sumRat[i], new(big.Rat).Set(rv))
+	state.counts[i]++
 }
 
 func evalSimpleAggregateArg(rawPlan *simpleSelectPlan, raw []any, proj simpleAggregateProjection) (any, error) {
@@ -393,30 +425,7 @@ func accumulateSimpleAggregateState(env ExecEnv, rawPlan *simpleSelectPlan, raw 
 			if v == nil {
 				continue
 			}
-			if f, ok := numeric(v); ok {
-				if state.useRat != nil && state.useRat[i] {
-					state.sumRat[i].Add(state.sumRat[i], new(big.Rat).SetFloat64(f))
-				} else {
-					state.sumFloat[i] += f
-				}
-				state.counts[i]++
-				continue
-			}
-			if rv, ok := storage.DecimalFromAny(v); ok {
-				if state.useRat == nil {
-					state.useRat = make([]bool, len(projs))
-					state.sumRat = make([]*big.Rat, len(projs))
-				}
-				if !state.useRat[i] {
-					state.sumRat[i] = new(big.Rat)
-					if state.counts[i] > 0 {
-						state.sumRat[i].SetFloat64(state.sumFloat[i])
-					}
-					state.useRat[i] = true
-				}
-				state.sumRat[i].Add(state.sumRat[i], new(big.Rat).Set(rv))
-				state.counts[i]++
-			}
+			state.addSum(i, v, len(projs))
 		case aggMin, aggMax:
 			v, err := evalSimpleAggregateArg(rawPlan, raw, proj)
 			if err != nil {
@@ -508,7 +517,7 @@ func simpleAggregateProjectionValue(state *simpleAggregateState, proj simpleAggr
 		if state.useRat != nil && state.useRat[i] {
 			return state.sumRat[i]
 		}
-		return state.sumFloat[i]
+		return state.sums[i].sum()
 	case aggAvg:
 		if state.counts[i] == 0 {
 			return nil
@@ -516,7 +525,7 @@ func simpleAggregateProjectionValue(state *simpleAggregateState, proj simpleAggr
 		if state.useRat != nil && state.useRat[i] {
 			return new(big.Rat).Quo(state.sumRat[i], big.NewRat(int64(state.counts[i]), 1))
 		}
-		return state.sumFloat[i] / float64(state.counts[i])
+		return state.sums[i].average(state.counts[i])
 	case aggMin, aggMax:
 		if state.haveMinMax[i] {
 			return state.minmax[i]

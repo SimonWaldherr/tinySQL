@@ -118,6 +118,66 @@ final class DatabaseTests: XCTestCase {
         try await cleanup.value
     }
 
+    func testDurableStorageScriptsBatchesAndTransactionState() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let options = StorageOptions(mode: .wal, walSync: .normal)
+        let database = try await Database.open(directory: directory, storage: options)
+        let changed = try await database.executeScript("""
+            CREATE TABLE notes (id INT PRIMARY KEY, body TEXT);
+            INSERT INTO notes VALUES (1, 'a;b');
+            """)
+        XCTAssertEqual(changed, 1)
+        let inserted = try await database.executeBatch(
+            "INSERT INTO notes VALUES (?, ?)",
+            parameterSets: [[2, "two"], [3, .null]]
+        )
+        XCTAssertEqual(inserted, 2)
+        try await database.execute("BEGIN")
+        var inTransaction = await database.isInTransaction
+        XCTAssertTrue(inTransaction)
+        try await database.execute("DELETE FROM notes WHERE id = ?", parameters: [3])
+        try await database.execute("ROLLBACK")
+        inTransaction = await database.isInTransaction
+        XCTAssertFalse(inTransaction)
+        try await database.sync()
+        try await database.close()
+
+        let reopened = try Database(directory: directory, storage: options)
+        let result = try await reopened.query("SELECT id, body FROM notes ORDER BY id")
+        XCTAssertEqual(result.rows.count, 3)
+        XCTAssertEqual(result.columnIndex("Id"), 0)
+        XCTAssertEqual(result.value(row: 0, column: "BODY")?.stringValue, "a;b")
+        XCTAssertEqual(result.value(row: 2, column: "body")?.isNull, true)
+        XCTAssertNil(result.value(row: 9, column: "body"))
+        // Integer arithmetic and SUM over INT columns stay integers.
+        let sum = try await reopened.query("SELECT SUM(id) AS total, SUM(id) / 2 AS half FROM notes")
+        XCTAssertEqual(sum.rows, [[.integer(6), .real(3)]])
+        try await reopened.close()
+
+        do {
+            _ = try Database(directory: directory, storage: StorageOptions(mode: .json, encryptionKey: Data([1, 2])))
+            XCTFail("Short encryption key was accepted")
+        } catch TinySQLError.invalidInput { }
+    }
+
+    func testLiteralParametersAndAccessors() async throws {
+        let database = try Database()
+        try await database.execute("CREATE TABLE t (i INT, r FLOAT, s TEXT, b BOOL)")
+        try await database.execute("INSERT INTO t VALUES (?, ?, ?, ?)", parameters: [7, 2.5, "Grüße", true])
+        let result = try await database.query("SELECT i, r, s, b FROM t")
+        let row = try XCTUnwrap(result.rows.first)
+        XCTAssertEqual(row, [7, 2.5, "Grüße", true])
+        XCTAssertEqual(row[0].int64Value, 7)
+        XCTAssertEqual(row[0].doubleValue, 7)
+        XCTAssertEqual(row[1].doubleValue, 2.5)
+        XCTAssertNil(row[1].int64Value)
+        XCTAssertEqual(row[2].stringValue, "Grüße")
+        XCTAssertEqual(row[3].boolValue, true)
+        XCTAssertNil(row[2].dataValue)
+        try await database.close()
+    }
+
     @MainActor
     func testExecutorRunsAwayFromMainActor() async throws {
         let database = try await Database.open()

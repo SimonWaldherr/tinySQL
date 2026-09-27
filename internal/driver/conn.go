@@ -47,6 +47,12 @@ type conn struct {
 
 var _ driver.ConnPrepareContext = (*conn)(nil)
 
+// InTransaction reports whether the connection is inside a transaction,
+// including one started with Exec("BEGIN") that database/sql cannot see.
+// Native bindings read it through sql.Conn.Raw to mirror SQL-level
+// transaction state across calls.
+func (c *conn) InTransaction() bool { return c.inTx }
+
 func (c *conn) Prepare(query string) (driver.Stmt, error) {
 	return c.PrepareContext(context.Background(), query)
 }

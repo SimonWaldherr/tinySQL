@@ -93,6 +93,18 @@ demo.mbtiles
 
 # Apple / Swift build products
 /bindings/apple/build/
+/bindings/c/build/
+/bindings/python/build/
+/bindings/python/dist/
+/bindings/python/*.egg-info/
+/bindings/python/tinysql/libtinysql.*
+/bindings/python/tinysql/tinysql.dll
+/bindings/rust/target/
+/bindings/rust/Cargo.lock
 /bindings/swift/CTinySQL.xcframework/
 /bindings/swift/.build/
 /bindings/swift/.swiftpm/
+
+# Python bytecode
+__pycache__/
+*.py[cod]

@@ -562,6 +562,10 @@ func TestSplitStatements(t *testing.T) {
 		{"SELECT 'a;b' FROM t", 1},
 		{"CREATE TABLE t (x INT)", 1},
 		{"", 0},
+		// An apostrophe in a comment used to open a string literal.
+		{"CREATE TABLE t (x INT); -- don't panic\nINSERT INTO t VALUES (1); SELECT 1", 3},
+		// Trigger bodies contain semicolons.
+		{"CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO a VALUES (1); DELETE FROM b; END; SELECT 1", 2},
 	}
 	for _, tc := range tests {
 		got := splitStatements(tc.input)

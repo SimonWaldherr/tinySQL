@@ -155,7 +155,9 @@ func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool
 		}
 
 		buf.WriteString(line)
-		if strings.HasSuffix(line, ";") {
+		// Execute only once the statement is complete, so a ';' inside a
+		// string or a CREATE TRIGGER body keeps reading the next line.
+		if strings.HasSuffix(line, ";") && sqlutil.StatementComplete(buf.String()) {
 			q := strings.TrimSpace(buf.String())
 			q = strings.TrimSpace(strings.TrimSuffix(q, ";"))
 			buf.Reset()
@@ -185,7 +187,7 @@ func replReadAndExecFile(db *sql.DB, filename string) {
 		fmt.Println("Error:", err)
 		return
 	}
-	stmts := strings.Split(string(data), ";")
+	stmts := sqlutil.SplitStatements(string(data))
 	for _, s := range stmts {
 		s = strings.TrimSpace(s)
 		if s == "" || strings.HasPrefix(s, "--") {

@@ -34,8 +34,8 @@ func TestPreparedLeadingWithInsertAndModulo(t *testing.T) {
 	defer selectStmt.Close()
 	for _, tc := range []struct {
 		divisor int64
-		want    []float64
-	}{{2, []float64{1, 0}}, {3, []float64{2, 2}}} {
+		want    []int64 // INT % INT is an integer
+	}{{2, []int64{1, 0}}, {3, []int64{2, 2}}} {
 		rows, err := selectStmt.Query([]driver.Value{tc.divisor})
 		if err != nil {
 			t.Fatal(err)

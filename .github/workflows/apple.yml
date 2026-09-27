@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: ['**/*.go', 'go.mod', 'go.sum', 'bindings/apple/**', 'bindings/swift/**', '.github/workflows/apple.yml']
+    paths: ['**/*.go', 'go.mod', 'go.sum', 'bindings/apple/**', 'bindings/c/**', 'bindings/swift/**', '.github/workflows/apple.yml']
   pull_request:
-    paths: ['**/*.go', 'go.mod', 'go.sum', 'bindings/apple/**', 'bindings/swift/**', '.github/workflows/apple.yml']
+    paths: ['**/*.go', 'go.mod', 'go.sum', 'bindings/apple/**', 'bindings/c/**', 'bindings/swift/**', '.github/workflows/apple.yml']
 
 permissions:
   contents: read
@@ -25,7 +25,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Test native bridge with race detector
-        run: go test -race ./bindings/apple
+        run: go test -race ./bindings/c
       - name: Build macOS, iOS and simulator XCFramework
         run: make build-apple
       - name: Run Swift integration tests

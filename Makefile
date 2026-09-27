@@ -560,6 +560,47 @@ info:
 	@echo "  Binary directory: $(BINARY_DIR)"
 	@echo "  Command directory: $(CMD_DIR)"
 
+.PHONY: build-c test-c test-python test-rust test-bindings
+
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+TINYSQL_SHARED_LIB := libtinysql.dylib
+TINYSQL_C_LIBS := -framework CoreFoundation -framework Security -lresolv
+else
+TINYSQL_SHARED_LIB := libtinysql.so
+TINYSQL_C_LIBS := -lpthread -lm -ldl
+endif
+C_ABI_BUILD := bindings/c/build
+
+## build-c: Build the C ABI (static archive, shared library, header) into bindings/c/build
+build-c:
+	mkdir -p $(C_ABI_BUILD)
+	$(GO) build -trimpath -buildmode=c-archive -o $(C_ABI_BUILD)/libtinysql.a ./bindings/c
+	$(GO) build -trimpath -buildmode=c-shared -o $(C_ABI_BUILD)/$(TINYSQL_SHARED_LIB) ./bindings/c
+	rm -f $(C_ABI_BUILD)/libtinysql.h
+	cp bindings/c/include/tinysql.h $(C_ABI_BUILD)/tinysql.h
+	@echo "$(GREEN)C ABI ready in $(C_ABI_BUILD)$(NC)"
+
+## test-c: Test the C ABI with the race detector and run the C smoke program
+test-c:
+	$(GO) test -race ./bindings/c
+	mkdir -p $(C_ABI_BUILD)
+	$(GO) build -buildmode=c-archive -o $(C_ABI_BUILD)/libtinysql.a ./bindings/c
+	$(CC) -Wall -Wextra -Werror -I bindings/c/include bindings/c/example/abi_smoke.c \
+		$(C_ABI_BUILD)/libtinysql.a $(TINYSQL_C_LIBS) -o $(C_ABI_BUILD)/abi_smoke
+	./$(C_ABI_BUILD)/abi_smoke
+
+## test-python: Build the shared library and run the Python package tests
+test-python:
+	$(MAKE) -C bindings/python test
+
+## test-rust: Run the Rust crate tests (the build script compiles the C ABI with Go)
+test-rust:
+	cargo test --manifest-path bindings/rust/Cargo.toml
+
+## test-bindings: Run the C, Python and Rust binding tests
+test-bindings: test-c test-python test-rust
+
 .PHONY: build-apple build-apple-macos test-swift
 ## build-apple: Build Swift XCFramework for macOS, iOS and iOS Simulator (requires Xcode)
 build-apple:
@@ -571,5 +612,5 @@ build-apple-macos:
 
 ## test-swift: Build the macOS bridge and run native Swift integration tests
 test-swift: build-apple-macos
-	$(GO) test -race ./bindings/apple
+	$(GO) test -race ./bindings/c
 	swift test --package-path bindings/swift

@@ -37,7 +37,7 @@ func TestInsertReturningStarAndExpression(t *testing.T) {
 	if got, want := rs.Cols, []string{"id", "next_qty"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("RETURNING expression cols = %v, want %v", got, want)
 	}
-	if rs.Rows[0]["id"] != 3 || rs.Rows[0]["next_qty"] != float64(10) {
+	if rs.Rows[0]["id"] != 3 || rs.Rows[0]["next_qty"] != 10 {
 		t.Fatalf("unexpected expression row: %#v", rs.Rows[0])
 	}
 }

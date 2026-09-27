@@ -524,8 +524,8 @@ func evalUnary(env ExecEnv, ex *Unary, row Row) (any, error) {
 	}
 	switch ex.Op {
 	case "+":
-		if f, ok := numeric(v); ok {
-			return f, nil
+		if n, ok := unaryNumeric("+", v); ok {
+			return n, nil
 		}
 		if r, ok := storage.DecimalFromAny(v); ok {
 			return new(big.Rat).Set(r), nil
@@ -535,8 +535,8 @@ func evalUnary(env ExecEnv, ex *Unary, row Row) (any, error) {
 		}
 		return nil, fmt.Errorf("unary + non-numeric")
 	case "-":
-		if f, ok := numeric(v); ok {
-			return -f, nil
+		if n, ok := unaryNumeric("-", v); ok {
+			return n, nil
 		}
 		if r, ok := storage.DecimalFromAny(v); ok {
 			neg := new(big.Rat).Set(r)
@@ -663,6 +663,13 @@ func evalArithmeticBinary(op string, lv, rv any) (any, error) {
 		return nil, fmt.Errorf("%s expects numeric", op)
 	}
 
+	if a, ok := integerOperand(lv); ok {
+		if b, ok := integerOperand(rv); ok {
+			if result, handled, err := integerArithmetic(op, a, b); handled {
+				return result, err
+			}
+		}
+	}
 	lf, lok := numeric(lv)
 	rf, rok := numeric(rv)
 	if !lok || !rok {

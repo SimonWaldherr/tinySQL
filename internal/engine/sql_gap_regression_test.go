@@ -14,8 +14,9 @@ func TestModuloOperator(t *testing.T) {
 		expr string
 		want any
 	}{
-		{"17 % 5", float64(2)}, {"-17 % 5", float64(-2)}, {"17 % -5", float64(2)},
-		{"5.5 % 2", float64(1.5)}, {"2 + 17 % 5 * 3", float64(8)},
+		// Integer operands give integers; / always yields REAL.
+		{"17 % 5", 2}, {"-17 % 5", -2}, {"17 % -5", 2},
+		{"5.5 % 2", float64(1.5)}, {"2 + 17 % 5 * 3", 8},
 		{"20 / 2 % 3", float64(1)}, {"NULL % 3", nil}, {"3 % NULL", nil},
 	} {
 		if got := queryScalar(t, db, tc.expr); got != tc.want {
@@ -35,7 +36,7 @@ func TestModuloOperator(t *testing.T) {
 	execSQL(t, db, `CREATE TABLE numbers (id INT)`)
 	execSQL(t, db, `INSERT INTO numbers VALUES (1), (2), (3), (4)`)
 	rows := execSQL(t, db, `SELECT id % 2 AS remainder FROM numbers WHERE id % 2 = 0`).Rows
-	if len(rows) != 2 || rows[0]["remainder"] != float64(0) {
+	if len(rows) != 2 || rows[0]["remainder"] != 0 {
 		t.Fatal(rows)
 	}
 	rows = execSQL(t, db, `SELECT a.id % b.id AS remainder FROM numbers a JOIN numbers b ON a.id = b.id`).Rows
@@ -43,7 +44,7 @@ func TestModuloOperator(t *testing.T) {
 		t.Fatal(rows)
 	}
 	for _, r := range rows {
-		if r["remainder"] != float64(0) {
+		if r["remainder"] != 0 {
 			t.Fatal(r)
 		}
 	}

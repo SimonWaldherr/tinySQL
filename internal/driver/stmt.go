@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"github.com/SimonWaldherr/tinySQL/internal/engine"
+	"github.com/SimonWaldherr/tinySQL/internal/sqlbind"
 )
 
 type stmt struct {
@@ -276,26 +277,13 @@ func markerSQLForPositionalParams(sqlText string) (string, int, bool) {
 	out.Grow(len(sqlText) + 32)
 	count := 0
 	for i := 0; i < len(sqlText); i++ {
-		ch := sqlText[i]
-		if ch == '\'' {
-			out.WriteByte(ch)
-			i++
-			for i < len(sqlText) {
-				b := sqlText[i]
-				out.WriteByte(b)
-				if b == '\'' {
-					if i+1 < len(sqlText) && sqlText[i+1] == '\'' {
-						i++
-						out.WriteByte(sqlText[i])
-						i++
-						continue
-					}
-					break
-				}
-				i++
-			}
+		// Strings, quoted identifiers and comments never contain parameters.
+		if end := sqlbind.SkipOpaque(sqlText, i); end > i {
+			out.WriteString(sqlText[i:end])
+			i = end - 1
 			continue
 		}
+		ch := sqlText[i]
 		if ch == '?' {
 			out.WriteByte('\'')
 			out.WriteString(preparedMarkerPrefix)

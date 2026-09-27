@@ -83,7 +83,7 @@ jobs:
             -trimpath -ldflags "-s -w -X main.Version=${GITHUB_REF_NAME:-dev} -X github.com/SimonWaldherr/tinySQL/internal/engine.BuildVersion=${GITHUB_REF_NAME:-dev}" \
             -o "$binary" ./cmd/tinysql
 
-          # Build C shared library (bindings/python provides c-shared target)
+          # Build the C ABI (bindings/c) as shared and static library
           # c-shared requires a native C toolchain; skip when target OS or
           # architecture differs from the runner. The CLI above remains fully
           # cross-compiled and is the supported artifact on every matrix row.
@@ -96,7 +96,13 @@ jobs:
             echo "Building c-shared library"
             CGO_ENABLED=1 GOOS=$GOOS GOARCH=$GOARCH go build -buildmode=c-shared \
               -ldflags "-X github.com/SimonWaldherr/tinySQL/internal/engine.BuildVersion=${GITHUB_REF_NAME:-dev}" \
-              -o $PKGDIR/libtinysql.$EXT ./bindings/python || true
+              -o $PKGDIR/libtinysql.$EXT ./bindings/c || true
+            CGO_ENABLED=1 GOOS=$GOOS GOARCH=$GOARCH go build -buildmode=c-archive \
+              -ldflags "-X github.com/SimonWaldherr/tinySQL/internal/engine.BuildVersion=${GITHUB_REF_NAME:-dev}" \
+              -o $PKGDIR/libtinysql.a ./bindings/c || true
+            # Ship the documented ABI header instead of cgo's generated one.
+            rm -f $PKGDIR/libtinysql.h
+            cp bindings/c/include/tinysql.h $PKGDIR/tinysql.h
           else
             echo "Skipping c-shared build for $GOOS-$GOARCH on runner $runner_arch (no cross C toolchain)"
           fi

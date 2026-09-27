@@ -46,12 +46,12 @@ func TestPivotBasicSum(t *testing.T) {
 	}
 	// Row map keys are always lowercased (putVal/getValLower convention),
 	// including pivot output columns named after their literal value.
-	expectFloat(t, east["electronics"], 125, 1e-9, "East Electronics")
-	expectFloat(t, east["furniture"], 50, 1e-9, "East Furniture")
+	expectInt(t, east["electronics"], 125, "East Electronics")
+	expectInt(t, east["furniture"], 50, "East Furniture")
 
 	west := byRegion["West"]
-	expectFloat(t, west["electronics"], 200, 1e-9, "West Electronics")
-	expectFloat(t, west["furniture"], 75, 1e-9, "West Furniture")
+	expectInt(t, west["electronics"], 200, "West Electronics")
+	expectInt(t, west["furniture"], 75, "West Furniture")
 }
 
 func TestPivotWithAliases(t *testing.T) {
@@ -65,10 +65,10 @@ func TestPivotWithAliases(t *testing.T) {
 	if len(rs.Rows) != 2 {
 		t.Fatalf("expected 2 rows, got %d", len(rs.Rows))
 	}
-	expectFloat(t, rs.Rows[0]["elec"], 125, 1e-9, "East elec (row0=East alphabetically)")
-	expectFloat(t, rs.Rows[0]["furn"], 50, 1e-9, "East furn")
-	expectFloat(t, rs.Rows[1]["elec"], 200, 1e-9, "West elec")
-	expectFloat(t, rs.Rows[1]["furn"], 75, 1e-9, "West furn")
+	expectInt(t, rs.Rows[0]["elec"], 125, "East elec (row0=East alphabetically)")
+	expectInt(t, rs.Rows[0]["furn"], 50, "East furn")
+	expectInt(t, rs.Rows[1]["elec"], 200, "West elec")
+	expectInt(t, rs.Rows[1]["furn"], 75, "West furn")
 }
 
 func TestPivotCount(t *testing.T) {
@@ -143,8 +143,8 @@ func TestPivotWithWhereFiltersSourceRows(t *testing.T) {
 	if len(rs.Rows) != 2 {
 		t.Fatalf("expected 2 rows, got %d: %+v", len(rs.Rows), rs.Rows)
 	}
-	expectFloat(t, rs.Rows[0]["elec"], 100, 1e-9, "East elec filtered")
-	expectFloat(t, rs.Rows[1]["elec"], 200, 1e-9, "West elec filtered")
+	expectInt(t, rs.Rows[0]["elec"], 100, "East elec filtered")
+	expectInt(t, rs.Rows[1]["elec"], 200, "West elec filtered")
 }
 
 func TestPivotSelectSpecificColumn(t *testing.T) {

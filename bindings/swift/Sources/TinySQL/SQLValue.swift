@@ -64,10 +64,83 @@ public enum SQLValue: Sendable, Equatable, Codable {
     }
 }
 
+// Literals make parameter lists concise: `parameters: [1, "Ada", 2.5, true]`.
+extension SQLValue: ExpressibleByIntegerLiteral {
+    public init(integerLiteral value: Int64) { self = .integer(value) }
+}
+
+extension SQLValue: ExpressibleByFloatLiteral {
+    public init(floatLiteral value: Double) { self = .real(value) }
+}
+
+extension SQLValue: ExpressibleByStringLiteral {
+    public init(stringLiteral value: String) { self = .text(value) }
+}
+
+extension SQLValue: ExpressibleByBooleanLiteral {
+    public init(booleanLiteral value: Bool) { self = .boolean(value) }
+}
+
+extension SQLValue {
+    public var isNull: Bool {
+        if case .null = self { return true }
+        return false
+    }
+
+    /// The integer value; booleans map to 0 and 1.
+    public var int64Value: Int64? {
+        switch self {
+        case .integer(let value): return value
+        case .boolean(let value): return value ? 1 : 0
+        default: return nil
+        }
+    }
+
+    /// The numeric value as a Double, for REAL and INTEGER values.
+    public var doubleValue: Double? {
+        switch self {
+        case .real(let value): return value
+        case .integer(let value): return Double(value)
+        default: return nil
+        }
+    }
+
+    public var stringValue: String? {
+        if case .text(let value) = self { return value }
+        return nil
+    }
+
+    public var boolValue: Bool? {
+        switch self {
+        case .boolean(let value): return value
+        case .integer(let value): return value != 0
+        default: return nil
+        }
+    }
+
+    public var dataValue: Data? {
+        if case .blob(let value) = self { return value }
+        return nil
+    }
+}
+
 public struct QueryResult: Sendable, Equatable {
     public let columns: [String]
     /// Values in column order. Positional rows also preserve duplicate column names.
     public let rows: [[SQLValue]]
+
+    /// The position of the first column named `name`, compared case-insensitively.
+    public func columnIndex(_ name: String) -> Int? {
+        columns.firstIndex { $0.caseInsensitiveCompare(name) == .orderedSame }
+    }
+
+    /// The value of column `name` in row `row`, or nil when either does not exist.
+    public func value(row: Int, column name: String) -> SQLValue? {
+        guard rows.indices.contains(row), let index = columnIndex(name), rows[row].indices.contains(index) else {
+            return nil
+        }
+        return rows[row][index]
+    }
 }
 
 public enum TinySQLError: Error, Sendable, Equatable, LocalizedError {

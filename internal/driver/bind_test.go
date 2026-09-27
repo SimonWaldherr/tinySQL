@@ -166,3 +166,32 @@ func TestSqlLiteral_Complex(t *testing.T) {
 		t.Fatalf("string literal escaping: %s", got)
 	}
 }
+
+// Placeholder characters in comments and quoted identifiers are SQL text, not
+// parameters. Previously "-- why?" made an argument-free Exec fail with
+// "not enough args for placeholders".
+func TestPlaceholderCharactersInCommentsAndIdentifiers(t *testing.T) {
+	db, err := sql.Open("tinysql", "mem://?tenant=bind_comment_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE t (id INT, "why?" TEXT) -- is this ok?`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO t VALUES (?, ?) /* $9 ? */", 1, "a"); err != nil {
+		t.Fatal(err)
+	}
+	stmt, err := db.Prepare(`SELECT "why?" FROM t WHERE id = ? -- trailing ?`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stmt.Close()
+	var got string
+	if err := stmt.QueryRow(1).Scan(&got); err != nil || got != "a" {
+		t.Fatalf("got %q, %v", got, err)
+	}
+	if err := db.QueryRow("SELECT COUNT(*) FROM t -- why?").Scan(new(int)); err != nil {
+		t.Fatal(err)
+	}
+}

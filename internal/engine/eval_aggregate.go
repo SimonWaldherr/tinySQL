@@ -160,10 +160,9 @@ func evalAggregateSumAvg(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 		return nil, fmt.Errorf("%s expects 1 arg", ex.Name)
 	}
 	var (
-		sumFloat float64
-		sumRat   = new(big.Rat)
-		useRat   bool
-		n        int
+		sum    sumAccumulator
+		sumRat *big.Rat
+		n      int
 	)
 	for _, r := range rows {
 		if err := checkCtx(env.ctx); err != nil {
@@ -176,22 +175,20 @@ func evalAggregateSumAvg(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 		if v == nil {
 			continue
 		}
-		if f, ok := numeric(v); ok {
-			if useRat {
-				sumRat.Add(sumRat, new(big.Rat).SetFloat64(f))
-			} else {
-				sumFloat += f
+		if sumRat == nil {
+			if sum.add(v) {
+				n++
+				continue
 			}
+		} else if rv, ok := ratFromNumeric(v); ok {
+			sumRat.Add(sumRat, rv)
 			n++
 			continue
 		}
 		if rv, ok := storage.DecimalFromAny(v); ok {
-			if !useRat {
-				// migrate any accumulated float sum into rational
-				if n > 0 {
-					sumRat.SetFloat64(sumFloat)
-				}
-				useRat = true
+			if sumRat == nil {
+				// migrate the exact integer/float total into the rational
+				sumRat = sum.rat()
 			}
 			sumRat.Add(sumRat, new(big.Rat).Set(rv))
 			n++
@@ -206,16 +203,17 @@ func evalAggregateSumAvg(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 		return nil, nil
 	}
 	if ex.Name == "SUM" {
-		if useRat {
+		if sumRat != nil {
 			return sumRat, nil
 		}
-		return sumFloat, nil
+		// Integer inputs produce an integer SUM (REAL after an overflow).
+		return sum.sum(), nil
 	}
-	if useRat {
+	if sumRat != nil {
 		avg := new(big.Rat).Quo(sumRat, big.NewRat(int64(n), 1))
 		return avg, nil
 	}
-	return sumFloat / float64(n), nil
+	return sum.average(n), nil
 }
 
 func evalAggregateMinMax(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
@@ -455,8 +453,8 @@ func evalAggregateUnary(env ExecEnv, ex *Unary, rows []Row) (any, error) {
 	}
 	switch ex.Op {
 	case "+":
-		if f, ok := numeric(v); ok {
-			return f, nil
+		if n, ok := unaryNumeric("+", v); ok {
+			return n, nil
 		}
 		if r, ok := storage.DecimalFromAny(v); ok {
 			return new(big.Rat).Set(r), nil
@@ -466,8 +464,8 @@ func evalAggregateUnary(env ExecEnv, ex *Unary, rows []Row) (any, error) {
 		}
 		return nil, fmt.Errorf("unary + non-numeric")
 	case "-":
-		if f, ok := numeric(v); ok {
-			return -f, nil
+		if n, ok := unaryNumeric("-", v); ok {
+			return n, nil
 		}
 		if r, ok := storage.DecimalFromAny(v); ok {
 			neg := new(big.Rat).Set(r)

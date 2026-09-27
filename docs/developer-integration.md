@@ -1,17 +1,22 @@
 # tinySQL developer integration
 
-tinySQL can run directly in a Go process, through `database/sql`, or in a
-browser/WebAssembly application. Choose the smallest integration surface that
-fits the host. For storage, DSN options, durability, and read-only serving, use
+tinySQL can run directly in a Go process, through `database/sql`, in a
+browser/WebAssembly application, or inside Rust, Python, Swift and C programs
+through the shared C ABI. Choose the smallest integration surface that fits
+the host; the [language bindings guide](language-bindings.md) compares the
+non-Go hosts. For storage, DSN options, durability, and read-only serving, use
 the [storage guide](storage-guide.md); for retrieval applications, start with the
 [RAG guide](rag-guide.md).
 
 | Host | Start with | Use it when |
 | --- | --- | --- |
-| Go application | `tinysql.NewDB`, `ParseSQL`, `Execute` | You need direct control of the database and statements. |
+| Go application | `tinysql.NewDB`, `ExecSQLArgs`, `ExecScript` | You need direct control of the database and statements. |
 | Existing SQL-oriented Go application | `github.com/SimonWaldherr/tinySQL/driver` | The application already uses `database/sql`. |
 | Browser application | `cmd/query_files_wasm` | Data and queries should run locally in WebAssembly. |
-| Swift / Xcode application | [Swift package](../bindings/swift/README.md) | Embed the engine in macOS or iOS/iPadOS with actor isolation, bound parameters and snapshot persistence. |
+| Swift / Xcode application | [Swift package](../bindings/swift/README.md) | Embed the engine in macOS or iOS/iPadOS with actor isolation, bound parameters and durable storage. |
+| Rust application | [Rust crate](../bindings/rust/README.md) | A `Send + Sync` database with typed rows, batches and transactions, linked statically. |
+| Python application | [Python package](../bindings/python/README.md) | A DB-API 2.0 connection for scripts, notebooks and services. |
+| C, C++ or another FFI host | [C ABI](../bindings/c/README.md) | Any language that can call C functions and parse JSON. |
 
 Reference implementations live in `example_test.go`, `import_example_test.go`,
 `cmd/demo`, `cmd/ragdemo`, `cmd/query_files_wasm`, `cmd/wasm_browser`, and
@@ -24,30 +29,49 @@ below an `internal/` directory is not available to external modules.
 
 ```go
 db := tinysql.NewDB()
+defer db.Close()
 
-stmt, err := tinysql.ParseSQL(`CREATE TABLE users (id INT, name TEXT)`)
+// Schema and seed data: one call, statements split by the engine lexer.
+if _, err := tinysql.ExecScript(ctx, db, "default", `
+    CREATE TABLE users (id INT PRIMARY KEY, name TEXT);
+    CREATE INDEX users_name ON users (name);`); err != nil {
+    return err
+}
+
+// Bind values instead of formatting them into SQL text.
+if _, err := tinysql.ExecSQLArgs(ctx, db, "default",
+    "INSERT INTO users VALUES (?, ?)", 1, "O'Hara"); err != nil {
+    return err
+}
+rs, err := tinysql.ExecSQLArgs(ctx, db, "default",
+    "SELECT id, name FROM users WHERE name = ?", "O'Hara")
 if err != nil {
     return err
 }
-if _, err := tinysql.Execute(ctx, db, "default", stmt); err != nil {
-    return err
-}
-
-stmt, err = tinysql.ParseSQL(`INSERT INTO users VALUES (1, 'Alice')`)
-if err != nil {
-    return err
-}
-if _, err := tinysql.Execute(ctx, db, "default", stmt); err != nil {
-    return err
+for _, row := range rs.Rows {
+    fmt.Println(row["id"], row["name"])
 }
 ```
 
-`NewDB` creates an in-memory database. `default` is the conventional tenant in
-examples, but applications may use their own tenant names. Parse and execute
-each statement explicitly; split multi-statement input before parsing. For a
-large result, use `ExecSQLStream`, and close it as soon as the consumer stops.
-The [API stability guide](api-stability.md) covers stream ownership and
-backpressure.
+`NewDB` creates an in-memory database; `OpenDB` opens a durable one (see the
+[storage guide](storage-guide.md)). `default` is the conventional tenant in
+examples, but applications may use their own tenant names.
+
+| Function | Use it for |
+| --- | --- |
+| `ExecSQL(ctx, db, tenant, sql)` | One statement without parameters. |
+| `ExecSQLArgs(ctx, db, tenant, sql, args...)` | One statement with `?`, `$1` or `:1` parameters. Strings, `[]byte`, numbers, booleans, `nil`, `time.Time` and JSON-marshalable values are bound as literals; placeholder characters inside quotes or comments are left alone. |
+| `ExecScript(ctx, db, tenant, script)` | Several statements; returns the last result. Semicolons in literals, comments and `CREATE TRIGGER ... BEGIN ... END` bodies do not split. Stops at the first failing statement ("statement N: ..."). |
+| `ParseSQL` + `Execute` | Parse once, execute many times without parameters. |
+| `ExecSQLStream` | Large results; close the stream as soon as the consumer stops. |
+| `ExecSQLColumnar` | Column-oriented results for analytics. |
+| `sqlutil.SplitStatements` | Split a script without executing it (editors, migration tools). |
+
+Transaction control (`BEGIN`/`COMMIT`) belongs to the `database/sql` driver
+below; the direct API executes each statement immediately. Integer arithmetic
+and `SUM` over integer columns return `int`; division and `AVG` return
+`float64`. The [API stability guide](api-stability.md) covers stream ownership
+and backpressure.
 
 `BeautifySQL` and `MinifySQL` format or compact SQL without a database or parser
 round trip. They preserve literals, quoted identifiers, and comments, but do not
@@ -111,7 +135,8 @@ _, _, _ = navCfg, ragCfg, toolCfg
 ```
 
 `OpenWithDB` binds a pool to a caller-supplied `*tinysql.DB`; close the pool
-before the native database. It does not change a process-wide default. Legacy
+before the native database. A database opened with a durable `StorageMode`
+persists every acknowledged write, exactly like the equivalent `mode=` DSN. It does not change a process-wide default. Legacy
 empty-DSN callers that intentionally need that behavior must call
 `driver.SetDefaultDB` explicitly.
 
@@ -162,11 +187,13 @@ unless the frontend or host persists it. The reference tool limits SQL input to
 
 ## Deutsch
 
-tinySQL laesst sich direkt in Go, ueber `database/sql` oder im Browser mit WASM
-einbinden. Fuer neue Go-Anwendungen ist die direkte API mit `NewDB`, `ParseSQL`
-und `Execute` passend; bestehende SQL-Anwendungen verwenden das oeffentliche
-Paket `github.com/SimonWaldherr/tinySQL/driver`. Pakete unter `internal/` sind
-keine externe API.
+tinySQL laesst sich direkt in Go, ueber `database/sql`, im Browser mit WASM
+sowie ueber die gemeinsame C-ABI in Rust, Python, Swift und C einbinden (siehe
+[Language-Bindings-Leitfaden](language-bindings.md)). Fuer neue Go-Anwendungen
+ist die direkte API mit `NewDB`, `ExecSQLArgs` (gebundene Parameter) und
+`ExecScript` (mehrere Anweisungen) passend; bestehende SQL-Anwendungen
+verwenden das oeffentliche Paket `github.com/SimonWaldherr/tinySQL/driver`.
+Pakete unter `internal/` sind keine externe API.
 
 Eine `*sql.DB` teilt eine tinySQL-Datenbank mit ihren Verbindungen. Ein zweites
 `sql.Open` erzeugt dagegen auch bei gleichem `mem://`-DSN eine neue Datenbank.

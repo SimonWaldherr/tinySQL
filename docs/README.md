@@ -7,6 +7,8 @@ current behavior and keep performance claims scoped to the workload they measure
 
 - [Developer integration](developer-integration.md) — embed tinySQL from Go,
   `database/sql`, or WebAssembly.
+- [Language bindings](language-bindings.md) — embed tinySQL in Rust, Python,
+  Swift, or any C-compatible host through the shared C ABI.
 - [Storage and persistence](storage-guide.md) — select a storage mode, configure
   a DSN, back up data, and serve read-only artifacts.
 - [CLI guide](cli-guide.md) — find the command-line tools and browser playground.
