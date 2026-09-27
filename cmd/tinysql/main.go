@@ -23,6 +23,7 @@ import (
 
 	tsql "github.com/SimonWaldherr/tinySQL"
 	"github.com/SimonWaldherr/tinySQL/exporter"
+	"github.com/SimonWaldherr/tinySQL/sqlutil"
 )
 
 // Version is replaced at build time, for example with:
@@ -499,7 +500,9 @@ func (r *Repl) Run() error {
 			r.buf.WriteString(line)
 			r.buf.WriteByte('\n')
 
-			if strings.HasSuffix(trimmed, ";") {
+			// A trailing ';' ends input only outside literals, comments and
+			// trigger bodies, so multi-line CREATE TRIGGER blocks work.
+			if strings.HasSuffix(trimmed, ";") && sqlutil.StatementComplete(r.buf.String()) {
 				sqlText := r.buf.String()
 				r.buf.Reset()
 
@@ -1439,41 +1442,11 @@ func printSchema(out io.Writer, db *tsql.DB, tenant, tableFilter string) error {
 	return nil
 }
 
-// splitStatements is a simple state-machine splitter.
-// Ideally, use a proper lexer, but this suffices for a CLI wrapper.
+// splitStatements splits a script with the engine lexer: semicolons inside
+// literals, quoted identifiers, comments (including apostrophes in them) and
+// CREATE TRIGGER bodies do not end a statement.
 func splitStatements(sql string) []string {
-	var stmts []string
-	var buf strings.Builder
-	inSingle := false
-	inDouble := false
-
-	for i := 0; i < len(sql); i++ {
-		ch := sql[i]
-		switch ch {
-		case '\'':
-			if !inDouble {
-				inSingle = !inSingle
-			}
-		case '"':
-			if !inSingle {
-				inDouble = !inDouble
-			}
-		case ';':
-			if !inSingle && !inDouble {
-				s := strings.TrimSpace(buf.String())
-				if s != "" {
-					stmts = append(stmts, s)
-				}
-				buf.Reset()
-				continue
-			}
-		}
-		buf.WriteByte(ch)
-	}
-	if s := strings.TrimSpace(buf.String()); s != "" {
-		stmts = append(stmts, s)
-	}
-	return stmts
+	return sqlutil.SplitStatements(sql)
 }
 
 // ---- Legacy Utility Commands (sqlite-utils style) ---------------------------

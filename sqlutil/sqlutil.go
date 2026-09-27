@@ -140,3 +140,11 @@ func IsResultProducing(sql string) bool {
 func SplitStatements(script string) []string {
 	return engine.SplitStatements(script)
 }
+
+// StatementComplete reports whether script ends with a complete statement,
+// like SQLite's sqlite3_complete: the last token is a terminating semicolon
+// outside string literals, quoted identifiers, comments and CREATE TRIGGER
+// bodies. Interactive shells use it to decide when to execute buffered input.
+func StatementComplete(script string) bool {
+	return engine.StatementComplete(script)
+}

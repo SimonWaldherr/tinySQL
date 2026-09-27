@@ -16,6 +16,7 @@ import (
 	tsql "github.com/SimonWaldherr/tinySQL"
 	"github.com/SimonWaldherr/tinySQL/exporter"
 	"github.com/SimonWaldherr/tinySQL/internal/engine"
+	"github.com/SimonWaldherr/tinySQL/sqlutil"
 )
 
 // ============================================================================
@@ -1067,29 +1068,11 @@ func truncateSQL(s string, n int) string {
 	return s
 }
 
+// splitStatements splits a script with the engine lexer, so comments with
+// apostrophes and CREATE TRIGGER bodies are linted and diffed as whole
+// statements.
 func splitStatements(sqlStr string) []string {
-	var stmts []string
-	var buf strings.Builder
-	inString := false
-	for i := 0; i < len(sqlStr); i++ {
-		c := sqlStr[i]
-		if c == '\'' {
-			inString = !inString
-		}
-		if c == ';' && !inString {
-			s := strings.TrimSpace(buf.String())
-			if s != "" {
-				stmts = append(stmts, s)
-			}
-			buf.Reset()
-			continue
-		}
-		buf.WriteByte(c)
-	}
-	if s := strings.TrimSpace(buf.String()); s != "" {
-		stmts = append(stmts, s)
-	}
-	return stmts
+	return sqlutil.SplitStatements(sqlStr)
 }
 
 // PrintLintResult prints lint findings to stdout.
@@ -1452,7 +1435,7 @@ func runToolsREPL(tenant string) {
 
 		sqlBuf.WriteString(line)
 
-		if strings.HasSuffix(line, ";") {
+		if strings.HasSuffix(line, ";") && sqlutil.StatementComplete(sqlBuf.String()) {
 			sql := strings.TrimSuffix(strings.TrimSpace(sqlBuf.String()), ";")
 			sqlBuf.Reset()
 

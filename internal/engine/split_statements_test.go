@@ -56,6 +56,30 @@ END;`
 	}
 }
 
+func TestStatementComplete(t *testing.T) {
+	for script, want := range map[string]bool{
+		"":                    false,
+		"   ":                 false,
+		"SELECT 1":            false,
+		"SELECT 1;":           true,
+		"SELECT 1; -- done":   true,
+		"SELECT 1;\nSELECT 2": false,
+		"SELECT 'a;":          false,
+		"SELECT 'a;';":        true,
+		`SELECT "x;`:          false,
+		"-- don't\nSELECT 1;": true,
+		"/* ; */":             false,
+		"CREATE TRIGGER t AFTER INSERT ON x BEGIN INSERT INTO y VALUES (1);":      false,
+		"CREATE TRIGGER t AFTER INSERT ON x BEGIN INSERT INTO y VALUES (1); END":  false,
+		"CREATE TRIGGER t AFTER INSERT ON x BEGIN INSERT INTO y VALUES (1); END;": true,
+		"BEGIN;": true,
+	} {
+		if got := StatementComplete(script); got != want {
+			t.Errorf("StatementComplete(%q) = %v, want %v", script, got, want)
+		}
+	}
+}
+
 func FuzzSplitStatements(f *testing.F) {
 	for _, seed := range []string{"SELECT 1; SELECT 2", "'a;b';", "CREATE TRIGGER t BEGIN x; END;", "/* ; */ --;\n;"} {
 		f.Add(seed)

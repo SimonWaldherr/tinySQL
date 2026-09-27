@@ -541,6 +541,19 @@ func TestSplitStatements_StringWithSemicolon(t *testing.T) {
 	}
 }
 
+func TestLintKeepsTriggerBodiesAndCommentApostrophes(t *testing.T) {
+	script := "-- don't split here; really\nCREATE TABLE t (id INT);\n" +
+		"CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO t VALUES (1); END;"
+	if stmts := splitStatements(script); len(stmts) != 2 {
+		t.Fatalf("expected 2 statements, got %d: %q", len(stmts), stmts)
+	}
+	for _, issue := range LintSQL(script).Issues {
+		if issue.Rule.ID == "L009" {
+			t.Fatalf("valid script reported a syntax error: %+v", issue)
+		}
+	}
+}
+
 func TestCountNesting(t *testing.T) {
 	if n := countNesting("SELECT (1)"); n != 1 {
 		t.Errorf("expected depth 1, got %d", n)

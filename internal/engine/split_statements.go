@@ -13,6 +13,23 @@ import "strings"
 // empty statements are skipped. Splitting never validates syntax: each
 // returned statement is parsed and reported individually by its executor.
 func SplitStatements(script string) []string {
+	statements, _ := scanStatements(script)
+	return statements
+}
+
+// StatementComplete reports whether script ends with a complete statement:
+// its last token is a semicolon that terminates a statement, outside string
+// literals, quoted identifiers, comments and CREATE TRIGGER bodies. It is the
+// equivalent of SQLite's sqlite3_complete and lets interactive shells decide
+// when buffered input is ready to execute. Syntax is not validated.
+func StatementComplete(script string) bool {
+	statements, pending := scanStatements(script)
+	return !pending && len(statements) > 0
+}
+
+// scanStatements splits script and reports whether tokens follow the last
+// terminating semicolon (an unfinished statement).
+func scanStatements(script string) ([]string, bool) {
 	lx := lexer{s: script}
 	var (
 		statements []string
@@ -71,5 +88,5 @@ func SplitStatements(script string) []string {
 			statements = append(statements, statement)
 		}
 	}
-	return statements
+	return statements, start >= 0
 }
