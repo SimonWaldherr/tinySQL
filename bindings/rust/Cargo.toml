@@ -1,0 +1,21 @@
+[package]
+name = "tinysql"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.73"
+description = "Safe Rust bindings for the embedded tinySQL database engine"
+license-file = "../../LICENSE"
+repository = "https://github.com/SimonWaldherr/tinySQL"
+documentation = "https://github.com/SimonWaldherr/tinySQL/blob/main/docs/language-bindings.md"
+readme = "README.md"
+keywords = ["sql", "database", "embedded"]
+categories = ["database", "api-bindings"]
+build = "build.rs"
+links = "tinysql"
+
+[dependencies]
+serde_json = "1"
+
+[profile.dev]
+# The engine itself is compiled by Go; keep Rust test builds quick.
+debug = 1

@@ -109,11 +109,17 @@ func OpenWithDB(db *storage.DB) (*sql.DB, error) {
 }
 
 // newEmbeddedServer keeps the legacy and isolated embedding defaults aligned.
+// A caller-supplied database opened with a durable storage mode (tinysql.OpenDB
+// with ModeDisk, ModeJSON, ...) persists every acknowledged write exactly like
+// the equivalent mode= DSN; a plain NewDB/LoadFromFile database keeps the
+// caller-managed snapshot behavior.
 func newEmbeddedServer(db *storage.DB) *server {
-	return newServer(db, cfg{
+	s := newServer(db, cfg{
 		tenant:      "default",
 		maxReaders:  4,
 		maxWriters:  1,
 		busyTimeout: 250 * time.Millisecond,
 	})
+	s.usesStorageBackend = db.Backend() != nil && db.StorageMode() != storage.ModeMemory
+	return s
 }

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tinysql"
+version = "0.2.0"
+description = "Embedded tinySQL database engine with a DB-API 2.0 interface"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "AGPL-3.0" }
+authors = [{ name = "Simon Waldherr" }]
+keywords = ["sql", "database", "embedded", "dbapi"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Go",
+    "Topic :: Database :: Database Engines/Servers",
+]
+
+[project.urls]
+Homepage = "https://github.com/SimonWaldherr/tinySQL"
+Documentation = "https://github.com/SimonWaldherr/tinySQL/blob/main/docs/language-bindings.md"
+
+[tool.setuptools]
+packages = ["tinysql"]
+
+[tool.setuptools.package-data]
+tinysql = ["py.typed", "libtinysql.so", "libtinysql.dylib", "tinysql.dll"]

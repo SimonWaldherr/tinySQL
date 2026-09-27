@@ -1,15 +1,24 @@
-.PHONY: all build run clean
+.PHONY: all build test run clean
 
-LIB     := libtinysql.so
-PACKAGE := .
+GO      ?= go
+PYTHON  ?= python3
+ROOT    := ../..
+LIBNAME := $(if $(filter Darwin,$(shell uname -s)),libtinysql.dylib,libtinysql.so)
+LIB     := tinysql/$(LIBNAME)
 
 all: build
 
+# Build the shared library from the unified C ABI into the package directory.
 build:
-	GO111MODULE=on go build -buildmode=c-shared -o $(LIB) $(PACKAGE)
+	cd $(ROOT) && $(GO) build -trimpath -buildmode=c-shared -o bindings/python/$(LIB) ./bindings/c
+	rm -f tinysql/libtinysql.h
+
+test: build
+	$(PYTHON) -m unittest discover -s tests -v
 
 run: build
-	python3 example.py
+	$(PYTHON) examples/quickstart.py
 
 clean:
-	rm -f $(LIB) libtinysql.h
+	rm -f tinysql/libtinysql.so tinysql/libtinysql.dylib tinysql/tinysql.dll tinysql/libtinysql.h
+	rm -rf build dist *.egg-info tinysql/__pycache__ tests/__pycache__

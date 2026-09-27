@@ -1,4 +1,4 @@
 module CTinySQL {
-    header "CTinySQL.h"
+    header "tinysql.h"
     export *
 }

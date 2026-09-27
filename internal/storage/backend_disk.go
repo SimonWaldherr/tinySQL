@@ -723,12 +723,25 @@ func (b *DiskBackend) readTableFile(path string) (*Table, error) {
 		for _, row := range dt.Rows {
 			for i, col := range dt.Cols {
 				if i < len(row) {
-					if number, ok := row[i].(json.Number); ok && col.Type == IntType && col.Affinity == AffinityDefault {
+					if number, ok := row[i].(json.Number); ok && col.Type == IntType {
+						// INT columns hold Go ints. Decoding them through
+						// float64 changed their type and lost precision above
+						// 2^53. A declared INT/INTEGER column has SQLite
+						// integer affinity, which may also keep a REAL it could
+						// not store losslessly; only that case stays float64.
 						value, err := strconv.Atoi(string(number))
-						if err != nil {
+						switch {
+						case err == nil:
+							row[i] = value
+						case col.Affinity == AffinityDefault:
 							return nil, fmt.Errorf("decode INT column %q: %w", col.Name, err)
+						default:
+							real, err := number.Float64()
+							if err != nil {
+								return nil, fmt.Errorf("decode INT column %q: %w", col.Name, err)
+							}
+							row[i] = real
 						}
-						row[i] = value
 					} else {
 						value, err := normalizeJSONNumbers(row[i])
 						if err != nil {

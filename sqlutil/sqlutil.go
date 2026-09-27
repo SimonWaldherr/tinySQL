@@ -131,3 +131,12 @@ func IsResultProducing(sql string) bool {
 		strings.HasPrefix(upper, "SHOW") ||
 		strings.HasPrefix(upper, "EXPLAIN")
 }
+
+// SplitStatements splits a multi-statement SQL script with tinySQL's lexer.
+// Semicolons inside string/BLOB literals, quoted identifiers and comments do
+// not split, and CREATE TRIGGER ... BEGIN ... END bodies stay intact.
+// Statements are returned trimmed and without their terminating semicolon.
+// Syntax is not validated; parse or execute each statement to report errors.
+func SplitStatements(script string) []string {
+	return engine.SplitStatements(script)
+}

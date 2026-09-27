@@ -24,25 +24,25 @@ func testDatabase(t *testing.T) uint64 {
 func TestDatabaseRoundTripAndIsolation(t *testing.T) {
 	id := testDatabase(t)
 	for _, statement := range []string{"CREATE TABLE items (id INT, name TEXT, payload BLOB)", "CREATE TABLE empty_table (id INT)"} {
-		if _, err := runSQL(id, statement, "[]", false); err != nil {
+		if _, err := runSQL(id, statement, "[]", modeExec); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := runSQL(id, "INSERT INTO items VALUES (?, ?, ?)", `[9223372036854775807,"Grüße ' 🦊",{"blob":"AAH/"}]`, false); err != nil {
+	if _, err := runSQL(id, "INSERT INTO items VALUES (?, ?, ?)", `[9223372036854775807,"Grüße ' 🦊",{"blob":"AAH/"}]`, modeExec); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := runSQL(id, "SELECT id, name, payload FROM items WHERE id = ?", `[9223372036854775807]`, true)
+	rows, err := runSQL(id, "SELECT id, name, payload FROM items WHERE id = ?", `[9223372036854775807]`, modeQuery)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(rows.Rows) != 1 || rows.Rows[0][0] != int64(math.MaxInt64) || rows.Rows[0][1] != "Grüße ' 🦊" {
 		t.Fatalf("unexpected result: %#v", rows)
 	}
-	if rows.Rows[0][2].(map[string]string)["blob"] != "AAH/" {
+	if blob, ok := rows.Rows[0][2].([]byte); !ok || string(blob) != "\x00\x01\xff" {
 		t.Fatal(rows.Rows)
 	}
 	other := testDatabase(t)
-	if _, err := runSQL(other, "SELECT * FROM items", "[]", true); err == nil {
+	if _, err := runSQL(other, "SELECT * FROM items", "[]", modeQuery); err == nil {
 		t.Fatal("databases share state")
 	}
 	path := filepath.Join(t.TempDir(), "Grüße.snapshot")
@@ -54,14 +54,14 @@ func TestDatabaseRoundTripAndIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer closeDatabase(restored.Handle)
-	result, err := runSQL(restored.Handle, "SELECT * FROM items", "[]", true)
+	result, err := runSQL(restored.Handle, "SELECT * FROM items", "[]", modeQuery)
 	if err != nil || len(result.Rows) != 1 {
 		t.Fatalf("restore: %#v, %v", result, err)
 	}
 	if _, err := closeDatabase(id); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runSQL(id, "SELECT 1", "[]", true); err == nil {
+	if _, err := runSQL(id, "SELECT 1", "[]", modeQuery); err == nil {
 		t.Fatal("closed handle accepted")
 	}
 	if _, err := openDatabase(filepath.Join(t.TempDir(), "missing")); err == nil {
@@ -78,7 +78,7 @@ func TestParametersAndErrorEnvelope(t *testing.T) {
 	for _, fn := range []func() (response, error){
 		func() (response, error) { panic("test panic") },
 		func() (response, error) { return response{Rows: [][]any{{math.NaN()}}}, nil },
-		func() (response, error) { return runSQL(0, "SELECT 1", "[]", true) },
+		func() (response, error) { return runSQL(0, "SELECT 1", "[]", modeQuery) },
 	} {
 		var result response
 		if err := json.Unmarshal(encodeResponse(fn), &result); err != nil || result.Error == "" {
@@ -131,7 +131,7 @@ func TestSnapshotsHaveNoImplicitPersistence(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			id := testDatabase(t)
 			for _, statement := range []string{"CREATE TABLE items (id INT)", "BEGIN", "INSERT INTO items VALUES (7)", "COMMIT"} {
-				if _, err := runSQL(id, statement, "[]", false); err != nil {
+				if _, err := runSQL(id, statement, "[]", modeExec); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -147,7 +147,7 @@ func TestSnapshotsHaveNoImplicitPersistence(t *testing.T) {
 			if _, err := os.Stat(path + ".wal"); !os.IsNotExist(err) {
 				t.Fatalf("unexpected WAL: %v", err)
 			}
-			if _, err := runSQL(loaded.Handle, "INSERT INTO items VALUES (8)", "[]", false); err != nil {
+			if _, err := runSQL(loaded.Handle, "INSERT INTO items VALUES (8)", "[]", modeExec); err != nil {
 				t.Fatal(err)
 			}
 			unchanged, err := openDatabase(path)
@@ -155,7 +155,7 @@ func TestSnapshotsHaveNoImplicitPersistence(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer closeDatabase(unchanged.Handle)
-			rows, err := runSQL(unchanged.Handle, "SELECT id FROM items", "[]", true)
+			rows, err := runSQL(unchanged.Handle, "SELECT id FROM items", "[]", modeQuery)
 			if err != nil || len(rows.Rows) != 1 || rows.Rows[0][0] != int64(7) {
 				t.Fatalf("snapshot changed: %#v, %v", rows, err)
 			}
@@ -176,18 +176,18 @@ func TestSnapshotsHaveNoImplicitPersistence(t *testing.T) {
 func TestTransactionConnectionAndConcurrentClose(t *testing.T) {
 	id := testDatabase(t)
 	for _, statement := range []string{"CREATE TABLE items (id INT)", "BEGIN", "INSERT INTO items VALUES (1)", "ROLLBACK"} {
-		if _, err := runSQL(id, statement, "[]", false); err != nil {
+		if _, err := runSQL(id, statement, "[]", modeExec); err != nil {
 			t.Fatal(err)
 		}
 	}
-	result, err := runSQL(id, "SELECT * FROM items", "[]", true)
+	result, err := runSQL(id, "SELECT * FROM items", "[]", modeQuery)
 	if err != nil || len(result.Rows) != 0 {
 		t.Fatalf("rollback: %#v, %v", result, err)
 	}
 	var group sync.WaitGroup
 	for i := 0; i < 16; i++ {
 		group.Add(1)
-		go func() { defer group.Done(); _, _ = runSQL(id, "SELECT * FROM items", "[]", true) }()
+		go func() { defer group.Done(); _, _ = runSQL(id, "SELECT * FROM items", "[]", modeQuery) }()
 	}
 	group.Add(1)
 	go func() { defer group.Done(); _, _ = closeDatabase(id) }()

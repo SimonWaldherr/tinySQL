@@ -82,3 +82,39 @@ func TestOpenWithDBRejectsInvalidDatabase(t *testing.T) {
 		t.Fatal("closed database accepted")
 	}
 }
+
+// A caller-supplied database with a durable backend must persist each
+// acknowledged write, like the equivalent mode= DSN, not only on Close.
+func TestOpenWithDBPersistsDurableModesPerWrite(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	native, err := tinysql.OpenDB(tinysql.StorageConfig{Mode: tinysql.ModeJSON, Path: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer native.Close()
+	pool, err := driver.OpenWithDB(native)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	for _, statement := range []string{"CREATE TABLE notes (id INT, body TEXT)", "INSERT INTO notes VALUES (1, 'kept')"} {
+		if _, err := pool.ExecContext(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Read the files through an independent read-only database while the
+	// writer is still open.
+	reader, err := tinysql.OpenDB(tinysql.StorageConfig{Mode: tinysql.ModeJSON, Path: dir, ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	rs, err := tinysql.ExecSQL(ctx, reader, "default", "SELECT body FROM notes WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rs.Rows) != 1 || rs.Rows[0]["body"] != "kept" {
+		t.Fatalf("write not persisted before close: %#v", rs.Rows)
+	}
+}

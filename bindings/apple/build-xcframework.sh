@@ -36,7 +36,7 @@ build_slice() {
         CGO_CFLAGS="-target $target -isysroot \"$sdk_path\"" \
         CGO_LDFLAGS="-target $target -isysroot \"$sdk_path\"" \
         go build -trimpath -buildmode=c-archive \
-        -o "$stage/$name/libCTinySQL.a" ./bindings/apple
+        -o "$stage/$name/libCTinySQL.a" ./bindings/c
 }
 
 build_slice macos-arm64 macosx darwin arm64 arm64-apple-macos12.0
@@ -44,7 +44,7 @@ build_slice macos-amd64 macosx darwin amd64 x86_64-apple-macos12.0
 mkdir -p "$stage/macos"
 xcrun lipo -create "$stage/macos-arm64/libCTinySQL.a" "$stage/macos-amd64/libCTinySQL.a" \
     -output "$stage/macos/libCTinySQL.a"
-args=(-library "$stage/macos/libCTinySQL.a" -headers "$root/bindings/apple/include")
+args=(-library "$stage/macos/libCTinySQL.a" -headers "$root/bindings/c/include")
 if [[ "$mode" == all ]]; then
     build_slice ios-arm64 iphoneos ios arm64 arm64-apple-ios15.0
     build_slice simulator-arm64 iphonesimulator ios arm64 arm64-apple-ios15.0-simulator
@@ -52,8 +52,8 @@ if [[ "$mode" == all ]]; then
     mkdir -p "$stage/simulator"
     xcrun lipo -create "$stage/simulator-arm64/libCTinySQL.a" "$stage/simulator-amd64/libCTinySQL.a" \
         -output "$stage/simulator/libCTinySQL.a"
-    args+=(-library "$stage/ios-arm64/libCTinySQL.a" -headers "$root/bindings/apple/include")
-    args+=(-library "$stage/simulator/libCTinySQL.a" -headers "$root/bindings/apple/include")
+    args+=(-library "$stage/ios-arm64/libCTinySQL.a" -headers "$root/bindings/c/include")
+    args+=(-library "$stage/simulator/libCTinySQL.a" -headers "$root/bindings/c/include")
 fi
 xcodebuild -create-xcframework "${args[@]}" -output "$stage/CTinySQL.xcframework"
 rm -rf "$package/CTinySQL.xcframework"
