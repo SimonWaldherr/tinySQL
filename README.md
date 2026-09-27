@@ -41,17 +41,15 @@ func main() {
 	db := tinysql.NewDB()
 	defer db.Close()
 
-	for _, sql := range []string{
-		"CREATE TABLE users (id INT PRIMARY KEY, name TEXT)",
-		"INSERT INTO users VALUES (1, 'Ada'), (2, 'Grace')",
-	} {
-		if _, err := tinysql.ExecSQL(ctx, db, "default", sql); err != nil {
-			panic(err)
-		}
+	if _, err := tinysql.ExecScript(ctx, db, "default", `
+		CREATE TABLE users (id INT PRIMARY KEY, name TEXT);
+		INSERT INTO users VALUES (1, 'Ada'), (2, 'Grace');`); err != nil {
+		panic(err)
 	}
 
-	result, err := tinysql.ExecSQL(ctx, db, "default",
-		"SELECT id, name FROM users ORDER BY id")
+	// Bind values with ?, $1 or :1 instead of formatting SQL text.
+	result, err := tinysql.ExecSQLArgs(ctx, db, "default",
+		"SELECT id, name FROM users WHERE id >= ? ORDER BY id", 1)
 	if err != nil {
 		panic(err)
 	}
@@ -65,6 +63,26 @@ For database/sql, streaming, columnar results, transactions, and the query
 builder, see [developer integration](docs/developer-integration.md) and the
 [driver package](./driver).
 
+### Rust, Python, Swift and C
+
+The same engine embeds into other languages through one C ABI
+([`bindings/c`](bindings/c/README.md)); see the
+[language bindings guide](docs/language-bindings.md).
+
+```python
+import tinysql                                   # make -C bindings/python build
+with tinysql.connect("./data", mode="wal") as conn:
+    conn.execute("CREATE TABLE IF NOT EXISTS users (id INT PRIMARY KEY, name TEXT)")
+    conn.executemany("INSERT INTO users VALUES (?, ?)", [(1, "Ada"), (2, "Grace")])
+    print(conn.execute("SELECT name FROM users WHERE id = ?", (2,)).fetchone())
+```
+
+```rust
+let db = tinysql::Database::open_in_memory()?;   // tinysql = { path = "bindings/rust" }
+db.execute_script("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")?;
+db.execute("INSERT INTO users VALUES (?, ?)", tinysql::params![1, "Ada"])?;
+```
+
 ## Choose a workflow
 
 | Goal | Start with |
@@ -74,6 +92,7 @@ builder, see [developer integration](docs/developer-integration.md) and the
 | Embed a local SQL service | [server](cmd/server/README.md) or [tinysqld](cmd/tinysqld/README.md) |
 | Build a browser app | [query_files_wasm](cmd/query_files_wasm/README.md), [wasm_browser](cmd/wasm_browser/README.md), or [wasm_node](cmd/wasm_node/README.md) |
 | Embed in a Swift / Xcode app | [Swift package and Apple XCFramework](bindings/swift/README.md) for macOS, iOS and iPadOS |
+| Embed in Rust, Python or C | [Rust crate](bindings/rust/README.md), [Python package](bindings/python/README.md), [C ABI](bindings/c/README.md) |
 | Use AI tooling or local RAG | [tinysql-mcp-server](cmd/tinysql-mcp-server/README.md) and the [RAG guide](docs/rag-guide.md) |
 | Browse every runnable program | [command index](cmd/README.md) |
 
@@ -84,7 +103,7 @@ builder, see [developer integration](docs/developer-integration.md) and the
 | SQL | DDL/DML, CTEs, joins, grouping, windows, views, triggers, table-valued functions, stored procedures, jobs, and common SQLite-compatible PRAGMAs |
 | Data | CSV/TSV, JSON/NDJSON, XML, YAML, Excel, GeoJSON, TopoJSON, KML, OSM XML, routing graphs, Shapefiles, GeoPackage, and MBTiles |
 | Search | Full-text, vector, hybrid search, RAG helpers, regex, JSON, URL, HTML, date, math, bitmap, and hash functions |
-| Deployment | Pure-Go embedded API, database/sql driver, CLI, HTTP/gRPC server, browser/WASM builds, and multiple storage backends |
+| Deployment | Pure-Go embedded API, database/sql driver, Rust/Python/Swift/C bindings, CLI, HTTP/gRPC server, browser/WASM builds, and multiple storage backends |
 
 The complete SQL function reference is [FUNCTIONS.sql](FUNCTIONS.sql). Runnable
 feature examples are in [example_showcase.sql](example_showcase.sql).
@@ -168,6 +187,7 @@ distributed transactions are not implemented.
 | Guide | Use it for |
 | --- | --- |
 | [Developer integration](docs/developer-integration.md) | Go API, database/sql, streaming, and browser embedding |
+| [Language bindings](docs/language-bindings.md) | Rust, Python, Swift and C: types, transactions, persistence, performance |
 | [CLI guide](docs/cli-guide.md) | Shells, servers, and file-query tools |
 | [Storage guide](docs/storage-guide.md) | Backends, DSNs, read-only mode, and large artifacts |
 | [RAG guide](docs/rag-guide.md) | Vector, hybrid retrieval, reranking, and context |
@@ -182,6 +202,7 @@ distributed transactions are not implemented.
 ```bash
 go test ./...
 go vet ./...
+make test-bindings   # C ABI, Python package and Rust crate
 ```
 
 The browser playground build lives in cmd/query_files_wasm:

@@ -37,6 +37,10 @@ make build-all
 | `make wasm-check` | Compile the standard-Go browser, Node, and query-files WebAssembly targets without retaining artifacts. |
 | `make tinygo-wasm` | Build and execute the Node WASM smoke test using the pinned TinyGo Docker image. |
 | `make ci` | The complete standard-Go GitHub Actions matrix: formatting, module verification, native/WASM builds, vet, tests, race detection, and coverage. |
+| `make build-c` | Build the C ABI (`libtinysql.a`, shared library, `tinysql.h`) into `bindings/c/build`. |
+| `make test-c` / `make test-python` / `make test-rust` | Test the C ABI (race detector plus a C program), the Python package, or the Rust crate. |
+| `make test-bindings` | All three binding suites. |
+| `make build-apple` / `make test-swift` | Build the Swift XCFramework and run the Swift tests (macOS with Xcode). |
 | `cd odbc && make linux` | Build the c-shared ODBC driver from its nested Go module. |
 | `make coverage` | Run tests and open an HTML coverage report. |
 | `make bench` | Benchmarks with allocation output. |

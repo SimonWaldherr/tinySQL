@@ -21,6 +21,16 @@ The CLI, HTTP API, and gRPC API are versioned at their transport boundaries.
 New endpoints and optional response fields are additive. Existing output modes
 remain compatible unless a major release explicitly says otherwise.
 
+## Native C ABI
+
+`bindings/c/include/tinysql.h` versions the native interface used by the
+Rust, Python and Swift bindings. `TinySQLABIVersion()` returns the ABI
+version (currently `2`). A new version only adds functions and optional JSON
+response members; existing signatures, ownership rules and response shapes
+stay valid, so a binding checks for a minimum version. Removing or changing a
+function requires a major release. The legacy single-database functions of
+the former Python bridge remain exported.
+
 ## Streams
 
 `ExecuteStream`, `ExecSQLStream`, and `ExecuteCompiledStream` use a default

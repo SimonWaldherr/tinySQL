@@ -104,3 +104,7 @@ demo.mbtiles
 /bindings/swift/CTinySQL.xcframework/
 /bindings/swift/.build/
 /bindings/swift/.swiftpm/
+
+# Python bytecode
+__pycache__/
+*.py[cod]

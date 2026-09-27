@@ -201,7 +201,7 @@ jobs:
           govulncheck ./...
 
   build-bindings:
-    name: Build Bindings
+    name: Test Bindings
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
@@ -212,10 +212,19 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build Python Bindings
-        run: |
-          cd bindings/python
-          make build
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Test C ABI (race detector and C smoke program)
+        run: make test-c
+
+      - name: Test Python package
+        run: make test-python
+
+      - name: Test Rust crate
+        run: make test-rust
 
       - name: Build ODBC Bindings
         run: |

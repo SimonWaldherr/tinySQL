@@ -20,7 +20,11 @@ to preserve when changing internals, see [architecture.md](./architecture.md).
 |-- cmd/                     Executables, demos, web apps, WASM builds
 |-- examples/                TinyGo smoke test and RP2350 bare-metal example
 |-- benchmarks/              Benchmark tests
-|-- bindings/python/         Python bindings and packaging example
+|-- bindings/c/              C ABI shared by all native bindings (tinysql.h)
+|-- bindings/python/         Python DB-API 2.0 package on the C ABI
+|-- bindings/rust/           Rust crate linking the C ABI statically
+|-- bindings/swift/          Swift package for macOS, iOS and iPadOS
+|-- bindings/apple/          XCFramework build script for the Swift package
 |-- odbc/                    ODBC bridge and its tests
 |-- data/                    Sample datasets for demos and tests
 |-- docs/                    Guides and integration notes
