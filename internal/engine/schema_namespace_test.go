@@ -50,7 +50,7 @@ func TestSchemaQualifiedTablesViewsAndMaterializedViews(t *testing.T) {
 	}
 
 	rs = querySchemaSQL(t, ctx, db, "SELECT total FROM sales.order_total")
-	if len(rs.Rows) != 1 || rs.Rows[0]["total"] != float64(17) {
+	if len(rs.Rows) != 1 || rs.Rows[0]["total"] != 17 {
 		t.Fatalf("schema-qualified materialized view rows = %#v", rs.Rows)
 	}
 }

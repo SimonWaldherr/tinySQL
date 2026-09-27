@@ -531,16 +531,16 @@ func evalRawUnary(plan *simpleSelectPlan, raw []any, ex *Unary) (any, error) {
 func applyUnaryOp(op string, v any) (any, error) {
 	switch op {
 	case "+":
-		if f, ok := numeric(v); ok {
-			return f, nil
+		if n, ok := unaryNumeric("+", v); ok {
+			return n, nil
 		}
 		if v == nil {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("unary + non-numeric")
 	case "-":
-		if f, ok := numeric(v); ok {
-			return -f, nil
+		if n, ok := unaryNumeric("-", v); ok {
+			return n, nil
 		}
 		if v == nil {
 			return nil, nil

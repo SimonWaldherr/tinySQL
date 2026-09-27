@@ -501,8 +501,12 @@ func collectConstraintEqualityTerms(expr Expr, table *storage.Table, colIndex ma
 	if !ok {
 		return 0
 	}
-	value, ok := signedNumericLiteral(operand)
-	if !ok || !(value > -0x1p53 && value < 0x1p53) || math.Trunc(value) != value {
+	literal, ok := signedNumericLiteral(operand)
+	if !ok {
+		return 0
+	}
+	value, ok := signedIntegerKey(literal)
+	if !ok {
 		return 0
 	}
 	pos, found := colIndex[ref.Lower]
@@ -522,7 +526,7 @@ func collectConstraintEqualityTerms(expr Expr, table *storage.Table, colIndex ma
 	if index == nil || index.nonIntegerRows != 0 {
 		return 0
 	}
-	out[pos] = int64(value)
+	out[pos] = value
 	return 1
 }
 
@@ -738,23 +742,35 @@ func collectEqualityTerms(expr Expr, colIndex map[string]int, out map[int]any) i
 	return 0
 }
 
-// signedNumericLiteral preserves unary evaluation's float64 result. In
-// particular, negating a large integer must not silently become exact int64
-// arithmetic. Bound operands are read afresh by index selection each execution.
-func signedNumericLiteral(expr Expr) (float64, bool) {
+// signedNumericLiteral returns the value unary evaluation produces for a
+// sign applied to a numeric literal: an exact integer for integer literals
+// (REAL only for -(-2^63)), float64 for REAL literals. Plans must use the
+// evaluator's value so index seeks and scans agree. Bound operands are read
+// afresh by index selection each execution.
+func signedNumericLiteral(expr Expr) (any, bool) {
 	u, ok := expr.(*Unary)
 	if !ok || (u.Op != "+" && u.Op != "-") {
-		return 0, false
+		return nil, false
 	}
 	lit, ok := u.Expr.(*Literal)
 	if !ok {
+		return nil, false
+	}
+	return unaryNumeric(u.Op, lit.Val)
+}
+
+// signedIntegerKey converts a signed literal into an exact integer seek key.
+// Integers are exact at any magnitude. A REAL qualifies only when it is
+// integral and inside ±2^53, where distinct integers cannot round to it.
+func signedIntegerKey(value any) (int64, bool) {
+	if i, ok := integerOperand(value); ok {
+		return i, true
+	}
+	f, ok := value.(float64)
+	if !ok || !(f > -0x1p53 && f < 0x1p53) || math.Trunc(f) != f {
 		return 0, false
 	}
-	v, ok := numeric(lit.Val)
-	if u.Op == "-" {
-		v = -v
-	}
-	return v, ok
+	return int64(f), true
 }
 
 // collectSecondaryEqualityTerms adds signed numeric operands only for loaded
@@ -783,16 +799,21 @@ func collectSecondaryEqualityTerms(expr Expr, table *storage.Table, colIndex map
 	if !ok {
 		return 0
 	}
-	value, ok := signedNumericLiteral(operand)
-	// Distinct integers can round to the same float at and beyond these bounds.
-	if !ok || !(value > -0x1p53 && value < 0x1p53) || math.Trunc(value) != value {
+	literal, ok := signedNumericLiteral(operand)
+	if !ok {
+		return 0
+	}
+	// Distinct integers can round to the same REAL beyond ±2^53; see
+	// signedIntegerKey.
+	value, ok := signedIntegerKey(literal)
+	if !ok {
 		return 0
 	}
 	pos, found := colIndex[ref.Lower]
 	if !found || !numericColumnIsIntegerOrNull(table, pos) {
 		return 0
 	}
-	out[pos] = int64(value)
+	out[pos] = value
 	return 1
 }
 

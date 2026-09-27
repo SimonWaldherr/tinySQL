@@ -22,10 +22,7 @@
 package engine
 
 import (
-	"math/big"
 	"strings"
-
-	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 // simpleJoinAggregatePlan combines a two-table equi-join plan with a single
@@ -235,30 +232,7 @@ func accumulateSimpleJoinAggregateState(join *simpleJoinPlan, left, right []any,
 			if v == nil {
 				continue
 			}
-			if f, ok := numeric(v); ok {
-				if state.useRat != nil && state.useRat[i] {
-					state.sumRat[i].Add(state.sumRat[i], new(big.Rat).SetFloat64(f))
-				} else {
-					state.sumFloat[i] += f
-				}
-				state.counts[i]++
-				continue
-			}
-			if rv, ok := storage.DecimalFromAny(v); ok {
-				if state.useRat == nil {
-					state.useRat = make([]bool, len(projs))
-					state.sumRat = make([]*big.Rat, len(projs))
-				}
-				if !state.useRat[i] {
-					state.sumRat[i] = new(big.Rat)
-					if state.counts[i] > 0 {
-						state.sumRat[i].SetFloat64(state.sumFloat[i])
-					}
-					state.useRat[i] = true
-				}
-				state.sumRat[i].Add(state.sumRat[i], new(big.Rat).Set(rv))
-				state.counts[i]++
-			}
+			state.addSum(i, v, len(projs))
 		case aggMin, aggMax:
 			v, err := evalJoinRawExpr(join, left, right, proj.arg)
 			if err != nil {

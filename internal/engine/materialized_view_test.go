@@ -29,10 +29,10 @@ func TestCreateViewSupportsCTE(t *testing.T) {
 	if len(rs.Rows) != 2 {
 		t.Fatalf("rows = %d, want 2: %#v", len(rs.Rows), rs.Rows)
 	}
-	if rs.Rows[0]["customer_id"] != 1 || rs.Rows[0]["total"] != float64(10) {
+	if rs.Rows[0]["customer_id"] != 1 || rs.Rows[0]["total"] != 10 {
 		t.Fatalf("first row = %#v", rs.Rows[0])
 	}
-	if rs.Rows[1]["customer_id"] != 2 || rs.Rows[1]["total"] != float64(7) {
+	if rs.Rows[1]["customer_id"] != 2 || rs.Rows[1]["total"] != 7 {
 		t.Fatalf("second row = %#v", rs.Rows[1])
 	}
 }
@@ -53,19 +53,19 @@ func TestMaterializedViewWithCTEAndManualRefresh(t *testing.T) {
 	`)
 
 	rs := mvQuerySQL(t, ctx, db, "SELECT total FROM sale_totals")
-	if len(rs.Rows) != 1 || rs.Rows[0]["total"] != float64(10) {
+	if len(rs.Rows) != 1 || rs.Rows[0]["total"] != 10 {
 		t.Fatalf("initial materialized rows = %#v", rs.Rows)
 	}
 
 	mvExecSQL(t, ctx, db, "INSERT INTO events VALUES ('sale', 5)")
 	rs = mvQuerySQL(t, ctx, db, "SELECT total FROM sale_totals")
-	if len(rs.Rows) != 1 || rs.Rows[0]["total"] != float64(10) {
+	if len(rs.Rows) != 1 || rs.Rows[0]["total"] != 10 {
 		t.Fatalf("cache should remain unchanged before manual refresh: %#v", rs.Rows)
 	}
 
 	mvExecSQL(t, ctx, db, "REFRESH MATERIALIZED VIEW sale_totals")
 	rs = mvQuerySQL(t, ctx, db, "SELECT total FROM sale_totals")
-	if len(rs.Rows) != 1 || rs.Rows[0]["total"] != float64(15) {
+	if len(rs.Rows) != 1 || rs.Rows[0]["total"] != 15 {
 		t.Fatalf("refreshed materialized rows = %#v", rs.Rows)
 	}
 }
@@ -195,7 +195,7 @@ func TestAlterViewMaterializeAndBackToView(t *testing.T) {
 	}
 
 	rs := mvQuerySQL(t, ctx, db, "SELECT total FROM paid_total_convert")
-	if len(rs.Rows) != 1 || rs.Rows[0]["total"] != float64(10) {
+	if len(rs.Rows) != 1 || rs.Rows[0]["total"] != 10 {
 		t.Fatalf("unexpected materialized conversion rows: %#v", rs.Rows)
 	}
 
@@ -215,7 +215,7 @@ func TestAlterViewMaterializeAndBackToView(t *testing.T) {
 
 	mvExecSQL(t, ctx, db, "INSERT INTO orders VALUES (3, 7, 'paid')")
 	rs = mvQuerySQL(t, ctx, db, "SELECT total FROM paid_total_convert")
-	if len(rs.Rows) != 1 || rs.Rows[0]["total"] != float64(17) {
+	if len(rs.Rows) != 1 || rs.Rows[0]["total"] != 17 {
 		t.Fatalf("converted view should re-run query: %#v", rs.Rows)
 	}
 }
@@ -286,7 +286,7 @@ func TestMaterializedViewDependenciesAndInvalidateOnChange(t *testing.T) {
 	}
 
 	rs = mvQuerySQL(t, ctx, db, "SELECT total FROM dep_paid_totals WHERE customer_id = 1")
-	if len(rs.Rows) != 1 || rs.Rows[0]["total"] != float64(10) {
+	if len(rs.Rows) != 1 || rs.Rows[0]["total"] != 10 {
 		t.Fatalf("initial materialized rows = %#v", rs.Rows)
 	}
 
@@ -297,7 +297,7 @@ func TestMaterializedViewDependenciesAndInvalidateOnChange(t *testing.T) {
 	}
 
 	rs = mvQuerySQL(t, ctx, db, "SELECT total FROM dep_paid_totals WHERE customer_id = 1")
-	if len(rs.Rows) != 1 || rs.Rows[0]["total"] != float64(17) {
+	if len(rs.Rows) != 1 || rs.Rows[0]["total"] != 17 {
 		t.Fatalf("stale read should refresh materialized rows: %#v", rs.Rows)
 	}
 	rs = mvQuerySQL(t, ctx, db, "SELECT name, is_stale FROM catalog.materialized_views WHERE name = 'dep_paid_totals'")
@@ -324,7 +324,7 @@ func TestMaterializedViewInvalidateOnChangeIsOptIn(t *testing.T) {
 		t.Fatalf("non opt-in materialized view should stay fresh: %#v", rs.Rows)
 	}
 	rs = mvQuerySQL(t, ctx, db, "SELECT total FROM noinv_total")
-	if len(rs.Rows) != 1 || rs.Rows[0]["total"] != float64(10) {
+	if len(rs.Rows) != 1 || rs.Rows[0]["total"] != 10 {
 		t.Fatalf("non opt-in materialized view should keep cache: %#v", rs.Rows)
 	}
 }

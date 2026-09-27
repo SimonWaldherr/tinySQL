@@ -50,7 +50,7 @@ func TestMaterializedUngroupedAggregate(t *testing.T) {
 	}{
 		{"simple", `SELECT COUNT(*) AS n, SUM(val) AS total FROM t`, rows, []Row{{"n": 4, "total": 6.0}}, false},
 		{"having", `SELECT COUNT(*) AS n, SUM(val) AS total FROM t HAVING COUNT(*) > 0`, rows, []Row{{"n": 4, "total": 6.0}}, false},
-		{"median-expression", `SELECT COUNT(*) + 1 AS n, MEDIAN(val) AS median FROM t`, rows, []Row{{"n": 5.0, "median": 2.0}}, false},
+		{"median-expression", `SELECT COUNT(*) + 1 AS n, MEDIAN(val) AS median FROM t`, rows, []Row{{"n": 5, "median": 2.0}}, false},
 		{"empty-simple", `SELECT COUNT(*) AS n, SUM(val) AS total FROM t`, nil, []Row{{"n": 0, "total": nil}}, false},
 		{"empty-having", `SELECT COUNT(*) AS n, SUM(val) AS total FROM t HAVING COUNT(*) IS NOT NULL`, nil, []Row{{"n": 0, "total": nil}}, false},
 		{"empty-rejected", `SELECT COUNT(*) AS n FROM t HAVING COUNT(*) > 0`, nil, nil, false},

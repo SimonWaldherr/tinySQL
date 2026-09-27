@@ -20,7 +20,7 @@ func Example_viewsAndMaterializedViews() {
 			panic(err)
 		}
 	}
-	querySQL := func(sql string) float64 {
+	querySQL := func(sql string) any {
 		stmt, err := tsql.ParseSQL(sql)
 		if err != nil {
 			panic(err)
@@ -29,7 +29,7 @@ func Example_viewsAndMaterializedViews() {
 		if err != nil {
 			panic(err)
 		}
-		return rs.Rows[0]["total"].(float64)
+		return rs.Rows[0]["total"]
 	}
 
 	execSQL("CREATE TABLE orders (customer_id INT, amount INT, status TEXT)")
@@ -44,7 +44,7 @@ func Example_viewsAndMaterializedViews() {
 		FROM paid_orders
 		GROUP BY customer_id
 	`)
-	fmt.Printf("view: %.0f\n", querySQL("SELECT total FROM paid_customer_totals WHERE customer_id = 1"))
+	fmt.Printf("view: %v\n", querySQL("SELECT total FROM paid_customer_totals WHERE customer_id = 1"))
 
 	execSQL(`
 		CREATE MATERIALIZED VIEW paid_customer_totals_mv AS
@@ -58,14 +58,14 @@ func Example_viewsAndMaterializedViews() {
 	`)
 
 	execSQL("INSERT INTO orders VALUES (1, 5, 'paid')")
-	fmt.Printf("materialized before refresh: %.0f\n", querySQL("SELECT total FROM paid_customer_totals_mv WHERE customer_id = 1"))
+	fmt.Printf("materialized before refresh: %v\n", querySQL("SELECT total FROM paid_customer_totals_mv WHERE customer_id = 1"))
 
 	execSQL("REFRESH MATERIALIZED VIEW paid_customer_totals_mv")
-	fmt.Printf("materialized after refresh: %.0f\n", querySQL("SELECT total FROM paid_customer_totals_mv WHERE customer_id = 1"))
+	fmt.Printf("materialized after refresh: %v\n", querySQL("SELECT total FROM paid_customer_totals_mv WHERE customer_id = 1"))
 
 	execSQL("ALTER MATERIALIZED VIEW paid_customer_totals_mv TO VIEW")
 	execSQL("INSERT INTO orders VALUES (1, 2, 'paid')")
-	fmt.Printf("converted view: %.0f\n", querySQL("SELECT total FROM paid_customer_totals_mv WHERE customer_id = 1"))
+	fmt.Printf("converted view: %v\n", querySQL("SELECT total FROM paid_customer_totals_mv WHERE customer_id = 1"))
 
 	// Output:
 	// view: 10

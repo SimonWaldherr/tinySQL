@@ -11,8 +11,13 @@ const aggregateBatchMinRows = 2048
 type aggregateBatchColumn struct {
 	column  int
 	numeric bool
-	values  [aggregateBatchSize]float64
+	values  [aggregateBatchSize]float64 // REAL cells
+	ints    [aggregateBatchSize]int64   // integer cells, marked in isInt
 	valid   [aggregateBatchSize / 64]uint64
+	isInt   [aggregateBatchSize / 64]uint64
+	// hasInt/hasFloat describe the current batch's non-NULL cells, so the
+	// common homogeneous batches take a loop without per-cell type checks.
+	hasInt, hasFloat bool
 }
 
 type aggregateBatchOp struct {
@@ -233,7 +238,7 @@ func copyAggregateBatchStates(states []*simpleAggregateState, ops []aggregateBat
 		for _, state := range states {
 			state.counts[op.projection] = state.counts[op.copyFrom-1]
 			if op.kind != aggCount {
-				state.sumFloat[op.projection] = state.sumFloat[op.copyFrom-1]
+				state.sums[op.projection] = state.sums[op.copyFrom-1]
 			}
 		}
 	}
@@ -243,6 +248,8 @@ func extractAggregateColumns(rows [][]any, selected []int, cols []aggregateBatch
 	for c := range cols {
 		col := &cols[c]
 		clear(col.valid[:])
+		clear(col.isInt[:])
+		col.hasInt, col.hasFloat = false, false
 		for i, id := range selected {
 			if col.column >= len(rows[id]) {
 				return false // scalar evaluation reports the usual column error
@@ -251,13 +258,25 @@ func extractAggregateColumns(rows [][]any, selected []int, cols []aggregateBatch
 			if v == nil {
 				continue
 			}
-			col.valid[i/64] |= uint64(1) << uint(i%64)
-			if col.numeric {
-				f, ok := numeric(v)
-				if !ok {
-					return false
-				}
-				col.values[i] = f
+			bit := uint64(1) << uint(i%64)
+			col.valid[i/64] |= bit
+			if !col.numeric {
+				continue
+			}
+			switch x := v.(type) {
+			case int:
+				col.ints[i] = int64(x)
+				col.isInt[i/64] |= bit
+				col.hasInt = true
+			case int64:
+				col.ints[i] = x
+				col.isInt[i/64] |= bit
+				col.hasInt = true
+			case float64:
+				col.values[i] = x
+				col.hasFloat = true
+			default:
+				return false
 			}
 		}
 	}
@@ -271,19 +290,42 @@ func accumulateWholeBatch(state *simpleAggregateState, n int, cols []aggregateBa
 		return
 	}
 	col := &cols[op.column]
-	count, sum := state.counts[p], state.sumFloat[p]
-	for i := 0; i < n; i++ {
-		if col.valid[i/64]&(uint64(1)<<uint(i%64)) == 0 {
-			continue
+	count, acc := state.counts[p], &state.sums[p]
+	switch {
+	case op.kind == aggCount || (!col.hasInt && !col.hasFloat):
+		for i := 0; i < n; i++ {
+			if col.valid[i/64]&(uint64(1)<<uint(i%64)) != 0 {
+				count++
+			}
 		}
-		count++
-		if op.kind != aggCount {
-			// Keep the original addition order, including across batch boundaries.
-			// Partial batch sums would change floating-point rounding.
+	case !col.hasInt:
+		// Keep the original addition order, including across batch boundaries.
+		// Partial batch sums would change floating-point rounding.
+		acc.addFloat(0) // switch to REAL; adding zero leaves the sum unchanged
+		sum := acc.floatSum
+		for i := 0; i < n; i++ {
+			if col.valid[i/64]&(uint64(1)<<uint(i%64)) == 0 {
+				continue
+			}
+			count++
 			sum += col.values[i]
 		}
+		acc.floatSum = sum
+	default:
+		for i := 0; i < n; i++ {
+			bit := uint64(1) << uint(i%64)
+			if col.valid[i/64]&bit == 0 {
+				continue
+			}
+			count++
+			if col.isInt[i/64]&bit != 0 {
+				acc.addInt(col.ints[i])
+			} else {
+				acc.addFloat(col.values[i])
+			}
+		}
 	}
-	state.counts[p], state.sumFloat[p] = count, sum
+	state.counts[p] = count
 }
 
 func accumulateGroupedBatch(states []*simpleAggregateState, cols []aggregateBatchColumn, op aggregateBatchOp) {
@@ -296,12 +338,18 @@ func accumulateGroupedBatch(states []*simpleAggregateState, cols []aggregateBatc
 	}
 	col := &cols[op.column]
 	for i, state := range states {
-		if col.valid[i/64]&(uint64(1)<<uint(i%64)) == 0 {
+		bit := uint64(1) << uint(i%64)
+		if col.valid[i/64]&bit == 0 {
 			continue
 		}
 		state.counts[p]++
-		if op.kind != aggCount {
-			state.sumFloat[p] += col.values[i]
+		if op.kind == aggCount {
+			continue
+		}
+		if col.isInt[i/64]&bit != 0 {
+			state.sums[p].addInt(col.ints[i])
+		} else {
+			state.sums[p].addFloat(col.values[i])
 		}
 	}
 }

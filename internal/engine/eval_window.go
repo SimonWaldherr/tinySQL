@@ -254,7 +254,7 @@ func evalMovingAggregate(env ExecEnv, ex *FuncCall, partitionRows []Row, current
 	}
 
 	// Calculate sum over window
-	var sum float64
+	var sum sumAccumulator
 	count := 0
 	for i := startIdx; i <= currentIdx && i < len(partitionRows); i++ {
 		val, err := evalExpr(env, valueExpr, partitionRows[i])
@@ -262,23 +262,20 @@ func evalMovingAggregate(env ExecEnv, ex *FuncCall, partitionRows []Row, current
 			return nil, err
 		}
 		if val != nil {
-			if valFloat, ok := val.(float64); ok {
-				sum += valFloat
-			} else if valInt, ok := val.(int); ok {
-				sum += float64(valInt)
-			}
+			sum.add(val)
 			count++
 		}
 	}
 
 	if ex.Name == "MOVING_SUM" {
-		return sum, nil
+		// Integer inputs keep an integer running sum, like SUM.
+		return sum.sum(), nil
 	}
 	// MOVING_AVG
 	if count == 0 {
 		return nil, nil
 	}
-	return sum / float64(count), nil
+	return sum.average(count), nil
 }
 
 // evalWindowFunction evaluates a window function with OVER clause

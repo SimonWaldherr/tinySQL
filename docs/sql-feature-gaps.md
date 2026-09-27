@@ -15,7 +15,7 @@ for example, target-less `ON CONFLICT DO NOTHING` already works.
 | Views on the right of JOIN | Ordinary and materialized views supply rows and column metadata, including empty-view LEFT JOIN null extension. |
 
 ```sql
-SELECT 17 % 5 AS remainder; -- 2
+SELECT 17 % 5 AS remainder; -- 2 (INT)
 SELECT -17 % 5 AS remainder; -- -2
 SELECT 5.5 % 2 AS remainder; -- 1.5
 SELECT NULL % 5 AS remainder; -- NULL
@@ -38,12 +38,43 @@ SELECT n.id, e.id AS even_id
 FROM numbers n LEFT JOIN even_numbers e ON n.id = e.id;
 ```
 
-`%` uses tinySQL's existing arithmetic numeric model: ordinary numbers are
-converted to floating point, while two decimal rational operands stay exact.
-It is a remainder with truncation toward zero, not a nonnegative mathematical
-modulo. Division by zero raises an error. NULL propagates. This is not SQLite's
-integer-only `%` coercion rule; do not rely on floating-point arithmetic to
-preserve integers larger than 2^53.
+`%` follows the arithmetic model below: two integers give an integer, a
+REAL operand gives a REAL, and two decimal rational operands stay exact. It is
+a remainder with truncation toward zero, not a nonnegative mathematical
+modulo. Division by zero raises an error. NULL propagates.
+
+## Integer arithmetic
+
+Arithmetic keeps integers exact, as SQLite does. Every evaluation path — the
+generic evaluator, raw projections and filters, joins, HAVING, columnar
+results, index-seek planning and all aggregate kernels — shares one
+implementation (`internal/engine/arith.go`), and a differential test compares
+their values and Go types.
+
+| Expression | Result |
+| --- | --- |
+| `+`, `-`, `*`, `%` on two integers | Integer (`SELECT 1 + 41` → `42`, `SELECT -5` → `-5`) |
+| Integer overflow of `+`, `-`, `*` or unary `-` | REAL with the nearest value (`9223372036854775807 + 1` → `9.223372036854776e+18`) |
+| Any REAL operand | REAL (`1.5 + 1` → `2.5`) |
+| `/` | Always REAL (`7 / 2` → `3.5`, `84 / 2` → `42.0`) |
+| DECIMAL/MONEY operands | Exact rational |
+| `SUM` over integers | Integer; REAL if the total overflows 64 bits |
+| `SUM` with any REAL input, `AVG` | REAL |
+| `MOVING_SUM` | Like `SUM` |
+
+Division deliberately differs from SQLite, whose `7 / 2` truncates to `3`:
+tinySQL has always returned the exact quotient, and silently truncating
+existing queries would be a far more dangerous change than keeping it. Use
+`CAST(7 / 2 AS INT)` or `FLOOR` where truncation is intended. Unlike SQLite,
+an overflowing integer `SUM` continues as REAL instead of raising
+"integer overflow".
+
+Before this change every arithmetic result was a float64: `SELECT 1 + 41`
+returned `42.0`, integers above 2^53 lost precision, and `WHERE id = 2^53 + 1`
+style comparisons could match neighbouring keys. Applications that relied on
+float results from integer arithmetic (for example a Go type assertion to
+`float64` on `SUM(int_column)`) now receive `int` values; database/sql
+drivers see `int64`.
 
 Both CTE INSERT spellings are supported:
 `WITH ... INSERT INTO ... SELECT ...` and `INSERT INTO ... WITH ... SELECT ...`.
@@ -76,7 +107,7 @@ by the additions above.
 ## Verification
 
 ```sh
-go test ./internal/engine -run 'TestModuloOperator|TestLeadingWith|TestViewsAsJoin'
+go test ./internal/engine -run 'TestModuloOperator|TestLeadingWith|TestViewsAsJoin|TestArithmeticPathsAgree|TestBatchSumMatchesScalarAccumulator|TestIntegerArithmeticSemantics'
 go test ./internal/driver -run TestPreparedLeadingWithInsertAndModulo
 go test ./cmd/gameoflife
 ```

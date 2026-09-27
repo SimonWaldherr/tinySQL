@@ -145,7 +145,7 @@ func TestAggregateHelpers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SUM aggregate failed: %v", err)
 	}
-	if math.Abs(sumRes.(float64)-3.0) > 1e-9 {
+	if sumRes != 3 { // SUM over integers is an integer
 		t.Fatalf("expected SUM 3, got %#v", sumRes)
 	}
 
@@ -161,7 +161,7 @@ func TestAggregateHelpers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unary + aggregate failed: %v", err)
 	}
-	if math.Abs(plusRes.(float64)-3.0) > 1e-9 {
+	if plusRes != 3 {
 		t.Fatalf("expected unary + result 3, got %#v", plusRes)
 	}
 
@@ -169,7 +169,7 @@ func TestAggregateHelpers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unary - aggregate failed: %v", err)
 	}
-	if math.Abs(minusRes.(float64)+3.0) > 1e-9 {
+	if minusRes != -3 {
 		t.Fatalf("expected unary - result -3, got %#v", minusRes)
 	}
 
@@ -197,7 +197,7 @@ func TestAggregateHelpers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Binary aggregate failed: %v", err)
 	}
-	if math.Abs(combinedRes.(float64)-5.0) > 1e-9 {
+	if combinedRes != 5 {
 		t.Fatalf("expected SUM+COUNT = 5, got %#v", combinedRes)
 	}
 

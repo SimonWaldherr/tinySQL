@@ -933,9 +933,9 @@ func TestPlusOperatorStringConcat(t *testing.T) {
 	if mix != "hello42" {
 		t.Fatalf("Unexpected mix result: %v", mix)
 	}
-	sum, _ := get("sum").(float64)
-	if sum != 50 {
-		t.Fatalf("Unexpected numeric sum: %v", sum)
+	// INT + integer literal stays an integer (SQLite semantics).
+	if sum := get("sum"); sum != 50 {
+		t.Fatalf("Unexpected numeric sum: %#v", sum)
 	}
 }
 
