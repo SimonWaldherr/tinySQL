@@ -45,3 +45,39 @@ go test ./internal/engine -run '^Test.*(Geo|Spatial)' \
 Randomized differential tests compare optimized predicates with the original
 orientation test; existing GIS relation tests cover crossings, containment,
 holes, boundaries, and spatial-search ordering.
+
+## GeoJSON decoding and encoding
+
+Compact Point, LineString, Polygon and MultiPolygon inputs decode directly to
+geometry values. Other ordinary JSON objects use a small generic decoder.
+Escaped strings, non-ASCII input and unsupported forms retain the original
+`encoding/json` path. Number parsing and output formatting preserve float64
+rounding, negative zero and JSON error behavior. Differential tests, randomized
+inputs and `FuzzFastJSONObject` check compatibility with the standard decoder.
+
+Geometry output avoids reflection for coordinates and metadata, including
+CRS axes (`[]string`) and GeoPackage version/SRID fields (`byte`/`int32`).
+Unsupported values still use `json.Marshal`, including its base64 treatment of
+BLOBs and rejection of NaN/Inf.
+
+Local samples on Apple M2 Max, Go 1.27.1, darwin/arm64, GOMAXPROCS=12, three
+150 ms runs compared against commit `2ecf4a1` using the same SQL benchmark:
+
+| Full scan of 2,000 rows | Before | After | Allocs/op before → after |
+| --- | ---: | ---: | ---: |
+| GEO_LON | 2.77–2.89 ms | 0.63–0.67 ms | 38,007 → 6,005 |
+| GEO_DISTANCE | 5.34–5.40 ms | 0.93–1.04 ms | ~70,008 → 6,005 |
+| GEO_BUFFER (16 segments) | 15.77–15.91 ms | 9.87–10.23 ms | ~166,045 → ~90,007 |
+
+CRS metadata encoding took about 320 ns and one allocation versus 1,030 ns and
+13 allocations with `json.Marshal`; GeoPackage metadata took 482–599 ns and one
+allocation versus 1,416–1,426 ns and 18 allocations. These are local samples,
+not throughput guarantees; repeat on an idle machine for precise comparisons.
+
+```sh
+go test ./internal/engine -run '^$' \
+  -bench 'BenchmarkGeoSQL/(GEO_LON|GEO_DISTANCE|GEO_BUFFER)$' \
+  -benchtime=150ms -count=3 -benchmem
+go test ./internal/engine -run '^$' -bench BenchmarkMarshalGeoMetadata \
+  -benchtime=200ms -count=3 -benchmem
+```

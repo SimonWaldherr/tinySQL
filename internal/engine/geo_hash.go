@@ -12,7 +12,6 @@
 package engine
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
 	"strings"
@@ -206,7 +205,7 @@ func evalGeoHashBBox(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	// GEO_BBOX and ST_BBOX. A raw Go slice reaches a client as Go's default
 	// "[1 2 3]" formatting, which is not JSON and which nothing downstream can
 	// parse -- the WASM bridge renders any non-scalar with %v.
-	out, err := json.Marshal([]float64{minLon, minLat, maxLon, maxLat})
+	out, err := marshalGeoJSON([]float64{minLon, minLat, maxLon, maxLat})
 	if err != nil {
 		return nil, err
 	}
@@ -253,7 +252,7 @@ func evalGeoHashNeighbors(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		}
 	}
 	// A JSON array string, as in evalGeoHashBBox above.
-	out, err := json.Marshal(cells)
+	out, err := marshalGeoJSON(cells)
 	if err != nil {
 		return nil, err
 	}

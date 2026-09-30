@@ -817,7 +817,7 @@ func evalGeoFromWKT(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 			return nil, fmt.Errorf("%s: expected a %s, got %s", ex.Name, want, got)
 		}
 	}
-	body, err := json.Marshal(obj)
+	body, err := marshalGeoJSON(obj)
 	if err != nil {
 		return nil, fmt.Errorf("%s: encode result: %w", ex.Name, err)
 	}
@@ -944,7 +944,7 @@ func evalGeoAsGeoJSON(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 			return nil, fmt.Errorf("%s: %w", ex.Name, err)
 		}
 	}
-	body, err := json.Marshal(obj)
+	body, err := marshalGeoJSON(obj)
 	if err != nil {
 		return nil, fmt.Errorf("%s: encode result: %w", ex.Name, err)
 	}

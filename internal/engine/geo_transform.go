@@ -20,7 +20,6 @@
 package engine
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
 )
@@ -94,7 +93,7 @@ func evalGeoTransform(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err := transformGeoJSONPositionsInPlace(out, project); err != nil {
 		return nil, fmt.Errorf("%s: %w", ex.Name, err)
 	}
-	body, err := json.Marshal(out)
+	body, err := marshalGeoJSON(out)
 	if err != nil {
 		return nil, fmt.Errorf("%s: encode result: %w", ex.Name, err)
 	}

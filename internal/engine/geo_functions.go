@@ -119,15 +119,32 @@ type geoJSONPoint struct {
 // so its result can round-trip straight back through GEO_LON/GEO_LAT/
 // GEO_DISTANCE/etc. without a separate representation to support.
 func geoPointJSON(lon, lat float64, z *float64) (any, error) {
-	coords := []float64{lon, lat}
-	if z != nil {
-		coords = append(coords, *z)
+	// Written directly: this is exactly what json.Marshal(geoJSONPoint{...})
+	// produced, without the reflection. NaN and infinities still fail, through
+	// json.Marshal, with its usual error.
+	buf := make([]byte, 0, 64)
+	buf = append(buf, `{"coordinates":[`...)
+	var ok bool
+	if buf, ok = appendGeoJSONFloat(buf, lon); ok {
+		buf = append(buf, ',')
+		if buf, ok = appendGeoJSONFloat(buf, lat); ok && z != nil {
+			buf = append(buf, ',')
+			buf, ok = appendGeoJSONFloat(buf, *z)
+		}
 	}
-	body, err := json.Marshal(geoJSONPoint{Coordinates: coords, Type: "Point"})
-	if err != nil {
-		return nil, err
+	if !ok {
+		coords := []float64{lon, lat}
+		if z != nil {
+			coords = append(coords, *z)
+		}
+		body, err := marshalGeoJSON(geoJSONPoint{Coordinates: coords, Type: "Point"})
+		if err != nil {
+			return nil, err
+		}
+		return string(body), nil
 	}
-	return string(body), nil
+	buf = append(buf, `],"type":"Point"}`...)
+	return string(buf), nil
 }
 
 func evalGeoLon(env ExecEnv, ex *FuncCall, row Row) (any, error) {
@@ -421,7 +438,7 @@ func evalGeoBuffer(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		ring = append(ring, []float64{destLon, destLat})
 	}
 	ring = append(ring, ring[0]) // GeoJSON rings must be explicitly closed
-	body, err := json.Marshal(map[string]any{"type": "Polygon", "coordinates": []any{ring}})
+	body, err := marshalGeoJSON(map[string]any{"type": "Polygon", "coordinates": []any{ring}})
 	if err != nil {
 		return nil, err
 	}
@@ -459,7 +476,7 @@ func evalGeoConvexHull(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		ring = append(ring, []float64{p.Lon, p.Lat})
 	}
 	ring = append(ring, ring[0])
-	body, err := json.Marshal(map[string]any{"type": "Polygon", "coordinates": []any{ring}})
+	body, err := marshalGeoJSON(map[string]any{"type": "Polygon", "coordinates": []any{ring}})
 	if err != nil {
 		return nil, err
 	}
@@ -498,7 +515,7 @@ func evalGeoEnvelope(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		[]float64{minLon, maxLat},
 		[]float64{minLon, minLat},
 	}
-	body, err := json.Marshal(map[string]any{"type": "Polygon", "coordinates": []any{ring}})
+	body, err := marshalGeoJSON(map[string]any{"type": "Polygon", "coordinates": []any{ring}})
 	if err != nil {
 		return nil, err
 	}
@@ -622,6 +639,13 @@ func evalGeoPointArgNamed(env ExecEnv, name string, args []Expr, row Row, idx in
 }
 
 func geoPointFromValue(v any) (geoPoint, error) {
+	// Compact GeoJSON, which is what GEO_POINT and GEOMETRY columns hold, goes
+	// straight to a geoPoint; anything else takes the encoding/json path below.
+	if text, ok := geoTextValue(v); ok {
+		if p, ok := decodeGeoPointFast(text); ok {
+			return p, nil
+		}
+	}
 	switch x := v.(type) {
 	case map[string]any:
 		return geoPointFromMap(x)
@@ -634,6 +658,20 @@ func geoPointFromValue(v any) (geoPoint, error) {
 	default:
 		return geoPoint{}, fmt.Errorf("expected GeoJSON Point, got %T", v)
 	}
+}
+
+// geoTextValue returns v as text when it is one of the forms a geometry arrives
+// in as serialized GeoJSON: a string, []byte or json.RawMessage.
+func geoTextValue(v any) (string, bool) {
+	switch x := v.(type) {
+	case string:
+		return x, true
+	case []byte:
+		return string(x), true
+	case json.RawMessage:
+		return string(x), true
+	}
+	return "", false
 }
 
 func geoPointFromJSON(body []byte) (geoPoint, error) {
@@ -729,6 +767,11 @@ func evalGeoLineStringArg(env ExecEnv, ex *FuncCall, row Row, idx int) (geoLineS
 // single-element geoMultiPolygon) or a MultiPolygon (every part parsed the
 // same way polygonFromRingsValue parses a Polygon's own coordinates).
 func geoMultiPolygonFromValue(v any) (geoMultiPolygon, error) {
+	if text, ok := geoTextValue(v); ok {
+		if mp, ok := decodeGeoMultiPolygonFast(text); ok {
+			return mp, nil
+		}
+	}
 	obj, err := geoObjectFromValue(v)
 	if err != nil {
 		return geoMultiPolygon{}, err
@@ -787,6 +830,11 @@ func polygonFromRingsValue(v any) (geoPolygon, error) {
 }
 
 func geoLineStringFromValue(v any) (geoLineString, error) {
+	if text, ok := geoTextValue(v); ok {
+		if ls, ok := decodeGeoLineStringFast(text); ok {
+			return ls, nil
+		}
+	}
 	obj, err := geoObjectFromValue(v)
 	if err != nil {
 		return nil, err
@@ -824,6 +872,9 @@ func geoObjectFromValue(v any) (map[string]any, error) {
 	case []byte:
 		return geoObjectFromJSON(x)
 	case string:
+		if obj, ok := decodeJSONObjectFast(x); ok {
+			return obj, nil
+		}
 		return geoObjectFromJSON([]byte(strings.TrimSpace(x)))
 	default:
 		return nil, fmt.Errorf("expected GeoJSON geometry, got %T", v)
@@ -831,6 +882,9 @@ func geoObjectFromValue(v any) (map[string]any, error) {
 }
 
 func geoObjectFromJSON(body []byte) (map[string]any, error) {
+	if obj, ok := decodeJSONObjectFast(string(body)); ok {
+		return obj, nil
+	}
 	var obj map[string]any
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return nil, err
@@ -856,7 +910,7 @@ func canonicalGeoJSON(v any) (string, error) {
 	if err := validateGeometryShape(obj); err != nil {
 		return "", err
 	}
-	body, err := json.Marshal(obj)
+	body, err := marshalGeoJSON(obj)
 	if err != nil {
 		return "", fmt.Errorf("encode geometry: %w", err)
 	}

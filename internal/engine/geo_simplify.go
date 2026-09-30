@@ -58,7 +58,7 @@ func evalGeoSimplify(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", ex.Name, err)
 	}
-	result, err := json.Marshal(object)
+	result, err := marshalGeoJSON(object)
 	if err != nil {
 		return nil, fmt.Errorf("%s: encode simplified geometry: %w", ex.Name, err)
 	}
@@ -104,6 +104,14 @@ func geoSimplifyObject(value any) (map[string]any, error) {
 	// for a JSON text encode+decode round trip to get one.
 	if x, ok := value.(map[string]any); ok {
 		return geoDeepCloneObject(x), nil
+	}
+
+	// Compact GeoJSON decodes without encoding/json; the map is freshly built,
+	// as the contract above requires. Anything else takes the path below.
+	if text, ok := geoTextValue(value); ok {
+		if object, ok := decodeJSONObjectFast(text); ok {
+			return object, nil
+		}
 	}
 
 	var data []byte

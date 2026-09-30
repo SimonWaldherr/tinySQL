@@ -539,10 +539,15 @@ func lookupConstraintIndexRows(index *constraintIndexEntry, value any) []int {
 	if index == nil {
 		return nil
 	}
-	buckets := make([][]int, 0, 3)
+	// Gather every candidate bucket's rows into one stack buffer; the only
+	// allocation is the returned slice itself.
+	var stack [8]int
+	rows := stack[:0]
+	buckets := 0
 	add := func(v any) {
-		if rows := index.rows[comparableKeyPart(v)]; len(rows) > 0 {
-			buckets = append(buckets, rows)
+		var ok bool
+		if rows, ok = index.appendRows(rows, comparableKeyPart(v)); ok {
+			buckets++
 		}
 	}
 	add(value)
@@ -565,22 +570,14 @@ func lookupConstraintIndexRows(index *constraintIndexEntry, value any) []int {
 			}
 		}
 	}
-	if len(buckets) == 0 {
+	if len(rows) == 0 {
 		return nil
 	}
-	if len(buckets) == 1 {
-		return buckets[0]
+	out := append(make([]int, 0, len(rows)), rows...)
+	if buckets > 1 {
+		sort.Ints(out) // preserve the observable table-scan order
 	}
-	rowCount := 0
-	for _, bucket := range buckets {
-		rowCount += len(bucket)
-	}
-	rows := make([]int, 0, rowCount)
-	for _, bucket := range buckets {
-		rows = append(rows, bucket...)
-	}
-	sort.Ints(rows) // preserve the observable table-scan order
-	return rows
+	return out
 }
 
 func isNumericSQLValue(value any) bool {

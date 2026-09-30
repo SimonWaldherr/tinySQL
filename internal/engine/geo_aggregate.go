@@ -13,7 +13,6 @@
 package engine
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
 )
@@ -26,7 +25,7 @@ import (
 const geoDissolveMaxResultBytes = 16 << 20
 
 func marshalGeoAggregateResult(name string, object map[string]any) (any, error) {
-	body, err := json.Marshal(object)
+	body, err := marshalGeoJSON(object)
 	if err != nil {
 		return nil, fmt.Errorf("%s: encode result: %w", name, err)
 	}
@@ -181,7 +180,7 @@ func evalAggregateGeoBBoxAgg(env ExecEnv, ex *FuncCall, rows []Row) (any, error)
 	if !acc.Set {
 		return nil, nil
 	}
-	body, err := json.Marshal([]float64{acc.MinX, acc.MinY, acc.MaxX, acc.MaxY})
+	body, err := marshalGeoJSON([]float64{acc.MinX, acc.MinY, acc.MaxX, acc.MaxY})
 	if err != nil {
 		return nil, fmt.Errorf("%s: encode result: %w", ex.Name, err)
 	}

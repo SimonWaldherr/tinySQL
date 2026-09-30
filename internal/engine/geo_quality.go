@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
 	"strings"
@@ -26,7 +25,7 @@ func evalGeoClean(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err := cleanGeoJSONObject(object); err != nil {
 		return nil, fmt.Errorf("%s: %w", ex.Name, err)
 	}
-	result, err := json.Marshal(object)
+	result, err := marshalGeoJSON(object)
 	return string(result), err
 }
 
@@ -57,7 +56,7 @@ func evalGeoSnap(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err := cleanGeoJSONObject(object); err != nil {
 		return nil, fmt.Errorf("%s: snapped geometry is invalid: %w", ex.Name, err)
 	}
-	result, err := json.Marshal(object)
+	result, err := marshalGeoJSON(object)
 	return string(result), err
 }
 

@@ -214,18 +214,11 @@ func jsBegin(this js.Value, args []js.Value) any {
 		return apiResult(false, "transaction already active", "")
 	}
 
-	// DeepClone keeps the Node API transactional without linking the
-	// database/sql driver -- the same in-memory MVCC-light clone the SQL
-	// driver's own BeginTx uses (internal/driver/conn.go), instead of the
-	// previous round trip through storage.SaveToBytes/LoadFromBytes. That
-	// GOB round trip paid for reflection-based serialization twice per BEGIN
-	// and, worse, silently dropped runtime state DeepClone preserves (WAL,
-	// audit log, MVCC coordinator, scheduler, storage backend, config,
-	// extensions): LoadFromBytes only ever reconstructs tables and the
-	// catalog. LockContentForRead/UnlockContentForRead mirrors BeginTx's own
-	// guard against a concurrent mutation of the live rows DeepClone reads.
+	// Share immutable scalar rows and copy mutable cells, keeping BEGIN lean
+	// while preserving rollback isolation. This single-connection embedding
+	// promotes its shadow directly, so it needs no conflict-detection base.
 	wasmStorageDB.LockContentForRead()
-	transactionDB = wasmStorageDB.DeepClone()
+	transactionDB = wasmStorageDB.SnapshotForWriteTx()
 	wasmStorageDB.UnlockContentForRead()
 
 	logInfo("Transaction started successfully")

@@ -15,6 +15,15 @@ import (
 type Table struct {
 	Name string
 	Cols []Column
+	// Rows holds the table's rows. A stored row slice is immutable: a writer
+	// that changes a row builds a new slice and replaces the slot
+	// (Rows[i] = next), it never assigns into an existing row's cells, and it
+	// never appends to one without first clipping its capacity. The rows of a
+	// transaction's shadow rely on this: SnapshotForTx shares each row that
+	// holds only scalar cells with the live table instead of copying it, which
+	// is what keeps BEGIN from costing a full copy of every table. Row
+	// contents that are themselves mutable (BLOB, VECTOR and JSON cells) are
+	// still copied per row; see cloneRowsShared.
 	Rows [][]any
 	// Indexes contains materialized secondary and composite indexes keyed by
 	// lower-case SQL index name. Unlike catalog metadata these entries are
@@ -675,8 +684,12 @@ func (t *Table) AddColumn(col Column) error {
 	// construction is what makes it safe.
 	t.Cols = append(t.Cols, col)
 	t.colPos[key] = len(t.Cols) - 1
-	for i := range t.Rows {
-		t.Rows[i] = append(t.Rows[i], nil)
+	for i, row := range t.Rows {
+		// Clip the capacity so the widened row is always a new slice, even
+		// when the stored one has spare room: a stored row may be shared with
+		// a transaction shadow (see Rows), and appending into shared spare
+		// capacity would write through to it.
+		t.Rows[i] = append(row[:len(row):len(row)], nil)
 	}
 	// Every existing row's contents changed, so a derived structure that only
 	// knows how to grow by appending rows must rebuild rather than assume it

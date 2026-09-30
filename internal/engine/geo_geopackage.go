@@ -4,7 +4,6 @@
 package engine
 
 import (
-	"encoding/json"
 	"fmt"
 
 	"github.com/SimonWaldherr/tinySQL/internal/gpkg"
@@ -61,7 +60,7 @@ func evalGPKGBBox(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if len(geometry.BBox) == 0 {
 		return nil, nil
 	}
-	body, err := json.Marshal(geometry.BBox)
+	body, err := marshalGeoJSON(geometry.BBox)
 	if err != nil {
 		return nil, fmt.Errorf("%s: encode bbox: %w", ex.Name, err)
 	}
@@ -83,7 +82,7 @@ func evalGPKGHeader(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if len(geometry.BBox) > 0 {
 		out["bbox"] = geometry.BBox
 	}
-	body, err := json.Marshal(out)
+	body, err := marshalGeoJSON(out)
 	if err != nil {
 		return nil, fmt.Errorf("%s: encode header: %w", ex.Name, err)
 	}
@@ -117,7 +116,7 @@ func evalGeoFromGPKG(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", ex.Name, err)
 	}
-	body, err := json.Marshal(object)
+	body, err := marshalGeoJSON(object)
 	if err != nil {
 		return nil, fmt.Errorf("%s: encode result: %w", ex.Name, err)
 	}

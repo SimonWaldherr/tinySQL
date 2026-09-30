@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
 	"strings"
@@ -77,7 +76,7 @@ func evalGeoBBox(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if !bbox.Set {
 		return nil, fmt.Errorf("%s: geometry has no coordinates", ex.Name)
 	}
-	result, err := json.Marshal([]float64{bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY})
+	result, err := marshalGeoJSON([]float64{bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY})
 	if err != nil {
 		return nil, fmt.Errorf("%s: encode bounding box: %w", ex.Name, err)
 	}
@@ -498,7 +497,7 @@ func evalGeoAffine(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err := transformGeoJSONObject(object, transform); err != nil {
 		return nil, fmt.Errorf("%s: %w", ex.Name, err)
 	}
-	result, err := json.Marshal(object)
+	result, err := marshalGeoJSON(object)
 	if err != nil {
 		return nil, fmt.Errorf("%s: encode result: %w", ex.Name, err)
 	}
@@ -621,7 +620,7 @@ func evalGeoSmooth(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 			return nil, fmt.Errorf("%s: %w", ex.Name, err)
 		}
 	}
-	result, err := json.Marshal(object)
+	result, err := marshalGeoJSON(object)
 	if err != nil {
 		return nil, fmt.Errorf("%s: encode result: %w", ex.Name, err)
 	}
@@ -805,7 +804,7 @@ func evalGeoDropHoles(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err := dropGeoHoles(object); err != nil {
 		return nil, fmt.Errorf("%s: %w", ex.Name, err)
 	}
-	result, err := json.Marshal(object)
+	result, err := marshalGeoJSON(object)
 	if err != nil {
 		return nil, fmt.Errorf("%s: encode result: %w", ex.Name, err)
 	}

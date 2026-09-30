@@ -176,7 +176,7 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 	c.srv.db.LockContentForRead()
 	var base, shadow *storage.DB
 	if opts.ReadOnly {
-		shadow = c.srv.db.DeepClone()
+		shadow = c.srv.db.SnapshotForReadTx()
 	} else {
 		// A read-only transaction produces no changes to merge, so it needs
 		// only a single stable read snapshot and no conflict-detection base.

@@ -47,6 +47,23 @@ async function main() {
   success(db.exec("UPDATE items SET label = 'committed' WHERE id = 0"));
   success(db.commit());
   assert.deepEqual(success(db.query('SELECT label FROM items WHERE id = 0')).rows, [['committed']]);
+  success(db.exec('CREATE TABLE mutable (id INT PRIMARY KEY, meta JSON)'));
+  success(db.exec(`INSERT INTO mutable VALUES (1, '{"nested":{"value":"original"}}')`));
+  success(db.begin());
+  success(db.exec(`UPDATE mutable SET meta = JSON_SET(meta, 'nested.value', 'changed') WHERE id = 1`));
+  assert.deepEqual(success(db.query("SELECT JSON_GET(meta, 'nested.value') FROM mutable")).rows, [['changed']]);
+  success(db.exec('ALTER TABLE items ADD COLUMN extra INT'));
+  success(db.exec("INSERT INTO items (id, label, active) VALUES (200, 'temporary', true)"));
+  success(db.exec('DELETE FROM items WHERE id = 1'));
+  success(db.rollback());
+  assert.deepEqual(success(db.query("SELECT JSON_GET(meta, 'nested.value') FROM mutable")).rows, [['original']]);
+  const rolledBack = success(db.query('SELECT * FROM items ORDER BY id'));
+  assert.deepEqual(rolledBack.columns, ['id', 'label', 'active']);
+  expected[0][1] = 'committed';
+  assert.deepEqual(rolledBack.rows, expected);
+  // Exercise the optimized numeric geometry decode and its escaped-key fallback.
+  assert.deepEqual(success(db.query(`SELECT GEO_LON('{"type":"Point","coordinates":[13.405,52.52]}')`)).rows, [[13.405]]);
+  assert.deepEqual(success(db.query(`SELECT GEO_LAT('{"ty\\u0070e":"Point","coordinates":[13.405,52.52]}')`)).rows, [[52.52]]);
   if (db.exportDB) {
     const snapshot = success(db.exportDB());
     success(db.close());

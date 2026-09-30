@@ -129,3 +129,36 @@ profile. See [measurements, ownership and retention tradeoffs](insert-update-per
 Qualified direct CTE projections avoid copying every source row to add qualifier
 keys. Indexed SELECTs size output capacity using index candidates. See
 [benchmarks, eligibility and regression coverage](cte-select-performance.md).
+
+## Transaction snapshots and constraint caches
+
+Transaction shadows share immutable scalar row slices, copy the outer row
+headers and deep-copy mutable JSON/BLOB/vector cells. Writers replace stored
+rows; adding a column clips row capacity before appending. Read-only snapshots
+need no insertion headroom. Writable snapshots reserve modest headroom so the
+first INSERT avoids reallocating the complete row-header slice.
+
+`SnapshotForTx` also records the metadata needed for conflict detection.
+Browser and Node WASM APIs instead use `SnapshotForWriteTx`: their single
+connection promotes a private shadow directly without a conflict-detection
+base. Rollback, concurrent live writes and later transactions remain covered
+by isolation tests; WASM checks include JSON_SET, ALTER TABLE, INSERT and DELETE.
+
+Constraint caches store singleton row IDs directly in a flat map, reserve
+multi-row buckets for duplicate values and reuse collapsed bucket slots.
+A cache lagging behind appended rows is extended before a point deletion,
+avoiding a complete cache rebuild during INSERT/DELETE churn.
+
+On Apple M2 Max with Go 1.27.1, three local 150 ms samples for a 10,000-row
+`SnapshotForTx` changed from 312–332 µs and ~899 KB/op at commit `2ecf4a1` to
+119–121 µs and ~268 KB/op. A separate three-column shadow benchmark measured
+`SnapshotForWriteTx` at 107–127 µs and ~266 KB/op versus `DeepClone` at
+295–298 µs and ~733 KB/op. Snapshot creation still scales with row count and
+mutable-cell content; sharing does not make BEGIN constant-time.
+
+```sh
+go test ./internal/storage -run '^$' \
+  -bench 'BenchmarkSnapshotForTx/rows=10000$|BenchmarkWriteTxShadow' \
+  -benchtime=200ms -count=3 -benchmem
+go test ./internal/driver -run '^$' -bench BenchmarkTxSmallWrite -benchmem
+```

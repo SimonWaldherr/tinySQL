@@ -6,6 +6,7 @@ package engine
 
 import (
 	"fmt"
+	"maps"
 	"reflect"
 	"slices"
 	"sort"
@@ -681,13 +682,152 @@ type constraintIndexSet struct {
 
 type constraintIndexEntry struct {
 	rowCount int // rows already reflected in `rows`, i.e. t.Rows[:rowCount]
-	rows     map[any][]int
+	// rows maps a column value (comparableKeyPart) to the row holding it. A
+	// value >= 0 is that row's index, which is the case for every PRIMARY KEY
+	// and UNIQUE key -- the columns this cache exists for. A negative value v
+	// addresses the bucket multi[^v], used only while a key is held by two or
+	// more rows (a FOREIGN KEY parent column that is not unique).
+	//
+	// Keeping the single-row case inline instead of as a one-element []int
+	// matters twice: building the index no longer allocates once per distinct
+	// key, and cloning it for a transaction (CloneDerived) is a flat map copy
+	// with no per-key fix-up.
+	rows      map[any]int
+	multi     [][]int // buckets with two or more rows, in insertion order
+	freeMulti []int   // indexes into multi whose bucket shrank back to one row
 	// Maintained with the cache, not table.Version: signed point updates must
 	// not rescan the entire column after every write to prove seek safety.
 	nonIntegerRows int
 	maxValue       any // first table-order integer maximum, preserving int/int64
 	maxRow         int
 	maxKnown       bool
+}
+
+func newConstraintIndexEntry(sizeHint int) *constraintIndexEntry {
+	return &constraintIndexEntry{rows: make(map[any]int, sizeHint), maxKnown: true}
+}
+
+// add records that row holds key, after any rows already recorded for it.
+func (e *constraintIndexEntry) add(key any, row int) {
+	cur, ok := e.rows[key]
+	switch {
+	case !ok:
+		e.rows[key] = row
+	case cur >= 0:
+		e.rows[key] = e.newBucket(cur, row)
+	default:
+		slot := ^cur
+		e.multi[slot] = append(e.multi[slot], row)
+	}
+}
+
+// newBucket allocates a two-row bucket and returns the rows-map value that
+// addresses it.
+func (e *constraintIndexEntry) newBucket(first, second int) int {
+	if n := len(e.freeMulti); n > 0 {
+		slot := e.freeMulti[n-1]
+		e.freeMulti = e.freeMulti[:n-1]
+		e.multi[slot] = append(e.multi[slot][:0], first, second)
+		return ^slot
+	}
+	e.multi = append(e.multi, []int{first, second})
+	return ^(len(e.multi) - 1)
+}
+
+// remove drops row from key's rows, if present. The remaining rows keep their
+// order; a bucket that falls to one row collapses back to the inline form.
+func (e *constraintIndexEntry) remove(key any, row int) {
+	cur, ok := e.rows[key]
+	if !ok {
+		return
+	}
+	if cur >= 0 {
+		if cur == row {
+			delete(e.rows, key)
+		}
+		return
+	}
+	slot := ^cur
+	bucket := e.multi[slot]
+	for i, ri := range bucket {
+		if ri != row {
+			continue
+		}
+		bucket = append(bucket[:i], bucket[i+1:]...)
+		if len(bucket) == 1 {
+			e.rows[key] = bucket[0]
+			e.multi[slot] = bucket[:0]
+			e.freeMulti = append(e.freeMulti, slot)
+		} else {
+			e.multi[slot] = bucket
+		}
+		return
+	}
+}
+
+// appendRows appends every row holding key to dst, in bucket order, and
+// reports whether the key was present.
+func (e *constraintIndexEntry) appendRows(dst []int, key any) ([]int, bool) {
+	cur, ok := e.rows[key]
+	if !ok {
+		return dst, false
+	}
+	if cur >= 0 {
+		return append(dst, cur), true
+	}
+	return append(dst, e.multi[^cur]...), true
+}
+
+// exists reports whether key is held by any row other than excludeRow.
+func (e *constraintIndexEntry) exists(key any, excludeRow int) bool {
+	cur, ok := e.rows[key]
+	if !ok {
+		return false
+	}
+	if cur >= 0 {
+		return cur != excludeRow
+	}
+	for _, ri := range e.multi[^cur] {
+		if ri != excludeRow {
+			return true
+		}
+	}
+	return false
+}
+
+// clone returns a copy that shares no mutable state with e. The rows map holds
+// only ints, so maps.Clone copies it without touching individual keys; the
+// multi buckets are packed into one backing array with their capacity clipped,
+// so appending to one bucket can never write into its neighbour.
+func (e *constraintIndexEntry) clone() *constraintIndexEntry {
+	c := *e
+	c.rows = maps.Clone(e.rows)
+	c.freeMulti = slices.Clone(e.freeMulti)
+	if len(e.multi) > 0 {
+		total := 0
+		for _, b := range e.multi {
+			total += len(b)
+		}
+		backing := make([]int, total)
+		c.multi = make([][]int, len(e.multi))
+		off := 0
+		for i, b := range e.multi {
+			n := copy(backing[off:], b)
+			c.multi[i] = backing[off : off+n : off+n]
+			off += n
+		}
+	}
+	return &c
+}
+
+// buckets expands the index into the key -> rows view it had before the
+// inline single-row form existed. Tests use it to compare against a model.
+func (e *constraintIndexEntry) buckets() map[any][]int {
+	out := make(map[any][]int, len(e.rows))
+	for k := range e.rows {
+		out[k], _ = e.appendRows(nil, k)
+	}
+	return out
 }
 
 func (e *constraintIndexEntry) observeMaximum(value any, row int) {
@@ -723,12 +863,7 @@ func constraintNonInteger(value any) int {
 }
 
 func constraintIndexValueExists(index *constraintIndexEntry, val any, excludeRow int) bool {
-	for _, rowIdx := range index.rows[comparableKeyPart(val)] {
-		if rowIdx != excludeRow {
-			return true
-		}
-	}
-	return false
+	return index.exists(comparableKeyPart(val), excludeRow)
 }
 
 // CloneDerived implements storage.DerivedCloner, so a per-transaction table
@@ -739,8 +874,8 @@ func constraintIndexValueExists(index *constraintIndexEntry, val any, excludeRow
 // used to make total constraint-checking work O(transactions x table_size)
 // instead of O(table_size) amortized.
 //
-// Every map (set.cols itself, each entry's rows map, and each rows value's
-// []int slice) is copied rather than referenced, matching DerivedCloner's
+// Every map and slice (set.cols itself, each entry's rows map and multi
+// buckets) is copied rather than referenced, matching DerivedCloner's
 // contract that the clone and the original must share no mutable state:
 // getConstraintIndex/patchConstraintIndexRow/patchConstraintIndexSwapRemove
 // all mutate these in place, and the cloned table's rows diverge
@@ -748,11 +883,7 @@ func constraintIndexValueExists(index *constraintIndexEntry, val any, excludeRow
 func (set *constraintIndexSet) CloneDerived() any {
 	cloned := &constraintIndexSet{cols: make(map[int]*constraintIndexEntry, len(set.cols))}
 	for colIdx, entry := range set.cols {
-		rows := make(map[any][]int, len(entry.rows))
-		for k, ids := range entry.rows {
-			rows[k] = append([]int(nil), ids...)
-		}
-		cloned.cols[colIdx] = &constraintIndexEntry{rowCount: entry.rowCount, rows: rows, nonIntegerRows: entry.nonIntegerRows, maxValue: entry.maxValue, maxRow: entry.maxRow, maxKnown: entry.maxKnown}
+		cloned.cols[colIdx] = entry.clone()
 	}
 	return cloned
 }
@@ -778,7 +909,7 @@ func getConstraintIndex(t *storage.Table, colIdx int) *constraintIndexEntry {
 		// First use for this column, or the table shrank (DELETE already
 		// invalidates explicitly; this is a defensive fallback in case some
 		// row-removing path doesn't).
-		e = &constraintIndexEntry{rows: make(map[any][]int, len(t.Rows)), maxKnown: true}
+		e = newConstraintIndexEntry(len(t.Rows))
 		set.cols[colIdx] = e
 	}
 	extendConstraintIndex(t, colIdx, e)
@@ -792,18 +923,26 @@ func extendConstraintIndex(t *storage.Table, colIdx int, e *constraintIndexEntry
 		if colIdx >= len(r) || r[colIdx] == nil {
 			continue
 		}
-		k := comparableKeyPart(r[colIdx])
-		e.rows[k] = append(e.rows[k], i)
+		e.add(comparableKeyPart(r[colIdx]), i)
 		e.nonIntegerRows += constraintNonInteger(r[colIdx])
 		e.observeMaximum(r[colIdx], i)
 	}
 	e.rowCount = len(t.Rows)
 }
 
-// currentConstraintIndex returns an already complete cache entry without
-// building one. Point DELETE uses this to avoid allocating an O(n) hash map on
-// the first operation after loading a table; a cold delete can scan one key
-// column once and still avoid the much larger rollback clone.
+// currentConstraintIndex returns the table's cache entry for colIdx if one
+// exists, brought up to date with the table, without ever building one from
+// scratch. Point DELETE uses this to avoid allocating an O(n) hash map on the
+// first operation after loading a table; a cold delete can scan one key column
+// once and still avoid the much larger rollback clone.
+//
+// An entry that merely lags behind appended rows is caught up rather than
+// treated as cold: every INSERT leaves its table's entry one row behind until
+// the next constrained check, so refusing a lagging entry sent every
+// INSERT-then-DELETE pair down the cold path, which scanned the whole key column
+// and then dropped the entry, making the next INSERT rebuild it in full.
+// Catching up costs only the rows added since, which is the work the next
+// getConstraintIndex would do anyway.
 func currentConstraintIndex(t *storage.Table, colIdx int) *constraintIndexEntry {
 	t.DerivedLock()
 	defer t.DerivedUnlock()
@@ -812,9 +951,10 @@ func currentConstraintIndex(t *storage.Table, colIdx int) *constraintIndexEntry 
 		return nil
 	}
 	entry := set.cols[colIdx]
-	if entry == nil || entry.rowCount != len(t.Rows) {
+	if entry == nil || entry.rowCount > len(t.Rows) {
 		return nil
 	}
+	extendConstraintIndex(t, colIdx, entry)
 	return entry
 }
 
@@ -859,8 +999,7 @@ func patchConstraintIndexRow(t *storage.Table, rowIdx int, oldRow, newRow []any)
 			removeConstraintIndexBucketEntry(e, oldVal, rowIdx)
 		}
 		if newVal != nil {
-			nk := comparableKeyPart(newVal)
-			e.rows[nk] = append(e.rows[nk], rowIdx)
+			e.add(comparableKeyPart(newVal), rowIdx)
 		}
 	}
 }
@@ -872,13 +1011,14 @@ func patchConstraintIndexRow(t *storage.Table, rowIdx int, oldRow, newRow []any)
 // table's pre-delete row count as oldLen.
 //
 // Only an entry that is fully caught up with the table (e.rowCount ==
-// oldLen, the same condition currentConstraintIndex checks) can be patched
-// from just these two rows' old and new values -- a partial entry may
-// already have indexed deleteRowID's old value without having reached
-// lastRowID yet, and patching it from these two rows alone would leave it
-// internally inconsistent. Such entries are dropped instead, exactly like
-// invalidateConstraintIndexes but scoped to the one lagging column rather
-// than every column on the table.
+// oldLen) can be patched from just these two rows' old and new values -- a
+// partial entry may already have indexed deleteRowID's old value without
+// having reached lastRowID yet, and patching it from these two rows alone
+// would leave it internally inconsistent. An entry that lags is therefore
+// extended to oldLen first; only one that claims more rows than the table has
+// (which a consistent cache never does) is dropped, exactly like
+// invalidateConstraintIndexes but scoped to the one column rather than every
+// column on the table.
 func patchConstraintIndexSwapRemove(t *storage.Table, deleteRowID int, deletedRow []any, lastRowID int, lastRow []any, oldLen int) {
 	t.DerivedLock()
 	defer t.DerivedUnlock()
@@ -887,10 +1027,14 @@ func patchConstraintIndexSwapRemove(t *storage.Table, deleteRowID int, deletedRo
 		return
 	}
 	for colIdx, e := range set.cols {
-		if e.rowCount != oldLen {
+		if e.rowCount > oldLen {
 			delete(set.cols, colIdx)
 			continue
 		}
+		// An entry that lags (every INSERT leaves one row unindexed) is caught
+		// up first, so it is complete and can be patched from just the two
+		// affected rows; dropping it instead forced a full rebuild.
+		extendConstraintIndex(t, colIdx, e)
 		if e.maxValue != nil && e.maxRow == deleteRowID {
 			e.maxKnown, e.maxValue = false, nil
 		} else if e.maxKnown && deleteRowID != lastRowID && colIdx < len(lastRow) {
@@ -908,8 +1052,7 @@ func patchConstraintIndexSwapRemove(t *storage.Table, deleteRowID int, deletedRo
 		if deleteRowID != lastRowID && colIdx < len(lastRow) {
 			if newVal := lastRow[colIdx]; newVal != nil {
 				removeConstraintIndexBucketEntry(e, newVal, lastRowID)
-				k := comparableKeyPart(newVal)
-				e.rows[k] = append(e.rows[k], deleteRowID)
+				e.add(comparableKeyPart(newVal), deleteRowID)
 			}
 		}
 		e.rowCount = oldLen - 1
@@ -919,18 +1062,7 @@ func patchConstraintIndexSwapRemove(t *storage.Table, deleteRowID int, deletedRo
 // removeConstraintIndexBucketEntry removes rowIdx from val's bucket in e, if
 // present.
 func removeConstraintIndexBucketEntry(e *constraintIndexEntry, val any, rowIdx int) {
-	k := comparableKeyPart(val)
-	bucket := e.rows[k]
-	for i, ri := range bucket {
-		if ri == rowIdx {
-			if len(bucket) == 1 {
-				delete(e.rows, k)
-			} else {
-				e.rows[k] = append(bucket[:i], bucket[i+1:]...)
-			}
-			break
-		}
-	}
+	e.remove(comparableKeyPart(val), rowIdx)
 }
 
 func constraintValueExists(t *storage.Table, colIdx int, val any, excludeRow int) bool {

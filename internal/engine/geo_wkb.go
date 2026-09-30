@@ -332,7 +332,7 @@ func evalGeoFromWKB(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	body, err := json.Marshal(obj)
+	body, err := marshalGeoJSON(obj)
 	if err != nil {
 		return nil, fmt.Errorf("%s: encode result: %w", ex.Name, err)
 	}

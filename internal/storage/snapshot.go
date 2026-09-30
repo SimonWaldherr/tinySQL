@@ -25,10 +25,43 @@ func (db *DB) DeepClone() *DB {
 	return out
 }
 
+// SnapshotForReadTx is DeepClone for a snapshot that is only read, such as a
+// read-only transaction: it shares immutable rows with the source (see
+// cloneRowsShared) instead of copying them, so taking it does not cost a full
+// copy of the database. Callers that write to the snapshot should use
+// SnapshotForWriteTx or SnapshotForTx.
+func (db *DB) SnapshotForReadTx() *DB {
+	out := NewDB()
+	db.copyRuntimeState(out, true)
+	markShadow(out)
+	for tn, tdb := range db.tenants {
+		for _, t := range tdb.tables {
+			out.upsertTable(tn, cloneTableForRead(t))
+		}
+	}
+	return out
+}
+
+// SnapshotForWriteTx creates a private writable shadow, sharing immutable
+// scalar rows and copying mutable cells. Embeddings with one connection can
+// promote it directly without allocating a conflict-detection base. Callers
+// must hold LockContentForRead while taking the snapshot, as for SnapshotForTx.
+func (db *DB) SnapshotForWriteTx() *DB {
+	out := NewDB()
+	db.copyRuntimeState(out, true)
+	markShadow(out)
+	for tn, tdb := range db.tenants {
+		for _, t := range tdb.tables {
+			out.upsertTable(tn, cloneTableForTx(t))
+		}
+	}
+	return out
+}
+
 // SnapshotForTx creates the pair of snapshots a SQL transaction needs while
-// copying row data only once instead of twice.
+// sharing immutable rows and copying mutable cells only once.
 //
-// shadow is a full deep clone that receives the transaction's writes. base is
+// shadow is a private writable snapshot receiving the transaction's writes. base is
 // a lightweight snapshot that records each table's identity and Version but no
 // rows: the only consumers of the base — CollectWALChanges and the driver's
 // conflict detection — read Table.Version and table existence exclusively and
@@ -51,7 +84,7 @@ func (db *DB) SnapshotForTx() (base *DB, shadow *DB) {
 	for tn, tdb := range db.tenants {
 		for _, t := range tdb.tables {
 			base.upsertTable(tn, cloneTableMeta(t))
-			shadow.upsertTable(tn, cloneTable(t))
+			shadow.upsertTable(tn, cloneTableForTx(t))
 		}
 	}
 	return base, shadow
@@ -74,6 +107,26 @@ func cloneTableMeta(t *Table) *Table {
 
 func cloneTable(t *Table) *Table {
 	return cloneTableWithRows(t, cloneRows(t.Rows), true)
+}
+
+// cloneTableForTx is cloneTable for a transaction's private shadow. The shadow
+// exists to be written, and the first INSERT appends to its row slice; sizing
+// that slice exactly would make the first append copy every row header a
+// second time (and allocate 25% more on top), so the clone reserves a little
+// room up front.
+//
+// The shadow shares every row that holds only scalar cells with the live table
+// (see cloneRowsShared) instead of copying it: copying made BEGIN cost a full
+// copy of every table.
+func cloneTableForTx(t *Table) *Table {
+	return cloneTableWithRows(t, cloneRowsShared(t.Rows, len(t.Rows)/16+16), true)
+}
+
+// cloneTableForRead is cloneTable for a snapshot that is only ever read, such
+// as a read-only transaction: rows are shared like cloneTableForTx does, with
+// no spare capacity.
+func cloneTableForRead(t *Table) *Table {
+	return cloneTableWithRows(t, cloneRowsShared(t.Rows, 0), true)
 }
 
 // cloneTableForStreamDML makes a private writer view for a table currently
@@ -181,7 +234,12 @@ func cloneVectorIndexes(src map[string]*VectorIndex) map[string]*VectorIndex {
 // contiguous avoids one allocation per row while preserving the original
 // per-row append semantics through a full slice expression.
 func cloneRows(rows [][]any) [][]any {
-	cloned := make([][]any, len(rows))
+	return cloneRowsHeadroom(rows, 0)
+}
+
+// cloneRowsHeadroom is cloneRows with spare capacity in the returned row slice.
+func cloneRowsHeadroom(rows [][]any, headroom int) [][]any {
+	cloned := make([][]any, len(rows), len(rows)+headroom)
 	maxInt := int(^uint(0) >> 1)
 	totalCells := 0
 	for _, row := range rows {
@@ -190,7 +248,7 @@ func cloneRows(rows [][]any) [][]any {
 			// reachable for an impossibly large in-memory table on supported
 			// platforms, but retain the safe per-row behavior rather than
 			// overflowing the allocation size.
-			return cloneRowsIndividually(rows)
+			return cloneRowsIndividually(rows, headroom)
 		}
 		totalCells += len(row)
 	}
@@ -203,25 +261,76 @@ func cloneRows(rows [][]any) [][]any {
 		// row was independently allocated with cap == len, so append must not
 		// be able to overwrite the next row in the shared backing array.
 		copyRow := cells[offset:end:end]
-		for j, value := range row {
-			copyRow[j] = cloneCell(value)
-		}
+		copy(copyRow, row)
+		cloneMutableCells(copyRow)
 		cloned[i] = copyRow
 		offset = end
 	}
 	return cloned
 }
 
-func cloneRowsIndividually(rows [][]any) [][]any {
-	cloned := make([][]any, len(rows))
+func cloneRowsIndividually(rows [][]any, headroom int) [][]any {
+	cloned := make([][]any, len(rows), len(rows)+headroom)
 	for i, row := range rows {
 		copyRow := make([]any, len(row))
-		for j, value := range row {
-			copyRow[j] = cloneCell(value)
-		}
+		copy(copyRow, row)
+		cloneMutableCells(copyRow)
 		cloned[i] = copyRow
 	}
 	return cloned
+}
+
+// cloneRowsShared copies the row-header slice but shares each row whose cells
+// are all immutable scalars with the source, relying on Table.Rows' rule that a
+// stored row slice is never written through. A row holding a mutable reference
+// cell (BLOB, VECTOR, JSON: see cloneCell) gets a private copy, exactly as
+// cloneRows would give it, so JSON_SET and friends still cannot reach the
+// source through a transaction.
+//
+// Sharing turns the per-row cost from copying every cell into one type test per
+// cell, and the allocation from the whole table into its row headers.
+func cloneRowsShared(rows [][]any, headroom int) [][]any {
+	cloned := make([][]any, len(rows), len(rows)+headroom)
+	var chunk []any // backing store for the private copies, carved per row
+	for i, row := range rows {
+		if !hasMutableCell(row) {
+			cloned[i] = row
+			continue
+		}
+		if len(chunk) < len(row) {
+			chunk = make([]any, max(len(row), 1024))
+		}
+		private := chunk[:len(row):len(row)]
+		chunk = chunk[len(row):]
+		copy(private, row)
+		cloneMutableCells(private)
+		cloned[i] = private
+	}
+	return cloned
+}
+
+func hasMutableCell(row []any) bool {
+	for _, value := range row {
+		switch value.(type) {
+		case []byte, []float64, map[string]any, []any:
+			return true
+		}
+	}
+	return false
+}
+
+// cloneMutableCells replaces, in a row that was just copied, every cell whose
+// value is a mutable reference type with a private copy (see cloneCell). The
+// scalar cells that make up nearly every row were already copied by the caller
+// with one memmove, so this is only a type test per cell: calling cloneCell for
+// each of them was a third of the cost of cloning a large table.
+func cloneMutableCells(row []any) {
+	for j, value := range row {
+		switch value.(type) {
+		case []byte, []float64, map[string]any, []any:
+			row[j] = cloneCell(value)
+		}
+	}
 }
 
 // cloneCell preserves snapshot isolation for mutable reference-typed values.

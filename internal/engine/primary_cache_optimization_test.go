@@ -27,8 +27,8 @@ func TestPrimaryCacheMaintenanceAndChurn(t *testing.T) {
 			key := comparableKeyPart(row[0])
 			want[key] = append(want[key], i)
 		}
-		if index.nonIntegerRows != other || !reflect.DeepEqual(index.rows, want) {
-			t.Fatalf("cache=%v count=%d; want %v count=%d", index.rows, index.nonIntegerRows, want, other)
+		if index.nonIntegerRows != other || !reflect.DeepEqual(index.buckets(), want) {
+			t.Fatalf("cache=%v count=%d; want %v count=%d", index.buckets(), index.nonIntegerRows, want, other)
 		}
 	}
 	change := func(row int, value any) {
@@ -53,7 +53,7 @@ func TestPrimaryCacheMaintenanceAndChurn(t *testing.T) {
 	table.DerivedUnlock()
 	change(3, int(3))
 	check()
-	if clone.cols[0].nonIntegerRows != 2 || len(clone.cols[0].rows[float64(3)]) != 1 {
+	if clone.cols[0].nonIntegerRows != 2 || len(clone.cols[0].buckets()[float64(3)]) != 1 {
 		t.Fatal("clone shared cache mutations")
 	}
 	last := len(table.Rows) - 1

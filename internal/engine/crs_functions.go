@@ -8,7 +8,6 @@
 package engine
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
 	"net/url"
@@ -222,7 +221,7 @@ func evalCRSInfo(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		out["axes"] = info.Axes
 		out["unit"] = info.Unit
 	}
-	body, err := json.Marshal(out)
+	body, err := marshalGeoJSON(out)
 	if err != nil {
 		return nil, fmt.Errorf("%s: encode result: %w", ex.Name, err)
 	}
