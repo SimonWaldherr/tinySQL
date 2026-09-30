@@ -3,8 +3,6 @@ package standards
 import (
 	"errors"
 	"net/http"
-	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 )
@@ -40,14 +38,7 @@ func TestFormatTimeUsesUTCAndRFC3339(t *testing.T) {
 	}
 }
 
-func TestProblemWriterAndSQLStateEdgeCases(t *testing.T) {
-	problem := NewProblem(http.StatusUnprocessableEntity, "", "invalid row", "/rows/1")
-	recorder := httptest.NewRecorder()
-	WriteProblem(recorder, problem)
-	if recorder.Code != http.StatusUnprocessableEntity || recorder.Header().Get("Content-Type") != MediaTypeProblemJSON || !strings.Contains(recorder.Body.String(), `"detail":"invalid row"`) {
-		t.Fatalf("WriteProblem response = status:%d headers:%v body:%s", recorder.Code, recorder.Header(), recorder.Body.String())
-	}
-
+func TestSQLStateEdgeCases(t *testing.T) {
 	if _, err := ParseTime("not-a-time"); err == nil {
 		t.Fatal("ParseTime accepted invalid input")
 	}

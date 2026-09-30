@@ -168,6 +168,27 @@ go build -tags=shapefile ./...             # ESRI Shapefile and ZIP imports
 go build -tags=sqliteimport,shapefile ./...
 ```
 
+For size-sensitive embeddings such as browser WASM bundles, the
+`tinysql_minimal` tag drops optional features that pull in large
+dependencies: the SQL `HTTP()` function (net/http, crypto/tls),
+`HTML_TEMPLATE()` (html/template, whose reflection use
+also keeps otherwise unused methods alive), `standards.WriteProblem`, and YAML
+imports (gopkg.in/yaml.v3). The SQL functions and YAML imports return an error;
+`standards.WriteProblem` is excluded from the API. `HTML_ESCAPE()`, core SQL, the
+`database/sql` driver and the other importers are unchanged. With Go 1.27 this
+shrinks the browser bundle from about 27.46 MB to 15.56 MB (43%)
+before wasm-opt with stripped symbols; sizes vary with the toolchain. `-tags no_http` removes only
+the `HTTP()` function.
+
+```bash
+GOOS=js GOARCH=wasm go build -tags=tinysql_minimal -trimpath -ldflags='-s -w' -o tinySQL.wasm ./cmd/wasm_browser
+```
+
+Browser and Node build scripts select `WASM_PROFILE=minimal` by default;
+use `WASM_PROFILE=full` to include optional features. `make wasm-smoke` checks
+both profiles for dependency exclusions, size reduction and JavaScript API
+behavior, including transactions and browser snapshot imports.
+
 See the [storage guide](docs/storage-guide.md) for DSNs, persistence,
 read-only serving, backups, encryption scope, and large datasets.
 

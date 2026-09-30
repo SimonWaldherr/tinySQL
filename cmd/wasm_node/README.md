@@ -26,9 +26,16 @@ Manual equivalent:
 
 ```bash
 cd cmd/wasm_node
-GOOS=js GOARCH=wasm go build -o tinySQL.wasm .
+GOOS=js GOARCH=wasm go build -tags=tinysql_minimal -trimpath -ldflags="-s -w" -o tinySQL.wasm .
 cp "$(go env GOROOT)/lib/wasm/wasm_exec.js" ./
 ```
+
+Build scripts default to `WASM_PROFILE=minimal`, excluding SQL `HTTP()`,
+`HTML_TEMPLATE()`, YAML imports and the HTTP problem writer. `HTML_ESCAPE()`
+and core SQL remain available. Set `WASM_PROFILE=full` to restore optional
+features with the Go compiler. TinyGo retains its target-specific restrictions.
+Set `WASM_OPTIMIZE=false` to skip Binaryen optimisation. Always distribute
+`wasm_exec.js` from the same build alongside the WASM binary.
 
 ## Run
 

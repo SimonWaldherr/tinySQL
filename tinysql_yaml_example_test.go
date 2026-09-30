@@ -1,3 +1,5 @@
+//go:build !tinysql_minimal
+
 package tinysql
 
 import (
@@ -7,15 +9,15 @@ import (
 	"path/filepath"
 )
 
-func ExampleImportFile_xml() {
+func ExampleImportFile_yaml() {
 	dir, err := os.MkdirTemp("", "tinysql-import-example-*")
 	if err != nil {
 		panic(err)
 	}
 	defer os.RemoveAll(dir)
 
-	file := filepath.Join(dir, "people.xml")
-	data := `<root><record id="1" name="Alice"/><record id="2" name="Bob"/></root>`
+	file := filepath.Join(dir, "people.yaml")
+	data := "- id: 1\n  name: Alice\n- id: 2\n  name: Bob\n"
 	if err := os.WriteFile(file, []byte(data), 0600); err != nil {
 		panic(err)
 	}

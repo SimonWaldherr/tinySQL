@@ -238,9 +238,6 @@ func TestPublicMapImportWrappers(t *testing.T) {
 	ctx := context.Background()
 	db := tsql.NewDB()
 
-	if _, err := tsql.ImportYAML(ctx, db, "default", "yaml_public", strings.NewReader("- id: 1\n"), &tsql.ImportOptions{CreateTable: true}); err != nil {
-		t.Fatalf("ImportYAML failed: %v", err)
-	}
 	if _, err := tsql.ImportXML(ctx, db, "default", "xml_public", strings.NewReader("<root><row id=\"1\"/></root>"), &tsql.ImportOptions{CreateTable: true}); err != nil {
 		t.Fatalf("ImportXML failed: %v", err)
 	}

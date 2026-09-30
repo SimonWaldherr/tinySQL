@@ -11,10 +11,17 @@ WASM_OUT="web/tinySQL.wasm"
 # Set WASM_COMPILER=tinygo to prioritize a substantially smaller artifact.
 # The default remains Go so existing builds keep their current toolchain.
 WASM_COMPILER="${WASM_COMPILER:-go}"
+# Minimal is the embedding default; full restores HTTP, templates and YAML.
+WASM_PROFILE="${WASM_PROFILE:-minimal}"
+case "$WASM_PROFILE" in
+    minimal) WASM_TAGS="tinysql_minimal" ;;
+    full) WASM_TAGS="" ;;
+    *) echo "unsupported WASM_PROFILE=$WASM_PROFILE (expected minimal or full)" >&2; exit 2 ;;
+esac
 
 usage() {
     cat <<'EOF'
-Usage:
+Usage (WASM_PROFILE=minimal by default; set full for optional features):
   ./build.sh                 Build tinySQL browser WASM assets
   ./build.sh --serve         Build and start a local web server
   ./build.sh --build-only    Build only (explicit)
@@ -30,18 +37,25 @@ human() { numfmt --to=iec-i --suffix=B "$1" 2>/dev/null || echo "$1 bytes"; }
 
 optimise_wasm() {
     local best_size variant temp size
+    local optimizer_succeeded=false
+    if [[ "${WASM_OPTIMIZE:-true}" != "true" ]]; then
+        echo "Skipping WASM optimisation (WASM_OPTIMIZE=${WASM_OPTIMIZE})"
+        return
+    fi
     if ! command -v wasm-opt >/dev/null 2>&1; then
         echo "Tip: install Binaryen (wasm-opt) for additional WASM size optimisation"
         return
     fi
     best_size="$(filesize "$WASM_OUT")"
+    # Go 1.27 emits saturating float-to-int instructions; Binaryen must
+    # allow that feature or validation rejects every optimization variant.
     for variant in \
-        "--enable-bulk-memory -Oz --strip-debug" \
-        "--enable-bulk-memory -Oz --strip-debug --converge" \
-        "--enable-bulk-memory -O3 --strip-debug --converge"; do
+        "--enable-bulk-memory --enable-nontrapping-float-to-int -Oz --strip-debug" \
+        "--enable-bulk-memory --enable-nontrapping-float-to-int -Oz --strip-debug --converge"; do
         temp="${WASM_OUT}.opt.tmp"
         # shellcheck disable=SC2086
         if wasm-opt $variant -o "$temp" "$WASM_OUT" 2>/dev/null; then
+            optimizer_succeeded=true
             size="$(filesize "$temp")"
             if [[ "$size" -gt 0 && "$size" -lt "$best_size" ]]; then
                 echo "  wasm-opt $variant: saved $((best_size - size)) bytes"
@@ -54,6 +68,9 @@ optimise_wasm() {
             rm -f "$temp"
         fi
     done
+    if [[ "$optimizer_succeeded" == false ]]; then
+        echo "Warning: wasm-opt rejected all variants; keeping the unoptimized module" >&2
+    fi
 }
 
 for arg in "$@"; do
@@ -107,7 +124,7 @@ build_wasm() {
             fi
             cp "$wasm_exec_path" web/wasm_exec.js
             # shellcheck disable=SC2086
-            GOOS=js GOARCH=wasm go build ${GOFLAGS:-} -trimpath -buildvcs=false -ldflags "-s -w" -o "$WASM_OUT" .
+            GOOS=js GOARCH=wasm go build ${GOFLAGS:-} -tags="$WASM_TAGS" -trimpath -buildvcs=false -ldflags "-s -w" -o "$WASM_OUT" .
             ;;
         tinygo)
             if ! command -v tinygo >/dev/null 2>&1; then
@@ -115,7 +132,7 @@ build_wasm() {
                 exit 1
             fi
             cp "$(tinygo env TINYGOROOT)/targets/wasm_exec.js" web/wasm_exec.js
-            tinygo build -target=wasm -no-debug -o "$WASM_OUT" .
+            tinygo build -tags="$WASM_TAGS" -target=wasm -no-debug -o "$WASM_OUT" .
             ;;
         *)
             echo "unsupported WASM_COMPILER=$WASM_COMPILER (expected go or tinygo)" >&2
@@ -130,12 +147,12 @@ if [[ "$WASM_COMPILER" == "go" ]] && ! command -v go >/dev/null 2>&1; then
 fi
 
 if [[ "$SKIP_BUILD" == false ]]; then
-    echo "Building WASM module with $WASM_COMPILER"
+    echo "Building WASM module with $WASM_COMPILER ($WASM_PROFILE profile)"
     mkdir -p web
     build_wasm
     optimise_wasm
     if command -v gzip >/dev/null 2>&1; then
-        gzip -9 -c "$WASM_OUT" > "${WASM_OUT}.gz" 2>/dev/null || true
+        gzip -9 -n -c "$WASM_OUT" > "${WASM_OUT}.gz" 2>/dev/null || true
     fi
 fi
 

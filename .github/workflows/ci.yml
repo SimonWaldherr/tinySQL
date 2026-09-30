@@ -77,6 +77,9 @@ jobs:
       - name: Run standard-Go CI matrix
         run: make ci
 
+      - name: Check Go WASM embedding profiles
+        run: make wasm-smoke
+
       - name: Summarize coverage
         run: |
           go tool cover -func=coverage.out -o coverage.txt

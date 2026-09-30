@@ -1,8 +1,9 @@
-//go:build tinygo.wasm || baremetal
+//go:build tinygo.wasm || baremetal || tinysql_minimal
 
 package standards
 
-// NewProblem remains available on TinyGo without importing net/http. The
+// NewProblem remains available on TinyGo and in tinysql_minimal builds
+// without importing net/http. The
 // fallback titles cover the common HTTP statuses used by tinySQL integrations.
 func NewProblem(status int, title, detail, instance string) Problem {
 	if title == "" {

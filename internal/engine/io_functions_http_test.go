@@ -1,4 +1,4 @@
-//go:build !tinygo.wasm && !baremetal && !no_http
+//go:build !tinygo.wasm && !baremetal && !no_http && !tinysql_minimal
 
 package engine
 

@@ -19,10 +19,17 @@ The build creates web/tinySQL.wasm, an optional gzip companion, and
 web/wasm_exec.js. To serve manually:
 
 ```bash
-GOOS=js GOARCH=wasm go build -o web/tinySQL.wasm .
+GOOS=js GOARCH=wasm go build -tags=tinysql_minimal -trimpath -ldflags="-s -w" -o web/tinySQL.wasm .
 cp "$(go env GOROOT)/lib/wasm/wasm_exec.js" web/
 cd web && python3 -m http.server 8080
 ```
+
+Build scripts default to `WASM_PROFILE=minimal`, excluding SQL `HTTP()`,
+`HTML_TEMPLATE()`, YAML imports and the HTTP problem writer. `HTML_ESCAPE()`
+and core SQL remain available. Set `WASM_PROFILE=full` to restore optional
+features with the Go compiler. TinyGo retains its target-specific restrictions.
+Set `WASM_OPTIMIZE=false` to skip Binaryen optimisation. Always distribute
+`wasm_exec.js` from the same build alongside the WASM binary.
 
 ## Included UI
 
@@ -48,9 +55,13 @@ The module exposes window.tinySQL:
 | tinySQL.exec(sql) | Execute a statement |
 | tinySQL.query(sql) | Execute a query and return rows |
 | tinySQL.exportDB() | Return a base64 GOB snapshot |
-| tinySQL.importDB(snapshot) | Replace the current database from a snapshot |
+| tinySQL.importDB(snapshot, [dsn]) | Replace the current database from a snapshot |
 | tinySQL.listTables() | Return table metadata |
 | tinySQL.describeTable(table) | Return column definitions |
+
+Snapshot imports select the `default` tenant unless an optional `mem://?tenant=...`
+DSN is supplied. Use the same tenant as `open()` to access its restored tables;
+the snapshot itself includes all tenants.
 
 ## Notes
 

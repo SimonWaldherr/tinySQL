@@ -6,7 +6,7 @@ SHELL := /usr/bin/env bash
 .PHONY: build-wasm-browser build-wasm-node build-studio build-tinysqlpage build-migrate
 .PHONY: build-query-files build-query-files-wasm build-fsql run-query-files-demo
 .PHONY: build-gh-pages-demo check-gh-pages-demo update-gh-pages push-gh-pages
-.PHONY: test-all test-unit test-integration test-jsonv2 test-ci coverage build-check wasm-check tinygo-wasm ci verify verify-ci
+.PHONY: test-all test-unit test-integration test-jsonv2 test-ci coverage build-check wasm-check wasm-smoke tinygo-wasm ci verify verify-ci
 .PHONY: test-query-files test-query-files-wasm test-fsql test-gorm test-sqlpackages test-sql-compat test-server
 .PHONY: run-wasm-browser run-wasm-node-demo deps deps-all update-deps tidy tidy-all modules-verify bench bench-engine bench-hotpaths bench-stream bench-stream-guard release-check script-lint docker-build info
 .DEFAULT_GOAL := help
@@ -135,6 +135,10 @@ wasm-check:
 	GOOS=js GOARCH=wasm $(GO) build -trimpath -o "$$tmpdir/tinysql-node.wasm" ./$(CMD_DIR)/wasm_node; \
 	(cd $(QUERY_FILES_WASM_DIR) && GOOS=js GOARCH=wasm $(GO) build -trimpath -o "$$tmpdir/query-files.wasm" .); \
 	echo "$(GREEN)✓ WebAssembly targets compile$(NC)"
+
+## wasm-smoke: Check full/minimal WASM dependencies, sizes and JavaScript APIs
+wasm-smoke:
+	@bash scripts/check-wasm.sh
 
 ## tinygo-wasm: Build and smoke-test the Node WASM bundle with the pinned TinyGo Docker image
 tinygo-wasm:
@@ -301,6 +305,7 @@ test-jsonv2:
 test-ci:
 	@echo "$(GREEN)Running CI test matrix...$(NC)"
 	$(GO) test ./... -count=1
+	$(GO) test -tags=tinysql_minimal ./... -count=1
 	$(MAKE) --no-print-directory test-sql-compat GO_TEST_FLAGS=-count=1
 	$(MAKE) --no-print-directory test-query-files GO_TEST_FLAGS=-count=1
 	$(MAKE) --no-print-directory test-query-files-wasm GO_TEST_FLAGS=-count=1

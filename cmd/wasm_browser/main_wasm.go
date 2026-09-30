@@ -242,6 +242,17 @@ func jsImportDB(this js.Value, args []js.Value) any {
 		return apiResult(false, err.Error(), "")
 	}
 
+	dsn := "mem://?tenant=default"
+	if len(args) > 1 {
+		if args[1].Type() != js.TypeString {
+			return apiResult(false, "dsn must be a string", "")
+		}
+		dsn = args[1].String()
+	}
+	if _, err := wasmTenantFromDSN(dsn); err != nil {
+		return apiResult(false, err.Error(), "")
+	}
+
 	encoded := strings.TrimSpace(args[0].String())
 	if encoded == "" {
 		return apiResult(false, "snapshot must not be empty", "")
@@ -256,7 +267,7 @@ func jsImportDB(this js.Value, args []js.Value) any {
 		logError("Failed to import database", err)
 		return apiResult(false, err.Error(), "")
 	}
-	if err = bindStorageDB(loaded, "mem://?tenant=default"); err != nil {
+	if err = bindStorageDB(loaded, dsn); err != nil {
 		logError("Failed to bind imported database", err)
 		return apiResult(false, err.Error(), "")
 	}

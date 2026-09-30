@@ -12,8 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"gopkg.in/yaml.v3"
-
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
@@ -214,18 +212,9 @@ func ImportYAML(
 		return nil, fmt.Errorf("read YAML: %w", err)
 	}
 
-	var records []map[string]any
-	// Try YAML list
-	if err := yaml.Unmarshal(all, &records); err == nil {
-		// ok
-	} else {
-		// Try single mapping
-		var single map[string]any
-		if err2 := yaml.Unmarshal(all, &single); err2 == nil {
-			records = append(records, single)
-		} else {
-			return nil, fmt.Errorf("unsupported YAML structure: %v / %v", err, err2)
-		}
+	records, err := decodeYAMLRecords(all)
+	if err != nil {
+		return nil, err
 	}
 
 	if len(records) == 0 {

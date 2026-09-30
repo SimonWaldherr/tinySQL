@@ -1,10 +1,11 @@
-//go:build no_http
+//go:build (no_http || tinysql_minimal) && !tinygo.wasm && !baremetal
 
 package engine
 
 import "fmt"
 
-// evalHTTPFunc is intentionally unavailable when built with -tags no_http.
+// evalHTTPFunc is intentionally unavailable when built with -tags no_http
+// or -tags tinysql_minimal.
 // Keeping the SQL function registered produces an actionable query error
 // instead of an "unknown function" parse error, mirroring
 // io_functions_tinygo.go's identical stub for TinyGo targets. Unlike that
