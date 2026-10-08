@@ -8,7 +8,7 @@ SHELL := /usr/bin/env bash
 .PHONY: build-gh-pages-demo check-gh-pages-demo update-gh-pages push-gh-pages
 .PHONY: test-all test-unit test-integration test-jsonv2 test-ci coverage build-check wasm-check wasm-smoke tinygo-wasm ci verify verify-ci
 .PHONY: test-query-files test-query-files-wasm test-fsql test-gorm test-sqlpackages test-sql-compat test-server
-.PHONY: run-wasm-browser run-wasm-node-demo deps deps-all update-deps tidy tidy-all modules-verify bench bench-engine bench-hotpaths bench-stream bench-stream-guard release-check script-lint docker-build info
+.PHONY: run-wasm-browser run-wasm-node-demo deps deps-all update-deps tidy tidy-all modules-tidy-check modules-verify bench bench-engine bench-hotpaths bench-stream bench-stream-guard release-check script-lint docker-build info
 .DEFAULT_GOAL := help
 
 # Variables
@@ -481,6 +481,15 @@ tidy-all:
 		(cd "$$dir" && $(GO) mod tidy); \
 	done
 
+## modules-tidy-check: Verify every tracked Go module is tidy without modifying it
+modules-tidy-check:
+	@echo "$(GREEN)Checking tracked Go modules are tidy...$(NC)"
+	@for mod in $(GO_MOD_FILES); do \
+		dir="$$(dirname "$$mod")"; \
+		echo "$(GREEN)→ $$dir$(NC)"; \
+		(cd "$$dir" && $(GO) mod tidy -diff); \
+	done
+
 ## modules-verify: Download and verify checksums for every tracked Go module
 modules-verify:
 	@echo "$(GREEN)Downloading and verifying tracked Go modules...$(NC)"
@@ -499,7 +508,7 @@ verify-ci: fmt-check vet build-check test-all
 	@echo "$(GREEN)✓ CI verification passed$(NC)"
 
 ## ci: Run the complete standard-Go CI matrix
-ci: fmt-check modules-verify build-check wasm-check vet test-ci bench-stream-guard
+ci: fmt-check modules-tidy-check modules-verify build-check wasm-check vet test-ci bench-stream-guard
 	@echo "$(GREEN)✓ Standard-Go CI verification passed$(NC)"
 
 ## clean: Remove build artifacts

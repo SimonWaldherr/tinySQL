@@ -19,8 +19,10 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"math/bits"
+	"runtime"
 	"slices"
 	"sort"
 	"sync"
@@ -167,26 +169,68 @@ func getGeoGridIndex(ctx context.Context, tenant string, table *storage.Table, c
 	}
 }
 
-// buildGeoGridIndex makes one pass to find every row's bbox/centroid (via
-// the existing collectGeoBBox/collectGeoCentroid accumulators -- the same
-// ones GEO_BBOX/GEO_CENTROID already use per-row), picks a cell size from
-// the resulting row count and union bbox, then a second pass buckets each
-// row into every cell its own bbox touches.
-func buildGeoGridIndex(ctx context.Context, table *storage.Table, colIdx int) (*geoGridIndex, error) {
-	idx := &geoGridIndex{table: table, version: table.Version, uniqueCells: true}
+// geoGridParallelMinRows is the table size from which the first pass fans out
+// over several goroutines; below it the goroutines cost more than they save.
+const geoGridParallelMinRows = 4096
+
+// scanRows is the build's first pass: decode every row's geometry once and
+// record its bbox and centroid in idx. Rows are independent and each writes only
+// its own slots of idx, so a large table is split into contiguous ranges that
+// run in parallel; the union bbox is merged afterwards (min and max do not
+// depend on order). It returns the union and the number of indexed rows.
+func (idx *geoGridIndex) scanRows(ctx context.Context, table *storage.Table, colIdx int) (geoEditBBox, int, error) {
 	n := len(table.Rows)
-	idx.valid = make([]bool, n)
-	idx.centroids = make([]geoPoint, n)
-	idx.bboxes = make([]geoEditBBox, n)
+	workers := min(runtime.GOMAXPROCS(0), n/geoGridParallelMinRows*2, 16)
+	if workers <= 1 {
+		return idx.scanRange(ctx, table, colIdx, 0, n)
+	}
+	type partial struct {
+		union geoEditBBox
+		valid int
+		err   error
+	}
+	parts := make([]partial, workers)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		lo, hi := n*w/workers, n*(w+1)/workers
+		wg.Add(1)
+		go func(w, lo, hi int) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					parts[w].err = fmt.Errorf("spatial index build: %v", r)
+				}
+			}()
+			parts[w].union, parts[w].valid, parts[w].err = idx.scanRange(ctx, table, colIdx, lo, hi)
+		}(w, lo, hi)
+	}
+	wg.Wait()
+	union := geoEditBBox{}
+	valid := 0
+	for _, p := range parts {
+		if p.err != nil {
+			return geoEditBBox{}, 0, p.err
+		}
+		valid += p.valid
+		if p.union.Set {
+			union.add(geoEditPoint{X: p.union.MinX, Y: p.union.MinY})
+			union.add(geoEditPoint{X: p.union.MaxX, Y: p.union.MaxY})
+		}
+	}
+	return union, valid, nil
+}
+
+// scanRange indexes rows [lo, hi) and returns their union bbox and count.
+func (idx *geoGridIndex) scanRange(ctx context.Context, table *storage.Table, colIdx, lo, hi int) (geoEditBBox, int, error) {
 	union := geoEditBBox{}
 	validCount := 0
-
-	for i, row := range table.Rows {
+	for i := lo; i < hi; i++ {
 		if i&1023 == 0 {
 			if err := checkCtx(ctx); err != nil {
-				return nil, err
+				return union, validCount, err
 			}
 		}
+		row := table.Rows[i]
 		if colIdx >= len(row) || row[colIdx] == nil {
 			continue
 		}
@@ -217,6 +261,24 @@ func buildGeoGridIndex(ctx context.Context, table *storage.Table, colIdx int) (*
 		union.add(geoEditPoint{X: bbox.MinX, Y: bbox.MinY})
 		union.add(geoEditPoint{X: bbox.MaxX, Y: bbox.MaxY})
 		validCount++
+	}
+	return union, validCount, nil
+}
+
+// buildGeoGridIndex makes one pass to find every row's bbox/centroid (via
+// the existing collectGeoBBox/collectGeoCentroid accumulators -- the same
+// ones GEO_BBOX/GEO_CENTROID already use per-row), picks a cell size from
+// the resulting row count and union bbox, then a second pass buckets each
+// row into every cell its own bbox touches.
+func buildGeoGridIndex(ctx context.Context, table *storage.Table, colIdx int) (*geoGridIndex, error) {
+	idx := &geoGridIndex{table: table, version: table.Version, uniqueCells: true}
+	n := len(table.Rows)
+	idx.valid = make([]bool, n)
+	idx.centroids = make([]geoPoint, n)
+	idx.bboxes = make([]geoEditBBox, n)
+	union, validCount, err := idx.scanRows(ctx, table, colIdx)
+	if err != nil {
+		return nil, err
 	}
 
 	idx.cells = make(map[geoCellID][]int32)

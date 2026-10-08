@@ -24,8 +24,28 @@ for tool in osmium tippecanoe curl; do
 done
 
 echo "==> downloading $GEOFABRIK_URL"
-if [ ! -f niederbayern-latest.osm.pbf ]; then
-  curl -fL --retry 3 -o niederbayern-latest.osm.pbf "$GEOFABRIK_URL"
+PBF_FILE="niederbayern-latest.osm.pbf"
+PBF_PART="${PBF_FILE}.part"
+if [ ! -s "$PBF_FILE" ]; then
+  # Geofabrik updates its `-latest` redirect around dataset rollover. Retry
+  # the whole request (including a transient redirect loop), and only expose
+  # the file after curl has completed so a failed attempt is never reused.
+  for attempt in 1 2 3 4; do
+    rm -f "$PBF_PART"
+    if curl --fail --location --max-redirs 10 --connect-timeout 30 \
+      --max-time 1800 --output "$PBF_PART" "$GEOFABRIK_URL"; then
+      mv "$PBF_PART" "$PBF_FILE"
+      break
+    fi
+    rm -f "$PBF_PART"
+    if [ "$attempt" = 4 ]; then
+      echo "error: could not download $GEOFABRIK_URL after $attempt attempts" >&2
+      exit 1
+    fi
+    delay=$((30 * (2 ** (attempt - 1))))
+    echo "    download failed; retrying in ${delay}s (attempt $((attempt + 1))/4)" >&2
+    sleep "$delay"
+  done
 else
   echo "    already present, skipping download"
 fi

@@ -137,7 +137,7 @@ func selectSimplePlanIndexRows(plan *simpleSelectPlan, where Expr) error {
 		// trailing index columns, so the result is a superset and the residual
 		// WHERE still runs — which is what lets a two-dimensional predicate such
 		// as a bounding box narrow to one band and filter the other axis.
-		rowIDs, seekErr := table.LookupSecondaryIndexRange(rangePlan.index, rangePlan.prefix, rangePlan.lo, rangePlan.hi)
+		rowIDs, seekErr := table.LookupSecondaryIndexRangeNext(rangePlan.index, rangePlan.prefix, rangePlan.lo, rangePlan.hi, rangePlan.next)
 		if seekErr != nil {
 			if !errors.Is(seekErr, storage.ErrIndexRangeUnsupported) {
 				return seekErr

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/rand"
 	"strings"
 	"testing"
 
@@ -139,4 +140,84 @@ var geoBenchSink int
 func parseGeoBenchSQL(q string) (Statement, error) {
 	p := NewParser(q)
 	return p.ParseStatement()
+}
+
+// BenchmarkGeoSQLRegion is the common "which points lie in this region" query,
+// where the region is a constant polygon with many vertices (a border, a
+// service area) and the rows are points.
+func BenchmarkGeoSQLRegion(b *testing.B) {
+	db := newGeoBenchDB(b)
+	ctx := context.Background()
+	for _, vertices := range []int{16, 500, 5000} {
+		region := fmt.Sprintf(`'{"type":"Polygon","coordinates":[%s]}'`, geoBenchRing(10.5, 51.5, 2.5, vertices))
+		for _, c := range []struct{ name, expr string }{
+			{"ST_WITHIN", `ST_WITHIN(pt, ` + region + `)`},
+			{"ST_CONTAINS", `ST_CONTAINS(` + region + `, pt)`},
+			{"ST_INTERSECTS", `ST_INTERSECTS(pt, ` + region + `)`},
+			{"ST_COVERS", `ST_COVERS(` + region + `, pt)`},
+			{"ST_TOUCHES", `ST_TOUCHES(pt, ` + region + `)`},
+		} {
+			stmt, err := parseGeoBenchSQL(`SELECT ` + c.expr + ` AS v FROM g`)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Run(fmt.Sprintf("%s/vertices=%d", c.name, vertices), func(b *testing.B) {
+				b.ReportAllocs()
+				for i := 0; i < b.N; i++ {
+					rs, err := Execute(ctx, db, "default", stmt)
+					if err != nil {
+						b.Fatal(err)
+					}
+					geoBenchSink = len(rs.Rows)
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkGeoSearch measures GEO_SEARCH on a layer of polygons: the first
+// query builds the spatial index (it decodes every geometry), later queries are
+// served from it.
+func BenchmarkGeoSearch(b *testing.B) {
+	const features = 20000
+	db := storage.NewDB()
+	ctx := context.Background()
+	run := func(q string) *ResultSet {
+		rs, err := Execute(ctx, db, "default", mustParse(q))
+		if err != nil {
+			b.Fatalf("%s: %v", q, err)
+		}
+		return rs
+	}
+	run(`CREATE TABLE layer (id INT PRIMARY KEY, geom GEOMETRY)`)
+	table, _ := db.Get("default", "layer")
+	rng := rand.New(rand.NewSource(3))
+	for i := 0; i < features; i++ {
+		cx, cy := 5+rng.Float64()*10, 45+rng.Float64()*10
+		g, err := canonicalGeoJSON(fmt.Sprintf(`{"type":"Polygon","coordinates":[%s]}`, geoBenchRing(cx, cy, 0.01, 8)))
+		if err != nil {
+			b.Fatal(err)
+		}
+		table.Rows = append(table.Rows, []any{i, g})
+	}
+	table.Version++
+
+	b.Run("cold-build", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			table.Version++ // invalidates the cached index
+			rs := run(`SELECT id FROM GEO_SEARCH('layer', 'geom', 'bbox_intersects', 9, 49, 9.5, 49.5)`)
+			geoBenchSink = len(rs.Rows)
+		}
+	})
+	b.Run("warm-query", func(b *testing.B) {
+		run(`SELECT id FROM GEO_SEARCH('layer', 'geom', 'bbox_intersects', 9, 49, 9.5, 49.5)`)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			x := 5 + float64(i%90)/10
+			rs := run(fmt.Sprintf(`SELECT id FROM GEO_SEARCH('layer', 'geom', 'bbox_intersects', %.2f, 49, %.2f, 49.5)`, x, x+0.5))
+			geoBenchSink = len(rs.Rows)
+		}
+	})
 }

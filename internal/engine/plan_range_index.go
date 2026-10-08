@@ -143,10 +143,13 @@ func collectRangeTerms(expr Expr, colIndex map[string]int, out map[int]*rangeTer
 
 // rangeIndexPlan describes a chosen equality-prefix-plus-range access path.
 type rangeIndexPlan struct {
-	index      *storage.SecondaryIndex
-	prefix     []any
-	lo         storage.IndexRangeBound
-	hi         storage.IndexRangeBound
+	index  *storage.SecondaryIndex
+	prefix []any
+	lo     storage.IndexRangeBound
+	hi     storage.IndexRangeBound
+	// next, when set, bounds the index column after the range column; the seek
+	// uses it to skip entries outside it (see storage.IndexNextBounds).
+	next       *storage.IndexNextBounds
 	predicates []string
 	rangeCol   string
 }
@@ -179,7 +182,7 @@ func selectRangeIndex(table *storage.Table, colIndex map[string]int, where Expr)
 		usable := false
 		var plan *rangeIndexPlan
 
-		for _, column := range idx.Columns {
+		for colPos, column := range idx.Columns {
 			pos, err := table.ColIndex(column)
 			if err != nil {
 				break
@@ -211,6 +214,7 @@ func selectRangeIndex(table *storage.Table, colIndex map[string]int, where Expr)
 				predicates: append(append([]string(nil), predicates...), rangePredicateText(column, lo, hi)),
 				rangeCol:   column,
 			}
+			plan.next = nextColumnBounds(table, idx, colPos+1, equalities, ranges)
 			usable = true
 			break
 		}
@@ -231,6 +235,33 @@ func selectRangeIndex(table *storage.Table, colIndex map[string]int, where Expr)
 		return nil, false
 	}
 	return best, true
+}
+
+// nextColumnBounds returns usable bounds for the index column at position
+// colPos, the one following the range column -- the longitude of a (lat, lon)
+// index -- or nil. Only a column with its own safe numeric bounds qualifies, by
+// the same rule as the range column itself; equality on it is left to the
+// residual filter.
+func nextColumnBounds(table *storage.Table, idx *storage.SecondaryIndex, colPos int, equalities map[int]any, ranges map[int]*rangeTerm) *storage.IndexNextBounds {
+	if colPos >= len(idx.Columns) {
+		return nil
+	}
+	pos, err := table.ColIndex(idx.Columns[colPos])
+	if err != nil {
+		return nil
+	}
+	if _, isEquality := equalities[pos]; isEquality {
+		return nil
+	}
+	term, ok := ranges[pos]
+	if !ok || !term.bounded() {
+		return nil
+	}
+	lo, hi, ok := rangeBoundsForColumn(table, pos, *term)
+	if !ok {
+		return nil
+	}
+	return &storage.IndexNextBounds{Lo: lo, Hi: hi}
 }
 
 func sortedIndexNames(table *storage.Table) []string {

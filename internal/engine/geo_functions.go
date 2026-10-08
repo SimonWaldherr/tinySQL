@@ -356,11 +356,11 @@ func evalGeoWithinPolygon(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	mp, err := evalGeoPolygonArg(env, ex, row, 1)
+	region, err := evalGeoPolygonEntryArg(env, ex, row, 1)
 	if err != nil {
 		return nil, err
 	}
-	return pointInMultiPolygon(p, mp), nil
+	return region.contains(p), nil
 }
 
 // evalGeoPolygonContains is ST_CONTAINS(polygon, point), PostGIS's
@@ -371,7 +371,7 @@ func evalGeoPolygonContains(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err := requireArgs(ex.Name, ex, 2, 2); err != nil {
 		return nil, err
 	}
-	mp, err := evalGeoPolygonArg(env, ex, row, 0)
+	region, err := evalGeoPolygonEntryArg(env, ex, row, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -379,7 +379,7 @@ func evalGeoPolygonContains(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return pointInMultiPolygon(p, mp), nil
+	return region.contains(p), nil
 }
 
 // evalGeoPolygonArea returns a GeoJSON Polygon or MultiPolygon's area in
@@ -390,11 +390,11 @@ func evalGeoPolygonArea(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err := requireArgs(ex.Name, ex, 1, 1); err != nil {
 		return nil, err
 	}
-	mp, err := evalGeoPolygonArg(env, ex, row, 0)
+	region, err := evalGeoPolygonEntryArg(env, ex, row, 0)
 	if err != nil {
 		return nil, err
 	}
-	return multiPolygonAreaMeters(mp), nil
+	return multiPolygonAreaMeters(region.mp), nil
 }
 
 // evalGeoBuffer approximates a circular buffer of radiusMeters around a
@@ -492,22 +492,48 @@ func evalGeoEnvelope(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err := requireArgs(ex.Name, ex, 1, 1); err != nil {
 		return nil, err
 	}
-	bboxResult, err := evalGeoBBox(env, ex, row)
+	value, err := evalExpr(env, ex.Args[0], row)
 	if err != nil {
 		return nil, err
 	}
-	if bboxResult == nil {
+	if value == nil {
 		return nil, nil
 	}
-	bboxJSON, ok := bboxResult.(string)
-	if !ok {
-		return nil, fmt.Errorf("%s: unexpected bounding box result type %T", ex.Name, bboxResult)
+	bbox, err := geoBBoxOfValue(ex.Name, value)
+	if err != nil {
+		return nil, err
 	}
-	var bbox []float64
-	if err := json.Unmarshal([]byte(bboxJSON), &bbox); err != nil || len(bbox) != 4 {
-		return nil, fmt.Errorf("%s: could not read bounding box: %w", ex.Name, err)
+	return geoEnvelopeJSON(bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY)
+}
+
+// geoEnvelopeJSON writes the closed rectangle ring as the Polygon text
+// marshalGeoJSON would produce for it.
+func geoEnvelopeJSON(minLon, minLat, maxLon, maxLat float64) (any, error) {
+	buf := make([]byte, 0, 160)
+	buf = append(buf, `{"coordinates":[[`...)
+	corners := [5][2]float64{{minLon, minLat}, {maxLon, minLat}, {maxLon, maxLat}, {minLon, maxLat}, {minLon, minLat}}
+	for i, c := range corners {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, '[')
+		var ok bool
+		if buf, ok = appendGeoJSONFloat(buf, c[0]); !ok {
+			return geoEnvelopeJSONSlow(minLon, minLat, maxLon, maxLat)
+		}
+		buf = append(buf, ',')
+		if buf, ok = appendGeoJSONFloat(buf, c[1]); !ok {
+			return geoEnvelopeJSONSlow(minLon, minLat, maxLon, maxLat)
+		}
+		buf = append(buf, ']')
 	}
-	minLon, minLat, maxLon, maxLat := bbox[0], bbox[1], bbox[2], bbox[3]
+	buf = append(buf, `]],"type":"Polygon"}`...)
+	return string(buf), nil
+}
+
+// geoEnvelopeJSONSlow is the original construction, kept for values the direct
+// writer declines (it reports exactly the errors json.Marshal does).
+func geoEnvelopeJSONSlow(minLon, minLat, maxLon, maxLat float64) (any, error) {
 	ring := []any{
 		[]float64{minLon, minLat},
 		[]float64{maxLon, minLat},
@@ -515,7 +541,7 @@ func evalGeoEnvelope(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		[]float64{minLon, maxLat},
 		[]float64{minLon, minLat},
 	}
-	body, err := marshalGeoJSON(map[string]any{"type": "Polygon", "coordinates": []any{ring}})
+	body, err := json.Marshal(map[string]any{"type": "Polygon", "coordinates": []any{ring}})
 	if err != nil {
 		return nil, err
 	}
@@ -776,6 +802,15 @@ func geoMultiPolygonFromValue(v any) (geoMultiPolygon, error) {
 	if err != nil {
 		return geoMultiPolygon{}, err
 	}
+	// A cached constant geometry keeps its typed form with it.
+	if entry, ok := geoCachedObjectPolygon(obj); ok {
+		return entry.mp, entry.err
+	}
+	return geoMultiPolygonFromObject(obj)
+}
+
+// geoMultiPolygonFromObject converts a decoded Polygon or MultiPolygon object.
+func geoMultiPolygonFromObject(obj map[string]any) (geoMultiPolygon, error) {
 	typ, _ := obj["type"].(string)
 	switch {
 	case strings.EqualFold(typ, "Polygon"):
@@ -872,10 +907,18 @@ func geoObjectFromValue(v any) (map[string]any, error) {
 	case []byte:
 		return geoObjectFromJSON(x)
 	case string:
-		if obj, ok := decodeJSONObjectFast(x); ok {
+		if obj := geoObjCacheLookup(x); obj != nil {
 			return obj, nil
 		}
-		return geoObjectFromJSON([]byte(strings.TrimSpace(x)))
+		if obj, ok := decodeJSONObjectFast(x); ok {
+			geoObjCacheStore(x, obj)
+			return obj, nil
+		}
+		obj, err := geoObjectFromJSON([]byte(strings.TrimSpace(x)))
+		if err == nil {
+			geoObjCacheStore(x, obj)
+		}
+		return obj, err
 	default:
 		return nil, fmt.Errorf("expected GeoJSON geometry, got %T", v)
 	}
@@ -903,6 +946,18 @@ func geoObjectFromJSON(body []byte) (map[string]any, error) {
 // builtin_string.go) use, so a value entering the database through either
 // path ends up as identical, predictable text.
 func canonicalGeoJSON(v any) (string, error) {
+	if text, ok := geoTextValue(v); ok {
+		if out, ok := canonicalGeoJSONFast(text); ok {
+			return out, nil
+		}
+	}
+	return canonicalGeoJSONSlow(v)
+}
+
+// canonicalGeoJSONSlow is canonicalGeoJSON through decoded maps. It handles
+// every input canonicalGeoJSONFast declines and is the reference the fast path
+// is tested against.
+func canonicalGeoJSONSlow(v any) (string, error) {
 	obj, err := geoObjectFromValue(v)
 	if err != nil {
 		return "", err

@@ -238,6 +238,11 @@ func ExecuteStreamWithOptions(ctx context.Context, db *storage.DB, tenant string
 	if opts.Buffer < 0 {
 		return nil, fmt.Errorf("stream buffer must not be negative: %d", opts.Buffer)
 	}
+	if sel, ok := stmt.(*Select); ok && streamableSimpleSelect(sel) {
+		if stream, err := streamSmallSelect(ctx, db, tenant, sel, opts.Buffer); stream != nil || err != nil {
+			return stream, err
+		}
+	}
 	streamCtx, cancel := context.WithCancelCause(ctx)
 	stream := &ResultStream{
 		ctx:            streamCtx,
@@ -264,6 +269,354 @@ func ExecuteStreamWithOptions(ctx context.Context, db *storage.DB, tenant string
 		<-stream.done
 		return nil, context.Cause(streamCtx)
 	}
+}
+
+// The synchronous first phase of a streamed SELECT. A request that touches a
+// few rows -- a point lookup by key, a viewport query, a small LIMIT -- is
+// answered before ExecuteStream returns; only when the scan outgrows these
+// budgets does a producer goroutine take over, from exactly where the first
+// phase stopped.
+const (
+	// syncStreamMaxRows is the most rows the first phase produces.
+	syncStreamMaxRows = 64
+	// syncStreamMaxCandidates is the most candidate rows it examines.
+	syncStreamMaxCandidates = 2048
+)
+
+// closedResultStreamDone is the Done channel of every stream whose production
+// finished before it was returned.
+var closedResultStreamDone = func() chan struct{} {
+	c := make(chan struct{})
+	close(c)
+	return c
+}()
+
+// simpleScanState is the position of a simple-plan scan, so that it can be
+// handed from the synchronous first phase to the producer goroutine.
+type simpleScanState struct {
+	next    int    // next candidate position to examine
+	matched int    // matches seen, for OFFSET
+	emitted int    // rows produced, for LIMIT
+	scanned uint64 // candidates examined
+}
+
+// streamSmallSelect starts a streamable SELECT synchronously.
+//
+// A point lookup is the request a tile server or an API makes thousands of times
+// a second; for it the goroutine start, the channel hand-offs and the scheduler
+// wake-ups cost more than the lookup itself. The first phase evaluates rows here,
+// under the read lock the producer would hold, into the stream's buffer. If the
+// whole result fits within the budgets, the returned stream is already complete:
+// same API, but Next never blocks and no goroutine exists. Otherwise the
+// producer goroutine continues the scan from the first phase's position, so the
+// work is neither repeated nor reordered.
+//
+// It returns (nil, nil) when the statement does not qualify -- a caller that
+// asked for a small buffer (it asked for backpressure), ORDER BY, a paged source
+// -- and ExecuteStreamWithOptions then streams as before. Planning errors are
+// reported here exactly as the producer reports them.
+func streamSmallSelect(ctx context.Context, db *storage.DB, tenant string, sel *Select, buffer int) (*ResultStream, error) {
+	// Rows are buffered before any consumer exists, so they must fit the
+	// requested buffer for the result to be indistinguishable from the
+	// producer's.
+	maxRows := min(syncStreamMaxRows, buffer)
+	if maxRows <= 0 {
+		return nil, nil
+	}
+	if err := checkPermission(ctx, db, sel); err != nil {
+		recordAudit(ctx, db, tenant, sel, err)
+		return nil, err
+	}
+	db.LockContentForRead()
+	locked := true
+	defer func() {
+		if locked {
+			db.UnlockContentForRead()
+		}
+	}()
+	env := ExecEnv{
+		ctx:           ctx,
+		tenant:        tenant,
+		db:            db,
+		now:           time.Now(),
+		subqueryCache: newSubqueryResultCache(),
+	}
+	plan, handled, err := buildStreamingSimpleSelectPlan(env, sel)
+	if err != nil {
+		recordAudit(ctx, db, tenant, sel, err)
+		return nil, err
+	}
+	if !handled || len(plan.orderBy) != 0 {
+		return nil, nil
+	}
+	if plan.pagedSource != nil {
+		if !plan.pagedSingleRow {
+			return nil, nil
+		}
+		return streamSmallPagedSelect(ctx, db, tenant, sel, plan, buffer)
+	}
+	if err := checkCtx(ctx); err != nil {
+		err = context.Cause(ctx)
+		recordAudit(ctx, db, tenant, sel, err)
+		return nil, err
+	}
+
+	rows := simplePlanRows(plan)
+	candidates := len(rows)
+	if plan.rowIDs != nil {
+		candidates = len(plan.rowIDs)
+	}
+	offset := 0
+	if plan.offset != nil && *plan.offset > 0 {
+		offset = *plan.offset
+	}
+	limit := -1
+	if plan.limit != nil {
+		limit = *plan.limit
+	}
+
+	var out [syncStreamMaxRows]Row
+	produced := 0
+	var st simpleScanState
+	finished := limit == 0
+	// An evaluation error after earlier rows is delivered the way the producer
+	// delivers it: the rows first, the error through Err.
+	var evalErr error
+	collect := func() {
+		// The producer goroutine turns a panic while evaluating a row into an
+		// error; keep that behavior here.
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				evalErr = fmt.Errorf("internal error executing streamed statement: %v", recovered)
+			}
+		}()
+		budget := min(candidates, syncStreamMaxCandidates)
+		for st.next < budget {
+			i := st.next
+			rowID := i
+			if plan.rowIDs != nil {
+				rowID = plan.rowIDs[i]
+			}
+			if rowID < 0 || rowID >= len(rows) {
+				evalErr = fmt.Errorf("index %q returned invalid row id %d", plan.indexName, rowID)
+				return
+			}
+			st.next++
+			st.scanned++
+			raw := rows[rowID]
+			match := plan.filterFullyCovered
+			if !match {
+				var err error
+				if match, err = evalRawWhere(plan, raw); err != nil {
+					evalErr = err
+					return
+				}
+			}
+			if !match {
+				continue
+			}
+			if st.matched < offset {
+				st.matched++
+				continue
+			}
+			row, err := projectRawRowPooled(plan, raw)
+			if err != nil {
+				evalErr = err
+				return
+			}
+			out[produced] = row
+			produced++
+			st.emitted++
+			if limit >= 0 && st.emitted >= limit {
+				finished = true
+				return
+			}
+			if produced >= maxRows {
+				return
+			}
+		}
+	}
+	if !finished {
+		collect()
+	}
+	if evalErr != nil || finished || st.next >= candidates {
+		recordAudit(ctx, db, tenant, sel, evalErr)
+		return completedResultStream(ctx, plan.outputCols, out[:produced], st.scanned, evalErr, buffer), nil
+	}
+
+	// The scan outgrew the first phase: a producer continues it. Hand over what
+	// the producer's own startup would have established -- the table pin that
+	// lets it outlive the read lock, or the lock itself.
+	streamCtx, cancel := context.WithCancelCause(ctx)
+	ch := make(chan Row, buffer)
+	for _, row := range out[:produced] {
+		ch <- row
+	}
+	stream := &ResultStream{
+		Cols:           append([]string(nil), plan.outputCols...),
+		ctx:            streamCtx,
+		cancel:         cancel,
+		rows:           ch,
+		done:           make(chan struct{}),
+		startedAt:      time.Now(),
+		bufferCapacity: buffer,
+	}
+	stream.rowsProduced.Store(uint64(produced))
+	if produced > 0 {
+		stream.firstRowAt.Store(time.Now().UnixNano())
+	}
+	// The scan loop publishes candidates in groups of 64 and adds the remainder
+	// when it ends; start from the groups the first phase already completed.
+	stream.rowsScanned.Store(st.scanned &^ 63)
+	var releasePin func()
+	if release, pinned := db.PinTableForStream(plan.table); pinned {
+		releasePin = release
+		db.UnlockContentForRead()
+		locked = false
+	}
+	go produceStreamTail(stream, plan, st, db, tenant, sel, releasePin, locked)
+	locked = false // ownership of the read lock, if still held, moved to the producer
+	return stream, nil
+}
+
+// produceStreamTail continues a simple-plan scan from st on its own goroutine.
+// It releases the read lock or table pin it was handed, audits the statement and
+// finishes the stream, as produceResultStream does for a stream it started.
+func produceStreamTail(stream *ResultStream, plan *simpleSelectPlan, st simpleScanState, db *storage.DB, tenant string, stmt Statement, releasePin func(), locked bool) {
+	var err error
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("internal error executing streamed statement: %v", recovered)
+		}
+		if locked {
+			db.UnlockContentForRead()
+		}
+		if releasePin != nil {
+			releasePin()
+		}
+		recordAudit(stream.ctx, db, tenant, stmt, err)
+		stream.finish(err)
+	}()
+	err = streamSimpleSelectPlanFrom(stream, plan, db, st)
+}
+
+// streamSmallPagedSelect is streamSmallSelect for a paged (read-only on-disk)
+// point seek on a unique index, which yields at most one row. The cursor is
+// drained here, under the read lock, so no producer goroutine is needed to
+// serve a tile or a record by key.
+func streamSmallPagedSelect(ctx context.Context, db *storage.DB, tenant string, sel *Select, plan *simpleSelectPlan, buffer int) (*ResultStream, error) {
+	source := plan.pagedSource
+	var out []Row
+	var scanned uint64
+	var evalErr error
+	run := func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				evalErr = fmt.Errorf("internal error executing streamed statement: %v", recovered)
+			}
+		}()
+		cursor, ok, err := db.OpenPagedIndexRangeCursor(source.tenant, source.table, source.indexName, source.startKey, source.endKey)
+		if err == nil && (!ok || cursor == nil) {
+			err = fmt.Errorf("paged stream source is unavailable")
+		}
+		if err != nil {
+			evalErr = err
+			return
+		}
+		offset := 0
+		if plan.offset != nil && *plan.offset > 0 {
+			offset = *plan.offset
+		}
+		limit := -1
+		if plan.limit != nil {
+			limit = *plan.limit
+		}
+		if limit == 0 {
+			return
+		}
+		matched := 0
+		for !cursor.Done() {
+			if err := checkCtx(ctx); err != nil {
+				evalErr = context.Cause(ctx)
+				return
+			}
+			batch, err := cursor.NextBatch(pagedResultStreamBatchRows)
+			if err != nil {
+				evalErr = err
+				return
+			}
+			for _, raw := range batch {
+				scanned++
+				match := plan.filterFullyCovered
+				if !match {
+					if match, err = evalRawWhere(plan, raw); err != nil {
+						evalErr = err
+						return
+					}
+				}
+				if !match {
+					continue
+				}
+				if matched < offset {
+					matched++
+					continue
+				}
+				row, err := projectRawRowPooled(plan, raw)
+				if err != nil {
+					evalErr = err
+					return
+				}
+				out = append(out, row)
+				if limit >= 0 && len(out) >= limit {
+					return
+				}
+			}
+		}
+	}
+	run()
+	if evalErr != nil && len(out) == 0 {
+		// Nothing was produced: report like the producer does for a source that
+		// cannot be opened or read.
+		recordAudit(ctx, db, tenant, sel, evalErr)
+		if errors.Is(evalErr, context.Canceled) || errors.Is(evalErr, context.DeadlineExceeded) {
+			return nil, evalErr
+		}
+		return failedResultStream(ctx, plan.outputCols, evalErr, buffer), nil
+	}
+	recordAudit(ctx, db, tenant, sel, evalErr)
+	return completedResultStream(ctx, plan.outputCols, out, scanned, evalErr, buffer), nil
+}
+
+// completedResultStream wraps already-produced rows in a finished ResultStream.
+func completedResultStream(ctx context.Context, cols []string, rows []Row, scanned uint64, err error, buffer int) *ResultStream {
+	ch := make(chan Row, len(rows))
+	for _, row := range rows {
+		ch <- row
+	}
+	close(ch)
+	now := time.Now()
+	stream := &ResultStream{
+		Cols:           append([]string(nil), cols...),
+		ctx:            ctx,
+		cancel:         func(error) {},
+		rows:           ch,
+		done:           closedResultStreamDone,
+		producerErr:    err,
+		startedAt:      now,
+		bufferCapacity: buffer,
+	}
+	stream.rowsScanned.Store(scanned)
+	stream.rowsProduced.Store(uint64(len(rows)))
+	if len(rows) > 0 {
+		stream.firstRowAt.Store(now.UnixNano())
+	}
+	stream.completedAt.Store(now.UnixNano())
+	stream.complete.Store(true)
+	return stream
+}
+
+func failedResultStream(ctx context.Context, cols []string, err error, buffer int) *ResultStream {
+	return completedResultStream(ctx, cols, nil, 0, err, buffer)
 }
 
 func produceResultStream(stream *ResultStream, header chan<- resultStreamHeader, db *storage.DB, tenant string, stmt Statement) {
@@ -394,6 +747,12 @@ func streamSimpleSelectPlan(stream *ResultStream, plan *simpleSelectPlan, db *st
 	if plan.pagedSource != nil {
 		return streamPagedSimpleSelectPlan(stream, plan, db)
 	}
+	return streamSimpleSelectPlanFrom(stream, plan, db, simpleScanState{})
+}
+
+// streamSimpleSelectPlanFrom runs the scan from position st, which is the zero
+// state for a scan that has not started.
+func streamSimpleSelectPlanFrom(stream *ResultStream, plan *simpleSelectPlan, db *storage.DB, st simpleScanState) error {
 	rows := simplePlanRows(plan)
 	rowCount := len(rows)
 	if plan.rowIDs != nil {
@@ -411,15 +770,15 @@ func streamSimpleSelectPlan(stream *ResultStream, plan *simpleSelectPlan, db *st
 		return nil
 	}
 
-	matched, emitted := 0, 0
-	var scanned uint64
+	matched, emitted := st.matched, st.emitted
+	scanned := st.scanned
 	defer func() {
 		// Publish the unbatched tail so completed stream statistics are exact.
 		if remainder := scanned & 63; remainder != 0 {
 			stream.rowsScanned.Add(remainder)
 		}
 	}()
-	for i := 0; i < rowCount; i++ {
+	for i := st.next; i < rowCount; i++ {
 		scanned++
 		// Hot scans only touch shared state every 64 candidates. Stats observed
 		// during a query are therefore at most 63 rows behind, while completed

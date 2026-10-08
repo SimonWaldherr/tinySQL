@@ -540,12 +540,12 @@ func evalGeoPerimeter(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err := requireArgs(ex.Name, ex, 1, 1); err != nil {
 		return nil, err
 	}
-	mp, err := evalGeoPolygonArg(env, ex, row, 0)
+	region, err := evalGeoPolygonEntryArg(env, ex, row, 0)
 	if err != nil {
 		return nil, err
 	}
 	total := 0.0
-	for _, poly := range mp.Polygons {
+	for _, poly := range region.mp.Polygons {
 		for _, ring := range poly.Rings {
 			for i := 1; i < len(ring); i++ {
 				total += haversineMeters(ring[i-1].Lat, ring[i-1].Lon, ring[i].Lat, ring[i].Lon)

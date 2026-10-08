@@ -62,6 +62,24 @@ const numericComponentLen = 1 + 4 + 8
 // caller still filters. Row IDs come back in table order, matching the
 // observable order of a scan with no ORDER BY.
 func (t *Table) LookupSecondaryIndexRange(idx *SecondaryIndex, prefix []any, lo, hi IndexRangeBound) ([]int, error) {
+	return t.LookupSecondaryIndexRangeNext(idx, prefix, lo, hi, nil)
+}
+
+// IndexNextBounds are bounds on the index column that follows the range column,
+// applied to each entry as the walk passes it. They only drop rows the caller's
+// residual filter would drop anyway; an entry whose next component cannot be
+// compared exactly (another type tag, NULL, a shorter key) is always kept.
+//
+// This is what makes a two-dimensional box predicate on a (lat, lon) index cost
+// about the rows inside the box rather than every row in the latitude band.
+type IndexNextBounds struct {
+	Lo, Hi IndexRangeBound
+}
+
+// LookupSecondaryIndexRangeNext is LookupSecondaryIndexRange with an optional
+// pre-filter on the column after the range column. next may be nil. The result
+// is a superset of the matching rows, exactly as for the one-column form.
+func (t *Table) LookupSecondaryIndexRangeNext(idx *SecondaryIndex, prefix []any, lo, hi IndexRangeBound, next *IndexNextBounds) ([]int, error) {
 	if idx == nil {
 		return nil, nil
 	}
@@ -91,6 +109,13 @@ func (t *Table) LookupSecondaryIndexRange(idx *SecondaryIndex, prefix []any, lo,
 		if len(hiEnc) != numericComponentLen {
 			return nil, fmt.Errorf("%w: upper bound %T is not numeric", ErrIndexRangeUnsupported, hi.Value)
 		}
+	}
+
+	// Bounds on the following column become a pre-filter only if they encode as
+	// fixed-width numeric components of one kind; otherwise it is simply off.
+	var nextFilter *nextComponentFilter
+	if next != nil && len(prefix)+1 < len(idx.Columns) {
+		nextFilter = newNextComponentFilter(*next)
 	}
 
 	// Start at the first entry that could satisfy the prefix and lower bound.
@@ -144,6 +169,10 @@ func (t *Table) LookupSecondaryIndexRange(idx *SecondaryIndex, prefix []any, lo,
 				return false // past the bound, and the rest sorts higher still
 			}
 		}
+		if nextFilter != nil && nextFilter.excludes(key[off+numericComponentLen:]) {
+			i++
+			return true
+		}
 		out = append(out, rowIDs...)
 		i++
 		return true
@@ -153,6 +182,61 @@ func (t *Table) LookupSecondaryIndexRange(idx *SecondaryIndex, prefix []any, lo,
 	}
 	sort.Ints(out)
 	return out, nil
+}
+
+// nextComponentFilter compares the component after the range column with its
+// bounds, byte for byte, which orders exactly as the numbers do (see the file
+// comment).
+type nextComponentFilter struct {
+	loEnc, hiEnc       [numericComponentLen]byte
+	hasLo, hasHi       bool
+	loInclusive, hiInc bool
+	tag                byte
+}
+
+func newNextComponentFilter(b IndexNextBounds) *nextComponentFilter {
+	f := &nextComponentFilter{loInclusive: b.Lo.Inclusive, hiInc: b.Hi.Inclusive}
+	if !b.Lo.Absent {
+		enc := appendCanonicalIndexValue(f.loEnc[:0], b.Lo.Value)
+		if len(enc) != numericComponentLen {
+			return nil
+		}
+		f.hasLo, f.tag = true, f.loEnc[0]
+	}
+	if !b.Hi.Absent {
+		enc := appendCanonicalIndexValue(f.hiEnc[:0], b.Hi.Value)
+		if len(enc) != numericComponentLen {
+			return nil
+		}
+		if f.hasLo && f.hiEnc[0] != f.tag {
+			return nil // bounds of different kinds: nothing exact to compare
+		}
+		f.hasHi, f.tag = true, f.hiEnc[0]
+	}
+	if !f.hasLo && !f.hasHi {
+		return nil
+	}
+	return f
+}
+
+// excludes reports whether the entry whose remaining key starts with rest
+// provably lies outside the bounds.
+func (f *nextComponentFilter) excludes(rest []byte) bool {
+	if len(rest) < numericComponentLen || rest[0] != f.tag {
+		return false
+	}
+	comp := rest[:numericComponentLen]
+	if f.hasLo {
+		if cmp := bytes.Compare(comp, f.loEnc[:]); cmp < 0 || (cmp == 0 && !f.loInclusive) {
+			return true
+		}
+	}
+	if f.hasHi {
+		if cmp := bytes.Compare(comp, f.hiEnc[:]); cmp > 0 || (cmp == 0 && !f.hiInc) {
+			return true
+		}
+	}
+	return false
 }
 
 // loHiTag returns the type tag the bounds encode with. Both bounds are checked

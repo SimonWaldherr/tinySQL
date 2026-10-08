@@ -55,10 +55,13 @@ func evalGeoClip(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		allowNonconvex = bv.(bool)
 	}
 
-	boundaryMP, err := geoMultiPolygonFromValue(boundaryVal)
+	// The boundary is usually one constant for every row; the parsed polygon is
+	// shared and only read here.
+	boundaryEntry, err := geoPolygonFromValueCached(boundaryVal)
 	if err != nil {
 		return nil, fmt.Errorf("%s boundary: %w", ex.Name, err)
 	}
+	boundaryMP := boundaryEntry.mp
 	if len(boundaryMP.Polygons) != 1 || len(boundaryMP.Polygons[0].Rings) != 1 {
 		return nil, fmt.Errorf("%s: boundary must be a single Polygon with no holes", ex.Name)
 	}

@@ -232,14 +232,18 @@ func geoPointsIntersectPoints(aObj, bObj map[string]any) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	return pointsIntersectPoints(aPts, bPts), nil
+}
+
+func pointsIntersectPoints(aPts, bPts []geoPoint) bool {
 	for _, a := range aPts {
 		for _, b := range bPts {
 			if a.Lon == b.Lon && a.Lat == b.Lat {
-				return true, nil
+				return true
 			}
 		}
 	}
-	return false, nil
+	return false
 }
 
 func geoPointsIntersectLines(aObj, bObj map[string]any) (bool, error) {
@@ -251,16 +255,20 @@ func geoPointsIntersectLines(aObj, bObj map[string]any) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	return pointsIntersectLines(pts, lines), nil
+}
+
+func pointsIntersectLines(pts []geoPoint, lines []geoLineString) bool {
 	for _, p := range pts {
 		for _, ls := range lines {
 			for i := 0; i+1 < len(ls); i++ {
 				if pointOnSegment(p, ls[i], ls[i+1]) {
-					return true, nil
+					return true
 				}
 			}
 		}
 	}
-	return false, nil
+	return false
 }
 
 func geoPointsIntersectPolygons(aObj, bObj map[string]any) (bool, error) {
@@ -272,12 +280,16 @@ func geoPointsIntersectPolygons(aObj, bObj map[string]any) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	return pointsIntersectPolygons(pts, mp), nil
+}
+
+func pointsIntersectPolygons(pts []geoPoint, mp geoMultiPolygon) bool {
 	for _, p := range pts {
 		if pointInMultiPolygon(p, mp) || pointOnMultiPolygonBoundary(p, mp) {
-			return true, nil
+			return true
 		}
 	}
-	return false, nil
+	return false
 }
 
 // geoLinesIntersectLines is the one fully rigorous pair here: two
@@ -293,14 +305,18 @@ func geoLinesIntersectLines(aObj, bObj map[string]any) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	return linesIntersectLines(aLines, bLines), nil
+}
+
+func linesIntersectLines(aLines, bLines []geoLineString) bool {
 	for _, la := range aLines {
 		for _, lb := range bLines {
 			if geoPathsIntersect(la, lb) {
-				return true, nil
+				return true
 			}
 		}
 	}
-	return false, nil
+	return false
 }
 
 // geoLinesIntersectPolygons tests every line segment against every ring
@@ -319,19 +335,23 @@ func geoLinesIntersectPolygons(aObj, bObj map[string]any) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	return linesIntersectPolygons(lines, mp), nil
+}
+
+func linesIntersectPolygons(lines []geoLineString, mp geoMultiPolygon) bool {
 	for _, ls := range lines {
 		for _, poly := range mp.Polygons {
 			for _, ring := range poly.Rings {
 				if geoPathsIntersect(ls, ring) {
-					return true, nil
+					return true
 				}
 			}
 		}
 		if len(ls) > 0 && pointInMultiPolygon(ls[0], mp) {
-			return true, nil
+			return true
 		}
 	}
-	return false, nil
+	return false
 }
 
 // geoPolygonsIntersectPolygons tests every ring (including holes) of every
@@ -352,10 +372,14 @@ func geoPolygonsIntersectPolygons(aObj, bObj map[string]any) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	return polygonsIntersectPolygons(aMP, bMP), nil
+}
+
+func polygonsIntersectPolygons(aMP, bMP geoMultiPolygon) bool {
 	for _, pa := range aMP.Polygons {
 		for _, pb := range bMP.Polygons {
 			if polygonsShareBoundary(pa, pb) {
-				return true, nil
+				return true
 			}
 		}
 	}
@@ -364,7 +388,7 @@ func geoPolygonsIntersectPolygons(aObj, bObj map[string]any) (bool, error) {
 			continue
 		}
 		if pointInMultiPolygon(pa.Rings[0][0], bMP) {
-			return true, nil
+			return true
 		}
 	}
 	for _, pb := range bMP.Polygons {
@@ -372,10 +396,10 @@ func geoPolygonsIntersectPolygons(aObj, bObj map[string]any) (bool, error) {
 			continue
 		}
 		if pointInMultiPolygon(pb.Rings[0][0], aMP) {
-			return true, nil
+			return true
 		}
 	}
-	return false, nil
+	return false
 }
 
 func polygonsShareBoundary(pa, pb geoPolygon) bool {
@@ -426,6 +450,80 @@ func geoPathBounds(path []geoPoint) (minX, minY, maxX, maxY float64) {
 	return
 }
 
+// ── typed relate shapes ───────────────────────────────────────────────────
+
+// geoRelateShape is a geometry already decoded to the typed form the pairwise
+// algorithms use, for the shapes the fast text decoder understands: Point,
+// LineString, Polygon and MultiPolygon. polygons is shared and read-only when it
+// comes from the parse cache.
+type geoRelateShape struct {
+	kind     geoRelateKind
+	pts      []geoPoint
+	lines    []geoLineString
+	polygons *geoPolygonEntry
+}
+
+// geoRelateShapeFromText decodes v when it is compact GeoJSON text of a
+// supported kind, and reports ok=false for everything else.
+func geoRelateShapeFromText(v any) (geoRelateShape, bool) {
+	text, isText := geoTextValue(v)
+	if !isText {
+		return geoRelateShape{}, false
+	}
+	// A large constant region is recognized by the cache before anything scans
+	// its text: finding the type of a megabyte of coordinates for every row would
+	// cost more than the geometry test.
+	if entry := geoPolyCacheLookup(text); entry != nil {
+		return geoRelateShape{kind: geoRelatePolygons, polygons: entry}, true
+	}
+	typ, _, ok := geoFastHeader(text)
+	if !ok {
+		return geoRelateShape{}, false
+	}
+	switch {
+	case geoEqualFold(typ, "point"):
+		p, ok := decodeGeoPointFast(text)
+		if !ok {
+			return geoRelateShape{}, false
+		}
+		return geoRelateShape{kind: geoRelatePoints, pts: []geoPoint{p}}, true
+	case geoEqualFold(typ, "linestring"):
+		ls, ok := decodeGeoLineStringFast(text)
+		if !ok {
+			return geoRelateShape{}, false
+		}
+		return geoRelateShape{kind: geoRelateLines, lines: []geoLineString{ls}}, true
+	case geoEqualFold(typ, "polygon"), geoEqualFold(typ, "multipolygon"):
+		entry, err := geoPolygonFromValueCached(text)
+		if err != nil {
+			return geoRelateShape{}, false
+		}
+		return geoRelateShape{kind: geoRelatePolygons, polygons: entry}, true
+	}
+	return geoRelateShape{}, false
+}
+
+// geoIntersectsShapes is geoIntersectsDispatch over typed shapes.
+func geoIntersectsShapes(a, b geoRelateShape) bool {
+	if a.kind > b.kind {
+		a, b = b, a
+	}
+	switch {
+	case a.kind == geoRelatePoints && b.kind == geoRelatePoints:
+		return pointsIntersectPoints(a.pts, b.pts)
+	case a.kind == geoRelatePoints && b.kind == geoRelateLines:
+		return pointsIntersectLines(a.pts, b.lines)
+	case a.kind == geoRelatePoints && b.kind == geoRelatePolygons:
+		return b.polygons.pointsIntersect(a.pts)
+	case a.kind == geoRelateLines && b.kind == geoRelateLines:
+		return linesIntersectLines(a.lines, b.lines)
+	case a.kind == geoRelateLines && b.kind == geoRelatePolygons:
+		return linesIntersectPolygons(a.lines, b.polygons.mp)
+	default: // polygons with polygons
+		return polygonsIntersectPolygons(a.polygons.mp, b.polygons.mp)
+	}
+}
+
 // ── ST_INTERSECTS / ST_DISJOINT ──────────────────────────────────────────
 
 func evalGeoIntersects(env ExecEnv, ex *FuncCall, row Row) (any, error) {
@@ -442,6 +540,15 @@ func evalGeoIntersects(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	}
 	if av == nil || bv == nil {
 		return nil, nil
+	}
+	// Compact GeoJSON text takes the typed path: no intermediate maps, and a
+	// large constant region is parsed once (geoPolygonFromValueCached). Anything
+	// else, including every malformed input, runs the original path below so
+	// results and error messages are unchanged.
+	if a, ok := geoRelateShapeFromText(av); ok {
+		if b, ok := geoRelateShapeFromText(bv); ok {
+			return geoIntersectsShapes(a, b), nil
+		}
 	}
 	aObj, err := geoObjectFromValue(av)
 	if err != nil {

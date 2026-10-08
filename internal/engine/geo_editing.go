@@ -65,22 +65,37 @@ func evalGeoBBox(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if value == nil {
 		return nil, nil
 	}
-	object, err := geoSimplifyObject(value)
+	bbox, err := geoBBoxOfValue(ex.Name, value)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", ex.Name, err)
-	}
-	bbox := geoEditBBox{}
-	if err := collectGeoBBox(object, &bbox); err != nil {
-		return nil, fmt.Errorf("%s: %w", ex.Name, err)
-	}
-	if !bbox.Set {
-		return nil, fmt.Errorf("%s: geometry has no coordinates", ex.Name)
+		return nil, err
 	}
 	result, err := marshalGeoJSON([]float64{bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY})
 	if err != nil {
 		return nil, fmt.Errorf("%s: encode bounding box: %w", ex.Name, err)
 	}
 	return string(result), nil
+}
+
+// geoBBoxOfValue computes the bounding box of a geometry value. Plain geometry
+// text is scanned directly; anything else is decoded and walked.
+func geoBBoxOfValue(name string, value any) (geoEditBBox, error) {
+	if text, ok := geoTextValue(value); ok {
+		if bbox, ok := geoBBoxFast(text); ok {
+			return bbox, nil
+		}
+	}
+	object, err := geoSimplifyObject(value)
+	if err != nil {
+		return geoEditBBox{}, fmt.Errorf("%s: %w", name, err)
+	}
+	bbox := geoEditBBox{}
+	if err := collectGeoBBox(object, &bbox); err != nil {
+		return geoEditBBox{}, fmt.Errorf("%s: %w", name, err)
+	}
+	if !bbox.Set {
+		return geoEditBBox{}, fmt.Errorf("%s: geometry has no coordinates", name)
+	}
+	return bbox, nil
 }
 
 func collectGeoBBox(object map[string]any, bbox *geoEditBBox) error {

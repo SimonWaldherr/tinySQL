@@ -162,3 +162,55 @@ go test ./internal/storage -run '^$' \
   -benchtime=200ms -count=3 -benchmem
 go test ./internal/driver -run '^$' -bench BenchmarkTxSmallWrite -benchmem
 ```
+
+Whole-transaction samples on the same machine (single connection, one small
+write per transaction, three-column table with a primary key; `BenchmarkTxSmallWrite`
+in `internal/driver`) went from about 115 µs, 0.92 ms and 10.2–10.9 ms to
+49 µs, 0.23 ms and 1.9 ms for tables of 1,000, 10,000 and 100,000 rows. An
+INSERT followed by a point DELETE on a 100,000-row primary-key table
+(`BenchmarkInsertDeleteChurnLargePKTable`) went from about 4.6 ms to 3 µs
+because the key cache is no longer discarded and rebuilt each time.
+
+## Small results without a producer goroutine
+
+`ExecuteStream` runs the first part of a streamable `SELECT` on the calling
+goroutine, under the read lock the producer would hold: up to 64 produced rows
+and 2,048 examined candidates. If the query finishes inside those budgets the
+returned `ResultStream` is already complete (`Done` is closed, `Next` never
+blocks) and no goroutine exists. Otherwise a producer continues the scan from the
+exact position the first phase reached, with the table pin or lock handed over,
+so no row is repeated, skipped or reordered. Point lookups by key, small `LIMIT`s,
+viewport queries and tile fetches no longer pay a goroutine start and two
+scheduler wake-ups, which dominated them.
+
+The first phase is used only when the requested stream buffer can hold its rows
+(`StreamOptions{Buffer: 0}` still means strict backpressure and takes the
+producer path), `ORDER BY` and `DISTINCT` are excluded as before, and an
+evaluation error after earlier rows is still delivered through `Err` after those
+rows. A paged (read-only on-disk) point seek on a unique index with every column
+bound is answered the same way. Tests compare results, ordering, statistics,
+cancellation and snapshot behavior against `Execute` and the producer path around
+the budget boundaries.
+
+Local samples (Apple M2 Max, Go 1.27.1, `go test ./benchmarks`, `database/sql`
+with bound parameters, for the commit before and after; SQLite is
+`modernc.org/sqlite`):
+
+| Benchmark | Before | After | SQLite (same run) |
+| --- | ---: | ---: | ---: |
+| `TileLookup4k` (in memory) | 9.3 µs | 3.3 µs | 2.8 µs |
+| `TileLookup64k` (in memory) | 10.1 µs | 4.3 µs | 3.6 µs |
+| `TileLookupOnDisk` (paged index) | 20.1–23.4 µs | 12.9–13.7 µs | 6.0–9.0 µs |
+| `ViewportIndexed` | 61–88 µs | 38 µs | 46–48 µs |
+| `CategoryInViewport` | 21.5 µs | 8.5 µs | 20–22 µs |
+
+The remaining on-disk cost is `pread` of cache-missing pages (the benchmark caps
+the page cache at 32 MiB for a ~52 MB tileset). Memory-mapping read-only
+artifacts would remove those system calls, but it adds SIGBUS exposure if a file
+is truncated in place and is therefore not enabled.
+
+```sh
+go test ./benchmarks -run '^$' \
+  -bench 'TileLookup4k|TileLookup64k|TileLookupOnDisk|ViewportIndexed|CategoryInViewport' -benchmem
+go test ./internal/engine -run 'ExecuteStream' -race -count=1
+```

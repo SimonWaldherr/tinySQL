@@ -193,3 +193,27 @@ func BenchmarkMarshalGeoMetadata(b *testing.B) {
 		}
 	}
 }
+
+func TestGeoEnvelopeJSONMatchesMarshal(t *testing.T) {
+	rng := rand.New(rand.NewSource(81))
+	vals := []float64{0, math.Copysign(0, -1), 1e-7, -1e22, 13.405, 5e-324, math.NaN(), math.Inf(1)}
+	for i := 0; i < 5000; i++ {
+		var v [4]float64
+		for k := range v {
+			if rng.Intn(6) == 0 {
+				v[k] = vals[rng.Intn(len(vals))]
+			} else {
+				v[k] = (rng.Float64() - 0.5) * 360
+			}
+		}
+		ring := []any{[]float64{v[0], v[1]}, []float64{v[2], v[1]}, []float64{v[2], v[3]}, []float64{v[0], v[3]}, []float64{v[0], v[1]}}
+		want, wantErr := json.Marshal(map[string]any{"type": "Polygon", "coordinates": []any{ring}})
+		got, gotErr := geoEnvelopeJSON(v[0], v[1], v[2], v[3])
+		if (wantErr == nil) != (gotErr == nil) {
+			t.Fatalf("%v: error mismatch json=%v direct=%v", v, wantErr, gotErr)
+		}
+		if wantErr == nil && got.(string) != string(want) {
+			t.Fatalf("%v:\n direct %s\n json   %s", v, got, want)
+		}
+	}
+}

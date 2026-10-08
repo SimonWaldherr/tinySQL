@@ -837,9 +837,18 @@ func evalGeoAsWKT(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err := requireArgs(ex.Name, ex, 1, 1); err != nil {
 		return nil, err
 	}
-	obj, err := evalGeoObjectArg(env, ex, row, 0)
+	v, err := evalExpr(env, ex.Args[0], row)
 	if err != nil {
 		return nil, err
+	}
+	if text, ok := geoTextValue(v); ok {
+		if wkt, ok := geoWKTFromTextFast(text); ok {
+			return wkt, nil
+		}
+	}
+	obj, err := geoObjectFromValue(v)
+	if err != nil {
+		return nil, fmt.Errorf("%s arg1: %w", ex.Name, err)
 	}
 	wkt, err := geoJSONToWKT(obj)
 	if err != nil {
@@ -913,6 +922,30 @@ func evalGeoFromGeoJSON(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 func evalGeoAsGeoJSON(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err := requireArgs(ex.Name, ex, 1, 2); err != nil {
 		return nil, err
+	}
+	if len(ex.Args) == 1 {
+		// Without rounding this is canonicalization: one pass over plain text.
+		v, err := evalExpr(env, ex.Args[0], row)
+		if err != nil {
+			return nil, err
+		}
+		if text, ok := geoTextValue(v); ok {
+			if out, ok := canonicalGeoJSONFast(text); ok {
+				return out, nil
+			}
+		}
+		obj, err := geoObjectFromValue(v)
+		if err != nil {
+			return nil, fmt.Errorf("%s arg1: %w", ex.Name, err)
+		}
+		if err := validateGeometryShape(obj); err != nil {
+			return nil, fmt.Errorf("%s: %w", ex.Name, err)
+		}
+		body, err := marshalGeoJSON(obj)
+		if err != nil {
+			return nil, fmt.Errorf("%s: encode result: %w", ex.Name, err)
+		}
+		return string(body), nil
 	}
 	obj, err := evalGeoObjectArg(env, ex, row, 0)
 	if err != nil {

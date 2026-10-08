@@ -402,8 +402,11 @@ type simpleSelectPlan struct {
 	// rows is a query-private source supplied by page-oriented index seeks.
 	// It is never retained in a cached plan, so decoded BLOBs remain bounded
 	// to the request that loaded them.
-	rows            [][]any
-	pagedSource     *pagedSimpleSelectSource
+	rows        [][]any
+	pagedSource *pagedSimpleSelectSource
+	// pagedSingleRow marks a paged point seek on a unique index with every
+	// column bound: it can yield at most one row.
+	pagedSingleRow  bool
 	scanType        string
 	indexName       string
 	indexPredicates []string

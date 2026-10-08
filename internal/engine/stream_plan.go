@@ -59,6 +59,7 @@ func buildStreamingSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, 
 		source.startKey = start
 		source.endKey = append(append([]byte(nil), start...), 0xff)
 		plan.scanType = "PAGED INDEX POINT SEEK"
+		plan.pagedSingleRow = idx.Unique
 		plan.indexName = idx.Name
 		plan.indexPredicates = predicates
 		plan.residualFilter = residual

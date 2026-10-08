@@ -85,6 +85,8 @@ Running `go mod tidy` in the repository root does not update nested modules;
 a stale module otherwise fails independently in CI. Use `make tidy-all` after
 changing shared dependencies to tidy every tracked module. `make modules-verify`
 checks checksums across that same tracked set without touching untracked work.
+`make modules-tidy-check` is the non-mutating CI gate that rejects a stale
+nested module before its build runs.
 
 Variables are overridable:
 
