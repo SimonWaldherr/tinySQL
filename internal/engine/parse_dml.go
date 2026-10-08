@@ -83,11 +83,15 @@ func (p *Parser) parseInsertOnConflict() (bool, error) {
 
 func (p *Parser) parseInsertValueRows() ([][]Expr, error) {
 	var rows [][]Expr
+	rowWidth := 0
 	for {
 		if err := p.expectSymbol("("); err != nil {
 			return nil, err
 		}
-		var vals []Expr
+		// Most VALUES lists repeat the same number of columns. Once the
+		// first row establishes that width, allocate subsequent rows once
+		// instead of growing their expression slices for every column.
+		vals := make([]Expr, 0, rowWidth)
 		for {
 			e, err := p.parseExpr()
 			if err != nil {
@@ -104,6 +108,7 @@ func (p *Parser) parseInsertValueRows() ([][]Expr, error) {
 			break
 		}
 		rows = append(rows, vals)
+		rowWidth = len(vals)
 		if p.cur.Typ == tSymbol && p.cur.Val == "," {
 			p.next()
 			continue

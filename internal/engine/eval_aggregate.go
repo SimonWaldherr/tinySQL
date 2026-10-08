@@ -516,7 +516,7 @@ func evalAggregateCase(env ExecEnv, ex *CaseExpr, rows []Row) (any, error) {
 			if err != nil {
 				return nil, err
 			}
-			if cmp, err := compare(target, whenVal); err == nil && cmp == 0 {
+			if caseValuesEqual(target, whenVal) {
 				return evalAggregate(env, w.Then, rows)
 			}
 		}

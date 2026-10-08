@@ -75,11 +75,17 @@ type simpleAggregateState struct {
 	groupValues []any
 	counts      []int // COUNT result, or non-null sample count for SUM/AVG
 	sums        []sumAccumulator
-	sumRat      []*big.Rat
-	useRat      []bool
 	minmax      []any
 	haveMinMax  []bool
-	distinct    []distinctCountSet
+	optional    *aggregateOptionalState
+}
+
+// Numeric COUNT/SUM/AVG groups need none of this state. Keeping the headers
+// lazy saves 64 bytes per group on 64-bit hosts before backing allocations.
+type aggregateOptionalState struct {
+	sumRat   []*big.Rat
+	useRat   []bool
+	distinct []distinctCountSet
 }
 
 func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error) {
@@ -209,16 +215,7 @@ func buildSimpleAggregateSourcePlan(plan *simpleAggregatePlan) (*simpleSelectPla
 }
 
 func executeSimpleSingleGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, rawPlan *simpleSelectPlan) (*ResultSet, bool, error) {
-	// A map[any] looks natural here, but converting a string group value from
-	// a row into an interface makes it escape on every lookup.  On a large
-	// text GROUP BY that turns one otherwise allocation-free scan into one
-	// allocation per input row.  Use the same framed key representation as the
-	// multi-column path instead: string(keyBuf) is allocation-free for a map
-	// lookup, while a stable string is materialized only for a new group.
-	groups := make(map[string]*simpleAggregateState)
-	order := make([]*simpleAggregateState, 0)
-	groupCol := plan.groupCols[0]
-	keyBuf := make([]byte, 0, 32)
+	groups := newAggregateGroups(plan.projs, len(plan.groupCols))
 	rowCount := len(plan.table.Rows)
 	if rawPlan.rowIDs != nil {
 		rowCount = len(rawPlan.rowIDs)
@@ -246,32 +243,17 @@ func executeSimpleSingleGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, r
 			continue
 		}
 
-		groupValue := raw[groupCol]
-		keyBuf = writeSingleGroupKey(keyBuf[:0], groupValue)
-		state, exists := groups[string(keyBuf)]
-		if !exists {
-			state = newSimpleAggregateState([]any{groupValue}, len(plan.projs))
-			groups[string(keyBuf)] = state
-			order = append(order, state)
-		}
+		state := groups.state(raw, plan.groupCols)
 		if err := accumulateSimpleAggregateState(env, rawPlan, raw, state, plan.projs); err != nil {
 			return nil, true, err
 		}
 	}
-	rs, err := finalizeSimpleAggregateResultSet(env, plan, order)
+	rs, err := finalizeSimpleAggregateResultSet(env, plan, groups.order)
 	return rs, true, err
 }
 
 func executeSimpleMultiGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, rawPlan *simpleSelectPlan) (*ResultSet, bool, error) {
-	groups := make(map[string]*simpleAggregateState)
-	order := make([]*simpleAggregateState, 0)
-	// keyBuf is reused across rows via keyBuf[:0] (retaining its backing
-	// array) rather than resetting a *strings.Builder to nil every row — see
-	// the writeFmtKeyPart doc comment. Real GROUP BY workloads have far fewer
-	// distinct groups than rows, so most rows hit the zero-allocation map
-	// lookup below and only the first row of each group pays for a real
-	// string allocation.
-	keyBuf := make([]byte, 0, 64)
+	groups := newAggregateGroups(plan.projs, len(plan.groupCols))
 	rowCount := len(plan.table.Rows)
 	if rawPlan.rowIDs != nil {
 		rowCount = len(rawPlan.rowIDs)
@@ -298,24 +280,7 @@ func executeSimpleMultiGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, ra
 			continue
 		}
 
-		keyBuf = keyBuf[:0]
-		for i, groupCol := range plan.groupCols {
-			if i > 0 {
-				keyBuf = append(keyBuf, '\x1f')
-			}
-			keyBuf = writeFmtKeyPart(keyBuf, raw[groupCol])
-		}
-		state, exists := groups[string(keyBuf)]
-		if !exists {
-			key := string(keyBuf)
-			values := make([]any, len(plan.groupCols))
-			for i, groupCol := range plan.groupCols {
-				values[i] = raw[groupCol]
-			}
-			state = newSimpleAggregateState(values, len(plan.projs))
-			groups[key] = state
-			order = append(order, state)
-		}
+		state := groups.state(raw, plan.groupCols)
 		if err := accumulateSimpleAggregateState(env, rawPlan, raw, state, plan.projs); err != nil {
 			return nil, true, err
 		}
@@ -326,10 +291,10 @@ func executeSimpleMultiGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, ra
 	// "GROUP BY x" correctly produces zero rows here instead, which is why
 	// this is conditioned on zero group-by columns specifically, not just an
 	// empty result.
-	if len(plan.groupCols) == 0 && len(order) == 0 {
-		order = append(order, newSimpleAggregateState(nil, len(plan.projs)))
+	if len(plan.groupCols) == 0 && len(groups.order) == 0 {
+		groups.state(nil, nil)
 	}
-	rs, err := finalizeSimpleAggregateResultSet(env, plan, order)
+	rs, err := finalizeSimpleAggregateResultSet(env, plan, groups.order)
 	return rs, true, err
 }
 
@@ -348,9 +313,9 @@ func newSimpleAggregateState(groupValues []any, projections int) *simpleAggregat
 // projection to an exact rational, mirroring evalAggregateSumAvg. Values of
 // other types are ignored, as before.
 func (state *simpleAggregateState) addSum(i int, v any, projections int) {
-	if state.useRat != nil && state.useRat[i] {
+	if state.optional != nil && state.optional.useRat != nil && state.optional.useRat[i] {
 		if r, ok := ratFromNumeric(v); ok {
-			state.sumRat[i].Add(state.sumRat[i], r)
+			state.optional.sumRat[i].Add(state.optional.sumRat[i], r)
 			state.counts[i]++
 			return
 		}
@@ -362,16 +327,19 @@ func (state *simpleAggregateState) addSum(i int, v any, projections int) {
 	if !ok {
 		return
 	}
-	if state.useRat == nil {
-		state.useRat = make([]bool, projections)
-		state.sumRat = make([]*big.Rat, projections)
+	if state.optional == nil {
+		state.optional = &aggregateOptionalState{}
 	}
-	if !state.useRat[i] {
+	if state.optional.useRat == nil {
+		state.optional.useRat = make([]bool, projections)
+		state.optional.sumRat = make([]*big.Rat, projections)
+	}
+	if !state.optional.useRat[i] {
 		// Migrate the exact integer/float total accumulated so far.
-		state.sumRat[i] = state.sums[i].rat()
-		state.useRat[i] = true
+		state.optional.sumRat[i] = state.sums[i].rat()
+		state.optional.useRat[i] = true
 	}
-	state.sumRat[i].Add(state.sumRat[i], new(big.Rat).Set(rv))
+	state.optional.sumRat[i].Add(state.optional.sumRat[i], new(big.Rat).Set(rv))
 	state.counts[i]++
 }
 
@@ -411,10 +379,13 @@ func accumulateSimpleAggregateState(env ExecEnv, rawPlan *simpleSelectPlan, raw 
 			if v == nil {
 				continue
 			}
-			if state.distinct == nil {
-				state.distinct = make([]distinctCountSet, len(projs))
+			if state.optional == nil {
+				state.optional = &aggregateOptionalState{}
 			}
-			if state.distinct[i].add(v) {
+			if state.optional.distinct == nil {
+				state.optional.distinct = make([]distinctCountSet, len(projs))
+			}
+			if state.optional.distinct[i].add(v) {
 				state.counts[i]++
 			}
 		case aggSum, aggAvg:
@@ -514,16 +485,16 @@ func simpleAggregateProjectionValue(state *simpleAggregateState, proj simpleAggr
 		if state.counts[i] == 0 {
 			return nil
 		}
-		if state.useRat != nil && state.useRat[i] {
-			return state.sumRat[i]
+		if state.optional != nil && state.optional.useRat != nil && state.optional.useRat[i] {
+			return state.optional.sumRat[i]
 		}
 		return state.sums[i].sum()
 	case aggAvg:
 		if state.counts[i] == 0 {
 			return nil
 		}
-		if state.useRat != nil && state.useRat[i] {
-			return new(big.Rat).Quo(state.sumRat[i], big.NewRat(int64(state.counts[i]), 1))
+		if state.optional != nil && state.optional.useRat != nil && state.optional.useRat[i] {
+			return new(big.Rat).Quo(state.optional.sumRat[i], big.NewRat(int64(state.counts[i]), 1))
 		}
 		return state.sums[i].average(state.counts[i])
 	case aggMin, aggMax:

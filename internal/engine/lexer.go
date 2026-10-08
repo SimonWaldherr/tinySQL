@@ -38,10 +38,8 @@ type token struct {
 type lexer struct {
 	s   string
 	pos int
-	// scratch backs upperInto's uppercased copy of an identifier/keyword
-	// candidate, reused across every call for this lexer (one lexer per
-	// parsed statement) instead of allocating fresh on each one. See
-	// upperInto.
+	// Reused only for unusually long candidates; ordinary tokens use a
+	// stack buffer in canonicalKeyword.
 	scratch []byte
 }
 
@@ -352,8 +350,8 @@ func (lx *lexer) tokenizeIdentOrKeyword(start int) token {
 	if hasDot {
 		return token{Typ: tIdent, Val: val, Pos: start}
 	}
-	if up := lx.upperInto(val); isKeyword(up) {
-		return token{Typ: tKeyword, Val: up, Pos: start}
+	if keyword := lx.canonicalKeyword(val); keyword != "" {
+		return token{Typ: tKeyword, Val: keyword, Pos: start}
 	}
 	return token{Typ: tIdent, Val: val, Pos: start}
 }
@@ -444,9 +442,7 @@ func (lx *lexer) tokenizeSymbol(start int) token {
 // upper returns s uppercased (ASCII only, which is all tinySQL's keyword
 // list and column-type-name parsing ever need to match against), allocating
 // only when s actually contains a lowercase ASCII byte. Used by the cold,
-// once-per-statement call sites in parse_column_type.go and
-// parse_statement.go; the per-token hot path in tokenizeIdentOrKeyword uses
-// upperInto instead, which reuses a buffer across many calls.
+// once-per-statement call sites in parse_column_type.go and parse_statement.go.
 func upper(s string) string {
 	hasLower := false
 	for i := 0; i < len(s); i++ {
@@ -467,19 +463,11 @@ func upper(s string) string {
 	return string(b)
 }
 
-// upperInto is upper's contract (ASCII-only uppercase, no-op fast path)
-// implemented for the per-token hot path in tokenizeIdentOrKeyword, which
-// calls this once for every identifier and keyword lexed.
-//
-// The original implementation (upper, above) allocated twice on the
-// has-lowercase path: once via []byte(s) for a mutable copy, and again via
-// string(b) to hand isKeyword's switch a string. This reuses lx.scratch --
-// one buffer per lexer, i.e. per parsed statement, grown only when a longer
-// candidate appears than any seen so far -- to fold case into, cutting that
-// to the one allocation string(lx.scratch[:len(s)]) must still make (Go
-// strings are immutable, so the switch needs its own independent copy;
-// nothing shorter than a real allocation can supply that).
-func (lx *lexer) upperInto(s string) string {
+// canonicalKeyword classifies a candidate without allocating an uppercase
+// copy for ordinary identifiers. The switch does not retain its argument,
+// so the temporary string view of the stack buffer does not allocate. Only
+// a lowercase keyword needs an immutable uppercase copy for token.Val.
+func (lx *lexer) canonicalKeyword(s string) string {
 	hasLower := false
 	for i := 0; i < len(s); i++ {
 		if s[i] >= 'a' && s[i] <= 'z' {
@@ -488,20 +476,33 @@ func (lx *lexer) upperInto(s string) string {
 		}
 	}
 	if !hasLower {
-		return s
+		if isKeyword(s) {
+			return s
+		}
+		return ""
 	}
-	if cap(lx.scratch) < len(s) {
-		lx.scratch = make([]byte, len(s))
+	var small [32]byte
+	buf := small[:]
+	if len(s) > len(buf) {
+		// Reuse storage for long identifiers and keep lookup correct if a
+		// future keyword exceeds the stack buffer.
+		if cap(lx.scratch) < len(s) {
+			lx.scratch = make([]byte, len(s))
+		}
+		buf = lx.scratch
 	}
-	buf := lx.scratch[:len(s)]
+	buf = buf[:len(s)]
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if c >= 'a' && c <= 'z' {
-			c -= 32
+			c -= 'a' - 'A'
 		}
 		buf[i] = c
 	}
-	return string(buf)
+	if isKeyword(string(buf)) {
+		return string(buf)
+	}
+	return ""
 }
 
 func isKeyword(up string) bool {

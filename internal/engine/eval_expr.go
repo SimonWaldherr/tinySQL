@@ -442,6 +442,17 @@ func similarToRegexp(pattern string) string {
 	return b.String()
 }
 
+// A NULL operand never matches a simple CASE arm. Check it before compare
+// would allocate an error that CASE immediately discards. Callers still
+// evaluate each WHEN expression, preserving its errors and evaluation order.
+func caseValuesEqual(a, b any) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	cmp, err := compare(a, b)
+	return err == nil && cmp == 0
+}
+
 func evalCaseExpr(env ExecEnv, ex *CaseExpr, row Row) (any, error) {
 	if ex.Operand != nil {
 		target, err := evalExpr(env, ex.Operand, row)
@@ -453,7 +464,7 @@ func evalCaseExpr(env ExecEnv, ex *CaseExpr, row Row) (any, error) {
 			if err != nil {
 				return nil, err
 			}
-			if cmp, err := compare(target, whenVal); err == nil && cmp == 0 {
+			if caseValuesEqual(target, whenVal) {
 				return evalExpr(env, w.Then, row)
 			}
 		}

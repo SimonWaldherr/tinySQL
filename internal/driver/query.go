@@ -126,6 +126,18 @@ func (c *conn) queryStatementWithCleanup(ctx context.Context, st engine.Statemen
 		}
 		return nil, err
 	}
+	// Small scans can finish inside ExecuteStream. Their buffered rows no
+	// longer need the reader reservation or the borrowed prepared AST, so
+	// release both here without allocating a completion watcher goroutine.
+	select {
+	case <-stream.Done():
+		c.srv.releaseReader()
+		if onClose != nil {
+			onClose()
+		}
+		return &rows{stream: stream, streamCols: stream.Columns()}, nil
+	default:
+	}
 	var releaseOnce sync.Once
 	release := func() {
 		releaseOnce.Do(func() {

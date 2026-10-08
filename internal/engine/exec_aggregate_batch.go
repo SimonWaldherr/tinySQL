@@ -126,13 +126,11 @@ func executeAggregateBatches(env ExecEnv, plan *simpleAggregatePlan, source *sim
 	}
 	var selected [aggregateBatchSize]int
 	var states [aggregateBatchSize]*simpleAggregateState
-	groups := make(map[string]*simpleAggregateState)
-	order := make([]*simpleAggregateState, 0)
+	groups := newAggregateGroups(plan.projs, len(plan.groupCols))
 	key := make([]byte, 0, 64)
 	var whole *simpleAggregateState
 	if len(plan.groupCols) == 0 {
-		whole = newSimpleAggregateState(nil, len(plan.projs))
-		order = append(order, whole)
+		whole = groups.state(nil, nil)
 	}
 	// Once a runtime value needs scalar handling, retain that path for the
 	// rest of the query: a state may now contain an exact rational accumulator.
@@ -170,34 +168,32 @@ func executeAggregateBatches(env ExecEnv, plan *simpleAggregatePlan, source *sim
 				// Materialize shared states before the first scalar row. COUNT(x)
 				// and SUM(x) can diverge on nonnumeric values, and decimal promotion
 				// must see each aggregate's complete preceding numeric history.
-				copyAggregateBatchStates(order, ops)
+				copyAggregateBatchStates(groups.order, ops)
 			}
 		}
 		if whole == nil {
-			for i, id := range selected[:count] {
-				raw := rows[id]
-				key = key[:0]
-				if len(plan.groupCols) == 1 {
-					key = writeSingleGroupKey(key, raw[plan.groupCols[0]])
-				} else {
+			if len(plan.groupCols) == 1 {
+				for i, id := range selected[:count] {
+					states[i] = groups.state(rows[id], plan.groupCols)
+				}
+			} else {
+				// Keep the composite-key buffer local to the batch loop; storing
+				// it through the group store on every row adds write barriers.
+				for i, id := range selected[:count] {
+					raw := rows[id]
+					key = key[:0]
 					for j, col := range plan.groupCols {
-						if j > 0 {
+						if j != 0 {
 							key = append(key, '\x1f')
 						}
 						key = writeFmtKeyPart(key, raw[col])
 					}
-				}
-				state := groups[string(key)]
-				if state == nil {
-					values := make([]any, len(plan.groupCols))
-					for j, col := range plan.groupCols {
-						values[j] = raw[col]
+					state := groups.other[string(key)]
+					if state == nil {
+						state = groups.newEncodedState(key, raw, plan.groupCols)
 					}
-					state = newSimpleAggregateState(values, len(plan.projs))
-					groups[string(key)] = state
-					order = append(order, state)
+					states[i] = state
 				}
-				states[i] = state
 			}
 		}
 		if scalar {
@@ -224,9 +220,9 @@ func executeAggregateBatches(env ExecEnv, plan *simpleAggregatePlan, source *sim
 		}
 	}
 	if !scalar {
-		copyAggregateBatchStates(order, ops)
+		copyAggregateBatchStates(groups.order, ops)
 	}
-	rs, err := finalizeSimpleAggregateResultSet(env, plan, order)
+	rs, err := finalizeSimpleAggregateResultSet(env, plan, groups.order)
 	return rs, true, err
 }
 

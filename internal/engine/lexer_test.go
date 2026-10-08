@@ -1,5 +1,5 @@
 // Direct lexer tests, focused on the ASCII fast paths added to
-// peek/next/skipWS/tokenizeIdentOrKeyword/tokenizeSymbol/upperInto: every one
+// peek/next/skipWS/tokenizeIdentOrKeyword/tokenizeSymbol/canonicalKeyword: every one
 // of them must produce byte-identical results to the general Unicode-aware
 // path they short-circuit, for both ASCII and non-ASCII input. The package's
 // own header comment on lexer.go documents a past bug in exactly this shape
@@ -241,13 +241,8 @@ func TestLexerWhitespaceAndComments(t *testing.T) {
 	}
 }
 
-// TestLexerKeywordCaseInsensitivity pins upperInto's scratch-buffer reuse
-// across MANY tokens in one lexer -- the whole point of the optimization --
-// by lexing many differently-cased keywords and identifiers back to back
-// and checking each is classified correctly, including identifiers longer
-// than an earlier keyword (forcing the scratch buffer to grow mid-statement)
-// and shorter ones after (checking the grown buffer's stale tail bytes don't
-// leak into a shorter token's result).
+// TestLexerKeywordCaseInsensitivity checks that case folding preserves token
+// values across later tokens, including long candidates followed by short ones.
 func TestLexerKeywordCaseInsensitivity(t *testing.T) {
 	sql := "select Select SELECT sElEcT from short_er_identifier_name_that_is_quite_long a select"
 	toks := lexAll(t, sql)

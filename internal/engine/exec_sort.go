@@ -70,27 +70,15 @@ func (h orderedValueRowHeap) Swap(i, j int) {
 	h.items[i], h.items[j] = h.items[j], h.items[i]
 }
 
-// orderedValueRowHeapPush/pushBounded's Fix path replicate container/heap's
-// up/down algorithm directly on the concrete type instead of going through
-// heap.Interface. heap.Push/Fix take/operate via an `any`-boxing Push method,
-// which forces every orderedValueRow (a Row map plus a keys slice) to be
-// heap-allocated just to box it into the interface — on an ORDER BY ... LIMIT
-// N query this is up to N allocations purely from filling the top-N heap,
-// mirroring the same fix already applied to vecScoredHeap (vector_search.go)
-// and vecMinScoredHeap (vector_index.go).
-func orderedValueRowHeapPush(h *orderedValueRowHeap, v orderedValueRow) {
+// Concrete heap operations avoid container/heap's per-row interface boxing.
+// All of the first keepCount rows are retained, so build their heap bottom up
+// once, in O(keepCount), instead of restoring it after every insertion.
+func orderedValueRowHeapPush(h *orderedValueRowHeap, v orderedValueRow, keepCount int) {
 	h.items = append(h.items, v)
-	orderedValueRowHeapUp(*h, len(h.items)-1)
-}
-
-func orderedValueRowHeapUp(h orderedValueRowHeap, j int) {
-	for {
-		i := (j - 1) / 2
-		if i == j || !h.Less(j, i) {
-			break
+	if len(h.items) == keepCount {
+		for i := len(h.items)/2 - 1; i >= 0; i-- {
+			orderedValueRowHeapDown(*h, i)
 		}
-		h.Swap(i, j)
-		j = i
 	}
 }
 
@@ -121,7 +109,7 @@ func (h *orderedValueRowHeap) pushBounded(item orderedValueRow, keepCount int) [
 		return item.keys
 	}
 	if len(h.items) < keepCount {
-		orderedValueRowHeapPush(h, item)
+		orderedValueRowHeapPush(h, item, keepCount)
 		return nil
 	}
 	if compareOrderedValueRows(h.orderBy, h.items[0], item) > 0 {
@@ -212,19 +200,12 @@ func (h orderedValueRowSingleHeap) Swap(i, j int) {
 	h.items[i], h.items[j] = h.items[j], h.items[i]
 }
 
-func orderedValueRowSingleHeapPush(h *orderedValueRowSingleHeap, v orderedValueRowSingle) {
+func orderedValueRowSingleHeapPush(h *orderedValueRowSingleHeap, v orderedValueRowSingle, keepCount int) {
 	h.items = append(h.items, v)
-	orderedValueRowSingleHeapUp(*h, len(h.items)-1)
-}
-
-func orderedValueRowSingleHeapUp(h orderedValueRowSingleHeap, j int) {
-	for {
-		i := (j - 1) / 2
-		if i == j || !h.Less(j, i) {
-			break
+	if len(h.items) == keepCount {
+		for i := len(h.items)/2 - 1; i >= 0; i-- {
+			orderedValueRowSingleHeapDown(*h, i)
 		}
-		h.Swap(i, j)
-		j = i
 	}
 }
 
@@ -253,7 +234,7 @@ func (h *orderedValueRowSingleHeap) pushBounded(item orderedValueRowSingle, keep
 		return
 	}
 	if len(h.items) < keepCount {
-		orderedValueRowSingleHeapPush(h, item)
+		orderedValueRowSingleHeapPush(h, item, keepCount)
 		return
 	}
 	if compareOrderedValue(h.items[0].key, item.key, h.desc) > 0 {
@@ -309,7 +290,12 @@ func applySortOrderWithLimit(orderBy []OrderItem, outRows []Row, limit, offset *
 	var items []orderedValueRow
 	var keyArena, reusableKeys []any
 	var topRows orderedValueRowHeap
-	useTopN := limit != nil && keepCount > 0 && keepCount < len(outRows)
+	// For large pages the heap retains most rows and then sorts them anyway.
+	// Sorting once avoids that extra heap maintenance; small pages retain
+	// the bounded allocation and comparison cost of the TopN path. Above
+	// the 90% cutover, full sorting uses at most a ninth more storage for
+	// items and keys than the heap would retain.
+	useTopN := limit != nil && keepCount < len(outRows) && keepCount <= len(outRows)-len(outRows)/10
 	if useTopN {
 		keyArena = make([]any, 0, min(keepCount+1, rawKeyArenaChunkRows)*len(orderBy))
 		topRows = orderedValueRowHeap{
@@ -317,7 +303,7 @@ func applySortOrderWithLimit(orderBy []OrderItem, outRows []Row, limit, offset *
 			items:   make([]orderedValueRow, 0, min(cap(outRows), keepCount)),
 		}
 	} else {
-		items = make([]orderedValueRow, 0, min(cap(outRows), keepCount))
+		items = make([]orderedValueRow, 0, len(outRows))
 		keyArena = make([]any, 0, len(outRows)*len(orderBy))
 	}
 
@@ -340,8 +326,8 @@ func applySortOrderWithLimit(orderBy []OrderItem, outRows []Row, limit, offset *
 
 	sort.Sort(orderedValueRowsAsc{orderBy: orderBy, items: items})
 
-	sorted := make([]Row, len(items))
-	for i, item := range items {
+	sorted := make([]Row, keepCount)
+	for i, item := range items[:keepCount] {
 		sorted[i] = item.row
 	}
 	return sorted

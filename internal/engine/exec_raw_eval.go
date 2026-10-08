@@ -249,8 +249,7 @@ func evalRawCase(plan *simpleSelectPlan, raw []any, ex *CaseExpr) (any, error) {
 		}
 		matched := false
 		if ex.Operand != nil {
-			cmp, err := compare(target, value)
-			matched = err == nil && cmp == 0
+			matched = caseValuesEqual(target, value)
 		} else {
 			matched = toTri(value) == tvTrue
 		}
