@@ -93,6 +93,20 @@ func (s *statementWAL) commit() error {
 		return nil
 	}
 	_, err := s.wal.LogCommit(s.txID)
+	if err == nil {
+		s.started = false
+	}
+	return err
+}
+
+func (s *statementWAL) abort() error {
+	if s == nil || s.wal == nil || !s.started || s.ambient {
+		return nil
+	}
+	_, err := s.wal.LogAbort(s.txID)
+	if err == nil {
+		s.started = false
+	}
 	return err
 }
 

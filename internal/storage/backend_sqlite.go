@@ -38,6 +38,7 @@ type SQLiteBackend struct {
 	db       *sql.DB
 	path     string
 	readOnly bool
+	closed   bool
 	stats    BackendStats
 }
 
@@ -524,8 +525,13 @@ func (b *SQLiteBackend) Sync() error {
 func (b *SQLiteBackend) Close() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	_, _ = b.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
-	return b.db.Close()
+	if b.closed {
+		return nil
+	}
+	_, err := b.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+	closeErr := b.db.Close()
+	b.closed = true
+	return errors.Join(err, closeErr)
 }
 
 func (b *SQLiteBackend) Mode() StorageMode { return ModeSQLite }

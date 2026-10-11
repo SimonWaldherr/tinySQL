@@ -296,24 +296,18 @@ func (w *WALManager) Close() error {
 	if w.closed {
 		return nil
 	}
+	var err error
 	if w.writer != nil {
-		if err := w.writer.Flush(); err != nil {
-			return err
-		}
+		err = w.writer.Flush()
 	}
 	if w.file != nil {
-		if err := syncWALFile(w.file, w.syncMode); err != nil {
-			return err
-		}
-		if err := w.file.Close(); err != nil {
-			return err
-		}
+		err = errors.Join(err, syncWALFile(w.file, w.syncMode), w.file.Close())
 	}
 	w.closed = true
 	w.file = nil
 	w.writer = nil
 	w.encoder = nil
-	return nil
+	return err
 }
 
 func (w *WALManager) writeRecord(rec *walRecord) error {

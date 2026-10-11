@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"html/template"
 	"sort"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
+	"github.com/SimonWaldherr/tinySQL/internal/errutil"
 )
 
 // App holds the shared application state.
@@ -184,7 +184,9 @@ func (a *App) getRecord(ctx context.Context, table string, id string) (columns [
 func (a *App) insertRecord(ctx context.Context, table string, values map[string]string, cols []Column) error {
 	// Determine next id via MAX(id)+1.
 	var maxID sql.NullInt64
-	_ = a.sqlDB.QueryRowContext(ctx, "SELECT MAX(id) FROM "+quoteName(table)).Scan(&maxID)
+	if err := a.sqlDB.QueryRowContext(ctx, "SELECT MAX(id) FROM "+quoteName(table)).Scan(&maxID); err != nil {
+		return fmt.Errorf("determine next record id: %w", err)
+	}
 	nextID := maxID.Int64 + 1
 
 	colNames := make([]string, 0, len(cols))
@@ -293,14 +295,7 @@ func (a *App) queryRows(ctx context.Context, query string) (columns []string, re
 
 // closeRows preserves both query errors and errors from closing the result stream.
 func closeRows(rows *sql.Rows, err *error) {
-	if closeErr := rows.Close(); closeErr != nil {
-		wrapped := fmt.Errorf("close query rows: %w", closeErr)
-		if *err == nil {
-			*err = wrapped
-		} else {
-			*err = errors.Join(*err, wrapped)
-		}
-	}
+	errutil.Close(rows, err, "close query rows")
 }
 
 func scanRows(rows *sql.Rows) ([]string, [][]string, error) {

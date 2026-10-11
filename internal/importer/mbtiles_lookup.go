@@ -22,6 +22,8 @@ import (
 	"net/url"
 
 	_ "modernc.org/sqlite"
+
+	"github.com/SimonWaldherr/tinySQL/internal/errutil"
 )
 
 // LookupMBTilesTile reads one tile's raw bytes from filePath. z/x/y are in
@@ -44,7 +46,7 @@ func LookupMBTilesTile(ctx context.Context, filePath string, z, x, y int) (data 
 	if err != nil {
 		return nil, false, fmt.Errorf("open mbtiles: %w", err)
 	}
-	defer src.Close()
+	defer errutil.Close(src, &err, "close MBTiles lookup database")
 	if err := src.PingContext(ctx); err != nil {
 		return nil, false, fmt.Errorf("open mbtiles %s: %w", filePath, err)
 	}

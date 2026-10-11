@@ -17,6 +17,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/SimonWaldherr/tinySQL/internal/errutil"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
@@ -30,11 +31,10 @@ const (
 // ImportMBTilesArtifact builds a bounded paged-index database in a temporary
 // sibling directory and publishes it only after checksums and logical index
 // validation succeed. The source is opened read-only and is never modified.
-func ImportMBTilesArtifact(ctx context.Context, sourcePath, artifactPath string, opts *MBTilesArtifactOptions) (*MBTilesArtifactResult, error) {
+func ImportMBTilesArtifact(ctx context.Context, sourcePath, artifactPath string, opts *MBTilesArtifactOptions) (result *MBTilesArtifactResult, err error) {
 	if opts == nil {
 		opts = &MBTilesArtifactOptions{}
 	}
-	var err error
 	opts, err = cloneArtifactOptions(opts)
 	if err != nil {
 		return nil, fmt.Errorf("copy MBTiles artifact options: %w", err)
@@ -62,7 +62,7 @@ func ImportMBTilesArtifact(ctx context.Context, sourcePath, artifactPath string,
 	if err != nil {
 		return nil, fmt.Errorf("open MBTiles source: %w", err)
 	}
-	defer src.Close()
+	defer errutil.Close(src, &err, "close MBTiles source database")
 	if err := src.PingContext(ctx); err != nil {
 		return nil, fmt.Errorf("ping MBTiles source: %w", err)
 	}
@@ -89,7 +89,11 @@ func ImportMBTilesArtifact(ctx context.Context, sourcePath, artifactPath string,
 	if err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(tmp)
+	defer func() {
+		if cleanupErr := os.RemoveAll(tmp); cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("remove temporary artifact: %w", cleanupErr))
+		}
+	}()
 
 	db, err := storage.OpenDB(storage.StorageConfig{Mode: storage.ModePagedIndex, Path: filepath.Join(tmp, "database"), MaxMemoryBytes: opts.MaxMemoryBytes})
 	if err != nil {
@@ -98,7 +102,7 @@ func ImportMBTilesArtifact(ctx context.Context, sourcePath, artifactPath string,
 	closeDB := true
 	defer func() {
 		if closeDB {
-			_ = db.Close()
+			errutil.Close(db, &err, "close temporary artifact database")
 		}
 	}()
 
@@ -271,7 +275,7 @@ func estimateArtifactResources(ctx context.Context, db *sql.DB, schema artifactS
 	}, nil
 }
 
-func readArtifactMetadata(ctx context.Context, db *sql.DB) ([][]any, string, error) {
+func readArtifactMetadata(ctx context.Context, db *sql.DB) (out [][]any, digest string, err error) {
 	rows := [][]any{}
 	h := sha256.New()
 	exists, err := artifactTableExists(ctx, db, "metadata")
@@ -282,7 +286,7 @@ func readArtifactMetadata(ctx context.Context, db *sql.DB) ([][]any, string, err
 	if err != nil {
 		return nil, "", fmt.Errorf("read MBTiles metadata: %w", err)
 	}
-	defer sqlRows.Close()
+	defer errutil.Close(sqlRows, &err, "close artifact metadata rows")
 	for sqlRows.Next() {
 		var name, value sql.NullString
 		if err := sqlRows.Scan(&name, &value); err != nil {
@@ -300,12 +304,12 @@ func readArtifactMetadata(ctx context.Context, db *sql.DB) ([][]any, string, err
 	return rows, hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func importFlatToFlat(ctx context.Context, src *sql.DB, db *storage.DB, p *artifactProgress, digest io.Writer) error {
+func importFlatToFlat(ctx context.Context, src *sql.DB, db *storage.DB, p *artifactProgress, digest io.Writer) (err error) {
 	rows, err := src.QueryContext(ctx, "SELECT zoom_level,tile_column,tile_row,tile_data FROM tiles ORDER BY zoom_level,tile_column,tile_row")
 	if err != nil {
 		return fmt.Errorf("query flat MBTiles: %w", err)
 	}
-	defer rows.Close()
+	defer errutil.Close(rows, &err, "close flat tile rows")
 	batch := make([][]any, 0, p.batchSize)
 	for rows.Next() {
 		var z, x, y int
@@ -333,12 +337,12 @@ func importFlatToFlat(ctx context.Context, src *sql.DB, db *storage.DB, p *artif
 	return appendArtifactRows(ctx, db, "default", "tiles", batch, p.batchSize, p, nil)
 }
 
-func importFlatToNormalized(ctx context.Context, src *sql.DB, db *storage.DB, p *artifactProgress, digest io.Writer) error {
+func importFlatToNormalized(ctx context.Context, src *sql.DB, db *storage.DB, p *artifactProgress, digest io.Writer) (err error) {
 	rows, err := src.QueryContext(ctx, "SELECT zoom_level,tile_column,tile_row,tile_data FROM tiles ORDER BY zoom_level,tile_column,tile_row")
 	if err != nil {
 		return fmt.Errorf("query flat MBTiles: %w", err)
 	}
-	defer rows.Close()
+	defer errutil.Close(rows, &err, "close flat tile rows")
 	mapRows := make([][]any, 0, p.batchSize)
 	imageRows := make([][]any, 0, p.batchSize)
 	for rows.Next() {
@@ -376,12 +380,12 @@ func importFlatToNormalized(ctx context.Context, src *sql.DB, db *storage.DB, p 
 	return appendArtifactRows(ctx, db, "default", "images", imageRows, p.batchSize, nil, nil)
 }
 
-func importNormalizedToNormalized(ctx context.Context, src *sql.DB, db *storage.DB, p *artifactProgress, digest io.Writer) error {
+func importNormalizedToNormalized(ctx context.Context, src *sql.DB, db *storage.DB, p *artifactProgress, digest io.Writer) (err error) {
 	rows, err := src.QueryContext(ctx, "SELECT m.zoom_level,m.tile_column,m.tile_row,m.tile_id,i.tile_data FROM map m JOIN images i ON i.tile_id=m.tile_id ORDER BY m.zoom_level,m.tile_column,m.tile_row")
 	if err != nil {
 		return fmt.Errorf("query normalized MBTiles: %w", err)
 	}
-	defer rows.Close()
+	defer errutil.Close(rows, &err, "close normalized tile rows")
 	batch := make([][]any, 0, p.batchSize)
 	for rows.Next() {
 		var z, x, y int
@@ -413,12 +417,12 @@ func importNormalizedToNormalized(ctx context.Context, src *sql.DB, db *storage.
 	return importNormalizedImages(ctx, src, db, p)
 }
 
-func importNormalizedToFlat(ctx context.Context, src *sql.DB, db *storage.DB, p *artifactProgress, digest io.Writer) error {
+func importNormalizedToFlat(ctx context.Context, src *sql.DB, db *storage.DB, p *artifactProgress, digest io.Writer) (err error) {
 	rows, err := src.QueryContext(ctx, "SELECT m.zoom_level,m.tile_column,m.tile_row,i.tile_data FROM map m JOIN images i ON i.tile_id=m.tile_id ORDER BY m.zoom_level,m.tile_column,m.tile_row")
 	if err != nil {
 		return fmt.Errorf("query normalized MBTiles: %w", err)
 	}
-	defer rows.Close()
+	defer errutil.Close(rows, &err, "close normalized tile rows")
 	batch := make([][]any, 0, p.batchSize)
 	for rows.Next() {
 		var z, x, y int
@@ -446,12 +450,12 @@ func importNormalizedToFlat(ctx context.Context, src *sql.DB, db *storage.DB, p 
 	return appendArtifactRows(ctx, db, "default", "tiles", batch, p.batchSize, p, nil)
 }
 
-func importNormalizedImages(ctx context.Context, src *sql.DB, db *storage.DB, p *artifactProgress) error {
+func importNormalizedImages(ctx context.Context, src *sql.DB, db *storage.DB, p *artifactProgress) (err error) {
 	rows, err := src.QueryContext(ctx, "SELECT tile_id,tile_data FROM images ORDER BY tile_id")
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer errutil.Close(rows, &err, "close normalized image rows")
 	batch := make([][]any, 0, p.batchSize)
 	for rows.Next() {
 		var id string

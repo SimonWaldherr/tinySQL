@@ -2,6 +2,7 @@ package pager
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -849,21 +850,11 @@ func (p *Pager) Close() error {
 	p.mu.Unlock()
 
 	// Final checkpoint to ensure all data is on disk.
-	if err := p.Checkpoint(); err != nil {
-		// Best effort — still close files.
-		if p.wal != nil {
-			_ = p.wal.Close()
-		}
-		_ = p.file.Close()
-		return err
-	}
+	err := p.Checkpoint()
 	if p.wal != nil {
-		if err := p.wal.Close(); err != nil {
-			_ = p.file.Close()
-			return err
-		}
+		err = errors.Join(err, p.wal.Close())
 	}
-	return p.file.Close()
+	return errors.Join(err, p.file.Close())
 }
 
 // Path returns the database file path.

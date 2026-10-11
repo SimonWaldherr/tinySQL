@@ -7,12 +7,14 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 
 	_ "modernc.org/sqlite"
 
+	"github.com/SimonWaldherr/tinySQL/internal/errutil"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
@@ -27,7 +29,7 @@ func ImportMBTiles(
 	tableName string,
 	filePath string,
 	opts *ImportOptions,
-) (*ImportResult, error) {
+) (out *ImportResult, err error) {
 	if opts == nil {
 		opts = &ImportOptions{}
 	}
@@ -37,7 +39,7 @@ func ImportMBTiles(
 	if err != nil {
 		return nil, fmt.Errorf("open mbtiles: %w", err)
 	}
-	defer src.Close()
+	defer errutil.Close(src, &err, "close MBTiles source database")
 
 	if err := importMBTilesMetadata(ctx, db, tenant, tableName+"_metadata", src, opts); err != nil {
 		return nil, err
@@ -51,7 +53,7 @@ func ImportMBTiles(
 	if err != nil {
 		return nil, fmt.Errorf("query mbtiles tiles: %w", err)
 	}
-	defer sqlRows.Close()
+	defer errutil.Close(sqlRows, &err, "close MBTiles tile rows")
 
 	// Tiles are inserted in bounded batches rather than collected into one slice
 	// first. A tileset is the one import where that distinction decides whether
@@ -130,16 +132,21 @@ func ImportMBTilesReader(
 	tableName string,
 	src io.Reader,
 	opts *ImportOptions,
-) (*ImportResult, error) {
+) (out *ImportResult, err error) {
 	tmp, err := os.CreateTemp("", "tinysql-mbtiles-*.mbtiles")
 	if err != nil {
 		return nil, fmt.Errorf("create temp mbtiles: %w", err)
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	defer func() {
+		if cleanupErr := os.Remove(tmpName); cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("remove temporary MBTiles: %w", cleanupErr))
+		}
+	}()
 	if _, err := io.Copy(tmp, src); err != nil {
-		_ = tmp.Close()
-		return nil, fmt.Errorf("write temp mbtiles: %w", err)
+		err = fmt.Errorf("write temp mbtiles: %w", err)
+		errutil.Close(tmp, &err, "close temporary MBTiles")
+		return nil, err
 	}
 	if err := tmp.Close(); err != nil {
 		return nil, fmt.Errorf("close temp mbtiles: %w", err)
@@ -147,7 +154,7 @@ func ImportMBTilesReader(
 	return ImportMBTiles(ctx, db, tenant, tableName, tmpName, opts)
 }
 
-func importMBTilesMetadata(ctx context.Context, db *storage.DB, tenant, tableName string, src *sql.DB, opts *ImportOptions) error {
+func importMBTilesMetadata(ctx context.Context, db *storage.DB, tenant, tableName string, src *sql.DB, opts *ImportOptions) (err error) {
 	if !mbtilesTableExists(ctx, src, "metadata") {
 		return nil
 	}
@@ -160,7 +167,7 @@ func importMBTilesMetadata(ctx context.Context, db *storage.DB, tenant, tableNam
 	if err != nil {
 		return fmt.Errorf("query mbtiles metadata: %w", err)
 	}
-	defer sqlRows.Close()
+	defer errutil.Close(sqlRows, &err, "close MBTiles metadata rows")
 
 	rows := make([][]any, 0)
 	for sqlRows.Next() {

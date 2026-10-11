@@ -13,6 +13,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/SimonWaldherr/tinySQL/internal/errutil"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
@@ -96,7 +97,7 @@ func newTempArtifactDir(parent string) (string, error) {
 	}
 	for _, dir := range []string{"database", "indexes"} {
 		if err := os.Mkdir(filepath.Join(tmp, dir), 0o755); err != nil {
-			return "", fmt.Errorf("create artifact directory %s: %w", dir, err)
+			return "", errors.Join(fmt.Errorf("create artifact directory %s: %w", dir, err), os.RemoveAll(tmp))
 		}
 	}
 	return tmp, nil
@@ -224,14 +225,14 @@ func checksumFiles(root string, names []string) (map[string]string, error) {
 	return out, nil
 }
 
-func writeChecksumsFile(root string) error {
+func writeChecksumsFile(root string) (err error) {
 	names := append([]string{"manifest.json"}, artifactDataFileNames(root)...)
 	sort.Strings(names)
 	f, err := os.OpenFile(filepath.Join(root, "checksums.sha256"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer errutil.Close(f, &err, "close artifact checksums")
 	for _, name := range names {
 		sum, err := checksumFile(filepath.Join(root, name))
 		if err != nil {
@@ -244,7 +245,7 @@ func writeChecksumsFile(root string) error {
 	return f.Sync()
 }
 
-func syncArtifactTree(root string) error {
+func syncArtifactTree(root string) (err error) {
 	names := append([]string{"manifest.json"}, artifactDataFileNames(root)...)
 	names = append(names, "checksums.sha256", "COMPLETE")
 	for _, name := range names {
@@ -257,8 +258,7 @@ func syncArtifactTree(root string) error {
 			return err
 		}
 		if err = f.Sync(); err != nil {
-			_ = f.Close()
-			return err
+			return errors.Join(err, f.Close())
 		}
 		if err = f.Close(); err != nil {
 			return err
@@ -274,7 +274,7 @@ func syncArtifactTree(root string) error {
 	if err != nil {
 		return err
 	}
-	defer d.Close()
+	defer errutil.Close(d, &err, "close artifact directory")
 	return d.Sync()
 }
 
@@ -283,7 +283,9 @@ func publishArtifact(tmp, target string, replace bool) error {
 		return os.Rename(tmp, target)
 	}
 	backup := target + ".rollback"
-	_ = os.RemoveAll(backup)
+	if err := os.RemoveAll(backup); err != nil {
+		return fmt.Errorf("remove previous artifact backup: %w", err)
+	}
 	if _, err := os.Lstat(target); err == nil {
 		if err := os.Rename(target, backup); err != nil {
 			return err
@@ -293,12 +295,11 @@ func publishArtifact(tmp, target string, replace bool) error {
 	}
 	if err := os.Rename(tmp, target); err != nil {
 		if _, backupErr := os.Lstat(backup); backupErr == nil {
-			_ = os.Rename(backup, target)
+			if restoreErr := os.Rename(backup, target); restoreErr != nil {
+				return errors.Join(err, fmt.Errorf("restore artifact backup: %w", restoreErr))
+			}
 		}
 		return err
 	}
-	if _, err := os.Lstat(backup); err == nil {
-		return os.RemoveAll(backup)
-	}
-	return nil
+	return os.RemoveAll(backup)
 }

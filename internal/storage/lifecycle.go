@@ -4,6 +4,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -191,7 +192,7 @@ func (db *DB) Close() error {
 	}
 	db.closeChangeWatchers()
 
-	var firstErr error
+	var closeErr error
 
 	db.StopJobScheduler()
 	// Stop and join the AdvancedWAL checkpoint worker before closing any
@@ -207,47 +208,37 @@ func (db *DB) Close() error {
 	// quickly. Row-backed work is safe in the WAL either way, but checkpointing
 	// it here also leaves a compact clean shutdown artifact.
 	if wal := db.AdvancedWAL(); wal != nil && wal.checkpointWorkPending() {
-		if err := wal.Checkpoint(db); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		closeErr = errors.Join(closeErr, wal.Checkpoint(db))
 	}
 
 	// Sync dirty tables to backend.
-	if err := db.Sync(); err != nil && firstErr == nil {
-		firstErr = err
-	}
+	closeErr = errors.Join(closeErr, db.Sync())
 
 	// Close backend (may do its own final save).
 	if db.backend != nil {
-		if err := db.backend.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		closeErr = errors.Join(closeErr, db.backend.Close())
 	}
 
 	// Close WAL resources.
 	if db.wal != nil {
-		if err := db.wal.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		closeErr = errors.Join(closeErr, db.wal.Close())
 	}
 	if db.advancedWAL != nil {
-		if err := db.advancedWAL.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		closeErr = errors.Join(closeErr, db.advancedWAL.Close())
 	}
 
 	db.mu.Lock()
 	db.closing = false
 	db.lastCloseAt = time.Now()
-	if firstErr == nil {
+	if closeErr == nil {
 		db.closed = true
 		db.lastError = ""
 	} else {
-		db.lastError = firstErr.Error()
+		db.lastError = closeErr.Error()
 	}
 	db.mu.Unlock()
 
-	return firstErr
+	return closeErr
 }
 
 // Evict removes a table from the in-memory cache without deleting it from

@@ -22,6 +22,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/SimonWaldherr/tinySQL/internal/errutil"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
@@ -43,7 +44,7 @@ func ExportMBTiles(
 	tenant string,
 	filePath string,
 	opts *ExportMBTilesOptions,
-) (*ExportMBTilesResult, error) {
+) (result *ExportMBTilesResult, err error) {
 	if opts == nil {
 		opts = &ExportMBTilesOptions{TileRowIsTMS: true}
 	}
@@ -85,13 +86,13 @@ func ExportMBTiles(
 	if err != nil {
 		return nil, fmt.Errorf("export mbtiles: create %s: %w", filePath, err)
 	}
-	defer dst.Close()
+	defer errutil.Close(dst, &err, "close MBTiles export database")
 
 	if err := mbtilesCreateSchema(ctx, dst); err != nil {
 		return nil, err
 	}
 
-	result := &ExportMBTilesResult{MinZoom: -1, MaxZoom: -1}
+	result = &ExportMBTilesResult{MinZoom: -1, MaxZoom: -1}
 	if err := mbtilesWriteTiles(ctx, dst, db, tenant, opts.TilesTable, tiles, idx, opts, result); err != nil {
 		return nil, err
 	}

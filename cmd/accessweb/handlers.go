@@ -213,7 +213,7 @@ func (a *App) exportTableHandler(w http.ResponseWriter, r *http.Request) {
 // tableRowsSorted fetches a page of rows, optionally sorted by a known column.
 // meta must already be validated (obtained from a.tableMeta). The SQL query is
 // built entirely from DB-sourced values (meta.Name, validated column names).
-func (a *App) tableRowsSorted(r *http.Request, page int, sortCol, dir string, meta TableMeta) ([]Column, [][]string, error) {
+func (a *App) tableRowsSorted(r *http.Request, page int, sortCol, dir string, meta TableMeta) (columns []Column, records [][]string, err error) {
 	if page < 1 {
 		page = 1
 	}
@@ -249,7 +249,7 @@ func (a *App) tableRowsSorted(r *http.Request, page int, sortCol, dir string, me
 	if err != nil {
 		return nil, nil, err
 	}
-	defer rows.Close()
+	defer closeRows(rows, &err)
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {

@@ -76,7 +76,7 @@ func (db *DB) maybeCheckpointAdvancedWAL(wal *AdvancedWAL) {
 		if errors.Is(err, ErrAdvancedWALCheckpointActiveTransactions) {
 			return
 		}
-		db.markError(fmt.Errorf("advanced WAL automatic checkpoint: %w", err))
+		_ = db.markError(fmt.Errorf("advanced WAL automatic checkpoint: %w", err))
 		return
 	}
 	db.markSynced()

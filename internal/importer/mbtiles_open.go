@@ -29,6 +29,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/SimonWaldherr/tinySQL/internal/errutil"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
@@ -47,7 +48,7 @@ func OpenMBTiles(
 	tenant string,
 	filePath string,
 	opts *OpenMBTilesOptions,
-) (*OpenMBTilesResult, error) {
+) (out *OpenMBTilesResult, err error) {
 	if opts == nil {
 		opts = &OpenMBTilesOptions{}
 	}
@@ -63,7 +64,7 @@ func OpenMBTiles(
 	if err != nil {
 		return nil, fmt.Errorf("open mbtiles: %w", err)
 	}
-	defer src.Close()
+	defer errutil.Close(src, &err, "close MBTiles source database")
 	if err := src.PingContext(ctx); err != nil {
 		return nil, fmt.Errorf("open mbtiles %s: %w", filePath, err)
 	}
@@ -84,7 +85,7 @@ func OpenMBTiles(
 	if err != nil {
 		return nil, fmt.Errorf("open mbtiles: query tiles: %w", err)
 	}
-	defer sqlRows.Close()
+	defer errutil.Close(sqlRows, &err, "close MBTiles tile rows")
 
 	colNames := []string{"zoom_level", "tile_column", "tile_row", "tile_size", "tile_sha256"}
 	colTypes := []storage.ColType{storage.IntType, storage.IntType, storage.IntType, storage.IntType, storage.TextType}

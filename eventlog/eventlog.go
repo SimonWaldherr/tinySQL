@@ -7,12 +7,27 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"github.com/SimonWaldherr/tinySQL/driver"
 	"time"
+
+	"github.com/SimonWaldherr/tinySQL/driver"
+	"github.com/SimonWaldherr/tinySQL/internal/errutil"
 )
 
 var ErrCursorExpired = errors.New("event cursor precedes retention boundary")
 var ErrAckConflict = errors.New("consumer cursor changed; read a fresh batch")
+
+// rollback ignores the expected result after Commit while preserving failures
+// when a transaction is abandoned or a read-only snapshot is released.
+func rollback(tx *sql.Tx, err *error) {
+	if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+		wrapped := fmt.Errorf("rollback event transaction: %w", rollbackErr)
+		if *err == nil {
+			*err = wrapped
+		} else {
+			*err = errors.Join(*err, wrapped)
+		}
+	}
+}
 
 type Log struct{ db *sql.DB }
 type Event struct {
@@ -31,7 +46,7 @@ type Batch struct {
 
 // Open initializes reserved _tiny_event_* tables. The caller owns db. Concurrent
 // initialization or writes may return a transaction conflict: retry the transaction.
-func openOnce(ctx context.Context, db *sql.DB) (*Log, error) {
+func openOnce(ctx context.Context, db *sql.DB) (log *Log, err error) {
 	if db == nil {
 		return nil, errors.New("database is required")
 	}
@@ -39,7 +54,7 @@ func openOnce(ctx context.Context, db *sql.DB) (*Log, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer rollback(tx, &err)
 	for _, q := range []string{
 		"CREATE TABLE IF NOT EXISTS _tiny_event_log (seq INT PRIMARY KEY, event_key TEXT, topic TEXT, payload BLOB, created_ms INT)",
 		"CREATE TABLE IF NOT EXISTS _tiny_event_state (name TEXT PRIMARY KEY, value INT)",
@@ -91,12 +106,12 @@ func Append(ctx context.Context, tx *sql.Tx, eventKey, topic string, payload []b
 }
 
 // Publish commits a standalone event. Use Append for an atomic business outbox.
-func (l *Log) publishOnce(ctx context.Context, key, topic string, payload []byte) (int64, error) {
+func (l *Log) publishOnce(ctx context.Context, key, topic string, payload []byte) (sequence int64, err error) {
 	tx, err := l.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback()
+	defer rollback(tx, &err)
 	seq, err := Append(ctx, tx, key, topic, payload)
 	if err != nil {
 		return 0, err
@@ -109,7 +124,7 @@ func (l *Log) publishOnce(ctx context.Context, key, topic string, payload []byte
 
 // RegisterConsumer persists the last processed sequence. Existing consumers
 // retain their cursor. Zero starts at the beginning when history is retained.
-func (l *Log) registerConsumerOnce(ctx context.Context, name string, after int64) error {
+func (l *Log) registerConsumerOnce(ctx context.Context, name string, after int64) (err error) {
 	if name == "" || after < 0 {
 		return errors.New("valid consumer name and cursor required")
 	}
@@ -117,7 +132,7 @@ func (l *Log) registerConsumerOnce(ctx context.Context, name string, after int64
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer rollback(tx, &err)
 	var current int64
 	err = tx.QueryRowContext(ctx, "SELECT position FROM _tiny_event_consumers WHERE name = ?", name).Scan(&current)
 	if err == nil {
@@ -145,7 +160,7 @@ func (l *Log) registerConsumerOnce(ctx context.Context, name string, after int64
 // Read returns a bounded batch after the persisted cursor. Until Ack succeeds,
 // another Read returns the same events (at-least-once processing). Consumers
 // sharing a name must coordinate effects; Read is not an exclusive work lease.
-func (l *Log) Read(ctx context.Context, consumer string, limit int) (*Batch, error) {
+func (l *Log) Read(ctx context.Context, consumer string, limit int) (result *Batch, err error) {
 	if limit < 1 || limit > 10000 {
 		return nil, errors.New("batch size must be between 1 and 10000")
 	}
@@ -153,7 +168,7 @@ func (l *Log) Read(ctx context.Context, consumer string, limit int) (*Batch, err
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer rollback(tx, &err)
 	var cursor int64
 	if err = tx.QueryRowContext(ctx, "SELECT position FROM _tiny_event_consumers WHERE name = ?", consumer).Scan(&cursor); err != nil {
 		return nil, err
@@ -169,7 +184,7 @@ func (l *Log) Read(ctx context.Context, consumer string, limit int) (*Batch, err
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer errutil.Close(rows, &err, "close event rows")
 	batch := &Batch{From: cursor, To: cursor, from: cursor, to: cursor, consumer: consumer, log: l}
 	for rows.Next() {
 		var e Event
@@ -192,7 +207,7 @@ func (l *Log) Read(ctx context.Context, consumer string, limit int) (*Batch, err
 // Ack confirms all events in this batch after the caller has processed them.
 // Repeating the same Ack is harmless; a stale competing batch cannot advance
 // a newer cursor. External effects must be idempotent across crash/retry windows.
-func (b *Batch) ackOnce(ctx context.Context) error {
+func (b *Batch) ackOnce(ctx context.Context) (err error) {
 	if b == nil || b.log == nil {
 		return errors.New("invalid event batch")
 	}
@@ -200,7 +215,7 @@ func (b *Batch) ackOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer rollback(tx, &err)
 	var current int64
 	if err = tx.QueryRowContext(ctx, "SELECT position FROM _tiny_event_consumers WHERE name = ?", b.consumer).Scan(&current); err != nil {
 		return err
@@ -227,7 +242,7 @@ func (b *Batch) ackOnce(ctx context.Context) error {
 // Prune permanently removes events through a sequence and advances the retention
 // boundary atomically. Lagging consumers then receive ErrCursorExpired rather
 // than silently skipping missing events. Applications decide their retention policy.
-func (l *Log) pruneOnce(ctx context.Context, through int64) error {
+func (l *Log) pruneOnce(ctx context.Context, through int64) (err error) {
 	if through < 0 {
 		return errors.New("negative retention cursor")
 	}
@@ -235,7 +250,7 @@ func (l *Log) pruneOnce(ctx context.Context, through int64) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer rollback(tx, &err)
 	floor, last, err := bounds(ctx, tx)
 	if err != nil {
 		return err
@@ -270,13 +285,12 @@ type ConsumerStats struct {
 	Expired                              bool
 }
 
-func (l *Log) Stats(ctx context.Context, consumer string) (ConsumerStats, error) {
-	var out ConsumerStats
+func (l *Log) Stats(ctx context.Context, consumer string) (out ConsumerStats, err error) {
 	tx, err := l.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return out, err
 	}
-	defer tx.Rollback()
+	defer rollback(tx, &err)
 	if err = tx.QueryRowContext(ctx, "SELECT position FROM _tiny_event_consumers WHERE name = ?", consumer).Scan(&out.Position); err != nil {
 		return out, err
 	}

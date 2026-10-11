@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"io"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -94,7 +95,7 @@ func TestCloseRowsPreservesErrors(t *testing.T) {
 
 func TestQueryFunctionsReportCloseErrors(t *testing.T) {
 	closeErr := errors.New("stream close failed")
-	for _, method := range []string{"tableRows", "getRecord", "queryRows"} {
+	for _, method := range []string{"tableRows", "getRecord", "queryRows", "tableRowsSorted"} {
 		t.Run(method, func(t *testing.T) {
 			stream := &closeErrorRows{closeErr: closeErr}
 			app := &App{sqlDB: newCloseErrorDB(t, stream)}
@@ -106,6 +107,8 @@ func TestQueryFunctionsReportCloseErrors(t *testing.T) {
 				_, _, err = app.getRecord(context.Background(), "items", "1")
 			case "queryRows":
 				_, _, err = app.queryRows(context.Background(), "SELECT id FROM items")
+			case "tableRowsSorted":
+				_, _, err = app.tableRowsSorted(httptest.NewRequest("GET", "/", nil), 1, "id", "asc", TableMeta{Name: "items", Columns: []Column{{Name: "id"}}})
 			}
 			if !errors.Is(err, closeErr) {
 				t.Fatalf("expected close error, got %v", err)
@@ -114,6 +117,15 @@ func TestQueryFunctionsReportCloseErrors(t *testing.T) {
 				t.Fatalf("expected one close, got %d", stream.closes)
 			}
 		})
+	}
+}
+
+func TestInsertRecordPreservesIDQueryError(t *testing.T) {
+	nextErr := errors.New("cannot read maximum id")
+	app := &App{sqlDB: newCloseErrorDB(t, &closeErrorRows{nextErr: nextErr})}
+	err := app.insertRecord(context.Background(), "items", nil, []Column{{Name: "id"}})
+	if !errors.Is(err, nextErr) {
+		t.Fatalf("expected ID query error, got %v", err)
 	}
 }
 

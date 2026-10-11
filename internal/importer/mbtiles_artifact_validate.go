@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/SimonWaldherr/tinySQL/internal/errutil"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
@@ -59,7 +60,7 @@ func OpenMBTilesArtifact(ctx context.Context, artifactPath string, maxMemoryByte
 	return db, manifest, nil
 }
 
-func validateArtifact(ctx context.Context, root string, requireComplete bool) (*MBTilesArtifactManifest, error) {
+func validateArtifact(ctx context.Context, root string, requireComplete bool) (result *MBTilesArtifactManifest, err error) {
 	if requireComplete {
 		if info, err := os.Stat(filepath.Join(root, "COMPLETE")); err != nil || !info.Mode().IsRegular() || info.Size() != 0 {
 			return nil, errors.New("artifact is not complete")
@@ -123,7 +124,7 @@ func validateArtifact(ctx context.Context, root string, requireComplete bool) (*
 	if err != nil {
 		return nil, fmt.Errorf("open artifact database for validation: %w", err)
 	}
-	defer db.Close()
+	defer errutil.Close(db, &err, "close artifact validation database")
 	tableRows := make(map[string]int64, len(manifest.Tables))
 	for _, table := range manifest.Tables {
 		if err := validateArtifactTable(ctx, db, table); err != nil {

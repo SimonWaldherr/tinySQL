@@ -14,20 +14,20 @@ import (
 	"sort"
 	"time"
 
+	"github.com/SimonWaldherr/tinySQL/internal/errutil"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 // ImportTileArtifact streams a repeatable tile source directly into a
 // validated, atomically published artifact. It never creates or opens an
 // intermediate SQLite/MBTiles database.
-func ImportTileArtifact(ctx context.Context, source TileArtifactSource, artifactPath string, opts *MBTilesArtifactOptions) (*MBTilesArtifactResult, error) {
+func ImportTileArtifact(ctx context.Context, source TileArtifactSource, artifactPath string, opts *MBTilesArtifactOptions) (result *MBTilesArtifactResult, err error) {
 	if source == nil {
 		return nil, errors.New("tile artifact source is nil")
 	}
 	if opts == nil {
 		opts = &MBTilesArtifactOptions{}
 	}
-	var err error
 	opts, err = cloneArtifactOptions(opts)
 	if err != nil {
 		return nil, fmt.Errorf("copy tile artifact options: %w", err)
@@ -87,7 +87,11 @@ func ImportTileArtifact(ctx context.Context, source TileArtifactSource, artifact
 	if err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(tmp)
+	defer func() {
+		if cleanupErr := os.RemoveAll(tmp); cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("remove temporary artifact: %w", cleanupErr))
+		}
+	}()
 	db, err := storage.OpenDB(storage.StorageConfig{Mode: storage.ModePagedIndex, Path: filepath.Join(tmp, "database"), MaxMemoryBytes: opts.MaxMemoryBytes})
 	if err != nil {
 		return nil, fmt.Errorf("create paged-index database: %w", err)
@@ -95,7 +99,7 @@ func ImportTileArtifact(ctx context.Context, source TileArtifactSource, artifact
 	closeDB := true
 	defer func() {
 		if closeDB {
-			_ = db.Close()
+			errutil.Close(db, &err, "close temporary artifact database")
 		}
 	}()
 	if err := createArtifactTables(db, MBTilesSchemaFlat); err != nil {

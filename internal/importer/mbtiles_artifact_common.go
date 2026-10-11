@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+
+	"github.com/SimonWaldherr/tinySQL/internal/errutil"
 )
 
 const mbtilesArtifactFormatVersion = 1
@@ -70,12 +72,12 @@ func artifactDataFileNames(root string) []string {
 	return names
 }
 
-func checksumFile(path string) (string, error) {
+func checksumFile(path string) (sum string, err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer errutil.Close(f, &err, "close checksum source")
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err

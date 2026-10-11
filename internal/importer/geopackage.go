@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,6 +17,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/SimonWaldherr/tinySQL/internal/errutil"
 	"github.com/SimonWaldherr/tinySQL/internal/geoencoding"
 	"github.com/SimonWaldherr/tinySQL/internal/gpkg"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -35,12 +37,12 @@ type geoPackageColumn struct {
 
 // InspectGeoPackage reads only OGC catalog tables and returns the available
 // vector feature layers. It never contacts an external service.
-func InspectGeoPackage(ctx context.Context, filePath string) (*GeoPackageInfo, error) {
+func InspectGeoPackage(ctx context.Context, filePath string) (out *GeoPackageInfo, err error) {
 	source, err := openGeoPackage(ctx, filePath)
 	if err != nil {
 		return nil, err
 	}
-	defer source.Close()
+	defer errutil.Close(source, &err, "close GeoPackage source database")
 	return inspectGeoPackageDB(ctx, source)
 }
 
@@ -58,7 +60,7 @@ func openGeoPackage(ctx context.Context, filePath string) (*sql.DB, error) {
 	return source, nil
 }
 
-func inspectGeoPackageDB(ctx context.Context, source *sql.DB) (*GeoPackageInfo, error) {
+func inspectGeoPackageDB(ctx context.Context, source *sql.DB) (out *GeoPackageInfo, err error) {
 	info := &GeoPackageInfo{}
 	if err := source.QueryRowContext(ctx, "PRAGMA application_id").Scan(&info.ApplicationID); err != nil {
 		return nil, fmt.Errorf("read GeoPackage application_id: %w", err)
@@ -104,7 +106,7 @@ func inspectGeoPackageDB(ctx context.Context, source *sql.DB) (*GeoPackageInfo, 
 	if err != nil {
 		return nil, fmt.Errorf("read GeoPackage feature catalog: %w", err)
 	}
-	defer rows.Close()
+	defer errutil.Close(rows, &err, "close GeoPackage catalog rows")
 	for rows.Next() {
 		var layer GeoPackageLayer
 		var minX, minY, maxX, maxY sql.NullFloat64
@@ -151,7 +153,7 @@ func ImportGeoPackage(
 	tableName string,
 	filePath string,
 	opts *ImportOptions,
-) (*ImportResult, error) {
+) (out *ImportResult, err error) {
 	if opts == nil {
 		opts = &ImportOptions{}
 	}
@@ -161,7 +163,7 @@ func ImportGeoPackage(
 	if err != nil {
 		return nil, err
 	}
-	defer source.Close()
+	defer errutil.Close(source, &err, "close GeoPackage source database")
 	info, err := inspectGeoPackageDB(ctx, source)
 	if err != nil {
 		return nil, err
@@ -185,7 +187,7 @@ func ImportGeoPackageReader(
 	tableName string,
 	src io.Reader,
 	opts *ImportOptions,
-) (*ImportResult, error) {
+) (out *ImportResult, err error) {
 	if opts == nil {
 		opts = &ImportOptions{}
 	}
@@ -194,11 +196,16 @@ func ImportGeoPackageReader(
 		return nil, fmt.Errorf("create temporary GeoPackage: %w", err)
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	defer func() {
+		if cleanupErr := os.Remove(tmpName); cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("remove temporary GeoPackage: %w", cleanupErr))
+		}
+	}()
 	limited := limitInput(ctx, src, opts)
 	if _, err := io.Copy(tmp, limited); err != nil {
-		_ = tmp.Close()
-		return nil, fmt.Errorf("write temporary GeoPackage: %w", err)
+		err = fmt.Errorf("write temporary GeoPackage: %w", err)
+		errutil.Close(tmp, &err, "close temporary GeoPackage")
+		return nil, err
 	}
 	if err := tmp.Close(); err != nil {
 		return nil, fmt.Errorf("close temporary GeoPackage: %w", err)
@@ -243,7 +250,7 @@ func importGeoPackageLayer(
 	info *GeoPackageInfo,
 	layer GeoPackageLayer,
 	opts *ImportOptions,
-) (*ImportResult, error) {
+) (out *ImportResult, err error) {
 	columns, err := geoPackageColumns(ctx, source, layer.TableName)
 	if err != nil {
 		return nil, err
@@ -279,7 +286,7 @@ func importGeoPackageLayer(
 	if err != nil {
 		return nil, fmt.Errorf("query GeoPackage layer %q: %w", layer.TableName, err)
 	}
-	defer sourceRows.Close()
+	defer errutil.Close(sourceRows, &err, "close GeoPackage layer rows")
 
 	batchSize := opts.BatchSize
 	if batchSize <= 0 {
@@ -354,12 +361,12 @@ func importGeoPackageLayer(
 	return result, nil
 }
 
-func geoPackageColumns(ctx context.Context, source *sql.DB, tableName string) ([]geoPackageColumn, error) {
+func geoPackageColumns(ctx context.Context, source *sql.DB, tableName string) (out []geoPackageColumn, err error) {
 	rows, err := source.QueryContext(ctx, `SELECT name, type, pk FROM pragma_table_info(?) ORDER BY cid`, tableName)
 	if err != nil {
 		return nil, fmt.Errorf("read GeoPackage layer %q columns: %w", tableName, err)
 	}
-	defer rows.Close()
+	defer errutil.Close(rows, &err, "close GeoPackage column rows")
 	var columns []geoPackageColumn
 	for rows.Next() {
 		var column geoPackageColumn

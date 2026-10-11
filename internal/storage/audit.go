@@ -23,6 +23,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -209,13 +210,14 @@ func (a *AuditLog) Entries() []AuditEntry {
 func (a *AuditLog) Close() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	var err error
 	if a.writer != nil {
-		if err := a.writer.Flush(); err != nil {
-			return err
-		}
+		err = a.writer.Flush()
 	}
 	if a.file != nil {
-		return a.file.Close()
+		err = errors.Join(err, a.file.Close())
 	}
-	return nil
+	a.writer = nil
+	a.file = nil
+	return err
 }

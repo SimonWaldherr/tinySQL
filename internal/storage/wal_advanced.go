@@ -1464,20 +1464,15 @@ func (w *AdvancedWAL) Close() error {
 		return nil
 	}
 
-	if err := w.flush(); err != nil {
-		return err
-	}
-
+	err := w.flush()
 	if w.file != nil {
-		if err := w.file.Close(); err != nil {
-			return err
-		}
+		err = errors.Join(err, w.file.Close())
 	}
 	w.closed = true
 	w.file = nil
 	w.writer = nil
 	w.encoder = nil
-	return nil
+	return err
 }
 
 // GetNextLSN returns the next LSN to be assigned.

@@ -103,6 +103,7 @@ func executeStatementWithColumns(ctx context.Context, db *storage.DB, tenant str
 	// it, a statement's armed catalog rollback point would still be installed
 	// when the next statement mutated the catalog, and would capture that
 	// statement's pre-image instead. See storage.ReleaseStatementSnapshot.
+	statementWAL := newStatementWAL(db)
 	defer db.ReleaseStatementSnapshot(snapshot)
 	defer func() { recordAudit(ctx, db, tenant, stmt, err) }()
 	defer func() {
@@ -113,12 +114,18 @@ func executeStatementWithColumns(ctx context.Context, db *storage.DB, tenant str
 		purgeCachesAfterRollback(db, snapshot)
 	}()
 	defer func() {
+		if err != nil {
+			if abortErr := statementWAL.abort(); abortErr != nil {
+				err = errors.Join(err, fmt.Errorf("abort statement WAL: %w", abortErr))
+			}
+		}
+	}()
+	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("internal error executing statement: %v", r)
 		}
 	}()
 
-	statementWAL := newStatementWAL(db)
 	env := ExecEnv{ctx: ctx, tenant: tenant, db: db, statementWAL: statementWAL, now: time.Now(), subqueryCache: newSubqueryResultCache(), dml: plan, procedureOverride: procedure, rollbackArmed: snapshot != nil}
 	var columnarHandled bool
 	if columns != nil {

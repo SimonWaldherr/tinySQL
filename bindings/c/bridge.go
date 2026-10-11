@@ -23,6 +23,7 @@ import (
 
 	tsql "github.com/SimonWaldherr/tinySQL"
 	tsqldriver "github.com/SimonWaldherr/tinySQL/driver"
+	"github.com/SimonWaldherr/tinySQL/internal/errutil"
 	"github.com/SimonWaldherr/tinySQL/internal/sqlbind"
 	"github.com/SimonWaldherr/tinySQL/sqlutil"
 )
@@ -206,12 +207,12 @@ func register(db *tsql.DB) (response, error) {
 	return response{Handle: id}, nil
 }
 
-func loadSnapshot(path string) (*tsql.DB, error) {
+func loadSnapshot(path string) (loaded *tsql.DB, err error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer errutil.Close(file, &err, "close snapshot file")
 	info, err := file.Stat()
 	if err != nil {
 		return nil, err
@@ -225,7 +226,7 @@ func loadSnapshot(path string) (*tsql.DB, error) {
 		if err != nil {
 			return nil, err
 		}
-		defer compressed.Close()
+		defer errutil.Close(compressed, &err, "close compressed snapshot")
 		reader = compressed
 	}
 	buffered := bufio.NewReader(reader)
@@ -419,12 +420,12 @@ func (d *database) withTransactionState(r response) response {
 	return r
 }
 
-func queryRows(conn *sql.Conn, query string, args []any) (response, error) {
+func queryRows(conn *sql.Conn, query string, args []any) (out response, err error) {
 	rows, err := conn.QueryContext(context.Background(), query, args...)
 	if err != nil {
 		return response{}, err
 	}
-	defer rows.Close()
+	defer errutil.Close(rows, &err, "close query rows")
 	columns, err := rows.Columns()
 	if err != nil {
 		return response{}, err
@@ -456,7 +457,7 @@ func queryRows(conn *sql.Conn, query string, args []any) (response, error) {
 			result.Rows[i] = cells[i*width : (i+1)*width : (i+1)*width]
 		}
 	}
-	return result, rows.Close()
+	return result, nil
 }
 
 // executeBatch prepares sql once and executes it for every parameter set.
@@ -465,13 +466,13 @@ func executeBatch(id uint64, query, parameters string) (response, error) {
 	if err != nil {
 		return response{}, err
 	}
-	return withStatement(id, func(d *database) (response, error) {
+	return withStatement(id, func(d *database) (out response, err error) {
 		ctx := context.Background()
 		stmt, err := d.conn.PrepareContext(ctx, query)
 		if err != nil {
 			return response{}, err
 		}
-		defer stmt.Close()
+		defer errutil.Close(stmt, &err, "close batch statement")
 		var total int64
 		for i, args := range sets {
 			result, err := stmt.ExecContext(ctx, args...)
