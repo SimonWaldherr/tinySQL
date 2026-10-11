@@ -16,6 +16,13 @@ type schedulerTestExecutor struct {
 	panicMsg string
 }
 
+func waitForScheduler(s *Scheduler) {
+	s.mu.RLock()
+	done := s.workDone
+	s.mu.RUnlock()
+	<-done
+}
+
 func (e *schedulerTestExecutor) ExecuteSQL(_ context.Context, sql string) (interface{}, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -155,7 +162,7 @@ func TestSchedulerMaxConcurrentJobsLimitsExecution(t *testing.T) {
 	}
 
 	close(exec.release)
-	s.wg.Wait()
+	waitForScheduler(s)
 
 	exec.mu.Lock()
 	defer exec.mu.Unlock()
@@ -177,7 +184,7 @@ func TestSchedulerExecuteJobSuccessFailureAndSkipped(t *testing.T) {
 		t.Fatalf("RegisterJob success failed: %v", err)
 	}
 	s.executeJob(success)
-	s.wg.Wait()
+	waitForScheduler(s)
 
 	if exec.callCount() != 1 {
 		t.Fatalf("executor calls = %d, want 1", exec.callCount())
@@ -197,7 +204,7 @@ func TestSchedulerExecuteJobSuccessFailureAndSkipped(t *testing.T) {
 		t.Fatalf("RegisterJob failing failed: %v", err)
 	}
 	failingScheduler.executeJob(failing)
-	failingScheduler.wg.Wait()
+	waitForScheduler(failingScheduler)
 
 	noExecScheduler := NewScheduler(db, nil)
 	noExec := &CatalogJob{Name: "noexec", SQLText: "SELECT 2", ScheduleType: "ONCE", Enabled: true}
@@ -205,7 +212,7 @@ func TestSchedulerExecuteJobSuccessFailureAndSkipped(t *testing.T) {
 		t.Fatalf("RegisterJob noexec failed: %v", err)
 	}
 	noExecScheduler.executeJob(noExec)
-	noExecScheduler.wg.Wait()
+	waitForScheduler(noExecScheduler)
 
 	statuses := map[string]string{}
 	for _, run := range db.Catalog().ListJobHistory() {
@@ -236,7 +243,7 @@ func TestSchedulerExecuteJobRecoversFromPanic(t *testing.T) {
 	// be recovered and recorded as a FAILED job run, not propagate out of the
 	// scheduler's goroutine.
 	s.executeJob(job)
-	s.wg.Wait()
+	waitForScheduler(s)
 
 	var found bool
 	for _, run := range db.Catalog().ListJobHistory() {
@@ -263,7 +270,7 @@ func TestSchedulerExecuteJobRecoversFromPanic(t *testing.T) {
 		t.Fatalf("RegisterJob after-panic failed: %v", err)
 	}
 	s2.executeJob(follow)
-	s2.wg.Wait()
+	waitForScheduler(s2)
 	if successExec.callCount() != 1 {
 		t.Fatalf("executor calls after recovered panic = %d, want 1", successExec.callCount())
 	}
@@ -346,7 +353,7 @@ func TestSchedulerCheckIntervalJobs(t *testing.T) {
 	}
 
 	s.checkIntervalJobs(now)
-	s.wg.Wait()
+	waitForScheduler(s)
 
 	if exec.callCount() != 2 {
 		t.Fatalf("executor calls = %d, want 2", exec.callCount())

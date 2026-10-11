@@ -14,3 +14,15 @@ func BenchmarkSchedulerCatchUp(b *testing.B) {
 		s.calculateNextRun(job)
 	}
 }
+
+func BenchmarkSchedulerStopIdle(b *testing.B) {
+	db := NewDB()
+	b.Cleanup(func() { db.Close() })
+	b.ReportAllocs()
+	for b.Loop() {
+		b.StopTimer()
+		s := NewScheduler(db, nil)
+		b.StartTimer()
+		s.Stop()
+	}
+}

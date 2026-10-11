@@ -27,8 +27,11 @@ type Scheduler struct {
 	cronEntries                                   map[string]cron.EntryID
 	stopCh                                        chan struct{}
 	started                                       bool
-	wg                                            sync.WaitGroup
-	executor                                      JobExecutor // Interface for executing SQL
+	// workDone is closed when the interval loop and every admitted run finish.
+	// It permits bounded shutdown without spawning a goroutine stuck in Wait.
+	workDone chan struct{}
+	pending  int
+	executor JobExecutor // Interface for executing SQL
 
 	lifeMu                         sync.Mutex
 	active                         map[int64]*jobTask
@@ -78,6 +81,8 @@ type jobExecution struct {
 // NewScheduler creates a new job scheduler
 func NewScheduler(db *DB, executor JobExecutor) *Scheduler {
 	loc, _ := time.LoadLocation("UTC")
+	done := make(chan struct{})
+	close(done)
 	return &Scheduler{
 		db:          db,
 		catalog:     db.Catalog(),
@@ -85,6 +90,7 @@ func NewScheduler(db *DB, executor JobExecutor) *Scheduler {
 		running:     make(map[string]*jobExecution),
 		cronEntries: make(map[string]cron.EntryID),
 		stopCh:      make(chan struct{}),
+		workDone:    done,
 		executor:    executor,
 		active:      make(map[int64]*jobTask),
 		maxWorkers:  defaultMaxConcurrentJobs, maxQueued: 256, instanceID: uuid.NewString(),
@@ -105,7 +111,7 @@ func (s *Scheduler) Start() error {
 		s.stopCh = make(chan struct{})
 	}
 
-	if s.stopped && s.workers > 0 {
+	if s.stopped && s.pending > 0 {
 		return errors.New("scheduler is still stopping")
 	}
 	s.stopped = false
@@ -124,9 +130,9 @@ func (s *Scheduler) Start() error {
 	// Capture the stop channel under the lock so the goroutine never reads
 	// s.stopCh directly; Stop() may write s.stopCh = nil concurrently.
 	stopCh := s.stopCh
-	s.wg.Add(1)
+	s.addWorkLocked()
 	go func() {
-		defer s.wg.Done()
+		defer s.finishWork()
 		s.runIntervalScheduler(stopCh)
 	}()
 	s.started = true
@@ -137,6 +143,10 @@ func (s *Scheduler) Start() error {
 
 // Stop halts the scheduler and cancels all running jobs
 func (s *Scheduler) Stop() {
+	s.stopWithTimeout(schedulerShutdownTimeout)
+}
+
+func (s *Scheduler) stopWithTimeout(timeout time.Duration) {
 	s.lifeMu.Lock()
 	defer s.lifeMu.Unlock()
 	s.mu.Lock()
@@ -154,17 +164,43 @@ func (s *Scheduler) Stop() {
 		task.exec.cancelFn()
 	}
 	// Retain queued jobs for workers to record cancellation without executing SQL.
+	done := s.workDone
 	s.mu.Unlock()
 	<-s.cron.Stop().Done()
-	done := make(chan struct{})
-	go func() { s.wg.Wait(); close(done) }()
-	timer := time.NewTimer(schedulerShutdownTimeout)
+	select {
+	case <-done:
+		return
+	default:
+	}
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case <-done:
 	case <-timer.C:
 		log.Print("job scheduler shutdown timed out")
 	}
+}
+
+// All admissions and completions share mu, so workDone can be renewed only
+// after the previous generation has finished.
+func (s *Scheduler) addWorkLocked() {
+	if s.pending == 0 {
+		s.workDone = make(chan struct{})
+	}
+	s.pending++
+}
+
+func (s *Scheduler) finishWorkLocked() {
+	s.pending--
+	if s.pending == 0 {
+		close(s.workDone)
+	}
+}
+
+func (s *Scheduler) finishWork() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.finishWorkLocked()
 }
 
 // schedulerShutdownTimeout bounds how long Stop waits for already-running

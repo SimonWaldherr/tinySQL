@@ -190,18 +190,25 @@ func (idx *geoGridIndex) scanRows(ctx context.Context, table *storage.Table, col
 		err   error
 	}
 	parts := make([]partial, workers)
+	run := func(w, lo, hi int) {
+		defer func() {
+			if r := recover(); r != nil {
+				parts[w].err = fmt.Errorf("spatial index build: %v", r)
+			}
+		}()
+		parts[w].union, parts[w].valid, parts[w].err = idx.scanRange(ctx, table, colIdx, lo, hi)
+	}
 	var wg sync.WaitGroup
+	wg.Add(workers - 1)
 	for w := 0; w < workers; w++ {
 		lo, hi := n*w/workers, n*(w+1)/workers
-		wg.Add(1)
+		if w == workers-1 {
+			run(w, lo, hi)
+			break
+		}
 		go func(w, lo, hi int) {
 			defer wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					parts[w].err = fmt.Errorf("spatial index build: %v", r)
-				}
-			}()
-			parts[w].union, parts[w].valid, parts[w].err = idx.scanRange(ctx, table, colIdx, lo, hi)
+			run(w, lo, hi)
 		}(w, lo, hi)
 	}
 	wg.Wait()

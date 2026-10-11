@@ -60,6 +60,11 @@ type server struct {
 
 	persistMu    sync.Mutex
 	persistTimer *time.Timer
+	// Serialize timer I/O with flushPersist: stopping an AfterFunc timer does
+	// not wait for a callback that has already started. Generations invalidate
+	// callbacks that fired but were still waiting when a flush canceled them.
+	persistRunMu      sync.Mutex
+	persistGeneration uint64
 	// persistDirty is true when a debounced persist() call has been
 	// requested since the last actual sync completed. It lets
 	// runDebouncedPersist and flushPersist tell "nothing to do" (e.g.
@@ -261,7 +266,9 @@ func (s *server) schedulePersist() {
 	if s.persistTimer != nil {
 		return
 	}
-	s.persistTimer = time.AfterFunc(s.persistDebounce, s.runDebouncedPersist)
+	s.persistGeneration++
+	generation := s.persistGeneration
+	s.persistTimer = time.AfterFunc(s.persistDebounce, func() { s.runDebouncedPersist(generation) })
 }
 
 // runDebouncedPersist is the timer callback: it performs the sync owed by
@@ -270,8 +277,14 @@ func (s *server) schedulePersist() {
 // There is no caller left to report a failure to here, so it is logged —
 // the same best-effort posture persistBestEffort already uses for cleanup
 // paths, and DB.Sync additionally records its own failures for HealthCheck.
-func (s *server) runDebouncedPersist() {
+func (s *server) runDebouncedPersist(generation uint64) {
+	s.persistRunMu.Lock()
+	defer s.persistRunMu.Unlock()
 	s.persistMu.Lock()
+	if generation != s.persistGeneration {
+		s.persistMu.Unlock()
+		return
+	}
 	s.persistTimer = nil
 	dirty := s.persistDirty
 	s.persistDirty = false
@@ -280,6 +293,9 @@ func (s *server) runDebouncedPersist() {
 		return
 	}
 	if err := s.persistNow(); err != nil {
+		s.persistMu.Lock()
+		s.persistDirty = true // retain the obligation for the next write or flush
+		s.persistMu.Unlock()
 		log.Printf("tinysql: debounced persist failed: %v", err)
 	}
 }
@@ -292,18 +308,27 @@ func (s *server) runDebouncedPersist() {
 // pending debounced sync is never silently lost when the process exits
 // cleanly.
 func (s *server) flushPersist() error {
+	s.persistRunMu.Lock()
+	defer s.persistRunMu.Unlock()
 	s.persistMu.Lock()
 	if s.persistTimer != nil {
 		s.persistTimer.Stop()
 		s.persistTimer = nil
 	}
+	s.persistGeneration++
 	dirty := s.persistDirty
 	s.persistDirty = false
 	s.persistMu.Unlock()
 	if !dirty {
 		return nil
 	}
-	return s.persistNow()
+	err := s.persistNow()
+	if err != nil {
+		s.persistMu.Lock()
+		s.persistDirty = true
+		s.persistMu.Unlock()
+	}
+	return err
 }
 
 // persistBestEffort is persist for cleanup paths that have no caller left to

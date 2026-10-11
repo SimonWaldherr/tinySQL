@@ -98,3 +98,43 @@ func TestFTSParallelBuildExtendsLikeSequential(t *testing.T) {
 		t.Fatal("append-only extension of a parallel build differs from a sequential fresh build")
 	}
 }
+
+func BenchmarkFTSRunChunks(b *testing.B) {
+	for _, workers := range []int{1, 2, 8} {
+		b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {
+			chunks := make([]ftsBuildChunk, workers)
+			fn := func(c *ftsBuildChunk) { c.numDocs++ }
+			b.ReportAllocs()
+			for b.Loop() {
+				ftsRunChunks(chunks, fn)
+			}
+		})
+	}
+}
+
+func TestFTSRunChunksWaitsBeforePropagatingPanic(t *testing.T) {
+	for _, panicChunk := range []int{0, 2} {
+		chunks := make([]ftsBuildChunk, 3)
+		for i := range chunks {
+			chunks[i].lo = i
+		}
+		var recovered any
+		func() {
+			defer func() { recovered = recover() }()
+			ftsRunChunks(chunks, func(c *ftsBuildChunk) {
+				if c.lo == panicChunk {
+					panic("chunk failed")
+				}
+				c.numDocs = 1
+			})
+		}()
+		if recovered != "chunk failed" {
+			t.Fatalf("lost panic from chunk %d: %v", panicChunk, recovered)
+		}
+		for i := range chunks {
+			if i != panicChunk && chunks[i].numDocs != 1 {
+				t.Fatalf("panic returned before chunk %d finished", i)
+			}
+		}
+	}
+}

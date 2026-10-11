@@ -67,7 +67,7 @@ func TestSchedulerBoundedQueueAndOverlappingRunIDs(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := make(chan struct{})
-	go func() { s.wg.Wait(); close(done) }()
+	go func() { waitForScheduler(s); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
@@ -112,7 +112,7 @@ func TestSchedulerRetriesKeepExecutionIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.wg.Wait()
+	waitForScheduler(s)
 	exec.mu.Lock()
 	defer exec.mu.Unlock()
 	if len(exec.infos) != 3 {

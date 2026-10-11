@@ -92,7 +92,7 @@ func (s *Scheduler) SubmitJob(job *CatalogJob) (int64, error) {
 	task := &jobTask{job: copy, ctx: ctx, exec: &jobExecution{startTime: time.Now(), cancelFn: cancel}, queuedAt: time.Now(), info: JobRunInfo{RunID: id, IdempotencyKey: fmt.Sprintf("%s:%d", s.instanceID, id)}}
 	s.active[id] = task
 	s.running[copy.Name] = task.exec
-	s.wg.Add(1)
+	s.addWorkLocked()
 	if s.workers < s.maxWorkers {
 		s.workers++
 		go s.runWorker(task)
@@ -134,7 +134,7 @@ func (s *Scheduler) runWorker(task *jobTask) {
 			}
 		}
 		s.completed++
-		s.wg.Done()
+		s.finishWorkLocked()
 		if len(s.queue) == 0 || s.workers > s.maxWorkers {
 			s.workers--
 			s.mu.Unlock()
@@ -148,6 +148,12 @@ func (s *Scheduler) runWorker(task *jobTask) {
 func (s *Scheduler) runTask(task *jobTask) {
 	defer s.db.notifyGlobalChanges()
 	defer task.exec.cancelFn()
+	var retryTimer *time.Timer
+	defer func() {
+		if retryTimer != nil {
+			retryTimer.Stop()
+		}
+	}()
 	task.startedAt = time.Now()
 	delay := time.Duration(0)
 	if task.job.NextRunAt != nil && task.startedAt.After(*task.job.NextRunAt) {
@@ -200,12 +206,15 @@ func (s *Scheduler) runTask(task *jobTask) {
 		s.retried++
 		s.mu.Unlock()
 		delay := jobRetryDelay(task.job.RetryDelayMs, attempts)
-		timer := time.NewTimer(delay)
+		if retryTimer == nil {
+			retryTimer = time.NewTimer(delay)
+		} else {
+			retryTimer.Reset(delay)
+		}
 		select {
 		case <-task.ctx.Done():
-		case <-timer.C:
+		case <-retryTimer.C:
 		}
-		timer.Stop()
 		status = "SUCCEEDED"
 		message = ""
 	}

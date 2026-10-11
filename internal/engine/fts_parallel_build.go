@@ -137,23 +137,33 @@ func (c *ftsBuildChunk) terms(index *storage.FTSIndex) {
 	c.tokens = nil
 }
 
-// ftsRunChunks runs fn for every chunk on its own goroutine and re-raises a
-// worker panic on the calling goroutine, where the executor's own recovery
-// can see it.
+// ftsRunChunks uses the caller for one chunk and starts workers for the rest.
+// It waits for every worker before re-raising a panic on the caller, where the
+// executor's own recovery can see it.
 func ftsRunChunks(chunks []ftsBuildChunk, fn func(*ftsBuildChunk)) {
+	if len(chunks) <= 1 {
+		if len(chunks) == 1 {
+			fn(&chunks[0])
+		}
+		return
+	}
+	run := func(c *ftsBuildChunk) {
+		defer func() {
+			if r := recover(); r != nil {
+				c.panicked, c.didPanic = r, true
+			}
+		}()
+		fn(c)
+	}
 	var wg sync.WaitGroup
-	for i := range chunks {
-		wg.Add(1)
+	wg.Add(len(chunks) - 1)
+	for i := range chunks[:len(chunks)-1] {
 		go func(c *ftsBuildChunk) {
 			defer wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					c.panicked, c.didPanic = r, true
-				}
-			}()
-			fn(c)
+			run(c)
 		}(&chunks[i])
 	}
+	run(&chunks[len(chunks)-1])
 	wg.Wait()
 	for i := range chunks {
 		if chunks[i].didPanic {

@@ -328,6 +328,12 @@ func (l *Log) Prune(ctx context.Context, through int64) error {
 func retryConflict[T any](ctx context.Context, work func() (T, error)) (T, error) {
 	var result T
 	var err error
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 	for attempt := 0; attempt < 4; attempt++ {
 		if err = ctx.Err(); err != nil {
 			return result, err
@@ -339,10 +345,17 @@ func retryConflict[T any](ctx context.Context, work func() (T, error)) (T, error
 		if attempt == 3 {
 			break
 		}
-		timer := time.NewTimer(time.Duration(1<<attempt) * time.Millisecond)
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		delay := time.Duration(1<<attempt) * time.Millisecond
+		if timer == nil {
+			timer = time.NewTimer(delay)
+		} else {
+			timer.Reset(delay)
+		}
 		select {
 		case <-ctx.Done():
-			timer.Stop()
 			return result, ctx.Err()
 		case <-timer.C:
 		}
