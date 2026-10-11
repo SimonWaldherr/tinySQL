@@ -4,6 +4,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -53,12 +54,57 @@ func TestFetchHTTPBoundsResponseAndReusesClient(t *testing.T) {
 
 func TestFetchHTTPHonorsContext(t *testing.T) {
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		<-req.Context().Done()
-		return nil, req.Context().Err()
+		t.Fatal("canceled request reached the transport")
+		return nil, context.Canceled
 	})}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := fetchHTTP(ctx, client, "https://example.com/data", 64); err == nil {
-		t.Fatal("fetchHTTP ignored canceled context")
+	if _, err := fetchHTTP(ctx, client, "https://example.com/data", 64); !errors.Is(err, context.Canceled) {
+		t.Fatalf("fetchHTTP lost cancellation error: %v", err)
+	}
+}
+
+type httpReadFunc func([]byte) (int, error)
+
+func (f httpReadFunc) Read(p []byte) (int, error) { return f(p) }
+
+func TestFetchHTTPPreservesCancellationDuringIO(t *testing.T) {
+	for _, stage := range []string{"transport", "body"} {
+		t.Run(stage, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if stage == "transport" {
+					cancel()
+					return nil, req.Context().Err()
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body: io.NopCloser(httpReadFunc(func([]byte) (int, error) {
+						cancel()
+						return 0, req.Context().Err()
+					})),
+					Header:  make(http.Header),
+					Request: req,
+				}, nil
+			})}
+			if _, err := fetchHTTP(ctx, client, "https://example.com/data", 64); !errors.Is(err, context.Canceled) {
+				t.Fatalf("fetchHTTP lost cancellation during %s: %v", stage, err)
+			}
+		})
+	}
+}
+
+func TestFetchHTTPAcceptsNilContext(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("ok")),
+			Header:     make(http.Header),
+			Request:    req,
+		}, nil
+	})}
+	if body, err := fetchHTTP(nil, client, "https://example.com/data", 64); err != nil || body != "ok" {
+		t.Fatalf("fetchHTTP(nil) = %q, %v", body, err)
 	}
 }

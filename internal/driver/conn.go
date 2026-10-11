@@ -152,7 +152,7 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 		c.txReadOnly = true
 		c.txDirty = false
 		c.txCatalogRev = 0
-		return &tx{c: c}, nil
+		return &tx{c: c, ctx: ctx}, nil
 	}
 
 	// Create snapshot copy under read lock; writer blocks commit briefly.
@@ -197,7 +197,7 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 	// contents here are also the live contents at BEGIN.
 	c.txCatalogRev = shadow.Catalog().Revision()
 	c.txCatalog = shadow.SnapshotCatalog()
-	return &tx{c: c}, nil
+	return &tx{c: c, ctx: ctx}, nil
 }
 
 // Ping implements driver.Pinger so database/sql can health-check the connection.
@@ -212,10 +212,14 @@ func (c *conn) Ping(ctx context.Context) error {
 	return nil
 }
 
-type tx struct{ c *conn }
+// driver.Tx has no context argument on Commit, so retain the BeginTx context.
+type tx struct {
+	c   *conn
+	ctx context.Context
+}
 
 func (t *tx) Commit() error {
-	return t.c.commitTx()
+	return t.c.commitTx(t.ctx)
 }
 
 func (t *tx) Rollback() error {

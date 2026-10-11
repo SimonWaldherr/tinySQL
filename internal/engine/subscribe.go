@@ -67,6 +67,12 @@ func SubscribeSQLWithOptions(ctx context.Context, db *storage.DB, tenant, query 
 	if db == nil {
 		return nil, fmt.Errorf("database is required")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
+	}
 	stmt, err := NewParser(query).ParseStatement()
 	if err != nil {
 		return nil, err

@@ -474,7 +474,7 @@ func (c *conn) execTransactionControl(ctx context.Context, sqlStr string) (drive
 		}
 		return driver.RowsAffected(0), true, nil
 	case txCommit:
-		if err := c.commitTx(); err != nil {
+		if err := c.commitTx(ctx); err != nil {
 			return nil, true, err
 		}
 		return driver.RowsAffected(0), true, nil

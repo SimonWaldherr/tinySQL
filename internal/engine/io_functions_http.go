@@ -51,20 +51,26 @@ func evalHTTPFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 }
 
 func fetchHTTP(ctx context.Context, client *http.Client, rawURL string, maxResponseBytes int64) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("http(): %w", err)
+	}
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
-		return "", fmt.Errorf("http(): invalid URL: %v", err)
+		return "", fmt.Errorf("http(): invalid URL: %w", err)
 	}
 	if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 		return "", fmt.Errorf("http(): URL must be absolute http or https")
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
 	if err != nil {
-		return "", fmt.Errorf("http(): %v", err)
+		return "", fmt.Errorf("http(): %w", err)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("http(): %v", err)
+		return "", fmt.Errorf("http(): %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -84,7 +90,7 @@ func fetchHTTP(ctx context.Context, client *http.Client, rawURL string, maxRespo
 	}
 	data, err := io.ReadAll(reader)
 	if err != nil {
-		return "", fmt.Errorf("http(): %v", err)
+		return "", fmt.Errorf("http(): %w", err)
 	}
 	if maxResponseBytes > 0 && int64(len(data)) > maxResponseBytes {
 		return "", fmt.Errorf("http(): response exceeds %d bytes", maxResponseBytes)

@@ -11,7 +11,13 @@ import (
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
-func (c *conn) commitTx() error {
+func (c *conn) commitTx(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !c.inTx {
 		return fmt.Errorf("tinysql: no active transaction")
 	}
@@ -36,7 +42,7 @@ func (c *conn) commitTx() error {
 	if c.shadow == nil {
 		return fmt.Errorf("tinysql: no active transaction snapshot")
 	}
-	if err := c.srv.acquireWriter(context.Background()); err != nil {
+	if err := c.srv.acquireWriter(ctx); err != nil {
 		return err
 	}
 	defer c.srv.releaseWriter()
@@ -49,9 +55,13 @@ func (c *conn) commitTx() error {
 	// writeMu still excludes every other writer while that I/O runs.
 	c.srv.writeMu.Lock()
 	defer c.srv.writeMu.Unlock()
+	// Cancellation while waiting must not publish the transaction.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	oldDB := c.srv.db
 	newDB := c.shadow
-	wal, needCheckpoint, err := c.commitTxApply(oldDB, newDB)
+	wal, needCheckpoint, err := c.commitTxApply(ctx, oldDB, newDB)
 	if err != nil {
 		return err
 	}
@@ -109,11 +119,14 @@ func (c *conn) commitTx() error {
 // this function reading or overwriting them, since the scheduler never
 // touches server.mu/writeMu at all. See BeginTx (conn.go) for the
 // equivalent gap on the snapshot/clone side.
-func (c *conn) commitTxApply(oldDB, newDB *storage.DB) (wal *storage.WALManager, needCheckpoint bool, err error) {
+func (c *conn) commitTxApply(ctx context.Context, oldDB, newDB *storage.DB) (wal *storage.WALManager, needCheckpoint bool, err error) {
 	c.srv.mu.Lock()
 	defer c.srv.mu.Unlock()
 	oldDB.LockContentForWrite()
 	defer oldDB.UnlockContentForWrite()
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
 	changes := storage.CollectWALChanges(c.txBase, newDB)
 	// The transaction's catalog work — CREATE VIEW/TRIGGER/JOB, GRANT, and the
 	// materialized-view staleness marks DML leaves behind — lives on the
@@ -144,6 +157,11 @@ func (c *conn) commitTxApply(oldDB, newDB *storage.DB) (wal *storage.WALManager,
 		c.clearTxState()
 		return nil, false, fmt.Errorf("%w on the system catalog", ErrTransactionConflict)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	// From the first WAL write onward, finish publishing and persisting the
+	// transaction even if the request is canceled, keeping the commit atomic.
 	wal = oldDB.WAL()
 	if wal != nil && len(changes) > 0 {
 		needCheckpoint, err = wal.LogTransaction(changes)

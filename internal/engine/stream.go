@@ -199,6 +199,9 @@ func (s *ResultStream) finish(err error) {
 	s.completedAt.Store(time.Now().UnixNano())
 	s.complete.Store(true)
 	close(s.rows)
+	// Production owns this child context. Release its parent registration even
+	// when the consumer drains to EOF without calling Close.
+	s.cancel(errResultStreamClosed)
 	close(s.done)
 }
 
@@ -264,10 +267,10 @@ func ExecuteStreamWithOptions(ctx context.Context, db *storage.DB, tenant string
 		}
 		stream.Cols = append([]string(nil), h.cols...)
 		return stream, nil
-	case <-streamCtx.Done():
-		cancel(context.Cause(streamCtx))
+	case <-ctx.Done():
+		cancel(context.Cause(ctx))
 		<-stream.done
-		return nil, context.Cause(streamCtx)
+		return nil, context.Cause(ctx)
 	}
 }
 
