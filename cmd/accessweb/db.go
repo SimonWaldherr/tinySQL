@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"html/template"
 	"sort"
@@ -99,7 +100,7 @@ func (a *App) tableMeta(ctx context.Context, name string) (TableMeta, error) {
 const pageSize = 50
 
 // tableRows returns a page of rows from a table.
-func (a *App) tableRows(ctx context.Context, name string, page int) ([]Column, [][]string, error) {
+func (a *App) tableRows(ctx context.Context, name string, page int) (columns []Column, records [][]string, err error) {
 	if page < 1 {
 		page = 1
 	}
@@ -110,7 +111,7 @@ func (a *App) tableRows(ctx context.Context, name string, page int) ([]Column, [
 	if err != nil {
 		return nil, nil, err
 	}
-	defer rows.Close()
+	defer closeRows(rows, &err)
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
@@ -141,13 +142,13 @@ func (a *App) tableRows(ctx context.Context, name string, page int) ([]Column, [
 }
 
 // getRecord fetches a single record by id.
-func (a *App) getRecord(ctx context.Context, table string, id string) ([]Column, []string, error) {
+func (a *App) getRecord(ctx context.Context, table string, id string) (columns []Column, record []string, err error) {
 	rows, err := a.sqlDB.QueryContext(ctx,
 		fmt.Sprintf("SELECT * FROM %s WHERE id = ?", quoteName(table)), parseID(id))
 	if err != nil {
 		return nil, nil, err
 	}
-	defer rows.Close()
+	defer closeRows(rows, &err)
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
@@ -159,6 +160,9 @@ func (a *App) getRecord(ctx context.Context, table string, id string) ([]Column,
 	}
 
 	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return nil, nil, err
+		}
 		return nil, nil, sql.ErrNoRows
 	}
 	vals := make([]interface{}, len(cols))
@@ -278,13 +282,25 @@ func (a *App) executeSQL(ctx context.Context, query string) QueryResult { //noli
 	return result
 }
 
-func (a *App) queryRows(ctx context.Context, query string) ([]string, [][]string, error) { //nolint:gosec
+func (a *App) queryRows(ctx context.Context, query string) (columns []string, records [][]string, err error) { //nolint:gosec
 	rows, err := a.sqlDB.QueryContext(ctx, query)
 	if err != nil {
 		return nil, nil, err
 	}
-	defer rows.Close()
+	defer closeRows(rows, &err)
 	return scanRows(rows)
+}
+
+// closeRows preserves both query errors and errors from closing the result stream.
+func closeRows(rows *sql.Rows, err *error) {
+	if closeErr := rows.Close(); closeErr != nil {
+		wrapped := fmt.Errorf("close query rows: %w", closeErr)
+		if *err == nil {
+			*err = wrapped
+		} else {
+			*err = errors.Join(*err, wrapped)
+		}
+	}
 }
 
 func scanRows(rows *sql.Rows) ([]string, [][]string, error) {
