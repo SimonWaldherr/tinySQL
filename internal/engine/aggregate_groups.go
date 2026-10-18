@@ -7,14 +7,15 @@ import "math"
 // used by the general GROUP BY evaluator. Separate key kinds preserve the
 // engine's distinction between int, int64, float64, bool and NULL groups.
 type aggregateGroups struct {
-	text    map[string]*simpleAggregateState
-	numbers [3]map[uint64]*simpleAggregateState // int, int64, float64
-	fixed   [3]*simpleAggregateState            // NULL, false, true
-	other   map[string]*simpleAggregateState
-	key     []byte
-	order   []*simpleAggregateState
-	whole   *simpleAggregateState
-	arena   aggregateStateArena
+	text      map[string]*simpleAggregateState
+	textPairs map[[2]string]*simpleAggregateState
+	numbers   [3]map[uint64]*simpleAggregateState // int, int64, float64
+	fixed     [3]*simpleAggregateState            // NULL, false, true
+	other     map[string]*simpleAggregateState
+	key       []byte
+	order     []*simpleAggregateState
+	whole     *simpleAggregateState
+	arena     aggregateStateArena
 }
 
 func newAggregateGroups(projs []simpleAggregateProjection, groupCount int) aggregateGroups {
@@ -83,6 +84,25 @@ func (g *aggregateGroups) state(raw []any, cols []int) *simpleAggregateState {
 		state := g.newState(raw, cols)
 		g.numbers[kind][key] = state
 		return state
+	}
+	if len(cols) == 2 {
+		// Text pairs are common dimension keys. Hash the two strings directly
+		// instead of formatting and copying a framed composite key per group.
+		// Other type combinations retain the canonical typed encoding below.
+		left, leftText := raw[cols[0]].(string)
+		right, rightText := raw[cols[1]].(string)
+		if leftText && rightText {
+			key := [2]string{left, right}
+			if state := g.textPairs[key]; state != nil {
+				return state
+			}
+			if g.textPairs == nil {
+				g.textPairs = make(map[[2]string]*simpleAggregateState)
+			}
+			state := g.newState(raw, cols)
+			g.textPairs[key] = state
+			return state
+		}
 	}
 	return g.encodedState(raw, cols)
 }

@@ -393,18 +393,19 @@ func processAggregateQueryFastPath(env ExecEnv, s *Select, filtered []Row) ([]Ro
 		return nil, nil, false, nil
 	}
 
-	var groups map[string]*simpleAggregateState
-	if len(groupKeys) > 0 {
-		groups = make(map[string]*simpleAggregateState, len(filtered)/2)
-	}
-	order := make([]*simpleAggregateState, 0)
-	keyBuf := make([]byte, 0, 64)
+	// Materialized inputs share the raw aggregate store's typed group lookup
+	// and query-local state arena. Resolve row-map keys above, then reuse one
+	// positional scratch row; the store owns each new group's copied values.
+	groups := newAggregateGroups(projs, len(groupKeys))
 	groupValues := make([]any, len(groupKeys))
+	groupCols := make([]int, len(groupKeys))
+	for i := range groupCols {
+		groupCols[i] = i
+	}
 
 	var ungrouped *simpleAggregateState
 	if len(groupKeys) == 0 {
-		ungrouped = newSimpleAggregateState(nil, len(s.Projs))
-		order = append(order, ungrouped)
+		ungrouped = groups.state(nil, nil)
 	}
 
 	for rowIdx, r := range filtered {
@@ -415,28 +416,14 @@ func processAggregateQueryFastPath(env ExecEnv, s *Select, filtered []Row) ([]Ro
 		}
 		var state *simpleAggregateState
 		if len(groupKeys) > 0 {
-			keyBuf = keyBuf[:0]
 			for gi, gkey := range groupKeys {
 				v, ok := r[gkey]
 				if !ok {
 					return nil, nil, false, unknownColumnErr(groupNames[gi], columnSuggestionFromRow(groupNames[gi], r))
 				}
 				groupValues[gi] = v
-				if gi > 0 {
-					keyBuf = append(keyBuf, '\x1f')
-				}
-				keyBuf = writeFmtKeyPart(keyBuf, v)
 			}
-			// Lookup without copying the scratch buffer; only a new group
-			// needs to own its key after the buffer is reused for the next row.
-			st, ok := groups[string(keyBuf)]
-			if !ok {
-				values := append(make([]any, 0, len(groupValues)), groupValues...)
-				st = newSimpleAggregateState(values, len(s.Projs))
-				groups[string(keyBuf)] = st
-				order = append(order, st)
-			}
-			state = st
+			state = groups.state(groupValues, groupCols)
 		} else {
 			state = ungrouped
 		}
@@ -446,7 +433,7 @@ func processAggregateQueryFastPath(env ExecEnv, s *Select, filtered []Row) ([]Ro
 		}
 	}
 
-	result := simpleAggregateResultSet(projs, outCols, order)
+	result := simpleAggregateResultSet(projs, outCols, groups.order)
 	return result.Rows, result.Cols, true, nil
 }
 

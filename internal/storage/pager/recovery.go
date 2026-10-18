@@ -17,8 +17,8 @@ import (
 //   1. Read all WAL records.
 //   2. Build a map TxID → list of PAGE_IMAGE records.
 //   3. Track which TxIDs have a COMMIT record (committed set).
-//   4. For each committed TX in LSN order, apply PAGE_IMAGE records
-//      whose LSN > page's on-disk LSN.
+//   4. Apply the newest committed PAGE_IMAGE for each page whose LSN
+//      exceeds the checkpoint LSN.
 //   5. Fsync the database file.
 //   6. Update and flush the superblock with new checkpoint_lsn.
 //   7. Truncate the WAL.
@@ -65,9 +65,11 @@ func recoverClassifyWAL(records []*WALRecord) (txMap map[TxID]*recoverTxEntry, m
 	return txMap, maxLSN, maxTxID
 }
 
-// recoverApplyPages writes committed page images that are newer than the checkpoint.
+// recoverApplyPages writes the latest committed image of each page newer than
+// the checkpoint. Full page images supersede earlier images independently of
+// other pages, so replay needs only one write per changed page.
 func (p *Pager) recoverApplyPages(txMap map[TxID]*recoverTxEntry) (int, error) {
-	applied := 0
+	latest := make(map[PageID]*WALRecord)
 	for _, tr := range txMap {
 		if !tr.committed || tr.aborted {
 			continue
@@ -76,11 +78,20 @@ func (p *Pager) recoverApplyPages(txMap map[TxID]*recoverTxEntry) (int, error) {
 			if rec.LSN <= LSN(p.sb.CheckpointLSN) {
 				continue
 			}
-			if err := p.writePageRaw(rec.PageID, rec.Data); err != nil {
-				return applied, fmt.Errorf("recover apply page %d: %w", rec.PageID, err)
+			// Go map iteration does not preserve WAL order. Applying each
+			// transaction immediately could overwrite a newer committed page
+			// with an older image from a transaction visited later.
+			if previous := latest[rec.PageID]; previous == nil || rec.LSN > previous.LSN {
+				latest[rec.PageID] = rec
 			}
-			applied++
 		}
+	}
+	applied := 0
+	for pageID, rec := range latest {
+		if err := p.writePageRaw(pageID, rec.Data); err != nil {
+			return applied, fmt.Errorf("recover apply page %d: %w", pageID, err)
+		}
+		applied++
 	}
 	return applied, nil
 }
@@ -128,10 +139,19 @@ func (p *Pager) Recover() error {
 		return fmt.Errorf("recover read WAL: %w", err)
 	}
 	if len(records) == 0 {
+		// Checkpoints truncate the WAL, but their LSN remains in the
+		// superblock. New writes must advance past it after a clean reopen
+		// or the next recovery would skip those writes as checkpointed.
+		p.wal.SetNextLSN(LSN(p.sb.CheckpointLSN) + 1)
 		return nil
 	}
 
 	txMap, maxLSN, maxTxID := recoverClassifyWAL(records)
+	if checkpointLSN := LSN(p.sb.CheckpointLSN); maxLSN < checkpointLSN {
+		// A crash after flushing the checkpoint but before truncating the
+		// WAL may leave only older records. Never move the counter back.
+		maxLSN = checkpointLSN
+	}
 
 	applied, err := p.recoverApplyPages(txMap)
 	if err != nil {

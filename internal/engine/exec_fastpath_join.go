@@ -42,8 +42,8 @@ func executeSimpleJoinFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error)
 		if leftKey == nil {
 			continue
 		}
-		matches := rightByKey[comparableKeyPart(leftKey)]
-		for _, right := range matches {
+		for rowID := rightByKey.first(comparableKeyPart(leftKey)); rowID != 0; rowID = rightByKey.after(rowID) {
+			right := rightByKey.rows[rowID-1]
 			match, err := evalJoinRawWhere(plan, left, right)
 			if err != nil {
 				return nil, true, err
@@ -61,23 +61,56 @@ func executeSimpleJoinFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error)
 	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, true, nil
 }
 
+// Row IDs are one-based so zero is both a missing bucket and the end of a
+// chain. Unique keys need only a map entry; the shared link array is allocated
+// lazily on the first duplicate. Appending to each bucket's tail preserves
+// right-input encounter order without a separate slice allocation per key.
+type simpleJoinMatchRange struct {
+	first, last int
+}
+
+type simpleJoinRightIndex struct {
+	rows  [][]any
+	byKey map[any]simpleJoinMatchRange
+	next  []int
+}
+
+func (index *simpleJoinRightIndex) first(key any) int { return index.byKey[key].first }
+
+func (index *simpleJoinRightIndex) after(rowID int) int {
+	if index.next == nil {
+		return 0
+	}
+	return index.next[rowID-1]
+}
+
 // rightRowsByKey returns a version-validated index of the right join input.
 // Queries hold the database content read lock for their full execution, so a
 // published index remains immutable while callers use it. Writers obtain the
 // exclusive content lock and increment Table.Version, causing the next query
 // to rebuild the index from the new rows.
-func (p *simpleJoinPlan) rightRowsByKey() (map[any][][]any, error) {
+func (p *simpleJoinPlan) rightRowsByKey() (*simpleJoinRightIndex, error) {
 	cache := &p.rightLookup
 	cache.mu.RLock()
 	if cache.table == p.right && cache.version == p.right.Version {
-		byKey := cache.byKey
+		index := cache.index
 		cache.mu.RUnlock()
-		return byKey, nil
+		return index, nil
 	}
 	cache.mu.RUnlock()
 
-	byKey := make(map[any][][]any, len(p.right.Rows))
-	for _, right := range p.right.Rows {
+	// Serialize cache misses. Concurrent first executions share one build
+	// instead of allocating a complete right-input index in every goroutine.
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if cache.table == p.right && cache.version == p.right.Version {
+		return cache.index, nil
+	}
+	index := &simpleJoinRightIndex{
+		rows:  p.right.Rows,
+		byKey: make(map[any]simpleJoinMatchRange, len(p.right.Rows)),
+	}
+	for i, right := range index.rows {
 		if p.rightFilter != nil {
 			match, err := p.rightFilter(right)
 			if err != nil {
@@ -95,18 +128,23 @@ func (p *simpleJoinPlan) rightRowsByKey() (map[any][][]any, error) {
 			continue
 		}
 		key := comparableKeyPart(keyVal)
-		byKey[key] = append(byKey[key], right)
-	}
-
-	cache.mu.Lock()
-	defer cache.mu.Unlock()
-	if cache.table == p.right && cache.version == p.right.Version {
-		return cache.byKey, nil
+		rowID := i + 1
+		bucket := index.byKey[key]
+		if bucket.first == 0 {
+			bucket.first = rowID
+		} else {
+			if index.next == nil {
+				index.next = make([]int, len(index.rows))
+			}
+			index.next[bucket.last-1] = rowID
+		}
+		bucket.last = rowID
+		index.byKey[key] = bucket
 	}
 	cache.table = p.right
 	cache.version = p.right.Version
-	cache.byKey = byKey
-	return byKey, nil
+	cache.index = index
+	return index, nil
 }
 
 func buildSimpleJoinPlan(env ExecEnv, s *Select) (*simpleJoinPlan, bool, error) {

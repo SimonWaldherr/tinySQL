@@ -14,10 +14,13 @@ func scalarDistinctKey(v any) (any, bool) {
 }
 
 // COUNT(DISTINCT) historically deduplicates by valueText, unlike SELECT
-// DISTINCT's typed keys. Reuse a buffer but preserve that exact equivalence.
+// DISTINCT's typed keys. Integer-only inputs can use exact integer keys without
+// formatting every row. The first other non-NULL type migrates those keys to
+// text, preserving equivalences such as int(1), int64(1), 1.0 and "1".
 type distinctCountSet struct {
-	seen map[string]struct{}
-	buf  []byte
+	integers map[int64]struct{}
+	seen     map[string]struct{}
+	buf      []byte
 }
 
 func (s *distinctCountSet) add(v any) bool {
@@ -25,7 +28,31 @@ func (s *distinctCountSet) add(v any) bool {
 		return false
 	}
 	if s.seen == nil {
-		s.seen = make(map[string]struct{})
+		var integer int64
+		integerValue := true
+		switch x := v.(type) {
+		case int:
+			integer = int64(x)
+		case int64:
+			integer = x
+		default:
+			integerValue = false
+		}
+		if integerValue {
+			if _, exists := s.integers[integer]; exists {
+				return false
+			}
+			if s.integers == nil {
+				s.integers = make(map[int64]struct{})
+			}
+			s.integers[integer] = struct{}{}
+			return true
+		}
+		s.seen = make(map[string]struct{}, len(s.integers)+1)
+		for integer := range s.integers {
+			s.seen[strconv.FormatInt(integer, 10)] = struct{}{}
+		}
+		s.integers = nil
 	}
 	if text, ok := v.(string); ok {
 		if _, exists := s.seen[text]; exists {

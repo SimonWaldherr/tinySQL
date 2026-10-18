@@ -214,3 +214,65 @@ go test ./benchmarks -run '^$' \
   -bench 'TileLookup4k|TileLookup64k|TileLookupOnDisk|ViewportIndexed|CategoryInViewport' -benchmem
 go test ./internal/engine -run 'ExecuteStream' -race -count=1
 ```
+
+## JOINs and subqueries (2026-10-18)
+
+Raw equi-JOINs index right-side row positions instead of allocating a separate
+slice for every key. Buckets keep their original encounter order. A shared
+link array is allocated only when duplicates occur; unique keys need none.
+Prepared plain JOINs and JOIN aggregates share this representation, and
+concurrent cold queries build each version's index once. Table identity and
+version still control invalidation after writes or replacement.
+
+General hash JOINs use the same principle with bucket heads and positions in
+the chosen build input. Build/probe orientation and outer-JOIN padding are
+unchanged. Both implementations preserve their existing key semantics and
+fall back for the same unsupported join conditions as before.
+
+Direct `IN (SELECT ...)` queries cache a compact membership set per execution.
+Suitable integer, REAL, text and boolean probes use hash lookups instead of
+scanning every candidate for every outer row. Integer equality stays exact;
+cross-REAL comparisons use the existing rounded comparison rules. Small sets
+and other probe types retain the comparison kernel. NULL, NOT IN, empty sets,
+scalar-subquery cardinality and trigger/correlation cache restrictions remain
+covered by regressions. The cache stores values and indices rather than
+retaining one result Row map per inner row. Building the hash index allocates
+additional scratch; this is a speed/retention tradeoff, not a reduction in
+total allocated bytes for every IN query.
+
+FROM/JOIN subqueries with narrow projections reuse their exclusively owned
+result maps when adding source aliases. Shared CTE/table-function results
+still copy. Wide projections retain the correctly sized copying path because
+growing their maps in place increased temporary allocations in measurements.
+
+Measurements below use Apple M2 Max, Go 1.27.2, darwin/arm64. Fixtures and
+parsing are outside the timed section. Index-building samples used
+`-cpu=1 -p=1 -benchtime=300ms -count=3`; the numbers are workload-specific.
+The baseline kernels are from `736b9a2`, with other working-tree changes
+present during measurement. These are development measurements rather than
+comparisons of clean releases. The commands below measure the current tree;
+the general hash-JOIN benchmark also retains the former slice layout as a
+same-process control.
+
+| Workload | Bytes/op before → after | Allocations before → after |
+| --- | ---: | ---: |
+| Raw JOIN index, 50,000 unique right keys | 4,348,336 → 2,624,112 | 50,130 → 131 |
+| Raw JOIN index, 50,000 rows / 500 keys | 6,912,336 → 3,025,520 | 4,130 → 132 |
+| General JOIN, 32,768 unique build keys, no matches | ~6,815,000 → ~3,757,000 | 33,042 → 274 |
+| General JOIN, 32,768 build rows / 256 keys, no matches | ~860,000 → ~551,000 | 2,062 → 15 |
+| FROM subquery, 50,000 rows / 2 projected columns | 34,403,364 → 17,201,980 | 200,007 → 100,006 |
+
+Raw unique-key index construction measured median 5.85 ms before and 2.79 ms
+after; repeated-key construction measured 4.21 ms and 2.62 ms. Warm prepared
+JOIN-COUNT controls retained their allocation profile and showed no material
+latency regression. An IN query with 4,000 outer rows and 2,000 inner values
+measured 95.65 → 1.75 ms for integers and 105.24 → 4.58 ms for text in initial
+local samples. The additional index scratch was about 0.18 MB and 0.25 MB per
+query respectively. Concurrent host load caused substantial timing variance,
+so these samples do not establish a universal speedup.
+
+```sh
+go test ./internal/engine -run 'TestRawJoin|TestCompactHashJoin|TestInSubqueryMembership|TestDerivedSubquery|TestOwnedSubqueryAliasing' -count=1
+go test ./internal/engine -run '^$' -bench '^(BenchmarkRawJoinLookupBuild|BenchmarkRawJoinLargePrepared|BenchmarkGeneralHashJoinCompact|BenchmarkInSubqueryManyRows|BenchmarkDerivedSubqueryRows)$' -benchmem -benchtime=300ms -count=3 -cpu=1 -p=1
+go test -race ./internal/engine -run 'TestRawJoin|TestCompactHashJoin|TestInSubqueryMembership|TestDerivedSubquery|TestOwnedSubqueryAliasing' -count=1
+```

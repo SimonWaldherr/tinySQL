@@ -68,11 +68,12 @@ type (
 		// goroutines stays race-free.
 		handlerIdx int32
 	}
-	// InExpr represents "expr IN (val1, val2, ...)"
+	// InExpr represents "expr IN (val1, val2, ...)" or "expr IN (SELECT ...)".
 	InExpr struct {
-		Expr   Expr
-		Values []Expr
-		Negate bool // For NOT IN
+		Expr     Expr
+		Values   []Expr
+		Negate   bool // For NOT IN
+		Subquery bool // Values contains one set-valued SubqueryExpr, not a scalar list item.
 	}
 	// LikeExpr represents "expr LIKE pattern [ESCAPE char]"
 	LikeExpr struct {

@@ -82,8 +82,8 @@ var demoQueries = map[string]string{
 
 	// Subqueries & Advanced
 	"subquery_avg": "SELECT id, user_id, amount, status FROM orders WHERE amount > (SELECT AVG(amount) FROM orders WHERE status = 'PAID') ORDER BY amount DESC",
+	"in_subquery":  "SELECT name, email FROM users WHERE active = TRUE AND id IN (SELECT DISTINCT user_id FROM orders WHERE status = 'PAID') ORDER BY name",
 	// "exists_clause":     "SELECT u.name, u.email FROM users u WHERE EXISTS (SELECT 1 FROM events e WHERE e.user_id = u.id) ORDER BY u.name", // NOT SUPPORTED YET
-	// "in_subquery":       "SELECT name, email FROM users WHERE active = TRUE AND id IN (SELECT DISTINCT user_id FROM orders WHERE status = 'PAID') ORDER BY name", // SUBQUERY IN IN NOT SUPPORTED
 	// "correlated_subquery": "SELECT u.name, o.id, o.amount, o.status FROM users u JOIN orders o ON u.id = o.user_id WHERE o.id = (SELECT MIN(id) FROM orders o2 WHERE o2.user_id = u.id) ORDER BY o.amount DESC", // SUBQUERY IN WHERE NOT SUPPORTED
 
 	// Filtering & Conditions
@@ -155,6 +155,7 @@ func TestProblematicQueries(t *testing.T) {
 		sql         string
 		expectError bool
 		reason      string
+		wantNames   []string
 	}{
 		{
 			name:        "COALESCE in aggregate",
@@ -176,9 +177,10 @@ func TestProblematicQueries(t *testing.T) {
 		},
 		{
 			name:        "IN with subquery",
-			sql:         "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders WHERE status = 'PAID')",
-			expectError: true, // Subquery in IN not supported
-			reason:      "Subquery in IN clause not implemented",
+			sql:         "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders WHERE status = 'PAID') ORDER BY name",
+			expectError: false,
+			reason:      "IN should compare against every row of the subquery",
+			wantNames:   []string{"Alice", "Bob"},
 		},
 	}
 
@@ -195,7 +197,7 @@ func TestProblematicQueries(t *testing.T) {
 				return
 			}
 
-			_, err = engine.Execute(ctx, db, tenant, stmt)
+			rs, err := engine.Execute(ctx, db, tenant, stmt)
 			if err != nil {
 				if !tt.expectError {
 					t.Errorf("Unexpected execute error: %v\nReason: %s", err, tt.reason)
@@ -204,6 +206,15 @@ func TestProblematicQueries(t *testing.T) {
 				}
 			} else if tt.expectError {
 				t.Errorf("Expected error but query succeeded\nReason: %s", tt.reason)
+			} else if tt.wantNames != nil {
+				if len(rs.Rows) != len(tt.wantNames) {
+					t.Fatalf("got %d rows, want %d", len(rs.Rows), len(tt.wantNames))
+				}
+				for i, want := range tt.wantNames {
+					if got := rs.Rows[i]["name"]; got != want {
+						t.Errorf("row %d: name=%v, want %s", i, got, want)
+					}
+				}
 			}
 		})
 	}

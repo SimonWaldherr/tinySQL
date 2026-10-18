@@ -348,7 +348,10 @@ func applySortOrderWithLimitSingle(orderBy OrderItem, outRows []Row, limit, offs
 	}
 
 	var items []orderedValueRowSingle
-	useTopN := limit != nil && keepCount > 0 && keepCount < len(outRows)
+	// Match the multi-column cutover: keeping almost every row in a heap
+	// adds work before sorting the same page. A full sort also preserves
+	// pdqsort's linear behavior for already ordered input.
+	useTopN := limit != nil && keepCount < len(outRows) && keepCount <= len(outRows)-len(outRows)/10
 	var topRows orderedValueRowSingleHeap
 	if useTopN {
 		topRows = orderedValueRowSingleHeap{
@@ -356,7 +359,7 @@ func applySortOrderWithLimitSingle(orderBy OrderItem, outRows []Row, limit, offs
 			items: make([]orderedValueRowSingle, 0, min(cap(outRows), keepCount)),
 		}
 	} else {
-		items = make([]orderedValueRowSingle, 0, min(cap(outRows), keepCount))
+		items = make([]orderedValueRowSingle, 0, len(outRows))
 	}
 
 	for i, row := range outRows {
@@ -376,8 +379,8 @@ func applySortOrderWithLimitSingle(orderBy OrderItem, outRows []Row, limit, offs
 		items: items,
 	})
 
-	sorted := make([]Row, len(items))
-	for i, item := range items {
+	sorted := make([]Row, keepCount)
+	for i, item := range items[:keepCount] {
 		sorted[i] = item.row
 	}
 	return sorted

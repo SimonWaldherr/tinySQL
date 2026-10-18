@@ -233,11 +233,8 @@ func TestSubqueryCacheIntegration_UncorrelatedInSubqueryExecutesOnce(t *testing.
 	ctx := context.Background()
 	mustExec(t, db, ctx, "CREATE TABLE outer_t (x INT)")
 	mustExec(t, db, ctx, "CREATE TABLE small_table (y INT)")
-	// Exactly one row: evalSubqueryExpr (which the IN (SELECT ...) form
-	// reaches through evalExpr's generic *SubqueryExpr dispatch -- see its
-	// doc comment) requires a scalar (0- or 1-row) result independently of
-	// this cache, a pre-existing constraint this test does not exercise.
 	mustExec(t, db, ctx, "INSERT INTO small_table VALUES (4)")
+	mustExec(t, db, ctx, "INSERT INTO small_table VALUES (18), (NULL), (4)")
 
 	const outerRows = 40
 	for i := 1; i <= outerRows; i++ {
@@ -250,7 +247,7 @@ func TestSubqueryCacheIntegration_UncorrelatedInSubqueryExecutesOnce(t *testing.
 	if err != nil {
 		t.Fatalf("executeSelect failed: %v", err)
 	}
-	if len(rs.Rows) != 1 || rs.Rows[0]["x"] != 4 {
+	if len(rs.Rows) != 2 || rs.Rows[0]["x"] != 4 || rs.Rows[1]["x"] != 18 {
 		t.Fatalf("unexpected result rows: %#v", rs.Rows)
 	}
 

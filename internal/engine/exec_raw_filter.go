@@ -271,22 +271,19 @@ func buildRawAndFilter(colIndex map[string]int, leftExpr, rightExpr Expr) func([
 }
 
 func buildRawAndFilterWithFallback(colIndex map[string]int, expr Expr, fastFilter func([]any) (bool, error)) func([]any) (bool, error) {
-	// Eager, not lazy: this plan is captured by the closure below, and that
-	// closure can end up in a cached plan template (see
-	// loadSimpleSelectPlanTemplate) shared by concurrently executing
-	// statements. Building rowTextCols on first use would then be a write
-	// from two goroutines at once.
-	plan := &simpleSelectPlan{colIndex: colIndex, rowTextCols: rawRowTextColumns(colIndex)}
+	// A compilable sibling does not make this expression raw-evaluable.
+	// In particular, subqueries must force the complete predicate back to
+	// the general evaluator, even when the other side is a simple comparison.
+	fallback := buildRawExprFilter(colIndex, expr)
+	if fallback == nil {
+		return nil
+	}
 	return func(raw []any) (bool, error) {
 		fast, err := fastFilter(raw)
 		if err != nil || !fast {
 			return false, err
 		}
-		v, err := evalRawExpr(plan, raw, expr)
-		if err != nil {
-			return false, err
-		}
-		return toTri(v) == tvTrue, nil
+		return fallback(raw)
 	}
 }
 
@@ -341,22 +338,18 @@ func buildRawOrFilter(colIndex map[string]int, leftExpr, rightExpr Expr) func([]
 }
 
 func buildRawOrFilterWithFallback(colIndex map[string]int, expr Expr, fastFilter func([]any) (bool, error)) func([]any) (bool, error) {
-	// Eager, not lazy: this plan is captured by the closure below, and that
-	// closure can end up in a cached plan template (see
-	// loadSimpleSelectPlanTemplate) shared by concurrently executing
-	// statements. Building rowTextCols on first use would then be a write
-	// from two goroutines at once.
-	plan := &simpleSelectPlan{colIndex: colIndex, rowTextCols: rawRowTextColumns(colIndex)}
+	// Share the same admissibility checks as the standalone fallback and
+	// buildRawAndFilterWithFallback; OR cannot evaluate subqueries on raw rows.
+	fallback := buildRawExprFilter(colIndex, expr)
+	if fallback == nil {
+		return nil
+	}
 	return func(raw []any) (bool, error) {
 		fast, err := fastFilter(raw)
 		if err != nil || fast {
 			return fast, err
 		}
-		v, err := evalRawExpr(plan, raw, expr)
-		if err != nil {
-			return false, err
-		}
-		return toTri(v) == tvTrue, nil
+		return fallback(raw)
 	}
 }
 

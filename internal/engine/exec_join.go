@@ -21,16 +21,7 @@ func processJoins(env ExecEnv, joins []JoinClause, cur []Row) ([]Row, error) {
 			if err != nil {
 				return nil, err
 			}
-			rightRows = make([]Row, len(subRs.Rows))
-			for i, row := range subRs.Rows {
-				rightRows[i] = make(Row)
-				for k, v := range row {
-					rightRows[i][strings.ToLower(k)] = v
-					if j.Right.Alias != "" {
-						rightRows[i][strings.ToLower(j.Right.Alias+"."+k)] = v
-					}
-				}
-			}
+			rightRows = aliasOwnedRows(subRs.Rows, j.Right.Alias)
 			// build synthetic table metadata
 			cols := make([]storage.Column, 0, len(subRs.Cols))
 			for _, c := range subRs.Cols {

@@ -168,7 +168,7 @@ func TestAggregateBatchFallbackShapes(t *testing.T) {
 		`SELECT MIN(amount),SUM(amount) FROM batch_facts`,
 		`SELECT COUNT(DISTINCT amount),SUM(amount) FROM batch_facts`,
 		`SELECT SUM(amount+1) FROM batch_facts`,
-		`SELECT COUNT(*) FROM batch_facts`,
+		`SELECT COUNT(amount+1) FROM batch_facts`,
 	} {
 		plan, ok, err := buildSimpleAggregatePlan(env, mustParse(sql).(*Select))
 		if !ok || err != nil {

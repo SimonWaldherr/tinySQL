@@ -111,7 +111,7 @@ func TestSimpleJoinFastPathCachesAndInvalidatesRightLookup(t *testing.T) {
 
 	plan.rightLookup.mu.RLock()
 	lookupVersion := plan.rightLookup.version
-	lookupRows := len(plan.rightLookup.byKey)
+	lookupRows := len(plan.rightLookup.index.byKey)
 	plan.rightLookup.mu.RUnlock()
 	if lookupVersion != plan.right.Version || lookupRows != 2 {
 		t.Fatalf("right lookup not rebuilt for version %d: version=%d keys=%d", plan.right.Version, lookupVersion, lookupRows)

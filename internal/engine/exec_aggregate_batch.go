@@ -1,6 +1,9 @@
 package engine
 
-import "fmt"
+import (
+	"fmt"
+	"math/bits"
+)
 
 // Batches are query-local scratch, never a second copy of a table. Keeping the
 // source as row IDs lets filtering precede column extraction and bounds memory
@@ -41,7 +44,7 @@ func aggregateBatchEligible(plan *simpleAggregatePlan, source *simpleSelectPlan)
 		return false
 	}
 	// Validate the whole shape before allocating any batch scratch.
-	hasNumeric := false
+	hasAggregate := false
 	for _, proj := range plan.projs {
 		switch proj.kind {
 		case aggGroupCol:
@@ -50,16 +53,17 @@ func aggregateBatchEligible(plan *simpleAggregatePlan, source *simpleSelectPlan)
 			if proj.arg != nil && proj.argColumn == 0 {
 				return false
 			}
+			hasAggregate = true
 		case aggSum, aggAvg:
 			if proj.argColumn == 0 {
 				return false
 			}
-			hasNumeric = true
+			hasAggregate = true
 		default:
 			return false
 		}
 	}
-	return hasNumeric
+	return hasAggregate
 }
 
 func buildAggregateBatch(plan *simpleAggregatePlan, source *simpleSelectPlan) ([]aggregateBatchColumn, []aggregateBatchOp, bool) {
@@ -286,9 +290,18 @@ func accumulateWholeBatch(state *simpleAggregateState, n int, cols []aggregateBa
 		return
 	}
 	col := &cols[op.column]
+	if op.kind == aggCount {
+		// Extraction already built one validity bitmap for every projection
+		// of this column. Count its words instead of rescanning each row.
+		// Unused bits in a partial batch are zeroed during extraction.
+		for _, word := range col.valid[:(n+63)/64] {
+			state.counts[p] += bits.OnesCount64(word)
+		}
+		return
+	}
 	count, acc := state.counts[p], &state.sums[p]
 	switch {
-	case op.kind == aggCount || (!col.hasInt && !col.hasFloat):
+	case !col.hasInt && !col.hasFloat:
 		for i := 0; i < n; i++ {
 			if col.valid[i/64]&(uint64(1)<<uint(i%64)) != 0 {
 				count++

@@ -132,6 +132,28 @@ not lose data), and only move to `Hybrid`/`Index`/`PagedIndex` once you've
 actually measured that the dataset doesn't fit in memory — most applications
 never need to.
 
+### Pager crash recovery
+
+The page-based pager replays the newest committed WAL image for each page,
+chosen by its log sequence number (LSN). Aborted and uncommitted images and
+images at or below the checkpoint watermark are ignored. Repeated updates to
+one page therefore require only one recovery write and cannot overwrite the
+latest committed version through unordered transaction iteration.
+
+After reopening a checkpointed database, new WAL sequence numbers advance past
+the persisted checkpoint even when the WAL is empty. This prevents later
+recovery from skipping newly committed changes as if they were already
+checkpointed. The file format is unchanged. This is the pager's WAL protocol;
+the `wal` and `advanced_wal` storage modes have separate recovery paths.
+
+Regression tests simulate commits followed by a crash without checkpointing,
+including the sequence close, reopen, commit, crash, reopen:
+
+```sh
+go test ./internal/storage/pager -run TestRecovery -count=3
+go test -race ./internal/storage/pager -run TestRecovery -count=3
+```
+
 ### Online snapshots and backups
 
 `SaveToFile`, `SaveToWriter`, and `SaveToBytes` capture tables and catalog as

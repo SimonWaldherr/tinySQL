@@ -710,7 +710,9 @@ func (p *Parser) parseOrderByOrdinal(sel *Select) (string, error) {
 }
 
 func (p *Parser) parseLimitOffset(sel *Select) error {
+	limitSpecified := false
 	if p.cur.Typ == tKeyword && p.cur.Val == "LIMIT" {
+		limitSpecified = true
 		p.next()
 		n, err := p.parseLimitOffsetValue("LIMIT")
 		if err != nil {
@@ -726,22 +728,29 @@ func (p *Parser) parseLimitOffset(sel *Select) error {
 		}
 		sel.Offset = n
 	}
-	// SQL:2008 alternate syntax: OFFSET n ROWS [FETCH {FIRST|NEXT} m {ROW|ROWS} ONLY].
-	// The bare "ROWS" after a numeric OFFSET is optional noise words.
-	if p.cur.Typ == tKeyword && p.cur.Val == "ROWS" && sel.Offset != nil {
+	// SQL:2008 permits singular ROW as well as ROWS, and a FETCH without
+	// an explicit count requests one row.
+	if p.cur.Typ == tKeyword && (p.cur.Val == "ROW" || p.cur.Val == "ROWS") && sel.Offset != nil {
 		p.next()
 	}
 	if p.cur.Typ == tKeyword && p.cur.Val == "FETCH" {
+		if limitSpecified {
+			return p.errf("LIMIT and FETCH cannot be combined")
+		}
 		p.next()
 		if p.cur.Typ != tKeyword || (p.cur.Val != "FIRST" && p.cur.Val != "NEXT") {
 			return p.errf("expected FIRST or NEXT after FETCH")
 		}
 		p.next()
-		n, err := p.parseLimitOffsetValue("FETCH")
-		if err != nil {
-			return err
+		n := 1
+		if p.cur.Typ != tKeyword || (p.cur.Val != "ROW" && p.cur.Val != "ROWS") {
+			count, err := p.parseLimitOffsetValue("FETCH")
+			if err != nil {
+				return err
+			}
+			n = *count
 		}
-		sel.Limit = n
+		sel.Limit = &n
 		if p.cur.Typ != tKeyword || (p.cur.Val != "ROW" && p.cur.Val != "ROWS") {
 			return p.errf("expected ROW or ROWS after FETCH count")
 		}
@@ -754,13 +763,16 @@ func (p *Parser) parseLimitOffset(sel *Select) error {
 }
 
 // parseLimitOffsetValue parses a LIMIT/OFFSET/FETCH value: either the
-// SQL-standard "ALL" (no limit — returns nil, nil), or a constant integer
+// "ALL" for LIMIT (no limit — returns nil, nil), or a constant integer
 // expression evaluated immediately (LIMIT/OFFSET are resolved before
 // execution, not per-row), e.g. a bare literal or arithmetic like "2 + 3".
 // Non-constant expressions (column references, subqueries) are rejected
 // with a clear error.
 func (p *Parser) parseLimitOffsetValue(clause string) (*int, error) {
 	if p.cur.Typ == tKeyword && p.cur.Val == "ALL" {
+		if clause != "LIMIT" {
+			return nil, p.errf("%s expects a non-negative integer, not ALL", clause)
+		}
 		p.next()
 		return nil, nil
 	}
@@ -772,17 +784,34 @@ func (p *Parser) parseLimitOffsetValue(clause string) (*int, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s must be a constant expression: %w", clause, err)
 	}
+	// Preserve engine integers exactly. Converting through float64 rounds
+	// values above 2^53 and can even reject a valid MaxInt as an overflow.
+	if i, ok := integerOperand(val); ok {
+		if i < 0 {
+			return nil, fmt.Errorf("%s must be non-negative, got %d", clause, i)
+		}
+		if i > int64(math.MaxInt) {
+			return nil, fmt.Errorf("%s exceeds the maximum supported integer", clause)
+		}
+		n := int(i)
+		return &n, nil
+	}
 	f, ok := numeric(val)
 	if !ok {
 		return nil, fmt.Errorf("%s expects an integer, got %T", clause, val)
 	}
-	if f != math.Trunc(f) {
+	if math.IsNaN(f) || math.IsInf(f, 0) || f != math.Trunc(f) {
 		return nil, fmt.Errorf("%s expects an integer, got %v", clause, f)
 	}
-	n := int(f)
-	if n < 0 {
-		return nil, fmt.Errorf("%s must be non-negative, got %d", clause, n)
+	if f < 0 {
+		return nil, fmt.Errorf("%s must be non-negative, got %v", clause, f)
 	}
+	// Use the exclusive power-of-two bound: float64(MaxInt) rounds up on
+	// 64-bit hosts, so comparing against it with '>' admits an overflow.
+	if f >= math.Ldexp(1, strconv.IntSize-1) {
+		return nil, fmt.Errorf("%s exceeds the maximum supported integer", clause)
+	}
+	n := int(f)
 	return &n, nil
 }
 

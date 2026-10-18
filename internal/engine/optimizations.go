@@ -132,8 +132,9 @@ func (h *HashJoinOptimizer) processHashJoin(leftRows, rightRows []Row, condition
 	// For INNER JOIN, build from the smaller relation to minimise hash table size.
 	var buildRows, probeRows []Row
 	var buildColumn, probeColumn string
+	probeIsLeft := joinType == OptimizedJoinTypeLeft || len(leftRows) > len(rightRows)
 
-	if joinType == OptimizedJoinTypeLeft || len(leftRows) > len(rightRows) {
+	if probeIsLeft {
 		// probe = left, build = right
 		buildRows = rightRows
 		probeRows = leftRows
@@ -155,15 +156,26 @@ func (h *HashJoinOptimizer) processHashJoin(leftRows, rightRows []Row, condition
 	lowerBuildColumn := strings.ToLower(buildColumn)
 	lowerProbeColumn := strings.ToLower(probeColumn)
 
-	// Build hash table
-	hashTable := make(map[any][]Row)
-	for _, row := range buildRows {
+	// Store bucket heads as one-based positions in a contiguous chain arena.
+	// Keeping rows in buildRows avoids one separately allocated []Row per
+	// distinct key and reduces each hash entry from a slice header to an int.
+	// Prepending in reverse input order preserves duplicate-match ordering.
+	hashTable := make(map[any]int)
+	var next []int
+	for i := len(buildRows) - 1; i >= 0; i-- {
 		if err := checkCtx(h.env.ctx); err != nil {
 			return nil, err
 		}
-		key := h.getJoinKey(row, buildColumn, lowerBuildColumn)
+		key := h.getJoinKey(buildRows[i], buildColumn, lowerBuildColumn)
 		if key != nil {
-			hashTable[key] = append(hashTable[key], row)
+			if previous := hashTable[key]; previous != 0 {
+				if next == nil {
+					// Unique and all-NULL keys need no chain arena at all.
+					next = make([]int, len(buildRows))
+				}
+				next[i] = previous
+			}
+			hashTable[key] = i + 1
 		}
 	}
 
@@ -183,18 +195,21 @@ func (h *HashJoinOptimizer) processHashJoin(leftRows, rightRows []Row, condition
 		matched := false
 
 		if key != nil {
-			if matchingRows, exists := hashTable[key]; exists {
-				for _, buildRow := range matchingRows {
-					// probeRow is always left when joinType == Left, or right when Inner+right>left
-					var mergedRow Row
-					if joinType == OptimizedJoinTypeLeft || len(leftRows) > len(rightRows) {
-						mergedRow = mergeRows(probeRow, buildRow) // left=probe, right=build
-					} else {
-						mergedRow = mergeRows(buildRow, probeRow) // left=build, right=probe
-					}
-					result = append(result, mergedRow)
-					matched = true
+			for position := hashTable[key]; position != 0; {
+				buildRow := buildRows[position-1]
+				// probeRow is always left when joinType == Left, or right when Inner+right>left
+				var mergedRow Row
+				if probeIsLeft {
+					mergedRow = mergeRows(probeRow, buildRow) // left=probe, right=build
+				} else {
+					mergedRow = mergeRows(buildRow, probeRow) // left=build, right=probe
 				}
+				result = append(result, mergedRow)
+				matched = true
+				if next == nil {
+					break
+				}
+				position = next[position-1]
 			}
 		}
 

@@ -87,6 +87,39 @@ behavior. A CTE of the same name takes precedence. This does not add lateral
 or correlated JOIN sources. The Game of Life demo now exercises `%` and a
 direct join against a view: `go run ./cmd/gameoflife -steps 100`.
 
+## Subquery membership and pagination
+
+`IN (SELECT ...)` and `NOT IN (SELECT ...)` compare against every row of a
+one-column result. Duplicate candidates do not change membership. A matching
+value takes precedence over NULL candidates; without a match, a NULL candidate
+makes the result unknown. An empty subquery yields FALSE for IN and TRUE for
+NOT IN, including a NULL left operand. Direct `IN (WITH ... SELECT ...)` also
+works. Results are cached only within an execution when the existing subquery
+cache proves it safe.
+
+AND/OR filters with a subquery fall back to the general evaluator. A simple
+sibling comparison no longer sends an unsupported IN, scalar or EXISTS
+subquery into the raw-row evaluator.
+
+Scalar subqueries still allow at most one row and now require exactly one
+column, including when they return no rows. An additional pair of parentheses,
+as in `IN ((SELECT ...))`, keeps the subquery scalar and retains its cardinality
+check.
+
+Pagination accepts `OFFSET n ROW` as well as `ROWS`, and a FETCH clause without
+a count defaults to one row:
+
+```sql
+SELECT id FROM numbers ORDER BY id OFFSET 2 ROW FETCH NEXT ROW ONLY;
+```
+
+These forms follow the [SQL:2008 pagination syntax documented by PostgreSQL](https://www.postgresql.org/docs/17/sql-select.html#SQL-LIMIT).
+`LIMIT ALL` remains supported; `OFFSET ALL`, `FETCH FIRST ALL ROWS ONLY` and
+combining LIMIT with FETCH are rejected. Integer bounds remain exact above
+2^53, up to the platform's maximum `int`; out-of-range bounds are rejected
+before conversion. Both materialized and raw execution paths handle large
+valid limits and offsets without allocating a buffer of that size.
+
 ## Important remaining gaps
 
 | Missing operation | Current boundary | Main implementation work |
@@ -110,6 +143,9 @@ by the additions above.
 go test ./internal/engine -run 'TestModuloOperator|TestLeadingWith|TestViewsAsJoin|TestArithmeticPathsAgree|TestBatchSumMatchesScalarAccumulator|TestIntegerArithmeticSemantics'
 go test ./internal/driver -run TestPreparedLeadingWithInsertAndModulo
 go test ./cmd/gameoflife
+go test ./internal/engine -run 'TestInSubquery|TestInScalarSubquery|TestLogicalSubqueriesDeclineRawFilter|TestSubqueryRequiresSingleColumn|TestSubqueryCache|TestFetchDefaultCountAndSingularOffset|TestPagination'
+go test ./internal/driver -run TestSQLPreparedInSubqueryBindingsAndFetch
+go test ./cmd/wasm_browser
 ```
 
 The regressions cover operator precedence, NULL/zero/negative/decimal operands,

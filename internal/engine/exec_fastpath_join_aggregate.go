@@ -73,8 +73,8 @@ func executeSimpleJoinAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, boo
 		if leftKeyVal == nil {
 			continue
 		}
-		matches := rightByKey[comparableKeyPart(leftKeyVal)]
-		for _, right := range matches {
+		for rowID := rightByKey.first(comparableKeyPart(leftKeyVal)); rowID != 0; rowID = rightByKey.after(rowID) {
+			right := rightByKey.rows[rowID-1]
 			match, err := evalJoinRawWhere(plan.join, left, right)
 			if err != nil {
 				return nil, true, err
@@ -137,7 +137,7 @@ type simpleJoinCountState struct {
 	count      int
 }
 
-func executeSimpleJoinCountStarFastPath(env ExecEnv, plan *simpleJoinAggregatePlan, rightByKey map[any][][]any) (*ResultSet, bool, error) {
+func executeSimpleJoinCountStarFastPath(env ExecEnv, plan *simpleJoinAggregatePlan, rightByKey *simpleJoinRightIndex) (*ResultSet, bool, error) {
 	// Keep the compact states in one contiguous slice. The map only needs an
 	// index, which avoids one heap object for every distinct group.
 	groups := make(map[string]int)
@@ -162,7 +162,8 @@ func executeSimpleJoinCountStarFastPath(env ExecEnv, plan *simpleJoinAggregatePl
 		if leftKey == nil {
 			continue
 		}
-		for _, right := range rightByKey[comparableKeyPart(leftKey)] {
+		for rowID := rightByKey.first(comparableKeyPart(leftKey)); rowID != 0; rowID = rightByKey.after(rowID) {
+			right := rightByKey.rows[rowID-1]
 			match, err := evalJoinRawWhere(plan.join, left, right)
 			if err != nil {
 				return nil, true, err

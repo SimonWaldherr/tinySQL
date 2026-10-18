@@ -39,7 +39,7 @@ func resolveSubquery(env ExecEnv, s *Select) ([]Row, error) {
 	if err != nil {
 		return nil, err
 	}
-	return aliasRows(subResult.Rows, s.From.Alias), nil
+	return aliasOwnedRows(subResult.Rows, s.From.Alias), nil
 }
 
 // derivedKeys are the output map keys a source key contributes: the key itself
@@ -88,6 +88,64 @@ func aliasRows(rows []Row, alias string) []Row {
 		out[i] = dst
 	}
 	return out
+}
+
+// aliasOwnedRows consumes freshly projected subquery rows. executeSelect owns
+// those maps exclusively, so adding source qualifiers does not require a second
+// map and row slice for every result. Shared CTE and table-function results keep
+// using the copying conversions above and below.
+func aliasOwnedRows(rows []Row, alias string) []Row {
+	if rows == nil {
+		return []Row{}
+	}
+	if alias != "" {
+		// Widening a large map may allocate more temporary backing storage
+		// than one correctly sized copy. Reuse narrow projections only;
+		// decide before editing any row so the fallback sees pristine input.
+		for _, row := range rows {
+			if len(row) > 4 {
+				return aliasRows(rows, alias)
+			}
+		}
+	}
+	type cell struct {
+		key   string
+		value any
+	}
+	var cells []cell
+	keys := make(map[string]derivedKeys)
+	lowerAlias := strings.ToLower(alias)
+	for i, row := range rows {
+		// Snapshot original cells before editing: ranging over a map while
+		// adding qualified keys could visit the new keys and qualify them again.
+		// Values must also be captured before a qualified key overwrites an
+		// existing key (for example when an output column itself contains '.').
+		cells = cells[:0]
+		for key, value := range row {
+			cells = append(cells, cell{key: key, value: value})
+		}
+		if row == nil {
+			row = make(Row)
+		} else {
+			clear(row)
+		}
+		for _, c := range cells {
+			dk, ok := keys[c.key]
+			if !ok {
+				dk.plain = strings.ToLower(c.key)
+				if alias != "" {
+					dk.qualified = lowerAlias + "." + dk.plain
+				}
+				keys[c.key] = dk
+			}
+			row[dk.plain] = c.value
+			if alias != "" {
+				row[dk.qualified] = c.value
+			}
+		}
+		rows[i] = row
+	}
+	return rows
 }
 
 // resolveTableFunc handles FROM table-valued function

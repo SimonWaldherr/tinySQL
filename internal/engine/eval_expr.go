@@ -162,6 +162,11 @@ func evalIn(env ExecEnv, ex *InExpr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if ex.Subquery && len(ex.Values) == 1 {
+		if subquery, ok := ex.Values[0].(*SubqueryExpr); ok {
+			return evalInSubquery(env, val, ex, subquery)
+		}
+	}
 	if val == nil {
 		// SQL three-valued logic: NULL IN (...) and NULL NOT IN (...) are
 		// both unknown, not a definite true/false.
@@ -199,6 +204,33 @@ func evalIn(env ExecEnv, ex *InExpr, row Row) (any, error) {
 		return true, nil
 	}
 	return false, nil
+}
+
+// IN compares against every row of a one-column subquery, rather than
+// evaluating it as a scalar expression. An empty result is FALSE even for a
+// NULL probe; for a nonempty result, a match wins over any NULL candidates.
+func evalInSubquery(env ExecEnv, val any, owner *InExpr, ex *SubqueryExpr) (any, error) {
+	set, err := evalCachedInSubquerySet(env, owner, ex.Select)
+	if err != nil {
+		return nil, err
+	}
+	if !set.hasRows {
+		return owner.Negate, nil
+	}
+	if val == nil {
+		return nil, nil
+	}
+	matched, err := set.contains(env, val)
+	if err != nil {
+		return nil, err
+	}
+	if matched {
+		return !owner.Negate, nil
+	}
+	if set.hasNull {
+		return nil, nil
+	}
+	return owner.Negate, nil
 }
 
 func evalLike(env ExecEnv, ex *LikeExpr, row Row) (any, error) {
@@ -486,43 +518,24 @@ func evalCaseExpr(env ExecEnv, ex *CaseExpr, row Row) (any, error) {
 }
 
 func evalSubqueryExpr(env ExecEnv, ex *SubqueryExpr) (any, error) {
-	// Also the path evalIn (evalIn's IN (SELECT ...) form, eval_expr.go)
-	// reaches through evalExpr's generic *SubqueryExpr dispatch: ex.Values
-	// holds a single *SubqueryExpr there, so evalExpr calls this function for
-	// that case too, and this cache lookup covers it for free. See
-	// evalCachedSubquery for how repeated evaluations of the same
-	// *SubqueryExpr node within one statement execution avoid re-running the
-	// subquery when it is safe to do so.
 	rs, err := evalCachedSubquery(env, ex, ex.Select)
 	if err != nil {
 		return nil, err
 	}
-	if rs == nil || len(rs.Rows) == 0 {
+	if rs == nil {
+		return nil, nil
+	}
+	if len(rs.Cols) != 1 {
+		return nil, fmt.Errorf("scalar subquery must return exactly one column, got %d", len(rs.Cols))
+	}
+	if len(rs.Rows) == 0 {
 		return nil, nil
 	}
 	if len(rs.Rows) > 1 {
 		return nil, fmt.Errorf("scalar subquery returned %d rows", len(rs.Rows))
 	}
-	row := rs.Rows[0]
-	if len(rs.Cols) == 1 {
-		if v, ok := getValLower(row, strings.ToLower(rs.Cols[0])); ok {
-			return v, nil
-		}
-	}
-	if len(row) == 1 {
-		for _, v := range row {
-			return v, nil
-		}
-	}
-	for _, col := range rs.Cols {
-		if v, ok := getValLower(row, strings.ToLower(col)); ok {
-			return v, nil
-		}
-	}
-	for _, v := range row {
-		return v, nil
-	}
-	return nil, nil
+	v, _ := getValLower(rs.Rows[0], strings.ToLower(rs.Cols[0]))
+	return v, nil
 }
 
 func evalUnary(env ExecEnv, ex *Unary, row Row) (any, error) {

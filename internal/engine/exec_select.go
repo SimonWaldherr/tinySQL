@@ -504,5 +504,5 @@ type simpleJoinRightLookupCache struct {
 	mu      sync.RWMutex
 	table   *storage.Table
 	version int
-	byKey   map[any][][]any
+	index   *simpleJoinRightIndex
 }

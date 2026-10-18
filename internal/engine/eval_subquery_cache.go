@@ -1,8 +1,6 @@
 // Caching for WHERE/SELECT-list subqueries: EXISTS (...), scalar (SELECT ...)
-// expressions, and the IN (SELECT ...) form (which reaches evalSubqueryExpr
-// through evalExpr's generic *SubqueryExpr dispatch inside evalIn's value
-// loop -- see eval_expr.go). Without this cache, evalExistsExpr and
-// evalSubqueryExpr call executeSelect on the subquery's SELECT every single
+// expressions, and the IN (SELECT ...) form. Without this cache, their
+// evaluators call executeSelect on the subquery's SELECT every single
 // time they are evaluated, which for a subquery inside a WHERE clause means
 // once per outer row (applyWhereClause in exec_join.go). Most such
 // subqueries do not depend on the outer row at all -- e.g.
@@ -18,10 +16,14 @@
 // not part of that check.
 package engine
 
-import "strings"
+import (
+	"fmt"
+	"math"
+	"strings"
+)
 
-// subqueryCacheEntry holds the cached outcome for one *ExistsExpr/
-// *SubqueryExpr AST node, plus the one-time correlation verdict that decides
+// subqueryCacheEntry holds the cached outcome for one *ExistsExpr,
+// *SubqueryExpr or direct *InExpr node, plus the correlation verdict that decides
 // whether caching applies at all.
 type subqueryCacheEntry struct {
 	// correlated is computed once, the first time this node is evaluated
@@ -31,6 +33,7 @@ type subqueryCacheEntry struct {
 	correlated bool
 	ready      bool
 	rs         *ResultSet
+	inSet      *inSubquerySet
 	err        error
 	// execCount counts every actual executeSelect call made for this node,
 	// whether from a cache miss or because correlated/env.triggerRow bypassed
@@ -40,7 +43,7 @@ type subqueryCacheEntry struct {
 	execCount int
 }
 
-// subqueryResultCache memoizes evalCachedSubquery's result per AST node for
+// subqueryResultCache memoizes subquery rows or membership sets per AST node for
 // one statement execution. Like windowPartitionCache (eval_window.go), it is
 // deliberately scoped to a single top-level Execute() call (see its
 // construction in exec_statement.go) rather than kept alive across calls:
@@ -65,7 +68,7 @@ func newSubqueryResultCache() *subqueryResultCache {
 // evalCachedSubquery runs sel -- the SELECT owned by node, an *ExistsExpr or
 // *SubqueryExpr -- and returns its ResultSet, executing it only once per
 // statement execution for nodes proven safe to cache and re-executing on
-// every call otherwise. Callers (evalExistsExpr, evalSubqueryExpr) must treat
+// every call otherwise. Callers must treat
 // the returned *ResultSet as read-only: it may be handed back verbatim on a
 // later call for the same node, so mutating it would corrupt the cache.
 func evalCachedSubquery(env ExecEnv, node Expr, sel *Select) (*ResultSet, error) {
@@ -85,14 +88,7 @@ func evalCachedSubquery(env ExecEnv, node Expr, sel *Select) (*ResultSet, error)
 		// re-execute in both cases.
 		return executeSelect(env, sel)
 	}
-	entry, ok := cache.entries[node]
-	if !ok {
-		entry = &subqueryCacheEntry{correlated: isSelectCorrelated(sel)}
-		if cache.entries == nil {
-			cache.entries = make(map[Expr]*subqueryCacheEntry, 1)
-		}
-		cache.entries[node] = entry
-	}
+	entry := cache.entry(node, sel)
 	if entry.correlated {
 		entry.execCount++
 		return executeSelect(env, sel)
@@ -103,6 +99,209 @@ func evalCachedSubquery(env ExecEnv, node Expr, sel *Select) (*ResultSet, error)
 		entry.execCount++
 	}
 	return entry.rs, entry.err
+}
+
+func (cache *subqueryResultCache) entry(node Expr, sel *Select) *subqueryCacheEntry {
+	entry := cache.entries[node]
+	if entry == nil {
+		entry = &subqueryCacheEntry{correlated: isSelectCorrelated(sel)}
+		if cache.entries == nil {
+			cache.entries = make(map[Expr]*subqueryCacheEntry, 1)
+		}
+		cache.entries[node] = entry
+	}
+	return entry
+}
+
+// A direct IN node owns its membership cache separately from its SubqueryExpr.
+// This permits discarding result Row maps without affecting a scalar use of
+// the same subquery node in a hand-built AST. Parsed ASTs are never mutated.
+func evalCachedInSubquerySet(env ExecEnv, owner *InExpr, sel *Select) (*inSubquerySet, error) {
+	cache := env.subqueryCache
+	if cache == nil || env.triggerRow != nil {
+		rs, err := executeSelect(env, sel)
+		if err != nil {
+			return nil, err
+		}
+		return buildInSubquerySet(env, rs, false)
+	}
+	entry := cache.entry(owner, sel)
+	if entry.correlated {
+		entry.execCount++
+		rs, err := executeSelect(env, sel)
+		if err != nil {
+			return nil, err
+		}
+		return buildInSubquerySet(env, rs, false)
+	}
+	if !entry.ready {
+		entry.execCount++
+		rs, err := executeSelect(env, sel)
+		if err == nil {
+			entry.inSet, err = buildInSubquerySet(env, rs, true)
+		}
+		entry.err, entry.ready = err, true
+	}
+	return entry.inSet, entry.err
+}
+
+// Retain values rather than one Row map per candidate. Unsupported probe
+// types continue to use compare in input order; common types use typed sets.
+// Integer and REAL sets are separate because int64 equality is exact while
+// comparisons involving a REAL intentionally round integers to float64.
+type inSubquerySet struct {
+	values       []any
+	integers     map[int64]struct{}
+	reals        map[float64]struct{}
+	integerReals map[float64]struct{} // built only for REAL probes
+	texts        map[string]struct{}
+	booleans     uint8
+	hasRows      bool
+	hasNull      bool
+	hasNaN       bool
+	indexed      bool
+}
+
+// Tiny sets are cheaper to scan than to index, while still dropping Row maps.
+const inSubqueryIndexMinRows = 16
+
+func buildInSubquerySet(env ExecEnv, rs *ResultSet, index bool) (*inSubquerySet, error) {
+	set := &inSubquerySet{}
+	if rs == nil {
+		return set, nil
+	}
+	if len(rs.Cols) != 1 {
+		return nil, fmt.Errorf("IN subquery must return exactly one column, got %d", len(rs.Cols))
+	}
+	set.hasRows = len(rs.Rows) > 0
+	set.indexed = index && len(rs.Rows) >= inSubqueryIndexMinRows
+	set.values = make([]any, 0, len(rs.Rows))
+	column := strings.ToLower(rs.Cols[0])
+	for i, row := range rs.Rows {
+		if i&255 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, err
+			}
+		}
+		value := row[column]
+		if value == nil {
+			set.hasNull = true
+			continue
+		}
+		set.values = append(set.values, value)
+		if set.indexed {
+			set.index(value)
+		}
+	}
+	if len(set.values) == 0 {
+		set.values = nil
+	}
+	return set, nil
+}
+
+func (s *inSubquerySet) index(value any) {
+	switch value := value.(type) {
+	case int:
+		if s.integers == nil {
+			s.integers = make(map[int64]struct{})
+		}
+		s.integers[int64(value)] = struct{}{}
+	case int64:
+		if s.integers == nil {
+			s.integers = make(map[int64]struct{})
+		}
+		s.integers[value] = struct{}{}
+	case float64:
+		if math.IsNaN(value) {
+			s.hasNaN = true
+		} else {
+			if s.reals == nil {
+				s.reals = make(map[float64]struct{})
+			}
+			s.reals[value] = struct{}{}
+		}
+	case string:
+		if s.texts == nil {
+			s.texts = make(map[string]struct{})
+		}
+		s.texts[value] = struct{}{}
+	case bool:
+		if value {
+			s.booleans |= 2
+		} else {
+			s.booleans |= 1
+		}
+	}
+}
+
+func (s *inSubquerySet) contains(env ExecEnv, value any) (bool, error) {
+	if s.indexed {
+		switch value := value.(type) {
+		case int:
+			return s.containsInteger(int64(value)), nil
+		case int64:
+			return s.containsInteger(value), nil
+		case float64:
+			// compare currently returns equality for NaN and any numeric
+			// operand. Preserve that behavior instead of relying on NaN keys.
+			if s.hasNaN {
+				return true, nil
+			}
+			if math.IsNaN(value) {
+				return len(s.integers) > 0 || len(s.reals) > 0, nil
+			}
+			if _, ok := s.reals[value]; ok {
+				return true, nil
+			}
+			if len(s.integers) > 0 && s.integerReals == nil {
+				if err := checkCtx(env.ctx); err != nil {
+					return false, err
+				}
+				rounded := make(map[float64]struct{}, len(s.integers))
+				processed := 0
+				for integer := range s.integers {
+					if processed&255 == 0 {
+						if err := checkCtx(env.ctx); err != nil {
+							return false, err
+						}
+					}
+					rounded[float64(integer)] = struct{}{}
+					processed++
+				}
+				if err := checkCtx(env.ctx); err != nil {
+					return false, err
+				}
+				s.integerReals = rounded
+			}
+			_, ok := s.integerReals[value]
+			return ok, nil
+		case string:
+			_, ok := s.texts[value]
+			return ok, nil
+		case bool:
+			if value {
+				return s.booleans&2 != 0, nil
+			}
+			return s.booleans&1 != 0, nil
+		}
+	}
+	for _, candidate := range s.values {
+		if cmp, err := compare(value, candidate); err == nil && cmp == 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *inSubquerySet) containsInteger(value int64) bool {
+	if s.hasNaN {
+		return true
+	}
+	if _, ok := s.integers[value]; ok {
+		return true
+	}
+	_, ok := s.reals[float64(value)]
+	return ok
 }
 
 // isSelectCorrelated reports whether sel -- the body of an EXISTS, scalar

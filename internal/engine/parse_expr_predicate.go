@@ -172,6 +172,19 @@ func (p *Parser) parseCmpIn(l Expr, negate bool) (Expr, bool, error) {
 	if err := p.expectSymbol("("); err != nil {
 		return nil, true, err
 	}
+	// A direct SELECT/WITH is a set-valued subquery. A SELECT inside an
+	// additional pair of parentheses remains a scalar list expression and
+	// must retain the scalar cardinality checks.
+	if p.cur.Typ == tKeyword && (p.cur.Val == "SELECT" || p.cur.Val == "WITH") {
+		sel, err := p.parseSelectWithCTE()
+		if err != nil {
+			return nil, true, err
+		}
+		if err := p.expectSymbol(")"); err != nil {
+			return nil, true, err
+		}
+		return &InExpr{Expr: l, Values: []Expr{&SubqueryExpr{Select: sel}}, Negate: negate, Subquery: true}, true, nil
+	}
 	var values []Expr
 	for {
 		e, err := p.parseExpr()

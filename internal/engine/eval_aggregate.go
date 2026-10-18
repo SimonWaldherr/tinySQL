@@ -125,6 +125,7 @@ func evalAggregateCount(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 	// Handle COUNT(DISTINCT col)
 	if ex.Distinct {
 		var seen distinctCountSet
+		cnt := 0
 		for _, r := range rows {
 			if err := checkCtx(env.ctx); err != nil {
 				return nil, err
@@ -133,9 +134,11 @@ func evalAggregateCount(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 			if err != nil {
 				return nil, err
 			}
-			seen.add(v)
+			if seen.add(v) {
+				cnt++
+			}
 		}
-		return len(seen.seen), nil
+		return cnt, nil
 	}
 
 	// Regular COUNT(col)
