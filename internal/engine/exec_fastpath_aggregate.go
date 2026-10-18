@@ -104,6 +104,7 @@ func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 	if err != nil {
 		return nil, true, err
 	}
+	bindSimplePlanClock(rawPlan, env)
 
 	if cols, ops, ok := buildAggregateBatch(plan, rawPlan); ok {
 		return executeAggregateBatches(env, plan, rawPlan, cols, ops)

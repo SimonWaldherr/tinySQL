@@ -107,6 +107,7 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	if env.triggerRow == nil && !hasTriggers && len(s.Returning) == 0 && isSimpleRawPredicate(s.Where) {
 		colIndex := simpleColumnIndex(t, s.Table)
 		rawPlan := &simpleSelectPlan{table: t, colIndex: colIndex, where: s.Where, filter: buildRawFilter(colIndex, s.Where)}
+		bindSimplePlanClock(rawPlan, env)
 		kept := make([][]any, 0, len(t.Rows))
 		oldToNew := make(map[int]int, len(t.Rows))
 		del := 0
@@ -220,6 +221,7 @@ func executeConstraintPointDelete(env ExecEnv, s *Delete, table *storage.Table, 
 		where:    s.Where,
 		filter:   buildRawFilter(colIndex, s.Where),
 	}
+	bindSimplePlanClock(rawPlan, env)
 	deleteRowID := -1
 	for _, rowID := range rowIDs {
 		if rowID < 0 || rowID >= len(table.Rows) {

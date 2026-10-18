@@ -30,7 +30,6 @@
 package engine
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
 	"math/rand"
@@ -55,36 +54,6 @@ func toVec(env ExecEnv, expr Expr, row Row) ([]float64, error) {
 	return vecFromValue(v)
 }
 
-// vecFromValue is toVec after expression evaluation. Raw execution paths use
-// it to preserve the public conversion semantics without wrapping an already
-// available stored value back into a synthetic Literal expression.
-func vecFromValue(v any) ([]float64, error) {
-	switch x := v.(type) {
-	case []float64:
-		return x, nil
-	case string:
-		var arr []float64
-		if err := json.Unmarshal([]byte(x), &arr); err == nil {
-			return arr, nil
-		}
-		var anyArr []any
-		if err := json.Unmarshal([]byte(x), &anyArr); err == nil {
-			f, err := anySliceToFloat64(anyArr)
-			if err != nil {
-				return nil, err
-			}
-			return f, nil
-		}
-		return nil, fmt.Errorf("cannot interpret string as vector: %q", x)
-	case []any:
-		return anySliceToFloat64(x)
-	case nil:
-		return nil, fmt.Errorf("NULL is not a valid vector")
-	default:
-		return nil, fmt.Errorf("cannot convert %T to vector", v)
-	}
-}
-
 func requireArgs(name string, ex *FuncCall, min, max int) error {
 	n := len(ex.Args)
 	if n < min || n > max {
@@ -107,9 +76,10 @@ func requireArgs(name string, ex *FuncCall, min, max int) error {
 // inline (it flows to the heap through evalExpr) the raw path's stack buffer
 // behind vals would be heap-allocated on every row as well.
 type funcArgs struct {
-	ex    *FuncCall
-	vals  []any
-	scope *funcEvalScope
+	ex     *FuncCall
+	vals   []any
+	scope  *funcEvalScope
+	rawNow time.Time
 }
 
 type funcEvalScope struct {
@@ -128,11 +98,10 @@ func (a *funcArgs) value(i int) (any, error) {
 	return evalExpr(a.scope.env, a.ex.Args[i], a.scope.row)
 }
 
-// now is envNow for the call's environment. The raw executor runs without
-// one, exactly as its generic fallback calls handlers with ExecEnv{}.
+// now uses the statement clock in either evaluator.
 func (a *funcArgs) now() time.Time {
 	if a.scope == nil {
-		return envNow(ExecEnv{})
+		return envNow(ExecEnv{now: a.rawNow})
 	}
 	return envNow(a.scope.env)
 }
@@ -169,8 +138,8 @@ func (a *funcArgs) vectorPair(name string) ([]float64, []float64, error) {
 // generic raw path does, so results and errors are unchanged.
 func evalRawVectorFunc(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, bool, error) {
 	switch ex.Name {
-	case "VEC_DOT", "VEC_COSINE_SIMILARITY", "VEC_COSINE_DISTANCE", "VEC_L2_DISTANCE",
-		"VEC_MANHATTAN_DISTANCE", "VEC_DISTANCE", "VEC_HAMMING_DISTANCE",
+	case "VEC_DOT", "VEC_DOT_PRODUCT", "VEC_INNER_PRODUCT", "VEC_COSINE_SIMILARITY", "VEC_COSINE_DISTANCE", "VEC_L2_DISTANCE", "VEC_EUCLIDEAN_DISTANCE",
+		"VEC_MANHATTAN_DISTANCE", "VEC_L1_DISTANCE", "VEC_DISTANCE", "VEC_HAMMING_DISTANCE",
 		"RECENCY_SCORE", "RAG_HYBRID_SCORE", "RAG_RANK_SCORE":
 	default:
 		return nil, false, nil
@@ -189,19 +158,19 @@ func evalRawVectorFunc(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, bo
 	}
 	// Direct calls, not a func-value table: an indirect call would make args
 	// (and the stack buffer behind vals) escape to the heap on every row.
-	args := funcArgs{ex: ex, vals: vals}
+	args := funcArgs{ex: ex, vals: vals, rawNow: plan.now}
 	var v any
 	var err error
 	switch ex.Name {
-	case "VEC_DOT":
+	case "VEC_DOT", "VEC_DOT_PRODUCT", "VEC_INNER_PRODUCT":
 		v, err = vecDotArgs(&args)
 	case "VEC_COSINE_SIMILARITY":
 		v, err = vecCosineSimilarityArgs(&args)
 	case "VEC_COSINE_DISTANCE":
 		v, err = vecCosineDistanceArgs(&args)
-	case "VEC_L2_DISTANCE":
+	case "VEC_L2_DISTANCE", "VEC_EUCLIDEAN_DISTANCE":
 		v, err = vecL2DistanceArgs(&args)
-	case "VEC_MANHATTAN_DISTANCE":
+	case "VEC_MANHATTAN_DISTANCE", "VEC_L1_DISTANCE":
 		v, err = vecManhattanDistanceArgs(&args)
 	case "VEC_DISTANCE":
 		v, err = vecDistanceArgs(&args)
@@ -215,57 +184,6 @@ func evalRawVectorFunc(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, bo
 		v, err = ragRankScoreArgs(&args)
 	}
 	return v, true, err
-}
-
-// ---------------------------------------------------------------------------
-// VEC_FROM_JSON – parse JSON array → vector
-// ---------------------------------------------------------------------------
-
-func evalVecFromJSON(env ExecEnv, ex *FuncCall, row Row) (any, error) {
-	if err := requireArgs("VEC_FROM_JSON", ex, 1, 1); err != nil {
-		return nil, err
-	}
-	val, err := evalExpr(env, ex.Args[0], row)
-	if err != nil {
-		return nil, err
-	}
-	s, ok := val.(string)
-	if !ok {
-		return nil, fmt.Errorf("VEC_FROM_JSON requires a string argument, got %T", val)
-	}
-	var arr []float64
-	if err := json.Unmarshal([]byte(s), &arr); err != nil {
-		// Try via []any
-		var anyArr []any
-		if err2 := json.Unmarshal([]byte(s), &anyArr); err2 != nil {
-			return nil, fmt.Errorf("VEC_FROM_JSON: invalid JSON array: %v", err)
-		}
-		arr2, err2 := anySliceToFloat64(anyArr)
-		if err2 != nil {
-			return nil, fmt.Errorf("VEC_FROM_JSON: %v", err2)
-		}
-		return arr2, nil
-	}
-	return arr, nil
-}
-
-// ---------------------------------------------------------------------------
-// VEC_TO_JSON – serialize vector → JSON string
-// ---------------------------------------------------------------------------
-
-func evalVecToJSON(env ExecEnv, ex *FuncCall, row Row) (any, error) {
-	if err := requireArgs("VEC_TO_JSON", ex, 1, 1); err != nil {
-		return nil, err
-	}
-	vec, err := toVec(env, ex.Args[0], row)
-	if err != nil {
-		return nil, fmt.Errorf("VEC_TO_JSON: %w", err)
-	}
-	b, err := json.Marshal(vec)
-	if err != nil {
-		return nil, fmt.Errorf("VEC_TO_JSON: %w", err)
-	}
-	return string(b), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -310,13 +228,9 @@ func evalVecNormalize(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("VEC_NORMALIZE: %w", err)
 	}
-	norm := vectorL2Norm(vec)
-	if norm == 0 {
-		return nil, fmt.Errorf("VEC_NORMALIZE: zero-length vector cannot be normalized")
-	}
 	out := make([]float64, len(vec))
-	for i, v := range vec {
-		out[i] = v / norm
+	if !search.VectorNormalize(out, vec) {
+		return nil, fmt.Errorf("VEC_NORMALIZE: zero-length vector cannot be normalized")
 	}
 	return out, nil
 }
@@ -489,12 +403,11 @@ func cosineSimilarity(a, b []float64) (float64, error) {
 	if len(a) != len(b) {
 		return 0, fmt.Errorf("dimension mismatch %d vs %d", len(a), len(b))
 	}
-	dot, normA2, normB2 := search.VectorCosineParts(a, b)
-	denom := math.Sqrt(normA2) * math.Sqrt(normB2)
-	if denom == 0 {
+	sim, ok := search.VectorCosine(a, b)
+	if !ok {
 		return 0, fmt.Errorf("zero-length vector")
 	}
-	return dot / denom, nil
+	return sim, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -662,9 +575,9 @@ func evalVecSlice(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if length < 0 {
 		return nil, fmt.Errorf("VEC_SLICE: length %d must not be negative", length)
 	}
-	end := start + length
-	if end > len(vec) {
-		end = len(vec)
+	end := len(vec)
+	if length < len(vec)-start {
+		end = start + length
 	}
 	out := make([]float64, end-start)
 	copy(out, vec[start:end])
@@ -999,8 +912,18 @@ func evalVecQuantize(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return out, nil
 	}
 
-	levels := math.Pow(2, float64(bits)) - 1
+	levels := float64((uint32(1) << uint(bits)) - 1)
 	out := make([]float64, len(vec))
+	if math.IsInf(rangeV, 1) && !math.IsInf(minV, 0) && !math.IsInf(maxV, 0) {
+		// Opposite finite endpoints may have an unrepresentable difference.
+		// Halve before subtracting, then interpolate without forming the range.
+		minHalf, rangeHalf := minV/2, maxV/2-minV/2
+		for i, v := range vec {
+			fraction := math.Round((v/2-minHalf)/rangeHalf*levels) / levels
+			out[i] = (1-fraction)*minV + fraction*maxV
+		}
+		return out, nil
+	}
 	// Quantize: normalize to [0,1], scale to levels, round, scale back. Each
 	// element is independent (no cross-element state), so this is a clean
 	// 4-way unroll (same style as search.VectorL1Unrolled in vector_math.go) unlike
@@ -1100,102 +1023,6 @@ func evalVecAvg(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 }
 
 // ---------------------------------------------------------------------------
-// VEC_TO_BYTES – encode vector as compact float32 binary (returns hex string)
-// VEC_TO_BYTES(vector)
-// ---------------------------------------------------------------------------
-
-func evalVecToBytes(env ExecEnv, ex *FuncCall, row Row) (any, error) {
-	if err := requireArgs("VEC_TO_BYTES", ex, 1, 1); err != nil {
-		return nil, err
-	}
-	vec, err := toVec(env, ex.Args[0], row)
-	if err != nil {
-		return nil, fmt.Errorf("VEC_TO_BYTES: %w", err)
-	}
-	// Encode each float64 as float32 (4 bytes, little-endian) for compactness.
-	buf := make([]byte, len(vec)*4)
-	for i, v := range vec {
-		bits32 := math.Float32bits(float32(v))
-		buf[i*4] = byte(bits32)
-		buf[i*4+1] = byte(bits32 >> 8)
-		buf[i*4+2] = byte(bits32 >> 16)
-		buf[i*4+3] = byte(bits32 >> 24)
-	}
-	return fmt.Sprintf("%x", buf), nil
-}
-
-// ---------------------------------------------------------------------------
-// VEC_FROM_BYTES – decode a compact float32 binary blob (hex string) to vector
-// VEC_FROM_BYTES(hex_blob)
-// ---------------------------------------------------------------------------
-
-func evalVecFromBytes(env ExecEnv, ex *FuncCall, row Row) (any, error) {
-	if err := requireArgs("VEC_FROM_BYTES", ex, 1, 1); err != nil {
-		return nil, err
-	}
-	val, err := evalExpr(env, ex.Args[0], row)
-	if err != nil {
-		return nil, err
-	}
-	var buf []byte
-	switch x := val.(type) {
-	case string:
-		decoded, err := hexDecodeString(strings.TrimSpace(x))
-		if err != nil {
-			return nil, fmt.Errorf("VEC_FROM_BYTES: invalid hex: %w", err)
-		}
-		buf = decoded
-	case []byte:
-		buf = x
-	case nil:
-		return nil, fmt.Errorf("VEC_FROM_BYTES: NULL input")
-	default:
-		return nil, fmt.Errorf("VEC_FROM_BYTES: expected string or bytes, got %T", val)
-	}
-	if len(buf)%4 != 0 {
-		return nil, fmt.Errorf("VEC_FROM_BYTES: byte length %d is not a multiple of 4", len(buf))
-	}
-	vec := make([]float64, len(buf)/4)
-	for i := range vec {
-		bits32 := uint32(buf[i*4]) |
-			uint32(buf[i*4+1])<<8 |
-			uint32(buf[i*4+2])<<16 |
-			uint32(buf[i*4+3])<<24
-		vec[i] = float64(math.Float32frombits(bits32))
-	}
-	return vec, nil
-}
-
-// hexDecodeString is a local helper to avoid importing encoding/hex in this file.
-func hexDecodeString(s string) ([]byte, error) {
-	if len(s)%2 != 0 {
-		return nil, fmt.Errorf("odd hex length")
-	}
-	out := make([]byte, len(s)/2)
-	for i := 0; i < len(s); i += 2 {
-		hi, ok1 := hexNibble(s[i])
-		lo, ok2 := hexNibble(s[i+1])
-		if !ok1 || !ok2 {
-			return nil, fmt.Errorf("invalid hex character at position %d", i)
-		}
-		out[i/2] = (hi << 4) | lo
-	}
-	return out, nil
-}
-
-func hexNibble(c byte) (byte, bool) {
-	switch {
-	case c >= '0' && c <= '9':
-		return c - '0', true
-	case c >= 'a' && c <= 'f':
-		return c - 'a' + 10, true
-	case c >= 'A' && c <= 'F':
-		return c - 'A' + 10, true
-	}
-	return 0, false
-}
-
-// ---------------------------------------------------------------------------
 // VEC_BINARY_QUANTIZE – 1-bit binary quantization
 // VEC_BINARY_QUANTIZE(vector)
 //
@@ -1272,23 +1099,20 @@ func evalVecCentroid(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err := requireArgs("VEC_CENTROID", ex, 2, 256); err != nil {
 		return nil, err
 	}
-	vecs := make([][]float64, 0, len(ex.Args))
+	var out []float64
 	for i, arg := range ex.Args {
 		v, err := toVec(env, arg, row)
 		if err != nil {
 			return nil, fmt.Errorf("VEC_CENTROID arg%d: %w", i+1, err)
 		}
-		if len(vecs) > 0 && len(v) != len(vecs[0]) {
-			return nil, fmt.Errorf("VEC_CENTROID: dimension mismatch at arg%d: %d vs %d", i+1, len(v), len(vecs[0]))
+		if i == 0 {
+			out = make([]float64, len(v))
+		} else if len(v) != len(out) {
+			return nil, fmt.Errorf("VEC_CENTROID: dimension mismatch at arg%d: %d vs %d", i+1, len(v), len(out))
 		}
-		vecs = append(vecs, v)
-	}
-	dim := len(vecs[0])
-	out := make([]float64, dim)
-	for _, v := range vecs {
 		search.VectorAccumulate(out, v)
 	}
-	n := float64(len(vecs))
+	n := float64(len(ex.Args))
 	for i := range out {
 		out[i] /= n
 	}

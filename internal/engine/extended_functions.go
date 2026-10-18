@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -43,7 +44,7 @@ func evalInPeriod(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, fmt.Errorf("IN_PERIOD: %v", err)
 	}
 
-	now := time.Now()
+	now := envNow(env)
 	period = strings.ToUpper(period)
 
 	// Handle aliases
@@ -129,7 +130,7 @@ func evalExtract(env ExecEnv, args []Expr, row Row) (any, error) {
 	}
 
 	partVal, err := evalExpr(env, args[0], row)
-	if err != nil {
+	if err != nil || partVal == nil {
 		return nil, err
 	}
 	part, ok := partVal.(string)
@@ -190,7 +191,7 @@ func evalDateTrunc(env ExecEnv, args []Expr, row Row) (any, error) {
 	}
 
 	unitVal, err := evalExpr(env, args[0], row)
-	if err != nil {
+	if err != nil || unitVal == nil {
 		return nil, err
 	}
 	unit, ok := unitVal.(string)
@@ -213,33 +214,49 @@ func evalDateTrunc(env ExecEnv, args []Expr, row Row) (any, error) {
 	}
 
 	unit = strings.ToUpper(unit)
+	year, month, day := dateTime.Date()
 	switch unit {
 	case "YEAR":
-		return time.Date(dateTime.Year(), 1, 1, 0, 0, 0, 0, dateTime.Location()), nil
+		return time.Date(year, 1, 1, 0, 0, 0, 0, dateTime.Location()), nil
 	case "QUARTER":
-		q := ((int(dateTime.Month()) - 1) / 3)
-		return time.Date(dateTime.Year(), time.Month(q*3+1), 1, 0, 0, 0, 0, dateTime.Location()), nil
+		q := (int(month) - 1) / 3
+		return time.Date(year, time.Month(q*3+1), 1, 0, 0, 0, 0, dateTime.Location()), nil
 	case "MONTH":
-		return time.Date(dateTime.Year(), dateTime.Month(), 1, 0, 0, 0, 0, dateTime.Location()), nil
+		return time.Date(year, month, 1, 0, 0, 0, 0, dateTime.Location()), nil
 	case "WEEK":
-		// Start of week (Monday)
-		weekday := int(dateTime.Weekday())
-		if weekday == 0 {
-			weekday = 7
-		}
-		daysBack := weekday - 1
-		return dateTime.AddDate(0, 0, -daysBack).Truncate(24 * time.Hour), nil
+		daysBack := (int(dateTime.Weekday()) + 6) % 7
+		return time.Date(year, month, day-daysBack, 0, 0, 0, 0, dateTime.Location()), nil
 	case "DAY":
-		return dateTime.Truncate(24 * time.Hour), nil
+		return time.Date(year, month, day, 0, 0, 0, 0, dateTime.Location()), nil
 	case "HOUR":
-		return dateTime.Truncate(time.Hour), nil
+		return truncateDateClock(dateTime, time.Hour), nil
 	case "MINUTE":
-		return dateTime.Truncate(time.Minute), nil
+		return truncateDateClock(dateTime, time.Minute), nil
 	case "SECOND":
-		return dateTime.Truncate(time.Second), nil
+		return dateTime.Add(-time.Duration(dateTime.Nanosecond())), nil
 	default:
 		return nil, fmt.Errorf("DATE_TRUNC: unsupported unit '%s'", unit)
 	}
+}
+
+// Subtracting the lower clock fields preserves which occurrence of a repeated
+// DST hour the input belongs to. Reconstruct only if a transition inside the
+// interval changed the requested wall-clock fields (e.g. a half-hour shift).
+func truncateDateClock(t time.Time, precision time.Duration) time.Time {
+	hour, minute, second := t.Clock()
+	remove := time.Duration(second)*time.Second + time.Duration(t.Nanosecond())
+	if precision == time.Hour {
+		remove += time.Duration(minute) * time.Minute
+		minute = 0
+	}
+	truncated := t.Add(-remove)
+	year, month, day := t.Date()
+	ty, tm, td := truncated.Date()
+	th, tmin, ts := truncated.Clock()
+	if ty == year && tm == month && td == day && th == hour && tmin == minute && ts == 0 {
+		return truncated
+	}
+	return time.Date(year, month, day, hour, minute, 0, 0, t.Location())
 }
 
 // evalEOMonthFunc returns the end of month for a date with optional offset
@@ -269,24 +286,28 @@ func evalEOMonth(env ExecEnv, args []Expr, row Row) (any, error) {
 	offset := 0
 	if len(args) == 2 {
 		offsetVal, err := evalExpr(env, args[1], row)
-		if err != nil {
+		if err != nil || offsetVal == nil {
 			return nil, err
 		}
 		offsetNum, ok := numeric(offsetVal)
 		if !ok {
 			return nil, fmt.Errorf("EOMONTH: offset must be numeric")
 		}
-		offset = int(offsetNum)
+		offset, err = dateCalendarCount(offsetNum)
+		if err != nil || offset == math.MaxInt {
+			return nil, fmt.Errorf("EOMONTH: offset out of range")
+		}
 	}
 
-	// Add offset months
-	targetDate := dateTime.AddDate(0, offset, 0)
-
-	// Get first day of next month, then subtract one day
-	firstOfNextMonth := time.Date(targetDate.Year(), targetDate.Month()+1, 1, 0, 0, 0, 0, targetDate.Location())
-	endOfMonth := firstOfNextMonth.AddDate(0, 0, -1)
-
-	return endOfMonth, nil
+	// Start at the first of the month so an input such as January 31 does
+	// not normalize past February before the offset is applied.
+	year, month, _ := dateTime.Date()
+	first := time.Date(year, month, 1, 0, 0, 0, 0, dateTime.Location())
+	result, err := addDateChecked(first, 0, offset+1, -1)
+	if err != nil {
+		return nil, fmt.Errorf("EOMONTH: %w", err)
+	}
+	return result, nil
 }
 
 // evalAddMonthsFunc adds a number of months to a date
@@ -314,7 +335,7 @@ func evalAddMonths(env ExecEnv, args []Expr, row Row) (any, error) {
 	}
 
 	monthsVal, err := evalExpr(env, args[1], row)
-	if err != nil {
+	if err != nil || monthsVal == nil {
 		return nil, err
 	}
 
@@ -323,7 +344,15 @@ func evalAddMonths(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, fmt.Errorf("ADD_MONTHS: months must be numeric")
 	}
 
-	return dateTime.AddDate(0, int(months), 0), nil
+	count, err := dateCalendarCount(months)
+	if err != nil {
+		return nil, fmt.Errorf("ADD_MONTHS: %w", err)
+	}
+	result, err := addDateChecked(dateTime, 0, count, 0)
+	if err != nil {
+		return nil, fmt.Errorf("ADD_MONTHS: %w", err)
+	}
+	return result, nil
 }
 
 // ==================== Regex Functions ====================

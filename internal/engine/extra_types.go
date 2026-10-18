@@ -7,6 +7,7 @@
 package engine
 
 import (
+	"bytes"
 	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -16,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"math"
 	"math/bits"
 	"net/url"
 	"strings"
@@ -546,10 +548,131 @@ func blobDecode(v any) ([]byte, error) {
 	}
 }
 
+// The low four bits hold a hex digit, and bit 4 marks uppercase input. Invalid
+// bytes have a sentinel outside the valid range, so validation needs one check.
+var blobHexDigits = func() [256]byte {
+	var table [256]byte
+	for i := range table {
+		table[i] = 0xff
+	}
+	for i := byte(0); i < 10; i++ {
+		table['0'+i] = i
+	}
+	for i := byte(0); i < 6; i++ {
+		table['a'+i], table['A'+i] = 10+i, 0x10|10+i
+	}
+	return table
+}()
+
+// blobSource is a borrowed view of bytes or legacy string input. String inputs
+// are classified once; LENGTH, SUBSTR and CONCAT need not allocate a decoded
+// copy of the entire input. Only copyTo writes bytes, always into owned storage.
+type blobSource struct {
+	raw   []byte
+	text  string
+	hex   bool
+	upper bool
+}
+
+func readBlobSource(v any) (blobSource, error) {
+	switch x := v.(type) {
+	case []byte:
+		return blobSource{raw: x}, nil
+	case string:
+		s := strings.TrimSpace(x)
+		if len(s)%2 != 0 {
+			return blobSource{text: s}, nil
+		}
+		var flags byte
+		i := 0
+		for ; i+4 <= len(s); i += 4 {
+			digits := blobHexDigits[s[i]] | blobHexDigits[s[i+1]] | blobHexDigits[s[i+2]] | blobHexDigits[s[i+3]]
+			if digits == 0xff {
+				return blobSource{text: s}, nil
+			}
+			flags |= digits
+		}
+		for ; i < len(s); i++ {
+			digit := blobHexDigits[s[i]]
+			if digit == 0xff {
+				return blobSource{text: s}, nil
+			}
+			flags |= digit
+		}
+		return blobSource{text: s, hex: true, upper: flags&0x10 != 0}, nil
+	case nil:
+		return blobSource{}, nil
+	default:
+		return blobSource{}, fmt.Errorf("BLOB: cannot decode %T", v)
+	}
+}
+
+func (s blobSource) len() int {
+	if s.raw != nil {
+		return len(s.raw)
+	}
+	if s.hex {
+		return len(s.text) / 2
+	}
+	return len(s.text)
+}
+
+func blobHexDigit(c byte) byte {
+	return blobHexDigits[c] & 0xf
+}
+
+// copyTo copies an already bounded segment of the decoded source into dst.
+func (s blobSource) copyTo(dst []byte, start int) {
+	if s.raw != nil {
+		copy(dst, s.raw[start:])
+	} else if s.hex {
+		text := s.text[start*2 : (start+len(dst))*2]
+		i := 0
+		// Bound four output bytes at once rather than checking both source
+		// indices on every decoded byte. The source was already validated.
+		for ; i+4 <= len(dst); i += 4 {
+			src, out := text[i*2:i*2+8], dst[i:i+4]
+			out[0] = blobHexDigits[src[0]]<<4 | blobHexDigits[src[1]]&0xf
+			out[1] = blobHexDigits[src[2]]<<4 | blobHexDigits[src[3]]&0xf
+			out[2] = blobHexDigits[src[4]]<<4 | blobHexDigits[src[5]]&0xf
+			out[3] = blobHexDigits[src[6]]<<4 | blobHexDigits[src[7]]&0xf
+		}
+		for ; i < len(dst); i++ {
+			dst[i] = blobHexDigits[text[i*2]]<<4 | blobHexDigits[text[i*2+1]]&0xf
+		}
+	} else {
+		copy(dst, s.text[start:])
+	}
+}
+
+func (s blobSource) at(i int) byte {
+	if s.raw != nil {
+		return s.raw[i]
+	}
+	if s.hex {
+		return blobHexDigit(s.text[i*2])<<4 | blobHexDigit(s.text[i*2+1])
+	}
+	return s.text[i]
+}
+
 // blobHexString renders raw bytes as lowercase hex. Used only by BLOB_HEX, which
 // exists to produce text; functions returning a blob return the bytes themselves.
 func blobHexString(b []byte) string {
 	return hex.EncodeToString(b)
+}
+
+func blobLengthValue(v any) (any, error) {
+	if v == nil {
+		return nil, nil
+	}
+	if b, ok := v.([]byte); ok {
+		return len(b), nil
+	}
+	s, err := readBlobSource(v)
+	if err != nil {
+		return nil, err
+	}
+	return s.len(), nil
 }
 
 // evalBlobLength returns the byte length of a BLOB.
@@ -561,14 +684,32 @@ func evalBlobLength(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	return blobLengthValue(v)
+}
+
+func blobHexValue(v any) (any, error) {
 	if v == nil {
 		return nil, nil
+	}
+	if text, ok := v.(string); ok {
+		s, _ := readBlobSource(v)
+		if s.hex {
+			if !s.upper {
+				// A tiny trimmed result should not retain a large padded input.
+				if len(text) >= 4096 && len(s.text) < len(text)/2 {
+					return strings.Clone(s.text), nil
+				}
+				return s.text, nil
+			}
+			return strings.ToLower(s.text), nil
+		}
+		return hex.EncodeToString([]byte(s.text)), nil
 	}
 	b, err := blobDecode(v)
 	if err != nil {
 		return nil, err
 	}
-	return len(b), nil
+	return blobHexString(b), nil
 }
 
 // evalBlobHex converts a BLOB to its hex string representation.
@@ -580,26 +721,10 @@ func evalBlobHex(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if v == nil {
-		return nil, nil
-	}
-	b, err := blobDecode(v)
-	if err != nil {
-		return nil, err
-	}
-	return blobHexString(b), nil
+	return blobHexValue(v)
 }
 
-// evalBlobFromHex decodes a hex string into a BLOB. Returns []byte, so the
-// result can be stored in a BLOB column.
-func evalBlobFromHex(env ExecEnv, ex *FuncCall, row Row) (any, error) {
-	if len(ex.Args) != 1 {
-		return nil, fmt.Errorf("BLOB_FROM_HEX expects 1 argument: (hex_string)")
-	}
-	v, err := evalExpr(env, ex.Args[0], row)
-	if err != nil {
-		return nil, err
-	}
+func blobFromHexValue(v any) (any, error) {
 	if v == nil {
 		return nil, nil
 	}
@@ -614,8 +739,73 @@ func evalBlobFromHex(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	return b, nil
 }
 
-// evalBlobSubstr extracts a byte substring from a BLOB.
-// BLOB_SUBSTR(blob, start, length)  — 0-based start index.
+// evalBlobFromHex decodes a hex string into a BLOB. Returns []byte, so the
+// result can be stored in a BLOB column.
+func evalBlobFromHex(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if len(ex.Args) != 1 {
+		return nil, fmt.Errorf("BLOB_FROM_HEX expects 1 argument: (hex_string)")
+	}
+	v, err := evalExpr(env, ex.Args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	return blobFromHexValue(v)
+}
+
+// blobSubstrIndex retains the integer and truncated REAL arguments accepted by
+// toInt, but rejects conversions that overflow the machine's int (also on WASM).
+func blobSubstrIndex(v any) (int, error) {
+	const maxInt = int(^uint(0) >> 1)
+	const minInt = -maxInt - 1
+	switch x := v.(type) {
+	case int64:
+		if x < int64(minInt) || x > int64(maxInt) {
+			return 0, fmt.Errorf("integer out of range")
+		}
+	case float64:
+		x = math.Trunc(x)
+		// The upper bound is exclusive because float64(maxInt) rounds upward
+		// for a 64-bit int. Converting that rounded value would overflow.
+		if math.IsNaN(x) || x < float64(minInt) || x >= -float64(minInt) {
+			return 0, fmt.Errorf("integer out of range")
+		}
+	}
+	return toInt(v)
+}
+
+func blobSubstrValue(blobVal, startVal, lenVal any) (any, error) {
+	if blobVal == nil {
+		return nil, nil
+	}
+	s, err := readBlobSource(blobVal)
+	if err != nil {
+		return nil, err
+	}
+	start, err := blobSubstrIndex(startVal)
+	if err != nil {
+		return nil, fmt.Errorf("BLOB_SUBSTR start: %w", err)
+	}
+	length, err := blobSubstrIndex(lenVal)
+	if err != nil {
+		return nil, fmt.Errorf("BLOB_SUBSTR length: %w", err)
+	}
+	if length < 0 {
+		return nil, fmt.Errorf("BLOB_SUBSTR length must be non-negative")
+	}
+	if start < 0 || start >= s.len() {
+		return []byte{}, nil
+	}
+	// Clamp before adding: a very large length must not wrap start+length.
+	if remaining := s.len() - start; length > remaining {
+		length = remaining
+	}
+	result := make([]byte, length)
+	s.copyTo(result, start)
+	return result, nil
+}
+
+// evalBlobSubstr extracts an owned byte substring from a BLOB.
+// BLOB_SUBSTR(blob, start, length) — 0-based start index.
 func evalBlobSubstr(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if len(ex.Args) != 3 {
 		return nil, fmt.Errorf("BLOB_SUBSTR expects 3 arguments: (blob, start, length)")
@@ -632,34 +822,39 @@ func evalBlobSubstr(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if blobVal == nil {
-		return nil, nil
+	return blobSubstrValue(blobVal, startVal, lenVal)
+}
+
+func blobConcatValue(aVal, bVal any) (any, error) {
+	if a, ok := aVal.([]byte); ok {
+		if b, ok := bVal.([]byte); ok {
+			if len(a) > int(^uint(0)>>1)-len(b) {
+				return nil, fmt.Errorf("BLOB_CONCAT result is too large")
+			}
+			result := make([]byte, len(a)+len(b))
+			copy(result, a)
+			copy(result[len(a):], b)
+			return result, nil
+		}
 	}
-	b, err := blobDecode(blobVal)
+	a, err := readBlobSource(aVal)
 	if err != nil {
 		return nil, err
 	}
-	start, err := toInt(startVal)
+	b, err := readBlobSource(bVal)
 	if err != nil {
-		return nil, fmt.Errorf("BLOB_SUBSTR start: %w", err)
+		return nil, err
 	}
-	length, err := toInt(lenVal)
-	if err != nil {
-		return nil, fmt.Errorf("BLOB_SUBSTR length: %w", err)
+	if a.len() > int(^uint(0)>>1)-b.len() {
+		return nil, fmt.Errorf("BLOB_CONCAT result is too large")
 	}
-	if start < 0 || start >= len(b) {
-		return []byte{}, nil
-	}
-	end := start + length
-	if end > len(b) {
-		end = len(b)
-	}
-	// Copied rather than sub-sliced: the result may be stored in a column, and a
-	// sub-slice would keep the whole source blob reachable and alias its bytes.
-	return append([]byte(nil), b[start:end]...), nil
+	result := make([]byte, a.len()+b.len())
+	a.copyTo(result[:a.len()], 0)
+	b.copyTo(result[a.len():], 0)
+	return result, nil
 }
 
-// evalBlobConcat concatenates two BLOBs.
+// evalBlobConcat concatenates two BLOBs, treating NULL inputs as empty.
 func evalBlobConcat(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if len(ex.Args) != 2 {
 		return nil, fmt.Errorf("BLOB_CONCAT expects 2 arguments: (a, b)")
@@ -672,23 +867,18 @@ func evalBlobConcat(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	var a, b []byte
-	if aVal != nil {
-		a, err = blobDecode(aVal)
-		if err != nil {
-			return nil, err
-		}
+	return blobConcatValue(aVal, bVal)
+}
+
+func blobToBase64Value(v any) (any, error) {
+	if v == nil {
+		return nil, nil
 	}
-	if bVal != nil {
-		b, err = blobDecode(bVal)
-		if err != nil {
-			return nil, err
-		}
+	b, err := blobDecode(v)
+	if err != nil {
+		return nil, err
 	}
-	result := make([]byte, len(a)+len(b))
-	copy(result, a)
-	copy(result[len(a):], b)
-	return result, nil
+	return base64.StdEncoding.EncodeToString(b), nil
 }
 
 // evalBlobToBase64 encodes a BLOB as a base64 string.
@@ -700,18 +890,40 @@ func evalBlobToBase64(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	return blobToBase64Value(v)
+}
+
+func blobFromBase64Value(v any) (any, error) {
 	if v == nil {
 		return nil, nil
 	}
-	b, err := blobDecode(v)
-	if err != nil {
-		return nil, err
+	s, ok := v.(string)
+	if !ok {
+		return nil, fmt.Errorf("BLOB_FROM_BASE64: argument must be a string, got %T", v)
 	}
-	return base64.StdEncoding.EncodeToString(b), nil
+	s = strings.TrimSpace(s)
+	if strings.ContainsAny(s, "-_") {
+		// Standard base64 rejects these bytes, so decoding it first would only
+		// allocate a discarded buffer. Keep URL-safe errors for invalid input.
+		b, err := base64.URLEncoding.DecodeString(s)
+		if err != nil {
+			return nil, fmt.Errorf("BLOB_FROM_BASE64: %w", err)
+		}
+		return b, nil
+	}
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		// The final URL-safe error is part of the existing error contract,
+		// including when the input contains '+' or '/'.
+		b, err = base64.URLEncoding.DecodeString(s)
+		if err != nil {
+			return nil, fmt.Errorf("BLOB_FROM_BASE64: %w", err)
+		}
+	}
+	return b, nil
 }
 
-// evalBlobFromBase64 decodes a base64 string into a BLOB. Returns []byte, so the
-// result can be stored in a BLOB column.
+// evalBlobFromBase64 decodes a base64 string into an owned BLOB.
 func evalBlobFromBase64(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if len(ex.Args) != 1 {
 		return nil, fmt.Errorf("BLOB_FROM_BASE64 expects 1 argument: (base64_string)")
@@ -720,22 +932,48 @@ func evalBlobFromBase64(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if v == nil {
-		return nil, nil
+	return blobFromBase64Value(v)
+}
+
+func blobEqualValue(aVal, bVal any) (any, error) {
+	if aVal == nil || bVal == nil {
+		return aVal == nil && bVal == nil, nil
 	}
-	s, ok := v.(string)
-	if !ok {
-		return nil, fmt.Errorf("BLOB_FROM_BASE64: argument must be a string, got %T", v)
-	}
-	b, err := base64.StdEncoding.DecodeString(strings.TrimSpace(s))
-	if err != nil {
-		// Try URL-safe base64.
-		b, err = base64.URLEncoding.DecodeString(strings.TrimSpace(s))
-		if err != nil {
-			return nil, fmt.Errorf("BLOB_FROM_BASE64: %w", err)
+	if a, ok := aVal.([]byte); ok {
+		if b, ok := bVal.([]byte); ok {
+			return bytes.Equal(a, b), nil
 		}
 	}
-	return b, nil
+	if a, ok := aVal.(string); ok {
+		if b, ok := bVal.(string); ok && strings.TrimSpace(a) == strings.TrimSpace(b) {
+			return true, nil
+		}
+	}
+	a, err := readBlobSource(aVal)
+	if err != nil {
+		return nil, err
+	}
+	b, err := readBlobSource(bVal)
+	if err != nil {
+		return nil, err
+	}
+	if a.len() != b.len() {
+		return false, nil
+	}
+	if a.raw == nil && b.raw == nil {
+		if a.hex && b.hex {
+			return strings.EqualFold(a.text, b.text), nil
+		}
+		if !a.hex && !b.hex {
+			return a.text == b.text, nil
+		}
+	}
+	for i := 0; i < a.len(); i++ {
+		if a.at(i) != b.at(i) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // evalBlobEqual returns true if two BLOBs contain identical bytes.
@@ -751,26 +989,7 @@ func evalBlobEqual(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if aVal == nil || bVal == nil {
-		return aVal == nil && bVal == nil, nil
-	}
-	a, err := blobDecode(aVal)
-	if err != nil {
-		return nil, err
-	}
-	b, err := blobDecode(bVal)
-	if err != nil {
-		return nil, err
-	}
-	if len(a) != len(b) {
-		return false, nil
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false, nil
-		}
-	}
-	return true, nil
+	return blobEqualValue(aVal, bVal)
 }
 
 // ─────────────────────────── Registration ────────────────────────────────────

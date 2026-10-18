@@ -13,6 +13,112 @@ import (
 	"strings"
 )
 
+// bindSimplePlanClock runs only on an execution-private plan. Cached filters
+// may capture their own synthetic plan, so clock-dependent predicates must
+// instead evaluate against this execution's timestamp.
+func bindSimplePlanClock(plan *simpleSelectPlan, env ExecEnv) {
+	plan.now = envNow(env)
+	if rawExprUsesStatementClock(plan.where) {
+		plan.filter = buildRawClockFilter(plan, plan.where)
+	}
+}
+
+func buildRawClockFilter(plan *simpleSelectPlan, e Expr) func([]any) (bool, error) {
+	if !rawExprUsesStatementClock(e) {
+		return buildRawFilter(plan.colIndex, e)
+	}
+	if ex, ok := e.(*Binary); ok && (ex.Op == "AND" || ex.Op == "OR") {
+		left := buildRawClockFilter(plan, ex.Left)
+		right := buildRawClockFilter(plan, ex.Right)
+		if ex.Op == "AND" {
+			// Match the existing filter compiler's preference for a cheap
+			// specialized conjunct before an expensive expression fallback.
+			if rawExprUsesStatementClock(ex.Left) && !rawExprUsesStatementClock(ex.Right) && buildRawFilterSpecialized(plan.colIndex, ex.Right) != nil {
+				left, right = right, left
+			}
+			return func(raw []any) (bool, error) {
+				match, err := left(raw)
+				if err != nil || !match {
+					return false, err
+				}
+				return right(raw)
+			}
+		}
+		return func(raw []any) (bool, error) {
+			match, err := left(raw)
+			if err != nil || match {
+				return match, err
+			}
+			return right(raw)
+		}
+	}
+	return func(raw []any) (bool, error) {
+		value, err := evalRawExpr(plan, raw, e)
+		return toTri(value) == tvTrue, err
+	}
+}
+
+func rawExprUsesStatementClock(e Expr) bool {
+	switch ex := e.(type) {
+	case *FuncCall:
+		name := strings.ToUpper(ex.Name)
+		for _, arg := range ex.Args {
+			if rawExprUsesStatementClock(arg) {
+				return true
+			}
+		}
+		switch name {
+		case "NOW", "GETDATE", "TODAY", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP",
+			"IN_PERIOD", "RECENCY_SCORE", "RAG_HYBRID_SCORE", "RAG_RANK_SCORE":
+			return true
+		case "DATE", "TIME", "DATETIME", "JULIANDAY", "UNIXEPOCH", "STRFTIME":
+			valueIndex := 0
+			if name == "STRFTIME" {
+				valueIndex = 1
+			}
+			if len(ex.Args) <= valueIndex {
+				return true
+			}
+			if literal, ok := ex.Args[valueIndex].(*Literal); ok && !literal.Parameter {
+				text, _ := literal.Val.(string)
+				return strings.EqualFold(strings.TrimSpace(text), "now")
+			}
+			return true
+		}
+	case *CaseExpr:
+		if rawExprUsesStatementClock(ex.Operand) || rawExprUsesStatementClock(ex.Else) {
+			return true
+		}
+		for _, branch := range ex.Whens {
+			if rawExprUsesStatementClock(branch.When) || rawExprUsesStatementClock(branch.Then) {
+				return true
+			}
+		}
+	case *Unary:
+		return rawExprUsesStatementClock(ex.Expr)
+	case *Binary:
+		return rawExprUsesStatementClock(ex.Left) || rawExprUsesStatementClock(ex.Right)
+	case *IsNull:
+		return rawExprUsesStatementClock(ex.Expr)
+	case *LikeExpr:
+		return rawExprUsesStatementClock(ex.Expr) || rawExprUsesStatementClock(ex.Pattern) || rawExprUsesStatementClock(ex.Escape)
+	case *RegexpExpr:
+		return rawExprUsesStatementClock(ex.Expr) || rawExprUsesStatementClock(ex.Pattern)
+	case *BetweenExpr:
+		return rawExprUsesStatementClock(ex.Expr) || rawExprUsesStatementClock(ex.Lo) || rawExprUsesStatementClock(ex.Hi)
+	case *InExpr:
+		if rawExprUsesStatementClock(ex.Expr) {
+			return true
+		}
+		for _, value := range ex.Values {
+			if rawExprUsesStatementClock(value) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // combineAndConjuncts is the inverse of flattenAndConjuncts: it rebuilds a
 // left-associative AND chain from a conjunct list, or nil for an empty list
 // (buildRawFilter/buildRawFilterSpecialized both treat a nil expression as

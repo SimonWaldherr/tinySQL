@@ -157,14 +157,20 @@ func TestISODurationShiftBasic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse error: %v", err)
 	}
-	got := d.shift(base, false)
+	got, err := d.shift(base, false)
+	if err != nil {
+		t.Fatalf("shift error: %v", err)
+	}
 	want := base.AddDate(1, 2, 3).Add(4*time.Hour + 5*time.Minute + 6*time.Second)
 	if !got.Equal(want) {
 		t.Fatalf("shift = %v, want %v", got, want)
 	}
 
 	// negate=true (DATE_SUB's 2-arg form) must invert every component.
-	got = d.shift(base, true)
+	got, err = d.shift(base, true)
+	if err != nil {
+		t.Fatalf("negated shift error: %v", err)
+	}
 	want = base.AddDate(-1, -2, -3).Add(-(4*time.Hour + 5*time.Minute + 6*time.Second))
 	if !got.Equal(want) {
 		t.Fatalf("negated shift = %v, want %v", got, want)
@@ -189,7 +195,10 @@ func TestISODurationShiftIsDSTSafe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse error: %v", err)
 	}
-	shifted := d.shift(base, false)
+	shifted, err := d.shift(base, false)
+	if err != nil {
+		t.Fatalf("shift error: %v", err)
+	}
 	if shifted.Hour() != 9 {
 		t.Fatalf("P1D shift across DST: got wall-clock hour %d, want 9 (AddDate must preserve local time-of-day)", shifted.Hour())
 	}

@@ -211,10 +211,11 @@ func VectorDistance(metric string, a, b []float64, normA, normB float64) (float6
 	}
 	switch metric {
 	case "cosine":
-		if normA == 0 || normB == 0 {
+		sim, ok := VectorCosineWithNorms(a, b, normA, normB)
+		if !ok {
 			return 0, false
 		}
-		return 1.0 - VectorDot(a, b)/(normA*normB), true
+		return 1.0 - sim, true
 	case "l2":
 		return math.Sqrt(VectorL2Squared(a, b)), true
 	case "manhattan":

@@ -120,6 +120,23 @@ combining LIMIT with FETCH are rejected. Integer bounds remain exact above
 before conversion. Both materialized and raw execution paths handle large
 valid limits and offsets without allocating a buffer of that size.
 
+## Date and time functions
+
+Date/time evaluation now preserves a statement-wide clock, calendar-aware
+truncation and month-end offsets. STRFTIME handles escaped percent signs and
+literal text directly, supports SQLite's documented substitutions, and returns
+NULL for unsupported codes. Date/time functions propagate NULL inputs; numeric
+timestamp conversion preserves native integer seconds and rejects invalid
+ranges. See [date/time execution](datetime-performance.md) for compatibility
+boundaries, parser and formatter measurements, and regression commands.
+
+MAKE_DATE/DATEFROMPARTS, LAST_DAY, DAYNAME, MONTHNAME and DATEPART provide
+calendar construction and component helpers. CONVERT/TRY_CONVERT support
+type-first conversion and a documented subset of explicit date styles.
+The calendar is proleptic Gregorian; JULIANDAY is a day number, not a separate
+calendar mode. SQL Server session settings and alternative calendars remain
+unsupported.
+
 ## Important remaining gaps
 
 | Missing operation | Current boundary | Main implementation work |

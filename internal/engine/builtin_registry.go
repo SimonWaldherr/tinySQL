@@ -60,6 +60,8 @@ func getBuiltinFunctions() map[string]funcHandler {
 		"LEFT":              evalLeftFunc,
 		"RIGHT":             evalRightFunc,
 		"CAST":              evalCastFunc,
+		"CONVERT":           evalConvertFunc,
+		"TRY_CONVERT":       evalConvertFunc,
 		"REPLACE":           evalReplaceFunc,
 		"INSTR":             evalInstrFunc,
 		"LOCATE":            evalLocateFunc,
@@ -92,6 +94,12 @@ func getBuiltinFunctions() map[string]funcHandler {
 		"HOUR":              evalHourFunc,
 		"MINUTE":            evalMinuteFunc,
 		"SECOND":            evalSecondFunc,
+		"MAKE_DATE":         evalCalendarFunc,
+		"DATEFROMPARTS":     evalCalendarFunc,
+		"LAST_DAY":          evalCalendarFunc,
+		"DAYNAME":           evalCalendarFunc,
+		"MONTHNAME":         evalCalendarFunc,
+		"DATEPART":          evalDatePartFunc,
 		"RANDOM":            evalRandomFunc,
 		"RAND":              evalRandomFunc,
 		// Math functions
@@ -240,7 +248,7 @@ func evalNowFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err := requireNoArgs(ex); err != nil {
 		return nil, err
 	}
-	return time.Now(), nil
+	return envNow(env), nil
 }
 
 // evalRowToTextFunc implements ROW_TO_TEXT() — concatenates every column
@@ -284,7 +292,7 @@ func evalCurrentDateFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err := requireNoArgs(ex); err != nil {
 		return nil, err
 	}
-	now := time.Now()
+	now := envNow(env)
 	y, m, d := now.Date()
 	return time.Date(y, m, d, 0, 0, 0, 0, now.Location()), nil
 }
@@ -300,14 +308,14 @@ func evalCurrentTimeFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err := requireNoArgs(ex); err != nil {
 		return nil, err
 	}
-	return time.Now().Format("15:04:05"), nil
+	return envNow(env).Format("15:04:05"), nil
 }
 
 func evalTodayFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err := requireNoArgs(ex); err != nil {
 		return nil, err
 	}
-	now := time.Now()
+	now := envNow(env)
 	y, m, d := now.Date()
 	return time.Date(y, m, d, 0, 0, 0, 0, now.Location()), nil
 }
@@ -323,17 +331,52 @@ func evalFromTimestampFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if val == nil {
 		return nil, nil
 	}
-	floatAny, err := coerceToFloat(val)
-	if err != nil {
-		return nil, fmt.Errorf("FROM_TIMESTAMP expects numeric or string input: %w", err)
+	var sec, nsec int64
+	switch seconds := val.(type) {
+	case int:
+		sec = int64(seconds)
+	case int64:
+		sec = seconds
+	default:
+		floatAny, err := coerceToFloat(val)
+		if err != nil {
+			return nil, fmt.Errorf("FROM_TIMESTAMP expects numeric or string input: %w", err)
+		}
+		floatSeconds, ok := floatAny.(float64)
+		if !ok {
+			return nil, fmt.Errorf("FROM_TIMESTAMP expected float result, got %T", floatAny)
+		}
+		if math.IsNaN(floatSeconds) || floatSeconds < -0x1p63 || floatSeconds >= 0x1p63 {
+			return nil, fmt.Errorf("FROM_TIMESTAMP: seconds out of range")
+		}
+		whole, frac := math.Modf(floatSeconds)
+		sec = int64(whole)
+		nsec = int64(math.Round(frac * 1e9))
+		// Normalize before checking the seconds bound: rounding can carry
+		// a fraction into the preceding or following second.
+		if nsec < 0 {
+			if sec == math.MinInt64 {
+				return nil, fmt.Errorf("FROM_TIMESTAMP: seconds out of range")
+			}
+			sec--
+			nsec += 1e9
+		} else if nsec >= 1e9 {
+			sec++ // sec < MaxInt64 after the float bound above.
+			nsec -= 1e9
+		}
 	}
-	seconds, ok := floatAny.(float64)
-	if !ok {
-		return nil, fmt.Errorf("FROM_TIMESTAMP expected float result, got %T", floatAny)
+	// Go stores signed seconds since year 1. Unix seconds beyond this
+	// bound overflow that representation even though they fit in int64.
+	if sec > math.MaxInt64+(time.Time{}).Unix() {
+		return nil, fmt.Errorf("FROM_TIMESTAMP: seconds out of range")
 	}
-	sec, frac := math.Modf(seconds)
-	nsec := int64(math.Round(frac * 1e9))
-	return time.Unix(int64(sec), nsec), nil
+	result := time.Unix(sec, nsec)
+	// Calendar conversion also has an absolute epoch near the negative
+	// int64 limit. Values before it wrap into positive calendar years.
+	if sec < (time.Time{}).Unix() && result.UTC().Year() > 0 {
+		return nil, fmt.Errorf("FROM_TIMESTAMP: seconds out of range")
+	}
+	return result, nil
 }
 
 func evalTimestampFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
@@ -347,8 +390,17 @@ func evalTimestampFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if val == nil {
 		return nil, nil
 	}
+	switch seconds := val.(type) {
+	case int:
+		return int64(seconds), nil
+	case int64:
+		return val, nil
+	}
 	if floatAny, err := coerceToFloat(val); err == nil {
 		if seconds, ok := floatAny.(float64); ok {
+			if math.IsNaN(seconds) || seconds < -0x1p63 || seconds >= 0x1p63 {
+				return nil, fmt.Errorf("TIMESTAMP: seconds out of range")
+			}
 			return int64(seconds), nil
 		}
 	}

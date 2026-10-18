@@ -276,3 +276,11 @@ go test ./internal/engine -run 'TestRawJoin|TestCompactHashJoin|TestInSubqueryMe
 go test ./internal/engine -run '^$' -bench '^(BenchmarkRawJoinLookupBuild|BenchmarkRawJoinLargePrepared|BenchmarkGeneralHashJoinCompact|BenchmarkInSubqueryManyRows|BenchmarkDerivedSubqueryRows)$' -benchmem -benchtime=300ms -count=3 -cpu=1 -p=1
 go test -race ./internal/engine -run 'TestRawJoin|TestCompactHashJoin|TestInSubqueryMembership|TestDerivedSubquery|TestOwnedSubqueryAliasing' -count=1
 ```
+
+## BLOBs and vectors (2026-10-18)
+
+BLOB value kernels avoid full-source decoding for byte lengths and substrings.
+Vector JSON and binary codecs allocate their final result directly, and scaled
+numeric fallbacks handle extreme finite magnitudes. See
+[BLOB and vector execution](blob-vector-performance.md) for compatibility,
+allocation measurements, the HEX concatenation tradeoff and regression commands.

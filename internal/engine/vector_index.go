@@ -1262,10 +1262,11 @@ func vecRankingDistanceKind(kind int, a, b []float64, normA, normB float64) (flo
 	var d float64
 	switch kind {
 	case vecMetricCosine:
-		if normA == 0 || normB == 0 {
+		similarity, ok := search.VectorCosineWithNorms(a, b, normA, normB)
+		if !ok {
 			return 0, false
 		}
-		d = 1.0 - search.VectorDot(a, b)/(normA*normB)
+		d = 1.0 - similarity
 	case vecMetricL2:
 		d = search.VectorL2Squared(a, b)
 	case vecMetricManhattan:

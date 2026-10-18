@@ -331,6 +331,33 @@ func evalRawFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, erro
 	// through the argument-wrapper pool below evaluates discarded branches
 	// and can raise errors that their ordinary handlers would never reach.
 	switch ex.Name {
+	case "CONVERT", "TRY_CONVERT":
+		return evalConvertCall(ex, func(arg Expr) (any, error) {
+			return evalRawExpr(plan, raw, arg)
+		})
+	case "DATEPART":
+		return evalDatePartCall(ex, func(arg Expr) (any, error) {
+			return evalRawExpr(plan, raw, arg)
+		})
+	case "MAKE_DATE", "DATEFROMPARTS", "LAST_DAY", "DAYNAME", "MONTHNAME":
+		return evalCalendarCall(ex, func(arg Expr) (any, error) {
+			return evalRawExpr(plan, raw, arg)
+		})
+	case "BLOB_LENGTH", "BLOB_HEX", "BLOB_FROM_HEX", "BLOB_SUBSTR", "BLOB_CONCAT", "BLOB_TO_BASE64", "BLOB_FROM_BASE64", "BLOB_EQUAL":
+		return evalRawBlobFuncCall(plan, raw, ex)
+	case "NOW", "GETDATE", "TODAY", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP":
+		if err := requireNoArgs(ex); err != nil {
+			return nil, err
+		}
+		if handler := boundFuncHandler(ex); handler != nil {
+			return handler(ExecEnv{now: plan.now}, ex, rawEmptyRow)
+		}
+		return evalFuncCall(ExecEnv{now: plan.now}, ex, rawEmptyRow)
+	case "DATE", "TIME", "DATETIME", "JULIANDAY", "UNIXEPOCH", "STRFTIME",
+		"DATE_ADD", "DATE_SUB", "DATEADD", "DATESUB", "DATEDIFF", "OVERLAPS", "EXTRACT", "DATE_TRUNC", "EOMONTH", "ADD_MONTHS":
+		if rawDateCallNeedsOrder(ex) {
+			return evalRawDateFuncCall(plan, raw, ex)
+		}
 	case "TRIM", "LTRIM", "RTRIM":
 		if len(ex.Args) < 1 || len(ex.Args) > 2 {
 			return nil, fmt.Errorf("%s expects 1 or 2 arguments", ex.Name)
@@ -474,9 +501,9 @@ func evalRawFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, erro
 		// Handler resolved at parse time; call it directly instead of going
 		// back through evalFuncCall's registry dispatch. ex.Over was already
 		// rejected above, so this cannot bypass the window-function check.
-		return h(ExecEnv{}, &sc.call, rawEmptyRow)
+		return h(ExecEnv{now: plan.now}, &sc.call, rawEmptyRow)
 	}
-	return evalFuncCall(ExecEnv{}, &sc.call, rawEmptyRow)
+	return evalFuncCall(ExecEnv{now: plan.now}, &sc.call, rawEmptyRow)
 }
 
 // evalRawRowToText is the raw-row equivalent of evalRowToTextFunc. The

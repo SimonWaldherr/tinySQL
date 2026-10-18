@@ -45,6 +45,7 @@ func buildStreamingSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, 
 		return nil, ok, err
 	}
 	plan := *template
+	bindSimplePlanClock(&plan, env)
 	plan.table = metadata
 	resetSimplePlanAccess(&plan, 0)
 	source := &pagedSimpleSelectSource{tenant: env.tenant, table: s.From.Table}

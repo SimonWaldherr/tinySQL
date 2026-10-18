@@ -227,10 +227,9 @@ type ExecEnv struct {
 	// cleanly instead of recursing until stack exhaustion.
 	foreignKeyActions *foreignKeyActionState
 	// now is the evaluation timestamp for this statement, set once when the
-	// statement begins executing. RECENCY_SCORE/RAG_HYBRID_SCORE/RAG_RANK_SCORE
-	// default to it (via envNow) instead of calling time.Now() per row, so
-	// every row of one query — and every RAG scorer call within it — sees the
-	// same "now" and ranks consistently. The zero value falls back to
+	// statement begins executing. Clock functions and recency scorers use it
+	// via envNow so every row and nested expression sees the same "now".
+	// The zero value falls back to
 	// time.Now() (see envNow), which is what ExecEnv{} in tests gets.
 	now time.Time
 	// dml carries the planning work executeStatement already performed to pick

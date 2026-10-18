@@ -277,6 +277,7 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 	}
 
 	rawPlan := &simpleSelectPlan{table: plan.table, colIndex: plan.colIndex, where: plan.where, filter: buildRawFilter(plan.colIndex, plan.where)}
+	bindSimplePlanClock(rawPlan, env)
 	updated := 0
 	mutated := 0
 	values := make([]any, len(plan.sets))

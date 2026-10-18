@@ -35,6 +35,7 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 				return nil, ok, err
 			}
 			plan := *template
+			bindSimplePlanClock(&plan, env)
 			plan.table = metadata
 			return simpleLimitZeroPlan(env, &plan)
 		}
@@ -52,6 +53,7 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 					return nil, ok, err
 				}
 				plan := *template
+				bindSimplePlanClock(&plan, env)
 				plan.table = metadata
 				resetSimplePlanAccess(&plan, len(rows))
 				plan.rows = rows
@@ -85,6 +87,7 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 		return nil, ok, err
 	}
 	plan := *template
+	bindSimplePlanClock(&plan, env)
 	if s.Limit != nil && *s.Limit == 0 {
 		return simpleLimitZeroPlan(env, &plan)
 	}

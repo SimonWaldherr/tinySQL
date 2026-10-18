@@ -112,7 +112,7 @@ func vecParseArgs(env ExecEnv, args []Expr, row Row) (vecSearchArgs, error) {
 	a.k = k
 
 	a.metric = "cosine"
-	if len(args) == 5 {
+	if len(args) >= 5 {
 		mv, err := evalExpr(env, args[4], row)
 		if err != nil {
 			return a, fmt.Errorf("VEC_SEARCH metric: %w", err)
@@ -758,7 +758,7 @@ func mergeTwoVecColumnSegments(left, right vecColumnSegment, normsReady bool) ve
 }
 
 func vectorL2Norm(v []float64) float64 {
-	return math.Sqrt(search.VectorDot(v, v))
+	return search.VectorNorm(v)
 }
 
 func pushTopK(heapRows *vecScoredHeap, rowIdx int, distance float64, k int) {
@@ -879,10 +879,11 @@ func buildVecDistanceFunc(metric string, query []float64, queryNorm float64) vec
 // This matters especially on Linux/amd64: AVX2/FMA makes the dot product fast
 // enough that the generic function/switch chain becomes measurable overhead.
 func vecCosineRankingDistance(vec, query []float64, norm, queryNorm float64) (float64, bool) {
-	if len(vec) != len(query) || norm == 0 || queryNorm == 0 {
+	similarity, ok := search.VectorCosineWithNorms(vec, query, norm, queryNorm)
+	if !ok {
 		return 0, false
 	}
-	distance := 1.0 - search.VectorDot(vec, query)/(norm*queryNorm)
+	distance := 1.0 - similarity
 	if math.IsNaN(distance) {
 		return 0, false
 	}
@@ -979,7 +980,7 @@ func vecSearchTopK(ctx context.Context, rows [][]any, queryLen int, k int, cache
 	}
 	wg.Wait()
 
-	merged := newScoredHeap(k, -1)
+	merged := newScoredHeap(k, len(rows))
 	for i := range results {
 		if results[i].err != nil {
 			return nil, results[i].err

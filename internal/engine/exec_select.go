@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -367,6 +368,8 @@ func selectReferencesCTE(env ExecEnv, s *Select) bool {
 }
 
 type simpleSelectPlan struct {
+	// now belongs to the execution copy, never the cached plan template.
+	now        time.Time
 	table      *storage.Table
 	colIndex   map[string]int
 	projs      []simpleProjection

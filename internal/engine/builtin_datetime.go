@@ -5,6 +5,7 @@ package engine
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -22,6 +23,9 @@ func evalDateDiff(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if unitVal == nil {
+		return nil, nil
+	}
 	unit, ok := unitVal.(string)
 	if !ok {
 		return nil, fmt.Errorf("DATEDIFF unit must be a string")
@@ -37,6 +41,9 @@ func evalDateDiff(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	endVal, err := evalExpr(env, ex.Args[2], row)
 	if err != nil {
 		return nil, err
+	}
+	if startVal == nil || endVal == nil {
+		return nil, nil
 	}
 
 	// Convert values to time.Time
@@ -179,6 +186,27 @@ func parseTimeValue(val any) (time.Time, error) {
 		if t, ok := parseTimeFixedDigits(v); ok {
 			return t, nil
 		}
+		// Keep the length-specific acceptance rules below: for example, a
+		// ten-character clock with a fraction was only tried as a date.
+		switch len(v) {
+		case 5, 8:
+			if t, ok := parseClockFixedDigits(v); ok {
+				return t, nil
+			}
+		case 16:
+			if v[10] == ' ' {
+				if date, ok := parseTimeFixedDigits(v[:10]); ok {
+					if clock, ok := parseClockFixedDigits(v[11:]); ok {
+						return date.Add(time.Duration(clock.Hour())*time.Hour + time.Duration(clock.Minute())*time.Minute), nil
+					}
+				}
+			}
+		case 10, 19:
+		default:
+			if t, ok := parseClockFixedDigits(v); ok {
+				return t, nil
+			}
+		}
 		// Select candidate formats by string length to avoid trying all formats on every call.
 		var formats []string
 		switch len(v) {
@@ -207,6 +235,53 @@ func parseTimeValue(val any) (time.Time, error) {
 	}
 }
 
+// parseClockFixedDigits handles only fixed-width clock fields. Its caller
+// decides which layouts are valid; the datetime family does not accept a bare
+// clock. The fallback retains time.Parse's variable-width hour handling.
+func parseClockFixedDigits(s string) (time.Time, bool) {
+	if len(s) != 5 && len(s) < 8 {
+		return time.Time{}, false
+	}
+	if s[2] != ':' {
+		return time.Time{}, false
+	}
+	digit2 := func(i int) (int, bool) {
+		a, b := s[i]-'0', s[i+1]-'0'
+		return int(a)*10 + int(b), a <= 9 && b <= 9
+	}
+	hour, hourOK := digit2(0)
+	minute, minuteOK := digit2(3)
+	if !hourOK || !minuteOK || hour > 23 || minute > 59 {
+		return time.Time{}, false
+	}
+	var second, nanos int
+	if len(s) >= 8 {
+		if s[5] != ':' {
+			return time.Time{}, false
+		}
+		var secondOK bool
+		second, secondOK = digit2(6)
+		if !secondOK || second > 59 {
+			return time.Time{}, false
+		}
+		if len(s) > 8 {
+			if len(s) == 9 || s[8] != '.' && s[8] != ',' {
+				return time.Time{}, false
+			}
+			scale := 100000000
+			for i := 9; i < len(s); i++ {
+				digit := s[i] - '0'
+				if digit > 9 {
+					return time.Time{}, false
+				}
+				nanos += int(digit) * scale
+				scale /= 10
+			}
+		}
+	}
+	return time.Date(0, time.January, 1, hour, minute, second, nanos, time.UTC), true
+}
+
 // ───────────────── the SQLite date/time function family ──────────────────────
 //
 // DATE, TIME, DATETIME, JULIANDAY, UNIXEPOCH and STRFTIME all share one
@@ -219,7 +294,7 @@ func parseTimeValue(val any) (time.Time, error) {
 // Timezone note: SQLite's 'now' and its rendering are UTC unless the
 // 'localtime' modifier is given. Here 'now' is the local wall clock, because
 // every other clock in this engine already is — NOW(), GETDATE(),
-// CURRENT_TIMESTAMP, CURRENT_DATE and TODAY all read time.Now() and keep its
+// CURRENT_TIMESTAMP, CURRENT_DATE and TODAY use the statement clock and keep its
 // location. Having datetime('now') disagree with CURRENT_TIMESTAMP inside the
 // same query would be a worse surprise than disagreeing with sqlite3 on a
 // machine that is not set to UTC, so the family follows the engine.
@@ -247,9 +322,9 @@ func rejectDateModifiers(fn string, args []Expr, accepted int) error {
 // this family — parseDateTime itself is shared with YEAR/MONTH/DATEDIFF/
 // OVERLAPS and others where a bare 'now' string is far more likely to be
 // malformed data than an intentional clock read.
-func parseSQLiteTimeValue(val any) (time.Time, error) {
+func parseSQLiteTimeValue(env ExecEnv, val any) (time.Time, error) {
 	if s, ok := val.(string); ok && strings.EqualFold(strings.TrimSpace(s), "now") {
-		return time.Now(), nil
+		return envNow(env), nil
 	}
 	return parseDateTime(val)
 }
@@ -258,48 +333,62 @@ func parseSQLiteTimeValue(val any) (time.Time, error) {
 // argument is absent — and rejects anything after it as an unsupported
 // modifier. valueIdx is 0 for DATE/TIME/DATETIME/JULIANDAY/UNIXEPOCH and 1 for
 // STRFTIME, whose first argument is the format string.
-func sqliteTimeArg(env ExecEnv, fn string, args []Expr, valueIdx int, row Row) (time.Time, error) {
+func sqliteTimeArg(env ExecEnv, fn string, args []Expr, valueIdx int, row Row) (time.Time, bool, error) {
 	if err := rejectDateModifiers(fn, args, valueIdx+1); err != nil {
-		return time.Time{}, err
+		return time.Time{}, false, err
 	}
 	if len(args) <= valueIdx {
-		return time.Now(), nil
+		return envNow(env), false, nil
 	}
 	val, err := evalExpr(env, args[valueIdx], row)
 	if err != nil {
-		return time.Time{}, err
+		return time.Time{}, false, err
 	}
-	return parseSQLiteTimeValue(val)
+	if val == nil {
+		return time.Time{}, true, nil
+	}
+	t, err := parseSQLiteTimeValue(env, val)
+	return t, false, err
 }
 
 func evalStrftime(env ExecEnv, args []Expr, row Row) (any, error) {
 	if len(args) < 1 {
 		return nil, fmt.Errorf("STRFTIME expects at least 1 argument: (format[, datetime])")
 	}
+	if err := rejectDateModifiers("STRFTIME", args, 2); err != nil {
+		return nil, err
+	}
 	formatVal, err := evalExpr(env, args[0], row)
 	if err != nil {
 		return nil, err
 	}
+	if formatVal == nil {
+		return nil, nil
+	}
 	format := valueText(formatVal)
 
-	t, err := sqliteTimeArg(env, "STRFTIME", args, 1, row)
-	if err != nil {
+	t, null, err := sqliteTimeArg(env, "STRFTIME", args, 1, row)
+	if err != nil || null {
 		return nil, err
 	}
-	return strftimeFormat(t, format), nil
+	formatted, ok := strftimeFormat(t, format)
+	if !ok {
+		return nil, nil
+	}
+	return formatted, nil
 }
 
 func evalDate(env ExecEnv, args []Expr, row Row) (any, error) {
-	t, err := sqliteTimeArg(env, "DATE", args, 0, row)
-	if err != nil {
+	t, null, err := sqliteTimeArg(env, "DATE", args, 0, row)
+	if err != nil || null {
 		return nil, err
 	}
 	return t.Format("2006-01-02"), nil
 }
 
 func evalTime(env ExecEnv, args []Expr, row Row) (any, error) {
-	t, err := sqliteTimeArg(env, "TIME", args, 0, row)
-	if err != nil {
+	t, null, err := sqliteTimeArg(env, "TIME", args, 0, row)
+	if err != nil || null {
 		return nil, err
 	}
 	return t.Format("15:04:05"), nil
@@ -311,8 +400,8 @@ func evalTime(env ExecEnv, args []Expr, row Row) (any, error) {
 // form; a caller writing datetime(...) is asking for SQLite's fixed-width
 // rendering and gets exactly that.
 func evalDatetime(env ExecEnv, args []Expr, row Row) (any, error) {
-	t, err := sqliteTimeArg(env, "DATETIME", args, 0, row)
-	if err != nil {
+	t, null, err := sqliteTimeArg(env, "DATETIME", args, 0, row)
+	if err != nil || null {
 		return nil, err
 	}
 	return t.Format("2006-01-02 15:04:05"), nil
@@ -330,8 +419,8 @@ const unixEpochJulianDay = 2440587.5
 // julianday() itself has no trouble with, and quietly wrapping would turn a
 // far-future date into a far-past one.
 func evalJulianday(env ExecEnv, args []Expr, row Row) (any, error) {
-	t, err := sqliteTimeArg(env, "JULIANDAY", args, 0, row)
-	if err != nil {
+	t, null, err := sqliteTimeArg(env, "JULIANDAY", args, 0, row)
+	if err != nil || null {
 		return nil, err
 	}
 	const secondsPerDay = 86400.0
@@ -343,8 +432,8 @@ func evalJulianday(env ExecEnv, args []Expr, row Row) (any, error) {
 // epoch, as an integer. Returned as int64 so it lands in an INT column and
 // compares as a number rather than as text.
 func evalUnixepoch(env ExecEnv, args []Expr, row Row) (any, error) {
-	t, err := sqliteTimeArg(env, "UNIXEPOCH", args, 0, row)
-	if err != nil {
+	t, null, err := sqliteTimeArg(env, "UNIXEPOCH", args, 0, row)
+	if err != nil || null {
 		return nil, err
 	}
 	return t.Unix(), nil
@@ -355,7 +444,7 @@ func evalYear(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, fmt.Errorf("YEAR expects 1 argument")
 	}
 	val, err := evalExpr(env, args[0], row)
-	if err != nil {
+	if err != nil || val == nil {
 		return nil, err
 	}
 	t, err := parseDateTime(val)
@@ -370,7 +459,7 @@ func evalMonth(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, fmt.Errorf("MONTH expects 1 argument")
 	}
 	val, err := evalExpr(env, args[0], row)
-	if err != nil {
+	if err != nil || val == nil {
 		return nil, err
 	}
 	t, err := parseDateTime(val)
@@ -385,7 +474,7 @@ func evalDay(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, fmt.Errorf("DAY expects 1 argument")
 	}
 	val, err := evalExpr(env, args[0], row)
-	if err != nil {
+	if err != nil || val == nil {
 		return nil, err
 	}
 	t, err := parseDateTime(val)
@@ -400,7 +489,7 @@ func evalHour(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, fmt.Errorf("HOUR expects 1 argument")
 	}
 	val, err := evalExpr(env, args[0], row)
-	if err != nil {
+	if err != nil || val == nil {
 		return nil, err
 	}
 	t, err := parseDateTime(val)
@@ -415,7 +504,7 @@ func evalMinute(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, fmt.Errorf("MINUTE expects 1 argument")
 	}
 	val, err := evalExpr(env, args[0], row)
-	if err != nil {
+	if err != nil || val == nil {
 		return nil, err
 	}
 	t, err := parseDateTime(val)
@@ -430,7 +519,7 @@ func evalSecond(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, fmt.Errorf("SECOND expects 1 argument")
 	}
 	val, err := evalExpr(env, args[0], row)
-	if err != nil {
+	if err != nil || val == nil {
 		return nil, err
 	}
 	t, err := parseDateTime(val)
@@ -472,6 +561,19 @@ func parseDateTime(val any) (time.Time, error) {
 	if t, ok := parseTimeFixedDigits(str); ok {
 		return t, nil
 	}
+	// These legacy layouts cannot overlap ISO timestamps. Try their matching
+	// shape before allocating errors for all the preceding ISO layouts.
+	var legacyLayout string
+	if len(str) == 10 && str[2] == '/' && str[5] == '/' {
+		legacyLayout = "01/02/2006"
+	} else if len(str) == 11 && str[2] == '-' && str[6] == '-' {
+		legacyLayout = "02-Jan-2006"
+	}
+	if legacyLayout != "" {
+		if t, err := time.Parse(legacyLayout, str); err == nil {
+			return t, nil
+		}
+	}
 	for _, f := range parseDateTimeFallbackFormats {
 		if t, err := time.Parse(f, str); err == nil {
 			return t, nil
@@ -480,47 +582,12 @@ func parseDateTime(val any) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("cannot parse '%s' as datetime", str)
 }
 
-// strftimeStaticReplacer covers the SQLite strftime codes whose Go
-// equivalents don't depend on the value of t, so a single package-level
-// *strings.Replacer can be reused across every call instead of building a
-// fresh map (and doing a ReplaceAll pass per entry) each time.
-var strftimeStaticReplacer = strings.NewReplacer(
-	"%Y", "2006",
-	"%m", "01",
-	"%d", "02",
-	"%H", "15",
-	"%M", "04",
-	"%S", "05",
-	"%%", "%",
-)
-
-// strftimeFormat converts SQLite-style strftime format to Go time
-func strftimeFormat(t time.Time, format string) string {
-	result := format
-	// %j/%W/%w/%s need a value computed from t, so only pay for that
-	// (and the ReplaceAll scan) when the format string actually uses them.
-	if strings.Contains(result, "%j") {
-		result = strings.ReplaceAll(result, "%j", fmt.Sprintf("%03d", t.YearDay()))
-	}
-	if strings.Contains(result, "%W") {
-		result = strings.ReplaceAll(result, "%W", fmt.Sprintf("%02d", (t.YearDay()-int(t.Weekday())+7)/7))
-	}
-	if strings.Contains(result, "%w") {
-		result = strings.ReplaceAll(result, "%w", strconv.Itoa(int(t.Weekday())))
-	}
-	if strings.Contains(result, "%s") {
-		result = strings.ReplaceAll(result, "%s", strconv.FormatInt(t.Unix(), 10))
-	}
-	result = strftimeStaticReplacer.Replace(result)
-	return t.Format(result)
-}
-
 func evalDayOfWeek(env ExecEnv, args []Expr, row Row) (any, error) {
 	if len(args) != 1 {
 		return nil, fmt.Errorf("DAYOFWEEK expects 1 argument")
 	}
 	val, err := evalExpr(env, args[0], row)
-	if err != nil {
+	if err != nil || val == nil {
 		return nil, err
 	}
 	t, err := parseDateTime(val)
@@ -535,7 +602,7 @@ func evalDayOfYear(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, fmt.Errorf("DAYOFYEAR expects 1 argument")
 	}
 	val, err := evalExpr(env, args[0], row)
-	if err != nil {
+	if err != nil || val == nil {
 		return nil, err
 	}
 	t, err := parseDateTime(val)
@@ -550,7 +617,7 @@ func evalWeekOfYear(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, fmt.Errorf("WEEKOFYEAR expects 1 argument")
 	}
 	val, err := evalExpr(env, args[0], row)
-	if err != nil {
+	if err != nil || val == nil {
 		return nil, err
 	}
 	t, err := parseDateTime(val)
@@ -566,7 +633,7 @@ func evalQuarter(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, fmt.Errorf("QUARTER expects 1 argument")
 	}
 	val, err := evalExpr(env, args[0], row)
-	if err != nil {
+	if err != nil || val == nil {
 		return nil, err
 	}
 	t, err := parseDateTime(val)
@@ -586,11 +653,22 @@ func evalQuarter(env ExecEnv, args []Expr, row Row) (any, error) {
 // 24*time.Hour — is what makes DATE_ADD/DATE_SUB correct across a DST
 // boundary; the two both used to inline this same switch verbatim.
 func applyDateUnitShift(t time.Time, interval float64, unit string) (time.Time, error) {
+	if math.IsNaN(interval) || math.IsInf(interval, 0) {
+		return t, fmt.Errorf("interval must be finite")
+	}
 	switch unit {
 	case "YEAR", "YEARS":
-		return t.AddDate(int(interval), 0, 0), nil
+		count, err := dateCalendarCount(interval)
+		if err != nil {
+			return t, err
+		}
+		return addDateChecked(t, count, 0, 0)
 	case "MONTH", "MONTHS":
-		return t.AddDate(0, int(interval), 0), nil
+		count, err := dateCalendarCount(interval)
+		if err != nil {
+			return t, err
+		}
+		return addDateChecked(t, 0, count, 0)
 	case "WEEK", "WEEKS":
 		// Scale to days BEFORE truncating, not after: int(interval)*7 (the
 		// previous version) truncated interval to a whole *week count*
@@ -598,18 +676,48 @@ func applyDateUnitShift(t time.Time, interval float64, unit string) (time.Time, 
 		// days a caller who wrote 13.3 DAY (the same duration) would get --
 		// up to nearly 7 days silently discarded, unlike every other unit
 		// here, which only ever loses a fraction of one output unit.
-		return t.AddDate(0, 0, int(interval*7)), nil
+		count, err := dateCalendarCount(interval * 7)
+		if err != nil {
+			return t, err
+		}
+		return addDateChecked(t, 0, 0, count)
 	case "DAY", "DAYS":
-		return t.AddDate(0, 0, int(interval)), nil
+		count, err := dateCalendarCount(interval)
+		if err != nil {
+			return t, err
+		}
+		return addDateChecked(t, 0, 0, count)
 	case "HOUR", "HOURS":
-		return t.Add(time.Duration(interval) * time.Hour), nil
+		clock, err := dateClockDuration(interval, time.Hour)
+		return t.Add(clock), err
 	case "MINUTE", "MINUTES":
-		return t.Add(time.Duration(interval) * time.Minute), nil
+		clock, err := dateClockDuration(interval, time.Minute)
+		return t.Add(clock), err
 	case "SECOND", "SECONDS":
-		return t.Add(time.Duration(interval) * time.Second), nil
+		clock, err := dateClockDuration(interval, time.Second)
+		return t.Add(clock), err
 	default:
 		return t, fmt.Errorf("unknown unit '%s'", unit)
 	}
+}
+
+func dateCalendarCount(interval float64) (int, error) {
+	const limit = float64(1 << (strconv.IntSize - 1))
+	count := math.Trunc(interval)
+	if math.IsNaN(count) || count < -limit || count >= limit {
+		return 0, fmt.Errorf("calendar interval out of range")
+	}
+	return int(count), nil
+}
+
+// Truncate in the input unit before scaling, as DATE_ADD/DATE_SUB already do.
+// All clock-unit bounds fit exactly in float64, including on 32-bit targets.
+func dateClockDuration(interval float64, unit time.Duration) (time.Duration, error) {
+	count := math.Trunc(interval)
+	if math.IsNaN(count) || count < float64(math.MinInt64/int64(unit)) || count > float64(math.MaxInt64/int64(unit)) {
+		return 0, fmt.Errorf("clock interval out of range")
+	}
+	return time.Duration(count) * unit, nil
 }
 
 // isoDurationRE matches an ISO 8601 duration: an optional leading '-', then
@@ -706,19 +814,48 @@ func parseISO8601Duration(s string) (isoDuration, error) {
 // (DATE_SUB's 2-argument form). The calendar components combine into one
 // AddDate call and the clock components into one Add call, each applied
 // exactly once, rather than one call per component.
-func (d isoDuration) shift(t time.Time, negate bool) time.Time {
+func (d isoDuration) shift(t time.Time, negate bool) (time.Time, error) {
 	sign := 1
 	if negate {
 		sign = -1
 	}
-	t = t.AddDate(sign*d.years, sign*d.months, sign*(d.weeks*7+d.days))
-	if d.hours != 0 || d.minutes != 0 || d.seconds != 0 {
-		clock := time.Duration(d.hours)*time.Hour +
-			time.Duration(d.minutes)*time.Minute +
-			time.Duration(d.seconds)*time.Second
-		t = t.Add(time.Duration(sign) * clock)
+	if d.weeks > math.MaxInt/7 || d.weeks < math.MinInt/7 {
+		return t, fmt.Errorf("calendar interval out of range")
 	}
-	return t
+	days := d.weeks * 7
+	if d.days > 0 && days > math.MaxInt-d.days || d.days < 0 && days < math.MinInt-d.days {
+		return t, fmt.Errorf("calendar interval out of range")
+	}
+	days += d.days
+	if negate && (d.years == math.MinInt || d.months == math.MinInt || days == math.MinInt) {
+		return t, fmt.Errorf("calendar interval out of range")
+	}
+	var clock time.Duration
+	for _, part := range []struct {
+		count int
+		unit  time.Duration
+	}{{d.hours, time.Hour}, {d.minutes, time.Minute}, {d.seconds, time.Second}} {
+		if part.count == 0 {
+			continue
+		}
+		span, err := dateClockDuration(float64(part.count), part.unit)
+		if err != nil {
+			return t, err
+		}
+		if span > 0 && clock > time.Duration(math.MaxInt64)-span || span < 0 && clock < time.Duration(math.MinInt64)-span {
+			return t, fmt.Errorf("clock interval out of range")
+		}
+		clock += span
+	}
+	if negate && clock == time.Duration(math.MinInt64) {
+		return t, fmt.Errorf("clock interval out of range")
+	}
+	var err error
+	t, err = addDateChecked(t, sign*d.years, sign*d.months, sign*days)
+	if err != nil {
+		return t, err
+	}
+	return t.Add(time.Duration(sign) * clock), nil
 }
 
 // evalDateAdd implements two call forms:
@@ -734,7 +871,7 @@ func evalDateAdd(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, fmt.Errorf("DATE_ADD expects (date, interval, unit) or (date, iso8601_duration)")
 	}
 	dateVal, err := evalExpr(env, args[0], row)
-	if err != nil {
+	if err != nil || dateVal == nil {
 		return nil, err
 	}
 	t, err := parseDateTime(dateVal)
@@ -744,7 +881,7 @@ func evalDateAdd(env ExecEnv, args []Expr, row Row) (any, error) {
 
 	if len(args) == 2 {
 		durVal, err := evalExpr(env, args[1], row)
-		if err != nil {
+		if err != nil || durVal == nil {
 			return nil, err
 		}
 		durStr, ok := durVal.(string)
@@ -755,7 +892,11 @@ func evalDateAdd(env ExecEnv, args []Expr, row Row) (any, error) {
 		if err != nil {
 			return nil, fmt.Errorf("DATE_ADD: %w", err)
 		}
-		return dur.shift(t, false), nil
+		result, err := dur.shift(t, false)
+		if err != nil {
+			return nil, fmt.Errorf("DATE_ADD: %w", err)
+		}
+		return result, nil
 	}
 
 	intervalVal, err := evalExpr(env, args[1], row)
@@ -765,6 +906,9 @@ func evalDateAdd(env ExecEnv, args []Expr, row Row) (any, error) {
 	unitVal, err := evalExpr(env, args[2], row)
 	if err != nil {
 		return nil, err
+	}
+	if intervalVal == nil || unitVal == nil {
+		return nil, nil
 	}
 	interval, ok := numeric(intervalVal)
 	if !ok {
@@ -786,7 +930,7 @@ func evalDateSub(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, fmt.Errorf("DATE_SUB expects (date, interval, unit) or (date, iso8601_duration)")
 	}
 	dateVal, err := evalExpr(env, args[0], row)
-	if err != nil {
+	if err != nil || dateVal == nil {
 		return nil, err
 	}
 	t, err := parseDateTime(dateVal)
@@ -796,7 +940,7 @@ func evalDateSub(env ExecEnv, args []Expr, row Row) (any, error) {
 
 	if len(args) == 2 {
 		durVal, err := evalExpr(env, args[1], row)
-		if err != nil {
+		if err != nil || durVal == nil {
 			return nil, err
 		}
 		durStr, ok := durVal.(string)
@@ -807,7 +951,11 @@ func evalDateSub(env ExecEnv, args []Expr, row Row) (any, error) {
 		if err != nil {
 			return nil, fmt.Errorf("DATE_SUB: %w", err)
 		}
-		return dur.shift(t, true), nil
+		result, err := dur.shift(t, true)
+		if err != nil {
+			return nil, fmt.Errorf("DATE_SUB: %w", err)
+		}
+		return result, nil
 	}
 
 	intervalVal, err := evalExpr(env, args[1], row)
@@ -817,6 +965,9 @@ func evalDateSub(env ExecEnv, args []Expr, row Row) (any, error) {
 	unitVal, err := evalExpr(env, args[2], row)
 	if err != nil {
 		return nil, err
+	}
+	if intervalVal == nil || unitVal == nil {
+		return nil, nil
 	}
 	interval, ok := numeric(intervalVal)
 	if !ok {

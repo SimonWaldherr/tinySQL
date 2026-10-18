@@ -25,6 +25,12 @@ func (p *Parser) parseFuncCallWithName(name string) (Expr, error) {
 	if err := p.expectSymbol("("); err != nil {
 		return nil, err
 	}
+	if name == "CONVERT" || name == "TRY_CONVERT" {
+		return p.parseConvertCall(name)
+	}
+	if name == "DATEPART" {
+		return p.parseDatePartCall(name)
+	}
 
 	// Handle CAST(expr AS type) specially
 	if name == "CAST" {
