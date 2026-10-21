@@ -60,6 +60,7 @@ type simpleAggregateProjection struct {
 	// argColumn is the resolved raw column index plus one, or zero when the
 	// argument needs evaluation. It belongs to this table-bound plan only.
 	argColumn  int
+	argBinary  *aggregateBinaryArg
 	groupIndex int // only used by aggGroupCol
 }
 
@@ -390,6 +391,9 @@ func accumulateSimpleAggregateState(env ExecEnv, rawPlan *simpleSelectPlan, raw 
 				state.counts[i]++
 			}
 		case aggSum, aggAvg:
+			if proj.argBinary != nil && proj.argBinary.accumulate(raw, state, i) {
+				continue
+			}
 			v, err := evalSimpleAggregateArg(rawPlan, raw, proj)
 			if err != nil {
 				return err
@@ -640,10 +644,13 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 	if !eligible || !hasAgg {
 		return nil, false, nil
 	}
-	// Resolve ordinary SUM/AVG/MIN/MAX/COUNT column arguments once, avoiding
-	// a name lookup for every aggregate of every source row. Unknown names
-	// and expressions retain the evaluator's existing error/lazy semantics.
+	// Bind direct arguments and simple SUM/AVG arithmetic once per execution.
+	// Unknown names and other expressions retain the evaluator's existing
+	// error/lazy semantics.
 	for i := range projs {
+		if projs[i].kind == aggSum || projs[i].kind == aggAvg {
+			projs[i].argBinary = buildAggregateBinaryArg(colIndex, projs[i].arg)
+		}
 		if ref, ok := projs[i].arg.(*VarRef); ok {
 			key := ref.Lower
 			if key == "" {

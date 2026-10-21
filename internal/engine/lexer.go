@@ -187,85 +187,74 @@ func (lx *lexer) tokenizeBlob(start int) token {
 	return token{Typ: tBlob, Val: string(decoded), Pos: start}
 }
 
-// Helper: tokenize string literals
 func (lx *lexer) tokenizeString(start int) token {
-	lx.next() // consume opening quote
-	// Fast path: most string literals contain no embedded '' escape, so scan
-	// ahead byte-wise for the closing quote first. A single-byte ASCII quote
-	// can never occur as a continuation byte of a multi-byte UTF-8 sequence,
-	// so this scan is safe regardless of the literal's content, and slicing
-	// the original string is both zero-copy and skips the decode/re-encode
-	// strings.Builder.WriteRune would otherwise do for every byte. The slow
-	// path below decodes every byte through utf8.DecodeRuneInString, which
-	// silently replaces malformed UTF-8 with U+FFFD -- so a plain slice is
-	// only equivalent when the content is valid UTF-8; malformed content
-	// must still fall back to the slow path to get the same sanitization.
-	contentStart := lx.pos
-	for i := contentStart; i < len(lx.s); i++ {
-		if lx.s[i] != '\'' {
-			continue
-		}
-		if i+1 < len(lx.s) && lx.s[i+1] == '\'' {
-			break // escaped quote present -- fall back to the slow path
-		}
-		if content := lx.s[contentStart:i]; utf8.ValidString(content) {
-			lx.pos = i + 1
-			return token{Typ: tString, Val: content, Pos: start}
-		}
-		break // malformed UTF-8 -- fall back to the slow path to sanitize it
-	}
-	var val strings.Builder
-	for lx.pos < len(lx.s) {
-		ch := lx.next()
-		if ch == '\'' {
-			if lx.peek() == '\'' {
-				lx.next()
-				val.WriteRune('\'')
-				continue
-			}
-			break
-		}
-		val.WriteRune(ch)
-	}
-	return token{Typ: tString, Val: val.String(), Pos: start}
+	return lx.tokenizeQuoted(start, '\'', tString)
 }
 
-// tokenizeQuotedIdent handles SQL-style double-quoted identifiers.
-// It preserves case and allows embedded double-quotes escaped by doubling ("").
 func (lx *lexer) tokenizeQuotedIdent(start int) token {
-	lx.next() // consume opening double-quote
-	// Same zero-copy fast path as tokenizeString, for the common case of no
-	// embedded "" escape and valid UTF-8 content (see tokenizeString for why
-	// malformed UTF-8 must still fall back to the sanitizing slow path).
-	contentStart := lx.pos
-	for i := contentStart; i < len(lx.s); i++ {
-		if lx.s[i] != '"' {
-			continue
-		}
-		if i+1 < len(lx.s) && lx.s[i+1] == '"' {
-			break // escaped quote present -- fall back to the slow path
-		}
-		if content := lx.s[contentStart:i]; utf8.ValidString(content) {
-			lx.pos = i + 1
-			return token{Typ: tIdent, Val: content, Pos: start}
-		}
-		break // malformed UTF-8 -- fall back to the slow path to sanitize it
-	}
-	var val strings.Builder
-	for lx.pos < len(lx.s) {
-		ch := lx.next()
-		if ch == '"' {
-			if lx.peek() == '"' {
-				lx.next()
-				val.WriteRune('"')
-				continue
-			}
+	return lx.tokenizeQuoted(start, '"', tIdent)
+}
+
+// tokenizeQuoted scans whole byte spans between ASCII quote delimiters. A
+// delimiter cannot split a UTF-8 rune. Count doubled quotes before allocating
+// so escaped values need one exactly sized buffer; plain values remain slices
+// of the SQL source.
+func (lx *lexer) tokenizeQuoted(start int, quote byte, typ tokenType) token {
+	begin := start + 1
+	end := begin
+	escapes := 0
+	for {
+		i := strings.IndexByte(lx.s[end:], quote)
+		if i < 0 {
+			end = len(lx.s)
+			lx.pos = end
 			break
 		}
-		val.WriteRune(ch)
+		end += i
+		if end+1 < len(lx.s) && lx.s[end+1] == quote {
+			escapes++
+			end += 2
+			continue
+		}
+		lx.pos = end + 1
+		break
 	}
-	// Return as identifier token (preserve original casing)
-	return token{Typ: tIdent, Val: val.String(), Pos: start}
+	content := lx.s[begin:end]
+	if !utf8.ValidString(content) {
+		// Keep the historical replacement of each malformed byte with U+FFFD.
+		// strings.ToValidUTF8 would collapse consecutive malformed bytes.
+		lx.pos = begin
+		return lx.tokenizeQuotedRunes(start, quote, typ)
+	}
+	if escapes == 0 {
+		return token{Typ: typ, Val: content, Pos: start}
+	}
+	var value strings.Builder
+	value.Grow(len(content) - escapes)
+	for escapes > 0 {
+		i := strings.IndexByte(content, quote)
+		value.WriteString(content[:i+1])
+		content = content[i+2:]
+		escapes--
+	}
+	value.WriteString(content)
+	return token{Typ: typ, Val: value.String(), Pos: start}
+}
+
+func (lx *lexer) tokenizeQuotedRunes(start int, quote byte, typ tokenType) token {
+	var value strings.Builder
+	for lx.pos < len(lx.s) {
+		ch := lx.next()
+		if ch == rune(quote) {
+			if lx.peek() == rune(quote) {
+				lx.next()
+			} else {
+				break
+			}
+		}
+		value.WriteRune(ch)
+	}
+	return token{Typ: typ, Val: value.String(), Pos: start}
 }
 
 // Helper: tokenize numeric literals. The token is a contiguous run in the

@@ -133,9 +133,12 @@ boundaries, parser and formatter measurements, and regression commands.
 MAKE_DATE/DATEFROMPARTS, LAST_DAY, DAYNAME, MONTHNAME and DATEPART provide
 calendar construction and component helpers. CONVERT/TRY_CONVERT support
 type-first conversion and a documented subset of explicit date styles.
-The calendar is proleptic Gregorian; JULIANDAY is a day number, not a separate
-calendar mode. SQL Server session settings and alternative calendars remain
-unsupported.
+Ordinary dates remain proleptic Gregorian. TO_CALENDAR, FROM_CALENDAR and
+CALENDAR_CONVERT provide explicit Julian, Discordian and Islamic civil
+conversion, plus ISO week and ordinal date formats. See
+[calendar conversion](calendar-conversion.md) for syntax and supported ranges.
+JULIANDAY remains an astronomical day number. SQL Server session settings and
+observational calendar variants remain unsupported.
 
 ## Important remaining gaps
 

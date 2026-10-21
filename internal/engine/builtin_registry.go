@@ -100,6 +100,9 @@ func getBuiltinFunctions() map[string]funcHandler {
 		"DAYNAME":           evalCalendarFunc,
 		"MONTHNAME":         evalCalendarFunc,
 		"DATEPART":          evalDatePartFunc,
+		"TO_CALENDAR":       evalCalendarConversion,
+		"FROM_CALENDAR":     evalCalendarConversion,
+		"CALENDAR_CONVERT":  evalCalendarConversion,
 		"RANDOM":            evalRandomFunc,
 		"RAND":              evalRandomFunc,
 		// Math functions

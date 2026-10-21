@@ -100,9 +100,9 @@ Materialized aggregation now shares the typed group lookup and query-local
 state arena used by raw aggregation. It no longer reserves a string-key map
 for half the input rows or allocates every accumulator slice separately for
 every group. This benefits grouped COUNT, SUM, AVG, MIN and MAX over subquery
-and join results. Materialized and scalar raw grouping use a pair of strings
-directly for two text grouping columns; other composite values and batch
-grouping retain the existing framed encoding.
+and join results. Materialized, scalar raw and batch grouping use a pair of strings
+directly for two text grouping columns; other composite values retain the
+existing framed encoding.
 
 Direct-column COUNT queries with at least 2,048 candidate rows can also use
 the batch kernel. Repeated COUNTs share extraction and validity masks, and an
@@ -153,4 +153,42 @@ workload and machine before choosing latency budgets.
 ```sh
 go test ./internal/engine -run 'TestCompositeGroupLookup|TestAggregateGroups|TestMaterializedGroupStore|TestAggregateCountBatches|TestDistinctCountInteger|TestCountDistinctIntegerSQL' -count=1
 go test ./internal/engine -run '^$' -bench '^(BenchmarkMaterializedAggregate|BenchmarkAggregateCompositeLookup|BenchmarkDistinctIntegerSet|BenchmarkDistinctIntegerSQL|BenchmarkAggregateCountBatches|BenchmarkAggregateCountKernel)$' -benchmem -benchtime=300ms -count=3 -cpu=1 -p=1
+```
+
+
+## Text-pair grouping in batches (2026-10-21)
+
+The batch aggregation loop now uses the existing text-pair group lookup for
+COUNT/SUM/AVG over two text dimensions. It avoids framing both strings for
+every input row and copying the encoded key for each new group. Other key
+types retain the local encoding buffer. Group states, encounter order and
+scalar fallback for decimal inputs are shared with the previous path.
+
+These measurements compare binaries built immediately before and after this
+change, with the same other working-tree changes and benchmark fixtures.
+Go 1.27.2, darwin/arm64, Apple M2 Max; 20,000 rows, COUNT(*), SUM(v), AVG(v).
+Medians of three alternating 250 ms runs, GOMAXPROCS=1 and -cpu=1; fixture
+construction and parsing are excluded. Short/long keys have 350 groups;
+unique keys have 20,000 groups. Times are indicative local measurements.
+
+| Keys | Time before → after | Bytes before → after | Allocations before → after |
+| --- | ---: | ---: | ---: |
+| Short text pairs | 990 → 838 µs | 310,370 → 321,074 | 1,842 → 1,492 |
+| Long text pairs | 1,160 → 1,050 µs | 361,155 → 321,074 | 1,844 → 1,492 |
+| Unique text pairs | 10.37 → 10.01 ms | 17,447,468 → 18,202,715 | 101,205 → 81,205 |
+| Integer control | 978 → 893 µs | 307,570 → 307,570 | 1,842 → 1,842 |
+| Mixed control | 977 → 978 µs | 309,810 → 309,810 | 1,842 → 1,842 |
+
+Wider inline map keys increase bytes by about 3–4% for short or unique keys;
+long keys reduce bytes by about 11%. This is not a universal memory reduction.
+The integer control's timing variation also cautions against attributing every
+latency difference to the change. Allocation differences are consistent.
+
+Differential tests cover NULL, Unicode, invalid UTF-8, separator characters,
+mixed key types, repeated grouping columns, HAVING/ORDER BY/LIMIT/OFFSET, and
+decimal fallback before, at and after batch boundaries.
+
+```sh
+go test ./internal/engine -run 'TestBatchTextGroupsMatchScalar' -count=1
+GOMAXPROCS=1 go test ./internal/engine -run '^$' -bench '^BenchmarkBatchTextGroups$' -benchmem -benchtime=250ms -count=3 -cpu=1
 ```

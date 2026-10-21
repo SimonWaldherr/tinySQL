@@ -331,6 +331,10 @@ func evalRawFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, erro
 	// through the argument-wrapper pool below evaluates discarded branches
 	// and can raise errors that their ordinary handlers would never reach.
 	switch ex.Name {
+	case "TO_CALENDAR", "FROM_CALENDAR", "CALENDAR_CONVERT":
+		return evalCalendarConversionCall(ex, func(arg Expr) (any, error) {
+			return evalRawExpr(plan, raw, arg)
+		})
 	case "CONVERT", "TRY_CONVERT":
 		return evalConvertCall(ex, func(arg Expr) (any, error) {
 			return evalRawExpr(plan, raw, arg)

@@ -185,6 +185,14 @@ func executeAggregateBatches(env ExecEnv, plan *simpleAggregatePlan, source *sim
 				// it through the group store on every row adds write barriers.
 				for i, id := range selected[:count] {
 					raw := rows[id]
+					if len(plan.groupCols) == 2 {
+						left, leftText := raw[plan.groupCols[0]].(string)
+						right, rightText := raw[plan.groupCols[1]].(string)
+						if leftText && rightText {
+							states[i] = groups.textPairState(left, right, raw, plan.groupCols)
+							continue
+						}
+					}
 					key = key[:0]
 					for j, col := range plan.groupCols {
 						if j != 0 {

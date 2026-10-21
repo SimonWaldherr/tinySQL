@@ -203,31 +203,14 @@ func evalTrimCommon(env ExecEnv, name string, side trimSide, args []Expr, row Ro
 func trimStringValue(val any, str, cutset string, side trimSide) (any, error) {
 	var trimmed string
 	if cutset == "" {
-		// Default: Unicode-aware whitespace trimming. strings.TrimSpace
-		// already has its own inlined ASCII fast path in the standard
-		// library, so the TRIM (both-sides) case goes straight there
-		// unchanged. TrimLeftFunc/TrimRightFunc do not have an equivalent:
-		// they decode each rune and make an indirect call through the
-		// predicate argument (unicode.IsSpace) even for a plain-ASCII
-		// string, where every whitespace rune unicode.IsSpace would report
-		// is already one of the six bytes asciiIsSpace checks directly.
-		// LTRIM/RTRIM run on every row of a scan, so skip the indirect
-		// per-rune calls whenever the whole string is ASCII (checked once
-		// via stringIsASCII, the same fast-path pattern stringPrefix/LENGTH
-		// already use) and fall back to the general Unicode path otherwise.
+		// Inspect only the requested edge. An ASCII check of the entire
+		// string would make trimming a short prefix/suffix scale with the
+		// untouched text. Decode Unicode only if the edge reaches it.
 		switch side {
 		case trimLeft:
-			if stringIsASCII(str) {
-				trimmed = asciiTrimLeftSpace(str)
-			} else {
-				trimmed = strings.TrimLeftFunc(str, unicode.IsSpace)
-			}
+			trimmed = trimLeftSpace(str)
 		case trimRight:
-			if stringIsASCII(str) {
-				trimmed = asciiTrimRightSpace(str)
-			} else {
-				trimmed = strings.TrimRightFunc(str, unicode.IsSpace)
-			}
+			trimmed = trimRightSpace(str)
 		default:
 			trimmed = strings.TrimSpace(str)
 		}
@@ -250,12 +233,7 @@ func trimStringValue(val any, str, cutset string, side trimSide) (any, error) {
 	return trimmed, nil
 }
 
-// asciiIsSpace matches unicode.IsSpace's verdict for every rune a
-// stringIsASCII string can actually decode to: unicode.IsSpace treats two
-// extra Latin-1 codepoints (NEL 0x85, NBSP 0xA0) as space, but neither is
-// representable as a single ASCII byte (both are >= 0x80), so they can never
-// appear in a string stringIsASCII has already confirmed is all single-byte
-// runes -- making this exactly equivalent to unicode.IsSpace there.
+// asciiIsSpace matches unicode.IsSpace for ASCII bytes.
 func asciiIsSpace(b byte) bool {
 	switch b {
 	case ' ', '\t', '\n', '\v', '\f', '\r':
@@ -264,22 +242,24 @@ func asciiIsSpace(b byte) bool {
 	return false
 }
 
-// asciiTrimLeftSpace/asciiTrimRightSpace are strings.TrimLeftFunc(str,
-// unicode.IsSpace)/TrimRightFunc(str, unicode.IsSpace) for a string already
-// known to be pure ASCII: a direct byte scan instead of decoding each rune
-// and making an indirect call through the predicate for every one of them.
-func asciiTrimLeftSpace(str string) string {
+func trimLeftSpace(str string) string {
 	i := 0
 	for i < len(str) && asciiIsSpace(str[i]) {
 		i++
 	}
+	if i < len(str) && str[i] >= utf8.RuneSelf {
+		return strings.TrimLeftFunc(str[i:], unicode.IsSpace)
+	}
 	return str[i:]
 }
 
-func asciiTrimRightSpace(str string) string {
+func trimRightSpace(str string) string {
 	i := len(str)
 	for i > 0 && asciiIsSpace(str[i-1]) {
 		i--
+	}
+	if i > 0 && str[i-1] >= utf8.RuneSelf {
+		return strings.TrimRightFunc(str[:i], unicode.IsSpace)
 	}
 	return str[:i]
 }
@@ -461,23 +441,37 @@ func evalLength(env ExecEnv, args []Expr, row Row) (any, error) {
 func stringRunes(str string) []rune { return []rune(str) }
 
 func stringIsASCII(str string) bool {
-	for i := 0; i < len(str); i++ {
-		if str[i] >= utf8.RuneSelf {
-			return false
-		}
-	}
-	return true
+	return stringASCIIPrefixLen(str) == len(str)
 }
 
-// stringCharCount returns the character count of str without materializing
-// a []rune, taking the same ASCII fast path stringPrefix already uses so
-// callers that only need a count (not the runes themselves) can avoid the
-// allocation stringRunes(str) would otherwise force.
-func stringCharCount(str string) int {
-	if stringIsASCII(str) {
-		return len(str)
+// Check eight bytes at a time without decoding runes or using unsafe loads.
+// A set high bit stops the word scan; the byte loop finds the exact boundary.
+func stringASCIIPrefixLen(str string) int {
+	i := 0
+	for len(str)-i >= 8 {
+		chunk := str[i:]
+		_ = chunk[7] // One bounds check for all eight bytes.
+		word := uint64(chunk[0]) | uint64(chunk[1])<<8 | uint64(chunk[2])<<16 | uint64(chunk[3])<<24 |
+			uint64(chunk[4])<<32 | uint64(chunk[5])<<40 | uint64(chunk[6])<<48 | uint64(chunk[7])<<56
+		if word&0x8080808080808080 != 0 {
+			break
+		}
+		i += 8
 	}
-	return utf8.RuneCountInString(str)
+	for i < len(str) && str[i] < utf8.RuneSelf {
+		i++
+	}
+	return i
+}
+
+// Count a known ASCII prefix directly and decode only the remaining suffix.
+// RuneCountInString retains one character per malformed UTF-8 byte.
+func stringCharCount(str string) int {
+	prefix := stringASCIIPrefixLen(str)
+	if prefix == len(str) {
+		return prefix
+	}
+	return prefix + utf8.RuneCountInString(str[prefix:])
 }
 
 func stringPrefix(str string, length int) string {

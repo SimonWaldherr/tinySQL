@@ -92,19 +92,23 @@ func (g *aggregateGroups) state(raw []any, cols []int) *simpleAggregateState {
 		left, leftText := raw[cols[0]].(string)
 		right, rightText := raw[cols[1]].(string)
 		if leftText && rightText {
-			key := [2]string{left, right}
-			if state := g.textPairs[key]; state != nil {
-				return state
-			}
-			if g.textPairs == nil {
-				g.textPairs = make(map[[2]string]*simpleAggregateState)
-			}
-			state := g.newState(raw, cols)
-			g.textPairs[key] = state
-			return state
+			return g.textPairState(left, right, raw, cols)
 		}
 	}
 	return g.encodedState(raw, cols)
+}
+
+func (g *aggregateGroups) textPairState(left, right string, raw []any, cols []int) *simpleAggregateState {
+	key := [2]string{left, right}
+	if state := g.textPairs[key]; state != nil {
+		return state
+	}
+	if g.textPairs == nil {
+		g.textPairs = make(map[[2]string]*simpleAggregateState)
+	}
+	state := g.newState(raw, cols)
+	g.textPairs[key] = state
+	return state
 }
 
 func (g *aggregateGroups) fixedState(i int, raw []any, cols []int) *simpleAggregateState {

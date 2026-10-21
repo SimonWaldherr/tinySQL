@@ -60,8 +60,10 @@ unit counts is retained.
 Dates use the proleptic Gregorian calendar: its leap-year rules apply even to
 historical dates, without a Julian/Gregorian cutover. ISO week dates are
 available through STRFTIME, WEEKOFYEAR and DATEPART. JULIANDAY produces an
-astronomical day number; it does not switch to the Julian calendar. Julian,
-Discordian, Hijri and other calendar systems are not implemented.
+astronomical day number; it does not switch to the Julian calendar.
+Explicit [calendar conversion functions](calendar-conversion.md) support the
+Julian, Discordian and Islamic civil calendars, ISO week dates and ordinal
+dates without changing the interpretation of ordinary date functions.
 
 | Function | Result |
 | --- | --- |

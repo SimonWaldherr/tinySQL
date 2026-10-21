@@ -328,6 +328,9 @@ func buildRawFilterBinary(colIndex map[string]int, ex *Binary) func([]any) (bool
 }
 
 func buildRawAndFilter(colIndex map[string]int, leftExpr, rightExpr Expr) func([]any) (bool, error) {
+	if filter := buildRawRangeFilter(colIndex, leftExpr, rightExpr, false); filter != nil {
+		return filter
+	}
 	left := buildRawFilterSpecialized(colIndex, leftExpr)
 	right := buildRawFilterSpecialized(colIndex, rightExpr)
 	if left != nil && right != nil {
@@ -394,6 +397,9 @@ func buildRawAndFilterWithFallback(colIndex map[string]int, expr Expr, fastFilte
 }
 
 func buildRawOrFilter(colIndex map[string]int, leftExpr, rightExpr Expr) func([]any) (bool, error) {
+	if filter := buildRawRangeFilter(colIndex, leftExpr, rightExpr, true); filter != nil {
+		return filter
+	}
 	left := buildRawFilterSpecialized(colIndex, leftExpr)
 	right := buildRawFilterSpecialized(colIndex, rightExpr)
 	if left != nil && right != nil {
