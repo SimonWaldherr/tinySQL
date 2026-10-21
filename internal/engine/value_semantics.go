@@ -205,8 +205,7 @@ func compare(a, b any) (int, error) {
 func compareBigRat(ax *big.Rat, b any) (int, error) {
 	// Try to convert b to big.Rat
 	if bx, ok := storage.DecimalFromAny(b); ok {
-		rb := new(big.Rat).Set(bx)
-		return ax.Cmp(rb), nil
+		return compareDecimalRats(ax, bx), nil
 	}
 	// If b is numeric (int/float), convert
 	switch bx := b.(type) {

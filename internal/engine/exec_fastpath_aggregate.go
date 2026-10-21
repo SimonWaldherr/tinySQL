@@ -101,7 +101,13 @@ func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 		return rs, used, err
 	}
 
+	var accessPhase *queryPhase
+	if env.profile != nil {
+		_, accessPhase = startQueryPhase(env, "PLAN/INDEX", "aggregate source access")
+		defer accessPhase.finish(-1)
+	}
 	rawPlan, err := buildSimpleAggregateSourcePlan(plan)
+	accessPhase.finish(0)
 	if err != nil {
 		return nil, true, err
 	}
@@ -134,10 +140,15 @@ func executeUnfilteredCountStar(env ExecEnv, plan *simpleAggregatePlan) (*Result
 	if err := checkCtx(env.ctx); err != nil {
 		return nil, true, err
 	}
+	var phase *queryPhase
+	if env.profile != nil {
+		_, phase = startQueryPhase(env, "COUNT", "visible table cardinality")
+	}
 	state := newSimpleAggregateState(nil, len(plan.projs))
 	for i := range state.counts {
 		state.counts[i] = len(plan.table.Rows)
 	}
+	phase.finish(1)
 	rs, err := finalizeSimpleAggregateResultSet(env, plan, []*simpleAggregateState{state})
 	return rs, true, err
 }
@@ -158,10 +169,18 @@ func executeConstraintMaximum(env ExecEnv, plan *simpleAggregatePlan) (*ResultSe
 	if constraint != storage.PrimaryKey && constraint != storage.Unique {
 		return nil, false, nil
 	}
-	value, used, err := cachedConstraintMaximum(env, plan.table, col)
+	cacheEnv := env
+	var cachePhase *queryPhase
+	if env.profile != nil {
+		cacheEnv, cachePhase = startQueryPhase(env, "PLAN/INDEX", "constraint maximum cache lookup")
+		defer cachePhase.finish(-1)
+	}
+	value, used, err := cachedConstraintMaximum(cacheEnv, plan.table, col)
 	if !used || err != nil {
+		cachePhase.finish(0)
 		return nil, used, err
 	}
+	cachePhase.finish(1)
 	state := newSimpleAggregateState(nil, 1)
 	state.minmax[0], state.haveMinMax[0] = value, value != nil
 	rs, err := finalizeSimpleAggregateResultSet(env, plan, []*simpleAggregateState{state})
@@ -187,6 +206,11 @@ func cachedConstraintMaximum(env ExecEnv, table *storage.Table, col int) (any, b
 		return nil, false, nil
 	}
 	if !entry.maxKnown {
+		var scanPhase *queryPhase
+		if env.profile != nil {
+			_, scanPhase = startQueryPhase(env, "SCAN/AGGREGATE", "populate cached maximum")
+			defer scanPhase.finish(-1)
+		}
 		entry.maxKnown, entry.maxValue = true, nil
 		for i, row := range table.Rows {
 			if i&255 == 0 {
@@ -199,6 +223,7 @@ func cachedConstraintMaximum(env ExecEnv, table *storage.Table, col int) (any, b
 				entry.observeMaximum(row[col], i)
 			}
 		}
+		scanPhase.finish(1)
 	}
 	return entry.maxValue, true, nil
 }
@@ -217,6 +242,11 @@ func buildSimpleAggregateSourcePlan(plan *simpleAggregatePlan) (*simpleSelectPla
 }
 
 func executeSimpleSingleGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, rawPlan *simpleSelectPlan) (*ResultSet, bool, error) {
+	var scanPhase *queryPhase
+	if env.profile != nil {
+		_, scanPhase = startQueryPhase(env, "SCAN/FILTER/AGGREGATE", "raw scalar accumulation")
+		defer scanPhase.finish(-1)
+	}
 	groups := newAggregateGroups(plan.projs, len(plan.groupCols))
 	rowCount := len(plan.table.Rows)
 	if rawPlan.rowIDs != nil {
@@ -250,11 +280,17 @@ func executeSimpleSingleGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, r
 			return nil, true, err
 		}
 	}
+	scanPhase.finish(int64(len(groups.order)))
 	rs, err := finalizeSimpleAggregateResultSet(env, plan, groups.order)
 	return rs, true, err
 }
 
 func executeSimpleMultiGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, rawPlan *simpleSelectPlan) (*ResultSet, bool, error) {
+	var scanPhase *queryPhase
+	if env.profile != nil {
+		_, scanPhase = startQueryPhase(env, "SCAN/FILTER/AGGREGATE", "raw scalar accumulation")
+		defer scanPhase.finish(-1)
+	}
 	groups := newAggregateGroups(plan.projs, len(plan.groupCols))
 	rowCount := len(plan.table.Rows)
 	if rawPlan.rowIDs != nil {
@@ -296,6 +332,7 @@ func executeSimpleMultiGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, ra
 	if len(plan.groupCols) == 0 && len(groups.order) == 0 {
 		groups.state(nil, nil)
 	}
+	scanPhase.finish(int64(len(groups.order)))
 	rs, err := finalizeSimpleAggregateResultSet(env, plan, groups.order)
 	return rs, true, err
 }
@@ -433,6 +470,11 @@ func accumulateSimpleAggregateState(env ExecEnv, rawPlan *simpleSelectPlan, raw 
 // back to rowsFromTable and allocating a Row map for every input row.
 func finalizeSimpleAggregateResultSet(env ExecEnv, plan *simpleAggregatePlan, order []*simpleAggregateState) (*ResultSet, error) {
 	if plan.having != nil {
+		var havingPhase *queryPhase
+		if env.profile != nil {
+			_, havingPhase = startQueryPhase(env, "HAVING", "filter aggregate states")
+			defer havingPhase.finish(-1)
+		}
 		kept := order[:0]
 		for i, state := range order {
 			if i&63 == 0 {
@@ -449,10 +491,21 @@ func finalizeSimpleAggregateResultSet(env ExecEnv, plan *simpleAggregatePlan, or
 			}
 		}
 		order = kept
+		havingPhase.finish(int64(len(order)))
+	}
+	var projectPhase *queryPhase
+	if env.profile != nil {
+		_, projectPhase = startQueryPhase(env, "PROJECT", "materialize aggregate results")
 	}
 	result := simpleAggregateResultSet(plan.projs, plan.outputCols, order)
+	projectPhase.finish(int64(len(result.Rows)))
 	if len(plan.orderBy) > 0 {
+		var sortPhase *queryPhase
+		if env.profile != nil {
+			_, sortPhase = startQueryPhase(env, "SORT", "order aggregate results")
+		}
 		result.Rows = applySortOrderWithLimit(plan.orderBy, result.Rows, plan.limit, plan.offset)
+		sortPhase.finish(int64(len(result.Rows)))
 	}
 	result.Rows = applyOffsetLimit(&Select{Limit: plan.limit, Offset: plan.offset}, result.Rows)
 	return result, nil

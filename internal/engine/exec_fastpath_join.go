@@ -16,9 +16,20 @@ func executeSimpleJoinFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error)
 		return nil, ok, err
 	}
 
+	var lookupPhase *queryPhase
+	if env.profile != nil {
+		_, lookupPhase = startQueryPhase(env, "JOIN LOOKUP", "build or reuse right hash index; distinct keys")
+		defer lookupPhase.finish(-1)
+	}
 	rightByKey, err := plan.rightRowsByKey()
 	if err != nil {
 		return nil, true, err
+	}
+	lookupPhase.finish(int64(len(rightByKey.byKey)))
+	var probePhase *queryPhase
+	if env.profile != nil {
+		_, probePhase = startQueryPhase(env, "JOIN PROBE/FILTER/PROJECT", "raw equi-join")
+		defer probePhase.finish(-1)
 	}
 
 	outRows := make([]Row, 0, min(len(plan.left.Rows), len(plan.right.Rows)))
@@ -58,6 +69,7 @@ func executeSimpleJoinFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error)
 			outRows = append(outRows, out)
 		}
 	}
+	probePhase.finish(int64(len(outRows)))
 	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, true, nil
 }
 

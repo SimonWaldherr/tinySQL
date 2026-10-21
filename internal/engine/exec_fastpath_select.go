@@ -37,6 +37,11 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 		return executeSimpleSelectUnfilteredFastPath(env, plan)
 	}
 
+	var scanPhase *queryPhase
+	if env.profile != nil {
+		_, scanPhase = startQueryPhase(env, "SCAN/FILTER/PROJECT", "raw filtered scan")
+		defer scanPhase.finish(-1)
+	}
 	initialCap := simpleSelectInitialCap(plan)
 	if plan.limit != nil && *plan.limit >= 0 {
 		initialCap = min(initialCap, *plan.limit)
@@ -114,6 +119,7 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 		}
 	}
 
+	scanPhase.finish(int64(len(outRows)))
 	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, true, nil
 }
 
@@ -161,6 +167,11 @@ func executeSimpleSelectDistinctFastPath(env ExecEnv, plan *simpleSelectPlan) (*
 		return &ResultSet{Cols: plan.outputCols, Rows: []Row{}}, true, nil
 	}
 
+	var scanPhase *queryPhase
+	if env.profile != nil {
+		_, scanPhase = startQueryPhase(env, "SCAN/FILTER/PROJECT/DISTINCT", "raw distinct scan")
+		defer scanPhase.finish(-1)
+	}
 	rows := simplePlanRows(plan)
 	rowCount := len(rows)
 	if plan.rowIDs != nil {
@@ -254,8 +265,14 @@ func executeSimpleSelectDistinctFastPath(env ExecEnv, plan *simpleSelectPlan) (*
 		}
 	}
 
+	scanPhase.finish(int64(len(outRows)))
 	if len(plan.orderBy) > 0 {
+		var sortPhase *queryPhase
+		if env.profile != nil {
+			_, sortPhase = startQueryPhase(env, "SORT", "order distinct results")
+		}
 		outRows = applySortOrderWithLimit(plan.orderBy, outRows, plan.limit, plan.offset)
+		sortPhase.finish(int64(len(outRows)))
 		outRows = applyOffsetLimit(&Select{Limit: plan.limit, Offset: plan.offset}, outRows)
 	}
 	if outRows == nil {
@@ -295,6 +312,11 @@ func executeSimpleSelectUnfilteredFastPath(env ExecEnv, plan *simpleSelectPlan) 
 		end = start + *plan.limit
 	}
 
+	var scanPhase *queryPhase
+	if env.profile != nil {
+		_, scanPhase = startQueryPhase(env, "SCAN/PROJECT", "raw unfiltered page")
+		defer scanPhase.finish(-1)
+	}
 	outRows := make([]Row, 0, end-start)
 	for i, raw := range rows[start:end] {
 		// The first source row was checked above. Continue at the same 64-row
@@ -310,6 +332,7 @@ func executeSimpleSelectUnfilteredFastPath(env ExecEnv, plan *simpleSelectPlan) 
 		}
 		outRows = append(outRows, out)
 	}
+	scanPhase.finish(int64(len(outRows)))
 	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, true, nil
 }
 
@@ -363,6 +386,11 @@ func simpleFloatOrderColumn(plan *simpleSelectPlan) (int, bool) {
 // same < and > comparisons as compareFloat, including treating NaN as equal
 // to every other value, so it preserves the generic comparator's behavior.
 func executeSimpleSelectFloatOrderedTopN(env ExecEnv, plan *simpleSelectPlan, sourceRows [][]any, column, keepCount int) (*ResultSet, error) {
+	var scanPhase *queryPhase
+	if env.profile != nil {
+		_, scanPhase = startQueryPhase(env, "SCAN/TOP-N", "raw float ordering")
+		defer scanPhase.finish(-1)
+	}
 	topRows := floatOrderedRawRowHeap{
 		desc:  plan.orderBy[0].Desc,
 		items: make([]floatOrderedRawRow, 0, simpleSelectInitialCap(plan)),
@@ -377,7 +405,13 @@ func executeSimpleSelectFloatOrderedTopN(env ExecEnv, plan *simpleSelectPlan, so
 	}
 
 	rows := topRows.items
+	scanPhase.finish(int64(len(rows)))
+	var sortPhase *queryPhase
+	if env.profile != nil {
+		_, sortPhase = startQueryPhase(env, "SORT", "order retained float candidates")
+	}
 	sort.Stable(floatOrderedRawRowsAsc{desc: topRows.desc, items: rows})
+	sortPhase.finish(int64(len(rows)))
 	start := 0
 	if plan.offset != nil && *plan.offset > 0 {
 		start = *plan.offset
@@ -390,6 +424,11 @@ func executeSimpleSelectFloatOrderedTopN(env ExecEnv, plan *simpleSelectPlan, so
 		rows = rows[:*plan.limit]
 	}
 
+	var projectPhase *queryPhase
+	if env.profile != nil {
+		_, projectPhase = startQueryPhase(env, "PROJECT", "materialize ordered page")
+		defer projectPhase.finish(-1)
+	}
 	outRows := make([]Row, 0, len(rows))
 	for _, item := range rows {
 		out, err := projectRawRow(plan, item.raw)
@@ -398,6 +437,7 @@ func executeSimpleSelectFloatOrderedTopN(env ExecEnv, plan *simpleSelectPlan, so
 		}
 		outRows = append(outRows, out)
 	}
+	projectPhase.finish(int64(len(outRows)))
 	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, nil
 }
 
@@ -507,6 +547,11 @@ func simpleFloatOrderScorer(plan *simpleSelectPlan) (rawFloatScorer, bool) {
 }
 
 func executeSimpleSelectFloatScoredTopN(env ExecEnv, plan *simpleSelectPlan, sourceRows [][]any, rowCount, keepCount int, score rawFloatScorer) (*ResultSet, error) {
+	var scanPhase *queryPhase
+	if env.profile != nil {
+		_, scanPhase = startQueryPhase(env, "SCAN/FILTER/TOP-N", "raw floating-point scoring")
+		defer scanPhase.finish(-1)
+	}
 	topRows := floatOrderedRawRowHeap{
 		desc:  plan.orderBy[0].Desc,
 		items: make([]floatOrderedRawRow, 0, simpleSelectInitialCap(plan)),
@@ -540,7 +585,13 @@ func executeSimpleSelectFloatScoredTopN(env ExecEnv, plan *simpleSelectPlan, sou
 	}
 
 	rows := topRows.items
+	scanPhase.finish(int64(len(rows)))
+	var sortPhase *queryPhase
+	if env.profile != nil {
+		_, sortPhase = startQueryPhase(env, "SORT", "order retained float candidates")
+	}
 	sort.Stable(floatOrderedRawRowsAsc{desc: topRows.desc, items: rows})
+	sortPhase.finish(int64(len(rows)))
 	start := 0
 	if plan.offset != nil && *plan.offset > 0 {
 		start = *plan.offset
@@ -552,6 +603,11 @@ func executeSimpleSelectFloatScoredTopN(env ExecEnv, plan *simpleSelectPlan, sou
 	if *plan.limit < len(rows) {
 		rows = rows[:*plan.limit]
 	}
+	var projectPhase *queryPhase
+	if env.profile != nil {
+		_, projectPhase = startQueryPhase(env, "PROJECT", "materialize ordered page")
+		defer projectPhase.finish(-1)
+	}
 	outRows := make([]Row, 0, len(rows))
 	for _, item := range rows {
 		out, err := projectRawRow(plan, item.raw)
@@ -560,6 +616,7 @@ func executeSimpleSelectFloatScoredTopN(env ExecEnv, plan *simpleSelectPlan, sou
 		}
 		outRows = append(outRows, out)
 	}
+	projectPhase.finish(int64(len(outRows)))
 	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, nil
 }
 
@@ -678,6 +735,11 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 		// coercion makes this true for normal FLOAT/FLOAT64 tables; direct
 		// storage callers can still provide NULL or a different Go type, which
 		// must follow generic SQL ordering instead.
+		var validatePhase *queryPhase
+		if env.profile != nil {
+			_, validatePhase = startQueryPhase(env, "VALIDATE", "float ordering source types")
+			defer validatePhase.finish(-1)
+		}
 		allFloat64 := true
 		for i, raw := range sourceRows {
 			if i&63 == 0 {
@@ -694,10 +756,23 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 				break
 			}
 		}
+		validatePhase.finish(0)
 		if allFloat64 {
 			rs, err := executeSimpleSelectFloatOrderedTopN(env, plan, sourceRows, column, keepCount)
 			return rs, true, err
 		}
+	}
+
+	var scanPhase *queryPhase
+	if env.profile != nil {
+		detail := "collect raw ordering keys"
+		operation := "SCAN/FILTER"
+		if keepCount > 0 {
+			detail = "retain bounded ordering candidates"
+			operation = "SCAN/FILTER/TOP-N"
+		}
+		_, scanPhase = startQueryPhase(env, operation, detail)
+		defer scanPhase.finish(-1)
 	}
 
 	// A bounded top-N query stores candidates in topRows. Do not also allocate
@@ -800,6 +875,11 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 		rows = topRows.items
 	}
 
+	scanPhase.finish(int64(len(rows)))
+	var sortPhase *queryPhase
+	if env.profile != nil {
+		_, sortPhase = startQueryPhase(env, "SORT", "order raw candidates")
+	}
 	// Sort a permutation of positions instead of the items themselves: a swap
 	// moves 4 bytes instead of a whole orderedRawRow, which is what dominates
 	// large sorts. perm starts as the identity permutation, so its values are
@@ -812,6 +892,7 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 		perm[i] = int32(i)
 	}
 	sort.Sort(orderedRawRowsPermAsc{plan: plan, items: rows, perm: perm})
+	sortPhase.finish(int64(len(rows)))
 
 	start := 0
 	if plan.offset != nil && *plan.offset > 0 {
@@ -825,6 +906,11 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 		perm = perm[:*plan.limit]
 	}
 
+	var projectPhase *queryPhase
+	if env.profile != nil {
+		_, projectPhase = startQueryPhase(env, "PROJECT", "materialize ordered page")
+		defer projectPhase.finish(-1)
+	}
 	outRows := make([]Row, 0, len(perm))
 	for _, p := range perm {
 		out, err := projectRawRow(plan, rows[p].raw)
@@ -833,6 +919,7 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 		}
 		outRows = append(outRows, out)
 	}
+	projectPhase.finish(int64(len(outRows)))
 	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, true, nil
 }
 

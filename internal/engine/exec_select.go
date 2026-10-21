@@ -12,8 +12,47 @@ import (
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
-func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
-	cteEnv, err := processCTEs(env, s)
+func executeSelect(env ExecEnv, s *Select) (result *ResultSet, err error) {
+	if env.profile != nil {
+		var phase *queryPhase
+		detail := s.From.Table
+		if s.From.Subquery != nil {
+			detail = "derived table"
+		} else if s.From.TableFunc != nil {
+			detail = "table function"
+		} else if detail == "" {
+			detail = "constant row"
+		}
+		if s.From.Alias != "" {
+			detail += " AS " + s.From.Alias
+		}
+		env, phase = startQueryPhase(env, "SELECT", detail)
+		defer func() {
+			var rows int64
+			if result != nil {
+				rows = int64(len(result.Rows))
+			}
+			phase.finish(rows)
+		}()
+	}
+	cteInput := env
+	var ctePhase *queryPhase
+	if len(s.CTEs) > 0 {
+		cteInput, ctePhase = startQueryPhase(env, "CTE", "materialize common table expressions")
+	}
+	cteEnv, err := processCTEs(cteInput, s)
+	if ctePhase != nil {
+		var rows int64
+		for _, cte := range s.CTEs {
+			if rs := cteEnv.ctes[strings.ToLower(cte.Name)]; rs != nil {
+				rows += int64(len(rs.Rows))
+			}
+		}
+		ctePhase.finish(rows)
+		// Keep the bindings created by processCTEs, but make subsequent
+		// execution phases siblings of CTE materialization.
+		cteEnv.profileParent = env.profileParent
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +100,9 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 	}
 
 	// FROM (Tabelle, CTE oder Subselect) - now optional
-	leftRows, err := resolveFromClause(cteEnv, cteEnv, s)
+	phaseEnv, phase := startQueryPhase(cteEnv, "SOURCE", "materialize FROM rows")
+	leftRows, err := resolveFromClause(phaseEnv, phaseEnv, s)
+	phase.finish(int64(len(leftRows)))
 	if err != nil {
 		return nil, err
 	}
@@ -69,37 +110,68 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 	cur := leftRows
 
 	// JOINs
-	cur, err = processJoins(cteEnv, s.Joins, cur)
+	phaseEnv = cteEnv
+	phase = nil
+	if len(s.Joins) > 0 {
+		phaseEnv, phase = startQueryPhase(cteEnv, "JOIN", "general joins")
+	}
+	cur, err = processJoins(phaseEnv, s.Joins, cur)
+	phase.finish(int64(len(cur)))
 	if err != nil {
 		return nil, err
 	}
 
 	// WHERE
-	filtered, err := applyWhereClause(cteEnv, s.Where, cur)
+	phaseEnv = cteEnv
+	phase = nil
+	if s.Where != nil {
+		phaseEnv, phase = startQueryPhase(cteEnv, "FILTER", "WHERE")
+	}
+	filtered, err := applyWhereClause(phaseEnv, s.Where, cur)
+	phase.finish(int64(len(filtered)))
 	if err != nil {
 		return nil, err
 	}
 
 	// GROUP/HAVING
-	outRows, outCols, err := processGroupByHaving(cteEnv, term, filtered)
+	phaseEnv = cteEnv
+	phase = nil
+	if cteEnv.profile != nil {
+		operation, detail := "PROJECT", "expressions and window functions"
+		if term.Pivot != nil {
+			operation, detail = "PIVOT/PROJECT", "pivot and projection"
+		} else if len(term.GroupBy) > 0 || anyAggInSelect(term.Projs) || isAggregate(term.Having) {
+			operation, detail = "GROUP/PROJECT/HAVING", "general aggregation"
+		}
+		phaseEnv, phase = startQueryPhase(cteEnv, operation, detail)
+	}
+	outRows, outCols, err := processGroupByHaving(phaseEnv, term, filtered)
+	phase.finish(int64(len(outRows)))
 	if err != nil {
 		return nil, err
 	}
 
 	// DISTINCT
 	if term.Distinct {
+		detail := "deduplicate projected rows"
+		if len(term.DistinctOn) > 0 {
+			detail = "DISTINCT ON including ordering"
+		}
+		phaseEnv, phase = startQueryPhase(cteEnv, "DISTINCT", detail)
 		// If DISTINCT ON (...) was used, apply DISTINCT ON semantics: keep first
 		// row per distinct-on key. The ORDER BY clause controls which row is
 		// considered "first"; so apply ORDER BY first if present.
 		if len(term.DistinctOn) > 0 {
 			var err error
-			outRows, err = applyDistinctOn(cteEnv, term, outRows)
+			outRows, err = applyDistinctOn(phaseEnv, term, outRows)
 			if err != nil {
+				phase.finish(int64(len(outRows)))
 				return nil, err
 			}
 		} else {
 			outRows = distinctRows(outRows, outCols)
 		}
+		phase.finish(int64(len(outRows)))
 	}
 
 	// A simple SELECT applies its tail directly.  For a compound SELECT the
@@ -116,12 +188,21 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 	}
 	if !compound {
 		if len(s.OrderBy) > 0 {
+			_, phase = startQueryPhase(cteEnv, "SORT", "ORDER BY")
 			resultRows = applySortOrderWithLimit(s.OrderBy, resultRows, s.Limit, s.Offset)
+			phase.finish(int64(len(resultRows)))
+		}
+		phase = nil
+		if s.Limit != nil || s.Offset != nil {
+			_, phase = startQueryPhase(cteEnv, "LIMIT", "OFFSET/LIMIT")
 		}
 		resultRows = applyOffsetLimit(s, resultRows)
+		phase.finish(int64(len(resultRows)))
 	} else {
 		var err error
-		resultRows, resultCols, err = processUnionClauses(cteEnv, s.Union, resultRows, resultCols, orderAliases)
+		phaseEnv, phase = startQueryPhase(cteEnv, "SET OPERATION", "combine query terms")
+		resultRows, resultCols, err = processUnionClauses(phaseEnv, s.Union, resultRows, resultCols, orderAliases)
+		phase.finish(int64(len(resultRows)))
 		if err != nil {
 			return nil, err
 		}
@@ -139,13 +220,21 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 	}
 	if compound {
 		if len(s.OrderBy) > 0 {
+			_, phase = startQueryPhase(cteEnv, "SORT", "compound ORDER BY")
 			compoundOrderBy, err := resolveCompoundOrderBy(s.OrderBy, orderAliases)
 			if err != nil {
+				phase.finish(0)
 				return nil, err
 			}
 			resultRows = applySortOrderWithLimit(compoundOrderBy, resultRows, s.Limit, s.Offset)
+			phase.finish(int64(len(resultRows)))
+		}
+		phase = nil
+		if s.Limit != nil || s.Offset != nil {
+			_, phase = startQueryPhase(cteEnv, "LIMIT", "compound OFFSET/LIMIT")
 		}
 		resultRows = applyOffsetLimit(s, resultRows)
+		phase.finish(int64(len(resultRows)))
 	}
 	return &ResultSet{Cols: resultCols, Rows: resultRows}, nil
 }
@@ -157,7 +246,7 @@ func executeSelect(env ExecEnv, s *Select) (*ResultSet, error) {
 // unambiguous CTE-name/alias-qualified projections can read the immutable
 // ResultSet directly. Qualified predicates and dotted output names retain
 // the general path and its full lookup semantics.
-func executeSimpleCTESelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error) {
+func executeSimpleCTESelectFastPath(env ExecEnv, s *Select) (result *ResultSet, ok bool, err error) {
 	if s == nil || len(s.Joins) > 0 || len(s.GroupBy) > 0 || s.Having != nil ||
 		s.Union != nil || s.Pivot != nil || s.Distinct || len(s.OrderBy) > 0 ||
 		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil ||
@@ -256,6 +345,17 @@ func executeSimpleCTESelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 		// expression/type errors. Keep that observable behavior for this edge
 		// case instead of returning before the predicate is evaluated.
 		return nil, false, nil
+	}
+	if env.profile != nil {
+		var phase *queryPhase
+		env, phase = startQueryPhase(env, "SCAN/FILTER/PROJECT", "materialized CTE")
+		defer func() {
+			var rows int64
+			if result != nil {
+				rows = int64(len(result.Rows))
+			}
+			phase.finish(rows)
+		}()
 	}
 	capacity := len(cteResult.Rows) - offset
 	if capacity < 0 {

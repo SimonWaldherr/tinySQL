@@ -182,13 +182,17 @@ func (c *cteRowCache) store(key cteRowCacheKey, rows []Row) []Row {
 }
 
 type ExecEnv struct {
-	ctx         context.Context
-	tenant      string
-	db          *storage.DB
-	ctes        map[string]*ResultSet // For CTE support
-	cteRowCache *cteRowCache          // materialized CTE source rows, per statement
-	windowRows  []Row                 // All rows for window function context
-	windowIndex int                   // Current row index in window context
+	ctx context.Context
+	// Profiling is execution-local and enabled only by EXPLAIN ANALYZE.
+	// Child environments retain the collector and carry their own parent span.
+	profile       *queryProfile
+	profileParent int
+	tenant        string
+	db            *storage.DB
+	ctes          map[string]*ResultSet // For CTE support
+	cteRowCache   *cteRowCache          // materialized CTE source rows, per statement
+	windowRows    []Row                 // All rows for window function context
+	windowIndex   int                   // Current row index in window context
 	// windowPartitions memoizes, per structural PARTITION BY/ORDER BY shape
 	// and PARTITION BY key, the partitioned+ordered row set built from
 	// windowRows -- see windowPartitionCache in eval_window.go for why.

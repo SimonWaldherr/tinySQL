@@ -42,14 +42,25 @@ func executeSimpleJoinAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, boo
 		return nil, ok, err
 	}
 
+	var lookupPhase *queryPhase
+	if env.profile != nil {
+		_, lookupPhase = startQueryPhase(env, "JOIN LOOKUP", "build or reuse right hash index; distinct keys")
+		defer lookupPhase.finish(-1)
+	}
 	rightByKey, err := plan.join.rightRowsByKey()
 	if err != nil {
 		return nil, true, err
 	}
+	lookupPhase.finish(int64(len(rightByKey.byKey)))
 	if simpleJoinAggregateCountStarOnly(plan) {
 		return executeSimpleJoinCountStarFastPath(env, plan, rightByKey)
 	}
 
+	var probePhase *queryPhase
+	if env.profile != nil {
+		_, probePhase = startQueryPhase(env, "JOIN PROBE/FILTER/AGGREGATE", "raw equi-join accumulation")
+		defer probePhase.finish(-1)
+	}
 	groups := make(map[string]*simpleAggregateState)
 	order := make([]*simpleAggregateState, 0)
 	keyBuf := make([]byte, 0, 32)
@@ -102,7 +113,14 @@ func executeSimpleJoinAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, boo
 		}
 	}
 
-	return simpleAggregateResultSet(plan.projs, plan.outputCols, order), true, nil
+	probePhase.finish(int64(len(order)))
+	var projectPhase *queryPhase
+	if env.profile != nil {
+		_, projectPhase = startQueryPhase(env, "PROJECT", "materialize join aggregate results")
+	}
+	result := simpleAggregateResultSet(plan.projs, plan.outputCols, order)
+	projectPhase.finish(int64(len(result.Rows)))
+	return result, true, nil
 }
 
 // simpleJoinAggregateCountStarOnly identifies the particularly common
@@ -138,6 +156,11 @@ type simpleJoinCountState struct {
 }
 
 func executeSimpleJoinCountStarFastPath(env ExecEnv, plan *simpleJoinAggregatePlan, rightByKey *simpleJoinRightIndex) (*ResultSet, bool, error) {
+	var probePhase *queryPhase
+	if env.profile != nil {
+		_, probePhase = startQueryPhase(env, "JOIN PROBE/FILTER/AGGREGATE", "raw equi-join compact COUNT(*)")
+		defer probePhase.finish(-1)
+	}
 	// Keep the compact states in one contiguous slice. The map only needs an
 	// index, which avoids one heap object for every distinct group.
 	groups := make(map[string]int)
@@ -186,6 +209,11 @@ func executeSimpleJoinCountStarFastPath(env ExecEnv, plan *simpleJoinAggregatePl
 		}
 	}
 
+	probePhase.finish(int64(len(order)))
+	var projectPhase *queryPhase
+	if env.profile != nil {
+		_, projectPhase = startQueryPhase(env, "PROJECT", "materialize join aggregate results")
+	}
 	rows := make([]Row, 0, len(order))
 	for _, state := range order {
 		row := make(Row, len(plan.projs))
@@ -198,6 +226,7 @@ func executeSimpleJoinCountStarFastPath(env ExecEnv, plan *simpleJoinAggregatePl
 		}
 		rows = append(rows, row)
 	}
+	projectPhase.finish(int64(len(rows)))
 	return &ResultSet{Cols: plan.outputCols, Rows: rows}, true, nil
 }
 

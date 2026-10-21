@@ -123,6 +123,11 @@ func buildAggregateBatch(plan *simpleAggregatePlan, source *simpleSelectPlan) ([
 }
 
 func executeAggregateBatches(env ExecEnv, plan *simpleAggregatePlan, source *simpleSelectPlan, cols []aggregateBatchColumn, ops []aggregateBatchOp) (*ResultSet, bool, error) {
+	var scanPhase *queryPhase
+	if env.profile != nil {
+		_, scanPhase = startQueryPhase(env, "SCAN/FILTER/AGGREGATE", "batched accumulation; scalar fallback for nonnumeric values")
+		defer scanPhase.finish(-1)
+	}
 	rows := plan.table.Rows
 	n := len(rows)
 	if source.rowIDs != nil {
@@ -234,6 +239,7 @@ func executeAggregateBatches(env ExecEnv, plan *simpleAggregatePlan, source *sim
 	if !scalar {
 		copyAggregateBatchStates(groups.order, ops)
 	}
+	scanPhase.finish(int64(len(groups.order)))
 	rs, err := finalizeSimpleAggregateResultSet(env, plan, groups.order)
 	return rs, true, err
 }

@@ -4,13 +4,12 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
-	"time"
 )
 
 func executeExplain(env ExecEnv, s *Explain) (*ResultSet, error) {
 	rows := make([]Row, 0, 8)
 	addExplainStep(&rows, "PLAN", statementName(s.Statement))
-	explainStatement(env, &rows, s.Statement)
+	cols := []string{"step", "operation", "detail"}
 	if s.Analyze {
 		// EXPLAIN itself intentionally needs no object permission because it
 		// only describes a plan. ANALYZE executes the wrapped statement, so
@@ -20,28 +19,46 @@ func executeExplain(env ExecEnv, s *Explain) (*ResultSet, error) {
 		}
 		var before, after runtime.MemStats
 		runtime.ReadMemStats(&before)
-		started := time.Now()
+		profile := newQueryProfile()
+		env.profile, env.profileParent = profile, 0
+		env, phase := startQueryPhase(env, "EXECUTE", statementName(s.Statement))
+		executionEnv := env
+		if _, selectStatement := s.Statement.(*Select); !selectStatement {
+			// Go procedure handlers may issue concurrent nested reads. Detailed
+			// spans describe the synchronous SELECT executor; other statements
+			// retain a single execution total, including their nested work.
+			executionEnv.profile, executionEnv.profileParent = nil, 0
+		}
 		// Execute already holds this statement's content lock. Re-entering it
 		// for a mutating inner statement would try to take a write lock while
 		// this goroutine still holds the outer lock and deadlock. execStmt
 		// intentionally shares the outer lock, rollback snapshot, audit entry,
 		// and statement WAL transaction instead.
-		rs, err := execStmt(env, s.Statement)
-		elapsed := time.Since(started)
-		runtime.ReadMemStats(&after)
-		if err != nil {
-			return nil, err
-		}
+		rs, err := execStmt(executionEnv, s.Statement)
 		actualRows := 0
 		if rs != nil {
 			actualRows = len(rs.Rows)
 		}
-		addExplainStep(&rows, "ANALYZE", fmt.Sprintf("actual rows=%d time=%s allocations=%d allocated_bytes=%d page_reads=0 cache_hits=0 cache_misses=0", actualRows, elapsed, after.Mallocs-before.Mallocs, after.TotalAlloc-before.TotalAlloc))
+		phase.finish(int64(actualRows))
+		runtime.ReadMemStats(&after)
+		if err != nil {
+			return nil, err
+		}
+		// Planning for display can populate caches and choose index rows. Do it
+		// after execution so the analyzer does not warm the query it measures.
+		env.profile, env.profileParent = nil, 0
+		explainStatement(env, &rows, s.Statement)
+		profile.appendRows(&rows)
+		elapsed := profile.nodes[0].total
+		addExplainStep(&rows, "ANALYZE", fmt.Sprintf("actual rows=%d time=%s allocations=%d allocated_bytes=%d allocation_scope=process", actualRows, elapsed, after.Mallocs-before.Mallocs, after.TotalAlloc-before.TotalAlloc))
+		cols = append(cols, "parent_step", "calls", "actual_rows", "total_ns", "self_ns", "percent", "bottleneck")
+	} else {
+		explainStatement(env, &rows, s.Statement)
 	}
 	for i, row := range rows {
 		row["step"] = i + 1
 	}
-	return &ResultSet{Cols: []string{"step", "operation", "detail"}, Rows: rows}, nil
+	return &ResultSet{Cols: cols, Rows: rows}, nil
 }
 
 func explainStatement(env ExecEnv, rows *[]Row, stmt Statement) {
@@ -97,12 +114,17 @@ func explainSelect(env ExecEnv, rows *[]Row, sel *Select, prefix string) {
 	}
 	if sel.From.Table != "" || sel.From.Subquery != nil || sel.From.TableFunc != nil {
 		batchAggregate := false
-		plan, ok, err := buildSimpleSelectPlan(env, sel)
-		if err == nil && !ok {
-			if aggregate, supported, aggErr := buildSimpleAggregatePlan(env, sel); aggErr == nil && supported {
-				plan, err = buildSimpleAggregateSourcePlan(aggregate)
-				ok = err == nil
-				batchAggregate = ok && aggregateBatchEligible(aggregate, plan)
+		var plan *simpleSelectPlan
+		var ok bool
+		var err error
+		if !explainMaterializedSource(env, sel.From) {
+			plan, ok, err = buildSimpleSelectPlan(env, sel)
+			if err == nil && !ok {
+				if aggregate, supported, aggErr := buildSimpleAggregatePlan(env, sel); aggErr == nil && supported {
+					plan, err = buildSimpleAggregateSourcePlan(aggregate)
+					ok = err == nil
+					batchAggregate = ok && aggregateBatchEligible(aggregate, plan)
+				}
 			}
 		}
 		if err == nil && ok {
@@ -154,6 +176,22 @@ func explainSelect(env ExecEnv, rows *[]Row, sel *Select, prefix string) {
 	if len(sel.Projs) > 0 {
 		addExplainStep(rows, "PROJECT", fmt.Sprintf("%d column(s)", len(sel.Projs)))
 	}
+}
+
+// Building a materialized source plan may execute its refresh query. Rendering
+// a plan must not refresh it, including when a cache expires during ANALYZE.
+// Keep the metadata-only description, while preserving physical-table lookup
+// precedence for callers that store a table with the same name as a view.
+func explainMaterializedSource(env ExecEnv, from FromItem) bool {
+	if from.Table == "" {
+		return false
+	}
+	schema, name := splitObjectName(from.Table)
+	if _, ok := env.db.Catalog().GetMaterializedView(schema, name); !ok {
+		return false
+	}
+	_, err := env.db.Get(env.tenant, from.Table)
+	return err != nil
 }
 
 func explainFrom(env ExecEnv, rows *[]Row, op string, from FromItem, prefix string) {

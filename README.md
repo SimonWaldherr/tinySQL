@@ -210,6 +210,7 @@ distributed transactions are not implemented.
 | [Developer integration](docs/developer-integration.md) | Go API, database/sql, streaming, and browser embedding |
 | [Language bindings](docs/language-bindings.md) | Rust, Python, Swift and C: types, transactions, persistence, performance |
 | [CLI guide](docs/cli-guide.md) | Shells, servers, and file-query tools |
+| [Query analyzer](docs/query-analyzer.md) | Measured execution stages, bottlenecks, and optimization examples |
 | [Storage guide](docs/storage-guide.md) | Backends, DSNs, read-only mode, and large artifacts |
 | [RAG guide](docs/rag-guide.md) | Vector, hybrid retrieval, reranking, and context |
 | [Geospatial standards](docs/geospatial-standards.md) | GIS formats, CRS profiles, and interoperability |
