@@ -877,8 +877,10 @@ func (idx *vecHNSWIndex) insertHNSWNode(rowIdx int, cache vecSearchColumnCacheEn
 	if !ok {
 		return
 	}
+	visited.reset()
+	visited.visit(current)
 	for layer := idx.maxLevel; layer > level; layer-- {
-		current, currentDist = idx.greedyClosest(&scorer, current, currentDist, layer)
+		current, currentDist = idx.greedyClosest(&scorer, current, currentDist, layer, visited)
 	}
 	for layer := min(level, idx.maxLevel); layer >= 0; layer-- {
 		candidates := idx.searchLayer(&scorer, current, currentDist, vecHNSWEfConstruction, layer, visited, scratch)
@@ -1055,11 +1057,14 @@ func (idx *vecHNSWIndex) searchCandidates(ctx context.Context, s *vecRowScorer, 
 	if !ok {
 		return nil, nil
 	}
+	visited.ensure(len(idx.neighbors))
+	visited.reset()
+	visited.visit(current)
 	for layer := idx.maxLevel; layer > 0; layer-- {
 		if err := checkCtx(ctx); err != nil {
 			return nil, err
 		}
-		current, currentDist = idx.greedyClosest(s, current, currentDist, layer)
+		current, currentDist = idx.greedyClosest(s, current, currentDist, layer, visited)
 	}
 	if err := checkCtx(ctx); err != nil {
 		return nil, err
@@ -1069,12 +1074,17 @@ func (idx *vecHNSWIndex) searchCandidates(ctx context.Context, s *vecRowScorer, 
 
 // greedyClosest walks layer from current to the nearest node reachable by
 // strictly improving moves. This is searchLayer with ef == 1, minus the
-// heaps and the visited set: distance strictly decreases on every move, so
-// the walk cannot cycle.
-func (idx *vecHNSWIndex) greedyClosest(s *vecRowScorer, current int, currentDist float64, layer int) (int, float64) {
+// heaps. A previously scored node cannot improve on a later best node: the
+// distance/row-ID ordering only improves. Share visited across greedy layers
+// to avoid computing the same distance again; searchLayer resets it before
+// the subsequent beam search, which must still explore those nodes.
+func (idx *vecHNSWIndex) greedyClosest(s *vecRowScorer, current int, currentDist float64, layer int, visited *vecVisitedSet) (int, float64) {
 	for changed := true; changed; {
 		changed = false
 		for _, nb := range idx.neighborLayer(current, layer) {
+			if !visited.visit(nb) {
+				continue
+			}
 			d, ok := s.distance(nb)
 			if ok && vecScoredRowLess(vecScoredRow{rowIdx: nb, distance: d}, vecScoredRow{rowIdx: current, distance: currentDist}) {
 				current, currentDist, changed = nb, d, true

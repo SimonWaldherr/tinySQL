@@ -29,6 +29,31 @@ func TestLexerLongCandidatesPreserveKeywordValues(t *testing.T) {
 	}
 }
 
+func TestLexerCanonicalKeywordsDoNotAllocate(t *testing.T) {
+	// Retain each token while the lexer folds later candidates, so a reused
+	// mutable buffer cannot silently overwrite previously returned keywords.
+	want := [...]string{
+		"SELECT", "FROM", "WHERE", "AND", "TRUE", "RECURSIVE", "PRAGMA",
+		"MILLISECONDS", "VEC_MANHATTAN_DISTANCE", "CURRENT_DATE", "FETCH", "ONLY",
+	}
+	sql := strings.ToLower(strings.Join(want[:], " "))
+	var got [len(want)]token
+	allocs := testing.AllocsPerRun(100, func() {
+		lx := newLexer(sql)
+		for i := range got {
+			got[i] = lx.nextToken()
+		}
+	})
+	for i, tok := range got {
+		if tok.Typ != tKeyword || tok.Val != want[i] {
+			t.Errorf("token %d = {%v %q}, want keyword %q", i, tok.Typ, tok.Val, want[i])
+		}
+	}
+	if allocs != 0 {
+		t.Errorf("lexing lowercase keywords allocated %.0f objects, want zero", allocs)
+	}
+}
+
 func TestParseInsertValueRowsWithDifferentWidths(t *testing.T) {
 	// Parsing retains each row independently even when its width differs from
 	// the preceding row. Execution performs the column-count validation.
@@ -68,6 +93,27 @@ func BenchmarkLexerKeywordCasing(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				lx := newLexer(tc.sql)
 				for lx.nextToken().Typ != tEOF {
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkParseKeywordCasing(b *testing.B) {
+	sql := "SELECT account_identifier, user_identifier FROM customer_accounts WHERE account_identifier = 42 AND enabled = TRUE ORDER BY user_identifier LIMIT 10"
+	for _, tc := range []struct {
+		name string
+		sql  string
+	}{
+		{"Mixed", sql},
+		{"Upper", strings.ToUpper(sql)},
+		{"Lower", strings.ToLower(sql)},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if _, err := NewParser(tc.sql).ParseStatement(); err != nil {
+					b.Fatal(err)
 				}
 			}
 		})

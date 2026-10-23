@@ -650,8 +650,10 @@ func cloneSecondaryIndexes(in map[string]*SecondaryIndex) map[string]*SecondaryI
 // materializeSecondaryIndexesForEncode returns a fresh map[string]*SecondaryIndex
 // snapshot suitable for crossing a persistence boundary (GOB/JSON encode, or
 // the paged-index backend's B+Tree writer): every entry's Entries reflects
-// the live skip-list state as of right now, via materialize's O(n) ascending
-// walk. Unlike cloneSecondaryIndexes, this is meant to be called only
+// the live skip-list state as of right now, via All's O(n) ascending walk.
+// All already copies keys and row IDs, so its result can become the snapshot
+// directly without storing and then copying a second full image in idx.Entries.
+// Unlike cloneSecondaryIndexes, this is meant to be called only
 // immediately before encoding -- never on every mutation.
 func materializeSecondaryIndexesForEncode(in map[string]*SecondaryIndex) map[string]*SecondaryIndex {
 	if len(in) == 0 {
@@ -662,12 +664,18 @@ func materializeSecondaryIndexesForEncode(in map[string]*SecondaryIndex) map[str
 		if idx == nil {
 			continue
 		}
-		idx.materialize()
-		entries := make([]IndexEntry, len(idx.Entries))
-		for i, entry := range idx.Entries {
-			entries[i] = IndexEntry{Key: append([]byte(nil), entry.Key...), RowIDs: append([]int(nil), entry.RowIDs...)}
+		idx.mu.RLock()
+		var entries []IndexEntry
+		if idx.fast != nil {
+			entries = idx.fast.All()
+		} else {
+			entries = make([]IndexEntry, len(idx.Entries))
+			for i, entry := range idx.Entries {
+				entries[i] = IndexEntry{Key: append([]byte(nil), entry.Key...), RowIDs: append([]int(nil), entry.RowIDs...)}
+			}
 		}
 		out[key] = &SecondaryIndex{Name: idx.Name, Columns: append([]string(nil), idx.Columns...), Unique: idx.Unique, Entries: entries}
+		idx.mu.RUnlock()
 	}
 	return out
 }

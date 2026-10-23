@@ -493,6 +493,23 @@ func finalizeSimpleAggregateResultSet(env ExecEnv, plan *simpleAggregatePlan, or
 		order = kept
 		havingPhase.finish(int64(len(order)))
 	}
+	// Without ORDER BY the encounter order is already final. Page the states
+	// before allocating result maps, after evaluating every aggregate/HAVING
+	// expression so discarded groups still report errors and cancellation.
+	if len(plan.orderBy) == 0 {
+		start := 0
+		if plan.offset != nil && *plan.offset > 0 {
+			start = *plan.offset
+		}
+		if start > len(order) {
+			order = order[:0]
+		} else {
+			order = order[start:]
+			if plan.limit != nil && *plan.limit < len(order) {
+				order = order[:*plan.limit]
+			}
+		}
+	}
 	var projectPhase *queryPhase
 	if env.profile != nil {
 		_, projectPhase = startQueryPhase(env, "PROJECT", "materialize aggregate results")
@@ -506,8 +523,8 @@ func finalizeSimpleAggregateResultSet(env ExecEnv, plan *simpleAggregatePlan, or
 		}
 		result.Rows = applySortOrderWithLimit(plan.orderBy, result.Rows, plan.limit, plan.offset)
 		sortPhase.finish(int64(len(result.Rows)))
+		result.Rows = applyOffsetLimit(&Select{Limit: plan.limit, Offset: plan.offset}, result.Rows)
 	}
-	result.Rows = applyOffsetLimit(&Select{Limit: plan.limit, Offset: plan.offset}, result.Rows)
 	return result, nil
 }
 

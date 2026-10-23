@@ -271,12 +271,13 @@ func (f *RAGContextFromTableFunc) Execute(ctx context.Context, args []Expr, env 
 	// RAG_CONTEXT_FROM's own contract with real callers is to fail loudly on
 	// a bad column name or a non-numeric chunk index, exactly as it did
 	// before the extract-method refactor).
+	hitDocument := hits.outputColumn(hitDocCol)
+	hitChunk := hits.outputColumn(hitChunkCol)
 	for hitIdx := 0; hitIdx < hits.len(); hitIdx++ {
-		hit := hits.outputRow(hitIdx)
-		if _, ok := ragValue(hit, hitDocCol); !ok {
+		if _, ok := hitDocument.value(hits, hitIdx); !ok {
 			return nil, fmt.Errorf("RAG_CONTEXT_FROM: hit column %q not found", hitDocCol)
 		}
-		chunkVal, ok := ragValue(hit, hitChunkCol)
+		chunkVal, ok := hitChunk.value(hits, hitIdx)
 		if !ok {
 			return nil, fmt.Errorf("RAG_CONTEXT_FROM: hit column %q not found", hitChunkCol)
 		}
@@ -357,9 +358,14 @@ func ragExpandContextFrom(source, hits ragSource, docCol, chunkCol, hitDocCol, h
 			}
 		}
 	} else {
+		hitDocument := hits.outputColumn(hitDocCol)
+		hitChunk := hits.outputColumn(hitChunkCol)
+		hitRanks := [...]ragOutputColumn{
+			hits.outputColumn("_rrf_rank"), hits.outputColumn("_vec_rank"),
+			hits.outputColumn("_hit_rank"), hits.outputColumn("rank"),
+		}
 		for hitIdx := 0; hitIdx < hits.len(); hitIdx++ {
-			hit := hits.outputRow(hitIdx)
-			docID, ok := ragValue(hit, hitDocCol)
+			docID, ok := hitDocument.value(hits, hitIdx)
 			if !ok {
 				// Column presence is validated up front by the caller (see
 				// RAGContextFromTableFunc.Execute) against every current caller's
@@ -368,7 +374,7 @@ func ragExpandContextFrom(source, hits ragSource, docCol, chunkCol, hitDocCol, h
 				// return.
 				continue
 			}
-			chunkVal, ok := ragValue(hit, hitChunkCol)
+			chunkVal, ok := hitChunk.value(hits, hitIdx)
 			if !ok {
 				continue
 			}
@@ -376,7 +382,16 @@ func ragExpandContextFrom(source, hits ragSource, docCol, chunkCol, hitDocCol, h
 			if err != nil {
 				continue
 			}
-			addHit(docID, centerChunk, ragHitRank(hit, hitIdx+1), hitIdx)
+			hitRank := hitIdx + 1
+			for _, rankColumn := range hitRanks {
+				if value, ok := rankColumn.value(hits, hitIdx); ok {
+					if rank, err := toInt(value); err == nil {
+						hitRank = rank
+						break
+					}
+				}
+			}
+			addHit(docID, centerChunk, hitRank, hitIdx)
 		}
 	}
 
@@ -614,6 +629,66 @@ func (source ragSource) outputRow(rowIndex int) Row {
 		}
 	}
 	return out
+}
+
+// ragOutputColumn reads one value with outputRow's projection semantics,
+// without copying every hit column merely to recover its document and rank.
+// A declared but missing cell is NULL; undeclared keys in a CTE Row are hidden.
+type ragOutputColumn struct {
+	index int
+	name  string
+}
+
+func (source ragSource) outputColumn(name string) ragOutputColumn {
+	column := ragOutputColumn{index: -1}
+	lower := strings.ToLower(name)
+	if source.tableSource {
+		if index, ok := source.columnIdx[lower]; ok {
+			return ragOutputColumn{index: index, name: source.cols[index]}
+		}
+	} else {
+		for i, candidate := range source.cols {
+			if strings.ToLower(candidate) == lower {
+				// outputRow retains the last projection with the same map key.
+				column = ragOutputColumn{index: i, name: candidate}
+			}
+		}
+	}
+	if column.index >= 0 {
+		return column
+	}
+	// Match ragValue's Unicode case-fold fallback only when the normalized
+	// key is absent; an exact key takes precedence over an equivalent name.
+	for i, candidate := range source.cols {
+		key := strings.ToLower(candidate)
+		if strings.EqualFold(key, name) {
+			// outputRow overwrites a normalized key with its final projection.
+			// Resolve that same projection when a Unicode fold (such as s/ſ)
+			// found the key, rather than returning its first physical column.
+			for j := len(source.cols) - 1; j > i; j-- {
+				if strings.ToLower(source.cols[j]) == key {
+					i = j
+					break
+				}
+			}
+			return ragOutputColumn{index: i, name: source.cols[i]}
+		}
+	}
+	return column
+}
+
+func (column ragOutputColumn) value(source ragSource, rowIndex int) (any, bool) {
+	if column.index < 0 {
+		return nil, false
+	}
+	if source.tableSource {
+		if column.index < len(source.rawRows[rowIndex]) {
+			return source.rawRows[rowIndex][column.index], true
+		}
+		return nil, true
+	}
+	value, _ := ragValue(source.rows[rowIndex], column.name)
+	return value, true
 }
 
 func ragFindContextRows(source ragSource, docCol, chunkCol string, docID any, centerChunk, before, after int) []ragContextRow {

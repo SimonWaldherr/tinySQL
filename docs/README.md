@@ -62,6 +62,10 @@ current behavior and keep performance claims scoped to the workload they measure
 
 ## Design and performance notes
 
+- [RAG, vector, and GROUP BY performance](rag-group-performance.md) — context
+  expansion, HNSW traversal, integer grouping, and aggregate pagination.
+- [Query and index performance](query-index-performance.md) — text ordering,
+  UNION chains, keyword parsing, and persistence snapshots.
 - [Memory optimization](memory-optimization.md) — resident-memory versus
   allocation-churn tradeoffs.
 - [Driver and engine performance](driver-engine-performance.md) — shared

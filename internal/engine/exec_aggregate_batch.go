@@ -197,6 +197,12 @@ func executeAggregateBatches(env ExecEnv, plan *simpleAggregatePlan, source *sim
 							states[i] = groups.textPairState(left, right, raw, plan.groupCols)
 							continue
 						}
+						leftInt, leftInteger := raw[plan.groupCols[0]].(int)
+						rightInt, rightInteger := raw[plan.groupCols[1]].(int)
+						if leftInteger && rightInteger {
+							states[i] = groups.intPairState(leftInt, rightInt, raw, plan.groupCols)
+							continue
+						}
 					}
 					key = key[:0]
 					for j, col := range plan.groupCols {

@@ -3,12 +3,14 @@ package engine
 import "math"
 
 // aggregateGroups belongs to one execution. Single-column keys avoid text
-// formatting, while composite and unusual values retain the framed encoding
-// used by the general GROUP BY evaluator. Separate key kinds preserve the
-// engine's distinction between int, int64, float64, bool and NULL groups.
+// formatting, as do pairs of text or int values. Other composite and unusual
+// values retain the framed encoding used by the general GROUP BY evaluator.
+// Separate key kinds preserve the distinction between int, int64, float64,
+// bool and NULL groups.
 type aggregateGroups struct {
 	text      map[string]*simpleAggregateState
 	textPairs map[[2]string]*simpleAggregateState
+	intPairs  map[[2]int]*simpleAggregateState
 	numbers   [3]map[uint64]*simpleAggregateState // int, int64, float64
 	fixed     [3]*simpleAggregateState            // NULL, false, true
 	other     map[string]*simpleAggregateState
@@ -86,7 +88,7 @@ func (g *aggregateGroups) state(raw []any, cols []int) *simpleAggregateState {
 		return state
 	}
 	if len(cols) == 2 {
-		// Text pairs are common dimension keys. Hash the two strings directly
+		// Text and integer pairs are common dimension keys. Hash them directly
 		// instead of formatting and copying a framed composite key per group.
 		// Other type combinations retain the canonical typed encoding below.
 		left, leftText := raw[cols[0]].(string)
@@ -94,8 +96,29 @@ func (g *aggregateGroups) state(raw []any, cols []int) *simpleAggregateState {
 		if leftText && rightText {
 			return g.textPairState(left, right, raw, cols)
 		}
+		leftInt, leftInteger := raw[cols[0]].(int)
+		rightInt, rightInteger := raw[cols[1]].(int)
+		if leftInteger && rightInteger {
+			return g.intPairState(leftInt, rightInt, raw, cols)
+		}
 	}
 	return g.encodedState(raw, cols)
+}
+
+// Integer dimension pairs can be hashed without formatting a composite key.
+// Restrict this map to int values: int64, float64 and NULL belong to separate
+// groups under the canonical encoding, even when numerically equal to an int.
+func (g *aggregateGroups) intPairState(left, right int, raw []any, cols []int) *simpleAggregateState {
+	key := [2]int{left, right}
+	if state := g.intPairs[key]; state != nil {
+		return state
+	}
+	if g.intPairs == nil {
+		g.intPairs = make(map[[2]int]*simpleAggregateState)
+	}
+	state := g.newState(raw, cols)
+	g.intPairs[key] = state
+	return state
 }
 
 func (g *aggregateGroups) textPairState(left, right string, raw []any, cols []int) *simpleAggregateState {

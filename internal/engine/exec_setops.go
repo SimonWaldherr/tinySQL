@@ -16,9 +16,15 @@ const setOperationContextBatchRows = 64
 func processUnionClauses(env ExecEnv, union *UnionClause, leftRows []Row, leftCols []string, orderAliases map[string]string) ([]Row, []string, error) {
 	resultRows := leftRows
 	resultCols := leftCols
+	var unionDistinct *setOperationDistinctAccumulator
 
 	current := union
 	for current != nil {
+		// Adjacent UNION terms can share their membership set. Other set
+		// operations change membership or multiplicity and end that run.
+		if current.Type != UnionDistinct {
+			unionDistinct = nil
+		}
 		// Execute the right-hand SELECT
 		rightResult, err := executeSelect(env, current.Right)
 		if err != nil {
@@ -53,15 +59,18 @@ func processUnionClauses(env ExecEnv, union *UnionClause, leftRows []Row, leftCo
 			}
 
 		case UnionDistinct:
-			// UNION: Append and then remove duplicates
-			resultRows, err = appendRowsWithContext(env.ctx, resultRows, rightRows)
-			if err != nil {
+			// Hash the accumulated left result only once per UNION run.
+			// Rehashing it for every term makes a growing chain quadratic.
+			if unionDistinct == nil {
+				unionDistinct = newSetOperationDistinctAccumulator(resultCols, len(resultRows)+len(rightRows))
+				if err := unionDistinct.appendRows(env.ctx, resultRows); err != nil {
+					return nil, nil, err
+				}
+			}
+			if err := unionDistinct.appendRows(env.ctx, rightRows); err != nil {
 				return nil, nil, err
 			}
-			resultRows, err = distinctSetOperationRowsWithContext(env.ctx, resultRows, resultCols)
-			if err != nil {
-				return nil, nil, err
-			}
+			resultRows = unionDistinct.rows
 
 		case Except:
 			// EXCEPT: Remove rows that exist in the right result
@@ -260,24 +269,46 @@ func distinctSetOperationRows(rows []Row, cols []string) []Row {
 }
 
 func distinctSetOperationRowsWithContext(ctx context.Context, rows []Row, cols []string) ([]Row, error) {
-	columnKeys := setOperationColumnKeys(cols)
-	seen := make(map[string]struct{}, len(rows)/2)
-	result := make([]Row, 0, len(rows))
-	buf := make([]byte, 0, 64)
+	accumulator := newSetOperationDistinctAccumulator(cols, len(rows))
+	if err := accumulator.appendRows(ctx, rows); err != nil {
+		return nil, err
+	}
+	return accumulator.rows, nil
+}
+
+// setOperationDistinctAccumulator preserves first-occurrence order and the
+// compound SELECT equality rules while accepting multiple terms incrementally.
+type setOperationDistinctAccumulator struct {
+	columnKeys []string
+	seen       map[string]struct{}
+	rows       []Row
+	key        []byte
+}
+
+func newSetOperationDistinctAccumulator(cols []string, capacity int) *setOperationDistinctAccumulator {
+	return &setOperationDistinctAccumulator{
+		columnKeys: setOperationColumnKeys(cols),
+		seen:       make(map[string]struct{}, capacity/2),
+		rows:       make([]Row, 0, capacity),
+		key:        make([]byte, 0, 64),
+	}
+}
+
+func (a *setOperationDistinctAccumulator) appendRows(ctx context.Context, rows []Row) error {
 	for i, row := range rows {
 		if i&(setOperationContextBatchRows-1) == 0 {
 			if err := checkCtx(ctx); err != nil {
-				return nil, err
+				return err
 			}
 		}
-		buf = appendSetOperationSignature(buf[:0], row, columnKeys)
-		if _, found := seen[string(buf)]; found {
+		a.key = appendSetOperationSignature(a.key[:0], row, a.columnKeys)
+		if _, found := a.seen[string(a.key)]; found {
 			continue
 		}
-		seen[string(buf)] = struct{}{}
-		result = append(result, row)
+		a.seen[string(a.key)] = struct{}{}
+		a.rows = append(a.rows, row)
 	}
-	return result, nil
+	return nil
 }
 
 func setOperationColumnKeys(cols []string) []string {

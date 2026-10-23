@@ -136,7 +136,9 @@ func TestVecHNSWSearchLayerLeavesEntryPoint(t *testing.T) {
 			t.Fatalf("ef=%d: searchLayer returned %v, want nearest row %d first", ef, got, n-1)
 		}
 	}
-	if best, _ := idx.greedyClosest(&scorer, 0, entryDist, 0); best != n-1 {
+	visited.reset()
+	visited.visit(0)
+	if best, _ := idx.greedyClosest(&scorer, 0, entryDist, 0, visited); best != n-1 {
 		t.Fatalf("greedyClosest stopped at %d, want %d", best, n-1)
 	}
 }

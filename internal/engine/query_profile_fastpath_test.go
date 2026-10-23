@@ -45,6 +45,7 @@ func TestQueryProfileFastPaths(t *testing.T) {
 		{"float_top_n", "SELECT id FROM profile_input ORDER BY value LIMIT 5", map[string]int64{"VALIDATE": 0, "SCAN/TOP-N": 5, "SORT": 5, "PROJECT": 5}},
 		{"scored_top_n", "SELECT id, FTS_RANK(grp, 'a') AS score FROM profile_input ORDER BY score DESC LIMIT 5", map[string]int64{"SCAN/FILTER/TOP-N": 5, "SORT": 5, "PROJECT": 5}},
 		{"scalar_aggregate", "SELECT grp, MIN(value) FROM profile_input GROUP BY grp", map[string]int64{"PLAN/INDEX": 0, "SCAN/FILTER/AGGREGATE": 4, "PROJECT": 4}},
+		{"aggregate_page", "SELECT grp, SUM(value) AS total FROM profile_input GROUP BY grp HAVING SUM(value) > 0 LIMIT 1 OFFSET 2", map[string]int64{"PLAN/INDEX": 0, "SCAN/FILTER/AGGREGATE": 4, "HAVING": 4, "PROJECT": 1}},
 		{"batch_aggregate", "SELECT grp, SUM(value) AS total FROM profile_input GROUP BY grp HAVING SUM(value) > 0 ORDER BY total", map[string]int64{"PLAN/INDEX": 0, "SCAN/FILTER/AGGREGATE": 4, "HAVING": 4, "PROJECT": 4, "SORT": 4}},
 		{"metadata_count", "SELECT COUNT(*) FROM profile_input", map[string]int64{"COUNT": 1, "PROJECT": 1}},
 		{"join", "SELECT a.id, b.category FROM profile_input a JOIN profile_right b ON a.id = b.id", map[string]int64{"JOIN LOOKUP": 64, "JOIN PROBE/FILTER/PROJECT": 64}},

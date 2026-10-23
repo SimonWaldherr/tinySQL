@@ -1055,6 +1055,18 @@ func compareOrderedRawRows(plan *simpleSelectPlan, a, b orderedRawRow) int {
 }
 
 func compareOrderedValue(a, b any, desc bool) int {
+	// Text dimension keys dominate multi-column sorts. Compare them once,
+	// without the generic SQL comparison/error path on every sort comparison.
+	// Mixed types and NULL retain the existing ordering rules below.
+	if left, ok := a.(string); ok {
+		if right, ok := b.(string); ok {
+			cmp := strings.Compare(left, right)
+			if desc {
+				return -cmp
+			}
+			return cmp
+		}
+	}
 	cmp := compareForOrder(a, b, desc)
 	switch {
 	case cmp == 0:
