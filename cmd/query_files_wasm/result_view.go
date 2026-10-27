@@ -67,32 +67,75 @@ func buildResultRowIndexes(result *tinysql.ResultSet, filterNeedle, sortColumn, 
 		return nil
 	}
 
+	var filterColumns []string
+	if filterNeedle != "" {
+		// Result rows use lower-case keys. Normalize each column once per view,
+		// instead of once per cell in every row.
+		filterColumns = make([]string, len(result.Cols))
+		for i, column := range result.Cols {
+			filterColumns[i] = strings.ToLower(column)
+		}
+	}
 	rowIndexes := make([]int, 0, len(result.Rows))
 	for index, row := range result.Rows {
-		if filterNeedle == "" || resultRowContains(row, result.Cols, filterNeedle) {
+		if filterNeedle == "" || resultRowContains(row, filterColumns, filterNeedle) {
 			rowIndexes = append(rowIndexes, index)
 		}
+	}
+	if len(rowIndexes) < 2 {
+		return rowIndexes
 	}
 
 	if sortColumn != "" && resultHasColumn(result, sortColumn) {
 		descending := strings.EqualFold(sortDirection, "desc")
-		// sort.Slice calls its comparison function O(n log n) times. Convert a
-		// value to its numeric/text comparison representation once per row rather
-		// than repeatedly parsing and stringifying it in WASM for every compare.
-		sortValues := make([]resultViewSortValue, len(result.Rows))
-		for index, row := range result.Rows {
-			value, _ := tinysql.GetVal(row, sortColumn)
-			sortValues[index] = newResultViewSortValue(value)
-		}
-		sort.SliceStable(rowIndexes, func(i, j int) bool {
-			comparison := compareResultViewSortValues(sortValues[rowIndexes[i]], sortValues[rowIndexes[j]])
-			if descending {
-				return comparison > 0
+		sortKey := strings.ToLower(sortColumn)
+		// When most rows match, sorting integer indexes is cheaper than moving
+		// the larger keys on every swap. Preserve that fast path for broad or
+		// absent filters.
+		if len(rowIndexes) >= len(result.Rows)/2 {
+			sortValues := make([]resultViewSortValue, len(result.Rows))
+			for index, row := range result.Rows {
+				sortValues[index] = newResultViewSortValue(row[sortKey])
 			}
-			return comparison < 0
-		})
+			sort.SliceStable(rowIndexes, func(i, j int) bool {
+				comparison := compareResultViewSortValues(sortValues[rowIndexes[i]], sortValues[rowIndexes[j]])
+				if descending {
+					return comparison > 0
+				}
+				return comparison < 0
+			})
+			return rowIndexes
+		}
+		// Convert only matching rows. A selective filter can leave very few
+		// visible rows out of a large result, and converting the other values
+		// needlessly consumes CPU and memory in WASM.
+		sortValues := make([]resultViewSortValue, len(rowIndexes))
+		for i, index := range rowIndexes {
+			sortValues[i] = newResultViewSortValue(result.Rows[index][sortKey])
+		}
+		sort.Stable(resultViewSorter{indexes: rowIndexes, values: sortValues, descending: descending})
 	}
 	return rowIndexes
+}
+
+// Keep sort keys aligned with their row indexes without copying row maps.
+type resultViewSorter struct {
+	indexes    []int
+	values     []resultViewSortValue
+	descending bool
+}
+
+func (s resultViewSorter) Len() int { return len(s.indexes) }
+func (s resultViewSorter) Less(i, j int) bool {
+	comparison := compareResultViewSortValues(s.values[i], s.values[j])
+	if s.descending {
+		return comparison > 0
+	}
+	return comparison < 0
+}
+func (s resultViewSorter) Swap(i, j int) {
+	s.indexes[i], s.indexes[j] = s.indexes[j], s.indexes[i]
+	s.values[i], s.values[j] = s.values[j], s.values[i]
 }
 
 type resultViewSortValue struct {
@@ -173,9 +216,10 @@ func sliceResultPage(result *tinysql.ResultSet, rowIndexes []int, offset, limit 
 	}
 }
 
+// columns are normalized lower-case result-row keys.
 func resultRowContains(row tinysql.Row, columns []string, needle string) bool {
 	for _, column := range columns {
-		value, ok := tinysql.GetVal(row, column)
+		value, ok := row[column]
 		if !ok || value == nil {
 			continue
 		}
@@ -191,7 +235,55 @@ func resultRowContains(row tinysql.Row, columns []string, needle string) bool {
 		if !isString {
 			text = fmt.Sprint(value)
 		}
-		if strings.Contains(strings.ToLower(text), needle) {
+		if resultContainsFolded(text, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// resultContainsFolded implements the existing Lower(text)-then-Contains
+// semantics without allocating a lower-case copy for short ASCII values.
+// Long inputs use strings.Contains' efficient implementation, and Unicode is
+// always handled by Go's case mapping (which can change encoded length).
+func resultContainsFolded(text, needle string) bool {
+	if len(needle) == 0 {
+		return true
+	}
+	if len(text) > 128 || len(needle) > 16 {
+		return strings.Contains(strings.ToLower(text), needle)
+	}
+	for i := 0; i < len(needle); i++ {
+		if needle[i] >= 0x80 {
+			return strings.Contains(strings.ToLower(text), needle)
+		}
+	}
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		if c >= 0x80 {
+			return strings.Contains(strings.ToLower(text), needle)
+		}
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != needle[0] || i+len(needle) > len(text) {
+			continue
+		}
+		matched := true
+		for j := 1; j < len(needle); j++ {
+			c = text[i+j]
+			if c >= 0x80 {
+				return strings.Contains(strings.ToLower(text), needle)
+			}
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			if c != needle[j] {
+				matched = false
+				break
+			}
+		}
+		if matched {
 			return true
 		}
 	}

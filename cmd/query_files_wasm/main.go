@@ -175,19 +175,30 @@ func executeSQLTextWithContext(ctx context.Context, sqlText string) (*tinysql.Re
 
 func resultRowsToJS(columns []string, rows []tinysql.Row) []interface{} {
 	safeRows := make([]interface{}, 0, len(rows))
+	keys := resultColumnKeys(columns)
 	for _, row := range rows {
-		safeRows = append(safeRows, resultRowToJS(columns, row))
+		safeRows = append(safeRows, resultRowToJS(columns, keys, row))
 	}
 	return safeRows
+}
+
+// TinySQL rows use lowercase map keys; compute them once per result rather
+// than lowercasing each column name for every row in a page or stream.
+func resultColumnKeys(columns []string) []string {
+	keys := make([]string, len(columns))
+	for i, column := range columns {
+		keys[i] = strings.ToLower(column)
+	}
+	return keys
 }
 
 // resultRowToJS normalizes a result row to values that can cross the
 // syscall/js boundary predictably. Streaming queries reuse it both for their
 // preview payload and for byte-limit accounting.
-func resultRowToJS(columns []string, row tinysql.Row) map[string]interface{} {
+func resultRowToJS(columns, keys []string, row tinysql.Row) map[string]interface{} {
 	outRow := make(map[string]interface{}, len(columns))
-	for _, col := range columns {
-		val, ok := tinysql.GetVal(row, col)
+	for i, col := range columns {
+		val, ok := row[keys[i]]
 		if !ok || val == nil {
 			outRow[col] = nil
 			continue
@@ -306,12 +317,13 @@ func importFileRequest(this js.Value, args []js.Value) interface{} {
 
 	opts := &tinysql.FuzzyImportOptions{
 		ImportOptions: &tinysql.ImportOptions{
-			CreateTable:   true,
-			Truncate:      false,
-			HeaderMode:    "auto",
-			TypeInference: true,
-			TableName:     tableName,
-			MaxInputBytes: maxImportBytes,
+			CreateTable:    true,
+			Truncate:       false,
+			HeaderMode:     "auto",
+			TypeInference:  true,
+			TableName:      tableName,
+			MaxInputBytes:  maxImportBytes,
+			MaxRecordBytes: maxImportBytes,
 		},
 		SkipInvalidRows:    true,
 		TrimWhitespace:     true,

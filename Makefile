@@ -348,6 +348,11 @@ test-fsql:
 test-query-files-wasm:
 	@echo "$(GREEN)Running query_files_wasm tests...$(NC)"
 	cd $(QUERY_FILES_WASM_DIR) && $(GO) test $(GO_TEST_FLAGS) ./...
+	@if command -v node >/dev/null 2>&1; then \
+		cd $(QUERY_FILES_WASM_DIR) && node --test ./*.test.cjs && \
+		GOOS=js GOARCH=wasm $(GO) test $(filter-out -race,$(GO_TEST_FLAGS)) -tags no_http \
+			-exec "$$($(GO) env GOROOT)/lib/wasm/go_js_wasm_exec" ./...; \
+	else echo "$(YELLOW)node not installed; skipping query_files_wasm JavaScript and WASM tests$(NC)"; fi
 
 ## coverage: Generate and view test coverage report
 coverage: test-all

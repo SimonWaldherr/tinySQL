@@ -1,0 +1,55 @@
+<!doctype html><title>Workspace save benchmark</title><pre id="out">RUNNING</pre><script src="baseline.js"></script><script>const BaselineStorage=TinySQLWorkspaceStorage.WorkspaceStorage;</script><script src="workspace-storage.js"></script><script>
+(async () => {
+  const unique = 'save-bench-' + crypto.randomUUID();
+  const oldStore = new BaselineStorage({databaseName:unique+'-old', maxGenerations:5});
+  const store = new TinySQLWorkspaceStorage.WorkspaceStorage({databaseName:unique+'-new', maxGenerations:5});
+  const second = new TinySQLWorkspaceStorage.WorkspaceStorage({databaseName:unique+'-new', maxGenerations:5});
+  const bytes = new Uint8Array(8 * 1024 * 1024); bytes.fill(7);
+  async function seed(s) { await s.createWorkspace({id:'demo', name:'demo', snapshot:bytes,format:'raw'}); for(let i=0;i<4;i++) await s.saveWorkspace('demo',bytes); }
+  await seed(oldStore); await seed(store);
+  const oldTimes=[],newTimes=[];
+  for(let i=0;i<6;i++) {
+    let start=performance.now(); await oldStore.saveWorkspace('demo',bytes); oldTimes.push(performance.now()-start);
+    start=performance.now(); await store.saveWorkspace('demo',bytes); newTimes.push(performance.now()-start);
+  }
+  await Promise.all([store.saveWorkspace('demo',bytes),second.saveWorkspace('demo',bytes)]);
+  const versions=await store.listGenerations('demo');
+  if(versions.length!==5 || new Set(versions.map(v=>v.generation)).size!==5 || versions[0].generation!==13) throw Error('Concurrent allocation/retention failed');
+  const restored=await second.loadWorkspace('demo');
+  if(restored.generation.generation!==13 || new Uint8Array(restored.snapshot)[0]!==7) throw Error('Saved snapshot did not survive retention');
+  let opfs='unavailable';
+  if(navigator.storage?.getDirectory) {
+    const o=new TinySQLWorkspaceStorage.WorkspaceStorage({databaseName:unique+'-opfs',preferOPFS:true,opfsThresholdBytes:0,maxGenerations:2});
+    await o.createWorkspace({id:'opfs',name:'opfs',snapshot:new Uint8Array([1]),format:'raw'});
+    const db=await o.open(); const oldRecord=await o._getGenerationRecord(db,'opfs',1);
+    if(oldRecord.snapshotBackend==='opfs') {
+      // Force an invalid retention key after the new workspace and generation
+      // writes are queued. The real IndexedDB transaction must roll back and
+      // the staged OPFS file must be discarded, while the old file survives.
+      const findObsolete=o._findObsoleteGenerations;
+      const writeSnapshot=o._writeOPFSSnapshot.bind(o);
+      let stagedFile;
+      o._writeOPFSSnapshot=async bytes=>{const value=await writeSnapshot(bytes);stagedFile=value.opfsFileName;return value};
+      o._findObsoleteGenerations=()=>[{generation:NaN}];
+      let aborted=false; try { await o.saveWorkspace('opfs',new Uint8Array([9])); } catch (_) { aborted=true; }
+      o._findObsoleteGenerations=findObsolete;
+      if(!aborted || (await o.getWorkspace('opfs')).currentGeneration!==1 || await o._getGenerationRecord(db,'opfs',2)) throw Error('Aborted save changed IndexedDB state');
+      const dir=await o._getOPFSSnapshotDirectory(false);
+      await dir.getFileHandle(oldRecord.opfsFileName);
+      let discarded=false; try { await dir.getFileHandle(stagedFile); } catch(e) { if(e.name==='NotFoundError') discarded=true; else throw e; }
+      if(!discarded) throw Error('Aborted save did not discard staged OPFS file');
+      await o.saveWorkspace('opfs',new Uint8Array([2]));
+      await o.saveWorkspace('opfs',new Uint8Array([3]));
+      if(await o._getGenerationRecord(db,'opfs',1)) throw Error('Obsolete OPFS record retained');
+      let removed=false; try { await dir.getFileHandle(oldRecord.opfsFileName); } catch(e) { if(e.name==='NotFoundError') removed=true; else throw e; }
+      if(!removed) throw Error('Obsolete OPFS file was not cleaned up');
+      if(new Uint8Array(await (await o.loadWorkspace('opfs')).snapshot.arrayBuffer())[0]!==3) throw Error('Current OPFS file corrupted');
+      opfs='passed';
+    }
+    await o.deleteWorkspace('opfs'); o.close(); indexedDB.deleteDatabase(unique+'-opfs');
+  }
+  const mean=a=>a.reduce((x,y)=>x+y,0)/a.length;
+  document.querySelector('#out').textContent=`PASS IndexedDB; concurrent saves; retention; OPFS rollback and cleanup ${opfs}; five 8 MiB generations; old ${mean(oldTimes).toFixed(2)} ms; new ${mean(newTimes).toFixed(2)} ms; `+JSON.stringify({oldTimes,newTimes});
+  oldStore.close(); store.close(); second.close(); indexedDB.deleteDatabase(unique+'-old'); indexedDB.deleteDatabase(unique+'-new');
+})().catch(e=>{document.querySelector('#out').textContent='FAIL '+e.stack});
+</script>

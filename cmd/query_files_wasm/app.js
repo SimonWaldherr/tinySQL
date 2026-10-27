@@ -69,6 +69,10 @@ let activeWorkspaceName = DEFAULT_WORKSPACE_NAME;
 let legacySnapshotMigrationPending = false;
 let legacySnapshotMigrationWorkspaceId = null;
 let workspaceTransition = null;
+// Keep writes and workspace changes blocked while a saved snapshot is being
+// restored, or after its restoration failed. Otherwise an empty engine could
+// be saved over a workspace whose data was merely unreadable temporarily.
+let workspaceRestoreBlocked = false;
 let workspaceEpoch = 0;
 let queryExecutionInFlight = false;
 let activeQueryAbortController = null;
@@ -373,6 +377,10 @@ function setWorkspaceControlsBusy(busy) {
 }
 
 function runWorkspaceTransition(task) {
+    if (workspaceRestoreBlocked) {
+        showToast('The saved workspace is not ready. Reload the page to retry restoration.', 'error');
+        return Promise.resolve(false);
+    }
     if (workspaceTransition) {
         showToast('A workspace change is already in progress.', 'info');
         return Promise.resolve(false);
@@ -395,11 +403,21 @@ function runWorkspaceTransition(task) {
     });
     workspaceTransition = transition;
     return transition.finally(() => {
-        if (workspaceTransition === transition) workspaceTransition = null;
+        if (workspaceTransition === transition) {
+            workspaceTransition = null;
+            // A pending autosave may have become ready while the database
+            // was being replaced. Retry only after the active workspace and
+            // the worker database agree again.
+            if (snapshotDirty) scheduleDatabaseSnapshotSave(0);
+        }
     });
 }
 
 function requireStableWorkspace(action = 'continue') {
+    if (workspaceRestoreBlocked) {
+        showToast('The saved workspace is not ready. Reload the page to retry restoration.', 'error');
+        return false;
+    }
     if (!isWorkspaceTransitioning()) return true;
     showToast(`Please wait for the workspace change to finish before you ${action}.`, 'info');
     return false;
@@ -407,6 +425,7 @@ function requireStableWorkspace(action = 'continue') {
 
 function resetWorkspaceResultView({ showIntro = false } = {}) {
     currentResults = null;
+    visibleResultsCache = null;
     resultViewState = {
         filterText: '',
         sortColumn: '',
@@ -506,7 +525,7 @@ async function initializeWorkspaceStorage() {
 }
 
 async function saveDatabaseSnapshotNow() {
-    if (!wasmReady || (
+    if (workspaceRestoreBlocked || !wasmReady || (
         typeof wasmApi.exportDatabaseBytes !== 'function'
         && typeof wasmApi.exportDatabase !== 'function'
     ) || !workspaceStore) {
@@ -559,7 +578,7 @@ function scheduleDatabaseSnapshotSave(delay = 250) {
     snapshotSaveTimer = window.setTimeout(() => {
         const save = () => {
             snapshotIdleHandle = null;
-            if (snapshotDirty) {
+            if (snapshotDirty && !isWorkspaceTransitioning()) {
                 saveDatabaseSnapshotNow().catch((error) => console.warn('Autosave failed:', error));
             }
         };
@@ -572,7 +591,7 @@ function scheduleDatabaseSnapshotSave(delay = 250) {
 }
 
 async function restoreDatabaseSnapshot() {
-    if ((typeof wasmApi.importDatabase !== 'function' && typeof wasmApi.importDatabaseBytes !== 'function') || !workspaceStore) return false;
+    if (!workspaceStore) return false;
     try {
         const restored = await workspaceStore.recoverWorkspace(activeWorkspaceId, {
             validate: async (snapshot) => {
@@ -596,12 +615,11 @@ async function restoreDatabaseSnapshot() {
         return true;
     } catch (error) {
         console.warn('Workspace restore failed:', error);
-        updateStatus(`Saved workspace could not be restored: ${error.message}`);
-        return false;
+        throw new Error(`Saved workspace could not be restored. Reload to retry: ${error.message}`, { cause: error });
     }
 }
 
-async function refreshWorkspaceSelector() {
+async function refreshWorkspaceSelector({ renderHiddenPanel = false } = {}) {
     if (!workspaceStore) return [];
     const workspaces = await workspaceStore.listWorkspaces();
     const selector = document.getElementById('workspaceSelect');
@@ -613,7 +631,12 @@ async function refreshWorkspaceSelector() {
         }).join('');
         selector.disabled = isWorkspaceTransitioning() || workspaces.length === 0;
     }
-    renderWorkspacePanel(workspaces);
+    // Autosaves refresh the visible selector, but the workspace panel is
+    // normally closed. Avoid rebuilding its hidden DOM until it is shown.
+    const panel = document.getElementById('workspacePanel');
+    if (renderHiddenPanel || (panel && !panel.classList.contains('hidden'))) {
+        renderWorkspacePanel(workspaces);
+    }
     return workspaces;
 }
 
@@ -660,7 +683,7 @@ async function openWorkspacePanel() {
     const panel = document.getElementById('workspacePanel');
     if (!panel) return;
     try {
-        await refreshWorkspaceSelector();
+        await refreshWorkspaceSelector({ renderHiddenPanel: true });
     } catch (error) {
         showToast(`Could not list workspaces: ${error.message}`, 'error');
         return;
@@ -790,16 +813,68 @@ async function createWorkspaceFromPanel() {
 }
 
 function sqlMayMutate(sql) {
-    const stripped = String(sql || '')
-        .replace(/--[^\n]*/g, ' ')
-        .replace(/\/\*[\s\S]*?\*\//g, ' ')
-        .replace(/'(?:''|[^'])*'/g, "''")
-        .trim();
-    if (!stripped) return false;
-    return stripped.split(';').some((statement) => {
-        const first = statement.trim().split(/\s+/)[0]?.toUpperCase();
-        return first && !['SELECT', 'WITH', 'EXPLAIN', 'SHOW', 'DESCRIBE', 'PRAGMA'].includes(first);
-    });
+    const input = String(sql || '');
+    // The common single SELECT needs neither a lexer nor an autosave. A
+    // semicolon anywhere else falls through to the quote/comment-aware path.
+    const firstSemicolon = input.indexOf(';');
+    if (/^\s*SELECT(?:\s|\(|$)/i.test(input) &&
+        (firstSemicolon < 0 || /^[;\s]*$/.test(input.slice(firstSemicolon)))) return false;
+    const readOnly = new Set(['SELECT', 'EXPLAIN', 'SHOW', 'DESCRIBE', 'PRAGMA']);
+    const writeCommands = new Set(['INSERT', 'UPDATE', 'DELETE', 'MERGE', 'REPLACE']);
+    let first = '', quote = '', depth = 0, cteClosed = false, cteCommand = false, explainPrefix = false;
+    let lineComment = false, blockComment = false;
+    for (let i = 0; i < input.length; i++) {
+        const char = input[i], next = input[i + 1];
+        if (lineComment) {
+            if (char === '\n' || char === '\r') lineComment = false;
+            continue;
+        }
+        if (blockComment) {
+            if (char === '*' && next === '/') { blockComment = false; i++; }
+            continue;
+        }
+        if (quote) {
+            if (char === quote) {
+                if (next === quote) i++;
+                else quote = '';
+            }
+            continue;
+        }
+        if (char === '-' && next === '-') { lineComment = true; i++; continue; }
+        if (char === '/' && next === '*') { blockComment = true; i++; continue; }
+        if (char === "'" || char === '"' || char === '`') { quote = char; continue; }
+        if (char === '[') { quote = ']'; continue; }
+        if (char === '(') { depth++; continue; }
+        if (char === ')') {
+            if (depth > 0 && --depth === 0 && first === 'WITH') cteClosed = true;
+            continue;
+        }
+        if (char === ';' && depth === 0) {
+            // If a leading WITH cannot be classified, persist conservatively.
+            if (first === 'WITH' && !cteCommand) return true;
+            first = ''; cteClosed = false; cteCommand = false; explainPrefix = false;
+            continue;
+        }
+        if (depth !== 0 || !/[A-Za-z_]/.test(char)) continue;
+        let end = i + 1;
+        while (end < input.length && /[A-Za-z0-9_$]/.test(input[end])) end++;
+        const word = input.slice(i, end).toUpperCase();
+        i = end - 1;
+        if (!first) {
+            first = word;
+            explainPrefix = first === 'EXPLAIN';
+            if (first !== 'WITH' && !readOnly.has(first)) return true;
+        } else if (explainPrefix) {
+            explainPrefix = false;
+            // ANALYZE executes its wrapped statement. Classify that command
+            // normally so writes are persisted; plain EXPLAIN only plans it.
+            if (word === 'ANALYZE') first = '';
+        } else if (first === 'WITH' && cteClosed && !cteCommand) {
+            if (writeCommands.has(word)) return true;
+            if (word === 'SELECT') cteCommand = true;
+        }
+    }
+    return first === 'WITH' && !cteCommand;
 }
 
 // The legacy path is still the compatible choice for real SQL scripts. A
@@ -819,7 +894,7 @@ function hasMultipleSQLStatements(sql) {
         const next = input[index + 1];
 
         if (lineComment) {
-            if (char === '\n') lineComment = false;
+            if (char === '\n' || char === '\r') lineComment = false;
             continue;
         }
         if (blockComment) {
@@ -906,6 +981,7 @@ function handleQueryStreamEvent(message) {
     }
 
     if (phase === 'started') {
+        visibleResultsCache = null;
         const columns = Array.isArray(event.columns) ? event.columns.map((column) => String(column)) : [];
         currentResults = {
             columns,
@@ -1021,6 +1097,7 @@ async function initWasm() {
                 wasmApi[method] = wasmEngine[method].bind(wasmEngine);
             }
         }
+        workspaceRestoreBlocked = true;
         wasmReady = true;
         console.log('WASM worker initialized successfully');
 
@@ -1032,16 +1109,25 @@ async function initWasm() {
             Object.entries(wasmApi).map(([k,v]) => [k, typeof v])
         ));
         
+        const initialHash = window.location.hash || '';
+        const hashDemoPayload = decodeDemoHash(initialHash);
+        // A shared demo must never replace a remembered workspace before it
+        // has been recovered and safely saved.
+        await restoreDatabaseSnapshot();
+        // If local storage is unavailable, an initial share link can still
+        // run in the fresh temporary engine, before the UI permits edits. Do
+        // not do this if any client-side data was queued during startup.
+        const temporaryHashLoaded = Boolean(hashDemoPayload && !workspaceStore &&
+            currentTables.length === 0 && Object.keys(pendingClientTables).length === 0 &&
+            await applyHashDemoPayload(hashDemoPayload, { freshTemporary: true }));
+        if (temporaryHashLoaded) lastAppliedHash = initialHash;
+        workspaceRestoreBlocked = false;
         updateStatus("Ready");
         statusIndicator?.classList.remove('loading', 'failed');
         statusIndicator?.classList.add('ready');
         document.getElementById('executeBtn').disabled = false;
         await refreshRuntimeStatus();
         scheduleRuntimeStatusRefresh();
-        const hashDemoPayload = decodeDemoHash();
-        if (!hashDemoPayload) {
-            await restoreDatabaseSnapshot();
-        }
         // If any tables were registered client-side before WASM was ready,
         // import them now into the WASM-backed database so queries will work.
         if (Object.keys(pendingClientTables).length > 0) {
@@ -1072,13 +1158,18 @@ async function initWasm() {
             scheduleDatabaseSnapshotSave();
         }
         await loadTables();
-        if (hashDemoPayload) {
-            await applyHashDemoPayload(hashDemoPayload);
-            lastAppliedHash = window.location.hash || '';
+        if (temporaryHashLoaded) {
+            if (hashDemoPayload.autoRun && hashDemoPayload.query) await onExecuteClick();
+            if (hashDemoPayload.id === 'jobs') startLiveJobWatch();
+        } else if (hashDemoPayload) {
+            if (await applyHashDemoPayload(hashDemoPayload)) lastAppliedHash = initialHash;
         }
     } catch (err) {
+        workspaceRestoreBlocked = true;
+        wasmReady = false;
+        document.getElementById('executeBtn').disabled = true;
         console.error("Failed to load WASM:", err);
-        updateStatus("Failed to load WASM");
+        updateStatus(err.message || 'Failed to load WASM');
         statusIndicator?.classList.remove('loading', 'ready');
         statusIndicator?.classList.add('failed');
     }
@@ -1724,8 +1815,9 @@ function loadShareableDemo(demoId) {
     if (window.location.hash === `#${hash}`) {
         const payload = decodeDemoHash(`#${hash}`);
         if (payload) {
-            applyHashDemoPayload(payload);
-            lastAppliedHash = `#${hash}`;
+            applyHashDemoPayload(payload).then(loaded => {
+                if (loaded) lastAppliedHash = `#${hash}`;
+            });
         }
     } else {
         window.location.hash = hash;
@@ -2270,51 +2362,72 @@ async function importDemoPayloadTable(table) {
     };
 }
 
-async function applyHashDemoPayload(payload) {
+async function applyHashDemoPayload(payload, { freshTemporary = false } = {}) {
     if (!payload || applyingHashDemo || !wasmReady || typeof wasmApi.importFile !== 'function') {
         return false;
     }
-    if (!requireStableWorkspace('load shared demo data')) return false;
+    const temporary = freshTemporary && !workspaceStore && workspaceRestoreBlocked &&
+        currentTables.length === 0 && Object.keys(pendingClientTables).length === 0;
+    if (!temporary && !requireStableWorkspace('load shared demo data')) return false;
+    if (!workspaceStore && !temporary) {
+        showToast('Shared demos need local workspace storage to preserve your current data.', 'error');
+        return false;
+    }
     openStudio({ focusEditor: false });
     applyingHashDemo = true;
     try {
-        updateStatus(`Loading shared demo: ${payload.title || payload.id || 'tinySQL'}...`);
-        if (typeof wasmApi.clearDatabase === 'function') {
-            const cleared = await wasmApi.clearDatabase();
-            if (!cleared?.success) throw new Error(cleared?.error || 'Could not clear the current workspace.');
-        }
-        currentTables = [];
-        resetWorkspaceResultView();
-        for (const key of Object.keys(pendingClientTables)) {
-            delete pendingClientTables[key];
-        }
-
-        for (const table of payload.tables) {
-            const tableInfo = await importDemoPayloadTable(table);
-            currentTables.push(tableInfo);
-            if (isRoutingGraphFile(table.fileName)) {
-                await loadTables();
+        const title = String(payload.title || payload.id || 'tinySQL');
+        const loadDemo = async () => {
+            updateStatus(`Loading shared demo: ${title}...`);
+            if (typeof wasmApi.clearDatabase !== 'function') {
+                throw new Error('The local engine cannot prepare a demo workspace.');
             }
-        }
-
-        renderTables();
-        showDemoQueries();
-        if (payload.query) {
-            setQuery(payload.query);
-        }
-        scheduleDatabaseSnapshotSave();
-        updateStatus(`Loaded shared demo: ${payload.title || payload.id || 'tinySQL'}`);
-
-        if (payload.autoRun && payload.query) {
+            const cleared = await wasmApi.clearDatabase();
+            if (!cleared?.success) throw new Error(cleared?.error || 'Could not prepare the demo workspace.');
+            currentTables = [];
+            resetWorkspaceResultView();
+            for (const key of Object.keys(pendingClientTables)) delete pendingClientTables[key];
+            for (const table of payload.tables) {
+                const tableInfo = await importDemoPayloadTable(table);
+                currentTables.push(tableInfo);
+                if (isRoutingGraphFile(table.fileName)) await loadTables();
+            }
+            renderTables();
+            showDemoQueries();
+            if (payload.query) setQuery(payload.query);
+            await refreshWorkspaceSelector();
+            if (workspaceStore) scheduleDatabaseSnapshotSave();
+            updateStatus(`Loaded shared demo: ${title}`);
+            return true;
+        };
+        const loaded = temporary ? await loadDemo() : await runWorkspaceTransition(async () => {
+            stopLiveJobWatch();
+            const saved = await saveDatabaseSnapshotNow();
+            if (!saved) throw new Error('The current workspace could not be saved.');
+            const workspace = await workspaceStore.createWorkspace({name: `Demo: ${title}`.slice(0, 128), format: 'tinysql-gob'});
+            // Assign the new identity before replacing the engine database:
+            // failures or deferred autosaves must never write the new state
+            // into the original workspace.
+            activeWorkspaceId = workspace.id;
+            activeWorkspaceName = workspace.name;
+            workspaceEpoch += 1;
+            storageSet(ACTIVE_WORKSPACE_KEY, activeWorkspaceId);
+            return loadDemo();
+        });
+        if (!loaded) return false;
+        if (!temporary && payload.autoRun && payload.query) {
             await onExecuteClick();
         }
-        if (payload.id === 'jobs') {
+        if (!temporary && payload.id === 'jobs') {
             startLiveJobWatch();
-        } else {
+        } else if (!temporary) {
             stopLiveJobWatch();
         }
         return true;
     } catch (error) {
+        // The demo has its own identity even when an import fails. Update the
+        // selector so the saved original remains accessible to the user.
+        try { await loadTables(); await refreshWorkspaceSelector(); } catch (_) { /* keep original error */ }
         updateStatus('Shared demo failed');
         showToast(`Shared demo failed: ${error.message}`, 'error');
         console.error('applyHashDemoPayload failed:', error);
@@ -2333,8 +2446,9 @@ async function applyHashDemoFromLocation() {
     if (!payload) {
         return false;
     }
-    lastAppliedHash = hash;
-    return applyHashDemoPayload(payload);
+    const loaded = await applyHashDemoPayload(payload);
+    if (loaded) lastAppliedHash = hash;
+    return loaded;
 }
 
 async function loadDemoTables(tableNames, finalQuery, statusText) {
@@ -2628,7 +2742,6 @@ function setupEditorSyntaxHighlighting() {
     // Update line/column counter on cursor changes. Typing is covered by
     // refresh() below, which drives the counter through syncEditorHighlight().
     editor.addEventListener('click', updateEditorLineCount);
-    editor.addEventListener('keyup', updateEditorLineCount);
     editor.addEventListener('focus', updateEditorLineCount);
 
     refresh();
@@ -2638,6 +2751,8 @@ function setupEditorSyntaxHighlighting() {
 // drive it too. Every path that replaces the editor content programmatically
 // (demos, history, table shortcuts, Format, workspace restore) already calls
 // that, and used to leave the counter stuck on the previous query.
+let editorLineCacheText = null;
+let editorLineBreaks = [];
 function updateEditorLineCount() {
     const editor = document.getElementById('queryEditor');
     const counter = document.getElementById('editorLineCount');
@@ -2645,13 +2760,34 @@ function updateEditorLineCount() {
         return;
     }
     const pos = editor.selectionStart ?? 0;
-    const textBefore = editor.value.slice(0, pos);
-    const line = textBefore.split('\n').length;
-    const col = pos - textBefore.lastIndexOf('\n');
-    const totalLines = editor.value.split('\n').length;
+    const text = editor.value;
+    if (text !== editorLineCacheText) {
+        const breaks = [];
+        for (let index = text.indexOf('\n'); index !== -1; index = text.indexOf('\n', index + 1)) {
+            breaks.push(index);
+        }
+        editorLineCacheText = text;
+        editorLineBreaks = breaks;
+    }
+    // Textarea offsets and String.indexOf both count UTF-16 code units.
+    // Find the number of newlines strictly before the caret.
+    let low = 0, high = editorLineBreaks.length;
+    while (low < high) {
+        const mid = (low + high) >>> 1;
+        if (editorLineBreaks[mid] < pos) low = mid + 1;
+        else high = mid;
+    }
+    const line = low + 1;
+    const col = pos - (low === 0 ? -1 : editorLineBreaks[low - 1]);
+    const totalLines = editorLineBreaks.length + 1;
     counter.textContent = `Ln ${line}, Col ${col} \u2022 ${totalLines} line${totalLines !== 1 ? 's' : ''}`;
 }
 
+// Input is followed by keyup, and cursor-only keys also trigger keyup. Cache
+// the rendered text so those events keep the caret/scroll state in sync
+// without tokenizing the same SQL and replacing the overlay again.
+let highlightedEditorText = null;
+let highlightedEditorElement = null;
 function syncEditorHighlight() {
     const editor = document.getElementById('queryEditor');
     const highlight = document.getElementById('sqlHighlight');
@@ -2659,7 +2795,12 @@ function syncEditorHighlight() {
         return;
     }
 
-    highlight.innerHTML = renderSqlHighlight(editor.value);
+    const value = editor.value;
+    if (highlight !== highlightedEditorElement || value !== highlightedEditorText) {
+        highlight.innerHTML = renderSqlHighlight(value);
+        highlightedEditorElement = highlight;
+        highlightedEditorText = value;
+    }
     highlight.scrollTop = editor.scrollTop;
     highlight.scrollLeft = editor.scrollLeft;
     updateEditorLineCount();
@@ -3060,6 +3201,11 @@ async function importSingleFile(file) {
 async function importExcelFile(file) {
     const workspaceAtStart = activeWorkspaceId;
     const epochAtStart = workspaceEpoch;
+    let importedSheets = 0;
+    let failedSheets = 0;
+    let attempted = false;
+    let firstImportedTable = '';
+    let failureStatus = '';
     if (typeof XLSX === 'undefined') {
         showToast('Excel support is unavailable right now. Try CSV or JSON, or refresh the page.', 'error');
         updateStatus('Excel support unavailable');
@@ -3074,8 +3220,6 @@ async function importExcelFile(file) {
             return false;
         }
         const workbook = XLSX.read(data, { type: 'array' });
-        let importedSheets = 0;
-
         for (const sheetName of workbook.SheetNames) {
             if (workspaceAtStart !== activeWorkspaceId || epochAtStart !== workspaceEpoch || !requireStableWorkspace('import files')) {
                 return false;
@@ -3088,9 +3232,11 @@ async function importExcelFile(file) {
 
             const tableName = sanitizeTableName(sheetName);
             updateStatus(`Importing sheet: ${sheetName}...`);
+            attempted = true;
             const result = await wasmApi.importFile(`${sheetName}.json`, JSON.stringify(jsonData), tableName);
             if (!result?.success) {
                 console.error(`Failed to import sheet "${sheetName}":`, result?.error || 'unknown error');
+                failedSheets += 1;
                 continue;
             }
 
@@ -3102,23 +3248,37 @@ async function importExcelFile(file) {
             const existingIndex = currentTables.findIndex(t => t.name === tableName);
             if (existingIndex >= 0) currentTables[existingIndex] = tableInfo;
             else currentTables.push(tableInfo);
+            if (!firstImportedTable) firstImportedTable = tableName;
             importedSheets += 1;
         }
 
-        renderTables();
-        updateStatus(`Excel file imported: ${importedSheets} sheet(s)`);
+        failureStatus = failedSheets ? `Excel import incomplete: ${importedSheets} sheet(s) imported, ${failedSheets} failed` : '';
+        updateStatus(failureStatus || `Excel file imported: ${importedSheets} sheet(s)`);
         const executeBtn = document.getElementById('executeBtn');
         if (executeBtn) executeBtn.disabled = false;
-        if (currentTables.length > 0) {
-            const firstTable = currentTables[0].name;
-            setQuery(`SELECT * FROM ${quoteSqlIdentifier(firstTable)} LIMIT 10`);
+        if (firstImportedTable) {
+            setQuery(`SELECT * FROM ${quoteSqlIdentifier(firstImportedTable)} LIMIT 10`);
         }
-        scheduleDatabaseSnapshotSave();
-        return importedSheets > 0;
+        return importedSheets > 0 && failedSheets === 0;
     } catch (err) {
+        failedSheets += 1;
         alert(`Failed to parse Excel file: ${err.message}`);
-        updateStatus('Excel import failed');
+        failureStatus = 'Excel import failed';
+        updateStatus(failureStatus);
         return false;
+    } finally {
+        // Earlier sheets may have already changed the database, including
+        // when a later sheet throws or a workspace transition interrupts us.
+        if (attempted && workspaceAtStart === activeWorkspaceId && epochAtStart === workspaceEpoch) {
+            if (failedSheets > 0) {
+                try { await loadTables(); } catch (error) { console.warn('Could not refresh tables after Excel import:', error); }
+            }
+            if (workspaceAtStart === activeWorkspaceId && epochAtStart === workspaceEpoch) {
+                if (failureStatus) updateStatus(failureStatus);
+                scheduleDatabaseSnapshotSave();
+                renderTables();
+            }
+        }
     }
 }
 
@@ -3132,6 +3292,11 @@ async function importExcelFile(file) {
 async function importShapefileFile(file) {
     const workspaceAtStart = activeWorkspaceId;
     const epochAtStart = workspaceEpoch;
+    let importedLayers = 0;
+    let failedLayers = 0;
+    let attempted = false;
+    let firstImportedTable = '';
+    let failureStatus = '';
     if (typeof shp !== 'function') {
         showToast('Shapefile support is unavailable right now. Try GeoJSON, or refresh the page.', 'error');
         updateStatus('Shapefile support unavailable');
@@ -3150,8 +3315,6 @@ async function importShapefileFile(file) {
         // carries a .fileName shpjs derived from the source .shp's own name.
         const parsed = await shp(data);
         const collections = Array.isArray(parsed) ? parsed : [parsed];
-        let importedLayers = 0;
-
         for (let i = 0; i < collections.length; i++) {
             if (workspaceAtStart !== activeWorkspaceId || epochAtStart !== workspaceEpoch || !requireStableWorkspace('import files')) {
                 return false;
@@ -3163,9 +3326,11 @@ async function importShapefileFile(file) {
             const layerName = collection.fileName || (collections.length > 1 ? `layer_${i + 1}` : file.name);
             const tableName = sanitizeTableName(layerName);
             updateStatus(`Importing layer: ${layerName}...`);
+            attempted = true;
             const result = await wasmApi.importFile(`${layerName}.geojson`, JSON.stringify(collection), tableName);
             if (!result?.success) {
                 console.error(`Failed to import shapefile layer "${layerName}":`, result?.error || 'unknown error');
+                failedLayers += 1;
                 continue;
             }
 
@@ -3177,23 +3342,35 @@ async function importShapefileFile(file) {
             const existingIndex = currentTables.findIndex(t => t.name === tableName);
             if (existingIndex >= 0) currentTables[existingIndex] = tableInfo;
             else currentTables.push(tableInfo);
+            if (!firstImportedTable) firstImportedTable = tableName;
             importedLayers += 1;
         }
 
-        renderTables();
-        updateStatus(`Shapefile imported: ${importedLayers} layer(s)`);
+        failureStatus = failedLayers ? `Shapefile import incomplete: ${importedLayers} layer(s) imported, ${failedLayers} failed` : '';
+        updateStatus(failureStatus || `Shapefile imported: ${importedLayers} layer(s)`);
         const executeBtn = document.getElementById('executeBtn');
         if (executeBtn) executeBtn.disabled = false;
-        if (importedLayers > 0 && currentTables.length > 0) {
-            const firstTable = currentTables[currentTables.length - importedLayers].name;
-            setQuery(`SELECT * FROM ${quoteSqlIdentifier(firstTable)} LIMIT 10`);
+        if (firstImportedTable) {
+            setQuery(`SELECT * FROM ${quoteSqlIdentifier(firstImportedTable)} LIMIT 10`);
         }
-        scheduleDatabaseSnapshotSave();
-        return importedLayers > 0;
+        return importedLayers > 0 && failedLayers === 0;
     } catch (err) {
+        failedLayers += 1;
         alert(`Failed to parse shapefile: ${err.message}`);
-        updateStatus('Shapefile import failed');
+        failureStatus = 'Shapefile import failed';
+        updateStatus(failureStatus);
         return false;
+    } finally {
+        if (attempted && workspaceAtStart === activeWorkspaceId && epochAtStart === workspaceEpoch) {
+            if (failedLayers > 0) {
+                try { await loadTables(); } catch (error) { console.warn('Could not refresh tables after shapefile import:', error); }
+            }
+            if (workspaceAtStart === activeWorkspaceId && epochAtStart === workspaceEpoch) {
+                if (failureStatus) updateStatus(failureStatus);
+                scheduleDatabaseSnapshotSave();
+                renderTables();
+            }
+        }
     }
 }
 
@@ -3474,6 +3651,7 @@ async function removeTable(tableName) {
     currentTables = currentTables.filter(t => t.name !== tableName);
     if (currentResults && currentResults.sourceTable === tableName) {
         currentResults = null;
+        visibleResultsCache = null;
     }
     renderTables();
     scheduleDatabaseSnapshotSave();
@@ -3650,6 +3828,10 @@ async function onExecuteClick() {
     const useStreamingQuery = !hasMultipleSQLStatements(query) &&
         typeof wasmApi.executeQueryStream === 'function';
     activeQueryAbortController = useStreamingQuery ? new AbortController() : null;
+    // A failed batch can still have committed earlier statements. Likewise,
+    // an interrupted write may already have changed the in-memory database.
+    const mutationPossible = sqlMayMutate(query);
+    let querySent = false;
 
     executeBtn.disabled = true;
     executeBtn.innerHTML = '<span class="spinner"></span> Running…';
@@ -3673,6 +3855,7 @@ async function onExecuteClick() {
         // the bounded ResultStream preview. Scripts keep the established
         // materialized semantics until multi-statement streaming is added.
         const hasMulti = hasMultipleSQLStatements(query) && typeof wasmApi.executeMulti === 'function';
+        querySent = true;
         const result = useStreamingQuery
             ? await wasmApi.executeQueryStream(query, { signal: activeQueryAbortController.signal })
             : hasMulti
@@ -3716,10 +3899,6 @@ async function onExecuteClick() {
             await renderResults(currentResults);
             pushHistory(query, duration, currentResults.rowCount);
             saveEditorState();
-            if (sqlMayMutate(query)) {
-                await loadTables();
-                scheduleDatabaseSnapshotSave();
-            }
             const resultCount = currentResults.truncated
                 ? `${currentResults.rowCount.toLocaleString()}+ preview rows`
                 : `${currentResults.rowCount.toLocaleString()} rows`;
@@ -3739,6 +3918,7 @@ async function onExecuteClick() {
     } catch (error) {
         const cancelled = error?.name === 'AbortError';
         currentResults = null;
+        visibleResultsCache = null;
         resultsContainer.innerHTML = cancelled ? `
             <div class="empty-state">
                 <div class="empty-state-icon">■</div>
@@ -3754,6 +3934,17 @@ async function onExecuteClick() {
         setOpenVanillaGridEnabled(false);
         updateStatus(cancelled ? 'Query cancelled' : 'Query failed');
     } finally {
+        if (querySent && mutationPossible) {
+            // Statements preceding a failure are not rolled back by
+            // executeMulti. Refresh and persist even when a later statement,
+            // the response or the result renderer fails.
+            try {
+                await loadTables();
+            } catch (error) {
+                console.warn('Could not refresh tables after query:', error);
+            }
+            scheduleDatabaseSnapshotSave();
+        }
         queryExecutionInFlight = false;
         activeQueryAbortController = null;
         activeQueryStreamProgress = null;
@@ -3842,6 +4033,7 @@ function startLiveJobWatch() {
 async function renderResults(data) {
     const resultsContainer = document.getElementById('resultsContainer');
     if (!resultsContainer || !data || !Array.isArray(data.rows) || !Array.isArray(data.columns) || data.rowCount === 0) {
+        visibleResultsCache = null;
         if (resultsContainer) {
             window.clearVanillaGrid?.();
             setOpenVanillaGridEnabled(false);
@@ -3865,6 +4057,16 @@ async function renderResults(data) {
     const pageKey = `${resultViewState.page}|${pageSize}|${resultViewState.filterText}|${resultViewState.sortColumn}|${resultViewState.sortDirection}`;
     if (data.serverPaged && data.pageKey !== pageKey) {
         const requestedPageKey = pageKey;
+        // Filter and paging requests can overlap. Reject stale failures as
+        // well as stale successes, even when the user returns to the same
+        // view while an earlier request is still in flight.
+        const requestToken = {};
+        data.pageRequestToken = requestToken;
+        const isCurrentRequest = () => {
+            const latestPageKey = `${resultViewState.page}|${resultViewState.pageSize}|${resultViewState.filterText}|${resultViewState.sortColumn}|${resultViewState.sortDirection}`;
+            return data === currentResults && data.pageRequestToken === requestToken &&
+                latestPageKey === requestedPageKey && !isWorkspaceTransitioning();
+        };
         const pageOffset = (Math.max(1, resultViewState.page) - 1) * pageSize;
         let pageResult;
         try {
@@ -3876,7 +4078,7 @@ async function renderResults(data) {
                 resultViewState.sortDirection
             );
         } catch (error) {
-            if (data !== currentResults || isWorkspaceTransitioning()) return;
+            if (!isCurrentRequest()) return;
             resultsContainer.innerHTML = `
                 <div class="error-message">
                     <strong>Result paging failed:</strong> ${escapeHtml(error.message || error)}
@@ -3884,8 +4086,7 @@ async function renderResults(data) {
             `;
             return;
         }
-        const latestPageKey = `${resultViewState.page}|${resultViewState.pageSize}|${resultViewState.filterText}|${resultViewState.sortColumn}|${resultViewState.sortDirection}`;
-        if (data !== currentResults || latestPageKey !== requestedPageKey) {
+        if (!isCurrentRequest()) {
             return;
         }
         if (!pageResult || !pageResult.success) {
@@ -3952,6 +4153,9 @@ async function renderResults(data) {
                     <br>Duration: ${data?.duration || '0 ms'}
                 </div>
                 <div style="margin-top: 12px;">
+                    <label class="results-filter">Filter
+                        <input id="resultFilterInput" type="search" value="${escapeHtml(resultViewState.filterText)}" placeholder="Search rows..." oninput="scheduleResultFilterUpdate()">
+                    </label>
                     <button onclick="clearResultViewFilters()">Clear Filter</button>
                 </div>
             </div>
@@ -4233,20 +4437,25 @@ function openInVanillaGrid() {
         showToast('Pivot Grid is unavailable. The table view and exports still work.', 'error');
         return;
     }
-    // getVisibleResults() may return source.rows itself, not a copy, when no
-    // filter/sort is active (see its own comment). The pivot grid is a
-    // third-party library with its own sortable/filterable column UI, whose
-    // internals this file does not control; hand it an array it cannot
-    // alias back into currentResults.rows even if it sorts in place.
-    window.renderVanillaGrid?.({ ...visible, rows: visible.rows.slice() });
+    // The grid is third-party code: isolate both the array and row records so
+    // grid edits cannot change the result or invalidate a cached view.
+    window.renderVanillaGrid?.({ ...visible, rows: visible.rows.map((row) => ({ ...row })) });
 }
+
+// Reuse the derived view while only the page changes. Stream chunks append to
+// rows in place, so the array length is part of the cache key as well as its
+// identity. Result rows are otherwise immutable; new queries replace the
+// result and the third-party grid receives copies. Only one view is retained.
+let visibleResultsCache = null;
 
 function getVisibleResults(source = currentResults) {
     if (!source || !Array.isArray(source.rows) || !Array.isArray(source.columns)) {
+        visibleResultsCache = null;
         return null;
     }
 
     if (source.serverPaged) {
+        visibleResultsCache = null;
         return {
             columns: source.columns.slice(),
             rows: source.rows.slice(),
@@ -4257,30 +4466,40 @@ function getVisibleResults(source = currentResults) {
 
     const filterText = resultViewState.filterText.trim().toLowerCase();
     const sortActive = resultViewState.sortColumn && source.columns.includes(resultViewState.sortColumn);
-    // Filtering/sorting build their own new array (filter()/sort() already
-    // do not touch source.rows), so the defensive slice() is only needed
-    // when returning source.rows unchanged — otherwise every streaming
-    // re-render (every 120ms while a query streams) and every pagination
-    // click copied the entire result set only to read it back unmodified.
-    // Callers only ever read the returned rows/columns arrays (pagination's
-    // own .slice(), the export/copy/code-generator functions, and
-    // openInVanillaGrid, which takes its own defensive copy before handing
-    // rows to the third-party pivot grid library — see its call site).
-    let rows = filterText || sortActive ? source.rows.slice() : source.rows;
-    if (filterText) {
-        rows = rows.filter((row) => source.columns.some((column) => {
-            const value = row[column];
-            if (value === null || value === undefined) {
-                return false;
-            }
-            return String(value).toLowerCase().includes(filterText);
-        }));
-    }
-
-    if (sortActive) {
-        const column = resultViewState.sortColumn;
-        const direction = resultViewState.sortDirection === 'desc' ? -1 : 1;
-        rows.sort((leftRow, rightRow) => direction * compareResultValues(leftRow[column], rightRow[column]));
+    const sortColumn = sortActive ? resultViewState.sortColumn : '';
+    const sortDirection = sortActive && resultViewState.sortDirection === 'desc' ? 'desc' : 'asc';
+    let rows = source.rows;
+    if (!filterText && !sortColumn) {
+        visibleResultsCache = null;
+    } else if (visibleResultsCache && visibleResultsCache.source === source &&
+        visibleResultsCache.sourceRows === source.rows && visibleResultsCache.rowLength === source.rows.length &&
+        visibleResultsCache.columns === source.columns && visibleResultsCache.columnLength === source.columns.length &&
+        visibleResultsCache.filterText === filterText && visibleResultsCache.sortColumn === sortColumn &&
+        visibleResultsCache.sortDirection === sortDirection) {
+        rows = visibleResultsCache.rows;
+    } else {
+        if (filterText) {
+            rows = source.rows.filter((row) => source.columns.some((column) => {
+                const value = row[column];
+                if (value === null || value === undefined) return false;
+                return String(value).toLowerCase().includes(filterText);
+            }));
+        }
+        if (sortColumn && rows.length > 1) {
+            const direction = sortDirection === 'desc' ? -1 : 1;
+            // Prepare the sort representation once per row instead of
+            // converting the same values for every O(n log n) comparison.
+            const keyedRows = rows.map((row) => ({ row, key: resultValueSortKey(row[sortColumn]) }));
+            keyedRows.sort((left, right) => direction * compareResultSortKeys(left.key, right.key));
+            rows = keyedRows.map((entry) => entry.row);
+        } else if (sortColumn && rows === source.rows) {
+            // Sorting zero or one row makes no comparisons, but preserve the
+            // separate result array used for sorted views.
+            rows = rows.slice();
+        }
+        visibleResultsCache = { source, sourceRows: source.rows, rowLength: source.rows.length,
+            columns: source.columns, columnLength: source.columns.length,
+            filterText, sortColumn, sortDirection, rows };
     }
 
     return {
@@ -4297,29 +4516,26 @@ function getVisibleResults(source = currentResults) {
 // Array.prototype.sort otherwise.
 const resultValueCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
 
-function compareResultValues(leftValue, rightValue) {
-    if (leftValue === rightValue) {
+function resultValueSortKey(value) {
+    if (value === null || value === undefined) return { value, missing: true };
+    const number = typeof value === 'number' ? value : Number(value);
+    return { value, number, numeric: Number.isFinite(number), text: String(value) };
+}
+
+function compareResultSortKeys(left, right) {
+    if (left.value === right.value) {
         return 0;
     }
-    if (leftValue === null || leftValue === undefined) {
+    if (left.missing) {
         return 1;
     }
-    if (rightValue === null || rightValue === undefined) {
+    if (right.missing) {
         return -1;
     }
-
-    const leftNumber = typeof leftValue === 'number' ? leftValue : Number(leftValue);
-    const rightNumber = typeof rightValue === 'number' ? rightValue : Number(rightValue);
-    const leftIsNumeric = Number.isFinite(leftNumber);
-    const rightIsNumeric = Number.isFinite(rightNumber);
-
-    if (leftIsNumeric && rightIsNumeric) {
-        return leftNumber - rightNumber;
+    if (left.numeric && right.numeric) {
+        return left.number - right.number;
     }
-
-    const leftText = String(leftValue);
-    const rightText = String(rightValue);
-    return resultValueCollator.compare(leftText, rightText);
+    return resultValueCollator.compare(left.text, right.text);
 }
 
 let resultFilterTimer = null;
@@ -4495,20 +4711,15 @@ function exportCSV(visible = getVisibleResults()) {
         return;
     }
     
-    let csv = visible.columns.join(',') + '\n';
+    const escapeCsv = (value) => {
+        if (value === null || value === undefined) return '';
+        const text = String(value);
+        return /[",\r\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+    };
+    let csv = visible.columns.map(escapeCsv).join(',') + '\n';
     
     visible.rows.forEach(row => {
-        const values = visible.columns.map(col => {
-            let value = row[col];
-            if (value === null || value === undefined) {
-                return '';
-            }
-            value = String(value);
-            if (value.includes(',') || value.includes('"') || value.includes('\n')) {
-                value = '"' + value.replace(/"/g, '""') + '"';
-            }
-            return value;
-        });
+        const values = visible.columns.map(col => escapeCsv(row[col]));
         csv += values.join(',') + '\n';
     });
     
@@ -4525,10 +4736,10 @@ function exportTSV(visible = getVisibleResults()) {
         if (value === null || value === undefined) {
             return '';
         }
-        return String(value).replace(/\t/g, ' ').replace(/\r?\n/g, ' ');
+        return String(value).replace(/\r\n|[\t\r\n]/g, ' ');
     };
 
-    const lines = [visible.columns.join('\t')];
+    const lines = [visible.columns.map(escapeTsv).join('\t')];
     visible.rows.forEach((row) => {
         lines.push(visible.columns.map((column) => escapeTsv(row[column])).join('\t'));
     });
@@ -4561,6 +4772,11 @@ function exportXLSX(visible = getVisibleResults()) {
     }
     const sheet = window.XLSX.utils.aoa_to_sheet(sheetRows);
     sheet['!cols'] = visible.columns.map((column, index) => {
+        // The width is capped at 48. Large first cells are common in text
+        // columns and already determine the answer without scanning a sample.
+        if (String(column).length >= 46 || String(sheetRows[1][index] ?? '').length >= 46) {
+            return { wch: 48 };
+        }
         const values = sheetRows.slice(0, 1000).map((row) => String(row[index] ?? ''));
         return { wch: Math.min(48, Math.max(10, String(column).length + 2, ...values.map((value) => value.length + 2))) };
     });
@@ -4709,13 +4925,12 @@ function detectClipboardImportFormat(text) {
     if (!trimmed) {
         return 'csv';
     }
-    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-        return 'json';
-    }
-
-    const lines = trimmed.split(/\r?\n/).filter(Boolean);
+    const lines = trimmed.split(/\r\n|[\r\n]/).filter((line) => line.trim());
     if (lines.length > 1 && lines.every((line) => line.trim().startsWith('{') && line.trim().endsWith('}'))) {
         return 'jsonl';
+    }
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        return 'json';
     }
 
     const sample = lines.slice(0, 5).join('\n');
@@ -4785,12 +5000,17 @@ async function importClipboardData() {
 
 // Escape HTML – static map avoids creating DOM nodes on every call
 function escapeHtml(text) {
-    return String(text)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
+    // A result page escapes every text cell. Scan once, including the common
+    // case with no special characters, instead of running five replacements.
+    return String(text).replace(/[&<>"']/g, (char) => {
+        switch (char) {
+            case '&': return '&amp;';
+            case '<': return '&lt;';
+            case '>': return '&gt;';
+            case '"': return '&quot;';
+            default: return '&#39;';
+        }
+    });
 }
 
 // Escape XML special chars

@@ -34,13 +34,14 @@ type streamQueryOperation struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	stream    *tinysql.ResultStream
-	columns   []string
-	rows      []tinysql.Row
-	resultB   int64
-	truncated bool
-	reason    string
-	settled   bool
+	stream     *tinysql.ResultStream
+	columns    []string
+	columnKeys []string
+	rows       []tinysql.Row
+	resultB    int64
+	truncated  bool
+	reason     string
+	settled    bool
 
 	resolve js.Value
 	pump    js.Func
@@ -153,7 +154,7 @@ func (op *streamQueryOperation) run(_ js.Value, _ []js.Value) interface{} {
 	// already-encoded JSON (see streamJSRow) so byte accounting does not
 	// normalize or re-encode a row a second time immediately before emitting
 	// it to JavaScript.
-	batch := make([]interface{}, 0, streamPumpRows)
+	batch := make([]json.RawMessage, 0, streamPumpRows)
 	for rowCount := 0; rowCount < streamPumpRows; rowCount++ {
 		if err := op.ctx.Err(); err != nil {
 			_ = op.stream.Close()
@@ -171,7 +172,7 @@ func (op *streamQueryOperation) run(_ js.Value, _ []js.Value) interface{} {
 		}
 
 		row := op.stream.Row()
-		jsRow, rowBytes, err := streamJSRow(op.columns, row)
+		jsRow, rowBytes, err := streamJSRow(op.columns, op.columnKeys, row)
 		if err != nil {
 			_ = op.stream.Close()
 			op.finishError(fmt.Errorf("encode streamed row: %w", err))
@@ -226,26 +227,21 @@ func (op *streamQueryOperation) start() error {
 	}
 	op.stream = stream
 	op.columns = stream.Columns()
+	op.columnKeys = resultColumnKeys(op.columns)
 	op.emit("started", map[string]interface{}{
 		"columns": stringsToInterfaces(op.columns),
 	})
 	return nil
 }
 
-func streamJSRow(columns []string, row tinysql.Row) (json.RawMessage, int64, error) {
-	jsRow := resultRowToJS(columns, row)
+func streamJSRow(columns, keys []string, row tinysql.Row) (json.RawMessage, int64, error) {
+	jsRow := resultRowToJS(columns, keys, row)
 	encoded, err := json.Marshal(jsRow)
 	if err != nil {
 		return nil, 0, err
 	}
-	// Returning the already-encoded bytes (rather than the map streamJSValue
-	// would otherwise re-walk and re-encode from scratch inside emitChunk's
-	// batch) means every streamed row is fully JSON-marshaled once, not
-	// twice. json.RawMessage implements json.Marshaler by copying its bytes
-	// back out verbatim, so the outer Marshal in streamJSValue compacts
-	// already-escaped bytes instead of re-encoding the row's fields —
-	// byte-for-byte identical output, since both passes use the same
-	// escapeHTML-on encoding/json defaults.
+	// The chunk emitter reuses these encoded bytes without re-encoding the
+	// fields, and byte accounting uses precisely the same representation.
 	//
 	// Include one JSON separator/newline byte, matching the server's streaming
 	// response limiter closely enough to make the browser budget predictable.
@@ -254,8 +250,8 @@ func streamJSRow(columns []string, row tinysql.Row) (json.RawMessage, int64, err
 
 // streamRowBytes is also used by the materialized multi-statement safeguard.
 // Streaming calls streamJSRow directly so that conversion is not duplicated.
-func streamRowBytes(columns []string, row tinysql.Row) (int64, error) {
-	_, bytes, err := streamJSRow(columns, row)
+func streamRowBytes(columns, keys []string, row tinysql.Row) (int64, error) {
+	_, bytes, err := streamJSRow(columns, keys, row)
 	return bytes, err
 }
 
@@ -269,14 +265,39 @@ func (op *streamQueryOperation) finishTruncated(reason string) {
 	op.finishSuccess()
 }
 
-func (op *streamQueryOperation) emitChunk(rows []interface{}) {
+func (op *streamQueryOperation) emitChunk(rows []json.RawMessage) {
 	if len(rows) == 0 {
 		return
 	}
-	op.emit("chunk", map[string]interface{}{
+	reporter := js.Global().Get("__tinySQLReportQueryStream")
+	if reporter.Type() != js.TypeFunction {
+		return
+	}
+	// Rows were already validated and encoded by streamJSRow. Send them
+	// directly to JSON.parse rather than asking encoding/json to scan and
+	// compact every RawMessage a second time when packaging the event.
+	payload := streamJSValue(op.eventPayload("chunk", map[string]interface{}{
 		"columns": stringsToInterfaces(op.columns),
-		"rows":    rows,
-	})
+	}))
+	payload.Set("rows", streamRowsJSValue(rows))
+	reporter.Invoke(op.requestID, payload)
+}
+
+func streamRowsJSValue(rows []json.RawMessage) js.Value {
+	size := 2
+	for _, row := range rows {
+		size += len(row) + 1
+	}
+	data := make([]byte, 0, size)
+	data = append(data, '[')
+	for i, row := range rows {
+		if i != 0 {
+			data = append(data, ',')
+		}
+		data = append(data, row...)
+	}
+	data = append(data, ']')
+	return js.Global().Get("JSON").Call("parse", string(data))
 }
 
 func (op *streamQueryOperation) finishSuccess() {
@@ -365,6 +386,10 @@ func (op *streamQueryOperation) emit(phase string, extra map[string]interface{})
 	if reporter.Type() != js.TypeFunction {
 		return
 	}
+	reporter.Invoke(op.requestID, streamJSValue(op.eventPayload(phase, extra)))
+}
+
+func (op *streamQueryOperation) eventPayload(phase string, extra map[string]interface{}) map[string]interface{} {
 	payload := map[string]interface{}{
 		"phase":        phase,
 		"elapsedMs":    durationMilliseconds(op.startedAt),
@@ -380,7 +405,7 @@ func (op *streamQueryOperation) emit(phase string, extra map[string]interface{})
 	for key, value := range extra {
 		payload[key] = value
 	}
-	reporter.Invoke(op.requestID, streamJSValue(payload))
+	return payload
 }
 
 func durationMilliseconds(start time.Time) float64 {

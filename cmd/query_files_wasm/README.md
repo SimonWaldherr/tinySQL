@@ -7,6 +7,11 @@ The Go/WASM engine runs in a dedicated browser worker. Imported data and
 snapshots stay in the browser unless you export or deliberately share a URL
 demo.
 
+Shared demos open in a new local workspace after the current one has been
+saved. If browser workspace storage is unavailable, a shared link can still
+start in a fresh temporary engine; opening one over an active temporary
+database is disabled so its in-memory data is not lost.
+
 ## Build and run
 
 ```bash
@@ -56,6 +61,57 @@ before producing their first row.
 Browser imports are limited to 64 MiB; snapshot imports are limited to 256 MiB.
 Those limits protect the most expensive local paths, not the total memory used
 by an in-memory database.
+
+To exercise workspace recovery against a real browser IndexedDB and compare
+it with a committed baseline, run `./benchmark-workspace-recovery.sh HEAD`
+from this directory and open the printed local URL. The test uses a temporary
+database, five 8 MiB generations, and six timed recovery pairs; it reports
+storage recovery time without the subsequent Go/WASM snapshot import. It also
+checks concurrent saves, retention, and recovery from a rejected snapshot.
+The optional Git reference selects the baseline, and `PORT` changes the local
+server port. Stop the server with Ctrl-C.
+
+Similarly, `./benchmark-workspace-save.sh HEAD` compares saving retained
+generations and checks concurrent saves, retention, and OPFS rollback and
+cleanup in a browser. Both scripts use isolated temporary databases and files.
+
+## Tests and benchmarks
+
+Run native Go, JavaScript, and Go/WASM tests from the repository root (Node.js
+is required for the JavaScript and Go/WASM tests):
+
+```bash
+make test-query-files-wasm GO_TEST_FLAGS=-count=1
+node cmd/query_files_wasm/result-view.bench.cjs
+node cmd/query_files_wasm/export-xlsx.bench.cjs
+node cmd/query_files_wasm/editor-highlight.bench.cjs
+node cmd/query_files_wasm/editor-position.bench.cjs
+node cmd/query_files_wasm/result-cells.bench.cjs
+node cmd/query_files_wasm/workspace-panel.bench.cjs
+node cmd/query_files_wasm/sql-mutation.bench.cjs
+```
+
+The JavaScript benchmarks measure local sort, result-cell formatting, XLSX
+preparation, editor highlighting and positioning, workspace panel refreshes,
+and SQL mutation detection without browser rendering or XLSX serialization.
+Pass a prior `app.js` path as an argument to compare versions. To run the Go
+filter, sorting, row-conversion, streaming and SQL splitting benchmarks in
+Node's WASM runtime:
+
+```bash
+cd cmd/query_files_wasm
+GOOS=js GOARCH=wasm go test -tags no_http \
+  -exec "$(go env GOROOT)/lib/wasm/go_js_wasm_exec" \
+  -run '^$' -bench '^Benchmark(BuildResultRowIndexesFilteredSort|ResultSortColumnKeys|ResultFilterUppercaseColumns|ResultViewCaseInsensitiveFilter|ResultConversion|StreamChunkEmission|SplitStatements)$' -benchmem
+```
+
+The shared CSV importer can also be measured as a complete WASM import from
+the repository root:
+
+```bash
+GOOS=js GOARCH=wasm go test -exec "$(go env GOROOT)/lib/wasm/go_js_wasm_exec" \
+  ./internal/importer -run '^$' -bench '^BenchmarkFuzzyImportCSV$' -benchmem
+```
 
 ## Recent engine features in the demo
 

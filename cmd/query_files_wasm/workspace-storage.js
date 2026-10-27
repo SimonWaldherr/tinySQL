@@ -836,7 +836,12 @@
             const id = normalizeWorkspaceID(workspaceId);
             const workspace = await this.getWorkspace(id);
             const db = await this.open();
-            const allGenerations = (await this._getGenerations(db, id)).sort(sortNewestFirst);
+            // Read only keys up front: IndexedDB otherwise structured-clones
+            // every retained snapshot, even when the current one is valid.
+            // Fetch each immutable record only when recovery reaches it.
+            const allGenerations = (await this._getGenerationNumbers(db, id))
+                .map((generation) => ({ generation }))
+                .sort(sortNewestFirst);
             if (allGenerations.length === 0) {
                 return {
                     workspace,
@@ -863,8 +868,13 @@
 
             const attemptedGenerations = [];
             let lastError;
-            for (const record of ordered) {
-                attemptedGenerations.push(record.generation);
+            for (const candidate of ordered) {
+                attemptedGenerations.push(candidate.generation);
+                const record = await this._getGenerationRecord(db, id, candidate.generation);
+                // Another tab may have trimmed a generation since the key
+                // list was read; continue with remaining candidates. Actual
+                // IndexedDB errors still propagate as they did on getAll.
+                if (!record) continue;
                 let snapshot;
                 try {
                     snapshot = await this._snapshotForRead(record);
@@ -1229,6 +1239,14 @@
             return Array.isArray(result) ? result : [];
         }
 
+        async _getGenerationNumbers(db, workspaceId) {
+            const transaction = db.transaction(GENERATIONS_STORE, 'readonly');
+            const index = transaction.objectStore(GENERATIONS_STORE).index(GENERATIONS_BY_WORKSPACE);
+            const keys = await requestAsPromise(index.getAllKeys(workspaceId));
+            await transactionAsPromise(transaction);
+            return Array.isArray(keys) ? keys.map((key) => key[1]) : [];
+        }
+
         /**
          * Atomically create a workspace and (when supplied) its first
          * generation.  `add()` is intentional: it is the cross-tab-safe
@@ -1414,7 +1432,10 @@
                         // It also repairs stale nextGeneration values left by
                         // an older client: allocation is always above every
                         // stored numeric generation.
-                        const existingGenerationsRequest = generationIndex.getAll(workspaceId);
+                        // Retention and generation allocation only need the
+                        // primary keys. Loading every record here also clones
+                        // every retained IndexedDB snapshot on each save.
+                        const existingGenerationsRequest = generationIndex.getAllKeys(workspaceId);
                         existingGenerationsRequest.onerror = () => {
                             failure = requestFailure(
                                 'Could not read workspace generations before saving.',
@@ -1425,7 +1446,7 @@
                         existingGenerationsRequest.onsuccess = () => {
                             try {
                                 const existingGenerations = Array.isArray(existingGenerationsRequest.result)
-                                    ? existingGenerationsRequest.result
+                                    ? existingGenerationsRequest.result.map((key) => ({ generation: key[1] }))
                                     : [];
                                 const generationNumber = this._allocateGenerationNumber(
                                     current,
@@ -1519,22 +1540,46 @@
                                     workspace,
                                     keepGenerations
                                 );
+                                // Only records that will be deleted need to
+                                // be read: OPFS cleanup needs their file names
+                                // after the transaction commits. Queue both
+                                // the read and delete in this transaction so
+                                // concurrent tabs cannot change the decision.
+                                obsoleteGenerations = [];
                                 for (const obsoleteGeneration of obsolete) {
-                                    const deleteRequest = generations.delete([
-                                        workspaceId,
-                                        obsoleteGeneration.generation,
-                                    ]);
-                                    deleteRequest.onerror = () => {
+                                    const key = [workspaceId, obsoleteGeneration.generation];
+                                    const obsoleteRequest = generations.get(key);
+                                    obsoleteRequest.onerror = () => {
                                         if (!failure) {
                                             failure = requestFailure(
-                                                'Could not trim old workspace generations.',
+                                                'Could not read obsolete workspace generations.',
                                                 'WORKSPACE_SAVE_FAILED',
-                                                deleteRequest.error
+                                                obsoleteRequest.error
                                             );
                                         }
                                     };
+                                    obsoleteRequest.onsuccess = () => {
+                                        try {
+                                            if (obsoleteRequest.result) obsoleteGenerations.push(obsoleteRequest.result);
+                                            const deleteRequest = generations.delete(key);
+                                            deleteRequest.onerror = () => {
+                                                if (!failure) {
+                                                    failure = requestFailure(
+                                                        'Could not trim old workspace generations.',
+                                                        'WORKSPACE_SAVE_FAILED',
+                                                        deleteRequest.error
+                                                    );
+                                                }
+                                            };
+                                        } catch (error) {
+                                            failAndAbort(requestFailure(
+                                                'Could not trim old workspace generations.',
+                                                'WORKSPACE_SAVE_FAILED',
+                                                error
+                                            ));
+                                        }
+                                    };
                                 }
-                                obsoleteGenerations = obsolete;
                                 usedStagedOPFS = Boolean(useStagedSnapshot);
                                 savedWorkspace = workspace;
                             } catch (error) {

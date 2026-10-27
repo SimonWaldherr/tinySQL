@@ -40,6 +40,7 @@
             this.worker = null;
             this.ready = false;
             this._initializing = null;
+            this._cancelInitialization = null;
             this._nextRequestId = 1;
             this._queued = [];
             this._active = null;
@@ -80,11 +81,14 @@
                 const cleanupInitError = (error) => {
                     if (this.ready) return;
                     this._initializing = null;
+                    if (this._cancelInitialization === cleanupInitError) this._cancelInitialization = null;
                     worker.terminate();
                     if (this.worker === worker) this.worker = null;
                     reject(error);
                 };
+                this._cancelInitialization = cleanupInitError;
                 const handleWorkerFailure = (error) => {
+                    if (this.worker !== worker) return;
                     if (!this.ready) {
                         cleanupInitError(error);
                         return;
@@ -92,10 +96,16 @@
                     this.ready = false;
                     if (this.worker === worker) this.worker = null;
                     worker.terminate();
-                    this._emit('error', error);
                     this._failAll(error);
+                    this._emit('error', error);
                 };
-                worker.onmessage = (event) => this._handleMessage(event.data, resolve, cleanupInitError);
+                worker.onmessage = (event) => {
+                    // Events queued by an old worker must not affect a later
+                    // initialization or its requests.
+                    if (this.worker !== worker) return;
+                    if (event.data?.type === 'ready') this._cancelInitialization = null;
+                    this._handleMessage(event.data, resolve, cleanupInitError);
+                };
                 worker.onerror = (event) => handleWorkerFailure(workerError({ message: event.message, name: 'WorkerError' }));
                 worker.onmessageerror = () => handleWorkerFailure(workerError({ message: 'WASM worker returned data that could not be cloned.' }));
                 try {
@@ -134,9 +144,11 @@
                 this.ready = false;
                 this.worker?.terminate();
                 this.worker = null;
-                this._emit('error', error);
                 this._failAll(error);
                 rejectInit?.(error);
+                // Settle the failed initialization before notifying listeners:
+                // an error handler may immediately call init() to retry.
+                this._emit('error', error);
                 return;
             }
             if (message.type === 'progress') {
@@ -275,6 +287,7 @@
 
         terminate() {
             const error = workerError({ message: 'The WASM worker was terminated.', code: 'WASM_WORKER_TERMINATED' });
+            this._cancelInitialization?.(error);
             this._failAll(error);
             this.worker?.terminate();
             this.worker = null;

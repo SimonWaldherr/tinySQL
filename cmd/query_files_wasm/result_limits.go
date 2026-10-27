@@ -33,13 +33,14 @@ func limitResultForBrowser(result *tinysql.ResultSet) (*tinysql.ResultSet, resul
 		Rows: make([]tinysql.Row, 0, min(len(result.Rows), streamPreviewMaxRows)),
 	}
 	info := resultLimitInfo{RowsProduced: len(result.Rows)}
+	keys := resultColumnKeys(result.Cols)
 	for _, row := range result.Rows {
 		if len(limited.Rows) >= streamPreviewMaxRows {
 			info.Truncated = true
 			info.Reason = "row"
 			break
 		}
-		rowBytes, err := streamRowBytes(result.Cols, row)
+		rowBytes, err := streamRowBytes(result.Cols, keys, row)
 		if err != nil {
 			return nil, resultLimitInfo{}, fmt.Errorf("measure row: %w", err)
 		}

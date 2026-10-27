@@ -1,0 +1,43 @@
+<!doctype html><title>Workspace recovery benchmark</title><pre id="out">RUNNING</pre><script src="baseline.js"></script><script>const BaselineStorage=TinySQLWorkspaceStorage.WorkspaceStorage;</script><script src="workspace-storage.js"></script><script>
+(async () => {
+  const name = 'recovery-test-' + crypto.randomUUID();
+  const s = new TinySQLWorkspaceStorage.WorkspaceStorage({databaseName:name, maxGenerations:5});
+  const t = new TinySQLWorkspaceStorage.WorkspaceStorage({databaseName:name, maxGenerations:5});
+  const baseline = new BaselineStorage({databaseName:name, maxGenerations:5});
+  const expected = new Uint8Array(8 * 1024 * 1024); expected.fill(4);
+  await s.createWorkspace({id:'demo',name:'demo',snapshot:expected,format:'raw'});
+  await Promise.all([2,3].map(n => { const v=expected.slice(); v[0]=n; return (n===2?s:t).saveWorkspace('demo',v); }));
+  const h=await s.listGenerations('demo');
+  if (h.length!==3 || new Set(h.map(x=>x.generation)).size!==3) throw Error('concurrent save lost a generation');
+  for(let i=0;i<2;i++) {const v=expected.slice();v[0]=4+i;await s.saveWorkspace('demo',v);}
+  const db=await s.open();
+  async function oldRecover() { return baseline.recoverWorkspace('demo'); }
+  const times={old:[],next:[]};
+  await oldRecover(); await s.recoverWorkspace('demo');
+  for(let i=0;i<6;i++){let start=performance.now(); await oldRecover();times.old.push(performance.now()-start);start=performance.now();let result=await s.recoverWorkspace('demo');times.next.push(performance.now()-start);if(new Uint8Array(result.snapshot)[0]!==5)throw Error('wrong snapshot');}
+  const bad=await s.recoverWorkspace('demo',{validate: b=>new Uint8Array(b)[0]===4});
+  if (!bad.recovered || bad.attemptedGenerations.length!==2 || new Uint8Array(bad.snapshot)[0]!==4) throw Error('fallback invalid');
+  const mean=xs=>xs.reduce((a,b)=>a+b,0)/xs.length;
+  const sixth=expected.slice(); sixth[0]=6; await s.saveWorkspace('demo',sixth);
+  const retained=await s.listGenerations('demo');
+  if (retained.length!==5 || retained.some(x=>x.generation===1)) throw Error('retention mismatch');
+  const retainedFallback=await s.recoverWorkspace('demo',{validate:b=>new Uint8Array(b)[0]===5});
+  if(!retainedFallback.recovered || retainedFallback.attemptedGenerations.length!==2) throw Error('retained fallback mismatch');
+  let opfs='unavailable';
+  if (navigator.storage && navigator.storage.getDirectory) {
+    const p=new TinySQLWorkspaceStorage.WorkspaceStorage({databaseName:name+'-opfs',preferOPFS:true,opfsThresholdBytes:0});
+    const first=new Uint8Array([21]), second=new Uint8Array([22]);
+    await p.createWorkspace({id:'opfs',name:'opfs',snapshot:first,format:'raw'});
+    await p.saveWorkspace('opfs',second);
+    const status=await p.getWorkspace('opfs');
+    if(status.backend==='opfs') {
+      const r=await p.recoverWorkspace('opfs',{validate:async b=>new Uint8Array(b instanceof Blob ? await b.arrayBuffer() : b)[0]===21});
+      if (!r.recovered || r.attemptedGenerations.length!==2) throw Error('OPFS fallback mismatch');
+      opfs='passed';
+    }
+    await p.deleteWorkspace('opfs');p.close();indexedDB.deleteDatabase(name+'-opfs');
+  }
+  document.querySelector('#out').textContent='PASS real IndexedDB; concurrent saves; retention; retained fallback; OPFS '+opfs+'; 5 x 8 MiB; old mean '+mean(times.old).toFixed(2)+' ms; new mean '+mean(times.next).toFixed(2)+' ms; raw '+JSON.stringify(times);
+  s.close(); t.close(); baseline.close(); indexedDB.deleteDatabase(name);
+})().catch(e=>{document.querySelector('#out').textContent='FAIL '+e.stack});
+</script>
