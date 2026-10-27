@@ -88,6 +88,8 @@ done:
 
 // vectorL2SquaredSSE2 computes the squared Euclidean distance for two equally
 // sized float64 slices using baseline SSE2 packed double operations.
+// Load both inputs with MOVUPD: Go slices need not be 16-byte aligned, but
+// legacy SUBPD memory operands require alignment (unlike AVX VSUBPD).
 TEXT ·vectorL2SquaredSSE2(SB), NOSPLIT, $0-56
 	MOVQ a_base+0(FP), SI
 	MOVQ a_len+8(FP), CX
@@ -102,19 +104,23 @@ TEXT ·vectorL2SquaredSSE2(SB), NOSPLIT, $0-56
 
 l2_loop:
 	MOVUPD (SI), X1
-	SUBPD (DI), X1
+	MOVUPD (DI), X2
+	SUBPD X2, X1
 	MULPD X1, X1
 	ADDPD X1, X0
 	MOVUPD 16(SI), X1
-	SUBPD 16(DI), X1
+	MOVUPD 16(DI), X2
+	SUBPD X2, X1
 	MULPD X1, X1
 	ADDPD X1, X3
 	MOVUPD 32(SI), X1
-	SUBPD 32(DI), X1
+	MOVUPD 32(DI), X2
+	SUBPD X2, X1
 	MULPD X1, X1
 	ADDPD X1, X4
 	MOVUPD 48(SI), X1
-	SUBPD 48(DI), X1
+	MOVUPD 48(DI), X2
+	SUBPD X2, X1
 	MULPD X1, X1
 	ADDPD X1, X5
 	ADDQ $64, SI
@@ -171,19 +177,23 @@ TEXT ·vectorL1SSE2(SB), NOSPLIT, $0-56
 
 l1_loop:
 	MOVUPD (SI), X1
-	SUBPD (DI), X1
+	MOVUPD (DI), X2
+	SUBPD X2, X1
 	ANDPD X7, X1
 	ADDPD X1, X0
 	MOVUPD 16(SI), X1
-	SUBPD 16(DI), X1
+	MOVUPD 16(DI), X2
+	SUBPD X2, X1
 	ANDPD X7, X1
 	ADDPD X1, X3
 	MOVUPD 32(SI), X1
-	SUBPD 32(DI), X1
+	MOVUPD 32(DI), X2
+	SUBPD X2, X1
 	ANDPD X7, X1
 	ADDPD X1, X4
 	MOVUPD 48(SI), X1
-	SUBPD 48(DI), X1
+	MOVUPD 48(DI), X2
+	SUBPD X2, X1
 	ANDPD X7, X1
 	ADDPD X1, X5
 	ADDQ $64, SI

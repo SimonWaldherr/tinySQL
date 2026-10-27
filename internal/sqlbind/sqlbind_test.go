@@ -20,6 +20,8 @@ func TestBindSkipsStringsIdentifiersAndComments(t *testing.T) {
 		{"quoted identifier", `SELECT "why?" FROM t WHERE id = ?`, []any{4}, `SELECT "why?" FROM t WHERE id = 4`},
 		{"backtick identifier", "SELECT `a?b` FROM t WHERE id = ?", []any{5}, "SELECT `a?b` FROM t WHERE id = 5"},
 		{"line comment", "SELECT ? -- really?\nFROM t", []any{6}, "SELECT 6 -- really?\nFROM t"},
+		{"CR line comment", "SELECT -- ? $2\r?", []any{6}, "SELECT -- ? $2\r6"},
+		{"CRLF line comment", "SELECT -- ? $2\r\n$1", []any{6}, "SELECT -- ? $2\r\n6"},
 		{"block comment", "SELECT /* $1 ? */ ?", []any{7}, "SELECT /* $1 ? */ 7"},
 		{"trailing comment without args", "SELECT 1 -- why?", nil, "SELECT 1 -- why?"},
 		{"unterminated comment", "SELECT ? /* ?", []any{8}, "SELECT 8 /* ?"},
@@ -79,7 +81,7 @@ func TestSkipOpaque(t *testing.T) {
 		sql  string
 		want int
 	}{
-		{"'a''b' x", 6}, {`"a""b" x`, 6}, {"-- c\nx", 4}, {"/* c */x", 7}, {"x", 0}, {"-x", 0}, {"/x", 0}, {"'open", 5},
+		{"'a''b' x", 6}, {`"a""b" x`, 6}, {"-- c\nx", 4}, {"-- c\rx", 4}, {"-- c\r\nx", 4}, {"/* c */x", 7}, {"x", 0}, {"-x", 0}, {"/x", 0}, {"'open", 5},
 	} {
 		if got := SkipOpaque(tc.sql, 0); got != tc.want {
 			t.Errorf("SkipOpaque(%q) = %d, want %d", tc.sql, got, tc.want)

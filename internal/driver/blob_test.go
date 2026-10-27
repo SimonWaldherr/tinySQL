@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"database/sql/driver"
 	"path/filepath"
 	"testing"
@@ -82,8 +83,45 @@ func TestBlobRoundTripThroughDriver(t *testing.T) {
 			continue
 		}
 		b, ok := one[0].([]byte)
-		if !ok || !bytes.Equal(b, tc.want) {
+		if !ok || b == nil || !bytes.Equal(b, tc.want) {
 			t.Fatalf("id %d = %#v, want empty BLOB", tc.id, one[0])
+		}
+	}
+}
+
+func TestEmptyBlobScanDistinctFromNull(t *testing.T) {
+	db, err := sql.Open("tinysql", "mem://?tenant=empty_blob_scan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE blob_scan (id INT, data BLOB)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO blob_scan VALUES (1, ?)`, []byte{}); err != nil {
+		t.Fatal(err)
+	}
+	stmt, err := db.Prepare(`INSERT INTO blob_scan VALUES (2, ?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stmt.Close()
+	if _, err := stmt.Exec([]byte{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO blob_scan VALUES (3, NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []int{1, 2, 3} {
+		var got []byte
+		if err := db.QueryRow(`SELECT data FROM blob_scan WHERE id = ?`, id).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if id != 3 && (got == nil || len(got) != 0) {
+			t.Errorf("id %d: empty BLOB scanned as %#v", id, got)
+		}
+		if id == 3 && got != nil {
+			t.Errorf("NULL scanned as %#v", got)
 		}
 	}
 }

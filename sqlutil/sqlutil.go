@@ -65,17 +65,21 @@ func AnalyzeStatement(stmt engine.Statement) Analysis {
 	case *engine.Select:
 		return Analysis{Kind: KindSelect, ReadOnly: true, ResultProducing: true}
 	case *engine.Explain:
+		if s.Analyze {
+			inner := AnalyzeStatement(s.Statement)
+			return Analysis{Kind: KindExplain, ObjectName: inner.ObjectName, ReadOnly: inner.ReadOnly, ResultProducing: true, Mutation: inner.Mutation, DDL: inner.DDL, Job: inner.Job}
+		}
 		return Analysis{Kind: KindExplain, ReadOnly: true, ResultProducing: true}
 	case *engine.Analyze:
 		return Analysis{Kind: KindAnalyze, ObjectName: s.Table, Mutation: true, ResultProducing: true}
 	case *engine.Pragma:
 		return Analysis{Kind: KindPragma, ReadOnly: true, ResultProducing: true}
 	case *engine.Insert:
-		return Analysis{Kind: KindInsert, ObjectName: s.Table, Mutation: true}
+		return Analysis{Kind: KindInsert, ObjectName: s.Table, Mutation: true, ResultProducing: len(s.Returning) > 0}
 	case *engine.Update:
-		return Analysis{Kind: KindUpdate, ObjectName: s.Table, Mutation: true}
+		return Analysis{Kind: KindUpdate, ObjectName: s.Table, Mutation: true, ResultProducing: len(s.Returning) > 0}
 	case *engine.Delete:
-		return Analysis{Kind: KindDelete, ObjectName: s.Table, Mutation: true}
+		return Analysis{Kind: KindDelete, ObjectName: s.Table, Mutation: true, ResultProducing: len(s.Returning) > 0}
 	case *engine.CreateTable:
 		return Analysis{Kind: KindCreateTable, ObjectName: s.Name, DDL: true}
 	case *engine.DropTable:
@@ -124,6 +128,9 @@ func IsResultProducing(sql string) bool {
 	a, err := Analyze(sql)
 	if err == nil {
 		return a.ResultProducing
+	}
+	if len(engine.SplitStatements(sql)) > 1 {
+		return false
 	}
 	upper := strings.TrimSpace(strings.ToUpper(sql))
 	return strings.HasPrefix(upper, "SELECT") ||

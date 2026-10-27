@@ -844,6 +844,8 @@ type vecDistanceFunc func(vec []float64, norm float64) (float64, bool)
 // resolving a row's norm at all.
 func vecDistanceFuncNeedsNorm(metric string) bool { return metric == "cosine" }
 
+// Resolve the metric once per query. Each specialized path preserves the
+// generic length and NaN checks while avoiding dispatch for every candidate.
 func buildVecDistanceFunc(metric string, query []float64, queryNorm float64) vecDistanceFunc {
 	switch metric {
 	case "cosine":
@@ -855,22 +857,43 @@ func buildVecDistanceFunc(metric string, query []float64, queryNorm float64) vec
 		}
 	case "l2":
 		return func(vec []float64, _ float64) (float64, bool) {
-			return vecCheckedDistance(metric, vec, query, 0, 0)
+			if len(vec) != len(query) {
+				return 0, false
+			}
+			distance := search.VectorL2Squared(vec, query)
+			if math.IsNaN(distance) {
+				return 0, false
+			}
+			return distance, true
 		}
 	case "manhattan":
 		return func(vec []float64, _ float64) (float64, bool) {
-			return vecCheckedDistance(metric, vec, query, 0, 0)
+			if len(vec) != len(query) {
+				return 0, false
+			}
+			distance := search.VectorL1Distance(vec, query)
+			if math.IsNaN(distance) {
+				return 0, false
+			}
+			return distance, true
 		}
 	case "dot":
 		return func(vec []float64, _ float64) (float64, bool) {
-			return vecCheckedDistance(metric, vec, query, 0, 0)
+			if len(vec) != len(query) {
+				return 0, false
+			}
+			distance := -search.VectorDot(vec, query)
+			if math.IsNaN(distance) {
+				return 0, false
+			}
+			return distance, true
 		}
 	default:
 		return func([]float64, float64) (float64, bool) { return 0, false }
 	}
 }
 
-// vecCosineRankingDistance is the cosine branch of vecCheckedDistance without
+// vecCosineRankingDistance is the cosine branch of VectorRankingDistance without
 // its per-row metric dispatch. Cosine is RAG_SEARCH's default and every flat
 // candidate otherwise passes through VectorRankingDistance and VectorDistance
 // just to select this same formula. Keeping the length and NaN checks here
@@ -888,26 +911,6 @@ func vecCosineRankingDistance(vec, query []float64, norm, queryNorm float64) (fl
 		return 0, false
 	}
 	return distance, true
-}
-
-// vecCheckedDistance wraps search.VectorRankingDistance with a NaN guard. A NaN or
-// Inf-derived-NaN vector component (e.g. dividing by a zero-ish norm that
-// underflowed, or a NaN stored via a non-SQL insertion path) can produce a
-// NaN distance even though search.VectorDistance's own "ok" contract only rejects
-// dimension mismatches and zero-norm vectors. Treat a NaN result the same as
-// any other invalid-row case (ok=false) so it is excluded from top-k
-// consideration instead of poisoning the heap (see pushTopK).
-//
-// Returns a ranking-only distance (see search.VectorRankingDistance) — every caller
-// of buildVecDistanceFunc's returned closure funnels into
-// vecSearchTopKWithIndex, which finalizes the small top-k result once
-// instead of every candidate paying for it during the scan.
-func vecCheckedDistance(metric string, a, b []float64, normA, normB float64) (float64, bool) {
-	dist, ok := search.VectorRankingDistance(metric, a, b, normA, normB)
-	if !ok || math.IsNaN(dist) {
-		return 0, false
-	}
-	return dist, true
 }
 
 func vecSearchWorkerCount(rows, dims int) int {

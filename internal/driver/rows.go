@@ -136,7 +136,9 @@ func (r *rows) copyRow(row engine.Row, cols []string, dest []driver.Value) error
 		case []byte:
 			// database/sql callers may retain Scan destinations; return an owned
 			// slice just as the standard drivers do for binary columns.
-			dest[i] = append([]byte(nil), vv...)
+			// A typed nil slice is still a BLOB here; SQL NULL arrived as a
+			// nil interface. Preserve that distinction for empty BLOB scans.
+			dest[i] = append([]byte{}, vv...)
 		default:
 			b, err := storage.JSONMarshal(vv)
 			if err != nil {

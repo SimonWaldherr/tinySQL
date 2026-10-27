@@ -31,7 +31,7 @@ func markerSQLForNumberedParams(sqlText string) (string, []int, int, bool) {
 				i++
 			}
 		case strings.HasPrefix(sqlText[i:], "--"):
-			for i < len(sqlText) && sqlText[i] != '\n' {
+			for i < len(sqlText) && sqlText[i] != '\n' && sqlText[i] != '\r' {
 				i++
 			}
 		case strings.HasPrefix(sqlText[i:], "/*"):

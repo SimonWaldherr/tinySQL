@@ -195,6 +195,11 @@ func evalTrimCommon(env ExecEnv, name string, side trimSide, args []Expr, row Ro
 		} else {
 			return nil, fmt.Errorf("%s cutset must be a string", name)
 		}
+		// An explicit empty cutset contains no characters to remove. It is
+		// different from omitting the argument, which trims whitespace.
+		if cutset == "" {
+			return str, nil
+		}
 	}
 
 	return trimStringValue(val, str, cutset, side)
@@ -536,9 +541,6 @@ func evalSubstring(env ExecEnv, args []Expr, row Row) (any, error) {
 		start = 0
 	}
 	startByte := substringByteOffset(str, start)
-	if startByte == len(str) {
-		return "", nil
-	}
 	endByte := len(str)
 
 	// Get length if provided
@@ -769,6 +771,9 @@ func evalRepeat(env ExecEnv, args []Expr, row Row) (any, error) {
 	count, ok := countAny.(int)
 	if !ok || count < 0 {
 		return "", nil
+	}
+	if len(str) > 0 && count > int(^uint(0)>>1)/len(str) {
+		return nil, fmt.Errorf("REPEAT result is too large")
 	}
 	return strings.Repeat(str, count), nil
 }

@@ -54,19 +54,73 @@ func evalRound(env ExecEnv, args []Expr, row Row) (any, error) {
 		if decVal == nil {
 			return nil, nil
 		}
-		decAny, err := coerceToInt(decVal)
+		decimals, err = decimalPrecision(decVal)
 		if err != nil {
 			return nil, fmt.Errorf("ROUND decimals must be numeric")
 		}
-		var ok bool
-		decimals, ok = decAny.(int)
-		if !ok {
-			return nil, fmt.Errorf("ROUND decimals internal error: expected int, got %T", decAny)
-		}
 	}
 
-	mult := math.Pow(10, float64(decimals))
-	return math.Round(f*mult) / mult, nil
+	return scaleDecimal(f, decimals, math.Round), nil
+}
+
+// decimalPrecision clamps before converting to int, including on 32-bit
+// platforms. Larger magnitudes cannot affect a finite float64's result.
+func decimalPrecision(v any) (int, error) {
+	switch n := v.(type) {
+	case int:
+		return max(-309, min(324, n)), nil
+	case int64:
+		return int(max(int64(-309), min(int64(324), n))), nil
+	case float64:
+		if math.IsNaN(n) {
+			return 0, fmt.Errorf("invalid decimal precision")
+		}
+		return int(max(-309, min(324, n))), nil
+	}
+	converted, err := coerceToInt(v)
+	if err != nil {
+		return 0, err
+	}
+	n, ok := converted.(int)
+	if !ok {
+		return 0, fmt.Errorf("invalid decimal precision")
+	}
+	return max(-309, min(324, n)), nil
+}
+
+// scaleDecimal rounds or truncates at a decimal position without letting the
+// intermediate power of ten produce NaN or an avoidable infinity.
+func scaleDecimal(value float64, decimals int, op func(float64) float64) float64 {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return value
+	}
+	if decimals >= 324 {
+		return value
+	}
+	if decimals <= -309 {
+		return math.Copysign(0, value)
+	}
+	// 10^309 overflows, but subnormal values can still change when rounded
+	// at such a precision. Apply and undo that scale in two finite stages.
+	var mult float64
+	if decimals >= -22 && decimals <= 22 {
+		// These powers are exact before reciprocation, so Pow10 preserves
+		// Pow's rounding while avoiding its general exponent calculation.
+		mult = math.Pow10(decimals)
+	} else {
+		mult = math.Pow(10, float64(min(decimals, 308)))
+	}
+	extra := 1.0
+	if decimals > 308 {
+		extra = math.Pow10(decimals - 308)
+	}
+	scaled := value * mult * extra
+	if math.IsInf(scaled, 0) {
+		// Scaling a finite float overflowed; it cannot have a representable
+		// digit at the requested fractional position.
+		return value
+	}
+	return (op(scaled) / extra) / mult
 }
 
 func evalFloor(env ExecEnv, args []Expr, row Row) (any, error) {
@@ -173,9 +227,15 @@ func evalMod(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if av == nil {
+		return nil, nil
+	}
 	bv, err := evalExpr(env, args[1], row)
 	if err != nil {
 		return nil, err
+	}
+	if bv == nil {
+		return nil, nil
 	}
 	a, ok := numeric(av)
 	if !ok {
@@ -199,9 +259,15 @@ func evalPower(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if baseVal == nil {
+		return nil, nil
+	}
 	expVal, err := evalExpr(env, args[1], row)
 	if err != nil {
 		return nil, err
+	}
+	if expVal == nil {
+		return nil, nil
 	}
 	base, ok := numeric(baseVal)
 	if !ok {
@@ -221,6 +287,9 @@ func evalSqrt(env ExecEnv, args []Expr, row Row) (any, error) {
 	val, err := evalExpr(env, args[0], row)
 	if err != nil {
 		return nil, err
+	}
+	if val == nil {
+		return nil, nil
 	}
 	n, ok := numeric(val)
 	if !ok {
@@ -242,6 +311,9 @@ func evalLog(env ExecEnv, args []Expr, row Row) (any, error) {
 		if err != nil {
 			return nil, err
 		}
+		if val == nil {
+			return nil, nil
+		}
 		n, ok := numeric(val)
 		if !ok {
 			return nil, fmt.Errorf("LOG: argument must be numeric")
@@ -256,9 +328,15 @@ func evalLog(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if baseVal == nil {
+		return nil, nil
+	}
 	val, err := evalExpr(env, args[1], row)
 	if err != nil {
 		return nil, err
+	}
+	if val == nil {
+		return nil, nil
 	}
 	base, ok := numeric(baseVal)
 	if !ok {
@@ -282,6 +360,9 @@ func evalLn(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if val == nil {
+		return nil, nil
+	}
 	n, ok := numeric(val)
 	if !ok {
 		return nil, fmt.Errorf("LN: argument must be numeric")
@@ -299,6 +380,9 @@ func evalLog10(env ExecEnv, args []Expr, row Row) (any, error) {
 	val, err := evalExpr(env, args[0], row)
 	if err != nil {
 		return nil, err
+	}
+	if val == nil {
+		return nil, nil
 	}
 	n, ok := numeric(val)
 	if !ok {
@@ -318,6 +402,9 @@ func evalLog2(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if val == nil {
+		return nil, nil
+	}
 	n, ok := numeric(val)
 	if !ok {
 		return nil, fmt.Errorf("LOG2: argument must be numeric")
@@ -336,6 +423,9 @@ func evalExp(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if val == nil {
+		return nil, nil
+	}
 	n, ok := numeric(val)
 	if !ok {
 		return nil, fmt.Errorf("EXP: argument must be numeric")
@@ -350,6 +440,9 @@ func evalSign(env ExecEnv, args []Expr, row Row) (any, error) {
 	val, err := evalExpr(env, args[0], row)
 	if err != nil {
 		return nil, err
+	}
+	if val == nil {
+		return nil, nil
 	}
 	n, ok := numeric(val)
 	if !ok {
@@ -371,6 +464,9 @@ func evalTruncate(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if val == nil {
+		return nil, nil
+	}
 	n, ok := numeric(val)
 	if !ok {
 		return nil, fmt.Errorf("TRUNCATE: argument must be numeric")
@@ -381,14 +477,19 @@ func evalTruncate(env ExecEnv, args []Expr, row Row) (any, error) {
 		if err != nil {
 			return nil, err
 		}
+		if dv == nil {
+			return nil, nil
+		}
 		d, ok := numeric(dv)
 		if !ok {
 			return nil, fmt.Errorf("TRUNCATE: decimals must be numeric")
 		}
-		decimals = int(d)
+		decimals, err = decimalPrecision(d)
+		if err != nil {
+			return nil, fmt.Errorf("TRUNCATE: decimals must be numeric")
+		}
 	}
-	multiplier := math.Pow(10, float64(decimals))
-	return math.Trunc(n*multiplier) / multiplier, nil
+	return scaleDecimal(n, decimals, math.Trunc), nil
 }
 
 // Trigonometric functions
@@ -399,6 +500,9 @@ func evalSin(env ExecEnv, args []Expr, row Row) (any, error) {
 	val, err := evalExpr(env, args[0], row)
 	if err != nil {
 		return nil, err
+	}
+	if val == nil {
+		return nil, nil
 	}
 	n, ok := numeric(val)
 	if !ok {
@@ -415,6 +519,9 @@ func evalCos(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if val == nil {
+		return nil, nil
+	}
 	n, ok := numeric(val)
 	if !ok {
 		return nil, fmt.Errorf("COS: argument must be numeric")
@@ -430,6 +537,9 @@ func evalTan(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if val == nil {
+		return nil, nil
+	}
 	n, ok := numeric(val)
 	if !ok {
 		return nil, fmt.Errorf("TAN: argument must be numeric")
@@ -444,6 +554,9 @@ func evalAsin(env ExecEnv, args []Expr, row Row) (any, error) {
 	val, err := evalExpr(env, args[0], row)
 	if err != nil {
 		return nil, err
+	}
+	if val == nil {
+		return nil, nil
 	}
 	n, ok := numeric(val)
 	if !ok {
@@ -463,6 +576,9 @@ func evalAcos(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if val == nil {
+		return nil, nil
+	}
 	n, ok := numeric(val)
 	if !ok {
 		return nil, fmt.Errorf("ACOS: argument must be numeric")
@@ -481,6 +597,9 @@ func evalAtan(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if val == nil {
+		return nil, nil
+	}
 	n, ok := numeric(val)
 	if !ok {
 		return nil, fmt.Errorf("ATAN: argument must be numeric")
@@ -496,9 +615,15 @@ func evalAtan2(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if yVal == nil {
+		return nil, nil
+	}
 	xVal, err := evalExpr(env, args[1], row)
 	if err != nil {
 		return nil, err
+	}
+	if xVal == nil {
+		return nil, nil
 	}
 	y, ok := numeric(yVal)
 	if !ok {
@@ -519,6 +644,9 @@ func evalDegrees(env ExecEnv, args []Expr, row Row) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if val == nil {
+		return nil, nil
+	}
 	n, ok := numeric(val)
 	if !ok {
 		return nil, fmt.Errorf("DEGREES: argument must be numeric")
@@ -533,6 +661,9 @@ func evalRadians(env ExecEnv, args []Expr, row Row) (any, error) {
 	val, err := evalExpr(env, args[0], row)
 	if err != nil {
 		return nil, err
+	}
+	if val == nil {
+		return nil, nil
 	}
 	n, ok := numeric(val)
 	if !ok {

@@ -104,7 +104,7 @@ func (lx *lexer) skipWS() {
 			case '-':
 				if lx.peekN(1) == '-' {
 					lx.pos += 2
-					for lx.pos < len(lx.s) && lx.s[lx.pos] != '\n' {
+					for lx.pos < len(lx.s) && lx.s[lx.pos] != '\n' && lx.s[lx.pos] != '\r' {
 						lx.pos++
 					}
 					continue

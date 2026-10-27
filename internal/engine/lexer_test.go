@@ -9,6 +9,7 @@
 package engine
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -238,6 +239,20 @@ func TestLexerWhitespaceAndComments(t *testing.T) {
 		if toks[i].Val != w {
 			t.Fatalf("token %d = %q, want %q (all: %+v)", i, toks[i].Val, w, toks)
 		}
+	}
+}
+
+func TestLineCommentEndsAtAnyCommonLineEnding(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE line_comment_items (id INT)`)
+	execSQL(t, db, `INSERT INTO line_comment_items VALUES (1), (2)`)
+	for _, ending := range []string{"\n", "\r", "\r\n"} {
+		t.Run(fmt.Sprintf("%q", ending), func(t *testing.T) {
+			result := execSQL(t, db, "SELECT id FROM line_comment_items -- note"+ending+"WHERE id = 2")
+			if len(result.Rows) != 1 || fmt.Sprint(result.Rows[0]["id"]) != "2" {
+				t.Fatalf("line ending %q: result = %#v", ending, result.Rows)
+			}
+		})
 	}
 }
 

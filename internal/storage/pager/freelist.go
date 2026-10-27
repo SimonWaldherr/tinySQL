@@ -2,6 +2,7 @@ package pager
 
 import (
 	"encoding/binary"
+	"fmt"
 )
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -127,19 +128,35 @@ func NewFreeManager() *FreeManager {
 // LoadFromDisk walks the free-list chain starting at head and populates
 // the in-memory set. readPage is a callback that reads a page by ID.
 func (fm *FreeManager) LoadFromDisk(head PageID, readPage func(PageID) ([]byte, error)) error {
-	fm.head = head
+	// Build a new set first: a bad chain or a failed read must not leave a
+	// partially loaded list that could allocate pages still in use.
+	free := make(map[PageID]struct{})
+	seen := make(map[PageID]struct{})
 	pid := head
 	for pid != InvalidPageID {
+		if _, ok := seen[pid]; ok {
+			return fmt.Errorf("free-list cycle at page %d", pid)
+		}
+		seen[pid] = struct{}{}
 		buf, err := readPage(pid)
 		if err != nil {
 			return err
 		}
+		if len(buf) < freeListDataOff {
+			return fmt.Errorf("free-list page %d too short", pid)
+		}
+		count := binary.LittleEndian.Uint32(buf[freeListCountOff:])
+		if uint64(count) > uint64(FreeListCapacity(len(buf))) {
+			return fmt.Errorf("free-list page %d has invalid entry count %d", pid, count)
+		}
 		fl := WrapFreeListPage(buf)
 		for _, freeID := range fl.AllEntries() {
-			fm.free[freeID] = struct{}{}
+			free[freeID] = struct{}{}
 		}
 		pid = fl.NextFreeList()
 	}
+	fm.head = head
+	fm.free = free
 	return nil
 }
 

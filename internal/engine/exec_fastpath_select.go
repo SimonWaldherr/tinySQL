@@ -884,14 +884,19 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 	// moves 4 bytes instead of a whole orderedRawRow, which is what dominates
 	// large sorts. perm starts as the identity permutation, so its values are
 	// pre-sort positions; breaking comparator ties on them makes the unstable
-	// (pdqsort) sort.Sort reproduce exactly the order sort.Stable produced
-	// here before — scan order for full sorts, heap order for top-N — without
-	// symMerge's O(n log² n) element moves.
+	// pdqsort reproduce the former stable order: scan order for full sorts,
+	// heap order for top-N, without symMerge's O(n log² n) element moves.
 	perm := make([]int32, len(rows))
 	for i := range perm {
 		perm[i] = int32(i)
 	}
-	sort.Sort(orderedRawRowsPermAsc{plan: plan, items: rows, perm: perm})
+	if useTopN {
+		// Keep the established bounded path, including for small pages;
+		// full scans benefit from the generic sort's direct element swaps.
+		sort.Sort(orderedRawRowsPermAsc{plan: plan, items: rows, perm: perm})
+	} else {
+		sortFullOrderedRawPositions(plan, rows, perm)
+	}
 	sortPhase.finish(int64(len(rows)))
 
 	start := 0
@@ -923,6 +928,21 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, true, nil
 }
 
+func sortFullOrderedRawPositions(plan *simpleSelectPlan, rows []orderedRawRow, perm []int32) {
+	slices.SortFunc(perm, func(i, j int32) int {
+		if cmp := compareOrderedRawRows(plan, rows[i], rows[j]); cmp != 0 {
+			return cmp
+		}
+		if i < j {
+			return -1
+		}
+		if i > j {
+			return 1
+		}
+		return 0
+	})
+}
+
 // rawKeyArenaChunkRows sizes keyArena chunks in rows' worth of keys. Chunking
 // keeps allocation proportional to matched rows — a selective WHERE must not
 // pre-pay key storage for the whole table — while keeping each chunk's keys
@@ -942,14 +962,8 @@ func reserveKeySlots(arena []any, k int) (newArena, keys []any) {
 	return arena, arena[start : start+k : start+k]
 }
 
-// orderedRawRowsPermAsc sorts a permutation of positions into items rather
-// than items itself. orderedRawRow is a 64-byte, pointer-heavy struct, so
-// swapping elements directly is the dominant sort cost at scale; swapping
-// int32 positions moves 4 bytes. perm must start as the identity permutation:
-// its values are pre-sort positions, and the comparator breaks key ties on
-// them, which both pins a total order (so the pdqsort result is unique) and
-// reproduces stable-sort semantics. int32 suffices because these are indexes
-// into an in-memory row slice.
+// orderedRawRowsPermAsc sorts indices, breaking key ties by their original
+// position so the bounded path retains its established stable ordering.
 type orderedRawRowsPermAsc struct {
 	plan  *simpleSelectPlan
 	items []orderedRawRow

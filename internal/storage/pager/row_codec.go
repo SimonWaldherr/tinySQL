@@ -239,7 +239,7 @@ func unmarshalRow(data []byte, copyBytes bool) ([]any, error) {
 			}
 			n := int(binary.LittleEndian.Uint32(data[off : off+4]))
 			off += 4
-			if n < 0 || off+n*8 > len(data) {
+			if n < 0 || n > (len(data)-off)/8 {
 				return nil, fmt.Errorf("truncated vector data at column %d", i)
 			}
 			vec := make([]float64, n)
@@ -370,7 +370,7 @@ func unmarshalRowBytesColumn(data []byte, column int, copyBytes bool) ([]byte, e
 			}
 			length := int(binary.LittleEndian.Uint32(data[off : off+4]))
 			off += 4
-			if length < 0 || off+length*8 > len(data) {
+			if length < 0 || length > (len(data)-off)/8 {
 				return nil, fmt.Errorf("truncated vector data at column %d", i)
 			}
 			off += length * 8
@@ -475,7 +475,7 @@ func unmarshalRowColumn(data []byte, column int, copyBytes bool) (any, error) {
 			}
 			n := int(binary.LittleEndian.Uint32(data[off : off+4]))
 			off += 4
-			if n < 0 || off+n*8 > len(data) {
+			if n < 0 || n > (len(data)-off)/8 {
 				return nil, fmt.Errorf("truncated vector data at column %d", i)
 			}
 			if want {

@@ -133,7 +133,7 @@ func SkipOpaque(sql string, i int) int {
 		return len(sql)
 	case '-':
 		if i+1 < len(sql) && sql[i+1] == '-' {
-			if end := strings.IndexByte(sql[i+2:], '\n'); end >= 0 {
+			if end := strings.IndexAny(sql[i+2:], "\r\n"); end >= 0 {
 				return i + 2 + end
 			}
 			return len(sql)

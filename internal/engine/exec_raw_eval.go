@@ -388,6 +388,9 @@ func evalRawFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, erro
 			if !ok {
 				return nil, fmt.Errorf("%s cutset must be a string", ex.Name)
 			}
+			if cutset == "" {
+				return str, nil
+			}
 		}
 		side := trimBoth
 		if ex.Name == "LTRIM" {

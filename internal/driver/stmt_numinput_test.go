@@ -15,6 +15,8 @@ func TestPreparedNumInput(t *testing.T) {
 	}{
 		{"SELECT ?", 1},
 		{"SELECT ?, 'it''s ?', ?", 2},
+		{"SELECT -- ? $2\r?", 1},
+		{"SELECT -- ? $2\r$1", 1},
 		{"SELECT 1", -1},
 		{"SELECT $1, $1", 1},
 		{"SELECT :2, :1", 2},
@@ -28,6 +30,30 @@ func TestPreparedNumInput(t *testing.T) {
 			defer s.Close()
 			if got := s.NumInput(); got != tc.want {
 				t.Fatalf("NumInput=%d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParameterBindingAfterCRLineComment(t *testing.T) {
+	db, err := sql.Open("tinysql", "mem://?tenant=cr_comment_binding")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, query := range []string{"SELECT -- ? $2\r? AS value", "SELECT -- ? $2\r$1 AS value"} {
+		t.Run(query, func(t *testing.T) {
+			var got int
+			if err := db.QueryRow(query, 42).Scan(&got); err != nil || got != 42 {
+				t.Fatalf("direct query: value=%d err=%v", got, err)
+			}
+			stmt, err := db.Prepare(query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stmt.Close()
+			if err := stmt.QueryRow(42).Scan(&got); err != nil || got != 42 {
+				t.Fatalf("prepared query: value=%d err=%v", got, err)
 			}
 		})
 	}

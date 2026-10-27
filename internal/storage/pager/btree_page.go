@@ -156,7 +156,12 @@ func (bp *BTreePage) setSlotCount(n int) {
 	binary.LittleEndian.PutUint16(bp.buf[btreeSlotHdrOff:], uint16(n))
 }
 func (bp *BTreePage) freeSpaceEnd() int {
-	return int(binary.LittleEndian.Uint16(bp.buf[btreeSlotHdrOff+2:]))
+	off := int(binary.LittleEndian.Uint16(bp.buf[btreeSlotHdrOff+2:]))
+	// Zero denotes the end of a 64 KiB page, which does not fit in uint16.
+	if off == 0 && bp.pageSize == MaxPageSize {
+		return bp.pageSize
+	}
+	return off
 }
 func (bp *BTreePage) setFreeSpaceEnd(off int) {
 	binary.LittleEndian.PutUint16(bp.buf[btreeSlotHdrOff+2:], uint16(off))
@@ -192,7 +197,7 @@ func (bp *BTreePage) getRecord(i int) []byte {
 	if e.Offset == 0 && e.Length == 0 {
 		return nil
 	}
-	return bp.buf[e.Offset : e.Offset+e.Length]
+	return bp.buf[int(e.Offset) : int(e.Offset)+int(e.Length)]
 }
 
 // insertRecordAt inserts a record at position pos, shifting later slots.
@@ -286,21 +291,9 @@ func (bp *BTreePage) searchInternal(key []byte) int {
 	return lo
 }
 
-// FindChild returns the child PageID for the given search key.
-// For internal-page navigation: find the largest key <= searchKey.
+// FindChild returns the child PageID covering the given search key.
 func (bp *BTreePage) FindChild(key []byte) PageID {
-	sc := bp.slotCount()
-	for i := sc - 1; i >= 0; i-- {
-		e := bp.GetInternalEntry(i)
-		if bytes.Compare(key, e.Key) >= 0 {
-			return e.ChildID
-		}
-	}
-	// Key is smaller than all separators — follow leftmost child.
-	if sc > 0 {
-		return bp.GetInternalEntry(0).ChildID
-	}
-	return bp.RightChild()
+	return bp.SearchInternal(key)
 }
 
 // GetAllInternalEntries returns all separator entries in order.
@@ -396,7 +389,7 @@ func (bp *BTreePage) UpdateLeafEntry(pos int, entry LeafEntry) error {
 	if int(old.Length) >= len(rec) {
 		// In-place.
 		copy(bp.buf[old.Offset:], rec)
-		for j := int(old.Offset) + len(rec); j < int(old.Offset+old.Length); j++ {
+		for j := int(old.Offset) + len(rec); j < int(old.Offset)+int(old.Length); j++ {
 			bp.buf[j] = 0
 		}
 		bp.setSlotEntry(pos, SlotEntry{Offset: old.Offset, Length: uint16(len(rec))})

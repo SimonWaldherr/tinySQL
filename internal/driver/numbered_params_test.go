@@ -17,6 +17,7 @@ func TestNumberedParameterPlan(t *testing.T) {
 		{"SELECT $2, :1", []int{1, 0}, 2},
 		{"SELECT '$99 ?', $1 AS \"$9\" -- $8 ?\n", []int{0}, 1},
 		{"SELECT /* $99 ? */ $1", []int{0}, 1},
+		{"SELECT -- $99 ?\r$1", []int{0}, 1},
 	} {
 		t.Run(tc.sql, func(t *testing.T) {
 			p, err := buildPreparedQuery(tc.sql)

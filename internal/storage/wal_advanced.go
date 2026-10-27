@@ -1406,10 +1406,23 @@ func hashWALValue(h io.Writer, v any, scratch *[40]byte) {
 		_, _ = h.Write(b)
 	case []float64:
 		_, _ = io.WriteString(h, "V")
-		var b [8]byte
-		for _, f := range t {
-			binary.LittleEndian.PutUint64(b[:], math.Float64bits(f))
-			_, _ = h.Write(b[:])
+		// Hash the same little-endian bytes in batches. The shared scratch
+		// holds five values, reducing per-value CRC updates without allocating
+		// a separate buffer or changing the durable checksum stream.
+		for len(t) >= 5 {
+			binary.LittleEndian.PutUint64(scratch[0:8], math.Float64bits(t[0]))
+			binary.LittleEndian.PutUint64(scratch[8:16], math.Float64bits(t[1]))
+			binary.LittleEndian.PutUint64(scratch[16:24], math.Float64bits(t[2]))
+			binary.LittleEndian.PutUint64(scratch[24:32], math.Float64bits(t[3]))
+			binary.LittleEndian.PutUint64(scratch[32:40], math.Float64bits(t[4]))
+			_, _ = h.Write(scratch[:])
+			t = t[5:]
+		}
+		if len(t) > 0 {
+			for i, f := range t {
+				binary.LittleEndian.PutUint64(scratch[i*8:i*8+8], math.Float64bits(f))
+			}
+			_, _ = h.Write(scratch[:len(t)*8])
 		}
 	case []any:
 		_, _ = io.WriteString(h, "[")

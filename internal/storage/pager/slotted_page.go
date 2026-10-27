@@ -81,7 +81,14 @@ func (sp *SlottedPage) setSlotCount(n int) {
 
 // FreeSpaceEnd is the byte offset where the next record will be written.
 func (sp *SlottedPage) FreeSpaceEnd() int {
-	return int(binary.LittleEndian.Uint16(sp.buf[slottedHeaderOff+2:]))
+	off := int(binary.LittleEndian.Uint16(sp.buf[slottedHeaderOff+2:]))
+	// The maximum supported 64 KiB page cannot be represented as a uint16.
+	// A zero free-space offset represents the end of that page; valid records
+	// cannot extend into the slot directory at offset zero.
+	if off == 0 && sp.pageSize == 1<<16 {
+		return sp.pageSize
+	}
+	return off
 }
 
 func (sp *SlottedPage) setFreeSpaceEnd(off int) {
@@ -126,15 +133,37 @@ func (sp *SlottedPage) GetRecord(i int) []byte {
 	if e.Offset == 0 && e.Length == 0 {
 		return nil
 	}
-	return sp.buf[e.Offset : e.Offset+e.Length]
+	return sp.buf[int(e.Offset) : int(e.Offset)+int(e.Length)]
+}
+
+// slotOffset represents an empty record at the end of a 64 KiB page without
+// producing the (0, 0) tombstone marker.
+func slotOffset(off int) uint16 {
+	if off == 1<<16 {
+		return uint16(off - 1)
+	}
+	return uint16(off)
 }
 
 // InsertRecord adds a new record to the page.
 // Returns the slot index, or an error if there is insufficient space.
 func (sp *SlottedPage) InsertRecord(data []byte) (int, error) {
 	needed := len(data)
-	if sp.FreeSpace() < needed {
-		return -1, fmt.Errorf("page full: need %d bytes, have %d", needed, sp.FreeSpace())
+	// A deleted slot can be reused without allocating another directory entry.
+	sc := sp.SlotCount()
+	reusable := -1
+	for i := 0; i < sc; i++ {
+		if sp.IsDeleted(i) {
+			reusable = i
+			break
+		}
+	}
+	available := sp.FreeSpace()
+	if reusable >= 0 {
+		available += slotEntrySize
+	}
+	if available < needed {
+		return -1, fmt.Errorf("page full: need %d bytes, have %d", needed, available)
 	}
 
 	// Place record at FreeSpaceEnd - len(data).
@@ -142,17 +171,13 @@ func (sp *SlottedPage) InsertRecord(data []byte) (int, error) {
 	copy(sp.buf[newEnd:], data)
 	sp.setFreeSpaceEnd(newEnd)
 
-	// Try to reuse a tombstone slot first.
-	sc := sp.SlotCount()
-	for i := 0; i < sc; i++ {
-		if sp.IsDeleted(i) {
-			sp.setSlot(i, SlotEntry{Offset: uint16(newEnd), Length: uint16(needed)})
-			return i, nil
-		}
+	if reusable >= 0 {
+		sp.setSlot(reusable, SlotEntry{Offset: slotOffset(newEnd), Length: uint16(needed)})
+		return reusable, nil
 	}
 
 	// Add new slot.
-	sp.setSlot(sc, SlotEntry{Offset: uint16(newEnd), Length: uint16(needed)})
+	sp.setSlot(sc, SlotEntry{Offset: slotOffset(newEnd), Length: uint16(needed)})
 	sp.setSlotCount(sc + 1)
 	return sc, nil
 }
@@ -178,15 +203,15 @@ func (sp *SlottedPage) UpdateRecord(i int, data []byte) error {
 		// In-place update — pad with zeros if shorter.
 		copy(sp.buf[old.Offset:], data)
 		if len(data) < int(old.Length) {
-			for j := int(old.Offset) + len(data); j < int(old.Offset+old.Length); j++ {
+			for j := int(old.Offset) + len(data); j < int(old.Offset)+int(old.Length); j++ {
 				sp.buf[j] = 0
 			}
 		}
 		sp.setSlot(i, SlotEntry{Offset: old.Offset, Length: uint16(len(data))})
 		return nil
 	}
-	// Does not fit — tombstone + new record at FreeSpaceEnd.
-	sp.setSlot(i, SlotEntry{Offset: 0, Length: 0})
+	// Does not fit — append at FreeSpaceEnd. Check capacity before changing
+	// the slot so a failed update leaves the original record intact.
 	needed := len(data)
 	if sp.FreeSpace()+slotEntrySize < needed { // FreeSpace deducted a slot
 		return fmt.Errorf("page full on update: need %d bytes", needed)
@@ -194,7 +219,7 @@ func (sp *SlottedPage) UpdateRecord(i int, data []byte) error {
 	newEnd := sp.FreeSpaceEnd() - needed
 	copy(sp.buf[newEnd:], data)
 	sp.setFreeSpaceEnd(newEnd)
-	sp.setSlot(i, SlotEntry{Offset: uint16(newEnd), Length: uint16(needed)})
+	sp.setSlot(i, SlotEntry{Offset: slotOffset(newEnd), Length: uint16(needed)})
 	return nil
 }
 
@@ -219,7 +244,7 @@ func (sp *SlottedPage) Compact() {
 		newEnd := sp.FreeSpaceEnd() - len(r.data)
 		copy(sp.buf[newEnd:], r.data)
 		sp.setFreeSpaceEnd(newEnd)
-		sp.setSlot(r.slot, SlotEntry{Offset: uint16(newEnd), Length: uint16(len(r.data))})
+		sp.setSlot(r.slot, SlotEntry{Offset: slotOffset(newEnd), Length: uint16(len(r.data))})
 	}
 }
 

@@ -501,26 +501,32 @@ func (idx *vecIVFIndex) search(ctx context.Context, query []float64, queryNorm f
 	// down the ranking. Without that, VEC_SEARCH with an ivf index silently
 	// returned fewer rows than asked for -- 7 of 10 on a 10-row table -- while
 	// flat and hnsw returned k.
-	centroidHeap := newScoredHeap(len(idx.centroids), -1)
+	// Only the nearest probes are normally consumed. Heapify all candidates
+	// once, then pop them as needed instead of fully sorting every centroid.
+	centroidHeap := make(vecMinScoredHeap, 0, len(idx.centroids))
+	kind := vecMetricKind(idx.metric)
 	for i, c := range idx.centroids {
 		// Selecting which centroids to probe, not a value ever exposed to a
 		// caller — ranking-only distance is enough (vecRowScorer uses the same
 		// for rows).
-		dist, ok := search.VectorRankingDistance(idx.metric, c, query, idx.centroidNorms[i], queryNorm)
+		dist, ok := vecRankingDistanceKind(kind, c, query, idx.centroidNorms[i], queryNorm)
 		if !ok {
 			continue
 		}
-		pushTopK(centroidHeap, i, dist, len(idx.centroids))
+		centroidHeap = append(centroidHeap, vecScoredRow{rowIdx: i, distance: dist})
 	}
-	rankedCentroids := topKFromHeap(centroidHeap, len(idx.centroids))
+	for i := len(centroidHeap)/2 - 1; i >= 0; i-- {
+		vecMinHeapDown(centroidHeap, i)
+	}
 
 	scorer := newVecRowScorer(idx.metric, query, queryNorm, newVecRowResolver(&cache, metricNeedsNorms(idx.metric)))
 	resultHeap := newScoredHeap(k, -1)
-	for probed, c := range rankedCentroids {
+	for probed := 0; len(centroidHeap) > 0; probed++ {
 		// Past the probe budget, keep going only while short of k.
 		if probed >= probes && resultHeap.Len() >= k {
 			break
 		}
+		c := vecMinHeapPop(&centroidHeap)
 		list := idx.lists[c.rowIdx]
 		for i, rowIdx := range list {
 			if i&1023 == 0 {
@@ -1338,16 +1344,35 @@ func centroidNormsFor(metric string, centroids [][]float64) []float64 {
 // nearestCentroid only ever returns an index, never the distance itself, so
 // it uses the cheaper ranking-only distance (see search.VectorRankingDistance).
 func nearestCentroid(metric string, vec []float64, vecNorm float64, centroids [][]float64, norms []float64) int {
+	if metric == "l2" {
+		return nearestCentroidL2(vec, centroids)
+	}
+	kind := vecMetricKind(metric)
 	best := 0
 	bestDist := math.MaxFloat64
 	for i, c := range centroids {
-		dist, ok := search.VectorRankingDistance(metric, c, vec, norms[i], vecNorm)
+		dist, ok := vecRankingDistanceKind(kind, c, vec, norms[i], vecNorm)
 		if !ok {
 			continue
 		}
 		if dist < bestDist {
 			best = i
 			bestDist = dist
+		}
+	}
+	return best
+}
+
+// Squared L2 needs neither norms nor metric dispatch inside the k-means loop.
+func nearestCentroidL2(vec []float64, centroids [][]float64) int {
+	best := 0
+	bestDist := math.MaxFloat64
+	for i, centroid := range centroids {
+		if len(centroid) != len(vec) {
+			continue
+		}
+		if distance := search.VectorL2Squared(centroid, vec); distance < bestDist {
+			best, bestDist = i, distance
 		}
 	}
 	return best
