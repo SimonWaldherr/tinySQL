@@ -113,7 +113,8 @@ type ImportOptions struct {
 	// Defaults include RFC3339, ISO8601, common US/EU formats.
 	DateTimeFormats []string
 
-	// StrictTypes when true causes import to fail if data doesn't match detected types (default false).
+	// StrictTypes when true skips rows that don't match detected types and records
+	// conversion errors in ImportResult.Errors (default false).
 	// When false, falls back to TEXT on type conversion errors.
 	StrictTypes bool
 
@@ -148,7 +149,7 @@ type ImportOptions struct {
 // ImportResult returns metadata about the import operation.
 type ImportResult struct {
 	RowsInserted int64             // Total rows successfully inserted
-	RowsSkipped  int64             // Rows skipped due to errors (if StrictTypes=false)
+	RowsSkipped  int64             // Rows skipped due to conversion or record errors
 	Delimiter    rune              // Detected or configured delimiter
 	HadHeader    bool              // Whether a header row was detected/configured
 	Encoding     string            // Detected encoding: "utf-8", "utf-8-bom", "utf-16le", "utf-16be"
@@ -237,6 +238,9 @@ func ImportCSV(
 				break
 			}
 			if err != nil {
+				if !isCSVRecordError(err) {
+					return nil, fmt.Errorf("read CSV sample: %w", err)
+				}
 				result.Errors = append(result.Errors, fmt.Sprintf("read error: %v", err))
 				continue
 			}
@@ -261,7 +265,7 @@ func ImportCSV(
 	}
 
 	// Insert the sampled rows first, then continue streaming from the reader.
-	rows, skipped, errs := insertCSVRecords(ctx, db, tenant, tableName, colNames, colTypes, sampleData, csvr, opts)
+	rows, skipped, errs, insertErr := insertCSVRecords(ctx, db, tenant, tableName, colNames, colTypes, sampleData, csvr, opts)
 	result.RowsInserted = rows
 	result.RowsSkipped = skipped
 	result.Errors = append(result.Errors, errs...)
@@ -269,7 +273,14 @@ func ImportCSV(
 	// Ensure the bufio.Reader is consumed/closed if needed
 	_ = sr
 
-	return result, nil
+	return result, insertErr
+}
+
+// Only CSV syntax errors describe an individual bad record. Source errors,
+// cancellation and input limits must stop the stream and reach the caller.
+func isCSVRecordError(err error) bool {
+	var parseErr *csv.ParseError
+	return errors.As(err, &parseErr)
 }
 
 // prepareReader handles gzip detection and encoding normalization, returning an
@@ -369,7 +380,7 @@ func (r *strictUTF8Reader) Read(p []byte) (int, error) {
 		if n > 0 {
 			r.process(append(r.tail, buf[:n]...))
 		}
-		if err != nil {
+		if err != nil && r.readErr == nil {
 			if err == io.EOF && len(r.tail) > 0 {
 				r.readErr = fmt.Errorf("invalid UTF-8 at end of input")
 			} else {
@@ -554,6 +565,17 @@ func decodeUTF16All(b []byte, bigEndian bool) ([]byte, error) {
 			u16s[i] = uint16(b[i*2])<<8 | uint16(b[i*2+1])
 		} else {
 			u16s[i] = uint16(b[i*2+1])<<8 | uint16(b[i*2])
+		}
+	}
+	for i := 0; i < len(u16s); i++ {
+		unit := u16s[i]
+		if unit >= 0xd800 && unit <= 0xdbff {
+			if i+1 >= len(u16s) || u16s[i+1] < 0xdc00 || u16s[i+1] > 0xdfff {
+				return nil, fmt.Errorf("invalid UTF-16 surrogate pair")
+			}
+			i++
+		} else if unit >= 0xdc00 && unit <= 0xdfff {
+			return nil, fmt.Errorf("invalid UTF-16 surrogate pair")
 		}
 	}
 

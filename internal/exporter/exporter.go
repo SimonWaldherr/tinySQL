@@ -301,9 +301,15 @@ func geometryCellBytes(v any) []byte {
 		}
 		return nil
 	case []byte:
-		return x
+		if json.Valid(x) {
+			return x
+		}
+		return nil
 	case json.RawMessage:
-		return []byte(x)
+		if json.Valid(x) {
+			return []byte(x)
+		}
+		return nil
 	case map[string]any:
 		b, err := json.Marshal(x)
 		if err != nil {

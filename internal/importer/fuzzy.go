@@ -18,6 +18,11 @@ import (
 // headerPattern matches typical column-name identifiers.
 var headerPattern = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]*$`)
 
+// A completely consistent multi-column parse receives the highest possible
+// delimiter score. Later candidates cannot improve it, and ties keep the
+// earlier candidate.
+const maxDelimiterScore = 1.2
+
 // FuzzyImportOptions extends ImportOptions with fuzzy parsing capabilities
 type FuzzyImportOptions struct {
 	*ImportOptions
@@ -323,6 +328,9 @@ func fuzzyParseCSV(data string, opts *FuzzyImportOptions) (rune, [][]string, err
 			bestScore = score
 			bestDelimiter = delim
 			bestRecords = records
+			if score == maxDelimiterScore {
+				break
+			}
 		}
 	}
 
@@ -382,7 +390,7 @@ func tryParseWithDelimiter(data string, delim rune, opts *FuzzyImportOptions) ([
 
 	// Bonus if most common column count is > 1
 	if mostCommonCols > 1 {
-		score *= 1.2
+		score *= maxDelimiterScore
 	}
 
 	return records, score
@@ -637,6 +645,20 @@ func fuzzyParseJSONInput(dataStr string, opts *FuzzyImportOptions) ([]map[string
 	if err := json.Unmarshal([]byte(dataStr), &single); err == nil {
 		return []map[string]interface{}{single}, nil
 	}
+	if opts.FuzzyJSON {
+		// Valid JSON must be parsed before applying the heuristic repair: its
+		// substitutions can otherwise alter apostrophes and key-like text
+		// inside perfectly valid string values. Try a whole-document repair
+		// only for malformed arrays or objects, then fall back to parsing
+		// JSONL one line at a time so valid records are never rewritten.
+		fixed := fixCommonJSONIssues(dataStr)
+		if err := json.Unmarshal([]byte(fixed), &records); err == nil {
+			return records, nil
+		}
+		if err := json.Unmarshal([]byte(fixed), &single); err == nil {
+			return []map[string]interface{}{single}, nil
+		}
+	}
 	recs, err := parseLineDelimitedJSON(dataStr, opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse JSON: %v", err)
@@ -717,18 +739,16 @@ func FuzzyImportJSON(
 		}
 	}
 	applyFuzzyDefaults(opts)
+	if opts.ImportOptions == nil {
+		opts.ImportOptions = &ImportOptions{}
+	}
 
-	data, err := io.ReadAll(src)
+	data, err := io.ReadAll(limitInput(ctx, src, opts.ImportOptions))
 	if err != nil {
 		return nil, err
 	}
 
-	dataStr := string(data)
-	if opts.FuzzyJSON {
-		dataStr = fixCommonJSONIssues(dataStr)
-	}
-
-	records, err := fuzzyParseJSONInput(dataStr, opts)
+	records, err := fuzzyParseJSONInput(string(data), opts)
 	if err != nil {
 		return nil, err
 	}
@@ -785,7 +805,18 @@ func FuzzyImportJSON(
 func parseLineDelimitedJSON(data string, opts *FuzzyImportOptions) ([]map[string]interface{}, error) {
 	var records []map[string]interface{}
 
+	// Accept CRLF and legacy CR-only line endings as well as LF. Raw line
+	// breaks are invalid inside JSON strings; escaped breaks are unchanged.
+	data = strings.ReplaceAll(data, "\r\n", "\n")
+	data = strings.ReplaceAll(data, "\r", "\n")
 	scanner := bufio.NewScanner(strings.NewReader(data))
+	if opts.ImportOptions != nil && opts.MaxRecordBytes > 0 {
+		initialBuffer := opts.MaxRecordBytes
+		if initialBuffer > 64*1024 {
+			initialBuffer = 64 * 1024
+		}
+		scanner.Buffer(make([]byte, initialBuffer), opts.MaxRecordBytes)
+	}
 	lineNum := 0
 
 	for scanner.Scan() {

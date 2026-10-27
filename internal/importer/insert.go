@@ -125,7 +125,8 @@ func insertAllRecords(
 		if err != nil {
 			if opts.StrictTypes {
 				errors = append(errors, fmt.Sprintf("row %d: %v", rowNum+1, err))
-				return rowsInserted, rowsSkipped + 1, errors
+				rowsSkipped++
+				continue
 			}
 			errors = append(errors, fmt.Sprintf("row %d: %v (skipped)", rowNum+1, err))
 			rowsSkipped++
@@ -171,7 +172,7 @@ func insertCSVRecords(
 	initialRecords [][]string,
 	csvr *csv.Reader,
 	opts *ImportOptions,
-) (rowsInserted int64, rowsSkipped int64, errors []string) {
+) (rowsInserted int64, rowsSkipped int64, errors []string, fatalErr error) {
 	errors = make([]string, 0)
 	batch := make([][]any, 0, opts.BatchSize)
 	rowNum := 0
@@ -193,7 +194,7 @@ func insertCSVRecords(
 			if opts.StrictTypes {
 				errors = append(errors, fmt.Sprintf("row %d: %v", rowNum, err))
 				rowsSkipped++
-				return true
+				return false
 			}
 			errors = append(errors, fmt.Sprintf("row %d: %v (skipped)", rowNum, err))
 			rowsSkipped++
@@ -204,6 +205,7 @@ func insertCSVRecords(
 		if len(batch) >= opts.BatchSize {
 			if err := flushBatch(); err != nil {
 				errors = append(errors, err.Error())
+				fatalErr = err
 				return true
 			}
 		}
@@ -211,6 +213,7 @@ func insertCSVRecords(
 		select {
 		case <-ctx.Done():
 			errors = append(errors, "import cancelled")
+			fatalErr = ctx.Err()
 			return true
 		default:
 		}
@@ -219,7 +222,7 @@ func insertCSVRecords(
 
 	for _, rec := range initialRecords {
 		if stop := processRecord(rec); stop {
-			return rowsInserted, rowsSkipped, errors
+			return rowsInserted, rowsSkipped, errors, fatalErr
 		}
 	}
 
@@ -229,21 +232,28 @@ func insertCSVRecords(
 			break
 		}
 		if err != nil {
+			if !isCSVRecordError(err) {
+				if flushErr := flushBatch(); flushErr != nil {
+					return rowsInserted, rowsSkipped, errors, flushErr
+				}
+				return rowsInserted, rowsSkipped, errors, fmt.Errorf("read CSV: %w", err)
+			}
 			rowNum++
 			errors = append(errors, fmt.Sprintf("row %d: read error: %v", rowNum, err))
 			rowsSkipped++
 			continue
 		}
 		if stop := processRecord(rec); stop {
-			return rowsInserted, rowsSkipped, errors
+			return rowsInserted, rowsSkipped, errors, fatalErr
 		}
 	}
 
 	if err := flushBatch(); err != nil {
 		errors = append(errors, err.Error())
+		fatalErr = err
 	}
 
-	return rowsInserted, rowsSkipped, errors
+	return rowsInserted, rowsSkipped, errors, fatalErr
 }
 
 // convertRow converts a CSV record to a typed row for insertion.

@@ -87,6 +87,9 @@ type xlsxCell struct {
 	V  string `xml:"v"`
 	Is struct {
 		T string `xml:"t"`
+		R []struct {
+			T string `xml:"t"`
+		} `xml:"r"`
 	} `xml:"is"`
 }
 
@@ -378,7 +381,14 @@ func xlsxCellString(c xlsxCell, sst []string, dateStyles map[int]bool) string {
 		}
 		return sst[idx]
 	case "inlineStr":
-		return c.Is.T
+		if len(c.Is.R) == 0 {
+			return c.Is.T
+		}
+		var b strings.Builder
+		for _, run := range c.Is.R {
+			b.WriteString(run.T)
+		}
+		return b.String()
 	case "b":
 		if strings.TrimSpace(c.V) == "1" {
 			return "true"

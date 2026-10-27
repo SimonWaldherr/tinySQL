@@ -4,7 +4,9 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/xml"
 	"fmt"
+	"io"
 	"testing"
 	"time"
 
@@ -90,6 +92,61 @@ func TestImportXLSXDateConversion(t *testing.T) {
 	}
 }
 
+func TestImportXLSXStrictTypesKeepsValidRowsAroundBadRow(t *testing.T) {
+	base := buildMinimalXLSX(t, "1")
+	zr, err := zip.NewReader(bytes.NewReader(base), int64(len(base)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, part := range zr.File {
+		out, err := zw.Create(part.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if part.Name == "xl/worksheets/sheet1.xml" {
+			_, err = io.WriteString(out, `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>`+
+				`<row><c r="A1" t="inlineStr"><is><t>num</t></is></c></row>`+
+				`<row><c r="A2"><v>12</v></c></row>`+
+				`<row><c r="A3" t="inlineStr"><is><t>bad</t></is></c></row>`+
+				`<row><c r="A4"><v>34</v></c></row></sheetData></worksheet>`)
+		} else {
+			var in io.ReadCloser
+			in, err = part.Open()
+			if err == nil {
+				_, err = io.Copy(out, in)
+				closeErr := in.Close()
+				if err == nil {
+					err = closeErr
+				}
+			}
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db := storage.NewDB()
+	result, err := ImportXLSX(context.Background(), db, "default", "numbers", bytes.NewReader(buf.Bytes()),
+		&ImportOptions{CreateTable: true, HeaderMode: "present", TypeInference: true, StrictTypes: true, SampleRecords: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RowsInserted != 2 || result.RowsSkipped != 1 || len(result.Errors) != 1 {
+		t.Fatalf("result = %+v", result)
+	}
+	tbl, err := db.Get("default", "numbers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tbl.Rows) != 2 || tbl.Rows[0][0] != int64(12) || tbl.Rows[1][0] != int64(34) {
+		t.Fatalf("rows = %#v", tbl.Rows)
+	}
+}
+
 func TestXLSXColumnIndex(t *testing.T) {
 	cases := []struct {
 		ref  string
@@ -109,6 +166,16 @@ func TestXLSXColumnIndex(t *testing.T) {
 		if ok != c.ok || (ok && got != c.want) {
 			t.Errorf("xlsxColumnIndex(%q) = (%d, %v), want (%d, %v)", c.ref, got, ok, c.want, c.ok)
 		}
+	}
+}
+
+func TestXLSXInlineRichText(t *testing.T) {
+	var cell xlsxCell
+	if err := xml.Unmarshal([]byte(`<c r="A1" t="inlineStr"><is><r><t xml:space="preserve">hello </t></r><r><t>world</t></r></is></c>`), &cell); err != nil {
+		t.Fatal(err)
+	}
+	if got := xlsxCellString(cell, nil, nil); got != "hello world" {
+		t.Fatalf("rich inline text = %q", got)
 	}
 }
 

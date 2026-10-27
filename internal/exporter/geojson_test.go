@@ -154,3 +154,24 @@ func TestExportGeoJSONMalformedCellDoesNotAbort(t *testing.T) {
 		t.Errorf("malformed geometry cell should become geometry:null, got %v", features[0].(map[string]any)["geometry"])
 	}
 }
+
+func TestExportGeoJSONMalformedBinaryCellDoesNotCorruptOutput(t *testing.T) {
+	for _, value := range []any{[]byte(`{broken`), json.RawMessage(`{broken`)} {
+		rs := &engine.ResultSet{Cols: []string{"geom"}, Rows: []engine.Row{{"geom": value}}}
+		var buf bytes.Buffer
+		if err := ExportGeoJSON(&buf, rs, "geom", Options{}); err != nil {
+			t.Fatal(err)
+		}
+		var fc struct {
+			Features []struct {
+				Geometry any `json:"geometry"`
+			} `json:"features"`
+		}
+		if err := json.Unmarshal(buf.Bytes(), &fc); err != nil {
+			t.Fatalf("invalid JSON from %T: %v: %s", value, err, buf.String())
+		}
+		if len(fc.Features) != 1 || fc.Features[0].Geometry != nil {
+			t.Fatalf("malformed %T geometry = %#v, want null", value, fc.Features)
+		}
+	}
+}

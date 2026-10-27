@@ -62,6 +62,25 @@ func TestConvertRow_StrictFallback(t *testing.T) {
 	}
 }
 
+func TestInsertAllRecordsStrictContinuesAfterBadRow(t *testing.T) {
+	db := storage.NewDB()
+	cols := []string{"num"}
+	types := []storage.ColType{storage.IntType}
+	if err := createTable(context.Background(), db, "default", "records", cols, types); err != nil {
+		t.Fatal(err)
+	}
+	opts := &ImportOptions{StrictTypes: true, BatchSize: 10}
+	inserted, skipped, errs := insertAllRecords(context.Background(), db, "default", "records", cols, types,
+		[][]string{{"12"}, {"bad"}, {"34"}}, opts)
+	if inserted != 2 || skipped != 1 || len(errs) != 1 {
+		t.Fatalf("inserted=%d skipped=%d errors=%v", inserted, skipped, errs)
+	}
+	tbl, _ := db.Get("default", "records")
+	if len(tbl.Rows) != 2 || tbl.Rows[0][0] != int64(12) || tbl.Rows[1][0] != int64(34) {
+		t.Fatalf("rows = %#v", tbl.Rows)
+	}
+}
+
 func TestStreamInsertCSV(t *testing.T) {
 	ctx := context.Background()
 	db := storage.NewDB()
@@ -77,8 +96,8 @@ func TestStreamInsertCSV(t *testing.T) {
 	r := csvReaderFromString(csvData)
 
 	opts := &ImportOptions{BatchSize: 1, TypeInference: false}
-	rows, skipped, errs := insertCSVRecords(ctx, db, "default", "stream_tbl", colNames, colTypes, nil, r, opts)
-	if rows != 2 || skipped != 0 || len(errs) != 0 {
-		t.Fatalf("streamInsertCSV unexpected: rows=%d skipped=%d errs=%v", rows, skipped, errs)
+	rows, skipped, errs, err := insertCSVRecords(ctx, db, "default", "stream_tbl", colNames, colTypes, nil, r, opts)
+	if rows != 2 || skipped != 0 || len(errs) != 0 || err != nil {
+		t.Fatalf("streamInsertCSV unexpected: rows=%d skipped=%d errs=%v error=%v", rows, skipped, errs, err)
 	}
 }
