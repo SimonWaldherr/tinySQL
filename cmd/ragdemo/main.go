@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	tsql "github.com/SimonWaldherr/tinySQL"
@@ -25,7 +27,7 @@ import (
 type config struct {
 	baseURL, embeddingModel, chatModel, docsDir, query string
 	chunkSize, overlap, topK, candidateK, batchSize    int
-	hybrid, generate, verbose                          bool
+	hybrid, generate, verbose, offline                 bool
 }
 
 type chunk struct {
@@ -85,6 +87,7 @@ func parseFlags() config {
 	flag.BoolVar(&c.hybrid, "hybrid", true, "fuse vector and BM25 results using reciprocal-rank fusion")
 	flag.BoolVar(&c.generate, "generate", false, "generate an answer for -query using the chat model")
 	flag.BoolVar(&c.verbose, "verbose", false, "print all evaluation hits, not only failures")
+	flag.BoolVar(&c.offline, "offline", false, "use simple local word features instead of an embedding server")
 	flag.Parse()
 	return c
 }
@@ -96,12 +99,20 @@ func run(ctx context.Context, cfg config) error {
 	if cfg.topK < 1 || cfg.candidateK < cfg.topK || cfg.batchSize < 1 {
 		return errors.New("require top-k >= 1, candidate-k >= top-k, and batch-size >= 1")
 	}
+	if cfg.offline {
+		if cfg.generate {
+			return errors.New("-generate requires an embedding and chat server; omit -offline")
+		}
+		if cfg.query == "" {
+			cfg.query = "How can I search vectors with VEC_SEARCH?"
+		}
+	}
 
 	chunks, err := loadChunks(cfg.docsDir, cfg.chunkSize, cfg.overlap)
 	if err != nil {
 		return err
 	}
-	client := &lmClient{baseURL: strings.TrimRight(cfg.baseURL, "/"), http: &http.Client{Timeout: 3 * time.Minute}}
+	client := &lmClient{baseURL: strings.TrimRight(cfg.baseURL, "/"), http: &http.Client{Timeout: 3 * time.Minute}, offline: cfg.offline}
 
 	started := time.Now()
 	dims := 0
@@ -141,12 +152,17 @@ func run(ctx context.Context, cfg config) error {
 	if err != nil {
 		return err
 	}
+	defer db.Close()
 	fmt.Fprintf(os.Stderr, "database load: %s (batched inserts)\n", time.Since(started).Round(time.Millisecond))
 	corpus := make(map[string]chunk, len(chunks))
 	for _, c := range chunks {
 		corpus[key(c.DocID, c.Index)] = c
 	}
-	fmt.Printf("Corpus: %d chunks from %s | dimensions: %d | chunk=%d overlap=%d\n", len(chunks), cfg.docsDir, len(chunks[0].Embedding), cfg.chunkSize, cfg.overlap)
+	features := cfg.embeddingModel
+	if cfg.offline {
+		features = "offline word features (not semantic embeddings)"
+	}
+	fmt.Printf("Corpus: %d chunks from %s | dimensions: %d | chunk=%d overlap=%d | features: %s\n", len(chunks), cfg.docsDir, len(chunks[0].Embedding), cfg.chunkSize, cfg.overlap, features)
 
 	if cfg.query != "" {
 		hits, err := retrieve(ctx, client, db, corpus, cfg, cfg.query)
@@ -346,7 +362,10 @@ func retrieveSQL(cfg config, queryVec []float64, query string) (string, error) {
 		opts["text_columns"] = []string{"heading", "chunk_text"}
 		opts["text_query"] = query
 		opts["key_columns"] = []string{"doc_id", "chunk_index"}
-		cols += ", _fts_rank, _rrf_score"
+		// A hit found by only one retriever does not carry the other pass's
+		// rank fields. Selecting each such field explicitly can fail on that
+		// row, while SELECT * preserves the sparse result for the checks below.
+		cols = "*"
 	}
 	optsJSON, err := json.Marshal(opts)
 	if err != nil {
@@ -553,9 +572,13 @@ func floatValue(row tsql.Row, name string) (float64, bool) {
 type lmClient struct {
 	baseURL string
 	http    *http.Client
+	offline bool
 }
 
 func (c *lmClient) embed(ctx context.Context, model string, input []string) ([][]float64, error) {
+	if c.offline {
+		return offlineEmbeddings(ctx, input)
+	}
 	body := struct {
 		Model string   `json:"model"`
 		Input []string `json:"input"`
@@ -581,6 +604,37 @@ func (c *lmClient) embed(ctx context.Context, model string, input []string) ([][
 			return nil, fmt.Errorf("empty embedding at index %d", item.Index)
 		}
 		out[item.Index] = item.Embedding
+	}
+	return out, nil
+}
+
+// offlineEmbeddings makes deterministic hashed word-presence vectors so the
+// retrieval pipeline can be explored without a model or network connection.
+// These deliberately simple features are not semantic model embeddings.
+func offlineEmbeddings(ctx context.Context, input []string) ([][]float64, error) {
+	const dims = 2048
+	out := make([][]float64, len(input))
+	for i, text := range input {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		words := strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
+			return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_'
+		})
+		if len(words) == 0 {
+			return nil, fmt.Errorf("offline input %d has no letters or digits", i+1)
+		}
+		vector := make([]float64, dims)
+		for _, word := range words {
+			h := fnv.New64a()
+			_, _ = h.Write([]byte(word))
+			sum := h.Sum64()
+			// Two hash regions make an accidental collision less likely
+			// to look like an exact match for a short technical query.
+			vector[sum%(dims/2)] = 1
+			vector[dims/2+(sum>>32)%(dims/2)] = 1
+		}
+		out[i] = vector
 	}
 	return out, nil
 }

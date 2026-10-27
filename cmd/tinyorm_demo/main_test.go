@@ -38,3 +38,18 @@ func TestRunRejectsUnknownFormat(t *testing.T) {
 		t.Fatal("expected unsupported-format error")
 	}
 }
+
+func TestRunCountrySelection(t *testing.T) {
+	var out bytes.Buffer
+	if err := runCountry(context.Background(), &out, "json", true, " ch "); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"Zurich"`) || strings.Contains(out.String(), `"Cologne"`) {
+		t.Fatalf("unexpected selection: %s", out.String())
+	}
+	for _, country := range []string{"", "123", "D!"} {
+		if err := runCountry(context.Background(), &out, "text", false, country); err == nil {
+			t.Fatalf("accepted %q", country)
+		}
+	}
+}

@@ -6,11 +6,60 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	_ "github.com/SimonWaldherr/tinySQL/driver"
 )
+
+func TestREPLExecutesScriptsWithCommentsAndMultilineStrings(t *testing.T) {
+	db := openTestDB(t)
+	input := "CREATE TABLE repl_script (id INT, value TEXT); INSERT INTO repl_script VALUES (1, 'first');\n" +
+		"INSERT INTO repl_script VALUES (2, -- keep this newline\n'second'); -- trailing comment\n" +
+		"/* block comment */ INSERT INTO repl_script VALUES (3, 'third');\n" +
+		"INSERT INTO repl_script VALUES (4, 'line one\n-- not a comment\nline three');\n" +
+		"INSERT INTO repl_script VALUES (9876, 'returning') RETURNING id;\n"
+	stdin, err := os.CreateTemp(t.TempDir(), "stdin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdin.Close()
+	if _, err = stdin.WriteString(input); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = stdin.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := os.CreateTemp(t.TempDir(), "stdout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdout.Close()
+	oldIn, oldOut := os.Stdin, os.Stdout
+	os.Stdin, os.Stdout = stdin, stdout
+	defer func() { os.Stdin, os.Stdout = oldIn, oldOut }()
+	runREPL(db, false, "table", false, false, false)
+	if _, err = stdout.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	output, err := os.ReadFile(stdout.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(output), "ERR") {
+		t.Fatalf("REPL errors: %s", output)
+	}
+	if !strings.Contains(string(output), "9876") {
+		t.Fatalf("RETURNING result missing from REPL output: %s", output)
+	}
+	for id, want := range map[int]string{1: "first", 2: "second", 3: "third", 4: "line one\n-- not a comment\nline three", 9876: "returning"} {
+		var got string
+		if err := db.QueryRow("SELECT value FROM repl_script WHERE id = ?", id).Scan(&got); err != nil || got != want {
+			t.Errorf("row %d: got %q, err %v; want %q", id, got, err, want)
+		}
+	}
+}
 
 func TestBuildRepl(t *testing.T) {
 	// Generous on purpose. This shells out to the real toolchain, the link step

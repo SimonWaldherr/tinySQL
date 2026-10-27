@@ -39,6 +39,19 @@ go run ./examples/native-client \
 The client keeps old and new revisions in distinct namespaces and switches its
 active manifest only after every requested tile is present.
 
+After synchronization, stop the server and read a tile from the active local
+revision using TMS coordinates:
+
+```bash
+go run ./examples/native-client -cache ./demo-cache -dataset dach \
+  -read 8/137/167 -output ./tile.bin
+```
+
+The command reports the byte count, content type, encoding and SHA-256; omit
+`-output` to inspect metadata without writing a file. The exported bytes keep
+their original encoding. A missing manifest or tile produces an error. The
+read mode never contacts the server and cannot be combined with `-manifest`.
+
 ## 3. Browser / WASM
 
 In one terminal, start the demo server with a CORS origin matching port 8081.

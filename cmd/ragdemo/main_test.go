@@ -3,9 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -143,11 +147,8 @@ func TestBuildDBInsertsQueryableRows(t *testing.T) {
 	}
 }
 
-// TestRetrieveSQLHybridRequestsFusedColumns pins the contract retrieve()
-// depends on: hybrid mode must ask RAG_SEARCH for both passes plus the fused
-// score, and must identify rows across those passes with key_columns. Without
-// key_columns RAG_SEARCH rejects the call; without _rrf_score the demo would
-// silently fall back to ranking a fused result by vector similarity alone.
+// Hybrid fusion requires key_columns. SELECT * also preserves fields that may
+// be absent on hits found by just one retrieval pass.
 func TestRetrieveSQLHybridRequestsFusedColumns(t *testing.T) {
 	cfg := config{topK: 5, candidateK: 15, hybrid: true}
 	sql, err := retrieveSQL(cfg, []float64{0.5, -0.25}, "How do I set a query timeout?")
@@ -155,7 +156,7 @@ func TestRetrieveSQLHybridRequestsFusedColumns(t *testing.T) {
 		t.Fatalf("retrieveSQL: %v", err)
 	}
 	for _, want := range []string{
-		"_rrf_score", "_fts_rank", "_vec_similarity",
+		"SELECT * FROM RAG_SEARCH",
 		`"text_columns":["heading","chunk_text"]`,
 		`"key_columns":["doc_id","chunk_index"]`,
 		`"candidate_k":15`,
@@ -185,6 +186,77 @@ func TestRetrieveSQLVectorOnlyOmitsFusionColumns(t *testing.T) {
 	}
 	if _, err := tsql.ParseSQL(sql); err != nil {
 		t.Fatalf("vector-only SQL does not parse: %v\n%s", err, sql)
+	}
+}
+
+func TestHybridRetrievalHandlesSinglePassHits(t *testing.T) {
+	chunks := []chunk{
+		{DocID: "vector.md", Text: "apple pear", Embedding: []float64{1, 0}},
+		{DocID: "other.md", Text: "plum cherry", Embedding: []float64{0.9, 0.1}},
+		{DocID: "lexical.md", Text: "volcano eruption", Embedding: []float64{0, 1}},
+	}
+	db, err := buildDB(chunks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	corpus := make(map[string]chunk, len(chunks))
+	for _, c := range chunks {
+		corpus[key(c.DocID, c.Index)] = c
+	}
+	hits, err := retrieveVector(t.Context(), db, corpus, config{topK: 2, candidateK: 2, hybrid: true}, "volcano", []float64{1, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 2 {
+		t.Fatalf("got %d hits, want two: %+v", len(hits), hits)
+	}
+	byDoc := map[string]hit{}
+	for _, h := range hits {
+		byDoc[h.Chunk.DocID] = h
+	}
+	if h, ok := byDoc["vector.md"]; !ok || h.VectorRank != 1 || h.FTSRank != 0 {
+		t.Errorf("vector-only hit = %+v, present=%t", h, ok)
+	}
+	if h, ok := byDoc["lexical.md"]; !ok || h.FTSRank != 1 || h.VectorRank != 0 {
+		t.Errorf("lexical-only hit = %+v, present=%t", h, ok)
+	}
+}
+
+func TestOfflineEmbeddingsDeterministicAndCancelable(t *testing.T) {
+	got, err := offlineEmbeddings(t.Context(), []string{"ÄPFEL VEC_SEARCH", "äpfel vec_search"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || len(got[0]) != 2048 || !reflect.DeepEqual(got[0], got[1]) {
+		t.Fatalf("case-insensitive vectors differ or have wrong dimensions")
+	}
+	if _, err := offlineEmbeddings(t.Context(), []string{"!?"}); err == nil {
+		t.Fatal("expected an error for an input without words")
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := offlineEmbeddings(ctx, []string{"query"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled input: got %v", err)
+	}
+}
+
+func TestOfflineDemoRunsWithoutServer(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "notes.md"), []byte("# Search\nUse saffron to find the relevant section.\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config{baseURL: "http://127.0.0.1:1", docsDir: dir, query: "saffron", chunkSize: 200, overlap: 20, topK: 1, candidateK: 2, batchSize: 2, hybrid: true, offline: true}
+	if err := run(t.Context(), cfg); err != nil {
+		t.Fatalf("offline retrieval: %v", err)
+	}
+	cfg.query = "" // The documented default query must also run offline.
+	if err := run(t.Context(), cfg); err != nil {
+		t.Fatalf("offline default query: %v", err)
+	}
+	cfg.generate = true
+	if err := run(t.Context(), cfg); err == nil || !strings.Contains(err.Error(), "-generate") {
+		t.Fatalf("offline answer generation: got %v", err)
 	}
 }
 

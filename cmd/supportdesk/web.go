@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -109,6 +110,7 @@ func (a *supportDeskApp) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/search", a.search)
 	mux.HandleFunc("GET /api/tickets", a.tickets)
 	mux.HandleFunc("POST /api/tickets", a.createTicket)
+	mux.HandleFunc("POST /api/tickets/{id}/status", a.changeTicketStatus)
 }
 
 func (a *supportDeskApp) index(w http.ResponseWriter, r *http.Request) {
@@ -228,6 +230,55 @@ func (a *supportDeskApp) createTicket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	webapp.JSON(w, http.StatusCreated, supportTicket{ID: id, ArticleID: in.ArticleID, Subject: in.Subject, Status: "open", Article: articleTitle})
+}
+
+// changeTicketStatus records each actual status transition in the same transaction.
+func (a *supportDeskApp) changeTicketStatus(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id < 1 {
+		webapp.Error(w, r, http.StatusNotFound, "ticket not found")
+		return
+	}
+	var in struct {
+		Status string `json:"status"`
+	}
+	if err := supportDecodeJSON(w, r, &in); err != nil || (in.Status != "open" && in.Status != "closed") {
+		webapp.Error(w, r, http.StatusBadRequest, "status must be open or closed")
+		return
+	}
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		webapp.Error(w, r, 500, "could not change ticket")
+		return
+	}
+	defer tx.Rollback()
+	var current string
+	if err := tx.QueryRowContext(r.Context(), "SELECT status FROM tickets WHERE id=?", id).Scan(&current); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			webapp.Error(w, r, 404, "ticket not found")
+		} else {
+			webapp.Error(w, r, 500, "could not change ticket")
+		}
+		return
+	}
+	if current != in.Status {
+		if _, err = tx.ExecContext(r.Context(), "UPDATE tickets SET status=? WHERE id=?", in.Status, id); err == nil {
+			var eventID int64
+			eventID, err = webapp.NextID(r.Context(), tx, "ticket_events")
+			if err == nil {
+				_, err = tx.ExecContext(r.Context(), "INSERT INTO ticket_events (id,ticket_id,event,occurred_at) VALUES (?,?,?,?)", eventID, id, in.Status, time.Now().UTC().Unix())
+			}
+		}
+		if err != nil {
+			webapp.Error(w, r, 500, "could not change ticket")
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		webapp.Error(w, r, 500, "could not save ticket")
+		return
+	}
+	webapp.JSON(w, http.StatusOK, map[string]string{"status": in.Status})
 }
 
 func (a *supportDeskApp) listArticles(ctx context.Context) ([]supportArticle, error) {

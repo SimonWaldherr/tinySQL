@@ -68,7 +68,9 @@ func TestFeatureTour(t *testing.T) {
 	exec := newExecutor(db, false, true, "table")
 	seedSampleData(exec)
 	// Running the tour must not panic or return errors.
-	runFeatureTour(exec)
+	if err := runFeatureTour(exec); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestRunScript(t *testing.T) {

@@ -31,7 +31,7 @@ Neustart hinweg erhalten.
 ## Web-Funktionen und API
 
 Im Browser lassen sich Artikel durchsuchen, ein passender Artikel auswählen
-und daraus ein neues offenes Ticket anlegen. Jeder Ticketvorgang erhält einen
+und daraus ein neues offenes Ticket anlegen. Tickets können geschlossen und wieder geöffnet werden; jede tatsächliche Statusänderung wird zusammen mit dem Ticket gespeichert. Jeder Ticketvorgang erhält einen
 Audit-Eintrag; Artikel und Starttickets werden nur beim ersten Befüllen der
 Datenbank angelegt.
 
@@ -43,6 +43,7 @@ Datenbank angelegt.
 | `GET` | `/api/search?q=<begriff>` | Volltextsuche; ohne `q` alle Artikel |
 | `GET` | `/api/tickets` | Offene und vorhandene Tickets lesen |
 | `POST` | `/api/tickets` | Ticket mit `{"article_id":1,"subject":"…"}` anlegen |
+| `POST` | `/api/tickets/{id}/status` | Status mit `{"status":"closed"}` oder `{"status":"open"}` setzen |
 
 ## Betriebshinweis
 

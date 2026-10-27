@@ -112,7 +112,55 @@ func (a *app) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/validate", a.validate)
 	mux.HandleFunc("GET /api/imports", a.listRuns)
 	mux.HandleFunc("GET /api/imports/{id}", a.getRun)
+	mux.HandleFunc("GET /api/imports/{id}/preview", a.previewRun)
 	mux.HandleFunc("POST /api/imports/{id}/commit", a.commitRun)
+}
+
+type previewRow struct {
+	Row    int               `json:"row"`
+	Values map[string]string `json:"values"`
+}
+
+func (a *app) previewRun(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id < 1 {
+		webapp.Error(w, r, http.StatusBadRequest, "invalid import id")
+		return
+	}
+	var exists int
+	if err := a.db.QueryRowContext(r.Context(), "SELECT id FROM import_runs WHERE id=?", id).Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			webapp.Error(w, r, http.StatusNotFound, "import not found")
+		} else {
+			webapp.Error(w, r, http.StatusInternalServerError, "could not load import")
+		}
+		return
+	}
+	rows, err := a.db.QueryContext(r.Context(), "SELECT row_number,data_json FROM import_rows WHERE import_id=? ORDER BY row_number LIMIT 20", id)
+	if err != nil {
+		webapp.Error(w, r, http.StatusInternalServerError, "could not load preview")
+		return
+	}
+	defer rows.Close()
+	items := make([]previewRow, 0)
+	for rows.Next() {
+		var item previewRow
+		var data string
+		if err := rows.Scan(&item.Row, &data); err != nil {
+			webapp.Error(w, r, http.StatusInternalServerError, "could not load preview")
+			return
+		}
+		if err := json.Unmarshal([]byte(data), &item.Values); err != nil {
+			webapp.Error(w, r, http.StatusInternalServerError, "could not load preview")
+			return
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		webapp.Error(w, r, http.StatusInternalServerError, "could not load preview")
+		return
+	}
+	webapp.JSON(w, http.StatusOK, items)
 }
 
 func (a *app) index(w http.ResponseWriter, r *http.Request) {

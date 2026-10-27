@@ -32,16 +32,18 @@ func (a *offlineApp) status(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *offlineApp) search(w http.ResponseWriter, r *http.Request) {
-	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	var (
-		items []poi
-		err   error
-	)
-	if query == "" {
-		items, err = listPOIs(r.Context(), a.db)
-	} else {
-		items, err = searchPOIs(r.Context(), a.db, query)
+	values := r.URL.Query()
+	query := strings.TrimSpace(values.Get("q"))
+	var near *proximity
+	if values.Has("lon") || values.Has("lat") || values.Has("radius_m") {
+		var err error
+		near, err = parseProximity(values.Get("lon")+","+values.Get("lat"), values.Get("radius_m"))
+		if err != nil {
+			offlineError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
+	items, err := queryPOIs(r.Context(), a.db, query, near)
 	if err != nil {
 		offlineError(w, http.StatusInternalServerError, "search failed")
 		return
@@ -50,19 +52,7 @@ func (a *offlineApp) search(w http.ResponseWriter, r *http.Request) {
 }
 
 func listPOIs(ctx context.Context, db *tinysql.DB) ([]poi, error) {
-	rs, err := tinysql.ExecSQL(ctx, db, "default", `SELECT id, name, category, city, lat, lon FROM poi ORDER BY name`)
-	if err != nil {
-		return nil, err
-	}
-	items := make([]poi, 0, len(rs.Rows))
-	for _, row := range rs.Rows {
-		items = append(items, poi{
-			ID: intValue(row, "id"), Name: stringValue(row, "name"),
-			Category: stringValue(row, "category"), City: stringValue(row, "city"),
-			Lat: floatValue(row, "lat"), Lon: floatValue(row, "lon"),
-		})
-	}
-	return items, nil
+	return queryPOIs(ctx, db, "", nil)
 }
 
 func writeOfflineJSON(w http.ResponseWriter, status int, v any) {

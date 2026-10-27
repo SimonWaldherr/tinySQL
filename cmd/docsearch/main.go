@@ -12,6 +12,7 @@ import (
 	"html/template"
 	"io/fs"
 	"log"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -102,6 +103,7 @@ func (a *app) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/status", a.status)
 	mux.HandleFunc("GET /api/search", a.search)
 	mux.HandleFunc("GET /api/documents/{id}", a.getDocument)
+	mux.HandleFunc("GET /api/documents/{id}/download", a.downloadDocument)
 	mux.HandleFunc("POST /api/reindex", a.reindex)
 }
 
@@ -164,6 +166,28 @@ func (a *app) getDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	webapp.JSON(w, http.StatusOK, d)
+}
+
+// downloadDocument serves the indexed snapshot, never a path from the request.
+func (a *app) downloadDocument(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(strings.TrimSpace(r.PathValue("id")), 10, 64)
+	if err != nil || id < 1 {
+		webapp.Error(w, r, http.StatusNotFound, "document not found")
+		return
+	}
+	var path, content string
+	err = a.db.QueryRowContext(r.Context(), "SELECT path, content FROM documents WHERE id = ?", id).Scan(&path, &content)
+	if err == sql.ErrNoRows {
+		webapp.Error(w, r, http.StatusNotFound, "document not found")
+		return
+	}
+	if err != nil {
+		webapp.Error(w, r, http.StatusInternalServerError, "document could not be read")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filepath.Base(path)}))
+	_, _ = w.Write([]byte(content))
 }
 
 func (a *app) index(ctx context.Context) (int, error) {

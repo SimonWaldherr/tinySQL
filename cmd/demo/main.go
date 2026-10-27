@@ -119,7 +119,10 @@ Examples:
 			flag.Usage()
 			os.Exit(1)
 		}
-		runFeatureTour(exec)
+		if err := runFeatureTour(exec); err != nil {
+			fmt.Fprintln(os.Stderr, "feature tour:", err)
+			os.Exit(1)
+		}
 	}
 }
 
@@ -230,7 +233,7 @@ func seedSampleData(exec *executor) {
 
 // ---- feature tour -----------------------------------------------------------
 
-func runFeatureTour(exec *executor) {
+func runFeatureTour(exec *executor) error {
 	type step struct {
 		label string
 		sql   string
@@ -238,6 +241,12 @@ func runFeatureTour(exec *executor) {
 	steps := []step{
 		{"DISTINCT values", `SELECT DISTINCT active FROM users ORDER BY active ASC`},
 		{"JSON extraction", `SELECT id, JSON_GET(meta, 'device') AS device FROM orders ORDER BY id`},
+		{"CTE: paid orders grouped by customer", `
+WITH paid AS (SELECT user_id, amount FROM orders WHERE status = 'PAID')
+SELECT user_id, SUM(amount) AS total FROM paid GROUP BY user_id ORDER BY user_id`},
+		{"Geospatial distance and bearing: Berlin to Munich", `
+SELECT GEO_DISTANCE(52.5200, 13.4050, 48.1372, 11.5755) AS meters,
+       GEO_BEARING(52.5200, 13.4050, 48.1372, 11.5755) AS bearing_degrees`},
 		{"Trigger: insert an order and inspect its audit row", `INSERT INTO orders VALUES (105, 3, 49.0, 'PAID', '{"device":"web"}')`},
 		{"  (the AFTER INSERT trigger wrote this audit row)", `SELECT order_id, event FROM order_audit ORDER BY order_id`},
 		{"LEFT JOIN + GROUP BY + aggregates", `
@@ -317,10 +326,11 @@ HAVING SUM(o.amount) >= 150`},
 		q := strings.TrimSpace(s.sql)
 		fmt.Println(q)
 		if err := exec.run(q); err != nil {
-			fmt.Fprintln(os.Stderr, "ERR:", err)
+			return fmt.Errorf("%s: %w", s.label, err)
 		}
 		fmt.Println()
 	}
+	return nil
 }
 
 // ---- script execution -------------------------------------------------------

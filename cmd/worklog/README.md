@@ -38,7 +38,7 @@ Start, sodass vergessene Buchungen nach einem Neustart erkannt werden.
 
 Nachtschichten werden nicht an Mitternacht beendet. Für Tagesberichte teilt die
 Auswertung ein durchlaufendes Intervall lediglich an der Grenze des in
-`-timezone` gewählten Kalendertags auf.
+`-timezone` gewählten Kalendertags auf. Der Tagesbericht kann im Browser und über die API auf einen Datumsbereich begrenzt werden; die berücksichtigten Zeitintervalle werden zuerst aufgeteilt. Der Bericht berücksichtigt die jüngsten 10.000 Ereignisse und ein laufendes Arbeitsintervall bis zum Abrufzeitpunkt.
 
 ## HTTP-API
 
@@ -46,6 +46,7 @@ Auswertung ein durchlaufendes Intervall lediglich an der Grenze des in
 | --- | --- | --- |
 | `GET` | `/healthz` | Einfacher Health-Check |
 | `GET` | `/api/dashboard?user_id=<id>` | Profile, aktueller Status, Historie, Berichte und kritische Fälle |
+| `GET` | `/api/report?user_id=<id>&from=2026-08-01&to=2026-08-31` | Tagesbericht im optionalen, inklusiven Datumsbereich |
 | `POST` | `/api/stamp` | Statusereignis schreiben |
 | `POST` | `/api/departments` | Abteilung anlegen |
 | `POST` | `/api/users` | Profil anlegen |

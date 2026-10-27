@@ -38,6 +38,7 @@ gespeichert.
 | `GET` | `/api/status` | Indexgröße und Zeit des jüngsten Dokuments |
 | `GET` | `/api/search?q=<begriff>` | Volltextsuche; ohne `q` die neuesten Dokumente |
 | `GET` | `/api/documents/{id}` | Vollständigen Inhalt eines indexierten Dokuments lesen |
+| `GET` | `/api/documents/{id}/download` | Indexierten Dokumentstand als Textdatei herunterladen |
 | `POST` | `/api/reindex` | Quellverzeichnis erneut einlesen |
 
 Die Anwendung dient auch als kleines Beispiel für `FTS_SEARCH`; bei einer

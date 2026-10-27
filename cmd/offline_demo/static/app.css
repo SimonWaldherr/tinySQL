@@ -12,12 +12,31 @@
 }
 
 form {
-    display: flex;
-    gap: 0.5rem;
+    display: grid;
+    gap: 0.75rem;
+}
+
+form label {
+    display: grid;
+    gap: 0.25rem;
 }
 
 form input {
-    flex: 1;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+fieldset {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+    gap: 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: 0.5rem;
+}
+
+.actions {
+    display: flex;
+    gap: 0.5rem;
 }
 
 button#all {
@@ -57,4 +76,16 @@ svg {
     fill: #c03f2e;
     stroke: var(--surface);
     stroke-width: 2;
+}
+
+.center {
+    fill: none;
+    stroke: var(--accent);
+    stroke-width: 4;
+}
+
+@media (max-width: 720px) {
+    .layout {
+        grid-template-columns: 1fr;
+    }
 }

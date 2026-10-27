@@ -18,6 +18,7 @@ import (
 	"math"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -184,7 +185,35 @@ func (a *app) state(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) events(w http.ResponseWriter, r *http.Request) {
-	items, err := a.listEvents(r.Context(), 200)
+	filter := eventFilter{limit: 200}
+	values := r.URL.Query()
+	for _, param := range []struct {
+		name string
+		dest *int64
+	}{{"vehicle_id", &filter.vehicleID}, {"zone_id", &filter.zoneID}} {
+		if raw := values.Get(param.name); raw != "" {
+			v, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil || v < 1 {
+				webapp.Error(w, r, http.StatusBadRequest, param.name+" must be a positive integer")
+				return
+			}
+			*param.dest = v
+		}
+	}
+	filter.kind = values.Get("kind")
+	if filter.kind != "" && filter.kind != "entered" && filter.kind != "exited" {
+		webapp.Error(w, r, http.StatusBadRequest, "kind must be entered or exited")
+		return
+	}
+	if raw := values.Get("limit"); raw != "" {
+		limit, err := strconv.Atoi(raw)
+		if err != nil || limit < 1 || limit > 200 {
+			webapp.Error(w, r, http.StatusBadRequest, "limit must be between 1 and 200")
+			return
+		}
+		filter.limit = limit
+	}
+	items, err := a.filteredEvents(r.Context(), filter)
 	if err != nil {
 		webapp.Error(w, r, http.StatusInternalServerError, "could not load events")
 		return
@@ -387,9 +416,35 @@ func queryZones(ctx context.Context, db queryRower) ([]zone, error) {
 }
 
 func (a *app) listEvents(ctx context.Context, limit int) ([]event, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT e.id, e.vehicle_id, v.name, e.zone_id, z.name, e.kind, e.lon, e.lat, e.occurred_at
+	return a.filteredEvents(ctx, eventFilter{limit: limit})
+}
+
+type eventFilter struct {
+	vehicleID, zoneID int64
+	kind              string
+	limit             int
+}
+
+func (a *app) filteredEvents(ctx context.Context, f eventFilter) ([]event, error) {
+	sqlText := `SELECT e.id, e.vehicle_id, v.name, e.zone_id, z.name, e.kind, e.lon, e.lat, e.occurred_at
 		FROM geofence_events e JOIN vehicles v ON v.id = e.vehicle_id JOIN zones z ON z.id = e.zone_id
-		ORDER BY e.occurred_at DESC LIMIT ?`, limit)
+		WHERE 1 = 1`
+	var args []any
+	if f.vehicleID != 0 {
+		sqlText += " AND e.vehicle_id = ?"
+		args = append(args, f.vehicleID)
+	}
+	if f.zoneID != 0 {
+		sqlText += " AND e.zone_id = ?"
+		args = append(args, f.zoneID)
+	}
+	if f.kind != "" {
+		sqlText += " AND e.kind = ?"
+		args = append(args, f.kind)
+	}
+	sqlText += " ORDER BY e.occurred_at DESC, e.id DESC LIMIT ?"
+	args = append(args, f.limit)
+	rows, err := a.db.QueryContext(ctx, sqlText, args...)
 	if err != nil {
 		return nil, err
 	}

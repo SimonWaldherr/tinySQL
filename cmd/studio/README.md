@@ -10,7 +10,7 @@ light theme toggle.
 
 ## Prerequisites
 
-- Go 1.26.5+
+- Go 1.27.3+
 - [Wails v2 CLI](https://wails.io/docs/gettingstarted/installation):
   ```bash
   go install github.com/wailsapp/wails/v2/cmd/wails@latest

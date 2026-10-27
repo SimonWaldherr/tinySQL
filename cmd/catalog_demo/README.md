@@ -34,6 +34,9 @@ only these registered jobs; it accepts no arbitrary SQL.
 
 The web mode starts with a fresh in-memory dataset. Tables, job history, and
 scheduler state disappear on restart.
+The dashboard's history filter selects a job; up to 30 recent runs are retained
+across all jobs. Scheduled executions are associated with a job when its SQL
+uniquely identifies it; ambiguous SQL is shown as `scheduled`.
 
 ## HTTP API
 
@@ -41,6 +44,7 @@ scheduler state disappear on restart.
 | --- | --- | --- |
 | GET | /healthz | Liveness check |
 | GET | /api/state | Catalog, job status, and recent runs |
+| GET | /api/state?job=integrity_check | Recent runs for one job |
 | POST | /api/jobs/{name}/run | Run a registered job |
 
 ```bash

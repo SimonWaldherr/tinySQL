@@ -55,6 +55,14 @@ in `geofence_events`.
 {"type":"Polygon","coordinates":[…]}}`. Die Geometrie wird vor dem
 Speichern als gültiges GeoJSON-Polygon geprüft.
 
+`GET /api/events` unterstützt kombinierbare Filter `vehicle_id`, `zone_id` und
+`kind` (`entered` oder `exited`) sowie `limit` von 1 bis 200. Die Filter
+werden vor der Begrenzung angewendet; die neuesten Ereignisse stehen zuerst:
+
+```bash
+curl 'http://127.0.0.1:8091/api/events?vehicle_id=1&kind=entered&limit=10'
+```
+
 ## Betriebshinweis
 
 Die Anwendung hat absichtlich keine Anmeldung. Positionsdaten sind in der

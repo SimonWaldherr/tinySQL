@@ -1,9 +1,24 @@
-# Local LM Studio RAG evaluation
+# Local RAG retrieval demo
 
-Part of [tinySQL](../../README.md). This demo makes retrieval quality visible
-before asking an LLM for an answer. It chunks repository Markdown files, gets
-embeddings from a local OpenAI-compatible LM Studio server, stores them in
-tinySQL, and reports retrieved chunks, ranks, Hit@k, and MRR.
+Part of [tinySQL](../../README.md). This demo chunks repository Markdown files,
+stores their vectors in tinySQL, and shows ranked retrieval results. It can use
+local word features without a server or model embeddings from an
+OpenAI-compatible LM Studio server. Model-based evaluation also reports Hit@k
+and MRR before optionally asking an LLM for an answer.
+
+To try retrieval without installing a model or starting a server:
+
+```sh
+go run ./cmd/ragdemo -offline
+go run ./cmd/ragdemo -offline -query "How do I use VEC_SEARCH?" -top-k 3
+go run ./cmd/ragdemo -offline -query "VEC_WARM" -hybrid=false
+```
+
+Offline mode uses deterministic hashed word-presence features, not semantic
+embeddings; it illustrates the retrieval pipeline but does not measure
+embedding-model quality. It runs a sample question when `-query` is omitted.
+The built-in evaluation suite and `-generate` require LM Studio; `-generate`
+cannot be combined with `-offline`.
 
 Start LM Studio on port 1234 with an embedding model, then run:
 

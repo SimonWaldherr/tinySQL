@@ -6,6 +6,10 @@ From the repository root:
 go run ./cmd/routingdemo
 go run ./cmd/routingdemo -iterations 1000
 go run ./cmd/routingdemo -json
+
+# Select one profile and choose points on or near the embedded network.
+go run ./cmd/routingdemo -profile bicycle \
+  -from 10.9995,48.00001 -to 11,48.001 -max-snap-meters 20 -json
 ```
 
 The embedded, synthetic five-node OSM network requires no downloads, model,
@@ -14,6 +18,12 @@ are explicitly exempt, and pedestrians are unaffected by this vehicle restrictio
 Both endpoints are off-road and snap onto partial street segments. Output compares
 metres, estimated travel seconds, graph build time and mean query time for all
 three profiles. `-json` includes the GeoJSON geometry and snap details.
+
+`-from` and `-to` use **longitude,latitude** in WGS84. The default profile
+`all` compares car, bicycle, and foot; `-profile` can select one of them.
+`-max-snap-meters` sets the maximum distance to an eligible road, from more
+than 0 up to 5000 metres (default 10). Points outside that radius return an
+error; the example network covers only the coordinates shown above.
 
 Every iteration computes a fresh route. Graph construction is timed separately;
 these tiny-network timings include snapping and are an execution demonstration,

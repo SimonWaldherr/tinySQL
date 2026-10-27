@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
 	"github.com/SimonWaldherr/tinySQL/tinyorm"
@@ -27,6 +28,7 @@ func (Place) TableName() string { return "places" }
 func main() {
 	format := flag.String("format", "text", "Output format: text or json")
 	includeInactive := flag.Bool("include-inactive", false, "Include inactive places in the country result")
+	country := flag.String("country", "DE", "Two-letter country code for the CLI selection")
 	web := flag.Bool("web", false, "Serve the persistent places directory in a browser")
 	addr := flag.String("addr", "127.0.0.1:8088", "HTTP listen address when -web is set; use :8088 to accept connections from other machines")
 	snapshot := flag.String("snapshot", "places.snapshot", "Snapshot path when -web is set (empty for in-memory)")
@@ -37,7 +39,7 @@ func main() {
 		}
 		return
 	}
-	if err := run(context.Background(), os.Stdout, *format, *includeInactive); err != nil {
+	if err := runCountry(context.Background(), os.Stdout, *format, *includeInactive, *country); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -46,6 +48,14 @@ func main() {
 // FindByPK. Keeping it separate from main makes the example testable and lets
 // scripts choose stable JSON output.
 func run(ctx context.Context, out io.Writer, format string, includeInactive bool) error {
+	return runCountry(ctx, out, format, includeInactive, "DE")
+}
+
+func runCountry(ctx context.Context, out io.Writer, format string, includeInactive bool, country string) error {
+	country = strings.ToUpper(strings.TrimSpace(country))
+	if len(country) != 2 || country[0] < 'A' || country[0] > 'Z' || country[1] < 'A' || country[1] > 'Z' {
+		return fmt.Errorf("country must be a two-letter code")
+	}
 	db := tinyorm.New(tinysql.NewDB(), "default")
 
 	if err := db.AutoMigrate(ctx, Place{}); err != nil {
@@ -62,14 +72,14 @@ func run(ctx context.Context, out io.Writer, format string, includeInactive bool
 		}
 	}
 
-	var germanPlaces []Place
+	var selectedPlaces []Place
 	where := "country = :country AND active = :active"
-	params := map[string]any{"country": "DE", "active": true}
+	params := map[string]any{"country": country, "active": true}
 	if includeInactive {
 		where = "country = :country"
-		params = map[string]any{"country": "DE"}
+		params = map[string]any{"country": country}
 	}
-	if err := db.Select(ctx, &germanPlaces, where, params); err != nil {
+	if err := db.Select(ctx, &selectedPlaces, where, params); err != nil {
 		return err
 	}
 
@@ -82,14 +92,14 @@ func run(ctx context.Context, out io.Writer, format string, includeInactive bool
 		return json.NewEncoder(out).Encode(struct {
 			LoadedByPK Place   `json:"loaded_by_pk"`
 			Places     []Place `json:"places"`
-		}{berlin, germanPlaces})
+		}{berlin, selectedPlaces})
 	}
 	if format != "text" {
 		return fmt.Errorf("unsupported format %q (use text or json)", format)
 	}
 	_, _ = fmt.Fprintf(out, "loaded by pk: %s %.4f %.4f\n", berlin.Name, berlin.Lat, berlin.Lon)
-	_, _ = fmt.Fprintf(out, "DE places: %d\n", len(germanPlaces))
-	for _, place := range germanPlaces {
+	_, _ = fmt.Fprintf(out, "%s places: %d\n", country, len(selectedPlaces))
+	for _, place := range selectedPlaces {
 		_, _ = fmt.Fprintf(out, "- %s (%s, active=%t)\n", place.Name, place.Country, place.Active)
 	}
 	return nil

@@ -50,7 +50,20 @@ type jobRun struct {
 type webSchedulerExecutor struct{ app *catalogWebApp }
 
 func (e *webSchedulerExecutor) ExecuteSQL(ctx context.Context, sql string) (interface{}, error) {
-	return e.app.executeSQL(ctx, "scheduled", sql)
+	// JobExecutor receives SQL but no job name. Resolve it only when the SQL
+	// uniquely identifies a registered job; otherwise keep the generic label.
+	name := "scheduled"
+	matches := 0
+	for _, job := range e.app.catalog.ListJobs() {
+		if job.SQLText == sql {
+			name = job.Name
+			matches++
+		}
+	}
+	if matches != 1 {
+		name = "scheduled"
+	}
+	return e.app.executeSQL(ctx, name, sql)
 }
 
 func serveCatalogDashboard(addr string) error {
@@ -133,8 +146,13 @@ func (a *catalogWebApp) state(w http.ResponseWriter, r *http.Request) {
 	sort.Strings(names)
 	jobs := a.jobViews()
 	a.mu.Lock()
-	runs := make([]jobRun, len(a.runs))
-	copy(runs, a.runs)
+	runs := make([]jobRun, 0, len(a.runs))
+	filter := r.URL.Query().Get("job")
+	for _, run := range a.runs {
+		if filter == "" || run.Job == filter {
+			runs = append(runs, run)
+		}
+	}
 	a.mu.Unlock()
 	writeCatalogJSON(w, 200, map[string]any{"tables": names, "jobs": jobs, "runs": runs})
 }

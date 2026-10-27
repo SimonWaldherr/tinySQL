@@ -75,11 +75,6 @@ func handleInputError(err error, htmlMode bool, htmlParts *[]string) {
 	}
 }
 
-// shouldSkipLine checks if a line should be skipped for execution
-func shouldSkipLine(line string) bool {
-	return line == "" || strings.HasPrefix(line, "--") || strings.HasPrefix(line, "/*")
-}
-
 // executeStatement executes a complete SQL statement
 func executeStatement(db *sql.DB, q string, beautiful, htmlMode, errorsOnly bool, format string, srcLines []string, htmlParts *[]string, interactive bool) []string {
 	if sqlutil.IsResultProducing(q) {
@@ -143,8 +138,10 @@ func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool
 			srcLines = append(srcLines, raw)
 		}
 
-		// Skip pure comment or empty lines for execution-building as before
-		if shouldSkipLine(line) {
+		// Only skip standalone blank and line-comment input when no statement
+		// is pending. Inside a statement these lines can belong to a string,
+		// and a newline must terminate any preceding SQL line comment.
+		if buf.Len() == 0 && (line == "" || strings.HasPrefix(line, "--")) {
 			continue
 		}
 
@@ -154,29 +151,29 @@ func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool
 			}
 		}
 
-		buf.WriteString(line)
+		buf.WriteString(raw)
+		buf.WriteByte('\n')
 		// Execute only once the statement is complete, so a ';' inside a
 		// string or a CREATE TRIGGER body keeps reading the next line.
-		if strings.HasSuffix(line, ";") && sqlutil.StatementComplete(buf.String()) {
-			q := strings.TrimSpace(buf.String())
-			q = strings.TrimSpace(strings.TrimSuffix(q, ";"))
+		if sqlutil.StatementComplete(buf.String()) {
+			statements := sqlutil.SplitStatements(buf.String())
 			buf.Reset()
 
-			if echo && !beautiful && !htmlMode {
-				// In non-beautiful mode preserve existing echo behaviour. When
-				// beautiful is enabled we print the accumulated block instead.
-				fmt.Println("--", q)
-			}
+			for _, q := range statements {
+				if echo && !beautiful && !htmlMode {
+					// In beautiful mode the source block is printed with results.
+					fmt.Println("--", q)
+				}
 
-			newSrcLines := executeStatement(db, q, beautiful, htmlMode, errorsOnly, format, srcLines, &htmlParts, interactive)
-			if newSrcLines == nil && beautiful {
-				srcLines = nil
-			} else if newSrcLines != nil {
-				srcLines = newSrcLines
+				newSrcLines := executeStatement(db, q, beautiful, htmlMode, errorsOnly, format, srcLines, &htmlParts, interactive)
+				if newSrcLines == nil && beautiful {
+					srcLines = nil
+				} else if newSrcLines != nil {
+					srcLines = newSrcLines
+				}
 			}
 			continue
 		}
-		buf.WriteString(" ")
 	}
 }
 

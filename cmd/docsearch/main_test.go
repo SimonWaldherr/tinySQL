@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/SimonWaldherr/tinySQL/cmd/internal/webapp"
@@ -38,5 +39,39 @@ func TestIndexAndSearch(t *testing.T) {
 	a.getDocument(res, req)
 	if res.Code != http.StatusOK {
 		t.Fatalf("document endpoint status = %d: %s", res.Code, res.Body.String())
+	}
+}
+
+func TestDownloadServesIndexedSnapshot(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "guide.md")
+	if err := os.WriteFile(path, []byte("# Original\nHello"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	db, err := webapp.Open(ctx, "mem://?tenant=docsearch-download")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	a := &app{db: db, root: dir}
+	if err := a.bootstrap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("changed"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		path string
+		want int
+	}{{"/api/documents/1/download", 200}, {"/api/documents/999/download", 404}, {"/api/documents/no/download", 404}} {
+		res := httptest.NewRecorder()
+		a.handler().ServeHTTP(res, httptest.NewRequest(http.MethodGet, tc.path, nil))
+		if res.Code != tc.want {
+			t.Fatalf("%s: %d %s", tc.path, res.Code, res.Body.String())
+		}
+		if tc.want == 200 && (res.Body.String() != "# Original\nHello" || !strings.Contains(res.Header().Get("Content-Disposition"), "guide.md")) {
+			t.Fatalf("unexpected download: %v %q", res.Header(), res.Body.String())
+		}
 	}
 }

@@ -86,6 +86,17 @@ func Register() error {
 			handler: demoLogEvent,
 		},
 		{
+			name: "demo_event_summary",
+			options: tinysql.StoredProcedureOptions{
+				Description: "Count logged events by category, optionally filtering by category",
+				ReadOnly:    true,
+				Parameters: []tinysql.StoredProcedureParameter{
+					{Name: "category", Description: "optional exact category", Required: false},
+				},
+			},
+			handler: demoEventSummary,
+		},
+		{
 			name: "demo_release_features",
 			options: tinysql.StoredProcedureOptions{
 				Description: "Show the feature areas covered by the browser build",
@@ -112,6 +123,22 @@ func Register() error {
 		}
 	}
 	return nil
+}
+
+// demoEventSummary reads the table created by demo_log_event. An empty log
+// has no table yet, so it returns an empty result without creating one.
+func demoEventSummary(ctx tinysql.ProcedureContext, args []any) (*tinysql.ResultSet, error) {
+	tables, err := ctx.ExecuteSQLArgs("SELECT name FROM sys.tables WHERE name = ?", "demo_procedure_log")
+	if err != nil {
+		return nil, err
+	}
+	if len(tables.Rows) == 0 {
+		return &tinysql.ResultSet{Cols: []string{"category", "total"}}, nil
+	}
+	if len(args) > 0 {
+		return ctx.ExecuteSQLArgs("SELECT category, COUNT(*) AS total FROM demo_procedure_log WHERE category = ? GROUP BY category ORDER BY category", args[0])
+	}
+	return ctx.ExecuteSQL("SELECT category, COUNT(*) AS total FROM demo_procedure_log GROUP BY category ORDER BY category")
 }
 
 func demoLogEvent(ctx tinysql.ProcedureContext, args []any) (*tinysql.ResultSet, error) {

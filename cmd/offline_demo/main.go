@@ -15,19 +15,22 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"math"
 	"net/http"
-
-	"github.com/SimonWaldherr/tinySQL/cmd/internal/webapp"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	tinysql "github.com/SimonWaldherr/tinySQL"
+	"github.com/SimonWaldherr/tinySQL/cmd/internal/webapp"
 )
 
 type config struct {
 	snapshot string
 	query    string
+	near     string
+	radius   string
 	json     bool
 	rebuild  bool
 	readOnly bool
@@ -36,24 +39,41 @@ type config struct {
 }
 
 type poi struct {
-	ID       int     `json:"id"`
-	Name     string  `json:"name"`
-	Category string  `json:"category"`
-	City     string  `json:"city"`
-	Lat      float64 `json:"lat"`
-	Lon      float64 `json:"lon"`
+	ID       int      `json:"id"`
+	Name     string   `json:"name"`
+	Category string   `json:"category"`
+	City     string   `json:"city"`
+	Lat      float64  `json:"lat"`
+	Lon      float64  `json:"lon"`
+	Distance *float64 `json:"distance_m,omitempty"`
+}
+
+type proximity struct {
+	lon, lat, radius float64
 }
 
 func main() {
 	var cfg config
 	flag.StringVar(&cfg.snapshot, "snapshot", "", "Optional snapshot path; created on first run and reused afterwards")
 	flag.StringVar(&cfg.query, "query", "München", "Search name, city, or category")
+	flag.StringVar(&cfg.near, "near", "", "Search near longitude,latitude (requires -radius-m)")
+	flag.StringVar(&cfg.radius, "radius-m", "", "Search radius in metres (requires -near)")
 	flag.BoolVar(&cfg.json, "json", false, "Write stable JSON instead of a text table")
 	flag.BoolVar(&cfg.rebuild, "rebuild", false, "Ignore an existing snapshot and rebuild the sample dataset")
 	flag.BoolVar(&cfg.readOnly, "read-only", true, "Reject writes after loading or creating the dataset")
 	flag.BoolVar(&cfg.web, "web", false, "Serve the local POI explorer in a browser")
 	flag.StringVar(&cfg.addr, "addr", "127.0.0.1:8086", "HTTP listen address when -web is set; use :8086 to accept connections from other machines")
 	flag.Parse()
+	// A nearby search without an explicit text query covers all POIs.
+	queryExplicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "query" {
+			queryExplicit = true
+		}
+	})
+	if cfg.near != "" && !queryExplicit {
+		cfg.query = ""
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -81,6 +101,9 @@ type offlineApp struct {
 }
 
 func serveWeb(ctx context.Context, cfg config) error {
+	if cfg.near != "" || cfg.radius != "" {
+		return fmt.Errorf("-near and -radius-m apply to CLI searches; use the browser form in web mode")
+	}
 	db, source, err := openPOIDatabase(ctx, cfg)
 	if err != nil {
 		return err
@@ -115,6 +138,13 @@ func (a *offlineApp) handler() http.Handler {
 }
 
 func run(ctx context.Context, cfg config, out io.Writer) error {
+	near, err := parseProximity(cfg.near, cfg.radius)
+	if err != nil {
+		return err
+	}
+	if near == nil && strings.TrimSpace(cfg.query) == "" {
+		return fmt.Errorf("query must not be empty")
+	}
 	db, source, err := openPOIDatabase(ctx, cfg)
 	if err != nil {
 		return err
@@ -124,7 +154,7 @@ func run(ctx context.Context, cfg config, out io.Writer) error {
 	if cfg.readOnly {
 		db.SetReadOnly(true)
 	}
-	results, err := searchPOIs(ctx, db, cfg.query)
+	results, err := queryPOIs(ctx, db, cfg.query, near)
 	if err != nil {
 		return err
 	}
@@ -139,14 +169,27 @@ func run(ctx context.Context, cfg config, out io.Writer) error {
 	}
 
 	_, _ = fmt.Fprintf(out, "Offline POI demo (%s, read-only=%t)\n", source, db.IsReadOnly())
-	_, _ = fmt.Fprintf(out, "Search: %q — %d result(s)\n\n", cfg.query, len(results))
+	if near != nil {
+		_, _ = fmt.Fprintf(out, "Search: %q near %.6f,%.6f within %g m — %d result(s)\n\n", cfg.query, near.lon, near.lat, near.radius, len(results))
+	} else {
+		_, _ = fmt.Fprintf(out, "Search: %q — %d result(s)\n\n", cfg.query, len(results))
+	}
 	if len(results) == 0 {
 		return nil
 	}
-	_, _ = fmt.Fprintln(out, "ID  NAME                 CATEGORY       CITY")
-	_, _ = fmt.Fprintln(out, "--  -------------------  -------------  ----------")
+	if near != nil {
+		_, _ = fmt.Fprintln(out, "ID  NAME                 CATEGORY       CITY        DISTANCE (m)")
+		_, _ = fmt.Fprintln(out, "--  -------------------  -------------  ----------  ------------")
+	} else {
+		_, _ = fmt.Fprintln(out, "ID  NAME                 CATEGORY       CITY")
+		_, _ = fmt.Fprintln(out, "--  -------------------  -------------  ----------")
+	}
 	for _, p := range results {
-		_, _ = fmt.Fprintf(out, "%-2d  %-19s  %-13s  %s\n", p.ID, p.Name, p.Category, p.City)
+		if p.Distance != nil {
+			_, _ = fmt.Fprintf(out, "%-2d  %-19s  %-13s  %-10s  %.0f\n", p.ID, p.Name, p.Category, p.City, *p.Distance)
+		} else {
+			_, _ = fmt.Fprintf(out, "%-2d  %-19s  %-13s  %s\n", p.ID, p.Name, p.Category, p.City)
+		}
 	}
 	return nil
 }
@@ -194,32 +237,91 @@ func seedPOIs(ctx context.Context, db *tinysql.DB) error {
 }
 
 func searchPOIs(ctx context.Context, db *tinysql.DB, query string) ([]poi, error) {
-	needle := strings.TrimSpace(query)
-	if needle == "" {
+	if strings.TrimSpace(query) == "" {
 		return nil, fmt.Errorf("query must not be empty")
 	}
+	return queryPOIs(ctx, db, query, nil)
+}
+
+// parseProximity accepts the same longitude,latitude ordering as GeoJSON and
+// the routing demos. The empty pair selects ordinary text-only search.
+func parseProximity(coords, radius string) (*proximity, error) {
+	coords, radius = strings.TrimSpace(coords), strings.TrimSpace(radius)
+	if coords == "" && radius == "" {
+		return nil, nil
+	}
+	parts := strings.Split(coords, ",")
+	if len(parts) != 2 || radius == "" {
+		return nil, fmt.Errorf("nearby search requires longitude,latitude and a radius in metres")
+	}
+	parse := func(s string) (float64, error) {
+		v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+			return 0, fmt.Errorf("invalid nearby search number %q", s)
+		}
+		return v, nil
+	}
+	lon, err := parse(parts[0])
+	if err != nil {
+		return nil, err
+	}
+	lat, err := parse(parts[1])
+	if err != nil {
+		return nil, err
+	}
+	meters, err := parse(radius)
+	if err != nil {
+		return nil, err
+	}
+	if lon < -180 || lon > 180 || lat < -90 || lat > 90 || meters <= 0 {
+		return nil, fmt.Errorf("longitude must be between -180 and 180, latitude between -90 and 90, and radius positive")
+	}
+	return &proximity{lon: lon, lat: lat, radius: meters}, nil
+}
+
+func queryPOIs(ctx context.Context, db *tinysql.DB, query string, near *proximity) ([]poi, error) {
+	needle := strings.TrimSpace(query)
 	// The demo builds a literal from a local CLI argument; production callers
 	// should use the database/sql driver's bound parameters instead.
 	needle = strings.ReplaceAll(needle, "'", "''")
-	pattern := "'%" + needle + "%'"
-	sql := fmt.Sprintf(`SELECT id, name, category, city, lat, lon
-FROM poi
-WHERE name LIKE %s OR city LIKE %s OR category LIKE %s
-ORDER BY name`, pattern, pattern, pattern)
+	var conditions []string
+	if needle != "" {
+		pattern := "'%" + needle + "%'"
+		conditions = append(conditions, fmt.Sprintf("(name LIKE %s OR city LIKE %s OR category LIKE %s)", pattern, pattern, pattern))
+	}
+	columns := "id, name, category, city, lat, lon"
+	order := "name"
+	if near != nil {
+		number := func(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) }
+		distance := "GEO_DISTANCE(" + number(near.lat) + ", " + number(near.lon) + ", lat, lon)"
+		columns += ", " + distance + " AS distance_m"
+		conditions = append(conditions, distance+" <= "+number(near.radius))
+		order = "distance_m, name, id"
+	}
+	sql := "SELECT " + columns + " FROM poi"
+	if len(conditions) > 0 {
+		sql += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	sql += " ORDER BY " + order
 	rs, err := tinysql.ExecSQL(ctx, db, "default", sql)
 	if err != nil {
 		return nil, err
 	}
 	result := make([]poi, 0, len(rs.Rows))
 	for _, row := range rs.Rows {
-		result = append(result, poi{
+		p := poi{
 			ID:       intValue(row, "id"),
 			Name:     stringValue(row, "name"),
 			Category: stringValue(row, "category"),
 			City:     stringValue(row, "city"),
 			Lat:      floatValue(row, "lat"),
 			Lon:      floatValue(row, "lon"),
-		})
+		}
+		if near != nil {
+			distance := floatValue(row, "distance_m")
+			p.Distance = &distance
+		}
+		result = append(result, p)
 	}
 	return result, nil
 }

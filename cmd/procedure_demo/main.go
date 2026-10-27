@@ -19,7 +19,11 @@ func main() {
 		`CALL demo_geo_distance(52.5200, 13.4050, 48.1372, 11.5755)`,
 		`CALL demo_find_functions('RAG%')`,
 		`CALL demo_log_event('demo', 'stored procedure executed safely')`,
+		`CALL demo_log_event('demo', 'another event')`,
+		`CALL demo_event_summary()`,
+		`CALL demo_event_summary('demo')`,
 		`CALL demo_table_summary()`,
+		`CALL demo_runtime_status()`,
 		`SELECT name, read_only, atomic, calls, errors FROM sys.procedures ORDER BY name`,
 	}
 	for _, query := range queries {

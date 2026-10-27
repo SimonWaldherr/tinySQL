@@ -2,6 +2,7 @@
 
 ```sh
 go run ./cmd/gameoflife -width 50 -height 30 -steps 100 -seed 1 -interval 100ms
+go run ./cmd/gameoflife -width 10 -height 10 -pattern glider -steps 4 -interval 0 -plain
 ```
 
 Conway's rules run in SQL: an eight-row offset CTE generates neighbor
@@ -10,6 +11,9 @@ One atomic stored procedure materializes the next generation before replacing
 the current board. Go seeds the board and renders ordered rows in the terminal.
 The board wraps around at both edges. The interval is a pause after computation,
 not a promise of ten generations per second. Dimensions are limited to 3–200.
+`-pattern` selects `random` (default), `block`, `blinker`, or `glider`.
+The seed controls the random pattern. `-plain` disables terminal clearing so
+that generations remain readable in logs or redirected output.
 
 This implements the approach in
 [SimonWaldherr/GameOfLife's SQL shell demo](https://github.com/SimonWaldherr/GameOfLife/blob/main/cgol.sql.sh).

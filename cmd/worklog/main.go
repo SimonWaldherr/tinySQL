@@ -186,6 +186,7 @@ func (a *app) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /", a.index)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { webapp.JSON(w, 200, map[string]bool{"ok": true}) })
 	mux.HandleFunc("GET /api/dashboard", a.dashboard)
+	mux.HandleFunc("GET /api/report", a.reportRange)
 	mux.HandleFunc("POST /api/stamp", a.stamp)
 	mux.HandleFunc("POST /api/departments", a.createDepartment)
 	mux.HandleFunc("POST /api/users", a.createUser)
@@ -250,6 +251,51 @@ func (a *app) dashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	webapp.JSON(w, 200, map[string]any{"users": users, "types": types, "departments": departments, "selected_user_id": selected, "team": team, "history": history, "report": reports, "critical": critical, "timeout_seconds": int64(a.timeout.Seconds())})
+}
+
+// reportRange filters local calendar-day totals after splitting the recorded
+// intervals, including the current interval, across midnight and DST.
+func (a *app) reportRange(w http.ResponseWriter, r *http.Request) {
+	userID := parsePositive(r.URL.Query().Get("user_id"))
+	if userID == 0 {
+		webapp.Error(w, r, 400, "user_id is required")
+		return
+	}
+	from, to := r.URL.Query().Get("from"), r.URL.Query().Get("to")
+	for _, value := range []string{from, to} {
+		if value != "" {
+			parsed, err := time.Parse("2006-01-02", value)
+			if err != nil || parsed.Format("2006-01-02") != value {
+				webapp.Error(w, r, 400, "dates must use YYYY-MM-DD")
+				return
+			}
+		}
+	}
+	if from != "" && to != "" && from > to {
+		webapp.Error(w, r, 400, "from must not be after to")
+		return
+	}
+	var id int64
+	if err := a.db.QueryRowContext(r.Context(), "SELECT id FROM users WHERE id=?", userID).Scan(&id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			webapp.Error(w, r, 404, "user not found")
+		} else {
+			webapp.Error(w, r, 500, "could not load user")
+		}
+		return
+	}
+	items, err := a.report(r.Context(), userID, time.Now())
+	if err != nil {
+		webapp.Error(w, r, 500, "could not calculate hours")
+		return
+	}
+	filtered := make([]dayTotal, 0, len(items))
+	for _, day := range items {
+		if (from == "" || day.Date >= from) && (to == "" || day.Date <= to) {
+			filtered = append(filtered, day)
+		}
+	}
+	webapp.JSON(w, 200, map[string]any{"user_id": userID, "from": from, "to": to, "days": filtered})
 }
 
 func (a *app) stamp(w http.ResponseWriter, r *http.Request) {

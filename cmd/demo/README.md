@@ -30,7 +30,7 @@ Options:
 
 Without `-script` or `-interactive`, the default run is a feature tour covering
 joins, PIVOT/window functions, JSON, triggers, full-text search, vector search,
-CTEs, temp tables, and UPDATE/DELETE.
+CTEs, geospatial distance and bearing, temp tables, and UPDATE/DELETE.
 
 ## Examples
 

@@ -28,6 +28,9 @@ go run ./cmd/import-validate -addr 127.0.0.1:8093
 
 So bleibt die Prüfung von der eigentlichen Datenübernahme getrennt. Auch
 fehlerhafte Läufe bleiben mitsamt ihren Fehlern in der Historie sichtbar.
+Eine Vorschau zeigt die ersten 20 gespeicherten Zeilen mit den umbenannten
+Zielspalten, auch bei abgelehnten Läufen. Die Vorschau schreibt keine Daten
+in die Zieltabelle.
 
 ## Regel-Format
 
@@ -62,6 +65,7 @@ Uploads sind auf 5 MiB und 10.000 Datenzeilen begrenzt.
 | `POST` | `/api/validate` | Multipart-Upload mit `target`, `rules` und `file` prüfen |
 | `GET` | `/api/imports` | Importhistorie laden |
 | `GET` | `/api/imports/{id}` | Importlauf und Fehlerdetails laden |
+| `GET` | `/api/imports/{id}/preview` | Erste 20 vorbereitete Zeilen samt Zielspalten anzeigen |
 | `POST` | `/api/imports/{id}/commit` | Einen validierten Lauf in die Zieltabelle schreiben |
 
 Die Anwendung hat keine Benutzerverwaltung. Sie sollte deshalb lokal gebunden

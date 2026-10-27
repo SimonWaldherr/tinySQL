@@ -52,3 +52,41 @@ func TestRunRejectsBlankQuery(t *testing.T) {
 		t.Fatal("expected blank query to fail")
 	}
 }
+
+func TestTicketStatusTransitionsRecordAudit(t *testing.T) {
+	ctx := context.Background()
+	db, err := webapp.Open(ctx, "mem://?tenant=supportdesk-status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	a := &supportDeskApp{db: db}
+	if err := a.bootstrap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	h := a.handler()
+	for _, tc := range []struct {
+		path, body string
+		want       int
+	}{
+		{"/api/tickets/1/status", `{"status":"closed"}`, 200},
+		{"/api/tickets/1/status", `{"status":"closed"}`, 200},
+		{"/api/tickets/1/status", `{"status":"open"}`, 200},
+		{"/api/tickets/1/status", `{"status":"invalid"}`, 400},
+		{"/api/tickets/99/status", `{"status":"open"}`, 404},
+	} {
+		res := httptest.NewRecorder()
+		h.ServeHTTP(res, httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body)))
+		if res.Code != tc.want {
+			t.Fatalf("%s %s: got %d: %s", tc.path, tc.body, res.Code, res.Body.String())
+		}
+	}
+	var state string
+	if err := db.QueryRowContext(ctx, "SELECT status FROM tickets WHERE id=1").Scan(&state); err != nil || state != "open" {
+		t.Fatalf("state %q: %v", state, err)
+	}
+	var events int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM ticket_events WHERE ticket_id=1").Scan(&events); err != nil || events != 3 {
+		t.Fatalf("events %d: %v", events, err)
+	}
+}

@@ -76,22 +76,48 @@ func registerStep() error {
 	})
 }
 
+// initialCells supplies reproducible examples as well as the original random board.
+func initialCells(width, height int, pattern string, seed int64) (map[[2]int]bool, error) {
+	live := map[[2]int]bool{}
+	if pattern == "random" {
+		rng := rand.New(rand.NewSource(seed))
+		for y := 0; y < height; y++ {
+			for x := 0; x < width; x++ {
+				live[[2]int{x, y}] = rng.Float64() < 0.4
+			}
+		}
+		return live, nil
+	}
+	patterns := map[string][][2]int{
+		"blinker": {{0, 1}, {1, 1}, {2, 1}},
+		"block":   {{0, 0}, {1, 0}, {0, 1}, {1, 1}},
+		"glider":  {{1, 0}, {2, 1}, {0, 2}, {1, 2}, {2, 2}},
+	}
+	cells, ok := patterns[pattern]
+	if !ok {
+		return nil, fmt.Errorf("unknown pattern %q (use random, blinker, block or glider)", pattern)
+	}
+	for _, cell := range cells {
+		live[[2]int{cell[0] + (width-3)/2, cell[1] + (height-3)/2}] = true
+	}
+	return live, nil
+}
+
 func run() error {
 	width := flag.Int("width", 50, "board width (3..200)")
 	height := flag.Int("height", 30, "board height (3..200)")
 	steps := flag.Int("steps", 100, "generations to run")
 	seed := flag.Int64("seed", 1, "random seed")
+	pattern := flag.String("pattern", "random", "initial pattern: random, blinker, block or glider")
+	plain := flag.Bool("plain", false, "print generations without terminal escape codes")
 	interval := flag.Duration("interval", 100*time.Millisecond, "pause between generations")
 	flag.Parse()
 	if *width < 3 || *height < 3 || *width > 200 || *height > 200 || *steps < 0 || *interval < 0 {
 		return fmt.Errorf("invalid dimensions, steps or interval")
 	}
-	rng := rand.New(rand.NewSource(*seed))
-	live := map[[2]int]bool{}
-	for y := 0; y < *height; y++ {
-		for x := 0; x < *width; x++ {
-			live[[2]int{x, y}] = rng.Float64() < 0.4
-		}
+	live, err := initialCells(*width, *height, *pattern, *seed)
+	if err != nil {
+		return err
 	}
 	db := tinysql.NewDB()
 	ctx := context.Background()
@@ -107,7 +133,10 @@ func run() error {
 			return err
 		}
 		var out strings.Builder
-		fmt.Fprintf(&out, "\x1b[H\x1b[2JGeneration %d\n", step)
+		if !*plain {
+			out.WriteString("\x1b[H\x1b[2J")
+		}
+		fmt.Fprintf(&out, "Generation %d\n", step)
 		for i, row := range rs.Rows {
 			if fmt.Sprint(row["alive"]) == "1" {
 				out.WriteString("█")
