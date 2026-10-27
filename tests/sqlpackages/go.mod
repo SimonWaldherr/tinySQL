@@ -1,6 +1,6 @@
 module github.com/SimonWaldherr/tinySQL/tests/sqlpackages
 
-go 1.26.5
+go 1.27.3
 
 require (
 	github.com/Masterminds/squirrel v1.5.4

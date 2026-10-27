@@ -18,7 +18,7 @@ single-process services that need SQL without operating a database server.
 
 ## Start here
 
-tinySQL requires Go **1.26.5+**.
+tinySQL requires Go **1.27.3+**.
 
 ```bash
 go get github.com/SimonWaldherr/tinySQL@latest

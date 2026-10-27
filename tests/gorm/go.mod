@@ -1,6 +1,6 @@
 module github.com/SimonWaldherr/tinySQL/tests/gorm
 
-go 1.26.5
+go 1.27.3
 
 require (
 	github.com/SimonWaldherr/tinySQL v0.0.0

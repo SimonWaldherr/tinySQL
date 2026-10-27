@@ -203,6 +203,10 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
 
+      - name: Run govulncheck for server module
+        working-directory: cmd/server
+        run: govulncheck ./...
+
   build-bindings:
     name: Test Bindings
     runs-on: ubuntu-latest
