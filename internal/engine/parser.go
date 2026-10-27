@@ -35,16 +35,16 @@ type Parser struct {
 	depth int
 }
 
-// maxParseDepth bounds parseExpr/parseSelect recursion. 200 comfortably
+// maxParseDepth bounds expression, statement, and CTE recursion. 200 comfortably
 // covers any realistic hand-written or generated query while stopping
 // pathological nesting well before it threatens the goroutine stack.
 const maxParseDepth = 200
 
 func (p *Parser) enterRecursion() error {
-	p.depth++
-	if p.depth > maxParseDepth {
+	if p.depth >= maxParseDepth {
 		return p.errf("expression or subquery nested too deeply (limit %d)", maxParseDepth)
 	}
+	p.depth++
 	return nil
 }
 

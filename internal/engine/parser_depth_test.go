@@ -66,3 +66,46 @@ func TestParserAllowsReasonableNesting(t *testing.T) {
 		t.Errorf("expected 10 levels of subquery nesting to parse fine, got: %v", err)
 	}
 }
+
+func TestParserBoundsRecursiveSyntax(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		sql  func(int) string
+	}{
+		{"signs", func(n int) string { return "SELECT " + strings.Repeat("- + ", n) + "1" }},
+		{"explain", func(n int) string { return strings.Repeat("EXPLAIN ", n) + "SELECT 1" }},
+		{"cte", func(n int) string {
+			return strings.Repeat("WITH c AS (", n) + "SELECT 1" + strings.Repeat(") SELECT * FROM c", n)
+		}},
+		{"trigger", func(n int) string {
+			return strings.Repeat("CREATE TRIGGER t AFTER INSERT ON items BEGIN ", n) +
+				"SELECT 1;" + strings.Repeat(" END;", n)
+		}},
+		{"mixed", func(n int) string {
+			return strings.Repeat("EXPLAIN ", n) + strings.Repeat("WITH c AS (", n) +
+				"SELECT " + strings.Repeat("+ ", n) + "1" + strings.Repeat(") SELECT * FROM c", n)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tooDeep := maxParseDepth + 1
+			if tc.name == "mixed" {
+				// Each individual syntax is below the limit; their combined
+				// stack depth must still be bounded by the same counter.
+				tooDeep = maxParseDepth / 2
+			}
+			for _, depth := range []int{10, tooDeep} {
+				p := NewParser(tc.sql(depth))
+				_, err := p.ParseStatement()
+				if depth == 10 && err != nil {
+					t.Fatalf("ordinary nesting: %v", err)
+				}
+				if depth == tooDeep && (err == nil || !strings.Contains(err.Error(), "nested too deeply")) {
+					t.Fatalf("depth %d: want nesting error, got %v", depth, err)
+				}
+				if p.depth != 0 {
+					t.Fatalf("unbalanced recursion counter after parsing: %d", p.depth)
+				}
+			}
+		})
+	}
+}

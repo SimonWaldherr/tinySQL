@@ -121,6 +121,14 @@ publishes the shadow's catalog.
 
 These are load-bearing. Each one was broken at some point and cost data.
 
+**Bound recursive parsing.** Expressions, statements, CTE bodies and unary
+sign chains share the parser's depth counter. Guard recursion before descending:
+nested WITH clauses are parsed before their SELECT, while EXPLAIN and trigger
+bodies recurse through statement dispatch. The limit is 200 guarded frames,
+including combinations of these forms. Exceeding it returns a parse error
+before stack exhaustion. This counter does not limit total query size or the
+number of elements in flat lists.
+
 **One write-ahead logging site.** Exactly one place appends a statement to
 `WALManager`: `maybeLogToWALManager` in `wal_logging.go`. The driver logs only
 whole transactions, at `COMMIT`. When both logged, every autocommit write went

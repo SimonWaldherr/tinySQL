@@ -27,6 +27,10 @@ func (p *Parser) ParseStatement() (Statement, error) {
 // used for individual statements inside CREATE TRIGGER ... BEGIN ... END;
 // public callers must use ParseStatement above.
 func (p *Parser) parseStatement() (Statement, error) {
+	if err := p.enterRecursion(); err != nil {
+		return nil, err
+	}
+	defer p.exitRecursion()
 	if p.cur.Typ == tIdent {
 		return p.parseBareTableSelect()
 	}

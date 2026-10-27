@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -50,7 +51,10 @@ func compileCachedLikeMatcher(pattern string, caseInsensitive bool) func(string)
 	if v, ok := m.Load(key); ok {
 		return v.(func(string) bool)
 	}
-	matcher := compileLikeStringMatcher(pattern, caseInsensitive)
+	// SQL literals may be slices of the complete query. Own the pattern before
+	// compiling too: matcher closures can retain substrings of their input.
+	key.pattern = strings.Clone(pattern)
+	matcher := compileLikeStringMatcher(key.pattern, caseInsensitive)
 	if likeMatcherCacheCount.Add(1) > likeMatcherCacheMaxEntries {
 		// Simple full reset, same tradeoff compileCachedRegexp makes: no LRU
 		// bookkeeping, and a reset is rare with a reasonable working set of

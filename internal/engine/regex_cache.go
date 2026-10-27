@@ -2,6 +2,7 @@ package engine
 
 import (
 	"regexp"
+	"strings"
 	"sync"
 )
 
@@ -50,6 +51,9 @@ func loadCachedRegexp(pattern string) (*cachedRegexp, error) {
 	if compiled != nil {
 		return compiled, nil
 	}
+	// Regexp retains its source expression. A small SQL literal must not keep
+	// the entire query alive through either the cache key or the regexp.
+	pattern = strings.Clone(pattern)
 	re, err := regexp.Compile(pattern)
 	if err != nil {
 		return nil, err

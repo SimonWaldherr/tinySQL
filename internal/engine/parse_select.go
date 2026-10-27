@@ -16,6 +16,11 @@ func (p *Parser) parseWithClause() ([]CTE, error) {
 
 	// Parse WITH clause if present
 	if p.cur.Typ == tKeyword && p.cur.Val == "WITH" {
+		// A nested WITH is parsed before its SELECT reaches the usual guard.
+		if err := p.enterRecursion(); err != nil {
+			return nil, err
+		}
+		defer p.exitRecursion()
 		p.next()
 
 		// WITH RECURSIVE permits self references in following CTEs. Whether a

@@ -55,6 +55,10 @@ func (p *Parser) parseMulDiv() (Expr, error) {
 
 func (p *Parser) parseUnary() (Expr, error) {
 	if p.cur.Typ == tSymbol && (p.cur.Val == "+" || p.cur.Val == "-") {
+		if err := p.enterRecursion(); err != nil {
+			return nil, err
+		}
+		defer p.exitRecursion()
 		op := p.cur.Val
 		p.next()
 		// Recurse into parseUnary so stacked prefix operators chain, e.g.

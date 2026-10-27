@@ -8,8 +8,8 @@ import (
 
 // compileLikeStringMatcher binds the pattern once. Literal runs separated by
 // % use string search instead of restarting the rune matcher at every position.
-// Fixed-width _ patterns decode only their wildcard positions. Escaped literals
-// share the string-search path; combinations of _ with % retain the rune matcher.
+// Fixed-width _ patterns decode only their wildcard positions. Mixed patterns
+// check their anchored ends before using the rune matcher for the middle.
 func compileLikeStringMatcher(pattern string, insensitive bool) func(string) bool {
 	pat := pattern
 	if insensitive {
@@ -19,19 +19,8 @@ func compileLikeStringMatcher(pattern string, insensitive bool) func(string) boo
 	switch {
 	case strings.Contains(pat, "_") && !strings.ContainsAny(pat, "%\\") && utf8.ValidString(pat) && !strings.ContainsRune(pat, utf8.RuneError):
 		parts := strings.Split(pat, "_")
-		match = func(s string) bool {
-			for _, part := range parts[:len(parts)-1] {
-				if !strings.HasPrefix(s, part) {
-					return false
-				}
-				s = s[len(part):]
-				if len(s) == 0 {
-					return false
-				}
-				_, width := utf8.DecodeRuneInString(s)
-				s = s[width:]
-			}
-			return s == parts[len(parts)-1]
+		return func(s string) bool {
+			return matchLikePrefix(s, parts, insensitive) == len(s)
 		}
 
 	case !utf8.ValidString(pat) || strings.ContainsRune(pat, utf8.RuneError):
@@ -49,8 +38,14 @@ func compileLikeStringMatcher(pattern string, insensitive bool) func(string) boo
 					return n >= 0 && (!exact || n == len(s))
 				}
 			}
+			if insensitive && len(parts) == 2 && parts[0] == "" {
+				return func(s string) bool { return lowerSuffixStart(s, parts[1]) >= 0 }
+			}
 			match = compileLikeLiteralParts(parts)
 		} else {
+			if anchored := compileLikeAnchoredMatcher(pat, insensitive); anchored != nil {
+				return anchored
+			}
 			match = func(s string) bool { return matchLikePattern(s, pat, '\\') }
 		}
 	}
@@ -58,6 +53,126 @@ func compileLikeStringMatcher(pattern string, insensitive bool) func(string) boo
 		return func(s string) bool { return match(strings.ToLower(s)) }
 	}
 	return match
+}
+
+// The parts before the first and after the last unescaped % have fixed rune
+// widths, even when they contain _. Their positions are therefore known:
+// checking a long suffix at every possible input position only repeats work.
+// The caller excludes invalid UTF-8 and RuneError literals, whose matching
+// semantics require decoding input rather than comparing literal bytes.
+func compileLikeAnchoredMatcher(pattern string, insensitive bool) func(string) bool {
+	first, last := -1, -1
+	for i := 0; i < len(pattern); i++ {
+		switch pattern[i] {
+		case '\\':
+			i++
+		case '%':
+			if first < 0 {
+				first = i
+			}
+			last = i
+		}
+	}
+	if first < 0 || first == 0 && last == len(pattern)-1 {
+		return nil
+	}
+	prefix := likeAnchorParts(pattern[:first])
+	suffix := likeAnchorParts(pattern[last+1:])
+	middle := pattern[first : last+1]
+	return func(s string) bool {
+		start := matchLikePrefix(s, prefix, insensitive)
+		if start < 0 {
+			return false
+		}
+		// Restrict the suffix to the remainder so the anchors cannot overlap.
+		s = s[start:]
+		end := matchLikeSuffix(s, suffix, insensitive)
+		if end < 0 {
+			return false
+		}
+		if first == last {
+			return true
+		}
+		s = s[:end]
+		if insensitive {
+			s = strings.ToLower(s)
+		}
+		return matchLikePattern(s, middle, '\\')
+	}
+}
+
+// Split a %-free anchor into literal runs separated by unescaped _. Empty
+// runs retain consecutive wildcards; a trailing backslash stays literal.
+func likeAnchorParts(pattern string) []string {
+	if !strings.ContainsRune(pattern, '\\') {
+		return strings.Split(pattern, "_")
+	}
+	var parts []string
+	var literal strings.Builder
+	for i := 0; i < len(pattern); i++ {
+		switch pattern[i] {
+		case '_':
+			parts = append(parts, literal.String())
+			literal.Reset()
+		case '\\':
+			if i+1 < len(pattern) {
+				i++
+			}
+			literal.WriteByte(pattern[i])
+		default:
+			literal.WriteByte(pattern[i])
+		}
+	}
+	return append(parts, literal.String())
+}
+
+func matchLikePrefix(s string, parts []string, insensitive bool) int {
+	pos := 0
+	for i, part := range parts {
+		width := len(part)
+		if insensitive {
+			width = lowerPrefixLen(s[pos:], part)
+			if width < 0 {
+				return -1
+			}
+		} else if !strings.HasPrefix(s[pos:], part) {
+			return -1
+		}
+		pos += width
+		if i+1 < len(parts) {
+			if pos == len(s) {
+				return -1
+			}
+			_, width := utf8.DecodeRuneInString(s[pos:])
+			pos += width
+		}
+	}
+	return pos
+}
+
+func matchLikeSuffix(s string, parts []string, insensitive bool) int {
+	pos := len(s)
+	for i := len(parts) - 1; i >= 0; i-- {
+		if insensitive {
+			pos = lowerSuffixStart(s[:pos], parts[i])
+			if pos < 0 {
+				return -1
+			}
+		} else {
+			if !strings.HasSuffix(s[:pos], parts[i]) {
+				return -1
+			}
+			pos -= len(parts[i])
+		}
+		if i > 0 {
+			if pos == 0 {
+				return -1
+			}
+			_, width := utf8.DecodeLastRuneInString(s[:pos])
+			pos -= width
+		}
+	}
+	return pos
 }
 
 // likeLiteralParts splits on unescaped %, retaining empty anchors. A trailing
@@ -158,6 +273,38 @@ func lowerPrefixLen(s, prefix string) int {
 		}
 		i += width
 		j += pw
+	}
+	return i
+}
+
+// lowerSuffixStart is lowerPrefixLen's backwards counterpart. The returned
+// offset belongs to the original input: Unicode lowercasing can change byte
+// widths (for example İ becomes i), so subtracting len(suffix) is insufficient.
+func lowerSuffixStart(s, suffix string) int {
+	i, j := len(s), len(suffix)
+	for j > 0 {
+		if i == 0 {
+			return -1
+		}
+		c := s[i-1]
+		if c < utf8.RuneSelf && suffix[j-1] < utf8.RuneSelf {
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			if c != suffix[j-1] {
+				return -1
+			}
+			i--
+			j--
+			continue
+		}
+		r, width := utf8.DecodeLastRuneInString(s[:i])
+		p, pw := utf8.DecodeLastRuneInString(suffix[:j])
+		if unicode.ToLower(r) != p {
+			return -1
+		}
+		i -= width
+		j -= pw
 	}
 	return i
 }
