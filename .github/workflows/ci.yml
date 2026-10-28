@@ -76,6 +76,49 @@ jobs:
           go tool cover -func=coverage.out -o coverage.txt
           tail -1 coverage.txt >> $GITHUB_STEP_SUMMARY
 
+  browser-tests:
+    name: Browser workspaces (Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: '**/go.sum'
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: cmd/query_files_wasm/package-lock.json
+
+      - name: Install browser test dependencies
+        working-directory: cmd/query_files_wasm
+        run: npm ci
+
+      - name: Install Chromium
+        working-directory: cmd/query_files_wasm
+        run: npx playwright install --with-deps chromium
+
+      - name: Test imports and workspace persistence
+        run: make test-query-files-browser
+
+      - name: Upload browser failure diagnostics
+        if: ${{ failure() && !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-test-failures
+          path: |
+            cmd/query_files_wasm/playwright-report/
+            cmd/query_files_wasm/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
   # This intentionally runs independently of the main test job: TinyGo is an
   # optional release compiler, so its smoke test must not extend the critical
   # path of Go tests. It skips wasm-opt, whose output-size work is validated

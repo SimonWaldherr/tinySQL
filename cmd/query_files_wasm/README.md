@@ -113,6 +113,41 @@ GOOS=js GOARCH=wasm go test -exec "$(go env GOROOT)/lib/wasm/go_js_wasm_exec" \
   ./internal/importer -run '^$' -bench '^BenchmarkFuzzyImportCSV$' -benchmem
 ```
 
+### Browser integration tests
+
+Install the pinned Playwright dependencies and Chromium once (Node.js 20+ and
+Go are required):
+
+```bash
+cd cmd/query_files_wasm
+npm ci
+npx playwright install chromium
+cd ../..
+make test-query-files-browser
+```
+
+On Linux, use `npx playwright install --with-deps chromium` to also install
+Chromium's system libraries. CI runs these tests in its own job and uploads
+the HTML report, failure screenshots and traces when a test fails.
+
+The test server builds the `no_http` WASM module and matching Go runtime into
+a temporary directory, serves the real application on `127.0.0.1:4173`, and
+removes those assets when it stops. Set `TINYSQL_BROWSER_PORT` to use a different
+port. Each test gets an isolated browser context; reloads within a test retain
+its actual IndexedDB and OPFS data. Optional CDN libraries are blocked, so the
+CSV/JSON import and normal table-view tests do not depend on external services.
+
+The suite covers CSV/JSONL file uploads, autosave and reload, switching between
+workspaces with the same table name, recovery from a corrupt generation,
+blocked writes after unrecoverable snapshots, and a snapshot above the 8 MiB
+OPFS threshold. It uses the storage API only to inspect saved generations and
+seed corrupt input; imports, queries and workspace changes go through the UI
+and the real WASM worker. Assertions wait for visible results or committed
+snapshots rather than sleeping for a fixed autosave delay.
+
+For debugging, run `npm run test:browser -- --headed` in this directory or
+`npx playwright show-report` after a run.
+
 ## Recent engine features in the demo
 
 The **Text columns** starter recipe demonstrates `TEXT_TO_COLUMNS(text,

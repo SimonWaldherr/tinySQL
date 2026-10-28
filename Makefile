@@ -7,7 +7,7 @@ SHELL := /usr/bin/env bash
 .PHONY: build-query-files build-query-files-wasm build-fsql run-query-files-demo
 .PHONY: build-gh-pages-demo check-gh-pages-demo update-gh-pages push-gh-pages
 .PHONY: test-all test-unit test-integration test-jsonv2 test-ci coverage build-check wasm-check wasm-smoke tinygo-wasm ci verify verify-ci
-.PHONY: test-query-files test-query-files-wasm test-fsql test-gorm test-sqlpackages test-sql-compat test-server
+.PHONY: test-query-files test-query-files-wasm test-query-files-browser test-fsql test-gorm test-sqlpackages test-sql-compat test-server
 .PHONY: run-wasm-browser run-wasm-node-demo deps deps-all update-deps tidy tidy-all modules-tidy-check modules-verify bench bench-engine bench-hotpaths bench-stream bench-stream-guard release-check script-lint docker-build info
 .DEFAULT_GOAL := help
 
@@ -354,6 +354,10 @@ test-query-files-wasm:
 		GOOS=js GOARCH=wasm $(GO) test $(filter-out -race,$(GO_TEST_FLAGS)) -tags no_http \
 			-exec "$$($(GO) env GOROOT)/lib/wasm/go_js_wasm_exec" ./...; \
 	else echo "$(YELLOW)node not installed; skipping query_files_wasm JavaScript and WASM tests$(NC)"; fi
+
+## test-query-files-browser: Run browser workspace integration tests (requires npm ci and Playwright Chromium)
+test-query-files-browser:
+	cd $(QUERY_FILES_WASM_DIR) && npm run test:browser
 
 ## coverage: Generate and view test coverage report
 coverage: test-all

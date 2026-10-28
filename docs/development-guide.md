@@ -42,6 +42,7 @@ act workflow_dispatch -W .github/workflows/local-act.yml
 | `make test-jsonv2` | Storage/engine persistence tests against Go's experimental JSON v2 — a compatibility gate, not a production default. |
 | `make test-query-files` / `make test-fsql` | Standalone query-files and filesystem-query module tests. |
 | `make test-query-files-wasm` | Tests inside `cmd/query_files_wasm`. |
+| `make test-query-files-browser` | Real Chromium import, snapshot recovery and workspace-switching tests; requires the browser test dependencies described in the module README. |
 | `make wasm-check` | Compile the standard-Go browser, Node, and query-files WebAssembly targets without retaining artifacts. |
 | `make tinygo-wasm` | Build and execute the Node WASM smoke test using the pinned TinyGo Docker image. |
 | `make ci` | The complete standard-Go GitHub Actions matrix: formatting, module verification, native/WASM builds, vet, tests, race detection, and coverage. |
