@@ -20,6 +20,14 @@ make ci
 make build-all
 ```
 
+Pushes and pull requests use `.github/workflows/ci.yml`. The smaller
+`Local CI (act)` workflow is manual so it does not duplicate the standard CI
+matrix on GitHub. To run it with a local Docker daemon:
+
+```bash
+act workflow_dispatch -W .github/workflows/local-act.yml
+```
+
 | Target | Purpose |
 |---|---|
 | `make build` | Build `cmd/tinysql` into `bin/tinysql`. |

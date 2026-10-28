@@ -1,6 +1,12 @@
 name: Local CI (act)
 
-on: [push, pull_request]
+# Run locally with: act workflow_dispatch -W .github/workflows/local-act.yml
+# Pushes and pull requests are covered by ci.yml.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
