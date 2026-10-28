@@ -31,9 +31,14 @@ async function main() {
   assert.deepEqual(result.columns, ['id', 'label', 'active']);
   assert.deepEqual(result.rows, expected); // Exercises the bulk result bridge.
   assert.deepEqual(success(db.query('SELECT id FROM items WHERE id = -1')).rows, []);
-  assert.deepEqual(success(db.query("SELECT HTML_ESCAPE('<b>&</b>') AS escaped")).rows, [['&lt;b&gt;&amp;&lt;/b&gt;']]);
+  const escaped = db.query("SELECT HTML_ESCAPE('<b>&</b>') AS escaped");
+  if (process.argv[4] === 'tinygo') {
+    assert.ok(escaped.error, 'TinyGo HTML escaping must report an error');
+  } else {
+    assert.deepEqual(success(escaped).rows, [['&lt;b&gt;&amp;&lt;/b&gt;']]);
+  }
   const template = db.query(`SELECT HTML_TEMPLATE('<b>{{.name}}</b>', '{"name":"x"}') AS rendered`);
-  if (process.argv[4] === 'minimal') {
+  if (process.argv[4] === 'minimal' || process.argv[4] === 'tinygo') {
     assert.ok(template.error, 'minimal templates must report an error');
     assert.ok(db.query("SELECT HTTP('https://example.com')").error, 'minimal HTTP must report an error');
   } else {

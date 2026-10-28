@@ -29,7 +29,8 @@ STREAM_FIRST_ROW_MAX_NS ?= 50000000
 STREAM_FIRST_ROW_MAX_B ?= 262144
 WASM_BROWSER_SCRIPT := ./$(CMD_DIR)/wasm_browser/build.sh
 WASM_NODE_SCRIPT := ./$(CMD_DIR)/wasm_node/build.sh
-TINYGO_IMAGE ?= tinygo/tinygo:0.41.1
+# TinyGo 0.42 adds support for the Go 1.27 toolchain used by this module.
+TINYGO_IMAGE ?= tinygo/tinygo:0.42.0
 TINYGO_PATH := /usr/local/tinygo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 TINYGO_DOCKER_USER := $(shell id -u):$(shell id -g)
 QUERY_FILES_DIR := ./$(CMD_DIR)/query_files
@@ -155,8 +156,8 @@ tinygo-wasm:
 		--volume "$(CURDIR):/src" \
 		--workdir /src/cmd/wasm_node \
 		$(TINYGO_IMAGE) \
-		sh -c 'WASM_COMPILER=tinygo WASM_OPTIMIZE=false ./build.sh --build-only'; \
-	node cmd/wasm_node/wasm_runner.js query 'SELECT 1 AS ready'
+		sh -c 'tinygo version && WASM_COMPILER=tinygo WASM_OPTIMIZE=false ./build.sh --build-only'; \
+	node scripts/wasm-smoke.js cmd/wasm_node/tinySQL.wasm cmd/wasm_node/wasm_exec.js tinygo
 
 ## build-query-files: Build standalone query_files CLI
 build-query-files:

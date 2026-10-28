@@ -7,6 +7,9 @@ WebAssembly apps needing a real SQL engine without a separate service.
 TinyGo build constraints are applied automatically — no fork, no special import
 path.
 
+Use TinyGo 0.42.0 or newer with the repository's Go 1.27 toolchain. TinyGo
+0.41.1 supports Go only through 1.26; the Docker smoke test pins 0.42.0.
+
 ## Smoke test
 
 ```bash
@@ -39,6 +42,8 @@ make tinygo-wasm
 
 It explicitly preserves the image's TinyGo and Go binary paths, avoiding
 shell-profile differences between local Docker and GitHub Actions runners.
+The smoke test asserts query results, transactions and snapshot round trips,
+and verifies the expected errors for features unavailable on TinyGo.
 
 The smallest supported embedded integration: create an in-memory database,
 parse SQL, execute a query.
@@ -51,7 +56,9 @@ result, err := tinysql.Execute(context.Background(), db, "default", stmt)
 
 ## Target support
 
-Verified with TinyGo 0.41.1 against the complete tinySQL feature set:
+The following target results were recorded with TinyGo 0.41.1 and Go 1.26.
+Current CI checks WASM with TinyGo 0.42.0 and Go 1.27; bare-metal targets
+should be rechecked with that toolchain before deployment.
 
 | Target | Result | Notes |
 |---|---|---|
