@@ -144,6 +144,7 @@ func executeAggregateBatches(env ExecEnv, plan *simpleAggregatePlan, source *sim
 	// Once a runtime value needs scalar handling, retain that path for the
 	// rest of the query: a state may now contain an exact rational accumulator.
 	scalar := false
+	needsFilter := source.where != nil && !source.filterFullyCovered
 	for start := 0; start < n; start += aggregateBatchSize {
 		count := 0
 		for i := start; i < min(start+aggregateBatchSize, n); i++ {
@@ -159,15 +160,17 @@ func executeAggregateBatches(env ExecEnv, plan *simpleAggregatePlan, source *sim
 			if id < 0 || id >= len(rows) {
 				return nil, true, fmt.Errorf("index %q returned invalid row id %d", source.indexName, id)
 			}
-			var match bool
-			var err error
-			if source.filter != nil {
-				match, err = source.filter(rows[id])
-			} else {
-				match, err = evalRawWhere(source, rows[id])
-			}
-			if err != nil {
-				return nil, true, err
+			match := true
+			if needsFilter {
+				var err error
+				if source.filter != nil {
+					match, err = source.filter(rows[id])
+				} else {
+					match, err = evalRawWhere(source, rows[id])
+				}
+				if err != nil {
+					return nil, true, err
+				}
 			}
 			if match {
 				selected[count] = id

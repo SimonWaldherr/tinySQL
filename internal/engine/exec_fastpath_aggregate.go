@@ -252,6 +252,7 @@ func executeSimpleSingleGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, r
 	if rawPlan.rowIDs != nil {
 		rowCount = len(rawPlan.rowIDs)
 	}
+	needsFilter := rawPlan.where != nil && !rawPlan.filterFullyCovered
 	for i := 0; i < rowCount; i++ {
 		rowID := i
 		if rawPlan.rowIDs != nil {
@@ -267,15 +268,17 @@ func executeSimpleSingleGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, r
 				return nil, true, err
 			}
 		}
-		var match bool
-		var err error
-		if rawPlan.filter != nil {
-			match, err = rawPlan.filter(raw)
-		} else {
-			match, err = evalRawWhere(rawPlan, raw)
-		}
-		if err != nil {
-			return nil, true, err
+		match := true
+		if needsFilter {
+			var err error
+			if rawPlan.filter != nil {
+				match, err = rawPlan.filter(raw)
+			} else {
+				match, err = evalRawWhere(rawPlan, raw)
+			}
+			if err != nil {
+				return nil, true, err
+			}
 		}
 		if !match {
 			continue
@@ -302,6 +305,7 @@ func executeSimpleMultiGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, ra
 	if rawPlan.rowIDs != nil {
 		rowCount = len(rawPlan.rowIDs)
 	}
+	needsFilter := rawPlan.where != nil && !rawPlan.filterFullyCovered
 	for rowIdx := 0; rowIdx < rowCount; rowIdx++ {
 		rowID := rowIdx
 		if rawPlan.rowIDs != nil {
@@ -316,15 +320,17 @@ func executeSimpleMultiGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, ra
 				return nil, true, err
 			}
 		}
-		var match bool
-		var err error
-		if rawPlan.filter != nil {
-			match, err = rawPlan.filter(raw)
-		} else {
-			match, err = evalRawWhere(rawPlan, raw)
-		}
-		if err != nil {
-			return nil, true, err
+		match := true
+		if needsFilter {
+			var err error
+			if rawPlan.filter != nil {
+				match, err = rawPlan.filter(raw)
+			} else {
+				match, err = evalRawWhere(rawPlan, raw)
+			}
+			if err != nil {
+				return nil, true, err
+			}
 		}
 		if !match {
 			continue

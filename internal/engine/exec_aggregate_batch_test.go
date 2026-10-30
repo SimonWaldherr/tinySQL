@@ -146,6 +146,7 @@ func TestAggregateBatchCandidatesAndCancellation(t *testing.T) {
 	defer cancel()
 	env.ctx = ctx
 	calls := 0
+	source.where = &Literal{Val: true}
 	source.filter = func([]any) (bool, error) {
 		calls++
 		if calls == 70 {
