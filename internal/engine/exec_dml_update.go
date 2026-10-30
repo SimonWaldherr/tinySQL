@@ -316,7 +316,13 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 				return nil, true, err
 			}
 		}
-		match, err := evalRawWhere(rawPlan, raw)
+		var match bool
+		var err error
+		if rawPlan.filter != nil {
+			match, err = rawPlan.filter(raw)
+		} else {
+			match, err = evalRawWhere(rawPlan, raw)
+		}
 		if err != nil {
 			return nil, true, err
 		}

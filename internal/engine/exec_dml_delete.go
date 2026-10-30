@@ -117,7 +117,13 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 					return nil, err
 				}
 			}
-			match, err := evalRawWhere(rawPlan, r)
+			var match bool
+			var err error
+			if rawPlan.filter != nil {
+				match, err = rawPlan.filter(r)
+			} else {
+				match, err = evalRawWhere(rawPlan, r)
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -230,7 +236,13 @@ func executeConstraintPointDelete(env ExecEnv, s *Delete, table *storage.Table, 
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
 		}
-		match, err := evalRawWhere(rawPlan, table.Rows[rowID])
+		var match bool
+		var err error
+		if rawPlan.filter != nil {
+			match, err = rawPlan.filter(table.Rows[rowID])
+		} else {
+			match, err = evalRawWhere(rawPlan, table.Rows[rowID])
+		}
 		if err != nil {
 			return nil, err
 		}

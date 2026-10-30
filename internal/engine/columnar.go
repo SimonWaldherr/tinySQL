@@ -127,7 +127,11 @@ func executeSimpleColumnarSelect(env ExecEnv, s *Select, out *ColumnarResultSet)
 		}
 		match := plan.where == nil || plan.filterFullyCovered
 		if !match {
-			match, err = evalRawWhere(plan, rows[id])
+			if plan.filter != nil {
+				match, err = plan.filter(rows[id])
+			} else {
+				match, err = evalRawWhere(plan, rows[id])
+			}
 			if err != nil {
 				return true, err
 			}

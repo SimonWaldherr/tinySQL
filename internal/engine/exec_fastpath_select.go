@@ -86,7 +86,11 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 		match := plan.filterFullyCovered
 		if !match {
 			var err error
-			match, err = evalRawWhere(plan, raw)
+			if plan.filter != nil {
+				match, err = plan.filter(raw)
+			} else {
+				match, err = evalRawWhere(plan, raw)
+			}
 			if err != nil {
 				return nil, true, err
 			}
@@ -212,7 +216,11 @@ func executeSimpleSelectDistinctFastPath(env ExecEnv, plan *simpleSelectPlan) (*
 		match := plan.filterFullyCovered
 		if !match {
 			var err error
-			match, err = evalRawWhere(plan, raw)
+			if plan.filter != nil {
+				match, err = plan.filter(raw)
+			} else {
+				match, err = evalRawWhere(plan, raw)
+			}
 			if err != nil {
 				return nil, true, err
 			}
@@ -570,7 +578,13 @@ func executeSimpleSelectFloatScoredTopN(env ExecEnv, plan *simpleSelectPlan, sou
 				return nil, err
 			}
 		}
-		match, err := evalRawWhere(plan, raw)
+		var match bool
+		var err error
+		if plan.filter != nil {
+			match, err = plan.filter(raw)
+		} else {
+			match, err = evalRawWhere(plan, raw)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -813,7 +827,13 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 				return nil, true, err
 			}
 		}
-		match, err := evalRawWhere(plan, raw)
+		var match bool
+		var err error
+		if plan.filter != nil {
+			match, err = plan.filter(raw)
+		} else {
+			match, err = evalRawWhere(plan, raw)
+		}
 		if err != nil {
 			return nil, true, err
 		}

@@ -235,8 +235,92 @@ func buildRawFilterSpecialized(colIndex map[string]int, e Expr) func([]any) (boo
 		return buildRawFilterRegexp(colIndex, ex)
 	case *InExpr:
 		return buildRawFilterIn(colIndex, ex)
+	case *BetweenExpr:
+		return buildRawFilterBetween(colIndex, ex)
 	case *FuncCall:
 		return buildRawFilterFuncCall(colIndex, ex)
+	}
+	return nil
+}
+
+// buildRawFilterBetween compiles a BETWEEN expression into a specialized
+// closure that reads the column once per row and compares against pre-typed
+// bounds, avoiding the three evalRawExpr calls of the generic evalRawBetween.
+func buildRawFilterBetween(colIndex map[string]int, ex *BetweenExpr) func([]any) (bool, error) {
+	ref, ok := ex.Expr.(*VarRef)
+	if !ok {
+		return nil
+	}
+	colIdx, ok := colIndex[strings.ToLower(ref.Name)]
+	if !ok {
+		return nil
+	}
+	loLit, ok := ex.Lo.(*Literal)
+	if !ok || loLit.Parameter {
+		return nil
+	}
+	hiLit, ok := ex.Hi.(*Literal)
+	if !ok || hiLit.Parameter {
+		return nil
+	}
+	negate := ex.Negate
+	// Integer bounds: compare in int64 space for int/int64 columns, float64 for float columns.
+	if low, ok := rangeIntegerBound(loLit.Val); ok {
+		if high, ok := rangeIntegerBound(hiLit.Val); ok {
+			return func(raw []any) (bool, error) {
+				switch v := raw[colIdx].(type) {
+				case int:
+					m := int64(v) >= low && int64(v) <= high
+					if negate {
+						return !m, nil
+					}
+					return m, nil
+				case int64:
+					m := v >= low && v <= high
+					if negate {
+						return !m, nil
+					}
+					return m, nil
+				case float64:
+					m := v >= float64(low) && v <= float64(high)
+					if negate {
+						return !m, nil
+					}
+					return m, nil
+				}
+				return negate, nil
+			}
+		}
+	}
+	if low, ok := loLit.Val.(float64); ok {
+		if high, ok := hiLit.Val.(float64); ok {
+			return func(raw []any) (bool, error) {
+				v, ok := numericFast(raw[colIdx])
+				if !ok {
+					return negate, nil
+				}
+				m := v >= low && v <= high
+				if negate {
+					return !m, nil
+				}
+				return m, nil
+			}
+		}
+	}
+	if low, ok := loLit.Val.(string); ok {
+		if high, ok := hiLit.Val.(string); ok {
+			return func(raw []any) (bool, error) {
+				v, ok := raw[colIdx].(string)
+				if !ok {
+					return negate, nil
+				}
+				m := v >= low && v <= high
+				if negate {
+					return !m, nil
+				}
+				return m, nil
+			}
+		}
 	}
 	return nil
 }
@@ -880,6 +964,12 @@ func reverseComparisonOp(op string) string {
 func buildColLiteralFilter(colIdx int, op string, litVal any) func([]any) (bool, error) {
 	switch op {
 	case "=":
+		if bv, ok := litVal.(bool); ok {
+			return func(raw []any) (bool, error) {
+				a, ok := raw[colIdx].(bool)
+				return ok && a == bv, nil
+			}
+		}
 		return func(raw []any) (bool, error) {
 			a := raw[colIdx]
 			if a == nil || litVal == nil {
@@ -888,6 +978,12 @@ func buildColLiteralFilter(colIdx int, op string, litVal any) func([]any) (bool,
 			return rawEqual(a, litVal), nil
 		}
 	case "!=", "<>":
+		if bv, ok := litVal.(bool); ok {
+			return func(raw []any) (bool, error) {
+				a, ok := raw[colIdx].(bool)
+				return ok && a != bv, nil
+			}
+		}
 		return func(raw []any) (bool, error) {
 			a := raw[colIdx]
 			if a == nil || litVal == nil {

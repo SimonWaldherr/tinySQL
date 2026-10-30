@@ -159,7 +159,13 @@ func executeAggregateBatches(env ExecEnv, plan *simpleAggregatePlan, source *sim
 			if id < 0 || id >= len(rows) {
 				return nil, true, fmt.Errorf("index %q returned invalid row id %d", source.indexName, id)
 			}
-			match, err := evalRawWhere(source, rows[id])
+			var match bool
+			var err error
+			if source.filter != nil {
+				match, err = source.filter(rows[id])
+			} else {
+				match, err = evalRawWhere(source, rows[id])
+			}
 			if err != nil {
 				return nil, true, err
 			}

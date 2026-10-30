@@ -267,7 +267,13 @@ func executeSimpleSingleGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, r
 				return nil, true, err
 			}
 		}
-		match, err := evalRawWhere(rawPlan, raw)
+		var match bool
+		var err error
+		if rawPlan.filter != nil {
+			match, err = rawPlan.filter(raw)
+		} else {
+			match, err = evalRawWhere(rawPlan, raw)
+		}
 		if err != nil {
 			return nil, true, err
 		}
@@ -310,7 +316,13 @@ func executeSimpleMultiGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, ra
 				return nil, true, err
 			}
 		}
-		match, err := evalRawWhere(rawPlan, raw)
+		var match bool
+		var err error
+		if rawPlan.filter != nil {
+			match, err = rawPlan.filter(raw)
+		} else {
+			match, err = evalRawWhere(rawPlan, raw)
+		}
 		if err != nil {
 			return nil, true, err
 		}

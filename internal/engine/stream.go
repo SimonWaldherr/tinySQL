@@ -410,7 +410,12 @@ func streamSmallSelect(ctx context.Context, db *storage.DB, tenant string, sel *
 			match := plan.filterFullyCovered
 			if !match {
 				var err error
-				if match, err = evalRawWhere(plan, raw); err != nil {
+				if plan.filter != nil {
+					match, err = plan.filter(raw)
+				} else {
+					match, err = evalRawWhere(plan, raw)
+				}
+				if err != nil {
 					evalErr = err
 					return
 				}
@@ -552,7 +557,12 @@ func streamSmallPagedSelect(ctx context.Context, db *storage.DB, tenant string, 
 				scanned++
 				match := plan.filterFullyCovered
 				if !match {
-					if match, err = evalRawWhere(plan, raw); err != nil {
+					if plan.filter != nil {
+						match, err = plan.filter(raw)
+					} else {
+						match, err = evalRawWhere(plan, raw)
+					}
+					if err != nil {
 						evalErr = err
 						return
 					}
@@ -806,7 +816,11 @@ func streamSimpleSelectPlanFrom(stream *ResultStream, plan *simpleSelectPlan, db
 		match := plan.filterFullyCovered
 		if !match {
 			var err error
-			match, err = evalRawWhere(plan, raw)
+			if plan.filter != nil {
+				match, err = plan.filter(raw)
+			} else {
+				match, err = evalRawWhere(plan, raw)
+			}
 			if err != nil {
 				return err
 			}
@@ -899,7 +913,11 @@ func streamPagedSimpleSelectPlan(stream *ResultStream, plan *simpleSelectPlan, d
 			}
 			match := plan.filterFullyCovered
 			if !match {
-				match, err = evalRawWhere(plan, raw)
+				if plan.filter != nil {
+					match, err = plan.filter(raw)
+				} else {
+					match, err = evalRawWhere(plan, raw)
+				}
 				if err != nil {
 					return err
 				}

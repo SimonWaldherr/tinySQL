@@ -291,7 +291,13 @@ func (s *querySubscriptionState) refresh(ctx context.Context) (result *QueryChan
 			}
 		}
 		change.ScannedRows++
-		match, err := evalRawWhere(template, table.Rows[i])
+		var match bool
+		var err error
+		if template.filter != nil {
+			match, err = template.filter(table.Rows[i])
+		} else {
+			match, err = evalRawWhere(template, table.Rows[i])
+		}
 		if err != nil {
 			return nil, err
 		}
