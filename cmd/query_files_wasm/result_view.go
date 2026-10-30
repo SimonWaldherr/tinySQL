@@ -150,10 +150,14 @@ func newResultViewSortValue(value any) resultViewSortValue {
 		return resultViewSortValue{isNil: true}
 	}
 	number, isNumber := resultViewNumber(value)
+	text, isString := value.(string)
+	if !isString {
+		text = fmt.Sprint(value)
+	}
 	return resultViewSortValue{
 		isNumber: isNumber,
 		number:   number,
-		text:     strings.ToLower(fmt.Sprint(value)),
+		text:     strings.ToLower(text),
 	}
 }
 

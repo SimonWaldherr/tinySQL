@@ -216,6 +216,8 @@ func buildRawRowToTextAndFilter(colIndex map[string]int, e Expr) func([]any) (bo
 // access plus a comparison) and runs first, while an expression that only
 // evaluates through the evalRawExpr fallback (typically a function call
 // such as a vector distance) runs second, only on rows that survive.
+// Column BETWEEN parses into Binary comparisons; explicit BetweenExpr nodes
+// retain the expression evaluator's NULL, NaN and mixed-type semantics.
 func buildRawFilterSpecialized(colIndex map[string]int, e Expr) func([]any) (bool, error) {
 	if e == nil {
 		return func([]any) (bool, error) { return true, nil }
@@ -235,92 +237,8 @@ func buildRawFilterSpecialized(colIndex map[string]int, e Expr) func([]any) (boo
 		return buildRawFilterRegexp(colIndex, ex)
 	case *InExpr:
 		return buildRawFilterIn(colIndex, ex)
-	case *BetweenExpr:
-		return buildRawFilterBetween(colIndex, ex)
 	case *FuncCall:
 		return buildRawFilterFuncCall(colIndex, ex)
-	}
-	return nil
-}
-
-// buildRawFilterBetween compiles a BETWEEN expression into a specialized
-// closure that reads the column once per row and compares against pre-typed
-// bounds, avoiding the three evalRawExpr calls of the generic evalRawBetween.
-func buildRawFilterBetween(colIndex map[string]int, ex *BetweenExpr) func([]any) (bool, error) {
-	ref, ok := ex.Expr.(*VarRef)
-	if !ok {
-		return nil
-	}
-	colIdx, ok := colIndex[strings.ToLower(ref.Name)]
-	if !ok {
-		return nil
-	}
-	loLit, ok := ex.Lo.(*Literal)
-	if !ok || loLit.Parameter {
-		return nil
-	}
-	hiLit, ok := ex.Hi.(*Literal)
-	if !ok || hiLit.Parameter {
-		return nil
-	}
-	negate := ex.Negate
-	// Integer bounds: compare in int64 space for int/int64 columns, float64 for float columns.
-	if low, ok := rangeIntegerBound(loLit.Val); ok {
-		if high, ok := rangeIntegerBound(hiLit.Val); ok {
-			return func(raw []any) (bool, error) {
-				switch v := raw[colIdx].(type) {
-				case int:
-					m := int64(v) >= low && int64(v) <= high
-					if negate {
-						return !m, nil
-					}
-					return m, nil
-				case int64:
-					m := v >= low && v <= high
-					if negate {
-						return !m, nil
-					}
-					return m, nil
-				case float64:
-					m := v >= float64(low) && v <= float64(high)
-					if negate {
-						return !m, nil
-					}
-					return m, nil
-				}
-				return negate, nil
-			}
-		}
-	}
-	if low, ok := loLit.Val.(float64); ok {
-		if high, ok := hiLit.Val.(float64); ok {
-			return func(raw []any) (bool, error) {
-				v, ok := numericFast(raw[colIdx])
-				if !ok {
-					return negate, nil
-				}
-				m := v >= low && v <= high
-				if negate {
-					return !m, nil
-				}
-				return m, nil
-			}
-		}
-	}
-	if low, ok := loLit.Val.(string); ok {
-		if high, ok := hiLit.Val.(string); ok {
-			return func(raw []any) (bool, error) {
-				v, ok := raw[colIdx].(string)
-				if !ok {
-					return negate, nil
-				}
-				m := v >= low && v <= high
-				if negate {
-					return !m, nil
-				}
-				return m, nil
-			}
-		}
 	}
 	return nil
 }
@@ -363,6 +281,21 @@ func buildRawFilterVarRef(colIndex map[string]int, ex *VarRef) func([]any) (bool
 func buildRawFilterUnary(colIndex map[string]int, ex *Unary) func([]any) (bool, error) {
 	if ex.Op != "NOT" {
 		return nil
+	}
+	if ref, ok := ex.Expr.(*VarRef); ok {
+		key := ref.Lower
+		if key == "" {
+			key = strings.ToLower(ref.Name)
+		}
+		if column, ok := colIndex[key]; ok {
+			return func(raw []any) (bool, error) {
+				if column < 0 || column >= len(raw) {
+					return false, fmt.Errorf("column %q is out of range", ref.Name)
+				}
+				// UNKNOWN stays excluded; only SQL FALSE becomes TRUE.
+				return toTri(raw[column]) == tvFalse, nil
+			}
+		}
 	}
 	// ISNULL always returns a boolean, so its negation can safely share the
 	// direct IS NOT NULL column check without collapsing SQL UNKNOWN.
@@ -980,8 +913,9 @@ func buildColLiteralFilter(colIdx int, op string, litVal any) func([]any) (bool,
 	case "!=", "<>":
 		if bv, ok := litVal.(bool); ok {
 			return func(raw []any) (bool, error) {
-				a, ok := raw[colIdx].(bool)
-				return ok && a != bv, nil
+				value := raw[colIdx]
+				a, ok := value.(bool)
+				return value != nil && (!ok || a != bv), nil
 			}
 		}
 		return func(raw []any) (bool, error) {
