@@ -62,8 +62,14 @@ func buildResultPage(result *tinysql.ResultSet, offset, limit int, filterText, s
 	return sliceResultPage(result, rowIndexes, offset, limit)
 }
 
+// A nil index means all rows in their original order. An empty, non-nil index
+// means the filter matched no rows.
 func buildResultRowIndexes(result *tinysql.ResultSet, filterNeedle, sortColumn, sortDirection string) []int {
 	if result == nil {
+		return nil
+	}
+	sortRows := sortColumn != "" && resultHasColumn(result, sortColumn)
+	if filterNeedle == "" && !sortRows {
 		return nil
 	}
 
@@ -86,7 +92,7 @@ func buildResultRowIndexes(result *tinysql.ResultSet, filterNeedle, sortColumn, 
 		return rowIndexes
 	}
 
-	if sortColumn != "" && resultHasColumn(result, sortColumn) {
+	if sortRows {
 		descending := strings.EqualFold(sortDirection, "desc")
 		sortKey := strings.ToLower(sortColumn)
 		// When most rows match, sorting integer indexes is cheaper than moving
@@ -199,6 +205,9 @@ func sliceResultPage(result *tinysql.ResultSet, rowIndexes []int, offset, limit 
 	}
 
 	filteredRows := len(rowIndexes)
+	if rowIndexes == nil {
+		filteredRows = len(result.Rows)
+	}
 	if offset > filteredRows {
 		offset = filteredRows
 	}
@@ -208,8 +217,12 @@ func sliceResultPage(result *tinysql.ResultSet, rowIndexes []int, offset, limit 
 	}
 
 	rows := make([]tinysql.Row, 0, end-offset)
-	for _, index := range rowIndexes[offset:end] {
-		rows = append(rows, result.Rows[index])
+	if rowIndexes == nil {
+		rows = append(rows, result.Rows[offset:end]...)
+	} else {
+		for _, index := range rowIndexes[offset:end] {
+			rows = append(rows, result.Rows[index])
+		}
 	}
 	return resultPage{
 		Rows:         rows,

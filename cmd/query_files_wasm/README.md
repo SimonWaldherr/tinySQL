@@ -102,8 +102,12 @@ Node's WASM runtime:
 cd cmd/query_files_wasm
 GOOS=js GOARCH=wasm go test -tags no_http \
   -exec "$(go env GOROOT)/lib/wasm/go_js_wasm_exec" \
-  -run '^$' -bench '^Benchmark(BuildResultRowIndexesFilteredSort|ResultSortColumnKeys|ResultFilterUppercaseColumns|ResultViewCaseInsensitiveFilter|ResultConversion|StreamChunkEmission|SplitStatements)$' -benchmem
+  -run '^$' -bench '^Benchmark(ResultFirstPage|BuildResultRowIndexesFilteredSort|ResultSortColumnKeys|ResultFilterUppercaseColumns|ResultViewCaseInsensitiveFilter|ResultConversion|StreamChunkEmission|SplitStatements)$' -benchmem
 ```
+
+`BenchmarkResultFirstPage` measures paging an already materialized result,
+excluding SQL execution, JavaScript conversion, and rendering. Sizes above
+10,000 rows are scaling controls beyond the default browser preview limit.
 
 The shared CSV importer can also be measured as a complete WASM import from
 the repository root:
