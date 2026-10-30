@@ -457,7 +457,11 @@ func selectConstraintIndex(table *storage.Table, colIndex map[string]int, where 
 		return nil, "", false, false
 	}
 	equalities := make(map[int]any)
-	totalTerms := collectConstraintEqualityTerms(where, table, colIndex, equalities, false)
+	collectConstraintEqualityTerms(where, table, colIndex, equalities, false)
+	// Only a single equality can be fully covered by this point lookup.
+	// Counting extracted equalities misses other predicates such as IS NULL.
+	predicate, single := where.(*Binary)
+	residual := !single || predicate.Op != "="
 	for colIdx, value := range equalities {
 		if colIdx < 0 || colIdx >= len(table.Cols) {
 			continue
@@ -472,7 +476,7 @@ func selectConstraintIndex(table *storage.Table, colIndex map[string]int, where 
 		if rows == nil {
 			rows = []int{}
 		}
-		return rows, column.Name, totalTerms != 1, true
+		return rows, column.Name, residual, true
 	}
 	return nil, "", false, false
 }
