@@ -2,6 +2,7 @@ package importer
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/csv"
 	"encoding/json"
@@ -660,6 +661,13 @@ func fixCommonJSONIssues(s string) string {
 //
 //nolint:gocyclo // Fuzzy JSON import applies numerous fallback parsing strategies.
 func fuzzyParseJSONInput(dataStr string, opts *FuzzyImportOptions) ([]map[string]interface{}, error) {
+	if hasJSONLinesPrefix(dataStr) {
+		records, err := parseLineDelimitedJSON(dataStr, opts)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse JSON: %v", err)
+		}
+		return records, nil
+	}
 	var records []map[string]interface{}
 	if err := json.Unmarshal([]byte(dataStr), &records); err == nil {
 		return records, nil
@@ -689,6 +697,17 @@ func fuzzyParseJSONInput(dataStr string, opts *FuzzyImportOptions) ([]map[string
 	return recs, nil
 }
 
+// A complete object on the first nonblank line followed by more content cannot
+// be one JSON document. Pretty-printed documents retain whole-document parsing.
+func hasJSONLinesPrefix(data string) bool {
+	data = strings.TrimSpace(data)
+	if !strings.HasPrefix(data, "{") {
+		return false
+	}
+	end := strings.IndexAny(data, "\r\n")
+	return end >= 0 && json.Valid([]byte(strings.TrimSpace(data[:end])))
+}
+
 // fuzzyJSONColumnNames extracts all unique keys from a slice of records.
 func fuzzyJSONColumnNames(records []map[string]interface{}) []string {
 	columnSet := make(map[string]bool)
@@ -710,8 +729,12 @@ func fuzzyBuildJSONSampleData(records []map[string]interface{}, columnNames []st
 	for ri, rec := range records {
 		row := make([]string, len(columnNames))
 		for ci, colName := range columnNames {
-			if v, ok := rec[colName]; ok {
-				row[ci] = fmt.Sprint(v)
+			if v, ok := rec[colName]; ok && v != nil {
+				if text, ok := v.(string); ok {
+					row[ci] = text
+				} else {
+					row[ci] = fmt.Sprint(v)
+				}
 			}
 		}
 		sampleData[ri] = row
@@ -782,7 +805,10 @@ func FuzzyImportJSON(
 
 	columnNames := fuzzyJSONColumnNames(records)
 	numCols := len(columnNames)
-	sampleData := fuzzyBuildJSONSampleData(records, columnNames)
+	var sampleData [][]string
+	if opts.TypeInference {
+		sampleData = fuzzyBuildJSONSampleData(records, columnNames)
+	}
 	colTypes := fuzzyPrepareColumnTypes(sampleData, numCols, opts)
 
 	columns := make([]storage.Column, numCols)
@@ -844,16 +870,16 @@ func parseLineDelimitedJSON(data string, opts *FuzzyImportOptions) ([]map[string
 
 	for scanner.Scan() {
 		lineNum++
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
 			continue
 		}
 
 		var record map[string]interface{}
-		err := json.Unmarshal([]byte(line), &record)
+		err := json.Unmarshal(line, &record)
 		if err != nil {
 			if opts.FuzzyJSON {
-				fixed := fixCommonJSONIssues(line)
+				fixed := fixCommonJSONIssues(string(line))
 				if err2 := json.Unmarshal([]byte(fixed), &record); err2 == nil {
 					records = append(records, record)
 					continue

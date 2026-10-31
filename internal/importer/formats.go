@@ -2,6 +2,7 @@ package importer
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"encoding/xml"
@@ -363,12 +364,12 @@ func streamJSONRecords(src io.Reader, result *ImportResult, maxRecordBytes int) 
 		}
 		return func() (map[string]any, error) {
 			for scanner.Scan() {
-				line := strings.TrimSpace(scanner.Text())
-				if line == "" {
+				line := bytes.TrimSpace(scanner.Bytes())
+				if len(line) == 0 {
 					continue
 				}
 				var rec map[string]any
-				if err := json.Unmarshal([]byte(line), &rec); err != nil {
+				if err := json.Unmarshal(line, &rec); err != nil {
 					result.Errors = append(result.Errors, fmt.Sprintf("decode record: %v", err))
 					continue
 				}
@@ -399,7 +400,9 @@ func buildJSONSampleData(records []map[string]any, colNames []string) [][]string
 }
 
 func jsonImportValue(val any) string {
-	switch val.(type) {
+	switch value := val.(type) {
+	case string:
+		return value
 	case map[string]any, []any:
 		body, err := json.Marshal(val)
 		if err == nil {
@@ -516,7 +519,7 @@ func ImportJSON(
 		row := make([]any, len(colNames))
 		valid := true
 		for j, col := range colNames {
-			if val, ok := rec[col]; ok {
+			if val, ok := rec[col]; ok && val != nil {
 				converted, err := convertValue(jsonImportValue(val), colTypes[j],
 					opts.DateTimeFormats, opts.NullLiterals)
 				if err != nil && opts.StrictTypes {

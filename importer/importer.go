@@ -36,6 +36,7 @@ func ImportCSV(ctx context.Context, db *tinysql.DB, tenant, tableName string, sr
 }
 
 // ImportJSON imports JSON or NDJSON-like data from src.
+// JSON null and missing fields become SQL NULL, including in strict mode.
 func ImportJSON(ctx context.Context, db *tinysql.DB, tenant, tableName string, src io.Reader, opts *ImportOptions) (*ImportResult, error) {
 	return ii.ImportJSON(ctx, db, tenant, tableName, src, opts)
 }
@@ -128,6 +129,7 @@ func FuzzyImportCSV(ctx context.Context, db *tinysql.DB, tenant, tableName strin
 }
 
 // FuzzyImportJSON imports malformed JSON-like data using tolerant parsing.
+// Null and missing values are excluded from column type inference.
 func FuzzyImportJSON(ctx context.Context, db *tinysql.DB, tenant, tableName string, src io.Reader, opts *FuzzyImportOptions) (*ImportResult, error) {
 	return ii.FuzzyImportJSON(ctx, db, tenant, tableName, src, opts)
 }
