@@ -18,6 +18,8 @@ import (
 // headerPattern matches typical column-name identifiers.
 var headerPattern = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]*$`)
 
+var unquotedJSONKeyPattern = regexp.MustCompile(`([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:`)
+
 // A completely consistent multi-column parse receives the highest possible
 // delimiter score. Later candidates cannot improve it, and ties keep the
 // earlier candidate.
@@ -597,10 +599,32 @@ func fuzzyConvertValue(value string, targetType storage.ColType, opts *FuzzyImpo
 	}
 }
 
-// removeNonNumeric removes non-numeric characters but keeps signs and decimals
+// removeNonNumeric removes non-numeric characters but keeps signs and decimals.
+// Clean ASCII numbers reuse their input; other values retain lenient filtering.
 func removeNonNumeric(s string, allowDecimal bool) string {
-	var result strings.Builder
 	hasDecimal := false
+	plain := true
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= '0' && c <= '9' {
+			continue
+		}
+		if i == 0 && (c == '-' || c == '+') {
+			continue
+		}
+		if allowDecimal && c == '.' && !hasDecimal {
+			hasDecimal = true
+			continue
+		}
+		plain = false
+		break
+	}
+	if plain {
+		return s
+	}
+
+	var result strings.Builder
+	hasDecimal = false
 	hasSign := false
 
 	for _, r := range s {
@@ -624,8 +648,7 @@ func fixCommonJSONIssues(s string) string {
 	s = strings.ReplaceAll(s, "'", "\"")
 
 	// Fix unquoted keys (simple cases)
-	re := regexp.MustCompile(`([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:`)
-	s = re.ReplaceAllString(s, `$1"$2":`)
+	s = unquotedJSONKeyPattern.ReplaceAllString(s, `$1"$2":`)
 
 	return s
 }
