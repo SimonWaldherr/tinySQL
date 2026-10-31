@@ -19,39 +19,15 @@ type aggregateOperand struct {
 }
 
 func isAggregate(e Expr) bool {
-	switch ex := e.(type) {
-	case *FuncCall:
+	if ex, ok := e.(*FuncCall); ok {
 		if ex.Over != nil {
 			return false
 		}
 		if isAggregateName(ex.Name) && (ex.Name != "VEC_AVG" || len(ex.Args) == 1) {
 			return true
 		}
-		for _, arg := range ex.Args {
-			if isAggregate(arg) {
-				return true
-			}
-		}
-	case *Unary:
-		return isAggregate(ex.Expr)
-	case *Binary:
-		return isAggregate(ex.Left) || isAggregate(ex.Right)
-	case *IsNull:
-		return isAggregate(ex.Expr)
-	case *CaseExpr:
-		if ex.Operand != nil && isAggregate(ex.Operand) {
-			return true
-		}
-		for _, w := range ex.Whens {
-			if isAggregate(w.When) || isAggregate(w.Then) {
-				return true
-			}
-		}
-		if ex.Else != nil && isAggregate(ex.Else) {
-			return true
-		}
 	}
-	return false
+	return anyExprChild(e, isAggregate)
 }
 
 func isAggregateName(name string) bool {
@@ -78,12 +54,54 @@ func evalAggregate(env ExecEnv, e Expr, rows []Row) (any, error) {
 		return evalAggregateIsNull(env, ex, rows)
 	case *CaseExpr:
 		return evalAggregateCase(env, ex, rows)
+	case *InExpr, *BetweenExpr, *LikeExpr, *RegexpExpr:
+		return evalAggregatePredicate(env, e, rows)
+	case *SubqueryExpr, *ExistsExpr:
+		return evalExpr(env, e, nil)
 	default:
 		if len(rows) == 0 {
 			return nil, nil
 		}
 		return evalExpr(env, e, rows[0])
 	}
+}
+
+func evalAggregatePredicate(env ExecEnv, e Expr, rows []Row) (any, error) {
+	wrap := func(e Expr) Expr {
+		if e == nil {
+			return nil
+		}
+		if _, literal := e.(*Literal); literal {
+			return e
+		}
+		return &aggregateOperand{expr: e, rows: rows}
+	}
+	var predicate Expr
+	switch ex := e.(type) {
+	case *InExpr:
+		copy := *ex
+		copy.Expr = wrap(ex.Expr)
+		if !ex.Subquery {
+			copy.Values = make([]Expr, len(ex.Values))
+			for i, value := range ex.Values {
+				copy.Values[i] = wrap(value)
+			}
+		}
+		predicate = &copy
+	case *BetweenExpr:
+		copy := *ex
+		copy.Expr, copy.Lo, copy.Hi = wrap(ex.Expr), wrap(ex.Lo), wrap(ex.Hi)
+		predicate = &copy
+	case *LikeExpr:
+		copy := *ex
+		copy.Expr, copy.Pattern, copy.Escape = wrap(ex.Expr), wrap(ex.Pattern), wrap(ex.Escape)
+		predicate = &copy
+	case *RegexpExpr:
+		copy := *ex
+		copy.Expr, copy.Pattern = wrap(ex.Expr), wrap(ex.Pattern)
+		predicate = &copy
+	}
+	return evalExpr(env, predicate, nil)
 }
 
 func evalAggregateFuncCall(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {

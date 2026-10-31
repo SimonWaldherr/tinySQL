@@ -62,40 +62,10 @@ func anyWindowInSelect(items []SelectItem) bool {
 
 // hasWindowFunction checks if an expression contains a window function
 func hasWindowFunction(e Expr) bool {
-	switch ex := e.(type) {
-	case *FuncCall:
-		if ex.Over != nil {
-			return true
-		}
-		if hasWindowFunction(ex.Filter) {
-			return true
-		}
-		// Check arguments recursively
-		for _, arg := range ex.Args {
-			if hasWindowFunction(arg) {
-				return true
-			}
-		}
-	case *Unary:
-		return hasWindowFunction(ex.Expr)
-	case *Binary:
-		return hasWindowFunction(ex.Left) || hasWindowFunction(ex.Right)
-	case *IsNull:
-		return hasWindowFunction(ex.Expr)
-	case *CaseExpr:
-		if ex.Operand != nil && hasWindowFunction(ex.Operand) {
-			return true
-		}
-		for _, w := range ex.Whens {
-			if hasWindowFunction(w.When) || hasWindowFunction(w.Then) {
-				return true
-			}
-		}
-		if ex.Else != nil && hasWindowFunction(ex.Else) {
-			return true
-		}
+	if call, ok := e.(*FuncCall); ok && call.Over != nil {
+		return true
 	}
-	return false
+	return anyExprChild(e, hasWindowFunction)
 }
 
 // extractWindowOffset extracts and validates offset from window function arguments
@@ -235,6 +205,11 @@ func evalWindowFunction(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	allRows := env.windowRows
 	if allRows == nil {
 		return nil, fmt.Errorf("window function context not available")
+	}
+	for _, order := range ex.Over.OrderBy {
+		if _, found := getValLower(row, strings.ToLower(order.Col)); !found {
+			return nil, unknownColumnErr(order.Col, columnSuggestionFromRow(order.Col, row))
+		}
 	}
 
 	// Unordered ROW_NUMBER uses source position directly, including duplicate

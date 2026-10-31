@@ -84,6 +84,16 @@ func executeSelect(env ExecEnv, s *Select) (result *ResultSet, err error) {
 		return rs, err
 	}
 
+	if s.Having != nil && len(s.GroupBy) == 0 && !anyAggInSelect(s.Projs) && !isAggregate(s.Having) {
+		return nil, fmt.Errorf("HAVING requires GROUP BY or an aggregate")
+	}
+	// Grouped windows need a separate projection phase over aggregate rows.
+	// Until that exists, reject the combination instead of running windows
+	// against the original input or treating them as ordinary aggregates.
+	if anyWindowInSelect(s.Projs) && (len(s.GroupBy) != 0 || anyAggInSelect(s.Projs) || isAggregate(s.Having)) {
+		return nil, fmt.Errorf("window functions with grouped aggregates are not supported; aggregate in a subquery first")
+	}
+
 	// ORDER BY/LIMIT/OFFSET after a set operation belong to the whole compound
 	// result, not to its left-most term.  Keep the term's projection free of
 	// those global clauses: besides avoiding a premature sort/page, this

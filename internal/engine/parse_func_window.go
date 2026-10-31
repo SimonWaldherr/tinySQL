@@ -165,6 +165,23 @@ func (p *Parser) parseFuncSuffix(call *FuncCall) (Expr, error) {
 			return nil, err
 		}
 		call.Over = oc
+		for _, arg := range call.Args {
+			if isAggregate(arg) || hasWindowFunction(arg) {
+				return nil, p.errf("nested aggregate or window calls in OVER arguments are not supported; aggregate in a subquery first")
+			}
+		}
+		for _, part := range oc.PartitionBy {
+			if isAggregate(part) || hasWindowFunction(part) {
+				return nil, p.errf("nested aggregate or window calls in PARTITION BY are not supported; aggregate in a subquery first")
+			}
+		}
+	}
+	if call.Over == nil && isAggregateName(call.Name) && (call.Name != "VEC_AVG" || len(call.Args) == 1) {
+		for _, arg := range call.Args {
+			if isAggregate(arg) || hasWindowFunction(arg) {
+				return nil, p.errf("nested aggregate or window calls in aggregate arguments are not supported; aggregate in a subquery first")
+			}
+		}
 	}
 	return foldConstFuncCall(bindFuncHandler(call)), nil
 }
