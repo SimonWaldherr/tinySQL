@@ -85,6 +85,9 @@ func validateRawColumnRefs(cols map[string]int, e Expr) error {
 		}
 		children = ex.Values
 	case *FuncCall:
+		if err := validateRawColumnRefs(cols, ex.Filter); err != nil {
+			return err
+		}
 		children = ex.Args
 	}
 	for _, child := range children {

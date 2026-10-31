@@ -140,6 +140,25 @@ conversion, plus ISO week and ordinal date formats. See
 JULIANDAY remains an astronomical day number. SQL Server session settings and
 observational calendar variants remain unsupported.
 
+ISODOW and DATEPART(ISO_WEEKDAY, ...) provide an explicit Monday-first weekday.
+DATEDIFF now counts crossed UTC boundaries; TIMESTAMPDIFF provides complete
+elapsed units. This replaces DATEDIFF's previous fixed-duration approximations
+for months and years. See the [migration note](datetime-performance.md#differences-boundaries-and-elapsed-units).
+
+## Filtered aggregates and explicit ordering
+
+Aggregate FILTER (WHERE ...) is supported for grouped, ungrouped and window
+aggregates, including HAVING. It evaluates the predicate before the aggregate
+argument, excludes FALSE/NULL and retains groups whose selected input is empty.
+COUNT(DISTINCT ...), SUM/AVG and the other ordinary aggregates can also use OVER.
+
+ORDER BY accepts NULLS FIRST/LAST, including in window definitions. ROWS frames
+count positions; numeric RANGE offsets count values and require one ORDER BY
+column. FIRST_VALUE/LAST_VALUE share aggregate frame bounds, including empty
+frames. STRING_SPLIT accepts multi-character delimiters and an optional ordinal
+column. [SQL semantics](sql-semantics.md) describes the contracts, execution
+fallbacks and remaining window limitations.
+
 ## Important remaining gaps
 
 | Missing operation | Current boundary | Main implementation work |
@@ -149,7 +168,6 @@ observational calendar variants remain unsupported.
 | `ON CONFLICT (...) DO UPDATE` / full UPSERT | Only target-less `DO NOTHING` exists | Conflict-target resolution, `excluded` row binding, UPDATE constraints and triggers. |
 | `SAVEPOINT`, `ROLLBACK TO`, `RELEASE` | Driver deliberately rejects nested transaction spellings | Nested rollback boundaries integrated with storage and WAL. |
 | Partial indexes and generated columns | Not supported by the schema/parser | Persist predicates/expressions and maintain them on every mutation path. |
-| Aggregate `FILTER (WHERE ...)` | Function parser handles calls and OVER, without FILTER | Per-aggregate predicates across generic, grouped and optimized aggregate paths. |
 | WITH-prefixed UPDATE/DELETE and modifying CTE bodies | SELECT-based CTEs only | DML scope, execution order, RETURNING relations and atomic rollback. |
 
 These larger changes remain explicit gaps; accepting their syntax without

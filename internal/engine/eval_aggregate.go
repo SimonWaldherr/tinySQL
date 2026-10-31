@@ -11,15 +11,26 @@ import (
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
+// aggregateOperand is execution-local. Scalar handlers evaluate it on demand,
+// preserving their arity checks, NULL propagation and discarded branches.
+type aggregateOperand struct {
+	expr Expr
+	rows []Row
+}
+
 func isAggregate(e Expr) bool {
 	switch ex := e.(type) {
 	case *FuncCall:
-		switch ex.Name {
-		case "COUNT", "SUM", "AVG", "MIN", "MAX", "MEDIAN",
-			"MIN_BY", "MAX_BY", "ARG_MIN", "ARG_MAX",
-			"GEO_DISSOLVE", "GEO_UNION_AGG", "ST_UNION",
-			"GEO_BBOX_AGG", "GEO_CENTROID_AGG":
+		if ex.Over != nil {
+			return false
+		}
+		if isAggregateName(ex.Name) && (ex.Name != "VEC_AVG" || len(ex.Args) == 1) {
 			return true
+		}
+		for _, arg := range ex.Args {
+			if isAggregate(arg) {
+				return true
+			}
 		}
 	case *Unary:
 		return isAggregate(ex.Expr)
@@ -43,8 +54,20 @@ func isAggregate(e Expr) bool {
 	return false
 }
 
+func isAggregateName(name string) bool {
+	switch name {
+	case "COUNT", "SUM", "AVG", "MIN", "MAX", "MEDIAN", "VEC_AVG",
+		"MIN_BY", "MAX_BY", "ARG_MIN", "ARG_MAX",
+		"GEO_DISSOLVE", "GEO_UNION_AGG", "ST_UNION", "GEO_BBOX_AGG", "GEO_CENTROID_AGG":
+		return true
+	}
+	return false
+}
+
 func evalAggregate(env ExecEnv, e Expr, rows []Row) (any, error) {
 	switch ex := e.(type) {
+	case *Literal:
+		return ex.Val, nil
 	case *FuncCall:
 		return evalAggregateFuncCall(env, ex, rows)
 	case *Unary:
@@ -64,6 +87,22 @@ func evalAggregate(env ExecEnv, e Expr, rows []Row) (any, error) {
 }
 
 func evalAggregateFuncCall(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
+	if ex.Filter != nil {
+		var selected []Row
+		for _, row := range rows {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, err
+			}
+			value, err := evalExpr(env, ex.Filter, row)
+			if err != nil {
+				return nil, err
+			}
+			if toTri(value) == tvTrue {
+				selected = append(selected, row)
+			}
+		}
+		rows = selected
+	}
 	switch ex.Name {
 	case "COUNT":
 		return evalAggregateCount(env, ex, rows)
@@ -86,31 +125,21 @@ func evalAggregateFuncCall(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 	case "GEO_CENTROID_AGG":
 		return evalAggregateGeoCentroidAgg(env, ex, rows)
 	default:
-		// For non-aggregate functions like DATEDIFF, LEFT, etc., evaluate their arguments
-		// in the aggregate context first, then call the function
-		if len(rows) == 0 {
-			return nil, nil
-		}
-
-		// Create a new FuncCall with evaluated arguments
-		evaledArgs := make([]Expr, len(ex.Args))
+		call := *ex
+		call.Args = make([]Expr, len(ex.Args))
 		for i, arg := range ex.Args {
-			val, err := evalAggregate(env, arg, rows)
-			if err != nil {
-				return nil, err
+			if _, literal := arg.(*Literal); literal || ex.Name == "CAST" && i == 1 {
+				// Preserve syntax operands such as CAST's target declaration.
+				call.Args[i] = arg
+			} else {
+				call.Args[i] = &aggregateOperand{expr: arg, rows: rows}
 			}
-			evaledArgs[i] = &Literal{Val: val}
 		}
-
-		evaledFunc := &FuncCall{
-			Name:     ex.Name,
-			Args:     evaledArgs,
-			Star:     ex.Star,
-			Distinct: ex.Distinct,
+		var row Row
+		if len(rows) != 0 {
+			row = rows[0]
 		}
-
-		// Now evaluate the function normally with a single row
-		return evalFuncCall(env, evaledFunc, rows[0])
+		return evalFuncCall(env, &call, row)
 	}
 }
 
@@ -166,6 +195,7 @@ func evalAggregateSumAvg(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 		sum    sumAccumulator
 		sumRat *big.Rat
 		n      int
+		seen   distinctCountSet
 	)
 	for _, r := range rows {
 		if err := checkCtx(env.ctx); err != nil {
@@ -176,6 +206,9 @@ func evalAggregateSumAvg(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 			return nil, err
 		}
 		if v == nil {
+			continue
+		}
+		if ex.Distinct && !seen.add(v) {
 			continue
 		}
 		if sumRat == nil {
@@ -262,6 +295,7 @@ func evalAggregateMedian(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 		return nil, fmt.Errorf("MEDIAN expects 1 arg")
 	}
 	var values []float64
+	var seen distinctCountSet
 	for _, r := range rows {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
@@ -271,6 +305,9 @@ func evalAggregateMedian(env ExecEnv, ex *FuncCall, rows []Row) (any, error) {
 			return nil, err
 		}
 		if f, ok := numeric(v); ok {
+			if ex.Distinct && !seen.add(v) {
+				continue
+			}
 			values = append(values, f)
 		}
 	}
@@ -486,15 +523,9 @@ func evalAggregateUnary(env ExecEnv, ex *Unary, rows []Row) (any, error) {
 }
 
 func evalAggregateBinary(env ExecEnv, ex *Binary, rows []Row) (any, error) {
-	lv, err := evalAggregate(env, ex.Left, rows)
-	if err != nil {
-		return nil, err
-	}
-	rv, err := evalAggregate(env, ex.Right, rows)
-	if err != nil {
-		return nil, err
-	}
-	return evalExpr(env, &Binary{Op: ex.Op, Left: &Literal{Val: lv}, Right: &Literal{Val: rv}}, Row{})
+	return evalExpr(env, &Binary{Op: ex.Op,
+		Left:  &aggregateOperand{expr: ex.Left, rows: rows},
+		Right: &aggregateOperand{expr: ex.Right, rows: rows}}, nil)
 }
 
 func evalAggregateIsNull(env ExecEnv, ex *IsNull, rows []Row) (any, error) {

@@ -35,7 +35,7 @@ var foldableConstFuncs = map[string]bool{
 // the error still surfaces at execution time with today's semantics — a
 // query that never evaluates the expression keeps never erroring.
 func foldConstFuncCall(fc *FuncCall) Expr {
-	if fc.Over != nil || fc.Star || fc.Distinct {
+	if fc.Over != nil || fc.Star || fc.Distinct || fc.Filter != nil {
 		return fc
 	}
 	if !foldableConstFuncs[strings.ToUpper(fc.Name)] {

@@ -337,7 +337,7 @@ func isSimpleRawExpr(e Expr) bool {
 		}
 		return true
 	case *FuncCall:
-		if ex.Over != nil {
+		if ex.Over != nil || ex.Filter != nil {
 			return false
 		}
 		if rowAwareFuncNames[ex.Name] && ex.Name != "ROW_TO_TEXT" {
@@ -404,6 +404,9 @@ func exprHasRowAwareFuncCall(e Expr) bool {
 		}
 		return false
 	case *FuncCall:
+		if exprHasRowAwareFuncCall(ex.Filter) {
+			return true
+		}
 		if rowAwareFuncNames[ex.Name] && ex.Name != "ROW_TO_TEXT" {
 			return true
 		}

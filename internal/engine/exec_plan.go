@@ -364,6 +364,9 @@ func exprContainsBoundParameter(expr Expr) bool {
 			}
 		}
 	case *FuncCall:
+		if exprContainsBoundParameter(ex.Filter) {
+			return true
+		}
 		for _, arg := range ex.Args {
 			if exprContainsBoundParameter(arg) {
 				return true

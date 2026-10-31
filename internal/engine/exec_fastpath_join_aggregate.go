@@ -411,7 +411,7 @@ func buildSimpleJoinAggregateProjections(items []SelectItem, leftIndex, rightInd
 		}
 
 		fc, ok := it.Expr.(*FuncCall)
-		if !ok || fc.Distinct || fc.Over != nil {
+		if !ok || fc.Distinct || fc.Over != nil || fc.Filter != nil {
 			return nil, nil, false, false
 		}
 		var kind aggKind

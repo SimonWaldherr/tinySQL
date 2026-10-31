@@ -31,6 +31,20 @@ async function main() {
   assert.deepEqual(result.columns, ['id', 'label', 'active']);
   assert.deepEqual(result.rows, expected); // Exercises the bulk result bridge.
   assert.deepEqual(success(db.query('SELECT id FROM items WHERE id = -1')).rows, []);
+  assert.deepEqual(success(db.query(`SELECT DATEDIFF(MONTH, '2024-01-31', '2024-02-29'),
+    TIMESTAMPDIFF(MONTH, '2024-01-31', '2024-02-29'), ISODOW('2024-03-01')`)).rows, [[1, 0, 5]]);
+  assert.deepEqual(success(db.query(`SELECT COUNT(*) FILTER (WHERE active),
+    SUM(id) FILTER (WHERE active) FROM items`)).rows, [[100, 9900]]);
+  assert.deepEqual(success(db.query(`SELECT id, COUNT(DISTINCT active) OVER () AS kinds,
+    SUM(id) FILTER (WHERE active) OVER (ORDER BY id ROWS 1 PRECEDING) AS total
+    FROM items WHERE id < 3 ORDER BY id`)).rows, [[0, 2, 0], [1, 2, 0], [2, 2, 2]]);
+  assert.deepEqual(success(db.query(`SELECT id, SUM(id) OVER (ORDER BY id RANGE 1 PRECEDING)
+    FROM items WHERE id < 3 ORDER BY id`)).rows, [[0, 0], [1, 1], [2, 3]]);
+  assert.deepEqual(success(db.query(`SELECT value FROM (
+    SELECT 1 AS value UNION ALL SELECT NULL AS value
+    ) AS nullable ORDER BY value NULLS FIRST`)).rows, [[null], [1]]);
+  assert.deepEqual(success(db.query(`SELECT value, ordinal FROM STRING_SPLIT('ä::🙂::', '::', 1)
+    ORDER BY ordinal`)).rows, [['ä', 1], ['🙂', 2], ['', 3]]);
   const escaped = db.query("SELECT HTML_ESCAPE('<b>&</b>') AS escaped");
   if (process.argv[4] === 'tinygo') {
     assert.ok(escaped.error, 'TinyGo HTML escaping must report an error');

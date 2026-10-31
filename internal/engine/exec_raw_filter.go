@@ -61,6 +61,9 @@ func buildRawClockFilter(plan *simpleSelectPlan, e Expr) func([]any) (bool, erro
 func rawExprUsesStatementClock(e Expr) bool {
 	switch ex := e.(type) {
 	case *FuncCall:
+		if rawExprUsesStatementClock(ex.Filter) {
+			return true
+		}
 		name := strings.ToUpper(ex.Name)
 		for _, arg := range ex.Args {
 			if rawExprUsesStatementClock(arg) {

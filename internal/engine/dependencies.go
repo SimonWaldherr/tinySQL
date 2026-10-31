@@ -79,6 +79,7 @@ func collectExprDependencies(cat *storage.CatalogManager, expr Expr, ctes map[st
 	case *IsNull:
 		collectExprDependencies(cat, ex.Expr, ctes, seen)
 	case *FuncCall:
+		collectExprDependencies(cat, ex.Filter, ctes, seen)
 		for _, arg := range ex.Args {
 			collectExprDependencies(cat, arg, ctes, seen)
 		}

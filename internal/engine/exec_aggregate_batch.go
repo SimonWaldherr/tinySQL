@@ -46,6 +46,11 @@ func aggregateBatchEligible(plan *simpleAggregatePlan, source *simpleSelectPlan)
 	// Validate the whole shape before allocating any batch scratch.
 	hasAggregate := false
 	for _, proj := range plan.projs {
+		// Per-aggregate predicates use scalar raw accumulation; sharing a
+		// batch's sample counts would otherwise mix different filtered sets.
+		if proj.filter != nil {
+			return false
+		}
 		switch proj.kind {
 		case aggGroupCol:
 			continue

@@ -60,7 +60,7 @@ func (p *Parser) parseFuncCallWithName(name string) (Expr, error) {
 		if err := p.expectSymbol(")"); err != nil {
 			return nil, err
 		}
-		return bindFuncHandler(&FuncCall{Name: name, Star: true}), nil
+		return p.parseFuncSuffix(&FuncCall{Name: name, Star: true})
 	}
 
 	// POSITION supports both its SQL-standard `POSITION(needle IN haystack)`
@@ -123,18 +123,50 @@ func (p *Parser) parseFuncCallWithName(name string) (Expr, error) {
 		return nil, err
 	}
 
-	// Check for OVER clause (window functions)
-	var overClause *OverClause
+	return p.parseFuncSuffix(&FuncCall{Name: name, Args: args, Distinct: distinct})
+}
+
+func (p *Parser) parseFuncSuffix(call *FuncCall) (Expr, error) {
+	if call.Distinct {
+		switch call.Name {
+		case "COUNT", "SUM", "AVG", "MIN", "MAX", "MEDIAN":
+		default:
+			return nil, p.errf("DISTINCT is not supported for %s", call.Name)
+		}
+	}
+	if p.cur.Typ == tKeyword && p.cur.Val == "FILTER" {
+		if !isAggregateName(call.Name) {
+			return nil, p.errf("FILTER requires an aggregate function")
+		}
+		p.next()
+		if err := p.expectSymbol("("); err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("WHERE"); err != nil {
+			return nil, err
+		}
+		predicate, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if isAggregate(predicate) || hasWindowFunction(predicate) {
+			return nil, p.errf("FILTER predicate cannot contain aggregate or window functions")
+		}
+		if err := p.expectSymbol(")"); err != nil {
+			return nil, err
+		}
+		call.Filter = predicate
+	}
+	// FILTER precedes OVER in the SQL grammar, including for COUNT(*).
 	if p.cur.Typ == tKeyword && p.cur.Val == "OVER" {
 		p.next()
 		oc, err := p.parseOverClause()
 		if err != nil {
 			return nil, err
 		}
-		overClause = oc
+		call.Over = oc
 	}
-
-	return foldConstFuncCall(bindFuncHandler(&FuncCall{Name: name, Args: args, Distinct: distinct, Over: overClause})), nil
+	return foldConstFuncCall(bindFuncHandler(call)), nil
 }
 
 // parseOverClause parses the OVER (PARTITION BY ... ORDER BY ... frame) clause
@@ -222,6 +254,29 @@ func (p *Parser) parseOverFrame(oc *OverClause) error {
 	frame, err := p.parseWindowFrame()
 	if err != nil {
 		return err
+	}
+	if frame.Mode == "RANGE" && (strings.HasPrefix(frame.StartType, "OFFSET") || strings.HasPrefix(frame.EndType, "OFFSET")) && len(oc.OrderBy) != 1 {
+		return p.errf("RANGE offset requires exactly one ORDER BY column")
+	}
+	if frame.StartType == "UNBOUNDED_FOLLOWING" || frame.EndType == "UNBOUNDED_PRECEDING" {
+		return p.errf("invalid unbounded window frame")
+	}
+	position := func(kind string, n int) int64 {
+		switch kind {
+		case "UNBOUNDED_PRECEDING":
+			return -1 << 63
+		case "UNBOUNDED_FOLLOWING":
+			return 1<<63 - 1
+		case "OFFSET_PRECEDING":
+			return -int64(n)
+		case "OFFSET_FOLLOWING":
+			return int64(n)
+		default:
+			return 0
+		}
+	}
+	if position(frame.StartType, frame.StartValue) > position(frame.EndType, frame.EndValue) {
+		return p.errf("window frame start follows its end")
 	}
 	oc.Frame = frame
 	return nil

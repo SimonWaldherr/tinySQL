@@ -19,6 +19,8 @@ func evalExpr(env ExecEnv, e Expr, row Row) (any, error) {
 	// (applyWhereClause, processNonAggregateQuery, UPDATE/DELETE loops, etc.),
 	// not per expression node. This avoids O(nodes_per_row) channel selects.
 	switch ex := e.(type) {
+	case *aggregateOperand:
+		return evalAggregate(env, ex.expr, ex.rows)
 	case *Literal:
 		return ex.Val, nil
 	case *VarRef:

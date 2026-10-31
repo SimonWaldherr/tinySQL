@@ -489,6 +489,9 @@ func exprHasUnresolvedReference(e Expr, scope map[string]bool) bool {
 	case *IsNull:
 		return exprHasUnresolvedReference(ex.Expr, scope)
 	case *FuncCall:
+		if exprHasUnresolvedReference(ex.Filter, scope) {
+			return true
+		}
 		for _, arg := range ex.Args {
 			if exprHasUnresolvedReference(arg, scope) {
 				return true

@@ -49,6 +49,7 @@ type (
 		Args     []Expr
 		Star     bool
 		Distinct bool        // For COUNT(DISTINCT col)
+		Filter   Expr        // FILTER (WHERE predicate), evaluated before arguments
 		Over     *OverClause // For window functions
 		// handlerIdx is 1 + the position of Name's handler in
 		// funcHandlerTable, resolved once at parse time (bindFuncHandler) so

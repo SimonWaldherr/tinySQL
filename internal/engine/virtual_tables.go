@@ -688,20 +688,6 @@ func extensionStatusRows(env ExecEnv) []Row {
 	return rows
 }
 
-// isAggregateName returns true for known aggregate function names.
-func isAggregateName(name string) bool {
-	switch name {
-	case "COUNT", "SUM", "AVG", "MIN", "MAX",
-		"GROUP_CONCAT", "STRING_AGG",
-		"FIRST", "LAST",
-		"MIN_BY", "MAX_BY", "ARG_MIN", "ARG_MAX",
-		"GEO_DISSOLVE", "GEO_UNION_AGG", "ST_UNION",
-		"GEO_BBOX_AGG", "GEO_CENTROID_AGG":
-		return true
-	}
-	return false
-}
-
 // isWindowFuncName returns true for known window function names.
 func isWindowFuncName(name string) bool {
 	switch name {

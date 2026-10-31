@@ -67,6 +67,9 @@ func hasWindowFunction(e Expr) bool {
 		if ex.Over != nil {
 			return true
 		}
+		if hasWindowFunction(ex.Filter) {
+			return true
+		}
 		// Check arguments recursively
 		for _, arg := range ex.Args {
 			if hasWindowFunction(arg) {
@@ -145,62 +148,6 @@ func evalLeadFunction(env ExecEnv, ex *FuncCall, partitionRows []Row, currentIdx
 		return nil, nil
 	}
 	return evalExpr(env, ex.Args[0], partitionRows[leadIdx])
-}
-
-// evalFirstValue evaluates the FIRST_VALUE window function
-func evalFirstValue(env ExecEnv, ex *FuncCall, partitionRows []Row) (any, error) {
-	if len(ex.Args) == 0 {
-		return nil, fmt.Errorf("FIRST_VALUE requires an argument")
-	}
-	if len(partitionRows) == 0 {
-		return nil, nil
-	}
-	return evalExpr(env, ex.Args[0], partitionRows[0])
-}
-
-// evalLastValue evaluates the LAST_VALUE window function. SQLite's implicit
-// frame for a window with ORDER BY is RANGE BETWEEN UNBOUNDED PRECEDING AND
-// CURRENT ROW, so CURRENT ROW extends through all following peer rows. With
-// no ORDER BY, every row is a peer and the implicit frame covers the whole
-// partition. An explicit ROWS frame deliberately retains its row-position
-// semantics.
-func evalLastValue(env ExecEnv, ex *FuncCall, partitionRows []Row, currentIdx int) (any, error) {
-	if len(ex.Args) == 0 {
-		return nil, fmt.Errorf("LAST_VALUE requires an argument")
-	}
-	if len(partitionRows) == 0 {
-		return nil, nil
-	}
-	endIdx := lastValueFrameEnd(partitionRows, currentIdx, ex.Over)
-	return evalExpr(env, ex.Args[0], partitionRows[endIdx])
-}
-
-// lastValueFrameEnd resolves the end of LAST_VALUE's effective frame. The
-// parser represents an omitted frame as nil, rather than materializing SQL's
-// implicit RANGE frame, so that case belongs here instead of in
-// calculateFrameEnd. For the supported RANGE ... CURRENT ROW forms, peers are
-// included at the end just like SQLite. RANGE offset bounds remain subject to
-// the engine's existing positional frame implementation.
-func lastValueFrameEnd(partitionRows []Row, currentIdx int, over *OverClause) int {
-	if currentIdx < 0 {
-		currentIdx = 0
-	}
-	if currentIdx >= len(partitionRows) {
-		currentIdx = len(partitionRows) - 1
-	}
-
-	if over == nil || over.Frame == nil {
-		if over == nil || len(over.OrderBy) == 0 {
-			return len(partitionRows) - 1
-		}
-		return lastWindowPeerIndex(partitionRows, currentIdx, over.OrderBy)
-	}
-
-	frame := over.Frame
-	if strings.EqualFold(frame.Mode, "RANGE") && frame.EndType == "CURRENT" {
-		return lastWindowPeerIndex(partitionRows, currentIdx, over.OrderBy)
-	}
-	return calculateFrameEnd(currentIdx, len(partitionRows), frame)
 }
 
 // lastWindowPeerIndex returns the final row in currentIdx's ORDER BY peer
@@ -302,6 +249,16 @@ func evalWindowFunction(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	// the O(N)-filter + O(N log N)-sort work P times, not N times.
 	partitionRows, currentIdx := resolveWindowPartition(env, ex, allRows, row)
 
+	if isAggregateName(ex.Name) {
+		frame, err := windowFrameRows(env, partitionRows, currentIdx, ex.Over)
+		if err != nil {
+			return nil, err
+		}
+		call := *ex
+		call.Over = nil
+		return evalAggregateFuncCall(env, &call, frame)
+	}
+
 	// Evaluate the specific window function
 	switch ex.Name {
 	case "ROW_NUMBER":
@@ -325,9 +282,9 @@ func evalWindowFunction(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	case "LEAD":
 		return evalLeadFunction(env, ex, partitionRows, currentIdx, row)
 	case "FIRST_VALUE":
-		return evalFirstValue(env, ex, partitionRows)
+		return evalWindowFrameValue(env, ex, partitionRows, currentIdx, false)
 	case "LAST_VALUE":
-		return evalLastValue(env, ex, partitionRows, currentIdx)
+		return evalWindowFrameValue(env, ex, partitionRows, currentIdx, true)
 	case "MOVING_SUM", "MOVING_AVG":
 		return evalMovingAggregate(env, ex, partitionRows, currentIdx, row)
 	default:
@@ -964,32 +921,4 @@ func rowsEqual(a, b Row) bool {
 		}
 	}
 	return true
-}
-
-// calculateFrameEnd calculates the end index for frame-based window functions
-func calculateFrameEnd(currentIdx, totalRows int, frame *WindowFrame) int {
-	if frame == nil {
-		return currentIdx // Default: CURRENT ROW
-	}
-
-	switch frame.EndType {
-	case "CURRENT":
-		return currentIdx
-	case "UNBOUNDED_FOLLOWING":
-		return totalRows - 1
-	case "OFFSET_FOLLOWING":
-		endIdx := currentIdx + frame.EndValue
-		if endIdx >= totalRows {
-			return totalRows - 1
-		}
-		return endIdx
-	case "OFFSET_PRECEDING":
-		endIdx := currentIdx - frame.EndValue
-		if endIdx < 0 {
-			return 0
-		}
-		return endIdx
-	default:
-		return currentIdx
-	}
 }

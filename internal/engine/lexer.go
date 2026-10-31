@@ -509,6 +509,8 @@ func keywordValue(up string) string {
 		return "BY"
 	case "HAVING":
 		return "HAVING"
+	case "FILTER":
+		return "FILTER"
 	case "ORDER":
 		return "ORDER"
 	case "ASC":

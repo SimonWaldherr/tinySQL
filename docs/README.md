@@ -23,6 +23,8 @@ current behavior and keep performance claims scoped to the workload they measure
 - [Architecture](architecture.md) and [architecture diagrams](architecture-diagrams.md)
   — layer ownership, statement flow, transactions, and persistence invariants.
 - [SQL feature gaps](sql-feature-gaps.md) — supported additions and known limits.
+- [SQL semantics](sql-semantics.md) — date differences, NULLs, trimming, filtered
+  aggregates, window frames and dialect compatibility.
 
 ## Use the runtime
 

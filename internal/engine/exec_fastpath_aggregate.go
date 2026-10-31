@@ -54,9 +54,11 @@ const (
 )
 
 type simpleAggregateProjection struct {
-	name string
-	kind aggKind
-	arg  Expr // nil for the group-by column and for COUNT(*)
+	name       string
+	kind       aggKind
+	arg        Expr // nil for the group-by column and for COUNT(*)
+	filter     Expr
+	filterEval func([]any) (bool, error)
 	// argColumn is the resolved raw column index plus one, or zero when the
 	// argument needs evaluation. It belongs to this table-bound plan only.
 	argColumn  int
@@ -112,6 +114,11 @@ func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 		return nil, true, err
 	}
 	bindSimplePlanClock(rawPlan, env)
+	for i := range plan.projs {
+		if plan.projs[i].filter != nil {
+			plan.projs[i].filterEval = buildRawClockFilter(rawPlan, plan.projs[i].filter)
+		}
+	}
 
 	if cols, ops, ok := buildAggregateBatch(plan, rawPlan); ok {
 		return executeAggregateBatches(env, plan, rawPlan, cols, ops)
@@ -133,7 +140,7 @@ func executeUnfilteredCountStar(env ExecEnv, plan *simpleAggregatePlan) (*Result
 		return nil, false, nil
 	}
 	for _, proj := range plan.projs {
-		if proj.kind != aggCount || proj.arg != nil {
+		if proj.kind != aggCount || proj.arg != nil || proj.filter != nil {
 			return nil, false, nil
 		}
 	}
@@ -161,7 +168,7 @@ func executeConstraintMaximum(env ExecEnv, plan *simpleAggregatePlan) (*ResultSe
 		return nil, false, nil
 	}
 	proj := plan.projs[0]
-	if proj.kind != aggMax || proj.argColumn == 0 {
+	if proj.kind != aggMax || proj.argColumn == 0 || proj.filter != nil {
 		return nil, false, nil
 	}
 	col := proj.argColumn - 1
@@ -413,6 +420,15 @@ func evalSimpleAggregateArg(rawPlan *simpleSelectPlan, raw []any, proj simpleAgg
 
 func accumulateSimpleAggregateState(env ExecEnv, rawPlan *simpleSelectPlan, raw []any, state *simpleAggregateState, projs []simpleAggregateProjection) error {
 	for i, proj := range projs {
+		if proj.filter != nil {
+			match, err := proj.filterEval(raw)
+			if err != nil {
+				return err
+			}
+			if !match {
+				continue
+			}
+		}
 		switch proj.kind {
 		case aggGroupCol:
 			continue
@@ -635,7 +651,7 @@ func simpleAggregateProjectionForFunc(plan *simpleAggregatePlan, fc *FuncCall) (
 		arg = fc.Args[0]
 	}
 	for i, proj := range plan.projs {
-		if proj.kind == kind && simpleAggregateArgumentsEqual(proj.arg, arg) {
+		if proj.kind == kind && simpleAggregateArgumentsEqual(proj.arg, arg) && simpleAggregateArgumentsEqual(proj.filter, fc.Filter) {
 			return i, true
 		}
 	}
@@ -838,13 +854,13 @@ func buildSimpleAggregateProjection(it SelectItem, idx int, colIndex map[string]
 	}
 
 	fc, ok := it.Expr.(*FuncCall)
-	if !ok || fc.Over != nil || (fc.Distinct && (fc.Name != "COUNT" || fc.Star)) {
+	if !ok || fc.Over != nil || !isSimpleRawPredicate(fc.Filter) || (fc.Distinct && (fc.Name != "COUNT" || fc.Star)) {
 		return simpleAggregateProjection{}, "", false, false, nil
 	}
 
 	if fc.Name == "COUNT" {
 		if fc.Star {
-			return simpleAggregateProjection{name: name, kind: aggCount}, name, true, true, nil
+			return simpleAggregateProjection{name: name, kind: aggCount, filter: fc.Filter}, name, true, true, nil
 		}
 		if len(fc.Args) != 1 || !isSimpleRawExpr(fc.Args[0]) {
 			return simpleAggregateProjection{}, "", false, false, nil
@@ -853,14 +869,14 @@ func buildSimpleAggregateProjection(it SelectItem, idx int, colIndex map[string]
 		if fc.Distinct {
 			kind = aggCountDistinct
 		}
-		return simpleAggregateProjection{name: name, kind: kind, arg: fc.Args[0]}, name, true, true, nil
+		return simpleAggregateProjection{name: name, kind: kind, arg: fc.Args[0], filter: fc.Filter}, name, true, true, nil
 	}
 
 	if kind, ok := simpleAggFuncKinds[fc.Name]; ok {
 		if fc.Star || len(fc.Args) != 1 || !isSimpleRawExpr(fc.Args[0]) {
 			return simpleAggregateProjection{}, "", false, false, nil
 		}
-		return simpleAggregateProjection{name: name, kind: kind, arg: fc.Args[0]}, name, true, true, nil
+		return simpleAggregateProjection{name: name, kind: kind, arg: fc.Args[0], filter: fc.Filter}, name, true, true, nil
 	}
 
 	return simpleAggregateProjection{}, "", false, false, nil

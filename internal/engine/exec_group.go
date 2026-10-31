@@ -157,6 +157,7 @@ func collectVarRefNames(e Expr) map[string]bool {
 		case *IsNull:
 			walk(ex.Expr)
 		case *FuncCall:
+			walk(ex.Filter)
 			for _, a := range ex.Args {
 				walk(a)
 			}
@@ -463,7 +464,7 @@ func compileAggregateProjectionForFastPath(it SelectItem, idx int, groupPos map[
 	}
 
 	fc, ok := it.Expr.(*FuncCall)
-	if !ok || fc.Over != nil || fc.Distinct || len(fc.Name) == 0 {
+	if !ok || fc.Over != nil || fc.Distinct || fc.Filter != nil || len(fc.Name) == 0 {
 		return simpleAggregateProjection{}, aggregateProjectionArg{}, false, nil
 	}
 
