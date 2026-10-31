@@ -22,6 +22,8 @@ func BenchmarkDateTimeQueries(b *testing.B) {
 		b.Fatal(err)
 	}
 	for _, tc := range []struct{ name, sql string }{
+		{"ISOYearFilter", `SELECT COUNT(*) FROM dates WHERE YEAR(iso)=2024`},
+		{"ISOMonthFilter", `SELECT COUNT(*) FROM dates WHERE MONTH(iso)=3`},
 		{"LegacyYearFilter", `SELECT COUNT(*) FROM dates WHERE YEAR(legacy)=2024`},
 		{"FormattedMonthFilter", `SELECT COUNT(*) FROM dates WHERE STRFTIME('%Y-%m', iso)='2024-03'`},
 		{"DateTruncGroups", `SELECT DATE_TRUNC('MONTH', iso) AS month, COUNT(*) FROM dates GROUP BY DATE_TRUNC('MONTH', iso)`},

@@ -34,6 +34,9 @@ func BenchmarkRawDateFunctions(b *testing.B) {
 	plan := &simpleSelectPlan{colIndex: map[string]int{"value": 0}}
 	row := []any{"2024-03-05 06:07:08.123"}
 	for _, call := range []string{
+		"YEAR(value)",
+		"MONTH(value)",
+		"WEEKOFYEAR(value)",
 		"DATE_ADD(value, 1, 'DAY')",
 		"STRFTIME('%Y-%m-%d %H:%M:%S', value)",
 		"DATE(value)",

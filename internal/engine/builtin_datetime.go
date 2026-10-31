@@ -165,13 +165,22 @@ func parseTimeFixedDigits(s string) (time.Time, bool) {
 	if m < 1 || m > 12 || d < 1 || d > 31 {
 		return time.Time{}, false
 	}
-	t := time.Date(y, time.Month(m), d, hh, mm, ss, nanos, time.UTC)
-	// Reject dates time.Date normalized (e.g. Feb 31 → Mar 3) to keep
-	// time.Parse's out-of-range error semantics via the fallback path.
-	if t.Day() != d {
+	// Check month bounds before construction, avoiding a calendar conversion
+	// back from time.Time merely to detect normalization of invalid dates.
+	lastDay := 31
+	switch m {
+	case 2:
+		lastDay = 28
+		if gregorianLeap(y) {
+			lastDay++
+		}
+	case 4, 6, 9, 11:
+		lastDay = 30
+	}
+	if d > lastDay {
 		return time.Time{}, false
 	}
-	return t, true
+	return time.Date(y, time.Month(m), d, hh, mm, ss, nanos, time.UTC), true
 }
 
 func parseTimeValue(val any) (time.Time, error) {
@@ -439,94 +448,68 @@ func evalUnixepoch(env ExecEnv, args []Expr, row Row) (any, error) {
 	return t.Unix(), nil
 }
 
-func evalYear(env ExecEnv, args []Expr, row Row) (any, error) {
+// Both evaluators share validation, NULL propagation and calendar extraction;
+// raw calls can evaluate their operand without creating argument wrappers.
+func evalDateComponent(name string, args []Expr, eval func(Expr) (any, error)) (any, error) {
 	if len(args) != 1 {
-		return nil, fmt.Errorf("YEAR expects 1 argument")
+		return nil, fmt.Errorf("%s expects 1 argument", name)
 	}
-	val, err := evalExpr(env, args[0], row)
-	if err != nil || val == nil {
+	value, err := eval(args[0])
+	if err != nil || value == nil {
 		return nil, err
 	}
-	t, err := parseDateTime(val)
+	date, err := parseDateTime(value)
 	if err != nil {
 		return nil, err
 	}
-	return t.Year(), nil
+	switch name {
+	case "YEAR":
+		return date.Year(), nil
+	case "MONTH":
+		return int(date.Month()), nil
+	case "DAY":
+		return date.Day(), nil
+	case "HOUR":
+		return date.Hour(), nil
+	case "MINUTE":
+		return date.Minute(), nil
+	case "SECOND":
+		return date.Second(), nil
+	case "DAYOFWEEK":
+		return int(date.Weekday()) + 1, nil
+	case "DAYOFYEAR":
+		return date.YearDay(), nil
+	case "WEEKOFYEAR":
+		_, week := date.ISOWeek()
+		return week, nil
+	case "QUARTER":
+		return (int(date.Month())-1)/3 + 1, nil
+	}
+	return nil, fmt.Errorf("unknown date component %q", name)
+}
+
+func evalYear(env ExecEnv, args []Expr, row Row) (any, error) {
+	return evalDateComponent("YEAR", args, func(arg Expr) (any, error) { return evalExpr(env, arg, row) })
 }
 
 func evalMonth(env ExecEnv, args []Expr, row Row) (any, error) {
-	if len(args) != 1 {
-		return nil, fmt.Errorf("MONTH expects 1 argument")
-	}
-	val, err := evalExpr(env, args[0], row)
-	if err != nil || val == nil {
-		return nil, err
-	}
-	t, err := parseDateTime(val)
-	if err != nil {
-		return nil, err
-	}
-	return int(t.Month()), nil
+	return evalDateComponent("MONTH", args, func(arg Expr) (any, error) { return evalExpr(env, arg, row) })
 }
 
 func evalDay(env ExecEnv, args []Expr, row Row) (any, error) {
-	if len(args) != 1 {
-		return nil, fmt.Errorf("DAY expects 1 argument")
-	}
-	val, err := evalExpr(env, args[0], row)
-	if err != nil || val == nil {
-		return nil, err
-	}
-	t, err := parseDateTime(val)
-	if err != nil {
-		return nil, err
-	}
-	return t.Day(), nil
+	return evalDateComponent("DAY", args, func(arg Expr) (any, error) { return evalExpr(env, arg, row) })
 }
 
 func evalHour(env ExecEnv, args []Expr, row Row) (any, error) {
-	if len(args) != 1 {
-		return nil, fmt.Errorf("HOUR expects 1 argument")
-	}
-	val, err := evalExpr(env, args[0], row)
-	if err != nil || val == nil {
-		return nil, err
-	}
-	t, err := parseDateTime(val)
-	if err != nil {
-		return nil, err
-	}
-	return t.Hour(), nil
+	return evalDateComponent("HOUR", args, func(arg Expr) (any, error) { return evalExpr(env, arg, row) })
 }
 
 func evalMinute(env ExecEnv, args []Expr, row Row) (any, error) {
-	if len(args) != 1 {
-		return nil, fmt.Errorf("MINUTE expects 1 argument")
-	}
-	val, err := evalExpr(env, args[0], row)
-	if err != nil || val == nil {
-		return nil, err
-	}
-	t, err := parseDateTime(val)
-	if err != nil {
-		return nil, err
-	}
-	return t.Minute(), nil
+	return evalDateComponent("MINUTE", args, func(arg Expr) (any, error) { return evalExpr(env, arg, row) })
 }
 
 func evalSecond(env ExecEnv, args []Expr, row Row) (any, error) {
-	if len(args) != 1 {
-		return nil, fmt.Errorf("SECOND expects 1 argument")
-	}
-	val, err := evalExpr(env, args[0], row)
-	if err != nil || val == nil {
-		return nil, err
-	}
-	t, err := parseDateTime(val)
-	if err != nil {
-		return nil, err
-	}
-	return t.Second(), nil
+	return evalDateComponent("SECOND", args, func(arg Expr) (any, error) { return evalExpr(env, arg, row) })
 }
 
 // parseDateTime tries to parse a value as a time.Time
@@ -583,64 +566,19 @@ func parseDateTime(val any) (time.Time, error) {
 }
 
 func evalDayOfWeek(env ExecEnv, args []Expr, row Row) (any, error) {
-	if len(args) != 1 {
-		return nil, fmt.Errorf("DAYOFWEEK expects 1 argument")
-	}
-	val, err := evalExpr(env, args[0], row)
-	if err != nil || val == nil {
-		return nil, err
-	}
-	t, err := parseDateTime(val)
-	if err != nil {
-		return nil, err
-	}
-	return int(t.Weekday()) + 1, nil // 1=Sunday, 7=Saturday
+	return evalDateComponent("DAYOFWEEK", args, func(arg Expr) (any, error) { return evalExpr(env, arg, row) })
 }
 
 func evalDayOfYear(env ExecEnv, args []Expr, row Row) (any, error) {
-	if len(args) != 1 {
-		return nil, fmt.Errorf("DAYOFYEAR expects 1 argument")
-	}
-	val, err := evalExpr(env, args[0], row)
-	if err != nil || val == nil {
-		return nil, err
-	}
-	t, err := parseDateTime(val)
-	if err != nil {
-		return nil, err
-	}
-	return t.YearDay(), nil
+	return evalDateComponent("DAYOFYEAR", args, func(arg Expr) (any, error) { return evalExpr(env, arg, row) })
 }
 
 func evalWeekOfYear(env ExecEnv, args []Expr, row Row) (any, error) {
-	if len(args) != 1 {
-		return nil, fmt.Errorf("WEEKOFYEAR expects 1 argument")
-	}
-	val, err := evalExpr(env, args[0], row)
-	if err != nil || val == nil {
-		return nil, err
-	}
-	t, err := parseDateTime(val)
-	if err != nil {
-		return nil, err
-	}
-	_, week := t.ISOWeek()
-	return week, nil
+	return evalDateComponent("WEEKOFYEAR", args, func(arg Expr) (any, error) { return evalExpr(env, arg, row) })
 }
 
 func evalQuarter(env ExecEnv, args []Expr, row Row) (any, error) {
-	if len(args) != 1 {
-		return nil, fmt.Errorf("QUARTER expects 1 argument")
-	}
-	val, err := evalExpr(env, args[0], row)
-	if err != nil || val == nil {
-		return nil, err
-	}
-	t, err := parseDateTime(val)
-	if err != nil {
-		return nil, err
-	}
-	return (int(t.Month())-1)/3 + 1, nil
+	return evalDateComponent("QUARTER", args, func(arg Expr) (any, error) { return evalExpr(env, arg, row) })
 }
 
 // applyDateUnitShift adds interval count of unit to t. Calendar units
