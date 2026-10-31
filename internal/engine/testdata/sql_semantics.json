@@ -1,9 +1,36 @@
 {
   "setup": [
     "CREATE TABLE contract_facts (id INT PRIMARY KEY, grp TEXT, k INT, v INT, enabled BOOL)",
-    "INSERT INTO contract_facts VALUES (1,'a',NULL,10,TRUE),(2,'a',2,20,FALSE),(3,'a',1,10,TRUE),(4,'b',NULL,NULL,TRUE),(5,'b',2,7,NULL),(6,'b',3,NULL,FALSE)"
+    "INSERT INTO contract_facts VALUES (1,'a',NULL,10,TRUE),(2,'a',2,20,FALSE),(3,'a',1,10,TRUE),(4,'b',NULL,NULL,TRUE),(5,'b',2,7,NULL),(6,'b',3,NULL,FALSE)",
+    "CREATE TABLE contract_rag (id INT PRIMARY KEY, doc BIGINT, chunk INT, tenant TEXT, body TEXT, embedding VECTOR)",
+    "INSERT INTO contract_rag VALUES (1,9007199254740992,0,'a','alpha','[1,0]'),(2,9007199254740992,1,'a','alpha','[0.8,0.2]'),(3,9007199254740993,0,'b','beta','[0,1]'),(4,9007199254740993,1,'b','beta','[0.2,0.8]')",
+    "CREATE TABLE contract_rag_hits (doc BIGINT, chunk INT)",
+    "INSERT INTO contract_rag_hits VALUES (9007199254740992,0),(9007199254740993,0)"
   ],
   "cases": [
+    {
+      "name": "vector_hits_retain_qualified_metadata",
+      "sql": "SELECT r.id AS hit_id,r._vec_rank AS hit_rank FROM VEC_SEARCH('contract_rag','embedding','[1,0]',2) r ORDER BY hit_rank",
+      "columns": ["hit_id", "hit_rank"],
+      "rows": [[1,1],[2,2]]
+    },
+    {
+      "name": "vector_prefilter_applies_before_top_k",
+      "sql": "SELECT r.id AS hit_id FROM VEC_SEARCH_FILTERED('contract_rag','embedding','[1,0]',2,'{\"pre_filter\":{\"equals\":{\"tenant\":\"b\"}}}') r ORDER BY hit_id",
+      "columns": ["hit_id"],
+      "rows": [[3],[4]]
+    },
+    {
+      "name": "context_keeps_adjacent_bigint_documents_distinct",
+      "sql": "SELECT r.id AS hit_id,CAST(r.doc AS TEXT) AS doc_id FROM RAG_CONTEXT_FROM('contract_rag','doc','chunk','contract_rag_hits','doc','chunk',0,1) r ORDER BY hit_id",
+      "columns": ["hit_id", "doc_id"],
+      "rows": [[1,"9007199254740992"],[2,"9007199254740992"],[3,"9007199254740993"],[4,"9007199254740993"]]
+    },
+    {
+      "name": "reject_null_id_acl_even_with_metadata_filter",
+      "sql": "SELECT id FROM RAG_SEARCH('contract_rag','embedding','[1,0]',2,'{\"pre_filter\":{\"allowed_row_ids\":null,\"equals\":{\"tenant\":\"a\"}}}')",
+      "error": "pre_filter.allowed_row_ids must not be null"
+    },
     {
       "name": "weekday_uses_explicit_input_offset",
       "sql": "SELECT ISODOW('2024-03-01T00:30:00+14:00') AS friday, DATEPART(ISO_WEEKDAY,'2024-03-03T23:30:00-12:00') AS sunday",

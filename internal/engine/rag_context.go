@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -459,13 +460,13 @@ type ragContextIndex struct {
 }
 
 // ragDocumentKey is comparable without allocating for the text document IDs
-// that dominate RAG datasets. Numeric values share one key kind to preserve
-// rawEqual's int/int64/float64 comparison behavior.
+// that dominate RAG datasets. Integers stay exact, and integral float64 IDs
+// share their key only when they represent that integer exactly.
 type ragDocumentKey struct {
-	kind   uint8
-	text   string
-	number float64
-	bool   bool
+	kind    uint8
+	text    string
+	number  float64
+	integer int64
 }
 
 type ragContextKey struct {
@@ -725,7 +726,7 @@ func ragFindContextRows(source ragSource, docCol, chunkCol string, docID any, ce
 				continue
 			}
 			docVal := raw[docIdx]
-			if !rawEqual(docVal, docID) {
+			if !ragContextDocumentsEqual(docVal, docID) {
 				continue
 			}
 			chunkIndex, err := toInt(raw[chunkIdx])
@@ -740,7 +741,7 @@ func ragFindContextRows(source ragSource, docCol, chunkCol string, docID any, ce
 
 	for rowIndex := 0; rowIndex < source.len(); rowIndex++ {
 		docVal, ok := source.value(rowIndex, docCol)
-		if !ok || !rawEqual(docVal, docID) {
+		if !ok || !ragContextDocumentsEqual(docVal, docID) {
 			continue
 		}
 		chunkVal, ok := source.value(rowIndex, chunkCol)
@@ -862,19 +863,18 @@ func (idx ragContextIndex) find(docID any, centerChunk, before, after int) []rag
 	end := sort.Search(len(chunks), func(i int) bool { return chunks[i].chunkIndex > maxChunk })
 	matches := chunks[start:end]
 
-	// The key preserves rawEqual's cross-numeric-type behavior; retain the
-	// final equality check for edge values such as NaN.
+	// Retain the final equality check for unsupported key types and NaN.
 	if len(matches) == 0 {
 		return nil
 	}
 	for i, match := range matches {
-		if rawEqual(match.docID, docID) {
+		if ragContextDocumentsEqual(match.docID, docID) {
 			continue
 		}
 		filtered := make([]ragContextRow, 0, len(matches)-1)
 		filtered = append(filtered, matches[:i]...)
 		for _, remaining := range matches[i+1:] {
-			if rawEqual(remaining.docID, docID) {
+			if ragContextDocumentsEqual(remaining.docID, docID) {
 				filtered = append(filtered, remaining)
 			}
 		}
@@ -888,19 +888,38 @@ func ragContextDocumentKey(docID any) ragDocumentKey {
 	case nil:
 		return ragDocumentKey{kind: 1}
 	case int:
-		return ragDocumentKey{kind: 2, number: float64(v)}
+		return ragDocumentKey{kind: 2, integer: int64(v)}
 	case int64:
-		return ragDocumentKey{kind: 2, number: float64(v)}
+		return ragDocumentKey{kind: 2, integer: v}
 	case float64:
-		return ragDocumentKey{kind: 2, number: v}
+		if v >= -0x1p63 && v < 0x1p63 && math.Trunc(v) == v {
+			return ragDocumentKey{kind: 2, integer: int64(v)}
+		}
+		return ragDocumentKey{kind: 5, number: v}
 	case string:
 		return ragDocumentKey{kind: 3, text: v}
 	case bool:
-		return ragDocumentKey{kind: 4, bool: v}
+		if v {
+			return ragDocumentKey{kind: 4, integer: 1}
+		}
+		return ragDocumentKey{kind: 4}
 	default:
 		// rawEqual cannot match this type, so all unsupported values may share
 		// a key. The final rawEqual check in find filters them back out.
 		return ragDocumentKey{}
+	}
+}
+
+// Context identity must be transitive for indexed lookup and deduplication.
+// Converting an integer to float64 before comparison can equate two distinct
+// BIGINT IDs with the same rounded float. Use the same exact keys for the
+// direct scan and the index so warming cannot change the returned context.
+func ragContextDocumentsEqual(left, right any) bool {
+	switch left.(type) {
+	case int, int64, float64:
+		return ragContextDocumentKey(left) == ragContextDocumentKey(right)
+	default:
+		return rawEqual(left, right)
 	}
 }
 
@@ -909,19 +928,52 @@ func ragContextIdentity(docID any, chunkIndex int) ragContextKey {
 }
 
 func ragContextKeyLess(left, right ragContextKey) bool {
-	if left.document.kind != right.document.kind {
-		return left.document.kind < right.document.kind
+	a, b := left.document, right.document
+	aKind, bKind := a.kind, b.kind
+	if aKind == 5 {
+		aKind = 2
 	}
-	if left.document.text != right.document.text {
-		return left.document.text < right.document.text
+	if bKind == 5 {
+		bKind = 2
 	}
-	if left.document.number != right.document.number {
-		return left.document.number < right.document.number
+	if aKind != bKind {
+		return aKind < bKind
 	}
-	if left.document.bool != right.document.bool {
-		return !left.document.bool && right.document.bool
+	if aKind == 2 && a != b {
+		return ragContextNumericKeyLess(a, b)
+	}
+	if a.text != b.text {
+		return a.text < b.text
+	}
+	if a.integer != b.integer {
+		return a.integer < b.integer
 	}
 	return left.chunkIndex < right.chunkIndex
+}
+
+func ragContextNumericKeyLess(a, b ragDocumentKey) bool {
+	if a.kind == 2 && b.kind == 2 {
+		return a.integer < b.integer
+	}
+	if a.kind == 5 && b.kind == 5 {
+		return a.number < b.number || !math.IsNaN(a.number) && math.IsNaN(b.number)
+	}
+	if a.kind == 5 {
+		return !ragContextNumericKeyLess(b, a)
+	}
+	// b is fractional or outside int64's range. Compare without rounding a
+	// large integer first, particularly at float64(math.MaxInt64) == 2^63.
+	if b.number >= 0x1p63 || math.IsNaN(b.number) {
+		return true
+	}
+	if b.number < -0x1p63 {
+		return false
+	}
+	whole := int64(b.number)
+	if a.integer != whole {
+		return a.integer < whole
+	}
+	return float64(a.integer) < b.number
 }
 
 func ragBetterContextProvenance(hitRank, offset, hitIndex int, current *ragContextCandidate) bool {

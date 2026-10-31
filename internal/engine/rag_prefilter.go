@@ -151,8 +151,23 @@ func ragParseSearchOptions(raw string) (ragSearchOptions, error) {
 		return opts, err
 	}
 	for name, value := range fields {
-		if strings.EqualFold(name, "pre_filter") && strings.TrimSpace(string(value)) == "null" {
+		if !strings.EqualFold(name, "pre_filter") {
+			continue
+		}
+		if strings.TrimSpace(string(value)) == "null" {
 			return opts, fmt.Errorf("pre_filter must not be null")
+		}
+		// An explicit NULL ID list must not silently remove that part of an
+		// ACL when an independent equals/spatial restriction is also present.
+		// RawMessage distinguishes it from an omitted list; [] remains deny-all.
+		var presence struct {
+			AllowedRowIDs json.RawMessage `json:"allowed_row_ids"`
+		}
+		if err := json.Unmarshal(value, &presence); err != nil {
+			return opts, err
+		}
+		if strings.TrimSpace(string(presence.AllowedRowIDs)) == "null" {
+			return opts, fmt.Errorf("pre_filter.allowed_row_ids must not be null")
 		}
 	}
 	return opts, nil
