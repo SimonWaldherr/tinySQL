@@ -274,10 +274,35 @@ class Cursor:
         self._set_result(result)
         return self
 
-    def executemany(self, sql: str, seq_of_parameters: Iterable[Any]) -> "Cursor":
-        """Prepare *sql* once and run it for every parameter sequence."""
+    def executemany(self, sql: str, seq_of_parameters: Iterable[Any], *, batch_size: Optional[int] = None) -> "Cursor":
+        """Prepare once per native batch; batch_size optionally bounds buffering."""
         self._check()
         _validate_text(sql)
+        if batch_size is not None:
+            if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+                raise ProgrammingError("batch_size must be a positive integer")
+            self._reset()
+            sets = []
+            affected = 0
+            started = False
+
+            def flush() -> None:
+                nonlocal affected, started
+                if not started:
+                    self.connection._before_statement(sql)
+                    started = True
+                result = self.connection._call("TinySQLDatabaseExecuteBatch", sql, _dumps(sets))
+                affected += result.get("rowsAffected", 0)
+                sets.clear()
+
+            for parameters in seq_of_parameters:
+                sets.append(_encode_list(parameters))
+                if len(sets) == batch_size:
+                    flush()
+            if sets:
+                flush()
+            self.rowcount = affected
+            return self
         sets = [_encode_list(p) for p in seq_of_parameters]
         self._reset()
         if not sets:
@@ -402,9 +427,12 @@ class Connection:
         """Run one statement and return a cursor with its result."""
         return self.cursor().execute(sql, parameters)
 
-    def executemany(self, sql: str, seq_of_parameters: Iterable[Any]) -> Cursor:
-        """Prepare *sql* once and run it for every parameter sequence."""
-        return self.cursor().executemany(sql, seq_of_parameters)
+    def executemany(self, sql: str, seq_of_parameters: Iterable[Any], *, batch_size: Optional[int] = None) -> Cursor:
+        """Run parameter sequences in one native batch or bounded chunks."""
+        if batch_size is None:
+            # Keep the original call shape for user-supplied cursor overrides.
+            return self.cursor().executemany(sql, seq_of_parameters)
+        return self.cursor().executemany(sql, seq_of_parameters, batch_size=batch_size)
 
     def executescript(self, script: str) -> Cursor:
         """Run a multi-statement script. A pending implicit transaction is committed first."""

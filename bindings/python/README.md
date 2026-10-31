@@ -65,7 +65,8 @@ the `disk`, `json`, `index` and `hybrid` modes. See the
   Row-producing statements (SELECT, WITH, PRAGMA, `... RETURNING`) fill the
   cursor; others set `cursor.rowcount`.
 - `executemany(sql, rows)` prepares the statement once in the engine and
-  sends all parameter rows in a single native call.
+  sends all parameter rows in a single native call by default. Pass
+  `batch_size=1000` to consume an iterable in bounded native batches.
 - `executescript(script)` runs several statements; semicolons inside
   strings, comments and `CREATE TRIGGER ... BEGIN ... END` bodies are handled.
 - Placeholders: `?` (the declared `paramstyle`), `$1` or `:1`. Named
@@ -126,3 +127,25 @@ The single-database functions of the former bindings (`TinySQLExec`,
 `TinySQLSave`, `TinySQLLoad`, `TinySQLReset`, `TinySQLVersion`,
 `TinySQLFree`) are still exported by the library for existing `ctypes`
 callers. New code should use this package.
+
+## Large imports
+
+```python
+conn.execute("CREATE TABLE events (id INT PRIMARY KEY, body TEXT)")
+with conn.transaction():
+    conn.executemany("INSERT INTO events VALUES (?, ?)",
+                     ((i, "event") for i in range(100_000)), batch_size=1000)
+```
+
+The optional positive integer `batch_size` bounds the encoded rows per call.
+Omitting it retains whole-input validation and the existing single-call behavior.
+Chunked imports validate incrementally: a failing generator, invalid parameter or
+SQL error can leave earlier chunks applied outside a transaction. Use the scope
+above for all-or-nothing ingestion. Error row numbers refer to the failing chunk.
+`rowcount` is the combined affected count on success and stays unknown (-1) on
+failure. No transaction is opened for empty input.
+
+Each chunk prepares the statement again; tune the size for row width, memory
+and call overhead. This bounds parameter assembly, not query result memory:
+results remain materialized, including when fetched using `fetchmany`.
+See [bulk integration measurements](../../docs/language-bindings.md#large-data-imports).

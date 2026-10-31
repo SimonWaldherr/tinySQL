@@ -6,6 +6,7 @@ import datetime
 import decimal
 import doctest
 import gzip
+import json
 import math
 import os
 import pathlib
@@ -120,6 +121,79 @@ class ConnectionTests(unittest.TestCase):
         self.assertTrue(self.conn.in_transaction)
         self.conn.rollback()
         self.assertFalse(self.conn.in_transaction)
+
+    def test_chunked_batches_preserve_order_types_and_counts(self):
+        self.conn.execute("CREATE TABLE chunks (id INT PRIMARY KEY, text TEXT, raw BLOB)")
+        consumed = []
+        def rows():
+            for i in range(7):
+                consumed.append(i)
+                yield (i, "text\x00" if i % 2 else None, b"\x00\xff")
+        from unittest.mock import patch
+        native_call = self.conn._library.call
+        sizes = []
+        def observe(name, *args):
+            if name == "TinySQLDatabaseExecuteBatch":
+                sizes.append(len(json.loads(args[-1])))
+                self.assertEqual(len(consumed), sum(sizes))
+            return native_call(name, *args)
+        with patch.object(self.conn._library, "call", side_effect=observe):
+            cur = self.conn.executemany("INSERT INTO chunks VALUES (?, ?, ?)", rows(), batch_size=3)
+        self.assertEqual(sizes, [3, 3, 1])
+        self.assertEqual(cur.rowcount, 7)
+        self.assertEqual(consumed, list(range(7)))
+        self.assertEqual([tuple(r) for r in self.conn.execute("SELECT * FROM chunks ORDER BY id")],
+                         [(i, "text\x00" if i % 2 else None, b"\x00\xff") for i in range(7)])
+        self.assertEqual(cur.executemany("INSERT INTO chunks VALUES (?, ?, ?)", iter(()), batch_size=2).rowcount, 0)
+        for size in [0, -1, True, 1.5]:
+            with self.assertRaises(tinysql.ProgrammingError):
+                cur.executemany("INSERT INTO chunks VALUES (?, ?, ?)", rows(), batch_size=size)
+        self.assertEqual(consumed, list(range(7)))
+
+    def test_chunked_failures_and_default_validation_remain_distinct(self):
+        self.conn.execute("CREATE TABLE chunks (id INT PRIMARY KEY)")
+        with self.assertRaises(tinysql.IntegrityError):
+            self.conn.executemany("INSERT INTO chunks VALUES (?)", [(1,), (2,), (1,)], batch_size=2)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0], 2)
+        self.conn.execute("DELETE FROM chunks")
+        with self.assertRaises(tinysql.IntegrityError):
+            with self.conn.transaction():
+                self.conn.executemany("INSERT INTO chunks VALUES (?)", [(1,), (2,), (1,)], batch_size=2)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0], 0)
+        # Legacy mode validates the whole parameter iterable before any write.
+        with self.assertRaises(tinysql.ProgrammingError):
+            self.conn.executemany("INSERT INTO chunks VALUES (?)", [(1,), (object(),)])
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0], 0)
+        def broken():
+            yield (3,)
+            yield (4,)
+            raise ValueError("source failed")
+        with self.assertRaises(ValueError):
+            with self.conn.transaction():
+                self.conn.executemany("INSERT INTO chunks VALUES (?)", broken(), batch_size=2)
+        self.assertFalse(self.conn.in_transaction)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0], 0)
+
+    def test_large_chunked_generator(self):
+        self.conn.execute("CREATE TABLE large_chunks (id INT PRIMARY KEY)")
+        with self.conn.transaction():
+            result = self.conn.executemany("INSERT INTO large_chunks VALUES (?)",
+                                           ((i,) for i in range(5003)), batch_size=1024)
+        self.assertEqual(result.rowcount, 5003)
+        self.assertEqual(tuple(self.conn.execute("SELECT COUNT(*),SUM(id) FROM large_chunks").fetchone()),
+                         (5003, 5003 * 5002 // 2))
+
+    def test_default_executemany_preserves_legacy_cursor_override(self):
+        from unittest.mock import patch
+        self.conn.execute("CREATE TABLE legacy_cursor (id INT)")
+        cursor = self.conn.cursor()
+        class LegacyCursor:
+            def executemany(self, sql, parameters):
+                return cursor.executemany(sql, parameters)
+        with patch.object(self.conn, "cursor", return_value=LegacyCursor()):
+            result = self.conn.executemany("INSERT INTO legacy_cursor VALUES (?)", [(1,), (2,)])
+        self.assertEqual(result.rowcount, 2)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM legacy_cursor").fetchone()[0], 2)
 
     def test_other_parameter_types(self):
         self.conn.execute("CREATE TABLE t (d TEXT, ts TEXT, dec TEXT, mv BLOB)")

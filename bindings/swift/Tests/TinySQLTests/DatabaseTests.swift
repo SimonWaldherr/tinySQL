@@ -240,6 +240,56 @@ final class DatabaseTests: XCTestCase {
         try await database.close()
     }
 
+    func testBoundedBatchesAndPositionalAccess() async throws {
+        let database = try await Database.open()
+        try await database.execute("CREATE TABLE chunks (id INT PRIMARY KEY, raw BLOB)")
+        let changed = try await database.transaction { db in
+            try db.executeBatchChunked("INSERT INTO chunks VALUES (?, ?)",
+                parameterSets: (0..<7).lazy.map { [.integer(Int64($0)), .blob(Data([0, 255]))] }, batchSize: 3)
+        }
+        XCTAssertEqual(changed, 7)
+        let result = try await database.query("SELECT id AS repeated, id AS repeated, raw FROM chunks ORDER BY id")
+        let index = try XCTUnwrap(result.columnIndex("REPEATED"))
+        XCTAssertEqual(index, 0)
+        let legacyLookup = result.value
+        XCTAssertEqual(legacyLookup(0, "REPEATED"), .integer(0))
+        let legacyEmpty = try await database.transaction { db in
+            let legacyBatch = db.executeBatch
+            return try legacyBatch("INSERT INTO chunks VALUES (?, ?)", [])
+        }
+        XCTAssertEqual(legacyEmpty, 0)
+        for i in 0..<7 {
+            XCTAssertEqual(result.valueAt(row: i, column: index), .integer(Int64(i)))
+            XCTAssertEqual(result.valueAt(row: i, column: 2), .blob(Data([0, 255])))
+        }
+        XCTAssertNil(result.valueAt(row: -1, column: index))
+        XCTAssertNil(result.valueAt(row: 0, column: -1))
+        XCTAssertNil(result.valueAt(row: 0, column: 99))
+        let large = try await database.transaction { db in
+            try db.executeBatchChunked("INSERT INTO chunks (id) VALUES (?)",
+                parameterSets: (7..<5007).lazy.map { [.integer(Int64($0))] }, batchSize: 1024)
+        }
+        XCTAssertEqual(large, 5000)
+        let empty = try await database.executeBatchChunked("INSERT INTO chunks VALUES (?, ?)", parameterSets: [[SQLValue]](), batchSize: 2)
+        XCTAssertEqual(empty, 0)
+        for size in [0, -1] {
+            do {
+                try await database.executeBatchChunked("INSERT INTO chunks (id) VALUES (?)", parameterSets: [[9]], batchSize: size)
+                XCTFail("Invalid batch size accepted")
+            } catch TinySQLError.invalidInput { }
+        }
+        try await database.execute("DELETE FROM chunks")
+        do {
+            try await database.transaction { db in
+                try db.executeBatchChunked("INSERT INTO chunks (id) VALUES (?)", parameterSets: [[1], [2], [1]], batchSize: 2)
+            }
+            XCTFail("Duplicate key was accepted")
+        } catch TinySQLError.database { }
+        let remaining = try await database.query("SELECT COUNT(*) FROM chunks")
+        XCTAssertEqual(remaining.rows, [[0]])
+        try await database.close()
+    }
+
     @MainActor
     func testExecutorRunsAwayFromMainActor() async throws {
         let database = try await Database.open()

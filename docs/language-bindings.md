@@ -196,3 +196,38 @@ serialisiert, verschiedene Handles laufen parallel. Für Massendaten Batches
 in einer Transaktion verwenden und große Ergebnisse mit `LIMIT` seitenweise
 lesen. `make test-bindings` testet C, Python und Rust; Swift läuft unter macOS
 mit `make test-swift`.
+
+## Large data imports
+
+All three bindings offer opt-in bounded parameter batches without a C ABI
+change. Existing calls continue to submit a single native batch.
+
+| Binding | Bounded import | Reusable column position |
+| --- | --- | --- |
+| Python | `conn.executemany(sql, rows, batch_size=1000)` | Existing `row[index]` or named Row lookup |
+| Swift | `db.executeBatchChunked(sql, parameterSets: sequence, batchSize: 1000)` | `columnIndex(name)`, then `valueAt(row:column:)` |
+| Rust | `db.execute_batch_chunked(sql, iterator, 1000)` | `rows.column_index(name)?`, then `row.value(index)?` or `row.get(index)?` |
+
+The batch size counts rows, not bytes. Use lazy producers to avoid constructing
+the entire input before ingestion. Each native chunk re-prepares the statement;
+smaller chunks trade call/setup overhead for lower transient memory. Chunked
+validation occurs during consumption, so errors can leave earlier chunks
+and rows preceding the error within the failing chunk applied. Wrap the complete
+import in the binding's transaction scope for atomicity;
+error row numbers refer to the failing chunk. These APIs do not stream query
+results: result sets still cross the bridge as a complete JSON response. Stored
+data, transaction state and already collected inputs have separate memory costs.
+
+A local Python 3.15.2 measurement over 20,000 rows (integer plus 128 ASCII
+characters), using three runs and a sink in place of the native library, found:
+
+| Parameter batch | Median peak Python heap | Native-call placeholders | Largest JSON payload |
+| --- | ---: | ---: | ---: |
+| One complete batch (existing default) | 8,079,936 bytes | 1 | 2,768,891 bytes |
+| 1,000 rows per chunk | 409,548 bytes | 20 | 139,001 bytes |
+
+The harness uses `tracemalloc`; native Go decoding, SQL execution and persistent
+storage are excluded. These figures demonstrate reduced Python parameter memory,
+not an end-to-end speedup or measured Swift/Rust memory usage. Reproduce with
+`python3 bindings/python/benchmarks/batch_memory.py`. See each binding README for
+transaction examples, error semantics and ownership constraints.

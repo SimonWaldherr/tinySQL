@@ -147,6 +147,35 @@ public actor Database {
         return try statementResult(result).rowsAffected ?? 0
     }
 
+    /// Consumes a sequence in bounded native batches, including lazy sequences.
+    /// Earlier chunks remain applied on failure unless wrapped in transaction.
+    /// Native row numbers in errors are relative to the failing chunk.
+    @discardableResult
+    public func executeBatchChunked<S: Sequence>(
+        _ sql: String, parameterSets: S, batchSize: Int
+    ) throws -> Int64 where S.Element == [SQLValue] {
+        try requireOpen()
+        try Task.checkCancellation()
+        guard batchSize > 0 else {
+            throw TinySQLError.invalidInput("batchSize must be positive")
+        }
+        guard !sql.utf8.contains(0) else { throw TinySQLError.invalidInput("SQL must not contain NUL") }
+        var chunk: [[SQLValue]] = []
+        var affected: Int64 = 0
+        for row in parameterSets {
+            try Task.checkCancellation()
+            chunk.append(row)
+            if chunk.count == batchSize {
+                affected += try executeBatch(sql, parameterSets: chunk)
+                chunk.removeAll(keepingCapacity: true)
+            }
+        }
+        if !chunk.isEmpty {
+            affected += try executeBatch(sql, parameterSets: chunk)
+        }
+        return affected
+    }
+
     /// Flushes durable storage modes to disk; a no-op for other databases.
     public func sync() throws {
         try requireOpen()

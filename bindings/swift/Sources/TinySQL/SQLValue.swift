@@ -136,9 +136,15 @@ public struct QueryResult: Sendable, Equatable {
 
     /// The value of column `name` in row `row`, or nil when either does not exist.
     public func value(row: Int, column name: String) -> SQLValue? {
-        guard rows.indices.contains(row), let index = columnIndex(name), rows[row].indices.contains(index) else {
+        guard let index = columnIndex(name) else {
             return nil
         }
+        return valueAt(row: row, column: index)
+    }
+
+    /// Resolve columnIndex once and reuse it across rows without repeated name scans.
+    public func valueAt(row: Int, column index: Int) -> SQLValue? {
+        guard rows.indices.contains(row), rows[row].indices.contains(index) else { return nil }
         return rows[row][index]
     }
 }

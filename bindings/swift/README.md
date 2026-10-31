@@ -204,3 +204,33 @@ The C ABI is documented in
 [`tinysql.h`](../c/include/tinysql.h) (module `CTinySQL`). Each returned C
 buffer must be freed with `TinySQLDatabaseFree`; the Swift wrapper does this
 with `defer`, including error paths.
+
+## Large imports and wide results
+
+`executeBatchChunked` accepts a `Sequence`, including a lazy producer.
+Construct lazy inputs inside the isolated transaction closure to keep generation
+and ingestion on the database executor:
+
+```swift
+try await database.execute("CREATE TABLE events (id INT PRIMARY KEY, body TEXT)")
+try await database.transaction { db in
+    try db.executeBatchChunked("INSERT INTO events VALUES (?, ?)",
+        parameterSets: (0..<100_000).lazy.map { [.integer(Int64($0)), .text("event")] },
+        batchSize: 1000)
+}
+let result = try await database.query("SELECT body FROM events LIMIT 100")
+if let column = result.columnIndex("BODY") {
+    for row in result.rows.indices {
+        let value = result.valueAt(row: row, column: column)
+        print(value as Any)
+    }
+}
+```
+
+Existing array-based `executeBatch` calls retain their single native call.
+`batchSize` must be positive; each chunk prepares the statement separately.
+Earlier chunks remain applied on errors or cancellation outside a transaction.
+Native error row numbers are relative to the failing chunk. Parameter memory
+scales with chunk size and row width; query results still materialize in full.
+Resolve a column name once and use the checked integer accessor in row loops;
+invalid row or column positions return nil, as named access does.

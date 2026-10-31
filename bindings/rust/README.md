@@ -103,3 +103,31 @@ make test-rust            # from the repository root
 # or
 cargo test --manifest-path bindings/rust/Cargo.toml
 ```
+
+## Large imports and wide results
+
+`execute_batch_chunked` consumes an iterator in bounded native calls; the
+existing `execute_batch` keeps its single-call behavior:
+
+```rust
+use tinysql::Value;
+db.execute("CREATE TABLE events (id INT PRIMARY KEY, body TEXT)", &[])?;
+db.transaction(|tx| tx.execute_batch_chunked(
+    "INSERT INTO events VALUES (?, ?)",
+    (0..100_000).map(|i| vec![Value::from(i), Value::from("event")]),
+    1000,
+))?;
+let rows = db.query("SELECT body FROM events LIMIT 100", &[])?;
+let body = rows.column_index("BODY")?;
+for row in &rows {
+    let value = row.value(body)?; // Borrow the value; reuse the resolved position.
+    println!("{value:?}");
+}
+```
+
+Batch size must be positive. Encoding and validation are incremental; earlier
+chunks remain applied on failure without a transaction. Error row numbers are
+relative to their native chunk. Each chunk prepares the statement separately.
+Memory depends on chunk size and row width; an already collected input is still
+retained by its owner. Query results remain materialized. Column lookup chooses
+the first ASCII case-insensitive name, as existing `Row::get` does.

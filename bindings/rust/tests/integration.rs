@@ -306,3 +306,67 @@ fn transaction_rolls_back_during_panic_unwinding() {
         Some(2)
     );
 }
+
+#[test]
+fn chunked_ingestion_and_reusable_column_positions() {
+    let db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE chunks (id INT PRIMARY KEY, raw BLOB)", &[])
+        .unwrap();
+    let rows = (0..7).map(|i| vec![Value::Integer(i), Value::Blob(vec![0, 255])]);
+    let summary = db
+        .execute_batch_chunked("INSERT INTO chunks VALUES (?, ?)", rows, 3)
+        .unwrap();
+    assert_eq!((summary.statements, summary.rows_affected), (7, 7));
+    let rows = db
+        .query(
+            "SELECT id AS repeated, id AS repeated, raw FROM chunks ORDER BY id",
+            &[],
+        )
+        .unwrap();
+    let column = rows.column_index("REPEATED").unwrap();
+    assert_eq!(column, 0);
+    assert!(rows.column_index("missing").is_err());
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(row.get::<i64>(column).unwrap(), i as i64);
+        assert_eq!(row.get::<Vec<u8>>(2).unwrap(), vec![0, 255]);
+    }
+    let large = db
+        .execute_batch_chunked(
+            "INSERT INTO chunks (id) VALUES (?)",
+            (7..5007).map(|i| vec![Value::from(i)]),
+            1024,
+        )
+        .unwrap();
+    assert_eq!(large.rows_affected, 5000);
+    assert_eq!(
+        db.query_value::<i64>("SELECT COUNT(*) FROM chunks", &[])
+            .unwrap(),
+        Some(5007)
+    );
+    assert!(db
+        .execute_batch_chunked("", Vec::<Vec<Value>>::new(), 0)
+        .is_err());
+    let empty = db
+        .execute_batch_chunked(
+            "INSERT INTO chunks VALUES (?, ?)",
+            Vec::<Vec<Value>>::new(),
+            2,
+        )
+        .unwrap();
+    assert_eq!(empty.statements, 0);
+    db.execute("DELETE FROM chunks", &[]).unwrap();
+    let failed = db.transaction(|tx| {
+        tx.execute_batch_chunked(
+            "INSERT INTO chunks (id) VALUES (?)",
+            [vec![1.into()], vec![2.into()], vec![1.into()]],
+            2,
+        )
+    });
+    assert!(failed.is_err());
+    assert!(!db.in_transaction());
+    assert_eq!(
+        db.query_value::<i64>("SELECT COUNT(*) FROM chunks", &[])
+            .unwrap(),
+        Some(0)
+    );
+}

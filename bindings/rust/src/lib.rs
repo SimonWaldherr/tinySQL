@@ -406,6 +406,42 @@ impl Database {
         Ok(summary(&response))
     }
 
+    /// Imports an iterator in bounded native batches. Memory for encoded
+    /// parameters scales with `batch_size`, not the total iterator length.
+    /// Earlier chunks remain applied on failure unless enclosed in a transaction.
+    /// Native row numbers in errors are relative to the failing chunk.
+    pub fn execute_batch_chunked<I, R>(
+        &self,
+        sql: &str,
+        rows: I,
+        batch_size: usize,
+    ) -> Result<Summary>
+    where
+        I: IntoIterator<Item = R>,
+        R: AsRef<[Value]>,
+    {
+        if batch_size == 0 {
+            return Err(Error::InvalidInput("batch_size must be positive".into()));
+        }
+        let mut chunk = Vec::new();
+        let mut total = Summary::default();
+        for row in rows {
+            chunk.push(row);
+            if chunk.len() == batch_size {
+                let result = self.execute_batch(sql, &chunk)?;
+                total.statements += result.statements;
+                total.rows_affected += result.rows_affected;
+                chunk.clear();
+            }
+        }
+        if !chunk.is_empty() {
+            let result = self.execute_batch(sql, &chunk)?;
+            total.statements += result.statements;
+            total.rows_affected += result.rows_affected;
+        }
+        Ok(total)
+    }
+
     /// Runs `body` inside `BEGIN ... COMMIT`, attempting rollback on errors or
     /// panic unwinding while the transaction remains active. With panic=abort, process termination cannot run cleanup.
     /// Dedicate the handle to this scope: concurrent calls on the same handle
@@ -545,6 +581,12 @@ impl Rows {
     /// Column names in result order.
     pub fn columns(&self) -> &[String] {
         &self.columns
+    }
+
+    /// Resolve a name once, then reuse the position with Row::get for wide results.
+    /// Matching is ASCII case-insensitive and chooses the first duplicate name.
+    pub fn column_index(&self, name: &str) -> Result<usize> {
+        name.position(&self.columns)
     }
 
     pub fn len(&self) -> usize {
