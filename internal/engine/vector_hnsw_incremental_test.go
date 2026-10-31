@@ -108,7 +108,7 @@ func TestVecHNSWIncrementalExtendMatchesFullRebuild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := vecIndexCacheKey{tenant: "default", table: table.Name, colIdx: colIdx, metric: "cosine"}
+	key := vecIndexCacheKey{source: table, tenant: "default", table: table.Name, colIdx: colIdx, metric: "cosine"}
 
 	vecHNSWCacheMu.RLock()
 	incremental := vecHNSWCache[key]
@@ -196,7 +196,7 @@ func TestVecHNSWExtendFallsBackToFullRebuildAfterUpdateOrDelete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := vecIndexCacheKey{tenant: "default", table: table.Name, colIdx: colIdx, metric: "cosine"}
+	key := vecIndexCacheKey{source: table, tenant: "default", table: table.Name, colIdx: colIdx, metric: "cosine"}
 
 	for i := 0; i < 40; i++ {
 		insertRow(i)
@@ -339,7 +339,7 @@ func TestVecHNSWExtendContextCancellationLeavesConsistentGraph(t *testing.T) {
 	}
 	table.Version++
 
-	key := vecIndexCacheKey{tenant: "default", table: table.Name, colIdx: colIdx, metric: "cosine"}
+	key := vecIndexCacheKey{source: table, tenant: "default", table: table.Name, colIdx: colIdx, metric: "cosine"}
 	vecHNSWCacheMu.RLock()
 	idx := vecHNSWCache[key]
 	vecHNSWCacheMu.RUnlock()

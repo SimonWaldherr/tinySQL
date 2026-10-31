@@ -42,7 +42,7 @@ func TestVecWarmBuildsIndex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := vecIndexCacheKey{tenant: "default", table: table.Name, colIdx: colIdx, metric: "cosine"}
+	key := vecIndexCacheKey{source: table, tenant: "default", table: table.Name, colIdx: colIdx, metric: "cosine"}
 	vecHNSWCacheMu.RLock()
 	idx := vecHNSWCache[key]
 	vecHNSWCacheMu.RUnlock()

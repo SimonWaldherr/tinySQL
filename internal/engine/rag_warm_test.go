@@ -36,7 +36,7 @@ func TestRAGWarmBuildsVectorAndFTSCaches(t *testing.T) {
 		t.Fatal(err)
 	}
 	vectorColumn, _ := table.ColIndex("embedding")
-	vectorKey := vecIndexCacheKey{tenant: "default", table: table.Name, colIdx: vectorColumn, metric: "cosine"}
+	vectorKey := vecIndexCacheKey{source: table, tenant: "default", table: table.Name, colIdx: vectorColumn, metric: "cosine"}
 	vecHNSWCacheMu.RLock()
 	vectorIndex := vecHNSWCache[vectorKey]
 	vecHNSWCacheMu.RUnlock()

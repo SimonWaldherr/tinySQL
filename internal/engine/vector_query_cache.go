@@ -8,6 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 // VectorCacheConfig controls the optional process-wide VEC_SEARCH result
@@ -65,8 +67,11 @@ type VectorQueryEvent struct {
 
 type vecQueryCacheKey struct {
 	tenant, table, column, metric, index string
-	version, k                           int
-	query                                [32]byte
+	// Names and versions are local to a database. The source identity also
+	// distinguishes independent databases, transaction shadows and replacements.
+	source     *storage.Table
+	version, k int
+	query      [32]byte
 }
 type vecQueryCacheEntry struct {
 	rows    []vecScoredRow
@@ -174,7 +179,7 @@ func vecAnalyticsEnabled() bool {
 	return vecQueryCacheState.analyticsEnabled.Load()
 }
 
-func vecQueryKey(tenant string, tableName, colName string, version int, a vecSearchArgs) vecQueryCacheKey {
+func vecQueryKey(tenant string, table *storage.Table, colName string, a vecSearchArgs) vecQueryCacheKey {
 	h := sha256.New()
 	var bits [8]byte
 	for _, v := range a.queryVec {
@@ -183,7 +188,7 @@ func vecQueryKey(tenant string, tableName, colName string, version int, a vecSea
 	}
 	var query [32]byte
 	copy(query[:], h.Sum(nil))
-	return vecQueryCacheKey{tenant: tenant, table: tableName, column: colName, version: version, metric: a.metric, index: a.indexMode, k: a.k, query: query}
+	return vecQueryCacheKey{tenant: tenant, table: table.Name, source: table, column: colName, version: table.Version, metric: a.metric, index: a.indexMode, k: a.k, query: query}
 }
 
 func mathFloat64bits(v float64) uint64 { return math.Float64bits(v) }

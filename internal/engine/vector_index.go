@@ -36,6 +36,7 @@ const (
 )
 
 type vecIndexCacheKey struct {
+	source *storage.Table
 	tenant string
 	table  string
 	colIdx int
@@ -46,6 +47,21 @@ type vecIndexCacheKey struct {
 // key — see vecIVFBuilds/vecHNSWBuilds and vecColumnBuildCall (vector_search.go)
 // for the shared pattern.
 type vecIndexBuildCall struct{ done chan struct{} }
+
+// A waiting request owns neither the build nor its lifetime. It may leave
+// without canceling the builder or other waiters.
+func waitVecIndexBuild(ctx context.Context, done <-chan struct{}) error {
+	if ctx == nil {
+		<-done
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		return nil
+	}
+}
 
 type vecIVFIndex struct {
 	table         *storage.Table
@@ -359,7 +375,7 @@ func finalizeVecScoredRows(metric string, rows []vecScoredRow) {
 }
 
 func getVecIVFIndex(ctx context.Context, tenant string, table *storage.Table, colIdx int, metric string, dims int, cache vecSearchColumnCacheEntry) (*vecIVFIndex, error) {
-	key := vecIndexCacheKey{tenant: tenant, table: table.Name, colIdx: colIdx, metric: metric}
+	key := vecIndexCacheKey{source: table, tenant: tenant, table: table.Name, colIdx: colIdx, metric: metric}
 
 	// Lock-free fast path — see publishVecIVFCacheSnapshotLocked.
 	if snap := vecIVFCacheSnapshot.Load(); snap != nil {
@@ -383,7 +399,9 @@ func getVecIVFIndex(ctx context.Context, tenant string, table *storage.Table, co
 		}
 		if call := vecIVFBuilds[key]; call != nil {
 			vecIVFCacheMu.Unlock()
-			<-call.done
+			if err := waitVecIndexBuild(ctx, call.done); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		call := &vecIndexBuildCall{done: make(chan struct{})}
@@ -544,7 +562,7 @@ func (idx *vecIVFIndex) search(ctx context.Context, query []float64, queryNorm f
 }
 
 func getVecHNSWIndex(ctx context.Context, tenant string, table *storage.Table, colIdx int, metric string, dims int, cache vecSearchColumnCacheEntry) (*vecHNSWIndex, error) {
-	key := vecIndexCacheKey{tenant: tenant, table: table.Name, colIdx: colIdx, metric: metric}
+	key := vecIndexCacheKey{source: table, tenant: tenant, table: table.Name, colIdx: colIdx, metric: metric}
 
 	for {
 		vecHNSWCacheMu.RLock()
@@ -562,7 +580,9 @@ func getVecHNSWIndex(ctx context.Context, tenant string, table *storage.Table, c
 		}
 		if call := vecHNSWBuilds[key]; call != nil {
 			vecHNSWCacheMu.Unlock()
-			<-call.done
+			if err := waitVecIndexBuild(ctx, call.done); err != nil {
+				return nil, err
+			}
 			continue
 		}
 

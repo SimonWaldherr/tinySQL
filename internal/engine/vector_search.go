@@ -219,6 +219,7 @@ func vecScoredHeapDown(h vecScoredHeap, i0 int) {
 }
 
 type vecSearchColumnCacheKey struct {
+	source *storage.Table
 	tenant string
 	table  string
 	colIdx int
@@ -369,13 +370,12 @@ func (c vecSearchColumnCacheEntry) contiguousSegment() (vecColumnSegment, bool) 
 type vecColumnBuildCall struct{ done chan struct{} }
 
 // vecColumnCacheMaxEntries bounds the column cache. Entries are keyed by
-// (tenant, table, column) and each one pins its *storage.Table — including
-// every row — via the entry's table pointer. Same-name replacement reuses
-// the key, and DROP TABLE purges eagerly (purgeVectorCachesFor), but paths
-// with no purge hook (table renames, tenant removal) would otherwise leak
-// one pinned table per orphaned key for the life of the process. When the
-// cap is hit, arbitrary entries are evicted; the cost of a bad eviction is
-// one lazy rebuild scan on next query.
+// (source identity, tenant, table, column) and each one pins its table,
+// including every row. DROP TABLE purges eagerly (purgeVectorCachesFor),
+// but replacements, renames and tenant removal may leave older identities
+// behind. Without a cap those entries would remain for the life of the
+// process. At capacity, arbitrary entries are evicted; the cost of a bad
+// eviction is one lazy rebuild scan on the next query.
 const vecColumnCacheMaxEntries = 256
 
 var (
@@ -462,7 +462,7 @@ func evictOverCap[K comparable, V any](m map[K]V, maxEntries int) {
 }
 
 func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeNorms bool) vecSearchColumnCacheEntry {
-	key := vecSearchColumnCacheKey{tenant: tenant, table: table.Name, colIdx: colIdx}
+	key := vecSearchColumnCacheKey{source: table, tenant: tenant, table: table.Name, colIdx: colIdx}
 
 	// Lock-free fast path: entries are immutable once published (verified:
 	// buildVecColumnCache/extendVecColumnCache/mergeVecColumnSegments always
@@ -1128,7 +1128,7 @@ func vecSearchCandidates(ctx context.Context, env ExecEnv, a vecSearchArgs) (*st
 		cacheHit          bool
 	)
 	if cacheEnabled {
-		key = vecQueryKey(tenant, table.Name, a.colName, table.Version, a)
+		key = vecQueryKey(tenant, table, a.colName, a)
 		scoredRowsOrdered, cacheHit = getVecQueryCache(key)
 	}
 	if !cacheHit {
