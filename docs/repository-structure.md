@@ -127,8 +127,16 @@ Reference examples live in `docs/reference/functions.sql`; `make reference`
 regenerates its HTML view and the browser playground's JSON overview. Generation
 never executes FILE/HTTP examples or captures the current clock.
 
+The former root paths remain compatible: `FUNCTIONS.sql` and
+`example_showcase.sql` are copies refreshed by `make reference`,
+`FUNCTIONS.sql.html` redirects to the canonical HTML page, and
+`demo_formats.sh` forwards to the script under `scripts/`. Edit the canonical
+sources; freshness tests protect the compatibility copies from drifting.
+
 Builds and coverage use `bin/`. Put profiling output there too, for example
 `go test -o bin/engine.test -cpuprofile=bin/engine.cpu.prof ./internal/engine`.
 `make clean` removes generated build output and recognized ignored root leftovers,
 including the obsolete `.gocache/`. It preserves database files, WALs and the local
 `.gh-pages-worktree/`; worktrees have their own Git lifecycle.
+The default coverage path is `bin/coverage.out`; older automation that expects
+a root profile can still use `make test-all COVERPROFILE=coverage.out`.

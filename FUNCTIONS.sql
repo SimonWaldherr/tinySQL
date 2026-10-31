@@ -1,0 +1,1720 @@
+-- tinySQL Function Examples
+-- Selected examples of the tinySQL SQL dialect. See ../sql-semantics.md
+-- for exact compatibility rules. Later sections may require their setup
+-- statements, local sample files, network access, or optional build tags.
+
+-- ============================================================
+-- CHECKED SEMANTICS EXAMPLES
+-- ============================================================
+-- This section runs in the native test suite. Examples are independent,
+-- deterministic and require no files, network, session language or timezone.
+
+-- ISO weekdays use Monday=1 through Sunday=7 in the input's explicit offset.
+SELECT ISODOW('2024-03-01T00:30:00+14:00') AS friday,
+       DATEPART(ISO_WEEKDAY,'2024-03-03T23:30:00-12:00') AS sunday;
+
+-- DATEDIFF counts UTC boundaries; TIMESTAMPDIFF counts complete elapsed units.
+-- Calendar months are not approximated as 30 days.
+SELECT DATEDIFF(MONTH,'2024-01-31','2024-02-29') AS boundaries,
+       TIMESTAMPDIFF(MONTH,'2024-01-31','2024-02-29') AS complete_months;
+
+-- Equivalent instants and DST transitions use elapsed UTC time.
+SELECT DATEDIFF(DAY,'2024-03-01T00:30:00+01:00','2024-02-29T23:30:00Z') AS same_instant,
+       TIMESTAMPDIFF(HOUR,'2024-03-30T12:00:00+01:00','2024-03-31T12:00:00+02:00') AS elapsed_hours;
+
+-- NULL is distinct from empty text, zero and FALSE. ISNULL is a Boolean test.
+SELECT ISNULL(NULL) AS missing, ISNULL('') AS empty_text,
+       0 IS NOT NULL AS zero_present, FALSE IS NOT NULL AS false_present;
+
+-- Replacement functions evaluate only the arguments they need.
+SELECT COALESCE('ok',1/0) AS lazy_value, IFNULL(NULL,FALSE) AS replacement;
+
+-- Trimming accepts a set of Unicode characters. An empty set removes nothing.
+SELECT LTRIM('🙂xxtext','🙂x') AS characters,
+       TRIM(' text ','') AS empty_set, TRIM(NULL,1/0) AS lazy_null;
+
+-- STRING_SPLIT uses a literal, possibly multi-character delimiter.
+-- Empty fields are preserved; request ordinals and ORDER BY for stable order.
+SELECT value,ordinal FROM STRING_SPLIT('alpha::beta::::','::',1) ORDER BY ordinal;
+
+-- FILTER restricts aggregate input without removing the group itself.
+WITH reference_values AS (SELECT 1 AS v UNION ALL SELECT 2 AS v UNION ALL SELECT NULL AS v)
+SELECT COUNT(*) FILTER (WHERE v IS NOT NULL) AS non_null_rows,
+       SUM(v) FILTER (WHERE v>=2) AS selected_total FROM reference_values;
+
+-- JSON_GET reads structured JSON values, not unparsed SQL text.
+-- Nested objects from JSON table input can be accessed using dotted/bracket paths.
+SELECT JSON_GET(meta,'items[0].sku') AS sku, JSON_GET(meta,'value') AS json_null
+FROM TABLE_FROM_JSON('[{"meta":{"items":[{"sku":"A"}],"value":null}}]');
+
+-- JSON table functions currently decode numeric cells as float64.
+-- Transport identifiers above 2^53 as JSON strings to retain their precision.
+SELECT id AS exact_id
+FROM TABLE_FROM_JSON('[{"id":"9007199254740993"}]');
+
+-- JSON Lines accepts one object per line, including surrounding blank lines.
+SELECT id,name FROM TABLE_FROM_JSON_LINES('
+{"id":1,"name":"Ada"}
+{"id":2,"name":"Lin"}
+') ORDER BY id;
+
+-- END CHECKED SEMANTICS EXAMPLES
+
+-- ============================================================
+-- DATE AND TIME FUNCTIONS
+-- ============================================================
+
+-- Current date and time
+SELECT NOW() as current_timestamp;
+SELECT CURRENT_DATE() as today;
+SELECT CURRENT_TIME() as current_time;
+
+-- Date part extraction
+SELECT YEAR(NOW()) as current_year;
+SELECT MONTH(NOW()) as current_month;
+SELECT DAY(NOW()) as current_day;
+SELECT HOUR(NOW()) as current_hour;
+SELECT MINUTE(NOW()) as current_minute;
+SELECT SECOND(NOW()) as current_second;
+SELECT QUARTER(NOW()) as current_quarter;
+SELECT DAYOFWEEK(NOW()) as day_of_week;
+SELECT DAYOFYEAR(NOW()) as day_of_year;
+SELECT WEEKOFYEAR(NOW()) as week_of_year;
+
+-- EXTRACT function (alternative to individual functions)
+SELECT EXTRACT('YEAR', NOW()) as year;
+SELECT EXTRACT('MONTH', NOW()) as month;
+SELECT EXTRACT('DAY', NOW()) as day;
+SELECT EXTRACT('QUARTER', NOW()) as quarter;
+SELECT EXTRACT('WEEK', NOW()) as week;
+SELECT EXTRACT('DAYOFWEEK', NOW()) as dow;
+
+-- Date arithmetic
+SELECT DATE_ADD(CURRENT_DATE(), 7, 'DAY') as next_week;
+SELECT DATE_SUB(CURRENT_DATE(), 30, 'DAY') as last_month;
+SELECT DATEDIFF('DAYS', '2024-01-01', '2024-12-31') as days_in_2024;
+
+-- ADD_MONTHS function
+SELECT ADD_MONTHS(CURRENT_DATE(), 3) as three_months_later;
+SELECT ADD_MONTHS(CURRENT_DATE(), -6) as six_months_ago;
+
+-- DATE_TRUNC function (truncate to period start)
+SELECT DATE_TRUNC('YEAR', NOW()) as start_of_year;
+SELECT DATE_TRUNC('QUARTER', NOW()) as start_of_quarter;
+SELECT DATE_TRUNC('MONTH', NOW()) as start_of_month;
+SELECT DATE_TRUNC('WEEK', NOW()) as start_of_week;
+SELECT DATE_TRUNC('DAY', NOW()) as start_of_day;
+SELECT DATE_TRUNC('HOUR', NOW()) as start_of_hour;
+
+-- EOMONTH function (end of month)
+SELECT EOMONTH(CURRENT_DATE()) as end_of_current_month;
+SELECT EOMONTH(CURRENT_DATE(), 1) as end_of_next_month;
+SELECT EOMONTH(CURRENT_DATE(), -1) as end_of_last_month;
+
+-- IN_PERIOD function (period membership checks)
+SELECT IN_PERIOD('TODAY', CURRENT_DATE()) as is_today;
+SELECT IN_PERIOD('YTD', '2024-06-15') as is_year_to_date;
+SELECT IN_PERIOD('MTD', CURRENT_DATE()) as is_month_to_date;
+SELECT IN_PERIOD('QTD', CURRENT_DATE()) as is_quarter_to_date;
+SELECT IN_PERIOD('L12M', DATE_SUB(CURRENT_DATE(), 180, 'DAY')) as is_last_12_months;
+SELECT IN_PERIOD('CURRENT_QUARTER', CURRENT_DATE()) as is_current_quarter;
+SELECT IN_PERIOD('PREVIOUS_QUARTER', DATE_SUB(CURRENT_DATE(), 120, 'DAY')) as was_previous_quarter;
+SELECT IN_PERIOD('CURRENT_YEAR_FULL', CURRENT_DATE()) as is_current_year;
+
+-- Date formatting
+SELECT STRFTIME('%Y-%m-%d', NOW()) as iso_date;
+SELECT STRFTIME('%d.%m.%Y', NOW()) as german_date;
+SELECT STRFTIME('%A, %B %d, %Y', NOW()) as long_date;
+SELECT DATE(NOW()) as date_only;
+SELECT TIME(NOW()) as time_only;
+
+-- ============================================================
+-- STRING FUNCTIONS
+-- ============================================================
+
+-- Case conversion
+SELECT UPPER('hello world') as uppercase;
+SELECT LOWER('HELLO WORLD') as lowercase;
+SELECT INITCAP('hello world from tinysql') as title_case;
+
+-- String manipulation
+SELECT CONCAT('Hello', ' ', 'World') as concatenated;
+SELECT CONCAT_WS(', ', 'Apple', 'Banana', 'Cherry') as joined_with_separator;
+SELECT LENGTH('Hello World') as string_length;
+SELECT CHAR_LENGTH('Hello') as char_length;
+SELECT SUBSTRING('Hello World', 7, 5) as substring_result;
+SELECT SUBSTR('Hello World', 1, 5) as substr_result;
+SELECT LEFT('Hello World', 5) as left_chars;
+SELECT RIGHT('Hello World', 5) as right_chars;
+SELECT REVERSE('Hello') as reversed;
+SELECT REPEAT('Ha', 3) as repeated;
+
+-- String trimming
+SELECT TRIM('  Hello  ') as trimmed;
+SELECT LTRIM('  Hello') as left_trimmed;
+SELECT RTRIM('Hello  ') as right_trimmed;
+
+-- String padding
+SELECT LPAD('42', 5, '0') as left_padded;
+SELECT RPAD('42', 5, '0') as right_padded;
+
+-- String replacement
+SELECT REPLACE('Hello World', 'World', 'Universe') as replaced;
+
+-- String search
+SELECT INSTR('Hello World', 'World') as position;
+SELECT LOCATE('World', 'Hello World') as locate_position;
+
+-- String formatting
+SELECT PRINTF('Value: %d, Name: %s', 42, 'Test') as formatted;
+SELECT FORMAT('Pi is approximately %.2f', 3.14159) as formatted_number;
+
+-- SPLIT function (returns array)
+SELECT SPLIT('apple,banana,cherry', ',') as fruit_array;
+
+-- Split and extract part (existing function)
+SELECT SPLIT_PART('apple,banana,cherry', ',', 2) as second_fruit;
+
+-- Special string functions
+SELECT SPACE(10) as ten_spaces;
+SELECT ASCII('A') as ascii_value;
+SELECT CHAR(65) as char_from_ascii;
+SELECT SOUNDEX('Smith') as soundex_code;
+SELECT QUOTE('It''s a test') as quoted_string;
+
+-- ============================================================
+-- REGEX FUNCTIONS
+-- ============================================================
+
+-- Pattern matching
+SELECT REGEXP_MATCH('test@example.com', '.*@.*\.com') as is_email;
+SELECT REGEXP_MATCH('12345', '^\d+$') as is_numeric;
+
+-- Pattern extraction
+SELECT REGEXP_EXTRACT('Order #12345 processed', '#\d+') as order_number;
+SELECT REGEXP_EXTRACT('Email: test@example.com', '\w+@\w+\.\w+') as email;
+
+-- Pattern replacement
+SELECT REGEXP_REPLACE('2024-11-27', '-', '/') as date_with_slashes;
+SELECT REGEXP_REPLACE('Hello123World456', '\d+', 'X') as numbers_replaced;
+
+-- ============================================================
+-- FULL-TEXT SEARCH FUNCTIONS
+-- ============================================================
+
+-- FTS_MATCH: boolean match against a query (term, phrase, boolean, wildcard)
+SELECT FTS_MATCH('the quick brown fox', 'fox') as has_fox;
+SELECT FTS_MATCH('the quick brown fox', 'quick AND fox') as has_both;
+SELECT FTS_MATCH('the quick brown fox', 'cat OR fox') as has_either;
+SELECT FTS_MATCH('the quick brown fox', 'NOT cat') as lacks_cat;
+SELECT FTS_MATCH('the quick brown fox jumps', '"quick brown"') as has_phrase;
+SELECT FTS_MATCH('the database stores information', 'inform*') as has_prefix;
+-- ? / _ match one character; * / % match zero or more characters.
+SELECT FTS_MATCH('colour palette', 'colo?r') as single_char_wildcard;
+SELECT FTS_MATCH('database systems', 'data%') as multi_char_wildcard;
+
+-- FTS_RANK / BM25: relevance score for the same query syntax (higher = more relevant)
+SELECT FTS_RANK('the quick brown fox', 'fox AND quick') as relevance;
+SELECT BM25('the quick brown fox', 'fox AND quick') as relevance_alias;
+
+-- FTS_SNIPPET / FTS_HIGHLIGHT: return the text with matches wrapped in markers
+SELECT FTS_SNIPPET('the quick brown fox', 'fox', '<em>', '</em>', '', 10) as excerpt;
+
+-- FTS_WORD_COUNT: number of (stop-word-filtered, stemmed) tokens
+SELECT FTS_WORD_COUNT('hello world foo') as token_count;
+
+-- FTS_SEARCH table-valued function: ranked search across a real table.
+-- With no column arguments it searches the WHOLE ROW (every column, not
+-- just TEXT ones); pass explicit column names to restrict the search.
+-- Repeated calls against an unchanged table reuse a cached tokenization,
+-- so it's cheap for interactive/repeated queries.
+CREATE TABLE fts_demo_articles (id INT, title TEXT, body TEXT);
+INSERT INTO fts_demo_articles VALUES (1, 'Go Programming', 'Go is a fast compiled language for systems programming');
+INSERT INTO fts_demo_articles VALUES (2, 'Python Tutorial', 'Python is a dynamic scripting language popular for data science');
+INSERT INTO fts_demo_articles VALUES (3, 'Database Design', 'Relational databases store data in tables with relationships');
+
+SELECT id, title, _fts_score, _fts_rank
+FROM FTS_SEARCH('fts_demo_articles', 'programming language', 2)
+ORDER BY _fts_rank;
+
+-- Restrict the search to a single column
+SELECT id, title FROM FTS_SEARCH('fts_demo_articles', 'relational', 5, 'body');
+
+DROP TABLE fts_demo_articles;
+
+-- ROW_TO_TEXT: ad-hoc whole-row substring search inside an ordinary WHERE
+-- clause, combinable with other conditions. Cheaper to set up than
+-- FTS_SEARCH (no ranking, no table function) but also less precise; good
+-- for a quick "search everywhere" filter.
+CREATE TABLE row_to_text_demo (id INT, customer TEXT, status TEXT);
+INSERT INTO row_to_text_demo VALUES (1, 'Acme Corp', 'open');
+INSERT INTO row_to_text_demo VALUES (2, 'Globex', 'closed');
+SELECT id FROM row_to_text_demo WHERE ROW_TO_TEXT() LIKE '%Acme%' AND status = 'open';
+DROP TABLE row_to_text_demo;
+
+-- CONTAINS_ALL / CONTAINS_ANY / CONTAINS_SCORE: a friendlier, case-insensitive
+-- alternative to chaining "ROW_TO_TEXT() LIKE '%term%' AND ROW_TO_TEXT() LIKE
+-- '%other%' ..." for each term. Terms are literal substrings, not patterns —
+-- unlike LIKE, '%' and '_' have no wildcard meaning here.
+CREATE TABLE contains_demo (id INT, description TEXT);
+INSERT INTO contains_demo VALUES (1, 'Widget A2000 - blue, waterproof');
+INSERT INTO contains_demo VALUES (2, 'Widget B300 - red');
+INSERT INTO contains_demo VALUES (3, 'Gadget C100 - blue, waterproof, wireless');
+
+-- CONTAINS_ALL: every term must be present (case-insensitive substring match)
+SELECT id, description FROM contains_demo
+WHERE CONTAINS_ALL(description, 'blue', 'waterproof');
+
+-- CONTAINS_ANY: at least one term must be present
+SELECT id, description FROM contains_demo
+WHERE CONTAINS_ANY(description, 'wireless', 'red');
+
+-- CONTAINS_SCORE: count of matched terms (0..N) - use in ORDER BY to rank
+-- rows by how many search terms they contain
+SELECT id, description, CONTAINS_SCORE(description, 'blue', 'waterproof', 'wireless') as match_count
+FROM contains_demo
+ORDER BY match_count DESC;
+
+DROP TABLE contains_demo;
+
+-- ============================================================
+-- NUMERIC FUNCTIONS
+-- ============================================================
+
+-- Basic math
+SELECT ABS(-42) as absolute_value;
+SELECT SIGN(-15) as sign_of_number;
+SELECT ROUND(3.14159, 2) as rounded;
+SELECT FLOOR(3.7) as floor_value;
+SELECT CEIL(3.2) as ceiling_value;
+SELECT CEILING(3.2) as ceiling_value2;
+SELECT TRUNCATE(3.14159, 2) as truncated;
+SELECT TRUNC(3.14159, 2) as trunc_value;
+
+-- Advanced math
+SELECT POWER(2, 8) as power_of_two;
+SELECT POW(3, 3) as cube;
+SELECT SQRT(16) as square_root;
+SELECT MOD(17, 5) as modulo;
+
+-- Logarithms and exponentials
+SELECT LOG(100) as natural_log;
+SELECT LN(2.71828) as ln_value;
+SELECT LOG10(1000) as log_base_10;
+SELECT LOG2(1024) as log_base_2;
+SELECT EXP(1) as euler_number;
+
+-- Trigonometry
+SELECT PI() as pi_value;
+SELECT SIN(PI() / 2) as sine_90_degrees;
+SELECT COS(0) as cosine_0_degrees;
+SELECT TAN(PI() / 4) as tangent_45_degrees;
+SELECT ASIN(1) as arcsine;
+SELECT ACOS(0) as arccosine;
+SELECT ATAN(1) as arctangent;
+SELECT ATAN2(1, 1) as atan2_value;
+SELECT DEGREES(PI()) as radians_to_degrees;
+SELECT RADIANS(180) as degrees_to_radians;
+
+-- Random numbers
+SELECT RANDOM() as random_value;
+SELECT RAND() as rand_value;
+
+-- ============================================================
+-- ARRAY FUNCTIONS
+-- ============================================================
+
+-- Create arrays
+SELECT SPLIT('red,green,blue', ',') as colors;
+
+-- Array element access
+SELECT FIRST(SPLIT('alpha,beta,gamma', ',')) as first_element;
+SELECT LAST(SPLIT('alpha,beta,gamma', ',')) as last_element;
+
+-- Array properties
+SELECT ARRAY_LENGTH(SPLIT('one,two,three,four', ',')) as array_size;
+
+-- Array membership
+SELECT ARRAY_CONTAINS(SPLIT('apple,banana,cherry', ','), 'banana') as has_banana;
+SELECT IN_ARRAY(SPLIT('1,2,3,4,5', ','), '3') as has_three;
+
+-- Array to string
+SELECT ARRAY_JOIN(SPLIT('hello,world', ','), ' ') as joined_array;
+SELECT ARRAY_JOIN(SPLIT('a,b,c', ','), ' - ') as joined_with_dash;
+
+-- Array manipulation
+SELECT ARRAY_DISTINCT(SPLIT('a,b,a,c,b,d', ',')) as unique_elements;
+SELECT ARRAY_SORT(SPLIT('zebra,apple,mango,banana', ',')) as sorted_array;
+
+-- ============================================================
+-- AGGREGATE FUNCTIONS
+-- ============================================================
+
+-- Create a sample table for aggregate examples
+CREATE TABLE temp_numbers (group_id INT, value INT);
+INSERT INTO temp_numbers VALUES (1, 10), (1, 20), (1, 30);
+INSERT INTO temp_numbers VALUES (2, 5), (2, 15), (2, 25);
+INSERT INTO temp_numbers VALUES (3, 100), (3, 200);
+-- COUNT
+SELECT group_id, COUNT(*) as total_count FROM temp_numbers GROUP BY group_id;
+SELECT group_id, COUNT(value) as non_null_count FROM temp_numbers GROUP BY group_id;
+
+-- Basic aggregates (use with GROUP BY in real queries)
+-- SELECT COUNT(*) as total_count FROM table;
+-- SELECT COUNT(column) as non_null_count FROM table;
+-- SELECT SUM(amount) as total FROM table;
+-- SELECT AVG(value) as average FROM table;
+-- SELECT MIN(price) as minimum FROM table;
+-- SELECT MAX(price) as maximum FROM table;
+
+-- MIN_BY and MAX_BY - Get value from row with min/max of another column
+-- These are useful for time-series data and finding associated values
+
+-- Create a sample sales table
+CREATE TABLE temp_sales (product TEXT, sale_date TEXT, amount INT);
+INSERT INTO temp_sales VALUES ('Laptop', '2025-01-15', 1200);
+INSERT INTO temp_sales VALUES ('Mouse', '2025-03-20', 25);
+INSERT INTO temp_sales VALUES ('Keyboard', '2025-02-10', 75);
+INSERT INTO temp_sales VALUES ('Monitor', '2025-01-05', 350);
+
+-- Get the product name from the row with the earliest date
+SELECT MIN_BY(product, sale_date) as earliest_product FROM temp_sales;
+
+-- Get the product name from the row with the latest date
+SELECT MAX_BY(product, sale_date) as latest_product FROM temp_sales;
+
+-- Get the product name with the lowest amount
+SELECT MIN_BY(product, amount) as cheapest FROM temp_sales;
+
+-- Get the product name with the highest amount
+SELECT MAX_BY(product, amount) as most_expensive FROM temp_sales;
+
+-- Get the amount from the row with the earliest date
+SELECT MIN_BY(amount, sale_date) as earliest_amount FROM temp_sales;
+
+-- Get the amount from the row with the latest date
+SELECT MAX_BY(amount, sale_date) as latest_amount FROM temp_sales;
+
+-- Aliases ARG_MIN and ARG_MAX are also supported
+SELECT ARG_MIN(product, amount) as cheapest_via_argmin FROM temp_sales;
+SELECT ARG_MAX(product, amount) as most_expensive_via_argmax FROM temp_sales;
+
+-- Clean up
+DROP TABLE temp_sales;
+DROP TABLE temp_numbers;
+
+-- ============================================================
+-- COMPARISON AND RANGE PREDICATES
+-- ============================================================
+
+-- BETWEEN: inclusive range check, equivalent to (x >= lo AND x <= hi)
+SELECT 5 BETWEEN 1 AND 10 as in_range;
+SELECT 15 BETWEEN 1 AND 10 as out_of_range;
+SELECT 5 NOT BETWEEN 1 AND 10 as not_in_range;
+
+-- BETWEEN also works on dates and strings (lexicographic range for strings)
+SELECT '2024-06-15' BETWEEN '2024-01-01' AND '2024-12-31' as in_2024;
+SELECT 'mango' BETWEEN 'apple' AND 'peach' as alphabetically_between;
+
+-- The comparand is evaluated exactly once even for expensive/non-deterministic
+-- expressions, e.g. RANDOM() BETWEEN 0.0 AND 1.0 is always true, never
+-- comparing two different random draws against each other.
+SELECT RANDOM() BETWEEN 0.0 AND 1.0 as random_is_always_in_unit_range;
+
+-- ============================================================
+-- LIMIT / OFFSET
+-- ============================================================
+
+CREATE TABLE limit_demo (id INT);
+INSERT INTO limit_demo VALUES (1);
+INSERT INTO limit_demo VALUES (2);
+INSERT INTO limit_demo VALUES (3);
+INSERT INTO limit_demo VALUES (4);
+INSERT INTO limit_demo VALUES (5);
+
+-- LIMIT ALL means "no limit" (same as omitting LIMIT entirely)
+SELECT * FROM limit_demo ORDER BY id LIMIT ALL;
+
+-- LIMIT/OFFSET accept any constant expression, not just a bare literal
+SELECT * FROM limit_demo ORDER BY id LIMIT 2 + 1 OFFSET 1 * 2;
+
+-- SQL:2008 standard syntax: OFFSET n ROWS FETCH {FIRST|NEXT} m ROWS ONLY
+SELECT * FROM limit_demo ORDER BY id OFFSET 1 ROWS FETCH FIRST 2 ROWS ONLY;
+
+DROP TABLE limit_demo;
+
+-- ============================================================
+-- CONDITIONAL AND NULL HANDLING
+-- ============================================================
+
+-- NULL handling
+SELECT COALESCE(NULL, NULL, 'default') as first_non_null;
+SELECT NVL(NULL, 'replacement') as nvl_result;
+SELECT IFNULL(NULL, 'value') as ifnull_result;
+SELECT NULLIF(5, 5) as nullif_equal;
+SELECT NULLIF(5, 3) as nullif_different;
+
+-- Conditional
+SELECT IF(10 > 5, 'yes', 'no') as if_result;
+SELECT IIF(2 + 2 = 4, 'correct', 'wrong') as iif_result;
+SELECT GREATEST(10, 25, 15, 30) as greatest_value;
+SELECT LEAST(10, 25, 15, 30) as least_value;
+
+-- CASE expressions
+SELECT
+    CASE
+        WHEN 10 > 20 THEN 'impossible'
+        WHEN 10 > 5 THEN 'correct'
+        ELSE 'wrong'
+    END as case_result;
+
+-- ============================================================
+-- CRYPTOGRAPHIC AND ENCODING FUNCTIONS
+-- ============================================================
+
+-- Hashing
+SELECT MD5('password') as md5_hash;
+SELECT SHA1('password') as sha1_hash;
+SELECT SHA256('password') as sha256_hash;
+SELECT SHA512('password') as sha512_hash;
+
+-- Encoding
+SELECT BASE64('Hello World') as base64_encoded;
+SELECT BASE64_DECODE('SGVsbG8gV29ybGQ=') as base64_decoded;
+SELECT HEX('Hello') as hex_encoded;
+SELECT UNHEX('48656C6C6F') as hex_decoded;
+
+-- ============================================================
+-- JSON FUNCTIONS
+-- ============================================================
+
+-- JSON columns decode stored JSON text; JSON_GET/JSON_EXTRACT read the value.
+CREATE TABLE json_reference (id INT, meta JSON);
+INSERT INTO json_reference VALUES (1, '{"name":"John","user":{"name":"Jane"},"items":[{"sku":"A"}]}');
+SELECT JSON_GET(meta,'name') AS json_name, JSON_EXTRACT(meta,'user.name') AS nested_value FROM json_reference;
+UPDATE json_reference SET meta=JSON_SET(meta,'items[0].sku','B') WHERE id=1;
+SELECT JSON_GET(meta,'items[0].sku') AS updated_sku FROM json_reference;
+DROP TABLE json_reference;
+
+-- ============================================================
+-- TYPE CONVERSION AND INTROSPECTION
+-- ============================================================
+
+-- Type casting
+SELECT CAST('123' AS INTEGER) as string_to_int;
+SELECT CAST(3.14 AS INTEGER) as float_to_int;
+SELECT CAST(42 AS TEXT) as int_to_string;
+
+-- Type checking
+SELECT TYPEOF(42) as integer_type;
+SELECT TYPEOF('text') as string_type;
+SELECT TYPEOF(3.14) as float_type;
+
+-- ============================================================
+-- UTILITY FUNCTIONS
+-- ============================================================
+
+-- UUID generation
+SELECT UUID() as unique_id;
+
+-- Version info
+SELECT VERSION() as tinysql_version;
+
+-- ============================================================
+-- WINDOW FUNCTIONS
+-- ============================================================
+
+-- Window functions operate on a set of rows (window) relative to the current row
+-- Syntax: function() OVER (PARTITION BY ... ORDER BY ... frame_clause)
+
+-- Create sample table for window function examples
+CREATE TABLE window_demo (
+    product TEXT,
+    category TEXT,
+    sale_date TEXT,
+    amount INT
+);
+
+INSERT INTO window_demo VALUES ('Laptop', 'Electronics', '2025-01-15', 1200);
+INSERT INTO window_demo VALUES ('Mouse', 'Electronics', '2025-01-20', 25);
+INSERT INTO window_demo VALUES ('Desk', 'Furniture', '2025-01-25', 350);
+INSERT INTO window_demo VALUES ('Keyboard', 'Electronics', '2025-02-10', 75);
+INSERT INTO window_demo VALUES ('Chair', 'Furniture', '2025-02-15', 200);
+
+-- ROW_NUMBER: Assign unique row numbers
+SELECT
+    product,
+    amount,
+    ROW_NUMBER() OVER (ORDER BY amount) as row_num
+FROM window_demo
+ORDER BY amount;
+
+-- ROW_NUMBER with PARTITION BY: Restart numbering per partition
+SELECT
+    product,
+    category,
+    amount,
+    ROW_NUMBER() OVER (PARTITION BY category ORDER BY amount) as row_in_category
+FROM window_demo
+ORDER BY category, amount;
+
+-- RANK: like ROW_NUMBER, but tied rows share a rank and the next rank
+-- skips ahead by the tie-group size (e.g. 1, 1, 3)
+SELECT
+    product,
+    amount,
+    RANK() OVER (ORDER BY amount DESC) as rank_by_amount
+FROM window_demo
+ORDER BY amount DESC;
+
+-- DENSE_RANK: like RANK, but no gaps after ties (e.g. 1, 1, 2)
+SELECT
+    product,
+    amount,
+    DENSE_RANK() OVER (ORDER BY amount DESC) as dense_rank_by_amount
+FROM window_demo
+ORDER BY amount DESC;
+
+-- PERCENT_RANK and CUME_DIST: relative standing within the partition, as a
+-- fraction in [0, 1]
+SELECT
+    product,
+    amount,
+    PERCENT_RANK() OVER (ORDER BY amount) as percent_rank,
+    CUME_DIST() OVER (ORDER BY amount) as cume_dist
+FROM window_demo
+ORDER BY amount;
+
+-- NTILE: split the partition into N (approximately) equal-sized buckets
+SELECT
+    product,
+    amount,
+    NTILE(3) OVER (ORDER BY amount) as tercile
+FROM window_demo
+ORDER BY amount;
+
+-- LAG: Access previous row value
+SELECT
+    product,
+    amount,
+    LAG(amount, 1) OVER (ORDER BY sale_date) as previous_amount
+FROM window_demo
+ORDER BY sale_date;
+
+-- LAG with default value for first row
+SELECT
+    product,
+    amount,
+    LAG(amount, 1, 0) OVER (ORDER BY sale_date) as previous_or_zero
+FROM window_demo
+ORDER BY sale_date;
+
+-- LEAD: Access next row value
+SELECT
+    product,
+    amount,
+    LEAD(amount, 1) OVER (ORDER BY sale_date) as next_amount
+FROM window_demo
+ORDER BY sale_date;
+
+-- FIRST_VALUE: Get first value in window
+SELECT
+    product,
+    amount,
+    FIRST_VALUE(product) OVER (ORDER BY amount) as cheapest_product
+FROM window_demo
+ORDER BY amount;
+
+-- FIRST_VALUE with PARTITION BY
+SELECT
+    product,
+    category,
+    amount,
+    FIRST_VALUE(product) OVER (PARTITION BY category ORDER BY amount) as cheapest_in_category
+FROM window_demo
+ORDER BY category, amount;
+
+-- LAST_VALUE: Get last value in window (up to current row by default)
+SELECT
+    product,
+    amount,
+    LAST_VALUE(product) OVER (ORDER BY amount) as most_expensive_so_far
+FROM window_demo
+ORDER BY amount;
+
+-- MOVING_SUM: Calculate moving/rolling sum
+SELECT
+    product,
+    sale_date,
+    amount,
+    MOVING_SUM(3, amount) OVER (ORDER BY sale_date) as rolling_sum_3days
+FROM window_demo
+ORDER BY sale_date;
+
+-- MOVING_AVG: Calculate moving/rolling average
+SELECT
+    product,
+    sale_date,
+    amount,
+    MOVING_AVG(3, amount) OVER (ORDER BY sale_date) as rolling_avg_3days
+FROM window_demo
+ORDER BY sale_date;
+
+-- Complex example: LAG with PARTITION BY
+SELECT
+    product,
+    category,
+    amount,
+    LAG(amount, 1) OVER (PARTITION BY category ORDER BY sale_date) as prev_in_category
+FROM window_demo
+ORDER BY category, sale_date;
+
+-- Clean up
+DROP TABLE window_demo;
+
+-- ============================================================
+-- COMPLEX QUERIES COMBINING MULTIPLE FUNCTIONS
+-- ============================================================
+
+-- Example 1: Date range analysis with period check
+SELECT
+    CURRENT_DATE() as today,
+    DATE_TRUNC('MONTH', CURRENT_DATE()) as month_start,
+    EOMONTH(CURRENT_DATE()) as month_end,
+    IN_PERIOD('MTD', CURRENT_DATE()) as is_month_to_date,
+    DATEDIFF('DAYS', DATE_TRUNC('MONTH', CURRENT_DATE()), CURRENT_DATE()) as days_into_month;
+
+-- Example 2: String processing with regex
+SELECT
+    REGEXP_EXTRACT('Order #12345', '#(\d+)') as order_id,
+    UPPER(REGEXP_REPLACE('test@EXAMPLE.com', '@.*', '')) as username,
+    ARRAY_LENGTH(SPLIT('item1,item2,item3', ',')) as item_count;
+
+-- Example 3: Numeric calculations
+SELECT
+    ROUND(PI() * POWER(5, 2), 2) as circle_area_r5,
+    DEGREES(ATAN2(3, 4)) as angle_degrees,
+    ABS(SIGN(-42) * 100) as absolute_signed;
+
+-- Example 4: Array operations
+SELECT
+    FIRST(ARRAY_SORT(ARRAY_DISTINCT(SPLIT('zebra,apple,zebra,mango', ',')))) as first_sorted_unique,
+    ARRAY_JOIN(ARRAY_SORT(SPLIT('3,1,4,1,5,9', ',')), ' -> ') as sorted_numbers;
+
+-- Example 5: Conditional logic with dates
+SELECT
+    CASE
+        WHEN IN_PERIOD('TODAY', CURRENT_DATE()) THEN 'Today'
+        WHEN IN_PERIOD('MTD', CURRENT_DATE()) THEN 'This Month'
+        WHEN IN_PERIOD('QTD', CURRENT_DATE()) THEN 'This Quarter'
+        WHEN IN_PERIOD('YTD', CURRENT_DATE()) THEN 'This Year'
+        ELSE 'Historical'
+    END as period_classification;
+
+-- Example 6: NULL handling with coalesce chain
+SELECT
+    COALESCE(
+        NULL,
+        NULLIF('', ''),
+        REGEXP_EXTRACT('No match here', 'PATTERN'),
+        'Final Default'
+    ) as coalesce_result;
+
+-- ============================================================
+-- PIVOT
+-- ============================================================
+
+-- PIVOT spreads the distinct values of one column into new output columns,
+-- aggregating another column into each. Every other selected column becomes
+-- an implicit GROUP BY key. Scope: one aggregate function and a static
+-- (literal) value list.
+CREATE TABLE pivot_demo (region TEXT, category TEXT, amount INT);
+INSERT INTO pivot_demo VALUES ('East', 'Electronics', 100);
+INSERT INTO pivot_demo VALUES ('East', 'Furniture', 50);
+INSERT INTO pivot_demo VALUES ('West', 'Electronics', 200);
+INSERT INTO pivot_demo VALUES ('West', 'Furniture', 75);
+
+-- One row per region, one column per category, aliased for clean output names
+SELECT *
+FROM pivot_demo
+PIVOT (SUM(amount) FOR category IN ('Electronics' AS electronics, 'Furniture' AS furniture));
+
+-- WHERE filters the source rows before pivoting
+SELECT *
+FROM pivot_demo
+WHERE amount >= 100
+PIVOT (SUM(amount) FOR category IN ('Electronics' AS electronics));
+
+-- COUNT works too, not just SUM
+SELECT *
+FROM pivot_demo
+PIVOT (COUNT(amount) FOR category IN ('Electronics' AS electronics_count, 'Furniture' AS furniture_count));
+
+DROP TABLE pivot_demo;
+
+-- ============================================================
+-- PRACTICAL USE CASES
+-- ============================================================
+
+-- Use Case 1: Email validation and extraction
+SELECT
+    REGEXP_MATCH('user@example.com', '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$') as is_valid_email,
+    SPLIT_PART('user@example.com', '@', 1) as username,
+    SPLIT_PART('user@example.com', '@', 2) as domain;
+
+-- Use Case 2: Date-based filtering helper
+SELECT
+    IN_PERIOD('LAST_12_MONTHS', ADD_MONTHS(CURRENT_DATE(), -6)) as in_last_year,
+    IN_PERIOD('CURRENT_QUARTER', CURRENT_DATE()) as in_current_quarter,
+    EXTRACT('QUARTER', CURRENT_DATE()) as current_quarter_number;
+
+-- Complex Example: DISTINCT ON + ROW_NUMBER, string concatenation,
+-- column names with spaces, and timestamp helpers.
+CREATE TABLE demo_orders (
+    order_id INT,
+    customer TEXT,
+    order_date TEXT,
+    total INT,
+    "customer name" TEXT
+);
+
+INSERT INTO demo_orders VALUES
+    (1, 'alice', '2025-01-10 09:15:00', 120, 'Alice A'),
+    (2, 'alice', '2025-02-05 14:20:00', 200, 'Alice A'),
+    (3, 'bob',   '2025-01-12 11:05:00', 75,  'Robert B'),
+    (4, 'bob',   '2025-03-01 08:30:00', 50,  'Robert B'),
+    (5, 'carol', '2025-02-20 16:45:00', 300, 'Carol C');
+
+-- Use DISTINCT ON to pick the most recent order per customer.
+-- Note: DISTINCT ON keeps the first row per key; ORDER BY controls which row is first.
+SELECT DISTINCT ON (customer)
+    customer,
+    "customer name",
+    total,
+    order_date,
+    -- STRING CONCAT via + operator (also works with CONCAT)
+    customer + ' - ' + CAST(total AS TEXT) AS summary,
+    -- ROW_NUMBER demonstrates window function numbering per PARTITION
+    ROW_NUMBER() OVER (PARTITION BY customer ORDER BY order_date DESC) AS rn,
+    -- TIMESTAMP helpers
+    GETDATE() AS now_ts,
+    TODAY() AS today_date,
+    FROM_TIMESTAMP(0) AS epoch_zero,
+    TIMESTAMP('2023-05-01 00:00:00') AS ts_epoch
+FROM demo_orders
+ORDER BY customer, order_date DESC;
+
+-- Show all rows with ROW_NUMBER and LAG for context
+SELECT
+    order_id,
+    customer,
+    "customer name",
+    order_date,
+    total,
+    ROW_NUMBER() OVER (PARTITION BY customer ORDER BY order_date) AS rn_asc,
+    LAG(total, 1) OVER (PARTITION BY customer ORDER BY order_date) AS prev_total
+FROM demo_orders
+ORDER BY customer, order_date;
+
+-- Cleanup demo table
+DROP TABLE demo_orders;
+
+-- Use Case 3: String normalization
+SELECT
+    UPPER(TRIM(REGEXP_REPLACE('  Hello   World  ', '\s+', ' '))) as normalized_string;
+
+-- Use Case 4: Array processing from CSV
+SELECT
+    ARRAY_LENGTH(SPLIT('red,green,blue,yellow', ',')) as color_count,
+    ARRAY_CONTAINS(SPLIT('red,green,blue', ','), 'green') as has_green,
+    ARRAY_JOIN(ARRAY_SORT(ARRAY_DISTINCT(SPLIT('b,a,c,a,b', ','))), ',') as sorted_unique;
+
+-- Use Case 5: Complex date arithmetic
+SELECT
+    ADD_MONTHS(DATE_TRUNC('YEAR', CURRENT_DATE()), 6) as mid_year,
+    EOMONTH(ADD_MONTHS(CURRENT_DATE(), 3), 0) as end_of_quarter,
+    DATEDIFF('DAYS',
+        DATE_TRUNC('YEAR', CURRENT_DATE()),
+        EOMONTH(DATE_TRUNC('YEAR', CURRENT_DATE()), 11)
+    ) as days_in_year;
+
+-- ============================================================
+-- CTE (Common Table Expression) EXAMPLES
+-- ============================================================
+
+-- Non-recursive CTE: useful for organizing complex subqueries
+WITH recent_sales AS (
+    SELECT * FROM (SELECT '2025-01-01' AS sale_date, 'A' AS product) AS t
+)
+SELECT * FROM recent_sales;
+
+-- Recursive CTE example: generate numbers 1..5
+WITH RECURSIVE nums AS (
+    SELECT 1 AS n
+    UNION ALL
+    SELECT n + 1 FROM nums WHERE n < 5
+)
+SELECT * FROM nums ORDER BY n;
+
+-- Fibonacci via recursive CTE: generate first 10 Fibonacci numbers
+WITH RECURSIVE fib AS (
+    -- n: index, a: current fib value, b: next fib value
+    SELECT 0 AS n, 0 AS a, 1 AS b
+    UNION ALL
+    SELECT n + 1, b, a + b FROM fib WHERE n < 9
+)
+SELECT n, a AS fib_value FROM fib ORDER BY n;
+
+-- ============================================================
+-- IO AND TRANSFORM FUNCTIONS
+
+-- URL helpers: parse components, query values, references, and path segments
+SELECT URL_PARSE('https://example.org/a%20b?q=geo+data#result') as url_components;
+SELECT URL_QUERY_GET('https://example.org/search?q=geo+data', 'q') as query_value;
+SELECT URL_RESOLVE('https://example.org/a/b/', '../tiles/12/2200/1400.pbf') as resolved_url;
+SELECT URL_ENCODE('key=value & more') as encoded_query_value;
+SELECT URL_DECODE('key%3Dvalue+%26+more') as decoded_query_value;
+SELECT URL_PATH_ENCODE('tiles/Altstadt Nord') as encoded_path_segment;
+SELECT URL_PATH_DECODE('tiles%2FAltstadt%20Nord') as decoded_path_segment;
+
+-- Context-aware HTML rendering with JSON template data
+SELECT HTML_ESCAPE('<strong>untrusted</strong>') as escaped_html;
+SELECT HTML_TEMPLATE('<a href="{{.url}}">{{.label}}</a>',
+                     '{"url":"/map","label":"Map & data"}') as rendered_html;
+
+-- GZIP/GUNZIP: Compression functions (safe examples)
+SELECT LENGTH(GZIP('tinySQL gzip test string')) as gzip_compressed_length;
+SELECT GUNZIP(GZIP('roundtrip test')) as gunzip_roundtrip;
+
+-- BASE64 encoding/decoding (safe examples)
+SELECT BASE64_ENCODE('hello world') as base64_encoded_example;
+SELECT BASE64_DECODE(BASE64_ENCODE('hello world')) as base64_decoded_roundtrip;
+
+SELECT FILE('./data/data.json') as file_content;
+
+-- HTTP: Fetch an HTTP GET response (30 second timeout, 8 MiB response limit)
+SELECT HTTP('https://jsonplaceholder.typicode.com/todos/1') as http_response;
+
+-- Combined example: Read and decompress a gzipped file
+SELECT GUNZIP(FILE('./data/data.csv.gz')) as decompressed_content;
+
+-- Combined example: Fetch and decode base64 data from HTTP
+SELECT HTTP('https://jsonplaceholder.typicode.com/todos/1') as decoded_api_response;
+
+SELECT * FROM TABLE_FROM_JSON(FILE('data/data.json')) ;
+SELECT * FROM TABLE_FROM_CSV(FILE('data/sample.csv'), '{"delimiter":",","header":true}');
+
+-- ============================================================
+-- TABLE-VALUED FUNCTIONS (TVF)
+-- ============================================================
+
+-- Table-valued functions can be used in FROM and JOIN clauses.
+-- File examples below use paths relative to the repository root.
+
+-- TABLE_FROM_JSON: Parse JSON array into table
+SELECT * FROM TABLE_FROM_JSON('[{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]');
+
+-- TABLE_FROM_JSON_LINES: Parse JSON Lines (JSONL) format
+SELECT * FROM TABLE_FROM_JSON_LINES(FILE('data/data.jsonl'));
+
+-- TABLE_FROM_CSV: Parse CSV data with configurable delimiter
+SELECT * FROM TABLE_FROM_CSV(FILE('data/sample.csv'), '{"delimiter":",","header":true}');
+
+-- Combined example: Query JSON data from HTTP endpoint
+-- Use local demo JSON instead of external HTTP endpoint
+SELECT * FROM TABLE_FROM_JSON(FILE('data/data.json')) WHERE id > 0;
+
+-- Combined example: Join CSV file with database table
+-- Ensure `users` demo table exists before JOIN examples
+CREATE TABLE IF NOT EXISTS users (
+    id INT,
+    name TEXT,
+    email TEXT
+);
+INSERT INTO users VALUES (1, 'Alice', 'alice@example.com') ON CONFLICT DO NOTHING;
+INSERT INTO users VALUES (2, 'Bob', 'bob@example.com') ON CONFLICT DO NOTHING;
+INSERT INTO users VALUES (3, 'Carol', 'carol@example.com') ON CONFLICT DO NOTHING;
+
+-- Combined example: Join CSV file with database table
+SELECT u.name, o.amount
+FROM users u
+JOIN TABLE_FROM_CSV(FILE('./data/orders.csv'), '{"delimiter":",","header":true}') o ON u.id = o.user_id;
+
+-- ============================================================
+-- SYSTEM CATALOG
+-- ============================================================
+
+-- Note: System catalog tables are implemented and available via the Go API.
+-- SQL syntax for querying catalog is planned for future release:
+
+-- List all tables
+SELECT * FROM catalog.tables;
+
+-- Find columns for a specific table
+SELECT * FROM catalog.columns WHERE table_name = 'users';
+
+-- View all registered functions
+SELECT name, function_type, return_type FROM catalog.functions;
+
+-- Check scheduled jobs
+SELECT name, enabled, schedule_type, next_run_at FROM catalog.jobs WHERE enabled = true;
+
+-- ============================================================
+-- JOB SCHEDULER
+-- ============================================================
+
+-- Note: Job scheduler is fully implemented and operational via the Go API.
+-- SQL syntax for job management is planned for future release:
+
+-- Create a CRON job
+CREATE JOB cleanup_logs
+    SCHEDULE CRON '0 0 3 * * *'  -- Daily at 3 AM
+    TIMEZONE 'UTC'
+    MAX_RUNTIME 300000            -- 5 minutes
+    NO_OVERLAP
+AS
+    DELETE FROM logs WHERE created_at < datetime('now', '-7 days');
+
+-- Create an INTERVAL job
+CREATE JOB refresh_stats
+    SCHEDULE INTERVAL 30000       -- Every 30 seconds
+    MAX_RUNTIME 10000             -- 10 seconds
+AS
+    INSERT INTO stats_cache SELECT * FROM compute_stats();
+
+-- Create a ONCE job
+CREATE JOB send_report
+    SCHEDULE ONCE '2025-12-31 23:59:59'
+    TIMEZONE 'America/New_York'
+AS
+    SELECT generate_report('annual');
+
+-- Enable/disable jobs
+ALTER JOB cleanup_logs ENABLE;
+ALTER JOB cleanup_logs DISABLE;
+
+-- Drop a job
+DROP JOB cleanup_logs;
+
+-- ============================================================
+-- PRACTICAL FUNCTION EXAMPLES
+-- ============================================================
+
+-- Example 1: Load and process JSON data from a file
+SELECT * FROM TABLE_FROM_JSON(FILE('./data/data.json'))
+WHERE id > 1
+ORDER BY name;
+
+-- Materialize JSON into a demo table for downstream examples
+CREATE TABLE demotable AS SELECT * FROM TABLE_FROM_JSON(FILE('./data/data.json'));
+
+-- Example 2: Fetch and parse CSV from HTTP endpoint
+SELECT product, SUM(quantity) as total
+FROM TABLE_FROM_CSV(FILE('data/sales.csv'), '{"delimiter":",","header":true}')
+GROUP BY product;
+
+-- Example 3: Process compressed log files
+SELECT * FROM TABLE_FROM_JSON_LINES(FILE('./data/data.jsonl'))
+WHERE id > 1;
+
+-- Example 4: Combine multiple data sources
+SELECT
+        u.name,
+        o.order_date,
+        p.price
+FROM users u
+JOIN TABLE_FROM_CSV(FILE('./data/orders.csv'), '{"delimiter":",","header":true}') o ON u.id = o.user_id
+JOIN TABLE_FROM_JSON(FILE('./data/prices.json')) p ON o.product = p.product;
+-- Example 5: Base64-encoded JSON data
+SELECT * FROM TABLE_FROM_JSON(BASE64_DECODE(FILE('./data/encoded_data.b64')));
+
+-- ============================================================
+-- VECTOR / EMBEDDING FUNCTIONS  (RAG Vector Database Support)
+-- ============================================================
+
+-- tinySQL supports a native VECTOR data type for storing float64 embeddings,
+-- plus a rich set of functions for similarity search, distance computation,
+-- and vector manipulation — enabling RAG (Retrieval-Augmented Generation)
+-- workloads directly in SQL.
+
+-- ---- Vector Creation & Conversion ----
+
+-- Parse a JSON array into a VECTOR
+SELECT VEC_FROM_JSON('[1.0, 2.0, 3.0]') as embedding;
+
+-- Serialize a VECTOR back to JSON
+SELECT VEC_TO_JSON(VEC_FROM_JSON('[1.5, 2.5, 3.5]')) as json_vec;
+
+-- ---- Vector Introspection ----
+
+-- Number of dimensions
+SELECT VEC_DIM(VEC_FROM_JSON('[1,2,3,4,5]')) as dimensions;
+
+-- L2 (Euclidean) norm
+SELECT VEC_NORM(VEC_FROM_JSON('[3.0, 4.0]')) as norm_is_5;
+
+-- ---- Vector Normalization ----
+
+-- Normalize to unit length
+SELECT VEC_NORMALIZE(VEC_FROM_JSON('[3.0, 4.0]')) as unit_vec;
+
+-- ---- Element-wise Arithmetic ----
+
+-- Addition
+SELECT VEC_ADD(VEC_FROM_JSON('[1,2,3]'), VEC_FROM_JSON('[4,5,6]')) as sum_vec;
+
+-- Subtraction
+SELECT VEC_SUB(VEC_FROM_JSON('[5,7,9]'), VEC_FROM_JSON('[1,2,3]')) as diff_vec;
+
+-- Hadamard (element-wise) product
+SELECT VEC_MUL(VEC_FROM_JSON('[2,3,4]'), VEC_FROM_JSON('[5,6,7]')) as prod_vec;
+
+-- Scalar multiplication
+SELECT VEC_SCALE(VEC_FROM_JSON('[1,2,3]'), 2.5) as scaled_vec;
+
+-- ---- Similarity & Distance Functions ----
+
+-- Dot product (inner product)
+SELECT VEC_DOT(VEC_FROM_JSON('[1,2,3]'), VEC_FROM_JSON('[4,5,6]')) as dot_product;
+
+-- Cosine similarity ∈ [-1, 1]  (1 = identical direction)
+SELECT VEC_COSINE_SIMILARITY(VEC_FROM_JSON('[1,0]'), VEC_FROM_JSON('[1,0]')) as same_dir;
+SELECT VEC_COSINE_SIMILARITY(VEC_FROM_JSON('[1,0]'), VEC_FROM_JSON('[0,1]')) as orthogonal;
+
+-- Cosine distance ∈ [0, 2]  (0 = identical)
+SELECT VEC_COSINE_DISTANCE(VEC_FROM_JSON('[1,0]'), VEC_FROM_JSON('[1,0]')) as zero_dist;
+
+-- Euclidean (L2) distance
+SELECT VEC_L2_DISTANCE(VEC_FROM_JSON('[0,0]'), VEC_FROM_JSON('[3,4]')) as dist_5;
+
+-- Manhattan (L1) distance
+SELECT VEC_MANHATTAN_DISTANCE(VEC_FROM_JSON('[1,2,3]'), VEC_FROM_JSON('[4,6,8]')) as dist_12;
+
+-- Generic distance function with selectable metric
+SELECT VEC_DISTANCE(VEC_FROM_JSON('[1,0]'), VEC_FROM_JSON('[0,1]'), 'cosine')    as cosine_dist;
+SELECT VEC_DISTANCE(VEC_FROM_JSON('[0,0]'), VEC_FROM_JSON('[3,4]'), 'l2')        as l2_dist;
+SELECT VEC_DISTANCE(VEC_FROM_JSON('[0,0]'), VEC_FROM_JSON('[3,4]'), 'manhattan') as l1_dist;
+SELECT VEC_DISTANCE(VEC_FROM_JSON('[1,0]'), VEC_FROM_JSON('[0,1]'), 'dot')       as dot_dist;
+
+-- ---- Vector Manipulation ----
+
+-- Extract a sub-vector (0-based start, length)
+SELECT VEC_SLICE(VEC_FROM_JSON('[10,20,30,40,50]'), 1, 3) as sub_vec;
+
+-- Concatenate two vectors
+SELECT VEC_CONCAT(VEC_FROM_JSON('[1,2]'), VEC_FROM_JSON('[3,4,5]')) as concat_vec;
+
+-- Element-wise average of two vectors
+SELECT VEC_AVG(VEC_FROM_JSON('[2,4,6]'), VEC_FROM_JSON('[4,6,8]')) as avg_vec;
+
+-- ---- Quantization ----
+
+-- Simulate 8-bit quantization (reduces precision, saves storage)
+SELECT VEC_QUANTIZE(VEC_FROM_JSON('[0.0, 0.5, 1.0]'), 8) as quantized_8bit;
+
+-- Simulate 16-bit quantization
+SELECT VEC_QUANTIZE(VEC_FROM_JSON('[0.0, 0.33, 0.67, 1.0]'), 16) as quantized_16bit;
+
+-- ---- Random Vector Generation ----
+
+-- Generate a random unit vector of 5 dimensions
+SELECT VEC_RANDOM(5) as random_vec;
+
+-- Deterministic random vector with a seed
+SELECT VEC_RANDOM(5, 42) as seeded_vec;
+
+-- ---- VECTOR Column Type ----
+
+-- Tables can have VECTOR columns for storing embeddings
+CREATE TABLE vec_demo_docs (id INT, title TEXT, embedding VECTOR);
+INSERT INTO vec_demo_docs VALUES (1, 'apple',       '[1.0, 0.0, 0.0]');
+INSERT INTO vec_demo_docs VALUES (2, 'banana',      '[0.9, 0.1, 0.0]');
+INSERT INTO vec_demo_docs VALUES (3, 'cherry',      '[0.0, 1.0, 0.0]');
+INSERT INTO vec_demo_docs VALUES (4, 'date fruit',  '[0.0, 0.0, 1.0]');
+INSERT INTO vec_demo_docs VALUES (5, 'elderberry',  '[0.8, 0.2, 0.0]');
+
+-- Query embeddings with inline similarity scoring
+SELECT title,
+       VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[1.0, 0.0, 0.0]')) as similarity
+FROM vec_demo_docs
+ORDER BY similarity DESC;
+
+-- Filter by similarity threshold
+SELECT title,
+       VEC_DISTANCE(embedding, VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 'cosine') as distance
+FROM vec_demo_docs
+WHERE VEC_DISTANCE(embedding, VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 'cosine') < 0.5
+ORDER BY distance;
+
+-- ---- k-NN Vector Search (Table-Valued Function) ----
+
+-- VEC_SEARCH(table, column, query_vector, k [, metric [, index]])
+-- Returns the k nearest neighbours with _vec_distance and _vec_rank columns
+SELECT * FROM VEC_SEARCH('vec_demo_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 3);
+
+-- Search with L2 distance metric
+SELECT * FROM VEC_SEARCH('vec_demo_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 3, 'l2');
+
+-- Search with cached approximate ANN indexes for larger RAG tables
+SELECT * FROM VEC_SEARCH('vec_demo_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 3, 'cosine', 'hnsw');
+SELECT * FROM VEC_SEARCH('vec_demo_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 3, 'cosine', 'ivf');
+
+-- VEC_WARM(table, column [, metric [, index]]) prebuilds the vector column
+-- cache and the requested ANN index (ivf/hnsw) ahead of time, instead of
+-- paying that one-time O(n log n) build cost on whichever query happens to
+-- run first. Building an HNSW index is real, non-trivial work (each row
+-- insertion does its own approximate-nearest-neighbor search against the
+-- graph built so far) — worth doing explicitly right after a bulk load
+-- (e.g. a nightly re-embed) rather than surprising the first live query with
+-- it. Returns one row describing what was warmed.
+SELECT * FROM VEC_WARM('vec_demo_docs', 'embedding', 'cosine', 'hnsw');
+
+-- VEC_TOP_K is an alias for VEC_SEARCH
+SELECT * FROM VEC_TOP_K('vec_demo_docs', 'embedding', VEC_FROM_JSON('[0.0, 1.0, 0.0]'), 2, 'cosine');
+
+-- ---- RAG Workflow Example ----
+
+-- 1. Create a knowledge base with embeddings
+CREATE TABLE vec_demo_kb (id INT, content TEXT, embedding VECTOR);
+INSERT INTO vec_demo_kb VALUES (1, 'Go is a statically typed language',       '[0.9, 0.1, 0.0, 0.0]');
+INSERT INTO vec_demo_kb VALUES (2, 'Python is dynamically typed',             '[0.8, 0.2, 0.1, 0.0]');
+INSERT INTO vec_demo_kb VALUES (3, 'Databases store structured data',         '[0.0, 0.0, 0.9, 0.1]');
+INSERT INTO vec_demo_kb VALUES (4, 'Vector search enables AI applications',   '[0.1, 0.0, 0.1, 0.9]');
+
+-- 2. Semantic search: find docs closest to a query embedding
+SELECT * FROM VEC_SEARCH('vec_demo_kb', 'embedding', VEC_FROM_JSON('[0.85, 0.15, 0.05, 0.0]'), 2);
+
+-- 3. Inline similarity ranking
+SELECT content,
+       VEC_COSINE_SIMILARITY(embedding, VEC_FROM_JSON('[0.85, 0.15, 0.05, 0.0]')) as relevance
+FROM vec_demo_kb
+ORDER BY relevance DESC;
+
+-- 4. Vector arithmetic for query expansion (average two embeddings)
+SELECT VEC_AVG(VEC_FROM_JSON('[0.9, 0.1, 0.0, 0.0]'), VEC_FROM_JSON('[0.8, 0.2, 0.1, 0.0]')) as expanded_query;
+
+-- Cleanup demo tables
+DROP TABLE vec_demo_docs;
+DROP TABLE vec_demo_kb;
+
+-- ---- RAG_SEARCH: composed retrieval (one call) ----
+
+-- RAG_SEARCH(table, vector_column, query_vector, k [, options_json]) composes
+-- VEC_SEARCH + FTS_SEARCH (hybrid reciprocal rank fusion) + RAG_CONTEXT_FROM
+-- (neighbor-chunk expansion) into a single table-valued function, instead of
+-- hand-assembling that pipeline from the three primitives above.
+
+CREATE TABLE rag_search_demo (
+    doc_id      TEXT,
+    chunk_index INT,
+    chunk_text  TEXT,
+    embedding   VECTOR
+);
+INSERT INTO rag_search_demo VALUES
+    ('doc-1', 0, 'TinySQL is a lightweight embeddable SQL engine', '[0.9, 0.1, 0.0]'),
+    ('doc-1', 1, 'It supports vector search and full-text search', '[0.85, 0.15, 0.05]'),
+    ('doc-1', 2, 'RAG pipelines combine retrieval with generation', '[0.1, 0.0, 0.9]'),
+    ('doc-2', 0, 'Full-text search uses BM25 ranking', '[0.2, 0.0, 0.8]');
+
+-- 1. Vector-only search (equivalent to VEC_SEARCH, one call)
+SELECT doc_id, chunk_index, chunk_text, _vec_distance, _vec_similarity, _vec_rank
+FROM RAG_SEARCH('rag_search_demo', 'embedding', VEC_FROM_JSON('[0.9, 0.1, 0.0]'), 2);
+
+-- 2. Hybrid vector + BM25 keyword search fused via reciprocal rank fusion
+-- (RRF). key_columns is required in hybrid mode: it's how RAG_SEARCH matches
+-- a row across the independently-fetched vector and text candidate sets.
+SELECT doc_id, chunk_index, chunk_text, _rrf_score, _rrf_rank
+FROM RAG_SEARCH('rag_search_demo', 'embedding', VEC_FROM_JSON('[0.9, 0.1, 0.0]'), 3, '{
+    "text_column": "chunk_text",
+    "text_query": "full-text search",
+    "key_columns": ["doc_id", "chunk_index"]
+}');
+
+-- 3. Hybrid search plus neighbor-chunk context expansion, in one call
+-- (replaces wrapping the hybrid result in RAG_CONTEXT_FROM separately).
+SELECT doc_id, chunk_index, chunk_text, _hit_rank, _context_offset, _context_rank
+FROM RAG_SEARCH('rag_search_demo', 'embedding', VEC_FROM_JSON('[0.9, 0.1, 0.0]'), 2, '{
+    "text_column": "chunk_text",
+    "text_query": "vector search",
+    "key_columns": ["doc_id", "chunk_index"],
+    "expand_before": 1,
+    "expand_after": 1,
+    "doc_id_column": "doc_id",
+    "chunk_index_column": "chunk_index"
+}')
+ORDER BY _context_rank;
+
+DROP TABLE rag_search_demo;
+
+-- ---- HYBRID_SEARCH: one search term, semantic + full-text ----
+
+-- The query vector is the embedding of the same search term, generated with
+-- the model used to populate the VECTOR column. The PRIMARY KEY is used
+-- automatically to fuse vector and BM25 candidate lists.
+CREATE TABLE hybrid_search_demo (
+    id        INT PRIMARY KEY,
+    content   TEXT,
+    embedding VECTOR
+);
+INSERT INTO hybrid_search_demo VALUES
+    (1, 'database timeout retry guide', '[1.0, 0.0, 0.0]'),
+    (2, 'general systems handbook',      '[0.8, 0.2, 0.0]'),
+    (3, 'unrelated cooking notes',       '[0.0, 1.0, 0.0]');
+
+SELECT id, content, _vec_similarity, _fts_score, _rrf_score, _rrf_rank
+FROM HYBRID_SEARCH(
+    'hybrid_search_demo', 'embedding', 'content', 'time?ut retry*',
+    VEC_FROM_JSON('[0.9, 0.1, 0.0]'), 3
+)
+ORDER BY _rrf_rank;
+
+-- VEC_HYBRID_SEARCH is an alias. Tables without a PRIMARY KEY provide the
+-- identity columns via the optional JSON object:
+-- '{"key_columns":["doc_id","chunk_index"],"index":"hnsw","candidate_k":50}'
+
+DROP TABLE hybrid_search_demo;
+
+-- ============================================================
+-- GEOSPATIAL FUNCTIONS
+-- ============================================================
+
+-- Geometry is stored and returned as GeoJSON, either in a plain TEXT/JSON
+-- column or in the dedicated GEOMETRY column type (validated on write and
+-- canonicalized to stable text). Raw four-number coordinate arguments use
+-- (lat, lon, lat, lon); GeoJSON itself stays [lon, lat].
+
+CREATE TABLE geo_demo (name TEXT, geometry GEOMETRY);
+INSERT INTO geo_demo VALUES ('Berlin', '{"type":"Point","coordinates":[13.4050,52.5200]}');
+INSERT INTO geo_demo VALUES ('Munich', '{"type":"Point","coordinates":[11.5755,48.1372]}');
+
+-- GEO_POINT: build a GeoJSON Point from (lon, lat[, z])
+SELECT GEO_POINT(13.4050, 52.5200) AS berlin;
+
+-- ST_MAKEPOINT / ST_POINT: aliases of GEO_POINT
+SELECT ST_MAKEPOINT(13.4050, 52.5200) AS berlin,
+       ST_POINT(13.4050, 52.5200) AS also_berlin;
+
+-- GEO_LON / GEO_X: read a Point's longitude. ST_X is the alias.
+SELECT GEO_LON(geometry) AS lon, ST_X(geometry) AS lon_alias
+FROM geo_demo WHERE name = 'Berlin';
+
+-- GEO_LAT / GEO_Y: read a Point's latitude. ST_Y is the alias.
+SELECT GEO_LAT(geometry) AS lat, ST_Y(geometry) AS lat_alias
+FROM geo_demo WHERE name = 'Berlin';
+
+-- GEO_DISTANCE: great-circle distance in meters between two points.
+-- HAVERSINE and ST_DISTANCE are aliases.
+SELECT a.name, b.name, GEO_DISTANCE(a.geometry, b.geometry) AS meters
+FROM geo_demo a JOIN geo_demo b ON a.name = 'Berlin' AND b.name = 'Munich';
+
+-- GEO_DISTANCE also accepts four raw (lat1, lon1, lat2, lon2) numbers
+SELECT GEO_DISTANCE(52.5200, 13.4050, 48.1372, 11.5755) AS meters;
+
+-- GEO_DWITHIN: true if two points are within a given radius (meters).
+-- ST_DWITHIN is the alias.
+SELECT GEO_DWITHIN(
+    '{"type":"Point","coordinates":[13.4050,52.5200]}',
+    '{"type":"Point","coordinates":[13.4060,52.5205]}',
+    200) AS within_200m;
+
+-- GEO_WITHIN_BBOX: true if a point falls inside [minLon, minLat, maxLon, maxLat].
+-- ST_WITHIN_BBOX is the alias.
+SELECT GEO_WITHIN_BBOX(geometry, 5, 47, 15, 55) AS in_germany_ish
+FROM geo_demo WHERE name = 'Berlin';
+
+-- GEO_BEARING: initial compass bearing (0-360 clockwise from north) from the
+-- first point toward the second. ST_AZIMUTH is the alias.
+SELECT a.name, b.name, GEO_BEARING(a.geometry, b.geometry) AS bearing_deg
+FROM geo_demo a JOIN geo_demo b ON a.name = 'Berlin' AND b.name = 'Munich';
+
+-- GEO_MIDPOINT: great-circle midpoint between two points. ST_MIDPOINT is the alias.
+SELECT a.name, b.name, GEO_MIDPOINT(a.geometry, b.geometry) AS midpoint
+FROM geo_demo a JOIN geo_demo b ON a.name = 'Berlin' AND b.name = 'Munich';
+
+-- GEO_DESTINATION: project a point along a bearing for a distance (meters).
+-- ST_PROJECT is the alias.
+SELECT GEO_DESTINATION(geometry, 90, 10000) AS ten_km_east
+FROM geo_demo WHERE name = 'Berlin';
+
+-- GEO_WITHIN_POLYGON: point-in-polygon(-or-multipolygon) test.
+-- ST_WITHIN is the alias; ST_CONTAINS takes the same two arguments reversed
+-- (polygon, point), matching PostGIS's ST_Contains(A, B) = "A contains B".
+SELECT
+    GEO_WITHIN_POLYGON(
+        '{"type":"Point","coordinates":[0.5,0.5]}',
+        '{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}'
+    ) AS point_inside,
+    ST_CONTAINS(
+        '{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}',
+        '{"type":"Point","coordinates":[9,9]}'
+    ) AS point_outside;
+
+-- GEO_POLYGON_AREA: area in square meters, exterior ring minus holes.
+-- ST_AREA is the alias. Accepts a Polygon or MultiPolygon.
+SELECT GEO_POLYGON_AREA(
+    '{"type":"Polygon","coordinates":[[[13.0,52.0],[13.1,52.0],[13.1,52.1],[13.0,52.1],[13.0,52.0]]]}'
+) AS square_meters;
+
+-- GEO_LENGTH: sum of great-circle segment lengths of a LineString, in meters.
+-- ST_LENGTH is the alias.
+SELECT GEO_LENGTH(
+    '{"type":"LineString","coordinates":[[13.40,52.52],[13.41,52.52],[13.41,52.53]]}'
+) AS meters;
+
+-- GEO_INTERSECTS: true if two geometries (point/line/polygon, any combination)
+-- share at least one point. ST_INTERSECTS is the alias. Respects polygon
+-- holes: a shape nested in another's hole is NOT reported as intersecting.
+SELECT GEO_INTERSECTS(
+    '{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}',
+    '{"type":"Polygon","coordinates":[[[0.5,0.5],[1.5,0.5],[1.5,1.5],[0.5,1.5],[0.5,0.5]]]}'
+) AS overlapping_squares;
+
+-- GEO_DISJOINT: the exact negation of GEO_INTERSECTS. ST_DISJOINT is the alias.
+SELECT GEO_DISJOINT(
+    '{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}',
+    '{"type":"Polygon","coordinates":[[[10,10],[11,10],[11,11],[10,11],[10,10]]]}'
+) AS far_apart_squares;
+
+-- GEO_EQUALS: same coordinates, allowing for a different start vertex,
+-- winding direction, or Polygon-vs-single-part-MultiPolygon wrapping (NOT
+-- full OGC point-set equality -- two differently-vertexized polygons
+-- covering the same area are not detected as equal). ST_EQUALS is the alias.
+SELECT GEO_EQUALS(
+    '{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}',
+    '{"type":"Polygon","coordinates":[[[1,0],[1,1],[0,1],[0,0],[1,0]]]}'
+) AS same_square_rotated_start;
+
+-- GEO_BUFFER: approximate a circular buffer (meters) around a point as a
+-- regular polygon; the optional 3rd argument sets the vertex count (8-256,
+-- default 32). ST_BUFFER is the alias.
+SELECT GEO_BUFFER(geometry, 500, 16) AS half_km_circle
+FROM geo_demo WHERE name = 'Berlin';
+
+-- GEO_CONVEX_HULL: convex hull of every vertex in a geometry, as a Polygon.
+-- ST_CONVEXHULL is the alias. Computed in plain lon/lat space (a standard
+-- planar approximation, not a rigorous spherical hull).
+SELECT GEO_CONVEX_HULL(
+    '{"type":"MultiPoint","coordinates":[[0,0],[2,0],[2,2],[0,2],[1,1]]}'
+) AS hull;
+
+-- GEO_ENVELOPE: a geometry's bounding box as a Polygon (vs. GEO_BBOX's plain
+-- array). ST_ENVELOPE is the alias.
+SELECT GEO_ENVELOPE(
+    '{"type":"LineString","coordinates":[[0,0],[3,1],[1,4]]}'
+) AS bbox_polygon;
+
+-- GEO_LINE_INTERPOLATE: the point a fraction (0-1) of the way along a
+-- LineString, by actual distance, not vertex count. ST_LINE_INTERPOLATE_POINT
+-- is the alias.
+SELECT GEO_LINE_INTERPOLATE(
+    '{"type":"LineString","coordinates":[[13.40,52.52],[13.50,52.60]]}', 0.5
+) AS midway;
+
+-- GEO_CLIP: Sutherland-Hodgman clip of a geometry to a convex boundary
+-- polygon. ST_CLIP is the alias. Rejects a non-convex boundary unless the
+-- optional 3rd argument (allow_nonconvex) is true -- a best-effort,
+-- not-guaranteed-correct result in that case.
+SELECT GEO_CLIP(
+    '{"type":"Polygon","coordinates":[[[0,0],[4,0],[4,4],[0,4],[0,0]]]}',
+    '{"type":"Polygon","coordinates":[[[1,1],[3,1],[3,3],[1,3],[1,1]]]}'
+) AS clipped_to_inner_square;
+
+-- ============================================================
+-- GEOSPATIAL: EDITING AND QUALITY
+-- ============================================================
+
+-- GEO_SIMPLIFY: reduce vertex count. Accepts Douglas-Peucker ('dp', the
+-- default), 'visvalingam-effective', and 'visvalingam-weighted'.
+-- ST_SIMPLIFY is the alias.
+SELECT GEO_SIMPLIFY(
+    '{"type":"LineString","coordinates":[[0,0],[1,0.05],[2,0],[3,2],[4,2]]}',
+    0.2, 'dp'
+) AS simplified;
+
+-- GEO_BBOX: bounding box as [minLon, minLat, maxLon, maxLat]. ST_BBOX is the alias.
+SELECT GEO_BBOX(
+    '{"type":"Polygon","coordinates":[[[-2,-2],[-2,2],[2,2],[2,-2],[-2,-2]]]}'
+) AS bbox;
+
+-- GEO_CENTROID: area/length-weighted centroid of a geometry. ST_CENTROID is the alias.
+SELECT GEO_CENTROID(
+    '{"type":"Polygon","coordinates":[[[-2,-2],[-2,2],[2,2],[2,-2],[-2,-2]]]}'
+) AS centroid;
+
+-- GEO_AFFINE: shift, scale, and rotate a geometry around an anchor (default
+-- anchor: the geometry's own bbox center; here given explicitly as the last
+-- two arguments). ST_AFFINE is the alias.
+SELECT GEO_AFFINE(
+    '{"type":"Point","coordinates":[1,0]}', 0, 0, 1.0, 90, 0, 0
+) AS rotated_90deg_around_origin;
+
+-- GEO_SMOOTH: Chaikin corner-cutting smoothing, 0-8 iterations. ST_SMOOTH is the alias.
+SELECT GEO_SMOOTH(
+    '{"type":"LineString","coordinates":[[0,0],[1,1],[2,0]]}', 1
+) AS smoothed;
+
+-- GEO_DROP_HOLES: remove every hole from a Polygon/MultiPolygon, keeping only
+-- exterior rings. ST_REMOVE_HOLES is the alias.
+SELECT GEO_DROP_HOLES(
+    '{"type":"Polygon","coordinates":[[[-2,-2],[-2,2],[2,2],[2,-2],[-2,-2]],[[-1,-1],[-1,1],[1,1],[1,-1],[-1,-1]]]}'
+) AS outer_ring_only;
+
+-- GEO_CLEAN: remove repeated consecutive vertices and normalize ring closure.
+-- ST_CLEAN is the alias. Rejects a result collapsing below the GeoJSON
+-- minimum vertex count instead of returning invalid output.
+SELECT GEO_CLEAN(
+    '{"type":"LineString","coordinates":[[0,0],[0,0],[1,1],[2,2]]}'
+) AS deduplicated;
+
+-- GEO_SNAP: round coordinates to a grid, then clean. ST_SNAPTOGRID is the alias.
+SELECT GEO_SNAP(
+    '{"type":"Point","coordinates":[13.40473,52.52019]}', 0.001
+) AS snapped;
+
+-- GEO_IS_VALID: structural GeoJSON check (not full topology validation --
+-- no self-intersection detection). ST_ISVALID is the alias.
+SELECT GEO_IS_VALID('{"type":"Point","coordinates":[13.40,52.52]}') AS valid,
+       GEO_IS_VALID('{"type":"Polygon","coordinates":[[[0,0],[1,1]]]}') AS invalid_too_few_points;
+
+-- CREATE TABLE ... GEOMETRY: a first-class, validated, canonicalizing column
+-- type (not just TEXT/JSON). A bare number or a Feature/FeatureCollection is
+-- rejected -- a GEOMETRY column holds a Geometry.
+CREATE TABLE geo_typed_demo (id INT, shape GEOMETRY);
+INSERT INTO geo_typed_demo VALUES (1, '{"type":"Point","coordinates":[13.40,52.52]}');
+SELECT id, shape FROM geo_typed_demo;
+
+-- CAST(x AS GEOMETRY) validates and canonicalizes the same way a column write does
+SELECT CAST('{"coordinates":[1,2],"type":"Point"}' AS GEOMETRY) AS canonical;
+
+DROP TABLE geo_typed_demo;
+
+-- ============================================================
+-- GEOSPATIAL: REGION OPERATIONS, SEARCH, AND CLASSIFICATION
+-- ============================================================
+
+-- Mapshaper-inspired region-editing verbs and BI-oriented helpers for
+-- turning raw geometry into location-based KPIs and choropleth dashboards.
+
+CREATE TABLE geo_region_demo (region TEXT, footprint GEOMETRY, population FLOAT);
+INSERT INTO geo_region_demo VALUES ('north', '{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}', 100);
+INSERT INTO geo_region_demo VALUES ('north', '{"type":"Polygon","coordinates":[[[1,0],[2,0],[2,1],[1,1],[1,0]]]}', 300);
+INSERT INTO geo_region_demo VALUES ('south', '{"type":"Polygon","coordinates":[[[10,10],[11,10],[11,11],[10,11],[10,10]]]}', 50);
+
+-- GEO_DISSOLVE: merge every geometry in a group into one, by cancelling
+-- shared directed edges between adjacent polygons. GEO_UNION_AGG and
+-- ST_UNION are the same operation under aggregate-style names. Correct for
+-- topologically-clean, vertex-aligned adjacent input (e.g. this project's
+-- own output, or real GIS boundary data) -- NOT a general polygon-boolean-
+-- union for overlapping-but-misaligned input.
+SELECT region, GEO_DISSOLVE(footprint) AS boundary
+FROM geo_region_demo GROUP BY region ORDER BY region;
+
+-- GEO_UNION_AGG / ST_UNION: aliases of GEO_DISSOLVE
+SELECT region, GEO_UNION_AGG(footprint) AS boundary
+FROM geo_region_demo GROUP BY region ORDER BY region;
+
+-- GEO_BBOX_AGG: bounding box across every geometry in a group.
+SELECT region, GEO_BBOX_AGG(footprint) AS bbox
+FROM geo_region_demo GROUP BY region ORDER BY region;
+
+-- GEO_CENTROID_AGG: (optionally weighted) centroid across a group. The
+-- optional weight combines with GEO_CENTROID's own area/length weighting --
+-- here, a population-weighted centroid of already-area-weighted per-row centroids.
+SELECT region, GEO_CENTROID_AGG(footprint, population) AS weighted_centroid
+FROM geo_region_demo GROUP BY region ORDER BY region;
+
+-- GEO_SEARCH: an indexed bbox/radius search over a table, backed by a lazy,
+-- per-table grid index invalidated automatically on writes. Exact for Point
+-- columns; for polygon/line columns it indexes by centroid (a large shape
+-- whose edge -- not centroid -- clips into the window is a false negative;
+-- use GEO_INTERSECTS for exact shape overlap).
+SELECT region FROM GEO_SEARCH('geo_region_demo', 'footprint', 'bbox', -1, -1, 3, 3);
+SELECT region FROM GEO_SEARCH('geo_region_demo', 'footprint', 'radius', 0.5, 0.5, 200000);
+
+DROP TABLE geo_region_demo;
+
+-- EQUAL_INTERVAL / NATURAL_BREAKS: choropleth classification window
+-- functions, bucketing a KPI column into N legend classes. Quantile
+-- classification needs no new function -- NTILE(n) OVER (ORDER BY kpi)
+-- already does that.
+CREATE TABLE geo_kpi_demo (district TEXT, buildings INT);
+INSERT INTO geo_kpi_demo VALUES ('a', 5);
+INSERT INTO geo_kpi_demo VALUES ('b', 12);
+INSERT INTO geo_kpi_demo VALUES ('c', 48);
+INSERT INTO geo_kpi_demo VALUES ('d', 51);
+INSERT INTO geo_kpi_demo VALUES ('e', 95);
+
+SELECT district, buildings,
+       EQUAL_INTERVAL(3) OVER (ORDER BY buildings) AS equal_interval_class,
+       NATURAL_BREAKS(3) OVER (ORDER BY buildings) AS natural_breaks_class,
+       NTILE(3) OVER (ORDER BY buildings) AS quantile_class
+FROM geo_kpi_demo ORDER BY buildings;
+
+DROP TABLE geo_kpi_demo;
+
+-- ST_TOUCHES: boundary-only contact -- true, but ST_INTERSECTS would also be
+-- true (they share the whole x=1 edge), while ST_COVERS/ST_COVEREDBY test
+-- "every point of one is in-or-on the other" instead of boundary contact.
+SELECT ST_TOUCHES(
+  '{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}',
+  '{"type":"Polygon","coordinates":[[[1,0],[2,0],[2,1],[1,1],[1,0]]]}'
+) AS shares_edge_only;
+
+SELECT ST_COVERS(
+  '{"type":"Polygon","coordinates":[[[-4,-4],[4,-4],[4,4],[-4,4],[-4,-4]]]}',
+  '{"type":"Polygon","coordinates":[[[-1,-1],[1,-1],[1,1],[-1,1],[-1,-1]]]}'
+) AS big_square_covers_small_one;
+
+-- GEO_PERIMETER / ST_PERIMETER: sum of every ring's great-circle length
+-- (exterior and holes alike), the boundary counterpart to GEO_POLYGON_AREA.
+SELECT ST_PERIMETER('{"type":"Polygon","coordinates":[[[0,0],[0,1],[1,1],[1,0],[0,0]]]}') AS meters;
+
+-- WKT/EWKT interop: ST_GEOMFROMTEXT parses Well-Known Text (including an
+-- "SRID=4326;" EWKT prefix -- any other SRID errors, pointing at
+-- ST_TRANSFORM) into the same GeoJSON every other function here works with;
+-- ST_ASTEXT/ST_ASEWKT render it back out.
+SELECT ST_ASTEXT(ST_GEOMFROMTEXT('POLYGON((13.3 52.4,13.5 52.4,13.5 52.6,13.3 52.6,13.3 52.4))')) AS wkt;
+SELECT ST_ASEWKT(ST_MAKEPOINT(13.405, 52.520)) AS ewkt;
+
+-- WKB/EWKB interop: the binary sibling of WKT, as a BLOB or hex text.
+SELECT ST_ASTEXT(ST_GEOMFROMWKB(ST_ASBINARY(ST_MAKEPOINT(13.405, 52.520)))) AS round_tripped;
+
+-- OGC GeoPackageBinary interop works on any BLOB, independent of its source.
+-- Inspect/extract operations preserve every CRS. Conversion to GeoJSON is
+-- deliberately limited to WGS84 so projected metres are never relabelled as
+-- longitude/latitude. This sample is a little-endian EPSG:4326 Point without
+-- an optional envelope.
+SELECT GPKG_SRID(BLOB_FROM_HEX('47500001e6100000010100000000000000000027400000000000204840')) AS srid,
+       GPKG_HEADER(BLOB_FROM_HEX('47500001e6100000010100000000000000000027400000000000204840')) AS header,
+       ST_ASTEXT(GEO_FROM_GPKG(BLOB_FROM_HEX('47500001e6100000010100000000000000000027400000000000204840'))) AS point;
+
+-- CRS identifiers normalize across human EPSG labels, OGC URNs, and OGC
+-- definition URIs. Axis order follows the CRS definition (important for WMS
+-- 1.3 and the INSPIRE north/east variants).
+SELECT CRS_NORMALIZE('urn:ogc:def:crs:EPSG::25832') AS canonical_crs,
+       CRS_URI('EPSG:3035') AS definition_uri,
+       CRS_AXIS_ORDER('http://www.opengis.net/def/crs/EPSG/0/3035') AS axis_order,
+       CRS_INFO('EPSG:10732') AS german_dref91_profile;
+
+-- GEO_AS_GEOJSON / ST_ASGEOJSON: canonicalize (and optionally round) a
+-- GeoJSON value's coordinates.
+SELECT ST_ASGEOJSON(ST_MAKEPOINT(13.4049823, 52.5200066), 3) AS rounded_geojson;
+
+-- Geohash: encode a point to a base-32 locality key, decode it back to a
+-- point, inspect its cell bounds, or list the 8 surrounding cells (plus
+-- itself, at index 4).
+SELECT GEO_GEOHASH_ENCODE(ST_MAKEPOINT(13.405, 52.520), 8) AS geohash;
+SELECT ST_ASTEXT(GEO_GEOHASH_DECODE('u33dc0cp')) AS decoded_point;
+SELECT GEO_GEOHASH_BBOX('u33dc0cp') AS cell_bounds;
+SELECT GEO_GEOHASH_NEIGHBORS('u33dc0cp') AS surrounding_cells;
+
+-- ST_TRANSFORM: reproject between WGS84 (4326) and Web Mercator (3857) --
+-- the one other SRID this project's own TILE_* functions use. No other
+-- SRID is supported (see the WKT/EWKT note above).
+SELECT ST_TRANSFORM(ST_MAKEPOINT(13.405, 52.520), 3857) AS web_mercator;
+
+DROP TABLE geo_demo;
+
+-- ============================================================
+-- ROUTING GRAPHS AND SHORTEST PATHS
+-- ============================================================
+
+-- ROUTE_SHORTEST_PATH / ROUTE_DISTANCE run Dijkstra's algorithm directly
+-- over any edge table with a source column, a target column, and a
+-- non-negative numeric weight column -- exactly the shape
+-- importer.ImportRoutingGraph produces, but not limited to it.
+CREATE TABLE routing_demo (edge_id TEXT, source TEXT, target TEXT, cost FLOAT64);
+INSERT INTO routing_demo VALUES ('e1', 'A', 'B', 1);
+INSERT INTO routing_demo VALUES ('e2', 'B', 'C', 2);
+INSERT INTO routing_demo VALUES ('e3', 'A', 'C', 10);
+
+-- ROUTE_SHORTEST_PATH: one row per node on the cheapest path (here A->B->C,
+-- total cost 3, correctly passing over the direct but pricier A->C edge).
+SELECT * FROM ROUTE_SHORTEST_PATH('routing_demo', 'source', 'target', 'cost', 'A', 'C');
+
+-- ROUTE_DISTANCE: just the total cost, or NULL if unreachable.
+SELECT ROUTE_DISTANCE('routing_demo', 'source', 'target', 'cost', 'A', 'C') AS total_cost;
+
+-- Optional 'directed' (default, source->target only) / 'undirected' mode.
+SELECT ROUTE_DISTANCE('routing_demo', 'source', 'target', 'cost', 'C', 'A', 'undirected') AS reverse_cost;
+
+DROP TABLE routing_demo;
+
+-- ============================================================
+-- TILE FUNCTIONS
+-- ============================================================
+
+-- Web Mercator XYZ tile addressing, for working with MBTiles tilesets in
+-- SQL. XYZ (web clients, /{z}/{x}/{y}.png) counts rows from the top; TMS
+-- (what MBTiles stores in tiles.tile_row) counts rows from the bottom.
+
+-- TILE_X / TILE_Y: the XYZ tile column/row containing (lon, zoom) / (lat, zoom)
+SELECT TILE_X(13.405, 14) AS col, TILE_Y(52.520, 14) AS row;
+
+-- TILE_ZXY: the covering tile at one call, including the MBTiles TMS row
+SELECT TILE_ZXY(13.405, 52.520, 14) AS tile;
+
+-- TILE_FLIP_Y: convert an XYZ row to/from the MBTiles TMS tile_row (its own
+-- inverse). TILE_ROW_TMS is the alias.
+SELECT TILE_FLIP_Y(TILE_Y(52.520, 14), 14) AS tms_row;
+
+-- TILE_LON / TILE_LAT: the (west, north) edge of a tile
+SELECT TILE_LON(TILE_X(13.405, 14), 14) AS west_edge,
+       TILE_LAT(TILE_Y(52.520, 14), 14) AS north_edge;
+
+-- TILE_BBOX: a tile's geographic bounds as [west, south, east, north]
+SELECT TILE_BBOX(14, TILE_X(13.405, 14), TILE_Y(52.520, 14)) AS bounds;
+
+-- TILE_QUADKEY / TILE_FROM_QUADKEY: Bing Maps quadkey encoding, and its inverse
+SELECT TILE_QUADKEY(14, TILE_X(13.405, 14), TILE_Y(52.520, 14)) AS quadkey;
+SELECT TILE_FROM_QUADKEY('12020120310320') AS tile;
+
+-- TILE_PARENT: the containing tile one zoom level up (NULL at zoom 0)
+SELECT TILE_PARENT(14, TILE_X(13.405, 14), TILE_Y(52.520, 14)) AS parent;
+
+-- TILE_COUNT: how many tiles a fully populated zoom level holds (4^zoom)
+SELECT TILE_COUNT(10) AS tiles_at_zoom_10;
+
+-- TILE_CONTAINS: whether a tile covers a point (edges belong to the tile on
+-- their north/west sides, matching TILE_X/TILE_Y's own assignment)
+SELECT TILE_CONTAINS(14, TILE_X(13.405, 14), TILE_Y(52.520, 14), 13.405, 52.520) AS covers_point;
+
+-- TILE_MATRIX_BBOX / WMTS_TILE_BBOX: address any OGC TileMatrix from its
+-- declared origin, cell size, tile dimensions, column and row. Coordinates
+-- remain in that TileMatrixSet's CRS; no provider or WebMercator preset is
+-- involved. TILE_MATRIX_POSITION performs the inverse lookup.
+SELECT TILE_MATRIX_BBOX(100000, 500000, 10, 256, 256, 2, 3, 'topLeft') AS native_crs_bbox,
+       TILE_MATRIX_POSITION(105121, 492319, 100000, 500000, 10, 256, 256, 'topLeft') AS tile_index;
+
+-- WMS_BBOX accepts EPSG labels as well as OGC CRS URIs/URNs. WMS 1.3 applies
+-- the registered CRS axis order; the optional final xy/yx argument makes an
+-- unregistered/private CRS explicit.
+SELECT WMS_BBOX(4000000, 2000000, 5000000, 3000000, 'EPSG:3035', '1.3.0') AS inspire_laea_bbox,
+       WMS_BBOX(1, 2, 3, 4, 'EPSG:999999', '1.3.0', 'yx') AS explicit_private_crs_bbox;
+
+-- A tiles table lookup, converting the client's XYZ row to the MBTiles TMS
+-- row stored on disk:
+CREATE TABLE tile_lookup_demo (zoom_level INT, tile_column INT, tile_row INT, tile_data BLOB);
+INSERT INTO tile_lookup_demo VALUES
+    (14, TILE_X(13.405, 14), TILE_FLIP_Y(TILE_Y(52.520, 14), 14), BLOB_FROM_HEX('00'));
+SELECT tile_data FROM tile_lookup_demo
+WHERE zoom_level = 14
+  AND tile_column = TILE_X(13.405, 14)
+  AND tile_row = TILE_FLIP_Y(TILE_Y(52.520, 14), 14);
+DROP TABLE tile_lookup_demo;
+
+-- MBTILES_TILE / MBTILES_TILES / MBTILES_METADATA: read an existing
+-- .mbtiles file's tiles or metadata directly from SQL, without a separate
+-- import/open step first. Requires the sqliteimport build tag (a build
+-- without it still has these functions, but they return a clear
+-- "requires the sqliteimport build tag" error instead of "unknown
+-- function"). Illustrative -- these need a real .mbtiles file on disk, so
+-- they are not run as part of this reference file.
+--
+-- SELECT MBTILES_TILE('city.mbtiles', 14, TILE_X(13.405, 14), TILE_FLIP_Y(TILE_Y(52.520, 14), 14)) AS tile_data;
+-- SELECT zoom_level, tile_column, tile_row, tile_size, tile_sha256 FROM MBTILES_TILES('city.mbtiles', 0, 8);
+-- SELECT * FROM MBTILES_METADATA('city.mbtiles');
+
+-- ============================================================
+-- END OF EXAMPLES
+-- ============================================================

@@ -31,6 +31,8 @@ func WriteFiles(root string) error {
 		return err
 	}
 	for path, data := range map[string][]byte{
+		// Preserve downloads and scripts using the former canonical path.
+		"FUNCTIONS.sql": source,
 		"cmd/wasm_browser/web/function_examples.json": json.Bytes(),
 		"docs/reference/functions.html":               html.Bytes(),
 	} {

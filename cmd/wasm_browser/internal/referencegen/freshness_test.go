@@ -73,3 +73,27 @@ func TestCheckedInHTMLMatchesFunctionsSQL(t *testing.T) {
 		t.Fatal("HTML reference is stale; run make reference")
 	}
 }
+
+func TestLegacySQLPathsMatchCanonicalSources(t *testing.T) {
+	root, err := FindRepoRoot(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for legacy, canonical := range map[string]string{
+		"FUNCTIONS.sql":        SourcePath,
+		"example_showcase.sql": "demos/sql/showcase.sql",
+	} {
+		got, err := os.ReadFile(filepath.Join(root, legacy))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(canonical)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		normalize := func(b []byte) []byte { return bytes.ReplaceAll(b, []byte("\r\n"), []byte("\n")) }
+		if !bytes.Equal(normalize(got), normalize(want)) {
+			t.Errorf("%s is stale; run make reference", legacy)
+		}
+	}
+}

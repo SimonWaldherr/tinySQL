@@ -281,6 +281,7 @@ test: test-all
 ## reference: Regenerate the HTML and browser JSON function references
 reference:
 	$(GO) run ./cmd/wasm_browser/tools/gen_reference.go
+	cp demos/sql/showcase.sql example_showcase.sql
 
 ## test-all: Run all tests with coverage
 test-all:
