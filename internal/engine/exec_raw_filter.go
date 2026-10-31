@@ -1261,8 +1261,15 @@ func buildCompiledGlobFilter(colIdx int, pattern string, caseInsensitive, negate
 }
 
 // buildInFilter builds a fast set-membership closure for col IN (litVals).
-// It pre-builds typed maps for all-int and all-string value sets for O(1) lookup.
+// A single value reuses a literal comparison; larger lists use typed maps.
 func buildInFilter(colIdx int, litVals []any, negate bool) func([]any) (bool, error) {
+	if len(litVals) == 1 {
+		op := "="
+		if negate {
+			op = "!="
+		}
+		return buildColLiteralFilter(colIdx, op, litVals[0])
+	}
 	hasNull := false
 	integers := make(map[int64]struct{})
 	floats := make(map[float64]struct{})
