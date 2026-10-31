@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math"
 	"sort"
 	"strings"
@@ -18,12 +19,13 @@ import (
 // full scan of the corpus per query, which became the dominant cost of a RAG
 // SELECT once retrieval itself was made fast. It is cached here the same way the
 // vector column cache and the tokenized-document cache are: keyed by
-// (tenant, table, columns), validated against the table pointer and
-// table.Version, and rebuilt lazily whenever either changes.
+// (source identity, tenant, table, columns), validated against table.Version.
+// Pure appends extend it lazily; structural changes require a full rebuild.
 //
 // Entries are immutable once published, so concurrent queries share one index.
 
 type ragContextIndexCacheKey struct {
+	source   *storage.Table
 	tenant   string
 	table    string
 	docCol   string // lower-cased
@@ -36,9 +38,11 @@ type ragContextIndexCacheKey struct {
 }
 
 type ragContextIndexCacheEntry struct {
-	table   *storage.Table
-	version int
-	index   ragContextIndex
+	table         *storage.Table
+	version       int
+	structVersion int
+	rows          int
+	index         ragContextIndex
 }
 
 // ragContextIndexCacheMaxEntries bounds the cache for the same reason the vector
@@ -79,16 +83,27 @@ func getRAGContextIndex(source ragSource, docCol, chunkCol string) ragContextInd
 		return index
 	}
 
-	index := ragBuildContextIndex(source, docCol, chunkCol)
+	ragContextIndexCacheMu.RLock()
+	previous, exists := ragContextIndexCache[key]
+	ragContextIndexCacheMu.RUnlock()
+	var index ragContextIndex
+	if exists && source.rowFilter == nil && previous.table == source.table &&
+		previous.structVersion == source.table.StructVersion() && previous.rows <= len(source.rawRows) {
+		index = ragExtendContextIndex(previous.index, source, docCol, chunkCol, previous.rows)
+	} else {
+		index = ragBuildContextIndex(source, docCol, chunkCol)
+	}
 
 	ragContextIndexCacheMu.Lock()
 	if _, exists := ragContextIndexCache[key]; !exists {
 		evictOverCap(ragContextIndexCache, ragContextIndexCacheMaxEntries)
 	}
 	ragContextIndexCache[key] = ragContextIndexCacheEntry{
-		table:   source.table,
-		version: source.table.Version,
-		index:   index,
+		table:         source.table,
+		version:       source.table.Version,
+		structVersion: source.table.StructVersion(),
+		rows:          len(source.rawRows),
+		index:         index,
 	}
 	ragContextIndexCacheMu.Unlock()
 	return index
@@ -96,6 +111,7 @@ func getRAGContextIndex(source ragSource, docCol, chunkCol string) ragContextInd
 
 func ragContextCacheKey(source ragSource, docCol, chunkCol string) ragContextIndexCacheKey {
 	return ragContextIndexCacheKey{
+		source:   source.table,
 		tenant:   source.tenant,
 		table:    source.table.Name,
 		docCol:   strings.ToLower(docCol),
@@ -828,6 +844,37 @@ func ragBuildContextIndex(source ragSource, docCol, chunkCol string) ragContextI
 
 	ragSortContextIndex(contexts)
 	return contexts
+}
+
+// Extend only unrestricted physical-table indexes: an ACL's authorized rows
+// can change on append and require their own version-scoped rebuild. Clone the
+// directory and touched document slices so readers of the prior index retain
+// an immutable snapshot. Untouched documents keep their existing chunk slices.
+func ragExtendContextIndex(previous ragContextIndex, source ragSource, docCol, chunkCol string, start int) ragContextIndex {
+	if start == len(source.rawRows) {
+		return previous
+	}
+	tail := source
+	tail.rawRows = source.rawRows[start:]
+	delta := ragBuildContextIndex(tail, docCol, chunkCol)
+	if len(delta.byDocument) == 0 {
+		return previous
+	}
+	index := ragContextIndex{byDocument: maps.Clone(previous.byDocument)}
+	for key, added := range delta.byDocument {
+		existing := previous.byDocument[key]
+		chunks := make([]ragContextRow, len(existing)+len(added))
+		copy(chunks, existing)
+		for i, row := range added {
+			row.sourceRow += start
+			chunks[len(existing)+i] = row
+		}
+		// Appends may arrive out of chunk order. Stable sorting keeps earlier
+		// physical rows first when chunk positions are duplicated.
+		sortRagContextRows(chunks)
+		index.byDocument[key] = chunks
+	}
+	return index
 }
 
 // ragSortContextIndex orders each document's chunks by chunk index, which is

@@ -956,6 +956,14 @@ LIMIT 6;
 calling `RAG_CONTEXT`: it builds the document/chunk lookup once for all hits and
 deduplicates overlapping windows.
 
+For unrestricted physical tables, an already built context index incorporates
+pure appends without rescanning existing rows. It shares untouched document
+groups with the previous immutable index. Updates, deletes, schema changes,
+and ACL-scoped sources rebuild safely. Context indexes are isolated by table
+instance across databases and discarded after statement rollback. See the
+[ingestion benchmark](rag-serving-performance.md#context-indexes-after-ingestion)
+for costs and limits.
+
 Context lookup and deduplication preserve exact BIGINT document IDs, including
 adjacent values above 2^53. JavaScript numbers cannot represent every such ID;
 keep external IDs as strings, or select `CAST(doc_id AS TEXT)` when transporting

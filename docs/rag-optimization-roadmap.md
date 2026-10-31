@@ -42,6 +42,12 @@ preserves exact BIGINT IDs, and explicit null ID allowlists fail closed. See
 [RAG serving measurements](rag-serving-performance.md) for scope, allocation
 results, and remaining memory-budget limitations.
 
+Unrestricted context indexes also extend after pure appends, sharing untouched
+document groups while copying the document directory and changed groups.
+Structural changes and ACL-scoped sources still rebuild. Directory copying
+remains proportional to document count; this is not a general mutable-index
+implementation.
+
 ### Implemented: filtered retrieval before ranking
 
 `RAG_SEARCH` and `HYBRID_SEARCH` accept an explicit `pre_filter` options

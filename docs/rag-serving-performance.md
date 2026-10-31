@@ -7,9 +7,9 @@ columns, ranking algorithms, and persisted index formats are unchanged.
 
 ## Cache identity across databases
 
-Vector-column, IVF, HNSW, and optional result-cache keys include the source
-table's runtime identity. A tenant, table name, and version are insufficient:
-two independent databases can have the same values for all three.
+Vector-column, IVF, HNSW, context-index, and optional result-cache keys include
+the source table's runtime identity. A tenant, table name, and version are
+insufficient: two independent databases can have the same values for all three.
 
 Previously, alternating between such databases replaced the column/ANN cache
 entry on each request. The optional result cache could return candidate row
@@ -17,9 +17,10 @@ positions from the other database. Each table now retains its own warm entries,
 including after equal-version table replacement. DROP/recreate and rollback
 remain covered by cache invalidation tests.
 
-The caches are still process-wide and bounded: 256 vector-column entries and
-64 entries in each ANN cache. Old table instances can remain referenced until
-eviction; result-cache entries expire according to their configured TTL. These
+The caches are still process-wide and bounded: 256 vector-column entries,
+256 context-index entries, and 64 entries in each ANN cache. Old table instances
+can remain referenced until eviction; result-cache entries expire according to
+their configured TTL. These
 are entry limits, not byte budgets. Budget vector copies and ANN topology memory
 for every serving database, and warm each database separately with `RAG_WARM`.
 
@@ -106,3 +107,46 @@ The last benchmark isolates six-hit materialization and qualification at eight
 and 32 source columns. Compare repeated runs on an idle machine; evaluate
 recall@k, tail latency, warm-up time, and resident memory on the actual corpus
 before choosing a vector index mode.
+
+## Context indexes after ingestion
+
+An unrestricted physical-table context index now extends after pure appends.
+It reads only new rows, clones the document directory, and replaces the chunk
+slices of affected documents. Unaffected slices remain shared with the old
+immutable index. Stable sorting preserves physical-row order for duplicate
+chunk positions, even when ingestion arrives out of chunk order.
+
+The table's structural-change counter gates this path. UPDATE, DELETE, schema
+changes, and table replacement require a full rebuild. ACL-scoped indexes keep
+their version-specific rebuild because appended rows can change authorization
+membership. CTE sources also continue to build from their current result rows.
+Context indexes built during a failed statement are purged on rollback: a later
+write may reuse both the restored table pointer and the failed version number.
+A trigger regression test demonstrates that otherwise an out-of-window row
+could inherit a rolled-back neighbor's physical position.
+
+The following follow-up measurement compares against `fa51a40`, on the same
+machine and Go version as above. Each iteration starts with a warm index over
+100 or 1,000 documents of 12 chunks each, appends 12 chunks to one existing
+document, then measures index refresh and one 12-neighbor lookup. Ingestion,
+SQL execution, and result-map materialization are excluded. Values are medians
+of three 200ms runs:
+
+| Existing rows | Time/op, before → after | Bytes/op, before → after | Allocs/op, before → after |
+| --- | ---: | ---: | ---: |
+| 1,200 | 88.35 µs → 4.74 µs | 121,304 → 12,120 | 612 → 14 |
+| 12,000 | 852.15 µs → 21.44 µs | 1,316,457 → 150,144 | 6,023 → 16 |
+
+This is a small-batch context-index benchmark, not a full RAG latency claim.
+Directory cloning still scales with document count, and copying/sorting touched
+documents scales with their chunk count. Large ingestion batches and a corpus
+dominated by one huge document need their own measurements.
+
+```sh
+go test ./internal/engine -run '^$' \
+  -bench '^BenchmarkRAGContextIndexAfterAppend$' \
+  -benchmem -benchtime=200ms -count=3
+```
+
+The benchmark harness was added with this change; copy its file to the baseline
+checkout to reproduce the comparison.

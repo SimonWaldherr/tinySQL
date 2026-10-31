@@ -45,6 +45,20 @@ async function main() {
       assert.deepEqual(actual.rows, contract.rows, `${contract.name}: rows`);
     }
   }
+  // Revisit a warmed neighbor index across ingestion and structural edits.
+  success(db.exec('CREATE TABLE context_edits (id INT PRIMARY KEY, doc TEXT, chunk INT)'));
+  success(db.exec("INSERT INTO context_edits VALUES (1,'a',2),(2,'a',0),(3,'b',1)"));
+  success(db.exec('CREATE TABLE context_edit_hits (doc TEXT, chunk INT)'));
+  success(db.exec("INSERT INTO context_edit_hits VALUES ('a',0)"));
+  const contextRows = () => success(db.query(`SELECT id FROM RAG_CONTEXT_FROM(
+    'context_edits','doc','chunk','context_edit_hits','doc','chunk',0,1) ORDER BY id`)).rows;
+  assert.deepEqual(contextRows(), [[2]]);
+  success(db.exec("INSERT INTO context_edits VALUES (4,'a',1),(5,'a',1)"));
+  assert.deepEqual(contextRows(), [[2],[4]]); // Duplicate positions keep the first source row.
+  success(db.exec('UPDATE context_edits SET chunk=9 WHERE id=4'));
+  assert.deepEqual(contextRows(), [[2],[5]]);
+  success(db.exec('DELETE FROM context_edits WHERE id=2'));
+  assert.deepEqual(contextRows(), [[5]]);
   const escaped = db.query("SELECT HTML_ESCAPE('<b>&</b>') AS escaped");
   if (process.argv[4] === 'tinygo') {
     assert.ok(escaped.error, 'TinyGo HTML escaping must report an error');
