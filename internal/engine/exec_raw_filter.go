@@ -282,6 +282,11 @@ func buildRawFilterUnary(colIndex map[string]int, ex *Unary) func([]any) (bool, 
 	if ex.Op != "NOT" {
 		return nil
 	}
+	if nullTest, ok := ex.Expr.(*IsNull); ok {
+		if filter := buildRawFilterIsNull(colIndex, &IsNull{Expr: nullTest.Expr, Negate: !nullTest.Negate}); filter != nil {
+			return filter
+		}
+	}
 	if ref, ok := ex.Expr.(*VarRef); ok {
 		key := ref.Lower
 		if key == "" {
@@ -318,7 +323,7 @@ func buildRawFilterUnary(colIndex map[string]int, ex *Unary) func([]any) (bool, 
 func buildRawFilterIsNull(colIndex map[string]int, ex *IsNull) func([]any) (bool, error) {
 	innerRef, ok := ex.Expr.(*VarRef)
 	if !ok {
-		return nil
+		return buildRawNullExpressionFilter(colIndex, ex)
 	}
 	colIdx, ok := colIndex[strings.ToLower(innerRef.Name)]
 	if !ok {
