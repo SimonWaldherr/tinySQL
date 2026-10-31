@@ -621,7 +621,7 @@ func windowPartitionShapesEqual(left, right *windowPartitionShape) bool {
 		}
 	}
 	for i := range left.orderBy {
-		if left.orderBy[i].Desc != right.orderBy[i].Desc || !strings.EqualFold(left.orderBy[i].Col, right.orderBy[i].Col) {
+		if left.orderBy[i].Desc != right.orderBy[i].Desc || left.orderBy[i].Nulls != right.orderBy[i].Nulls || !strings.EqualFold(left.orderBy[i].Col, right.orderBy[i].Col) {
 			return false
 		}
 	}

@@ -145,7 +145,7 @@ func (s orderedValueRowsAsc) Swap(i, j int) { s.items[i], s.items[j] = s.items[j
 
 func compareOrderedValueRows(orderBy []OrderItem, a, b orderedValueRow) int {
 	for i, oi := range orderBy {
-		cmp := compareOrderedValue(a.keys[i], b.keys[i], oi.Desc)
+		cmp := compareOrderedValueNulls(a.keys[i], b.keys[i], oi.Desc, oi.Nulls)
 		if cmp != 0 {
 			return cmp
 		}
@@ -167,13 +167,14 @@ type orderedValueRowSingle struct {
 }
 
 type orderedValueRowsSingleAsc struct {
+	nulls NullOrder
 	desc  bool
 	items []orderedValueRowSingle
 }
 
 func (s orderedValueRowsSingleAsc) Len() int { return len(s.items) }
 func (s orderedValueRowsSingleAsc) Less(i, j int) bool {
-	if cmp := compareOrderedValue(s.items[i].key, s.items[j].key, s.desc); cmp != 0 {
+	if cmp := compareOrderedValueNulls(s.items[i].key, s.items[j].key, s.desc, s.nulls); cmp != 0 {
 		return cmp < 0
 	}
 	return s.items[i].idx < s.items[j].idx
@@ -181,6 +182,7 @@ func (s orderedValueRowsSingleAsc) Less(i, j int) bool {
 func (s orderedValueRowsSingleAsc) Swap(i, j int) { s.items[i], s.items[j] = s.items[j], s.items[i] }
 
 type orderedValueRowSingleHeap struct {
+	nulls NullOrder
 	desc  bool
 	items []orderedValueRowSingle
 }
@@ -190,7 +192,7 @@ func (h orderedValueRowSingleHeap) Len() int { return len(h.items) }
 func (h orderedValueRowSingleHeap) Less(i, j int) bool {
 	// See orderedValueRowHeap.Less: later rows lose ties, matching a full
 	// stable sort plus truncation.
-	if cmp := compareOrderedValue(h.items[i].key, h.items[j].key, h.desc); cmp != 0 {
+	if cmp := compareOrderedValueNulls(h.items[i].key, h.items[j].key, h.desc, h.nulls); cmp != 0 {
 		return cmp > 0
 	}
 	return h.items[i].idx > h.items[j].idx
@@ -237,7 +239,7 @@ func (h *orderedValueRowSingleHeap) pushBounded(item orderedValueRowSingle, keep
 		orderedValueRowSingleHeapPush(h, item, keepCount)
 		return
 	}
-	if compareOrderedValue(h.items[0].key, item.key, h.desc) > 0 {
+	if compareOrderedValueNulls(h.items[0].key, item.key, h.desc, h.nulls) > 0 {
 		h.items[0] = item
 		orderedValueRowSingleHeapDown(*h, 0)
 	}
@@ -255,6 +257,7 @@ func applySortOrderSingle(orderBy OrderItem, outRows []Row) []Row {
 	}
 	sort.Sort(orderedValueRowsSingleAsc{
 		desc:  orderBy.Desc,
+		nulls: orderBy.Nulls,
 		items: items,
 	})
 	for i, item := range items {
@@ -356,6 +359,7 @@ func applySortOrderWithLimitSingle(orderBy OrderItem, outRows []Row, limit, offs
 	if useTopN {
 		topRows = orderedValueRowSingleHeap{
 			desc:  orderBy.Desc,
+			nulls: orderBy.Nulls,
 			items: make([]orderedValueRowSingle, 0, min(cap(outRows), keepCount)),
 		}
 	} else {
@@ -376,6 +380,7 @@ func applySortOrderWithLimitSingle(orderBy OrderItem, outRows []Row, limit, offs
 
 	sort.Sort(orderedValueRowsSingleAsc{
 		desc:  orderBy.Desc,
+		nulls: orderBy.Nulls,
 		items: items,
 	})
 

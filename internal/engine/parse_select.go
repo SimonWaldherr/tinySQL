@@ -641,12 +641,11 @@ func (p *Parser) parseOrderByClause(sel *Select) error {
 					return err
 				}
 			}
-			desc := false
-			if p.cur.Typ == tKeyword && (p.cur.Val == "ASC" || p.cur.Val == "DESC") {
-				desc = (p.cur.Val == "DESC")
-				p.next()
+			item, err := p.parseOrderDirection(OrderItem{Col: col})
+			if err != nil {
+				return err
 			}
-			sel.OrderBy = append(sel.OrderBy, OrderItem{Col: col, Desc: desc})
+			sel.OrderBy = append(sel.OrderBy, item)
 			if p.cur.Typ == tSymbol && p.cur.Val == "," {
 				p.next()
 				continue
@@ -655,6 +654,26 @@ func (p *Parser) parseOrderByClause(sel *Select) error {
 		}
 	}
 	return nil
+}
+
+func (p *Parser) parseOrderDirection(item OrderItem) (OrderItem, error) {
+	if p.cur.Typ == tKeyword && (p.cur.Val == "ASC" || p.cur.Val == "DESC") {
+		item.Desc = p.cur.Val == "DESC"
+		p.next()
+	}
+	if p.cur.Typ == tKeyword && p.cur.Val == "NULLS" {
+		p.next()
+		switch {
+		case p.cur.Typ == tKeyword && p.cur.Val == "FIRST":
+			item.Nulls = NullsFirst
+		case p.cur.Typ == tKeyword && p.cur.Val == "LAST":
+			item.Nulls = NullsLast
+		default:
+			return OrderItem{}, p.errf("expected FIRST or LAST after NULLS")
+		}
+		p.next()
+	}
+	return item, nil
 }
 
 // orderByProjectionName resolves a function/expression used in ORDER BY to

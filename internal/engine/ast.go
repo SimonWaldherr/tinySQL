@@ -480,9 +480,20 @@ type SelectItem struct {
 
 // OrderItem specifies ordering column and direction.
 type OrderItem struct {
-	Col  string
-	Desc bool
+	Col   string
+	Desc  bool
+	Nulls NullOrder
 }
+
+// NullOrder is independent of direction. The zero value preserves the
+// existing default: NULLs last for both ASC and DESC.
+type NullOrder byte
+
+const (
+	NullsDefault NullOrder = iota
+	NullsFirst
+	NullsLast
+)
 
 // OverClause represents the OVER clause for window functions.
 type OverClause struct {

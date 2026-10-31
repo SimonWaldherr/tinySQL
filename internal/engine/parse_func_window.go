@@ -212,12 +212,7 @@ func (p *Parser) parseOverOrderItem() (OrderItem, error) {
 	col := p.cur.Val
 	p.next()
 
-	desc := false
-	if p.cur.Typ == tKeyword && (p.cur.Val == "DESC" || p.cur.Val == "ASC") {
-		desc = p.cur.Val == "DESC"
-		p.next()
-	}
-	return OrderItem{Col: col, Desc: desc}, nil
+	return p.parseOrderDirection(OrderItem{Col: col})
 }
 
 func (p *Parser) parseOverFrame(oc *OverClause) error {

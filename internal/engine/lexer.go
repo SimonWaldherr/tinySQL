@@ -515,6 +515,8 @@ func keywordValue(up string) string {
 		return "ASC"
 	case "DESC":
 		return "DESC"
+	case "NULLS":
+		return "NULLS"
 	case "LIMIT":
 		return "LIMIT"
 	case "OFFSET":

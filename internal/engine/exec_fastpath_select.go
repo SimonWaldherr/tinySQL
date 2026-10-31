@@ -345,6 +345,7 @@ func executeSimpleSelectUnfilteredFastPath(env ExecEnv, plan *simpleSelectPlan) 
 }
 
 type orderedRawRow struct {
+	idx  int // original scan position, retained across heap swaps
 	raw  []any
 	key  any
 	keys []any
@@ -357,6 +358,7 @@ type orderedRawRow struct {
 // all nullable, mixed-type, indexed, or filtered queries retain the general
 // orderedRawRow implementation below.
 type floatOrderedRawRow struct {
+	idx int
 	raw []any
 	key float64
 }
@@ -409,7 +411,7 @@ func executeSimpleSelectFloatOrderedTopN(env ExecEnv, plan *simpleSelectPlan, so
 				return nil, err
 			}
 		}
-		topRows.pushBounded(floatOrderedRawRow{raw: raw, key: raw[column].(float64)}, keepCount)
+		topRows.pushBounded(floatOrderedRawRow{raw: raw, key: raw[column].(float64), idx: i}, keepCount)
 	}
 
 	rows := topRows.items
@@ -595,7 +597,7 @@ func executeSimpleSelectFloatScoredTopN(env ExecEnv, plan *simpleSelectPlan, sou
 		if err != nil {
 			return nil, err
 		}
-		topRows.pushBounded(floatOrderedRawRow{raw: raw, key: key}, keepCount)
+		topRows.pushBounded(floatOrderedRawRow{raw: raw, key: key, idx: i}, keepCount)
 	}
 
 	rows := topRows.items
@@ -642,7 +644,7 @@ type floatOrderedRawRowHeap struct {
 func (h floatOrderedRawRowHeap) less(i, j int) bool {
 	// The heap root is the worst retained row, hence the reversed comparison.
 	// Direct float comparisons — semantically identical to the generic
-	// comparator (NaN ranks equal to everything, ties are not less) but small
+	// comparator, with scan position breaking ties, but small
 	// enough to inline into every heap level of every pushed row.
 	a, b := h.items[i].key, h.items[j].key
 	if a < b {
@@ -651,7 +653,7 @@ func (h floatOrderedRawRowHeap) less(i, j int) bool {
 	if a > b {
 		return !h.desc
 	}
-	return false
+	return h.items[i].idx > h.items[j].idx
 }
 
 func (h floatOrderedRawRowHeap) swap(i, j int) {
@@ -713,8 +715,7 @@ type floatOrderedRawRowsAsc struct {
 
 func (s floatOrderedRawRowsAsc) Len() int { return len(s.items) }
 func (s floatOrderedRawRowsAsc) Less(i, j int) bool {
-	// Direct float comparisons; NaN ranks equal to everything and ties are
-	// not less, so sort.Stable keeps their existing order.
+	// Direct float comparisons; retain scan position for equal keys.
 	a, b := s.items[i].key, s.items[j].key
 	if a < b {
 		return !s.desc
@@ -722,7 +723,7 @@ func (s floatOrderedRawRowsAsc) Less(i, j int) bool {
 	if a > b {
 		return s.desc
 	}
-	return false
+	return s.items[i].idx < s.items[j].idx
 }
 func (s floatOrderedRawRowsAsc) Swap(i, j int) { s.items[i], s.items[j] = s.items[j], s.items[i] }
 
@@ -885,6 +886,7 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 			}
 			item = orderedRawRow{raw: raw, keys: keys}
 		}
+		item.idx = i
 		if useTopN {
 			reusableKeys = topRows.pushBounded(item, keepCount)
 		} else {
@@ -904,8 +906,8 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 	// moves 4 bytes instead of a whole orderedRawRow, which is what dominates
 	// large sorts. perm starts as the identity permutation, so its values are
 	// pre-sort positions; breaking comparator ties on them makes the unstable
-	// pdqsort reproduce the former stable order: scan order for full sorts,
-	// heap order for top-N, without symMerge's O(n log² n) element moves.
+	// pdqsort preserve scan order, including after heap swaps, without
+	// symMerge's O(n log² n) element moves.
 	perm := make([]int32, len(rows))
 	for i := range perm {
 		perm[i] = int32(i)
@@ -1077,13 +1079,21 @@ func (h *orderedRawRowHeap) pushBounded(item orderedRawRow, keepCount int) []any
 
 func compareOrderedRawRows(plan *simpleSelectPlan, a, b orderedRawRow) int {
 	if len(plan.orderBy) == 1 {
-		return compareOrderedValue(a.key, b.key, plan.orderBy[0].Desc)
-	}
-	for i, oi := range plan.orderBy {
-		cmp := compareOrderedValue(a.keys[i], b.keys[i], oi.Desc)
-		if cmp != 0 {
+		if cmp := compareOrderedValueNulls(a.key, b.key, plan.orderBy[0].Desc, plan.orderBy[0].Nulls); cmp != 0 {
 			return cmp
 		}
+	} else {
+		for i, oi := range plan.orderBy {
+			if cmp := compareOrderedValueNulls(a.keys[i], b.keys[i], oi.Desc, oi.Nulls); cmp != 0 {
+				return cmp
+			}
+		}
+	}
+	if a.idx < b.idx {
+		return -1
+	}
+	if a.idx > b.idx {
+		return 1
 	}
 	return 0
 }
@@ -1114,4 +1124,18 @@ func compareOrderedValue(a, b any, desc bool) int {
 	default:
 		return 1
 	}
+}
+
+// Explicit NULL placement does not reverse when the value direction is DESC.
+func compareOrderedValueNulls(a, b any, desc bool, nulls NullOrder) int {
+	if nulls != NullsDefault && (a == nil || b == nil) {
+		if a == nil && b == nil {
+			return 0
+		}
+		if (a == nil) == (nulls == NullsFirst) {
+			return -1
+		}
+		return 1
+	}
+	return compareOrderedValue(a, b, desc)
 }
