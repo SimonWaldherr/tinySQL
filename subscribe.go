@@ -2,12 +2,23 @@ package tinysql
 
 import (
 	"context"
+
 	"github.com/SimonWaldherr/tinySQL/internal/engine"
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
+type TableRef = storage.TableRef
+
+type ChangeWatch = storage.ChangeWatch
+
+type ChangeWatchStats = storage.ChangeWatchStats
+
 type QueryChange = engine.QueryChange
+
 type QuerySubscription = engine.QuerySubscription
+
 type SubscriptionStats = engine.SubscriptionStats
+
 type SubscriptionOptions = engine.SubscriptionOptions
 
 // SubscribeSQL delivers an initial result and coalesced result deltas for a
