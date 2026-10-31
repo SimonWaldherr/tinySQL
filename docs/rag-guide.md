@@ -526,6 +526,10 @@ scan of the authorized subset. This makes the API safe for typed and
 SQLite-affinity-compatible columns instead of risking false-negative index
 lookups.
 
+An omitted `allowed_row_ids` permits a metadata-only filter. An explicit `[]`
+authorizes no rows; an explicit `null` is rejected, even when `equals` or
+`spatial` is also supplied. Do not use a null list to mean an unavailable ACL.
+
 Georeferenced corpora can add a `spatial` boundary to the same pre-filter. It
 is intersected with IDs and equality metadata before either retriever ranks a
 candidate. Bbox mode uses WGS84 `[west,south,east,north]` and matches geometry
@@ -835,8 +839,18 @@ tsql.ConfigureVectorCache(cfg)
 stats := tsql.VectorCacheAnalytics()
 ```
 
+Runtime vector caches distinguish table instances across independent databases,
+including when tenant names, table names, and versions coincide. Warm each
+serving database separately. Column caches retain at most 256 entries and each
+ANN cache at most 64; these bounds count entries rather than bytes. Replaced
+table instances may remain referenced until eviction. See
+[RAG serving measurements](rag-serving-performance.md) for cache reuse and
+result-allocation benchmarks.
+
 Use request contexts with deadlines. tinySQL propagates cancellation through
 query execution and index warm-up.
+Requests waiting for another IVF/HNSW build can cancel without canceling the
+shared build.
 
 ## 12. Troubleshooting checklist
 
@@ -941,6 +955,12 @@ LIMIT 6;
 `RAG_CONTEXT_FROM` can expand that hit set afterward. Prefer it over repeatedly
 calling `RAG_CONTEXT`: it builds the document/chunk lookup once for all hits and
 deduplicates overlapping windows.
+
+Context lookup and deduplication preserve exact BIGINT document IDs, including
+adjacent values above 2^53. JavaScript numbers cannot represent every such ID;
+keep external IDs as strings, or select `CAST(doc_id AS TEXT)` when transporting
+integer IDs to JavaScript. Precision already lost in the caller cannot be
+recovered by retrieval.
 
 ## 14. Design rationale and further reading
 

@@ -9,6 +9,8 @@ speedup claim:
   vector kernels, fusion, context expansion, and FTS ingestion;
 - [filtered RAG postings](rag-filtered-postings-performance.md) covers strict
   authorization filters;
+- [RAG serving](rag-serving-performance.md) covers cache reuse across databases,
+  result-map allocations, and exact context identity;
 - [geospatial performance](geospatial-performance.md) covers predicate and
   grid-window shortcuts; and
 - [driver and engine performance](driver-engine-performance.md) covers shared

@@ -34,6 +34,14 @@ at three consecutive stages of one hybrid query:
 
 The public result schemas and SQL APIs remain unchanged.
 
+Serving caches distinguish source-table instances across independent databases,
+so equal names and versions neither mix optional cached candidates nor displace
+each other's warm vector columns and ANN indexes. SQL qualifies freshly
+materialized built-in retrieval rows without another map copy. Context identity
+preserves exact BIGINT IDs, and explicit null ID allowlists fail closed. See
+[RAG serving measurements](rag-serving-performance.md) for scope, allocation
+results, and remaining memory-budget limitations.
+
 ### Implemented: filtered retrieval before ranking
 
 `RAG_SEARCH` and `HYBRID_SEARCH` accept an explicit `pre_filter` options

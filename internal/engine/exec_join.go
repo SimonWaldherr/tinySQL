@@ -47,16 +47,7 @@ func processJoins(env ExecEnv, joins []JoinClause, cur []Row) ([]Row, error) {
 			if env.tableFuncColumns != nil {
 				env.tableFuncColumns[tf] = rs.Cols
 			}
-			rightRows = make([]Row, len(rs.Rows))
-			for i, row := range rs.Rows {
-				rightRows[i] = make(Row)
-				for k, v := range row {
-					rightRows[i][strings.ToLower(k)] = v
-					if j.Right.Alias != "" {
-						rightRows[i][strings.ToLower(j.Right.Alias+"."+k)] = v
-					}
-				}
-			}
+			rightRows = aliasRetrievalRows(fn, rs, j.Right.Alias)
 			// synthetic table metadata from ResultSet columns
 			cols := make([]storage.Column, 0, len(rs.Cols))
 			for _, c := range rs.Cols {

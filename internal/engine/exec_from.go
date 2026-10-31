@@ -167,7 +167,7 @@ func resolveTableFunc(env ExecEnv, s *Select) ([]Row, error) {
 	if env.tableFuncColumns != nil {
 		env.tableFuncColumns[s.From.TableFunc] = rs.Cols
 	}
-	return aliasRows(rs.Rows, s.From.Alias), nil
+	return aliasRetrievalRows(tf, rs, s.From.Alias), nil
 }
 
 // resolveTableSource handles CTE, catalog, sys, or regular table resolution
