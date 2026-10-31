@@ -47,13 +47,31 @@ func TestTrimEdgesEvaluatorParity(t *testing.T) {
 	plan := &simpleSelectPlan{colIndex: map[string]int{"v": 0}}
 	for _, name := range []string{"LTRIM", "RTRIM", "TRIM"} {
 		for _, value := range []any{nil, "  text  ", " \u2003漢🙂\u00a0 ", " \xff ", 123} {
-			for _, cutset := range [][]Expr{nil, {&Literal{Val: " 漢"}}, {&Literal{Val: nil}}, {&Literal{Val: 1}}, {&VarRef{Name: "missing"}}} {
+			for _, cutset := range [][]Expr{nil, {&Literal{Val: ""}}, {&Literal{Val: " 漢"}}, {&Literal{Val: nil}}, {&Literal{Val: 1}}, {&VarRef{Name: "missing"}}} {
 				call := &FuncCall{Name: name, Args: append([]Expr{&VarRef{Name: "v"}}, cutset...)}
 				want, wantErr := evalFuncCall(ExecEnv{}, call, Row{"v": value})
 				got, gotErr := evalRawFuncCall(plan, []any{value}, call)
 				if !reflect.DeepEqual(got, want) || (gotErr == nil) != (wantErr == nil) {
 					t.Fatalf("%s(%v): raw %v/%v, general %v/%v", name, value, got, gotErr, want, wantErr)
 				}
+			}
+		}
+	}
+}
+
+func TestTrimEmptySetAndNullContracts(t *testing.T) {
+	for _, name := range []string{"TRIM", "LTRIM", "RTRIM"} {
+		for _, tc := range []struct {
+			args string
+			want any
+		}{
+			{"'  text  ', ''", "  text  "},
+			{"'  text  ', NULL", nil},
+			{"NULL, 1/0", nil},
+		} {
+			sql := "SELECT " + name + "(" + tc.args + ") AS v"
+			if got := evalScalarSQL(t, sql); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("%s = %v, want %v", sql, got, tc.want)
 			}
 		}
 	}

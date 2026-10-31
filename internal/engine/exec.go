@@ -182,7 +182,10 @@ func (c *cteRowCache) store(key cteRowCacheKey, rows []Row) []Row {
 }
 
 type ExecEnv struct {
-	ctx context.Context
+	// Per-SELECT metadata from already executed table functions. Empty star
+	// projections must preserve their schema without executing the source twice.
+	tableFuncColumns map[*TableFuncCall][]string
+	ctx              context.Context
 	// Profiling is execution-local and enabled only by EXPLAIN ANALYZE.
 	// Child environments retain the collector and carry their own parent span.
 	profile       *queryProfile

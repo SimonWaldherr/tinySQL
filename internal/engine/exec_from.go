@@ -164,6 +164,9 @@ func resolveTableFunc(env ExecEnv, s *Select) ([]Row, error) {
 	if err != nil {
 		return nil, err
 	}
+	if env.tableFuncColumns != nil {
+		env.tableFuncColumns[s.From.TableFunc] = rs.Cols
+	}
 	return aliasRows(rs.Rows, s.From.Alias), nil
 }
 

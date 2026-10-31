@@ -48,6 +48,9 @@ func emptyProjectionColumns(env ExecEnv, s *Select) ([]string, error) {
 }
 
 func emptySourceColumns(env ExecEnv, source FromItem) ([]string, error) {
+	if source.TableFunc != nil {
+		return env.tableFuncColumns[source.TableFunc], nil
+	}
 	if source.Subquery != nil {
 		rs, err := executeSelect(env, source.Subquery)
 		if err != nil {

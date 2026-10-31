@@ -99,6 +99,16 @@ func executeSelect(env ExecEnv, s *Select) (result *ResultSet, err error) {
 		term = &termCopy
 	}
 
+	if s.From.TableFunc != nil {
+		cteEnv.tableFuncColumns = make(map[*TableFuncCall][]string)
+	} else {
+		for _, join := range s.Joins {
+			if join.Right.TableFunc != nil {
+				cteEnv.tableFuncColumns = make(map[*TableFuncCall][]string)
+				break
+			}
+		}
+	}
 	// FROM (Tabelle, CTE oder Subselect) - now optional
 	phaseEnv, phase := startQueryPhase(cteEnv, "SOURCE", "materialize FROM rows")
 	leftRows, err := resolveFromClause(phaseEnv, phaseEnv, s)

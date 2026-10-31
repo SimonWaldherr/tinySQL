@@ -49,6 +49,7 @@ func getBuiltinFunctions() map[string]funcHandler {
 		"CONCAT_WS":         evalConcatWsFunc,
 		"COLUMNS_TO_TEXT":   evalConcatWsFunc,
 		"TEXT_TO_COLUMNS":   evalTextToColumnsScalar,
+		"STRING_SPLIT":      evalStringSplitScalar,
 		"LENGTH":            evalLengthFunc,
 		"LEN":               evalLengthFunc,
 		"SUBSTRING":         evalSubstringFunc,

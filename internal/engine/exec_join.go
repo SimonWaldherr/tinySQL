@@ -44,6 +44,9 @@ func processJoins(env ExecEnv, joins []JoinClause, cur []Row) ([]Row, error) {
 			if err != nil {
 				return nil, err
 			}
+			if env.tableFuncColumns != nil {
+				env.tableFuncColumns[tf] = rs.Cols
+			}
 			rightRows = make([]Row, len(rs.Rows))
 			for i, row := range rs.Rows {
 				rightRows[i] = make(Row)
