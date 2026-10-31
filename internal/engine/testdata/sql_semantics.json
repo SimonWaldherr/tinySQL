@@ -1,0 +1,150 @@
+{
+  "setup": [
+    "CREATE TABLE contract_facts (id INT PRIMARY KEY, grp TEXT, k INT, v INT, enabled BOOL)",
+    "INSERT INTO contract_facts VALUES (1,'a',NULL,10,TRUE),(2,'a',2,20,FALSE),(3,'a',1,10,TRUE),(4,'b',NULL,NULL,TRUE),(5,'b',2,7,NULL),(6,'b',3,NULL,FALSE)"
+  ],
+  "cases": [
+    {
+      "name": "weekday_uses_explicit_input_offset",
+      "sql": "SELECT ISODOW('2024-03-01T00:30:00+14:00') AS friday, DATEPART(ISO_WEEKDAY,'2024-03-03T23:30:00-12:00') AS sunday",
+      "columns": ["friday", "sunday"],
+      "rows": [[5,7]]
+    },
+    {
+      "name": "boundaries_are_not_complete_months",
+      "sql": "SELECT DATEDIFF(MONTH,'2024-01-31','2024-02-29') AS boundaries, TIMESTAMPDIFF(MONTH,'2024-01-31','2024-02-29') AS complete",
+      "columns": ["boundaries", "complete"],
+      "rows": [[1,0]]
+    },
+    {
+      "name": "equivalent_instants_and_dst",
+      "sql": "SELECT DATEDIFF(DAY,'2024-03-01T00:30:00+01:00','2024-02-29T23:30:00Z') AS same, TIMESTAMPDIFF(HOUR,'2024-03-30T12:00:00+01:00','2024-03-31T12:00:00+02:00') AS elapsed_hours",
+      "columns": ["same", "elapsed_hours"],
+      "rows": [[0,23]]
+    },
+    {
+      "name": "wide_integer_date_result",
+      "sql": "SELECT TIMESTAMPDIFF(SECOND,'1000-01-01','2000-01-01') AS elapsed_seconds",
+      "columns": ["elapsed_seconds"],
+      "rows": [[31556908800]]
+    },
+    {
+      "name": "exact_subseconds_survive_text_transport",
+      "sql": "SELECT CAST(DATEDIFF(NANOSECOND,'1970-01-01T00:00:00Z','2262-04-11T23:47:16.854775807Z') AS TEXT) AS positive, CAST(TIMESTAMPDIFF(NANOSECOND,'1970-01-01T00:00:00Z','1677-09-21T00:12:43.145224192Z') AS TEXT) AS negative",
+      "columns": ["positive", "negative"],
+      "rows": [["9223372036854775807","-9223372036854775808"]]
+    },
+    {
+      "name": "statement_clock_is_shared",
+      "sql": "SELECT NOW() = CURRENT_TIMESTAMP() AS same",
+      "columns": ["same"],
+      "rows": [[true]]
+    },
+    {
+      "name": "null_is_distinct_from_empty_and_false",
+      "sql": "SELECT ISNULL(NULL) AS absent, ISNULL('') AS empty, ISNULL(FALSE) AS is_false, COALESCE('ok',1/0) AS lazy",
+      "columns": ["absent", "empty", "is_false", "lazy"],
+      "rows": [[true,false,false,"ok"]]
+    },
+    {
+      "name": "unicode_and_explicit_trim_sets",
+      "sql": "SELECT TRIM(' text ') AS whitespace, LTRIM('🙂xxtext','🙂x') AS characters, TRIM(' text ','') AS empty_set, TRIM(NULL,1/0) AS lazy_null",
+      "columns": ["whitespace", "characters", "empty_set", "lazy_null"],
+      "rows": [["text","text"," text ",null]]
+    },
+    {
+      "name": "filtered_aggregates_keep_empty_groups",
+      "sql": "SELECT grp, COUNT(*) FILTER (WHERE enabled) AS n, SUM(v) FILTER (WHERE enabled) AS total FROM contract_facts GROUP BY grp ORDER BY grp",
+      "columns": ["grp", "n", "total"],
+      "rows": [["a",2,20],["b",1,null]]
+    },
+    {
+      "name": "discarded_arguments_are_not_evaluated",
+      "sql": "SELECT COUNT(*) FILTER (WHERE NULL) AS n, SUM(1/0) FILTER (WHERE FALSE) AS total FROM contract_facts",
+      "columns": ["n", "total"],
+      "rows": [[0,null]]
+    },
+    {
+      "name": "aggregate_predicate_uses_whole_group",
+      "sql": "SELECT SUM(v) BETWEEN 40 AND 50 AS between_result, SUM(v) IN (47,99) AS in_result, CAST(SUM(v) AS TEXT) LIKE '4%' AS like_result FROM contract_facts",
+      "columns": ["between_result", "in_result", "like_result"],
+      "rows": [[true,true,true]]
+    },
+    {
+      "name": "explicit_null_placement_and_stable_page",
+      "sql": "SELECT id FROM contract_facts ORDER BY k ASC NULLS FIRST LIMIT 3 OFFSET 1",
+      "columns": ["id"],
+      "rows": [[4],[3],[2]]
+    },
+    {
+      "name": "descending_values_do_not_reverse_null_placement",
+      "sql": "SELECT id FROM contract_facts ORDER BY k DESC NULLS LAST",
+      "columns": ["id"],
+      "rows": [[6],[2],[5],[3],[1],[4]]
+    },
+    {
+      "name": "distinct_window_and_value_range",
+      "sql": "SELECT id, COUNT(DISTINCT grp) OVER () AS categories, SUM(v) OVER (ORDER BY k RANGE 1 PRECEDING) AS total FROM contract_facts WHERE k IS NOT NULL ORDER BY id",
+      "columns": ["id", "categories", "total"],
+      "rows": [[2,2,37],[3,2,10],[5,2,37],[6,2,27]]
+    },
+    {
+      "name": "window_inside_predicate",
+      "sql": "SELECT id, ROW_NUMBER() OVER (ORDER BY id) IN (1,2) AS first_two FROM contract_facts WHERE id<=3 ORDER BY id",
+      "columns": ["id", "first_two"],
+      "rows": [[1,true],[2,true],[3,false]]
+    },
+    {
+      "name": "literal_split_preserves_empty_fields",
+      "sql": "SELECT value,ordinal FROM STRING_SPLIT('ä::🙂::::','::',1) ORDER BY ordinal",
+      "columns": ["value", "ordinal"],
+      "rows": [["ä",1],["🙂",2],["",3],["",4]]
+    },
+    {
+      "name": "empty_table_function_keeps_schema",
+      "sql": "SELECT value,ordinal FROM STRING_SPLIT(NULL,'::',1)",
+      "columns": ["value", "ordinal"],
+      "rows": []
+    },
+    {
+      "name": "reject_nested_aggregate_in_filter",
+      "sql": "SELECT COUNT(*) FILTER (WHERE SUM(v) IN (47)) FROM contract_facts",
+      "error": "FILTER predicate"
+    },
+    {
+      "name": "reject_nested_window_in_filter",
+      "sql": "SELECT COUNT(*) FILTER (WHERE ROW_NUMBER() OVER () BETWEEN 1 AND 2) FROM contract_facts",
+      "error": "FILTER predicate"
+    },
+    {
+      "name": "reject_unknown_window_sort_key",
+      "sql": "SELECT SUM(v) OVER (ORDER BY missing RANGE 1 PRECEDING) FROM contract_facts",
+      "error": "unknown column"
+    },
+    {
+      "name": "reject_unsupported_grouped_window",
+      "sql": "SELECT grp,COUNT(*),ROW_NUMBER() OVER (ORDER BY grp) FROM contract_facts GROUP BY grp",
+      "error": "aggregate in a subquery"
+    },
+    {
+      "name": "reject_nested_window_argument",
+      "sql": "SELECT SUM(ROW_NUMBER() OVER ()) OVER () FROM contract_facts",
+      "error": "nested aggregate or window"
+    },
+    {
+      "name": "reject_nested_ordinary_aggregate",
+      "sql": "SELECT COUNT(SUM(v)) FROM contract_facts",
+      "error": "nested aggregate or window"
+    },
+    {
+      "name": "reject_having_that_would_be_ignored",
+      "sql": "SELECT id FROM contract_facts HAVING FALSE",
+      "error": "HAVING requires"
+    },
+    {
+      "name": "reject_unsupported_date_modifiers",
+      "sql": "SELECT DATE('2024-01-01','+1 day')",
+      "error": "modifiers are not supported"
+    }
+  ]
+}

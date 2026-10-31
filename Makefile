@@ -6,7 +6,7 @@ SHELL := /usr/bin/env bash
 .PHONY: build-wasm-browser build-wasm-node build-studio build-tinysqlpage build-migrate
 .PHONY: build-query-files build-query-files-wasm build-fsql run-query-files-demo
 .PHONY: build-gh-pages-demo check-gh-pages-demo update-gh-pages push-gh-pages
-.PHONY: test-all test-unit test-integration test-jsonv2 test-ci coverage build-check wasm-check wasm-smoke tinygo-wasm ci verify verify-ci
+.PHONY: test-all test-unit test-integration test-jsonv2 test-semantics test-ci coverage build-check wasm-check wasm-smoke tinygo-wasm ci verify verify-ci
 .PHONY: test-query-files test-query-files-wasm test-query-files-browser test-fsql test-gorm test-sqlpackages test-sql-compat test-server
 .PHONY: run-wasm-browser run-wasm-node-demo deps deps-all update-deps tidy tidy-all modules-tidy-check modules-verify bench bench-engine bench-hotpaths bench-stream bench-stream-guard release-check script-lint docker-build info
 .DEFAULT_GOAL := help
@@ -302,6 +302,13 @@ test-jsonv2:
 	@echo "$(GREEN)Testing JSON v2 compatibility...$(NC)"
 	GOEXPERIMENT=jsonv2 $(GO) test $(GO_TEST_FLAGS) ./internal/storage ./internal/engine
 
+## test-semantics: Check SQL contracts under different process timezones
+test-semantics:
+	@set -eu; for zone in UTC Europe/Berlin Pacific/Kiritimati; do \
+		printf 'SQL semantics: TZ=%s\n' "$$zone"; \
+		TZ="$$zone" LC_ALL=C $(GO) test ./internal/engine -run '^TestSQLSemanticsContract$$' -count=1; \
+	done
+
 ## test-ci: Run the complete non-TinyGo test matrix used by continuous integration
 test-ci:
 	@echo "$(GREEN)Running CI test matrix...$(NC)"
@@ -518,7 +525,7 @@ verify-ci: fmt-check vet build-check test-all
 	@echo "$(GREEN)✓ CI verification passed$(NC)"
 
 ## ci: Run the complete standard-Go CI matrix
-ci: fmt-check modules-tidy-check modules-verify build-check wasm-check vet test-ci bench-stream-guard
+ci: fmt-check modules-tidy-check modules-verify build-check wasm-check vet test-semantics test-ci bench-stream-guard
 	@echo "$(GREEN)✓ Standard-Go CI verification passed$(NC)"
 
 ## clean: Remove build artifacts

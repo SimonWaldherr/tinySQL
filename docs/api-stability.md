@@ -21,6 +21,38 @@ The CLI, HTTP API, and gRPC API are versioned at their transport boundaries.
 New endpoints and optional response fields are additive. Existing output modes
 remain compatible unless a major release explicitly says otherwise.
 
+## SQL behavior
+
+SQL results are part of the public contract, independently of Go source
+compatibility. This includes NULL behavior, argument evaluation, numeric
+precision, calendar definitions, timezone interpretation and ordering defaults.
+
+- Preserve the documented meaning of a released operation. Prefer a new,
+  explicit operation when a different meaning is useful.
+- An intentional incompatible SQL change requires a breaking release, release
+  notes with before/after results, and an executable migration example. A
+  documentation edit alone does not make an existing query compatible.
+- A correctness fix must include the failing query and expected result or
+  error. If callers can observe a changed result, describe that impact in the
+  release notes even when the previous result was a bug.
+- The same explicit inputs must not acquire different meanings through
+  connection settings, process locale, optimizer selection or integer width.
+  Document ambient inputs such as the statement clock separately.
+- Reject unsupported syntax or combinations with a useful error. Do not
+  accept a spelling while ignoring an argument or approximating its meaning.
+
+The current unreleased DATEDIFF change is an intentional SQL behavior break:
+it counts crossed UTC boundaries. Duration queries must migrate to
+TIMESTAMPDIFF. The [migration examples](datetime-performance.md#differences-boundaries-and-elapsed-units)
+must accompany the release notes, including an audit of stored view/procedure
+SQL that calls DATEDIFF. This does not change APIVersion or the storage format.
+
+The [SQL contracts](../internal/engine/testdata/sql_semantics.json) are checked
+through native row, streaming and columnar APIs and the full/minimal Browser
+and Node WASM APIs. `make test-semantics` also runs them in three process
+timezones. Add cases when extending a feature; change existing expectations
+only with an explanation of compatibility and migration impact.
+
 ## Native C ABI
 
 `bindings/c/include/tinysql.h` versions the native interface used by the

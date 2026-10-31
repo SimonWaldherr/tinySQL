@@ -5,12 +5,25 @@ function name does not imply complete compatibility with that database.
 These contracts apply equally to ordinary results, streaming and columnar
 results; unsupported optimization shapes use the general evaluator.
 
+[Executable examples](../internal/engine/testdata/sql_semantics.json) lock these
+contracts across native results, streams, columns and WASM. The
+[compatibility policy](api-stability.md#sql-behavior) applies to changes in their
+meaning as well as to changes in SQL syntax.
+
+SQL integer arithmetic retains 64-bit precision. JavaScript's JSON/Number
+representation can round integers above 2^53; use CAST(value AS TEXT) when an
+exact large integer must cross that boundary. The contracts include the signed
+nanosecond limits transported as text.
+
 ## Dates and clocks
 
 Timezone-free timestamps parse as UTC. Explicit offsets and native time.Time
 locations are retained by component extraction and calendar arithmetic.
 There is no session language, session timezone or SET DATEFIRST setting.
 NOW and related functions use one timestamp per statement execution.
+Clock functions currently require parentheses in SELECT expressions. The
+statement clock retains the host's local timezone; use an explicit timestamp
+with an offset when a reproducible calendar date is required.
 
 `ISODOW(date)`, `DATEPART(ISO_WEEKDAY, date)` and
 `EXTRACT('ISODOW', date)` return Monday=1 through Sunday=7 in the input's
@@ -96,6 +109,20 @@ INTERVAL syntax, fractional offset or frame EXCLUDE clause. For day ranges,
 order by an integer day number rather than a timestamp or a row index. Window
 aggregation currently evaluates each frame with the general accumulator;
 support does not imply a specialized sliding-window performance optimization.
+
+Window functions and grouped aggregation cannot share a SELECT scope yet.
+Nested aggregate/window arguments and window calls inside FILTER are rejected,
+including when hidden within IN, BETWEEN or pattern predicates. Aggregate in a
+subquery first, then apply windows to its result:
+
+```sql
+SELECT category, total, ROW_NUMBER() OVER (ORDER BY total DESC) AS position
+FROM (SELECT category, SUM(amount) AS total FROM entries GROUP BY category) AS grouped;
+```
+
+Unknown window sort keys raise an error instead of being treated as NULL keys.
+HAVING requires GROUP BY or an aggregate; it is never silently discarded on
+an ordinary row query.
 
 ## Splitting strings into rows
 

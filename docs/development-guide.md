@@ -10,6 +10,17 @@ go test -coverprofile=coverage.out ./...
 Go 1.26's `testing/synctest` provides virtual time for concurrency tests; keep
 new timing-sensitive tests deterministic instead of adding real sleeps.
 
+For SQL behavior changes, follow the [SQL compatibility contract](api-stability.md#sql-behavior)
+and update [the executable contracts](../internal/engine/testdata/sql_semantics.json).
+Use independent expected results, including errors; comparison between two
+engine paths alone can preserve a bug shared by both. Keep the SQLite oracle
+tests for overlapping standard behavior, and document deliberate differences.
+
+Before adding an optimization, establish NULL, empty-input, Unicode, timezone,
+overflow and discarded-argument behavior. Then compare the optimized execution
+with those results. The existing `make ci` and `make wasm-smoke` gates check
+the same contract fixtures; unsupported combinations need negative cases.
+
 ## Makefile
 
 `make` or `make help` lists all documented targets. Common workflow:
@@ -40,6 +51,7 @@ act workflow_dispatch -W .github/workflows/local-act.yml
 | `make test` / `make test-all` | Root tests plus the standalone query-file demo modules. |
 | `make test-unit` | Short unit tests. |
 | `make test-jsonv2` | Storage/engine persistence tests against Go's experimental JSON v2 — a compatibility gate, not a production default. |
+| `make test-semantics` | Shared SQL contracts under UTC, Europe/Berlin and Pacific/Kiritimati; included in `make ci`. |
 | `make test-query-files` / `make test-fsql` | Standalone query-files and filesystem-query module tests. |
 | `make test-query-files-wasm` | Tests inside `cmd/query_files_wasm`. |
 | `make test-query-files-browser` | Real Chromium import, snapshot recovery and workspace-switching tests; requires the browser test dependencies described in the module README. |

@@ -2,7 +2,6 @@ package engine
 
 import (
 	"fmt"
-	"math"
 	"strings"
 	"time"
 )
@@ -52,10 +51,7 @@ func evalDateDiffCall(ex *FuncCall, eval func(Expr) (any, error)) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", ex.Name, err)
 	}
-	if n < math.MinInt || n > math.MaxInt {
-		return nil, fmt.Errorf("%s: result out of integer range", ex.Name)
-	}
-	return int(n), nil
+	return intResult(n), nil
 }
 
 func normalizeDateDiffUnit(unit string) string {
