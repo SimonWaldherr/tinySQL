@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null
 
 if ! command -v go >/dev/null 2>&1; then
     echo "go toolchain not found" >&2

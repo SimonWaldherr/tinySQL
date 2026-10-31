@@ -43,6 +43,7 @@ tinySQL.wasm
 coverage*.out
 coverage*.html
 coverage-func.txt
+coverage.txt
 
 # Local tooling
 .actrc

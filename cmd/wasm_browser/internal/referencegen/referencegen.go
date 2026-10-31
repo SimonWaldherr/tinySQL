@@ -13,18 +13,22 @@ import (
 )
 
 // SectionExamples contains the SQL example blocks that belong to one
-// top-level section in FUNCTIONS.sql.
+// top-level section in docs/reference/functions.sql.
 type SectionExamples struct {
 	Section  string   `json:"section"`
 	Examples []string `json:"examples"`
 }
 
-// Generate extracts SQL example blocks from FUNCTIONS.sql. A section is only
+// Generate extracts SQL example blocks from the canonical SQL reference. A section is only
 // started by a title enclosed by the decorative comment rules used in that
 // file. This deliberately ignores ordinary comments such as "COUNT" or
 // "Example 1", which are descriptions within the current section rather than
 // categories of their own.
 func Generate(r io.Reader) ([]SectionExamples, error) {
+	return generate(r, false)
+}
+
+func generate(r io.Reader, comments bool) ([]SectionExamples, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
@@ -84,6 +88,8 @@ func Generate(r io.Reader) ([]SectionExamples, error) {
 			if awaitingTitle && title != "" {
 				pendingTitle = title
 				awaitingTitle = false
+			} else if comments {
+				buffer = append(buffer, line)
 			}
 			continue
 		}
@@ -121,19 +127,19 @@ func Encode(w io.Writer, sections []SectionExamples) error {
 }
 
 // FindRepoRoot returns the nearest parent directory that contains
-// FUNCTIONS.sql. It lets both generator entry points work from any directory.
+// docs/reference/functions.sql. Generator entry points work from any directory.
 func FindRepoRoot(start string) (string, error) {
 	dir, err := filepath.Abs(start)
 	if err != nil {
 		return "", fmt.Errorf("resolve start directory: %w", err)
 	}
 	for {
-		if _, err := os.Stat(filepath.Join(dir, "FUNCTIONS.sql")); err == nil {
+		if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(SourcePath))); err == nil {
 			return dir, nil
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return "", fmt.Errorf("FUNCTIONS.sql not found above %s", start)
+			return "", fmt.Errorf("%s not found above %s", SourcePath, start)
 		}
 		dir = parent
 	}

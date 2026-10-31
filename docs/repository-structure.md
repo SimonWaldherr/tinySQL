@@ -11,8 +11,17 @@ to preserve when changing internals, see [architecture.md](./architecture.md).
 
 ```text
 /
-|-- tinysql.go               Public package entry points and helpers
-|-- builder.go               Query/build helpers for the public API
+|-- doc.go                   Package documentation
+|-- tinysql.go               Core DB/table types, column constants, constructors
+|-- query.go                 Parsing, compilation, row/stream/columnar execution
+|-- storage.go               Storage configuration, MVCC, WAL, snapshots, encryption
+|-- import.go                Structured-file import and JSON table export
+|-- retrieval.go             Vector cache configuration and typed RAG filters
+|-- catalog.go               Catalog and authorization facade
+|-- jobs.go / subscribe.go   Scheduler and change subscriptions
+|-- extensions.go            Extensions, table functions, stored procedures
+|-- mbtiles_compat.go        Deprecated MBTiles compatibility facade
+|-- builder*.go              SELECT, expressions, mutations, SQL rendering
 |-- agent_context.go         Compact database metadata snapshot builder
 |-- driver/                  Public database/sql driver wrapper
 |-- exporter/                Public ResultSet export helpers
@@ -30,8 +39,10 @@ to preserve when changing internals, see [architecture.md](./architecture.md).
 |-- docs/                    Guides and integration notes
 |-- deploy/observability/    Alerting and SLO manifests
 |-- tests/examples.yml       Example-driven test data
-|-- example_*.sql            Showcase SQL used in docs and demos
-|-- FUNCTIONS.sql[.html]     Generated function reference
+|-- demos/sql/showcase.sql   Runnable SQL feature tour
+|-- scripts/                 Build checks, cleanup, output-format demo
+|-- docs/reference/          SQL source and generated HTML function reference
+|-- bin/                     Ignored binary, coverage and profile output
 |-- .github/                 Actions workflows and repo automation
 |-- Makefile                 Build, test, and helper targets
 `-- README.md                Overview, quick start, tool index
@@ -99,5 +110,25 @@ cmd/
 
 `example_test.go`, `example_exists_test.go`,
 `example_view_dependencies_test.go`, `import_example_test.go`, and
-`example_showcase.sql` demonstrate the public API and SQL features.
+[`demos/sql/showcase.sql`](../demos/sql/showcase.sql) demonstrate the public API and SQL features.
 `exporter/example_test.go` covers the public export facade.
+
+## Public API layout
+
+All root Go files belong to the same `tinysql` package. This grouping changes
+source navigation, not import paths or exported signatures. Builder declarations
+live in `builder.go` (SELECT/CTE), `builder_expr.go` (expressions),
+`builder_mutation.go` (schema and DML), and `builder_sql.go` (SQL rendering).
+Public-package tests remain beside the API they exercise.
+
+`examples/` contains target-specific embedding examples; `demos/README.md` is the
+index for runnable feature demonstrations, including programs under `cmd/`.
+Reference examples live in `docs/reference/functions.sql`; `make reference`
+regenerates its HTML view and the browser playground's JSON overview. Generation
+never executes FILE/HTTP examples or captures the current clock.
+
+Builds and coverage use `bin/`. Put profiling output there too, for example
+`go test -o bin/engine.test -cpuprofile=bin/engine.cpu.prof ./internal/engine`.
+`make clean` removes generated build output and recognized ignored root leftovers,
+including the obsolete `.gocache/`. It preserves database files, WALs and the local
+`.gh-pages-worktree/`; worktrees have their own Git lifecycle.

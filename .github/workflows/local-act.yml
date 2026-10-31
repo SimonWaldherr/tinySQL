@@ -25,4 +25,4 @@ jobs:
 
       - name: Summarize coverage
         run: |
-          go tool cover -func=coverage.out
+          go tool cover -func=bin/coverage.out

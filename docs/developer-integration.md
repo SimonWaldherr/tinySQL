@@ -20,12 +20,14 @@ the [storage guide](storage-guide.md); for retrieval applications, start with th
 
 Reference implementations live in `example_test.go`, `import_example_test.go`,
 `cmd/demo`, `cmd/ragdemo`, `cmd/query_files_wasm`, `cmd/wasm_browser`, and
-`example_showcase.sql`.
+[`demos/sql/showcase.sql`](../demos/sql/showcase.sql).
 
 ## Direct Go API
 
 Use the root module for the public parser, execution, and import APIs. Code
-below an `internal/` directory is not available to external modules.
+below an `internal/` directory is not available to external modules. The
+[public API layout](repository-structure.md#public-api-layout) maps source files
+to their responsibilities; they share the same root import path.
 
 ```go
 db := tinysql.NewDB()

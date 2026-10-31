@@ -1,5 +1,21 @@
 [
   {
+    "section": "CHECKED SEMANTICS EXAMPLES",
+    "examples": [
+      "SELECT ISODOW('2024-03-01T00:30:00+14:00') AS friday,\n       DATEPART(ISO_WEEKDAY,'2024-03-03T23:30:00-12:00') AS sunday;",
+      "SELECT DATEDIFF(MONTH,'2024-01-31','2024-02-29') AS boundaries,\n       TIMESTAMPDIFF(MONTH,'2024-01-31','2024-02-29') AS complete_months;",
+      "SELECT DATEDIFF(DAY,'2024-03-01T00:30:00+01:00','2024-02-29T23:30:00Z') AS same_instant,\n       TIMESTAMPDIFF(HOUR,'2024-03-30T12:00:00+01:00','2024-03-31T12:00:00+02:00') AS elapsed_hours;",
+      "SELECT ISNULL(NULL) AS missing, ISNULL('') AS empty_text,\n       0 IS NOT NULL AS zero_present, FALSE IS NOT NULL AS false_present;",
+      "SELECT COALESCE('ok',1/0) AS lazy_value, IFNULL(NULL,FALSE) AS replacement;",
+      "SELECT LTRIM('🙂xxtext','🙂x') AS characters,\n       TRIM(' text ','') AS empty_set, TRIM(NULL,1/0) AS lazy_null;",
+      "SELECT value,ordinal FROM STRING_SPLIT('alpha::beta::::','::',1) ORDER BY ordinal;",
+      "WITH reference_values AS (SELECT 1 AS v UNION ALL SELECT 2 AS v UNION ALL SELECT NULL AS v)\nSELECT COUNT(*) FILTER (WHERE v IS NOT NULL) AS non_null_rows,\n       SUM(v) FILTER (WHERE v\u003e=2) AS selected_total FROM reference_values;",
+      "SELECT JSON_GET(meta,'items[0].sku') AS sku, JSON_GET(meta,'value') AS json_null\nFROM TABLE_FROM_JSON('[{\"meta\":{\"items\":[{\"sku\":\"A\"}],\"value\":null}}]');",
+      "SELECT id AS exact_id\nFROM TABLE_FROM_JSON('[{\"id\":\"9007199254740993\"}]');",
+      "SELECT id,name FROM TABLE_FROM_JSON_LINES('\n{\"id\":1,\"name\":\"Ada\"}\n{\"id\":2,\"name\":\"Lin\"}\n') ORDER BY id;"
+    ]
+  },
+  {
     "section": "DATE AND TIME FUNCTIONS",
     "examples": [
       "SELECT NOW() as current_timestamp;\nSELECT CURRENT_DATE() as today;\nSELECT CURRENT_TIME() as current_time;",
@@ -29,7 +45,7 @@
     ]
   },
   {
-    "section": "NEW: REGEX FUNCTIONS",
+    "section": "REGEX FUNCTIONS",
     "examples": [
       "SELECT REGEXP_MATCH('test@example.com', '.*@.*\\.com') as is_email;\nSELECT REGEXP_MATCH('12345', '^\\d+$') as is_numeric;",
       "SELECT REGEXP_EXTRACT('Order #12345 processed', '#\\d+') as order_number;\nSELECT REGEXP_EXTRACT('Email: test@example.com', '\\w+@\\w+\\.\\w+') as email;",
@@ -66,7 +82,7 @@
     ]
   },
   {
-    "section": "NEW: ARRAY FUNCTIONS",
+    "section": "ARRAY FUNCTIONS",
     "examples": [
       "SELECT SPLIT('red,green,blue', ',') as colors;",
       "SELECT FIRST(SPLIT('alpha,beta,gamma', ',')) as first_element;\nSELECT LAST(SPLIT('alpha,beta,gamma', ',')) as last_element;",
@@ -79,7 +95,7 @@
   {
     "section": "AGGREGATE FUNCTIONS",
     "examples": [
-      "CREATE TABLE temp_numbers (group_id INT, value INT);\nINSERT INTO temp_numbers VALUES (1, 10), (1, 20), (1, 30);\nINSERT INTO temp_numbers VALUES (2, 5), (2, 15), (2, 25);  \nINSERT INTO temp_numbers VALUES (3, 100), (3, 200);\nSELECT group_id, COUNT(*) as total_count FROM temp_numbers GROUP BY group_id;\nSELECT group_id, COUNT(value) as non_null_count FROM temp_numbers GROUP BY group_id;",
+      "CREATE TABLE temp_numbers (group_id INT, value INT);\nINSERT INTO temp_numbers VALUES (1, 10), (1, 20), (1, 30);\nINSERT INTO temp_numbers VALUES (2, 5), (2, 15), (2, 25);\nINSERT INTO temp_numbers VALUES (3, 100), (3, 200);\nSELECT group_id, COUNT(*) as total_count FROM temp_numbers GROUP BY group_id;\nSELECT group_id, COUNT(value) as non_null_count FROM temp_numbers GROUP BY group_id;",
       "CREATE TABLE temp_sales (product TEXT, sale_date TEXT, amount INT);\nINSERT INTO temp_sales VALUES ('Laptop', '2025-01-15', 1200);\nINSERT INTO temp_sales VALUES ('Mouse', '2025-03-20', 25);\nINSERT INTO temp_sales VALUES ('Keyboard', '2025-02-10', 75);\nINSERT INTO temp_sales VALUES ('Monitor', '2025-01-05', 350);",
       "SELECT MIN_BY(product, sale_date) as earliest_product FROM temp_sales;",
       "SELECT MAX_BY(product, sale_date) as latest_product FROM temp_sales;",
@@ -114,7 +130,7 @@
     "examples": [
       "SELECT COALESCE(NULL, NULL, 'default') as first_non_null;\nSELECT NVL(NULL, 'replacement') as nvl_result;\nSELECT IFNULL(NULL, 'value') as ifnull_result;\nSELECT NULLIF(5, 5) as nullif_equal;\nSELECT NULLIF(5, 3) as nullif_different;",
       "SELECT IF(10 \u003e 5, 'yes', 'no') as if_result;\nSELECT IIF(2 + 2 = 4, 'correct', 'wrong') as iif_result;\nSELECT GREATEST(10, 25, 15, 30) as greatest_value;\nSELECT LEAST(10, 25, 15, 30) as least_value;",
-      "SELECT \n    CASE \n        WHEN 10 \u003e 20 THEN 'impossible'\n        WHEN 10 \u003e 5 THEN 'correct'\n        ELSE 'wrong'\n    END as case_result;"
+      "SELECT\n    CASE\n        WHEN 10 \u003e 20 THEN 'impossible'\n        WHEN 10 \u003e 5 THEN 'correct'\n        ELSE 'wrong'\n    END as case_result;"
     ]
   },
   {
@@ -122,6 +138,12 @@
     "examples": [
       "SELECT MD5('password') as md5_hash;\nSELECT SHA1('password') as sha1_hash;\nSELECT SHA256('password') as sha256_hash;\nSELECT SHA512('password') as sha512_hash;",
       "SELECT BASE64('Hello World') as base64_encoded;\nSELECT BASE64_DECODE('SGVsbG8gV29ybGQ=') as base64_decoded;\nSELECT HEX('Hello') as hex_encoded;\nSELECT UNHEX('48656C6C6F') as hex_decoded;"
+    ]
+  },
+  {
+    "section": "JSON FUNCTIONS",
+    "examples": [
+      "CREATE TABLE json_reference (id INT, meta JSON);\nINSERT INTO json_reference VALUES (1, '{\"name\":\"John\",\"user\":{\"name\":\"Jane\"},\"items\":[{\"sku\":\"A\"}]}');\nSELECT JSON_GET(meta,'name') AS json_name, JSON_EXTRACT(meta,'user.name') AS nested_value FROM json_reference;\nUPDATE json_reference SET meta=JSON_SET(meta,'items[0].sku','B') WHERE id=1;\nSELECT JSON_GET(meta,'items[0].sku') AS updated_sku FROM json_reference;\nDROP TABLE json_reference;"
     ]
   },
   {
@@ -139,37 +161,37 @@
     ]
   },
   {
-    "section": "WINDOW FUNCTIONS - FULLY IMPLEMENTED",
+    "section": "WINDOW FUNCTIONS",
     "examples": [
       "CREATE TABLE window_demo (\n    product TEXT,\n    category TEXT,\n    sale_date TEXT,\n    amount INT\n);",
       "INSERT INTO window_demo VALUES ('Laptop', 'Electronics', '2025-01-15', 1200);\nINSERT INTO window_demo VALUES ('Mouse', 'Electronics', '2025-01-20', 25);\nINSERT INTO window_demo VALUES ('Desk', 'Furniture', '2025-01-25', 350);\nINSERT INTO window_demo VALUES ('Keyboard', 'Electronics', '2025-02-10', 75);\nINSERT INTO window_demo VALUES ('Chair', 'Furniture', '2025-02-15', 200);",
-      "SELECT \n    product,\n    amount,\n    ROW_NUMBER() OVER (ORDER BY amount) as row_num\nFROM window_demo\nORDER BY amount;",
-      "SELECT \n    product,\n    category,\n    amount,\n    ROW_NUMBER() OVER (PARTITION BY category ORDER BY amount) as row_in_category\nFROM window_demo\nORDER BY category, amount;",
+      "SELECT\n    product,\n    amount,\n    ROW_NUMBER() OVER (ORDER BY amount) as row_num\nFROM window_demo\nORDER BY amount;",
+      "SELECT\n    product,\n    category,\n    amount,\n    ROW_NUMBER() OVER (PARTITION BY category ORDER BY amount) as row_in_category\nFROM window_demo\nORDER BY category, amount;",
       "SELECT\n    product,\n    amount,\n    RANK() OVER (ORDER BY amount DESC) as rank_by_amount\nFROM window_demo\nORDER BY amount DESC;",
       "SELECT\n    product,\n    amount,\n    DENSE_RANK() OVER (ORDER BY amount DESC) as dense_rank_by_amount\nFROM window_demo\nORDER BY amount DESC;",
       "SELECT\n    product,\n    amount,\n    PERCENT_RANK() OVER (ORDER BY amount) as percent_rank,\n    CUME_DIST() OVER (ORDER BY amount) as cume_dist\nFROM window_demo\nORDER BY amount;",
       "SELECT\n    product,\n    amount,\n    NTILE(3) OVER (ORDER BY amount) as tercile\nFROM window_demo\nORDER BY amount;",
       "SELECT\n    product,\n    amount,\n    LAG(amount, 1) OVER (ORDER BY sale_date) as previous_amount\nFROM window_demo\nORDER BY sale_date;",
-      "SELECT \n    product,\n    amount,\n    LAG(amount, 1, 0) OVER (ORDER BY sale_date) as previous_or_zero\nFROM window_demo\nORDER BY sale_date;",
-      "SELECT \n    product,\n    amount,\n    LEAD(amount, 1) OVER (ORDER BY sale_date) as next_amount\nFROM window_demo\nORDER BY sale_date;",
-      "SELECT \n    product,\n    amount,\n    FIRST_VALUE(product) OVER (ORDER BY amount) as cheapest_product\nFROM window_demo\nORDER BY amount;",
-      "SELECT \n    product,\n    category,\n    amount,\n    FIRST_VALUE(product) OVER (PARTITION BY category ORDER BY amount) as cheapest_in_category\nFROM window_demo\nORDER BY category, amount;",
-      "SELECT \n    product,\n    amount,\n    LAST_VALUE(product) OVER (ORDER BY amount) as most_expensive_so_far\nFROM window_demo\nORDER BY amount;",
-      "SELECT \n    product,\n    sale_date,\n    amount,\n    MOVING_SUM(3, amount) OVER (ORDER BY sale_date) as rolling_sum_3days\nFROM window_demo\nORDER BY sale_date;",
-      "SELECT \n    product,\n    sale_date,\n    amount,\n    MOVING_AVG(3, amount) OVER (ORDER BY sale_date) as rolling_avg_3days\nFROM window_demo\nORDER BY sale_date;",
-      "SELECT \n    product,\n    category,\n    amount,\n    LAG(amount, 1) OVER (PARTITION BY category ORDER BY sale_date) as prev_in_category\nFROM window_demo\nORDER BY category, sale_date;",
+      "SELECT\n    product,\n    amount,\n    LAG(amount, 1, 0) OVER (ORDER BY sale_date) as previous_or_zero\nFROM window_demo\nORDER BY sale_date;",
+      "SELECT\n    product,\n    amount,\n    LEAD(amount, 1) OVER (ORDER BY sale_date) as next_amount\nFROM window_demo\nORDER BY sale_date;",
+      "SELECT\n    product,\n    amount,\n    FIRST_VALUE(product) OVER (ORDER BY amount) as cheapest_product\nFROM window_demo\nORDER BY amount;",
+      "SELECT\n    product,\n    category,\n    amount,\n    FIRST_VALUE(product) OVER (PARTITION BY category ORDER BY amount) as cheapest_in_category\nFROM window_demo\nORDER BY category, amount;",
+      "SELECT\n    product,\n    amount,\n    LAST_VALUE(product) OVER (ORDER BY amount) as most_expensive_so_far\nFROM window_demo\nORDER BY amount;",
+      "SELECT\n    product,\n    sale_date,\n    amount,\n    MOVING_SUM(3, amount) OVER (ORDER BY sale_date) as rolling_sum_3days\nFROM window_demo\nORDER BY sale_date;",
+      "SELECT\n    product,\n    sale_date,\n    amount,\n    MOVING_AVG(3, amount) OVER (ORDER BY sale_date) as rolling_avg_3days\nFROM window_demo\nORDER BY sale_date;",
+      "SELECT\n    product,\n    category,\n    amount,\n    LAG(amount, 1) OVER (PARTITION BY category ORDER BY sale_date) as prev_in_category\nFROM window_demo\nORDER BY category, sale_date;",
       "DROP TABLE window_demo;"
     ]
   },
   {
     "section": "COMPLEX QUERIES COMBINING MULTIPLE FUNCTIONS",
     "examples": [
-      "SELECT \n    CURRENT_DATE() as today,\n    DATE_TRUNC('MONTH', CURRENT_DATE()) as month_start,\n    EOMONTH(CURRENT_DATE()) as month_end,\n    IN_PERIOD('MTD', CURRENT_DATE()) as is_month_to_date,\n    DATEDIFF('DAYS', DATE_TRUNC('MONTH', CURRENT_DATE()), CURRENT_DATE()) as days_into_month;",
-      "SELECT \n    REGEXP_EXTRACT('Order #12345', '#(\\d+)') as order_id,\n    UPPER(REGEXP_REPLACE('test@EXAMPLE.com', '@.*', '')) as username,\n    ARRAY_LENGTH(SPLIT('item1,item2,item3', ',')) as item_count;",
-      "SELECT \n    ROUND(PI() * POWER(5, 2), 2) as circle_area_r5,\n    DEGREES(ATAN2(3, 4)) as angle_degrees,\n    ABS(SIGN(-42) * 100) as absolute_signed;",
-      "SELECT \n    FIRST(ARRAY_SORT(ARRAY_DISTINCT(SPLIT('zebra,apple,zebra,mango', ',')))) as first_sorted_unique,\n    ARRAY_JOIN(ARRAY_SORT(SPLIT('3,1,4,1,5,9', ',')), ' -\u003e ') as sorted_numbers;",
-      "SELECT \n    CASE \n        WHEN IN_PERIOD('TODAY', CURRENT_DATE()) THEN 'Today'\n        WHEN IN_PERIOD('MTD', CURRENT_DATE()) THEN 'This Month'\n        WHEN IN_PERIOD('QTD', CURRENT_DATE()) THEN 'This Quarter'\n        WHEN IN_PERIOD('YTD', CURRENT_DATE()) THEN 'This Year'\n        ELSE 'Historical'\n    END as period_classification;",
-      "SELECT \n    COALESCE(\n        NULL,\n        NULLIF('', ''),\n        REGEXP_EXTRACT('No match here', 'PATTERN'),\n        'Final Default'\n    ) as coalesce_result;"
+      "SELECT\n    CURRENT_DATE() as today,\n    DATE_TRUNC('MONTH', CURRENT_DATE()) as month_start,\n    EOMONTH(CURRENT_DATE()) as month_end,\n    IN_PERIOD('MTD', CURRENT_DATE()) as is_month_to_date,\n    DATEDIFF('DAYS', DATE_TRUNC('MONTH', CURRENT_DATE()), CURRENT_DATE()) as days_into_month;",
+      "SELECT\n    REGEXP_EXTRACT('Order #12345', '#(\\d+)') as order_id,\n    UPPER(REGEXP_REPLACE('test@EXAMPLE.com', '@.*', '')) as username,\n    ARRAY_LENGTH(SPLIT('item1,item2,item3', ',')) as item_count;",
+      "SELECT\n    ROUND(PI() * POWER(5, 2), 2) as circle_area_r5,\n    DEGREES(ATAN2(3, 4)) as angle_degrees,\n    ABS(SIGN(-42) * 100) as absolute_signed;",
+      "SELECT\n    FIRST(ARRAY_SORT(ARRAY_DISTINCT(SPLIT('zebra,apple,zebra,mango', ',')))) as first_sorted_unique,\n    ARRAY_JOIN(ARRAY_SORT(SPLIT('3,1,4,1,5,9', ',')), ' -\u003e ') as sorted_numbers;",
+      "SELECT\n    CASE\n        WHEN IN_PERIOD('TODAY', CURRENT_DATE()) THEN 'Today'\n        WHEN IN_PERIOD('MTD', CURRENT_DATE()) THEN 'This Month'\n        WHEN IN_PERIOD('QTD', CURRENT_DATE()) THEN 'This Quarter'\n        WHEN IN_PERIOD('YTD', CURRENT_DATE()) THEN 'This Year'\n        ELSE 'Historical'\n    END as period_classification;",
+      "SELECT\n    COALESCE(\n        NULL,\n        NULLIF('', ''),\n        REGEXP_EXTRACT('No match here', 'PATTERN'),\n        'Final Default'\n    ) as coalesce_result;"
     ]
   },
   {
@@ -185,16 +207,16 @@
   {
     "section": "PRACTICAL USE CASES",
     "examples": [
-      "SELECT \n    REGEXP_MATCH('user@example.com', '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$') as is_valid_email,\n    SPLIT_PART('user@example.com', '@', 1) as username,\n    SPLIT_PART('user@example.com', '@', 2) as domain;",
-      "SELECT \n    IN_PERIOD('LAST_12_MONTHS', ADD_MONTHS(CURRENT_DATE(), -6)) as in_last_year,\n    IN_PERIOD('CURRENT_QUARTER', CURRENT_DATE()) as in_current_quarter,\n    EXTRACT('QUARTER', CURRENT_DATE()) as current_quarter_number;",
+      "SELECT\n    REGEXP_MATCH('user@example.com', '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$') as is_valid_email,\n    SPLIT_PART('user@example.com', '@', 1) as username,\n    SPLIT_PART('user@example.com', '@', 2) as domain;",
+      "SELECT\n    IN_PERIOD('LAST_12_MONTHS', ADD_MONTHS(CURRENT_DATE(), -6)) as in_last_year,\n    IN_PERIOD('CURRENT_QUARTER', CURRENT_DATE()) as in_current_quarter,\n    EXTRACT('QUARTER', CURRENT_DATE()) as current_quarter_number;",
       "CREATE TABLE demo_orders (\n    order_id INT,\n    customer TEXT,\n    order_date TEXT,\n    total INT,\n    \"customer name\" TEXT\n);",
       "INSERT INTO demo_orders VALUES\n    (1, 'alice', '2025-01-10 09:15:00', 120, 'Alice A'),\n    (2, 'alice', '2025-02-05 14:20:00', 200, 'Alice A'),\n    (3, 'bob',   '2025-01-12 11:05:00', 75,  'Robert B'),\n    (4, 'bob',   '2025-03-01 08:30:00', 50,  'Robert B'),\n    (5, 'carol', '2025-02-20 16:45:00', 300, 'Carol C');",
       "SELECT DISTINCT ON (customer)\n    customer,\n    \"customer name\",\n    total,\n    order_date,\n    customer + ' - ' + CAST(total AS TEXT) AS summary,\n    ROW_NUMBER() OVER (PARTITION BY customer ORDER BY order_date DESC) AS rn,\n    GETDATE() AS now_ts,\n    TODAY() AS today_date,\n    FROM_TIMESTAMP(0) AS epoch_zero,\n    TIMESTAMP('2023-05-01 00:00:00') AS ts_epoch\nFROM demo_orders\nORDER BY customer, order_date DESC;",
       "SELECT\n    order_id,\n    customer,\n    \"customer name\",\n    order_date,\n    total,\n    ROW_NUMBER() OVER (PARTITION BY customer ORDER BY order_date) AS rn_asc,\n    LAG(total, 1) OVER (PARTITION BY customer ORDER BY order_date) AS prev_total\nFROM demo_orders\nORDER BY customer, order_date;",
       "DROP TABLE demo_orders;",
-      "SELECT \n    UPPER(TRIM(REGEXP_REPLACE('  Hello   World  ', '\\s+', ' '))) as normalized_string;",
-      "SELECT \n    ARRAY_LENGTH(SPLIT('red,green,blue,yellow', ',')) as color_count,\n    ARRAY_CONTAINS(SPLIT('red,green,blue', ','), 'green') as has_green,\n    ARRAY_JOIN(ARRAY_SORT(ARRAY_DISTINCT(SPLIT('b,a,c,a,b', ','))), ',') as sorted_unique;",
-      "SELECT \n    ADD_MONTHS(DATE_TRUNC('YEAR', CURRENT_DATE()), 6) as mid_year,\n    EOMONTH(ADD_MONTHS(CURRENT_DATE(), 3), 0) as end_of_quarter,\n    DATEDIFF('DAYS', \n        DATE_TRUNC('YEAR', CURRENT_DATE()), \n        EOMONTH(DATE_TRUNC('YEAR', CURRENT_DATE()), 11)\n    ) as days_in_year;"
+      "SELECT\n    UPPER(TRIM(REGEXP_REPLACE('  Hello   World  ', '\\s+', ' '))) as normalized_string;",
+      "SELECT\n    ARRAY_LENGTH(SPLIT('red,green,blue,yellow', ',')) as color_count,\n    ARRAY_CONTAINS(SPLIT('red,green,blue', ','), 'green') as has_green,\n    ARRAY_JOIN(ARRAY_SORT(ARRAY_DISTINCT(SPLIT('b,a,c,a,b', ','))), ',') as sorted_unique;",
+      "SELECT\n    ADD_MONTHS(DATE_TRUNC('YEAR', CURRENT_DATE()), 6) as mid_year,\n    EOMONTH(ADD_MONTHS(CURRENT_DATE(), 3), 0) as end_of_quarter,\n    DATEDIFF('DAYS',\n        DATE_TRUNC('YEAR', CURRENT_DATE()),\n        EOMONTH(DATE_TRUNC('YEAR', CURRENT_DATE()), 11)\n    ) as days_in_year;"
     ]
   },
   {
@@ -206,7 +228,7 @@
     ]
   },
   {
-    "section": "IO AND TRANSFORM FUNCTIONS (safe runnable examples enabled)",
+    "section": "IO AND TRANSFORM FUNCTIONS",
     "examples": [
       "SELECT URL_PARSE('https://example.org/a%20b?q=geo+data#result') as url_components;\nSELECT URL_QUERY_GET('https://example.org/search?q=geo+data', 'q') as query_value;\nSELECT URL_RESOLVE('https://example.org/a/b/', '../tiles/12/2200/1400.pbf') as resolved_url;\nSELECT URL_ENCODE('key=value \u0026 more') as encoded_query_value;\nSELECT URL_DECODE('key%3Dvalue+%26+more') as decoded_query_value;\nSELECT URL_PATH_ENCODE('tiles/Altstadt Nord') as encoded_path_segment;\nSELECT URL_PATH_DECODE('tiles%2FAltstadt%20Nord') as decoded_path_segment;",
       "SELECT HTML_ESCAPE('\u003cstrong\u003euntrusted\u003c/strong\u003e') as escaped_html;\nSELECT HTML_TEMPLATE('\u003ca href=\"{{.url}}\"\u003e{{.label}}\u003c/a\u003e',\n                     '{\"url\":\"/map\",\"label\":\"Map \u0026 data\"}') as rendered_html;",
@@ -227,7 +249,7 @@
       "SELECT * FROM TABLE_FROM_CSV(FILE('data/sample.csv'), '{\"delimiter\":\",\",\"header\":true}');",
       "SELECT * FROM TABLE_FROM_JSON(FILE('data/data.json')) WHERE id \u003e 0;",
       "CREATE TABLE IF NOT EXISTS users (\n    id INT,\n    name TEXT,\n    email TEXT\n);\nINSERT INTO users VALUES (1, 'Alice', 'alice@example.com') ON CONFLICT DO NOTHING;\nINSERT INTO users VALUES (2, 'Bob', 'bob@example.com') ON CONFLICT DO NOTHING;\nINSERT INTO users VALUES (3, 'Carol', 'carol@example.com') ON CONFLICT DO NOTHING;",
-      "SELECT u.name, o.amount \nFROM users u\nJOIN TABLE_FROM_CSV(FILE('./data/orders.csv'), '{\"delimiter\":\",\",\"header\":true}') o ON u.id = o.user_id;"
+      "SELECT u.name, o.amount\nFROM users u\nJOIN TABLE_FROM_CSV(FILE('./data/orders.csv'), '{\"delimiter\":\",\",\"header\":true}') o ON u.id = o.user_id;"
     ]
   },
   {
@@ -250,13 +272,13 @@
     ]
   },
   {
-    "section": "PRACTICAL EXAMPLES WITH NEW FUNCTIONS",
+    "section": "PRACTICAL FUNCTION EXAMPLES",
     "examples": [
       "SELECT * FROM TABLE_FROM_JSON(FILE('./data/data.json'))\nWHERE id \u003e 1\nORDER BY name;",
-      "SELECT * INTO demotable FROM TABLE_FROM_JSON(FILE('./data/data.json'));",
+      "CREATE TABLE demotable AS SELECT * FROM TABLE_FROM_JSON(FILE('./data/data.json'));",
       "SELECT product, SUM(quantity) as total\nFROM TABLE_FROM_CSV(FILE('data/sales.csv'), '{\"delimiter\":\",\",\"header\":true}')\nGROUP BY product;",
       "SELECT * FROM TABLE_FROM_JSON_LINES(FILE('./data/data.jsonl'))\nWHERE id \u003e 1;",
-      "SELECT \n        u.name,\n        o.order_date,\n        p.price\nFROM users u\nJOIN TABLE_FROM_CSV(FILE('./data/orders.csv'), '{\"delimiter\":\",\",\"header\":true}') o ON u.id = o.user_id\nJOIN TABLE_FROM_JSON(FILE('./data/prices.json')) p ON o.product = p.product;\nSELECT * FROM TABLE_FROM_JSON(BASE64_DECODE(FILE('./data/encoded_data.b64')));"
+      "SELECT\n        u.name,\n        o.order_date,\n        p.price\nFROM users u\nJOIN TABLE_FROM_CSV(FILE('./data/orders.csv'), '{\"delimiter\":\",\",\"header\":true}') o ON u.id = o.user_id\nJOIN TABLE_FROM_JSON(FILE('./data/prices.json')) p ON o.product = p.product;\nSELECT * FROM TABLE_FROM_JSON(BASE64_DECODE(FILE('./data/encoded_data.b64')));"
     ]
   },
   {

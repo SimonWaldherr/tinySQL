@@ -8,6 +8,9 @@ Run commands from the repository root unless stated otherwise.
 | [Offline POI explorer](../cmd/offline_demo/README.md) | `go run ./cmd/offline_demo -near 11.5756,48.1372 -radius-m 1000` | None; a local sample snapshot |
 | [RAG retrieval](../cmd/ragdemo/README.md) | `go run ./cmd/ragdemo -offline` | None; deterministic demonstration features |
 | [Tiles and offline sync](../cmd/tinyTiles/examples/README.md) | Follow the nested module's build/serve commands | A `.ttiles` artifact; WASM build for browser use |
+| [SQL script](sql/showcase.sql) | `go run ./cmd/repl < demos/sql/showcase.sql` | None |
+| [Output formats](../scripts/demo-formats.sh) | `bash scripts/demo-formats.sh` | Go toolchain |
+| [TinyGo embedding](../examples/tinygo-smoke/main.go) | `tinygo run -target=wasm ./examples/tinygo-smoke` | TinyGo |
 | [SQL feature tour](../cmd/demo/README.md) | `go run ./cmd/demo -timer` | None |
 | [Stored procedures](../cmd/procedure_demo/README.md) | `go run ./cmd/procedure_demo` | None |
 | [Catalog and scheduler](../cmd/catalog_demo/README.md) | `go run ./cmd/catalog_demo -web` | None; in-memory sample |

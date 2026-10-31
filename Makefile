@@ -1,7 +1,7 @@
 SHELL := /usr/bin/env bash
 .SHELLFLAGS := -eu -o pipefail -c
 
-.PHONY: help build test clean install lint fmt fmt-check hooks-install vet run-repl run-server run-demo
+.PHONY: help build test clean reference install lint fmt fmt-check hooks-install vet run-repl run-server run-demo
 .PHONY: build-all build-repl build-server build-demo build-cli build-debug build-catalog
 .PHONY: build-wasm-browser build-wasm-node build-studio build-tinysqlpage build-migrate
 .PHONY: build-query-files build-query-files-wasm build-fsql run-query-files-demo
@@ -20,7 +20,7 @@ VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev
 LDFLAGS := -ldflags "-X main.Version=$(VERSION) -X github.com/SimonWaldherr/tinySQL/internal/engine.BuildVersion=$(VERSION)"
 GO_BUILD_FLAGS := $(GOFLAGS) $(LDFLAGS)
 GO_TEST_FLAGS ?= -v
-COVERPROFILE ?= coverage.out
+COVERPROFILE ?= $(BINARY_DIR)/coverage.out
 BENCH_COUNT ?= 3
 # The stream guard is deliberately generous on time for shared CI runners but
 # strict on allocation: a first result must not allocate a full 20k-row result
@@ -278,9 +278,14 @@ install:
 ## test: Run all tests
 test: test-all
 
+## reference: Regenerate the HTML and browser JSON function references
+reference:
+	$(GO) run ./cmd/wasm_browser/tools/gen_reference.go
+
 ## test-all: Run all tests with coverage
 test-all:
 	@echo "$(GREEN)Running all tests...$(NC)"
+	@mkdir -p "$(dir $(COVERPROFILE))"
 	$(GO) test $(GO_TEST_FLAGS) -race -coverprofile=$(COVERPROFILE) ./...
 	$(MAKE) test-query-files
 	$(MAKE) test-query-files-wasm
@@ -324,6 +329,7 @@ test-ci:
 	$(MAKE) --no-print-directory test-query-files GO_TEST_FLAGS='-race -count=1'
 	$(MAKE) --no-print-directory test-query-files-wasm GO_TEST_FLAGS='-race -count=1'
 	$(MAKE) --no-print-directory test-server GO_TEST_FLAGS='-race -count=1'
+	@mkdir -p "$(dir $(COVERPROFILE))"
 	$(GO) test -coverprofile=$(COVERPROFILE) ./...
 	$(GO) tool cover -func=$(COVERPROFILE)
 
@@ -436,7 +442,7 @@ script-lint:
 	@if ! command -v shellcheck >/dev/null; then \
 		echo "$(YELLOW)shellcheck not installed, skipping$(NC)"; \
 	else \
-		shellcheck demo_formats.sh cmd/query_files/demo.sh cmd/query_files_wasm/build.sh cmd/wasm_node/build.sh cmd/wasm_browser/build.sh; \
+		shellcheck scripts/clean-root.sh scripts/demo-formats.sh cmd/query_files/demo.sh cmd/query_files_wasm/build.sh cmd/wasm_node/build.sh cmd/wasm_browser/build.sh; \
 	fi
 
 ## fmt: Format all Go files
@@ -531,13 +537,12 @@ ci: fmt-check modules-tidy-check modules-verify build-check wasm-check vet test-
 ## clean: Remove build artifacts
 clean:
 	@echo "$(GREEN)Cleaning build artifacts...$(NC)"
-	rm -rf $(BINARY_DIR)
-	rm -f $(COVERPROFILE)
+	rm -rf -- "$(BINARY_DIR)"
+	bash scripts/clean-root.sh
+	rm -f -- "$(COVERPROFILE)"
 	rm -f cmd/wasm_browser/web/tinySQL.wasm cmd/wasm_browser/web/wasm_exec.js
 	rm -f cmd/wasm_node/tinySQL.wasm cmd/wasm_node/wasm_exec.js
 	rm -f cmd/query_files_wasm/query_files.wasm cmd/query_files_wasm/query_files.wasm.gz cmd/query_files_wasm/wasm_exec.js
-	find . -name "*.db.wal" -type f -delete
-	find . -name "*.dat.wal" -type f -delete
 	@echo "$(GREEN)✓ Clean complete$(NC)"
 
 ## run-repl: Run the REPL

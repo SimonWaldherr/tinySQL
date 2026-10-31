@@ -105,8 +105,9 @@ db.execute("INSERT INTO users VALUES (?, ?)", tinysql::params![1, "Ada"])?;
 | Search | Full-text, vector, hybrid search, RAG helpers, regex, JSON, URL, HTML, date, math, bitmap, and hash functions |
 | Deployment | Pure-Go embedded API, database/sql driver, Rust/Python/Swift/C bindings, CLI, HTTP/gRPC server, browser/WASM builds, and multiple storage backends |
 
-The complete SQL function reference is [FUNCTIONS.sql](FUNCTIONS.sql). Runnable
-feature examples are in [example_showcase.sql](example_showcase.sql).
+See the [SQL function examples](docs/reference/functions.sql) and
+[HTML reference](docs/reference/functions.html) for supported operations and semantics. Runnable
+feature examples are in [SQL showcase](demos/sql/showcase.sql).
 
 ### GIS, routing, and tiles
 

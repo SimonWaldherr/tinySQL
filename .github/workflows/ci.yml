@@ -73,8 +73,8 @@ jobs:
 
       - name: Summarize coverage
         run: |
-          go tool cover -func=coverage.out -o coverage.txt
-          tail -1 coverage.txt >> $GITHUB_STEP_SUMMARY
+          go tool cover -func=bin/coverage.out -o bin/coverage.txt
+          tail -1 bin/coverage.txt >> $GITHUB_STEP_SUMMARY
 
   browser-tests:
     name: Browser workspaces (Chromium)

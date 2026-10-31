@@ -9,10 +9,13 @@ import (
 func TestGenReferenceWritesOutput(t *testing.T) {
 	dir := t.TempDir()
 
-	// Create a dummy FUNCTIONS.sql in repo root
-	src := filepath.Join(dir, "FUNCTIONS.sql")
+	// Create the canonical SQL source under a temporary repository root.
+	if err := os.MkdirAll(filepath.Join(dir, "docs", "reference"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(dir, "docs", "reference", "functions.sql")
 	if err := os.WriteFile(src, []byte("-- Example\nSELECT 1;\n"), 0o644); err != nil {
-		t.Fatalf("failed to write FUNCTIONS.sql: %v", err)
+		t.Fatalf("failed to write SQL reference: %v", err)
 	}
 
 	// Run main with working dir set to temp dir

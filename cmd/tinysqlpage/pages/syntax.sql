@@ -1155,5 +1155,5 @@ FROM ui_context;
 
 SELECT
     'text' AS component,
-    'This documentation is auto-generated from the tinySQL engine. For more examples, see the FUNCTIONS.sql file in the repository.' AS content
+    'This documentation is auto-generated from the tinySQL engine. For more examples, see docs/reference/functions.sql in the repository.' AS content
 FROM ui_context;

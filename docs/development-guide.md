@@ -4,7 +4,8 @@
 
 ```bash
 go test ./... -count=1
-go test -coverprofile=coverage.out ./...
+mkdir -p bin
+go test -coverprofile=bin/coverage.out ./...
 ```
 
 Go 1.26's `testing/synctest` provides virtual time for concurrency tests; keep
@@ -41,6 +42,8 @@ act workflow_dispatch -W .github/workflows/local-act.yml
 
 | Target | Purpose |
 |---|---|
+| `make reference` | Regenerate HTML and browser JSON from `docs/reference/functions.sql`; freshness tests enforce both outputs. |
+| `make clean` | Remove build output and legacy root artifacts; preserve databases, WALs and Git worktrees. |
 | `make build` | Build `cmd/tinysql` into `bin/tinysql`. |
 | `make build-all` | Build the CLI plus the common command demos into `bin/`. |
 | `make build-query-files-wasm` | Build the browser playground WASM artifacts. |

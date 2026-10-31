@@ -1,6 +1,64 @@
 -- tinySQL Function Examples
--- This file demonstrates all supported SQL functions in tinySQL
--- Execute these examples to learn the complete SQL dialect
+-- Selected examples of the tinySQL SQL dialect. See ../sql-semantics.md
+-- for exact compatibility rules. Later sections may require their setup
+-- statements, local sample files, network access, or optional build tags.
+
+-- ============================================================
+-- CHECKED SEMANTICS EXAMPLES
+-- ============================================================
+-- This section runs in the native test suite. Examples are independent,
+-- deterministic and require no files, network, session language or timezone.
+
+-- ISO weekdays use Monday=1 through Sunday=7 in the input's explicit offset.
+SELECT ISODOW('2024-03-01T00:30:00+14:00') AS friday,
+       DATEPART(ISO_WEEKDAY,'2024-03-03T23:30:00-12:00') AS sunday;
+
+-- DATEDIFF counts UTC boundaries; TIMESTAMPDIFF counts complete elapsed units.
+-- Calendar months are not approximated as 30 days.
+SELECT DATEDIFF(MONTH,'2024-01-31','2024-02-29') AS boundaries,
+       TIMESTAMPDIFF(MONTH,'2024-01-31','2024-02-29') AS complete_months;
+
+-- Equivalent instants and DST transitions use elapsed UTC time.
+SELECT DATEDIFF(DAY,'2024-03-01T00:30:00+01:00','2024-02-29T23:30:00Z') AS same_instant,
+       TIMESTAMPDIFF(HOUR,'2024-03-30T12:00:00+01:00','2024-03-31T12:00:00+02:00') AS elapsed_hours;
+
+-- NULL is distinct from empty text, zero and FALSE. ISNULL is a Boolean test.
+SELECT ISNULL(NULL) AS missing, ISNULL('') AS empty_text,
+       0 IS NOT NULL AS zero_present, FALSE IS NOT NULL AS false_present;
+
+-- Replacement functions evaluate only the arguments they need.
+SELECT COALESCE('ok',1/0) AS lazy_value, IFNULL(NULL,FALSE) AS replacement;
+
+-- Trimming accepts a set of Unicode characters. An empty set removes nothing.
+SELECT LTRIM('🙂xxtext','🙂x') AS characters,
+       TRIM(' text ','') AS empty_set, TRIM(NULL,1/0) AS lazy_null;
+
+-- STRING_SPLIT uses a literal, possibly multi-character delimiter.
+-- Empty fields are preserved; request ordinals and ORDER BY for stable order.
+SELECT value,ordinal FROM STRING_SPLIT('alpha::beta::::','::',1) ORDER BY ordinal;
+
+-- FILTER restricts aggregate input without removing the group itself.
+WITH reference_values AS (SELECT 1 AS v UNION ALL SELECT 2 AS v UNION ALL SELECT NULL AS v)
+SELECT COUNT(*) FILTER (WHERE v IS NOT NULL) AS non_null_rows,
+       SUM(v) FILTER (WHERE v>=2) AS selected_total FROM reference_values;
+
+-- JSON_GET reads structured JSON values, not unparsed SQL text.
+-- Nested objects from JSON table input can be accessed using dotted/bracket paths.
+SELECT JSON_GET(meta,'items[0].sku') AS sku, JSON_GET(meta,'value') AS json_null
+FROM TABLE_FROM_JSON('[{"meta":{"items":[{"sku":"A"}],"value":null}}]');
+
+-- JSON table functions currently decode numeric cells as float64.
+-- Transport identifiers above 2^53 as JSON strings to retain their precision.
+SELECT id AS exact_id
+FROM TABLE_FROM_JSON('[{"id":"9007199254740993"}]');
+
+-- JSON Lines accepts one object per line, including surrounding blank lines.
+SELECT id,name FROM TABLE_FROM_JSON_LINES('
+{"id":1,"name":"Ada"}
+{"id":2,"name":"Lin"}
+') ORDER BY id;
+
+-- END CHECKED SEMANTICS EXAMPLES
 
 -- ============================================================
 -- DATE AND TIME FUNCTIONS
@@ -23,7 +81,7 @@ SELECT DAYOFWEEK(NOW()) as day_of_week;
 SELECT DAYOFYEAR(NOW()) as day_of_year;
 SELECT WEEKOFYEAR(NOW()) as week_of_year;
 
--- NEW: EXTRACT function (alternative to individual functions)
+-- EXTRACT function (alternative to individual functions)
 SELECT EXTRACT('YEAR', NOW()) as year;
 SELECT EXTRACT('MONTH', NOW()) as month;
 SELECT EXTRACT('DAY', NOW()) as day;
@@ -36,11 +94,11 @@ SELECT DATE_ADD(CURRENT_DATE(), 7, 'DAY') as next_week;
 SELECT DATE_SUB(CURRENT_DATE(), 30, 'DAY') as last_month;
 SELECT DATEDIFF('DAYS', '2024-01-01', '2024-12-31') as days_in_2024;
 
--- NEW: ADD_MONTHS function
+-- ADD_MONTHS function
 SELECT ADD_MONTHS(CURRENT_DATE(), 3) as three_months_later;
 SELECT ADD_MONTHS(CURRENT_DATE(), -6) as six_months_ago;
 
--- NEW: DATE_TRUNC function (truncate to period start)
+-- DATE_TRUNC function (truncate to period start)
 SELECT DATE_TRUNC('YEAR', NOW()) as start_of_year;
 SELECT DATE_TRUNC('QUARTER', NOW()) as start_of_quarter;
 SELECT DATE_TRUNC('MONTH', NOW()) as start_of_month;
@@ -48,12 +106,12 @@ SELECT DATE_TRUNC('WEEK', NOW()) as start_of_week;
 SELECT DATE_TRUNC('DAY', NOW()) as start_of_day;
 SELECT DATE_TRUNC('HOUR', NOW()) as start_of_hour;
 
--- NEW: EOMONTH function (end of month)
+-- EOMONTH function (end of month)
 SELECT EOMONTH(CURRENT_DATE()) as end_of_current_month;
 SELECT EOMONTH(CURRENT_DATE(), 1) as end_of_next_month;
 SELECT EOMONTH(CURRENT_DATE(), -1) as end_of_last_month;
 
--- NEW: IN_PERIOD function (period membership checks)
+-- IN_PERIOD function (period membership checks)
 SELECT IN_PERIOD('TODAY', CURRENT_DATE()) as is_today;
 SELECT IN_PERIOD('YTD', '2024-06-15') as is_year_to_date;
 SELECT IN_PERIOD('MTD', CURRENT_DATE()) as is_month_to_date;
@@ -111,7 +169,7 @@ SELECT LOCATE('World', 'Hello World') as locate_position;
 SELECT PRINTF('Value: %d, Name: %s', 42, 'Test') as formatted;
 SELECT FORMAT('Pi is approximately %.2f', 3.14159) as formatted_number;
 
--- NEW: SPLIT function (returns array)
+-- SPLIT function (returns array)
 SELECT SPLIT('apple,banana,cherry', ',') as fruit_array;
 
 -- Split and extract part (existing function)
@@ -125,7 +183,7 @@ SELECT SOUNDEX('Smith') as soundex_code;
 SELECT QUOTE('It''s a test') as quoted_string;
 
 -- ============================================================
--- NEW: REGEX FUNCTIONS
+-- REGEX FUNCTIONS
 -- ============================================================
 
 -- Pattern matching
@@ -263,7 +321,7 @@ SELECT RANDOM() as random_value;
 SELECT RAND() as rand_value;
 
 -- ============================================================
--- NEW: ARRAY FUNCTIONS
+-- ARRAY FUNCTIONS
 -- ============================================================
 
 -- Create arrays
@@ -295,7 +353,7 @@ SELECT ARRAY_SORT(SPLIT('zebra,apple,mango,banana', ',')) as sorted_array;
 -- Create a sample table for aggregate examples
 CREATE TABLE temp_numbers (group_id INT, value INT);
 INSERT INTO temp_numbers VALUES (1, 10), (1, 20), (1, 30);
-INSERT INTO temp_numbers VALUES (2, 5), (2, 15), (2, 25);  
+INSERT INTO temp_numbers VALUES (2, 5), (2, 15), (2, 25);
 INSERT INTO temp_numbers VALUES (3, 100), (3, 200);
 -- COUNT
 SELECT group_id, COUNT(*) as total_count FROM temp_numbers GROUP BY group_id;
@@ -309,7 +367,7 @@ SELECT group_id, COUNT(value) as non_null_count FROM temp_numbers GROUP BY group
 -- SELECT MIN(price) as minimum FROM table;
 -- SELECT MAX(price) as maximum FROM table;
 
--- NEW: MIN_BY and MAX_BY - Get value from row with min/max of another column
+-- MIN_BY and MAX_BY - Get value from row with min/max of another column
 -- These are useful for time-series data and finding associated values
 
 -- Create a sample sales table
@@ -403,8 +461,8 @@ SELECT GREATEST(10, 25, 15, 30) as greatest_value;
 SELECT LEAST(10, 25, 15, 30) as least_value;
 
 -- CASE expressions
-SELECT 
-    CASE 
+SELECT
+    CASE
         WHEN 10 > 20 THEN 'impossible'
         WHEN 10 > 5 THEN 'correct'
         ELSE 'wrong'
@@ -430,9 +488,13 @@ SELECT UNHEX('48656C6C6F') as hex_decoded;
 -- JSON FUNCTIONS
 -- ============================================================
 
--- JSON extraction
--- SELECT JSON_GET('{"name":"John","age":30}', 'name') as json_name;
--- SELECT JSON_EXTRACT('{"user":{"name":"Jane"}}', 'user.name') as nested_value;
+-- JSON columns decode stored JSON text; JSON_GET/JSON_EXTRACT read the value.
+CREATE TABLE json_reference (id INT, meta JSON);
+INSERT INTO json_reference VALUES (1, '{"name":"John","user":{"name":"Jane"},"items":[{"sku":"A"}]}');
+SELECT JSON_GET(meta,'name') AS json_name, JSON_EXTRACT(meta,'user.name') AS nested_value FROM json_reference;
+UPDATE json_reference SET meta=JSON_SET(meta,'items[0].sku','B') WHERE id=1;
+SELECT JSON_GET(meta,'items[0].sku') AS updated_sku FROM json_reference;
+DROP TABLE json_reference;
 
 -- ============================================================
 -- TYPE CONVERSION AND INTROSPECTION
@@ -459,7 +521,7 @@ SELECT UUID() as unique_id;
 SELECT VERSION() as tinysql_version;
 
 -- ============================================================
--- WINDOW FUNCTIONS - FULLY IMPLEMENTED
+-- WINDOW FUNCTIONS
 -- ============================================================
 
 -- Window functions operate on a set of rows (window) relative to the current row
@@ -480,7 +542,7 @@ INSERT INTO window_demo VALUES ('Keyboard', 'Electronics', '2025-02-10', 75);
 INSERT INTO window_demo VALUES ('Chair', 'Furniture', '2025-02-15', 200);
 
 -- ROW_NUMBER: Assign unique row numbers
-SELECT 
+SELECT
     product,
     amount,
     ROW_NUMBER() OVER (ORDER BY amount) as row_num
@@ -488,7 +550,7 @@ FROM window_demo
 ORDER BY amount;
 
 -- ROW_NUMBER with PARTITION BY: Restart numbering per partition
-SELECT 
+SELECT
     product,
     category,
     amount,
@@ -540,7 +602,7 @@ FROM window_demo
 ORDER BY sale_date;
 
 -- LAG with default value for first row
-SELECT 
+SELECT
     product,
     amount,
     LAG(amount, 1, 0) OVER (ORDER BY sale_date) as previous_or_zero
@@ -548,7 +610,7 @@ FROM window_demo
 ORDER BY sale_date;
 
 -- LEAD: Access next row value
-SELECT 
+SELECT
     product,
     amount,
     LEAD(amount, 1) OVER (ORDER BY sale_date) as next_amount
@@ -556,7 +618,7 @@ FROM window_demo
 ORDER BY sale_date;
 
 -- FIRST_VALUE: Get first value in window
-SELECT 
+SELECT
     product,
     amount,
     FIRST_VALUE(product) OVER (ORDER BY amount) as cheapest_product
@@ -564,7 +626,7 @@ FROM window_demo
 ORDER BY amount;
 
 -- FIRST_VALUE with PARTITION BY
-SELECT 
+SELECT
     product,
     category,
     amount,
@@ -573,7 +635,7 @@ FROM window_demo
 ORDER BY category, amount;
 
 -- LAST_VALUE: Get last value in window (up to current row by default)
-SELECT 
+SELECT
     product,
     amount,
     LAST_VALUE(product) OVER (ORDER BY amount) as most_expensive_so_far
@@ -581,7 +643,7 @@ FROM window_demo
 ORDER BY amount;
 
 -- MOVING_SUM: Calculate moving/rolling sum
-SELECT 
+SELECT
     product,
     sale_date,
     amount,
@@ -590,7 +652,7 @@ FROM window_demo
 ORDER BY sale_date;
 
 -- MOVING_AVG: Calculate moving/rolling average
-SELECT 
+SELECT
     product,
     sale_date,
     amount,
@@ -599,7 +661,7 @@ FROM window_demo
 ORDER BY sale_date;
 
 -- Complex example: LAG with PARTITION BY
-SELECT 
+SELECT
     product,
     category,
     amount,
@@ -615,7 +677,7 @@ DROP TABLE window_demo;
 -- ============================================================
 
 -- Example 1: Date range analysis with period check
-SELECT 
+SELECT
     CURRENT_DATE() as today,
     DATE_TRUNC('MONTH', CURRENT_DATE()) as month_start,
     EOMONTH(CURRENT_DATE()) as month_end,
@@ -623,25 +685,25 @@ SELECT
     DATEDIFF('DAYS', DATE_TRUNC('MONTH', CURRENT_DATE()), CURRENT_DATE()) as days_into_month;
 
 -- Example 2: String processing with regex
-SELECT 
+SELECT
     REGEXP_EXTRACT('Order #12345', '#(\d+)') as order_id,
     UPPER(REGEXP_REPLACE('test@EXAMPLE.com', '@.*', '')) as username,
     ARRAY_LENGTH(SPLIT('item1,item2,item3', ',')) as item_count;
 
 -- Example 3: Numeric calculations
-SELECT 
+SELECT
     ROUND(PI() * POWER(5, 2), 2) as circle_area_r5,
     DEGREES(ATAN2(3, 4)) as angle_degrees,
     ABS(SIGN(-42) * 100) as absolute_signed;
 
 -- Example 4: Array operations
-SELECT 
+SELECT
     FIRST(ARRAY_SORT(ARRAY_DISTINCT(SPLIT('zebra,apple,zebra,mango', ',')))) as first_sorted_unique,
     ARRAY_JOIN(ARRAY_SORT(SPLIT('3,1,4,1,5,9', ',')), ' -> ') as sorted_numbers;
 
 -- Example 5: Conditional logic with dates
-SELECT 
-    CASE 
+SELECT
+    CASE
         WHEN IN_PERIOD('TODAY', CURRENT_DATE()) THEN 'Today'
         WHEN IN_PERIOD('MTD', CURRENT_DATE()) THEN 'This Month'
         WHEN IN_PERIOD('QTD', CURRENT_DATE()) THEN 'This Quarter'
@@ -650,7 +712,7 @@ SELECT
     END as period_classification;
 
 -- Example 6: NULL handling with coalesce chain
-SELECT 
+SELECT
     COALESCE(
         NULL,
         NULLIF('', ''),
@@ -695,13 +757,13 @@ DROP TABLE pivot_demo;
 -- ============================================================
 
 -- Use Case 1: Email validation and extraction
-SELECT 
+SELECT
     REGEXP_MATCH('user@example.com', '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$') as is_valid_email,
     SPLIT_PART('user@example.com', '@', 1) as username,
     SPLIT_PART('user@example.com', '@', 2) as domain;
 
 -- Use Case 2: Date-based filtering helper
-SELECT 
+SELECT
     IN_PERIOD('LAST_12_MONTHS', ADD_MONTHS(CURRENT_DATE(), -6)) as in_last_year,
     IN_PERIOD('CURRENT_QUARTER', CURRENT_DATE()) as in_current_quarter,
     EXTRACT('QUARTER', CURRENT_DATE()) as current_quarter_number;
@@ -758,21 +820,21 @@ ORDER BY customer, order_date;
 DROP TABLE demo_orders;
 
 -- Use Case 3: String normalization
-SELECT 
+SELECT
     UPPER(TRIM(REGEXP_REPLACE('  Hello   World  ', '\s+', ' '))) as normalized_string;
 
 -- Use Case 4: Array processing from CSV
-SELECT 
+SELECT
     ARRAY_LENGTH(SPLIT('red,green,blue,yellow', ',')) as color_count,
     ARRAY_CONTAINS(SPLIT('red,green,blue', ','), 'green') as has_green,
     ARRAY_JOIN(ARRAY_SORT(ARRAY_DISTINCT(SPLIT('b,a,c,a,b', ','))), ',') as sorted_unique;
 
 -- Use Case 5: Complex date arithmetic
-SELECT 
+SELECT
     ADD_MONTHS(DATE_TRUNC('YEAR', CURRENT_DATE()), 6) as mid_year,
     EOMONTH(ADD_MONTHS(CURRENT_DATE(), 3), 0) as end_of_quarter,
-    DATEDIFF('DAYS', 
-        DATE_TRUNC('YEAR', CURRENT_DATE()), 
+    DATEDIFF('DAYS',
+        DATE_TRUNC('YEAR', CURRENT_DATE()),
         EOMONTH(DATE_TRUNC('YEAR', CURRENT_DATE()), 11)
     ) as days_in_year;
 
@@ -804,7 +866,7 @@ WITH RECURSIVE fib AS (
 SELECT n, a AS fib_value FROM fib ORDER BY n;
 
 -- ============================================================
--- IO AND TRANSFORM FUNCTIONS (safe runnable examples enabled)
+-- IO AND TRANSFORM FUNCTIONS
 
 -- URL helpers: parse components, query values, references, and path segments
 SELECT URL_PARSE('https://example.org/a%20b?q=geo+data#result') as url_components;
@@ -846,9 +908,8 @@ SELECT * FROM TABLE_FROM_CSV(FILE('data/sample.csv'), '{"delimiter":",","header"
 -- TABLE-VALUED FUNCTIONS (TVF)
 -- ============================================================
 
--- Note: Table-valued functions are currently in development.
--- The infrastructure is implemented, but parser integration is pending.
--- These will be available in a future release:
+-- Table-valued functions can be used in FROM and JOIN clauses.
+-- File examples below use paths relative to the repository root.
 
 -- TABLE_FROM_JSON: Parse JSON array into table
 SELECT * FROM TABLE_FROM_JSON('[{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]');
@@ -875,7 +936,7 @@ INSERT INTO users VALUES (2, 'Bob', 'bob@example.com') ON CONFLICT DO NOTHING;
 INSERT INTO users VALUES (3, 'Carol', 'carol@example.com') ON CONFLICT DO NOTHING;
 
 -- Combined example: Join CSV file with database table
-SELECT u.name, o.amount 
+SELECT u.name, o.amount
 FROM users u
 JOIN TABLE_FROM_CSV(FILE('./data/orders.csv'), '{"delimiter":",","header":true}') o ON u.id = o.user_id;
 
@@ -936,7 +997,7 @@ ALTER JOB cleanup_logs DISABLE;
 DROP JOB cleanup_logs;
 
 -- ============================================================
--- PRACTICAL EXAMPLES WITH NEW FUNCTIONS
+-- PRACTICAL FUNCTION EXAMPLES
 -- ============================================================
 
 -- Example 1: Load and process JSON data from a file
@@ -945,7 +1006,7 @@ WHERE id > 1
 ORDER BY name;
 
 -- Materialize JSON into a demo table for downstream examples
-SELECT * INTO demotable FROM TABLE_FROM_JSON(FILE('./data/data.json'));
+CREATE TABLE demotable AS SELECT * FROM TABLE_FROM_JSON(FILE('./data/data.json'));
 
 -- Example 2: Fetch and parse CSV from HTTP endpoint
 SELECT product, SUM(quantity) as total
@@ -957,7 +1018,7 @@ SELECT * FROM TABLE_FROM_JSON_LINES(FILE('./data/data.jsonl'))
 WHERE id > 1;
 
 -- Example 4: Combine multiple data sources
-SELECT 
+SELECT
         u.name,
         o.order_date,
         p.price
