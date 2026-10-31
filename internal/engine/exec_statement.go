@@ -187,9 +187,9 @@ func executeStatementWithColumns(ctx context.Context, db *storage.DB, tenant str
 
 // purgeCachesAfterRollback drops the derived state that a rolled-back
 // statement may have built from rows that are no longer there: the
-// constraint-value index, and the vector/geo/routing/vector-query caches, which are
-// keyed by name rather than by table pointer and so cannot notice the restore
-// themselves.
+// constraint-value index and retrieval/geo/routing caches. A restore may keep
+// the same table pointer and reuse a version for different data, so pointer
+// and version checks alone cannot detect every rolled-back cache entry.
 //
 // It is scoped to the tables the snapshot actually restored. A statement whose
 // rollback point covers one table is, by construction, a statement that no
@@ -207,6 +207,7 @@ func purgeCachesAfterRollback(db *storage.DB, snapshot *storage.StatementSnapsho
 				purgeGeoGridCachesFor(rollbackTenant, table.Name)
 				purgeRouteGraphCachesFor(rollbackTenant, table.Name)
 				purgeVecQueryCacheFor(rollbackTenant, table.Name)
+				purgeRAGContextCachesFor(rollbackTenant, table.Name)
 				purgeRAGPreFilterCachesFor(table.Name)
 			}
 		}
@@ -220,6 +221,7 @@ func purgeCachesAfterRollback(db *storage.DB, snapshot *storage.StatementSnapsho
 		purgeGeoGridCachesFor(ref.Tenant, ref.Table)
 		purgeRouteGraphCachesFor(ref.Tenant, ref.Table)
 		purgeVecQueryCacheFor(ref.Tenant, ref.Table)
+		purgeRAGContextCachesFor(ref.Tenant, ref.Table)
 		purgeRAGPreFilterCachesFor(ref.Table)
 	}
 }
