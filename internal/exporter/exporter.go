@@ -205,7 +205,9 @@ func ExportCSV(w io.Writer, rs *engine.ResultSet, opts Options) error {
 // jsonRowMap converts one ResultSet row into a map keyed by display column
 // name, applying jsonValue's BLOB envelope handling per Options.
 func jsonRowMap(r engine.Row, cols []string, opts Options) map[string]any {
-	return jsonRowMapWithKeys(r, cols, resultColumnKeys(cols), opts)
+	m := make(map[string]any, len(cols))
+	fillJSONRowMap(m, r, cols, resultColumnKeys(cols), opts)
+	return m
 }
 
 func resultColumnKeys(cols []string) []string {
@@ -216,12 +218,10 @@ func resultColumnKeys(cols []string) []string {
 	return keys
 }
 
-func jsonRowMapWithKeys(r engine.Row, cols, keys []string, opts Options) map[string]any {
-	m := make(map[string]any, len(cols))
+func fillJSONRowMap(m map[string]any, r engine.Row, cols, keys []string, opts Options) {
 	for i, c := range cols {
 		m[c] = jsonValue(r[keys[i]], opts)
 	}
-	return m
 }
 
 // ExportJSON writes ResultSet rows as a JSON array of objects. Like
@@ -235,8 +235,9 @@ func ExportJSON(w io.Writer, rs *engine.ResultSet, opts Options) error {
 		return err
 	}
 	keys := resultColumnKeys(rs.Cols)
+	m := make(map[string]any, len(rs.Cols))
 	for i, r := range rs.Rows {
-		m := jsonRowMapWithKeys(r, rs.Cols, keys, opts)
+		fillJSONRowMap(m, r, rs.Cols, keys, opts)
 		var b []byte
 		var err error
 		if opts.PrettyJSON {
@@ -276,8 +277,9 @@ func ExportJSON(w io.Writer, rs *engine.ResultSet, opts Options) error {
 func ExportNDJSON(w io.Writer, rs *engine.ResultSet, opts Options) error {
 	enc := json.NewEncoder(w)
 	keys := resultColumnKeys(rs.Cols)
+	m := make(map[string]any, len(rs.Cols))
 	for _, r := range rs.Rows {
-		m := jsonRowMapWithKeys(r, rs.Cols, keys, opts)
+		fillJSONRowMap(m, r, rs.Cols, keys, opts)
 		if err := enc.Encode(m); err != nil {
 			return err
 		}
