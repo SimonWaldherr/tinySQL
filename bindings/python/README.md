@@ -103,6 +103,12 @@ before the first INSERT/UPDATE/DELETE and lasts until `commit()`. `BEGIN`,
 reflects the engine's state. Leaving a `with tinysql.connect(...)` block
 commits (or, after an exception, rolls back) and closes the connection.
 
+Transaction scopes attempt rollback after body errors, interrupted execution
+and commit failures, preserving the original exception. Do not issue transaction
+control inside the scope. SQL text and snapshot paths containing NUL are rejected
+before native calls; bind text values containing NUL as parameters. Invalid script
+text is rejected before an implicit transaction can be committed.
+
 ## Errors and threads
 
 Errors derive from `tinysql.Error` following PEP 249: syntax errors and

@@ -178,6 +178,68 @@ final class DatabaseTests: XCTestCase {
         try await database.close()
     }
 
+    func testTransactionScopesRollbackAndRemainUsable() async throws {
+        enum ApplicationFailure: Error { case failed }
+        let database = try await Database.open()
+        try await database.execute("CREATE TABLE scoped (id INT PRIMARY KEY)")
+        let changed = try await database.transaction { db in
+            try db.executeBatch("INSERT INTO scoped VALUES (?)", parameterSets: [[1], [2]])
+        }
+        XCTAssertEqual(changed, 2)
+        do {
+            try await database.transaction { db in
+                try db.execute("INSERT INTO scoped VALUES (3)")
+                throw ApplicationFailure.failed
+            }
+            XCTFail("Expected application error")
+        } catch ApplicationFailure.failed { }
+        do {
+            try await database.transaction { db in
+                try db.transaction { nested in try nested.execute("INSERT INTO scoped VALUES (4)") }
+            }
+            XCTFail("Nested transaction was accepted")
+        } catch TinySQLError.invalidInput { }
+        let cancelled = Task {
+            do {
+                try await database.transaction { db in
+                    try db.execute("INSERT INTO scoped VALUES (5)")
+                    withUnsafeCurrentTask { $0?.cancel() }
+                }
+                XCTFail("Cancelled transaction committed")
+            } catch is CancellationError { }
+        }
+        try await cancelled.value
+        let active = await database.isInTransaction
+        XCTAssertFalse(active)
+        let rows = try await database.query("SELECT id FROM scoped ORDER BY id")
+        XCTAssertEqual(rows.rows, [[1], [2]])
+        try await database.transaction { db in try db.execute("INSERT INTO scoped VALUES (6)") }
+        try await database.close()
+    }
+
+    func testConcurrentTransactionScopesDoNotInterleave() async throws {
+        let database = try await Database.open()
+        try await database.execute("CREATE TABLE pairs (seq INT PRIMARY KEY, owner INT)")
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for owner in 0..<20 {
+                group.addTask {
+                    try await database.transaction { db in
+                        let count = try db.query("SELECT COUNT(*) FROM pairs").rows[0][0].int64Value!
+                        try db.execute("INSERT INTO pairs VALUES (?, ?)", parameters: [.integer(count), .integer(Int64(owner))])
+                        try db.execute("INSERT INTO pairs VALUES (?, ?)", parameters: [.integer(count + 1), .integer(Int64(owner))])
+                    }
+                }
+            }
+            try await group.waitForAll()
+        }
+        let result = try await database.query("SELECT owner FROM pairs ORDER BY seq")
+        XCTAssertEqual(result.rows.count, 40)
+        for i in stride(from: 0, to: result.rows.count, by: 2) {
+            XCTAssertEqual(result.rows[i], result.rows[i + 1])
+        }
+        try await database.close()
+    }
+
     @MainActor
     func testExecutorRunsAwayFromMainActor() async throws {
         let database = try await Database.open()

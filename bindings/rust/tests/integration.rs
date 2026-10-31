@@ -280,3 +280,29 @@ fn closed_database_rejects_calls() {
     db.execute("CREATE TABLE t (id INT)", &[]).unwrap();
     drop(db);
 }
+
+#[test]
+fn transaction_rolls_back_during_panic_unwinding() {
+    let db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE panic_rows (id INT)", &[]).unwrap();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: tinysql::Result<()> = db.transaction(|db| {
+            db.execute("INSERT INTO panic_rows VALUES (1)", &[])?;
+            panic!("application failed");
+        });
+    }));
+    assert!(panic.is_err());
+    assert!(!db.in_transaction());
+    assert_eq!(
+        db.query_value::<i64>("SELECT COUNT(*) FROM panic_rows", &[])
+            .unwrap(),
+        Some(0)
+    );
+    db.transaction(|db| db.execute("INSERT INTO panic_rows VALUES (2)", &[]))
+        .unwrap();
+    assert_eq!(
+        db.query_value::<i64>("SELECT id FROM panic_rows", &[])
+            .unwrap(),
+        Some(2)
+    );
+}

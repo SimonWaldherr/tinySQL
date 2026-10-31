@@ -188,6 +188,13 @@ def _dumps(value: Any) -> str:
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
 
 
+def _validate_text(value: str, label: str = "SQL") -> None:
+    if not isinstance(value, str):
+        raise ProgrammingError(f"{label} must be a string")
+    if "\x00" in value:
+        raise ProgrammingError(f"{label} must not contain NUL")
+
+
 _FIRST_WORD = re.compile(r"^\s*(?:(?:--[^\n]*(?:\n|$)|/\*.*?\*/)\s*)*([A-Za-z]+)", re.S)
 _DML_WORDS = frozenset({"INSERT", "UPDATE", "DELETE", "REPLACE", "UPSERT"})
 
@@ -260,6 +267,7 @@ class Cursor:
     def execute(self, sql: str, parameters: Any = None) -> "Cursor":
         """Run one statement. Row-producing statements fill the result set."""
         self._check()
+        _validate_text(sql)
         values = _encode_list(parameters)
         self.connection._before_statement(sql)
         result = self.connection._call("TinySQLDatabaseRun", sql, _dumps(values) if values else "")
@@ -269,6 +277,7 @@ class Cursor:
     def executemany(self, sql: str, seq_of_parameters: Iterable[Any]) -> "Cursor":
         """Prepare *sql* once and run it for every parameter sequence."""
         self._check()
+        _validate_text(sql)
         sets = [_encode_list(p) for p in seq_of_parameters]
         self._reset()
         if not sets:
@@ -282,6 +291,7 @@ class Cursor:
     def executescript(self, script: str) -> "Cursor":
         """Run a multi-statement script; a pending implicit transaction commits first."""
         self._check()
+        _validate_text(script)
         self.connection._commit_implicit()
         result = self.connection._call("TinySQLDatabaseExecuteScript", script)
         self._reset()
@@ -426,12 +436,14 @@ class Connection:
         self.begin()
         try:
             yield self
+            self.commit()
         except BaseException:
             if self.in_transaction:
-                self.rollback()
+                try:
+                    self.rollback()
+                except Error:
+                    pass  # Preserve the operation/commit error for the caller.
             raise
-        else:
-            self.commit()
 
     def _before_statement(self, sql: str) -> None:
         # PEP 249 mode: open a transaction implicitly before data changes.
@@ -446,7 +458,9 @@ class Connection:
 
     def save(self, path: str) -> None:
         """Write committed state to a snapshot file (gzip when it ends in ``.gz``)."""
-        self._call("TinySQLDatabaseSave", str(path))
+        path = str(path)
+        _validate_text(path, "path")
+        self._call("TinySQLDatabaseSave", path)
 
     def sync(self) -> None:
         """Flush durable storage modes (disk, json, index, hybrid) to disk."""

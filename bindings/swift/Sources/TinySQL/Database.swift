@@ -82,6 +82,37 @@ public actor Database {
         return QueryResult(columns: result.columns ?? [], rows: result.rows ?? [])
     }
 
+    /// Runs synchronous database work atomically on this actor's executor.
+    /// The isolated closure cannot suspend, so other actor calls cannot join
+    /// the transaction. Do not issue BEGIN/COMMIT/ROLLBACK inside the closure.
+    /// Errors and cancellation attempt rollback while the transaction is active;
+    /// the original error is preserved.
+    public func transaction<T: Sendable>(
+        _ body: @Sendable (isolated Database) throws -> T
+    ) throws -> T {
+        try requireOpen()
+        try Task.checkCancellation()
+        guard !isInTransaction else {
+            throw TinySQLError.invalidInput("A transaction is already active")
+        }
+        try execute("BEGIN")
+        do {
+            let value = try body(self)
+            try Task.checkCancellation()
+            try execute("COMMIT")
+            return value
+        } catch {
+            // Cleanup must still run on a cancelled task. execute() rejects
+            // cancellation before invoking the C ABI, so bypass that check.
+            if handle != 0 && isInTransaction {
+                _ = try? "ROLLBACK".withCString {
+                    try statementResult(Self.decode(TinySQLDatabaseExecute(handle, $0, nil)))
+                }
+            }
+            throw error
+        }
+    }
+
     /// Runs a multi-statement script. Semicolons inside literals, comments and
     /// `CREATE TRIGGER ... BEGIN ... END` bodies do not split statements. Stops
     /// at the first failing statement; earlier statements stay applied.

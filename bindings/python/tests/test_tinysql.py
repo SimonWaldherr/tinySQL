@@ -70,6 +70,57 @@ class ConnectionTests(unittest.TestCase):
         with self.assertRaises(tinysql.ProgrammingError):
             self.conn.execute("SELECT ?", (object(),))
 
+    def test_nul_sql_is_rejected_before_native_side_effects(self):
+        self.conn.execute("CREATE TABLE nul_rows (id INT)")
+        for operation in [
+            lambda: self.conn.execute("INSERT INTO nul_rows VALUES (1)\x00ignored"),
+            lambda: self.conn.executemany("INSERT INTO nul_rows VALUES (?)\x00ignored", [(1,)]),
+            lambda: self.conn.executescript("INSERT INTO nul_rows VALUES (1);\x00ignored"),
+        ]:
+            with self.assertRaises(tinysql.ProgrammingError):
+                operation()
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM nul_rows").fetchone()[0], 0)
+        self.conn.autocommit = False
+        self.conn.execute("INSERT INTO nul_rows VALUES (2)")
+        with self.assertRaises(tinysql.ProgrammingError):
+            self.conn.executescript("SELECT 1\x00ignored")
+        self.assertTrue(self.conn.in_transaction)
+        self.conn.rollback()
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM nul_rows").fetchone()[0], 0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "snapshot")
+            with self.assertRaises(tinysql.ProgrammingError):
+                self.conn.save(path + "\x00ignored")
+            self.assertFalse(os.path.exists(path))
+
+    def test_commit_failure_rolls_back_transaction_scope(self):
+        from unittest.mock import patch
+        self.conn.execute("CREATE TABLE commit_rows (id INT)")
+        error = tinysql.OperationalError("injected commit failure")
+        with patch.object(self.conn, "commit", side_effect=error):
+            with self.assertRaises(tinysql.OperationalError) as failure:
+                with self.conn.transaction():
+                    self.conn.execute("INSERT INTO commit_rows VALUES (1)")
+        self.assertIs(failure.exception, error)
+        self.assertFalse(self.conn.in_transaction)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM commit_rows").fetchone()[0], 0)
+        with self.conn.transaction():
+            self.conn.execute("INSERT INTO commit_rows VALUES (2)")
+        self.assertEqual(self.conn.execute("SELECT id FROM commit_rows").fetchone()[0], 2)
+
+    def test_transaction_cleanup_preserves_application_error(self):
+        from unittest.mock import patch
+        original = ValueError("application failure")
+        with patch.object(self.conn, "rollback", side_effect=tinysql.OperationalError("cleanup failed")):
+            with self.assertRaises(ValueError) as failure:
+                with self.conn.transaction():
+                    raise original
+        self.assertIs(failure.exception, original)
+        # Cleanup was deliberately made to fail; callers can still retry it.
+        self.assertTrue(self.conn.in_transaction)
+        self.conn.rollback()
+        self.assertFalse(self.conn.in_transaction)
+
     def test_other_parameter_types(self):
         self.conn.execute("CREATE TABLE t (d TEXT, ts TEXT, dec TEXT, mv BLOB)")
         aware = datetime.datetime(2026, 9, 27, 14, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=2)))

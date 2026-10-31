@@ -143,14 +143,33 @@ engine values follow the existing database/sql driver's conversion rules
 so `.real(1)` and large integral doubles retain their type across JSON encoding.
 SQL column coercion still follows the engine's rules.
 
+## Transaction scopes
+
+Use an isolated synchronous closure to keep a unit of work on the database's
+serial executor without actor reentrancy:
+
+```swift
+let inserted = try await database.transaction { db in
+    try db.executeBatch("INSERT INTO notes VALUES (?, ?)",
+                        parameterSets: [[3, "three"], [4, "four"]])
+}
+```
+
+The closure receives `isolated Database`, so its database calls need no `await`.
+It cannot suspend for network or UI work; prepare that data before entering.
+The helper commits on success and attempts rollback on a thrown error or
+cancellation observed before commit, while the transaction is still active. Cleanup still runs in cancelled tasks. Nested scopes
+are rejected. Do not issue transaction-control SQL inside the closure.
+A cancellation arriving after the native commit has started cannot undo it.
+
 ## Lifetime, concurrency and persistence
 
 - `close()` is idempotent in Swift; further operations throw `.closed`. `deinit`
   also releases the native handle. Explicit close lets you observe close errors.
 - Every call uses a pinned SQL connection, so `BEGIN`, `COMMIT`, and `ROLLBACK`
-  span calls. Do not share an actor with unrelated tasks during a multi-call
-  transaction: suspension between calls allows those tasks to join it. Use a
-  dedicated actor for that unit of work.
+  span calls. Prefer `transaction { db in ... }` for an isolated synchronous
+  unit of work. Manual multi-call transactions still need a dedicated actor:
+  suspension between calls allows other tasks to join them.
 - `Database()` is in-memory. `Database(directory:storage:)` opens or creates a
   durable database directory. `Database(snapshot:)` loads an **existing tinySQL
   snapshot**, not a SQLite file. A missing/corrupt file throws. `save(to:)` is

@@ -83,12 +83,16 @@ checkpoint settings, `wal_sync_normal()` and `encryption_key(&[u8; 32])`
   `Blob`. `Row::get::<T>` converts to `i64` (and smaller integer types with a
   range check), `f64`, `bool`, `String`, `Vec<u8>`, `Value` and `Option<T>`
   for nullable columns; columns are addressed by index or case-insensitive name.
-- `db.transaction(|tx| { ...; Ok(value) })` commits on `Ok` and rolls back on
-  `Err`. `BEGIN`/`COMMIT` as SQL work too; `in_transaction()` reflects the
-  engine state.
+- `db.transaction(|tx| { ...; Ok(value) })` commits on `Ok` and attempts rollback on
+  `Err`, commit failures and panic unwinding while the transaction is active. Cleanup does not run with
+  `panic=abort`. The original error or panic is preserved. Do not issue
+  transaction-control SQL inside the closure. `BEGIN`/`COMMIT` as SQL work
+  too; `in_transaction()` reflects the engine state.
 
 `Database` is `Send + Sync`. Calls on one database are serialized in the
-engine; separate databases run in parallel. Results are materialized, so page
+engine; separate databases run in parallel. A transaction spans multiple calls:
+use a dedicated handle or application-level synchronization for its entire
+scope when sharing a database between threads. Results are materialized, so page
 large results with `LIMIT` or a keyset condition. Dropping a database closes
 it; `close()` reports close errors.
 

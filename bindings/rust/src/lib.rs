@@ -406,7 +406,10 @@ impl Database {
         Ok(summary(&response))
     }
 
-    /// Runs `body` inside `BEGIN ... COMMIT`, rolling back when it fails.
+    /// Runs `body` inside `BEGIN ... COMMIT`, attempting rollback on errors or
+    /// panic unwinding while the transaction remains active. With panic=abort, process termination cannot run cleanup.
+    /// Dedicate the handle to this scope: concurrent calls on the same handle
+    /// can otherwise join its transaction. Do not issue transaction control in `body`.
     pub fn transaction<T>(&self, body: impl FnOnce(&Database) -> Result<T>) -> Result<T> {
         if self.in_transaction() {
             return Err(Error::InvalidInput(
@@ -414,18 +417,19 @@ impl Database {
             ));
         }
         self.execute("BEGIN", &[])?;
-        match body(self) {
-            Ok(value) => {
-                self.execute("COMMIT", &[])?;
-                Ok(value)
-            }
-            Err(error) => {
-                if self.in_transaction() {
-                    let _ = self.execute("ROLLBACK", &[]);
+        struct Rollback<'a>(&'a Database);
+        impl Drop for Rollback<'_> {
+            fn drop(&mut self) {
+                if self.0.in_transaction() {
+                    let _ = self.0.execute("ROLLBACK", &[]);
                 }
-                Err(error)
             }
         }
+        let rollback = Rollback(self);
+        let value = body(self)?;
+        self.execute("COMMIT", &[])?;
+        drop(rollback);
+        Ok(value)
     }
 
     /// Whether the database is inside `BEGIN ... COMMIT/ROLLBACK`, including

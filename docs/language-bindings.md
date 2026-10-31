@@ -79,7 +79,7 @@ TinySQLDatabaseFree(rows);
 | Bound parameters `?`, `$1`, `:1` | `ExecSQLArgs`, `database/sql` | `params!` | DB-API `qmark` | `[SQLValue]` |
 | Prepared batch | `database/sql` `Prepare` | `execute_batch` | `executemany` | `executeBatch` |
 | Multi-statement scripts | `ExecScript` | `execute_script` | `executescript` | `executeScript` |
-| Transactions | `database/sql` `BeginTx` or SQL `BEGIN` | `transaction(closure)` | `with conn.transaction():` | `BEGIN`/`COMMIT` + `isInTransaction` |
+| Transactions | `database/sql` `BeginTx` or SQL `BEGIN` | `transaction(closure)` | `with conn.transaction():` | `transaction { isolatedDB in ... }` or SQL transaction control |
 | Encryption at rest | `StorageConfig.EncryptionKey` | `encryption_key` | `encryption_key=` | `StorageOptions.encryptionKey` |
 | Streaming results | `ExecSQLStream`, `database/sql` rows | materialized | materialized | materialized |
 
