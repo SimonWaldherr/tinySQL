@@ -56,9 +56,9 @@ func setupTestDB() *storage.DB {
 // Demo queries from index.html
 var demoQueries = map[string]string{
 	// Date & Time Functions
-	"datediff_group":   "SELECT user_id, DATEDIFF('HOURS', MIN(ts), MAX(ts)) AS hours_span FROM events GROUP BY user_id ORDER BY user_id",
+	"datediff_group":   "SELECT user_id, TIMESTAMPDIFF('HOURS', MIN(ts), MAX(ts)) AS hours_span FROM events GROUP BY user_id ORDER BY user_id",
 	"datediff_days":    "SELECT user_id, MIN(ts) AS first_event, MAX(ts) AS last_event, DATEDIFF('DAYS', MIN(ts), MAX(ts)) AS days_active FROM events GROUP BY user_id HAVING COUNT(*) > 1",
-	"datediff_minutes": "SELECT e1.user_id, e1.ts AS login_time, e2.ts AS next_event, DATEDIFF('MINUTES', e1.ts, e2.ts) AS minutes_diff FROM events e1 JOIN events e2 ON e1.user_id = e2.user_id AND e2.id > e1.id WHERE JSON_GET(e1.data, 'type') = 'login' ORDER BY e1.user_id, e1.ts",
+	"datediff_minutes": "SELECT e1.user_id, e1.ts AS login_time, e2.ts AS next_event, TIMESTAMPDIFF('MINUTES', e1.ts, e2.ts) AS minutes_diff FROM events e1 JOIN events e2 ON e1.user_id = e2.user_id AND e2.id > e1.id WHERE JSON_GET(e1.data, 'type') = 'login' ORDER BY e1.user_id, e1.ts",
 	"events_by_date":   "SELECT LEFT(ts, 10) AS event_date, COUNT(*) AS event_count, COUNT(DISTINCT user_id) AS unique_users FROM events GROUP BY LEFT(ts, 10) ORDER BY event_date",
 
 	// JSON Operations
@@ -94,7 +94,7 @@ var demoQueries = map[string]string{
 
 	// Analytics & Reporting
 	"timeseries":       "SELECT user_id, ts, JSON_GET(data, 'type') AS event_type FROM events ORDER BY user_id, ts",
-	"cohort_analysis":  "SELECT user_id, MIN(ts) AS first_seen, MAX(ts) AS last_seen, COUNT(*) AS total_events, DATEDIFF('HOURS', MIN(ts), MAX(ts)) AS session_hours FROM events GROUP BY user_id ORDER BY session_hours DESC",
+	"cohort_analysis":  "SELECT user_id, MIN(ts) AS first_seen, MAX(ts) AS last_seen, COUNT(*) AS total_events, TIMESTAMPDIFF('HOURS', MIN(ts), MAX(ts)) AS session_hours FROM events GROUP BY user_id ORDER BY session_hours DESC",
 	"revenue_analysis": "SELECT LEFT(CAST(o.id AS TEXT), 1) AS period, COUNT(*) AS orders, SUM(amount) AS revenue, AVG(amount) AS avg_order_value, COUNT(DISTINCT user_id) AS unique_customers FROM orders o WHERE status = 'PAID' GROUP BY LEFT(CAST(o.id AS TEXT), 1) ORDER BY period",
 	"user_activity":    "SELECT JSON_GET(data, 'type') AS event_type, COUNT(*) AS frequency, COUNT(DISTINCT user_id) AS unique_users, MIN(ts) AS first_occurrence, MAX(ts) AS last_occurrence FROM events GROUP BY JSON_GET(data, 'type') ORDER BY frequency DESC",
 

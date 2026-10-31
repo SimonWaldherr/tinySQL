@@ -1386,10 +1386,10 @@ func TestGOBPersistenceWithNewDataTypes(t *testing.T) {
 	t.Log("✅ GOB persistence test completed successfully!")
 }
 
-// TestDateDiffAndTimeAggregation tests DATEDIFF function with GROUP BY and time aggregation
+// TestTimestampDiffAndTimeAggregation tests TIMESTAMPDIFF function with GROUP BY and time aggregation
 //
 //nolint:gocyclo // Extensive temporal scenarios require multiple branches in one test.
-func TestDateDiffAndTimeAggregation(t *testing.T) {
+func TestTimestampDiffAndTimeAggregation(t *testing.T) {
 	db := tsql.NewDB()
 	ctx := context.Background()
 
@@ -1439,14 +1439,14 @@ func TestDateDiffAndTimeAggregation(t *testing.T) {
 		}
 	}
 
-	// Test 1: Calculate session duration in hours using DATEDIFF
+	// Test 1: Calculate session duration in hours using TIMESTAMPDIFF
 	durationQuerySQL := `
 		SELECT 
 			session_id,
 			user_name,
 			start_time,
 			end_time,
-			DATEDIFF('HOURS', start_time, end_time) AS duration_hours
+			TIMESTAMPDIFF('HOURS', start_time, end_time) AS duration_hours
 		FROM user_sessions 
 		ORDER BY user_name, session_id
 	`
@@ -1454,11 +1454,11 @@ func TestDateDiffAndTimeAggregation(t *testing.T) {
 	p = tsql.NewParser(durationQuerySQL)
 	stmt, err = p.ParseStatement()
 	if err != nil {
-		t.Fatalf("Failed to parse DATEDIFF query: %v", err)
+		t.Fatalf("Failed to parse TIMESTAMPDIFF query: %v", err)
 	}
 	rs, err := tsql.Execute(ctx, db, "default", stmt)
 	if err != nil {
-		t.Fatalf("Failed to execute DATEDIFF query: %v", err)
+		t.Fatalf("Failed to execute TIMESTAMPDIFF query: %v", err)
 	}
 
 	// Verify individual session durations
@@ -1492,7 +1492,7 @@ func TestDateDiffAndTimeAggregation(t *testing.T) {
 		if !ok {
 			// Try alternative column names
 			for key := range row {
-				if strings.Contains(strings.ToLower(key), "duration") || strings.Contains(strings.ToLower(key), "datediff") {
+				if strings.Contains(strings.ToLower(key), "duration") || strings.Contains(strings.ToLower(key), "timestampdiff") {
 					duration, ok = tsql.GetVal(row, key)
 					break
 				}
@@ -1515,7 +1515,7 @@ func TestDateDiffAndTimeAggregation(t *testing.T) {
 		SELECT 
 			user_name,
 			COUNT(*) AS session_count,
-			AVG(DATEDIFF('HOURS', start_time, end_time)) AS avg_duration_hours
+			AVG(TIMESTAMPDIFF('HOURS', start_time, end_time)) AS avg_duration_hours
 		FROM user_sessions 
 		GROUP BY user_name
 		ORDER BY user_name
@@ -1597,14 +1597,14 @@ func TestDateDiffAndTimeAggregation(t *testing.T) {
 		}
 	}
 
-	// Test 3: Find long sessions (>= 4 hours) using DATEDIFF in WHERE clause
+	// Test 3: Find long sessions (>= 4 hours) using TIMESTAMPDIFF in WHERE clause
 	longSessionsSQL := `
 		SELECT 
 			session_id,
 			user_name,
-			DATEDIFF('HOURS', start_time, end_time) AS duration_hours
+			TIMESTAMPDIFF('HOURS', start_time, end_time) AS duration_hours
 		FROM user_sessions 
-		WHERE DATEDIFF('HOURS', start_time, end_time) >= 4
+		WHERE TIMESTAMPDIFF('HOURS', start_time, end_time) >= 4
 		ORDER BY duration_hours DESC
 	`
 
@@ -1631,11 +1631,11 @@ func TestDateDiffAndTimeAggregation(t *testing.T) {
 		t.Logf("   Session %v (%v): %v hours", sessionID, userName, duration)
 	}
 
-	// Test 4: Calculate total time per user using SUM with DATEDIFF
+	// Test 4: Calculate total time per user using SUM with TIMESTAMPDIFF
 	totalTimeSQL := `
 		SELECT 
 			user_name,
-			SUM(DATEDIFF('HOURS', start_time, end_time)) AS total_hours
+			SUM(TIMESTAMPDIFF('HOURS', start_time, end_time)) AS total_hours
 		FROM user_sessions 
 		GROUP BY user_name
 		ORDER BY total_hours DESC
@@ -1662,5 +1662,5 @@ func TestDateDiffAndTimeAggregation(t *testing.T) {
 		t.Logf("   %v: %v total hours", userName, totalHours)
 	}
 
-	t.Log("✅ DATEDIFF with GROUP BY and time aggregation test completed successfully!")
+	t.Log("✅ TIMESTAMPDIFF with GROUP BY and time aggregation test completed successfully!")
 }

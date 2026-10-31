@@ -50,8 +50,14 @@ const functionData = {
       {
         name: 'DATEDIFF(unit, date1, date2)',
         syntax: 'DATEDIFF(unit, date1, date2)',
-        description: 'Berechnet die Differenz zwischen zwei Daten.',
+        description: 'Zählt überschrittene Kalendergrenzen in UTC.',
         examples: ["SELECT DATEDIFF('DAYS', '2024-01-01', '2024-12-31') as days;"]
+      },
+      {
+        name: 'TIMESTAMPDIFF(unit, date1, date2)',
+        syntax: 'TIMESTAMPDIFF(unit, date1, date2)',
+        description: 'Zählt vollständige verstrichene Einheiten zwischen zwei Zeitpunkten.',
+        examples: ["SELECT TIMESTAMPDIFF(HOUR, '2024-01-01T12:30:00Z', '2024-01-01T14:00:00Z') as hours;"]
       },
       {
         name: 'EXTRACT(part, date)',

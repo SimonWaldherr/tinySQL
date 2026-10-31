@@ -171,6 +171,8 @@ func evalExtract(env ExecEnv, args []Expr, row Row) (any, error) {
 	case "WEEK":
 		_, week := dateTime.ISOWeek()
 		return week, nil
+	case "ISODOW", "ISO_WEEKDAY":
+		return (int(dateTime.Weekday())+6)%7 + 1, nil
 	case "DAYOFWEEK", "DOW":
 		return int(dateTime.Weekday()), nil
 	case "DAYOFYEAR", "DOY":

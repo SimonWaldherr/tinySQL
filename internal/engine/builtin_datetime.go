@@ -13,76 +13,6 @@ import (
 	"time"
 )
 
-func evalDateDiff(env ExecEnv, ex *FuncCall, row Row) (any, error) {
-	if len(ex.Args) != 3 {
-		return nil, fmt.Errorf("DATEDIFF expects 3 arguments: (unit, start_date, end_date)")
-	}
-
-	// Get the unit (HOURS, DAYS, MINUTES, etc.)
-	unitVal, err := evalExpr(env, ex.Args[0], row)
-	if err != nil {
-		return nil, err
-	}
-	if unitVal == nil {
-		return nil, nil
-	}
-	unit, ok := unitVal.(string)
-	if !ok {
-		return nil, fmt.Errorf("DATEDIFF unit must be a string")
-	}
-
-	// Get start date
-	startVal, err := evalExpr(env, ex.Args[1], row)
-	if err != nil {
-		return nil, err
-	}
-
-	// Get end date
-	endVal, err := evalExpr(env, ex.Args[2], row)
-	if err != nil {
-		return nil, err
-	}
-	if startVal == nil || endVal == nil {
-		return nil, nil
-	}
-
-	// Convert values to time.Time
-	startTime, err := parseTimeValue(startVal)
-	if err != nil {
-		return nil, fmt.Errorf("DATEDIFF start_date: %v", err)
-	}
-
-	endTime, err := parseTimeValue(endVal)
-	if err != nil {
-		return nil, fmt.Errorf("DATEDIFF end_date: %v", err)
-	}
-
-	// Calculate difference
-	diff := endTime.Sub(startTime)
-
-	// Return based on unit
-	switch strings.ToUpper(unit) {
-	case "HOURS":
-		return int(diff.Hours()), nil
-	case "MINUTES":
-		return int(diff.Minutes()), nil
-	case "SECONDS":
-		return int(diff.Seconds()), nil
-	case "DAYS":
-		return int(diff.Hours() / 24), nil
-	case "WEEKS":
-		return int(diff.Hours() / (24 * 7)), nil
-	case "MONTHS":
-		// Approximate: 30 days per month
-		return int(diff.Hours() / (24 * 30)), nil
-	case "YEARS":
-		// Approximate: 365 days per year
-		return int(diff.Hours() / (24 * 365)), nil
-	default:
-		return nil, fmt.Errorf("unsupported DATEDIFF unit: %s (supported: HOURS, MINUTES, SECONDS, DAYS, WEEKS, MONTHS, YEARS)", unit)
-	}
-}
-
 // parseTimeFixedDigits parses the fixed-width layouts "2006-01-02 15:04:05",
 // "2006-01-02T15:04:05" and "2006-01-02", including fractional seconds
 // and RFC3339 UTC timestamps, directly without going through
@@ -477,6 +407,8 @@ func evalDateComponent(name string, args []Expr, eval func(Expr) (any, error)) (
 		return date.Second(), nil
 	case "DAYOFWEEK":
 		return int(date.Weekday()) + 1, nil
+	case "ISODOW":
+		return (int(date.Weekday())+6)%7 + 1, nil
 	case "DAYOFYEAR":
 		return date.YearDay(), nil
 	case "WEEKOFYEAR":
@@ -1063,4 +995,8 @@ func evalRangeMerge(env ExecEnv, args []Expr, row Row) (any, error) {
 		out[i] = []any{r.start, r.end}
 	}
 	return out, nil
+}
+
+func evalISODow(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	return evalDateComponent("ISODOW", ex.Args, func(arg Expr) (any, error) { return evalExpr(env, arg, row) })
 }

@@ -38,6 +38,8 @@ func getBuiltinFunctions() map[string]funcHandler {
 		"FROM_TIMESTAMP":    evalFromTimestampFunc,
 		"TIMESTAMP":         evalTimestampFunc,
 		"DATEDIFF":          evalDateDiff,
+		"TIMESTAMPDIFF":     evalDateDiff,
+		"ISODOW":            evalISODow,
 		"LTRIM":             evalLTrimFunc,
 		"RTRIM":             evalRTrimFunc,
 		"TRIM":              evalTrimFunc,

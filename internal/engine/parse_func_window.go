@@ -99,9 +99,17 @@ func (p *Parser) parseFuncCallWithName(name string) (Expr, error) {
 	var args []Expr
 	if p.cur.Typ != tSymbol || p.cur.Val != ")" {
 		for {
-			e, err := p.parseExpr()
-			if err != nil {
-				return nil, err
+			var e Expr
+			if (name == "DATEDIFF" || name == "TIMESTAMPDIFF") && len(args) == 0 &&
+				(p.cur.Typ == tIdent || p.cur.Typ == tKeyword) && p.peek.Typ == tSymbol && p.peek.Val == "," && knownDateDiffUnit(p.cur.Val) {
+				e = &Literal{Val: strings.ToUpper(p.cur.Val)}
+				p.next()
+			} else {
+				var err error
+				e, err = p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
 			}
 			args = append(args, e)
 			if p.cur.Typ == tSymbol && p.cur.Val == "," {

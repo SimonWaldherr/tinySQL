@@ -55,6 +55,42 @@ time.Time's range before returning it. Ordinary calendar shifts still use
 AddDate and clock shifts use fixed durations. Existing truncation of fractional
 unit counts is retained.
 
+## Differences: boundaries and elapsed units
+
+`DATEDIFF(unit, start, end)` counts crossed UTC calendar or clock boundaries.
+`TIMESTAMPDIFF(unit, start, end)` counts complete elapsed units, truncated toward
+zero. Both accept quoted units or bare unit names, including singular/plural
+names and the DATEPART abbreviations. An unrecognized bare identifier remains a column reference. If a unit column
+has the same name as a supported unit, qualify it or use an expression such as
+`COALESCE(unit_column, 'DAY')` to disambiguate.
+
+Both inputs are normalized to UTC before comparison. Equivalent instants with
+different offsets produce zero. Component extraction, DATE_TRUNC and calendar
+shifts continue to use the input location. A calendar DAY shift across spring
+DST can therefore span 23 hours; TIMESTAMPDIFF(HOUR, ...) reports 23.
+
+| Expression | Result |
+| --- | --- |
+| `DATEDIFF(MONTH, '2024-01-31', '2024-02-29')` | 1 month boundary |
+| `TIMESTAMPDIFF(MONTH, '2024-01-31', '2024-02-29')` | 0 complete months |
+| `DATEDIFF(DAY, '2024-02-28T23:59:59Z', '2024-02-29T00:00:00Z')` | 1 day boundary |
+| `TIMESTAMPDIFF(DAY, '2024-02-28T23:59:59Z', '2024-02-29T00:00:00Z')` | 0 complete 24-hour days |
+
+Supported units are YEAR, QUARTER, MONTH, WEEK, ISO_WEEK, DAY, HOUR, MINUTE,
+SECOND, MILLISECOND, MICROSECOND and NANOSECOND. DATEDIFF weeks begin on Sunday;
+ISO_WEEK begins on Monday. TIMESTAMPDIFF weeks are complete seven-day durations.
+A complete month requires reaching the original day and time of day; no
+month-end clamping is applied. Years and quarters use complete months divided
+by twelve and three. Swapping operands negates the result.
+
+Migration: DATEDIFF formerly divided elapsed time by fixed durations, including
+approximations of 30 days per month and 365 days per year. Those approximations
+are removed. Use TIMESTAMPDIFF for the former complete-duration interpretation
+of seconds through weeks. Months and years now have explicit calendar meaning.
+Integer arithmetic preserves subsecond precision and supports spans beyond
+Go's time.Duration range; an unrepresentable integer result raises an error.
+NULL propagation and argument error order are shared by raw and ordinary calls.
+
 ## Calendar helpers
 
 Dates use the proleptic Gregorian calendar: its leap-year rules apply even to
@@ -72,12 +108,14 @@ dates without changing the interpretation of ordinary date functions.
 | `DAYNAME(date)` | English weekday name, such as `Thursday`, from the input's local date. |
 | `MONTHNAME(date)` | English month name, such as `February`, from the input's local date. |
 | `DATEPART(part, date)` | Integer component, with bare or quoted part names. |
+| `ISODOW(date)` | ISO weekday: Monday=1 through Sunday=7, using the input location. |
 
 DATEPART supports YEAR, QUARTER, MONTH, DAYOFYEAR, DAY, WEEK, WEEKDAY, HOUR,
 MINUTE, SECOND, MILLISECOND, MICROSECOND, NANOSECOND, TZOFFSET, ISO_WEEK and
-ISO_YEAR, plus the common [T-SQL abbreviations](https://learn.microsoft.com/en-us/sql/t-sql/functions/datepart-transact-sql).
+ISO_YEAR, ISO_WEEKDAY (also ISODOW), plus the common [T-SQL abbreviations](https://learn.microsoft.com/en-us/sql/t-sql/functions/datepart-transact-sql).
 WEEK uses Sunday-first weeks with January 1 in week 1; WEEKDAY is Sunday=1
-through Saturday=7. ISO_WEEK and ISO_YEAR use ISO week numbering. There is no
+through Saturday=7. ISO_WEEKDAY and EXTRACT('ISODOW', date) use Monday=1
+through Sunday=7, so a Friday filter is `WHERE ISODOW(date_column) = 5`. ISO_WEEK and ISO_YEAR use ISO week numbering. There is no
 SET DATEFIRST setting. Nanoseconds retain Go's full nine-digit precision.
 All of these helpers propagate NULL and share validation between raw and
 ordinary evaluation, including argument evaluation order.

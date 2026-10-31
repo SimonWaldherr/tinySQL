@@ -338,9 +338,9 @@ SELECT * FROM users;"></textarea>
           <select id="demo-select" class="demo-select" disabled>
             <option value="">➕ Demo-Query auswählen…</option>
             <optgroup label="🕒 Date & Time Functions">
-              <option value="datediff_group">DATEDIFF: Zeitspanne je Nutzer (HOURS)</option>
+              <option value="datediff_group">TIMESTAMPDIFF: Zeitspanne je Nutzer (HOURS)</option>
               <option value="datediff_days">DATEDIFF: Tage zwischen Events</option>
-              <option value="datediff_minutes">DATEDIFF: Minuten zwischen Login/Logout</option>
+              <option value="datediff_minutes">TIMESTAMPDIFF: Minuten zwischen Login/Logout</option>
               <option value="events_by_date">Events nach Datum gruppiert</option>
             </optgroup>
             <optgroup label="📋 JSON Operations">
@@ -455,9 +455,9 @@ SELECT * FROM users;"></textarea>
 
     const demoQueries = {
       // Date & Time Functions
-      datediff_group: `-- Zeitspanne je Nutzer in Stunden (DATEDIFF)\nSELECT user_id, DATEDIFF('HOURS', MIN(ts), MAX(ts)) AS hours_span\nFROM events\nGROUP BY user_id\nORDER BY user_id;`,
+      datediff_group: `-- Zeitspanne je Nutzer in Stunden (TIMESTAMPDIFF)\nSELECT user_id, TIMESTAMPDIFF('HOURS', MIN(ts), MAX(ts)) AS hours_span\nFROM events\nGROUP BY user_id\nORDER BY user_id;`,
       datediff_days: `-- Tage zwischen ersten und letzten Events\nSELECT user_id, \n       MIN(ts) AS first_event,\n       MAX(ts) AS last_event,\n       DATEDIFF('DAYS', MIN(ts), MAX(ts)) AS days_active\nFROM events\nGROUP BY user_id\nHAVING COUNT(*) > 1;`,
-      datediff_minutes: `-- Minuten zwischen Login und nächstem Event\nSELECT e1.user_id, e1.ts AS login_time, e2.ts AS next_event,\n       DATEDIFF('MINUTES', e1.ts, e2.ts) AS minutes_diff\nFROM events e1 \nJOIN events e2 ON e1.user_id = e2.user_id AND e2.id > e1.id\nWHERE JSON_GET(e1.data, 'type') = 'login'\nORDER BY e1.user_id, e1.ts;`,
+      datediff_minutes: `-- Minuten zwischen Login und nächstem Event\nSELECT e1.user_id, e1.ts AS login_time, e2.ts AS next_event,\n       TIMESTAMPDIFF('MINUTES', e1.ts, e2.ts) AS minutes_diff\nFROM events e1 \nJOIN events e2 ON e1.user_id = e2.user_id AND e2.id > e1.id\nWHERE JSON_GET(e1.data, 'type') = 'login'\nORDER BY e1.user_id, e1.ts;`,
       events_by_date: `-- Events nach Datum gruppiert\nSELECT LEFT(ts, 10) AS event_date,\n       COUNT(*) AS event_count,\n       COUNT(DISTINCT user_id) AS unique_users\nFROM events\nGROUP BY LEFT(ts, 10)\nORDER BY event_date;`,
 
       // JSON Operations
@@ -494,7 +494,7 @@ SELECT * FROM users;"></textarea>
 
       // Analytics & Reporting
       timeseries: `-- Timeseries: Events je Nutzer\nSELECT user_id, ts, JSON_GET(data, 'type') AS event_type\nFROM events\nORDER BY user_id, ts;`,
-      cohort_analysis: `-- Cohort: Erster vs. Letzter Event\nSELECT user_id,\n       MIN(ts) AS first_seen,\n       MAX(ts) AS last_seen,\n       COUNT(*) AS total_events,\n       DATEDIFF('HOURS', MIN(ts), MAX(ts)) AS session_hours\nFROM events\nGROUP BY user_id\nORDER BY session_hours DESC;`,
+      cohort_analysis: `-- Cohort: Erster vs. Letzter Event\nSELECT user_id,\n       MIN(ts) AS first_seen,\n       MAX(ts) AS last_seen,\n       COUNT(*) AS total_events,\n       TIMESTAMPDIFF('HOURS', MIN(ts), MAX(ts)) AS session_hours\nFROM events\nGROUP BY user_id\nORDER BY session_hours DESC;`,
       revenue_analysis: `-- Revenue: Analyse nach Datum\nSELECT LEFT(o.id, 1) AS period,  -- Pseudo-Monat\n       COUNT(*) AS orders,\n       SUM(amount) AS revenue,\n       AVG(amount) AS avg_order_value,\n       COUNT(DISTINCT user_id) AS unique_customers\nFROM orders o\nWHERE status = 'PAID'\nGROUP BY LEFT(o.id, 1)\nORDER BY period;`,
       user_activity: `-- Activity: Event-Häufigkeit\nSELECT JSON_GET(data, 'type') AS event_type,\n       COUNT(*) AS frequency,\n       COUNT(DISTINCT user_id) AS unique_users,\n       MIN(ts) AS first_occurrence,\n       MAX(ts) AS last_occurrence\nFROM events\nGROUP BY JSON_GET(data, 'type')\nORDER BY frequency DESC;`,
 

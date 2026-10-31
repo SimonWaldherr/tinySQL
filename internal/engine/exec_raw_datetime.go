@@ -17,10 +17,6 @@ func rawDateCallNeedsOrder(ex *FuncCall) bool {
 		}
 		literal, ok := ex.Args[0].(*Literal)
 		return !ok || literal.Val == nil
-	case "DATEDIFF":
-		if len(ex.Args) != 3 {
-			return true
-		}
 	case "EXTRACT", "DATE_TRUNC":
 		if len(ex.Args) != 2 {
 			return true
@@ -43,7 +39,7 @@ func rawDateCallNeedsOrder(ex *FuncCall) bool {
 		}
 	}
 	switch ex.Name {
-	case "DATEDIFF", "EXTRACT", "DATE_TRUNC":
+	case "EXTRACT", "DATE_TRUNC":
 		literal, ok := ex.Args[0].(*Literal)
 		if !ok {
 			return true
@@ -83,10 +79,6 @@ func evalRawDateFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, 
 		}
 	case "DATE_ADD", "DATE_SUB":
 		if len(ex.Args) != 2 && len(ex.Args) != 3 {
-			return evalFuncCall(env, ex, rawEmptyRow)
-		}
-	case "DATEDIFF":
-		if len(ex.Args) != 3 {
 			return evalFuncCall(env, ex, rawEmptyRow)
 		}
 	case "OVERLAPS":
@@ -133,15 +125,6 @@ func evalRawDateFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, 
 		case "STRFTIME":
 			if i == 0 && value == nil {
 				return nil, nil
-			}
-		case "DATEDIFF":
-			if i == 0 {
-				if value == nil {
-					return nil, nil
-				}
-				if _, ok := value.(string); !ok {
-					return nil, fmt.Errorf("DATEDIFF unit must be a string")
-				}
 			}
 		case "EXTRACT", "DATE_TRUNC":
 			if i == 0 {

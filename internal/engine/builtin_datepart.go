@@ -45,6 +45,8 @@ func evalDatePartCall(ex *FuncCall, eval func(Expr) (any, error)) (any, error) {
 		// Fixed Sunday-first weeks, with January 1 always in week 1.
 		jan1 := time.Date(date.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
 		return (date.YearDay()-1+int(jan1.Weekday()))/7 + 1, nil
+	case "ISO_WEEKDAY", "ISODOW":
+		return (int(date.Weekday())+6)%7 + 1, nil
 	case "WEEKDAY", "DW":
 		return int(date.Weekday()) + 1, nil
 	case "HOUR", "HH":

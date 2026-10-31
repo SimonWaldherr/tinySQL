@@ -453,7 +453,7 @@ SELECT
     'table' AS component,
     '' AS title,
     'DATEDIFF(unit, d1, d2)' AS function,
-    'Returns difference between dates' AS description,
+    'Counts crossed UTC calendar boundaries; use TIMESTAMPDIFF for complete elapsed units' AS description,
     'SELECT DATEDIFF(''DAYS'', ''2024-01-01'', NOW())' AS example
 FROM ui_context
 UNION ALL

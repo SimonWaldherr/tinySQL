@@ -331,7 +331,7 @@ func evalRawFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, erro
 	// through the argument-wrapper pool below evaluates discarded branches
 	// and can raise errors that their ordinary handlers would never reach.
 	switch ex.Name {
-	case "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "DAYOFWEEK", "DAYOFYEAR", "WEEKOFYEAR", "QUARTER":
+	case "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "DAYOFWEEK", "DAYOFYEAR", "WEEKOFYEAR", "QUARTER", "ISODOW":
 		return evalDateComponent(ex.Name, ex.Args, func(arg Expr) (any, error) {
 			return evalRawExpr(plan, raw, arg)
 		})
@@ -341,6 +341,10 @@ func evalRawFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, erro
 		})
 	case "CONVERT", "TRY_CONVERT":
 		return evalConvertCall(ex, func(arg Expr) (any, error) {
+			return evalRawExpr(plan, raw, arg)
+		})
+	case "DATEDIFF", "TIMESTAMPDIFF":
+		return evalDateDiffCall(ex, func(arg Expr) (any, error) {
 			return evalRawExpr(plan, raw, arg)
 		})
 	case "DATEPART":
@@ -362,7 +366,7 @@ func evalRawFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, erro
 		}
 		return evalFuncCall(ExecEnv{now: plan.now}, ex, rawEmptyRow)
 	case "DATE", "TIME", "DATETIME", "JULIANDAY", "UNIXEPOCH", "STRFTIME",
-		"DATE_ADD", "DATE_SUB", "DATEADD", "DATESUB", "DATEDIFF", "OVERLAPS", "EXTRACT", "DATE_TRUNC", "EOMONTH", "ADD_MONTHS":
+		"DATE_ADD", "DATE_SUB", "DATEADD", "DATESUB", "OVERLAPS", "EXTRACT", "DATE_TRUNC", "EOMONTH", "ADD_MONTHS":
 		if rawDateCallNeedsOrder(ex) {
 			return evalRawDateFuncCall(plan, raw, ex)
 		}
