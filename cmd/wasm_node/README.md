@@ -64,6 +64,12 @@ for `global.tinySQL`. The runner is a CLI helper, not a CommonJS module.
 - For the browser variant see [`../wasm_browser/`](../wasm_browser/).
 
 The Node build shares the browser build's adaptive result-transfer bridge.
-Large primitive result sets use a single JSON transfer internally; callers still
-receive native JavaScript objects. Small responses and values requiring special
-conversion retain the direct path.
+Large primitive results use bounded JSON blocks internally; callers still
+receive native JavaScript objects. Blocks contain at most 1,024 rows with a
+conservative 256 KiB encoded-row budget. Special values and oversized rows use
+direct conversion without disabling batching for neighboring rows.
+
+Queries remain synchronous and fully materialized. Use SQL projections and
+`LIMIT` to control result memory. See
+[WASM result performance](../../docs/wasm-result-performance.md) for measurements,
+benchmark commands and compatibility guarantees.

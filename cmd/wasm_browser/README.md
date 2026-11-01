@@ -74,9 +74,18 @@ load the gzip companion through DecompressionStream when possible; other
 browsers and already-compressing hosts fall back to the uncompressed module.
 
 Browser and Node builds use an adaptive result bridge: larger JSON-compatible
-primitive result sets cross the WASM boundary as one JSON payload, while small
-or special values retain direct conversion. Callers receive the same JavaScript
-response shape either way. Set window.tinySQLWasmDebug to true before loading
-the module to enable diagnostic logs.
+primitive results cross the WASM boundary in blocks of at most 1,024 rows and a
+conservative 256 KiB encoded-row budget. Small results keep a single transfer.
+Special values and oversized rows use direct conversion; neighboring blocks
+still use the fast path. Callers receive the same native JavaScript response
+shape. Set window.tinySQLWasmDebug to true before loading the module to enable
+diagnostic logs.
+
+The synchronous `query()` API still materializes the complete result. Blocks
+limit temporary JSON buffers, not database or result memory. Use SQL `LIMIT` and
+projections to reduce large responses, or the worker-based
+[query_files_wasm app](../query_files_wasm/README.md) for a responsive UI.
+See [WASM result performance](../../docs/wasm-result-performance.md) for benchmark
+commands and compatibility guarantees.
 
 For Node.js, see [wasm_node](../wasm_node/README.md).

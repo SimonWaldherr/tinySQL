@@ -5,13 +5,18 @@ const assert = require('node:assert/strict');
 const path = require('path');
 const { performance } = require('perf_hooks');
 
+globalThis.crypto ||= require('node:crypto').webcrypto;
 require(process.env.WASM_EXEC_JS || './web/wasm_exec.js');
 
 const wasmPath = path.resolve(process.argv[2] || './web/tinySQL.wasm');
 const iterations = Number.parseInt(process.argv[3] || '1000', 10);
+const tableRows = Number.parseInt(process.argv[4] || '200', 10);
 
 if (!Number.isInteger(iterations) || iterations < 1) {
   throw new Error('iterations must be a positive integer');
+}
+if (!Number.isInteger(tableRows) || tableRows < 200) {
+  throw new Error('tableRows must be an integer of at least 200');
 }
 
 function parse(response) {
@@ -92,9 +97,14 @@ async function main() {
   const db = await loadTinySQL();
   assertSuccess(db.open('mem://?tenant=benchmark'), 'open');
   assertSuccess(db.exec('CREATE TABLE users (id INT PRIMARY KEY, name TEXT, active BOOL)'), 'create');
-  for (let id = 0; id < 200; id++) {
+
+  for (let offset = 0; offset < tableRows; offset += 256) {
+    const values = Array.from({ length: Math.min(256, tableRows - offset) }, (_, index) => {
+      const id = offset + index;
+      return `(${id}, 'user_${id}', ${id % 2 === 0})`;
+    });
     assertSuccess(
-      db.exec(`INSERT INTO users VALUES (${id}, 'user_${id}', ${id % 2 === 0})`),
+      db.exec(`INSERT INTO users VALUES ${values.join(',')}`),
       'insert',
     );
   }
@@ -102,12 +112,13 @@ async function main() {
   // Validate cell values as well as row counts before measuring transfer speed.
   const full = assertSuccess(db.query('SELECT id, name, active FROM users ORDER BY id'), 'verify full result');
   assert.deepEqual(full.columns, ['id', 'name', 'active']);
-  assert.deepEqual(full.rows, Array.from({ length: 200 }, (_, id) => [id, `user_${id}`, id % 2 === 0]));
+  assert.deepEqual(full.rows, Array.from({ length: tableRows }, (_, id) => [id, `user_${id}`, id % 2 === 0]));
   const empty = assertSuccess(db.query('SELECT id FROM users WHERE id = -1'), 'verify empty result');
   assert.deepEqual(empty.rows, []);
 
   console.log(JSON.stringify({
     wasm: wasmPath,
+    tableRows,
     results: [
       benchmarkQuery(db, 'constant', 'SELECT 1 AS n, \'hello\' AS greeting'),
       benchmarkQuery(

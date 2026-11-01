@@ -312,18 +312,17 @@ func jsQuery(this js.Value, args []js.Value) any {
 	}
 
 	// Prepare result rows
-	rows := make([][]any, 0, len(resultSet.Rows))
+	rows := wasmbridge.MakeRows(len(resultSet.Rows), len(resultSet.Cols))
 
 	lowerColumns := make([]string, len(resultSet.Cols))
 	for i, column := range resultSet.Cols {
 		lowerColumns[i] = strings.ToLower(column)
 	}
-	for _, sourceRow := range resultSet.Rows {
-		row := make([]any, len(resultSet.Cols))
+	for rowIndex, sourceRow := range resultSet.Rows {
+		row := rows[rowIndex]
 		for i, column := range lowerColumns {
 			row[i] = convertValue(sourceRow[column])
 		}
-		rows = append(rows, row)
 	}
 
 	count := len(rows)

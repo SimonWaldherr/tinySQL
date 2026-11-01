@@ -31,6 +31,21 @@ async function main() {
   assert.deepEqual(result.columns, ['id', 'label', 'active']);
   assert.deepEqual(result.rows, expected); // Exercises the bulk result bridge.
   assert.deepEqual(success(db.query('SELECT id FROM items WHERE id = -1')).rows, []);
+  // Cross multiple result-transfer blocks, including the small/large boundary.
+  success(db.exec('CREATE TABLE bulk_transfer (id INT, label TEXT, active BOOL)'));
+  const bulkExpected = Array.from({ length: 5003 }, (_, id) => [id, `é漢🙂<&_${id}`, id % 2 === 0]);
+  for (let offset = 0; offset < bulkExpected.length; offset += 500) {
+    const values = bulkExpected.slice(offset, offset + 500)
+      .map(([id, label, active]) => `(${id}, '${label}', ${active})`).join(',');
+    success(db.exec(`INSERT INTO bulk_transfer VALUES ${values}`));
+  }
+  for (const limit of [31, 32, 1023, 1024, 1025, bulkExpected.length]) {
+    const bulk = success(db.query(`SELECT id, label, active FROM bulk_transfer LIMIT ${limit}`));
+    assert.deepEqual(bulk.columns, ['id', 'label', 'active']);
+    assert.deepEqual(bulk.rows, bulkExpected.slice(0, limit));
+    assert.equal(bulk.count, limit);
+    assert.equal(typeof bulk.elapsed_ms, 'number');
+  }
   const contracts = JSON.parse(fs.readFileSync(path.join(__dirname,
     '../internal/engine/testdata/sql_semantics.json'), 'utf8'));
   for (const sql of contracts.setup) success(db.exec(sql));
