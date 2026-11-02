@@ -1591,6 +1591,34 @@ func TestBeautifySQLSeparatesBlockComments(t *testing.T) {
 	}
 }
 
+// Two-character operators were dropped by the tokenizer, so "a >= 5" lost its
+// operator entirely and the formatted statement meant something else.
+func TestSQLFormatKeepsMultiCharOperators(t *testing.T) {
+	const in = "select a from t where a >= 5 and b<>3 and c!=1 and d<=2 and e||f = 'x'"
+	for _, op := range []string{">=", "<>", "!=", "<=", "||"} {
+		if got := BeautifySQL(in); !strings.Contains(got, op) {
+			t.Errorf("BeautifySQL dropped %q: %q", op, got)
+		}
+		if got := MinifySQL(in); !strings.Contains(got, op) {
+			t.Errorf("MinifySQL dropped %q: %q", op, got)
+		}
+	}
+	want := "SELECT a\nFROM t\nWHERE a >= 5\nAND b <> 3\nAND c != 1\nAND d <= 2\nAND e || f = 'x'"
+	if got := BeautifySQL(in); got != want {
+		t.Errorf("BeautifySQL() = %q, want %q", got, want)
+	}
+}
+
+// "a - -1" must not minify to "a--1", where "--" starts a comment.
+func TestMinifySQLDoesNotFuseOperatorsIntoComments(t *testing.T) {
+	if got := MinifySQL("SELECT 5 - -1"); strings.Contains(got, "--") {
+		t.Errorf("MinifySQL created a comment opener: %q", got)
+	}
+	if got := MinifySQL("SELECT 6 / /* c */ 2"); !strings.Contains(got, "/ /*") {
+		t.Errorf("MinifySQL lost the separator before a block comment: %q", got)
+	}
+}
+
 func BenchmarkBeautifySQL(b *testing.B) {
 	sql := "SELECT id, name, email FROM users WHERE active = true AND age > 25 ORDER BY name"
 	for i := 0; i < b.N; i++ {

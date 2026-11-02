@@ -556,6 +556,7 @@ func sqlFormatTokens(sql string) []string {
 			if (c1 == '<' || c1 == '>' || c1 == '!' || c1 == '=' || c1 == '|' || c1 == '&') &&
 				(c2 == '=' || c2 == '<' || c2 == '>' || c2 == '|' || c2 == '&') {
 				i += 2
+				tokens = append(tokens, sql[start:i])
 				continue
 			}
 		}
@@ -587,6 +588,10 @@ func needsSQLSeparator(left, right string) bool {
 		return true
 	}
 	ln := len(left) - 1
+	// Adjacent operator characters must not fuse into a comment opener.
+	if (left[ln] == '-' && right[0] == '-') || (left[ln] == '/' && right[0] == '*') {
+		return true
+	}
 	leftWord := isSQLWord(left[ln])
 	leftQuote := left[ln] == '\'' || left[ln] == '"' || left[ln] == '`' || left[ln] == ']'
 	rightWord := isSQLWord(right[0])
