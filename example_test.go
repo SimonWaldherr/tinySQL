@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -1663,4 +1664,438 @@ func TestTimestampDiffAndTimeAggregation(t *testing.T) {
 	}
 
 	t.Log("✅ TIMESTAMPDIFF with GROUP BY and time aggregation test completed successfully!")
+}
+
+// --- EXISTS ---
+
+// existsExampleDB contains the minimal setup and execution helpers for the
+// fluent EXISTS example.
+type existsExampleDB struct {
+	db  *tsql.DB
+	ctx context.Context
+}
+
+func (e existsExampleDB) execute(sql string) *tsql.ResultSet {
+	stmt, err := tsql.ParseSQL(sql)
+	if err != nil {
+		panic(err)
+	}
+	rs, err := tsql.Execute(e.ctx, e.db, "default", stmt)
+	if err != nil {
+		panic(err)
+	}
+	return rs
+}
+
+func ExampleExists() {
+	example := existsExampleDB{db: tsql.NewDB(), ctx: context.Background()}
+	example.execute("CREATE TABLE items (id INT, name TEXT)")
+	example.execute("CREATE TABLE tags (item_id INT)")
+	example.execute("INSERT INTO items VALUES (1, 'Ada'), (2, 'Linus')")
+	example.execute("INSERT INTO tags VALUES (1)")
+
+	query := tsql.Select(tsql.Col("name")).
+		From("items").
+		Where(tsql.Exists(tsql.SelectStar().From("tags"))).
+		Build()
+	results, err := tsql.Execute(example.ctx, example.db, "default", query)
+	if err != nil {
+		panic(err)
+	}
+	for _, row := range results.Rows {
+		fmt.Println(row["name"])
+	}
+
+	// Output:
+	// Ada
+	// Linus
+}
+
+// --- View dependencies ---
+
+// dependencyExampleDB keeps the example focused on view dependencies instead
+// of repeating the parse-and-execute plumbing for every SQL statement.
+type dependencyExampleDB struct {
+	db  *tsql.DB
+	ctx context.Context
+}
+
+func (e dependencyExampleDB) execute(sql string) *tsql.ResultSet {
+	stmt, err := tsql.ParseSQL(sql)
+	if err != nil {
+		panic(err)
+	}
+	rs, err := tsql.Execute(e.ctx, e.db, "default", stmt)
+	if err != nil {
+		panic(err)
+	}
+	return rs
+}
+
+func Example_viewDependencies() {
+	example := dependencyExampleDB{db: tsql.NewDB(), ctx: context.Background()}
+	example.execute("CREATE TABLE customers (id INT, active BOOL)")
+	example.execute("CREATE TABLE orders (customer_id INT, amount INT)")
+	example.execute(`
+		CREATE VIEW active_customer_orders AS
+		SELECT orders.amount
+		FROM orders JOIN customers ON orders.customer_id = customers.id
+		WHERE customers.active = true
+	`)
+
+	rs := example.execute(`
+		SELECT depends_on_name
+		FROM sys.dependencies
+		WHERE object_name = 'active_customer_orders'
+		ORDER BY depends_on_name
+	`)
+	for _, row := range rs.Rows {
+		fmt.Println(row["depends_on_name"])
+	}
+
+	// Output:
+	// customers
+	// orders
+}
+
+// --- Views ---
+
+func Example_viewsAndMaterializedViews() {
+	db := tsql.NewDB()
+	ctx := context.Background()
+
+	execSQL := func(sql string) {
+		stmt, err := tsql.ParseSQL(sql)
+		if err != nil {
+			panic(err)
+		}
+		if _, err := tsql.Execute(ctx, db, "default", stmt); err != nil {
+			panic(err)
+		}
+	}
+	querySQL := func(sql string) any {
+		stmt, err := tsql.ParseSQL(sql)
+		if err != nil {
+			panic(err)
+		}
+		rs, err := tsql.Execute(ctx, db, "default", stmt)
+		if err != nil {
+			panic(err)
+		}
+		return rs.Rows[0]["total"]
+	}
+
+	execSQL("CREATE TABLE orders (customer_id INT, amount INT, status TEXT)")
+	execSQL("INSERT INTO orders VALUES (1, 10, 'paid'), (1, 4, 'open'), (2, 7, 'paid')")
+
+	execSQL(`
+		CREATE VIEW paid_customer_totals AS
+		WITH paid_orders AS (
+			SELECT customer_id, amount FROM orders WHERE status = 'paid'
+		)
+		SELECT customer_id, SUM(amount) AS total
+		FROM paid_orders
+		GROUP BY customer_id
+	`)
+	fmt.Printf("view: %v\n", querySQL("SELECT total FROM paid_customer_totals WHERE customer_id = 1"))
+
+	execSQL(`
+		CREATE MATERIALIZED VIEW paid_customer_totals_mv AS
+		WITH paid_orders AS (
+			SELECT customer_id, amount FROM orders WHERE status = 'paid'
+		)
+		SELECT customer_id, SUM(amount) AS total
+		FROM paid_orders
+		GROUP BY customer_id
+		WITH DATA
+	`)
+
+	execSQL("INSERT INTO orders VALUES (1, 5, 'paid')")
+	fmt.Printf("materialized before refresh: %v\n", querySQL("SELECT total FROM paid_customer_totals_mv WHERE customer_id = 1"))
+
+	execSQL("REFRESH MATERIALIZED VIEW paid_customer_totals_mv")
+	fmt.Printf("materialized after refresh: %v\n", querySQL("SELECT total FROM paid_customer_totals_mv WHERE customer_id = 1"))
+
+	execSQL("ALTER MATERIALIZED VIEW paid_customer_totals_mv TO VIEW")
+	execSQL("INSERT INTO orders VALUES (1, 2, 'paid')")
+	fmt.Printf("converted view: %v\n", querySQL("SELECT total FROM paid_customer_totals_mv WHERE customer_id = 1"))
+
+	// Output:
+	// view: 10
+	// materialized before refresh: 10
+	// materialized after refresh: 15
+	// converted view: 17
+}
+
+// --- Import ---
+
+// ExampleImportCSV demonstrates importing a CSV file into tinySQL.
+func ExampleImportCSV() {
+	ctx := context.Background()
+	db := tsql.NewDB()
+
+	// Sample CSV data
+	csvData := `id,name,age,active
+1,Alice,30,true
+2,Bob,25,false
+3,Charlie,35,true`
+
+	// Import CSV data
+	result, err := tsql.ImportCSV(ctx, db, "default", "users",
+		strings.NewReader(csvData), &tsql.ImportOptions{
+			CreateTable:   true,
+			TypeInference: true,
+			HeaderMode:    "present",
+		})
+
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Imported %d rows into table with columns: %v\n",
+		result.RowsInserted, result.ColumnNames)
+	fmt.Printf("Detected types: %v\n", result.ColumnTypes)
+
+	// Query the imported data
+	stmt, _ := tsql.ParseSQL("SELECT name, age FROM users WHERE active = true ORDER BY age")
+	rs, _ := tsql.Execute(ctx, db, "default", stmt)
+
+	for _, row := range rs.Rows {
+		fmt.Printf("Name: %v, Age: %v\n", row["name"], row["age"])
+	}
+
+	// Output:
+	// Imported 3 rows into table with columns: [id name age active]
+	// Detected types: [INT TEXT INT BOOL]
+	// Name: Alice, Age: 30
+	// Name: Charlie, Age: 35
+}
+
+// ExampleImportJSON demonstrates importing JSON data into tinySQL.
+func ExampleImportJSON() {
+	ctx := context.Background()
+	db := tsql.NewDB()
+
+	// Sample JSON data
+	jsonData := `[
+		{"id": 1, "product": "Laptop", "price": 999.99, "in_stock": true},
+		{"id": 2, "product": "Mouse", "price": 29.99, "in_stock": true},
+		{"id": 3, "product": "Keyboard", "price": 79.99, "in_stock": false}
+	]`
+
+	// Import JSON data
+	result, err := tsql.ImportJSON(ctx, db, "default", "products",
+		strings.NewReader(jsonData), &tsql.ImportOptions{
+			CreateTable:   true,
+			TypeInference: true,
+		})
+
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Imported %d rows\n", result.RowsInserted)
+
+	// Query the imported data
+	stmt, _ := tsql.ParseSQL("SELECT product, price FROM products WHERE in_stock = true")
+	rs, _ := tsql.Execute(ctx, db, "default", stmt)
+
+	for _, row := range rs.Rows {
+		fmt.Printf("%v: $%v\n", row["product"], row["price"])
+	}
+
+	// Output:
+	// Imported 3 rows
+	// Laptop: $999.99
+	// Mouse: $29.99
+}
+
+// ExampleImportFile demonstrates importing a file with format auto-detection.
+func ExampleImportFile() {
+	ctx := context.Background()
+	db := tsql.NewDB()
+
+	// Create a temporary CSV file
+	tmpFile, _ := os.CreateTemp("", "example-*.csv")
+	defer os.Remove(tmpFile.Name())
+
+	csvContent := `date,temperature,humidity
+2024-01-01,72.5,45
+2024-01-02,73.2,48
+2024-01-03,71.8,52`
+
+	tmpFile.WriteString(csvContent)
+	tmpFile.Close()
+
+	// Import the file (format auto-detected from extension)
+	result, err := tsql.ImportFile(ctx, db, "default", "weather",
+		tmpFile.Name(), nil) // nil uses default options
+
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Imported %d rows\n", result.RowsInserted)
+	fmt.Printf("Delimiter: %q, Header: %v\n", result.Delimiter, result.HadHeader)
+
+	// Query with aggregation
+	stmt, _ := tsql.ParseSQL("SELECT COUNT(*) as row_count, AVG(temperature) as avg_temp FROM weather")
+	rs, _ := tsql.Execute(ctx, db, "default", stmt)
+
+	if len(rs.Rows) > 0 {
+		fmt.Printf("Count: %v rows, Average temperature: %.2f°F\n",
+			rs.Rows[0]["row_count"], rs.Rows[0]["avg_temp"])
+	}
+
+	// Output:
+	// Imported 3 rows
+	// Delimiter: ',', Header: true
+	// Count: 3 rows, Average temperature: 72.50°F
+}
+
+// ExampleOpenFile demonstrates the convenience function for opening and querying files.
+func ExampleOpenFile() {
+	ctx := context.Background()
+
+	// Create a temporary TSV file
+	tmpFile, _ := os.CreateTemp("", "data-*.tsv")
+	defer os.Remove(tmpFile.Name())
+
+	tsvContent := "city\tpopulation\tcountry\n"
+	tsvContent += "Tokyo\t37400000\tJapan\n"
+	tsvContent += "Delhi\t31400000\tIndia\n"
+	tsvContent += "Shanghai\t27800000\tChina\n"
+
+	tmpFile.WriteString(tsvContent)
+	tmpFile.Close()
+
+	// Open file directly (creates DB and imports in one step)
+	db, tableName, err := tsql.OpenFile(ctx, tmpFile.Name(), &tsql.ImportOptions{
+		HeaderMode: "present", // Explicitly mark header present for TSV
+	})
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Opened file into table: data\n")
+
+	// Query immediately - use simple count since column names may be sanitized
+	query := fmt.Sprintf("SELECT COUNT(*) as total FROM %s", tableName)
+	stmt, _ := tsql.ParseSQL(query)
+	rs, err2 := tsql.Execute(ctx, db, "default", stmt)
+	if err2 != nil {
+		fmt.Printf("Query error: %v\n", err2)
+		return
+	}
+
+	if len(rs.Rows) > 0 {
+		fmt.Printf("Total cities: %v\n", rs.Rows[0]["total"])
+	}
+
+	// Output:
+	// Opened file into table: data
+	// Total cities: 3
+}
+
+// ExampleImportOptions demonstrates various import configuration options.
+func ExampleImportOptions() {
+	ctx := context.Background()
+	db := tsql.NewDB()
+
+	// CSV with custom options
+	csvData := `name;score;grade
+Alice;95.5;A
+Bob;87.3;B
+Charlie;92.1;A`
+
+	result, _ := tsql.ImportCSV(ctx, db, "default", "students",
+		strings.NewReader(csvData), &tsql.ImportOptions{
+			CreateTable:         true,
+			TypeInference:       true,
+			HeaderMode:          "present",
+			DelimiterCandidates: []rune{';'}, // Force semicolon delimiter
+			BatchSize:           100,
+			NullLiterals:        []string{"", "NULL", "N/A"},
+		})
+
+	fmt.Printf("Imported %d rows using delimiter '%c'\n",
+		result.RowsInserted, result.Delimiter)
+	fmt.Printf("Columns: %v\n", result.ColumnNames)
+	// Note: Type names may vary (Float64Type vs FloatType)
+	fmt.Printf("Has %d columns with types detected\n", len(result.ColumnTypes))
+
+	// Output:
+	// Imported 3 rows using delimiter ';'
+	// Columns: [name score grade]
+	// Has 3 columns with types detected
+}
+
+// ExampleImportCSV_compressed demonstrates importing gzip-compressed CSV files.
+func ExampleImportCSV_compressed() {
+	ctx := context.Background()
+	db := tsql.NewDB()
+
+	// In real usage, you would use a .csv.gz file
+	// This example shows the API for when you have compressed data
+
+	csvData := `id,value
+1,100
+2,200
+3,300`
+
+	// Import (gzip detection is automatic)
+	result, _ := tsql.ImportCSV(ctx, db, "default", "data",
+		strings.NewReader(csvData), nil)
+
+	fmt.Printf("Imported %d rows with encoding: %s\n",
+		result.RowsInserted, result.Encoding)
+
+	// Output:
+	// Imported 3 rows with encoding: utf-8
+}
+
+func ExampleImportFile_xml() {
+	dir, err := os.MkdirTemp("", "tinysql-import-example-*")
+	if err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(dir)
+
+	file := filepath.Join(dir, "people.xml")
+	data := `<root><record id="1" name="Alice"/><record id="2" name="Bob"/></root>`
+	if err := os.WriteFile(file, []byte(data), 0600); err != nil {
+		panic(err)
+	}
+
+	db := tsql.NewDB()
+	result, err := tsql.ImportFile(context.Background(), db, "default", "people", file,
+		&tsql.ImportOptions{CreateTable: true, TypeInference: true})
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println(result.RowsInserted)
+	// Output: 2
+}
+
+// --- SQL formatting ---
+
+func ExampleBeautifySQL() {
+	query := "select id,name from users where status = 'active' and id=42"
+
+	fmt.Println(tsql.BeautifySQL(query))
+	fmt.Println("---")
+	fmt.Println(tsql.MinifySQL(query))
+
+	// Output:
+	// SELECT id, name
+	// FROM users
+	// WHERE status = 'active'
+	// AND id = 42
+	// ---
+	// select id,name from users where status='active' and id=42
 }

@@ -18,7 +18,7 @@ the [storage guide](storage-guide.md); for retrieval applications, start with th
 | Python application | [Python package](../bindings/python/README.md) | A DB-API 2.0 connection for scripts, notebooks and services. |
 | C, C++ or another FFI host | [C ABI](../bindings/c/README.md) | Any language that can call C functions and parse JSON. |
 
-Reference implementations live in `example_test.go`, `import_example_test.go`,
+Reference implementations live in `example_test.go`,
 `cmd/demo`, `cmd/ragdemo`, `cmd/query_files_wasm`, `cmd/wasm_browser`, and
 [`demos/sql/showcase.sql`](../demos/sql/showcase.sql).
 
@@ -149,8 +149,8 @@ writes should normally share that transaction.
 
 Keep extensions on public APIs: register custom table-valued functions with
 `tinysql.RegisterExternalTableFunc`. Use `ImportCSV`, `ImportJSON`, `ImportFile`,
-or `OpenFile` for file ingestion; `import_example_test.go` shows options for
-table creation, type inference, and headers.
+or `OpenFile` for file ingestion; the import examples in `example_test.go` show
+options for table creation, type inference, and headers.
 
 ## Browser and WebAssembly
 
