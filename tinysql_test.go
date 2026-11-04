@@ -3,6 +3,7 @@ package tinysql
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -1107,6 +1108,834 @@ func TestDistinctOnAndWindowFunctions(t *testing.T) {
 		} else {
 			if prev == nil || prev.(int) != expPrev[i].(int) {
 				t.Fatalf("unexpected prev at row %d: got %#v want %#v", i, prev, expPrev[i])
+			}
+		}
+	}
+}
+
+// --- Bare tables ---
+
+func TestBareTableNameSelectsAllRows(t *testing.T) {
+	ctx := context.Background()
+	db := NewDB()
+	t.Cleanup(func() { _ = db.Close() })
+
+	for _, query := range []string{
+		"CREATE TABLE users (id INT, name TEXT)",
+		"INSERT INTO users VALUES (1, 'Alice')",
+		"INSERT INTO users VALUES (2, 'Bob')",
+	} {
+		stmt, err := ParseSQL(query)
+		if err != nil {
+			t.Fatalf("parse %q: %v", query, err)
+		}
+		if _, err := Execute(ctx, db, "default", stmt); err != nil {
+			t.Fatalf("execute %q: %v", query, err)
+		}
+	}
+
+	stmt, err := ParseSQL("users")
+	if err != nil {
+		t.Fatalf("parse bare table name: %v", err)
+	}
+	rs, err := Execute(ctx, db, "default", stmt)
+	if err != nil {
+		t.Fatalf("execute bare table name: %v", err)
+	}
+	if len(rs.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rs.Rows))
+	}
+	if got, ok := GetVal(rs.Rows[0], "name"); !ok || got != "Alice" {
+		t.Fatalf("expected first name Alice, got %v (ok=%v)", got, ok)
+	}
+}
+
+func TestBareQuotedTableNameSelectsAllRows(t *testing.T) {
+	ctx := context.Background()
+	db := NewDB()
+	t.Cleanup(func() { _ = db.Close() })
+
+	for _, query := range []string{
+		`CREATE TABLE "order" (id INT)`,
+		`INSERT INTO "order" VALUES (7)`,
+	} {
+		stmt, err := ParseSQL(query)
+		if err != nil {
+			t.Fatalf("parse %q: %v", query, err)
+		}
+		if _, err := Execute(ctx, db, "default", stmt); err != nil {
+			t.Fatalf("execute %q: %v", query, err)
+		}
+	}
+
+	stmt, err := ParseSQL(`"order";`)
+	if err != nil {
+		t.Fatalf("parse quoted bare table name: %v", err)
+	}
+	rs, err := Execute(ctx, db, "default", stmt)
+	if err != nil {
+		t.Fatalf("execute quoted bare table name: %v", err)
+	}
+	if len(rs.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rs.Rows))
+	}
+	if got, ok := GetVal(rs.Rows[0], "id"); !ok || got != 7 {
+		t.Fatalf("expected id 7, got %v (ok=%v)", got, ok)
+	}
+}
+
+func TestBareKeywordTableNameSelectsAllRows(t *testing.T) {
+	ctx := context.Background()
+	db := NewDB()
+	t.Cleanup(func() { _ = db.Close() })
+
+	for _, query := range []string{
+		"CREATE TABLE order (id INT)",
+		"INSERT INTO order VALUES (3)",
+	} {
+		stmt, err := ParseSQL(query)
+		if err != nil {
+			t.Fatalf("parse %q: %v", query, err)
+		}
+		if _, err := Execute(ctx, db, "default", stmt); err != nil {
+			t.Fatalf("execute %q: %v", query, err)
+		}
+	}
+
+	stmt, err := ParseSQL("order")
+	if err != nil {
+		t.Fatalf("parse bare keyword table name: %v", err)
+	}
+	rs, err := Execute(ctx, db, "default", stmt)
+	if err != nil {
+		t.Fatalf("execute bare keyword table name: %v", err)
+	}
+	if len(rs.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rs.Rows))
+	}
+	if got, ok := GetVal(rs.Rows[0], "id"); !ok || got != 3 {
+		t.Fatalf("expected id 3, got %v (ok=%v)", got, ok)
+	}
+}
+
+func TestBareTableNameRejectsExtraTokens(t *testing.T) {
+	if _, err := ParseSQL("users where id = 1"); err == nil {
+		t.Fatal("expected parse error for bare table name with extra tokens")
+	}
+}
+
+// --- WHERE features ---
+
+// execQuery is a helper that parses and executes a single SQL string.
+func execQuery(t *testing.T, ctx context.Context, db *storage.DB, sql string) *engine.ResultSet {
+	t.Helper()
+	p := engine.NewParser(sql)
+	st, err := p.ParseStatement()
+	if err != nil {
+		t.Fatalf("parse %q: %v", sql, err)
+	}
+	rs, err := engine.Execute(ctx, db, "default", st)
+	if err != nil {
+		t.Fatalf("execute %q: %v", sql, err)
+	}
+	return rs
+}
+
+// setupWhereDB creates a fresh DB with a small table used by WHERE feature tests.
+func setupWhereDB(t *testing.T) (*storage.DB, context.Context) {
+	t.Helper()
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	for _, sql := range []string{
+		`CREATE TABLE words (id INT, word TEXT, score INT)`,
+		`INSERT INTO words VALUES (1,  'apple',   10)`,
+		`INSERT INTO words VALUES (2,  'Apricot',  20)`,
+		`INSERT INTO words VALUES (3,  'banana',  30)`,
+		`INSERT INTO words VALUES (4,  'blueberry', 40)`,
+		`INSERT INTO words VALUES (5,  'cherry',  50)`,
+		`INSERT INTO words VALUES (6,  'Cherry',  60)`,
+		`INSERT INTO words VALUES (7,  'date',    70)`,
+		`INSERT INTO words VALUES (8,  'elderberry', 80)`,
+		`INSERT INTO words VALUES (9,  'fig',     90)`,
+		`INSERT INTO words VALUES (10, 'grape',   100)`,
+	} {
+		execQuery(t, ctx, db, sql)
+	}
+	return db, ctx
+}
+
+// TestILIKE verifies case-insensitive LIKE matching.
+func TestILIKE(t *testing.T) {
+	db, ctx := setupWhereDB(t)
+
+	t.Run("basic match", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT word FROM words WHERE word ILIKE 'cherry'`)
+		if len(rs.Rows) != 2 {
+			t.Fatalf("expected 2 rows (cherry, Cherry), got %d", len(rs.Rows))
+		}
+	})
+
+	t.Run("prefix wildcard", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT word FROM words WHERE word ILIKE 'ap%'`)
+		if len(rs.Rows) != 2 {
+			t.Fatalf("expected 2 rows (apple, Apricot), got %d", len(rs.Rows))
+		}
+	})
+
+	t.Run("suffix wildcard", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT word FROM words WHERE word ILIKE '%berry'`)
+		// blueberry, elderberry (cherry ends in 'erry' not 'berry')
+		if len(rs.Rows) != 2 {
+			t.Fatalf("expected 2 rows (*berry), got %d: %v", len(rs.Rows), rs.Rows)
+		}
+	})
+
+	t.Run("NOT ILIKE", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT word FROM words WHERE word NOT ILIKE '%e%'`)
+		// words without 'e' or 'E' (case-insensitive):
+		// apple has 'e', Apricot no 'e', banana no, blueberry has 'e', cherry has 'e',
+		// Cherry has 'e', date has 'e', elderberry has 'e', fig no, grape has 'e'
+		// no 'e': Apricot, banana, fig → 3
+		if len(rs.Rows) != 3 {
+			t.Fatalf("expected 3 rows (Apricot, banana, fig), got %d", len(rs.Rows))
+		}
+	})
+}
+
+// TestGLOB verifies GLOB (* / ?) pattern matching.
+func TestGLOB(t *testing.T) {
+	db, ctx := setupWhereDB(t)
+
+	t.Run("star wildcard", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT word FROM words WHERE word GLOB 'b*'`)
+		if len(rs.Rows) != 2 {
+			t.Fatalf("expected 2 rows (banana, blueberry), got %d", len(rs.Rows))
+		}
+	})
+
+	t.Run("question mark wildcard", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT word FROM words WHERE word GLOB '???'`)
+		// words of exactly 3 chars: fig
+		if len(rs.Rows) != 1 {
+			t.Fatalf("expected 1 row (fig), got %d", len(rs.Rows))
+		}
+	})
+
+	t.Run("case sensitive", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT word FROM words WHERE word GLOB 'Cherry'`)
+		if len(rs.Rows) != 1 {
+			t.Fatalf("expected 1 row (Cherry exact), got %d", len(rs.Rows))
+		}
+	})
+
+	t.Run("NOT GLOB", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT word FROM words WHERE word NOT GLOB '*berry'`)
+		// berry-words: blueberry, elderberry → 10 - 2 = 8
+		if len(rs.Rows) != 8 {
+			t.Fatalf("expected 8 rows (non-berry), got %d", len(rs.Rows))
+		}
+	})
+}
+
+// TestREGEXP verifies REGEXP / RLIKE infix operator.
+func TestREGEXP(t *testing.T) {
+	db, ctx := setupWhereDB(t)
+
+	t.Run("REGEXP basic", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT word FROM words WHERE word REGEXP '^[aA]'`)
+		// apple, Apricot
+		if len(rs.Rows) != 2 {
+			t.Fatalf("expected 2 rows, got %d", len(rs.Rows))
+		}
+	})
+
+	t.Run("RLIKE alias", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT word FROM words WHERE word RLIKE 'berry$'`)
+		// blueberry, elderberry
+		if len(rs.Rows) != 2 {
+			t.Fatalf("expected 2 rows (blueberry, elderberry), got %d", len(rs.Rows))
+		}
+	})
+
+	t.Run("NOT REGEXP", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT word FROM words WHERE word NOT REGEXP 'berry$'`)
+		if len(rs.Rows) != 8 {
+			t.Fatalf("expected 8 rows, got %d", len(rs.Rows))
+		}
+	})
+}
+
+// TestSIMILARTO verifies the SIMILAR TO operator.
+func TestSIMILARTO(t *testing.T) {
+	db, ctx := setupWhereDB(t)
+
+	t.Run("percent wildcard", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT word FROM words WHERE word SIMILAR TO 'c%'`)
+		// cherry (lowercase) — SIMILAR TO is case-sensitive
+		if len(rs.Rows) != 1 {
+			t.Fatalf("expected 1 row (cherry), got %d", len(rs.Rows))
+		}
+	})
+
+	t.Run("alternation", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT word FROM words WHERE word SIMILAR TO 'fig|date'`)
+		if len(rs.Rows) != 2 {
+			t.Fatalf("expected 2 rows (fig, date), got %d", len(rs.Rows))
+		}
+	})
+
+	t.Run("NOT SIMILAR TO", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT word FROM words WHERE word NOT SIMILAR TO '%berry'`)
+		if len(rs.Rows) != 8 {
+			t.Fatalf("expected 8 rows, got %d", len(rs.Rows))
+		}
+	})
+}
+
+// TestEXISTS verifies the EXISTS (subquery) predicate.
+func TestEXISTS(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	for _, sql := range []string{
+		`CREATE TABLE items (id INT, name TEXT)`,
+		`CREATE TABLE tags (item_id INT, tag TEXT)`,
+		`INSERT INTO items VALUES (1, 'Alpha')`,
+		`INSERT INTO items VALUES (2, 'Beta')`,
+		`INSERT INTO tags VALUES (1, 'hot')`,
+	} {
+		execQuery(t, ctx, db, sql)
+	}
+
+	t.Run("EXISTS non-empty subquery is true", func(t *testing.T) {
+		// All items are returned because the subquery always has rows.
+		rs := execQuery(t, ctx, db, `SELECT name FROM items WHERE EXISTS (SELECT 1 FROM tags)`)
+		if len(rs.Rows) != 2 {
+			t.Fatalf("expected 2 rows (all items), got %d", len(rs.Rows))
+		}
+	})
+
+	t.Run("EXISTS empty subquery is false", func(t *testing.T) {
+		// No items returned because the subquery is empty.
+		rs := execQuery(t, ctx, db, `SELECT name FROM items WHERE EXISTS (SELECT 1 FROM tags WHERE tag = 'nonexistent')`)
+		if len(rs.Rows) != 0 {
+			t.Fatalf("expected 0 rows, got %d", len(rs.Rows))
+		}
+	})
+
+	t.Run("NOT EXISTS non-empty subquery is false", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT name FROM items WHERE NOT EXISTS (SELECT 1 FROM tags)`)
+		if len(rs.Rows) != 0 {
+			t.Fatalf("expected 0 rows, got %d", len(rs.Rows))
+		}
+	})
+
+	t.Run("NOT EXISTS empty subquery is true", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT name FROM items WHERE NOT EXISTS (SELECT 1 FROM tags WHERE tag = 'none')`)
+		if len(rs.Rows) != 2 {
+			t.Fatalf("expected 2 rows, got %d", len(rs.Rows))
+		}
+	})
+}
+
+// TestLEVENSHTEIN verifies the LEVENSHTEIN / EDIT_DISTANCE functions.
+func TestLEVENSHTEIN(t *testing.T) {
+	db := storage.NewDB()
+	ctx := context.Background()
+
+	execQuery(t, ctx, db, `CREATE TABLE t (s TEXT)`)
+	execQuery(t, ctx, db, `INSERT INTO t VALUES ('kitten')`)
+	execQuery(t, ctx, db, `INSERT INTO t VALUES ('sitting')`)
+	execQuery(t, ctx, db, `INSERT INTO t VALUES ('abc')`)
+
+	t.Run("kitten→sitting", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT LEVENSHTEIN(s, 'sitting') AS d FROM t WHERE s = 'kitten'`)
+		if rs.Rows[0]["d"] != 3 {
+			t.Fatalf("expected Levenshtein(kitten,sitting)=3, got %v", rs.Rows[0]["d"])
+		}
+	})
+
+	t.Run("identical strings", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT LEVENSHTEIN('hello', 'hello') AS d FROM t LIMIT 1`)
+		if rs.Rows[0]["d"] != 0 {
+			t.Fatalf("expected 0 for identical strings, got %v", rs.Rows[0]["d"])
+		}
+	})
+
+	t.Run("EDIT_DISTANCE alias", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT EDIT_DISTANCE('abc', 'xyz') AS d FROM t LIMIT 1`)
+		if rs.Rows[0]["d"] != 3 {
+			t.Fatalf("expected 3, got %v", rs.Rows[0]["d"])
+		}
+	})
+
+	t.Run("WHERE LEVENSHTEIN filter", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT s FROM t WHERE LEVENSHTEIN(s, 'abc') <= 1`)
+		if len(rs.Rows) != 1 || rs.Rows[0]["s"] != "abc" {
+			t.Fatalf("expected only 'abc', got %v", rs.Rows)
+		}
+	})
+}
+
+// TestSTRING_PREDICATES verifies CONTAINS, STARTS_WITH, ENDS_WITH.
+func TestSTRING_PREDICATES(t *testing.T) {
+	db, ctx := setupWhereDB(t)
+
+	t.Run("CONTAINS", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT word FROM words WHERE CONTAINS(word, 'err')`)
+		// blueberry, cherry, Cherry, elderberry
+		if len(rs.Rows) != 4 {
+			t.Fatalf("expected 4 rows, got %d: %v", len(rs.Rows), rs.Rows)
+		}
+	})
+
+	t.Run("STARTS_WITH", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT word FROM words WHERE STARTS_WITH(word, 'b')`)
+		// banana, blueberry
+		if len(rs.Rows) != 2 {
+			t.Fatalf("expected 2 rows, got %d", len(rs.Rows))
+		}
+	})
+
+	t.Run("ENDS_WITH", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT word FROM words WHERE ENDS_WITH(word, 'erry')`)
+		// cherry, Cherry (no berry ending without b)
+		// actually: cherry ends in 'erry', Cherry ends in 'erry', blueberry ends in 'erry', elderberry ends in 'erry'
+		if len(rs.Rows) != 4 {
+			t.Fatalf("expected 4 rows (*erry), got %d", len(rs.Rows))
+		}
+	})
+
+	t.Run("CONTAINS false", func(t *testing.T) {
+		rs := execQuery(t, ctx, db, `SELECT word FROM words WHERE CONTAINS(word, 'xyz')`)
+		if len(rs.Rows) != 0 {
+			t.Fatalf("expected 0 rows, got %d", len(rs.Rows))
+		}
+	})
+}
+
+// --- System views ---
+
+func TestQuotedQualifiedSystemViews(t *testing.T) {
+	ctx := context.Background()
+	db := NewDB()
+
+	create, err := ParseSQL("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+	if err != nil {
+		t.Fatalf("parse create: %v", err)
+	}
+	if _, err := Execute(ctx, db, "default", create); err != nil {
+		t.Fatalf("execute create: %v", err)
+	}
+
+	queries := []string{
+		`SELECT * FROM "sys"."constraints" LIMIT 10`,
+		`SELECT * FROM "catalog"."columns" LIMIT 10`,
+	}
+	for _, query := range queries {
+		stmt, err := ParseSQL(query)
+		if err != nil {
+			t.Fatalf("parse %s: %v", query, err)
+		}
+		if _, err := Execute(ctx, db, "default", stmt); err != nil {
+			t.Fatalf("execute %s: %v", query, err)
+		}
+	}
+}
+
+// --- SQL formatting ---
+
+func TestBeautifySQL(t *testing.T) {
+	got := BeautifySQL("select id,name from users where note = 'from  x' and id=1")
+	want := "SELECT id, name\nFROM users\nWHERE note = 'from  x'\nAND id = 1"
+	if got != want {
+		t.Fatalf("BeautifySQL() = %q, want %q", got, want)
+	}
+}
+
+func TestMinifySQLPreservesProtectedTokens(t *testing.T) {
+	got := MinifySQL("SELECT  'a  b'  -- keep this\n FROM  [user name]  WHERE id = 1")
+	want := "SELECT 'a  b' -- keep this\nFROM [user name] WHERE id=1"
+	if got != want {
+		t.Fatalf("MinifySQL() = %q, want %q", got, want)
+	}
+}
+
+// A line comment runs to end of line, so BeautifySQL has to terminate it.
+// newline() is a no-op while atLineStart is set, and writing the comment did
+// not clear that flag, so the closing newline never fired: "SELECT 1 -- note"
+// followed by "FROM t" came out as "-- noteFROM t", putting the FROM clause
+// inside the comment.
+func TestBeautifySQLTerminatesLineComments(t *testing.T) {
+	got := BeautifySQL("SELECT 1 -- note\nFROM t")
+	if strings.Contains(got, "-- noteFROM") {
+		t.Fatalf("FROM was absorbed into the comment: %q", got)
+	}
+	if !strings.Contains(got, "-- note\n") {
+		t.Errorf("comment is not terminated by a newline: %q", got)
+	}
+	if _, err := ParseSQL(got); err != nil {
+		t.Errorf("beautified output does not parse: %v\n%s", err, got)
+	}
+}
+
+// The same for a block comment followed by more of the statement.
+func TestBeautifySQLSeparatesBlockComments(t *testing.T) {
+	got := BeautifySQL("SELECT a, /* mid */ b FROM t")
+	if strings.Contains(got, "*/b") {
+		t.Errorf("token ran straight onto the block comment: %q", got)
+	}
+	if _, err := ParseSQL(got); err != nil {
+		t.Errorf("beautified output does not parse: %v\n%s", err, got)
+	}
+}
+
+// Two-character operators were dropped by the tokenizer, so "a >= 5" lost its
+// operator entirely and the formatted statement meant something else.
+func TestSQLFormatKeepsMultiCharOperators(t *testing.T) {
+	const in = "select a from t where a >= 5 and b<>3 and c!=1 and d<=2 and e||f = 'x'"
+	for _, op := range []string{">=", "<>", "!=", "<=", "||"} {
+		if got := BeautifySQL(in); !strings.Contains(got, op) {
+			t.Errorf("BeautifySQL dropped %q: %q", op, got)
+		}
+		if got := MinifySQL(in); !strings.Contains(got, op) {
+			t.Errorf("MinifySQL dropped %q: %q", op, got)
+		}
+	}
+	want := "SELECT a\nFROM t\nWHERE a >= 5\nAND b <> 3\nAND c != 1\nAND d <= 2\nAND e || f = 'x'"
+	if got := BeautifySQL(in); got != want {
+		t.Errorf("BeautifySQL() = %q, want %q", got, want)
+	}
+}
+
+// "a - -1" must not minify to "a--1", where "--" starts a comment.
+func TestMinifySQLDoesNotFuseOperatorsIntoComments(t *testing.T) {
+	if got := MinifySQL("SELECT 5 - -1"); strings.Contains(got, "--") {
+		t.Errorf("MinifySQL created a comment opener: %q", got)
+	}
+	if got := MinifySQL("SELECT 6 / /* c */ 2"); !strings.Contains(got, "/ /*") {
+		t.Errorf("MinifySQL lost the separator before a block comment: %q", got)
+	}
+}
+
+func BenchmarkBeautifySQL(b *testing.B) {
+	sql := "SELECT id, name, email FROM users WHERE active = true AND age > 25 ORDER BY name"
+	for i := 0; i < b.N; i++ {
+		_ = BeautifySQL(sql)
+	}
+}
+
+func BenchmarkMinifySQL(b *testing.B) {
+	sql := "SELECT  id  ,  name  FROM  users  WHERE  active  =  true"
+	for i := 0; i < b.N; i++ {
+		_ = MinifySQL(sql)
+	}
+}
+
+func BenchmarkBeautifySQLComplex(b *testing.B) {
+	sql := `SELECT u.id, u.name, d.dept_name, p.project_name
+		FROM users u
+		JOIN departments d ON u.dept_id = d.id
+		LEFT JOIN projects p ON u.id = p.user_id
+		WHERE u.active = true AND d.status = 'active'
+		GROUP BY u.id, u.name, d.dept_name, p.project_name
+		HAVING COUNT(*) > 1
+		ORDER BY u.name
+		LIMIT 100`
+	for i := 0; i < b.N; i++ {
+		_ = BeautifySQL(sql)
+	}
+}
+
+// --- Agent context ---
+
+func TestBuildAgentContext(t *testing.T) {
+	ctx := context.Background()
+	db := NewDB()
+
+	for _, sql := range []string{
+		"CREATE TABLE departments (id INT PRIMARY KEY, name TEXT)",
+		"CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, dept_id INT FOREIGN KEY REFERENCES departments(id))",
+		"INSERT INTO departments VALUES (1, 'Engineering')",
+		"INSERT INTO employees VALUES (1, 'Ada', 1)",
+	} {
+		stmt, err := ParseSQL(sql)
+		if err != nil {
+			t.Fatalf("ParseSQL(%q): %v", sql, err)
+		}
+		if _, err := Execute(ctx, db, "default", stmt); err != nil {
+			t.Fatalf("Execute(%q): %v", sql, err)
+		}
+	}
+
+	profile, err := BuildAgentContext(ctx, db, "default", AgentContextConfig{
+		MaxTables:          2,
+		MaxColumnsPerTable: 2,
+		MaxRelations:       2,
+		MaxFunctions:       3,
+		MaxViews:           2,
+		MaxTriggers:        2,
+		MaxJobs:            2,
+		MaxConnections:     2,
+		MaxChars:           5000,
+	})
+	if err != nil {
+		t.Fatalf("BuildAgentContext: %v", err)
+	}
+
+	for _, want := range []string{
+		"tinySQL agent profile",
+		"version:",
+		"tables(",
+		"departments",
+		"employees",
+		"relations(",
+		"employees.dept_id -> departments.id",
+		"connections(",
+		"features:",
+		"gaps:",
+	} {
+		if !strings.Contains(profile, want) {
+			t.Fatalf("expected profile to contain %q, got:\n%s", want, profile)
+		}
+	}
+
+	if len(profile) > 5000 {
+		t.Fatalf("expected bounded profile, got %d chars", len(profile))
+	}
+}
+
+func TestDefaultAgentContextConfig(t *testing.T) {
+	cfg := DefaultAgentContextConfig().normalized()
+	if cfg.MaxTables <= 0 || cfg.MaxChars <= 0 {
+		t.Fatalf("expected positive defaults, got %+v", cfg)
+	}
+}
+
+func BenchmarkBuildAgentContext(b *testing.B) {
+	ctx := context.Background()
+	for i := 0; i < b.N; i++ {
+		db := NewDB()
+		for _, sql := range []string{
+			"CREATE TABLE departments (id INT PRIMARY KEY, name TEXT)",
+			"CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, dept_id INT)",
+			"INSERT INTO departments VALUES (1, 'Engineering'), (2, 'Sales'), (3, 'HR')",
+			"INSERT INTO employees VALUES (1, 'Ada', 1), (2, 'Grace', 1), (3, 'Alan', 2)",
+		} {
+			stmt, _ := ParseSQL(sql)
+			Execute(ctx, db, "default", stmt)
+		}
+		_, _ = BuildAgentContext(ctx, db, "default", DefaultAgentContextConfig())
+	}
+}
+
+// --- Deployment modes ---
+
+func TestParseDeploymentMode(t *testing.T) {
+	tests := []struct {
+		input string
+		want  DeploymentMode
+		err   bool
+	}{
+		{"", DeploymentPackage, false},
+		{"package", DeploymentPackage, false},
+		{"sqlite", DeploymentEmbedded, false},
+		{"server", DeploymentServer, false},
+		{"enterprise", DeploymentEnterprise, false},
+		{"unknown", DeploymentPackage, true},
+	}
+
+	for _, tc := range tests {
+		got, err := ParseDeploymentMode(tc.input)
+		if (err != nil) != tc.err {
+			t.Fatalf("ParseDeploymentMode(%q) error = %v, wantErr %v", tc.input, err, tc.err)
+		}
+		if got != tc.want {
+			t.Fatalf("ParseDeploymentMode(%q) = %v, want %v", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestOpenPackageInstance(t *testing.T) {
+	inst := OpenPackage("tenant1")
+	defer inst.Close()
+
+	if inst.Mode != DeploymentPackage {
+		t.Fatalf("mode = %v, want %v", inst.Mode, DeploymentPackage)
+	}
+	if inst.Tenant != "tenant1" {
+		t.Fatalf("tenant = %q", inst.Tenant)
+	}
+
+	if _, err := inst.ExecuteSQL(context.Background(), "CREATE TABLE users (id INT, name TEXT)"); err != nil {
+		t.Fatalf("ExecuteSQL CREATE TABLE failed: %v", err)
+	}
+	if _, err := inst.ExecuteSQL(context.Background(), "INSERT INTO users VALUES (1, 'Ada')"); err != nil {
+		t.Fatalf("ExecuteSQL INSERT failed: %v", err)
+	}
+	rs, err := inst.ExecuteSQL(context.Background(), "SELECT name FROM users")
+	if err != nil {
+		t.Fatalf("ExecuteSQL SELECT failed: %v", err)
+	}
+	if len(rs.Rows) != 1 || rs.Rows[0]["name"] != "Ada" {
+		t.Fatalf("unexpected rows: %#v", rs.Rows)
+	}
+}
+
+func TestOpenEmbeddedInstance(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "embedded.gob")
+	inst, err := OpenEmbedded(path, "")
+	if err != nil {
+		t.Fatalf("OpenEmbedded failed: %v", err)
+	}
+	defer inst.Close()
+
+	if inst.Mode != DeploymentEmbedded {
+		t.Fatalf("mode = %v, want %v", inst.Mode, DeploymentEmbedded)
+	}
+	if inst.DB.StorageMode() != ModeWAL {
+		t.Fatalf("storage mode = %v, want %v", inst.DB.StorageMode(), ModeWAL)
+	}
+}
+
+func TestOpenEnterpriseRequiresDurableStorage(t *testing.T) {
+	if _, err := OpenEnterprise(StorageConfig{}, ""); err == nil {
+		t.Fatal("expected enterprise mode without path to fail")
+	}
+	if _, err := OpenEnterprise(StorageConfig{Mode: ModeMemory, Path: filepath.Join(t.TempDir(), "db.gob")}, ""); err == nil {
+		t.Fatal("expected enterprise memory mode to fail")
+	}
+}
+
+func TestOpenEnterpriseStartsScheduler(t *testing.T) {
+	dir := t.TempDir()
+	inst, err := OpenEnterprise(StorageConfig{Mode: ModeDisk, Path: dir}, "")
+	if err != nil {
+		t.Fatalf("OpenEnterprise failed: %v", err)
+	}
+	defer inst.Close()
+
+	if inst.Mode != DeploymentEnterprise {
+		t.Fatalf("mode = %v, want %v", inst.Mode, DeploymentEnterprise)
+	}
+	if inst.DB.JobScheduler() == nil {
+		t.Fatal("expected enterprise profile to start job scheduler")
+	}
+}
+
+func TestInstanceStopStartRestartHealth(t *testing.T) {
+	dir := t.TempDir()
+	inst, err := OpenEnterprise(StorageConfig{Mode: ModeDisk, Path: dir}, "main")
+	if err != nil {
+		t.Fatalf("OpenEnterprise failed: %v", err)
+	}
+	defer inst.Close()
+
+	if !inst.Health().OK {
+		t.Fatalf("initial health = %#v", inst.Health())
+	}
+	if _, err := inst.ExecuteSQL(context.Background(), "CREATE TABLE users (id INT, name TEXT)"); err != nil {
+		t.Fatalf("CREATE TABLE failed: %v", err)
+	}
+	if _, err := inst.ExecuteSQL(context.Background(), "INSERT INTO users VALUES (1, 'Ada')"); err != nil {
+		t.Fatalf("INSERT failed: %v", err)
+	}
+
+	if err := inst.Stop(); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+	stopped := inst.Health()
+	if stopped.OK || !stopped.Closed || stopped.LastCloseAt.IsZero() {
+		t.Fatalf("stopped health mismatch: %#v", stopped)
+	}
+
+	if err := inst.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	if !inst.Health().OK || inst.DB.JobScheduler() == nil {
+		t.Fatalf("started health mismatch: %#v", inst.Health())
+	}
+	rs, err := inst.ExecuteSQL(context.Background(), "SELECT name FROM users")
+	if err != nil {
+		t.Fatalf("SELECT after start failed: %v", err)
+	}
+	if len(rs.Rows) != 1 || rs.Rows[0]["name"] != "Ada" {
+		t.Fatalf("unexpected rows after start: %#v", rs.Rows)
+	}
+
+	if err := inst.Restart(); err != nil {
+		t.Fatalf("Restart failed: %v", err)
+	}
+	if !inst.Health().OK || inst.DB.JobScheduler() == nil {
+		t.Fatalf("restarted health mismatch: %#v", inst.Health())
+	}
+}
+
+// --- Specialized tables ---
+
+func TestCreateSpecializedTable(t *testing.T) {
+	db := NewDB()
+	defer db.Close()
+	for _, kind := range []TableKind{KeyValueTable, DocumentTable, TimeSeriesTable} {
+		if err := CreateSpecializedTable(t.Context(), db, "default", string(kind), kind); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := CreateSpecializedTable(t.Context(), db, "other", "keyvalue", KeyValueTable, "k", "v"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ExecSQL(t.Context(), db, "other", `INSERT INTO keyvalue VALUES ('a', X'0102')`); err != nil {
+		t.Fatal(err)
+	}
+	rs, err := ExecSQL(t.Context(), db, "default", `SELECT * FROM keyvalue`)
+	if err != nil || len(rs.Rows) != 0 {
+		t.Fatalf("tenant isolation: %v %v", rs, err)
+	}
+	if err := CreateSpecializedTable(t.Context(), nil, "default", "x", KeyValueTable); err == nil {
+		t.Fatal("nil DB accepted")
+	}
+	if err := CreateSpecializedTable(t.Context(), db, "default", "x", TableKind("bad")); err == nil {
+		t.Fatal("unknown kind accepted")
+	}
+	if err := CreateSpecializedTable(t.Context(), db, "default", "x", KeyValueTable, "one"); err == nil {
+		t.Fatal("wrong columns accepted")
+	}
+}
+
+// --- Delayed inserts scheduler ---
+
+func TestDelayedInsertsScheduledDelivery(t *testing.T) {
+	db := NewDB()
+	run := func(sql string) *ResultSet {
+		t.Helper()
+		stmt, err := NewParser(sql).ParseStatement()
+		if err != nil {
+			t.Fatal(err)
+		}
+		rs, err := Execute(context.Background(), db, "default", stmt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rs
+	}
+	run(`CREATE TABLE scheduled_docs (id INT)`)
+	run(`CALL DELAY_INSERT('0s', 'INSERT INTO scheduled_docs VALUES (1)')`)
+	run(`CREATE JOB delayed_ingest SCHEDULE INTERVAL 1000 AS CALL FLUSH_DELAYED_INSERTS(10)`)
+	if err := StartJobScheduler(db, "default"); err != nil {
+		t.Fatal(err)
+	}
+	defer StopJobScheduler(db)
+	deadline := time.After(5 * time.Second)
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("scheduler did not deliver queued values")
+		case <-ticker.C:
+			if len(run(`SELECT * FROM scheduled_docs`).Rows) == 1 {
+				return
 			}
 		}
 	}

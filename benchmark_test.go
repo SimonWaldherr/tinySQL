@@ -233,3 +233,41 @@ func BenchmarkExecuteCompiled_Select(b *testing.B) {
 		benchmarkRows = len(rs.Rows)
 	}
 }
+
+// --- Builder ---
+
+var benchmarkBuilderSQL string
+
+func BenchmarkBuilderToSQLNested(b *testing.B) {
+	stmt := Select(Col("u.id"), Upper(Col("u.name")), Count(Col("o.id"))).
+		FromAs("users", "u").
+		LeftJoinAs("orders", "o", Eq(Col("u.id"), Col("o.user_id"))).
+		Where(And(
+			Gt(Col("u.age"), Val(18)),
+			Or(Eq(Col("u.active"), Val(true)), IsNotNull(Col("o.id"))),
+		)).
+		GroupBy("u.id", "u.name").
+		Having(Gt(Count(Col("o.id")), Val(0))).
+		OrderByDesc("u.id").
+		Limit(50).
+		Offset(10).
+		Build()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		benchmarkBuilderSQL = ToSQL(stmt)
+	}
+}
+
+func BenchmarkBuilderInsertBatch(b *testing.B) {
+	builder := InsertInto("events").Columns("id", "label", "payload")
+	for i := 0; i < 100; i++ {
+		builder.Values(Val(i+1000), Val("O'Reilly's event"), Val([]byte{0, 1, 2, 255}))
+	}
+	stmt := builder.Build()
+	b.ReportAllocs()
+	for b.Loop() {
+		benchmarkBuilderSQL = ToSQL(stmt)
+	}
+}

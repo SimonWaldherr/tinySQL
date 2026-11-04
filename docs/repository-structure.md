@@ -12,17 +12,21 @@ to preserve when changing internals, see [architecture.md](./architecture.md).
 ```text
 /
 |-- doc.go                   Package documentation
-|-- tinysql.go               Core DB/table types, column constants, constructors
-|-- query.go                 Parsing, compilation, row/stream/columnar execution
-|-- storage.go               Storage configuration, MVCC, WAL, snapshots, encryption
-|-- import.go                Structured-file import and JSON table export
-|-- retrieval.go             Vector cache configuration and typed RAG filters
-|-- catalog.go               Catalog and authorization facade
-|-- jobs.go / subscribe.go   Scheduler and change subscriptions
+|-- tinysql.go               Core DB/table types, column constants, constructors,
+|                            specialized-table helper
+|-- query.go                 Parsing, compilation, row/stream/columnar execution,
+|                            SQL formatting
+|-- storage.go               Storage configuration, MVCC, WAL, snapshots, encryption,
+|                            deployment modes
+|-- import.go                Structured-file import, JSON table export, deprecated
+|                            MBTiles compatibility facade
+|-- retrieval.go             Vector cache configuration, typed RAG filters, agent
+|                            context snapshot builder
+|-- catalog.go               Catalog and authorization facade, scheduler, change
+|                            subscriptions
 |-- extensions.go            Extensions, table functions, stored procedures
-|-- mbtiles_compat.go        Deprecated MBTiles compatibility facade
-|-- builder*.go              SELECT, expressions, mutations, SQL rendering
-|-- agent_context.go         Compact database metadata snapshot builder
+|-- builder.go               SELECT, expressions, schema/DML mutations, SQL rendering
+|-- *_test.go                Public-API tests, examples, benchmarks (see below)
 |-- driver/                  Public database/sql driver wrapper
 |-- exporter/                Public ResultSet export helpers
 |-- internal/                Engine, storage, importer, driver internals
@@ -108,18 +112,33 @@ cmd/
 
 ## Examples
 
-`example_test.go`, `example_exists_test.go`,
-`example_view_dependencies_test.go`, `import_example_test.go`, and
-[`demos/sql/showcase.sql`](../demos/sql/showcase.sql) demonstrate the public API and SQL features.
+`example_test.go` holds the runnable `Example*` functions for the public API
+(queries, views, EXISTS, import) and
+[`demos/sql/showcase.sql`](../demos/sql/showcase.sql) demonstrates the SQL features.
 `exporter/example_test.go` covers the public export facade.
 
 ## Public API layout
 
 All root Go files belong to the same `tinysql` package. This grouping changes
 source navigation, not import paths or exported signatures. Builder declarations
-live in `builder.go` (SELECT/CTE), `builder_expr.go` (expressions),
-`builder_mutation.go` (schema and DML), and `builder_sql.go` (SQL rendering).
-Public-package tests remain beside the API they exercise.
+(SELECT/CTE, expressions, schema and DML, SQL rendering) all live in `builder.go`;
+`catalog.go` also carries the scheduler and subscription facades.
+
+Root tests are kept in a handful of files by role instead of one file per feature:
+
+| File | Package | Contents |
+| --- | --- | --- |
+| `tinysql_test.go` | `tinysql` | Core, WHERE, bare-table, system-view, formatting, agent-context, deployment and scheduler tests |
+| `builder_test.go` | `tinysql` | Builder coverage and literal generation |
+| `benchmark_test.go` | `tinysql` | Engine and builder benchmarks |
+| `api_test.go` | `tinysql_test` | Public API behavior: parameters, scripts, extensions, subscriptions, JSON, read-only, columnar, index advisor |
+| `example_test.go` | `tinysql_test` | Runnable examples |
+| `tinysql_yaml_test.go` | `tinysql_test` | YAML import (`!tinysql_minimal` only) |
+| `tinysql_minimal_test.go` | `tinysql_test` | Minimal-build contract (`tinysql_minimal` only) |
+
+Build-tag-specific tests stay in their own files so the default and minimal
+builds both compile; add new feature tests to the file matching their role and
+package.
 
 `examples/` contains target-specific embedding examples; `demos/README.md` is the
 index for runnable feature demonstrations, including programs under `cmd/`.
