@@ -1203,11 +1203,17 @@ func evalTypeof(env ExecEnv, args []Expr, row Row) (any, error) {
 }
 
 func evalCast(env ExecEnv, args []Expr, row Row) (any, error) {
+	return evalCastArgs(args, func(e Expr) (any, error) { return evalExpr(env, e, row) })
+}
+
+// Keep CAST's target as syntax, and share conversion/error ordering between
+// the row-map evaluator and the raw-row aggregation/projection paths.
+func evalCastArgs(args []Expr, eval func(Expr) (any, error)) (any, error) {
 	if len(args) != 2 {
 		return nil, fmt.Errorf("CAST expects 2 arguments")
 	}
 
-	val, err := evalExpr(env, args[0], row)
+	val, err := eval(args[0])
 	if err != nil {
 		return nil, err
 	}

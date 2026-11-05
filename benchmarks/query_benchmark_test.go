@@ -30,10 +30,10 @@ type queryOps struct {
 
 // ── tinySQL ────────────────────────────────────────────────────────────────
 
-func openTinyQuery(mode storage.StorageMode, sql_ string) func(b *testing.B) queryOps {
-	return func(b *testing.B) queryOps {
+func openTinyQuery(mode storage.StorageMode, sql_ string) func(b testing.TB) queryOps {
+	return func(b testing.TB) queryOps {
 		b.Helper()
-		dir := tmpDir(b)
+		dir := b.TempDir()
 		cfg := storage.DefaultStorageConfig(mode)
 		cfg.Path = filepath.Join(dir, "bench.db")
 		db, err := tinysql.OpenDB(cfg)
@@ -86,40 +86,66 @@ func openTinyQuery(mode storage.StorageMode, sql_ string) func(b *testing.B) que
 
 // ── SQLite via modernc (pure Go) ────────────────────────────────────────────
 
-func openSQLiteQuery(sql_ string) func(b *testing.B) queryOps {
-	return func(b *testing.B) queryOps {
+func openSQLiteQuery(sql_ string) func(b testing.TB) queryOps {
+	return func(b testing.TB) queryOps {
 		b.Helper()
-		dir := tmpDir(b)
+		dir := b.TempDir()
 		dbPath := filepath.Join(dir, "bench.sqlite3")
 		db, err := sql.Open("sqlite", dbPath)
 		if err != nil {
 			b.Fatal(err)
 		}
-		db.Exec("PRAGMA journal_mode=WAL")
-		db.Exec("PRAGMA synchronous=NORMAL")
+		exec := func(query string, args ...any) {
+			b.Helper()
+			if _, err := db.Exec(query, args...); err != nil {
+				b.Fatalf("exec %q: %v", query, err)
+			}
+		}
+		exec("PRAGMA journal_mode=WAL")
+		exec("PRAGMA synchronous=NORMAL")
 
 		return queryOps{
 			populate: func(nCustomers, nOrdersPerCustomer int) {
-				db.Exec("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)")
-				db.Exec("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL)")
+				exec("CREATE TABLE customers (id INTEGER, name TEXT)")
+				exec("CREATE TABLE orders (id INTEGER, customer_id INTEGER, amount REAL)")
 
-				tx, _ := db.Begin()
-				cstmt, _ := tx.Prepare("INSERT INTO customers VALUES (?,?)")
-				for c := 0; c < nCustomers; c++ {
-					cstmt.Exec(c, fmt.Sprintf("cust_%d", c))
+				tx, err := db.Begin()
+				if err != nil {
+					b.Fatal(err)
 				}
-				cstmt.Close()
+				defer tx.Rollback()
+				cstmt, err := tx.Prepare("INSERT INTO customers VALUES (?,?)")
+				if err != nil {
+					b.Fatal(err)
+				}
+				for c := 0; c < nCustomers; c++ {
+					if _, err := cstmt.Exec(c, fmt.Sprintf("cust_%d", c)); err != nil {
+						b.Fatal(err)
+					}
+				}
+				if err := cstmt.Close(); err != nil {
+					b.Fatal(err)
+				}
 
-				ostmt, _ := tx.Prepare("INSERT INTO orders VALUES (?,?,?)")
+				ostmt, err := tx.Prepare("INSERT INTO orders VALUES (?,?,?)")
+				if err != nil {
+					b.Fatal(err)
+				}
 				oid := 0
 				for c := 0; c < nCustomers; c++ {
 					for o := 0; o < nOrdersPerCustomer; o++ {
-						ostmt.Exec(oid, c, float64(oid)*3.14)
+						if _, err := ostmt.Exec(oid, c, float64(oid)*3.14); err != nil {
+							b.Fatal(err)
+						}
 						oid++
 					}
 				}
-				ostmt.Close()
-				tx.Commit()
+				if err := ostmt.Close(); err != nil {
+					b.Fatal(err)
+				}
+				if err := tx.Commit(); err != nil {
+					b.Fatal(err)
+				}
 			},
 			query: func() int {
 				rows, err := db.Query(sql_)
@@ -128,15 +154,23 @@ func openSQLiteQuery(sql_ string) func(b *testing.B) queryOps {
 				}
 				defer rows.Close()
 				n := 0
-				cols, _ := rows.Columns()
+				cols, err := rows.Columns()
+				if err != nil {
+					b.Fatal(err)
+				}
 				dest := make([]any, len(cols))
 				scanArgs := make([]any, len(cols))
 				for i := range dest {
 					scanArgs[i] = &dest[i]
 				}
 				for rows.Next() {
-					rows.Scan(scanArgs...)
+					if err := rows.Scan(scanArgs...); err != nil {
+						b.Fatal(err)
+					}
 					n++
+				}
+				if err := rows.Err(); err != nil {
+					b.Fatal(err)
 				}
 				return n
 			},
@@ -163,7 +197,7 @@ func BenchmarkJoin(b *testing.B) {
 		label := fmt.Sprintf("customers=%d,orders=%d", sz.customers, sz.customers*sz.perCustomer)
 		for _, be := range []struct {
 			name string
-			open func(b *testing.B) queryOps
+			open func(b testing.TB) queryOps
 		}{
 			{"tinySQL-Memory", openTinyQuery(storage.ModeMemory, joinSQLTiny)},
 			{"tinySQL-Disk", openTinyQuery(storage.ModeDisk, joinSQLTiny)},
@@ -185,6 +219,7 @@ func BenchmarkJoin(b *testing.B) {
 						b.Fatalf("expected %d joined rows, got %d", want, n)
 					}
 				}
+				b.StopTimer()
 			})
 		}
 	}
@@ -207,7 +242,7 @@ func BenchmarkAggregate(b *testing.B) {
 		label := fmt.Sprintf("customers=%d,orders=%d", sz.customers, sz.customers*sz.perCustomer)
 		for _, be := range []struct {
 			name string
-			open func(b *testing.B) queryOps
+			open func(b testing.TB) queryOps
 		}{
 			{"tinySQL-Memory", openTinyQuery(storage.ModeMemory, aggSQL)},
 			{"tinySQL-Disk", openTinyQuery(storage.ModeDisk, aggSQL)},
@@ -228,6 +263,37 @@ func BenchmarkAggregate(b *testing.B) {
 					if n != want {
 						b.Fatalf("expected %d grouped rows, got %d", want, n)
 					}
+				}
+				b.StopTimer()
+			})
+		}
+	}
+}
+
+// TestQueryBenchmarkFixtures checks the workload before performance runs.
+func TestQueryBenchmarkFixtures(t *testing.T) {
+	cases := []struct {
+		name, query string
+		want        int
+	}{
+		{"join", "SELECT o.id, c.name, o.amount FROM orders o JOIN customers c ON o.customer_id = c.id", 6},
+		{"aggregate", "SELECT customer_id, COUNT(*), SUM(amount) FROM orders GROUP BY customer_id", 3},
+	}
+	for _, tc := range cases {
+		for _, backend := range []struct {
+			name string
+			open func(testing.TB) queryOps
+		}{
+			{"tiny-memory", openTinyQuery(storage.ModeMemory, tc.query)},
+			{"tiny-disk", openTinyQuery(storage.ModeDisk, tc.query)},
+			{"sqlite", openSQLiteQuery(tc.query)},
+		} {
+			t.Run(tc.name+"/"+backend.name, func(t *testing.T) {
+				ops := backend.open(t)
+				defer ops.close()
+				ops.populate(3, 2)
+				if got := ops.query(); got != tc.want {
+					t.Fatalf("got %d rows, want %d", got, tc.want)
 				}
 			})
 		}

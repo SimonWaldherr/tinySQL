@@ -81,10 +81,31 @@ act workflow_dispatch -W .github/workflows/local-act.yml
 | `make run-repl` / `make run-server` / `make run-demo` | Build and start the corresponding demo. |
 | `make info` | Print build version, Go version, configured paths. |
 
-`verify-ci` builds all host Go packages plus the `query_files` CLI and its WASM
-artifact. Run `make build-wasm-browser` or `make build-wasm-node` separately
-when changing those targets. Push `main` separately after committing source
+`verify-ci` builds all host Go packages plus the `query_files` CLI. Run
+`make build-wasm-browser` or `make build-wasm-node` separately when changing
+those targets. Push `main` separately after committing source
 changes.
+
+## Benchmarking
+
+Use a focused benchmark and repeated samples when comparing changes:
+
+```bash
+go test ./benchmarks -run '^$' -bench '^Benchmark(Join|Aggregate)$' -benchmem -count=5 > before.txt
+# Repeat on the changed revision into after.txt, then use benchstat if installed:
+benchstat before.txt after.txt
+```
+
+Run both revisions on the same machine with the same Go version, power settings,
+and background load. The query benchmarks populate each backend before timing;
+they include query parsing/execution and result retrieval, but exclude setup and
+cleanup. tinySQL materializes results while SQLite rows are scanned via
+`database/sql`, and their query planners and storage settings differ, so these
+numbers are workload comparisons rather than isolated engine measurements.
+The `TestQueryBenchmarkFixtures` test checks expected result counts for each
+backend. `make bench` runs the root module's benchmarks; nested modules need
+separate runs. `make bench-hotpaths` and `make bench-stream` provide focused
+alternatives. Benchmark result files should stay outside version control.
 
 ## Git hooks
 

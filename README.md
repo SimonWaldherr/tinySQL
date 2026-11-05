@@ -4,27 +4,27 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/SimonWaldherr/tinySQL.svg)](https://pkg.go.dev/github.com/SimonWaldherr/tinySQL)
 [![DOI](https://zenodo.org/badge/1065449861.svg)](https://doi.org/10.5281/zenodo.17216339)
 
-tinySQL is an embeddable SQL database engine written in Go. It is useful for
-learning database internals, local tools, tests, browser/WASM applications, and
-single-process services that need SQL without operating a database server.
+tinySQL brings an embeddable SQL engine to Go: useful for local tools, tests,
+browser applications, and learning how databases work. Run it in-process, take
+it to WebAssembly, or explore its parser, executor, and storage backends.
 
 [Browser playground](https://simonwaldherr.github.io/tinySQL/) ·
-[map demo](https://simonwaldherr.github.io/tinySQL/tiles-demo.html) ·
-[video](https://youtu.be/W28-aBk3BL0)
+[Map demo](https://simonwaldherr.github.io/tinySQL/tiles-demo.html) ·
+[Video](https://youtu.be/W28-aBk3BL0) ·
+[Documentation](docs/README.md)
 
 > tinySQL is not a drop-in replacement for PostgreSQL, MySQL, or a clustered
-> production database. Review [limitations](#limitations) before using it for
-> critical workloads.
+> database. Review the [limitations](#limitations) for critical workloads.
 
-## Start here
+## Get started
 
-tinySQL requires Go **1.27.3+**.
+Requires Go **1.27.3+**:
 
 ```bash
 go get github.com/SimonWaldherr/tinySQL@latest
 ```
 
-Create an in-memory database and run SQL:
+Create an in-memory database, insert data, and query it with a bound parameter:
 
 ```go
 package main
@@ -59,181 +59,43 @@ func main() {
 }
 ```
 
-For database/sql, streaming, columnar results, transactions, and the query
-builder, see [developer integration](docs/developer-integration.md) and the
-[driver package](./driver).
+For `database/sql`, transactions, streaming, and the query builder, see
+[developer integration](docs/developer-integration.md). Rust, Python, Swift,
+and C are supported through the [language bindings](docs/language-bindings.md).
 
-### Rust, Python, Swift and C
+## Explore
 
-The same engine embeds into other languages through one C ABI
-([`bindings/c`](bindings/c/README.md)); see the
-[language bindings guide](docs/language-bindings.md).
+- **SQL and data:** joins, CTEs, windows, views, triggers, procedures, and
+  imports from common document, tabular, and geospatial formats. Browse the
+  [function reference](docs/reference/functions.html) and [SQL showcase](demos/sql/showcase.sql).
+- **Search and maps:** full-text, vector, and hybrid retrieval; geometry,
+  routing, and tiles. See the [RAG](docs/rag-guide.md),
+  [geospatial](docs/geospatial-standards.md), and [routing](docs/osm-routing.md) guides.
+- **Tools and services:** try the [CLI](docs/cli-guide.md),
+  [file query tools](cmd/query_files/README.md),
+  [server](cmd/server/README.md), or [browser build](cmd/query_files_wasm/README.md).
+  The [command index](cmd/README.md) lists the rest.
+- **Storage:** choose in-memory, WAL, JSON, disk, indexed, or SQLite-backed
+  storage. The [storage guide](docs/storage-guide.md) covers configuration,
+  persistence, backups, and trade-offs. For column-oriented data exports, see
+  [analytical snapshots](docs/analytical-snapshots.md).
 
-```python
-import tinysql                                   # make -C bindings/python build
-with tinysql.connect("./data", mode="wal") as conn:
-    conn.execute("CREATE TABLE IF NOT EXISTS users (id INT PRIMARY KEY, name TEXT)")
-    conn.executemany("INSERT INTO users VALUES (?, ?)", [(1, "Ada"), (2, "Grace")])
-    print(conn.execute("SELECT name FROM users WHERE id = ?", (2,)).fetchone())
-```
-
-```rust
-let db = tinysql::Database::open_in_memory()?;   // tinysql = { path = "bindings/rust" }
-db.execute_script("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")?;
-db.execute("INSERT INTO users VALUES (?, ?)", tinysql::params![1, "Ada"])?;
-```
-
-## Choose a workflow
-
-| Goal | Start with |
-| --- | --- |
-| Explore tinySQL interactively | [demo](cmd/demo/README.md), [repl](cmd/repl/README.md), or [tinysql](cmd/tinysql/README.md) |
-| Query files or migrate data | [query_files](cmd/query_files/README.md), [fsql](cmd/fsql/README.md), or [migrate](cmd/migrate/README.md) |
-| Embed a local SQL service | [server](cmd/server/README.md) or [tinysqld](cmd/tinysqld/README.md) |
-| Build a browser app | [query_files_wasm](cmd/query_files_wasm/README.md), [wasm_browser](cmd/wasm_browser/README.md), or [wasm_node](cmd/wasm_node/README.md) |
-| Embed in a Swift / Xcode app | [Swift package and Apple XCFramework](bindings/swift/README.md) for macOS, iOS and iPadOS |
-| Embed in Rust, Python or C | [Rust crate](bindings/rust/README.md), [Python package](bindings/python/README.md), [C ABI](bindings/c/README.md) |
-| Use AI tooling or local RAG | [tinysql-mcp-server](cmd/tinysql-mcp-server/README.md) and the [RAG guide](docs/rag-guide.md) |
-| Browse every runnable program | [command index](cmd/README.md) |
-
-## Capabilities
-
-| Area | Includes |
-| --- | --- |
-| SQL | DDL/DML, CTEs, joins, grouping, windows, views, triggers, table-valued functions, stored procedures, jobs, and common SQLite-compatible PRAGMAs |
-| Data | CSV/TSV, JSON/NDJSON, XML, YAML, Excel, GeoJSON, TopoJSON, KML, OSM XML, routing graphs, Shapefiles, GeoPackage, and MBTiles |
-| Search | Full-text, vector, hybrid search, RAG helpers, regex, JSON, URL, HTML, date, math, bitmap, and hash functions |
-| Deployment | Pure-Go embedded API, database/sql driver, Rust/Python/Swift/C bindings, CLI, HTTP/gRPC server, browser/WASM builds, and multiple storage backends |
-
-See the [SQL function examples](docs/reference/functions.sql) and
-[HTML reference](docs/reference/functions.html) for supported operations and semantics. Runnable
-feature examples are in [SQL showcase](demos/sql/showcase.sql).
-
-### GIS, routing, and tiles
-
-Geometry is stored as GeoJSON or validated GEOMETRY; tinySQL includes
-measurement, predicates, editing, spatial search, choropleth classification,
-WKT/WKB, geohash, and Web Mercator helpers. Use the
-[geospatial standards guide](docs/geospatial-standards.md) for formats, CRS
-profiles, coordinate conventions, and interoperability limits.
-
-Routing functions run Dijkstra or coordinate-guided A* over ordinary edge
-tables. The [OSM routing guide](docs/osm-routing.md) explains graph import,
-profiles, turn restrictions, and the HTTP demo.
-
-For tiles, the TILE_*, MBTILES_*, and TILE_COVER functions support Web Mercator
-and OGC TileMatrix workflows. tinysqld -tiles can publish an MBTiles-shaped
-table; see its [README](cmd/tinysqld/README.md) and the
-[storage guide](docs/storage-guide.md) for durable artifacts.
-
-### Retrieval and RAG
-
-Vector, full-text, and hybrid retrieval can be combined with metadata filters
-and reranking. RAG_WARM and ROUTE_WARM prepare derived serving structures
-before traffic. The [RAG guide](docs/rag-guide.md) covers schema design,
-ingestion, evaluation, tuning, caching, and context expansion.
-
-## Storage and optional imports
-
-Open persistent databases with OpenDB and a StorageConfig:
-
-| Mode | Best fit |
-| --- | --- |
-| ModeMemory | Tests, browser/WASM, and temporary data |
-| ModeWAL | In-memory tables with write-ahead-log recovery |
-| ModeDisk | Per-table GOB files with lazy loading |
-| ModeJSON | Human-readable, diffable per-table JSON |
-| ModeIndex / ModeHybrid | Disk-backed tables with bounded caching |
-| ModePagedIndex | Large equality lookups such as MBTiles |
-| ModeSQLite | A .sqlite file interoperable with SQLite tools; requires sqliteimport |
-
-For example, ModeJSON persists each table as readable JSON:
-
-```go
-db, err := tinysql.OpenDB(tinysql.StorageConfig{
-	Mode: tinysql.ModeJSON,
-	Path: "./data",
-})
-if err != nil {
-	panic(err)
-}
-defer db.Close()
-```
-
-The core has no SQLite or Shapefile runtime dependency. Build optional file
-support only when needed:
-
-```bash
-go build -tags=sqliteimport ./...          # SQLite, GeoPackage, MBTiles
-go build -tags=shapefile ./...             # ESRI Shapefile and ZIP imports
-go build -tags=sqliteimport,shapefile ./...
-```
-
-For size-sensitive embeddings such as browser WASM bundles, the
-`tinysql_minimal` tag drops optional features that pull in large
-dependencies: the SQL `HTTP()` function (net/http, crypto/tls),
-`HTML_TEMPLATE()` (html/template, whose reflection use
-also keeps otherwise unused methods alive), `standards.WriteProblem`, and YAML
-imports (gopkg.in/yaml.v3). The SQL functions and YAML imports return an error;
-`standards.WriteProblem` is excluded from the API. `HTML_ESCAPE()`, core SQL, the
-`database/sql` driver and the other importers are unchanged. With Go 1.27 this
-shrinks the browser bundle from about 27.46 MB to 15.56 MB (43%)
-before wasm-opt with stripped symbols; sizes vary with the toolchain. `-tags no_http` removes only
-the `HTTP()` function.
-
-```bash
-GOOS=js GOARCH=wasm go build -tags=tinysql_minimal -trimpath -ldflags='-s -w' -o tinySQL.wasm ./cmd/wasm_browser
-```
-
-Browser and Node build scripts select `WASM_PROFILE=minimal` by default;
-use `WASM_PROFILE=full` to include optional features. `make wasm-smoke` checks
-both profiles for dependency exclusions, size reduction and JavaScript API
-behavior, including transactions and browser snapshot imports.
-
-See the [storage guide](docs/storage-guide.md) for DSNs, persistence,
-read-only serving, backups, encryption scope, and large datasets.
-
-## Services and operations
-
-server provides HTTP and gRPC APIs, optional TLS and bearer authentication,
-plus asynchronous read-only replicas. The [cluster guide](docs/cluster.md)
-includes a primary/replica deployment and recovery workflow. tinysqld is the
-durable DBMS entry point with health, scheduler, and optional tile endpoints.
-
-Both are deliberately smaller than a general-purpose distributed database:
-replication is asynchronous, and automatic failover, multi-primary writes, and
-distributed transactions are not implemented.
-
-## Guides
-
-| Guide | Use it for |
-| --- | --- |
-| [Developer integration](docs/developer-integration.md) | Go API, database/sql, streaming, and browser embedding |
-| [Language bindings](docs/language-bindings.md) | Rust, Python, Swift and C: types, transactions, persistence, performance |
-| [CLI guide](docs/cli-guide.md) | Shells, servers, and file-query tools |
-| [Query analyzer](docs/query-analyzer.md) | Measured execution stages, bottlenecks, and optimization examples |
-| [Storage guide](docs/storage-guide.md) | Backends, DSNs, read-only mode, and large artifacts |
-| [RAG guide](docs/rag-guide.md) | Vector, hybrid retrieval, reranking, and context |
-| [Geospatial standards](docs/geospatial-standards.md) | GIS formats, CRS profiles, and interoperability |
-| [SQL feature gaps](docs/sql-feature-gaps.md) | Supported SQL and current gaps |
-| [Architecture](docs/architecture.md) | Parser, executor, storage, and invariants |
-| [Development guide](docs/development-guide.md) | Tests, Make targets, and release workflow |
-| [API stability](docs/api-stability.md) | Compatibility guarantees and upgrades |
+SQLite, GeoPackage, and MBTiles support requires the `sqliteimport` build tag;
+Shapefile support requires `shapefile`. For smaller WASM builds,
+`tinysql_minimal` omits optional features; see
+[browser build guide](cmd/wasm_browser/README.md) for details.
 
 ## Develop
 
 ```bash
 go test ./...
 go vet ./...
-make test-bindings   # C ABI, Python package and Rust crate
+make test-bindings   # C ABI, Python and Rust
 ```
 
-The browser playground build lives in cmd/query_files_wasm:
-
-```bash
-cd cmd/query_files_wasm
-./build.sh --build-only
-```
+See the [development guide](docs/development-guide.md) for tests, benchmarks,
+and build targets; the [architecture guide](docs/architecture.md) for internals;
+and [API stability](docs/api-stability.md) for compatibility guarantees.
 
 ## Limitations
 
@@ -252,6 +114,4 @@ cd cmd/query_files_wasm
 - RBAC is coarse and single-table oriented. Encryption does not cover
   WAL-backed modes or metadata files.
 
-tinySQL is primarily an educational and embeddable engine. It keeps the parser,
-planner, executor, storage backends, and practical extensions easy to inspect,
-test, and adapt.
+See [SQL feature gaps](docs/sql-feature-gaps.md) for details and current coverage.

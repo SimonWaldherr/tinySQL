@@ -331,6 +331,10 @@ func evalRawFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, erro
 	// through the argument-wrapper pool below evaluates discarded branches
 	// and can raise errors that their ordinary handlers would never reach.
 	switch ex.Name {
+	case "CAST":
+		return evalCastArgs(ex.Args, func(arg Expr) (any, error) {
+			return evalRawExpr(plan, raw, arg)
+		})
 	case "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "DAYOFWEEK", "DAYOFYEAR", "WEEKOFYEAR", "QUARTER", "ISODOW":
 		return evalDateComponent(ex.Name, ex.Args, func(arg Expr) (any, error) {
 			return evalRawExpr(plan, raw, arg)

@@ -40,6 +40,8 @@ current behavior and keep performance claims scoped to the workload they measure
   reopening.
 - [Columnar execution](columnar-execution.md) — aggregate batches and compact
   result sets.
+- [Analytical snapshots](analytical-snapshots.md) — column-oriented table exports
+  and their limitations.
 - [Clusters and load balancing](cluster.md) — primary/replica deployment.
 - [TinyGo and embedded targets](tinygo-guide.md) — supported targets and build
   flow.
