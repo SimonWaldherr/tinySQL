@@ -76,6 +76,8 @@ func executeStatementWithColumns(ctx context.Context, db *storage.DB, tenant str
 			snapshot, snapshotErr = db.SnapshotForRowDeleteStatement(tenant, table, rowIDs)
 		} else if table, ok := appendOnlySnapshotTarget(plan); ok {
 			snapshot, snapshotErr = db.SnapshotForAppendOnlyTableStatement(tenant, table)
+		} else if table, ok := rowsOnlySnapshotTarget(plan); ok {
+			snapshot, snapshotErr = db.SnapshotForRowsOnlyStatement(tenant, table)
 		} else if table, ok := tableScopedSnapshotTarget(plan); ok {
 			snapshot, snapshotErr = db.SnapshotForTableStatement(tenant, table)
 		} else {
@@ -467,6 +469,24 @@ func rowDeleteSnapshotTarget(plan *dmlPlan) (string, []int, bool) {
 		return "", nil, false
 	}
 	return s.Table, plan.rowIDs, true
+}
+
+// rowsOnlySnapshotTarget identifies the UPDATE and DELETE statements that
+// tableScopedSnapshotTarget would give a deep table clone, and for which a copy of
+// the row headers is enough (see storage.SnapshotForRowsOnlyStatement): the same
+// conditions, restricted to the two statements that replace rows instead of
+// appending them. INSERT has its own, cheaper snapshot above.
+func rowsOnlySnapshotTarget(plan *dmlPlan) (string, bool) {
+	if plan == nil || plan.hasTriggers() || plan.tenantFK {
+		return "", false
+	}
+	switch s := plan.stmt.(type) {
+	case *Update:
+		return s.Table, true
+	case *Delete:
+		return s.Table, true
+	}
+	return "", false
 }
 
 // tableScopedSnapshotTarget identifies DML that cannot mutate a table other
