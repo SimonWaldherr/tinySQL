@@ -218,7 +218,7 @@ func TestSubscriptionAggregateUnsupportedShapesUseFullRefresh(t *testing.T) {
 	execSQL(t, db, `INSERT INTO live_shapes VALUES (1, 2), (2, 3)`)
 	for i, query := range []string{
 		`SELECT g, SUM(v) AS s FROM live_shapes WHERE COALESCE(v, 0) > 0 GROUP BY g`,
-		`SELECT g, SUM(v) AS s FROM live_shapes GROUP BY g HAVING SUM(v) > 0`,
+		`SELECT g, SUM(v) AS s FROM live_shapes GROUP BY g HAVING COALESCE(SUM(v), 0) > 0`,
 		`SELECT g, SUM(v) AS s FROM live_shapes GROUP BY g ORDER BY g`,
 		`SELECT COUNT(DISTINCT v) AS n FROM live_shapes`,
 		`SELECT SUM(v) + 1 AS s FROM live_shapes`,
@@ -519,5 +519,64 @@ func TestSubscriptionAggregateWhereNewIndex(t *testing.T) {
 	}
 	if want := execSQL(t, db, query); !subscriptionAggregateSameResult(want, state.snapshot) {
 		t.Fatalf("got %v want %v", state.snapshot, want.Rows)
+	}
+}
+
+func TestSubscriptionAggregateHavingTransitions(t *testing.T) {
+	db := storage.NewDB()
+	t.Cleanup(func() { _ = db.Close() })
+	execSQL(t, db, `CREATE TABLE having_live (g INT, v INT)`)
+	execSQL(t, db, `INSERT INTO having_live VALUES (1, 4), (2, 12)`)
+	query := `SELECT g, SUM(v) AS total, COUNT(*) AS n FROM having_live GROUP BY g HAVING SUM(v) > 10`
+	state := &querySubscriptionState{db: db, tenant: "default", query: mustParse(query).(*Select)}
+	if _, err := state.refresh(t.Context()); err != nil || state.aggregate == nil {
+		t.Fatalf("initial: %v", err)
+	}
+	for _, q := range []string{`INSERT INTO having_live VALUES (1, 8)`, `UPDATE having_live SET v = 1 WHERE v = 12`, `DELETE FROM having_live WHERE v = 8`, `INSERT INTO having_live VALUES (3, 20)`} {
+		execSQL(t, db, q)
+		change, err := state.refresh(t.Context())
+		if err != nil || change == nil || change.ScannedRows < 0 {
+			t.Fatalf("%s: %v %v", q, change, err)
+		}
+		if want := execSQL(t, db, query); !subscriptionAggregateSameResult(want, state.snapshot) {
+			t.Fatalf("%s: got %v want %v", q, state.snapshot, want.Rows)
+		}
+	}
+}
+
+func TestSubscriptionAggregateIndexedCount(t *testing.T) {
+	db := filteredAggregateFixture(t, 600, true)
+	query := `SELECT category, COUNT(*) AS n, COUNT(amount) AS present FROM facts WHERE region='r1' AND time>=100 AND time<150 GROUP BY category HAVING COUNT(*) > 0`
+	state := &querySubscriptionState{db: db, tenant: "default", query: mustParse(query).(*Select)}
+	if _, err := state.refresh(t.Context()); err != nil || state.aggregate == nil {
+		t.Fatalf("initial: %v", err)
+	}
+	for _, q := range []string{`INSERT INTO facts VALUES (601,'r1','c0',120,99,48,11)`, `UPDATE facts SET region='r1', time=120 WHERE id=102`, `DELETE FROM facts WHERE id=111`} {
+		execSQL(t, db, q)
+		_, err := state.refresh(t.Context())
+		if err != nil || state.aggregate == nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		if want := execSQL(t, db, query); !subscriptionAggregateSameResult(want, state.snapshot) {
+			t.Fatalf("%s: got %v want %v", q, state.snapshot, want.Rows)
+		}
+	}
+}
+
+func TestSubscriptionAggregateHavingError(t *testing.T) {
+	db := storage.NewDB()
+	t.Cleanup(func() { _ = db.Close() })
+	execSQL(t, db, `CREATE TABLE having_error (g INT, v INT)`)
+	execSQL(t, db, `INSERT INTO having_error VALUES (1, 2)`)
+	query := `SELECT g, SUM(v) AS total FROM having_error GROUP BY g HAVING 1 / SUM(v) > 0`
+	state := &querySubscriptionState{db: db, tenant: "default", query: mustParse(query).(*Select)}
+	if _, err := state.refresh(t.Context()); err != nil || state.aggregate == nil {
+		t.Fatalf("initial: %v", err)
+	}
+	execSQL(t, db, `UPDATE having_error SET v = 0`)
+	_, got := state.refresh(t.Context())
+	_, want := Execute(t.Context(), db, "default", mustParse(query))
+	if got == nil || want == nil || got.Error() != want.Error() {
+		t.Fatalf("got %v, want %v", got, want)
 	}
 }

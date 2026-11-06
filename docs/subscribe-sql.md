@@ -61,8 +61,10 @@ INSERT/UPDATE path. Deletions and expired update history require a full scan.
 Simple aggregates over a physical table can maintain results after INSERT,
 UPDATE and DELETE. This path supports direct GROUP BY columns and COUNT, SUM,
 AVG, MIN and MAX over direct columns (and COUNT(*)), with deterministic,
-row-local WHERE predicates. HAVING, ordering, pagination, indexed WHERE plans,
-and unsupported types and expressions use the general path. The first refresh
+row-local WHERE predicates and HAVING expressions supported by the aggregate
+planner. Ordering, pagination and unsupported types and expressions use the
+general path. Indexed WHERE plans are incremental for direct COUNT aggregates;
+other aggregates fall back to preserve scan-order semantics. The first refresh
 scans the table; updates use the bounded row-update history and recompute
 changed groups in source order. A delete compacts physical positions, so the
 subscription checks the remaining rows against retained identities, then
@@ -140,4 +142,17 @@ floating-point results.
 
 ```sh
 go test ./internal/engine -run '^$' -bench '^BenchmarkSubscriptionAggregateMutation$' -benchmem -benchtime=30x -count=3
+```
+
+### HAVING and indexed counts
+
+On an Apple M2 Max with Go 1.27.3, three 30-iteration runs over 20,000
+initial rows measured a grouped SUM with HAVING at 468–500 µs before and
+52–70 µs after incremental maintenance. An indexed filtered COUNT measured
+364–371 µs before and 7–11 µs after; this benchmark times refresh only and
+performs each INSERT with index maintenance outside the timed section. These
+figures depend on the query and data distribution.
+
+```sh
+go test ./internal/engine -run '^$' -bench '^BenchmarkSubscriptionAggregate(Having|IndexedCount)$' -benchmem -benchtime=30x -count=3
 ```

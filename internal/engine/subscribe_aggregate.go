@@ -39,7 +39,7 @@ type subscriptionAggregateGroup struct {
 func (s *querySubscriptionState) tryInitializeAggregate(ctx context.Context) error {
 	s.aggregateChecked = true
 	q := s.query
-	if !subscriptionPredicate(q.Where) || q.Having != nil || len(q.OrderBy) != 0 || q.Limit != nil || q.Offset != nil {
+	if !subscriptionPredicate(q.Where) || len(q.OrderBy) != 0 || q.Limit != nil || q.Offset != nil {
 		return nil
 	}
 	env := ExecEnv{ctx: ctx, db: s.db, tenant: s.tenant}
@@ -65,9 +65,14 @@ func (s *querySubscriptionState) tryInitializeAggregate(ctx context.Context) err
 			return nil
 		}
 	}
-	source, err := buildSimpleAggregateSourcePlan(plan)
-	if err != nil || source.rowIDs != nil {
-		return nil
+	var source *simpleSelectPlan
+	if subscriptionIndexOrderIndependent(plan) {
+		source = &simpleSelectPlan{table: table, colIndex: plan.colIndex, where: plan.where, filter: buildRawFilter(plan.colIndex, plan.where)}
+	} else {
+		source, err = buildSimpleAggregateSourcePlan(plan)
+		if err != nil || source.rowIDs != nil {
+			return nil
+		}
 	}
 	a := &subscriptionAggregate{table: table, columns: append([]storage.Column(nil), table.Cols...), plan: plan, source: source, groups: make(map[string]*subscriptionAggregateGroup), identities: make(map[*any]*subscriptionAggregateRow, len(table.Rows)), rows: make([]*subscriptionAggregateRow, 0, len(table.Rows)+len(table.Rows)/4), version: table.Version, structural: table.StructVersion(), count: len(table.Rows)}
 	for i, raw := range table.Rows {
@@ -100,7 +105,10 @@ func (s *querySubscriptionState) tryInitializeAggregate(ctx context.Context) err
 	if len(plan.groupCols) == 0 {
 		a.ensureWholeGroup()
 	}
-	result := a.result()
+	result, err := a.result(ctx)
+	if err != nil {
+		return nil
+	}
 	if !subscriptionAggregateSameResult(result, s.snapshot) {
 		return nil
 	}
@@ -165,12 +173,12 @@ func (a *subscriptionAggregate) ensureWholeGroup() {
 		a.groups[""] = &subscriptionAggregateGroup{state: newSimpleAggregateState(nil, len(a.plan.projs)), members: make(map[*subscriptionAggregateRow]struct{})}
 	}
 }
-func (a *subscriptionAggregate) result() *ResultSet {
+func (a *subscriptionAggregate) result(ctx context.Context) (*ResultSet, error) {
 	states := make([]*simpleAggregateState, 0, len(a.groups))
 	for _, g := range a.groups {
 		states = append(states, g.state)
 	}
-	return simpleAggregateResultSet(a.plan.projs, a.plan.outputCols, states)
+	return finalizeSimpleAggregateResultSet(ExecEnv{ctx: ctx}, a.plan, states)
 }
 func subscriptionAggregateSameResult(result *ResultSet, snapshot []Row) bool {
 	if len(result.Rows) != len(snapshot) {
@@ -308,9 +316,9 @@ func (s *querySubscriptionState) refreshAggregate(ctx context.Context) (*QueryCh
 		return fallback()
 	}
 	// An index can change the executor's scan order and thus floating point sums.
-	if a.plan.where != nil {
+	if a.plan.where != nil && !subscriptionIndexOrderIndependent(a.plan) {
 		source, err := buildSimpleAggregateSourcePlan(a.plan)
-		if err != nil || source.rowIDs != nil {
+		if err != nil || source.rowIDs != nil && !subscriptionIndexOrderIndependent(a.plan) {
 			return fallback()
 		}
 	}
@@ -522,5 +530,20 @@ func (s *querySubscriptionState) refreshAggregate(ctx context.Context) (*QueryCh
 	if !changed && len(affected) == 0 {
 		return nil, nil
 	}
-	return s.applySubscriptionResult(ctx, a.result(), scanned)
+	result, err := a.result(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.applySubscriptionResult(ctx, result, scanned)
+}
+
+// COUNT over direct columns is independent of the source scan order.
+// SUM/AVG and mixed-type MIN/MAX continue to use the full executor when indexed.
+func subscriptionIndexOrderIndependent(plan *simpleAggregatePlan) bool {
+	for _, proj := range plan.projs {
+		if proj.kind != aggGroupCol && proj.kind != aggCount {
+			return false
+		}
+	}
+	return true
 }
