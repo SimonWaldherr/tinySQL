@@ -25,17 +25,21 @@ import (
 )
 
 type simpleAggregatePlan struct {
-	table      *storage.Table
-	colIndex   map[string]int
-	groupCols  []int
-	where      Expr
-	having     Expr
-	havingEval simpleHavingEval
-	orderBy    []OrderItem
-	limit      *int
-	offset     *int
-	projs      []simpleAggregateProjection
-	outputCols []string
+	table        *storage.Table
+	colIndex     map[string]int
+	groupCols    []int
+	groupExprs   []Expr
+	groupKeyCols []int
+	exprSlots    map[*FuncCall]int
+	resultEvals  []simpleHavingEval
+	where        Expr
+	having       Expr
+	havingEval   simpleHavingEval
+	orderBy      []OrderItem
+	limit        *int
+	offset       *int
+	projs        []simpleAggregateProjection
+	outputCols   []string
 }
 
 // aggKind identifies which aggregate a simpleAggregateProjection computes in
@@ -255,6 +259,8 @@ func executeSimpleSingleGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, r
 		defer scanPhase.finish(-1)
 	}
 	groups := newAggregateGroups(plan.projs, len(plan.groupCols))
+	groupValues := make([]any, len(plan.groupExprs))
+	groupCache := make([]map[string]any, len(plan.groupExprs))
 	rowCount := len(plan.table.Rows)
 	if rawPlan.rowIDs != nil {
 		rowCount = len(rawPlan.rowIDs)
@@ -291,7 +297,10 @@ func executeSimpleSingleGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, r
 			continue
 		}
 
-		state := groups.state(raw, plan.groupCols)
+		state, err := simpleAggregateGroupState(groupsStateArgs{groups: &groups, plan: plan, rawPlan: rawPlan, raw: raw, values: groupValues, cache: groupCache})
+		if err != nil {
+			return nil, true, err
+		}
 		if err := accumulateSimpleAggregateState(env, rawPlan, raw, state, plan.projs); err != nil {
 			return nil, true, err
 		}
@@ -308,6 +317,8 @@ func executeSimpleMultiGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, ra
 		defer scanPhase.finish(-1)
 	}
 	groups := newAggregateGroups(plan.projs, len(plan.groupCols))
+	groupValues := make([]any, len(plan.groupExprs))
+	groupCache := make([]map[string]any, len(plan.groupExprs))
 	rowCount := len(plan.table.Rows)
 	if rawPlan.rowIDs != nil {
 		rowCount = len(rawPlan.rowIDs)
@@ -343,7 +354,10 @@ func executeSimpleMultiGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, ra
 			continue
 		}
 
-		state := groups.state(raw, plan.groupCols)
+		state, err := simpleAggregateGroupState(groupsStateArgs{groups: &groups, plan: plan, rawPlan: rawPlan, raw: raw, values: groupValues, cache: groupCache})
+		if err != nil {
+			return nil, true, err
+		}
 		if err := accumulateSimpleAggregateState(env, rawPlan, raw, state, plan.projs); err != nil {
 			return nil, true, err
 		}
@@ -526,6 +540,28 @@ func finalizeSimpleAggregateResultSet(env ExecEnv, plan *simpleAggregatePlan, or
 		}
 		order = kept
 		havingPhase.finish(int64(len(order)))
+	}
+	if plan.resultEvals != nil {
+		result := &ResultSet{Cols: plan.outputCols, Rows: make([]Row, 0, len(order))}
+		for _, state := range order {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, err
+			}
+			row := make(Row, len(plan.resultEvals))
+			for i, eval := range plan.resultEvals {
+				value, err := eval(state)
+				if err != nil {
+					return nil, err
+				}
+				putVal(row, plan.outputCols[i], value)
+			}
+			result.Rows = append(result.Rows, row)
+		}
+		if len(plan.orderBy) > 0 {
+			result.Rows = applySortOrderWithLimit(plan.orderBy, result.Rows, plan.limit, plan.offset)
+		}
+		result.Rows = applyOffsetLimit(&Select{Limit: plan.limit, Offset: plan.offset}, result.Rows)
+		return result, nil
 	}
 	// Without ORDER BY the encounter order is already final. Page the states
 	// before allocating result maps, after evaluating every aggregate/HAVING
@@ -726,10 +762,16 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 	colIndex := simpleColumnIndex(table, aliasOr(s.From))
 	groupCols := make([]int, len(s.GroupBy))
 	groupPositions := make(map[int]int, len(s.GroupBy))
+	hasGroupExpr := false
 	for i, groupExpr := range s.GroupBy {
 		groupRef, ok := groupExpr.(*VarRef)
 		if !ok {
-			return nil, false, nil
+			if !simpleAggregateGroupExpr(groupExpr) {
+				return nil, false, nil
+			}
+			groupCols[i] = -1
+			hasGroupExpr = true
+			continue
 		}
 		groupCol, ok := colIndex[strings.ToLower(groupRef.Name)]
 		if !ok {
@@ -741,13 +783,48 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 		}
 	}
 
-	projs, outputCols, hasAgg, eligible, err := buildSimpleAggregateProjections(s, colIndex, groupPositions)
-	if err != nil {
-		return nil, true, err
+	var projs []simpleAggregateProjection
+	var outputCols []string
+	var resultEvals []simpleHavingEval
+	var exprSlots map[*FuncCall]int
+	if !hasGroupExpr {
+		var hasAgg, eligible bool
+		projs, outputCols, hasAgg, eligible, err = buildSimpleAggregateProjections(s, colIndex, groupPositions)
+		if err != nil {
+			return nil, true, err
+		}
+		if !eligible || !hasAgg {
+			projs = nil
+		}
 	}
-	if !eligible || !hasAgg {
-		return nil, false, nil
+	if projs == nil {
+		var ok bool
+		projs, outputCols, resultEvals, exprSlots, ok = buildAggregateExpressionProjections(s, colIndex, groupCols, groupPositions)
+		if !ok {
+			return nil, false, nil
+		}
 	}
+
+	// Grouping and HAVING precede projection in the general evaluator. Do not
+	// eagerly evaluate potentially failing aggregate arguments on these new
+	// paths before grouping finishes or HAVING has rejected a group.
+	if resultEvals != nil && (hasGroupExpr || s.Having != nil) {
+		for _, proj := range projs {
+			if proj.filter != nil {
+				return nil, false, nil
+			}
+			switch arg := proj.arg.(type) {
+			case nil, *Literal:
+			case *VarRef:
+				if _, ok := colIndex[strings.ToLower(arg.Name)]; !ok {
+					return nil, false, nil
+				}
+			default:
+				return nil, false, nil
+			}
+		}
+	}
+
 	// Bind direct arguments and simple SUM/AVG arithmetic once per execution.
 	// Unknown names and other expressions retain the evaluator's existing
 	// error/lazy semantics.
@@ -766,16 +843,25 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 		}
 	}
 	plan := &simpleAggregatePlan{
-		table:      table,
-		colIndex:   colIndex,
-		groupCols:  groupCols,
-		where:      s.Where,
-		having:     s.Having,
-		orderBy:    s.OrderBy,
-		limit:      s.Limit,
-		offset:     s.Offset,
-		projs:      projs,
-		outputCols: outputCols,
+		table:       table,
+		colIndex:    colIndex,
+		groupCols:   groupCols,
+		resultEvals: resultEvals,
+		exprSlots:   exprSlots,
+		where:       s.Where,
+		having:      s.Having,
+		orderBy:     s.OrderBy,
+		limit:       s.Limit,
+		offset:      s.Offset,
+		projs:       projs,
+		outputCols:  outputCols,
+	}
+	if hasGroupExpr {
+		plan.groupExprs = s.GroupBy
+		plan.groupKeyCols = make([]int, len(s.GroupBy))
+		for i := range plan.groupKeyCols {
+			plan.groupKeyCols[i] = i
+		}
 	}
 	if plan.having != nil {
 		plan.havingEval = compileSimpleHaving(plan, plan.having)

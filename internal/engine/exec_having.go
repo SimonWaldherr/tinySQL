@@ -25,7 +25,10 @@ func compileSimpleHaving(plan *simpleAggregatePlan, e Expr) simpleHavingEval {
 			}
 		}
 	case *FuncCall:
-		i, ok := simpleAggregateProjectionForFunc(plan, ex)
+		i, ok := plan.exprSlots[ex]
+		if !ok {
+			i, ok = simpleAggregateProjectionForFunc(plan, ex)
+		}
 		if ok {
 			proj := plan.projs[i]
 			return func(s *simpleAggregateState) (any, error) { return simpleAggregateProjectionValue(s, proj, i), nil }
@@ -40,7 +43,8 @@ func compileSimpleHaving(plan *simpleAggregatePlan, e Expr) simpleHavingEval {
 			if err != nil {
 				return nil, err
 			}
-			return applyUnaryOp(ex.Op, v)
+			// Aggregate evaluation also accepts exact DECIMAL/MONEY values.
+			return evalAggregateUnary(ExecEnv{}, &Unary{Op: ex.Op, Expr: &Literal{Val: v}}, nil)
 		}
 	case *IsNull:
 		inner := compileSimpleHaving(plan, ex.Expr)

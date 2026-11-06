@@ -225,7 +225,13 @@ func evalWindowFunction(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	partitionRows, currentIdx := resolveWindowPartition(env, ex, allRows, row)
 
 	if isAggregateName(ex.Name) {
-		frame, err := windowFrameRows(env, partitionRows, currentIdx, ex.Over)
+		if count, used, err := cachedWindowFrameCount(env, ex, row, partitionRows, currentIdx); used || err != nil {
+			return count, err
+		}
+		frame, used, err := cachedWindowIntRange(env, ex, row, partitionRows, currentIdx)
+		if !used && err == nil {
+			frame, err = windowFrameRows(env, partitionRows, currentIdx, ex.Over)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -420,7 +426,9 @@ type windowPartitionShape struct {
 }
 
 type windowPartitionEntry struct {
-	rows []Row
+	rows          []Row
+	countPrefixes map[string][]int
+	integerRanges map[string][]int64
 	// posByOrigIdx maps a row's index within env.windowRows to that row's
 	// position within rows (post partition-filter, post sort). Built once
 	// per partition (see buildWindowPartition) so evalWindowFunction can

@@ -36,6 +36,9 @@ type aggregateBatchOp struct {
 // nonnumeric values also switch to scalar accumulation, without rereading or
 // reevaluating the predicate of a batch.
 func aggregateBatchEligible(plan *simpleAggregatePlan, source *simpleSelectPlan) bool {
+	if len(plan.groupExprs) != 0 {
+		return false
+	}
 	n := len(plan.table.Rows)
 	if source.rowIDs != nil {
 		n = len(source.rowIDs)

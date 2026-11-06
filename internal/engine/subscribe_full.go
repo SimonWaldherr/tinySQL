@@ -16,6 +16,11 @@ func (s *querySubscriptionState) refreshFull(ctx context.Context) (*QueryChange,
 	if err != nil {
 		return nil, err
 	}
+	return s.applySubscriptionResult(ctx, rs, -1)
+}
+
+// applySubscriptionResult compares visible rows as multisets and retains owned copies.
+func (s *querySubscriptionState) applySubscriptionResult(ctx context.Context, rs *ResultSet, scanned int) (*QueryChange, error) {
 	if s.options.MaxResultRows > 0 && len(rs.Rows) > s.options.MaxResultRows {
 		return nil, fmt.Errorf("subscription result exceeds row limit %d", s.options.MaxResultRows)
 	}
@@ -23,7 +28,24 @@ func (s *querySubscriptionState) refreshFull(ctx context.Context) (*QueryChange,
 	if !initial && !slices.Equal(s.cols, rs.Cols) {
 		return nil, fmt.Errorf("subscription result schema changed")
 	}
-	change := &QueryChange{Initial: initial, Cols: slices.Clone(rs.Cols), ScannedRows: -1}
+	// A common live-metric result is one row. If its visible values did not
+	// change, avoid building a multiset index and cloning the same snapshot.
+	if !initial && len(s.snapshot) == 1 && len(rs.Rows) == 1 {
+		same := true
+		for key, old := range s.snapshot[0] {
+			if !reflect.DeepEqual(old, rs.Rows[0][key]) {
+				same = false
+				break
+			}
+		}
+		if same {
+			if err := checkCtx(ctx); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		}
+	}
+	change := &QueryChange{Initial: initial, Cols: slices.Clone(rs.Cols), ScannedRows: scanned}
 	keys := setOperationColumnKeys(rs.Cols)
 	// Signatures narrow comparisons; DeepEqual resolves collisions and preserves
 	// Go value types. Index lists retain duplicate rows with multiset semantics.

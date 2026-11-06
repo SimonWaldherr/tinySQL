@@ -436,8 +436,20 @@ func encodeText(rows [][]any, c int) ([]byte, byte, error) {
 			if !useDict {
 				continue
 			}
-			n, ok := dict[v]
-			if !ok {
+			// For tiny dictionaries, direct comparisons avoid a hash lookup.
+			// Keep populating the map so the transition to larger sets is exact.
+			var n uint32
+			if len(order) <= 4 {
+				for j, existing := range order {
+					if existing == v {
+						n = uint32(j + 1)
+						break
+					}
+				}
+			} else {
+				n = dict[v]
+			}
+			if n == 0 {
 				if len(order) >= DictMaxDistinct {
 					useDict = false
 					dict, order, idx = nil, nil, nil
@@ -446,6 +458,17 @@ func encodeText(rows [][]any, c int) ([]byte, byte, error) {
 				order = append(order, v)
 				n = uint32(len(order))
 				dict[v] = n
+				// A highly diverse prefix predicts a large dictionary. Reserve at most
+				// the format limit to avoid repeated growth; a skewed prefix may
+				// cause temporary over-allocation but cannot change the encoding.
+				if len(order) == 8192 && i < 16384 && len(rows) > 32768 {
+					capacity := min(len(rows), DictMaxDistinct)
+					larger := make(map[string]uint32, capacity)
+					for j, entry := range order {
+						larger[entry] = uint32(j + 1)
+					}
+					dict = larger
+				}
 			}
 			idx = binary.AppendUvarint(idx, uint64(n))
 		default:

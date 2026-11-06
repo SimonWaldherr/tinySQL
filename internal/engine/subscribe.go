@@ -185,6 +185,8 @@ type querySubscriptionState struct {
 	full                       bool
 	fullInitialized            bool
 	snapshot                   []Row
+	aggregate                  *subscriptionAggregate
+	aggregateChecked           bool
 	watch                      *storage.ChangeWatch
 	options                    SubscriptionOptions
 	scopeInitialized           bool
@@ -206,6 +208,7 @@ func (s *querySubscriptionState) refresh(ctx context.Context) (result *QueryChan
 			result = nil
 			s.rows = nil
 			s.snapshot = nil
+			s.aggregate = nil
 		}
 	}()
 	defer func() {
@@ -230,9 +233,16 @@ func (s *querySubscriptionState) refresh(ctx context.Context) (result *QueryChan
 			s.scopeGeneration = generation
 		}
 	}
+	if s.aggregate != nil {
+		return s.refreshAggregate(ctx)
+	}
 	if s.full || !subscriptionIncrementalEligible(s.query) {
 		s.full = true
-		return s.refreshFull(ctx)
+		change, err := s.refreshFull(ctx)
+		if err == nil && !s.aggregateChecked {
+			err = s.tryInitializeAggregate(ctx)
+		}
+		return change, err
 	}
 	table, err := s.db.Get(s.tenant, s.query.From.Table)
 	if err != nil {

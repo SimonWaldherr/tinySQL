@@ -64,7 +64,7 @@ func TestSubscriptionGeneralSelectMatchesExecutor(t *testing.T) {
 					if len(delta.Cols) == 0 {
 						t.Fatal("missing result schema")
 					}
-					if delta.ScannedRows != -1 {
+					if delta.ScannedRows != -1 && state.aggregate == nil {
 						t.Fatalf("unexpected scan count %d", delta.ScannedRows)
 					}
 					for _, removed := range delta.Removed {

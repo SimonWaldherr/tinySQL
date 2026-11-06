@@ -2,6 +2,7 @@ package tinystore
 
 import (
 	"encoding/gob"
+	"fmt"
 	tsql "github.com/SimonWaldherr/tinySQL"
 	"os"
 	"path/filepath"
@@ -73,6 +74,57 @@ func BenchmarkSnapshot(b *testing.B) {
 					}
 				}
 			})
+		})
+	}
+}
+
+// BenchmarkEncodeColumn isolates CPU and allocation costs from filesystem sync.
+func BenchmarkEncodeColumn(b *testing.B) {
+	const count = 100000
+	rows := make([][]any, count)
+	for i := range rows {
+		var nullable any = i
+		if i%10 == 0 {
+			nullable = nil
+		}
+		rows[i] = []any{"2026-11-01", []string{"north", "south", "east", "west"}[i%4], i, float64(i) / 10, nullable, fmt.Sprintf("unique-%d", i), fmt.Sprintf("skew-%d", i%1024)}
+	}
+	for _, tc := range []struct {
+		name string
+		col  int
+		typ  byte
+	}{
+		{"text_constant", 0, typeText}, {"text_cycling", 1, typeText},
+		{"int", 2, typeInt}, {"float", 3, typeFloat}, {"int_nullable", 4, typeInt}, {"text_distinct", 5, typeText}, {"text_skew", 6, typeText},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				_, _, err := encodeColumn(rows, tc.col, tc.typ)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkWriteTextCardinality includes durable file writing for distinct text values.
+func BenchmarkWriteTextCardinality(b *testing.B) {
+	for _, count := range []int{100000, 120000} {
+		b.Run(fmt.Sprintf("rows=%d", count), func(b *testing.B) {
+			table := tsql.NewTable("distinct", []tsql.Column{{Name: "value", Type: tsql.TextType}}, false)
+			for i := 0; i < count; i++ {
+				table.Rows = append(table.Rows, []any{fmt.Sprintf("value-%d", i)})
+			}
+			dir := b.TempDir()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				if _, err := Write(dir, table); err != nil {
+					b.Fatal(err)
+				}
+			}
 		})
 	}
 }

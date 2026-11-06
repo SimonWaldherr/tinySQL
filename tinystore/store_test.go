@@ -152,6 +152,35 @@ func TestTextPlainWhenTooManyDistinctValues(t *testing.T) {
 	sameTable(t, tbl, got)
 }
 
+func TestDictionarySmallLookupTransition(t *testing.T) {
+	rows := [][]any{{""}, {"a"}, {"b"}, {"c"}, {nil}, {"a"}, {"d"}, {""}, {"d"}, {"b"}}
+	tbl := table("small_dict", []tsql.Column{{Name: "text", Type: tsql.TextType}}, rows)
+	sameTable(t, tbl, writeRead(t, tbl))
+	block, enc, err := encodeText(rows, 0)
+	if err != nil || enc != encTextDict {
+		t.Fatalf("encoding %d: %v", enc, err)
+	}
+	// Check the reference sequence independently of the reader.
+	want := []byte{1, 2, 3, 4, 0, 2, 5, 1, 5, 3}
+	if !bytes.HasSuffix(block, want) {
+		t.Fatalf("dictionary references: %x", block)
+	}
+}
+
+func TestDictionaryDiversePrefixAndRepeatedValues(t *testing.T) {
+	rows := make([][]any, 33000)
+	for i := range rows {
+		rows[i] = []any{fmt.Sprintf("value-%d", i%9000)}
+	}
+	rows[32999] = []any{nil}
+	tbl := table("diverse", []tsql.Column{{Name: "value", Type: tsql.TextType}}, rows)
+	sameTable(t, tbl, writeRead(t, tbl))
+	rows[32999][0] = 42
+	if _, _, err := encodeText(rows, 0); err == nil {
+		t.Fatal("invalid text value accepted")
+	}
+}
+
 func TestDictionaryReferencesCrossVarintBoundary(t *testing.T) {
 	rows := make([][]any, 0, 132)
 	for i := 0; i < 130; i++ {

@@ -33,14 +33,13 @@ admission and equality with the derived-table evaluation path.
 | Application optimization | Current tinySQL evidence and decision |
 | --- | --- |
 | Remove CAST from SUM/AVG | Already admitted by `isSimpleRawExpr` and `buildSimpleAggregateProjection`. Keep CAST semantics; the raw evaluator is optimized in this change. |
-| Store day/week/month/quarter/year columns | `buildSimpleAggregatePlan` still requires a `VarRef` for each GROUP BY item. Extend it with evaluated grouping keys, then consider a bounded per-query cache for deterministic date expressions. Preserve NULLs, timezone semantics, mixed-type equality and expression errors. Do not automatically add five physical columns to every date field. |
-| Rewrite ratios as an aggregate subquery plus outer division | `buildSimpleAggregateProjection` still requires a plain group column or aggregate call. The appropriate engine improvement is to accumulate aggregate leaves once and evaluate the enclosing expression per group. Test HAVING, aliases, empty input, zero denominators, decimals and nested aggregates before enabling it. A dataset-specific compiler rewrite is not a general SQL rewrite. |
+| Store day/week/month/quarter/year columns | The raw aggregate path supports deterministic arithmetic, predicates and selected date functions as grouping keys. Consider a bounded per-query cache for repeated deterministic date expressions. Preserve NULLs, timezone semantics, mixed-type equality and expression errors. Do not automatically add five physical columns to every date field. |
+| Rewrite ratios as an aggregate subquery plus outer division | The raw aggregate path accumulates supported aggregate leaves once and evaluates arithmetic over them per group; unsupported expressions use the general evaluator. Test HAVING, aliases, empty input, zero denominators, decimals and nested aggregates before enabling it. A dataset-specific compiler rewrite is not a general SQL rewrite. |
 | Build tables through the storage API | Useful for new, privately built analytical copies; the example uses `NewTable` and one `DB.Put`. Do not route general SQL INSERT through direct row assignment: that would bypass constraints, triggers and transaction contracts. Transaction snapshots already share immutable scalar rows (`SnapshotForTx`/`cloneRowsShared`); remeasure throughput before changing commit behavior. |
 | Intern repeated strings | Included in dictionary snapshot decoding. Generic global interning would retain unrelated datasets and cost memory for high-cardinality values. |
 | Warm copies before activation; count cells instead of rows | Sound application lifecycle and budget decisions. Keep scheduling, dataset policies, generation swaps and cleanup in the application. |
 
-The next engine priorities are expression grouping and aggregate expressions
-such as ratios. A transparent replacement of the database's durable table
+A transparent replacement of the database's durable table
 format is a separate migration project: the snapshot codec intentionally lacks
 much of the metadata and type coverage required by ModeDisk.
 
@@ -101,3 +100,54 @@ On the same Apple M2 Max and Go 1.27.3, three local runs of the 100,000-row
 and about 3.65 MB allocated per operation before this change, versus 6.61–6.69 ms
 and about 3.06 MB afterward. These short filesystem measurements are sensitive
 to system load and apply only to this fixture.
+
+## Aggregate expression benchmarks
+
+On an Apple M2 Max with Go 1.27.3, three 300 ms runs of
+`BenchmarkAggregateExpressions` over 10,000 rows gave the following ranges.
+These measurements compare the general path with the raw aggregate path and
+are specific to the fixtures, not a general speedup guarantee.
+
+| Query | Before | After | Allocated bytes/op before → after |
+| --- | ---: | ---: | ---: |
+| Group by YEAR | 2.48–2.55 ms | 0.71–0.74 ms | 4.18 MB → 83 KB |
+| SUM / COUNT by category | 2.14 ms | 0.164–0.165 ms | 4.07 MB → 22 KB |
+
+The fast path accepts selected deterministic grouping functions and arithmetic
+over supported aggregates. Other expressions, including scalar functions around
+aggregates and short-circuit boolean expressions, use the general path.
+
+```sh
+go test ./internal/engine -run '^$' -bench '^BenchmarkAggregateExpressions$' -benchmem -count=3 -benchtime=300ms
+```
+
+## Live metrics and fixed row windows
+
+Repeated textual dates in simple date-part grouping keys use a query-local cache
+of at most 1,024 values per key. `COUNT(column)` over sufficiently wide `ROWS`
+frames uses a query-local prefix count per partition and column. Numeric `RANGE`
+frames with a non-null integer ordering key use binary search over a validated,
+query-local partition index. Other key types, filters, DISTINCT and expression
+arguments retain their existing paths where applicable.
+Live queries incrementally maintain a subset of aggregates on data changes; a single
+unchanged result also avoids building a multiset diff.
+
+On an Apple M2 Max with Go 1.27.3, three short local runs measured:
+
+| Workload | Before | After |
+| --- | ---: | ---: |
+| `YEAR` grouping, 10,000 rows with repeated dates | 0.71–0.74 ms | 0.62–0.65 ms |
+| `COUNT` over a 1,000-row window, 5,000 rows | 108–110 ms | 2.77 ms |
+| `COUNT` over an integer `RANGE` of 1,000 units, 5,000 rows | 746–758 ms | 3.17–3.22 ms |
+| Unchanged single live `COUNT` result | 1.84–1.87 µs | 1.28–1.33 µs |
+
+These are fixture-specific measurements. The `RANGE` baseline temporarily
+disabled the integer fast path, with one iteration per run. Live aggregates are
+incrementally maintained only for supported query shapes; see the
+[subscription guide](subscribe-sql.md). The integer `RANGE` optimization accelerates frame-bound lookup;
+aggregate evaluation still depends on the function and frame size.
+
+```sh
+go test ./internal/engine -run '^$' -bench '^BenchmarkAggregateExpressions/GroupExpression$' -benchmem -count=3
+go test ./internal/engine -run '^$' -bench '^Benchmark(WindowMetricCount|WindowMetricTimeRange|SubscriptionMetricUnchanged)$' -benchmem -count=3
+```
