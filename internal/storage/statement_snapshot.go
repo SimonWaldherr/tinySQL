@@ -32,6 +32,11 @@ type StatementSnapshot struct {
 	// rowDelete is the compact rollback state for a triggerless point DELETE
 	// on a table without secondary indexes.
 	rowDelete *rowDeleteTableState
+	// rowsOnly is the rollback state for a triggerless UPDATE or DELETE that is
+	// not bounded by a constraint seek: a copy of the table's row HEADERS (no
+	// cell is copied) instead of a deep clone of every row, plus whatever is
+	// needed to rebuild the secondary indexes. See SnapshotForRowsOnlyStatement.
+	rowsOnly *rowsOnlyTableState
 	// full is false for a table-scoped snapshot. Such snapshots restore only
 	// the table that the statement can mutate, leaving unrelated tables in
 	// place. This avoids cloning an entire database for ordinary DML.
@@ -74,6 +79,8 @@ func (s *StatementSnapshot) RestoredTables() ([]TableRef, bool) {
 		return []TableRef{{Tenant: s.tenant, Table: s.rowUpdate.table.Name}}, true
 	case s.rowDelete != nil:
 		return []TableRef{{Tenant: s.tenant, Table: s.rowDelete.table.Name}}, true
+	case s.rowsOnly != nil:
+		return []TableRef{{Tenant: s.tenant, Table: s.rowsOnly.table.Name}}, true
 	case s.full:
 		return nil, false
 	}
@@ -217,6 +224,22 @@ type rowUpdateTableState struct {
 	dirtyRowsState dirtyRowsState
 }
 
+// rowsOnlyTableState is the pre-image behind SnapshotForRowsOnlyStatement.
+type rowsOnlyTableState struct {
+	table          *Table
+	rows           [][]any
+	version        int
+	stats          *TableStats
+	dirtyFrom      int
+	dirtyRows      []int
+	dirtyRowsState dirtyRowsState
+	// ftsGeneration and vectorGeneration are how often the lazily built full-text
+	// and vector index structures changed before the statement; see
+	// restoreRowsOnlyTable.
+	ftsGeneration    int
+	vectorGeneration int
+}
+
 type rowDeleteTableState struct {
 	table          *Table
 	rowID          int
@@ -269,6 +292,69 @@ func (db *DB) SnapshotForTableStatement(tenant, name string) (*StatementSnapshot
 	return &StatementSnapshot{
 		tables: map[string]map[string]tableState{
 			tenant: {key: {table: table, state: cloneTable(table)}},
+		},
+		catalog: armCatalogRollback(db.Catalog()),
+	}, nil
+}
+
+// SnapshotForRowsOnlyStatement is SnapshotForTableStatement for a triggerless
+// UPDATE or DELETE, without the deep copy.
+//
+// Table DML never writes through an existing row's cells: UPDATE puts a new row
+// slice at the same position, DELETE builds a new outer slice, and a row that is
+// kept stays byte-for-byte what it was (cloneTableForStreamDML relies on the same
+// fact for a stream's private writer view). A copy of the outer slice, which is
+// one slice header per row, is therefore a complete pre-image of the rows, and
+// copying it costs a few megabytes where cloneTable copied every embedding vector,
+// JSON and blob cell as well. For a table of 100000 rows of 768-dimensional
+// vectors with one secondary index that was about 100 ms (UPDATE: about 450 ms,
+// the index copy included) per statement, matching or not.
+//
+// Secondary indexes are NOT copied: they are mutated in place by UPDATE and
+// replaced by DELETE, so the pre-image would have to be a deep copy of the skip
+// list. Instead, rollback rebuilds them from the restored rows. A rollback is the
+// rare path (a constraint violation on a later row), so it may cost O(rows); a
+// statement that succeeds, the overwhelming majority, pays nothing for the indexes.
+//
+// The lazily built full-text and vector index structures (FTSIndexes,
+// VectorIndexes) are not copied either. DML does not touch them: they describe the
+// rows at a table version and are refreshed or rebuilt on the next search once the
+// version moved. Only a statement that itself runs a search over the table (an
+// UPDATE whose predicate calls an FTS or vector function) can change them, and that
+// is detected by their generation counters; see restoreRowsOnlyTable. A RAG chunk
+// table has these structures as soon as it has been searched once, so they must not
+// push such a table back to the deep clone.
+//
+// A table a stream is reading right now falls back to SnapshotForTableStatement
+// (restoring in place would corrupt the stream's source, see
+// RestoreStatementSnapshot). Callers must also use a full snapshot when triggers or
+// foreign keys can write to other tables.
+func (db *DB) SnapshotForRowsOnlyStatement(tenant, name string) (*StatementSnapshot, error) {
+	if db == nil {
+		return nil, nil
+	}
+	table, err := db.Get(tenant, name)
+	if err != nil {
+		return nil, err
+	}
+	if db.IsTablePinnedForStream(table) {
+		return db.SnapshotForTableStatement(tenant, name)
+	}
+	rows := make([][]any, len(table.Rows))
+	copy(rows, table.Rows)
+	return &StatementSnapshot{
+		tenant: tenant,
+		rowsOnly: &rowsOnlyTableState{
+			table:          table,
+			rows:           rows,
+			version:        table.Version,
+			stats:          cloneTableStats(table.Stats),
+			dirtyFrom:      table.dirtyFrom,
+			dirtyRows:      captureDirtyRows(table),
+			dirtyRowsState: table.dirtyRowsState,
+
+			ftsGeneration:    table.ftsGeneration,
+			vectorGeneration: table.vectorGeneration,
 		},
 		catalog: armCatalogRollback(db.Catalog()),
 	}, nil
@@ -418,6 +504,11 @@ func (db *DB) RestoreStatementSnapshot(snapshot *StatementSnapshot) {
 		} else {
 			restoreRowUpdateTable(state)
 		}
+	} else if snapshot.rowsOnly != nil {
+		// Never pinned: SnapshotForRowsOnlyStatement falls back to a table
+		// snapshot for a table a stream is reading, and a stream cannot start
+		// while the statement holds the content write lock.
+		restoreRowsOnlyTable(snapshot.rowsOnly)
 	} else if snapshot.rowDelete != nil {
 		state := snapshot.rowDelete
 		if db.IsTablePinnedForStream(state.table) {
@@ -560,6 +651,61 @@ func restoreRowUpdateTable(state *rowUpdateTableState) {
 		}
 		table.Rows[rowID] = state.rows[i]
 	}
+	table.Version = state.version
+	table.Stats = cloneTableStats(state.stats)
+	table.dirtyFrom = state.dirtyFrom
+	table.dirtyRows = state.dirtyRows
+	table.dirtyRowsState = state.dirtyRowsState
+}
+
+func restoreRowsOnlyTable(state *rowsOnlyTableState) {
+	if state == nil || state.table == nil {
+		return
+	}
+	table := state.table
+	table.dropDerived()
+	table.Rows = state.rows
+	// Rebuilt from the restored rows: the statement may have mutated an index in
+	// place (UPDATE) or replaced it (DELETE). Every index is built first and
+	// installed only if all of them succeeded, so a failure cannot leave some
+	// indexes rebuilt and others not. Rows that were indexed before are indexed
+	// again, so a failure (a duplicate in a UNIQUE index) cannot happen unless the
+	// table was inconsistent already; the indexes are then left as the statement
+	// left them rather than half replaced.
+	if len(table.Indexes) > 0 {
+		rebuilt := make(map[*SecondaryIndex]*SkipList, len(table.Indexes))
+		ok := true
+		for _, idx := range table.Indexes {
+			fast, err := table.buildSecondaryIndex(idx)
+			if err != nil {
+				ok = false
+				break
+			}
+			rebuilt[idx] = fast
+		}
+		if ok {
+			for idx, fast := range rebuilt {
+				idx.mu.Lock()
+				idx.fast = fast
+				idx.Entries = nil
+				idx.mu.Unlock()
+			}
+		}
+	}
+	// A statement that ran a search over this table can have built or extended
+	// the full-text or vector index structures against rows that are now gone.
+	// They are derived data and rebuild on the next search; dropping them is
+	// always correct, so do it whenever their generation moved. A statement that
+	// did not search leaves them untouched, which is the common case and what
+	// keeps a searched RAG table cheap.
+	table.DerivedLock()
+	if table.ftsGeneration != state.ftsGeneration && len(table.FTSIndexes) > 0 {
+		table.FTSIndexes = make(map[string]*FTSIndex)
+	}
+	if table.vectorGeneration != state.vectorGeneration && len(table.VectorIndexes) > 0 {
+		table.VectorIndexes = make(map[string]*VectorIndex)
+	}
+	table.DerivedUnlock()
 	table.Version = state.version
 	table.Stats = cloneTableStats(state.stats)
 	table.dirtyFrom = state.dirtyFrom
