@@ -122,3 +122,34 @@ func BenchmarkSubscriptionAggregateIndexedCount(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkSubscriptionIndexedSumAvg(b *testing.B) {
+	for _, incremental := range []bool{false, true} {
+		b.Run(fmt.Sprintf("incremental=%t", incremental), func(b *testing.B) {
+			db := filteredAggregateFixture(b, 20000, true)
+			table, _ := db.Get("default", "facts")
+			query := `SELECT category, SUM(amount) AS total, AVG(amount) AS mean FROM facts WHERE region='r1' AND time>=100 AND time<19000 GROUP BY category`
+			state := &querySubscriptionState{db: db, tenant: "default", query: mustParse(query).(*Select)}
+			if _, err := state.refresh(b.Context()); err != nil || state.aggregate == nil {
+				b.Fatalf("initial: %v", err)
+			}
+			if !incremental {
+				state.aggregate = nil
+				state.aggregateChecked = true
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				b.StopTimer()
+				insert := fmt.Sprintf(`INSERT INTO facts VALUES (%d,'r1','c1',120,0.1,48,11)`, len(table.Rows)+1)
+				if _, err := Execute(b.Context(), db, "default", mustParse(insert)); err != nil {
+					b.Fatal(err)
+				}
+				b.StartTimer()
+				if _, err := state.refresh(b.Context()); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

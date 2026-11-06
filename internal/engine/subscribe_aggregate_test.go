@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"math"
 	"math/big"
 	"math/rand"
 	"reflect"
@@ -487,16 +488,16 @@ func TestSubscriptionAggregateSchemaChangeFallsBack(t *testing.T) {
 	}
 }
 
-func TestSubscriptionAggregateIndexedWhereFallsBack(t *testing.T) {
+func TestSubscriptionAggregateIndexedSum(t *testing.T) {
 	db := filteredAggregateFixture(t, 600, true)
 	query := `SELECT category, SUM(amount) AS total FROM facts WHERE region='r1' AND time>=100 AND time<150 GROUP BY category`
 	state := &querySubscriptionState{db: db, tenant: "default", query: mustParse(query).(*Select)}
-	if _, err := state.refresh(t.Context()); err != nil || state.aggregate != nil {
-		t.Fatalf("expected index fallback: %v", err)
+	if _, err := state.refresh(t.Context()); err != nil || state.aggregate == nil {
+		t.Fatalf("expected incremental plan: %v", err)
 	}
 	execSQL(t, db, `INSERT INTO facts VALUES (601,'r1','c0',120,99,48,11)`)
 	change, err := state.refresh(t.Context())
-	if err != nil || change == nil || change.ScannedRows != -1 {
+	if err != nil || change == nil || change.ScannedRows < 0 {
 		t.Fatalf("refresh: %v %v", change, err)
 	}
 	if want := execSQL(t, db, query); !subscriptionAggregateSameResult(want, state.snapshot) {
@@ -514,8 +515,8 @@ func TestSubscriptionAggregateWhereNewIndex(t *testing.T) {
 	execSQL(t, db, `CREATE INDEX region_window ON facts(region,time)`)
 	execSQL(t, db, `INSERT INTO facts VALUES (601,'r1','c0',120,99,48,11)`)
 	change, err := state.refresh(t.Context())
-	if err != nil || change == nil || change.ScannedRows != -1 || state.aggregate != nil {
-		t.Fatalf("expected fallback: %v %v", change, err)
+	if err != nil || change == nil || change.ScannedRows < 0 || state.aggregate == nil {
+		t.Fatalf("expected incremental plan: %v %v", change, err)
 	}
 	if want := execSQL(t, db, query); !subscriptionAggregateSameResult(want, state.snapshot) {
 		t.Fatalf("got %v want %v", state.snapshot, want.Rows)
@@ -578,5 +579,94 @@ func TestSubscriptionAggregateHavingError(t *testing.T) {
 	_, want := Execute(t.Context(), db, "default", mustParse(query))
 	if got == nil || want == nil || got.Error() != want.Error() {
 		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestSubscriptionIndexedSumAvgExactOrder(t *testing.T) {
+	db := filteredAggregateFixture(t, 3000, true)
+	table, err := db.Get("default", "facts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Alternating magnitudes make a changed addition order observable.
+	for i, row := range table.Rows {
+		if i%17 != 0 {
+			row[4] = []float64{1e16, 1, -1e16, 0.1}[i%4]
+		}
+	}
+	for _, query := range []string{
+		`SELECT SUM(amount) AS total, AVG(amount) AS mean FROM facts WHERE region='r1' AND time>=100 AND time<2000`,
+		`SELECT category, SUM(amount) AS total, AVG(amount) AS mean, COUNT(amount) AS n FROM facts WHERE region='r1' AND time>=100 AND time<2000 GROUP BY category`,
+	} {
+		state := &querySubscriptionState{db: db, tenant: "default", query: mustParse(query).(*Select)}
+		if _, err := state.refresh(t.Context()); err != nil || state.aggregate == nil {
+			t.Fatalf("initial %s: %v", query, err)
+		}
+		for _, q := range []string{
+			`INSERT INTO facts VALUES (4001,'r1','c1',150,0.25,48,11)`,
+			`UPDATE facts SET amount=0.3, category='c2' WHERE id=111`,
+			`UPDATE facts SET region='r1', time=151 WHERE id=102`,
+			`DELETE FROM facts WHERE id=121`,
+		} {
+			execSQL(t, db, q)
+			if _, err := state.refresh(t.Context()); err != nil || state.aggregate == nil {
+				t.Fatalf("%s: %v", q, err)
+			}
+			want := execSQL(t, db, query)
+			if !subscriptionAggregateSameResult(want, state.snapshot) {
+				t.Fatalf("%s after %s: got %v want %v", query, q, state.snapshot, want.Rows)
+			}
+		}
+		execSQL(t, db, `DELETE FROM facts WHERE id=4001`)
+	}
+}
+
+func TestSubscriptionIndexedSumFullyCoveredFallsBack(t *testing.T) {
+	db := filteredAggregateFixture(t, 600, false)
+	query := `SELECT SUM(amount) AS total, AVG(amount) AS mean FROM facts WHERE id=123`
+	env := ExecEnv{ctx: t.Context(), db: db, tenant: "default"}
+	plan, ok, err := buildSimpleAggregatePlan(env, mustParse(query).(*Select))
+	if err != nil || !ok {
+		t.Fatalf("plan: %v %v", ok, err)
+	}
+	source, err := buildSimpleAggregateSourcePlan(plan)
+	if err != nil || !source.filterFullyCovered {
+		t.Fatalf("expected covered seek: %v", err)
+	}
+	state := &querySubscriptionState{db: db, tenant: "default", query: mustParse(query).(*Select)}
+	if _, err := state.refresh(t.Context()); err != nil || state.aggregate != nil {
+		t.Fatalf("expected fallback: %v", err)
+	}
+	execSQL(t, db, `UPDATE facts SET amount=0.1 WHERE id=123`)
+	change, err := state.refresh(t.Context())
+	if err != nil || change == nil || change.ScannedRows != -1 {
+		t.Fatalf("refresh: %v %v", change, err)
+	}
+}
+
+func TestSubscriptionIndexedSumIntegerOverflow(t *testing.T) {
+	db := storage.NewDB()
+	t.Cleanup(func() { _ = db.Close() })
+	table := storage.NewTable("indexed_overflow", []storage.Column{{Name: "k", Type: storage.IntType}, {Name: "v", Type: storage.IntType}}, false)
+	table.Rows = [][]any{{1, math.MaxInt}, {1, 1}, {1, -1}, {2, 7}}
+	if err := table.CreateSecondaryIndex("overflow_k", []string{"k"}, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put("default", table); err != nil {
+		t.Fatal(err)
+	}
+	query := `SELECT SUM(v) AS total, AVG(v) AS mean FROM indexed_overflow WHERE k=1`
+	state := &querySubscriptionState{db: db, tenant: "default", query: mustParse(query).(*Select)}
+	if _, err := state.refresh(t.Context()); err != nil || state.aggregate == nil {
+		t.Fatalf("initial: %v", err)
+	}
+	for _, q := range []string{`INSERT INTO indexed_overflow VALUES (1,2)`, `UPDATE indexed_overflow SET v=2 WHERE v=-1`, `DELETE FROM indexed_overflow WHERE v=1`} {
+		execSQL(t, db, q)
+		if _, err := state.refresh(t.Context()); err != nil || state.aggregate == nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		if want := execSQL(t, db, query); !subscriptionAggregateSameResult(want, state.snapshot) {
+			t.Fatalf("%s: got %v want %v", q, state.snapshot, want.Rows)
+		}
 	}
 }

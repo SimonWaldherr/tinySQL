@@ -63,8 +63,8 @@ UPDATE and DELETE. This path supports direct GROUP BY columns and COUNT, SUM,
 AVG, MIN and MAX over direct columns (and COUNT(*)), with deterministic,
 row-local WHERE predicates and HAVING expressions supported by the aggregate
 planner. Ordering, pagination and unsupported types and expressions use the
-general path. Indexed WHERE plans are incremental for direct COUNT aggregates;
-other aggregates fall back to preserve scan-order semantics. The first refresh
+general path. Indexed WHERE plans retain table-order accumulation for supported aggregates.
+Fully covered constraint seeks fall back to the general path. The first refresh
 scans the table; updates use the bounded row-update history and recompute
 changed groups in source order. A delete compacts physical positions, so the
 subscription checks the remaining rows against retained identities, then
@@ -155,4 +155,21 @@ figures depend on the query and data distribution.
 
 ```sh
 go test ./internal/engine -run '^$' -bench '^BenchmarkSubscriptionAggregate(Having|IndexedCount)$' -benchmem -benchtime=30x -count=3
+```
+
+### Indexed SUM and AVG
+
+For indexed predicates, candidate row IDs retain table order. Appended values
+are accumulated in that order, and changed groups are recomputed in row order;
+this preserves floating-point rounding and integer overflow behavior. Fully
+covered constraint seeks use the general path because they can bypass predicate
+evaluation.
+
+On an Apple M2 Max with Go 1.27.3, three 30-iteration runs over 20,000 initial
+rows measured 596–790 µs per refresh with full recomputation and 456–463 µs
+with incremental maintenance. Inserts and index updates were outside the timed
+section. Results depend on selectivity and group size.
+
+```sh
+go test ./internal/engine -run '^$' -bench '^BenchmarkSubscriptionIndexedSumAvg$' -benchmem -benchtime=30x -count=3
 ```

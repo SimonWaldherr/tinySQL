@@ -35,7 +35,7 @@ type subscriptionAggregateGroup struct {
 }
 
 // Only direct projections and deterministic, row-local filters are eligible.
-// Indexed WHERE plans use the normal executor to preserve input ordering.
+// Index candidates are in table order; fully covered constraint seeks fall back.
 func (s *querySubscriptionState) tryInitializeAggregate(ctx context.Context) error {
 	s.aggregateChecked = true
 	q := s.query
@@ -70,7 +70,7 @@ func (s *querySubscriptionState) tryInitializeAggregate(ctx context.Context) err
 		source = &simpleSelectPlan{table: table, colIndex: plan.colIndex, where: plan.where, filter: buildRawFilter(plan.colIndex, plan.where)}
 	} else {
 		source, err = buildSimpleAggregateSourcePlan(plan)
-		if err != nil || source.rowIDs != nil {
+		if err != nil || source.filterFullyCovered {
 			return nil
 		}
 	}
@@ -135,6 +135,9 @@ func (a *subscriptionAggregate) makeRow(raw []any, index int) (*subscriptionAggr
 	}
 	if !match {
 		return row, true, nil
+	}
+	if !a.isCandidate(index) {
+		return nil, false, nil
 	}
 	if !a.accepts(raw) {
 		return nil, false, nil
@@ -251,7 +254,7 @@ func subscriptionAggregateScalar(v any) bool {
 }
 
 // unchangedRow checks only the predicate and values that affect this result.
-func (a *subscriptionAggregate) unchangedRow(old *subscriptionAggregateRow, raw []any) (bool, error) {
+func (a *subscriptionAggregate) unchangedRow(old *subscriptionAggregateRow, raw []any, index int) (bool, error) {
 	matched := true
 	var err error
 	if a.source.where != nil {
@@ -269,6 +272,9 @@ func (a *subscriptionAggregate) unchangedRow(old *subscriptionAggregateRow, raw 
 	}
 	if !matched {
 		return true, nil
+	}
+	if !a.isCandidate(index) {
+		return false, nil
 	}
 	if !a.accepts(raw) {
 		return false, nil
@@ -315,12 +321,13 @@ func (s *querySubscriptionState) refreshAggregate(ctx context.Context) (*QueryCh
 	if table != a.table || !reflect.DeepEqual(a.columns, table.Cols) {
 		return fallback()
 	}
-	// An index can change the executor's scan order and thus floating point sums.
+	// Fully covered seeks bypass WHERE evaluation in the executor.
 	if a.plan.where != nil && !subscriptionIndexOrderIndependent(a.plan) {
 		source, err := buildSimpleAggregateSourcePlan(a.plan)
-		if err != nil || source.rowIDs != nil && !subscriptionIndexOrderIndependent(a.plan) {
+		if err != nil || source.filterFullyCovered {
 			return fallback()
 		}
+		a.source.rowIDs = source.rowIDs
 	}
 	env := ExecEnv{ctx: ctx, db: s.db, tenant: s.tenant}
 	affected := make(map[string]struct{})
@@ -368,7 +375,7 @@ func (s *querySubscriptionState) refreshAggregate(ctx context.Context) (*QueryCh
 			if len(raw) == 0 {
 				return fallback()
 			}
-			unchanged, err := a.unchangedRow(old, raw)
+			unchanged, err := a.unchangedRow(old, raw, i)
 			if err != nil {
 				return fallback()
 			}
@@ -453,7 +460,7 @@ func (s *querySubscriptionState) refreshAggregate(ctx context.Context) (*QueryCh
 				}
 				lastOld = old.index
 				old.seen = a.generation
-				same, err := a.unchangedRow(old, raw)
+				same, err := a.unchangedRow(old, raw, i)
 				if err != nil {
 					return fallback()
 				}
@@ -538,7 +545,7 @@ func (s *querySubscriptionState) refreshAggregate(ctx context.Context) (*QueryCh
 }
 
 // COUNT over direct columns is independent of the source scan order.
-// SUM/AVG and mixed-type MIN/MAX continue to use the full executor when indexed.
+// Other aggregates validate indexed access before incrementally maintaining state.
 func subscriptionIndexOrderIndependent(plan *simpleAggregatePlan) bool {
 	for _, proj := range plan.projs {
 		if proj.kind != aggGroupCol && proj.kind != aggCount {
@@ -546,4 +553,13 @@ func subscriptionIndexOrderIndependent(plan *simpleAggregatePlan) bool {
 		}
 	}
 	return true
+}
+
+// Candidate lists are sorted in table order by the index planner.
+func (a *subscriptionAggregate) isCandidate(row int) bool {
+	if a.source.rowIDs == nil {
+		return true
+	}
+	i := sort.SearchInts(a.source.rowIDs, row)
+	return i < len(a.source.rowIDs) && a.source.rowIDs[i] == row
 }
