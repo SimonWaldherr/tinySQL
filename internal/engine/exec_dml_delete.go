@@ -108,8 +108,11 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 		colIndex := simpleColumnIndex(t, s.Table)
 		rawPlan := &simpleSelectPlan{table: t, colIndex: colIndex, where: s.Where, filter: buildRawFilter(colIndex, s.Where)}
 		bindSimplePlanClock(rawPlan, env)
-		kept := make([][]any, 0, len(t.Rows))
-		oldToNew := make(map[int]int, len(t.Rows))
+		// Most no-match scans do not need an output slice or a position map.
+		// Allocate them only after the first deletion; rows before it retain
+		// their original positions.
+		var kept [][]any
+		var oldToNew map[int]int
 		del := 0
 		for i, r := range t.Rows {
 			if i&63 == 0 {
@@ -131,9 +134,21 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 				if err := wal.logDelete(env, i, r, t.Cols); err != nil {
 					return nil, err
 				}
+				if del == 0 {
+					kept = make([][]any, i, len(t.Rows)-1)
+					copy(kept, t.Rows[:i])
+					if len(t.Indexes) != 0 {
+						oldToNew = make(map[int]int, len(t.Rows)-1)
+						for j := 0; j < i; j++ {
+							oldToNew[j] = j
+						}
+					}
+				}
 				del++
-			} else {
-				oldToNew[i] = len(kept)
+			} else if del > 0 {
+				if oldToNew != nil {
+					oldToNew[i] = len(kept)
+				}
 				kept = append(kept, r)
 			}
 		}

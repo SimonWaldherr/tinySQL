@@ -245,3 +245,96 @@ func TestRowsOnlySnapshotFallsBackForAPinnedStreamSource(t *testing.T) {
 		t.Fatal("a table a stream is reading must keep the deep snapshot, so the stream's source is never restored in place")
 	}
 }
+
+// Rollback invalidation must remain dirty even if a search index generation
+// was persisted after it changed and before the statement was rolled back.
+func TestRowsOnlySnapshotInvalidationMarksPersistedIndexesDirty(t *testing.T) {
+	db := NewDB()
+	t.Cleanup(func() { _ = db.Close() })
+	table := rowsOnlyTestTable(t, db)
+	snapshot, err := db.SnapshotForRowsOnlyStatement("default", "chunks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	table.DerivedLock()
+	table.FTSIndexes["f"] = &FTSIndex{}
+	table.VectorIndexes["v"] = &VectorIndex{}
+	table.MarkFTSIndexesChanged()
+	table.MarkVectorIndexesChanged()
+	fg, vg := table.ftsGeneration, table.vectorGeneration
+	table.DerivedUnlock()
+	table.MarkFTSIndexesPersisted(fg)
+	table.MarkVectorIndexesPersisted(vg)
+	db.RestoreStatementSnapshot(snapshot)
+	if got, dirty := table.FTSIndexesPersistenceState(); !dirty || got <= fg {
+		t.Fatalf("FTS generation %d dirty %v, discarded %d", got, dirty, fg)
+	}
+	if got, dirty := table.VectorIndexesPersistenceState(); !dirty || got <= vg {
+		t.Fatalf("vector generation %d dirty %v, discarded %d", got, dirty, vg)
+	}
+}
+
+func TestRowsOnlySnapshotReadsSearchGenerationsUnderLock(t *testing.T) {
+	db := NewDB()
+	t.Cleanup(func() { _ = db.Close() })
+	table := rowsOnlyTestTable(t, db)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 2000; i++ {
+			table.DerivedLock()
+			table.MarkFTSIndexesChanged()
+			table.MarkVectorIndexesChanged()
+			table.DerivedUnlock()
+		}
+	}()
+	for i := 0; i < 2000; i++ {
+		snapshot, err := db.SnapshotForRowsOnlyStatement("default", "chunks")
+		if err != nil {
+			t.Fatal(err)
+		}
+		db.ReleaseStatementSnapshot(snapshot)
+	}
+	<-done
+}
+
+func TestRowsOnlySnapshotPersistsSearchIndexInvalidation(t *testing.T) {
+	db, err := OpenDB(StorageConfig{Mode: ModeDisk, Path: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	table := rowsOnlyTestTable(t, db)
+	if err := db.SyncTable("default", table); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := db.SnapshotForRowsOnlyStatement("default", "chunks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.ReleaseStatementSnapshot(snapshot)
+	table.DerivedLock()
+	table.FTSIndexes["f"] = &FTSIndex{}
+	table.VectorIndexes["v"] = &VectorIndex{}
+	table.MarkFTSIndexesChanged()
+	table.MarkVectorIndexesChanged()
+	table.DerivedUnlock()
+	if err := db.SyncTable("default", table); err != nil {
+		t.Fatal(err)
+	}
+	db.RestoreStatementSnapshot(snapshot)
+	if err := db.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	backend, ok := db.backend.(*DiskBackend)
+	if !ok {
+		t.Fatalf("unexpected backend %T", db.backend)
+	}
+	loaded, err := backend.LoadTable("default", "chunks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.FTSIndexes) != 0 || len(loaded.VectorIndexes) != 0 {
+		t.Fatalf("discarded indexes were persisted: FTS %d vector %d", len(loaded.FTSIndexes), len(loaded.VectorIndexes))
+	}
+}

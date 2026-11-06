@@ -316,6 +316,7 @@ func (s *querySubscriptionState) refreshAggregate(ctx context.Context) (*QueryCh
 	}
 	env := ExecEnv{ctx: ctx, db: s.db, tenant: s.tenant}
 	affected := make(map[string]struct{})
+	changed := false
 	remove := func(row *subscriptionAggregateRow) {
 		if row.matched {
 			delete(a.groups[row.group].members, row)
@@ -335,6 +336,7 @@ func (s *querySubscriptionState) refreshAggregate(ctx context.Context) (*QueryCh
 		}
 		group := a.ensureGroup(row)
 		group.members[row] = struct{}{}
+		changed = true
 		if _, dirty := affected[row.group]; !dirty {
 			return accumulateSimpleAggregateState(env, a.source, row.values, group.state, a.plan.projs)
 		}
@@ -353,7 +355,27 @@ func (s *querySubscriptionState) refreshAggregate(ctx context.Context) (*QueryCh
 			if err := checkCtx(ctx); err != nil {
 				return nil, err
 			}
-			next, ok, err := a.makeRow(table.Rows[i], i)
+			old := a.rows[i]
+			raw := table.Rows[i]
+			if len(raw) == 0 {
+				return fallback()
+			}
+			unchanged, err := a.unchangedRow(old, raw)
+			if err != nil {
+				return fallback()
+			}
+			if unchanged {
+				oldID, newID := &old.source[0], &raw[0]
+				if other := a.identities[newID]; other != nil && other != old {
+					return fallback()
+				}
+				delete(a.identities, oldID)
+				a.identities[newID] = old
+				old.source = raw
+				scanned++
+				continue
+			}
+			next, ok, err := a.makeRow(raw, i)
 			scanned++
 			if err != nil || !ok {
 				return fallback()
@@ -361,7 +383,6 @@ func (s *querySubscriptionState) refreshAggregate(ctx context.Context) (*QueryCh
 			if next.matched {
 				next.values = append([]any(nil), next.values...)
 			}
-			old := a.rows[i]
 			oldID, newID := &old.source[0], &next.source[0]
 			if other := a.identities[newID]; other != nil && other != old {
 				return fallback()
@@ -498,5 +519,8 @@ func (s *querySubscriptionState) refreshAggregate(ctx context.Context) (*QueryCh
 	a.count = len(table.Rows)
 	a.version = table.Version
 	a.structural = table.StructVersion()
+	if !changed && len(affected) == 0 {
+		return nil, nil
+	}
 	return s.applySubscriptionResult(ctx, a.result(), scanned)
 }

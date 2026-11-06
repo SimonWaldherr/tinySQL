@@ -342,6 +342,9 @@ func (db *DB) SnapshotForRowsOnlyStatement(tenant, name string) (*StatementSnaps
 	}
 	rows := make([][]any, len(table.Rows))
 	copy(rows, table.Rows)
+	table.DerivedLock()
+	ftsGeneration, vectorGeneration := table.ftsGeneration, table.vectorGeneration
+	table.DerivedUnlock()
 	return &StatementSnapshot{
 		tenant: tenant,
 		rowsOnly: &rowsOnlyTableState{
@@ -353,8 +356,8 @@ func (db *DB) SnapshotForRowsOnlyStatement(tenant, name string) (*StatementSnaps
 			dirtyRows:      captureDirtyRows(table),
 			dirtyRowsState: table.dirtyRowsState,
 
-			ftsGeneration:    table.ftsGeneration,
-			vectorGeneration: table.vectorGeneration,
+			ftsGeneration:    ftsGeneration,
+			vectorGeneration: vectorGeneration,
 		},
 		catalog: armCatalogRollback(db.Catalog()),
 	}, nil
@@ -701,9 +704,13 @@ func restoreRowsOnlyTable(state *rowsOnlyTableState) {
 	table.DerivedLock()
 	if table.ftsGeneration != state.ftsGeneration && len(table.FTSIndexes) > 0 {
 		table.FTSIndexes = make(map[string]*FTSIndex)
+		// Clearing is itself a new persistent change, including when an
+		// intervening sync already recorded the discarded generation.
+		table.MarkFTSIndexesChanged()
 	}
 	if table.vectorGeneration != state.vectorGeneration && len(table.VectorIndexes) > 0 {
 		table.VectorIndexes = make(map[string]*VectorIndex)
+		table.MarkVectorIndexesChanged()
 	}
 	table.DerivedUnlock()
 	table.Version = state.version
