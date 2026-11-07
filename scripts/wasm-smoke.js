@@ -46,6 +46,12 @@ async function main() {
     assert.equal(bulk.count, limit);
     assert.equal(typeof bulk.elapsed_ms, 'number');
   }
+  // CTE ordering binds source qualifiers and output aliases before pagination.
+  const orderedCTE = success(db.query('WITH c AS (SELECT id,label,active FROM bulk_transfer) SELECT q.id AS id,q.label AS caption FROM c q WHERE q.id>=4900 ORDER BY q.active DESC,id DESC LIMIT 5 OFFSET 2'));
+  assert.deepEqual(orderedCTE.columns, ['id', 'caption']);
+  assert.deepEqual(orderedCTE.rows, [4998, 4996, 4994, 4992, 4990].map(id => bulkExpected[id].slice(0, 2)));
+  assert.deepEqual(success(db.query('WITH c AS (SELECT id,label FROM bulk_transfer) SELECT q.id AS caption,q.label AS caption FROM c q ORDER BY caption DESC LIMIT 3')).rows,
+    [999, 998, 997].map(id => [bulkExpected[id][1]]));
   // Mutating an index run must visit every original candidate exactly once.
   success(db.exec('CREATE TABLE indexed_edits (id INT PRIMARY KEY, category TEXT, code INT, amount INT)'));
   success(db.exec("INSERT INTO indexed_edits VALUES (3,'a',10,7),(1,'b',10,8),(2,'a',10,9)"));

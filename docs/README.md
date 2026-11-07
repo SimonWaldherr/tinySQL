@@ -66,6 +66,8 @@ current behavior and keep performance claims scoped to the workload they measure
 
 ## Design and performance notes
 
+- [Ordered CTE consumers](cte-order-performance.md) — bind sort keys, select
+  pages before allocating output maps, and preserve materialization boundaries.
 - [DELETE and materialization](delete-cte-materialization-performance.md) —
   research sources, CTE binding, INTO/TEMP construction and measured tradeoffs.
 - [JSON and set performance](json-and-set-performance.md) — Go JSON compatibility,

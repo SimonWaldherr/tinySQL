@@ -260,15 +260,15 @@ func executeSelect(env ExecEnv, s *Select) (result *ResultSet, err error) {
 }
 
 // executeSimpleCTESelectFastPath fuses a single materialized-CTE scan with a
-// simple WHERE, direct-column projection, OFFSET and LIMIT. The general path
+// simple WHERE, direct-column projection, ordering, OFFSET and LIMIT. The general path
 // first copies every CTE row to add source qualifiers, then allocates a second
 // slice for WHERE and finally projects the survivors. Bare references and
 // unambiguous CTE-name/alias-qualified projections can read the immutable
-// ResultSet directly. Qualified predicates and dotted output names retain
-// the general path and its full lookup semantics.
+// ResultSet directly. Ordering selects source rows before building the output
+// maps; ambiguous dotted source columns retain the general lookup rules.
 func executeSimpleCTESelectFastPath(env ExecEnv, s *Select) (result *ResultSet, ok bool, err error) {
 	if s == nil || len(s.Joins) > 0 || len(s.GroupBy) > 0 || s.Having != nil ||
-		s.Union != nil || s.Pivot != nil || s.Distinct || len(s.OrderBy) > 0 ||
+		s.Union != nil || s.Pivot != nil || s.Distinct ||
 		s.From.Table == "" || s.From.Subquery != nil || s.From.TableFunc != nil ||
 		anyAggInSelect(s.Projs) || anyWindowInSelect(s.Projs) {
 		return nil, false, nil
@@ -290,13 +290,16 @@ func executeSimpleCTESelectFastPath(env ExecEnv, s *Select) (result *ResultSet, 
 		}
 		qualifier, column, qualified := strings.Cut(name, ".")
 		if !qualified {
-			return name, true
+			if len(s.OrderBy) == 0 {
+				return name, true
+			}
+			qualifier, column = cteName, name
 		}
 		if qualifier != cteName && (sourceAlias == "" || qualifier != sourceAlias) {
 			return "", false
 		}
 		if !columnsBound {
-			// Bind the schema once, lazily: unqualified consumers need no map.
+			// Unordered, unqualified consumers need no schema lookup.
 			columnKeys = make(map[string]struct{}, len(cteResult.Cols))
 			for _, col := range cteResult.Cols {
 				if strings.Contains(col, ".") {
@@ -329,12 +332,7 @@ func executeSimpleCTESelectFastPath(env ExecEnv, s *Select) (result *ResultSet, 
 		}
 	}
 
-	type projection struct {
-		source string
-		name   string
-		key    string
-	}
-	projections := make([]projection, 0, len(s.Projs))
+	projections := make([]cteSelectProjection, 0, len(s.Projs))
 	outputCols := make([]string, 0, len(s.Projs))
 	for i, item := range s.Projs {
 		ref := item.Expr.(*VarRef)
@@ -344,7 +342,7 @@ func executeSimpleCTESelectFastPath(env ExecEnv, s *Select) (result *ResultSet, 
 		}
 		source, _ = resolveSource(source)
 		name := projName(item, i)
-		projections = append(projections, projection{source: source, name: name, key: strings.ToLower(name)})
+		projections = append(projections, cteSelectProjection{source: source, name: name, key: strings.ToLower(name)})
 		seen := false
 		for _, existing := range outputCols {
 			if existing == name {
@@ -358,7 +356,7 @@ func executeSimpleCTESelectFastPath(env ExecEnv, s *Select) (result *ResultSet, 
 	}
 
 	predicate := s.Where
-	if exprHasQualifiedVarRef(predicate) {
+	if len(s.OrderBy) > 0 || exprHasQualifiedVarRef(predicate) {
 		var valid bool
 		predicate, valid = resolveCTEFilter(predicate, resolveSource)
 		if !valid {
@@ -385,7 +383,11 @@ func executeSimpleCTESelectFastPath(env ExecEnv, s *Select) (result *ResultSet, 
 	}
 	if env.profile != nil {
 		var phase *queryPhase
-		env, phase = startQueryPhase(env, "SCAN/FILTER/PROJECT", "materialized CTE")
+		operation := "SCAN/FILTER/PROJECT"
+		if len(s.OrderBy) > 0 {
+			operation = "SCAN/FILTER/SORT/PROJECT"
+		}
+		env, phase = startQueryPhase(env, operation, "materialized CTE")
 		defer func() {
 			var rows int64
 			if result != nil {
@@ -393,6 +395,9 @@ func executeSimpleCTESelectFastPath(env ExecEnv, s *Select) (result *ResultSet, 
 			}
 			phase.finish(rows)
 		}()
+	}
+	if len(s.OrderBy) > 0 {
+		return executeOrderedCTESelect(env, s, cteResult, projections, outputCols, resolveSource, filter)
 	}
 	capacity := len(cteResult.Rows) - offset
 	if capacity < 0 {

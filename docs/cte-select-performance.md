@@ -6,10 +6,12 @@ consumer reads the materialized result directly, avoiding intermediate maps
 with qualified keys for every source row. Output names, explicit aliases and
 last-value behavior for duplicate output names remain intact.
 
-Eligibility still requires direct column projections, no sorting, DISTINCT,
-aggregation, window functions, joins or compound operations. Qualified WHERE
-references, unknown qualifiers and ambiguous dotted CTE output column names
-retain the general execution path. CTE definitions are still materialized;
+The original optimization required direct column projections without sorting,
+DISTINCT, aggregation, windows, joins or compound operations. Follow-ups added
+[qualified WHERE binding](delete-cte-materialization-performance.md) and
+[ordered direct-column consumers](cte-order-performance.md). Unknown qualifiers
+and ambiguous dotted CTE output columns retain the general execution path.
+CTE definitions are still materialized;
 this change does not inline them or push predicates into their definitions.
 Recursive CTE evaluation rules are unchanged.
 
