@@ -572,14 +572,9 @@ func (b *DiskBackend) writeTableFile(path, tenant string, t *Table) (int64, erro
 	var encErr error
 	if b.format == diskFormatJSON {
 		// JSONMarshal-equivalent normalization (big.Rat/uuid.UUID -> string)
-		// applied to Rows before encoding; Cols/Name/etc. are already
-		// JSON-safe types.
-		normalized := dt
-		normalized.Rows = make([][]any, len(dt.Rows))
-		for i, row := range dt.Rows {
-			normalized.Rows[i] = normalizeForJSON(row).([]any)
-		}
-		encErr = enc.Encode(normalized)
+		// applied to Rows before encoding. Custom default-value marshalers
+		// retain their representation and the old isolation from row data.
+		encErr = enc.Encode(normalizeJSONTable(dt))
 	} else {
 		encErr = enc.Encode(dt)
 	}
@@ -625,12 +620,7 @@ func (b *DiskBackend) encodeTableInto(w io.Writer, dt diskTable) error {
 	enc := b.newEncoder(target)
 	var err error
 	if b.format == diskFormatJSON {
-		normalized := dt
-		normalized.Rows = make([][]any, len(dt.Rows))
-		for i, row := range dt.Rows {
-			normalized.Rows[i] = normalizeForJSON(row).([]any)
-		}
-		err = enc.Encode(normalized)
+		err = enc.Encode(normalizeJSONTable(dt))
 	} else {
 		err = enc.Encode(dt)
 	}

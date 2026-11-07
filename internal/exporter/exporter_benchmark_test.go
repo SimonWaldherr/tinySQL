@@ -47,3 +47,25 @@ func BenchmarkStreamingExports(b *testing.B) {
 		})
 	}
 }
+
+// Compare both implementations on identical data and encoder semantics.
+func BenchmarkJSONExportEncoding(b *testing.B) {
+	rs := benchmarkResultSet(1000)
+	for _, pretty := range []bool{false, true} {
+		for _, tc := range []struct {
+			name string
+			run  func(io.Writer, *engine.ResultSet, Options) error
+		}{
+			{"legacy", exportJSONLegacy}, {"stream", ExportJSON},
+		} {
+			b.Run(fmt.Sprintf("pretty=%t/%s", pretty, tc.name), func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					if err := tc.run(io.Discard, rs, Options{PrettyJSON: pretty}); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}

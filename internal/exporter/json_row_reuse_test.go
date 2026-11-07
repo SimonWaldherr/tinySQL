@@ -109,7 +109,7 @@ func TestJSONExportsPreserveWriterErrors(t *testing.T) {
 			}
 			for _, limit := range []int{0, 1, complete.Len() / 2, complete.Len() - 1} {
 				writer := &jsonExportLimitedWriter{remaining: limit}
-				if err := export.fn(writer, result, opts); !errors.Is(err, errJSONExportWrite) {
+				if err := export.fn(writer, result, opts); err != errJSONExportWrite {
 					t.Fatalf("%s pretty=%v limit=%d: error=%v", export.name, pretty, limit, err)
 				}
 				if !bytes.Equal(writer.Bytes(), complete.Bytes()[:limit]) {

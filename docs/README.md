@@ -66,6 +66,8 @@ current behavior and keep performance claims scoped to the workload they measure
 
 ## Design and performance notes
 
+- [JSON and set performance](json-and-set-performance.md) — Go JSON compatibility,
+  streaming export, normalization, and set representation.
 - [RAG, vector, and GROUP BY performance](rag-group-performance.md) — context
   expansion, HNSW traversal, integer grouping, and aggregate pagination.
 - [Query and index performance](query-index-performance.md) — text ordering,

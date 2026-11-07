@@ -227,48 +227,10 @@ func fillJSONRowMap(m map[string]any, r engine.Row, cols, keys []string, opts Op
 // ExportJSON writes ResultSet rows as a JSON array of objects. Like
 // ExportNDJSON, it encodes one row at a time instead of materializing a
 // result-sized []map[string]any, so memory use stays proportional to a
-// single row rather than the whole result set. The bytes written are
-// identical to json.Encoder (with the same PrettyJSON setting) encoding that
-// materialized slice in one call.
+// single row rather than the whole result set. Output uses the established
+// encoding/json semantics, including the PrettyJSON setting.
 func ExportJSON(w io.Writer, rs *engine.ResultSet, opts Options) error {
-	if _, err := io.WriteString(w, "["); err != nil {
-		return err
-	}
-	keys := resultColumnKeys(rs.Cols)
-	m := make(map[string]any, len(rs.Cols))
-	for i, r := range rs.Rows {
-		fillJSONRowMap(m, r, rs.Cols, keys, opts)
-		var b []byte
-		var err error
-		if opts.PrettyJSON {
-			b, err = json.MarshalIndent(m, "  ", "  ")
-		} else {
-			b, err = json.Marshal(m)
-		}
-		if err != nil {
-			return err
-		}
-		sep := ""
-		if i > 0 {
-			sep = ","
-		}
-		if opts.PrettyJSON {
-			sep += "\n  "
-		}
-		if _, err := io.WriteString(w, sep); err != nil {
-			return err
-		}
-		if _, err := w.Write(b); err != nil {
-			return err
-		}
-	}
-	if opts.PrettyJSON && len(rs.Rows) > 0 {
-		if _, err := io.WriteString(w, "\n"); err != nil {
-			return err
-		}
-	}
-	_, err := io.WriteString(w, "]\n")
-	return err
+	return exportJSON(w, rs, opts)
 }
 
 // ExportNDJSON writes one JSON object per ResultSet row. Unlike ExportJSON it
