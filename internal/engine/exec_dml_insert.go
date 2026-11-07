@@ -266,6 +266,10 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	// computed once per statement instead of per row.
 	constrainedCols := constrainedColumnIndices(t.Cols)
 	hasDefaults := tableHasDefaults(t.Cols)
+	var defaults []insertColumnDefault
+	if hasDefaults && len(rows) > 1 && !hasBefore && !hasAfter {
+		defaults = planInsertDefaults(t.Cols)
+	}
 	wal, err := beginWALAuto(env, s.Table)
 	if err != nil {
 		return nil, err
@@ -290,7 +294,13 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 		}
 		row := arena.row(len(t.Cols))
 		if hasDefaults {
-			if err := applyColumnDefaults(row, t.Cols); err != nil {
+			var err error
+			if defaults != nil {
+				err = applyInsertDefaults(row, t.Cols, defaults)
+			} else {
+				err = applyColumnDefaults(row, t.Cols)
+			}
+			if err != nil {
 				return nil, err
 			}
 		}
@@ -487,17 +497,83 @@ func applyColumnDefaults(row []any, cols []storage.Column) error {
 		if !col.HasDefault {
 			continue
 		}
-		v := col.DefaultValue
-		if b, ok := v.([]byte); ok {
-			v = append([]byte(nil), b...)
-		}
-		cv, err := coerceColumnValue(v, col)
+		cv, err := coerceColumnDefault(col)
 		if err != nil {
-			return fmt.Errorf("default for column %q: %w", col.Name, err)
+			return err
 		}
 		row[i] = cv
 	}
 	return nil
+}
+
+type insertColumnDefault struct {
+	col    int
+	value  any
+	cached bool
+}
+
+func planInsertDefaults(cols []storage.Column) []insertColumnDefault {
+	for _, col := range cols {
+		if col.HasDefault && !immutableInsertDefault(col.DefaultValue) {
+			if _, blob := col.DefaultValue.([]byte); !blob {
+				// A custom conversion can change other defaults between rows.
+				return nil
+			}
+		}
+	}
+	var defaults []insertColumnDefault
+	for i, col := range cols {
+		if col.HasDefault {
+			defaults = append(defaults, insertColumnDefault{col: i})
+		}
+	}
+	return defaults
+}
+
+// This statement-local list skips columns without defaults. Coercion remains
+// lazy so row-shape errors, cancellation and default failures keep their order.
+// Both the input and the result must be primitive to be reused. Mutable defaults
+// and custom conversions retain their per-row ownership and behavior.
+func applyInsertDefaults(row []any, cols []storage.Column, defaults []insertColumnDefault) error {
+	for i := range defaults {
+		entry := &defaults[i]
+		if !entry.cached {
+			col := cols[entry.col]
+			value, err := coerceColumnDefault(col)
+			if err != nil {
+				return err
+			}
+			row[entry.col] = value
+			if immutableInsertDefault(col.DefaultValue) && immutableInsertDefault(value) {
+				entry.value, entry.cached = value, true
+			}
+		} else {
+			row[entry.col] = entry.value
+		}
+	}
+	return nil
+}
+
+func coerceColumnDefault(col storage.Column) (any, error) {
+	value := col.DefaultValue
+	if blob, ok := value.([]byte); ok {
+		value = append([]byte(nil), blob...)
+	}
+	out, err := coerceColumnValue(value, col)
+	if err != nil {
+		return nil, fmt.Errorf("default for column %q: %w", col.Name, err)
+	}
+	return out, nil
+}
+
+func immutableInsertDefault(value any) bool {
+	switch value.(type) {
+	case nil, string, bool, int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64, uintptr, float32, float64:
+		return true
+	default:
+		return false
+	}
 }
 
 // validateRowConstraints checks row's constrained columns (NOT NULL,

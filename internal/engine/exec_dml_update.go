@@ -15,7 +15,12 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 			return rs, err
 		}
 	}
+	return executeGeneralUpdate(env, s)
+}
 
+// Keep the general executor's row maps and trigger state off the fast path's
+// stack frame. A point update need not reserve that state on every call.
+func executeGeneralUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 	t := planTable(env.planFor(s))
 	if t == nil {
 		var err error
@@ -56,7 +61,21 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 	}
 	values := make([]any, len(sets))
 	changedCols := make([]int, 0, len(sets))
-	for ri, r := range t.Rows {
+	sourceRows := t.Rows
+	var candidates []int
+	if plan := env.planFor(s); plan != nil && !plan.tenantFK && !hasBefore && !hasAfter && plan.rowIDsFound {
+		candidates = plan.rowIDs
+	}
+	candidateCount := len(sourceRows)
+	if candidates != nil {
+		candidateCount = len(candidates)
+	}
+	for candidate := 0; candidate < candidateCount; candidate++ {
+		ri := candidate
+		if candidates != nil {
+			ri = candidates[candidate]
+		}
+		r := sourceRows[ri]
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
 		}
@@ -107,6 +126,9 @@ func executeUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 			// but need not validate, rewrite indexes, dirty the row or enter WAL.
 			if len(changedCols) == 0 && !hasBefore && !hasAfter {
 				n++
+				if len(s.Returning) > 0 {
+					returningRows = append(returningRows, row)
+				}
 				continue
 			}
 			nextRow := append([]any(nil), t.Rows[ri]...)
@@ -415,7 +437,7 @@ func buildSimpleUpdatePlan(env ExecEnv, s *Update) (*simpleUpdatePlan, bool, err
 			return nil, true, err
 		}
 	}
-	// newDMLPlan resolved the column index and the constraint seek already, to
+	// newDMLPlan resolved the column index and the candidate seek already, to
 	// decide this statement's rollback snapshot shape; both are pure functions
 	// of state that cannot have changed since.
 	colIndex := planColumnIndex(stmtPlan)
@@ -433,8 +455,10 @@ func buildSimpleUpdatePlan(env ExecEnv, s *Update) (*simpleUpdatePlan, bool, err
 	}
 	var rowIDs []int
 	if candidates, found := planConstraintRows(stmtPlan, func() ([]int, bool) {
-		rows, _, _, ok := selectConstraintIndex(table, colIndex, s.Where)
-		return rows, ok
+		if rows, _, _, ok := selectConstraintIndex(table, colIndex, s.Where); ok {
+			return rows, true
+		}
+		return selectUpdateSecondaryRows(table, colIndex, s.Where)
 	}); found {
 		rowIDs = candidates
 	}
@@ -445,4 +469,30 @@ func buildSimpleUpdatePlan(env ExecEnv, s *Update) (*simpleUpdatePlan, bool, err
 		sets:     sets,
 		rowIDs:   rowIDs,
 	}, true, nil
+}
+
+// UPDATE must own its candidate list: changing an indexed column can remove
+// row IDs from the very index run being traversed. Both point and prefix seeks
+// retain table order, including for RETURNING and constraint-error precedence.
+func selectUpdateSecondaryRows(table *storage.Table, columns map[string]int, where Expr) ([]int, bool) {
+	index, values, _, _ := selectSecondaryIndex(table, columns, where)
+	if index == nil {
+		return nil, false
+	}
+	var rows []int
+	var err error
+	if len(values) == len(index.Columns) {
+		rows, err = table.LookupSecondaryIndexPoint(index, values)
+		rows = append([]int{}, rows...)
+	} else {
+		rows, err = table.LookupSecondaryIndexPrefix(index, values)
+		if rows == nil {
+			rows = []int{}
+		}
+	}
+	if err != nil {
+		// A failed optional seek must retain the scan path's behavior.
+		return nil, false
+	}
+	return rows, true
 }

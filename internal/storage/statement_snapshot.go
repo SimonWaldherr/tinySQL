@@ -394,10 +394,10 @@ func (db *DB) SnapshotForAppendOnlyTableStatement(tenant, name string) (*Stateme
 }
 
 // SnapshotForRowUpdateStatement captures a lightweight rollback point for an
-// UPDATE whose candidate row IDs are already known through a PRIMARY KEY or
-// UNIQUE constraint seek. Callers must use a table/full snapshot when triggers
-// or foreign-key actions can mutate state beyond these rows. Secondary-index
-// entries for the bounded rows are restored directly on rollback.
+// UPDATE whose candidate row IDs are already known through an index seek.
+// Callers need a table/full snapshot when triggers or foreign-key actions can
+// mutate state beyond these rows. Secondary-index entries for the bounded rows
+// are restored directly on rollback.
 func (db *DB) SnapshotForRowUpdateStatement(tenant, name string, rowIDs []int) (*StatementSnapshot, error) {
 	if db == nil {
 		return nil, nil

@@ -77,3 +77,72 @@ these samples do not establish a substantial latency improvement. Capacity is
 reserved before row validation, so a failing large batch can allocate header
 space before reporting its error. Conflict-skipping inserts are excluded to
 avoid reserving for rows that may never be inserted.
+
+## Indexed UPDATE and sparse defaults (2026-11-07)
+
+Triggerless UPDATEs can use ordinary secondary-index equality and composite
+prefix seeks when no foreign keys exist in the tenant. PRIMARY KEY/UNIQUE
+constraint seeks retain priority. The candidate list also bounds the rollback
+snapshot, so a point update no longer copies every row header in the table.
+The general executor, including RETURNING, uses the same bounded candidates.
+Its larger row-map/trigger state is kept in a separate function from the fast
+UPDATE dispatcher.
+
+Point-seek candidates are copied before execution because changing an indexed
+column can remove entries from the searched index run. Prefix results already
+own their row IDs. Both retain physical row order, and every candidate still
+passes the full WHERE predicate, coercion, constraints, index maintenance and
+WAL handling. Mixed numeric equality uses the SELECT planner's existing seek
+safety rules; a compatibility check may require scanning column values.
+Trigger and foreign-key paths retain their broader execution/snapshot rules.
+
+`UPDATE ... RETURNING` now includes matching rows whose values stay unchanged.
+Those matches count as updates without dirtying the row or advancing the table
+version. A statement with both changed and unchanged matches returns both.
+
+Multi-row INSERTs with an explicit column list prepare a compact default-column
+list. Primitive default inputs and primitive coercion results can be reused
+within the statement. BLOBs are still copied, and defaults parsed from JSON/vector
+strings into containers are decoded per row. Unknown default types use the
+original per-row path, preserving custom conversion calls and effects on other
+defaults. Triggers also retain that path.
+Default coercion stays after row-shape validation and cancellation checks, even
+when an explicit value later overwrites the default. Single-row statements keep
+their existing path; parameter-set APIs still execute separate statements.
+
+### Measurements
+
+Apple M2 Max, Go 1.27.3, darwin/arm64, GOMAXPROCS=12. Comparisons against
+`457f0ee` use the same benchmark code and an original-source overlay. Serialized
+runs take three 300–500 ms samples. The fixtures reuse parsed statements and
+in-memory storage; parsing, durable I/O and client/FFI transfer are excluded.
+
+| Workload | Before | After | Allocated bytes/op before → after |
+|---|---:|---:|---:|
+| UPDATE one row by indexed text key in 20,000 rows | 185–192 µs | 1.98–2.05 µs | 485,428 → 2,183 |
+| Same, RETURNING id and amount | 3.85–3.99 ms | 2.49–2.54 µs | 7,205,449 → 2,551 |
+| INSERT 1,000 rows into 64 columns with one default | 203–223 µs | 187–208 µs | 1,074,089 → 1,074,122 |
+
+The batch timing ranges overlap; a separate 500 ms comparison measured medians
+of 261 µs before and 231 µs after. The default plan adds one small allocation
+per statement; row-storage allocation is unchanged. The plain point UPDATE
+also allocates five more small objects for planning while eliminating the large
+snapshot allocation. These results apply to the measured shapes rather than
+all UPDATEs or inserts. Full-table UPDATEs and default-free inserts retain their
+existing execution strategies.
+
+```sh
+go test ./internal/engine -run '^$' \
+  -bench '^(BenchmarkUpdateSecondaryIndex|BenchmarkBatchInsertSparseDefaults)$' \
+  -benchmem -benchtime=500ms -count=3
+go test ./internal/engine \
+  -run 'TestUpdateSecondaryIndex|TestUpdateReturningIncludesUnchangedMatches|TestBatchDefaults' -count=1
+make wasm-smoke
+```
+
+Regression tests exercise point/prefix key moves, residual NULL predicates,
+empty seeks, duplicate-key rollback and retry, numeric representation mixing,
+unchanged RETURNING matches, mutable defaults across 64-row blocks, custom
+conversion effects and error precedence. The JavaScript smoke checks cover
+indexed UPDATE, unchanged RETURNING, rollback and a 131-row defaulted INSERT in
+the Browser/Node full and minimal profiles.

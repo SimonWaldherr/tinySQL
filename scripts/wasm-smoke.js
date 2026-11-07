@@ -46,6 +46,18 @@ async function main() {
     assert.equal(bulk.count, limit);
     assert.equal(typeof bulk.elapsed_ms, 'number');
   }
+  // Mutating an index run must visit every original candidate exactly once.
+  success(db.exec('CREATE TABLE indexed_edits (id INT PRIMARY KEY, category TEXT, code INT, amount INT)'));
+  success(db.exec("INSERT INTO indexed_edits VALUES (3,'a',10,7),(1,'b',10,8),(2,'a',10,9)"));
+  success(db.exec('CREATE INDEX indexed_edits_key ON indexed_edits(category,code)'));
+  assert.deepEqual(success(db.query("UPDATE indexed_edits SET category='moved' WHERE category='a' AND code=10 RETURNING id")).rows, [[3], [2]]);
+  assert.deepEqual(success(db.query("UPDATE indexed_edits SET amount=amount WHERE category='moved' RETURNING id,amount")).rows, [[3, 7], [2, 9]]);
+  assert.ok(db.exec("UPDATE indexed_edits SET id=999 WHERE category='moved'").error);
+  assert.deepEqual(success(db.query("SELECT id,amount FROM indexed_edits WHERE category='moved'")).rows, [[3, 7], [2, 9]]);
+  success(db.exec("CREATE TABLE batch_defaults (id INT, amount INT DEFAULT 7, label TEXT DEFAULT 'base')"));
+  success(db.exec('INSERT INTO batch_defaults (id) VALUES '
+    + Array.from({ length: 131 }, (_, id) => `(${id})`).join(',')));
+  assert.deepEqual(success(db.query('SELECT COUNT(*),SUM(amount) FROM batch_defaults')).rows, [[131, 917]]);
   const contracts = JSON.parse(fs.readFileSync(path.join(__dirname,
     '../internal/engine/testdata/sql_semantics.json'), 'utf8'));
   for (const sql of contracts.setup) success(db.exec(sql));

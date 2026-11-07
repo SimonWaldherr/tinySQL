@@ -304,7 +304,7 @@ func planColumnIndex(plan *dmlPlan) map[string]int {
 	return plan.colIndex
 }
 
-// planConstraintRows returns the precomputed constraint-index candidate set
+// planConstraintRows returns the precomputed index candidate set
 // and whether the seek found an index to use, falling back to seek() when the
 // plan holds no precomputed answer. A non-nil colIndex is what marks the pair
 // as precomputed: newDMLPlan only ever fills them in together.
@@ -385,6 +385,9 @@ func newDMLPlan(out *dmlPlan, db *storage.DB, tenant string, stmt Statement) *dm
 		plan.colIndex = simpleColumnIndex(table, s.Table)
 		if s.Where != nil {
 			plan.rowIDs, _, _, plan.rowIDsFound = selectConstraintIndex(table, plan.colIndex, s.Where)
+			if !plan.rowIDsFound {
+				plan.rowIDs, plan.rowIDsFound = selectUpdateSecondaryRows(table, plan.colIndex, s.Where)
+			}
 		}
 	case *Delete:
 		// Both consumers (rowDeleteSnapshotTarget and executeDelete's point
@@ -431,8 +434,8 @@ func appendOnlySnapshotTarget(plan *dmlPlan) (string, bool) {
 	return s.Table, true
 }
 
-// rowUpdateSnapshotTarget identifies a point UPDATE whose constraint-index
-// candidate set bounds every row the statement can replace. The compact
+// rowUpdateSnapshotTarget identifies an UPDATE whose index candidate set
+// bounds every row the statement can replace. The compact
 // snapshot is safe when no trigger/FK can write elsewhere; storage restores
 // secondary-index entries for those bounded rows as part of rollback.
 func rowUpdateSnapshotTarget(plan *dmlPlan) (string, []int, bool) {
