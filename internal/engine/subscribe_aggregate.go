@@ -35,7 +35,7 @@ type subscriptionAggregateGroup struct {
 }
 
 // Only direct projections and deterministic, row-local filters are eligible.
-// Index candidates are in table order; fully covered constraint seeks fall back.
+// Index candidates are in table order, including fully covered constraint seeks.
 func (s *querySubscriptionState) tryInitializeAggregate(ctx context.Context) error {
 	s.aggregateChecked = true
 	q := s.query
@@ -70,7 +70,7 @@ func (s *querySubscriptionState) tryInitializeAggregate(ctx context.Context) err
 		source = &simpleSelectPlan{table: table, colIndex: plan.colIndex, where: plan.where, filter: buildRawFilter(plan.colIndex, plan.where)}
 	} else {
 		source, err = buildSimpleAggregateSourcePlan(plan)
-		if err != nil || source.filterFullyCovered {
+		if err != nil {
 			return nil
 		}
 	}
@@ -123,7 +123,9 @@ func (a *subscriptionAggregate) makeRow(raw []any, index int) (*subscriptionAggr
 	row := &subscriptionAggregateRow{source: raw, index: index}
 	match := true
 	var err error
-	if a.source.where != nil {
+	if a.source.filterFullyCovered {
+		match = a.isCandidate(index)
+	} else if a.source.where != nil {
 		if a.source.filter != nil {
 			match, err = a.source.filter(raw)
 		} else {
@@ -257,7 +259,9 @@ func subscriptionAggregateScalar(v any) bool {
 func (a *subscriptionAggregate) unchangedRow(old *subscriptionAggregateRow, raw []any, index int) (bool, error) {
 	matched := true
 	var err error
-	if a.source.where != nil {
+	if a.source.filterFullyCovered {
+		matched = a.isCandidate(index)
+	} else if a.source.where != nil {
 		if a.source.filter != nil {
 			matched, err = a.source.filter(raw)
 		} else {
@@ -321,10 +325,10 @@ func (s *querySubscriptionState) refreshAggregate(ctx context.Context) (*QueryCh
 	if table != a.table || !reflect.DeepEqual(a.columns, table.Cols) {
 		return fallback()
 	}
-	// Fully covered seeks bypass WHERE evaluation in the executor.
+	// Rebind candidates; a changed coverage mode requires rebuilding the state.
 	if a.plan.where != nil && !subscriptionIndexOrderIndependent(a.plan) {
 		source, err := buildSimpleAggregateSourcePlan(a.plan)
-		if err != nil || source.filterFullyCovered {
+		if err != nil || source.filterFullyCovered != a.source.filterFullyCovered {
 			return fallback()
 		}
 		a.source.rowIDs = source.rowIDs

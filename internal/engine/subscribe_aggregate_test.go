@@ -621,7 +621,7 @@ func TestSubscriptionIndexedSumAvgExactOrder(t *testing.T) {
 	}
 }
 
-func TestSubscriptionIndexedSumFullyCoveredFallsBack(t *testing.T) {
+func TestSubscriptionIndexedSumFullyCovered(t *testing.T) {
 	db := filteredAggregateFixture(t, 600, false)
 	query := `SELECT SUM(amount) AS total, AVG(amount) AS mean FROM facts WHERE id=123`
 	env := ExecEnv{ctx: t.Context(), db: db, tenant: "default"}
@@ -634,13 +634,30 @@ func TestSubscriptionIndexedSumFullyCoveredFallsBack(t *testing.T) {
 		t.Fatalf("expected covered seek: %v", err)
 	}
 	state := &querySubscriptionState{db: db, tenant: "default", query: mustParse(query).(*Select)}
-	if _, err := state.refresh(t.Context()); err != nil || state.aggregate != nil {
-		t.Fatalf("expected fallback: %v", err)
+	if _, err := state.refresh(t.Context()); err != nil || state.aggregate == nil {
+		t.Fatalf("expected incremental plan: %v", err)
 	}
 	execSQL(t, db, `UPDATE facts SET amount=0.1 WHERE id=123`)
 	change, err := state.refresh(t.Context())
-	if err != nil || change == nil || change.ScannedRows != -1 {
+	if err != nil || change == nil || change.ScannedRows < 0 {
 		t.Fatalf("refresh: %v %v", change, err)
+	}
+	if want := execSQL(t, db, query); !subscriptionAggregateSameResult(want, state.snapshot) {
+		t.Fatalf("got %v want %v", state.snapshot, want.Rows)
+	}
+	for _, mutation := range []string{
+		`UPDATE facts SET id=700 WHERE id=123`,
+		`INSERT INTO facts VALUES (123,'r1','c1',120,0.25,48,11)`,
+		`DELETE FROM facts WHERE id=123`,
+	} {
+		execSQL(t, db, mutation)
+		change, err := state.refresh(t.Context())
+		if err != nil || change == nil || change.ScannedRows < 0 || state.aggregate == nil {
+			t.Fatalf("%s: %v %v", mutation, change, err)
+		}
+		if want := execSQL(t, db, query); !subscriptionAggregateSameResult(want, state.snapshot) {
+			t.Fatalf("%s: got %v want %v", mutation, state.snapshot, want.Rows)
+		}
 	}
 }
 

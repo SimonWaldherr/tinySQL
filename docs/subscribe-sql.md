@@ -64,7 +64,8 @@ AVG, MIN and MAX over direct columns (and COUNT(*)), with deterministic,
 row-local WHERE predicates and HAVING expressions supported by the aggregate
 planner. Ordering, pagination and unsupported types and expressions use the
 general path. Indexed WHERE plans retain table-order accumulation for supported aggregates.
-Fully covered constraint seeks fall back to the general path. The first refresh
+Fully covered constraint seeks use index membership instead of reevaluating
+the predicate. The first refresh
 scans the table; updates use the bounded row-update history and recompute
 changed groups in source order. A delete compacts physical positions, so the
 subscription checks the remaining rows against retained identities, then
@@ -161,9 +162,9 @@ go test ./internal/engine -run '^$' -bench '^BenchmarkSubscriptionAggregate(Havi
 
 For indexed predicates, candidate row IDs retain table order. Appended values
 are accumulated in that order, and changed groups are recomputed in row order;
-this preserves floating-point rounding and integer overflow behavior. Fully
-covered constraint seeks use the general path because they can bypass predicate
-evaluation.
+this preserves floating-point rounding and integer overflow behavior. For fully covered constraint seeks, membership in the current candidate list
+determines whether a row contributes. A change in coverage mode causes a full
+refresh and rebuild.
 
 On an Apple M2 Max with Go 1.27.3, three 30-iteration runs over 20,000 initial
 rows measured 596–790 µs per refresh with full recomputation and 456–463 µs
@@ -172,4 +173,16 @@ section. Results depend on selectivity and group size.
 
 ```sh
 go test ./internal/engine -run '^$' -bench '^BenchmarkSubscriptionIndexedSumAvg$' -benchmem -benchtime=30x -count=3
+```
+
+### Fully covered constraint seeks
+
+For a primary-key lookup over 20,000 rows, three 50-iteration runs on an Apple
+M2 Max with Go 1.27.3 measured 7.45–9.23 µs per refresh before and 6.24–8.58 µs
+after incremental maintenance, with allocations decreasing from 4,392 to
+3,056 bytes per operation. The timing ranges overlap; the allocation reduction
+is clearer for this small single-row result. Mutation time is excluded.
+
+```sh
+go test ./internal/engine -run '^$' -bench '^BenchmarkSubscriptionCoveredSumAvg$' -benchmem -benchtime=50x -count=3
 ```

@@ -153,3 +153,26 @@ func BenchmarkSubscriptionIndexedSumAvg(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkSubscriptionCoveredSumAvg(b *testing.B) {
+	db := filteredAggregateFixture(b, 20000, false)
+	table, _ := db.Get("default", "facts")
+	state := &querySubscriptionState{db: db, tenant: "default", query: mustParse(`SELECT SUM(amount) AS total, AVG(amount) AS mean FROM facts WHERE id=123`).(*Select)}
+	if _, err := state.refresh(b.Context()); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		b.StopTimer()
+		row := append([]any(nil), table.Rows[123]...)
+		row[4] = row[4].(float64) + 1
+		table.Rows[123] = row
+		table.MarkRowUpdated(123)
+		table.Version++
+		b.StartTimer()
+		if _, err := state.refresh(b.Context()); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
