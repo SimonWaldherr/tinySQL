@@ -128,7 +128,7 @@ func enqueueDelayedInsert(pc ProcedureContext, args []any) (*ResultSet, error) {
 		return nil, err
 	}
 	p := delayedInsertPayload{Version: 1, Table: insert.Table, Columns: insert.Cols, Schema: target.Cols, OnConflictDoNothing: insert.OnConflictDoNothing}
-	rows := insert.Rows
+	rows := insertRowSource{values: insert.Rows}
 	if insert.Select != nil {
 		rs, err := pc.Execute(insert.Select)
 		if err != nil {
@@ -158,7 +158,8 @@ func enqueueDelayedInsert(pc ProcedureContext, args []any) (*ResultSet, error) {
 			}
 		}
 	}
-	for _, row := range rows {
+	for ri := 0; ri < rows.len(); ri++ {
+		row := rows.at(ri)
 		if err := checkCtx(pc.env.ctx); err != nil {
 			return nil, err
 		}
@@ -187,11 +188,11 @@ func enqueueDelayedInsert(pc ProcedureContext, args []any) (*ResultSet, error) {
 		return nil, err
 	}
 	owner, _ := UserFromContext(pc.env.ctx)
-	queueInsert := &Insert{Table: delayedInsertTable, Rows: [][]Expr{{&Literal{Val: id}, &Literal{Val: due}, &Literal{Val: insert.Table}, &Literal{Val: payload.Bytes()}, &Literal{Val: owner}, &Literal{Val: pc.env.now}, &Literal{Val: len(rows)}}}}
+	queueInsert := &Insert{Table: delayedInsertTable, Rows: [][]Expr{{&Literal{Val: id}, &Literal{Val: due}, &Literal{Val: insert.Table}, &Literal{Val: payload.Bytes()}, &Literal{Val: owner}, &Literal{Val: pc.env.now}, &Literal{Val: rows.len()}}}}
 	if _, err := execStmt(pc.env, queueInsert); err != nil {
 		return nil, err
 	}
-	return &ResultSet{Cols: []string{"id", "due_at", "row_count"}, Rows: []Row{{"id": id, "due_at": due, "row_count": len(rows)}}}, nil
+	return &ResultSet{Cols: []string{"id", "due_at", "row_count"}, Rows: []Row{{"id": id, "due_at": due, "row_count": rows.len()}}}, nil
 }
 
 // Keep at most one batch of due-job references even with a large overdue queue.

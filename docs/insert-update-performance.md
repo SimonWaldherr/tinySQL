@@ -7,9 +7,11 @@ remain unchanged for snapshots and rollback. Single-row INSERTs and selective
 UPDATEs keep individual row allocations. Trigger, coercion, constraint, index,
 RETURNING and WAL handling continue through the existing execution paths.
 
-INSERT ... SELECT normalizes result column names once and packs the temporary
-expression slices and Literal objects into blocks. Every cell retains its own
-Literal; selected values still pass through normal INSERT validation.
+The original INSERT ... SELECT adapter normalized result column names once and
+packed temporary expressions into blocks. It has since been replaced with a
+[row cursor](delete-cte-materialization-performance.md) that reuses expression
+slots while preserving normal INSERT validation. The historical adapter
+measurements below describe the earlier implementation.
 
 ## Measurements
 

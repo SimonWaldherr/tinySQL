@@ -35,7 +35,7 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 		afterDelRunner = &triggerListRunner{triggers: afterDelTriggers}
 	}
 	hasTriggers := len(beforeDelTriggers) > 0 || len(afterDelTriggers) > 0
-	if env.triggerRow == nil && !hasTriggers && len(s.Returning) == 0 && isSimpleRawPredicate(s.Where) {
+	if s.Where != nil && env.triggerRow == nil && !hasTriggers && len(s.Returning) == 0 && isSimpleRawPredicate(s.Where) {
 		// newDMLPlan already resolved both of these while choosing this
 		// statement's rollback snapshot shape; see planConstraintRows.
 		colIndex := planColumnIndex(stmtPlan)
@@ -104,10 +104,18 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 	}
 
 	// Fast path: no triggers and a simple predicate – skip the full Row map allocation.
-	if env.triggerRow == nil && !hasTriggers && len(s.Returning) == 0 && isSimpleRawPredicate(s.Where) {
-		colIndex := simpleColumnIndex(t, s.Table)
+	if env.triggerRow == nil && !hasTriggers && isSimpleRawPredicate(s.Where) {
+		colIndex := planColumnIndex(stmtPlan)
+		if colIndex == nil {
+			colIndex = simpleColumnIndex(t, s.Table)
+		}
 		rawPlan := &simpleSelectPlan{table: t, colIndex: colIndex, where: s.Where, filter: buildRawFilter(colIndex, s.Where)}
 		bindSimplePlanClock(rawPlan, env)
+		var returningRows []Row
+		var keys tableRowKeys
+		if len(s.Returning) > 0 {
+			keys = newTableRowKeys(t.Cols, strings.ToLower(s.Table)+".")
+		}
 		// Most no-match scans do not need an output slice or a position map.
 		// Allocate them only after the first deletion; rows before it retain
 		// their original positions.
@@ -133,6 +141,9 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 			if match {
 				if err := wal.logDelete(env, i, r, t.Cols); err != nil {
 					return nil, err
+				}
+				if len(s.Returning) > 0 {
+					returningRows = append(returningRows, buildTableRow(keys, r))
 				}
 				if del == 0 {
 					kept = make([][]any, i, len(t.Rows)-1)
@@ -168,6 +179,9 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 			t.InvalidateStats()
 			t.MarkDirtyFrom(-1)
 			markDependentMaterializedViewsStale(env, s.Table)
+		}
+		if len(s.Returning) > 0 {
+			return projectReturningRows(env, t.Cols, s.Returning, returningRows)
 		}
 		return &ResultSet{Cols: []string{"deleted"}, Rows: []Row{{"deleted": del}}}, nil
 	}

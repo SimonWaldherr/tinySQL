@@ -47,12 +47,21 @@ func executeCreateTable(env ExecEnv, s *CreateTable) (*ResultSet, error) {
 	}
 	t := storage.NewTable(s.Name, cols, s.IsTemp)
 	t.Rows = make([][]any, 0, len(rs.Rows))
-	for _, r := range rs.Rows {
-		row := make([]any, len(cols))
+	arena := dmlRowArena{rowsPerBlock: min(len(rs.Rows), 64)}
+	for rowIndex, r := range rs.Rows {
+		if rowIndex&63 == 0 {
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, err
+			}
+		}
+		row := arena.row(len(cols))
 		for i, lower := range lowerNames {
 			row[i] = r[lower]
 		}
 		t.Rows = append(t.Rows, row)
+	}
+	if err := checkCtx(env.ctx); err != nil {
+		return nil, err
 	}
 	return nil, env.db.Put(env.tenant, t)
 }

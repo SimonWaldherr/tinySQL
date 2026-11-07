@@ -280,6 +280,10 @@ func executeSimpleCTESelectFastPath(env ExecEnv, s *Select) (result *ResultSet, 
 	// Resolve source qualifiers once instead of constructing qualified maps
 	// for every materialized row. Dotted output column names retain the
 	// generic lookup rules, where qualified and literal dotted keys can collide.
+	cteName := strings.ToLower(s.From.Table)
+	sourceAlias := strings.ToLower(s.From.Alias)
+	var columnKeys map[string]struct{}
+	columnsBound, dottedColumns := false, false
 	resolveSource := func(name string) (string, bool) {
 		if name == "" {
 			return "", false
@@ -288,19 +292,24 @@ func executeSimpleCTESelectFastPath(env ExecEnv, s *Select) (result *ResultSet, 
 		if !qualified {
 			return name, true
 		}
-		if qualifier != strings.ToLower(s.From.Table) &&
-			(s.From.Alias == "" || qualifier != strings.ToLower(s.From.Alias)) {
+		if qualifier != cteName && (sourceAlias == "" || qualifier != sourceAlias) {
 			return "", false
 		}
-		found := false
-		for _, col := range cteResult.Cols {
-			if strings.Contains(col, ".") {
-				return "", false
+		if !columnsBound {
+			// Bind the schema once, lazily: unqualified consumers need no map.
+			columnKeys = make(map[string]struct{}, len(cteResult.Cols))
+			for _, col := range cteResult.Cols {
+				if strings.Contains(col, ".") {
+					dottedColumns = true
+				}
+				columnKeys[strings.ToLower(col)] = struct{}{}
 			}
-			if strings.ToLower(col) == column {
-				found = true
-			}
+			columnsBound = true
 		}
+		if dottedColumns {
+			return "", false
+		}
+		_, found := columnKeys[column]
 		return column, found
 	}
 	// Reject expression/star projections before allocating a candidate plan.
@@ -348,8 +357,16 @@ func executeSimpleCTESelectFastPath(env ExecEnv, s *Select) (result *ResultSet, 
 		}
 	}
 
-	filter := buildRowWhereFilter(s.Where)
-	if s.Where != nil && (filter == nil || exprHasQualifiedVarRef(s.Where)) {
+	predicate := s.Where
+	if exprHasQualifiedVarRef(predicate) {
+		var valid bool
+		predicate, valid = resolveCTEFilter(predicate, resolveSource)
+		if !valid {
+			return nil, false, nil
+		}
+	}
+	filter := buildRowWhereFilter(predicate)
+	if s.Where != nil && filter == nil {
 		return nil, false, nil
 	}
 	offset := 0
@@ -422,6 +439,59 @@ func executeSimpleCTESelectFastPath(env ExecEnv, s *Select) (result *ResultSet, 
 		}
 	}
 	return &ResultSet{Cols: outputCols, Rows: outRows}, true, nil
+}
+
+// Bind qualified filter references to the materialized CTE's plain keys.
+// Copy changed nodes only: parsed/compiled statements can be shared by callers.
+func resolveCTEFilter(expr Expr, resolve func(string) (string, bool)) (Expr, bool) {
+	switch ex := expr.(type) {
+	case nil, *Literal:
+		return expr, true
+	case *VarRef:
+		name := ex.Lower
+		if name == "" {
+			name = strings.ToLower(ex.Name)
+		}
+		key, valid := resolve(name)
+		if !valid {
+			return nil, false
+		}
+		if key == name {
+			return expr, true
+		}
+		copy := *ex
+		copy.Lower = key
+		return &copy, true
+	case *Binary:
+		left, ok := resolveCTEFilter(ex.Left, resolve)
+		if !ok {
+			return nil, false
+		}
+		right, ok := resolveCTEFilter(ex.Right, resolve)
+		if !ok {
+			return nil, false
+		}
+		if left == ex.Left && right == ex.Right {
+			return expr, true
+		}
+		return &Binary{Op: ex.Op, Left: left, Right: right}, true
+	case *Unary:
+		inner, ok := resolveCTEFilter(ex.Expr, resolve)
+		if !ok {
+			return nil, false
+		}
+		copy := *ex
+		copy.Expr = inner
+		return &copy, true
+	case *IsNull:
+		inner, ok := resolveCTEFilter(ex.Expr, resolve)
+		if !ok {
+			return nil, false
+		}
+		return &IsNull{Expr: inner, Negate: ex.Negate}, true
+	default:
+		return nil, false
+	}
 }
 
 func exprHasQualifiedVarRef(expr Expr) bool {

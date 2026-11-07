@@ -78,6 +78,8 @@ drivers see `int64`.
 
 Both CTE INSERT spellings are supported:
 `WITH ... INSERT INTO ... SELECT ...` and `INSERT INTO ... WITH ... SELECT ...`.
+`CREATE [TEMP] TABLE name AS WITH ... SELECT ...` is also supported, including
+`IF NOT EXISTS`, through the same SELECT/CTE parser.
 The new leading-WITH form requires an INSERT SELECT source; it does not add
 WITH-prefixed UPDATE, DELETE or INSERT VALUES. Data-modifying CTE bodies are
 also outside this implementation.

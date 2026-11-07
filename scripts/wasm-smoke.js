@@ -58,6 +58,13 @@ async function main() {
   success(db.exec('INSERT INTO batch_defaults (id) VALUES '
     + Array.from({ length: 131 }, (_, id) => `(${id})`).join(',')));
   assert.deepEqual(success(db.query('SELECT COUNT(*),SUM(amount) FROM batch_defaults')).rows, [[131, 917]]);
+  success(db.exec('CREATE TEMP TABLE selected_stage AS WITH c AS (SELECT id,label FROM bulk_transfer) SELECT q.id AS id,q.label AS label FROM c q WHERE q.id>=4999'));
+  assert.deepEqual(success(db.query('SELECT id,label FROM selected_stage')).rows, bulkExpected.slice(4999).map(row => row.slice(0, 2)));
+  assert.deepEqual(success(db.query('DELETE FROM selected_stage WHERE id=5001 RETURNING id,label')).rows, [bulkExpected[5001].slice(0, 2)]);
+  assert.ok(db.query('DELETE FROM selected_stage WHERE id>=0 RETURNING missing').error);
+  assert.deepEqual(success(db.query('SELECT id FROM selected_stage ORDER BY id')).rows, [[4999], [5000], [5002]]);
+  success(db.exec('INSERT INTO selected_stage WITH c AS (SELECT id,label FROM bulk_transfer) SELECT q.id,q.label FROM c q WHERE q.id>=1 AND q.id<3'));
+  assert.deepEqual(success(db.query('SELECT id FROM selected_stage ORDER BY id')).rows, [[1], [2], [4999], [5000], [5002]]);
   const contracts = JSON.parse(fs.readFileSync(path.join(__dirname,
     '../internal/engine/testdata/sql_semantics.json'), 'utf8'));
   for (const sql of contracts.setup) success(db.exec(sql));

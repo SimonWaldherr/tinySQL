@@ -66,7 +66,7 @@ func TestCTESimpleScanAppliesWhereProjectionOffsetAndLimit(t *testing.T) {
 	}
 }
 
-func TestCTESimpleScanFallsBackForQualifiedReferences(t *testing.T) {
+func TestCTESimpleScanSupportsQualifiedReferences(t *testing.T) {
 	db := storage.NewDB()
 	rs := execSQL(t, db, `WITH c AS (SELECT 1 AS n) SELECT q.n FROM c AS q WHERE q.n = 1`)
 	if len(rs.Rows) != 1 {

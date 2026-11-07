@@ -16,7 +16,7 @@ import (
 )
 
 func executeInsert(env ExecEnv, s *Insert) (*ResultSet, error) {
-	rows := s.Rows
+	rows := insertRowSource{values: s.Rows}
 	if s.Select != nil {
 		rs, err := execStmt(env, s.Select)
 		if err != nil {
@@ -24,7 +24,7 @@ func executeInsert(env ExecEnv, s *Insert) (*ResultSet, error) {
 		}
 		rows = insertRowsFromResultSet(rs)
 	}
-	if len(rows) == 0 && s.Select == nil {
+	if rows.len() == 0 && s.Select == nil {
 		return nil, fmt.Errorf("INSERT requires at least one VALUES clause")
 	}
 	t := planTable(env.planFor(s))
@@ -36,46 +36,56 @@ func executeInsert(env ExecEnv, s *Insert) (*ResultSet, error) {
 	}
 	tmp := Row{}
 	if len(s.Cols) == 0 {
-		return executeInsertAllColumns(env, s, t, tmp, rows)
+		return executeInsertAllColumns(env, s, t, tmp, &rows)
 	}
-	return executeInsertSpecificColumns(env, s, t, tmp, rows)
+	return executeInsertSpecificColumns(env, s, t, tmp, &rows)
 }
 
-// insertRowsFromResultSet adapts a SELECT result to INSERT's existing
-// expression-based row path. Literals preserve the selected values exactly,
-// while the ordinary INSERT coercion, constraint, trigger, index and WAL paths
-// remain shared with VALUES inserts.
-func insertRowsFromResultSet(rs *ResultSet) [][]Expr {
-	rows := make([][]Expr, len(rs.Rows))
-	if len(rows) == 0 {
+// insertRowSource borrows one selected row at a time through a reusable set
+// of literal slots. INSERT consumes it synchronously before advancing; stored
+// rows and RETURNING maps retain values, never the temporary expressions.
+type insertRowSource struct {
+	values      [][]Expr
+	selected    *ResultSet
+	columns     []string
+	expressions []Expr
+	literals    []Literal
+}
+
+func insertRowsFromResultSet(rs *ResultSet) insertRowSource {
+	rows := insertRowSource{selected: rs}
+	if len(rs.Rows) == 0 {
 		return rows
 	}
-	columns := make([]string, len(rs.Cols))
+	rows.columns = make([]string, len(rs.Cols))
+	rows.expressions = make([]Expr, len(rs.Cols))
+	rows.literals = make([]Literal, len(rs.Cols))
 	for i, column := range rs.Cols {
-		columns[i] = strings.ToLower(column)
-	}
-	// These blocks live only for this INSERT. Give each cell its own Literal
-	// and cap each row slice so appending cannot overwrite the next row.
-	for start := 0; start < len(rows); {
-		count := min(64, len(rows)-start)
-		width := len(columns)
-		expressions := make([]Expr, count*width)
-		literals := make([]Literal, count*width)
-		for i := 0; i < count; i++ {
-			base := i * width
-			row := expressions[base : base+width : base+width]
-			for j, column := range columns {
-				literals[base+j].Val = rs.Rows[start+i][column]
-				row[j] = &literals[base+j]
-			}
-			rows[start+i] = row
-		}
-		start += count
+		rows.columns[i] = strings.ToLower(column)
+		rows.expressions[i] = &rows.literals[i]
 	}
 	return rows
 }
 
-func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, rows [][]Expr) (*ResultSet, error) {
+func (s *insertRowSource) len() int {
+	if s.selected != nil {
+		return len(s.selected.Rows)
+	}
+	return len(s.values)
+}
+
+func (s *insertRowSource) at(i int) []Expr {
+	if s.selected == nil {
+		return s.values[i]
+	}
+	for j, column := range s.columns {
+		s.literals[j].Val = s.selected.Rows[i][column]
+	}
+	return s.expressions
+}
+
+func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, rows *insertRowSource) (*ResultSet, error) {
+	rowCount := rows.len()
 	expected := len(t.Cols)
 	beforeTriggers, afterTriggers := planTriggers(env.planFor(s), env, s.Table, storage.TriggerInsert)
 	hasBefore := len(beforeTriggers) > 0
@@ -96,7 +106,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 	// plus one string concatenation per column, none of which anything read.
 	var returningRows []Row
 	if len(s.Returning) > 0 {
-		returningRows = make([]Row, 0, len(rows))
+		returningRows = make([]Row, 0, rowCount)
 	}
 	var keys tableRowKeys
 	if needsRow {
@@ -131,11 +141,12 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 	// Reserve row headers once when every input row will be appended on
 	// success. Triggers can mutate the table, and DO NOTHING may skip most
 	// inputs, so those paths retain incremental growth.
-	if !hasBefore && !hasAfter && !s.OnConflictDoNothing && len(rows) > 1 {
-		t.Rows = slices.Grow(t.Rows, len(rows))
+	if !hasBefore && !hasAfter && !s.OnConflictDoNothing && rowCount > 1 {
+		t.Rows = slices.Grow(t.Rows, rowCount)
 	}
-	arena := dmlRowArena{rowsPerBlock: min(len(rows), 64)}
-	for _, vals := range rows {
+	arena := dmlRowArena{rowsPerBlock: min(rowCount, 64)}
+	for ri := 0; ri < rowCount; ri++ {
+		vals := rows.at(ri)
 		if len(vals) != expected {
 			return nil, fmt.Errorf("INSERT expects %d values", expected)
 		}
@@ -218,7 +229,8 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 	return nil, nil
 }
 
-func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, rows [][]Expr) (*ResultSet, error) {
+func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, rows *insertRowSource) (*ResultSet, error) {
+	rowCount := rows.len()
 	colIdx := make([]int, len(s.Cols))
 	for i, name := range s.Cols {
 		idx, err := t.ColIndex(name)
@@ -242,7 +254,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	// RETURNING clause asks for the row map.
 	var returningRows []Row
 	if len(s.Returning) > 0 {
-		returningRows = make([]Row, 0, len(rows))
+		returningRows = make([]Row, 0, rowCount)
 	}
 	var keys tableRowKeys
 	if needsRow {
@@ -267,7 +279,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	constrainedCols := constrainedColumnIndices(t.Cols)
 	hasDefaults := tableHasDefaults(t.Cols)
 	var defaults []insertColumnDefault
-	if hasDefaults && len(rows) > 1 && !hasBefore && !hasAfter {
+	if hasDefaults && rowCount > 1 && !hasBefore && !hasAfter {
 		defaults = planInsertDefaults(t.Cols)
 	}
 	wal, err := beginWALAuto(env, s.Table)
@@ -281,11 +293,12 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	// Reserve row headers once when every input row will be appended on
 	// success. Triggers can mutate the table, and DO NOTHING may skip most
 	// inputs, so those paths retain incremental growth.
-	if !hasBefore && !hasAfter && !s.OnConflictDoNothing && len(rows) > 1 {
-		t.Rows = slices.Grow(t.Rows, len(rows))
+	if !hasBefore && !hasAfter && !s.OnConflictDoNothing && rowCount > 1 {
+		t.Rows = slices.Grow(t.Rows, rowCount)
 	}
-	arena := dmlRowArena{rowsPerBlock: min(len(rows), 64)}
-	for _, vals := range rows {
+	arena := dmlRowArena{rowsPerBlock: min(rowCount, 64)}
+	for ri := 0; ri < rowCount; ri++ {
+		vals := rows.at(ri)
 		if len(vals) != len(s.Cols) {
 			return nil, fmt.Errorf("INSERT column/value mismatch")
 		}

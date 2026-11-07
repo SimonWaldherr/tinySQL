@@ -42,8 +42,14 @@ func BenchmarkInsertSelectAdapt(b *testing.B) {
 	}
 	b.ReportAllocs()
 	for b.Loop() {
-		if len(insertRowsFromResultSet(rs)) != 1000 {
+		rows := insertRowsFromResultSet(rs)
+		if rows.len() != 1000 {
 			b.Fatal("rows")
+		}
+		for i := 0; i < rows.len(); i++ {
+			if rows.at(i)[0].(*Literal).Val != i {
+				b.Fatal("stale selected row")
+			}
 		}
 	}
 }
@@ -107,13 +113,14 @@ func TestDMLPackedRowsRemainIndependent(t *testing.T) {
 	}
 }
 
-func TestInsertSelectAdaptIndependentCells(t *testing.T) {
+func TestInsertSelectCursorPreservesSourceValues(t *testing.T) {
 	rs := &ResultSet{Cols: []string{"ID", "LaBeL", "missing"}, Rows: make([]Row, 130)}
 	for i := range rs.Rows {
 		rs.Rows[i] = Row{"id": i, "label": fmt.Sprint(i)}
 	}
 	rows := insertRowsFromResultSet(rs)
-	for i, row := range rows {
+	for i := 0; i < rows.len(); i++ {
+		row := rows.at(i)
 		for j, want := range []any{i, fmt.Sprint(i), nil} {
 			if got := row[j].(*Literal).Val; got != want {
 				t.Fatalf("cell %d,%d=%v, want %v", i, j, got, want)
@@ -122,8 +129,12 @@ func TestInsertSelectAdaptIndependentCells(t *testing.T) {
 		row[0].(*Literal).Val = -1
 		extended := append(row, &Literal{Val: "sentinel"})
 		extended[len(row)] = &Literal{Val: "changed"}
+		if rs.Rows[i]["id"] != i {
+			t.Fatal("cursor changed its source result")
+		}
 	}
-	if len(insertRowsFromResultSet(&ResultSet{})) != 0 {
+	empty := insertRowsFromResultSet(&ResultSet{})
+	if empty.len() != 0 {
 		t.Fatal("empty result")
 	}
 }

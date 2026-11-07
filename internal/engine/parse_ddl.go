@@ -115,7 +115,7 @@ func (p *Parser) parseCreateTable() (Statement, error) {
 	}
 	if p.cur.Typ == tKeyword && p.cur.Val == "AS" {
 		p.next()
-		sel, err := p.parseSelect()
+		sel, err := p.parseSelectWithCTE()
 		if err != nil {
 			return nil, err
 		}
