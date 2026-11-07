@@ -254,6 +254,9 @@ func buildRawExprFilter(colIndex map[string]int, e Expr) func([]any) (bool, erro
 	if !isSimpleRawExpr(e) || exprHasRowAwareFuncCall(e) {
 		return nil
 	}
+	if filter := buildRawConversionFilter(colIndex, e); filter != nil {
+		return filter
+	}
 	// Eager, not lazy: this plan is captured by the closure below, and that
 	// closure can end up in a cached plan template (see
 	// loadSimpleSelectPlanTemplate) shared by concurrently executing

@@ -497,17 +497,31 @@ func simpleFloatOrderScorer(plan *simpleSelectPlan) (rawFloatScorer, bool) {
 			return ftsLiteralTermsRank(ftsValueToString(raw[col]), terms, counts), nil
 		}, true
 
-	case "VEC_DOT", "VEC_COSINE_SIMILARITY", "VEC_COSINE_DISTANCE",
-		"VEC_L2_DISTANCE", "VEC_MANHATTAN_DISTANCE", "VEC_HAMMING_DISTANCE":
+	case "VEC_DOT", "VEC_DOT_PRODUCT", "VEC_INNER_PRODUCT", "VEC_COSINE_SIMILARITY", "VEC_COSINE_DISTANCE",
+		"VEC_L2_DISTANCE", "VEC_EUCLIDEAN_DISTANCE", "VEC_MANHATTAN_DISTANCE", "VEC_L1_DISTANCE", "VEC_HAMMING_DISTANCE":
+		if len(call.Args) != 2 {
+			return nil, false
+		}
 		query, ok := call.Args[1].(*Literal)
 		if !ok {
 			return nil, false
 		}
-		queryVec, ok := query.Val.([]float64)
-		if !ok {
+		// This scorer is prepared for each execution, after parameter binding.
+		// Decode constant JSON/[]any inputs once rather than for every row.
+		// Failed conversions retain row-time argument/error ordering.
+		queryVec, err := vecFromValue(query.Val)
+		if err != nil {
 			return nil, false
 		}
 		name := call.Name
+		switch name {
+		case "VEC_DOT_PRODUCT", "VEC_INNER_PRODUCT":
+			name = "VEC_DOT"
+		case "VEC_EUCLIDEAN_DISTANCE":
+			name = "VEC_L2_DISTANCE"
+		case "VEC_L1_DISTANCE":
+			name = "VEC_MANHATTAN_DISTANCE"
+		}
 		var queryPositive []bool
 		if name == "VEC_HAMMING_DISTANCE" {
 			queryPositive = make([]bool, len(queryVec))

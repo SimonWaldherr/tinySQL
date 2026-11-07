@@ -27,7 +27,7 @@ func projectRawRow(plan *simpleSelectPlan, raw []any) (Row, error) {
 			v = raw[p.colIdx]
 		} else {
 			var err error
-			v, err = evalRawExpr(plan, raw, p.expr)
+			v, err = evalRawProjection(plan, raw, p)
 			if err != nil {
 				return nil, err
 			}
@@ -77,7 +77,7 @@ func projectRawRowPooled(plan *simpleSelectPlan, raw []any) (Row, error) {
 			v = raw[p.colIdx]
 		} else {
 			var err error
-			v, err = evalRawExpr(plan, raw, p.expr)
+			v, err = evalRawProjection(plan, raw, p)
 			if err != nil {
 				clear(out)
 				rawRowPool.Put(out)
@@ -119,13 +119,20 @@ func projectRawValues(plan *simpleSelectPlan, raw []any, vals []any) error {
 			vals[i] = raw[p.colIdx]
 			continue
 		}
-		v, err := evalRawExpr(plan, raw, p.expr)
+		v, err := evalRawProjection(plan, raw, p)
 		if err != nil {
 			return err
 		}
 		vals[i] = v
 	}
 	return nil
+}
+
+func evalRawProjection(plan *simpleSelectPlan, raw []any, p simpleProjection) (any, error) {
+	if p.value != nil {
+		return p.value(raw)
+	}
+	return evalRawExpr(plan, raw, p.expr)
 }
 
 // rowFromProjectedValues materializes the Row map for already-computed

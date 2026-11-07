@@ -649,9 +649,10 @@ type simpleProjection struct {
 	key    string // strings.ToLower(name) – pre-computed Row map key
 	altKey string // optional second Row map key (e.g. "alias.col" for SELECT *,
 	// matching rowsFromTable's qualified+unqualified dual keys); empty if unused
-	side   int  // 0=left, 1=right (join), -1=single-table or expression
-	colIdx int  // >= 0: direct array index into raw/left/right; -1: use expr
-	expr   Expr // used when colIdx < 0
+	side   int               // 0=left, 1=right (join), -1=single-table or expression
+	colIdx int               // >= 0: direct array index into raw/left/right; -1: use expr
+	expr   Expr              // used when colIdx < 0
+	value  rawValueEvaluator // optional bound conversion; immutable in cached plans
 }
 
 type simpleJoinPlan struct {

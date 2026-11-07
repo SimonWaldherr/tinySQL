@@ -66,6 +66,8 @@ current behavior and keep performance claims scoped to the workload they measure
 
 ## Design and performance notes
 
+- [SELECT, conversions, and vector ranking](select-conversion-vector-performance.md)
+  — bind conversion declarations, preserve BETWEEN semantics and prepare query vectors.
 - [Ordered CTE consumers](cte-order-performance.md) — bind sort keys, select
   pages before allocating output maps, and preserve materialization boundaries.
 - [DELETE and materialization](delete-cte-materialization-performance.md) —

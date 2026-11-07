@@ -71,28 +71,40 @@ func evalConvertCall(ex *FuncCall, eval func(Expr) (any, error)) (any, error) {
 		if err != nil || input == nil {
 			return nil, err
 		}
-		number, ok := numeric(input)
-		if !ok || math.IsNaN(number) || number < 0 || number > 127 || math.Trunc(number) != number {
-			return nil, fmt.Errorf("%s: style must be a supported integer", ex.Name)
-		}
-		style = int(number)
-		if _, _, ok := conversionDateLayout(style); !ok {
-			return nil, fmt.Errorf("%s: unsupported date style %d", ex.Name, style)
+		style, err = conversionStyle(ex.Name, input)
+		if err != nil {
+			return nil, err
 		}
 	}
+	return convertCallValue(ex.Name, value, target, style)
+}
+
+func conversionStyle(name string, input any) (int, error) {
+	number, ok := numeric(input)
+	if !ok || math.IsNaN(number) || number < 0 || number > 127 || math.Trunc(number) != number {
+		return 0, fmt.Errorf("%s: style must be a supported integer", name)
+	}
+	style := int(number)
+	if _, _, ok := conversionDateLayout(style); !ok {
+		return 0, fmt.Errorf("%s: unsupported date style %d", name, style)
+	}
+	return style, nil
+}
+
+func convertCallValue(name string, value any, target conversionTarget, style int) (any, error) {
 	if value == nil {
 		return nil, nil
 	}
-	if strings.EqualFold(ex.Name, "TRY_CONVERT") && style < 0 && (target.name == "INT" || target.name == "INTEGER" || target.name == "BIGINT") {
+	if strings.EqualFold(name, "TRY_CONVERT") && style < 0 && (target.name == "INT" || target.name == "INTEGER" || target.name == "BIGINT") {
 		result, _ := conversionIntegerValue(value)
 		return result, nil
 	}
 	result, err := convertValue(value, target, style)
 	if err != nil {
-		if strings.EqualFold(ex.Name, "TRY_CONVERT") {
+		if strings.EqualFold(name, "TRY_CONVERT") {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("%s: %w", ex.Name, err)
+		return nil, fmt.Errorf("%s: %w", name, err)
 	}
 	return result, nil
 }

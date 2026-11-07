@@ -143,6 +143,7 @@ func buildSimpleSelectProjection(it SelectItem, idx int, colIndex map[string]int
 		side:   -1,
 		colIdx: colIdx,
 		expr:   it.Expr,
+		value:  compileRawConversion(colIndex, it.Expr),
 	}, true
 }
 

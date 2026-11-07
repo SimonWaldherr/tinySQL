@@ -52,6 +52,16 @@ async function main() {
   assert.deepEqual(orderedCTE.rows, [4998, 4996, 4994, 4992, 4990].map(id => bulkExpected[id].slice(0, 2)));
   assert.deepEqual(success(db.query('WITH c AS (SELECT id,label FROM bulk_transfer) SELECT q.id AS caption,q.label AS caption FROM c q ORDER BY caption DESC LIMIT 3')).rows,
     [999, 998, 997].map(id => [bulkExpected[id][1]]));
+  success(db.exec('CREATE TABLE converted_values (id INT,input TEXT)'));
+  success(db.exec("INSERT INTO converted_values VALUES (1,'12'),(2,'bad'),(3,NULL),(4,'7')"));
+  assert.deepEqual(success(db.query('SELECT id,TRY_CONVERT(INT,input) AS amount FROM converted_values')).rows,
+    [[1, 12], [2, null], [3, null], [4, 7]]);
+  assert.deepEqual(success(db.query('SELECT id FROM converted_values WHERE TRY_CONVERT(INT,input) BETWEEN 7 AND 12')).rows, [[1], [4]]);
+  assert.deepEqual(success(db.query('SELECT id FROM converted_values WHERE CAST(input AS INT) NOT BETWEEN 8 AND 11 AND id=1')).rows, [[1]]);
+  success(db.exec('CREATE TABLE ranked_vectors (id INT,embedding VECTOR)'));
+  success(db.exec("INSERT INTO ranked_vectors VALUES (3,'[1,0]'),(1,'[1,0]'),(2,'[0,1]'),(4,NULL)"));
+  assert.deepEqual(success(db.query("SELECT id,VEC_EUCLIDEAN_DISTANCE(embedding,'[1,0]') AS distance FROM ranked_vectors WHERE id BETWEEN 1 AND 3 ORDER BY distance LIMIT 2")).rows, [[3, 0], [1, 0]]);
+  assert.ok(db.query("SELECT VEC_L2_DISTANCE(embedding,'[1,0]',99) AS distance FROM ranked_vectors WHERE id=1 ORDER BY distance LIMIT 1").error);
   // Mutating an index run must visit every original candidate exactly once.
   success(db.exec('CREATE TABLE indexed_edits (id INT PRIMARY KEY, category TEXT, code INT, amount INT)'));
   success(db.exec("INSERT INTO indexed_edits VALUES (3,'a',10,7),(1,'b',10,8),(2,'a',10,9)"));
