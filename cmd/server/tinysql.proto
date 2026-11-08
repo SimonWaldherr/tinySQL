@@ -9,6 +9,7 @@ service TinySQL {
   rpc Query(QueryRequest) returns (QueryResponse);
   rpc QueryStream(QueryRequest) returns (stream QueryStreamResponse);
   rpc Bootstrap(BootstrapRequest) returns (BootstrapResponse);
+  rpc BootstrapStream(BootstrapRequest) returns (stream BootstrapChunk);
   rpc GetChangesSince(GetChangesSinceRequest) returns (GetChangesSinceResponse);
   rpc GetChanges(GetChangesSinceRequest) returns (stream GetChangesSinceResponse);
 }
@@ -55,7 +56,17 @@ message QueryStreamResponse {
   string error = 8;
 }
 
-message BootstrapRequest { string tenant = 1; }
+message BootstrapRequest {
+  string tenant = 1;
+  int64 chunk_bytes = 2;
+}
+
+message BootstrapChunk {
+  bytes data = 1;
+  uint64 watermark_lsn = 2;
+  uint64 epoch = 3;
+  bool complete = 4;
+}
 
 message BootstrapResponse {
   bytes snapshot_gob = 1;

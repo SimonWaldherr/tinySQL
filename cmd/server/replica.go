@@ -194,21 +194,22 @@ func runReplicaBootstrap(ctx context.Context, primaryAddr, tenant string, opts r
 	callCtx, cancel := replicaCallContext(ctx, opts)
 	defer cancel()
 
-	var resp bootstrapResponse
-	req := &bootstrapRequest{Tenant: tenant}
-	if err := conn.Invoke(callCtx, "/tinysql.TinySQL/Bootstrap", req, &resp); err != nil {
+	db, watermark, epoch, err = bootstrapFromStream(callCtx, conn, tenant, opts)
+	if status.Code(err) == codes.Unimplemented {
+		var resp bootstrapResponse
+		if err = conn.Invoke(callCtx, "/tinysql.TinySQL/Bootstrap", &bootstrapRequest{Tenant: tenant}, &resp); err == nil {
+			db, err = storage.LoadFromBytes(resp.SnapshotGob)
+			watermark, epoch = resp.WatermarkLSN, resp.Epoch
+		}
+	}
+	if err != nil {
 		return nil, 0, 0, fmt.Errorf("bootstrap from primary %s: %w", primaryAddr, err)
 	}
-
-	db, err = storage.LoadFromBytes(resp.SnapshotGob)
-	if err != nil {
-		return nil, 0, 0, fmt.Errorf("decode snapshot from primary %s: %w", primaryAddr, err)
-	}
-	if err := storage.InitializeReplicaState(db, resp.Epoch, resp.WatermarkLSN); err != nil {
+	if err := storage.InitializeReplicaState(db, epoch, watermark); err != nil {
 		_ = db.Close()
 		return nil, 0, 0, fmt.Errorf("initialize replica bootstrap state from primary %s: %w", primaryAddr, err)
 	}
-	return db, resp.WatermarkLSN, resp.Epoch, nil
+	return db, watermark, epoch, nil
 }
 
 // pollChangesSinceOnce performs one GetChangesSince RPC call against conn,
@@ -647,9 +648,7 @@ func runReplica(replicaOf string) error {
 	srv := newServer(db, resolveRunTenant("default"), *flagAuth, nil, trustedProxies, peerDialCreds)
 	srv.replica = &replicaHealth{primary: replicaOf, transport: strings.ToLower(strings.TrimSpace(*flagReplicaTransport)), timeout: *flagReplicaReadyTimeout}
 	defer func() {
-		srv.dbMu.Lock()
-		defer srv.dbMu.Unlock()
-		_ = srv.db.Close()
+		_ = srv.closeDatabase()
 	}()
 	encoding.RegisterCodec(jsonCodec{})
 	encoding.RegisterCodec(protobufCodec{})
@@ -678,7 +677,7 @@ func runReplica(replicaOf string) error {
 		srv.serveReplicaLoop(ctx, replicaOf, opts, changesLoop)
 	}()
 	runErr := waitForServerStop(errChan)
-	srv.ready.Store(false)
+	srv.beginShutdown()
 	cancel()
 	shutdownErr := shutdownRunServers(httpSrv, grpcSrv, nil)
 	<-done

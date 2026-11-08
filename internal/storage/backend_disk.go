@@ -759,7 +759,7 @@ func (b *DiskBackend) readTableFile(path string) (*Table, error) {
 	}
 	// diskToTable normalizes vector cells regardless of source format: GOB
 	// preserves []float64 exactly, JSON decodes numeric arrays as []any.
-	return diskToTable(dt), nil
+	return diskToTableOwned(dt), nil
 }
 
 // ──── Manifest (JSON) ───────────────────────────────────────────────────

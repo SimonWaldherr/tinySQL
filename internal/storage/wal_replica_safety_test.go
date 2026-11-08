@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -9,6 +10,11 @@ import (
 )
 
 func TestSnapshotWithWatermarkWaitsForMutationAndCommit(t *testing.T) {
+	t.Run("legacy", func(t *testing.T) { testSnapshotWaitsForMutationAndCommit(t, false) })
+	t.Run("streamed", func(t *testing.T) { testSnapshotWaitsForMutationAndCommit(t, true) })
+}
+
+func testSnapshotWaitsForMutationAndCommit(t *testing.T, streamed bool) {
 	tmp := t.TempDir()
 	wal, err := OpenAdvancedWAL(AdvancedWALConfig{Path: filepath.Join(tmp, "primary.wal")})
 	if err != nil {
@@ -34,7 +40,16 @@ func TestSnapshotWithWatermarkWaitsForMutationAndCommit(t *testing.T) {
 	}
 	done := make(chan snapshotResult, 1)
 	go func() {
-		data, watermark, _, snapErr := SnapshotWithWatermark(db, wal)
+		var data []byte
+		var watermark uint64
+		var snapErr error
+		if streamed {
+			var output bytes.Buffer
+			watermark, _, snapErr = WriteReplicationSnapshot(t.Context(), db, wal, &output)
+			data = output.Bytes()
+		} else {
+			data, watermark, _, snapErr = SnapshotWithWatermark(db, wal)
+		}
 		done <- snapshotResult{data: data, watermark: watermark, err: snapErr}
 	}()
 	select {
@@ -69,7 +84,12 @@ func TestSnapshotWithWatermarkWaitsForMutationAndCommit(t *testing.T) {
 	if result.watermark != uint64(commitLSN) {
 		t.Fatalf("snapshot watermark = %d, want committed LSN %d", result.watermark, commitLSN)
 	}
-	loaded, err := LoadFromBytes(result.data)
+	var loaded *DB
+	if streamed {
+		loaded, err = LoadReplicationSnapshot(t.Context(), bytes.NewReader(result.data))
+	} else {
+		loaded, err = LoadFromBytes(result.data)
+	}
 	if err != nil {
 		t.Fatalf("LoadFromBytes: %v", err)
 	}

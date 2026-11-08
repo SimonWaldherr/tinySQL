@@ -114,10 +114,23 @@ networks that cannot carry long-lived gRPC streams. On different hosts, configur
 CA/server name on replicas. Terminate public HTTPS at your load balancer or use
 the server's HTTP TLS flags.
 
-The complete snapshot and each WAL response must fit both the primary's
-`-grpc-max-send-bytes` and the replica's `-grpc-max-recv-bytes`. Defaults are
-4 MiB; these examples use 64 MiB. Increase both deliberately for larger datasets;
-bootstrap is a whole-database transfer and each replica must fit it in memory.
+New replicas use `BootstrapStream`: the primary serializes 256-row batches and
+sends messages of at most 64 KiB, reduced further to fit both nodes' configured
+message limits. A complete snapshot can therefore exceed the gRPC message limit.
+The primary admits one bootstrap at a time to limit concurrent detached images;
+queued requests honor cancellation and `-peer-timeout` covers the whole transfer.
+Increase that timeout for slow links or large datasets. Data, catalog and the WAL
+resume position belong to one consistent capture. Locks are released before
+encoding and network output. Replicas publish the image only after its completion
+marker and successful stream termination.
+
+The unary `Bootstrap` method and historical snapshot files remain supported.
+A new replica falls back to unary bootstrap when an older primary reports
+`Unimplemented`; that path still requires the whole snapshot to fit a message.
+Each WAL response also remains a single message. The defaults are 4 MiB; the
+examples allow 64 MiB for larger WAL batches. Bootstrap transfers the whole
+database and every replica still holds a complete in-memory copy. Chunked transfer
+reduces transient buffers; it does not turn replication into disk-paged storage.
 
 ## Readiness and recovery
 
@@ -141,6 +154,15 @@ that removes needed WAL records, a schema/catalog checkpoint, or a changed WAL
 epoch triggers a full new snapshot. Existing queries finish against their
 current snapshot before that database is closed. Replicas never execute a
 second job scheduler or replay SQL triggers; they apply committed row changes.
+
+On SIGTERM/SIGINT a node permanently withdraws readiness, ends its open-ended
+replication feeds and starts draining HTTP and gRPC together. Ordinary requests
+retain `-shutdown-timeout` to finish, then remaining transports are forced closed
+before the database is persisted and closed. A forced drain is reported as an
+error. Final storage flush/checkpoint I/O may take additional time; the Compose
+example gives containers 60 seconds before Docker can send SIGKILL. Adjust that
+grace period for the dataset and storage device. The primary's named volume is
+retained by `docker compose down`; `down --volumes` deliberately removes it.
 
 `-peers` is federation: it concatenates results from distinct databases. It is
 not replication or load balancing, and would duplicate rows across identical

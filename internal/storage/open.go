@@ -313,7 +313,7 @@ func loadGOBInto(db *DB, filename string) (bool, error) {
 		return false, err
 	}
 	for _, dt := range dump {
-		_ = db.Put(dt.Tenant, diskToTable(dt))
+		_ = db.Put(dt.Tenant, diskToTableOwned(dt))
 	}
 	loadedCatalog := false
 	var dc diskCatalog

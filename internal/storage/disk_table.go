@@ -160,6 +160,17 @@ func normalizeVectorValue(v any) any {
 }
 
 func diskToTable(dt diskTable) *Table {
+	return restoreDiskTable(dt, false)
+}
+
+// Fresh decoders own their row slices. Transfer them instead of allocating a
+// second set of headers and cells; WAL callers that retain records keep using
+// diskToTable's copying behavior.
+func diskToTableOwned(dt diskTable) *Table {
+	return restoreDiskTable(dt, true)
+}
+
+func restoreDiskTable(dt diskTable, owned bool) *Table {
 	cols := make([]Column, len(dt.Cols))
 	for i, c := range dt.Cols {
 		cols[i] = Column(c)
@@ -171,9 +182,21 @@ func diskToTable(dt diskTable) *Table {
 	t.FTSIndexes = cloneFTSIndexes(dt.FTSIndexes)
 	t.VectorIndexes = cloneVectorIndexes(dt.VectorIndexes)
 	t.Stats = cloneTableStats(dt.Stats)
-	t.Rows = make([][]any, len(dt.Rows))
+	if owned && dt.Rows != nil {
+		t.Rows = dt.Rows[:len(dt.Rows):len(dt.Rows)]
+	} else {
+		t.Rows = make([][]any, len(dt.Rows))
+	}
 	for ri, r := range dt.Rows {
-		row := make([]any, len(r))
+		var row []any
+		if owned && r != nil {
+			row = r[:len(r):len(r)]
+			if len(row) > len(cols) {
+				clear(row[len(cols):])
+			}
+		} else {
+			row = make([]any, len(r))
+		}
 		for ci, v := range r {
 			if ci >= len(cols) {
 				break // Skip extra columns beyond schema

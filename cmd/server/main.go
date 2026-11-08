@@ -196,7 +196,8 @@ type queryStreamResponse struct {
 // replica. gob preserves those concrete types, and the WAL file already
 // gob-encodes WALRecord, so no new type registration is needed.
 type bootstrapRequest struct {
-	Tenant string `json:"tenant" protobuf:"1"`
+	Tenant     string `json:"tenant" protobuf:"1"`
+	ChunkBytes int64  `json:"chunk_bytes,omitempty" protobuf:"2"`
 }
 
 type bootstrapResponse struct {
@@ -241,7 +242,7 @@ func (jsonCodec) Name() string                       { return "json" }
 func (jsonCodec) Marshal(v any) ([]byte, error)      { return storage.JSONMarshal(v) }
 func (jsonCodec) Unmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }
 
-// gRPC service interface and descriptors (manual, no protobuf)
+// Manual gRPC registration for the wire schema in tinysql.proto.
 type TinySQLServer interface {
 	Exec(context.Context, *execRequest) (*execResponse, error)
 	Query(context.Context, *queryRequest) (*queryResponse, error)
@@ -260,6 +261,7 @@ func registerTinySQLServer(s *grpc.Server, srv TinySQLServer) {
 			{MethodName: "GetChangesSince", Handler: _TinySQL_GetChangesSince_Handler},
 		},
 		Streams: []grpc.StreamDesc{
+			{StreamName: "BootstrapStream", Handler: _TinySQL_BootstrapStream_Handler, ServerStreams: true},
 			{
 				StreamName:    "GetChanges",
 				Handler:       _TinySQL_GetChanges_Handler,
@@ -391,7 +393,8 @@ func _TinySQL_GetChanges_Handler(srv any, stream grpc.ServerStream) (err error) 
 		return err
 	}
 
-	ctx := stream.Context()
+	ctx, cancel := s.replicationContext(stream.Context())
+	defer cancel()
 	sinceLSN := req.SinceLSN
 	backoff := replicaMinPollBackoff
 
@@ -533,6 +536,8 @@ func _TinySQL_QueryStream_Handler(srv any, stream grpc.ServerStream) (err error)
 
 // server state
 type server struct {
+	drainCtx    context.Context
+	drainCancel context.CancelFunc
 	// dbMu pins a database generation until a request (including a stream)
 	// finishes, so re-bootstrap never closes a database still being read.
 	dbMu             sync.RWMutex
@@ -554,12 +559,17 @@ type server struct {
 	analytics        bool
 	startedAt        time.Time
 	ready            atomic.Bool
+	draining         atomic.Bool
 	metrics          *metricsRegistry
 	execSem          chan struct{} // bounded concurrency for Exec/Query; nil = unlimited
+	bootstrapSem     chan struct{} // one detached bootstrap image at a time
 }
 
 func newServer(db *storage.DB, defaultTenant, authToken string, peers []string, trustedProxies []*net.IPNet, peerDialCreds credentials.TransportCredentials) *server {
+	drainCtx, drainCancel := context.WithCancel(context.Background())
 	s := &server{
+		drainCtx: drainCtx, drainCancel: drainCancel,
+		bootstrapSem:     make(chan struct{}, 1),
 		db:               db,
 		cache:            engine.NewQueryCache(200),
 		peers:            peers,
@@ -1225,6 +1235,13 @@ var errNoAdvancedWAL = errors.New("database is not running with an advanced WAL 
 // decode via storage.LoadFromBytes and then resume from via
 // GetChangesSince(sinceLSN=watermark).
 func (s *server) Bootstrap(ctx context.Context, req *bootstrapRequest) (*bootstrapResponse, error) {
+	ctx, cancel := s.replicationContext(ctx)
+	defer cancel()
+	release, err := s.acquireBootstrap(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	unlock, err := s.acquireDatabase()
 	if err != nil {
 		return nil, err
@@ -2248,9 +2265,12 @@ func run() error {
 
 	runErr := waitForServerStop(errChan)
 
-	srv.ready.Store(false)
+	srv.beginShutdown()
 
-	shutdownErr := shutdownRunServers(httpSrv, grpcSrv, db)
+	shutdownErr := shutdownRunServers(httpSrv, grpcSrv, nil)
+	if err := srv.closeDatabase(); err != nil {
+		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("close db: %w", err))
+	}
 
 	if runErr != nil {
 		return runErr
@@ -2506,6 +2526,21 @@ func shutdownRunServers(httpSrv *http.Server, grpcSrv *grpc.Server, db *storage.
 	defer cancel()
 
 	var shutdownErr error
+	var grpcDone chan error
+	if grpcSrv != nil {
+		grpcDone = make(chan error, 1)
+		go func() {
+			done := make(chan struct{})
+			go func() { grpcSrv.GracefulStop(); close(done) }()
+			select {
+			case <-done:
+				grpcDone <- nil
+			case <-shutdownCtx.Done():
+				grpcSrv.Stop()
+				grpcDone <- fmt.Errorf("grpc shutdown: %w", shutdownCtx.Err())
+			}
+		}()
+	}
 	if httpSrv != nil {
 		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 			// Cancel streams still holding a database generation after the
@@ -2514,17 +2549,8 @@ func shutdownRunServers(httpSrv *http.Server, grpcSrv *grpc.Server, db *storage.
 			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("http shutdown: %w", err))
 		}
 	}
-	if grpcSrv != nil {
-		done := make(chan struct{})
-		go func() {
-			grpcSrv.GracefulStop()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-shutdownCtx.Done():
-			grpcSrv.Stop()
-		}
+	if grpcDone != nil {
+		shutdownErr = errors.Join(shutdownErr, <-grpcDone)
 	}
 	if db != nil {
 		if err := db.Close(); err != nil {

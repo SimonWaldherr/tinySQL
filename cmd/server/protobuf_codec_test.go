@@ -26,6 +26,7 @@ func TestProtobufCodecRoundTripsTransportMessages(t *testing.T) {
 		{"query response", &queryResponse{SQL: "SELECT", Columns: []string{"id", "blob"}, Rows: []map[string]any{{"id": float64(1), "blob": "base64:AQI="}}, Duration: "2ms", Count: 1, Truncated: true}, &queryResponse{}},
 		{"stream response", &queryStreamResponse{Type: "row", Columns: []string{"id"}, Row: map[string]any{"id": float64(1)}, Count: 1}, &queryStreamResponse{}},
 		{"bootstrap", &bootstrapResponse{SnapshotGob: []byte{0, 1, 2, 3}, WatermarkLSN: 42, Epoch: 7}, &bootstrapResponse{}},
+		{"bootstrap-chunk", &bootstrapChunk{Data: []byte{1, 2, 3}, WatermarkLSN: 42, Epoch: 7, Complete: true}, &bootstrapChunk{}},
 		{"changes", &getChangesSinceResponse{RecordsGob: []byte{9, 8, 7}, ResumeLSN: 99, Epoch: 7}, &getChangesSinceResponse{}},
 	}
 

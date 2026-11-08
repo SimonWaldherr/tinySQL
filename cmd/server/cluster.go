@@ -62,7 +62,33 @@ func (h *replicaHealth) snapshot() map[string]any {
 }
 
 func (s *server) isReady() bool {
-	return s.ready.Load() && (s.replica == nil || s.replica.available())
+	return !s.draining.Load() && s.ready.Load() && (s.replica == nil || s.replica.available())
+}
+
+func (s *server) beginShutdown() {
+	s.draining.Store(true)
+	s.ready.Store(false)
+	if s.drainCancel != nil {
+		s.drainCancel()
+	}
+}
+
+func (s *server) closeDatabase() error {
+	s.dbMu.Lock()
+	defer s.dbMu.Unlock()
+	s.cache.Clear()
+	return s.db.Close()
+}
+
+// Replication streams are open-ended. End them during drain while ordinary
+// requests retain the graceful shutdown window to complete.
+func (s *server) replicationContext(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	if s.drainCtx == nil {
+		return ctx, cancel
+	}
+	stop := context.AfterFunc(s.drainCtx, cancel)
+	return ctx, func() { stop(); cancel() }
 }
 
 var errServerNotReady = status.Error(codes.Unavailable, "server not ready")

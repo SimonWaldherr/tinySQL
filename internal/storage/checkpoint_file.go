@@ -146,7 +146,7 @@ func LoadFromFile(filename string) (*DB, error) {
 	}
 	db := NewDB()
 	for _, dt := range dump {
-		_ = db.Put(dt.Tenant, diskToTable(dt))
+		_ = db.Put(dt.Tenant, diskToTableOwned(dt))
 	}
 	var dc diskCatalog
 	if err := dec.Decode(&dc); err == nil {
@@ -234,7 +234,7 @@ func LoadFromReader(r io.Reader, extra ...any) (*DB, error) {
 	}
 	db := NewDB()
 	for _, dt := range dump {
-		_ = db.Put(dt.Tenant, diskToTable(dt))
+		_ = db.Put(dt.Tenant, diskToTableOwned(dt))
 	}
 	var dc diskCatalog
 	if err := dec.Decode(&dc); err == nil {

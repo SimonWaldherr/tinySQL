@@ -66,6 +66,8 @@ current behavior and keep performance claims scoped to the workload they measure
 
 ## Design and performance notes
 
+- [Loading and replica lifecycle](loading-replication-performance.md) — restore
+  ownership, streamed bootstrap, shutdown, allocation and process-memory measurements.
 - [SELECT, conversions, and vector ranking](select-conversion-vector-performance.md)
   — bind conversion declarations, preserve BETWEEN semantics and prepare query vectors.
 - [Ordered CTE consumers](cte-order-performance.md) — bind sort keys, select

@@ -130,6 +130,14 @@ source, transport, WAL epoch, resume LSN, last response time, and last error.
 See the [cluster guide](../../docs/cluster.md) for asynchronous read semantics,
 primary routing, message-size limits, and operational recovery.
 
+Replica bootstrap uses bounded `BootstrapStream` messages and falls back to unary
+bootstrap with older primaries. A whole snapshot can exceed the streaming message
+limit; each WAL response still needs to fit one message. The primary admits one
+bootstrap at a time. SIGTERM/SIGINT withdraws readiness and ends replication feeds
+before draining requests and closing storage. See [loading and lifecycle
+measurements](../../docs/loading-replication-performance.md) for memory limits,
+compatibility coverage and measured results.
+
 ### Streaming queries
 
 `POST /api/query/stream` is the preferred tool-facing API for large result
