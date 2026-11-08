@@ -1,0 +1,39 @@
+name: Cluster integration
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TINYSQL_AUTH_TOKEN: cluster-ci-local-test-token
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate deployment configuration
+        run: docker compose -f deploy/cluster/compose.yaml config --quiet
+      - name: Start primary, replicas and balancer
+        run: docker compose -f deploy/cluster/compose.yaml up --build -d
+      - name: Check replication and read routing
+        run: python3 deploy/cluster/smoke.py --timeout 90
+      - name: Remove one read replica
+        run: |
+          docker compose -f deploy/cluster/compose.yaml stop replica1
+          python3 deploy/cluster/smoke.py --replicas replica2 --timeout 90
+      - name: Rejoin the replica
+        run: |
+          docker compose -f deploy/cluster/compose.yaml start replica1
+          python3 deploy/cluster/smoke.py --timeout 90
+      - name: Show logs
+        if: failure()
+        run: docker compose -f deploy/cluster/compose.yaml logs --no-color
+      - name: Stop cluster
+        if: always()
+        run: docker compose -f deploy/cluster/compose.yaml down --volumes

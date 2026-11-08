@@ -1,0 +1,60 @@
+name: tinysql-cluster
+
+x-node: &node
+  image: tinysql-cluster:local
+  build:
+    context: ../..
+    dockerfile: deploy/cluster/Dockerfile
+  restart: unless-stopped
+  stop_grace_period: 60s
+
+services:
+  primary:
+    <<: *node
+    command:
+      - -http=:8080
+      - -grpc=:9090
+      - -dsn=file:/data/primary?mode=advanced_wal&tenant=default
+      - -auth=${TINYSQL_AUTH_TOKEN:?Set TINYSQL_AUTH_TOKEN before starting the cluster}
+      - -grpc-max-send-bytes=67108864
+    volumes:
+      - primary-data:/data
+
+  replica1:
+    <<: *node
+    command:
+      - -http=:8080
+      - -grpc=:9090
+      - -replica-of=primary:9090
+      - -auth=${TINYSQL_AUTH_TOKEN:?Set TINYSQL_AUTH_TOKEN before starting the cluster}
+      - -peer-timeout=30s
+      - -grpc-max-recv-bytes=67108864
+    depends_on:
+      - primary
+
+  replica2:
+    <<: *node
+    command:
+      - -http=:8080
+      - -grpc=:9090
+      - -replica-of=primary:9090
+      - -auth=${TINYSQL_AUTH_TOKEN:?Set TINYSQL_AUTH_TOKEN before starting the cluster}
+      - -peer-timeout=30s
+      - -grpc-max-recv-bytes=67108864
+    depends_on:
+      - primary
+
+  proxy:
+    image: haproxy:3.2-alpine
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - primary
+      - replica1
+      - replica2
+    restart: unless-stopped
+
+volumes:
+  primary-data:

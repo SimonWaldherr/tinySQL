@@ -1,0 +1,12 @@
+.git
+bin
+data
+node_modules
+**/node_modules
+**/*.wasm
+**/*.test
+**/*.prof
+**/*.mbtiles
+**/*.pbf
+.env
+**/.DS_Store
