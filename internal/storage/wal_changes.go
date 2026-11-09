@@ -69,6 +69,11 @@ func CollectWALChanges(prev, next *DB) []WALChange {
 			if prevTenant != nil {
 				pv = prevTenant.tables[key]
 			}
+			// A table a transaction shadow still shares with the live database
+			// has not been written by that transaction.
+			if next.isTxShared(nt) {
+				continue
+			}
 			if pv == nil || pv.Version != nt.Version {
 				changes = append(changes, WALChange{Tenant: tn, Name: nt.Name, Table: nt})
 			}

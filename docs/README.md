@@ -87,6 +87,8 @@ current behavior and keep performance claims scoped to the workload they measure
 - [CTE alignment](cte-performance.md), [CTE and indexed SELECT](cte-select-performance.md),
   [ORDER BY and aggregates](order-aggregate-performance.md), and
   [windows, DISTINCT, and LIMIT](window-distinct-limit-performance.md).
+- [Transaction snapshots](transaction-snapshot-performance.md) — `BEGIN` shares
+  live tables and copies on first write instead of copying the database.
 - [INSERT and UPDATE](insert-update-performance.md),
   [index and trigger allocation](index-trigger-performance.md), and
   [trigger, range-index, WAL, and CTE follow-up](trigger-index-wal-cte-performance.md).

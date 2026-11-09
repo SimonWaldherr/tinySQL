@@ -39,6 +39,11 @@ type SecondaryIndex struct {
 
 	mu   sync.RWMutex
 	fast *SkipList
+	// shared is set on both ends when fast is also referenced by another index
+	// (see borrow). A shared skip list is read-only: whoever mutates first
+	// replaces it with a private copy (hydrateForWrite), so a copy of a table
+	// costs nothing until one of the two sides actually changes the index.
+	shared bool
 }
 
 // hydrate builds the mutable structure from persisted Entries.
@@ -54,6 +59,27 @@ func (idx *SecondaryIndex) hydrate() *SkipList {
 			}
 		}
 		idx.fast = fast
+	}
+	return idx.fast
+}
+
+// hydrateForWrite is hydrate for a caller that is about to mutate the returned
+// skip list: a list this index shares with another (see borrow) is copied first,
+// so the mutation cannot reach the other index.
+func (idx *SecondaryIndex) hydrateForWrite() *SkipList {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if idx.fast == nil {
+		fast := NewSkipList()
+		for _, entry := range idx.Entries {
+			for _, rowID := range entry.RowIDs {
+				fast.Insert(entry.Key, rowID)
+			}
+		}
+		idx.fast = fast
+	} else if idx.shared {
+		idx.fast = idx.fast.Clone()
+		idx.shared = false
 	}
 	return idx.fast
 }
@@ -97,6 +123,32 @@ func (idx *SecondaryIndex) clone() *SecondaryIndex {
 		out.Entries[i] = IndexEntry{Key: append([]byte(nil), entry.Key...), RowIDs: append([]int(nil), entry.RowIDs...)}
 	}
 	return out
+}
+
+// borrow returns an index that shares idx's skip list instead of copying it.
+// Both indexes treat the list as read-only from now on and copy it on their
+// first write (hydrateForWrite), which is why this is safe for a source that
+// goes on to be modified. An index that has not built a skip list yet has only
+// Entries, which are copied as clone does.
+func (idx *SecondaryIndex) borrow() *SecondaryIndex {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if idx.fast == nil {
+		out := &SecondaryIndex{Name: idx.Name, Columns: append([]string(nil), idx.Columns...), Unique: idx.Unique}
+		out.Entries = make([]IndexEntry, len(idx.Entries))
+		for i, entry := range idx.Entries {
+			out.Entries[i] = IndexEntry{Key: append([]byte(nil), entry.Key...), RowIDs: append([]int(nil), entry.RowIDs...)}
+		}
+		return out
+	}
+	idx.shared = true
+	return &SecondaryIndex{
+		Name:    idx.Name,
+		Columns: append([]string(nil), idx.Columns...),
+		Unique:  idx.Unique,
+		fast:    idx.fast,
+		shared:  true,
+	}
 }
 
 // Len reports the authoritative distinct-key count without rebuilding the index.
@@ -213,6 +265,7 @@ func (t *Table) RebuildSecondaryIndexes() error {
 		}
 		idx.mu.Lock()
 		idx.fast = fast
+		idx.shared = false
 		idx.Entries = nil
 		idx.mu.Unlock()
 	}
@@ -236,7 +289,7 @@ func (t *Table) InsertSecondaryIndexRow(rowID int, row []any, names []string) er
 		if err != nil {
 			return fmt.Errorf("index %q: %w", index.Name, err)
 		}
-		index.hydrate().Insert(key, rowID)
+		index.hydrateForWrite().Insert(key, rowID)
 	}
 	return nil
 }
@@ -265,7 +318,7 @@ func (t *Table) UpdateSecondaryIndexRow(rowID int, before, after []any, names []
 		if bytes.Equal(beforeKey, afterKey) {
 			continue
 		}
-		fast := index.hydrate()
+		fast := index.hydrateForWrite()
 		fast.Remove(beforeKey, rowID)
 		fast.Insert(afterKey, rowID)
 	}
@@ -294,6 +347,7 @@ func (t *Table) ReindexSecondaryIndexRows(oldToNew map[int]int) {
 			}
 		}
 		index.fast = rebuilt
+		index.shared = false
 	}
 }
 
@@ -319,6 +373,7 @@ func (t *Table) DeleteSecondaryIndexRow(rowID int) {
 			}
 		}
 		index.fast = rebuilt
+		index.shared = false
 	}
 }
 
@@ -343,7 +398,7 @@ func (t *Table) SwapRemoveSecondaryIndexRow(deleteRowID int, deletedRow []any, l
 	}
 	if deleteRowID == lastRowID {
 		for _, u := range delUpdates {
-			u.index.hydrate().Remove(u.key, deleteRowID)
+			u.index.hydrateForWrite().Remove(u.key, deleteRowID)
 		}
 		return nil
 	}
@@ -352,10 +407,10 @@ func (t *Table) SwapRemoveSecondaryIndexRow(deleteRowID int, deletedRow []any, l
 		return err
 	}
 	for i, u := range delUpdates {
-		u.index.hydrate().Remove(u.key, deleteRowID)
+		u.index.hydrateForWrite().Remove(u.key, deleteRowID)
 		lu := lastUpdates[i]
-		lu.index.hydrate().Remove(lu.key, lastRowID)
-		lu.index.hydrate().Insert(lu.key, deleteRowID)
+		lu.index.hydrateForWrite().Remove(lu.key, lastRowID)
+		lu.index.hydrateForWrite().Insert(lu.key, deleteRowID)
 	}
 	return nil
 }
@@ -365,6 +420,7 @@ func (t *Table) SwapRemoveSecondaryIndexRow(deleteRowID int, deletedRow []any, l
 func (t *Table) ClearSecondaryIndexes() {
 	for _, index := range t.Indexes {
 		index.fast = NewSkipList()
+		index.shared = false
 		index.Entries = nil
 	}
 }
@@ -643,6 +699,22 @@ func cloneSecondaryIndexes(in map[string]*SecondaryIndex) map[string]*SecondaryI
 			continue
 		}
 		out[key] = idx.clone()
+	}
+	return out
+}
+
+// borrowSecondaryIndexes is cloneSecondaryIndexes without the copy: see
+// SecondaryIndex.borrow.
+func borrowSecondaryIndexes(in map[string]*SecondaryIndex) map[string]*SecondaryIndex {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]*SecondaryIndex, len(in))
+	for key, idx := range in {
+		if idx == nil {
+			continue
+		}
+		out[key] = idx.borrow()
 	}
 	return out
 }

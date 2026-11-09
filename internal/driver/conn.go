@@ -19,11 +19,15 @@ type conn struct {
 	srv    *server
 	tenant string
 
-	inTx       bool
-	txBase     *storage.DB // Snapshot base used for conflict detection
-	shadow     *storage.DB // Snapshot copy (MVCC-light)
-	txReadOnly bool        // Active tx requested as read-only
-	txDirty    bool        // A successful write ran against shadow.
+	inTx   bool
+	txBase *storage.DB // Snapshot base used for conflict detection
+	shadow *storage.DB // Snapshot copy (MVCC-light)
+	// txRelease unpins the live tables the shadow still shares (see
+	// storage.SnapshotForTxShared). It must run when the transaction ends, on
+	// every path; clearTxState is the single place that does.
+	txRelease  func()
+	txReadOnly bool // Active tx requested as read-only
+	txDirty    bool // A successful write ran against shadow.
 	// txCatalogRev is the shadow catalog's revision when the transaction began,
 	// and txCatalog a copy of its contents. commitTx uses the revision as a
 	// cheap gate — unchanged means nothing touched the catalog at all — and the
@@ -175,15 +179,18 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 	// statement, driver-mediated or not.
 	c.srv.db.LockContentForRead()
 	var base, shadow *storage.DB
+	var release func()
 	if opts.ReadOnly {
-		shadow = c.srv.db.SnapshotForReadTx()
+		shadow, release = c.srv.db.SnapshotForReadTxShared()
 	} else {
 		// A read-only transaction produces no changes to merge, so it needs
 		// only a single stable read snapshot and no conflict-detection base.
 		// A read-write transaction needs a mutable shadow plus a
-		// lightweight version-only base (SnapshotForTx copies rows once,
-		// not twice).
-		base, shadow = c.srv.db.SnapshotForTx()
+		// lightweight version-only base. Neither copies a table up front: the
+		// shadow shares the live tables and takes a private copy of one only
+		// when the transaction first writes it, so BEGIN costs the number of
+		// tables, not the number of rows.
+		base, shadow, release = c.srv.db.SnapshotForTxShared()
 	}
 	c.srv.db.UnlockContentForRead()
 	c.srv.mu.RUnlock()
@@ -191,6 +198,7 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 	c.inTx = true
 	c.txBase = base
 	c.shadow = shadow
+	c.txRelease = release
 	c.txReadOnly = opts.ReadOnly
 	c.txDirty = false
 	// The shadow's catalog is a private deep copy of the live one, so its

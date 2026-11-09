@@ -38,5 +38,23 @@ func detachStreamSnapshotsForWrite(db *storage.DB, tenant string, stmt Statement
 			}
 		}
 		db.DetachPinnedTableForWrite(tenant, table)
+	case *CreateTable, *DropTable, *CreateView, *DropView,
+		*CreateMaterializedView, *DropMaterializedView,
+		*AlterViewMaterialize, *AlterMaterializedViewToView,
+		*CreateJob, *AlterJob, *DropJob, *CreateTrigger, *DropTrigger,
+		*CreateUser, *DropUser, *AlterUser, *CreateRole, *DropRole,
+		*GrantPrivilege, *RevokePrivilege, *GrantRoleStmt, *RevokeRoleStmt:
+		// These create, remove or re-point whole objects and the catalog; none
+		// of them writes into the contents of a table that already exists, so
+		// a pinned table (a stream's source, or one a transaction shadow
+		// shares with the live database) can stay as it is. DROP TABLE only
+		// discards derived caches.
+	default:
+		// ANALYZE, REFRESH MATERIALIZED VIEW, CALL and any statement type added
+		// later: anything not listed above may reach into tables it never
+		// names, so every pinned table is detached before it runs. Copying more
+		// than necessary is safe; mutating a table a stream or a transaction
+		// snapshot still reads is not.
+		db.DetachAllPinnedForWrite()
 	}
 }

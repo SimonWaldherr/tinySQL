@@ -121,3 +121,135 @@ func TestConstraintIndexEntryCloneBucketsAreIndependent(t *testing.T) {
 		t.Fatalf("clone mutation leaked into original: %v", got)
 	}
 }
+
+// uniqueModel is the model for entries holding one row per key, which is the
+// only kind constraintIndexEntry.borrow lends.
+type uniqueModel map[int]int
+
+func (m uniqueModel) clone() uniqueModel {
+	out := make(uniqueModel, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func (m uniqueModel) buckets() map[any][]int {
+	out := make(map[any][]int, len(m))
+	for k, v := range m {
+		out[k] = []int{v}
+	}
+	return out
+}
+
+// Entries borrowed from one another must behave exactly like independent
+// copies: a write to any of them, the lender included, is invisible to the
+// others. The test keeps a family of entries (originals, borrowers, borrowers of
+// borrowers) next to a plain-map model of each and checks all of them after
+// every step.
+func TestConstraintIndexEntryBorrowMatchesModel(t *testing.T) {
+	for seed := int64(1); seed <= 60; seed++ {
+		rng := rand.New(rand.NewSource(seed))
+		keys := 20 + rng.Intn(200)
+		type member struct {
+			entry *constraintIndexEntry
+			model uniqueModel
+		}
+		first := newConstraintIndexEntry(0)
+		family := []member{{first, uniqueModel{}}}
+
+		for step := 0; step < 800; step++ {
+			i := rng.Intn(len(family))
+			m := family[i]
+			k := rng.Intn(keys)
+			switch op := rng.Intn(12); {
+			case op < 5: // insert a key that is not held yet
+				if _, held := m.model[k]; !held {
+					row := rng.Intn(1000)
+					m.entry.add(k, row)
+					m.model[k] = row
+				}
+			case op < 8: // delete a held key
+				if row, held := m.model[k]; held {
+					m.entry.remove(k, row)
+					delete(m.model, k)
+				}
+			case op < 10: // move a key to another row, as an UPDATE of the key does
+				if row, held := m.model[k]; held {
+					m.entry.remove(k, row)
+					next := rng.Intn(1000)
+					m.entry.add(k, next)
+					m.model[k] = next
+				}
+			case op == 10 && len(family) < 12:
+				b, ok := m.entry.borrow()
+				if !ok {
+					t.Fatalf("seed %d step %d: borrow refused an entry without multi buckets", seed, step)
+				}
+				family = append(family, member{b, m.model.clone()})
+			default:
+				// A flat copy must also stay independent of its source.
+				family = append(family, member{m.entry.clone(), m.model.clone()})
+			}
+			for j, f := range family {
+				if got := f.entry.buckets(); !reflect.DeepEqual(got, f.model.buckets()) {
+					t.Fatalf("seed %d step %d: member %d diverged from its model", seed, step, j)
+				}
+				for probe := 0; probe < keys; probe += 7 {
+					_, held := f.model[probe]
+					if f.entry.exists(probe, -1) != held {
+						t.Fatalf("seed %d step %d: member %d exists(%d)=%v want %v", seed, step, j, probe, !held, held)
+					}
+				}
+			}
+		}
+	}
+}
+
+// An entry with multi-row buckets cannot be lent: its bucket slices grow in
+// place. borrow must say so instead of sharing them.
+func TestConstraintIndexEntryBorrowRefusesMultiBuckets(t *testing.T) {
+	e := newConstraintIndexEntry(0)
+	e.add("a", 1)
+	e.add("a", 2)
+	if _, ok := e.borrow(); ok {
+		t.Fatal("borrow shared an entry that has a multi-row bucket")
+	}
+	set := &constraintIndexSet{cols: map[int]*constraintIndexEntry{0: e}}
+	if _, ok := set.BorrowDerived(); ok {
+		t.Fatal("BorrowDerived lent a set that contains a multi-row bucket")
+	}
+}
+
+// Once an overlay grows past the point where carrying it forward is cheaper
+// than starting over, the next borrower gets a flat map and the chain of
+// overlays does not deepen.
+func TestConstraintIndexEntryBorrowFlattensLargeOverlay(t *testing.T) {
+	e := newConstraintIndexEntry(0)
+	for k := 0; k < 100; k++ {
+		e.add(k, k)
+	}
+	b, _ := e.borrow()
+	for k := 100; k < 100+constraintOverlayMinDelta*2; k++ {
+		b.add(k, k)
+	}
+	b.remove(5, 5)
+	c, ok := b.borrow()
+	if !ok {
+		t.Fatal("borrow refused")
+	}
+	if c.base != nil {
+		t.Fatal("oversized overlay was carried forward instead of flattened")
+	}
+	want := 100 + constraintOverlayMinDelta*2 - 1
+	if got := len(c.buckets()); got != want {
+		t.Fatalf("flattened entry holds %d keys, want %d", got, want)
+	}
+	if c.exists(5, -1) {
+		t.Fatal("key removed in the overlay reappeared after flattening")
+	}
+	// The lender's own view is untouched.
+	if !e.exists(5, -1) || e.exists(100, -1) {
+		t.Fatal("lender changed")
+	}
+}

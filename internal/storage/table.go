@@ -210,6 +210,19 @@ type DerivedCloner interface {
 	CloneDerived() any
 }
 
+// DerivedBorrower is implemented by derived state that can lend itself to the
+// copy of a table without duplicating its contents. The lender and the borrower
+// share the underlying structure read-only until either one first changes it,
+// at which point that side copies what it needs; neither can observe the
+// other's later changes.
+//
+// BorrowDerived reports false when the state cannot be lent (the caller then
+// falls back to DerivedCloner). Like CloneDerived it is called with the
+// source's DerivedLock held.
+type DerivedBorrower interface {
+	BorrowDerived() (any, bool)
+}
+
 // DerivedLock locks this table's derived-state slot. Derived and SetDerived
 // may only be called while it is held; pair it with DerivedUnlock.
 //

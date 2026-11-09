@@ -626,7 +626,7 @@ func removeAppendedIndexEntries(table *Table, rowCount int) {
 		// per (index, row) pair: the skip list it returns cannot change out
 		// from under this loop, since the caller holds DB's write lock for
 		// the whole statement.
-		fast := idx.hydrate()
+		fast := idx.hydrateForWrite()
 		for i, row := range appended {
 			key, err := table.indexKey(idx.Columns, row)
 			if err != nil {
@@ -690,6 +690,7 @@ func restoreRowsOnlyTable(state *rowsOnlyTableState) {
 			for idx, fast := range rebuilt {
 				idx.mu.Lock()
 				idx.fast = fast
+				idx.shared = false
 				idx.Entries = nil
 				idx.mu.Unlock()
 			}

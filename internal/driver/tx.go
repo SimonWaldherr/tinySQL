@@ -215,6 +215,10 @@ func (c *conn) rollbackTx() error {
 }
 
 func (c *conn) clearTxState() {
+	if c.txRelease != nil {
+		c.txRelease()
+		c.txRelease = nil
+	}
 	c.inTx = false
 	c.txBase = nil
 	c.shadow = nil

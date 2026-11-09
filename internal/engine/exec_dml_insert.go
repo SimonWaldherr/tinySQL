@@ -7,6 +7,7 @@ package engine
 import (
 	"fmt"
 	"maps"
+	"math"
 	"reflect"
 	"slices"
 	"sort"
@@ -781,7 +782,17 @@ type constraintIndexEntry struct {
 	// matters twice: building the index no longer allocates once per distinct
 	// key, and cloning it for a transaction (CloneDerived) is a flat map copy
 	// with no per-key fix-up.
-	rows      map[any]int
+	rows map[any]int
+	// base, when non-nil, holds keys this entry reads through to but never
+	// writes: the map of the entry it was borrowed from (see borrow). rows is
+	// then only this entry's changes on top of base, and a key that base holds
+	// but this entry has removed carries the value constraintRowTombstone in
+	// rows. A borrowed base always holds row indexes (>= 0) only.
+	base map[any]int
+	// lent is set on an entry whose rows map a borrower now uses as its base.
+	// That map must not change any more, so the entry copies it before its own
+	// next write (own).
+	lent      bool
 	multi     [][]int // buckets with two or more rows, in insertion order
 	freeMulti []int   // indexes into multi whose bucket shrank back to one row
 	// Maintained with the cache, not table.Version: signed point updates must
@@ -796,9 +807,70 @@ func newConstraintIndexEntry(sizeHint int) *constraintIndexEntry {
 	return &constraintIndexEntry{rows: make(map[any]int, sizeHint), maxKnown: true}
 }
 
+// constraintRowTombstone marks, in an overlay entry's rows map, a key that its
+// base holds but that has since been removed.
+const constraintRowTombstone = math.MinInt
+
+// get returns the value recorded for key: a row index (>= 0), or the negative
+// reference to a multi bucket. The second result is false when the key is not
+// held.
+func (e *constraintIndexEntry) get(key any) (int, bool) {
+	if v, ok := e.rows[key]; ok {
+		if v == constraintRowTombstone {
+			return 0, false
+		}
+		return v, true
+	}
+	if e.base != nil {
+		v, ok := e.base[key]
+		return v, ok
+	}
+	return 0, false
+}
+
+// unset removes key. Over a borrowed base the removal has to be recorded, since
+// the base itself cannot change.
+func (e *constraintIndexEntry) unset(key any) {
+	if e.base != nil {
+		if _, inBase := e.base[key]; inBase {
+			e.rows[key] = constraintRowTombstone
+			return
+		}
+	}
+	delete(e.rows, key)
+}
+
+// own makes the rows map private to e before a write. An entry whose map was
+// lent to a borrower keeps that map exactly as it was and continues on a copy.
+func (e *constraintIndexEntry) own() {
+	if e.lent {
+		e.rows = maps.Clone(e.rows)
+		e.lent = false
+	}
+}
+
+// flatRows returns a new map holding every key e currently holds, with the
+// overlay applied. The result shares nothing with e.
+func (e *constraintIndexEntry) flatRows() map[any]int {
+	if e.base == nil {
+		return maps.Clone(e.rows)
+	}
+	out := make(map[any]int, len(e.base)+len(e.rows))
+	maps.Copy(out, e.base)
+	for k, v := range e.rows {
+		if v == constraintRowTombstone {
+			delete(out, k)
+		} else {
+			out[k] = v
+		}
+	}
+	return out
+}
+
 // add records that row holds key, after any rows already recorded for it.
 func (e *constraintIndexEntry) add(key any, row int) {
-	cur, ok := e.rows[key]
+	e.own()
+	cur, ok := e.get(key)
 	switch {
 	case !ok:
 		e.rows[key] = row
@@ -826,13 +898,14 @@ func (e *constraintIndexEntry) newBucket(first, second int) int {
 // remove drops row from key's rows, if present. The remaining rows keep their
 // order; a bucket that falls to one row collapses back to the inline form.
 func (e *constraintIndexEntry) remove(key any, row int) {
-	cur, ok := e.rows[key]
+	e.own()
+	cur, ok := e.get(key)
 	if !ok {
 		return
 	}
 	if cur >= 0 {
 		if cur == row {
-			delete(e.rows, key)
+			e.unset(key)
 		}
 		return
 	}
@@ -857,7 +930,7 @@ func (e *constraintIndexEntry) remove(key any, row int) {
 // appendRows appends every row holding key to dst, in bucket order, and
 // reports whether the key was present.
 func (e *constraintIndexEntry) appendRows(dst []int, key any) ([]int, bool) {
-	cur, ok := e.rows[key]
+	cur, ok := e.get(key)
 	if !ok {
 		return dst, false
 	}
@@ -869,7 +942,7 @@ func (e *constraintIndexEntry) appendRows(dst []int, key any) ([]int, bool) {
 
 // exists reports whether key is held by any row other than excludeRow.
 func (e *constraintIndexEntry) exists(key any, excludeRow int) bool {
-	cur, ok := e.rows[key]
+	cur, ok := e.get(key)
 	if !ok {
 		return false
 	}
@@ -890,7 +963,9 @@ func (e *constraintIndexEntry) exists(key any, excludeRow int) bool {
 // so appending to one bucket can never write into its neighbour.
 func (e *constraintIndexEntry) clone() *constraintIndexEntry {
 	c := *e
-	c.rows = maps.Clone(e.rows)
+	c.rows = e.flatRows()
+	c.base = nil
+	c.lent = false
 	c.freeMulti = slices.Clone(e.freeMulti)
 	if len(e.multi) > 0 {
 		total := 0
@@ -909,11 +984,52 @@ func (e *constraintIndexEntry) clone() *constraintIndexEntry {
 	return &c
 }
 
+// borrow returns an entry holding the same keys as e that reads through to e's
+// map instead of copying it, or false when e cannot be lent because it has
+// multi-row buckets (their slices are appended to in place, so they are copied
+// by clone instead).
+//
+// Both entries keep working independently afterwards: the borrower writes only
+// to its own overlay, and e copies the lent map before it next changes it (see
+// own). When e is itself an overlay the borrower shares e's base and copies just
+// e's changes, unless there are enough of them that starting afresh from a flat
+// map is cheaper than carrying them forward.
+func (e *constraintIndexEntry) borrow() (*constraintIndexEntry, bool) {
+	if len(e.multi) > 0 {
+		return nil, false
+	}
+	c := *e
+	c.multi, c.freeMulti, c.lent = nil, nil, false
+	switch {
+	case e.base == nil:
+		e.lent = true
+		c.base = e.rows
+		c.rows = make(map[any]int)
+	case len(e.rows) <= max(constraintOverlayMinDelta, len(e.base)/constraintOverlayDeltaDivisor):
+		c.base = e.base
+		c.rows = maps.Clone(e.rows)
+	default:
+		c.base = nil
+		c.rows = e.flatRows()
+	}
+	return &c, true
+}
+
+// An overlay is carried over to the next borrower while it stays small; beyond
+// the larger of constraintOverlayMinDelta and 1/constraintOverlayDeltaDivisor
+// of its base, copying it per borrow would cost about as much as copying the
+// whole map, so it is folded into a flat map instead.
+const (
+	constraintOverlayMinDelta     = 1024
+	constraintOverlayDeltaDivisor = 32
+)
+
 // buckets expands the index into the key -> rows view it had before the
 // inline single-row form existed. Tests use it to compare against a model.
 func (e *constraintIndexEntry) buckets() map[any][]int {
-	out := make(map[any][]int, len(e.rows))
-	for k := range e.rows {
+	flat := e.flatRows()
+	out := make(map[any][]int, len(flat))
+	for k := range flat {
 		out[k], _ = e.appendRows(nil, k)
 	}
 	return out
@@ -969,6 +1085,22 @@ func constraintIndexValueExists(index *constraintIndexEntry, val any, excludeRow
 // getConstraintIndex/patchConstraintIndexRow/patchConstraintIndexSwapRemove
 // all mutate these in place, and the cloned table's rows diverge
 // independently from the source's the moment either one is next written.
+// BorrowDerived implements storage.DerivedBorrower: the same state as
+// CloneDerived, handed to the copy of a table without duplicating the key maps.
+// A transaction that updates one row of a table with a hundred thousand rows no
+// longer starts by copying the hash of every key in it.
+func (set *constraintIndexSet) BorrowDerived() (any, bool) {
+	borrowed := &constraintIndexSet{cols: make(map[int]*constraintIndexEntry, len(set.cols))}
+	for colIdx, entry := range set.cols {
+		b, ok := entry.borrow()
+		if !ok {
+			return nil, false
+		}
+		borrowed.cols[colIdx] = b
+	}
+	return borrowed, true
+}
+
 func (set *constraintIndexSet) CloneDerived() any {
 	cloned := &constraintIndexSet{cols: make(map[int]*constraintIndexEntry, len(set.cols))}
 	for colIdx, entry := range set.cols {

@@ -47,46 +47,28 @@ func (db *DB) PinTableForStream(table *Table) (release func(), ok bool) {
 // mutate the table returned by Get while existing streams continue to read the
 // old, immutable instance.
 //
+// A transaction shadow also reaches here for a table it still shares with the
+// live database (see SnapshotForTxShared): the writer then gets a private copy
+// and the live instance is left untouched for everyone else.
+//
 // A false result means no current table was pinned (or this DB uses an
 // evictable backend), so no copy was needed.
 func (db *DB) DetachPinnedTableForWrite(tenant, name string) bool {
-	if db == nil || name == "" || db.backendTablesEvictable() {
-		return false
-	}
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	tenantDB := db.getTenantRO(tenant)
-	if tenantDB == nil {
-		return false
-	}
-	key := canonicalTableName(name)
-	table := tenantDB.tables[key]
-	if table == nil {
-		return false
-	}
-
-	db.streamSnapshotMu.Lock()
-	pinned := db.streamSnapshots[table] != 0
-	db.streamSnapshotMu.Unlock()
-	if !pinned {
-		return false
-	}
-
-	// DML only needs an independent row-header segment. Existing cells stay
-	// shared with the immutable stream; writers replace changed row slices,
-	// so they cannot mutate a streamed row through that sharing.
-	tenantDB.tables[key] = cloneTableForStreamDML(table)
-	return true
+	return db.detachPinnedTable(tenant, name, false)
 }
 
 // DetachPinnedTableForSchemaWrite is the schema-mutation companion to
 // DetachPinnedTableForWrite. ALTER TABLE can edit existing row cells in place
 // while widening or shrinking them, so it deliberately retains a deep clone.
 func (db *DB) DetachPinnedTableForSchemaWrite(tenant, name string) bool {
+	return db.detachPinnedTable(tenant, name, true)
+}
+
+func (db *DB) detachPinnedTable(tenant, name string, schemaWrite bool) bool {
 	if db == nil || name == "" || db.backendTablesEvictable() {
 		return false
 	}
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	tenantDB := db.getTenantRO(tenant)
@@ -98,13 +80,32 @@ func (db *DB) DetachPinnedTableForSchemaWrite(tenant, name string) bool {
 	if table == nil {
 		return false
 	}
+
+	// A table this transaction shadow still shares with the live database is
+	// the live database's instance: never write to it. The streams that may
+	// also be reading it keep their own pins, which stay valid on the old
+	// instance.
+	if src, shared := db.takeTxShared(table); shared {
+		tenantDB.tables[key] = privateCopyOfShared(src, table, schemaWrite)
+		src.unpinTxTable(table)
+		return true
+	}
+
 	db.streamSnapshotMu.Lock()
 	pinned := db.streamSnapshots[table] != 0
 	db.streamSnapshotMu.Unlock()
 	if !pinned {
 		return false
 	}
-	tenantDB.tables[key] = cloneTable(table)
+
+	if schemaWrite {
+		tenantDB.tables[key] = cloneTable(table)
+		return true
+	}
+	// DML only needs an independent row-header segment. Existing cells stay
+	// shared with the immutable stream; writers replace changed row slices,
+	// so they cannot mutate a streamed row through that sharing.
+	tenantDB.tables[key] = cloneTableForStreamDML(table)
 	return true
 }
 

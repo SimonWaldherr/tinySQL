@@ -119,14 +119,14 @@ func cloneTable(t *Table) *Table {
 // (see cloneRowsShared) instead of copying it: copying made BEGIN cost a full
 // copy of every table.
 func cloneTableForTx(t *Table) *Table {
-	return cloneTableWithRows(t, cloneRowsShared(t.Rows, len(t.Rows)/16+16), true)
+	return cloneTableWithRows(t, cloneRowsSharedFor(t, len(t.Rows)/16+16), true)
 }
 
 // cloneTableForRead is cloneTable for a snapshot that is only ever read, such
 // as a read-only transaction: rows are shared like cloneTableForTx does, with
 // no spare capacity.
 func cloneTableForRead(t *Table) *Table {
-	return cloneTableWithRows(t, cloneRowsShared(t.Rows, 0), true)
+	return cloneTableWithRows(t, cloneRowsSharedFor(t, 0), true)
 }
 
 // cloneTableForStreamDML makes a private writer view for a table currently
@@ -138,10 +138,30 @@ func cloneTableForRead(t *Table) *Table {
 func cloneTableForStreamDML(t *Table) *Table {
 	rows := make([][]any, len(t.Rows))
 	copy(rows, t.Rows)
-	return cloneTableWithRows(t, rows, false)
+	return cloneTableCore(t, rows, false, true)
+}
+
+// cloneTableForSharedTx is cloneTableForTx for the first write a transaction
+// shadow makes to a table it shares with the live database: the same private
+// row copy, but with the indexes lent rather than duplicated (see
+// cloneTableCore), so the write does not pay for copying structures it may
+// never change.
+func cloneTableForSharedTx(t *Table) *Table {
+	return cloneTableCore(t, cloneRowsSharedFor(t, len(t.Rows)/16+16), true, true)
 }
 
 func cloneTableWithRows(t *Table, rows [][]any, copySearchIndexes bool) *Table {
+	return cloneTableCore(t, rows, copySearchIndexes, false)
+}
+
+// cloneTableCore copies t's metadata and attaches rows. With borrow set, the
+// secondary indexes and the derived state are lent to the copy instead of being
+// duplicated: each side copies a structure only when it first changes it. That
+// turns the part of a table copy that was proportional to the number of rows
+// into constant work for a writer that changes few of them, and is what lets a
+// transaction write one row of a large table without first duplicating the
+// table's indexes.
+func cloneTableCore(t *Table, rows [][]any, copySearchIndexes, borrow bool) *Table {
 	cols := make([]Column, len(t.Cols))
 	copy(cols, t.Cols)
 	nt := NewTable(t.Name, cols, t.IsTemp)
@@ -149,7 +169,11 @@ func cloneTableWithRows(t *Table, rows [][]any, copySearchIndexes bool) *Table {
 	nt.structVersion = t.structVersion
 	nt.rowUpdateBase = t.rowUpdateBase
 	nt.rowUpdateLog = append([]rowUpdateDelta(nil), t.rowUpdateLog...)
-	nt.Indexes = cloneSecondaryIndexes(t.Indexes)
+	if borrow {
+		nt.Indexes = borrowSecondaryIndexes(t.Indexes)
+	} else {
+		nt.Indexes = cloneSecondaryIndexes(t.Indexes)
+	}
 	nt.Stats = cloneTableStats(t.Stats)
 	nt.dirtyFrom = t.dirtyFrom
 	nt.dirtyRows = append([]int(nil), t.dirtyRows...)
@@ -166,6 +190,15 @@ func cloneTableWithRows(t *Table, rows [][]any, copySearchIndexes bool) *Table {
 		nt.VectorIndexes = cloneVectorIndexes(t.VectorIndexes)
 		nt.vectorGeneration = t.vectorGeneration
 		nt.vectorPersistedGeneration = t.vectorPersistedGeneration
+	}
+	if borrow {
+		if lender, ok := t.derived.(DerivedBorrower); ok {
+			if derived, ok := lender.BorrowDerived(); ok {
+				nt.derived = derived
+				t.DerivedUnlock()
+				return nt
+			}
+		}
 	}
 	if cloner, ok := t.derived.(DerivedCloner); ok {
 		nt.derived = cloner.CloneDerived()
@@ -307,6 +340,42 @@ func cloneRowsShared(rows [][]any, headroom int) [][]any {
 		cloned[i] = private
 	}
 	return cloned
+}
+
+// cloneRowsSharedFor is cloneRowsShared for the rows of t. When t's column
+// types are all plain scalars no row can hold a mutable reference cell, so the
+// per-row, per-cell type test cloneRowsShared makes (which touches every row and
+// was the larger half of the cost of cloning a big table) has nothing to find
+// and the row headers are copied with a single memmove.
+func cloneRowsSharedFor(t *Table, headroom int) [][]any {
+	if t.onlyScalarColumns() {
+		cloned := make([][]any, len(t.Rows), len(t.Rows)+headroom)
+		copy(cloned, t.Rows)
+		return cloned
+	}
+	return cloneRowsShared(t.Rows, headroom)
+}
+
+// onlyScalarColumns reports whether every column has a type whose cells are
+// immutable values (numbers, strings, booleans, times, ...). Types that store a
+// reference — BLOB, JSON, VECTOR, MAP, ARRAY and friends, and anything this list
+// does not know — are not scalar, so a new column type defaults to the careful
+// per-cell copy rather than to sharing.
+func (t *Table) onlyScalarColumns() bool {
+	for i := range t.Cols {
+		switch t.Cols[i].Type {
+		case IntType, Int8Type, Int16Type, Int32Type, Int64Type,
+			UintType, Uint8Type, Uint16Type, Uint32Type, Uint64Type,
+			Float32Type, Float64Type, FloatType,
+			StringType, TextType, RuneType, BoolType,
+			TimeType, DateType, DateTimeType, TimestampType, DurationType,
+			DecimalType, MoneyType, UUIDType, XMLType, IntervalType,
+			YAMLType, URLType, HASHType:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func hasMutableCell(row []any) bool {

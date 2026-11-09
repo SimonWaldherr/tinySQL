@@ -211,15 +211,54 @@ func findSimpleSelectOrderExpr(col string, projs []simpleProjection, colIndex ma
 }
 
 func simpleColumnIndex(t *storage.Table, alias string) map[string]int {
-	idx := make(map[string]int, len(t.Cols)*3)
 	tableName := strings.ToLower(t.Name)
 	aliasName := strings.ToLower(alias)
-	for i, c := range t.Cols {
+	// An alias equal to the table name (every DML statement passes its own table
+	// name) would insert the same qualified keys twice.
+	qualifyAlias := aliasName != "" && aliasName != tableName
+
+	// All qualified keys are cut from one string, so a statement allocates the
+	// map and one backing string instead of two concatenations per column.
+	size := 0
+	for _, c := range t.Cols {
+		size += len(tableName) + 1 + len(c.Name)
+		if qualifyAlias {
+			size += len(aliasName) + 1 + len(c.Name)
+		}
+	}
+	var keys strings.Builder
+	keys.Grow(size)
+	type span struct {
+		col          string
+		table, alias [2]int
+	}
+	// Tables of up to 16 columns keep this scratch list on the stack.
+	var scratch [16]span
+	spans := scratch[:0]
+	for _, c := range t.Cols {
 		col := strings.ToLower(c.Name)
-		idx[col] = i
-		idx[tableName+"."+col] = i
-		if aliasName != "" {
-			idx[aliasName+"."+col] = i
+		sp := span{col: col}
+		sp.table[0] = keys.Len()
+		keys.WriteString(tableName)
+		keys.WriteByte('.')
+		keys.WriteString(col)
+		sp.table[1] = keys.Len()
+		if qualifyAlias {
+			sp.alias[0] = keys.Len()
+			keys.WriteString(aliasName)
+			keys.WriteByte('.')
+			keys.WriteString(col)
+			sp.alias[1] = keys.Len()
+		}
+		spans = append(spans, sp)
+	}
+	all := keys.String()
+	idx := make(map[string]int, len(t.Cols)*3)
+	for i, sp := range spans {
+		idx[sp.col] = i
+		idx[all[sp.table[0]:sp.table[1]]] = i
+		if qualifyAlias {
+			idx[all[sp.alias[0]:sp.alias[1]]] = i
 		}
 	}
 	return idx
