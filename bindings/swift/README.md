@@ -1,8 +1,10 @@
 # tinySQL for Swift and Xcode
 
 A Swift package backed by a static Go XCFramework. It provides independent
-`Database` actors, bound SQL parameters, typed values, durable storage modes,
-scripts and batches, explicit snapshots, and automatic native resource cleanup.
+`Database` actors, bound SQL parameters, typed values, `Codable` models,
+live queries for SwiftUI, durable storage modes with the right app directories
+and Keychain-held keys, scripts and batches, explicit snapshots, and automatic
+native resource cleanup.
 The package wraps the shared [C ABI](../c/include/tinysql.h) that the Python
 and Rust bindings use as well; see the
 [language bindings guide](../../docs/language-bindings.md).
@@ -38,10 +40,25 @@ The package identity is the directory name `swift` for this local path.
 For macOS-only development, use `make build-apple-macos`. Before building an iOS
 app, run `make build-apple` again: each build replaces the generated framework
 with exactly the selected platforms. Generated artifacts are ignored by Git;
-build before resolving the local package. This repository does not currently
-provide a hosted binary package for remote SwiftPM resolution. For distribution,
-ship this package directory together with the generated XCFramework, or publish a
-versioned XCFramework ZIP and use SwiftPM's URL/checksum binary target mechanism.
+build before resolving the local package.
+
+### Distribute without a local build
+
+SwiftPM resolves remote packages from a `Package.swift` at the repository root and
+downloads binary targets from a URL, so a release is a zipped XCFramework plus a
+manifest that names its URL and checksum. One command produces both:
+
+```sh
+make package-apple-release URL=https://github.com/you/tinysql-swift/releases/download/1.0.0/CTinySQL.xcframework.zip
+```
+
+It builds all slices and writes `bindings/apple/build/release/` with
+`CTinySQL.xcframework.zip`, a ready `Package.swift` (URL and checksum filled in),
+`Sources/` and `LICENSE`. Upload the zip to that URL, commit the other three to the
+repository that serves the package, and tag a version. Apps then use
+**File → Add Package Dependencies…** with your repository URL, with no Go
+toolchain and no local build. The archive contains the macOS, iOS and simulator
+variants; Xcode selects the relevant platform and architecture for the app.
 
 The packaging follows Apple's [XCFramework guide](https://developer.apple.com/documentation/xcode/creating-a-multi-platform-binary-framework-bundle)
 and [binary Swift package guide](https://developer.apple.com/documentation/xcode/distributing-binary-frameworks-as-swift-packages).
@@ -143,6 +160,141 @@ engine values follow the existing database/sql driver's conversion rules
 so `.real(1)` and large integral doubles retain their type across JSON encoding.
 SQL column coercion still follows the engine's rules.
 
+## Typed models
+
+Query results decode into `Codable` types, and records insert from them. No
+mapping code, no manual column indexes:
+
+```swift
+struct Note: Codable, Sendable, Identifiable {
+    var id: Int
+    var body: String
+    var createdAt: Date
+    var pinned: Bool
+    var tags: [String]          // stored as JSON text
+    var attachment: URL?        // NULL <-> nil
+}
+
+try await database.execute("""
+    CREATE TABLE IF NOT EXISTS notes (id INT PRIMARY KEY, body TEXT, created_at TIMESTAMP,
+                                      pinned BOOL, tags TEXT, attachment TEXT)
+    """)
+try await database.insert(
+    Note(id: 1, body: "Hello", createdAt: .now, pinned: true, tags: ["a"], attachment: nil),
+    into: "notes", columnNaming: .snakeCase)               // createdAt -> created_at
+let pinned = try await database.query(
+    "SELECT * FROM notes WHERE pinned = ? ORDER BY created_at DESC", parameters: [true], as: Note.self)
+let total = try await database.query("SELECT COUNT(*) FROM notes").decodeFirst(Int.self)
+```
+
+- **Columns to properties**: names match ignoring case and underscores, so
+  `created_at`, `CREATED_AT` and `createdAt` all fill `createdAt`. `CodingKeys` work
+  as usual and are the way to rename a column.
+- **Types**: all fixed-width integers (checked for overflow), `Float`/`Double`,
+  `Bool`, `String`, `Data` (BLOB), `Date`, `UUID`, `URL` and `RawRepresentable`
+  enums of those. Any other `Codable` value (arrays, nested structs, dictionaries)
+  is stored as JSON text in a TEXT column. `UInt` and `UInt64` insert only when
+  the value fits a signed 64-bit integer, otherwise `insert` throws.
+- **Dates** are RFC 3339 text in UTC with microseconds
+  (`2026-11-09T17:14:57.250000Z`), compatible with TIMESTAMP columns. In TEXT
+  columns, consistently using this fixed UTC format preserves chronological
+  order for `ORDER BY` and `BETWEEN`.
+  Reading also accepts offsets, a date alone, a space instead of `T`, and numbers
+  as seconds since 1970.
+- **Parameters** accept `SQLValue(date)`, `.date(_:)`, `.uuid(_:)`, `.url(_:)`
+  and literals including `nil`: `parameters: [1, "Ada", nil, .date(.now)]`.
+- **Inserting**: `insert` leaves nil properties out so column defaults apply;
+  `insertAll` writes one prepared statement for many records, atomically, using the
+  union of their columns (NULL where a record has none). Table and column names must
+  be plain identifiers because they are part of the SQL text; values are always bound.
+- A decoding error names the offending column and expected type through
+  `DecodingError`; a database error stays a `TinySQLError`.
+
+## SwiftUI and live queries
+
+`changes()` yields after writes settle (after each `execute`, `executeBatch` and
+`executeScript` outside a transaction, and after the `COMMIT` or `ROLLBACK` that
+ends one), `observe` turns a query into a stream that re-runs on those signals, and
+`LiveQuery` publishes it to SwiftUI:
+
+```swift
+struct NotesView: View {
+    @StateObject private var notes: LiveQuery<Note>
+
+    init(database: Database) {
+        _notes = StateObject(wrappedValue: LiveQuery(
+            database: database, sql: "SELECT * FROM notes ORDER BY created_at DESC"))
+    }
+
+    var body: some View {
+        List(notes.rows) { Text($0.body) }
+            .overlay { if !notes.hasLoaded { ProgressView() } }
+            .task { await notes.run() }        // follows changes while the view is on screen
+    }
+}
+```
+
+Without SwiftUI, iterate directly: `for try await notes in database.observe("SELECT * FROM notes", as: Note.self) { ... }`.
+Details:
+
+- The current result arrives first; a re-run that produces an identical result is
+  not yielded, so a write to an unrelated table does not redraw a view.
+- Queries run on the database's executor and the stream throws if the query fails
+  (for example because its table was dropped); it finishes when the database closes
+  or the consumer stops. `LiveQuery.error` holds that error.
+- The signal is "something may have changed", not a per-table log. Writes issued
+  through `query(_:)` (such as `INSERT ... RETURNING`) and writes by other processes
+  do not notify; use `execute` for writes.
+- Bursts coalesce, so a consumer that is busy never builds a backlog, and a
+  transaction notifies once, after it ends.
+
+## Where to put the database
+
+`DatabaseDirectory` creates the folder and applies Apple's conventions:
+
+```swift
+// <Application Support>/<bundle id>/notes, usable in the background after first unlock
+let directory = try DatabaseDirectory.applicationSupport("notes")
+let database = try await Database.open(directory: directory)
+
+// Shared between the app, its widgets and extensions
+let shared = try DatabaseDirectory.appGroup("group.com.example.app", "notes")
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `fileProtection` | `.completeUntilFirstUserAuthentication` | iOS Data Protection class of the directory, inherited by the files in it. `.complete` makes the database unreadable to background work on a locked device. Ignored on macOS. |
+| `excludeFromBackup` | `false` | Keep a rebuildable cache out of iCloud and device backups; leave it off for user data. |
+
+`Database.openInApplicationSupport("notes")` does both steps. For `.wal` and
+`.advancedWAL`, `directory:` is the database *file* unless a directory already exists
+there, in which case the file `database.tinysql` lives inside it (so a folder
+prepared by `DatabaseDirectory` works for every mode). One process owns writes to a
+durable database; widgets and extensions should read through the app or open it
+read-only in a table-file mode.
+
+### Encryption keys in the Keychain
+
+```swift
+let key = try KeychainKeyStore(service: "com.example.app").loadOrCreateKey()   // 32 random bytes, created once
+let database = try await Database.open(
+    directory: try DatabaseDirectory.applicationSupport("vault"),
+    storage: StorageOptions(mode: .disk, encryptionKey: key))
+```
+
+The key comes from the system's secure random generator and is not synchronized
+through iCloud Keychain. On iOS and the macOS data protection keychain it is
+available after first unlock (`ThisDeviceOnly`); backup restoration can restore it
+to the same device, but cannot migrate it to another device. The default macOS
+login keychain follows its own access and backup policies. Losing the key loses
+the data. Use `accessGroup` to share it with your other apps, and
+`useDataProtectionKeychain: true` on macOS for signed or sandboxed apps with a
+keychain access group. See [Apple's keychain implementation notes](https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains)
+and [accessibility rules](https://developer.apple.com/documentation/security/ksecattraccessible).
+Unit tests without a host app cannot reach the
+Keychain on iOS (`errSecMissingEntitlement`), so run tests that use it inside an
+app target.
+
 ## Transaction scopes
 
 Use an isolated synchronous closure to keep a unit of work on the database's
@@ -193,12 +345,17 @@ make test-swift
 # After a full framework build, preserve all slices and just run tests:
 go test -race ./bindings/c
 swift test --package-path bindings/swift
+# The same suite on an iOS Simulator (the package scheme builds for iOS):
+xcodebuild test -scheme TinySQL -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
+    -derivedDataPath .build/xcode-sim CODE_SIGNING_ALLOWED=NO   # run in bindings/swift
 ```
 
 Tests exercise the real native library: instance isolation, Unicode and quoted
 parameters, Int64/Double precision, NULL/BLOB values, save/load, gzip integrity,
 transactions, durable storage modes, scripts, batches, literal parameters,
-concurrent calls, task cancellation, errors and close handling.
+concurrent calls, task cancellation, errors and close handling, `Codable` models,
+dates and change notification. A few tests skip where the environment cannot
+provide App Groups or a host-less Keychain (the iOS Simulator).
 CI also compiles in Swift 6 mode and builds with Xcode's iOS SDK.
 The C ABI is documented in
 [`tinysql.h`](../c/include/tinysql.h) (module `CTinySQL`). Each returned C

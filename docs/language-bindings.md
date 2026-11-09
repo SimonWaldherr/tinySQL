@@ -82,6 +82,8 @@ TinySQLDatabaseFree(rows);
 | Transactions | `database/sql` `BeginTx` or SQL `BEGIN` | `transaction(closure)` | `with conn.transaction():` | `transaction { isolatedDB in ... }` or SQL transaction control |
 | Encryption at rest | `StorageConfig.EncryptionKey` | `encryption_key` | `encryption_key=` | `StorageOptions.encryptionKey` |
 | Streaming results | `ExecSQLStream`, `database/sql` rows | materialized | materialized | materialized |
+| Typed models | `tinyorm` | `Value` accessors | rows as dicts | `Codable`: `query(_:as:)`, `insert(_:into:)` |
+| Live queries | polling or hooks | - | - | `changes()`, `observe(_:)`, SwiftUI `LiveQuery` |
 
 Go additionally offers streaming, columnar results, the query builder, custom
 table-valued functions, stored procedures, file importers and multi-tenancy.
@@ -104,6 +106,8 @@ REALs are tagged so an integral double such as `3.0` keeps its type across
 JSON. Integer arithmetic and `SUM` over integer columns return integers;
 division and `AVG` return REAL (see [SQL feature gaps](sql-feature-gaps.md#integer-arithmetic)).
 Timestamps and other engine types arrive as text (RFC 3339 for timestamps).
+Swift reads and writes `Date`, `UUID` and `URL` through that text form (see the
+[Swift guide](../bindings/swift/README.md#typed-models)).
 
 ## Transactions and concurrency
 

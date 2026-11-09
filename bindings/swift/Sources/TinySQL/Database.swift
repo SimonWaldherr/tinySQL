@@ -13,6 +13,13 @@ public actor Database {
     /// including transactions started by SQL text or scripts.
     public private(set) var isInTransaction = false
 
+    // Change notification: `changes()` subscribers are told after writes have
+    // settled (see `publishChanges`). A write inside a transaction is held back
+    // until the transaction ends.
+    private var observers: [Int: AsyncStream<Void>.Continuation] = [:]
+    private var nextObserverID = 0
+    private var hasUnpublishedWrite = false
+
     public nonisolated var unownedExecutor: UnownedSerialExecutor {
         executor.asUnownedSerialExecutor()
     }
@@ -41,10 +48,13 @@ public actor Database {
         return database
     }
 
-    /// Opens or creates a durable database in `directory`. Every acknowledged
-    /// write is persisted by the selected storage mode.
+    /// Opens or creates a durable database at `directory`. Every acknowledged
+    /// write is persisted by the selected storage mode. The table-file modes keep
+    /// their files inside that directory. `.wal` and `.advancedWAL` use the URL as
+    /// the database file unless a directory already exists there, in which case
+    /// they keep `StorageOptions.logDatabaseFileName` inside it.
     public init(directory: URL, storage: StorageOptions = StorageOptions()) throws {
-        let options = try storage.json(path: Self.filePath(directory))
+        let options = try storage.json(path: Self.storagePath(directory, mode: storage.mode))
         let result = try options.withCString { try Self.consume(TinySQLDatabaseOpenWithOptions($0)) }
         guard let handle = result.handle, handle != 0 else { throw TinySQLError.invalidResponse }
         self.handle = handle
@@ -108,6 +118,7 @@ public actor Database {
                 _ = try? "ROLLBACK".withCString {
                     try statementResult(Self.decode(TinySQLDatabaseExecute(handle, $0, nil)))
                 }
+                publishChanges()
             }
             throw error
         }
@@ -122,6 +133,9 @@ public actor Database {
         try requireOpen()
         try Task.checkCancellation()
         guard !script.utf8.contains(0) else { throw TinySQLError.invalidInput("SQL must not contain NUL") }
+        // A failing script keeps its earlier statements, so it counts as a write.
+        hasUnpublishedWrite = true
+        defer { publishChanges() }
         let result = try script.withCString { value in
             try Self.decode(TinySQLDatabaseExecuteScript(handle, value))
         }
@@ -139,6 +153,9 @@ public actor Database {
         guard !sql.utf8.contains(0) else { throw TinySQLError.invalidInput("SQL must not contain NUL") }
         let data = try encoder.encode(parameterSets)
         let json = String(decoding: data, as: UTF8.self)
+        // Earlier rows of a failing batch stay applied outside a transaction.
+        hasUnpublishedWrite = true
+        defer { publishChanges() }
         let result = try sql.withCString { statement in
             try json.withCString { values in
                 try Self.decode(TinySQLDatabaseExecuteBatch(handle, statement, values))
@@ -197,7 +214,47 @@ public actor Database {
         let closing = handle
         handle = 0
         isInTransaction = false
+        hasUnpublishedWrite = false
+        let finished = observers.values
+        observers.removeAll()
+        for continuation in finished { continuation.finish() }
         _ = try Self.consume(TinySQLDatabaseClose(closing))
+    }
+
+    /// A stream that yields once after writes made through this actor have
+    /// settled: after each `execute`, `executeBatch` and `executeScript` outside a
+    /// transaction, and after the `COMMIT` (or `ROLLBACK`) that ends one. Bursts
+    /// coalesce into a single pending element, so a slow consumer never builds a
+    /// backlog. The stream finishes when the database closes.
+    ///
+    /// It is a coarse "something may have changed" signal, not a per-table log:
+    /// re-run your queries (see `observe(_:parameters:)`) when it fires. Writes
+    /// issued through `query(_:)` (for example `INSERT ... RETURNING`) and writes
+    /// made by other processes do not notify.
+    public func changes() -> AsyncStream<Void> {
+        let (stream, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        guard handle != 0 else {
+            continuation.finish()
+            return stream
+        }
+        let id = nextObserverID
+        nextObserverID += 1
+        observers[id] = continuation
+        continuation.onTermination = { [weak self] _ in
+            guard let self else { return }
+            Task { await self.removeObserver(id) }
+        }
+        return stream
+    }
+
+    private func removeObserver(_ id: Int) {
+        observers[id] = nil
+    }
+
+    private func publishChanges() {
+        guard hasUnpublishedWrite, !isInTransaction else { return }
+        hasUnpublishedWrite = false
+        for continuation in observers.values { continuation.yield(()) }
     }
 
     private func requireOpen() throws {
@@ -210,6 +267,10 @@ public actor Database {
         guard !sql.utf8.contains(0) else { throw TinySQLError.invalidInput("SQL must not contain NUL") }
         let data = try encoder.encode(parameters)
         let json = String(decoding: data, as: UTF8.self)
+        if !query {
+            hasUnpublishedWrite = true
+        }
+        defer { if !query { publishChanges() } }
         let result = try sql.withCString { statement in
             try json.withCString { values in
                 try Self.decode(query
@@ -226,6 +287,21 @@ public actor Database {
         isInTransaction = result.inTransaction ?? false
         if let error = result.error, !error.isEmpty { throw TinySQLError.database(error) }
         return result
+    }
+
+    /// The path handed to the engine. The table-file modes use `url` as their
+    /// storage directory. The log-based modes (`.wal`, `.advancedWAL`) use it as
+    /// the database *file* (with the log beside it), which fails if a directory is
+    /// already there, so an existing directory holds the file instead. That makes
+    /// a folder prepared by `DatabaseDirectory` work for every mode.
+    private nonisolated static func storagePath(_ url: URL, mode: StorageMode) throws -> String {
+        let path = try filePath(url)
+        guard mode == .wal || mode == .advancedWAL else { return path }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            return path
+        }
+        return url.appendingPathComponent(StorageOptions.logDatabaseFileName).path
     }
 
     private nonisolated static func filePath(_ url: URL) throws -> String {

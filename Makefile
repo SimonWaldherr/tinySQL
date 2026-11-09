@@ -638,7 +638,7 @@ test-rust:
 ## test-bindings: Run the C, Python and Rust binding tests
 test-bindings: test-c test-python test-rust
 
-.PHONY: build-apple build-apple-macos test-swift
+.PHONY: build-apple build-apple-macos test-swift package-apple-release
 ## build-apple: Build Swift XCFramework for macOS, iOS and iOS Simulator (requires Xcode)
 build-apple:
 	./bindings/apple/build-xcframework.sh
@@ -646,6 +646,11 @@ build-apple:
 ## build-apple-macos: Build a macOS-only Swift XCFramework for local development
 build-apple-macos:
 	./bindings/apple/build-xcframework.sh macos
+
+## package-apple-release: Build a SwiftPM release (zip + checksum); usage: make package-apple-release URL=https://host/CTinySQL.xcframework.zip
+package-apple-release:
+	@test -n "$(URL)" || { echo "Usage: make package-apple-release URL=https://host/path/CTinySQL.xcframework.zip" >&2; exit 2; }
+	./bindings/apple/package-release.sh "$(URL)"
 
 ## test-swift: Build the macOS bridge and run native Swift integration tests
 test-swift: build-apple-macos

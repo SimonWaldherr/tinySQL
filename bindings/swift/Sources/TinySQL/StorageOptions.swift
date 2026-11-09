@@ -39,6 +39,9 @@ public struct StorageOptions: Sendable, Equatable {
     /// and `.hybrid`. Keep it in the Keychain, never next to the database.
     public var encryptionKey: Data?
 
+    /// The file `.wal` and `.advancedWAL` databases use inside a directory.
+    public static let logDatabaseFileName = "database.tinysql"
+
     public init(
         mode: StorageMode = .wal,
         readOnly: Bool = false,

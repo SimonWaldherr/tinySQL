@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: ['**/*.go', 'go.mod', 'go.sum', 'bindings/apple/**', 'bindings/c/**', 'bindings/swift/**', '.github/workflows/apple.yml']
+    paths: ['**/*.go', 'go.mod', 'go.sum', 'Makefile', 'bindings/apple/**', 'bindings/c/**', 'bindings/swift/**', '.github/workflows/apple.yml']
   pull_request:
-    paths: ['**/*.go', 'go.mod', 'go.sum', 'bindings/apple/**', 'bindings/c/**', 'bindings/swift/**', '.github/workflows/apple.yml']
+    paths: ['**/*.go', 'go.mod', 'go.sum', 'Makefile', 'bindings/apple/**', 'bindings/c/**', 'bindings/swift/**', '.github/workflows/apple.yml']
 
 permissions:
   contents: read
@@ -26,8 +26,8 @@ jobs:
           go-version-file: go.mod
       - name: Test native bridge with race detector
         run: go test -race ./bindings/c
-      - name: Build macOS, iOS and simulator XCFramework
-        run: make build-apple
+      - name: Build and package macOS, iOS and simulator XCFramework
+        run: make package-apple-release URL=https://example.invalid/CTinySQL.xcframework.zip
       - name: Run Swift integration tests
         run: swift test --package-path bindings/swift
       - name: Check Swift 6 compatibility
@@ -35,3 +35,19 @@ jobs:
       - name: Build the package with the iOS SDK
         working-directory: bindings/swift
         run: xcodebuild -quiet -scheme TinySQL -destination 'generic/platform=iOS' -derivedDataPath .build/xcode-ios CODE_SIGNING_ALLOWED=NO build
+      - name: Run Swift tests on the iOS Simulator
+        working-directory: bindings/swift
+        run: |
+          device="$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          for runtime, entries in devices.items():
+              if "iOS" not in runtime:
+                  continue
+              for device in entries:
+                  if device.get("isAvailable") and "iPhone" in device["name"]:
+                      print(device["udid"])
+                      sys.exit(0)
+          sys.exit("No available iPhone simulator; install an iOS runtime in Xcode.")
+          ')"
+          xcodebuild -quiet test -scheme TinySQL -destination "id=$device" -derivedDataPath .build/xcode-sim CODE_SIGNING_ALLOWED=NO
