@@ -34,6 +34,16 @@ async function main() {
     COUNT(DISTINCT (id+1)%5) AS kinds, MIN(CAST(id AS FLOAT)+0.5) AS smallest,
     MAX((id+1)*2) AS largest FROM items`)).rows, [[40200, 201, 5, 0.5, 400]]);
   assert.deepEqual(success(db.query('SELECT id FROM items WHERE id = -1')).rows, []);
+  success(db.exec('CREATE TABLE conditional_values (v INT, fallback INT)'));
+  success(db.exec('INSERT INTO conditional_values VALUES (NULL,7),(0,9),(2,NULL),(NULL,NULL)'));
+  assert.deepEqual(success(db.query(`SELECT CASE WHEN v IS NULL THEN COALESCE(fallback,9)
+    ELSE COALESCE(v,1/0) END AS value FROM conditional_values`)).rows, [[7], [0], [2], [9]]);
+  assert.deepEqual(success(db.query(`SELECT SUM(COALESCE(v,fallback,0)) AS total,
+    COUNT(COALESCE(v,fallback)) AS n,
+    MIN(CASE v WHEN 0 THEN 1 ELSE COALESCE(v,fallback,9) END) AS smallest
+    FROM conditional_values`)).rows, [[9, 3, 1]]);
+  assert.deepEqual(success(db.query('SELECT IFNULL(v,fallback,9), NVL(v,fallback,9) FROM conditional_values')).rows,
+    [[7, 7], [0, 0], [2, 2], [9, 9]]);
   // Cross multiple result-transfer blocks, including the small/large boundary.
   success(db.exec('CREATE TABLE bulk_transfer (id INT, label TEXT, active BOOL)'));
   const bulkExpected = Array.from({ length: 5003 }, (_, id) => [id, `é漢🙂<&_${id}`, id % 2 === 0]);
@@ -63,6 +73,9 @@ async function main() {
     assert.deepEqual(success(db.query(`SELECT id FROM ordered_floats ORDER BY score DESC LIMIT ${limit} OFFSET ${offset}`)).rows,
       byScore.slice(offset, offset + limit).map(row => [row[0]]));
   }
+  success(db.exec('UPDATE ordered_floats SET score = COALESCE(score,1/0)'));
+  success(db.exec('UPDATE ordered_floats SET score = CASE WHEN score IS NULL THEN 1/0 ELSE score END'));
+  assert.deepEqual(success(db.query('SELECT id,score FROM ordered_floats ORDER BY id')).rows, floatRows);
   // CTE ordering binds source qualifiers and output aliases before pagination.
   const orderedCTE = success(db.query('WITH c AS (SELECT id,label,active FROM bulk_transfer) SELECT q.id AS id,q.label AS caption FROM c q WHERE q.id>=4900 ORDER BY q.active DESC,id DESC LIMIT 5 OFFSET 2'));
   assert.deepEqual(orderedCTE.columns, ['id', 'caption']);

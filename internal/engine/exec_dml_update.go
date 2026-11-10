@@ -322,7 +322,9 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 	var setValues []rawValueEvaluator
 	if candidateCount >= 64 {
 		for i, set := range plan.sets {
-			if _, binary := set.expr.(*Binary); !binary {
+			switch set.expr.(type) {
+			case *Binary, *CaseExpr, *FuncCall:
+			default:
 				continue
 			}
 			value := compileRawValue(plan.colIndex, set.expr)

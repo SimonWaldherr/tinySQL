@@ -848,7 +848,7 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 		}
 		if projs[i].arg != nil && projs[i].argColumn == 0 && projs[i].argBinary == nil {
 			switch projs[i].arg.(type) {
-			case *Binary, *FuncCall:
+			case *Binary, *FuncCall, *CaseExpr:
 				projs[i].argValue = compileRawValue(colIndex, projs[i].arg)
 			}
 		}

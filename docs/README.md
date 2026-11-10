@@ -86,6 +86,8 @@ current behavior and keep performance claims scoped to the workload they measure
   allocation and execution-path improvements; it links to focused records below.
 - [Standard SQL execution](standard-query-performance.md) — bound SELECT, WHERE
   and UPDATE expressions, plus raw ordering without copying sort candidates.
+- [CASE and COALESCE execution](conditional-expression-performance.md) — bound
+  conditional values, lazy branches, NULL compatibility and measured tradeoffs.
 - [Query optimizer research](query-optimizer-research.md) — PostgreSQL, DuckDB
   and SQLite techniques assessed against tinySQL, with adaptive large-page sorts.
 - [CTE alignment](cte-performance.md), [CTE and indexed SELECT](cte-select-performance.md),
